@@ -167,7 +167,7 @@ func (a *Analyzer) Analyze() GraphStats {
 		for i := len(sorted) - 1; i >= 0; i-- {
 			stats.TopologicalOrder = append(stats.TopologicalOrder, a.nodeToID[sorted[i].ID()])
 		}
-		
+
 		// 6. Critical Path Heuristic (DAG only)
 		stats.CriticalPathScore = a.computeHeights(sorted)
 	}
