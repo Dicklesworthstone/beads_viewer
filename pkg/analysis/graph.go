@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"math"
+	"time"
 
 	"beads_viewer/pkg/model"
 
@@ -151,23 +152,49 @@ func (a *Analyzer) Analyze() GraphStats {
 	}
 
 	// 3c. HITS (hubs/authorities) captures dependency vs depended-on roles
-	// Only run if graph has edges (HITS hangs on graphs with no edges)
+	// Only run if graph has edges (HITS can hang on graphs with no edges or
+	// certain sparse topologies). We run with a timeout to avoid blocking.
 	if a.g.Edges().Len() > 0 {
-		hubAuth := network.HITS(a.g, 1e-4) // Higher tolerance for stability
-		for id, ha := range hubAuth {
-			stats.Hubs[a.nodeToID[id]] = ha.Hub
-			stats.Authorities[a.nodeToID[id]] = ha.Authority
+		type hitsResult struct {
+			data map[int64]network.HubAuthority
+		}
+		done := make(chan hitsResult, 1)
+		go func() {
+			hubAuth := network.HITS(a.g, 1e-3) // Relaxed tolerance for faster convergence
+			done <- hitsResult{data: hubAuth}
+		}()
+
+		select {
+		case result := <-done:
+			for id, ha := range result.data {
+				stats.Hubs[a.nodeToID[id]] = ha.Hub
+				stats.Authorities[a.nodeToID[id]] = ha.Authority
+			}
+		case <-time.After(500 * time.Millisecond):
+			// HITS timed out - skip these metrics rather than hanging
 		}
 	}
 
-	// 4. Cycles
-	cycles := topo.DirectedCyclesIn(a.g)
-	for _, cycle := range cycles {
-		var cycleIDs []string
-		for _, n := range cycle {
-			cycleIDs = append(cycleIDs, a.nodeToID[n.ID()])
+	// 4. Cycles (with timeout to avoid hanging on complex graphs)
+	type cyclesResult struct {
+		cycles [][]graph.Node
+	}
+	cyclesDone := make(chan cyclesResult, 1)
+	go func() {
+		cyclesDone <- cyclesResult{cycles: topo.DirectedCyclesIn(a.g)}
+	}()
+
+	select {
+	case result := <-cyclesDone:
+		for _, cycle := range result.cycles {
+			var cycleIDs []string
+			for _, n := range cycle {
+				cycleIDs = append(cycleIDs, a.nodeToID[n.ID()])
+			}
+			stats.Cycles = append(stats.Cycles, cycleIDs)
 		}
-		stats.Cycles = append(stats.Cycles, cycleIDs)
+	case <-time.After(500 * time.Millisecond):
+		// Cycle detection timed out - skip
 	}
 
 	// 5. Topological Sort (Linear Order)

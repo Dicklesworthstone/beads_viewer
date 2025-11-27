@@ -1,8 +1,10 @@
 package analysis_test
 
 import (
+	"fmt"
 	"sort"
 	"testing"
+	"time"
 
 	"beads_viewer/pkg/analysis"
 	"beads_viewer/pkg/model"
@@ -420,6 +422,111 @@ func TestGetOpenBlockers(t *testing.T) {
 	// Should only include B (C is closed)
 	if len(openBlockers) != 1 || openBlockers[0] != "B" {
 		t.Errorf("Expected open blockers [B], got %v", openBlockers)
+	}
+}
+
+// TestAnalyzeCompletesWithinTimeout ensures that Analyze() does not hang
+// even on graphs that might cause HITS or cycle detection to take a long time.
+// This test creates a sparse graph structure that could cause convergence issues
+// and verifies the analysis completes within a reasonable time.
+func TestAnalyzeCompletesWithinTimeout(t *testing.T) {
+	// Create a graph with many disconnected nodes plus some edges
+	// This can cause HITS to struggle with convergence
+	var issues []model.Issue
+	for i := 0; i < 100; i++ {
+		issue := model.Issue{
+			ID:     fmt.Sprintf("ISSUE-%d", i),
+			Status: model.StatusOpen,
+		}
+		// Create some sparse dependencies that might cause issues
+		if i > 0 && i%10 == 0 {
+			issue.Dependencies = []*model.Dependency{
+				{DependsOnID: fmt.Sprintf("ISSUE-%d", i-1), Type: model.DepBlocks},
+			}
+		}
+		issues = append(issues, issue)
+	}
+
+	an := analysis.NewAnalyzer(issues)
+
+	// Use a channel to detect if Analyze() completes
+	done := make(chan struct{})
+	go func() {
+		_ = an.Analyze()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success - completed within time limit
+	case <-time.After(3 * time.Second):
+		t.Fatal("Analyze() did not complete within 3 seconds - possible hang in HITS or cycle detection")
+	}
+}
+
+// TestAnalyzeNoEdgesGraph ensures analysis completes on graphs with nodes but no edges.
+// HITS in particular has historically hung on such graphs.
+func TestAnalyzeNoEdgesGraph(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen},
+		{ID: "C", Status: model.StatusOpen},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+
+	done := make(chan struct{})
+	go func() {
+		_ = an.Analyze()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(2 * time.Second):
+		t.Fatal("Analyze() hung on graph with no edges")
+	}
+}
+
+// TestAnalyzeSparseDisconnectedGraph tests a worst-case scenario for HITS convergence.
+func TestAnalyzeSparseDisconnectedGraph(t *testing.T) {
+	// Create multiple disconnected components
+	var issues []model.Issue
+	for component := 0; component < 5; component++ {
+		base := component * 10
+		for i := 0; i < 10; i++ {
+			issue := model.Issue{
+				ID:     fmt.Sprintf("C%d-ISSUE-%d", component, i),
+				Status: model.StatusOpen,
+			}
+			if i > 0 {
+				issue.Dependencies = []*model.Dependency{
+					{DependsOnID: fmt.Sprintf("C%d-ISSUE-%d", component, i-1), Type: model.DepBlocks},
+				}
+			}
+			_ = base // unused but documents structure
+			issues = append(issues, issue)
+		}
+	}
+
+	an := analysis.NewAnalyzer(issues)
+
+	done := make(chan struct{})
+	go func() {
+		stats := an.Analyze()
+		// Verify we got reasonable results
+		if len(stats.PageRank) != 50 {
+			t.Errorf("Expected 50 PageRank entries, got %d", len(stats.PageRank))
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(2 * time.Second):
+		t.Fatal("Analyze() hung on sparse disconnected graph")
 	}
 }
 
