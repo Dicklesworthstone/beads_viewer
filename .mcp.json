@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "gopls": {
+      "type": "stdio",
+      "command": "go",
+      "args": [
+        "run",
+        "golang.org/x/tools/gopls@latest",
+        "mcp"
+      ],
+      "env": {}
+    }
+  }
+}
