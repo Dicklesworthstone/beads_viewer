@@ -10,12 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"beads_viewer/pkg/analysis"
-	"beads_viewer/pkg/export"
-	"beads_viewer/pkg/loader"
-	"beads_viewer/pkg/model"
-	"beads_viewer/pkg/recipe"
-	"beads_viewer/pkg/updater"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/export"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/updater"
 
 	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/list"

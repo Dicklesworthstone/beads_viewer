@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"beads_viewer/pkg/analysis"
-	"beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // Helper to parse JSONL directly

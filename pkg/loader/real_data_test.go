@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"beads_viewer/pkg/loader"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 func TestLoadRealIssuesBenchmark(t *testing.T) {

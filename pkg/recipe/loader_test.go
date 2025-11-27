@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"beads_viewer/pkg/recipe"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 )
 
 func TestLoaderBuiltinRecipes(t *testing.T) {

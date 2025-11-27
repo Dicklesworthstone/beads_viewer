@@ -3,7 +3,7 @@ package loader_test
 import (
 	"testing"
 
-	"beads_viewer/pkg/loader"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 func TestLoadSyntheticComplex(t *testing.T) {

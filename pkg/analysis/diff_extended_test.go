@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // TestDiff_TextFieldChanges tests detection of changes in text fields

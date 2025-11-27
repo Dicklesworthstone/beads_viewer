@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // FindJSONLPath locates the beads JSONL file in the given directory.

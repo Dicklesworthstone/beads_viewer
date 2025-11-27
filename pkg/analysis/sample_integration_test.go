@@ -5,8 +5,8 @@ import (
 	"slices"
 	"testing"
 
-	"beads_viewer/pkg/loader"
-	"beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // loadSampleIssues loads the shared fixture used for integration-style tests.

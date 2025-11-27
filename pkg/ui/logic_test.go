@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"beads_viewer/pkg/model"
-	"beads_viewer/pkg/recipe"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 )
 
 // White-box testing of UI model logic

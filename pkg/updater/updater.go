@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"beads_viewer/pkg/version"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/version"
 )
 
 type Release struct {

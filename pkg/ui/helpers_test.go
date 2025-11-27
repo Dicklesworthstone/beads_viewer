@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"beads_viewer/pkg/model"
-	"beads_viewer/pkg/ui"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 )
 
 // TestTruncateRunesHelper tests UTF-8 safe truncation

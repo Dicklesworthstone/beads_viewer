@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"beads_viewer/pkg/loader"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 func TestLoadRealIssues(t *testing.T) {
