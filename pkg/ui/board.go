@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
 	"github.com/charmbracelet/lipgloss"
 )

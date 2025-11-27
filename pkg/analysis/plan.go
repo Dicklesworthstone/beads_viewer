@@ -3,7 +3,7 @@ package analysis
 import (
 	"sort"
 
-	"beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // PlanItem represents a single actionable item in the execution plan

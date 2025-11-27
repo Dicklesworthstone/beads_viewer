@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"beads_viewer/pkg/recipe"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 )
 
 func TestParseRelativeTimeDays(t *testing.T) {

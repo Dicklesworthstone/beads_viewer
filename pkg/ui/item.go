@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // DiffStatus represents the diff state of an issue in time-travel mode

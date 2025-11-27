@@ -3,9 +3,9 @@ package ui_test
 import (
 	"testing"
 
-	"beads_viewer/pkg/analysis"
-	"beads_viewer/pkg/model"
-	"beads_viewer/pkg/ui"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 )
 
 // createTestInsights creates a test Insights struct with sample data

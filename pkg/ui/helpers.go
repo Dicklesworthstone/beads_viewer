@@ -6,7 +6,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // FormatTimeRel returns a relative time string (e.g., "2h ago", "3d ago")

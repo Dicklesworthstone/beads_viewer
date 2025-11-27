@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 func TestNewSnapshot(t *testing.T) {

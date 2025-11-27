@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 
 	"github.com/charmbracelet/lipgloss"
 )

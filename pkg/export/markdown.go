@@ -9,7 +9,7 @@ import (
 	"time"
 	"unicode"
 
-	"beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // sanitizeMermaidID ensures an ID is valid for Mermaid diagrams.
