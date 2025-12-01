@@ -36,7 +36,7 @@
 ### ⚡ Quick Install
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/github.com/Dicklesworthstone/beads_viewer/main/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/main/install.sh?$(date +%s)" | bash
 ```
 
 ---
