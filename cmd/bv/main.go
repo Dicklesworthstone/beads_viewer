@@ -42,7 +42,8 @@ func main() {
 	asOf := flag.String("as-of", "", "View state at point in time (commit SHA, branch, tag, or date)")
 	forceFullAnalysis := flag.Bool("force-full-analysis", false, "Compute all metrics regardless of graph size (may be slow for large graphs)")
 	profileStartup := flag.Bool("profile-startup", false, "Output detailed startup timing profile for diagnostics")
-	profileJSON := flag.Bool("profile-json", false, "Output profile in JSON format (use with --profile-startup)")
+	profileTUIStartup := flag.Bool("profile-tui-startup", false, "Output comprehensive TUI startup profile (includes analysis + UI components)")
+	profileJSON := flag.Bool("profile-json", false, "Output profile in JSON format (use with --profile-startup or --profile-tui-startup)")
 	noHooks := flag.Bool("no-hooks", false, "Skip running hooks during export")
 	workspaceConfig := flag.String("workspace", "", "Load issues from workspace config file (.bv/workspace.yaml)")
 	repoFilter := flag.String("repo", "", "Filter issues by repository prefix (e.g., 'api-' or 'api')")
@@ -145,6 +146,12 @@ func main() {
 		fmt.Println("      Outputs detailed startup timing profile for diagnostics.")
 		fmt.Println("      Shows Phase 1 (blocking) and Phase 2 (async) breakdown.")
 		fmt.Println("      Provides recommendations based on timing analysis.")
+		fmt.Println("      Use with --profile-json for machine-readable output.")
+		fmt.Println("")
+		fmt.Println("  --profile-tui-startup")
+		fmt.Println("      Comprehensive TUI startup profile including UI component initialization.")
+		fmt.Println("      Shows all phases: data loading, graph analysis, and TUI components.")
+		fmt.Println("      Use this to diagnose slow startup when --profile-startup shows fast times.")
 		fmt.Println("      Use with --profile-json for machine-readable output.")
 		fmt.Println("")
 		fmt.Println("  --workspace CONFIG")
@@ -289,6 +296,12 @@ func main() {
 	// Handle --profile-startup
 	if *profileStartup {
 		runProfileStartup(issues, loadDuration, *profileJSON, *forceFullAnalysis)
+		os.Exit(0)
+	}
+
+	// Handle --profile-tui-startup
+	if *profileTUIStartup {
+		runProfileTUIStartup(issues, loadDuration, activeRecipe, beadsPath, *profileJSON)
 		os.Exit(0)
 	}
 
@@ -1145,6 +1158,146 @@ func runProfileStartup(issues []model.Issue, loadDuration time.Duration, jsonOut
 		// Human-readable output
 		printProfileReport(profile, loadDuration, totalWithLoad)
 	}
+}
+
+// runProfileTUIStartup runs profiled TUI startup and outputs comprehensive results
+func runProfileTUIStartup(issues []model.Issue, loadDuration time.Duration, activeRecipe *recipe.Recipe, beadsPath string, jsonOutput bool) {
+	// Create model with profiling
+	_, tuiProfile := ui.NewModelWithProfile(issues, activeRecipe, beadsPath)
+
+	// Set the load duration
+	tuiProfile.SetLoadDuration(loadDuration)
+	tuiProfile.ComputeTotals()
+
+	if jsonOutput {
+		// JSON output
+		output := struct {
+			GeneratedAt string             `json:"generated_at"`
+			DataPath    string             `json:"data_path"`
+			Profile     *ui.TUIStartupProfile `json:"profile"`
+		}{
+			GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+			DataPath:    ".beads/beads.jsonl",
+			Profile:     tuiProfile,
+		}
+
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(output); err != nil {
+			fmt.Fprintf(os.Stderr, "Error encoding profile: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		// Human-readable output
+		printTUIProfileReport(tuiProfile)
+	}
+}
+
+// printTUIProfileReport outputs a human-readable TUI startup profile
+func printTUIProfileReport(profile *ui.TUIStartupProfile) {
+	fmt.Println("TUI Startup Profile")
+	fmt.Println("===================")
+	fmt.Printf("Data: %d issues, %d dependencies\n\n", profile.IssueCount, profile.DependencyCount)
+
+	// Phase 1 - Data Loading
+	fmt.Println("Phase 1 - Data Loading:")
+	fmt.Printf("  Load JSONL:        %v\n\n", formatDuration(profile.LoadJSONL))
+
+	// Phase 2 - Analysis
+	if profile.Analysis != nil {
+		fmt.Println("Phase 2 - Graph Analysis:")
+		fmt.Printf("  Build graph:       %v\n", formatDuration(profile.Analysis.BuildGraph))
+		fmt.Printf("  Degree:            %v\n", formatDuration(profile.Analysis.Degree))
+		fmt.Printf("  TopoSort:          %v\n", formatDuration(profile.Analysis.TopoSort))
+		printMetricLine("PageRank", profile.Analysis.PageRank, profile.Analysis.PageRankTO, profile.Analysis.Config.ComputePageRank)
+		printMetricLine("Betweenness", profile.Analysis.Betweenness, profile.Analysis.BetweennessTO, profile.Analysis.Config.ComputeBetweenness)
+		printMetricLine("Eigenvector", profile.Analysis.Eigenvector, false, profile.Analysis.Config.ComputeEigenvector)
+		printMetricLine("HITS", profile.Analysis.HITS, profile.Analysis.HITSTO, profile.Analysis.Config.ComputeHITS)
+		printMetricLine("Critical Path", profile.Analysis.CriticalPath, false, profile.Analysis.Config.ComputeCriticalPath)
+		printCyclesLine(profile.Analysis)
+		fmt.Printf("  Total Analysis:    %v\n\n", formatDuration(profile.Analysis.Total))
+	}
+
+	// Phase 3 - TUI Components
+	fmt.Println("Phase 3 - TUI Components:")
+	fmt.Printf("  Sort issues:       %v\n", formatDuration(profile.SortIssues))
+	fmt.Printf("  Build lookup:      %v\n", formatDuration(profile.BuildLookup))
+	fmt.Printf("  Compute stats:     %v\n", formatDuration(profile.ComputeStats))
+	fmt.Printf("  Theme init:        %v\n", formatDuration(profile.ThemeInit))
+	fmt.Printf("  List setup:        %v\n", formatDuration(profile.ListSetup))
+	fmt.Printf("  Glamour renderer:  %v\n", formatDuration(profile.GlamourInit))
+	fmt.Printf("  Board model:       %v\n", formatDuration(profile.BoardInit))
+	fmt.Printf("  Insights panel:    %v\n", formatDuration(profile.InsightsInit))
+	fmt.Printf("  Graph view:        %v\n", formatDuration(profile.GraphViewInit))
+	fmt.Printf("  Recipe loader:     %v\n", formatDuration(profile.RecipeLoader))
+	fmt.Printf("  Recipe picker:     %v\n", formatDuration(profile.RecipePicker))
+	fmt.Printf("  Text input:        %v\n", formatDuration(profile.TextInputInit))
+	fmt.Printf("  File watcher:      %v\n", formatDuration(profile.FileWatcherInit))
+	fmt.Printf("  Total TUI:         %v\n\n", formatDuration(profile.TUIComponentsTotal))
+
+	// Total
+	fmt.Printf("NewModel total:      %v\n", formatDuration(profile.NewModelTotal))
+	fmt.Printf("Total startup:       %v\n\n", formatDuration(profile.TotalStartup))
+
+	// Recommendations
+	recommendations := generateTUIProfileRecommendations(profile)
+	if len(recommendations) > 0 {
+		fmt.Println("Recommendations:")
+		for _, rec := range recommendations {
+			fmt.Printf("  %s\n", rec)
+		}
+	}
+}
+
+// generateTUIProfileRecommendations generates actionable recommendations based on TUI profile
+func generateTUIProfileRecommendations(profile *ui.TUIStartupProfile) []string {
+	var recs []string
+
+	// Check overall startup time
+	if profile.TotalStartup < 500*time.Millisecond {
+		recs = append(recs, "✓ Startup within acceptable range (<500ms)")
+	} else if profile.TotalStartup < 1*time.Second {
+		recs = append(recs, "✓ Startup acceptable (<1s)")
+	} else if profile.TotalStartup < 2*time.Second {
+		recs = append(recs, "⚠ Startup is slow (1-2s)")
+	} else {
+		recs = append(recs, "⚠ Startup is very slow (>2s) - see breakdown above")
+	}
+
+	// Find the slowest TUI component
+	type component struct {
+		name     string
+		duration time.Duration
+	}
+	components := []component{
+		{"Glamour renderer", profile.GlamourInit},
+		{"File watcher", profile.FileWatcherInit},
+		{"Recipe loader", profile.RecipeLoader},
+		{"Board model", profile.BoardInit},
+		{"Insights panel", profile.InsightsInit},
+		{"Graph view", profile.GraphViewInit},
+		{"List setup", profile.ListSetup},
+		{"Theme init", profile.ThemeInit},
+	}
+
+	// Find slowest
+	var slowest component
+	for _, c := range components {
+		if c.duration > slowest.duration {
+			slowest = c
+		}
+	}
+
+	if slowest.duration > 100*time.Millisecond {
+		recs = append(recs, fmt.Sprintf("⚠ Slowest component: %s (%v)", slowest.name, formatDuration(slowest.duration)))
+	}
+
+	// Check if analysis is dominating
+	if profile.Analysis != nil && profile.Analysis.Total > profile.TUIComponentsTotal {
+		recs = append(recs, "ℹ Analysis phase is taking longer than TUI initialization - use --profile-startup for details")
+	}
+
+	return recs
 }
 
 // printProfileReport outputs a human-readable startup profile

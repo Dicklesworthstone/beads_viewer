@@ -388,6 +388,253 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	}
 }
 
+// NewModelWithProfile creates a new Model with detailed timing profile.
+// Used by --profile-tui-startup to diagnose slow startup.
+func NewModelWithProfile(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath string) (Model, *TUIStartupProfile) {
+	profile := &TUIStartupProfile{
+		IssueCount: len(issues),
+	}
+	totalStart := time.Now()
+
+	// Count dependencies
+	for _, issue := range issues {
+		profile.DependencyCount += len(issue.Dependencies)
+	}
+
+	// Graph Analysis - run synchronously with profiling for accurate timing
+	t := time.Now()
+	analyzer := analysis.NewAnalyzer(issues)
+
+	// Estimate edge count for config selection
+	edgeCount := 0
+	for _, issue := range issues {
+		edgeCount += len(issue.Dependencies)
+	}
+	config := analysis.ConfigForSize(len(issues), edgeCount)
+	graphStats, analysisProfile := analyzer.AnalyzeWithProfile(config)
+	profile.Analysis = analysisProfile
+
+	// Sort issues
+	t = time.Now()
+	if activeRecipe != nil && activeRecipe.Sort.Field != "" {
+		r := activeRecipe
+		descending := r.Sort.Direction == "desc"
+
+		sort.Slice(issues, func(i, j int) bool {
+			less := false
+			switch r.Sort.Field {
+			case "priority":
+				less = issues[i].Priority < issues[j].Priority
+			case "created", "created_at":
+				less = issues[i].CreatedAt.Before(issues[j].CreatedAt)
+			case "updated", "updated_at":
+				less = issues[i].UpdatedAt.Before(issues[j].UpdatedAt)
+			case "impact":
+				less = graphStats.GetCriticalPathScore(issues[i].ID) < graphStats.GetCriticalPathScore(issues[j].ID)
+			case "pagerank":
+				less = graphStats.GetPageRankScore(issues[i].ID) < graphStats.GetPageRankScore(issues[j].ID)
+			default:
+				less = issues[i].Priority < issues[j].Priority
+			}
+			if descending {
+				return !less
+			}
+			return less
+		})
+	} else {
+		sort.Slice(issues, func(i, j int) bool {
+			iClosed := issues[i].Status == model.StatusClosed
+			jClosed := issues[j].Status == model.StatusClosed
+			if iClosed != jClosed {
+				return !iClosed
+			}
+			if issues[i].Priority != issues[j].Priority {
+				return issues[i].Priority < issues[j].Priority
+			}
+			return issues[i].CreatedAt.After(issues[j].CreatedAt)
+		})
+	}
+	profile.SortIssues = time.Since(t)
+
+	// Build lookup map and list items
+	t = time.Now()
+	issueMap := make(map[string]*model.Issue, len(issues))
+	items := make([]list.Item, len(issues))
+	for i := range issues {
+		issueMap[issues[i].ID] = &issues[i]
+		items[i] = IssueItem{
+			Issue:      issues[i],
+			GraphScore: graphStats.GetPageRankScore(issues[i].ID),
+			Impact:     graphStats.GetCriticalPathScore(issues[i].ID),
+			RepoPrefix: ExtractRepoPrefix(issues[i].ID),
+		}
+	}
+	profile.BuildLookup = time.Since(t)
+
+	// Compute stats
+	t = time.Now()
+	cOpen, cReady, cBlocked, cClosed := 0, 0, 0, 0
+	for i := range issues {
+		issue := &issues[i]
+		if issue.Status == model.StatusClosed {
+			cClosed++
+			continue
+		}
+		cOpen++
+		if issue.Status == model.StatusBlocked {
+			cBlocked++
+			continue
+		}
+		isBlocked := false
+		for _, dep := range issue.Dependencies {
+			if dep.Type != model.DepBlocks {
+				continue
+			}
+			if blocker, exists := issueMap[dep.DependsOnID]; exists && blocker.Status != model.StatusClosed {
+				isBlocked = true
+				break
+			}
+		}
+		if !isBlocked {
+			cReady++
+		}
+	}
+	profile.ComputeStats = time.Since(t)
+
+	// Theme
+	t = time.Now()
+	theme := DefaultTheme(lipgloss.NewRenderer(os.Stdout))
+	profile.ThemeInit = time.Since(t)
+
+	// List setup
+	t = time.Now()
+	delegate := IssueDelegate{Theme: theme, WorkspaceMode: false}
+	l := list.New(items, delegate, 0, 0)
+	l.Title = ""
+	l.SetShowTitle(false)
+	l.SetShowHelp(false)
+	l.SetShowStatusBar(false)
+	l.SetShowPagination(false)
+	l.SetFilteringEnabled(true)
+	l.DisableQuitKeybindings()
+	l.Styles.Title = lipgloss.NewStyle()
+	l.Styles.TitleBar = lipgloss.NewStyle()
+	l.Styles.FilterPrompt = lipgloss.NewStyle().Foreground(theme.Primary)
+	l.Styles.FilterCursor = lipgloss.NewStyle().Foreground(theme.Primary)
+	l.Styles.StatusBar = lipgloss.NewStyle()
+	l.Styles.StatusEmpty = lipgloss.NewStyle()
+	l.Styles.StatusBarActiveFilter = lipgloss.NewStyle()
+	l.Styles.StatusBarFilterCount = lipgloss.NewStyle()
+	l.Styles.NoItems = lipgloss.NewStyle()
+	l.Styles.PaginationStyle = lipgloss.NewStyle()
+	l.Styles.HelpStyle = lipgloss.NewStyle()
+	profile.ListSetup = time.Since(t)
+
+	// Glamour markdown renderer
+	t = time.Now()
+	renderer, _ := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(80),
+	)
+	profile.GlamourInit = time.Since(t)
+
+	// Initialize sub-components
+	t = time.Now()
+	board := NewBoardModel(issues, theme)
+	profile.BoardInit = time.Since(t)
+
+	t = time.Now()
+	ins := graphStats.GenerateInsights(len(issues))
+	insightsPanel := NewInsightsModel(ins, issueMap, theme)
+	profile.InsightsInit = time.Since(t)
+
+	t = time.Now()
+	graphView := NewGraphModel(issues, &ins, theme)
+	profile.GraphViewInit = time.Since(t)
+
+	priorityHints := make(map[string]*analysis.PriorityRecommendation)
+
+	// Initialize recipe loader
+	t = time.Now()
+	recipeLoader := recipe.NewLoader()
+	_ = recipeLoader.Load()
+	profile.RecipeLoader = time.Since(t)
+
+	t = time.Now()
+	recipePicker := NewRecipePickerModel(recipeLoader.List(), theme)
+	profile.RecipePicker = time.Since(t)
+
+	// Initialize time-travel input
+	t = time.Now()
+	ti := textinput.New()
+	ti.Placeholder = "HEAD~5, main, v1.0.0, 2024-01-01..."
+	ti.CharLimit = 100
+	ti.Width = 40
+	ti.Prompt = "⏱️  Revision: "
+	ti.PromptStyle = lipgloss.NewStyle().Foreground(theme.Primary).Bold(true)
+	ti.TextStyle = lipgloss.NewStyle().Foreground(theme.Base.GetForeground())
+	profile.TextInputInit = time.Since(t)
+
+	// Initialize file watcher for live reload
+	t = time.Now()
+	var fileWatcher *watcher.Watcher
+	var watcherErr error
+	if beadsPath != "" {
+		w, err := watcher.NewWatcher(beadsPath,
+			watcher.WithDebounceDuration(200*time.Millisecond),
+		)
+		if err != nil {
+			watcherErr = err
+		} else if err := w.Start(); err != nil {
+			watcherErr = err
+		} else {
+			fileWatcher = w
+		}
+	}
+	profile.FileWatcherInit = time.Since(t)
+
+	var initialStatus string
+	var initialStatusErr bool
+	if watcherErr != nil {
+		initialStatus = fmt.Sprintf("Live reload unavailable: %v", watcherErr)
+		initialStatusErr = true
+	}
+
+	profile.NewModelTotal = time.Since(totalStart)
+	profile.ComputeTotals()
+
+	m := Model{
+		issues:            issues,
+		issueMap:          issueMap,
+		analyzer:          analyzer,
+		analysis:          graphStats,
+		beadsPath:         beadsPath,
+		watcher:           fileWatcher,
+		list:              l,
+		renderer:          renderer,
+		board:             board,
+		graphView:         graphView,
+		insightsPanel:     insightsPanel,
+		theme:             theme,
+		currentFilter:     "all",
+		focused:           focusList,
+		countOpen:         cOpen,
+		countReady:        cReady,
+		countBlocked:      cBlocked,
+		countClosed:       cClosed,
+		priorityHints:     priorityHints,
+		showPriorityHints: false,
+		recipeLoader:      recipeLoader,
+		recipePicker:      recipePicker,
+		activeRecipe:      activeRecipe,
+		timeTravelInput:   ti,
+		statusMsg:         initialStatus,
+		statusIsError:     initialStatusErr,
+	}
+
+	return m, profile
+}
+
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{CheckUpdateCmd(), WaitForPhase2Cmd(m.analysis)}
 	if m.watcher != nil {
