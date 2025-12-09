@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -275,9 +274,9 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Make sure you are in a project initialized with 'bd init'.")
 			os.Exit(1)
 		}
-		// Get beads file path for live reload
-		cwd, _ := os.Getwd()
-		beadsPath, _ = loader.FindJSONLPath(filepath.Join(cwd, ".beads"))
+		// Get beads file path for live reload (respects BEADS_DIR)
+		beadsDir, _ := loader.GetBeadsDir("")
+		beadsPath, _ = loader.FindJSONLPath(beadsDir)
 	}
 	loadDuration := time.Since(loadStart)
 

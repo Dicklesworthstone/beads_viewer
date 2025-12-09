@@ -206,6 +206,71 @@ func TestFindJSONLPath_FollowsSymlink(t *testing.T) {
 }
 
 // =============================================================================
+// GetBeadsDir Tests
+// =============================================================================
+
+func TestGetBeadsDir_UsesEnvVar(t *testing.T) {
+	// Set BEADS_DIR environment variable
+	customDir := "/custom/beads/path"
+	os.Setenv("BEADS_DIR", customDir)
+	defer os.Unsetenv("BEADS_DIR")
+
+	dir, err := loader.GetBeadsDir("")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if dir != customDir {
+		t.Errorf("Expected %s, got %s", customDir, dir)
+	}
+}
+
+func TestGetBeadsDir_EnvVarOverridesRepoPath(t *testing.T) {
+	// Set BEADS_DIR environment variable
+	customDir := "/custom/beads/path"
+	os.Setenv("BEADS_DIR", customDir)
+	defer os.Unsetenv("BEADS_DIR")
+
+	// Even with a repo path, BEADS_DIR should take precedence
+	dir, err := loader.GetBeadsDir("/some/repo/path")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if dir != customDir {
+		t.Errorf("Expected BEADS_DIR (%s) to override repo path, got %s", customDir, dir)
+	}
+}
+
+func TestGetBeadsDir_FallsBackToRepoPath(t *testing.T) {
+	// Ensure BEADS_DIR is not set
+	os.Unsetenv("BEADS_DIR")
+
+	repoPath := "/my/repo"
+	dir, err := loader.GetBeadsDir(repoPath)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	expected := filepath.Join(repoPath, ".beads")
+	if dir != expected {
+		t.Errorf("Expected %s, got %s", expected, dir)
+	}
+}
+
+func TestGetBeadsDir_FallsBackToCwd(t *testing.T) {
+	// Ensure BEADS_DIR is not set
+	os.Unsetenv("BEADS_DIR")
+
+	dir, err := loader.GetBeadsDir("")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	cwd, _ := os.Getwd()
+	expected := filepath.Join(cwd, ".beads")
+	if dir != expected {
+		t.Errorf("Expected %s, got %s", expected, dir)
+	}
+}
+
+// =============================================================================
 // LoadIssues Tests
 // =============================================================================
 
@@ -215,6 +280,28 @@ func TestLoadIssues_NonExistentBeadsDir(t *testing.T) {
 	_, err := loader.LoadIssues(dir)
 	if err == nil {
 		t.Fatal("Expected error for non-existent .beads directory")
+	}
+}
+
+func TestLoadIssues_RespectsBeadsDirEnvVar(t *testing.T) {
+	// Create a custom beads directory (not inside .beads)
+	customDir := t.TempDir()
+	os.WriteFile(filepath.Join(customDir, "beads.jsonl"), []byte(`{"id":"env-1","title":"From Env","status":"open","issue_type":"task"}`+"\n"), 0644)
+
+	// Set BEADS_DIR to point to custom directory
+	os.Setenv("BEADS_DIR", customDir)
+	defer os.Unsetenv("BEADS_DIR")
+
+	// Call LoadIssues with empty path - it should use BEADS_DIR
+	issues, err := loader.LoadIssues("")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("Expected 1 issue, got %d", len(issues))
+	}
+	if issues[0].ID != "env-1" {
+		t.Errorf("Expected ID 'env-1', got '%s'", issues[0].ID)
 	}
 }
 

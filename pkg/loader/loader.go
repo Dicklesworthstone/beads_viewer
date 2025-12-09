@@ -79,18 +79,36 @@ func FindJSONLPath(beadsDir string) (string, error) {
 	return filepath.Join(beadsDir, candidates[0]), nil
 }
 
-// LoadIssues reads issues from the .beads directory in the given repository path.
-// Automatically finds the correct JSONL file (beads.jsonl preferred, issues.jsonl fallback).
-func LoadIssues(repoPath string) ([]model.Issue, error) {
+// GetBeadsDir returns the beads directory path, respecting the BEADS_DIR environment variable.
+// If BEADS_DIR is set, it is used directly.
+// Otherwise, falls back to .beads in the given repoPath (or cwd if repoPath is empty).
+func GetBeadsDir(repoPath string) (string, error) {
+	// Check BEADS_DIR environment variable first
+	if envDir := os.Getenv("BEADS_DIR"); envDir != "" {
+		return envDir, nil
+	}
+
+	// Fall back to .beads in repo path
 	if repoPath == "" {
 		var err error
 		repoPath, err = os.Getwd()
 		if err != nil {
-			return nil, fmt.Errorf("failed to get current working directory: %w", err)
+			return "", fmt.Errorf("failed to get current working directory: %w", err)
 		}
 	}
 
-	beadsDir := filepath.Join(repoPath, ".beads")
+	return filepath.Join(repoPath, ".beads"), nil
+}
+
+// LoadIssues reads issues from the .beads directory in the given repository path.
+// Automatically finds the correct JSONL file (beads.jsonl preferred, issues.jsonl fallback).
+// Respects the BEADS_DIR environment variable if set.
+func LoadIssues(repoPath string) ([]model.Issue, error) {
+	beadsDir, err := GetBeadsDir(repoPath)
+	if err != nil {
+		return nil, err
+	}
+
 	jsonlPath, err := FindJSONLPath(beadsDir)
 	if err != nil {
 		return nil, err
