@@ -49,11 +49,11 @@ func FindJSONLPath(beadsDir string) (string, error) {
 	}
 
 	// Priority order for beads files:
-	// 1. beads.jsonl (canonical)
-	// 2. beads.base.jsonl (bd's primary storage)
-	// 3. issues.jsonl (legacy)
+	// 1. issues.jsonl (canonical)
+	// 2. beads.jsonl
+	// 3. beads.base.jsonl (bd's primary storage)
 	// 4. First candidate
-	preferredNames := []string{"beads.jsonl", "beads.base.jsonl", "issues.jsonl"}
+	preferredNames := []string{"issues.jsonl", "beads.jsonl", "beads.base.jsonl"}
 
 	for _, preferred := range preferredNames {
 		for _, name := range candidates {
@@ -80,7 +80,7 @@ func FindJSONLPath(beadsDir string) (string, error) {
 }
 
 // LoadIssues reads issues from the .beads directory in the given repository path.
-// Automatically finds the correct JSONL file (beads.jsonl preferred, issues.jsonl fallback).
+// Automatically finds the correct JSONL file (issues.jsonl preferred, beads.jsonl fallback).
 func LoadIssues(repoPath string) ([]model.Issue, error) {
 	if repoPath == "" {
 		var err error

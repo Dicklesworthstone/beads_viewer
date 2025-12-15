@@ -411,14 +411,15 @@ func TestOpenInEditorTerminalEditorGuard(t *testing.T) {
 	oldCwd, _ := os.Getwd()
 	defer os.Chdir(oldCwd)
 	_ = os.MkdirAll(filepath.Join(tmp, ".beads"), 0755)
-	_ = os.WriteFile(filepath.Join(tmp, ".beads", "beads.jsonl"), []byte("{}"), 0644)
+	beadsFile := filepath.Join(tmp, ".beads", "issues.jsonl")
+	_ = os.WriteFile(beadsFile, []byte("{}"), 0644)
 	_ = os.Chdir(tmp)
 
 	origEditor := os.Getenv("EDITOR")
 	defer os.Setenv("EDITOR", origEditor)
 	_ = os.Setenv("EDITOR", "vim") // triggers terminal-editor guard, no exec
 
-	m := NewModel(nil, nil, "")
+	m := NewModel(nil, nil, beadsFile)
 	m.openInEditor()
 	if !m.statusIsError || !strings.Contains(m.statusMsg, "terminal editor") {
 		t.Fatalf("expected terminal editor warning, got %q", m.statusMsg)
@@ -539,7 +540,7 @@ func TestOpenInEditorMissingAndGUI(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("openInEditor GUI path is unreliable on headless Windows CI")
 	}
-	// Missing beads file branch
+	// Empty beadsPath branch
 	tmp := t.TempDir()
 	origWD, _ := os.Getwd()
 	t.Cleanup(func() { _ = os.Chdir(origWD) })
@@ -547,19 +548,21 @@ func TestOpenInEditorMissingAndGUI(t *testing.T) {
 
 	m := NewModel([]model.Issue{{ID: "1", Title: "x", Status: model.StatusOpen}}, nil, "")
 	m.openInEditor()
-	if !m.statusIsError || !strings.Contains(m.statusMsg, "No .beads") {
+	if !m.statusIsError || !strings.Contains(m.statusMsg, "No beads file") {
 		t.Fatalf("expected missing beads error, got %q", m.statusMsg)
 	}
 
 	// Success branch with GUI-ish editor
 	beadsDir := filepath.Join(tmp, ".beads")
 	_ = os.Mkdir(beadsDir, 0o755)
-	_ = os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(`{}`), 0o644)
+	beadsFile := filepath.Join(beadsDir, "issues.jsonl")
+	_ = os.WriteFile(beadsFile, []byte(`{}`), 0o644)
 
 	origEditor := os.Getenv("EDITOR")
 	t.Cleanup(func() { _ = os.Setenv("EDITOR", origEditor) })
 	_ = os.Setenv("EDITOR", "true") // present on POSIX; not in terminal editor block
 
+	m = NewModel([]model.Issue{{ID: "1", Title: "x", Status: model.StatusOpen}}, nil, beadsFile)
 	m.openInEditor()
 	if m.statusIsError || !strings.Contains(m.statusMsg, "Opened in") {
 		t.Fatalf("expected success opening editor, got %q", m.statusMsg)

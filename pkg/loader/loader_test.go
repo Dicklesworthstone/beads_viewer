@@ -48,7 +48,7 @@ func TestFindJSONLPath_NoJSONLFiles(t *testing.T) {
 	}
 }
 
-func TestFindJSONLPath_PrefersBeadsJSONL(t *testing.T) {
+func TestFindJSONLPath_PrefersIssuesJSONL(t *testing.T) {
 	dir := t.TempDir()
 	// Create multiple JSONL files
 	os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte(`{"id":"1"}`), 0644)
@@ -59,16 +59,30 @@ func TestFindJSONLPath_PrefersBeadsJSONL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
+	if filepath.Base(path) != "issues.jsonl" {
+		t.Errorf("Expected issues.jsonl to be preferred, got: %s", path)
+	}
+}
+
+func TestFindJSONLPath_FallsBackToBeadsJSONL(t *testing.T) {
+	dir := t.TempDir()
+	// Create beads.jsonl and beads.base.jsonl (no issues.jsonl)
+	os.WriteFile(filepath.Join(dir, "beads.jsonl"), []byte(`{"id":"1"}`), 0644)
+	os.WriteFile(filepath.Join(dir, "beads.base.jsonl"), []byte(`{"id":"2"}`), 0644)
+
+	path, err := loader.FindJSONLPath(dir)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 	if filepath.Base(path) != "beads.jsonl" {
-		t.Errorf("Expected beads.jsonl to be preferred, got: %s", path)
+		t.Errorf("Expected beads.jsonl, got: %s", path)
 	}
 }
 
 func TestFindJSONLPath_FallsBackToBeadsBase(t *testing.T) {
 	dir := t.TempDir()
-	// Create beads.base.jsonl and issues.jsonl (no beads.jsonl)
-	os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte(`{"id":"1"}`), 0644)
-	os.WriteFile(filepath.Join(dir, "beads.base.jsonl"), []byte(`{"id":"2"}`), 0644)
+	// Create only beads.base.jsonl
+	os.WriteFile(filepath.Join(dir, "beads.base.jsonl"), []byte(`{"id":"1"}`), 0644)
 
 	path, err := loader.FindJSONLPath(dir)
 	if err != nil {
@@ -76,20 +90,6 @@ func TestFindJSONLPath_FallsBackToBeadsBase(t *testing.T) {
 	}
 	if filepath.Base(path) != "beads.base.jsonl" {
 		t.Errorf("Expected beads.base.jsonl, got: %s", path)
-	}
-}
-
-func TestFindJSONLPath_FallsBackToIssues(t *testing.T) {
-	dir := t.TempDir()
-	// Create only issues.jsonl
-	os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte(`{"id":"1"}`), 0644)
-
-	path, err := loader.FindJSONLPath(dir)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if filepath.Base(path) != "issues.jsonl" {
-		t.Errorf("Expected issues.jsonl, got: %s", path)
 	}
 }
 

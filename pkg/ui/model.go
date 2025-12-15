@@ -2471,18 +2471,16 @@ func (m *Model) copyIssueToClipboard() {
 	m.statusIsError = false
 }
 
-// openInEditor opens the beads.jsonl file in the user's preferred editor
+// openInEditor opens the beads file in the user's preferred editor
 func (m *Model) openInEditor() {
-	cwd, err := os.Getwd()
-	if err != nil {
-		m.statusMsg = "❌ Cannot get working directory"
+	if m.beadsPath == "" {
+		m.statusMsg = "❌ No beads file configured"
 		m.statusIsError = true
 		return
 	}
 
-	beadsFile := filepath.Join(cwd, ".beads", "beads.jsonl")
-	if _, err := os.Stat(beadsFile); os.IsNotExist(err) {
-		m.statusMsg = "❌ No .beads/beads.jsonl file found"
+	if _, err := os.Stat(m.beadsPath); os.IsNotExist(err) {
+		m.statusMsg = fmt.Sprintf("❌ Beads file not found: %s", m.beadsPath)
 		m.statusIsError = true
 		return
 	}
@@ -2510,7 +2508,7 @@ func (m *Model) openInEditor() {
 		switch runtime.GOOS {
 		case "darwin":
 			// Use 'open' to launch default app for .jsonl files
-			cmd := exec.Command("open", "-t", beadsFile)
+			cmd := exec.Command("open", "-t", m.beadsPath)
 			if err := cmd.Start(); err == nil {
 				m.statusMsg = "📝 Opened in default text editor"
 				m.statusIsError = false
@@ -2536,8 +2534,8 @@ func (m *Model) openInEditor() {
 	}
 
 	// Launch GUI editor in background
-	cmd := exec.Command(editor, beadsFile)
-	err = cmd.Start()
+	cmd := exec.Command(editor, m.beadsPath)
+	err := cmd.Start()
 	if err != nil {
 		m.statusMsg = fmt.Sprintf("❌ Failed to open editor: %v", err)
 		m.statusIsError = true
