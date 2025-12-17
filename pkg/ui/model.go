@@ -4422,6 +4422,12 @@ func (m *Model) updateViewportContent() {
 		sb.WriteString(item.Description + "\n\n")
 	}
 
+	// Design Notes
+	if item.Design != "" {
+		sb.WriteString("### 📐 Design Notes\n")
+		sb.WriteString(item.Design + "\n\n")
+	}
+
 	// Acceptance Criteria
 	if item.AcceptanceCriteria != "" {
 		sb.WriteString("### Acceptance Criteria\n")
