@@ -2,127 +2,106 @@ package loader
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func TestMatchesBVPattern(t *testing.T) {
-	tests := []struct {
-		line    string
-		matches bool
-	}{
-		// Should match
-		{".bv", true},
-		{".bv/", true},
-		{".bv/*", true},
-		{".bv/**", true},
-		{".bv/**/*", true},
-		{"/.bv", true},    // Leading slash should be normalized
-		{"/.bv/", true},
-
-		// Should not match
-		{"", false},
-		{"#.bv", false},   // Comment
-		{".bv2", false},
-		{".bvx", false},
-		{"bv/", false},
-		{".beads/", false},
-		{"node_modules/", false},
-		{".bv-backup", false},
-		{"*.bv", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.line, func(t *testing.T) {
-			got := matchesBVPattern(tt.line)
-			if got != tt.matches {
-				t.Errorf("matchesBVPattern(%q) = %v, want %v", tt.line, got, tt.matches)
-			}
-		})
+// initGitRepo initializes a git repo in the given directory with isolated config
+func initGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	cmd := exec.Command("git", "init")
+	cmd.Dir = dir
+	// Isolate from global gitconfig to avoid test pollution
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL=/dev/null",
+		"GIT_CONFIG_SYSTEM=/dev/null",
+	)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
 	}
 }
 
-func TestIsBVInGitignore(t *testing.T) {
+func TestIsBVIgnoredByGit(t *testing.T) {
+	// Isolate from user's global gitconfig
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+
 	tests := []struct {
-		name     string
-		content  string
-		expected bool
+		name           string
+		gitignoreContent string
+		expected       bool
 	}{
 		{
-			name:     "empty file",
-			content:  "",
-			expected: false,
+			name:           "empty gitignore",
+			gitignoreContent: "",
+			expected:       false,
 		},
 		{
-			name:     "has .bv",
-			content:  "node_modules/\n.bv\n*.log\n",
-			expected: true,
+			name:           "has .bv",
+			gitignoreContent: "node_modules/\n.bv\n*.log\n",
+			expected:       true,
 		},
 		{
-			name:     "has .bv/",
-			content:  "node_modules/\n.bv/\n*.log\n",
-			expected: true,
+			name:           "has .bv/",
+			gitignoreContent: "node_modules/\n.bv/\n*.log\n",
+			expected:       true,
 		},
 		{
-			name:     "has .bv/*",
-			content:  ".bv/*\n",
-			expected: true,
+			name:           "has .bv/*",
+			gitignoreContent: ".bv/*\n",
+			expected:       true,
 		},
 		{
-			name:     "has /.bv/",
-			content:  "/.bv/\n",
-			expected: true,
+			name:           "has /.bv/",
+			gitignoreContent: "/.bv/\n",
+			expected:       true,
 		},
 		{
-			name:     "commented out",
-			content:  "# .bv/\n",
-			expected: false,
+			name:           "commented out",
+			gitignoreContent: "# .bv/\n",
+			expected:       false,
 		},
 		{
-			name:     "different pattern",
-			content:  ".beads/\nnode_modules/\n",
-			expected: false,
+			name:           "different pattern",
+			gitignoreContent: ".beads/\nnode_modules/\n",
+			expected:       false,
 		},
 		{
-			name:     "similar but not matching",
-			content:  ".bv2/\n.bvx\nbv/\n",
-			expected: false,
-		},
-		{
-			name:     "with whitespace",
-			content:  "  .bv/  \n",
-			expected: true,
+			name:           "similar but not matching",
+			gitignoreContent: ".bv2/\n.bvx\nbv/\n",
+			expected:       false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tmpDir := t.TempDir()
-			gitignorePath := filepath.Join(tmpDir, ".gitignore")
+			initGitRepo(t, tmpDir)
 
-			if err := os.WriteFile(gitignorePath, []byte(tt.content), 0644); err != nil {
-				t.Fatalf("failed to write test file: %v", err)
+			if tt.gitignoreContent != "" {
+				gitignorePath := filepath.Join(tmpDir, ".gitignore")
+				if err := os.WriteFile(gitignorePath, []byte(tt.gitignoreContent), 0644); err != nil {
+					t.Fatalf("failed to write .gitignore: %v", err)
+				}
 			}
 
-			got, err := isBVInGitignore(gitignorePath)
-			if err != nil {
-				t.Fatalf("isBVInGitignore() error = %v", err)
-			}
+			got := isBVIgnoredByGit(tmpDir)
 			if got != tt.expected {
-				t.Errorf("isBVInGitignore() = %v, want %v", got, tt.expected)
+				t.Errorf("isBVIgnoredByGit() = %v, want %v", got, tt.expected)
 			}
 		})
 	}
 }
 
-func TestIsBVInGitignore_FileNotExists(t *testing.T) {
+func TestIsBVIgnoredByGit_NotAGitRepo(t *testing.T) {
 	tmpDir := t.TempDir()
-	gitignorePath := filepath.Join(tmpDir, ".gitignore")
 
-	_, err := isBVInGitignore(gitignorePath)
-	if !os.IsNotExist(err) {
-		t.Errorf("expected IsNotExist error, got %v", err)
+	// Not a git repo, git check-ignore will fail
+	got := isBVIgnoredByGit(tmpDir)
+	if got != false {
+		t.Errorf("isBVIgnoredByGit() in non-git dir = %v, want false", got)
 	}
 }
 
@@ -193,8 +172,13 @@ func TestAppendToGitignore(t *testing.T) {
 }
 
 func TestEnsureBVInGitignore(t *testing.T) {
+	// Isolate from user's global gitconfig
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+
 	t.Run("creates gitignore if not exists", func(t *testing.T) {
 		tmpDir := t.TempDir()
+		initGitRepo(t, tmpDir)
 
 		if err := EnsureBVInGitignore(tmpDir); err != nil {
 			t.Fatalf("EnsureBVInGitignore() error = %v", err)
@@ -212,6 +196,7 @@ func TestEnsureBVInGitignore(t *testing.T) {
 
 	t.Run("adds to existing gitignore", func(t *testing.T) {
 		tmpDir := t.TempDir()
+		initGitRepo(t, tmpDir)
 		gitignorePath := filepath.Join(tmpDir, ".gitignore")
 
 		// Create existing .gitignore
@@ -238,6 +223,7 @@ func TestEnsureBVInGitignore(t *testing.T) {
 
 	t.Run("idempotent - doesn't duplicate", func(t *testing.T) {
 		tmpDir := t.TempDir()
+		initGitRepo(t, tmpDir)
 		gitignorePath := filepath.Join(tmpDir, ".gitignore")
 
 		// Create existing .gitignore with .bv/ already present
@@ -263,6 +249,7 @@ func TestEnsureBVInGitignore(t *testing.T) {
 
 	t.Run("recognizes existing .bv pattern", func(t *testing.T) {
 		tmpDir := t.TempDir()
+		initGitRepo(t, tmpDir)
 		gitignorePath := filepath.Join(tmpDir, ".gitignore")
 
 		// Create existing .gitignore with .bv (without slash)
@@ -284,9 +271,31 @@ func TestEnsureBVInGitignore(t *testing.T) {
 			t.Errorf("should not add when .bv already present, got:\n%s", content)
 		}
 	})
+
+	t.Run("non-git directory still creates gitignore", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// Not a git repo - git check-ignore will fail, so we'll add .bv/
+
+		if err := EnsureBVInGitignore(tmpDir); err != nil {
+			t.Fatalf("EnsureBVInGitignore() error = %v", err)
+		}
+
+		content, err := os.ReadFile(filepath.Join(tmpDir, ".gitignore"))
+		if err != nil {
+			t.Fatalf("failed to read .gitignore: %v", err)
+		}
+
+		if !strings.Contains(string(content), ".bv/") {
+			t.Errorf("expected .bv/ in .gitignore, got:\n%s", content)
+		}
+	})
 }
 
 func TestEnsureBVInGitignore_UsesCurrentDir(t *testing.T) {
+	// Isolate from user's global gitconfig
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+
 	// Save current directory
 	origDir, err := os.Getwd()
 	if err != nil {
@@ -295,6 +304,7 @@ func TestEnsureBVInGitignore_UsesCurrentDir(t *testing.T) {
 	defer os.Chdir(origDir)
 
 	tmpDir := t.TempDir()
+	initGitRepo(t, tmpDir)
 	if err := os.Chdir(tmpDir); err != nil {
 		t.Fatal(err)
 	}

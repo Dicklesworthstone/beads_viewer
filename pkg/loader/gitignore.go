@@ -3,23 +3,21 @@
 package loader
 
 import (
-	"bufio"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"strings"
 )
 
-// EnsureBVInGitignore ensures that .bv/ is listed in the project's .gitignore file.
+// EnsureBVInGitignore ensures that .bv/ is ignored by git.
 // This prevents bv-specific files (semantic search index, baselines, drift config, etc.)
 // from polluting the git repository.
 //
 // The function is idempotent and safe to call multiple times.
-// It will:
-//   - Create .gitignore if it doesn't exist
-//   - Add ".bv/" if it's not already present (checks for .bv, .bv/, .bv/*, etc.)
-//   - Preserve existing file content and formatting
+// It uses git check-ignore to detect if .bv is already ignored (respecting all
+// gitignore sources: .gitignore, .git/info/exclude, global gitignore, etc.).
+// If not ignored, it appends ".bv/" to the project's .gitignore file.
 //
-// Returns nil on success, or an error if the file cannot be read/written.
+// Returns nil on success, or an error if the file cannot be written.
 func EnsureBVInGitignore(projectDir string) error {
 	if projectDir == "" {
 		var err error
@@ -29,71 +27,25 @@ func EnsureBVInGitignore(projectDir string) error {
 		}
 	}
 
-	gitignorePath := filepath.Join(projectDir, ".gitignore")
-
-	// Check if .bv is already in .gitignore
-	alreadyPresent, err := isBVInGitignore(gitignorePath)
-	if err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if alreadyPresent {
+	// Check if .bv is already ignored by git
+	if isBVIgnoredByGit(projectDir) {
 		return nil
 	}
 
 	// Append .bv/ to .gitignore
+	gitignorePath := filepath.Join(projectDir, ".gitignore")
 	return appendToGitignore(gitignorePath, ".bv/")
 }
 
-// isBVInGitignore checks if .bv is already covered by the .gitignore file.
-// It returns true if any of these patterns are found:
-//   - .bv
-//   - .bv/
-//   - .bv/*
-//   - .bv/**
-func isBVInGitignore(path string) (bool, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		// Skip empty lines and comments
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		// Check for patterns that would cover .bv/
-		if matchesBVPattern(line) {
-			return true, nil
-		}
-	}
-
-	return false, scanner.Err()
-}
-
-// matchesBVPattern checks if a gitignore line covers the .bv directory.
-func matchesBVPattern(line string) bool {
-	// Normalize: remove leading/trailing slashes for comparison
-	normalized := strings.TrimPrefix(line, "/")
-
-	// Exact matches for .bv directory
-	patterns := []string{
-		".bv",
-		".bv/",
-		".bv/*",
-		".bv/**",
-		".bv/**/*",
-	}
-
-	for _, pattern := range patterns {
-		if normalized == pattern {
-			return true
-		}
-	}
-
-	return false
+// isBVIgnoredByGit uses git check-ignore to determine if .bv is already ignored.
+// This is more robust than manual parsing since it respects all gitignore sources:
+// .gitignore, .git/info/exclude, global gitignore, and nested .gitignore files.
+func isBVIgnoredByGit(projectDir string) bool {
+	cmd := exec.Command("git", "check-ignore", "-q", ".bv/")
+	cmd.Dir = projectDir
+	err := cmd.Run()
+	// Exit code 0 means the path is ignored, exit code 1 means it's not ignored
+	return err == nil
 }
 
 // appendToGitignore appends a pattern to the .gitignore file.
