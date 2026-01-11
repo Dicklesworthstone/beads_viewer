@@ -124,7 +124,7 @@ function Main {
             throw "go install failed with exit code $LASTEXITCODE"
         }
     } catch {
-        Write-Error2 "Failed to build $BIN_NAME: $_"
+        Write-Error2 "Failed to build ${BIN_NAME}: $_"
         exit 1
     }
 
