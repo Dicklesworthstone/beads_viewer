@@ -118,13 +118,12 @@ function Main {
     Write-Info "Building $BIN_NAME from source..."
 
     $env:CGO_ENABLED = "0"
-    try {
-        & go install "$REPO/cmd/$BIN_NAME@latest" 2>&1 | ForEach-Object { Write-Host $_ }
-        if ($LASTEXITCODE -ne 0) {
-            throw "go install failed with exit code $LASTEXITCODE"
-        }
-    } catch {
-        Write-Error2 "Failed to build ${BIN_NAME}: $_"
+    $prevErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & go install "$REPO/cmd/$BIN_NAME@latest" 2>&1 | ForEach-Object { Write-Host $_ }
+    $ErrorActionPreference = $prevErrorActionPreference
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error2 "Failed to build ${BIN_NAME}: go install exited with code $LASTEXITCODE"
         exit 1
     }
 
