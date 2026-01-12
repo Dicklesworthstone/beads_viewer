@@ -19,7 +19,7 @@
         # 1. Set vendorHash to: pkgs.lib.fakeHash
         # 2. Run: nix build .#bv 2>&1 | grep "got:"
         # 3. Replace vendorHash with the hash from "got:"
-        vendorHash = "sha256-rtIqTK6ez27kvPMbNjYSJKFLRbfUv88jq8bCfMkYjfs=";
+        vendorHash = "sha256-V8Bl5lW9vd7o1ZcQ6rvs3WJ1ueYX7xKnHTyRAASHlng=";
       in
       {
         packages = {
