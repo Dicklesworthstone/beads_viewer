@@ -24,6 +24,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/updater"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/util/beadid"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/watcher"
 
 	"github.com/atotto/clipboard"
@@ -78,6 +79,8 @@ const (
 	SortCreatedDesc                 // By creation date, newest first
 	SortPriority                    // By priority only (ascending)
 	SortUpdated                     // By last update, newest first
+	SortIDAsc                       // By bead/issue ID hierarchical ascending (parent -> child)
+	SortIDDesc                      // By bead/issue ID hierarchical descending
 	numSortModes                    // Keep this last - used for cycling
 )
 
@@ -92,6 +95,10 @@ func (s SortMode) String() string {
 		return "Priority"
 	case SortUpdated:
 		return "Updated"
+	case SortIDAsc:
+		return "ID ↑"
+	case SortIDDesc:
+		return "ID ↓"
 	default:
 		return "Default"
 	}
@@ -5974,6 +5981,12 @@ func (m *Model) sortFilteredItems(items []list.Item, issues []model.Issue) {
 		case SortUpdated:
 			// Most recently updated first
 			return iItem.Issue.UpdatedAt.After(jItem.Issue.UpdatedAt)
+		case SortIDAsc:
+			// Hierarchical ID ascending (parent -> child)
+			return beadid.Less(iItem.Issue.ID, jItem.Issue.ID)
+		case SortIDDesc:
+			// Hierarchical ID descending
+			return beadid.Less(jItem.Issue.ID, iItem.Issue.ID)
 		default:
 			// Default: Open first, then priority, then newest
 			iClosed := isClosedLikeStatus(iItem.Issue.Status)
@@ -5986,6 +5999,7 @@ func (m *Model) sortFilteredItems(items []list.Item, issues []model.Issue) {
 			}
 			return iItem.Issue.CreatedAt.After(jItem.Issue.CreatedAt)
 		}
+
 	})
 
 	// Reorder items and issues based on sorted indices
