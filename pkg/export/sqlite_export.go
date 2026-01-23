@@ -646,6 +646,7 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 			CreatedAt:   issue.CreatedAt,
 			UpdatedAt:   issue.UpdatedAt,
 			ClosedAt:    issue.ClosedAt,
+			CloseReason: issue.CloseReason,
 		}
 
 		if m := e.Metrics; m != nil {

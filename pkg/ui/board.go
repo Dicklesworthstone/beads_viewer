@@ -1658,6 +1658,14 @@ func (b *BoardModel) renderDetailPanel(width, height int) string {
 				content.WriteString("\n")
 			}
 
+			// Resolution (for closed issues with close_reason)
+			if issue.Status.IsClosed() && issue.CloseReason != nil && *issue.CloseReason != "" {
+				content.WriteString("\n---\n\n")
+				content.WriteString("**Resolution:**\n\n")
+				content.WriteString(*issue.CloseReason)
+				content.WriteString("\n")
+			}
+
 			// Timestamps
 			content.WriteString("\n---\n\n")
 			content.WriteString(fmt.Sprintf("*Created: %s*\n", FormatTimeRel(issue.CreatedAt)))

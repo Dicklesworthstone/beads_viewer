@@ -195,6 +195,12 @@ func GenerateMarkdown(issues []model.Issue, title string) (string, error) {
 			sb.WriteString(i.Notes + "\n\n")
 		}
 
+		// Resolution (for closed issues with close_reason)
+		if i.Status.IsClosed() && i.CloseReason != nil && *i.CloseReason != "" {
+			sb.WriteString("### Resolution\n\n")
+			sb.WriteString(*i.CloseReason + "\n\n")
+		}
+
 		if len(i.Dependencies) > 0 {
 			sb.WriteString("### Dependencies\n\n")
 			for _, dep := range i.Dependencies {

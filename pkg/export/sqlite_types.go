@@ -25,6 +25,7 @@ type ExportIssue struct {
 	CreatedAt   time.Time       `json:"created_at"`
 	UpdatedAt   time.Time       `json:"updated_at"`
 	ClosedAt    *time.Time      `json:"closed_at,omitempty"`
+	CloseReason *string         `json:"close_reason,omitempty"` // Resolution for closed issues
 
 	// Computed graph metrics
 	PageRank       float64  `json:"pagerank"`

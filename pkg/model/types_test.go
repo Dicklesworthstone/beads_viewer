@@ -595,9 +595,89 @@ func TestBurndownPoint_Struct(t *testing.T) {
 	}
 }
 
+func TestIssue_CloseReason_JSON(t *testing.T) {
+	// Test parsing close_reason from JSON
+	closeReason := "Completed successfully"
+	jsonStr := `{
+		"id": "TEST-1",
+		"title": "Test Issue",
+		"status": "closed",
+		"issue_type": "task",
+		"priority": 2,
+		"created_at": "2025-01-01T00:00:00Z",
+		"updated_at": "2025-01-01T00:00:00Z",
+		"closed_at": "2025-01-02T00:00:00Z",
+		"close_reason": "Completed successfully"
+	}`
+
+	var issue Issue
+	if err := json.Unmarshal([]byte(jsonStr), &issue); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	if issue.CloseReason == nil {
+		t.Errorf("CloseReason should not be nil")
+	}
+	if *issue.CloseReason != closeReason {
+		t.Errorf("CloseReason mismatch: got %q, want %q", *issue.CloseReason, closeReason)
+	}
+
+	// Test marshaling back to JSON
+	data, err := json.Marshal(issue)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	var roundTrip Issue
+	if err := json.Unmarshal(data, &roundTrip); err != nil {
+		t.Fatalf("json.Unmarshal round-trip failed: %v", err)
+	}
+
+	if roundTrip.CloseReason == nil {
+		t.Errorf("CloseReason should not be nil after round-trip")
+	}
+	if *roundTrip.CloseReason != closeReason {
+		t.Errorf("CloseReason round-trip mismatch: got %q, want %q", *roundTrip.CloseReason, closeReason)
+	}
+}
+
+func TestIssue_CloseReason_Optional(t *testing.T) {
+	// Test that close_reason is optional (backwards compatibility)
+	jsonStr := `{
+		"id": "TEST-1",
+		"title": "Test Issue",
+		"status": "closed",
+		"issue_type": "task",
+		"priority": 2,
+		"created_at": "2025-01-01T00:00:00Z",
+		"updated_at": "2025-01-01T00:00:00Z",
+		"closed_at": "2025-01-02T00:00:00Z"
+	}`
+
+	var issue Issue
+	if err := json.Unmarshal([]byte(jsonStr), &issue); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	if issue.CloseReason != nil {
+		t.Errorf("CloseReason should be nil when not present in JSON")
+	}
+
+	// Verify it doesn't appear in JSON when nil
+	data, err := json.Marshal(issue)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	if strings.Contains(string(data), "close_reason") {
+		t.Errorf("close_reason should be omitted when nil, got: %s", string(data))
+	}
+}
+
 func TestIssue_Clone(t *testing.T) {
 	now := time.Now()
 	closedAt := now.Add(-1 * time.Hour)
+	closeReason := "Fixed in v1.2.3"
 	estimatedMinutes := 60
 	externalRef := "JIRA-123"
 	compactedAt := now.Add(-2 * time.Hour)
@@ -615,6 +695,7 @@ func TestIssue_Clone(t *testing.T) {
 		CreatedAt:         now,
 		UpdatedAt:         now,
 		ClosedAt:          &closedAt,
+		CloseReason:       &closeReason,
 		ExternalRef:       &externalRef,
 		CompactedAt:       &compactedAt,
 		CompactedAtCommit: &compactedAtCommit,
@@ -652,6 +733,13 @@ func TestIssue_Clone(t *testing.T) {
 		t.Errorf("ClosedAt value mismatch")
 	}
 
+	if clone.CloseReason == original.CloseReason {
+		t.Errorf("CloseReason should be a new pointer")
+	}
+	if *clone.CloseReason != *original.CloseReason {
+		t.Errorf("CloseReason value mismatch")
+	}
+
 	// Verify slice fields are deep copied
 	if &clone.Labels == &original.Labels {
 		t.Errorf("Labels should be a new slice")
@@ -664,6 +752,11 @@ func TestIssue_Clone(t *testing.T) {
 	*clone.EstimatedMinutes = 120
 	if *original.EstimatedMinutes != 60 {
 		t.Errorf("Modifying clone affected original EstimatedMinutes")
+	}
+
+	*clone.CloseReason = "Modified reason"
+	if *original.CloseReason != "Fixed in v1.2.3" {
+		t.Errorf("Modifying clone affected original CloseReason")
 	}
 
 	clone.Labels[0] = "modified"
@@ -703,6 +796,9 @@ func TestIssue_Clone_NilFields(t *testing.T) {
 	}
 	if clone.ClosedAt != nil {
 		t.Errorf("ClosedAt should be nil")
+	}
+	if clone.CloseReason != nil {
+		t.Errorf("CloseReason should be nil")
 	}
 	if clone.Labels != nil {
 		t.Errorf("Labels should be nil")

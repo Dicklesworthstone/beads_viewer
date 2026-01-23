@@ -23,6 +23,7 @@ type Issue struct {
 	UpdatedAt          time.Time     `json:"updated_at"`
 	DueDate            *time.Time    `json:"due_date,omitempty"`
 	ClosedAt           *time.Time    `json:"closed_at,omitempty"`
+	CloseReason        *string       `json:"close_reason,omitempty"`
 	ExternalRef        *string       `json:"external_ref,omitempty"`
 	CompactionLevel    int           `json:"compaction_level,omitempty"`
 	CompactedAt        *time.Time    `json:"compacted_at,omitempty"`
@@ -45,6 +46,10 @@ func (i Issue) Clone() Issue {
 	if i.ClosedAt != nil {
 		v := *i.ClosedAt
 		clone.ClosedAt = &v
+	}
+	if i.CloseReason != nil {
+		v := *i.CloseReason
+		clone.CloseReason = &v
 	}
 	if i.DueDate != nil {
 		v := *i.DueDate

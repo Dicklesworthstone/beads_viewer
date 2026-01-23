@@ -74,6 +74,7 @@ type Recommendation struct {
 	Reasons     []string       `json:"reasons"`
 	UnblocksIDs []string       `json:"unblocks_ids,omitempty"`
 	BlockedBy   []string       `json:"blocked_by,omitempty"`
+	CloseReason *string        `json:"close_reason,omitempty"` // Resolution for closed issues
 }
 
 // QuickWin represents a low-effort, high-impact item
@@ -719,6 +720,7 @@ func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageConte
 			Action:      reasons.ActionHint,
 			Reasons:     reasons.All,
 			UnblocksIDs: unblocksMap[score.IssueID],
+			CloseReason: issue.CloseReason,
 		}
 		if len(blockedBy) > 0 {
 			rec.BlockedBy = blockedBy
