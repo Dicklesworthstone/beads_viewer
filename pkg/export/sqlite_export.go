@@ -286,12 +286,14 @@ func (e *SQLiteExporter) insertComments(db *sql.DB) error {
 	defer stmt.Close()
 
 	for _, issue := range e.Issues {
-		for _, comment := range issue.Comments {
+		for idx, comment := range issue.Comments {
 			if comment == nil {
 				continue
 			}
+			// Use composite ID to avoid conflicts in workspace mode
+			compositeID := fmt.Sprintf("%s_%d", issue.ID, idx+1)
 			_, err := stmt.Exec(
-				comment.ID,
+				compositeID,
 				issue.ID,
 				comment.Author,
 				comment.Text,

@@ -72,9 +72,10 @@ func createCoreTables(db *sql.DB) error {
 	}
 
 	// Comments table - issue discussion threads (bv-52)
+	// id is TEXT to support composite IDs (issue_id + index) in workspace mode
 	commentsSQL := `
 		CREATE TABLE IF NOT EXISTS comments (
-			id INTEGER PRIMARY KEY,
+			id TEXT PRIMARY KEY,
 			issue_id TEXT NOT NULL,
 			author TEXT,
 			text TEXT NOT NULL,
