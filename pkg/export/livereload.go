@@ -258,6 +258,13 @@ type injectingResponseWriter struct {
 	committed bool
 }
 
+func (w *injectingResponseWriter) WriteHeader(code int) {
+	// Remove Content-Length because we will inject extra bytes,
+	// making the original length incorrect.
+	w.Header().Del("Content-Length")
+	w.ResponseWriter.WriteHeader(code)
+}
+
 func (w *injectingResponseWriter) Write(b []byte) (int, error) {
 	if w.committed {
 		return w.ResponseWriter.Write(b)
