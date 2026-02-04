@@ -346,8 +346,7 @@ func TestRobotPlanWithRecipe(t *testing.T) {
 func TestRobotNextWithFilters(t *testing.T) {
 	bv := buildBvBinary(t)
 	env := t.TempDir()
-	writeBeads(t, env, `{"id":"BUG-1","title":"Bug issue","status":"open","priority":1,"issue_type":"bug","labels":["bug"]}
-{"id":"TASK-1","title":"Task issue","status":"open","priority":2,"issue_type":"task","labels":["feature"]}`)
+	writeBeads(t, env, `{"id":"BLOCKED-1","title":"Blocked issue","status":"blocked","priority":1,"issue_type":"task"}`)
 
 	cmd := exec.Command(bv, "--recipe", "actionable", "--robot-next")
 	cmd.Dir = env
@@ -359,6 +358,7 @@ func TestRobotNextWithFilters(t *testing.T) {
 	var payload struct {
 		ID       string `json:"id"`
 		DataHash string `json:"data_hash"`
+		Message  string `json:"message"`
 	}
 	if err := json.Unmarshal(out, &payload); err != nil {
 		t.Fatalf("robot-next json decode failed: %v\n%s", err, out)
@@ -367,7 +367,9 @@ func TestRobotNextWithFilters(t *testing.T) {
 	if payload.DataHash == "" {
 		t.Fatalf("robot-next missing data_hash")
 	}
-	// Result depends on recipe filtering, just verify we got valid output
+	if payload.ID != "" || payload.Message != "No actionable items available" {
+		t.Fatalf("expected no actionable items with recipe filter, got id=%q message=%q", payload.ID, payload.Message)
+	}
 }
 
 // TestRobotTriageQuickWins verifies quick_wins section is populated.
