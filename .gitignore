@@ -1,5 +1,6 @@
 beads_reference/
 /bv
+/bv-dev
 /main
 *.test
 cmd/bv/bv

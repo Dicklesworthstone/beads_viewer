@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -114,14 +113,9 @@ func LoadIssuesRecursive(repoPath string, maxDepth int) ([]model.Issue, error) {
 				issues[i].Labels = append(issues[i].Labels, repoLabel)
 			}
 
-			// Store repository metadata in Tags field
-			if issues[i].Tags == nil {
-				issues[i].Tags = make([]string, 0)
-			}
-			// Add repository path as metadata
-			repoPathTag := fmt.Sprintf("_repo_path:%s", ws.RepoPath)
-			if !containsTag(issues[i].Tags, repoPathTag) {
-				issues[i].Tags = append(issues[i].Tags, repoPathTag)
+			// Store repository name in SourceRepo field if not already set
+			if issues[i].SourceRepo == "" {
+				issues[i].SourceRepo = ws.RepoName
 			}
 		}
 
@@ -155,11 +149,3 @@ func containsLabel(labels []string, target string) bool {
 	return false
 }
 
-func containsTag(tags []string, target string) bool {
-	for _, tag := range tags {
-		if tag == target {
-			return true
-		}
-	}
-	return false
-}
