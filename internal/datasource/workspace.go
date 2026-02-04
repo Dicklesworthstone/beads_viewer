@@ -55,7 +55,16 @@ func DiscoverBeadsWorkspaces(root string, maxDepth int) []WorkspaceInfo {
 			return fs.SkipDir
 		}
 
-		rel := strings.TrimPrefix(strings.TrimPrefix(path, root), sep)
+		// Calculate depth based on repository path (parent of .beads), not beads dir itself
+		// This allows maxDepth to represent repository nesting depth, not directory path depth
+		var repoPath string
+		if name == ".beads" {
+			repoPath = filepath.Dir(path)
+		} else {
+			repoPath = path
+		}
+
+		rel := strings.TrimPrefix(strings.TrimPrefix(repoPath, root), sep)
 		if rel != "" {
 			if depth := len(strings.Split(rel, sep)); depth > maxDepth {
 				return fs.SkipDir
@@ -63,7 +72,6 @@ func DiscoverBeadsWorkspaces(root string, maxDepth int) []WorkspaceInfo {
 		}
 
 		if name == ".beads" {
-			repoPath := filepath.Dir(path)
 			repoName := filepath.Base(repoPath)
 
 			workspaces = append(workspaces, WorkspaceInfo{
@@ -71,7 +79,7 @@ func DiscoverBeadsWorkspaces(root string, maxDepth int) []WorkspaceInfo {
 				RepoPath: repoPath,
 				RepoName: repoName,
 			})
-			return fs.SkipDir
+			// Don't skip the directory - allow traversal to continue for nested repos
 		}
 		return nil
 	})
