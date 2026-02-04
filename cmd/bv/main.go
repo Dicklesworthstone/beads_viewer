@@ -120,6 +120,8 @@ func main() {
 	noHooks := flag.Bool("no-hooks", false, "Skip running hooks during export")
 	workspaceConfig := flag.String("workspace", "", "Load issues from workspace config file (.bv/workspace.yaml)")
 	repoFilter := flag.String("repo", "", "Filter issues by repository prefix (e.g., 'api-' or 'api')")
+	discoverRecursive := flag.Bool("discover-recursive", false, "Recursively discover all .beads directories in current folder and children")
+	discoverDepth := flag.Int("discover-depth", 3, "Maximum depth for recursive .beads discovery (default: 3)")
 	saveBaseline := flag.String("save-baseline", "", "Save current metrics as baseline with optional description")
 	baselineInfo := flag.Bool("baseline-info", false, "Show information about the current baseline")
 	checkDrift := flag.Bool("check-drift", false, "Check for drift from baseline (exit codes: 0=OK, 1=critical, 2=warning)")
@@ -1129,9 +1131,9 @@ func main() {
 		workspaceRoot := filepath.Dir(filepath.Dir(*workspaceConfig))
 		_ = loader.EnsureBVInGitignore(workspaceRoot)
 	} else {
-		// Load from single repo (original behavior)
+		// Load from single repo (original behavior) or recursive discovery
 		var err error
-		issues, err = datasource.LoadIssues("")
+		issues, err = datasource.LoadIssuesWithDiscovery("", *discoverRecursive, *discoverDepth)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
 			fmt.Fprintln(os.Stderr, "Make sure you are in a project initialized with 'bd init'.")
