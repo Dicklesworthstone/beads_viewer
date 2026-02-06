@@ -393,8 +393,10 @@ func generateQuickActions(issues []model.Issue) string {
 
 	// Unblock blocked items
 	if len(blockedIDs) > 0 {
-		sb.WriteString("# Update blocked items to in_progress when unblocked\n")
-		sb.WriteString(fmt.Sprintf("%s update %s -s in_progress\n", analysis.BeadsCLI(), strings.Join(blockedIDs, " ")))
+		sb.WriteString("# Claim blocked items when unblocked\n")
+		for _, id := range blockedIDs {
+			sb.WriteString(fmt.Sprintf("%s\n", analysis.ClaimCommand(id)))
+		}
 	}
 
 	sb.WriteString("```\n\n")
@@ -420,13 +422,13 @@ func generateIssueCommands(issue model.Issue) string {
 	switch issue.Status {
 	case model.StatusOpen:
 		sb.WriteString("# Start working on this issue\n")
-		sb.WriteString(fmt.Sprintf("%s update %s -s in_progress\n\n", analysis.BeadsCLI(), escapedID))
+		sb.WriteString(fmt.Sprintf("%s\n\n", analysis.ClaimCommand(escapedID)))
 	case model.StatusInProgress:
 		sb.WriteString("# Mark as complete\n")
 		sb.WriteString(fmt.Sprintf("%s close %s\n\n", analysis.BeadsCLI(), escapedID))
 	case model.StatusBlocked:
 		sb.WriteString("# Unblock and start working\n")
-		sb.WriteString(fmt.Sprintf("%s update %s -s in_progress\n\n", analysis.BeadsCLI(), escapedID))
+		sb.WriteString(fmt.Sprintf("%s\n\n", analysis.ClaimCommand(escapedID)))
 	}
 
 	// Common actions

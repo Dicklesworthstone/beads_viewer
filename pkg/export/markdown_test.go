@@ -1320,11 +1320,11 @@ func TestGenerateQuickActions_WithBlockedIssues(t *testing.T) {
 
 	result := generateQuickActions(issues)
 
-	if !strings.Contains(result, "# Update blocked items") {
+	if !strings.Contains(result, "# Claim blocked items") {
 		t.Error("Missing blocked items comment")
 	}
-	if !strings.Contains(result, analysis.BeadsCLI()+" update BLOCKED-1 -s in_progress") {
-		t.Error("Missing blocked update command")
+	if !strings.Contains(result, analysis.ClaimCommand("BLOCKED-1")) {
+		t.Error("Missing blocked claim command")
 	}
 }
 
@@ -1411,14 +1411,13 @@ func TestGenerateIssueCommands_OpenIssue(t *testing.T) {
 	if !strings.Contains(result, "# Start working on this issue") {
 		t.Error("Missing start working comment")
 	}
-	cli := analysis.BeadsCLI()
-	if !strings.Contains(result, cli+" update OPEN-1 -s in_progress") {
-		t.Error("Missing update to in_progress command")
+	if !strings.Contains(result, analysis.ClaimCommand("OPEN-1")) {
+		t.Error("Missing claim command for open issue")
 	}
-	if !strings.Contains(result, cli+" comment OPEN-1") {
+	if !strings.Contains(result, analysis.BeadsCLI()+" comment OPEN-1") {
 		t.Error("Missing comment command")
 	}
-	if !strings.Contains(result, cli+" show OPEN-1") {
+	if !strings.Contains(result, analysis.BeadsCLI()+" show OPEN-1") {
 		t.Error("Missing show command")
 	}
 }
@@ -1458,8 +1457,8 @@ func TestGenerateIssueCommands_BlockedIssue(t *testing.T) {
 	if !strings.Contains(result, "# Unblock and start working") {
 		t.Error("Missing unblock comment")
 	}
-	if !strings.Contains(result, analysis.BeadsCLI()+" update BLOCKED-1 -s in_progress") {
-		t.Error("Missing unblock command")
+	if !strings.Contains(result, analysis.ClaimCommand("BLOCKED-1")) {
+		t.Error("Missing unblock claim command")
 	}
 }
 

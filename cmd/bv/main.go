@@ -3009,7 +3009,7 @@ func main() {
 			sb.WriteString("#\n")
 			sb.WriteString("# To claim all listed items (uncomment to enable):\n")
 			for _, rec := range recs {
-				sb.WriteString(fmt.Sprintf("# bd update %s --status=in_progress\n", rec.ID))
+				sb.WriteString(fmt.Sprintf("# %s\n", analysis.ClaimCommand(rec.ID)))
 			}
 		}
 
