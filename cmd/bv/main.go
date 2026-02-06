@@ -2776,8 +2776,8 @@ func main() {
 				Score:         top.Score,
 				Reasons:       top.Reasons,
 				Unblocks:      top.Unblocks,
-				ClaimCmd:      fmt.Sprintf("bd update %s --status=in_progress", top.ID),
-				ShowCmd:       fmt.Sprintf("bd show %s", top.ID),
+				ClaimCmd:      analysis.ClaimCommand(top.ID),
+				ShowCmd:       analysis.ShowCommand(top.ID),
 			}
 
 			encoder := newRobotEncoder(os.Stdout)
@@ -2994,9 +2994,9 @@ func main() {
 				}
 
 				// Claim command
-				sb.WriteString(fmt.Sprintf("# To claim: bd update %s --status=in_progress\n", rec.ID))
+				sb.WriteString(fmt.Sprintf("# To claim: %s\n", analysis.ClaimCommand(rec.ID)))
 				// Show command
-				sb.WriteString(fmt.Sprintf("bd show %s\n", rec.ID))
+				sb.WriteString(fmt.Sprintf("%s\n", analysis.ShowCommand(rec.ID)))
 				sb.WriteString("\n")
 			}
 
@@ -3004,7 +3004,7 @@ func main() {
 			sb.WriteString("# === Quick Actions ===\n")
 			sb.WriteString("# To claim the top pick:\n")
 			if len(recs) > 0 {
-				sb.WriteString(fmt.Sprintf("# bd update %s --status=in_progress\n", recs[0].ID))
+				sb.WriteString(fmt.Sprintf("# %s\n", analysis.ClaimCommand(recs[0].ID)))
 			}
 			sb.WriteString("#\n")
 			sb.WriteString("# To claim all listed items (uncomment to enable):\n")

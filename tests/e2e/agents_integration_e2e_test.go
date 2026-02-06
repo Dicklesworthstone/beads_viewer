@@ -323,7 +323,7 @@ func TestAgentsE2E_LegacyBlurbMigration(t *testing.T) {
 	}
 
 	// Verify new content
-	if !strings.Contains(string(content), "bd ready") {
+	if !strings.Contains(string(content), "br ready") {
 		t.Error("Should have current blurb content")
 	}
 }

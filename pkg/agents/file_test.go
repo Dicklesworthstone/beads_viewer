@@ -90,7 +90,7 @@ func TestUpdateBlurbInFile(t *testing.T) {
 	if count != 1 {
 		t.Errorf("Expected exactly 1 blurb marker, got %d", count)
 	}
-	if !strings.Contains(contentStr, "bd ready") {
+	if !strings.Contains(contentStr, "br ready") {
 		t.Error("Updated blurb should contain current content")
 	}
 }

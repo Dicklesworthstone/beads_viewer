@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -372,28 +373,28 @@ func generateQuickActions(issues []model.Issue) string {
 	// Close in-progress items (most common action)
 	if len(inProgressIDs) > 0 {
 		sb.WriteString("# Close all in-progress items\n")
-		sb.WriteString(fmt.Sprintf("bd close %s\n\n", strings.Join(inProgressIDs, " ")))
+		sb.WriteString(fmt.Sprintf("%s close %s\n\n", analysis.BeadsCLI(), strings.Join(inProgressIDs, " ")))
 	}
 
 	// Close open items
 	if len(openIDs) > 0 && len(openIDs) <= 10 {
 		sb.WriteString("# Close all open items\n")
-		sb.WriteString(fmt.Sprintf("bd close %s\n\n", strings.Join(openIDs, " ")))
+		sb.WriteString(fmt.Sprintf("%s close %s\n\n", analysis.BeadsCLI(), strings.Join(openIDs, " ")))
 	} else if len(openIDs) > 10 {
 		sb.WriteString(fmt.Sprintf("# Close open items (%d total, showing first 10)\n", len(openIDs)))
-		sb.WriteString(fmt.Sprintf("bd close %s\n\n", strings.Join(openIDs[:10], " ")))
+		sb.WriteString(fmt.Sprintf("%s close %s\n\n", analysis.BeadsCLI(), strings.Join(openIDs[:10], " ")))
 	}
 
 	// Bulk priority update for high-priority items
 	if len(highPriorityIDs) > 0 {
 		sb.WriteString("# View high-priority items (P0/P1)\n")
-		sb.WriteString(fmt.Sprintf("bd show %s\n\n", strings.Join(highPriorityIDs, " ")))
+		sb.WriteString(fmt.Sprintf("%s show %s\n\n", analysis.BeadsCLI(), strings.Join(highPriorityIDs, " ")))
 	}
 
 	// Unblock blocked items
 	if len(blockedIDs) > 0 {
 		sb.WriteString("# Update blocked items to in_progress when unblocked\n")
-		sb.WriteString(fmt.Sprintf("bd update %s -s in_progress\n", strings.Join(blockedIDs, " ")))
+		sb.WriteString(fmt.Sprintf("%s update %s -s in_progress\n", analysis.BeadsCLI(), strings.Join(blockedIDs, " ")))
 	}
 
 	sb.WriteString("```\n\n")
@@ -419,24 +420,24 @@ func generateIssueCommands(issue model.Issue) string {
 	switch issue.Status {
 	case model.StatusOpen:
 		sb.WriteString("# Start working on this issue\n")
-		sb.WriteString(fmt.Sprintf("bd update %s -s in_progress\n\n", escapedID))
+		sb.WriteString(fmt.Sprintf("%s update %s -s in_progress\n\n", analysis.BeadsCLI(), escapedID))
 	case model.StatusInProgress:
 		sb.WriteString("# Mark as complete\n")
-		sb.WriteString(fmt.Sprintf("bd close %s\n\n", escapedID))
+		sb.WriteString(fmt.Sprintf("%s close %s\n\n", analysis.BeadsCLI(), escapedID))
 	case model.StatusBlocked:
 		sb.WriteString("# Unblock and start working\n")
-		sb.WriteString(fmt.Sprintf("bd update %s -s in_progress\n\n", escapedID))
+		sb.WriteString(fmt.Sprintf("%s update %s -s in_progress\n\n", analysis.BeadsCLI(), escapedID))
 	}
 
 	// Common actions
 	sb.WriteString("# Add a comment\n")
-	sb.WriteString(fmt.Sprintf("bd comment %s 'Your comment here'\n\n", escapedID))
+	sb.WriteString(fmt.Sprintf("%s comment %s 'Your comment here'\n\n", analysis.BeadsCLI(), escapedID))
 
 	sb.WriteString("# Change priority (0=Critical, 1=High, 2=Medium, 3=Low)\n")
-	sb.WriteString(fmt.Sprintf("bd update %s -p 1\n\n", escapedID))
+	sb.WriteString(fmt.Sprintf("%s update %s -p 1\n\n", analysis.BeadsCLI(), escapedID))
 
 	sb.WriteString("# View full details\n")
-	sb.WriteString(fmt.Sprintf("bd show %s\n", escapedID))
+	sb.WriteString(fmt.Sprintf("%s show %s\n", analysis.BeadsCLI(), escapedID))
 
 	sb.WriteString("```\n\n")
 	sb.WriteString("</details>\n\n")

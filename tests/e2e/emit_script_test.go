@@ -39,8 +39,8 @@ func TestEmitScript_BashAndFish(t *testing.T) {
 			if tt.wantExtra != "" && !strings.Contains(s, tt.wantExtra) {
 				t.Fatalf("missing %q:\n%s", tt.wantExtra, s)
 			}
-			if !strings.Contains(s, "bd show A") {
-				t.Fatalf("missing bd show command for A:\n%s", s)
+			if !strings.Contains(s, "show A") {
+				t.Fatalf("missing show command for A:\n%s", s)
 			}
 			if !strings.Contains(s, "# Data hash:") {
 				t.Fatalf("missing data hash header:\n%s", s)

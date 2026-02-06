@@ -26,7 +26,7 @@ const AgentBlurb = `<!-- bv-agent-instructions-v1 -->
 
 ## Beads Workflow Integration
 
-This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) for issue tracking. Issues are stored in ` + "`" + `.beads/` + "`" + ` and tracked in git.
+This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) for issue tracking. Issues are stored in ` + "`" + `.beads/` + "`" + ` and tracked in git. Use ` + "`" + `br` + "`" + ` for all mutations.
 
 ### Essential Commands
 
@@ -34,31 +34,31 @@ This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_view
 # View issues (launches TUI - avoid in automated sessions)
 bv
 
-# CLI commands for agents (use these instead)
-bd ready              # Show issues ready to work (no blockers)
-bd list --status=open # All open issues
-bd show <id>          # Full issue details with dependencies
-bd create --title="..." --type=task --priority=2
-bd update <id> --status=in_progress
-bd close <id> --reason="Completed"
-bd close <id1> <id2>  # Close multiple issues at once
-bd sync               # Commit and push changes
+# CLI commands for agents (use br, not bd)
+br ready              # Show issues ready to work (no blockers)
+br list --status=open # All open issues
+br show <id>          # Full issue details with dependencies
+br create --title="..." --type=task --priority=2
+br update <id> --claim # Atomic: sets assignee + in_progress, fails if already claimed
+br close <id> --reason="Completed"
+br close <id1> <id2>  # Close multiple issues at once
+br sync --flush-only  # Export DB to JSONL
 ` + "```" + `
 
 ### Workflow Pattern
 
-1. **Start**: Run ` + "`" + `bd ready` + "`" + ` to find actionable work
-2. **Claim**: Use ` + "`" + `bd update <id> --status=in_progress` + "`" + `
+1. **Start**: Run ` + "`" + `br ready` + "`" + ` to find actionable work
+2. **Claim**: Use ` + "`" + `br update <id> --claim` + "`" + ` (atomic — fails if another agent already claimed it)
 3. **Work**: Implement the task
-4. **Complete**: Use ` + "`" + `bd close <id>` + "`" + `
-5. **Sync**: Always run ` + "`" + `bd sync` + "`" + ` at session end
+4. **Complete**: Use ` + "`" + `br close <id>` + "`" + `
+5. **Sync**: Always run ` + "`" + `br sync --flush-only` + "`" + ` at session end
 
 ### Key Concepts
 
-- **Dependencies**: Issues can block other issues. ` + "`" + `bd ready` + "`" + ` shows only unblocked work.
+- **Dependencies**: Issues can block other issues. ` + "`" + `br ready` + "`" + ` shows only unblocked work.
 - **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
 - **Types**: task, bug, feature, epic, question, docs
-- **Blocking**: ` + "`" + `bd dep add <issue> <depends-on>` + "`" + ` to add dependencies
+- **Blocking**: ` + "`" + `br dep add <issue> <depends-on>` + "`" + ` to add dependencies
 
 ### Session Protocol
 
@@ -67,19 +67,18 @@ bd sync               # Commit and push changes
 ` + "```" + `bash
 git status              # Check what changed
 git add <files>         # Stage code changes
-bd sync                 # Commit beads changes
-git commit -m "..."     # Commit code
-bd sync                 # Commit any new beads changes
+br sync --flush-only    # Export beads changes to JSONL
+git commit -m "..."     # Commit everything
 git push                # Push to remote
 ` + "```" + `
 
 ### Best Practices
 
-- Check ` + "`" + `bd ready` + "`" + ` at session start to find available work
+- Check ` + "`" + `br ready` + "`" + ` at session start to find available work
 - Update status as you work (in_progress → closed)
-- Create new issues with ` + "`" + `bd create` + "`" + ` when you discover tasks
+- Create new issues with ` + "`" + `br create` + "`" + ` when you discover tasks
 - Use descriptive titles and set appropriate priority/type
-- Always ` + "`" + `bd sync` + "`" + ` before ending session
+- Always ` + "`" + `br sync --flush-only` + "`" + ` before ending session
 
 <!-- end-bv-agent-instructions -->`
 

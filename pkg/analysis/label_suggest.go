@@ -239,7 +239,7 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 			fmt.Sprintf("Consider adding label '%s'", match.Label),
 			match.Reason,
 			match.Confidence,
-		).WithAction(fmt.Sprintf("bd update %s --add-label=%s", match.IssueID, match.Label)).
+		).WithAction(fmt.Sprintf("%s update %s --add-label=%s", BeadsCLI(), match.IssueID, match.Label)).
 			WithMetadata("suggested_label", match.Label).
 			WithMetadata("matched_keywords", match.MatchedWords)
 

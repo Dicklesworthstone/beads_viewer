@@ -1286,10 +1286,11 @@ func TestGenerateQuickActions_WithOpenIssues(t *testing.T) {
 	if !strings.Contains(result, "## Quick Actions") {
 		t.Error("Missing Quick Actions header")
 	}
-	if !strings.Contains(result, "bd close OPEN-1 OPEN-2") {
+	cli := analysis.BeadsCLI()
+	if !strings.Contains(result, cli+" close OPEN-1 OPEN-2") {
 		t.Error("Missing bulk close command")
 	}
-	if !strings.Contains(result, "bd show OPEN-2") {
+	if !strings.Contains(result, cli+" show OPEN-2") {
 		t.Error("Missing high-priority show command (P1)")
 	}
 }
@@ -1306,7 +1307,7 @@ func TestGenerateQuickActions_WithInProgressIssues(t *testing.T) {
 	if !strings.Contains(result, "# Close all in-progress items") {
 		t.Error("Missing in-progress close comment")
 	}
-	if !strings.Contains(result, "bd close PROG-1 PROG-2") {
+	if !strings.Contains(result, analysis.BeadsCLI()+" close PROG-1 PROG-2") {
 		t.Error("Missing in-progress bulk close command")
 	}
 }
@@ -1322,7 +1323,7 @@ func TestGenerateQuickActions_WithBlockedIssues(t *testing.T) {
 	if !strings.Contains(result, "# Update blocked items") {
 		t.Error("Missing blocked items comment")
 	}
-	if !strings.Contains(result, "bd update BLOCKED-1 -s in_progress") {
+	if !strings.Contains(result, analysis.BeadsCLI()+" update BLOCKED-1 -s in_progress") {
 		t.Error("Missing blocked update command")
 	}
 }
@@ -1370,11 +1371,12 @@ func TestGenerateQuickActions_ManyOpenIssues(t *testing.T) {
 	if !strings.Contains(result, "OPEN-9") {
 		t.Error("Missing 10th issue (OPEN-9) in command")
 	}
-	// Extract the bd close command line to verify truncation
+	// Extract the close command line to verify truncation
 	// OPEN-10 should NOT appear in the bulk close command
-	closeIdx := strings.Index(result, "bd close OPEN-0")
+	closeCmd := analysis.BeadsCLI() + " close OPEN-0"
+	closeIdx := strings.Index(result, closeCmd)
 	if closeIdx == -1 {
-		t.Fatal("Missing bd close command")
+		t.Fatal("Missing close command")
 	}
 	// Get the line containing the close command
 	lineEnd := strings.Index(result[closeIdx:], "\n")
@@ -1409,13 +1411,14 @@ func TestGenerateIssueCommands_OpenIssue(t *testing.T) {
 	if !strings.Contains(result, "# Start working on this issue") {
 		t.Error("Missing start working comment")
 	}
-	if !strings.Contains(result, "bd update OPEN-1 -s in_progress") {
+	cli := analysis.BeadsCLI()
+	if !strings.Contains(result, cli+" update OPEN-1 -s in_progress") {
 		t.Error("Missing update to in_progress command")
 	}
-	if !strings.Contains(result, "bd comment OPEN-1") {
+	if !strings.Contains(result, cli+" comment OPEN-1") {
 		t.Error("Missing comment command")
 	}
-	if !strings.Contains(result, "bd show OPEN-1") {
+	if !strings.Contains(result, cli+" show OPEN-1") {
 		t.Error("Missing show command")
 	}
 }
@@ -1435,7 +1438,7 @@ func TestGenerateIssueCommands_InProgressIssue(t *testing.T) {
 	if !strings.Contains(result, "# Mark as complete") {
 		t.Error("Missing mark complete comment")
 	}
-	if !strings.Contains(result, "bd close PROG-1") {
+	if !strings.Contains(result, analysis.BeadsCLI()+" close PROG-1") {
 		t.Error("Missing close command")
 	}
 }
@@ -1455,7 +1458,7 @@ func TestGenerateIssueCommands_BlockedIssue(t *testing.T) {
 	if !strings.Contains(result, "# Unblock and start working") {
 		t.Error("Missing unblock comment")
 	}
-	if !strings.Contains(result, "bd update BLOCKED-1 -s in_progress") {
+	if !strings.Contains(result, analysis.BeadsCLI()+" update BLOCKED-1 -s in_progress") {
 		t.Error("Missing unblock command")
 	}
 }
@@ -1546,7 +1549,7 @@ func TestGenerateMarkdown_IncludesPerIssueCommands(t *testing.T) {
 	if !strings.Contains(md, "📋 Commands") {
 		t.Error("Missing Commands summary text")
 	}
-	if !strings.Contains(md, "bd update CMD-1") {
+	if !strings.Contains(md, analysis.BeadsCLI()+" update CMD-1") {
 		t.Error("Missing per-issue update command")
 	}
 }

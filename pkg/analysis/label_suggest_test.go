@@ -447,8 +447,8 @@ func TestSuggestLabels_SuggestionFormat(t *testing.T) {
 	if sug.ActionCommand == "" {
 		t.Error("ActionCommand is empty")
 	}
-	if !strings.Contains(sug.ActionCommand, "bd update") {
-		t.Errorf("ActionCommand should contain 'bd update', got: %s", sug.ActionCommand)
+	if !strings.Contains(sug.ActionCommand, BeadsCLI()+" update") {
+		t.Errorf("ActionCommand should contain '%s update', got: %s", BeadsCLI(), sug.ActionCommand)
 	}
 	if !strings.Contains(sug.ActionCommand, "--add-label") {
 		t.Errorf("ActionCommand should contain '--add-label', got: %s", sug.ActionCommand)
