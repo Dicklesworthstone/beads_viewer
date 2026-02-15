@@ -2387,7 +2387,7 @@ This feedback loop improves correlation accuracy over time—confirmed correlati
 
 ## 🤖 Cass Integration: AI Session Correlation (Optional)
 
-`bv` optionally integrates with [**cass**](https://github.com/Dicklesworthstone/cass) (Claude Agent Session Store)—a tool that captures and indexes coding sessions from AI assistants like Claude. When cass is installed, `bv` automatically enhances its correlation capabilities with session-based insights.
+`bv` optionally integrates with [**cass**](https://github.com/Dicklesworthstone/coding_agent_session_search) (Claude Agent Session Store)—a tool that captures and indexes coding sessions from AI assistants like Claude. When cass is installed, `bv` automatically enhances its correlation capabilities with session-based insights.
 
 ### How It Works
 
@@ -2471,7 +2471,7 @@ When cass is healthy, the status bar shows agent activity:
 ### Installing Cass
 
 ```bash
-# Install cass (see https://github.com/Dicklesworthstone/cass for full docs)
+# Install cass (see https://github.com/Dicklesworthstone/coding_agent_session_search for full docs)
 brew install dicklesworthstone/tap/cass   # macOS
 # or
 cargo install cass                         # From source
