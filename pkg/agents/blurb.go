@@ -11,77 +11,77 @@ import (
 
 // BlurbVersion is the current version of the agent instructions blurb.
 // Increment this when making breaking changes to the blurb format.
-const BlurbVersion = 1
+const BlurbVersion = 2
 
 // BlurbStartMarker marks the beginning of injected agent instructions.
-const BlurbStartMarker = "<!-- bv-agent-instructions-v1 -->"
+const BlurbStartMarker = "<!-- beads-agent-instructions-v2 -->"
 
 // BlurbEndMarker marks the end of injected agent instructions.
-const BlurbEndMarker = "<!-- end-bv-agent-instructions -->"
+const BlurbEndMarker = "<!-- end-beads-agent-instructions -->"
 
 // AgentBlurb contains the instructions to be appended to AGENTS.md files.
-const AgentBlurb = `<!-- bv-agent-instructions-v1 -->
+const AgentBlurb = `<!-- beads-agent-instructions-v2 -->
 
 ---
 
 ## Beads Workflow Integration
 
-This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) for issue tracking. Issues are stored in ` + "`" + `.beads/` + "`" + ` and tracked in git.
+This project uses [beads](https://github.com/steveyegge/beads) for issue tracking. Issues live in ` + "`" + `.beads/` + "`" + ` and are tracked in git.
 
-### Essential Commands
+Two CLIs: **bd** (issue CRUD) and **bv** (graph-aware triage, read-only).
+
+### bd: Issue Management
 
 ` + "```" + `bash
-# View issues (launches TUI - avoid in automated sessions)
-bv
-
-# CLI commands for agents (use these instead)
-br ready              # Show issues ready to work (no blockers)
-br list --status=open # All open issues
-br show <id>          # Full issue details with dependencies
-br create --title="..." --type=task --priority=2
-br update <id> --status=in_progress
-br close <id> --reason="Completed"
-br close <id1> <id2>  # Close multiple issues at once
-br sync               # Commit and push changes
+bd ready              # Unblocked issues ready to work
+bd list --status=open # All open issues
+bd show <id>          # Full details with dependencies
+bd create --title="..." --type=task --priority=2
+bd update <id> --status=in_progress
+bd close <id>         # Mark complete
+bd close <id1> <id2>  # Close multiple
+bd dep add <a> <b>    # a depends on b
+bd sync               # Sync with git
 ` + "```" + `
 
-### Workflow Pattern
+### bv: Graph Analysis (read-only)
 
-1. **Start**: Run ` + "`" + `br ready` + "`" + ` to find actionable work
-2. **Claim**: Use ` + "`" + `br update <id> --status=in_progress` + "`" + `
+**NEVER run bare ` + "`" + `bv` + "`" + `** — it launches interactive TUI. Always use ` + "`" + `--robot-*` + "`" + ` flags:
+
+` + "```" + `bash
+bv --robot-triage     # Ranked picks, quick wins, blockers, health
+bv --robot-next       # Single top pick + claim command
+bv --robot-plan       # Parallel execution tracks
+bv --robot-alerts     # Stale issues, cascades, mismatches
+bv --robot-insights   # Full graph metrics: PageRank, betweenness, cycles
+` + "```" + `
+
+### Workflow
+
+1. **Start**: ` + "`" + `bd ready` + "`" + ` (or ` + "`" + `bv --robot-triage` + "`" + ` for graph analysis)
+2. **Claim**: ` + "`" + `bd update <id> --status=in_progress` + "`" + `
 3. **Work**: Implement the task
-4. **Complete**: Use ` + "`" + `br close <id>` + "`" + `
-5. **Sync**: Always run ` + "`" + `br sync` + "`" + ` at session end
+4. **Complete**: ` + "`" + `bd close <id>` + "`" + `
+5. **Sync**: ` + "`" + `bd sync` + "`" + ` at session end
+
+### Session Close Protocol
+
+` + "```" + `bash
+git status            # Check what changed
+git add <files>       # Stage code changes
+bd sync               # Commit beads changes
+git commit -m "..."   # Commit code
+bd sync               # Commit any new beads changes
+git push              # Push to remote
+` + "```" + `
 
 ### Key Concepts
 
-- **Dependencies**: Issues can block other issues. ` + "`" + `br ready` + "`" + ` shows only unblocked work.
-- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
+- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (numbers only)
 - **Types**: task, bug, feature, epic, question, docs
-- **Blocking**: ` + "`" + `br dep add <issue> <depends-on>` + "`" + ` to add dependencies
+- **Dependencies**: ` + "`" + `bd ready` + "`" + ` shows only unblocked work
 
-### Session Protocol
-
-**Before ending any session, run this checklist:**
-
-` + "```" + `bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-br sync                 # Commit beads changes
-git commit -m "..."     # Commit code
-br sync                 # Commit any new beads changes
-git push                # Push to remote
-` + "```" + `
-
-### Best Practices
-
-- Check ` + "`" + `br ready` + "`" + ` at session start to find available work
-- Update status as you work (in_progress → closed)
-- Create new issues with ` + "`" + `br create` + "`" + ` when you discover tasks
-- Use descriptive titles and set appropriate priority/type
-- Always ` + "`" + `br sync` + "`" + ` before ending session
-
-<!-- end-bv-agent-instructions -->`
+<!-- end-beads-agent-instructions -->`
 
 // SupportedAgentFiles lists the filenames that can contain agent instructions.
 var SupportedAgentFiles = []string{
@@ -92,7 +92,7 @@ var SupportedAgentFiles = []string{
 }
 
 // blurbVersionRegex extracts the version number from a blurb marker.
-var blurbVersionRegex = regexp.MustCompile(`<!-- bv-agent-instructions-v(\d+) -->`)
+var blurbVersionRegex = regexp.MustCompile(`<!-- beads-agent-instructions-v(\d+) -->`)
 
 // LegacyBlurbPatterns are markers that identify the old blurb format (pre-v1, no HTML markers).
 var LegacyBlurbPatterns = []string{
@@ -113,15 +113,20 @@ var legacyBlurbEndPattern = regexp.MustCompile(`(?m)bv already computes the hard
 // Used as fallback when the end pattern isn't found.
 var legacyBlurbNextSectionPattern = regexp.MustCompile(`(?m)^#{1,2}\s+[^#]`)
 
-// ContainsBlurb checks if the content already contains a beads_viewer agent blurb.
+// ContainsBlurb checks if the content contains the current beads agent blurb (v2+).
 func ContainsBlurb(content string) bool {
-	return strings.Contains(content, "<!-- bv-agent-instructions-v")
+	return strings.Contains(content, "<!-- beads-agent-instructions-v")
 }
 
-// ContainsLegacyBlurb checks if the content contains the old-format blurb (pre-v1, no HTML markers).
-// Requires all 4 legacy patterns to match to avoid false positives on content that
-// merely references robot flags (like the current AGENTS.md documentation).
+// ContainsLegacyBlurb checks if the content contains any old-format blurb:
+// the bv- or br- HTML marker formats, or the very old pre-v1 no-marker format.
 func ContainsLegacyBlurb(content string) bool {
+	// Check for structured legacy formats (bv- and br- HTML markers)
+	if strings.Contains(content, "<!-- bv-agent-instructions-v") ||
+		strings.Contains(content, "<!-- br-agent-instructions-v") {
+		return true
+	}
+	// Check for very old format (pre-v1, no HTML markers)
 	if !legacyBlurbStartPattern.MatchString(content) {
 		return false
 	}
@@ -177,23 +182,36 @@ func AppendBlurb(content string) string {
 }
 
 // RemoveBlurb removes an existing blurb from the content.
+// Handles all known marker formats: beads- (current), bv- and br- (legacy).
 func RemoveBlurb(content string) string {
-	startIdx := strings.Index(content, "<!-- bv-agent-instructions-v")
-	if startIdx == -1 {
-		return content
+	type markerPair struct {
+		start string
+		end   string
 	}
-	endIdx := strings.Index(content, BlurbEndMarker)
-	if endIdx == -1 {
-		return content
+	pairs := []markerPair{
+		{"<!-- beads-agent-instructions-v", "<!-- end-beads-agent-instructions -->"},
+		{"<!-- bv-agent-instructions-v", "<!-- end-bv-agent-instructions -->"},
+		{"<!-- br-agent-instructions-v", "<!-- end-br-agent-instructions -->"},
 	}
-	endIdx += len(BlurbEndMarker)
-	for endIdx < len(content) && (content[endIdx] == '\n' || content[endIdx] == '\r') {
-		endIdx++
+	for _, pair := range pairs {
+		startIdx := strings.Index(content, pair.start)
+		if startIdx == -1 {
+			continue
+		}
+		endIdx := strings.Index(content, pair.end)
+		if endIdx == -1 {
+			continue
+		}
+		endIdx += len(pair.end)
+		for endIdx < len(content) && (content[endIdx] == '\n' || content[endIdx] == '\r') {
+			endIdx++
+		}
+		for startIdx > 0 && (content[startIdx-1] == '\n' || content[startIdx-1] == '\r') {
+			startIdx--
+		}
+		return content[:startIdx] + content[endIdx:]
 	}
-	for startIdx > 0 && (content[startIdx-1] == '\n' || content[startIdx-1] == '\r') {
-		startIdx--
-	}
-	return content[:startIdx] + content[endIdx:]
+	return content
 }
 
 // RemoveLegacyBlurb removes the old-format blurb (pre-v1, no HTML markers) from content.

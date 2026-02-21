@@ -56,8 +56,8 @@ func TestDetectAgentFile(t *testing.T) {
 		if !detection.HasBlurb {
 			t.Error("Expected HasBlurb to be true")
 		}
-		if detection.BlurbVersion != 1 {
-			t.Errorf("Expected BlurbVersion 1, got %d", detection.BlurbVersion)
+		if detection.BlurbVersion != BlurbVersion {
+			t.Errorf("Expected BlurbVersion %d, got %d", BlurbVersion, detection.BlurbVersion)
 		}
 		if detection.NeedsBlurb() {
 			t.Error("Expected NeedsBlurb() to return false")

@@ -22,14 +22,19 @@ func TestContainsBlurb(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:     "has blurb v1",
-			content:  "# My AGENTS.md\n\n<!-- bv-agent-instructions-v1 -->\nSome content\n<!-- end-bv-agent-instructions -->",
+			name:     "has blurb v2",
+			content:  "# My AGENTS.md\n\n<!-- beads-agent-instructions-v2 -->\nSome content\n<!-- end-beads-agent-instructions -->",
 			expected: true,
 		},
 		{
-			name:     "has blurb v2 (future)",
-			content:  "# My AGENTS.md\n\n<!-- bv-agent-instructions-v2 -->\nSome content\n<!-- end-bv-agent-instructions -->",
+			name:     "has blurb v3 (future)",
+			content:  "# My AGENTS.md\n\n<!-- beads-agent-instructions-v3 -->\nSome content\n<!-- end-beads-agent-instructions -->",
 			expected: true,
+		},
+		{
+			name:     "bv marker is legacy (not ContainsBlurb)",
+			content:  "# My AGENTS.md\n\n<!-- bv-agent-instructions-v1 -->\nSome content\n<!-- end-bv-agent-instructions -->",
+			expected: false,
 		},
 	}
 
@@ -56,17 +61,17 @@ func TestGetBlurbVersion(t *testing.T) {
 		},
 		{
 			name:     "version 1",
-			content:  "<!-- bv-agent-instructions-v1 -->",
+			content:  "<!-- beads-agent-instructions-v1 -->",
 			expected: 1,
 		},
 		{
-			name:     "version 2 (future)",
-			content:  "<!-- bv-agent-instructions-v2 -->",
+			name:     "version 2 (current)",
+			content:  "<!-- beads-agent-instructions-v2 -->",
 			expected: 2,
 		},
 		{
 			name:     "version 10 (multi-digit)",
-			content:  "<!-- bv-agent-instructions-v10 -->",
+			content:  "<!-- beads-agent-instructions-v10 -->",
 			expected: 10,
 		},
 	}
@@ -96,8 +101,8 @@ func TestAppendBlurb(t *testing.T) {
 	}
 
 	// Should contain key content
-	if !strings.Contains(result, "br ready") {
-		t.Error("AppendBlurb() result missing 'br ready' command")
+	if !strings.Contains(result, "bd ready") {
+		t.Error("AppendBlurb() result missing 'bd ready' command")
 	}
 
 	// Should preserve original content
@@ -144,7 +149,7 @@ func TestRemoveBlurbNoBlurb(t *testing.T) {
 
 func TestUpdateBlurb(t *testing.T) {
 	// Start with content containing old blurb
-	oldContent := "# My AGENTS.md\n\n<!-- bv-agent-instructions-v1 -->\nOld blurb content\n<!-- end-bv-agent-instructions -->\n"
+	oldContent := "# My AGENTS.md\n\n<!-- beads-agent-instructions-v1 -->\nOld blurb content\n<!-- end-bv-agent-instructions -->\n"
 	result := UpdateBlurb(oldContent)
 
 	// Should have exactly one blurb
@@ -154,7 +159,7 @@ func TestUpdateBlurb(t *testing.T) {
 	}
 
 	// Should have current blurb content
-	if !strings.Contains(result, "br ready") {
+	if !strings.Contains(result, "bd ready") {
 		t.Error("UpdateBlurb() result missing current blurb content")
 	}
 
@@ -177,8 +182,8 @@ func TestNeedsUpdate(t *testing.T) {
 		},
 		{
 			name:     "current version",
-			content:  "<!-- bv-agent-instructions-v1 -->",
-			expected: false, // v1 is current, no update needed
+			content:  "<!-- beads-agent-instructions-v2 -->",
+			expected: false, // v2 is current, no update needed
 		},
 	}
 
@@ -195,14 +200,14 @@ func TestNeedsUpdate(t *testing.T) {
 func TestAgentBlurbContent(t *testing.T) {
 	// Verify blurb contains essential commands
 	essentials := []string{
-		"br ready",
-		"br list",
-		"br show",
-		"br create",
-		"br update",
-		"br close",
-		"br sync",
-		"br dep add",
+		"bd ready",
+		"bd list",
+		"bd show",
+		"bd create",
+		"bd update",
+		"bd close",
+		"bd sync",
+		"bd dep add",
 	}
 
 	for _, cmd := range essentials {
@@ -284,6 +289,16 @@ func TestContainsLegacyBlurb(t *testing.T) {
 			name:     "has current blurb (not legacy)",
 			content:  "# My AGENTS.md\n\n" + AgentBlurb,
 			expected: false,
+		},
+		{
+			name:     "bv HTML marker is legacy",
+			content:  "# My AGENTS.md\n\n<!-- bv-agent-instructions-v1 -->\nContent\n<!-- end-bv-agent-instructions -->",
+			expected: true,
+		},
+		{
+			name:     "br HTML marker is legacy",
+			content:  "# My AGENTS.md\n\n<!-- br-agent-instructions-v1 -->\nContent\n<!-- end-br-agent-instructions -->",
+			expected: true,
 		},
 		{
 			name:     "partial legacy (missing patterns)",
@@ -417,12 +432,12 @@ func TestUpdateBlurbFromLegacy(t *testing.T) {
 	}
 
 	// Should have current blurb content
-	if !strings.Contains(result, "br ready") {
+	if !strings.Contains(result, "bd ready") {
 		t.Error("UpdateBlurb() from legacy missing current blurb content")
 	}
 
-	// Should NOT have legacy content
-	if strings.Contains(result, "--robot-insights") {
+	// Should NOT have legacy content (unique phrase only in old format)
+	if strings.Contains(result, "bv already computes the hard parts") {
 		t.Error("UpdateBlurb() from legacy still contains legacy content")
 	}
 
@@ -689,52 +704,52 @@ func TestGetBlurbVersionEdgeCases(t *testing.T) {
 	}{
 		{
 			name:     "v0 marker",
-			content:  "<!-- bv-agent-instructions-v0 -->",
+			content:  "<!-- beads-agent-instructions-v0 -->",
 			expected: 0, // v0 parses to 0
 		},
 		{
 			name:     "v99 high version",
-			content:  "<!-- bv-agent-instructions-v99 -->",
+			content:  "<!-- beads-agent-instructions-v99 -->",
 			expected: 99,
 		},
 		{
 			name:     "v999 very high version",
-			content:  "<!-- bv-agent-instructions-v999 -->",
+			content:  "<!-- beads-agent-instructions-v999 -->",
 			expected: 999,
 		},
 		{
 			name:     "malformed non-numeric version",
-			content:  "<!-- bv-agent-instructions-vX -->",
+			content:  "<!-- beads-agent-instructions-vX -->",
 			expected: 0,
 		},
 		{
 			name:     "malformed version with letters",
-			content:  "<!-- bv-agent-instructions-v1a -->",
+			content:  "<!-- beads-agent-instructions-v1a -->",
 			expected: 0, // \d+ matches "1" but then pattern expects " -->" not "a -->"
 		},
 		{
 			name:     "multiple version markers returns first",
-			content:  "<!-- bv-agent-instructions-v3 -->\nsome content\n<!-- bv-agent-instructions-v5 -->",
+			content:  "<!-- beads-agent-instructions-v3 -->\nsome content\n<!-- beads-agent-instructions-v5 -->",
 			expected: 3, // FindStringSubmatch returns first match
 		},
 		{
 			name:     "version marker in middle of content",
-			content:  "# Header\n\nSome text before\n\n<!-- bv-agent-instructions-v7 -->\n\nContent after",
+			content:  "# Header\n\nSome text before\n\n<!-- beads-agent-instructions-v7 -->\n\nContent after",
 			expected: 7,
 		},
 		{
 			name:     "version marker with extra spaces (no match)",
-			content:  "<!-- bv-agent-instructions-v 1 -->",
+			content:  "<!-- beads-agent-instructions-v 1 -->",
 			expected: 0, // regex requires no space before digits
 		},
 		{
 			name:     "partial marker (missing closing)",
-			content:  "<!-- bv-agent-instructions-v1",
+			content:  "<!-- beads-agent-instructions-v1",
 			expected: 0, // regex requires " -->"
 		},
 		{
 			name:     "negative-looking version (just digits)",
-			content:  "<!-- bv-agent-instructions-v-1 -->",
+			content:  "<!-- beads-agent-instructions-v-1 -->",
 			expected: 0, // \d+ doesn't match "-1"
 		},
 	}
@@ -758,9 +773,9 @@ func TestRemoveBlurbEdgeCases(t *testing.T) {
 	}{
 		{
 			name: "blurb at very start of file",
-			content: `<!-- bv-agent-instructions-v1 -->
+			content: `<!-- beads-agent-instructions-v1 -->
 Content
-<!-- end-bv-agent-instructions -->
+<!-- end-beads-agent-instructions -->
 
 ## Real Section
 `,
@@ -768,21 +783,21 @@ Content
 		},
 		{
 			name: "blurb with CRLF line endings",
-			content: "# Header\r\n\r\n<!-- bv-agent-instructions-v1 -->\r\n" +
-				"Content\r\n<!-- end-bv-agent-instructions -->\r\n\r\n## Footer\r\n",
+			content: "# Header\r\n\r\n<!-- beads-agent-instructions-v1 -->\r\n" +
+				"Content\r\n<!-- end-beads-agent-instructions -->\r\n\r\n## Footer\r\n",
 			expectPreserved: []string{"# Header", "## Footer"},
 		},
 		{
 			name: "blurb only content in file",
-			content: `<!-- bv-agent-instructions-v1 -->
+			content: `<!-- beads-agent-instructions-v1 -->
 Content
-<!-- end-bv-agent-instructions -->
+<!-- end-beads-agent-instructions -->
 `,
 			expectPreserved: []string{}, // should be empty or nearly empty
 		},
 		{
 			name:            "missing end marker",
-			content:         "# Header\n\n<!-- bv-agent-instructions-v1 -->\nContent without end",
+			content:         "# Header\n\n<!-- beads-agent-instructions-v1 -->\nContent without end",
 			expectPreserved: []string{"# Header", "Content without end"}, // unchanged
 		},
 	}
@@ -791,9 +806,14 @@ Content
 		t.Run(tt.name, func(t *testing.T) {
 			result := RemoveBlurb(tt.content)
 
-			// Should not contain markers
-			if strings.Contains(result, "<!-- bv-agent-instructions") &&
-				strings.Contains(result, "<!-- end-bv-agent-instructions -->") {
+			// Should not contain markers (checks all supported formats)
+			hasStart := strings.Contains(result, "<!-- beads-agent-instructions") ||
+				strings.Contains(result, "<!-- bv-agent-instructions") ||
+				strings.Contains(result, "<!-- br-agent-instructions")
+			hasEnd := strings.Contains(result, "<!-- end-beads-agent-instructions -->") ||
+				strings.Contains(result, "<!-- end-bv-agent-instructions -->") ||
+				strings.Contains(result, "<!-- end-br-agent-instructions -->")
+			if hasStart && hasEnd {
 				t.Error("RemoveBlurb() result still contains both markers")
 			}
 
@@ -823,7 +843,7 @@ func TestContainsAnyBlurbEdgeCases(t *testing.T) {
 --robot-plan
 bv already computes the hard parts for you.
 
-<!-- bv-agent-instructions-v1 -->
+<!-- beads-agent-instructions-v1 -->
 Current blurb
 <!-- end-bv-agent-instructions -->
 `,
@@ -831,7 +851,7 @@ Current blurb
 		},
 		{
 			name:     "only start marker no end",
-			content:  "<!-- bv-agent-instructions-v1 -->\nContent",
+			content:  "<!-- beads-agent-instructions-v1 -->\nContent",
 			expected: true, // ContainsBlurb checks for start marker only
 		},
 		{
@@ -841,7 +861,7 @@ Current blurb
 		},
 		{
 			name:     "marker inside code block",
-			content:  "```\n<!-- bv-agent-instructions-v1 -->\n```",
+			content:  "```\n<!-- beads-agent-instructions-v1 -->\n```",
 			expected: true, // simple string check doesn't parse markdown
 		},
 	}
