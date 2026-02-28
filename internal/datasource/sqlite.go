@@ -62,20 +62,55 @@ func (r *SQLiteReader) LoadIssues() ([]model.Issue, error) {
 	return r.LoadIssuesFiltered(nil)
 }
 
+// hasLabelsColumn reports whether the issues table has a labels column.
+// Some beads clients (e.g. br/beads-rs) store labels in a separate labels
+// table instead of a JSON column on the issues row.
+func (r *SQLiteReader) hasLabelsColumn() bool {
+	rows, err := r.db.Query("PRAGMA table_info(issues)")
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var dfltValue sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dfltValue, &pk); err != nil {
+			continue
+		}
+		if strings.EqualFold(name, "labels") {
+			return true
+		}
+	}
+	return false
+}
+
 // LoadIssuesFiltered reads issues matching the filter function
 func (r *SQLiteReader) LoadIssuesFiltered(filter func(*model.Issue) bool) ([]model.Issue, error) {
-	// Query for all non-tombstone issues
-	query := `
+	// Detect whether this is a native bv database (labels column on issues)
+	// or a br/beads-rs database (labels in a separate labels table).
+	// We check once per call; the result is stable for the lifetime of a query.
+	useLabelsColumn := r.hasLabelsColumn()
+
+	labelsExpr := "i.labels"
+	if !useLabelsColumn {
+		// Aggregate labels from the separate labels table as a JSON array.
+		// This handles br-format databases where labels live in their own table.
+		labelsExpr = `(SELECT json_group_array(label) FROM labels WHERE issue_id = i.id)`
+	}
+
+	query := fmt.Sprintf(`
 		SELECT
-			id, title, description, status, priority, issue_type,
-			assignee, estimated_minutes, created_at, updated_at,
-			due_date, closed_at, external_ref, compaction_level,
-			compacted_at, compacted_at_commit, original_size,
-			labels, design, acceptance_criteria, notes, source_repo
-		FROM issues
-		WHERE (tombstone IS NULL OR tombstone = 0)
-		ORDER BY updated_at DESC
-	`
+			i.id, i.title, i.description, i.status, i.priority, i.issue_type,
+			i.assignee, i.estimated_minutes, i.created_at, i.updated_at,
+			i.due_date, i.closed_at, i.external_ref, i.compaction_level,
+			i.compacted_at, i.compacted_at_commit, i.original_size,
+			%s, i.design, i.acceptance_criteria, i.notes, i.source_repo
+		FROM issues i
+		WHERE (i.tombstone IS NULL OR i.tombstone = 0)
+		ORDER BY i.updated_at DESC
+	`, labelsExpr)
 
 	rows, err := r.db.Query(query)
 	if err != nil {
