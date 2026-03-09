@@ -1481,6 +1481,32 @@ func TestExportPages_GraphLayoutNodesCovered(t *testing.T) {
 	}
 }
 
+// TestExportPages_ViewerPreservesIssueDeepLinks verifies exported viewer.js
+// doesn't clobber an incoming #/issue/:id hash during cold-start init.
+func TestExportPages_ViewerPreservesIssueDeepLinks(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+
+	repoDir := createSimpleRepo(t, 3)
+	exportDir := filepath.Join(repoDir, "bv-pages")
+
+	cmd := exec.Command(bv, "--export-pages", exportDir)
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("--export-pages failed: %v\n%s", err, out)
+	}
+
+	viewerJSBytes, err := os.ReadFile(filepath.Join(exportDir, "viewer.js"))
+	if err != nil {
+		t.Fatalf("read viewer.js: %v", err)
+	}
+	viewerJS := string(viewerJSBytes)
+
+	if !strings.Contains(viewerJS, "window.location.hash.startsWith('#/issue/')") {
+		t.Fatal("viewer.js missing deep-link guard for #/issue/:id")
+	}
+}
+
 // TestExportPages_PrecomputedLayoutUsedByViewer verifies viewer.js loads precomputed layout
 func TestExportPages_PrecomputedLayoutUsedByViewer(t *testing.T) {
 	bv := buildBvBinary(t)

@@ -1888,6 +1888,10 @@ function filtersFromURL() {
  * Update URL with current filter state (without page reload)
  */
 function syncFiltersToURL(view, filters, sort, searchQuery) {
+  // Preserve issue deep-links on cold load; don't overwrite #/issue/:id
+  // with #/issues before the router has a chance to consume the hash.
+  if (window.location.hash && window.location.hash.startsWith('#/issue/')) return;
+
   const paramString = filtersToURL(filters, sort, searchQuery);
   const baseHash = `#/${view}`;
   const newHash = paramString ? `${baseHash}?${paramString}` : baseHash;
