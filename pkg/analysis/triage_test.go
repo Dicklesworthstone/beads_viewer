@@ -74,7 +74,7 @@ func TestComputeTriage_BasicIssues(t *testing.T) {
 }
 
 func TestComputeTriage_UsesBDCommandBackend(t *testing.T) {
-	t.Setenv("BV_CMD_BACKEND", "bd")
+	t.Setenv("BV_BEADS_CLI", "bd")
 
 	issues := []model.Issue{
 		{

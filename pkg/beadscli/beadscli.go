@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const backendEnvVar = "BV_CMD_BACKEND"
+const backendEnvVar = "BV_BEADS_CLI"
 
 // Current returns the active command backend for user-facing helper commands.
 // Defaults to br for legacy stacks unless main configures a bd workspace.

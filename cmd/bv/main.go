@@ -55,7 +55,7 @@ func configureCommandBackend(repoPath string) {
 	if beadsDir, err := loader.GetBeadsDir(repoPath); err == nil {
 		backend = loader.DetectWorkspaceBackend(beadsDir)
 	}
-	_ = os.Setenv("BV_CMD_BACKEND", string(backend))
+	_ = os.Setenv("BV_BEADS_CLI", string(backend))
 }
 
 func resolveWorkspaceForCLI(repoPath string, refreshBDExport bool) (*loader.WorkspaceResolution, error) {

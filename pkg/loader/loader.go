@@ -159,7 +159,13 @@ func PrepareWorkspaceForRead(repoPath string, refreshBDExport bool, warnFunc fun
 	if err != nil {
 		return nil, err
 	}
+	return PrepareBeadsDirForRead(beadsDir, refreshBDExport, warnFunc)
+}
 
+// PrepareBeadsDirForRead resolves the active JSONL file for an explicit .beads
+// directory. This is used by workspace loading where the beads path is already
+// known and may not be discoverable from cwd/BEADS_DIR alone.
+func PrepareBeadsDirForRead(beadsDir string, refreshBDExport bool, warnFunc func(string)) (*WorkspaceResolution, error) {
 	resolution := &WorkspaceResolution{
 		Backend:  DetectWorkspaceBackend(beadsDir),
 		BeadsDir: beadsDir,
@@ -262,10 +268,9 @@ func getMainRepoRoot(repoPath string) (string, error) {
 	return mainRepoRoot, nil
 }
 
-// FindJSONLPath locates the beads JSONL file in the given directory.
-// Prefers beads.jsonl (canonical per bd) over issues.jsonl (legacy) to match
-// the file that bd writes to in stealth/direct mode. Fixes bv-96.
-// Skips backup files and merge artifacts.
+// FindJSONLPath locates the active beads JSONL file in the given directory.
+// Prefers issues.jsonl for modern bd interop, then falls back to legacy
+// beads.jsonl and beads.base.jsonl. Skips backup files and merge artifacts.
 func FindJSONLPath(beadsDir string) (string, error) {
 	return FindJSONLPathWithWarnings(beadsDir, nil)
 }

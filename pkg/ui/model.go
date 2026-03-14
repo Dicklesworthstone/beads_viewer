@@ -1844,6 +1844,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Reload issues from disk
 		// Use custom warning handler to prevent stderr pollution during TUI render (bv-fix)
 		var reloadWarnings []string
+		if _, err := loader.PrepareBeadsDirForRead(filepath.Dir(m.beadsPath), true, func(msg string) {
+			reloadWarnings = append(reloadWarnings, msg)
+		}); err != nil {
+			m.statusMsg = fmt.Sprintf("Refresh error: %v", err)
+			m.statusIsError = true
+			if m.watcher != nil {
+				cmds = append(cmds, WatchFileCmd(m.watcher))
+			}
+			return m, tea.Batch(cmds...)
+		}
 		var loadStart time.Time
 		if profileRefresh {
 			loadStart = time.Now()

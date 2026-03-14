@@ -20,20 +20,20 @@ const BlurbStartMarker = "<!-- bv-agent-instructions-v2 -->"
 const BlurbEndMarker = "<!-- end-bv-agent-instructions -->"
 
 // AgentBlurb contains the instructions to be appended to AGENTS.md files.
-// This is the v2 blurb that combines br workflow commands with bv robot triage.
+// This is the v2 blurb that combines beads CLI workflows with bv robot triage.
 const AgentBlurb = `<!-- bv-agent-instructions-v2 -->
 
 ---
 
 ## Beads Workflow Integration
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (` + "`" + `br` + "`" + `) for issue tracking and [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (` + "`" + `bv` + "`" + `) for graph-aware triage. Issues are stored in ` + "`" + `.beads/` + "`" + ` and tracked in git.
+This project uses a Beads CLI (` + "`" + `bd` + "`" + ` for modern Dolt-based workspaces, or ` + "`" + `br` + "`" + ` for the beads_rust stack) together with [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) (` + "`" + `bv` + "`" + `) for graph-aware triage. Issues are stored in ` + "`" + `.beads/` + "`" + ` and tracked in git.
 
 ### Using bv as an AI sidecar
 
-bv is a graph-aware triage engine for Beads projects (.beads/beads.jsonl). Instead of parsing JSONL or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
+bv is a graph-aware triage engine for Beads projects (` + "`" + `.beads/issues.jsonl` + "`" + ` with legacy fallbacks). Instead of parsing JSONL or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
 
-**Scope boundary:** bv handles *what to work on* (triage, priority, planning). ` + "`" + `br` + "`" + ` handles creating, modifying, and closing beads.
+**Scope boundary:** bv handles *what to work on* (triage, priority, planning). The local Beads CLI (` + "`" + `bd` + "`" + ` or ` + "`" + `br` + "`" + `) handles creating, modifying, and closing beads.
 
 **CRITICAL: Use ONLY --robot-* flags. Bare bv launches an interactive TUI that blocks your session.**
 
@@ -76,9 +76,10 @@ bv --recipe actionable --robot-plan          # Pre-filter: ready to work (no blo
 bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank scores
 ` + "```" + `
 
-### br Commands for Issue Management
+### Beads CLI Commands for Issue Management
 
 ` + "```" + `bash
+# Replace ` + "`" + `br` + "`" + ` with ` + "`" + `bd` + "`" + ` in modern Dolt-based workspaces.
 br ready              # Show issues ready to work (no blockers)
 br list --status=open # All open issues
 br show <id>          # Full issue details with dependencies

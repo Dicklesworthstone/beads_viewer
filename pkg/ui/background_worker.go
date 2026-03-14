@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -1340,10 +1341,30 @@ func (w *BackgroundWorker) buildSnapshot() *DataSnapshot {
 	// Huge tier: default to open-only unless the recipe explicitly includes closed/tombstone.
 	loadOpenOnly := tier == datasetTierHuge && !recipeIncludesClosedStatuses(currentRecipe)
 
+	var loadWarnings []string
+	if _, err := loader.PrepareBeadsDirForRead(filepath.Dir(w.beadsPath), true, func(msg string) {
+		loadWarnings = append(loadWarnings, msg)
+	}); err != nil {
+		workerErr := &WorkerError{
+			Phase: "refresh_export",
+			Cause: err,
+			Time:  time.Now(),
+		}
+		w.logEvent(LogLevelError, "snapshot_refresh_failed", map[string]any{
+			"path":  w.beadsPath,
+			"error": err.Error(),
+		})
+		w.recordError(workerErr)
+		w.send(SnapshotErrorMsg{
+			Err:         workerErr,
+			Recoverable: true,
+		})
+		return nil
+	}
+
 	// Load issues from file with panic recovery
 	var issues []model.Issue
 	var pooledRefs []*model.Issue
-	var loadWarnings []string
 	var loadStart time.Time
 	if profileSnapshot {
 		loadStart = time.Now()
