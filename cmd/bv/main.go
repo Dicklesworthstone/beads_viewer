@@ -5,8 +5,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	flag "github.com/spf13/pflag"
 	"fmt"
+	flag "github.com/spf13/pflag"
 	"html"
 	"io"
 	"io/fs"
@@ -31,6 +31,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/agents"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/beadscli"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/export"
@@ -48,6 +49,34 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+func configureCommandBackend(repoPath string) {
+	backend := loader.BackendBR
+	if beadsDir, err := loader.GetBeadsDir(repoPath); err == nil {
+		backend = loader.DetectWorkspaceBackend(beadsDir)
+	}
+	_ = os.Setenv("BV_CMD_BACKEND", string(backend))
+}
+
+func resolveWorkspaceForCLI(repoPath string, refreshBDExport bool) (*loader.WorkspaceResolution, error) {
+	return loader.PrepareWorkspaceForRead(repoPath, refreshBDExport, func(msg string) {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
+	})
+}
+
+func loadIssuesForCLI(repoPath string, refreshBDExport bool) ([]model.Issue, string, error) {
+	resolution, err := resolveWorkspaceForCLI(repoPath, refreshBDExport)
+	if err != nil {
+		return nil, "", err
+	}
+
+	issues, err := datasource.LoadIssuesFromDir(resolution.BeadsDir)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return issues, resolution.JSONL, nil
+}
 
 func main() {
 	cpuProfile := flag.String("cpu-profile", "", "Write CPU profile to file")
@@ -253,6 +282,10 @@ func main() {
 		os.Setenv("BV_NO_CACHE", "1")
 	}
 
+	// Detect the active workspace stack once so helper commands can emit the
+	// right CLI (`bd` for modern beads, `br` for legacy/file-first stacks).
+	configureCommandBackend("")
+
 	// Ensure static export flags are retained even when build tags strip features in some environments.
 	_ = exportPages
 	_ = pagesTitle
@@ -412,7 +445,7 @@ func main() {
 		fmt.Println("  --emit-script [--script-limit=N]")
 		fmt.Println("      Emits a shell script for top-N recommendations (default: 5).")
 		fmt.Println("      Includes hash/config header for deterministic ordering.")
-		fmt.Println("      Output: br show commands for each item, commented claim commands")
+		fmt.Printf("      Output: %s show commands for each item, commented claim commands\n", beadscli.Tool())
 		fmt.Println("      Options: --script-format=bash|fish|zsh, --script-limit=N")
 		fmt.Println("      Example: bv --emit-script > work.sh && bash work.sh")
 		fmt.Println("      Example: bv --emit-script --script-limit=3")
@@ -558,8 +591,8 @@ func main() {
 		fmt.Println("      Useful for agent workflows and automation.")
 		fmt.Println("      Output includes:")
 		fmt.Println("        - Header comment with data hash and generation time")
-		fmt.Println("        - br show commands for each recommended item")
-		fmt.Println("        - Commented br update commands to claim items")
+		fmt.Printf("        - %s show commands for each recommended item\n", beadscli.Tool())
+		fmt.Printf("        - Commented %s update commands to claim items\n", beadscli.Tool())
 		fmt.Println("      Options:")
 		fmt.Println("        --script-limit=N      Number of items (default: 5)")
 		fmt.Println("        --script-format=X     Script format: bash, fish, zsh")
@@ -1148,7 +1181,7 @@ func main() {
 			}
 
 			// Load issues to get score breakdown
-			issues, err := datasource.LoadIssues("")
+			issues, _, err := loadIssuesForCLI("", true)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error loading issues: %v\n", err)
 				os.Exit(1)
@@ -1380,15 +1413,19 @@ func main() {
 	} else {
 		// Load from single repo (original behavior)
 		var err error
-		issues, err = datasource.LoadIssues("")
+		issues, beadsPath, err = loadIssuesForCLI("", true)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
-			fmt.Fprintln(os.Stderr, "Make sure you are in a project initialized with 'br init'.")
+			fmt.Fprintln(os.Stderr, "Make sure you are in a project initialized with 'bd init' or 'br init'.")
 			os.Exit(1)
 		}
 		// Get beads file path for live reload (respects BEADS_DIR env var)
-		beadsDir, _ := loader.GetBeadsDir("")
-		beadsPath, _ = loader.FindJSONLPath(beadsDir)
+		resolution, err := resolveWorkspaceForCLI("", false)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving beads workspace: %v\n", err)
+			os.Exit(1)
+		}
+		beadsDir := resolution.BeadsDir
 
 		// Automatically ensure .bv/ is in .gitignore to prevent polluting git
 		// with search indexes, baselines, and other bv-specific files.
@@ -1915,7 +1952,7 @@ func main() {
 					if *workspaceConfig != "" {
 						freshIssues, _, err = workspace.LoadAllFromConfig(context.Background(), *workspaceConfig)
 					} else {
-						freshIssues, err = datasource.LoadIssues("")
+						freshIssues, _, err = loadIssuesForCLI("", false)
 					}
 					if err != nil {
 						fmt.Printf("  → Error reloading issues: %v\n", err)
@@ -3025,8 +3062,8 @@ func main() {
 				Score:         top.Score,
 				Reasons:       top.Reasons,
 				Unblocks:      top.Unblocks,
-				ClaimCmd:      fmt.Sprintf("br update %s --status=in_progress", top.ID),
-				ShowCmd:       fmt.Sprintf("br show %s", top.ID),
+				ClaimCmd:      beadscli.Shell("{tool} update %s --status=in_progress", top.ID),
+				ShowCmd:       beadscli.Shell("{tool} show %s", top.ID),
 			}
 
 			encoder := newRobotEncoder(os.Stdout)
@@ -3243,9 +3280,9 @@ func main() {
 				}
 
 				// Claim command
-				sb.WriteString(fmt.Sprintf("# To claim: br update %s --status=in_progress\n", rec.ID))
+				sb.WriteString(beadscli.Shell("# To claim: {tool} update %s --status=in_progress\n", rec.ID))
 				// Show command
-				sb.WriteString(fmt.Sprintf("br show %s\n", rec.ID))
+				sb.WriteString(beadscli.Shell("{tool} show %s\n", rec.ID))
 				sb.WriteString("\n")
 			}
 
@@ -3253,12 +3290,12 @@ func main() {
 			sb.WriteString("# === Quick Actions ===\n")
 			sb.WriteString("# To claim the top pick:\n")
 			if len(recs) > 0 {
-				sb.WriteString(fmt.Sprintf("# br update %s --status=in_progress\n", recs[0].ID))
+				sb.WriteString(beadscli.Shell("# {tool} update %s --status=in_progress\n", recs[0].ID))
 			}
 			sb.WriteString("#\n")
 			sb.WriteString("# To claim all listed items (uncomment to enable):\n")
 			for _, rec := range recs {
-				sb.WriteString(fmt.Sprintf("# br update %s --status=in_progress\n", rec.ID))
+				sb.WriteString(beadscli.Shell("# {tool} update %s --status=in_progress\n", rec.ID))
 			}
 		}
 
@@ -4261,8 +4298,8 @@ func main() {
 		}
 		output := CausalityEnvelope{
 			CausalityResult: result,
-			OutputFormat:     robotOutputFormat,
-			Version:          version.Version,
+			OutputFormat:    robotOutputFormat,
+			Version:         version.Version,
 		}
 
 		encoder := newRobotEncoder(os.Stdout)
@@ -4905,7 +4942,7 @@ func main() {
 	}
 
 	if len(issues) == 0 {
-		fmt.Println("No issues found. Create some with 'br create'!")
+		fmt.Printf("No issues found. Create some with '%s create'!\n", beadscli.Tool())
 		os.Exit(0)
 	}
 
@@ -6842,7 +6879,7 @@ func absInt(v int) int {
 // BurndownOutput represents the JSON output for --robot-burndown (bv-159)
 type BurndownOutput struct {
 	RobotEnvelope
-	SprintID string `json:"sprint_id"`
+	SprintID          string                `json:"sprint_id"`
 	SprintName        string                `json:"sprint_name"`
 	StartDate         time.Time             `json:"start_date"`
 	EndDate           time.Time             `json:"end_date"`
@@ -7167,7 +7204,7 @@ func calculateBurndownAt(sprint *model.Sprint, issues []model.Issue, now time.Ti
 	idealLine := generateIdealLine(sprint, totalIssues)
 
 	return BurndownOutput{
-		SprintID: sprint.ID,
+		SprintID:          sprint.ID,
 		SprintName:        sprint.Name,
 		StartDate:         sprint.StartDate,
 		EndDate:           sprint.EndDate,

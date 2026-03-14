@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/beadscli"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -194,7 +195,7 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 
 		// Add action command if both are open
 		if !isClosedLikeDuplicateStatus(issue1.Status) && !isClosedLikeDuplicateStatus(issue2.Status) {
-			sug = sug.WithAction(fmt.Sprintf("br dep add %s %s --type=related", pair.Issue1, pair.Issue2))
+			sug = sug.WithAction(beadscli.Shell("{tool} dep add %s %s --type=related", pair.Issue1, pair.Issue2))
 		}
 
 		suggestions = append(suggestions, sug)

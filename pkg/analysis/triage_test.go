@@ -73,6 +73,29 @@ func TestComputeTriage_BasicIssues(t *testing.T) {
 	}
 }
 
+func TestComputeTriage_UsesBDCommandBackend(t *testing.T) {
+	t.Setenv("BV_CMD_BACKEND", "bd")
+
+	issues := []model.Issue{
+		{
+			ID:        "test-1",
+			Title:     "First issue",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			UpdatedAt: time.Now(),
+		},
+	}
+
+	triage := ComputeTriage(issues)
+	if triage.Commands.ListReady != "CI=1 bd ready --json" {
+		t.Fatalf("expected bd-ready command, got %s", triage.Commands.ListReady)
+	}
+	if triage.Commands.ShowTop != "CI=1 bd show test-1 --json" {
+		t.Fatalf("expected bd-show command, got %s", triage.Commands.ShowTop)
+	}
+}
+
 func TestComputeTriage_IgnoresTombstoneIssues(t *testing.T) {
 	issues := []model.Issue{
 		{

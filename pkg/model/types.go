@@ -1,7 +1,10 @@
 package model
 
 import (
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"strconv"
 	"time"
 )
 
@@ -99,7 +102,7 @@ func (i *Issue) Validate() error {
 	if i.Title == "" {
 		return fmt.Errorf("issue title cannot be empty")
 	}
-	if !i.Status.IsValid() {
+	if i.Status == "" {
 		return fmt.Errorf("invalid status: %s", i.Status)
 	}
 	if !i.IssueType.IsValid() {
@@ -234,6 +237,62 @@ type Comment struct {
 	Author    string    `json:"author"`
 	Text      string    `json:"text"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// UnmarshalJSON accepts both the legacy numeric comment IDs and the UUID-style
+// string IDs emitted by current bd exports. String IDs are mapped to a stable
+// synthetic int64 so the rest of the viewer can remain unchanged.
+func (c *Comment) UnmarshalJSON(data []byte) error {
+	type rawComment struct {
+		ID        json.RawMessage `json:"id"`
+		IssueID   string          `json:"issue_id"`
+		Author    string          `json:"author"`
+		Text      string          `json:"text"`
+		CreatedAt time.Time       `json:"created_at"`
+	}
+
+	var raw rawComment
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	commentID, err := parseCommentID(raw.ID)
+	if err != nil {
+		return err
+	}
+
+	c.ID = commentID
+	c.IssueID = raw.IssueID
+	c.Author = raw.Author
+	c.Text = raw.Text
+	c.CreatedAt = raw.CreatedAt
+	return nil
+}
+
+func parseCommentID(raw json.RawMessage) (int64, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, nil
+	}
+
+	var numericID int64
+	if err := json.Unmarshal(raw, &numericID); err == nil {
+		return numericID, nil
+	}
+
+	var stringID string
+	if err := json.Unmarshal(raw, &stringID); err == nil {
+		if stringID == "" {
+			return 0, nil
+		}
+		if parsed, err := strconv.ParseInt(stringID, 10, 64); err == nil {
+			return parsed, nil
+		}
+		hasher := fnv.New64a()
+		_, _ = hasher.Write([]byte(stringID))
+		return int64(hasher.Sum64() & 0x7fffffffffffffff), nil
+	}
+
+	return 0, fmt.Errorf("invalid comment id: %s", string(raw))
 }
 
 // Sprint represents a time-boxed period of work

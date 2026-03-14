@@ -50,7 +50,7 @@ func TestFindJSONLPath_NoJSONLFiles(t *testing.T) {
 	}
 }
 
-func TestFindJSONLPath_PrefersBeadsJSONL(t *testing.T) {
+func TestFindJSONLPath_PrefersIssuesJSONL(t *testing.T) {
 	dir := t.TempDir()
 	// Create multiple JSONL files
 	os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte(`{"id":"1"}`), 0644)
@@ -61,25 +61,23 @@ func TestFindJSONLPath_PrefersBeadsJSONL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	// Per bv-96, beads.jsonl is canonical (matches what bd writes in stealth mode)
-	if filepath.Base(path) != "beads.jsonl" {
-		t.Errorf("Expected beads.jsonl to be preferred (matches bd stealth mode), got: %s", path)
+	if filepath.Base(path) != "issues.jsonl" {
+		t.Errorf("Expected issues.jsonl to be preferred, got: %s", path)
 	}
 }
 
-func TestFindJSONLPath_FallsBackToIssuesJSONL(t *testing.T) {
+func TestFindJSONLPath_FallsBackToBeadsJSONL(t *testing.T) {
 	dir := t.TempDir()
-	// Create issues.jsonl only (no beads.jsonl)
-	os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte(`{"id":"1"}`), 0644)
+	// Create beads.jsonl only (no issues.jsonl)
+	os.WriteFile(filepath.Join(dir, "beads.jsonl"), []byte(`{"id":"1"}`), 0644)
 	os.WriteFile(filepath.Join(dir, "other.jsonl"), []byte(`{"id":"2"}`), 0644)
 
 	path, err := loader.FindJSONLPath(dir)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	// issues.jsonl is second priority after beads.jsonl (bv-96)
-	if filepath.Base(path) != "issues.jsonl" {
-		t.Errorf("Expected issues.jsonl as fallback, got: %s", path)
+	if filepath.Base(path) != "beads.jsonl" {
+		t.Errorf("Expected beads.jsonl as fallback, got: %s", path)
 	}
 }
 
@@ -202,8 +200,103 @@ func TestFindJSONLPathWithWarnings_ReportsMergeArtifacts(t *testing.T) {
 	if !strings.Contains(warnings[0], "beads.left.jsonl") {
 		t.Errorf("Warning should mention beads.left.jsonl: %s", warnings[0])
 	}
-	if !strings.Contains(warnings[0], "br clean") {
-		t.Errorf("Warning should suggest 'br clean': %s", warnings[0])
+	if !strings.Contains(warnings[0], "Clean them up") {
+		t.Errorf("Warning should suggest cleanup: %s", warnings[0])
+	}
+}
+
+func TestDetectWorkspaceBackend_DoltDir(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir dolt: %v", err)
+	}
+
+	if got := loader.DetectWorkspaceBackend(beadsDir); got != loader.BackendBD {
+		t.Fatalf("DetectWorkspaceBackend() = %q, want %q", got, loader.BackendBD)
+	}
+}
+
+func TestPrepareWorkspaceForRead_RefreshesBDIssuesJSONL(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stub uses POSIX sh")
+	}
+
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir dolt: %v", err)
+	}
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	bdScript := filepath.Join(binDir, "bd")
+	script := "#!/bin/sh\nif [ \"$1\" != \"export\" ] || [ \"$2\" != \"-o\" ]; then exit 2; fi\nprintf '{\"id\":\"BD-1\",\"title\":\"Test\",\"status\":\"open\",\"priority\":1,\"issue_type\":\"task\"}\\n' > \"$3\"\n"
+	if err := os.WriteFile(bdScript, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	resolution, err := loader.PrepareWorkspaceForRead(dir, true, nil)
+	if err != nil {
+		t.Fatalf("PrepareWorkspaceForRead() error = %v", err)
+	}
+	if resolution.Backend != loader.BackendBD {
+		t.Fatalf("Backend = %q, want %q", resolution.Backend, loader.BackendBD)
+	}
+	if filepath.Base(resolution.JSONL) != "issues.jsonl" {
+		t.Fatalf("JSONL = %q, want issues.jsonl", resolution.JSONL)
+	}
+	if _, err := os.Stat(resolution.JSONL); err != nil {
+		t.Fatalf("expected issues.jsonl to exist: %v", err)
+	}
+}
+
+func TestPrepareWorkspaceForRead_FallsBackToExistingIssuesJSONL(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script stub uses POSIX sh")
+	}
+
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir dolt: %v", err)
+	}
+
+	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(issuesPath, []byte(`{"id":"BD-1","title":"Stale","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write issues.jsonl: %v", err)
+	}
+
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	bdScript := filepath.Join(binDir, "bd")
+	script := "#!/bin/sh\necho export failed >&2\nexit 1\n"
+	if err := os.WriteFile(bdScript, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var warnings []string
+	resolution, err := loader.PrepareWorkspaceForRead(dir, true, func(msg string) {
+		warnings = append(warnings, msg)
+	})
+	if err != nil {
+		t.Fatalf("PrepareWorkspaceForRead() error = %v", err)
+	}
+	if resolution.JSONL != issuesPath {
+		t.Fatalf("JSONL = %q, want %q", resolution.JSONL, issuesPath)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "bd export failed") {
+		t.Fatalf("expected export failure warning, got %#v", warnings)
 	}
 }
 

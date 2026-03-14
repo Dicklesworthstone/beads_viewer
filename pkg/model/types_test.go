@@ -239,6 +239,28 @@ func TestComment_Struct(t *testing.T) {
 	}
 }
 
+func TestComment_UnmarshalJSON_AcceptsNumericID(t *testing.T) {
+	var comment Comment
+	data := []byte(`{"id":1,"issue_id":"A","author":"user","text":"hello","created_at":"2024-01-01T00:00:00Z"}`)
+	if err := json.Unmarshal(data, &comment); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if comment.ID != 1 {
+		t.Fatalf("comment.ID = %d, want 1", comment.ID)
+	}
+}
+
+func TestComment_UnmarshalJSON_AcceptsStringID(t *testing.T) {
+	var comment Comment
+	data := []byte(`{"id":"0195fb34-73a5-7ac1-bbdf-65f8ec40d3f6","issue_id":"A","author":"user","text":"hello","created_at":"2024-01-01T00:00:00Z"}`)
+	if err := json.Unmarshal(data, &comment); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if comment.ID == 0 {
+		t.Fatal("comment.ID should be populated for string IDs")
+	}
+}
+
 func TestIssue_Validate(t *testing.T) {
 	now := time.Now()
 
@@ -280,14 +302,14 @@ func TestIssue_Validate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "Invalid Status",
+			name: "Unknown NonEmpty Status Allowed",
 			issue: Issue{
 				ID:        "TEST-1",
 				Title:     "Valid Issue",
 				Status:    "invalid",
 				IssueType: TypeBug,
 			},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name: "Empty Type",
