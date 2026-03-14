@@ -42,10 +42,10 @@ type WorkspaceResolution struct {
 	Warning  string
 }
 
-// PreferredJSONLNames defines the priority order for looking up beads data files.
-// issues.jsonl is the canonical interchange file for current bd exports.
-// beads.jsonl and beads.base.jsonl remain legacy fallbacks for older stacks.
-var PreferredJSONLNames = []string{"issues.jsonl", "beads.jsonl", "beads.base.jsonl"}
+// PreferredJSONLNames defines the default priority order for legacy/file-first
+// stacks. Modern bd workspaces bypass this via PrepareBeadsDirForRead and use
+// .beads/issues.jsonl explicitly.
+var PreferredJSONLNames = []string{"beads.jsonl", "issues.jsonl", "beads.base.jsonl"}
 
 type beadsMetadata struct {
 	Backend string `json:"backend"`
@@ -269,8 +269,9 @@ func getMainRepoRoot(repoPath string) (string, error) {
 }
 
 // FindJSONLPath locates the active beads JSONL file in the given directory.
-// Prefers issues.jsonl for modern bd interop, then falls back to legacy
-// beads.jsonl and beads.base.jsonl. Skips backup files and merge artifacts.
+// Legacy/file-first stacks prefer beads.jsonl, then issues.jsonl, then
+// beads.base.jsonl. Modern bd interop bypasses this via PrepareBeadsDirForRead.
+// Skips backup files and merge artifacts.
 func FindJSONLPath(beadsDir string) (string, error) {
 	return FindJSONLPathWithWarnings(beadsDir, nil)
 }
