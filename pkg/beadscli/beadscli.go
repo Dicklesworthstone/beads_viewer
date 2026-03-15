@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+// current tracks the active Beads CLI for this process.
+// It is internal runtime state, not a user-facing environment/config contract.
 var current = "br"
 
 // SetTool sets the active Beads CLI for generated helper commands.

@@ -1200,7 +1200,10 @@ the complete picture.
 
 ### How Beads Are Stored
 
-Your issues live in ` + "`.beads/issues.jsonl`" + ` — a simple JSON Lines file:
+In the primary ` + "`br`" + ` stack, your issues live in ` + "`.beads/beads.jsonl`" + `.
+In modern ` + "`bd`" + ` workspaces, ` + "`bv`" + ` uses a compatibility export centered on ` + "`.beads/issues.jsonl`" + `.
+
+The important point: ` + "`bv`" + ` always works from a local JSON Lines view:
 
 ` + "```" + `json
 {"id":"bv-abc123","title":"Fix auth","type":"bug","priority":1,...}
@@ -1256,7 +1259,7 @@ Press **r** in List view to filter to **ready** issues only:
 This is your **actionable work queue**. These issues have no dependencies
 blocking them — you can start any of them right now.
 
-> **Tip:** Start your day with ` + "`br ready`" + ` to see what you can tackle.
+> **Tip:** Start your day with ` + "`br ready`" + ` on the primary ` + "`br`" + ` stack, or ` + "`bd ready`" + ` when ` + "`bv`" + ` detects a ` + "`bd`" + ` workspace.
 
 ### Adding Dependencies
 
@@ -2186,14 +2189,14 @@ Regular bv is for humans. **Robot mode** is for agents:
 6. Agent calls: bv --robot-next (repeat)
 ` + "```" + `
 
-### The br CLI (for Agents)
+### The Beads CLI (for Agents)
 
 | Command | Purpose |
 |---------|---------|
-| ` + "`br ready`" + ` | List actionable issues |
-| ` + "`br update <id> --status=in_progress`" + ` | Claim work |
-| ` + "`br close <id>`" + ` | Complete work |
-| ` + "`br sync`" + ` | Commit changes to git |
+| ` + "`br ready`" + ` / ` + "`bd ready`" + ` | List actionable issues |
+| ` + "`br update <id> --status=in_progress`" + ` / ` + "`bd update <id> --status=in_progress`" + ` | Claim work |
+| ` + "`br close <id>`" + ` / ` + "`bd close <id>`" + ` | Complete work |
+| ` + "`br sync`" + ` / ` + "`bd export -o .beads/issues.jsonl`" + ` | Refresh the JSONL view |
 
 ### AGENTS.md Integration
 
