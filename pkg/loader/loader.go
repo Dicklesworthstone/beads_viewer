@@ -24,24 +24,6 @@ const BeadsDirEnvVar = "BEADS_DIR"
 // Can point to a specific file (e.g., /path/to/.beads/beads.jsonl) or a .beads directory.
 const BeadsDBEnvVar = "BEADS_DB"
 
-// WorkspaceBackend identifies the command/data backend for the current workspace.
-type WorkspaceBackend string
-
-const (
-	// BackendBR is the legacy/file-first stack used by beads_rust and older repos.
-	BackendBR WorkspaceBackend = "br"
-	// BackendBD is the Dolt-native steveyegge/beads stack.
-	BackendBD WorkspaceBackend = "bd"
-)
-
-// WorkspaceResolution captures the resolved .beads directory and active JSONL path.
-type WorkspaceResolution struct {
-	Backend  WorkspaceBackend
-	BeadsDir string
-	JSONL    string
-	Warning  string
-}
-
 // PreferredJSONLNames defines the default priority order for legacy/file-first
 // stacks. Modern bd workspaces bypass this via PrepareBeadsDirForRead and use
 // .beads/issues.jsonl explicitly.
@@ -121,85 +103,73 @@ func resolveBeadsDB(dbPath string) (string, error) {
 	return filepath.Dir(dbPath), nil
 }
 
-// DetectWorkspaceBackend determines whether the given .beads directory belongs
-// to a modern bd (Dolt-native) workspace or a legacy/file-first stack.
-func DetectWorkspaceBackend(beadsDir string) WorkspaceBackend {
+// IsBDWorkspace returns true when the given .beads directory belongs to a
+// modern Dolt-native bd workspace.
+func IsBDWorkspace(beadsDir string) bool {
 	if beadsDir == "" {
-		return BackendBR
+		return false
 	}
 
 	// Fast path: modern beads stores Dolt data under .beads/dolt/.
 	if info, err := os.Stat(filepath.Join(beadsDir, "dolt")); err == nil && info.IsDir() {
-		return BackendBD
+		return true
 	}
 
 	// Fallback: metadata.json may explicitly record the backend.
 	metaPath := filepath.Join(beadsDir, "metadata.json")
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
-		return BackendBR
+		return false
 	}
 
 	var meta beadsMetadata
 	if err := stdjson.Unmarshal(data, &meta); err != nil {
-		return BackendBR
+		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(meta.Backend), "dolt") {
-		return BackendBD
-	}
-
-	return BackendBR
+	return strings.EqualFold(strings.TrimSpace(meta.Backend), "dolt")
 }
 
 // PrepareWorkspaceForRead resolves the active JSONL file for the workspace.
 // For bd workspaces, it can refresh .beads/issues.jsonl by running
 // `bd export -o .beads/issues.jsonl` before reading.
-func PrepareWorkspaceForRead(repoPath string, refreshBDExport bool, warnFunc func(string)) (*WorkspaceResolution, error) {
+func PrepareWorkspaceForRead(repoPath string, refreshBDExport bool, warnFunc func(string)) (string, string, error) {
 	beadsDir, err := GetBeadsDir(repoPath)
 	if err != nil {
-		return nil, err
+		return "", "", err
 	}
-	return PrepareBeadsDirForRead(beadsDir, refreshBDExport, warnFunc)
+	jsonlPath, err := PrepareBeadsDirForRead(beadsDir, refreshBDExport, warnFunc)
+	if err != nil {
+		return "", "", err
+	}
+	return beadsDir, jsonlPath, nil
 }
 
 // PrepareBeadsDirForRead resolves the active JSONL file for an explicit .beads
 // directory. This is used by workspace loading where the beads path is already
 // known and may not be discoverable from cwd/BEADS_DIR alone.
-func PrepareBeadsDirForRead(beadsDir string, refreshBDExport bool, warnFunc func(string)) (*WorkspaceResolution, error) {
-	resolution := &WorkspaceResolution{
-		Backend:  DetectWorkspaceBackend(beadsDir),
-		BeadsDir: beadsDir,
-	}
-
-	if resolution.Backend == BackendBD {
+func PrepareBeadsDirForRead(beadsDir string, refreshBDExport bool, warnFunc func(string)) (string, error) {
+	if IsBDWorkspace(beadsDir) {
 		issuesPath := filepath.Join(beadsDir, "issues.jsonl")
 		if refreshBDExport {
 			if err := exportBDIssuesJSONL(beadsDir, issuesPath); err != nil {
 				if _, statErr := os.Stat(issuesPath); statErr == nil {
-					resolution.Warning = fmt.Sprintf("bd export failed, using existing issues.jsonl: %v", err)
 					if warnFunc != nil {
-						warnFunc(resolution.Warning)
+						warnFunc(fmt.Sprintf("bd export failed, using existing issues.jsonl: %v", err))
 					}
 				} else {
-					return nil, fmt.Errorf("failed to refresh bd compatibility JSONL: %w", err)
+					return "", fmt.Errorf("failed to refresh bd compatibility JSONL: %w", err)
 				}
 			}
 		}
 
 		if _, err := os.Stat(issuesPath); err != nil {
-			return nil, fmt.Errorf("no compatibility JSONL found at %s; run 'bd export -o .beads/issues.jsonl'", issuesPath)
+			return "", fmt.Errorf("no compatibility JSONL found at %s; run 'bd export -o .beads/issues.jsonl'", issuesPath)
 		}
 
-		resolution.JSONL = issuesPath
-		return resolution, nil
+		return issuesPath, nil
 	}
 
-	jsonlPath, err := FindJSONLPath(beadsDir)
-	if err != nil {
-		return nil, err
-	}
-	resolution.JSONL = jsonlPath
-	return resolution, nil
+	return FindJSONLPath(beadsDir)
 }
 
 func exportBDIssuesJSONL(beadsDir, issuesPath string) error {
@@ -331,6 +301,9 @@ func FindJSONLPathWithWarnings(beadsDir string, warnFunc func(msg string)) (stri
 	// 3. beads.base.jsonl (fallback, may be present during merge resolution)
 	// 4. First candidate
 	preferredNames := PreferredJSONLNames
+	if IsBDWorkspace(beadsDir) {
+		preferredNames = []string{"issues.jsonl", "beads.jsonl", "beads.base.jsonl"}
+	}
 
 	for _, preferred := range preferredNames {
 		for _, name := range candidates {

@@ -155,11 +155,11 @@ func (l *AggregateLoader) loadSingleRepo(repo RepoConfig) ([]model.Issue, error)
 
 	// Load raw issues from the repo, respecting custom beads path if provided
 	beadsDir := filepath.Join(repoPath, repo.GetBeadsPath())
-	resolution, err := loader.PrepareBeadsDirForRead(beadsDir, true, nil)
+	jsonlPath, err := loader.PrepareBeadsDirForRead(beadsDir, true, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
 	}
-	issues, err := loader.LoadIssuesFromFile(resolution.JSONL)
+	issues, err := loader.LoadIssuesFromFile(jsonlPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
 	}

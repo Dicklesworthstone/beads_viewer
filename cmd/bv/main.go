@@ -51,31 +51,31 @@ import (
 )
 
 func configureCommandBackend(repoPath string) {
-	backend := loader.BackendBR
-	if beadsDir, err := loader.GetBeadsDir(repoPath); err == nil {
-		backend = loader.DetectWorkspaceBackend(beadsDir)
+	if beadsDir, err := loader.GetBeadsDir(repoPath); err == nil && loader.IsBDWorkspace(beadsDir) {
+		beadscli.SetTool("bd")
+	} else {
+		beadscli.SetTool("br")
 	}
-	_ = os.Setenv("BV_BEADS_CLI", string(backend))
 }
 
-func resolveWorkspaceForCLI(repoPath string, refreshBDExport bool) (*loader.WorkspaceResolution, error) {
+func resolveWorkspaceForCLI(repoPath string, refreshBDExport bool) (string, string, error) {
 	return loader.PrepareWorkspaceForRead(repoPath, refreshBDExport, func(msg string) {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
 	})
 }
 
 func loadIssuesForCLI(repoPath string, refreshBDExport bool) ([]model.Issue, string, error) {
-	resolution, err := resolveWorkspaceForCLI(repoPath, refreshBDExport)
+	beadsDir, jsonlPath, err := resolveWorkspaceForCLI(repoPath, refreshBDExport)
 	if err != nil {
 		return nil, "", err
 	}
 
-	issues, err := datasource.LoadIssuesFromDir(resolution.BeadsDir)
+	issues, err := datasource.LoadIssuesFromDir(beadsDir)
 	if err != nil {
 		return nil, "", err
 	}
 
-	return issues, resolution.JSONL, nil
+	return issues, jsonlPath, nil
 }
 
 func main() {
@@ -1420,12 +1420,11 @@ func main() {
 			os.Exit(1)
 		}
 		// Get beads file path for live reload (respects BEADS_DIR env var)
-		resolution, err := resolveWorkspaceForCLI("", false)
+		beadsDir, _, err := resolveWorkspaceForCLI("", false)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error resolving beads workspace: %v\n", err)
 			os.Exit(1)
 		}
-		beadsDir := resolution.BeadsDir
 
 		// Automatically ensure .bv/ is in .gitignore to prevent polluting git
 		// with search indexes, baselines, and other bv-specific files.
@@ -1868,7 +1867,7 @@ func main() {
 						repoPath = filepath.Join(workspaceRoot, repoPath)
 					}
 					beadsDir := filepath.Join(repoPath, repo.GetBeadsPath())
-					issuesFile, err := loader.FindJSONLPath(beadsDir)
+					issuesFile, err := loader.PrepareBeadsDirForRead(beadsDir, true, nil)
 					if err != nil {
 						fmt.Printf("  → Warning: could not find issues.jsonl for repo %s: %v\n", repo.GetName(), err)
 						continue
@@ -1882,8 +1881,11 @@ func main() {
 				}
 			} else {
 				// Single-repo mode: watch current directory's issues.jsonl
-				cwd, _ := os.Getwd()
-				issuesFile := filepath.Join(cwd, ".beads", "issues.jsonl")
+				_, issuesFile, err := resolveWorkspaceForCLI("", true)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error resolving issues.jsonl path: %v\n", err)
+					os.Exit(1)
+				}
 				watchFiles = append(watchFiles, issuesFile)
 			}
 

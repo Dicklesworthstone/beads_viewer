@@ -2,25 +2,24 @@ package beadscli
 
 import (
 	"fmt"
-	"os"
 	"strings"
 )
 
-const backendEnvVar = "BV_BEADS_CLI"
+var current = "br"
 
-// Current returns the active command backend for user-facing helper commands.
-// Defaults to br for legacy stacks unless main configures a bd workspace.
-func Current() string {
-	backend := strings.TrimSpace(strings.ToLower(os.Getenv(backendEnvVar)))
-	if backend == "bd" {
-		return "bd"
+// SetTool sets the active Beads CLI for generated helper commands.
+func SetTool(tool string) {
+	switch strings.TrimSpace(strings.ToLower(tool)) {
+	case "bd":
+		current = "bd"
+	default:
+		current = "br"
 	}
-	return "br"
 }
 
 // Tool returns the active command binary name.
 func Tool() string {
-	return Current()
+	return current
 }
 
 // Shell formats a plain shell command for the active backend.

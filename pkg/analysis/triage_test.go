@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/beadscli"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -74,7 +75,8 @@ func TestComputeTriage_BasicIssues(t *testing.T) {
 }
 
 func TestComputeTriage_UsesBDCommandBackend(t *testing.T) {
-	t.Setenv("BV_BEADS_CLI", "bd")
+	beadscli.SetTool("bd")
+	defer beadscli.SetTool("br")
 
 	issues := []model.Issue{
 		{

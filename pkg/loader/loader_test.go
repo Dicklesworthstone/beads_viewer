@@ -212,8 +212,8 @@ func TestDetectWorkspaceBackend_DoltDir(t *testing.T) {
 		t.Fatalf("mkdir dolt: %v", err)
 	}
 
-	if got := loader.DetectWorkspaceBackend(beadsDir); got != loader.BackendBD {
-		t.Fatalf("DetectWorkspaceBackend() = %q, want %q", got, loader.BackendBD)
+	if !loader.IsBDWorkspace(beadsDir) {
+		t.Fatal("IsBDWorkspace() = false, want true")
 	}
 }
 
@@ -241,17 +241,17 @@ func TestPrepareWorkspaceForRead_RefreshesBDIssuesJSONL(t *testing.T) {
 
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	resolution, err := loader.PrepareWorkspaceForRead(dir, true, nil)
+	beadsDirResolved, jsonlPath, err := loader.PrepareWorkspaceForRead(dir, true, nil)
 	if err != nil {
 		t.Fatalf("PrepareWorkspaceForRead() error = %v", err)
 	}
-	if resolution.Backend != loader.BackendBD {
-		t.Fatalf("Backend = %q, want %q", resolution.Backend, loader.BackendBD)
+	if beadsDirResolved != beadsDir {
+		t.Fatalf("BeadsDir = %q, want %q", beadsDirResolved, beadsDir)
 	}
-	if filepath.Base(resolution.JSONL) != "issues.jsonl" {
-		t.Fatalf("JSONL = %q, want issues.jsonl", resolution.JSONL)
+	if filepath.Base(jsonlPath) != "issues.jsonl" {
+		t.Fatalf("JSONL = %q, want issues.jsonl", jsonlPath)
 	}
-	if _, err := os.Stat(resolution.JSONL); err != nil {
+	if _, err := os.Stat(jsonlPath); err != nil {
 		t.Fatalf("expected issues.jsonl to exist: %v", err)
 	}
 }
@@ -286,14 +286,14 @@ func TestPrepareWorkspaceForRead_FallsBackToExistingIssuesJSONL(t *testing.T) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	var warnings []string
-	resolution, err := loader.PrepareWorkspaceForRead(dir, true, func(msg string) {
+	_, jsonlPath, err := loader.PrepareWorkspaceForRead(dir, true, func(msg string) {
 		warnings = append(warnings, msg)
 	})
 	if err != nil {
 		t.Fatalf("PrepareWorkspaceForRead() error = %v", err)
 	}
-	if resolution.JSONL != issuesPath {
-		t.Fatalf("JSONL = %q, want %q", resolution.JSONL, issuesPath)
+	if jsonlPath != issuesPath {
+		t.Fatalf("JSONL = %q, want %q", jsonlPath, issuesPath)
 	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "bd export failed") {
 		t.Fatalf("expected export failure warning, got %#v", warnings)
