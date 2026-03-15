@@ -124,7 +124,7 @@ No web page loads, no heavy clients. `bv` starts instantly and lets you fly thro
 *   **Split-View Dashboard:** On wider screens, see your list on the left and full details on the right.
 *   **Markdown Rendering:** Issue descriptions, comments, and notes are beautifully rendered with syntax highlighting, headers, and lists.
 *   **Instant Filtering:** Zero-latency filtering. Press `o` for Open, `c` for Closed, or `r` for Ready (unblocked) tasks.
-*   **Live Reload:** Watches `.beads/beads.jsonl` and refreshes lists, details, and insights automatically when the file changes—no restart needed.
+*   **Live Reload:** Watches the active Beads JSONL view and refreshes lists, details, and insights automatically when that file changes—no restart needed.
 
 ### 🔎 Rich Context
 Don't just read the title. `bv` gives you the full picture:
@@ -143,7 +143,7 @@ Don't just read the title. `bv` gives you the full picture:
 *   **Export:** Press `E` to export all issues to a timestamped Markdown file with Mermaid diagrams.
 *   **Graph Export (CLI):** `bv --robot-graph` outputs the dependency graph as JSON, DOT (Graphviz), or Mermaid format. Use `--graph-format=dot` for rendering with Graphviz, or `--graph-root=ID --graph-depth=3` to extract focused subgraphs.
 *   **Copy:** Press `C` to copy the selected issue as formatted Markdown to your clipboard.
-*   **Edit:** Press `O` to open the `.beads/beads.jsonl` file in your preferred GUI editor.
+*   **Edit:** Press `O` to open the active Beads JSONL file in your preferred GUI editor.
 *   **Time-Travel:** Press `t` to compare against any git revision, or `T` for quick HEAD~5 comparison. Combined with History view (`h`), you can navigate to any commit and see exactly what changed.
 
 ### 🔌 Automation Hooks
@@ -156,7 +156,7 @@ Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, not
 ```
 ### Using bv as an AI sidecar
 
-bv is a graph-aware triage engine for Beads projects (.beads/beads.jsonl). Instead of parsing JSONL or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
+bv is a graph-aware triage engine for Beads projects. In the primary `br` stack it reads `.beads/beads.jsonl`; in `bd` workspaces it uses a compatibility export centered on `.beads/issues.jsonl`.
 
 **Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use [MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail).
 
@@ -3401,10 +3401,10 @@ The updater (`pkg/updater/updater.go`) is architected for silence and safety:
 Reliability is key. `bv` doesn't assume a perfect environment; it actively handles common file system inconsistencies.
 
 ### 1. Intelligent Path Discovery
-The loader (`pkg/loader/loader.go`) doesn't just blindly open `.beads/beads.jsonl`. It employs a priority-based discovery algorithm:
-1.  **Canonical:** Checks for `issues.jsonl` (preferred by beads upstream).
-2.  **Legacy:** Fallback to `beads.jsonl` for backward compatibility.
-3.  **Base:** Checks `beads.base.jsonl` (used by `br` in daemon mode).
+The loader (`pkg/loader/loader.go`) doesn't just blindly open a single path. It uses a compatibility-aware discovery strategy:
+1.  **Primary `br` path:** Checks `beads.jsonl` first for the file-first `br` stack.
+2.  **`bd` compatibility path:** In modern Dolt-based `bd` repos, `bv` targets `issues.jsonl` as the canonical compatibility export.
+3.  **Legacy fallbacks:** Checks `issues.jsonl` or `beads.base.jsonl` when needed.
 4.  **Validation:** It skips temporary files like `*.backup` or `deletions.jsonl` to prevent displaying corrupted state.
 
 ### 2. Robust Parsing
@@ -3423,7 +3423,7 @@ In complex software projects, tasks are not isolated. They are deeply interconne
 `bv` adopts a **Graph-First** philosophy:
 1.  **Structure is Reality:** The dependency graph *is* the project. The list view is just a projection of that graph.
 2.  **Explicit Blocking:** We don't just "relate" tasks; we define strict "blocks". If A blocks B, you literally cannot mark B as "Ready" in `bv` until A is Closed.
-3.  **Local-First, Text-Based:** Your project data lives in your repo (`.beads/beads.jsonl`), not on a remote server. It travels with your code, branches with your git, and merges with your PRs.
+3.  **Local-First, Text-Based:** In the primary `br` stack, your project data lives in your repo as JSONL (`.beads/beads.jsonl`). In `bd` workspaces, `bv` uses a compatibility export centered on `.beads/issues.jsonl`.
 
 ---
 
@@ -3819,7 +3819,7 @@ Copyright (c) 2025 Jeffrey Emanuel
 
 ## 🧷 Robustness & Self-Healing
 - Loader skips malformed lines with warnings, strips UTF-8 BOM, tolerates large lines (10MB).
-- Beads file discovery order: issues.jsonl → beads.jsonl → beads.base.jsonl; skips backups/merge artifacts/deletions manifests.
+- Beads file discovery order for the primary `br` stack: beads.jsonl → issues.jsonl → beads.base.jsonl. In modern `bd` workspaces, `bv` targets `.beads/issues.jsonl` explicitly.
 - Live reload is debounced; update check is non-blocking with graceful failure on network issues.
 
 ## 🔗 Integrating with CI & Agents

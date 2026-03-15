@@ -278,10 +278,10 @@ type Alert struct {
 
 // CommandHelpers provides copy-paste commands for common actions
 type CommandHelpers struct {
-	ClaimTop      string `json:"claim_top"`      // CI=1 br update <id> --status in_progress --json
-	ShowTop       string `json:"show_top"`       // CI=1 br show <id> --json
-	ListReady     string `json:"list_ready"`     // CI=1 br ready --json
-	ListBlocked   string `json:"list_blocked"`   // CI=1 br blocked --json
+	ClaimTop      string `json:"claim_top"`      // CI=1 <beads-cli> update <id> --status in_progress --json
+	ShowTop       string `json:"show_top"`       // CI=1 <beads-cli> show <id> --json
+	ListReady     string `json:"list_ready"`     // CI=1 <beads-cli> ready --json
+	ListBlocked   string `json:"list_blocked"`   // CI=1 <beads-cli> blocked --json
 	RefreshTriage string `json:"refresh_triage"` // bv --robot-triage
 }
 
@@ -312,7 +312,7 @@ type TrackRecommendationGroup struct {
 	Reason          string           `json:"reason"`                  // Why these are grouped (e.g., "Independent work stream")
 	Recommendations []Recommendation `json:"recommendations"`         // Recommendations in this track
 	TopPick         *TopPick         `json:"top_pick,omitempty"`      // Best item in this track
-	ClaimCommand    string           `json:"claim_command,omitempty"` // CI=1 br update <top_pick_id> --status in_progress --json
+	ClaimCommand    string           `json:"claim_command,omitempty"` // CI=1 <beads-cli> update <top_pick_id> --status in_progress --json
 	TotalUnblocks   int              `json:"total_unblocks"`          // Sum of unblocks in this track
 }
 
@@ -321,7 +321,7 @@ type LabelRecommendationGroup struct {
 	Label           string           `json:"label"`
 	Recommendations []Recommendation `json:"recommendations"`         // Recommendations with this label
 	TopPick         *TopPick         `json:"top_pick,omitempty"`      // Best item with this label
-	ClaimCommand    string           `json:"claim_command,omitempty"` // CI=1 br update <top_pick_id> --status in_progress --json
+	ClaimCommand    string           `json:"claim_command,omitempty"` // CI=1 <beads-cli> update <top_pick_id> --status in_progress --json
 	TotalUnblocks   int              `json:"total_unblocks"`          // Sum of unblocks for this label
 }
 
