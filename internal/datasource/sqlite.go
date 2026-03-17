@@ -388,15 +388,19 @@ func (r *SQLiteReader) GetIssueByID(id string) (*model.Issue, error) {
 
 // GetLastModified returns the most recent update time
 func (r *SQLiteReader) GetLastModified() (time.Time, error) {
-	var updatedAt sql.NullTime
-	err := r.db.QueryRow("SELECT MAX(updated_at) FROM issues").Scan(&updatedAt)
+	var raw sql.NullString
+	err := r.db.QueryRow("SELECT MAX(updated_at) FROM issues").Scan(&raw)
 	if err != nil {
 		return time.Time{}, err
 	}
-	if !updatedAt.Valid {
+	if !raw.Valid || raw.String == "" {
 		return time.Time{}, nil
 	}
-	return updatedAt.Time, nil
+	t, err := time.Parse(time.RFC3339Nano, raw.String)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("cannot parse updated_at %q: %w", raw.String, err)
+	}
+	return t, nil
 }
 
 // parseJSONStringArray parses a JSON array of strings

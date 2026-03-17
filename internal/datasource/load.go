@@ -70,21 +70,12 @@ func loadSmart(beadsDir, repoPath string) ([]model.Issue, error) {
 }
 
 // LoadFromSource loads issues from a specific DataSource, dispatching to the
-// appropriate reader based on source type.
+// appropriate reader via the IssueReader interface.
 func LoadFromSource(source DataSource) ([]model.Issue, error) {
-	switch source.Type {
-	case SourceTypeSQLite:
-		reader, err := NewSQLiteReader(source)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open SQLite source %s: %w", source.Path, err)
-		}
-		defer reader.Close()
-		return reader.LoadIssues()
-
-	case SourceTypeJSONLLocal, SourceTypeJSONLWorktree:
-		return loader.LoadIssuesFromFile(source.Path)
-
-	default:
-		return nil, fmt.Errorf("unknown source type: %s", source.Type)
+	reader, err := NewReader(source)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source %s: %w", source.Path, err)
 	}
+	defer reader.Close()
+	return reader.LoadIssues()
 }

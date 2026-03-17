@@ -3,7 +3,6 @@ package datasource
 import (
 	"fmt"
 
-	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -176,26 +175,9 @@ func CompareSources(sourceA, sourceB DataSource, opts DiffOptions) (*SourceDiff,
 	return &diff, nil
 }
 
-// loadIssuesFromSource loads issues from any source type
+// loadIssuesFromSource loads issues from any source type via the IssueReader interface.
 func loadIssuesFromSource(source DataSource) ([]model.Issue, error) {
-	switch source.Type {
-	case SourceTypeSQLite:
-		reader, err := NewSQLiteReader(source)
-		if err != nil {
-			return nil, err
-		}
-		defer reader.Close()
-		return reader.LoadIssues()
-	case SourceTypeJSONLLocal, SourceTypeJSONLWorktree:
-		return loadIssuesFromJSONL(source.Path)
-	default:
-		return nil, fmt.Errorf("unsupported source type: %s", source.Type)
-	}
-}
-
-// loadIssuesFromJSONL loads issues from a JSONL file using the existing loader
-func loadIssuesFromJSONL(path string) ([]model.Issue, error) {
-	return loader.LoadIssuesFromFile(path)
+	return LoadFromSource(source)
 }
 
 // CheckAllSourcesConsistent compares all sources and reports any inconsistencies
