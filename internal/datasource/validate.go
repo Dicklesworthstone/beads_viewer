@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	_ "github.com/go-sql-driver/mysql"
 	json "github.com/goccy/go-json"
 	_ "modernc.org/sqlite"
 )
@@ -63,6 +64,8 @@ func ValidateSourceWithOptions(source *DataSource, opts ValidationOptions) error
 		err = validateSQLite(source, opts)
 	case SourceTypeJSONLLocal, SourceTypeJSONLWorktree:
 		err = validateJSONL(source, opts)
+	case SourceTypeDolt:
+		err = validateDolt(source, opts)
 	default:
 		err = fmt.Errorf("unknown source type: %s", source.Type)
 	}
@@ -279,6 +282,44 @@ func validateJSONL(source *DataSource, opts ValidationOptions) error {
 		opts.Logger(fmt.Sprintf("JSONL validation passed: %s (%d issues, %d errors)", source.Path, validLines, errorLines))
 	}
 
+	return nil
+}
+
+// validateDolt validates a Dolt data source by connecting and checking schema.
+func validateDolt(source *DataSource, opts ValidationOptions) error {
+	db, err := sql.Open("mysql", source.Path)
+	if err != nil {
+		return fmt.Errorf("cannot open Dolt connection: %w", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("cannot connect to Dolt server: %w", err)
+	}
+
+	// Check issues table exists with required columns
+	var count int
+	for _, col := range []string{"id", "title", "status"} {
+		err := db.QueryRow(`
+			SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+			WHERE TABLE_NAME = 'issues' AND COLUMN_NAME = ?
+		`, col).Scan(&count)
+		if err != nil || count == 0 {
+			return fmt.Errorf("missing required column: %s", col)
+		}
+	}
+
+	if opts.CountIssues {
+		err = db.QueryRow("SELECT COUNT(*) FROM issues WHERE (tombstone IS NULL OR tombstone = 0)").Scan(&count)
+		if err != nil {
+			return fmt.Errorf("cannot count issues: %w", err)
+		}
+		source.IssueCount = count
+	}
+
+	if opts.Verbose {
+		opts.Logger(fmt.Sprintf("Dolt validation passed: %s (%d issues)", source.Path, source.IssueCount))
+	}
 	return nil
 }
 
