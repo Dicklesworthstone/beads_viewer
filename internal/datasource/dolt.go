@@ -12,8 +12,9 @@ import (
 
 // DoltReader implements IssueReader for Dolt databases via the MySQL wire protocol.
 type DoltReader struct {
-	db  *sql.DB
-	dsn string
+	db           *sql.DB
+	dsn          string
+	hasTombstone bool
 }
 
 // NewDoltReader opens a connection to a Dolt sql-server.
@@ -32,7 +33,16 @@ func NewDoltReader(source DataSource) (*DoltReader, error) {
 		return nil, fmt.Errorf("cannot connect to Dolt server: %w", err)
 	}
 
-	return &DoltReader{db: db, dsn: source.Path}, nil
+	r := &DoltReader{db: db, dsn: source.Path}
+	// Detect schema: not all beads databases have a tombstone column
+	var count int
+	err = db.QueryRow(`
+		SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_NAME = 'issues' AND COLUMN_NAME = 'tombstone'
+	`).Scan(&count)
+	r.hasTombstone = err == nil && count > 0
+
+	return r, nil
 }
 
 // Close closes the database connection.
@@ -60,9 +70,9 @@ func (r *DoltReader) LoadIssuesFiltered(filter func(*model.Issue) bool) ([]model
 			i.compacted_at, i.compacted_at_commit, i.original_size,
 			%s, i.design, i.acceptance_criteria, i.notes, i.source_repo
 		FROM issues i
-		WHERE (i.tombstone IS NULL OR i.tombstone = 0)
+		%s
 		ORDER BY i.updated_at DESC
-	`, labelsExpr)
+	`, labelsExpr, r.tombstoneFilterAliased())
 
 	rows, err := r.db.Query(query)
 	if err != nil {
@@ -173,12 +183,12 @@ func (r *DoltReader) scanFullIssue(rows *sql.Rows) (model.Issue, error) {
 
 // loadIssuesSimple is a fallback for databases with fewer columns.
 func (r *DoltReader) loadIssuesSimple(filter func(*model.Issue) bool) ([]model.Issue, error) {
-	rows, err := r.db.Query(`
+	rows, err := r.db.Query(fmt.Sprintf(`
 		SELECT id, title, description, status, priority, issue_type, created_at, updated_at
 		FROM issues
-		WHERE (tombstone IS NULL OR tombstone = 0)
+		%s
 		ORDER BY updated_at DESC
-	`)
+	`, r.tombstoneFilter()))
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
@@ -222,7 +232,7 @@ func (r *DoltReader) loadIssuesSimple(filter func(*model.Issue) bool) ([]model.I
 // CountIssues returns the count of non-tombstone issues.
 func (r *DoltReader) CountIssues() (int, error) {
 	var count int
-	err := r.db.QueryRow("SELECT COUNT(*) FROM issues WHERE (tombstone IS NULL OR tombstone = 0)").Scan(&count)
+	err := r.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM issues%s", r.tombstoneFilter())).Scan(&count)
 	return count, err
 }
 
@@ -251,6 +261,23 @@ func (r *DoltReader) GetLastModified() (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return updatedAt.Time, nil
+}
+
+// tombstoneFilter returns a WHERE clause fragment to exclude tombstone issues,
+// or an empty string if the schema has no tombstone column.
+func (r *DoltReader) tombstoneFilter() string {
+	if r.hasTombstone {
+		return " WHERE (tombstone IS NULL OR tombstone = 0)"
+	}
+	return ""
+}
+
+// tombstoneFilterAliased returns the filter using table alias "i".
+func (r *DoltReader) tombstoneFilterAliased() string {
+	if r.hasTombstone {
+		return " WHERE (i.tombstone IS NULL OR i.tombstone = 0)"
+	}
+	return ""
 }
 
 // labelsExpression returns the SQL expression for loading labels.

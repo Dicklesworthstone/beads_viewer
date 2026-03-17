@@ -4,6 +4,7 @@
 package datasource
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	_ "github.com/go-sql-driver/mysql"
 	json "github.com/goccy/go-json"
 )
 
@@ -339,11 +341,14 @@ func discoverDoltSources(beadsDir string, opts DiscoveryOptions) ([]DataSource, 
 
 	dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%d)/%s?parseTime=true", port, dbName)
 
-	// Use the metadata file's mod time as the source mod time
-	metaInfo, _ := os.Stat(metaPath)
+	// Query the actual latest update time from the database for accurate freshness
 	modTime := time.Now()
-	if metaInfo != nil {
-		modTime = metaInfo.ModTime()
+	if db, err := sql.Open("mysql", dsn); err == nil {
+		var latest sql.NullTime
+		if err := db.QueryRow("SELECT MAX(updated_at) FROM issues").Scan(&latest); err == nil && latest.Valid {
+			modTime = latest.Time
+		}
+		db.Close()
 	}
 
 	source := DataSource{

@@ -312,7 +312,11 @@ func validateDolt(source *DataSource, opts ValidationOptions) error {
 	if opts.CountIssues {
 		err = db.QueryRow("SELECT COUNT(*) FROM issues WHERE (tombstone IS NULL OR tombstone = 0)").Scan(&count)
 		if err != nil {
-			return fmt.Errorf("cannot count issues: %w", err)
+			// Retry without tombstone filter (column may not exist)
+			err = db.QueryRow("SELECT COUNT(*) FROM issues").Scan(&count)
+			if err != nil {
+				return fmt.Errorf("cannot count issues: %w", err)
+			}
 		}
 		source.IssueCount = count
 	}
