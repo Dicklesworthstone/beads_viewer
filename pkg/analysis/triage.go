@@ -471,9 +471,15 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	// Compute enhanced triage scores (bv-147)
 	triageScores := computeTriageScoresFromImpact(impactScores, unblocksMap, analyzer, DefaultTriageScoringOptions())
 
-	// Build recommendations using enhanced scores (bv-148)
-	// Pass triageCtx instead of analyzer for cached blocker lookups (bv-k4az)
-	recommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, opts.TopN)
+	// Build recommendations using enhanced scores (bv-148).
+	// Top picks must be selected from the full scored set before truncating
+	// recommendations; otherwise --robot-next can report no actionable work
+	// when the top opts.TopN scored items are all blocked.
+	allRecommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, len(triageScores))
+	recommendations := allRecommendations
+	if len(recommendations) > opts.TopN {
+		recommendations = recommendations[:opts.TopN]
+	}
 
 	// Build quick wins
 	quickWins := buildQuickWins(impactScores, unblocksMap, opts.QuickWinN)
@@ -482,7 +488,7 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	blockersToClear := buildBlockersToClearWithContext(triageCtx, unblocksMap, opts.BlockerN)
 
 	// Build top picks for quick ref
-	topPicks := buildTopPicks(recommendations, 3)
+	topPicks := buildTopPicks(allRecommendations, 3)
 
 	// Determine top issue for commands
 	topID := ""

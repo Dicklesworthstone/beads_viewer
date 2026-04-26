@@ -1555,6 +1555,67 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 	}
 }
 
+func TestComputeTriage_TopPicksSearchBeyondRecommendationLimit(t *testing.T) {
+	now := time.Date(2026, 4, 26, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "ready-low-impact",
+			Title:     "Ready low impact",
+			Status:    model.StatusOpen,
+			Priority:  4,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+		},
+	}
+	for i := 0; i < 8; i++ {
+		blockedID := "blocked-high-impact-" + string(rune('a'+i))
+		blockerID := "zz-gate-" + string(rune('a'+i))
+		issues = append(issues,
+			model.Issue{
+				ID:        blockedID,
+				Title:     "Blocked high impact",
+				Status:    model.StatusOpen,
+				Priority:  0,
+				IssueType: model.TypeBug,
+				Labels:    []string{"urgent"},
+				UpdatedAt: now.Add(-30 * 24 * time.Hour),
+				Dependencies: []*model.Dependency{
+					{
+						IssueID:     blockedID,
+						DependsOnID: blockerID,
+						Type:        model.DepBlocks,
+					},
+				},
+			},
+			model.Issue{
+				ID:        blockerID,
+				Title:     "Gate",
+				Status:    model.StatusOpen,
+				Priority:  4,
+				IssueType: model.TypeTask,
+				UpdatedAt: now,
+			},
+		)
+	}
+
+	analyzer := NewAnalyzer(issues)
+	stats := analyzer.AnalyzeAsync(context.Background())
+	stats.WaitForPhase2()
+
+	triage := ComputeTriageFromAnalyzer(analyzer, stats, issues, TriageOptions{TopN: 3}, now)
+	if len(triage.Recommendations) != 3 {
+		t.Fatalf("expected capped recommendations, got %d", len(triage.Recommendations))
+	}
+	if len(triage.QuickRef.TopPicks) == 0 {
+		t.Fatal("expected top picks to find actionable work beyond capped blocked recommendations")
+	}
+	for _, pick := range triage.QuickRef.TopPicks {
+		if blockers := analyzer.GetOpenBlockers(pick.ID); len(blockers) > 0 {
+			t.Fatalf("top pick %q is blocked by %v", pick.ID, blockers)
+		}
+	}
+}
+
 // TestBuildTopPicks_LimitRespected verifies the limit is respected when filtering.
 func TestBuildTopPicks_LimitRespected(t *testing.T) {
 	recommendations := []Recommendation{
