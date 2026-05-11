@@ -4,22 +4,69 @@ package loader
 
 import (
 	"bufio"
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
-// EnsureBVInGitignore ensures that .bv/ is listed in the project's .gitignore file.
-// This prevents bv-specific files (semantic search index, baselines, drift config, etc.)
-// from polluting the git repository.
+// resolveGitDir returns the absolute path of the repository's git directory
+// for projectDir, using `git rev-parse --git-dir`. This correctly handles
+// worktrees and submodules where `<projectDir>/.git` is a file pointer.
 //
-// The function is idempotent and safe to call multiple times.
-// It will:
-//   - Create .gitignore if it doesn't exist
-//   - Add ".bv/" if it's not already present (checks for .bv, .bv/, .bv/*, etc.)
-//   - Preserve existing file content and formatting
+// Exposed as a package variable so tests can stub it.
+var resolveGitDir = func(projectDir string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--git-dir")
+	cmd.Dir = projectDir
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	gitDir := strings.TrimSpace(string(out))
+	if gitDir == "" {
+		return "", os.ErrNotExist
+	}
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(projectDir, gitDir)
+	}
+	return gitDir, nil
+}
+
+// resolveCoreExcludesFile returns the path configured by
+// `git config --get core.excludesFile`, expanded for a leading `~`.
+// Returns empty string if unset.
 //
-// Returns nil on success, or an error if the file cannot be read/written.
+// Exposed as a package variable so tests can stub it.
+var resolveCoreExcludesFile = func() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "config", "--get", "core.excludesFile")
+	out, err := cmd.Output()
+	if err != nil {
+		// `git config --get` exits 1 when key is unset; treat as empty.
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return "", nil
+		}
+		return "", err
+	}
+	return expandHome(strings.TrimSpace(string(out))), nil
+}
+
+// EnsureBVInGitignore ensures that .bv/ is ignored by git for projectDir.
+// It inspects, in order:
+//   - <projectDir>/.gitignore
+//   - <gitDir>/info/exclude       (per-repo, uncommitted)
+//   - core.excludesFile           (user-wide, from `git config`)
+//   - $XDG_CONFIG_HOME/git/ignore (or ~/.config/git/ignore) and
+//     ~/.gitignore_global         (conventional fallbacks)
+//
+// If any of those already covers .bv/, the local .gitignore is left untouched.
+// Otherwise, .bv/ is appended to <projectDir>/.gitignore (creating it if
+// needed). The function is idempotent and safe to call repeatedly.
 func EnsureBVInGitignore(projectDir string) error {
 	if projectDir == "" {
 		var err error
@@ -31,25 +78,76 @@ func EnsureBVInGitignore(projectDir string) error {
 
 	gitignorePath := filepath.Join(projectDir, ".gitignore")
 
-	// Check if .bv is already in .gitignore
-	alreadyPresent, err := isBVInGitignore(gitignorePath)
-	if err != nil && !os.IsNotExist(err) {
+	// 1. Local .gitignore.
+	if covered, err := isBVInGitignore(gitignorePath); err == nil && covered {
+		return nil
+	} else if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if alreadyPresent {
-		return nil
+
+	// 2. .git/info/exclude.
+	if gitDir, err := resolveGitDir(projectDir); err == nil && gitDir != "" {
+		excludePath := filepath.Join(gitDir, "info", "exclude")
+		if covered, err := isBVInGitignore(excludePath); err == nil && covered {
+			return nil
+		}
 	}
 
-	// Append .bv/ to .gitignore
+	// 3. core.excludesFile, then conventional fallbacks.
+	for _, candidate := range globalGitignoreCandidates() {
+		if candidate == "" {
+			continue
+		}
+		if covered, err := isBVInGitignore(candidate); err == nil && covered {
+			return nil
+		}
+	}
+
+	// 4. Append.
 	return appendToGitignore(gitignorePath, ".bv/")
 }
 
-// isBVInGitignore checks if .bv is already covered by the .gitignore file.
-// It returns true if any of these patterns are found:
-//   - .bv
-//   - .bv/
-//   - .bv/*
-//   - .bv/**
+// globalGitignoreCandidates returns the ordered list of paths to inspect for a
+// global ignore of .bv/. First entry is core.excludesFile (if set), followed by
+// the conventional fallbacks git itself checks.
+func globalGitignoreCandidates() []string {
+	var paths []string
+	if p, err := resolveCoreExcludesFile(); err == nil && p != "" {
+		paths = append(paths, p)
+	}
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		paths = append(paths, filepath.Join(xdg, "git", "ignore"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		paths = append(paths,
+			filepath.Join(home, ".config", "git", "ignore"),
+			filepath.Join(home, ".gitignore_global"),
+		)
+	}
+	return paths
+}
+
+// expandHome expands a leading `~/` (or bare `~`) using the user's home dir.
+// Other paths are returned unchanged.
+func expandHome(path string) string {
+	if path == "" {
+		return ""
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return path
+		}
+		if path == "~" {
+			return home
+		}
+		return filepath.Join(home, path[2:])
+	}
+	return path
+}
+
+// isBVInGitignore reports whether the file at path contains a pattern that
+// covers the .bv directory. Missing files return (false, os.ErrNotExist).
 func isBVInGitignore(path string) (bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -60,11 +158,9 @@ func isBVInGitignore(path string) (bool, error) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// Check for patterns that would cover .bv/
 		if matchesBVPattern(line) {
 			return true, nil
 		}
@@ -73,12 +169,14 @@ func isBVInGitignore(path string) (bool, error) {
 	return false, scanner.Err()
 }
 
-// matchesBVPattern checks if a gitignore line covers the .bv directory.
+// matchesBVPattern reports whether a gitignore line covers the .bv directory.
+// Recognized forms (with optional leading `/` or `**/`):
+//
+//	.bv  .bv/  .bv/*  .bv/**  .bv/**/*
 func matchesBVPattern(line string) bool {
-	// Normalize: remove leading/trailing slashes for comparison
 	normalized := strings.TrimPrefix(line, "/")
+	normalized = strings.TrimPrefix(normalized, "**/")
 
-	// Exact matches for .bv directory
 	patterns := []string{
 		".bv",
 		".bv/",
@@ -96,34 +194,26 @@ func matchesBVPattern(line string) bool {
 	return false
 }
 
-// appendToGitignore appends a pattern to the .gitignore file.
-// It creates the file if it doesn't exist.
-// It ensures there's a newline before the pattern if the file doesn't end with one.
+// appendToGitignore appends a pattern to the .gitignore file, creating it if
+// missing. Ensures a separating blank line when appending to existing content.
 func appendToGitignore(path string, pattern string) error {
-	// Check if file exists and its current content
 	content, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
-	// Open file for appending (creates if not exists)
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
 
-	// Build the content to append based on whether file has existing content
 	var toWrite string
 	if len(content) == 0 {
-		// New file: just add comment and pattern (no leading blank line)
 		toWrite = "# bv (beads viewer) local config and caches\n" + pattern + "\n"
 	} else {
-		// Existing file: ensure proper separation
 		if content[len(content)-1] != '\n' {
-			// File doesn't end with newline, add one first
 			toWrite = "\n"
 		}
-		// Add blank line separator, comment, and pattern
 		toWrite += "\n# bv (beads viewer) local config and caches\n" + pattern + "\n"
 	}
 

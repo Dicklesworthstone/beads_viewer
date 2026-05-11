@@ -7,6 +7,25 @@ import (
 	"testing"
 )
 
+// isolateGlobalGitignore points HOME and XDG_CONFIG_HOME at an empty tmp dir
+// and stubs resolveCoreExcludesFile/resolveGitDir to return empty, so tests
+// don't read the developer's real ~/.gitignore_global or run real git.
+func isolateGlobalGitignore(t *testing.T) {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "xdg"))
+
+	origGitDir := resolveGitDir
+	origExcludes := resolveCoreExcludesFile
+	resolveGitDir = func(string) (string, error) { return "", os.ErrNotExist }
+	resolveCoreExcludesFile = func() (string, error) { return "", nil }
+	t.Cleanup(func() {
+		resolveGitDir = origGitDir
+		resolveCoreExcludesFile = origExcludes
+	})
+}
+
 func TestMatchesBVPattern(t *testing.T) {
 	tests := []struct {
 		line    string
@@ -20,6 +39,10 @@ func TestMatchesBVPattern(t *testing.T) {
 		{".bv/**/*", true},
 		{"/.bv", true}, // Leading slash should be normalized
 		{"/.bv/", true},
+		{"**/.bv", true},
+		{"**/.bv/", true},
+		{"**/.bv/*", true},
+		{"**/.bv/**", true},
 
 		// Should not match
 		{"", false},
@@ -31,6 +54,7 @@ func TestMatchesBVPattern(t *testing.T) {
 		{"node_modules/", false},
 		{".bv-backup", false},
 		{"*.bv", false},
+		{"**/.bv2", false},
 	}
 
 	for _, tt := range tests {
@@ -193,6 +217,7 @@ func TestAppendToGitignore(t *testing.T) {
 }
 
 func TestEnsureBVInGitignore(t *testing.T) {
+	isolateGlobalGitignore(t)
 	t.Run("creates gitignore if not exists", func(t *testing.T) {
 		tmpDir := t.TempDir()
 
@@ -287,6 +312,7 @@ func TestEnsureBVInGitignore(t *testing.T) {
 }
 
 func TestEnsureBVInGitignore_UsesCurrentDir(t *testing.T) {
+	isolateGlobalGitignore(t)
 	// Save current directory
 	origDir, err := os.Getwd()
 	if err != nil {
@@ -311,5 +337,117 @@ func TestEnsureBVInGitignore_UsesCurrentDir(t *testing.T) {
 
 	if !strings.Contains(string(content), ".bv/") {
 		t.Errorf("expected .bv/ in .gitignore, got:\n%s", content)
+	}
+}
+
+func TestEnsureBVInGitignore_RespectsGitInfoExclude(t *testing.T) {
+	isolateGlobalGitignore(t)
+
+	tmpDir := t.TempDir()
+	gitDir := filepath.Join(tmpDir, ".git")
+	if err := os.MkdirAll(filepath.Join(gitDir, "info"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	excludePath := filepath.Join(gitDir, "info", "exclude")
+	if err := os.WriteFile(excludePath, []byte("# local excludes\n.bv/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := resolveGitDir
+	resolveGitDir = func(dir string) (string, error) { return gitDir, nil }
+	t.Cleanup(func() { resolveGitDir = orig })
+
+	if err := EnsureBVInGitignore(tmpDir); err != nil {
+		t.Fatalf("EnsureBVInGitignore() error = %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(tmpDir, ".gitignore")); !os.IsNotExist(err) {
+		t.Fatalf("expected no .gitignore to be created, stat err = %v", err)
+	}
+}
+
+func TestEnsureBVInGitignore_RespectsCoreExcludesFile(t *testing.T) {
+	isolateGlobalGitignore(t)
+
+	tmpDir := t.TempDir()
+	globalPath := filepath.Join(tmpDir, "global_ignore")
+	if err := os.WriteFile(globalPath, []byte("**/.bv/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := resolveCoreExcludesFile
+	resolveCoreExcludesFile = func() (string, error) { return globalPath, nil }
+	t.Cleanup(func() { resolveCoreExcludesFile = orig })
+
+	projectDir := t.TempDir()
+	if err := EnsureBVInGitignore(projectDir); err != nil {
+		t.Fatalf("EnsureBVInGitignore() error = %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(projectDir, ".gitignore")); !os.IsNotExist(err) {
+		t.Fatalf("expected no .gitignore to be created, stat err = %v", err)
+	}
+}
+
+func TestEnsureBVInGitignore_RespectsHomeGitignoreGlobal(t *testing.T) {
+	isolateGlobalGitignore(t)
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.WriteFile(filepath.Join(home, ".gitignore_global"), []byte(".bv\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	projectDir := t.TempDir()
+	if err := EnsureBVInGitignore(projectDir); err != nil {
+		t.Fatalf("EnsureBVInGitignore() error = %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(projectDir, ".gitignore")); !os.IsNotExist(err) {
+		t.Fatalf("expected no .gitignore to be created, stat err = %v", err)
+	}
+}
+
+func TestEnsureBVInGitignore_AppendsWhenNoSourceCovers(t *testing.T) {
+	isolateGlobalGitignore(t)
+
+	projectDir := t.TempDir()
+	if err := EnsureBVInGitignore(projectDir); err != nil {
+		t.Fatalf("EnsureBVInGitignore() error = %v", err)
+	}
+
+	content, err := os.ReadFile(filepath.Join(projectDir, ".gitignore"))
+	if err != nil {
+		t.Fatalf("expected .gitignore created, err = %v", err)
+	}
+	if !strings.Contains(string(content), ".bv/") {
+		t.Errorf("expected .bv/ in .gitignore, got:\n%s", content)
+	}
+
+	// Second call must be idempotent.
+	if err := EnsureBVInGitignore(projectDir); err != nil {
+		t.Fatalf("second EnsureBVInGitignore() error = %v", err)
+	}
+	content2, _ := os.ReadFile(filepath.Join(projectDir, ".gitignore"))
+	if strings.Count(string(content2), ".bv/") != 1 {
+		t.Errorf("expected 1 occurrence of .bv/, got %d:\n%s", strings.Count(string(content2), ".bv/"), content2)
+	}
+}
+
+func TestExpandHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	tests := map[string]string{
+		"":              "",
+		"~":             home,
+		"~/foo":         filepath.Join(home, "foo"),
+		"/abs/path":     "/abs/path",
+		"relative/path": "relative/path",
+	}
+	for in, want := range tests {
+		if got := expandHome(in); got != want {
+			t.Errorf("expandHome(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
