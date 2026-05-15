@@ -73,6 +73,7 @@ var rootHelpSections = []flagHelpSection{
 				"profile-startup",
 				"profile-json",
 				"no-cache",
+				"no-gitignore",
 				"force-full-analysis",
 				"background-mode",
 				"no-background-mode",
@@ -191,6 +192,19 @@ func hasAnyPrefix(name string, prefixes ...string) bool {
 		}
 	}
 	return false
+}
+
+func shouldManageGitignore(noGitignore bool) bool {
+	if noGitignore {
+		return false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("BV_NO_GITIGNORE"))) {
+	case "1", "true", "yes", "on":
+		return false
+	default:
+		return true
+	}
 }
 
 type modifierFlagRule struct {
@@ -1388,6 +1402,7 @@ func main() {
 	diffSince := flag.String("diff-since", "", "Show changes since historical point (commit SHA, branch, tag, or date)")
 	asOf := flag.String("as-of", "", "View state at point in time (commit SHA, branch, tag, or date)")
 	noCache := flag.Bool("no-cache", false, "Bypass disk cache for robot triage (also: BV_NO_CACHE=1)")
+	noGitignore := flag.Bool("no-gitignore", false, "Do not automatically add .bv/ to .gitignore (also: BV_NO_GITIGNORE=1)")
 	forceFullAnalysis := flag.Bool("force-full-analysis", false, "Compute all metrics regardless of graph size (may be slow for large graphs)")
 	profileStartup := flag.Bool("profile-startup", false, "Output detailed startup timing profile for diagnostics")
 	profileJSON := flag.Bool("profile-json", false, "Output profile in JSON format (use with --profile-startup)")
@@ -1728,6 +1743,7 @@ func main() {
 		if *noCache {
 			os.Setenv("BV_NO_CACHE", "1")
 		}
+		manageGitignore := shouldManageGitignore(*noGitignore)
 
 		// Ensure static export flags are retained even when build tags strip features in some environments.
 		_ = exportPages
@@ -2317,7 +2333,9 @@ func main() {
 			// Automatically ensure .bv/ is in .gitignore at workspace root
 			// Workspace config is typically at .bv/workspace.yaml, so project root is two levels up
 			workspaceRoot := filepath.Dir(filepath.Dir(*workspaceConfig))
-			_ = loader.EnsureBVInGitignore(workspaceRoot)
+			if manageGitignore {
+				_ = loader.EnsureBVInGitignore(workspaceRoot)
+			}
 		} else {
 			// Load from single repo (original behavior)
 			var err error
@@ -2335,7 +2353,9 @@ func main() {
 			// with search indexes, baselines, and other bv-specific files.
 			// This is done silently and only in single-repo mode.
 			projectDir := filepath.Dir(beadsDir)
-			_ = loader.EnsureBVInGitignore(projectDir)
+			if manageGitignore {
+				_ = loader.EnsureBVInGitignore(projectDir)
+			}
 		}
 		loadDuration := time.Since(loadStart)
 
@@ -8071,6 +8091,7 @@ func robotEnvVars() map[string]string {
 		"TOON_INDENT":         "TOON indentation level (0-16)",
 		"BV_PRETTY_JSON":      "Set to 1 for indented JSON output",
 		"BV_ROBOT":            "Set to 1 to force robot mode (clean stdout)",
+		"BV_NO_GITIGNORE":     "Set to 1/true/yes/on to disable automatic .bv/ additions to .gitignore",
 		"BV_SEARCH_MODE":      "Search mode: text or hybrid",
 		"BV_SEARCH_PRESET":    "Hybrid search preset name",
 	}

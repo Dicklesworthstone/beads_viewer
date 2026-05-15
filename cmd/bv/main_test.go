@@ -40,6 +40,32 @@ func runCommandWithTimeout(t *testing.T, dir, exe string, args ...string) (strin
 	return stdout.String(), stderr.String(), err
 }
 
+func TestShouldManageGitignore(t *testing.T) {
+	tests := []struct {
+		name        string
+		envValue    string
+		flagValue   bool
+		wantManaged bool
+	}{
+		{name: "default manages gitignore", wantManaged: true},
+		{name: "flag disables gitignore management", flagValue: true, wantManaged: false},
+		{name: "env one disables gitignore management", envValue: "1", wantManaged: false},
+		{name: "env true disables gitignore management", envValue: "true", wantManaged: false},
+		{name: "env yes disables gitignore management", envValue: "yes", wantManaged: false},
+		{name: "env on disables gitignore management", envValue: "on", wantManaged: false},
+		{name: "env false leaves gitignore management enabled", envValue: "false", wantManaged: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("BV_NO_GITIGNORE", tt.envValue)
+			if got := shouldManageGitignore(tt.flagValue); got != tt.wantManaged {
+				t.Fatalf("shouldManageGitignore(%v) = %v, want %v", tt.flagValue, got, tt.wantManaged)
+			}
+		})
+	}
+}
+
 func TestFilterByRepo_CaseInsensitiveAndFlexibleSeparators(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "api-AUTH-1", SourceRepo: "services/api"},

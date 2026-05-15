@@ -3689,6 +3689,7 @@ bv has a comprehensive built-in help system:
 | `BV_FRESHNESS_WARN_S` | Snapshot staleness warning threshold (seconds). | `30` |
 | `BV_FRESHNESS_STALE_S` | Snapshot staleness critical threshold (seconds). | `120` |
 | `BV_MAX_LINE_SIZE_MB` | Max JSONL line size in MB (lines larger than this are skipped with a warning). | `10` |
+| `BV_NO_GITIGNORE` | Disable automatic `.bv/` additions to `.gitignore` (`1`/`true`/`yes`/`on`). | (disabled) |
 | `BV_SKIP_PHASE2` | Skip Phase 2 graph metrics (centrality, cycles, critical path) (`1`/`0`). | (disabled) |
 | `BV_PHASE2_TIMEOUT_S` | Override per-metric Phase 2 timeouts (seconds). | (size-based) |
 | `BV_SEMANTIC_EMBEDDER` | Semantic embedding provider for `bv --search` and TUI semantic mode. | `hash` |
