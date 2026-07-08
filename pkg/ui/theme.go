@@ -12,8 +12,10 @@ import (
 // package init so every style helper can branch without re-detecting.
 var TermProfile colorprofile.Profile
 
-// BVThemeOverride holds the user's explicit theme preference from BV_THEME.
-// Values: "" (auto-detect), "dark", "light".
+// BVThemeOverride holds the user's explicit theme preference.
+// Values: "" (auto-detect), "dark", "light". It can be set from (in order of
+// precedence) the --theme flag, the BV_THEME env var, or ~/.config/bv/config.yaml.
+// Use SetThemeOverride to change it so the global renderer stays in sync.
 var BVThemeOverride string
 
 func init() {
@@ -23,8 +25,41 @@ func init() {
 	// This is useful when the terminal reports the wrong background color or
 	// when using themes that confuse auto-detection (e.g., Windows Terminal
 	// custom schemes, tmux, SSH). (bv-128)
+	//
+	// This only records the preference; the caller (cmd/bv) resolves the full
+	// flag > env > config precedence and calls SetThemeOverride once at startup,
+	// which is what actually applies it to the global renderer.
 	if v := strings.ToLower(strings.TrimSpace(os.Getenv("BV_THEME"))); v == "light" || v == "dark" {
 		BVThemeOverride = v
+	}
+}
+
+// SetThemeOverride records an explicit light/dark preference and applies it to
+// the GLOBAL lipgloss renderer via lipgloss.SetHasDarkBackground.
+//
+// This is the crucial step for light-terminal support: most of the UI is built
+// with the package-global lipgloss.NewStyle() (and markdown uses the global
+// lipgloss.HasDarkBackground()), so every AdaptiveColor resolves against the
+// default renderer. Setting only a per-model renderer — as older code did — left
+// the bulk of the UI stuck on auto-detection, which falls back to DARK when the
+// terminal does not answer the background query (common over SSH/tmux). By
+// pinning the global renderer here, light and dark themes render consistently.
+//
+// Accepted values are "light" and "dark"; "auto", "" or any unrecognized value
+// clears the override and leaves lipgloss's auto-detection in place. This should
+// be called once, early at startup, before styles are rendered. (bv-128)
+func SetThemeOverride(v string) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "light":
+		BVThemeOverride = "light"
+		lipgloss.SetHasDarkBackground(false)
+	case "dark":
+		BVThemeOverride = "dark"
+		lipgloss.SetHasDarkBackground(true)
+	default:
+		// "auto", "", or unrecognized: leave the global renderer's
+		// auto-detection untouched so adaptive colors follow the terminal.
+		BVThemeOverride = ""
 	}
 }
 

@@ -3774,6 +3774,38 @@ The UI uses a visually distinct, high-contrast theme inspired by Dracula Princip
 *   **Status Open:** `#50FA7B` (Green)
 *   **Status Blocked:** `#FF5555` (Red)
 
+#### Light & dark terminals
+
+`bv` ships **both a light and a dark palette** and picks one to match your terminal
+background. Every color is WCAG-AA tuned for its background, so text stays readable
+either way.
+
+By default `bv` **auto-detects** the terminal background. Detection is unreliable in
+some environments (SSH, `tmux`/`screen`, terminals that don't answer the background
+query), where it falls back to assuming a **dark** background — which makes the light
+(near-white) text unreadable on a light terminal. If that happens, pin the theme
+explicitly:
+
+```bash
+bv --theme light      # force the light palette (dark text on light background)
+bv --theme dark       # force the dark palette (light text on dark background)
+bv --theme auto       # force auto-detection (the default)
+```
+
+You can also set it persistently, without passing the flag every time:
+
+```bash
+# Environment variable (e.g. in your shell profile)
+export BV_THEME=light
+```
+
+```yaml
+# ~/.config/bv/config.yaml
+theme: light   # light | dark | auto
+```
+
+**Precedence:** `--theme` flag → `BV_THEME` env var → `~/.config/bv/config.yaml` → auto-detect.
+
 ---
 
 ## 📄 License

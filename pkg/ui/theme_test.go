@@ -27,6 +27,52 @@ func isColorEmpty(c lipgloss.AdaptiveColor) bool {
 	return c.Light == "" && c.Dark == ""
 }
 
+func TestSetThemeOverride(t *testing.T) {
+	// SetThemeOverride mutates package-global and default-renderer state; save
+	// and restore so we don't leak into other tests.
+	savedOverride := BVThemeOverride
+	savedDark := lipgloss.HasDarkBackground()
+	defer func() {
+		BVThemeOverride = savedOverride
+		lipgloss.SetHasDarkBackground(savedDark)
+	}()
+
+	SetThemeOverride("light")
+	if BVThemeOverride != "light" {
+		t.Errorf("after light: BVThemeOverride = %q, want %q", BVThemeOverride, "light")
+	}
+	if lipgloss.HasDarkBackground() {
+		t.Error("after light: global HasDarkBackground() = true, want false")
+	}
+
+	SetThemeOverride("dark")
+	if BVThemeOverride != "dark" {
+		t.Errorf("after dark: BVThemeOverride = %q, want %q", BVThemeOverride, "dark")
+	}
+	if !lipgloss.HasDarkBackground() {
+		t.Error("after dark: global HasDarkBackground() = false, want true")
+	}
+
+	// Case-insensitive and whitespace-tolerant.
+	SetThemeOverride("  LIGHT ")
+	if BVThemeOverride != "light" || lipgloss.HasDarkBackground() {
+		t.Errorf("after '  LIGHT ': BVThemeOverride = %q, dark = %v; want light/false",
+			BVThemeOverride, lipgloss.HasDarkBackground())
+	}
+
+	// "auto" and unrecognized values clear the override.
+	SetThemeOverride("dark")
+	SetThemeOverride("auto")
+	if BVThemeOverride != "" {
+		t.Errorf("after auto: BVThemeOverride = %q, want empty", BVThemeOverride)
+	}
+	SetThemeOverride("dark")
+	SetThemeOverride("banana")
+	if BVThemeOverride != "" {
+		t.Errorf("after unrecognized value: BVThemeOverride = %q, want empty", BVThemeOverride)
+	}
+}
+
 func TestGetStatusColor(t *testing.T) {
 	renderer := lipgloss.NewRenderer(nil)
 	theme := DefaultTheme(renderer)

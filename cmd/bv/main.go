@@ -77,6 +77,7 @@ var rootHelpSections = []flagHelpSection{
 				"profile-json",
 				"no-cache",
 				"force-full-analysis",
+				"theme",
 				"background-mode",
 				"no-background-mode",
 			)
@@ -1577,6 +1578,8 @@ func main() {
 	debugRender := flag.String("debug-render", "", "Render a view and output to file (views: insights, board)")
 	debugWidth := flag.Int("debug-width", 180, "Width for debug render")
 	debugHeight := flag.Int("debug-height", 50, "Height for debug render")
+	// Color theme selection (bv-128): light, dark, or auto (default).
+	themeFlag := flag.String("theme", "", "Color theme for the TUI: light, dark, or auto (default: auto-detect terminal background)")
 	// Experimental background snapshot worker (bv-o11l)
 	backgroundMode := flag.Bool("background-mode", false, "Enable experimental background snapshot loading (TUI only)")
 	noBackgroundMode := flag.Bool("no-background-mode", false, "Disable experimental background snapshot loading (TUI only)")
@@ -1683,6 +1686,17 @@ func main() {
 		NotReadyLabels:          robotNotReadyLabels,
 	})
 	rootCmd := newRootCommand(func() error {
+		// Resolve and apply the color theme before any styling is computed, so
+		// every adaptive color (global styles, badges, markdown) agrees on the
+		// terminal background. Precedence: --theme > BV_THEME > config > auto.
+		// This is what makes light terminals readable when auto-detection fails
+		// (e.g. over SSH/tmux, where lipgloss falls back to a dark background). (bv-128)
+		if flag.CommandLine.Changed("theme") && normalizeThemePreference(*themeFlag) == "" &&
+			strings.TrimSpace(*themeFlag) != "" {
+			fmt.Fprintf(os.Stderr, "Warning: invalid --theme value %q (expected light, dark, or auto); using auto-detect\n", *themeFlag)
+		}
+		ui.SetThemeOverride(resolveThemePreference(*themeFlag, flag.CommandLine.Changed("theme")))
+
 		modifierRules := []modifierFlagRule{
 			{modifier: "robot-diff", requires: []string{"diff-since"}},
 			{modifier: "robot-search", requires: []string{"search"}},
@@ -5585,6 +5599,74 @@ func countEdges(issues []model.Issue) int {
 		}
 	}
 	return count
+}
+
+// normalizeThemePreference canonicalizes a theme string to "light", "dark",
+// "auto", or "" (unrecognized/empty). Matching is case-insensitive and
+// whitespace-tolerant.
+func normalizeThemePreference(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "light":
+		return "light"
+	case "dark":
+		return "dark"
+	case "auto":
+		return "auto"
+	default:
+		return ""
+	}
+}
+
+// resolveThemePreference determines the effective color-theme preference using
+// the precedence: --theme flag > BV_THEME env var > ~/.config/bv/config.yaml >
+// auto-detect. It returns "light", "dark", "auto", or "" when nothing is
+// specified (in which case auto-detection is used). An invalid --theme value is
+// treated as "auto" so the flag never silently falls through to a lower-priority
+// source the user did not intend. (bv-128)
+func resolveThemePreference(flagVal string, flagChanged bool) string {
+	if flagChanged {
+		if v := normalizeThemePreference(flagVal); v != "" {
+			return v
+		}
+		return "auto" // explicit but invalid → honor the flag level as auto
+	}
+	if v := normalizeThemePreference(os.Getenv("BV_THEME")); v != "" {
+		return v
+	}
+	if v, ok := loadThemeFromUserConfig(); ok {
+		if nv := normalizeThemePreference(v); nv != "" {
+			return nv
+		}
+	}
+	return ""
+}
+
+// loadThemeFromUserConfig reads the top-level `theme:` key from
+// ~/.config/bv/config.yaml. It returns (value, true) when the key is present and
+// non-empty, else ("", false). Validation of the value happens in
+// normalizeThemePreference. (bv-128)
+func loadThemeFromUserConfig() (string, bool) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || homeDir == "" {
+		return "", false
+	}
+	configPath := filepath.Join(homeDir, ".config", "bv", "config.yaml")
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return "", false
+	}
+
+	var cfg struct {
+		Theme string `yaml:"theme"`
+	}
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return "", false
+	}
+	if strings.TrimSpace(cfg.Theme) == "" {
+		return "", false
+	}
+	return cfg.Theme, true
 }
 
 func loadBackgroundModeFromUserConfig() (bool, bool) {
