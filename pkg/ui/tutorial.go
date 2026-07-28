@@ -1576,7 +1576,9 @@ Press **Enter** on any issue to see its full details.
 | Key | Action |
 |-----|--------|
 | **O** | Open/edit in external editor |
-| **C** | Copy issue ID to clipboard |
+| **y** | Copy issue ID to clipboard |
+| **C** | Copy the full issue to clipboard |
+| **D** | Delete issue after confirmation |
 | **j/k** | Scroll content up/down |
 | **Esc** | Return to list |
 

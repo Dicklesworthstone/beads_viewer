@@ -222,9 +222,11 @@ const contextHelpDetail = `## Detail View
   Esc       Return to list
   Tab       Switch to split view
 
-**Actions (from list view)**
+**Actions**
   O         Open in editor
-  C         Copy issue ID
+  y         Copy issue ID
+  C         Copy full issue
+  D         Delete issue (asks first)
 
 **Info Shown**
 • Full description (markdown)

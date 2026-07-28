@@ -5532,8 +5532,11 @@ func (m *Model) renderHelpOverlay() string {
 		{"t", "Time-travel"},
 		{"T", "Quick time-travel"},
 		{"x", "Export markdown"},
-		{"C", "Copy to clipboard"},
+		{"y", "Copy issue ID"},
+		{"C", "Copy full issue"},
 		{"O", "Open in editor"},
+		{"D", "Delete issue (detail)"},
+		{"R-click", "Copy ID/description"},
 	}
 
 	statusSection := []struct{ key, desc string }{

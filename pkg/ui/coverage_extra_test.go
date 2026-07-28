@@ -1294,6 +1294,14 @@ func TestHelpOverlayScroll(t *testing.T) {
 	if !strings.Contains(out, "Tutorial") {
 		t.Fatalf("help overlay should show Tutorial hint")
 	}
+	// Fork-added user actions must remain discoverable from the primary "?"
+	// help surface. This guards against updating only the key registry or footer
+	// when a new action is introduced.
+	for _, action := range []string{"Delete issue", "Copy issue ID", "Copy full issue", "R-click", "Copy ID/description"} {
+		if !strings.Contains(out, action) {
+			t.Errorf("help overlay should document %q", action)
+		}
+	}
 
 	// Test Space key closes help for tutorial entry (bv-0trk)
 	m.showHelp = true

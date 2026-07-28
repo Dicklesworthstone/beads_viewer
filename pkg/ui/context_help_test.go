@@ -203,6 +203,9 @@ func TestContextHelpKeyboardShortcuts(t *testing.T) {
 		{ContextGraph, "f"},
 		{ContextBoard, "h/l"},
 		{ContextDetail, "Esc"},
+		{ContextDetail, "y"},
+		{ContextDetail, "C"},
+		{ContextDetail, "D"},
 		{ContextSplit, "Tab"},
 		{ContextFilter, "/"},
 	}
