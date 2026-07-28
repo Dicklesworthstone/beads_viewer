@@ -872,6 +872,7 @@ func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edge
         <div class="context-menu-divider"></div>
         <div class="context-menu-item" id="ctx-path">🛤️ Find path to...</div>
         <div class="context-menu-item" id="ctx-copy">📋 Copy ID</div>
+        <div class="context-menu-item" id="ctx-copy-description">📝 Copy description</div>
     </div>
     <div class="help-overlay" id="help-overlay">
         <div class="help-content">
@@ -1525,6 +1526,17 @@ document.getElementById('ctx-connected').onclick = () => {
     hideContextMenu();
 };
 document.getElementById('ctx-copy').onclick = () => { if (contextNode) { navigator.clipboard.writeText(contextNode.id); showToast('Copied: ' + contextNode.id); } hideContextMenu(); };
+document.getElementById('ctx-copy-description').onclick = () => {
+    if (contextNode) {
+        if (contextNode.description) {
+            navigator.clipboard.writeText(contextNode.description);
+            showToast('Description copied');
+        } else {
+            showToast('No description to copy');
+        }
+    }
+    hideContextMenu();
+};
 document.getElementById('ctx-path').onclick = () => { showToast('Click another node to find path'); pathStartNode = contextNode; hideContextMenu(); };
 
 let pathStartNode = null;

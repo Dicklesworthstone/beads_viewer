@@ -79,6 +79,46 @@ func TestGenerateInteractiveGraphHTML_Basic(t *testing.T) {
 	}
 }
 
+func TestGenerateInteractiveGraphHTML_ContextMenuCopiesIDOrDescription(t *testing.T) {
+	tmpDir := t.TempDir()
+	issues := []model.Issue{
+		{
+			ID:          "bv-copy",
+			Title:       "Copy fields independently",
+			Description: "Only this description should be copied.",
+			Status:      model.StatusOpen,
+			Priority:    2,
+		},
+	}
+
+	path, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues: issues,
+		Path:   tmpDir + "/copy_context_menu.html",
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML failed: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read generated graph: %v", err)
+	}
+	html := string(data)
+
+	required := []string{
+		`id="ctx-copy">📋 Copy ID`,
+		`id="ctx-copy-description">📝 Copy description`,
+		"navigator.clipboard.writeText(contextNode.id)",
+		"navigator.clipboard.writeText(contextNode.description)",
+		"showToast('No description to copy')",
+	}
+	for _, want := range required {
+		if !strings.Contains(html, want) {
+			t.Fatalf("generated graph missing context-menu behavior %q", want)
+		}
+	}
+}
+
 func TestGenerateInteractiveGraphHTML_EscapesDynamicHTML(t *testing.T) {
 	tmpDir := t.TempDir()
 	issues := []model.Issue{
