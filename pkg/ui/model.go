@@ -60,6 +60,7 @@ const (
 	focusRepoPicker
 	focusHelp
 	focusQuitConfirm
+	focusDeleteConfirm
 	focusTimeTravelInput
 	focusHistory
 	focusAttention
@@ -134,6 +135,15 @@ func WaitForPhase2Cmd(stats *analysis.GraphStats) tea.Cmd {
 
 // FileChangedMsg is sent when the beads file changes on disk
 type FileChangedMsg struct{}
+
+// deleteIssueResultMsg reports the result of the guarded Beads CLI deletion.
+// Deletion runs outside Update so a slow CLI/database operation never freezes
+// the terminal interface.
+type deleteIssueResultMsg struct {
+	issueID string
+	output  string
+	err     error
+}
 
 // editorExitMsg is sent when a terminal editor process exits after editing an issue (bv-134).
 type editorExitMsg struct {
@@ -479,6 +489,11 @@ type Model struct {
 	showHelp                 bool
 	helpScroll               int // Scroll offset for help overlay
 	showQuitConfirm          bool
+	showDeleteConfirm        bool
+	deleteTargetID           string
+	deleteTargetTitle        string
+	deleteConfirmFocus       int // 0 = Cancel, 1 = Delete; Cancel is deliberately the default.
+	deleteInProgress         bool
 	ready                    bool
 	width                    int
 	height                   int
@@ -1317,6 +1332,47 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg := msg.(type) {
+	case deleteIssueResultMsg:
+		// Ignore a stale completion if the dialog was replaced before the CLI
+		// returned. This should be rare, but prevents feedback for one bead from
+		// being applied to a later selection.
+		if msg.issueID != m.deleteTargetID {
+			return m, nil
+		}
+
+		m.deleteInProgress = false
+		m.showDeleteConfirm = false
+		m.deleteTargetID = ""
+		m.deleteTargetTitle = ""
+
+		if msg.err != nil {
+			detail := strings.Join(strings.Fields(msg.output), " ")
+			if detail == "" {
+				detail = msg.err.Error()
+			}
+			if len(detail) > 180 {
+				detail = detail[:177] + "..."
+			}
+			m.statusMsg = fmt.Sprintf("❌ Could not delete %s: %s", msg.issueID, detail)
+			m.statusIsError = true
+			m.focused = focusDetail
+			return m, nil
+		}
+
+		m.showDetails = false
+		m.focused = focusList
+		m.statusMsg = fmt.Sprintf("Deleted %s (recoverable tombstone)", msg.issueID)
+		m.statusIsError = false
+
+		// The Beads CLI updates its authoritative store and JSONL export. Force
+		// the same reload path used by Ctrl+R so every view drops the tombstoned
+		// bead immediately instead of waiting for a filesystem debounce.
+		if m.backgroundWorker != nil {
+			m.backgroundWorker.ForceRefresh()
+			return m, WaitForBackgroundWorkerMsgCmd(m.backgroundWorker)
+		}
+		return m, func() tea.Msg { return FileChangedMsg{} }
+
 	case UpdateMsg:
 		if !updater.IsNewerThanCurrent(msg.TagName) {
 			m.updateAvailable = false
@@ -2495,6 +2551,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusMsg = ""
 		m.statusIsError = false
 
+		// Handle guarded bead deletion before every other modal and global key.
+		// While the CLI is running, input is intentionally ignored except for
+		// Ctrl+C; allowing the target or selection to change would make the
+		// completion ambiguous.
+		if m.showDeleteConfirm {
+			if m.deleteInProgress {
+				if msg.String() == "ctrl+c" {
+					return m, tea.Quit
+				}
+				return m, nil
+			}
+
+			switch msg.String() {
+			case "left", "right", "tab", "shift+tab":
+				m.deleteConfirmFocus = 1 - m.deleteConfirmFocus
+			case "esc", "q", "n", "N":
+				m.cancelDeleteConfirmation()
+			case "enter":
+				if m.deleteConfirmFocus == 0 {
+					m.cancelDeleteConfirmation()
+					return m, nil
+				}
+				m.deleteInProgress = true
+				return m, deleteIssueCmd(m.deleteTargetID, m.beadsPath)
+			}
+			return m, nil
+		}
+
 		// Handle AGENTS.md prompt modal (bv-i8dk)
 		if m.showAgentPrompt {
 			m.agentPromptModal, cmd = m.agentPromptModal.Update(msg)
@@ -3367,7 +3451,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case focusDetail:
-				// Intercept "O" in detail view for editor dispatch (bv-134)
+				// Intercept write actions in detail view before passing input to
+				// the scrolling viewport.
+				if keyStr == "D" {
+					m.promptDeleteSelectedIssue()
+					return m, nil
+				}
 				if keyStr == "O" {
 					if editorCmd := m.openInEditor(); editorCmd != nil {
 						return m, editorCmd
@@ -4917,8 +5006,11 @@ func (m Model) View() string {
 
 	var body string
 
-	// Quit confirmation overlay takes highest priority
-	if m.showQuitConfirm {
+	// Destructive confirmation takes highest priority so no other overlay can
+	// obscure the exact bead ID being acted on.
+	if m.showDeleteConfirm {
+		body = m.renderDeleteConfirm()
+	} else if m.showQuitConfirm {
 		body = m.renderQuitConfirm()
 	} else if m.showAgentPrompt {
 		// AGENTS.md prompt modal (bv-i8dk)
@@ -5042,6 +5134,64 @@ func (m Model) renderQuitConfirm() string {
 		lipgloss.Center,
 		box,
 	)
+}
+
+func (m Model) renderDeleteConfirm() string {
+	t := m.theme
+
+	boxStyle := t.Renderer.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(t.Blocked).
+		Padding(1, 3).
+		Align(lipgloss.Center).
+		MaxWidth(max(40, m.width-8))
+
+	titleStyle := t.Renderer.NewStyle().
+		Foreground(t.Blocked).
+		Bold(true)
+	idStyle := t.Renderer.NewStyle().
+		Foreground(t.Primary).
+		Bold(true)
+	textStyle := t.Renderer.NewStyle().
+		Foreground(t.Base.GetForeground())
+	mutedStyle := t.Renderer.NewStyle().
+		Foreground(t.Subtext)
+
+	button := func(label string, focused, destructive bool) string {
+		style := t.Renderer.NewStyle().Padding(0, 2)
+		if focused {
+			if destructive {
+				style = style.Background(t.Blocked).Foreground(t.Base.GetBackground()).Bold(true)
+			} else {
+				style = style.Background(t.Primary).Foreground(t.Base.GetBackground()).Bold(true)
+			}
+		} else {
+			style = style.Foreground(t.Subtext)
+		}
+		return style.Render(label)
+	}
+
+	var content string
+	if m.deleteInProgress {
+		content = titleStyle.Render("Deleting bead…") + "\n\n" +
+			idStyle.Render(m.deleteTargetID) + "\n\n" +
+			mutedStyle.Render("Waiting for the Beads CLI")
+	} else {
+		targetTitle := strings.TrimSpace(m.deleteTargetTitle)
+		if targetTitle == "" {
+			targetTitle = "(untitled)"
+		}
+		content = titleStyle.Render("Delete this bead?") + "\n\n" +
+			idStyle.Render(m.deleteTargetID) + "\n" +
+			textStyle.Render(targetTitle) + "\n\n" +
+			mutedStyle.Render("Creates a recoverable tombstone. Deletion is refused if other beads depend on it.") + "\n\n" +
+			button("Cancel", m.deleteConfirmFocus == 0, false) + "  " +
+			button("Delete", m.deleteConfirmFocus == 1, true) + "\n\n" +
+			mutedStyle.Render("←/→ or Tab to choose • Enter to confirm • Esc to cancel")
+	}
+
+	box := boxStyle.Render(content)
+	return lipgloss.Place(m.width, m.height-1, lipgloss.Center, lipgloss.Center, box)
 }
 
 func (m Model) renderListWithHeader() string {
@@ -6439,8 +6589,11 @@ func (m *Model) renderFooter() string {
 			keyHints = append(keyHints, keyStyle.Render("t")+" exit diff", keyStyle.Render("C")+" copy", keyStyle.Render("abgi")+" views", keyStyle.Render("?")+" help")
 		} else if m.isSplitView {
 			keyHints = append(keyHints, keyStyle.Render("tab")+" focus", keyStyle.Render("C")+" copy", keyStyle.Render("x")+" export", keyStyle.Render("Ctrl+R")+" refresh", keyStyle.Render("?")+" help")
+			if m.focused == focusDetail {
+				keyHints = append(keyHints, keyStyle.Render("D")+" delete")
+			}
 		} else if m.showDetails {
-			keyHints = append(keyHints, keyStyle.Render("esc")+" back", keyStyle.Render("C")+" copy", keyStyle.Render("O")+" edit", keyStyle.Render("Ctrl+R")+" refresh", keyStyle.Render("?")+" help")
+			keyHints = append(keyHints, keyStyle.Render("esc")+" back", keyStyle.Render("C")+" copy", keyStyle.Render("O")+" edit", keyStyle.Render("D")+" delete", keyStyle.Render("Ctrl+R")+" refresh", keyStyle.Render("?")+" help")
 		} else {
 			keyHints = append(keyHints, keyStyle.Render("⏎")+" details", keyStyle.Render("t")+" diff", keyStyle.Render("S")+" triage", keyStyle.Render("l")+" labels", keyStyle.Render("Ctrl+R")+" refresh", keyStyle.Render("?")+" help")
 			if m.workspaceMode {
@@ -7348,7 +7501,7 @@ func (m Model) listChromeLines() int {
 func (m Model) handleLeftClick(x, y int) Model {
 	// Ignore clicks while any overlay/modal is up: the main list isn't drawn,
 	// so there is nothing meaningful to focus or select.
-	if m.showQuitConfirm || m.showAgentPrompt || m.showCassModal ||
+	if m.showDeleteConfirm || m.showQuitConfirm || m.showAgentPrompt || m.showCassModal ||
 		m.showUpdateModal || m.showLabelHealthDetail || m.showLabelGraphAnalysis ||
 		m.showLabelDrilldown || m.showAlertsPanel || m.showTimeTravelPrompt ||
 		m.showRecipePicker || m.showRepoPicker || m.showLabelPicker ||
@@ -7914,6 +8067,8 @@ func (f focus) String() string {
 		return "help"
 	case focusQuitConfirm:
 		return "quit_confirm"
+	case focusDeleteConfirm:
+		return "delete_confirm"
 	case focusTimeTravelInput:
 		return "time_travel_input"
 	case focusHistory:
@@ -7937,6 +8092,114 @@ func (f focus) String() string {
 	default:
 		return "unknown"
 	}
+}
+
+// promptDeleteSelectedIssue opens the guarded confirmation for the bead shown
+// in the detail view. Historical and multi-repository views remain read-only:
+// neither has one unambiguous writable Beads store.
+func (m *Model) promptDeleteSelectedIssue() {
+	if m.timeTravelMode {
+		m.statusMsg = "Deletion is unavailable while viewing historical state"
+		m.statusIsError = true
+		return
+	}
+	if m.workspaceMode || m.beadsPath == "" {
+		m.statusMsg = "Deletion requires a single writable Beads repository"
+		m.statusIsError = true
+		return
+	}
+
+	selectedItem := m.list.SelectedItem()
+	if selectedItem == nil {
+		m.statusMsg = "❌ No issue selected"
+		m.statusIsError = true
+		return
+	}
+	issueItem, ok := selectedItem.(IssueItem)
+	if !ok {
+		m.statusMsg = "❌ Invalid item type"
+		m.statusIsError = true
+		return
+	}
+
+	m.deleteTargetID = issueItem.Issue.ID
+	m.deleteTargetTitle = issueItem.Issue.Title
+	m.deleteConfirmFocus = 0
+	m.deleteInProgress = false
+	m.showDeleteConfirm = true
+	m.focused = focusDeleteConfirm
+}
+
+func (m *Model) cancelDeleteConfirmation() {
+	m.showDeleteConfirm = false
+	m.deleteTargetID = ""
+	m.deleteTargetTitle = ""
+	m.deleteConfirmFocus = 0
+	m.deleteInProgress = false
+	m.focused = focusDetail
+}
+
+// deleteIssueCmd asks the repository's own Beads CLI to create a tombstone.
+// It deliberately omits --force, --cascade, and --hard so dependency checks and
+// recovery history remain intact.
+func deleteIssueCmd(issueID, beadsPath string) tea.Cmd {
+	return func() tea.Msg {
+		cmd, err := buildDeleteIssueCommand(issueID, beadsPath)
+		if err != nil {
+			return deleteIssueResultMsg{issueID: issueID, err: err}
+		}
+		output, err := cmd.CombinedOutput()
+		return deleteIssueResultMsg{
+			issueID: issueID,
+			output:  string(output),
+			err:     err,
+		}
+	}
+}
+
+func buildDeleteIssueCommand(issueID, beadsPath string) (*exec.Cmd, error) {
+	if strings.TrimSpace(issueID) == "" {
+		return nil, fmt.Errorf("issue ID is empty")
+	}
+	if strings.TrimSpace(beadsPath) == "" {
+		return nil, fmt.Errorf("Beads source path is unavailable")
+	}
+
+	absolutePath, err := filepath.Abs(beadsPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve Beads source path: %w", err)
+	}
+	beadsDir := filepath.Dir(absolutePath)
+	if info, statErr := os.Stat(absolutePath); statErr == nil && info.IsDir() {
+		beadsDir = absolutePath
+	}
+	if filepath.Base(beadsDir) != ".beads" {
+		return nil, fmt.Errorf("Beads source is not inside a .beads directory")
+	}
+	repoDir := filepath.Dir(beadsDir)
+
+	tool := ""
+	if info, statErr := os.Stat(filepath.Join(beadsDir, "beads.db")); statErr == nil && !info.IsDir() {
+		tool = "br"
+	} else if info, statErr := os.Stat(filepath.Join(beadsDir, "embeddeddolt")); statErr == nil && info.IsDir() {
+		tool = "bd"
+	} else if _, lookErr := exec.LookPath("br"); lookErr == nil {
+		tool = "br"
+	} else if _, lookErr := exec.LookPath("bd"); lookErr == nil {
+		tool = "bd"
+	} else {
+		return nil, fmt.Errorf("neither br nor bd is installed")
+	}
+
+	cmd := exec.Command(tool,
+		"delete",
+		"--reason", "Deleted from bv interactive viewer",
+		"--json",
+		"--",
+		issueID,
+	)
+	cmd.Dir = repoDir
+	return cmd, nil
 }
 
 // FocusState returns the current focus state as a string for testing (bv-5e5q).

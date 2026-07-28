@@ -57,6 +57,11 @@ type flagHelpSection struct {
 	match func(string) bool
 }
 
+// tuiWindowTitle is build metadata rather than the command name. Official
+// builds keep the "bv" default; identifiable forks can override it with:
+// -ldflags "-X main.tuiWindowTitle=<name>"
+var tuiWindowTitle = "bv"
+
 var rootHelpSections = []flagHelpSection{
 	{
 		title: "General Flags",
@@ -5525,6 +5530,10 @@ func runTUIProgram(m ui.Model) error {
 		tea.WithMouseCellMotion(),
 		tea.WithoutSignalHandler(),
 	)
+	// Set the startup title before Run initializes the renderer. This gives
+	// custom builds an unmistakable terminal tab/window label without changing
+	// the executable name or any CLI commands.
+	p.SetWindowTitle(tuiWindowTitle)
 
 	runDone := make(chan struct{})
 	defer close(runDone)

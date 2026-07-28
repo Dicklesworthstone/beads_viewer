@@ -13,6 +13,7 @@ const (
 	ContextRecipePicker       Context = "recipe-picker"
 	ContextHelp               Context = "help"
 	ContextQuitConfirm        Context = "quit-confirm"
+	ContextDeleteConfirm      Context = "delete-confirm"
 	ContextLabelHealthDetail  Context = "label-health-detail"
 	ContextLabelDrilldown     Context = "label-drilldown"
 	ContextLabelGraphAnalysis Context = "label-graph-analysis"
@@ -69,6 +70,11 @@ func (m Model) CurrentContext() Context {
 	// Quit confirmation
 	if m.showQuitConfirm {
 		return ContextQuitConfirm
+	}
+
+	// Delete confirmation
+	if m.showDeleteConfirm {
+		return ContextDeleteConfirm
 	}
 
 	// Label picker overlay
@@ -193,6 +199,7 @@ func (c Context) Description() string {
 		ContextRecipePicker:       "Recipe picker",
 		ContextHelp:               "Help overlay",
 		ContextQuitConfirm:        "Quit confirmation",
+		ContextDeleteConfirm:      "Delete confirmation",
 		ContextLabelHealthDetail:  "Label health detail",
 		ContextLabelDrilldown:     "Label drilldown",
 		ContextLabelGraphAnalysis: "Label graph analysis",
@@ -225,7 +232,7 @@ func (c Context) Description() string {
 // IsOverlay returns true if the context is an overlay (modal/popup)
 func (c Context) IsOverlay() bool {
 	switch c {
-	case ContextLabelPicker, ContextRecipePicker, ContextHelp, ContextQuitConfirm,
+	case ContextLabelPicker, ContextRecipePicker, ContextHelp, ContextQuitConfirm, ContextDeleteConfirm,
 		ContextLabelHealthDetail, ContextLabelDrilldown, ContextLabelGraphAnalysis,
 		ContextTimeTravelInput, ContextAlerts, ContextRepoPicker, ContextAgentPrompt,
 		ContextCassSession:
@@ -275,6 +282,7 @@ func (c Context) TutorialPages() []int {
 		ContextLabelGraphAnalysis: {6, 11},   // Graph, Labels
 		ContextTimeTravelInput:    {10},      // Time-Travel
 		ContextQuitConfirm:        {1},       // Navigation basics
+		ContextDeleteConfirm:      {4},       // Detail view actions
 		ContextCassSession:        {8},       // History (cass integrates with history)
 	}
 	if pages, ok := pageMap[c]; ok {

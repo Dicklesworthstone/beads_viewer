@@ -322,6 +322,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"y", "Copy issue ID", "Actions", "all"},
 		{"C", "Copy full issue", "Actions", "detail"},
 		{"O", "Open in $EDITOR", "Actions", "detail"},
+		{"D", "Delete selected issue", "Actions", "detail"},
 		{"'", "Recipe picker", "Actions", "list"},
 		{"U", "Self-update check", "Actions", "all"},
 		{"V", "Cass sessions", "Actions", "list"},
