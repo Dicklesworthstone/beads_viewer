@@ -1,81 +1,64 @@
-# Beads - AI-Native Issue Tracking
+# Beads with br (beads_rust)
 
-Welcome to Beads! This repository uses **Beads** for issue tracking - a modern, AI-native tool designed to live directly in your codebase alongside your code.
+This repository uses **Beads** for issue tracking through the Rust `br` CLI. Issues live beside the code in `.beads/issues.jsonl`.
+
+**Important:** `br` is non-invasive and never executes git commands. After `br sync --flush-only`, stage and commit `.beads/` through the repository's normal git workflow.
 
 ## What is Beads?
 
-Beads is issue tracking that lives in your repo, making it perfect for AI coding agents and developers who want their issues close to their code. No web UI required - everything works through the CLI and integrates seamlessly with git.
+Beads is a dependency-aware, CLI-first issue tracker designed for developers and coding agents. The local SQLite database provides fast queries; the tracked JSONL export carries issue history through git.
 
-**Learn more:** [github.com/steveyegge/beads](https://github.com/steveyegge/beads)
+**Learn more:** [github.com/Dicklesworthstone/beads_rust](https://github.com/Dicklesworthstone/beads_rust)
 
 ## Quick Start
 
 ### Essential Commands
 
 ```bash
-# Create new issues
-bd create "Add user authentication"
+# Create a new issue
+br create --title="Add user authentication" --type=task --priority=2
 
-# View all issues
-bd list
+# View and inspect issues
+br list
+br show <issue-id>
 
-# View issue details
-bd show <issue-id>
+# Update and complete work
+br update <issue-id> --status=in_progress
+br close <issue-id> --reason="Completed"
 
-# Update issue status
-bd update <issue-id> --status in_progress
-bd update <issue-id> --status done
+# Export database changes to tracked JSONL
+br sync --flush-only
 
-# Sync with git remote
-bd sync
+# Then stage and commit through normal git workflow
+git add .beads/
+git commit -m "sync beads"
 ```
 
 ### Working with Issues
 
 Issues in Beads are:
-- **Git-native**: Stored in `.beads/issues.jsonl` and synced like code
-- **AI-friendly**: CLI-first design works perfectly with AI coding agents
-- **Branch-aware**: Issues can follow your branch workflow
-- **Always in sync**: Auto-syncs with your commits
 
-## Why Beads?
-
-✨ **AI-Native Design**
-- Built specifically for AI-assisted development workflows
-- CLI-first interface works seamlessly with AI coding agents
-- No context switching to web UIs
-
-🚀 **Developer Focused**
-- Issues live in your repo, right next to your code
-- Works offline, syncs when you push
-- Fast, lightweight, and stays out of your way
-
-🔧 **Git Integration**
-- Automatic sync with git commits
-- Branch-aware issue tracking
-- Intelligent JSONL merge resolution
+- **Git-native**: Exported to `.beads/issues.jsonl` and committed like code
+- **AI-friendly**: CLI-first design works well for coding agents
+- **Dependency-aware**: `br ready` shows open work with no active blockers
+- **Explicitly synchronized**: `br` never commits or pushes behind your back
 
 ## Get Started with Beads
 
-Try Beads in your own projects:
+To initialize another repository after installing `br`:
 
 ```bash
-# Install Beads
-curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
-
-# Initialize in your repo
-bd init
-
-# Create your first issue
-bd create "Try out Beads"
+br init --prefix "<lowercase-project-name>"
+br create --title="Try out Beads" --type=task --priority=2
+br sync --flush-only
 ```
 
 ## Learn More
 
-- **Documentation**: [github.com/steveyegge/beads/docs](https://github.com/steveyegge/beads/tree/main/docs)
-- **Quick Start Guide**: Run `bd quickstart`
-- **Examples**: [github.com/steveyegge/beads/examples](https://github.com/steveyegge/beads/tree/main/examples)
+- **Documentation**: [github.com/Dicklesworthstone/beads_rust](https://github.com/Dicklesworthstone/beads_rust)
+- **Agent guide**: Run `br robot-docs guide`
+- **Workspace diagnostics**: Run `br doctor`
 
 ---
 
-*Beads: Issue tracking that moves at the speed of thought* ⚡
+*Beads: durable project memory beside the code.*

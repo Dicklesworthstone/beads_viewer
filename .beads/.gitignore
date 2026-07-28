@@ -44,3 +44,12 @@ beads.right.meta.json
 
 # Local history backups
 .br_history/
+
+# br write coordination
+.write.lock
+*.tmp
+
+# Legacy bd/Dolt runtime retained locally for rollback after migration
+embeddeddolt/
+backup/
+.auto-import-issues.jsonl
