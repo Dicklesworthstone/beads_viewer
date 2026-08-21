@@ -1396,7 +1396,7 @@ func TestTriageGroupByTrack_SingleTrack(t *testing.T) {
 		totalRecs += len(g.Recommendations)
 		hasClaimableRec := false
 		for _, rec := range g.Recommendations {
-			if isClaimableRecommendation(rec, nil, nil) {
+			if isClaimableRecommendation(rec, time.Time{}, nil, nil) {
 				hasClaimableRec = true
 				break
 			}
@@ -1563,7 +1563,7 @@ func TestTriageGroupByTrack_TopPickHasHighestScore(t *testing.T) {
 		}
 		// Top pick should have the highest score in the group
 		for _, rec := range g.Recommendations {
-			if !isClaimableRecommendation(rec, nil, nil) {
+			if !isClaimableRecommendation(rec, time.Time{}, nil, nil) {
 				continue
 			}
 			if rec.Score > g.TopPick.Score {
@@ -1724,7 +1724,7 @@ func TestBuildTopPicks_FiltersBlockedItems(t *testing.T) {
 	}
 
 	// Test with limit of 3
-	picks := buildTopPicks(recommendations, 3, nil, nil)
+	picks := buildTopPicks(recommendations, 3, time.Time{}, nil, nil)
 
 	// Should have exactly 3 picks (all actionable items)
 	if len(picks) != 3 {
@@ -1885,7 +1885,7 @@ func TestBuildTopPicks_LimitRespected(t *testing.T) {
 	}
 
 	// Limit of 2
-	picks := buildTopPicks(recommendations, 2, nil, nil)
+	picks := buildTopPicks(recommendations, 2, time.Time{}, nil, nil)
 	if len(picks) != 2 {
 		t.Errorf("expected 2 picks with limit=2, got %d", len(picks))
 	}
@@ -1903,7 +1903,7 @@ func TestBuildTopPicks_AllBlocked(t *testing.T) {
 		{ID: "b2", Title: "Blocked 2", Status: string(model.StatusOpen), Score: 90.0, BlockedBy: []string{"y"}},
 	}
 
-	picks := buildTopPicks(recommendations, 10, nil, nil)
+	picks := buildTopPicks(recommendations, 10, time.Time{}, nil, nil)
 	if len(picks) != 0 {
 		t.Errorf("expected 0 picks when all are blocked, got %d", len(picks))
 	}
@@ -1941,7 +1941,7 @@ func TestBuildTopPicks_SkipsBlockedStatusAndAssigned(t *testing.T) {
 		},
 	}
 
-	picks := buildTopPicks(recommendations, 3, nil, nil)
+	picks := buildTopPicks(recommendations, 3, time.Time{}, nil, nil)
 	if len(picks) != 1 {
 		t.Fatalf("expected only the claimable open issue, got %d picks: %#v", len(picks), picks)
 	}
@@ -1996,6 +1996,62 @@ func TestComputeTriage_NotReadyLabelExcludedFromTopPicks(t *testing.T) {
 	for _, pick := range got.QuickRef.TopPicks {
 		if pick.ID == "RAW-1" {
 			t.Fatalf("RAW-1 (needs-polish) must not appear in claimable top picks")
+		}
+	}
+}
+
+func TestComputeTriage_FutureDeferUntilExcludedFromClaimablePicks(t *testing.T) {
+	now := time.Date(2026, 8, 21, 7, 0, 0, 0, time.UTC)
+	future := now.Add(30 * 24 * time.Hour)
+	expired := now.Add(-time.Second)
+	issues := []model.Issue{
+		{ID: "FUTURE-1", Title: "Deferred by scheduler", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, DeferUntil: &future, Labels: []string{"lane"}, UpdatedAt: now},
+		{ID: "EXPIRED-1", Title: "Defer elapsed", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, DeferUntil: &expired, Labels: []string{"lane"}, UpdatedAt: now},
+		{ID: "READY-1", Title: "Ready work", Status: model.StatusOpen, Priority: 4, IssueType: model.TypeTask, Labels: []string{"lane"}, UpdatedAt: now},
+		{ID: "CLOSED-1", Title: "Closed work", Status: model.StatusClosed, Priority: 0, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "TOMBSTONE-1", Title: "Deleted work", Status: model.StatusTombstone, Priority: 0, IssueType: model.TypeTask, UpdatedAt: now},
+	}
+
+	triage := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		WaitForPhase2: true,
+		GroupByTrack:  true,
+		GroupByLabel:  true,
+	}, now)
+	want := map[string]bool{"EXPIRED-1": false, "READY-1": false}
+	for _, pick := range triage.QuickRef.TopPicks {
+		if pick.ID == "FUTURE-1" || pick.ID == "CLOSED-1" || pick.ID == "TOMBSTONE-1" {
+			t.Fatalf("non-claimable issue leaked into top_picks: %#v", pick)
+		}
+		if _, ok := want[pick.ID]; ok {
+			want[pick.ID] = true
+		}
+	}
+	for id, found := range want {
+		if !found {
+			t.Fatalf("expected %s in top_picks, got %#v", id, triage.QuickRef.TopPicks)
+		}
+	}
+	for _, group := range triage.RecommendationsByTrack {
+		if group.TopPick != nil && group.TopPick.ID == "FUTURE-1" {
+			t.Fatalf("future-deferred issue leaked into track top pick: %#v", group)
+		}
+	}
+	for _, group := range triage.RecommendationsByLabel {
+		if group.TopPick != nil && group.TopPick.ID == "FUTURE-1" {
+			t.Fatalf("future-deferred issue leaked into label top pick: %#v", group)
+		}
+	}
+	for _, rec := range triage.Recommendations {
+		if rec.ID != "FUTURE-1" {
+			continue
+		}
+		if !contains(rec.Action, "Wait until 2026-09-20T07:00:00Z") {
+			t.Fatalf("future-deferred action = %q, want wait guidance", rec.Action)
+		}
+		for _, reason := range rec.Reasons {
+			if contains(reason, "available for work") {
+				t.Fatalf("future-deferred recommendation claims availability: %v", rec.Reasons)
+			}
 		}
 	}
 }

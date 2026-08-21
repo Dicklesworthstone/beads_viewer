@@ -7,6 +7,32 @@ import (
 	"time"
 )
 
+func TestIssueDeferUntilJSONAndClone(t *testing.T) {
+	const raw = `{"id":"deferred-1","title":"Later","status":"open","issue_type":"task","defer_until":"2027-01-01T17:00:00Z"}`
+	var issue Issue
+	if err := json.Unmarshal([]byte(raw), &issue); err != nil {
+		t.Fatalf("unmarshal issue: %v", err)
+	}
+	want := time.Date(2027, 1, 1, 17, 0, 0, 0, time.UTC)
+	if issue.DeferUntil == nil || !issue.DeferUntil.Equal(want) {
+		t.Fatalf("defer_until = %v, want %v", issue.DeferUntil, want)
+	}
+	if !issue.IsDeferredAt(want.Add(-time.Second)) {
+		t.Fatal("future defer_until must be active")
+	}
+	if issue.IsDeferredAt(want) {
+		t.Fatal("defer_until at the current instant must be expired")
+	}
+
+	clone := issue.Clone()
+	if clone.DeferUntil == issue.DeferUntil {
+		t.Fatal("Clone must copy defer_until storage")
+	}
+	if clone.DeferUntil == nil || !clone.DeferUntil.Equal(want) {
+		t.Fatalf("clone defer_until = %v, want %v", clone.DeferUntil, want)
+	}
+}
+
 func TestStatus_IsValid(t *testing.T) {
 	tests := []struct {
 		name   string

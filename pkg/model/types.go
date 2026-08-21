@@ -24,6 +24,7 @@ type Issue struct {
 	CreatedAt          time.Time     `json:"created_at"`
 	UpdatedAt          time.Time     `json:"updated_at"`
 	DueDate            *time.Time    `json:"due_date,omitempty"`
+	DeferUntil         *time.Time    `json:"defer_until,omitempty"`
 	ClosedAt           *time.Time    `json:"closed_at,omitempty"`
 	ExternalRef        *string       `json:"external_ref,omitempty"`
 	CompactionLevel    int           `json:"compaction_level,omitempty"`
@@ -51,6 +52,10 @@ func (i Issue) Clone() Issue {
 	if i.DueDate != nil {
 		v := *i.DueDate
 		clone.DueDate = &v
+	}
+	if i.DeferUntil != nil {
+		v := *i.DeferUntil
+		clone.DeferUntil = &v
 	}
 	if i.ExternalRef != nil {
 		v := *i.ExternalRef
@@ -91,6 +96,13 @@ func (i Issue) Clone() Issue {
 	}
 
 	return clone
+}
+
+// IsDeferredAt reports whether the issue is scheduler-deferred past now.
+// A defer_until timestamp at or before now has expired and does not withhold
+// otherwise-ready work.
+func (i Issue) IsDeferredAt(now time.Time) bool {
+	return i.DeferUntil != nil && i.DeferUntil.After(now)
 }
 
 // Validate checks if the issue data is logically valid

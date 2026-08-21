@@ -2033,7 +2033,7 @@ func robotNextIssueIndex(issues []model.Issue) map[string]model.Issue {
 	return issueByID
 }
 
-func robotNextClaimabilityReasons(pick analysis.TopPick, issueByID map[string]model.Issue) []string {
+func robotNextClaimabilityReasons(pick analysis.TopPick, issueByID map[string]model.Issue, now time.Time) []string {
 	issue, ok := issueByID[pick.ID]
 	if !ok {
 		return []string{fmt.Sprintf("%s is absent from loaded Beads records", pick.ID)}
@@ -2048,6 +2048,9 @@ func robotNextClaimabilityReasons(pick analysis.TopPick, issueByID map[string]mo
 	}
 	if assignee := strings.TrimSpace(issue.Assignee); assignee != "" {
 		reasons = append(reasons, fmt.Sprintf("%s is already assigned to %s", pick.ID, assignee))
+	}
+	if issue.IsDeferredAt(now) {
+		reasons = append(reasons, fmt.Sprintf("%s is deferred until %s", pick.ID, issue.DeferUntil.UTC().Format(time.RFC3339)))
 	}
 
 	var openBlockers []string
@@ -2087,7 +2090,7 @@ func robotNextDiagnosticFromPick(pick analysis.TopPick) robotNextDiagnosticPick 
 	}
 }
 
-func robotNextClaimablePick(picks []analysis.TopPick, issues []model.Issue) (analysis.TopPick, *robotNextDiagnosticPick, []string, bool) {
+func robotNextClaimablePick(picks []analysis.TopPick, issues []model.Issue, now time.Time) (analysis.TopPick, *robotNextDiagnosticPick, []string, bool) {
 	if len(picks) == 0 {
 		return analysis.TopPick{}, nil, nil, false
 	}
@@ -2096,7 +2099,7 @@ func robotNextClaimablePick(picks []analysis.TopPick, issues []model.Issue) (ana
 	firstDiagnostic := robotNextDiagnosticFromPick(picks[0])
 	var firstUnsafeReasons []string
 	for _, pick := range picks {
-		reasons := robotNextClaimabilityReasons(pick, issueByID)
+		reasons := robotNextClaimabilityReasons(pick, issueByID, now)
 		if len(reasons) == 0 {
 			return pick, &firstDiagnostic, nil, true
 		}
@@ -2150,7 +2153,7 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 		return nil
 	}
 
-	top, diagnostic, unsafePickReasons, ok := robotNextClaimablePick(triage.QuickRef.TopPicks, ctx.Issues)
+	top, diagnostic, unsafePickReasons, ok := robotNextClaimablePick(triage.QuickRef.TopPicks, ctx.Issues, now)
 	if !ok {
 		output.Message = "No claim command emitted because the top recommendation was not claim-safe"
 		output.DiagnosticTopPick = diagnostic

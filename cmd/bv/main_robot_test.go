@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -224,6 +225,73 @@ func TestRobotNextEmitsClaimOnlyForSafeTopPick(t *testing.T) {
 	}
 }
 
+func TestRobotCommandsExcludeFutureDeferredClosedAndTombstoneIssues(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+
+	beads := `{"id":"FUTURE-1","title":"Deferred by scheduler","status":"open","priority":0,"issue_type":"task","defer_until":"2026-09-20T07:00:00Z"}
+{"id":"READY-1","title":"Ready work","status":"open","priority":4,"issue_type":"task"}
+{"id":"CLOSED-1","title":"Closed work","status":"closed","priority":0,"issue_type":"task"}
+{"id":"TOMBSTONE-1","title":"Deleted work","status":"tombstone","priority":0,"issue_type":"task"}
+`
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(beads), 0o644); err != nil {
+		t.Fatalf("write beads: %v", err)
+	}
+
+	exe := buildTestBinary(t)
+	run := func(flag string, dst any) []byte {
+		t.Helper()
+		cmd := exec.Command(exe, flag, "--format=json")
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "SOURCE_DATE_EPOCH=1787320800")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%s failed: %v", flag, err)
+		}
+		if err := json.Unmarshal(out, dst); err != nil {
+			t.Fatalf("%s json: %v\n%s", flag, err, out)
+		}
+		return out
+	}
+
+	var next struct {
+		Actionable bool   `json:"actionable"`
+		ID         string `json:"id"`
+		ClaimCmd   string `json:"claim_command"`
+	}
+	nextOut := run("--robot-next", &next)
+	if !next.Actionable || next.ID != "READY-1" || !strings.Contains(next.ClaimCmd, "READY-1") {
+		t.Fatalf("robot-next selected non-ready work: %s", nextOut)
+	}
+
+	var triage struct {
+		Triage struct {
+			QuickRef struct {
+				TopPicks []analysis.TopPick `json:"top_picks"`
+			} `json:"quick_ref"`
+			Recommendations []analysis.Recommendation `json:"recommendations"`
+		} `json:"triage"`
+	}
+	triageOut := run("--robot-triage", &triage)
+	if len(triage.Triage.QuickRef.TopPicks) == 0 || triage.Triage.QuickRef.TopPicks[0].ID != "READY-1" {
+		t.Fatalf("robot-triage did not lead with READY-1: %s", triageOut)
+	}
+	for _, pick := range triage.Triage.QuickRef.TopPicks {
+		switch pick.ID {
+		case "FUTURE-1", "CLOSED-1", "TOMBSTONE-1":
+			t.Fatalf("robot-triage leaked non-ready pick %s: %s", pick.ID, triageOut)
+		}
+	}
+	for _, rec := range triage.Triage.Recommendations {
+		if rec.ID == "FUTURE-1" && (!strings.Contains(rec.Action, "Wait until") || strings.Contains(strings.Join(rec.Reasons, " "), "available for work")) {
+			t.Fatalf("robot-triage described future-deferred work as ready: %#v", rec)
+		}
+	}
+}
+
 func TestRobotNextClaimablePickRejectsAssignedTopPick(t *testing.T) {
 	picks := []analysis.TopPick{{
 		ID:    "ASSIGNED-1",
@@ -238,7 +306,7 @@ func TestRobotNextClaimablePickRejectsAssignedTopPick(t *testing.T) {
 		Assignee:  " cc11 ",
 	}}
 
-	_, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues)
+	_, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues, time.Time{})
 	if ok {
 		t.Fatalf("assigned top pick must not be claimable")
 	}

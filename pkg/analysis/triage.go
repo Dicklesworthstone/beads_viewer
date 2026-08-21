@@ -103,6 +103,7 @@ type Recommendation struct {
 	Assignee    string         `json:"assignee,omitempty"`
 	Priority    int            `json:"priority"`
 	Labels      []string       `json:"labels"`
+	DeferUntil  *time.Time     `json:"defer_until,omitempty"`
 	Score       float64        `json:"score"`
 	Breakdown   ScoreBreakdown `json:"breakdown"`
 	Action      string         `json:"action"` // Suggested next action (human-readable)
@@ -569,7 +570,7 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	// So: build the recommendations against the full triageScores set
 	// first, slice to opts.TopN for the user-visible recommendations
 	// list, and feed the *unsliced* set into buildTopPicks.
-	allRecommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, len(triageScores))
+	allRecommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, len(triageScores), now)
 	recommendations := allRecommendations
 	if len(recommendations) > opts.TopN {
 		recommendations = recommendations[:opts.TopN]
@@ -590,7 +591,7 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	// Build top picks for quick ref. Pass the full set so blocked
 	// high-priority items don't crowd genuine actionable work out of
 	// the picks (issue #146).
-	topPicks := buildTopPicks(allRecommendations, 3, opts.NotReadyLabels, parentsWithOpenChildren)
+	topPicks := buildTopPicks(allRecommendations, 3, now, opts.NotReadyLabels, parentsWithOpenChildren)
 
 	// Determine top issue for commands
 	topID := ""
@@ -605,10 +606,10 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	var recsByTrack []TrackRecommendationGroup
 	var recsByLabel []LabelRecommendationGroup
 	if opts.GroupByTrack {
-		recsByTrack = buildRecommendationsByTrack(recommendations, analyzer, unblocksMap, opts.NotReadyLabels, parentsWithOpenChildren)
+		recsByTrack = buildRecommendationsByTrack(recommendations, analyzer, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
 	}
 	if opts.GroupByLabel {
-		recsByLabel = buildRecommendationsByLabel(recommendations, unblocksMap, opts.NotReadyLabels, parentsWithOpenChildren)
+		recsByLabel = buildRecommendationsByLabel(recommendations, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
 	}
 
 	// Calculate staleness if history is available
@@ -816,7 +817,7 @@ func computeCountsWithContext(issues []model.Issue, ctx *TriageContext) HealthCo
 
 // buildRecommendationsFromTriageScores creates recommendations using enhanced triage scores.
 // Uses TriageContext for cached blocker lookups (bv-k4az optimization).
-func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageContext, limit int) []Recommendation {
+func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageContext, limit int, now time.Time) []Recommendation {
 	if len(scores) > limit {
 		scores = scores[:limit]
 	}
@@ -832,7 +833,7 @@ func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageConte
 		}
 
 		// Generate reasons using the new logic (cached via TriageContext)
-		reasons := GenerateTriageReasonsForScore(score, ctx)
+		reasons := generateTriageReasonsForScoreAt(score, ctx, now)
 
 		// Get blocked by (cached via TriageContext)
 		blockedBy := ctx.OpenBlockers(score.IssueID)
@@ -845,6 +846,7 @@ func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageConte
 			Assignee:    issue.Assignee,
 			Priority:    score.Priority,
 			Labels:      issue.Labels,
+			DeferUntil:  issue.DeferUntil,
 			Score:       score.TriageScore,
 			Breakdown:   score.Breakdown,
 			Action:      reasons.ActionHint,
@@ -1048,10 +1050,10 @@ func buildBlockersToClearWithContext(ctx *TriageContext, unblocksMap map[string]
 // buildTopPicks creates condensed top picks from recommendations.
 // Only includes actionable (non-blocked) items since TopPicks are used
 // for "what should I work on next" queries (e.g., --robot-next).
-func buildTopPicks(recommendations []Recommendation, limit int, notReadyLabels []string, parentsWithOpenChildren map[string]bool) []TopPick {
+func buildTopPicks(recommendations []Recommendation, limit int, now time.Time, notReadyLabels []string, parentsWithOpenChildren map[string]bool) []TopPick {
 	picks := make([]TopPick, 0, limit)
 	for _, rec := range recommendations {
-		if !isClaimableRecommendation(rec, notReadyLabels, parentsWithOpenChildren) {
+		if !isClaimableRecommendation(rec, now, notReadyLabels, parentsWithOpenChildren) {
 			continue
 		}
 		picks = append(picks, TopPick{
@@ -1082,7 +1084,7 @@ func buildTopPicks(recommendations []Recommendation, limit int, notReadyLabels [
 // notReadyLabels may be empty (the default), in which case the label gate is a
 // no-op. parentsWithOpenChildren may be nil, in which case the parent gate is
 // skipped (used by unit tests that exercise the predicate in isolation).
-func isClaimableRecommendation(rec Recommendation, notReadyLabels []string, parentsWithOpenChildren map[string]bool) bool {
+func isClaimableRecommendation(rec Recommendation, now time.Time, notReadyLabels []string, parentsWithOpenChildren map[string]bool) bool {
 	if parentsWithOpenChildren[rec.ID] {
 		return false
 	}
@@ -1090,6 +1092,7 @@ func isClaimableRecommendation(rec Recommendation, notReadyLabels []string, pare
 		rec.Type != string(model.TypeEpic) &&
 		rec.Assignee == "" &&
 		len(rec.BlockedBy) == 0 &&
+		(rec.DeferUntil == nil || !rec.DeferUntil.After(now)) &&
 		!hasAnyLabel(rec.Labels, notReadyLabels)
 }
 
@@ -1418,10 +1421,17 @@ type TriageReasons struct {
 // GenerateTriageReasons creates actionable reasons for a triage recommendation
 // These are emoji-prefixed, human-readable explanations that tell agents what to DO
 func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
+	return generateTriageReasonsAt(ctx, time.Now())
+}
+
+func generateTriageReasonsAt(ctx TriageReasonContext, now time.Time) TriageReasons {
 	var reasons []string
 	primary := ""
 	actionHint := "Start work on this issue"
-	if ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress {
+	isFutureDeferred := ctx.Issue != nil && ctx.Issue.IsDeferredAt(now)
+	if isFutureDeferred {
+		actionHint = fmt.Sprintf("Wait until %s before claiming", ctx.Issue.DeferUntil.UTC().Format(time.RFC3339))
+	} else if ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress {
 		actionHint = "Continue work on this issue"
 	} else if ctx.Issue != nil && ctx.Issue.Status == model.StatusBlocked {
 		actionHint = "Resolve blocked status before claiming this issue"
@@ -1496,7 +1506,7 @@ func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 		// Update action hint unless in-progress (keep work/review guidance) or critically stale
 		isInProgress := ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress
 		isCriticalStale := isInProgress && ctx.DaysSinceUpdate > 14
-		if !isInProgress && !isCriticalStale {
+		if !isInProgress && !isCriticalStale && !isFutureDeferred {
 			actionHint = "Quick win - start here for fast progress"
 		}
 	}
@@ -1528,7 +1538,12 @@ func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 		!isInProgress &&
 		!isBlockedStatus &&
 		!isOpenStatus
-	if isInProgress {
+	if isFutureDeferred {
+		reasons = append(reasons, fmt.Sprintf("⏸️ Deferred until %s - not ready to claim", ctx.Issue.DeferUntil.UTC().Format(time.RFC3339)))
+		if ctx.ClaimedByAgent != "" {
+			reasons = append(reasons, fmt.Sprintf("👤 Claimed by %s", ctx.ClaimedByAgent))
+		}
+	} else if isInProgress {
 		if ctx.ClaimedByAgent != "" {
 			reason := fmt.Sprintf("👤 Claimed by %s", ctx.ClaimedByAgent)
 			reasons = append(reasons, reason)
@@ -1612,6 +1627,10 @@ func formatUnblockList(ids []string) string {
 // GenerateTriageReasonsForScore generates reasons from a TriageScore and TriageContext.
 // Uses cached blocker lookups for better performance (bv-k4az optimization).
 func GenerateTriageReasonsForScore(score TriageScore, triageCtx *TriageContext) TriageReasons {
+	return generateTriageReasonsForScoreAt(score, triageCtx, time.Now())
+}
+
+func generateTriageReasonsForScoreAt(score TriageScore, triageCtx *TriageContext, now time.Time) TriageReasons {
 	analyzer := triageCtx.Analyzer()
 	unblocksMap := triageCtx.UnblocksMap()
 	issue := analyzer.GetIssue(score.IssueID)
@@ -1639,7 +1658,7 @@ func GenerateTriageReasonsForScore(score TriageScore, triageCtx *TriageContext) 
 		BlockerDepth:    triageCtx.BlockerDepth(score.IssueID), // cached
 	}
 
-	return GenerateTriageReasons(ctx)
+	return generateTriageReasonsAt(ctx, now)
 }
 
 // EnhanceRecommendationWithTriageReasons updates a Recommendation with triage-specific reasons
@@ -1661,7 +1680,7 @@ func EnhanceRecommendationWithTriageReasons(rec *Recommendation, triageReasons T
 //
 // This differs from the previous connected-components approach which created
 // one track per disconnected work stream (issue #68).
-func buildRecommendationsByTrack(recs []Recommendation, analyzer *Analyzer, unblocksMap map[string][]string, notReadyLabels []string, parentsWithOpenChildren map[string]bool) []TrackRecommendationGroup {
+func buildRecommendationsByTrack(recs []Recommendation, analyzer *Analyzer, unblocksMap map[string][]string, now time.Time, notReadyLabels []string, parentsWithOpenChildren map[string]bool) []TrackRecommendationGroup {
 	// Compute blocker depth for all recommendations.
 	// Depth 0 = actionable now (no blockers), Depth N = blocked by depth-(N-1) items.
 	blockerDepths := make(map[string]int, len(recs))
@@ -1737,7 +1756,7 @@ func buildRecommendationsByTrack(recs []Recommendation, analyzer *Analyzer, unbl
 		group.TotalUnblocks += len(unblocksMap[rec.ID])
 
 		// Update top pick (highest score in this layer)
-		if isClaimableRecommendation(rec, notReadyLabels, parentsWithOpenChildren) && (group.TopPick == nil || rec.Score > group.TopPick.Score) {
+		if isClaimableRecommendation(rec, now, notReadyLabels, parentsWithOpenChildren) && (group.TopPick == nil || rec.Score > group.TopPick.Score) {
 			group.TopPick = &TopPick{
 				ID:       rec.ID,
 				Title:    rec.Title,
@@ -1779,7 +1798,7 @@ func layerReason(depth int, totalRecs int) string {
 }
 
 // buildRecommendationsByLabel groups recommendations by label
-func buildRecommendationsByLabel(recs []Recommendation, unblocksMap map[string][]string, notReadyLabels []string, parentsWithOpenChildren map[string]bool) []LabelRecommendationGroup {
+func buildRecommendationsByLabel(recs []Recommendation, unblocksMap map[string][]string, now time.Time, notReadyLabels []string, parentsWithOpenChildren map[string]bool) []LabelRecommendationGroup {
 	groups := make(map[string]*LabelRecommendationGroup)
 
 	for _, rec := range recs {
@@ -1797,7 +1816,7 @@ func buildRecommendationsByLabel(recs []Recommendation, unblocksMap map[string][
 		group.Recommendations = append(group.Recommendations, rec)
 		group.TotalUnblocks += len(unblocksMap[rec.ID])
 
-		if isClaimableRecommendation(rec, notReadyLabels, parentsWithOpenChildren) && (group.TopPick == nil || rec.Score > group.TopPick.Score) {
+		if isClaimableRecommendation(rec, now, notReadyLabels, parentsWithOpenChildren) && (group.TopPick == nil || rec.Score > group.TopPick.Score) {
 			group.TopPick = &TopPick{
 				ID:       rec.ID,
 				Title:    rec.Title,
