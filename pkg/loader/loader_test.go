@@ -367,6 +367,7 @@ func TestIssuePoolResetsFields(t *testing.T) {
 	issue.Description = "desc"
 	issue.Assignee = "owner"
 	issue.DueDate = &now
+	issue.DeferUntil = &now
 	issue.ClosedAt = &now
 	issue.EstimatedMinutes = new(int)
 	*issue.EstimatedMinutes = 42
@@ -383,8 +384,8 @@ func TestIssuePoolResetsFields(t *testing.T) {
 	if reset.ID != "" || reset.Title != "" || reset.Description != "" || reset.Assignee != "" {
 		t.Fatalf("expected scalar fields to be cleared, got ID=%q title=%q desc=%q assignee=%q", reset.ID, reset.Title, reset.Description, reset.Assignee)
 	}
-	if reset.DueDate != nil || reset.ClosedAt != nil || reset.EstimatedMinutes != nil || reset.ExternalRef != nil {
-		t.Fatalf("expected pointer fields to be nil: due=%v closed=%v est=%v ext=%v", reset.DueDate, reset.ClosedAt, reset.EstimatedMinutes, reset.ExternalRef)
+	if reset.DueDate != nil || reset.DeferUntil != nil || reset.ClosedAt != nil || reset.EstimatedMinutes != nil || reset.ExternalRef != nil {
+		t.Fatalf("expected pointer fields to be nil: due=%v defer=%v closed=%v est=%v ext=%v", reset.DueDate, reset.DeferUntil, reset.ClosedAt, reset.EstimatedMinutes, reset.ExternalRef)
 	}
 	if len(reset.Dependencies) != 0 {
 		t.Fatalf("expected dependencies to be reset, got %d", len(reset.Dependencies))

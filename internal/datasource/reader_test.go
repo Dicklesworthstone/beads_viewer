@@ -285,6 +285,26 @@ func TestSQLiteReader_EscapesURIControlCharsInPath(t *testing.T) {
 	}
 }
 
+func TestSQLiteReader_LoadsDeferUntil(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "defer-until.db")
+	createContractTestSQLiteDB(t, dbPath)
+
+	r, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: dbPath})
+	if err != nil {
+		t.Fatalf("NewSQLiteReader: %v", err)
+	}
+	defer r.Close()
+
+	issue, err := r.GetIssueByID("CTR-1")
+	if err != nil {
+		t.Fatalf("GetIssueByID: %v", err)
+	}
+	want := time.Date(2026, 9, 15, 16, 0, 0, 0, time.UTC)
+	if issue.DeferUntil == nil || !issue.DeferUntil.Equal(want) {
+		t.Fatalf("defer_until = %v, want %v", issue.DeferUntil, want)
+	}
+}
+
 func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "export.db")
@@ -306,6 +326,7 @@ func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 			labels TEXT,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
+			defer_until TEXT,
 			closed_at TEXT
 		);
 		CREATE TABLE dependencies (
@@ -321,8 +342,8 @@ func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 			text TEXT NOT NULL,
 			created_at TEXT NOT NULL
 		);
-		INSERT INTO issues (id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at)
-		VALUES ('EXP-1', 'Export issue', 'from export schema', 'open', 1, 'task', 'cc11', '["graph","sqlite"]', ?, ?);
+		INSERT INTO issues (id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at, defer_until)
+		VALUES ('EXP-1', 'Export issue', 'from export schema', 'open', 1, 'task', 'cc11', '["graph","sqlite"]', ?, ?, '2026-09-15T16:00:00Z');
 		INSERT INTO issues (id, title, description, status, priority, issue_type, assignee, labels, created_at, updated_at)
 		VALUES ('ROOT-1', 'Root issue', '', 'open', 2, 'task', '', '[]', ?, ?);
 		INSERT INTO dependencies (issue_id, depends_on_id, type)
@@ -352,6 +373,9 @@ func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 	}
 	if issue.Assignee != "cc11" {
 		t.Fatalf("expected assignee from fallback schema, got %q", issue.Assignee)
+	}
+	if issue.DeferUntil == nil || issue.DeferUntil.Format(time.RFC3339) != "2026-09-15T16:00:00Z" {
+		t.Fatalf("expected defer_until from fallback schema, got %v", issue.DeferUntil)
 	}
 	if len(issue.Dependencies) != 1 {
 		t.Fatalf("expected one dependency from fallback schema, got %#v", issue.Dependencies)
@@ -390,6 +414,7 @@ func createContractTestSQLiteDB(t *testing.T, path string) {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			due_date DATETIME,
+			defer_until DATETIME,
 			closed_at DATETIME,
 			external_ref TEXT,
 			compaction_level INTEGER DEFAULT 0,
@@ -422,10 +447,10 @@ func createContractTestSQLiteDB(t *testing.T, path string) {
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	_, err = db.Exec(`
-		INSERT INTO issues (id, title, status, issue_type, updated_at) VALUES
-		('CTR-1', 'First issue',  'open',   'task', ?),
-		('CTR-2', 'Second issue', 'open',   'task', ?),
-		('CTR-3', 'Third issue',  'closed', 'task', ?)
+		INSERT INTO issues (id, title, status, issue_type, updated_at, defer_until) VALUES
+		('CTR-1', 'First issue',  'open',   'task', ?, '2026-09-15T16:00:00Z'),
+		('CTR-2', 'Second issue', 'open',   'task', ?, NULL),
+		('CTR-3', 'Third issue',  'closed', 'task', ?, NULL)
 	`, now, now, now)
 	if err != nil {
 		t.Fatal(err)

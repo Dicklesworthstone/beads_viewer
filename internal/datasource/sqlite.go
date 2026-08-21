@@ -150,6 +150,12 @@ func (r *SQLiteReader) LoadIssues() ([]model.Issue, error) {
 
 // LoadIssuesFiltered reads issues matching the filter function
 func (r *SQLiteReader) LoadIssuesFiltered(filter func(*model.Issue) bool) ([]model.Issue, error) {
+	columns := r.issuesColumns()
+	deferUntilExpr := "NULL"
+	if columns["defer_until"] {
+		deferUntilExpr = "i.defer_until"
+	}
+
 	// Detect schema: beads-rs (br) databases store labels in a separate
 	// "labels" table rather than a JSON column on "issues". We substitute
 	// a subquery so that labels are loaded transparently.
@@ -164,13 +170,13 @@ func (r *SQLiteReader) LoadIssuesFiltered(filter func(*model.Issue) bool) ([]mod
 		SELECT
 			i.id, i.title, i.description, i.status, i.priority, i.issue_type,
 			i.assignee, i.estimated_minutes, i.created_at, i.updated_at,
-			i.due_date, i.closed_at, i.external_ref, i.compaction_level,
+			i.due_date, %s, i.closed_at, i.external_ref, i.compaction_level,
 			i.compacted_at, i.compacted_at_commit, i.original_size,
 			%s, i.design, i.acceptance_criteria, i.notes, i.source_repo
 		FROM issues i
 		WHERE (i.tombstone IS NULL OR i.tombstone = 0)
 		ORDER BY i.updated_at DESC
-	`, labelsExpr)
+	`, deferUntilExpr, labelsExpr)
 
 	rows, err := r.db.Query(query)
 	if err != nil {
@@ -183,7 +189,7 @@ func (r *SQLiteReader) LoadIssuesFiltered(filter func(*model.Issue) bool) ([]mod
 	for rows.Next() {
 		var issue model.Issue
 		var estimatedMinutes, compactionLevel, originalSize sql.NullInt64
-		var createdAt, updatedAt, dueDate, closedAt, compactedAt sql.NullTime
+		var createdAt, updatedAt, dueDate, deferUntil, closedAt, compactedAt sql.NullTime
 		var description, assignee, externalRef, design, acceptanceCriteria, notes, sourceRepo, compactedAtCommit sql.NullString
 		var labelsJSON sql.NullString
 		var issueType string
@@ -191,7 +197,7 @@ func (r *SQLiteReader) LoadIssuesFiltered(filter func(*model.Issue) bool) ([]mod
 		err := rows.Scan(
 			&issue.ID, &issue.Title, &description, &issue.Status, &issue.Priority, &issueType,
 			&assignee, &estimatedMinutes, &createdAt, &updatedAt,
-			&dueDate, &closedAt, &externalRef, &compactionLevel,
+			&dueDate, &deferUntil, &closedAt, &externalRef, &compactionLevel,
 			&compactedAt, &compactedAtCommit, &originalSize,
 			&labelsJSON, &design, &acceptanceCriteria, &notes, &sourceRepo,
 		)
@@ -220,6 +226,10 @@ func (r *SQLiteReader) LoadIssuesFiltered(filter func(*model.Issue) bool) ([]mod
 		if dueDate.Valid {
 			t := dueDate.Time
 			issue.DueDate = &t
+		}
+		if deferUntil.Valid {
+			t := deferUntil.Time
+			issue.DeferUntil = &t
 		}
 		if closedAt.Valid {
 			t := closedAt.Time
@@ -306,7 +316,7 @@ func (r *SQLiteReader) loadIssuesSimple(filter func(*model.Issue) bool) ([]model
 		orderBy = "ORDER BY updated_at DESC"
 	}
 	query := fmt.Sprintf(`
-		SELECT id, title, %s, status, %s, %s, %s, %s, %s, %s
+		SELECT id, title, %s, status, %s, %s, %s, %s, %s, %s, %s
 		FROM issues
 		%s
 		%s
@@ -317,6 +327,7 @@ func (r *SQLiteReader) loadIssuesSimple(filter func(*model.Issue) bool) ([]model
 		expr("assignee", "NULL"),
 		expr("created_at", "NULL"),
 		expr("updated_at", "NULL"),
+		expr("defer_until", "NULL"),
 		expr("labels", "NULL"),
 		where,
 		orderBy,
@@ -335,13 +346,13 @@ func (r *SQLiteReader) loadIssuesSimple(filter func(*model.Issue) bool) ([]model
 	for rows.Next() {
 		var issue model.Issue
 		var description, assignee sql.NullString
-		var createdAt, updatedAt sql.NullString
+		var createdAt, updatedAt, deferUntil sql.NullString
 		var labelsJSON sql.NullString
 		var issueType string
 
 		err := rows.Scan(
 			&issue.ID, &issue.Title, &description, &issue.Status, &issue.Priority, &issueType,
-			&assignee, &createdAt, &updatedAt, &labelsJSON,
+			&assignee, &createdAt, &updatedAt, &deferUntil, &labelsJSON,
 		)
 		if err != nil {
 			continue
@@ -362,6 +373,11 @@ func (r *SQLiteReader) loadIssuesSimple(filter func(*model.Issue) bool) ([]model
 		if updatedAt.Valid {
 			if t, ok := parseSQLiteTime(updatedAt.String); ok {
 				issue.UpdatedAt = t
+			}
+		}
+		if deferUntil.Valid {
+			if t, ok := parseSQLiteTime(deferUntil.String); ok {
+				issue.DeferUntil = &t
 			}
 		}
 		if labelsJSON.Valid && labelsJSON.String != "" && labelsJSON.String != "null" {

@@ -122,6 +122,7 @@ func clearIssueReferences(issue *model.Issue) {
 	issue.Labels = issue.Labels[:0]
 
 	issue.DueDate = nil
+	issue.DeferUntil = nil
 	issue.ClosedAt = nil
 	issue.EstimatedMinutes = nil
 	issue.ExternalRef = nil
