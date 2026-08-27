@@ -77,7 +77,15 @@ func HybridCandidateLimit(limit int, total int, query string) int {
 	if limit <= 0 {
 		limit = hybridCandidateDefaultLimit
 	}
-	base := limit * 3
+	if total <= 0 {
+		return 0
+	}
+
+	maxInt := int(^uint(0) >> 1)
+	base := maxInt
+	if limit <= maxInt/3 {
+		base = limit * 3
+	}
 	min := hybridCandidateMin
 	if IsShortQuery(query) {
 		min = hybridCandidateMinShort
@@ -86,7 +94,7 @@ func HybridCandidateLimit(limit int, total int, query string) int {
 	if candidate < min {
 		candidate = min
 	}
-	if total > 0 && candidate > total {
+	if candidate > total {
 		candidate = total
 	}
 	return candidate

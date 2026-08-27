@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"math"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 func TestRobotHistoryTimeoutFromMillisecondsChecked(t *testing.T) {
@@ -71,6 +73,18 @@ func TestResolveRobotHistoryTimeoutSaturatesOverflow(t *testing.T) {
 	flagValue := 25
 	if got := resolveRobotHistoryTimeout(phaseThreeRobotHandlerConfig{HistoryTimeoutMs: &flagValue}); got != 25*time.Millisecond {
 		t.Fatalf("explicit flag timeout = %s, want 25ms and precedence over environment", got)
+	}
+}
+
+func TestTriageHistoryResultStatusPrefersTimeout(t *testing.T) {
+	if got := triageHistoryResultStatus(context.DeadlineExceeded, errors.New("git log failed")); got != "timeout" {
+		t.Fatalf("deadline plus report error status = %q, want timeout", got)
+	}
+	if got := triageHistoryResultStatus(nil, errors.New("git log failed")); got != "error" {
+		t.Fatalf("report error status = %q, want error", got)
+	}
+	if got := triageHistoryResultStatus(nil, nil); got != "ok" {
+		t.Fatalf("successful report status = %q, want ok", got)
 	}
 }
 
@@ -254,7 +268,7 @@ func TestRobotRegistryDispatchFlag_RunsActiveHandler(t *testing.T) {
 	}
 }
 
-func TestRobotDiffHandlerPinsNestedTimestampWithoutMutatingInput(t *testing.T) {
+func TestRobotDiffHandlerPreservesSnapshotTimestampsWithoutMutatingInput(t *testing.T) {
 	pinned := time.Date(2026, 8, 26, 12, 34, 56, 0, time.UTC)
 	t.Setenv("SOURCE_DATE_EPOCH", strconv.FormatInt(pinned.Unix(), 10))
 
@@ -267,11 +281,11 @@ func TestRobotDiffHandlerPinsNestedTimestampWithoutMutatingInput(t *testing.T) {
 	diff := &analysis.SnapshotDiff{FromTimestamp: from, ToTimestamp: originalTo}
 	var output bytes.Buffer
 	handled, err := registry.DispatchFlag("robot-diff", RobotContext{
-		DataHash:              "current-hash",
-		Diff:                  diff,
-		DiffResolvedRevision:  "abc123",
+		DataHash:             "current-hash",
+		Diff:                 diff,
+		DiffResolvedRevision: "abc123",
 		DiffHistoricalIssues: nil,
-		Encoder:               json.NewEncoder(&output),
+		Encoder:              json.NewEncoder(&output),
 	})
 	if err != nil {
 		t.Fatalf("dispatch robot-diff: %v", err)
@@ -289,14 +303,201 @@ func TestRobotDiffHandlerPinsNestedTimestampWithoutMutatingInput(t *testing.T) {
 	if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
 		t.Fatalf("decode robot-diff output: %v\n%s", err, output.String())
 	}
-	if decoded.GeneratedAt != pinned.Format(time.RFC3339) || !decoded.Diff.ToTimestamp.Equal(pinned) {
-		t.Fatalf("pinned output times = generated %q, nested %v; want %v", decoded.GeneratedAt, decoded.Diff.ToTimestamp, pinned)
+	if decoded.GeneratedAt != pinned.Format(time.RFC3339) {
+		t.Fatalf("generated_at = %q, want %v", decoded.GeneratedAt, pinned)
+	}
+	if !decoded.Diff.ToTimestamp.Equal(originalTo) {
+		t.Fatalf("to timestamp = %v, want preserved endpoint %v", decoded.Diff.ToTimestamp, originalTo)
 	}
 	if !decoded.Diff.FromTimestamp.Equal(from) {
 		t.Fatalf("from timestamp = %v, want %v", decoded.Diff.FromTimestamp, from)
 	}
 	if !diff.ToTimestamp.Equal(originalTo) {
 		t.Fatalf("handler mutated input diff timestamp to %v", diff.ToTimestamp)
+	}
+}
+
+func TestRobotDiffGeneratedAndSnapshotTimestampsPreserveIndependentPrecision(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 34, 56, 123_456_789, time.UTC)
+	originalTo := now.Add(time.Hour)
+	diff := &analysis.SnapshotDiff{ToTimestamp: originalTo}
+	var output bytes.Buffer
+	if err := handleRobotDiffAt(RobotContext{
+		DataHash: "current-hash",
+		Diff:     diff,
+		Encoder:  json.NewEncoder(&output),
+	}, now); err != nil {
+		t.Fatalf("encode robot-diff at precise instant: %v", err)
+	}
+
+	var decoded struct {
+		GeneratedAt string `json:"generated_at"`
+		Diff        struct {
+			ToTimestamp string `json:"to_timestamp"`
+		} `json:"diff"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode robot-diff output: %v\n%s", err, output.String())
+	}
+	wantGenerated := "2026-08-26T12:34:56.123456789Z"
+	wantEndpoint := originalTo.Format(time.RFC3339Nano)
+	if decoded.GeneratedAt != wantGenerated || decoded.Diff.ToTimestamp != wantEndpoint {
+		t.Fatalf("serialized instants = generated %q, endpoint %q; want %q and %q", decoded.GeneratedAt, decoded.Diff.ToTimestamp, wantGenerated, wantEndpoint)
+	}
+	if !diff.ToTimestamp.Equal(originalTo) {
+		t.Fatalf("handler mutated input diff timestamp to %v", diff.ToTimestamp)
+	}
+}
+
+func TestRobotDiffSurfacesBothSnapshotLoadGaps(t *testing.T) {
+	diff := &analysis.SnapshotDiff{}
+	var output bytes.Buffer
+	if err := handleRobotDiffAt(RobotContext{
+		DataHash: "current-hash",
+		LoadStats: &RobotLoadStats{
+			SourcePath: ".beads/issues.jsonl",
+			Valid:      10,
+			Errors:     1,
+		},
+		Diff: diff,
+		DiffFromLoadStats: &RobotLoadStats{
+			SourcePath: "abc123:.beads/issues.jsonl",
+			Valid:      9,
+			Errors:     2,
+		},
+		DiffResolvedRevision: "abc123",
+		Encoder:              json.NewEncoder(&output),
+	}, time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("encode incomplete-authority robot-diff: %v", err)
+	}
+	var decoded struct {
+		FromLoadStats *RobotLoadStats        `json:"from_load_stats"`
+		ToLoadStats   *RobotLoadStats        `json:"to_load_stats"`
+		Degraded      []robotNextDegradation `json:"degraded"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode incomplete-authority robot-diff: %v\n%s", err, output.String())
+	}
+	if decoded.FromLoadStats == nil || decoded.FromLoadStats.Errors != 2 {
+		t.Fatalf("from_load_stats = %+v, want two dropped historical records", decoded.FromLoadStats)
+	}
+	if decoded.ToLoadStats == nil || decoded.ToLoadStats.Errors != 1 {
+		t.Fatalf("to_load_stats = %+v, want one dropped current record", decoded.ToLoadStats)
+	}
+	codes := make(map[string]bool, len(decoded.Degraded))
+	for _, degradation := range decoded.Degraded {
+		codes[degradation.Code] = true
+	}
+	if !codes["robot_diff_from_load_incomplete"] || !codes["robot_diff_to_load_incomplete"] {
+		t.Fatalf("degradations = %+v, want distinct from/to load warnings", decoded.Degraded)
+	}
+}
+
+func TestRepositoryRouteGapRejectsWorkingDirectorySideData(t *testing.T) {
+	ctx := RobotContext{RepositoryRouteUnavailableReasons: []string{
+		"BEADS_DB selects issue storage without proving its repository",
+	}}
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "correlation", err: requireLiveSingleRepoCorrelationContext(ctx, "--robot-history")},
+		{name: "side data", err: requireLiveSingleRepoSideDataContext(ctx, "--robot-alerts", "saved baseline")},
+	} {
+		if test.err == nil || !strings.Contains(test.err.Error(), "BEADS_DB") {
+			t.Fatalf("%s route guard error = %v, want explicit repository-routing evidence", test.name, test.err)
+		}
+	}
+}
+
+func TestSanitizeRobotTriageRecommendationDoesNotMutateSharedReasonBacking(t *testing.T) {
+	shared := []string{"available for work", "high impact"}
+	first := analysis.Recommendation{Reasons: shared}
+	second := analysis.Recommendation{Reasons: shared}
+
+	sanitizeRobotTriageRecommendation(&first, "diagnostic only")
+	if got := strings.Join(first.Reasons, "|"); got != "high impact|diagnostic only" {
+		t.Fatalf("sanitized reasons = %q", got)
+	}
+	if got := strings.Join(second.Reasons, "|"); got != "available for work|high impact" {
+		t.Fatalf("sanitizing one recommendation mutated shared peer reasons: %q", got)
+	}
+}
+
+func TestAnalysisHandlersEmitRepositoryRouteAndHistoricalClockEvidence(t *testing.T) {
+	t.Setenv("BV_NO_CACHE", "1")
+	t.Setenv("SOURCE_DATE_EPOCH", "1787745600")
+	analysisTime := time.Date(2024, 2, 3, 4, 5, 6, 0, time.UTC)
+	issue := model.Issue{ID: "READY-1", Title: "Ready", Status: model.StatusOpen, IssueType: model.TypeTask}
+	baseCtx := RobotContext{
+		Issues:                            []model.Issue{issue},
+		AuthoritativeIssues:               []model.Issue{issue},
+		DataHash:                          analysis.ComputeDataHash([]model.Issue{issue}),
+		DataHashMatchesIssues:             true,
+		AsOf:                              "release-2024",
+		AsOfCommit:                        "0123456789abcdef",
+		AnalysisTime:                      analysisTime,
+		RepositoryRouteUnavailableReasons: []string{"explicit source route is unverified"},
+	}
+
+	tests := []struct {
+		name     string
+		command  string
+		registry func() *RobotRegistry
+	}{
+		{
+			name: "plan", command: "robot-plan",
+			registry: func() *RobotRegistry {
+				active := true
+				registry := newRobotRegistry()
+				registerPhaseTwoRobotHandlers(&registry, phaseTwoRobotHandlerConfig{RobotPlanFlag: &active})
+				return &registry
+			},
+		},
+		{
+			name: "priority", command: "robot-priority",
+			registry: func() *RobotRegistry {
+				active := true
+				registry := newRobotRegistry()
+				registerPhaseTwoRobotHandlers(&registry, phaseTwoRobotHandlerConfig{RobotPriorityFlag: &active})
+				return &registry
+			},
+		},
+		{
+			name: "insights", command: "robot-insights",
+			registry: func() *RobotRegistry {
+				active := true
+				registry := newRobotRegistry()
+				registerPhaseThreeRobotHandlers(&registry, phaseThreeRobotHandlerConfig{RobotInsightsFlag: &active})
+				return &registry
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			ctx := baseCtx
+			ctx.Encoder = json.NewEncoder(&output)
+			handled, err := test.registry().DispatchFlag(test.command, ctx)
+			if err != nil {
+				t.Fatalf("dispatch %s: %v", test.command, err)
+			}
+			if !handled {
+				t.Fatalf("%s was not dispatched", test.command)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
+				t.Fatalf("decode %s: %v\n%s", test.command, err, output.String())
+			}
+			routes, ok := decoded["repository_route_unavailable_reasons"].([]any)
+			if !ok || len(routes) != 1 || routes[0] != "explicit source route is unverified" {
+				t.Fatalf("%s route evidence = %#v", test.command, decoded["repository_route_unavailable_reasons"])
+			}
+			if decoded["analysis_time"] != analysisTime.Format(time.RFC3339Nano) {
+				t.Fatalf("%s analysis_time = %#v, want %s", test.command, decoded["analysis_time"], analysisTime.Format(time.RFC3339Nano))
+			}
+		})
 	}
 }
 
@@ -422,45 +623,60 @@ func TestWriteRobotHelp_ReturnsWriterErrorAfterIntro(t *testing.T) {
 }
 
 func TestFilterOrphanReportByMinScoreRebuildsDerivedFields(t *testing.T) {
+	shaA := "aaaaaaa111111111111111111111111111111111"
+	shaB := "aaaaaaa222222222222222222222222222222222"
 	report := &correlation.OrphanReport{
 		Stats: correlation.OrphanReportStats{
-			CandidateCount: 2,
-			AvgSuspicion:   70,
+			CandidateCount: 3,
+			AvgSuspicion:   65,
 		},
 		Candidates: []correlation.OrphanCandidate{
 			{
+				SHA:            shaA,
 				ShortSHA:       "aaaaaaa",
 				SuspicionScore: 90,
 				ProbableBeads:  []correlation.ProbableBead{{BeadID: "bv-keep"}},
 			},
 			{
+				SHA:            shaB,
+				ShortSHA:       "aaaaaaa",
+				SuspicionScore: 80,
+				ProbableBeads:  []correlation.ProbableBead{{BeadID: "bv-keep"}},
+			},
+			{
+				SHA:            "ccccccc333333333333333333333333333333333",
+				ShortSHA:       "ccccccc",
+				SuspicionScore: 70,
+			},
+			{
+				SHA:            "bbbbbbb444444444444444444444444444444444",
 				ShortSHA:       "bbbbbbb",
 				SuspicionScore: 20,
 				ProbableBeads:  []correlation.ProbableBead{{BeadID: "bv-drop"}},
 			},
 		},
 		ByBead: map[string][]string{
-			"bv-keep": []string{"aaaaaaa"},
-			"bv-drop": []string{"bbbbbbb"},
+			"bv-keep": {shaA, shaB},
+			"bv-drop": {"bbbbbbb444444444444444444444444444444444"},
 		},
 	}
 
 	filterOrphanReportByMinScore(report, 50)
 
-	if len(report.Candidates) != 1 {
-		t.Fatalf("candidate count = %d, want 1", len(report.Candidates))
+	if len(report.Candidates) != 3 {
+		t.Fatalf("candidate count = %d, want 3", len(report.Candidates))
 	}
 	if strings.Compare(report.Candidates[0].ShortSHA, "aaaaaaa") != 0 {
 		t.Fatalf("candidate short SHA = %q, want aaaaaaa", report.Candidates[0].ShortSHA)
 	}
-	if report.Stats.CandidateCount != 1 {
-		t.Fatalf("stats candidate count = %d, want 1", report.Stats.CandidateCount)
+	if report.Stats.CandidateCount != 2 {
+		t.Fatalf("stats candidate count = %d, want 2 probable candidates", report.Stats.CandidateCount)
 	}
-	if report.Stats.AvgSuspicion != 90 {
-		t.Fatalf("avg suspicion = %v, want 90", report.Stats.AvgSuspicion)
+	if report.Stats.AvgSuspicion != 80 {
+		t.Fatalf("avg suspicion = %v, want 80", report.Stats.AvgSuspicion)
 	}
-	if got := report.ByBead["bv-keep"]; len(got) != 1 || strings.Compare(got[0], "aaaaaaa") != 0 {
-		t.Fatalf("kept by_bead entry = %#v, want aaaaaaa", got)
+	if got := report.ByBead["bv-keep"]; len(got) != 2 || got[0] != shaA || got[1] != shaB {
+		t.Fatalf("kept by_bead entry = %#v, want both full collision-safe SHAs", got)
 	}
 	if dropped := report.ByBead["bv-drop"]; dropped != nil {
 		t.Fatalf("dropped candidate still present in by_bead: %#v", dropped)

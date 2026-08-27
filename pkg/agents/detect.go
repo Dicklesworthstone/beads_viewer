@@ -28,8 +28,9 @@ type AgentFileDetection struct {
 	// found before any malformed marker. A healthy injected blurb has count 1.
 	BlurbCount int
 
-	// BlurbStructureError describes malformed versioned marker structure. It is
-	// empty when all versioned start/end markers are balanced and non-nested.
+	// BlurbStructureError describes malformed versioned marker structure or a
+	// bounded Markdown analysis that could not safely classify marker text. It is
+	// empty only when structural analysis completed without either condition.
 	BlurbStructureError string
 
 	// Content is the file content (populated if file was read)
@@ -46,7 +47,8 @@ func (d AgentFileDetection) NeedsBlurb() bool {
 	return d.Found() && !d.HasBlurb && !d.HasMalformedBlurb()
 }
 
-// HasMalformedBlurb reports whether versioned marker structure is invalid.
+// HasMalformedBlurb reports whether marker structure is invalid or could not be
+// classified safely within the bounded Markdown analysis limits.
 func (d AgentFileDetection) HasMalformedBlurb() bool {
 	return d.BlurbStructureError != ""
 }
@@ -107,20 +109,46 @@ func DetectAgentFile(workDir string) AgentFileDetection {
 
 // checkAgentFile checks a specific file path for agent configuration.
 func checkAgentFile(filePath, fileType string) AgentFileDetection {
-	// Check if file exists
-	info, err := os.Stat(filePath)
-	if err != nil || info.IsDir() {
+	// Inspect the path object itself before opening it. Following a symlink here
+	// could disclose arbitrary external file contents through Content.
+	info, err := agentFilePathInfo(filePath)
+	if err != nil {
 		return AgentFileDetection{}
 	}
+	detection := AgentFileDetection{
+		FilePath: filePath,
+		FileType: fileType,
+	}
+	if !info.Mode().IsRegular() {
+		return detection
+	}
 
-	// Read file content
-	content, err := os.ReadFile(filePath)
+	// Read through an opened handle with the same hard size limit used by the
+	// mutation path. os.ReadFile sizes its allocation from mutable path state,
+	// so a sparse or concurrently enlarged file could otherwise force an
+	// unbounded allocation before EnsureBlurb reaches its guarded write path.
+	file, err := openAgentFileForInspectionAtPath(filePath)
 	if err != nil {
 		// File exists but not readable - return detection without content
-		return AgentFileDetection{
-			FilePath: filePath,
-			FileType: fileType,
-		}
+		return detection
+	}
+	defer file.Close()
+
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !sameAgentFileSnapshot(info, openedInfo) {
+		return detection
+	}
+	content, err := readAgentFileExactly(file, openedInfo.Size())
+	if err != nil {
+		return detection
+	}
+	afterInfo, err := file.Stat()
+	if err != nil || !sameAgentFileSnapshot(openedInfo, afterInfo) {
+		return detection
+	}
+	currentInfo, err := agentFilePathInfo(filePath)
+	if err != nil || !sameAgentFileSnapshot(afterInfo, currentInfo) {
+		return detection
 	}
 
 	contentStr := string(content)

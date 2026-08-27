@@ -3,6 +3,7 @@ package analysis
 import (
 	"testing"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 	graph "gonum.org/v1/gonum/graph"
 	"gonum.org/v1/gonum/graph/simple"
@@ -27,7 +28,7 @@ func buildTestGraph(nodes int, edges [][2]int) *simple.DirectedGraph {
 
 func TestFindCyclesSafe_Empty(t *testing.T) {
 	g := simple.NewDirectedGraph()
-	cycles := findCyclesSafe(g, 10)
+	cycles := findCyclesSafe(g, 10).cycles
 	if len(cycles) != 0 {
 		t.Errorf("expected 0 cycles for empty graph, got %d", len(cycles))
 	}
@@ -37,7 +38,7 @@ func TestFindCyclesSafe_NoCycles(t *testing.T) {
 	// Simple DAG: 0 -> 1 -> 2
 	g := buildTestGraph(3, [][2]int{{0, 1}, {1, 2}})
 
-	cycles := findCyclesSafe(g, 10)
+	cycles := findCyclesSafe(g, 10).cycles
 	if len(cycles) != 0 {
 		t.Errorf("expected 0 cycles for DAG, got %d", len(cycles))
 	}
@@ -70,7 +71,7 @@ func TestFindCyclesSafe_SimpleCycle(t *testing.T) {
 	// Cycle: 0 -> 1 -> 2 -> 0
 	g := buildTestGraph(3, [][2]int{{0, 1}, {1, 2}, {2, 0}})
 
-	cycles := findCyclesSafe(g, 10)
+	cycles := findCyclesSafe(g, 10).cycles
 	if len(cycles) == 0 {
 		t.Error("expected to find cycle")
 		return
@@ -92,7 +93,7 @@ func TestFindCyclesSafe_DirectCycle(t *testing.T) {
 	// Direct cycle: 0 <-> 1
 	g := buildTestGraph(2, [][2]int{{0, 1}, {1, 0}})
 
-	cycles := findCyclesSafe(g, 10)
+	cycles := findCyclesSafe(g, 10).cycles
 	if len(cycles) == 0 {
 		t.Error("expected to find direct cycle")
 		return
@@ -111,7 +112,7 @@ func TestFindCyclesSafe_MultipleCycles(t *testing.T) {
 	// Cycle 2: 2 -> 3 -> 2
 	g := buildTestGraph(4, [][2]int{{0, 1}, {1, 0}, {2, 3}, {3, 2}})
 
-	cycles := findCyclesSafe(g, 10)
+	cycles := findCyclesSafe(g, 10).cycles
 	if len(cycles) < 2 {
 		t.Errorf("expected at least 2 cycles, got %d", len(cycles))
 	}
@@ -126,9 +127,116 @@ func TestFindCyclesSafe_Limit(t *testing.T) {
 	})
 
 	// Limit to 2
-	cycles := findCyclesSafe(g, 2)
-	if len(cycles) > 2 {
-		t.Errorf("expected at most 2 cycles with limit, got %d", len(cycles))
+	result := findCyclesSafe(g, 2)
+	cycles := result.cycles
+	if len(cycles) != 2 {
+		t.Errorf("stored cycles=%d, want exact limit 2", len(cycles))
+	}
+	if result.total != 3 {
+		t.Errorf("total=%d, want 3 cycle representatives before limiting", result.total)
+	}
+	if !result.truncated {
+		t.Error("expected truncation flag when cycle representatives exceed limit")
+	}
+}
+
+func TestAnalyzerCycleLimitReportsTruncationTruthfully(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B", Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "C", Dependencies: []*model.Dependency{{DependsOnID: "D", Type: model.DepBlocks}}},
+		{ID: "D", Dependencies: []*model.Dependency{{DependsOnID: "C", Type: model.DepBlocks}}},
+		{ID: "E", Dependencies: []*model.Dependency{{DependsOnID: "F", Type: model.DepBlocks}}},
+		{ID: "F", Dependencies: []*model.Dependency{{DependsOnID: "E", Type: model.DepBlocks}}},
+	}
+	config := AnalysisConfig{
+		DisableCache:     true,
+		RunToCompletion:  true,
+		ComputeCycles:    true,
+		MaxCyclesToStore: 2,
+	}
+
+	stats, profile := NewAnalyzer(issues).AnalyzeWithProfile(config)
+	if got := len(stats.Cycles()); got != 2 {
+		t.Fatalf("stored cycle count=%d, want configured limit 2", got)
+	}
+	if profile.CycleCount != 3 {
+		t.Fatalf("profile cycle count=%d, want all 3 cycle representatives", profile.CycleCount)
+	}
+	cycleStatus := stats.Status().Cycles
+	if cycleStatus.State != "computed" {
+		t.Fatalf("cycle status=%q, want computed", cycleStatus.State)
+	}
+	if want := "truncated to 2 of 3 cycle representatives"; cycleStatus.Reason != want {
+		t.Fatalf("cycle status reason=%q, want %q", cycleStatus.Reason, want)
+	}
+}
+
+func TestAnalyzerCyclesIgnoreClosedAndTombstonedNodes(t *testing.T) {
+	for _, inactiveStatus := range []model.Status{model.StatusClosed, model.StatusTombstone} {
+		t.Run(string(inactiveStatus), func(t *testing.T) {
+			issues := []model.Issue{
+				{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+				{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "C", Type: model.DepBlocks}}},
+				{ID: "C", Status: inactiveStatus, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+			}
+			config := AnalysisConfig{
+				DisableCache:     true,
+				RunToCompletion:  true,
+				ComputeCycles:    true,
+				MaxCyclesToStore: 10,
+			}
+
+			stats := NewAnalyzer(issues).AnalyzeWithConfig(config)
+			if got := stats.Cycles(); len(got) != 0 {
+				t.Fatalf("inactive issue preserved a non-operational cycle: %#v", got)
+			}
+		})
+	}
+}
+
+func TestCyclicGraphDoesNotPublishEmptyCriticalMetricsAsComputed(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+	}
+	config := AnalysisConfig{
+		DisableCache:        true,
+		RunToCompletion:     true,
+		ComputeCriticalPath: true,
+		ComputeSlack:        true,
+	}
+
+	stats := NewAnalyzer(issues).AnalyzeWithConfig(config)
+	status := stats.Status()
+	for name, entry := range map[string]statusEntry{
+		"critical": status.Critical,
+		"slack":    status.Slack,
+	} {
+		if entry.State != "skipped" || entry.Reason == "" {
+			t.Fatalf("%s status = %+v, want skipped with cycle reason", name, entry)
+		}
+	}
+	if len(stats.CriticalPathScore()) != 0 || len(stats.Slack()) != 0 {
+		t.Fatalf("cyclic graph published critical metrics: critical=%v slack=%v", stats.CriticalPathScore(), stats.Slack())
+	}
+}
+
+func TestCycleEligibilityHashChangesWhenCycleMemberCloses(t *testing.T) {
+	openIssues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+	}
+	closedIssues := append([]model.Issue(nil), openIssues...)
+	closedIssues[1].Status = model.StatusClosed
+
+	openAnalyzer := NewAnalyzer(openIssues)
+	closedAnalyzer := NewAnalyzer(closedIssues)
+	if openAnalyzer.graphStructureHash() != closedAnalyzer.graphStructureHash() {
+		t.Fatal("status-only change unexpectedly changed topology hash")
+	}
+	if openAnalyzer.cycleEligibilityHash() == closedAnalyzer.cycleEligibilityHash() {
+		t.Fatal("status-only change did not change cycle cache identity")
 	}
 }
 
@@ -143,7 +251,7 @@ func TestFindCyclesSafe_LimitChoosesCanonicalSubset(t *testing.T) {
 		{4, 5}, {5, 4},
 	}
 	g := buildTestGraph(10, edges)
-	cycles := findCyclesSafe(g, 3)
+	cycles := findCyclesSafe(g, 3).cycles
 	if len(cycles) != 3 {
 		t.Fatalf("cycle count=%d, want 3", len(cycles))
 	}
@@ -152,8 +260,8 @@ func TestFindCyclesSafe_LimitChoosesCanonicalSubset(t *testing.T) {
 			t.Fatalf("cycle %d starts at %d, want canonical %d; cycles=%v", i, got, wantStart, cycles)
 		}
 	}
-	if got := findCyclesSafe(g, 0); len(got) != 0 {
-		t.Fatalf("zero limit returned %d cycles", len(got))
+	if got := findCyclesSafe(g, 0); len(got.cycles) != 0 || got.total != 0 || got.truncated {
+		t.Fatalf("zero limit returned unexpected result: %+v", got)
 	}
 }
 
@@ -166,7 +274,7 @@ func TestFindCyclesSafe_SortedByLength(t *testing.T) {
 		{2, 3}, {3, 4}, {4, 5}, {5, 2}, // 4-cycle
 	})
 
-	cycles := findCyclesSafe(g, 10)
+	cycles := findCyclesSafe(g, 10).cycles
 	if len(cycles) < 2 {
 		t.Skip("need at least 2 cycles for sort test")
 	}
@@ -189,7 +297,7 @@ func TestFindCyclesSafe_Determinism(t *testing.T) {
 	// Run multiple times
 	var firstCycles [][]int64
 	for run := 0; run < 5; run++ {
-		cycles := findCyclesSafe(g, 10)
+		cycles := findCyclesSafe(g, 10).cycles
 
 		if firstCycles == nil {
 			firstCycles = make([][]int64, len(cycles))

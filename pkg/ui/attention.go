@@ -12,8 +12,14 @@ import (
 // ComputeAttentionView builds a pre-rendered table for label attention
 // This keeps the TUI layer simple and deterministic for tests.
 func ComputeAttentionView(issues []model.Issue, width int) (string, error) {
+	return ComputeAttentionViewAt(issues, width, time.Now())
+}
+
+// ComputeAttentionViewAt builds the attention table at a caller-owned clock.
+// Historical TUI views use this so old snapshots do not age as wall time moves.
+func ComputeAttentionViewAt(issues []model.Issue, width int, now time.Time) (string, error) {
 	cfg := analysis.DefaultLabelHealthConfig()
-	result := analysis.ComputeLabelAttentionScores(issues, cfg, time.Now().UTC())
+	result := analysis.ComputeLabelAttentionScores(issues, cfg, now.UTC())
 
 	headers := []string{"Rank", "Label", "Attention", "Reason"}
 	sepWidth := len(" | ") * (len(headers) - 1)

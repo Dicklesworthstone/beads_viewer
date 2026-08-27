@@ -19,17 +19,23 @@ import (
 
 // CacheKey uniquely identifies a cached history report
 type CacheKey struct {
-	HeadSHA   string // Current git HEAD
-	BeadsHash string // Hash of beads content
-	Options   string // Serialized options
+	HeadSHA      string // Current git HEAD
+	HistoryState string // Full/shallow/unavailable repository history state
+	BeadsHash    string // Hash of beads content
+	Options      string // Serialized options
 }
 
 // String returns a string representation of the cache key
 func (k CacheKey) String() string {
-	return k.HeadSHA + ":" + k.BeadsHash + ":" + k.Options
+	return k.HeadSHA + ":" + k.HistoryState + ":" + k.BeadsHash + ":" + k.Options
 }
 
-// CacheEntry holds a cached report with metadata
+func (k CacheKey) historyCacheSafe() bool {
+	return k.HistoryState == coCommitHistoryStateFull
+}
+
+// CacheEntry holds a cached report with metadata. Report is immutable shared
+// state: HistoryCache deliberately does not deep-clone multi-megabyte reports.
 type CacheEntry struct {
 	Key             CacheKey
 	Report          *HistoryReport
@@ -38,7 +44,12 @@ type CacheEntry struct {
 	ComputeDuration time.Duration // How long it took to generate this report
 }
 
-// HistoryCache provides thread-safe caching of history reports with LRU eviction
+// HistoryCache provides thread-safe caching of history reports with LRU
+// eviction. Its mutex protects cache metadata, not fields reachable through a
+// report pointer. Put/PutWithDuration transfer immutable ownership of report to
+// the cache; Get/GetWithMeta return a borrowed read-only pointer. Callers that
+// need to modify a report must clone it first. This contract avoids turning a
+// cache hit into an O(report size) copy and is followed by all package callers.
 type HistoryCache struct {
 	mu       sync.RWMutex
 	entries  map[string]*CacheEntry
@@ -84,7 +95,7 @@ func NewHistoryCacheWithOptions(repoPath string, maxAge time.Duration, maxSize i
 	}
 }
 
-// Get retrieves a cached report if available and valid
+// Get retrieves a borrowed immutable cached report if available and valid.
 func (c *HistoryCache) Get(key CacheKey) (*HistoryReport, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -95,8 +106,10 @@ func (c *HistoryCache) Get(key CacheKey) (*HistoryReport, bool) {
 		return nil, false
 	}
 
-	// Check if entry is expired
-	if time.Since(entry.CreatedAt) > c.maxAge {
+	// Reject stale, zero, and future-dated entries. time.Since alone treats a
+	// future timestamp as a negative age and would retain it indefinitely until
+	// the wall clock caught up.
+	if !cacheCreatedAtIsFresh(entry.CreatedAt, time.Now(), c.maxAge) {
 		c.removeEntryLocked(keyStr)
 		return nil, false
 	}
@@ -108,12 +121,14 @@ func (c *HistoryCache) Get(key CacheKey) (*HistoryReport, bool) {
 	return entry.Report, true
 }
 
-// Put stores a report in the cache
+// Put transfers immutable ownership of report to the cache. The caller must not
+// mutate report or any reachable map, slice, or pointer after this call.
 func (c *HistoryCache) Put(key CacheKey, report *HistoryReport) {
 	c.PutWithDuration(key, report, 0)
 }
 
-// PutWithDuration stores a report with its compute duration for XFetch
+// PutWithDuration stores a report with its compute duration for XFetch and has
+// the same immutable-ownership contract as Put.
 func (c *HistoryCache) PutWithDuration(key CacheKey, report *HistoryReport, computeDuration time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -147,7 +162,8 @@ func (c *HistoryCache) PutWithDuration(key CacheKey, report *HistoryReport, comp
 	c.order = append(c.order, keyStr)
 }
 
-// GetWithMeta retrieves a cached report with its metadata for XFetch decisions
+// GetWithMeta retrieves a borrowed immutable cached report with its metadata for
+// XFetch decisions.
 func (c *HistoryCache) GetWithMeta(key CacheKey) (*HistoryReport, time.Time, time.Duration, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -158,8 +174,7 @@ func (c *HistoryCache) GetWithMeta(key CacheKey) (*HistoryReport, time.Time, tim
 		return nil, time.Time{}, 0, false
 	}
 
-	// Check if entry is expired
-	if time.Since(entry.CreatedAt) > c.maxAge {
+	if !cacheCreatedAtIsFresh(entry.CreatedAt, time.Now(), c.maxAge) {
 		c.removeEntryLocked(keyStr)
 		return nil, time.Time{}, 0, false
 	}
@@ -283,7 +298,20 @@ func (c *HistoryCache) evictOldestLocked() {
 
 // BuildCacheKey creates a cache key for the given parameters
 func BuildCacheKey(repoPath string, beads []BeadInfo, opts CorrelatorOptions) (CacheKey, error) {
-	headSHA, err := getGitHead(repoPath)
+	return buildCacheKeyContext(context.Background(), repoPath, beads, opts)
+}
+
+// buildCacheKeyContext is the cancellation-aware form used by callers that
+// promise to bound every Git subprocess. Keep BuildCacheKey as the public,
+// run-to-completion compatibility entry point.
+func buildCacheKeyContext(ctx context.Context, repoPath string, beads []BeadInfo, opts CorrelatorOptions) (CacheKey, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return CacheKey{}, err
+		}
+	}
+	historyState := coCommitRepositoryHistoryState(ctx, repoPath)
+	headSHA, err := getGitHeadContext(ctx, repoPath)
 	if err != nil {
 		return CacheKey{}, err
 	}
@@ -292,9 +320,10 @@ func BuildCacheKey(repoPath string, beads []BeadInfo, opts CorrelatorOptions) (C
 	optsHash := hashOptions(opts)
 
 	return CacheKey{
-		HeadSHA:   headSHA,
-		BeadsHash: beadsHash,
-		Options:   optsHash,
+		HeadSHA:      headSHA,
+		HistoryState: historyState,
+		BeadsHash:    beadsHash,
+		Options:      optsHash,
 	}, nil
 }
 
@@ -306,8 +335,7 @@ func getGitHead(repoPath string) (string, error) {
 // getGitHeadContext returns the current HEAD SHA, bounding the git subprocess
 // by ctx (#166). A nil ctx means context.Background().
 func getGitHeadContext(ctx context.Context, repoPath string) (string, error) {
-	cmd := gitCommand(ctx, "rev-parse", "HEAD")
-	cmd.Dir = repoPath
+	cmd := repoGitCommand(ctx, repoPath, "rev-parse", "HEAD")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -317,21 +345,35 @@ func getGitHeadContext(ctx context.Context, repoPath string) (string, error) {
 
 // hashBeads creates a hash of all bead fields that are embedded in reports.
 func hashBeads(beads []BeadInfo) string {
-	if len(beads) == 0 {
-		return hex.EncodeToString(sha256.New().Sum(nil))[:12]
+	// buildHistories treats duplicate IDs as last-write-wins. Canonicalize to
+	// that same effective map before hashing; sorting every raw triple would make
+	// opposite duplicate orders collide even though they assemble different
+	// titles/statuses in the report.
+	effective := make(map[string]BeadInfo, len(beads))
+	for _, bead := range beads {
+		effective[bead.ID] = bead
 	}
-
-	entries := make([]string, 0, len(beads))
-	for _, b := range beads {
-		entries = append(entries, b.ID+"\x00"+b.Title+"\x00"+b.Status)
+	canonical := make([]BeadInfo, 0, len(effective))
+	for _, bead := range effective {
+		canonical = append(canonical, bead)
 	}
-	sort.Strings(entries)
-
-	h := sha256.New()
-	for _, entry := range entries {
-		h.Write([]byte(entry))
+	sort.Slice(canonical, func(i, j int) bool {
+		if canonical[i].ID != canonical[j].ID {
+			return canonical[i].ID < canonical[j].ID
+		}
+		if canonical[i].Title != canonical[j].Title {
+			return canonical[i].Title < canonical[j].Title
+		}
+		return canonical[i].Status < canonical[j].Status
+	})
+	data, err := json.Marshal(canonical)
+	if err != nil {
+		// BeadInfo currently contains strings only, so this is unreachable. Keep
+		// the failure fail-closed if the type later acquires a non-JSON field.
+		return ""
 	}
-	return hex.EncodeToString(h.Sum(nil))[:12]
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // hashOptions creates a hash of correlator options
@@ -352,9 +394,8 @@ func hashOptions(opts CorrelatorOptions) string {
 		return "default"
 	}
 
-	h := sha256.New()
-	h.Write(data)
-	return hex.EncodeToString(h.Sum(nil))[:12]
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // CachedCorrelator wraps a Correlator with caching support
@@ -393,12 +434,19 @@ func NewCachedCorrelatorWithOptions(repoPath string, maxAge time.Duration, maxSi
 	}
 }
 
-// GenerateReport generates a history report, using cache when possible
+// GenerateReport generates a history report, using cache when possible. The
+// returned report may be cache-backed and must be treated as immutable.
 func (c *CachedCorrelator) GenerateReport(beads []BeadInfo, opts CorrelatorOptions) (*HistoryReport, error) {
 	// Build cache key
 	key, err := BuildCacheKey(c.cache.repoPath, beads, opts)
 	if err != nil {
 		// If we can't build a cache key, fall back to uncached
+		return c.generate(beads, opts)
+	}
+	if !key.historyCacheSafe() {
+		// A shallow boundary can move after fetch --deepen without changing
+		// HEAD. Never read or populate this long-lived cache until Git proves
+		// the repository has complete history.
 		return c.generate(beads, opts)
 	}
 

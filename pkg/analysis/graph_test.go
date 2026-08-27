@@ -566,6 +566,7 @@ func TestGetBlockers(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "B", Type: model.DepBlocks},
+			{DependsOnID: "B", Type: model.DepBlocks},       // Duplicate semantic edge
 			{DependsOnID: "C", Type: model.DepRelated},      // Not a blocker
 			{DependsOnID: "missing", Type: model.DepBlocks}, // Missing
 		}},
@@ -586,6 +587,7 @@ func TestGetOpenBlockers(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "B", Type: model.DepBlocks},
+			{DependsOnID: "B", Type: model.DepBlocks}, // Duplicate semantic edge
 			{DependsOnID: "C", Type: model.DepBlocks},
 		}},
 		{ID: "B", Status: model.StatusOpen},
@@ -772,6 +774,57 @@ func TestGetBlockerChain(t *testing.T) {
 		}
 		if !result.Chain[0].Actionable {
 			t.Error("Expected target to be actionable")
+		}
+	})
+
+	t.Run("future deferred root is not actionable", func(t *testing.T) {
+		now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+		future := now.Add(time.Hour)
+		issues := []model.Issue{
+			{ID: "A", Status: model.StatusOpen, Title: "Deferred root", DeferUntil: &future},
+		}
+		an := analysis.NewAnalyzer(issues)
+		an.SetNow(now)
+		result := an.GetBlockerChain("A")
+
+		if result == nil || len(result.Chain) != 1 {
+			t.Fatalf("unexpected blocker-chain result: %#v", result)
+		}
+		if result.IsBlocked {
+			t.Fatal("a scheduler deferral is not a dependency blocker")
+		}
+		if result.Chain[0].Actionable {
+			t.Fatal("future-deferred root must not be labeled actionable")
+		}
+	})
+
+	t.Run("blocked parent propagates into child chain", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "ROOT", Status: model.StatusOpen, Title: "Root blocker"},
+			{ID: "P", Status: model.StatusOpen, Title: "Blocked parent", Dependencies: []*model.Dependency{
+				{DependsOnID: "ROOT", Type: model.DepBlocks},
+			}},
+			{ID: "CHILD", Status: model.StatusOpen, Title: "Child", Dependencies: []*model.Dependency{
+				{DependsOnID: "P", Type: model.DepParentChild},
+			}},
+		}
+		an := analysis.NewAnalyzer(issues)
+		result := an.GetBlockerChain("CHILD")
+
+		if result == nil || !result.IsBlocked {
+			t.Fatalf("parent-blocked child must have a blocker chain: %#v", result)
+		}
+		if result.ChainLength != 2 {
+			t.Fatalf("chain length = %d, want CHILD <- P <- ROOT", result.ChainLength)
+		}
+		if len(result.RootBlockers) != 1 || result.RootBlockers[0].ID != "ROOT" {
+			t.Fatalf("root blockers = %#v, want ROOT", result.RootBlockers)
+		}
+		if result.Chain[0].Actionable {
+			t.Fatal("parent-blocked child must not be labeled actionable")
+		}
+		if !result.RootBlockers[0].Actionable {
+			t.Fatal("unblocked ROOT should be actionable")
 		}
 	})
 

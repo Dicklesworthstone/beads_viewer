@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -242,31 +244,31 @@ func TestHistoryModel_SetReportPreservesGitSelectionByIdentity(t *testing.T) {
 func TestHistoryModel_SetReportPreservesBeadAndCommitSelectionByIdentity(t *testing.T) {
 	h := NewHistoryModel(createTestHistoryReport(), testTheme())
 	for i, beadID := range h.beadIDs {
-		if beadID == "bv-2" {
+		if beadID == "bv-1" {
 			h.selectedBead = i
 			break
 		}
 	}
 	selectedHistory := h.SelectedHistory()
-	if selectedHistory == nil || selectedHistory.BeadID != "bv-2" || len(selectedHistory.Commits) < 2 {
+	if selectedHistory == nil || selectedHistory.BeadID != "bv-1" || len(selectedHistory.Commits) < 2 {
 		t.Fatalf("multi-commit bead fixture is unavailable: %+v", selectedHistory)
 	}
 	h.selectedCommit = 1
 	wantSHA := h.SelectedCommit().SHA
 
 	refreshed := createTestHistoryReport()
-	history := refreshed.Histories["bv-2"]
+	history := refreshed.Histories["bv-1"]
 	history.Commits = append([]correlation.CorrelatedCommit{{
 		SHA:       "newer-than-selection",
 		ShortSHA:  "newer",
 		Message:   "newer commit",
 		Timestamp: time.Now().Add(time.Hour),
 	}}, history.Commits...)
-	refreshed.Histories["bv-2"] = history
+	refreshed.Histories["bv-1"] = history
 	h.SetReport(refreshed)
 
-	if got := h.SelectedBeadID(); got != "bv-2" {
-		t.Fatalf("selected bead after refresh=%q, want bv-2", got)
+	if got := h.SelectedBeadID(); got != "bv-1" {
+		t.Fatalf("selected bead after refresh=%q, want bv-1", got)
 	}
 	if selected := h.SelectedCommit(); selected == nil || selected.SHA != wantSHA {
 		t.Fatalf("selected bead commit after refresh=%+v, want SHA %s", selected, wantSHA)
@@ -357,6 +359,48 @@ func TestHistoryModel_Navigation(t *testing.T) {
 	}
 }
 
+func TestHistoryModel_TimelineOffsetResetsAcrossBeadChanges(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	commits := func(prefix string, count int) []correlation.CorrelatedCommit {
+		result := make([]correlation.CorrelatedCommit, count)
+		for i := range result {
+			result[i] = correlation.CorrelatedCommit{
+				SHA:       fmt.Sprintf("%s-%02d", prefix, i),
+				ShortSHA:  fmt.Sprintf("%s-%02d", prefix, i),
+				Message:   fmt.Sprintf("%s commit %d", prefix, i),
+				Timestamp: now.Add(time.Duration(i) * time.Minute),
+			}
+		}
+		return result
+	}
+	report := &correlation.HistoryReport{Histories: map[string]correlation.BeadHistory{
+		"LONG":  {BeadID: "LONG", Title: "Long history", Commits: commits("long", 10)},
+		"SHORT": {BeadID: "SHORT", Title: "Shorter history", Commits: commits("short", 6)},
+	}}
+	h := NewHistoryModel(report, testTheme())
+	h.SetSize(180, 12) // Four visible timeline rows.
+	if h.SelectedBeadID() != "LONG" {
+		t.Fatalf("initial bead = %q, want LONG", h.SelectedBeadID())
+	}
+	h.focused = historyFocusTimeline
+	h.MoveDown()
+	h.MoveDown()
+	if h.timelineScrollOffset != 2 {
+		t.Fatalf("long-history offset = %d, want 2", h.timelineScrollOffset)
+	}
+
+	h.focused = historyFocusList
+	h.MoveDown()
+	if h.SelectedBeadID() != "SHORT" || h.timelineScrollOffset != 0 {
+		t.Fatalf("short selection = %q offset=%d, want SHORT offset 0", h.SelectedBeadID(), h.timelineScrollOffset)
+	}
+	h.focused = historyFocusTimeline
+	h.MoveDown()
+	if h.timelineScrollOffset != 1 {
+		t.Fatalf("short-history first MoveDown offset = %d, want 1", h.timelineScrollOffset)
+	}
+}
+
 func TestHistoryModel_ToggleFocus(t *testing.T) {
 	report := createTestHistoryReport()
 	theme := testTheme()
@@ -428,11 +472,36 @@ func TestHistoryModel_AuthorFilter(t *testing.T) {
 	if len(h.beadIDs) != 1 || h.beadIDs[0] != "bv-1" {
 		t.Errorf("filtered beadID = %v, want [bv-1]", h.beadIDs)
 	}
+	for _, commit := range h.histories[0].Commits {
+		if commit.Author != "Dev One" {
+			t.Fatalf("author filter retained commit by %q", commit.Author)
+		}
+	}
 
 	// Clear filter
 	h.SetAuthorFilter("")
 	if len(h.histories) != 3 {
 		t.Errorf("histories after clearing filter = %d, want 3", len(h.histories))
+	}
+}
+
+func TestHistoryModel_AuthorFilterNarrowsGitCommitList(t *testing.T) {
+	report := &correlation.HistoryReport{Histories: map[string]correlation.BeadHistory{
+		"A": {
+			BeadID: "A",
+			Commits: []correlation.CorrelatedCommit{
+				{SHA: "alice", Author: "Alice", AuthorEmail: "alice@example.com"},
+				{SHA: "bob", Author: "Bob", AuthorEmail: "bob@example.com"},
+			},
+		},
+	}}
+	h := NewHistoryModel(report, testTheme())
+	h.ToggleViewMode()
+	h.SetAuthorFilter("alice@example.com")
+
+	commits := h.GetFilteredCommitList()
+	if len(commits) != 1 || commits[0].SHA != "alice" {
+		t.Fatalf("git author filter returned %+v, want only alice", commits)
 	}
 }
 
@@ -1041,6 +1110,414 @@ func TestHistoryModel_GitSearchWithNoMatchesStaysEmpty(t *testing.T) {
 	}
 	if got := h.GetFilteredCommitList(); len(got) != 0 {
 		t.Fatalf("zero-result query exposed %d unfiltered commits", len(got))
+	}
+}
+
+func TestHistoryModel_GitAllSearchIncludesBeadTitles(t *testing.T) {
+	report := createTestHistoryReport()
+	h := NewHistoryModel(report, testTheme())
+	h.ToggleViewMode()
+	h.StartSearch()
+	h.searchInput.SetValue("authentication")
+	h.applySearchFilter()
+
+	commits := h.GetFilteredCommitList()
+	if len(commits) != 2 {
+		t.Fatalf("git all-field title search returned %d commits, want 2", len(commits))
+	}
+	for _, commit := range commits {
+		if !slices.Contains(commit.BeadIDs, "bv-1") {
+			t.Fatalf("git all-field title search returned unrelated commit %+v", commit)
+		}
+	}
+}
+
+func TestHistoryModel_GitModeComposesSearchConfidenceAndFileFilters(t *testing.T) {
+	report := &correlation.HistoryReport{
+		Histories: map[string]correlation.BeadHistory{
+			"A": {
+				BeadID: "A",
+				Commits: []correlation.CorrelatedCommit{
+					{
+						SHA:        "keep-target",
+						ShortSHA:   "keep",
+						Message:    "keep this change",
+						Author:     "Alice",
+						Confidence: 0.9,
+						Files:      []correlation.FileChange{{Path: "target.go"}},
+					},
+					{
+						SHA:        "low-target",
+						ShortSHA:   "low",
+						Message:    "keep low confidence",
+						Author:     "Alice",
+						Confidence: 0.2,
+						Files:      []correlation.FileChange{{Path: "target.go"}},
+					},
+				},
+			},
+			"B": {
+				BeadID: "B",
+				Commits: []correlation.CorrelatedCommit{{
+					SHA:        "keep-other",
+					ShortSHA:   "other",
+					Message:    "keep unrelated file",
+					Author:     "Bob",
+					Confidence: 0.95,
+					Files:      []correlation.FileChange{{Path: "other.go"}},
+				}},
+			},
+		},
+	}
+
+	h := NewHistoryModel(report, testTheme())
+	h.ToggleViewMode()
+	h.StartSearch()
+	h.searchInput.SetValue("keep")
+	h.applySearchFilter()
+	h.FinishSearch()
+	h.SetMinConfidence(0.5)
+	h.fileFilter = "target.go"
+	h.applySearchFilter()
+
+	commits := h.GetFilteredCommitList()
+	if len(commits) != 1 || commits[0].SHA != "keep-target" {
+		t.Fatalf("composed git filters returned %+v, want only keep-target", commits)
+	}
+
+	refreshed := &correlation.HistoryReport{Histories: map[string]correlation.BeadHistory{
+		"A": report.Histories["A"],
+		"C": {
+			BeadID: "C",
+			Commits: []correlation.CorrelatedCommit{{
+				SHA:        "new-wrong-file",
+				ShortSHA:   "new",
+				Message:    "keep new change",
+				Author:     "Alice",
+				Confidence: 0.99,
+				Files:      []correlation.FileChange{{Path: "elsewhere.go"}},
+			}},
+		},
+	}}
+	h.SetReport(refreshed)
+
+	commits = h.GetFilteredCommitList()
+	if len(commits) != 1 || commits[0].SHA != "keep-target" {
+		t.Fatalf("refreshed composed git filters returned %+v, want only keep-target", commits)
+	}
+	if got := h.SearchQuery(); got != "keep" {
+		t.Fatalf("refreshed search query=%q, want keep", got)
+	}
+}
+
+func TestHistoryModel_TimelineUsesFilteredCommitSlice(t *testing.T) {
+	now := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)
+	commits := []correlation.CorrelatedCommit{{
+		SHA:        "visible",
+		ShortSHA:   "visible",
+		Message:    "visible-marker",
+		Author:     "Alice",
+		Timestamp:  now,
+		Confidence: 0.9,
+	}}
+	for i := 0; i < 5; i++ {
+		commits = append(commits, correlation.CorrelatedCommit{
+			SHA:        fmt.Sprintf("hidden-%d", i),
+			ShortSHA:   fmt.Sprintf("hide-%d", i),
+			Message:    fmt.Sprintf("hidden-marker-%d", i),
+			Author:     "Bob",
+			Timestamp:  now.Add(time.Duration(i+1) * time.Minute),
+			Confidence: 0.9,
+		})
+	}
+	report := &correlation.HistoryReport{Histories: map[string]correlation.BeadHistory{
+		"A": {BeadID: "A", Title: "Filtered timeline", Status: "open", Commits: commits},
+	}}
+
+	h := NewHistoryModel(report, testTheme())
+	h.SetSize(100, 9)
+	h.timelineScrollOffset = 4
+	h.SetAuthorFilter("Alice")
+	if h.timelineScrollOffset != 0 {
+		t.Fatalf("filtered timeline retained stale offset %d, want 0", h.timelineScrollOffset)
+	}
+	if selected := h.SelectedHistory(); selected == nil || len(selected.Commits) != 1 {
+		t.Fatalf("filtered selected history = %+v, want one Alice commit", selected)
+	}
+
+	rendered := h.renderTimelinePanel(100, 8)
+	if !strings.Contains(rendered, "visible-marker") {
+		t.Fatalf("filtered timeline omitted visible commit: %q", rendered)
+	}
+	if strings.Contains(rendered, "hidden-marker") {
+		t.Fatalf("filtered timeline leaked a commit excluded by the author filter: %q", rendered)
+	}
+
+	h.focused = historyFocusTimeline
+	h.MoveDown()
+	if h.timelineScrollOffset != 0 {
+		t.Fatalf("timeline scroll offset = %d, want 0 for the one filtered entry", h.timelineScrollOffset)
+	}
+}
+
+func TestHistoryModel_TimelineBudgetsRenderedRowsAndShowsFinalEntry(t *testing.T) {
+	const finalSentinel = "FINAL-TIMELINE"
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	commits := make([]correlation.CorrelatedCommit, 9)
+	for i := range commits {
+		message := fmt.Sprintf("timeline message %d", i)
+		if i == len(commits)-1 {
+			message = finalSentinel
+		}
+		commits[i] = correlation.CorrelatedCommit{
+			SHA:        fmt.Sprintf("commit-%02d", i),
+			ShortSHA:   fmt.Sprintf("c-%02d", i),
+			Message:    message,
+			Timestamp:  now.Add(time.Duration(i) * time.Minute),
+			Confidence: 0.9,
+		}
+	}
+	cycle := 48 * time.Hour
+	report := &correlation.HistoryReport{Histories: map[string]correlation.BeadHistory{
+		"A": {
+			BeadID:    "A",
+			Title:     "Rendered row accounting",
+			Commits:   commits,
+			CycleTime: &correlation.CycleTime{CreateToClose: &cycle},
+		},
+	}}
+
+	h := NewHistoryModel(report, testTheme())
+	h.SetSize(220, 22)
+	_ = h.StartSearch() // The bordered search box makes the rendered header taller.
+	headerHeight := lipgloss.Height(h.renderHeader())
+	if headerHeight <= 4 {
+		t.Fatalf("search header height=%d, want a multi-row header fixture", headerHeight)
+	}
+	panelWidth, panelHeight := h.timelinePanelSize()
+	if want := h.height - headerHeight; panelHeight != want {
+		t.Fatalf("timeline panel height=%d, want terminal budget %d", panelHeight, want)
+	}
+
+	layout := h.layoutTimeline(h.SelectedHistory(), panelWidth, panelHeight)
+	if got := lipgloss.Height(layout.entries[0]); got != 2 {
+		t.Fatalf("rendered commit entry height=%d, want 2 rows", got)
+	}
+	if !layout.showScroll {
+		t.Fatal("multi-row fixture unexpectedly fits without scrolling")
+	}
+
+	h.focused = historyFocusTimeline
+	for i := 0; i < len(commits)+1; i++ {
+		h.MoveDown()
+	}
+	if h.timelineScrollOffset == 0 {
+		t.Fatal("timeline did not advance to its final rendered-row window")
+	}
+	panel := h.renderTimelinePanel(panelWidth, panelHeight)
+	if got := lipgloss.Height(panel); got != panelHeight {
+		t.Fatalf("rendered timeline panel height=%d, want %d", got, panelHeight)
+	}
+	if !strings.Contains(panel, finalSentinel) {
+		t.Fatalf("final timeline sentinel was not visible at max scroll: %q", panel)
+	}
+	if !strings.Contains(panel, "Cycle: 2d") {
+		t.Fatalf("timeline summary footer was not visible: %q", panel)
+	}
+
+	view := h.View()
+	if got := lipgloss.Height(view); got != h.height {
+		t.Fatalf("rendered History height=%d, want configured height %d", got, h.height)
+	}
+}
+
+func TestHistoryModel_TimelinePrefersEntryOverSummaryWhenRowsAreTight(t *testing.T) {
+	const entrySentinel = "VISIBLE-TIMELINE-EVENT"
+	cycle := 24 * time.Hour
+	report := &correlation.HistoryReport{Histories: map[string]correlation.BeadHistory{
+		"A": {
+			BeadID: "A",
+			Commits: []correlation.CorrelatedCommit{{
+				SHA:        "commit-a",
+				ShortSHA:   "c-a",
+				Message:    entrySentinel,
+				Timestamp:  time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC),
+				Confidence: 0.9,
+			}},
+			CycleTime: &correlation.CycleTime{CreateToClose: &cycle},
+		},
+	}}
+
+	h := NewHistoryModel(report, testTheme())
+	const panelWidth, panelHeight = 80, 6 // Four inner rows: title plus one two-row entry.
+	layout := h.layoutTimeline(h.SelectedHistory(), panelWidth, panelHeight)
+	entryRows := lipgloss.Height(layout.entries[0])
+	if entryRows != 2 {
+		t.Fatalf("fixture entry height=%d, want 2", entryRows)
+	}
+	if layout.summary != "" {
+		t.Fatalf("tight layout retained optional summary and left entry budget=%d", layout.entryRowBudget)
+	}
+	if layout.entryRowBudget < entryRows {
+		t.Fatalf("entry row budget=%d, want at least %d", layout.entryRowBudget, entryRows)
+	}
+	if end := timelineWindowEnd(layout.entries, 0, layout.entryRowBudget); end != 1 {
+		t.Fatalf("tight layout rendered %d entries, want the primary event", end)
+	}
+
+	panel := h.renderTimelinePanel(panelWidth, panelHeight)
+	if got := lipgloss.Height(panel); got != panelHeight {
+		t.Fatalf("tight timeline panel height=%d, want %d", got, panelHeight)
+	}
+	if !strings.Contains(panel, entrySentinel) {
+		t.Fatalf("tight timeline omitted the event sentinel: %q", panel)
+	}
+	if strings.Contains(panel, "Cycle:") {
+		t.Fatalf("tight timeline rendered optional summary ahead of its event: %q", panel)
+	}
+}
+
+func TestHistoryModel_NegativeSelectionsAreUnavailable(t *testing.T) {
+	h := NewHistoryModel(createTestHistoryReportWithFiles(), testTheme())
+	h.ToggleFileTree()
+	h.selectedFileIdx = -1
+	if got := h.SelectedFileName(); got != "" {
+		t.Fatalf("SelectedFileName with negative index = %q, want empty", got)
+	}
+	if got := h.SelectedFileNode(); got != nil {
+		t.Fatalf("SelectedFileNode with negative index = %+v, want nil", got)
+	}
+	h.CollapseFileNode()
+	h.ToggleExpandFile()
+	h.MoveDownFileTree()
+	if h.selectedFileIdx != 0 {
+		t.Fatalf("MoveDownFileTree did not recover negative selection: got %d, want 0", h.selectedFileIdx)
+	}
+
+	h.selectedBead = -1
+	if got := h.SelectedBeadID(); got != "" {
+		t.Fatalf("SelectedBeadID with negative index = %q, want empty", got)
+	}
+	if got := h.SelectedHistory(); got != nil {
+		t.Fatalf("SelectedHistory with negative index = %+v, want nil", got)
+	}
+	h.NextCommit()
+	h.ToggleExpand()
+	h.focused = historyFocusMiddle
+	h.MoveDown()
+	h.focused = historyFocusTimeline
+	_ = h.renderTimelinePanel(80, 10)
+
+	h.ToggleViewMode()
+	h.selectedGitCommit = -1
+	if got := h.SelectedGitCommit(); got != nil {
+		t.Fatalf("SelectedGitCommit with negative index = %+v, want nil", got)
+	}
+	h.focused = historyFocusMiddle
+	h.MoveDownGit()
+	h.NextRelatedBead()
+}
+
+func TestHistoryModel_FilterSetterPreservesActiveSearch(t *testing.T) {
+	h := NewHistoryModel(createTestHistoryReport(), testTheme())
+	h.StartSearch()
+	h.searchInput.SetValue("indexes")
+	h.applySearchFilter()
+
+	h.SetMinConfidence(0.5)
+	if got := h.beadIDs; len(got) != 1 || got[0] != "bv-3" {
+		t.Fatalf("confidence update discarded active search: bead IDs=%v, want [bv-3]", got)
+	}
+
+	h.SetAuthorFilter("Dev Two")
+	if got := h.beadIDs; len(got) != 1 || got[0] != "bv-3" {
+		t.Fatalf("author update discarded active search: bead IDs=%v, want [bv-3]", got)
+	}
+}
+
+func TestHistoryModel_FiltersPreserveSurvivingSelectionIdentity(t *testing.T) {
+	beadMode := NewHistoryModel(createTestHistoryReport(), testTheme())
+	for i, beadID := range beadMode.beadIDs {
+		if beadID == "bv-2" {
+			beadMode.selectedBead = i
+			break
+		}
+	}
+	beadMode.SetAuthorFilter("Dev Two")
+	if got := beadMode.SelectedBeadID(); got != "bv-2" {
+		t.Fatalf("bead filter moved surviving selection to %q, want bv-2", got)
+	}
+
+	now := time.Now()
+	report := &correlation.HistoryReport{Histories: map[string]correlation.BeadHistory{
+		"A": {
+			BeadID: "A",
+			Commits: []correlation.CorrelatedCommit{
+				{SHA: "new-low", Timestamp: now, Confidence: 0.1},
+				{SHA: "middle-low", Timestamp: now.Add(-time.Minute), Confidence: 0.2},
+				{SHA: "old-high", Timestamp: now.Add(-2 * time.Minute), Confidence: 0.9},
+			},
+		},
+	}}
+	gitMode := NewHistoryModel(report, testTheme())
+	gitMode.ToggleViewMode()
+	for i, commit := range gitMode.GetFilteredCommitList() {
+		if commit.SHA == "old-high" {
+			gitMode.selectedGitCommit = i
+			break
+		}
+	}
+	gitMode.SetMinConfidence(0.5)
+	if selected := gitMode.SelectedGitCommit(); selected == nil || selected.SHA != "old-high" {
+		t.Fatalf("git filter lost surviving commit selection: %+v", selected)
+	}
+}
+
+func TestHistoryModel_GitCommitListSortsByFullTimestamp(t *testing.T) {
+	minute := time.Date(2026, 8, 26, 12, 34, 0, 0, time.UTC)
+	report := &correlation.HistoryReport{Histories: map[string]correlation.BeadHistory{
+		"A": {
+			BeadID: "A",
+			Commits: []correlation.CorrelatedCommit{
+				// The SHA order deliberately disagrees with chronological order.
+				{SHA: "zzz-older", Timestamp: minute.Add(5 * time.Second)},
+				{SHA: "aaa-newer", Timestamp: minute.Add(50 * time.Second)},
+			},
+		},
+	}}
+
+	h := NewHistoryModel(report, testTheme())
+	h.ToggleViewMode()
+	commits := h.GetFilteredCommitList()
+	if len(commits) != 2 {
+		t.Fatalf("git commit count = %d, want 2", len(commits))
+	}
+	if commits[0].SHA != "aaa-newer" || commits[1].SHA != "zzz-older" {
+		t.Fatalf("git commit order = [%s %s], want [aaa-newer zzz-older]", commits[0].SHA, commits[1].SHA)
+	}
+	if commits[0].Timestamp != commits[1].Timestamp {
+		t.Fatalf("fixture display timestamps differ: %q vs %q", commits[0].Timestamp, commits[1].Timestamp)
+	}
+}
+
+func TestHistoryModel_SearchDoesNotResurrectConfidenceFilteredCommit(t *testing.T) {
+	report := &correlation.HistoryReport{Histories: map[string]correlation.BeadHistory{
+		"A": {
+			BeadID: "A",
+			Commits: []correlation.CorrelatedCommit{
+				{SHA: "high", Message: "retained", Confidence: 0.9},
+				{SHA: "low", Message: "excluded needle", Confidence: 0.2},
+			},
+		},
+	}}
+	h := NewHistoryModel(report, testTheme())
+	h.StartSearch()
+	h.searchInput.SetValue("excluded needle")
+	h.applySearchFilter()
+	h.SetMinConfidence(0.5)
+
+	if len(h.beadIDs) != 0 || len(h.histories) != 0 {
+		t.Fatalf("search resurrected confidence-filtered commit: IDs=%v histories=%+v", h.beadIDs, h.histories)
 	}
 }
 

@@ -521,28 +521,38 @@ func (f *TestFixture) AddIssueWithLabels(title, status string, priority int, iss
 	return id
 }
 
-// Write writes all issues to the .beads/beads.jsonl file.
+// Write creates a current-br issue export plus its source-routing metadata.
 func (f *TestFixture) Write() error {
 	f.t.Helper()
 
-	beadsPath := filepath.Join(f.Dir, ".beads", "beads.jsonl")
+	beadsDir := filepath.Join(f.Dir, ".beads")
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
 	file, err := os.Create(beadsPath)
 	if err != nil {
-		return fmt.Errorf("create beads.jsonl: %w", err)
+		return fmt.Errorf("create issues.jsonl: %w", err)
 	}
-	defer file.Close()
 
 	for _, issue := range f.beads {
 		data, err := json.Marshal(issue)
 		if err != nil {
+			_ = file.Close()
 			return fmt.Errorf("marshal issue %s: %w", issue.ID, err)
 		}
 		if _, err := file.Write(data); err != nil {
+			_ = file.Close()
 			return fmt.Errorf("write issue %s: %w", issue.ID, err)
 		}
 		if _, err := file.WriteString("\n"); err != nil {
+			_ = file.Close()
 			return fmt.Errorf("write newline: %w", err)
 		}
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close issues.jsonl: %w", err)
+	}
+	metadata := []byte("{\"database\":\"beads.db\",\"jsonl_export\":\"issues.jsonl\"}\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0o644); err != nil {
+		return fmt.Errorf("write metadata.json: %w", err)
 	}
 
 	return nil

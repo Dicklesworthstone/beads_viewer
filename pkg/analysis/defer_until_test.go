@@ -151,6 +151,28 @@ func TestGetActionableIssues_ExcludesFutureDeferred(t *testing.T) {
 	}
 }
 
+func TestTriageUnblocksMap_ExcludesFutureDeferredSuccessor(t *testing.T) {
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "BLOCKER", Status: model.StatusOpen},
+		{ID: "PARKED", Status: model.StatusBlocked, DeferUntil: &future, Dependencies: []*model.Dependency{
+			{DependsOnID: "BLOCKER", Type: model.DepBlocks},
+		}},
+	}
+
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(now)
+	if got := NewTriageContext(analyzer).Unblocks("BLOCKER"); len(got) != 0 {
+		t.Fatalf("future-deferred successor leaked into unblocks: %v", got)
+	}
+
+	analyzer.SetNow(future)
+	if got := NewTriageContext(analyzer).Unblocks("BLOCKER"); len(got) != 1 || got[0] != "PARKED" {
+		t.Fatalf("elapsed successor should be unblocked, got %v", got)
+	}
+}
+
 func TestIsClaimableRecommendation_DeferUntil(t *testing.T) {
 	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
 	future := now.Add(time.Minute)

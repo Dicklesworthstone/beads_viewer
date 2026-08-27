@@ -47,7 +47,7 @@ func LoadSprintsFromFile(path string) ([]model.Sprint, error) {
 // Malformed or invalid sprints are skipped with warnings written to stderr,
 // consistent with ParseIssues behavior (suppressed in robot mode).
 func ParseSprints(r io.Reader) ([]model.Sprint, error) {
-	var sprints []model.Sprint
+	sprints := make([]model.Sprint, 0)
 
 	warn := func(msg string) {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)

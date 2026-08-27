@@ -98,7 +98,10 @@ func DefaultConfig() AnalysisConfig {
 func ConfigForSize(nodeCount, edgeCount int) AnalysisConfig {
 	density := 0.0
 	if nodeCount > 1 {
-		density = float64(edgeCount) / float64(nodeCount*(nodeCount-1))
+		// Convert before multiplying. The graph can never contain enough nodes
+		// to overflow an int in practice, but ConfigForSize is a public helper
+		// and callers may pass synthetic counts (for planning or tests).
+		density = float64(edgeCount) / (float64(nodeCount) * float64(nodeCount-1))
 	}
 
 	var cfg AnalysisConfig
@@ -386,8 +389,7 @@ func ApplyEnvOverrides(cfg AnalysisConfig) AnalysisConfig {
 		cfg.ComputeCriticalPath = false
 	}
 
-	if seconds, ok := envPositiveInt(EnvPhase2TimeoutSeconds); ok {
-		timeout := time.Duration(seconds) * time.Second
+	if timeout, ok := envPositiveSeconds(EnvPhase2TimeoutSeconds); ok {
 		if cfg.ComputeBetweenness {
 			cfg.BetweennessTimeout = timeout
 		}
@@ -410,20 +412,29 @@ func validSourceDateEpoch() bool {
 	if v == "" {
 		return false
 	}
-	_, err := strconv.ParseInt(v, 10, 64)
-	return err == nil
+	seconds, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return false
+	}
+	// Keep this activation contract aligned with cmd/bv's pinned robot clock:
+	// RFC3339 and time.Time's JSON encoding require a four-digit year. An
+	// unencodable epoch must not silently remove every analysis timeout while
+	// the rest of the robot output falls back to wall-clock time.
+	year := time.Unix(seconds, 0).UTC().Year()
+	return year >= 0 && year < 10000
 }
 
-func envPositiveInt(name string) (int, bool) {
+func envPositiveSeconds(name string) (time.Duration, bool) {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
 		return 0, false
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
+	seconds, err := strconv.ParseInt(v, 10, 64)
+	maxSeconds := int64(time.Duration(1<<63-1) / time.Second)
+	if err != nil || seconds <= 0 || seconds > maxSeconds {
 		return 0, false
 	}
-	return n, true
+	return time.Duration(seconds) * time.Second, true
 }
 
 func envBool(name string) bool {

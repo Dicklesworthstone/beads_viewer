@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -21,6 +22,27 @@ func TestGenerateTopReasons_Empty(t *testing.T) {
 		if r.Weight < 0.01 {
 			t.Errorf("should not include negligible reason %s with weight %f", r.Factor, r.Weight)
 		}
+	}
+}
+
+func TestEstimateDaysSavedDoesNotOverflowIntAccumulator(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	issueMap := map[string]model.Issue{
+		"A": {ID: "A", EstimatedMinutes: &maxInt},
+		"B": {ID: "B", EstimatedMinutes: &maxInt},
+	}
+
+	got := estimateDaysSaved([]string{"A", "B"}, issueMap)
+	if got <= 0 || math.IsInf(got, 0) || math.IsNaN(got) {
+		t.Fatalf("estimateDaysSaved overflowed: %v", got)
+	}
+
+	analyzer := NewAnalyzer([]model.Issue{
+		{ID: "A", EstimatedMinutes: &maxInt},
+		{ID: "B", EstimatedMinutes: &maxInt},
+	})
+	if got := analyzer.computeMedianEstimatedMinutes(); got != maxInt {
+		t.Fatalf("median estimate=%d, want %d", got, maxInt)
 	}
 }
 
@@ -297,6 +319,50 @@ func TestTopWhatIfDeltas_SkipsTombstone(t *testing.T) {
 	results := analyzer.TopWhatIfDeltas(10)
 	if len(results) != 0 {
 		t.Fatalf("expected tombstone to be excluded, got %d results", len(results))
+	}
+}
+
+func TestWhatIfDeltaExcludesDeferredAndParentGatedCascade(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "ROOT", Status: model.StatusOpen},
+		{ID: "PARENT-BLOCKER", Status: model.StatusOpen},
+		{ID: "PARENT", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "PARENT-BLOCKER", Type: model.DepBlocks},
+		}},
+		{ID: "DEFERRED", Status: model.StatusBlocked, DeferUntil: &future, Dependencies: []*model.Dependency{
+			{DependsOnID: "ROOT", Type: model.DepBlocks},
+		}},
+		{ID: "PARENT-GATED", Status: model.StatusBlocked, Dependencies: []*model.Dependency{
+			{DependsOnID: "ROOT", Type: model.DepBlocks},
+			{DependsOnID: "PARENT", Type: model.DepParentChild},
+		}},
+	}
+
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(now)
+	delta := analyzer.computeWhatIfDeltaFromStats("ROOT", &GraphStats{})
+	if delta.DirectUnblocks != 0 || delta.TransitiveUnblocks != 0 || delta.BlockedReduction != 0 {
+		t.Fatalf("what-if claimed unavailable work became actionable: %+v", delta)
+	}
+}
+
+func TestWhatIfDeltaCountsParentPropagationCascade(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "ROOT", Status: model.StatusOpen},
+		{ID: "PARENT", Status: model.StatusBlocked, Dependencies: []*model.Dependency{
+			{DependsOnID: "ROOT", Type: model.DepBlocks},
+		}},
+		{ID: "CHILD", Status: model.StatusBlocked, Dependencies: []*model.Dependency{
+			{DependsOnID: "PARENT", Type: model.DepParentChild},
+		}},
+	}
+
+	analyzer := NewAnalyzer(issues)
+	delta := analyzer.computeWhatIfDeltaFromStats("ROOT", &GraphStats{})
+	if delta.DirectUnblocks != 1 || delta.TransitiveUnblocks != 2 {
+		t.Fatalf("what-if parent cascade = %+v, want direct=1 transitive=2", delta)
 	}
 }
 

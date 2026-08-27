@@ -638,9 +638,11 @@ func TestParseIssuesWithOptions_RejectsDuplicateIDsDeterministically(t *testing.
 	}, "\n")
 
 	var warnings []string
+	warningCount := 0
 	stats := loader.ParseStats{}
 	issues, err := loader.ParseIssuesWithOptions(strings.NewReader(input), loader.ParseOptions{
 		Stats:          &stats,
+		WarningCount:   &warningCount,
 		WarningHandler: func(message string) { warnings = append(warnings, message) },
 	})
 	if err != nil {
@@ -657,6 +659,9 @@ func TestParseIssuesWithOptions_RejectsDuplicateIDsDeterministically(t *testing.
 	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], `duplicate issue ID "same"`) {
 		t.Fatalf("warnings=%q, want one duplicate-ID warning", warnings)
+	}
+	if warningCount != 1 {
+		t.Fatalf("warning count=%d, want 1", warningCount)
 	}
 }
 
@@ -926,12 +931,22 @@ func TestLoadIssuesFromFile_WhitespaceOnly(t *testing.T) {
 	path := filepath.Join(dir, "whitespace.jsonl")
 	os.WriteFile(path, []byte("\n\n\n   \n\t\n"), 0644)
 
-	issues, err := loader.LoadIssuesFromFile(path)
+	var stats loader.ParseStats
+	warningCount := 0
+	var warnings []string
+	issues, err := loader.LoadIssuesFromFileWithOptions(path, loader.ParseOptions{
+		Stats:          &stats,
+		WarningCount:   &warningCount,
+		WarningHandler: func(message string) { warnings = append(warnings, message) },
+	})
 	if err != nil {
 		t.Fatalf("Whitespace-only file should not error: %v", err)
 	}
 	if len(issues) != 0 {
 		t.Errorf("Expected 0 issues from whitespace-only file, got %d", len(issues))
+	}
+	if stats != (loader.ParseStats{}) || warningCount != 0 || len(warnings) != 0 {
+		t.Fatalf("whitespace-only accounting = %+v, count %d, warnings %v; want all empty", stats, warningCount, warnings)
 	}
 }
 
@@ -1062,6 +1077,47 @@ func TestLoadIssuesFromFile_PermissionDenied(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to open issues file") {
 		t.Errorf("Unexpected error: %v", err)
+	}
+}
+
+func TestLoadIssuesFromFileRejectsNonRegularSource(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("/dev/null is a Unix device")
+	}
+	if _, err := os.Stat("/dev/null"); err != nil {
+		t.Skipf("/dev/null unavailable: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := os.Symlink("/dev/null", path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		load func() error
+	}{
+		{
+			name: "plain",
+			load: func() error {
+				_, err := loader.LoadIssuesFromFileWithOptions(path, loader.ParseOptions{})
+				return err
+			},
+		},
+		{
+			name: "pooled",
+			load: func() error {
+				_, err := loader.LoadIssuesFromFileWithOptionsPooled(path, loader.ParseOptions{})
+				return err
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.load(); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+				t.Fatalf("load error = %v, want a regular-file rejection", err)
+			}
+		})
 	}
 }
 
@@ -1500,6 +1556,119 @@ func TestGetBeadsDir_FollowsRedirect(t *testing.T) {
 	wantAbs, _ := filepath.Abs(target)
 	if result != wantAbs {
 		t.Errorf("redirect not followed: got %s, want %s", result, wantAbs)
+	}
+}
+
+func TestGetBeadsDirWithTraceFollowsEnvironmentDirectoryRedirects(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source", ".beads")
+	target := filepath.Join(root, "target", ".beads")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "redirect"), []byte("../../target/.beads\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, envName := range []string{loader.BeadsDirEnvVar, loader.BeadsDBEnvVar} {
+		t.Run(envName, func(t *testing.T) {
+			t.Setenv(loader.BeadsDBEnvVar, "")
+			t.Setenv(loader.BeadsDirEnvVar, "")
+			t.Setenv(envName, source)
+			got, trace, err := loader.GetBeadsDirWithTrace(filepath.Join(root, "ignored"))
+			if err != nil {
+				t.Fatalf("GetBeadsDirWithTrace: %v", err)
+			}
+			if got != target {
+				t.Fatalf("resolved directory = %s, want %s", got, target)
+			}
+			wantTrace := []string{filepath.Join(source, "redirect"), filepath.Join(target, "redirect")}
+			if len(trace) != len(wantTrace) {
+				t.Fatalf("trace = %v, want %v", trace, wantTrace)
+			}
+			for i := range wantTrace {
+				if trace[i] != wantTrace[i] {
+					t.Fatalf("trace[%d] = %s, want %s", i, trace[i], wantTrace[i])
+				}
+			}
+		})
+	}
+}
+
+func TestGetBeadsDirConcreteDatabaseFileDoesNotFollowParentRedirect(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source", ".beads")
+	target := filepath.Join(root, "target", ".beads")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "redirect"), []byte("../../target/.beads\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(source, "beads.db")
+	if err := os.WriteFile(database, []byte("database"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(loader.BeadsDBEnvVar, database)
+	t.Setenv(loader.BeadsDirEnvVar, "")
+
+	got, trace, err := loader.GetBeadsDirWithTrace(root)
+	if err != nil {
+		t.Fatalf("GetBeadsDirWithTrace: %v", err)
+	}
+	if got != source || len(trace) != 0 {
+		t.Fatalf("concrete database route = (%s, %v), want pinned parent %s with no redirect trace", got, trace, source)
+	}
+}
+
+func TestResolveBeadsDirRejectsRedirectDirectory(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "redirect"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loader.ResolveBeadsDirWithTrace(beadsDir); err == nil {
+		t.Fatal("directory at redirect path was treated as an absent redirect")
+	}
+}
+
+func TestResolveBeadsDirRejectsNonRegularRedirect(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("/dev/null is a Unix device")
+	}
+	if _, err := os.Stat("/dev/null"); err != nil {
+		t.Skipf("/dev/null unavailable: %v", err)
+	}
+
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/dev/null", filepath.Join(beadsDir, "redirect")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	if _, _, err := loader.ResolveBeadsDirWithTrace(beadsDir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("non-regular redirect error = %v, want a regular-file rejection", err)
+	}
+}
+
+func TestResolveBeadsDirRejectsOversizedRedirect(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte(strings.Repeat("x", 4097)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := loader.ResolveBeadsDirWithTrace(beadsDir); err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("oversized redirect error = %v, want a size-limit rejection", err)
 	}
 }
 

@@ -3,8 +3,11 @@ package workspace_test
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +21,36 @@ func requireWorkspaceLoaderString(t *testing.T, name, got, want string) {
 	if strings.Compare(got, want) != 0 {
 		t.Fatalf("expected %s %q, got %q", name, want, got)
 	}
+}
+
+func captureWorkspaceStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	original := os.Stderr
+	os.Stderr = writer
+	defer func() {
+		os.Stderr = original
+		_ = writer.Close()
+		_ = reader.Close()
+	}()
+
+	fn()
+	os.Stderr = original
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		_ = reader.Close()
+		t.Fatalf("read stderr: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close stderr reader: %v", err)
+	}
+	return string(output)
 }
 
 // createTestBeadsFile creates a .beads/beads.jsonl file with test issues
@@ -126,6 +159,198 @@ func TestAggregateLoaderLoadAll(t *testing.T) {
 			requireWorkspaceLoaderString(t, issue.ID+" SourceRepo", issue.SourceRepo, "api")
 		case "web-UI-1":
 			requireWorkspaceLoaderString(t, issue.ID+" SourceRepo", issue.SourceRepo, "web")
+		}
+	}
+}
+
+func TestAggregateLoaderReportsDroppedRecordsFromSuccessfulRepository(t *testing.T) {
+	tmpDir := t.TempDir()
+	repoPath := filepath.Join(tmpDir, "api")
+	beadsDir := filepath.Join(repoPath, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := `{"id":"GOOD-1","title":"Good","status":"open","issue_type":"task"}` + "\n" +
+		`{"id":"BROKEN",not-json}` + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	config := &workspace.Config{Repos: []workspace.RepoConfig{{Name: "api", Path: "api", Prefix: "api-"}}}
+	aggregate := workspace.NewAggregateLoader(config, tmpDir)
+	issues, results, err := aggregate.LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "api-GOOD-1" {
+		t.Fatalf("loaded issues = %+v, want only namespaced valid record", issues)
+	}
+	if len(results) != 1 || results[0].Error != nil {
+		t.Fatalf("load results = %+v, want one tolerant successful repository", results)
+	}
+	if got := results[0].ParseStats; got.Valid != 1 || got.Errors != 1 || got.Skipped != 0 {
+		t.Fatalf("parse stats = %+v, want Valid=1 Errors=1 Skipped=0", got)
+	}
+}
+
+func TestAggregateLoaderExcludesTombstonesButKeepsSourceAccounting(t *testing.T) {
+	tmpDir := t.TempDir()
+	repoPath := filepath.Join(tmpDir, "api")
+	createTestBeadsFile(t, repoPath, []model.Issue{
+		{ID: "LIVE-1", Title: "Live", Status: model.StatusOpen},
+		{ID: "OLD-1", Title: "Deleted", Status: model.StatusTombstone},
+	})
+
+	config := &workspace.Config{Repos: []workspace.RepoConfig{{Name: "api", Path: "api", Prefix: "api-"}}}
+	issues, results, err := workspace.NewAggregateLoader(config, tmpDir).LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "api-LIVE-1" {
+		t.Fatalf("workspace issues = %+v, want only api-LIVE-1", issues)
+	}
+	if len(results) != 1 || results[0].Error != nil {
+		t.Fatalf("load results = %+v, want one successful repository", results)
+	}
+	if got := results[0].ParseStats; got.Valid != 2 || got.Errors != 0 || got.Skipped != 0 {
+		t.Fatalf("parse stats = %+v, want source Valid=2 Errors=0 Skipped=0", got)
+	}
+}
+
+func TestAggregateLoaderDefaultParseWarningsRemainInteractiveAndRobotSafe(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, "api", ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	content := "{\"id\":\"GOOD-1\",\"title\":\"Good\",\"status\":\"open\",\"issue_type\":\"task\"}\n" +
+		"{\"id\":\"BROKEN\",not-json}\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write tolerant workspace source: %v", err)
+	}
+	config := &workspace.Config{Repos: []workspace.RepoConfig{{Name: "api", Path: "api", Prefix: "api-"}}}
+
+	for _, tc := range []struct {
+		name         string
+		robot        string
+		wantWarnings int
+	}{
+		{name: "interactive", robot: "", wantWarnings: 1},
+		{name: "robot", robot: "1", wantWarnings: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BV_ROBOT", tc.robot)
+			aggregate := workspace.NewAggregateLoader(config, tmpDir)
+			var issues []model.Issue
+			var results []workspace.LoadResult
+			var loadErr error
+			stderr := captureWorkspaceStderr(t, func() {
+				issues, results, loadErr = aggregate.LoadAll(context.Background())
+			})
+			if loadErr != nil {
+				t.Fatalf("LoadAll() error = %v", loadErr)
+			}
+			if len(issues) != 1 || len(results) != 1 || results[0].ParseStats.Valid != 1 || results[0].ParseStats.Errors != 1 {
+				t.Fatalf("tolerant load lost issue/evidence: issues=%+v results=%+v", issues, results)
+			}
+			if got := strings.Count(stderr, "Warning: skipping malformed JSON on line 2:"); got != tc.wantWarnings {
+				t.Fatalf("stderr warning count=%d, want %d; stderr=%q", got, tc.wantWarnings, stderr)
+			}
+		})
+	}
+}
+
+func TestAggregateLoaderCustomLoggerReceivesParseWarningOnce(t *testing.T) {
+	t.Setenv("BV_ROBOT", "")
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, "api", ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	content := "{\"id\":\"GOOD-1\",\"title\":\"Good\",\"status\":\"open\",\"issue_type\":\"task\"}\n" +
+		"{\"id\":\"BROKEN\",not-json}\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write tolerant workspace source: %v", err)
+	}
+
+	config := &workspace.Config{Repos: []workspace.RepoConfig{{Name: "api", Path: "api", Prefix: "api-"}}}
+	aggregate := workspace.NewAggregateLoader(config, tmpDir)
+	var logged strings.Builder
+	aggregate.SetLogger(log.New(&logged, "", 0))
+	stderr := captureWorkspaceStderr(t, func() {
+		if _, _, err := aggregate.LoadAll(context.Background()); err != nil {
+			t.Errorf("LoadAll() error = %v", err)
+		}
+	})
+	if stderr != "" {
+		t.Fatalf("custom logger duplicated parse warning to stderr: %q", stderr)
+	}
+	if got := strings.Count(logged.String(), "repository \"api\": skipping malformed JSON on line 2:"); got != 1 {
+		t.Fatalf("custom logger warning count=%d, want 1; log=%q", got, logged.String())
+	}
+}
+
+func TestAggregateLoaderRejectsAllSkippedRepositoryAsWrongSource(t *testing.T) {
+	tmpDir := t.TempDir()
+	goodRepo := filepath.Join(tmpDir, "good")
+	createTestBeadsFile(t, goodRepo, []model.Issue{{ID: "READY-1", Title: "Ready"}})
+	skippedBeadsDir := filepath.Join(tmpDir, "skipped", ".beads")
+	if err := os.MkdirAll(skippedBeadsDir, 0o755); err != nil {
+		t.Fatalf("create skipped repository: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skippedBeadsDir, "issues.jsonl"), []byte("{\"_type\":\"sprint\",\"id\":\"sprint-1\"}\n"), 0o644); err != nil {
+		t.Fatalf("write all-skipped source: %v", err)
+	}
+	config := &workspace.Config{Repos: []workspace.RepoConfig{
+		{Name: "good", Path: "good", Prefix: "good-"},
+		{Name: "skipped", Path: "skipped", Prefix: "skipped-"},
+	}}
+	issues, results, err := workspace.NewAggregateLoader(config, tmpDir).LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("one valid repository should keep exploratory workspace load available: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "good-READY-1" {
+		t.Fatalf("loaded issues = %+v, want only the valid repository", issues)
+	}
+	if len(results) != 2 || results[1].Error == nil || results[1].ParseStats.Skipped != 1 || results[1].ParseStats.Valid != 0 {
+		t.Fatalf("all-skipped repository was not marked failed/incomplete: %+v", results)
+	}
+}
+
+func TestAggregateLoaderRejectsCrossRepositoryNamespacedIDCollision(t *testing.T) {
+	tmpDir := t.TempDir()
+	createTestBeadsFile(t, filepath.Join(tmpDir, "one"), []model.Issue{{ID: "b-1", Title: "First"}})
+	createTestBeadsFile(t, filepath.Join(tmpDir, "two"), []model.Issue{{ID: "1", Title: "Second"}})
+	config := &workspace.Config{Repos: []workspace.RepoConfig{
+		{Name: "one", Path: "one", Prefix: "a-"},
+		{Name: "two", Path: "two", Prefix: "a-b-"},
+	}}
+	issues, results, err := workspace.NewAggregateLoader(config, tmpDir).LoadAll(context.Background())
+	if err == nil {
+		t.Fatalf("namespaced ID collision returned issues %+v and results %+v", issues, results)
+	}
+	for _, want := range []string{"duplicate issue IDs", "a-b-1", `path "one"`, `path "two"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("collision error %q missing %q", err, want)
+		}
+	}
+}
+
+func TestAggregateLoaderRejectsNormalizedSourceRepoCollision(t *testing.T) {
+	tmpDir := t.TempDir()
+	createTestBeadsFile(t, filepath.Join(tmpDir, "one"), []model.Issue{{ID: "1", Title: "First"}})
+	createTestBeadsFile(t, filepath.Join(tmpDir, "two"), []model.Issue{{ID: "2", Title: "Second"}})
+	config := &workspace.Config{Repos: []workspace.RepoConfig{
+		{Name: "one", Path: "one", Prefix: "api-"},
+		{Name: "two", Path: "two", Prefix: "api:"},
+	}}
+	issues, results, err := workspace.NewAggregateLoader(config, tmpDir).LoadAll(context.Background())
+	if err == nil {
+		t.Fatalf("normalized source repository collision returned issues %+v and results %+v", issues, results)
+	}
+	for _, want := range []string{"normalized source repository key", `"api"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("source repository collision error %q missing %q", err, want)
 		}
 	}
 }
@@ -525,6 +750,176 @@ repos:
 	}
 }
 
+func TestLoadAllFromConfigFollowsRepositoryTrackerRedirect(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	configDir := filepath.Join(workspaceRoot, ".bv")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	repoDir := filepath.Join(workspaceRoot, "api")
+	localBeads := filepath.Join(repoDir, ".beads")
+	terminalBeads := filepath.Join(workspaceRoot, "tracker", ".beads")
+	if err := os.MkdirAll(localBeads, 0o755); err != nil {
+		t.Fatalf("mkdir local beads: %v", err)
+	}
+	if err := os.MkdirAll(terminalBeads, 0o755); err != nil {
+		t.Fatalf("mkdir terminal beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localBeads, "redirect"), []byte("../../tracker/.beads\n"), 0o644); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(localBeads, "issues.jsonl"),
+		[]byte(`{"id":"STALE-LOCAL","title":"Stale local copy","status":"open","issue_type":"task"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write stale local issues: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(terminalBeads, "issues.jsonl"),
+		[]byte(`{"id":"TERMINAL-1","title":"Terminal tracker","status":"open","issue_type":"task"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write terminal issues: %v", err)
+	}
+	configPath := filepath.Join(configDir, "workspace.yaml")
+	if err := os.WriteFile(configPath, []byte("repos:\n  - path: api\n    prefix: api-\n"), 0o644); err != nil {
+		t.Fatalf("write workspace config: %v", err)
+	}
+
+	issues, results, err := workspace.LoadAllFromConfig(context.Background(), configPath)
+	if err != nil {
+		t.Fatalf("LoadAllFromConfig: %v", err)
+	}
+	if len(results) != 1 || results[0].Error != nil {
+		t.Fatalf("workspace results = %+v, want one successful redirected repo", results)
+	}
+	if len(issues) != 1 || issues[0].ID != "api-TERMINAL-1" {
+		t.Fatalf("workspace issues = %+v, want terminal redirect authority only", issues)
+	}
+}
+
+func TestLoadAllFromRelativeConfigRefreshesCorrectBDRepoWithSanitizedEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake bd fixture uses POSIX sh")
+	}
+	t.Setenv("BV_ROBOT", "1")
+	workspaceRoot := t.TempDir()
+	configDir := filepath.Join(workspaceRoot, ".bv")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatalf("create config directory: %v", err)
+	}
+	configPath := filepath.Join(configDir, "workspace.yaml")
+	if err := os.WriteFile(configPath, []byte("repos:\n  - name: api\n    path: api\n    prefix: api-\n"), 0o644); err != nil {
+		t.Fatalf("write workspace config: %v", err)
+	}
+
+	targetRepo := filepath.Join(workspaceRoot, "api")
+	targetBeads := filepath.Join(targetRepo, ".beads")
+	if err := os.MkdirAll(filepath.Join(targetBeads, "embeddeddolt"), 0o755); err != nil {
+		t.Fatalf("create target bd workspace: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetBeads, "metadata.json"), []byte(`{"backend":"dolt"}`), 0o644); err != nil {
+		t.Fatalf("write target metadata: %v", err)
+	}
+	targetIssues := filepath.Join(targetBeads, "issues.jsonl")
+	targetFixture := `{"id":"TARGET-STALE","title":"Target stale export","status":"open","issue_type":"task"}` + "\n"
+	if err := os.WriteFile(targetIssues, []byte(targetFixture), 0o644); err != nil {
+		t.Fatalf("write target compatibility export: %v", err)
+	}
+
+	hostileBeads := filepath.Join(workspaceRoot, "hostile", ".beads")
+	if err := os.MkdirAll(hostileBeads, 0o755); err != nil {
+		t.Fatalf("create hostile beads directory: %v", err)
+	}
+	hostileDB := filepath.Join(hostileBeads, "issues.jsonl")
+	hostileFixture := `{"id":"HOSTILE-1","title":"Wrong ambient source","status":"open","issue_type":"task"}` + "\n"
+	if err := os.WriteFile(hostileDB, []byte(hostileFixture), 0o644); err != nil {
+		t.Fatalf("write hostile source: %v", err)
+	}
+	t.Setenv("BEADS_DIR", hostileBeads)
+	t.Setenv("BEADS_DB", hostileDB)
+
+	binDir := filepath.Join(workspaceRoot, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("create fake bd directory: %v", err)
+	}
+	observationPath := filepath.Join(workspaceRoot, "bd-observation.txt")
+	script := "#!/bin/sh\n" +
+		"{\n" +
+		"  printf 'command=%s %s\\n' \"$1\" \"$2\"\n" +
+		"  printf 'pwd=%s\\n' \"$(pwd -P)\"\n" +
+		"  printf 'beads_dir=%s\\n' \"${BEADS_DIR-unset}\"\n" +
+		"  printf 'beads_db=%s\\n' \"${BEADS_DB-unset}\"\n" +
+		"  printf 'output=%s\\n' \"$3\"\n" +
+		"} > '" + observationPath + "'\n" +
+		"printf 'workspace-intentional-refresh-failure\\n' >&2\n" +
+		"exit 23\n"
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	if err := os.Chdir(workspaceRoot); err != nil {
+		t.Fatalf("change to workspace root: %v", err)
+	}
+	defer func() {
+		if err := os.Chdir(oldWD); err != nil {
+			t.Errorf("restore working directory: %v", err)
+		}
+	}()
+
+	var issues []model.Issue
+	var results []workspace.LoadResult
+	var loadErr error
+	stderr := captureWorkspaceStderr(t, func() {
+		issues, results, loadErr = workspace.LoadAllFromConfig(context.Background(), filepath.Join(".bv", "workspace.yaml"))
+	})
+	if loadErr != nil {
+		t.Fatalf("LoadAllFromConfig() error = %v", loadErr)
+	}
+	if stderr != "" {
+		t.Fatalf("robot workspace load wrote stderr: %q", stderr)
+	}
+	if len(issues) != 1 || issues[0].ID != "api-TARGET-STALE" {
+		t.Fatalf("workspace loaded wrong authority: %+v", issues)
+	}
+	if len(results) != 1 || results[0].Error != nil {
+		t.Fatalf("workspace results = %+v, want one usable stale-export result", results)
+	}
+	if len(results[0].AuthorityWarnings) != 1 || !strings.Contains(results[0].AuthorityWarnings[0], "workspace-intentional-refresh-failure") {
+		t.Fatalf("workspace authority warnings = %v, want surfaced bd fallback", results[0].AuthorityWarnings)
+	}
+
+	absTargetBeads, err := filepath.Abs(filepath.Join("api", ".beads"))
+	if err != nil {
+		t.Fatalf("resolve target beads path: %v", err)
+	}
+	absTargetIssues, err := filepath.Abs(filepath.Join("api", ".beads", "issues.jsonl"))
+	if err != nil {
+		t.Fatalf("resolve target issues path: %v", err)
+	}
+	observation, err := os.ReadFile(observationPath)
+	if err != nil {
+		t.Fatalf("read fake bd observation: %v", err)
+	}
+	for _, want := range []string{
+		"command=export -o",
+		"pwd=" + filepath.Dir(absTargetBeads),
+		"beads_dir=" + absTargetBeads,
+		"beads_db=unset",
+		"output=" + absTargetIssues,
+	} {
+		if !strings.Contains(string(observation), want+"\n") {
+			t.Fatalf("bd observation %q missing exact line %q", observation, want)
+		}
+	}
+}
+
 func TestLoadAllFromConfigWithDiscovery(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -607,6 +1002,44 @@ defaults:
 	requireWorkspaceLoaderString(t, "cross-repo dependency", apiIssue.Dependencies[0].DependsOnID, "shared-UTIL-1")
 	requireWorkspaceLoaderString(t, "api SourceRepo", apiIssue.SourceRepo, "api")
 	requireWorkspaceLoaderString(t, "shared SourceRepo", byID["shared-UTIL-1"].SourceRepo, "shared")
+}
+
+func TestAggregateLoaderDiscoveryFollowsTrackerRedirect(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	repoBeads := filepath.Join(workspaceRoot, "services", "api", ".beads")
+	terminalBeads := filepath.Join(workspaceRoot, "tracker", ".beads")
+	if err := os.MkdirAll(repoBeads, 0o755); err != nil {
+		t.Fatalf("create discovered redirect stub: %v", err)
+	}
+	if err := os.MkdirAll(terminalBeads, 0o755); err != nil {
+		t.Fatalf("create terminal tracker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoBeads, "redirect"), []byte("../../../tracker/.beads\n"), 0o644); err != nil {
+		t.Fatalf("write discovered tracker redirect: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(terminalBeads, "issues.jsonl"),
+		[]byte(`{"id":"REDIRECTED-1","title":"Redirected","status":"open","issue_type":"task"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatalf("write terminal issue source: %v", err)
+	}
+
+	config := &workspace.Config{Discovery: workspace.DiscoveryConfig{
+		Enabled:  true,
+		Patterns: []string{"services/*"},
+		MaxDepth: 2,
+	}}
+	issues, results, err := workspace.NewAggregateLoader(config, workspaceRoot).LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() through discovered redirect: %v", err)
+	}
+	if len(results) != 1 || results[0].Error != nil {
+		t.Fatalf("discovered redirect results = %+v, want one successful repository", results)
+	}
+	if len(issues) != 1 || issues[0].ID != "api-REDIRECTED-1" {
+		t.Fatalf("discovered redirect issues = %+v, want terminal tracker issue", issues)
+	}
 }
 
 func TestAggregateLoaderDiscoveryRespectsDisabledExplicitRepo(t *testing.T) {

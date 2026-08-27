@@ -3,11 +3,11 @@ package correlation
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -118,19 +118,26 @@ func (s *StreamExtractor) StreamEvents(opts StreamOptions) ([]BeadEvent, error) 
 
 	// Wait for command to finish
 	cmdErr := cmd.Wait()
-	if cmdErr != nil {
-		// Check if it's just because we reached the limit
-		if exitErr, ok := cmdErr.(*exec.ExitError); ok {
-			if exitErr.ExitCode() != 0 && exitErr.ExitCode() != 141 {
-				return nil, fmt.Errorf("git log failed: %w", cmdErr)
-			}
-		}
+	if err := streamCommandWaitError(s.ctx, cmdErr); err != nil {
+		return nil, err
 	}
 
 	// Reverse to chronological order
 	reverseEvents(events)
 
 	return events, nil
+}
+
+func streamCommandWaitError(ctx context.Context, waitErr error) error {
+	if waitErr == nil {
+		return nil
+	}
+	if ctx != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return fmt.Errorf("git log canceled: %w", cause)
+		}
+	}
+	return fmt.Errorf("git log failed: %w", waitErr)
 }
 
 // countCommits quickly counts commits matching the criteria
@@ -145,8 +152,7 @@ func (s *StreamExtractor) countCommits(opts StreamOptions) (int, error) {
 		args = insertBefore(args, "--", fmt.Sprintf("--until=%s", opts.Until.Format(time.RFC3339)))
 	}
 
-	cmd := gitCommand(s.ctx, args...)
-	cmd.Dir = s.repoPath
+	cmd := repoGitCommand(s.ctx, s.repoPath, args...)
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -161,8 +167,8 @@ func (s *StreamExtractor) countCommits(opts StreamOptions) (int, error) {
 // buildStreamCommand creates the git log command for streaming
 func (s *StreamExtractor) buildStreamCommand(opts StreamOptions, limit int) *exec.Cmd {
 	args := []string{
-		"log",
 		"-p",
+		"--unified=1",
 		"--follow",
 		"--format=" + gitLogHeaderFormat,
 	}
@@ -182,9 +188,7 @@ func (s *StreamExtractor) buildStreamCommand(opts StreamOptions, limit int) *exe
 	// Use primary beads file
 	args = append(args, s.primaryBeadsFile())
 
-	cmd := gitCommand(s.ctx, withNoColorGit(args)...)
-	cmd.Dir = s.repoPath
-	return cmd
+	return lifecycleGitLogCommand(s.ctx, s.repoPath, args...)
 }
 
 // parseStream parses git log output as a stream
@@ -192,6 +196,7 @@ func (s *StreamExtractor) parseStream(r io.Reader, filterBeadID string, closedSi
 	var events []BeadEvent
 	var currentCommit *commitBuffer
 	processed := 0
+	objectIDWidth := 0
 
 	scanner := bufio.NewScanner(r)
 	// Use 64KB initial buffer, grow up to 10MB (matching extractor.go)
@@ -204,6 +209,15 @@ func (s *StreamExtractor) parseStream(r io.Reader, filterBeadID string, closedSi
 
 		// Check for new commit header (uses package-level compiled regex)
 		if commitPattern.MatchString(line) {
+			info, err := parseCommitInfo(line)
+			if err != nil {
+				return nil, fmt.Errorf("parsing stream commit header: %w", err)
+			}
+			if objectIDWidth == 0 {
+				objectIDWidth = len(info.SHA)
+			} else if len(info.SHA) != objectIDWidth {
+				return nil, fmt.Errorf("mixed-width stream commit object IDs: got %d and %d characters", objectIDWidth, len(info.SHA))
+			}
 			// Process previous commit if exists
 			if currentCommit != nil {
 				commitEvents, err := s.processCommitBuffer(currentCommit, filterBeadID, closedSince)
@@ -223,10 +237,28 @@ func (s *StreamExtractor) parseStream(r io.Reader, filterBeadID string, closedSi
 			if onProgress != nil && processed%10 == 0 {
 				onProgress(processed, total)
 			}
+		} else if strings.ContainsRune(line, '\x00') {
+			return nil, fmt.Errorf("malformed commit header with noncanonical object ID")
 		} else if currentCommit != nil {
-			// Only collect lines that might contain bead JSON (lines starting with + or -)
-			if len(line) > 0 && (line[0] == '+' || line[0] == '-') && strings.Contains(line, "{") {
+			// Retain hunk headers and one-byte placeholders for non-candidate hunk
+			// body lines. The classifier must advance physical line coordinates for
+			// every +/-/context line even when that line cannot contain bead JSON;
+			// otherwise a later BOM record can be mistaken for physical line one.
+			switch {
+			case strings.HasPrefix(line, "@@ "):
 				currentCommit.diffLines = append(currentCommit.diffLines, line)
+			case len(line) > 0 && (line[0] == '+' || line[0] == '-'):
+				if strings.Contains(line, "{") {
+					currentCommit.diffLines = append(currentCommit.diffLines, line)
+				} else {
+					currentCommit.diffLines = append(currentCommit.diffLines, line[:1])
+				}
+			case len(line) > 0 && line[0] == ' ':
+				if strings.Contains(line, "{") {
+					currentCommit.diffLines = append(currentCommit.diffLines, line)
+				} else {
+					currentCommit.diffLines = append(currentCommit.diffLines, " ")
+				}
 			}
 		}
 	}
@@ -294,42 +326,35 @@ func parseCommitHeader(line string) (commitInfo, error) {
 // parseBufferedDiff extracts events from buffered diff lines
 func (s *StreamExtractor) parseBufferedDiff(lines []string, info commitInfo, filterBeadID string, closedSince *time.Time) []BeadEvent {
 	var events []BeadEvent
+	var classifier unifiedDiffRecordClassifier
 
 	oldBeads := make(map[string]beadSnapshot)
 	newBeads := make(map[string]beadSnapshot)
 	seenBeads := make(map[string]bool)
 
 	for _, line := range lines {
-		// Robustly handle diff lines:
-		// 1. Identify removal (-) or addition (+)
-		// 2. Trim spaces to handle indented JSON (e.g. "  {")
-		// 3. Verify it starts with "{" to avoid false positives on non-JSON diffs
-
-		if strings.HasPrefix(line, "-") {
-			jsonStr := strings.TrimSpace(strings.TrimPrefix(line, "-"))
-			if strings.HasPrefix(jsonStr, "{") {
-				if snap, ok := parseBeadJSON(jsonStr); ok {
-					if filterBeadID == "" || snap.ID == filterBeadID {
-						oldBeads[snap.ID] = snap
-						seenBeads[snap.ID] = true
-					}
-				}
+		jsonStr, added, ok := classifier.classify(line)
+		if !ok {
+			continue
+		}
+		if snap, parsed := parseBeadJSON(jsonStr); parsed && (filterBeadID == "" || snap.ID == filterBeadID) {
+			if added {
+				newBeads[snap.ID] = snap
+			} else {
+				oldBeads[snap.ID] = snap
 			}
-		} else if strings.HasPrefix(line, "+") {
-			jsonStr := strings.TrimSpace(strings.TrimPrefix(line, "+"))
-			if strings.HasPrefix(jsonStr, "{") {
-				if snap, ok := parseBeadJSON(jsonStr); ok {
-					if filterBeadID == "" || snap.ID == filterBeadID {
-						newBeads[snap.ID] = snap
-						seenBeads[snap.ID] = true
-					}
-				}
-			}
+			seenBeads[snap.ID] = true
 		}
 	}
 
-	// Generate events
+	// Generate events in a stable order. A single commit can update multiple
+	// beads, and map iteration order must not leak into robot/history output.
+	beadIDs := make([]string, 0, len(seenBeads))
 	for beadID := range seenBeads {
+		beadIDs = append(beadIDs, beadID)
+	}
+	sort.Strings(beadIDs)
+	for _, beadID := range beadIDs {
 		oldSnap, hadOld := oldBeads[beadID]
 		newSnap, hasNew := newBeads[beadID]
 
@@ -369,10 +394,11 @@ func (s *StreamExtractor) parseBufferedDiff(lines []string, info commitInfo, fil
 
 // BatchFileStatsExtractor extracts file stats for multiple commits in batches
 type BatchFileStatsExtractor struct {
-	repoPath  string
-	batchSize int
-	mu        sync.Mutex
-	cache     map[string][]FileChange
+	repoPath          string
+	batchSize         int
+	mu                sync.Mutex
+	cache             map[string][]FileChange
+	cacheHistoryState string
 
 	// ctx, when set via WithContext, bounds the git subprocesses spawned by
 	// the extractor (issue #166). nil means context.Background().
@@ -407,6 +433,10 @@ func (b *BatchFileStatsExtractor) SetBatchSize(size int) {
 
 // ExtractBatch extracts file changes for multiple commit SHAs in a batch
 func (b *BatchFileStatsExtractor) ExtractBatch(shas []string) (map[string][]FileChange, error) {
+	if len(shas) == 0 {
+		return map[string][]FileChange{}, nil
+	}
+	historyState := b.prepareCacheHistoryState()
 	result, uncached := b.splitCached(shas)
 
 	if len(uncached) == 0 {
@@ -415,7 +445,9 @@ func (b *BatchFileStatsExtractor) ExtractBatch(shas []string) (map[string][]File
 
 	batchSize := b.currentBatchSize()
 
-	// Process in batches
+	// Process in batches, but do not publish partial results to either the
+	// caller or the memo if a later batch fails.
+	fetched := make(map[string][]FileChange, len(uncached))
 	for i := 0; i < len(uncached); i += batchSize {
 		end := i + batchSize
 		if end > len(uncached) {
@@ -425,14 +457,28 @@ func (b *BatchFileStatsExtractor) ExtractBatch(shas []string) (map[string][]File
 
 		batchResult, err := b.extractBatchFiles(batch)
 		if err != nil {
-			return result, err
+			return nil, err
 		}
-
-		// Merge results and update cache
-		b.storeBatchResult(result, batchResult)
+		mergeBatchFileStatsResult(fetched, batchResult)
 	}
+	mergeBatchFileStatsResult(result, fetched)
+	b.storeBatchResultIfHistoryStateCurrent(historyState, fetched)
 
 	return result, nil
+}
+
+// prepareCacheHistoryState binds this extractor's SHA-keyed memo to the Git
+// history shape that produced it. Shallow boundaries can move without changing
+// a commit SHA, so shallow/unavailable repositories never retain memoized diffs.
+func (b *BatchFileStatsExtractor) prepareCacheHistoryState() string {
+	state := coCommitRepositoryHistoryState(b.ctx, b.repoPath)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if state != coCommitHistoryStateFull || state != b.cacheHistoryState {
+		b.cache = make(map[string][]FileChange)
+	}
+	b.cacheHistoryState = state
+	return state
 }
 
 func (b *BatchFileStatsExtractor) currentBatchSize() int {
@@ -462,12 +508,25 @@ func (b *BatchFileStatsExtractor) splitCached(shas []string) (map[string][]FileC
 	return result, uncached
 }
 
-func (b *BatchFileStatsExtractor) storeBatchResult(result map[string][]FileChange, batchResult map[string][]FileChange) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
+func mergeBatchFileStatsResult(result map[string][]FileChange, batchResult map[string][]FileChange) {
 	for sha, files := range batchResult {
 		result[sha] = cloneFileChanges(files)
+	}
+}
+
+func (b *BatchFileStatsExtractor) storeBatchResultIfHistoryStateCurrent(expectedState string, batchResult map[string][]FileChange) {
+	if expectedState != coCommitHistoryStateFull {
+		return
+	}
+	currentState := coCommitRepositoryHistoryState(b.ctx, b.repoPath)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if currentState != coCommitHistoryStateFull || currentState != expectedState || b.cacheHistoryState != expectedState {
+		b.cache = make(map[string][]FileChange)
+		b.cacheHistoryState = currentState
+		return
+	}
+	for sha, files := range batchResult {
 		b.cache[sha] = cloneFileChanges(files)
 	}
 }
@@ -484,84 +543,31 @@ func cloneFileChanges(files []FileChange) []FileChange {
 
 // extractBatchFiles extracts files for a batch of commits using a single git command
 func (b *BatchFileStatsExtractor) extractBatchFiles(shas []string) (map[string][]FileChange, error) {
-	result := make(map[string][]FileChange)
-
-	// Use git log with specific commits to get all file changes in one call
-	// Format: commit SHA, then name-status
-	args := []string{"log", "--name-status", "--format=%H", "--no-walk"}
-	args = append(args, shas...)
-
-	cmd := gitCommand(b.ctx, args...)
-	cmd.Dir = b.repoPath
-
-	out, err := cmd.Output()
+	coCommitter := NewCoCommitExtractor(b.repoPath)
+	coCommitter.ctx = b.ctx
+	filesBySHA, err := coCommitter.batchFilesChanged(shas)
 	if err != nil {
-		// Fall back to individual extraction
+		// Keep the legacy fallback, but require every requested commit to be
+		// successfully inspected so a failure cannot masquerade as an empty diff.
 		return b.extractIndividually(shas)
 	}
-
-	// Parse output: each commit starts with SHA line, followed by empty line, then files
-	var currentSHA string
-	var currentFiles []FileChange
-
-	scanner := bufio.NewScanner(bytes.NewReader(out))
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Check if this is a SHA line (40 hex chars)
-		if len(line) == 40 && isHexString(line) {
-			// Save previous commit's files
-			if currentSHA != "" {
-				result[currentSHA] = filterCodeFiles(currentFiles)
-			}
-			currentSHA = line
-			currentFiles = nil
-			continue
-		}
-
-		if line == "" {
-			continue
-		}
-
-		// Parse file change line
-		parts := strings.Split(line, "\t")
-		if len(parts) >= 2 {
-			action := parts[0]
-			path := parts[1]
-
-			if len(parts) == 3 && strings.HasPrefix(action, "R") {
-				path = parts[2]
-				action = "R"
-			}
-
-			if len(action) > 1 {
-				action = string(action[0])
-			}
-
-			currentFiles = append(currentFiles, FileChange{
-				Path:   path,
-				Action: action,
-			})
-		}
+	result := make(map[string][]FileChange, len(filesBySHA))
+	for _, sha := range shas {
+		result[sha] = filterCodeFiles(filesBySHA[sha])
 	}
-
-	// Save last commit's files
-	if currentSHA != "" {
-		result[currentSHA] = filterCodeFiles(currentFiles)
-	}
-
-	return result, scanner.Err()
+	return result, nil
 }
 
 // extractIndividually falls back to extracting files one commit at a time
 func (b *BatchFileStatsExtractor) extractIndividually(shas []string) (map[string][]FileChange, error) {
 	result := make(map[string][]FileChange)
 	cocommit := NewCoCommitExtractor(b.repoPath)
+	cocommit.ctx = b.ctx
 
 	for _, sha := range shas {
 		files, err := cocommit.getFilesChanged(sha)
 		if err != nil {
-			continue // Skip failed commits
+			return nil, fmt.Errorf("extracting file stats for commit %s: %w", sha, err)
 		}
 		result[sha] = filterCodeFiles(files)
 	}

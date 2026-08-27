@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -188,6 +189,63 @@ func TestPerCommitCacheNamespaceIsolation(t *testing.T) {
 	b := perCommitEventCacheNamespace(e.primaryBeadsFile(), "bv-123")
 	if a == b {
 		t.Fatalf("namespaces collide for different BeadID filters: %q", a)
+	}
+}
+
+func TestReadPerCommitEventCacheRejectsOversizedInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "per-commit-events.json")
+	fixture := []byte(fmt.Sprintf(`{"version":%d,"entries":{"ns":{"commits":{"sha":{"created_at":"2026-08-26T12:00:00Z","old_sha":"old","new_sha":"new","events":[]}}}}}`, perCommitEventCacheVersion))
+	if err := os.WriteFile(path, fixture, 0o600); err != nil {
+		t.Fatalf("write cache fixture: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open cache fixture: %v", err)
+	}
+	defer f.Close()
+
+	valid := readPerCommitEventCacheLockedWithLimit(f, int64(len(fixture)))
+	if _, ok := valid.Entries["ns"].Commits["sha"]; !ok {
+		t.Fatalf("valid cache fixture did not decode: %+v", valid)
+	}
+	got := readPerCommitEventCacheLockedWithLimit(f, 8)
+	if got.Version != perCommitEventCacheVersion || len(got.Entries) != 0 {
+		t.Fatalf("oversized cache should fail closed to an empty current-version cache: %+v", got)
+	}
+}
+
+func TestReadPerCommitEventCacheRejectsPreOversizedRecordFixVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "per-commit-events-v1.json")
+	fixture := []byte(`{"version":1,"entries":{"ns":{"commits":{"sha":{"created_at":"2026-08-26T12:00:00Z","old_sha":"old","new_sha":"new","events":[]}}}}}`)
+	if err := os.WriteFile(path, fixture, 0o600); err != nil {
+		t.Fatalf("write legacy cache fixture: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open legacy cache fixture: %v", err)
+	}
+	defer f.Close()
+
+	got := readPerCommitEventCacheLockedWithLimit(f, int64(len(fixture)))
+	if got.Version != perCommitEventCacheVersion || len(got.Entries) != 0 {
+		t.Fatalf("pre-parser-fix cache should fail closed to an empty v%d cache: %+v", perCommitEventCacheVersion, got)
+	}
+}
+
+func TestPrunePerCommitEventsRejectsFutureTimestamp(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	entries := map[string]perCommitNamespaceBucket{
+		"ns": {Commits: map[string]perCommitEventEntry{
+			"fresh":  {CreatedAt: now.Add(-time.Hour)},
+			"future": {CreatedAt: now.Add(time.Nanosecond)},
+		}},
+	}
+	pruneAndBoundPerCommitEntries(now, entries)
+	if _, ok := entries["ns"].Commits["fresh"]; !ok {
+		t.Fatal("fresh per-commit event entry was removed")
+	}
+	if _, ok := entries["ns"].Commits["future"]; ok {
+		t.Fatal("future-dated per-commit event entry was retained")
 	}
 }
 

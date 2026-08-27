@@ -50,10 +50,27 @@ func TestAnalyzerAnalyzeWithConfigCachesPhase2(t *testing.T) {
 	if stats.IsPhase2Ready() == false {
 		t.Fatalf("expected phase2 ready")
 	}
-	// Ensure empty graph path still returns non-nil profile
+	// Ensure empty graph path still returns a complete, self-describing profile.
 	a2 := NewAnalyzer(nil)
-	if _, profile := a2.AnalyzeWithProfile(cfg); profile == nil {
+	emptyStats, profile := a2.AnalyzeWithProfile(cfg)
+	if profile == nil {
 		t.Fatalf("expected non-nil profile for empty graph")
+	}
+	status := emptyStats.Status()
+	for name, entry := range map[string]statusEntry{
+		"page_rank":    status.PageRank,
+		"betweenness":  status.Betweenness,
+		"eigenvector":  status.Eigenvector,
+		"hits":         status.HITS,
+		"critical":     status.Critical,
+		"cycles":       status.Cycles,
+		"k_core":       status.KCore,
+		"articulation": status.Articulation,
+		"slack":        status.Slack,
+	} {
+		if entry.State == "" || entry.State == "pending" {
+			t.Fatalf("empty profiled graph left %s status incomplete: %+v", name, entry)
+		}
 	}
 	// Tiny sleep to avoid zero durations in formatDuration paths
 	time.Sleep(1 * time.Millisecond)
@@ -72,6 +89,10 @@ func TestAnalyzerAnalyzeAsync_ReusesStatsWhenGraphUnchanged(t *testing.T) {
 	stats1 := NewAnalyzer(issues1).AnalyzeAsync(context.Background())
 	if stats1 == nil {
 		t.Fatalf("expected non-nil stats")
+	}
+	stats1.WaitForPhase2()
+	if !stats1.IsPhase2Ready() {
+		t.Fatal("first analysis did not complete Phase 2")
 	}
 
 	// Content-only changes (titles) shouldn't invalidate graph stats reuse.
@@ -96,6 +117,85 @@ func TestAnalyzerAnalyzeAsync_ReusesStatsWhenGraphUnchanged(t *testing.T) {
 	stats2.WaitForPhase2()
 	if !stats2.IsPhase2Ready() {
 		t.Fatalf("expected phase2 ready after WaitForPhase2")
+	}
+}
+
+func TestAnalyzerIncrementalCacheRejectsCanceledPhase2AndRetriesLive(t *testing.T) {
+	t.Setenv("BV_ROBOT", "0")
+
+	issues := []model.Issue{
+		{
+			ID:           "incremental-cancel-dependent",
+			Status:       model.StatusOpen,
+			Dependencies: []*model.Dependency{{DependsOnID: "incremental-cancel-blocker", Type: model.DepBlocks}},
+		},
+		{ID: "incremental-cancel-blocker", Status: model.StatusOpen},
+	}
+	config := AnalysisConfig{
+		RunToCompletion: true,
+		ComputePageRank: true,
+	}
+	canceledAnalyzer := NewAnalyzer(issues)
+	cacheKey := canceledAnalyzer.graphStructureHash() + "|" + ComputeConfigHash(&config)
+	incrementalGraphStatsCacheMu.Lock()
+	delete(incrementalGraphStatsCache, cacheKey)
+	incrementalGraphStatsCacheMu.Unlock()
+	t.Cleanup(func() {
+		incrementalGraphStatsCacheMu.Lock()
+		delete(incrementalGraphStatsCache, cacheKey)
+		incrementalGraphStatsCacheMu.Unlock()
+	})
+
+	canceledContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceled := canceledAnalyzer.AnalyzeAsyncWithConfig(canceledContext, config)
+	canceled.WaitForPhase2()
+	if canceled.IsPhase2Ready() {
+		t.Fatal("canceled analysis unexpectedly published Phase 2")
+	}
+
+	live := NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	if live == canceled {
+		t.Fatal("live retry reused canceled incremental-cache result")
+	}
+	live.WaitForPhase2()
+	if !live.IsPhase2Ready() {
+		t.Fatal("live retry did not complete Phase 2")
+	}
+	if len(live.PageRank()) != len(issues) {
+		t.Fatalf("live retry PageRank has %d entries, want %d", len(live.PageRank()), len(issues))
+	}
+
+	cached := NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	if cached != live {
+		t.Fatal("completed live retry was not published to the incremental cache")
+	}
+}
+
+func TestAnalyzerAnalyzeAsyncAcceptsNilContext(t *testing.T) {
+	t.Setenv("BV_ROBOT", "0")
+
+	issues := []model.Issue{
+		{
+			ID:           "nil-context-dependent",
+			Status:       model.StatusOpen,
+			Dependencies: []*model.Dependency{{DependsOnID: "nil-context-blocker", Type: model.DepBlocks}},
+		},
+		{ID: "nil-context-blocker", Status: model.StatusOpen},
+	}
+	config := AnalysisConfig{
+		DisableCache:    true,
+		RunToCompletion: true,
+		ComputePageRank: true,
+	}
+
+	stats := NewAnalyzer(issues).AnalyzeAsyncWithConfig(nil, config)
+	stats.WaitForPhase2()
+	if !stats.IsPhase2Ready() {
+		t.Fatal("nil context prevented Phase 2 publication")
+	}
+	if len(stats.PageRank()) != len(issues) {
+		t.Fatalf("nil-context PageRank has %d entries, want %d", len(stats.PageRank()), len(issues))
 	}
 }
 
@@ -367,6 +467,76 @@ func TestAnalyzerRunToCompletionIsIndependentOfIssueAndDependencyOrder(t *testin
 	}
 }
 
+func TestAnalyzerOwnsIssueSnapshotForGraphAndDataHash(t *testing.T) {
+	deferUntil := time.Date(2026, time.September, 1, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:         "A",
+			Title:      "original",
+			Status:     model.StatusOpen,
+			DeferUntil: &deferUntil,
+			Labels:     []string{"stable"},
+			Dependencies: []*model.Dependency{
+				{IssueID: "A", DependsOnID: "B", Type: model.DepBlocks},
+			},
+			Comments: []*model.Comment{{ID: "comment-1", IssueID: "A", Text: "original"}},
+		},
+		{
+			ID:           "B",
+			Title:        "blocker",
+			Status:       model.StatusOpen,
+			Labels:       []string{"blocker-label"},
+			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepRelated}},
+			Comments:     []*model.Comment{{ID: "comment-2", IssueID: "B", Text: "blocker comment"}},
+		},
+	}
+	wantHash := ComputeDataHash(issues)
+	analyzer := NewAnalyzer(issues)
+
+	returned := analyzer.GetIssue("A")
+	if returned == nil {
+		t.Fatal("GetIssue(A) returned nil")
+	}
+	returned.Title = "mutated through getter"
+	returned.Labels[0] = "mutated through getter"
+	returned.Dependencies[0].DependsOnID = "missing"
+	returned.Comments[0].Text = "mutated through getter"
+	*returned.DeferUntil = deferUntil.Add(48 * time.Hour)
+	actionable := analyzer.GetActionableIssues()
+	if len(actionable) != 1 || actionable[0].ID != "B" {
+		t.Fatalf("unexpected initial actionable issues: %+v", actionable)
+	}
+	actionable[0].Title = "mutated through actionable getter"
+	actionable[0].Labels[0] = "mutated through actionable getter"
+	actionable[0].Dependencies[0].DependsOnID = "missing"
+	actionable[0].Comments[0].Text = "mutated through actionable getter"
+
+	issues[0].Title = "mutated"
+	issues[0].Status = model.StatusClosed
+	issues[0].Labels[0] = "mutated"
+	issues[0].Dependencies[0].DependsOnID = "missing"
+	issues[0].Comments[0].Text = "mutated"
+	*issues[0].DeferUntil = deferUntil.Add(24 * time.Hour)
+
+	if got := analyzer.DataHash(); got != wantHash {
+		t.Fatalf("caller mutation changed analyzer data hash: got %s, want %s", got, wantHash)
+	}
+	stable := analyzer.GetIssue("A")
+	if stable == nil || stable.Title != "original" || stable.Labels[0] != "stable" || stable.Dependencies[0].DependsOnID != "B" || stable.Comments[0].Text != "original" || !stable.DeferUntil.Equal(deferUntil) {
+		t.Fatalf("GetIssue exposed analyzer-owned nested data: %+v", stable)
+	}
+	if stableB := analyzer.GetIssue("B"); stableB == nil || stableB.Title != "blocker" || stableB.Labels[0] != "blocker-label" || stableB.Dependencies[0].DependsOnID != "A" || stableB.Comments[0].Text != "blocker comment" {
+		t.Fatalf("GetActionableIssues exposed analyzer-owned data: %+v", stableB)
+	}
+	config := NoPhase2Config()
+	config.DisableCache = true
+	stats := analyzer.AnalyzeAsyncWithConfig(context.Background(), config)
+	stats.WaitForPhase2()
+	if stats.OutDegree["A"] != 1 || stats.InDegree["B"] != 1 {
+		t.Fatalf("caller mutation changed analyzer graph: out=%v in=%v", stats.OutDegree, stats.InDegree)
+	}
+}
+
 func TestAnalyzerDAGMetricsAreIndependentOfIssueAndDependencyOrder(t *testing.T) {
 	issues := []model.Issue{
 		{
@@ -449,5 +619,27 @@ func TestAnalyzerNegativeCycleLimitUsesSafeDefault(t *testing.T) {
 	}
 	if got := stats.Cycles(); len(got) != 1 {
 		t.Fatalf("negative cycle limit returned %d cycles, want safe-default result", len(got))
+	}
+}
+
+func TestMetricStatusClaimUnsafeReasonsFailsClosedOnUnknownStates(t *testing.T) {
+	status := MetricStatus{
+		PageRank:    statusEntry{},
+		Betweenness: statusEntry{State: "unexpected", Reason: "corrupt cache"},
+	}
+	reasons := status.ClaimUnsafeReasons()
+	if len(reasons) != 2 {
+		t.Fatalf("unsafe reasons = %v, want both unknown metric states", reasons)
+	}
+	if reasons[0] != "PageRank unknown" || reasons[1] != "Betweenness unexpected: corrupt cache" {
+		t.Fatalf("unsafe reasons = %v, want explicit fail-closed diagnostics", reasons)
+	}
+
+	safe := MetricStatus{
+		PageRank:    statusEntry{State: "computed"},
+		Betweenness: statusEntry{State: "approx"},
+	}
+	if reasons := safe.ClaimUnsafeReasons(); len(reasons) != 0 {
+		t.Fatalf("computed metric states reported unsafe: %v", reasons)
 	}
 }

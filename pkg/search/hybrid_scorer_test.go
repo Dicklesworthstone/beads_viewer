@@ -145,3 +145,27 @@ func TestNewHybridScorer_FallsBackBeforeNormalizingInvalidWeights(t *testing.T) 
 		t.Fatalf("expected default weights, got %+v", scorer.weights)
 	}
 }
+
+func TestHybridScorerAtUsesPinnedRecencyClock(t *testing.T) {
+	reference := time.Date(2024, time.June, 30, 12, 0, 0, 0, time.UTC)
+	cache := &stubMetricsCache{
+		metrics: map[string]IssueMetrics{
+			"A": {IssueID: "A", UpdatedAt: reference.Add(-30 * 24 * time.Hour)},
+		},
+	}
+	scorer := NewHybridScorerAt(Weights{Recency: 1}, cache, reference)
+	result, err := scorer.Score("A", 0)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if got, want := result.ComponentScores["recency"], math.Exp(-1); math.Abs(got-want) > 1e-12 {
+		t.Fatalf("recency component = %f, want %f", got, want)
+	}
+}
+
+func TestHybridScorerAtCapturesZeroReferenceClockOnce(t *testing.T) {
+	scorer := NewHybridScorerAt(Weights{Recency: 1}, nil, time.Time{}).(*hybridScorer)
+	if scorer.now.IsZero() {
+		t.Fatal("zero reference clock was not captured at construction")
+	}
+}

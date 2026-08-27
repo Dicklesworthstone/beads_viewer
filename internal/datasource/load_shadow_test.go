@@ -3,6 +3,7 @@ package datasource
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -49,6 +50,37 @@ func TestLoadSmartNonIssueShadow(t *testing.T) {
 	}
 }
 
+func TestLoadSmartEqualTimePrefersCanonicalJSONLName(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	beadsDir := t.TempDir()
+	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	legacyPath := filepath.Join(beadsDir, "beads.jsonl")
+	if err := os.WriteFile(issuesPath, []byte(`{"id":"CURRENT-1","title":"current","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write canonical source: %v", err)
+	}
+	if err := os.WriteFile(legacyPath, []byte(`{"id":"LEGACY-1","title":"legacy","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write legacy source: %v", err)
+	}
+	equalTime := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	for _, path := range []string{issuesPath, legacyPath} {
+		if err := os.Chtimes(path, equalTime, equalTime); err != nil {
+			t.Fatalf("set equal timestamp for %s: %v", path, err)
+		}
+	}
+
+	issues, err := LoadIssuesFromDir(beadsDir)
+	if err != nil {
+		t.Fatalf("LoadIssuesFromDir: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "CURRENT-1" {
+		t.Fatalf("loaded issues = %+v, want canonical issues.jsonl contents", issues)
+	}
+	selected, ok := LastSelectedSource()
+	if !ok || selected.Path != issuesPath {
+		t.Fatalf("selected source = %+v, present %v; want %s", selected, ok, issuesPath)
+	}
+}
+
 // A legitimately empty issues.jsonl (no records at all) is a valid empty project:
 // it must load as 0 issues with no error, not be rejected.
 func TestLoadSmartEmptyProjectValid(t *testing.T) {
@@ -63,5 +95,27 @@ func TestLoadSmartEmptyProjectValid(t *testing.T) {
 	got, err := LoadIssuesFromDir(beads)
 	if err != nil || len(got) != 0 {
 		t.Errorf("empty project: got %d issues err=%v, want 0 / nil", len(got), err)
+	}
+}
+
+func TestLoadIssuesFromDirRejectsAllSkippedOnlySource(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	beadsDir := t.TempDir()
+	path := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(path, []byte(`{"_type":"sprint","id":"sprint-only"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write all-skipped source: %v", err)
+	}
+
+	issues, err := LoadIssuesFromDir(beadsDir)
+	if err == nil {
+		t.Fatalf("all-skipped-only source was accepted as empty authority: %+v", issues)
+	}
+	if issues != nil {
+		t.Fatalf("all-skipped-only source returned %d issues with an error", len(issues))
+	}
+	for _, want := range []string{path, "no issue records", "1 non-issue"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("all-skipped rejection %q missing %q", err, want)
+		}
 	}
 }

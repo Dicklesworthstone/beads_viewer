@@ -3,6 +3,7 @@ package correlation
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"sync/atomic"
@@ -83,7 +84,7 @@ func TestPerCommitCoCommitDifferential(t *testing.T) {
 	}
 	t.Logf("status-change SHAs: %d", len(shas))
 
-	namespace := perCommitCoCommitCacheNamespace()
+	namespace := perCommitCoCommitCacheNamespace(root)
 
 	run := func() ([]CorrelatedCommit, int64) {
 		atomic.StoreInt64(&coCommitFetchedSHAsCounter, 0)
@@ -182,13 +183,55 @@ func TestLineStatsWireRoundTrip(t *testing.T) {
 }
 
 // TestPerCommitCoCommitNamespaceStable verifies the namespace is a stable,
-// non-empty hash of the exclude-pathspec args (so the same exclude set always
-// keys the same bucket).
+// non-empty hash of the repository and fixed extraction policy.
 func TestPerCommitCoCommitNamespaceStable(t *testing.T) {
-	a := perCommitCoCommitCacheNamespace()
-	b := perCommitCoCommitCacheNamespace()
+	repo := t.TempDir()
+	a := perCommitCoCommitCacheNamespace(repo)
+	b := perCommitCoCommitCacheNamespace(repo)
 	if a == "" || a != b {
 		t.Fatalf("namespace not stable/non-empty: %q vs %q", a, b)
+	}
+	if other := perCommitCoCommitCacheNamespace(t.TempDir()); other == a {
+		t.Fatalf("distinct repository paths shared namespace %q", a)
+	}
+}
+
+func TestReadPerCommitCoCommitCacheRejectsOversizedInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "per-commit-cocommits.json")
+	fixture := []byte(fmt.Sprintf(`{"version":%d,"entries":{"ns":{"commits":{"sha":{"created_at":"2026-08-26T12:00:00Z","files":[],"line_stats":{}}}}}}`, perCommitCoCommitCacheVersion))
+	if err := os.WriteFile(path, fixture, 0o600); err != nil {
+		t.Fatalf("write cache fixture: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open cache fixture: %v", err)
+	}
+	defer f.Close()
+
+	valid := readPerCommitCoCommitCacheLockedWithLimit(f, int64(len(fixture)))
+	if _, ok := valid.Entries["ns"].Commits["sha"]; !ok {
+		t.Fatalf("valid cache fixture did not decode: %+v", valid)
+	}
+	got := readPerCommitCoCommitCacheLockedWithLimit(f, 8)
+	if got.Version != perCommitCoCommitCacheVersion || len(got.Entries) != 0 {
+		t.Fatalf("oversized cache should fail closed to an empty current-version cache: %+v", got)
+	}
+}
+
+func TestPrunePerCommitCoCommitsRejectsFutureTimestamp(t *testing.T) {
+	now := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	entries := map[string]perCommitCoCommitNamespaceBucket{
+		"ns": {Commits: map[string]perCommitCoCommitEntry{
+			"fresh":  {CreatedAt: now.Add(-time.Hour)},
+			"future": {CreatedAt: now.Add(time.Nanosecond)},
+		}},
+	}
+	pruneAndBoundPerCommitCoCommitEntries(now, entries)
+	if _, ok := entries["ns"].Commits["fresh"]; !ok {
+		t.Fatal("fresh per-commit co-commit entry was removed")
+	}
+	if _, ok := entries["ns"].Commits["future"]; ok {
+		t.Fatal("future-dated per-commit co-commit entry was retained")
 	}
 }
 

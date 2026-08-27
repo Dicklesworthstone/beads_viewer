@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // BlurbVersion is the current version of the agent instructions blurb.
@@ -21,6 +22,25 @@ const BlurbStartMarker = "<!-- bv-agent-instructions-v4 -->"
 const BlurbEndMarker = "<!-- end-bv-agent-instructions -->"
 
 const blurbStartPrefix = "<!-- bv-agent-instructions-v"
+
+const (
+	// A 16 MiB file can legally contain millions of one-byte lines. Keeping a
+	// markdownLine for every one of them would turn the file-size limit into a
+	// much larger memory allocation. Bound the parsed representation directly.
+	maxMarkdownAnalysisLines = 1 << 18
+	// Container parsing constructs a small descriptor for every nested list or
+	// blockquote and several Markdown classifiers inspect the same prefix. Bound
+	// both one-line depth and aggregate explicit-container work before any of
+	// those classifiers allocate their slices.
+	maxMarkdownContainerDepth    = 256
+	maxMarkdownContainerPrefixes = 1 << 20
+
+	// Legacy blurbs must be rediscovered after each removal because an old,
+	// dangling fence can change how the remaining Markdown is parsed. Bound the
+	// aggregate rescanned input so adversarial duplicate copies cannot make that
+	// compatibility path quadratic without limit.
+	maxLegacyBlurbRemovalScanBytes = 64 << 20
+)
 
 // AgentBlurb contains the instructions to be appended to AGENTS.md files.
 // This is the v4 blurb that combines bd/br workflow commands with bv robot triage.
@@ -210,9 +230,18 @@ type legacyBlurbSpan struct {
 
 // ContainsBlurb checks for a standalone versioned start marker outside fenced
 // Markdown. Marker examples in code fences and inline prose are documentation,
-// not installed instructions.
+// not installed instructions. Because this compatibility API cannot return an
+// error, it conservatively returns true when bounded Markdown analysis is
+// indeterminate; checked file operations expose the diagnostic instead.
 func ContainsBlurb(content string) bool {
-	for _, marker := range scanBlurbMarkers(content) {
+	markers, err := scanBlurbMarkersChecked(content)
+	if err != nil {
+		// The boolean API cannot return analysis uncertainty. Fail closed so a
+		// caller never interprets budget-limited Markdown as proof of absence;
+		// checked file operations surface the underlying error.
+		return true
+	}
+	for _, marker := range markers {
 		if marker.kind == blurbStart || marker.kind == blurbInvalidStart {
 			return true
 		}
@@ -327,12 +356,13 @@ func updateBlurbChecked(content string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for ContainsBlurb(content) {
-		withoutBlurb := removeFirstVersionedBlurb(content)
-		if withoutBlurb == content {
-			return "", fmt.Errorf("malformed bv agent blurb: unable to remove validated marker")
-		}
-		content = withoutBlurb
+	blocks, err := inspectBlurbBlocks(content)
+	if err != nil {
+		return "", err
+	}
+	content, err = removeVersionedBlurbBlocks(content, blocks)
+	if err != nil {
+		return "", err
 	}
 	updated := AppendBlurb(content)
 	count, err := inspectBlurbStructure(updated)
@@ -352,14 +382,83 @@ func removeBlurbsChecked(content string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for ContainsBlurb(content) {
-		withoutBlurb := removeFirstVersionedBlurb(content)
-		if withoutBlurb == content {
-			return "", fmt.Errorf("malformed bv agent blurb: unable to remove validated marker")
-		}
-		content = withoutBlurb
+	blocks, err := inspectBlurbBlocks(content)
+	if err != nil {
+		return "", err
 	}
-	return content, nil
+	return removeVersionedBlurbBlocks(content, blocks)
+}
+
+// removeVersionedBlurbBlocks removes already-validated, ordered blocks in one
+// pass. Repeatedly rescanning and copying the remaining document once per
+// duplicate makes an otherwise valid size-bounded file quadratic.
+func removeVersionedBlurbBlocks(content string, blocks []blurbBlock) (string, error) {
+	if len(blocks) == 0 {
+		return content, nil
+	}
+
+	type removalGroup struct {
+		start      int
+		end        int
+		firstBlock int
+		lastBlock  int
+	}
+	groups := make([]removalGroup, 0, len(blocks))
+	previousBlockEnd := 0
+	for i, block := range blocks {
+		if block.start < previousBlockEnd || block.start < 0 || block.end < block.start || block.end > len(content) {
+			return "", fmt.Errorf("malformed bv agent blurb: invalid validated block range [%d,%d)", block.start, block.end)
+		}
+		previousBlockEnd = block.end
+		start := trimLineBreaksBefore(content, block.start)
+		end := trimLineBreaksAfter(content, block.end)
+		if len(groups) > 0 && start <= groups[len(groups)-1].end {
+			group := &groups[len(groups)-1]
+			if end > group.end {
+				group.end = end
+			}
+			group.lastBlock = i
+			continue
+		}
+		groups = append(groups, removalGroup{
+			start:      start,
+			end:        end,
+			firstBlock: i,
+			lastBlock:  i,
+		})
+	}
+
+	var result strings.Builder
+	result.Grow(len(content))
+	cursor := 0
+	for _, group := range groups {
+		if group.start < cursor || group.end < group.start || group.end > len(content) {
+			return "", fmt.Errorf("malformed bv agent blurb: overlapping removal range [%d,%d)", group.start, group.end)
+		}
+		result.WriteString(content[cursor:group.start])
+		if group.start > 0 {
+			// Preserve the original newline convention while excluding the blurb
+			// bodies themselves. Adjacent blocks form one removal group, so their
+			// intervening line breaks are considered exactly once and collapse to
+			// the same single separator as repeated removals.
+			var removedLineBreaks strings.Builder
+			boundary := group.start
+			for i := group.firstBlock; i <= group.lastBlock; i++ {
+				block := blocks[i]
+				if boundary < block.start {
+					removedLineBreaks.WriteString(content[boundary:block.start])
+				}
+				boundary = block.end
+			}
+			if boundary < group.end {
+				removedLineBreaks.WriteString(content[boundary:group.end])
+			}
+			result.WriteString(preferredLineBreak(removedLineBreaks.String()))
+		}
+		cursor = group.end
+	}
+	result.WriteString(content[cursor:])
+	return result.String(), nil
 }
 
 // prepareBlurbMutation validates both the original Markdown view and a
@@ -434,8 +533,19 @@ func removeLegacyBlurbsChecked(content string) (string, bool, int, error) {
 func removeLegacyBlurbsCheckedWithPolicy(content string, consumeAmbiguousFence bool) (string, bool, int, error) {
 	ambiguousFencePreserved := false
 	removed := 0
+	scannedBytes := 0
 	for {
-		span, ok, ambiguous := findLegacyBlurbWithPolicy(content, consumeAmbiguousFence)
+		if len(content) > maxLegacyBlurbRemovalScanBytes-scannedBytes {
+			return "", ambiguousFencePreserved, removed, fmt.Errorf(
+				"markdown analysis limit exceeded after scanning %d bytes while removing duplicate legacy bv blurbs",
+				scannedBytes,
+			)
+		}
+		scannedBytes += len(content)
+		span, ok, ambiguous, scanErr := findLegacyBlurbWithPolicyChecked(content, consumeAmbiguousFence)
+		if scanErr != nil {
+			return "", ambiguousFencePreserved, removed, scanErr
+		}
 		ambiguousFencePreserved = ambiguousFencePreserved || ambiguous
 		if !ok {
 			return content, ambiguousFencePreserved, removed, nil
@@ -460,7 +570,7 @@ func inspectBlurbStructure(content string) (int, error) {
 }
 
 func inspectBlurbBlocks(content string) ([]blurbBlock, error) {
-	markers := scanBlurbMarkers(content)
+	markers, scanErr := scanBlurbMarkersChecked(content)
 	blocks := make([]blurbBlock, 0, len(markers)/2)
 	var open *blurbMarker
 	for i := range markers {
@@ -484,11 +594,19 @@ func inspectBlurbBlocks(content string) ([]blurbBlock, error) {
 	if open != nil {
 		return blocks, fmt.Errorf("malformed bv agent blurb: start marker at byte %d has no end marker", open.byteOffset)
 	}
+	if scanErr != nil {
+		return blocks, scanErr
+	}
 	return blocks, nil
 }
 
 func scanBlurbMarkers(content string) []blurbMarker {
-	lines := scanMarkdownLines(content)
+	markers, _ := scanBlurbMarkersChecked(content)
+	return markers
+}
+
+func scanBlurbMarkersChecked(content string) ([]blurbMarker, error) {
+	lines, scanErr := scanMarkdownLinesChecked(content)
 	markers := make([]blurbMarker, 0, 2)
 	for _, line := range lines {
 		if !line.outsideFence || !line.topLevel {
@@ -525,12 +643,22 @@ func scanBlurbMarkers(content string) []blurbMarker {
 			markers = append(markers, marker)
 		}
 	}
-	return markers
+	return markers, scanErr
 }
 
 func scanMarkdownLines(content string) []markdownLine {
-	lines := make([]markdownLine, 0, strings.Count(content, "\n")+1)
+	lines, _ := scanMarkdownLinesChecked(content)
+	return lines
+}
+
+func scanMarkdownLinesChecked(content string) ([]markdownLine, error) {
+	lineCount, err := markdownPhysicalLineCount(content)
+	if err != nil {
+		return nil, err
+	}
+	lines := make([]markdownLine, 0, lineCount)
 	var fence markdownFence
+	linkReferenceEnd := -1
 	htmlCommentDepth := 0
 	htmlRawTag := ""
 	htmlTerminator := ""
@@ -556,8 +684,12 @@ func scanMarkdownLines(content string) []markdownLine {
 		blank := isMarkdownBlankLine(text)
 		paragraphAtLineStart := paragraphOpen
 		topLevel := markdownLineIsTopLevel(text, listContainers)
-		outside := true
-		if fence.char != 0 {
+		// A definition recognized on an earlier line owns all of its continuation
+		// lines. Do this before looking for fenced-block openers so a literal ``` in
+		// a multiline link title cannot leak fence state beyond the definition.
+		outside := start >= linkReferenceEnd
+		topLevelReferenceLine := !outside
+		if outside && fence.char != 0 {
 			if blank {
 				// Blank lines remain inside list and blockquote fenced blocks even
 				// when their container prefix is omitted.
@@ -578,10 +710,54 @@ func scanMarkdownLines(content string) []markdownLine {
 		// HTML comment and hide marker lines after the fence closes.
 		if outside && htmlCommentDepth == 0 && htmlRawTag == "" && htmlTerminator == "" && !htmlBlankTerminated {
 			if char, width, rest, containers, ok := markdownFenceOpening(text); ok {
+				if len(containers) > maxMarkdownContainerDepth {
+					return lines, fmt.Errorf("markdown analysis limit exceeded at byte %d: container depth %d exceeds %d", start, len(containers), maxMarkdownContainerDepth)
+				}
 				// Backtick info strings cannot contain backticks in CommonMark.
 				if char != '`' || !strings.Contains(rest, "`") {
 					outside = false
 					fence = markdownFence{char: char, width: width, containers: containers}
+				}
+			}
+		}
+		// A top-level indented code block is protected documentation just like a
+		// fenced code block. Indented code cannot interrupt a paragraph, so retain
+		// paragraph continuations as ordinary Markdown text.
+		if outside && htmlCommentDepth == 0 && htmlRawTag == "" && htmlTerminator == "" && !htmlBlankTerminated &&
+			topLevel && !paragraphAtLineStart && markdownLineStartsIndentedCode(text) {
+			outside = false
+		}
+		// Link reference definitions are block material, not paragraphs. In
+		// particular, a complete definition may be followed immediately by a type-7
+		// HTML block. Protect every physical line in the bounded top-level definition
+		// so marker-shaped label or title examples remain documentation. A definition
+		// never interrupts a paragraph, so only start this lookahead at a block
+		// boundary. Container-nested single-line definitions are handled separately;
+		// their prefixes make a safe multiline lookahead context-dependent.
+		if outside && htmlCommentDepth == 0 && htmlRawTag == "" && htmlTerminator == "" && !htmlBlankTerminated &&
+			!paragraphAtLineStart {
+			switch {
+			case topLevel:
+				definitionEnd, ok := commonMarkLinkReferenceDefinitionEnd(content, start)
+				if definitionEnd == commonMarkScanBudgetExceeded {
+					return lines, fmt.Errorf("markdown analysis limit exceeded at byte %d while parsing a link reference definition", start)
+				}
+				if ok {
+					linkReferenceEnd = definitionEnd
+					topLevelReferenceLine = true
+					outside = false
+				}
+			default:
+				openingText, openingContainers := markdownHTMLBlockOpening(text, listContainers)
+				if len(openingContainers) > maxMarkdownContainerDepth {
+					return lines, fmt.Errorf("markdown analysis limit exceeded at byte %d: container depth %d exceeds %d", start, len(openingContainers), maxMarkdownContainerDepth)
+				}
+				definitionEnd, ok := commonMarkLinkReferenceDefinitionEnd(openingText, 0)
+				if definitionEnd == commonMarkScanBudgetExceeded {
+					return lines, fmt.Errorf("markdown analysis limit exceeded at byte %d while parsing a nested link reference definition", start)
+				}
+				if ok && definitionEnd == len(openingText) {
+					outside = false
 				}
 			}
 		}
@@ -630,6 +806,9 @@ func scanMarkdownLines(content string) []markdownLine {
 			}
 		} else if outside {
 			openingText, openingContainers := markdownHTMLBlockOpening(text, listContainers)
+			if len(openingContainers) > maxMarkdownContainerDepth {
+				return lines, fmt.Errorf("markdown analysis limit exceeded at byte %d: container depth %d exceeds %d", start, len(openingContainers), maxMarkdownContainerDepth)
+			}
 			if tag := opensHTMLRawBlock(openingText); tag != "" {
 				htmlRawTag = tag
 				htmlContainers = append([]markdownContainer(nil), openingContainers...)
@@ -673,16 +852,24 @@ func scanMarkdownLines(content string) []markdownLine {
 
 		// Carry list continuation indentation so an HTML block opened on a later
 		// indented line remains scoped to that list, not the whole document.
-		if blank && emptyListParentDepth >= 0 {
+		if topLevelReferenceLine {
+			// List-looking bytes inside a multiline label or title are inline
+			// definition content. A top-level definition also ends any lazy list
+			// continuation that preceded it.
+			listContainers = nil
+			emptyListParentDepth = -1
+		} else if blank && emptyListParentDepth >= 0 {
 			// An empty list marker has no paragraph whose continuation can span a
 			// blank line. End that innermost list without discarding any ancestor
 			// container that still owns the following indented content.
 			listContainers = listContainers[:emptyListParentDepth]
 			emptyListParentDepth = -1
-		} else if remainder, explicitContainers, ok := stripMarkdownOpeningContainersWithActive(text, listContainers); ok &&
+		} else if remainder, explicitContainers, parentDepth, ok := stripMarkdownOpeningContainersWithActive(text, listContainers); ok &&
 			containsMarkdownList(explicitContainers) &&
 			!(paragraphAtLineStart && (isMarkdownBlankLine(remainder) || firstNewContainerCannotInterruptParagraph(explicitContainers, listContainers))) {
-			parentDepth := markdownContainerPrefixLength(explicitContainers, listContainers)
+			if len(explicitContainers) > maxMarkdownContainerDepth {
+				return lines, fmt.Errorf("markdown analysis limit exceeded at byte %d: container depth %d exceeds %d", start, len(explicitContainers), maxMarkdownContainerDepth)
+			}
 			listContainers = append([]markdownContainer(nil), explicitContainers...)
 			emptyListParentDepth = -1
 			if isMarkdownBlankLine(remainder) {
@@ -710,7 +897,88 @@ func scanMarkdownLines(content string) []markdownLine {
 		}
 		start = next
 	}
-	return lines
+	return lines, nil
+}
+
+// markdownPhysicalLineCount mirrors scanMarkdownLinesChecked's CR, LF, and
+// CRLF splitting without allocating a line table. Rejecting before allocation
+// is important for newline-dense files at the accepted byte-size boundary.
+func markdownPhysicalLineCount(content string) (int, error) {
+	lineCount := 0
+	containerPrefixes := 0
+	for start := 0; start < len(content); {
+		lineCount++
+		if lineCount > maxMarkdownAnalysisLines {
+			return 0, fmt.Errorf(
+				"markdown analysis limit exceeded at byte %d: more than %d physical lines",
+				start,
+				maxMarkdownAnalysisLines,
+			)
+		}
+		end := start
+		for end < len(content) && content[end] != '\n' && content[end] != '\r' {
+			end++
+		}
+		depth := markdownOpeningContainerDepth(content[start:end], maxMarkdownContainerDepth+1)
+		if depth > maxMarkdownContainerDepth {
+			return 0, fmt.Errorf(
+				"markdown analysis limit exceeded at byte %d: container depth exceeds %d",
+				start,
+				maxMarkdownContainerDepth,
+			)
+		}
+		if depth > maxMarkdownContainerPrefixes-containerPrefixes {
+			return 0, fmt.Errorf(
+				"markdown analysis limit exceeded at byte %d: more than %d explicit container prefixes",
+				start,
+				maxMarkdownContainerPrefixes,
+			)
+		}
+		containerPrefixes += depth
+		if end == len(content) {
+			break
+		}
+		if content[end] == '\r' && end+1 < len(content) && content[end+1] == '\n' {
+			start = end + 2
+		} else {
+			start = end + 1
+		}
+	}
+	return lineCount, nil
+}
+
+// markdownOpeningContainerDepth follows the same prefix grammar as
+// stripMarkdownOpeningContainers without retaining descriptors. limit makes a
+// single adversarial line bounded even before the caller can reject it.
+func markdownOpeningContainerDepth(line string, limit int) int {
+	line = strings.TrimSuffix(line, "\r")
+	depth := 0
+	pos := 0
+	for depth < limit {
+		spaces := countLeadingSpaces(line[pos:])
+		if spaces > 3 {
+			return depth
+		}
+		pos += spaces
+		if pos >= len(line) {
+			return depth
+		}
+		if line[pos] == '>' {
+			depth++
+			pos++
+			if pos < len(line) && (line[pos] == ' ' || line[pos] == '\t') {
+				pos++
+			}
+			continue
+		}
+		markerWidth, gapBytes, _, _, isList := markdownListMarker(line[pos:], spaces)
+		if !isList {
+			return depth
+		}
+		depth++
+		pos += markerWidth + gapBytes
+	}
+	return depth
 }
 
 // markdownLineIsTopLevel reports whether line is outside every explicit or
@@ -851,6 +1119,327 @@ func isASCIIDigit(value byte) bool {
 	return value >= '0' && value <= '9'
 }
 
+const (
+	maxCommonMarkReferenceDefinitionBytes = 16 << 10
+	maxCommonMarkReferenceLabelCharacters = 999
+	maxCommonMarkDestinationParenDepth    = 32
+	commonMarkScanBudgetExceeded          = -1
+)
+
+// commonMarkLinkReferenceDefinitionEnd recognizes a deliberately bounded
+// CommonMark link reference definition beginning at a physical line boundary.
+// It accepts multiline labels and titles. Definite syntax errors reject the
+// candidate normally. If a plausible candidate exhausts a fixed analysis
+// budget, the function returns commonMarkScanBudgetExceeded with ok=false so
+// checked callers can report uncertainty instead of claiming that all remaining
+// content is either documentation or installed instructions. For a recognized
+// definition, the returned offset is the end of its last physical line before
+// the line ending.
+func commonMarkLinkReferenceDefinitionEnd(content string, start int) (int, bool) {
+	if start < 0 || start >= len(content) {
+		return 0, false
+	}
+	limit := len(content)
+	if remaining := len(content) - start; remaining > maxCommonMarkReferenceDefinitionBytes {
+		limit = start + maxCommonMarkReferenceDefinitionBytes
+	}
+
+	pos := start
+	indent := 0
+	for pos < limit && content[pos] == ' ' && indent < 4 {
+		pos++
+		indent++
+	}
+	if indent > 3 || pos >= limit || content[pos] != '[' {
+		return 0, false
+	}
+	pos++
+
+	labelCharacters := 0
+	labelHasContent := false
+	lineHasContent := true // The opening '[' makes the first physical line nonblank.
+	escaped := false
+	for {
+		if pos >= limit {
+			if limit < len(content) {
+				return commonMarkScanBudgetExceeded, false
+			}
+			return 0, false
+		}
+		if width := markdownLineEndingWidth(content, pos); width > 0 {
+			if !lineHasContent {
+				return 0, false
+			}
+			if pos+width > limit {
+				if limit < len(content) {
+					return commonMarkScanBudgetExceeded, false
+				}
+				return 0, false
+			}
+			labelCharacters++
+			if labelCharacters > maxCommonMarkReferenceLabelCharacters {
+				return 0, false
+			}
+			pos += width
+			lineHasContent = false
+			escaped = false
+			continue
+		}
+
+		value := content[pos]
+		if !escaped && value == ']' {
+			pos++
+			break
+		}
+		if !escaped && value == '[' {
+			return 0, false
+		}
+		characterWidth := 1
+		if value >= utf8.RuneSelf {
+			_, characterWidth = utf8.DecodeRuneInString(content[pos:limit])
+		}
+		labelCharacters++
+		if labelCharacters > maxCommonMarkReferenceLabelCharacters {
+			return 0, false
+		}
+		if value != ' ' && value != '\t' {
+			labelHasContent = true
+			lineHasContent = true
+		}
+		if escaped {
+			escaped = false
+		} else if value == '\\' {
+			escaped = true
+		}
+		pos += characterWidth
+	}
+	if !labelHasContent || pos >= limit || content[pos] != ':' {
+		return 0, false
+	}
+	pos++
+	pos = skipMarkdownSpacesTabs(content, pos, limit)
+	if width := markdownLineEndingWidth(content, pos); width > 0 {
+		if pos+width > limit {
+			if limit < len(content) {
+				return commonMarkScanBudgetExceeded, false
+			}
+			return 0, false
+		}
+		pos += width
+		pos = skipMarkdownSpacesTabs(content, pos, limit)
+	}
+	if pos >= limit {
+		if limit < len(content) {
+			return commonMarkScanBudgetExceeded, false
+		}
+		return 0, false
+	}
+
+	destinationEnd, ok := commonMarkLinkDestinationEnd(content, pos, limit)
+	if !ok {
+		if destinationEnd == commonMarkScanBudgetExceeded || destinationEnd == limit && limit < len(content) {
+			return commonMarkScanBudgetExceeded, false
+		}
+		return 0, false
+	}
+	pos = destinationEnd
+	spaceStart := pos
+	pos = skipMarkdownSpacesTabs(content, pos, limit)
+	hasTitleSeparator := pos > spaceStart
+	if pos == len(content) {
+		return pos, true
+	}
+	if pos >= limit {
+		if limit < len(content) {
+			return commonMarkScanBudgetExceeded, false
+		}
+		return 0, false
+	}
+
+	if width := markdownLineEndingWidth(content, pos); width > 0 {
+		definitionEnd := pos
+		if pos+width > limit {
+			if limit < len(content) {
+				return commonMarkScanBudgetExceeded, false
+			}
+			return definitionEnd, true
+		}
+		titleStart := skipMarkdownSpacesTabs(content, pos+width, limit)
+		if titleStart >= limit {
+			if limit < len(content) {
+				return commonMarkScanBudgetExceeded, false
+			}
+			return definitionEnd, true
+		}
+		if !isCommonMarkLinkTitleDelimiter(content[titleStart]) {
+			return definitionEnd, true
+		}
+		titleEnd, titleOK := commonMarkLinkTitleEnd(content, titleStart, limit)
+		if !titleOK {
+			if titleEnd == limit && limit < len(content) {
+				return commonMarkScanBudgetExceeded, false
+			}
+			// A malformed would-be title on the next line is an ordinary block;
+			// the preceding destination-only definition remains valid.
+			return definitionEnd, true
+		}
+		tail := skipMarkdownSpacesTabs(content, titleEnd, limit)
+		if tail == limit && limit < len(content) {
+			return commonMarkScanBudgetExceeded, false
+		}
+		if tail == len(content) || tail < limit && markdownLineEndingWidth(content, tail) > 0 {
+			return tail, true
+		}
+		return definitionEnd, true
+	}
+
+	if !hasTitleSeparator || !isCommonMarkLinkTitleDelimiter(content[pos]) {
+		return 0, false
+	}
+	titleEnd, ok := commonMarkLinkTitleEnd(content, pos, limit)
+	if !ok {
+		if titleEnd == limit && limit < len(content) {
+			return commonMarkScanBudgetExceeded, false
+		}
+		return 0, false
+	}
+	tail := skipMarkdownSpacesTabs(content, titleEnd, limit)
+	if tail == limit && limit < len(content) {
+		return commonMarkScanBudgetExceeded, false
+	}
+	if tail == len(content) || tail < limit && markdownLineEndingWidth(content, tail) > 0 {
+		return tail, true
+	}
+	return 0, false
+}
+
+func commonMarkLinkDestinationEnd(content string, start, limit int) (int, bool) {
+	if start >= limit || markdownLineEndingWidth(content, start) > 0 {
+		return 0, false
+	}
+	if content[start] == '<' {
+		for pos := start + 1; pos < limit; pos++ {
+			value := content[pos]
+			if markdownLineEndingWidth(content, pos) > 0 || value == '<' {
+				return 0, false
+			}
+			if value == '\\' && pos+1 < limit && isASCIICommonMarkPunctuation(content[pos+1]) {
+				pos++
+				continue
+			}
+			if value == '>' {
+				return pos + 1, true
+			}
+		}
+		return limit, false
+	}
+
+	depth := 0
+	pos := start
+	for pos < limit {
+		value := content[pos]
+		if value == ' ' || value == '\t' || markdownLineEndingWidth(content, pos) > 0 {
+			break
+		}
+		if value < 0x20 || value == 0x7f || value == '<' {
+			return 0, false
+		}
+		if value == '\\' && pos+1 < limit && isASCIICommonMarkPunctuation(content[pos+1]) {
+			pos += 2
+			continue
+		}
+		switch value {
+		case '(':
+			depth++
+			if depth > maxCommonMarkDestinationParenDepth {
+				return commonMarkScanBudgetExceeded, false
+			}
+		case ')':
+			if depth == 0 {
+				return 0, false
+			}
+			depth--
+		}
+		pos++
+	}
+	return pos, pos > start && depth == 0
+}
+
+func commonMarkLinkTitleEnd(content string, start, limit int) (int, bool) {
+	if start >= limit || !isCommonMarkLinkTitleDelimiter(content[start]) {
+		return 0, false
+	}
+	opener := content[start]
+	closer := opener
+	if opener == '(' {
+		closer = ')'
+	}
+	lineHasContent := true // The opening delimiter makes this line nonblank.
+	for pos := start + 1; pos < limit; {
+		if width := markdownLineEndingWidth(content, pos); width > 0 {
+			if !lineHasContent {
+				return 0, false
+			}
+			if pos+width > limit {
+				return limit, false
+			}
+			pos += width
+			lineHasContent = false
+			continue
+		}
+		value := content[pos]
+		if value == '\\' && pos+1 < limit && isASCIICommonMarkPunctuation(content[pos+1]) {
+			lineHasContent = true
+			pos += 2
+			continue
+		}
+		if value == closer {
+			return pos + 1, true
+		}
+		if opener == '(' && value == '(' {
+			return 0, false
+		}
+		if value != ' ' && value != '\t' {
+			lineHasContent = true
+		}
+		pos++
+	}
+	return limit, false
+}
+
+func skipMarkdownSpacesTabs(content string, start, limit int) int {
+	for start < limit && (content[start] == ' ' || content[start] == '\t') {
+		start++
+	}
+	return start
+}
+
+func markdownLineEndingWidth(content string, pos int) int {
+	if pos < 0 || pos >= len(content) {
+		return 0
+	}
+	switch content[pos] {
+	case '\n':
+		return 1
+	case '\r':
+		if pos+1 < len(content) && content[pos+1] == '\n' {
+			return 2
+		}
+		return 1
+	default:
+		return 0
+	}
+}
+
+func isCommonMarkLinkTitleDelimiter(value byte) bool {
+	return value == '\'' || value == '"' || value == '('
+}
+
+func isASCIICommonMarkPunctuation(value byte) bool {
+	return value >= '!' && value <= '/' || value >= ':' && value <= '@' ||
+		value >= '[' && value <= '`' || value >= '{' && value <= '~'
+}
+
 func isMarkdownBlankLine(line string) bool {
 	return strings.Trim(line, " \t") == ""
 }
@@ -898,24 +1487,28 @@ func markdownContainersAreLists(containers []markdownContainer) bool {
 }
 
 func markdownHTMLBlockOpening(line string, listContainers []markdownContainer) (string, []markdownContainer) {
-	if remainder, containers, ok := stripMarkdownOpeningContainersWithActive(line, listContainers); ok {
+	if remainder, containers, _, ok := stripMarkdownOpeningContainersWithActive(line, listContainers); ok {
 		return remainder, containers
 	}
 	return line, nil
 }
 
-func stripMarkdownOpeningContainersWithActive(line string, active []markdownContainer) (string, []markdownContainer, bool) {
+func stripMarkdownOpeningContainersWithActive(line string, active []markdownContainer) (string, []markdownContainer, int, bool) {
 	if len(active) > 0 {
-		if remainder, matched := stripMarkdownContainerPrefix(line, active); matched == len(active) {
+		if remainder, matched := stripMarkdownContainerPrefix(line, active); matched > 0 {
 			tail, added, ok := stripMarkdownOpeningContainers(remainder)
 			if ok {
-				containers := append([]markdownContainer(nil), active...)
+				// A sibling nested-list marker matches its ancestor containers but
+				// not the previous child container. Preserve that matched prefix so
+				// later continuation content remains scoped to the ancestor item.
+				containers := append([]markdownContainer(nil), active[:matched]...)
 				containers = append(containers, added...)
-				return tail, containers, true
+				return tail, containers, matched, true
 			}
 		}
 	}
-	return stripMarkdownOpeningContainers(line)
+	remainder, containers, ok := stripMarkdownOpeningContainers(line)
+	return remainder, containers, 0, ok
 }
 
 // isCompleteCommonMarkHTMLTag recognizes the complete open/closing-tag shape
@@ -1021,8 +1614,12 @@ func startsNonParagraphMarkdownBlock(line string, paragraphAlreadyOpen bool) boo
 	if remainder, containers, ok := stripMarkdownOpeningContainers(line); ok && len(containers) > 0 {
 		line = remainder
 	}
-	leading := countLeadingSpaces(line)
-	if leading >= 4 || leading < len(line) && line[leading] == '\t' {
+	if !paragraphAlreadyOpen {
+		if definitionEnd, ok := commonMarkLinkReferenceDefinitionEnd(line, 0); definitionEnd == commonMarkScanBudgetExceeded || ok && definitionEnd == len(line) {
+			return true
+		}
+	}
+	if markdownLineStartsIndentedCode(line) {
 		// Indented code cannot interrupt a paragraph; in that state it is an
 		// ordinary continuation line rather than a new block.
 		return !paragraphAlreadyOpen
@@ -1068,6 +1665,12 @@ func startsNonParagraphMarkdownBlock(line string, paragraphAlreadyOpen bool) boo
 	return false
 }
 
+func markdownLineStartsIndentedCode(line string) bool {
+	line = strings.TrimSuffix(line, "\r")
+	leading := countLeadingSpaces(line)
+	return leading >= 4 || leading < len(line) && line[leading] == '\t'
+}
+
 func markdownFenceOpening(line string) (byte, int, string, []markdownContainer, bool) {
 	remainder, containers, ok := stripMarkdownOpeningContainers(line)
 	if !ok {
@@ -1099,6 +1702,9 @@ func stripMarkdownOpeningContainers(line string) (string, []markdownContainer, b
 		}
 
 		if line[pos] == '>' {
+			if len(containers) >= maxMarkdownContainerDepth {
+				return "", nil, false
+			}
 			containers = append(containers, markdownContainer{kind: markdownBlockquote})
 			pos++
 			if pos < len(line) && (line[pos] == ' ' || line[pos] == '\t') {
@@ -1109,6 +1715,9 @@ func stripMarkdownOpeningContainers(line string) (string, []markdownContainer, b
 
 		markerWidth, gapBytes, continuationIndent, orderedStart, isList := markdownListMarker(line[pos:], spaces)
 		if isList {
+			if len(containers) >= maxMarkdownContainerDepth {
+				return "", nil, false
+			}
 			containers = append(containers, markdownContainer{
 				kind:         markdownList,
 				indent:       continuationIndent,
@@ -1323,12 +1932,20 @@ func markdownSetextHeading(lines []markdownLine, underlineIndex int) (int, int, 
 }
 
 func findLegacyBlurb(content string) (legacyBlurbSpan, bool) {
-	span, ok, _ := findLegacyBlurbWithPolicy(content, false)
+	span, ok, _, _ := findLegacyBlurbWithPolicyChecked(content, false)
 	return span, ok
 }
 
 func findLegacyBlurbWithPolicy(content string, consumeAmbiguousFence bool) (legacyBlurbSpan, bool, bool) {
-	lines := scanMarkdownLines(content)
+	span, ok, ambiguous, _ := findLegacyBlurbWithPolicyChecked(content, consumeAmbiguousFence)
+	return span, ok, ambiguous
+}
+
+func findLegacyBlurbWithPolicyChecked(content string, consumeAmbiguousFence bool) (legacyBlurbSpan, bool, bool, error) {
+	lines, scanErr := scanMarkdownLinesChecked(content)
+	if scanErr != nil {
+		return legacyBlurbSpan{}, false, false, scanErr
+	}
 	for i, line := range lines {
 		level, title, ok := markdownHeading(line)
 		if !ok || level != 3 || title != "Using bv as an AI sidecar" {
@@ -1392,9 +2009,9 @@ func findLegacyBlurbWithPolicy(content string, consumeAmbiguousFence bool) (lega
 				}
 			}
 		}
-		return legacyBlurbSpan{start: line.start, end: end}, true, ambiguousFencePreserved
+		return legacyBlurbSpan{start: line.start, end: end}, true, ambiguousFencePreserved, nil
 	}
-	return legacyBlurbSpan{}, false, false
+	return legacyBlurbSpan{}, false, false, nil
 }
 
 func legacyFenceIsClearlyTrailing(lines []markdownLine, opener, sectionEnd int, char byte, width int) bool {

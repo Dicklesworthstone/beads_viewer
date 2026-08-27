@@ -2,6 +2,7 @@ package correlation
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,9 +102,6 @@ func TestNewNetworkBuilder(t *testing.T) {
 	if len(builder.beadFiles) == 0 {
 		t.Error("Expected beadFiles map to be populated")
 	}
-	if len(builder.beadCommits) == 0 {
-		t.Error("Expected beadCommits map to be populated")
-	}
 }
 
 func TestNewNetworkBuilderNilReport(t *testing.T) {
@@ -111,6 +109,39 @@ func TestNewNetworkBuilderNilReport(t *testing.T) {
 
 	if builder == nil {
 		t.Fatal("Expected non-nil NetworkBuilder even with nil report")
+	}
+}
+
+func TestNetworkBuilderIgnoresEmptyNormalizedPaths(t *testing.T) {
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-001": {
+			BeadID:  "bv-001",
+			Commits: []CorrelatedCommit{{SHA: "commit-one", Files: []FileChange{{Path: ""}}}},
+		},
+		"bv-002": {
+			BeadID:  "bv-002",
+			Commits: []CorrelatedCommit{{SHA: "commit-two", Files: []FileChange{{Path: "./"}}}},
+		},
+	}}
+
+	builder := NewNetworkBuilder(report)
+	for beadID, files := range builder.beadFiles {
+		if len(files) != 0 {
+			t.Fatalf("beadFiles[%q]=%v, want no normalized files", beadID, files)
+		}
+	}
+
+	network := builder.BuildAt(time.Time{})
+	for beadID, node := range network.Nodes {
+		if node.FileCount != 0 {
+			t.Fatalf("node %q FileCount=%d, want 0", beadID, node.FileCount)
+		}
+	}
+	if len(network.Edges) != 0 {
+		t.Fatalf("empty paths created network edges: %+v", network.Edges)
+	}
+	if len(network.Clusters) != 0 {
+		t.Fatalf("empty paths created network clusters: %+v", network.Clusters)
 	}
 }
 
@@ -484,28 +515,116 @@ func TestCommonPathPrefix(t *testing.T) {
 	}
 }
 
-func TestSplitEdgeKey(t *testing.T) {
-	tests := []struct {
-		key      string
-		expected []string
-	}{
-		{"bv-001:bv-002:commit", []string{"bv-001", "bv-002", "commit"}},
-		{"bv-001:bv-002:file", []string{"bv-001", "bv-002", "file"}},
-		{"a:b:c:d", []string{"a", "b", "c", "d"}},
-		{"single", []string{"single"}},
+func TestNetworkEdgeKeysPreserveOpaqueBeadIDs(t *testing.T) {
+	const (
+		beadA = "team:api"
+		beadB = "team:ui"
+	)
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			beadA: {
+				BeadID: beadA,
+				Title:  "API",
+				Status: "open",
+				Commits: []CorrelatedCommit{
+					{SHA: "commit-1", Files: []FileChange{{Path: "shared.go"}}},
+					{SHA: "commit-2", Files: []FileChange{{Path: "shared.go"}}},
+				},
+			},
+			beadB: {
+				BeadID: beadB,
+				Title:  "UI",
+				Status: "open",
+				Commits: []CorrelatedCommit{
+					{SHA: "commit-1", Files: []FileChange{{Path: "shared.go"}}},
+					{SHA: "commit-2", Files: []FileChange{{Path: "shared.go"}}},
+				},
+			},
+		},
+		CommitIndex: CommitIndex{
+			"commit-1": {beadA, beadB},
+			"commit-2": {beadA, beadB},
+		},
 	}
 
-	for _, tt := range tests {
-		result := splitEdgeKey(tt.key)
-		if len(result) != len(tt.expected) {
-			t.Errorf("For key %q: expected %d parts, got %d", tt.key, len(tt.expected), len(result))
-			continue
+	network := NewNetworkBuilder(report).BuildAt(time.Time{})
+	if len(network.Edges) != 2 {
+		t.Fatalf("typed edges = %#v, want shared-commit and shared-file edges", network.Edges)
+	}
+	for _, edge := range network.Edges {
+		if edge.FromBead != beadA || edge.ToBead != beadB {
+			t.Fatalf("opaque bead ID was split or reordered incorrectly: %+v", edge)
 		}
-		for i, part := range result {
-			if part != tt.expected[i] {
-				t.Errorf("For key %q: part %d expected %q, got %q", tt.key, i, tt.expected[i], part)
-			}
-		}
+	}
+	if network.Nodes[beadA].Degree != 1 || network.Nodes[beadB].Degree != 1 {
+		t.Fatalf("parallel typed edges inflated degree: a=%d b=%d", network.Nodes[beadA].Degree, network.Nodes[beadB].Degree)
+	}
+	if network.Stats.Density != 1 {
+		t.Fatalf("two-node simple density = %v, want 1", network.Stats.Density)
+	}
+	if len(network.Clusters) != 1 {
+		t.Fatalf("clusters = %#v, want one strong two-node cluster", network.Clusters)
+	}
+	cluster := network.Clusters[0]
+	if cluster.InternalEdges != 1 || cluster.InternalConnectivity != 1 {
+		t.Fatalf("parallel typed edges inflated cluster metrics: %+v", cluster)
+	}
+	if cluster.CentralBead != beadA {
+		t.Fatalf("central bead tie = %q, want deterministic lexical winner %q", cluster.CentralBead, beadA)
+	}
+}
+
+func TestSharedCommitEdgesIgnoreMissingNetworkNodes(t *testing.T) {
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-a": {BeadID: "bv-a", Status: "open"},
+			"bv-b": {BeadID: "bv-b", Status: "open"},
+		},
+		CommitIndex: CommitIndex{
+			"commit-1": {"bv-a", "bv-b", "bv-missing"},
+			"commit-2": {"bv-a", "bv-missing"},
+			"":         {"bv-a", "bv-b"},
+			"  ":       {"bv-a", "bv-b"},
+		},
+	}
+
+	network := NewNetworkBuilder(report).BuildAt(time.Time{})
+	if len(network.Edges) != 1 {
+		t.Fatalf("shared-commit edges = %+v, want only the bv-a/bv-b edge", network.Edges)
+	}
+	edge := network.Edges[0]
+	if edge.FromBead != "bv-a" || edge.ToBead != "bv-b" || edge.Weight != 1 {
+		t.Fatalf("shared-commit edge = %+v, want bv-a/bv-b weight 1", edge)
+	}
+	if network.Stats.TotalEdges != 1 || network.Stats.Density != 1 {
+		t.Fatalf("dangling CommitIndex member affected stats: %+v", network.Stats)
+	}
+}
+
+func TestSharedCommitEdgeDetailsUseFullSHAs(t *testing.T) {
+	shaA := "abcdefg" + strings.Repeat("1", 33)
+	shaB := "abcdefg" + strings.Repeat("2", 33)
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-a": {BeadID: "bv-a", Status: "open"},
+			"bv-b": {BeadID: "bv-b", Status: "open"},
+		},
+		CommitIndex: CommitIndex{
+			shaA: {"bv-a", "bv-b"},
+			shaB: {"bv-a", "bv-b"},
+		},
+	}
+
+	network := NewNetworkBuilder(report).BuildAt(time.Time{})
+	if len(network.Edges) != 1 {
+		t.Fatalf("shared-commit edges = %+v, want one", network.Edges)
+	}
+	edge := network.Edges[0]
+	if edge.EdgeType != EdgeSharedCommit || edge.Weight != 2 {
+		t.Fatalf("shared-commit edge = %+v, want weight 2", edge)
+	}
+	if len(edge.Details) != 2 || edge.Details[0] != shaA || edge.Details[1] != shaB {
+		t.Fatalf("shared-commit details = %#v, want sorted full SHAs [%q %q]", edge.Details, shaA, shaB)
 	}
 }
 
@@ -701,7 +820,7 @@ func TestNetworkDensityCalculation(t *testing.T) {
 	maxEdges := n * (n - 1) / 2
 
 	if maxEdges > 0 {
-		expectedDensity := float64(network.Stats.TotalEdges) / float64(maxEdges)
+		expectedDensity := float64(len(networkPairs(network, 0))) / float64(maxEdges)
 		if network.Stats.Density < 0 || network.Stats.Density > 1 {
 			t.Errorf("Density should be between 0 and 1, got %f", network.Stats.Density)
 		}
@@ -710,6 +829,110 @@ func TestNetworkDensityCalculation(t *testing.T) {
 		if diff > 0.01 || diff < -0.01 {
 			t.Errorf("Expected density ~%f, got %f", expectedDensity, network.Stats.Density)
 		}
+	}
+}
+
+func TestGetSubNetworkRecomputesDerivedGraphState(t *testing.T) {
+	network := &ImpactNetwork{
+		GeneratedAt: time.Date(2026, 8, 26, 1, 2, 3, 0, time.UTC),
+		DataHash:    "source-hash",
+		Nodes: map[string]*NetworkNode{
+			"a": {BeadID: "a", Title: "A", Degree: 99, ClusterID: 7, Connectivity: 99},
+			"b": {BeadID: "b", Title: "B", Degree: 99, ClusterID: 7, Connectivity: 99},
+			"c": {BeadID: "c", Title: "C", Degree: 99, ClusterID: 7, Connectivity: 99},
+		},
+		Edges: []NetworkEdge{
+			{FromBead: "a", ToBead: "b", EdgeType: EdgeSharedCommit, Weight: 2},
+			{FromBead: "a", ToBead: "b", EdgeType: EdgeSharedFile, Weight: 1, Details: []string{"shared.go"}},
+			{FromBead: "b", ToBead: "c", EdgeType: EdgeSharedCommit, Weight: 2},
+		},
+		Clusters: []BeadCluster{{ClusterID: 7, BeadIDs: []string{"a", "b", "c"}}},
+	}
+
+	sub := network.GetSubNetwork("a", 1)
+	if len(sub.Nodes) != 2 || sub.Nodes["a"] == nil || sub.Nodes["b"] == nil {
+		t.Fatalf("subnetwork nodes = %#v, want a and b", sub.Nodes)
+	}
+	if sub.Nodes["a"].Degree != 1 || sub.Nodes["b"].Degree != 1 {
+		t.Fatalf("subnetwork retained full-network degree: a=%d b=%d", sub.Nodes["a"].Degree, sub.Nodes["b"].Degree)
+	}
+	if sub.Stats.TotalEdges != 2 || sub.Stats.Density != 1 || sub.Stats.MaxDegree != 1 {
+		t.Fatalf("subnetwork stats were not recomputed from its induced graph: %+v", sub.Stats)
+	}
+	if len(sub.Clusters) != 1 {
+		t.Fatalf("subnetwork clusters = %#v, want one recomputed cluster", sub.Clusters)
+	}
+	cluster := sub.Clusters[0]
+	if cluster.ClusterID != 0 || cluster.InternalEdges != 1 || cluster.InternalConnectivity != 1 || cluster.CentralBead != "a" {
+		t.Fatalf("subnetwork cluster retained stale/full-network state: %+v", cluster)
+	}
+	if len(cluster.SharedFiles) != 1 || cluster.SharedFiles[0] != "shared.go" {
+		t.Fatalf("subnetwork cluster lost available shared-file samples: %+v", cluster.SharedFiles)
+	}
+	for i := range sub.Edges {
+		if len(sub.Edges[i].Details) == 0 {
+			continue
+		}
+		sub.Edges[i].Details[0] = "caller-mutated.go"
+		for _, sourceEdge := range network.Edges {
+			if sourceEdge.EdgeType == EdgeSharedFile && sourceEdge.Details[0] != "shared.go" {
+				t.Fatalf("subnetwork edge details alias source network: %+v", sourceEdge.Details)
+			}
+		}
+		break
+	}
+	for _, beadID := range []string{"a", "b"} {
+		node := sub.Nodes[beadID]
+		if node.ClusterID != 0 || node.Connectivity != 1 {
+			t.Fatalf("subnetwork node %q derived state = %+v, want cluster 0/connectivity 1", beadID, node)
+		}
+	}
+}
+
+func TestGetSubNetworkIgnoresDanglingSharedFileEdges(t *testing.T) {
+	network := &ImpactNetwork{
+		Nodes: map[string]*NetworkNode{
+			"a": {BeadID: "a", Title: "A"},
+		},
+		Edges: []NetworkEdge{
+			{FromBead: "a", ToBead: "missing", EdgeType: EdgeSharedFile, Weight: 2, Details: []string{"secret.go"}},
+		},
+	}
+
+	sub := network.GetSubNetwork("a", 1)
+	if len(sub.Nodes) != 1 || sub.Nodes["a"] == nil {
+		t.Fatalf("subnetwork nodes = %#v, want only a", sub.Nodes)
+	}
+	if len(sub.Edges) != 0 || sub.Stats.TotalEdges != 0 || sub.Nodes["a"].Degree != 0 {
+		t.Fatalf("dangling edge leaked into subnetwork: edges=%#v stats=%+v node=%+v", sub.Edges, sub.Stats, sub.Nodes["a"])
+	}
+
+	if nilSub := (*ImpactNetwork)(nil).GetSubNetwork("a", 1); nilSub == nil || len(nilSub.Nodes) != 0 {
+		t.Fatalf("nil network subgraph = %#v, want a non-nil empty graph", nilSub)
+	}
+}
+
+func TestToResultHandlesNilNetworkAndNodes(t *testing.T) {
+	nilResult := (*ImpactNetwork)(nil).ToResult("", 1)
+	if nilResult == nil || nilResult.Network == nil || len(nilResult.Network.Nodes) != 0 {
+		t.Fatalf("nil network result = %#v, want a non-nil empty network", nilResult)
+	}
+
+	network := &ImpactNetwork{
+		Nodes: map[string]*NetworkNode{
+			"nil": nil,
+			"ok":  {BeadID: "ok", Degree: 1},
+		},
+	}
+	result := network.ToResult("", 1)
+	if len(result.TopConnected) != 1 || result.TopConnected[0].BeadID != "ok" {
+		t.Fatalf("top connected with nil node = %+v, want only ok", result.TopConnected)
+	}
+
+	builder := &NetworkBuilder{}
+	builder.calculateStats(network)
+	if network.Stats.TotalNodes != 1 || network.Stats.IsolatedNodes != 0 || network.Stats.MaxDegree != 1 {
+		t.Fatalf("stats with nil node = %+v, want one real degree-one node", network.Stats)
 	}
 }
 

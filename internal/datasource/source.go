@@ -6,11 +6,11 @@ package datasource
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 // SourceType identifies the type of data source
@@ -72,6 +72,11 @@ type DiscoveryOptions struct {
 	ValidateAfterDiscovery bool
 	// IncludeInvalid includes sources that failed validation in results
 	IncludeInvalid bool
+	// SkipWorktreeSources confines discovery to BeadsDir. Explicit BEADS_DB,
+	// BEADS_DIR, and --db directory selectors use this so a newer export under
+	// the caller's unrelated Git administrative directory cannot override the
+	// selected tracker authority.
+	SkipWorktreeSources bool
 	// Verbose enables detailed logging during discovery
 	Verbose bool
 	// Logger receives log messages when Verbose is true
@@ -106,23 +111,10 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 			return sources, nil
 		}
 
-		// Check BEADS_DB environment variable (can be file or directory)
-		if envDB := os.Getenv("BEADS_DB"); envDB != "" {
-			beadsDir = resolveBeadsDBPath(envDB)
-		} else if envDir := os.Getenv("BEADS_DIR"); envDir != "" {
-			// Check BEADS_DIR environment variable
-			beadsDir = envDir
-		} else {
-			// Use repo path or current directory
-			repoPath := opts.RepoPath
-			if repoPath == "" {
-				var err error
-				repoPath, err = os.Getwd()
-				if err != nil {
-					return nil, fmt.Errorf("failed to get current directory: %w", err)
-				}
-			}
-			beadsDir = filepath.Join(repoPath, ".beads")
+		var err error
+		beadsDir, err = loader.GetBeadsDir(opts.RepoPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve beads directory: %w", err)
 		}
 	}
 
@@ -134,24 +126,27 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 
 	// Discover SQLite database
 	sqliteSources, err := discoverSQLiteSources(beadsDir, opts)
-	if err != nil && opts.Verbose {
-		opts.Logger(fmt.Sprintf("SQLite discovery warning: %v", err))
+	if err != nil {
+		return nil, err
 	}
 	sources = append(sources, sqliteSources...)
 
 	// Discover local JSONL files
 	localSources, err := discoverLocalJSONLSources(beadsDir, opts)
-	if err != nil && opts.Verbose {
-		opts.Logger(fmt.Sprintf("Local JSONL discovery warning: %v", err))
+	if err != nil {
+		return nil, err
 	}
 	sources = append(sources, localSources...)
 
-	// Discover worktree JSONL files
-	worktreeSources, err := discoverWorktreeSources(opts.RepoPath, opts)
-	if err != nil && opts.Verbose {
-		opts.Logger(fmt.Sprintf("Worktree discovery warning: %v", err))
+	// Discover worktree JSONL files unless the caller selected a concrete
+	// tracker directory whose authority must remain self-contained.
+	if !opts.SkipWorktreeSources {
+		worktreeSources, err := discoverWorktreeSources(opts.RepoPath, opts)
+		if err != nil {
+			return nil, err
+		}
+		sources = append(sources, worktreeSources...)
 	}
-	sources = append(sources, worktreeSources...)
 
 	// Validate sources if requested
 	if opts.ValidateAfterDiscovery {
@@ -173,13 +168,8 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 		sources = validSources
 	}
 
-	// Sort by priority and mod time
-	sort.Slice(sources, func(i, j int) bool {
-		if sources[i].ModTime.Equal(sources[j].ModTime) {
-			return sources[i].Priority > sources[j].Priority
-		}
-		return sources[i].ModTime.After(sources[j].ModTime)
-	})
+	// Use the same deterministic authority order as selection and loading.
+	sortByFreshnessThenPriority(sources)
 
 	if opts.Verbose {
 		opts.Logger(fmt.Sprintf("Discovered %d sources", len(sources)))
@@ -213,17 +203,34 @@ func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource
 	// Look for beads.db
 	dbPath := filepath.Join(beadsDir, "beads.db")
 	info, err := os.Stat(dbPath)
-	if err == nil {
-		sources = append(sources, DataSource{
-			Type:     SourceTypeSQLite,
-			Path:     dbPath,
-			Priority: PrioritySQLite,
-			ModTime:  info.ModTime(),
-			Size:     info.Size(),
-		})
-		if opts.Verbose {
-			opts.Logger(fmt.Sprintf("Found SQLite: %s (mod=%s)", dbPath, info.ModTime().Format(time.RFC3339)))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
 		}
+		return nil, fmt.Errorf("stat SQLite source %s: %w", dbPath, err)
+	}
+	// In WAL mode, a committed transaction can advance beads.db-wal while the
+	// main database file keeps its older checkpoint timestamp. Treat the newest
+	// of the pair as SQLite's freshness or smart selection can receive a WAL
+	// watcher event and still choose an older JSONL export.
+	modTime := info.ModTime()
+	walPath := dbPath + "-wal"
+	if walInfo, walErr := os.Stat(walPath); walErr == nil {
+		if walInfo.ModTime().After(modTime) {
+			modTime = walInfo.ModTime()
+		}
+	} else if !os.IsNotExist(walErr) {
+		return nil, fmt.Errorf("stat SQLite WAL source %s: %w", walPath, walErr)
+	}
+	sources = append(sources, DataSource{
+		Type:     SourceTypeSQLite,
+		Path:     dbPath,
+		Priority: PrioritySQLite,
+		ModTime:  modTime,
+		Size:     info.Size(),
+	})
+	if opts.Verbose {
+		opts.Logger(fmt.Sprintf("Found SQLite: %s (mod=%s)", dbPath, modTime.Format(time.RFC3339)))
 	}
 
 	return sources, nil
@@ -262,7 +269,7 @@ func discoverLocalJSONLSources(beadsDir string, opts DiscoveryOptions) ([]DataSo
 		path := filepath.Join(beadsDir, name)
 		info, err := e.Info()
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("stat JSONL source %s: %w", path, err)
 		}
 
 		sources = append(sources, DataSource{
@@ -291,24 +298,23 @@ func discoverWorktreeSources(repoPath string, opts DiscoveryOptions) ([]DataSour
 		}
 	}
 
-	// Find git directory
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
-	cmd.Dir = repoPath
-	out, err := cmd.Output()
+	// Resolve the Git directory through the loader's repository-pinned command
+	// path. Ambient GIT_DIR/GIT_WORK_TREE values must not redirect discovery to
+	// another repository's issue exports.
+	gitDir, err := loader.GetGitDir(repoPath)
 	if err != nil {
 		// Not a git repository
 		return nil, nil
-	}
-	gitDir := strings.TrimSpace(string(out))
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(repoPath, gitDir)
 	}
 
 	// Look for beads-worktrees directory
 	worktreesDir := filepath.Join(gitDir, "beads-worktrees")
 	if _, err := os.Stat(worktreesDir); err != nil {
-		// No worktrees directory
-		return nil, nil
+		if os.IsNotExist(err) {
+			// No worktrees directory
+			return nil, nil
+		}
+		return nil, fmt.Errorf("stat beads worktrees directory %s: %w", worktreesDir, err)
 	}
 
 	var sources []DataSource
@@ -330,7 +336,10 @@ func discoverWorktreeSources(repoPath string, opts DiscoveryOptions) ([]DataSour
 		jsonlPath := filepath.Join(wtDir, "issues.jsonl")
 		info, err := os.Stat(jsonlPath)
 		if err != nil {
-			continue
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("stat worktree JSONL source %s: %w", jsonlPath, err)
 		}
 
 		sources = append(sources, DataSource{

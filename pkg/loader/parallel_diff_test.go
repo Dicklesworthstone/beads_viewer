@@ -3,6 +3,7 @@ package loader
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,56 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func TestReadParallelCandidateBoundedRestoresOffsetWhenLimitExceeded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "candidate.jsonl")
+	if err := os.WriteFile(path, []byte("abcdef"), 0o600); err != nil {
+		t.Fatalf("write candidate: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open candidate: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Seek(1, io.SeekStart); err != nil {
+		t.Fatalf("position candidate: %v", err)
+	}
+
+	data, withinLimit, err := readParallelCandidateBounded(f, 4)
+	if err != nil {
+		t.Fatalf("bounded candidate read: %v", err)
+	}
+	if withinLimit || data != nil {
+		t.Fatalf("over-limit candidate = %q, withinLimit=%v; want serial fallback", data, withinLimit)
+	}
+	next := make([]byte, 1)
+	if _, err := io.ReadFull(f, next); err != nil {
+		t.Fatalf("read after fallback: %v", err)
+	}
+	if string(next) != "b" {
+		t.Fatalf("file offset was not restored: next byte = %q, want b", next)
+	}
+}
+
+func TestReadParallelCandidateBoundedAcceptsInputAtLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "candidate.jsonl")
+	if err := os.WriteFile(path, []byte("abcd"), 0o600); err != nil {
+		t.Fatalf("write candidate: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open candidate: %v", err)
+	}
+	defer f.Close()
+
+	data, withinLimit, err := readParallelCandidateBounded(f, 4)
+	if err != nil {
+		t.Fatalf("bounded candidate read: %v", err)
+	}
+	if !withinLimit || string(data) != "abcd" {
+		t.Fatalf("at-limit candidate = %q, withinLimit=%v", data, withinLimit)
+	}
+}
 
 // parseSerial runs the loader's serial path on data by feeding it through a
 // *bytes.Reader (which is not *os.File, so parseIssuesWithOptions never takes
@@ -312,6 +363,52 @@ func TestParallelDiff_WarningAndFilterCallbacksObserveSourceOrder(t *testing.T) 
 	}
 }
 
+func TestOverLimitLineIsCountedAsDroppedRecordOnSerialAndParallelPaths(t *testing.T) {
+	const lineLimit = 128
+	data := []byte(strings.Repeat("x", lineLimit) + "\n" +
+		`{"id":"kept","title":"Kept","status":"open","issue_type":"task"}` + "\n")
+
+	run := func(parallel bool) ([]model.Issue, ParseStats, []string) {
+		t.Helper()
+		var stats ParseStats
+		var warnings []string
+		opts := ParseOptions{
+			BufferSize: lineLimit,
+			Stats:      &stats,
+			WarningHandler: func(message string) {
+				if stats.Errors != 1 {
+					t.Fatalf("parallel=%v: over-limit warning observed errors=%d, want 1", parallel, stats.Errors)
+				}
+				warnings = append(warnings, message)
+			},
+		}
+		var issues []model.Issue
+		var err error
+		if parallel {
+			issues, _, err = parseIssuesParallel(data, opts, false, lineLimit)
+		} else {
+			issues, _, err = parseIssuesWithOptions(bytes.NewReader(data), opts, false)
+		}
+		if err != nil {
+			t.Fatalf("parallel=%v: parse error: %v", parallel, err)
+		}
+		return issues, stats, warnings
+	}
+
+	serialIssues, serialStats, serialWarnings := run(false)
+	parallelIssues, parallelStats, parallelWarnings := run(true)
+	wantStats := ParseStats{Valid: 1, Errors: 1}
+	if !reflect.DeepEqual(serialIssues, parallelIssues) || len(serialIssues) != 1 || serialIssues[0].ID != "kept" {
+		t.Fatalf("serial/parallel retained issues differ: serial=%+v parallel=%+v", serialIssues, parallelIssues)
+	}
+	if serialStats != wantStats || parallelStats != wantStats {
+		t.Fatalf("over-limit accounting: serial=%+v parallel=%+v want=%+v", serialStats, parallelStats, wantStats)
+	}
+	if !reflect.DeepEqual(serialWarnings, parallelWarnings) || len(serialWarnings) != 1 || !strings.Contains(serialWarnings[0], "line too long") {
+		t.Fatalf("over-limit warnings differ: serial=%v parallel=%v", serialWarnings, parallelWarnings)
+	}
+}
+
 func TestParallelDiff_DuplicateWarningObservesReclassifiedStats(t *testing.T) {
 	data := []byte(
 		`{"id":"dup","title":"First","status":"open","issue_type":"task","priority":1}` + "\n" +
@@ -364,6 +461,7 @@ func TestParallelDiff_LineCapacityBoundaries(t *testing.T) {
 		{name: "crlf accepted when terminator fits", data: []byte(strings.Repeat("x", 14) + "\r\n"), bufferSize: 16},
 		{name: "crlf rejected when cr fills cap", data: []byte(strings.Repeat("x", 15) + "\r\n"), bufferSize: 16},
 		{name: "sub-minimum buffer uses bufio floor", data: []byte(strings.Repeat("x", 15) + "\n"), bufferSize: 1},
+		{name: "whitespace-only lines are ignored", data: []byte("   \n\t\r\n"), bufferSize: 16},
 	}
 
 	for _, tc := range tests {

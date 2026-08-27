@@ -4,17 +4,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/datasource"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/export"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/workspace"
 	flag "github.com/spf13/pflag"
 )
 
@@ -38,6 +43,88 @@ func runCommandWithTimeout(t *testing.T, dir, exe string, args ...string) (strin
 	}
 
 	return stdout.String(), stderr.String(), err
+}
+
+func writeCurrentBRMetadata(t *testing.T, beadsDir string) {
+	t.Helper()
+	metadata := []byte(`{"database":"beads.db","jsonl_export":"issues.jsonl"}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0o644); err != nil {
+		t.Fatalf("write current-br metadata: %v", err)
+	}
+}
+
+func TestExplicitSingleRepoRepositoryRouteUnavailableReasons(t *testing.T) {
+	tests := []struct {
+		name     string
+		dbFlag   string
+		beadsDB  string
+		beadsDir string
+		wantText string
+		wantGap  bool
+	}{
+		{name: "automatic discovery is routed", wantGap: false},
+		{name: "db flag", dbFlag: "/other/.beads/issues.jsonl", wantText: "--db", wantGap: true},
+		{name: "BEADS_DB", beadsDB: "/other/.beads/issues.jsonl", wantText: "BEADS_DB", wantGap: true},
+		{name: "BEADS_DIR", beadsDir: "/other/.beads", wantText: "BEADS_DIR", wantGap: true},
+		{name: "flag wins over inherited env", dbFlag: "/flag/.beads/issues.jsonl", beadsDB: "/env/.beads/issues.jsonl", beadsDir: "/env/.beads", wantText: "--db", wantGap: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(loader.BeadsDBEnvVar, tt.beadsDB)
+			t.Setenv(loader.BeadsDirEnvVar, tt.beadsDir)
+			reasons := explicitSingleRepoRepositoryRouteUnavailableReasons(tt.dbFlag)
+			if (len(reasons) > 0) != tt.wantGap {
+				t.Fatalf("reasons = %v, want gap %v", reasons, tt.wantGap)
+			}
+			if tt.wantText != "" && !strings.Contains(strings.Join(reasons, "; "), tt.wantText) {
+				t.Fatalf("reasons = %v, want selector %q", reasons, tt.wantText)
+			}
+		})
+	}
+}
+
+func TestSingleRepoWatchSiblingFilesTracksCanonicalAuthorityChanges(t *testing.T) {
+	t.Setenv(loader.BeadsDBEnvVar, "")
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+	path := filepath.Join(beadsDir, "issues.jsonl")
+	got := make(map[string]bool)
+	for _, name := range singleRepoWatchSiblingFiles(path) {
+		got[name] = true
+	}
+	for _, want := range []string{"beads.db", "beads.db-wal", "issues.jsonl", "beads.jsonl", "beads.base.jsonl"} {
+		if !got[want] {
+			t.Fatalf("watch siblings = %v, missing %q", got, want)
+		}
+	}
+
+	t.Setenv(loader.BeadsDBEnvVar, path)
+	if explicit := singleRepoWatchSiblingFiles(path); len(explicit) != 0 {
+		t.Fatalf("explicit source broadened into sibling watch: %v", explicit)
+	}
+}
+
+func requireReadableCPUProfile(t *testing.T, exe, profilePath string) {
+	t.Helper()
+
+	profileInfo, err := os.Stat(profilePath)
+	if err != nil {
+		t.Fatalf("stat CPU profile: %v", err)
+	}
+	if profileInfo.Size() == 0 {
+		t.Fatal("CPU profile is empty; profiling was not finalized before process exit")
+	}
+
+	pprofCmd := exec.Command("go", "tool", "pprof", "-top", exe, profilePath)
+	pprofOutput, err := pprofCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read CPU profile with go tool pprof: %v\n%s", err, pprofOutput)
+	}
+	if !bytes.Contains(pprofOutput, []byte("Type: cpu")) {
+		t.Fatalf("go tool pprof did not identify a CPU profile:\n%s", pprofOutput)
+	}
 }
 
 func TestFilterByRepo_CaseInsensitiveAndFlexibleSeparators(t *testing.T) {
@@ -65,6 +152,82 @@ func TestFilterByRepo_CaseInsensitiveAndFlexibleSeparators(t *testing.T) {
 		if len(got) != tt.expected {
 			t.Errorf("filterByRepo(%q) = %d issues, want %d", tt.filter, len(got), tt.expected)
 		}
+	}
+}
+
+func TestWorkspaceParseAuthorityGapReasonsAreDeterministicAndSuccessfulRepoOnly(t *testing.T) {
+	results := []workspace.LoadResult{
+		{RepoName: "zeta", ParseStats: loader.ParseStats{Valid: 2, Errors: 3}},
+		{RepoName: "failed", ParseStats: loader.ParseStats{Errors: 9}, Error: errors.New("missing repository")},
+		{RepoName: "clean", ParseStats: loader.ParseStats{Valid: 1}},
+		{RepoName: "alpha", ParseStats: loader.ParseStats{Valid: 4, Errors: 1}},
+	}
+
+	got := workspaceParseAuthorityGapReasons(results)
+	want := []string{`workspace JSONL parsing dropped records (repository=count): "alpha"=1, "zeta"=3`}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("workspace authority reasons = %v, want %v", got, want)
+	}
+	if got := workspaceParseAuthorityGapReasons([]workspace.LoadResult{{RepoName: "clean"}}); got != nil {
+		t.Fatalf("clean workspace authority reasons = %v, want nil", got)
+	}
+
+	ambiguous := []workspace.LoadResult{
+		{RepoName: "api=old, web", RepoPath: "repos/one", ParseStats: loader.ParseStats{Errors: 2}},
+		{RepoName: "api=old, web", RepoPath: "repos/two", Error: errors.New("unavailable")},
+	}
+	if got := workspaceParseAuthorityGapReasons(ambiguous); !reflect.DeepEqual(got,
+		[]string{`workspace JSONL parsing dropped records (repository=count): "api=old, web" (path "repos/one")=2`}) {
+		t.Fatalf("delimited repository parse diagnostic is ambiguous: %v", got)
+	}
+	if got := workspaceFailedAuthorityGapReasons(ambiguous); !reflect.DeepEqual(got,
+		[]string{`workspace failed to load 1 configured repository: "api=old, web" (path "repos/two")`}) {
+		t.Fatalf("delimited repository failure diagnostic is ambiguous: %v", got)
+	}
+}
+
+func TestWorkspaceWatchReloadAuthorityErrorRejectsIncompleteSnapshots(t *testing.T) {
+	clean := []workspace.LoadResult{{RepoName: "api", ParseStats: loader.ParseStats{Valid: 2}}}
+	if err := workspaceWatchReloadAuthorityError(clean); err != nil {
+		t.Fatalf("clean workspace reload rejected: %v", err)
+	}
+
+	tests := []struct {
+		name     string
+		results  []workspace.LoadResult
+		wantText string
+	}{
+		{
+			name:     "repository failed",
+			results:  []workspace.LoadResult{{RepoName: "api", Error: errors.New("unavailable")}},
+			wantText: "failed to load 1 configured repository",
+		},
+		{
+			name:     "records dropped",
+			results:  []workspace.LoadResult{{RepoName: "api", ParseStats: loader.ParseStats{Valid: 2, Errors: 1}}},
+			wantText: "JSONL parsing dropped records",
+		},
+		{
+			name: "source fallback",
+			results: []workspace.LoadResult{{
+				RepoName:          "api",
+				ParseStats:        loader.ParseStats{Valid: 2},
+				AuthorityWarnings: []string{"using stale compatibility export"},
+			}},
+			wantText: "source authority is incomplete",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := workspaceWatchReloadAuthorityError(tt.results)
+			if err == nil {
+				t.Fatal("incomplete workspace reload accepted")
+			}
+			if got := err.Error(); !strings.Contains(got, "retaining the previous export") || !strings.Contains(got, tt.wantText) {
+				t.Fatalf("reload error = %q, want retention message containing %q", got, tt.wantText)
+			}
+		})
 	}
 }
 
@@ -122,7 +285,7 @@ func TestRobotFlagsOutputJSON(t *testing.T) {
 	}
 }
 
-func TestRobotCPUProfileFinalizedBeforeExit(t *testing.T) {
+func TestCPUProfileFinalizedBeforeCommandExit(t *testing.T) {
 	tmpDir := t.TempDir()
 	writeTestBeadsFixture(t, tmpDir)
 	exe := buildTestBinary(t)
@@ -144,22 +307,41 @@ func TestRobotCPUProfileFinalizedBeforeExit(t *testing.T) {
 			t.Fatalf("profiled robot command returned invalid JSON: %s", stdout)
 		}
 
-		profileInfo, err := os.Stat(profilePath)
-		if err != nil {
-			t.Fatalf("stat CPU profile: %v", err)
-		}
-		if profileInfo.Size() == 0 {
-			t.Fatal("CPU profile is empty; profiling was not finalized before process exit")
-		}
+		requireReadableCPUProfile(t, exe, profilePath)
+	})
 
-		pprofCmd := exec.Command("go", "tool", "pprof", "-top", exe, profilePath)
-		pprofOutput, err := pprofCmd.CombinedOutput()
+	t.Run("preview error unwinds profile defer", func(t *testing.T) {
+		profilePath := filepath.Join(t.TempDir(), "preview-cpu.pprof")
+		missingBundle := filepath.Join(t.TempDir(), "missing-pages-bundle")
+		stdout, stderr, err := runCommandWithTimeout(
+			t,
+			tmpDir,
+			exe,
+			"--cpu-profile", profilePath,
+			"--preview-pages", missingBundle,
+		)
+		if err == nil {
+			t.Fatalf("missing preview bundle unexpectedly succeeded\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+		}
+		if !strings.Contains(stderr, "Error starting preview server") {
+			t.Fatalf("missing preview error diagnostic\nstderr:\n%s", stderr)
+		}
+		requireReadableCPUProfile(t, exe, profilePath)
+	})
+
+	t.Run("direct exit command finalizes profile", func(t *testing.T) {
+		profilePath := filepath.Join(t.TempDir(), "agents-check-cpu.pprof")
+		stdout, stderr, err := runCommandWithTimeout(
+			t,
+			tmpDir,
+			exe,
+			"--cpu-profile", profilePath,
+			"--agents-check",
+		)
 		if err != nil {
-			t.Fatalf("read CPU profile with go tool pprof: %v\n%s", err, pprofOutput)
+			t.Fatalf("profiled direct-exit command failed: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
 		}
-		if !bytes.Contains(pprofOutput, []byte("Type: cpu")) {
-			t.Fatalf("go tool pprof did not identify a CPU profile:\n%s", pprofOutput)
-		}
+		requireReadableCPUProfile(t, exe, profilePath)
 	})
 
 	t.Run("invalid destination fails before success output", func(t *testing.T) {
@@ -312,6 +494,192 @@ func TestResolveSingleRepoWatchFile_RespectsExplicitBeadsDBFile(t *testing.T) {
 	requireString(t, got, dbPath)
 }
 
+func TestResolveSingleRepoWatchFileReusesLastSuccessfulSource(t *testing.T) {
+	t.Setenv(loader.BeadsDBEnvVar, "")
+	t.Setenv(loader.BeadsDirEnvVar, "")
+	t.Setenv("BV_ROBOT", "1")
+
+	repoDir := t.TempDir()
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+	selectedPath := filepath.Join(beadsDir, "issues.jsonl")
+	writeIssueJSONL(t, selectedPath, "SELECTED-1")
+	invalidPath := filepath.Join(beadsDir, "fresher-invalid.jsonl")
+	if err := os.WriteFile(invalidPath, []byte("{not-json}\n"), 0o644); err != nil {
+		t.Fatalf("write invalid JSONL candidate: %v", err)
+	}
+	older := time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC)
+	newer := older.Add(time.Hour)
+	if err := os.Chtimes(selectedPath, older, older); err != nil {
+		t.Fatalf("age selected source: %v", err)
+	}
+	if err := os.Chtimes(invalidPath, newer, newer); err != nil {
+		t.Fatalf("freshen invalid source: %v", err)
+	}
+
+	sources, err := datasource.DiscoverSources(datasource.DiscoveryOptions{
+		BeadsDir:               beadsDir,
+		RepoPath:               repoDir,
+		ValidateAfterDiscovery: false,
+	})
+	if err != nil {
+		t.Fatalf("discover watcher fixture: %v", err)
+	}
+	if len(sources) < 2 || sources[0].Path != invalidPath {
+		t.Fatalf("fixture did not make naive rediscovery choose invalid source: %+v", sources)
+	}
+	issues, err := datasource.LoadIssues(repoDir)
+	if err != nil {
+		t.Fatalf("load watcher fixture: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "SELECTED-1" {
+		t.Fatalf("loaded issues = %+v, want SELECTED-1", issues)
+	}
+
+	watchFile, err := resolveSingleRepoWatchFile(repoDir)
+	if err != nil {
+		t.Fatalf("resolveSingleRepoWatchFile: %v", err)
+	}
+	requireString(t, watchFile, selectedPath)
+}
+
+func TestSingleRepoTrackerAuthorityRequiresAffirmativeCurrentBRMetadata(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		selectedBase string
+		metadata     string
+		markBD       bool
+		wantReason   string
+	}{
+		{name: "canonical SQLite declared by real metadata", selectedBase: "beads.db", metadata: `{"database":"beads.db","jsonl_export":"issues.jsonl"}`},
+		{name: "canonical issues JSONL declared by real metadata", selectedBase: "issues.jsonl", metadata: `{"database":"beads.db","jsonl_export":"issues.jsonl"}`},
+		{name: "missing selected source", metadata: `{"database":"beads.db","jsonl_export":"issues.jsonl"}`, wantReason: "could not be resolved"},
+		{name: "missing metadata", selectedBase: "issues.jsonl", wantReason: "metadata"},
+		{name: "malformed metadata", selectedBase: "issues.jsonl", metadata: `{not-json}`, wantReason: "metadata"},
+		{name: "metadata without source declarations", selectedBase: "issues.jsonl", metadata: `{}`, wantReason: "metadata"},
+		{name: "mismatched declaration", selectedBase: "issues.jsonl", metadata: `{"jsonl_export":"other.jsonl"}`, wantReason: "metadata"},
+		{name: "ambiguous database declaration for JSONL", selectedBase: "issues.jsonl", metadata: `{"database":"issues.jsonl"}`, wantReason: "metadata"},
+		{name: "ambiguous JSONL declaration for SQLite", selectedBase: "beads.db", metadata: `{"jsonl_export":"beads.db"}`, wantReason: "metadata"},
+		{name: "legacy JSONL remains diagnostic even when declared", selectedBase: "beads.jsonl", metadata: `{"jsonl_export":"beads.jsonl"}`, wantReason: "canonical"},
+		{name: "arbitrary JSONL remains diagnostic even when declared", selectedBase: "custom.jsonl", metadata: `{"jsonl_export":"custom.jsonl"}`, wantReason: "canonical"},
+		{name: "Dolt backend is not current br authority", selectedBase: "issues.jsonl", metadata: `{"backend":"dolt","jsonl_export":"issues.jsonl"}`, wantReason: "Dolt"},
+		{name: "bd Dolt marker overrides current-looking metadata", selectedBase: "issues.jsonl", metadata: `{"jsonl_export":"issues.jsonl"}`, markBD: true, wantReason: "bd/Dolt workspace detected"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			beadsDir := t.TempDir()
+			if test.metadata != "" {
+				if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(test.metadata), 0o644); err != nil {
+					t.Fatalf("write metadata fixture: %v", err)
+				}
+			}
+			if test.markBD {
+				if err := os.Mkdir(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+					t.Fatalf("mark bd/Dolt workspace: %v", err)
+				}
+			}
+			selectedPath := ""
+			if test.selectedBase != "" {
+				selectedPath = filepath.Join(beadsDir, test.selectedBase)
+				if err := os.WriteFile(selectedPath, nil, 0o644); err != nil {
+					t.Fatalf("write selected-source fixture: %v", err)
+				}
+			}
+			reasons := singleRepoTrackerAuthorityUnavailableReasons(beadsDir, selectedPath)
+			if test.wantReason == "" {
+				if len(reasons) != 0 {
+					t.Fatalf("affirmatively declared current-br source rejected: %v", reasons)
+				}
+				return
+			}
+			if len(reasons) == 0 || !strings.Contains(strings.Join(reasons, "; "), test.wantReason) {
+				t.Fatalf("tracker authority reasons = %v, want %q", reasons, test.wantReason)
+			}
+		})
+	}
+}
+
+func TestSingleRepoTrackerAuthorityRejectsSymlinkedAuthorityFiles(t *testing.T) {
+	t.Run("selected source", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		writeCurrentBRMetadata(t, beadsDir)
+		outside := filepath.Join(t.TempDir(), "outside.jsonl")
+		if err := os.WriteFile(outside, nil, 0o644); err != nil {
+			t.Fatalf("write outside source: %v", err)
+		}
+		selected := filepath.Join(beadsDir, "issues.jsonl")
+		if err := os.Symlink(outside, selected); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		reasons := singleRepoTrackerAuthorityUnavailableReasons(beadsDir, selected)
+		if len(reasons) == 0 || !strings.Contains(strings.Join(reasons, "; "), "non-symlink") {
+			t.Fatalf("symlinked selected source was accepted: %v", reasons)
+		}
+	})
+
+	t.Run("metadata", func(t *testing.T) {
+		beadsDir := t.TempDir()
+		selected := filepath.Join(beadsDir, "issues.jsonl")
+		if err := os.WriteFile(selected, nil, 0o644); err != nil {
+			t.Fatalf("write selected source: %v", err)
+		}
+		outsideMetadata := filepath.Join(t.TempDir(), "metadata.json")
+		if err := os.WriteFile(outsideMetadata, []byte(`{"jsonl_export":"issues.jsonl"}`), 0o644); err != nil {
+			t.Fatalf("write outside metadata: %v", err)
+		}
+		if err := os.Symlink(outsideMetadata, filepath.Join(beadsDir, "metadata.json")); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		reasons := singleRepoTrackerAuthorityUnavailableReasons(beadsDir, selected)
+		if len(reasons) == 0 || !strings.Contains(strings.Join(reasons, "; "), "non-symlink") {
+			t.Fatalf("symlinked metadata was accepted: %v", reasons)
+		}
+	})
+}
+
+func TestEmitScriptIsInspectOnly(t *testing.T) {
+	t.Setenv(loader.BeadsDBEnvVar, "")
+	t.Setenv(loader.BeadsDirEnvVar, "")
+	t.Setenv("SOURCE_DATE_EPOCH", "1787745600")
+	t.Setenv("BV_NO_CACHE", "1")
+
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(`{"id":"READY-1","title":"Ready work","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write issues: %v", err)
+	}
+	writeCurrentBRMetadata(t, beadsDir)
+
+	exe := buildTestBinary(t)
+	stdout, stderr, err := runCommandWithTimeout(t, dir, exe, "--emit-script", "--script-limit=1")
+	if err != nil {
+		t.Fatalf("emit inspect-only script: %v\nstdout:\n%s\nstderr:\n%s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "inspect-only") {
+		t.Fatalf("script does not identify its non-mutating behavior:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "# To claim: br update READY-1 --status=in_progress") {
+		t.Fatalf("script omitted the commented opt-in claim command:\n%s", stdout)
+	}
+
+	var executable []string
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		executable = append(executable, line)
+	}
+	wantExecutable := []string{"set -euo pipefail", "br show READY-1"}
+	if !reflect.DeepEqual(executable, wantExecutable) {
+		t.Fatalf("executable script lines = %q, want inspect-only %q\n%s", executable, wantExecutable, stdout)
+	}
+}
+
 func TestResolvePagesSource_RespectsExplicitBeadsDBFile(t *testing.T) {
 	beadsDir := t.TempDir()
 	selectedPath := filepath.Join(beadsDir, "selected.jsonl")
@@ -459,6 +827,18 @@ func TestRobotNowHonorsSourceDateEpoch(t *testing.T) {
 	t.Setenv("SOURCE_DATE_EPOCH", "1234567890")
 	requireString(t, robotNow().Format(time.RFC3339), "2009-02-13T23:31:30Z")
 	requireString(t, NewRobotEnvelope("hash").GeneratedAt, "2009-02-13T23:31:30Z")
+}
+
+func TestRobotNowRejectsUnencodableSourceDateEpoch(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "9223372036854775807")
+
+	if sourceDateEpochActive() {
+		t.Fatal("unencodable SOURCE_DATE_EPOCH should not activate the pinned robot clock")
+	}
+	got := robotNow()
+	if _, err := json.Marshal(got); err != nil {
+		t.Fatalf("robotNow() fallback %v is not JSON encodable: %v", got, err)
+	}
 }
 
 func TestAgentIntentArgRewrite(t *testing.T) {
@@ -658,6 +1038,28 @@ func TestAgentIntentArgRewrite(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			requireArgs(t, rewriteAgentIntentArgs(tt.args), tt.want)
 		})
+	}
+}
+
+func TestShellScriptFieldsRejectCommandInjection(t *testing.T) {
+	comment := shellCommentText("title\nprintf ignored\x00\tend")
+	if strings.ContainsAny(comment, "\r\n\x00\t") {
+		t.Fatalf("shell comment retained a control character: %q", comment)
+	}
+	if comment != "title printf ignored  end" {
+		t.Fatalf("shell comment = %q, want single inert line", comment)
+	}
+	if got := shellCommentText("reason\\"); got != "reason\\ " {
+		t.Fatalf("trailing-backslash comment = %q, want newline-stable comment text", got)
+	}
+
+	if got, ok := shellCommandBeadID("team's item"); !ok || got != "'team'\\''s item'" {
+		t.Fatalf("quoted bead ID = (%q, %v), want safe single-quoted word", got, ok)
+	}
+	for _, id := range []string{"--help", "READY-1\nprintf ignored", "READY-1\x00ignored"} {
+		if got, ok := shellCommandBeadID(id); ok || got != "" {
+			t.Fatalf("unsafe bead ID %q encoded as (%q, %v)", id, got, ok)
+		}
 	}
 }
 
@@ -915,6 +1317,62 @@ func TestRobotSchemaCoversDocumentedRobotCommands(t *testing.T) {
 	}
 }
 
+func TestIssueBackedRobotSchemasExposeSourceEvidence(t *testing.T) {
+	schemas := generateRobotSchemas()
+	evidenceFields := []string{
+		"load_stats",
+		"authority_incomplete_reasons",
+		"repository_route_unavailable_reasons",
+		"as_of",
+		"as_of_commit",
+		"analysis_time",
+	}
+	envelopeProperties := requireNestedSchemaProperties(t, schemas.Envelope, "robot envelope")
+	for _, field := range evidenceFields {
+		if envelopeProperties[field] == nil {
+			t.Fatalf("common robot envelope schema missing source evidence property %q", field)
+		}
+	}
+	for command, doc := range robotCommandDocs() {
+		if !doc.NeedsIssues {
+			continue
+		}
+		properties := requireRobotSchemaProperties(t, schemas, command)
+		for _, field := range evidenceFields {
+			if properties[field] == nil {
+				t.Fatalf("%s schema missing source evidence property %q", command, field)
+			}
+		}
+	}
+}
+
+func TestRobotPlanAndInsightsSchemasMatchRuntimeShapes(t *testing.T) {
+	schemas := generateRobotSchemas()
+	planProperties := requireRobotSchemaProperties(t, schemas, "robot-plan")
+	plan := requireNestedSchemaProperties(t, planProperties["plan"], "robot-plan plan")
+	for _, field := range []string{"tracks", "total_actionable", "total_blocked", "summary"} {
+		if plan[field] == nil {
+			t.Fatalf("robot-plan plan schema missing %q", field)
+		}
+	}
+	if plan["phases"] != nil {
+		t.Fatalf("robot-plan schema still documents nonexistent phases")
+	}
+
+	insights := requireRobotSchemaProperties(t, schemas, "robot-insights")
+	for _, field := range []string{"analysis_config", "full_stats", "top_what_ifs", "ClusterDensity", "Cores", "Slack", "status"} {
+		if insights[field] == nil {
+			t.Fatalf("robot-insights schema missing %q", field)
+		}
+	}
+	for _, field := range []string{"Cores", "Slack"} {
+		property, ok := insights[field].(map[string]interface{})
+		if !ok || property["type"] != "array" {
+			t.Fatalf("robot-insights %s schema type = %v, want array", field, property["type"])
+		}
+	}
+}
+
 func TestRobotCapabilitiesSchemaDocumentsCommandMetadata(t *testing.T) {
 	schemas := generateRobotSchemas()
 	schema := schemas.Commands["robot-capabilities"]
@@ -1030,6 +1488,87 @@ func TestRobotSearchSchemaMatchesHandlerOutput(t *testing.T) {
 	}
 }
 
+func TestSearchExactIDPromotionTreatsIssueIDsAsOpaque(t *testing.T) {
+	query := "bv-9gf.3"
+	textResults := []search.SearchResult{
+		{IssueID: "bv-other", Score: 0.9},
+		{IssueID: query, Score: 0.1},
+	}
+	promotedText := promoteExactSearchResult(query, textResults)
+	if promotedText[0].IssueID != query || promotedText[1].IssueID != "bv-other" {
+		t.Fatalf("text exact-ID promotion = %+v", promotedText)
+	}
+
+	hybridResults := []search.HybridScore{
+		{IssueID: "bv-other", FinalScore: 0.9},
+		{IssueID: query, FinalScore: 0.1},
+	}
+	promotedHybrid := promoteExactHybridResult(query, hybridResults)
+	if promotedHybrid[0].IssueID != query || promotedHybrid[1].IssueID != "bv-other" {
+		t.Fatalf("hybrid exact-ID promotion = %+v", promotedHybrid)
+	}
+}
+
+func TestSearchExactIDPromotionRejectsAmbiguousCaseFold(t *testing.T) {
+	textResults := []search.SearchResult{
+		{IssueID: "other", Score: 0.9},
+		{IssueID: "ABC", Score: 0.2},
+		{IssueID: "abc", Score: 0.1},
+	}
+	promotedText := promoteExactSearchResult("AbC", textResults)
+	if promotedText[0].IssueID != "other" {
+		t.Fatalf("ambiguous folded text match was promoted: %+v", promotedText)
+	}
+	promotedText = promoteExactSearchResult("abc", textResults)
+	if promotedText[0].IssueID != "abc" {
+		t.Fatalf("exact-case text match was not promoted: %+v", promotedText)
+	}
+
+	hybridResults := []search.HybridScore{
+		{IssueID: "other", FinalScore: 0.9},
+		{IssueID: "ABC", FinalScore: 0.2},
+		{IssueID: "abc", FinalScore: 0.1},
+	}
+	promotedHybrid := promoteExactHybridResult("AbC", hybridResults)
+	if promotedHybrid[0].IssueID != "other" {
+		t.Fatalf("ambiguous folded hybrid match was promoted: %+v", promotedHybrid)
+	}
+	promotedHybrid = promoteExactHybridResult("abc", hybridResults)
+	if promotedHybrid[0].IssueID != "abc" {
+		t.Fatalf("exact-case hybrid match was not promoted: %+v", promotedHybrid)
+	}
+}
+
+func TestLoadIssuesFromBeadsDirMetadataJSONLExcludesTombstones(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	content := strings.Join([]string{
+		`{"id":"LIVE-1","title":"Live","status":"open","issue_type":"task"}`,
+		`{"id":"OLD-1","title":"Deleted","status":"tombstone","issue_type":"task"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(issuesPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write issues: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(beadsDir, "metadata.json"),
+		[]byte(`{"jsonl_export":"issues.jsonl"}`),
+		0o644,
+	); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	issues, err := loadIssuesFromBeadsDir(beadsDir)
+	if err != nil {
+		t.Fatalf("loadIssuesFromBeadsDir: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "LIVE-1" {
+		t.Fatalf("metadata-selected issues = %#v, want only LIVE-1", issues)
+	}
+}
+
 func TestRobotHistorySchemaMatchesHandlerOutput(t *testing.T) {
 	schemas := generateRobotSchemas()
 	properties := requireRobotSchemaProperties(t, schemas, "robot-history")
@@ -1070,10 +1609,75 @@ func TestRobotCorrelationStatsSchemaMatchesHandlerOutput(t *testing.T) {
 	}
 }
 
-func TestRobotCorrelationStatsOutputIncludesEnvelope(t *testing.T) {
+func TestRobotCorrelationSchemasMatchHandlerOutputs(t *testing.T) {
+	schemas := generateRobotSchemas()
+
+	explanation := requireRobotSchemaProperties(t, schemas, "robot-explain-correlation")
+	explanationFields := []string{
+		"generated_at", "data_hash", "output_format", "version",
+		"commit_sha", "bead_id", "confidence", "confidence_pct", "level", "method",
+		"signals", "total_weight", "summary", "recommendation",
+	}
+	for _, name := range explanationFields {
+		if explanation[name] == nil {
+			t.Fatalf("robot-explain-correlation schema missing top-level property %q", name)
+		}
+	}
+	explanationRequired, ok := schemas.Commands["robot-explain-correlation"]["required"].([]string)
+	if !ok {
+		t.Fatalf("robot-explain-correlation required has unexpected type %T", schemas.Commands["robot-explain-correlation"]["required"])
+	}
+	for _, name := range explanationFields {
+		requireContainsString(t, explanationRequired, name)
+	}
+	signals, ok := explanation["signals"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("robot-explain-correlation signals has unexpected type %T", explanation["signals"])
+	}
+	signal := requireNestedSchemaProperties(t, signals["items"], "robot-explain-correlation signal")
+	for _, name := range []string{"type", "weight", "detail"} {
+		if signal[name] == nil {
+			t.Fatalf("robot-explain-correlation signal schema missing %q", name)
+		}
+	}
+
+	for _, command := range []string{"robot-confirm-correlation", "robot-reject-correlation"} {
+		properties := requireRobotSchemaProperties(t, schemas, command)
+		feedbackFields := []string{
+			"generated_at", "data_hash", "output_format", "version",
+			"status", "commit", "bead", "by", "reason", "orig_conf",
+		}
+		for _, name := range feedbackFields {
+			if properties[name] == nil {
+				t.Fatalf("%s schema missing top-level property %q", command, name)
+			}
+		}
+		required, ok := schemas.Commands[command]["required"].([]string)
+		if !ok {
+			t.Fatalf("%s required has unexpected type %T", command, schemas.Commands[command]["required"])
+		}
+		for _, name := range feedbackFields {
+			requireContainsString(t, required, name)
+		}
+		status, ok := properties["status"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s status has unexpected type %T", command, properties["status"])
+		}
+		statuses, ok := status["enum"].([]string)
+		if !ok {
+			t.Fatalf("%s status enum has unexpected type %T", command, status["enum"])
+		}
+		wantStatus := "confirmed"
+		if command == "robot-reject-correlation" {
+			wantStatus = "rejected"
+		}
+		requireContainsString(t, statuses, wantStatus)
+	}
+}
+
+func TestRobotCorrelationStatsOutputIncludesEnvelopeWithoutIssueSource(t *testing.T) {
 	exe := buildTestBinary(t)
 	tmpDir := t.TempDir()
-	writeTestBeadsFixture(t, tmpDir)
 
 	out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-correlation-stats")
 	if err != nil {
@@ -1304,9 +1908,19 @@ func TestRobotRelationshipWorkflowSchemasMatchHandlerOutputs(t *testing.T) {
 	}
 
 	blockerProps := requireRobotSchemaProperties(t, schemas, "robot-blocker-chain")
-	for _, name := range []string{"generated_at", "data_hash", "output_format", "version", "result"} {
+	for _, name := range []string{"generated_at", "data_hash", "output_format", "version", "result", "degraded"} {
 		if blockerProps[name] == nil {
 			t.Fatalf("robot-blocker-chain schema missing top-level property %q", name)
+		}
+	}
+	degraded, ok := blockerProps["degraded"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("robot-blocker-chain degraded has unexpected type %T", blockerProps["degraded"])
+	}
+	degradation := requireNestedSchemaProperties(t, degraded["items"], "robot-blocker-chain degradation")
+	for _, name := range []string{"code", "severity", "message", "repair"} {
+		if degradation[name] == nil {
+			t.Fatalf("robot-blocker-chain degradation schema missing %q", name)
 		}
 	}
 	blockerResultProps := requireNestedSchemaProperties(t, blockerProps["result"], "robot-blocker-chain result")
@@ -1445,6 +2059,140 @@ func TestRobotGroupedTriageSchemasMatchHandlerOutput(t *testing.T) {
 	}
 }
 
+func TestRobotTriageSchemaSeparatesRecommendationShapes(t *testing.T) {
+	schemas := generateRobotSchemas()
+	schema := schemas.Commands["robot-triage"]
+	properties := requireRobotSchemaProperties(t, schemas, "robot-triage")
+
+	triage := requireNestedSchemaProperties(t, properties["triage"], "robot-triage triage")
+	quickRef := requireNestedSchemaProperties(t, triage["quick_ref"], "robot-triage quick_ref")
+	topPicks, ok := quickRef["top_picks"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("robot-triage top_picks has unexpected type %T", quickRef["top_picks"])
+	}
+	topPickItems, ok := topPicks["items"].(map[string]interface{})
+	if !ok || topPickItems["$ref"] != "#/$defs/top_pick" {
+		t.Fatalf("robot-triage top_picks items = %#v, want top_pick ref", topPicks["items"])
+	}
+
+	recommendations, ok := triage["recommendations"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("robot-triage recommendations has unexpected type %T", triage["recommendations"])
+	}
+	recommendationItems, ok := recommendations["items"].(map[string]interface{})
+	if !ok || recommendationItems["$ref"] != "#/$defs/recommendation" {
+		t.Fatalf("robot-triage recommendations items = %#v, want recommendation ref", recommendations["items"])
+	}
+
+	briefRecommendations, ok := properties["recommendations"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("robot-triage brief recommendations has unexpected type %T", properties["recommendations"])
+	}
+	briefItems, ok := briefRecommendations["items"].(map[string]interface{})
+	if !ok || briefItems["$ref"] != "#/$defs/brief_recommendation" {
+		t.Fatalf("robot-triage brief recommendations items = %#v, want brief_recommendation ref", briefRecommendations["items"])
+	}
+
+	definitions, ok := schema["$defs"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("robot-triage $defs has unexpected type %T", schema["$defs"])
+	}
+	topPick := requireNestedSchemaProperties(t, definitions["top_pick"], "robot-triage top_pick definition")
+	for _, name := range []string{"id", "title", "score", "reasons", "unblocks"} {
+		if topPick[name] == nil {
+			t.Fatalf("robot-triage top_pick definition missing %q", name)
+		}
+	}
+	for _, name := range []string{"action", "breakdown", "unblocks_ids"} {
+		if topPick[name] != nil {
+			t.Fatalf("robot-triage top_pick definition incorrectly exposes full recommendation field %q", name)
+		}
+	}
+
+	full := requireNestedSchemaProperties(t, definitions["recommendation"], "robot-triage recommendation definition")
+	for _, name := range []string{
+		"id", "title", "type", "status", "priority", "score", "breakdown", "action",
+		"reasons", "unblocks_ids", "blocked_by",
+	} {
+		if full[name] == nil {
+			t.Fatalf("robot-triage recommendation definition missing %q", name)
+		}
+	}
+	if full["unblocks"] != nil {
+		t.Fatalf("robot-triage full recommendation incorrectly exposes integer top-pick field unblocks")
+	}
+
+	brief := requireNestedSchemaProperties(t, definitions["brief_recommendation"], "robot-triage brief recommendation definition")
+	for _, name := range []string{"id", "title", "status", "assignee", "score", "unblocks", "blocked_by"} {
+		if brief[name] == nil {
+			t.Fatalf("robot-triage brief recommendation definition missing %q", name)
+		}
+	}
+	for _, name := range []string{"action", "breakdown", "unblocks_ids"} {
+		if brief[name] != nil {
+			t.Fatalf("robot-triage brief recommendation definition incorrectly exposes full field %q", name)
+		}
+	}
+}
+
+func TestRobotNextSchemaMatchesActionableAndDegradedOutputs(t *testing.T) {
+	schemas := generateRobotSchemas()
+	properties := requireRobotSchemaProperties(t, schemas, "robot-next")
+	for _, name := range []string{
+		"generated_at", "data_hash", "output_format", "version", "load_stats",
+		"authority_incomplete_reasons", "repository_route_unavailable_reasons",
+		"as_of", "as_of_commit", "analysis_time", "actionable", "phase2_ready", "status", "message",
+		"id", "title", "score", "reasons", "unblocks", "diagnostic_top_pick",
+		"claim_command", "show_command", "degraded", "usage_hints",
+	} {
+		if properties[name] == nil {
+			t.Fatalf("robot-next schema missing top-level property %q", name)
+		}
+	}
+
+	schema := schemas.Commands["robot-next"]
+	required, ok := schema["required"].([]string)
+	if !ok {
+		t.Fatalf("robot-next required has unexpected type %T", schema["required"])
+	}
+	for _, name := range []string{"generated_at", "data_hash", "output_format", "version", "actionable", "phase2_ready", "status"} {
+		requireContainsString(t, required, name)
+	}
+	for _, conditional := range []string{"id", "title", "score", "claim_command", "show_command"} {
+		for _, name := range required {
+			if name == conditional {
+				t.Fatalf("robot-next schema requires conditional field %q", conditional)
+			}
+		}
+	}
+
+	diagnostic := requireNestedSchemaProperties(t, properties["diagnostic_top_pick"], "robot-next diagnostic_top_pick")
+	for _, name := range []string{"id", "title", "score", "reasons", "unblocks"} {
+		if diagnostic[name] == nil {
+			t.Fatalf("robot-next diagnostic schema missing %q", name)
+		}
+	}
+
+	degraded, ok := properties["degraded"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("robot-next degraded has unexpected type %T", properties["degraded"])
+	}
+	degradation := requireNestedSchemaProperties(t, degraded["items"], "robot-next degradation item")
+	for _, name := range []string{"code", "severity", "message", "repair"} {
+		if degradation[name] == nil {
+			t.Fatalf("robot-next degradation schema missing %q", name)
+		}
+	}
+
+	doc := robotCommandDocs()["robot-next"]
+	for _, name := range []string{"actionable", "phase2_ready", "status", "claim_command", "degraded"} {
+		requireContainsString(t, doc.KeyFields, name)
+	}
+	if !strings.Contains(doc.Description, "only when actionable") {
+		t.Fatalf("robot-next description does not explain conditional claim commands: %q", doc.Description)
+	}
+}
+
 func TestRobotGroupedTriageDocsUseLiveJSONPaths(t *testing.T) {
 	docs := robotCommandDocs()
 	requireContainsString(t, docs["robot-triage-by-track"].KeyFields, "triage.recommendations_by_track[].top_pick")
@@ -1467,7 +2215,7 @@ func TestRobotDiffSchemaMatchesHandlerEnvelope(t *testing.T) {
 	if !ok {
 		t.Fatalf("robot-diff properties has unexpected type %T", schema["properties"])
 	}
-	for _, name := range []string{"resolved_revision", "from_data_hash", "to_data_hash", "diff"} {
+	for _, name := range []string{"resolved_revision", "from_data_hash", "to_data_hash", "from_load_stats", "to_load_stats", "degraded", "diff"} {
 		if properties[name] == nil {
 			t.Fatalf("robot-diff schema missing top-level property %q", name)
 		}
@@ -1574,12 +2322,17 @@ func TestRobotGraphSchemaMatchesExportResult(t *testing.T) {
 	if !ok {
 		t.Fatalf("robot-graph properties has unexpected type %T", schema["properties"])
 	}
-	for _, name := range []string{"format", "graph", "nodes", "edges", "filters_applied", "explanation", "data_hash", "adjacency"} {
+	for _, name := range []string{
+		"generated_at", "data_hash", "output_format", "version",
+		"load_stats", "authority_incomplete_reasons", "repository_route_unavailable_reasons", "as_of", "as_of_commit", "analysis_time",
+		"format", "graph", "nodes", "edges", "filters_applied", "explanation",
+		"adjacency", "analysis_config", "status",
+	} {
 		if properties[name] == nil {
 			t.Fatalf("robot-graph schema missing top-level property %q", name)
 		}
 	}
-	for _, stale := range []string{"generated_at", "stats"} {
+	for _, stale := range []string{"stats"} {
 		if properties[stale] != nil {
 			t.Fatalf("robot-graph schema still exposes stale top-level property %q", stale)
 		}
@@ -1607,7 +2360,11 @@ func TestRobotSuggestSchemaMatchesOutputShape(t *testing.T) {
 	if !ok {
 		t.Fatalf("robot-suggest properties has unexpected type %T", schema["properties"])
 	}
-	for _, name := range []string{"filters", "suggestions", "usage_hints"} {
+	for _, name := range []string{
+		"generated_at", "data_hash", "output_format", "version",
+		"load_stats", "authority_incomplete_reasons", "repository_route_unavailable_reasons", "as_of", "as_of_commit", "analysis_time",
+		"filters", "suggestions", "degraded", "usage_hints",
+	} {
 		if properties[name] == nil {
 			t.Fatalf("robot-suggest schema missing top-level property %q", name)
 		}
@@ -1916,7 +2673,7 @@ func TestRobotCapacitySchemaMatchesHandlerOutput(t *testing.T) {
 		"output_format", "version", "agents", "label", "open_issue_count",
 		"total_minutes", "total_days", "serial_minutes", "parallel_minutes",
 		"parallelizable_pct", "estimated_days", "critical_path_length",
-		"critical_path", "actionable_count", "actionable", "bottlenecks",
+		"critical_path", "actionable_count", "actionable", "bottlenecks", "degraded",
 	} {
 		if properties[name] == nil {
 			t.Fatalf("robot-capacity schema missing top-level property %q", name)
@@ -1931,6 +2688,17 @@ func TestRobotCapacitySchemaMatchesHandlerOutput(t *testing.T) {
 	for _, name := range []string{"id", "title", "blocks_count", "blocks"} {
 		if bottleneckProps[name] == nil {
 			t.Fatalf("robot-capacity bottleneck schema missing %q", name)
+		}
+	}
+
+	degradedProp, ok := properties["degraded"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("robot-capacity degraded has unexpected type %T", properties["degraded"])
+	}
+	degradationProps := requireNestedSchemaProperties(t, degradedProp["items"], "robot-capacity degradation item")
+	for _, name := range []string{"code", "severity", "message", "repair"} {
+		if degradationProps[name] == nil {
+			t.Fatalf("robot-capacity degradation schema missing %q", name)
 		}
 	}
 }
@@ -2028,6 +2796,14 @@ func TestModifierFlagValidation(t *testing.T) {
 			},
 		},
 		{
+			name: "history timeout is rejected by robot next",
+			args: []string{"--robot-next", "--robot-history-timeout-ms", "1"},
+			wantMessages: []string{
+				"Error: --robot-history-timeout-ms requires one of --robot-triage, --robot-triage-by-track or --robot-triage-by-label",
+				"Try: `bv robot-triage --robot-history-timeout-ms 10000 --json`.",
+			},
+		},
+		{
 			name: "capacity agents requires robot capacity",
 			args: []string{"--agents", "3"},
 			wantMessages: []string{
@@ -2064,6 +2840,7 @@ func TestModifierFlagValidation(t *testing.T) {
 }
 
 func TestApplyRecipeFilters_ActionableAndHasBlockers(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
 	now := time.Now()
 	a := model.Issue{ID: "A", Title: "Root", Status: model.StatusOpen, Priority: 2, CreatedAt: now}
 	b := model.Issue{
@@ -2091,6 +2868,44 @@ func TestApplyRecipeFilters_ActionableAndHasBlockers(t *testing.T) {
 	requireIssueIDs(t, blocked, "B")
 }
 
+func TestApplyRecipeFilters_UsesCanonicalParentBlocking(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "ROOT", Status: model.StatusOpen},
+		{ID: "PARENT", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "ROOT", Type: model.DepBlocks},
+		}},
+		{ID: "CHILD", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "PARENT", Type: model.DepParentChild},
+		}},
+		{ID: "CLOSED", Status: model.StatusClosed},
+	}
+
+	r := &recipe.Recipe{Filters: recipe.FilterConfig{Actionable: ptrBool(true)}}
+	requireIssueIDs(t, applyRecipeFilters(issues, r), "ROOT")
+
+	r.Filters.Actionable = nil
+	r.Filters.HasBlockers = ptrBool(true)
+	requireIssueIDs(t, applyRecipeFilters(issues, r), "PARENT", "CHILD")
+}
+
+func TestApplyRecipeFilters_TombstoneDependencyIsNotAnOpenBlocker(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "DONE", Title: "Removed blocker", Status: model.StatusTombstone},
+		{
+			ID:     "READY",
+			Title:  "Depends on removed blocker",
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{DependsOnID: "DONE", Type: model.DepBlocks},
+			},
+		},
+	}
+	r := &recipe.Recipe{Filters: recipe.FilterConfig{HasBlockers: ptrBool(true)}}
+	if got := applyRecipeFilters(issues, r); len(got) != 0 {
+		t.Fatalf("tombstone dependency was treated as open: %+v", got)
+	}
+}
+
 func TestApplyRecipeFilters_TitleAndPrefix(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "UI-1", Title: "Add login button"},
@@ -2108,6 +2923,7 @@ func TestApplyRecipeFilters_TitleAndPrefix(t *testing.T) {
 }
 
 func TestApplyRecipeFilters_TagsAndDates(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
 	now := time.Now()
 	old := now.Add(-48 * time.Hour)
 	issues := []model.Issue{
@@ -2129,6 +2945,7 @@ func TestApplyRecipeFilters_TagsAndDates(t *testing.T) {
 }
 
 func TestApplyRecipeFilters_DatesBlockersAndPrefix(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
 	now := time.Now()
 	early := now.Add(-72 * time.Hour)
 	issues := []model.Issue{
@@ -2149,6 +2966,25 @@ func TestApplyRecipeFilters_DatesBlockersAndPrefix(t *testing.T) {
 	got = applyRecipeFilters(issues, r)
 	if len(got) != 0 {
 		t.Fatalf("expected blockers=false to exclude API-2, got %#v", got)
+	}
+}
+
+func TestInteractiveRecipeFiltersIgnoreSourceDateEpoch(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "0")
+
+	elapsed := time.Now().UTC().Add(-time.Minute)
+	issue := model.Issue{
+		ID:         "ELAPSED-1",
+		Title:      "Deferral elapsed on the wall clock",
+		Status:     model.StatusOpen,
+		IssueType:  model.TypeTask,
+		DeferUntil: &elapsed,
+	}
+	r := &recipe.Recipe{Filters: recipe.FilterConfig{Actionable: ptrBool(true)}}
+
+	requireIssueIDs(t, applyRecipeFilters([]model.Issue{issue}, r), issue.ID)
+	if got := applyRobotRecipeFilters([]model.Issue{issue}, r); len(got) != 0 {
+		t.Fatalf("pinned robot filter should still treat %s as deferred at epoch zero: %#v", issue.ID, got)
 	}
 }
 
@@ -2283,6 +3119,30 @@ func repoRoot(t *testing.T) string {
 			t.Fatalf("could not find go.mod above %s", dir)
 		}
 		dir = parent
+	}
+}
+
+func TestPathWithinDirectoryResolvesSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "inside.jsonl")
+	if err := os.WriteFile(inside, []byte("inside"), 0o644); err != nil {
+		t.Fatalf("write inside file: %v", err)
+	}
+	if !pathWithinDirectory(inside, root) {
+		t.Fatal("ordinary child path should be within root")
+	}
+
+	outsideRoot := t.TempDir()
+	outside := filepath.Join(outsideRoot, "outside.jsonl")
+	if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	escape := filepath.Join(root, "escape.jsonl")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if pathWithinDirectory(escape, root) {
+		t.Fatal("symlink to an outside source must not pass repository containment")
 	}
 }
 

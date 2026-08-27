@@ -62,12 +62,22 @@ func normalizeImpact(blockerCount, maxBlockerCount int) float64 {
 	return float64(blockerCount) / float64(maxBlockerCount)
 }
 
-// normalizeRecency applies exponential decay (half-life ~30 days).
+// normalizeRecency applies exponential decay with a 30-day decay constant
+// (half-life about 21 days) relative to the current clock. Call
+// normalizeRecencyAt when the caller owns a historical or otherwise pinned
+// analysis clock.
 func normalizeRecency(updatedAt time.Time) float64 {
+	return normalizeRecencyAt(updatedAt, time.Now())
+}
+
+func normalizeRecencyAt(updatedAt, now time.Time) float64 {
 	if updatedAt.IsZero() {
 		return 0.5
 	}
-	daysSinceUpdate := time.Since(updatedAt).Hours() / 24
+	if now.IsZero() {
+		now = time.Now()
+	}
+	daysSinceUpdate := now.Sub(updatedAt).Hours() / 24
 	if daysSinceUpdate < 0 {
 		return 1.0
 	}

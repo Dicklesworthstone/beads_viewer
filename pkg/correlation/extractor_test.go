@@ -2,11 +2,37 @@ package correlation
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+type closeFailingSnapshotBlobReader struct {
+	blobs      map[string][]byte
+	closeErr   error
+	reads      int
+	closeCalls int
+}
+
+func (r *closeFailingSnapshotBlobReader) read(sha string) ([]byte, error) {
+	r.reads++
+	blob, ok := r.blobs[sha]
+	if !ok {
+		return nil, errors.New("unexpected blob object ID")
+	}
+	return append([]byte(nil), blob...), nil
+}
+
+func (*closeFailingSnapshotBlobReader) recycle([]byte) {}
+
+func (r *closeFailingSnapshotBlobReader) Close() error {
+	r.closeCalls++
+	return r.closeErr
+}
 
 func TestParseGitLogOutput(t *testing.T) {
 	// Mock git log output with two commits
@@ -85,6 +111,18 @@ func TestParseCommitInfo(t *testing.T) {
 	}
 }
 
+func TestParseCommitInfoSupportsSHA256(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	line := sha + "\x00" + "2025-01-15T10:30:00Z" + "\x00" + "Alice" + "\x00" + "alice@example.com" + "\x00" + "SHA-256 commit"
+	info, err := parseCommitInfo(line)
+	if err != nil {
+		t.Fatalf("parse SHA-256 commit info: %v", err)
+	}
+	if info.SHA != sha || !commitPattern.MatchString(line) {
+		t.Fatalf("SHA-256 header was not preserved: info=%+v matched=%t", info, commitPattern.MatchString(line))
+	}
+}
+
 func TestParseCommitInfo_InvalidFormat(t *testing.T) {
 	tests := []struct {
 		name string
@@ -92,6 +130,8 @@ func TestParseCommitInfo_InvalidFormat(t *testing.T) {
 	}{
 		{"missing parts", "abc123def456789012345678901234567890abcd" + "\x00" + "2025-01-15"},
 		{"invalid timestamp", "abc123def456789012345678901234567890abcd" + "\x00" + "not-a-date" + "\x00" + "author" + "\x00" + "email" + "\x00" + "msg"},
+		{"noncanonical object ID", strings.Repeat("a", 63) + "\x00" + "2025-01-15T10:30:00Z" + "\x00" + "author" + "\x00" + "email" + "\x00" + "msg"},
+		{"uppercase object ID", strings.Repeat("A", 64) + "\x00" + "2025-01-15T10:30:00Z" + "\x00" + "author" + "\x00" + "email" + "\x00" + "msg"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -100,6 +140,347 @@ func TestParseCommitInfo_InvalidFormat(t *testing.T) {
 				t.Error("Expected error for invalid input")
 			}
 		})
+	}
+}
+
+func TestParseGitLogOutputRejectsOversizedLineWithoutPartialEvents(t *testing.T) {
+	e := NewExtractor(t.TempDir())
+	sha := strings.Repeat("a", 40)
+	header := sha + "\x00" + "2025-01-15T10:30:00Z" + "\x00" + "Alice" + "\x00" + "alice@example.com" + "\x00" + "oversized"
+	record := "{\"id\":\"oversized\",\"status\":\"open\",\"title\":\"" + strings.Repeat("x", 10*1024*1024) + "\"}"
+	input := header + "\n+" + record + "\n"
+	events, err := e.parseGitLogOutput(strings.NewReader(input), "")
+	if err == nil || events != nil {
+		t.Fatalf("oversized lifecycle line result=%#v error=%v, want nil/error", events, err)
+	}
+	if !strings.Contains(err.Error(), "parser limit") {
+		t.Fatalf("oversized lifecycle line error=%v, want parser-limit context", err)
+	}
+	info, err := parseCommitInfo(header)
+	if err != nil {
+		t.Fatalf("parse oversized fixture header: %v", err)
+	}
+	directEvents := e.parseDiff([]byte("+"+record+"\n"), info, "")
+	if len(directEvents) != 1 || directEvents[0].BeadID != "oversized" || directEvents[0].EventType != EventCreated {
+		t.Fatalf("snapshot-sized record parse=%#v, want one created event", directEvents)
+	}
+}
+
+func TestParseGitLogOutputRejectsMixedObjectIDWidths(t *testing.T) {
+	header := func(sha string) string {
+		return sha + "\x00" + "2025-01-15T10:30:00Z" + "\x00" + "Alice" + "\x00" + "alice@example.com" + "\x00" + "mixed"
+	}
+	input := header(strings.Repeat("a", 40)) + "\n" + header(strings.Repeat("b", 64)) + "\n"
+	events, err := NewExtractor(t.TempDir()).parseGitLogOutput(strings.NewReader(input), "")
+	if err == nil || events != nil {
+		t.Fatalf("mixed-width lifecycle stream result=%#v error=%v, want nil/error", events, err)
+	}
+}
+
+func TestLifecycleGitPolicyPinsConfigAndAttributeSensitiveInputs(t *testing.T) {
+	policyArgs := append(append(lifecycleGitConfigArgs(), lifecycleGitLogOutputArgs()...), lifecycleHistoryOrderArgs()...)
+	joined := strings.Join(append(policyArgs, lifecycleGitDiffArgs()...), "\x00")
+	for _, want := range []string{
+		"core.quotePath=true",
+		"diff.renames=true",
+		"diff.renameLimit=1000",
+		"diff.algorithm=default",
+		"diff.indentHeuristic=false",
+		"i18n.logOutputEncoding=UTF-8",
+		"log.follow=false",
+		"--encoding=UTF-8",
+		"--no-use-mailmap",
+		"--no-abbrev-commit",
+		"--no-expand-tabs",
+		"--no-show-signature",
+		"--no-decorate",
+		"--no-notes",
+		"--root",
+		"--topo-order",
+		"--find-renames=50%",
+		"-l1000",
+		"--no-rename-empty",
+		"--diff-algorithm=default",
+		"--no-indent-heuristic",
+		"--no-ext-diff",
+		"--no-textconv",
+		"--text",
+		"--no-diff-merges",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("lifecycle Git policy omitted %q: %q", want, joined)
+		}
+	}
+	if !strings.Contains(strings.Join(lifecycleGitPolicyNamespaceInputs(), "\x00"), lifecycleGitPolicyVersion) {
+		t.Fatal("persistent-cache policy identity omitted the lifecycle policy version")
+	}
+}
+
+func TestLifecycleExtractionIgnoresHostileSameHeadGitConfig(t *testing.T) {
+	repo := initTempGitRepo(t)
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte(".beads/*.jsonl -diff\n"), 0o644); err != nil {
+		t.Fatalf("write hostile attributes: %v", err)
+	}
+	oldPath := filepath.Join(beadsDir, "beads.jsonl")
+	if err := os.WriteFile(oldPath, []byte("{\"id\":\"policy-bead\",\"title\":\"Policy\",\"status\":\"open\"}\n"), 0o644); err != nil {
+		t.Fatalf("write initial beads history: %v", err)
+	}
+	runGit(t, repo, "add", ".gitattributes", ".beads/beads.jsonl")
+	runGit(t, repo, "commit", "-m", "create policy bead")
+
+	runGit(t, repo, "mv", ".beads/beads.jsonl", ".beads/issues.jsonl")
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte("{\"id\":\"policy-bead\",\"title\":\"Policy\",\"status\":\"closed\"}\n"), 0o644); err != nil {
+		t.Fatalf("close renamed bead: %v", err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "close café policy bead")
+	headBefore, err := getGitHead(repo)
+	if err != nil {
+		t.Fatalf("resolve policy fixture HEAD: %v", err)
+	}
+
+	extract := func(t *testing.T) map[string][]BeadEvent {
+		t.Helper()
+		e := NewExtractor(repo)
+		results := make(map[string][]BeadEvent, 2)
+		for label, fn := range map[string]func(ExtractOptions) ([]BeadEvent, error){
+			"legacy":   e.extractViaGitLogPatch,
+			"snapshot": e.extractViaSnapshots,
+		} {
+			events, extractErr := fn(ExtractOptions{})
+			if extractErr != nil {
+				t.Fatalf("%s lifecycle extraction: %v", label, extractErr)
+			}
+			if len(events) != 2 || events[0].EventType != EventCreated || events[1].EventType != EventClosed || events[1].CommitMsg != "close café policy bead" {
+				t.Fatalf("%s lifecycle events=%#v", label, events)
+			}
+			results[label] = events
+		}
+		return results
+	}
+
+	baseline := extract(t)
+	for key, value := range map[string]string{
+		"core.bigFileThreshold":  "1",
+		"diff.algorithm":         "histogram",
+		"diff.indentHeuristic":   "true",
+		"diff.renameLimit":       "1",
+		"diff.renames":           "false",
+		"i18n.logOutputEncoding": "ISO-8859-1",
+		"log.decorate":           "full",
+		"log.follow":             "true",
+		"log.showRoot":           "false",
+		"log.showSignature":      "true",
+	} {
+		runGit(t, repo, "config", key, value)
+	}
+	headAfter, err := getGitHead(repo)
+	if err != nil || headAfter != headBefore {
+		t.Fatalf("hostile config changed HEAD: before=%q after=%q error=%v", headBefore, headAfter, err)
+	}
+	got := extract(t)
+	if !reflect.DeepEqual(got, baseline) {
+		t.Fatalf("same-HEAD hostile Git config changed lifecycle extraction:\n got=%#v\nwant=%#v", got, baseline)
+	}
+}
+
+func TestSnapshotExtractionDoesNotPublishBeforeBlobReaderExit(t *testing.T) {
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+
+	repo := initTempGitRepo(t)
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	content := []byte("{\"id\":\"close-failure\",\"title\":\"Close failure\",\"status\":\"open\"}\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), content, 0o644); err != nil {
+		t.Fatalf("write snapshot fixture: %v", err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "add snapshot close fixture")
+
+	extractor := NewExtractor(repo)
+	commits, err := extractor.snapshotCommits(ExtractOptions{})
+	if err != nil {
+		t.Fatalf("resolve snapshot fixture commits: %v", err)
+	}
+	if len(commits) != 1 || commits[0].oldSHA != "" || commits[0].newSHA == "" {
+		t.Fatalf("snapshot fixture commits=%+v, want one root addition", commits)
+	}
+	injectedErr := errors.New("injected cat-file exit failure")
+	fake := &closeFailingSnapshotBlobReader{
+		blobs:    map[string][]byte{commits[0].newSHA: content},
+		closeErr: injectedErr,
+	}
+	extractor.blobReaderFactory = func() (snapshotBlobReadCloser, error) {
+		return fake, nil
+	}
+
+	events, err := extractor.extractViaSnapshots(ExtractOptions{})
+	if !errors.Is(err, injectedErr) || events != nil {
+		t.Fatalf("snapshot close failure result=%#v error=%v, want nil/wrapped injected error", events, err)
+	}
+	if fake.reads != 1 {
+		t.Fatalf("fake delivered %d blob responses, want 1", fake.reads)
+	}
+	if fake.closeCalls != 1 {
+		t.Fatalf("blob reader Close called %d times, want exactly once", fake.closeCalls)
+	}
+	namespace := perCommitEventCacheNamespace(extractor.primaryBeadsFile(), "")
+	if cached := loadPerCommitEvents(namespace); len(cached) != 0 {
+		t.Fatalf("failed cat-file process published per-commit events: %#v", cached)
+	}
+}
+
+func TestSnapshotExtractionRejectsMissingNonemptyBlobWithoutPublishing(t *testing.T) {
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+
+	repo := initTempGitRepo(t)
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	content := []byte("{\"id\":\"missing-blob\",\"title\":\"Missing blob\",\"status\":\"open\"}\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), content, 0o644); err != nil {
+		t.Fatalf("write snapshot fixture: %v", err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "add missing blob fixture")
+
+	extractor := NewExtractor(repo)
+	commits, err := extractor.snapshotCommits(ExtractOptions{})
+	if err != nil {
+		t.Fatalf("resolve snapshot fixture commits: %v", err)
+	}
+	if len(commits) != 1 || commits[0].newSHA == "" {
+		t.Fatalf("snapshot fixture commits=%+v, want one nonempty new blob", commits)
+	}
+	fake := &closeFailingSnapshotBlobReader{
+		blobs: map[string][]byte{commits[0].newSHA: nil},
+	}
+	extractor.blobReaderFactory = func() (snapshotBlobReadCloser, error) {
+		return fake, nil
+	}
+
+	events, err := extractor.extractViaSnapshots(ExtractOptions{})
+	if err == nil || events != nil || !strings.Contains(err.Error(), "no content for nonempty blob") {
+		t.Fatalf("missing blob result=%#v error=%v, want nil/error", events, err)
+	}
+	if fake.closeCalls != 1 {
+		t.Fatalf("missing-blob reader Close called %d times, want exactly once", fake.closeCalls)
+	}
+	namespace := perCommitEventCacheNamespace(extractor.primaryBeadsFile(), "")
+	if cached := loadPerCommitEvents(namespace); len(cached) != 0 {
+		t.Fatalf("missing blob published per-commit events: %#v", cached)
+	}
+}
+
+func TestSnapshotExtractionPureCacheHitDoesNotStartBlobReader(t *testing.T) {
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+
+	repo := initTempGitRepo(t)
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	content := []byte("{\"id\":\"cached\",\"title\":\"Cached\",\"status\":\"open\"}\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), content, 0o644); err != nil {
+		t.Fatalf("write snapshot fixture: %v", err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "add cached snapshot fixture")
+
+	extractor := NewExtractor(repo)
+	want, err := extractor.extractViaSnapshots(ExtractOptions{})
+	if err != nil {
+		t.Fatalf("prime per-commit snapshot cache: %v", err)
+	}
+	factoryCalls := 0
+	injectedErr := errors.New("pure cache hit started blob reader")
+	extractor.blobReaderFactory = func() (snapshotBlobReadCloser, error) {
+		factoryCalls++
+		return nil, injectedErr
+	}
+
+	got, err := extractor.extractViaSnapshots(ExtractOptions{})
+	if err != nil {
+		t.Fatalf("pure per-commit cache hit: %v", err)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("pure cache hit started blob reader %d times", factoryCalls)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pure cache hit events=%#v, want %#v", got, want)
+	}
+}
+
+func TestSnapshotExtractionEmptyContributionIsDefinitiveCacheHit(t *testing.T) {
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+
+	repo := initTempGitRepo(t)
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	content := []byte("{\"id\":\"other\",\"title\":\"Other\",\"status\":\"open\"}\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), content, 0o644); err != nil {
+		t.Fatalf("write snapshot fixture: %v", err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "add unrelated snapshot fixture")
+
+	opts := ExtractOptions{BeadID: "target"}
+	extractor := NewExtractor(repo)
+	if events, err := extractor.extractViaSnapshots(opts); err != nil || len(events) != 0 {
+		t.Fatalf("prime empty per-commit contribution: events=%#v err=%v", events, err)
+	}
+	factoryCalls := 0
+	injectedErr := errors.New("empty cache hit started blob reader")
+	extractor.blobReaderFactory = func() (snapshotBlobReadCloser, error) {
+		factoryCalls++
+		return nil, injectedErr
+	}
+
+	events, err := extractor.extractViaSnapshots(opts)
+	if err != nil {
+		t.Fatalf("empty per-commit cache hit: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("empty per-commit cache hit returned events: %#v", events)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("empty per-commit cache hit started blob reader %d times", factoryCalls)
+	}
+}
+
+func TestParseSnapshotLogSupportsSHA256AndRejectsMixedObjectIDWidths(t *testing.T) {
+	commitSHA := strings.Repeat("a", 64)
+	newBlobSHA := strings.Repeat("b", 64)
+	header := commitSHA + "\x00" + "2025-01-15T10:30:00Z" + "\x00" + "Alice" + "\x00" + "alice@example.com" + "\x00" + "snapshot"
+	valid := []byte(header + "\n\n:000000 100644 " + strings.Repeat("0", 64) + " " + newBlobSHA + " A\t.beads/issues.jsonl\n")
+	commits, err := parseSnapshotLog(valid)
+	if err != nil {
+		t.Fatalf("parse SHA-256 snapshot log: %v", err)
+	}
+	if len(commits) != 1 || commits[0].info.SHA != commitSHA || commits[0].oldSHA != "" || commits[0].newSHA != newBlobSHA {
+		t.Fatalf("SHA-256 snapshot parse=%+v", commits)
+	}
+
+	mixed := []byte(header + "\n\n:000000 100644 " + strings.Repeat("0", 40) + " " + strings.Repeat("b", 40) + " A\t.beads/issues.jsonl\n")
+	if commits, err := parseSnapshotLog(mixed); err == nil || commits != nil {
+		t.Fatalf("mixed-width snapshot result=%+v error=%v, want nil/error", commits, err)
 	}
 }
 

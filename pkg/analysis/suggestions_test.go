@@ -527,6 +527,36 @@ func TestSuggestion_EdgeCases(t *testing.T) {
 	}
 }
 
+func TestBeadsCommandArgumentQuoting(t *testing.T) {
+	tests := []struct {
+		name string
+		id   string
+		want string
+		ok   bool
+	}{
+		{name: "ordinary", id: "READY-1", want: "READY-1", ok: true},
+		{name: "quoted", id: "team's item", want: "'team'\\''s item'", ok: true},
+		{name: "option shaped", id: "--help", ok: false},
+		{name: "newline", id: "READY-1\nprintf ignored", ok: false},
+		{name: "nul", id: "READY-1\x00ignored", ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := quoteBeadsCommandID(tt.id)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("quoteBeadsCommandID(%q) = (%q, %v), want (%q, %v)", tt.id, got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+
+	if got, ok := quoteBeadsFlagValue("-needs-review"); !ok || got != "-needs-review" {
+		t.Fatalf("flag value quoting = (%q, %v), want (-needs-review, true)", got, ok)
+	}
+	if _, ok := quoteBeadsFlagValue("unsafe\tlabel"); ok {
+		t.Fatal("control-bearing label was accepted as a command value")
+	}
+}
+
 // Benchmarks
 
 func BenchmarkNewSuggestion(b *testing.B) {

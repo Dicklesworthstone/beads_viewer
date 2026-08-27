@@ -2,6 +2,7 @@ package correlation
 
 import (
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -15,6 +16,13 @@ func TestFindRelatedWork_NotFound(t *testing.T) {
 	result := report.FindRelatedWork("bv-notexist", DefaultRelatedWorkOptions())
 	if result != nil {
 		t.Errorf("Expected nil result for non-existent bead, got %+v", result)
+	}
+}
+
+func TestFindRelatedWorkNilReport(t *testing.T) {
+	var report *HistoryReport
+	if result := report.FindRelatedWorkAt("anything", DefaultRelatedWorkOptions(), time.Time{}); result != nil {
+		t.Fatalf("nil report returned %+v, want nil", result)
 	}
 }
 
@@ -148,6 +156,37 @@ func TestFindRelatedWork_FileOverlap(t *testing.T) {
 	}
 }
 
+func TestFindRelatedWork_FileOverlapIgnoresEmptyTargetPaths(t *testing.T) {
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"target": {
+			BeadID: "target",
+			Status: "open",
+			Commits: []CorrelatedCommit{{
+				SHA:   "target-commit",
+				Files: []FileChange{{Path: "./"}, {Path: "shared.go"}},
+			}},
+		},
+		"related": {
+			BeadID: "related",
+			Status: "open",
+			Commits: []CorrelatedCommit{{
+				SHA:   "related-commit",
+				Files: []FileChange{{Path: "shared.go"}},
+			}},
+		},
+	}}
+	opts := DefaultRelatedWorkOptions()
+	opts.MinRelevance = 75
+
+	result := report.FindRelatedWorkAt("target", opts, time.Time{})
+	if result == nil || len(result.FileOverlap) != 1 {
+		t.Fatalf("file overlap=%+v, want one relation above threshold", result)
+	}
+	if got := result.FileOverlap[0]; got.BeadID != "related" || got.Relevance != 100 {
+		t.Fatalf("file overlap=%+v, want related at 100 relevance", got)
+	}
+}
+
 func TestFindRelatedWork_CommitOverlap(t *testing.T) {
 	now := time.Now()
 	sharedSHA := "shared123"
@@ -197,6 +236,30 @@ func TestFindRelatedWork_CommitOverlap(t *testing.T) {
 
 	if !foundShared {
 		t.Error("Expected bv-shared in CommitOverlap results")
+	}
+}
+
+func TestFindRelatedWork_CommitOverlapIgnoresEmptySHA(t *testing.T) {
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"target": {
+				BeadID:  "target",
+				Status:  "open",
+				Commits: []CorrelatedCommit{{SHA: " \t"}},
+			},
+			"related": {BeadID: "related", Status: "open"},
+		},
+		CommitIndex: CommitIndex{" \t": {"target", "related"}},
+	}
+	opts := DefaultRelatedWorkOptions()
+	opts.MinRelevance = 0
+
+	result := report.FindRelatedWorkAt("target", opts, time.Time{})
+	if result == nil {
+		t.Fatal("expected related-work result")
+	}
+	if len(result.CommitOverlap) != 0 {
+		t.Fatalf("empty SHA created a commit-overlap relation: %+v", result.CommitOverlap)
 	}
 }
 
@@ -334,7 +397,7 @@ func TestFindRelatedWork_CommitOverlapSharedCommitsSorted(t *testing.T) {
 		t.Fatal("Expected commit overlap results")
 	}
 
-	wantCommits := []string{"a000000", "b000000"}
+	wantCommits := []string{"a0000002", "b0000001"}
 	if !reflect.DeepEqual(result.CommitOverlap[0].SharedCommits, wantCommits) {
 		t.Fatalf("Expected shared commits sorted %v, got %v", wantCommits, result.CommitOverlap[0].SharedCommits)
 	}
@@ -416,6 +479,38 @@ func TestFindRelatedWork_DependencyCluster(t *testing.T) {
 	}
 }
 
+func TestFindRelatedWork_DependencyClusterTraversesReverseSecondHop(t *testing.T) {
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"target":   {BeadID: "target", Status: "open"},
+			"consumer": {BeadID: "consumer", Status: "open"},
+			"outer":    {BeadID: "outer", Status: "open"},
+		},
+		CommitIndex: make(CommitIndex),
+	}
+	opts := DefaultRelatedWorkOptions()
+	opts.MinRelevance = 0
+	opts.DependencyGraph = map[string][]string{
+		"consumer": {"target"},
+		"outer":    {"consumer"},
+	}
+
+	result := report.FindRelatedWorkAt("target", opts, time.Time{})
+	if result == nil {
+		t.Fatal("expected related-work result")
+	}
+	byID := make(map[string]RelatedWorkBead)
+	for _, bead := range result.DependencyCluster {
+		byID[bead.BeadID] = bead
+	}
+	if got := byID["consumer"].Relevance; got != 80 {
+		t.Fatalf("direct reverse dependency relevance = %d, want 80", got)
+	}
+	if got := byID["outer"].Relevance; got != 40 {
+		t.Fatalf("second-hop reverse dependency relevance = %d, want 40", got)
+	}
+}
+
 func TestFindRelatedWork_Concurrent(t *testing.T) {
 	now := time.Now()
 
@@ -440,7 +535,7 @@ func TestFindRelatedWork_Concurrent(t *testing.T) {
 			"bv-old": {
 				BeadID: "bv-old",
 				Title:  "Old Bead",
-				Status: "open",
+				Status: "closed",
 				Milestones: BeadMilestones{
 					Created: &BeadEvent{Timestamp: now.Add(-60 * 24 * time.Hour)},
 					Closed:  &BeadEvent{Timestamp: now.Add(-30 * 24 * time.Hour)},
@@ -480,6 +575,198 @@ func TestFindRelatedWork_Concurrent(t *testing.T) {
 		if rb.BeadID == "bv-old" {
 			t.Error("Unexpected bv-old in Concurrent results (should be excluded)")
 		}
+	}
+}
+
+func TestFindRelatedWork_ConcurrentDoesNotBridgeClosedReopenGap(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"target": {
+				BeadID: "target",
+				Status: "open",
+				Milestones: BeadMilestones{
+					Created:  &BeadEvent{Timestamp: now.Add(-20 * 24 * time.Hour)},
+					Closed:   &BeadEvent{Timestamp: now.Add(-10 * 24 * time.Hour)},
+					Reopened: &BeadEvent{Timestamp: now.Add(-2 * 24 * time.Hour)},
+				},
+			},
+			"during-gap": {
+				BeadID: "during-gap",
+				Status: "closed",
+				Milestones: BeadMilestones{
+					Created: &BeadEvent{Timestamp: now.Add(-8 * 24 * time.Hour)},
+					Closed:  &BeadEvent{Timestamp: now.Add(-6 * 24 * time.Hour)},
+				},
+			},
+			"after-reopen": {
+				BeadID: "after-reopen",
+				Status: "open",
+				Milestones: BeadMilestones{
+					Created: &BeadEvent{Timestamp: now.Add(-24 * time.Hour)},
+				},
+			},
+		},
+		CommitIndex: make(CommitIndex),
+	}
+	opts := DefaultRelatedWorkOptions()
+	opts.ConcurrencyWindow = 0
+	opts.MinRelevance = 0
+	opts.IncludeClosed = true
+
+	result := report.FindRelatedWorkAt("target", opts, now)
+	if result == nil {
+		t.Fatal("expected related-work result")
+	}
+	byID := make(map[string]RelatedWorkBead)
+	for _, bead := range result.Concurrent {
+		byID[bead.BeadID] = bead
+	}
+	if _, exists := byID["during-gap"]; exists {
+		t.Fatal("bead active only during the closed/reopen gap was marked concurrent")
+	}
+	if _, exists := byID["after-reopen"]; !exists {
+		t.Fatal("bead active after reopen was not marked concurrent")
+	}
+}
+
+func TestFindRelatedWorkConcurrentStartsAtClaimRatherThanCreation(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"target": {
+			BeadID: "target",
+			Status: "in_progress",
+			Milestones: BeadMilestones{
+				Created: &BeadEvent{Timestamp: now.Add(-20 * 24 * time.Hour)},
+				Claimed: &BeadEvent{Timestamp: now.Add(-10 * 24 * time.Hour)},
+			},
+		},
+		"backlog-only-peer": {
+			BeadID: "backlog-only-peer",
+			Status: "closed",
+			Milestones: BeadMilestones{
+				Created: &BeadEvent{Timestamp: now.Add(-16 * 24 * time.Hour)},
+				Claimed: &BeadEvent{Timestamp: now.Add(-16 * 24 * time.Hour)},
+				Closed:  &BeadEvent{Timestamp: now.Add(-15 * 24 * time.Hour)},
+			},
+		},
+		"active-peer": {
+			BeadID: "active-peer",
+			Status: "closed",
+			Milestones: BeadMilestones{
+				Created: &BeadEvent{Timestamp: now.Add(-12 * 24 * time.Hour)},
+				Claimed: &BeadEvent{Timestamp: now.Add(-9 * 24 * time.Hour)},
+				Closed:  &BeadEvent{Timestamp: now.Add(-8 * 24 * time.Hour)},
+			},
+		},
+	}}
+	opts := DefaultRelatedWorkOptions()
+	opts.ConcurrencyWindow = 0
+	opts.MinRelevance = 0
+	opts.IncludeClosed = true
+
+	result := report.FindRelatedWorkAt("target", opts, now)
+	if result == nil {
+		t.Fatal("expected related-work result")
+	}
+	byID := make(map[string]bool, len(result.Concurrent))
+	for _, bead := range result.Concurrent {
+		byID[bead.BeadID] = true
+	}
+	if byID["backlog-only-peer"] {
+		t.Fatal("peer completed before target claim was manufactured as concurrent")
+	}
+	if !byID["active-peer"] {
+		t.Fatal("peer active after target claim was not concurrent")
+	}
+}
+
+func TestFindRelatedWorkConcurrentUsesLatestActivationFromFullEventHistory(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"target": {
+			BeadID: "target",
+			Status: "in_progress",
+			Events: []BeadEvent{
+				{EventType: EventClaimed, Timestamp: now.Add(-20 * 24 * time.Hour)},
+				{EventType: EventClosed, Timestamp: now.Add(-15 * 24 * time.Hour)},
+				{EventType: EventReopened, Timestamp: now.Add(-10 * 24 * time.Hour)},
+				{EventType: EventClaimed, Timestamp: now.Add(-8 * 24 * time.Hour)},
+			},
+		},
+		"before-final-claim": {
+			BeadID: "before-final-claim",
+			Status: "closed",
+			Milestones: BeadMilestones{
+				Claimed: &BeadEvent{Timestamp: now.Add(-9 * 24 * time.Hour)},
+				Closed:  &BeadEvent{Timestamp: now.Add(-9 * 24 * time.Hour)},
+			},
+		},
+		"after-final-claim": {
+			BeadID: "after-final-claim",
+			Status: "closed",
+			Milestones: BeadMilestones{
+				Claimed: &BeadEvent{Timestamp: now.Add(-7 * 24 * time.Hour)},
+				Closed:  &BeadEvent{Timestamp: now.Add(-6 * 24 * time.Hour)},
+			},
+		},
+	}}
+	opts := DefaultRelatedWorkOptions()
+	opts.ConcurrencyWindow = 0
+	opts.MinRelevance = 0
+	opts.IncludeClosed = true
+
+	result := report.FindRelatedWorkAt("target", opts, now)
+	if result == nil {
+		t.Fatal("expected related-work result")
+	}
+	byID := make(map[string]bool, len(result.Concurrent))
+	for _, bead := range result.Concurrent {
+		byID[bead.BeadID] = true
+	}
+	if byID["before-final-claim"] {
+		t.Fatal("peer completed before the final claim was marked concurrent")
+	}
+	if !byID["after-final-claim"] {
+		t.Fatal("peer active after the final claim was not concurrent")
+	}
+}
+
+func TestFindRelatedWork_ConcurrentTreatsNegativeWindowAsZero(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"target": {
+			BeadID: "target",
+			Status: "closed",
+			Milestones: BeadMilestones{
+				Created: &BeadEvent{Timestamp: now.Add(-4 * time.Hour)},
+				Closed:  &BeadEvent{Timestamp: now.Add(-2 * time.Hour)},
+			},
+		},
+		"overlap": {
+			BeadID: "overlap",
+			Status: "closed",
+			Milestones: BeadMilestones{
+				Created: &BeadEvent{Timestamp: now.Add(-3 * time.Hour)},
+				Closed:  &BeadEvent{Timestamp: now.Add(-time.Hour)},
+			},
+		},
+	}}
+	opts := DefaultRelatedWorkOptions()
+	opts.IncludeClosed = true
+	opts.MinRelevance = 0
+	opts.ConcurrencyWindow = -24 * time.Hour
+
+	result := report.FindRelatedWorkAt("target", opts, now)
+	if result == nil || len(result.Concurrent) != 1 || result.Concurrent[0].BeadID != "overlap" {
+		t.Fatalf("negative concurrency tolerance removed a real overlap: %+v", result)
+	}
+}
+
+func TestFormatIntRelatedHandlesMinimumInt(t *testing.T) {
+	minInt := -int(^uint(0)>>1) - 1
+	if got, want := formatIntRelated(minInt), strconv.Itoa(minInt); got != want {
+		t.Fatalf("formatIntRelated(minInt) = %q, want %q", got, want)
 	}
 }
 

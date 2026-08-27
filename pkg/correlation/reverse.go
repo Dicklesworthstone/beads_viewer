@@ -203,8 +203,7 @@ func (rl *ReverseLookup) getCommitInfo(sha string) (*commitInfo, error) {
 		return nil, fmt.Errorf("no repo path configured")
 	}
 
-	cmd := gitCommand(rl.ctx, "log", "-1", "--format="+gitLogHeaderFormat, sha)
-	cmd.Dir = rl.repoPath
+	cmd := lifecycleGitLogCommand(rl.ctx, rl.repoPath, "-1", "--format="+gitLogHeaderFormat, "--end-of-options", sha)
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -278,7 +277,6 @@ func (rl *ReverseLookup) FindOrphanCommits(opts ExtractOptions) ([]OrphanCommit,
 // getAllCodeCommits gets all code commits (excluding merge commits and beads-only changes).
 func (rl *ReverseLookup) getAllCodeCommits(opts ExtractOptions) ([]OrphanCommit, error) {
 	args := []string{
-		"log",
 		"--no-merges",
 		"--format=" + gitLogHeaderFormat,
 	}
@@ -297,15 +295,13 @@ func (rl *ReverseLookup) getAllCodeCommits(opts ExtractOptions) ([]OrphanCommit,
 	// Exclude beads-only commits
 	args = append(args, "--", ":(exclude).beads/*")
 
-	cmd := gitCommand(rl.ctx, args...)
-	cmd.Dir = rl.repoPath
+	cmd := lifecycleGitLogCommand(rl.ctx, rl.repoPath, args...)
 
 	out, err := cmd.Output()
 	if err != nil {
 		// Try without exclusion pattern (older git versions)
 		args = args[:len(args)-2]
-		cmd = gitCommand(rl.ctx, args...)
-		cmd.Dir = rl.repoPath
+		cmd = lifecycleGitLogCommand(rl.ctx, rl.repoPath, args...)
 		out, err = cmd.Output()
 		if err != nil {
 			return nil, fmt.Errorf("git log failed: %w", err)
@@ -313,6 +309,7 @@ func (rl *ReverseLookup) getAllCodeCommits(opts ExtractOptions) ([]OrphanCommit,
 	}
 
 	var commits []OrphanCommit
+	objectIDWidth := 0
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	buf := make([]byte, 64*1024)
 	scanner.Buffer(buf, gitLogMaxScanTokenSize)
@@ -324,7 +321,12 @@ func (rl *ReverseLookup) getAllCodeCommits(opts ExtractOptions) ([]OrphanCommit,
 
 		info, err := parseCommitInfo(line)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("parse code-commit header: %w", err)
+		}
+		if objectIDWidth == 0 {
+			objectIDWidth = len(info.SHA)
+		} else if len(info.SHA) != objectIDWidth {
+			return nil, fmt.Errorf("mixed-width code-commit object IDs: got %d and %d characters", objectIDWidth, len(info.SHA))
 		}
 
 		commits = append(commits, OrphanCommit{
@@ -337,7 +339,10 @@ func (rl *ReverseLookup) getAllCodeCommits(opts ExtractOptions) ([]OrphanCommit,
 		})
 	}
 
-	return commits, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan code-commit output: %w", err)
+	}
+	return commits, nil
 }
 
 // GetCorrelatedCommitCount returns the number of commits that have at least one bead association.

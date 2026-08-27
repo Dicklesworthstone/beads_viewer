@@ -8,6 +8,7 @@ import (
 	"io"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -19,10 +20,19 @@ import (
 // nothing is new). It is never read on any production path.
 var blobsReadCounter int64
 
-// nullBlobSHA is git's all-zero object id, used in `--raw` diff lines for the
-// side of a change where the blob does not exist (a pure addition has an all-zero
-// "old" blob; a deletion an all-zero "new" blob).
-const nullBlobSHA = "0000000000000000000000000000000000000000"
+// isNullObjectID reports whether oid is Git's all-zero SHA-1 or SHA-256 object
+// ID, used in `--raw` output for a missing side of an add/delete.
+func isNullObjectID(oid string) bool {
+	if len(oid) != 40 && len(oid) != 64 {
+		return false
+	}
+	for i := range len(oid) {
+		if oid[i] != '0' {
+			return false
+		}
+	}
+	return true
+}
 
 // snapshotCommit holds the metadata and the followed file's old/new blob object
 // ids for a single commit that modified the followed beads file.
@@ -103,6 +113,7 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 	// practice; the last-use map keeps residency correct even if that ever fails.
 	// Cached commits contribute zero blob reads.
 	lastUse := make(map[string]int, len(commits)+1)
+	needsSnapshots := false
 	noteUse := func(sha string, i int) {
 		if sha == "" {
 			return
@@ -116,12 +127,29 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 		// A cache hit is valid only if the stored blob pair still matches the
 		// followed file's parent/child OIDs for this commit (re-validation guards
 		// against any rename-following anomaly; in practice always matches).
-		if ce, ok := cached[c.info.SHA]; ok && ce.OldSHA == c.oldSHA && ce.NewSHA == c.newSHA {
+		if ce, ok := cached[c.info.SHA]; ok && ce.OldSHA == c.oldSHA && ce.NewSHA == c.newSHA && ce.Events != nil {
 			perCommitEvents[i] = ce.Events
 			continue
 		}
+		needsSnapshots = true
 		noteUse(c.oldSHA, i)
 		noteUse(c.newSHA, i)
+	}
+	composeEvents := func() []BeadEvent {
+		var events []BeadEvent
+		for i := range commits {
+			events = append(events, perCommitEvents[i]...)
+		}
+		// snapshotCommits returns newest-first (git log order); match the
+		// Extract contract, which returns chronological events.
+		reverseEvents(events)
+		return events
+	}
+	if !needsSnapshots {
+		// A pure cache hit has already been revalidated against the live blob
+		// pairs. Avoid an otherwise-unused cat-file subprocess: it adds latency
+		// and could turn valid cached history into a process-startup failure.
+		return composeEvents(), nil
 	}
 
 	// Streaming blob reader: a single long-lived `git cat-file --batch` fed one
@@ -130,11 +158,16 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 	// reads equal the deduped uncached count — the incremental cache still reads
 	// only the NEW commits' blobs (~0 when nothing is new), matching the previous
 	// readBlobs behavior for the blobsReadCounter tests.
-	reader, err := e.newBlobReader()
+	reader, err := e.openSnapshotBlobReader()
 	if err != nil {
 		return nil, err
 	}
-	defer reader.Close()
+	readerOpen := true
+	defer func() {
+		if readerOpen {
+			_ = reader.Close()
+		}
+	}()
 
 	// snapshots is the live window of record-line multisets, keyed by blob OID.
 	// Each entry retains both the blob bytes its line slices alias and ordered
@@ -154,6 +187,9 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 		blob, err := reader.read(sha)
 		if err != nil {
 			return recordLineSnapshot{}, err
+		}
+		if blob == nil {
+			return recordLineSnapshot{}, fmt.Errorf("cat-file returned no content for nonempty blob object ID %q", sha)
 		}
 		snapshot, _ := buildRecordLineSnapshot(blob, reference, hashRecordLine)
 		snapshots[sha] = snapshot
@@ -208,22 +244,23 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 		}
 	}
 
+	// Verify the long-lived cat-file process completed successfully before any
+	// freshly derived contribution is published. In particular, cancellation can
+	// arrive after the final response was read but before git exits; treating an
+	// ignored Wait error as success would violate cancellation and seed a cache
+	// with results from an unverified subprocess.
+	closeErr := reader.Close()
+	readerOpen = false
+	if closeErr != nil {
+		return nil, fmt.Errorf("closing blob reader: %w", closeErr)
+	}
+
 	// Persist only the freshly computed commits (pure hits are never re-written,
 	// preserving the no-rewrite-on-pure-hit discipline when nothing is new).
 	storePerCommitEvents(namespace, fresh)
 
-	// Compose the full event slice in the SAME ORDER a full extraction produces:
-	// concatenate per-commit events in git-log (newest-first) order, exactly as
-	// the original single loop did, then reverse to chronological.
-	var events []BeadEvent
-	for i := range commits {
-		events = append(events, perCommitEvents[i]...)
-	}
-
-	// snapshotCommits returns newest-first (git log order); match the legacy
-	// Extract contract which sorts chronologically before returning.
-	reverseEvents(events)
-	return events, nil
+	// Compose the full event slice in the same order as a cold extraction.
+	return composeEvents(), nil
 }
 
 // snapshotCommits returns, newest-first, the commits that touched the followed
@@ -235,17 +272,16 @@ func (e *Extractor) snapshotCommits(opts ExtractOptions) ([]snapshotCommit, erro
 	primary := e.primaryBeadsFile()
 
 	args := []string{
-		"log",
 		"--raw",
-		"--no-abbrev", // full 40-char blob ids so cat-file resolves them directly
+		"--no-abbrev", // full SHA-1/SHA-256 blob ids so cat-file resolves them directly
 		"--follow",
 		"--format=" + gitLogHeaderFormat,
 	}
+	args = append(args, lifecycleHistoryOrderArgs()...)
 	args = appendHistoryFilters(args, opts)
 	args = append(args, "--", primary)
 
-	cmd := gitCommand(e.ctx, withNoColorGit(args)...)
-	cmd.Dir = e.repoPath
+	cmd := lifecycleGitLogCommand(e.ctx, e.repoPath, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -288,8 +324,15 @@ func appendHistoryFilters(args []string, opts ExtractOptions) []string {
 // exactly one diff entry per commit; we take the first usable one.
 func parseSnapshotLog(out []byte) ([]snapshotCommit, error) {
 	var commits []snapshotCommit
+	objectIDWidth := 0
 
 	locs := commitPattern.FindAllIndex(out, -1)
+	if len(locs) == 0 && len(bytes.TrimSpace(out)) != 0 {
+		return nil, fmt.Errorf("snapshot log contains no canonical commit headers")
+	}
+	if len(locs) > 0 && len(bytes.TrimSpace(out[:locs[0][0]])) != 0 {
+		return nil, fmt.Errorf("snapshot log contains data before its first commit header")
+	}
 	for i, loc := range locs {
 		start := loc[0]
 		end := len(out)
@@ -302,15 +345,24 @@ func parseSnapshotLog(out []byte) ([]snapshotCommit, error) {
 		// NUL-delimited %H..%s header.
 		nl := bytes.IndexByte(chunk, '\n')
 		if nl < 0 {
-			continue
+			return nil, fmt.Errorf("unterminated snapshot commit header")
 		}
 		info, err := parseCommitInfo(string(chunk[:nl]))
 		if err != nil {
 			return nil, fmt.Errorf("parsing snapshot commit header: %w", err)
 		}
+		if objectIDWidth == 0 {
+			objectIDWidth = len(info.SHA)
+		} else if len(info.SHA) != objectIDWidth {
+			return nil, fmt.Errorf("mixed-width snapshot commit object IDs: got %d and %d characters", objectIDWidth, len(info.SHA))
+		}
 
 		sc := snapshotCommit{info: info}
-		if parseRawDiffLines(chunk[nl+1:], &sc) {
+		usable, err := parseRawDiffLines(chunk[nl+1:], &sc)
+		if err != nil {
+			return nil, fmt.Errorf("parsing raw diff for commit %s: %w", info.SHA, err)
+		}
+		if usable {
 			commits = append(commits, sc)
 		}
 	}
@@ -323,11 +375,14 @@ func parseSnapshotLog(out []byte) ([]snapshotCommit, error) {
 // raw entry is present. A raw line looks like:
 //
 //	:<oldmode> <newmode> <oldsha> <newsha> <status>\t<path>[\t<newpath>]
-func parseRawDiffLines(payload []byte, sc *snapshotCommit) bool {
+func parseRawDiffLines(payload []byte, sc *snapshotCommit) (bool, error) {
 	scanner := bufio.NewScanner(bytes.NewReader(payload))
 	scanner.Buffer(make([]byte, 64*1024), gitLogMaxScanTokenSize)
 	for scanner.Scan() {
 		line := scanner.Text()
+		if strings.ContainsRune(line, '\x00') {
+			return false, fmt.Errorf("malformed commit header inside raw diff payload")
+		}
 		if len(line) == 0 || line[0] != ':' {
 			continue
 		}
@@ -340,28 +395,36 @@ func parseRawDiffLines(payload []byte, sc *snapshotCommit) bool {
 		}
 		fields := strings.Fields(meta)
 		if len(fields) < 5 {
-			continue
+			return false, fmt.Errorf("malformed raw diff metadata %q", meta)
 		}
 		oldSHA := fields[2]
 		newSHA := fields[3]
-		if oldSHA != nullBlobSHA {
+		objectIDWidth := len(sc.info.SHA)
+		if !isCanonicalCommitSHA(oldSHA) || !isCanonicalCommitSHA(newSHA) || len(oldSHA) != objectIDWidth || len(newSHA) != objectIDWidth {
+			return false, fmt.Errorf("invalid or mixed-width blob object IDs %q and %q for %d-character commit ID", oldSHA, newSHA, objectIDWidth)
+		}
+		if !isNullObjectID(oldSHA) {
 			sc.oldSHA = oldSHA
 		}
-		if newSHA != nullBlobSHA {
+		if !isNullObjectID(newSHA) {
 			sc.newSHA = newSHA
 		}
 		// We only act on commits where the followed file has a current blob; a
 		// pure deletion (new == zero) carries no `+{...}` records to extract and
 		// the legacy `-p` path likewise produced no events for it.
-		return sc.newSHA != ""
+		return sc.newSHA != "", nil
 	}
-	return false
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("scanning raw diff: %w", err)
+	}
+	return false, nil
 }
 
 // readBlobs reads the requested blob object ids via a single
 // `git cat-file --batch` process and returns their contents keyed by object id.
-// Object ids must already be unique. Missing blobs map to nil (treated as empty
-// by the caller).
+// Object ids must already be unique. Every requested ID came from a nonzero
+// raw-log side, so a missing response is repository corruption/unavailability,
+// not an empty snapshot, and fails the whole batch.
 //
 // NOTE: extractViaSnapshots no longer uses this — it streams via blobReader to
 // bound peak memory (#182), since holding every historical blob in one map is
@@ -370,17 +433,21 @@ func parseRawDiffLines(payload []byte, sc *snapshotCommit) bool {
 // need all blobs resident at once.
 func (e *Extractor) readBlobs(ids []string) (map[string][]byte, error) {
 	result := make(map[string][]byte, len(ids))
-	atomic.AddInt64(&blobsReadCounter, int64(len(ids)))
 	if len(ids) == 0 {
 		return result, nil
 	}
+	for _, id := range ids {
+		if !isCanonicalCommitSHA(id) {
+			return nil, fmt.Errorf("invalid cat-file blob object ID %q", id)
+		}
+	}
+	atomic.AddInt64(&blobsReadCounter, int64(len(ids)))
 
 	// Sort for deterministic request ordering (purely cosmetic; output is keyed
 	// by id so order does not affect correctness).
 	sort.Strings(ids)
 
-	cmd := gitCommand(e.ctx, "cat-file", "--batch")
-	cmd.Dir = e.repoPath
+	cmd := repoGitCommand(e.ctx, e.repoPath, "cat-file", "--batch")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("git cat-file stdin: %w", err)
@@ -421,26 +488,19 @@ func (e *Extractor) readBlobs(ids []string) (map[string][]byte, error) {
 			if err != nil {
 				return fmt.Errorf("reading cat-file header for %q: %w", s, err)
 			}
-			header = strings.TrimRight(header, "\n")
-			parts := strings.Fields(header)
-			if len(parts) == 2 && parts[1] == "missing" {
-				result[s] = nil
-				continue
+			size, missing, err := parseCatFileBatchHeader(s, header, 0)
+			if err != nil {
+				return err
 			}
-			if len(parts) != 3 {
-				return fmt.Errorf("unexpected cat-file header %q for %q", header, s)
-			}
-			var size int
-			if _, err := fmt.Sscanf(parts[2], "%d", &size); err != nil {
-				return fmt.Errorf("parsing cat-file size %q: %w", parts[2], err)
+			if missing {
+				return fmt.Errorf("cat-file reported nonempty blob object ID %q as missing", s)
 			}
 			content := make([]byte, size)
 			if _, err := readFull(reader, content); err != nil {
 				return fmt.Errorf("reading cat-file content for %q: %w", s, err)
 			}
-			// Trailing newline after each object's content.
-			if _, err := reader.Discard(1); err != nil {
-				return fmt.Errorf("discarding cat-file trailer for %q: %w", s, err)
+			if err := readCatFileBatchTrailer(reader, s); err != nil {
+				return err
 			}
 			result[s] = content
 		}
@@ -493,6 +553,14 @@ type blobReader struct {
 	arenaRunway int
 }
 
+type snapshotBlobReadCloser interface {
+	// read returns a non-nil slice for every present blob, including a
+	// zero-byte blob. Nil without an error violates the snapshot contract.
+	read(string) ([]byte, error)
+	recycle([]byte)
+	Close() error
+}
+
 const (
 	// blobReaderBufferSize is deliberately small enough that large blob payloads
 	// bypass bufio.Reader's transport buffer and read directly into their owned
@@ -506,8 +574,7 @@ const (
 
 // newBlobReader starts the streaming cat-file process for the extractor's repo.
 func (e *Extractor) newBlobReader() (*blobReader, error) {
-	cmd := gitCommand(e.ctx, "cat-file", "--batch")
-	cmd.Dir = e.repoPath
+	cmd := repoGitCommand(e.ctx, e.repoPath, "cat-file", "--batch")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("git cat-file stdin: %w", err)
@@ -528,10 +595,21 @@ func (e *Extractor) newBlobReader() (*blobReader, error) {
 	}, nil
 }
 
-// read returns the content of one blob object id (nil if git reports it
-// missing). Each call is counted in blobsReadCounter so the incremental-cache
-// tests can prove only the NEW commits' blobs are read.
+func (e *Extractor) openSnapshotBlobReader() (snapshotBlobReadCloser, error) {
+	if e.blobReaderFactory != nil {
+		return e.blobReaderFactory()
+	}
+	return e.newBlobReader()
+}
+
+// read returns the content of one blob object ID. A missing response is an
+// error: intentional absence is represented by an empty old/new SHA before this
+// layer. Each call is counted in blobsReadCounter so the incremental-cache tests
+// can prove only the NEW commits' blobs are read.
 func (b *blobReader) read(sha string) ([]byte, error) {
+	if !isCanonicalCommitSHA(sha) {
+		return nil, fmt.Errorf("invalid cat-file blob object ID %q", sha)
+	}
 	atomic.AddInt64(&blobsReadCounter, 1)
 	if _, err := b.w.WriteString(sha + "\n"); err != nil {
 		return nil, fmt.Errorf("writing cat-file id %q: %w", sha, err)
@@ -543,17 +621,12 @@ func (b *blobReader) read(sha string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading cat-file header for %q: %w", sha, err)
 	}
-	trimmed := strings.TrimRight(header, "\n")
-	parts := strings.Fields(trimmed)
-	if len(parts) == 2 && parts[1] == "missing" {
-		return nil, nil
+	size, missing, err := parseCatFileBatchHeader(sha, header, b.arenaRunway)
+	if err != nil {
+		return nil, err
 	}
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("unexpected cat-file header %q for %q", trimmed, sha)
-	}
-	var size int
-	if _, err := fmt.Sscanf(parts[2], "%d", &size); err != nil {
-		return nil, fmt.Errorf("parsing cat-file size %q: %w", parts[2], err)
+	if missing {
+		return nil, fmt.Errorf("cat-file reported nonempty blob object ID %q as missing", sha)
 	}
 	// A missing response returns above without consuming arenaRunway. Move the
 	// capacity removed from the transport buffer to exactly the first real blob
@@ -568,6 +641,11 @@ func (b *blobReader) read(sha string) ([]byte, error) {
 		content = make([]byte, size, capacity)
 	} else if runway > 0 {
 		content = content[:size:capacity]
+	} else if content == nil {
+		// Preserve nil as the reader-contract sentinel for "no blob returned".
+		// A legitimate zero-byte blob is present and must therefore use a
+		// non-nil empty slice even after the one-time arena runway is consumed.
+		content = make([]byte, 0)
 	} else {
 		content = content[:size]
 	}
@@ -575,11 +653,72 @@ func (b *blobReader) read(sha string) ([]byte, error) {
 	if _, err := readFull(b.out, content); err != nil {
 		return nil, fmt.Errorf("reading cat-file content for %q: %w", sha, err)
 	}
-	// Trailing newline after each object's content.
-	if _, err := b.out.Discard(1); err != nil {
-		return nil, fmt.Errorf("discarding cat-file trailer for %q: %w", sha, err)
+	if err := readCatFileBatchTrailer(b.out, sha); err != nil {
+		return nil, err
 	}
 	return content, nil
+}
+
+// parseCatFileBatchHeader validates one response from `git cat-file --batch`.
+// Binding the echoed object ID to the request is essential: accepting a
+// well-shaped response for a different request would silently attribute the
+// wrong historical snapshot to a commit. Exact type, unsigned size, and runway
+// checks keep malformed or desynchronized output from reaching an allocation.
+func parseCatFileBatchHeader(requested, header string, arenaRunway int) (size int, missing bool, err error) {
+	if !isCanonicalCommitSHA(requested) {
+		return 0, false, fmt.Errorf("invalid cat-file blob object ID %q", requested)
+	}
+	if arenaRunway < 0 {
+		return 0, false, fmt.Errorf("invalid cat-file arena runway %d for %q", arenaRunway, requested)
+	}
+	if !strings.HasSuffix(header, "\n") {
+		return 0, false, fmt.Errorf("unterminated cat-file header %q for %q", header, requested)
+	}
+	trimmed := strings.TrimSuffix(header, "\n")
+	parts := strings.Split(trimmed, " ")
+	if len(parts) != 2 && len(parts) != 3 {
+		return 0, false, fmt.Errorf("unexpected cat-file header %q for %q", trimmed, requested)
+	}
+	if parts[0] != requested {
+		return 0, false, fmt.Errorf("cat-file response object ID %q does not match request %q", parts[0], requested)
+	}
+	if len(parts) == 2 {
+		if parts[1] != "missing" {
+			return 0, false, fmt.Errorf("unexpected cat-file header %q for %q", trimmed, requested)
+		}
+		return 0, true, nil
+	}
+	if parts[1] != "blob" {
+		return 0, false, fmt.Errorf("cat-file response for %q has object type %q, want blob", requested, parts[1])
+	}
+	if parts[2] == "" {
+		return 0, false, fmt.Errorf("empty cat-file size for %q", requested)
+	}
+	for i := range len(parts[2]) {
+		if parts[2][i] < '0' || parts[2][i] > '9' {
+			return 0, false, fmt.Errorf("invalid cat-file size %q for %q", parts[2], requested)
+		}
+	}
+	size64, parseErr := strconv.ParseUint(parts[2], 10, 64)
+	if parseErr != nil {
+		return 0, false, fmt.Errorf("parsing cat-file size %q for %q: %w", parts[2], requested, parseErr)
+	}
+	maxInt := int(^uint(0) >> 1)
+	if size64 > uint64(maxInt-arenaRunway) {
+		return 0, false, fmt.Errorf("cat-file size %q for %q exceeds safe allocation limit with runway %d", parts[2], requested, arenaRunway)
+	}
+	return int(size64), false, nil
+}
+
+func readCatFileBatchTrailer(reader *bufio.Reader, requested string) error {
+	trailer, err := reader.ReadByte()
+	if err != nil {
+		return fmt.Errorf("reading cat-file trailer for %q: %w", requested, err)
+	}
+	if trailer != '\n' {
+		return fmt.Errorf("invalid cat-file trailer %q for %q, want newline", trailer, requested)
+	}
+	return nil
 }
 
 // recycle retains at most one no-longer-live blob buffer for the next read.
@@ -662,25 +801,31 @@ type recordLineBuildStats struct {
 	reusedBytes   int
 }
 
-// recordLineEntry is one entry of a recordLineSet: how many times the record line
-// occurs in the blob, plus a representative copy of the line bytes (needed to emit
-// the synthesized diff for changed records).
+// recordLineEntry is one exact record in a recordLineSet: how many times the
+// record line occurs in the blob, plus a representative copy of the line bytes
+// (needed to emit the synthesized diff for changed records). next links the rare
+// records with the same 64-bit digest; exact bytes, never the digest alone,
+// determine line identity.
 type recordLineEntry struct {
 	count int
 	text  []byte
+	next  *recordLineEntry
 }
 
-// recordLineSet is the multiset of a blob's JSON record lines (those beginning
-// with '{'), keyed by a 64-bit hash of the line. Beads writes one whole JSON
-// record per line, so identity of a record is line identity; keying by hash
-// avoids retaining/hashing the full multi-KB line strings as map keys
-// (~4x faster than a map[string]int over the same blob).
+// recordLineSet is the multiset of a blob's loader-eligible JSON record lines,
+// including their leading whitespace and an optional first-line UTF-8 BOM,
+// indexed by a 64-bit hash of the full physical line. Beads writes one whole
+// JSON record per line, so identity of a record is exact line identity. The hash
+// is only a fast bucket selector: colliding lines remain separate linked
+// entries. This avoids full multi-KB string map keys without treating a digest
+// collision as an unchanged lifecycle record.
 type recordLineSet map[uint64]*recordLineEntry
 
 // newRecordLineSet builds the record-line multiset for a blob. Non-record lines
-// (not starting with '{') are ignored, matching parseDiff which only acts on
-// lines beginning with '{'. The returned entries alias into blob, which the
-// caller retains for the duration of the extraction.
+// are ignored, matching the loader's JSON-object eligibility after its exact
+// first-line BOM and JSON-whitespace normalization. The returned entries retain
+// the full physical line and alias into blob, which the caller retains for the
+// duration of the extraction.
 func newRecordLineSet(blob []byte) recordLineSet {
 	snapshot, _ := buildRecordLineSnapshot(blob, nil, hashRecordLine)
 	return snapshot.lines
@@ -748,9 +893,18 @@ func buildRecordLineSnapshot(
 	set := make(recordLineSet, len(records))
 	for _, record := range records {
 		line := target[record.start:record.end]
-		if entry, ok := set[record.hash]; ok {
-			entry.count++
-		} else {
+		var previous *recordLineEntry
+		for entry := set[record.hash]; entry != nil; entry = entry.next {
+			if bytes.Equal(entry.text, line) {
+				entry.count++
+				previous = nil
+				break
+			}
+			previous = entry
+		}
+		if previous != nil {
+			previous.next = &recordLineEntry{count: 1, text: line}
+		} else if set[record.hash] == nil {
 			set[record.hash] = &recordLineEntry{count: 1, text: line}
 		}
 	}
@@ -763,10 +917,13 @@ func buildRecordLineSnapshot(
 	}, stats
 }
 
-// scanRecordLineDescriptors records only lines whose first byte is '{'. A final
-// record without a line-feed is included; empty and non-record lines do not
-// consume a record ordinal, which is what makes prefix/suffix comparison match
-// the recordLineSet semantics rather than physical line numbers.
+// scanRecordLineDescriptors records the JSON-object lines accepted by the
+// loader: JSON whitespace may precede an object, and a UTF-8 BOM is stripped
+// only when it begins the first physical line. Descriptors still retain the full
+// physical line so hashing, equality, and synthesized diffs remain byte-exact.
+// A final record without a line-feed is included; empty and non-record lines do
+// not consume a record ordinal, which makes prefix/suffix comparison match
+// recordLineSet semantics rather than physical line numbers.
 func scanRecordLineDescriptors(blob []byte) []recordLineDescriptor {
 	var records []recordLineDescriptor
 	for start := 0; start < len(blob); {
@@ -777,7 +934,7 @@ func scanRecordLineDescriptors(blob []byte) []recordLineDescriptor {
 			end = start + relativeNewline
 			next = end + 1
 		}
-		if end > start && blob[start] == '{' {
+		if isBeadRecordLine(blob[start:end], start == 0) {
 			records = append(records, recordLineDescriptor{start: start, end: end})
 		}
 		start = next
@@ -785,39 +942,55 @@ func scanRecordLineDescriptors(blob []byte) []recordLineDescriptor {
 	return records
 }
 
-// synthesizeRecordDiff produces the same `+{...}`/`-{...}` record lines that
-// `git log -p --unified=0` would emit for one commit, by computing the line-level
-// set difference between the parent blob's record set (old) and the commit blob's
+func isBeadRecordLine(line []byte, firstPhysicalLine bool) bool {
+	normalized := line
+	if firstPhysicalLine {
+		normalized = bytes.TrimPrefix(normalized, []byte{0xEF, 0xBB, 0xBF})
+	}
+	normalized = bytes.Trim(normalized, " \t\r\n")
+	return len(normalized) > 0 && normalized[0] == '{'
+}
+
+// synthesizeRecordDiff produces the same +/- physical record lines that a
+// zero-context Git patch would emit for one commit, by computing the line-level set
+// difference between the parent blob's record set (old) and the commit blob's
 // record set (new). A nil oldSet means "no parent" — every record reads as an
 // addition. A record present in exactly one side marks it added/removed; a
-// modified record appears as the old line removed and the new line added
-// (identical to git's unified=0 output for the downstream parser, which only
-// consumes lines beginning with '{').
+// modified record appears as the old line removed and the new line added. The
+// downstream parser applies the same JSON-whitespace and first-line BOM
+// normalization as the loader to every record admitted by this index.
 func synthesizeRecordDiff(oldSet, newSet recordLineSet) []byte {
 	var buf bytes.Buffer
 	// Removed: present in old, absent (or fewer) in new.
-	for h, oe := range oldSet {
-		newCount := 0
-		if ne, ok := newSet[h]; ok {
-			newCount = ne.count
-		}
-		for i := 0; i < oe.count-newCount; i++ {
-			buf.WriteByte('-')
-			buf.Write(oe.text)
-			buf.WriteByte('\n')
+	for h, bucket := range oldSet {
+		for oe := bucket; oe != nil; oe = oe.next {
+			newCount := recordLineCount(newSet[h], oe.text)
+			for i := 0; i < oe.count-newCount; i++ {
+				buf.WriteByte('-')
+				buf.Write(oe.text)
+				buf.WriteByte('\n')
+			}
 		}
 	}
 	// Added: present in new, absent (or fewer) in old.
-	for h, ne := range newSet {
-		oldCount := 0
-		if oe, ok := oldSet[h]; ok {
-			oldCount = oe.count
-		}
-		for i := 0; i < ne.count-oldCount; i++ {
-			buf.WriteByte('+')
-			buf.Write(ne.text)
-			buf.WriteByte('\n')
+	for h, bucket := range newSet {
+		for ne := bucket; ne != nil; ne = ne.next {
+			oldCount := recordLineCount(oldSet[h], ne.text)
+			for i := 0; i < ne.count-oldCount; i++ {
+				buf.WriteByte('+')
+				buf.Write(ne.text)
+				buf.WriteByte('\n')
+			}
 		}
 	}
 	return buf.Bytes()
+}
+
+func recordLineCount(bucket *recordLineEntry, text []byte) int {
+	for entry := bucket; entry != nil; entry = entry.next {
+		if bytes.Equal(entry.text, text) {
+			return entry.count
+		}
+	}
+	return 0
 }

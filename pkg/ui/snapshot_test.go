@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -143,6 +144,47 @@ func TestSnapshotBuilder_Simple(t *testing.T) {
 
 	if snapshot.CreatedAt.IsZero() {
 		t.Error("CreatedAt should be set")
+	}
+}
+
+func TestSnapshotBuilder_ReadyCountExcludesDeferredAndDraftIssues(t *testing.T) {
+	future := time.Now().Add(24 * time.Hour)
+	issues := []model.Issue{
+		{ID: "ready", Title: "Ready", Status: model.StatusOpen},
+		{ID: "scheduled", Title: "Scheduled", Status: model.StatusOpen, DeferUntil: &future},
+		{ID: "deferred", Title: "Deferred", Status: model.StatusDeferred},
+		{ID: "draft", Title: "Draft", Status: model.StatusDraft},
+	}
+
+	snapshot := NewSnapshotBuilder(issues).Build()
+	if snapshot.CountReady != 1 {
+		t.Fatalf("CountReady=%d, want only the unscheduled open issue", snapshot.CountReady)
+	}
+}
+
+func TestSnapshotBuilder_ReadyCountExcludesParentBlockedDescendants(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "ROOT", Title: "Root blocker", Status: model.StatusOpen},
+		{ID: "P", Title: "Blocked parent", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "ROOT", Type: model.DepBlocks},
+		}},
+		{ID: "CHILD", Title: "Child", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "P", Type: model.DepParentChild},
+		}},
+	}
+
+	snapshot := NewSnapshotBuilder(issues).Build()
+	if snapshot.CountReady != 1 {
+		t.Fatalf("CountReady=%d, want only ROOT; CHILD inherits P's blocker", snapshot.CountReady)
+	}
+}
+
+func TestNewModelAtDoesNotStartLiveReload(t *testing.T) {
+	t.Setenv("BV_BACKGROUND_MODE", "true")
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	m := NewModelAt(nil, nil, path, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	if m.watcher != nil || m.backgroundWorker != nil {
+		t.Fatal("historical model started a live watcher")
 	}
 }
 
@@ -490,6 +532,33 @@ func TestSnapshotBuilder_WithRecipe_FiltersListItems(t *testing.T) {
 	}
 	if got := snapshot.ListItems[0].Issue.ID; got != "open-1" {
 		t.Fatalf("Expected open-1, got %s", got)
+	}
+}
+
+func TestSnapshotBuilder_ActionableRecipeExcludesParentBlockedDescendants(t *testing.T) {
+	actionable := true
+	issues := []model.Issue{
+		{ID: "ROOT", Status: model.StatusOpen},
+		{ID: "CLOSED", Status: model.StatusClosed},
+		{ID: "DRAFT", Status: model.StatusDraft},
+		{ID: "STATUS-BLOCKED", Status: model.StatusBlocked},
+		{ID: "P", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "ROOT", Type: model.DepBlocks},
+		}},
+		{ID: "CHILD", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "P", Type: model.DepParentChild},
+		}},
+	}
+	r := &recipe.Recipe{
+		Name: "actionable",
+		Filters: recipe.FilterConfig{
+			Actionable: &actionable,
+		},
+	}
+
+	snapshot := NewSnapshotBuilder(issues).WithRecipe(r).Build()
+	if len(snapshot.ListItems) != 1 || snapshot.ListItems[0].Issue.ID != "ROOT" {
+		t.Fatalf("actionable recipe items = %#v, want only ROOT", snapshot.ListItems)
 	}
 }
 
@@ -850,9 +919,9 @@ func TestSnapshotSwapRefiltersAndRestoresVisibleSelection(t *testing.T) {
 	raw := cmd()
 	filterMsg, ok := raw.(snapshotListFilterMsg)
 	if batch, isBatch := raw.(tea.BatchMsg); isBatch {
-		// The snapshot also schedules history refresh work. Search backward so
-		// this unit test executes only the list-refilter command, which is added
-		// after the unrelated background commands.
+		// The snapshot can also schedule unrelated background work. Search
+		// backward so this unit test executes only the list-refilter command,
+		// which is added after those background commands.
 		for i := len(batch) - 1; i >= 0 && !ok; i-- {
 			filterMsg, ok = batch[i]().(snapshotListFilterMsg)
 		}
@@ -944,13 +1013,28 @@ func TestSnapshotSwapRejectsOutOfOrderVersionAndReleasesLease(t *testing.T) {
 	}
 
 	m := NewModel(copyIssues(olderIssues), nil, "")
-	updated, _ := m.Update(SnapshotReadyMsg{Snapshot: newer, SnapshotVer: 2})
+	acceptedSource := newLiveReloadSourceContext("/accepted/.beads", "/accepted", nil)
+	updated, _ := m.Update(SnapshotReadyMsg{
+		Snapshot:          newer,
+		SnapshotVer:       2,
+		liveSourceContext: acceptedSource,
+		smartLiveSource:   true,
+	})
 	m = updated.(*Model)
 	if m.snapshot != newer || m.lastAppliedSnapshotVer != 2 {
 		t.Fatalf("newer snapshot was not installed: snapshot=%p want=%p version=%d", m.snapshot, newer, m.lastAppliedSnapshotVer)
 	}
+	if !m.smartLiveSource || m.liveSourceContext.beadsDir != acceptedSource.beadsDir {
+		t.Fatalf("accepted snapshot route = %+v smart=%v, want %+v/true", m.liveSourceContext, m.smartLiveSource, acceptedSource)
+	}
 
-	updated, _ = m.Update(SnapshotReadyMsg{Snapshot: older, SnapshotVer: 1})
+	staleSource := newLiveReloadSourceContext("/stale/.beads", "/stale", nil)
+	updated, _ = m.Update(SnapshotReadyMsg{
+		Snapshot:          older,
+		SnapshotVer:       1,
+		liveSourceContext: staleSource,
+		smartLiveSource:   true,
+	})
 	m = updated.(*Model)
 	if m.snapshot != newer {
 		t.Fatalf("out-of-order snapshot replaced current snapshot: got=%p want=%p", m.snapshot, newer)
@@ -960,6 +1044,9 @@ func TestSnapshotSwapRejectsOutOfOrderVersionAndReleasesLease(t *testing.T) {
 	}
 	if got := m.issues[0].Title; got != "Newer snapshot" {
 		t.Fatalf("model data rolled back to stale snapshot: title=%q", got)
+	}
+	if m.liveSourceContext.beadsDir != acceptedSource.beadsDir {
+		t.Fatalf("stale snapshot changed route to %+v", m.liveSourceContext)
 	}
 	if staleReleases != 1 || older.hasPooledIssues() {
 		t.Fatalf("stale snapshot lease release count=%d active=%v, want 1/false", staleReleases, older.hasPooledIssues())
@@ -1001,6 +1088,30 @@ func TestSnapshotSwapRejectsOutOfOrderVersionAndReleasesLease(t *testing.T) {
 	m = updated.(*Model)
 	if !newer.phase2Ready {
 		t.Fatal("matching versioned Phase 2 update was rejected")
+	}
+}
+
+func TestSnapshotSwapReadyFilterExcludesScheduledIssue(t *testing.T) {
+	future := time.Now().Add(24 * time.Hour)
+	issues := []model.Issue{
+		{ID: "ready", Title: "Ready", Status: model.StatusOpen, IssueType: model.TypeTask},
+		{ID: "scheduled", Title: "Scheduled", Status: model.StatusOpen, IssueType: model.TypeTask, DeferUntil: &future},
+	}
+	cfg := snapshotBuildConfigDefault()
+	cfg.SkipPhase2 = true
+	snapshot := NewSnapshotBuilder(copyIssues(issues)).WithBuildConfig(cfg).Build()
+	m := NewModel(copyIssues(issues), nil, "")
+	m.currentFilter = "ready"
+
+	updated, _ := m.Update(SnapshotReadyMsg{Snapshot: snapshot, SnapshotVer: 1})
+	m = updated.(*Model)
+	items := m.list.Items()
+	if len(items) != 1 {
+		t.Fatalf("ready-filtered list has %d items, want 1", len(items))
+	}
+	item, ok := items[0].(IssueItem)
+	if !ok || item.Issue.ID != "ready" {
+		t.Fatalf("ready-filtered item = %#v, want ready", items[0])
 	}
 }
 
@@ -1617,6 +1728,9 @@ func TestWithPhase2_DetachesMutableIssueState(t *testing.T) {
 	if got := newSnapshot.IssueMap["A"].Title; got == "mutated old snapshot" {
 		t.Error("mutating the old snapshot should not affect the cloned Phase 2 snapshot")
 	}
+	if len(newSnapshot.ViewIssues) > 0 && newSnapshot.ViewIssues[0].Title == "mutated old snapshot" {
+		t.Error("mutating the old snapshot should not affect the Phase 2 view issues")
+	}
 }
 
 // TestWithPhase2_NilSnapshot verifies that WithPhase2 handles nil receiver gracefully.
@@ -1693,6 +1807,28 @@ func TestWithPhase2_TriagePopulation(t *testing.T) {
 	t.Logf("BlockerSet: %d entries", len(newSnapshot.BlockerSet))
 	t.Logf("QuickWinSet: %d entries", len(newSnapshot.QuickWinSet))
 	t.Logf("UnblocksMap: %d entries", len(newSnapshot.UnblocksMap))
+}
+
+func TestWithPhase2UsesAnalyzerReferenceTimeForDeferral(t *testing.T) {
+	pinned := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	deferUntil := pinned.Add(24 * time.Hour)
+	issues := []model.Issue{
+		{ID: "scheduled", Title: "Scheduled", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, DeferUntil: &deferUntil, UpdatedAt: pinned},
+		{ID: "ready", Title: "Ready", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1, UpdatedAt: pinned},
+	}
+	cfg := snapshotBuildConfigDefault()
+	cfg.SkipPhase2 = true
+	original := NewSnapshotBuilder(copyIssues(issues)).WithBuildConfig(cfg).Build()
+	analyzer := analysis.NewAnalyzer(issues)
+	analyzer.SetNow(pinned)
+	stats := analyzer.AnalyzeAsync(nil)
+	stats.WaitForPhase2()
+
+	updated := original.WithPhase2(stats, stats.GenerateInsights(len(issues)), issues, analyzer)
+	reasons, ok := updated.TriageReasons["scheduled"]
+	if !ok || !strings.Contains(reasons.ActionHint, "Deferred until") {
+		t.Fatalf("scheduled triage reasons = %+v, present %v; want pinned-time deferral guidance", reasons, ok)
+	}
 }
 
 // TestWithPhase2_TreeDeepCopy verifies that tree structures are deep copied,

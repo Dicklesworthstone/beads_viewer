@@ -8,15 +8,20 @@ import (
 	"testing"
 )
 
-// writeBeads writes the given JSONL content to .beads/beads.jsonl under dir.
+// writeBeads creates a minimal current-br fixture, including the metadata that
+// proves where live claim commands would be routed.
 func writeBeads(t *testing.T, dir, content string) {
 	t.Helper()
 	beadsDir := filepath.Join(dir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 		t.Fatalf("mkdir beads: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(content), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(content), 0o644); err != nil {
 		t.Fatalf("write beads: %v", err)
+	}
+	metadata := []byte("{\"database\":\"beads.db\",\"jsonl_export\":\"issues.jsonl\"}\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), metadata, 0o644); err != nil {
+		t.Fatalf("write beads metadata: %v", err)
 	}
 }
 

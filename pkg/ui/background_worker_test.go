@@ -106,6 +106,123 @@ func TestBackgroundWorker_NewWithPath(t *testing.T) {
 	}
 }
 
+func TestLoadIssuesForReloadReselectsFresherCanonicalSibling(t *testing.T) {
+	t.Setenv(loader.BeadsDBEnvVar, "")
+	t.Setenv(loader.BeadsDirEnvVar, "")
+	repoDir := t.TempDir()
+	t.Chdir(repoDir)
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initialPath := filepath.Join(beadsDir, "issues.jsonl")
+	fallbackPath := filepath.Join(beadsDir, "beads.jsonl")
+	if err := os.WriteFile(initialPath, []byte(`{"id":"old","title":"Old","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fallbackPath, []byte(`{"id":"new","title":"New","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(initialPath, base, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(fallbackPath, base.Add(time.Minute), base.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadIssuesForReload(initialPath, loader.ParseOptions{})
+	if err != nil {
+		t.Fatalf("smart reload: %v", err)
+	}
+	if len(loaded.Issues) != 1 || loaded.Issues[0].ID != "new" {
+		t.Fatalf("smart reload kept pinned source: %#v", loaded.Issues)
+	}
+}
+
+func TestLiveReloadSiblingFilesIncludesCanonicalSourcesAndSQLiteWAL(t *testing.T) {
+	t.Setenv(loader.BeadsDBEnvVar, "")
+	t.Setenv(loader.BeadsDirEnvVar, "")
+	path := filepath.Join(t.TempDir(), ".beads", "issues.jsonl")
+	got := make(map[string]bool)
+	for _, name := range liveReloadSiblingFiles(path) {
+		got[name] = true
+	}
+	for _, name := range []string{"beads.db", "beads.db-wal", "issues.jsonl", "beads.jsonl", "beads.base.jsonl"} {
+		if !got[name] {
+			t.Errorf("live reload candidate %q is missing from %v", name, got)
+		}
+	}
+}
+
+func TestLoadIssuesForReloadPreservesExplicitFileChoice(t *testing.T) {
+	repoDir := t.TempDir()
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	explicitPath := filepath.Join(beadsDir, "issues.jsonl")
+	siblingPath := filepath.Join(beadsDir, "beads.jsonl")
+	if err := os.WriteFile(explicitPath, []byte(
+		`{"id":"explicit","title":"Explicit","status":"open","issue_type":"task"}`+"\n"+
+			`{"id":"deleted","title":"Deleted","status":"tombstone","issue_type":"task"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(siblingPath, []byte(`{"id":"sibling","title":"Sibling","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(loader.BeadsDBEnvVar, explicitPath)
+
+	loaded, err := loadIssuesForReload(explicitPath, loader.ParseOptions{})
+	if err != nil {
+		t.Fatalf("explicit reload: %v", err)
+	}
+	if len(loaded.Issues) != 1 || loaded.Issues[0].ID != "explicit" {
+		t.Fatalf("explicit source was broadened to sibling selection: %#v", loaded.Issues)
+	}
+}
+
+func TestBackgroundWorkerSnapshotReselectsFresherCanonicalSibling(t *testing.T) {
+	t.Setenv(loader.BeadsDBEnvVar, "")
+	t.Setenv(loader.BeadsDirEnvVar, "")
+	repoDir := t.TempDir()
+	t.Chdir(repoDir)
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initialPath := filepath.Join(beadsDir, "issues.jsonl")
+	siblingPath := filepath.Join(beadsDir, "beads.jsonl")
+	if err := os.WriteFile(initialPath, []byte(`{"id":"old","title":"Old","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(siblingPath, []byte(`{"id":"new","title":"New","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(initialPath, base, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(siblingPath, base.Add(time.Minute), base.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	worker, err := NewBackgroundWorker(WorkerConfig{BeadsPath: initialPath})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker: %v", err)
+	}
+	defer worker.Stop()
+	snapshot := worker.buildSnapshot(false)
+	if snapshot == nil {
+		t.Fatal("smart background snapshot is nil")
+	}
+	defer snapshot.releasePooledIssues()
+	if len(snapshot.Issues) != 1 || snapshot.Issues[0].ID != "new" {
+		t.Fatalf("background snapshot kept pinned source: %#v", snapshot.Issues)
+	}
+}
+
 func TestBackgroundWorker_StartStop(t *testing.T) {
 	tmpDir := t.TempDir()
 	beadsPath := filepath.Join(tmpDir, "beads.jsonl")

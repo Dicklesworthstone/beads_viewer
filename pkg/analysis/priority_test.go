@@ -142,6 +142,33 @@ func TestComputeImpactScoresBlockerRatio(t *testing.T) {
 	}
 }
 
+func TestComputeImpactScoresBlockerRatioDeduplicatesDependents(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "duplicate-root", Status: model.StatusOpen},
+		{ID: "duplicate-dependent", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "duplicate-root", Type: model.DepBlocks},
+			{DependsOnID: "duplicate-root", Type: model.DepBlocks},
+			{DependsOnID: "duplicate-root", Type: model.DepBlocks},
+		}},
+		{ID: "two-root", Status: model.StatusOpen},
+		{ID: "two-dependent-a", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "two-root", Type: model.DepBlocks}}},
+		{ID: "two-dependent-b", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "two-root", Type: model.DepBlocks}}},
+	}
+
+	scores := analysis.NewAnalyzer(issues).ComputeImpactScores()
+	scoreByID := make(map[string]analysis.ImpactScore, len(scores))
+	for _, score := range scores {
+		scoreByID[score.IssueID] = score
+	}
+
+	if got := scoreByID["duplicate-root"].Breakdown.BlockerRatioNorm; got != 0.5 {
+		t.Fatalf("one unique dependent normalized ratio = %v, want 0.5", got)
+	}
+	if got := scoreByID["two-root"].Breakdown.BlockerRatioNorm; got != 1 {
+		t.Fatalf("two unique dependents normalized ratio = %v, want 1", got)
+	}
+}
+
 func TestComputeImpactScoresPageRank(t *testing.T) {
 	// Chain: A <- B <- C (C depends on B depends on A)
 	// A should have highest PageRank (fundamental dependency)
@@ -235,6 +262,10 @@ func TestTopImpactScores(t *testing.T) {
 	top10 := an.TopImpactScores(10)
 	if len(top10) != 5 {
 		t.Errorf("Expected 5 scores (all available), got %d", len(top10))
+	}
+
+	if got := an.TopImpactScores(-1); len(got) != 0 {
+		t.Errorf("Expected no scores for a negative limit, got %d", len(got))
 	}
 }
 

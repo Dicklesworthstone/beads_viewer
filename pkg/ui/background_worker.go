@@ -175,6 +175,8 @@ type workerMetrics struct {
 type BackgroundWorker struct {
 	// Configuration
 	beadsPath         string
+	liveSourceContext liveReloadSourceContext
+	smartLiveSource   bool
 	debounceDelay     time.Duration
 	heartbeatInterval time.Duration
 	watchdogInterval  time.Duration
@@ -269,6 +271,11 @@ type WorkerConfig struct {
 	HeartbeatTimeout  time.Duration // default: 30s
 	ProcessingTimeout time.Duration // default: 30s
 	MaxRecoveries     int           // default: 3
+
+	// Internal route identity supplied by Model. Keeping it separate from the
+	// selected file path lets redirects change without losing the invoking repo.
+	liveSourceContext liveReloadSourceContext
+	smartLiveSource   bool
 }
 
 // NewBackgroundWorker creates a new background worker.
@@ -330,6 +337,8 @@ func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 
 	w := &BackgroundWorker{
 		beadsPath:         cfg.BeadsPath,
+		liveSourceContext: cfg.liveSourceContext,
+		smartLiveSource:   cfg.smartLiveSource,
 		debounceDelay:     cfg.DebounceDelay,
 		heartbeatInterval: cfg.HeartbeatInterval,
 		watchdogInterval:  cfg.WatchdogInterval,
@@ -354,13 +363,14 @@ func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 		idleGCGCPercent:   idleGCConfig.GCPercent,
 		idleGCFunc:        runtime.GC,
 	}
+	if cfg.BeadsPath != "" && strings.TrimSpace(w.liveSourceContext.repoPath) == "" && !w.smartLiveSource {
+		w.liveSourceContext, w.smartLiveSource = liveReloadSmartSourceContext(cfg.BeadsPath)
+	}
 	w.lastActivityUnixNano.Store(time.Now().UnixNano())
 
 	// Initialize file watcher
 	if cfg.BeadsPath != "" {
-		fw, err := watcher.NewWatcher(cfg.BeadsPath,
-			watcher.WithDebounceDuration(cfg.DebounceDelay),
-		)
+		fw, err := newLiveReloadWatcherWithContext(cfg.BeadsPath, cfg.DebounceDelay, w.liveSourceContext, w.smartLiveSource)
 		if err != nil {
 			return nil, err
 		}
@@ -1213,14 +1223,20 @@ func (w *BackgroundWorker) processWithSnapshotBuilder(build func(bool) snapshotB
 			"coalesced":   coalesced,
 			"queue_depth": queueDepth,
 		})
+		w.mu.Lock()
+		readySourceContext := w.liveSourceContext
+		readySmartSource := w.smartLiveSource
+		w.mu.Unlock()
 		w.send(SnapshotReadyMsg{
-			Snapshot:         snapshot,
-			FileChangeAt:     fileChangeAt,
-			SentAt:           readyAt,
-			SnapshotVer:      version,
-			WorkerGeneration: gen,
-			QueueDepth:       queueDepth,
-			CoalesceCount:    coalesced,
+			Snapshot:          snapshot,
+			liveSourceContext: readySourceContext,
+			smartLiveSource:   readySmartSource,
+			FileChangeAt:      fileChangeAt,
+			SentAt:            readyAt,
+			SnapshotVer:       version,
+			WorkerGeneration:  gen,
+			QueueDepth:        queueDepth,
+			CoalesceCount:     coalesced,
 		})
 		// Start the Phase 2 waiter only after SnapshotReadyMsg has been queued.
 		// This guarantees message order and gives the completion message the
@@ -1458,6 +1474,9 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 	currentRecipe := w.currentRecipe
 	recipeID := w.currentRecipeID
 	recipeHash := w.currentRecipeHash
+	liveSourceContext := w.liveSourceContext
+	smartSourceSelection := w.smartLiveSource
+	liveWatcher := w.watcher
 	w.mu.RUnlock()
 
 	// Determine dataset tier using a fast line count (bv-9thm).
@@ -1467,15 +1486,18 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 	if profileSnapshot {
 		countStart = time.Now()
 	}
-	countErr := w.safeCompute("count_lines", func() error {
-		n, err := countIssuesForReload(w.beadsPath)
-		if err != nil {
-			return err
-		}
-		sourceLineCount = n
-		tier = datasetTierForIssueCount(n)
-		return nil
-	})
+	var countErr error
+	if !smartSourceSelection {
+		countErr = w.safeCompute("count_lines", func() error {
+			n, err := countIssuesForReload(w.beadsPath)
+			if err != nil {
+				return err
+			}
+			sourceLineCount = n
+			tier = datasetTierForIssueCount(n)
+			return nil
+		})
+	}
 	if profileSnapshot {
 		recordTiming("line_count", time.Since(countStart))
 	}
@@ -1500,21 +1522,52 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 	loadErr := w.safeCompute("load", func() error {
 		var err error
 		var loaded loader.PooledIssues
-		opts := loader.ParseOptions{
-			WarningHandler: func(string) {
+		var parseStats loader.ParseStats
+		if refreshed, ok := refreshLiveReloadSourceContext(liveSourceContext, smartSourceSelection); ok {
+			if watchErr := augmentLiveReloadWatcher(liveWatcher, w.beadsPath, refreshed, true); watchErr != nil {
 				loadWarningCount++
-			},
-			BufferSize: envMaxLineSizeBytes(),
+				w.logEvent(LogLevelWarn, "watch_route_refresh_failed", map[string]any{"error": watchErr.Error()})
+			}
+			liveSourceContext = refreshed
+			w.mu.Lock()
+			w.liveSourceContext = refreshed
+			w.smartLiveSource = true
+			w.mu.Unlock()
+		}
+		opts := loader.ParseOptions{
+			WarningHandler: func(string) {},
+			WarningCount:   &loadWarningCount,
+			BufferSize:     envMaxLineSizeBytes(),
+			Stats:          &parseStats,
 		}
 		if loadOpenOnly {
 			opts.IssueFilter = func(i *model.Issue) bool {
 				return i.Status != model.StatusClosed && i.Status != model.StatusTombstone
 			}
 		}
-		loaded, err = loadIssuesForReload(w.beadsPath, opts)
+		loaded, err = loadIssuesForReloadWithContext(w.beadsPath, opts, liveSourceContext, smartSourceSelection)
 		if err == nil {
 			issues = loaded.Issues
 			pooledRefs = loaded.PoolRefs
+			if smartSourceSelection {
+				// Smart selection must validate and materialize the newly authoritative
+				// source before its true size is known. Derive the tier from that one
+				// load, then apply the huge-dataset projection in memory so a stale
+				// count from the previously selected file cannot filter the wrong data.
+				sourceLineCount = len(issues)
+				tier = datasetTierForIssueCount(sourceLineCount)
+				loadOpenOnly = tier == datasetTierHuge && !recipeIncludesClosedStatuses(currentRecipe)
+				if loadOpenOnly {
+					openIssues := issues[:0]
+					for i := range issues {
+						if issues[i].Status != model.StatusClosed && issues[i].Status != model.StatusTombstone {
+							openIssues = append(openIssues, issues[i])
+						}
+					}
+					clear(issues[len(openIssues):])
+					issues = openIssues
+				}
+			}
 		}
 		return err
 	})
@@ -1831,13 +1884,15 @@ func (w *BackgroundWorker) runPhase2Analysis(snapshot *DataSnapshot, snapshotVer
 
 // SnapshotReadyMsg is sent to the UI when a new snapshot is ready.
 type SnapshotReadyMsg struct {
-	Snapshot         *DataSnapshot
-	FileChangeAt     time.Time
-	SentAt           time.Time
-	SnapshotVer      uint64
-	WorkerGeneration uint64
-	QueueDepth       int64
-	CoalesceCount    int64
+	Snapshot          *DataSnapshot
+	liveSourceContext liveReloadSourceContext
+	smartLiveSource   bool
+	FileChangeAt      time.Time
+	SentAt            time.Time
+	SnapshotVer       uint64
+	WorkerGeneration  uint64
+	QueueDepth        int64
+	CoalesceCount     int64
 }
 
 // SnapshotErrorMsg is sent to the UI when snapshot building fails.

@@ -3,6 +3,7 @@ package correlation
 
 import (
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -16,9 +17,11 @@ const (
 	CausalClaimed CausalEventType = "claimed"
 	// CausalCommit indicates a code commit related to the bead
 	CausalCommit CausalEventType = "commit"
-	// CausalBlocked indicates the bead became blocked
+	// CausalBlocked is reserved for an explicit block transition from a future
+	// history source. The current Git-history builder does not emit this event type.
 	CausalBlocked CausalEventType = "blocked"
-	// CausalUnblocked indicates the bead was unblocked
+	// CausalUnblocked is reserved for an explicit unblock transition from a
+	// future history source. The current Git-history builder does not emit it.
 	CausalUnblocked CausalEventType = "unblocked"
 	// CausalClosed indicates the bead was closed
 	CausalClosed CausalEventType = "closed"
@@ -47,8 +50,8 @@ type CausalChain struct {
 	Events     []CausalEvent `json:"events"`      // All events in chronological order
 	EdgeCount  int           `json:"edge_count"`  // Number of causal links
 	StartTime  time.Time     `json:"start_time"`  // First event time
-	EndTime    time.Time     `json:"end_time"`    // Last event time (or now if open)
-	TotalTime  time.Duration `json:"total_time"`  // Total elapsed time
+	EndTime    time.Time     `json:"end_time"`    // Terminal close, or reference time if open; zero when completion timing is unknown
+	TotalTime  time.Duration `json:"total_time"`  // Total elapsed time; zero when no defensible end instant exists
 	IsComplete bool          `json:"is_complete"` // True if bead is closed
 }
 
@@ -63,7 +66,7 @@ type BlockedPeriod struct {
 // CausalInsights contains derived analysis from the causal chain
 type CausalInsights struct {
 	TotalDuration     time.Duration   `json:"total_duration"`     // Total time from create to close/now
-	BlockedDuration   time.Duration   `json:"blocked_duration"`   // Total time spent blocked
+	BlockedDuration   time.Duration   `json:"blocked_duration"`   // Total time between explicit block/unblock events; currently zero for Git-built chains
 	ActiveDuration    time.Duration   `json:"active_duration"`    // Time not blocked
 	BlockedPercentage float64         `json:"blocked_percentage"` // % of time blocked
 	BlockedPeriods    []BlockedPeriod `json:"blocked_periods"`    // Each blocked period
@@ -88,8 +91,7 @@ type CausalityResult struct {
 
 // CausalityOptions configures causality analysis
 type CausalityOptions struct {
-	IncludeCommits bool              // Include commit events in chain (default true)
-	BlockerTitles  map[string]string // BeadID -> Title for blocker descriptions
+	IncludeCommits bool // Include commit events in chain (default true)
 }
 
 // DefaultCausalityOptions returns sensible defaults
@@ -107,27 +109,34 @@ func (hr *HistoryReport) BuildCausalityChain(beadID string, opts CausalityOption
 // BuildCausalityChainAt constructs the causal chain using a caller-owned
 // reference instant for open chains and serialized result metadata. The zero
 // instant is valid; open-chain duration is clamped rather than consulting the
-// wall clock when the reference instant predates the first event.
+// wall clock when the reference instant predates the latest observed event.
 func (hr *HistoryReport) BuildCausalityChainAt(beadID string, opts CausalityOptions, now time.Time) *CausalityResult {
+	if hr == nil {
+		return nil
+	}
+
 	history, exists := hr.Histories[beadID]
 	if !exists {
 		return nil
 	}
 
+	status := normalizeStatus(history.Status)
 	chain := &CausalChain{
-		BeadID: beadID,
-		Title:  history.Title,
-		Status: history.Status,
-		Events: []CausalEvent{},
+		BeadID:     beadID,
+		Title:      history.Title,
+		Status:     status,
+		Events:     []CausalEvent{},
+		IsComplete: status == "closed" || status == "tombstone",
 	}
 
 	// Collect all events with their timestamps
 	type rawEvent struct {
-		timestamp   time.Time
-		eventType   CausalEventType
-		description string
-		commitSHA   string
-		blockerID   string
+		timestamp       time.Time
+		eventType       CausalEventType
+		description     string
+		commitSHA       string
+		sourceCommitSHA string
+		blockerID       string
 	}
 	var rawEvents []rawEvent
 
@@ -154,9 +163,10 @@ func (hr *HistoryReport) BuildCausalityChainAt(beadID string, opts CausalityOpti
 		}
 
 		rawEvents = append(rawEvents, rawEvent{
-			timestamp:   event.Timestamp,
-			eventType:   causalType,
-			description: desc,
+			timestamp:       event.Timestamp,
+			eventType:       causalType,
+			description:     desc,
+			sourceCommitSHA: event.CommitSHA,
 		})
 	}
 
@@ -169,30 +179,70 @@ func (hr *HistoryReport) BuildCausalityChainAt(beadID string, opts CausalityOpti
 			if len(runes) > 50 {
 				desc = string(runes[:47]) + "..."
 			}
+			// Robot output must retain the collision-resistant commit identity.
+			// ShortSHA remains a legacy fallback for hand-built histories that do
+			// not carry the full object ID.
+			commitSHA := commit.SHA
+			if commitSHA == "" {
+				commitSHA = commit.ShortSHA
+			}
 			rawEvents = append(rawEvents, rawEvent{
-				timestamp:   commit.Timestamp,
-				eventType:   CausalCommit,
-				description: "Commit: " + desc,
-				commitSHA:   commit.ShortSHA,
+				timestamp:       commit.Timestamp,
+				eventType:       CausalCommit,
+				description:     "Commit: " + desc,
+				commitSHA:       commitSHA,
+				sourceCommitSHA: commit.SHA,
 			})
 		}
 	}
 
-	// Sort by timestamp
-	sort.Slice(rawEvents, func(i, j int) bool {
-		if !rawEvents[i].timestamp.Equal(rawEvents[j].timestamp) {
-			return rawEvents[i].timestamp.Before(rawEvents[j].timestamp)
-		}
-		leftOrder := causalEventOrder(rawEvents[i].eventType)
-		rightOrder := causalEventOrder(rawEvents[j].eventType)
-		if leftOrder != rightOrder {
-			return leftOrder < rightOrder
-		}
-		if rawEvents[i].commitSHA != rawEvents[j].commitSHA {
-			return rawEvents[i].commitSHA < rawEvents[j].commitSHA
-		}
-		return rawEvents[i].description < rawEvents[j].description
+	// Git timestamps have only second-level ordering fidelity. Preserve source
+	// order when instants tie: history.Events is already in causal/topological
+	// order, so ranking tied lifecycle events by type can invert reopen -> close
+	// into close -> reopen and fabricate an incomplete terminal state. Commits are
+	// initially appended after lifecycle events; the equal-time reconciliation
+	// below only moves one when a shared source commit establishes causal order.
+	sort.SliceStable(rawEvents, func(i, j int) bool {
+		return rawEvents[i].timestamp.Before(rawEvents[j].timestamp)
 	})
+	// Within a tied timestamp, place a correlated code commit immediately before
+	// the lifecycle transition from the same Git commit. This preserves the
+	// lifecycle slice's known causal order while ensuring a close co-committed
+	// with code counts as part of the completed interval. Unmatched equal-time
+	// commits remain after lifecycle events: timestamp equality alone is not
+	// evidence that they caused the transition.
+	for groupStart := 0; groupStart < len(rawEvents); {
+		groupEnd := groupStart + 1
+		for groupEnd < len(rawEvents) && rawEvents[groupEnd].timestamp.Equal(rawEvents[groupStart].timestamp) {
+			groupEnd++
+		}
+		group := rawEvents[groupStart:groupEnd]
+		ordered := make([]rawEvent, 0, len(group))
+		used := make([]bool, len(group))
+		for i, event := range group {
+			if event.eventType == CausalCommit {
+				continue
+			}
+			if event.sourceCommitSHA != "" {
+				for j, candidate := range group {
+					if used[j] || candidate.eventType != CausalCommit || candidate.sourceCommitSHA != event.sourceCommitSHA {
+						continue
+					}
+					ordered = append(ordered, candidate)
+					used[j] = true
+				}
+			}
+			ordered = append(ordered, event)
+			used[i] = true
+		}
+		for i, event := range group {
+			if !used[i] {
+				ordered = append(ordered, event)
+			}
+		}
+		copy(group, ordered)
+		groupStart = groupEnd
+	}
 
 	// Convert to CausalEvents with IDs and link causality
 	var prevEventID *int
@@ -230,16 +280,22 @@ func (hr *HistoryReport) BuildCausalityChainAt(beadID string, opts CausalityOpti
 	// Set chain metadata
 	if len(chain.Events) > 0 {
 		chain.StartTime = chain.Events[0].Timestamp
-		chain.EndTime = chain.Events[len(chain.Events)-1].Timestamp
-		status := normalizeStatus(history.Status)
-		chain.IsComplete = status == "closed" || status == "tombstone"
-		if !chain.IsComplete {
-			chain.EndTime = now
-			if chain.EndTime.Before(chain.StartTime) {
-				chain.EndTime = chain.StartTime
+		lastEventTime := chain.Events[len(chain.Events)-1].Timestamp
+		if chain.IsComplete {
+			// A current closed-like status establishes state, not timing. Only a
+			// terminal close transition establishes the completion instant; an
+			// arbitrary last commit must never be presented as that instant.
+			if completedAt, ok := chainCompletionTime(chain.Events); ok {
+				chain.EndTime = completedAt
+				chain.TotalTime = chain.EndTime.Sub(chain.StartTime)
 			}
+		} else {
+			chain.EndTime = now
+			if chain.EndTime.Before(lastEventTime) {
+				chain.EndTime = lastEventTime
+			}
+			chain.TotalTime = chain.EndTime.Sub(chain.StartTime)
 		}
-		chain.TotalTime = chain.EndTime.Sub(chain.StartTime)
 	}
 
 	// Count edges
@@ -248,7 +304,7 @@ func (hr *HistoryReport) BuildCausalityChainAt(beadID string, opts CausalityOpti
 	}
 
 	// Build insights
-	insights := buildInsights(chain, history)
+	insights := buildInsights(chain)
 
 	return &CausalityResult{
 		GeneratedAt: now,
@@ -258,83 +314,102 @@ func (hr *HistoryReport) BuildCausalityChainAt(beadID string, opts CausalityOpti
 	}
 }
 
-func causalEventOrder(eventType CausalEventType) int {
-	switch eventType {
-	case CausalCreated:
-		return 0
-	case CausalClaimed:
-		return 1
-	case CausalBlocked:
-		return 2
-	case CausalCommit:
-		return 3
-	case CausalUnblocked:
-		return 4
-	case CausalClosed:
-		return 5
-	case CausalReopened:
-		return 6
-	default:
-		return 7
-	}
-}
-
-// buildInsights derives analytical insights from the causal chain
-func buildInsights(chain *CausalChain, history BeadHistory) *CausalInsights {
+// buildInsights derives analytical insights from a causal chain. Its transition
+// handling is exercised with synthetic chains and reserved for a future history
+// source; BuildCausalityChainAt cannot currently derive blocked/unblocked
+// transitions from BeadEvent history and therefore never fabricates them.
+func buildInsights(chain *CausalChain) *CausalInsights {
 	insights := &CausalInsights{
 		TotalDuration:   chain.TotalTime,
 		BlockedPeriods:  []BlockedPeriod{},
 		CriticalPath:    []int{},
 		Recommendations: []string{},
 	}
+	insightEvents := causalInsightEvents(chain)
 
-	// Count commits
-	for _, event := range chain.Events {
+	// Count commits that occurred within the causal interval. Correlated commits
+	// after the terminal close remain visible in chain.Events but cannot explain
+	// how long completion took.
+	for _, event := range insightEvents {
 		if event.Type == CausalCommit {
 			insights.CommitCount++
 		}
 	}
 
-	// Find blocked periods by looking at status changes
-	// Note: This is a simplified approach - actual blocked state would need
-	// to be inferred from dependency resolution or explicit status
+	// Find blocked periods from explicit blocked/unblocked causal events.
 	var inBlockedState bool
 	var blockedStart time.Time
 	var currentBlocker string
 
-	for _, event := range chain.Events {
-		if event.Type == CausalBlocked {
+	appendBlockedPeriod := func(end time.Time) {
+		if end.Before(blockedStart) {
+			end = blockedStart
+		}
+		period := BlockedPeriod{
+			StartTime: blockedStart,
+			EndTime:   end,
+			Duration:  end.Sub(blockedStart),
+			BlockerID: currentBlocker,
+		}
+		insights.BlockedPeriods = append(insights.BlockedPeriods, period)
+		insights.BlockedDuration += period.Duration
+	}
+
+	for _, event := range insightEvents {
+		switch event.Type {
+		case CausalBlocked:
+			if inBlockedState {
+				// Repeated blocked observations do not restart the contiguous
+				// interval. Fill a previously unknown blocker when possible.
+				if currentBlocker == "" {
+					currentBlocker = event.BlockerID
+				}
+				continue
+			}
 			inBlockedState = true
 			blockedStart = event.Timestamp
 			currentBlocker = event.BlockerID
-		} else if event.Type == CausalUnblocked && inBlockedState {
-			period := BlockedPeriod{
-				StartTime: blockedStart,
-				EndTime:   event.Timestamp,
-				Duration:  event.Timestamp.Sub(blockedStart),
-				BlockerID: currentBlocker,
+		case CausalUnblocked, CausalClosed:
+			if inBlockedState {
+				appendBlockedPeriod(event.Timestamp)
+				inBlockedState = false
 			}
-			insights.BlockedPeriods = append(insights.BlockedPeriods, period)
-			insights.BlockedDuration += period.Duration
-			inBlockedState = false
 		}
 	}
 
-	// Calculate active duration and blocked percentage
-	insights.ActiveDuration = insights.TotalDuration - insights.BlockedDuration
-	if insights.TotalDuration > 0 {
-		insights.BlockedPercentage = float64(insights.BlockedDuration) / float64(insights.TotalDuration) * 100
+	// A bead can still be blocked at the end of the observed chain. Account
+	// for that open interval through the caller-pinned end time rather than
+	// silently reporting zero blocked time.
+	if inBlockedState {
+		appendBlockedPeriod(chain.EndTime)
+	}
+
+	// Calculate duration-derived fields only when the chain has a defensible end
+	// instant. Closed-like status without a terminal close transition has known
+	// state but unknown completion duration.
+	durationKnown := chainDurationKnown(chain)
+	if durationKnown {
+		insights.ActiveDuration = insights.TotalDuration - insights.BlockedDuration
+		if insights.ActiveDuration < 0 {
+			insights.ActiveDuration = 0
+		}
+		if insights.TotalDuration > 0 {
+			insights.BlockedPercentage = float64(insights.BlockedDuration) / float64(insights.TotalDuration) * 100
+			if insights.BlockedPercentage > 100 {
+				insights.BlockedPercentage = 100
+			}
+		}
 	}
 
 	// Build critical path (for now, it's the full linear path)
-	for _, event := range chain.Events {
+	for _, event := range insightEvents {
 		insights.CriticalPath = append(insights.CriticalPath, event.ID)
 	}
 
 	// Build critical path description
-	if len(chain.Events) > 0 {
+	if len(insightEvents) > 0 {
 		var pathParts []string
-		for _, event := range chain.Events {
+		for _, event := range insightEvents {
 			pathParts = append(pathParts, string(event.Type))
 		}
 		if len(pathParts) > 5 {
@@ -352,13 +427,13 @@ func buildInsights(chain *CausalChain, history BeadHistory) *CausalInsights {
 	}
 
 	// Calculate average time between events and find longest gap
-	if len(chain.Events) > 1 {
+	if len(insightEvents) > 1 {
 		var totalGap time.Duration
 		var longestGap time.Duration
 		longestGapIdx := 1 // Initialize to 1 (first valid gap index), not 0
 
-		for i := 1; i < len(chain.Events); i++ {
-			gap := chain.Events[i].Timestamp.Sub(chain.Events[i-1].Timestamp)
+		for i := 1; i < len(insightEvents); i++ {
+			gap := insightEvents[i].Timestamp.Sub(insightEvents[i-1].Timestamp)
 			totalGap += gap
 			if gap > longestGap {
 				longestGap = gap
@@ -366,15 +441,15 @@ func buildInsights(chain *CausalChain, history BeadHistory) *CausalInsights {
 			}
 		}
 
-		avgGap := totalGap / time.Duration(len(chain.Events)-1)
+		avgGap := totalGap / time.Duration(len(insightEvents)-1)
 		insights.AvgTimeBetween = &avgGap
 		insights.LongestGap = &longestGap
 		// longestGapIdx is always >= 1 since we initialize to 1 and only update with i >= 1
-		insights.LongestGapDesc = formatGapDescription(chain.Events[longestGapIdx-1], chain.Events[longestGapIdx], longestGap)
+		insights.LongestGapDesc = formatGapDescription(insightEvents[longestGapIdx-1], insightEvents[longestGapIdx], longestGap)
 	}
 
 	// Estimate time without blocks
-	if insights.BlockedDuration > 0 {
+	if durationKnown && insights.BlockedDuration > 0 {
 		estimated := insights.ActiveDuration
 		insights.EstimatedWithout = &estimated
 	}
@@ -388,6 +463,28 @@ func buildInsights(chain *CausalChain, history BeadHistory) *CausalInsights {
 	return insights
 }
 
+func causalInsightEvents(chain *CausalChain) []CausalEvent {
+	if chain == nil || len(chain.Events) == 0 || !chain.IsComplete {
+		if chain == nil {
+			return nil
+		}
+		return chain.Events
+	}
+	completedAt, complete := chainCompletionTime(chain.Events)
+	if !complete {
+		return chain.Events
+	}
+	// Equal-timestamp ordering places commits before close. Stop at the terminal
+	// close event itself so later post-completion observations cannot leak into
+	// duration-derived insights or the reported causal path.
+	for i := len(chain.Events) - 1; i >= 0; i-- {
+		if chain.Events[i].Type == CausalClosed && chain.Events[i].Timestamp.Equal(completedAt) {
+			return chain.Events[:i+1]
+		}
+	}
+	return chain.Events
+}
+
 // formatGapDescription creates a human-readable description of a gap
 func formatGapDescription(from, to CausalEvent, gap time.Duration) string {
 	return formatDurationShort(gap) + " between " + string(from.Type) + " and " + string(to.Type)
@@ -396,12 +493,22 @@ func formatGapDescription(from, to CausalEvent, gap time.Duration) string {
 // buildSummary creates a one-line summary of the bead's causal history
 func buildSummary(chain *CausalChain, insights *CausalInsights) string {
 	if !chain.IsComplete {
+		if chain.Status == "blocked" {
+			if !chainEndsBlocked(chain.Events) {
+				return "Blocked; transition timing unavailable from history"
+			}
+			return "Blocked now (" + formatDurationShort(insights.TotalDuration) + " total, " +
+				formatDurationShort(insights.BlockedDuration) + " blocked)"
+		}
 		if insights.BlockedPercentage > 50 {
 			return "In progress, mostly blocked (" + formatDurationShort(insights.TotalDuration) + " total, " +
 				formatPercent(insights.BlockedPercentage) + " blocked)"
 		}
 		return "In progress for " + formatDurationShort(insights.TotalDuration) +
-			" with " + formatInt(insights.CommitCount) + " commits"
+			" with " + formatCommitCount(insights.CommitCount)
+	}
+	if !chainEndsComplete(chain.Events) {
+		return "Completed; transition timing unavailable from history"
 	}
 
 	if insights.BlockedPercentage > 30 {
@@ -410,12 +517,27 @@ func buildSummary(chain *CausalChain, insights *CausalInsights) string {
 	}
 
 	return "Completed in " + formatDurationShort(insights.TotalDuration) +
-		" with " + formatInt(insights.CommitCount) + " commits"
+		" with " + formatCommitCount(insights.CommitCount)
+}
+
+func formatCommitCount(count int) string {
+	noun := "commits"
+	if count == 1 {
+		noun = "commit"
+	}
+	return formatInt(count) + " " + noun
 }
 
 // generateRecommendations creates actionable insights
 func generateRecommendations(chain *CausalChain, insights *CausalInsights) []string {
 	var recs []string
+
+	if chain.Status == "blocked" && !chainEndsBlocked(chain.Events) {
+		recs = append(recs, "Blocked-duration metrics are unavailable because history has no explicit block transition")
+	}
+	if chain.IsComplete && !chainEndsComplete(chain.Events) {
+		recs = append(recs, "Completion-duration metrics are unavailable because history has no terminal close transition")
+	}
 
 	// High blocked percentage
 	if insights.BlockedPercentage > 50 {
@@ -448,6 +570,50 @@ func generateRecommendations(chain *CausalChain, insights *CausalInsights) []str
 	return recs
 }
 
+func chainEndsBlocked(events []CausalEvent) bool {
+	blocked := false
+	for _, event := range events {
+		switch event.Type {
+		case CausalBlocked:
+			blocked = true
+		case CausalUnblocked, CausalClosed:
+			blocked = false
+		}
+	}
+	return blocked
+}
+
+func chainEndsComplete(events []CausalEvent) bool {
+	_, complete := chainCompletionTime(events)
+	return complete
+}
+
+func chainCompletionTime(events []CausalEvent) (time.Time, bool) {
+	complete := false
+	var completedAt time.Time
+	for _, event := range events {
+		switch event.Type {
+		case CausalClosed:
+			complete = true
+			completedAt = event.Timestamp
+		case CausalReopened:
+			complete = false
+			completedAt = time.Time{}
+		}
+	}
+	return completedAt, complete
+}
+
+func chainDurationKnown(chain *CausalChain) bool {
+	if chain == nil || len(chain.Events) == 0 {
+		return false
+	}
+	if !chain.IsComplete {
+		return true
+	}
+	return chainEndsComplete(chain.Events)
+}
+
 // Helper functions
 
 func formatDurationShort(d time.Duration) string {
@@ -461,9 +627,8 @@ func formatDurationShort(d time.Duration) string {
 	if days < 7 {
 		return formatInt(days) + "d"
 	}
-	weeks := days / 7
-	if weeks < 4 {
-		return formatInt(weeks) + "w"
+	if days < 30 {
+		return formatInt(days/7) + "w"
 	}
 	months := days / 30
 	return formatInt(months) + "mo"
@@ -474,22 +639,7 @@ func formatPercent(p float64) string {
 }
 
 func formatInt(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	result := ""
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		result = string(rune('0'+n%10)) + result
-		n /= 10
-	}
-	if neg {
-		result = "-" + result
-	}
-	return result
+	return strconv.Itoa(n)
 }
 
 // Note: appendUnique and normalizePath are defined in other files in this package

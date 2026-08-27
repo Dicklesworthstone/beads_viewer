@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -19,23 +18,24 @@ type robotSearchResult struct {
 }
 
 type robotSearchOutput struct {
-	GeneratedAt  string                `json:"generated_at"`
-	DataHash     string                `json:"data_hash"`
-	OutputFormat string                `json:"output_format,omitempty"`
-	Version      string                `json:"version,omitempty"`
-	Query        string                `json:"query"`
-	Provider     search.Provider       `json:"provider"`
-	Model        string                `json:"model,omitempty"`
-	Dim          int                   `json:"dim"`
-	IndexPath    string                `json:"index_path"`
-	Index        search.IndexSyncStats `json:"index"`
-	Loaded       bool                  `json:"loaded"`
-	Limit        int                   `json:"limit"`
-	Mode         search.SearchMode     `json:"mode"`
-	Preset       search.PresetName     `json:"preset,omitempty"`
-	Weights      *search.Weights       `json:"weights,omitempty"`
-	Results      []robotSearchResult   `json:"results"`
-	UsageHints   []string              `json:"usage_hints,omitempty"`
+	GeneratedAt  string `json:"generated_at"`
+	DataHash     string `json:"data_hash"`
+	OutputFormat string `json:"output_format,omitempty"`
+	Version      string `json:"version,omitempty"`
+	RobotSourceEvidence
+	Query      string                `json:"query"`
+	Provider   search.Provider       `json:"provider"`
+	Model      string                `json:"model,omitempty"`
+	Dim        int                   `json:"dim"`
+	IndexPath  string                `json:"index_path"`
+	Index      search.IndexSyncStats `json:"index"`
+	Loaded     bool                  `json:"loaded"`
+	Limit      int                   `json:"limit"`
+	Mode       search.SearchMode     `json:"mode"`
+	Preset     search.PresetName     `json:"preset,omitempty"`
+	Weights    *search.Weights       `json:"weights,omitempty"`
+	Results    []robotSearchResult   `json:"results"`
+	UsageHints []string              `json:"usage_hints,omitempty"`
 }
 
 func writeRobotSearchOutput(w io.Writer, out robotSearchOutput) error {
@@ -105,28 +105,35 @@ func buildHybridScores(results []search.SearchResult, scorer search.HybridScorer
 	return out, nil
 }
 
-var issueIDPattern = regexp.MustCompile(`^[A-Za-z]+-[A-Za-z0-9]+$`)
-
-func isLikelyIssueID(query string) bool {
-	return issueIDPattern.MatchString(strings.TrimSpace(query))
-}
-
 func promoteExactSearchResult(query string, results []search.SearchResult) []search.SearchResult {
 	needle := strings.TrimSpace(query)
 	if needle == "" || len(results) == 0 {
 		return results
 	}
+	exactIndex := -1
+	foldedIndex := -1
+	foldedMatches := 0
 	for i := range results {
-		if strings.EqualFold(results[i].IssueID, needle) {
-			if i == 0 {
-				return results
-			}
-			match := results[i]
-			copy(results[1:i+1], results[0:i])
-			results[0] = match
-			return results
+		switch {
+		case results[i].IssueID == needle:
+			exactIndex = i
+		case strings.EqualFold(results[i].IssueID, needle):
+			foldedIndex = i
+			foldedMatches++
 		}
 	}
+	if exactIndex < 0 {
+		if foldedMatches != 1 {
+			return results
+		}
+		exactIndex = foldedIndex
+	}
+	if exactIndex == 0 {
+		return results
+	}
+	match := results[exactIndex]
+	copy(results[1:exactIndex+1], results[0:exactIndex])
+	results[0] = match
 	return results
 }
 
@@ -135,16 +142,29 @@ func promoteExactHybridResult(query string, results []search.HybridScore) []sear
 	if needle == "" || len(results) == 0 {
 		return results
 	}
+	exactIndex := -1
+	foldedIndex := -1
+	foldedMatches := 0
 	for i := range results {
-		if strings.EqualFold(results[i].IssueID, needle) {
-			if i == 0 {
-				return results
-			}
-			match := results[i]
-			copy(results[1:i+1], results[0:i])
-			results[0] = match
-			return results
+		switch {
+		case results[i].IssueID == needle:
+			exactIndex = i
+		case strings.EqualFold(results[i].IssueID, needle):
+			foldedIndex = i
+			foldedMatches++
 		}
 	}
+	if exactIndex < 0 {
+		if foldedMatches != 1 {
+			return results
+		}
+		exactIndex = foldedIndex
+	}
+	if exactIndex == 0 {
+		return results
+	}
+	match := results[exactIndex]
+	copy(results[1:exactIndex+1], results[0:exactIndex])
+	results[0] = match
 	return results
 }

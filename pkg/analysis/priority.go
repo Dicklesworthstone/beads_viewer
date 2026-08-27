@@ -227,6 +227,9 @@ func (a *Analyzer) ComputeImpactScore(issueID string) *ImpactScore {
 
 // TopImpactScores returns the top N impact scores
 func (a *Analyzer) TopImpactScores(n int) []ImpactScore {
+	if n <= 0 {
+		return nil
+	}
 	scores := a.ComputeImpactScores()
 	if n > len(scores) {
 		n = len(scores)
@@ -316,7 +319,8 @@ func (a *Analyzer) computeMedianEstimatedMinutes() int {
 	sort.Ints(estimates)
 	mid := len(estimates) / 2
 	if len(estimates)%2 == 0 {
-		return (estimates[mid-1] + estimates[mid]) / 2
+		lower, upper := estimates[mid-1], estimates[mid]
+		return lower + (upper-lower)/2
 	}
 	return estimates[mid]
 }
@@ -848,9 +852,24 @@ func (a *Analyzer) computeWhatIfDeltaFromStats(issueID string, stats *GraphStats
 // countTransitiveUnblocks counts total issues unblocked by a hypothetical completion of issueID,
 // including cascading effects (diamonds, chains) via simulation.
 func (a *Analyzer) countTransitiveUnblocks(issueID string) int {
+	issue, exists := a.issueMap[issueID]
+	if !exists || isClosedLikeStatus(issue.Status) {
+		return 0
+	}
+	nodeID := a.idToNode[issueID]
+	if a.g.To(nodeID).Len() == 0 && len(a.childrenByParent[issueID]) == 0 {
+		return 0
+	}
+
 	// Set of "conceptually closed" issues: initially just the starting issue
-	simulatedClosed := make(map[string]bool)
-	simulatedClosed[issueID] = true
+	simulatedClosed := map[string]bool{issueID: true}
+
+	// Existing actionable work is not an effect of this hypothetical completion
+	// and must not be counted or auto-completed as part of the cascade.
+	baselineActionable := make(map[string]bool)
+	for _, actionable := range a.getActionableIssuesAfterCompletions(nil) {
+		baselineActionable[actionable.ID] = true
+	}
 
 	queue := []string{issueID}
 	count := 0
@@ -859,50 +878,30 @@ func (a *Analyzer) countTransitiveUnblocks(issueID string) int {
 		curr := queue[0]
 		queue = queue[1:]
 
-		// Find dependents of the current node
-		nodeID, ok := a.idToNode[curr]
-		if !ok {
-			continue
+		candidateSet := make(map[string]bool)
+		if nodeID, ok := a.idToNode[curr]; ok {
+			dependents := a.g.To(nodeID)
+			for dependents.Next() {
+				candidateSet[a.nodeToID[dependents.Node().ID()]] = true
+			}
+		}
+		for _, childID := range a.childrenByParent[curr] {
+			candidateSet[childID] = true
 		}
 
-		dependents := a.g.To(nodeID)
-		for dependents.Next() {
-			depNode := dependents.Node()
-			depID := a.nodeToID[depNode.ID()]
+		candidateIDs := make([]string, 0, len(candidateSet))
+		for candidateID := range candidateSet {
+			candidateIDs = append(candidateIDs, candidateID)
+		}
+		sort.Strings(candidateIDs)
 
-			// If already processed in simulation or really closed, skip
-			if simulatedClosed[depID] {
+		for _, candidateID := range candidateIDs {
+			if simulatedClosed[candidateID] || baselineActionable[candidateID] {
 				continue
 			}
-			if issue, exists := a.issueMap[depID]; exists && isClosedLikeStatus(issue.Status) {
-				continue
-			}
-
-			// Check if depID is now unblocked
-			// It is unblocked if ALL its blockers are (Real Closed OR Simulated Closed)
-			isBlocked := false
-			blockers := a.g.From(depNode.ID())
-			for blockers.Next() {
-				blockerNode := blockers.Node()
-				blockerID := a.nodeToID[blockerNode.ID()]
-
-				// Check blocker status
-				isClosed := false
-				if simulatedClosed[blockerID] {
-					isClosed = true
-				} else if bIssue, ok := a.issueMap[blockerID]; ok && isClosedLikeStatus(bIssue.Status) {
-					isClosed = true
-				}
-
-				if !isClosed {
-					isBlocked = true
-					break
-				}
-			}
-
-			if !isBlocked {
-				simulatedClosed[depID] = true
-				queue = append(queue, depID)
+			if a.isActionableAfterCompletions(candidateID, simulatedClosed) {
+				simulatedClosed[candidateID] = true
+				queue = append(queue, candidateID)
 				count++
 			}
 		}
@@ -917,13 +916,13 @@ func estimateDaysSaved(unblockedIDs []string, issueMap map[string]model.Issue) f
 		return 0
 	}
 
-	totalMinutes := 0
+	totalMinutes := 0.0
 	counted := 0
 
 	for _, id := range unblockedIDs {
 		if issue, ok := issueMap[id]; ok {
 			if issue.EstimatedMinutes != nil && *issue.EstimatedMinutes > 0 {
-				totalMinutes += *issue.EstimatedMinutes
+				totalMinutes += float64(*issue.EstimatedMinutes)
 				counted++
 			} else {
 				// Use default estimate for unestimated work
@@ -938,7 +937,7 @@ func estimateDaysSaved(unblockedIDs []string, issueMap map[string]model.Issue) f
 	}
 
 	// Convert to days (8-hour workday = 480 minutes)
-	return float64(totalMinutes) / 480.0
+	return totalMinutes / 480.0
 }
 
 // generateWhatIfExplanation creates a human-readable what-if summary

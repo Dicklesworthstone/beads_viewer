@@ -193,6 +193,59 @@ func TestCache_GetSet(t *testing.T) {
 	}
 }
 
+func TestCacheRejectsCanceledPhase2AndAllowsLiveRetry(t *testing.T) {
+	t.Setenv("BV_ROBOT", "0")
+
+	cache := analysis.NewCache(5 * time.Minute)
+	issues := []model.Issue{
+		{
+			ID:           "outer-cache-cancel-dependent",
+			Status:       model.StatusOpen,
+			Dependencies: []*model.Dependency{{DependsOnID: "outer-cache-cancel-blocker", Type: model.DepBlocks}},
+		},
+		{ID: "outer-cache-cancel-blocker", Status: model.StatusOpen},
+	}
+	config := analysis.AnalysisConfig{
+		RunToCompletion: true,
+		ComputePageRank: true,
+	}
+
+	canceledAnalyzer := analysis.NewCachedAnalyzer(issues, cache)
+	canceledAnalyzer.SetConfig(&config)
+	canceledContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceled := canceledAnalyzer.AnalyzeAsync(canceledContext)
+	canceled.WaitForPhase2()
+	if canceled.IsPhase2Ready() {
+		t.Fatal("canceled analysis unexpectedly published Phase 2")
+	}
+
+	// Exercise the public cache insertion guard deterministically as well as the
+	// CachedAnalyzer's asynchronous insertion attempt.
+	cacheKey := canceledAnalyzer.DataHash() + "|" + analysis.ComputeConfigHash(&config)
+	cache.SetByHash(cacheKey, canceled)
+	if _, ok := cache.GetByHash(cacheKey); ok {
+		t.Fatal("cache returned an incomplete Phase 2 result")
+	}
+	if _, _, hasData := cache.Stats(); hasData {
+		t.Fatal("cache stored an incomplete Phase 2 result")
+	}
+
+	liveAnalyzer := analysis.NewCachedAnalyzer(issues, cache)
+	liveAnalyzer.SetConfig(&config)
+	live := liveAnalyzer.AnalyzeAsync(context.Background())
+	if liveAnalyzer.WasCacheHit() || live == canceled {
+		t.Fatal("live retry reused canceled cache result")
+	}
+	live.WaitForPhase2()
+	if !live.IsPhase2Ready() {
+		t.Fatal("live retry did not complete Phase 2")
+	}
+	if len(live.PageRank()) != len(issues) {
+		t.Fatalf("live retry PageRank has %d entries, want %d", len(live.PageRank()), len(issues))
+	}
+}
+
 func TestCache_HashMismatch(t *testing.T) {
 	cache := analysis.NewCache(5 * time.Minute)
 	issues1 := []model.Issue{{ID: "A"}}

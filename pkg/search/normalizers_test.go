@@ -81,3 +81,14 @@ func TestNormalizeRecency(t *testing.T) {
 		t.Fatalf("expected recency 1.0 for future time, got %f", got)
 	}
 }
+
+func TestNormalizeRecencyAtUsesPinnedClock(t *testing.T) {
+	reference := time.Date(2024, time.June, 30, 12, 0, 0, 0, time.UTC)
+	updated := reference.Add(-30 * 24 * time.Hour)
+	if got, want := normalizeRecencyAt(updated, reference), math.Exp(-1); math.Abs(got-want) > 1e-12 {
+		t.Fatalf("normalizeRecencyAt() = %f, want %f", got, want)
+	}
+	if got := normalizeRecencyAt(reference.Add(time.Hour), reference); got != 1 {
+		t.Fatalf("future update score = %f, want 1", got)
+	}
+}

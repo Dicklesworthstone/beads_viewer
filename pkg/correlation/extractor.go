@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,11 @@ type ExtractOptions struct {
 type Extractor struct {
 	repoPath   string
 	beadsFiles []string // Files to track (e.g., .beads/beads.jsonl, .beads/issues.jsonl)
+
+	// blobReaderFactory is an internal test seam for verifying that snapshot
+	// extraction does not publish results until the long-lived cat-file process
+	// has exited successfully. nil uses the real Git-backed reader.
+	blobReaderFactory func() (snapshotBlobReadCloser, error)
 
 	// ctx, when set (via Correlator.WithContext or directly), bounds the git
 	// subprocesses spawned during extraction (issue #166). nil means
@@ -148,8 +154,7 @@ func (e *Extractor) Extract(opts ExtractOptions) ([]BeadEvent, error) {
 // edge case, never falling back to a slower-or-equal native diff in that case.
 func (e *Extractor) preferSnapshotPath() bool {
 	primary := e.primaryBeadsFile()
-	cmd := gitCommand(e.ctx, "cat-file", "-s", "HEAD:"+primary)
-	cmd.Dir = e.repoPath
+	cmd := repoGitCommand(e.ctx, e.repoPath, "cat-file", "-s", "HEAD:"+primary)
 	out, err := cmd.Output()
 	if err != nil {
 		return true
@@ -167,9 +172,7 @@ func (e *Extractor) extractViaGitLogPatch(opts ExtractOptions) ([]BeadEvent, err
 	// Build git log command
 	logArgs := e.buildGitLogArgs(opts)
 
-	// Disable colors so patch lines still start with raw '+' and '-'.
-	cmd := gitCommand(e.ctx, withNoColorGit(logArgs)...)
-	cmd.Dir = e.repoPath
+	cmd := lifecycleGitLogCommand(e.ctx, e.repoPath, logArgs...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -210,13 +213,13 @@ func (e *Extractor) extractViaGitLogPatch(opts ExtractOptions) ([]BeadEvent, err
 // buildGitLogArgs constructs the git log command arguments
 func (e *Extractor) buildGitLogArgs(opts ExtractOptions) []string {
 	args := []string{
-		"log",
 		"-p",                             // Include patch/diff
-		"--unified=0",                    // Zero context: parser only needs +/- JSONL lines, not unchanged records (#160)
+		"--unified=1",                    // One context line exposes line-1 BOM eligibility shifts
 		"--follow",                       // Track renames; requires a single pathspec (handled below)
 		"--format=" + gitLogHeaderFormat, // Custom format for commit info
-		"--",
 	}
+	args = append(args, lifecycleHistoryOrderArgs()...)
+	args = append(args, "--")
 
 	// Add time filters before "--"
 	if opts.Since != nil {
@@ -229,16 +232,11 @@ func (e *Extractor) buildGitLogArgs(opts ExtractOptions) []string {
 		args = insertBefore(args, "--", fmt.Sprintf("-n%d", opts.Limit))
 	}
 
-	// Optimization: If filtering by BeadID, tell git to only show commits
-	// where this ID appears in the diff (added or removed).
-	// We use -G with a regex to match the JSON field to avoid false positives on common IDs like "1".
-	// Regex matches: "id": [whitespace] "BEAD_ID"
-	if opts.BeadID != "" {
-		// Escape regex meta-characters in BeadID just in case
-		safeID := regexp.QuoteMeta(opts.BeadID)
-		regex := fmt.Sprintf(`"id":\s*"%s"`, safeID)
-		args = insertBefore(args, "--", fmt.Sprintf("-G%s", regex))
-	}
+	// Do not use Git's -G pickaxe for BeadID filtering. A record can become
+	// loader-eligible solely because an unchanged first-line BOM record moves
+	// from a later physical line to line one; that commit contains no matching
+	// +/- record for the bead. parseDiff applies the exact ID filter after the
+	// complete patch has reconstructed that eligibility transition.
 
 	// Use primary beads file for follow support (git requires single pathspec with --follow)
 	primary := ".beads/beads.jsonl"
@@ -274,6 +272,7 @@ func (e *Extractor) parseGitLogOutput(r io.Reader, filterBeadID string) ([]BeadE
 
 	var currentCommit *commitInfo
 	var diffBuffer bytes.Buffer
+	objectIDWidth := 0
 
 	// Helper to process the accumulated commit
 	processCommit := func() {
@@ -299,24 +298,16 @@ func (e *Extractor) parseGitLogOutput(r io.Reader, filterBeadID string) ([]BeadE
 		}
 
 		if isPrefix {
-			// Line too long. Skip it.
-			// Consume until newline or EOF
-			for isPrefix {
-				_, isPrefix, err = reader.ReadLine()
-				if err != nil && !errors.Is(err, io.EOF) {
-					return nil, err
-				}
-				if errors.Is(err, io.EOF) {
-					break
-				}
-			}
-			// Skip processing this line as it's incomplete/truncated
-			continue
+			// Silently skipping an oversized JSONL record would omit a lifecycle
+			// event and could then persist that partial history. Fail closed; the
+			// subprocess caller will kill/drain Git as appropriate.
+			return nil, fmt.Errorf("git log line exceeds %d-byte parser limit", maxScanTokenSize)
 		}
 
 		line := string(lineBytes)
 
-		// Check for commit header
+		// Check for commit header. A NUL-bearing line that does not match a
+		// canonical SHA-1/SHA-256 header is malformed Git output, not diff text.
 		if commitPattern.MatchString(line) {
 			// Finish previous commit
 			processCommit()
@@ -324,14 +315,17 @@ func (e *Extractor) parseGitLogOutput(r io.Reader, filterBeadID string) ([]BeadE
 			// Parse new header
 			info, err := parseCommitInfo(line)
 			if err != nil {
-				// Treat as diff content if parsing fails but regex matched
-				// (Shouldn't happen with our regex, but safe fallback)
-				diffBuffer.WriteString(line)
-				diffBuffer.WriteByte('\n')
-				continue
+				return nil, fmt.Errorf("parsing commit header: %w", err)
+			}
+			if objectIDWidth == 0 {
+				objectIDWidth = len(info.SHA)
+			} else if len(info.SHA) != objectIDWidth {
+				return nil, fmt.Errorf("mixed-width commit object IDs: got %d and %d characters", objectIDWidth, len(info.SHA))
 			}
 
 			currentCommit = &info
+		} else if strings.ContainsRune(line, '\x00') {
+			return nil, fmt.Errorf("malformed commit header with noncanonical object ID")
 		} else {
 			// Diff content
 			if currentCommit != nil {
@@ -347,14 +341,19 @@ func (e *Extractor) parseGitLogOutput(r io.Reader, filterBeadID string) ([]BeadE
 	return events, nil
 }
 
-// commitPattern matches the start of a commit in our custom log format
-var commitPattern = regexp.MustCompile(`(?m)^[0-9a-f]{40}\x00`)
+// commitPattern matches a complete lowercase SHA-1 or SHA-256 object ID at the
+// start of a commit in our custom log format. The terminating NUL prevents a
+// 64-character ID from being mistaken for a 40-character prefix.
+var commitPattern = regexp.MustCompile(`(?m)^(?:[0-9a-f]{40}|[0-9a-f]{64})\x00`)
 
 // parseCommitInfo extracts commit metadata from the header line
 func parseCommitInfo(line string) (commitInfo, error) {
 	parts := strings.SplitN(line, "\x00", 5)
 	if len(parts) != 5 {
 		return commitInfo{}, fmt.Errorf("invalid commit format: %s", line)
+	}
+	if !isCanonicalCommitSHA(parts[0]) {
+		return commitInfo{}, fmt.Errorf("invalid commit object ID %q", parts[0])
 	}
 
 	timestamp, err := time.Parse(time.RFC3339, parts[1])
@@ -376,54 +375,43 @@ func parseCommitInfo(line string) (commitInfo, error) {
 // parseDiff extracts bead events from a diff section
 func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID string) []BeadEvent {
 	var events []BeadEvent
+	var classifier unifiedDiffRecordClassifier
 
 	// Track old and new bead states for status change detection
 	oldBeads := make(map[string]beadSnapshot)
 	newBeads := make(map[string]beadSnapshot)
 	seenBeads := make(map[string]bool)
 
-	scanner := bufio.NewScanner(bytes.NewReader(diffData))
-	// Increase buffer for large diffs
-	const maxCapacity = 1024 * 1024 * 10 // 10MB
-	// Start with 64KB buffer, grow up to maxCapacity
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, maxCapacity)
+	// diffData is already resident in memory, so walk its line boundaries
+	// directly. A Scanner limit here used to silently truncate a synthesized
+	// snapshot diff when one valid JSONL record exceeded 10 MiB, omitting the
+	// event and allowing the partial result into the per-commit cache.
+	for start := 0; start < len(diffData); {
+		relativeEnd := bytes.IndexByte(diffData[start:], '\n')
+		end := len(diffData)
+		next := len(diffData)
+		if relativeEnd >= 0 {
+			end = start + relativeEnd
+			next = end + 1
+		}
+		lineBytes := diffData[start:end]
+		if len(lineBytes) > 0 && lineBytes[len(lineBytes)-1] == '\r' {
+			lineBytes = lineBytes[:len(lineBytes)-1]
+		}
+		line := string(lineBytes)
+		start = next
 
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Skip empty lines and diff metadata lines that start with:
-		// '@' = hunk headers (@@)
-		// 'd' = diff --git
-		// 'i' = index
-		// 'n' = new file mode
-		// We only care about lines starting with +/- which are actual changes.
-		if isIgnorableDiffMetadataLine(line) {
+		jsonStr, added, ok := classifier.classify(line)
+		if !ok {
 			continue
 		}
-
-		// Check for removed lines (old state) - JSON starts with {
-		if strings.HasPrefix(line, "-{") {
-			jsonStr := strings.TrimPrefix(line, "-")
-			if snap, ok := parseBeadJSON(jsonStr); ok {
-				if filterBeadID == "" || snap.ID == filterBeadID {
-					oldBeads[snap.ID] = snap
-					seenBeads[snap.ID] = true
-				}
+		if snap, parsed := parseBeadJSON(jsonStr); parsed && (filterBeadID == "" || snap.ID == filterBeadID) {
+			if added {
+				newBeads[snap.ID] = snap
+			} else {
+				oldBeads[snap.ID] = snap
 			}
-			continue
-		}
-
-		// Check for added lines (new state) - JSON starts with {
-		if strings.HasPrefix(line, "+{") {
-			jsonStr := strings.TrimPrefix(line, "+")
-			if snap, ok := parseBeadJSON(jsonStr); ok {
-				if filterBeadID == "" || snap.ID == filterBeadID {
-					newBeads[snap.ID] = snap
-					seenBeads[snap.ID] = true
-				}
-			}
-			continue
+			seenBeads[snap.ID] = true
 		}
 	}
 
@@ -472,6 +460,105 @@ func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID str
 	}
 
 	return events
+}
+
+// beadJSONFromDiffLine classifies one unified-diff record and returns its JSON
+// payload. JSON permits the four ASCII whitespace bytes, so both the
+// resident/snapshot and streaming history paths trim exactly those bytes after
+// the +/- marker before requiring an object. A BOM is accepted only immediately
+// after the marker, corresponding to the loader's physical first-line BOM.
+// Diff metadata such as +++/--- is rejected because it does not begin with an
+// object after normalization.
+func beadJSONFromDiffLine(line string) (jsonStr string, added bool, ok bool) {
+	return beadJSONFromDiffLineAt(line, true)
+}
+
+func beadJSONFromDiffLineAt(line string, allowBOM bool) (jsonStr string, added bool, ok bool) {
+	if len(line) < 2 || (line[0] != '+' && line[0] != '-') {
+		return "", false, false
+	}
+	jsonStr, ok = beadJSONFromPhysicalLine(line[1:], allowBOM)
+	return jsonStr, line[0] == '+', ok
+}
+
+func beadJSONFromPhysicalLine(line string, allowBOM bool) (jsonStr string, ok bool) {
+	jsonStr = line
+	if allowBOM {
+		jsonStr = strings.TrimPrefix(jsonStr, "\uFEFF")
+	}
+	jsonStr = strings.Trim(jsonStr, " \t\r\n")
+	if !strings.HasPrefix(jsonStr, "{") {
+		return "", false
+	}
+	return jsonStr, true
+}
+
+var unifiedDiffHunkPattern = regexp.MustCompile(`^@@ -([0-9]+)(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@`)
+
+// unifiedDiffRecordClassifier tracks the old/new physical line numbers supplied
+// by unified-diff hunk headers. The authoritative loader strips a BOM only from
+// physical line one, so accepting an immediate BOM on every +/- line would
+// create lifecycle events for records the loader rejects.
+type unifiedDiffRecordClassifier struct {
+	oldLine int
+	newLine int
+	inHunk  bool
+	sawHunk bool
+}
+
+func (c *unifiedDiffRecordClassifier) classify(line string) (jsonStr string, added bool, ok bool) {
+	if matches := unifiedDiffHunkPattern.FindStringSubmatch(line); matches != nil {
+		oldLine, oldErr := strconv.Atoi(matches[1])
+		newLine, newErr := strconv.Atoi(matches[2])
+		if oldErr == nil && newErr == nil {
+			c.oldLine = oldLine
+			c.newLine = newLine
+			c.inHunk = true
+			c.sawHunk = true
+		}
+		return "", false, false
+	}
+	if strings.HasPrefix(line, "diff --git ") {
+		c.oldLine = 0
+		c.newLine = 0
+		c.inHunk = false
+		c.sawHunk = false
+		return "", false, false
+	}
+	if len(line) == 0 {
+		return "", false, false
+	}
+
+	switch line[0] {
+	case '+':
+		allowBOM := !c.sawHunk || (c.inHunk && c.newLine == 1)
+		jsonStr, added, ok = beadJSONFromDiffLineAt(line, allowBOM)
+		if c.inHunk && !strings.HasPrefix(line, "+++") {
+			c.newLine++
+		}
+		return jsonStr, added, ok
+	case '-':
+		allowBOM := !c.sawHunk || (c.inHunk && c.oldLine == 1)
+		jsonStr, added, ok = beadJSONFromDiffLineAt(line, allowBOM)
+		if c.inHunk && !strings.HasPrefix(line, "---") {
+			c.oldLine++
+		}
+		return jsonStr, added, ok
+	case ' ':
+		oldJSON, oldEligible := beadJSONFromPhysicalLine(line[1:], c.inHunk && c.oldLine == 1)
+		newJSON, newEligible := beadJSONFromPhysicalLine(line[1:], c.inHunk && c.newLine == 1)
+		if c.inHunk {
+			c.oldLine++
+			c.newLine++
+		}
+		switch {
+		case oldEligible && !newEligible:
+			return oldJSON, false, true
+		case !oldEligible && newEligible:
+			return newJSON, true, true
+		}
+	}
+	return "", false, false
 }
 
 func isIgnorableDiffMetadataLine(line string) bool {

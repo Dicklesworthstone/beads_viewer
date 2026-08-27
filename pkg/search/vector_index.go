@@ -12,14 +12,17 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/util/topk"
 )
 
 const (
-	vectorIndexMagic   = "BVVI"
-	vectorIndexVersion = uint16(1)
+	vectorIndexMagic           = "BVVI"
+	vectorIndexVersion         = uint16(1)
+	vectorIndexHeaderBytes     = 4 + 2 + 2 + 4 + 4
+	vectorIndexEntryFixedBytes = 2 + sha256.Size
 )
 
 type ContentHash [32]byte
@@ -57,6 +60,7 @@ type VectorIndex struct {
 	entries  map[string]VectorEntry
 	idsCache []string
 	idsDirty bool
+	mutation uint64
 }
 
 func NewVectorIndex(dim int) *VectorIndex {
@@ -76,6 +80,10 @@ func LoadVectorIndex(path string) (*VectorIndex, error) {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat index: %w", err)
+	}
 
 	r := bufio.NewReader(f)
 
@@ -112,6 +120,22 @@ func LoadVectorIndex(path string) (*VectorIndex, error) {
 	if dimU32 == 0 {
 		return nil, fmt.Errorf("invalid dim 0")
 	}
+	maxInt := uint64(^uint(0) >> 1)
+	if uint64(dimU32) > maxInt {
+		return nil, fmt.Errorf("index dim %d exceeds platform int capacity", dimU32)
+	}
+	if info.Size() < vectorIndexHeaderBytes {
+		return nil, fmt.Errorf("index shorter than %d-byte header", vectorIndexHeaderBytes)
+	}
+	// Validate the smallest possible serialized body before allocating a vector.
+	// Each entry needs a non-empty ID, its content hash, and dim float32 values.
+	// Express the check as a division so even hostile uint32 count/dim values
+	// cannot overflow while being validated.
+	remainingBytes := uint64(info.Size() - vectorIndexHeaderBytes)
+	minEntryBytes := uint64(vectorIndexEntryFixedBytes+1) + uint64(dimU32)*4
+	if count > 0 && minEntryBytes > remainingBytes/uint64(count) {
+		return nil, fmt.Errorf("declared index body requires at least %d bytes per entry, but %d bytes remain for %d entries", minEntryBytes, remainingBytes, count)
+	}
 
 	idx := NewVectorIndex(int(dimU32))
 	for i := uint32(0); i < count; i++ {
@@ -128,6 +152,9 @@ func LoadVectorIndex(path string) (*VectorIndex, error) {
 			return nil, fmt.Errorf("read id: %w", err)
 		}
 		issueID := string(idBytes)
+		if _, exists := idx.entries[issueID]; exists {
+			return nil, fmt.Errorf("duplicate issue id %q", issueID)
+		}
 
 		var ch ContentHash
 		if _, err := io.ReadFull(r, ch[:]); err != nil {
@@ -147,6 +174,12 @@ func LoadVectorIndex(path string) (*VectorIndex, error) {
 			return nil, err
 		}
 	}
+	var trailing [1]byte
+	if n, err := r.Read(trailing[:]); n != 0 {
+		return nil, fmt.Errorf("unexpected trailing data")
+	} else if err != io.EOF {
+		return nil, fmt.Errorf("check trailing data: %w", err)
+	}
 
 	return idx, nil
 }
@@ -158,6 +191,12 @@ func (idx *VectorIndex) Save(path string) error {
 	// number of entries actually written, corrupting the file on Load.
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
+	if idx.Dim <= 0 || uint64(idx.Dim) > uint64(math.MaxUint32) {
+		return fmt.Errorf("index dim %d is outside serializable uint32 range", idx.Dim)
+	}
+	if uint64(len(idx.entries)) > uint64(math.MaxUint32) {
+		return fmt.Errorf("index entry count %d exceeds serializable uint32 range", len(idx.entries))
+	}
 
 	// Rebuild the sorted-ID cache inline (mirrors sortedIDs logic).
 	if idx.idsDirty || idx.idsCache == nil {
@@ -267,6 +306,9 @@ func (idx *VectorIndex) Upsert(issueID string, hash ContentHash, vec []float32) 
 	if len(vec) != idx.Dim {
 		return fmt.Errorf("vector dim mismatch: %d != %d", len(vec), idx.Dim)
 	}
+	if err := validateFiniteVector(vec); err != nil {
+		return err
+	}
 
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -278,6 +320,7 @@ func (idx *VectorIndex) Upsert(issueID string, hash ContentHash, vec []float32) 
 		ContentHash: hash,
 		Vector:      cp,
 	}
+	idx.mutation++
 	if !exists {
 		idx.idsDirty = true
 	}
@@ -292,6 +335,7 @@ func (idx *VectorIndex) Remove(issueID string) {
 		return
 	}
 	delete(idx.entries, issueID)
+	idx.mutation++
 	idx.idsDirty = true
 }
 
@@ -354,15 +398,39 @@ type SearchResult struct {
 }
 
 func (idx *VectorIndex) SearchTopK(query []float32, k int) ([]SearchResult, error) {
+	return idx.searchTopK(query, k, "")
+}
+
+// SearchTopKWithExactID returns the top semantic matches while guaranteeing
+// that an exact issue-ID match is present and ranked first. Issue IDs are
+// opaque, so matching makes no assumptions about their punctuation or
+// tracker-specific shape. A case-insensitive match is promoted only when it is
+// unambiguous; an exact-case match always wins.
+func (idx *VectorIndex) SearchTopKWithExactID(query []float32, k int, exactID string) ([]SearchResult, error) {
+	return idx.searchTopK(query, k, strings.TrimSpace(exactID))
+}
+
+func (idx *VectorIndex) searchTopK(query []float32, k int, exactID string) ([]SearchResult, error) {
 	if k <= 0 {
 		return nil, nil
 	}
 	if len(query) != idx.Dim {
 		return nil, fmt.Errorf("query dim mismatch: %d != %d", len(query), idx.Dim)
 	}
+	if err := validateFiniteVector(query); err != nil {
+		return nil, fmt.Errorf("invalid query: %w", err)
+	}
 
 	// sortedIDs now handles its own locking safely
 	ids := idx.sortedIDs()
+	// k is caller-controlled in CLI use. Bound heap capacity to the number of
+	// indexed entries so an oversized limit cannot trigger an enormous allocation.
+	if k > len(ids) {
+		k = len(ids)
+	}
+	if k == 0 {
+		return nil, nil
+	}
 
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
@@ -371,6 +439,10 @@ func (idx *VectorIndex) SearchTopK(query []float32, k int) ([]SearchResult, erro
 	collector := topk.New[SearchResult](k, func(a, b SearchResult) bool {
 		return a.IssueID < b.IssueID // Deterministic tie-breaking: smaller ID wins
 	})
+	var exactCaseResult SearchResult
+	hasExactCase := false
+	var foldedResult SearchResult
+	foldedMatches := 0
 
 	for _, issueID := range ids {
 		entry, ok := idx.entries[issueID]
@@ -379,10 +451,62 @@ func (idx *VectorIndex) SearchTopK(query []float32, k int) ([]SearchResult, erro
 			continue
 		}
 		score := dotFloat32(query, entry.Vector)
-		collector.Add(SearchResult{IssueID: issueID, Score: score}, score)
+		result := SearchResult{IssueID: issueID, Score: score}
+		collector.Add(result, score)
+		if exactID != "" {
+			switch {
+			case issueID == exactID:
+				exactCaseResult = result
+				hasExactCase = true
+			case strings.EqualFold(issueID, exactID):
+				foldedResult = result
+				foldedMatches++
+			}
+		}
 	}
 
-	return collector.Results(), nil
+	results := collector.Results()
+	exactResult := exactCaseResult
+	if !hasExactCase {
+		if foldedMatches != 1 {
+			return results, nil
+		}
+		exactResult = foldedResult
+	}
+	if exactResult.IssueID == "" {
+		return results, nil
+	}
+
+	exactIndex := -1
+	for i := range results {
+		if results[i].IssueID == exactResult.IssueID {
+			exactIndex = i
+			break
+		}
+	}
+	if exactIndex < 0 {
+		if len(results) < k {
+			results = append(results, exactResult)
+			exactIndex = len(results) - 1
+		} else {
+			results[len(results)-1] = exactResult
+			exactIndex = len(results) - 1
+		}
+	}
+	if exactIndex > 0 {
+		copy(results[1:exactIndex+1], results[:exactIndex])
+		results[0] = exactResult
+	}
+	return results, nil
+}
+
+func validateFiniteVector(vec []float32) error {
+	for i, value := range vec {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return fmt.Errorf("vector component %d must be finite", i)
+		}
+	}
+	return nil
 }
 
 func dotFloat32(a, b []float32) float64 {

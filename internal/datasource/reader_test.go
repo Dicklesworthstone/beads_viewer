@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -252,6 +253,75 @@ func TestSQLiteReader_MinimalValidatedSchemaLoads(t *testing.T) {
 	}
 }
 
+func TestSQLiteReaderExcludesStatusTombstonesWithoutMarkerColumn(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "status-tombstone.db")
+	db, err := sql.Open("sqlite", sqliteFileDSN(dbPath, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			status TEXT NOT NULL,
+			updated_at TEXT
+		);
+		INSERT INTO issues (id, title, status, updated_at) VALUES
+		('LIVE-1', 'Live issue', ' OPEN ', '2026-01-01T00:00:00Z'),
+		('CLOSED-1', 'Closed issue', ' CLOSED ', '2025-01-01T00:00:00Z'),
+		('DELETED-1', 'Deleted issue', ' TOMBSTONE ', '2030-01-01T00:00:00Z');
+	`)
+	if closeErr := db.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	source := DataSource{Type: SourceTypeSQLite, Path: dbPath}
+	if err := ValidateSource(&source); err != nil {
+		t.Fatalf("ValidateSource: %v", err)
+	}
+	if source.IssueCount != 2 {
+		t.Fatalf("validated IssueCount=%d, want two non-tombstone issues", source.IssueCount)
+	}
+
+	reader, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: dbPath})
+	if err != nil {
+		t.Fatalf("NewSQLiteReader: %v", err)
+	}
+	defer reader.Close()
+
+	issues, err := reader.LoadIssues()
+	if err != nil {
+		t.Fatalf("LoadIssues: %v", err)
+	}
+	if len(issues) != 2 || issues[0].ID != "LIVE-1" || issues[1].ID != "CLOSED-1" {
+		t.Fatalf("status tombstone leaked from LoadIssues: %#v", issues)
+	}
+	if issues[0].Status != model.StatusOpen || issues[1].Status != model.StatusClosed {
+		t.Fatalf("SQLite statuses were not normalized: %#v", issues)
+	}
+	count, err := reader.CountIssues()
+	if err != nil {
+		t.Fatalf("CountIssues: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("CountIssues=%d, want two non-tombstone issues", count)
+	}
+	if deleted, err := reader.GetIssueByID("DELETED-1"); err == nil || deleted != nil {
+		t.Fatalf("GetIssueByID returned status tombstone: issue=%#v err=%v", deleted, err)
+	}
+	modified, err := reader.GetLastModified()
+	if err != nil {
+		t.Fatalf("GetLastModified: %v", err)
+	}
+	wantModified := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if !modified.Equal(wantModified) {
+		t.Fatalf("GetLastModified=%v, want live issue time %v", modified, wantModified)
+	}
+}
+
 func TestSQLiteReader_MissingReadOnlyDatabaseFailsAtOpen(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "missing.db")
 
@@ -375,6 +445,216 @@ func TestSQLiteReader_FallbackSchemaLoadsGraphMetadata(t *testing.T) {
 	}
 	if len(issue.Comments) != 1 || issue.Comments[0].Text != "keeps metadata" {
 		t.Fatalf("expected comments from fallback schema, got %#v", issue.Comments)
+	}
+}
+
+func TestSQLiteReaderRejectsIssueScanFailureInsteadOfReturningPartialAuthority(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "bad-issue.db")
+	db, err := sql.Open("sqlite", sqliteFileDSN(dbPath, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			status TEXT NOT NULL,
+			priority INTEGER
+		);
+		INSERT INTO issues (id, title, status, priority) VALUES
+		('GOOD-1', 'Good row', 'open', 1),
+		('BAD-1', 'Bad row', 'open', 'not-an-integer');
+	`)
+	if closeErr := db.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: dbPath})
+	if err != nil {
+		t.Fatalf("NewSQLiteReader: %v", err)
+	}
+	defer r.Close()
+
+	issues, err := r.LoadIssues()
+	if err == nil {
+		t.Fatalf("LoadIssues returned partial authority: %#v", issues)
+	}
+	if issues != nil {
+		t.Fatalf("LoadIssues returned %d issues with scan error", len(issues))
+	}
+	if !strings.Contains(err.Error(), "scanning simple SQLite issue row") {
+		t.Fatalf("LoadIssues error lost scan context: %v", err)
+	}
+}
+
+func TestSQLiteReaderRejectsFullIssueScanFailureInsteadOfDowngrading(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "bad-full-issue.db")
+	createContractTestSQLiteDB(t, dbPath)
+	db, err := sql.Open("sqlite", sqliteFileDSN(dbPath, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec("UPDATE issues SET priority = 'not-an-integer' WHERE id = 'CTR-2'")
+	if closeErr := db.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: dbPath})
+	if err != nil {
+		t.Fatalf("NewSQLiteReader: %v", err)
+	}
+	defer r.Close()
+
+	issues, err := r.LoadIssues()
+	if err == nil {
+		t.Fatalf("LoadIssues silently skipped a corrupt full-schema row: %#v", issues)
+	}
+	if issues != nil {
+		t.Fatalf("LoadIssues returned %d issues with full-schema scan error", len(issues))
+	}
+	if !strings.Contains(err.Error(), "scanning full SQLite issue row") {
+		t.Fatalf("LoadIssues error lost full-schema scan context: %v", err)
+	}
+}
+
+func TestSQLiteReaderRejectsGraphMetadataFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		schema     string
+		wantErrSub string
+	}{
+		{
+			name: "dependency scan",
+			schema: `
+				CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT);
+				INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('ISSUE-1', NULL, 'blocks');
+			`,
+			wantErrSub: "scanning dependencies for SQLite issue",
+		},
+		{
+			name: "comment query",
+			schema: `
+				CREATE TABLE comments (issue_id TEXT);
+				INSERT INTO comments (issue_id) VALUES ('ISSUE-1');
+			`,
+			wantErrSub: "querying comments for SQLite issue",
+		},
+		{
+			name: "label scan",
+			schema: `
+				CREATE TABLE labels (issue_id TEXT, label TEXT);
+				INSERT INTO labels (issue_id, label) VALUES ('ISSUE-1', NULL);
+			`,
+			wantErrSub: "scanning labels for SQLite issue",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "bad-graph.db")
+			db, err := sql.Open("sqlite", sqliteFileDSN(dbPath, ""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = db.Exec(`
+				CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL);
+				INSERT INTO issues (id, title, status) VALUES ('ISSUE-1', 'Issue', 'open');
+			` + tc.schema)
+			if closeErr := db.Close(); err == nil && closeErr != nil {
+				err = closeErr
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			r, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: dbPath})
+			if err != nil {
+				t.Fatalf("NewSQLiteReader: %v", err)
+			}
+			defer r.Close()
+
+			issues, err := r.LoadIssues()
+			if err == nil {
+				t.Fatalf("LoadIssues returned partial authority: %#v", issues)
+			}
+			if issues != nil {
+				t.Fatalf("LoadIssues returned %d issues with graph metadata error", len(issues))
+			}
+			if !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Fatalf("LoadIssues error %q missing %q", err, tc.wantErrSub)
+			}
+		})
+	}
+}
+
+func TestSQLiteReaderUsesOneSnapshotForIssuesAndDependencies(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "snapshot.db")
+	writer, err := sql.Open("sqlite", sqliteFileDSN(dbPath, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	var journalMode string
+	if err := writer.QueryRow("PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
+		t.Fatalf("enable WAL: %v", err)
+	}
+	if !strings.EqualFold(journalMode, "wal") {
+		t.Fatalf("journal mode = %q, want WAL", journalMode)
+	}
+	if _, err := writer.Exec(`
+		CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL);
+		CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT);
+		INSERT INTO issues (id, title, status) VALUES
+		('A', 'First', 'open'),
+		('B', 'Second', 'open');
+		INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('B', 'OLD', 'blocks');
+	`); err != nil {
+		t.Fatalf("create snapshot fixture: %v", err)
+	}
+
+	r, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: dbPath})
+	if err != nil {
+		t.Fatalf("NewSQLiteReader: %v", err)
+	}
+	defer r.Close()
+
+	var updateErr error
+	updated := false
+	issues, err := r.LoadIssuesFiltered(func(issue *model.Issue) bool {
+		if issue.ID == "A" && !updated {
+			updated = true
+			_, updateErr = writer.Exec("UPDATE dependencies SET depends_on_id = 'NEW' WHERE issue_id = 'B'")
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatalf("LoadIssuesFiltered: %v", err)
+	}
+	if updateErr != nil {
+		t.Fatalf("concurrent dependency update: %v", updateErr)
+	}
+	if !updated {
+		t.Fatal("filter hook did not perform the coordinated write")
+	}
+
+	byID := make(map[string]model.Issue, len(issues))
+	for _, issue := range issues {
+		byID[issue.ID] = issue
+	}
+	b := byID["B"]
+	if len(b.Dependencies) != 1 || b.Dependencies[0].DependsOnID != "OLD" {
+		t.Fatalf("mixed-time issue graph observed: B dependencies = %#v, want snapshot value OLD", b.Dependencies)
+	}
+	var persisted string
+	if err := writer.QueryRow("SELECT depends_on_id FROM dependencies WHERE issue_id = 'B'").Scan(&persisted); err != nil {
+		t.Fatalf("read persisted dependency: %v", err)
+	}
+	if persisted != "NEW" {
+		t.Fatalf("coordinated write did not persist: got %q", persisted)
 	}
 }
 

@@ -2,7 +2,9 @@ package analysis
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
@@ -27,6 +29,14 @@ func TestDefaultAdvancedInsightsConfig(t *testing.T) {
 	}
 	if cfg.ParallelCutLimit != 5 {
 		t.Errorf("ParallelCutLimit: expected 5, got %d", cfg.ParallelCutLimit)
+	}
+}
+
+func TestGenerateAdvancedInsightsReportsEffectiveNormalizedConfig(t *testing.T) {
+	insights := NewAnalyzer(nil).GenerateAdvancedInsights(AdvancedInsightsConfig{})
+	want := DefaultAdvancedInsightsConfig()
+	if insights.Config != want {
+		t.Fatalf("reported config = %+v, want effective defaults %+v", insights.Config, want)
 	}
 }
 
@@ -132,6 +142,61 @@ func TestGenerateAdvancedInsightsWithCycles(t *testing.T) {
 	if insights.CycleBreak.Advisory == "" {
 		t.Error("expected advisory text")
 	}
+	validEdges := map[string]bool{
+		"A->B": true,
+		"B->C": true,
+		"C->A": true,
+	}
+	for _, suggestion := range insights.CycleBreak.Suggestions {
+		edge := suggestion.EdgeFrom + "->" + suggestion.EdgeTo
+		if !validEdges[edge] {
+			t.Fatalf("cycle break suggested nonexistent edge %q from closed cycle encoding: %#v", edge, insights.CycleBreak.Suggestions)
+		}
+	}
+	if insights.CycleBreak.Status.Limited != len(validEdges) {
+		t.Fatalf("cycle edge count = %d, want %d real edges", insights.CycleBreak.Status.Limited, len(validEdges))
+	}
+}
+
+func TestCycleBreakCollateralExcludesInactiveDependents(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "CLOSED", Status: model.StatusClosed, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "TOMBSTONE", Status: model.StatusTombstone, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+	}
+
+	got := NewAnalyzer(issues).GenerateAdvancedInsights(DefaultAdvancedInsightsConfig()).CycleBreak
+	for _, suggestion := range got.Suggestions {
+		if suggestion.EdgeFrom == "A" && suggestion.EdgeTo == "B" {
+			if suggestion.Collateral != 1 {
+				t.Fatalf("collateral = %d, want only active dependent A", suggestion.Collateral)
+			}
+			return
+		}
+	}
+	t.Fatalf("missing A->B cycle-break suggestion: %#v", got.Suggestions)
+}
+
+func TestCycleBreakAcceptsCompactSelfLoop(t *testing.T) {
+	issues := []model.Issue{{
+		ID:           "A",
+		Status:       model.StatusOpen,
+		Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}},
+	}}
+	provided := NewGraphStatsForTest(
+		nil, nil, nil, nil, nil, nil,
+		nil, nil, [][]string{{"A"}}, 0, nil,
+	)
+
+	got := NewAnalyzer(issues).GenerateAdvancedInsightsFromStats(provided, DefaultAdvancedInsightsConfig()).CycleBreak
+	if got.CycleCount != 1 || len(got.Suggestions) != 1 {
+		t.Fatalf("compact self-loop result = %+v, want one cycle and one suggestion", got)
+	}
+	suggestion := got.Suggestions[0]
+	if suggestion.EdgeFrom != "A" || suggestion.EdgeTo != "A" || suggestion.Impact != 1 {
+		t.Fatalf("compact self-loop suggestion = %+v, want A->A with impact 1", suggestion)
+	}
 }
 
 func TestGenerateAdvancedInsightsFromStatsUsesProvidedCyclesAndPreservesCaps(t *testing.T) {
@@ -168,6 +233,111 @@ func TestGenerateAdvancedInsightsFromStatsUsesProvidedCyclesAndPreservesCaps(t *
 	}
 	if got.InCycles == nil || len(got.InCycles) != 2 || got.InCycles[0] != 0 || got.InCycles[1] != 1 {
 		t.Fatalf("cycle ordering: expected [0 1], got %v", got.InCycles)
+	}
+}
+
+func TestCycleBreakPreservesTruncatedCycleInputEvidence(t *testing.T) {
+	an := NewAnalyzer([]model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen},
+		{ID: "C", Status: model.StatusOpen},
+		{ID: "D", Status: model.StatusOpen},
+	})
+	provided := NewGraphStatsForTest(
+		nil, nil, nil, nil, nil, nil,
+		nil, nil, [][]string{{"A", "B"}, {"C", "D"}}, 0, nil,
+	)
+	provided.status.Cycles.Reason = "truncated to 2 of 3 cycle representatives"
+
+	got := an.GenerateAdvancedInsightsFromStats(provided, DefaultAdvancedInsightsConfig()).CycleBreak
+	if !got.Status.Capped {
+		t.Fatalf("truncated cycle input did not mark feature capped: %+v", got.Status)
+	}
+	if got.Status.Reason != provided.status.Cycles.Reason {
+		t.Fatalf("cycle truncation reason = %q, want %q", got.Status.Reason, provided.status.Cycles.Reason)
+	}
+	if !strings.Contains(got.Advisory, "only stored cycles") {
+		t.Fatalf("advisory omitted stored-cycle limitation: %q", got.Advisory)
+	}
+}
+
+func TestGenerateAdvancedInsightsFromStatsDoesNotTreatUnavailableCyclesAsDAG(t *testing.T) {
+	an := NewAnalyzer([]model.Issue{{ID: "A", Status: model.StatusOpen}})
+	cfg := DefaultAdvancedInsightsConfig()
+
+	tests := []struct {
+		name          string
+		metricStatus  statusEntry
+		featureStatus string
+	}{
+		{
+			name:          "skipped",
+			metricStatus:  statusEntry{State: "skipped", Reason: "disabled for this analysis"},
+			featureStatus: "skipped",
+		},
+		{
+			name:          "timeout",
+			metricStatus:  statusEntry{State: "timeout", Reason: "deadline"},
+			featureStatus: "error",
+		},
+		{
+			name:          "canceled before publication",
+			metricStatus:  statusEntry{State: "pending"},
+			featureStatus: "pending",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provided := NewGraphStatsForTest(
+				nil, nil, nil, nil, nil, nil,
+				nil, nil, nil, 0, nil,
+			)
+			provided.status.Cycles = tt.metricStatus
+
+			got := an.GenerateAdvancedInsightsFromStats(provided, cfg).CycleBreak
+			if got.Status.State != tt.featureStatus {
+				t.Fatalf("feature state: got %q, want %q", got.Status.State, tt.featureStatus)
+			}
+			if got.Status.Reason == "" {
+				t.Fatal("expected unavailable cycle analysis to include a reason")
+			}
+			if strings.Contains(got.Advisory, "proper DAG") {
+				t.Fatalf("unavailable cycle analysis made an acyclic claim: %q", got.Advisory)
+			}
+			if got.CycleCount != 0 || len(got.Suggestions) != 0 {
+				t.Fatalf("unavailable cycle analysis returned findings: %+v", got)
+			}
+		})
+	}
+}
+
+func TestGenerateAdvancedInsightsCycleBreakNegativeLimitUsesDefault(t *testing.T) {
+	an := NewAnalyzer([]model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen},
+		{ID: "C", Status: model.StatusOpen},
+	})
+	provided := NewGraphStatsForTest(
+		nil, nil, nil, nil, nil, nil,
+		nil, nil, [][]string{{"A", "B", "C"}}, 0, nil,
+	)
+	cfg := DefaultAdvancedInsightsConfig()
+	cfg.CycleBreakLimit = -1
+
+	insights := an.GenerateAdvancedInsightsFromStats(provided, cfg)
+	got := insights.CycleBreak
+	if insights.Config.CycleBreakLimit != DefaultAdvancedInsightsConfig().CycleBreakLimit {
+		t.Fatalf("reported cycle-break limit = %d, want effective default", insights.Config.CycleBreakLimit)
+	}
+	if got.Status.State != "available" {
+		t.Fatalf("feature state: got %q, want available", got.Status.State)
+	}
+	if len(got.Suggestions) != 3 {
+		t.Fatalf("suggestions: got %d, want all 3 cycle edges under default limit", len(got.Suggestions))
+	}
+	if got.Status.Capped {
+		t.Fatalf("negative limit should normalize to the default, got capped status %+v", got.Status)
 	}
 }
 
@@ -373,6 +543,55 @@ func TestTopKSetLinearChain(t *testing.T) {
 	}
 }
 
+func TestTopKSetNeverSelectsBlockedHighGainBeforePrerequisite(t *testing.T) {
+	// B has the largest raw fanout, but it cannot be worked until A is done.
+	// The returned sequence must therefore be A, then B.
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "X", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "Y", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "Z", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+	}
+
+	an := NewAnalyzer(issues)
+	cfg := DefaultAdvancedInsightsConfig()
+	cfg.TopKSetLimit = 2
+	got := an.GenerateAdvancedInsights(cfg).TopKSet
+
+	if len(got.Items) != 2 {
+		t.Fatalf("expected 2 feasible picks, got %#v", got.Items)
+	}
+	if got.Items[0].ID != "A" || got.Items[1].ID != "B" {
+		t.Fatalf("pick order = [%s %s], want [A B]", got.Items[0].ID, got.Items[1].ID)
+	}
+	if got.Items[0].MarginalGain != 1 || got.Items[1].MarginalGain != 3 {
+		t.Fatalf("marginal gains = [%d %d], want [1 3]", got.Items[0].MarginalGain, got.Items[1].MarginalGain)
+	}
+}
+
+func TestTopKSetExcludesFutureDeferredCandidatesAndUnlocks(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "DEFERRED", Status: model.StatusOpen, DeferUntil: &future},
+		{ID: "READY", Status: model.StatusOpen},
+		{ID: "X", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "DEFERRED", Type: model.DepBlocks}}},
+		{ID: "Y", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "DEFERRED", Type: model.DepBlocks}}},
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	got := an.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig()).TopKSet
+
+	if len(got.Items) != 1 || got.Items[0].ID != "READY" {
+		t.Fatalf("future-deferred work leaked into feasible sequence: %#v", got.Items)
+	}
+	if got.Items[0].MarginalGain != 0 {
+		t.Fatalf("READY marginal gain = %d, want 0", got.Items[0].MarginalGain)
+	}
+}
+
 func TestTopKSetDeterministic(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "Hub", Status: model.StatusOpen},
@@ -426,6 +645,24 @@ func TestTopKSetCapping(t *testing.T) {
 	}
 	if !insights.TopKSet.Status.Capped {
 		t.Error("expected Capped=true when results exceed limit")
+	}
+}
+
+func TestTopKSetDoesNotClaimCapForCycleStrandedRemainder(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "READY", Status: model.StatusOpen},
+		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+	}
+	cfg := DefaultAdvancedInsightsConfig()
+	cfg.TopKSetLimit = 1
+
+	got := NewAnalyzer(issues).GenerateAdvancedInsights(cfg).TopKSet
+	if len(got.Items) != 1 || got.Items[0].ID != "READY" {
+		t.Fatalf("feasible sequence = %#v, want only READY", got.Items)
+	}
+	if got.Status.Capped {
+		t.Fatalf("cycle-stranded issues caused a false capped claim: %+v", got.Status)
 	}
 }
 
@@ -507,6 +744,31 @@ func TestCoverageSetLinearChain(t *testing.T) {
 	}
 	if insights.CoverageSet.CoverageRatio != 1.0 {
 		t.Errorf("expected 100%% coverage, got %f", insights.CoverageSet.CoverageRatio)
+	}
+	if len(insights.CoverageSet.Items) != 2 {
+		t.Fatalf("expected two selected nodes, got %#v", insights.CoverageSet.Items)
+	}
+	if second := insights.CoverageSet.Items[1]; second.EdgesAdded != 1 || second.TotalDegree != 2 {
+		t.Fatalf("second selection should add 1 uncovered edge but retain original degree 2, got %+v", second)
+	}
+}
+
+func TestCoverageSetCountsDuplicateDependencyRecordsOnce(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "A", Type: model.DepBlocks},
+			{DependsOnID: "A", Type: model.DepBlocks},
+			{DependsOnID: "A", Type: model.DepBlocks},
+		}},
+	}
+
+	got := NewAnalyzer(issues).GenerateAdvancedInsights(DefaultAdvancedInsightsConfig()).CoverageSet
+	if got.TotalEdges != 1 || got.EdgesCovered != 1 {
+		t.Fatalf("duplicate dependency records changed semantic edge counts: %+v", got)
+	}
+	if len(got.Items) != 1 || got.Items[0].EdgesAdded != 1 || got.Items[0].TotalDegree != 1 {
+		t.Fatalf("duplicate dependency records changed coverage selection: %+v", got.Items)
 	}
 }
 
@@ -679,6 +941,26 @@ func TestKPathsNoEdges(t *testing.T) {
 	}
 }
 
+func TestKPathsDoesNotPublishPartialResultForCyclicGraph(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "X", Status: model.StatusOpen},
+		{ID: "Y", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "X", Type: model.DepBlocks}}},
+	}
+
+	got := NewAnalyzer(issues).GenerateAdvancedInsights(DefaultAdvancedInsightsConfig()).KPaths
+	if got.Status.State != "skipped" {
+		t.Fatalf("feature state: got %q, want skipped", got.Status.State)
+	}
+	if got.Status.Reason == "" {
+		t.Fatal("expected cycle reason")
+	}
+	if len(got.Paths) != 0 {
+		t.Fatalf("cyclic graph published partial acyclic-fragment paths: %#v", got.Paths)
+	}
+}
+
 func TestKPathsLinearChain(t *testing.T) {
 	// A -> B -> C -> D: longest path is A-B-C-D (length 4)
 	issues := []model.Issue{
@@ -719,6 +1001,24 @@ func TestKPathsLinearChain(t *testing.T) {
 	}
 	if path.IssueIDs[3] != "D" {
 		t.Errorf("expected path to end with D, got %s", path.IssueIDs[3])
+	}
+}
+
+func TestKPathsStatusCountsRepresentativeSources(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "C", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+	}
+	cfg := DefaultAdvancedInsightsConfig()
+	cfg.KPathsLimit = 1
+
+	got := NewAnalyzer(issues).GenerateAdvancedInsights(cfg).KPaths
+	if got.Status.Limited != 1 {
+		t.Fatalf("eligible representative path count = %d, want 1", got.Status.Limited)
+	}
+	if got.Status.Capped {
+		t.Fatalf("single-source chain reported duplicate-source prefixes as capped: %+v", got.Status)
 	}
 }
 
@@ -875,6 +1175,9 @@ func TestKPathsPathLengthCap(t *testing.T) {
 	}
 	if !path.Truncated {
 		t.Error("expected Truncated=true for capped path")
+	}
+	if !insights.KPaths.Status.Capped {
+		t.Error("expected feature status capped=true when a returned path is truncated")
 	}
 }
 
@@ -1151,11 +1454,61 @@ func TestParallelCutClosedIssuesIgnored(t *testing.T) {
 	}
 }
 
+func TestParallelCutExcludesFutureDeferredCandidateAndUnlocks(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "DEFERRED", Status: model.StatusOpen, DeferUntil: &future},
+		{ID: "READY", Status: model.StatusOpen},
+		{ID: "X", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "DEFERRED", Type: model.DepBlocks}}},
+		{ID: "Y", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "DEFERRED", Type: model.DepBlocks}}},
+		{ID: "Z", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "DEFERRED", Type: model.DepBlocks}}},
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	got := an.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig()).ParallelCut
+
+	if len(got.Suggestions) != 0 {
+		t.Fatalf("future-deferred candidate leaked into parallel cut: %#v", got.Suggestions)
+	}
+	if got.MaxParallel != 1 {
+		t.Fatalf("max_parallel = %d, want current actionable width 1", got.MaxParallel)
+	}
+}
+
+func TestParallelCutAccountsForParentBlockedPropagation(t *testing.T) {
+	// CHILD has no direct blocker, but its parent P is blocked by ROOT. Completing
+	// ROOT makes both P and CHILD actionable, increasing ready width from 1 to 2.
+	issues := []model.Issue{
+		{ID: "ROOT", Status: model.StatusOpen},
+		{ID: "P", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "ROOT", Type: model.DepBlocks}}},
+		{ID: "CHILD", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "P", Type: model.DepParentChild}}},
+	}
+
+	an := NewAnalyzer(issues)
+	got := an.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig()).ParallelCut
+
+	if len(got.Suggestions) != 1 {
+		t.Fatalf("suggestions = %#v, want ROOT", got.Suggestions)
+	}
+	suggestion := got.Suggestions[0]
+	if suggestion.ID != "ROOT" || suggestion.ParallelGain != 1 {
+		t.Fatalf("suggestion = %#v, want ROOT with gain 1", suggestion)
+	}
+	if strings.Join(suggestion.EnabledTracks, ",") != "CHILD,P" {
+		t.Fatalf("enabled tracks = %v, want [CHILD P]", suggestion.EnabledTracks)
+	}
+	if got.MaxParallel != 2 {
+		t.Fatalf("max_parallel = %d, want 2", got.MaxParallel)
+	}
+}
+
 func TestParallelCutMaxParallel(t *testing.T) {
 	// Fork: Hub -> A, B, C
 	// Initial actionable: 1 (Hub)
 	// After completing Hub: 3 actionable (A, B, C)
-	// Max parallel should be 1 + 2 = 3
+	// The projected ready width should therefore be 3.
 	issues := []model.Issue{
 		{ID: "Hub", Status: model.StatusOpen},
 		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "Hub", Type: model.DepBlocks}}},
@@ -1167,9 +1520,32 @@ func TestParallelCutMaxParallel(t *testing.T) {
 	cfg := DefaultAdvancedInsightsConfig()
 	insights := an.GenerateAdvancedInsights(cfg)
 
-	// MaxParallel = currentActionable (1) + sum of gains (2) = 3
+	// Completing the returned cut {Hub} leaves A, B, and C ready.
 	if insights.ParallelCut.MaxParallel != 3 {
 		t.Errorf("expected MaxParallel 3, got %d", insights.ParallelCut.MaxParallel)
+	}
+}
+
+func TestParallelCutMaxParallelIncludesJointUnlocks(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen},
+		{ID: "A1", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "A2", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "B1", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B2", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "JOINT", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "A", Type: model.DepBlocks},
+			{DependsOnID: "B", Type: model.DepBlocks},
+		}},
+	}
+
+	got := NewAnalyzer(issues).GenerateAdvancedInsights(DefaultAdvancedInsightsConfig()).ParallelCut
+	if len(got.Suggestions) != 2 {
+		t.Fatalf("suggestions = %#v, want A and B", got.Suggestions)
+	}
+	if got.MaxParallel != 5 {
+		t.Fatalf("max_parallel = %d, want five issues ready after completing A and B", got.MaxParallel)
 	}
 }
 

@@ -1,9 +1,103 @@
 package correlation
 
 import (
+	"context"
+	"errors"
 	"regexp"
 	"testing"
 )
+
+func TestFindCommitsForBeadPreservesCanonicalIDForAliasMatch(t *testing.T) {
+	repo := initTempGitRepo(t)
+	runGit(t, repo, "commit", "--allow-empty", "-m", "Update beads-42")
+
+	matches, err := NewExplicitMatcher(repo).FindCommitsForBead("bv-42", ExtractOptions{})
+	if err != nil {
+		t.Fatalf("FindCommitsForBead: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("alias-only matches = %#v, want one", matches)
+	}
+	if matches[0].BeadID != "bv-42" {
+		t.Fatalf("alias-only match bead ID = %q, want canonical bv-42", matches[0].BeadID)
+	}
+	if commit := NewExplicitMatcher(repo).CreateCorrelatedCommit(matches[0], nil); commit.BeadID != "bv-42" {
+		t.Fatalf("alias-only correlated commit bead ID = %q, want canonical bv-42", commit.BeadID)
+	}
+}
+
+func TestFindCommitsForBeadRejectsLongerIDPrefixMatches(t *testing.T) {
+	repo := initTempGitRepo(t)
+	runGit(t, repo, "commit", "--allow-empty", "-m", "Update bv-420")
+	runGit(t, repo, "commit", "--allow-empty", "-m", "Update beads-420")
+
+	matches, err := NewExplicitMatcher(repo).FindCommitsForBead("bv-42", ExtractOptions{})
+	if err != nil {
+		t.Fatalf("FindCommitsForBead: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("bv-42 search accepted longer-ID commits: %#v", matches)
+	}
+}
+
+func TestFindCommitsForBeadTreatsIDAsLiteralGrepPattern(t *testing.T) {
+	repo := initTempGitRepo(t)
+	runGit(t, repo, "commit", "--allow-empty", "-m", "Update teamXfoo-42 decoy")
+	runGit(t, repo, "commit", "--allow-empty", "-m", "Update team.foo-42")
+
+	matches, err := NewExplicitMatcher(repo).FindCommitsForBead("team.foo-42", ExtractOptions{})
+	if err != nil {
+		t.Fatalf("FindCommitsForBead: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("literal-ID matches = %#v, want only the exact punctuation match", matches)
+	}
+	if matches[0].Message != "Update team.foo-42" {
+		t.Fatalf("literal-ID match message = %q, want exact punctuation match", matches[0].Message)
+	}
+}
+
+func TestFindCommitsForBeadAppliesLimitAcrossAliases(t *testing.T) {
+	repo := initTempGitRepo(t)
+	runGit(t, repo, "commit", "--allow-empty", "-m", "Update bv-42")
+	runGit(t, repo, "commit", "--allow-empty", "-m", "Update beads-42")
+
+	matches, err := NewExplicitMatcher(repo).FindCommitsForBead("bv-42", ExtractOptions{Limit: 1})
+	if err != nil {
+		t.Fatalf("FindCommitsForBead: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("aggregate limited matches = %#v, want exactly one", matches)
+	}
+}
+
+func TestFindCommitsForBeadLimitAppliesAfterRejectingLongerIDPrefix(t *testing.T) {
+	repo := initTempGitRepo(t)
+	runGit(t, repo, "commit", "--allow-empty", "-m", "Update bv-42")
+	runGit(t, repo, "commit", "--allow-empty", "-m", "Newer decoy for bv-420")
+
+	matches, err := NewExplicitMatcher(repo).FindCommitsForBead("bv-42", ExtractOptions{Limit: 1})
+	if err != nil {
+		t.Fatalf("FindCommitsForBead: %v", err)
+	}
+	if len(matches) != 1 || matches[0].Message != "Update bv-42" {
+		t.Fatalf("limited exact matches = %#v, want older exact bv-42 commit", matches)
+	}
+}
+
+func TestExplicitSearchAggregatesPropagateCancellation(t *testing.T) {
+	repo := initTempGitRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	matcher := NewExplicitMatcher(repo).WithContext(ctx)
+
+	if _, err := matcher.FindCommitsForBead("bv-42", ExtractOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("FindCommitsForBead cancellation error = %v, want context.Canceled", err)
+	}
+	if _, err := matcher.FindAllExplicitMatches([]string{"bv-42"}, ExtractOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("FindAllExplicitMatches cancellation error = %v, want context.Canceled", err)
+	}
+}
 
 func TestExtractIDsFromMessage(t *testing.T) {
 	m := NewExplicitMatcher("/tmp/test")
@@ -114,6 +208,7 @@ func TestNormalizeBeadID(t *testing.T) {
 		{"BV-42", "bv-42"},
 		{"123", "bv-123"}, // Numeric only gets bv- prefix
 		{"456", "bv-456"},
+		{"123abc", "123abc"},
 		{"proj-999", "proj-999"},
 	}
 

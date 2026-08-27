@@ -360,6 +360,78 @@ func TestRemoveBlurbFromFileRejectsMalformedMarkersWithoutWriting(t *testing.T) 
 	}
 }
 
+func TestAgentFileOperationsRejectMarkdownAnalysisLimitWithoutWriting(t *testing.T) {
+	original := "[reference]: " + strings.Repeat("(", maxCommonMarkDestinationParenDepth+1) + "\n" +
+		BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+	operations := []struct {
+		name string
+		run  func(string) error
+	}{
+		{name: "append", run: AppendBlurbToFile},
+		{name: "update", run: UpdateBlurbInFile},
+		{name: "remove", run: RemoveBlurbFromFile},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			filePath := filepath.Join(t.TempDir(), "AGENTS.md")
+			if err := os.WriteFile(filePath, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := operation.run(filePath); err == nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+				t.Fatalf("%s error=%v, want explicit analysis-limit refusal", operation.name, err)
+			}
+			got, err := os.ReadFile(filePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != original {
+				t.Fatalf("%s changed indeterminate content:\n got: %q\nwant: %q", operation.name, got, original)
+			}
+		})
+	}
+
+	filePath := filepath.Join(t.TempDir(), "AGENTS.md")
+	if err := os.WriteFile(filePath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if present, err := VerifyBlurbPresent(filePath); err == nil || present || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+		t.Fatalf("VerifyBlurbPresent() present=%v error=%v, want explicit analysis-limit refusal", present, err)
+	}
+}
+
+func TestAppendBlurbToFileRejectsAnalysisDenseMaximumSizeWithoutWriting(t *testing.T) {
+	tests := []struct {
+		name     string
+		original []byte
+	}{
+		{name: "physical lines", original: bytes.Repeat([]byte{'\n'}, maxAgentFileBytes)},
+		{name: "nested containers", original: bytes.Repeat([]byte{'>', ' '}, maxAgentFileBytes/2)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filePath := filepath.Join(t.TempDir(), "AGENTS.md")
+			if len(tt.original) != maxAgentFileBytes {
+				t.Fatalf("fixture size=%d, want exact accepted file limit %d", len(tt.original), maxAgentFileBytes)
+			}
+			if err := os.WriteFile(filePath, tt.original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			err := AppendBlurbToFile(filePath)
+			if err == nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+				t.Fatalf("AppendBlurbToFile() error=%v, want explicit Markdown-budget refusal", err)
+			}
+			got, readErr := os.ReadFile(filePath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !bytes.Equal(got, tt.original) {
+				t.Fatalf("analysis-budget refusal changed exact-limit file: got %d bytes, want original %d bytes", len(got), len(tt.original))
+			}
+		})
+	}
+}
+
 func TestRemoveBlurbFromFileRejectsFutureVersionWithoutWriting(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -568,8 +640,15 @@ func TestCreateAgentFileDoesNotReplaceExistingFile(t *testing.T) {
 	if statErr != nil {
 		t.Fatal(statErr)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("existing mode=%o after failed create, want 600", info.Mode().Perm())
+	}
+	matches, globErr := filepath.Glob(filepath.Join(tmpDir, ".bv-create-*"))
+	if globErr != nil {
+		t.Fatal(globErr)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("unpublished files=%v, want none when destination existed before create", matches)
 	}
 }
 
@@ -599,6 +678,52 @@ func TestWriteNewFileExclusiveUsesNoReplacementCreate(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("exclusive create replaced existing content: got %q, want %q", got, want)
+	}
+}
+
+func TestWriteNewFileExclusiveReportsPublishedStateWhenPrivateLinkCleanupFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "AGENTS.md")
+	want := []byte("# Complete instructions\n")
+
+	originalPublish := publishAgentFileExclusiveForCreate
+	publishAgentFileExclusiveForCreate = func(sourcePath, destinationPath string) (bool, error) {
+		if err := os.Link(sourcePath, destinationPath); err != nil {
+			t.Skipf("filesystem cannot emulate link-published cleanup failure: %v", err)
+			return false, err
+		}
+		return true, errors.New("injected private-link cleanup failure")
+	}
+	defer func() { publishAgentFileExclusiveForCreate = originalPublish }()
+
+	err := writeNewFileExclusive(filePath, want)
+	if err == nil || !strings.Contains(err.Error(), "destination was published") || strings.Contains(err.Error(), "unpublished file retained") {
+		t.Fatalf("writeNewFileExclusive() error=%v, want honest partial-publication diagnostic", err)
+	}
+	got, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("published content=%q, want %q", got, want)
+	}
+	matches, err := filepath.Glob(filepath.Join(tmpDir, ".bv-create-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("retained private links=%v, want exactly one recovery name", matches)
+	}
+	destinationInfo, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateInfo, err := os.Stat(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(destinationInfo, privateInfo) {
+		t.Fatal("retained private name is not the published destination inode")
 	}
 }
 
@@ -732,7 +857,7 @@ func TestWriteReplacementPreservesPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Fatalf("Initial permissions wrong: %o", info.Mode().Perm())
 	}
 
@@ -752,7 +877,7 @@ func TestWriteReplacementPreservesPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Errorf("Permissions not preserved: expected 0600, got %o", info.Mode().Perm())
 	}
 
@@ -891,6 +1016,18 @@ func TestWriteReplacementRejectsConcurrentByteChange(t *testing.T) {
 	// process lock. Byte verification must still refuse to overwrite the edit.
 	editor, err := os.OpenFile(filePath, os.O_WRONLY, 0)
 	if err != nil {
+		if runtime.GOOS == "windows" {
+			// The Windows lock intentionally denies new write-sharing handles, which
+			// is a stronger form of the same no-overwrite guarantee.
+			content, readErr := os.ReadFile(filePath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if string(content) != "original" {
+				t.Fatalf("source changed after denied concurrent writer: %q", content)
+			}
+			return
+		}
 		t.Fatal(err)
 	}
 	if _, err := editor.WriteAt([]byte("X"), 1); err != nil {
@@ -977,6 +1114,89 @@ func TestWriteReplacementRejectsHardLinkedFile(t *testing.T) {
 	}
 }
 
+func TestAppendBlurbRejectsOversizedAgentFileWithoutReadingOrWritingIt(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "AGENTS.md")
+	if err := os.WriteFile(filePath, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantSize := int64(maxAgentFileBytes + 1)
+	if err := os.Truncate(filePath, wantSize); err != nil {
+		t.Fatal(err)
+	}
+
+	err := AppendBlurbToFile(filePath)
+	if !errors.Is(err, errAgentFileTooLarge) {
+		t.Fatalf("AppendBlurbToFile() error=%v, want safe-size refusal", err)
+	}
+	info, statErr := os.Stat(filePath)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if info.Size() != wantSize {
+		t.Fatalf("oversized source size=%d after refusal, want %d", info.Size(), wantSize)
+	}
+}
+
+func TestEnsureBlurbDetectsOversizedAgentFileWithoutReadingOrWritingIt(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "AGENTS.md")
+	if err := os.WriteFile(filePath, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantSize := int64(maxAgentFileBytes + 1)
+	if err := os.Truncate(filePath, wantSize); err != nil {
+		t.Fatal(err)
+	}
+
+	detection := DetectAgentFile(tmpDir)
+	if !detection.Found() {
+		t.Fatal("DetectAgentFile() did not report the oversized AGENTS.md")
+	}
+	if detection.Content != "" {
+		t.Fatalf("DetectAgentFile() retained %d oversized bytes, want no content", len(detection.Content))
+	}
+
+	err := EnsureBlurb(tmpDir)
+	if !errors.Is(err, errAgentFileTooLarge) {
+		t.Fatalf("EnsureBlurb() error=%v, want safe-size refusal", err)
+	}
+	info, statErr := os.Stat(filePath)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if info.Size() != wantSize {
+		t.Fatalf("oversized source size=%d after refusal, want %d", info.Size(), wantSize)
+	}
+}
+
+func TestRemoveAgentReplacementIfSameRetainsCandidateAndPeerPath(t *testing.T) {
+	dir := t.TempDir()
+	candidatePath := filepath.Join(dir, ".bv-replace-candidate")
+	if err := os.WriteFile(candidatePath, []byte("candidate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	candidateInfo, err := os.Lstat(candidatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removeAgentReplacementIfSame(candidatePath, candidateInfo)
+	if content, err := os.ReadFile(candidatePath); err != nil || string(content) != "candidate" {
+		t.Fatalf("matching recovery candidate was removed or changed: content=%q err=%v", content, err)
+	}
+
+	preservedPath := filepath.Join(dir, "preserved-candidate")
+	if err := os.Rename(candidatePath, preservedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(candidatePath, []byte("peer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removeAgentReplacementIfSame(candidatePath, candidateInfo)
+	if content, err := os.ReadFile(candidatePath); err != nil || string(content) != "peer" {
+		t.Fatalf("peer path was removed or changed: content=%q err=%v", content, err)
+	}
+}
+
 func TestEnsureBlurb(t *testing.T) {
 	t.Run("no agent file - creates one", func(t *testing.T) {
 		tmpDir := t.TempDir()
@@ -1049,8 +1269,8 @@ func TestEnsureBlurb(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := EnsureBlurb(tmpDir); err == nil {
-			t.Fatal("expected malformed marker error")
+		if err := EnsureBlurb(tmpDir); err == nil || !strings.Contains(err.Error(), "malformed") {
+			t.Fatalf("EnsureBlurb error=%v, want explicit malformed-blurb refusal", err)
 		}
 		content, err := os.ReadFile(filePath)
 		if err != nil {
@@ -1058,6 +1278,26 @@ func TestEnsureBlurb(t *testing.T) {
 		}
 		if string(content) != original {
 			t.Fatalf("EnsureBlurb changed malformed content:\n got: %q\nwant: %q", content, original)
+		}
+	})
+
+	t.Run("future blurb - refuses downgrade without writing", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		filePath := filepath.Join(tmpDir, "AGENTS.md")
+		original := "# My Instructions\n\n<!-- bv-agent-instructions-v999 -->\nfuture instructions\n<!-- end-bv-agent-instructions -->\n\nPreserve exactly.\n"
+		if err := os.WriteFile(filePath, []byte(original), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := EnsureBlurb(tmpDir); err == nil || !strings.Contains(err.Error(), "refusing to downgrade") {
+			t.Fatalf("EnsureBlurb error=%v, want explicit future-blurb refusal", err)
+		}
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(content) != original {
+			t.Fatalf("EnsureBlurb changed future-version content:\n got: %q\nwant: %q", content, original)
 		}
 	})
 

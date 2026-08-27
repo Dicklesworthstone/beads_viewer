@@ -301,6 +301,10 @@ func approxBetweenness(g graph.Directed, sampleSize int, seed int64, determinist
 	}
 
 	if n == 0 {
+		// SampleSize reports pivots actually used, not the caller's requested
+		// size. An empty graph has no valid pivot even though non-empty graphs
+		// clamp a non-positive request to one.
+		result.SampleSize = 0
 		result.Elapsed = time.Since(start)
 		return result
 	}
@@ -482,6 +486,9 @@ func singleSourceBetweennessDense(adj cachedAdjacency, sourceIdx int, buf *brand
 // Note: edgeCount is accepted for future density-aware heuristics but currently unused.
 func RecommendSampleSize(nodeCount, edgeCount int) int {
 	_ = edgeCount // Reserved for future density-aware sampling heuristics
+	if nodeCount <= 0 {
+		return 0
+	}
 	switch {
 	case nodeCount < 100:
 		// Small graph: use exact algorithm

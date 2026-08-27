@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -311,6 +312,20 @@ func TestDetectDuplicates_MaxSuggestions(t *testing.T) {
 	}
 }
 
+func TestDetectDuplicates_NonPositiveMaxIsSafe(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "Implement user authentication system", Status: model.StatusOpen},
+		{ID: "B", Title: "Implement user authentication system", Status: model.StatusOpen},
+	}
+	for _, limit := range []int{0, -1} {
+		config := DefaultDuplicateConfig()
+		config.MaxSuggestions = limit
+		if suggestions := DetectDuplicates(issues, config); len(suggestions) != 0 {
+			t.Fatalf("MaxSuggestions=%d returned %d suggestions", limit, len(suggestions))
+		}
+	}
+}
+
 func TestDetectDuplicates_MinKeywords(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Title: "Fix it", Status: model.StatusOpen},
@@ -409,6 +424,27 @@ func TestDetectDuplicates_SortedBySimilarity(t *testing.T) {
 	}
 }
 
+func TestDetectDuplicates_PairDirectionIndependentOfInputOrder(t *testing.T) {
+	issueA := model.Issue{ID: "A", Title: "Implement user authentication system", Status: model.StatusOpen}
+	issueB := model.Issue{ID: "B", Title: "Implement user authentication system", Status: model.StatusOpen}
+	config := DefaultDuplicateConfig()
+
+	for name, issues := range map[string][]model.Issue{
+		"forward":  {issueA, issueB},
+		"reversed": {issueB, issueA},
+	} {
+		t.Run(name, func(t *testing.T) {
+			suggestions := DetectDuplicates(issues, config)
+			if len(suggestions) != 1 {
+				t.Fatalf("got %d suggestions, want one", len(suggestions))
+			}
+			if got := suggestions[0]; got.TargetBead != "A" || got.RelatedBead != "B" {
+				t.Fatalf("pair = %s/%s, want canonical A/B", got.TargetBead, got.RelatedBead)
+			}
+		})
+	}
+}
+
 // ============================================================================
 // Helper Function Tests
 // ============================================================================
@@ -495,6 +531,31 @@ func TestDuplicateDetector_LastRun(t *testing.T) {
 	lastRun := detector.LastRun()
 	if lastRun.Before(before) || lastRun.After(after) {
 		t.Errorf("LastRun() = %v, want between %v and %v", lastRun, before, after)
+	}
+}
+
+func TestDuplicateDetector_ConcurrentUse(t *testing.T) {
+	detector := NewDuplicateDetector(DefaultDuplicateConfig())
+	issues := []model.Issue{
+		{ID: "A", Title: "Implement user authentication system", Status: model.StatusOpen},
+		{ID: "B", Title: "Implement user authentication system", Status: model.StatusOpen},
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = detector.Detect(issues)
+		}()
+		go func() {
+			defer wg.Done()
+			_ = detector.LastRun()
+		}()
+	}
+	wg.Wait()
+	if detector.LastRun().IsZero() {
+		t.Fatal("concurrent detection did not record a completion time")
 	}
 }
 

@@ -39,7 +39,7 @@ type Baseline struct {
 	// TopMetrics contains top-N items for key metrics
 	TopMetrics TopMetrics `json:"top_metrics"`
 
-	// Cycles stores detected cycles
+	// Cycles stores one representative cycle per detected cyclic component.
 	Cycles [][]string `json:"cycles,omitempty"`
 }
 

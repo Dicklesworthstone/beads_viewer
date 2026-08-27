@@ -382,6 +382,68 @@ func TestUnblocksInvariance_NonexistentID(t *testing.T) {
 	}
 }
 
+func TestUnblocksInvariance_AlreadyClosedBlockerChangesNothing(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "done", Status: model.StatusClosed},
+		{ID: "ready", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "done", Type: model.DepBlocks},
+		}},
+	}
+
+	an := NewAnalyzer(issues)
+	if unblocks := an.ComputeUnblocks("done"); len(unblocks) != 0 {
+		t.Fatalf("an already-closed blocker cannot change readiness, got %v", unblocks)
+	}
+}
+
+func TestUnblocksInvariance_SelfDependencyDoesNotUnblockItself(t *testing.T) {
+	issues := []model.Issue{{
+		ID:     "self",
+		Status: model.StatusOpen,
+		Dependencies: []*model.Dependency{
+			{DependsOnID: "self", Type: model.DepBlocks},
+		},
+	}}
+
+	an := NewAnalyzer(issues)
+	if unblocks := an.ComputeUnblocks("self"); len(unblocks) != 0 {
+		t.Fatalf("a completed issue cannot become its own actionable successor, got %v", unblocks)
+	}
+	if count := an.countTransitiveUnblocks("self"); count != 0 {
+		t.Fatalf("a self-cycle cannot create a transitive unblock, got %d", count)
+	}
+}
+
+func TestUnblocksInvariance_DeferredAndParentBlockedRemainUnactionable(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "blocker", Status: model.StatusOpen},
+		{ID: "parent-blocker", Status: model.StatusOpen},
+		{ID: "parent", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "parent-blocker", Type: model.DepBlocks},
+		}},
+		{ID: "deferred", Status: model.StatusOpen, DeferUntil: &future, Dependencies: []*model.Dependency{
+			{DependsOnID: "blocker", Type: model.DepBlocks},
+		}},
+		{ID: "parent-gated", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "blocker", Type: model.DepBlocks},
+			{DependsOnID: "parent", Type: model.DepParentChild},
+		}},
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	if unblocks := an.ComputeUnblocks("blocker"); len(unblocks) != 0 {
+		t.Fatalf("deferred and parent-gated successors must remain unactionable, got %v", unblocks)
+	}
+
+	an.SetNow(future)
+	if unblocks := an.ComputeUnblocks("blocker"); !stringSlicesEqual(unblocks, []string{"deferred"}) {
+		t.Fatalf("only elapsed deferral should become actionable, got %v", unblocks)
+	}
+}
+
 // TestUnblocksInvariance_Determinism tests that unblocks lists are deterministically sorted.
 func TestUnblocksInvariance_Determinism(t *testing.T) {
 	issues := []model.Issue{

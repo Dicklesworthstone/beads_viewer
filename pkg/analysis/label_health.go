@@ -289,7 +289,7 @@ func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLab
 	}
 
 	// Build dependency list deterministically
-	var deps []LabelDependency
+	deps := make([]LabelDependency, 0, len(depMap))
 	for _, d := range depMap {
 		deps = append(deps, *d)
 	}
@@ -316,7 +316,7 @@ func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLab
 			maxOut = sum
 		}
 	}
-	var bottlenecks []string
+	bottlenecks := make([]string, 0)
 	for label, c := range outCounts {
 		if c == maxOut && c > 0 {
 			bottlenecks = append(bottlenecks, label)
@@ -328,6 +328,7 @@ func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLab
 		Labels:              labelList,
 		FlowMatrix:          matrix,
 		Dependencies:        deps,
+		CriticalPaths:       []LabelPath{},
 		BottleneckLabels:    bottlenecks,
 		TotalCrossLabelDeps: totalDeps,
 	}

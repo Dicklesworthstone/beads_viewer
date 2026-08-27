@@ -44,7 +44,7 @@ type StartupProfile struct {
 	CriticalPath  time.Duration `json:"critical_path"`
 	Cycles        time.Duration `json:"cycles"`
 	CyclesTO      bool          `json:"cycles_timeout"`
-	CycleCount    int           `json:"cycle_count"`
+	CycleCount    int           `json:"cycle_count"`  // One stored representative per cyclic component
 	KCore         time.Duration `json:"kcore"`        // bv-85
 	Articulation  time.Duration `json:"articulation"` // bv-85
 	Slack         time.Duration `json:"slack"`        // bv-85
@@ -150,6 +150,41 @@ func (s *GraphStats) IsPhase2Ready() bool {
 	return s.phase2Ready
 }
 
+// graphStatsReadyForCache is the publication gate shared by the in-memory
+// caches. WaitForPhase2 only means the worker exited: cancellation can close
+// phase2Done without publishing Phase 2 results. The readiness bit distinguishes
+// that case, while explicit pending/error states keep failed results out too.
+func graphStatsReadyForCache(stats *GraphStats) bool {
+	if stats == nil {
+		return false
+	}
+
+	stats.mu.RLock()
+	defer stats.mu.RUnlock()
+	if !stats.phase2Ready {
+		return false
+	}
+	for _, entry := range []statusEntry{
+		stats.status.PageRank,
+		stats.status.Betweenness,
+		stats.status.Eigenvector,
+		stats.status.HITS,
+		stats.status.Critical,
+		stats.status.Cycles,
+		stats.status.KCore,
+		stats.status.Articulation,
+		stats.status.Slack,
+	} {
+		switch entry.State {
+		case "computed", "approx", "skipped":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // Status returns a copy of metric status flags.
 func (s *GraphStats) Status() MetricStatus {
 	s.mu.RLock()
@@ -171,8 +206,13 @@ func (s MetricStatus) ClaimUnsafeReasons() []string {
 		{name: "Betweenness", entry: s.Betweenness},
 	} {
 		switch metric.entry.State {
-		case "pending", "timeout", "panic", "error", "skipped":
+		case "computed", "approx":
+			continue
+		default:
 			reason := metric.entry.State
+			if reason == "" {
+				reason = "unknown"
+			}
 			if metric.entry.Reason != "" {
 				reason += ": " + metric.entry.Reason
 			}
@@ -191,6 +231,22 @@ func stateFromTiming(enabled bool, timedOut bool) string {
 		return "timeout"
 	default:
 		return "computed"
+	}
+}
+
+func emptyGraphMetricStatus(config AnalysisConfig) MetricStatus {
+	kcoreComputed := config.ComputeKCore || config.ComputeArticulation
+	articulationComputed := config.ComputeArticulation || config.ComputeKCore
+	return MetricStatus{
+		PageRank:     statusEntry{State: stateFromTiming(config.ComputePageRank, false)},
+		Betweenness:  statusEntry{State: stateFromTiming(config.ComputeBetweenness, false)},
+		Eigenvector:  statusEntry{State: stateFromTiming(config.ComputeEigenvector, false)},
+		HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, false)},
+		Critical:     statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false)},
+		Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, false)},
+		KCore:        statusEntry{State: stateFromTiming(kcoreComputed, false)},
+		Articulation: statusEntry{State: stateFromTiming(articulationComputed, false)},
+		Slack:        statusEntry{State: stateFromTiming(config.ComputeSlack, false)},
 	}
 }
 
@@ -855,7 +911,9 @@ func (s *GraphStats) OutDegreeRank() map[string]int {
 	return cp
 }
 
-// Cycles returns a copy of detected cycles. Safe for concurrent iteration.
+// Cycles returns the stored representative cycle for each detected cyclic
+// component, subject to the configured storage cap. Safe for concurrent
+// iteration.
 // Returns nil if Phase 2 is not yet complete.
 func (s *GraphStats) Cycles() [][]string {
 	s.mu.RLock()
@@ -894,9 +952,27 @@ func NewGraphStatsForTest(
 		criticalPathScore: criticalPathScore,
 		cycles:            cycles,
 		phase2Ready:       true,
+		status: MetricStatus{
+			PageRank:     testMetricStatus(pageRank != nil),
+			Betweenness:  testMetricStatus(betweenness != nil),
+			Eigenvector:  testMetricStatus(eigenvector != nil),
+			HITS:         testMetricStatus(hubs != nil || authorities != nil),
+			Critical:     testMetricStatus(criticalPathScore != nil),
+			Cycles:       testMetricStatus(cycles != nil),
+			KCore:        statusEntry{State: "skipped"},
+			Articulation: statusEntry{State: "skipped"},
+			Slack:        statusEntry{State: "skipped"},
+		},
 	}
 	close(stats.phase2Done)
 	return stats
+}
+
+func testMetricStatus(computed bool) statusEntry {
+	if computed {
+		return statusEntry{State: "computed"}
+	}
+	return statusEntry{State: "skipped"}
 }
 
 const (
@@ -923,10 +999,11 @@ func getIncrementalGraphStatsCache(key string) (*GraphStats, bool) {
 	pruneIncrementalGraphStatsCacheLocked(now)
 
 	entry, ok := incrementalGraphStatsCache[key]
-	if !ok || entry.stats == nil {
+	if !ok || !graphStatsReadyForCache(entry.stats) {
+		delete(incrementalGraphStatsCache, key)
 		return nil, false
 	}
-	if now.Sub(entry.insertedAt) > incrementalGraphStatsCacheTTL {
+	if !cacheTimestampIsFresh(entry.insertedAt, now, incrementalGraphStatsCacheTTL) {
 		delete(incrementalGraphStatsCache, key)
 		return nil, false
 	}
@@ -934,7 +1011,7 @@ func getIncrementalGraphStatsCache(key string) (*GraphStats, bool) {
 }
 
 func putIncrementalGraphStatsCache(key string, stats *GraphStats) {
-	if key == "" || stats == nil {
+	if key == "" || !graphStatsReadyForCache(stats) {
 		return
 	}
 
@@ -951,7 +1028,7 @@ func putIncrementalGraphStatsCache(key string, stats *GraphStats) {
 
 func pruneIncrementalGraphStatsCacheLocked(now time.Time) {
 	for k, entry := range incrementalGraphStatsCache {
-		if entry.stats == nil || now.Sub(entry.insertedAt) > incrementalGraphStatsCacheTTL {
+		if entry.stats == nil || !cacheTimestampIsFresh(entry.insertedAt, now, incrementalGraphStatsCacheTTL) {
 			delete(incrementalGraphStatsCache, k)
 		}
 	}
@@ -1195,7 +1272,8 @@ type Analyzer struct {
 	idToNode         map[string]int64
 	nodeToID         map[int64]string
 	issueMap         map[string]model.Issue
-	issues           []model.Issue // Original input slice, retained for data-hash memoization
+	issues           []model.Issue // Analyzer-owned snapshot retained for data-hash memoization
+	childrenByParent map[string][]string
 	blockerCounts    []int
 	blockerCountsMax int
 	config           *AnalysisConfig // Optional custom config, nil means use size-based defaults
@@ -1324,14 +1402,68 @@ func (a *Analyzer) graphStructureHash() string {
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
+// cycleEligibilityHash fingerprints the set of issues that can participate in
+// an execution-blocking cycle. The general graph cache otherwise keys only on
+// nodes and edges, but closing one member changes cycle semantics without
+// changing that topology.
+func (a *Analyzer) cycleEligibilityHash() string {
+	ids := make([]string, 0, len(a.issueMap))
+	for id, issue := range a.issueMap {
+		if !isClosedLikeStatus(issue.Status) {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+
+	h := sha256.New()
+	for _, id := range ids {
+		h.Write([]byte(id))
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// activeCycleGraph returns the blocking graph induced by open-like issues.
+// Closed and tombstoned issues remain in a.g for historical centrality, but
+// they no longer block execution and therefore must break operational cycles.
+func (a *Analyzer) activeCycleGraph() directedGraph {
+	hasClosed := false
+	for _, issue := range a.issueMap {
+		if isClosedLikeStatus(issue.Status) {
+			hasClosed = true
+			break
+		}
+	}
+	if !hasClosed {
+		return a.g
+	}
+
+	active := newCompactDirectedGraph(len(a.nodeToID))
+	edges := a.g.Edges()
+	for edges.Next() {
+		edge := edges.Edge()
+		fromID := a.nodeToID[edge.From().ID()]
+		toID := a.nodeToID[edge.To().ID()]
+		from, fromExists := a.issueMap[fromID]
+		to, toExists := a.issueMap[toID]
+		if !fromExists || !toExists || isClosedLikeStatus(from.Status) || isClosedLikeStatus(to.Status) {
+			continue
+		}
+		active.addEdge(edge.From().ID(), edge.To().ID())
+	}
+	return active
+}
+
 func NewAnalyzer(issues []model.Issue) *Analyzer {
 	// Issue IDs are the graph's semantic identity. Assign compact numeric IDs in
 	// sorted issue-ID order so cache-equivalent input permutations cannot change
 	// sampled pivots, traversal order, floating-point reduction, or cycle choice.
 	// Malformed duplicate IDs retain the loader's last-record-wins semantics.
+	ownedIssues := make([]model.Issue, len(issues))
 	issueMap := make(map[string]model.Issue, len(issues))
-	for _, issue := range issues {
-		issueMap[issue.ID] = issue
+	for i, issue := range issues {
+		ownedIssues[i] = issue.Clone()
+		issueMap[ownedIssues[i].ID] = ownedIssues[i]
 	}
 	sortedIssueIDs := make([]string, 0, len(issueMap))
 	for id := range issueMap {
@@ -1342,6 +1474,7 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 	g := newCompactDirectedGraph(len(sortedIssueIDs))
 	idToNode := make(map[string]int64, len(sortedIssueIDs))
 	nodeToID := make(map[int64]string, len(sortedIssueIDs))
+	childrenByParent := make(map[string][]string)
 	blockerCounts := make([]int, len(sortedIssueIDs))
 
 	// 1. Add Nodes
@@ -1351,7 +1484,7 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 		nodeToID[nodeID] = id
 	}
 
-	// 2. Add Edges (Dependency Direction)
+	// 2. Add blocking edges and index parent-child rollups.
 	// We only model *blocking* relationships in the analysis graph. Non-blocking
 	// links such as "related" should not influence centrality metrics or cycle
 	// detection because they do not gate execution order.
@@ -1369,9 +1502,16 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 		}
 
 		blockingTargets := make([]int64, 0, len(issue.Dependencies))
+		var parentTargets []string
 		for _, dep := range issue.Dependencies {
 			if dep == nil {
 				continue
+			}
+
+			if dep.Type == model.DepParentChild {
+				if _, exists := issueMap[dep.DependsOnID]; exists {
+					parentTargets = append(parentTargets, dep.DependsOnID)
+				}
 			}
 
 			// Only model blocking relationships in the analysis graph
@@ -1385,17 +1525,24 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 			}
 			blockingTargets = append(blockingTargets, v)
 		}
+		sort.Strings(parentTargets)
+		for i, parentID := range parentTargets {
+			if i == 0 || parentID != parentTargets[i-1] {
+				childrenByParent[parentID] = append(childrenByParent[parentID], issueID)
+			}
+		}
 		sort.Slice(blockingTargets, func(i, j int) bool { return blockingTargets[i] < blockingTargets[j] })
 		for _, v := range blockingTargets {
-			// Count all blocking dependencies (including duplicates) for impact scoring.
 			if v < 0 || int(v) >= len(blockerCounts) {
 				continue
 			}
-			blockerCounts[v]++
 			if seenByBlocker[v] == epoch {
 				continue
 			}
 			seenByBlocker[v] = epoch
+			// Blocker ratio is defined as direct dependents (graph in-degree),
+			// so repeated dependency records from one issue count only once.
+			blockerCounts[v]++
 
 			// Issue (u) depends on v → edge u -> v
 			g.addEdge(u, v)
@@ -1414,7 +1561,8 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 		idToNode:         idToNode,
 		nodeToID:         nodeToID,
 		issueMap:         issueMap,
-		issues:           issues,
+		issues:           ownedIssues,
+		childrenByParent: childrenByParent,
 		blockerCounts:    blockerCounts,
 		blockerCountsMax: maxBlockers,
 		now:              time.Now(),
@@ -1443,6 +1591,10 @@ func (a *Analyzer) AnalyzeAsync(ctx context.Context) *GraphStats {
 // AnalyzeAsyncWithConfig performs graph analysis with a custom configuration.
 // This allows callers to override the default size-based algorithm selection.
 func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisConfig) *GraphStats {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	nodeCount := len(a.issueMap)
 	edgeCount := a.g.Edges().Len()
 
@@ -1465,7 +1617,11 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 				// the stale entry forever.
 			}
 		} else {
-			incCacheKey = a.graphStructureHash() + "|" + configHash
+			incCacheKey = a.graphStructureHash()
+			if config.ComputeCycles {
+				incCacheKey += "|cycles:" + a.cycleEligibilityHash()
+			}
+			incCacheKey += "|" + configHash
 			if cached, ok := getIncrementalGraphStatsCache(incCacheKey); ok {
 				return cached
 			}
@@ -1500,20 +1656,7 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 
 	// Handle empty graph - mark phase 2 ready immediately
 	if nodeCount == 0 {
-		kcoreComputed := config.ComputeKCore || config.ComputeArticulation
-		articulationComputed := config.ComputeArticulation || config.ComputeKCore
-		slackComputed := config.ComputeSlack
-		stats.status = MetricStatus{
-			PageRank:     statusEntry{State: stateFromTiming(config.ComputePageRank, false)},
-			Betweenness:  statusEntry{State: stateFromTiming(config.ComputeBetweenness, false)},
-			Eigenvector:  statusEntry{State: stateFromTiming(config.ComputeEigenvector, false)},
-			HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, false)},
-			Critical:     statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false)},
-			Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, false)},
-			KCore:        statusEntry{State: stateFromTiming(kcoreComputed, false)},
-			Articulation: statusEntry{State: stateFromTiming(articulationComputed, false)},
-			Slack:        statusEntry{State: stateFromTiming(slackComputed, false)},
-		}
+		stats.status = emptyGraphMetricStatus(config)
 		stats.phase2Ready = true
 		close(stats.phase2Done)
 		return stats
@@ -1521,10 +1664,6 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 
 	// Phase 1: Fast metrics (degree centrality, topo sort, density)
 	a.computePhase1(stats)
-
-	if incCacheKey != "" {
-		putIncrementalGraphStatsCache(incCacheKey, stats)
-	}
 
 	// bv-perf: Skip Phase 2 entirely when all metrics are disabled.
 	// This avoids goroutine overhead when Phase 2 results aren't needed
@@ -1543,11 +1682,12 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 		}
 		stats.phase2Ready = true
 		close(stats.phase2Done)
+		putIncrementalGraphStatsCache(incCacheKey, stats)
 		return stats
 	}
 
 	// Phase 2: Expensive metrics in background goroutine
-	go a.computePhase2(ctx, stats, config, robotCacheKey, dataHash, configHash)
+	go a.computePhase2(ctx, stats, config, incCacheKey, robotCacheKey, dataHash, configHash)
 
 	return stats
 }
@@ -1656,6 +1796,7 @@ func (a *Analyzer) AnalyzeWithProfile(config AnalysisConfig) (*GraphStats, *Star
 
 	// Handle empty graph
 	if nodeCount == 0 {
+		stats.status = emptyGraphMetricStatus(config)
 		stats.phase2Ready = true
 		close(stats.phase2Done)
 		profile.Total = time.Since(totalStart)
@@ -1716,6 +1857,10 @@ func (a *Analyzer) computePhase1WithProfile(stats *GraphStats, profile *StartupP
 
 // computePhase2WithProfile calculates expensive metrics with timing instrumentation.
 func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphStats, config AnalysisConfig, profile *StartupProfile) {
+	if ctx.Err() != nil {
+		return
+	}
+
 	localPageRank := make(map[string]float64)
 	localBetweenness := make(map[string]float64)
 	localEigenvector := make(map[string]float64)
@@ -1730,6 +1875,8 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 	betweennessIsApprox := false
 	actualBetweennessSample := 0
 	cyclesTruncated := false
+	criticalPathUnavailableReason := ""
+	slackUnavailableReason := ""
 	// RunToCompletion calls the four normally deadline-raced algorithms directly.
 	// Their inputs and iteration order are deterministic; removing the scheduler
 	// versus timer race makes the resulting values and status deterministic too.
@@ -1905,9 +2052,21 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 	// Critical Path
 	if ctx.Err() == nil && config.ComputeCriticalPath {
 		cpStart := time.Now()
-		sorted, err := topo.Sort(a.g)
-		if err == nil {
+		if len(stats.TopologicalOrder) == len(a.issueMap) {
+			// Phase 1 already paid for the topological sort. Its public order is
+			// dependencies-first, so reverse it back to the orientation expected
+			// by computeHeights instead of sorting the full graph a second time.
+			sorted := make([]graph.Node, 0, len(stats.TopologicalOrder))
+			for i := len(stats.TopologicalOrder) - 1; i >= 0; i-- {
+				nodeID, ok := a.idToNode[stats.TopologicalOrder[i]]
+				if !ok {
+					continue
+				}
+				sorted = append(sorted, a.g.Node(nodeID))
+			}
 			localCriticalPath = a.computeHeights(sorted)
+		} else {
+			criticalPathUnavailableReason = "dependency graph contains a cycle; topological order unavailable"
 		}
 		profile.CriticalPath = time.Since(cpStart)
 	}
@@ -1920,7 +2079,8 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 			maxCycles = 100
 		}
 
-		sccs := topo.TarjanSCC(a.g)
+		cycleGraph := a.activeCycleGraph()
+		sccs := topo.TarjanSCC(cycleGraph)
 		hasCycles := false
 		for _, scc := range sccs {
 			if len(scc) > 1 {
@@ -1929,7 +2089,7 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 			}
 			if len(scc) == 1 {
 				n := scc[0]
-				if a.g.HasEdgeFromTo(n.ID(), n.ID()) {
+				if cycleGraph.HasEdgeFromTo(n.ID(), n.ID()) {
 					hasCycles = true
 					break
 				}
@@ -1937,15 +2097,11 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 		}
 
 		if hasCycles {
-			consumeCycles := func(cycles [][]graph.Node) {
-				profile.CycleCount = len(cycles)
-				cyclesToProcess := cycles
-				if len(cyclesToProcess) > maxCycles {
-					cyclesToProcess = cyclesToProcess[:maxCycles]
-					cyclesTruncated = true
-				}
+			consumeCycles := func(result cycleDetectionResult) {
+				profile.CycleCount = result.total
+				cyclesTruncated = result.truncated
 
-				for _, cycle := range cyclesToProcess {
+				for _, cycle := range result.cycles {
 					var cycleIDs []string
 					for _, n := range cycle {
 						cycleIDs = append(cycleIDs, a.nodeToID[n.ID()])
@@ -1954,22 +2110,22 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 				}
 			}
 			if config.RunToCompletion {
-				if cycles, ok := runMetricSafely(func() [][]graph.Node {
-					return findCyclesSafe(a.g, maxCycles)
+				if cycles, ok := runMetricSafely(func() cycleDetectionResult {
+					return findCyclesSafe(cycleGraph, maxCycles)
 				}); ok {
 					consumeCycles(cycles)
 				} else {
 					profile.CyclesTO = true
 				}
 			} else {
-				cyclesDone := make(chan [][]graph.Node, 1)
+				cyclesDone := make(chan cycleDetectionResult, 1)
 				go func() {
 					defer func() {
 						if r := recover(); r != nil {
 							// Panic -> implicitly causes timeout in parent
 						}
 					}()
-					cyclesDone <- findCyclesSafe(a.g, maxCycles)
+					cyclesDone <- findCyclesSafe(cycleGraph, maxCycles)
 				}()
 
 				timer := time.NewTimer(config.CyclesTimeout)
@@ -2004,8 +2160,15 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 
 	if config.ComputeSlack {
 		slackStart := time.Now()
-		localSlack = a.computeSlack(stats.TopologicalOrder)
+		if len(stats.TopologicalOrder) == len(a.issueMap) {
+			localSlack = a.computeSlack(stats.TopologicalOrder)
+		} else {
+			slackUnavailableReason = "dependency graph contains a cycle; topological order unavailable"
+		}
 		profile.Slack = time.Since(slackStart)
+	}
+	if ctx.Err() != nil {
+		return
 	}
 
 	// Compute ranks (background optimization)
@@ -2018,6 +2181,13 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 
 	// Atomic assignment
 	stats.mu.Lock()
+	// Rank construction can itself be material on a large graph. Honor a
+	// cancellation that arrived after the preceding check instead of publishing
+	// a completed-looking result after the caller abandoned the analysis.
+	if ctx.Err() != nil {
+		stats.mu.Unlock()
+		return
+	}
 	stats.pageRank = localPageRank
 	stats.betweenness = localBetweenness
 	stats.eigenvector = localEigenvector
@@ -2044,13 +2214,24 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 		if cycleReason != "" {
 			cycleReason += "; "
 		}
-		cycleReason += "truncated"
+		cycleReason += fmt.Sprintf("truncated to %d of %d cycle representatives", len(localCycles), profile.CycleCount)
 	}
 
 	// record status snapshot
 	kcoreComputed := config.ComputeKCore || config.ComputeArticulation
 	articulationComputed := config.ComputeArticulation || config.ComputeKCore
 	slackComputed := config.ComputeSlack
+
+	criticalStatus := statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false), Elapsed: profile.CriticalPath}
+	if config.ComputeCriticalPath && criticalPathUnavailableReason != "" {
+		criticalStatus.State = "skipped"
+		criticalStatus.Reason = criticalPathUnavailableReason
+	}
+	slackStatus := statusEntry{State: stateFromTiming(slackComputed, false), Elapsed: profile.Slack}
+	if slackComputed && slackUnavailableReason != "" {
+		slackStatus.State = "skipped"
+		slackStatus.Reason = slackUnavailableReason
+	}
 
 	stats.status = MetricStatus{
 		PageRank: statusEntry{State: stateFromTiming(config.ComputePageRank, profile.PageRankTO), Elapsed: profile.PageRank},
@@ -2062,11 +2243,11 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 		},
 		Eigenvector:  statusEntry{State: stateFromTiming(config.ComputeEigenvector, false), Elapsed: profile.Eigenvector},
 		HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, profile.HITSTO), Reason: config.HITSSkipReason, Elapsed: profile.HITS},
-		Critical:     statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false), Elapsed: profile.CriticalPath},
+		Critical:     criticalStatus,
 		Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, profile.CyclesTO), Reason: cycleReason, Elapsed: profile.Cycles},
 		KCore:        statusEntry{State: stateFromTiming(kcoreComputed, false), Elapsed: profile.KCore},
 		Articulation: statusEntry{State: stateFromTiming(articulationComputed, false), Elapsed: profile.Articulation},
-		Slack:        statusEntry{State: stateFromTiming(slackComputed, false), Elapsed: profile.Slack},
+		Slack:        slackStatus,
 	}
 	stats.mu.Unlock()
 }
@@ -2128,7 +2309,7 @@ func (a *Analyzer) computePhase1(stats *GraphStats) {
 // computePhase2 calculates expensive metrics in background.
 // Computes to local variables first, then atomically assigns under lock.
 // Respects the config to skip expensive algorithms for large graphs.
-func (a *Analyzer) computePhase2(ctx context.Context, stats *GraphStats, config AnalysisConfig, cacheKey, dataHash, configHash string) {
+func (a *Analyzer) computePhase2(ctx context.Context, stats *GraphStats, config AnalysisConfig, incrementalCacheKey, robotCacheKey, dataHash, configHash string) {
 	defer close(stats.phase2Done)
 
 	// Recover from panics to prevent crashing the entire application
@@ -2163,8 +2344,11 @@ func (a *Analyzer) computePhase2(ctx context.Context, stats *GraphStats, config 
 	a.computePhase2WithProfile(ctx, stats, config, dummyProfile)
 	computeDuration := time.Since(computeStart)
 
-	if cacheKey != "" {
-		putRobotDiskCachedStats(cacheKey, dataHash, configHash, stats, computeDuration)
+	if incrementalCacheKey != "" {
+		putIncrementalGraphStatsCache(incrementalCacheKey, stats)
+	}
+	if robotCacheKey != "" {
+		putRobotDiskCachedStats(robotCacheKey, dataHash, configHash, stats, computeDuration)
 	}
 }
 
@@ -2508,21 +2692,41 @@ func findArticulationPoints(adj undirectedAdjacency) map[int64]bool {
 	return out
 }
 
-// GetActionableIssues returns issues that can be worked on immediately.
+// GetActionableIssues returns owned copies of issues that can be worked on immediately.
 // An issue is actionable if:
 //  1. It is not closed or tombstone
 //  2. All its blocking dependencies (type "blocks") are closed or tombstone
 //  3. None of its parent issues (via "parent-child" deps) are themselves blocked
 //     (transitive parent-blocked propagation, matching br's behavior)
+//  4. Its defer_until instant is absent or has elapsed
 //
 // Missing blockers don't block (graceful degradation).
 // Returns list sorted by ID for determinism.
 func (a *Analyzer) GetActionableIssues() []model.Issue {
+	issues := a.getActionableIssuesAfterCompletions(nil)
+	for i := range issues {
+		issues[i] = issues[i].Clone()
+	}
+	return issues
+}
+
+// getActionableIssuesAfterCompletions applies the canonical readiness rules
+// while treating IDs in completed as closed. Advanced planning features use it
+// to simulate a sequence of completions without mutating the analyzer's source
+// issues or maintaining a second, subtly different definition of actionable.
+func (a *Analyzer) getActionableIssuesAfterCompletions(completed map[string]bool) []model.Issue {
+	isCompleted := func(id string) bool {
+		return completed != nil && completed[id]
+	}
+	isUnavailable := func(id string, issue model.Issue) bool {
+		return isCompleted(id) || isClosedLikeStatus(issue.Status)
+	}
+
 	// Phase 1: Compute the set of directly blocked issues.
 	// An issue is directly blocked if it has an open blocking-type dependency.
 	directlyBlocked := make(map[string]bool)
 	for id, issue := range a.issueMap {
-		if isClosedLikeStatus(issue.Status) {
+		if isUnavailable(id, issue) {
 			continue
 		}
 		for _, dep := range issue.Dependencies {
@@ -2533,51 +2737,40 @@ func (a *Analyzer) GetActionableIssues() []model.Issue {
 			if !exists {
 				continue
 			}
-			if !isClosedLikeStatus(blocker.Status) {
+			if !isUnavailable(dep.DependsOnID, blocker) {
 				directlyBlocked[id] = true
 				break
 			}
 		}
 	}
 
-	// Phase 2: Build parent→children index for transitive propagation.
-	// In the dependency model, a child issue has a dep with Type=="parent-child"
-	// and DependsOnID pointing to the parent. So we invert: for each such dep,
-	// the parent (DependsOnID) has the child (issue.ID).
-	childrenOf := make(map[string][]string)
-	for _, issue := range a.issueMap {
-		for _, dep := range issue.Dependencies {
-			if dep != nil && dep.Type == model.DepParentChild {
-				if _, exists := a.issueMap[dep.DependsOnID]; exists {
-					childrenOf[dep.DependsOnID] = append(childrenOf[dep.DependsOnID], issue.ID)
-				}
-			}
-		}
-	}
-
-	// Phase 3: Propagate blocked status through parent-child relationships.
-	// If a parent is blocked, its children are also blocked (transitively).
+	// Phase 2: Propagate blocked status through the immutable parent→children
+	// index built with the graph. If a parent is blocked, its children are also
+	// blocked (transitively).
 	// Use BFS to propagate efficiently (not N^2). Cap depth at 50 to match br.
 	blocked := make(map[string]bool, len(directlyBlocked))
+	type blockedQueueEntry struct {
+		id    string
+		depth int
+	}
+	queue := make([]blockedQueueEntry, 0, len(directlyBlocked))
 	for id := range directlyBlocked {
 		blocked[id] = true
+		queue = append(queue, blockedQueueEntry{id: id})
 	}
 
 	const maxDepth = 50
-	for depth := 0; depth < maxDepth; depth++ {
-		var newlyBlocked []string
-		for parentID := range blocked {
-			for _, childID := range childrenOf[parentID] {
-				if !blocked[childID] && !isClosedLikeStatus(a.issueMap[childID].Status) {
-					newlyBlocked = append(newlyBlocked, childID)
-				}
+	for head := 0; head < len(queue); head++ {
+		current := queue[head]
+		if current.depth >= maxDepth {
+			continue
+		}
+		for _, childID := range a.childrenByParent[current.id] {
+			if blocked[childID] || isUnavailable(childID, a.issueMap[childID]) {
+				continue
 			}
-		}
-		if len(newlyBlocked) == 0 {
-			break
-		}
-		for _, id := range newlyBlocked {
-			blocked[id] = true
+			blocked[childID] = true
+			queue = append(queue, blockedQueueEntry{id: childID, depth: current.depth + 1})
 		}
 	}
 
@@ -2603,7 +2796,7 @@ func (a *Analyzer) GetActionableIssues() []model.Issue {
 	var actionable []model.Issue
 	for _, id := range ids {
 		issue := a.issueMap[id]
-		if isClosedLikeStatus(issue.Status) {
+		if isUnavailable(id, issue) {
 			continue
 		}
 		if blocked[id] {
@@ -2628,31 +2821,36 @@ func (a *Analyzer) GetActionableIssues() []model.Issue {
 // while never withholding a genuinely-leaf epic.
 func (a *Analyzer) ParentsWithOpenChildren() map[string]bool {
 	result := make(map[string]bool)
-	for _, issue := range a.issueMap {
-		for _, dep := range issue.Dependencies {
-			if dep == nil || dep.Type != model.DepParentChild {
-				continue
-			}
-			parentID := dep.DependsOnID
-			if _, exists := a.issueMap[parentID]; !exists {
-				continue
-			}
-			// issue is a child of parentID; if this child is open-like, the
-			// parent has open child work.
-			if !isClosedLikeStatus(issue.Status) {
+	for parentID, childIDs := range a.childrenByParent {
+		for _, childID := range childIDs {
+			child := a.issueMap[childID]
+			if !isClosedLikeStatus(child.Status) {
 				result[parentID] = true
+				break
 			}
 		}
 	}
 	return result
 }
 
-// GetIssue returns a single issue by ID, or nil if not found
-func (a *Analyzer) GetIssue(id string) *model.Issue {
+// getIssue returns a read-only view of an issue for internal analysis code.
+// Callers must not mutate the returned issue or any of its nested data.
+func (a *Analyzer) getIssue(id string) *model.Issue {
 	if issue, ok := a.issueMap[id]; ok {
 		return &issue
 	}
 	return nil
+}
+
+// GetIssue returns an owned copy of a single issue by ID, or nil if not found.
+// Mutating the result cannot change the analyzer's immutable input snapshot.
+func (a *Analyzer) GetIssue(id string) *model.Issue {
+	issue := a.getIssue(id)
+	if issue == nil {
+		return nil
+	}
+	clone := issue.Clone()
+	return &clone
 }
 
 // GetBlockers returns the IDs of issues that block the given issue
@@ -2670,7 +2868,7 @@ func (a *Analyzer) GetBlockers(issueID string) []string {
 			}
 		}
 	}
-	return blockers
+	return sortedUniqueIssueIDs(blockers)
 }
 
 // GetOpenBlockers returns the IDs of non-closed issues that block the given issue
@@ -2690,7 +2888,23 @@ func (a *Analyzer) GetOpenBlockers(issueID string) []string {
 			}
 		}
 	}
-	return openBlockers
+	return sortedUniqueIssueIDs(openBlockers)
+}
+
+func sortedUniqueIssueIDs(ids []string) []string {
+	if len(ids) < 2 {
+		return ids
+	}
+	sort.Strings(ids)
+	write := 1
+	for read := 1; read < len(ids); read++ {
+		if ids[read] == ids[write-1] {
+			continue
+		}
+		ids[write] = ids[read]
+		write++
+	}
+	return ids[:write]
 }
 
 // BlockerChainEntry represents a single entry in a blocker chain.
@@ -2725,6 +2939,7 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 	if !ok {
 		return nil
 	}
+	triageCtx := NewTriageContext(a)
 
 	result := &BlockerChainResult{
 		TargetID:     issueID,
@@ -2743,13 +2958,14 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 		Priority:    issue.Priority,
 		Depth:       0,
 		IsRoot:      false,
-		Actionable:  len(a.GetOpenBlockers(issueID)) == 0,
+		Actionable:  triageCtx.IsActionable(issueID),
 		BlocksCount: a.countBlockedBy(issueID),
 	}
 	result.Chain = append(result.Chain, targetEntry)
 
-	// Get direct open blockers
-	openBlockers := a.GetOpenBlockers(issueID)
+	// Include both direct predecessor blockers and parent-blocked propagation,
+	// matching the readiness contract used by triage and execution planning.
+	openBlockers := triageCtx.OpenBlockers(issueID)
 	if len(openBlockers) == 0 {
 		targetEntry.IsRoot = true
 		result.Chain[0] = targetEntry
@@ -2781,7 +2997,7 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 			return
 		}
 
-		blockerOpenBlockers := a.GetOpenBlockers(id)
+		blockerOpenBlockers := triageCtx.OpenBlockers(id)
 		isRoot := len(blockerOpenBlockers) == 0
 
 		if id != issueID {
@@ -2792,7 +3008,7 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 				Priority:    blocker.Priority,
 				Depth:       depth,
 				IsRoot:      isRoot,
-				Actionable:  isRoot,
+				Actionable:  triageCtx.IsActionable(id),
 				BlocksCount: a.countBlockedBy(id),
 			}
 			result.Chain = append(result.Chain, entry)

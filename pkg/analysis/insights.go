@@ -53,6 +53,9 @@ func (s *GraphStats) GenerateInsights(limit int) Insights {
 	artPts := s.ArticulationPoints()
 	slack := s.Slack()
 	cycles := s.Cycles()
+	if cycles == nil {
+		cycles = make([][]string, 0)
+	}
 	orphans := findOrphans(s.OutDegree)
 
 	// Velocity snapshot (populated later when triage provides it)
@@ -100,10 +103,7 @@ func (s *GraphStats) GenerateInsights(limit int) Insights {
 }
 
 func findOrphans(outDegree map[string]int) []string {
-	if len(outDegree) == 0 {
-		return nil
-	}
-	var ids []string
+	ids := make([]string, 0)
 	for id, deg := range outDegree {
 		if deg == 0 {
 			ids = append(ids, id)
@@ -160,6 +160,9 @@ func getTopItemsInt(m map[string]int, limit int) []InsightItem {
 }
 
 func limitStrings(s []string, limit int) []string {
+	if s == nil {
+		return []string{}
+	}
 	if limit <= 0 || len(s) <= limit {
 		return s
 	}

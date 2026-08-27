@@ -3,6 +3,7 @@ package analysis
 import (
 	"bytes"
 	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -147,6 +148,22 @@ func TestConfigForSize_XLGraph_VerySparse(t *testing.T) {
 	}
 }
 
+func TestConfigForSize_DensityDoesNotOverflowIntMultiplication(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("synthetic graph counts require a 64-bit int")
+	}
+
+	// Correct density is 0.002, so an XL graph must skip HITS. Multiplying
+	// these node counts as ints first overflows int64 and used to make the
+	// density negative, incorrectly classifying the graph as very sparse.
+	nodeCount := int(int64(3_100_000_000))
+	edgeCount := int(int64(19_220_000_000_000_000))
+	cfg := ConfigForSize(nodeCount, edgeCount)
+	if cfg.ComputeHITS {
+		t.Fatal("overflowed density classified a synthetic dense XL graph as sparse")
+	}
+}
+
 func TestSkippedMetrics(t *testing.T) {
 	cfg := AnalysisConfig{
 		ComputeBetweenness:    false,
@@ -244,6 +261,8 @@ func TestApplyEnvOverrides_SourceDateEpochRunToCompletion(t *testing.T) {
 		{name: "empty", value: "", want: false},
 		{name: "fractional", value: "1.5", want: false},
 		{name: "nonnumeric", value: "tomorrow", want: false},
+		{name: "int64 max is not JSON encodable", value: "9223372036854775807", want: false},
+		{name: "int64 min is not JSON encodable", value: "-9223372036854775808", want: false},
 		{name: "int64 overflow", value: "9223372036854775808", want: false},
 	}
 
@@ -319,6 +338,20 @@ func TestDefaultConfig_EnvPhase2TimeoutInvalidIgnored(t *testing.T) {
 	want := 500 * time.Millisecond
 	if cfg.BetweennessTimeout != want || cfg.PageRankTimeout != want || cfg.HITSTimeout != want || cfg.CyclesTimeout != want {
 		t.Errorf("Expected invalid %s to be ignored and defaults retained, got: betweenness=%v pagerank=%v hits=%v cycles=%v",
+			EnvPhase2TimeoutSeconds, cfg.BetweennessTimeout, cfg.PageRankTimeout, cfg.HITSTimeout, cfg.CyclesTimeout)
+	}
+}
+
+func TestDefaultConfig_EnvPhase2TimeoutOverflowIgnored(t *testing.T) {
+	t.Setenv(EnvPhase2TimeoutSeconds, "9223372036854775807")
+
+	cfg := DefaultConfig()
+
+	// Multiplying an unchecked seconds value by time.Second used to wrap to a
+	// negative duration, turning every metric timer into an immediate timeout.
+	want := 500 * time.Millisecond
+	if cfg.BetweennessTimeout != want || cfg.PageRankTimeout != want || cfg.HITSTimeout != want || cfg.CyclesTimeout != want {
+		t.Errorf("overflowing %s should be ignored, got: betweenness=%v pagerank=%v hits=%v cycles=%v",
 			EnvPhase2TimeoutSeconds, cfg.BetweennessTimeout, cfg.PageRankTimeout, cfg.HITSTimeout, cfg.CyclesTimeout)
 	}
 }

@@ -63,6 +63,54 @@ func isClosedLikeStatus(status model.Status) bool {
 	return status == model.StatusClosed || status == model.StatusTombstone
 }
 
+func issueIsReadyAt(issue *model.Issue, issueMap map[string]*model.Issue, now time.Time) bool {
+	if issue == nil || isClosedLikeStatus(issue.Status) || issue.Status == model.StatusBlocked ||
+		issue.Status == model.StatusDraft || issue.Status == model.StatusDeferred || issue.IsDeferredAt(now) {
+		return false
+	}
+	return !issueHasOpenBlocker(issue, issueMap, make(map[string]bool), 0)
+}
+
+// issueHasOpenBlocker matches the graph analyzer's blocking semantics: direct
+// blocking dependencies gate an issue, and a parent-child parent gates its
+// descendants only when that parent is itself transitively blocked. A plain
+// open parent never blocks its child. Parent traversal is cycle-safe and uses
+// the same depth cap as the analyzer/br propagation path.
+func issueHasOpenBlocker(issue *model.Issue, issueMap map[string]*model.Issue, visiting map[string]bool, depth int) bool {
+	if issue == nil || isClosedLikeStatus(issue.Status) {
+		return false
+	}
+	for _, dep := range issue.Dependencies {
+		if dep == nil || !dep.Type.IsBlocking() {
+			continue
+		}
+		if blocker, exists := issueMap[dep.DependsOnID]; exists && blocker != nil && !isClosedLikeStatus(blocker.Status) {
+			return true
+		}
+	}
+
+	const maxParentBlockDepth = 50
+	if depth >= maxParentBlockDepth || visiting[issue.ID] {
+		return false
+	}
+	visiting[issue.ID] = true
+	defer delete(visiting, issue.ID)
+
+	for _, dep := range issue.Dependencies {
+		if dep == nil || dep.Type != model.DepParentChild {
+			continue
+		}
+		parent, exists := issueMap[dep.DependsOnID]
+		if !exists || parent == nil || isClosedLikeStatus(parent.Status) || visiting[parent.ID] {
+			continue
+		}
+		if issueHasOpenBlocker(parent, issueMap, visiting, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
 type snapshotBuildConfig struct {
 	PrecomputeTriage      bool
 	PrecomputeTree        bool
@@ -417,6 +465,8 @@ func (b *SnapshotBuilder) WithPreviousSnapshot(prev *DataSnapshot, diff *analysi
 // or call GetGraphStats().WaitForPhase2() if you need Phase 2 data immediately.
 func (b *SnapshotBuilder) Build() *DataSnapshot {
 	issues := b.issues
+	referenceTime := time.Now()
+	b.analyzer.SetNow(referenceTime)
 
 	// Apply default sorting to match the legacy reload path:
 	// Open first, then priority (ascending), then created date (newest first).
@@ -472,18 +522,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 			continue
 		}
 
-		// Check if blocked by open dependencies
-		isBlocked := false
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
-				continue
-			}
-			if blocker, exists := issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-				isBlocked = true
-				break
-			}
-		}
-		if !isBlocked {
+		if issueIsReadyAt(issue, issueMap, referenceTime) {
 			cReady++
 		}
 	}
@@ -492,7 +531,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	if b.recipe != nil {
 		viewIssues = make([]model.Issue, 0, len(issues))
 		for i := range issues {
-			if issueMatchesRecipe(issues[i], issueMap, b.recipe) {
+			if issueMatchesRecipe(issues[i], issueMap, b.recipe, referenceTime) {
 				viewIssues = append(viewIssues, issues[i])
 			}
 		}
@@ -526,7 +565,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 
 	// Compute triage insights (may be skipped for large/huge datasets; bv-9thm).
 	if b.cfg.PrecomputeTriage {
-		triageResult := analysis.ComputeTriageFromAnalyzer(b.analyzer, graphStats, issues, analysis.TriageOptions{}, time.Now())
+		triageResult := analysis.ComputeTriageFromAnalyzer(b.analyzer, graphStats, issues, analysis.TriageOptions{}, referenceTime)
 		triageScores = make(map[string]float64, len(triageResult.Recommendations))
 		triageReasons = make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
 		quickWinSet = make(map[string]bool, len(triageResult.QuickWins))
@@ -601,7 +640,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		semanticDocs[id] = search.IssueDocument(item.Issue)
 	}
 
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlerts(issues, graphStats, b.analyzer)
+	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsAt(issues, graphStats, b.analyzer, referenceTime)
 
 	return &DataSnapshot{
 		Issues:         issues,
@@ -790,7 +829,7 @@ func recipeName(r *recipe.Recipe) string {
 	return r.Name
 }
 
-func issueMatchesRecipe(issue model.Issue, issueMap map[string]*model.Issue, r *recipe.Recipe) bool {
+func issueMatchesRecipe(issue model.Issue, issueMap map[string]*model.Issue, r *recipe.Recipe, now time.Time) bool {
 	if r == nil {
 		return true
 	}
@@ -839,19 +878,11 @@ func issueMatchesRecipe(issue model.Issue, issueMap map[string]*model.Issue, r *
 		}
 	}
 
-	// Actionable filter (true = no open blockers and not scheduler-deferred;
-	// issue #191 parity with `br ready`)
+	// Actionable filter uses the same ready predicate as the snapshot counters,
+	// including live-status, deferral, direct-blocker, and parent-chain gates.
 	if r.Filters.Actionable != nil && *r.Filters.Actionable {
-		if issue.IsDeferredAt(time.Now()) {
+		if !issueIsReadyAt(&issue, issueMap, now) {
 			return false
-		}
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
-				continue
-			}
-			if blocker, exists := issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-				return false
-			}
 		}
 	}
 
@@ -1252,8 +1283,16 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 	if s == nil {
 		return nil
 	}
+	referenceTime := s.CreatedAt
+	if analyzer != nil {
+		referenceTime = analyzer.Now()
+	}
+	if referenceTime.IsZero() {
+		referenceTime = time.Now()
+	}
 
 	issuesClone := cloneIssuesForAsync(s.Issues)
+	viewIssuesClone := cloneIssuesForAsync(s.ViewIssues)
 	clonedIssueMap := make(map[string]*model.Issue, len(issuesClone))
 	for i := range issuesClone {
 		clonedIssueMap[issuesClone[i].ID] = &issuesClone[i]
@@ -1267,7 +1306,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 	var unblocksMap map[string][]string
 
 	if stats != nil && analyzer != nil && len(issues) > 0 {
-		triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, stats, issues, analysis.TriageOptions{}, time.Now())
+		triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, stats, issues, analysis.TriageOptions{}, referenceTime)
 		triageScores = make(map[string]float64, len(triageResult.Recommendations))
 		triageReasons = make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
 		quickWinSet = make(map[string]bool, len(triageResult.QuickWins))
@@ -1304,7 +1343,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		listModelItems[i] = listItems[i]
 		listIndexByID[listItems[i].Issue.ID] = i
 	}
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlerts(issuesClone, stats, analyzer)
+	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsAt(issuesClone, stats, analyzer, referenceTime)
 
 	return &DataSnapshot{
 		// Clone mutable Phase 1 data so the new snapshot stays immutable even if
@@ -1312,7 +1351,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		Issues:         issuesClone,
 		IssueMap:       clonedIssueMap,
 		pooledIssues:   s.pooledIssues,
-		ViewIssues:     s.ViewIssues,
+		ViewIssues:     viewIssuesClone,
 		ListItems:      listItems, // Deep copy - contains mutable SearchComponents/TriageReasons
 		listModelItems: listModelItems,
 		listIndexByID:  listIndexByID,

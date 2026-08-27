@@ -1,6 +1,7 @@
 package agents
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -103,6 +104,35 @@ func TestDetectAgentFile(t *testing.T) {
 			t.Errorf("Expected AGENTS.md to be preferred, got %q", detection.FileType)
 		}
 	})
+}
+
+func TestDetectAgentFileDoesNotFollowSymlink(t *testing.T) {
+	workDir := t.TempDir()
+	externalDir := t.TempDir()
+	targetPath := filepath.Join(externalDir, "external-instructions.md")
+	targetContent := []byte("private external bytes\n" + AgentBlurb)
+	if err := os.WriteFile(targetPath, targetContent, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	agentPath := filepath.Join(workDir, "AGENTS.md")
+	if err := os.Symlink(targetPath, agentPath); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+
+	detection := DetectAgentFile(workDir)
+	if !detection.Found() || detection.FilePath != agentPath || detection.FileType != "AGENTS.md" {
+		t.Fatalf("DetectAgentFile()=%+v, want found symlink metadata", detection)
+	}
+	if detection.Content != "" || detection.HasBlurb || detection.HasLegacyBlurb || detection.BlurbVersion != 0 || detection.BlurbCount != 0 || detection.BlurbStructureError != "" {
+		t.Fatalf("DetectAgentFile() exposed or analyzed symlink target: %+v", detection)
+	}
+	after, err := os.ReadFile(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, targetContent) {
+		t.Fatalf("symlink target changed: got %q, want %q", after, targetContent)
+	}
 }
 
 func TestAgentFileDetectionMethods(t *testing.T) {
@@ -230,6 +260,26 @@ func TestDetectAgentFileReportsMalformedAndDuplicateBlurbs(t *testing.T) {
 				t.Fatal("malformed marker structure must not be treated as a safe append target")
 			}
 		})
+	}
+}
+
+func TestDetectAgentFileReportsMarkdownAnalysisLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+	content := "[reference]: " + strings.Repeat("(", maxCommonMarkDestinationParenDepth+1) + "\n" +
+		BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	detection := DetectAgentFile(tmpDir)
+	if !detection.Found() || !detection.HasBlurb || !detection.HasMalformedBlurb() {
+		t.Fatalf("DetectAgentFile()=%+v, want a found, fail-closed malformed detection", detection)
+	}
+	if detection.HasLegacyBlurb || detection.BlurbCount != 0 || detection.BlurbVersion != 0 {
+		t.Fatalf("DetectAgentFile() asserted unsupported blurb details under analysis uncertainty: %+v", detection)
+	}
+	if !strings.Contains(detection.BlurbStructureError, "markdown analysis limit exceeded") {
+		t.Fatalf("BlurbStructureError=%q, want explicit analysis-limit diagnostic", detection.BlurbStructureError)
 	}
 }
 

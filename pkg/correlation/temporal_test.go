@@ -1,11 +1,216 @@
 package correlation
 
 import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestFindCommitsInWindowPropagatesInFlightCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture uses a POSIX executable script")
+	}
+
+	fakeBin := t.TempDir()
+	gitPath := filepath.Join(fakeBin, "git")
+	if err := os.WriteFile(gitPath, []byte("#!/bin/sh\nwhile :; do :; done\n"), 0o755); err != nil {
+		t.Fatalf("write blocking git fixture: %v", err)
+	}
+	t.Setenv("PATH", fakeBin)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	correlator := NewTemporalCorrelator(t.TempDir()).WithContext(ctx)
+	_, err := correlator.FindCommitsInWindow(TemporalWindow{
+		AuthorEmail: "dev@example.com",
+		Start:       time.Unix(1, 0).UTC(),
+		End:         time.Unix(2, 0).UTC(),
+	})
+	if err == nil {
+		t.Fatal("FindCommitsInWindow returned success after its git process was canceled")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("FindCommitsInWindow error = %v, want context deadline exceeded", err)
+	}
+
+	claimed := &BeadEvent{Timestamp: time.Unix(1, 0).UTC(), AuthorEmail: "dev@example.com"}
+	closed := &BeadEvent{Timestamp: time.Unix(2, 0).UTC()}
+	_, err = correlator.ExtractAllTemporalCorrelations(map[string]BeadHistory{
+		"bv-42": {Milestones: BeadMilestones{Claimed: claimed, Closed: closed}},
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ExtractAllTemporalCorrelations error = %v, want context deadline exceeded", err)
+	}
+	if !strings.Contains(err.Error(), "bv-42") {
+		t.Fatalf("ExtractAllTemporalCorrelations error = %v, want bead context", err)
+	}
+}
+
+func TestFindCommitsInWindowPropagatesCancellationDuringFileExtraction(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture uses a POSIX executable script")
+	}
+
+	fakeBin := t.TempDir()
+	gitPath := filepath.Join(fakeBin, "git")
+	script := `#!/bin/sh
+case " $* " in
+  *" log "*)
+    printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0002025-12-15T10:30:00Z\000Dev\000dev@example.com\000work\n'
+    ;;
+  *" --no-renames "*)
+    exit 0
+    ;;
+  *" rev-parse "*" --is-shallow-repository "*)
+    printf 'false\n'
+    ;;
+  *" show "*)
+    while :; do :; done
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+`
+	if err := os.WriteFile(gitPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write staged git fixture: %v", err)
+	}
+	t.Setenv("PATH", fakeBin)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := NewTemporalCorrelator(t.TempDir()).WithContext(ctx).FindCommitsInWindow(TemporalWindow{
+		BeadID:      "bv-42",
+		AuthorEmail: "dev@example.com",
+		Start:       time.Unix(1, 0).UTC(),
+		End:         time.Unix(2_000_000_000, 0).UTC(),
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("file-extraction cancellation error = %v, want context deadline exceeded", err)
+	}
+	if !strings.Contains(err.Error(), strings.Repeat("a", 40)) {
+		t.Fatalf("file-extraction cancellation error = %v, want commit context", err)
+	}
+}
+
+func TestFindCommitsInWindowPropagatesBeadsProbeFailures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture uses a POSIX executable script")
+	}
+
+	for _, tc := range []struct {
+		name     string
+		showBody string
+	}{
+		{name: "git failure", showBody: "printf 'probe failed\\n' >&2; exit 23"},
+		{name: "parse failure", showBody: "printf 'bogus\\000'"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeBin := t.TempDir()
+			gitPath := filepath.Join(fakeBin, "git")
+			script := `#!/bin/sh
+case " $* " in
+  *" log "*)
+    printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0002025-12-15T10:30:00Z\000Dev\000dev@example.com\000work\n'
+    ;;
+  *" show "*)
+    ` + tc.showBody + `
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+`
+			if err := os.WriteFile(gitPath, []byte(script), 0o755); err != nil {
+				t.Fatalf("write failing git fixture: %v", err)
+			}
+			t.Setenv("PATH", fakeBin)
+
+			_, err := NewTemporalCorrelator(t.TempDir()).FindCommitsInWindow(TemporalWindow{
+				BeadID:      "bv-42",
+				AuthorEmail: "dev@example.com",
+				Start:       time.Unix(1, 0).UTC(),
+				End:         time.Unix(2_000_000_000, 0).UTC(),
+			})
+			if err == nil {
+				t.Fatal("FindCommitsInWindow returned success after Beads probe failure")
+			}
+			if !strings.Contains(err.Error(), "checking Beads-file changes") || !strings.Contains(err.Error(), strings.Repeat("a", 40)) {
+				t.Fatalf("Beads probe error = %v, want operation and commit context", err)
+			}
+		})
+	}
+}
+
+func TestExtractAllTemporalCorrelationsHasStableBeadOrder(t *testing.T) {
+	repo := initTempGitRepo(t)
+	now := time.Now()
+	histories := make(map[string]BeadHistory)
+	for _, beadID := range []string{"bv-03", "bv-01", "bv-02"} {
+		histories[beadID] = BeadHistory{
+			Title: beadID,
+			Milestones: BeadMilestones{
+				Claimed: &BeadEvent{Timestamp: now.Add(-time.Hour), Author: "Test User", AuthorEmail: "test@example.com"},
+				Closed:  &BeadEvent{Timestamp: now.Add(time.Hour)},
+			},
+		}
+	}
+
+	commits, err := NewTemporalCorrelator(repo).ExtractAllTemporalCorrelations(histories)
+	if err != nil {
+		t.Fatalf("ExtractAllTemporalCorrelations: %v", err)
+	}
+	want := []string{"bv-01", "bv-02", "bv-03"}
+	if len(commits) != len(want) {
+		t.Fatalf("len(commits) = %d, want %d: %+v", len(commits), len(want), commits)
+	}
+	for i, commit := range commits {
+		if commit.BeadID != want[i] {
+			t.Fatalf("commit %d BeadID = %q, want %q", i, commit.BeadID, want[i])
+		}
+	}
+}
+
+func TestTemporalTouchesBeadsFileUsesInvariantNULSafeDiff(t *testing.T) {
+	repo := initTempGitRepo(t)
+	if err := os.MkdirAll(filepath.Join(repo, ".beads"), 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	oldRelative := ".beads/odd\nname.jsonl"
+	newRelative := "archive/odd\nname.jsonl"
+	if err := os.WriteFile(filepath.Join(repo, oldRelative), []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("write odd-path beads fixture: %v", err)
+	}
+	runGit(t, repo, "add", oldRelative)
+	runGit(t, repo, "commit", "-m", "add odd-path beads fixture")
+	if err := os.MkdirAll(filepath.Join(repo, "archive"), 0o755); err != nil {
+		t.Fatalf("create archive directory: %v", err)
+	}
+	runGit(t, repo, "mv", oldRelative, newRelative)
+	runGit(t, repo, "commit", "-m", "move odd-path beads fixture")
+	sha, err := getGitHead(repo)
+	if err != nil {
+		t.Fatalf("resolve rename commit: %v", err)
+	}
+
+	// These settings alter the legacy newline-delimited/name-only output, but
+	// the production probe pins its own policy and forces rename pre/post images.
+	runGit(t, repo, "config", "core.quotePath", "false")
+	runGit(t, repo, "config", "diff.renames", "true")
+	touches, err := NewTemporalCorrelator(repo).touchesBeadsFile(sha)
+	if err != nil {
+		t.Fatalf("touchesBeadsFile: %v", err)
+	}
+	if !touches {
+		t.Fatal("rename out of .beads with a newline path was not recognized as a Beads-file commit")
+	}
+}
 
 func TestExtractPathHints(t *testing.T) {
 	tests := []struct {
@@ -459,6 +664,107 @@ func TestExtractWindowFromMilestones(t *testing.T) {
 				t.Errorf("End = %v, want %v", got.End, closedEvent.Timestamp)
 			}
 		})
+	}
+}
+
+func TestExtractWindowFromMilestonesUsesLatestContinuousInterval(t *testing.T) {
+	claimed := &BeadEvent{Timestamp: time.Unix(10, 0).UTC(), Author: "Dev", AuthorEmail: "dev@example.com"}
+	reopened := &BeadEvent{Timestamp: time.Unix(30, 0).UTC()}
+	closed := &BeadEvent{Timestamp: time.Unix(40, 0).UTC()}
+	window := ExtractWindowFromMilestones("bv-reopened", "Reopened", BeadMilestones{
+		Claimed: claimed, Reopened: reopened, Closed: closed,
+	})
+	if window == nil || !window.Start.Equal(reopened.Timestamp) || !window.End.Equal(closed.Timestamp) {
+		t.Fatalf("reopened window = %+v, want %v..%v", window, reopened.Timestamp, closed.Timestamp)
+	}
+
+	inverted := ExtractWindowFromMilestones("bv-still-open", "Still open", BeadMilestones{
+		Claimed:  claimed,
+		Closed:   &BeadEvent{Timestamp: time.Unix(20, 0).UTC()},
+		Reopened: reopened,
+	})
+	if inverted != nil {
+		t.Fatalf("close before latest reopen produced inverted completed window: %+v", inverted)
+	}
+}
+
+func TestExtractTemporalWindowFromHistoryUsesLatestActivationIdentity(t *testing.T) {
+	claimA := BeadEvent{EventType: EventClaimed, Timestamp: time.Unix(10, 0).UTC(), Author: "Dev A", AuthorEmail: "a@example.com"}
+	firstClose := BeadEvent{EventType: EventClosed, Timestamp: time.Unix(20, 0).UTC()}
+	reopenB := BeadEvent{EventType: EventReopened, Timestamp: time.Unix(30, 0).UTC(), Author: "Dev B", AuthorEmail: "b@example.com"}
+	claimC := BeadEvent{EventType: EventClaimed, Timestamp: time.Unix(35, 0).UTC(), Author: "Dev C", AuthorEmail: "c@example.com"}
+	finalClose := BeadEvent{EventType: EventClosed, Timestamp: time.Unix(40, 0).UTC()}
+
+	for _, tc := range []struct {
+		name       string
+		events     []BeadEvent
+		wantStart  time.Time
+		wantAuthor string
+		wantEmail  string
+	}{
+		{
+			name:       "reopen author replaces original claimant",
+			events:     []BeadEvent{claimA, firstClose, reopenB, finalClose},
+			wantStart:  reopenB.Timestamp,
+			wantAuthor: reopenB.Author,
+			wantEmail:  reopenB.AuthorEmail,
+		},
+		{
+			name:       "claim after reopen starts actual work interval",
+			events:     []BeadEvent{claimA, firstClose, reopenB, claimC, finalClose},
+			wantStart:  claimC.Timestamp,
+			wantAuthor: claimC.Author,
+			wantEmail:  claimC.AuthorEmail,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			history := BeadHistory{
+				Title:  "Reassigned work",
+				Events: tc.events,
+				// Keep the intentionally lossy summary present to prove the
+				// production helper uses Events rather than the first claim.
+				Milestones: BeadMilestones{Claimed: &claimA, Reopened: &reopenB, Closed: &finalClose},
+			}
+			window := extractTemporalWindowFromHistory("bv-reassigned", history)
+			if window == nil {
+				t.Fatal("history produced no completed temporal window")
+			}
+			if !window.Start.Equal(tc.wantStart) || !window.End.Equal(finalClose.Timestamp) || window.Author != tc.wantAuthor || window.AuthorEmail != tc.wantEmail {
+				t.Fatalf("window = %+v, want %v..%v owned by %s <%s>", window, tc.wantStart, finalClose.Timestamp, tc.wantAuthor, tc.wantEmail)
+			}
+		})
+	}
+}
+
+func TestConcurrentTemporalBeadsUseCurrentIntervalIdentity(t *testing.T) {
+	target := TemporalWindow{
+		BeadID:      "target",
+		Author:      "Dev C",
+		AuthorEmail: "c@example.com",
+		Start:       time.Unix(35, 0).UTC(),
+		End:         time.Unix(40, 0).UTC(),
+	}
+	event := func(kind EventType, second int64, author, email string) BeadEvent {
+		return BeadEvent{EventType: kind, Timestamp: time.Unix(second, 0).UTC(), Author: author, AuthorEmail: email}
+	}
+	histories := map[string]BeadHistory{
+		"target": {Events: []BeadEvent{
+			event(EventClaimed, 35, "Dev C", "c@example.com"),
+			event(EventClosed, 40, "", ""),
+		}},
+		"current-same-author": {Events: []BeadEvent{
+			event(EventClaimed, 5, "Dev A", "a@example.com"),
+			event(EventClosed, 10, "", ""),
+			event(EventReopened, 36, "Dev C", "c@example.com"),
+		}},
+		"stale-same-author": {Events: []BeadEvent{
+			event(EventClaimed, 5, "Dev C", "c@example.com"),
+			event(EventClosed, 10, "", ""),
+			event(EventReopened, 36, "Dev D", "d@example.com"),
+		}},
+	}
+	if got := countConcurrentTemporalBeads(histories, target); got != 2 {
+		t.Fatalf("concurrent beads = %d, want target plus current-same-author only", got)
 	}
 }
 

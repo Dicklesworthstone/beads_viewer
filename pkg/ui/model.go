@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net/url"
@@ -235,7 +236,248 @@ func WatchFileCmd(w *watcher.Watcher) tea.Cmd {
 	}
 }
 
+type liveReloadSourceContext struct {
+	beadsDir    string
+	repoPath    string
+	routeFiles  []string
+	worktreeDir string
+}
+
+func newLiveReloadSourceContext(beadsDir, repoPath string, routeFiles []string) liveReloadSourceContext {
+	selection := liveReloadSourceContext{
+		beadsDir:   beadsDir,
+		repoPath:   repoPath,
+		routeFiles: append([]string(nil), routeFiles...),
+	}
+	if gitDir, err := loader.GetGitDir(repoPath); err == nil {
+		selection.worktreeDir = filepath.Join(gitDir, "beads-worktrees")
+	}
+	return selection
+}
+
+func refreshLiveReloadSourceContext(selection liveReloadSourceContext, smart bool) (liveReloadSourceContext, bool) {
+	if !smart || strings.TrimSpace(selection.repoPath) == "" {
+		return liveReloadSourceContext{}, false
+	}
+	if _, explicit, err := datasource.ExplicitBeadsDBSource(); err != nil || explicit {
+		return liveReloadSourceContext{}, false
+	}
+	beadsDir, routeFiles, err := loader.GetBeadsDirWithTrace(selection.repoPath)
+	if err != nil {
+		// Resolution may fail because a newly-routed target does not exist yet.
+		// Preserve the partial trace and arm its candidate directory so creating
+		// the target/source can wake a retry without rewriting the old redirect.
+		candidateDir := selection.beadsDir
+		if len(routeFiles) > 0 {
+			candidateDir = filepath.Dir(routeFiles[len(routeFiles)-1])
+		}
+		return newLiveReloadSourceContext(candidateDir, selection.repoPath, routeFiles), true
+	}
+	if loader.IsBDWorkspace(beadsDir) {
+		return liveReloadSourceContext{}, false
+	}
+	return newLiveReloadSourceContext(beadsDir, selection.repoPath, routeFiles), true
+}
+
+func liveReloadSmartSourceContext(path string) (liveReloadSourceContext, bool) {
+	if strings.TrimSpace(path) == "" {
+		return liveReloadSourceContext{}, false
+	}
+
+	// A concrete BEADS_DB value is an explicit source choice. Do not broaden an
+	// explicit file watch into sibling discovery behind the caller's back.
+	if _, explicit, err := datasource.ExplicitBeadsDBSource(); err != nil || explicit {
+		return liveReloadSourceContext{}, false
+	}
+	if strings.TrimSpace(os.Getenv(loader.BeadsDBEnvVar)) != "" || strings.TrimSpace(os.Getenv(loader.BeadsDirEnvVar)) != "" {
+		beadsDir, routeFiles, err := loader.GetBeadsDirWithTrace("")
+		if err != nil || loader.IsBDWorkspace(beadsDir) {
+			return liveReloadSourceContext{}, false
+		}
+		repoPath := filepath.Dir(beadsDir)
+		if root, rootErr := loader.GetGitWorktreeRoot(""); rootErr == nil {
+			repoPath = root
+		}
+		return newLiveReloadSourceContext(beadsDir, repoPath, routeFiles), true
+	}
+
+	parentDir := filepath.Dir(path)
+	switch filepath.Base(parentDir) {
+	case ".beads", "_beads":
+		if loader.IsBDWorkspace(parentDir) {
+			return liveReloadSourceContext{}, false
+		}
+		repoPath := filepath.Dir(parentDir)
+		_, routeFiles, _ := loader.ResolveBeadsDirWithTrace(parentDir)
+		// A redirect target still normally ends in .beads. Recover the invoking
+		// worktree when its route resolves to this tracker instead of mistaking the
+		// shared tracker's parent for the repository and changing discovery scope on
+		// the first reload.
+		if root, err := loader.GetGitWorktreeRoot(""); err == nil {
+			if routed, routedFiles, routeErr := loader.GetBeadsDirWithTrace(root); routeErr == nil && sameReloadPath(routed, parentDir) {
+				repoPath = root
+				routeFiles = routedFiles
+			}
+		}
+		return newLiveReloadSourceContext(parentDir, repoPath, routeFiles), true
+	default:
+		// A selected worktree source lives under the Git directory rather than the
+		// routed .beads directory. Verify it against discovery before broadening the
+		// watch; an arbitrary programmatic path must remain pinned.
+		repoPath, err := loader.GetGitWorktreeRoot("")
+		if err != nil {
+			return liveReloadSourceContext{}, false
+		}
+		beadsDir, routeFiles, err := loader.GetBeadsDirWithTrace(repoPath)
+		if err != nil || loader.IsBDWorkspace(beadsDir) {
+			return liveReloadSourceContext{}, false
+		}
+		sources, err := datasource.DiscoverSources(datasource.DiscoveryOptions{
+			BeadsDir:               beadsDir,
+			RepoPath:               repoPath,
+			ValidateAfterDiscovery: false,
+		})
+		if err != nil {
+			return liveReloadSourceContext{}, false
+		}
+		for _, source := range sources {
+			if sameReloadPath(source.Path, path) {
+				return newLiveReloadSourceContext(beadsDir, repoPath, routeFiles), true
+			}
+		}
+		return liveReloadSourceContext{}, false
+	}
+}
+
+func sameReloadPath(first, second string) bool {
+	firstAbs, firstErr := filepath.Abs(first)
+	secondAbs, secondErr := filepath.Abs(second)
+	if firstErr != nil || secondErr != nil {
+		return filepath.Clean(first) == filepath.Clean(second)
+	}
+	return filepath.Clean(firstAbs) == filepath.Clean(secondAbs)
+}
+
+func liveReloadUsesSmartSourceSelection(path string) bool {
+	_, ok := liveReloadSmartSourceContext(path)
+	return ok
+}
+
+func liveReloadAdditionalFiles(path string) []string {
+	selection, smart := liveReloadSmartSourceContext(path)
+	return liveReloadAdditionalFilesForContext(path, selection, smart)
+}
+
+func liveReloadAdditionalFilesForContext(path string, selection liveReloadSourceContext, smart bool) []string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".db", ".sqlite", ".sqlite3":
+		if !smart {
+			return []string{path + "-wal"}
+		}
+	}
+	if !smart {
+		return nil
+	}
+	candidates := []string{
+		filepath.Join(selection.beadsDir, "beads.db"),
+		filepath.Join(selection.beadsDir, "beads.db-wal"),
+	}
+	candidates = append(candidates, selection.routeFiles...)
+	for _, name := range loader.PreferredJSONLNames {
+		candidates = append(candidates, filepath.Join(selection.beadsDir, name))
+	}
+	unique := make([]string, 0, len(candidates))
+	seen := make(map[string]bool, len(candidates)+1)
+	seen[filepath.Clean(path)] = true
+	for _, candidate := range candidates {
+		cleaned := filepath.Clean(candidate)
+		if seen[cleaned] {
+			continue
+		}
+		seen[cleaned] = true
+		unique = append(unique, cleaned)
+	}
+	return unique
+}
+
+func liveReloadSiblingFiles(path string) []string {
+	_, smart := liveReloadSmartSourceContext(path)
+	return liveReloadSiblingFilesForContext(smart)
+}
+
+func liveReloadSiblingFilesForContext(smart bool) []string {
+	if !smart {
+		return nil
+	}
+	// The WAL is a change trigger rather than a selectable source: SQLite may
+	// commit into beads.db-wal without updating beads.db until checkpoint.
+	names := make([]string, 0, len(loader.PreferredJSONLNames)+2)
+	names = append(names, "beads.db", "beads.db-wal")
+	names = append(names, loader.PreferredJSONLNames...)
+	return names
+}
+
+func newLiveReloadWatcher(path string, debounce time.Duration) (*watcher.Watcher, error) {
+	selection, smart := liveReloadSmartSourceContext(path)
+	return newLiveReloadWatcherWithContext(path, debounce, selection, smart)
+}
+
+func newLiveReloadWatcherWithContext(path string, debounce time.Duration, selection liveReloadSourceContext, smart bool) (*watcher.Watcher, error) {
+	options := []watcher.WatcherOption{
+		watcher.WithDebounceDuration(debounce),
+		watcher.WithSiblingFiles(liveReloadSiblingFilesForContext(smart)...),
+		watcher.WithAdditionalFiles(liveReloadAdditionalFilesForContext(path, selection, smart)...),
+	}
+	if smart {
+		options = append(options, watcher.WithDirectoryPatterns(
+			selection.beadsDir,
+			"*.jsonl", "beads.db", "beads.db-wal",
+		))
+		if selection.worktreeDir != "" {
+			options = append(options, watcher.WithRecursiveDirectoryPatterns(
+				selection.worktreeDir,
+				"*/issues.jsonl",
+			))
+		}
+	}
+	return watcher.NewWatcher(path, options...)
+}
+
+func augmentLiveReloadWatcher(w *watcher.Watcher, path string, selection liveReloadSourceContext, smart bool) error {
+	if w == nil || !smart {
+		return nil
+	}
+	if err := w.AddAdditionalFiles(liveReloadAdditionalFilesForContext(path, selection, true)...); err != nil {
+		return err
+	}
+	if err := w.AddDirectoryPatterns(selection.beadsDir, "*.jsonl", "beads.db", "beads.db-wal"); err != nil {
+		return err
+	}
+	if selection.worktreeDir != "" {
+		if err := w.AddRecursiveDirectoryPatterns(selection.worktreeDir, "*/issues.jsonl"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func loadIssuesForReload(path string, opts loader.ParseOptions) (loader.PooledIssues, error) {
+	selection, smart := liveReloadSmartSourceContext(path)
+	return loadIssuesForReloadWithContext(path, opts, selection, smart)
+}
+
+func loadIssuesForReloadWithContext(path string, opts loader.ParseOptions, selection liveReloadSourceContext, smart bool) (loader.PooledIssues, error) {
+	if smart {
+		if opts.Stats != nil {
+			*opts.Stats = loader.ParseStats{}
+		}
+		issues, err := datasource.LoadIssuesWithOptions(selection.repoPath, opts)
+		if err != nil {
+			return loader.PooledIssues{}, err
+		}
+		return loader.PooledIssues{Issues: issues}, nil
+	}
+
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".db", ".sqlite", ".sqlite3":
 		source, ok, err := datasource.SourceFromFile(path)
@@ -249,13 +491,20 @@ func loadIssuesForReload(path string, opts loader.ParseOptions) (loader.PooledIs
 		if err != nil {
 			return loader.PooledIssues{}, err
 		}
-		defer reader.Close()
-		issues, err := reader.LoadIssuesFiltered(opts.IssueFilter)
-		if err != nil {
-			return loader.PooledIssues{}, err
+		issues, loadErr := reader.LoadIssuesFiltered(opts.IssueFilter)
+		closeErr := reader.Close()
+		if err := errors.Join(loadErr, closeErr); err != nil {
+			return loader.PooledIssues{}, fmt.Errorf("loading reload source %s: %w", path, err)
 		}
 		return loader.PooledIssues{Issues: issues}, nil
 	default:
+		callerFilter := opts.IssueFilter
+		opts.IssueFilter = func(issue *model.Issue) bool {
+			if issue.Status.IsTombstone() {
+				return false
+			}
+			return callerFilter == nil || callerFilter(issue)
+		}
 		return loader.LoadIssuesFromFileWithOptionsPooled(path, opts)
 	}
 }
@@ -274,8 +523,12 @@ func countIssuesForReload(path string) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		defer reader.Close()
-		return reader.CountIssues()
+		count, countErr := reader.CountIssues()
+		closeErr := reader.Close()
+		if err := errors.Join(countErr, closeErr); err != nil {
+			return 0, fmt.Errorf("counting reload source %s: %w", path, err)
+		}
+		return count, nil
 	default:
 		return countJSONLLines(path)
 	}
@@ -421,14 +674,23 @@ func LoadHistoryCmd(
 	beadsPath string,
 	dataGeneration, requestGeneration uint64,
 ) tea.Cmd {
+	return loadHistoryCmdForRepo(ctx, issues, beadsPath, "", dataGeneration, requestGeneration)
+}
+
+func loadHistoryCmdForRepo(
+	ctx context.Context,
+	issues []model.Issue,
+	beadsPath, repositoryPath string,
+	dataGeneration, requestGeneration uint64,
+) tea.Cmd {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	return func() tea.Msg {
-		var repoPath string
+		repoPath := repositoryPath
 		var err error
 
-		if beadsPath != "" {
+		if repoPath == "" && beadsPath != "" {
 			// If beadsPath is provided (single-repo mode), derive repo root from it.
 			// Try to resolve absolute path first.
 			if absPath, e := filepath.Abs(beadsPath); e == nil {
@@ -492,6 +754,33 @@ func LoadHistoryCmd(
 	}
 }
 
+func liveReloadBeadsDir(path string, selection liveReloadSourceContext, smart bool) string {
+	if smart && strings.TrimSpace(selection.beadsDir) != "" {
+		return selection.beadsDir
+	}
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return filepath.Dir(path)
+}
+
+func liveReloadCurrentSourcePath(path string, selection liveReloadSourceContext, smart bool) string {
+	beadsDir := liveReloadBeadsDir(path, selection, smart)
+	if beadsDir == "" {
+		return path
+	}
+	if candidate, err := loader.FindJSONLPath(beadsDir); err == nil {
+		return candidate
+	}
+	for _, name := range []string{"beads.db", "beads.sqlite", "beads.sqlite3"} {
+		candidate := filepath.Join(beadsDir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return filepath.Join(beadsDir, filepath.Base(path))
+}
+
 // resolveHistoryCorrelationPath returns the path the History correlator should
 // follow through git history. Correlations come from the git history of the
 // JSONL export, so if the selected source is already a .jsonl we keep it; if it
@@ -547,9 +836,14 @@ type Model struct {
 	issueMap     map[string]*model.Issue
 	analyzer     *analysis.Analyzer
 	analysis     *analysis.GraphStats
-	beadsPath    string           // Path to beads.jsonl for reloading
-	watcher      *watcher.Watcher // File watcher for live reload
-	instanceLock *instance.Lock   // Multi-instance coordination lock
+	// analysisReferenceTime is non-zero for immutable historical views. Live
+	// models leave it zero so recency/defer calculations continue to advance.
+	analysisReferenceTime time.Time
+	beadsPath             string           // Path to beads.jsonl for reloading
+	watcher               *watcher.Watcher // File watcher for live reload
+	liveSourceContext     liveReloadSourceContext
+	smartLiveSource       bool
+	instanceLock          *instance.Lock // Multi-instance coordination lock
 
 	// Background Worker (Phase 2 architecture - bv-m7v8)
 	// snapshot is the current immutable data snapshot from BackgroundWorker.
@@ -888,6 +1182,15 @@ func (m *Model) invalidateSemanticFilter() {
 }
 
 func (m *Model) beginSemanticDatasetUpdate() {
+	// A history walk belongs to the old dataset. Cancel it immediately; callers
+	// restart on the new generation only when the History view is actually in use.
+	m.cancelHistoryLoad()
+	m.historyLoading = false
+	m.historyLoadDataGeneration = 0
+	// Failure is dataset-owned just like the report and request. Carrying it into
+	// a replacement dataset can make a newly empty project render as a failed
+	// history load instead of its correct terminal empty state.
+	m.historyLoadFailed = false
 	m.semanticDataGeneration++
 	m.invalidateSemanticFilter()
 	m.semanticIndexBuilding = false
@@ -1311,10 +1614,8 @@ func (m *Model) startHistoryLoad() tea.Cmd {
 	if m == nil {
 		return nil
 	}
-	// Repeated startup/snapshot notifications for the same semantic dataset
-	// share the in-flight git walk. Only a request with an owned cancellation
-	// context is eligible: NewModel marks historyLoading before Init schedules
-	// the first real command.
+	// Repeated requests for the same semantic dataset share the in-flight git
+	// walk. Only a request with an owned cancellation context is eligible.
 	if len(m.issues) > 0 &&
 		m.historyLoading &&
 		m.historyLoadCancel != nil &&
@@ -1338,21 +1639,27 @@ func (m *Model) startHistoryLoad() tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.historyLoadCancel = cancel
 	m.historyLoading = true
-	loadCommand := m.historyLoadCommand
-	if loadCommand == nil {
-		loadCommand = LoadHistoryCmd
+	historyPath := liveReloadCurrentSourcePath(m.beadsPath, m.liveSourceContext, m.smartLiveSource)
+	var cmd tea.Cmd
+	if loadCommand := m.historyLoadCommand; loadCommand != nil {
+		cmd = loadCommand(ctx, m.issuesForAsync(), historyPath, m.historyLoadDataGeneration, m.historyLoadRequestGeneration)
+	} else {
+		repositoryPath := ""
+		if m.smartLiveSource {
+			repositoryPath = m.liveSourceContext.repoPath
+		}
+		cmd = loadHistoryCmdForRepo(ctx, m.issuesForAsync(), historyPath, repositoryPath, m.historyLoadDataGeneration, m.historyLoadRequestGeneration)
 	}
-	cmd := loadCommand(
-		ctx,
-		m.issuesForAsync(),
-		m.beadsPath,
-		m.historyLoadDataGeneration,
-		m.historyLoadRequestGeneration,
-	)
 	if cmd == nil {
 		m.cancelHistoryLoad()
 		m.historyLoading = false
 		m.historyLoadDataGeneration = 0
+		m.historyLoadFailed = true
+		m.historyReportDataGeneration = 0
+		if m.isHistoryView {
+			m.statusMsg = "History load failed: no command was returned"
+			m.statusIsError = true
+		}
 	}
 	return cmd
 }
@@ -1370,11 +1677,25 @@ func (m *Model) quitCommand() tea.Cmd {
 	return tea.Quit
 }
 
-// NewModel creates a new Model from the given issues
-// beadsPath is the path to the beads.jsonl file for live reload support
+// NewModel creates a live Model from the given issues.
 func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath string) *Model {
+	return newModel(issues, activeRecipe, beadsPath, time.Time{})
+}
+
+// NewModelAt creates an immutable historical Model whose recency, deferral,
+// staleness, and attention calculations are pinned to analysisTime.
+func NewModelAt(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath string, analysisTime time.Time) *Model {
+	return newModel(issues, activeRecipe, beadsPath, analysisTime)
+}
+
+func newModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath string, analysisTime time.Time) *Model {
+	referenceTime := time.Now()
+	if !analysisTime.IsZero() {
+		referenceTime = analysisTime.UTC()
+	}
 	// Graph Analysis - Phase 1 is instant, Phase 2 runs in background
 	analyzer := analysis.NewAnalyzer(issues)
+	analyzer.SetNow(referenceTime)
 	graphStats := analyzer.AnalyzeAsync(context.Background())
 
 	// Sort issues
@@ -1491,18 +1812,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 			continue
 		}
 
-		// Check if blocked by open dependencies
-		isBlocked := false
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
-				continue
-			}
-			if blocker, exists := issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-				isBlocked = true
-				break
-			}
-		}
-		if !isBlocked {
+		if issueIsReadyAt(issue, issueMap, referenceTime) {
 			cReady++
 		}
 	}
@@ -1563,7 +1873,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	priorityHints := make(map[string]*analysis.PriorityRecommendation)
 
 	// Compute triage insights (bv-151) - reuse existing analyzer/stats (bv-runn.12)
-	triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, graphStats, issues, analysis.TriageOptions{}, time.Now())
+	triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, graphStats, issues, analysis.TriageOptions{}, referenceTime)
 	triageScores := make(map[string]float64, len(triageResult.Recommendations))
 	triageReasons := make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
 	quickWinSet := make(map[string]bool, len(triageResult.QuickWins))
@@ -1628,6 +1938,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	var backgroundWorker *BackgroundWorker
 	var backgroundModeErr error
 	backgroundModeRequested := false
+	liveSourceContext, smartLiveSource := liveReloadSmartSourceContext(beadsPath)
+	routedBeadsDir := liveReloadBeadsDir(beadsPath, liveSourceContext, smartLiveSource)
 	if v := strings.TrimSpace(os.Getenv("BV_BACKGROUND_MODE")); v != "" {
 		switch strings.ToLower(v) {
 		case "1", "true", "yes", "on":
@@ -1637,10 +1949,13 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		}
 	}
 
-	if beadsPath != "" && backgroundModeRequested {
+	liveReloadEnabled := beadsPath != "" && analysisTime.IsZero()
+	if liveReloadEnabled && backgroundModeRequested {
 		bw, err := NewBackgroundWorker(WorkerConfig{
-			BeadsPath:     beadsPath,
-			DebounceDelay: 200 * time.Millisecond,
+			BeadsPath:         beadsPath,
+			DebounceDelay:     200 * time.Millisecond,
+			liveSourceContext: liveSourceContext,
+			smartLiveSource:   smartLiveSource,
 		})
 		if err != nil {
 			backgroundModeErr = err
@@ -1649,10 +1964,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		}
 	}
 
-	if beadsPath != "" && backgroundWorker == nil {
-		w, err := watcher.NewWatcher(beadsPath,
-			watcher.WithDebounceDuration(200*time.Millisecond),
-		)
+	if liveReloadEnabled && backgroundWorker == nil {
+		w, err := newLiveReloadWatcherWithContext(beadsPath, 200*time.Millisecond, liveSourceContext, smartLiveSource)
 		if err != nil {
 			watcherErr = err
 		} else if err := w.Start(); err != nil {
@@ -1664,9 +1977,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 
 	// Initialize instance lock for multi-instance coordination (bv-vrvn)
 	var instLock *instance.Lock
-	if beadsPath != "" {
-		beadsDir := filepath.Dir(beadsPath)
-		lock, err := instance.NewLock(beadsDir)
+	if routedBeadsDir != "" && analysisTime.IsZero() {
+		lock, err := instance.NewLock(routedBeadsDir)
 		if err == nil {
 			instLock = lock
 		}
@@ -1701,21 +2013,20 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	}
 
 	// Precompute drift/health alerts (bv-168)
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlerts(issues, graphStats, analyzer)
+	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsAt(issues, graphStats, analyzer, referenceTime)
 
 	// Load sprints from the same directory as beadsPath (bv-161)
 	var sprints []model.Sprint
-	if beadsPath != "" {
-		beadsDir := filepath.Dir(beadsPath)
-		if loaded, err := loader.LoadSprintsFromFile(filepath.Join(beadsDir, loader.SprintsFileName)); err == nil {
+	if routedBeadsDir != "" {
+		if loaded, err := loader.LoadSprintsFromFile(filepath.Join(routedBeadsDir, loader.SprintsFileName)); err == nil {
 			sprints = loaded
 		}
 	}
 
 	// Tree view state should persist alongside the beads directory (e.g. BEADS_DIR overrides).
 	treeModel := NewTreeModel(theme)
-	if beadsPath != "" {
-		treeModel.SetBeadsDir(filepath.Dir(beadsPath))
+	if routedBeadsDir != "" {
+		treeModel.SetBeadsDir(routedBeadsDir)
 	}
 
 	m := Model{
@@ -1723,8 +2034,11 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		issueMap:                issueMap,
 		analyzer:                analyzer,
 		analysis:                graphStats,
+		analysisReferenceTime:   analysisTime.UTC(),
 		beadsPath:               beadsPath,
 		watcher:                 fileWatcher,
+		liveSourceContext:       liveSourceContext,
+		smartLiveSource:         smartLiveSource,
 		snapshotInitPending:     backgroundWorker != nil,
 		instanceLock:            instLock,
 		list:                    l,
@@ -1778,7 +2092,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		timeTravelInput:     ti,
 		statusMsg:           initialStatus,
 		statusIsError:       initialStatusErr,
-		historyLoading:      len(issues) > 0, // Will be loaded in Init()
+		historyLoading:      false, // History is loaded on demand when its view opens.
 		// Alerts panel (bv-168)
 		alerts:          alerts,
 		alertsCritical:  alertsCritical,
@@ -1789,6 +2103,9 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		sprints: sprints,
 		// AGENTS.md integration (bv-i8dk) - workDir derived from beadsPath
 		workDir: func() string {
+			if smartLiveSource && liveSourceContext.repoPath != "" {
+				return liveSourceContext.repoPath
+			}
 			if beadsPath != "" {
 				// beadsPath is like /path/to/project/.beads/beads.jsonl
 				// workDir is /path/to/project
@@ -1803,6 +2120,13 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	m.installBackgroundWorker(backgroundWorker)
 	m.registerKeyBindings()
 	return &m
+}
+
+func (m *Model) analysisNow() time.Time {
+	if m != nil && !m.analysisReferenceTime.IsZero() {
+		return m.analysisReferenceTime
+	}
+	return time.Now()
 }
 
 // rebuildInsightsPanel refreshes the underlying insights view model from the
@@ -1831,7 +2155,7 @@ func (m *Model) rebuildInsightsPanel() {
 	panel.showHeatmap = prev.showHeatmap
 
 	if m.analyzer != nil && m.analysis != nil {
-		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, time.Now())
+		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analysisNow())
 		panel.SetTopPicks(triage.QuickRef.TopPicks)
 		dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
 		panel.SetRecommendations(triage.Recommendations, dataHash)
@@ -1859,10 +2183,6 @@ func (m *Model) Init() tea.Cmd {
 		cmds = append(cmds, workerPollTickCmd())
 	} else if m.watcher != nil {
 		cmds = append(cmds, WatchFileCmd(m.watcher))
-	}
-	// Start loading history in background.
-	if historyCmd := m.startHistoryLoad(); historyCmd != nil {
-		cmds = append(cmds, historyCmd)
 	}
 	// Check for AGENTS.md integration prompt (bv-i8dk)
 	if m.workDir != "" && !m.workspaceMode {
@@ -2407,7 +2727,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Compute triage for insights panel (separate from snapshot triage for UI-specific features)
-		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, time.Now())
+		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analysisNow())
 		m.insightsPanel.SetTopPicks(triage.QuickRef.TopPicks)
 
 		// Set full recommendations with breakdown for priority radar (bv-93)
@@ -2422,13 +2742,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Refresh alerts now that full Phase 2 metrics (cycles, etc.) are available
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlerts(m.issues, m.analysis, m.analyzer)
+		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsAt(m.issues, m.analysis, m.analyzer, m.analysisNow())
 
 		// Invalidate label health cache since we have new graph metrics (criticality)
 		m.labelHealthCached = false
 		if m.focused == focusLabelDashboard {
 			cfg := analysis.DefaultLabelHealthConfig()
-			m.labelHealthCache = analysis.ComputeAllLabelHealth(m.issues, cfg, time.Now().UTC(), m.analysis)
+			m.labelHealthCache = analysis.ComputeAllLabelHealth(m.issues, cfg, m.analysisNow().UTC(), m.analysis)
 			m.labelHealthCached = true
 			m.labelDashboard.SetData(m.labelHealthCache.Labels)
 			m.statusMsg = fmt.Sprintf("Labels: %d total • critical %d • warning %d", m.labelHealthCache.TotalLabels, m.labelHealthCache.CriticalCount, m.labelHealthCache.WarningCount)
@@ -2533,18 +2853,40 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cancelHistoryLoad()
 		m.historyLoading = false
 		m.historyLoadDataGeneration = 0
-		if msg.Error != nil {
+		if msg.Error != nil || msg.Report == nil {
 			m.historyLoadFailed = true
+			m.historyReportDataGeneration = 0
 			// Retain the old report only as hidden state so a retry can restore the
 			// user's bead/commit/file-tree identity. Generation gates below prevent
 			// rendering or acting on it for a newer dataset.
-			m.statusMsg = fmt.Sprintf("History load failed: %v", msg.Error)
-			m.statusIsError = true
+			failureMessage := "History load failed: no report was returned"
+			if msg.Error != nil {
+				failureMessage = fmt.Sprintf("History load failed: %v", msg.Error)
+			}
+			if m.isHistoryView {
+				m.statusMsg = failureMessage
+				m.statusIsError = true
+			} else if m.statusMsg == "Loading history…" || m.statusMsg == "History is loading…" {
+				// The request failed after the user left History. Preserve its retry
+				// state, but do not let a background view overwrite newer feedback.
+				m.statusMsg = ""
+				m.statusIsError = false
+			}
 		} else {
 			m.historyLoadFailed = false
 			m.historyView.SetReport(msg.Report)
 			m.historyReportDataGeneration = msg.DataGeneration
-			m.historyView.SetSize(m.width, m.height-1)
+			m.historyView.SetSize(m.width, max(m.height-1, 5))
+			if m.isHistoryView {
+				m.statusMsg = fmt.Sprintf("Loaded history: %d beads with commits", msg.Report.Stats.BeadsWithCommits)
+				m.statusIsError = false
+			} else if m.statusMsg == "Loading history…" || m.statusMsg == "History is loading…" {
+				// The user can leave History while its command is still running. Do not
+				// leave a completed background operation advertised as in progress, but
+				// also do not overwrite a newer status from another view.
+				m.statusMsg = ""
+				m.statusIsError = false
+			}
 			// Refresh detail pane if visible
 			if m.isSplitView || m.showDetails {
 				m.updateViewportContent()
@@ -2593,6 +2935,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastAppliedSnapshotVer = msg.SnapshotVer
 		}
 		m.acceptWorkerGeneration(msg.WorkerGeneration)
+		if msg.smartLiveSource {
+			m.liveSourceContext = msg.liveSourceContext
+			m.smartLiveSource = true
+			m.tree.SetBeadsDir(msg.liveSourceContext.beadsDir)
+		}
 
 		firstSnapshot := m.snapshotInitPending && m.snapshot == nil
 		m.snapshotInitPending = false
@@ -2696,8 +3043,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Invalidate every async semantic result from the previous dataset before
 		// scheduling current-generation replacements.
 		m.beginSemanticDatasetUpdate()
-		if historyCmd := m.startHistoryLoad(); historyCmd != nil {
-			cmds = append(cmds, historyCmd)
+		if m.isHistoryView {
+			if historyCmd := m.startHistoryLoad(); historyCmd != nil {
+				cmds = append(cmds, historyCmd)
+			}
 		}
 		if m.semanticHybridEnabled {
 			if hybridCmd := m.startSemanticHybridBuild(); hybridCmd != nil {
@@ -2798,22 +3147,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					case "closed":
 						include = isClosedLikeStatus(issue.Status)
 					case "ready":
-						// Ready = Open/InProgress AND NO Open Blockers
-						// Exclude draft/deferred - not ready for execution
-						if !isClosedLikeStatus(issue.Status) && issue.Status != model.StatusBlocked &&
-							issue.Status != model.StatusDraft && issue.Status != model.StatusDeferred {
-							isBlocked := false
-							for _, dep := range issue.Dependencies {
-								if dep == nil || !dep.Type.IsBlocking() {
-									continue
-								}
-								if blocker, exists := m.issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-									isBlocked = true
-									break
-								}
-							}
-							include = !isBlocked
-						}
+						include = issueIsReadyAt(&issue, m.issueMap, m.analysisNow())
 					default:
 						if strings.HasPrefix(m.currentFilter, "label:") {
 							label := strings.TrimPrefix(m.currentFilter, "label:")
@@ -2909,8 +3243,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Reload sprints (bv-161)
-		if m.beadsPath != "" {
-			beadsDir := filepath.Dir(m.beadsPath)
+		if beadsDir := liveReloadBeadsDir(m.beadsPath, m.liveSourceContext, m.smartLiveSource); beadsDir != "" {
 			if loaded, err := loader.LoadSprintsFromFile(filepath.Join(beadsDir, loader.SprintsFileName)); err == nil {
 				m.sprints = loaded
 				// If we have a selected sprint, try to refresh it
@@ -3039,17 +3372,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Reload issues from disk
 		// Use custom warning handler to prevent stderr pollution during TUI render (bv-fix)
-		var reloadWarnings []string
+		reloadWarningCount := 0
 		var loadStart time.Time
 		if profileRefresh {
 			loadStart = time.Now()
 		}
-		loadedIssues, err := loadIssuesForReload(m.beadsPath, loader.ParseOptions{
-			WarningHandler: func(msg string) {
-				reloadWarnings = append(reloadWarnings, msg)
-			},
-			BufferSize: envMaxLineSizeBytes(),
-		})
+		if refreshed, ok := refreshLiveReloadSourceContext(m.liveSourceContext, m.smartLiveSource); ok {
+			if watchErr := augmentLiveReloadWatcher(m.watcher, m.beadsPath, refreshed, true); watchErr != nil {
+				reloadWarningCount++
+			}
+			m.liveSourceContext = refreshed
+			m.smartLiveSource = true
+			m.tree.SetBeadsDir(refreshed.beadsDir)
+		}
+		loadedIssues, err := loadIssuesForReloadWithContext(m.beadsPath, loader.ParseOptions{
+			WarningHandler: func(string) {},
+			WarningCount:   &reloadWarningCount,
+			BufferSize:     envMaxLineSizeBytes(),
+		}, m.liveSourceContext, m.smartLiveSource)
 		if profileRefresh {
 			recordTiming("load_issues", time.Since(loadStart))
 		}
@@ -3106,8 +3446,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Recompute analysis (async Phase 1/Phase 2) with caching
 		m.issues = newIssues
 		m.beginSemanticDatasetUpdate()
-		if historyCmd := m.startHistoryLoad(); historyCmd != nil {
-			cmds = append(cmds, historyCmd)
+		if m.isHistoryView {
+			if historyCmd := m.startHistoryLoad(); historyCmd != nil {
+				cmds = append(cmds, historyCmd)
+			}
 		}
 		var analysisStart time.Time
 		if profileRefresh {
@@ -3115,6 +3457,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		cachedAnalyzer := analysis.NewCachedAnalyzer(newIssues, nil)
 		m.analyzer = cachedAnalyzer.Analyzer
+		m.analyzer.SetNow(m.analysisNow())
 		m.analysis = cachedAnalyzer.AnalyzeAsync(context.Background())
 		cacheHit := cachedAnalyzer.WasCacheHit()
 		if profileRefresh {
@@ -3157,17 +3500,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.countBlocked++
 				continue
 			}
-			isBlocked := false
-			for _, dep := range issue.Dependencies {
-				if dep == nil || !dep.Type.IsBlocking() {
-					continue
-				}
-				if blocker, exists := m.issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-					isBlocked = true
-					break
-				}
-			}
-			if !isBlocked {
+			if issueIsReadyAt(issue, m.issueMap, m.analysisNow()) {
 				m.countReady++
 			}
 		}
@@ -3180,7 +3513,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if profileRefresh {
 			alertsStart = time.Now()
 		}
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlerts(m.issues, m.analysis, m.analyzer)
+		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsAt(m.issues, m.analysis, m.analyzer, m.analysisNow())
 		if profileRefresh {
 			recordTiming("alerts", time.Since(alertsStart))
 		}
@@ -3268,9 +3601,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				attentionStart = time.Now()
 			}
 			cfg := analysis.DefaultLabelHealthConfig()
-			m.attentionCache = analysis.ComputeLabelAttentionScores(m.issues, cfg, time.Now().UTC())
+			m.attentionCache = analysis.ComputeLabelAttentionScores(m.issues, cfg, m.analysisNow().UTC())
 			m.attentionCached = true
-			attText, _ := ComputeAttentionView(m.issues, max(40, m.width-4))
+			attText, _ := ComputeAttentionViewAt(m.issues, max(40, m.width-4), m.analysisNow())
 			m.rebuildInsightsPanel()
 			m.insightsPanel.labelAttention = m.attentionCache.Labels
 			m.insightsPanel.extraText = attText
@@ -3303,8 +3636,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Reload sprints (bv-161)
-		if m.beadsPath != "" {
-			beadsDir := filepath.Dir(m.beadsPath)
+		if beadsDir := liveReloadBeadsDir(m.beadsPath, m.liveSourceContext, m.smartLiveSource); beadsDir != "" {
 			if loaded, err := loader.LoadSprintsFromFile(filepath.Join(beadsDir, loader.SprintsFileName)); err == nil {
 				m.sprints = loaded
 				// If we have a selected sprint, try to refresh it
@@ -3338,8 +3670,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusMsg = fmt.Sprintf("Reloaded %d issues", len(newIssues))
 		}
-		if len(reloadWarnings) > 0 {
-			m.statusMsg += fmt.Sprintf(" (%d warnings)", len(reloadWarnings))
+		if reloadWarningCount > 0 {
+			m.statusMsg += fmt.Sprintf(" (%d warnings)", reloadWarningCount)
 		}
 		reloadDuration := time.Since(reloadStart)
 		if profileRefresh {
@@ -3377,8 +3709,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if autoAllowed {
 				bw, err := NewBackgroundWorker(WorkerConfig{
-					BeadsPath:     m.beadsPath,
-					DebounceDelay: 200 * time.Millisecond,
+					BeadsPath:         m.beadsPath,
+					DebounceDelay:     200 * time.Millisecond,
+					liveSourceContext: m.liveSourceContext,
+					smartLiveSource:   m.smartLiveSource,
 				})
 				if err == nil {
 					if m.watcher != nil {
@@ -4292,8 +4626,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// In search or file-tree mode, all keys go to the handler.
 				if !m.historyReportIsCurrent() {
 					// Keep stale report state untouched so identity can be restored when
-					// the current generation arrives, but never navigate or act on it.
-					if keyStr != "h" {
+					// the current generation arrives. Consume only History-local actions;
+					// non-conflicting global view toggles must still switch away while a
+					// load is pending or failed. The global h handler below owns retry/exit.
+					switch keyStr {
+					case "f", "g",
+						"j", "k", "up", "down",
+						"J", "K", "v", "tab", "enter",
+						"y", "c", "F", "o", "/":
 						viewToggleHandled = true
 					}
 					break
@@ -4491,7 +4831,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Compute label health (fast; phase1 metrics only needed) with caching
 				if !m.labelHealthCached {
 					cfg := analysis.DefaultLabelHealthConfig()
-					m.labelHealthCache = analysis.ComputeAllLabelHealth(m.issues, cfg, time.Now().UTC(), m.analysis)
+					m.labelHealthCache = analysis.ComputeAllLabelHealth(m.issues, cfg, m.analysisNow().UTC(), m.analysis)
 					m.labelHealthCached = true
 				}
 				m.labelDashboard.SetData(m.labelHealthCache.Labels)
@@ -4504,10 +4844,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Attention view: compute attention scores (cached) and render as text
 				if !m.attentionCached {
 					cfg := analysis.DefaultLabelHealthConfig()
-					m.attentionCache = analysis.ComputeLabelAttentionScores(m.issues, cfg, time.Now().UTC())
+					m.attentionCache = analysis.ComputeLabelAttentionScores(m.issues, cfg, m.analysisNow().UTC())
 					m.attentionCached = true
 				}
-				attText, _ := ComputeAttentionView(m.issues, max(40, m.width-4))
+				attText, _ := ComputeAttentionViewAt(m.issues, max(40, m.width-4), m.analysisNow())
 				m.isGraphView = false
 				m.isBoardView = false
 				m.isActionableView = false
@@ -5133,8 +5473,12 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 					m.historyView.ToggleExpandFile()
 				} else {
 					m.historyView.SelectFile()
-					name := m.historyView.SelectedFileName()
-					m.statusMsg = fmt.Sprintf("📁 Filtering by: %s", name)
+					if m.historyView.GetFileFilter() == "" {
+						m.statusMsg = "📁 File filter cleared"
+					} else {
+						name := m.historyView.SelectedFileName()
+						m.statusMsg = fmt.Sprintf("📁 Filtering by: %s", name)
+					}
 					m.statusIsError = false
 				}
 			}
@@ -5936,12 +6280,15 @@ func (m *Model) View() string {
 		body = m.actionableView.Render()
 	} else if m.isHistoryView {
 		if m.historyReportIsCurrent() {
-			m.historyView.SetSize(m.width, m.height-1)
+			m.historyView.SetSize(m.width, max(m.height-1, 5))
 			body = m.historyView.View()
 		} else {
 			message := "Loading history…"
-			if m.historyLoadFailed {
+			switch {
+			case m.historyLoadFailed:
 				message = "History unavailable; press h to retry"
+			case len(m.issues) == 0:
+				message = "No issue history available"
 			}
 			body = lipgloss.Place(max(m.width, 1), max(m.height-1, 1), lipgloss.Center, lipgloss.Center, message)
 		}
@@ -7606,21 +7953,7 @@ func (m *Model) matchesCurrentFilter(issue model.Issue) bool {
 	case "closed":
 		return isClosedLikeStatus(issue.Status)
 	case "ready":
-		// Ready = Open/InProgress AND NO Open Blockers
-		// Exclude draft/deferred - not ready for execution
-		if isClosedLikeStatus(issue.Status) || issue.Status == model.StatusBlocked ||
-			issue.Status == model.StatusDraft || issue.Status == model.StatusDeferred {
-			return false
-		}
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
-				continue
-			}
-			if blocker, exists := m.issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-				return false
-			}
-		}
-		return true
+		return issueIsReadyAt(&issue, m.issueMap, m.analysisNow())
 	default:
 		if strings.HasPrefix(m.currentFilter, "label:") {
 			label := strings.TrimPrefix(m.currentFilter, "label:")
@@ -7645,7 +7978,7 @@ func (m *Model) filteredIssuesForActiveView() []model.Issue {
 					continue
 				}
 			}
-			if issueMatchesRecipe(issue, m.issueMap, m.activeRecipe) {
+			if issueMatchesRecipe(issue, m.issueMap, m.activeRecipe, m.analysisNow()) {
 				filtered = append(filtered, issue)
 			}
 		}
@@ -7942,21 +8275,9 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 			}
 		}
 
-		// Apply actionable filter (no open blockers, not scheduler-deferred;
-		// issue #191 parity with `br ready`)
+		// Apply the same ready predicate used by snapshot counters.
 		if include && r.Filters.Actionable != nil && *r.Filters.Actionable {
-			// Check if issue is blocked
-			isBlocked := issue.IsDeferredAt(time.Now())
-			for _, dep := range issue.Dependencies {
-				if dep == nil || !dep.Type.IsBlocking() {
-					continue
-				}
-				if blocker, exists := m.issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-					isBlocked = true
-					break
-				}
-			}
-			include = !isBlocked
+			include = issueIsReadyAt(&issue, m.issueMap, m.analysisNow())
 		}
 
 		if include {
@@ -8538,8 +8859,8 @@ func (m *Model) updateViewportContent() {
 		}
 	}
 
-	// History Section (if data is loaded)
-	if m.historyView.HasReport() {
+	// History Section (only when it belongs to the current issue dataset).
+	if m.historyReportIsCurrent() {
 		historyMD := m.renderBeadHistoryMD(item.ID)
 		if historyMD != "" {
 			sb.WriteString(historyMD)
@@ -8556,6 +8877,9 @@ func (m *Model) updateViewportContent() {
 
 // renderBeadHistoryMD generates markdown for a bead's history
 func (m *Model) renderBeadHistoryMD(beadID string) string {
+	if !m.historyReportIsCurrent() {
+		return ""
+	}
 	hist := m.historyView.GetHistoryForBead(beadID)
 	if hist == nil || len(hist.Commits) == 0 {
 		return ""
@@ -8742,6 +9066,7 @@ func (m *Model) enterHistoryView() tea.Cmd {
 
 func (m *Model) historyReportIsCurrent() bool {
 	return m != nil && m.historyView.report != nil &&
+		!m.historyLoading && !m.historyLoadFailed &&
 		m.historyReportDataGeneration == m.semanticDataGeneration
 }
 
@@ -9466,10 +9791,9 @@ func startAllowlistedGUIEditor(kind allowlistedGUIEditorKind, targetFile string)
 // frontmatter markdown, suspends the TUI, launches the editor, and returns a
 // tea.Cmd that will produce an editorExitMsg when the editor exits (bv-134).
 // For GUI editors it launches them in the background as before.
-// Uses m.beadsPath which respects issues.jsonl (canonical per beads upstream).
+// Uses the current routed source path rather than the startup path.
 func (m *Model) openInEditor() tea.Cmd {
-	// Use the configured beadsPath instead of hardcoded path
-	beadsFile := m.beadsPath
+	beadsFile := liveReloadCurrentSourcePath(m.beadsPath, m.liveSourceContext, m.smartLiveSource)
 	if beadsFile == "" {
 		cwd, _ := os.Getwd()
 		if found, err := loader.FindJSONLPath(filepath.Join(cwd, ".beads")); err == nil {
@@ -9789,6 +10113,10 @@ func (m *Model) clearAttentionOverlay() {
 // computeAlerts calculates drift alerts for the current issues using the
 // already-computed graph stats/analyzer to avoid redundant work.
 func computeAlerts(issues []model.Issue, stats *analysis.GraphStats, analyzer *analysis.Analyzer) ([]drift.Alert, int, int, int) {
+	return computeAlertsAt(issues, stats, analyzer, time.Now())
+}
+
+func computeAlertsAt(issues []model.Issue, stats *analysis.GraphStats, analyzer *analysis.Analyzer, now time.Time) ([]drift.Alert, int, int, int) {
 	if len(issues) == 0 || stats == nil || analyzer == nil {
 		return nil, 0, 0, 0
 	}
@@ -9826,6 +10154,7 @@ func computeAlerts(issues []model.Issue, stats *analysis.GraphStats, analyzer *a
 	cur := &baseline.Baseline{Stats: curStats, Cycles: stats.Cycles()}
 
 	calc := drift.NewCalculator(bl, cur, driftConfig)
+	calc.SetNow(now)
 	calc.SetIssues(issues)
 	result := calc.Calculate()
 
@@ -9976,7 +10305,7 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 	case "board":
 		return m.board.View(width, height-1)
 	case "history":
-		m.historyView.SetSize(width, height-1)
+		m.historyView.SetSize(width, max(height-1, 5))
 		return m.historyView.View()
 	default:
 		return "Unknown view: " + viewName

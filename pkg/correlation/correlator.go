@@ -269,12 +269,10 @@ func (c *Correlator) buildHistories(beads []BeadInfo, events []BeadEvent, commit
 		// Calculate cycle time
 		history.CycleTime = CalculateCycleTime(history.Milestones)
 
-		// Set last author
-		if len(history.Commits) > 0 {
-			history.LastAuthor = history.Commits[len(history.Commits)-1].Author
-		} else if len(history.Events) > 0 {
-			history.LastAuthor = history.Events[len(history.Events)-1].Author
-		}
+		// Set the author from the most recent activity across both streams. A
+		// correlated code commit is not necessarily newer than the bead's latest
+		// lifecycle event.
+		history.LastAuthor = mostRecentHistoryAuthor(history.Events, history.Commits)
 
 		histories[beadID] = history
 	}
@@ -293,6 +291,39 @@ func dedupCommits(commits []CorrelatedCommit) []CorrelatedCommit {
 		}
 	}
 	return result
+}
+
+func mostRecentHistoryAuthor(events []BeadEvent, commits []CorrelatedCommit) string {
+	latest := time.Time{}
+	hasTimestamp := false
+	author := ""
+	consider := func(candidate string, timestamp time.Time) {
+		if candidate == "" {
+			return
+		}
+		if timestamp.IsZero() {
+			// Preserve the existing last-item fallback for synthetic/legacy records
+			// only while no real timestamp is available.
+			if !hasTimestamp {
+				author = candidate
+			}
+			return
+		}
+		if !hasTimestamp || timestamp.After(latest) || timestamp.Equal(latest) {
+			latest = timestamp
+			hasTimestamp = true
+			author = candidate
+		}
+	}
+	for _, event := range events {
+		consider(event.Author, event.Timestamp)
+	}
+	for _, commit := range commits {
+		// On equal timestamps, retain the historical preference for the explicit
+		// correlated-commit record by considering commits after lifecycle events.
+		consider(commit.Author, commit.Timestamp)
+	}
+	return author
 }
 
 // buildCommitIndex creates a reverse lookup from commit SHA to bead IDs
@@ -328,6 +359,21 @@ func BuildCommitIndex(histories map[string]BeadHistory) CommitIndex {
 
 // calculateStats computes aggregate statistics
 func (c *Correlator) calculateStats(histories map[string]BeadHistory, commits []CorrelatedCommit) HistoryStats {
+	return calculateHistoryStats(histories)
+}
+
+// RecalculateDerivedFields rebuilds every report field derived from Histories.
+// Callers that filter or otherwise replace Histories must use this before
+// serialization so CommitIndex and Stats describe the same visible commit set.
+func (r *HistoryReport) RecalculateDerivedFields() {
+	if r == nil {
+		return
+	}
+	r.CommitIndex = BuildCommitIndex(r.Histories)
+	r.Stats = calculateHistoryStats(r.Histories)
+}
+
+func calculateHistoryStats(histories map[string]BeadHistory) HistoryStats {
 	stats := HistoryStats{
 		TotalBeads:         len(histories),
 		MethodDistribution: make(map[string]int),

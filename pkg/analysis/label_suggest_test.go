@@ -410,6 +410,67 @@ func TestSuggestLabels_ConfidenceCapped(t *testing.T) {
 	}
 }
 
+func TestSuggestLabels_NonPositiveLimitsAreSafe(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "target", Title: "critical authentication bug", Status: model.StatusOpen},
+		{ID: "training", Title: "authentication bug", Status: model.StatusClosed, Labels: []string{"bug"}},
+	}
+	for _, tt := range []struct {
+		name     string
+		perIssue int
+		total    int
+	}{
+		{name: "zero per issue", perIssue: 0, total: 10},
+		{name: "negative per issue", perIssue: -1, total: 10},
+		{name: "zero total", perIssue: 10, total: 0},
+		{name: "negative total", perIssue: 10, total: -1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config := DefaultLabelSuggestionConfig()
+			config.MinConfidence = 0
+			config.MaxSuggestionsPerIssue = tt.perIssue
+			config.MaxTotalSuggestions = tt.total
+			if suggestions := SuggestLabels(issues, config); len(suggestions) != 0 {
+				t.Fatalf("returned %d suggestions", len(suggestions))
+			}
+		})
+	}
+}
+
+func TestSuggestLabels_LearnedConfidenceDeterministic(t *testing.T) {
+	config := DefaultLabelSuggestionConfig()
+	config.MinConfidence = 0
+	config.MaxSuggestionsPerIssue = 10
+	config.MaxTotalSuggestions = 10
+	config.BuiltinMappings = false
+
+	issues := []model.Issue{
+		{ID: "alpha-1", Title: "alpha", Status: model.StatusClosed, Labels: []string{"learned"}},
+		{ID: "beta-1", Title: "beta first", Status: model.StatusClosed, Labels: []string{"learned"}},
+		{ID: "beta-2", Title: "beta second", Status: model.StatusClosed, Labels: []string{"learned"}},
+		{ID: "gamma-1", Title: "gamma first", Status: model.StatusClosed, Labels: []string{"learned"}},
+		{ID: "gamma-2", Title: "gamma second", Status: model.StatusClosed, Labels: []string{"learned"}},
+		{ID: "gamma-3", Title: "gamma third", Status: model.StatusClosed, Labels: []string{"learned"}},
+		{ID: "gamma-4", Title: "gamma fourth", Status: model.StatusClosed, Labels: []string{"learned"}},
+		{ID: "gamma-5", Title: "gamma fifth", Status: model.StatusClosed, Labels: []string{"learned"}},
+		{ID: "gamma-6", Title: "gamma sixth", Status: model.StatusClosed, Labels: []string{"learned"}},
+		{ID: "target", Title: "alpha beta gamma", Status: model.StatusOpen},
+	}
+
+	var want float64
+	for run := 0; run < 100; run++ {
+		suggestions := SuggestLabels(issues, config)
+		if len(suggestions) != 1 {
+			t.Fatalf("run %d returned %d suggestions, want one", run, len(suggestions))
+		}
+		if run == 0 {
+			want = suggestions[0].Confidence
+		} else if suggestions[0].Confidence != want {
+			t.Fatalf("run %d confidence=%0.17g, want stable %0.17g", run, suggestions[0].Confidence, want)
+		}
+	}
+}
+
 // ============================================================================
 // SuggestLabels Tests - Suggestion Output Format
 // ============================================================================

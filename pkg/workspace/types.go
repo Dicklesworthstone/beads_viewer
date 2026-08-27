@@ -96,6 +96,7 @@ func (c *Config) Validate() error {
 	}
 
 	seen := make(map[string]bool)
+	seenSourceRepos := make(map[string]bool)
 	for i, repo := range c.Repos {
 		if repo.Path == "" {
 			return fmt.Errorf("repo[%d]: path is required", i)
@@ -106,6 +107,15 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("repo[%d]: duplicate prefix %q", i, prefix)
 		}
 		seen[prefix] = true
+
+		sourceRepo := sourceRepoKeyFromPrefix(prefix)
+		if sourceRepo == "" {
+			return fmt.Errorf("repo[%d]: prefix %q has no usable source repository key", i, prefix)
+		}
+		if seenSourceRepos[sourceRepo] {
+			return fmt.Errorf("repo[%d]: prefix %q duplicates normalized source repository key %q", i, prefix, sourceRepo)
+		}
+		seenSourceRepos[sourceRepo] = true
 	}
 
 	return nil
@@ -284,6 +294,9 @@ func ParseNamespacedID(id string, knownPrefixes []string) NamespacedID {
 
 // QualifyID adds a namespace prefix to a local ID
 func QualifyID(localID string, prefix string) string {
+	if localID == "" || prefix == "" {
+		return localID
+	}
 	if strings.HasPrefix(localID, prefix) {
 		return localID // Already qualified
 	}

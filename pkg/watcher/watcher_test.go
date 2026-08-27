@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -10,6 +11,53 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 )
+
+func TestWatcherFsnotifyErrorEnablesPollingFallback(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := os.WriteFile(path, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(path, WithPollInterval(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := newRunContext()
+	defer cancel()
+	fsw := &fsnotify.Watcher{
+		Events: make(chan fsnotify.Event),
+		Errors: make(chan error, 1),
+	}
+	w.mu.Lock()
+	w.ctx = ctx
+	w.cancel = cancel
+	w.fsWatcher = fsw
+	w.started = true
+	w.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		w.watchFsnotify(ctx, fsw, w.debouncer)
+		close(done)
+	}()
+	fsw.Errors <- errors.New("event queue overflow")
+
+	deadline := time.After(500 * time.Millisecond)
+	for !w.IsPolling() {
+		select {
+		case <-deadline:
+			t.Fatal("fsnotify error did not enable polling fallback")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("fsnotify watcher did not stop after cancellation")
+	}
+	w.debouncer.Cancel()
+}
 
 func TestDebouncer_CoalescesRapidTriggers(t *testing.T) {
 	d := NewDebouncer(50 * time.Millisecond)
@@ -309,6 +357,246 @@ func TestWatcher_FileRemoved(t *testing.T) {
 	if receivedError != ErrFileRemoved {
 		t.Errorf("expected ErrFileRemoved, got %v", receivedError)
 	}
+
+	select {
+	case <-w.Changed():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("removed primary file did not trigger source reselection")
+	}
+}
+
+func TestWatcher_PollingDetectsNewSiblingFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	primary := filepath.Join(tmpDir, "issues.jsonl")
+	if err := os.WriteFile(primary, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := NewWatcher(primary,
+		WithSiblingFiles("beads.db"),
+		WithDebounceDuration(5*time.Millisecond),
+		WithPollInterval(10*time.Millisecond),
+		WithForcePoll(true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "beads.db"), []byte("new candidate"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-w.Changed():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("polling watcher did not detect newly created sibling candidate")
+	}
+}
+
+func TestWatcherPollingDetectsAdditionalFileInAnotherDirectory(t *testing.T) {
+	primaryDir := t.TempDir()
+	secondaryDir := t.TempDir()
+	primary := filepath.Join(primaryDir, "issues.jsonl")
+	secondary := filepath.Join(secondaryDir, "issues.jsonl")
+	if err := os.WriteFile(primary, []byte("primary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondary, []byte("secondary"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := NewWatcher(primary,
+		WithAdditionalFiles(secondary),
+		WithDebounceDuration(5*time.Millisecond),
+		WithPollInterval(10*time.Millisecond),
+		WithForcePoll(true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	if err := os.WriteFile(secondary, []byte("secondary changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.Changed():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("polling watcher did not detect additional-file change")
+	}
+}
+
+func TestWatcherDirectoryPatternsIgnoreUnmatchedFiles(t *testing.T) {
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "issues.jsonl")
+	if err := os.WriteFile(primary, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(primary,
+		WithDirectoryPatterns(dir, "*.jsonl", "beads.db", "beads.db-wal"),
+		WithDebounceDuration(time.Millisecond),
+		WithPollInterval(5*time.Millisecond),
+		WithForcePoll(true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	if err := os.WriteFile(filepath.Join(dir, "beads.db-shm"), []byte("noise"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.Changed():
+		t.Fatal("unmatched SQLite shared-memory file triggered a change")
+	case <-time.After(40 * time.Millisecond):
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "new.jsonl"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.Changed():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("matching JSONL creation was not detected")
+	}
+}
+
+func TestWatcherRecursiveDirectoryPatternsDetectNewWorktree(t *testing.T) {
+	root := t.TempDir()
+	primary := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := os.WriteFile(primary, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(primary,
+		WithRecursiveDirectoryPatterns(root, "*/issues.jsonl"),
+		WithDebounceDuration(time.Millisecond),
+		WithPollInterval(5*time.Millisecond),
+		WithForcePoll(true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	worktree := filepath.Join(root, "feature")
+	if err := os.Mkdir(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "issues.jsonl"), []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.Changed():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("recursive watcher did not detect a new worktree issue file")
+	}
+}
+
+func TestWatcherDynamicAddsBeforeAndAfterStart(t *testing.T) {
+	primary := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := os.WriteFile(primary, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	existing := filepath.Join(directory, "existing.jsonl")
+	if err := os.WriteFile(existing, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(primary,
+		WithDebounceDuration(time.Millisecond),
+		WithPollInterval(5*time.Millisecond),
+		WithForcePoll(true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This used to panic because the pre-Start directory state map was nil.
+	if err := w.AddDirectoryPatterns(directory, "*.jsonl"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	additional := filepath.Join(t.TempDir(), "later.jsonl")
+	if err := w.AddAdditionalFiles(additional); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(additional, []byte("created"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.Changed():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("dynamically added exact file was not detected")
+	}
+
+	newDirectory := t.TempDir()
+	if err := w.AddDirectoryPatterns(newDirectory, "*.jsonl"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(newDirectory, "new.jsonl"), []byte("created"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.Changed():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("dynamically added directory pattern was not detected")
+	}
+}
+
+func TestWatcherDynamicRemotePathEnablesPolling(t *testing.T) {
+	primary := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := os.WriteFile(primary, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	remoteDir := t.TempDir()
+	remote := filepath.Join(remoteDir, "remote.jsonl")
+
+	original := detectFilesystemTypeFunc
+	detectFilesystemTypeFunc = func(path string) FilesystemType {
+		if filepath.Clean(path) == filepath.Clean(remoteDir) {
+			return FSTypeNFS
+		}
+		return FSTypeLocal
+	}
+	t.Cleanup(func() { detectFilesystemTypeFunc = original })
+
+	w, err := NewWatcher(primary, WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	if w.IsPolling() {
+		t.Fatal("local primary unexpectedly started in polling mode")
+	}
+	if err := w.AddAdditionalFiles(remote); err != nil {
+		t.Fatal(err)
+	}
+	if !w.IsPolling() {
+		t.Fatal("adding a remote source did not enable polling fallback")
+	}
+	if got := w.FilesystemType(); got != FSTypeNFS {
+		t.Fatalf("filesystem type = %v, want nfs", got)
+	}
 }
 
 func TestWatcher_PollingFileRemovedReportsOnce(t *testing.T) {
@@ -468,6 +756,140 @@ func TestWatcher_StartStop(t *testing.T) {
 
 	// Double stop should be safe
 	w.Stop()
+}
+
+func TestWatcher_RestartRejectsOldRunDebounce(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "test.jsonl")
+	if err := os.WriteFile(tmpFile, []byte("initial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWatcher(tmpFile,
+		WithForcePoll(true),
+		WithPollInterval(time.Hour),
+		WithDebounceDuration(5*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	w.mu.RLock()
+	oldCtx := w.ctx
+	oldDebouncer := w.debouncer
+	w.mu.RUnlock()
+	w.Stop()
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+	w.mu.RLock()
+	currentState := w.fileStates[tmpFile]
+	w.mu.RUnlock()
+	if changed, current := w.recordStatPathForRun(
+		oldCtx,
+		oldDebouncer,
+		tmpFile,
+		currentState.mtime.Add(time.Hour),
+		currentState.size+1,
+	); changed || current {
+		t.Fatalf("old run state write = changed %v, current %v; want both false", changed, current)
+	}
+	w.mu.RLock()
+	afterStaleWrite := w.fileStates[tmpFile]
+	w.mu.RUnlock()
+	if !sameFileState(afterStaleWrite, currentState) {
+		t.Fatalf("old run mutated current file state: before %+v, after %+v", currentState, afterStaleWrite)
+	}
+
+	w.scheduleChange(oldCtx, oldDebouncer)
+	select {
+	case <-w.Changed():
+		t.Fatal("old run delivered a change after restart")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	w.mu.RLock()
+	currentCtx := w.ctx
+	currentDebouncer := w.debouncer
+	w.mu.RUnlock()
+	w.scheduleChange(currentCtx, currentDebouncer)
+	select {
+	case <-w.Changed():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("current run debounce did not deliver a change")
+	}
+}
+
+func TestWatcher_FileStateDetectsIdentityChangeWithSameMetadata(t *testing.T) {
+	dir := t.TempDir()
+	firstPath := filepath.Join(dir, "first.jsonl")
+	secondPath := filepath.Join(dir, "second.jsonl")
+	for _, path := range []string{firstPath, secondPath} {
+		if err := os.WriteFile(path, []byte("same"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mtime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	for _, path := range []string{firstPath, secondPath} {
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstInfo, err := os.Stat(firstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondInfo, err := os.Stat(secondPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstInfo.Size() != secondInfo.Size() || !firstInfo.ModTime().Equal(secondInfo.ModTime()) {
+		t.Fatal("test setup did not produce matching size and modification time")
+	}
+	if sameFileState(fileStateFromInfo(firstInfo), fileStateFromInfo(secondInfo)) {
+		t.Fatal("different file identities with matching size and modification time were treated as unchanged")
+	}
+}
+
+func TestWatcher_FileStateDetectsSameIdentityContentChangeWithRestoredMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "same-file.jsonl")
+	mtime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.WriteFile(path, []byte("aaaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := fileStateFromInfo(beforeInfo)
+	if !before.hasChangeAt {
+		t.Skip("platform does not expose a change-time token")
+	}
+
+	if err := os.WriteFile(path, []byte("bbbb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := fileStateFromInfo(afterInfo)
+	if !os.SameFile(beforeInfo, afterInfo) || before.size != after.size || !before.mtime.Equal(after.mtime) {
+		t.Fatal("test setup did not preserve identity, size, and modification time")
+	}
+	if before.changeSec == after.changeSec && before.changeNsec == after.changeNsec {
+		t.Skip("filesystem did not advance change time at test resolution")
+	}
+	if sameFileState(before, after) {
+		t.Fatal("same-inode content replacement with restored metadata was treated as unchanged")
+	}
 }
 
 func TestWatcher_RestartPollingUsesPerRunContext(t *testing.T) {

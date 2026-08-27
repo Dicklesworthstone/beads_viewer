@@ -103,7 +103,7 @@ type LabelMatch struct {
 
 // SuggestLabels analyzes issues for potential label suggestions
 func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggestion {
-	if len(issues) == 0 {
+	if len(issues) == 0 || config.MaxSuggestionsPerIssue <= 0 || config.MaxTotalSuggestions <= 0 {
 		return nil
 	}
 
@@ -137,10 +137,6 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 
 		// Extract keywords
 		keywords := extractKeywords(issue.Title, issue.Description)
-		keywordSet := make(map[string]bool, len(keywords))
-		for _, k := range keywords {
-			keywordSet[k] = true
-		}
 
 		// Score potential labels
 		labelScores := make(map[string]float64)
@@ -148,7 +144,7 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 
 		// Check builtin mappings
 		if config.BuiltinMappings {
-			for keyword := range keywordSet {
+			for _, keyword := range keywords {
 				if labels, ok := builtinLabelMappings[keyword]; ok {
 					for _, label := range labels {
 						if !existingLabels[label] && allLabels[label] {
@@ -162,7 +158,10 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 
 		// Check learned mappings
 		if config.LearnFromExisting {
-			for keyword := range keywordSet {
+			// Preserve keyword order while accumulating floating-point bonuses.
+			// Iterating a keyword map randomized the addition order and could change
+			// the final confidence by an ulp between otherwise identical runs.
+			for _, keyword := range keywords {
 				if labelCounts, ok := learnedMappings[keyword]; ok {
 					for label, count := range labelCounts {
 						if !existingLabels[label] && allLabels[label] {
@@ -239,9 +238,13 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 			fmt.Sprintf("Consider adding label '%s'", match.Label),
 			match.Reason,
 			match.Confidence,
-		).WithAction(fmt.Sprintf("br update %s --add-label=%s", match.IssueID, match.Label)).
-			WithMetadata("suggested_label", match.Label).
+		).WithMetadata("suggested_label", match.Label).
 			WithMetadata("matched_keywords", match.MatchedWords)
+		issueArg, issueOK := quoteBeadsCommandID(match.IssueID)
+		labelArg, labelOK := quoteBeadsFlagValue(match.Label)
+		if issueOK && labelOK {
+			sug = sug.WithAction(fmt.Sprintf("br update %s --add-label=%s", issueArg, labelArg))
+		}
 
 		suggestions = append(suggestions, sug)
 	}

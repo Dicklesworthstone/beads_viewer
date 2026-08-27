@@ -1,8 +1,10 @@
 package correlation
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,12 +17,13 @@ import (
 
 func TestCacheKey_String(t *testing.T) {
 	key := CacheKey{
-		HeadSHA:   "abc123",
-		BeadsHash: "def456",
-		Options:   "opt789",
+		HeadSHA:      "abc123",
+		HistoryState: coCommitHistoryStateFull,
+		BeadsHash:    "def456",
+		Options:      "opt789",
 	}
 
-	expected := "abc123:def456:opt789"
+	expected := "abc123:" + coCommitHistoryStateFull + ":def456:opt789"
 	if got := key.String(); got != expected {
 		t.Errorf("CacheKey.String() = %q, want %q", got, expected)
 	}
@@ -207,6 +210,30 @@ func TestHistoryCache_Expiration(t *testing.T) {
 	}
 }
 
+func TestHistoryCacheRejectsFutureTimestamp(t *testing.T) {
+	cache := NewHistoryCache("/tmp/test")
+	key := CacheKey{HeadSHA: "future", BeadsHash: "beads", Options: "opts"}
+	cache.Put(key, &HistoryReport{})
+
+	cache.mu.Lock()
+	cache.entries[key.String()].CreatedAt = time.Now().Add(time.Hour)
+	cache.mu.Unlock()
+	if _, ok := cache.Get(key); ok {
+		t.Fatal("Get accepted future-dated cache entry")
+	}
+	if cache.Size() != 0 {
+		t.Fatal("Get did not remove future-dated cache entry")
+	}
+
+	cache.Put(key, &HistoryReport{})
+	cache.mu.Lock()
+	cache.entries[key.String()].CreatedAt = time.Now().Add(time.Hour)
+	cache.mu.Unlock()
+	if _, _, _, ok := cache.GetWithMeta(key); ok {
+		t.Fatal("GetWithMeta accepted future-dated cache entry")
+	}
+}
+
 func TestHistoryCache_Invalidate(t *testing.T) {
 	cache := NewHistoryCache("/tmp/test")
 
@@ -332,9 +359,44 @@ func TestHashBeads(t *testing.T) {
 		t.Error("Different bead titles should produce different hash")
 	}
 
-	// Hash should be 12 chars
-	if len(hash1) != 12 {
-		t.Errorf("Hash length = %d, want 12", len(hash1))
+	// Cache identity retains the full SHA-256 digest rather than truncating a
+	// correctness key for display convenience.
+	if len(hash1) != sha256.Size*2 {
+		t.Errorf("Hash length = %d, want %d", len(hash1), sha256.Size*2)
+	}
+}
+
+func TestHashBeadsFramesRecordsWithoutAmbiguity(t *testing.T) {
+	// The old NUL-delimited concatenation encoded both collections as the same
+	// byte stream: "a\x00t\x00xyz\x00u\x00v". JSON framing keeps field and record
+	// boundaries explicit even when adjacent values can be re-segmented.
+	left := []BeadInfo{
+		{ID: "a", Title: "t", Status: "x"},
+		{ID: "yz", Title: "u", Status: "v"},
+	}
+	right := []BeadInfo{
+		{ID: "a", Title: "t", Status: "xy"},
+		{ID: "z", Title: "u", Status: "v"},
+	}
+	if gotLeft, gotRight := hashBeads(left), hashBeads(right); gotLeft == gotRight {
+		t.Fatalf("distinct framed bead sets shared hash %q", gotLeft)
+	}
+}
+
+func TestHashBeadsMatchesDuplicateIDLastWriteWinsSemantics(t *testing.T) {
+	a := BeadInfo{ID: "bv-duplicate", Title: "first", Status: "open"}
+	b := BeadInfo{ID: "bv-duplicate", Title: "second", Status: "closed"}
+
+	firstThenSecond := hashBeads([]BeadInfo{a, b})
+	secondThenFirst := hashBeads([]BeadInfo{b, a})
+	if firstThenSecond == secondThenFirst {
+		t.Fatal("opposite duplicate-ID orders hashed alike despite assembling different last-write-wins reports")
+	}
+	if got, want := firstThenSecond, hashBeads([]BeadInfo{b}); got != want {
+		t.Fatalf("duplicate-ID hash=%q, want effective last entry hash %q", got, want)
+	}
+	if got, want := secondThenFirst, hashBeads([]BeadInfo{a}); got != want {
+		t.Fatalf("reversed duplicate-ID hash=%q, want effective last entry hash %q", got, want)
 	}
 }
 
@@ -400,6 +462,58 @@ func TestCachedCorrelator_CacheHitAndMiss(t *testing.T) {
 	}
 	if stats.HitRate != 0.5 {
 		t.Errorf("HitRate = %f, want 0.5", stats.HitRate)
+	}
+}
+
+func TestCachedCorrelatorBypassesShallowCacheAcrossSameHeadDeepen(t *testing.T) {
+	source := initTempGitRepo(t)
+	advanceGitHead(t, source, "second")
+	shallow := cloneShallowRepoForCacheTest(t, source)
+	headBefore, err := getGitHead(shallow)
+	if err != nil {
+		t.Fatalf("resolve shallow HEAD: %v", err)
+	}
+
+	correlator := NewCachedCorrelator(shallow)
+	correlator.shouldRefreshFn = neverRefreshForTest
+	var calls atomic.Int32
+	correlator.generateReportFn = func([]BeadInfo, CorrelatorOptions) (*HistoryReport, error) {
+		calls.Add(1)
+		return &HistoryReport{GitRange: coCommitRepositoryHistoryState(nil, shallow)}, nil
+	}
+
+	first, err := correlator.GenerateReport(nil, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("first shallow report: %v", err)
+	}
+	second, err := correlator.GenerateReport(nil, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("second shallow report: %v", err)
+	}
+	if first.GitRange != coCommitHistoryStateShallow || second.GitRange != coCommitHistoryStateShallow || calls.Load() != 2 {
+		t.Fatalf("shallow calls=%d first=%q second=%q, want two uncached shallow generations", calls.Load(), first.GitRange, second.GitRange)
+	}
+	if correlator.CacheStats().CacheSize != 0 {
+		t.Fatal("CachedCorrelator retained a shallow report")
+	}
+
+	runGit(t, shallow, "fetch", "--unshallow", "origin")
+	if headAfter, headErr := getGitHead(shallow); headErr != nil || headAfter != headBefore {
+		t.Fatalf("deepen changed HEAD: before=%q after=%q error=%v", headBefore, headAfter, headErr)
+	}
+	third, err := correlator.GenerateReport(nil, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("first full-history report: %v", err)
+	}
+	fourth, err := correlator.GenerateReport(nil, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("cached full-history report: %v", err)
+	}
+	if third.GitRange != coCommitHistoryStateFull || fourth != third || calls.Load() != 3 {
+		t.Fatalf("post-deepen calls=%d third=%q shared=%t, want one full generation then hit", calls.Load(), third.GitRange, fourth == third)
+	}
+	if correlator.CacheStats().CacheSize != 1 {
+		t.Fatal("CachedCorrelator did not retain the full-history report")
 	}
 }
 
@@ -957,14 +1071,25 @@ func runGit(t *testing.T, repoPath string, args ...string) {
 	}
 }
 
+func cloneShallowRepoForCacheTest(t *testing.T, source string) string {
+	t.Helper()
+	shallow := filepath.Join(t.TempDir(), "shallow")
+	sourceURL := (&url.URL{Scheme: "file", Path: source}).String()
+	cmd := exec.Command("git", "clone", "--depth=1", sourceURL, shallow)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create shallow clone: %v\n%s", err, out)
+	}
+	return shallow
+}
+
 func neverRefreshForTest(time.Time, time.Duration, float64, time.Time) bool {
 	return false
 }
 
 func TestCacheKey_Empty(t *testing.T) {
 	key := CacheKey{}
-	if key.String() != "::" {
-		t.Errorf("Empty CacheKey.String() = %q, want '::'", key.String())
+	if key.String() != ":::" {
+		t.Errorf("Empty CacheKey.String() = %q, want ':::'", key.String())
 	}
 }
 

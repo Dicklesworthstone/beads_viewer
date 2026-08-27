@@ -2,6 +2,7 @@
 package correlation
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"sort"
@@ -35,14 +36,14 @@ var (
 		{regexp.MustCompile(`\b(resolve|resolves|resolved)\b`), 10},
 		{regexp.MustCompile(`\b(implement|implements|implemented)\b`), 8},
 		{regexp.MustCompile(`\b(add|adds|added)\b`), 5},
-		{regexp.MustCompile(`#\d+`), 15},               // Issue number reference
-		{regexp.MustCompile(`\b[a-z]{2,5}-\d+\b`), 20}, // JIRA-style ID (lowercase since message is lowercased)
-		{regexp.MustCompile(`\bbv-[a-z0-9]+\b`), 25},   // bv-xxx pattern
-		{regexp.MustCompile(`\bbeads?[-_]?\d+\b`), 25}, // bead-123 pattern
+		{regexp.MustCompile(`#\d+`), 15},                               // Issue number reference
+		{regexp.MustCompile(`\b[a-z]{2,5}-\d+\b`), 20},                 // JIRA-style ID (lowercase since message is lowercased)
+		{regexp.MustCompile(`\bbv-[a-z0-9]+(?:[.-][a-z0-9]+)*\b`), 25}, // bv-xxx pattern
+		{regexp.MustCompile(`\bbeads?[-_]?\d+\b`), 25},                 // bead-123 pattern
 	}
 
 	// Pattern for extracting specific bead IDs from messages
-	orphanBeadIDPattern = regexp.MustCompile(`(?i)\bbv-([a-z0-9]{4,8})\b`) // Case-insensitive
+	orphanBeadIDPattern = regexp.MustCompile(`(?i)\bbv-([a-z0-9]+(?:[.-][a-z0-9]+)*)\b`)
 )
 
 // OrphanCandidate represents a commit that might be missing a bead linkage.
@@ -104,9 +105,10 @@ type OrphanDetector struct {
 	dataHash    string
 	lookup      *ReverseLookup
 	fileLookup  *FileLookup
-	beadWindows map[string]TemporalWindow // BeadID -> active time window
-	authorBeads map[string][]string       // Author email -> BeadIDs they worked on
+	beadWindows map[string][]TemporalWindow // BeadID -> all known active time windows
+	authorBeads map[string][]string         // normalized author email -> BeadIDs they worked on
 	now         time.Time
+	ctx         context.Context
 }
 
 // NewOrphanDetector creates a detector from a history report.
@@ -126,41 +128,52 @@ func NewSmartOrphanDetector(report *HistoryReport, repoPath string) *OrphanDetec
 	return NewOrphanDetector(report, repoPath)
 }
 
+// WithContext binds ctx to Git subprocesses used during orphan detection. A
+// nil context is accepted and has the same meaning as context.Background().
+func (od *OrphanDetector) WithContext(ctx context.Context) *OrphanDetector {
+	if od == nil {
+		return nil
+	}
+	od.ctx = ctx
+	if od.lookup != nil {
+		od.lookup.WithContext(ctx)
+	}
+	return od
+}
+
 // newOrphanDetector is the internal constructor.
 func newOrphanDetector(report *HistoryReport, repoPath string, now time.Time) *OrphanDetector {
 	od := &OrphanDetector{
 		repoPath:    repoPath,
-		dataHash:    report.DataHash,
 		lookup:      NewReverseLookupWithRepo(report, repoPath),
 		fileLookup:  NewFileLookup(report),
-		beadWindows: make(map[string]TemporalWindow),
+		beadWindows: make(map[string][]TemporalWindow),
 		authorBeads: make(map[string][]string),
 		now:         now,
 	}
+	if report == nil {
+		return od
+	}
+	od.dataHash = report.DataHash
 
 	// Build temporal windows for each bead
 	for beadID, history := range report.Histories {
-		if history.Milestones.Claimed != nil {
-			start := history.Milestones.Claimed.Timestamp
-			end := orphanActivityWindowEnd(history, now)
-			if !isClosedHistoryStatus(history.Status) && history.Milestones.Reopened != nil && history.Milestones.Reopened.Timestamp.After(start) {
-				start = history.Milestones.Reopened.Timestamp
-			}
-			od.beadWindows[beadID] = TemporalWindow{
-				BeadID: beadID,
-				Title:  history.Title,
-				Start:  start,
-				End:    end,
-			}
+		// Tombstones remain in the reverse lookup so their already-linked commits
+		// are not reclassified as orphans, but deleted work must never become a
+		// probable destination through timing or author heuristics.
+		if normalizeStatus(history.Status) == "tombstone" {
+			continue
+		}
+		if windows := orphanActivityWindows(beadID, history, now); len(windows) > 0 {
+			od.beadWindows[beadID] = windows
 		}
 
 		// Build author -> beads mapping
-		if history.LastAuthor != "" {
-			for _, commit := range history.Commits {
-				if commit.AuthorEmail != "" {
-					od.authorBeads[commit.AuthorEmail] = appendUnique(
-						od.authorBeads[commit.AuthorEmail], beadID)
-				}
+		for _, commit := range history.Commits {
+			authorEmail := normalizeAuthorEmail(commit.AuthorEmail)
+			if authorEmail != "" {
+				od.authorBeads[authorEmail] = appendUnique(
+					od.authorBeads[authorEmail], beadID)
 			}
 		}
 	}
@@ -176,15 +189,39 @@ func isClosedHistoryStatus(status string) bool {
 	return normalized == "closed" || normalized == "tombstone"
 }
 
-func orphanActivityWindowEnd(history BeadHistory, now time.Time) time.Time {
-	if isClosedHistoryStatus(history.Status) && history.Milestones.Closed != nil {
-		return history.Milestones.Closed.Timestamp
+func orphanActivityWindows(beadID string, history BeadHistory, now time.Time) []TemporalWindow {
+	if isClosedHistoryStatus(history.Status) {
+		terminalWindow := extractTemporalWindowFromHistory(beadID, history)
+		if terminalWindow == nil {
+			// A closed status without a terminal close interval has no defensible
+			// end time. Treating it as active through now creates false timing and
+			// author signals.
+			return nil
+		}
+
+		// A closed bead may have been claimed, closed, and reopened more than
+		// once. Derive every completed interval through the terminal close so an
+		// all-history orphan scan does not silently forget earlier work periods.
+		return temporalActivityIntervalsAt(beadID, history, terminalWindow.End)
 	}
-	return now
+
+	return temporalActivityIntervalsAt(beadID, history, now)
+}
+
+func normalizeAuthorEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
 }
 
 // DetectOrphans finds orphan commits with smart detection.
 func (od *OrphanDetector) DetectOrphans(opts ExtractOptions) (*OrphanReport, error) {
+	if od == nil {
+		return nil, fmt.Errorf("orphan detector is nil")
+	}
+	if od.lookup == nil {
+		return nil, fmt.Errorf("orphan detector has no reverse lookup")
+	}
+	od.lookup.WithContext(od.ctx)
+
 	// Get basic orphans first
 	orphans, stats, err := od.lookup.FindOrphanCommits(opts)
 	if err != nil {
@@ -339,8 +376,12 @@ type probableBeadBuilder struct {
 
 // checkTiming checks if commit was during an active bead's time window.
 func (od *OrphanDetector) checkTiming(candidate *OrphanCandidate, beadScores map[string]*probableBeadBuilder) {
-	for beadID, window := range od.beadWindows {
-		if candidate.Timestamp.After(window.Start) && candidate.Timestamp.Before(window.End) {
+	for beadID, windows := range od.beadWindows {
+		for _, window := range windows {
+			if candidate.Timestamp.Before(window.Start) || candidate.Timestamp.After(window.End) {
+				continue
+			}
+
 			// Commit during bead's active window
 			weight := 30 // Base weight for timing match
 
@@ -351,14 +392,21 @@ func (od *OrphanDetector) checkTiming(candidate *OrphanCandidate, beadScores map
 			})
 
 			if _, ok := beadScores[beadID]; !ok {
+				title := window.Title
+				status := "unknown"
+				if history, exists := od.lookup.beads[beadID]; exists {
+					title = history.Title
+					status = history.Status
+				}
 				beadScores[beadID] = &probableBeadBuilder{
-					title:  window.Title,
-					status: "in_progress", // If we're here, it was active
+					title:  title,
+					status: status,
 				}
 			}
 			beadScores[beadID].score += weight
 			beadScores[beadID].reasons = append(beadScores[beadID].reasons,
 				"commit during active timeframe")
+			break
 		}
 	}
 }
@@ -473,6 +521,9 @@ func (od *OrphanDetector) scoreMentionedBead(beadScores map[string]*probableBead
 	}
 	beadID = matches[0]
 	history := od.lookup.beads[beadID]
+	if normalizeStatus(history.Status) == "tombstone" {
+		return
+	}
 	if _, exists := beadScores[beadID]; !exists {
 		beadScores[beadID] = &probableBeadBuilder{
 			title:  history.Title,
@@ -490,23 +541,27 @@ func (od *OrphanDetector) checkAuthor(candidate *OrphanCandidate, beadScores map
 		return
 	}
 
-	beadIDs := od.authorBeads[candidate.AuthorEmail]
+	beadIDs := od.authorBeads[normalizeAuthorEmail(candidate.AuthorEmail)]
 	if len(beadIDs) == 0 {
 		return
 	}
 
 	// Check if any of the author's beads were active around the commit time
 	for _, beadID := range beadIDs {
-		window, ok := od.beadWindows[beadID]
-		if !ok {
+		windows := od.beadWindows[beadID]
+		if len(windows) == 0 {
 			continue
 		}
 
-		// Check if commit is within a week of the bead's active window
-		windowStart := window.Start.Add(-7 * 24 * time.Hour)
-		windowEnd := window.End.Add(7 * 24 * time.Hour)
+		for _, window := range windows {
+			// Check if commit is within a week of the bead's active window.
+			windowStart := window.Start.Add(-7 * 24 * time.Hour)
+			windowEnd := window.End.Add(7 * 24 * time.Hour)
 
-		if candidate.Timestamp.After(windowStart) && candidate.Timestamp.Before(windowEnd) {
+			if candidate.Timestamp.Before(windowStart) || candidate.Timestamp.After(windowEnd) {
+				continue
+			}
+
 			weight := 15
 
 			candidate.Signals = append(candidate.Signals, OrphanSignalHit{
@@ -529,13 +584,14 @@ func (od *OrphanDetector) checkAuthor(candidate *OrphanCandidate, beadScores map
 			beadScores[beadID].score += weight
 			beadScores[beadID].reasons = append(beadScores[beadID].reasons,
 				"same author worked on bead nearby")
+			break
 		}
 	}
 }
 
 // getCommitFiles returns files changed in a commit.
 func (od *OrphanDetector) getCommitFiles(sha string) ([]string, error) {
-	cocommit := &CoCommitExtractor{repoPath: od.repoPath}
+	cocommit := &CoCommitExtractor{repoPath: od.repoPath, ctx: od.ctx}
 	fileChanges, err := cocommit.getFilesChanged(sha)
 	if err != nil {
 		return nil, fmt.Errorf("get files changed: %w", err)

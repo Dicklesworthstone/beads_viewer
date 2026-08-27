@@ -1,7 +1,6 @@
 package correlation
 
 import (
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,8 +32,10 @@ import (
 // pure function of its events, so the artifact depends solely on the repository,
 // selected history path, HEAD, and extract options (see historyArtifact /
 // extractHistoryArtifact). A genuine HEAD change (a new commit) changes the SHA
-// and invalidates the entry. The schema version bumps invalidate stale entries
-// on format change.
+// and invalidates the entry. The shared namespace also binds repository history
+// state, and GenerateReportCached bypasses both reads and writes while shallow:
+// deepening can change a boundary commit's parent diff without changing HEAD.
+// The schema version bumps invalidate stale entries on format change.
 //
 // Storage discipline mirrors disk_cache.go exactly: same XDG cache dir
 // convention (BV_CACHE_DIR override, else UserCacheDir under "bv"), goccy JSON
@@ -42,12 +43,12 @@ import (
 // (a pure read does not rewrite the file just to bump AccessedAt).
 
 const (
-	headArtifactCacheVersion      = 2
-	headArtifactCacheFileName     = "correlation_head_artifact_cache.json"
-	headArtifactCacheMaxEntries   = 6
-	headArtifactCacheMaxAge       = 24 * time.Hour
-	headArtifactCacheMaxEntrySize = 64 << 20 // 64MB serialized artifact ceiling
-	headArtifactCacheMaxFileSize int64 = headArtifactCacheMaxEntries*headArtifactCacheMaxEntrySize + (1 << 20)
+	headArtifactCacheVersion            = 3
+	headArtifactCacheFileName           = "correlation_head_artifact_cache.json"
+	headArtifactCacheMaxEntries         = 6
+	headArtifactCacheMaxAge             = 24 * time.Hour
+	headArtifactCacheMaxEntrySize       = 64 << 20 // 64MB serialized artifact ceiling
+	headArtifactCacheMaxFileSize  int64 = headArtifactCacheMaxEntries*headArtifactCacheMaxEntrySize + (1 << 20)
 )
 
 type headArtifactCacheFile struct {

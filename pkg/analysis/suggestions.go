@@ -1,8 +1,37 @@
 package analysis
 
 import (
+	"strings"
 	"time"
+	"unicode"
 )
+
+func quoteBeadsCommandID(id string) (string, bool) {
+	if id == "" || strings.HasPrefix(id, "-") || strings.IndexFunc(id, unicode.IsControl) >= 0 {
+		return "", false
+	}
+	return quoteShellWord(id), true
+}
+
+// quoteBeadsFlagValue quotes a value that the caller concatenates after a
+// complete flag name and '='. Unlike a positional ID, a leading '-' is safe in
+// that position.
+func quoteBeadsFlagValue(value string) (string, bool) {
+	if value == "" || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return "", false
+	}
+	return quoteShellWord(value), true
+}
+
+func quoteShellWord(word string) string {
+	if strings.IndexFunc(word, func(r rune) bool {
+		return !(r == '-' || r == '_' || r == '=' || r == '/' || r == '.' || r == ':' || r == ',' ||
+			(r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z'))
+	}) < 0 {
+		return word
+	}
+	return "'" + strings.ReplaceAll(word, "'", "'\\''") + "'"
+}
 
 // SuggestionType categorizes the kind of suggestion
 type SuggestionType string

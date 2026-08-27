@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -168,7 +169,11 @@ type IDMatch struct {
 // normalizeBeadID normalizes a bead ID to a consistent format.
 func normalizeBeadID(id string) string {
 	// Handle numeric-only IDs (from beads-123 pattern)
-	if _, err := fmt.Sscanf(id, "%d", new(int)); err == nil {
+	numericOnly := id != ""
+	for i := 0; i < len(id) && numericOnly; i++ {
+		numericOnly = id[i] >= '0' && id[i] <= '9'
+	}
+	if numericOnly {
 		return "bv-" + id
 	}
 	// Convert to lowercase for consistency
@@ -238,10 +243,9 @@ func (m *ExplicitMatcher) FindCommitsForBead(beadID string, opts ExtractOptions)
 	seen := make(map[string]bool)
 
 	for _, pattern := range patterns {
-		matches, err := m.searchWithGrep(pattern, opts)
+		matches, err := m.searchWithGrep(beadID, pattern, opts)
 		if err != nil {
-			// Non-fatal: try other patterns
-			continue
+			return nil, fmt.Errorf("searching commits for bead %q with pattern %q: %w", beadID, pattern, err)
 		}
 
 		for _, match := range matches {
@@ -250,6 +254,21 @@ func (m *ExplicitMatcher) FindCommitsForBead(beadID string, opts ExtractOptions)
 				allMatches = append(allMatches, match)
 			}
 		}
+	}
+
+	// Limit is a bound on accepted exact matches, not on the fixed-string grep
+	// candidates. Git's fixed-string search also returns longer IDs (bv-420 for
+	// bv-42), so applying -n before parseGrepOutput validates the wrong prefix
+	// window and can hide an older exact match. Merge, order, and trim only after
+	// exact-ID filtering and deduplication.
+	sort.Slice(allMatches, func(i, j int) bool {
+		if !allMatches[i].Timestamp.Equal(allMatches[j].Timestamp) {
+			return allMatches[i].Timestamp.After(allMatches[j].Timestamp)
+		}
+		return allMatches[i].CommitSHA < allMatches[j].CommitSHA
+	})
+	if opts.Limit > 0 && len(allMatches) > opts.Limit {
+		allMatches = allMatches[:opts.Limit]
 	}
 
 	return allMatches, nil
@@ -266,30 +285,38 @@ func (m *ExplicitMatcher) buildGrepPatterns(beadID string) []string {
 		numericPart = id[idx+1:]
 	}
 
-	patterns := []string{
+	candidates := []string{
 		// Exact ID
 		beadID,
-		strings.ToUpper(beadID),
 	}
 
 	// If it's a bv-XXX style ID, also search for beads-XXX
 	if strings.HasPrefix(id, "bv-") && numericPart != "" {
-		patterns = append(patterns,
+		candidates = append(candidates,
 			"beads-"+numericPart,
 			"bead-"+numericPart,
-			"BEADS-"+numericPart,
-			"BEAD-"+numericPart,
 		)
 	}
 
+	// searchWithGrep is case-insensitive; retain one spelling per semantic
+	// pattern so aliases do not spawn redundant Git subprocesses.
+	patterns := make([]string, 0, len(candidates))
+	seen := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		key := strings.ToLower(candidate)
+		if !seen[key] {
+			seen[key] = true
+			patterns = append(patterns, candidate)
+		}
+	}
 	return patterns
 }
 
 // searchWithGrep runs git log --grep and parses results.
-func (m *ExplicitMatcher) searchWithGrep(pattern string, opts ExtractOptions) ([]ExplicitMatch, error) {
+func (m *ExplicitMatcher) searchWithGrep(beadID, pattern string, opts ExtractOptions) ([]ExplicitMatch, error) {
 	args := []string{
-		"log",
 		"--grep=" + pattern,
+		"--fixed-strings",
 		"-i", // Case insensitive
 		"--format=" + gitLogHeaderFormat,
 	}
@@ -301,28 +328,30 @@ func (m *ExplicitMatcher) searchWithGrep(pattern string, opts ExtractOptions) ([
 	if opts.Until != nil {
 		args = append(args, fmt.Sprintf("--until=%s", opts.Until.Format(time.RFC3339)))
 	}
-	if opts.Limit > 0 {
-		args = append(args, fmt.Sprintf("-n%d", opts.Limit))
-	}
-
-	cmd := gitCommand(m.ctx, args...)
-	cmd.Dir = m.repoPath
+	cmd := lifecycleGitLogCommand(m.ctx, m.repoPath, args...)
 
 	out, err := cmd.Output()
 	if err != nil {
+		if m.ctx != nil {
+			if ctxErr := m.ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("git log --grep canceled: %w", ctxErr)
+			}
+		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			// git log returns exit 0 even with no results, so this is a real error
-			return nil, fmt.Errorf("git log --grep failed: %s", string(exitErr.Stderr))
+			return nil, fmt.Errorf("git log --grep failed: %w: %s", err, string(exitErr.Stderr))
 		}
 		return nil, fmt.Errorf("git log --grep failed: %w", err)
 	}
 
-	return m.parseGrepOutput(out, pattern)
+	return m.parseGrepOutput(out, beadID, pattern)
 }
 
 // parseGrepOutput parses git log output into ExplicitMatch structs.
-func (m *ExplicitMatcher) parseGrepOutput(data []byte, searchPattern string) ([]ExplicitMatch, error) {
+func (m *ExplicitMatcher) parseGrepOutput(data []byte, beadID, _ string) ([]ExplicitMatch, error) {
 	var matches []ExplicitMatch
+	objectIDWidth := 0
+	canonicalTarget := normalizeBeadID(beadID)
 
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	buf := make([]byte, 64*1024)
@@ -335,7 +364,12 @@ func (m *ExplicitMatcher) parseGrepOutput(data []byte, searchPattern string) ([]
 
 		info, err := parseCommitInfo(line)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("parse git grep commit header: %w", err)
+		}
+		if objectIDWidth == 0 {
+			objectIDWidth = len(info.SHA)
+		} else if len(info.SHA) != objectIDWidth {
+			return nil, fmt.Errorf("mixed-width grep commit object IDs: got %d and %d characters", objectIDWidth, len(info.SHA))
 		}
 
 		message := info.Message
@@ -348,21 +382,34 @@ func (m *ExplicitMatcher) parseGrepOutput(data []byte, searchPattern string) ([]
 		var matchType string
 
 		for _, idMatch := range idMatches {
-			// Check if this ID matches what we searched for
-			if strings.EqualFold(idMatch.ID, searchPattern) ||
-				strings.Contains(strings.ToLower(idMatch.RawMatch), strings.ToLower(searchPattern)) {
+			// --grep is only a candidate prefilter: fixed-string search still
+			// matches bv-42 inside bv-420. Accept the commit only when the ID
+			// parser found an exact canonical target (including aliases such as
+			// beads-42 -> bv-42).
+			if strings.EqualFold(normalizeBeadID(idMatch.ID), canonicalTarget) {
 				matchType = idMatch.MatchType
 				confidence = CalculateConfidence(idMatch.MatchType, len(idMatches))
 				break
 			}
 		}
+		if matchType == "" && containsBeadID(message, canonicalTarget) {
+			// The caller supplied a known canonical ID, while the built-in
+			// discovery patterns intentionally recognize only common tracker
+			// shapes. Accept an exact literal token even when that discovery
+			// grammar cannot rediscover punctuation-bearing or lowercase IDs.
+			matchType = "literal"
+			confidence = CalculateConfidence(matchType, 1)
+		}
 
 		if matchType == "" {
-			matchType = "generic"
+			continue
 		}
 
 		matches = append(matches, ExplicitMatch{
-			BeadID:      searchPattern,
+			// searchPattern may be an alias (for example beads-42). Preserve the
+			// canonical ID requested by FindCommitsForBead so downstream report
+			// assembly never links the commit to a nonexistent alias bead.
+			BeadID:      beadID,
 			CommitSHA:   info.SHA,
 			Message:     message,
 			Author:      info.Author,
@@ -373,7 +420,10 @@ func (m *ExplicitMatcher) parseGrepOutput(data []byte, searchPattern string) ([]
 		})
 	}
 
-	return matches, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan git grep output: %w", err)
+	}
+	return matches, nil
 }
 
 // CreateCorrelatedCommit converts an ExplicitMatch to a CorrelatedCommit.
@@ -418,8 +468,7 @@ func (m *ExplicitMatcher) FindAllExplicitMatches(beadIDs []string, opts ExtractO
 	for _, beadID := range beadIDs {
 		matches, err := m.FindCommitsForBead(beadID, opts)
 		if err != nil {
-			// Non-fatal: continue with other beads
-			continue
+			return nil, fmt.Errorf("finding explicit matches for bead %q: %w", beadID, err)
 		}
 		if len(matches) > 0 {
 			results[beadID] = matches

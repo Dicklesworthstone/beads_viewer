@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
@@ -60,7 +62,7 @@ type DependencyMatch struct {
 // DetectMissingDependencies analyzes issues for potential missing dependencies
 // Optimized with inverted index to avoid O(N^2) comparisons.
 func DetectMissingDependencies(issues []model.Issue, config DependencySuggestionConfig) []Suggestion {
-	if len(issues) < 2 {
+	if len(issues) < 2 || config.MaxSuggestions <= 0 {
 		return nil
 	}
 
@@ -170,6 +172,7 @@ func DetectMissingDependencies(issues []model.Issue, config DependencySuggestion
 			}
 
 			// Check for exact title mentions / ID mentions
+			title1Lower := strings.ToLower(issue1.Title)
 			title2Lower := strings.ToLower(issue2.Title)
 			id1Lower := strings.ToLower(issue1.ID)
 			id2Lower := strings.ToLower(issue2.ID)
@@ -177,14 +180,15 @@ func DetectMissingDependencies(issues []model.Issue, config DependencySuggestion
 			desc2Lower := strings.ToLower(issue2.Description)
 
 			// ID mentioned
-			if strings.Contains(desc2Lower, id1Lower) || strings.Contains(desc1Lower, id2Lower) {
+			if containsExactIssueID(desc2Lower, id1Lower) || containsExactIssueID(desc1Lower, id2Lower) {
 				baseConf += config.ExactMatchBonus * 2
 			}
 
-			// Title words of issue1 mentioned in issue2's title
-			// Use the keywords map for O(1) check? No, iterating kws of issue1 is fast.
-			for _, word := range keywords[i] {
-				if len(word) >= 5 && strings.Contains(title2Lower, word) {
+			// Give one symmetric title bonus when a shared substantive keyword
+			// occurs in either title. Looking only from issue1 into issue2 made
+			// confidence depend on the caller's input order.
+			for _, word := range sharedKW {
+				if len(word) >= 5 && (strings.Contains(title1Lower, word) || strings.Contains(title2Lower, word)) {
 					baseConf += config.ExactMatchBonus
 					break
 				}
@@ -201,13 +205,11 @@ func DetectMissingDependencies(issues []model.Issue, config DependencySuggestion
 				continue
 			}
 
-			// Determine direction
-			var from, to *model.Issue
-			if issue1.CreatedAt.Before(issue2.CreatedAt) || issue1.Priority < issue2.Priority {
-				from, to = issue2, issue1
-			} else {
-				from, to = issue1, issue2
-			}
+			// Determine direction with a total, input-order-independent ranking.
+			// Prefer the older issue as the likely prerequisite, then the more
+			// urgent priority, then its ID. The previous pairwise OR rule reversed
+			// direction when age and priority disagreed and the input was permuted.
+			from, to := orderSuggestedDependency(issue1, issue2)
 
 			reason := fmt.Sprintf("%d shared keywords", len(sharedKW))
 			if len(sharedLabels) > 0 {
@@ -241,8 +243,17 @@ func DetectMissingDependencies(issues []model.Issue, config DependencySuggestion
 			match.Reason,
 			match.Confidence,
 		).WithRelatedBead(match.To).
-			WithAction(fmt.Sprintf("br dep add %s %s", match.From, match.To)).
 			WithMetadata("shared_keywords", match.SharedKeywords)
+		fromArg, fromOK := quoteBeadsCommandID(match.From)
+		toArg, toOK := quoteBeadsCommandID(match.To)
+		if fromOK && toOK {
+			if canAdd, cyclePath, warning := CheckDependencyAddition(issues, match.From, match.To); canAdd {
+				sug = sug.WithAction(fmt.Sprintf("br dep add %s %s", fromArg, toArg))
+			} else {
+				sug = sug.WithMetadata("action_unavailable_reason", warning).
+					WithMetadata("cycle_path", cyclePath)
+			}
+		}
 
 		if len(match.SharedLabels) > 0 {
 			sug = sug.WithMetadata("shared_labels", match.SharedLabels)
@@ -252,6 +263,60 @@ func DetectMissingDependencies(issues []model.Issue, config DependencySuggestion
 	}
 
 	return suggestions
+}
+
+// containsExactIssueID reports a case-normalized ID token, not a raw prefix.
+// A substring check treats bv-42 as an exact mention inside bv-420 and can turn
+// ordinary keyword overlap into a high-confidence dependency false positive.
+func containsExactIssueID(text, id string) bool {
+	if id == "" {
+		return false
+	}
+	for searchFrom := 0; searchFrom <= len(text)-len(id); {
+		relative := strings.Index(text[searchFrom:], id)
+		if relative < 0 {
+			return false
+		}
+		start := searchFrom + relative
+		end := start + len(id)
+		beforeIsID := false
+		if start > 0 {
+			r, _ := utf8.DecodeLastRuneInString(text[:start])
+			beforeIsID = isIssueIDRune(r)
+		}
+		afterIsID := false
+		if end < len(text) {
+			r, _ := utf8.DecodeRuneInString(text[end:])
+			afterIsID = isIssueIDRune(r)
+		}
+		if !beforeIsID && !afterIsID {
+			return true
+		}
+		searchFrom = start + 1
+	}
+	return false
+}
+
+func isIssueIDRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsNumber(r) || r == '-' || r == '_' || r == '.'
+}
+
+// orderSuggestedDependency returns the issue likely to depend on the other
+// first, followed by its likely prerequisite.
+func orderSuggestedDependency(first, second *model.Issue) (from, to *model.Issue) {
+	firstIsTarget := false
+	switch {
+	case !first.CreatedAt.Equal(second.CreatedAt):
+		firstIsTarget = first.CreatedAt.Before(second.CreatedAt)
+	case first.Priority != second.Priority:
+		firstIsTarget = first.Priority < second.Priority
+	default:
+		firstIsTarget = first.ID < second.ID
+	}
+	if firstIsTarget {
+		return second, first
+	}
+	return first, second
 }
 
 // findSharedKeys returns keys present in both maps

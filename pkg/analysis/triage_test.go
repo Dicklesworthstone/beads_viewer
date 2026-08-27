@@ -93,6 +93,11 @@ func TestComputeTriage_CountSemantics(t *testing.T) {
 			Dependencies: []*model.Dependency{{DependsOnID: "open-1", Type: model.DepBlocks}}},
 		// 1 deferred.
 		{ID: "def-1", Title: "Deferred", Status: model.StatusDeferred, Priority: 3, IssueType: model.TypeTask, UpdatedAt: now},
+		// The remaining recognized live statuses also belong to not_closed.
+		{ID: "draft-1", Title: "Draft", Status: model.StatusDraft, Priority: 3, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "pinned-1", Title: "Pinned", Status: model.StatusPinned, Priority: 3, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "hooked-1", Title: "Hooked", Status: model.StatusHooked, Priority: 3, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "review-1", Title: "Review", Status: model.StatusReview, Priority: 3, IssueType: model.TypeTask, UpdatedAt: now},
 		// 1 closed + 1 tombstone (both closed-like).
 		{ID: "done-1", Title: "Closed", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
 		{ID: "ghost-1", Title: "Tombstone", Status: model.StatusTombstone, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
@@ -126,12 +131,12 @@ func TestComputeTriage_CountSemantics(t *testing.T) {
 	if counts.Closed != 2 {
 		t.Errorf("expected 2 closed-like (closed+tombstone), got %d", counts.Closed)
 	}
-	if counts.NotClosed != 5 {
-		t.Errorf("expected 5 not closed, got %d", counts.NotClosed)
+	if counts.NotClosed != 9 {
+		t.Errorf("expected 9 not closed, got %d", counts.NotClosed)
 	}
 	// Legacy aggregates survive under the new names: not_closed is the old
-	// "open" (open+in_progress+blocked+deferred) and dependency_blocked is
-	// the old "blocked" (non-closed && !actionable).
+	// "open" (every status except closed/tombstone) and dependency_blocked
+	// is the old "blocked" (non-closed && !actionable).
 	if counts.NotClosed != counts.Total-counts.Closed {
 		t.Errorf("not_closed=%d must equal total-closed=%d", counts.NotClosed, counts.Total-counts.Closed)
 	}
@@ -278,6 +283,22 @@ func TestComputeTriage_TopPicks(t *testing.T) {
 	}
 	if len(triage.QuickRef.TopPicks) > 3 {
 		t.Errorf("expected max 3 top picks, got %d", len(triage.QuickRef.TopPicks))
+	}
+}
+
+func TestClaimableRecommendationRejectsCommandUnsafeID(t *testing.T) {
+	rec := Recommendation{
+		ID:     "--help",
+		Status: string(model.StatusOpen),
+		Type:   string(model.TypeTask),
+	}
+	if isClaimableRecommendation(rec, time.Time{}, nil, nil) {
+		t.Fatal("option-shaped bead ID was exposed as a claimable recommendation")
+	}
+	commands := buildCommands(rec.ID)
+	if commands.ClaimTop != "CI=1 br ready --json  # No top pick available" ||
+		commands.ShowTop != "CI=1 br ready --json  # No top pick available" {
+		t.Fatalf("unsafe bead ID leaked into commands: %+v", commands)
 	}
 }
 
@@ -906,6 +927,10 @@ func TestGetTopTriageScores(t *testing.T) {
 	top10 := GetTopTriageScores(issues, 10)
 	if len(top10) != 5 {
 		t.Errorf("expected 5 scores when requesting 10 from 5, got %d", len(top10))
+	}
+
+	if got := GetTopTriageScores(issues, -1); len(got) != 0 {
+		t.Errorf("expected no scores for a negative limit, got %d", len(got))
 	}
 }
 

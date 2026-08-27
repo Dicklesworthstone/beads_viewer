@@ -1,6 +1,7 @@
 package correlation
 
 import (
+	"context"
 	"regexp"
 	"testing"
 	"time"
@@ -13,7 +14,7 @@ func TestNewOrphanDetector(t *testing.T) {
 			"bv-test1": {
 				Title:      "Test Bead 1",
 				Status:     "closed",
-				LastAuthor: "Test Author", // Required for author->beads mapping
+				LastAuthor: "Test Author",
 				Milestones: BeadMilestones{
 					Claimed: &BeadEvent{
 						Timestamp: now.Add(-72 * time.Hour),
@@ -55,6 +56,98 @@ func TestNewOrphanDetector(t *testing.T) {
 	}
 }
 
+func TestNewOrphanDetectorNilReportIsSafe(t *testing.T) {
+	detector := NewOrphanDetectorAt(nil, "", time.Time{})
+	if detector == nil {
+		t.Fatal("expected a detector for a nil report")
+	}
+	if detector.dataHash != "" || len(detector.beadWindows) != 0 || len(detector.authorBeads) != 0 {
+		t.Fatalf("nil report populated detector state: %#v", detector)
+	}
+	if _, err := detector.DetectOrphans(ExtractOptions{}); err == nil {
+		t.Fatal("expected missing-repository error, got nil")
+	}
+}
+
+func TestNewOrphanDetectorBuildsAuthorMapWithoutLastAuthor(t *testing.T) {
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-work": {
+			Commits: []CorrelatedCommit{{AuthorEmail: "worker@example.com"}},
+		},
+	}}
+	detector := NewOrphanDetectorAt(report, "", time.Time{})
+	if got := detector.authorBeads["worker@example.com"]; len(got) != 1 || got[0] != "bv-work" {
+		t.Fatalf("author mapping = %v, want [bv-work]", got)
+	}
+}
+
+func TestNewOrphanDetectorExcludesTombstonesFromProbableBeadEvidence(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-deleted": {
+			Title:  "Deleted work",
+			Status: " TOMBSTONE ",
+			Milestones: BeadMilestones{
+				Claimed: &BeadEvent{Timestamp: now.Add(-48 * time.Hour)},
+				Closed:  &BeadEvent{Timestamp: now.Add(-24 * time.Hour)},
+			},
+			Commits: []CorrelatedCommit{{AuthorEmail: "worker@example.com"}},
+		},
+	}}
+
+	detector := NewOrphanDetectorAt(report, "", now)
+	if _, exists := detector.beadWindows["bv-deleted"]; exists {
+		t.Fatal("tombstoned bead retained a timing window")
+	}
+	if got := detector.authorBeads["worker@example.com"]; len(got) != 0 {
+		t.Fatalf("tombstoned bead retained author evidence: %v", got)
+	}
+
+	scores := make(map[string]*probableBeadBuilder)
+	detector.scoreMentionedBead(scores, "BV-DELETED")
+	if len(scores) != 0 {
+		t.Fatalf("message mention resurrected tombstoned bead: %#v", scores)
+	}
+}
+
+func TestNewOrphanDetectorSkipsClosedWindowWithoutCloseEvent(t *testing.T) {
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-closed": {
+			Status: "closed",
+			Milestones: BeadMilestones{
+				Claimed: &BeadEvent{Timestamp: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)},
+			},
+		},
+	}}
+	detector := NewOrphanDetectorAt(report, "", time.Date(2026, 8, 26, 0, 0, 0, 0, time.UTC))
+	if _, exists := detector.beadWindows["bv-closed"]; exists {
+		t.Fatal("closed bead without a close event received an open-ended activity window")
+	}
+}
+
+func TestOrphanDetectorWithContextPropagatesToLookup(t *testing.T) {
+	detector := NewOrphanDetectorAt(&HistoryReport{}, "", time.Time{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if got := detector.WithContext(ctx); got != detector {
+		t.Fatalf("WithContext returned %p, want receiver %p", got, detector)
+	}
+	if detector.ctx != ctx || detector.lookup.ctx != ctx {
+		t.Fatal("context was not propagated to orphan Git lookups")
+	}
+	if (*OrphanDetector)(nil).WithContext(ctx) != nil {
+		t.Fatal("nil receiver should remain nil")
+	}
+}
+
+func TestNilOrphanDetectorDetectOrphansReturnsError(t *testing.T) {
+	var detector *OrphanDetector
+	if _, err := detector.DetectOrphans(ExtractOptions{}); err == nil {
+		t.Fatal("expected nil-detector error, got nil")
+	}
+}
+
 func TestNewOrphanDetectorAtPinsOpenWindow(t *testing.T) {
 	pinned := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
 	claimed := pinned.Add(-48 * time.Hour)
@@ -67,10 +160,11 @@ func TestNewOrphanDetectorAtPinsOpenWindow(t *testing.T) {
 	}}
 
 	detector := NewOrphanDetectorAt(report, "", pinned)
-	window, ok := detector.beadWindows["bv-open"]
-	if !ok {
+	windows := detector.beadWindows["bv-open"]
+	if len(windows) != 1 {
 		t.Fatal("open bead window missing")
 	}
+	window := windows[0]
 	if !window.End.Equal(pinned) {
 		t.Fatalf("open window end = %v, want %v", window.End, pinned)
 	}
@@ -79,9 +173,9 @@ func TestNewOrphanDetectorAtPinsOpenWindow(t *testing.T) {
 	}
 
 	zeroDetector := NewOrphanDetectorAt(report, "", time.Time{})
-	zeroWindow := zeroDetector.beadWindows["bv-open"]
-	if !zeroDetector.now.IsZero() || !zeroWindow.End.IsZero() {
-		t.Fatalf("zero instant was replaced: detector=%v window_end=%v", zeroDetector.now, zeroWindow.End)
+	zeroWindows := zeroDetector.beadWindows["bv-open"]
+	if !zeroDetector.now.IsZero() || len(zeroWindows) != 0 {
+		t.Fatalf("zero instant was replaced or created a future window: detector=%v windows=%v", zeroDetector.now, zeroWindows)
 	}
 }
 
@@ -101,12 +195,156 @@ func TestNewOrphanDetectorAtUsesReopenedWindowAndDataHash(t *testing.T) {
 		},
 	}}
 	detector := NewOrphanDetectorAt(report, "", pinned)
-	window := detector.beadWindows["bv-reopened"]
+	window := detector.beadWindows["bv-reopened"][0]
 	if !window.Start.Equal(reopened) || !window.End.Equal(pinned) {
 		t.Fatalf("reopened window=%v..%v, want %v..%v", window.Start, window.End, reopened, pinned)
 	}
 	if detector.dataHash != "source-hash" {
 		t.Fatalf("detector data hash=%q, want source-hash", detector.dataHash)
+	}
+}
+
+func TestNewOrphanDetectorUsesAllIntervalsFromFullEventHistory(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	firstClaim := now.Add(-10 * 24 * time.Hour)
+	firstClose := now.Add(-8 * 24 * time.Hour)
+	reopened := now.Add(-4 * 24 * time.Hour)
+	finalClaim := now.Add(-3 * 24 * time.Hour)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-reclaimed": {
+			Title:  "Reclaimed work",
+			Status: "in_progress",
+			Milestones: BeadMilestones{
+				Claimed:  &BeadEvent{Timestamp: firstClaim},
+				Closed:   &BeadEvent{Timestamp: firstClose},
+				Reopened: &BeadEvent{Timestamp: reopened},
+			},
+			Events: []BeadEvent{
+				{EventType: EventClaimed, Timestamp: firstClaim},
+				{EventType: EventClosed, Timestamp: firstClose},
+				{EventType: EventReopened, Timestamp: reopened},
+				{EventType: EventClaimed, Timestamp: finalClaim},
+			},
+		},
+	}}
+
+	windows := NewOrphanDetectorAt(report, "", now).beadWindows["bv-reclaimed"]
+	if len(windows) != 2 {
+		t.Fatalf("activity windows = %d, want both completed and current intervals", len(windows))
+	}
+	if !windows[0].Start.Equal(firstClaim) || !windows[0].End.Equal(firstClose) {
+		t.Fatalf("first orphan activity window = %v..%v, want %v..%v", windows[0].Start, windows[0].End, firstClaim, firstClose)
+	}
+	if !windows[1].Start.Equal(finalClaim) || !windows[1].End.Equal(now) {
+		t.Fatalf("current orphan activity window = %v..%v, want %v..%v", windows[1].Start, windows[1].End, finalClaim, now)
+	}
+}
+
+func TestNewOrphanDetectorAtUsesReopenWithoutClaim(t *testing.T) {
+	pinned := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	reopened := pinned.Add(-24 * time.Hour)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-reopened": {
+			Status: "open",
+			Milestones: BeadMilestones{
+				Reopened: &BeadEvent{Timestamp: reopened},
+			},
+		},
+	}}
+
+	detector := NewOrphanDetectorAt(report, "", pinned)
+	windows := detector.beadWindows["bv-reopened"]
+	if len(windows) != 1 {
+		t.Fatal("reopened bead without an earlier claim received no activity window")
+	}
+	window := windows[0]
+	if !window.Start.Equal(reopened) || !window.End.Equal(pinned) {
+		t.Fatalf("reopened window=%v..%v, want %v..%v", window.Start, window.End, reopened, pinned)
+	}
+}
+
+func TestOrphanDetectorScoresEveryActivityIntervalAndKeepsCurrentStatus(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	firstClaim := now.Add(-20 * 24 * time.Hour)
+	firstClose := now.Add(-18 * 24 * time.Hour)
+	secondClaim := now.Add(-4 * 24 * time.Hour)
+	secondClose := now.Add(-2 * 24 * time.Hour)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-repeated": {
+			Title:  "Repeated work",
+			Status: "closed",
+			Events: []BeadEvent{
+				{EventType: EventClaimed, Timestamp: firstClaim},
+				{EventType: EventClosed, Timestamp: firstClose},
+				{EventType: EventReopened, Timestamp: secondClaim},
+				{EventType: EventClosed, Timestamp: secondClose},
+			},
+		},
+	}}
+	detector := NewOrphanDetectorAt(report, "", now)
+
+	for _, timestamp := range []time.Time{firstClaim, firstClose, secondClaim, secondClose} {
+		candidate := &OrphanCandidate{Timestamp: timestamp}
+		scores := make(map[string]*probableBeadBuilder)
+		detector.checkTiming(candidate, scores)
+		if len(candidate.Signals) != 1 {
+			t.Fatalf("timestamp %v produced %d timing signals, want 1", timestamp, len(candidate.Signals))
+		}
+		if got := scores["bv-repeated"]; got == nil || got.score != 30 || got.status != "closed" {
+			t.Fatalf("timestamp %v score = %+v, want score 30 with current closed status", timestamp, got)
+		}
+	}
+}
+
+func TestOrphanDetectorAuthorEmailIsCaseInsensitive(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-owned": {
+			Title:   "Owned work",
+			Status:  "in_progress",
+			Events:  []BeadEvent{{EventType: EventClaimed, Timestamp: now.Add(-time.Hour)}},
+			Commits: []CorrelatedCommit{{AuthorEmail: " Dev@Example.COM "}},
+		},
+	}}
+	detector := NewOrphanDetectorAt(report, "", now)
+	candidate := &OrphanCandidate{AuthorEmail: "dev@example.com", Timestamp: now}
+	scores := make(map[string]*probableBeadBuilder)
+	detector.checkAuthor(candidate, scores)
+	if len(candidate.Signals) != 1 {
+		t.Fatalf("case-insensitive author match produced %d signals, want 1", len(candidate.Signals))
+	}
+	if got := scores["bv-owned"]; got == nil || got.score != 15 {
+		t.Fatalf("case-insensitive author score = %+v, want 15", got)
+	}
+}
+
+func TestNewOrphanDetectorAtSkipsCloseBeforeLatestReopen(t *testing.T) {
+	pinned := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	closed := pinned.Add(-48 * time.Hour)
+	reopened := pinned.Add(-24 * time.Hour)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-reopened": {
+			Status: "closed",
+			Milestones: BeadMilestones{
+				Closed:   &BeadEvent{Timestamp: closed},
+				Reopened: &BeadEvent{Timestamp: reopened},
+			},
+			Commits: []CorrelatedCommit{{AuthorEmail: "worker@example.com"}},
+		},
+	}}
+
+	detector := NewOrphanDetectorAt(report, "", pinned)
+	if _, ok := detector.beadWindows["bv-reopened"]; ok {
+		t.Fatal("close before the latest reopen produced an inverted activity window")
+	}
+	candidate := &OrphanCandidate{
+		AuthorEmail: "worker@example.com",
+		Timestamp:   closed.Add(12 * time.Hour),
+	}
+	scores := make(map[string]*probableBeadBuilder)
+	detector.checkAuthor(candidate, scores)
+	if len(candidate.Signals) != 0 || len(scores) != 0 {
+		t.Fatalf("inverted lifecycle emitted author evidence: signals=%v scores=%v", candidate.Signals, scores)
 	}
 }
 
@@ -132,6 +370,26 @@ func TestScoreMentionedBeadRejectsAmbiguousCaseCollision(t *testing.T) {
 	unique.scoreMentionedBead(scores, "BV-ABCD")
 	if got := scores["bv-AbCd"]; got == nil || got.score != 35 {
 		t.Fatalf("unique case-insensitive match was not credited: %+v", scores)
+	}
+}
+
+func TestCheckMessageMatchesShortAndHierarchicalBeadIDs(t *testing.T) {
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-1":     {BeadID: "bv-1", Title: "Short", Status: "open"},
+		"bv-ab.2":  {BeadID: "bv-ab.2", Title: "Child", Status: "open"},
+		"bv-ab-c3": {BeadID: "bv-ab-c3", Title: "Hyphenated", Status: "open"},
+	}}
+	detector := NewOrphanDetectorAt(report, "", time.Time{})
+
+	for _, beadID := range []string{"bv-1", "bv-ab.2", "bv-ab-c3"} {
+		t.Run(beadID, func(t *testing.T) {
+			candidate := &OrphanCandidate{Message: "fix " + beadID}
+			scores := make(map[string]*probableBeadBuilder)
+			detector.checkMessage(candidate, scores)
+			if got := scores[beadID]; got == nil || got.score != 35 {
+				t.Fatalf("message score for %s = %+v, want 35", beadID, got)
+			}
+		})
 	}
 }
 

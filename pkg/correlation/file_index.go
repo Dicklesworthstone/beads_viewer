@@ -14,7 +14,7 @@ type BeadReference struct {
 	BeadID       string    `json:"bead_id"`
 	Title        string    `json:"title"`
 	Status       string    `json:"status"`        // open/in_progress/closed
-	CommitSHAs   []string  `json:"commit_shas"`   // which commits linked this bead to this file
+	CommitSHAs   []string  `json:"commit_shas"`   // full SHAs linking this bead to this file
 	LastTouch    time.Time `json:"last_touch"`    // most recent commit timestamp
 	TotalChanges int       `json:"total_changes"` // sum of insertions + deletions across commits
 }
@@ -74,6 +74,9 @@ func BuildFileIndex(report *HistoryReport) *FileBeadIndex {
 			for _, file := range commit.Files {
 				// Normalize path (remove leading ./ and normalize separators)
 				normalizedPath := normalizePath(file.Path)
+				if normalizedPath == "" {
+					continue
+				}
 
 				if fileBeadMap[normalizedPath] == nil {
 					fileBeadMap[normalizedPath] = make(map[string]*BeadReference)
@@ -91,16 +94,11 @@ func BuildFileIndex(report *HistoryReport) *FileBeadIndex {
 					fileBeadMap[normalizedPath][beadID] = ref
 				}
 
-				// Add commit SHA if not already present
-				found := false
-				for _, sha := range ref.CommitSHAs {
-					if sha == commit.ShortSHA {
-						found = true
-						break
-					}
-				}
-				if !found {
-					ref.CommitSHAs = append(ref.CommitSHAs, commit.ShortSHA)
+				// Machine-readable identities must remain lossless. Short prefixes
+				// can collide in sufficiently large repositories, so retain only the
+				// full SHA carried by the correlated commit.
+				if commit.SHA != "" {
+					ref.CommitSHAs = appendUnique(ref.CommitSHAs, commit.SHA)
 				}
 
 				// Update last touch time if this commit is more recent
@@ -183,6 +181,10 @@ func (fl *FileLookup) LookupByFile(path string) *FileBeadLookupResult {
 	// Try exact match first
 	if refs, ok := fl.index.FileToBeads[normalizedPath]; ok {
 		for _, ref := range refs {
+			// Lookup results are caller-owned snapshots. A struct copy still aliases
+			// the index's CommitSHAs backing array, so clone it just as the
+			// prefix/glob accumulation path does.
+			ref.CommitSHAs = append([]string(nil), ref.CommitSHAs...)
 			// Get current status from beads map (may have changed)
 			status := ref.Status
 			if history, ok := fl.beads[ref.BeadID]; ok {
@@ -423,53 +425,62 @@ func BuildCoChangeMatrix(report *HistoryReport) *CoChangeMatrix {
 		return matrix
 	}
 
-	// Track unique commits to avoid counting the same commit multiple times
-	// (a commit may appear in multiple bead histories if it touches multiple beads)
-	processedCommits := make(map[string]bool)
-
+	// A commit can appear in multiple bead histories. Assemble the union of its
+	// file observations before counting it so complementary copies cannot make
+	// co-change results depend on map iteration order.
+	commitFileSets := make(map[string]map[string]struct{})
 	for _, history := range report.Histories {
 		for _, commit := range history.Commits {
-			if processedCommits[commit.SHA] {
+			if commit.SHA == "" {
 				continue
 			}
-			processedCommits[commit.SHA] = true
-
-			// Normalize all file paths in this commit
-			var files []string
-			seenFiles := make(map[string]struct{}, len(commit.Files))
+			files := commitFileSets[commit.SHA]
+			if files == nil {
+				files = make(map[string]struct{}, len(commit.Files))
+				commitFileSets[commit.SHA] = files
+			}
 			for _, fc := range commit.Files {
 				normalized := normalizePath(fc.Path)
 				if normalized != "" {
-					if _, exists := seenFiles[normalized]; exists {
-						continue
-					}
-					seenFiles[normalized] = struct{}{}
-					files = append(files, normalized)
+					files[normalized] = struct{}{}
 				}
 			}
-			sort.Strings(files)
+		}
+	}
 
-			// Store files by immutable full SHA. Seven-character prefixes are not
-			// unique and can otherwise overwrite one another in long histories.
-			matrix.CommitFiles[commit.SHA] = files
+	commitSHAs := make([]string, 0, len(commitFileSets))
+	for sha := range commitFileSets {
+		commitSHAs = append(commitSHAs, sha)
+	}
+	sort.Strings(commitSHAs)
+	for _, sha := range commitSHAs {
+		fileSet := commitFileSets[sha]
+		files := make([]string, 0, len(fileSet))
+		for file := range fileSet {
+			files = append(files, file)
+		}
+		sort.Strings(files)
 
-			// Update file commit counts
-			for _, file := range files {
-				matrix.FileCommitCounts[file]++
-			}
+		// Store files by immutable full SHA. Seven-character prefixes are not
+		// unique and can otherwise overwrite one another in long histories.
+		matrix.CommitFiles[sha] = files
 
-			// Build co-change relationships (all pairs of files in this commit)
-			for i := 0; i < len(files); i++ {
-				for j := 0; j < len(files); j++ {
-					if i == j {
-						continue // Skip self-relationships
-					}
-					fileA, fileB := files[i], files[j]
-					if matrix.Matrix[fileA] == nil {
-						matrix.Matrix[fileA] = make(map[string]int)
-					}
-					matrix.Matrix[fileA][fileB]++
+		// Update file commit counts
+		for _, file := range files {
+			matrix.FileCommitCounts[file]++
+		}
+
+		// Build co-change relationships (all ordered file pairs in this commit).
+		for i := 0; i < len(files); i++ {
+			for j := 0; j < len(files); j++ {
+				if i == j {
+					continue // Skip self-relationships
 				}
+				fileA, fileB := files[i], files[j]
+				if matrix.Matrix[fileA] == nil {
+					matrix.Matrix[fileA] = make(map[string]int)
+				}
+				matrix.Matrix[fileA][fileB]++
 			}
 		}
 	}
@@ -690,14 +701,18 @@ func (fl *FileLookup) ImpactAnalysisAt(files []string, now time.Time) *ImpactRes
 		}
 		overlapScore := float64(ab.OverlapCount) / float64(len(normalizedFiles))
 		statusMultiplier := 0.5
-		if ab.Status == "in_progress" {
+		switch normalizedBeadStatus(ab.Status) {
+		case "in_progress":
 			statusMultiplier = 1.0
 			inProgressCount++
-		} else if ab.Status == "open" {
+		case "closed":
+			recentClosedCount++
+		default:
+			// Every non-closed status admitted by LookupByFile is live work
+			// (for example open, blocked, or deferred) and must not be
+			// misreported as a recently closed bead.
 			statusMultiplier = 0.8
 			openCount++
-		} else {
-			recentClosedCount++
 		}
 		ab.Relevance = (recencyScore*0.4 + overlapScore*0.4 + statusMultiplier*0.2)
 		result.AffectedBeads = append(result.AffectedBeads, *ab)
@@ -781,8 +796,7 @@ func normalizePath(path string) string {
 }
 
 func classifyBeadStatus(status string) (bucket string, skip bool) {
-	normalized := strings.ToLower(strings.TrimSpace(status))
-	switch normalized {
+	switch normalizedBeadStatus(status) {
 	case "tombstone":
 		return "", true
 	case "closed":
@@ -793,7 +807,7 @@ func classifyBeadStatus(status string) (bucket string, skip bool) {
 }
 
 func affectedBeadStatusPriority(status string) int {
-	switch strings.ToLower(strings.TrimSpace(status)) {
+	switch normalizedBeadStatus(status) {
 	case "in_progress":
 		return 0
 	case "closed":
@@ -801,6 +815,10 @@ func affectedBeadStatusPriority(status string) int {
 	default:
 		return 1
 	}
+}
+
+func normalizedBeadStatus(status string) string {
+	return strings.ToLower(strings.TrimSpace(status))
 }
 
 func sortBeadRefs(refs []BeadReference) {

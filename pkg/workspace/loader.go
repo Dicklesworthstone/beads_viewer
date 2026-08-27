@@ -24,8 +24,21 @@ type LoadResult struct {
 	// Prefix is the namespace prefix used for IDs
 	Prefix string
 
+	// RepoPath is the configured repository path, retained so diagnostics stay
+	// unambiguous even when display names are duplicated or contain delimiters.
+	RepoPath string
+
 	// Issues are the loaded issues with namespaced IDs
 	Issues []model.Issue
+
+	// ParseStats records source-order JSONL accounting for this repository.
+	// A successful load with Errors > 0 is usable for exploratory workspace
+	// views, but it is not a complete authority for claim-emitting robot output.
+	ParseStats loader.ParseStats
+
+	// AuthorityWarnings records source-selection fallbacks that kept this
+	// repository readable but may have made its issue snapshot stale.
+	AuthorityWarnings []string
 
 	// Error is set if loading failed
 	Error error
@@ -33,9 +46,10 @@ type LoadResult struct {
 
 // AggregateLoader loads issues from multiple repositories in a workspace
 type AggregateLoader struct {
-	config        *Config
-	workspaceRoot string
-	logger        *log.Logger
+	config                 *Config
+	workspaceRoot          string
+	logger                 *log.Logger
+	parseWarningsUseLogger bool
 }
 
 // NewAggregateLoader creates a new aggregate loader for the given workspace config
@@ -43,20 +57,21 @@ func NewAggregateLoader(config *Config, workspaceRoot string) *AggregateLoader {
 	return &AggregateLoader{
 		config:        config,
 		workspaceRoot: workspaceRoot,
-		// Silence by default. Callers can opt-in via SetLogger.
-		// This avoids polluting stderr (e.g., breaking robot JSON consumers that
-		// capture combined stdout/stderr).
+		// Silence aggregate progress/error logs by default. Per-record parse
+		// warnings still use the loader's default interactive-stderr/robot-quiet
+		// behavior until a caller explicitly routes them with SetLogger.
 		logger: log.New(io.Discard, "", 0),
 	}
 }
 
-// SetLogger sets a custom logger for error reporting.
-// Passing nil substitutes a discard logger to prevent nil pointer dereferences.
+// SetLogger sets a custom logger for aggregate diagnostics and per-record parse
+// warnings. Passing nil explicitly routes both to a discard logger.
 func (l *AggregateLoader) SetLogger(logger *log.Logger) {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
 	l.logger = logger
+	l.parseWarningsUseLogger = true
 }
 
 // LoadAll loads issues from all enabled repositories in the workspace.
@@ -86,6 +101,8 @@ func (l *AggregateLoader) LoadAll(ctx context.Context) ([]model.Issue, []LoadRes
 	var allIssues []model.Issue
 	var failedRepoNames []string
 	var firstRepoErr error
+	issueSource := make(map[string]string)
+	collisionSources := make(map[string]map[string]bool)
 	for _, result := range results {
 		if result.Error != nil {
 			// Log but continue - individual repo failures don't break the whole load
@@ -96,12 +113,40 @@ func (l *AggregateLoader) LoadAll(ctx context.Context) ([]model.Issue, []LoadRes
 			}
 			continue
 		}
+		identity := workspaceLoadResultIdentity(result)
+		for _, issue := range result.Issues {
+			if previous, exists := issueSource[issue.ID]; exists {
+				if collisionSources[issue.ID] == nil {
+					collisionSources[issue.ID] = map[string]bool{previous: true}
+				}
+				collisionSources[issue.ID][identity] = true
+			} else {
+				issueSource[issue.ID] = identity
+			}
+		}
 		allIssues = append(allIssues, result.Issues...)
 	}
 
 	if len(failedRepoNames) == len(results) {
 		return nil, results, fmt.Errorf("all %d enabled repositories failed to load (%s): %w",
 			len(results), strings.Join(failedRepoNames, ", "), firstRepoErr)
+	}
+	if len(collisionSources) > 0 {
+		ids := make([]string, 0, len(collisionSources))
+		for id := range collisionSources {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		details := make([]string, 0, len(ids))
+		for _, id := range ids {
+			sources := make([]string, 0, len(collisionSources[id]))
+			for source := range collisionSources[id] {
+				sources = append(sources, source)
+			}
+			sort.Strings(sources)
+			details = append(details, fmt.Sprintf("%q from %s", id, strings.Join(sources, ", ")))
+		}
+		return nil, results, fmt.Errorf("workspace namespacing produced duplicate issue IDs: %s", strings.Join(details, "; "))
 	}
 
 	return allIssues, results, nil
@@ -112,6 +157,7 @@ func (l *AggregateLoader) getEnabledRepos() ([]RepoConfig, error) {
 	var enabled []RepoConfig
 	seenPaths := make(map[string]bool)
 	seenPrefixes := make(map[string]bool)
+	seenSourceRepos := make(map[string]bool)
 
 	addRepo := func(repo RepoConfig) error {
 		repo = l.applyDefaults(repo)
@@ -133,8 +179,16 @@ func (l *AggregateLoader) getEnabledRepos() ([]RepoConfig, error) {
 		if seenPrefixes[prefixKey] {
 			return fmt.Errorf("duplicate workspace prefix %q", repo.GetPrefix())
 		}
+		sourceRepo := sourceRepoKeyFromPrefix(prefixKey)
+		if sourceRepo == "" {
+			return fmt.Errorf("workspace prefix %q has no usable source repository key", repo.GetPrefix())
+		}
+		if seenSourceRepos[sourceRepo] {
+			return fmt.Errorf("workspace prefix %q duplicates normalized source repository key %q", repo.GetPrefix(), sourceRepo)
+		}
 
 		seenPrefixes[prefixKey] = true
+		seenSourceRepos[sourceRepo] = true
 		enabled = append(enabled, repo)
 		return nil
 	}
@@ -225,7 +279,13 @@ func (l *AggregateLoader) discoverRepos() ([]RepoConfig, error) {
 
 		for _, match := range matches {
 			info, err := os.Stat(match)
-			if err != nil || !info.IsDir() {
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("inspect discovered repository %q: %w", match, err)
+			}
+			if !info.IsDir() {
 				continue
 			}
 			rel, err := filepath.Rel(rootAbs, match)
@@ -244,8 +304,28 @@ func (l *AggregateLoader) discoverRepos() ([]RepoConfig, error) {
 			}
 
 			beadsPath := l.defaultBeadsPath()
-			if _, err := loader.FindJSONLPath(filepath.Join(match, beadsPath)); err != nil {
+			beadsDir, err := loader.ResolveBeadsDir(filepath.Join(match, beadsPath))
+			if err != nil {
+				return nil, fmt.Errorf("resolve tracker for discovered repository %q: %w", match, err)
+			}
+			beadsInfo, err := os.Stat(beadsDir)
+			if os.IsNotExist(err) {
 				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("inspect tracker for discovered repository %q: %w", match, err)
+			}
+			if !beadsInfo.IsDir() {
+				continue
+			}
+			// A Dolt-native tracker is discoverable even before its compatibility
+			// export exists; loadSingleRepo refreshes that export. For JSONL-backed
+			// trackers, require a selectable issue file at the resolved redirect
+			// target rather than incorrectly probing only the local redirect stub.
+			if !loader.IsBDWorkspace(beadsDir) {
+				if _, err := loader.FindJSONLPath(beadsDir); err != nil {
+					continue
+				}
 			}
 
 			repos = append(repos, RepoConfig{
@@ -314,19 +394,23 @@ func (l *AggregateLoader) loadReposParallel(ctx context.Context, repos []RepoCon
 				results[i] = LoadResult{
 					RepoName: repo.GetName(),
 					Prefix:   repo.GetPrefix(),
+					RepoPath: repo.Path,
 					Error:    ctx.Err(),
 				}
 				return nil // Don't propagate context errors as fatal
 			default:
 			}
 
-			issues, err := l.loadSingleRepo(repo, knownPrefixes)
+			issues, parseStats, authorityWarnings, err := l.loadSingleRepo(repo, knownPrefixes)
 
 			results[i] = LoadResult{
-				RepoName: repo.GetName(),
-				Prefix:   repo.GetPrefix(),
-				Issues:   issues,
-				Error:    err,
+				RepoName:          repo.GetName(),
+				Prefix:            repo.GetPrefix(),
+				RepoPath:          repo.Path,
+				Issues:            issues,
+				ParseStats:        parseStats,
+				AuthorityWarnings: authorityWarnings,
+				Error:             err,
 			}
 
 			return nil // Individual repo errors are captured in results, not propagated
@@ -346,21 +430,64 @@ func (l *AggregateLoader) loadReposParallel(ctx context.Context, repos []RepoCon
 }
 
 // loadSingleRepo loads issues from a single repository and namespaced them
-func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[string]bool) ([]model.Issue, error) {
+func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[string]bool) ([]model.Issue, loader.ParseStats, []string, error) {
 	// Resolve the repo path relative to workspace root
 	repo = l.applyDefaults(repo)
 	repoPath := l.resolveRepoPath(repo.Path)
 
 	// Load raw issues from the repo, respecting custom beads path if provided
-	beadsDir := filepath.Join(repoPath, repo.GetBeadsPath())
-	jsonlPath, err := loader.FindJSONLPath(beadsDir)
+	beadsDir, err := loader.ResolveBeadsDir(filepath.Join(repoPath, repo.GetBeadsPath()))
 	if err != nil {
-		return nil, fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
+		return nil, loader.ParseStats{}, nil, fmt.Errorf("failed to resolve tracker for %s: %w", repo.GetName(), err)
 	}
-	issues, err := loader.LoadIssuesFromFile(jsonlPath)
+	var authorityWarnings []string
+	warnSourceFallback := func(message string) {
+		message = strings.TrimSpace(message)
+		if message == "" {
+			return
+		}
+		authorityWarnings = append(authorityWarnings, message)
+		if l.parseWarningsUseLogger {
+			if l.logger != nil {
+				l.logger.Printf("repository %q: %s", repo.GetName(), message)
+			}
+		} else if os.Getenv("BV_ROBOT") != "1" {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", message)
+		}
+	}
+	jsonlPath, err := loader.PrepareBeadsDirForRead(beadsDir, true, warnSourceFallback)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
+		return nil, loader.ParseStats{}, authorityWarnings, fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
 	}
+	var parseStats loader.ParseStats
+	parseOptions := loader.ParseOptions{Stats: &parseStats}
+	if l.parseWarningsUseLogger {
+		parseOptions.WarningHandler = func(message string) {
+			if l.logger != nil {
+				l.logger.Printf("repository %q: %s", repo.GetName(), message)
+			}
+		}
+	}
+	issues, err := loader.LoadIssuesFromFileWithOptions(jsonlPath, parseOptions)
+	if err != nil {
+		return nil, parseStats, authorityWarnings, fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
+	}
+	if parseStats.Valid == 0 && parseStats.Errors+parseStats.Skipped > 0 {
+		return nil, parseStats, authorityWarnings, fmt.Errorf("failed to load issues from %s: no issue records (%d non-issue/error lines, 0 valid issues)",
+			repo.GetName(), parseStats.Errors+parseStats.Skipped)
+	}
+	// ParseStats describes the source faithfully, including valid tombstone
+	// records, while the viewer's issue universe consistently excludes those
+	// soft-deleted records before namespacing, graph construction, and collision
+	// detection.
+	visibleIssues := issues[:0]
+	for i := range issues {
+		if !issues[i].Status.IsTombstone() {
+			visibleIssues = append(visibleIssues, issues[i])
+		}
+	}
+	clear(issues[len(visibleIssues):])
+	issues = visibleIssues
 
 	// Build map of local IDs for conflict resolution
 	localIDs := make(map[string]bool, len(issues))
@@ -372,7 +499,14 @@ func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[stri
 	prefix := repo.GetPrefix()
 	namespacedIssues := l.namespaceIssues(issues, prefix, localIDs, knownPrefixes)
 
-	return namespacedIssues, nil
+	return namespacedIssues, parseStats, authorityWarnings, nil
+}
+
+func workspaceLoadResultIdentity(result LoadResult) string {
+	if strings.TrimSpace(result.RepoPath) != "" {
+		return fmt.Sprintf("%q (path %q)", result.RepoName, result.RepoPath)
+	}
+	return fmt.Sprintf("%q", result.RepoName)
 }
 
 func knownRepoPrefixes(repos []RepoConfig) map[string]bool {

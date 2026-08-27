@@ -175,9 +175,22 @@ func TestDiffSinceAutoJSON_MalformedIssues_NoStderr(t *testing.T) {
 	}
 
 	var payload struct {
-		FromDataHash string `json:"from_data_hash"`
-		ToDataHash   string `json:"to_data_hash"`
-		Diff         struct {
+		FromDataHash  string `json:"from_data_hash"`
+		ToDataHash    string `json:"to_data_hash"`
+		FromLoadStats *struct {
+			Valid   int `json:"valid"`
+			Errors  int `json:"errors"`
+			Skipped int `json:"skipped"`
+		} `json:"from_load_stats"`
+		ToLoadStats *struct {
+			Valid   int `json:"valid"`
+			Errors  int `json:"errors"`
+			Skipped int `json:"skipped"`
+		} `json:"to_load_stats"`
+		Degraded []struct {
+			Code string `json:"code"`
+		} `json:"degraded"`
+		Diff struct {
 			NewIssues []struct {
 				ID string `json:"id"`
 			} `json:"new_issues"`
@@ -192,11 +205,93 @@ func TestDiffSinceAutoJSON_MalformedIssues_NoStderr(t *testing.T) {
 	if payload.FromDataHash == "" || payload.ToDataHash == "" {
 		t.Fatalf("expected both data hashes, got from=%q to=%q", payload.FromDataHash, payload.ToDataHash)
 	}
+	if payload.FromLoadStats == nil || payload.FromLoadStats.Errors != 1 || payload.FromLoadStats.Valid != 1 {
+		t.Fatalf("from_load_stats = %+v, want one valid and one malformed historical record", payload.FromLoadStats)
+	}
+	if payload.ToLoadStats == nil || payload.ToLoadStats.Errors != 1 || payload.ToLoadStats.Valid != 2 {
+		t.Fatalf("to_load_stats = %+v, want two valid and one malformed current record", payload.ToLoadStats)
+	}
+	degradationCodes := make(map[string]bool, len(payload.Degraded))
+	for _, degradation := range payload.Degraded {
+		degradationCodes[degradation.Code] = true
+	}
+	if !degradationCodes["robot_diff_from_load_incomplete"] || !degradationCodes["robot_diff_to_load_incomplete"] {
+		t.Fatalf("degraded = %+v, want distinct malformed from/to load warnings", payload.Degraded)
+	}
 	if payload.Diff.Summary.IssuesAdded != 1 {
 		t.Fatalf("expected issues_added=1, got %d", payload.Diff.Summary.IssuesAdded)
 	}
 	if len(payload.Diff.NewIssues) != 1 || payload.Diff.NewIssues[0].ID != "B" {
 		t.Fatalf("expected new issue B, got %+v", payload.Diff.NewIssues)
+	}
+}
+
+func TestRobotDiffAppliesLabelAndRepoScopeToBothSnapshots(t *testing.T) {
+	bv := buildBvBinary(t)
+	repoDir := t.TempDir()
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	historical := `{"id":"app-A","title":"Scoped","status":"open","priority":1,"issue_type":"task","labels":["scope"]}
+{"id":"other-B","title":"Outside scope","status":"open","priority":1,"issue_type":"task","labels":["other"]}` + "\n"
+	if err := os.WriteFile(issuesPath, []byte(historical), 0o644); err != nil {
+		t.Fatalf("write historical issues: %v", err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init", "-b", "main")
+	git("add", ".beads/issues.jsonl")
+	git("commit", "-m", "historical scoped fixture")
+
+	current := `{"id":"app-A","title":"Scoped","status":"closed","priority":1,"issue_type":"task","labels":["scope"]}
+{"id":"other-B","title":"Outside scope","status":"open","priority":1,"issue_type":"task","labels":["other"]}` + "\n"
+	if err := os.WriteFile(issuesPath, []byte(current), 0o644); err != nil {
+		t.Fatalf("write current issues: %v", err)
+	}
+
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "label", args: []string{"--label", "scope"}},
+		{name: "repo", args: []string{"--repo", "app"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args := append([]string{"--robot-diff", "--diff-since", "HEAD"}, test.args...)
+			cmd := exec.Command(bv, args...)
+			cmd.Dir = repoDir
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("scoped robot diff failed: %v\n%s", err, out)
+			}
+			var payload struct {
+				Diff struct {
+					ClosedIssues []struct {
+						ID string `json:"id"`
+					} `json:"closed_issues"`
+				} `json:"diff"`
+			}
+			if err := json.Unmarshal(out, &payload); err != nil {
+				t.Fatalf("decode scoped diff: %v\n%s", err, out)
+			}
+			if len(payload.Diff.ClosedIssues) != 1 || payload.Diff.ClosedIssues[0].ID != "app-A" {
+				t.Fatalf("scoped closed issues = %+v, want only app-A", payload.Diff.ClosedIssues)
+			}
+		})
 	}
 }
 

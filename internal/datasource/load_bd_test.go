@@ -1,12 +1,45 @@
 package datasource
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func captureDatasourceStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stderr pipe: %v", err)
+	}
+	original := os.Stderr
+	os.Stderr = writer
+	defer func() {
+		os.Stderr = original
+		_ = writer.Close()
+		_ = reader.Close()
+	}()
+
+	fn()
+	os.Stderr = original
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stderr writer: %v", err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		_ = reader.Close()
+		t.Fatalf("read stderr: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close stderr reader: %v", err)
+	}
+	return string(output)
+}
 
 // makeBDWorkspace creates a temp bd/Dolt workspace layout (#189):
 // .beads/metadata.json with backend=dolt plus an embeddeddolt/ data dir.
@@ -125,6 +158,44 @@ func TestLoadIssuesFromDir_BDWorkspaceFallsBackToExistingExport(t *testing.T) {
 	}
 	if len(issues) != 1 || issues[0].ID != "BD-2" {
 		t.Fatalf("expected the existing export issue, got %#v", issues)
+	}
+}
+
+func TestLoadIssuesFromDir_BDStaleExportRobotModeIsSilentAndReportsAuthorityWarning(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	dir, beadsDir := makeBDWorkspace(t)
+	hideBD(t, dir)
+	path := filepath.Join(beadsDir, "issues.jsonl")
+	existing := `{"id":"BD-STALE","title":"Existing stale export","status":"open","priority":1,"issue_type":"task"}` + "\n"
+	if err := os.WriteFile(path, []byte(existing), 0o644); err != nil {
+		t.Fatalf("write stale issues.jsonl: %v", err)
+	}
+
+	var issues []model.Issue
+	var loadErr error
+	stderr := captureDatasourceStderr(t, func() {
+		issues, loadErr = LoadIssuesFromDir(beadsDir)
+	})
+	if loadErr != nil {
+		t.Fatalf("LoadIssuesFromDir() error = %v", loadErr)
+	}
+	if stderr != "" {
+		t.Fatalf("robot-mode stale-export fallback wrote stderr: %q", stderr)
+	}
+	if len(issues) != 1 || issues[0].ID != "BD-STALE" {
+		t.Fatalf("expected existing stale export issue, got %#v", issues)
+	}
+	report := LastLoadReport()
+	if report == nil || report.Path != path {
+		t.Fatalf("stale-export load report = %+v, want path %q", report, path)
+	}
+	if len(report.AuthorityWarnings) != 1 {
+		t.Fatalf("authority warnings = %v, want exactly one stale-export warning", report.AuthorityWarnings)
+	}
+	for _, want := range []string{"bd export failed", "using existing issues.jsonl", "bd binary not found"} {
+		if !strings.Contains(report.AuthorityWarnings[0], want) {
+			t.Fatalf("authority warning %q missing %q", report.AuthorityWarnings[0], want)
+		}
 	}
 }
 

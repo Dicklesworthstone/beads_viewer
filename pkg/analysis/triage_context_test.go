@@ -538,7 +538,13 @@ func TestTriageContext_ThreadSafe(t *testing.T) {
 
 func TestTriageContext_Convenience(t *testing.T) {
 	issues := []model.Issue{
-		{ID: "A", Status: model.StatusOpen, Title: "Issue A"},
+		{
+			ID:           "A",
+			Status:       model.StatusOpen,
+			Title:        "Issue A",
+			Labels:       []string{"stable"},
+			Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepRelated}},
+		},
 		{ID: "B", Status: model.StatusOpen, Title: "Issue B"},
 	}
 	analyzer := NewAnalyzer(issues)
@@ -569,6 +575,16 @@ func TestTriageContext_Convenience(t *testing.T) {
 	allIssues := ctx.Issues()
 	if len(allIssues) != 2 {
 		t.Errorf("Issues() should return 2, got %d", len(allIssues))
+	}
+	for i := range allIssues {
+		if allIssues[i].ID == "A" {
+			allIssues[i].Labels[0] = "mutated"
+			allIssues[i].Dependencies[0].DependsOnID = "missing"
+		}
+	}
+	stable := ctx.GetIssue("A")
+	if stable == nil || stable.Labels[0] != "stable" || stable.Dependencies[0].DependsOnID != "B" {
+		t.Fatalf("Issues() exposed analyzer-owned nested data: %+v", stable)
 	}
 }
 

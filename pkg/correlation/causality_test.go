@@ -110,6 +110,200 @@ func TestBuildCausalityChainAtPinsOpenDurationAndTieOrder(t *testing.T) {
 	}
 }
 
+func TestBuildCausalityChainAtNormalizesStatusWithoutEvents(t *testing.T) {
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-empty": {
+				BeadID: "bv-empty",
+				Status: "  TOMBSTONE\t",
+			},
+		},
+	}
+
+	result := report.BuildCausalityChainAt("bv-empty", CausalityOptions{}, testTime(10))
+	if result == nil {
+		t.Fatal("expected causality result")
+	}
+	if got, want := result.Chain.Status, "tombstone"; got != want {
+		t.Fatalf("normalized status = %q, want %q", got, want)
+	}
+	if !result.Chain.IsComplete {
+		t.Fatal("tombstoned history with no events must still be complete")
+	}
+	if result.Chain.TotalTime != 0 || !result.Chain.StartTime.IsZero() || !result.Chain.EndTime.IsZero() {
+		t.Fatalf("empty chain times = start %v, end %v, total %v; want zero values",
+			result.Chain.StartTime, result.Chain.EndTime, result.Chain.TotalTime)
+	}
+	if got, want := result.Insights.Summary, "Completed; transition timing unavailable from history"; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	wantRecommendation := "Completion-duration metrics are unavailable because history has no terminal close transition"
+	if got := result.Insights.Recommendations; len(got) == 0 || got[0] != wantRecommendation {
+		t.Fatalf("recommendations = %q, want first recommendation %q", got, wantRecommendation)
+	}
+}
+
+func TestBuildCausalityChainClosedStatusAfterReopenDoesNotInventCompletionTime(t *testing.T) {
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-inconsistent": {
+			BeadID: "bv-inconsistent",
+			Status: "closed",
+			Events: []BeadEvent{
+				{EventType: EventCreated, Timestamp: testTime(0)},
+				{EventType: EventClosed, Timestamp: testTime(2)},
+				{EventType: EventReopened, Timestamp: testTime(3)},
+			},
+		},
+	}}
+
+	result := report.BuildCausalityChainAt("bv-inconsistent", CausalityOptions{}, testTime(10))
+	if result == nil || !result.Chain.IsComplete {
+		t.Fatalf("closed status result = %+v, want complete current state", result)
+	}
+	if got, want := result.Insights.Summary, "Completed; transition timing unavailable from history"; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	if !result.Chain.EndTime.IsZero() || result.Chain.TotalTime != 0 || result.Insights.TotalDuration != 0 || result.Insights.ActiveDuration != 0 {
+		t.Fatalf("unknown completion timing leaked numeric duration: chain=%+v insights=%+v", result.Chain, result.Insights)
+	}
+}
+
+func TestBuildCausalityChainClosedStatusWithCommitButNoCloseDoesNotInventCompletionTime(t *testing.T) {
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-missing-close": {
+			BeadID:  "bv-missing-close",
+			Status:  "closed",
+			Events:  []BeadEvent{{EventType: EventCreated, Timestamp: testTime(0)}},
+			Commits: []CorrelatedCommit{{SHA: "full-sha", Timestamp: testTime(8)}},
+		},
+	}}
+
+	result := report.BuildCausalityChainAt("bv-missing-close", DefaultCausalityOptions(), testTime(10))
+	if result == nil || len(result.Chain.Events) != 2 {
+		t.Fatalf("result = %+v, want two observed events", result)
+	}
+	if !result.Chain.EndTime.IsZero() || result.Chain.TotalTime != 0 || result.Insights.TotalDuration != 0 {
+		t.Fatalf("last commit was presented as completion timing: chain=%+v insights=%+v", result.Chain, result.Insights)
+	}
+	if result.Insights.EstimatedWithout != nil || result.Insights.ActiveDuration != 0 || result.Insights.BlockedPercentage != 0 {
+		t.Fatalf("unknown completion duration produced derived metrics: %+v", result.Insights)
+	}
+}
+
+func TestBuildCausalityChainUsesTerminalCloseRatherThanLaterCommit(t *testing.T) {
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-closed": {
+			BeadID: "bv-closed",
+			Status: "closed",
+			Events: []BeadEvent{
+				{EventType: EventCreated, Timestamp: testTime(0)},
+				{EventType: EventClosed, Timestamp: testTime(4)},
+			},
+			Commits: []CorrelatedCommit{{SHA: "post-close", Timestamp: testTime(7)}},
+		},
+	}}
+
+	result := report.BuildCausalityChainAt("bv-closed", DefaultCausalityOptions(), testTime(10))
+	if result == nil {
+		t.Fatal("expected causality result")
+	}
+	if got, want := result.Chain.EndTime, testTime(4); !got.Equal(want) {
+		t.Fatalf("completion end = %v, want terminal close %v", got, want)
+	}
+	if got, want := result.Chain.TotalTime, 4*time.Hour; got != want {
+		t.Fatalf("completion duration = %v, want %v", got, want)
+	}
+	if got := result.Insights.CommitCount; got != 0 {
+		t.Fatalf("causal commit count = %d, want 0 because the only commit is post-close", got)
+	}
+	if got, want := result.Insights.CriticalPathDesc, "created → closed"; got != want {
+		t.Fatalf("causal path = %q, want %q", got, want)
+	}
+	if result.Insights.LongestGap == nil || *result.Insights.LongestGap != 4*time.Hour {
+		t.Fatalf("longest causal gap = %v, want 4h before close", result.Insights.LongestGap)
+	}
+}
+
+func TestBuildCausalityChainCountsCodeCoCommittedWithTerminalClose(t *testing.T) {
+	const closingSHA = "0123456789abcdef0123456789abcdef01234567"
+	closedAt := testTime(4)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-close-with-code": {
+			BeadID: "bv-close-with-code",
+			Status: "closed",
+			Events: []BeadEvent{
+				{EventType: EventCreated, Timestamp: testTime(0), CommitSHA: "created-sha"},
+				{EventType: EventClosed, Timestamp: closedAt, CommitSHA: closingSHA},
+			},
+			Commits: []CorrelatedCommit{{
+				SHA:       closingSHA,
+				ShortSHA:  closingSHA[:7],
+				Message:   "finish implementation",
+				Timestamp: closedAt,
+			}},
+		},
+	}}
+
+	result := report.BuildCausalityChainAt("bv-close-with-code", DefaultCausalityOptions(), testTime(10))
+	if result == nil || result.Chain == nil {
+		t.Fatal("expected causality result")
+	}
+	wantTypes := []CausalEventType{CausalCreated, CausalCommit, CausalClosed}
+	if len(result.Chain.Events) != len(wantTypes) {
+		t.Fatalf("events = %+v, want created/commit/closed", result.Chain.Events)
+	}
+	for i, want := range wantTypes {
+		if got := result.Chain.Events[i].Type; got != want {
+			t.Fatalf("event %d = %q, want %q", i, got, want)
+		}
+	}
+	if result.Insights.CommitCount != 1 {
+		t.Fatalf("co-committed close commit count = %d, want 1", result.Insights.CommitCount)
+	}
+	if got, want := result.Insights.CriticalPathDesc, "created → commit → closed"; got != want {
+		t.Fatalf("co-committed causal path = %q, want %q", got, want)
+	}
+}
+
+func TestBuildCausalityChainAtNeverEndsBeforeLatestEvent(t *testing.T) {
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-future": {
+				BeadID: "bv-future",
+				Status: "open",
+				Events: []BeadEvent{{EventType: EventCreated, Timestamp: testTime(0)}},
+				Commits: []CorrelatedCommit{{
+					ShortSHA:  "future1",
+					Message:   "future commit",
+					Timestamp: testTime(5),
+				}},
+			},
+		},
+	}
+
+	result := report.BuildCausalityChainAt(
+		"bv-future",
+		CausalityOptions{IncludeCommits: true},
+		testTime(2),
+	)
+	if result == nil {
+		t.Fatal("expected causality result")
+	}
+	if got, want := result.Chain.EndTime, testTime(5); !got.Equal(want) {
+		t.Fatalf("end time = %v, want latest event %v", got, want)
+	}
+	if got, want := result.Chain.TotalTime, 5*time.Hour; got != want {
+		t.Fatalf("total time = %v, want %v", got, want)
+	}
+}
+
+func TestBuildCausalityChainAtNilReport(t *testing.T) {
+	var report *HistoryReport
+	if result := report.BuildCausalityChainAt("bv-test", CausalityOptions{}, testTime(0)); result != nil {
+		t.Fatalf("nil report result = %+v, want nil", result)
+	}
+}
+
 func TestBuildCausalityChain_CausalLinks(t *testing.T) {
 	report := &HistoryReport{
 		DataHash: "test-hash",
@@ -205,6 +399,72 @@ func TestBuildCausalityChain_WithCommits(t *testing.T) {
 	}
 }
 
+func TestBuildCausalityChainUsesFullSHAWhenShortSHAIsMissing(t *testing.T) {
+	const fullSHA = "0123456789abcdef0123456789abcdef01234567"
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-sha": {
+				BeadID: "bv-sha",
+				Status: "closed",
+				Events: []BeadEvent{{EventType: EventCreated, Timestamp: testTime(0)}},
+				Commits: []CorrelatedCommit{{
+					SHA:       fullSHA,
+					Message:   "linked work",
+					Timestamp: testTime(1),
+				}},
+			},
+		},
+	}
+
+	result := report.BuildCausalityChainAt("bv-sha", DefaultCausalityOptions(), testTime(2))
+	if result == nil {
+		t.Fatal("expected causality result")
+	}
+	for _, event := range result.Chain.Events {
+		if event.Type == CausalCommit {
+			if event.CommitSHA != fullSHA {
+				t.Fatalf("commit SHA = %q, want full SHA fallback %q", event.CommitSHA, fullSHA)
+			}
+			return
+		}
+	}
+	t.Fatal("expected commit event")
+}
+
+func TestBuildCausalityChainKeepsDistinctFullSHAsWithCollidingShortSHAs(t *testing.T) {
+	const (
+		sharedShort = "0123456"
+		firstFull   = "0123456aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		secondFull  = "0123456bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-collision": {
+			BeadID: "bv-collision",
+			Status: "in_progress",
+			Events: []BeadEvent{{EventType: EventCreated, Timestamp: testTime(0)}},
+			Commits: []CorrelatedCommit{
+				{SHA: firstFull, ShortSHA: sharedShort, Message: "first", Timestamp: testTime(1)},
+				{SHA: secondFull, ShortSHA: sharedShort, Message: "second", Timestamp: testTime(2)},
+			},
+		},
+	}}
+
+	result := report.BuildCausalityChainAt("bv-collision", DefaultCausalityOptions(), testTime(3))
+	if result == nil {
+		t.Fatal("expected causality result")
+	}
+	var got []string
+	for _, event := range result.Chain.Events {
+		if event.Type == CausalCommit {
+			got = append(got, event.CommitSHA)
+		}
+	}
+	want := []string{firstFull, secondFull}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("serialized commit SHAs = %v, want distinct full identities %v", got, want)
+	}
+}
+
 func TestBuildCausalityChain_InProgress(t *testing.T) {
 	report := &HistoryReport{
 		DataHash: "test-hash",
@@ -234,6 +494,51 @@ func TestBuildCausalityChain_InProgress(t *testing.T) {
 	}
 }
 
+func TestBuildCausalityChainBlockedWithoutTransitionIsHonest(t *testing.T) {
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-blocked": {
+				BeadID: "bv-blocked",
+				Status: " BLOCKED ",
+				Events: []BeadEvent{
+					{EventType: EventCreated, Timestamp: testTime(0)},
+					// The extractor currently represents open -> blocked as modified,
+					// which must not be upgraded to a timed block transition.
+					{EventType: EventModified, Timestamp: testTime(5)},
+				},
+			},
+		},
+	}
+
+	result := report.BuildCausalityChainAt(
+		"bv-blocked",
+		CausalityOptions{IncludeCommits: false},
+		testTime(10),
+	)
+	if result == nil {
+		t.Fatal("expected causality result")
+	}
+	if got, want := result.Chain.Status, "blocked"; got != want {
+		t.Fatalf("status = %q, want %q", got, want)
+	}
+	if got, want := result.Insights.Summary, "Blocked; transition timing unavailable from history"; got != want {
+		t.Fatalf("summary = %q, want %q", got, want)
+	}
+	wantRecommendation := "Blocked-duration metrics are unavailable because history has no explicit block transition"
+	if got := result.Insights.Recommendations; len(got) == 0 || got[0] != wantRecommendation {
+		t.Fatalf("recommendations = %q, want first recommendation %q", got, wantRecommendation)
+	}
+	if result.Insights.BlockedDuration != 0 || len(result.Insights.BlockedPeriods) != 0 {
+		t.Fatalf("missing transition must not fabricate blocked time: duration=%v periods=%+v",
+			result.Insights.BlockedDuration, result.Insights.BlockedPeriods)
+	}
+	for _, event := range result.Chain.Events {
+		if event.Type == CausalBlocked || event.Type == CausalUnblocked {
+			t.Fatalf("modified lifecycle event fabricated block transition: %+v", event)
+		}
+	}
+}
+
 func TestCausalInsights_BlockedPercentage(t *testing.T) {
 	// Test the blocked percentage calculation
 	insights := CausalInsights{
@@ -256,6 +561,81 @@ func TestCausalInsights_BlockedPercentage(t *testing.T) {
 	}
 }
 
+// These two buildInsights tests exercise its explicit-chain contract directly.
+// They do not claim that BuildCausalityChainAt can recover block timestamps from
+// the current EventModified-only Git history.
+func TestBuildInsightsSyntheticTransitionsTrackRepeatedBlockAndOpenPeriod(t *testing.T) {
+	chain := &CausalChain{
+		Status: "blocked",
+		Events: []CausalEvent{
+			{ID: 0, Type: CausalCreated, Timestamp: testTime(0)},
+			{ID: 1, Type: CausalBlocked, Timestamp: testTime(1), BlockerID: "bv-a"},
+			{ID: 2, Type: CausalBlocked, Timestamp: testTime(2), BlockerID: "bv-a"},
+			{ID: 3, Type: CausalBlocked, Timestamp: testTime(4), BlockerID: "bv-b"},
+			{ID: 4, Type: CausalUnblocked, Timestamp: testTime(6), BlockerID: "bv-b"},
+			{ID: 5, Type: CausalBlocked, Timestamp: testTime(8), BlockerID: "bv-c"},
+		},
+		StartTime: testTime(0),
+		EndTime:   testTime(10),
+		TotalTime: 10 * time.Hour,
+	}
+
+	insights := buildInsights(chain)
+	if got, want := len(insights.BlockedPeriods), 2; got != want {
+		t.Fatalf("blocked period count = %d, want %d: %+v", got, want, insights.BlockedPeriods)
+	}
+	wantPeriods := []BlockedPeriod{
+		{StartTime: testTime(1), EndTime: testTime(6), Duration: 5 * time.Hour, BlockerID: "bv-a"},
+		{StartTime: testTime(8), EndTime: testTime(10), Duration: 2 * time.Hour, BlockerID: "bv-c"},
+	}
+	for i, want := range wantPeriods {
+		if got := insights.BlockedPeriods[i]; got != want {
+			t.Errorf("blocked period %d = %+v, want %+v", i, got, want)
+		}
+	}
+	if got, want := insights.BlockedDuration, 7*time.Hour; got != want {
+		t.Errorf("blocked duration = %v, want %v", got, want)
+	}
+	if got, want := insights.ActiveDuration, 3*time.Hour; got != want {
+		t.Errorf("active duration = %v, want %v", got, want)
+	}
+	if got, want := insights.BlockedPercentage, 70.0; got != want {
+		t.Errorf("blocked percentage = %.1f, want %.1f", got, want)
+	}
+	if insights.EstimatedWithout == nil || *insights.EstimatedWithout != 3*time.Hour {
+		t.Errorf("estimated duration without blocks = %v, want 3h", insights.EstimatedWithout)
+	}
+	if got, want := insights.Summary, "Blocked now (10h total, 7h blocked)"; got != want {
+		t.Errorf("summary = %q, want %q", got, want)
+	}
+}
+
+func TestBuildInsightsSyntheticTransitionClosesWhenWorkCloses(t *testing.T) {
+	chain := &CausalChain{
+		Events: []CausalEvent{
+			{ID: 0, Type: CausalCreated, Timestamp: testTime(0)},
+			{ID: 1, Type: CausalBlocked, Timestamp: testTime(2), BlockerID: "bv-a"},
+			{ID: 2, Type: CausalClosed, Timestamp: testTime(7)},
+			{ID: 3, Type: CausalCommit, Timestamp: testTime(8)},
+		},
+		StartTime:  testTime(0),
+		EndTime:    testTime(8),
+		TotalTime:  8 * time.Hour,
+		IsComplete: true,
+	}
+
+	insights := buildInsights(chain)
+	if got, want := insights.BlockedDuration, 5*time.Hour; got != want {
+		t.Fatalf("blocked duration = %v, want %v", got, want)
+	}
+	if got, want := len(insights.BlockedPeriods), 1; got != want {
+		t.Fatalf("blocked period count = %d, want %d", got, want)
+	}
+	if got, want := insights.BlockedPeriods[0].EndTime, testTime(7); !got.Equal(want) {
+		t.Fatalf("blocked period end = %v, want close event %v", got, want)
+	}
+}
+
 func TestFormatDurationShort(t *testing.T) {
 	tests := []struct {
 		duration time.Duration
@@ -267,6 +647,9 @@ func TestFormatDurationShort(t *testing.T) {
 		{25 * time.Hour, "1d"},
 		{3 * 24 * time.Hour, "3d"},
 		{10 * 24 * time.Hour, "1w"},
+		{28 * 24 * time.Hour, "4w"},
+		{29 * 24 * time.Hour, "4w"},
+		{30 * 24 * time.Hour, "1mo"},
 		{35 * 24 * time.Hour, "1mo"},
 	}
 
@@ -315,6 +698,11 @@ func TestFormatInt(t *testing.T) {
 			t.Errorf("formatInt(%d) = '%s', expected '%s'", tt.n, result, tt.expected)
 		}
 	}
+
+	minInt := -int(^uint(0)>>1) - 1
+	if result := formatInt(minInt); len(result) < 2 || result == "-" {
+		t.Errorf("formatInt(minInt) = %q, want full decimal representation", result)
+	}
 }
 
 func TestBuildSummary_Completed(t *testing.T) {
@@ -333,6 +721,21 @@ func TestBuildSummary_Completed(t *testing.T) {
 	// Should mention completion and commit count
 	if summary == "" {
 		t.Error("Expected non-empty summary")
+	}
+}
+
+func TestFormatCommitCountUsesSingularOnlyForOne(t *testing.T) {
+	for _, tc := range []struct {
+		count int
+		want  string
+	}{
+		{count: 0, want: "0 commits"},
+		{count: 1, want: "1 commit"},
+		{count: 2, want: "2 commits"},
+	} {
+		if got := formatCommitCount(tc.count); got != tc.want {
+			t.Fatalf("formatCommitCount(%d) = %q, want %q", tc.count, got, tc.want)
+		}
 	}
 }
 
@@ -538,6 +941,43 @@ func TestBuildCausalityChain_SameTimestamps(t *testing.T) {
 	// LongestGapDesc should be computed without error
 	if result.Insights.LongestGapDesc == "" {
 		t.Error("Expected non-empty LongestGapDesc even with 0 gap")
+	}
+}
+
+func TestBuildCausalityChain_PreservesSameTimestampLifecycleOrder(t *testing.T) {
+	createdAt := testTime(0)
+	transitionAt := testTime(1)
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-tied-transitions": {
+				BeadID: "bv-tied-transitions",
+				Title:  "Tied lifecycle transitions",
+				Status: "closed",
+				Events: []BeadEvent{
+					{EventType: EventCreated, Timestamp: createdAt},
+					{EventType: EventClosed, Timestamp: transitionAt},
+					{EventType: EventReopened, Timestamp: transitionAt},
+					{EventType: EventClosed, Timestamp: transitionAt},
+				},
+			},
+		},
+	}
+
+	result := report.BuildCausalityChainAt("bv-tied-transitions", CausalityOptions{IncludeCommits: false}, transitionAt)
+	if result == nil || result.Chain == nil {
+		t.Fatal("expected a causal chain")
+	}
+	wantTypes := []CausalEventType{CausalCreated, CausalClosed, CausalReopened, CausalClosed}
+	if len(result.Chain.Events) != len(wantTypes) {
+		t.Fatalf("events = %#v, want %d lifecycle events", result.Chain.Events, len(wantTypes))
+	}
+	for i, want := range wantTypes {
+		if got := result.Chain.Events[i].Type; got != want {
+			t.Fatalf("event %d type = %q, want %q; tied lifecycle order changed", i, got, want)
+		}
+	}
+	if !result.Chain.IsComplete || !result.Chain.EndTime.Equal(transitionAt) {
+		t.Fatalf("terminal close was lost: complete=%v end=%v", result.Chain.IsComplete, result.Chain.EndTime)
 	}
 }
 

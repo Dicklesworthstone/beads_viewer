@@ -2,16 +2,20 @@
 package correlation
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // renamePattern matches git's brace notation for renames: {old => new}
@@ -25,9 +29,129 @@ var renamePattern = regexp.MustCompile(`\{[^}]* => ([^}]*)\}`)
 // It is never read on any production path.
 var coCommitFetchedSHAsCounter int64
 
+// Keep each git invocation comfortably below even conservative OS argument
+// limits. The largest supported revision (a SHA-256 object ID) consumes 65
+// argument bytes including its terminator, so this leaves ample room for the
+// environment, options, and pathspecs.
+const (
+	maxCoCommitSHAsPerGitCommand = 512
+	coCommitRenameLimit          = 1000
+	coCommitGitPolicyVersion     = "co-commit-diff-v4"
+	// coCommitBatchHeaderFormat ends each SHA header with two NUL bytes. At a
+	// record boundary that cannot be confused with either a name-status action
+	// (which starts with a status letter) or a numstat record (which starts with
+	// a decimal count or '-'). Paths are consumed according to their -z framing,
+	// so even a path containing newlines and SHA-looking text stays opaque.
+	coCommitBatchHeaderFormat = "%H%x00%x00"
+)
+
+// coCommitGitPolicyNamespaceInputs binds every option that can change the
+// co-committed FileChange artifacts. Both the per-commit cache and the outer
+// report/artifact caches must include this policy because an outer hit bypasses
+// co-commit extraction entirely.
+func coCommitGitPolicyNamespaceInputs() []string {
+	inputs := []string{coCommitGitPolicyVersion}
+	inputs = append(inputs, repoGitPolicyArgs()...)
+	inputs = append(inputs, coCommitGitConfigArgs()...)
+	inputs = append(inputs, coCommitDiffArgs("")...)
+	inputs = append(inputs, excludePathspecArgs()...)
+	return inputs
+}
+
+// coCommitGitConfigArgs fixes the config-controlled parts of Git's diff output.
+// Keep this policy paired with coCommitDiffArgs and include both in the
+// persistent-cache namespace; changing either policy must invalidate old data.
+func coCommitGitConfigArgs() []string {
+	return []string{
+		"-c", "color.ui=false",
+		"-c", "core.quotePath=true",
+		"-c", "core.bigFileThreshold=512m",
+		"-c", "diff.renames=true",
+		"-c", fmt.Sprintf("diff.renameLimit=%d", coCommitRenameLimit),
+		"-c", "diff.algorithm=default",
+	}
+}
+
+// coCommitDiffArgs fixes every diff/log option that can alter cached file
+// actions, paths, order-independent line counts, or merge behavior. --text
+// intentionally bypasses repository-local diff attributes so the same blobs do
+// not flip between numeric and binary numstat output across clones.
+func coCommitDiffArgs(diffFlag string) []string {
+	args := make([]string, 0, 15)
+	if diffFlag != "" {
+		args = append(args, diffFlag)
+	}
+	return append(args,
+		"-z",
+		"--find-renames=50%",
+		fmt.Sprintf("-l%d", coCommitRenameLimit),
+		"--no-rename-empty",
+		"--diff-algorithm=default",
+		"--no-indent-heuristic",
+		"--no-ext-diff",
+		"--no-textconv",
+		"--text",
+		"--ignore-submodules=none",
+		"--submodule=short",
+		"--no-relative",
+		"--diff-merges=first-parent",
+		"--root",
+		"--no-show-signature",
+		"--no-decorate",
+	)
+}
+
+// coCommitGitCommand prevents ambient repository-routing and diff environment
+// variables from silently changing the meaning of repoPath or the cached diff.
+func coCommitGitCommand(ctx context.Context, repoPath string, args []string) *exec.Cmd {
+	gitArgs := append(coCommitGitConfigArgs(), args...)
+	return repoGitCommand(ctx, repoPath, gitArgs...)
+}
+
+const (
+	coCommitHistoryStateFull        = "full-history-v1"
+	coCommitHistoryStateShallow     = "shallow-history-v1"
+	coCommitHistoryStateUnavailable = "unavailable-history-v1"
+)
+
+// coCommitRepositoryHistoryState returns the repository state that affects a
+// boundary commit's first-parent diff. Callers bind this value into higher-level
+// cache namespaces; they persist only the full-history state.
+func coCommitRepositoryHistoryState(ctx context.Context, repoPath string) string {
+	cmd := repoGitCommand(ctx, repoPath, "rev-parse", "--is-shallow-repository")
+	out, err := cmd.Output()
+	if err != nil {
+		return coCommitHistoryStateUnavailable
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "false":
+		return coCommitHistoryStateFull
+	case "true":
+		return coCommitHistoryStateShallow
+	default:
+		return coCommitHistoryStateUnavailable
+	}
+}
+
+// coCommitPersistentCacheSafe reports whether a commit's first-parent diff is
+// stable under the repository state that is not encoded in the per-commit key.
+// A shallow boundary changes Git's parent view: a boundary commit is diffed as
+// a root commit until the repository is deepened, even though its SHA is
+// unchanged. Persistent hits and stores are therefore disabled for shallow
+// repositories. A failed probe also fails closed; extraction still proceeds,
+// but only through process-local memoization.
+func coCommitPersistentCacheSafe(ctx context.Context, repoPath string) bool {
+	return coCommitRepositoryHistoryState(ctx, repoPath) == coCommitHistoryStateFull
+}
+
 // CoCommitExtractor extracts files that were changed in the same commit as bead changes
 type CoCommitExtractor struct {
 	repoPath string
+
+	// mu serializes the two public extraction entry points. CachedCorrelator's
+	// singleflight is keyed by report inputs, so different keys may concurrently
+	// share one Correlator and therefore this process-local memo.
+	mu sync.Mutex
 
 	// ctx, when set (via Correlator.WithContext or directly), bounds the git
 	// subprocesses spawned during co-commit extraction (issue #166). nil means
@@ -40,11 +164,31 @@ type CoCommitExtractor struct {
 	fileCache   map[string][]FileChange
 	statCache   map[string]map[string]lineStats
 	batchedSHAs map[string]struct{}
+
+	// memoizedHistoryState binds the process-local maps above to the repository
+	// history shape under which Git produced them. A shallow boundary can change
+	// after fetch --deepen without changing any commit SHA.
+	memoizedHistoryState string
 }
 
 // NewCoCommitExtractor creates a new co-commit extractor
 func NewCoCommitExtractor(repoPath string) *CoCommitExtractor {
 	return &CoCommitExtractor{repoPath: repoPath}
+}
+
+func (c *CoCommitExtractor) resetMemoizedDiffs() {
+	c.fileCache = nil
+	c.statCache = nil
+	c.batchedSHAs = nil
+}
+
+func (c *CoCommitExtractor) prepareMemoizedHistoryState() string {
+	state := coCommitRepositoryHistoryState(c.ctx, c.repoPath)
+	if state != coCommitHistoryStateFull || state != c.memoizedHistoryState {
+		c.resetMemoizedDiffs()
+	}
+	c.memoizedHistoryState = state
+	return state
 }
 
 // codeFileExtensions lists file extensions considered "code files"
@@ -95,6 +239,14 @@ var excludedPaths = []string{
 
 // ExtractCoCommittedFiles extracts code files changed in the same commit as a bead event
 func (c *CoCommitExtractor) ExtractCoCommittedFiles(event BeadEvent) ([]FileChange, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.prepareMemoizedHistoryState()
+	return c.extractCoCommittedFiles(event)
+}
+
+func (c *CoCommitExtractor) extractCoCommittedFiles(event BeadEvent) ([]FileChange, error) {
 	// Get file list with status
 	files, err := c.getFilesChanged(event.CommitSHA)
 	if err != nil {
@@ -104,8 +256,7 @@ func (c *CoCommitExtractor) ExtractCoCommittedFiles(event BeadEvent) ([]FileChan
 	// Get line stats
 	stats, err := c.getLineStats(event.CommitSHA)
 	if err != nil {
-		// Non-fatal: continue without stats
-		stats = make(map[string]lineStats)
+		return nil, fmt.Errorf("extracting co-commit line stats: %w", err)
 	}
 
 	// Filter to code files only
@@ -171,23 +322,44 @@ func excludePathspecArgs() []string {
 	return args
 }
 
-// primeBatch fetches name-status and numstat for every requested SHA in two
-// batched `git log` invocations and memoizes the result, so subsequent
+// primeBatch fetches name-status and numstat for every requested SHA in bounded
+// pairs of `git log` invocations and memoizes the result, so subsequent
 // getFilesChanged/getLineStats calls for those SHAs are served from memory
 // instead of forking one `git show` per commit. SHAs already batched are
 // skipped, keeping the call idempotent.
 //
-// We use `git log --no-walk=unsorted <SHAs>` rather than N×`git show`: a single
-// process streams each commit's first-parent diff (exactly what `git show`
-// computes) for the whole set. Two passes are required because git's
-// --name-status and --numstat are mutually exclusive in one invocation (the last
+// We use `git log --no-walk=unsorted --sparse <SHAs>` rather than N×`git show`:
+// --sparse keeps each explicitly requested commit's header even when the
+// pathspec excludes its entire diff (the common metadata-only Beads commit), and
+// each process streams every requested commit's first-parent diff (exactly what
+// `git show` computes) for a bounded subset. Two passes per subset are
+// required because git's --name-status and --numstat are mutually exclusive
+// in one invocation (the last
 // flag wins); the status letters live in one pass and the +/- line counts in the
 // other, matching the two existing parsers byte-for-byte. The same exclude
-// pathspecs are applied, so a commit whose diff is empty under the pathspec is
-// omitted from the stream — identical to `git show` printing nothing (verified)
-// and yielding an empty file list for that SHA. Either git-pass failure is
-// returned before any missing SHA is marked complete or cached.
+// pathspecs are applied. Git still emits the explicit commit header when its
+// filtered diff is empty, so the strict parser can distinguish a verified empty
+// contribution from a truncated/missing commit. Either Git-pass or parse failure
+// is returned before any missing SHA is marked complete or cached.
 func (c *CoCommitExtractor) primeBatch(shas []string) error {
+	objectIDWidth := 0
+	for _, sha := range shas {
+		if sha == "" {
+			continue
+		}
+		if !isCanonicalCommitSHA(sha) {
+			return fmt.Errorf("invalid co-commit SHA %q", sha)
+		}
+		if objectIDWidth == 0 {
+			objectIDWidth = len(sha)
+		} else if len(sha) != objectIDWidth {
+			return fmt.Errorf("mixed-width co-commit SHAs: got %d and %d characters", objectIDWidth, len(sha))
+		}
+	}
+	if objectIDWidth == 0 {
+		return nil
+	}
+	historyState := c.prepareMemoizedHistoryState()
 	if c.fileCache == nil {
 		c.fileCache = make(map[string][]FileChange)
 		c.statCache = make(map[string]map[string]lineStats)
@@ -213,16 +385,21 @@ func (c *CoCommitExtractor) primeBatch(shas []string) error {
 		return nil
 	}
 
-	// Persistent layer: a commit's (files, lineStats) is a pure function of
-	// (SHA, exclude-pathspec set) — see per_commit_cocommit_cache.go. Serve
+	// Persistent layer: within one repository namespace, a commit's
+	// (files, lineStats) is fixed by the SHA, the explicit Git diff policy, and
+	// the exclude-pathspec set — see per_commit_cocommit_cache.go. Serve
 	// SHAs already on disk straight into the in-memory maps and run the batched
 	// `git log` ONLY for SHAs missing from both memory and disk. A disk hit
-	// populates fileCache/statCache identically to the git path: Files in git
-	// (name-status) order, LineStats reconstructed exactly via fromLineStatsMap,
+	// populates fileCache/statCache identically to the git path: Files in stable
+	// path/action order, LineStats reconstructed exactly via fromLineStatsMap,
 	// and an empty diff memoized as nil files + empty stat map. So the in-memory
-	// maps are byte-identical regardless of how many SHAs came from disk.
-	namespace := perCommitCoCommitCacheNamespace()
-	disk := loadPerCommitCoCommit(namespace)
+	// maps are semantically identical regardless of how many SHAs came from disk.
+	namespace := perCommitCoCommitCacheNamespace(c.repoPath)
+	persistentCacheSafe := correlationDiskCacheEnabled() && historyState == coCommitHistoryStateFull
+	var disk map[string]perCommitCoCommitEntry
+	if persistentCacheSafe {
+		disk = loadPerCommitCoCommit(namespace)
+	}
 
 	missing := want
 	if disk != nil {
@@ -241,25 +418,32 @@ func (c *CoCommitExtractor) primeBatch(shas []string) error {
 		return nil
 	}
 
-	atomic.AddInt64(&coCommitFetchedSHAsCounter, int64(len(missing)))
-
-	files, err := c.batchFilesChanged(missing)
-	if err != nil {
-		return fmt.Errorf("batching co-commit name-status: %w", err)
-	}
-	stats, err := c.batchLineStats(missing)
-	if err != nil {
-		return fmt.Errorf("batching co-commit numstat: %w", err)
+	files := make(map[string][]FileChange, len(missing))
+	stats := make(map[string]map[string]lineStats, len(missing))
+	for _, batch := range coCommitSHABatches(missing) {
+		batchFiles, err := c.batchFilesChanged(batch)
+		if err != nil {
+			return fmt.Errorf("batching co-commit name-status: %w", err)
+		}
+		batchStats, err := c.batchLineStats(batch)
+		if err != nil {
+			return fmt.Errorf("batching co-commit numstat: %w", err)
+		}
+		atomic.AddInt64(&coCommitFetchedSHAsCounter, int64(len(batch)))
+		for sha, changed := range batchFiles {
+			files[sha] = changed
+		}
+		for sha, lineCounts := range batchStats {
+			stats[sha] = lineCounts
+		}
 	}
 
 	fresh := make(map[string]perCommitCoCommitEntry, len(missing))
 	now := time.Now().UTC()
 	for _, sha := range missing {
-		// files/stats maps only carry SHAs that appeared in the stream (i.e.
-		// produced a non-empty diff under the exclude pathspecs). Absent SHAs
-		// memoize as empty so future lookups hit the cache rather than re-forking
-		// git — matching the legacy per-commit path, where an empty diff yields an
-		// empty file list and the SHA contributes no correlated commit.
+		// Both strict batch parsers require a header for every requested SHA.
+		// A header with no following records is a verified empty diff, represented
+		// as nil files plus an empty stats map so future lookups do not re-fork Git.
 		c.fileCache[sha] = files[sha]
 		s, ok := stats[sha]
 		if !ok {
@@ -278,16 +462,44 @@ func (c *CoCommitExtractor) primeBatch(shas []string) error {
 	// Both git passes succeeded before any missing SHA was memoized, so a transient
 	// failure can neither masquerade as an empty diff nor poison a higher-level
 	// history artifact/report cache.
-	storePerCommitCoCommit(namespace, fresh)
+	if persistentCacheSafe && coCommitPersistentCacheSafe(c.ctx, c.repoPath) {
+		storePerCommitCoCommit(namespace, fresh)
+	}
 	return nil
+}
+
+func coCommitSHABatches(shas []string) [][]string {
+	if len(shas) == 0 {
+		return nil
+	}
+	batches := make([][]string, 0, (len(shas)+maxCoCommitSHAsPerGitCommand-1)/maxCoCommitSHAsPerGitCommand)
+	for start := 0; start < len(shas); start += maxCoCommitSHAsPerGitCommand {
+		end := min(start+maxCoCommitSHAsPerGitCommand, len(shas))
+		batches = append(batches, shas[start:end])
+	}
+	return batches
+}
+
+func isCanonicalCommitSHA(sha string) bool {
+	if len(sha) != 40 && len(sha) != 64 {
+		return false
+	}
+	for i := range len(sha) {
+		if (sha[i] < '0' || sha[i] > '9') && (sha[i] < 'a' || sha[i] > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // batchLogArgs builds `git log --no-walk=unsorted <diffFlag> --format=<header>
 // <SHAs> -- <exclude pathspecs>`, reusing the streaming-log header and exclude
 // helpers shared with the snapshot extractor.
 func batchLogArgs(diffFlag string, shas []string) []string {
-	args := make([]string, 0, len(shas)+8)
-	args = append(args, "log", "--no-walk=unsorted", diffFlag, "--format="+gitLogHeaderFormat)
+	args := make([]string, 0, len(shas)+24)
+	args = append(args, "log", "--no-walk=unsorted", "--sparse")
+	args = append(args, coCommitDiffArgs(diffFlag)...)
+	args = append(args, "--format="+coCommitBatchHeaderFormat, "--end-of-options")
 	args = append(args, shas...)
 	args = append(args, excludePathspecArgs()...)
 	return args
@@ -300,18 +512,16 @@ func batchLogArgs(diffFlag string, shas []string) []string {
 // were never actually inspected. A successful run with a genuinely-empty diff for
 // some SHA still returns no error (the empty result is correct and cacheable).
 func (c *CoCommitExtractor) batchFilesChanged(shas []string) (map[string][]FileChange, error) {
-	files := make(map[string][]FileChange, len(shas))
-
-	cmd := gitCommand(c.ctx, withNoColorGit(batchLogArgs("--name-status", shas))...)
-	cmd.Dir = c.repoPath
+	cmd := coCommitGitCommand(c.ctx, c.repoPath, batchLogArgs("--name-status", shas))
 	out, err := cmd.Output()
 	if err != nil {
-		return files, err
+		return nil, err
 	}
 
-	c.forEachCommitChunk(out, func(sha string, payload []byte) {
-		files[sha] = parseNameStatus(payload)
-	})
+	files, err := parseBatchNameStatus(out, shas)
+	if err != nil {
+		return nil, fmt.Errorf("parsing batched name-status: %w", err)
+	}
 	return files, nil
 }
 
@@ -319,175 +529,410 @@ func (c *CoCommitExtractor) batchFilesChanged(shas []string) (map[string][]FileC
 // line-stat maps using the same parsing as getLineStats. Like batchFilesChanged,
 // a git failure is surfaced as an error so the caller skips persisting empties.
 func (c *CoCommitExtractor) batchLineStats(shas []string) (map[string]map[string]lineStats, error) {
-	stats := make(map[string]map[string]lineStats, len(shas))
-
-	cmd := gitCommand(c.ctx, withNoColorGit(batchLogArgs("--numstat", shas))...)
-	cmd.Dir = c.repoPath
+	cmd := coCommitGitCommand(c.ctx, c.repoPath, batchLogArgs("--numstat", shas))
 	out, err := cmd.Output()
 	if err != nil {
-		return stats, err
+		return nil, err
 	}
 
-	c.forEachCommitChunk(out, func(sha string, payload []byte) {
-		stats[sha] = parseNumstat(payload)
-	})
+	stats, err := parseBatchNumstat(out, shas)
+	if err != nil {
+		return nil, fmt.Errorf("parsing batched numstat: %w", err)
+	}
 	return stats, nil
 }
 
-// forEachCommitChunk splits a `git log --format=<header>` stream into per-commit
-// chunks (the same boundary detection parseSnapshotLog uses) and invokes fn with
-// the commit SHA and the diff payload that follows its header line.
-func (c *CoCommitExtractor) forEachCommitChunk(out []byte, fn func(sha string, payload []byte)) {
-	locs := commitPattern.FindAllIndex(out, -1)
-	for i, loc := range locs {
-		start := loc[0]
-		end := len(out)
-		if i+1 < len(locs) {
-			end = locs[i+1][0]
-		}
-		chunk := out[start:end]
-
-		nl := bytes.IndexByte(chunk, '\n')
-		if nl < 0 {
-			continue
-		}
-		// The header is %H<NUL>... ; the SHA is the leading 40 hex chars.
-		header := chunk[:nl]
-		z := bytes.IndexByte(header, 0)
-		if z < 0 {
-			continue
-		}
-		sha := string(header[:z])
-		fn(sha, chunk[nl+1:])
+// coCommitRecordPadding skips only Git's formatting newlines between the
+// pretty-printed commit header and the first -z record (and between commits).
+// It is called only at record boundaries; path bytes, including leading or
+// trailing newlines, are consumed by the record parsers and never trimmed.
+func coCommitRecordPadding(data []byte, pos int) int {
+	for pos < len(data) && (data[pos] == '\n' || data[pos] == '\r') {
+		pos++
 	}
+	return pos
 }
 
-// parseNameStatus parses git name-status payload lines into FileChange entries.
-// Shared by getFilesChanged (per-commit `git show`) and the batched path.
-func parseNameStatus(payload []byte) []FileChange {
+// coCommitBatchPadding also accepts Git's optional NUL commit separator. This
+// is used only between fully consumed records; a missing path field is detected
+// inside parseNameStatusRecord/parseNumstatRecord before control returns here.
+func coCommitBatchPadding(data []byte, pos int) int {
+	for pos < len(data) && (data[pos] == 0 || data[pos] == '\n' || data[pos] == '\r') {
+		pos++
+	}
+	return pos
+}
+
+func parseCoCommitBatchHeader(data []byte, pos int) (string, int, bool) {
+	for _, objectIDLen := range [...]int{40, 64} {
+		headerLen := objectIDLen + 2
+		if len(data)-pos < headerLen || data[pos+objectIDLen] != 0 || data[pos+objectIDLen+1] != 0 {
+			continue
+		}
+		sha := string(data[pos : pos+objectIDLen])
+		if isCanonicalCommitSHA(sha) {
+			return sha, pos + headerLen, true
+		}
+	}
+	return "", pos, false
+}
+
+func expectedCoCommitSHAs(shas []string) map[string]struct{} {
+	expected := make(map[string]struct{}, len(shas))
+	for _, sha := range shas {
+		expected[sha] = struct{}{}
+	}
+	return expected
+}
+
+func validateCoCommitSHASet(shas []string) error {
+	objectIDWidth := 0
+	for _, sha := range shas {
+		if !isCanonicalCommitSHA(sha) {
+			return fmt.Errorf("invalid co-commit SHA %q", sha)
+		}
+		if objectIDWidth == 0 {
+			objectIDWidth = len(sha)
+		} else if len(sha) != objectIDWidth {
+			return fmt.Errorf("mixed-width co-commit SHAs: got %d and %d characters", objectIDWidth, len(sha))
+		}
+	}
+	return nil
+}
+
+func normalizedNameStatusAction(raw []byte) (string, error) {
+	if len(raw) == 0 || !strings.ContainsRune("ACDMRTUXB", rune(raw[0])) {
+		return "", fmt.Errorf("invalid name-status action %q", raw)
+	}
+	if len(raw) > 1 {
+		// Git documents a similarity score for R/C and may attach a
+		// dissimilarity score to M when rewrite detection is active.
+		if raw[0] != 'R' && raw[0] != 'C' && raw[0] != 'M' {
+			return "", fmt.Errorf("invalid name-status action %q", raw)
+		}
+		for _, digit := range raw[1:] {
+			if digit < '0' || digit > '9' {
+				return "", fmt.Errorf("invalid name-status action %q", raw)
+			}
+		}
+	}
+	return string(raw[0]), nil
+}
+
+func nextNULTerminatedField(data []byte, pos int, field string) ([]byte, int, error) {
+	if pos >= len(data) {
+		return nil, pos, fmt.Errorf("truncated %s", field)
+	}
+	relEnd := bytes.IndexByte(data[pos:], 0)
+	if relEnd < 0 {
+		return nil, pos, fmt.Errorf("unterminated %s", field)
+	}
+	end := pos + relEnd
+	return data[pos:end], end + 1, nil
+}
+
+func parseNameStatusRecord(data []byte, pos int) (FileChange, int, error) {
+	rawAction, next, err := nextNULTerminatedField(data, pos, "name-status action")
+	if err != nil {
+		return FileChange{}, pos, err
+	}
+	action, err := normalizedNameStatusAction(rawAction)
+	if err != nil {
+		return FileChange{}, pos, err
+	}
+
+	oldPath, next, err := nextNULTerminatedField(data, next, "name-status path")
+	if err != nil {
+		return FileChange{}, pos, err
+	}
+	if len(oldPath) == 0 {
+		return FileChange{}, pos, fmt.Errorf("empty name-status path for action %q", rawAction)
+	}
+	path := oldPath
+	if action == "R" || action == "C" {
+		path, next, err = nextNULTerminatedField(data, next, "name-status post-image path")
+		if err != nil {
+			return FileChange{}, pos, err
+		}
+		if len(path) == 0 {
+			return FileChange{}, pos, fmt.Errorf("empty name-status post-image path for action %q", rawAction)
+		}
+	}
+
+	return FileChange{Path: string(path), Action: action}, next, nil
+}
+
+func sortFileChanges(files []FileChange) {
+	sort.SliceStable(files, func(i, j int) bool {
+		if files[i].Path == files[j].Path {
+			return files[i].Action < files[j].Action
+		}
+		return files[i].Path < files[j].Path
+	})
+}
+
+// parseNameStatus parses `git --name-status -z` output. Git uses NUL for every
+// field boundary, so paths are returned byte-for-byte without core.quotePath
+// quoting and may safely contain tabs or newlines.
+func parseNameStatus(payload []byte) ([]FileChange, error) {
 	var files []FileChange
-	scanner := bufio.NewScanner(bytes.NewReader(payload))
-	scanner.Buffer(make([]byte, 64*1024), gitLogMaxScanTokenSize)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			continue
+	for pos := 0; ; {
+		pos = coCommitRecordPadding(payload, pos)
+		if pos == len(payload) {
+			break
 		}
-
-		// Format: "M\tpath/to/file" or "R100\told\tnew"
-		parts := strings.Split(line, "\t")
-		if len(parts) < 2 {
-			continue
+		file, next, err := parseNameStatusRecord(payload, pos)
+		if err != nil {
+			return nil, err
 		}
-
-		action := parts[0]
-		path := parts[1]
-
-		// Handle renames: R100\told\tnew
-		if len(parts) == 3 && strings.HasPrefix(action, "R") {
-			path = parts[2] // Use new name
-			action = "R"
-		}
-
-		// Normalize action to single char
-		if len(action) > 1 {
-			action = string(action[0])
-		}
-
-		files = append(files, FileChange{
-			Path:   path,
-			Action: action,
-		})
+		files = append(files, file)
+		pos = next
 	}
-	return files
+	sortFileChanges(files)
+	return files, nil
 }
 
-// parseNumstat parses git numstat payload lines into a per-path lineStats map.
-// Shared by getLineStats (per-commit `git show`) and the batched path.
-func parseNumstat(payload []byte) map[string]lineStats {
-	stats := make(map[string]lineStats)
-	scanner := bufio.NewScanner(bytes.NewReader(payload))
-	scanner.Buffer(make([]byte, 64*1024), gitLogMaxScanTokenSize)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
+func parseBatchNameStatus(out []byte, shas []string) (map[string][]FileChange, error) {
+	if err := validateCoCommitSHASet(shas); err != nil {
+		return nil, err
+	}
+	files := make(map[string][]FileChange, len(shas))
+	expected := expectedCoCommitSHAs(shas)
+	seenHeaders := make(map[string]struct{}, len(shas))
+	currentSHA := ""
+
+	for pos := 0; ; {
+		pos = coCommitBatchPadding(out, pos)
+		if pos == len(out) {
+			break
+		}
+		if sha, next, ok := parseCoCommitBatchHeader(out, pos); ok {
+			if _, ok := expected[sha]; !ok {
+				return nil, fmt.Errorf("unexpected commit header %s", sha)
+			}
+			if _, duplicate := seenHeaders[sha]; duplicate {
+				return nil, fmt.Errorf("duplicate commit header %s", sha)
+			}
+			seenHeaders[sha] = struct{}{}
+			currentSHA = sha
+			files[sha] = nil
+			pos = next
 			continue
 		}
-
-		// Format: "42\t10\tpath/to/file" or "-\t-\tbinary/file"
-		parts := strings.Split(line, "\t")
-		if len(parts) < 3 {
-			continue
+		if currentSHA == "" {
+			return nil, fmt.Errorf("name-status record before commit header at byte %d", pos)
 		}
-
-		insertions := 0
-		deletions := 0
-
-		// Binary files show "-" instead of numbers
-		if parts[0] != "-" {
-			insertions, _ = strconv.Atoi(parts[0])
+		file, next, err := parseNameStatusRecord(out, pos)
+		if err != nil {
+			return nil, fmt.Errorf("commit %s: %w", currentSHA, err)
 		}
-		if parts[1] != "-" {
-			deletions, _ = strconv.Atoi(parts[1])
-		}
-
-		// Handle renames: path might be "old => new" format
-		path := parts[2]
-		if strings.Contains(path, " => ") {
-			// Extract new path from "old => new" or "{old => new}" format
-			path = extractNewPath(path)
-		}
-
-		stats[path] = lineStats{
-			insertions: insertions,
-			deletions:  deletions,
+		files[currentSHA] = append(files[currentSHA], file)
+		pos = next
+	}
+	for sha := range files {
+		sortFileChanges(files[sha])
+	}
+	for _, sha := range shas {
+		if _, seen := seenHeaders[sha]; !seen {
+			return nil, fmt.Errorf("missing commit header %s", sha)
 		}
 	}
-	return stats
+	return files, nil
+}
+
+func parseNumstatCount(raw []byte, field string) (int, error) {
+	if bytes.Equal(raw, []byte("-")) {
+		return 0, nil
+	}
+	if len(raw) == 0 {
+		return 0, fmt.Errorf("empty numstat %s", field)
+	}
+	for _, digit := range raw {
+		if digit < '0' || digit > '9' {
+			return 0, fmt.Errorf("invalid numstat %s %q", field, raw)
+		}
+	}
+	value, err := strconv.Atoi(string(raw))
+	if err != nil {
+		return 0, fmt.Errorf("invalid numstat %s %q: %w", field, raw, err)
+	}
+	return value, nil
+}
+
+func parseNumstatRecord(data []byte, pos int) (string, lineStats, int, error) {
+	firstTab := bytes.IndexByte(data[pos:], '\t')
+	if firstTab < 0 {
+		return "", lineStats{}, pos, fmt.Errorf("unterminated numstat insertion count")
+	}
+	firstTab += pos
+	secondTab := bytes.IndexByte(data[firstTab+1:], '\t')
+	if secondTab < 0 {
+		return "", lineStats{}, pos, fmt.Errorf("unterminated numstat deletion count")
+	}
+	secondTab += firstTab + 1
+
+	insertions, err := parseNumstatCount(data[pos:firstTab], "insertion count")
+	if err != nil {
+		return "", lineStats{}, pos, err
+	}
+	deletions, err := parseNumstatCount(data[firstTab+1:secondTab], "deletion count")
+	if err != nil {
+		return "", lineStats{}, pos, err
+	}
+
+	pathStart := secondTab + 1
+	if pathStart >= len(data) {
+		return "", lineStats{}, pos, fmt.Errorf("truncated numstat path")
+	}
+	var path []byte
+	var next int
+	if data[pathStart] == 0 {
+		// Under -z, rename/copy numstat records encode an empty path field,
+		// followed by separately NUL-terminated pre-image and post-image paths.
+		oldPath, afterOld, fieldErr := nextNULTerminatedField(data, pathStart+1, "numstat pre-image path")
+		if fieldErr != nil {
+			return "", lineStats{}, pos, fieldErr
+		}
+		if len(oldPath) == 0 {
+			return "", lineStats{}, pos, fmt.Errorf("empty numstat pre-image path")
+		}
+		path, next, fieldErr = nextNULTerminatedField(data, afterOld, "numstat post-image path")
+		if fieldErr != nil {
+			return "", lineStats{}, pos, fieldErr
+		}
+	} else {
+		path, next, err = nextNULTerminatedField(data, pathStart, "numstat path")
+		if err != nil {
+			return "", lineStats{}, pos, err
+		}
+	}
+	if len(path) == 0 {
+		return "", lineStats{}, pos, fmt.Errorf("empty numstat path")
+	}
+	return string(path), lineStats{insertions: insertions, deletions: deletions}, next, nil
+}
+
+// parseNumstat parses `git --numstat -z` output into a per-path lineStats map.
+func parseNumstat(payload []byte) (map[string]lineStats, error) {
+	stats := make(map[string]lineStats)
+	for pos := 0; ; {
+		pos = coCommitRecordPadding(payload, pos)
+		if pos == len(payload) {
+			break
+		}
+		path, counts, next, err := parseNumstatRecord(payload, pos)
+		if err != nil {
+			return nil, err
+		}
+		stats[path] = counts
+		pos = next
+	}
+	return stats, nil
+}
+
+func parseBatchNumstat(out []byte, shas []string) (map[string]map[string]lineStats, error) {
+	if err := validateCoCommitSHASet(shas); err != nil {
+		return nil, err
+	}
+	stats := make(map[string]map[string]lineStats, len(shas))
+	expected := expectedCoCommitSHAs(shas)
+	seenHeaders := make(map[string]struct{}, len(shas))
+	currentSHA := ""
+
+	for pos := 0; ; {
+		pos = coCommitBatchPadding(out, pos)
+		if pos == len(out) {
+			break
+		}
+		if sha, next, ok := parseCoCommitBatchHeader(out, pos); ok {
+			if _, ok := expected[sha]; !ok {
+				return nil, fmt.Errorf("unexpected commit header %s", sha)
+			}
+			if _, duplicate := seenHeaders[sha]; duplicate {
+				return nil, fmt.Errorf("duplicate commit header %s", sha)
+			}
+			seenHeaders[sha] = struct{}{}
+			currentSHA = sha
+			stats[sha] = make(map[string]lineStats)
+			pos = next
+			continue
+		}
+		if currentSHA == "" {
+			return nil, fmt.Errorf("numstat record before commit header at byte %d", pos)
+		}
+		path, counts, next, err := parseNumstatRecord(out, pos)
+		if err != nil {
+			return nil, fmt.Errorf("commit %s: %w", currentSHA, err)
+		}
+		stats[currentSHA][path] = counts
+		pos = next
+	}
+	for _, sha := range shas {
+		if _, seen := seenHeaders[sha]; !seen {
+			return nil, fmt.Errorf("missing commit header %s", sha)
+		}
+	}
+	return stats, nil
 }
 
 // getFilesChanged returns the name-status file list for a commit. When the SHA
 // was primed via primeBatch it is served from the in-memory cache; otherwise it
 // falls back to a per-commit `git show --name-status`.
 func (c *CoCommitExtractor) getFilesChanged(sha string) ([]FileChange, error) {
+	if !isCanonicalCommitSHA(sha) {
+		return nil, fmt.Errorf("invalid co-commit SHA %q", sha)
+	}
 	if c.fileCache != nil {
 		if _, ok := c.batchedSHAs[sha]; ok {
 			return c.fileCache[sha], nil
 		}
 	}
 
-	gitArgs := append([]string{"show", "--name-status", "--format=", sha}, excludePathspecArgs()...)
-	cmd := gitCommand(c.ctx, gitArgs...)
-	cmd.Dir = c.repoPath
+	gitArgs := append([]string{"show"}, coCommitDiffArgs("--name-status")...)
+	gitArgs = append(gitArgs, "--format=", "--end-of-options", sha)
+	gitArgs = append(gitArgs, excludePathspecArgs()...)
+	cmd := coCommitGitCommand(c.ctx, c.repoPath, gitArgs)
 
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("git show --name-status failed: %w", err)
 	}
 
-	return parseNameStatus(out), nil
+	files, err := parseNameStatus(out)
+	if err != nil {
+		return nil, fmt.Errorf("parsing git show --name-status: %w", err)
+	}
+	return files, nil
 }
 
 // getLineStats returns insertion/deletion counts per file for a commit. When the
 // SHA was primed via primeBatch it is served from the in-memory cache; otherwise
 // it falls back to a per-commit `git show --numstat`.
 func (c *CoCommitExtractor) getLineStats(sha string) (map[string]lineStats, error) {
+	if !isCanonicalCommitSHA(sha) {
+		return nil, fmt.Errorf("invalid co-commit SHA %q", sha)
+	}
 	if c.statCache != nil {
 		if _, ok := c.batchedSHAs[sha]; ok {
 			return c.statCache[sha], nil
 		}
 	}
 
-	gitArgs := append([]string{"show", "--numstat", "--format=", sha}, excludePathspecArgs()...)
-	cmd := gitCommand(c.ctx, gitArgs...)
-	cmd.Dir = c.repoPath
+	gitArgs := append([]string{"show"}, coCommitDiffArgs("--numstat")...)
+	gitArgs = append(gitArgs, "--format=", "--end-of-options", sha)
+	gitArgs = append(gitArgs, excludePathspecArgs()...)
+	cmd := coCommitGitCommand(c.ctx, c.repoPath, gitArgs)
 
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("git show --numstat failed: %w", err)
 	}
 
-	return parseNumstat(out), nil
+	stats, err := parseNumstat(out)
+	if err != nil {
+		return nil, fmt.Errorf("parsing git show --numstat: %w", err)
+	}
+	return stats, nil
 }
 
 // extractNewPath handles git's rename notation in numstat output
@@ -600,12 +1045,43 @@ func isExcludedPath(path string) bool {
 	return false
 }
 
-// containsBeadID checks if text contains the bead ID
+// containsBeadID reports an exact, case-insensitive bead-ID token. A raw
+// substring match would treat bv-42 as an explicit reference inside bv-420 and
+// incorrectly increase the correlation confidence.
 func containsBeadID(text, beadID string) bool {
 	if beadID == "" {
 		return false
 	}
-	return strings.Contains(strings.ToLower(text), strings.ToLower(beadID))
+	lowerText := strings.ToLower(text)
+	lowerID := strings.ToLower(beadID)
+	for searchFrom := 0; searchFrom <= len(lowerText)-len(lowerID); {
+		relative := strings.Index(lowerText[searchFrom:], lowerID)
+		if relative < 0 {
+			return false
+		}
+		start := searchFrom + relative
+		end := start + len(lowerID)
+
+		beforeIsID := false
+		if start > 0 {
+			r, _ := utf8.DecodeLastRuneInString(lowerText[:start])
+			beforeIsID = isBeadIDRune(r)
+		}
+		afterIsID := false
+		if end < len(lowerText) {
+			r, _ := utf8.DecodeRuneInString(lowerText[end:])
+			afterIsID = isBeadIDRune(r)
+		}
+		if !beforeIsID && !afterIsID {
+			return true
+		}
+		searchFrom = start + 1
+	}
+	return false
+}
+
+func isBeadIDRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsNumber(r) || r == '-' || r == '_' || r == '.'
 }
 
 // allTestFiles returns true if all files are test files
@@ -642,6 +1118,9 @@ func shortSHA(sha string) string {
 
 // ExtractAllCoCommits extracts co-committed files for all events with status changes
 func (c *CoCommitExtractor) ExtractAllCoCommits(events []BeadEvent) ([]CorrelatedCommit, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	var commits []CorrelatedCommit
 	fileCache := make(map[string][]FileChange) // Cache file lookups by SHA
 
@@ -659,6 +1138,12 @@ func (c *CoCommitExtractor) ExtractAllCoCommits(events []BeadEvent) ([]Correlate
 	if err := c.primeBatch(batchSHAs); err != nil {
 		return nil, fmt.Errorf("priming co-commit batch: %w", err)
 	}
+	if c.memoizedHistoryState != coCommitHistoryStateFull {
+		// Unsafe-state memoization is useful only inside this one extraction.
+		// Discard it before a future invocation can observe a moved shallow
+		// boundary with the same commit SHA.
+		defer c.resetMemoizedDiffs()
+	}
 
 	for _, event := range events {
 		// Only process status change events
@@ -670,7 +1155,7 @@ func (c *CoCommitExtractor) ExtractAllCoCommits(events []BeadEvent) ([]Correlate
 		files, cached := fileCache[event.CommitSHA]
 		if !cached {
 			var err error
-			files, err = c.ExtractCoCommittedFiles(event)
+			files, err = c.extractCoCommittedFiles(event)
 			if err != nil {
 				return nil, fmt.Errorf("extracting co-committed files for %s: %w", event.CommitSHA, err)
 			}

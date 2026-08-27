@@ -1,7 +1,11 @@
 package correlation
 
 import (
+	"context"
+	"errors"
+	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -9,6 +13,43 @@ import (
 func TestIncrementalThreshold(t *testing.T) {
 	if IncrementalThreshold != 100 {
 		t.Errorf("IncrementalThreshold = %d, want 100", IncrementalThreshold)
+	}
+}
+
+func TestIncrementalOptionsSupportedOnlyForUnboundedAllHistory(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name string
+		opts CorrelatorOptions
+		want bool
+	}{
+		{name: "all history", want: true},
+		{name: "bead filter", opts: CorrelatorOptions{BeadID: "bv-1"}},
+		{name: "since", opts: CorrelatorOptions{Since: &now}},
+		{name: "until", opts: CorrelatorOptions{Until: &now}},
+		{name: "limit", opts: CorrelatorOptions{Limit: 10}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := incrementalOptionsSupported(tt.opts); got != tt.want {
+				t.Fatalf("incrementalOptionsSupported()=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIncrementalCorrelatorWithContextNilReceiverIsSafe(t *testing.T) {
+	var correlator *IncrementalCorrelator
+	if got := correlator.WithContext(context.Background()); got != nil {
+		t.Fatalf("nil receiver returned %p, want nil", got)
+	}
+}
+
+func TestBuildCacheKeyContextHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := buildCacheKeyContext(ctx, initTempGitRepo(t), nil, CorrelatorOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled cache-key lookup error = %v, want context.Canceled", err)
 	}
 }
 
@@ -145,12 +186,12 @@ func TestMergeReports_Basic(t *testing.T) {
 	merged := mergeReports(existing, beads, newEvents, nil)
 
 	// Check merged report
-	if merged.DataHash != existing.DataHash {
-		t.Errorf("DataHash changed: %s != %s", merged.DataHash, existing.DataHash)
+	if want := hashBeads(beads); merged.DataHash != want {
+		t.Errorf("DataHash = %s, want current bead hash %s", merged.DataHash, want)
 	}
 
-	if merged.GitRange != "abc123..def456 (incremental)" {
-		t.Errorf("GitRange = %s, want 'abc123..def456 (incremental)'", merged.GitRange)
+	if merged.GitRange != existing.GitRange {
+		t.Errorf("GitRange = %s, want stable range %q", merged.GitRange, existing.GitRange)
 	}
 
 	// Check merged history
@@ -439,6 +480,72 @@ func TestMergeReports_MilestonesRecalculated(t *testing.T) {
 	}
 }
 
+func TestMergeReportsUpdatesLastAuthorFromLifecycleEvent(t *testing.T) {
+	existing := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-1": {
+			BeadID:     "bv-1",
+			LastAuthor: "Old Author",
+			Events:     []BeadEvent{{BeadID: "bv-1", Author: "Old Author"}},
+		},
+	}}
+	beads := []BeadInfo{{ID: "bv-1"}}
+	newEvents := []BeadEvent{{BeadID: "bv-1", Author: "New Author", EventType: EventModified}}
+
+	merged := mergeReports(existing, beads, newEvents, nil)
+	if got := merged.Histories["bv-1"].LastAuthor; got != "New Author" {
+		t.Fatalf("LastAuthor=%q, want lifecycle event author", got)
+	}
+}
+
+func TestMergeReportsDoesNotLetOlderCommitOverrideNewerLifecycleAuthor(t *testing.T) {
+	now := time.Now()
+	existing := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-1": {
+			BeadID:  "bv-1",
+			Commits: []CorrelatedCommit{{SHA: "old", Author: "Code Author", Timestamp: now.Add(-2 * time.Hour)}},
+		},
+	}}
+	newEvents := []BeadEvent{{
+		BeadID:    "bv-1",
+		Author:    "Lifecycle Author",
+		EventType: EventModified,
+		Timestamp: now,
+	}}
+
+	merged := mergeReports(existing, []BeadInfo{{ID: "bv-1"}}, newEvents, nil)
+	if got := merged.Histories["bv-1"].LastAuthor; got != "Lifecycle Author" {
+		t.Fatalf("LastAuthor=%q, want newer lifecycle author", got)
+	}
+}
+
+func TestMergeReportsDoesNotAliasCachedHistoryInternals(t *testing.T) {
+	event := BeadEvent{BeadID: "bv-1", EventType: EventCreated, Author: "Original"}
+	file := FileChange{Path: "original.go"}
+	existing := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-1": {
+			BeadID:     "bv-1",
+			Events:     []BeadEvent{event},
+			Milestones: GetBeadMilestones([]BeadEvent{event}),
+			Commits:    []CorrelatedCommit{{SHA: "abc", Files: []FileChange{file}}},
+		},
+	}}
+
+	merged := mergeReports(existing, []BeadInfo{{ID: "bv-1"}}, nil, nil)
+	history := merged.Histories["bv-1"]
+	history.Events[0].Author = "Changed"
+	history.Commits[0].Files[0].Path = "changed.go"
+
+	if got := existing.Histories["bv-1"].Events[0].Author; got != "Original" {
+		t.Fatalf("cached event was mutated through merged report: %q", got)
+	}
+	if got := existing.Histories["bv-1"].Commits[0].Files[0].Path; got != "original.go" {
+		t.Fatalf("cached file change was mutated through merged report: %q", got)
+	}
+	if history.Milestones.Created == existing.Histories["bv-1"].Milestones.Created {
+		t.Fatal("merged milestone still aliases cached report milestone")
+	}
+}
+
 func TestIncrementalUpdateResult_Fields(t *testing.T) {
 	result := IncrementalUpdateResult{
 		Report:            &HistoryReport{},
@@ -484,6 +591,255 @@ func TestCanUpdateIncrementally_EmptySHA(t *testing.T) {
 	}
 	if err != nil {
 		t.Errorf("Should not return error for empty SHA, got %v", err)
+	}
+}
+
+func TestGetCommitsBetweenPinsThroughAndRejectsDivergence(t *testing.T) {
+	repo := initTempGitRepo(t)
+	base, err := getGitHead(repo)
+	if err != nil {
+		t.Fatalf("resolve base HEAD: %v", err)
+	}
+
+	advanceGitHead(t, repo, "first")
+	first, err := getGitHead(repo)
+	if err != nil {
+		t.Fatalf("resolve first HEAD: %v", err)
+	}
+	advanceGitHead(t, repo, "second")
+	second, err := getGitHead(repo)
+	if err != nil {
+		t.Fatalf("resolve second HEAD: %v", err)
+	}
+
+	commits, err := getCommitsBetween(context.Background(), repo, base, first)
+	if err != nil {
+		t.Fatalf("get pinned commit range: %v", err)
+	}
+	if len(commits) != 1 || commits[0] != first {
+		t.Fatalf("pinned range = %v, want only %s (current HEAD is %s)", commits, first, second)
+	}
+	if count, err := countCommitsBetween(context.Background(), repo, base, first); err != nil || count != 1 {
+		t.Fatalf("pinned count = %d, %v; want 1, nil", count, err)
+	}
+
+	runGit(t, repo, "checkout", "--detach", base)
+	advanceGitHead(t, repo, "diverged")
+	diverged, err := getGitHead(repo)
+	if err != nil {
+		t.Fatalf("resolve diverged HEAD: %v", err)
+	}
+	if _, err := getCommitsBetween(context.Background(), repo, first, diverged); err == nil {
+		t.Fatal("diverged cached commit was accepted as an incremental base")
+	}
+}
+
+func TestIncrementalReportMatchesFullReportAfterMetadataChange(t *testing.T) {
+	repo := initTempGitRepo(t)
+	t.Setenv("BV_NO_CACHE", "1")
+	t.Setenv("BV_ROBOT", "1")
+
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	writeBeads := func(content, message string) {
+		t.Helper()
+		if err := os.WriteFile(beadsPath, []byte(content), 0o644); err != nil {
+			t.Fatalf("write beads fixture: %v", err)
+		}
+		runGit(t, repo, "add", ".beads/issues.jsonl")
+		runGit(t, repo, "commit", "-m", message)
+	}
+
+	writeBeads("{\"id\":\"bv-1\",\"title\":\"Original\",\"status\":\"open\"}\n", "create bead")
+	ic := NewIncrementalCorrelator(repo)
+	initialBeads := []BeadInfo{{ID: "bv-1", Title: "Original", Status: "open"}}
+	initial, err := ic.GenerateReportWithDetails(initialBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("initial full report: %v", err)
+	}
+	if initial.WasIncremental {
+		t.Fatal("initial report unexpectedly incremental")
+	}
+
+	writeBeads("{\"id\":\"bv-1\",\"title\":\"Renamed\",\"status\":\"in_progress\"}\n", "claim bead")
+	currentBeads := []BeadInfo{{ID: "bv-1", Title: "Renamed", Status: "in_progress"}}
+	incremental, err := ic.GenerateReportWithDetails(currentBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("incremental report: %v", err)
+	}
+	if !incremental.WasIncremental || incremental.NewCommitCount != 1 {
+		t.Fatalf("update details = %+v, want one-commit incremental update", incremental)
+	}
+
+	full, err := NewCorrelator(repo).GenerateReport(currentBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("comparison full report: %v", err)
+	}
+	got := *incremental.Report
+	want := *full
+	got.GeneratedAt = time.Time{}
+	want.GeneratedAt = time.Time{}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("incremental report differs from full rebuild:\n incremental=%+v\n full=%+v", got, want)
+	}
+}
+
+func TestIncrementalRenameFallsBackAndMatchesFullHistory(t *testing.T) {
+	repo := initTempGitRepo(t)
+	t.Setenv("BV_NO_CACHE", "1")
+	t.Setenv("BV_ROBOT", "1")
+
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	legacyPath := filepath.Join(beadsDir, "beads.jsonl")
+	writeLegacy := func(status, message string) {
+		t.Helper()
+		content := "{\"id\":\"bv-rename\",\"title\":\"Rename\",\"status\":\"" + status + "\"}\n"
+		if err := os.WriteFile(legacyPath, []byte(content), 0o644); err != nil {
+			t.Fatalf("write legacy beads state %q: %v", status, err)
+		}
+		runGit(t, repo, "add", ".beads/beads.jsonl")
+		runGit(t, repo, "commit", "-m", message)
+	}
+
+	writeLegacy("open", "create rename fixture bead")
+	baseSHA, err := getGitHead(repo)
+	if err != nil {
+		t.Fatalf("resolve incremental base: %v", err)
+	}
+	openBeads := []BeadInfo{{ID: "bv-rename", Title: "Rename", Status: "open"}}
+	baseReport, err := NewCorrelator(repo).GenerateReport(openBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("generate base report: %v", err)
+	}
+
+	// The lifecycle transition occurs on the legacy path before that path is
+	// renamed. A current-path --no-walk query for issues.jsonl cannot see the
+	// transition commit, while a full --follow extraction can.
+	writeLegacy("closed", "close bead on legacy path")
+	runGit(t, repo, "mv", ".beads/beads.jsonl", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "rename beads database")
+
+	closedBeads := []BeadInfo{{ID: "bv-rename", Title: "Rename", Status: "closed"}}
+	ic := NewIncrementalCorrelator(repo)
+	if got := ic.correlator.extractor.primaryBeadsFile(); got != ".beads/issues.jsonl" {
+		t.Fatalf("current primary Beads path=%q, want issues.jsonl", got)
+	}
+	currentKey, err := buildCacheKeyContext(context.Background(), repo, closedBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("build current cache key: %v", err)
+	}
+	baseKey := currentKey
+	baseKey.HeadSHA = baseSHA
+	ic.cache.Put(baseKey, baseReport)
+
+	result, err := ic.GenerateReportWithDetails(closedBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("generate report across rename: %v", err)
+	}
+	if result.WasIncremental {
+		t.Fatalf("rename range used unsafe incremental extraction: %+v", result)
+	}
+
+	full, err := NewCorrelator(repo).GenerateReport(closedBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("comparison full report: %v", err)
+	}
+	got := *result.Report
+	want := *full
+	got.GeneratedAt = time.Time{}
+	want.GeneratedAt = time.Time{}
+	// IncrementalCorrelator records the exact processed HEAD as its cache cursor;
+	// a plain full report records the newest lifecycle-event SHA instead.
+	want.LatestCommitSHA = got.LatestCommitSHA
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rename fallback differs from full rebuild:\n got=%+v\nwant=%+v", got, want)
+	}
+	history := got.Histories["bv-rename"]
+	if len(history.Events) != 2 || history.Events[0].EventType != EventCreated || history.Events[1].EventType != EventClosed {
+		t.Fatalf("rename fallback lost legacy-path lifecycle event: %+v", history.Events)
+	}
+}
+
+func TestIncrementalCorrelatorBypassesShallowCacheAcrossSameHeadDeepen(t *testing.T) {
+	t.Setenv("BV_NO_CACHE", "1")
+	t.Setenv("BV_ROBOT", "1")
+
+	source := initTempGitRepo(t)
+	beadsDir := filepath.Join(source, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create beads directory: %v", err)
+	}
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	writeState := func(status, message string) {
+		t.Helper()
+		content := "{\"id\":\"bv-shallow\",\"title\":\"Shallow\",\"status\":\"" + status + "\"}\n"
+		if err := os.WriteFile(beadsPath, []byte(content), 0o644); err != nil {
+			t.Fatalf("write beads state %q: %v", status, err)
+		}
+		runGit(t, source, "add", ".beads/issues.jsonl")
+		runGit(t, source, "commit", "-m", message)
+	}
+	writeState("open", "create shallow fixture bead")
+	writeState("closed", "close shallow fixture bead")
+
+	shallow := cloneShallowRepoForCacheTest(t, source)
+	headBefore, err := getGitHead(shallow)
+	if err != nil {
+		t.Fatalf("resolve shallow HEAD: %v", err)
+	}
+	ic := NewIncrementalCorrelator(shallow)
+	beads := []BeadInfo{{ID: "bv-shallow", Title: "Shallow", Status: "closed"}}
+
+	for i := 0; i < 2; i++ {
+		result, reportErr := ic.GenerateReportWithDetails(beads, CorrelatorOptions{})
+		if reportErr != nil {
+			t.Fatalf("shallow report %d: %v", i+1, reportErr)
+		}
+		if result.WasIncremental || result.RefreshReason != "repository history is shallow or unavailable" {
+			t.Fatalf("shallow report %d details=%+v", i+1, result)
+		}
+	}
+	if ic.cache.Size() != 0 {
+		t.Fatalf("incremental cache retained %d shallow reports", ic.cache.Size())
+	}
+
+	runGit(t, shallow, "fetch", "--unshallow", "origin")
+	if headAfter, headErr := getGitHead(shallow); headErr != nil || headAfter != headBefore {
+		t.Fatalf("deepen changed HEAD: before=%q after=%q error=%v", headBefore, headAfter, headErr)
+	}
+	full, err := ic.GenerateReportWithDetails(beads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("full-history report after deepen: %v", err)
+	}
+	if full.WasIncremental {
+		t.Fatalf("first post-deepen report unexpectedly used cache/incremental path: %+v", full)
+	}
+	history := full.Report.Histories["bv-shallow"]
+	foundClosed := false
+	for _, event := range history.Events {
+		if event.EventType == EventClosed {
+			foundClosed = true
+		}
+	}
+	if !foundClosed {
+		t.Fatalf("post-deepen report served incomplete shallow history: %+v", history)
+	}
+	if ic.cache.Size() != 1 {
+		t.Fatalf("full-history report was not cached; size=%d", ic.cache.Size())
+	}
+
+	hit, err := ic.GenerateReportWithDetails(beads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("full-history cache hit: %v", err)
+	}
+	if !hit.WasIncremental || hit.NewCommitCount != 0 || hit.Report != full.Report {
+		t.Fatalf("post-deepen exact hit=%+v, want cached full-history report", hit)
 	}
 }
 

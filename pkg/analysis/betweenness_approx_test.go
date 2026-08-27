@@ -66,6 +66,9 @@ func TestApproxBetweenness_EmptyGraph(t *testing.T) {
 	if result.TotalNodes != 0 {
 		t.Errorf("Expected 0 nodes, got %d", result.TotalNodes)
 	}
+	if result.SampleSize != 0 {
+		t.Errorf("Expected 0 sampled pivots, got %d", result.SampleSize)
+	}
 }
 
 func TestApproxBetweenness_ZeroSampleSize(t *testing.T) {
@@ -109,6 +112,7 @@ func TestRecommendSampleSize(t *testing.T) {
 		maxExpected int
 	}{
 		{50, 100, 50, 50},       // Small: use full
+		{-1, 0, 0, 0},           // Invalid negative node count: no pivots
 		{100, 200, 50, 100},     // Medium: 20% sample
 		{500, 1000, 100, 100},   // Large: fixed sample
 		{2000, 5000, 200, 200},  // XL: larger fixed sample

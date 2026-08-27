@@ -104,10 +104,6 @@ func TestWorkflow_NewProjectSetup(t *testing.T) {
 func TestWorkflow_TriageAndRecommendations(t *testing.T) {
 	bv := buildBvBinary(t)
 	projectDir := t.TempDir()
-	beadsDir := filepath.Join(projectDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("mkdir failed: %v", err)
-	}
 
 	// Create a project with mixed priorities and dependencies
 	issues := `{"id": "EPIC-1", "title": "Epic: Feature X", "status": "open", "priority": 0, "issue_type": "epic"}
@@ -115,9 +111,7 @@ func TestWorkflow_TriageAndRecommendations(t *testing.T) {
 {"id": "TASK-2", "title": "Medium Task", "status": "open", "priority": 2, "issue_type": "task", "dependencies": [{"depends_on_id": "TASK-1", "type": "blocks"}]}
 {"id": "TASK-3", "title": "Low Priority Task", "status": "open", "priority": 3, "issue_type": "task", "dependencies": [{"depends_on_id": "TASK-2", "type": "blocks"}]}
 {"id": "BUG-1", "title": "Critical Bug", "status": "open", "priority": 0, "issue_type": "bug"}`
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(issues), 0644); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
+	writeBeads(t, projectDir, issues)
 
 	// Step 1: Get triage recommendations
 	cmd := exec.Command(bv, "--robot-triage")

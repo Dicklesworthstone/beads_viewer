@@ -3,7 +3,9 @@ package datasource
 import (
 	"database/sql"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +27,7 @@ func TestDiscoverSources_OnlySQLite(t *testing.T) {
 	createTestSQLiteDB(t, dbPath)
 
 	sources, err := DiscoverSources(DiscoveryOptions{
+		RepoPath:               filepath.Dir(beadsDir),
 		BeadsDir:               beadsDir,
 		ValidateAfterDiscovery: false,
 	})
@@ -142,6 +145,164 @@ func TestDiscoverSources_Multiple(t *testing.T) {
 	}
 }
 
+func TestDiscoverSourcesUsesSQLiteWALFreshness(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+	dbPath := filepath.Join(beadsDir, "beads.db")
+	createTestSQLiteDB(t, dbPath)
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(`{"id":"JSONL-1","title":"Export","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write JSONL: %v", err)
+	}
+	walPath := dbPath + "-wal"
+	if err := os.WriteFile(walPath, []byte("pending WAL bytes"), 0o644); err != nil {
+		t.Fatalf("write WAL marker: %v", err)
+	}
+	oldest := time.Date(2026, 8, 26, 10, 0, 0, 0, time.UTC)
+	middle := oldest.Add(time.Hour)
+	newest := middle.Add(time.Hour)
+	for path, timestamp := range map[string]time.Time{
+		dbPath:    oldest,
+		jsonlPath: middle,
+		walPath:   newest,
+	} {
+		if err := os.Chtimes(path, timestamp, timestamp); err != nil {
+			t.Fatalf("set mtime for %s: %v", path, err)
+		}
+	}
+
+	sources, err := DiscoverSources(DiscoveryOptions{
+		BeadsDir:               beadsDir,
+		ValidateAfterDiscovery: false,
+	})
+	if err != nil {
+		t.Fatalf("DiscoverSources: %v", err)
+	}
+	if len(sources) < 2 || sources[0].Type != SourceTypeSQLite {
+		t.Fatalf("sources = %+v, want WAL-fresh SQLite ranked before JSONL", sources)
+	}
+	if !sources[0].ModTime.Equal(newest) {
+		t.Fatalf("SQLite effective mtime = %v, want WAL mtime %v", sources[0].ModTime, newest)
+	}
+}
+
+func TestSQLiteValidationCacheIdentityIncludesWAL(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "beads.db")
+	if err := os.WriteFile(dbPath, []byte("main database identity"), 0o644); err != nil {
+		t.Fatalf("write database marker: %v", err)
+	}
+	source := DataSource{
+		Type:            SourceTypeSQLite,
+		Path:            dbPath,
+		Valid:           false,
+		ValidationError: "cached pre-WAL failure",
+	}
+	storeValidationCache(&source)
+	if hit, err := lookupValidationCache(&source, DefaultValidationOptions()); !hit || err == nil {
+		t.Fatalf("initial validation cache lookup = hit %v, err %v; want cached failure", hit, err)
+	}
+
+	if err := os.WriteFile(dbPath+"-wal", []byte("new committed WAL state"), 0o644); err != nil {
+		t.Fatalf("write WAL marker: %v", err)
+	}
+	if hit, err := lookupValidationCache(&source, DefaultValidationOptions()); hit || err != nil {
+		t.Fatalf("post-WAL validation cache lookup = hit %v, err %v; want cache miss", hit, err)
+	}
+}
+
+func TestValidationCacheKeyIncludesSourceType(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.data")
+	if err := os.WriteFile(path, []byte("same bytes"), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	jsonl := DataSource{
+		Type:       SourceTypeJSONLLocal,
+		Path:       path,
+		Valid:      true,
+		IssueCount: 1,
+	}
+	storeValidationCache(&jsonl)
+
+	sqlite := DataSource{Type: SourceTypeSQLite, Path: path}
+	if hit, err := lookupValidationCache(&sqlite, DefaultValidationOptions()); hit || err != nil {
+		t.Fatalf("SQLite lookup after JSONL cache entry = hit %v, err %v; want cache miss", hit, err)
+	}
+}
+
+func TestValidationCacheDetectsSameIdentityRewriteWithRestoredMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	mtime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.WriteFile(path, []byte("aaaa"), 0o644); err != nil {
+		t.Fatalf("write initial source: %v", err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("pin initial metadata: %v", err)
+	}
+	beforeInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat initial source: %v", err)
+	}
+	before := validationPathIdentityFromInfo(beforeInfo)
+	if !before.hasChangeAt {
+		t.Skip("platform does not expose a change-time token")
+	}
+
+	source := DataSource{Type: SourceTypeJSONLLocal, Path: path, Valid: true, IssueCount: 1}
+	storeValidationCache(&source)
+	if err := os.WriteFile(path, []byte("bbbb"), 0o644); err != nil {
+		t.Fatalf("rewrite source: %v", err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("restore source metadata: %v", err)
+	}
+	afterInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat rewritten source: %v", err)
+	}
+	after := validationPathIdentityFromInfo(afterInfo)
+	if !os.SameFile(beforeInfo, afterInfo) || before.size != after.size || !before.modTime.Equal(after.modTime) {
+		t.Fatal("test setup did not preserve identity, size, and modification time")
+	}
+	if before.changeSec == after.changeSec && before.changeNsec == after.changeNsec {
+		t.Skip("filesystem did not advance change time at test resolution")
+	}
+
+	changed := DataSource{Type: SourceTypeJSONLLocal, Path: path}
+	if hit, err := lookupValidationCache(&changed, DefaultValidationOptions()); hit || err != nil {
+		t.Fatalf("rewritten source cache lookup = hit %v, err %v; want miss", hit, err)
+	}
+}
+
+func TestValidationCacheDoesNotStoreVerdictForFileChangedDuringValidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := os.WriteFile(path, []byte(`{"id":"VALID-1","title":"valid","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write initial source: %v", err)
+	}
+	source := DataSource{Type: SourceTypeJSONLLocal, Path: path}
+	opts := DefaultValidationOptions()
+	opts.Verbose = true
+	var rewriteErr error
+	opts.Logger = func(string) {
+		if rewriteErr == nil {
+			rewriteErr = os.WriteFile(path, []byte("not valid JSONL anymore\n"), 0o644)
+		}
+	}
+	if err := ValidateSourceWithOptions(&source, opts); err != nil {
+		t.Fatalf("validation of initial source: %v", err)
+	}
+	if rewriteErr != nil {
+		t.Fatalf("rewrite source during validation: %v", rewriteErr)
+	}
+
+	changed := DataSource{Type: SourceTypeJSONLLocal, Path: path}
+	if hit, err := lookupValidationCache(&changed, DefaultValidationOptions()); hit || err != nil {
+		t.Fatalf("changed source cache lookup = hit %v, err %v; want miss", hit, err)
+	}
+}
+
 // TestDiscoverSources_Empty tests discovery with no sources
 func TestDiscoverSources_Empty(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -160,6 +321,27 @@ func TestDiscoverSources_Empty(t *testing.T) {
 
 	if len(sources) != 0 {
 		t.Errorf("Expected 0 sources, got %d", len(sources))
+	}
+}
+
+func TestDiscoverSourcesPropagatesSQLiteStatFailure(t *testing.T) {
+	beadsDir := t.TempDir()
+	dbPath := filepath.Join(beadsDir, "beads.db")
+	if err := os.Symlink(filepath.Base(dbPath), dbPath); err != nil {
+		t.Skipf("cannot create self-referential symlink fixture: %v", err)
+	}
+
+	_, err := DiscoverSources(DiscoveryOptions{
+		BeadsDir:               beadsDir,
+		ValidateAfterDiscovery: false,
+	})
+	if err == nil {
+		t.Fatal("DiscoverSources silently ignored an unreadable canonical SQLite source")
+	}
+	for _, want := range []string{"stat SQLite source", dbPath} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("DiscoverSources error = %q, want %q", err, want)
+		}
 	}
 }
 
@@ -245,6 +427,60 @@ func TestLoadIssues_RespectsBeadsDBSpecificSQLite(t *testing.T) {
 	}
 	if len(issues) != 1 || issues[0].ID != "SQLITE-1" {
 		t.Fatalf("expected explicit SQLite source, got %#v", issues)
+	}
+}
+
+func TestLoadIssues_ExplicitDirectoryDoesNotMixInCallerWorktreeExports(t *testing.T) {
+	for _, envName := range []string{loader.BeadsDBEnvVar, loader.BeadsDirEnvVar} {
+		t.Run(envName, func(t *testing.T) {
+			t.Setenv(loader.BeadsDBEnvVar, "")
+			t.Setenv(loader.BeadsDirEnvVar, "")
+
+			repoDir := t.TempDir()
+			git := exec.Command("git", "init", "-b", "main")
+			git.Dir = repoDir
+			if output, err := git.CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v\n%s", err, output)
+			}
+			foreignDir := filepath.Join(repoDir, ".git", "beads-worktrees", "foreign")
+			if err := os.MkdirAll(foreignDir, 0o755); err != nil {
+				t.Fatalf("mkdir foreign worktree export: %v", err)
+			}
+			foreignPath := filepath.Join(foreignDir, "issues.jsonl")
+			if err := os.WriteFile(foreignPath, []byte(`{"id":"FOREIGN-1","title":"Wrong repository","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+				t.Fatalf("write foreign worktree export: %v", err)
+			}
+
+			selectedDir := filepath.Join(t.TempDir(), ".beads")
+			if err := os.MkdirAll(selectedDir, 0o755); err != nil {
+				t.Fatalf("mkdir selected tracker: %v", err)
+			}
+			selectedPath := filepath.Join(selectedDir, "issues.jsonl")
+			if err := os.WriteFile(selectedPath, []byte(`{"id":"SELECTED-1","title":"Selected repository","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+				t.Fatalf("write selected tracker export: %v", err)
+			}
+			older := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+			newer := older.Add(time.Hour)
+			if err := os.Chtimes(selectedPath, older, older); err != nil {
+				t.Fatalf("age selected tracker export: %v", err)
+			}
+			if err := os.Chtimes(foreignPath, newer, newer); err != nil {
+				t.Fatalf("freshen foreign worktree export: %v", err)
+			}
+
+			t.Setenv(envName, selectedDir)
+			issues, err := LoadIssues(repoDir)
+			if err != nil {
+				t.Fatalf("LoadIssues with explicit directory: %v", err)
+			}
+			if len(issues) != 1 || issues[0].ID != "SELECTED-1" {
+				t.Fatalf("explicit directory loaded issues = %#v, want only SELECTED-1", issues)
+			}
+			selected, ok := LastSelectedSource()
+			if !ok || selected.Path != selectedPath {
+				t.Fatalf("selected source = %+v (ok=%t), want %s", selected, ok, selectedPath)
+			}
+		})
 	}
 }
 
@@ -586,6 +822,34 @@ func TestSelectBestSource_PriorityTiebreaker(t *testing.T) {
 
 	if selected.Type != SourceTypeSQLite {
 		t.Errorf("Expected SQLite (higher priority), got %s", selected.Type)
+	}
+}
+
+func TestSelectBestSourceEqualTimePrefersCanonicalJSONLName(t *testing.T) {
+	now := time.Now()
+	sources := []DataSource{
+		{
+			Type:     SourceTypeJSONLLocal,
+			Path:     "/test/beads.jsonl",
+			Priority: PriorityJSONLLocal,
+			ModTime:  now,
+			Valid:    true,
+		},
+		{
+			Type:     SourceTypeJSONLLocal,
+			Path:     "/test/issues.jsonl",
+			Priority: PriorityJSONLLocal,
+			ModTime:  now,
+			Valid:    true,
+		},
+	}
+
+	selected, err := SelectBestSource(sources)
+	if err != nil {
+		t.Fatalf("Selection failed: %v", err)
+	}
+	if selected.Path != "/test/issues.jsonl" {
+		t.Fatalf("selected %s, want canonical issues.jsonl", selected.Path)
 	}
 }
 

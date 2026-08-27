@@ -168,6 +168,18 @@ func TestModelCreationWithEmptyIssues(t *testing.T) {
 	m.SetFilter("ready")
 }
 
+func TestHistoricalReadyFilterUsesAnalysisTime(t *testing.T) {
+	analysisTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	deferUntil := analysisTime.Add(24 * time.Hour)
+	m := ui.NewModelAt([]model.Issue{
+		{ID: "scheduled", Title: "Scheduled", Status: model.StatusOpen, DeferUntil: &deferUntil},
+	}, nil, "", analysisTime)
+	m.SetFilter("ready")
+	if got := m.FilteredIssues(); len(got) != 0 {
+		t.Fatalf("historical ready filter returned scheduled issue: %+v", got)
+	}
+}
+
 func TestIssueItemDiffStatus(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "1", Title: "Test", Status: model.StatusOpen},

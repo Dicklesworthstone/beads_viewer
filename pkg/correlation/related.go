@@ -3,6 +3,7 @@ package correlation
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -74,6 +75,9 @@ func (hr *HistoryReport) FindRelatedWork(targetID string, opts RelatedWorkOption
 // instant for open activity windows and result metadata. The zero instant is
 // valid and is preserved.
 func (hr *HistoryReport) FindRelatedWorkAt(targetID string, opts RelatedWorkOptions, now time.Time) *RelatedWorkResult {
+	if hr == nil {
+		return nil
+	}
 	target, exists := hr.Histories[targetID]
 	if !exists {
 		return nil
@@ -99,9 +103,15 @@ func (hr *HistoryReport) FindRelatedWorkAt(targetID string, opts RelatedWorkOpti
 	targetFiles := make(map[string]bool)
 	targetCommits := make(map[string]bool)
 	for _, commit := range target.Commits {
-		targetCommits[commit.SHA] = true
+		if strings.TrimSpace(commit.SHA) != "" {
+			targetCommits[commit.SHA] = true
+		}
 		for _, fc := range commit.Files {
-			targetFiles[normalizePath(fc.Path)] = true
+			normalizedPath := normalizePath(fc.Path)
+			if normalizedPath == "" {
+				continue
+			}
+			targetFiles[normalizedPath] = true
 		}
 	}
 
@@ -276,7 +286,7 @@ func (hr *HistoryReport) findCommitOverlap(targetID string, targetCommits map[st
 			RelationType:  RelationCommitOverlap,
 			Relevance:     relevance,
 			Reason:        formatCommitOverlapReason(len(sharedSHAs), totalTargetCommits),
-			SharedCommits: limitStrings(shortenSHAs(sortedSHAs), 5),
+			SharedCommits: limitStrings(sortedSHAs, 5),
 		})
 	}
 
@@ -297,47 +307,44 @@ func (hr *HistoryReport) findDependencyCluster(targetID string, opts RelatedWork
 		return []RelatedWorkBead{}
 	}
 
-	// BFS to find beads within 2 hops of target (direct deps and their deps)
-	cluster := make(map[string]int) // beadID -> hop distance
-
-	// Direct dependencies (things target depends on)
-	if deps, ok := opts.DependencyGraph[targetID]; ok {
+	// Dependency clusters are undirected: A depending on B places both in the
+	// same cluster. Build both halves before traversing so second-hop reverse
+	// dependencies are reachable too.
+	neighbors := make(map[string]map[string]struct{})
+	for beadID, deps := range opts.DependencyGraph {
+		if neighbors[beadID] == nil {
+			neighbors[beadID] = make(map[string]struct{})
+		}
 		for _, depID := range deps {
-			if !seen[depID] {
-				cluster[depID] = 1
+			if neighbors[depID] == nil {
+				neighbors[depID] = make(map[string]struct{})
 			}
+			neighbors[beadID][depID] = struct{}{}
+			neighbors[depID][beadID] = struct{}{}
 		}
 	}
 
-	// Reverse dependencies (things that depend on target)
-	for beadID, deps := range opts.DependencyGraph {
-		if seen[beadID] {
+	type dependencyHop struct {
+		id       string
+		distance int
+	}
+	cluster := make(map[string]int) // beadID -> hop distance
+	visited := map[string]bool{targetID: true}
+	queue := []dependencyHop{{id: targetID}}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if current.distance == 2 {
 			continue
 		}
-		for _, depID := range deps {
-			if depID == targetID {
-				if _, exists := cluster[beadID]; !exists {
-					cluster[beadID] = 1
-				}
+		for neighborID := range neighbors[current.id] {
+			if visited[neighborID] {
+				continue
 			}
-		}
-	}
-
-	// Second hop: deps of deps
-	firstHop := make([]string, 0, len(cluster))
-	for id := range cluster {
-		firstHop = append(firstHop, id)
-	}
-
-	for _, hopID := range firstHop {
-		if deps, ok := opts.DependencyGraph[hopID]; ok {
-			for _, depID := range deps {
-				if !seen[depID] && depID != targetID {
-					if _, exists := cluster[depID]; !exists {
-						cluster[depID] = 2
-					}
-				}
-			}
+			visited[neighborID] = true
+			distance := current.distance + 1
+			cluster[neighborID] = distance
+			queue = append(queue, dependencyHop{id: neighborID, distance: distance})
 		}
 	}
 
@@ -345,6 +352,9 @@ func (hr *HistoryReport) findDependencyCluster(targetID string, opts RelatedWork
 	var results []RelatedWorkBead
 
 	for beadID, hops := range cluster {
+		if seen[beadID] {
+			continue
+		}
 		history, exists := hr.Histories[beadID]
 		if !exists {
 			continue
@@ -389,31 +399,19 @@ func (hr *HistoryReport) findDependencyCluster(targetID string, opts RelatedWork
 
 // findConcurrent finds beads active in the same time window
 func (hr *HistoryReport) findConcurrent(targetID string, target BeadHistory, opts RelatedWorkOptions, seen map[string]bool, now time.Time) []RelatedWorkBead {
-	// Determine target's activity window
-	var targetStart, targetEnd time.Time
-
-	if target.Milestones.Created != nil {
-		targetStart = target.Milestones.Created.Timestamp
-	}
-	if isClosedHistoryStatus(target.Status) && target.Milestones.Closed != nil {
-		targetEnd = target.Milestones.Closed.Timestamp
-	} else {
-		targetEnd = now
-	}
-
-	// If no start time, use first commit time
-	if targetStart.IsZero() && len(target.Commits) > 0 {
-		targetStart = target.Commits[0].Timestamp
-	}
-
-	// If still no times, can't determine concurrency
-	if targetStart.IsZero() {
+	targetStart, targetEnd, ok := relatedActivityWindow(target, now)
+	if !ok {
 		return []RelatedWorkBead{}
 	}
 
-	// Expand window by concurrency window option
-	windowStart := targetStart.Add(-opts.ConcurrencyWindow)
-	windowEnd := targetEnd.Add(opts.ConcurrencyWindow)
+	// Expand by a non-negative tolerance. A negative duration would invert or
+	// shrink the interval and can manufacture negative overlap durations.
+	concurrencyWindow := opts.ConcurrencyWindow
+	if concurrencyWindow < 0 {
+		concurrencyWindow = 0
+	}
+	windowStart := targetStart.Add(-concurrencyWindow)
+	windowEnd := targetEnd.Add(concurrencyWindow)
 
 	var results []RelatedWorkBead
 
@@ -427,24 +425,8 @@ func (hr *HistoryReport) findConcurrent(targetID string, target BeadHistory, opt
 			continue
 		}
 
-		// Determine this bead's activity window
-		var beadStart, beadEnd time.Time
-
-		if history.Milestones.Created != nil {
-			beadStart = history.Milestones.Created.Timestamp
-		}
-		if isClosedHistoryStatus(history.Status) && history.Milestones.Closed != nil {
-			beadEnd = history.Milestones.Closed.Timestamp
-		} else {
-			beadEnd = now
-		}
-
-		// Use first commit if no created timestamp
-		if beadStart.IsZero() && len(history.Commits) > 0 {
-			beadStart = history.Commits[0].Timestamp
-		}
-
-		if beadStart.IsZero() {
+		beadStart, beadEnd, ok := relatedActivityWindow(history, now)
+		if !ok {
 			continue
 		}
 
@@ -496,6 +478,53 @@ func (hr *HistoryReport) findConcurrent(targetID string, target BeadHistory, opt
 	}
 
 	return results
+}
+
+// relatedActivityWindow returns the most recent continuous activity interval.
+// A reopened bead was inactive between its previous close and reopen, so using
+// its original creation time would manufacture concurrency across that gap.
+func relatedActivityWindow(history BeadHistory, now time.Time) (time.Time, time.Time, bool) {
+	if intervals := temporalActivityIntervalsAt(history.BeadID, history, now); len(intervals) > 0 {
+		latest := intervals[len(intervals)-1]
+		return latest.Start, latest.End, true
+	}
+
+	// Some legacy/hand-built histories have no claim/reopen events. Fall back
+	// through their lossy milestone summary, then creation/commit evidence, so
+	// they remain analyzable without letting a pre-claim backlog interval
+	// override a real lifecycle activation.
+	var start time.Time
+	if history.Milestones.Claimed != nil {
+		start = history.Milestones.Claimed.Timestamp
+	}
+	if history.Milestones.Reopened != nil && (start.IsZero() || history.Milestones.Reopened.Timestamp.After(start)) {
+		start = history.Milestones.Reopened.Timestamp
+	}
+	if start.IsZero() && history.Milestones.Created != nil {
+		start = history.Milestones.Created.Timestamp
+	}
+	if start.IsZero() {
+		for _, commit := range history.Commits {
+			if !commit.Timestamp.IsZero() && (start.IsZero() || commit.Timestamp.Before(start)) {
+				start = commit.Timestamp
+			}
+		}
+	}
+	if start.IsZero() {
+		return time.Time{}, time.Time{}, false
+	}
+
+	end := now
+	if isClosedHistoryStatus(history.Status) {
+		if history.Milestones.Closed == nil {
+			return time.Time{}, time.Time{}, false
+		}
+		end = history.Milestones.Closed.Timestamp
+	}
+	if end.Before(start) {
+		return time.Time{}, time.Time{}, false
+	}
+	return start, end, true
 }
 
 // Helper functions
@@ -563,23 +592,7 @@ func formatPctRelated(pct int) string {
 }
 
 func formatIntRelated(n int) string {
-	// Simple int to string without importing strconv
-	if n == 0 {
-		return "0"
-	}
-	result := ""
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	for n > 0 {
-		result = string(rune('0'+n%10)) + result
-		n /= 10
-	}
-	if neg {
-		result = "-" + result
-	}
-	return result
+	return strconv.Itoa(n)
 }
 
 func limitStrings(s []string, max int) []string {
@@ -587,16 +600,4 @@ func limitStrings(s []string, max int) []string {
 		return s
 	}
 	return s[:max]
-}
-
-func shortenSHAs(shas []string) []string {
-	result := make([]string, len(shas))
-	for i, sha := range shas {
-		if len(sha) > 7 {
-			result[i] = sha[:7]
-		} else {
-			result[i] = sha
-		}
-	}
-	return result
 }

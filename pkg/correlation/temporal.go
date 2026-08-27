@@ -6,8 +6,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os/exec"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -77,7 +77,6 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 
 	// Build git log command with author and date filters
 	args := []string{
-		"log",
 		fmt.Sprintf("--author=%s", authorRegex),
 		fmt.Sprintf("--since=%s", window.Start.Format(time.RFC3339)),
 		fmt.Sprintf("--until=%s", window.End.Format(time.RFC3339)),
@@ -85,14 +84,19 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 		"--no-merges",
 	}
 
-	cmd := gitCommand(t.ctx, args...)
-	cmd.Dir = t.repoPath
+	cmd := lifecycleGitLogCommand(t.ctx, t.repoPath, args...)
 
 	out, err := cmd.Output()
 	if err != nil {
-		// No commits found is not an error
-		if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) == 0 {
-			return nil, nil
+		// A successful log with no matching commits exits zero and returns empty
+		// output. A non-zero exit with empty stderr is still a failure; in
+		// particular, CommandContext commonly reports cancellation that way after
+		// killing Git. Preserve cancellation for callers instead of converting it
+		// into a successful, cacheable empty result.
+		if t.ctx != nil {
+			if ctxErr := t.ctx.Err(); ctxErr != nil {
+				return nil, fmt.Errorf("git log canceled: %w", ctxErr)
+			}
 		}
 		return nil, fmt.Errorf("git log failed: %w", err)
 	}
@@ -102,6 +106,7 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 
 	// Parse commits
 	var commits []CorrelatedCommit
+	objectIDWidth := 0
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	buf := make([]byte, 64*1024)
 	scanner.Buffer(buf, gitLogMaxScanTokenSize)
@@ -113,7 +118,12 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 
 		info, err := parseCommitInfo(line)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("parse temporal commit header: %w", err)
+		}
+		if objectIDWidth == 0 {
+			objectIDWidth = len(info.SHA)
+		} else if len(info.SHA) != objectIDWidth {
+			return nil, fmt.Errorf("mixed-width temporal commit object IDs: got %d and %d characters", objectIDWidth, len(info.SHA))
 		}
 
 		sha := info.SHA
@@ -123,15 +133,26 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 			continue
 		}
 
-		// Skip commits that touch beads files (those are handled by co-commit extractor)
-		if t.touchesBeadsFile(sha) {
+		// Skip commits that touch beads files (those are handled by co-commit extractor).
+		// An unreadable/malformed diff is not evidence that the commit touches Beads;
+		// propagate it so callers cannot mistake an incomplete scan for success.
+		touchesBeads, err := t.touchesBeadsFile(sha)
+		if err != nil {
+			return nil, fmt.Errorf("checking Beads-file changes for temporal commit %s: %w", sha, err)
+		}
+		if touchesBeads {
 			continue
 		}
 
 		// Get file changes for this commit
 		files, err := t.coCommitter.ExtractCoCommittedFiles(BeadEvent{CommitSHA: sha})
 		if err != nil {
-			continue
+			if t.ctx != nil {
+				if ctxErr := t.ctx.Err(); ctxErr != nil {
+					err = ctxErr
+				}
+			}
+			return nil, fmt.Errorf("extracting code files for temporal commit %s: %w", sha, err)
 		}
 
 		// Skip if no code files
@@ -158,7 +179,10 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 		})
 	}
 
-	return commits, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan temporal commit output: %w", err)
+	}
+	return commits, nil
 }
 
 func gitAuthorRegex(author, authorEmail string) string {
@@ -172,24 +196,35 @@ func gitAuthorRegex(author, authorEmail string) string {
 	return regexp.QuoteMeta(identity)
 }
 
-// touchesBeadsFile checks if a commit modifies any beads file
-func (t *TemporalCorrelator) touchesBeadsFile(sha string) bool {
-	cmd := gitCommand(t.ctx, "show", "--name-only", "--format=", sha)
-	cmd.Dir = t.repoPath
+// touchesBeadsFile checks if a commit modifies any beads file.
+func (t *TemporalCorrelator) touchesBeadsFile(sha string) (bool, error) {
+	// Force rename detection off so a move from .beads/ to another directory
+	// exposes both the deleted pre-image and added post-image. NUL framing keeps
+	// control characters in paths opaque, while the shared co-commit policy pins
+	// every diff/config input and repository-routing environment variable.
+	gitArgs := append([]string{"show"}, coCommitDiffArgs("--name-status")...)
+	gitArgs = append(gitArgs, "--no-renames", "--format=", "--end-of-options", sha, "--")
+	cmd := coCommitGitCommand(t.ctx, t.repoPath, gitArgs)
 
 	out, err := cmd.Output()
 	if err != nil {
-		return false
+		if t.ctx != nil {
+			if ctxErr := t.ctx.Err(); ctxErr != nil {
+				return false, fmt.Errorf("git show canceled: %w", ctxErr)
+			}
+		}
+		return false, fmt.Errorf("git show --name-status failed: %w", err)
 	}
-
-	scanner := bufio.NewScanner(bytes.NewReader(out))
-	for scanner.Scan() {
-		path := scanner.Text()
-		if strings.HasPrefix(path, ".beads/") {
-			return true
+	files, err := parseNameStatus(out)
+	if err != nil {
+		return false, fmt.Errorf("parsing git show --name-status: %w", err)
+	}
+	for _, file := range files {
+		if strings.HasPrefix(file.Path, ".beads/") {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // calculateTemporalConfidence computes dynamic confidence for temporal correlation
@@ -322,55 +357,195 @@ func clamp(value, min, max float64) float64 {
 
 // ExtractWindowFromMilestones creates a TemporalWindow from bead milestones
 func ExtractWindowFromMilestones(beadID, title string, milestones BeadMilestones) *TemporalWindow {
-	// Need both claimed and closed events to define a window
-	if milestones.Claimed == nil || milestones.Closed == nil {
+	// Milestones are a lossy legacy summary: Claimed is the first claim while
+	// Reopened is the latest reopen, so they cannot represent a later reclaim.
+	// Prefer the most recent activation identity that they can express. The
+	// production ExtractAllTemporalCorrelations path derives the interval from
+	// the complete chronological Events slice instead.
+	if milestones.Closed == nil {
+		return nil
+	}
+	startEvent := latestTemporalActivation(milestones)
+	if startEvent == nil || startEvent.Timestamp.IsZero() || milestones.Closed.Timestamp.Before(startEvent.Timestamp) {
 		return nil
 	}
 
 	return &TemporalWindow{
 		BeadID:      beadID,
 		Title:       title,
-		Author:      milestones.Claimed.Author,
-		AuthorEmail: milestones.Claimed.AuthorEmail,
-		Start:       milestones.Claimed.Timestamp,
+		Author:      startEvent.Author,
+		AuthorEmail: startEvent.AuthorEmail,
+		Start:       startEvent.Timestamp,
 		End:         milestones.Closed.Timestamp,
 	}
+}
+
+func latestTemporalActivation(milestones BeadMilestones) *BeadEvent {
+	activation := milestones.Claimed
+	if milestones.Reopened != nil && (activation == nil || milestones.Reopened.Timestamp.After(activation.Timestamp)) {
+		activation = milestones.Reopened
+	}
+	return activation
+}
+
+// latestTemporalActivityStart returns the beginning of the most recent
+// continuous active interval. A bead is inactive between a close and a later
+// reopen, so using its first claim would manufacture temporal evidence across
+// that gap.
+func latestTemporalActivityStart(milestones BeadMilestones) time.Time {
+	if activation := latestTemporalActivation(milestones); activation != nil {
+		return activation.Timestamp
+	}
+	return time.Time{}
+}
+
+func extractTemporalWindowFromHistory(beadID string, history BeadHistory) *TemporalWindow {
+	if len(history.Events) == 0 {
+		return ExtractWindowFromMilestones(beadID, history.Title, history.Milestones)
+	}
+
+	events := append([]BeadEvent(nil), history.Events...)
+	sort.SliceStable(events, func(i, j int) bool {
+		return events[i].Timestamp.Before(events[j].Timestamp)
+	})
+	var activation *BeadEvent
+	var completed *TemporalWindow
+	for i := range events {
+		event := &events[i]
+		switch event.EventType {
+		case EventClaimed, EventReopened:
+			activation = event
+			// A later activation means the previous completed interval is no
+			// longer the bead's terminal state until another close arrives.
+			completed = nil
+		case EventClosed:
+			if activation != nil && !event.Timestamp.Before(activation.Timestamp) {
+				completed = &TemporalWindow{
+					BeadID:      beadID,
+					Title:       history.Title,
+					Author:      activation.Author,
+					AuthorEmail: activation.AuthorEmail,
+					Start:       activation.Timestamp,
+					End:         event.Timestamp,
+				}
+			}
+			activation = nil
+		}
+	}
+	return completed
+}
+
+// temporalActivityIntervalsAt derives author-owned activity intervals that
+// can overlap a target window ending at through. Open intervals are bounded by
+// through solely for overlap counting; they are never returned as completed
+// target windows.
+func temporalActivityIntervalsAt(beadID string, history BeadHistory, through time.Time) []TemporalWindow {
+	if len(history.Events) == 0 {
+		activation := latestTemporalActivation(history.Milestones)
+		if activation == nil || activation.Timestamp.IsZero() || activation.Timestamp.After(through) {
+			return nil
+		}
+		end := through
+		if closed := history.Milestones.Closed; closed != nil && !closed.Timestamp.Before(activation.Timestamp) && closed.Timestamp.Before(end) {
+			end = closed.Timestamp
+		}
+		return []TemporalWindow{{
+			BeadID:      beadID,
+			Title:       history.Title,
+			Author:      activation.Author,
+			AuthorEmail: activation.AuthorEmail,
+			Start:       activation.Timestamp,
+			End:         end,
+		}}
+	}
+
+	events := append([]BeadEvent(nil), history.Events...)
+	sort.SliceStable(events, func(i, j int) bool {
+		return events[i].Timestamp.Before(events[j].Timestamp)
+	})
+	intervals := make([]TemporalWindow, 0)
+	var activation *BeadEvent
+	for i := range events {
+		event := &events[i]
+		if event.Timestamp.After(through) {
+			break
+		}
+		switch event.EventType {
+		case EventClaimed, EventReopened:
+			activation = event
+		case EventClosed:
+			if activation != nil && !event.Timestamp.Before(activation.Timestamp) {
+				intervals = append(intervals, TemporalWindow{
+					BeadID:      beadID,
+					Title:       history.Title,
+					Author:      activation.Author,
+					AuthorEmail: activation.AuthorEmail,
+					Start:       activation.Timestamp,
+					End:         event.Timestamp,
+				})
+			}
+			activation = nil
+		}
+	}
+	if activation != nil && !through.Before(activation.Timestamp) {
+		intervals = append(intervals, TemporalWindow{
+			BeadID:      beadID,
+			Title:       history.Title,
+			Author:      activation.Author,
+			AuthorEmail: activation.AuthorEmail,
+			Start:       activation.Timestamp,
+			End:         through,
+		})
+	}
+	return intervals
+}
+
+func sameTemporalAuthor(first, second TemporalWindow) bool {
+	firstEmail := strings.TrimSpace(first.AuthorEmail)
+	secondEmail := strings.TrimSpace(second.AuthorEmail)
+	if firstEmail != "" || secondEmail != "" {
+		return firstEmail != "" && secondEmail != "" && strings.EqualFold(firstEmail, secondEmail)
+	}
+	firstName := strings.TrimSpace(first.Author)
+	secondName := strings.TrimSpace(second.Author)
+	return firstName != "" && secondName != "" && strings.EqualFold(firstName, secondName)
+}
+
+func countConcurrentTemporalBeads(histories map[string]BeadHistory, target TemporalWindow) int {
+	concurrent := 0
+	for beadID, history := range histories {
+		for _, interval := range temporalActivityIntervalsAt(beadID, history, target.End) {
+			if sameTemporalAuthor(target, interval) && interval.Start.Before(target.End) && interval.End.After(target.Start) {
+				concurrent++
+				break
+			}
+		}
+	}
+	return concurrent
 }
 
 // ExtractAllTemporalCorrelations finds temporal correlations for all beads with completed windows
 func (t *TemporalCorrelator) ExtractAllTemporalCorrelations(histories map[string]BeadHistory) ([]CorrelatedCommit, error) {
 	var allCommits []CorrelatedCommit
+	beadIDs := make([]string, 0, len(histories))
+	for beadID := range histories {
+		beadIDs = append(beadIDs, beadID)
+	}
+	sort.Strings(beadIDs)
 
-	for beadID, history := range histories {
-		window := ExtractWindowFromMilestones(beadID, history.Title, history.Milestones)
+	for _, beadID := range beadIDs {
+		history := histories[beadID]
+		window := extractTemporalWindowFromHistory(beadID, history)
 		if window == nil {
 			continue
 		}
 
 		// Calculate concurrent beads for this author during this window
-		concurrent := 0
-		for _, otherHistory := range histories {
-			if otherHistory.Milestones.Claimed != nil && otherHistory.Milestones.Claimed.AuthorEmail == window.AuthorEmail {
-				start := otherHistory.Milestones.Claimed.Timestamp
-				var end time.Time
-				if otherHistory.Milestones.Closed != nil {
-					end = otherHistory.Milestones.Closed.Timestamp
-				} else {
-					end = time.Now()
-				}
-
-				// Check for overlap: start1 < end2 && end1 > start2
-				if start.Before(window.End) && end.After(window.Start) {
-					concurrent++
-				}
-			}
-		}
-		window.ActiveBeads = concurrent
+		window.ActiveBeads = countConcurrentTemporalBeads(histories, *window)
 
 		commits, err := t.FindCommitsInWindow(*window)
 		if err != nil {
-			// Non-fatal: skip this bead
-			continue
+			return nil, fmt.Errorf("finding temporal commits for bead %q: %w", beadID, err)
 		}
 
 		allCommits = append(allCommits, commits...)

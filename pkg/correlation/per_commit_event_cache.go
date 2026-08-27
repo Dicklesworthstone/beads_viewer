@@ -1,10 +1,10 @@
 package correlation
 
 import (
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	json "github.com/goccy/go-json"
@@ -52,7 +52,9 @@ import (
 // serialized-size ceiling so it cannot grow without bound.
 
 const (
-	perCommitEventCacheVersion     = 1
+	// Version 2 invalidates entries produced before parseDiff stopped silently
+	// truncating JSONL records larger than 10 MiB.
+	perCommitEventCacheVersion     = 2
 	perCommitEventCacheFileName    = "correlation_per_commit_event_cache.json"
 	perCommitEventCacheMaxAge      = 30 * 24 * time.Hour // commits are immutable; keep a month
 	perCommitEventCacheMaxCommits  = 4000                // bound the accumulating commit map
@@ -87,10 +89,13 @@ type perCommitEventEntry struct {
 
 // perCommitEventCacheNamespace derives the bucket key for a snapshot extraction.
 // Two extractions share cached per-commit events iff they filter on the same
-// BeadID and follow the same primary file — the only inputs to parseDiff beyond
-// the per-commit blob pair and the (SHA-derived) commit metadata.
+// BeadID, follow the same primary file, and use the same pinned lifecycle Git
+// policy. The policy controls the commit metadata bytes stored in BeadEvent;
+// binding it here prevents a future policy change from reusing old messages.
 func perCommitEventCacheNamespace(primaryFile, beadID string) string {
-	return primaryFile + "\x00" + beadID
+	inputs := lifecycleGitPolicyNamespaceInputs()
+	inputs = append(inputs, primaryFile, beadID)
+	return strings.Join(inputs, "\x00")
 }
 
 func perCommitEventCachePath(create bool) (string, error) {
@@ -111,12 +116,16 @@ func perCommitEventCachePath(create bool) (string, error) {
 }
 
 func readPerCommitEventCacheLocked(f *os.File) perCommitEventCacheFile {
+	return readPerCommitEventCacheLockedWithLimit(f, perCommitEventCacheMaxFileSize)
+}
+
+func readPerCommitEventCacheLockedWithLimit(f *os.File, maxBytes int64) perCommitEventCacheFile {
 	empty := perCommitEventCacheFile{Version: perCommitEventCacheVersion, Entries: map[string]perCommitNamespaceBucket{}}
 	if _, err := f.Seek(0, 0); err != nil {
 		return empty
 	}
-	data, err := io.ReadAll(f)
-	if err != nil || len(data) == 0 {
+	data, ok := readCacheFileBounded(f, maxBytes)
+	if !ok || len(data) == 0 {
 		return empty
 	}
 	var cf perCommitEventCacheFile
@@ -213,7 +222,7 @@ func pruneAndBoundPerCommitEntries(now time.Time, entries map[string]perCommitNa
 	var all []item
 	for ns, bucket := range entries {
 		for sha, e := range bucket.Commits {
-			if e.CreatedAt.IsZero() || now.Sub(e.CreatedAt) > perCommitEventCacheMaxAge {
+			if !cacheCreatedAtIsFresh(e.CreatedAt, now, perCommitEventCacheMaxAge) {
 				delete(bucket.Commits, sha)
 				continue
 			}
@@ -279,7 +288,7 @@ func loadPerCommitEvents(namespace string) map[string]perCommitEventEntry {
 	// Filter aged entries out of the returned view without rewriting the file.
 	out := make(map[string]perCommitEventEntry, len(bucket.Commits))
 	for sha, e := range bucket.Commits {
-		if e.CreatedAt.IsZero() || now.Sub(e.CreatedAt) > perCommitEventCacheMaxAge {
+		if !cacheCreatedAtIsFresh(e.CreatedAt, now, perCommitEventCacheMaxAge) {
 			continue
 		}
 		out[sha] = e

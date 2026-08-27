@@ -47,10 +47,13 @@ func (fs *FeedbackStore) Load() error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
+	loaded := make(map[feedbackKey]CorrelationFeedback)
 	path := fs.feedbackPath()
 	file, err := os.Open(path)
 	if os.IsNotExist(err) {
-		// No feedback file yet, that's fine
+		// The file is the source of truth. A missing file therefore represents
+		// an empty store, including when this instance previously loaded data.
+		fs.cache = loaded
 		return nil
 	}
 	if err != nil {
@@ -59,6 +62,7 @@ func (fs *FeedbackStore) Load() error {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), gitLogMaxScanTokenSize)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -72,10 +76,14 @@ func (fs *FeedbackStore) Load() error {
 		}
 
 		key := feedbackKey{commitSHA: fb.CommitSHA, beadID: fb.BeadID}
-		fs.cache[key] = fb
+		loaded[key] = fb
 	}
 
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("reading feedback file: %w", err)
+	}
+	fs.cache = loaded
+	return nil
 }
 
 // Save stores a feedback entry, appending to the JSONL file
@@ -247,7 +255,7 @@ func (fs *FeedbackStore) GetByBead(beadID string) []CorrelationFeedback {
 	defer fs.mu.RUnlock()
 
 	var result []CorrelationFeedback
-	for _, fb := range fs.cache {
+	for _, fb := range fs.sortedFeedbackLocked() {
 		if fb.BeadID == beadID {
 			result = append(result, fb)
 		}
@@ -261,7 +269,7 @@ func (fs *FeedbackStore) GetByCommit(commitSHA string) []CorrelationFeedback {
 	defer fs.mu.RUnlock()
 
 	var result []CorrelationFeedback
-	for _, fb := range fs.cache {
+	for _, fb := range fs.sortedFeedbackLocked() {
 		if fb.CommitSHA == commitSHA {
 			result = append(result, fb)
 		}

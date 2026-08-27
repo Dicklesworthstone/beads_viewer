@@ -51,4 +51,11 @@ func TestHybridCandidateLimit(t *testing.T) {
 	if capped != 20 {
 		t.Fatalf("expected candidate limit capped by total, got %d", capped)
 	}
+	if empty := HybridCandidateLimit(5, 0, "benchmarks"); empty != 0 {
+		t.Fatalf("expected zero candidates for an empty index, got %d", empty)
+	}
+	maxInt := int(^uint(0) >> 1)
+	if overflowSafe := HybridCandidateLimit(maxInt, 1000, "long descriptive query for ranking"); overflowSafe != 1000 {
+		t.Fatalf("expected oversized limit to saturate at total 1000, got %d", overflowSafe)
+	}
 }

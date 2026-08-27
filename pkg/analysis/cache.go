@@ -22,7 +22,9 @@ import (
 )
 
 const (
-	robotAnalysisDiskCacheVersion = 4
+	// v5 changes cycle semantics to ignore closed/tombstoned issues. Reject v4
+	// entries so an upgrade cannot resurrect historical cycles from disk.
+	robotAnalysisDiskCacheVersion = 5
 	// robotAnalysisDiskCacheSubdirName holds one file per cache entry. The
 	// pre-v3 layout kept every entry in a single analysis_cache.json, which
 	// made each lookup decode — and each store rewrite + fsync — the entire
@@ -81,25 +83,35 @@ func (c *Cache) GetByHash(hash string) (*GraphStats, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if c.stats == nil {
+	if !graphStatsReadyForCache(c.stats) {
 		return nil, false
 	}
 
-	if hash == c.dataHash && time.Since(c.computedAt) < c.ttl {
+	now := time.Now()
+	if hash == c.dataHash && cacheTimestampIsFresh(c.computedAt, now, c.ttl) {
 		return c.stats, true
 	}
 	return nil, false
 }
 
-// Set stores analysis results in the cache.
+func cacheTimestampIsFresh(timestamp, now time.Time, maxAge time.Duration) bool {
+	return !timestamp.IsZero() && !timestamp.After(now) && now.Sub(timestamp) < maxAge
+}
+
+// Set stores complete analysis results in the cache. Incomplete Phase 2
+// results are ignored so cancellation cannot poison a later live analysis.
 func (c *Cache) Set(issues []model.Issue, stats *GraphStats) {
 	// Compute hash outside the lock (expensive operation)
 	hash := ComputeDataHash(issues)
 	c.SetByHash(hash, stats)
 }
 
-// SetByHash stores analysis results with a pre-computed hash.
+// SetByHash stores complete analysis results with a pre-computed hash.
 func (c *Cache) SetByHash(hash string, stats *GraphStats) {
+	if !graphStatsReadyForCache(stats) {
+		return
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -1007,7 +1019,7 @@ func (b graphStatsCacheBlob) validateForCacheHit() error {
 	}
 	for _, metric := range statuses {
 		switch metric.entry.State {
-		case "computed", "approx", "timeout", "skipped":
+		case "computed", "approx", "skipped":
 		default:
 			return fmt.Errorf("completed result has invalid %s status %q", metric.name, metric.entry.State)
 		}
@@ -1068,7 +1080,7 @@ func (b graphStatsCacheBlob) validateForCacheHit() error {
 func validateConfiguredCacheMetricStatus(name string, enabled bool, entry statusEntry) error {
 	if enabled {
 		switch entry.State {
-		case "computed", "timeout":
+		case "computed":
 			return nil
 		default:
 			return fmt.Errorf("enabled %s has status %q", name, entry.State)
@@ -1551,7 +1563,7 @@ func putRobotDiskCachedStats(fullKey, dataHash, configHash string, stats *GraphS
 	if !robotDiskCacheEnabled() {
 		return
 	}
-	if stats == nil || !stats.IsPhase2Ready() {
+	if !graphStatsReadyForCache(stats) {
 		return
 	}
 

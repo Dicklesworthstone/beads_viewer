@@ -30,7 +30,7 @@ func DefaultCycleWarningConfig() CycleWarningConfig {
 
 // DetectCycleWarnings generates suggestions for dependency cycles in the graph
 func DetectCycleWarnings(issues []model.Issue, config CycleWarningConfig) []Suggestion {
-	if len(issues) < 2 {
+	if len(issues) == 0 || config.MaxCycles <= 0 {
 		return nil
 	}
 
@@ -38,10 +38,17 @@ func DetectCycleWarnings(issues []model.Issue, config CycleWarningConfig) []Sugg
 	analyzer := NewAnalyzer(issues)
 
 	// Only compute cycles for performance
+	maxCyclesToStore := config.MaxCycles
+	if !config.IncludeSelfLoops && maxCyclesToStore < len(issues) {
+		// Cycle detection returns at most one cycle per SCC. Scan every SCC when
+		// self-loops are filtered so skipped cycles cannot hide a later reportable
+		// cycle merely because the output limit is small.
+		maxCyclesToStore = len(issues)
+	}
 	analysisConfig := ApplyEnvOverrides(AnalysisConfig{
 		ComputeCycles:    true,
 		CyclesTimeout:    500 * time.Millisecond,
-		MaxCyclesToStore: 100,
+		MaxCyclesToStore: maxCyclesToStore,
 	})
 	stats := analyzer.AnalyzeWithConfig(analysisConfig)
 
@@ -51,22 +58,15 @@ func DetectCycleWarnings(issues []model.Issue, config CycleWarningConfig) []Sugg
 		return nil
 	}
 
-	// Build issue ID to title map for better messages
-	issueMap := make(map[string]string, len(issues))
-	for _, issue := range issues {
-		issueMap[issue.ID] = issue.Title
-	}
-
 	var suggestions []Suggestion
 
-	for i, cycle := range cycles {
-		if i >= config.MaxCycles {
-			break
-		}
-
+	for _, cycle := range cycles {
 		// Skip self-loops if configured
 		if len(cycle) == 2 && cycle[0] == cycle[1] && !config.IncludeSelfLoops {
 			continue
+		}
+		if len(suggestions) >= config.MaxCycles {
+			break
 		}
 
 		// Create cycle path string
@@ -110,7 +110,11 @@ func DetectCycleWarnings(issues []model.Issue, config CycleWarningConfig) []Sugg
 			// Suggest removing the last edge in the cycle
 			from := cycle[cycleLen-1]
 			to := cycle[0]
-			sug = sug.WithAction(fmt.Sprintf("br dep remove %s %s", from, to))
+			fromArg, fromOK := quoteBeadsCommandID(from)
+			toArg, toOK := quoteBeadsCommandID(to)
+			if fromOK && toOK {
+				sug = sug.WithAction(fmt.Sprintf("br dep remove %s %s", fromArg, toArg))
+			}
 		}
 
 		// If there's a second issue, mark it as related

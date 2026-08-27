@@ -1933,6 +1933,319 @@ func TestIndentedContinuationDoesNotInterruptParagraph(t *testing.T) {
 	}
 }
 
+func TestLinkReferenceDefinitionsDoNotExposeMarkerDocumentation(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "definition followed immediately by type-seven HTML",
+			content: "[reference]: /url\n" +
+				"<agent-example>\n" +
+				"<!-- bv-agent-instructions-v99 -->\n" +
+				"example only\n" +
+				"<!-- end-bv-agent-instructions -->\n\n",
+		},
+		{
+			name: "multiline label contains marker example",
+			content: "[\n" +
+				"<!-- bv-agent-instructions-v99 -->\n" +
+				"example only\n" +
+				"<!-- end-bv-agent-instructions -->\n" +
+				"]: /url\n",
+		},
+		{
+			name: "multiline title contains marker example",
+			content: "[reference]: /url\n" +
+				"  \"title\n" +
+				"<!-- bv-agent-instructions-v99 -->\n" +
+				"example only\n" +
+				"<!-- end-bv-agent-instructions -->\n" +
+				"  continued\"\n",
+		},
+		{
+			name: "spaces before newline separate unindented title",
+			content: "[reference]: /url  \n" +
+				"\"title\n" +
+				"<!-- bv-agent-instructions-v99 -->\n" +
+				"example only\n" +
+				"<!-- end-bv-agent-instructions -->\n" +
+				"continued\"\n",
+		},
+		{
+			name: "angle destination permits tab",
+			content: "[reference]: <my\turl>\n" +
+				"<agent-example>\n" +
+				"<!-- bv-agent-instructions-v99 -->\n" +
+				"example only\n" +
+				"<!-- end-bv-agent-instructions -->\n\n",
+		},
+		{
+			name: "title permits non-line-ending control",
+			content: "[reference]: /url \"title\fcontinued\"\n" +
+				"<agent-example>\n" +
+				"<!-- bv-agent-instructions-v99 -->\n" +
+				"example only\n" +
+				"<!-- end-bv-agent-instructions -->\n\n",
+		},
+		{
+			name: "container definition does not leave a paragraph open",
+			content: "- [reference]: /url\n" +
+				"<agent-example>\n" +
+				"<!-- bv-agent-instructions-v99 -->\n" +
+				"example only\n" +
+				"<!-- end-bv-agent-instructions -->\n\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if ContainsAnyBlurb(tt.content) {
+				t.Fatal("marker documentation inside or after a link reference definition counted as installed")
+			}
+			if version := GetBlurbVersion(tt.content); version != 0 {
+				t.Fatalf("GetBlurbVersion()=%d for link-reference documentation, want 0", version)
+			}
+			if got := RemoveBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveBlurb() changed link-reference documentation:\n got: %q\nwant: %q", got, tt.content)
+			}
+		})
+	}
+}
+
+func TestReferenceLikeTextDoesNotCloseAnOpenParagraph(t *testing.T) {
+	tests := []struct {
+		name   string
+		prefix string
+	}{
+		{
+			name:   "definition syntax cannot interrupt paragraph",
+			prefix: "paragraph\n[reference]: /url\n",
+		},
+		{
+			name:   "same-line trailing text invalidates definition",
+			prefix: "[reference]: /url \"title\" trailing\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := tt.prefix + "<agent-example>\n" +
+				BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+			if !ContainsBlurb(content) {
+				t.Fatal("reference-like paragraph text incorrectly enabled a marker-hiding type-7 HTML block")
+			}
+			if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+				t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+			}
+		})
+	}
+}
+
+func TestFenceLookingLineInsideLinkTitleDoesNotLeakFenceState(t *testing.T) {
+	content := "[reference]: /url\n" +
+		"  \"title\n" +
+		"```\n" +
+		"  continued\"\n" +
+		BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+	if !ContainsBlurb(content) {
+		t.Fatal("fence-looking link-title content hid the installed blurb after the definition")
+	}
+	if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+	}
+}
+
+func TestUnindentedNextLineLinkReferenceTitleProtectsMarkerDocumentation(t *testing.T) {
+	// CommonMark 0.31.2 example 195 permits the destination and title on
+	// successive unindented lines. The line ending is sufficient separation.
+	content := "[reference]:\n" +
+		"<my url>\n" +
+		"\"title\n" +
+		"<!-- bv-agent-instructions-v99 -->\n" +
+		"example only\n" +
+		"<!-- end-bv-agent-instructions -->\n" +
+		"continued\"\n"
+	if ContainsAnyBlurb(content) {
+		t.Fatal("valid unindented next-line title exposed marker documentation")
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatalf("RemoveBlurb() changed a valid unindented next-line title:\n got: %q\nwant: %q", got, content)
+	}
+}
+
+func TestTrailingTextInvalidatesNextLineLinkReferenceTitle(t *testing.T) {
+	// CommonMark 0.31.2 example 210 leaves a would-be next-line title in the
+	// following paragraph when non-whitespace trails its closing delimiter.
+	content := "[reference]: /url\n" +
+		"\"ordinary paragraph\n" +
+		BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n" +
+		"continued\" ok\n"
+	if !ContainsBlurb(content) {
+		t.Fatal("invalid next-line title consumed a following paragraph and hid installed markers")
+	}
+	if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+	}
+}
+
+func TestLinkReferenceLabelLimitCountsUnicodeCharacters(t *testing.T) {
+	t.Run("999 multibyte characters remain a valid definition", func(t *testing.T) {
+		content := "[" + strings.Repeat("é", 999) + "]: /url\n" +
+			"<agent-example>\n" +
+			"<!-- bv-agent-instructions-v99 -->\nexample only\n<!-- end-bv-agent-instructions -->\n\n"
+		if ContainsAnyBlurb(content) {
+			t.Fatal("valid 999-character multibyte label exposed marker documentation")
+		}
+		if got := RemoveBlurb(content); got != content {
+			t.Fatalf("RemoveBlurb() changed documentation after a valid multibyte label:\n got: %q\nwant: %q", got, content)
+		}
+	})
+
+	t.Run("1000 characters are not a definition", func(t *testing.T) {
+		content := "[" + strings.Repeat("é", 1000) + "]: /url\n" +
+			"<agent-example>\n" + BlurbStartMarker + "\ninstalled\n" + BlurbEndMarker + "\n"
+		if !ContainsBlurb(content) {
+			t.Fatal("over-limit multibyte label incorrectly enabled a marker-hiding type-7 HTML block")
+		}
+		if count, err := inspectBlurbStructure(content); err != nil || count != 1 {
+			t.Fatalf("inspectBlurbStructure() count=%d err=%v, want 1, nil", count, err)
+		}
+	})
+}
+
+func TestOverBudgetLinkReferenceDefinitionFailsClosed(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "byte budget",
+			content: "[reference]: /url\n\"title\n" +
+				strings.Repeat("x", maxCommonMarkReferenceDefinitionBytes+1) + "\n" +
+				BlurbStartMarker + "\nexample only\n" + BlurbEndMarker + "\n" +
+				"continued title\"\n",
+		},
+		{
+			name: "destination depth budget",
+			content: "[reference]: " +
+				strings.Repeat("(", maxCommonMarkDestinationParenDepth+1) + "url" +
+				strings.Repeat(")", maxCommonMarkDestinationParenDepth+1) + "\n\"title\n" +
+				BlurbStartMarker + "\nexample only\n" + BlurbEndMarker + "\n" +
+				"continued title\"\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !ContainsAnyBlurb(tt.content) {
+				t.Fatal("boolean detection treated budget-limited Markdown as proof that no blurb is present")
+			}
+			if count, err := inspectBlurbStructure(tt.content); err == nil || count != 0 || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+				t.Fatalf("inspectBlurbStructure() count=%d err=%v, want an explicit analysis-limit error", count, err)
+			}
+			if _, err := removeBlurbsChecked(tt.content); err == nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+				t.Fatalf("removeBlurbsChecked() error=%v, want an explicit analysis-limit error", err)
+			}
+			if _, err := updateBlurbChecked(tt.content); err == nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+				t.Fatalf("updateBlurbChecked() error=%v, want an explicit analysis-limit error", err)
+			}
+			if got := RemoveBlurb(tt.content); got != tt.content {
+				t.Fatalf("compatibility RemoveBlurb() changed indeterminate content: got %d bytes, want exact %d bytes", len(got), len(tt.content))
+			}
+		})
+	}
+}
+
+func TestNewlineDenseMaximumSizeContentFailsClosedBeforeLineTableAllocation(t *testing.T) {
+	content := strings.Repeat("\n", maxAgentFileBytes)
+	if len(content) != maxAgentFileBytes {
+		t.Fatalf("fixture size=%d, want exact accepted file limit %d", len(content), maxAgentFileBytes)
+	}
+
+	if lines, err := scanMarkdownLinesChecked(content); err == nil || lines != nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+		t.Fatalf("scanMarkdownLinesChecked() lines=%d err=%v, want pre-allocation line-budget refusal", len(lines), err)
+	}
+	if count, err := inspectBlurbStructure(content); err == nil || count != 0 || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want explicit line-budget refusal", count, err)
+	}
+	if _, err := removeBlurbsChecked(content); err == nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+		t.Fatalf("removeBlurbsChecked() error=%v, want explicit line-budget refusal", err)
+	}
+	if _, err := updateBlurbChecked(content); err == nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+		t.Fatalf("updateBlurbChecked() error=%v, want explicit line-budget refusal", err)
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatal("compatibility removal changed line-budget-limited content")
+	}
+}
+
+func TestContainerDenseMaximumSizeContentFailsClosedBeforeContainerAllocation(t *testing.T) {
+	content := strings.Repeat("> ", maxAgentFileBytes/2)
+	if len(content) != maxAgentFileBytes {
+		t.Fatalf("fixture size=%d, want exact accepted file limit %d", len(content), maxAgentFileBytes)
+	}
+
+	if lines, err := scanMarkdownLinesChecked(content); err == nil || lines != nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+		t.Fatalf("scanMarkdownLinesChecked() lines=%d err=%v, want pre-allocation container-budget refusal", len(lines), err)
+	}
+	if count, err := inspectBlurbStructure(content); err == nil || count != 0 || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+		t.Fatalf("inspectBlurbStructure() count=%d err=%v, want explicit container-budget refusal", count, err)
+	}
+	if _, err := removeBlurbsChecked(content); err == nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+		t.Fatalf("removeBlurbsChecked() error=%v, want explicit container-budget refusal", err)
+	}
+	if _, err := updateBlurbChecked(content); err == nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+		t.Fatalf("updateBlurbChecked() error=%v, want explicit container-budget refusal", err)
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatal("compatibility removal changed container-budget-limited content")
+	}
+}
+
+func TestAggregateMarkdownContainerWorkBudgetFailsClosed(t *testing.T) {
+	line := strings.Repeat("> ", maxMarkdownContainerDepth) + "text\n"
+	lineCount := maxMarkdownContainerPrefixes/maxMarkdownContainerDepth + 1
+	content := strings.Repeat(line, lineCount)
+
+	if _, err := scanMarkdownLinesChecked(content); err == nil || !strings.Contains(err.Error(), "explicit container prefixes") {
+		t.Fatalf("scanMarkdownLinesChecked() error=%v, want aggregate container-work refusal", err)
+	}
+	if _, err := removeBlurbsChecked(content); err == nil || !strings.Contains(err.Error(), "markdown analysis limit exceeded") {
+		t.Fatalf("removeBlurbsChecked() error=%v, want aggregate container-work refusal", err)
+	}
+	if got := RemoveBlurb(content); got != content {
+		t.Fatal("compatibility removal changed aggregate-budget-limited content")
+	}
+}
+
+func TestDuplicateVersionedBlurbRemovalUsesOneLinearRewrite(t *testing.T) {
+	const blockCount = 8192
+	oldBlock := "<!-- bv-agent-instructions-v1 -->\r\nold\r\n" + BlurbEndMarker + "\r\n\r\n"
+	content := "# Header\r\n\r\n" + strings.Repeat(oldBlock, blockCount) + "Tail\r\n"
+
+	removed, err := removeBlurbsChecked(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "# Header\r\nTail\r\n"; removed != want {
+		t.Fatalf("linear duplicate removal produced %d bytes, want %q", len(removed), want)
+	}
+
+	updated, err := updateBlurbChecked(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(updated, BlurbStartMarker); got != 1 {
+		t.Fatalf("updated start-marker count=%d, want 1", got)
+	}
+	if !strings.HasPrefix(updated, "# Header\r\nTail\r\n") {
+		t.Fatalf("linear duplicate update lost surrounding content: prefix=%q", updated[:min(len(updated), 64)])
+	}
+	if withoutCRLF := strings.ReplaceAll(updated, "\r\n", ""); strings.ContainsAny(withoutCRLF, "\r\n") {
+		t.Fatal("linear duplicate update introduced mixed line endings")
+	}
+}
+
 func TestBareEqualsLineStartsParagraph(t *testing.T) {
 	content := "===\n" +
 		"<agent-example>\n" +
@@ -2119,5 +2432,98 @@ func TestNestedEmptyListAfterBlankPreservesOuterScope(t *testing.T) {
 	}
 	if got := RemoveBlurb(content); got != content {
 		t.Fatalf("RemoveBlurb() changed documentation inside outer list:\n got: %q\nwant: %q", got, content)
+	}
+}
+
+func TestSiblingNestedListsPreserveParentScope(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "unordered siblings before versioned example",
+			content: "- parent\n" +
+				"  - first child\n" +
+				"  - second child\n" +
+				"  <!-- bv-agent-instructions-v99 -->\n" +
+				"  example\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+		{
+			name: "ordered siblings before legacy example",
+			content: "1. parent\n" +
+				"   1. first child\n" +
+				"   2. second child\n" +
+				"   ### Using bv as an AI sidecar\n" +
+				"   --robot-insights\n" +
+				"   --robot-plan\n" +
+				"   bv already computes the hard parts for you.\n",
+		},
+		{
+			name: "empty sibling ends at parent depth",
+			content: "- parent\n" +
+				"  - first child\n" +
+				"  -\n\n" +
+				"  <!-- bv-agent-instructions-v99 -->\n" +
+				"  example\n" +
+				"  <!-- end-bv-agent-instructions -->\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if ContainsAnyBlurb(tt.content) {
+				t.Fatal("parent-scoped documentation after nested siblings counted as installed")
+			}
+			if got := RemoveLegacyBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveLegacyBlurb() changed parent-scoped documentation:\n got: %q\nwant: %q", got, tt.content)
+			}
+			if got := RemoveBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveBlurb() changed parent-scoped documentation:\n got: %q\nwant: %q", got, tt.content)
+			}
+		})
+	}
+}
+
+func TestLegacyPatternsInsideTopLevelIndentedCodeArePreserved(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{
+			name: "insights pattern",
+			content: "### Using bv as an AI sidecar\n\n" +
+				"    --robot-insights\n" +
+				"--robot-plan\n" +
+				"bv already computes the hard parts for you.\n",
+		},
+		{
+			name: "plan pattern",
+			content: "### Using bv as an AI sidecar\n\n" +
+				"--robot-insights\n\n" +
+				"    --robot-plan\n" +
+				"bv already computes the hard parts for you.\n",
+		},
+		{
+			name: "differentiator pattern",
+			content: "### Using bv as an AI sidecar\n\n" +
+				"--robot-insights\n" +
+				"--robot-plan\n\n" +
+				"    bv already computes the hard parts for you.\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if ContainsLegacyBlurb(tt.content) {
+				t.Fatal("legacy pattern inside a top-level indented code block counted as installed")
+			}
+			if got := RemoveLegacyBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveLegacyBlurb() changed indented-code documentation:\n got: %q\nwant: %q", got, tt.content)
+			}
+			if got := RemoveBlurb(tt.content); got != tt.content {
+				t.Fatalf("RemoveBlurb() changed indented-code documentation:\n got: %q\nwant: %q", got, tt.content)
+			}
+		})
 	}
 }

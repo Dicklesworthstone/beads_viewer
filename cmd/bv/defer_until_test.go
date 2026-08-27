@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 // bead whose defer_until is still in the future — the closest bv analog to
 // `br ready` — while an elapsed or absent deferral keeps it visible.
 func TestApplyRecipeFilters_ActionableHonoursDeferUntil(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
 	now := time.Now()
 	future := now.Add(90 * 24 * time.Hour)
 	elapsed := now.Add(-time.Minute)
@@ -47,6 +49,7 @@ func TestApplyRecipeFilters_ActionableHonoursDeferUntil(t *testing.T) {
 }
 
 func TestRobotNextClaimablePickSkipsDeferredTopPick(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
 	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
 	future := now.Add(24 * time.Hour)
 	picks := []analysis.TopPick{
@@ -83,10 +86,90 @@ func TestRobotNextClaimablePickSkipsDeferredTopPick(t *testing.T) {
 	}
 }
 
+func TestRobotNextTimestampsPreserveSubsecondClaimBoundary(t *testing.T) {
+	// The handler waits for phase 2 and requires completed claim metrics. Pin a
+	// valid robot epoch so the analysis config runs deterministic algorithms to
+	// completion rather than racing short wall-clock metric deadlines.
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("SOURCE_DATE_EPOCH", "1787392800")
+	t.Setenv("BV_SKIP_PHASE2", "")
+	t.Setenv("BV_PHASE2_TIMEOUT_S", "")
+	t.Setenv("BV_NO_CACHE", "1")
+
+	now := time.Date(2026, 8, 22, 12, 0, 0, 500_000_000, time.UTC)
+	deferUntil := now.Add(250 * time.Millisecond)
+	pick := analysis.TopPick{ID: "DEFERRED-SUBSECOND", Title: "Briefly parked", Score: 100}
+	issue := model.Issue{
+		ID:         pick.ID,
+		Title:      pick.Title,
+		Status:     model.StatusOpen,
+		IssueType:  model.TypeTask,
+		DeferUntil: &deferUntil,
+	}
+
+	reasons := robotNextClaimabilityReasons(pick, map[string]model.Issue{issue.ID: issue}, now)
+	if len(reasons) != 1 {
+		t.Fatalf("subsecond deferral reasons = %v, want exactly one", reasons)
+	}
+	generatedAt := formatRobotNextTime(now)
+	wantDeferUntil := formatRobotNextTime(deferUntil)
+	if generatedAt != "2026-08-22T12:00:00.5Z" || wantDeferUntil != "2026-08-22T12:00:00.75Z" {
+		t.Fatalf("precise times = generated %q, defer %q", generatedAt, wantDeferUntil)
+	}
+	if !strings.Contains(reasons[0], wantDeferUntil) {
+		t.Fatalf("deferral reason %q does not preserve %q", reasons[0], wantDeferUntil)
+	}
+	if generatedAt >= wantDeferUntil {
+		t.Fatalf("serialized claim clock %q must precede deferral %q", generatedAt, wantDeferUntil)
+	}
+	runAt := func(decisionTime time.Time) robotNextOutput {
+		t.Helper()
+		var output bytes.Buffer
+		if err := handleRobotNextAt(RobotContext{
+			DataHash: "subsecond-fixture",
+			Issues:   []model.Issue{issue},
+			Encoder:  json.NewEncoder(&output),
+		}, phaseThreeRobotHandlerConfig{}, decisionTime); err != nil {
+			t.Fatalf("handleRobotNextAt(%s): %v", decisionTime.Format(time.RFC3339Nano), err)
+		}
+		var decoded robotNextOutput
+		if err := json.Unmarshal(output.Bytes(), &decoded); err != nil {
+			t.Fatalf("decode robot-next output: %v\n%s", err, output.String())
+		}
+		return decoded
+	}
+
+	decoded := runAt(now)
+	if decoded.GeneratedAt != generatedAt {
+		t.Fatalf("robot-next generated_at = %q, want exact decision clock %q", decoded.GeneratedAt, generatedAt)
+	}
+	if decoded.Actionable || decoded.ClaimCmd != "" {
+		t.Fatalf("pre-boundary robot-next output is claimable: %+v", decoded)
+	}
+	if len(decoded.Degraded) != 1 || decoded.Degraded[0].Code != "no_actionable_recommendation" {
+		t.Fatalf("pre-boundary degradation = %+v, want no_actionable_recommendation", decoded.Degraded)
+	}
+
+	if reasons := robotNextClaimabilityReasons(pick, map[string]model.Issue{issue.ID: issue}, deferUntil); len(reasons) != 0 {
+		t.Fatalf("exact defer_until instant must be claimable, got reasons %v", reasons)
+	}
+	boundary := runAt(deferUntil)
+	if boundary.GeneratedAt != wantDeferUntil {
+		t.Fatalf("boundary generated_at = %q, want %q", boundary.GeneratedAt, wantDeferUntil)
+	}
+	if !boundary.Actionable || boundary.ID != issue.ID || boundary.ClaimCmd != "br update DEFERRED-SUBSECOND --status=in_progress" {
+		t.Fatalf("boundary robot-next output is not the expected claim: %+v", boundary)
+	}
+	if len(boundary.Degraded) != 0 {
+		t.Fatalf("boundary degradation = %+v, want none", boundary.Degraded)
+	}
+}
+
 // End-to-end through the built binary: a P0 bead deferred into the future
 // must not be handed out by --robot-next, must not appear in --robot-triage
 // top picks or the --robot-plan, and must drop out of `--recipe actionable`.
 func TestRobotCommandsHonourDeferUntilEndToEnd(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
 	dir := t.TempDir()
 	beadsDir := filepath.Join(dir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
@@ -99,9 +182,10 @@ func TestRobotCommandsHonourDeferUntilEndToEnd(t *testing.T) {
 {"id":"ELAPSED-1","title":"Deferral over","status":"open","priority":3,"issue_type":"task","defer_until":"2026-01-01T00:00:00Z"}
 {"id":"READY-1","title":"Ready work","status":"open","priority":2,"issue_type":"task"}
 `
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(beads), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(beads), 0o644); err != nil {
 		t.Fatalf("write beads: %v", err)
 	}
+	writeCurrentBRMetadata(t, beadsDir)
 
 	exe := buildTestBinary(t)
 	run := func(args ...string) []byte {
@@ -119,17 +203,19 @@ func TestRobotCommandsHonourDeferUntilEndToEnd(t *testing.T) {
 		return out
 	}
 
-	// --robot-next: READY-1 (P2) wins over the parked P0 and the P3.
+	// --robot-next uses the pinned clock for deterministic ranking, but must not
+	// emit a live mutation command from that non-live clock.
 	var next struct {
-		Actionable bool   `json:"actionable"`
-		ID         string `json:"id"`
+		Actionable bool                   `json:"actionable"`
+		ID         string                 `json:"id"`
+		Degraded   []robotNextDegradation `json:"degraded"`
 	}
 	nextOut := run("--robot-next")
 	if err := json.Unmarshal(nextOut, &next); err != nil {
 		t.Fatalf("robot-next json: %v\n%s", err, nextOut)
 	}
-	if !next.Actionable || next.ID != "READY-1" {
-		t.Fatalf("robot-next = %+v, want READY-1; payload=%s", next, nextOut)
+	if next.Actionable || next.ID != "" || len(next.Degraded) == 0 {
+		t.Fatalf("robot-next = %+v, want a pinned-clock no-claim result; payload=%s", next, nextOut)
 	}
 
 	// --robot-triage: top picks exclude FUTURE-1; its recommendation carries
@@ -150,6 +236,9 @@ func TestRobotCommandsHonourDeferUntilEndToEnd(t *testing.T) {
 	if triage.Triage.QuickRef.Actionable != 2 {
 		t.Fatalf("quick_ref.actionable = %d, want 2\n%s", triage.Triage.QuickRef.Actionable, triageOut)
 	}
+	if len(triage.Triage.QuickRef.TopPicks) != 0 {
+		t.Fatalf("pinned-clock triage exposed claimable top picks: %s", triageOut)
+	}
 	for _, pick := range triage.Triage.QuickRef.TopPicks {
 		if pick.ID == "FUTURE-1" {
 			t.Fatalf("robot-triage leaked deferred bead into top_picks: %s", triageOut)
@@ -164,8 +253,8 @@ func TestRobotCommandsHonourDeferUntilEndToEnd(t *testing.T) {
 		if rec.DeferUntil == nil || !rec.DeferUntil.Equal(time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)) {
 			t.Fatalf("FUTURE-1 recommendation defer_until = %v", rec.DeferUntil)
 		}
-		if !strings.Contains(rec.Action, "Deferred until 2026-12-01T00:00:00Z") {
-			t.Fatalf("FUTURE-1 action = %q, want deferral guidance", rec.Action)
+		if !strings.Contains(rec.Action, "Inspect only") {
+			t.Fatalf("FUTURE-1 action = %q, want non-mutating pinned-clock guidance", rec.Action)
 		}
 	}
 	if !sawFuture {

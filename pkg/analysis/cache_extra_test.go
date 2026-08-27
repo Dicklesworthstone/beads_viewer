@@ -18,7 +18,22 @@ import (
 func TestCacheSetTTLAndHash(t *testing.T) {
 	issues := []model.Issue{{ID: "C1", Title: "Cache"}}
 	c := NewCache(10 * time.Second)
-	stats := &GraphStats{NodeCount: 1}
+	completed := statusEntry{State: "computed"}
+	stats := &GraphStats{
+		NodeCount:   1,
+		phase2Ready: true,
+		status: MetricStatus{
+			PageRank:     completed,
+			Betweenness:  completed,
+			Eigenvector:  completed,
+			HITS:         completed,
+			Critical:     completed,
+			Cycles:       completed,
+			KCore:        completed,
+			Articulation: completed,
+			Slack:        completed,
+		},
+	}
 	c.Set(issues, stats)
 	if c.Hash() == "" {
 		t.Fatalf("expected hash after Set")
@@ -375,6 +390,12 @@ func TestRobotDiskCacheRejectsIsolatedCompletedResultCorruption(t *testing.T) {
 			},
 		},
 		{
+			name: "transient page rank timeout is not reusable",
+			mutate: func(entry *robotAnalysisDiskCacheEntry) {
+				entry.Result.Status.PageRank.State = "timeout"
+			},
+		},
+		{
 			name: "disabled betweenness status is computed",
 			mutate: func(entry *robotAnalysisDiskCacheEntry) {
 				entry.Result.Status.Betweenness.State = "computed"
@@ -438,13 +459,18 @@ func TestRobotDiskCacheRejectsIsolatedCompletedResultCorruption(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			entry := valid
+			// Decode the writer-produced bytes afresh so mutations to nested maps
+			// in one case cannot contaminate the supposedly isolated cases after it.
+			var entry robotAnalysisDiskCacheEntry
+			if err := json.Unmarshal(raw, &entry); err != nil {
+				t.Fatalf("decode clean writer entry: %v", err)
+			}
 			tt.mutate(&entry)
-			raw, err := json.Marshal(entry)
+			encoded, err := json.Marshal(entry)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(path, raw, 0o644); err != nil {
+			if err := os.WriteFile(path, encoded, 0o644); err != nil {
 				t.Fatal(err)
 			}
 
@@ -460,28 +486,28 @@ func TestRobotDiskCacheRejectsIsolatedCompletedResultCorruption(t *testing.T) {
 
 func TestCompletedCacheValidationRejectsNegativeBetweenness(t *testing.T) {
 	blob := graphStatsCacheBlob{
-		decoded:          true,
-		NodeCount:        1,
-		PageRank:         map[string]float64{"node": 1},
-		Betweenness:      map[string]float64{"node": -1},
-		Eigenvector:      map[string]float64{},
-		Hubs:             map[string]float64{},
-		Authorities:      map[string]float64{},
+		decoded:           true,
+		NodeCount:         1,
+		PageRank:          map[string]float64{"node": 1},
+		Betweenness:       map[string]float64{"node": -1},
+		Eigenvector:       map[string]float64{},
+		Hubs:              map[string]float64{},
+		Authorities:       map[string]float64{},
 		CriticalPathScore: map[string]float64{},
 		Config: AnalysisConfig{
 			ComputePageRank:    true,
 			ComputeBetweenness: true,
 		},
 		Status: MetricStatus{
-			PageRank:    statusEntry{State: "computed"},
-			Betweenness: statusEntry{State: "computed"},
-			Eigenvector: statusEntry{State: "skipped"},
-			HITS:        statusEntry{State: "skipped"},
-			Critical:    statusEntry{State: "skipped"},
-			Cycles:      statusEntry{State: "skipped"},
-			KCore:       statusEntry{State: "skipped"},
+			PageRank:     statusEntry{State: "computed"},
+			Betweenness:  statusEntry{State: "computed"},
+			Eigenvector:  statusEntry{State: "skipped"},
+			HITS:         statusEntry{State: "skipped"},
+			Critical:     statusEntry{State: "skipped"},
+			Cycles:       statusEntry{State: "skipped"},
+			KCore:        statusEntry{State: "skipped"},
 			Articulation: statusEntry{State: "skipped"},
-			Slack:       statusEntry{State: "skipped"},
+			Slack:        statusEntry{State: "skipped"},
 		},
 	}
 

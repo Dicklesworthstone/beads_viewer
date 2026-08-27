@@ -56,6 +56,11 @@ type CommitListEntry struct {
 	Timestamp string
 	FileCount int
 	BeadIDs   []string // Beads related to this commit
+
+	// sortTimestamp retains the complete commit instant. Timestamp is formatted
+	// only to minute precision for display, so sorting on it can reverse commits
+	// from the same minute when the SHA tie-breaker happens to disagree with time.
+	sortTimestamp time.Time
 }
 
 // historySearchMode tracks what type of search is active (bv-nkrj)
@@ -225,50 +230,9 @@ func (h *HistoryModel) SetReport(report *correlation.HistoryReport) {
 	// drop an active query and leave git-mode results tied to the old report.
 	h.applySearchFilter()
 	if h.viewMode == historyModeBead {
-		h.selectedBead = 0
-		h.selectedCommit = 0
-		for i, beadID := range h.beadIDs {
-			if beadID != selectedBeadID {
-				continue
-			}
-			h.selectedBead = i
-			for j := range h.histories[i].Commits {
-				if h.histories[i].Commits[j].SHA == selectedBeadCommitSHA {
-					h.selectedCommit = j
-					break
-				}
-			}
-			break
-		}
-		h.ensureBeadVisible()
-		if h.selectedBead < len(h.histories) {
-			h.ensureMiddleScrollVisible(h.selectedCommit, len(h.histories[h.selectedBead].Commits))
-		} else {
-			h.middleScrollOffset = 0
-		}
+		h.restoreBeadSelection(selectedBeadID, selectedBeadCommitSHA)
 	} else {
-		commits := h.GetFilteredCommitList()
-		h.selectedGitCommit = 0
-		h.selectedRelatedBead = 0
-		for i := range commits {
-			if commits[i].SHA != selectedGitSHA {
-				continue
-			}
-			h.selectedGitCommit = i
-			for j, beadID := range commits[i].BeadIDs {
-				if beadID == selectedRelatedBead {
-					h.selectedRelatedBead = j
-					break
-				}
-			}
-			break
-		}
-		h.ensureGitCommitVisible()
-		if h.selectedGitCommit < len(commits) {
-			h.ensureMiddleScrollVisible(h.selectedRelatedBead, len(commits[h.selectedGitCommit].BeadIDs))
-		} else {
-			h.middleScrollOffset = 0
-		}
+		h.restoreGitSelection(selectedGitSHA, selectedRelatedBead)
 	}
 	// Timeline rows are derived from the whole report and do not have a stable
 	// row identity across refreshes. Reset rather than retaining an invalid old
@@ -297,6 +261,55 @@ func (h *HistoryModel) SetReport(report *correlation.HistoryReport) {
 		} else if h.fileTreeScroll >= len(h.flatFileList) {
 			h.fileTreeScroll = len(h.flatFileList) - 1
 		}
+	}
+}
+
+func (h *HistoryModel) restoreBeadSelection(beadID, commitSHA string) {
+	h.selectedBead = 0
+	h.selectedCommit = 0
+	for i, candidateID := range h.beadIDs {
+		if candidateID != beadID {
+			continue
+		}
+		h.selectedBead = i
+		for j := range h.histories[i].Commits {
+			if h.histories[i].Commits[j].SHA == commitSHA {
+				h.selectedCommit = j
+				break
+			}
+		}
+		break
+	}
+	h.ensureBeadVisible()
+	if h.selectedBead >= 0 && h.selectedBead < len(h.histories) {
+		h.ensureMiddleScrollVisible(h.selectedCommit, len(h.histories[h.selectedBead].Commits))
+	} else {
+		h.middleScrollOffset = 0
+	}
+}
+
+func (h *HistoryModel) restoreGitSelection(commitSHA, relatedBeadID string) {
+	commits := h.GetFilteredCommitList()
+	h.selectedGitCommit = 0
+	h.selectedRelatedBead = 0
+	for i := range commits {
+		if commits[i].SHA != commitSHA {
+			continue
+		}
+		h.selectedGitCommit = i
+		for j, beadID := range commits[i].BeadIDs {
+			if beadID == relatedBeadID {
+				h.selectedRelatedBead = j
+				break
+			}
+		}
+		break
+	}
+	h.ensureGitCommitVisible()
+	if h.selectedGitCommit >= 0 && h.selectedGitCommit < len(commits) {
+		h.ensureMiddleScrollVisible(h.selectedRelatedBead, len(commits[h.selectedGitCommit].BeadIDs))
+	} else {
+		h.middleScrollOffset = 0
 	}
 }
 
@@ -335,7 +348,7 @@ func (h *HistoryModel) ClearSessionCache() {
 func (h *HistoryModel) rebuildFilteredList() {
 	// Capture current selection
 	var selectedID string
-	if h.selectedBead < len(h.beadIDs) {
+	if h.selectedBead >= 0 && h.selectedBead < len(h.beadIDs) {
 		selectedID = h.beadIDs[h.selectedBead]
 	}
 
@@ -355,17 +368,17 @@ func (h *HistoryModel) rebuildFilteredList() {
 
 		// Apply author filter
 		if h.authorFilter != "" {
-			authorMatch := false
+			var filtered []correlation.CorrelatedCommit
 			for _, c := range history.Commits {
 				if strings.Contains(strings.ToLower(c.Author), strings.ToLower(h.authorFilter)) ||
 					strings.Contains(strings.ToLower(c.AuthorEmail), strings.ToLower(h.authorFilter)) {
-					authorMatch = true
-					break
+					filtered = append(filtered, c)
 				}
 			}
-			if !authorMatch {
+			if len(filtered) == 0 {
 				continue
 			}
+			history.Commits = filtered
 		}
 
 		// Apply confidence filter - keep only commits meeting threshold
@@ -451,6 +464,8 @@ func (h *HistoryModel) rebuildFilteredList() {
 func (h *HistoryModel) SetSize(width, height int) {
 	h.width = width
 	h.height = height
+	timelineWidth, timelineHeight := h.timelinePanelSize()
+	h.clampTimelineScrollOffset(timelineWidth, timelineHeight)
 
 	// Adjust focus if pane is lost due to resize
 	panes := h.paneCount()
@@ -462,16 +477,146 @@ func (h *HistoryModel) SetSize(width, height int) {
 	}
 }
 
+type renderedTimelineLayout struct {
+	title          string
+	entries        []string
+	summary        string
+	entryRowBudget int
+	showScroll     bool
+}
+
+func renderedTimelineRows(entries []string) int {
+	rows := 0
+	for _, entry := range entries {
+		rows += lipgloss.Height(entry)
+	}
+	return rows
+}
+
+func timelineWindowEnd(entries []string, start, rowBudget int) int {
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(entries) || rowBudget <= 0 {
+		return start
+	}
+
+	rows := 0
+	end := start
+	for end < len(entries) {
+		entryRows := lipgloss.Height(entries[end])
+		if rows+entryRows > rowBudget {
+			break
+		}
+		rows += entryRows
+		end++
+	}
+	return end
+}
+
+func timelineFinalWindowStart(entries []string, rowBudget int) int {
+	if len(entries) == 0 || rowBudget <= 0 {
+		return 0
+	}
+
+	rows := 0
+	start := len(entries)
+	for start > 0 {
+		entryRows := lipgloss.Height(entries[start-1])
+		if rows+entryRows > rowBudget {
+			break
+		}
+		rows += entryRows
+		start--
+	}
+	return start
+}
+
+func (h *HistoryModel) timelinePanelSize() (width, height int) {
+	width = int(float64(h.width) * 0.22)
+	if width < 1 {
+		width = 1
+	}
+	height = historyPanelHeight(h.height, h.renderHeader())
+	return width, height
+}
+
+func (h *HistoryModel) layoutTimeline(hist *correlation.BeadHistory, width, height int) renderedTimelineLayout {
+	entries := h.buildTimeline(*hist)
+	layout := renderedTimelineLayout{
+		title:   h.renderTimelineTitle(width, hist.BeadID),
+		entries: make([]string, len(entries)),
+		summary: h.renderTimelineSummary(hist, width),
+	}
+	for i := range entries {
+		layout.entries[i] = h.renderTimelineEntry(entries[i], width)
+	}
+
+	contentRows := height - 2 // Rounded border.
+	if contentRows < 0 {
+		contentRows = 0
+	}
+	maxEntryRows := 0
+	for _, entry := range layout.entries {
+		maxEntryRows = max(maxEntryRows, lipgloss.Height(entry))
+	}
+	fixedRows := lipgloss.Height(layout.title)
+	if len(layout.entries) == 0 {
+		fixedRows += 2 // Blank line plus the empty-state message.
+	}
+	if layout.summary != "" {
+		summaryRows := lipgloss.Height(layout.summary)
+		// Timeline events are the panel's primary content. Keep the optional
+		// summary only when the tallest relevant entry can still render whole.
+		if fixedRows+summaryRows+maxEntryRows <= contentRows {
+			fixedRows += summaryRows
+		} else {
+			layout.summary = ""
+		}
+	}
+
+	availableRows := contentRows - fixedRows
+	if availableRows < 0 {
+		availableRows = 0
+	}
+	layout.entryRowBudget = availableRows
+	if renderedTimelineRows(layout.entries) > availableRows && availableRows > maxEntryRows {
+		// Reserve one row for the scroll indicator only when every individual
+		// entry can still fit in the remaining viewport.
+		layout.showScroll = true
+		layout.entryRowBudget--
+	}
+	return layout
+}
+
+func (h *HistoryModel) timelineMaxScroll(width, height int) int {
+	hist := h.SelectedHistory()
+	if hist == nil {
+		return 0
+	}
+	layout := h.layoutTimeline(hist, width, height)
+	return timelineFinalWindowStart(layout.entries, layout.entryRowBudget)
+}
+
+func (h *HistoryModel) clampTimelineScrollOffset(width, height int) {
+	if h.timelineScrollOffset < 0 {
+		h.timelineScrollOffset = 0
+	}
+	if maxScroll := h.timelineMaxScroll(width, height); h.timelineScrollOffset > maxScroll {
+		h.timelineScrollOffset = maxScroll
+	}
+}
+
 // SetAuthorFilter sets the author filter and rebuilds the list
 func (h *HistoryModel) SetAuthorFilter(author string) {
 	h.authorFilter = author
-	h.rebuildFilteredList()
+	h.applySearchFilter()
 }
 
 // SetMinConfidence sets the minimum confidence threshold and rebuilds the list
 func (h *HistoryModel) SetMinConfidence(conf float64) {
 	h.minConfidence = conf
-	h.rebuildFilteredList()
+	h.applySearchFilter()
 }
 
 // File tree methods (bv-190l)
@@ -654,6 +799,12 @@ func (h *HistoryModel) MoveUpFileTree() {
 
 // MoveDownFileTree moves selection down in the file tree
 func (h *HistoryModel) MoveDownFileTree() {
+	if h.selectedFileIdx < 0 {
+		if len(h.flatFileList) > 0 {
+			h.selectedFileIdx = 0
+		}
+		return
+	}
 	if h.selectedFileIdx < len(h.flatFileList)-1 {
 		h.selectedFileIdx++
 	}
@@ -661,7 +812,7 @@ func (h *HistoryModel) MoveDownFileTree() {
 
 // ToggleExpandFile expands or collapses the selected directory
 func (h *HistoryModel) ToggleExpandFile() {
-	if h.selectedFileIdx >= len(h.flatFileList) {
+	if h.selectedFileIdx < 0 || h.selectedFileIdx >= len(h.flatFileList) {
 		return
 	}
 	node := h.flatFileList[h.selectedFileIdx]
@@ -673,7 +824,7 @@ func (h *HistoryModel) ToggleExpandFile() {
 
 // SelectFile sets the file filter to the selected file
 func (h *HistoryModel) SelectFile() {
-	if h.selectedFileIdx >= len(h.flatFileList) {
+	if h.selectedFileIdx < 0 || h.selectedFileIdx >= len(h.flatFileList) {
 		return
 	}
 	node := h.flatFileList[h.selectedFileIdx]
@@ -682,13 +833,13 @@ func (h *HistoryModel) SelectFile() {
 	} else {
 		h.fileFilter = node.Path
 	}
-	h.rebuildFilteredList()
+	h.applySearchFilter()
 }
 
 // ClearFileFilter clears the file filter
 func (h *HistoryModel) ClearFileFilter() {
 	h.fileFilter = ""
-	h.rebuildFilteredList()
+	h.applySearchFilter()
 }
 
 // GetFileFilter returns the current file filter
@@ -698,7 +849,7 @@ func (h *HistoryModel) GetFileFilter() string {
 
 // SelectedFileName returns the name of the selected file/directory
 func (h *HistoryModel) SelectedFileName() string {
-	if h.selectedFileIdx >= len(h.flatFileList) {
+	if h.selectedFileIdx < 0 || h.selectedFileIdx >= len(h.flatFileList) {
 		return ""
 	}
 	return h.flatFileList[h.selectedFileIdx].Name
@@ -706,7 +857,7 @@ func (h *HistoryModel) SelectedFileName() string {
 
 // SelectedFileNode returns the currently selected file tree node
 func (h *HistoryModel) SelectedFileNode() *FileTreeNode {
-	if h.selectedFileIdx >= len(h.flatFileList) {
+	if h.selectedFileIdx < 0 || h.selectedFileIdx >= len(h.flatFileList) {
 		return nil
 	}
 	return h.flatFileList[h.selectedFileIdx]
@@ -714,7 +865,7 @@ func (h *HistoryModel) SelectedFileNode() *FileTreeNode {
 
 // CollapseFileNode collapses the selected node if it's an expanded directory
 func (h *HistoryModel) CollapseFileNode() {
-	if h.selectedFileIdx >= len(h.flatFileList) {
+	if h.selectedFileIdx < 0 || h.selectedFileIdx >= len(h.flatFileList) {
 		return
 	}
 	node := h.flatFileList[h.selectedFileIdx]
@@ -733,9 +884,12 @@ func (h *HistoryModel) MoveUp() {
 			h.selectedBead--
 			h.selectedCommit = 0
 			h.middleScrollOffset = 0 // Reset middle scroll when changing bead (bv-xrfh)
+			h.timelineScrollOffset = 0
 			h.ensureBeadVisible()
 		}
 	} else if h.focused == historyFocusTimeline {
+		timelineWidth, timelineHeight := h.timelinePanelSize()
+		h.clampTimelineScrollOffset(timelineWidth, timelineHeight)
 		if h.timelineScrollOffset > 0 {
 			h.timelineScrollOffset--
 		}
@@ -744,7 +898,7 @@ func (h *HistoryModel) MoveUp() {
 		if h.selectedCommit > 0 {
 			h.selectedCommit--
 			// Update middle pane scroll if in three-pane layout (bv-xrfh)
-			if h.focused == historyFocusMiddle && h.selectedBead < len(h.histories) {
+			if h.focused == historyFocusMiddle && h.selectedBead >= 0 && h.selectedBead < len(h.histories) {
 				h.ensureMiddleScrollVisible(h.selectedCommit, len(h.histories[h.selectedBead].Commits))
 			}
 		}
@@ -758,29 +912,18 @@ func (h *HistoryModel) MoveDown() {
 			h.selectedBead++
 			h.selectedCommit = 0
 			h.middleScrollOffset = 0 // Reset middle scroll when changing bead (bv-xrfh)
+			h.timelineScrollOffset = 0
 			h.ensureBeadVisible()
 		}
 	} else if h.focused == historyFocusTimeline {
-		if h.report != nil && h.selectedBead < len(h.beadIDs) {
-			beadID := h.beadIDs[h.selectedBead]
-			if hist, ok := h.report.Histories[beadID]; ok {
-				entries := h.buildTimeline(hist)
-				maxVisible := h.height - 8
-				if maxVisible < 3 {
-					maxVisible = 3
-				}
-				maxScroll := len(entries) - maxVisible
-				if maxScroll < 0 {
-					maxScroll = 0
-				}
-				if h.timelineScrollOffset < maxScroll {
-					h.timelineScrollOffset++
-				}
-			}
+		timelineWidth, timelineHeight := h.timelinePanelSize()
+		h.clampTimelineScrollOffset(timelineWidth, timelineHeight)
+		if h.timelineScrollOffset < h.timelineMaxScroll(timelineWidth, timelineHeight) {
+			h.timelineScrollOffset++
 		}
 	} else {
 		// In middle or detail pane, move to next commit
-		if h.selectedBead < len(h.histories) {
+		if h.selectedBead >= 0 && h.selectedBead < len(h.histories) {
 			commits := h.histories[h.selectedBead].Commits
 			if h.selectedCommit < len(commits)-1 {
 				h.selectedCommit++
@@ -835,7 +978,7 @@ func (h *HistoryModel) IsDetailFocused() bool {
 
 // NextCommit moves to the next commit within the selected bead (J key)
 func (h *HistoryModel) NextCommit() {
-	if h.selectedBead >= len(h.histories) {
+	if h.selectedBead < 0 || h.selectedBead >= len(h.histories) {
 		return
 	}
 	commits := h.histories[h.selectedBead].Commits
@@ -874,7 +1017,7 @@ func (h *HistoryModel) GetMinConfidence() float64 {
 
 // ToggleExpand expands/collapses the commits for the selected bead
 func (h *HistoryModel) ToggleExpand() {
-	if h.selectedBead < len(h.beadIDs) {
+	if h.selectedBead >= 0 && h.selectedBead < len(h.beadIDs) {
 		beadID := h.beadIDs[h.selectedBead]
 		h.expandedBeads[beadID] = !h.expandedBeads[beadID]
 	}
@@ -961,6 +1104,22 @@ func (h *HistoryModel) UpdateSearchInput(msg tea.Msg) tea.Cmd {
 
 // applySearchFilter filters the data based on current search query
 func (h *HistoryModel) applySearchFilter() {
+	selectedBeadID := ""
+	selectedBeadCommitSHA := ""
+	selectedGitSHA := ""
+	selectedRelatedBead := ""
+	if h.viewMode == historyModeGit {
+		if selected := h.SelectedGitCommit(); selected != nil {
+			selectedGitSHA = selected.SHA
+			selectedRelatedBead = h.SelectedRelatedBeadID()
+		}
+	} else {
+		selectedBeadID = h.SelectedBeadID()
+		if selected := h.SelectedCommit(); selected != nil {
+			selectedBeadCommitSHA = selected.SHA
+		}
+	}
+
 	// Always rebuild base filtered list first (applies author/confidence filters)
 	// This ensures we always filter from the complete set, not an already-filtered list
 	// (bv-nkrj fix: backspacing to relax filter now works correctly)
@@ -972,15 +1131,24 @@ func (h *HistoryModel) applySearchFilter() {
 	query := strings.TrimSpace(h.searchInput.Value())
 	if query == "" {
 		h.filteredCommits = nil // Use full commitList in git mode
-		return
+	} else {
+		// Apply search filter on top of base filters.
+		if h.viewMode == historyModeGit {
+			h.filterCommitList(query)
+		} else {
+			h.filterBeadList(query)
+		}
 	}
 
-	// Apply search filter on top of base filters
 	if h.viewMode == historyModeGit {
-		h.filterCommitList(query)
+		h.restoreGitSelection(selectedGitSHA, selectedRelatedBead)
 	} else {
-		h.filterBeadList(query)
+		h.restoreBeadSelection(selectedBeadID, selectedBeadCommitSHA)
 	}
+	// Timeline rows and their count are derived from the filtered commit slice.
+	// Retaining an offset from the previous slice can strand navigation beyond
+	// the new maximum even though rendering locally displays the first row.
+	h.timelineScrollOffset = 0
 }
 
 // filterCommitList filters commits in git mode based on search query
@@ -1054,6 +1222,12 @@ func (h *HistoryModel) commitMatchesQuery(commit CommitListEntry, query string) 
 			if strings.Contains(strings.ToLower(beadID), query) {
 				return true
 			}
+			if h.report != nil {
+				if hist, ok := h.report.Histories[beadID]; ok &&
+					strings.Contains(strings.ToLower(hist.Title), query) {
+					return true
+				}
+			}
 		}
 		return false
 	}
@@ -1069,12 +1243,14 @@ func (h *HistoryModel) filterBeadList(query string) {
 	var filteredHistories []correlation.BeadHistory
 	var filteredIDs []string
 
-	for _, beadID := range h.beadIDs {
-		if hist, ok := h.report.Histories[beadID]; ok {
-			if h.beadMatchesQuery(beadID, hist, query) {
-				filteredHistories = append(filteredHistories, hist)
-				filteredIDs = append(filteredIDs, beadID)
-			}
+	// h.histories already carries the author/confidence/file-filtered commit
+	// slices. Searching the raw report here would resurrect commits excluded by
+	// those base filters and make the displayed rows disagree with the badges.
+	for _, hist := range h.histories {
+		beadID := hist.BeadID
+		if h.beadMatchesQuery(beadID, hist, query) {
+			filteredHistories = append(filteredHistories, hist)
+			filteredIDs = append(filteredIDs, beadID)
 		}
 	}
 
@@ -1177,6 +1353,7 @@ func (h *HistoryModel) ToggleViewMode() {
 		h.selectedBead = 0
 		h.selectedCommit = 0
 		h.scrollOffset = 0
+		h.timelineScrollOffset = 0
 	}
 	// Re-apply preserved search query after mode changes, even after the input
 	// has been submitted and blurred.
@@ -1201,8 +1378,11 @@ func (h *HistoryModel) buildCommitList() {
 	beadIDsBySHA := make(map[string]map[string]struct{})
 	var entries []CommitListEntry
 
-	// Collect all commits from all bead histories
-	for beadID, hist := range h.report.Histories {
+	// Collect commits from the base filtered histories. Search is applied to the
+	// resulting commit list below, but author, confidence, and file filters have
+	// already narrowed h.histories and must affect git-centric mode too.
+	for _, hist := range h.histories {
+		beadID := hist.BeadID
 		for _, commit := range hist.Commits {
 			if entryIndex, ok := entryIndexBySHA[commit.SHA]; ok {
 				if _, ok := beadIDsBySHA[commit.SHA][beadID]; !ok {
@@ -1216,13 +1396,14 @@ func (h *HistoryModel) buildCommitList() {
 			beadIDsBySHA[commit.SHA] = map[string]struct{}{beadID: {}}
 
 			entries = append(entries, CommitListEntry{
-				SHA:       commit.SHA,
-				ShortSHA:  commit.ShortSHA,
-				Message:   commit.Message,
-				Author:    commit.Author,
-				Timestamp: commit.Timestamp.Format("2006-01-02 15:04"),
-				FileCount: len(commit.Files),
-				BeadIDs:   []string{beadID},
+				SHA:           commit.SHA,
+				ShortSHA:      commit.ShortSHA,
+				Message:       commit.Message,
+				Author:        commit.Author,
+				Timestamp:     commit.Timestamp.Format("2006-01-02 15:04"),
+				FileCount:     len(commit.Files),
+				BeadIDs:       []string{beadID},
+				sortTimestamp: commit.Timestamp,
 			})
 		}
 	}
@@ -1231,15 +1412,14 @@ func (h *HistoryModel) buildCommitList() {
 		sort.Strings(entries[i].BeadIDs)
 	}
 
-	// Sort by timestamp descending (most recent first)
-	// Note: We parse from formatted string since we stored it that way
+	// Sort by the complete timestamp descending (most recent first). The display
+	// string intentionally omits seconds and therefore cannot be the sort key.
 	sort.Slice(entries, func(i, j int) bool {
-		timestampOrder := strings.Compare(entries[i].Timestamp, entries[j].Timestamp)
-		if timestampOrder == 0 {
-			// Deterministic fallback for commits in same minute
+		if entries[i].sortTimestamp.Equal(entries[j].sortTimestamp) {
+			// Deterministic fallback for commits at the same instant.
 			return entries[i].SHA > entries[j].SHA
 		}
-		return timestampOrder > 0
+		return entries[i].sortTimestamp.After(entries[j].sortTimestamp)
 	})
 
 	h.commitList = entries
@@ -1281,7 +1461,7 @@ func (h *HistoryModel) MoveDownGit() {
 		}
 	} else {
 		// In middle or detail pane, move to next related bead
-		if h.selectedGitCommit < len(commits) {
+		if h.selectedGitCommit >= 0 && h.selectedGitCommit < len(commits) {
 			beadCount := len(commits[h.selectedGitCommit].BeadIDs)
 			if h.selectedRelatedBead < beadCount-1 {
 				h.selectedRelatedBead++
@@ -1297,7 +1477,7 @@ func (h *HistoryModel) MoveDownGit() {
 // NextRelatedBead moves to the next related bead in git mode (J key)
 func (h *HistoryModel) NextRelatedBead() {
 	commits := h.GetFilteredCommitList() // Use filtered list (bv-nkrj)
-	if h.selectedGitCommit >= len(commits) {
+	if h.selectedGitCommit < 0 || h.selectedGitCommit >= len(commits) {
 		return
 	}
 	beadCount := len(commits[h.selectedGitCommit].BeadIDs)
@@ -1316,7 +1496,7 @@ func (h *HistoryModel) PrevRelatedBead() {
 // SelectedGitCommit returns the selected commit in git mode
 func (h *HistoryModel) SelectedGitCommit() *CommitListEntry {
 	commits := h.GetFilteredCommitList() // Use filtered list (bv-nkrj)
-	if h.selectedGitCommit < len(commits) {
+	if h.selectedGitCommit >= 0 && h.selectedGitCommit < len(commits) {
 		return &commits[h.selectedGitCommit]
 	}
 	return nil
@@ -1325,7 +1505,7 @@ func (h *HistoryModel) SelectedGitCommit() *CommitListEntry {
 // SelectedRelatedBeadID returns the currently selected related bead ID in git mode
 func (h *HistoryModel) SelectedRelatedBeadID() string {
 	commit := h.SelectedGitCommit()
-	if commit != nil && h.selectedRelatedBead < len(commit.BeadIDs) {
+	if commit != nil && h.selectedRelatedBead >= 0 && h.selectedRelatedBead < len(commit.BeadIDs) {
 		return commit.BeadIDs[h.selectedRelatedBead]
 	}
 	return ""
@@ -1391,7 +1571,7 @@ func (h *HistoryModel) listHeight() int {
 
 // SelectedBeadID returns the currently selected bead ID
 func (h *HistoryModel) SelectedBeadID() string {
-	if h.selectedBead < len(h.beadIDs) {
+	if h.selectedBead >= 0 && h.selectedBead < len(h.beadIDs) {
 		return h.beadIDs[h.selectedBead]
 	}
 	return ""
@@ -1399,7 +1579,7 @@ func (h *HistoryModel) SelectedBeadID() string {
 
 // SelectedHistory returns the currently selected bead history
 func (h *HistoryModel) SelectedHistory() *correlation.BeadHistory {
-	if h.selectedBead < len(h.histories) {
+	if h.selectedBead >= 0 && h.selectedBead < len(h.histories) {
 		return &h.histories[h.selectedBead]
 	}
 	return nil
@@ -1408,7 +1588,7 @@ func (h *HistoryModel) SelectedHistory() *correlation.BeadHistory {
 // SelectedCommit returns the currently selected commit
 func (h *HistoryModel) SelectedCommit() *correlation.CorrelatedCommit {
 	hist := h.SelectedHistory()
-	if hist != nil && h.selectedCommit < len(hist.Commits) {
+	if hist != nil && h.selectedCommit >= 0 && h.selectedCommit < len(hist.Commits) {
 		return &hist.Commits[h.selectedCommit]
 	}
 	return nil
@@ -1457,6 +1637,13 @@ func (h *HistoryModel) paneCount() int {
 	}
 }
 
+func historyPanelHeight(totalHeight int, header string) int {
+	// Every panel has a two-row rounded border and needs at least one content
+	// row. For ordinary terminal sizes this is the exact remaining row budget;
+	// the floor only keeps very small debug/test sizes renderable.
+	return max(totalHeight-lipgloss.Height(header), 3)
+}
+
 // View renders the history view
 func (h *HistoryModel) View() string {
 	if h.report == nil {
@@ -1492,15 +1679,16 @@ func (h *HistoryModel) renderTwoPaneView() string {
 
 	// Render header
 	header := h.renderHeader()
+	panelHeight := historyPanelHeight(h.height, header)
 
 	// Render panels based on view mode (bv-tl3n)
 	var listPanel, detailPanel string
 	if h.viewMode == historyModeGit {
-		listPanel = h.renderGitCommitListPanel(listWidth, h.height-2)
-		detailPanel = h.renderGitDetailPanel(detailWidth, h.height-2)
+		listPanel = h.renderGitCommitListPanel(listWidth, panelHeight)
+		detailPanel = h.renderGitDetailPanel(detailWidth, panelHeight)
 	} else {
-		listPanel = h.renderListPanel(listWidth, h.height-2)
-		detailPanel = h.renderDetailPanel(detailWidth, h.height-2)
+		listPanel = h.renderListPanel(listWidth, panelHeight)
+		detailPanel = h.renderDetailPanel(detailWidth, panelHeight)
 	}
 
 	// Combine panels
@@ -1516,7 +1704,7 @@ func (h *HistoryModel) renderThreePaneView() string {
 
 	// Render header
 	header := h.renderHeader()
-	panelHeight := h.height - 2
+	panelHeight := historyPanelHeight(h.height, header)
 
 	// Wide layout: 4 panes with timeline (bv-1x6o)
 	if layout == layoutWide && h.viewMode != historyModeGit {
@@ -1678,6 +1866,134 @@ func (h *HistoryModel) formatTimelineTimestamp(t time.Time) string {
 	}
 }
 
+func (h *HistoryModel) renderTimelineTitle(width int, beadID string) string {
+	label := "TIMELINE"
+	if beadID != "" {
+		label += ": " + beadID
+	}
+	contentWidth := max(width-4, 1)
+	label = truncateRunesHelper(label, contentWidth, "…")
+	return h.theme.Renderer.NewStyle().
+		Bold(true).
+		Foreground(h.theme.Primary).
+		Width(contentWidth).
+		Align(lipgloss.Center).
+		Render(label)
+}
+
+func (h *HistoryModel) renderTimelineEntry(entry TimelineEntry, width int) string {
+	t := h.theme
+	r := t.Renderer
+	lineColor := t.Border
+	contentWidth := max(width-4, 1)
+
+	timestamp := h.formatTimelineTimestamp(entry.Timestamp)
+	timestampStyle := r.NewStyle().
+		Foreground(t.Subtext).
+		Width(8).
+		Align(lipgloss.Right)
+
+	var b strings.Builder
+	b.WriteString(timestampStyle.Render(timestamp))
+	b.WriteString(r.NewStyle().Foreground(lineColor).Render(" ┃ "))
+
+	switch entry.EntryType {
+	case timelineEntryEvent:
+		var eventColor lipgloss.TerminalColor
+		switch entry.EventType {
+		case "created":
+			eventColor = t.Secondary
+		case "claimed":
+			eventColor = t.InProgress
+		case "closed":
+			eventColor = t.Closed
+		case "reopened":
+			eventColor = t.Open
+		default:
+			eventColor = t.Secondary
+		}
+		b.WriteString(r.NewStyle().Foreground(eventColor).Bold(true).Render(entry.Label))
+		if entry.Detail != "" {
+			b.WriteString(" ")
+			detail := truncateRunesHelper(entry.Detail, width-22, "...")
+			b.WriteString(r.NewStyle().Foreground(t.Subtext).Render(detail))
+		}
+
+	case timelineEntryCommit:
+		var confColor lipgloss.TerminalColor
+		if entry.Confidence >= 0.8 {
+			confColor = t.Closed
+		} else if entry.Confidence >= 0.5 {
+			confColor = t.InProgress
+		} else {
+			confColor = t.Subtext
+		}
+		b.WriteString("├─ ")
+		b.WriteString(r.NewStyle().Foreground(confColor).Bold(true).Render(entry.Label))
+		b.WriteString(" ")
+		b.WriteString(r.NewStyle().Foreground(confColor).Render(fmt.Sprintf("%d%%", int(entry.Confidence*100))))
+
+		msg := strings.Split(entry.Detail, "\n")[0]
+		msg = truncateRunesHelper(msg, width-28, "...")
+		if msg != "" {
+			b.WriteString("\n")
+			b.WriteString(timestampStyle.Render(""))
+			b.WriteString(r.NewStyle().Foreground(lineColor).Render(" ┃   "))
+			b.WriteString(r.NewStyle().Foreground(t.Subtext).Italic(true).Render(msg))
+		}
+
+	case timelineEntrySession:
+		var sessionColor lipgloss.TerminalColor
+		if entry.SessionScore >= 80 {
+			sessionColor = t.Primary
+		} else if entry.SessionScore >= 50 {
+			sessionColor = t.InProgress
+		} else {
+			sessionColor = t.Subtext
+		}
+		b.WriteString(r.NewStyle().Foreground(sessionColor).Bold(true).Render(entry.Label))
+		if entry.Detail != "" {
+			b.WriteString("\n")
+			b.WriteString(timestampStyle.Render(""))
+			b.WriteString(r.NewStyle().Foreground(lineColor).Render(" ┃   "))
+			title := truncateRunesHelper(entry.Detail, width-16, "...")
+			b.WriteString(r.NewStyle().Foreground(t.Subtext).Italic(true).Render(title))
+		}
+	}
+
+	// The panel's Width rule wraps arbitrary overlong content. Bound each
+	// already-rendered row first so its measured height remains its terminal
+	// height when the enclosing panel is rendered.
+	return r.NewStyle().MaxWidth(contentWidth).Render(b.String())
+}
+
+func (h *HistoryModel) renderTimelineSummary(hist *correlation.BeadHistory, width int) string {
+	if hist == nil || hist.CycleTime == nil {
+		return ""
+	}
+
+	t := h.theme
+	r := t.Renderer
+	contentWidth := max(width-4, 1)
+	separator := r.NewStyle().Foreground(t.Border).Render(strings.Repeat("─", max(width-6, 0)))
+
+	var parts []string
+	if hist.CycleTime.CreateToClose != nil {
+		parts = append(parts, fmt.Sprintf("Cycle: %s", formatDuration(*hist.CycleTime.CreateToClose)))
+	}
+	if len(hist.Commits) > 0 {
+		avgConf := 0.0
+		for _, commit := range hist.Commits {
+			avgConf += commit.Confidence
+		}
+		avgConf /= float64(len(hist.Commits))
+		parts = append(parts, fmt.Sprintf("%d commits (avg %d%%)", len(hist.Commits), int(avgConf*100)))
+	}
+	summary := truncateRunesHelper(strings.Join(parts, " │ "), contentWidth, "…")
+	summary = r.NewStyle().Foreground(t.Subtext).Render(summary)
+	return separator + "\n" + summary
+}
+
 // renderTimelinePanel renders the timeline visualization panel (bv-1x6o)
 func (h *HistoryModel) renderTimelinePanel(width, height int) string {
 	t := h.theme
@@ -1694,196 +2010,56 @@ func (h *HistoryModel) renderTimelinePanel(width, height int) string {
 		Width(width - 2).
 		Height(height - 2)
 
-	// Title style
-	titleStyle := r.NewStyle().
-		Bold(true).
-		Foreground(t.Primary).
-		Width(width - 4).
-		Align(lipgloss.Center)
-
 	// Get selected bead
-	if len(h.beadIDs) == 0 || h.selectedBead >= len(h.beadIDs) {
-		content := titleStyle.Render("TIMELINE") + "\n\n" +
+	if len(h.beadIDs) == 0 || h.selectedBead < 0 || h.selectedBead >= len(h.beadIDs) {
+		content := h.renderTimelineTitle(width, "") + "\n\n" +
 			r.NewStyle().Foreground(t.Secondary).Render("Select a bead to view timeline")
 		return panelStyle.Render(content)
 	}
 
 	beadID := h.beadIDs[h.selectedBead]
-	hist, ok := h.report.Histories[beadID]
-	if !ok {
-		content := titleStyle.Render("TIMELINE") + "\n\n" +
+	hist := h.SelectedHistory()
+	if hist == nil {
+		content := h.renderTimelineTitle(width, "") + "\n\n" +
 			r.NewStyle().Foreground(t.Secondary).Render("No history data")
 		return panelStyle.Render(content)
 	}
 
-	// Build timeline entries
-	entries := h.buildTimeline(hist)
-
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("TIMELINE: " + beadID))
-	b.WriteString("\n")
-
-	if len(entries) == 0 {
-		b.WriteString("\n")
-		b.WriteString(r.NewStyle().Foreground(t.Secondary).Render("No events recorded"))
+	layout := h.layoutTimeline(hist, width, height)
+	layout.title = h.renderTimelineTitle(width, beadID)
+	blocks := []string{layout.title}
+	if len(layout.entries) == 0 {
+		blocks = append(blocks, "", r.NewStyle().
+			Foreground(t.Secondary).
+			MaxWidth(max(width-4, 1)).
+			Render("No events recorded"))
 	} else {
-		// Render timeline entries
-		maxVisible := height - 6 // Account for title, borders, summary
-		if maxVisible < 3 {
-			maxVisible = 3
+		maxScroll := timelineFinalWindowStart(layout.entries, layout.entryRowBudget)
+		if h.timelineScrollOffset < 0 {
+			h.timelineScrollOffset = 0
 		}
-
-		// Apply scroll offset
+		if h.timelineScrollOffset > maxScroll {
+			h.timelineScrollOffset = maxScroll
+		}
 		startIdx := h.timelineScrollOffset
-		if startIdx > len(entries)-maxVisible {
-			startIdx = len(entries) - maxVisible
-		}
-		if startIdx < 0 {
-			startIdx = 0
-		}
-		endIdx := startIdx + maxVisible
-		if endIdx > len(entries) {
-			endIdx = len(entries)
-		}
+		endIdx := timelineWindowEnd(layout.entries, startIdx, layout.entryRowBudget)
+		blocks = append(blocks, layout.entries[startIdx:endIdx]...)
 
-		// Timeline line style
-		lineColor := t.Border
-
-		for i := startIdx; i < endIdx; i++ {
-			entry := entries[i]
-			b.WriteString("\n")
-
-			// Timestamp on left
-			timestamp := h.formatTimelineTimestamp(entry.Timestamp)
-			timestampStyle := r.NewStyle().
-				Foreground(t.Subtext).
-				Width(8).
-				Align(lipgloss.Right)
-			b.WriteString(timestampStyle.Render(timestamp))
-
-			// Vertical line
-			b.WriteString(r.NewStyle().Foreground(lineColor).Render(" ┃ "))
-
-			// Entry content
-			switch entry.EntryType {
-			case timelineEntryEvent:
-				// Event marker with appropriate color
-				var eventColor lipgloss.TerminalColor
-				switch entry.EventType {
-				case "created":
-					eventColor = t.Secondary
-				case "claimed":
-					eventColor = t.InProgress
-				case "closed":
-					eventColor = t.Closed
-				case "reopened":
-					eventColor = t.Open
-				default:
-					eventColor = t.Secondary
-				}
-				eventStyle := r.NewStyle().Foreground(eventColor).Bold(true)
-				b.WriteString(eventStyle.Render(entry.Label))
-				if entry.Detail != "" {
-					b.WriteString(" ")
-					detailStyle := r.NewStyle().Foreground(t.Subtext)
-					// Truncate detail if needed
-					maxDetail := width - 22
-					detail := truncateRunesHelper(entry.Detail, maxDetail, "...")
-					b.WriteString(detailStyle.Render(detail))
-				}
-
-			case timelineEntryCommit:
-				// Commit with confidence coloring
-				var confColor lipgloss.TerminalColor
-				if entry.Confidence >= 0.8 {
-					confColor = t.Closed // Green for high confidence
-				} else if entry.Confidence >= 0.5 {
-					confColor = t.InProgress // Yellow for medium
-				} else {
-					confColor = t.Subtext // Gray for low
-				}
-				shaStyle := r.NewStyle().Foreground(confColor).Bold(true)
-				b.WriteString("├─ ")
-				b.WriteString(shaStyle.Render(entry.Label))
-				b.WriteString(" ")
-
-				// Confidence percentage
-				confPct := int(entry.Confidence * 100)
-				confStyle := r.NewStyle().Foreground(confColor)
-				b.WriteString(confStyle.Render(fmt.Sprintf("%d%%", confPct)))
-
-				// Truncate message (UTF-8 safe using runewidth)
-				maxMsg := width - 28
-				msg := strings.Split(entry.Detail, "\n")[0] // First line only
-				msg = truncateRunesHelper(msg, maxMsg, "...")
-				if msg != "" {
-					b.WriteString("\n")
-					b.WriteString(timestampStyle.Render(""))
-					b.WriteString(r.NewStyle().Foreground(lineColor).Render(" ┃   "))
-					msgStyle := r.NewStyle().Foreground(t.Subtext).Italic(true)
-					b.WriteString(msgStyle.Render(msg))
-				}
-
-			case timelineEntrySession:
-				// Session entry with score-based coloring (bv-pr1l)
-				var sessionColor lipgloss.TerminalColor
-				if entry.SessionScore >= 80 {
-					sessionColor = t.Primary // High relevance - primary color
-				} else if entry.SessionScore >= 50 {
-					sessionColor = t.InProgress // Medium relevance
-				} else {
-					sessionColor = t.Subtext // Lower relevance
-				}
-				sessionStyle := r.NewStyle().Foreground(sessionColor).Bold(true)
-				b.WriteString(sessionStyle.Render(entry.Label))
-
-				// Show detail (session title) if available
-				if entry.Detail != "" {
-					b.WriteString("\n")
-					b.WriteString(timestampStyle.Render(""))
-					b.WriteString(r.NewStyle().Foreground(lineColor).Render(" ┃   "))
-					// Truncate title if needed
-					maxTitle := width - 16
-					title := truncateRunesHelper(entry.Detail, maxTitle, "...")
-					titleStyle := r.NewStyle().Foreground(t.Subtext).Italic(true)
-					b.WriteString(titleStyle.Render(title))
-				}
-			}
-		}
-
-		// Scroll indicator if needed
-		if len(entries) > maxVisible {
-			b.WriteString("\n")
-			scrollInfo := fmt.Sprintf("↕ %d-%d of %d", startIdx+1, endIdx, len(entries))
+		if layout.showScroll {
+			scrollInfo := fmt.Sprintf("↕ %d-%d of %d", startIdx+1, endIdx, len(layout.entries))
 			scrollStyle := r.NewStyle().Foreground(t.Subtext).Italic(true)
-			// Pad for timestamp column alignment
-			b.WriteString(r.NewStyle().Width(8).Render(""))
-			b.WriteString(r.NewStyle().Foreground(lineColor).Render(" ┃ "))
-			b.WriteString(scrollStyle.Render(scrollInfo))
+			scrollLine := r.NewStyle().Width(8).Render("") +
+				r.NewStyle().Foreground(t.Border).Render(" ┃ ") +
+				scrollStyle.Render(scrollInfo)
+			blocks = append(blocks, r.NewStyle().MaxWidth(max(width-4, 1)).Render(scrollLine))
 		}
 	}
 
-	// Add cycle time summary at bottom if available
-	if hist.CycleTime != nil {
-		b.WriteString("\n")
-		b.WriteString(r.NewStyle().Foreground(t.Border).Render(strings.Repeat("─", max(width-6, 0))))
-		b.WriteString("\n")
-
-		summaryStyle := r.NewStyle().Foreground(t.Subtext)
-		if hist.CycleTime.CreateToClose != nil {
-			b.WriteString(summaryStyle.Render(fmt.Sprintf("Cycle: %s", formatDuration(*hist.CycleTime.CreateToClose))))
-		}
-		if len(hist.Commits) > 0 {
-			avgConf := 0.0
-			for _, c := range hist.Commits {
-				avgConf += c.Confidence
-			}
-			avgConf /= float64(len(hist.Commits))
-			b.WriteString(summaryStyle.Render(fmt.Sprintf(" │ %d commits (avg %d%%)", len(hist.Commits), int(avgConf*100))))
-		}
+	if layout.summary != "" {
+		blocks = append(blocks, layout.summary)
 	}
 
-	return panelStyle.Render(b.String())
+	return panelStyle.Render(strings.Join(blocks, "\n"))
 }
 
 // formatDuration formats a duration in a human-readable way (bv-1x6o)

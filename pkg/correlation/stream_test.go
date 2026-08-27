@@ -1,12 +1,38 @@
 package correlation
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestStreamCommandWaitErrorRejectsEveryFailure(t *testing.T) {
+	sentinel := errors.New("wait transport failed")
+	if err := streamCommandWaitError(nil, sentinel); !errors.Is(err, sentinel) {
+		t.Fatalf("non-exit wait error = %v, want wrapped sentinel", err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestStreamCommandExit141Helper")
+	cmd.Env = append(os.Environ(), "BV_STREAM_EXIT_141_HELPER=1")
+	exit141 := cmd.Run()
+	if exit141 == nil {
+		t.Fatal("exit-141 helper unexpectedly succeeded")
+	}
+	if err := streamCommandWaitError(nil, exit141); err == nil {
+		t.Fatal("exit status 141 was accepted as a complete history")
+	}
+}
+
+func TestStreamCommandExit141Helper(t *testing.T) {
+	if os.Getenv("BV_STREAM_EXIT_141_HELPER") == "1" {
+		os.Exit(141)
+	}
+}
 
 func TestDefaultHistoryLimit(t *testing.T) {
 	if DefaultHistoryLimit != 500 {
@@ -120,8 +146,9 @@ func TestStreamExtractor_BuildStreamCommandDisablesColor(t *testing.T) {
 	if len(args) < 4 {
 		t.Fatalf("git command args too short: %#v", args)
 	}
-	if args[0] != "git" || args[1] != "-c" || args[2] != "color.ui=false" || args[3] != "log" {
-		t.Fatalf("git command should disable color before log, got %#v", args)
+	joined := strings.Join(args, "\x00")
+	if args[0] != "git" || !strings.Contains(joined, "color.ui=false") || !strings.Contains(joined, "\x00log\x00") || !strings.Contains(joined, "--unified=1") {
+		t.Fatalf("git command should apply the deterministic lifecycle policy, got %#v", args)
 	}
 }
 
@@ -290,7 +317,8 @@ func TestBatchFileStatsExtractor_ClearCache(t *testing.T) {
 }
 
 func TestBatchFileStatsExtractor_CacheHit(t *testing.T) {
-	b := NewBatchFileStatsExtractor("/tmp/test")
+	b := NewBatchFileStatsExtractor(initTempGitRepo(t))
+	b.cacheHistoryState = coCommitHistoryStateFull
 
 	// Pre-populate cache
 	b.cache["abc123"] = []FileChange{{Path: "cached.go", Action: "M"}}
@@ -315,7 +343,8 @@ func TestBatchFileStatsExtractor_CacheHit(t *testing.T) {
 }
 
 func TestBatchFileStatsExtractor_CacheHitReturnsCopy(t *testing.T) {
-	b := NewBatchFileStatsExtractor("/tmp/test")
+	b := NewBatchFileStatsExtractor(initTempGitRepo(t))
+	b.cacheHistoryState = coCommitHistoryStateFull
 	b.cache["abc123"] = []FileChange{{Path: "cached.go", Action: "M"}}
 
 	result, err := b.ExtractBatch([]string{"abc123"})
@@ -334,13 +363,13 @@ func TestBatchFileStatsExtractor_CacheHitReturnsCopy(t *testing.T) {
 }
 
 func TestBatchFileStatsExtractor_StoredBatchReturnsCopy(t *testing.T) {
-	b := NewBatchFileStatsExtractor("/tmp/test")
-	result := make(map[string][]FileChange)
-
-	b.storeBatchResult(result, map[string][]FileChange{
+	b := NewBatchFileStatsExtractor(initTempGitRepo(t))
+	b.cacheHistoryState = coCommitHistoryStateFull
+	fetched := map[string][]FileChange{
 		"abc123": {{Path: "cached.go", Action: "M"}},
-	})
-	result["abc123"][0].Path = "mutated.go"
+	}
+	b.storeBatchResultIfHistoryStateCurrent(coCommitHistoryStateFull, fetched)
+	fetched["abc123"][0].Path = "mutated.go"
 
 	result, err := b.ExtractBatch([]string{"abc123"})
 	if err != nil {
@@ -348,6 +377,55 @@ func TestBatchFileStatsExtractor_StoredBatchReturnsCopy(t *testing.T) {
 	}
 	if got := result["abc123"][0].Path; got != "cached.go" {
 		t.Fatalf("cached path = %s, want cached.go", got)
+	}
+}
+
+func TestBatchFileStatsExtractorResetsMemoAfterSameHeadDeepen(t *testing.T) {
+	source := initTempGitRepo(t)
+	if err := os.WriteFile(filepath.Join(source, "README.md"), []byte("initial\nchanged\n"), 0o644); err != nil {
+		t.Fatalf("modify boundary fixture: %v", err)
+	}
+	runGit(t, source, "add", "README.md")
+	runGit(t, source, "commit", "-m", "modify boundary fixture")
+
+	shallow := cloneShallowRepoForCacheTest(t, source)
+	headSHA, err := getGitHead(shallow)
+	if err != nil {
+		t.Fatalf("resolve shallow HEAD: %v", err)
+	}
+	extractor := NewBatchFileStatsExtractor(shallow)
+	shallowResult, err := extractor.ExtractBatch([]string{headSHA})
+	if err != nil {
+		t.Fatalf("extract shallow boundary diff: %v", err)
+	}
+	if files := shallowResult[headSHA]; len(files) != 1 || files[0].Path != "README.md" || files[0].Action != "A" {
+		t.Fatalf("shallow boundary diff=%+v, want README root addition", files)
+	}
+	if len(extractor.cache) != 0 {
+		t.Fatalf("shallow extraction retained %d memoized diffs", len(extractor.cache))
+	}
+
+	runGit(t, shallow, "fetch", "--unshallow", "origin")
+	if currentHead, headErr := getGitHead(shallow); headErr != nil || currentHead != headSHA {
+		t.Fatalf("deepen changed HEAD: before=%q after=%q error=%v", headSHA, currentHead, headErr)
+	}
+	got, err := extractor.ExtractBatch([]string{headSHA})
+	if err != nil {
+		t.Fatalf("extract full boundary diff with reused extractor: %v", err)
+	}
+	want, err := NewBatchFileStatsExtractor(shallow).ExtractBatch([]string{headSHA})
+	if err != nil {
+		t.Fatalf("extract full boundary diff with fresh extractor: %v", err)
+	}
+	gotFiles, wantFiles := got[headSHA], want[headSHA]
+	if len(gotFiles) != 1 || gotFiles[0].Path != "README.md" || gotFiles[0].Action != "M" {
+		t.Fatalf("full boundary diff=%+v, want README modification", gotFiles)
+	}
+	if len(wantFiles) != len(gotFiles) || wantFiles[0] != gotFiles[0] {
+		t.Fatalf("reused extractor differs after deepen: got=%+v want=%+v", gotFiles, wantFiles)
+	}
+	if len(extractor.cache) != 1 {
+		t.Fatalf("full-history extraction retained %d memoized diffs, want 1", len(extractor.cache))
 	}
 }
 
@@ -393,6 +471,26 @@ func TestStreamExtractor_ParseBufferedDiff_Created(t *testing.T) {
 	}
 	if events[0].BeadID != "bv-1" {
 		t.Errorf("BeadID = %s, want bv-1", events[0].BeadID)
+	}
+}
+
+func TestStreamExtractor_ParseStreamAdvancesPastNonRecordBeforeBOM(t *testing.T) {
+	s := NewStreamExtractor("/tmp/test")
+	header := strings.Repeat("a", 40) + "\x00" + "2025-01-15T10:30:00Z" + "\x00" + "Alice" + "\x00" + "alice@example.com" + "\x00" + "add malformed prefix"
+	record := `{"id":"bv-bom-position","status":"open","title":"BOM position"}`
+	input := strings.Join([]string{
+		header,
+		"@@ -0,0 +1,2 @@",
+		"+not-json",
+		"+\uFEFF" + record,
+	}, "\n") + "\n"
+
+	events, err := s.parseStream(strings.NewReader(input), "", nil, 1, nil)
+	if err != nil {
+		t.Fatalf("parse stream: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("stream accepted a BOM record at physical line two after a non-record addition: %#v", events)
 	}
 }
 
@@ -442,6 +540,29 @@ func TestStreamExtractor_ParseBufferedDiff_FilterByBead(t *testing.T) {
 	}
 	if events[0].BeadID != "bv-1" {
 		t.Errorf("BeadID = %s, want bv-1", events[0].BeadID)
+	}
+}
+
+func TestStreamExtractor_ParseBufferedDiff_MultipleBeadsHaveStableOrder(t *testing.T) {
+	s := NewStreamExtractor("/tmp/test")
+	info := commitInfo{SHA: "abc123", Timestamp: time.Now()}
+	inputIDs := []string{"bv-08", "bv-03", "bv-10", "bv-01", "bv-06", "bv-04", "bv-09", "bv-02", "bv-07", "bv-05"}
+	lines := make([]string, 0, len(inputIDs))
+	for _, id := range inputIDs {
+		lines = append(lines, fmt.Sprintf(`+{"id":%q,"status":"open","title":"Test"}`, id))
+	}
+	want := []string{"bv-01", "bv-02", "bv-03", "bv-04", "bv-05", "bv-06", "bv-07", "bv-08", "bv-09", "bv-10"}
+
+	for iteration := 0; iteration < 32; iteration++ {
+		events := s.parseBufferedDiff(lines, info, "", nil)
+		if len(events) != len(want) {
+			t.Fatalf("iteration %d: len(events) = %d, want %d", iteration, len(events), len(want))
+		}
+		for i, event := range events {
+			if event.BeadID != want[i] {
+				t.Fatalf("iteration %d: event %d BeadID = %q, want %q", iteration, i, event.BeadID, want[i])
+			}
+		}
 	}
 }
 
@@ -648,5 +769,16 @@ func TestStreamExtractor_ParseStreamInvalidHeaderReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "parsing commit header") {
 		t.Fatalf("parseStream error = %v, want commit header context", err)
+	}
+}
+
+func TestStreamExtractorParseStreamRejectsMixedObjectIDWidths(t *testing.T) {
+	header := func(sha string) string {
+		return sha + "\x00" + "2025-12-15T10:30:00Z" + "\x00" + "Alice" + "\x00" + "alice@example.com" + "\x00" + "mixed"
+	}
+	input := header(strings.Repeat("a", 40)) + "\n" + header(strings.Repeat("b", 64)) + "\n"
+	events, err := NewStreamExtractor(t.TempDir()).parseStream(strings.NewReader(input), "", nil, 2, nil)
+	if err == nil || events != nil {
+		t.Fatalf("mixed-width stream result=%#v error=%v, want nil/error", events, err)
 	}
 }

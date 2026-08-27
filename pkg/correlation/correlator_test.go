@@ -1,6 +1,7 @@
 package correlation
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -161,6 +162,61 @@ func TestCalculateStats_WithData(t *testing.T) {
 	}
 	if stats.AvgCycleTimeDays == nil {
 		t.Error("expected avg cycle time to be set")
+	}
+}
+
+func TestHistoryReportRecalculateDerivedFieldsAfterCommitFiltering(t *testing.T) {
+	cycle := 48 * time.Hour
+	report := &HistoryReport{
+		Stats: HistoryStats{
+			TotalBeads:         99,
+			BeadsWithCommits:   99,
+			TotalCommits:       99,
+			UniqueAuthors:      99,
+			AvgCommitsPerBead:  99,
+			MethodDistribution: map[string]int{"stale": 99},
+		},
+		Histories: map[string]BeadHistory{
+			"A": {
+				Events:    []BeadEvent{{Author: "event-author"}},
+				Commits:   []CorrelatedCommit{{SHA: "same-sha", Author: "kept-author", Method: MethodCoCommitted}},
+				CycleTime: &CycleTime{ClaimToClose: &cycle},
+			},
+			"B": {
+				Commits: []CorrelatedCommit{{SHA: "same-sha", Author: "kept-author", Method: MethodCoCommitted}},
+			},
+			"C": {},
+		},
+	}
+
+	report.RecalculateDerivedFields()
+
+	if got, want := report.Stats.TotalBeads, 3; got != want {
+		t.Fatalf("total beads = %d, want %d", got, want)
+	}
+	if got, want := report.Stats.BeadsWithCommits, 2; got != want {
+		t.Fatalf("beads with commits = %d, want %d", got, want)
+	}
+	if got, want := report.Stats.TotalCommits, 1; got != want {
+		t.Fatalf("unique commits = %d, want %d", got, want)
+	}
+	if got, want := report.Stats.UniqueAuthors, 2; got != want {
+		t.Fatalf("unique authors = %d, want %d", got, want)
+	}
+	if got, want := report.Stats.AvgCommitsPerBead, 0.5; got != want {
+		t.Fatalf("average commits per bead = %v, want %v", got, want)
+	}
+	if got, want := report.Stats.MethodDistribution[MethodCoCommitted.String()], 2; got != want {
+		t.Fatalf("co-commit method count = %d, want %d", got, want)
+	}
+	if _, stale := report.Stats.MethodDistribution["stale"]; stale {
+		t.Fatalf("stale method distribution survived recalculation: %#v", report.Stats.MethodDistribution)
+	}
+	if report.Stats.AvgCycleTimeDays == nil || *report.Stats.AvgCycleTimeDays != 2 {
+		t.Fatalf("average cycle time = %v, want 2 days", report.Stats.AvgCycleTimeDays)
+	}
+	if got, want := report.CommitIndex["same-sha"], []string{"A", "B"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("commit index = %v, want %v", got, want)
 	}
 }
 
@@ -366,6 +422,20 @@ func TestBuildHistories_WithCommits(t *testing.T) {
 	}
 	if h.LastAuthor != "Test Author" {
 		t.Errorf("LastAuthor = %s, want 'Test Author'", h.LastAuthor)
+	}
+}
+
+func TestBuildHistoriesLastAuthorUsesMostRecentActivity(t *testing.T) {
+	c := NewCorrelator("/tmp/test")
+	now := time.Now()
+	histories := c.buildHistories(
+		[]BeadInfo{{ID: "bv-1"}},
+		[]BeadEvent{{BeadID: "bv-1", Author: "Lifecycle Author", Timestamp: now}},
+		[]CorrelatedCommit{{BeadID: "bv-1", SHA: "older", Author: "Code Author", Timestamp: now.Add(-time.Hour)}},
+	)
+
+	if got := histories["bv-1"].LastAuthor; got != "Lifecycle Author" {
+		t.Fatalf("LastAuthor=%q, want most recent lifecycle author", got)
 	}
 }
 

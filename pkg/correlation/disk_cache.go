@@ -55,10 +55,13 @@ func SetDiskCacheEnabled(on bool) { diskCacheForced.Store(on) }
 // The only working-tree-visible inputs are the bead ID/Title/Status, which are
 // captured by hashBeads. Together with the canonical repository/history
 // namespace, the key is complete; a dirty tree still produces a correct
-// hit/miss.
+// hit/miss. Shallow repositories are deliberately uncached: deepening can
+// change a boundary commit's effective parent without changing HEAD. The
+// repository history state is also part of the namespace so a same-HEAD
+// shallow-to-full transition cannot reuse an entry created under the old state.
 
 const (
-	correlationDiskCacheVersion      = 2
+	correlationDiskCacheVersion      = 3
 	correlationDiskCacheFileName     = "correlation_report_cache.json"
 	correlationDiskCacheDirName      = "bv"
 	correlationDiskCacheMaxEntries   = 6
@@ -122,7 +125,10 @@ func correlationDiskCacheKey(namespace, headSHA, beadsHash, optsHash string) str
 // correlationCacheNamespace isolates persistent history caches by both the
 // repository and the selected Beads history path. HEAD alone is not a complete
 // namespace: two workspaces can share a commit while selecting different JSONL
-// histories, and the extractor's primaryBeadsFile is a real artifact input.
+// histories, and the extractor's primaryBeadsFile is a real artifact input. The
+// Exact lifecycle and co-commit Git policies are included so a future policy
+// change cannot serve artifacts produced under different --follow, parser, or
+// FileChange/line-stat semantics.
 func correlationCacheNamespace(repoPath, primaryBeadsFile string) string {
 	repoInput := absoluteCleanPath(repoPath)
 	repoCanonical := repoInput
@@ -146,7 +152,10 @@ func correlationCacheNamespace(repoPath, primaryBeadsFile string) string {
 		}
 	}
 
-	identity := filepath.ToSlash(repoCanonical) + "\x00" + filepath.ToSlash(primaryPathspec)
+	identityParts := []string{filepath.ToSlash(repoCanonical), filepath.ToSlash(primaryPathspec)}
+	identityParts = append(identityParts, lifecycleGitPolicyNamespaceInputs()...)
+	identityParts = append(identityParts, coCommitGitPolicyNamespaceInputs()...)
+	identity := strings.Join(identityParts, "\x00")
 	sum := sha256.Sum256([]byte(identity))
 	return hex.EncodeToString(sum[:])
 }
@@ -167,11 +176,15 @@ func cacheCreatedAtIsFresh(createdAt, now time.Time, maxAge time.Duration) bool 
 }
 
 func (c *Correlator) persistentCacheNamespace() string {
+	return c.persistentCacheNamespaceForHistoryState(coCommitRepositoryHistoryState(c.ctx, c.repoPath))
+}
+
+func (c *Correlator) persistentCacheNamespaceForHistoryState(historyState string) string {
 	primary := ""
 	if c.extractor != nil {
 		primary = c.extractor.primaryBeadsFile()
 	}
-	return correlationCacheNamespace(c.repoPath, primary)
+	return correlationCacheNamespace(c.repoPath, primary) + ":" + historyState
 }
 
 func readCacheFileBounded(f *os.File, maxBytes int64) ([]byte, bool) {
@@ -272,7 +285,8 @@ func evictCorrelationDiskCacheLRU(entries map[string]correlationDiskCacheEntry) 
 // file on every robot invocation would dominate the cost of a hit, and the
 // AccessedAt bookkeeping is not load-bearing for correctness (eviction falls
 // back to CreatedAt for never-rewritten entries, an acceptable LRU
-// approximation). Prunes are likewise only persisted on the write path.
+// approximation). The caller reaches this only after repository-history-state
+// and HEAD probes. Prunes are likewise only persisted on the write path.
 func getCorrelationDiskCachedReport(namespace, headSHA, beadsHash, optsHash string) (*HistoryReport, bool) {
 	if !correlationDiskCacheEnabled() {
 		return nil, false
@@ -373,16 +387,25 @@ func putCorrelationDiskCachedReport(namespace, headSHA, beadsHash, optsHash stri
 //     new bead-hash.
 //
 // On a full miss (HEAD changed, or cold) it extracts once, persists BOTH the
-// artifact and the report, and returns. The assembled report is byte-identical
-// (modulo the always-fresh GeneratedAt timestamp, as with the pre-existing
-// outer cache) whether served fresh, from the outer cache, or rebuilt from the
-// artifact, because assembleReport is a pure function of (beads, opts, artifact)
-// and the artifact is reproduced exactly from the same HEAD+options.
+// artifact and the report, and returns. Apart from GeneratedAt, the assembled
+// report is byte-identical whether served fresh, from the outer cache, or
+// rebuilt from the artifact: fresh and artifact-assembly paths stamp the
+// assembly time, while an outer hit preserves its stored timestamp. The rest is
+// a pure function of (beads, opts, artifact), and the artifact is reproduced
+// exactly from the same HEAD+options.
 //
-// When the cache is disabled (non-robot mode, BV_NO_CACHE=1) or the HEAD cannot
-// be resolved, it falls straight through to GenerateReport unchanged.
+// When the cache is disabled (non-robot mode, BV_NO_CACHE=1), the repository is
+// shallow, its shallow state cannot be determined, or HEAD cannot be resolved,
+// it falls straight through to GenerateReport unchanged.
 func (c *Correlator) GenerateReportCached(beads []BeadInfo, opts CorrelatorOptions) (*HistoryReport, error) {
 	if !correlationDiskCacheEnabled() {
+		return c.GenerateReport(beads, opts)
+	}
+	historyState := coCommitRepositoryHistoryState(c.ctx, c.repoPath)
+	if historyState != coCommitHistoryStateFull {
+		// A shallow boundary changes first-parent/root diff semantics without
+		// changing HEAD. Fail closed on both reads and writes, including when
+		// the state probe itself fails.
 		return c.GenerateReport(beads, opts)
 	}
 
@@ -393,7 +416,7 @@ func (c *Correlator) GenerateReportCached(beads []BeadInfo, opts CorrelatorOptio
 	}
 	beadsHash := hashBeads(beads)
 	optsHash := hashOptions(opts)
-	namespace := c.persistentCacheNamespace()
+	namespace := c.persistentCacheNamespaceForHistoryState(historyState)
 
 	// Layer 1: fully assembled report for this exact (HEAD, beads, opts).
 	if report, ok := getCorrelationDiskCachedReport(namespace, headSHA, beadsHash, optsHash); ok {
@@ -426,6 +449,9 @@ func (c *Correlator) GenerateReportCached(beads []BeadInfo, opts CorrelatorOptio
 // its computed report, but no persistent entry is published under an
 // unverified key.
 func (c *Correlator) putExtractedHistoryCachesIfHeadUnchanged(namespace, headSHA, beadsHash, optsHash string, art *historyArtifact, report *HistoryReport) bool {
+	if coCommitRepositoryHistoryState(c.ctx, c.repoPath) != coCommitHistoryStateFull {
+		return false
+	}
 	currentHead, err := getGitHeadContext(c.ctx, c.repoPath)
 	if err != nil || currentHead != headSHA {
 		return false

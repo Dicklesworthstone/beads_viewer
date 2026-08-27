@@ -98,7 +98,9 @@ func (ctx *TriageContext) ActionableIssues() []model.Issue {
 	return ctx.actionable
 }
 
-// IsActionable returns true if the issue is actionable (open and not blocked).
+// IsActionable returns true when the issue is non-closed, has no active
+// scheduler deferral, and has neither an open blocking dependency nor a blocked
+// parent chain.
 //
 // This ensures ActionableIssues is computed first, then does O(1) lookup.
 func (ctx *TriageContext) IsActionable(id string) bool {
@@ -342,12 +344,13 @@ func (ctx *TriageContext) OpenBlockers(id string) []string {
 	return ctx.getOpenBlockersInternal(id)
 }
 
-// UnblocksMap returns a map of issue ID -> IDs of issues that would be unblocked
-// if this issue were completed.
+// UnblocksMap returns a map of issue ID -> IDs of non-deferred issues that
+// would lose their sole current claim blocker if this issue were completed.
 //
 // An issue A unblocks issue B if:
-//  1. B has a blocking dependency on A
-//  2. A is the ONLY remaining open blocker for B
+//  1. A is the ONLY remaining open blocker for B (either a direct predecessor
+//     or a parent whose blocked state propagates to B)
+//  2. B is not closed-like or scheduler-deferred
 //
 // Time complexity: O(n*d) on first call, O(1) thereafter.
 func (ctx *TriageContext) UnblocksMap() map[string][]string {
@@ -421,6 +424,11 @@ func (ctx *TriageContext) GetIssue(id string) *model.Issue {
 	return ctx.analyzer.GetIssue(id)
 }
 
+// getIssue returns the analyzer's read-only internal view for triage hot paths.
+func (ctx *TriageContext) getIssue(id string) *model.Issue {
+	return ctx.analyzer.getIssue(id)
+}
+
 // IssueCount returns the total number of issues.
 func (ctx *TriageContext) IssueCount() int {
 	return len(ctx.analyzer.issueMap)
@@ -430,7 +438,7 @@ func (ctx *TriageContext) IssueCount() int {
 func (ctx *TriageContext) Issues() []model.Issue {
 	issues := make([]model.Issue, 0, len(ctx.analyzer.issueMap))
 	for _, issue := range ctx.analyzer.issueMap {
-		issues = append(issues, issue)
+		issues = append(issues, issue.Clone())
 	}
 	return issues
 }

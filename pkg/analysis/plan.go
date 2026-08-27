@@ -40,7 +40,7 @@ type PlanSummary struct {
 // GetExecutionPlan generates a dependency-respecting execution plan
 // with parallel tracks identified for concurrent work.
 func (a *Analyzer) GetExecutionPlan() ExecutionPlan {
-	actionable := a.GetActionableIssues()
+	actionable := a.getActionableIssuesAfterCompletions(nil)
 
 	// Build set of actionable IDs for quick lookup
 	actionableSet := make(map[string]bool, len(actionable))
@@ -79,9 +79,10 @@ func (a *Analyzer) GetExecutionPlan() ExecutionPlan {
 	}
 }
 
-// computeUnblocks finds issues that would become actionable if the given issue is closed.
-// This exported analysis contract uses hard blocking dependencies only; triage-specific
-// parent-child claim blocking is handled through TriageContext.
+// computeUnblocks finds direct hard-dependency successors that would become
+// actionable if the given issue were closed. Parent-child edges are not direct
+// successors, but a successor whose parent chain remains blocked is not reported
+// as actionable. Scheduler-deferred successors are withheld as well.
 func (a *Analyzer) computeUnblocks(issueID string) []string {
 	var unblocks []string
 
@@ -89,44 +90,79 @@ func (a *Analyzer) computeUnblocks(issueID string) []string {
 	if !ok {
 		return nil
 	}
+	blocker, ok := a.issueMap[issueID]
+	if !ok || isClosedLikeStatus(blocker.Status) {
+		// Closing an already-closed issue cannot change readiness.
+		return nil
+	}
+
+	completed := map[string]bool{issueID: true}
 
 	dependents := a.g.To(blockerNodeID)
 
 	for dependents.Next() {
 		dependentNode := dependents.Node()
 		dependentID := a.nodeToID[dependentNode.ID()]
-		dependentIssue := a.issueMap[dependentID]
-
-		if isClosedLikeStatus(dependentIssue.Status) {
-			continue
-		}
-
-		otherBlockers := a.g.From(dependentNode.ID())
-		stillBlocked := false
-
-		for otherBlockers.Next() {
-			otherBlockerNode := otherBlockers.Node()
-			otherBlockerID := a.nodeToID[otherBlockerNode.ID()]
-
-			if otherBlockerID == issueID {
-				continue
-			}
-
-			if otherBlocker, exists := a.issueMap[otherBlockerID]; exists {
-				if !isClosedLikeStatus(otherBlocker.Status) {
-					stillBlocked = true
-					break
-				}
-			}
-		}
-
-		if !stillBlocked {
+		if a.isActionableAfterCompletions(dependentID, completed) {
 			unblocks = append(unblocks, dependentID)
 		}
 	}
 
 	sort.Strings(unblocks)
 	return unblocks
+}
+
+// isActionableAfterCompletions applies the same readiness contract as
+// GetActionableIssues to one issue without rebuilding the whole actionable set.
+// It is used by bounded what-if traversals where only a small affected frontier
+// needs to be checked.
+func (a *Analyzer) isActionableAfterCompletions(issueID string, completed map[string]bool) bool {
+	issue, ok := a.issueMap[issueID]
+	if !ok || completed[issueID] || isClosedLikeStatus(issue.Status) || issue.IsDeferredAt(a.now) {
+		return false
+	}
+	return !a.isBlockedAfterCompletions(issueID, completed, make(map[string]bool), 0)
+}
+
+// isBlockedAfterCompletions checks direct blocking dependencies and then
+// propagates a blocked parent down parent-child relationships. The traversal is
+// cycle-safe and uses the same depth bound as GetActionableIssues and br.
+func (a *Analyzer) isBlockedAfterCompletions(issueID string, completed, visiting map[string]bool, depth int) bool {
+	issue, ok := a.issueMap[issueID]
+	if !ok || completed[issueID] || isClosedLikeStatus(issue.Status) {
+		return false
+	}
+
+	for _, dep := range issue.Dependencies {
+		if dep == nil || !dep.Type.IsBlocking() {
+			continue
+		}
+		blocker, exists := a.issueMap[dep.DependsOnID]
+		if exists && !completed[dep.DependsOnID] && !isClosedLikeStatus(blocker.Status) {
+			return true
+		}
+	}
+
+	const maxParentBlockDepth = 50
+	if depth >= maxParentBlockDepth || visiting[issueID] {
+		return false
+	}
+	visiting[issueID] = true
+	defer delete(visiting, issueID)
+
+	for _, dep := range issue.Dependencies {
+		if dep == nil || dep.Type != model.DepParentChild {
+			continue
+		}
+		parent, exists := a.issueMap[dep.DependsOnID]
+		if !exists || completed[dep.DependsOnID] || isClosedLikeStatus(parent.Status) || visiting[parent.ID] {
+			continue
+		}
+		if a.isBlockedAfterCompletions(parent.ID, completed, visiting, depth+1) {
+			return true
+		}
+	}
+	return false
 }
 
 // ComputeUnblocks is an exported wrapper for computeUnblocks for consumers outside analysis.
@@ -201,7 +237,7 @@ func (a *Analyzer) findConnectedComponents() map[string][]string {
 
 // buildTracks creates execution tracks from connected components
 func (a *Analyzer) buildTracks(components map[string][]string, actionableSet map[string]bool, unblocksMap map[string][]string) []ExecutionTrack {
-	var tracks []ExecutionTrack
+	tracks := make([]ExecutionTrack, 0)
 	trackNum := 1
 
 	// Sort component roots for deterministic output
@@ -242,7 +278,7 @@ func (a *Analyzer) buildTracks(components map[string][]string, actionableSet map
 				Title:       issue.Title,
 				Priority:    issue.Priority,
 				Status:      string(issue.Status),
-				UnblocksIDs: unblocksMap[issue.ID],
+				UnblocksIDs: append([]string{}, unblocksMap[issue.ID]...),
 			}
 		}
 

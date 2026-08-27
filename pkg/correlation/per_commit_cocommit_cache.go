@@ -3,7 +3,6 @@ package correlation
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,24 +25,26 @@ import (
 //     new commit's co-commit data is actually new.
 //
 //   - This layer caches each individual commit's (Files, LineStats) contribution,
-//     keyed by the commit's IMMUTABLE SHA. A commit's co-commit data is a pure
-//     function of (commit SHA, exclude-pathspec set): git's name-status/numstat
-//     for a fixed commit under a fixed pathspec never change once the commit
-//     exists. So a commit's entry is stored accumulating and reused forever. When
-//     HEAD advances by k commits, only those k commits are uncached: the batched
-//     `git log` runs over just the k missing SHAs, not all ~500.
+//     keyed by the commit's immutable SHA inside a repository-and-policy
+//     namespace. The extractor pins every Git option that affects the records,
+//     strips ambient repository-routing variables, and sorts Files before
+//     persistence. When HEAD advances by k commits, only those k commits are
+//     uncached: the batched `git log` runs over just the k missing SHAs, not all
+//     ~500.
 //
-// CORRECTNESS — a commit's co-commit data depends ONLY on (SHA, exclude-pathspec):
+// CORRECTNESS — a cached contribution is bound to repository, SHA, policy, and
+// exclude pathspec:
 //
 //	primeBatch computes, for each SHA, files[sha] = parseNameStatus(<the SHA's
 //	first-parent name-status diff under excludePathspecArgs()>) and stats[sha] =
 //	parseNumstat(<...numstat...>). Both git diffs are pure functions of the commit
-//	object (fixed by its SHA) and the exclude pathspec set. No cross-commit state
-//	is carried. Therefore the entry is fully determined by (SHA, exclude pathspec),
-//	and keying on SHA within a namespace derived from the exclude pathspec is
-//	sound. The exclude pathspec is hashed into the namespace so a future change to
-//	excludedPaths can never serve stale data: it lands in a different bucket and
-//	the old commits are simply re-fetched.
+//	object under coCommitGitConfigArgs/coCommitDiffArgs and the exclude pathspec
+//	set. No cross-commit state is carried. The namespace also binds an absolute
+//	repository path so clone-local state cannot cross-contaminate another clone.
+//	Shallow repositories bypass this persistent layer because deepening changes a
+//	boundary commit's effective parent without changing its SHA. Any policy or
+//	excludedPaths change lands in a different bucket; the cache-file version
+//	separately rejects entries created before this binding existed.
 //
 // Storage discipline mirrors per_commit_event_cache.go / disk_cache.go exactly:
 // same XDG cache dir (BV_CACHE_DIR override, else UserCacheDir under "bv"), goccy
@@ -57,7 +58,7 @@ import (
 // disk is byte-identical to one freshly parsed from git.
 
 const (
-	perCommitCoCommitCacheVersion     = 1
+	perCommitCoCommitCacheVersion     = 2
 	perCommitCoCommitCacheFileName    = "correlation_per_commit_cocommit_cache.json"
 	perCommitCoCommitCacheMaxAge      = 30 * 24 * time.Hour // commits are immutable; keep a month
 	perCommitCoCommitCacheMaxCommits  = 4000                // bound the accumulating commit map
@@ -87,7 +88,8 @@ type perCommitCoCommitNamespaceBucket struct {
 }
 
 // perCommitCoCommitEntry is one commit's cached co-commit contribution. Files is
-// the name-status list (in git order); LineStats is the per-path numstat map.
+// the name-status list in stable path/action order; LineStats is the per-path
+// numstat map.
 // Either may be empty (a commit whose diff is empty under the exclude pathspec
 // caches as a definitive empty result, so it is never re-fetched) — matching
 // primeBatch's memoize-empty-on-absence behavior.
@@ -98,12 +100,20 @@ type perCommitCoCommitEntry struct {
 }
 
 // perCommitCoCommitCacheNamespace derives the bucket key for a co-commit
-// extraction. The ONLY input to the cached (Files, LineStats) beyond the commit
-// SHA is the exclude-pathspec set, so the namespace is a hash of those args plus
-// the schema version. A future change to excludedPaths produces a different
-// namespace, isolating it from stale entries.
-func perCommitCoCommitCacheNamespace() string {
-	h := sha256.Sum256([]byte(strings.Join(excludePathspecArgs(), "\x00")))
+// extraction. The namespace binds the repository location, the complete fixed
+// Git diff policy, and the exclude pathspec set. Repository binding prevents a
+// clone-local state from contaminating another clone that happens to contain
+// the same commit object. The extractor separately disables persistent access
+// while this repository is shallow. Policy/pathspec changes get a fresh
+// namespace, while the file-version bump rejects pre-policy caches.
+func perCommitCoCommitCacheNamespace(repoPath string) string {
+	absRepoPath, err := filepath.Abs(repoPath)
+	if err != nil {
+		absRepoPath = filepath.Clean(repoPath)
+	}
+	inputs := []string{filepath.Clean(absRepoPath)}
+	inputs = append(inputs, coCommitGitPolicyNamespaceInputs()...)
+	h := sha256.Sum256([]byte(strings.Join(inputs, "\x00")))
 	return hex.EncodeToString(h[:])
 }
 
@@ -145,12 +155,16 @@ func fromLineStatsMap(in map[string]lineStatsWire) map[string]lineStats {
 }
 
 func readPerCommitCoCommitCacheLocked(f *os.File) perCommitCoCommitCacheFile {
+	return readPerCommitCoCommitCacheLockedWithLimit(f, perCommitCoCommitCacheMaxFileSize)
+}
+
+func readPerCommitCoCommitCacheLockedWithLimit(f *os.File, maxBytes int64) perCommitCoCommitCacheFile {
 	empty := perCommitCoCommitCacheFile{Version: perCommitCoCommitCacheVersion, Entries: map[string]perCommitCoCommitNamespaceBucket{}}
 	if _, err := f.Seek(0, 0); err != nil {
 		return empty
 	}
-	data, err := io.ReadAll(f)
-	if err != nil || len(data) == 0 {
+	data, ok := readCacheFileBounded(f, maxBytes)
+	if !ok || len(data) == 0 {
 		return empty
 	}
 	var cf perCommitCoCommitCacheFile
@@ -245,7 +259,7 @@ func pruneAndBoundPerCommitCoCommitEntries(now time.Time, entries map[string]per
 	var all []item
 	for ns, bucket := range entries {
 		for sha, e := range bucket.Commits {
-			if e.CreatedAt.IsZero() || now.Sub(e.CreatedAt) > perCommitCoCommitCacheMaxAge {
+			if !cacheCreatedAtIsFresh(e.CreatedAt, now, perCommitCoCommitCacheMaxAge) {
 				delete(bucket.Commits, sha)
 				continue
 			}
@@ -311,7 +325,7 @@ func loadPerCommitCoCommit(namespace string) map[string]perCommitCoCommitEntry {
 	// Filter aged entries out of the returned view without rewriting the file.
 	out := make(map[string]perCommitCoCommitEntry, len(bucket.Commits))
 	for sha, e := range bucket.Commits {
-		if e.CreatedAt.IsZero() || now.Sub(e.CreatedAt) > perCommitCoCommitCacheMaxAge {
+		if !cacheCreatedAtIsFresh(e.CreatedAt, now, perCommitCoCommitCacheMaxAge) {
 			continue
 		}
 		out[sha] = e

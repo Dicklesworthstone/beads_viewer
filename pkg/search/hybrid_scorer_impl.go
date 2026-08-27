@@ -1,14 +1,31 @@
 package search
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 type hybridScorer struct {
 	weights Weights
 	cache   MetricsCache
+	now     time.Time
 }
 
 // NewHybridScorer creates a scorer with the given weights and metrics cache.
 func NewHybridScorer(weights Weights, cache MetricsCache) HybridScorer {
+	return NewHybridScorerAt(weights, cache, time.Now())
+}
+
+// NewHybridScorerAt creates a scorer whose recency component is evaluated at
+// referenceTime. Historical robot searches use their snapshot commit time so
+// identical snapshots do not drift as wall time advances.
+func NewHybridScorerAt(weights Weights, cache MetricsCache, referenceTime time.Time) HybridScorer {
+	if referenceTime.IsZero() {
+		// Capture the fallback clock once. Leaving it zero would make
+		// normalizeRecencyAt call time.Now independently for every Score call, so
+		// one scorer could rank an unchanged result set against moving timestamps.
+		referenceTime = time.Now()
+	}
 	normalized := defaultHybridWeights()
 	if err := weights.validateComponents(); err == nil {
 		normalized = weights.Normalize()
@@ -19,6 +36,7 @@ func NewHybridScorer(weights Weights, cache MetricsCache) HybridScorer {
 	return &hybridScorer{
 		weights: normalized,
 		cache:   cache,
+		now:     referenceTime,
 	}
 }
 
@@ -56,7 +74,7 @@ func (s *hybridScorer) Score(issueID string, textScore float64) (HybridScore, er
 		impactScore = normalizeImpact(metrics.BlockerCount, s.cache.MaxBlockerCount())
 	}
 	if s.weights.Recency > 0 {
-		recencyScore = normalizeRecency(metrics.UpdatedAt)
+		recencyScore = normalizeRecencyAt(metrics.UpdatedAt, s.now)
 	}
 
 	final := s.weights.TextRelevance*textScore +

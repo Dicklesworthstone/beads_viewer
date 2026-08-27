@@ -192,9 +192,9 @@ bv is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in c
 - `quick_ref.blocked_count` / `counts.blocked` — issues with status exactly `blocked`; always equals `counts.by_status.blocked`
 - `quick_ref.in_progress_count` — status exactly `in_progress`
 - `counts.closed` — closed-like issues (`closed` + `tombstone`)
-- `quick_ref.not_closed_count` / `counts.not_closed` — every non-closed issue (`open`+`in_progress`+`blocked`+`deferred`); this is the pre-#165 meaning of `open_count`
-- `quick_ref.actionable_count` / `counts.actionable` — non-closed issues with no open blocking dependencies (ready to work now)
-- `quick_ref.not_actionable_count` / `counts.dependency_blocked` — non-closed issues blocked by open dependencies regardless of status; this is the pre-#165 meaning of `blocked_count`
+- `quick_ref.not_closed_count` / `counts.not_closed` — every issue whose status is neither `closed` nor `tombstone` (including `open`, `in_progress`, `blocked`, `deferred`, `draft`, `pinned`, `hooked`, and `review`); this is the pre-#165 meaning of `open_count`
+- `quick_ref.actionable_count` / `counts.actionable` — non-closed issues with no active scheduler deferral, open blocking dependency, or blocked parent chain
+- `quick_ref.not_actionable_count` / `counts.dependency_blocked` — every non-closed issue outside the actionable set, including scheduler-deferred issues and issues blocked by an open dependency or blocked parent chain; despite the legacy `dependency_blocked` JSON name, this is the complete complement needed by the partition invariant and carries the pre-#165 meaning of `blocked_count`
 - Partition invariant: `not_closed == actionable + not_actionable` (every non-closed issue is exactly one of the two)
 
 **Liveness (#166):** the git-history prologue of `--robot-triage` is bounded (default 10s; tune via `--robot-history-timeout-ms <ms>` or `BV_ROBOT_HISTORY_TIMEOUT_MS`, `0` = unbounded). On timeout the in-flight git subprocess is killed and triage proceeds without history; `meta.history_status` reports `ok`, `error`, or `timeout` (omitted when history was not attempted).
@@ -261,11 +261,15 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 
 #### Understanding Robot Output
 
-**All robot JSON includes:**
-- `data_hash` — Fingerprint of the source JSONL issue file (verify consistency across calls)
-- `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
-- `as_of` / `as_of_commit` — Present when using `--as-of`; contains ref and resolved SHA
+**Issue-backed robot JSON source evidence:**
+- `data_hash` — Fingerprint of the canonical loaded issue universe (verify consistency across calls)
+- `as_of` / `as_of_commit` — Present when a command accepts `--as-of`; contains the requested ref and resolved SHA
+- `analysis_time` — Present for historical input; the resolved commit time used for deferral, recency, staleness, and forecast calculations
 - `load_stats` — Present only when issue records were dropped during load (malformed JSON or failed validation, e.g. `updated_at < created_at`): `{source_path, valid, errors, skipped, warnings}`. Check `.load_stats.errors > 0` to distinguish "issue absent from data" from "issue dropped by the loader"; stderr stays clean either way (#190)
+- `authority_incomplete_reasons` — Present when the source is usable for inspection but incomplete or potentially stale (for example, a workspace repository failed or a bd export refresh fell back to an older compatibility file)
+- `repository_route_unavailable_reasons` — Present when issue storage was selected explicitly but bv cannot prove that it belongs to the current working-directory repository. Claim commands and commands that mix in cwd Git/baseline/sprint data fail closed in this state.
+
+Commands that compute phased graph metrics also include `status` (`computed|approx|timeout|skipped` plus elapsed time/reason) and `analysis_config`; non-metric robot commands do not invent those fields.
 
 **Two-phase analysis:**
 - **Phase 1 (instant):** degree, topo sort, density — always available immediately
@@ -275,8 +279,8 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 
 #### jq Quick Reference
 
-bv --robot-triage | jq '.quick_ref'                        # At-a-glance summary
-bv --robot-triage | jq '.recommendations[0]'               # Top recommendation
+bv --robot-triage | jq '.triage.quick_ref'                 # At-a-glance summary
+bv --robot-triage | jq '.triage.recommendations[0]'        # Top recommendation
 bv --robot-plan | jq '.plan.summary.highest_impact'        # Best unblock target
 bv --robot-insights | jq '.status'                         # Check metric readiness
 bv --robot-insights | jq '.Cycles'                         # Circular deps (must fix!)
@@ -2307,23 +2311,31 @@ bv --robot-orphans
 
 ### Causal Chain Analysis
 
-The `--robot-causality` command reveals **why a bead took as long as it did** by reconstructing its timeline of events:
+The `--robot-causality` command reconstructs the lifecycle and correlated-commit timeline available from Git history:
 
 | Event Type | Description |
 |------------|-------------|
 | `created` | Bead was opened |
 | `claimed` | Work started (status → in_progress) |
 | `commit` | Code commit linked to bead |
-| `blocked` | Bead became blocked by another bead |
-| `unblocked` | Blocking dependency was resolved |
 | `closed` | Bead was completed |
 | `reopened` | Bead was reopened after closure |
 
 **Insights provided:**
-- **Blocked percentage**: How much time was spent waiting on dependencies
-- **Critical path**: The chain of events determining minimum completion time
+- **Elapsed duration**: Time from creation to the terminal close transition, or to the report reference time for open beads
+- **Event path**: The observed lifecycle and commit sequence
 - **Longest gap**: Identifies stalled periods needing investigation
 - **Recommendations**: Actionable suggestions (e.g., "Consider breaking into smaller beads")
+
+Git history currently records creation, claim, close, reopen, modification, and
+correlated-commit events. It does not preserve explicit blocked/unblocked
+transition timestamps, so blocked-duration and blocker-attribution metrics remain
+zero/empty in current `--robot-causality` output. The blocked/unblocked causal
+event types are reserved for a future history source that can provide defensible
+transition timestamps; the command does not infer them from a current blocked
+status or a generic modified event. A closed-like current status without a
+terminal close event reports completion timing as unavailable instead of guessing
+from the last commit.
 
 **Causality Output Schema:**
 ```json
@@ -2335,32 +2347,31 @@ The `--robot-causality` command reveals **why a bead took as long as it did** by
     "title": "Implement auth caching",
     "status": "closed",
     "events": [
-      {"id": 1, "type": "created", "timestamp": "2025-01-10T10:00:00Z"},
-      {"id": 2, "type": "claimed", "timestamp": "2025-01-10T11:00:00Z", "caused_by_id": 1},
-      {"id": 3, "type": "blocked", "timestamp": "2025-01-11T09:00:00Z", "blocker_id": "bv-456"},
-      {"id": 4, "type": "unblocked", "timestamp": "2025-01-12T16:00:00Z"},
-      {"id": 5, "type": "commit", "timestamp": "2025-01-13T10:00:00Z", "commit_sha": "abc1234"},
-      {"id": 6, "type": "closed", "timestamp": "2025-01-13T17:00:00Z"}
+      {"id": 0, "type": "created", "timestamp": "2025-01-10T10:00:00Z"},
+      {"id": 1, "type": "claimed", "timestamp": "2025-01-10T11:00:00Z", "caused_by_id": 0},
+      {"id": 2, "type": "commit", "timestamp": "2025-01-13T10:00:00Z", "commit_sha": "abc1234"},
+      {"id": 3, "type": "closed", "timestamp": "2025-01-13T17:00:00Z"}
     ],
-    "edge_count": 5,
-    "total_time": "79h0m0s",
+    "edge_count": 3,
+    "total_time": 284400000000000,
     "is_complete": true
   },
   "insights": {
-    "total_duration": "79h0m0s",
-    "blocked_duration": "31h0m0s",
-    "active_duration": "48h0m0s",
-    "blocked_percentage": 39.2,
-    "blocked_periods": [
-      {"start_time": "2025-01-11T09:00:00Z", "end_time": "2025-01-12T16:00:00Z", "blocker_id": "bv-456"}
-    ],
+    "total_duration": 284400000000000,
+    "blocked_duration": 0,
+    "active_duration": 284400000000000,
+    "blocked_percentage": 0,
+    "blocked_periods": [],
     "commit_count": 1,
-    "critical_path_desc": "created → claimed → blocked → unblocked → commit → closed",
-    "summary": "Bead took 79h total; 39% blocked by bv-456",
-    "recommendations": ["Consider unblocking bv-456 earlier to reduce wait time"]
+    "critical_path_desc": "created → claimed → commit → closed",
+    "summary": "Completed in 79h with 1 commit",
+    "recommendations": ["No significant issues detected in the causal flow"]
   }
 }
 ```
+
+Duration-valued JSON fields use Go's `time.Duration` representation in
+nanoseconds.
 
 ### Correlation Feedback System
 
@@ -2984,11 +2995,11 @@ These commands output **structured JSON** designed for programmatic consumption:
 | `--robot-alerts` | Drift + proactive warnings | Health monitoring |
 | `--robot-help` | Detailed AI agent documentation | Agent onboarding |
 
-All robot commands support `--as-of <ref>` for historical analysis. Output includes `as_of` and `as_of_commit` metadata fields when specified.
+Issue-only analysis commands such as triage, next, plan, priority, insights, graph, search, labels, metrics, suggest, forecast (without a sprint filter), and capacity support `--as-of <ref>`. Commands that would otherwise mix historical issues with live Git history, sprint metadata, saved baselines, or mutation feedback reject that combination explicitly. Output includes `as_of` and `as_of_commit` when historical input is accepted.
 
 ### Time-Travel Commands
 
-The `--as-of` flag lets you view project state at any historical point without modifying your working tree. It works with both the interactive TUI and all robot commands.
+The `--as-of` flag lets you view project state at any historical point without modifying your working tree. It works with the interactive TUI and robot commands whose inputs can be pinned to the same revision. Git-correlation commands (`--robot-history`, related/file-history/network/causality workflows), live sprint/baseline commands, and correlation feedback commands fail closed instead of combining historical issues with current side data.
 
 ```bash
 # View historical state (TUI)
@@ -3013,9 +3024,12 @@ bv --diff-since HEAD~10 --robot-diff                # From HEAD~10 to current
 bv --diff-since HEAD~10 --as-of HEAD~5 --robot-diff # From HEAD~10 to HEAD~5
 ```
 
-When using `--as-of` with robot commands, the JSON output includes additional metadata:
+When using `--as-of` with a supported robot command, the JSON output includes additional metadata:
 - `as_of`: The ref you specified (e.g., "HEAD~30", "v1.0.0")
 - `as_of_commit`: The resolved commit SHA for reproducibility
+- `analysis_time`: The resolved commit's committer time; time-sensitive analysis is evaluated at this instant, not at invocation time
+
+`--as-of` intentionally rejects `--db`, `BEADS_DB`, and `BEADS_DIR`: those selectors identify storage but do not prove which Git repository owns its history.
 
 ### Recipe Commands
 
@@ -3095,15 +3109,17 @@ bv --robot-triage --robot-triage-by-label
 
 ### Shell Script Emission
 
-Generate executable shell scripts from recommendations for automated workflows:
+Generate inspect-only shell scripts from recommendations. The emitted script
+executes `br show` for each recommendation; every `br update` mutation remains a
+commented, deliberate opt-in:
 
 ```bash
 # Emit bash script for top 5 recommendations
-bv --robot-triage --emit-script --script-limit=5
+bv --emit-script --script-limit=5
 
 # Different shell formats
-bv --robot-triage --emit-script --script-format=fish
-bv --robot-triage --emit-script --script-format=zsh
+bv --emit-script --script-format=fish
+bv --emit-script --script-format=zsh
 ```
 
 ### Feedback System (Adaptive Recommendations)
@@ -3878,7 +3894,7 @@ Copyright (c) 2026 Jeffrey Emanuel
   ```
 
 ## 🧮 Execution Plan Logic
-- Actionable set: open/in-progress issues with no open blocking dependencies.
+- Actionable set: non-closed issues with no active scheduler deferral, open blocking dependency, or blocked parent chain.
 - Unblocks: for each actionable, list of issues that would become actionable if it closed (no other open blockers).
 - Tracks: undirected connected components group actionable items into parallelizable streams.
 - Summary: highest-impact item = max unblocks, then priority, then ID for determinism.
@@ -3981,16 +3997,20 @@ by the named parties; see [LICENSE](LICENSE) for the complete controlling terms.
 
 ## 🤖 Robot JSON contract — quick cheat sheet
 
-**Shared across all robots**
-- `data_hash`: hash of the beads file driving the response (use to correlate multiple calls).
-- `analysis_config`: exact analysis settings (timeouts, modes, cycle caps) for reproducibility.
-- `status`: per-metric state `computed|approx|timeout|skipped` with elapsed ms/reason; always check before trusting heavy metrics like PageRank/Betweenness/HITS.
-- `as_of` / `as_of_commit`: present when using `--as-of`; contains the ref you specified and the resolved commit SHA for reproducibility.
+**Shared source evidence for issue-backed robots**
+- `data_hash`: hash of the canonical loaded issue universe driving the response (use to correlate multiple calls).
+- `load_stats`: present when JSONL records were dropped; treat `.errors > 0` as incomplete authority.
+- `authority_incomplete_reasons`: present for non-parse gaps such as failed workspace repositories or stale bd-export fallback.
+- `repository_route_unavailable_reasons`: present when selected issue storage cannot be safely paired with the working-directory repository; mutation and live side-data commands fail closed.
+- `as_of` / `as_of_commit`: present when a supported command uses `--as-of`; contains the requested ref and resolved commit SHA.
+- `analysis_time`: present for historical input; the resolved commit time used by time-sensitive analysis.
+
+Metric-producing commands additionally expose `analysis_config` and `status`; always inspect `status` before trusting heavy metrics such as PageRank, betweenness, or HITS.
 
 **Schemas in 5 seconds (jq-friendly)**
-- `bv --robot-insights` → `.status`, `.analysis_config`, metric maps (capped by `BV_INSIGHTS_MAP_LIMIT`), `Bottlenecks`, `CriticalPath`, `Cycles`, plus advanced signals: `Cores` (k-core), `Articulation` (cut vertices), `Slack` (longest-path slack).
+- `bv --robot-insights` → `.status`, `.analysis_config`, metric maps (capped by `BV_INSIGHTS_MAP_LIMIT`), `Bottlenecks`, `Keystones`, `Cycles`, plus advanced signals: `Cores` (k-core), `Articulation` (cut vertices), `Slack` (longest-path slack).
 - `bv --robot-plan` → `.plan.tracks[].items[].{id,unblocks}` for downstream unlocks; `.plan.summary.highest_impact`.
-- `bv --robot-priority` → `.recommendations[].{id,current_priority,suggested_priority,confidence,reasoning}`.
+- `bv --robot-priority` → `.recommendations[].{issue_id,current_priority,suggested_priority,confidence,reasoning}`.
 - `bv --robot-suggest` → `.suggestions.suggestions[]` (ranked suggestions) + `.suggestions.stats` (counts) + `.usage_hints`.
 - `bv --robot-diff --diff-since <ref>` → `{from_data_hash,to_data_hash,diff.summary,diff.new_issues,diff.cycle_*}`.
 - `bv --robot-history` → `.histories[ID].events` + `.commit_index` for reverse lookup; `.stats.method_distribution` shows how correlations were inferred.

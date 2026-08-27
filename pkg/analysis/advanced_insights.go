@@ -3,6 +3,9 @@ package analysis
 import (
 	"container/heap"
 	"sort"
+	"strings"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // intHeap implements heap.Interface for a min-heap of ints.
@@ -52,16 +55,39 @@ func DefaultAdvancedInsightsConfig() AdvancedInsightsConfig {
 	}
 }
 
+func (c AdvancedInsightsConfig) normalized() AdvancedInsightsConfig {
+	defaults := DefaultAdvancedInsightsConfig()
+	if c.TopKSetLimit <= 0 {
+		c.TopKSetLimit = defaults.TopKSetLimit
+	}
+	if c.CoverageSetLimit <= 0 {
+		c.CoverageSetLimit = defaults.CoverageSetLimit
+	}
+	if c.KPathsLimit <= 0 {
+		c.KPathsLimit = defaults.KPathsLimit
+	}
+	if c.PathLengthCap <= 0 {
+		c.PathLengthCap = defaults.PathLengthCap
+	}
+	if c.CycleBreakLimit <= 0 {
+		c.CycleBreakLimit = defaults.CycleBreakLimit
+	}
+	if c.ParallelCutLimit <= 0 {
+		c.ParallelCutLimit = defaults.ParallelCutLimit
+	}
+	return c
+}
+
 // AdvancedInsights provides structured, capped outputs for advanced graph analysis.
 // Each feature includes status tracking and usage hints for agent consumption.
 type AdvancedInsights struct {
-	// TopKSet: Best set of k beads maximizing downstream unlocks (submodular selection)
+	// TopKSet: Greedy feasible sequence for downstream unlocks
 	TopKSet *TopKSetResult `json:"topk_set,omitempty"`
 
-	// CoverageSet: Minimal set covering all critical paths
+	// CoverageSet: Bounded greedy set covering blocking dependency edges
 	CoverageSet *CoverageSetResult `json:"coverage_set,omitempty"`
 
-	// KPaths: K-shortest critical paths through the dependency graph
+	// KPaths: representative longest critical paths through the dependency graph
 	KPaths *KPathsResult `json:"k_paths,omitempty"`
 
 	// ParallelCut: Suggestions for maximizing parallel work
@@ -70,7 +96,7 @@ type AdvancedInsights struct {
 	// ParallelGain: Parallelization gain metrics for top recommendations
 	ParallelGain *ParallelGainResult `json:"parallel_gain,omitempty"`
 
-	// CycleBreak: Suggestions for breaking cycles with minimal collateral impact
+	// CycleBreak: Frequency-ranked edges from representative stored cycles
 	CycleBreak *CycleBreakResult `json:"cycle_break,omitempty"`
 
 	// Config: Caps and limits used for this analysis
@@ -89,7 +115,7 @@ type FeatureStatus struct {
 	Limited int    `json:"limited,omitempty"` // Original count before capping
 }
 
-// TopKSetResult represents the optimal set of issues to complete for maximum unlock.
+// TopKSetResult represents a greedy sequence of issues chosen for downstream unlock.
 type TopKSetResult struct {
 	Status       FeatureStatus `json:"status"`
 	Items        []TopKSetItem `json:"items,omitempty"`         // Ordered by selection sequence
@@ -102,12 +128,12 @@ type TopKSetResult struct {
 type TopKSetItem struct {
 	ID           string   `json:"id"`
 	Title        string   `json:"title,omitempty"`
-	MarginalGain int      `json:"marginal_gain"`      // Additional unlocks from this pick
-	Unblocks     []string `json:"unblocks,omitempty"` // IDs directly unblocked
+	MarginalGain int      `json:"marginal_gain"`      // Additional actionable issues from this pick
+	Unblocks     []string `json:"unblocks,omitempty"` // IDs newly actionable after this pick
 }
 
-// CoverageSetResult represents minimal set covering all dependency edges (vertex cover).
-// Uses greedy 2-approximation algorithm for bounded, deterministic output (bv-152).
+// CoverageSetResult represents a bounded set covering dependency edges (vertex cover).
+// Uses a deterministic highest-uncovered-degree heuristic (bv-152).
 type CoverageSetResult struct {
 	Status        FeatureStatus  `json:"status"`
 	Items         []CoverageItem `json:"items,omitempty"`
@@ -127,7 +153,7 @@ type CoverageItem struct {
 	SelectionSeq int    `json:"selection_seq"` // Order in which this was selected (1-indexed)
 }
 
-// KPathsResult represents K-shortest critical paths.
+// KPathsResult represents representative longest critical paths.
 type KPathsResult struct {
 	Status   FeatureStatus  `json:"status"`
 	Paths    []CriticalPath `json:"paths,omitempty"`
@@ -146,7 +172,7 @@ type CriticalPath struct {
 type ParallelCutResult struct {
 	Status      FeatureStatus     `json:"status"`
 	Suggestions []ParallelCutItem `json:"suggestions,omitempty"`
-	MaxParallel int               `json:"max_parallel"` // Maximum parallelism achievable
+	MaxParallel int               `json:"max_parallel"` // Projected ready width after completing returned suggestions
 	HowToUse    string            `json:"how_to_use"`
 }
 
@@ -178,7 +204,7 @@ type ParallelGainItem struct {
 type CycleBreakResult struct {
 	Status      FeatureStatus    `json:"status"`
 	Suggestions []CycleBreakItem `json:"suggestions,omitempty"`
-	CycleCount  int              `json:"cycle_count"` // Total cycles detected
+	CycleCount  int              `json:"cycle_count"` // Stored representative cycle records analyzed by this feature
 	HowToUse    string           `json:"how_to_use"`
 	Advisory    string           `json:"advisory"` // Important warning text
 }
@@ -187,8 +213,8 @@ type CycleBreakResult struct {
 type CycleBreakItem struct {
 	EdgeFrom   string `json:"edge_from"`  // Source node of edge to remove
 	EdgeTo     string `json:"edge_to"`    // Target node of edge to remove
-	Impact     int    `json:"impact"`     // Number of cycles broken
-	Collateral int    `json:"collateral"` // Dependents affected
+	Impact     int    `json:"impact"`     // Stored cycle records containing this edge
+	Collateral int    `json:"collateral"` // Active blocking dependents of EdgeTo
 	InCycles   []int  `json:"in_cycles"`  // Cycle indices containing this edge
 	Rationale  string `json:"rationale"`  // Why this edge is suggested
 }
@@ -197,8 +223,8 @@ type CycleBreakItem struct {
 func DefaultUsageHints() map[string]string {
 	return map[string]string{
 		"topk_set":      "Best k issues to complete for max downstream unlock. Work these in order.",
-		"coverage_set":  "Small vertex cover touching all dependency edges. Use for breadth coverage.",
-		"k_paths":       "K-shortest critical paths. Focus on issues appearing in multiple paths.",
+		"coverage_set":  "Greedy dependency-edge coverage. Check coverage_ratio and capped before treating it as complete.",
+		"k_paths":       "Representative longest critical paths. Focus on issues appearing in multiple paths.",
 		"parallel_cut":  "Issues that enable parallel work. Complete to maximize team throughput.",
 		"parallel_gain": "Parallelization improvement from completing each issue.",
 		"cycle_break":   "Structural fix suggestions. Apply BEFORE working on cycle members.",
@@ -215,6 +241,7 @@ func (a *Analyzer) GenerateAdvancedInsights(config AdvancedInsightsConfig) *Adva
 // reusing completed graph statistics when supplied. A nil stats value preserves
 // GenerateAdvancedInsights behavior by running analysis when cycle data is needed.
 func (a *Analyzer) GenerateAdvancedInsightsFromStats(stats *GraphStats, config AdvancedInsightsConfig) *AdvancedInsights {
+	config = config.normalized()
 	insights := &AdvancedInsights{
 		Config:     config,
 		UsageHints: DefaultUsageHints(),
@@ -223,7 +250,7 @@ func (a *Analyzer) GenerateAdvancedInsightsFromStats(stats *GraphStats, config A
 	// TopK Set - greedy submodular selection for maximum unlock (bv-145)
 	insights.TopKSet = a.generateTopKSet(config.TopKSetLimit)
 
-	// Coverage Set - greedy 2-approx vertex cover (bv-152)
+	// Coverage Set - bounded greedy vertex-cover heuristic (bv-152)
 	insights.CoverageSet = a.generateCoverageSet(config.CoverageSetLimit)
 
 	// K-Paths - top k longest/critical paths through the dependency graph (bv-153)
@@ -250,11 +277,41 @@ func (a *Analyzer) GenerateAdvancedInsightsFromStats(stats *GraphStats, config A
 // generateCycleBreakSuggestionsFromStats creates cycle break suggestions from
 // supplied cycle data, analyzing only when the caller has no reusable stats.
 func (a *Analyzer) generateCycleBreakSuggestionsFromStats(stats *GraphStats, limit int) *CycleBreakResult {
+	if limit <= 0 {
+		limit = 5
+	}
+
 	if stats == nil {
 		analyzed := a.Analyze()
 		stats = &analyzed
 	} else {
 		stats.WaitForPhase2()
+	}
+	cycleStatus := stats.Status().Cycles
+	if cycleStatus.State != "computed" {
+		state := "error"
+		switch cycleStatus.State {
+		case "pending":
+			state = "pending"
+		case "skipped":
+			state = "skipped"
+		}
+
+		reason := "cycle detection unavailable"
+		if cycleStatus.State != "" {
+			reason = "cycle detection " + cycleStatus.State
+		}
+		if cycleStatus.Reason != "" {
+			reason += ": " + cycleStatus.Reason
+		}
+		return &CycleBreakResult{
+			Status: FeatureStatus{
+				State:  state,
+				Reason: reason,
+			},
+			HowToUse: DefaultUsageHints()["cycle_break"],
+			Advisory: "Cycle analysis is unavailable; do not infer that the dependency graph is acyclic.",
+		}
 	}
 	cycles := stats.Cycles()
 
@@ -275,20 +332,30 @@ func (a *Analyzer) generateCycleBreakSuggestionsFromStats(stats *GraphStats, lim
 	edgeFreq := make(map[edgeKey][]int) // edge -> cycle indices
 
 	for i, cycle := range cycles {
-		if len(cycle) < 2 {
+		if len(cycle) == 0 {
 			continue
 		}
 		// Handle special markers
 		if cycle[0] == "CYCLE_DETECTION_TIMEOUT" || cycle[0] == "..." {
 			continue
 		}
-		for j := 0; j < len(cycle)-1; j++ {
-			key := edgeKey{from: cycle[j], to: cycle[j+1]}
+
+		// The graph detector returns closed paths (A,B,C,A), while test and
+		// external callers may supply the compact form (A,B,C). Normalize both to
+		// the same edge ring; closing an already-closed path would invent A->A.
+		nodeCount := len(cycle)
+		if nodeCount > 1 && cycle[0] == cycle[nodeCount-1] {
+			nodeCount--
+		}
+		seenInCycle := make(map[edgeKey]struct{}, nodeCount)
+		for j := 0; j < nodeCount; j++ {
+			key := edgeKey{from: cycle[j], to: cycle[(j+1)%nodeCount]}
+			if _, seen := seenInCycle[key]; seen {
+				continue
+			}
+			seenInCycle[key] = struct{}{}
 			edgeFreq[key] = append(edgeFreq[key], i)
 		}
-		// Close the cycle
-		key := edgeKey{from: cycle[len(cycle)-1], to: cycle[0]}
-		edgeFreq[key] = append(edgeFreq[key], i)
 	}
 
 	// Rank edges by frequency (breaking highest-frequency edges affects most cycles)
@@ -324,14 +391,20 @@ func (a *Analyzer) generateCycleBreakSuggestionsFromStats(stats *GraphStats, lim
 			Impact:     r.count,
 			Collateral: a.countDependents(r.key.to),
 			InCycles:   r.cycles,
-			Rationale:  "Appears in most cycles; removing minimizes structural damage.",
+			Rationale:  "Appears in the most stored cycle records; review collateral before removing this dependency.",
 		})
 	}
 
-	capped := len(ranked) > limit
+	inputCapped := strings.Contains(cycleStatus.Reason, "cycle representatives") && strings.Contains(cycleStatus.Reason, "truncated")
+	capped := len(ranked) > limit || inputCapped
+	advisory := "Cycle detection stores one representative cycle per cyclic component; review each edge and re-run analysis after a break."
+	if inputCapped {
+		advisory = "Cycle detection was capped; suggestions cover only stored cycles. " + advisory
+	}
 	return &CycleBreakResult{
 		Status: FeatureStatus{
 			State:   "available",
+			Reason:  cycleStatus.Reason,
 			Count:   len(suggestions),
 			Capped:  capped,
 			Limited: len(ranked),
@@ -339,7 +412,7 @@ func (a *Analyzer) generateCycleBreakSuggestionsFromStats(stats *GraphStats, lim
 		Suggestions: suggestions,
 		CycleCount:  len(cycles),
 		HowToUse:    DefaultUsageHints()["cycle_break"],
-		Advisory:    "Structural fix—apply cycle breaks BEFORE executing dependents.",
+		Advisory:    advisory,
 	}
 }
 
@@ -352,28 +425,33 @@ func (a *Analyzer) countDependents(issueID string) int {
 	}
 	to := a.g.To(nodeID)
 	for to.Next() {
-		count++
+		dependentID := a.nodeToID[to.Node().ID()]
+		dependent, ok := a.issueMap[dependentID]
+		if ok && !isClosedLikeStatus(dependent.Status) {
+			count++
+		}
 	}
 	return count
 }
 
-// generateTopKSet implements greedy submodular selection to find the best k issues
-// that maximize downstream unlocks when completed together (bv-145).
+// generateTopKSet implements greedy submodular selection to find a feasible
+// sequence of at most k issues that maximizes downstream unlocks (bv-145).
 func (a *Analyzer) generateTopKSet(k int) *TopKSetResult {
 	if k <= 0 {
 		k = 5 // default
 	}
 
-	// Get actionable (non-closed) issues as candidates
-	var candidates []string
-	for id, issue := range a.issueMap {
-		if !isClosedLikeStatus(issue.Status) {
-			candidates = append(candidates, id)
+	// Count the non-closed, non-deferred universe for status metadata. Candidate
+	// selection below is stricter: every pick must be actionable after the picks
+	// before it have been simulated as complete.
+	potentialCandidates := 0
+	for _, issue := range a.issueMap {
+		if !isClosedLikeStatus(issue.Status) && !issue.IsDeferredAt(a.now) {
+			potentialCandidates++
 		}
 	}
-	sort.Strings(candidates) // deterministic ordering
 
-	if len(candidates) == 0 {
+	if potentialCandidates == 0 {
 		return &TopKSetResult{
 			Status: FeatureStatus{
 				State:  "available",
@@ -390,18 +468,25 @@ func (a *Analyzer) generateTopKSet(k int) *TopKSetResult {
 	var marginalGains []int
 	totalGain := 0
 
-	// Greedy selection: pick k items with highest marginal gain
-	for i := 0; i < k && len(candidates) > 0; i++ {
+	// Greedy selection: at each step, consider only issues that are actionable
+	// after the preceding selections. This keeps "work these in order" honest:
+	// a blocked high-fanout node can never precede its prerequisite.
+	for i := 0; i < k; i++ {
+		actionable := a.getActionableIssuesAfterCompletions(completed)
+		if len(actionable) == 0 {
+			break
+		}
+		before := issueIDSet(actionable)
+
 		bestID := ""
 		bestGain := -1
 		var bestUnblocks []string
 
-		// Evaluate each remaining candidate
-		for _, candID := range candidates {
-			if completed[candID] {
-				continue
-			}
-			unblocks := a.computeMarginalUnblocks(candID, completed)
+		// getActionableIssuesAfterCompletions returns ID-sorted results, so the
+		// explicit tie-break below is defensive as well as deterministic.
+		for _, candidate := range actionable {
+			candID := candidate.ID
+			unblocks := a.computeMarginalUnblocksFromBefore(candID, completed, before)
 			gain := len(unblocks)
 			// Tie-break by ID for determinism
 			if gain > bestGain || (gain == bestGain && (bestID == "" || candID < bestID)) {
@@ -431,13 +516,22 @@ func (a *Analyzer) generateTopKSet(k int) *TopKSetResult {
 		totalGain += bestGain
 	}
 
+	// Reaching the output limit only means truncation when the simulated state
+	// has another feasible pick. Counting every remaining open issue produced a
+	// false capped claim for issues stranded in a dependency cycle.
+	hasNextFeasiblePick := len(items) >= k && len(a.getActionableIssuesAfterCompletions(completed)) > 0
+	status := FeatureStatus{
+		State:   "available",
+		Count:   len(items),
+		Capped:  hasNextFeasiblePick,
+		Limited: potentialCandidates,
+	}
+	if len(items) == 0 {
+		status.Reason = "No actionable issues"
+	}
+
 	return &TopKSetResult{
-		Status: FeatureStatus{
-			State:   "available",
-			Count:   len(items),
-			Capped:  len(items) >= k && len(candidates) > k,
-			Limited: len(candidates),
-		},
+		Status:       status,
 		Items:        items,
 		TotalGain:    totalGain,
 		MarginalGain: marginalGains,
@@ -448,59 +542,39 @@ func (a *Analyzer) generateTopKSet(k int) *TopKSetResult {
 // computeMarginalUnblocks computes which issues would become actionable if we complete
 // the given issue, assuming the issues in 'alreadyCompleted' are also done.
 func (a *Analyzer) computeMarginalUnblocks(issueID string, alreadyCompleted map[string]bool) []string {
+	before := issueIDSet(a.getActionableIssuesAfterCompletions(alreadyCompleted))
+	return a.computeMarginalUnblocksFromBefore(issueID, alreadyCompleted, before)
+}
+
+func issueIDSet(issues []model.Issue) map[string]bool {
+	result := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		result[issue.ID] = true
+	}
+	return result
+}
+
+// computeMarginalUnblocksFromBefore is the batch form of
+// computeMarginalUnblocks. Callers evaluating several candidates against the
+// same completion state can reuse the baseline set instead of rebuilding the
+// entire actionable graph for every candidate.
+func (a *Analyzer) computeMarginalUnblocksFromBefore(issueID string, alreadyCompleted, before map[string]bool) []string {
+	completedAfter := make(map[string]bool, len(alreadyCompleted)+1)
+	for id, done := range alreadyCompleted {
+		completedAfter[id] = done
+	}
+	completedAfter[issueID] = true
+
 	var unblocks []string
-
-	for _, issue := range a.issueMap {
-		// Skip closed issues
-		if isClosedLikeStatus(issue.Status) {
-			continue
-		}
-		// Skip if already "completed" in our simulation
-		if alreadyCompleted[issue.ID] {
-			continue
-		}
-		// Skip if this is the candidate itself
-		if issue.ID == issueID {
-			continue
-		}
-
-		// Check if this issue would become unblocked
-		wouldBeBlocked := false
-		hasThisBlocker := false
-
-		for _, dep := range issue.Dependencies {
-			if dep == nil {
-				continue
-			}
-			if !dep.Type.IsBlocking() {
-				continue
-			}
-
-			if dep.DependsOnID == issueID {
-				hasThisBlocker = true
-				continue
-			}
-
-			// Check if there's another open blocker (not already completed)
-			if blocker, exists := a.issueMap[dep.DependsOnID]; exists {
-				if !isClosedLikeStatus(blocker.Status) && !alreadyCompleted[dep.DependsOnID] {
-					wouldBeBlocked = true
-					break
-				}
-			}
-		}
-
-		// If this issue depends on issueID and would become unblocked
-		if hasThisBlocker && !wouldBeBlocked {
+	for _, issue := range a.getActionableIssuesAfterCompletions(completedAfter) {
+		if !before[issue.ID] {
 			unblocks = append(unblocks, issue.ID)
 		}
 	}
-
-	sort.Strings(unblocks)
 	return unblocks
 }
 
-// generateCoverageSet computes a greedy vertex cover (2-approx) over blocking edges.
+// generateCoverageSet computes a bounded greedy vertex-cover heuristic over blocking edges.
 // Uses only open issues; returns deterministic ordering with caps.
 func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 	if limit <= 0 {
@@ -510,6 +584,8 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 	// Build edge list of blocking deps between non-closed issues
 	type edge struct{ from, to string }
 	var edges []edge
+	seenEdges := make(map[edge]struct{})
+	totalDegree := make(map[string]int)
 	for id, issue := range a.issueMap {
 		if isClosedLikeStatus(issue.Status) {
 			continue
@@ -519,7 +595,13 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 				continue
 			}
 			if target, ok := a.issueMap[dep.DependsOnID]; ok && !isClosedLikeStatus(target.Status) {
-				edges = append(edges, edge{from: id, to: dep.DependsOnID})
+				e := edge{from: id, to: dep.DependsOnID}
+				if _, seen := seenEdges[e]; !seen {
+					seenEdges[e] = struct{}{}
+					edges = append(edges, e)
+					totalDegree[e.from]++
+					totalDegree[e.to]++
+				}
 			}
 		}
 	}
@@ -589,7 +671,7 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 			ID:           bestID,
 			Title:        title,
 			EdgesAdded:   added,
-			TotalDegree:  bestDeg,
+			TotalDegree:  totalDegree[bestID],
 			SelectionSeq: selection,
 		})
 	}
@@ -606,7 +688,7 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 		EdgesCovered:  edgesCovered,
 		TotalEdges:    totalEdges,
 		CoverageRatio: float64(edgesCovered) / float64(totalEdges),
-		Rationale:     "Greedy vertex cover (2-approx): iteratively pick highest uncovered degree until edges are covered or cap is reached.",
+		Rationale:     "Greedy vertex-cover heuristic: iteratively pick highest uncovered degree until edges are covered or cap is reached.",
 		HowToUse:      DefaultUsageHints()["coverage_set"],
 	}
 }
@@ -659,9 +741,12 @@ func (a *Analyzer) generateKPaths(k int, pathLengthCap int) *KPathsResult {
 	// Build adjacency: adj[i] = nodes that i blocks (i.e., they depend on i)
 	adj := make([][]int, n)
 	inDegree := make([]int, n)
+	seenBlockerEpoch := make([]int, n)
+	epoch := 0
 
 	for _, node := range nodes {
 		issue := a.issueMap[node.id]
+		epoch++
 		for _, dep := range issue.Dependencies {
 			if dep == nil || !dep.Type.IsBlocking() {
 				continue
@@ -671,6 +756,10 @@ func (a *Analyzer) generateKPaths(k int, pathLengthCap int) *KPathsResult {
 			if !ok {
 				continue // blocker is closed or not in graph
 			}
+			if seenBlockerEpoch[fromIdx] == epoch {
+				continue
+			}
+			seenBlockerEpoch[fromIdx] = epoch
 			toIdx := idToIndex[node.id]
 			adj[fromIdx] = append(adj[fromIdx], toIdx)
 			inDegree[toIdx]++
@@ -709,15 +798,26 @@ func (a *Analyzer) generateKPaths(k int, pathLengthCap int) *KPathsResult {
 		}
 	}
 
-	// If topoOrder doesn't include all nodes, there's a cycle - handle gracefully
-	// If topoOrder doesn't include all nodes, the graph has cycles; we still
-	// proceed with a partial ordering for path computation.
+	// A partial topological order cannot support an honest longest-path result:
+	// paths through or downstream of a cycle would be silently omitted. Fail
+	// closed and direct the caller to the cycle-break feature instead.
+	if len(topoOrder) != n {
+		return &KPathsResult{
+			Status: FeatureStatus{
+				State:  "skipped",
+				Reason: "Dependency graph contains a cycle; break cycles before computing critical paths",
+			},
+			HowToUse: DefaultUsageHints()["k_paths"],
+		}
+	}
 
 	// DP for longest path distances and predecessor tracking
 	dist := make([]int, n) // dist[i] = length of longest path ending at i
 	pred := make([]int, n) // pred[i] = predecessor on longest path (-1 if source)
+	source := make([]int, n)
 	for i := range pred {
 		pred[i] = -1
+		source[i] = i
 	}
 
 	// Process in topological order
@@ -726,9 +826,11 @@ func (a *Analyzer) generateKPaths(k int, pathLengthCap int) *KPathsResult {
 			if dist[u]+1 > dist[v] {
 				dist[v] = dist[u] + 1
 				pred[v] = u
+				source[v] = source[u]
 			} else if dist[u]+1 == dist[v] && (pred[v] == -1 || u < pred[v]) {
 				// Tie-break: prefer smaller index predecessor for determinism
 				pred[v] = u
+				source[v] = source[u]
 			}
 		}
 	}
@@ -755,6 +857,7 @@ func (a *Analyzer) generateKPaths(k int, pathLengthCap int) *KPathsResult {
 	// Reconstruct paths from top k endpoints
 	var paths []CriticalPath
 	usedSources := make(map[int]bool) // Avoid returning duplicate paths (same source)
+	pathLengthCapped := false
 
 	for _, pe := range pathEnds {
 		if len(paths) >= k {
@@ -780,11 +883,11 @@ func (a *Analyzer) generateKPaths(k int, pathLengthCap int) *KPathsResult {
 
 		// Check if we already have a path from this source
 		if len(pathIndices) > 0 {
-			source := pathIndices[0]
-			if usedSources[source] {
+			pathSource := source[pe.idx]
+			if usedSources[pathSource] {
 				continue // Skip duplicate source paths
 			}
-			usedSources[source] = true
+			usedSources[pathSource] = true
 		}
 
 		// Convert indices to issue IDs
@@ -792,6 +895,7 @@ func (a *Analyzer) generateKPaths(k int, pathLengthCap int) *KPathsResult {
 		if len(pathIndices) > pathLengthCap {
 			pathIndices = pathIndices[:pathLengthCap]
 			truncated = true
+			pathLengthCapped = true
 		}
 
 		issueIDs := make([]string, len(pathIndices))
@@ -807,20 +911,24 @@ func (a *Analyzer) generateKPaths(k int, pathLengthCap int) *KPathsResult {
 		})
 	}
 
-	// Count total non-trivial paths for status
-	totalPaths := 0
+	// Count the representative paths eligible for output, one per source. Using
+	// every non-trivial endpoint here would make status.capped claim omissions
+	// even when those endpoints are deliberately suppressed as duplicate-source
+	// variants.
+	representativeSources := make(map[int]struct{})
 	for _, pe := range pathEnds {
 		if pe.length > 0 {
-			totalPaths++
+			representativeSources[source[pe.idx]] = struct{}{}
 		}
 	}
+	representativeCount := len(representativeSources)
 
 	return &KPathsResult{
 		Status: FeatureStatus{
 			State:   "available",
 			Count:   len(paths),
-			Capped:  len(paths) >= k && totalPaths > k,
-			Limited: totalPaths,
+			Capped:  pathLengthCapped || (len(paths) >= k && representativeCount > k),
+			Limited: representativeCount,
 		},
 		Paths:    paths,
 		HowToUse: DefaultUsageHints()["k_paths"],
@@ -835,93 +943,43 @@ func (a *Analyzer) generateParallelCut(limit int) *ParallelCutResult {
 		limit = 5
 	}
 
-	// Build map of non-closed issues
-	openIssues := make(map[string]bool)
-	for id, issue := range a.issueMap {
-		if !isClosedLikeStatus(issue.Status) {
-			openIssues[id] = true
-		}
-	}
-
-	if len(openIssues) == 0 {
+	actionable := a.getActionableIssuesAfterCompletions(nil)
+	if len(actionable) == 0 {
 		return &ParallelCutResult{
 			Status: FeatureStatus{
 				State:  "available",
 				Count:  0,
-				Reason: "No open issues",
+				Reason: "No actionable issues",
 			},
 			MaxParallel: 0,
 			HowToUse:    DefaultUsageHints()["parallel_cut"],
 		}
 	}
 
-	// Build dependency graph: blockerOf[A] = list of issues that A blocks
-	blockerOf := make(map[string][]string)
-	blockedBy := make(map[string][]string) // blockedBy[B] = list of issues blocking B
+	before := issueIDSet(actionable)
 
-	for id, issue := range a.issueMap {
-		if !openIssues[id] {
-			continue
-		}
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
-				continue
-			}
-			if openIssues[dep.DependsOnID] {
-				blockerOf[dep.DependsOnID] = append(blockerOf[dep.DependsOnID], id)
-				blockedBy[id] = append(blockedBy[id], dep.DependsOnID)
-			}
-		}
-	}
-
-	// Count current actionable issues (no open blockers)
-	currentActionable := 0
-	for id := range openIssues {
-		if len(blockedBy[id]) == 0 {
-			currentActionable++
-		}
-	}
-
-	// Calculate parallel gain for each open issue
+	// Calculate parallel gain only for work that can actually start now. The
+	// canonical readiness simulation handles blocking dependency types,
+	// defer_until, and transitive parent-blocked propagation together.
 	type parallelCandidate struct {
 		id            string
 		parallelGain  int
-		newActionable int
 		enabledTracks []string
 	}
 	var candidates []parallelCandidate
 
-	for id := range openIssues {
-		// Count how many dependents would become actionable if this issue is completed
-		var newlyActionable []string
-
-		for _, depID := range blockerOf[id] {
-			if !openIssues[depID] {
-				continue
-			}
-			// Check if all other blockers of depID are closed (or would be after removing id)
-			allOthersClosed := true
-			for _, blockerID := range blockedBy[depID] {
-				if blockerID != id && openIssues[blockerID] {
-					allOthersClosed = false
-					break
-				}
-			}
-			if allOthersClosed {
-				newlyActionable = append(newlyActionable, depID)
-			}
-		}
+	for _, issue := range actionable {
+		id := issue.ID
+		newlyActionable := a.computeMarginalUnblocksFromBefore(id, nil, before)
 
 		// Parallel gain = newly actionable - 1 (the completed node leaves the actionable pool)
 		// Positive gain means net increase in parallel work opportunities
 		parallelGain := len(newlyActionable) - 1
 
 		if parallelGain > 0 {
-			sort.Strings(newlyActionable)
 			candidates = append(candidates, parallelCandidate{
 				id:            id,
 				parallelGain:  parallelGain,
-				newActionable: len(newlyActionable),
 				enabledTracks: newlyActionable,
 			})
 		}
@@ -956,11 +1014,14 @@ func (a *Analyzer) generateParallelCut(limit int) *ParallelCutResult {
 		}
 	}
 
-	// Calculate max parallel achievable
-	maxParallel := currentActionable
+	// Project the ready width after completing the returned cut as a set. Summing
+	// each candidate's independent marginal gain misses issues that require two or
+	// more suggested blockers to complete before becoming actionable.
+	completedCut := make(map[string]bool, len(candidates))
 	for _, c := range candidates {
-		maxParallel += c.parallelGain
+		completedCut[c.id] = true
 	}
+	maxParallel := len(a.getActionableIssuesAfterCompletions(completedCut))
 
 	return &ParallelCutResult{
 		Status: FeatureStatus{

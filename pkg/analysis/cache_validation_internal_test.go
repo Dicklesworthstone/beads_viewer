@@ -70,6 +70,55 @@ func TestBeadsTreeModTime_OnlyConsultsTopLevelFiles(t *testing.T) {
 	}
 }
 
+func TestMemoryCachesRejectFutureTimestamps(t *testing.T) {
+	stats := NewGraphStatsForTest(nil, nil, nil, nil, nil, nil, nil, nil, nil, 0, nil)
+	now := time.Now()
+
+	cache := NewCache(time.Minute)
+	cache.SetByHash("future", stats)
+	cache.mu.Lock()
+	cache.computedAt = now.Add(time.Hour)
+	cache.mu.Unlock()
+	if _, ok := cache.GetByHash("future"); ok {
+		t.Fatal("ordinary cache accepted a future-dated entry")
+	}
+
+	const key = "future-incremental-entry"
+	incrementalGraphStatsCacheMu.Lock()
+	incrementalGraphStatsCache[key] = incrementalGraphStatsCacheEntry{
+		stats:      stats,
+		insertedAt: now.Add(time.Hour),
+	}
+	incrementalGraphStatsCacheMu.Unlock()
+	if _, ok := getIncrementalGraphStatsCache(key); ok {
+		t.Fatal("incremental graph cache accepted a future-dated entry")
+	}
+}
+
+func TestMemoryCachesRejectIncompleteAnalysisStates(t *testing.T) {
+	for _, state := range []string{"timeout", ""} {
+		stats := NewGraphStatsForTest(nil, nil, nil, nil, nil, nil, nil, nil, nil, 0, nil)
+		stats.mu.Lock()
+		stats.status.PageRank = statusEntry{State: state}
+		stats.mu.Unlock()
+
+		key := "unusable-" + state
+		cache := NewCache(time.Minute)
+		cache.SetByHash(key, stats)
+		if _, ok := cache.GetByHash(key); ok {
+			t.Fatalf("ordinary cache returned analysis with metric state %q", state)
+		}
+		if _, _, hasData := cache.Stats(); hasData {
+			t.Fatalf("ordinary cache stored analysis with metric state %q", state)
+		}
+
+		putIncrementalGraphStatsCache(key, stats)
+		if _, ok := getIncrementalGraphStatsCache(key); ok {
+			t.Fatalf("incremental graph cache stored analysis with metric state %q", state)
+		}
+	}
+}
+
 // Issue #192: a plain cache miss (key absent) must be a pure read — it must
 // not touch other entries, create files, or fsync anything. The put after the
 // upcoming recompute is the only write on that path.
