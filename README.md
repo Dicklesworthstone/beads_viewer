@@ -138,7 +138,7 @@ At its heart, `bv` is about **viewing your work nicely**.
 No web page loads, no heavy clients. `bv` starts instantly and lets you fly through your issue backlog using standard Vim keys (`j`/`k`).
 *   **Split-View Dashboard:** On wider screens, see your list on the left and full details on the right.
 *   **Markdown Rendering:** Issue descriptions, comments, and notes are beautifully rendered with syntax highlighting, headers, and lists.
-*   **Instant Filtering:** Zero-latency filtering. Press `o` for Open, `c` for Closed, or `r` for Ready (unblocked) tasks.
+*   **Instant Filtering:** Zero-latency filtering. Press `o` for Open, `c` for Closed, or `r` for Ready (unblocked) tasks. Press `A` to filter by assignee or `I` to filter by issue type—both compose with the status filter instead of replacing it, so `o` + `A` narrows to one assignee's open issues.
 *   **Live Reload:** Watches the active Beads JSONL file and refreshes lists, details, and insights automatically when the file changes—no restart needed.
 
 ### 🔎 Rich Context
@@ -3658,6 +3658,8 @@ bv has a comprehensive built-in help system:
 | | `/` | **Search** (Fuzzy) |
 | | `Ctrl+S` | Toggle **Search Mode** (Semantic ↔ Fuzzy) |
 | | `l` | **Label Picker** (quick filter by label) |
+| | `A` | **Assignee Picker** (quick filter by assignee) |
+| | `I` | **Type Picker** (quick filter by issue type) |
 | **List Sorting** | `s` | Cycle Sort Mode (Default → Created ↑ → Created ↓ → Priority → Updated) |
 | **Views** | `b` | Toggle **Kanban Board** |
 | | `i` | Toggle **Insights Dashboard** |
@@ -3694,6 +3696,8 @@ bv has a comprehensive built-in help system:
 | | `!` | Toggle **Alerts Panel** (proactive warnings) |
 | | `'` | Recipe Picker |
 | | `w` | Repo Picker (workspace mode) |
+
+> **Note:** The assignee and type filters (`A` / `I`) compose with the status filter (`o`/`c`/`r`/`a`) instead of replacing it—e.g. `o` then `A` → alice narrows to alice's open issues. The label filter (`l`) still replaces the status filter rather than composing with it.
 
 ---
 
