@@ -5166,6 +5166,7 @@ func (m *Model) handleActionableKeys(msg tea.KeyMsg) *Model {
 // returns commands produced by the embedded text input (notably clipboard
 // paste commands) so the Bubble Tea runtime can execute them.
 func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
+	var cmd tea.Cmd
 	// Handle search input when active (bv-nkrj)
 	if m.historyView.IsSearchActive() {
 		switch msg.String() {
@@ -5426,7 +5427,7 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		m.isHistoryView = false
 		m.focused = focusList
 	}
-	return m, nil
+	return m, cmd
 }
 
 // getCommitURL returns the GitHub/GitLab commit URL for a SHA (bv-xf4p)
