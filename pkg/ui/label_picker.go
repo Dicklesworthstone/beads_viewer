@@ -10,7 +10,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// LabelPickerModel provides a fuzzy search popup for quick label filtering
+// LabelPickerModel provides a fuzzy search popup for quick filtering by an
+// arbitrary set of string values (labels, assignees, issue types, ...).
 type LabelPickerModel struct {
 	allLabels     []string
 	labelCounts   map[string]int // count of issues per label
@@ -20,6 +21,7 @@ type LabelPickerModel struct {
 	width         int
 	height        int
 	theme         Theme
+	title         string // overlay title; defaults to "Filter by Label" when empty
 }
 
 // NewLabelPickerModel creates a new label picker with fuzzy search
@@ -41,6 +43,14 @@ func NewLabelPickerModel(labels []string, counts map[string]int, theme Theme) La
 		selectedIndex: 0,
 		theme:         theme,
 	}
+}
+
+// NewPickerModel creates a fuzzy-search picker over an arbitrary set of
+// values with a custom overlay title (e.g. "Filter by Assignee").
+func NewPickerModel(values []string, counts map[string]int, theme Theme, title string) LabelPickerModel {
+	m := NewLabelPickerModel(values, counts, theme)
+	m.title = title
+	return m
 }
 
 // Focus activates the picker input and returns its initial cursor command.
@@ -254,7 +264,11 @@ func (m *LabelPickerModel) View() string {
 		Foreground(t.Primary).
 		Bold(true).
 		MarginBottom(1)
-	lines = append(lines, titleStyle.Render("Filter by Label"))
+	title := m.title
+	if title == "" {
+		title = "Filter by Label"
+	}
+	lines = append(lines, titleStyle.Render(title))
 	lines = append(lines, "")
 
 	// Search input

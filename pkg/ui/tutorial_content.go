@@ -346,7 +346,11 @@ func structuredTutorialPages() []StructuredTutorialPage {
 					{Key: "c", Desc: "Closed issues only"},
 					{Key: "r", Desc: "Ready (no blockers)"},
 					{Key: "a", Desc: "All (reset filter)"},
+					{Key: "A", Desc: "Filter by assignee (picker)"},
+					{Key: "I", Desc: "Filter by issue type (picker)"},
 				}},
+				Spacer{Lines: 1},
+				Tip{Text: "Assignee/type filters combine with o/c/r instead of replacing them"},
 				Spacer{Lines: 1},
 				Section{Title: "Searching"},
 				KeyTable{Bindings: []KeyHint{

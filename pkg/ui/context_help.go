@@ -102,6 +102,8 @@ const contextHelpList = `## List View
   o         Open issues only
   c         Closed issues only
   r         Ready (no blockers)
+  A         Filter by assignee
+  I         Filter by issue type
   /         Fuzzy search
   Ctrl+S    Semantic search (AI)
   H         Hybrid ranking
@@ -267,7 +269,11 @@ const contextHelpFilter = `## Filter Mode
   Esc       Clear search
 
 **Label Filters**
-  l         Open label picker`
+  l         Open label picker
+
+**Assignee/Type Filters**
+  A         Filter by assignee (combines with status)
+  I         Filter by issue type (combines with status)`
 
 const contextHelpLabelPicker = `## Label Picker
 

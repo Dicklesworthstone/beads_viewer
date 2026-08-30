@@ -64,12 +64,14 @@ const (
 	focusHistory
 	focusAttention
 	focusLabelPicker
-	focusSprint      // Sprint dashboard view (bv-161)
-	focusAgentPrompt // AGENTS.md integration prompt (bv-i8dk)
-	focusFlowMatrix  // Cross-label flow matrix view
-	focusTutorial    // Interactive tutorial (bv-8y31)
-	focusCassModal   // Cass session preview modal (bv-5bqh)
-	focusUpdateModal // Self-update modal (bv-182)
+	focusSprint         // Sprint dashboard view (bv-161)
+	focusAgentPrompt    // AGENTS.md integration prompt (bv-i8dk)
+	focusFlowMatrix     // Cross-label flow matrix view
+	focusTutorial       // Interactive tutorial (bv-8y31)
+	focusCassModal      // Cass session preview modal (bv-5bqh)
+	focusUpdateModal    // Self-update modal (bv-182)
+	focusAssigneePicker // Assignee filter picker
+	focusTypePicker     // Issue type filter picker
 )
 
 // embeddedTextInputTarget identifies one of the text inputs owned by Model.
@@ -82,6 +84,8 @@ const (
 	embeddedTextInputTimeTravel
 	embeddedTextInputLabelPicker
 	embeddedTextInputHistorySearch
+	embeddedTextInputAssigneePicker
+	embeddedTextInputTypePicker
 )
 
 // embeddedTextInputSession identifies one specific activation of an embedded
@@ -680,7 +684,12 @@ type Model struct {
 	historyLoadCommand           historyLoadCommandFactory
 
 	// Filter and sort state
-	currentFilter            string
+	currentFilter string
+	// assigneeFilter and typeFilter compose with currentFilter (status/label/
+	// recipe) instead of replacing it, so e.g. "open" + assignee "alice" shows
+	// only alice's open issues. Empty string means no constraint.
+	assigneeFilter           string
+	typeFilter               string
 	sortMode                 SortMode // bv-3ita: current sort mode
 	semanticSearchEnabled    bool
 	semanticIndexBuilding    bool
@@ -730,6 +739,16 @@ type Model struct {
 	// Label picker (bv-126)
 	showLabelPicker bool
 	labelPicker     LabelPickerModel
+
+	// Assignee picker (filter by assignee) - reuses LabelPickerModel's generic
+	// fuzzy-search overlay
+	showAssigneePicker bool
+	assigneePicker     LabelPickerModel
+
+	// Type picker (filter by issue type) - reuses LabelPickerModel's generic
+	// fuzzy-search overlay
+	showTypePicker bool
+	typePicker     LabelPickerModel
 
 	// Repo picker (workspace mode)
 	showRepoPicker bool
@@ -877,6 +896,40 @@ func extractLabelCounts(stats map[string]*analysis.LabelStats) map[string]int {
 		}
 	}
 	return counts
+}
+
+// extractAssigneeCounts returns the distinct assignees present in issues and
+// the number of issues assigned to each.
+func extractAssigneeCounts(issues []model.Issue) ([]string, map[string]int) {
+	counts := make(map[string]int)
+	for _, issue := range issues {
+		if issue.Assignee != "" {
+			counts[issue.Assignee]++
+		}
+	}
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	return names, counts
+}
+
+// extractIssueTypeCounts returns the distinct issue types present in issues
+// and the number of issues of each type. Issue types are open-ended (custom
+// types beyond bug/feature/task/epic/chore are supported), so this derives
+// the set from the data rather than the known-type constants.
+func extractIssueTypeCounts(issues []model.Issue) ([]string, map[string]int) {
+	counts := make(map[string]int)
+	for _, issue := range issues {
+		if issue.IssueType != "" {
+			counts[string(issue.IssueType)]++
+		}
+	}
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	return names, counts
 }
 
 // WorkspaceInfo contains workspace loading metadata for TUI display
@@ -1650,6 +1703,14 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	labelCounts := extractLabelCounts(labelExtraction.Stats)
 	labelPicker := NewLabelPickerModel(labelExtraction.Labels, labelCounts, theme)
 
+	// Initialize assignee picker (filter by assignee)
+	assigneeNames, assigneeCounts := extractAssigneeCounts(issues)
+	assigneePicker := NewPickerModel(assigneeNames, assigneeCounts, theme, "Filter by Assignee")
+
+	// Initialize issue type picker (filter by type)
+	typeNames, typeCounts := extractIssueTypeCounts(issues)
+	typePicker := NewPickerModel(typeNames, typeCounts, theme, "Filter by Type")
+
 	// Initialize time-travel input
 	ti := textinput.New()
 	ti.Placeholder = "HEAD~5, main, v1.0.0, 2024-01-01..."
@@ -1811,6 +1872,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		recipePicker:        recipePicker,
 		activeRecipe:        activeRecipe,
 		labelPicker:         labelPicker,
+		assigneePicker:      assigneePicker,
+		typePicker:          typePicker,
 		labelDrilldownCache: make(map[string][]model.Issue),
 		timeTravelInput:     ti,
 		statusMsg:           initialStatus,
@@ -1975,6 +2038,10 @@ func (m *Model) embeddedTextInputSessionIsActive(session embeddedTextInputSessio
 		return m.focused == focusTimeTravelInput && m.showTimeTravelPrompt && m.timeTravelInput.Focused()
 	case embeddedTextInputLabelPicker:
 		return m.focused == focusLabelPicker && m.showLabelPicker && m.labelPicker.input.Focused()
+	case embeddedTextInputAssigneePicker:
+		return m.focused == focusAssigneePicker && m.showAssigneePicker && m.assigneePicker.input.Focused()
+	case embeddedTextInputTypePicker:
+		return m.focused == focusTypePicker && m.showTypePicker && m.typePicker.input.Focused()
 	case embeddedTextInputHistorySearch:
 		return m.focused == focusHistory && m.isHistoryView &&
 			m.historyView.IsSearchActive() && m.historyView.searchInput.Focused()
@@ -2006,6 +2073,10 @@ func (m *Model) updateEmbeddedTextInput(msg embeddedTextInputMsg) tea.Cmd {
 		m.timeTravelInput, cmd = m.timeTravelInput.Update(msg.msg)
 	case embeddedTextInputLabelPicker:
 		cmd = m.labelPicker.UpdateInput(msg.msg)
+	case embeddedTextInputAssigneePicker:
+		cmd = m.assigneePicker.UpdateInput(msg.msg)
+	case embeddedTextInputTypePicker:
+		cmd = m.typePicker.UpdateInput(msg.msg)
 	case embeddedTextInputHistorySearch:
 		cmd = m.updateHistorySearchInput(msg.msg)
 	default:
@@ -2843,6 +2914,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		} else {
 			fastDefaultView := (m.currentFilter == "" || m.currentFilter == "all") &&
+				m.assigneeFilter == "" && m.typeFilter == "" &&
 				m.sortMode == SortDefault &&
 				(!m.workspaceMode || m.activeRepos == nil) &&
 				len(msg.Snapshot.listModelItems) == len(msg.Snapshot.ListItems) &&
@@ -2863,7 +2935,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				filteredItems = make([]list.Item, 0, len(msg.Snapshot.ListItems))
 				filteredIssues = make([]model.Issue, 0, len(msg.Snapshot.ListItems))
-				filterNow := time.Now()
 
 				for _, item := range msg.Snapshot.ListItems {
 					issue := item.Issue
@@ -2876,26 +2947,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 
-					include := false
-					switch m.currentFilter {
-					case "all":
-						include = true
-					case "open":
-						include = !isClosedLikeStatus(issue.Status)
-					case "closed":
-						include = isClosedLikeStatus(issue.Status)
-					case "ready":
-						include = isIssueReadyAt(issue, m.issueMap, filterNow)
-					default:
-						if strings.HasPrefix(m.currentFilter, "label:") {
-							label := strings.TrimPrefix(m.currentFilter, "label:")
-							for _, l := range issue.Labels {
-								if l == label {
-									include = true
-									break
-								}
-							}
-						}
+					include := m.matchesStatusOrLabelFilter(issue)
+					if include && m.assigneeFilter != "" && issue.Assignee != m.assigneeFilter {
+						include = false
+					}
+					if include && m.typeFilter != "" && string(issue.IssueType) != m.typeFilter {
+						include = false
 					}
 
 					if include {
@@ -4044,6 +4101,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m, inputCmd = m.handleLabelPickerKeys(msg)
 			return m, tea.Batch(inputCmd, m.pendingSemanticFilterCmd())
 		}
+		// Assignee and type pickers have the same always-focused text input as
+		// the label picker above, and need the same early interception.
+		if m.focused == focusAssigneePicker && m.showAssigneePicker {
+			if msg.String() == "ctrl+c" {
+				return m, m.quitCommand()
+			}
+			var inputCmd tea.Cmd
+			m, inputCmd = m.handleAssigneePickerKeys(msg)
+			return m, tea.Batch(inputCmd, m.pendingSemanticFilterCmd())
+		}
+		if m.focused == focusTypePicker && m.showTypePicker {
+			if msg.String() == "ctrl+c" {
+				return m, m.quitCommand()
+			}
+			var inputCmd tea.Cmd
+			m, inputCmd = m.handleTypePickerKeys(msg)
+			return m, tea.Batch(inputCmd, m.pendingSemanticFilterCmd())
+		}
 
 		// Handle keys when not filtering
 		if m.list.FilterState() != list.Filtering {
@@ -4684,6 +4759,40 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				focusCmd := m.beginEmbeddedTextInputSession(
 					embeddedTextInputLabelPicker,
 					m.labelPicker.Focus(),
+				)
+				return m, tea.Batch(focusCmd, m.pendingSemanticFilterCmd())
+
+			case "A":
+				// Open assignee picker for quick filter
+				if len(m.issues) == 0 {
+					return m, nil
+				}
+				assigneeNames, assigneeCounts := extractAssigneeCounts(m.issues)
+				m.assigneePicker.SetLabels(assigneeNames, assigneeCounts)
+				m.assigneePicker.Reset()
+				m.assigneePicker.SetSize(m.width, m.height-1)
+				m.showAssigneePicker = true
+				m.focused = focusAssigneePicker
+				focusCmd := m.beginEmbeddedTextInputSession(
+					embeddedTextInputAssigneePicker,
+					m.assigneePicker.Focus(),
+				)
+				return m, tea.Batch(focusCmd, m.pendingSemanticFilterCmd())
+
+			case "I":
+				// Open issue type picker for quick filter
+				if len(m.issues) == 0 {
+					return m, nil
+				}
+				typeNames, typeCounts := extractIssueTypeCounts(m.issues)
+				m.typePicker.SetLabels(typeNames, typeCounts)
+				m.typePicker.Reset()
+				m.typePicker.SetSize(m.width, m.height-1)
+				m.showTypePicker = true
+				m.focused = focusTypePicker
+				focusCmd := m.beginEmbeddedTextInputSession(
+					embeddedTextInputTypePicker,
+					m.typePicker.Focus(),
 				)
 				return m, tea.Batch(focusCmd, m.pendingSemanticFilterCmd())
 
@@ -5677,6 +5786,70 @@ func (m *Model) handleLabelPickerKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 	return m, inputCmd
 }
 
+// handleAssigneePickerKeys handles keyboard input when the assignee picker is focused
+func (m *Model) handleAssigneePickerKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
+	var inputCmd tea.Cmd
+	switch msg.String() {
+	case "esc":
+		m.showAssigneePicker = false
+		m.assigneePicker.Blur()
+		m.endEmbeddedTextInputSession(embeddedTextInputAssigneePicker)
+		m.focused = focusList
+	case "j", "down", "ctrl+n":
+		m.assigneePicker.MoveDown()
+	case "k", "up", "ctrl+p":
+		m.assigneePicker.MoveUp()
+	case "enter":
+		if selected := m.assigneePicker.SelectedLabel(); selected != "" {
+			m.assigneeFilter = selected
+			m.applyFilter()
+			m.statusMsg = fmt.Sprintf("Filtered by assignee: %s", selected)
+			m.statusIsError = false
+		}
+		m.showAssigneePicker = false
+		m.assigneePicker.Blur()
+		m.endEmbeddedTextInputSession(embeddedTextInputAssigneePicker)
+		m.focused = focusList
+	default:
+		// Pass other keys to text input for fuzzy search
+		inputCmd = m.assigneePicker.UpdateInput(msg)
+		inputCmd = m.scopeEmbeddedTextInputCmd(embeddedTextInputAssigneePicker, inputCmd)
+	}
+	return m, inputCmd
+}
+
+// handleTypePickerKeys handles keyboard input when the issue type picker is focused
+func (m *Model) handleTypePickerKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
+	var inputCmd tea.Cmd
+	switch msg.String() {
+	case "esc":
+		m.showTypePicker = false
+		m.typePicker.Blur()
+		m.endEmbeddedTextInputSession(embeddedTextInputTypePicker)
+		m.focused = focusList
+	case "j", "down", "ctrl+n":
+		m.typePicker.MoveDown()
+	case "k", "up", "ctrl+p":
+		m.typePicker.MoveUp()
+	case "enter":
+		if selected := m.typePicker.SelectedLabel(); selected != "" {
+			m.typeFilter = selected
+			m.applyFilter()
+			m.statusMsg = fmt.Sprintf("Filtered by type: %s", selected)
+			m.statusIsError = false
+		}
+		m.showTypePicker = false
+		m.typePicker.Blur()
+		m.endEmbeddedTextInputSession(embeddedTextInputTypePicker)
+		m.focused = focusList
+	default:
+		// Pass other keys to text input for fuzzy search
+		inputCmd = m.typePicker.UpdateInput(msg)
+		inputCmd = m.scopeEmbeddedTextInputCmd(embeddedTextInputTypePicker, inputCmd)
+	}
+	return m, inputCmd
+}
+
 // handleInsightsKeys handles keyboard input when insights panel is focused
 func (m *Model) handleInsightsKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
@@ -5976,6 +6149,10 @@ func (m *Model) View() string {
 		body = m.repoPicker.View()
 	} else if m.showLabelPicker {
 		body = m.labelPicker.View()
+	} else if m.showAssigneePicker {
+		body = m.assigneePicker.View()
+	} else if m.showTypePicker {
+		body = m.typePicker.View()
 	} else if m.showHelp {
 		body = m.renderHelpOverlay()
 	} else if m.showTutorial {
@@ -7028,6 +7205,20 @@ func (m *Model) renderFooter() string {
 				filterIcon = "🔍"
 			}
 		}
+
+		// Assignee/type filters compose with the status/label/recipe filter
+		// above rather than replacing it, so append them to the badge text.
+		var extras []string
+		if m.assigneeFilter != "" {
+			extras = append(extras, "@"+m.assigneeFilter)
+		}
+		if m.typeFilter != "" {
+			extras = append(extras, strings.ToUpper(m.typeFilter))
+		}
+		if len(extras) > 0 {
+			filterTxt = filterTxt + " · " + strings.Join(extras, " · ")
+			filterIcon = "🔍"
+		}
 	}
 
 	filterBadge := lipgloss.NewStyle().
@@ -7090,10 +7281,17 @@ func (m *Model) renderFooter() string {
 		} else {
 			// Normal board mode - show navigation hints with filter indicator (bv-naov)
 			filterInfo := ""
-			if m.currentFilter != "all" && m.currentFilter != "" {
+			if (m.currentFilter != "all" && m.currentFilter != "") || m.assigneeFilter != "" || m.typeFilter != "" {
 				shown := m.board.TotalCount()
 				total := len(m.issues)
-				filterInfo = fmt.Sprintf("[%s:%d/%d] ", m.currentFilter, shown, total)
+				label := m.currentFilter
+				if m.assigneeFilter != "" {
+					label += "+@" + m.assigneeFilter
+				}
+				if m.typeFilter != "" {
+					label += "+" + m.typeFilter
+				}
+				filterInfo = fmt.Sprintf("[%s:%d/%d] ", label, shown, total)
 			}
 			labelHint = lipgloss.NewStyle().
 				Foreground(ColorFooterHint).
@@ -7444,7 +7642,7 @@ func (m *Model) renderFooter() string {
 		keyHints = append(keyHints, keyStyle.Render("j/k")+" nav", keyStyle.Render("⏎")+" apply", keyStyle.Render("esc")+" cancel")
 	} else if m.showRepoPicker {
 		keyHints = append(keyHints, keyStyle.Render("j/k")+" nav", keyStyle.Render("space")+" toggle", keyStyle.Render("⏎")+" apply", keyStyle.Render("esc")+" cancel")
-	} else if m.showLabelPicker {
+	} else if m.showLabelPicker || m.showAssigneePicker || m.showTypePicker {
 		keyHints = append(keyHints, "type to filter", keyStyle.Render("j/k")+" nav", keyStyle.Render("⏎")+" apply", keyStyle.Render("esc")+" cancel")
 	} else if m.focused == focusInsights {
 		keyHints = append(keyHints, keyStyle.Render("h/l")+" panels", keyStyle.Render("e")+" explain", keyStyle.Render("⏎")+" jump", keyStyle.Render("?")+" help")
@@ -7632,6 +7830,10 @@ func (m *Model) hasActiveFilters() bool {
 	if m.currentFilter != "all" {
 		return true
 	}
+	// Check assignee/type filters (compose with the filter above)
+	if m.assigneeFilter != "" || m.typeFilter != "" {
+		return true
+	}
 	// Check if fuzzy search filter is active
 	if m.list.FilterState() == list.Filtering || m.list.FilterState() == list.FilterApplied {
 		return true
@@ -7642,6 +7844,8 @@ func (m *Model) hasActiveFilters() bool {
 // clearAllFilters resets all filters to their default state
 func (m *Model) clearAllFilters() {
 	m.currentFilter = "all"
+	m.assigneeFilter = ""
+	m.typeFilter = ""
 	m.setActiveRecipe(nil) // Clear any active recipe filter
 	// Reset the fuzzy search filter by resetting the filter state
 	m.list.ResetFilter()
@@ -7664,6 +7868,28 @@ func (m *Model) matchesCurrentFilter(issue model.Issue) bool {
 		}
 	}
 
+	if !m.matchesStatusOrLabelFilter(issue) {
+		return false
+	}
+
+	// Assignee/type compose with the status/label filter above (AND) rather
+	// than replacing it, so e.g. "open" + assignee "alice" narrows to alice's
+	// open issues instead of one filter clobbering the other.
+	if m.assigneeFilter != "" && issue.Assignee != m.assigneeFilter {
+		return false
+	}
+	if m.typeFilter != "" && string(issue.IssueType) != m.typeFilter {
+		return false
+	}
+	return true
+}
+
+// matchesStatusOrLabelFilter evaluates just the currentFilter axis (status:
+// all/open/closed/ready, or label:X/recipe:X). Split out so the background
+// snapshot fast-path in Update() can reuse the exact same status/label logic
+// alongside its own workspace-repo handling (see the Phase2/snapshot refresh
+// branch), without duplicating this switch a second time.
+func (m *Model) matchesStatusOrLabelFilter(issue model.Issue) bool {
 	switch m.currentFilter {
 	case "all":
 		return true
@@ -8374,6 +8600,7 @@ func (m *Model) handleLeftClick(x, y int) *Model {
 		m.showUpdateModal || m.showLabelHealthDetail || m.showLabelGraphAnalysis ||
 		m.showLabelDrilldown || m.showAlertsPanel || m.showTimeTravelPrompt ||
 		m.showRecipePicker || m.showRepoPicker || m.showLabelPicker ||
+		m.showAssigneePicker || m.showTypePicker ||
 		m.showHelp || m.showTutorial {
 		return m
 	}
@@ -8724,6 +8951,22 @@ func (m *Model) SetFilter(f string) {
 	m.applyFilter()
 }
 
+// SetAssigneeFilter sets the assignee filter, which composes with (rather
+// than replaces) the status/label filter set via SetFilter. Pass "" to clear
+// it. (exposed for testing)
+func (m *Model) SetAssigneeFilter(assignee string) {
+	m.assigneeFilter = assignee
+	m.applyFilter()
+}
+
+// SetTypeFilter sets the issue type filter, which composes with (rather than
+// replaces) the status/label filter set via SetFilter. Pass "" to clear it.
+// (exposed for testing)
+func (m *Model) SetTypeFilter(issueType string) {
+	m.typeFilter = issueType
+	m.applyFilter()
+}
+
 // FilteredIssues returns the currently visible issues (exposed for testing)
 func (m Model) FilteredIssues() []model.Issue {
 	items := m.list.Items()
@@ -8935,6 +9178,10 @@ func (f focus) String() string {
 		return "attention"
 	case focusLabelPicker:
 		return "label_picker"
+	case focusAssigneePicker:
+		return "assignee_picker"
+	case focusTypePicker:
+		return "type_picker"
 	case focusSprint:
 		return "sprint"
 	case focusAgentPrompt:

@@ -94,6 +94,120 @@ func TestModelFiltering(t *testing.T) {
 	}
 }
 
+func TestModelFilteringByAssigneeAndType(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "1", Title: "Bug for alice", Status: model.StatusOpen, IssueType: model.TypeBug, Assignee: "alice"},
+		{ID: "2", Title: "Feature for bob", Status: model.StatusOpen, IssueType: model.TypeFeature, Assignee: "bob"},
+		{ID: "3", Title: "Another bug for alice", Status: model.StatusClosed, IssueType: model.TypeBug, Assignee: "alice"},
+		{ID: "4", Title: "Unassigned task", Status: model.StatusOpen, IssueType: model.TypeTask, Assignee: ""},
+	}
+
+	m := ui.NewModel(issues, nil, "")
+
+	m.SetAssigneeFilter("alice")
+	aliceIssues := m.FilteredIssues()
+	if len(aliceIssues) != 2 {
+		t.Fatalf("Expected 2 issues for assignee 'alice', got %d", len(aliceIssues))
+	}
+	for _, issue := range aliceIssues {
+		if issue.Assignee != "alice" {
+			t.Errorf("Expected only alice's issues, got assignee %q", issue.Assignee)
+		}
+	}
+
+	m.SetAssigneeFilter("bob")
+	bobIssues := m.FilteredIssues()
+	if len(bobIssues) != 1 || bobIssues[0].ID != "2" {
+		t.Errorf("Expected 1 issue (ID 2) for assignee 'bob', got %#v", bobIssues)
+	}
+
+	m.SetAssigneeFilter("nobody")
+	if len(m.FilteredIssues()) != 0 {
+		t.Errorf("Expected 0 issues for unknown assignee, got %d", len(m.FilteredIssues()))
+	}
+	m.SetAssigneeFilter("") // clear before moving on to type-only checks
+
+	m.SetTypeFilter("bug")
+	bugIssues := m.FilteredIssues()
+	if len(bugIssues) != 2 {
+		t.Fatalf("Expected 2 issues for type 'bug', got %d", len(bugIssues))
+	}
+	for _, issue := range bugIssues {
+		if issue.IssueType != model.TypeBug {
+			t.Errorf("Expected only bug issues, got type %q", issue.IssueType)
+		}
+	}
+
+	m.SetTypeFilter("task")
+	taskIssues := m.FilteredIssues()
+	if len(taskIssues) != 1 || taskIssues[0].ID != "4" {
+		t.Errorf("Expected 1 issue (ID 4) for type 'task', got %#v", taskIssues)
+	}
+	m.SetTypeFilter("")
+
+	m.SetFilter("all")
+	if len(m.FilteredIssues()) != 4 {
+		t.Errorf("Expected 4 issues for 'all' after clearing filter, got %d", len(m.FilteredIssues()))
+	}
+}
+
+// TestModelFilteringComposesStatusWithAssigneeAndType guards against the
+// regression where selecting an assignee or type filter would silently
+// clobber an active open/closed/ready status filter instead of narrowing it
+// further (they should AND together, not replace one another).
+func TestModelFilteringComposesStatusWithAssigneeAndType(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "1", Title: "Open bug for alice", Status: model.StatusOpen, IssueType: model.TypeBug, Assignee: "alice"},
+		{ID: "2", Title: "Closed bug for alice", Status: model.StatusClosed, IssueType: model.TypeBug, Assignee: "alice"},
+		{ID: "3", Title: "Open feature for alice", Status: model.StatusOpen, IssueType: model.TypeFeature, Assignee: "alice"},
+		{ID: "4", Title: "Open bug for bob", Status: model.StatusOpen, IssueType: model.TypeBug, Assignee: "bob"},
+	}
+
+	m := ui.NewModel(issues, nil, "")
+
+	// Status filter alone: 3 open issues (1, 3, 4).
+	m.SetFilter("open")
+	if got := len(m.FilteredIssues()); got != 3 {
+		t.Fatalf("Expected 3 open issues, got %d", got)
+	}
+
+	// Adding an assignee filter on top of "open" should narrow, not replace:
+	// only alice's open issues (1, 3).
+	m.SetAssigneeFilter("alice")
+	openAlice := m.FilteredIssues()
+	if len(openAlice) != 2 {
+		t.Fatalf("Expected 2 issues for open+assignee:alice, got %d: %#v", len(openAlice), openAlice)
+	}
+	for _, issue := range openAlice {
+		if issue.Assignee != "alice" || issue.Status != model.StatusOpen {
+			t.Errorf("Expected only alice's open issues, got %+v", issue)
+		}
+	}
+
+	// Further narrowing by type on top of open+assignee: only issue 1.
+	m.SetTypeFilter("bug")
+	openAliceBug := m.FilteredIssues()
+	if len(openAliceBug) != 1 || openAliceBug[0].ID != "1" {
+		t.Fatalf("Expected 1 issue (ID 1) for open+assignee:alice+type:bug, got %#v", openAliceBug)
+	}
+
+	// Switching the status filter to "closed" while assignee/type filters
+	// stay active should now show alice's closed bug (ID 2) instead.
+	m.SetFilter("closed")
+	closedAliceBug := m.FilteredIssues()
+	if len(closedAliceBug) != 1 || closedAliceBug[0].ID != "2" {
+		t.Fatalf("Expected 1 issue (ID 2) for closed+assignee:alice+type:bug, got %#v", closedAliceBug)
+	}
+
+	// Clearing all filters restores every issue.
+	m.SetFilter("all")
+	m.SetAssigneeFilter("")
+	m.SetTypeFilter("")
+	if got := len(m.FilteredIssues()); got != 4 {
+		t.Fatalf("Expected 4 issues after clearing all filters, got %d", got)
+	}
+}
+
 func TestFormatTimeRel(t *testing.T) {
 	now := time.Now()
 	tests := []struct {

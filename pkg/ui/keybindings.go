@@ -313,6 +313,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"c", "Closed issues only", "Filters", "list"},
 		{"r", "Ready (unblocked)", "Filters", "list"},
 		{"l", "Label picker", "Filters", "list"},
+		{"A", "Assignee picker", "Filters", "list"},
+		{"I", "Issue type picker", "Filters", "list"},
 		{"/", "Search/filter", "Filters", "list"},
 
 		// Actions

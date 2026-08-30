@@ -1692,3 +1692,48 @@ func TestEditorExitMsgWithError(t *testing.T) {
 		t.Fatalf("expected editor error message, got %q", resultModel.statusMsg)
 	}
 }
+
+func TestExtractAssigneeCounts(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "1", Assignee: "alice"},
+		{ID: "2", Assignee: "bob"},
+		{ID: "3", Assignee: "alice"},
+		{ID: "4", Assignee: ""},
+	}
+
+	names, counts := extractAssigneeCounts(issues)
+
+	if len(names) != 2 {
+		t.Fatalf("expected 2 distinct assignees, got %d (%v)", len(names), names)
+	}
+	if counts["alice"] != 2 {
+		t.Errorf("expected alice count 2, got %d", counts["alice"])
+	}
+	if counts["bob"] != 1 {
+		t.Errorf("expected bob count 1, got %d", counts["bob"])
+	}
+	if _, ok := counts[""]; ok {
+		t.Error("expected unassigned issues to be excluded from counts")
+	}
+}
+
+func TestExtractIssueTypeCounts(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "1", IssueType: model.TypeBug},
+		{ID: "2", IssueType: model.TypeFeature},
+		{ID: "3", IssueType: model.TypeBug},
+		{ID: "4", IssueType: "molecule"}, // custom Gastown-style type
+	}
+
+	names, counts := extractIssueTypeCounts(issues)
+
+	if len(names) != 3 {
+		t.Fatalf("expected 3 distinct types, got %d (%v)", len(names), names)
+	}
+	if counts["bug"] != 2 {
+		t.Errorf("expected bug count 2, got %d", counts["bug"])
+	}
+	if counts["molecule"] != 1 {
+		t.Errorf("expected custom type 'molecule' to be counted, got %d", counts["molecule"])
+	}
+}

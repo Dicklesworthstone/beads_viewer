@@ -704,6 +704,170 @@ func TestKeyDispatch_Regression_LabelPickerConsumesQKey(t *testing.T) {
 	}
 }
 
+// testIssuesForAssigneeAndTypeDispatch mirrors testIssuesForKeyDispatch but
+// populates Assignee/IssueType so the pickers have real entries to select.
+func testIssuesForAssigneeAndTypeDispatch() []model.Issue {
+	return []model.Issue{
+		{ID: "kd-1", Title: "Test Issue 1", Status: model.StatusOpen, IssueType: model.TypeBug, Assignee: "alice"},
+		{ID: "kd-2", Title: "Test Issue 2", Status: model.StatusOpen, IssueType: model.TypeFeature, Assignee: "bob"},
+		{ID: "kd-3", Title: "Test Issue 3", Status: model.StatusClosed, IssueType: model.TypeBug, Assignee: "alice"},
+	}
+}
+
+// TestKeyDispatch_Regression_AssigneePickerConsumesQKey guards against the
+// same issue #176 class of bug as the label picker (see
+// TestKeyDispatch_Regression_LabelPickerConsumesQKey): the assignee picker
+// reuses the same always-focused text input, so a lowercase q must be typed
+// into the filter rather than triggering the global quit/back shortcut.
+func TestKeyDispatch_Regression_AssigneePickerConsumesQKey(t *testing.T) {
+	m := NewModel(testIssuesForAssigneeAndTypeDispatch(), nil, "")
+
+	updated, _ := m.Update(keyMsg("A"))
+	m = updated.(*Model)
+	if m.focused != focusAssigneePicker || !m.showAssigneePicker {
+		t.Fatalf("expected assignee picker after 'A', got focused=%v showAssigneePicker=%v", m.focused, m.showAssigneePicker)
+	}
+
+	updated, _ = m.Update(keyMsg("q"))
+	m = updated.(*Model)
+	if !m.showAssigneePicker || m.focused != focusAssigneePicker {
+		t.Fatalf("expected assignee picker to stay open after typing 'q', got focused=%v showAssigneePicker=%v", m.focused, m.showAssigneePicker)
+	}
+	if got := m.assigneePicker.InputValue(); got != "q" {
+		t.Fatalf("expected assignee filter input %q after typing 'q', got %q", "q", got)
+	}
+
+	updated, _ = m.Update(keyMsg("esc"))
+	m = updated.(*Model)
+	if m.showAssigneePicker || m.focused != focusList {
+		t.Fatalf("expected esc to cancel assignee picker, got focused=%v showAssigneePicker=%v", m.focused, m.showAssigneePicker)
+	}
+}
+
+// TestKeyDispatch_AssigneePickerEnterAppliesFilter verifies selecting an
+// assignee and pressing enter narrows the list to that assignee's issues.
+func TestKeyDispatch_AssigneePickerEnterAppliesFilter(t *testing.T) {
+	m := NewModel(testIssuesForAssigneeAndTypeDispatch(), nil, "")
+
+	updated, _ := m.Update(keyMsg("A"))
+	m = updated.(*Model)
+
+	for _, r := range "alice" {
+		updated, _ = m.Update(keyMsg(string(r)))
+		m = updated.(*Model)
+	}
+
+	updated, _ = m.Update(keyMsg("enter"))
+	m = updated.(*Model)
+
+	if m.showAssigneePicker || m.focused != focusList {
+		t.Fatalf("expected enter to close assignee picker and return to list, got focused=%v showAssigneePicker=%v", m.focused, m.showAssigneePicker)
+	}
+	if m.assigneeFilter != "alice" {
+		t.Fatalf("expected assigneeFilter %q, got %q", "alice", m.assigneeFilter)
+	}
+	for _, issue := range m.FilteredIssues() {
+		if issue.Assignee != "alice" {
+			t.Errorf("expected only alice's issues after filter, got assignee %q", issue.Assignee)
+		}
+	}
+}
+
+// TestKeyDispatch_Regression_TypePickerConsumesQKey mirrors the label/assignee
+// picker q-key regression above for the issue type picker.
+func TestKeyDispatch_Regression_TypePickerConsumesQKey(t *testing.T) {
+	m := NewModel(testIssuesForAssigneeAndTypeDispatch(), nil, "")
+
+	updated, _ := m.Update(keyMsg("I"))
+	m = updated.(*Model)
+	if m.focused != focusTypePicker || !m.showTypePicker {
+		t.Fatalf("expected type picker after 'I', got focused=%v showTypePicker=%v", m.focused, m.showTypePicker)
+	}
+
+	updated, _ = m.Update(keyMsg("q"))
+	m = updated.(*Model)
+	if !m.showTypePicker || m.focused != focusTypePicker {
+		t.Fatalf("expected type picker to stay open after typing 'q', got focused=%v showTypePicker=%v", m.focused, m.showTypePicker)
+	}
+	if got := m.typePicker.InputValue(); got != "q" {
+		t.Fatalf("expected type filter input %q after typing 'q', got %q", "q", got)
+	}
+
+	updated, _ = m.Update(keyMsg("esc"))
+	m = updated.(*Model)
+	if m.showTypePicker || m.focused != focusList {
+		t.Fatalf("expected esc to cancel type picker, got focused=%v showTypePicker=%v", m.focused, m.showTypePicker)
+	}
+}
+
+// TestKeyDispatch_TypePickerEnterAppliesFilter verifies selecting a type and
+// pressing enter narrows the list to that issue type.
+func TestKeyDispatch_TypePickerEnterAppliesFilter(t *testing.T) {
+	m := NewModel(testIssuesForAssigneeAndTypeDispatch(), nil, "")
+
+	updated, _ := m.Update(keyMsg("I"))
+	m = updated.(*Model)
+
+	for _, r := range "bug" {
+		updated, _ = m.Update(keyMsg(string(r)))
+		m = updated.(*Model)
+	}
+
+	updated, _ = m.Update(keyMsg("enter"))
+	m = updated.(*Model)
+
+	if m.showTypePicker || m.focused != focusList {
+		t.Fatalf("expected enter to close type picker and return to list, got focused=%v showTypePicker=%v", m.focused, m.showTypePicker)
+	}
+	if m.typeFilter != "bug" {
+		t.Fatalf("expected typeFilter %q, got %q", "bug", m.typeFilter)
+	}
+	for _, issue := range m.FilteredIssues() {
+		if issue.IssueType != model.TypeBug {
+			t.Errorf("expected only bug issues after filter, got type %q", issue.IssueType)
+		}
+	}
+}
+
+// TestKeyDispatch_Regression_AssigneeFilterComposesWithOpenClose guards
+// against the regression where opening the assignee/type picker and
+// selecting a value would silently discard an active "open"/"closed" status
+// filter instead of narrowing it further.
+func TestKeyDispatch_Regression_AssigneeFilterComposesWithOpenClose(t *testing.T) {
+	m := NewModel(testIssuesForAssigneeAndTypeDispatch(), nil, "")
+
+	// Apply the "open" status filter first (kd-3 is closed, so this should
+	// narrow to kd-1 and kd-2, both assigned to alice/bob respectively).
+	updated, _ := m.Update(keyMsg("o"))
+	m = updated.(*Model)
+	if m.currentFilter != "open" {
+		t.Fatalf("expected currentFilter %q after 'o', got %q", "open", m.currentFilter)
+	}
+
+	// Now layer an assignee filter on top via the picker.
+	updated, _ = m.Update(keyMsg("A"))
+	m = updated.(*Model)
+	for _, r := range "alice" {
+		updated, _ = m.Update(keyMsg(string(r)))
+		m = updated.(*Model)
+	}
+	updated, _ = m.Update(keyMsg("enter"))
+	m = updated.(*Model)
+
+	// The status filter must still be "open" (not clobbered by the picker),
+	// and the visible issues must satisfy BOTH constraints.
+	if m.currentFilter != "open" {
+		t.Fatalf("expected currentFilter to remain %q after applying assignee filter, got %q", "open", m.currentFilter)
+	}
+	if m.assigneeFilter != "alice" {
+		t.Fatalf("expected assigneeFilter %q, got %q", "alice", m.assigneeFilter)
+	}
+	filtered := m.FilteredIssues()
+	if len(filtered) != 1 || filtered[0].ID != "kd-1" {
+		t.Fatalf("expected only kd-1 (open, assigned to alice), got %#v", filtered)
+	}
+}
+
 func TestKeyDispatch_Regression_HistorySearchEnterKeepsFilter(t *testing.T) {
 	m := setupTestModel(t)
 
