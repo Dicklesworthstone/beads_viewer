@@ -1,7 +1,6 @@
 package correlation
 
 import (
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -42,12 +41,12 @@ import (
 // (a pure read does not rewrite the file just to bump AccessedAt).
 
 const (
-	headArtifactCacheVersion      = 2
-	headArtifactCacheFileName     = "correlation_head_artifact_cache.json"
-	headArtifactCacheMaxEntries   = 6
-	headArtifactCacheMaxAge       = 24 * time.Hour
-	headArtifactCacheMaxEntrySize = 64 << 20 // 64MB serialized artifact ceiling
-	headArtifactCacheMaxFileSize int64 = headArtifactCacheMaxEntries*headArtifactCacheMaxEntrySize + (1 << 20)
+	headArtifactCacheVersion            = 2
+	headArtifactCacheFileName           = "correlation_head_artifact_cache.json"
+	headArtifactCacheMaxEntries         = 6
+	headArtifactCacheMaxAge             = 24 * time.Hour
+	headArtifactCacheMaxEntrySize       = 64 << 20 // 64MB serialized artifact ceiling
+	headArtifactCacheMaxFileSize  int64 = headArtifactCacheMaxEntries*headArtifactCacheMaxEntrySize + (1 << 20)
 )
 
 type headArtifactCacheFile struct {
