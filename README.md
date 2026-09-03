@@ -1073,19 +1073,21 @@ export:
 ### Built-in Recipes
 `bv` ships with 11 pre-configured recipes:
 
+<!-- bv:generated:recipes -->
 | Recipe | Purpose |
-|--------|---------|
-| `default` | All open issues sorted by priority |
-| `actionable` | Ready to work (no blockers) |
-| `recent` | Updated in last 7 days |
-| `blocked` | Waiting on dependencies |
-| `high-impact` | Top PageRank scores |
-| `stale` | Open but untouched for 30+ days |
-| `triage` | Sorted by computed triage score (impact + unblocking potential) |
+|:---|:---|
+| `default` | Default view showing all open issues sorted by priority |
+| `actionable` | Issues ready to work on (no open blockers) |
+| `recent` | Issues updated in the last 7 days |
+| `blocked` | Issues waiting on dependencies |
+| `high-impact` | Issues with highest blocking impact (PageRank) |
+| `stale` | Open issues not updated in 30+ days |
+| `triage` | Issues sorted by computed triage score (high impact + unblocking potential) |
 | `closed` | Recently closed issues |
-| `release-cut` | Closed in last 14 days (for changelog generation) |
-| `quick-wins` | Easy P2/P3 items with no blockers |
-| `bottlenecks` | High betweenness nodes (project bottlenecks) |
+| `release-cut` | Recently closed items for changelog generation |
+| `quick-wins` | Easy items with no blockers - good for quick progress |
+| `bottlenecks` | High betweenness nodes - potential project bottlenecks |
+<!-- /bv:generated -->
 
 ### Using Recipes
 ```bash
@@ -1455,13 +1457,15 @@ Press `s` to cycle through **five distinct sort modes**, giving you instant cont
 
 ### Sort Modes
 
+<!-- bv:generated:sort-modes -->
 | Mode | Key Display | Ordering Logic | Use Case |
-|------|-------------|----------------|----------|
+|:---|:---:|:---|:---|
 | **Default** | `Default` | Priority (asc) → Created (desc) | Standard priority-driven workflow |
 | **Created ↑** | `Created ↑` | Creation date ascending (oldest first) | Audit: find long-standing issues |
 | **Created ↓** | `Created ↓` | Creation date descending (newest first) | Review: see recently created work |
 | **Priority** | `Priority` | Priority only (P0 → P4) | Pure priority triage |
 | **Updated** | `Updated` | Last update descending (newest first) | Activity tracking: see active issues |
+<!-- /bv:generated -->
 
 ### Design Philosophy
 
@@ -2885,6 +2889,7 @@ The Alerts System surfaces potential problems before they become blockers. It co
 
 Alert types are the `AlertType` constants in `pkg/drift/drift.go` (`AllAlertTypes()` lists every one, and a test proves each has an emitter); thresholds are `DefaultConfig()` in `pkg/drift/config.go`, overridable per project in `.bv/drift.yaml` (keys below). Every alert carries a `suggested_action`, and issue-level alerts carry the issue's `labels` so `--alert-label` can filter on them.
 
+<!-- bv:generated:alerts -->
 **Proactive checks** (run on the current graph, no baseline needed):
 
 | Type | Trigger | Severity | `.bv/drift.yaml` keys (default) |
@@ -2892,7 +2897,7 @@ Alert types are the `AlertType` constants in `pkg/drift/drift.go` (`AllAlertType
 | `stale_issue` | No activity for `stale_warning_days` (warning) or `stale_critical_days` (critical); thresholds are multiplied by `in_progress_stale_multiplier` for `in_progress` issues; `label_overrides` can tighten or loosen per label | Warning / Critical | `stale_warning_days` (14), `stale_critical_days` (30), `in_progress_stale_multiplier` (0.5) |
 | `blocking_cascade` | Actionable issue unblocks N+ others | Info / Warning | `blocking_cascade_info_threshold` (3), `blocking_cascade_warning_threshold` (5) |
 | `high_impact_unblock` | Actionable issue unblocks N+ others of which at least one is P0/P1 (two or more urgent items escalate to warning) | Info / Warning | `high_impact_unblock_min` (3), `high_impact_priority_max` (1) |
-| `abandoned_claim` | `in_progress` issue with an assignee idle longer than `stale_warning_days` x `in_progress_stale_multiplier` x `abandoned_claim_multiplier` (14 days by default) | Warning | `abandoned_claim_multiplier` (2) |
+| `abandoned_claim` | An `in_progress` issue with an assignee idle longer than `stale_warning_days` x `in_progress_stale_multiplier` x `abandoned_claim_multiplier` (14 days by default) | Warning | `abandoned_claim_multiplier` (2) |
 | `potential_duplicate` | Two open issues whose title/description keyword Jaccard similarity reaches the threshold (same detector as `--robot-suggest`); closed issues are never paired | Info | `duplicate_jaccard_threshold` (0.7), `duplicate_max_alerts` (10) |
 | `priority_mismatch` | `--robot-priority` recommends a *higher* priority with confidence at or above the floor (downgrade suggestions stay in `--robot-priority`) | Warning | `priority_mismatch_min_confidence` (0.6) |
 | `velocity_drop` | Closes in the last window fell by the percentage or more versus the previous window, which must contain at least the baseline count of closes | Warning | `velocity_drop_pct` (50), `velocity_window_days` (7), `velocity_min_baseline` (5) |
@@ -2903,11 +2908,13 @@ Alert types are the `AlertType` constants in `pkg/drift/drift.go` (`AllAlertType
 |------|---------|----------|----------------------------------|
 | `new_cycle` | A cycle exists that the baseline did not have | Critical | (always on unless disabled) |
 | `density_growth` | Graph density up by the info or warning percentage | Info / Warning | `density_info_pct` (20), `density_warning_pct` (50) |
-| `node_count_change` / `edge_count_change` | Node or edge count changed by the percentage or more | Info | `node_growth_info_pct` (25), `edge_growth_info_pct` (25) |
+| `node_count_change` | Node count changed by the percentage or more | Info | `node_growth_info_pct` (25) |
+| `edge_count_change` | Edge count changed by the percentage or more | Info | `edge_growth_info_pct` (25) |
 | `scope_creep` | Open-issue count grew by the percentage or more since the baseline | Info | `scope_creep_pct` (20) |
 | `blocked_increase` | N or more additional blocked issues | Warning | `blocked_increase_threshold` (5) |
 | `actionable_change` | Actionable count down by the warning percentage, or changed by the info percentage | Info / Warning | `actionable_decrease_warning_pct` (30), `actionable_increase_info_pct` (20) |
 | `pagerank_change` | A top-metric issue's PageRank moved by the percentage or more | Warning | `pagerank_change_warning_pct` (50) |
+<!-- /bv:generated -->
 
 Any type can be switched off with `disabled_alerts: [type, ...]`. `priority_mismatch` and `potential_duplicate` re-run whole-graph analysis, so above `proactive_max_issues` (2000) they are skipped and listed in `skipped_checks` with the reason; set the key to 0 to remove the cap. `--robot-alerts` runs both groups (drift checks compare against the saved baseline when one exists, otherwise against the current graph and stay silent); `--check-drift` runs only the drift checks and exits 0 (no alerts or info only), 2 (warnings), or 1 (critical, or no baseline saved yet).
 
@@ -3030,6 +3037,156 @@ bv --robot-triage --no-cache                      # Bypass the disk cache for th
 bv --robot-triage --db /path/to/.beads            # Beads database file or .beads directory (overrides BEADS_DB and BEADS_DIR)
 bv --robot-triage --format toon --stats           # Show JSON vs TOON token estimates on stderr (env: TOON_STATS=1)
 ```
+
+### Command-Line Flags
+
+<!-- bv:generated:flags -->
+| Flag | Type | Default | Description | Group |
+| :--- | :--- | :--- | :--- | :--- |
+| `--agents-add` | bool | `false` | Add beads workflow instructions to AGENTS.md (creates file if needed) | Agent File Management |
+| `--agents-check` | bool | `false` | Check AGENTS.md blurb status (default if no --agents-* action) | Agent File Management |
+| `--agents-dry-run` | bool | `false` | Show what would happen without executing (use with --agents-*) | Agent File Management |
+| `--agents-force` | bool | `false` | Skip confirmation prompts (use with --agents-*) | Agent File Management |
+| `--agents-remove` | bool | `false` | Remove beads workflow instructions from AGENTS.md | Agent File Management |
+| `--agents-update` | bool | `false` | Update beads workflow instructions to latest version | Agent File Management |
+| `--agent-brief` | string | (empty) | Export agent brief bundle to directory (includes triage.json, insights.json, brief.md, helpers.md) | Export & Reporting |
+| `--debug-height` | int | `50` | Height for debug render | Export & Reporting |
+| `--debug-render` | string | (empty) | Render a view and output to file (views: insights, board) | Export & Reporting |
+| `--debug-width` | int | `180` | Width for debug render | Export & Reporting |
+| `--emit-script` | bool | `false` | Emit shell script for top-N recommendations (agent workflows) | Export & Reporting |
+| `--export-graph` | string | (empty) | Export graph: .html for interactive, .png/.svg for static (auto-names if empty) | Export & Reporting |
+| `--export-md` | string | (empty) | Export issues to a Markdown file (e.g., report.md) | Export & Reporting |
+| `--export-pages` | string | (empty) | Export static site to directory (e.g., ./bv-pages) | Export & Reporting |
+| `--graph-preset` | string | `compact` | Graph layout preset: compact (default) or roomy | Export & Reporting |
+| `--graph-title` | string | (empty) | Title for graph export (default: project name) | Export & Reporting |
+| `--no-hooks` | bool | `false` | Skip running hooks during export | Export & Reporting |
+| `--no-live-reload` | bool | `false` | Disable live-reload in preview mode | Export & Reporting |
+| `--pages` | bool | `false` | Launch interactive Pages deployment wizard | Export & Reporting |
+| `--pages-include-closed` | bool | `true` | Include closed issues in export (default: true) | Export & Reporting |
+| `--pages-include-history` | bool | `true` | Include git history for time-travel (default: true) | Export & Reporting |
+| `--pages-title` | string | (empty) | Custom title for static site | Export & Reporting |
+| `--preview-pages` | string | (empty) | Preview existing static site bundle | Export & Reporting |
+| `--priority-brief` | string | (empty) | Export priority brief to Markdown file (e.g., brief.md) | Export & Reporting |
+| `--script-format` | string | `bash` | Script format: bash, fish, or zsh (use with --emit-script) | Export & Reporting |
+| `--script-limit` | int | `5` | Limit number of items in emitted script (use with --emit-script) | Export & Reporting |
+| `--watch-export` | bool | `false` | Watch for beads changes and auto-regenerate export (use with --export-pages) | Export & Reporting |
+| `--background-mode` | bool | `false` | Enable experimental background snapshot loading (TUI only) | General Flags |
+| `--check-update` | bool | `false` | Check if a new version is available | General Flags |
+| `--cpu-profile` | string | (empty) | Write CPU profile to file | General Flags |
+| `--db` | string | (empty) | Path to beads database file or .beads directory (overrides BEADS_DB and BEADS_DIR env vars) | General Flags |
+| `--force-full-analysis` | bool | `false` | Compute all metrics regardless of graph size (may be slow for large graphs) | General Flags |
+| `--format` | string | (empty) | Structured output format for --robot-* commands: json or toon (env: BV_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT) | General Flags |
+| `--no-background-mode` | bool | `false` | Disable experimental background snapshot loading (TUI only) | General Flags |
+| `--no-cache` | bool | `false` | Bypass disk cache for robot triage (also: BV_NO_CACHE=1) | General Flags |
+| `--profile-json` | bool | `false` | Output profile in JSON format (use with --profile-startup) | General Flags |
+| `--profile-startup` | bool | `false` | Output detailed startup timing profile for diagnostics | General Flags |
+| `--rollback` | bool | `false` | Rollback to the previous version (from backup) | General Flags |
+| `--stats` | bool | `false` | Show JSON vs TOON token estimates on stderr (env: TOON_STATS=1) | General Flags |
+| `--theme` | string | (empty) | Color theme: light, dark, or auto (default: detect terminal background) | General Flags |
+| `--update` | bool | `false` | Update bv to the latest version | General Flags |
+| `--update-dry-run` | bool | `false` | Show what an update would do without installing (use via 'bv upgrade --dry-run') | General Flags |
+| `--version` | bool | `false` | Show version | General Flags |
+| `--yes` | bool | `false` | Skip confirmation prompts (use with --update) | General Flags |
+| `--as-of` | string | (empty) | View state at point in time (commit SHA, branch, tag, or date) | History & Drift |
+| `--baseline-info` | bool | `false` | Show information about the current baseline | History & Drift |
+| `--bead-history` | string | (empty) | Show history for specific bead ID | History & Drift |
+| `--check-drift` | bool | `false` | Check for drift from baseline (exit codes: 0=OK, 1=critical, 2=warning) | History & Drift |
+| `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date) | History & Drift |
+| `--history-limit` | int | `500` | Max commits to analyze (0 = unlimited) | History & Drift |
+| `--history-since` | string | (empty) | Limit history to commits after this date/ref (e.g., '30 days ago', '2024-01-01') | History & Drift |
+| `--min-confidence` | float64 | `0` | Filter correlations by minimum confidence (0.0-1.0) | History & Drift |
+| `--save-baseline` | string | (empty) | Save current metrics as baseline with optional description | History & Drift |
+| `--feedback-accept` | string | (empty) | Record accept feedback for issue ID (tunes recommendation weights) | Other |
+| `--feedback-ignore` | string | (empty) | Record ignore feedback for issue ID (tunes recommendation weights) | Other |
+| `--feedback-reset` | bool | `false` | Reset all feedback data to defaults | Other |
+| `--feedback-show` | bool | `false` | Show current feedback status and weight adjustments | Other |
+| `--generate-docs` | bool | `false` | Generate documentation markdown and JSON artifacts | Other |
+| `--id-pattern` | stringArray | `[]` | Custom bead ID regex for commit-message matching, e.g. 'bh-[a-z0-9]{5}' (repeatable; capture group 1 is the ID, else the whole match) (#188) | Other |
+| `--network-depth` | int | `2` | Depth of subnetwork when querying specific bead (1-3) | Other |
+| `--agents` | int | `1` | Number of parallel agents for capacity simulation | Robot & Planning Flags |
+| `--attention-limit` | int | `5` | Limit number of labels in --robot-label-attention output | Robot & Planning Flags |
+| `--brief` | bool | `false` | Compact --robot-triage output: only decision-relevant fields (id, title, status, assignee, blockers, unblocks) (#183) | Robot & Planning Flags |
+| `--capacity-label` | string | (empty) | Filter capacity simulation by label | Robot & Planning Flags |
+| `--correlation-by` | string | (empty) | Agent/user identifier for correlation feedback | Robot & Planning Flags |
+| `--correlation-reason` | string | (empty) | Reason for correlation feedback | Robot & Planning Flags |
+| `--file-beads-limit` | int | `20` | Max closed beads to show (use with --robot-file-beads) | Robot & Planning Flags |
+| `--forecast-agents` | int | `1` | Number of parallel agents for capacity calculation | Robot & Planning Flags |
+| `--forecast-label` | string | (empty) | Filter forecast by label | Robot & Planning Flags |
+| `--forecast-sprint` | string | (empty) | Filter forecast by sprint ID | Robot & Planning Flags |
+| `--graph-depth` | int | `0` | Max depth for subgraph (0 = unlimited) | Robot & Planning Flags |
+| `--graph-format` | string | `json` | Graph output format: json, dot, mermaid | Robot & Planning Flags |
+| `--graph-root` | string | (empty) | Subgraph from specific root issue ID | Robot & Planning Flags |
+| `--hotspots-limit` | int | `10` | Max hotspots to show (use with --robot-file-hotspots) | Robot & Planning Flags |
+| `--orphans-min-score` | int | `30` | Minimum suspicion score for orphan candidates (0-100) | Robot & Planning Flags |
+| `--related-include-closed` | bool | `false` | Include closed beads in related work results | Robot & Planning Flags |
+| `--related-max-results` | int | `10` | Max results per category for related work | Robot & Planning Flags |
+| `--related-min-relevance` | percent_or_fraction | `20` | Minimum relevance score for related work (int 0-100 percent OR float 0.0-1.0 fraction) | Robot & Planning Flags |
+| `--relations-limit` | int | `10` | Max related files to show | Robot & Planning Flags |
+| `--relations-threshold` | float64 | `0.5` | Minimum correlation threshold (0.0-1.0) for related files | Robot & Planning Flags |
+| `--robot-alerts` | bool | `false` | Output alerts (drift + proactive) as JSON for AI agents | Robot & Planning Flags |
+| `--robot-blocker-chain` | string | (empty) | Output full blocker chain analysis for issue ID as JSON | Robot & Planning Flags |
+| `--robot-burndown` | string | (empty) | Output burndown data for sprint ID, or 'current' for active sprint | Robot & Planning Flags |
+| `--robot-capabilities` | bool | `false` | Output machine-readable command capabilities for AI agents | Robot & Planning Flags |
+| `--robot-capacity` | bool | `false` | Output capacity simulation and completion projection as JSON | Robot & Planning Flags |
+| `--robot-causality` | string | (empty) | Output causal chain analysis for bead ID as JSON | Robot & Planning Flags |
+| `--robot-confirm-correlation` | string | (empty) | Confirm a correlation is correct (format: SHA:beadID) | Robot & Planning Flags |
+| `--robot-correlation-stats` | bool | `false` | Output correlation feedback statistics as JSON | Robot & Planning Flags |
+| `--robot-diff` | bool | `false` | Output diff as JSON (use with --diff-since) | Robot & Planning Flags |
+| `--robot-docs` | string | (empty) | Machine-readable JSON docs for AI agents. Topics: guide, commands, examples, env, exit-codes, all | Robot & Planning Flags |
+| `--robot-drift` | bool | `false` | Output drift check as JSON (use with --check-drift) | Robot & Planning Flags |
+| `--robot-explain-correlation` | string | (empty) | Explain why a commit is linked to a bead (format: SHA:beadID) | Robot & Planning Flags |
+| `--robot-file-beads` | string | (empty) | Output beads that touched a file path as JSON | Robot & Planning Flags |
+| `--robot-file-hotspots` | bool | `false` | Output files touched by most beads as JSON | Robot & Planning Flags |
+| `--robot-file-relations` | string | (empty) | Output files that frequently co-change with the given file path | Robot & Planning Flags |
+| `--robot-forecast` | string | (empty) | Output ETA forecast for bead ID, or 'all' for all open issues | Robot & Planning Flags |
+| `--robot-graph` | bool | `false` | Output dependency graph as JSON/DOT/Mermaid for AI agents | Robot & Planning Flags |
+| `--robot-help` | bool | `false` | Show AI agent help | Robot & Planning Flags |
+| `--robot-history` | bool | `false` | Output bead-to-commit correlations as JSON | Robot & Planning Flags |
+| `--robot-history-timeout-ms` | int | `-1` | Budget in ms for the git-history prologue of robot triage (0 = unbounded; default 10000, env BV_ROBOT_HISTORY_TIMEOUT_MS) | Robot & Planning Flags |
+| `--robot-impact` | string | (empty) | Analyze impact of modifying files (comma-separated paths) | Robot & Planning Flags |
+| `--robot-impact-network` | string | (empty) | Output bead impact network as JSON (empty for full, or bead ID for subnetwork) | Robot & Planning Flags |
+| `--robot-insights` | bool | `false` | Output graph analysis and insights as JSON for AI agents | Robot & Planning Flags |
+| `--robot-label-attention` | bool | `false` | Output attention-ranked labels as JSON for AI agents | Robot & Planning Flags |
+| `--robot-label-flow` | bool | `false` | Output cross-label dependency flow as JSON for AI agents | Robot & Planning Flags |
+| `--robot-label-health` | bool | `false` | Output label health metrics as JSON for AI agents | Robot & Planning Flags |
+| `--robot-metrics` | bool | `false` | Output performance metrics (timing, cache, memory) as JSON | Robot & Planning Flags |
+| `--robot-next` | bool | `false` | Output only the top pick recommendation as JSON (minimal triage) | Robot & Planning Flags |
+| `--robot-not-ready-labels` | string | (empty) | Comma-separated labels marking a bead not-ready: excluded from claimable --robot-next/--robot-triage top picks (env: BV_ROBOT_NOT_READY_LABELS; #173) | Robot & Planning Flags |
+| `--robot-orphans` | bool | `false` | Output orphan commit candidates (commits that should be linked but aren't) as JSON | Robot & Planning Flags |
+| `--robot-plan` | bool | `false` | Output dependency-respecting execution plan as JSON for AI agents | Robot & Planning Flags |
+| `--robot-priority` | bool | `false` | Output priority recommendations as JSON for AI agents | Robot & Planning Flags |
+| `--robot-recipes` | bool | `false` | Output available recipes as JSON for AI agents | Robot & Planning Flags |
+| `--robot-reject-correlation` | string | (empty) | Reject an incorrect correlation (format: SHA:beadID) | Robot & Planning Flags |
+| `--robot-related` | string | (empty) | Output beads related to a specific bead ID as JSON | Robot & Planning Flags |
+| `--robot-schema` | bool | `false` | Output JSON Schema definitions for all robot commands | Robot & Planning Flags |
+| `--robot-search` | bool | `false` | Output semantic search results as JSON for AI agents (use with --search) | Robot & Planning Flags |
+| `--robot-sprint-list` | bool | `false` | Output sprints as JSON | Robot & Planning Flags |
+| `--robot-sprint-show` | string | (empty) | Output specific sprint details as JSON | Robot & Planning Flags |
+| `--robot-suggest` | bool | `false` | Output smart suggestions (duplicates, dependencies, labels, cycles) as JSON | Robot & Planning Flags |
+| `--robot-triage` | bool | `false` | Output unified triage as JSON (the mega-command for AI agents) | Robot & Planning Flags |
+| `--robot-triage-by-label` | bool | `false` | Group triage recommendations by label (bv-87) | Robot & Planning Flags |
+| `--robot-triage-by-track` | bool | `false` | Group triage recommendations by execution track (bv-87) | Robot & Planning Flags |
+| `--schema-command` | string | (empty) | Output schema for specific command only (e.g., robot-triage) | Robot & Planning Flags |
+| `--suggest-bead` | string | (empty) | Filter suggestions for specific bead ID | Robot & Planning Flags |
+| `--suggest-confidence` | float64 | `0` | Minimum confidence for suggestions (0.0-1.0) | Robot & Planning Flags |
+| `--suggest-type` | string | (empty) | Filter suggestions by type: duplicate, dependency, label, cycle | Robot & Planning Flags |
+| `--alert-label` | string | (empty) | Filter robot alerts by label match | Search & Filters |
+| `--alert-type` | string | (empty) | Filter robot alerts by alert type (e.g., stale_issue) | Search & Filters |
+| `--label` | string | (empty) | Scope analysis to label's subgraph (affects --robot-insights, --robot-plan, --robot-priority) | Search & Filters |
+| `--recipe` | string | (empty) | Apply a recipe by name (e.g., triage, actionable, high-impact) or by .yaml/.yml file path (e.g., .beads/recipes/sprint.yaml) | Search & Filters |
+| `--repo` | string | (empty) | Filter issues by repository prefix (e.g., 'api-' or 'api') | Search & Filters |
+| `--robot-by-assignee` | string | (empty) | Filter robot outputs by assignee (exact match) | Search & Filters |
+| `--robot-by-label` | string | (empty) | Filter robot outputs by label (exact match) | Search & Filters |
+| `--robot-max-results` | int | `0` | Limit robot output count (0 = use defaults) | Search & Filters |
+| `--robot-min-confidence` | float64 | `0` | Filter robot outputs by minimum confidence (0.0-1.0) | Search & Filters |
+| `--search` | string | (empty) | Semantic search query (vector-based; builds/updates index on first run) | Search & Filters |
+| `--search-limit` | int | `10` | Max results for --search/--robot-search | Search & Filters |
+| `--search-mode` | string | (empty) | Search ranking mode: text or hybrid (default: BV_SEARCH_MODE or text) | Search & Filters |
+| `--search-preset` | string | (empty) | Hybrid preset name (default: BV_SEARCH_PRESET or default) | Search & Filters |
+| `--search-weights` | string | (empty) | Hybrid weights JSON (overrides preset; keys: text,pagerank,status,impact,priority,recency) | Search & Filters |
+| `--severity` | string | (empty) | Filter robot alerts by severity (info|warning|critical) | Search & Filters |
+| `--workspace` | string | (empty) | Load issues from workspace config file (.bv/workspace.yaml) | Search & Filters |
+<!-- /bv:generated -->
 
 ### Time-Travel Commands
 
@@ -3219,6 +3376,18 @@ Hybrid defaults can be set via:
 - `BV_SEARCH_WEIGHTS` (JSON string, overrides preset)
 
 In `--robot-search` JSON, hybrid results include `mode`, `preset`, `weights`, plus per-result `text_score` and `component_scores`.
+
+#### Hybrid Search Presets
+
+<!-- bv:generated:presets -->
+| Preset | Text | PageRank | Status | Impact | Priority | Recency | Description |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---|
+| `default` | 0.40 | 0.20 | 0.15 | 0.10 | 0.10 | 0.05 | Balanced general-purpose search (text-led with graph context) |
+| `bug-hunting` | 0.30 | 0.15 | 0.15 | 0.15 | 0.20 | 0.05 | Prioritizes open issues with high impact and recency |
+| `sprint-planning` | 0.30 | 0.20 | 0.25 | 0.15 | 0.05 | 0.05 | Heavily weights PageRank and blocker impact for sprint grooming |
+| `impact-first` | 0.25 | 0.30 | 0.10 | 0.20 | 0.10 | 0.05 | Centrality-first: PageRank and graph impact dominate text matches |
+| `text-only` | 1.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | Pure keyword/semantic similarity with zero graph metric weighting |
+<!-- /bv:generated -->
 
 ### Example: AI Agent Workflow
 
@@ -3718,65 +3887,88 @@ bv has a comprehensive built-in help system:
 
 ### Keyboard Control Map
 
+<!-- bv:generated:keys -->
 | Context | Key | Action |
 | :--- | :---: | :--- |
-| **Global Navigation** | `j` / `k` | Next / Previous Item |
-| | `g` / `G` | Jump to Top / Bottom |
-| | `Ctrl+D` / `Ctrl+U` | Page Down / Up |
-| | `Tab` | Switch Focus (List ↔ Details) |
-| | `Enter` | Open / Focus Selection |
-| | `q` / `Esc` | Quit / Back |
-| **Filters** | `o` | Show **Open** Issues |
-| | `r` | Show **Ready** (Unblocked) |
-| | `c` | Show **Closed** Issues |
-| | `/` | **Search** (Fuzzy) |
-| | `Ctrl+S` | Toggle **Search Mode** (Semantic ↔ Fuzzy) |
-| | `l` | **Label Picker** (quick filter by label) |
-| **List Sorting** | `s` | Cycle Sort Mode (Default → Created ↑ → Created ↓ → Priority → Updated) |
-| | `S` | Sort by triage score (applies the built-in `triage` recipe) |
-| **Views** | `b` | Toggle **Kanban Board** |
-| | `i` | Toggle **Insights Dashboard** |
-| | `g` | Toggle **Graph Visualizer** (from the list; `gg` jumps to the top in Board and Tree) |
-| | `E` | Toggle **Tree View** (parent-child hierarchy) |
-| | `a` | Toggle **Actionable Plan** (`a` / `Esc` exits) |
-| | `h` | Toggle **History View** (bead-to-commit correlation) |
-| | `f` | Toggle **Flow Matrix** (cross-label dependencies) |
-| | `[` / `F3` | Toggle **Label Dashboard** (label health analytics) |
-| | `]` / `F4` | Toggle **Attention View** (label attention scores) |
-| **Kanban Board** | `h` / `l` | Move Between Columns |
-| | `j` / `k` | Move Within Column |
-| | `gg` / `Home` | Jump to Top |
-| | `/`, `n` / `N` | Search cards, next / previous match |
-| **Insights Dashboard** | `Tab` | Next Panel |
-| | `e` | Toggle Explanations |
-| | `x` | Toggle Calculation Proof |
-| | `m` | Toggle Heatmap Overlay |
-| **Graph View** | `hjkl` / arrows | Navigate the graph |
-| | `H` / `L` | Scroll Left / Right |
-| | `PgUp` / `PgDn` | Scroll up / down a page |
-| | `Ctrl+D` / `Ctrl+U` | Page Down / Up |
-| **Tree View** | `j` / `k` | Move cursor down / up |
-| | `h` / `l` | Collapse/parent or Expand/child |
-| | `Enter` / `Space` | Toggle expand/collapse |
-| | `o` / `O` | Expand all / Collapse all |
-| | `gg` / `G` | Jump to top / bottom |
-| **Time-Travel & Analysis** | `t` | Time-Travel Mode (custom revision) |
-| | `T` | Quick Time-Travel (HEAD~5) |
-| | `p` | Toggle Priority Hints Overlay |
-| **Actions** | `x` | Export to Markdown File |
-| | `C` | Copy Issue to Clipboard |
-| | `O` | Open in Editor |
-| | `U` | Self-update check (opens the update modal) |
-| **Help & Learning** | `?` | Toggle Help Overlay (keyboard shortcuts) |
-| | `` ` `` | Open Interactive Tutorial |
-| **Global** | `;` / `F2` | Toggle Shortcuts Sidebar |
-| | `!` | Toggle **Alerts Panel** (proactive warnings) |
-| | `'` | Recipe Picker |
-| | `w` | Repo Picker (workspace mode) |
-| | `P` | Open the Sprint Dashboard (from the list or detail view) |
-| **Insights** | `Shift+Tab` / `h` | Previous Insights panel |
-| **History** | `t` | Toggle the timeline pane |
-| **Time-travel** | `n` / `N` | Next / previous changed issue |
+| **all** | `j` | Move down |
+|  | `k` | Move up |
+|  | `G` | Go to end |
+| **list** | `home` | Go to start |
+| **board,tree** | `gg` | Go to start |
+| **all** | `ctrl+d` | Page down |
+|  | `ctrl+u` | Page up |
+|  | `enter` | Open details |
+|  | `esc` | Back/close (list: clear filters) |
+|  | `q` | Quit |
+| **list,detail** | `a` | Actionable view |
+|  | `b` | Board view |
+|  | `g` | Graph view |
+|  | `h` | History view |
+|  | `i` | Insights panel |
+|  | `E` | Tree view (parent-child hierarchy) |
+|  | `f` | Flow matrix (cross-label dependencies) |
+|  | `P` | Sprint dashboard |
+|  | `[` | Label dashboard |
+|  | `]` | Attention view |
+| **list** | `!` | Alerts panel |
+|  | `w` | Repo picker (workspace mode) |
+| **all** | `?` | Help overlay |
+|  | `;` | Shortcuts sidebar |
+| **list,detail** | `p` | Priority hints |
+| **list** | `o` | Open issues only |
+|  | `c` | Closed issues only |
+|  | `r` | Ready (unblocked) |
+|  | `l` | Label picker |
+|  | `/` | Search/filter |
+|  | `s` | Cycle sort mode |
+|  | `S` | Sort by triage score (triage recipe) |
+| **list,detail** | `t` | Time travel (custom revision) |
+|  | `T` | Time travel (HEAD~5) |
+| **list** | `n` | Next changed issue (time travel) |
+|  | `N` | Previous changed issue (time travel) |
+| **list,detail** | `x` | Export to markdown |
+| **all** | `y` | Copy issue ID |
+| **detail** | `C` | Copy full issue |
+|  | `O` | Open in  |
+| **list** | `'` | Recipe picker |
+| **all** | `U` | Self-update check |
+| **list** | `V` | Cass sessions |
+| **graph** | `hjkl` | Navigate graph |
+|  | `H` | Scroll left |
+|  | `L` | Scroll right |
+|  | `PgUp` | Scroll up |
+|  | `PgDn` | Scroll down |
+| **board** | `h` | Previous column |
+|  | `l` | Next column |
+|  | `H` | First column |
+|  | `L` | Last column |
+|  | `s` | Cycle swimlane mode |
+|  | `tab` | Toggle detail |
+| **tree** | `E` | Exit tree view |
+| **board** | `ctrl+j` | Scroll detail down |
+|  | `ctrl+k` | Scroll detail up |
+| **insights** | `h` | Previous panel |
+|  | `l` | Next panel |
+|  | `tab` | Next panel |
+|  | `shift+tab` | Previous panel |
+|  | `e` | Toggle explanations |
+|  | `x` | Calculation proof |
+|  | `m` | Heatmap toggle |
+| **history** | `v` | Toggle git/bead mode |
+|  | `tab` | Toggle focus |
+|  | `t` | Toggle timeline pane |
+|  | `f` | Toggle file tree |
+|  | `J` | Detail scroll down |
+|  | `K` | Detail scroll up |
+|  | `o` | Open in browser |
+| **attention** | `g` | Go to top |
+|  | `enter` | Label drilldown |
+|  | `1-9` | Filter list by rank |
+|  | `]` | Close attention view |
+| **sprint** | `P` | Close sprint dashboard |
+|  | `j` | Next sprint |
+|  | `k` | Previous sprint |
+<!-- /bv:generated -->
 
 ---
 
@@ -3786,49 +3978,51 @@ bv has a comprehensive built-in help system:
 
 ### Environment Variables
 
+<!-- bv:generated:env -->
 | Variable | Description | Default |
-|----------|-------------|---------|
+|:---|:---|:---|
 | `BEADS_DB` | Path to a beads database file or `.beads` directory. Overrides `BEADS_DIR`; overridden by `--db`. | (unset) |
 | `BEADS_DIR` | Custom beads directory path. When set, overrides the default `.beads` directory lookup. | `.beads` in cwd |
 | `BV_BACKGROUND_MODE` | Startup default for the background snapshot worker (`1` on, `0` off). At runtime the TUI promotes itself to the worker after any synchronous reload that takes 1 s or longer; `0` pins synchronous reload and disables that promotion. | sync at startup, auto-promote after a slow reload |
-| `BV_ROBOT` | Set to `1` to force robot mode (clean stdout, JSON logs, disk cache on). Every `--robot-*` flag sets it. | (unset) |
-| `BV_OUTPUT_FORMAT` | Default robot output format: `json` or `toon` (overridden by `--format`). | `json` |
-| `BV_PRETTY_JSON` | Set to `1` for indented JSON output. | (compact) |
-| `BV_NO_CACHE` | Set to `1` to bypass the robot analysis and correlation disk caches (`--no-cache` sets it). | (cache on) |
+| `BV_BUILD_HYBRID_WASM` | Set to `1` to build the hybrid search WASM scorer during `--export-pages` (requires wasm-pack). | (skip) |
 | `BV_CACHE_DIR` | Base directory for the disk caches (`analysis_cache/` and correlation caches live under it). | `<user cache dir>/bv` |
-| `BV_ROBOT_NOT_READY_LABELS` | Comma-separated labels marking a bead not-ready; excluded from claimable `--robot-next`/`--robot-triage` top picks (`--robot-not-ready-labels` overrides). | (none) |
-| `BV_ROBOT_HISTORY_TIMEOUT_MS` | Bound on the git-history prologue of `--robot-triage` in milliseconds; `0` = unbounded. | `10000` |
+| `BV_DEBOUNCE_MS` | Debounce window (milliseconds) for live reload events in background mode. | `200` |
+| `BV_DEBUG` | Any value: write `[BV_DEBUG]` diagnostics to stderr. | (off) |
+| `BV_FORCE_POLL` | Alias for `BV_FORCE_POLLING`. | (auto) |
+| `BV_FORCE_POLLING` | Force polling-based live reload (useful on NFS/SMB/SSHFS/FUSE or any setup where filesystem events are unreliable) (`1`/`0`). | (auto) |
+| `BV_FRESHNESS_STALE_S` | Snapshot staleness critical threshold (seconds). | `120` |
+| `BV_FRESHNESS_WARN_S` | Snapshot staleness warning threshold (seconds). | `30` |
+| `BV_HEARTBEAT_INTERVAL_S` | Background worker heartbeat interval (seconds). | `5` |
 | `BV_INSIGHTS_MAP_LIMIT` | Cap on the number of entries in each `--robot-insights` metric map. | (all) |
-| `BV_THEME` | Pin the TUI palette: `light` or `dark` (overridden by `--theme`). | (auto-detect) |
-| `BV_TUI_AUTOCLOSE_MS` | Quit the TUI automatically after this many milliseconds (for automated tests). | (unset) |
+| `BV_MAX_LINE_SIZE_MB` | Max JSONL line size in MB (lines larger than this are skipped with a warning). Applies to the TUI, the background worker, and robot loads. | `10` |
+| `BV_METRICS` | Set to `0` to disable internal timing metrics collection (`--robot-metrics`). | (enabled) |
 | `BV_NO_BROWSER` | Any value: never open a browser after exports or deployments. | (unset) |
-| `BV_TEST_MODE` | Any value: test harness mode; suppresses browser opening, terminal capability queries, and the background worker's idle GC tuning. | (unset) |
+| `BV_NO_CACHE` | Set to `1` to bypass the robot analysis and correlation disk caches (`--no-cache` sets it). | (cache on) |
+| `BV_NO_GITIGNORE` | Disable automatic ignore-file management for `.bv/` entirely (any non-empty value). See [Automatic `.bv/` ignore handling](#automatic-bv-ignore-handling). | (enabled) |
 | `BV_NO_SAVED_CONFIG` | Any value: the `--pages` wizard ignores the saved deployment configuration. | (unset) |
 | `BV_NO_UPDATE_CHECK` | Set to `1` to skip the TUI's startup release check (`updates: {check: false}` in `~/.config/bv/config.yaml` does the same); explicit `--check-update` / `--update` still work. | (check on) |
-| `BV_UPDATE_USE_TOKEN` | Set to `1` to let the update check and `--update` send the ambient `GITHUB_TOKEN` / `GH_TOKEN` to api.github.com (`updates: {use_token: true}` in config.yaml does the same). | (never sent) |
-| `BV_METRICS` | Set to `0` to disable internal timing metrics collection (`--robot-metrics`). | (enabled) |
-| `BV_DEBUG` | Any value: write `[BV_DEBUG]` diagnostics to stderr. | (off) |
-| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker. | (default) |
-| `BV_WORKER_TRACE` | Path to a trace file the background worker appends to. | (off) |
-| `BV_WORKER_METRICS` | Truthy value: the background worker records its own metrics. | (off) |
+| `BV_OUTPUT_FORMAT` | Default robot output format: `json` or `toon` (overridden by `--format`). | `json` |
+| `BV_PHASE2_TIMEOUT_S` | Override per-metric Phase 2 timeouts (seconds). | (size-based) |
+| `BV_PRETTY_JSON` | Set to `1` for indented JSON output. | (compact) |
+| `BV_ROBOT` | Set to `1` to force robot mode (clean stdout, JSON logs, disk cache on). Every `--robot-*` flag sets it. | (unset) |
+| `BV_ROBOT_HISTORY_TIMEOUT_MS` | Bound on the git-history prologue of `--robot-triage` in milliseconds; `0` = unbounded. | `10000` |
+| `BV_ROBOT_NOT_READY_LABELS` | Comma-separated labels marking a bead not-ready; excluded from claimable `--robot-next`/`--robot-triage` top picks (`--robot-not-ready-labels` overrides). | (none) |
 | `BV_SEARCH_MODE` | Default search mode: `text` or `hybrid` (`--search-mode` overrides). | `text` |
 | `BV_SEARCH_PRESET` | Default hybrid preset: `default`, `bug-hunting`, `sprint-planning`, `impact-first`, `text-only`; setting one implies hybrid mode. | `default` |
 | `BV_SEARCH_WEIGHTS` | JSON weight map for hybrid search; overrides the preset. | (preset) |
-| `BV_BUILD_HYBRID_WASM` | Set to `1` to build the hybrid search WASM scorer during `--export-pages` (requires wasm-pack). | (skip) |
-| `BV_FORCE_POLLING` | Force polling-based live reload (useful on NFS/SMB/SSHFS/FUSE or any setup where filesystem events are unreliable) (`1`/`0`). | (auto) |
-| `BV_FORCE_POLL` | Alias for `BV_FORCE_POLLING`. | (auto) |
-| `BV_DEBOUNCE_MS` | Debounce window (milliseconds) for live reload events in background mode. | `200` |
-| `BV_HEARTBEAT_INTERVAL_S` | Background worker heartbeat interval (seconds). | `5` |
-| `BV_WATCHDOG_INTERVAL_S` | Background worker watchdog interval (seconds). | `10` |
-| `BV_FRESHNESS_WARN_S` | Snapshot staleness warning threshold (seconds). | `30` |
-| `BV_FRESHNESS_STALE_S` | Snapshot staleness critical threshold (seconds). | `120` |
-| `BV_MAX_LINE_SIZE_MB` | Max JSONL line size in MB (lines larger than this are skipped with a warning). Applies to the TUI, the background worker, and robot loads. | `10` |
-| `BV_NO_GITIGNORE` | Disable automatic ignore-file management for `.bv/` entirely (any non-empty value). See [Automatic `.bv/` ignore handling](#automatic-bv-ignore-handling). | (enabled) |
-| `BV_SKIP_PHASE2` | Skip Phase 2 graph metrics (centrality, cycles, critical path) (`1`/`0`). | (disabled) |
-| `BV_PHASE2_TIMEOUT_S` | Override per-metric Phase 2 timeouts (seconds). | (size-based) |
-| `BV_SEMANTIC_EMBEDDER` | Embedding provider for `bv --search` and TUI search. Only `hash` (FNV-1a keyword feature hashing) is implemented; `python-sentence-transformers` and `openai` are reserved names that fail with "not implemented". | `hash` |
 | `BV_SEMANTIC_DIM` | Embedding dimension for the hashed search index. | `384` |
+| `BV_SEMANTIC_EMBEDDER` | Embedding provider for `bv --search` and TUI search. Only `hash` (FNV-1a keyword feature hashing) is implemented; `python-sentence-transformers` and `openai` are reserved names that fail with "not implemented". | `hash` |
 | `BV_SEMANTIC_MODEL` | Model name for a future non-hash provider; ignored by `hash`. | (empty) |
+| `BV_SKIP_PHASE2` | Skip Phase 2 graph metrics (centrality, cycles, critical path) (`1`/`0`). | (disabled) |
+| `BV_TEST_MODE` | Any value: test harness mode; suppresses browser opening, terminal capability queries, and the background worker's idle GC tuning. | (unset) |
+| `BV_THEME` | Pin the TUI palette: `light` or `dark` (overridden by `--theme`). | (auto-detect) |
+| `BV_TUI_AUTOCLOSE_MS` | Quit the TUI automatically after this many milliseconds (for automated tests). | (unset) |
+| `BV_UPDATE_USE_TOKEN` | Set to `1` to let the update check and `--update` send the ambient `GITHUB_TOKEN` / `GH_TOKEN` to api.github.com (`updates: {use_token: true}` in config.yaml does the same). | (never sent) |
+| `BV_WATCHDOG_INTERVAL_S` | Background worker watchdog interval (seconds). | `10` |
+| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker. | (default) |
+| `BV_WORKER_METRICS` | Truthy value: the background worker records its own metrics. | (off) |
+| `BV_WORKER_TRACE` | Path to a trace file the background worker appends to. | (off) |
+<!-- /bv:generated -->
 
 **Use cases for `BEADS_DIR`:**
 - **Monorepos**: Single beads directory shared across multiple packages

@@ -1,0 +1,75 @@
+{
+  "correlation_ranges": {
+    "co_committed": {
+      "description": "Changed in same commit as bead update (direct causation)",
+      "max": 0.99,
+      "min": 0.85
+    },
+    "explicit_id": {
+      "description": "Commit message explicitly references bead ID (developer intent)",
+      "max": 0.99,
+      "min": 0.7
+    },
+    "temporal_author": {
+      "description": "By same author during bead's active window (temporal correlation)",
+      "max": 0.85,
+      "min": 0.2
+    }
+  },
+  "impact_weights": {
+    "betweenness": 0.2,
+    "blocker_ratio": 0.13,
+    "pagerank": 0.22,
+    "priority_boost": 0.1,
+    "risk": 0.1,
+    "staleness": 0.05,
+    "time_to_impact": 0.1,
+    "urgency": 0.1
+  },
+  "label_health": {
+    "thresholds": {
+      "healthy": 70,
+      "stale_days": 14,
+      "warning": 40
+    },
+    "weights": {
+      "criticality": 0.25,
+      "flow": 0.25,
+      "freshness": 0.25,
+      "velocity": 0.25
+    }
+  },
+  "staleness_thresholds": {
+    "drift_in_progress_stale_multiplier": 0.5,
+    "drift_stale_critical_days": 30,
+    "drift_stale_warning_days": 14,
+    "label_health_stale_days": 14,
+    "priority_staleness_days": 30
+  },
+  "timeout_tiers": {
+    "large": {
+      "approx_betweenness_timeout_ms": 500,
+      "max_nodes": 1999,
+      "min_nodes": 500,
+      "mode": "approximate",
+      "timeout_ms": 300
+    },
+    "medium": {
+      "max_nodes": 499,
+      "min_nodes": 100,
+      "mode": "exact",
+      "timeout_ms": 500
+    },
+    "small": {
+      "max_nodes": 99,
+      "mode": "exact",
+      "timeout_ms": 2000
+    },
+    "xl": {
+      "approx_betweenness_timeout_ms": 500,
+      "min_nodes": 2000,
+      "mode": "approximate",
+      "timeout_ms": 200
+    }
+  }
+}
