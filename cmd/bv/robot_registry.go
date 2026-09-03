@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
@@ -1841,7 +1842,7 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	}
 
 	mapLimit := 200
-	if value := os.Getenv("BV_INSIGHTS_MAP_LIMIT"); value != "" {
+	if value := env.InsightsMapLimit.Get(); value != "" {
 		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
 			mapLimit = parsed
 		}
@@ -1947,8 +1948,8 @@ func resolveRobotHistoryTimeout(cfg phaseThreeRobotHandlerConfig) time.Duration 
 		timeout, _ := robotHistoryTimeoutFromMilliseconds(int64(*cfg.HistoryTimeoutMs))
 		return timeout
 	}
-	if env := strings.TrimSpace(os.Getenv("BV_ROBOT_HISTORY_TIMEOUT_MS")); env != "" {
-		if ms, err := strconv.ParseInt(env, 10, 64); err == nil {
+	if envVal := strings.TrimSpace(env.RobotHistoryTimeoutMS.Get()); envVal != "" {
+		if ms, err := strconv.ParseInt(envVal, 10, 64); err == nil {
 			if timeout, ok := robotHistoryTimeoutFromMilliseconds(ms); ok {
 				return timeout
 			}
@@ -1968,8 +1969,8 @@ func resolveNotReadyLabels(cfg phaseThreeRobotHandlerConfig) []string {
 	raw := ""
 	if cfg.NotReadyLabels != nil && strings.TrimSpace(*cfg.NotReadyLabels) != "" {
 		raw = *cfg.NotReadyLabels
-	} else if env := strings.TrimSpace(os.Getenv("BV_ROBOT_NOT_READY_LABELS")); env != "" {
-		raw = env
+	} else if envVal := strings.TrimSpace(env.RobotNotReadyLabels.Get()); envVal != "" {
+		raw = envVal
 	}
 	if raw == "" {
 		return nil

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
@@ -122,9 +123,9 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 		}
 
 		// Check BEADS_DB environment variable (can be file or directory)
-		if envDB := os.Getenv("BEADS_DB"); envDB != "" {
+		if envDB := env.BeadsDB.Get(); envDB != "" {
 			beadsDir = resolveBeadsDBPath(envDB)
-		} else if envDir := os.Getenv("BEADS_DIR"); envDir != "" {
+		} else if envDir := env.BeadsDir.Get(); envDir != "" {
 			// Check BEADS_DIR environment variable
 			beadsDir = envDir
 		} else {

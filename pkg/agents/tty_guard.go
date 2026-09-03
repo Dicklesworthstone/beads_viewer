@@ -3,6 +3,8 @@ package agents
 import (
 	"os"
 	"strings"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // init runs before Bubble Tea acquires the terminal (and before any TUI starts).
@@ -19,7 +21,7 @@ func init() {
 		return
 	}
 
-	if !shouldSuppressTTYQueries(os.Args, os.Getenv("BV_ROBOT") == "1", os.Getenv("BV_TEST_MODE") != "") {
+	if !shouldSuppressTTYQueries(os.Args, env.Robot.Bool(), env.TestMode.Get() != "") {
 		return
 	}
 

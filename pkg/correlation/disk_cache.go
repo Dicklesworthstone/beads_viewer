@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	json "github.com/goccy/go-json"
 )
@@ -93,17 +94,17 @@ type correlationDiskCacheEntry struct {
 // active. It mirrors the analysis disk cache: on in robot mode, off when the
 // caller asked to bypass caches.
 func correlationDiskCacheEnabled() bool {
-	if os.Getenv("BV_NO_CACHE") == "1" {
+	if env.NoCache.Bool() {
 		return false
 	}
-	return os.Getenv("BV_ROBOT") == "1" || diskCacheForced.Load()
+	return env.Robot.Bool() || diskCacheForced.Load()
 }
 
 // correlationDiskCachePath resolves the cache file location, honoring the same
 // conventions as the analysis disk cache: BV_CACHE_DIR override, otherwise the
 // user cache dir (which respects XDG_CACHE_HOME), under a shared "bv" subdir.
 func correlationDiskCachePath(create bool) (string, error) {
-	base := os.Getenv("BV_CACHE_DIR")
+	base := env.CacheDir.Get()
 	if base == "" {
 		dir, err := os.UserCacheDir()
 		if err != nil {

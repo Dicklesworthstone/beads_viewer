@@ -18,6 +18,8 @@ import (
 
 	"github.com/charmbracelet/huh"
 	"golang.org/x/term"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // WizardConfig holds configuration for the deployment wizard.
@@ -272,7 +274,7 @@ func (w *Wizard) Run() (*WizardResult, error) {
 
 	// Check for saved configuration first (unless BV_NO_SAVED_CONFIG is set)
 	savedConfig, err := LoadWizardConfig()
-	skipSaved := os.Getenv("BV_NO_SAVED_CONFIG") != ""
+	skipSaved := env.NoSavedConfig.Get() != ""
 	if !skipSaved && err == nil && savedConfig != nil && savedConfig.DeployTarget != "" {
 		// Found saved config - ask if user wants to use it
 		useSaved, err := w.offerSavedConfig(savedConfig)

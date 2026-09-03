@@ -15,6 +15,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 const skipDeploymentIssueCountVerification = -1
@@ -660,7 +662,7 @@ func OpenInBrowser(url string) error {
 // a different caller's environment (in the test suite, a previous test's
 // preview server opened a browser inside the next test's stubbed PATH).
 func prepareBrowserOpen(url string) (*exec.Cmd, error) {
-	if os.Getenv("BV_NO_BROWSER") != "" || os.Getenv("BV_TEST_MODE") != "" {
+	if env.NoBrowser.Get() != "" || env.TestMode.Get() != "" {
 		return nil, nil
 	}
 	name, args, err := browserOpenCommandForGOOS(runtime.GOOS, url)

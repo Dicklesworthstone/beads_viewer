@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/debug"
 	json "github.com/goccy/go-json"
 )
@@ -72,7 +73,7 @@ type headArtifactCacheEntry struct {
 // conventions as the report disk cache (BV_CACHE_DIR override, otherwise the
 // user cache dir which respects XDG_CACHE_HOME, under the shared "bv" subdir).
 func headArtifactCachePath(create bool) (string, error) {
-	base := os.Getenv("BV_CACHE_DIR")
+	base := env.CacheDir.Get()
 	if base == "" {
 		dir, err := os.UserCacheDir()
 		if err != nil {

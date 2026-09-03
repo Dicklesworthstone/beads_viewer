@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/internal/datasource"
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/agents"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
@@ -1699,7 +1700,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	var backgroundWorker *BackgroundWorker
 	var backgroundModeErr error
 	backgroundModeRequested := false
-	if v := strings.TrimSpace(os.Getenv("BV_BACKGROUND_MODE")); v != "" {
+	if v := strings.TrimSpace(env.BackgroundMode.Get()); v != "" {
 		switch strings.ToLower(v) {
 		case "1", "true", "yes", "on":
 			backgroundModeRequested = true
@@ -1930,7 +1931,7 @@ func (m *Model) Init() tea.Cmd {
 		cmds = append(cmds, CheckUpdateCmd())
 	}
 	// cass detection at startup (E4); tests opt back in by clearing BV_TEST_MODE.
-	if os.Getenv("BV_TEST_MODE") == "" {
+	if env.TestMode.Get() == "" {
 		cmds = append(cmds, CheckCassHealthCmd())
 	}
 	if m.backgroundWorker != nil {
@@ -3474,7 +3475,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		slowReload := reloadDuration >= time.Second
 		if slowReload && m.backgroundWorker == nil && m.beadsPath != "" {
 			autoAllowed := true
-			if v := strings.TrimSpace(os.Getenv("BV_BACKGROUND_MODE")); v != "" {
+			if v := strings.TrimSpace(env.BackgroundMode.Get()); v != "" {
 				switch strings.ToLower(v) {
 				case "0", "false", "no", "off":
 					autoAllowed = false
@@ -5570,7 +5571,7 @@ func normalizeGitRemoteWebURL(remote string) string {
 // Set BV_NO_BROWSER=1 to suppress browser opening (useful for tests).
 func openBrowserURL(url string) error {
 	// Skip browser opening in test mode or when explicitly disabled
-	if os.Getenv("BV_NO_BROWSER") != "" || os.Getenv("BV_TEST_MODE") != "" {
+	if env.NoBrowser.Get() != "" || env.TestMode.Get() != "" {
 		return nil
 	}
 

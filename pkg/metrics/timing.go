@@ -17,9 +17,10 @@
 package metrics
 
 import (
-	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // enabled controls whether metrics are collected.
@@ -28,7 +29,7 @@ import (
 var enabled atomic.Bool
 
 func init() {
-	enabled.Store(os.Getenv("BV_METRICS") != "0")
+	enabled.Store(env.Metrics.Get() != "0")
 }
 
 // Enabled returns whether metrics collection is enabled.

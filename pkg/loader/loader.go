@@ -19,6 +19,7 @@ import (
 
 	json "github.com/goccy/go-json"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
@@ -57,12 +58,12 @@ func GetBeadsDir(repoPath string) (string, error) {
 // watcher can observe a newly added hop.
 func GetBeadsDirWithTrace(repoPath string) (string, []string, error) {
 	// Check BEADS_DB environment variable first (highest priority after --db flag)
-	if envDB := os.Getenv(BeadsDBEnvVar); envDB != "" {
+	if envDB := env.BeadsDB.Get(); envDB != "" {
 		return resolveBeadsDBWithTrace(envDB)
 	}
 
 	// Check BEADS_DIR environment variable
-	if envDir := os.Getenv(BeadsDirEnvVar); envDir != "" {
+	if envDir := env.BeadsDir.Get(); envDir != "" {
 		return resolveBeadsRedirect(envDir)
 	}
 
@@ -657,7 +658,7 @@ const maxLineSizeMB = 1024
 // and robot/datasource alike — must consult this so the documented variable
 // has one meaning.
 func MaxLineSizeFromEnv() int {
-	raw := strings.TrimSpace(os.Getenv(MaxLineSizeEnvVar))
+	raw := strings.TrimSpace(env.MaxLineSizeMB.Get())
 	if raw == "" {
 		return 0
 	}
@@ -1229,7 +1230,7 @@ func estimateIssueCap(size int64) int {
 func resolveWarnHandler(h func(string), warningCount *int) func(string) {
 	sink := h
 	if sink == nil {
-		if os.Getenv("BV_ROBOT") == "1" {
+		if env.Robot.Bool() {
 			sink = func(string) {}
 		} else {
 			sink = func(msg string) {

@@ -33,6 +33,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/Dicklesworthstone/beads_viewer/internal/datasource"
+	"github.com/Dicklesworthstone/beads_viewer/internal/docgen"
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/agents"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
@@ -1451,6 +1453,7 @@ func main() {
 	flag.CommandLine.SortFlags = false
 
 	cpuProfile := flag.String("cpu-profile", "", "Write CPU profile to file")
+	generateDocs := flag.Bool("generate-docs", false, "Generate documentation markdown and JSON artifacts")
 	dbPath := flag.String("db", "", "Path to beads database file or .beads directory (overrides BEADS_DB and BEADS_DIR env vars)")
 	versionFlag := flag.Bool("version", false, "Show version")
 	// Update flags (bv-182)
@@ -1729,6 +1732,23 @@ func main() {
 		NotReadyLabels:          robotNotReadyLabels,
 	})
 	rootCmd := newRootCommand(func() error {
+		if *generateDocs {
+			var sections []docgen.FlagSection
+			for _, s := range rootHelpSections {
+				sections = append(sections, docgen.FlagSection{
+					Title: s.title,
+					Match: s.match,
+				})
+			}
+			if err := docgen.Generate(docgen.GenerateOptions{
+				FlagSet:  flag.CommandLine,
+				Sections: sections,
+			}); err != nil {
+				return fmt.Errorf("generating docs: %w", err)
+			}
+			return nil
+		}
+
 		// Resolve and pin the color theme before anything renders, so every
 		// adaptive color — package-global styles, per-model renderers, and
 		// glamour markdown — agrees on light vs dark. Precedence:
@@ -1931,7 +1951,7 @@ func main() {
 		_ = labelScope
 		_ = agentBrief
 
-		envRobot := os.Getenv("BV_ROBOT") == "1"
+		envRobot := env.Robot.Bool()
 		stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
 
 		robotMode := envRobot ||
@@ -4270,7 +4290,7 @@ func main() {
 			_ = os.Setenv("BV_BACKGROUND_MODE", "1")
 		} else if *noBackgroundMode {
 			_ = os.Setenv("BV_BACKGROUND_MODE", "0")
-		} else if v, ok := os.LookupEnv("BV_BACKGROUND_MODE"); ok && strings.TrimSpace(v) != "" {
+		} else if v, ok := env.BackgroundMode.Lookup(); ok && strings.TrimSpace(v) != "" {
 			// Respect explicit user env var.
 		} else if enabled, ok := loadBackgroundModeFromUserConfig(); ok {
 			if enabled {
@@ -4358,7 +4378,7 @@ func runTUIProgram(m *ui.Model) error {
 	}()
 
 	// Optional auto-quit for automated tests: set BV_TUI_AUTOCLOSE_MS.
-	if v := os.Getenv("BV_TUI_AUTOCLOSE_MS"); v != "" {
+	if v := env.TUIAutocloseMS.Get(); v != "" {
 		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
 			go func() {
 				timer := time.NewTimer(time.Duration(ms) * time.Millisecond)
@@ -4436,7 +4456,7 @@ func effectiveThemePreference(flagVal string, flagSet bool, warnTo io.Writer) st
 		}
 		return "auto"
 	}
-	if v := canonicalTheme(os.Getenv("BV_THEME")); v != "" {
+	if v := canonicalTheme(env.Theme.Get()); v != "" {
 		return v
 	}
 	if raw, ok := loadThemeFromUserConfig(); ok {
@@ -5091,7 +5111,7 @@ func copyViewerAssets(outputDir, title string) error {
 // embedded assets of a released binary do not carry it, so the checkout must
 // be reachable from the working directory.
 func maybeBuildHybridWasmAssets(outputDir string) error {
-	if os.Getenv("BV_BUILD_HYBRID_WASM") == "" {
+	if env.BuildHybridWasm.Get() == "" {
 		return nil
 	}
 
@@ -6994,7 +7014,7 @@ func (e *toonRobotEncoder) Encode(v any) error {
 // Set BV_PRETTY_JSON=1 to enable pretty-printing for human readability.
 func newJSONRobotEncoder(w io.Writer) *json.Encoder {
 	encoder := json.NewEncoder(w)
-	if os.Getenv("BV_PRETTY_JSON") == "1" {
+	if env.PrettyJSON.Bool() {
 		encoder.SetIndent("", "  ")
 	}
 	return encoder
@@ -7014,7 +7034,7 @@ func newRobotEncoder(w io.Writer) robotEncoder {
 func resolveRobotOutputFormat(cli string) string {
 	format := strings.TrimSpace(cli)
 	if format == "" {
-		format = strings.TrimSpace(os.Getenv("BV_OUTPUT_FORMAT"))
+		format = strings.TrimSpace(env.OutputFormat.Get())
 	}
 	if format == "" {
 		format = strings.TrimSpace(os.Getenv("TOON_DEFAULT_FORMAT"))

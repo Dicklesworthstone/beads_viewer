@@ -17,6 +17,7 @@ import (
 
 	json "github.com/goccy/go-json"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/xfetch"
@@ -1294,7 +1295,7 @@ func (b graphStatsCacheBlob) toGraphStats() *GraphStats {
 }
 
 func robotDiskCacheEnabled() bool {
-	return os.Getenv("BV_ROBOT") == "1" && os.Getenv("BV_NO_CACHE") != "1"
+	return env.Robot.Bool() && !env.NoCache.Bool()
 }
 
 // beadsDirModTime returns the most recent modification time of the .beads/
@@ -1305,7 +1306,7 @@ func robotDiskCacheEnabled() bool {
 func beadsDirModTime() time.Time {
 	// Check BEADS_DB first, then BEADS_DIR, then cwd/.beads
 	beadsDir := ""
-	if dbPath := os.Getenv("BEADS_DB"); dbPath != "" {
+	if dbPath := env.BeadsDB.Get(); dbPath != "" {
 		info, err := os.Stat(dbPath)
 		if err == nil {
 			if !info.IsDir() {
@@ -1318,7 +1319,7 @@ func beadsDirModTime() time.Time {
 	}
 
 	if beadsDir == "" {
-		beadsDir = os.Getenv("BEADS_DIR")
+		beadsDir = env.BeadsDir.Get()
 		if beadsDir == "" {
 			cwd, err := os.Getwd()
 			if err != nil {
@@ -1387,7 +1388,7 @@ func beadsTreeModTime(beadsDir string) time.Time {
 // robotAnalysisDiskCacheDir resolves (and optionally creates) the directory
 // holding the per-entry cache files.
 func robotAnalysisDiskCacheDir(create bool) (string, error) {
-	base := os.Getenv("BV_CACHE_DIR")
+	base := env.CacheDir.Get()
 	if base == "" {
 		dir, err := os.UserCacheDir()
 		if err != nil {

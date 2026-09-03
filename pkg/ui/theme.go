@@ -6,6 +6,8 @@ import (
 
 	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // TermProfile holds the detected terminal color profile. Computed once at
@@ -27,7 +29,7 @@ func init() {
 	// This is useful when the terminal reports the wrong background color or
 	// when using themes that confuse auto-detection (e.g., Windows Terminal
 	// custom schemes, tmux, SSH). (bv-128)
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv("BV_THEME"))); v == "light" || v == "dark" {
+	if v := strings.ToLower(strings.TrimSpace(env.Theme.Get())); v == "light" || v == "dark" {
 		BVThemeOverride = v
 	}
 }

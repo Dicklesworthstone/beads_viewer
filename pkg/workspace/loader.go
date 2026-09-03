@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
@@ -451,7 +452,7 @@ func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[stri
 			if l.logger != nil {
 				l.logger.Printf("repository %q: %s", repo.GetName(), message)
 			}
-		} else if os.Getenv("BV_ROBOT") != "1" {
+		} else if !env.Robot.Bool() {
 			fmt.Fprintf(os.Stderr, "Warning: %s\n", message)
 		}
 	}

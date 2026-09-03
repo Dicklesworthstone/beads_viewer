@@ -20,6 +20,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	dbg "github.com/Dicklesworthstone/beads_viewer/pkg/debug"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
@@ -303,10 +304,10 @@ func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 		cfg.MaxRecoveries = 3
 	}
 
-	logLevel := parseWorkerLogLevel(os.Getenv("BV_WORKER_LOG_LEVEL"))
-	metricsEnabled := envBool("BV_WORKER_METRICS")
-	tracePath := strings.TrimSpace(os.Getenv("BV_WORKER_TRACE"))
-	logJSON := os.Getenv("BV_ROBOT") == "1"
+	logLevel := parseWorkerLogLevel(env.WorkerLogLevel.Get())
+	metricsEnabled := env.WorkerMetrics.Bool()
+	tracePath := strings.TrimSpace(env.WorkerTrace.Get())
+	logJSON := env.Robot.Bool()
 
 	idleGCConfig := IdleGCConfig{
 		Enabled:     true,
@@ -573,7 +574,7 @@ func (w *BackgroundWorker) Start() error {
 	})
 
 	// Avoid mutating global GC percent in tests (it can interfere with parallel test execution).
-	if os.Getenv("BV_TEST_MODE") != "" {
+	if env.TestMode.Get() != "" {
 		idleGCGCPercent = 0
 	}
 

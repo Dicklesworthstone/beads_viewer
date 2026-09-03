@@ -25,6 +25,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 var (
@@ -38,7 +40,7 @@ var (
 )
 
 func init() {
-	if os.Getenv("BV_DEBUG") != "" {
+	if env.Debug.Get() != "" {
 		enabled.Store(true)
 		logger = log.New(os.Stderr, "[BV_DEBUG] ", log.Ltime|log.Lmicroseconds)
 	}

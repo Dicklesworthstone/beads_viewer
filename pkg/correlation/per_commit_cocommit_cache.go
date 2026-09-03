@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	json "github.com/goccy/go-json"
 )
 
@@ -108,7 +109,7 @@ func perCommitCoCommitCacheNamespace() string {
 }
 
 func perCommitCoCommitCachePath(create bool) (string, error) {
-	base := os.Getenv("BV_CACHE_DIR")
+	base := env.CacheDir.Get()
 	if base == "" {
 		dir, err := os.UserCacheDir()
 		if err != nil {

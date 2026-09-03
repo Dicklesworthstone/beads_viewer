@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // NoGitignoreEnvVar disables all automatic ignore-file management when set to
@@ -36,7 +38,7 @@ const NoGitignoreEnvVar = "BV_NO_GITIGNORE"
 //
 // Returns nil on success, or an error if a file cannot be read/written.
 func EnsureBVIgnored(projectDir string) error {
-	if os.Getenv(NoGitignoreEnvVar) != "" {
+	if env.NoGitignore.Get() != "" {
 		return nil
 	}
 

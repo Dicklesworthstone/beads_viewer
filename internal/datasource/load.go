@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
@@ -100,7 +101,7 @@ type loadRecorder struct {
 }
 
 func newLoadRecorder(path string) *loadRecorder {
-	return &loadRecorder{path: path, robot: os.Getenv("BV_ROBOT") == "1"}
+	return &loadRecorder{path: path, robot: env.Robot.Bool()}
 }
 
 // options wires the parse to this recorder. Warnings are buffered rather than
@@ -254,7 +255,7 @@ func loadBDWorkspace(beadsDir string) ([]model.Issue, error) {
 // points at a concrete source file. Directory values return ok=false so callers
 // can use normal source discovery within that directory.
 func ExplicitBeadsDBSource() (DataSource, bool, error) {
-	return SourceFromFile(os.Getenv(loader.BeadsDBEnvVar))
+	return SourceFromFile(env.BeadsDB.Get())
 }
 
 // SourceFromFile returns a DataSource for a concrete source file path. Directory

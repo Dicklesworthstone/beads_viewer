@@ -8,13 +8,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/debug"
 )
 
 // savedConfigDisabled reports whether BV_NO_SAVED_CONFIG is set, in which case
 // bv neither reads nor writes anything under the user config directory.
 func savedConfigDisabled() bool {
-	return os.Getenv("BV_NO_SAVED_CONFIG") != ""
+	return env.NoSavedConfig.Get() != ""
 }
 
 // TutorialProgress tracks which tutorial pages have been viewed.

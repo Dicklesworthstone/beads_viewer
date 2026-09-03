@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -52,7 +53,7 @@ func ParseSprints(r io.Reader) ([]model.Sprint, error) {
 	warn := func(msg string) {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
 	}
-	if os.Getenv("BV_ROBOT") == "1" {
+	if env.Robot.Bool() {
 		warn = func(string) {}
 	}
 

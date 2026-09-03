@@ -16,6 +16,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // Package-level compiled regexes for Cloudflare operations (avoids recompilation per call)
@@ -566,7 +568,7 @@ func DeleteCloudflareProject(projectName string, confirm bool) error {
 // Set BV_NO_BROWSER=1 to suppress browser opening (useful for tests).
 func OpenCloudflareInBrowser(projectName string) error {
 	// Skip browser opening in test mode or when explicitly disabled
-	if os.Getenv("BV_NO_BROWSER") != "" || os.Getenv("BV_TEST_MODE") != "" {
+	if env.NoBrowser.Get() != "" || env.TestMode.Get() != "" {
 		return nil
 	}
 	if err := validateCloudflareProjectName(projectName); err != nil {
