@@ -1,6 +1,7 @@
 version: 2
 
 project_name: bv
+dist: /tmp/bv-dist
 builds:
   - main: ./cmd/bv
     binary: bv
