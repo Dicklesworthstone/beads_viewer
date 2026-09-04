@@ -1130,7 +1130,8 @@ Initial release of Beads Viewer -- a keyboard-driven terminal interface for the 
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.23.0...HEAD
+[v0.23.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.22.0...v0.23.0
 [v0.22.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.21.2...v0.22.0
 [v0.21.2]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.21.1...v0.21.2
 [v0.21.1]: https://github.com/Dicklesworthstone/beads_viewer/tree/v0.21.1
