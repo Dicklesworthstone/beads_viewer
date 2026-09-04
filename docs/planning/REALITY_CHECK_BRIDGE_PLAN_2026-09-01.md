@@ -1,5 +1,420 @@
 # Bridge Plan: beads_viewer (bv)
 
+## Current reality check — 2026-09-04
+
+This section supersedes the September 1 baseline and September 2–3 rescore below.
+Those records are retained as history, not as the current backlog or verdict.
+
+**Assessment baseline:** clean `main`, `a90029b8`; Go 1.25.5; 615 closed beads,
+zero open and zero in progress before this audit. The released `v0.23.0` tag is
+`0b770db4741f7993b16a6531f87183a9f392d6c4`; HEAD adds only the GoReleaser dist
+setting. This audit changes the plan and tracker, not production code.
+
+### Verdict and answers to the five reality-check questions
+
+1. **What works:** this is a substantial functioning product. Loading, graph
+   analysis, normal single-project triage/planning, hybrid keyword search,
+   history correlation, drift, sprint reporting, the TUI, and export generation
+   have real implementations and passing tests. It is not a collection of stubs.
+2. **What does not:** filters and readiness do not compose consistently across
+   robot commands. Empty labels widen to the whole project; search ignores label
+   and recipe scope; filtered plans can invent readiness. Workspace partial
+   loads disappear from robot diagnostics. Suggested mutation commands lack a
+   reliable connection to the live source repository and original issue ID.
+   Recipe presentation and export fields are still parsed without being applied.
+3. **Blockers:** the core design conflates the records needed to establish
+   dependency truth with the records selected for display. Source provenance is
+   mostly descriptive metadata rather than an input to action eligibility.
+   Existing tests often check JSON shape or excluded IDs, missing these semantic
+   counterexamples. Release evidence is not bound to the exact shipped bytes.
+4. **Would completing the existing open beads finish the vision?** No. There
+   were no open beads. Several closed tasks delivered narrower results than
+   their titles or acceptance criteria; zero remaining tasks did not mean zero
+   remaining work. The new tasks below cover the residuals identified here.
+5. **Which goals had no active coverage?** Every gap S1–S5, V1–V5 and P1–P5
+   below had `NO_BEAD` coverage at the baseline. Some have historical closed
+   predecessors; those are evidence of previous work, not active ownership.
+
+No percentage of product completion is inferred from issue counts. This is a
+comprehensive review of documented capabilities and their implementation paths,
+not a proof that every line, platform, browser, or external service is correct.
+
+### Documentation and scope ledger
+
+Read AGENTS.md (984 lines) and README.md (4,326 lines) completely before code
+assessment. The plan/spec corpus included both advanced-optimization proposals,
+performance rounds/results, opportunity matrix, agent-friendliness report, TOON
+brief, original project prompts/roadmap, this bridge plan, the complete history
+feature plan, labels feature plan, complementary-feature analysis, embedding
+design, accessor design, Go practices, performance/testing/release/provenance
+guides, the E2E guide and graph-WASM README. Historical benchmark/implementation
+logs and the changelog were used as supporting records, not new specifications.
+
+The original top-eight roadmap is substantially delivered: planning, recipes
+(partial), prioritization, time travel, exports/hooks, workspaces (partial),
+search (narrowed), and on-demand drift. Recorded decisions explicitly narrow
+learned semantic embeddings to hashed keyword vectors (`bv-9hti.3`), scheduling
+to heuristics (`bv-9hti.5`), and path correlation to the three implemented
+strategies. Historical agent registration, a query DSL, speculative label views,
+and abandoned performance proposals are not silently reinstated. These decisions
+do **not** prove the original ambitious features were implemented. Recipe fields
+marked “not yet applied” remain unfinished accepted functionality, not retired
+ideas. No statistical calibration is claimed for priority or ETA confidence.
+
+### Vision checklist and evidence
+
+`WORKING` means a real path with passing tests and relevant local execution;
+it is bounded by the evidence column. `PARTIAL` identifies a demonstrated hole.
+`UNPROVEN` identifies an unverified promise, not a demonstrated failure.
+
+| # | Testable goal and documentation source | Status | Implementation and verification / remaining gap |
+|---|---|---|---|
+| 1 | Read current br and legacy JSONL; README “Generating the JSONL File” | WORKING | `pkg/loader/loader.go`, `internal/datasource/load.go`; loader/datasource suites and fixture CLI runs pass |
+| 2 | Tolerate BOM/CRLF, large lines and malformed records; README troubleshooting | WORKING | loader robustness, BOM and parallel-differential tests; per-record losses are counted; authority consequence remains S4 |
+| 3 | Select only issue sources, support explicit DB, redirects and worktrees | WORKING | `source.go`, `sqlite.go`, loader redirect/git tests; selected source reported by normal robot commands; Windows runtime remains V5 |
+| 4 | Aggregate workspaces with namespaces and collisions checked | PARTIAL | `workspace/loader.go` rejects collisions; successful workspace E2E passes; missing repository becomes silent partial robot output (S4), commands use virtual IDs (S5) |
+| 5 | Immediate degree/topology/density, asynchronous expensive metrics | WORKING | `analysis/graph.go`, `config.go`; graph/status/race tests and `--robot-insights` |
+| 6 | PageRank, betweenness, HITS, eigenvector and critical path | WORKING | actual algorithms and graph goldens/invariance tests; size-tiered approximation/timeouts are material, not exactness guarantees |
+| 7 | Cycles, k-core, articulation points and slack | WORKING | `graph_cycles.go`, advanced insights tests; cycles are representative SCC cycles, not enumeration of every simple cycle |
+| 8 | Repeatable analysis with visible computation status | WORKING | config/status/cache tests and fixed-input contracts; wall-clock metrics and generated times are intentionally volatile |
+| 9 | Rank ordinary project work and explain recommendations | WORKING | `triage.go`, `priority.go`, context tests; synthetic chain correctly prioritizes `ops-1`; scoped cases S3 |
+| 10 | Safe ready queue, parallel tracks and unblock counts | PARTIAL | `plan.go` passes ordinary graph tests, but removing an external blocker promotes its dependent (S3); graph independence is not a file-lock guarantee |
+| 11 | `--robot-next` emits only justified next actions | PARTIAL | direct missing-blocker guard works; historical and workspace source/action routing remains S5 |
+| 12 | Feedback changes rankings and reset restores defaults | WORKING | `feedback.go`, `loadRobotFeedback`, `feedback_effect_test.go` and correlation feedback E2E pass |
+| 13 | All issue-backed robots share truthful source/scope metadata | PARTIAL | registry envelope exists; search bypasses it (S2), workspace completeness absent (S4) |
+| 14 | Label/repo/recipe scopes compose without widening | PARTIAL | empty-label fallthrough (S1), pre-filter search input (S2), lost dependency context (S3) reproduced |
+| 15 | Time-travel and diff compare intended snapshots | PARTIAL | `loader/git.go`, scoped diff E2E pass; live-history/sprint exceptions declared; historical mutation hints remain S5 |
+| 16 | Discoverable robot help, capabilities, schema and formats | WORKING | registry and schema/help tests; 37 read-only command variants return valid JSON; this does not prove every payload's semantics |
+| 17 | TOON available without universal savings claims | WORKING | CLI `toonRobotEncoder` and `toon-go`; E2E format tests pass; prior measured size tradeoff explicitly documented |
+| 18 | Recipe source precedence, filtering and metric sort | PARTIAL | shared `recipe.Apply`, source/precedence/secondary-sort tests; parent readiness and composition require S3 |
+| 19 | Recipe columns/grouping/metrics/initial presentation | PARTIAL | `Recipe.UnappliedFields` names ignored view fields; P3 completes them |
+| 20 | Recipe export format, graph inclusion and templates | PARTIAL | `ExportConfig` parsed, no export consumer; README example also malformed (P2/P4) |
+| 21 | Hashed text retrieval plus configurable graph ranking | WORKING | `hash_embedder.go`, scorer/index tests and text/hybrid CLI runs; this is not learned semantics; scoping S2 |
+| 22 | Useful search quality at scale | UNPROVEN | ranking mechanics tested; no judged relevance dataset establishes useful retrieval; P5 supplies keyword/hybrid evaluation without claiming learned semantics; performance P1 |
+| 23 | Git history with co-commit, explicit-ID and temporal evidence | WORKING | `Correlator.assembleReport` merges all three and applies feedback; correlation/E2E suites and history CLI pass |
+| 24 | Orphans, file relations, related issues and impact networks | WORKING | actual extractors/index/network code, package tests and fixture robot runs; confidence remains heuristic |
+| 25 | Sprint list/detail/burndown, scope changes and risk | WORKING | `analysis/sprint.go`, `ui/sprint_view.go`; sprint, burndown-scope and P-key tests pass; historical sprint limitation declared |
+| 26 | Forecast and capacity as documented heuristics | WORKING | `analysis/eta.go`, capacity handler/tests and CLI; explicit estimate formula wording needs P2; no scheduler/calibrated interval delivered |
+| 27 | Label health, cross-label flow and attention dashboards | WORKING | `label_health.go`, label/flow/attention views and tests, three robot commands pass; scope correctness S1/S3 |
+| 28 | Alerts, baseline comparison and suggestions | WORKING | drift/suggestion implementations and all-type emitter tests; CLI passes; suggestions are advisory |
+| 29 | Responsive list/detail, board/tree/graph/insights navigation | WORKING | `ui/model.go`, per-view code and keybinding tests; local UI/E2E suites pass; universal frame-rate assertion P1 |
+| 30 | Live reload, background snapshots and stale-result rejection | WORKING | `background_worker.go`, `snapshot.go`, generation fencing; focused UI race suite passes; 10k update+render proof P1 |
+| 31 | Tutorial, context help, sidebar and cass session search | WORKING | `tutorial.go`, `keybindings.go`, cass modal and integration tests; external cass availability remains environmental |
+| 32 | Markdown, Mermaid, SVG/PNG and standalone graph exports | WORKING | `pkg/export` renderers and full export/graph E2E pass; external-font prose drift P2 |
+| 33 | SQLite FTS5 dashboard bundle with all assets | WORKING | `sqlite_export.go`, embedded viewer and offline bundle tests pass; generation is proven, interactive browser behavior V4 |
+| 34 | Offline/mobile dashboard search, graph and persistence | UNPROVEN | bundle tests mostly inspect artifacts; headless smoke requires boot markers only; complete journeys, offline reload and mobile layout need V4 |
+| 35 | Hooks with failure propagation and browser opt-out | WORKING | executor timeout/error handling and env scrubbing, hooks/export/browser-gate tests pass; no desktop browser opened by this audit |
+| 36 | Verified updater and versioned release downloads | WORKING | SemVer/digest/checksum tests; published Linux archive SHA-256 matches GitHub metadata; native target coverage V5 |
+| 37 | Release binary corresponds to a fully checked source commit | PARTIAL | published binary embeds tag SHA plus `vcs.modified=true`; gate has no bound receipt, docs commit after gate (V1) |
+| 38 | Vendored assets correspond to reviewed source | PARTIAL | all 15 hashes pass; graph-WASM source correspondence explicitly still owed (V2); CSP unsafe-eval is a documented residual |
+| 39 | Supported Windows/macOS/Linux install and upgrade flows | UNPROVEN | five archives exist; Linux binary runs; PowerShell harness described as Linux-only; native acceptance matrix V5 |
+| 40 | One dependable local/remote release verification path | PARTIAL | full local tests pass, remote suite fails on environment isolation; CI/release workflows disabled (V1/V3) |
+| 41 | 10k+ browsing and “glitch-free, 60fps” experience | UNPROVEN | current 10k graph microbenchmarks are encouraging; no universal frame proof, existing “large” robot test uses 500 issues (P1) |
+| 42 | Reference docs and examples agree with running behavior | PARTIAL | generated tables/parity tests exist; malformed YAML, stale prose, JSON paths and release guidance remain (P2) |
+
+The current narrowed product therefore has real breadth, with concentrated
+integration and proof gaps. No observed core command is a placeholder. Keyword
+and structural stub scans found intentional unavailable embedding providers and
+ignored recipe options; passing scans did not prevent the behavioral failures.
+
+### Reproductions and verification ledger
+
+Raw local evidence is retained in `/tmp/bv-reality-20260904-jfGFtf`; it is an
+ephemeral audit aid. The fixture definitions and acceptance criteria below and
+in the beads are the durable reproduction record.
+
+- Full `go test ./...` passes locally in all 29 packages, including E2E
+  (97.717 s for that package). `go build ./...` and `go vet ./...` pass.
+- Focused `go test -race` passes for analysis, UI, workspace and datasource.
+  This is not a claim of a full release-gate race run.
+- The RCH full suite fails in loader, UI and E2E. Loader/workspace tests discover
+  the enclosing repository because RCH places TMPDIR inside its source checkout;
+  editor tests and ASCII goldens depend on available tools/color environment.
+  Local passes narrow the diagnosis to portability/isolation (V3), not general
+  product failure. Remote benchmark execution succeeds.
+- `gofmt -l .` reports vendored dependency files. `gofmt -l cmd pkg internal
+  tests` returns no first-party files; no third-party source was reformatted.
+- Vendor verification: 15 entries, zero mismatches. Action pins: 23 references
+  across eight files, zero unpinned references.
+- 37 read-only robot variants on the six-issue synthetic Git repository exit
+  zero and parse as JSON. **Valid JSON is insufficient:** the cases below all
+  return successful, plausible, wrong or incomplete answers.
+- Fixture: `api-1` (backend) depends on `web-1` (frontend), which depends on
+  `ops-1` (ops). `web-9` is independent/frontend; `api-closed` is closed;
+  `api-defer` is deferred. All titles contain “Authentication”; priority 1,
+  type task, created 2026-08-01, updated 2026-08-02. Dependencies use `blocks`.
+  Ordinary plan correctly selects `ops-1` and `web-9`.
+- `--robot-plan --label absent-label` returns those same two actionable items
+  while asserting `scope.label=absent-label`. `--repo api` instead promotes the
+  blocked `api-1`; `--label backend` promotes blocked contextual `web-1`.
+  `--robot-triage --repo api` also marks `api-1` claimable. `--robot-next` catches
+  the missing direct blockers and emits no claim for these latter two cases.
+- `--search Authentication --robot-search --label backend` and the same search
+  with `--recipe actionable` both return all six records. The latter includes
+  closed and deferred issues. Search output lacks source/scope fields.
+- A workspace with readable `api/.beads/issues.jsonl` (local ID `safe`) and an
+  enabled nonexistent `missing/` repository succeeds silently. `--robot-next`
+  reports `actionable:true`, ID `api-safe`, and `br update api-safe
+  --status=in_progress`; it reports neither the failed repo nor the original
+  local ID/working directory. `--as-of HEAD --robot-next` also emits a live
+  mutation command from historical input. No suggested mutation was executed.
+- GitHub API checked on 2026-09-04: release `v0.23.0`, five platform archives
+  plus checksums. Linux amd64 archive digest is
+  `eb8bd29259846159104e531c90a0a0f80559a297e5cba3ad03213d7fe549da56`.
+  The downloaded binary reproduces the search and empty-label failures and
+  reports `vcs.modified=true`. This does not identify what was dirty and is not
+  evidence of malicious alteration. Seven workflows are `disabled_manually`;
+  only Copilot review is active. Sources: [release](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.23.0),
+  [workflow API](https://api.github.com/repos/Dicklesworthstone/beads_viewer/actions/workflows).
+- Three rounds of three iterations on the RCH worker (16 Go CPUs) measured
+  10k-node graph rebuild at 8.23–14.37 ms/op and graph View at 5.05–9.47 ms/op.
+  Real-data fixture (614 issues) full analysis was 27.23–30.66 ms/op;
+  full triage 0.98–3.21 ms/op; graph construction 0.674–0.793 ms/op.
+  These microbenchmarks are neither cold CLI latency nor p99 input-to-paint
+  latency, and are not comparable as regressions to the older different host.
+- Not executed: full release gate, destructive cleanup scripts, production
+  deployment, native Windows/macOS installation, or browser journeys. Existing
+  E2E tests verify export generation. No missing check is counted as passed.
+
+### Phase 2 — bridge plan and initial coverage
+
+Priority P1 means correctness/release trust; P2 means completion/proof/usability.
+Every implementation task gets a companion test task with negative controls and
+diagnostic output. Existing files are extended; no alternative implementations,
+compatibility layers, or new process framework is proposed.
+
+| Gap | Priority | Required change and finish condition | Existing closed predecessor |
+|---|---|---|---|
+| S1 Empty label widens scope | P1 | Empty intersection stays empty, every robot reports requested scope, never substitutes all issues; test absent/case/combined filters | `bv-3n9s.2` |
+| S2 Search ignores filters/envelope | P1 | Select candidates after scope, preserve dependency context for metric ranking, use dispatch envelope; text/hybrid/cache/limit/empty-set matrix | `bv-3n9s.1`, `.2` |
+| S3 Filtered graph invents readiness | P1 | Separate full dependency authority from selected result IDs; shared ready/blocked/claimable rules across plan/triage/next/recipe/TUI, including parent chains and unknown blockers | `bv-3n9s.2`, `bv-9hti.1` |
+| S4 Partial source reported as complete | P1 | Carry per-source success/drop/staleness diagnostics and aggregate completeness into every issue-backed payload; incomplete authority cannot emit proven claims | `bv-9hti.2`, loader/workspace hardening |
+| S5 Commands lack live source identity | P1 | Preserve original ID and repository path; suppress mutation hints for historical/ambiguous/read-only snapshots, route valid workspace actions correctly | `bv-3n9s.9`, `.10` |
+| V1 Release proof not bound to artifact | P1 | Produce/consume an exact-source gate receipt; skipped gates cannot authorize release; build clean artifact and verify embedded revision/digests; correct release ordering and manifest/SBOM claims | `bv-kaxg.1`, `.7` |
+| V2 Graph-WASM source correspondence | P1 | Pin the whole build pipeline, rebuild/review and atomically pair glue+WASM+manifest, compare in release verification; mismatch must fail | `bv-huf5.4` |
+| V3 RCH test isolation | P2 | Isolate temp discovery roots, fake GUI editor lookup, pin golden color rendering; local/remote standard suites agree without hiding failures | `bv-kaxg.3` |
+| V4 Browser/offline/mobile proof | P2 | Drive real dashboard search, detail, graph, charts, Mermaid, refresh/offline reload and narrow layout; retain console/network evidence and clear CSP residual policy | `bv-huf5.5`, `bv-9hti.4` |
+| V5 Native installation proof | P2 | Verify released install/update/capabilities on Windows and macOS plus Linux; verify actual Homebrew/Scoop versions and native path behavior; unsupported runs remain explicit | `bv-huf5.1`, `.2`, `.3` |
+| P1 Performance claim acceptance | P2 | Reproducible 1k/5k/10k cold/warm CLI and update+render workloads, p50/p95/p99/RSS/GC/status; qualify 60fps claim to measured conditions, profile only measured misses | `bv-fx5t.5`, `bv-kaxg.6` |
+| P2 Executable documentation examples | P2 | Correct YAML, jq paths, recipe key, external-font/CI/release prose and explicit-estimate formula; test meaningful example results, not substrings alone | `bv-fx5t.1`, `.2`, `.3`, `.4` |
+| P3 Recipe view fields | P2 | Honor columns/show_graph/show_metrics/group_by/collapsed/truncate_title/metrics consistently with max_items and keyboard focus; actionable errors for invalid fields | `bv-9hti.1` |
+| P4 Recipe export fields | P2 | Honor format/include_graph/template through existing export dispatch with explicit CLI precedence; deterministic escaped output, template errors, no incidental export from recipe selection | `bv-9hti.1` |
+| P5 Judged search relevance | P2 | Independently specified query intents/relevant IDs, per-query recall/nDCG and exact-ID checks, distractors at 5k/10k; ranking mechanics and timing alone are insufficient | `bv-9hti.3`; added during refinement 3 |
+
+Implementation order: establish S3's shared scope/readiness contract, carry S4's
+authority, then enable S5 actions; S1 can land independently. Search uses that
+same context. Recipe view/export completion follows the shared recipe contract.
+Release/provenance, environment isolation, browser/native proof and measured
+performance can proceed independently. P2 finishes after behavioral contracts
+settle. Final integration rechecks all gaps and cannot close with an unowned
+residual. Exact task IDs, ambition changes and refinement results follow below.
+
+### Workflow execution record
+
+Phase 1, the initial Phase 2 plan and initial Phase 3a creation are complete.
+Initial creation produced three epics and 28 implementation/proof tasks using
+`br` exclusively. Phase 3a uses this frozen
+template verbatim, before and after the ambition rounds:
+
+```text
+OK so please take ALL of that and elaborate on it and use it to create a comprehensive and granular
+set of beads for all this with tasks, subtasks, and dependency structure overlaid, with detailed
+comments so that the whole thing is totally self-contained and self-documenting (including relevant
+background, reasoning/justification, considerations, etc.-- anything we'd want our "future self" to
+know about the goals and intentions and thought process and how it serves the over-arching goals of
+the project.) The beads should be so detailed that we never need to consult back to the original
+markdown plan document. Remember to ONLY use the `br` tool to create and modify the beads and add
+the dependencies.
+```
+
+Phase 5 uses the following frozen template verbatim on each pass:
+
+```text
+Check over each bead super carefully-- are you sure it makes sense? Is it optimal? Could we change
+anything to make the system work better for users? If so, revise the beads. It's a lot easier and
+faster to operate in "plan space" before we start implementing these things! DO NOT OVERSIMPLIFY
+THINGS! DO NOT LOSE ANY FEATURES OR FUNCTIONALITY! Also make sure that as part of the beads we
+include comprehensive unit tests and e2e test scripts with great, detailed logging so we can be
+sure that everything is working perfectly after implementation. Make sure to ONLY use the `br` cli
+tool for all changes, and you can and should also use the `bv` tool to help diagnose potential
+problems with the beads.
+```
+
+### Ambition round 1 — one consistent meaning of actionable
+
+The first plan fixed individual dispatch paths but still allowed each subsystem
+to reinterpret missing context. Revise S2–S5 around one immutable loaded input:
+authoritative records, selected IDs, display-context IDs, origin identities,
+source completeness, and analysis clock. Reuse the current loader/model/context
+types; the shape is a design boundary, not a demand for a new framework.
+
+Use a three-state dependency result: satisfied, unsatisfied, unknown. Missing
+required records and truncated parent traversal are unknown, not satisfied.
+Keep independent facts separate: ready by dependency, open/unassigned and
+nondeferred, eligible under requested scope, source complete, live route known,
+and ranking metrics sufficient. One failed fact must not be obscured by a high
+centrality score. Exploratory reports remain available with reasons.
+
+The key invariant is **filtering cannot make previously blocked work ready**:
+for a fixed authoritative snapshot and clock, scoped-ready IDs are a subset of
+globally-ready IDs intersected with selected IDs. Display-only context may be
+outside that intersection; its presence must not expand action candidates.
+This gives a compact, independently testable oracle across all robot surfaces
+and the TUI. It also prevents “fixes” that merely add another guard to next.
+
+S5 must distinguish a recommendation from a reservation: emit a properly routed
+atomic `br update <local-id> --claim` suggestion where supported, and require the
+tracker to revalidate when the command is run. A snapshot cannot guarantee that
+another agent has not claimed the issue meanwhile. Historical exploration never
+silently becomes live mutation authority. Search must apply eligibility before
+top-k truncation, with stable ties and no alternating-scope cache contamination.
+
+### Ambition round 2 — evidence follows the release
+
+The first version treated the release gate, native tests, browser tests and WASM
+checks as separate proofs. V1 now composes them using the existing gate and one
+receipt, rather than adding another dashboard or issue-status service. A receipt
+records pass/fail/skipped distinctly; a diagnostic run can succeed for developer
+use while still being ineligible to establish a releasable build.
+
+Avoid a provenance cycle: commit source/version/docs first; write receipts and
+build output outside the source tree; bind the gate to the source/tree and
+toolchain; bind packaged bytes to that receipt afterward. Do not require an
+archive's checksum to appear inside the archive being hashed. Reject stale
+receipts and unaccounted build inputs. The published receipt identifies which
+platform/browser/WASM checks actually ran. Missing required evidence remains an
+open result, even if the ordinary Go suite is green.
+
+Retain a positive and a negative control for each proof: a valid build installs,
+a tampered one fails; a dashboard works offline after priming, a deliberately
+missing required asset fails; a graph-WASM pipeline reproduces, a changed tool
+or glue artifact fails. Native package-store checks establish the version a new
+user receives, not just the version in a release tag. No task enables workflows,
+publishes a release, or changes a package store implicitly.
+
+The final integration task will depend on every companion proof, inspect the
+actual issue states without force-closing blocked tasks, and rescore this
+checklist. The prior closing bead `bv-kaxg.7` explicitly used `--force` while
+dependencies remained open; its narrower recorded result was not full original
+acceptance. The new finish condition forbids repeating that substitution.
+
+### Ambition round 3 — stronger guarantees without speculative machinery
+
+The useful mathematical improvement is an independent readiness oracle and
+metamorphic properties, not a new ranking model. S3's tests now cover monotonic
+scope restriction, permutation invariance, cycle-safe parent traversal, and
+equivalence between a full result projected onto selected IDs and the scoped
+result. Different edge types must retain their established semantics. Build
+forward/reverse adjacency once per authoritative snapshot, avoiding repeated
+whole-graph scans as labels and recipes change. Unknown dependencies preserve a
+reason and do not force loss of all useful exploratory metrics.
+
+P1 measures quality and latency together: matching result IDs/order and metric
+states, stable source/configuration, and bounded allocations during refresh.
+Use same-host alternating baseline/current cohorts; report distributions and
+sample counts, not the minimum as a universal user guarantee. Cold and warm data
+are separate. An inconclusive noisy comparison should say so and rerun under
+controlled conditions, rather than relax the threshold or count timed-out work
+as an optimization. Profile a demonstrated miss before changing algorithms.
+
+P3/P4 need a single resolved recipe configuration with explicit ownership and
+precedence: project/user/builtin source precedence, then explicit CLI options,
+then user interaction. A reload must not restore stale collapsed/group state or
+replace an intentional user selection. Recipe/source/weight/clock identity must
+invalidate derived caches when it affects results. Templates remain data, never
+code execution. Export graph context must retain dependencies without leaking
+excluded records into the selected issue body. These lifecycle details make the
+completed fields coherent across TUI, search and export.
+
+All three rounds revise this same plan. Phase 3a is now reapplied to synchronize
+the added invariants, proof requirements and lifecycle details into the same
+beads; no production implementation has been substituted for planning.
+
+### Final bead map
+
+All descriptions include background, reproduction, implementation boundaries,
+tests and failure logging. Design, acceptance and refinement notes carry the
+additional invariants; no implementation depends on access to the temporary
+audit directory. All beads were created or revised through `br` only.
+
+| Gap | Implementation | Companion proof |
+|---|---|---|
+| S1 | `bv-xbvo.1` | `bv-xbvo.2` |
+| S2 | `bv-xbvo.3` | `bv-xbvo.4` |
+| S3 | `bv-xbvo.5` | `bv-xbvo.6` |
+| S4 | `bv-xbvo.7` | `bv-xbvo.8` |
+| S5 | `bv-xbvo.9` | `bv-xbvo.10` |
+| V1 | `bv-oonu.1` | `bv-oonu.2` |
+| V2 | `bv-oonu.3` | `bv-oonu.4` |
+| V3 | `bv-oonu.5` | `bv-oonu.6` |
+| V4 | `bv-oonu.7` | `bv-oonu.8` |
+| V5 | `bv-oonu.9` | `bv-oonu.10` |
+| P1 | `bv-apal.1` | `bv-apal.2` |
+| P2 | `bv-apal.3` | `bv-apal.4` |
+| P3 | `bv-apal.5` | `bv-apal.6` |
+| P4 | `bv-apal.7` | `bv-apal.8` |
+| P5 | `bv-apal.9` | `bv-apal.10` |
+
+Epics: `bv-xbvo` (scope/actions), `bv-oonu` (release/runtime proof), `bv-apal`
+(product completion). Final integration: `bv-oonu.11`, blocked on every proof.
+
+Proof tasks depend on their implementations. S2 and S4 consume S3's proven
+contract; S5 consumes S3/S4; P3 consumes S3 and P4 consumes P3; P5 consumes S2.
+P2 waits for the relevant implementation and evidence results before finalizing
+claims. The final integration task consumes all 15 proof tasks. Parent-child
+edges express ownership, not a cycle of child completion blocking its parent
+which in turn blocks the child. Estimates are rough effort, not calendar or
+native-runner availability commitments.
+
+### Phase 5 — five refinement passes
+
+Each pass applied the unchanged frozen template above to every current bead,
+including scope preservation, implementability, tests, logging and dependencies.
+
+| Pass | Findings and actual revisions |
+|---|---|
+| 1 | Separated S1 registry coverage from S2 search coverage so an independent small fix did not inherit an unrelated failing test; clarified all proof titles, epic ownership and final acceptance. |
+| 2 | Replaced generic acceptance on all 28 initial child tasks with gap-specific observable assertions. Proof tasks independently verify outcomes instead of implicitly requiring a companion to themselves. |
+| 3 | Found uncovered relevance-quality proof in vision row 22. Added P5 and its companion, extended final verification, and made P2 wait for performance/relevance/release/native/browser evidence. |
+| 4 | Compared every task against actual `bv`/`br` graph output. Clarified dependency-ready versus claimable sets, bounded source diagnostics, hash/cache identity, concurrent action revalidation, receipt trust limits and P1/P5 ownership. Updated final instructions to 15 pairs. |
+| 5 | Rechecked all 34 beads: complete descriptions and acceptance, no dangling dependencies, proof-to-implementation links, all 15 proofs blocking final acceptance, DB/export consistency, useful negative controls and existing-feature preservation. No further substantive revision found. |
+
+### Final validation and next work
+
+- **649 total beads: 615 previously closed, 34 new open, none in progress.**
+  No historical bead was reopened or marked newly verified merely by this audit.
+- **79 new dependency edges**, of which 48 are blocking and 31 parent-child.
+  `br dep cycles --json` reports zero cycles. `bv --robot-insights` reports
+  `Cycles: []` with cycle computation completed.
+- **Eight ready implementation tasks** from `br ready`: `bv-xbvo.1`,
+  `bv-xbvo.5`, `bv-oonu.1`, `bv-oonu.3`, `bv-oonu.5`, `bv-oonu.7`,
+  `bv-oonu.9`, `bv-apal.1`. Native/browser/toolchain work still requires its
+  specified environment; graph readiness is not proof that a runner is present.
+- `bv --robot-triage` ranks **`bv-xbvo.5` (S3)** first, then the empty-label fix
+  and release receipt work. That agrees with the causal analysis above.
+- `bv --robot-plan` counts 11 dependency-ready records including the three
+  epics, while `br ready` lists eight executable tasks. The final verification
+  dependency joins these goals into one graph component, so the single returned
+  track does not mean there is only one independent task. S3/P2 explicitly
+  preserve this distinction rather than asserting identical command lists.
+- `br sync --flush-only` verifies tracker export; `git diff --check` is clean.
+  Only this existing plan and `.beads/issues.jsonl` are changed in Git. No
+  production fix, release, push, deployment, file deletion or user-project
+  claim was performed.
+
+The **assessment and planning workflow is complete**: documentation-first
+vision extraction, code/runtime/release evidence, gap analysis, bridge plan,
+initial beads, three ambition rounds, bead synchronization, five refinement
+passes with a no-change final pass, and graph validation. **The delivery work
+is still open.** Completing the 15 implementation/proof pairs and final
+integration would close the residuals identified for the current documented
+scope; it would not implement the explicitly narrowed learned-embedding or
+scheduling aspirations, nor prove the absence of undiscovered defects.
+
+---
+
+## Historical baseline — 2026-09-01 (superseded above)
+
 **Reality check date:** 2026-09-01
 **Baseline:** main @ 03f92509, v0.22.0 + 39 commits, 541/541 beads closed, 0 open
 **Gap count:** 5 critical, 16 major, 18 minor (39 gaps; 0 had bead coverage when found)
@@ -650,4 +1065,3 @@ Re-scored against the tree at the end of the 2026-09-02 execution session, after
 | 39 beads for everything | DONE | 70 beads; 56 closed |
 
 Still open after 2026-09-03: F1 (table generation, a maintainer call recorded on the bead), G3 (the WASM hash comparison needs a local cargo build), G4 (Alpine CSP build so `'unsafe-eval'` can go), and the two epics that contain them. Epics A, B, C, D, E, H, I are closed; 65 of 70 beads are closed (the five open ones are F1, G3, G4, and their two epics). GitHub issues #195 and #197 were not closed from this session: that is an outward-facing action left to the maintainer, with the landing commits listed in `CHANGELOG.md` under "Reality check 2026-09".
-
