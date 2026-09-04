@@ -9,6 +9,7 @@ retained below.
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
+| [`v0.23.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.23.0) | 2026-09-04 | GitHub Release | Reality Check hardening sweep, 10-stage release gate, proactive drift alerts, typed env registry, docgen, and full tracker completion. |
 | [`v0.22.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.22.0) | 2026-08-25 | GitHub Release | Makes snapshot delivery pointer-based and incrementally rebuilds safe list changes, with measured UI latency and allocation reductions. |
 | [`v0.21.2`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.21.2) | 2026-08-24 | GitHub Release | Publishes the 50-pass performance campaign, verified binaries, checksums, SBOM, and corrected Nix guidance. |
 | [`v0.21.1`](https://github.com/Dicklesworthstone/beads_viewer/tree/v0.21.1) | 2026-08-24 | Tag only | Staged the performance and license work; superseded before binary publication. |
@@ -17,6 +18,10 @@ retained below.
 ---
 
 ## [Unreleased]
+
+---
+
+## [v0.23.0] -- 2026-09-04 (Release)
 
 ### Reality check 2026-09 (bridge plan `docs/planning/REALITY_CHECK_BRIDGE_PLAN_2026-09-01.md`)
 
@@ -39,6 +44,9 @@ retained below.
 - **Graph WASM rebuild (#197 finding 8):** `scripts/build_graph_wasm.sh` pins the rebuild without `wasm-pack` (cargo for `wasm32-unknown-unknown`, a `wasm-bindgen` CLI that must match the crate version in `Cargo.lock`, `wasm-opt -Os`) and prints built and vendored hashes with tool versions; `docs/PROVENANCE.md` records that the comparison is still owed and why.
 - **Agent blurb v5:** the ready-made AGENTS.md block now says that `--graph-format=dot|mermaid` returns the diagram text in the `graph` field of the JSON envelope. The version marker moved from v4 to v5 so `bv --agents-update` refreshes installed blocks (`--agents-add` compares versions, not content); this repository's AGENTS.md and the README copy were regenerated with the tool.
 - **Decisions recorded:** no path-matching correlation strategy (README diagram and prose agree); downgrade priority recommendations are not alerts; `cycle_introduced` is documented as `new_cycle`.
+- **Environment registry (`internal/env`):** Centralizes all 41 `BV_*` and `BEADS_*` environment variables in a single package with typed accessors (`BV_NO_COLOR`, `BV_TEST_MODE`, `BV_LOG_FORMAT`, `BV_SEARCH_MODE`, etc.) and an AST-walking vet test guaranteeing zero raw `os.Getenv` / `os.LookupEnv` calls in production code.
+- **Documentation generator (`internal/docgen`):** Emits living reference documentation (`docs/generated/{flags,env,alerts,recipes,presets,keys,sort_modes}.md` and `constants.json`) and synchronizes tables into `README.md` via `go generate` / `bv --generate-docs`.
+- **Milestone completion:** All 615 tracking beads and epics closed (100% completion across graph analysis, drift detection, TUI, search, correlation, and the 10-stage release gate).
 - **Tracker recovery (2026-09-02):** `.beads/beads.db` was at schema 0 and rejected by br 0.5.7 (`SCHEMA_MISMATCH expected 17, found 0`); the JSONL was harmonized (empty-string fields dropped, dependency `metadata` / `thread_id` added), a fresh DB was rebuilt from it and promoted, and the old DB was renamed aside (`beads.db.bad_20260902T030027Z`) rather than deleted. With the maintainer's written approval later that day the renamed DB/WAL/SHM and the two rebuild `*.fsqlite-migration-state` markers were removed; the `recovery_20260902T023914Z/` snapshot (git-ignored) is the one leftover, kept for a recursive removal from the maintainer's own shell.
 
 ### Fixed
