@@ -668,6 +668,12 @@ function buildWasmGraph() {
     }
 }
 
+// Keep the viewer's metric names separate from wasm-bindgen's serialized fields.
+export function computeHITSMetrics(wasmGraph) {
+    const result = wasmGraph.hitsDefault();
+    return { hub: result.hubs, authority: result.authorities };
+}
+
 function computeMetrics() {
     if (!store.wasmReady || !store.wasmGraph) return;
 
@@ -696,13 +702,7 @@ function computeMetrics() {
 
         // HITS (hub and authority scores)
         try {
-            const hitsResult = store.wasmGraph.hitsDefault();
-            if (hitsResult) {
-                store.metrics.hits = {
-                    hub: hitsResult.hub,
-                    authority: hitsResult.authority
-                };
-            }
+            store.metrics.hits = computeHITSMetrics(store.wasmGraph);
         } catch (e) {
             console.warn('[bv-graph] HITS computation skipped:', e);
         }

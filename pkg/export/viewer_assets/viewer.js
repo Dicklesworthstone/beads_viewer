@@ -190,6 +190,7 @@ const DB_STATE = {
   db: null,           // Database instance
   cacheKey: null,     // OPFS cache key (hash)
   source: 'unknown',  // 'network' | 'cache' | 'chunks'
+  fts5: null,         // Actual browser SQLite capability, not exported schema.
 };
 
 // Graph engine state (WASM)
@@ -767,10 +768,16 @@ async function initGraphEngine() {
       return false;
     }
 
+    // Isolated issues participate in metrics too. Edges alone omit them.
+    for (const row of execQuery('SELECT id FROM issues ORDER BY id')) {
+      GRAPH_STATE.nodeMap.set(row.id, GRAPH_STATE.graph.addNode(row.id));
+    }
+
     const deps = execQuery(`
       SELECT issue_id, depends_on_id
       FROM dependencies
       WHERE type = 'blocks'
+      ORDER BY issue_id, depends_on_id
     `);
 
     for (const row of deps) {
@@ -797,7 +804,7 @@ async function initGraphEngine() {
     const nodeCount = GRAPH_STATE.graph.nodeCount();
     const edgeCount = GRAPH_STATE.graph.edgeCount();
     if (nodeCount === 0) {
-      console.log('[Graph] WASM engine ready (no dependencies in project - metrics will use pre-computed data)');
+      console.log('[Graph] WASM engine ready (empty project)');
     } else {
       console.log(`[Graph] WASM engine loaded: ${nodeCount} nodes, ${edgeCount} edges`);
     }
@@ -1254,6 +1261,13 @@ function adjustHybridWeightsForQuery(baseWeights, term) {
   };
 }
 
+function supportsFTS5() {
+  if (DB_STATE.fts5 === null) {
+    DB_STATE.fts5 = execQuery('PRAGMA module_list').some(row => row.name === 'fts5');
+  }
+  return DB_STATE.fts5;
+}
+
 function searchIssues(term, options = {}) {
   const {
     mode = 'text',
@@ -1292,10 +1306,16 @@ function searchIssues(term, options = {}) {
   queryParams.push(fetchLimit, fetchOffset);
 
   let rows = [];
-  try {
-    rows = execQuery(sql, queryParams);
-  } catch {
-    return queryIssues({ ...searchFilters, search: term }, 'score', limit, offset);
+  if (supportsFTS5()) {
+    try {
+      rows = execQuery(sql, queryParams);
+    } catch {
+      // Invalid FTS syntax can still use plain substring matching. Continue
+      // through the same hybrid scorer instead of silently losing ranking.
+      rows = queryIssues({ ...searchFilters, search: term }, 'score', fetchLimit, fetchOffset);
+    }
+  } else {
+    rows = queryIssues({ ...searchFilters, search: term }, 'score', fetchLimit, fetchOffset);
   }
   if (isLikelyIssueID(term)) {
     rows = promoteExactID(term, rows);
@@ -1341,6 +1361,7 @@ function searchIssues(term, options = {}) {
 function countSearchIssues(term, filters = {}) {
   const searchFilters = { ...filters };
   delete searchFilters.search;
+  if (!supportsFTS5()) return countIssues({ ...searchFilters, search: term });
   const { clauses, params } = buildFilterClauses(searchFilters, 'i');
 
   let sql = `
@@ -2352,6 +2373,7 @@ function beadsApp() {
     stats: {},
     meta: {},
     dbSource: 'loading',
+    searchBackend: '',
 
     // Issues list
     issues: [],
@@ -2396,6 +2418,7 @@ function beadsApp() {
 
     // Selected issue
     selectedIssue: null,
+    copyLinkMessage: '',
     showDepGraph: false,
     issueNavList: [], // List of issue IDs for j/k navigation
     showKeyboardHelp: false, // Keyboard shortcuts help modal
@@ -2625,6 +2648,7 @@ function beadsApp() {
         }
 
         this.dbSource = DB_STATE.source;
+        this.searchBackend = supportsFTS5() ? 'FTS5' : 'substring';
         this.loadingMessage = 'Loading data...';
 
         // Load initial data
@@ -2726,10 +2750,24 @@ function beadsApp() {
       }
     },
 
+    async copyIssueLink() {
+      this.copyLinkMessage = '';
+      if (!this.selectedIssue) return;
+      const url = new URL(window.location.href);
+      url.hash = '#/issue/' + encodeURIComponent(this.selectedIssue.id);
+      try {
+        await navigator.clipboard.writeText(url.href);
+        this.copyLinkMessage = 'Link copied';
+      } catch (err) {
+        this.copyLinkMessage = 'Could not copy. Select the issue link to copy it manually.';
+      }
+    },
+
     /**
      * Handle hash change (browser back/forward navigation)
      */
     handleHashChange() {
+      this.copyLinkMessage = '';
       const urlState = filtersFromURL();
       const hash = window.location.hash;
 

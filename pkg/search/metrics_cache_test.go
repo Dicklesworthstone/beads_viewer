@@ -9,7 +9,47 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 )
+
+func TestAnalyzerMetricsLoader_ImmutableHashHasNoPerLookupAllocation(t *testing.T) {
+	issues, err := testutil.PerformanceIssues("realistic", 1000, 20260904)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loader := NewAnalyzerMetricsLoader(issues)
+	want := analysis.ComputeDataHash(issues)
+	if got, err := loader.ComputeDataHash(); err != nil || got != want {
+		t.Fatalf("snapshot hash=%q want=%q error=%v", got, want, err)
+	}
+	// A warm lookup of an immutable snapshot must not rebuild O(N) issue
+	// fingerprints. The real loader used to allocate ~80k objects per lookup.
+	allocations := testing.AllocsPerRun(3, func() {
+		if got, err := loader.ComputeDataHash(); err != nil || got != want {
+			t.Fatalf("warm snapshot hash=%q want=%q error=%v", got, want, err)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("immutable snapshot lookup allocated %.0f objects; want 0", allocations)
+	}
+	issues[0].Title += " changed source"
+	changed := NewAnalyzerMetricsLoader(issues)
+	newHash, err := changed.ComputeDataHash()
+	if err != nil || newHash == want {
+		t.Fatalf("new snapshot must identify changed source: hash=%q error=%v", newHash, err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if got, err := loader.ComputeDataHash(); err != nil || got != want {
+				t.Errorf("concurrent original snapshot hash=%q want=%q error=%v", got, want, err)
+			}
+		}()
+	}
+	wg.Wait()
+}
 
 type stubMetricsLoader struct {
 	metrics   map[string]IssueMetrics

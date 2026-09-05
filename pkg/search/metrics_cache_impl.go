@@ -36,6 +36,12 @@ type AnalyzerMetricsLoader struct {
 	issues []model.Issue
 	cache  *analysis.Cache
 	config *analysis.AnalysisConfig
+
+	// issues is a private deep clone and never changes after construction.
+	// Hash it once, including for a zero-value/empty loader. Mutable loader
+	// implementations still recompute their hash through ensureFresh.
+	hashOnce sync.Once
+	dataHash string
 }
 
 // NewAnalyzerMetricsLoader creates a loader that derives metrics from issues.
@@ -92,7 +98,14 @@ func (l *AnalyzerMetricsLoader) LoadMetrics() (map[string]IssueMetrics, error) {
 
 // ComputeDataHash returns the data hash for the loader's issue set.
 func (l *AnalyzerMetricsLoader) ComputeDataHash() (string, error) {
-	return analysis.ComputeDataHash(l.issues), nil
+	return l.snapshotHash(), nil
+}
+
+func (l *AnalyzerMetricsLoader) snapshotHash() string {
+	l.hashOnce.Do(func() {
+		l.dataHash = analysis.ComputeDataHash(l.issues)
+	})
+	return l.dataHash
 }
 
 // LoadMetricsWithHash computes metrics and hash atomically from the same issue set.
@@ -100,7 +113,7 @@ func (l *AnalyzerMetricsLoader) ComputeDataHash() (string, error) {
 // between separate LoadMetrics and ComputeDataHash calls.
 func (l *AnalyzerMetricsLoader) LoadMetricsWithHash() (map[string]IssueMetrics, string, error) {
 	if len(l.issues) == 0 {
-		return map[string]IssueMetrics{}, analysis.ComputeDataHash(l.issues), nil
+		return map[string]IssueMetrics{}, l.snapshotHash(), nil
 	}
 
 	cached := analysis.NewCachedAnalyzer(l.issues, l.cache)
@@ -130,7 +143,7 @@ func (l *AnalyzerMetricsLoader) LoadMetricsWithHash() (map[string]IssueMetrics, 
 	}
 
 	// Compute hash from the exact same issues used for metrics
-	hash := analysis.ComputeDataHash(l.issues)
+	hash := l.snapshotHash()
 
 	return metrics, hash, nil
 }

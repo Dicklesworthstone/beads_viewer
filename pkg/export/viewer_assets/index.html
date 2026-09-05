@@ -266,7 +266,7 @@
             </div>
 
             <!-- Mobile search button (shows on mobile) - larger touch target -->
-            <button @click="mobileSearchOpen = !mobileSearchOpen" class="sm:hidden p-3 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 active:bg-gray-200 dark:active:bg-gray-600">
+            <button @click="mobileSearchOpen = !mobileSearchOpen" aria-label="Search issues" class="sm:hidden p-3 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 active:bg-gray-200 dark:active:bg-gray-600">
               <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
               </svg>
@@ -974,7 +974,7 @@
           <!-- Filter header with toggle for mobile -->
           <div class="flex items-center justify-between md:mb-4"
                :class="{ 'mb-4': filtersExpanded }">
-            <button @click="filtersExpanded = !filtersExpanded" class="md:hidden flex items-center space-x-2">
+            <button @click="filtersExpanded = !filtersExpanded" aria-label="Toggle filters" class="md:hidden flex items-center space-x-2">
               <svg class="w-4 h-4 transition-transform" :class="{ 'rotate-90': filtersExpanded }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
               </svg>
@@ -1105,6 +1105,7 @@
           <p class="text-xs sm:text-sm text-gray-600 dark:text-gray-400">
             Showing <span class="font-medium" x-text="issues.length"></span> of
             <span class="font-medium" x-text="totalIssues"></span> issues
+            <span x-show="searchQuery && searchBackend === 'substring'" class="ml-2 text-gray-500" title="This browser SQLite engine does not include FTS5. Graph ranking still applies in Hybrid mode.">· Substring text matching</span>
           </p>
           <div class="text-xs sm:text-sm text-gray-500">
             Page <span x-text="page"></span> of <span x-text="Math.ceil(totalIssues / pageSize) || 1"></span>
@@ -3261,7 +3262,7 @@
               <div class="bg-white dark:bg-gray-800 border-b border-gray-100 dark:border-gray-700/50 px-6 py-4 shrink-0">
                 <div class="flex items-start justify-between">
                   <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-3 mb-2">
+                    <div class="flex flex-wrap items-center gap-3 mb-2">
                       <a :href="'#/issue/' + encodeURIComponent(selectedIssue.id)"
                          class="font-mono text-sm font-medium text-beads-600 dark:text-beads-400 hover:underline bg-beads-50 dark:bg-beads-900/20 px-2 py-0.5 rounded"
                          x-text="selectedIssue.id"></a>
@@ -3276,6 +3277,8 @@
                             x-text="'P' + selectedIssue.priority"></span>
                     </div>
                     <h2 class="text-lg font-semibold text-gray-900 dark:text-white leading-snug" x-text="selectedIssue.title"></h2>
+                    <button @click="copyIssueLink()" class="mt-2 px-3 py-2 text-sm rounded-lg bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-200">Copy link</button>
+                    <p class="mt-1 text-xs break-words" role="status" aria-live="polite" x-text="copyLinkMessage"></p>
                   </div>
                   <button @click="closeIssue()" class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg shrink-0 ml-4 transition-colors">
                     <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">

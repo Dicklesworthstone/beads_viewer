@@ -5,6 +5,7 @@
 package export
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -87,6 +88,9 @@ type SQLiteExportConfig struct {
 
 	// IncludeRobotOutputs determines whether to write JSON robot outputs
 	IncludeRobotOutputs bool
+	// RobotEnvelope carries source completeness and scope metadata into every
+	// exported robot JSON artifact without changing its existing payload shape.
+	RobotEnvelope map[string]json.RawMessage
 
 	// PageSize is the SQLite page size (optimal: 1024 for httpvfs)
 	PageSize int

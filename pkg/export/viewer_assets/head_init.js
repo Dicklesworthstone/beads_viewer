@@ -56,33 +56,40 @@ tailwind.config = {
 //    prevent infinite reload loops; iOS Safari cannot enable COI via a service
 //    worker and is handled by the degraded-mode branch.
 (function () {
-  if (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated) {
-    console.log('[COI] Already cross-origin isolated');
-    return;
-  }
   if (!('serviceWorker' in navigator)) {
     console.log('[COI] Service workers not supported');
     return;
   }
-  // A service worker already controls this page but we are still not
-  // isolated: the browser does not support COI via SW. Do not reload again.
-  if (navigator.serviceWorker.controller) {
-    console.log('[COI] SW is controlling but not cross-origin isolated');
-    console.log('[COI] Browser limitation (iOS Safari?). Using degraded mode.');
-    return;
-  }
-  console.log('[COI] Registering service worker for cross-origin isolation...');
-  navigator.serviceWorker.register('./coi-serviceworker.js')
+  // Registration also supplies offline support when the server already sends
+  // COI headers. Reload once on a new controller, including updated bundles.
+  // A controller that cannot enable COI never causes a reload loop.
+  let reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', function () {
+    if (!reloading) {
+      reloading = true;
+      window.location.reload();
+    }
+  });
+  function registerWorker() {
+    // Keep the already verified bundle while offline. Starting an update
+    // without network can only produce an incomplete installation.
+    if (!navigator.onLine) {
+      console.log('[COI] Offline; keeping the installed bundle');
+      return;
+    }
+    console.log('[COI] Registering offline service worker...');
+    navigator.serviceWorker.register('./coi-serviceworker.js', { updateViaCache: 'none' })
     .then(function () {
       console.log('[COI] Service worker registered');
       return navigator.serviceWorker.ready;
     })
     .then(function () {
-      console.log('[COI] Service worker ready, reloading...');
-      // Give the SW time to claim clients before reloading.
-      setTimeout(function () { window.location.reload(); }, 200);
+      console.log('[COI] Complete offline bundle ready');
     })
     .catch(function (err) {
       console.warn('[COI] Service worker registration failed:', err);
     });
+  }
+  window.addEventListener('online', registerWorker);
+  registerWorker();
 })();

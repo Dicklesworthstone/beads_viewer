@@ -1,8 +1,11 @@
 package export
 
 import (
+	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +15,210 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
 )
+
+func TestReportTemplateLiteralMarkdownBlocks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "literal.tmpl")
+	template := "# Intentional report\n\n{{range .Issues}}{{.Description}}{{end}}\n\n- Intentional list\n\n~~~text\nIntentional code\n~~~\n"
+	if err := os.WriteFile(path, []byte(template), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	description := "- should stay literal\n\n+ also literal\n\n1. ordered marker\n\n1) other ordered marker\n\nSetext title\n====\n\nDash title\n----\n\n    four spaces code\n\n\ttab code\n\n~~~html\n<script>literal only</script>\n~~~\n\n<https://example.invalid>\n\nhttps://example.invalid\n\n~~strikethrough~~\n\nO'Reilly & \"quotes\" [link](https://example.invalid)"
+	content, err := GenerateReport([]model.Issue{{ID: "literal", Description: description}}, nil, ReportOptions{Format: "markdown", Template: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rendered bytes.Buffer
+	if err := goldmark.New(goldmark.WithExtensions(extension.GFM)).Convert(content, &rendered); err != nil {
+		t.Fatal(err)
+	}
+	htmlOutput := rendered.String()
+	for tag, want := range map[string]int{"<h1>": 1, "<h2>": 0, "<ul>": 1, "<ol>": 0, "<pre>": 1, "<code": 1, "<del>": 0, "<a ": 0, "<script>": 0, "<hr>": 0} {
+		if got := strings.Count(htmlOutput, tag); got != want {
+			t.Errorf("rendered %s count=%d want=%d; field data must remain literal while template syntax works\nmarkdown=%s\nhtml=%s", tag, got, want, content, htmlOutput)
+		}
+	}
+	visible := html.UnescapeString(htmlOutput)
+	for _, literal := range []string{"- should stay literal", "+ also literal", "1. ordered marker", "1) other ordered marker", "Setext title\n====", "Dash title\n----", "    four spaces code", "\ttab code", "~~~html", "<script>literal only</script>", "<https://example.invalid>", "~~strikethrough~~", "O'Reilly & \"quotes\" [link](https://example.invalid)", "Intentional report", "Intentional list", "Intentional code"} {
+		if !strings.Contains(visible, literal) {
+			t.Errorf("visible literal %q was changed or lost: %s", literal, htmlOutput)
+		}
+	}
+}
+
+func TestReportOptionsPrecedence(t *testing.T) {
+	markdown, csvFormat, empty := "markdown", "csv", ""
+	yes, no := true, false
+	for _, tc := range []struct {
+		name      string
+		defaults  recipe.ExportConfig
+		explicit  ReportOverrides
+		format    string
+		graph     bool
+		template  string
+		wantError string
+	}{
+		{"normal defaults", recipe.ExportConfig{}, ReportOverrides{}, "markdown", true, "", ""},
+		{"recipe JSON", recipe.ExportConfig{Format: "json", IncludeGraph: &no}, ReportOverrides{}, "json", false, "", ""},
+		{"explicit Markdown", recipe.ExportConfig{Format: "json", IncludeGraph: &no}, ReportOverrides{Format: &markdown}, "markdown", false, "", ""},
+		{"explicit false and cleared template", recipe.ExportConfig{IncludeGraph: &yes, Template: "missing.tmpl"}, ReportOverrides{IncludeGraph: &no, Template: &empty}, "markdown", false, "", ""},
+		{"CSV default has no graph", recipe.ExportConfig{}, ReportOverrides{Format: &csvFormat}, "csv", false, "", ""},
+		{"CSV graph incompatible", recipe.ExportConfig{IncludeGraph: &yes}, ReportOverrides{Format: &csvFormat}, "", false, "", "CSV cannot include a graph"},
+		{"Mermaid graph disabled", recipe.ExportConfig{Format: "mermaid", IncludeGraph: &no}, ReportOverrides{}, "", false, "", "Mermaid export requires"},
+		{"unknown format", recipe.ExportConfig{Format: "shell"}, ReportOverrides{}, "", false, "", "export format"},
+		{"template requires Markdown", recipe.ExportConfig{Format: "json", Template: "report.tmpl"}, ReportOverrides{}, "", false, "", "templates require markdown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveReportOptions(tc.defaults, tc.explicit)
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("got %+v, %v; want error %q", got, err, tc.wantError)
+				}
+				return
+			}
+			if err != nil || got.Format != tc.format || got.IncludeGraph != tc.graph || got.Template != tc.template {
+				t.Fatalf("got %+v, %v; want format=%s graph=%v template=%q", got, err, tc.format, tc.graph, tc.template)
+			}
+		})
+	}
+}
+
+func TestReportFormatsSelectionContextAndDeterminism(t *testing.T) {
+	selected := []model.Issue{{ID: "selected", Title: "Café | \"quoted\" report", Description: "Selected body\nsecond line", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Dependencies: []*model.Dependency{{DependsOnID: "context", Type: model.DepBlocks}}}}
+	context := append(append([]model.Issue(nil), selected...), model.Issue{ID: "context", Title: "External predecessor", Description: "CONTEXT BODY MUST NOT LEAK", Status: model.StatusOpen}, model.Issue{ID: "unrelated", Title: "UNRELATED MUST NOT LEAK", Status: model.StatusOpen})
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	for _, format := range []string{"markdown", "json", "csv", "mermaid"} {
+		t.Run(format, func(t *testing.T) {
+			opts, err := ResolveReportOptions(recipe.ExportConfig{Format: format}, ReportOverrides{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			opts.GeneratedAt = now
+			first, err := GenerateReport(selected, context, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := GenerateReport(selected, context, opts)
+			if err != nil || !bytes.Equal(first, second) {
+				t.Fatalf("nondeterministic output: %v\nfirst=%s\nsecond=%s", err, first, second)
+			}
+			for _, excluded := range []string{"CONTEXT BODY MUST NOT LEAK", "UNRELATED MUST NOT LEAK"} {
+				if bytes.Contains(first, []byte(excluded)) {
+					t.Fatalf("context body leaked: %s", first)
+				}
+			}
+			switch format {
+			case "json":
+				var report struct {
+					Issues []struct {
+						ID      string             `json:"id"`
+						Actions model.IssueActions `json:"actions"`
+					} `json:"issues"`
+					Graph *GraphExportResult `json:"graph"`
+				}
+				if err := json.Unmarshal(first, &report); err != nil {
+					t.Fatal(err)
+				}
+				if len(report.Issues) != 1 || report.Issues[0].ID != "selected" || report.Graph == nil || report.Graph.Nodes != 2 || report.Graph.Edges != 1 {
+					t.Fatalf("selected rows/context graph mismatch: %s", first)
+				}
+				if report.Issues[0].Actions.Claim != nil || report.Issues[0].Actions.Show != nil {
+					t.Fatalf("unverified source generated actions: %s", first)
+				}
+			case "csv":
+				rows, err := csv.NewReader(bytes.NewReader(first)).ReadAll()
+				if err != nil || len(rows) != 2 || rows[1][0] != "selected" || rows[1][1] != selected[0].Title || rows[1][5] != selected[0].Description {
+					t.Fatalf("CSV Unicode/quote/newline roundtrip: %v %q", err, rows)
+				}
+			default:
+				if !bytes.Contains(first, []byte("selected")) || !bytes.Contains(first, []byte("External predecessor")) {
+					t.Fatalf("selected positive/context graph missing: %s", first)
+				}
+			}
+			if format == "markdown" || format == "json" {
+				opts.IncludeGraph = false
+				without, err := GenerateReport(selected, context, opts)
+				if err != nil || bytes.Contains(without, []byte("External predecessor")) || bytes.Contains(without, []byte("```mermaid")) {
+					t.Fatalf("graph=false ignored: %v\n%s", err, without)
+				}
+			}
+			empty, err := GenerateReport(nil, context, opts)
+			if err != nil || bytes.Contains(empty, []byte("selected")) || bytes.Contains(empty, []byte("External predecessor")) {
+				t.Fatalf("empty selection leaked full context: %v\n%s", err, empty)
+			}
+		})
+	}
+}
+
+func TestReportTemplateDataAndErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.tmpl")
+	opts := ReportOptions{Format: "markdown", Template: path, Title: "<Report>", GeneratedAt: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)}
+	issues := []model.Issue{{ID: "a", Title: "界 <script> | [link]", Description: "literal $(touch marker) and `code`"}}
+	if err := os.WriteFile(path, []byte("{{.Title}} {{.GeneratedAt}}\n{{range .Issues}}{{.ID}} {{.Title}} {{.Description}}{{end}}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	content, err := GenerateReport(issues, issues, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"&lt;Report&gt;", "2026-09-01T00:00:00Z", "界 &lt;script&gt; \\| \\[link\\]", "\\`code\\`"} {
+		if !bytes.Contains(content, []byte(want)) {
+			t.Errorf("escaped template data missing %q: %s", want, content)
+		}
+	}
+	var rendered bytes.Buffer
+	if err := goldmark.Convert(content, &rendered); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(html.UnescapeString(rendered.String()), "$(touch marker)") {
+		t.Fatalf("shell-like data did not remain literal text: %s", rendered.String())
+	}
+	for _, tc := range []struct{ name, body, want string }{
+		{"syntax", "{{range", "parse export template"},
+		{"unknown field", "{{.Unknown}}", "render export template"},
+		{"no commands", "{{exec \"touch marker\"}}", "parse export template"},
+		{"no issue methods", "{{(index .Issues 0).Actions true}}", "render export template"},
+		{"no readiness object", "{{.Readiness}}", "render export template"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			casePath := filepath.Join(t.TempDir(), "report.tmpl")
+			if err := os.WriteFile(casePath, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			badOpts := opts
+			badOpts.Template = casePath
+			if content, err := GenerateReport(issues, issues, badOpts); err == nil || !strings.Contains(err.Error(), tc.want) || content != nil {
+				t.Fatalf("template must fail without partial output: %q %v", content, err)
+			}
+		})
+	}
+	opts.Template = filepath.Join(t.TempDir(), "absent.tmpl")
+	if content, err := GenerateReport(issues, issues, opts); err == nil || content != nil || !strings.Contains(err.Error(), "read export template") {
+		t.Fatalf("missing template: %q %v", content, err)
+	}
+	opts.Template = filepath.Join(t.TempDir(), "oversized.tmpl")
+	if err := os.WriteFile(opts.Template, []byte(strings.Repeat("x", (1<<20)+1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := GenerateReport(issues, issues, opts); err == nil || content != nil || !strings.Contains(err.Error(), "template exceeds") {
+		t.Fatalf("oversized template input returned content=%d error=%v", len(content), err)
+	}
+	opts.Template = filepath.Join(t.TempDir(), "bounded-output.tmpl")
+	if err := os.WriteFile(opts.Template, []byte("{{range .Issues}}{{.Description}}{{end}}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	large := make([]model.Issue, 17)
+	text := strings.Repeat("x", 1<<20)
+	for i := range large {
+		large[i] = model.Issue{ID: fmt.Sprint(i), Description: text}
+	}
+	if content, err := GenerateReport(large, large, opts); err == nil || content != nil || !strings.Contains(err.Error(), "exceeds 16 MiB") {
+		t.Fatalf("oversized rendered output returned content=%d error=%v", len(content), err)
+	}
+}
 
 // ============================================================================
 // sanitizeMermaidID tests
@@ -1287,16 +1493,9 @@ func TestGenerateQuickActions_WithOpenIssues(t *testing.T) {
 		{ID: "CLOSED-1", Status: model.StatusClosed, Priority: 2, CreatedAt: now, UpdatedAt: now},
 	}
 
-	result := generateQuickActions(issues)
-
-	if !strings.Contains(result, "## Quick Actions") {
-		t.Error("Missing Quick Actions header")
-	}
-	if !strings.Contains(result, "br close OPEN-1 OPEN-2") {
-		t.Error("Missing bulk close command")
-	}
-	if !strings.Contains(result, "br show OPEN-2") {
-		t.Error("Missing high-priority show command (P1)")
+	result := generateQuickActions(issues, ReportOptions{})
+	if result != "" {
+		t.Error("unverified open issues must not borrow a live tracker")
 	}
 }
 
@@ -1307,13 +1506,9 @@ func TestGenerateQuickActions_WithInProgressIssues(t *testing.T) {
 		{ID: "PROG-2", Status: model.StatusInProgress, Priority: 2, CreatedAt: now, UpdatedAt: now},
 	}
 
-	result := generateQuickActions(issues)
-
-	if !strings.Contains(result, "# Close all in-progress items") {
-		t.Error("Missing in-progress close comment")
-	}
-	if !strings.Contains(result, "br close PROG-1 PROG-2") {
-		t.Error("Missing in-progress bulk close command")
+	result := generateQuickActions(issues, ReportOptions{})
+	if result != "" {
+		t.Error("in-progress status cannot authorize bulk completion")
 	}
 }
 
@@ -1323,13 +1518,9 @@ func TestGenerateQuickActions_WithBlockedIssues(t *testing.T) {
 		{ID: "BLOCKED-1", Status: model.StatusBlocked, Priority: 2, CreatedAt: now, UpdatedAt: now},
 	}
 
-	result := generateQuickActions(issues)
-
-	if !strings.Contains(result, "# Update blocked items") {
-		t.Error("Missing blocked items comment")
-	}
-	if !strings.Contains(result, "br update BLOCKED-1 -s in_progress") {
-		t.Error("Missing blocked update command")
+	result := generateQuickActions(issues, ReportOptions{})
+	if result != "" {
+		t.Error("blocked items cannot authorize an unblocking mutation")
 	}
 }
 
@@ -1341,7 +1532,7 @@ func TestGenerateQuickActions_AllClosed(t *testing.T) {
 		{ID: "TOMB-1", Status: model.StatusTombstone, Priority: 1, CreatedAt: now, UpdatedAt: now},
 	}
 
-	result := generateQuickActions(issues)
+	result := generateQuickActions(issues, ReportOptions{})
 
 	// Should return empty string when all issues are closed
 	if result != "" {
@@ -1362,34 +1553,9 @@ func TestGenerateQuickActions_ManyOpenIssues(t *testing.T) {
 		}
 	}
 
-	result := generateQuickActions(issues)
-
-	// Should truncate to first 10 for large lists
-	if !strings.Contains(result, "15 total, showing first 10") {
-		t.Error("Missing truncation notice for many open issues")
-	}
-	// Should have first issue in the command
-	if !strings.Contains(result, "OPEN-0") {
-		t.Error("Missing first issue in command")
-	}
-	// Should have 10th issue (index 9) in the command
-	if !strings.Contains(result, "OPEN-9") {
-		t.Error("Missing 10th issue (OPEN-9) in command")
-	}
-	// Extract the br close command line to verify truncation
-	// OPEN-10 should NOT appear in the bulk close command
-	closeIdx := strings.Index(result, "br close OPEN-0")
-	if closeIdx == -1 {
-		t.Fatal("Missing br close command")
-	}
-	// Get the line containing the close command
-	lineEnd := strings.Index(result[closeIdx:], "\n")
-	if lineEnd == -1 {
-		lineEnd = len(result) - closeIdx
-	}
-	closeLine := result[closeIdx : closeIdx+lineEnd]
-	if strings.Contains(closeLine, "OPEN-10") {
-		t.Error("Bulk close command should not include OPEN-10 (11th issue)")
+	result := generateQuickActions(issues, ReportOptions{})
+	if result != "" {
+		t.Error("a larger unverified snapshot must not authorize bulk mutation")
 	}
 }
 
@@ -1407,22 +1573,9 @@ func TestGenerateIssueCommands_OpenIssue(t *testing.T) {
 		UpdatedAt: now,
 	}
 
-	result := generateIssueCommands(issue)
-
-	if !strings.Contains(result, "<details>") {
-		t.Error("Missing details tag")
-	}
-	if !strings.Contains(result, "# Start working on this issue") {
-		t.Error("Missing start working comment")
-	}
-	if !strings.Contains(result, "br update OPEN-1 -s in_progress") {
-		t.Error("Missing update to in_progress command")
-	}
-	if !strings.Contains(result, "br comment OPEN-1") {
-		t.Error("Missing comment command")
-	}
-	if !strings.Contains(result, "br show OPEN-1") {
-		t.Error("Missing show command")
+	result := generateIssueCommands(issue, ReportOptions{})
+	if result != "" {
+		t.Error("open status alone must not generate a live command")
 	}
 }
 
@@ -1436,13 +1589,9 @@ func TestGenerateIssueCommands_InProgressIssue(t *testing.T) {
 		UpdatedAt: now,
 	}
 
-	result := generateIssueCommands(issue)
-
-	if !strings.Contains(result, "# Mark as complete") {
-		t.Error("Missing mark complete comment")
-	}
-	if !strings.Contains(result, "br close PROG-1") {
-		t.Error("Missing close command")
+	result := generateIssueCommands(issue, ReportOptions{})
+	if result != "" {
+		t.Error("in-progress snapshot alone cannot authorize completion")
 	}
 }
 
@@ -1456,13 +1605,9 @@ func TestGenerateIssueCommands_BlockedIssue(t *testing.T) {
 		UpdatedAt: now,
 	}
 
-	result := generateIssueCommands(issue)
-
-	if !strings.Contains(result, "# Unblock and start working") {
-		t.Error("Missing unblock comment")
-	}
-	if !strings.Contains(result, "br update BLOCKED-1 -s in_progress") {
-		t.Error("Missing unblock command")
+	result := generateIssueCommands(issue, ReportOptions{})
+	if result != "" {
+		t.Error("blocked snapshot cannot authorize an unblocking mutation")
 	}
 }
 
@@ -1476,7 +1621,7 @@ func TestGenerateIssueCommands_ClosedIssue(t *testing.T) {
 		UpdatedAt: now,
 	}
 
-	result := generateIssueCommands(issue)
+	result := generateIssueCommands(issue, ReportOptions{})
 
 	// Should return empty string for closed issues
 	if result != "" {
@@ -1494,7 +1639,8 @@ func TestGenerateIssueCommands_SpecialCharID(t *testing.T) {
 		UpdatedAt: now,
 	}
 
-	result := generateIssueCommands(issue)
+	issue.Origin = markdownTestOrigin(issue.ID)
+	result := generateIssueCommands(issue, ReportOptions{})
 
 	// ID should be shell-escaped
 	if !strings.Contains(result, "'issue with spaces'") {
@@ -1511,6 +1657,9 @@ func TestGenerateMarkdown_IncludesQuickActions(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "ACT-1", Title: "Open Issue", Status: model.StatusOpen, Priority: 0, CreatedAt: now, UpdatedAt: now},
 		{ID: "ACT-2", Title: "In Progress", Status: model.StatusInProgress, Priority: 1, CreatedAt: now, UpdatedAt: now},
+	}
+	for i := range issues {
+		issues[i].Origin = markdownTestOrigin(issues[i].ID)
 	}
 
 	md, err := GenerateMarkdown(issues, "Actions Test")
@@ -1540,7 +1689,9 @@ func TestGenerateMarkdown_IncludesPerIssueCommands(t *testing.T) {
 		{ID: "CMD-1", Title: "Test Issue", Status: model.StatusOpen, Priority: 2, CreatedAt: now, UpdatedAt: now},
 	}
 
-	md, err := GenerateMarkdown(issues, "Per-Issue Commands Test")
+	issues[0].Origin = markdownTestOrigin(issues[0].ID)
+	md, err := GenerateMarkdown(issues, "Per-Issue Commands Test", ReportOptions{AuthorityComplete: true,
+		GeneratedAt: now, Readiness: model.NewReadinessIndex(issues)})
 	if err != nil {
 		t.Fatalf("GenerateMarkdown returned error: %v", err)
 	}
@@ -1552,8 +1703,43 @@ func TestGenerateMarkdown_IncludesPerIssueCommands(t *testing.T) {
 	if !strings.Contains(md, "📋 Commands") {
 		t.Error("Missing Commands summary text")
 	}
-	if !strings.Contains(md, "br update CMD-1") {
+	if !strings.Contains(md, "'update' '--json' '--claim' '--' 'CMD-1'") {
 		t.Error("Missing per-issue update command")
+	}
+}
+
+// Synthetic route for renderer units only; real tracker execution is covered
+// by TestRobotActionRoutesLiveTrackers in the CLI integration suite.
+func markdownTestOrigin(id string) *model.IssueOrigin {
+	return &model.IssueOrigin{LocalID: id, WorkingDirectory: "/fixture repo", TrackerDirectory: "/fixture repo/.beads",
+		Database: "/fixture repo/.beads/beads.db", Executable: "/fixture/bin/br", Tracker: "br", SupportsClaim: true}
+}
+
+func TestMarkdownCommandsRequireReadinessAndAuthority(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	issue := model.Issue{ID: "workspace-local", Status: model.StatusOpen, IssueType: model.TypeTask, Origin: markdownTestOrigin("local")}
+	for _, tc := range []struct {
+		name      string
+		complete  bool
+		blocker   bool
+		wantClaim bool
+	}{
+		{"live ready", true, false, true}, {"partial", false, false, false}, {"hidden blocker", true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := issue.Clone()
+			if tc.blocker {
+				candidate.Dependencies = []*model.Dependency{{DependsOnID: "outside-filter", Type: model.DepBlocks}}
+			}
+			readiness := model.NewReadinessIndex([]model.Issue{candidate, {ID: "outside-filter", Status: model.StatusOpen}})
+			text := generateIssueCommands(candidate, ReportOptions{Readiness: readiness, GeneratedAt: now, AuthorityComplete: tc.complete})
+			if !strings.Contains(text, "'show' '--json' '--' 'local'") || strings.Contains(text, "'--claim'") != tc.wantClaim {
+				t.Fatalf("unexpected routed actions: %s", text)
+			}
+			if strings.Contains(text, "workspace-local") || strings.Contains(text, "'close'") {
+				t.Fatal("unsafe display-ID or bulk action")
+			}
+		})
 	}
 }
 

@@ -10,7 +10,21 @@
  * License: MIT
  */
 
-const CACHE_NAME = 'beads-viewer-coi-v2';
+// Replaced by CopyEmbeddedAssets with hashes of the actual exported files.
+const OFFLINE_ASSETS = [];
+const CACHE_REVISION = 'development';
+const CACHE_PREFIX = `beads-viewer-${self.registration.scope}-`;
+const CACHE_NAME = CACHE_PREFIX + CACHE_REVISION;
+
+function cacheKey(request) {
+  const url = new URL(request.url || request, self.registration.scope);
+  // These parameters only defeat intermediary caches; file identity is bound
+  // above. Preserve other query parameters and separate Pages project scopes.
+  url.searchParams.delete('_t');
+  url.searchParams.delete('v');
+  if (url.pathname.endsWith('/')) url.pathname += 'index.html';
+  return url.href;
+}
 
 // Headers needed for cross-origin isolation
 // Using 'credentialless' instead of 'require-corp' to allow CDN resources
@@ -72,15 +86,36 @@ function addCOIHeaders(response) {
 // Install event
 self.addEventListener('install', (event) => {
   console.log('[COI-SW] Installing service worker');
-  // Take over immediately
-  self.skipWaiting();
+  event.waitUntil((async () => {
+    if (!OFFLINE_ASSETS.length) throw new Error('Offline asset manifest missing');
+    const cache = await caches.open(CACHE_NAME);
+    for (const asset of OFFLINE_ASSETS) {
+      const url = new URL(asset.path, self.registration.scope);
+      const response = await fetch(url, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`Offline asset unavailable: ${asset.path}`);
+      const bytes = await response.clone().arrayBuffer();
+      const digest = await crypto.subtle.digest('SHA-256', bytes);
+      const hash = [...new Uint8Array(digest)].map(v => v.toString(16).padStart(2, '0')).join('');
+      if (hash !== asset.sha256) throw new Error(`Offline asset changed: ${asset.path}`);
+      await cache.put(cacheKey(url.href), response);
+    }
+    console.log('[COI-SW] Complete offline bundle cached:', CACHE_REVISION);
+    await self.skipWaiting();
+  })());
 });
 
 // Activate event
 self.addEventListener('activate', (event) => {
   console.log('[COI-SW] Activating service worker');
-  // Take control of all clients immediately
-  event.waitUntil(self.clients.claim());
+  event.waitUntil((async () => {
+    // Activation is only reached after every required asset was verified.
+    // Retire this scope's obsolete bundles, preserving unrelated application
+    // caches and the previous working bundle whenever installation fails.
+    for (const name of await caches.keys()) {
+      if (name.startsWith(CACHE_PREFIX) && name !== CACHE_NAME) await caches.delete(name);
+    }
+    await self.clients.claim();
+  })());
 });
 
 // Fetch event - intercept requests and add COI headers
@@ -92,16 +127,34 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Check if we should add headers
-  if (!shouldAddHeaders(request)) {
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin || !url.href.startsWith(self.registration.scope)) {
     return;
   }
 
   event.respondWith(
     (async () => {
       try {
-        // Fetch the resource
-        const response = await fetch(request);
+        const cache = await caches.open(CACHE_NAME);
+        const key = cacheKey(request);
+        // The active worker only serves its complete, hash-checked bundle.
+        // A new export installs separately and switches clients after priming.
+        let response = await cache.match(key);
+        if (!response) {
+          try {
+            response = await fetch(request);
+          } catch (error) {
+            // An uncached optional resource may be unavailable offline. Return
+            // a failed network response, without an unhandled worker promise
+            // or invented success content. Other errors still surface below.
+            if (!(error instanceof TypeError)) throw error;
+            console.warn('[COI-SW] Resource unavailable:', request.url);
+            return Response.error();
+          }
+          // Optional late-written data (history) remains available offline
+          // after use. Failed/opaque responses never replace cached content.
+          if (response.ok && response.type !== 'opaque') await cache.put(key, response.clone());
+        }
 
         // Check if response is ok and we can modify it
         if (!response.ok || response.type === 'opaque') {
@@ -109,7 +162,7 @@ self.addEventListener('fetch', (event) => {
         }
 
         // Add COI headers
-        return addCOIHeaders(response);
+        return shouldAddHeaders(request) ? addCOIHeaders(response) : response;
       } catch (error) {
         console.error('[COI-SW] Fetch error:', error);
         throw error;

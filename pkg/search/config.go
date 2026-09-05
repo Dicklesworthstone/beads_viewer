@@ -71,23 +71,29 @@ type SearchConfig struct {
 // SearchConfigFromEnv reads hybrid search configuration from environment variables.
 // Defaults: mode=text, preset=default.
 func SearchConfigFromEnv() (SearchConfig, error) {
+	return ParseSearchConfig(os.Getenv(EnvSearchMode), os.Getenv(EnvSearchPreset), os.Getenv(EnvSearchWeights))
+}
+
+// ParseSearchConfig validates effective values after the caller resolves their
+// source precedence. Empty values use the normal defaults.
+func ParseSearchConfig(modeValue, presetValue, weightsValue string) (SearchConfig, error) {
 	cfg := SearchConfig{
 		Mode:   SearchModeText,
 		Preset: PresetDefault,
 	}
 
 	modeSet := false
-	if mode := strings.TrimSpace(os.Getenv(EnvSearchMode)); mode != "" {
+	if mode := strings.TrimSpace(modeValue); mode != "" {
 		switch SearchMode(strings.ToLower(mode)) {
 		case SearchModeText, SearchModeHybrid:
 			cfg.Mode = SearchMode(strings.ToLower(mode))
 			modeSet = true
 		default:
-			return SearchConfig{}, fmt.Errorf("invalid %s: %q (expected text|hybrid)", EnvSearchMode, mode)
+			return SearchConfig{}, fmt.Errorf("invalid search mode: %q (expected text|hybrid)", mode)
 		}
 	}
 
-	if preset := strings.TrimSpace(os.Getenv(EnvSearchPreset)); preset != "" {
+	if preset := strings.TrimSpace(presetValue); preset != "" {
 		name := PresetName(strings.ToLower(preset))
 		if _, err := GetPreset(name); err != nil {
 			return SearchConfig{}, err
@@ -103,11 +109,11 @@ func SearchConfigFromEnv() (SearchConfig, error) {
 		case !modeSet:
 			cfg.Mode = SearchModeHybrid
 		case cfg.Mode == SearchModeText:
-			return SearchConfig{}, fmt.Errorf("%s=%q needs hybrid mode; unset %s=text or use %s=text-only", EnvSearchPreset, preset, EnvSearchMode, EnvSearchPreset)
+			return SearchConfig{}, fmt.Errorf("search preset %q needs hybrid mode; use hybrid mode or the text-only preset", preset)
 		}
 	}
 
-	if raw := strings.TrimSpace(os.Getenv(EnvSearchWeights)); raw != "" {
+	if raw := strings.TrimSpace(weightsValue); raw != "" {
 		weights, err := ParseWeightsJSON(raw)
 		if err != nil {
 			return SearchConfig{}, err

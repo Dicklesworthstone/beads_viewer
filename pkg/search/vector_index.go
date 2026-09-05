@@ -420,10 +420,25 @@ func (idx *VectorIndex) sortedIDs() []string {
 type SearchResult struct {
 	IssueID string  `json:"issue_id"`
 	Score   float64 `json:"score"`
+	// ExactIDMatch survives subsequent lexical/hybrid ranking without resolving
+	// a potentially ambiguous case-fold match from an already truncated list.
+	ExactIDMatch bool `json:"-"`
+}
+
+// VectorSearchOptions restricts eligible records before scoring and top-k.
+// Nil Eligible selects the entire index; an empty map selects no records.
+// MinScore is an inclusive raw text-similarity threshold, before hybrid scoring.
+// ScoreBoosts adds finite nonnegative lexical evidence after that threshold and
+// before top-k selection, so a prefix match cannot be discarded before ranking.
+type VectorSearchOptions struct {
+	Eligible    map[string]bool
+	ExactID     string
+	MinScore    *float64
+	ScoreBoosts map[string]float64
 }
 
 func (idx *VectorIndex) SearchTopK(query []float32, k int) ([]SearchResult, error) {
-	return idx.searchTopK(query, k, "")
+	return idx.SearchTopKWithOptions(query, k, VectorSearchOptions{})
 }
 
 // SearchTopKWithExactID returns the top semantic matches while guaranteeing
@@ -432,10 +447,19 @@ func (idx *VectorIndex) SearchTopK(query []float32, k int) ([]SearchResult, erro
 // tracker-specific shape. A case-insensitive match is promoted only when it is
 // unambiguous; an exact-case match always wins.
 func (idx *VectorIndex) SearchTopKWithExactID(query []float32, k int, exactID string) ([]SearchResult, error) {
-	return idx.searchTopK(query, k, strings.TrimSpace(exactID))
+	return idx.SearchTopKWithOptions(query, k, VectorSearchOptions{ExactID: exactID})
 }
 
-func (idx *VectorIndex) searchTopK(query []float32, k int, exactID string) ([]SearchResult, error) {
+func (idx *VectorIndex) SearchTopKWithOptions(query []float32, k int, opts VectorSearchOptions) ([]SearchResult, error) {
+	exactID := strings.TrimSpace(opts.ExactID)
+	if opts.MinScore != nil && (math.IsNaN(*opts.MinScore) || math.IsInf(*opts.MinScore, 0)) {
+		return nil, fmt.Errorf("minimum score must be finite")
+	}
+	for id, boost := range opts.ScoreBoosts {
+		if math.IsNaN(boost) || math.IsInf(boost, 0) || boost < 0 {
+			return nil, fmt.Errorf("score boost for %q must be finite and nonnegative", id)
+		}
+	}
 	if k <= 0 {
 		return nil, nil
 	}
@@ -470,12 +494,19 @@ func (idx *VectorIndex) searchTopK(query []float32, k int, exactID string) ([]Se
 	foldedMatches := 0
 
 	for _, issueID := range ids {
+		if opts.Eligible != nil && !opts.Eligible[issueID] {
+			continue
+		}
 		entry, ok := idx.entries[issueID]
 		if !ok {
 			// This can happen if the issue was removed concurrently between sortedIDs() and RLock()
 			continue
 		}
 		score := dotFloat32(query, entry.Vector)
+		if opts.MinScore != nil && score < *opts.MinScore {
+			continue
+		}
+		score += opts.ScoreBoosts[issueID]
 		result := SearchResult{IssueID: issueID, Score: score}
 		collector.Add(result, score)
 		if exactID != "" {
@@ -501,6 +532,7 @@ func (idx *VectorIndex) searchTopK(query []float32, k int, exactID string) ([]Se
 	if exactResult.IssueID == "" {
 		return results, nil
 	}
+	exactResult.ExactIDMatch = true
 
 	exactIndex := -1
 	for i := range results {
@@ -520,6 +552,8 @@ func (idx *VectorIndex) searchTopK(query []float32, k int, exactID string) ([]Se
 	}
 	if exactIndex > 0 {
 		copy(results[1:exactIndex+1], results[:exactIndex])
+		results[0] = exactResult
+	} else if exactIndex == 0 {
 		results[0] = exactResult
 	}
 	return results, nil

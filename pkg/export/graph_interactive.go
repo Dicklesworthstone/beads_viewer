@@ -24,14 +24,15 @@ var markedJS string
 
 // InteractiveGraphOptions configures HTML graph generation
 type InteractiveGraphOptions struct {
-	Issues      []model.Issue
-	Stats       *analysis.GraphStats
-	Triage      *analysis.TriageResult     // Full triage output for display
-	History     *correlation.HistoryReport // Git history correlation data
-	Title       string
-	DataHash    string
-	Path        string // Output path - if empty, auto-generates based on project
-	ProjectName string // Project name for auto-naming
+	Issues        []model.Issue
+	Stats         *analysis.GraphStats
+	Triage        *analysis.TriageResult     // Full triage output for display
+	History       *correlation.HistoryReport // Git history correlation data
+	Title         string
+	DataHash      string
+	Path          string // Output path - if empty, auto-generates based on project
+	ProjectName   string // Project name for auto-naming
+	RobotEnvelope map[string]json.RawMessage
 }
 
 // graphNode represents a node in the interactive graph with full bead data
@@ -283,6 +284,9 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 	graphData := map[string]interface{}{
 		"nodes": nodes,
 		"links": links,
+	}
+	for key, value := range opts.RobotEnvelope {
+		graphData[key] = value
 	}
 
 	// Add triage data if available

@@ -1,7 +1,25 @@
 {
   "_comment": "Provenance of every vendored viewer asset. scripts/verify_vendor.sh and pkg/export/vendor_manifest_test.go recompute the sha256 of each file and fail on any mismatch or unlisted file. A version of \"unknown\" means the artifact carries no version marker; the hash still pins the exact bytes shipped. Update this file (hash, version, date, reviewed_by) whenever an asset is replaced.",
-  "reviewed_by": "reality-check 2026-09-02 (versions and licenses read from the artifacts' own headers where present)",
-  "date": "2026-09-02",
+  "reviewed_by": "reality-check 2026-09-04 (graph pair: pinned rebuild and five real graph fixtures; other entries retain 2026-09-02 review)",
+  "date": "2026-09-04",
+  "graph_wasm": {
+    "source_sha256": "ea7b88f95e4b397e6a0654b1cc4180bc39b91f1de8fd64d41905afd6d53d24f2",
+    "cargo_lock_sha256": "03c9ee83a2503e7b7a22a81547ca1a9f45413827ab80ea071e01a9225e74ec87",
+    "pipeline": {
+      "bindgen_executable_sha256": "778ec413ee7c3ea501d49b376fef3c390bf1f6e64ece888ed30472f09c3a1923",
+      "bindgen_flags": "--target web --out-name bv_graph",
+      "cargo": "cargo 1.100.0-nightly (e8cb624d5 2026-08-22)",
+      "cargo_flags": "--locked --offline --release --target wasm32-unknown-unknown -j 2",
+      "features": "default",
+      "optimizer_executable_sha256": "1014958e6f20d412f1542320b43970214b0fb1ed780595e8f7c0d8761ed53725",
+      "optimizer_flags": "-Os",
+      "path_remapping": true,
+      "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0",
+      "target": "wasm32-unknown-unknown",
+      "wasm_bindgen": "0.2.121",
+      "wasm_opt": "132"
+    }
+  },
   "files": [
     {
       "name": "alpine.min.js",
@@ -24,20 +42,20 @@
     {
       "name": "bv_graph.js",
       "upstream": "bv-graph-wasm (this repository)",
-      "version": "wasm-bindgen glue generated with the .wasm below",
+      "version": "wasm-bindgen 0.2.121; paired with bv_graph_bg.wasm and graph_wasm provenance",
       "license": "MIT (repository license)",
-      "sha256": "d746d85abc80463e8f227f3ecbefb17d741e6c1a69d293630deefcb0513b1503",
+      "sha256": "d2f3eaecbfee48218c95fd35fbd71ea237aa0f6eb161f53124284eae1bbefe39",
       "source_url": "bv-graph-wasm/src",
-      "build_command": "cd bv-graph-wasm && make build-release (wasm-pack build --target web --release, then wasm-opt -Os when installed); see docs/PROVENANCE.md for the reproducibility status"
+      "build_command": "scripts/build_graph_wasm.sh (pinned rustc, locked Cargo, wasm-bindgen 0.2.121, Binaryen 132 -Os); see graph_wasm and docs/PROVENANCE.md"
     },
     {
       "name": "bv_graph_bg.wasm",
       "upstream": "bv-graph-wasm (this repository)",
-      "version": "built from bv-graph-wasm/Cargo.lock; a local wasm-pack rebuild on 2026-09-01 produced a different hash (67c14abd...), so this artifact is not yet reproducibly tied to source",
+      "version": "bv-graph-wasm 0.1.0; paired pinned source rebuild recorded in graph_wasm",
       "license": "MIT (repository license)",
-      "sha256": "fb2c84eeab8711efbf282b1c0db33c968cf829c14ceccca1ead9ad765e2e0449",
+      "sha256": "d80480e9241e6a71beee560638875c10b313ac8bd4f090ed1dc7e19db6964bb6",
       "source_url": "bv-graph-wasm/src",
-      "build_command": "cd bv-graph-wasm && make build-release (wasm-pack build --target web --release, then wasm-opt -Os when installed)"
+      "build_command": "scripts/build_graph_wasm.sh (pinned rustc, locked Cargo, wasm-bindgen 0.2.121, Binaryen 132 -Os); see graph_wasm and docs/PROVENANCE.md"
     },
     {
       "name": "chart.umd.min.js",

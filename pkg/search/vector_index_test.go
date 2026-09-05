@@ -239,6 +239,97 @@ func TestVectorIndex_SearchTopKBoundsOversizedLimitToIndex(t *testing.T) {
 	}
 }
 
+func TestVectorIndexScopedTopK(t *testing.T) {
+	idx := NewVectorIndex(2)
+	for id, score := range map[string]float32{"excluded": 1, "selected-a": 0.75, "selected-b": 0.5, "opaque/id.3": 0, "ABC": 0.25, "abc": 0.25} {
+		if err := idx.Upsert(id, ComputeContentHash(id), []float32{score, 0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	threshold := 0.5
+	cases := []struct {
+		name  string
+		k     int
+		opts  VectorSearchOptions
+		want  []string
+		exact bool
+	}{
+		{"unscoped", 2, VectorSearchOptions{}, []string{"excluded", "selected-a"}, false},
+		{"empty", 2, VectorSearchOptions{Eligible: map[string]bool{}}, nil, false},
+		{"leaders cannot consume slots", 2, VectorSearchOptions{Eligible: map[string]bool{"selected-a": true, "selected-b": true}}, []string{"selected-a", "selected-b"}, false},
+		{"excluded exact ID", 1, VectorSearchOptions{Eligible: map[string]bool{"selected-b": true}, ExactID: "excluded"}, []string{"selected-b"}, false},
+		{"opaque exact ID", 1, VectorSearchOptions{Eligible: map[string]bool{"selected-a": true, "opaque/id.3": true}, ExactID: "opaque/id.3"}, []string{"opaque/id.3"}, true},
+		{"inclusive score boundary", 2, VectorSearchOptions{Eligible: map[string]bool{"selected-a": true, "selected-b": true, "opaque/id.3": true}, MinScore: &threshold}, []string{"selected-a", "selected-b"}, false},
+		{"exact ID cannot bypass threshold", 1, VectorSearchOptions{ExactID: "opaque/id.3", MinScore: &threshold}, []string{"excluded"}, false},
+		{"ambiguous case fold", 1, VectorSearchOptions{ExactID: "AbC"}, []string{"excluded"}, false},
+		{"scope disambiguates case fold", 1, VectorSearchOptions{Eligible: map[string]bool{"excluded": true, "abc": true}, ExactID: "AbC"}, []string{"abc"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := idx.SearchTopKWithOptions([]float32{1, 0}, tc.k, tc.opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("results=%v want IDs %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i].IssueID != tc.want[i] || got[i].ExactIDMatch != (i == 0 && tc.exact) {
+					t.Errorf("result[%d]=%+v want %s exact=%v", i, got[i], tc.want[i], i == 0 && tc.exact)
+				}
+			}
+			if idx.Size() != 6 {
+				t.Fatal("scope mutated the unscoped index")
+			}
+		})
+	}
+	for _, invalid := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := idx.SearchTopKWithOptions([]float32{1, 0}, 2, VectorSearchOptions{MinScore: &invalid}); err == nil {
+			t.Errorf("accepted invalid threshold %v", invalid)
+		}
+	}
+}
+
+func TestVectorIndexLexicalEvidenceBeforeCutoff(t *testing.T) {
+	idx := NewVectorIndex(2)
+	for id, vector := range map[string][]float32{
+		"a-nearest": {0.25, 0}, "b-prefix": {0, 1}, "c-prefix": {0, 1}, "opaque/id": {0, 1},
+	} {
+		if err := idx.Upsert(id, ComputeContentHash(id), vector); err != nil {
+			t.Fatal(err)
+		}
+	}
+	threshold := 0.1
+	for _, tc := range []struct {
+		name  string
+		opts  VectorSearchOptions
+		want  string
+		score float64
+		exact bool
+	}{
+		{"unaffected without evidence", VectorSearchOptions{}, "a-nearest", 0.25, false},
+		{"prefix displaces raw leader", VectorSearchOptions{ScoreBoosts: map[string]float64{"b-prefix": 0.35}}, "b-prefix", 0.35, false},
+		{"tie breaks by ID", VectorSearchOptions{ScoreBoosts: map[string]float64{"b-prefix": 0.35, "c-prefix": 0.35}}, "b-prefix", 0.35, false},
+		{"excluded boost cannot consume slot", VectorSearchOptions{Eligible: map[string]bool{"a-nearest": true}, ScoreBoosts: map[string]float64{"b-prefix": 0.35}}, "a-nearest", 0.25, false},
+		{"raw threshold before evidence", VectorSearchOptions{MinScore: &threshold, ScoreBoosts: map[string]float64{"b-prefix": 0.35}}, "a-nearest", 0.25, false},
+		{"exact ID overrides boosted leader", VectorSearchOptions{ExactID: "opaque/id", ScoreBoosts: map[string]float64{"b-prefix": 0.35}}, "opaque/id", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for attempt := 0; attempt < 2; attempt++ {
+				got, err := idx.SearchTopKWithOptions([]float32{1, 0}, 1, tc.opts)
+				if err != nil || len(got) != 1 || got[0].IssueID != tc.want || got[0].Score != tc.score || got[0].ExactIDMatch != tc.exact {
+					t.Fatalf("got=%+v err=%v; want %s score=%g exact=%v", got, err, tc.want, tc.score, tc.exact)
+				}
+			}
+		})
+	}
+	for _, invalid := range []float64{-0.1, math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if _, err := idx.SearchTopKWithOptions([]float32{1, 0}, 1, VectorSearchOptions{ScoreBoosts: map[string]float64{"b-prefix": invalid}}); err == nil {
+			t.Errorf("accepted invalid evidence %v", invalid)
+		}
+	}
+}
+
 func TestVectorIndex_GetReturnsCopy(t *testing.T) {
 	idx := NewVectorIndex(2)
 	if err := idx.Upsert("A", ComputeContentHash("a"), []float32{1, 0}); err != nil {

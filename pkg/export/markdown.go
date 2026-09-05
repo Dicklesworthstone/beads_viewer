@@ -1,17 +1,302 @@
 package export
 
 import (
+	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"html"
+	"io"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
+	"text/template"
 	"time"
 	"unicode"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 )
+
+// ReportOverrides contains only explicitly supplied CLI settings. A pointer to
+// false or an empty template deliberately overrides the recipe value.
+type ReportOverrides struct {
+	Format       *string
+	IncludeGraph *bool
+	Template     *string
+}
+
+type ReportOptions struct {
+	Format            string
+	IncludeGraph      bool
+	Template          string
+	Title             string
+	GeneratedAt       time.Time
+	Readiness         *model.ReadinessIndex
+	AuthorityComplete bool
+	GraphIssues       []model.Issue
+	SourceAuthority   any
+	AuthorityHash     string
+	DataHash          string
+	SourcePath        string
+	SourceKind        string
+	AsOf              string
+	AsOfCommit        string
+}
+
+func ResolveReportOptions(defaults recipe.ExportConfig, explicit ReportOverrides) (ReportOptions, error) {
+	opts := ReportOptions{Format: "markdown", Title: "Beads Export"}
+	if defaults.Format != "" {
+		opts.Format = defaults.Format
+	}
+	if explicit.Format != nil {
+		opts.Format = *explicit.Format
+	}
+	opts.IncludeGraph = opts.Format != "csv"
+	if defaults.IncludeGraph != nil {
+		opts.IncludeGraph = *defaults.IncludeGraph
+	}
+	if explicit.IncludeGraph != nil {
+		opts.IncludeGraph = *explicit.IncludeGraph
+	}
+	opts.Template = defaults.Template
+	if explicit.Template != nil {
+		opts.Template = *explicit.Template
+	}
+	if err := opts.validate(); err != nil {
+		return ReportOptions{}, err
+	}
+	return opts, nil
+}
+
+func (opts ReportOptions) validate() error {
+	switch opts.Format {
+	case "markdown", "json", "csv", "mermaid":
+	default:
+		return fmt.Errorf("export format %q must be markdown, json, csv or mermaid", opts.Format)
+	}
+	if opts.Format == "csv" && opts.IncludeGraph {
+		return fmt.Errorf("CSV cannot include a graph; set --export-include-graph=false")
+	}
+	if opts.Format == "mermaid" && !opts.IncludeGraph {
+		return fmt.Errorf("Mermaid export requires include_graph=true")
+	}
+	if opts.Template != "" && opts.Format != "markdown" {
+		return fmt.Errorf("custom templates require markdown export")
+	}
+	return nil
+}
+
+// GenerateReport renders selected bodies in their supplied recipe order. The
+// context is consulted only for dependency graph closure and readiness; its
+// other issue bodies never become selected output rows.
+func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
+	if opts.Title == "" {
+		opts.Title = "Beads Export"
+	}
+	if opts.GeneratedAt.IsZero() {
+		opts.GeneratedAt = time.Now().UTC()
+	}
+	if opts.IncludeGraph {
+		opts.GraphIssues = reportGraphContext(selected, context)
+	}
+	switch opts.Format {
+	case "markdown":
+		if opts.Template != "" {
+			return renderReportTemplate(selected, opts)
+		}
+		content, err := GenerateMarkdown(selected, opts.Title, opts)
+		return []byte(content), err
+	case "json":
+		type row struct {
+			model.Issue
+			Actions model.IssueActions `json:"actions"`
+		}
+		rows := make([]row, 0, len(selected))
+		for _, issue := range selected {
+			claimable := opts.AuthorityComplete && opts.Readiness != nil && opts.Readiness.Claimable(issue.ID, opts.GeneratedAt)
+			rows = append(rows, row{issue, issue.Actions(claimable)})
+		}
+		var graph *GraphExportResult
+		if opts.IncludeGraph {
+			var err error
+			graph, err = ExportGraph(opts.GraphIssues, nil, GraphExportConfig{Format: GraphFormatJSON, DataHash: analysis.ComputeDataHash(opts.GraphIssues)})
+			if err != nil {
+				return nil, err
+			}
+		}
+		return json.MarshalIndent(struct {
+			Title           string             `json:"title"`
+			GeneratedAt     time.Time          `json:"generated_at"`
+			SourceAuthority any                `json:"source_authority"`
+			AuthorityHash   string             `json:"authority_hash,omitempty"`
+			DataHash        string             `json:"data_hash,omitempty"`
+			SourcePath      string             `json:"source_path,omitempty"`
+			SourceKind      string             `json:"source_kind,omitempty"`
+			AsOf            string             `json:"as_of,omitempty"`
+			AsOfCommit      string             `json:"as_of_commit,omitempty"`
+			Issues          []row              `json:"issues"`
+			Graph           *GraphExportResult `json:"graph,omitempty"`
+		}{opts.Title, opts.GeneratedAt, opts.SourceAuthority, opts.AuthorityHash, opts.DataHash, opts.SourcePath, opts.SourceKind, opts.AsOf, opts.AsOfCommit, rows, graph}, "", "  ")
+	case "csv":
+		var content bytes.Buffer
+		writer := csv.NewWriter(&content)
+		if err := writer.Write([]string{"id", "title", "status", "priority", "issue_type", "description", "labels"}); err != nil {
+			return nil, err
+		}
+		for _, issue := range selected {
+			if err := writer.Write([]string{issue.ID, issue.Title, string(issue.Status), fmt.Sprint(issue.Priority), string(issue.IssueType), issue.Description, strings.Join(issue.Labels, ";")}); err != nil {
+				return nil, err
+			}
+		}
+		writer.Flush()
+		return content.Bytes(), writer.Error()
+	case "mermaid":
+		return []byte(reportMermaid(opts.GraphIssues)), nil
+	}
+	return nil, fmt.Errorf("unhandled export format %q", opts.Format)
+}
+
+func reportGraphContext(selected, context []model.Issue) []model.Issue {
+	byID := make(map[string]model.Issue, len(context)+len(selected))
+	for _, issue := range context {
+		byID[issue.ID] = issue
+	}
+	queue := make([]string, 0, len(selected))
+	for _, issue := range selected {
+		byID[issue.ID] = issue
+		queue = append(queue, issue.ID)
+	}
+	seen := make(map[string]bool)
+	result := make([]model.Issue, 0, len(selected))
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		issue, ok := byID[id]
+		if !ok || issue.Status == model.StatusTombstone {
+			continue
+		}
+		result = append(result, issue)
+		for _, dep := range issue.Dependencies {
+			if dep != nil {
+				queue = append(queue, dep.DependsOnID)
+			}
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	return result
+}
+
+func reportMermaid(issues []model.Issue) string {
+	ids := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		ids[issue.ID] = true
+	}
+	return GenerateMermaidGraph(issues, ids, MermaidConfig{ShowNoDependenciesNode: true})
+}
+
+// Template data has no methods or function-valued fields. No filesystem,
+// environment, process or custom function is exposed to template execution.
+func renderReportTemplate(issues []model.Issue, opts ReportOptions) ([]byte, error) {
+	file, err := os.Open(opts.Template)
+	if err != nil {
+		return nil, fmt.Errorf("read export template: %w", err)
+	}
+	defer file.Close()
+	const maxTemplate = 1 << 20
+	raw, err := io.ReadAll(io.LimitReader(file, maxTemplate+1))
+	if err != nil {
+		return nil, fmt.Errorf("read export template: %w", err)
+	}
+	if len(raw) > maxTemplate {
+		return nil, fmt.Errorf("export template exceeds %d bytes", maxTemplate)
+	}
+	tmpl, err := template.New("report").Option("missingkey=error").Parse(string(raw))
+	if err != nil {
+		return nil, fmt.Errorf("parse export template: %w", err)
+	}
+	type issueData struct {
+		ID, Title, Status, IssueType, Description string
+		Priority                                  int
+		Labels                                    []string
+	}
+	data := struct {
+		Title, GeneratedAt, Graph string
+		Issues                    []issueData
+	}{Title: escapeReportText(opts.Title), GeneratedAt: opts.GeneratedAt.Format(time.RFC3339), Issues: make([]issueData, 0, len(issues))}
+	if opts.IncludeGraph {
+		data.Graph = reportMermaid(opts.GraphIssues)
+	}
+	for _, issue := range issues {
+		labels := make([]string, 0, len(issue.Labels))
+		for _, label := range issue.Labels {
+			labels = append(labels, escapeReportText(label))
+		}
+		data.Issues = append(data.Issues, issueData{escapeReportText(issue.ID), escapeReportText(issue.Title), escapeReportText(string(issue.Status)), escapeReportText(string(issue.IssueType)), escapeReportText(issue.Description), issue.Priority, labels})
+	}
+	writer := &reportTemplateWriter{remaining: 16 << 20}
+	if err := tmpl.Execute(writer, data); err != nil {
+		return nil, fmt.Errorf("render export template: %w", err)
+	}
+	return writer.Bytes(), nil
+}
+
+type reportTemplateWriter struct {
+	bytes.Buffer
+	remaining int
+}
+
+func (w *reportTemplateWriter) Write(raw []byte) (int, error) {
+	if len(raw) > w.remaining {
+		return 0, fmt.Errorf("rendered export template exceeds 16 MiB")
+	}
+	w.remaining -= len(raw)
+	return w.Buffer.Write(raw)
+}
+
+func escapeReportText(value string) string {
+	// Escape Markdown before HTML so numeric entities introduced for quotes
+	// are not broken by escaping their '#'. HTML-sensitive punctuation is
+	// handled by EscapeString; the remaining punctuation stays literal even
+	// in list, heading, fence, link and GFM strikethrough positions.
+	const markdownPunctuation = "\\`*_[]|#!$%()+,-./:;=?@^{}~"
+	var markdown strings.Builder
+	markdown.Grow(len(value))
+	for _, r := range value {
+		if strings.ContainsRune(markdownPunctuation, r) {
+			markdown.WriteByte('\\')
+		}
+		markdown.WriteRune(r)
+	}
+	escaped := html.EscapeString(markdown.String())
+	var literal strings.Builder
+	literal.Grow(len(escaped))
+	lineStart := true
+	for _, r := range escaped {
+		if lineStart && (r == ' ' || r == '\t') {
+			// Character references preserve the text while preventing field
+			// indentation from starting a Markdown code block.
+			if r == ' ' {
+				literal.WriteString("&#32;")
+			} else {
+				literal.WriteString("&#9;")
+			}
+			continue
+		}
+		literal.WriteRune(r)
+		lineStart = r == '\n' || r == '\r'
+	}
+	return literal.String()
+}
 
 // Package-level compiled regex for slug creation (avoids recompilation per call)
 var slugNonAlphanumericRegex = regexp.MustCompile(`[^a-z0-9]+`)
@@ -71,12 +356,22 @@ func sanitizeMermaidText(text string) string {
 }
 
 // GenerateMarkdown creates a comprehensive markdown report of all issues
-func GenerateMarkdown(issues []model.Issue, title string) (string, error) {
+func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptions) (string, error) {
+	opts := ReportOptions{IncludeGraph: true, GeneratedAt: time.Now(), GraphIssues: issues}
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	if opts.GeneratedAt.IsZero() {
+		opts.GeneratedAt = time.Now()
+	}
+	if opts.IncludeGraph && opts.GraphIssues == nil {
+		opts.GraphIssues = issues
+	}
 	var sb strings.Builder
 
 	// Header
 	sb.WriteString(fmt.Sprintf("# %s\n\n", title))
-	sb.WriteString(fmt.Sprintf("*Generated: %s*\n\n", time.Now().Format(time.RFC1123)))
+	sb.WriteString(fmt.Sprintf("*Generated: %s*\n\n", opts.GeneratedAt.Format(time.RFC1123)))
 
 	// Summary Statistics
 	sb.WriteString("## Summary\n\n")
@@ -105,7 +400,7 @@ func GenerateMarkdown(issues []model.Issue, title string) (string, error) {
 	sb.WriteString(fmt.Sprintf("| Closed | %d |\n\n", closed))
 
 	// Quick Actions Section
-	sb.WriteString(generateQuickActions(issues))
+	sb.WriteString(generateQuickActions(issues, opts))
 
 	// Precompute stable, unique slugs for TOC anchors and headings.
 	slugCounts := make(map[string]int, len(issues))
@@ -125,19 +420,16 @@ func GenerateMarkdown(issues []model.Issue, title string) (string, error) {
 	sb.WriteString("\n---\n\n")
 
 	// Dependency Graph (Mermaid)
-	sb.WriteString("## Dependency Graph\n\n")
-	sb.WriteString("```mermaid\n")
+	if opts.IncludeGraph {
+		sb.WriteString("## Dependency Graph\n\n")
+		sb.WriteString("```mermaid\n")
 
-	issueIDs := make(map[string]bool)
-	for _, i := range issues {
-		issueIDs[i.ID] = true
+		graph := reportMermaid(opts.GraphIssues)
+		sb.WriteString(graph)
+
+		sb.WriteString("```\n\n")
+		sb.WriteString("---\n\n")
 	}
-
-	graph := GenerateMermaidGraph(issues, issueIDs, MermaidConfig{ShowNoDependenciesNode: true})
-	sb.WriteString(graph)
-
-	sb.WriteString("```\n\n")
-	sb.WriteString("---\n\n")
 
 	// Individual Issues
 	for idx, i := range issues {
@@ -223,7 +515,7 @@ func GenerateMarkdown(issues []model.Issue, title string) (string, error) {
 		}
 
 		// Per-issue command snippets
-		sb.WriteString(generateIssueCommands(i))
+		sb.WriteString(generateIssueCommands(i, opts))
 
 		sb.WriteString("---\n\n")
 	}
@@ -337,72 +629,30 @@ func SaveMarkdownToFile(issues []model.Issue, filename string) error {
 	return os.WriteFile(filename, []byte(content), 0644)
 }
 
-// generateQuickActions creates a Quick Actions section with bulk commands
-func generateQuickActions(issues []model.Issue) string {
+// generateQuickActions offers inspection commands bound to each live tracker.
+// A report does not establish that every open issue is ready to be closed.
+func generateQuickActions(issues []model.Issue, options ReportOptions) string {
 	var sb strings.Builder
-
-	// Collect non-closed issues for bulk operations
-	var openIDs, inProgressIDs, blockedIDs []string
-	var highPriorityIDs []string // P0 and P1
-
-	for _, i := range issues {
-		escapedID := shellEscape(i.ID)
-		switch i.Status {
-		case model.StatusOpen:
-			openIDs = append(openIDs, escapedID)
-		case model.StatusInProgress:
-			inProgressIDs = append(inProgressIDs, escapedID)
-		case model.StatusBlocked:
-			blockedIDs = append(blockedIDs, escapedID)
+	for _, issue := range issues {
+		if isClosedLikeStatus(issue.Status) {
+			continue
 		}
-		if !isClosedLikeStatus(i.Status) && i.Priority <= 1 {
-			highPriorityIDs = append(highPriorityIDs, escapedID)
+		actions := issue.Actions(false)
+		if actions.Show != nil {
+			if sb.Len() == 0 {
+				sb.WriteString("## Quick Actions\n\nInspect the current tracker before acting on this snapshot:\n\n```bash\n")
+			}
+			sb.WriteString(actions.Show.Shell + "\n")
 		}
 	}
-
-	// Only generate section if there are actionable items
-	if len(openIDs)+len(inProgressIDs)+len(blockedIDs) == 0 {
-		return ""
+	if sb.Len() > 0 {
+		sb.WriteString("```\n\n")
 	}
-
-	sb.WriteString("## Quick Actions\n\n")
-	sb.WriteString("Ready-to-run commands for bulk operations:\n\n")
-	sb.WriteString("```bash\n")
-
-	// Close in-progress items (most common action)
-	if len(inProgressIDs) > 0 {
-		sb.WriteString("# Close all in-progress items\n")
-		sb.WriteString(fmt.Sprintf("br close %s\n\n", strings.Join(inProgressIDs, " ")))
-	}
-
-	// Close open items
-	if len(openIDs) > 0 && len(openIDs) <= 10 {
-		sb.WriteString("# Close all open items\n")
-		sb.WriteString(fmt.Sprintf("br close %s\n\n", strings.Join(openIDs, " ")))
-	} else if len(openIDs) > 10 {
-		sb.WriteString(fmt.Sprintf("# Close open items (%d total, showing first 10)\n", len(openIDs)))
-		sb.WriteString(fmt.Sprintf("br close %s\n\n", strings.Join(openIDs[:10], " ")))
-	}
-
-	// Bulk priority update for high-priority items
-	if len(highPriorityIDs) > 0 {
-		sb.WriteString("# View high-priority items (P0/P1)\n")
-		sb.WriteString(fmt.Sprintf("br show %s\n\n", strings.Join(highPriorityIDs, " ")))
-	}
-
-	// Unblock blocked items
-	if len(blockedIDs) > 0 {
-		sb.WriteString("# Update blocked items to in_progress when unblocked\n")
-		sb.WriteString(fmt.Sprintf("br update %s -s in_progress\n", strings.Join(blockedIDs, " ")))
-	}
-
-	sb.WriteString("```\n\n")
-
 	return sb.String()
 }
 
 // generateIssueCommands creates command snippets for a single issue
-func generateIssueCommands(issue model.Issue) string {
+func generateIssueCommands(issue model.Issue, options ReportOptions) string {
 	var sb strings.Builder
 
 	// Skip command snippets for closed issues
@@ -410,33 +660,22 @@ func generateIssueCommands(issue model.Issue) string {
 		return ""
 	}
 
-	escapedID := shellEscape(issue.ID)
+	claimable := options.AuthorityComplete && options.Readiness != nil && options.Readiness.Claimable(issue.ID, options.GeneratedAt)
+	actions := issue.Actions(claimable)
+	if actions.Show == nil {
+		return ""
+	}
 
 	sb.WriteString("<details>\n<summary>📋 Commands</summary>\n\n")
 	sb.WriteString("```bash\n")
 
-	// Status transitions based on current state
-	switch issue.Status {
-	case model.StatusOpen:
-		sb.WriteString("# Start working on this issue\n")
-		sb.WriteString(fmt.Sprintf("br update %s -s in_progress\n\n", escapedID))
-	case model.StatusInProgress:
-		sb.WriteString("# Mark as complete\n")
-		sb.WriteString(fmt.Sprintf("br close %s\n\n", escapedID))
-	case model.StatusBlocked:
-		sb.WriteString("# Unblock and start working\n")
-		sb.WriteString(fmt.Sprintf("br update %s -s in_progress\n\n", escapedID))
+	if actions.Claim != nil {
+		sb.WriteString("# Atomically claim; the live tracker may reject a stale recommendation\n")
+		sb.WriteString(actions.Claim.Shell + "\n\n")
 	}
 
-	// Common actions
-	sb.WriteString("# Add a comment\n")
-	sb.WriteString(fmt.Sprintf("br comment %s 'Your comment here'\n\n", escapedID))
-
-	sb.WriteString("# Change priority (0=Critical, 1=High, 2=Medium, 3=Low)\n")
-	sb.WriteString(fmt.Sprintf("br update %s -p 1\n\n", escapedID))
-
 	sb.WriteString("# View full details\n")
-	sb.WriteString(fmt.Sprintf("br show %s\n", escapedID))
+	sb.WriteString(actions.Show.Shell + "\n")
 
 	sb.WriteString("```\n\n")
 	sb.WriteString("</details>\n\n")

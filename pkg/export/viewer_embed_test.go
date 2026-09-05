@@ -1,12 +1,74 @@
 package export
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 )
+
+func TestCopyEmbeddedAssets_BindsCompleteOfflineBundle(t *testing.T) {
+	out := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(out, "chunks"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range map[string]string{
+		"beads.sqlite3.config.json": `{"chunked":true,"chunk_count":1}`,
+		"chunks/00000.bin":          "database chunk",
+	} {
+		if err := os.WriteFile(filepath.Join(out, name), []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := CopyEmbeddedAssets(out, "Offline test"); err != nil {
+		t.Fatal(err)
+	}
+	worker, err := os.ReadFile(filepath.Join(out, "coi-serviceworker.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	match := regexp.MustCompile(`const OFFLINE_ASSETS = (\[.*\]);`).FindSubmatch(worker)
+	if len(match) != 2 {
+		t.Fatal("exported worker has no offline file manifest")
+	}
+	var assets []struct {
+		Path string `json:"path"`
+		Hash string `json:"sha256"`
+	}
+	if err := json.Unmarshal(match[1], &assets); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, asset := range assets {
+		if seen[asset.Path] {
+			t.Fatalf("duplicate cache key %s", asset.Path)
+		}
+		seen[asset.Path] = true
+		data, err := os.ReadFile(filepath.Join(out, filepath.FromSlash(asset.Path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(data)
+		if asset.Hash != fmt.Sprintf("%x", hash) {
+			t.Errorf("%s hash does not bind exported bytes", asset.Path)
+		}
+	}
+	for _, required := range []string{"index.html", "viewer.js", "vendor/sql-wasm.wasm", "vendor/bv_graph_bg.wasm", "beads.sqlite3.config.json", "chunks/00000.bin"} {
+		if !seen[required] {
+			t.Errorf("required offline asset missing: %s", required)
+		}
+	}
+	if seen["coi-serviceworker.js"] || seen["graph-demo.html"] {
+		t.Fatal("self-referential/development asset in offline manifest")
+	}
+	if strings.Contains(string(worker), "CACHE_REVISION = 'development'") {
+		t.Fatal("offline cache has no bundle revision")
+	}
+}
 
 // TestEmbeddedIndex_CSPHasNoInlineScripts guards the dashboard's script
 // policy: script-src carries no 'unsafe-inline', no <script> block is inline,

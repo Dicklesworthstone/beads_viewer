@@ -524,12 +524,12 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 func (e *SQLiteExporter) writeRobotOutputs(dataDir string) error {
 	// Write triage output
 	if e.Triage != nil {
-		if err := writeJSON(filepath.Join(dataDir, "triage.json"), e.Triage); err != nil {
+		if err := e.writeRobotJSON(filepath.Join(dataDir, "triage.json"), e.Triage); err != nil {
 			return fmt.Errorf("write triage.json: %w", err)
 		}
 
 		// Also emit a compact project_health.json for fast robot consumption
-		if err := writeJSON(filepath.Join(dataDir, "project_health.json"), e.Triage.ProjectHealth); err != nil {
+		if err := e.writeRobotJSON(filepath.Join(dataDir, "project_health.json"), e.Triage.ProjectHealth); err != nil {
 			return fmt.Errorf("write project_health.json: %w", err)
 		}
 	}
@@ -543,11 +543,26 @@ func (e *SQLiteExporter) writeRobotOutputs(dataDir string) error {
 		DepCount:    len(e.Deps),
 		Title:       e.Config.Title,
 	}
-	if err := writeJSON(filepath.Join(dataDir, "meta.json"), meta); err != nil {
+	if err := e.writeRobotJSON(filepath.Join(dataDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)
 	}
 
 	return nil
+}
+
+func (e *SQLiteExporter) writeRobotJSON(path string, payload any) error {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encoding export payload: %w", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return fmt.Errorf("reading export payload fields: %w", err)
+	}
+	for key, value := range e.Config.RobotEnvelope {
+		fields[key] = value
+	}
+	return writeJSON(path, fields)
 }
 
 // chunkIfNeeded splits the database into chunks if it exceeds the threshold.
@@ -850,7 +865,7 @@ func (e *SQLiteExporter) ExportToJSON(path string) error {
 		Issues: issues,
 	}
 
-	return writeJSON(path, output)
+	return e.writeRobotJSON(path, output)
 }
 
 // stringSliceContains checks if a string slice contains a value.
@@ -1005,5 +1020,5 @@ func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
 		EdgeCount:   len(links),
 	}
 
-	return writeJSON(filepath.Join(dataDir, "graph_layout.json"), layout)
+	return e.writeRobotJSON(filepath.Join(dataDir, "graph_layout.json"), layout)
 }

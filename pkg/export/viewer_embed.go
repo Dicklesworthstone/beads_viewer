@@ -2,12 +2,15 @@
 package export
 
 import (
+	"crypto/sha256"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"html"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -24,6 +27,7 @@ var ViewerAssetsFS embed.FS
 // CopyEmbeddedAssets copies all embedded viewer assets to the specified output directory.
 // If title is provided, it replaces "Beads Viewer" in index.html.
 func CopyEmbeddedAssets(outputDir, title string) error {
+	var offlineFiles []string
 	// Walk the embedded filesystem and copy all files
 	err := fs.WalkDir(ViewerAssetsFS, "viewer_assets", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -76,10 +80,40 @@ func CopyEmbeddedAssets(outputDir, title string) error {
 		}
 
 		// Write the file
+		if relPath != "coi-serviceworker.js" {
+			offlineFiles = append(offlineFiles, relPath)
+		}
 		return os.WriteFile(destPath, content, 0644)
 	})
 
 	if err != nil {
+		return err
+	}
+
+	// SQLite export precedes asset copying. Bind the worker's offline cache to
+	// this exact bundle, including config/chunks, before a browser can activate it.
+	for _, name := range []string{"beads.sqlite3", "beads.sqlite3.config.json", "chunks", "data"} {
+		base := filepath.Join(outputDir, name)
+		if _, err := os.Stat(base); os.IsNotExist(err) {
+			continue // CopyEmbeddedAssets also supports standalone asset callers.
+		}
+		if err := filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() {
+				rel, err := filepath.Rel(outputDir, p)
+				if err != nil {
+					return err
+				}
+				offlineFiles = append(offlineFiles, filepath.ToSlash(rel))
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("collecting offline database assets: %w", err)
+		}
+	}
+	if err := bindOfflineAssets(outputDir, offlineFiles); err != nil {
 		return err
 	}
 
@@ -91,6 +125,39 @@ func CopyEmbeddedAssets(outputDir, title string) error {
 	}
 
 	return nil
+}
+
+// bindOfflineAssets embeds the exact file hashes consumed by SW installation.
+// A missing or changed asset prevents activation; it cannot create a verified
+// partial offline bundle. This list exists only to serve the offline cache.
+func bindOfflineAssets(outputDir string, files []string) error {
+	sort.Strings(files)
+	type asset struct {
+		Path string `json:"path"`
+		Hash string `json:"sha256"`
+	}
+	assets := make([]asset, 0, len(files))
+	for _, name := range files {
+		data, err := os.ReadFile(filepath.Join(outputDir, filepath.FromSlash(name)))
+		if err != nil {
+			return fmt.Errorf("hashing offline asset %s: %w", name, err)
+		}
+		assets = append(assets, asset{name, fmt.Sprintf("%x", sha256.Sum256(data))})
+	}
+	encoded, err := json.Marshal(assets)
+	if err != nil {
+		return fmt.Errorf("encoding offline assets: %w", err)
+	}
+	worker, err := ViewerAssetsFS.ReadFile("viewer_assets/coi-serviceworker.js")
+	if err != nil {
+		return fmt.Errorf("reading offline worker: %w", err)
+	}
+	hash := sha256.New()
+	hash.Write(worker)
+	hash.Write(encoded)
+	content := strings.Replace(string(worker), "const OFFLINE_ASSETS = [];", "const OFFLINE_ASSETS = "+string(encoded)+";", 1)
+	content = strings.Replace(content, "const CACHE_REVISION = 'development';", fmt.Sprintf("const CACHE_REVISION = '%x';", hash.Sum(nil)), 1)
+	return os.WriteFile(filepath.Join(outputDir, "coi-serviceworker.js"), []byte(content), 0644)
 }
 
 // isDevOnlyAsset reports whether a viewer asset is development-only and must
