@@ -26,7 +26,8 @@ func TestLoadSmartNonIssueShadow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := LoadIssuesFromDir(beads)
+	loaded, err := LoadIssuesFromDir(beads)
+	got := loaded.Issues
 	if err != nil || len(got) != 2 {
 		t.Fatalf("clean: got %d issues err=%v, want 2", len(got), err)
 	}
@@ -40,7 +41,8 @@ func TestLoadSmartNonIssueShadow(t *testing.T) {
 	now := time.Now()
 	_ = os.Chtimes(sprints, now, now)
 
-	got2, err := LoadIssuesFromDir(beads)
+	loaded2, err := LoadIssuesFromDir(beads)
+	got2 := loaded2.Issues
 	if err != nil {
 		t.Fatalf("with sprints: err=%v", err)
 	}
@@ -60,7 +62,8 @@ func TestLoadSmartEmptyProjectValid(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(beads, "issues.jsonl"), []byte(""), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got, err := LoadIssuesFromDir(beads)
+	loaded, err := LoadIssuesFromDir(beads)
+	got := loaded.Issues
 	if err != nil || len(got) != 0 {
 		t.Errorf("empty project: got %d issues err=%v, want 0 / nil", len(got), err)
 	}

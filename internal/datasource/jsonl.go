@@ -3,6 +3,7 @@ package datasource
 import (
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
@@ -11,7 +12,9 @@ import (
 
 // JSONLReader implements IssueReader for JSONL files on disk.
 type JSONLReader struct {
-	path string
+	path     string
+	reportMu sync.Mutex
+	report   LoadReport
 }
 
 // NewJSONLReader creates a reader for a JSONL data source.
@@ -23,15 +26,17 @@ func NewJSONLReader(source DataSource) (*JSONLReader, error) {
 }
 
 // LoadIssues returns all non-tombstone issues from the JSONL file.
-// Parse accounting is published via LastLoadReport so records dropped during
+// Parse accounting is retained by this reader so records dropped during
 // load (malformed JSON, failed validation) stay visible to callers (#190).
 func (r *JSONLReader) LoadIssues() ([]model.Issue, error) {
 	rec := newLoadRecorder(r.path)
 	all, err := loader.LoadIssuesFromFileWithOptions(r.path, rec.options())
+	r.reportMu.Lock()
+	r.report = rec.finish(all, err == nil)
+	r.reportMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	rec.commit()
 	// Filter out tombstone issues to match the IssueReader contract.
 	out := make([]model.Issue, 0, len(all))
 	for i := range all {
@@ -40,6 +45,12 @@ func (r *JSONLReader) LoadIssues() ([]model.Issue, error) {
 		}
 	}
 	return out, nil
+}
+
+func (r *JSONLReader) LoadReport() LoadReport {
+	r.reportMu.Lock()
+	defer r.reportMu.Unlock()
+	return cloneLoadReport(r.report)
 }
 
 // LoadIssuesFiltered returns issues matching the provided filter.

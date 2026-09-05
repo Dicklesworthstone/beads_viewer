@@ -367,6 +367,12 @@ func TestFindWorkspaceConfig(t *testing.T) {
 }
 
 func TestFindWorkspaceConfigNotFound(t *testing.T) {
+	// This test asserts that no ancestor config exists. Use the platform temp
+	// root, since RCH's TMPDIR can be below a source checkout with .bv config.
+	// TestFindWorkspaceConfig retains real parent traversal within its fixture.
+	t.Setenv("TMPDIR", "")
+	t.Setenv("TMP", "")
+	t.Setenv("TEMP", "")
 	tmpDir := t.TempDir()
 
 	_, err := workspace.FindWorkspaceConfig(tmpDir)

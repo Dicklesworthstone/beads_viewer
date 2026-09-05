@@ -676,7 +676,8 @@ func TestGitLoaderReportExcludesTombstonesWithoutChangingParseAccounting(t *test
 	runGit(t, repoDir, "config", "user.email", "test@example.com")
 	runGit(t, repoDir, "config", "user.name", "Test User")
 	content := strings.Join([]string{
-		`{"id":"LIVE-1","title":"Visible","status":"open","issue_type":"task"}`,
+		`{"id":"LIVE-1","title":"Visible","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"DELETED-1","type":"blocks"}]}`,
+		`{"id":"UNKNOWN-1","title":"Missing dependency","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"ABSENT","type":"blocks"}]}`,
 		`{"id":"DELETED-1","title":"Deleted","status":"tombstone","issue_type":"task"}`,
 	}, "\n") + "\n"
 	commitGitLoaderFixture(t, repoDir, ".beads/issues.jsonl", content, "historical tombstone authority")
@@ -687,12 +688,25 @@ func TestGitLoaderReportExcludesTombstonesWithoutChangingParseAccounting(t *test
 		if err != nil {
 			t.Fatalf("attempt %d historical report: %v", attempt, err)
 		}
-		if len(report.Issues) != 1 || report.Issues[0].ID != "LIVE-1" {
-			t.Fatalf("attempt %d visible historical issues = %+v, want only LIVE-1", attempt, report.Issues)
+		if len(report.Issues) != 2 || report.Issues[0].ID != "LIVE-1" || report.Issues[1].ID != "UNKNOWN-1" {
+			t.Fatalf("attempt %d visible historical issues = %+v, want LIVE-1 and UNKNOWN-1", attempt, report.Issues)
 		}
-		if report.ParseStats != (ParseStats{Valid: 2}) {
-			t.Fatalf("attempt %d parse stats = %+v, want both valid source records counted", attempt, report.ParseStats)
+		if report.ParseStats != (ParseStats{Valid: 3}) {
+			t.Fatalf("attempt %d parse stats = %+v, want all valid source records counted", attempt, report.ParseStats)
 		}
+		if len(report.TombstoneIDs) != 1 || report.TombstoneIDs[0] != "DELETED-1" {
+			t.Fatalf("attempt %d lost historical tombstone authority: %v", attempt, report.TombstoneIDs)
+		}
+		authority := append([]model.Issue(nil), report.Issues...)
+		for _, id := range report.TombstoneIDs {
+			authority = append(authority, model.Issue{ID: id, Status: model.StatusTombstone})
+		}
+		readiness := model.NewReadinessIndex(authority)
+		if !readiness.Ready("LIVE-1", time.Now()) || readiness.Ready("UNKNOWN-1", time.Now()) {
+			t.Fatalf("attempt %d confused a known tombstone with an absent dependency", attempt)
+		}
+		// Cache retrieval must preserve deleted authority despite caller edits.
+		report.TombstoneIDs[0] = "caller-mutated"
 	}
 }
 
@@ -754,6 +768,9 @@ func TestGitLoaderRejectsMalformedPreferredSourceWithoutLegacyFallback(t *testin
 	report, err := gitLoader.LoadAtWithReport("HEAD")
 	if err == nil {
 		t.Fatalf("malformed preferred source fell through to legacy authority: %+v", report)
+	}
+	if report.ParseStats.Errors != 1 || report.ParseStats.Valid != 0 || report.SourcePath != ".beads/issues.jsonl" || len(report.Warnings) != 1 {
+		t.Fatalf("rejected source lost structured parse accounting: %+v", report)
 	}
 	for _, want := range []string{".beads/issues.jsonl", "no issue records"} {
 		if !strings.Contains(err.Error(), want) {

@@ -143,8 +143,11 @@ func TestLoadIssues_FresherSyncBaseDoesNotWin(t *testing.T) {
 		return analysis.ComputeDataHash(clean)
 	}()
 
+	var loaded LoadResult
 	stderr := captureStderr(t, func() {
-		got, err := LoadIssuesFromDir(beads)
+		var err error
+		loaded, err = LoadIssuesFromDir(beads)
+		got := loaded.Issues
 		if err != nil {
 			t.Fatalf("LoadIssuesFromDir: %v", err)
 		}
@@ -158,9 +161,9 @@ func TestLoadIssues_FresherSyncBaseDoesNotWin(t *testing.T) {
 	if strings.Contains(stderr, "skipping invalid issue") || strings.Contains(stderr, "Warning") {
 		t.Errorf("probing sidecars leaked warnings to stderr:\n%s", stderr)
 	}
-	rep := LastLoadReport()
-	if rep == nil || filepath.Base(rep.Path) != "issues.jsonl" {
-		t.Fatalf("LastLoadReport = %+v, want issues.jsonl", rep)
+	rep := &loaded.Report
+	if filepath.Base(rep.Path) != "issues.jsonl" {
+		t.Fatalf("load report = %+v, want issues.jsonl", rep)
 	}
 	if rep.Errors != 0 || rep.Valid != 2 {
 		t.Errorf("load report = %+v, want 2 valid / 0 errors", rep)
@@ -193,12 +196,14 @@ func TestLoadIssues_RejectedCandidateIsSilentSelectedStillWarns(t *testing.T) {
 
 	t.Setenv("BV_ROBOT", "")
 	var got int
+	var loaded LoadResult
 	stderr := captureStderr(t, func() {
-		issues, err := LoadIssuesFromDir(beads)
+		var err error
+		loaded, err = LoadIssuesFromDir(beads)
 		if err != nil {
 			t.Fatalf("LoadIssuesFromDir: %v", err)
 		}
-		got = len(issues)
+		got = len(loaded.Issues)
 	})
 	if got != 1 {
 		t.Fatalf("got %d issues, want 1 from issues.jsonl", got)
@@ -206,7 +211,7 @@ func TestLoadIssues_RejectedCandidateIsSilentSelectedStillWarns(t *testing.T) {
 	if strings.Contains(stderr, "bad 1") || strings.Count(stderr, "Warning:") != 1 {
 		t.Errorf("stderr should carry exactly the selected source's one warning, got:\n%s", stderr)
 	}
-	if rep := LastLoadReport(); rep == nil || filepath.Base(rep.Path) != "issues.jsonl" || rep.Errors != 1 {
+	if rep := loaded.Report; filepath.Base(rep.Path) != "issues.jsonl" || rep.Errors != 1 {
 		t.Errorf("load report = %+v, want issues.jsonl with 1 error", rep)
 	}
 }
@@ -226,19 +231,21 @@ func TestLoadIssues_HonoursMaxLineSizeEnv(t *testing.T) {
 
 	t.Setenv(loader.MaxLineSizeEnvVar, "2")
 	t.Setenv("BV_ROBOT", "1") // keep the oversized-line warning out of the test output
-	got, err := LoadIssuesFromDir(beads)
+	loaded, err := LoadIssuesFromDir(beads)
+	got := loaded.Issues
 	if err != nil {
 		t.Fatalf("with 2MB cap: %v", err)
 	}
 	if len(got) != 1 {
 		t.Fatalf("with 2MB cap got %d issues, want 1 (oversized line dropped)", len(got))
 	}
-	if rep := LastLoadReport(); rep == nil || rep.Errors == 0 {
+	if rep := loaded.Report; rep.Errors == 0 {
 		t.Errorf("dropped oversized line must be counted in the load report, got %+v", rep)
 	}
 
 	t.Setenv(loader.MaxLineSizeEnvVar, "4")
-	got, err = LoadIssuesFromDir(beads)
+	loaded, err = LoadIssuesFromDir(beads)
+	got = loaded.Issues
 	if err != nil {
 		t.Fatalf("with 4MB cap: %v", err)
 	}

@@ -177,7 +177,8 @@ func CompareSources(sourceA, sourceB DataSource, opts DiffOptions) (*SourceDiff,
 
 // loadIssuesFromSource loads issues from any source type via the IssueReader interface.
 func loadIssuesFromSource(source DataSource) ([]model.Issue, error) {
-	return LoadFromSource(source)
+	loaded, err := LoadFromSource(source)
+	return loaded.Issues, err
 }
 
 // CheckAllSourcesConsistent compares all sources and reports any inconsistencies

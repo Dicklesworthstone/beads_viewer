@@ -27,15 +27,23 @@ type LoadResult struct {
 
 	// RepoPath is the configured repository path, retained so diagnostics stay
 	// unambiguous even when display names are duplicated or contain delimiters.
-	RepoPath string
+	RepoPath   string
+	SourcePath string
+	Disabled   bool
 
 	// Issues are the loaded issues with namespaced IDs
 	Issues []model.Issue
 
+	// TombstoneIDs names valid deleted records retained as dependency authority.
+	// IDs use the same repository namespace as Issues.
+	TombstoneIDs []string
+
 	// ParseStats records source-order JSONL accounting for this repository.
 	// A successful load with Errors > 0 is usable for exploratory workspace
 	// views, but it is not a complete authority for claim-emitting robot output.
-	ParseStats loader.ParseStats
+	ParseStats    loader.ParseStats
+	ParseWarnings []string
+	WarningCount  int
 
 	// AuthorityWarnings records source-selection fallbacks that kept this
 	// repository readable but may have made its issue snapshot stale.
@@ -83,17 +91,13 @@ func (l *AggregateLoader) LoadAll(ctx context.Context) ([]model.Issue, []LoadRes
 		return nil, nil, fmt.Errorf("workspace config is nil")
 	}
 
-	// Collect enabled repos
-	enabledRepos, err := l.getEnabledRepos()
+	// Keep disabled repositories in diagnostics without attempting to read them.
+	repos, err := l.getRepos()
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(enabledRepos) == 0 {
-		return nil, nil, fmt.Errorf("no enabled repositories in workspace")
-	}
-
 	// Load repos in parallel using errgroup
-	results, err := l.loadReposParallel(ctx, enabledRepos)
+	results, err := l.loadReposParallel(ctx, repos)
 	if err != nil {
 		return nil, results, fmt.Errorf("fatal error during parallel loading: %w", err)
 	}
@@ -102,9 +106,14 @@ func (l *AggregateLoader) LoadAll(ctx context.Context) ([]model.Issue, []LoadRes
 	var allIssues []model.Issue
 	var failedRepoNames []string
 	var firstRepoErr error
+	enabledCount := 0
 	issueSource := make(map[string]string)
 	collisionSources := make(map[string]map[string]bool)
 	for _, result := range results {
+		if result.Disabled {
+			continue
+		}
+		enabledCount++
 		if result.Error != nil {
 			// Log but continue - individual repo failures don't break the whole load
 			l.logRepoError(result.RepoName, result.Error)
@@ -115,22 +124,31 @@ func (l *AggregateLoader) LoadAll(ctx context.Context) ([]model.Issue, []LoadRes
 			continue
 		}
 		identity := workspaceLoadResultIdentity(result)
-		for _, issue := range result.Issues {
-			if previous, exists := issueSource[issue.ID]; exists {
-				if collisionSources[issue.ID] == nil {
-					collisionSources[issue.ID] = map[string]bool{previous: true}
+		recordIssueSource := func(id string) {
+			if previous, exists := issueSource[id]; exists {
+				if collisionSources[id] == nil {
+					collisionSources[id] = map[string]bool{previous: true}
 				}
-				collisionSources[issue.ID][identity] = true
+				collisionSources[id][identity] = true
 			} else {
-				issueSource[issue.ID] = identity
+				issueSource[id] = identity
 			}
+		}
+		for _, issue := range result.Issues {
+			recordIssueSource(issue.ID)
+		}
+		for _, id := range result.TombstoneIDs {
+			recordIssueSource(id)
 		}
 		allIssues = append(allIssues, result.Issues...)
 	}
 
-	if len(failedRepoNames) == len(results) {
+	if enabledCount == 0 {
+		return nil, results, fmt.Errorf("no enabled repositories in workspace")
+	}
+	if len(failedRepoNames) == enabledCount {
 		return nil, results, fmt.Errorf("all %d enabled repositories failed to load (%s): %w",
-			len(results), strings.Join(failedRepoNames, ", "), firstRepoErr)
+			enabledCount, strings.Join(failedRepoNames, ", "), firstRepoErr)
 	}
 	if len(collisionSources) > 0 {
 		ids := make([]string, 0, len(collisionSources))
@@ -153,8 +171,9 @@ func (l *AggregateLoader) LoadAll(ctx context.Context) ([]model.Issue, []LoadRes
 	return allIssues, results, nil
 }
 
-// getEnabledRepos returns all explicitly configured and discovered enabled repos.
-func (l *AggregateLoader) getEnabledRepos() ([]RepoConfig, error) {
+// getRepos returns configured and discovered repositories, including disabled
+// entries whose paths suppress auto-discovery of that same repository.
+func (l *AggregateLoader) getRepos() ([]RepoConfig, error) {
 	var enabled []RepoConfig
 	seenPaths := make(map[string]bool)
 	seenPrefixes := make(map[string]bool)
@@ -173,6 +192,7 @@ func (l *AggregateLoader) getEnabledRepos() ([]RepoConfig, error) {
 		seenPaths[pathKey] = true
 
 		if !repo.IsEnabled() {
+			enabled = append(enabled, repo)
 			return nil
 		}
 
@@ -388,6 +408,10 @@ func (l *AggregateLoader) loadReposParallel(ctx context.Context, repos []RepoCon
 
 	for i, repo := range repos {
 		i, repo := i, repo // capture loop variables
+		if !repo.IsEnabled() {
+			results[i] = LoadResult{RepoName: repo.GetName(), Prefix: repo.GetPrefix(), RepoPath: repo.Path, Disabled: true}
+			continue
+		}
 
 		g.Go(func() error {
 			select {
@@ -402,17 +426,7 @@ func (l *AggregateLoader) loadReposParallel(ctx context.Context, repos []RepoCon
 			default:
 			}
 
-			issues, parseStats, authorityWarnings, err := l.loadSingleRepo(repo, knownPrefixes)
-
-			results[i] = LoadResult{
-				RepoName:          repo.GetName(),
-				Prefix:            repo.GetPrefix(),
-				RepoPath:          repo.Path,
-				Issues:            issues,
-				ParseStats:        parseStats,
-				AuthorityWarnings: authorityWarnings,
-				Error:             err,
-			}
+			results[i] = l.loadSingleRepo(repo, knownPrefixes)
 
 			return nil // Individual repo errors are captured in results, not propagated
 		})
@@ -431,23 +445,28 @@ func (l *AggregateLoader) loadReposParallel(ctx context.Context, repos []RepoCon
 }
 
 // loadSingleRepo loads issues from a single repository and namespaced them
-func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[string]bool) ([]model.Issue, loader.ParseStats, []string, error) {
+func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[string]bool) LoadResult {
 	// Resolve the repo path relative to workspace root
 	repo = l.applyDefaults(repo)
 	repoPath := l.resolveRepoPath(repo.Path)
+	result := LoadResult{RepoName: repo.GetName(), Prefix: repo.GetPrefix(), RepoPath: repo.Path,
+		SourcePath: filepath.Join(repoPath, repo.GetBeadsPath())}
 
 	// Load raw issues from the repo, respecting custom beads path if provided
 	beadsDir, err := loader.ResolveBeadsDir(filepath.Join(repoPath, repo.GetBeadsPath()))
 	if err != nil {
-		return nil, loader.ParseStats{}, nil, fmt.Errorf("failed to resolve tracker for %s: %w", repo.GetName(), err)
+		result.Error = fmt.Errorf("failed to resolve tracker for %s: %w", repo.GetName(), err)
+		return result
 	}
-	var authorityWarnings []string
 	warnSourceFallback := func(message string) {
 		message = strings.TrimSpace(message)
 		if message == "" {
 			return
 		}
-		authorityWarnings = append(authorityWarnings, message)
+		result.WarningCount++
+		if len(result.AuthorityWarnings) < 10 {
+			result.AuthorityWarnings = append(result.AuthorityWarnings, message)
+		}
 		if l.parseWarningsUseLogger {
 			if l.logger != nil {
 				l.logger.Printf("repository %q: %s", repo.GetName(), message)
@@ -458,49 +477,63 @@ func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[stri
 	}
 	jsonlPath, err := loader.PrepareBeadsDirForRead(beadsDir, true, warnSourceFallback)
 	if err != nil {
-		return nil, loader.ParseStats{}, authorityWarnings, fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
+		result.SourcePath = beadsDir
+		result.Error = fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
+		return result
 	}
-	var parseStats loader.ParseStats
-	parseOptions := loader.ParseOptions{Stats: &parseStats}
-	if l.parseWarningsUseLogger {
-		parseOptions.WarningHandler = func(message string) {
+	result.SourcePath = jsonlPath
+	parseOptions := loader.ParseOptions{Stats: &result.ParseStats}
+	parseOptions.WarningHandler = func(message string) {
+		result.WarningCount++
+		if len(result.ParseWarnings) < 10 {
+			result.ParseWarnings = append(result.ParseWarnings, message)
+		}
+		if l.parseWarningsUseLogger {
 			if l.logger != nil {
 				l.logger.Printf("repository %q: %s", repo.GetName(), message)
 			}
+		} else if !env.Robot.Bool() {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", message)
 		}
 	}
 	issues, err := loader.LoadIssuesFromFileWithOptions(jsonlPath, parseOptions)
 	if err != nil {
-		return nil, parseStats, authorityWarnings, fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
+		result.Error = fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
+		return result
 	}
-	if parseStats.Valid == 0 && parseStats.Errors+parseStats.Skipped > 0 {
-		return nil, parseStats, authorityWarnings, fmt.Errorf("failed to load issues from %s: no issue records (%d non-issue/error lines, 0 valid issues)",
-			repo.GetName(), parseStats.Errors+parseStats.Skipped)
+	if result.ParseStats.Valid == 0 && result.ParseStats.Errors+result.ParseStats.Skipped > 0 {
+		result.Error = fmt.Errorf("failed to load issues from %s: no issue records (%d non-issue/error lines, 0 valid issues)",
+			repo.GetName(), result.ParseStats.Errors+result.ParseStats.Skipped)
+		return result
 	}
-	// ParseStats describes the source faithfully, including valid tombstone
-	// records, while the viewer's issue universe consistently excludes those
-	// soft-deleted records before namespacing, graph construction, and collision
-	// detection.
+	// Resolve local references before filtering tombstones: a deleted local ID
+	// that resembles another repository's prefix is still a local dependency.
+	localIDs := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		localIDs[issue.ID] = true
+	}
+	prefix := repo.GetPrefix()
+	var tombstoneIDs []string
+	// Keep deleted records out of views while retaining their namespaced IDs
+	// as known satisfied dependencies and checking their source for collisions.
 	visibleIssues := issues[:0]
 	for i := range issues {
-		if !issues[i].Status.IsTombstone() {
+		if issues[i].Status.IsTombstone() {
+			tombstoneIDs = append(tombstoneIDs, QualifyID(issues[i].ID, prefix))
+		} else {
 			visibleIssues = append(visibleIssues, issues[i])
 		}
 	}
 	clear(issues[len(visibleIssues):])
 	issues = visibleIssues
 
-	// Build map of local IDs for conflict resolution
-	localIDs := make(map[string]bool, len(issues))
-	for _, issue := range issues {
-		localIDs[issue.ID] = true
-	}
-
 	// Apply namespacing to all IDs
-	prefix := repo.GetPrefix()
+	loader.AttachIssueOrigins(issues, jsonlPath, result.ParseStats.Errors == 0 && len(result.AuthorityWarnings) == 0)
 	namespacedIssues := l.namespaceIssues(issues, prefix, localIDs, knownPrefixes)
 
-	return namespacedIssues, parseStats, authorityWarnings, nil
+	result.Issues = namespacedIssues
+	result.TombstoneIDs = tombstoneIDs
+	return result
 }
 
 func workspaceLoadResultIdentity(result LoadResult) string {
@@ -603,6 +636,7 @@ type LoadSummary struct {
 	TotalRepos      int
 	SuccessfulRepos int
 	FailedRepos     int
+	DisabledRepos   int
 	TotalIssues     int
 	FailedRepoNames []string
 	RepoPrefixes    []string // Prefixes of successfully loaded repos
@@ -615,7 +649,9 @@ func Summarize(results []LoadResult) LoadSummary {
 	}
 
 	for _, result := range results {
-		if result.Error != nil {
+		if result.Disabled {
+			summary.DisabledRepos++
+		} else if result.Error != nil {
 			summary.FailedRepos++
 			summary.FailedRepoNames = append(summary.FailedRepoNames, result.RepoName)
 		} else {

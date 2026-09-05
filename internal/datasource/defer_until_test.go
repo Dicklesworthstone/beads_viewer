@@ -85,8 +85,8 @@ func TestSQLiteReader_FullSchemaWithoutDeferUntilColumn(t *testing.T) {
 		);
 		CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, dependency_type TEXT);
 		CREATE TABLE comments (id TEXT, issue_id TEXT, author TEXT, text TEXT, created_at DATETIME);
-		INSERT INTO issues (id, title, status, issue_type, estimated_minutes, updated_at)
-		VALUES ('OLD-1', 'Legacy issue', 'open', 'task', 30, '2026-01-02T03:04:05Z');
+		INSERT INTO issues (id, title, status, issue_type, estimated_minutes, created_at, updated_at)
+		VALUES ('OLD-1', 'Legacy issue', 'open', 'task', 30, '2026-01-01T03:04:05Z', '2026-01-02T03:04:05Z');
 	`)
 	if closeErr := db.Close(); err == nil && closeErr != nil {
 		err = closeErr

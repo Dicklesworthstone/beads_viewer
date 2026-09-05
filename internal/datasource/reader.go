@@ -15,6 +15,9 @@ type IssueReader interface {
 	// LoadIssues returns all non-tombstone issues.
 	LoadIssues() ([]model.Issue, error)
 
+	// LoadReport returns owned accounting from this reader's most recent load.
+	LoadReport() LoadReport
+
 	// LoadIssuesFiltered returns issues that pass the filter function.
 	// A nil filter returns all issues (same as LoadIssues).
 	LoadIssuesFiltered(filter func(*model.Issue) bool) ([]model.Issue, error)

@@ -215,6 +215,65 @@ func TestAggregateLoaderExcludesTombstonesButKeepsSourceAccounting(t *testing.T)
 	if got := results[0].ParseStats; got.Valid != 2 || got.Errors != 0 || got.Skipped != 0 {
 		t.Fatalf("parse stats = %+v, want source Valid=2 Errors=0 Skipped=0", got)
 	}
+	if got := results[0].TombstoneIDs; len(got) != 1 || got[0] != "api-OLD-1" {
+		t.Fatalf("deleted dependency authority = %v, want api-OLD-1", got)
+	}
+}
+
+func TestAggregateLoaderPreservesTombstoneDependencyNamespaces(t *testing.T) {
+	root := t.TempDir()
+	createTestBeadsFile(t, filepath.Join(root, "api"), []model.Issue{
+		{ID: "LOCAL", Title: "Local deleted predecessor", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "web-GONE", Type: model.DepBlocks}}},
+		{ID: "CROSS", Title: "External deleted predecessor", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "web-DELETED", Type: model.DepBlocks}}},
+		{ID: "UNKNOWN", Title: "Missing external predecessor", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "web-ABSENT", Type: model.DepBlocks}}},
+		{ID: "web-GONE", Title: "Local tombstone resembling another namespace", Status: model.StatusTombstone},
+	})
+	createTestBeadsFile(t, filepath.Join(root, "web"), []model.Issue{
+		{ID: "DELETED", Title: "External tombstone", Status: model.StatusTombstone},
+	})
+	config := &workspace.Config{Repos: []workspace.RepoConfig{{Path: "api", Prefix: "api-"}, {Path: "web", Prefix: "web-"}}}
+	issues, results, err := workspace.NewAggregateLoader(config, root).LoadAll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 3 {
+		t.Fatalf("visible issues = %v, want three live API issues", issues)
+	}
+	authority := append([]model.Issue(nil), issues...)
+	knownDeleted := make(map[string]bool)
+	for _, result := range results {
+		for _, id := range result.TombstoneIDs {
+			knownDeleted[id] = true
+			authority = append(authority, model.Issue{ID: id, Status: model.StatusTombstone})
+		}
+	}
+	if len(knownDeleted) != 2 || !knownDeleted["api-web-GONE"] || !knownDeleted["web-DELETED"] {
+		t.Fatalf("namespaced deleted authority = %v", knownDeleted)
+	}
+	for _, issue := range issues {
+		if issue.ID == "api-LOCAL" && issue.Dependencies[0].DependsOnID != "api-web-GONE" {
+			t.Errorf("local tombstone was mistaken for an external reference: %s", issue.Dependencies[0].DependsOnID)
+		}
+	}
+	readiness := model.NewReadinessIndex(authority)
+	for _, id := range []string{"api-LOCAL", "api-CROSS"} {
+		if !readiness.Ready(id, time.Now()) {
+			t.Errorf("known deleted dependency incorrectly blocked %s", id)
+		}
+	}
+	if readiness.Ready("api-UNKNOWN", time.Now()) {
+		t.Fatal("missing external dependency was mistaken for a known tombstone")
+	}
+}
+
+func TestAggregateLoaderRejectsTombstoneLiveNamespaceCollision(t *testing.T) {
+	root := t.TempDir()
+	createTestBeadsFile(t, filepath.Join(root, "one"), []model.Issue{{ID: "b-1", Title: "Deleted", Status: model.StatusTombstone}})
+	createTestBeadsFile(t, filepath.Join(root, "two"), []model.Issue{{ID: "1", Title: "Live", Status: model.StatusOpen}})
+	config := &workspace.Config{Repos: []workspace.RepoConfig{{Path: "one", Prefix: "a-"}, {Path: "two", Prefix: "a-b-"}}}
+	if _, _, err := workspace.NewAggregateLoader(config, root).LoadAll(context.Background()); err == nil || !strings.Contains(err.Error(), "duplicate issue IDs") {
+		t.Fatalf("ambiguous deleted/live authority should fail, got %v", err)
+	}
 }
 
 func TestAggregateLoaderDefaultParseWarningsRemainInteractiveAndRobotSafe(t *testing.T) {
@@ -607,9 +666,9 @@ func TestAggregateLoaderDisabledRepos(t *testing.T) {
 		t.Fatalf("LoadAll() error = %v", err)
 	}
 
-	// Should only have 1 result (disabled repo excluded)
-	if len(results) != 1 {
-		t.Errorf("len(results) = %d, want 1", len(results))
+	// Disabled sources stay in diagnostics without being loaded.
+	if len(results) != 2 || !results[1].Disabled || results[1].Error != nil || len(results[1].Issues) != 0 {
+		t.Errorf("disabled repository accounting = %+v", results)
 	}
 
 	// Should only have 1 issue
@@ -846,6 +905,9 @@ func TestLoadAllFromRelativeConfigRefreshesCorrectBDRepoWithSanitizedEnvironment
 	}
 	observationPath := filepath.Join(workspaceRoot, "bd-observation.txt")
 	script := "#!/bin/sh\n" +
+		// Capability discovery is separate from this fake's deliberately failing
+		// export. Keep the export observation and failure assertions unchanged.
+		"if [ \"$1\" = update ] && [ \"$2\" = --help ]; then printf '%s\\n' '--db --json'; exit 0; fi\n" +
 		"{\n" +
 		"  printf 'command=%s %s\\n' \"$1\" \"$2\"\n" +
 		"  printf 'pwd=%s\\n' \"$(pwd -P)\"\n" +
@@ -1071,8 +1133,8 @@ func TestAggregateLoaderDiscoveryRespectsDisabledExplicitRepo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadAll() error = %v", err)
 	}
-	if len(results) != 1 {
-		t.Fatalf("len(results) = %d, want 1", len(results))
+	if len(results) != 2 || !results[0].Disabled || results[0].Error != nil {
+		t.Fatalf("disabled explicit repository must remain distinct from the discovered source: %+v", results)
 	}
 	if len(issues) != 1 {
 		t.Fatalf("len(issues) = %d, want 1", len(issues))

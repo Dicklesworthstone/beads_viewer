@@ -30,24 +30,26 @@ type revisionCache struct {
 
 // cacheEntry holds cached issues with metadata
 type cacheEntry struct {
-	issues     []model.Issue
-	parseStats ParseStats
-	warnings   []string
-	sourcePath string
-	loadedAt   time.Time
-	commitSHA  string
-	commitTime time.Time
+	issues       []model.Issue
+	tombstoneIDs []string
+	parseStats   ParseStats
+	warnings     []string
+	sourcePath   string
+	loadedAt     time.Time
+	commitSHA    string
+	commitTime   time.Time
 }
 
 // GitLoadReport is an immutable-by-convention snapshot of one historical
 // JSONL authority. LoadAtWithReport and its cache return caller-owned slices.
 type GitLoadReport struct {
-	Issues     []model.Issue
-	ParseStats ParseStats
-	Warnings   []string
-	SourcePath string
-	CommitSHA  string
-	CommitTime time.Time
+	Issues       []model.Issue
+	TombstoneIDs []string // Valid deleted records retained as dependency authority.
+	ParseStats   ParseStats
+	Warnings     []string
+	SourcePath   string
+	CommitSHA    string
+	CommitTime   time.Time
 }
 
 const maxGitLoadWarnings = 10
@@ -163,7 +165,7 @@ func (g *GitLoader) LoadAtWithReport(revision string) (GitLoadReport, error) {
 
 		report, err := g.loadFromGitWithReport(sha)
 		if err != nil {
-			return GitLoadReport{}, err
+			return report, err
 		}
 		commitTime, err := g.resolveCommitTime(sha)
 		if err != nil {
@@ -174,6 +176,9 @@ func (g *GitLoader) LoadAtWithReport(revision string) (GitLoadReport, error) {
 		return report, nil
 	})
 	if err != nil {
+		if report, ok := loaded.(GitLoadReport); ok {
+			return cloneGitLoadReport(report), err
+		}
 		return GitLoadReport{}, err
 	}
 	report, ok := loaded.(GitLoadReport)
@@ -371,14 +376,14 @@ func (g *GitLoader) loadFromGitWithReport(sha string) (GitLoadReport, error) {
 			// Once the highest-precedence existing authority is selected, any read
 			// or parse failure is fatal. Falling through to a lower-precedence legacy
 			// file would turn corruption into a plausible but stale snapshot.
-			return GitLoadReport{}, err
+			return report, err
 		}
 		// A non-empty source made entirely of non-issue or invalid records is
 		// not an empty historical project. Reject it here, before cache
 		// insertion, so callers cannot mistake a partial/wrong authority for a
 		// valid snapshot. A genuinely empty file remains valid.
 		if report.ParseStats.Valid == 0 && report.ParseStats.Errors+report.ParseStats.Skipped > 0 {
-			return GitLoadReport{}, fmt.Errorf("%s:%s: no issue records (%d non-issue/error lines, 0 valid issues)",
+			return report, fmt.Errorf("%s:%s: no issue records (%d non-issue/error lines, 0 valid issues)",
 				sha, path, report.ParseStats.Errors+report.ParseStats.Skipped)
 		}
 		return report, nil
@@ -438,18 +443,22 @@ func (g *GitLoader) loadFileFromGitWithReport(sha, path string) (GitLoadReport, 
 	// issue universe. Without this filter --as-of search/TUI paths can resurrect
 	// soft-deleted issues that the same JSONL authority excludes when loaded live.
 	visible := issues[:0]
+	var tombstoneIDs []string
 	for i := range issues {
-		if !issues[i].Status.IsTombstone() {
+		if issues[i].Status.IsTombstone() {
+			tombstoneIDs = append(tombstoneIDs, issues[i].ID)
+		} else {
 			visible = append(visible, issues[i])
 		}
 	}
 	clear(issues[len(visible):])
 	return GitLoadReport{
-		Issues:     visible,
-		ParseStats: stats,
-		Warnings:   warnings,
-		SourcePath: path,
-		CommitSHA:  sha,
+		Issues:       visible,
+		TombstoneIDs: tombstoneIDs,
+		ParseStats:   stats,
+		Warnings:     warnings,
+		SourcePath:   path,
+		CommitSHA:    sha,
 	}, nil
 }
 
@@ -519,24 +528,26 @@ func (c *revisionCache) setReport(report GitLoadReport) {
 	defer c.mu.Unlock()
 
 	c.entries[report.CommitSHA] = cacheEntry{
-		issues:     stored.Issues,
-		parseStats: stored.ParseStats,
-		warnings:   stored.Warnings,
-		sourcePath: stored.SourcePath,
-		loadedAt:   time.Now(),
-		commitSHA:  stored.CommitSHA,
-		commitTime: stored.CommitTime,
+		issues:       stored.Issues,
+		tombstoneIDs: stored.TombstoneIDs,
+		parseStats:   stored.ParseStats,
+		warnings:     stored.Warnings,
+		sourcePath:   stored.SourcePath,
+		loadedAt:     time.Now(),
+		commitSHA:    stored.CommitSHA,
+		commitTime:   stored.CommitTime,
 	}
 }
 
 func gitLoadReportFromCacheEntry(entry cacheEntry) GitLoadReport {
 	return cloneGitLoadReport(GitLoadReport{
-		Issues:     entry.issues,
-		ParseStats: entry.parseStats,
-		Warnings:   entry.warnings,
-		SourcePath: entry.sourcePath,
-		CommitSHA:  entry.commitSHA,
-		CommitTime: entry.commitTime,
+		Issues:       entry.issues,
+		TombstoneIDs: entry.tombstoneIDs,
+		ParseStats:   entry.parseStats,
+		Warnings:     entry.warnings,
+		SourcePath:   entry.sourcePath,
+		CommitSHA:    entry.commitSHA,
+		CommitTime:   entry.commitTime,
 	})
 }
 
@@ -547,6 +558,7 @@ func cloneGitLoadReport(report GitLoadReport) GitLoadReport {
 		cloned.Issues[i] = issue.Clone()
 	}
 	cloned.Warnings = append([]string(nil), report.Warnings...)
+	cloned.TombstoneIDs = append([]string(nil), report.TombstoneIDs...)
 	return cloned
 }
 

@@ -21,6 +21,70 @@ type readerFactory struct {
 	setup func(t *testing.T) IssueReader
 }
 
+func TestSQLiteLoadReportAccountsForReadLoss(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		extra      string
+		errors     int
+		readErrors int
+	}{
+		{"minimal_valid_without_optional_tables", "", 0, 0},
+		{"malformed_issue_row", `INSERT INTO issues VALUES ('bad', 'Unreadable priority', 'open', 'bad', NULL);`, 1, 0},
+		{"invalid_issue_row", `INSERT INTO issues VALUES ('bad', 'Invalid status', 'unsupported', 2, NULL);`, 1, 0},
+		{"malformed_dependency_row", `CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT); INSERT INTO dependencies VALUES ('safe', NULL, 'blocks');`, 0, 1},
+		{"malformed_dependency_table", `CREATE TABLE dependencies (issue_id TEXT, type TEXT);`, 0, 1},
+		{"legacy_dependency_without_type", `CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT); INSERT INTO dependencies VALUES ('safe', 'missing');`, 0, 0},
+		{"legacy_empty_dependency_type", `CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT); INSERT INTO dependencies VALUES ('safe', 'missing', '');`, 0, 0},
+		{"unsupported_dependency_type", `CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT); INSERT INTO dependencies VALUES ('safe', 'missing', 'unsupported');`, 0, 1},
+		{"invalid_deferral", `UPDATE issues SET defer_until = 'not-a-time';`, 0, 1},
+		{"invalid_creation_time", `ALTER TABLE issues ADD COLUMN created_at TEXT; UPDATE issues SET created_at = 'not-a-time';`, 0, 1},
+		{"invalid_update_time", `ALTER TABLE issues ADD COLUMN updated_at TEXT; UPDATE issues SET updated_at = 'not-a-time';`, 0, 1},
+		{"reversed_issue_times", `ALTER TABLE issues ADD COLUMN created_at TEXT; ALTER TABLE issues ADD COLUMN updated_at TEXT; INSERT INTO issues VALUES ('bad', 'Reversed times', 'open', 2, NULL, '2026-01-02T00:00:00Z', '2026-01-01T00:00:00Z');`, 1, 0},
+		{"duplicate_issue_id", `INSERT INTO issues VALUES ('safe', 'Duplicate', 'open', 2, NULL);`, 1, 0},
+		{"malformed_label_row", `CREATE TABLE labels (issue_id TEXT, label TEXT); INSERT INTO labels VALUES ('safe', NULL);`, 0, 1},
+		{"malformed_label_json", `ALTER TABLE issues ADD COLUMN labels TEXT; UPDATE issues SET labels = '[invalid';`, 0, 1},
+		{"malformed_comments_table", `CREATE TABLE comments (issue_id TEXT, body TEXT);`, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "beads.db")
+			db, err := sql.Open("sqlite", sqliteFileDSN(path, ""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`CREATE TABLE issues (id TEXT, title TEXT, status TEXT, priority INTEGER, defer_until TEXT);
+INSERT INTO issues VALUES ('safe', 'Readable issue', 'open', 2, NULL);` + tc.extra); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadFromSource(DataSource{Type: SourceTypeSQLite, Path: path})
+			if err != nil {
+				t.Fatalf("partial source must remain inspectable: %v", err)
+			}
+			if len(loaded.Issues) != 1 || loaded.Issues[0].ID != "safe" {
+				t.Fatalf("readable unique issue lost: %+v", loaded.Issues)
+			}
+			report := loaded.Report
+			if report.Valid != 1 || report.Errors != tc.errors || report.ReadErrors != tc.readErrors {
+				t.Fatalf("read-loss accounting = %+v; want valid=1 errors=%d read_errors=%d", report, tc.errors, tc.readErrors)
+			}
+			if report.WarningCount != tc.errors+tc.readErrors || len(report.Warnings) != report.WarningCount {
+				t.Fatalf("warning totals do not reconcile: %+v", report)
+			}
+			if strings.HasPrefix(tc.name, "legacy_") {
+				deps := loaded.Issues[0].Dependencies
+				if len(deps) != 1 || deps[0].DependsOnID != "missing" || !deps[0].Type.IsBlocking() {
+					t.Fatalf("legacy blocking edge was lost: %+v", deps)
+				}
+				if model.NewReadinessIndex(loaded.Issues).Ready("safe", time.Now()) {
+					t.Fatal("missing legacy blocker must withhold readiness")
+				}
+			}
+		})
+	}
+}
+
 // readerFactories returns factories for every IssueReader backend under test.
 func readerFactories() []readerFactory {
 	return []readerFactory{
@@ -79,6 +143,87 @@ func TestReaderContract_LoadIssues(t *testing.T) {
 			for _, want := range []string{"CTR-1", "CTR-2", "CTR-3"} {
 				if !ids[want] {
 					t.Errorf("missing issue %s", want)
+				}
+			}
+		})
+	}
+}
+
+func TestReaderContract_TombstonesRetainDependencyAuthority(t *testing.T) {
+	for _, backend := range []string{"jsonl", "sqlite-full", "sqlite-minimal"} {
+		t.Run(backend, func(t *testing.T) {
+			dir := t.TempDir()
+			source := DataSource{Type: SourceTypeJSONLLocal, Path: filepath.Join(dir, "issues.jsonl")}
+			if backend == "jsonl" {
+				contents := `{"id":"safe","title":"Safe","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"gone","type":"blocks"}]}
+{"id":"unknown","title":"Unknown","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"absent","type":"blocks"}]}
+{"id":"gone","title":"Deleted","status":"tombstone","issue_type":"task"}
+`
+				if err := os.WriteFile(source.Path, []byte(contents), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				source = DataSource{Type: SourceTypeSQLite, Path: filepath.Join(dir, "beads.db")}
+				if backend == "sqlite-full" {
+					createContractTestSQLiteDB(t, source.Path)
+				}
+				db, err := sql.Open("sqlite", sqliteFileDSN(source.Path, ""))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { db.Close() })
+				if backend == "sqlite-minimal" {
+					_, err = db.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, status TEXT, tombstone INTEGER);
+CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, dependency_type TEXT);`)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				_, err = db.Exec(`INSERT INTO issues (id, title, status, tombstone) VALUES
+('safe', 'Safe', 'open', 0), ('unknown', 'Unknown', 'open', 0), ('gone', 'Deleted', 'closed', 1);
+INSERT INTO dependencies VALUES ('safe', 'gone', 'blocks'), ('unknown', 'absent', 'blocks');`)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			reader, err := NewReader(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			visible, err := reader.LoadIssues()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, issue := range visible {
+				if issue.ID == "gone" {
+					t.Fatal("tombstone leaked into display rows")
+				}
+			}
+			report := reader.LoadReport()
+			if len(report.TombstoneIDs) != 1 || report.TombstoneIDs[0] != "gone" || report.Path != source.Path {
+				t.Fatalf("missing tombstone authority: %+v", report)
+			}
+			authority := append([]model.Issue(nil), visible...)
+			for _, id := range report.TombstoneIDs {
+				authority = append(authority, model.Issue{ID: id, Status: model.StatusTombstone})
+			}
+			index := model.NewReadinessIndex(authority)
+			if !index.Ready("safe", time.Now()) || index.Ready("unknown", time.Now()) {
+				t.Fatalf("tombstoned predecessor must be satisfied; missing predecessor must be unknown: safe=%s unknown=%s", index.DependencyState("safe"), index.DependencyState("unknown"))
+			}
+			report.TombstoneIDs[0] = "absent"
+			if reader.LoadReport().TombstoneIDs[0] != "gone" {
+				t.Fatal("caller mutated retained authority")
+			}
+			if backend != "jsonl" {
+				full, err := reader.(*SQLiteReader).LoadIssueAuthority()
+				if err != nil {
+					t.Fatal(err)
+				}
+				index = model.NewReadinessIndex(full)
+				if !index.Ready("safe", time.Now()) || index.Ready("unknown", time.Now()) {
+					t.Fatal("SQLite reload authority lost tombstone or fabricated missing record")
 				}
 			}
 		})

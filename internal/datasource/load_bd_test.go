@@ -63,7 +63,8 @@ func TestLoadIssuesFromDir_BDWorkspaceRefreshesViaExport(t *testing.T) {
 	dir, beadsDir := makeBDWorkspace(t)
 	installFakeBD(t, dir, `{"id":"BD-1","title":"From export","status":"open","priority":1,"issue_type":"task"}`+"\n")
 
-	issues, err := LoadIssuesFromDir(beadsDir)
+	loaded, err := LoadIssuesFromDir(beadsDir)
+	issues := loaded.Issues
 	if err != nil {
 		t.Fatalf("LoadIssuesFromDir() error = %v", err)
 	}
@@ -82,7 +83,8 @@ func TestLoadIssuesFromDir_BDWorkspaceNoExportErrorsLoudly(t *testing.T) {
 	dir, beadsDir := makeBDWorkspace(t)
 	hideBD(t, dir)
 
-	issues, err := LoadIssuesFromDir(beadsDir)
+	loaded, err := LoadIssuesFromDir(beadsDir)
+	issues := loaded.Issues
 	if err == nil {
 		t.Fatalf("expected loud error for Dolt workspace without export, got %d issues", len(issues))
 	}
@@ -102,7 +104,8 @@ func TestLoadIssuesFromDir_BDWorkspaceIgnoresStrayNonIssueJSONL(t *testing.T) {
 		t.Fatalf("write memories.jsonl: %v", err)
 	}
 
-	issues, err := LoadIssuesFromDir(beadsDir)
+	loaded, err := LoadIssuesFromDir(beadsDir)
+	issues := loaded.Issues
 	if err == nil {
 		t.Fatalf("expected error, got %d issues (silent-empty regression)", len(issues))
 	}
@@ -119,12 +122,16 @@ func TestLoadIssuesFromDir_BDWorkspaceFallsBackToExistingExport(t *testing.T) {
 		t.Fatalf("write issues.jsonl: %v", err)
 	}
 
-	issues, err := LoadIssuesFromDir(beadsDir)
+	loaded, err := LoadIssuesFromDir(beadsDir)
+	issues := loaded.Issues
 	if err != nil {
 		t.Fatalf("LoadIssuesFromDir() error = %v", err)
 	}
 	if len(issues) != 1 || issues[0].ID != "BD-2" {
 		t.Fatalf("expected the existing export issue, got %#v", issues)
+	}
+	if !loaded.Report.Stale || len(loaded.Report.AuthorityWarnings) == 0 {
+		t.Fatalf("existing export must retain stale source authority: %+v", loaded.Report)
 	}
 }
 
@@ -136,7 +143,8 @@ func TestLoadIssues_BDWorkspaceViaRepoPath(t *testing.T) {
 	t.Setenv("BEADS_DIR", "")
 	t.Setenv("BEADS_DB", "")
 
-	issues, err := LoadIssues(dir)
+	loaded, err := LoadIssues(dir)
+	issues := loaded.Issues
 	if err != nil {
 		t.Fatalf("LoadIssues() error = %v", err)
 	}

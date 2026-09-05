@@ -1,7 +1,11 @@
 package loader
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -9,6 +13,104 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func TestOpenIssuesFileRetriesChangedSnapshot(t *testing.T) {
+	for _, change := range []string{"append", "replace"} {
+		t.Run(change, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "issues.jsonl")
+			if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var opened []*os.File
+			openFile := func(path string) (*os.File, error) {
+				// Perform the real filesystem mutation after production's Stat
+				// and before its Open, making the narrow race deterministic.
+				if len(opened) == 0 {
+					if change == "append" {
+						writer, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+						if err != nil {
+							return nil, err
+						}
+						_, writeErr := writer.WriteString("new\n")
+						closeErr := writer.Close()
+						if writeErr != nil {
+							return nil, writeErr
+						}
+						if closeErr != nil {
+							return nil, closeErr
+						}
+					} else {
+						replacement := path + ".next"
+						if err := os.WriteFile(replacement, []byte("new\n"), 0o644); err != nil {
+							return nil, err
+						}
+						if err := os.Rename(replacement, path); err != nil {
+							return nil, err
+						}
+					}
+				}
+				file, err := os.Open(path)
+				if err == nil {
+					opened = append(opened, file)
+				}
+				return file, err
+			}
+			file, err := openIssuesFile(path, openFile)
+			if err != nil {
+				t.Fatalf("failed to reopen after %s: %v", change, err)
+			}
+			defer file.Close()
+			if len(opened) != 2 {
+				t.Fatalf("open attempts = %d, want one rejected snapshot and one fresh snapshot", len(opened))
+			}
+			if _, err := opened[0].Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("rejected handle was not closed: %v", err)
+			}
+			got, err := io.ReadAll(file)
+			want := "new\n"
+			if change == "append" {
+				want = "old\nnew\n"
+			}
+			if err != nil || string(got) != want {
+				t.Fatalf("read latest snapshot = %q, %v; want %q", got, err, want)
+			}
+		})
+	}
+}
+
+func TestOpenIssuesFileDoesNotHidePersistentFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	other := path + ".other"
+	for _, name := range []string{path, other} {
+		if err := os.WriteFile(name, []byte("data\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rejected []*os.File
+	file, err := openIssuesFile(path, func(string) (*os.File, error) {
+		handle, err := os.Open(other)
+		if err == nil {
+			rejected = append(rejected, handle)
+		}
+		return handle, err
+	})
+	if file != nil || err == nil || !strings.Contains(err.Error(), "changed while being opened") || len(rejected) != 3 {
+		t.Fatalf("persistent replacement = file %v error %v attempts %d; want bounded refusal", file, err, len(rejected))
+	}
+	for _, handle := range rejected {
+		if _, err := handle.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("persistent mismatch leaked a handle: %v", err)
+		}
+	}
+	permissionCalls := 0
+	file, err = openIssuesFile(path, func(path string) (*os.File, error) {
+		permissionCalls++
+		return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+	})
+	if file != nil || !errors.Is(err, os.ErrPermission) || permissionCalls != 1 {
+		t.Fatalf("permission failure was retried or hidden: file %v error %v attempts %d", file, err, permissionCalls)
+	}
+}
 
 // TestPooledIssueSliceIsolation verifies that after parsing with pooled issues,
 // returning pool refs to the pool does NOT affect the returned issues.

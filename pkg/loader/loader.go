@@ -3,6 +3,7 @@ package loader
 import (
 	"bufio"
 	"bytes"
+	"context"
 	stdjson "encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unicode/utf8"
 
 	json "github.com/goccy/go-json"
@@ -26,7 +28,146 @@ import (
 
 // beadsMetadata is the subset of .beads/metadata.json we care about.
 type beadsMetadata struct {
-	Backend string `json:"backend"`
+	Backend     string `json:"backend"`
+	Database    string `json:"database"`
+	JSONLExport string `json:"jsonl_export"`
+}
+
+type trackerCapabilities struct {
+	Executable string
+	Claim      bool
+	Error      string
+}
+
+var trackerCapabilityCache sync.Map
+
+// installedTrackerCapabilities only runs help, never a command that opens or
+// changes a tracker. Include executable identity in the cache key so replacing
+// an installed version during a long-running TUI invalidates its capabilities.
+func installedTrackerCapabilities(tracker string) trackerCapabilities {
+	executable, err := exec.LookPath(tracker)
+	if err != nil {
+		return trackerCapabilities{Error: "tracker executable is unavailable: " + tracker}
+	}
+	executable, err = filepath.Abs(executable)
+	if err != nil {
+		return trackerCapabilities{Error: "cannot resolve tracker executable"}
+	}
+	info, err := os.Stat(executable)
+	if err != nil {
+		return trackerCapabilities{Error: "cannot inspect tracker executable"}
+	}
+	key := fmt.Sprintf("%s:%d:%d", executable, info.Size(), info.ModTime().UnixNano())
+	if cached, ok := trackerCapabilityCache.Load(key); ok {
+		return cached.(trackerCapabilities)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	help, err := exec.CommandContext(ctx, executable, "update", "--help").Output()
+	caps := trackerCapabilities{Executable: executable}
+	if err != nil {
+		caps.Error = "cannot establish installed tracker capabilities"
+	} else {
+		fields := strings.Fields(string(help))
+		has := func(flag string) bool {
+			for _, field := range fields {
+				if field == flag {
+					return true
+				}
+			}
+			return false
+		}
+		if !has("--db") || !has("--json") || (tracker == "br" && (!has("--no-auto-import") || !has("--no-auto-flush"))) {
+			caps.Error = "installed tracker cannot bind the required explicit database route"
+		}
+		caps.Claim = has("--claim")
+	}
+	trackerCapabilityCache.Store(key, caps)
+	return caps
+}
+
+// AttachIssueOrigins binds IDs to an actual metadata-declared source before
+// any display namespace is applied. An arbitrary --db JSONL/SQLite input stays
+// readable but cannot borrow a nearby tracker merely by containing matching IDs.
+func AttachIssueOrigins(issues []model.Issue, sourcePath string, complete bool) {
+	origin := resolveIssueOrigin(sourcePath)
+	if !complete && origin.ReadOnlyReason == "" {
+		origin.ReadOnlyReason = "source authority is incomplete or stale"
+	}
+	for i := range issues {
+		local := origin
+		local.LocalID = issues[i].ID
+		issues[i].Origin = &local
+	}
+}
+
+func resolveIssueOrigin(sourcePath string) model.IssueOrigin {
+	origin := model.IssueOrigin{}
+	refuse := func(reason string) model.IssueOrigin {
+		origin.ReadOnlyReason = reason
+		return origin
+	}
+	path, err := filepath.Abs(sourcePath)
+	if err == nil {
+		path, err = filepath.EvalSymlinks(path)
+	}
+	if err != nil {
+		return refuse("source path cannot be resolved to a live tracker")
+	}
+	beadsDir := filepath.Dir(path)
+	metadata, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
+	if err != nil {
+		return refuse("source has no readable tracker metadata")
+	}
+	var meta beadsMetadata
+	if err := stdjson.Unmarshal(metadata, &meta); err != nil {
+		return refuse("source tracker metadata is invalid")
+	}
+	switch strings.ToLower(strings.TrimSpace(meta.Backend)) {
+	case "", "sqlite", "dolt":
+	default:
+		return refuse("unsupported tracker backend: " + meta.Backend)
+	}
+	origin.TrackerDirectory, origin.WorkingDirectory = beadsDir, filepath.Dir(beadsDir)
+	origin.Tracker = "br"
+	resolve := func(name string) (string, error) {
+		if name == "" {
+			return "", fmt.Errorf("empty tracker path")
+		}
+		if !filepath.IsAbs(name) {
+			name = filepath.Join(beadsDir, name)
+		}
+		return filepath.EvalSymlinks(name)
+	}
+	if IsBDWorkspace(beadsDir) {
+		origin.Tracker = "bd"
+		// The bd bridge specifically exports issues.jsonl from this Dolt
+		// directory. An unrelated sidecar is not that live source.
+		if filepath.Base(path) != "issues.jsonl" {
+			return refuse("source is not the live bd compatibility export")
+		}
+		origin.Database = beadsDir
+	} else {
+		database, dbErr := resolve(meta.Database)
+		if dbErr != nil {
+			return refuse("metadata does not resolve to an existing tracker database")
+		}
+		info, err := os.Stat(database)
+		if err != nil || !info.Mode().IsRegular() {
+			return refuse("metadata database is not a regular file")
+		}
+		exportPath, _ := resolve(meta.JSONLExport)
+		if path != database && path != exportPath {
+			return refuse("source is not the metadata-declared live database or export")
+		}
+		origin.Database = database
+	}
+	caps := installedTrackerCapabilities(origin.Tracker)
+	if caps.Error != "" {
+		return refuse(caps.Error)
+	}
+	origin.Executable, origin.SupportsClaim = caps.Executable, caps.Claim
+	return origin
 }
 
 // BeadsDirEnvVar is the name of the environment variable for custom beads directory
@@ -741,41 +882,46 @@ func (s ParseStats) ErrorRate() float64 {
 	return float64(s.Errors) / float64(total)
 }
 
-// openIssuesFile opens the issues file after checking it is a regular file and
-// that the opened handle is the same file that was inspected, so a path swapped
-// between stat and open is refused instead of read.
-func openIssuesFile(path string) (*os.File, error) {
-	pathInfo, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return nil, fmt.Errorf("no beads issues found at %s", path)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect issues file %s: %w", path, err)
-	}
-	if !pathInfo.Mode().IsRegular() {
-		return nil, fmt.Errorf("issues path is not a regular file: %s", path)
-	}
+// openIssuesFile opens a regular file whose identity, mode, size and mtime match
+// its inspected snapshot. Concurrent append or atomic replacement can invalidate
+// that snapshot; discard the handle and inspect/open again without ever reading
+// an unverified handle. Other errors remain immediate, and continuous changes
+// are refused after a bounded number of attempts.
+func openIssuesFile(path string, openFile func(string) (*os.File, error)) (*os.File, error) {
+	const maxOpenAttempts = 3
+	for attempt := 0; attempt < maxOpenAttempts; attempt++ {
+		pathInfo, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("no beads issues found at %s", path)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect issues file %s: %w", path, err)
+		}
+		if !pathInfo.Mode().IsRegular() {
+			return nil, fmt.Errorf("issues path is not a regular file: %s", path)
+		}
 
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open issues file: %w", err)
-	}
-	openedInfo, err := file.Stat()
-	if err != nil {
+		file, err := openFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open issues file: %w", err)
+		}
+		openedInfo, err := file.Stat()
+		if err != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("failed to inspect opened issues file %s: %w", path, err)
+		}
+		if sameFileSnapshot(pathInfo, openedInfo) {
+			return file, nil
+		}
 		_ = file.Close()
-		return nil, fmt.Errorf("failed to inspect opened issues file %s: %w", path, err)
 	}
-	if !sameFileSnapshot(pathInfo, openedInfo) {
-		_ = file.Close()
-		return nil, fmt.Errorf("issues file changed while being opened: %s", path)
-	}
-	return file, nil
+	return nil, fmt.Errorf("issues file changed while being opened: %s", path)
 }
 
 // LoadIssuesFromFileWithOptions reads issues from a file with custom options.
 func LoadIssuesFromFileWithOptions(path string, opts ParseOptions) ([]model.Issue, error) {
 	defer metrics.Timer(metrics.LoaderParse)()
-	file, err := openIssuesFile(path)
+	file, err := openIssuesFile(path, os.Open)
 	if err != nil {
 		return nil, err
 	}
@@ -788,7 +934,7 @@ func LoadIssuesFromFileWithOptions(path string, opts ParseOptions) ([]model.Issu
 // The caller must return pooled issues via ReturnIssuePtrsToPool when no longer needed.
 func LoadIssuesFromFileWithOptionsPooled(path string, opts ParseOptions) (PooledIssues, error) {
 	defer metrics.Timer(metrics.LoaderParse)()
-	file, err := openIssuesFile(path)
+	file, err := openIssuesFile(path, os.Open)
 	if err != nil {
 		return PooledIssues{}, err
 	}

@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
@@ -16,15 +15,15 @@ import (
 // retains, so a pathologically corrupt file cannot bloat robot payloads.
 const maxLoadReportWarnings = 10
 
-// LoadReport captures per-line parse accounting for the most recent successful
-// JSONL load, so callers (robot payload emitters in particular) can surface
+// LoadReport captures accounting for one source load,
+// so callers (robot payload emitters in particular) can surface
 // records that were dropped during load instead of silently reporting them as
 // nonexistent (#190). Errors counts issue-shaped lines that were malformed JSON
 // or failed model validation (e.g. updated_at < created_at), plus later records
 // that repeat an earlier issue ID; each such skip also contributes a
 // human-readable reason to Warnings (capped).
 type LoadReport struct {
-	// Path is the JSONL file the report describes.
+	// Path is the source file the report describes.
 	Path string
 	// Valid is the number of unique issue lines that parsed and validated.
 	Valid int
@@ -34,57 +33,38 @@ type LoadReport struct {
 	// Skipped is the number of recognized non-issue `_type` records.
 	Skipped int
 	// Warnings holds up to maxLoadReportWarnings skip reasons, in file order.
-	Warnings []string
+	Warnings     []string
+	WarningCount int
+	// ReadErrors counts failed related-record reads separately from dropped
+	// issue rows, so Valid + Errors + Skipped continues to reconcile.
+	ReadErrors        int
+	AuthorityWarnings []string
+	Stale             bool
+	// TombstoneIDs preserves satisfied dependencies whose records are hidden
+	// from the viewer. These IDs come from the same successful source read.
+	TombstoneIDs []string
 }
 
-var (
-	lastLoadReportMu sync.Mutex
-	lastLoadReport   *LoadReport
-)
+// LoadResult binds visible issues, selected source, and accounting from the
+// same read. A later load cannot replace this result's source authority.
+type LoadResult struct {
+	Issues []model.Issue
+	Source DataSource
+	Report LoadReport
+}
 
-// LastLoadReport returns a copy of the parse accounting recorded by the most
-// recent successful JSONL load in this process, or nil when no JSONL load has
-// completed (e.g. the issues came from SQLite). Robot commands consult this to
-// emit a `load_stats` block whenever records were dropped during load (#190).
-func LastLoadReport() *LoadReport {
-	lastLoadReportMu.Lock()
-	defer lastLoadReportMu.Unlock()
-	if lastLoadReport == nil {
-		return nil
+func cloneLoadReport(report LoadReport) LoadReport {
+	report.Warnings = append([]string(nil), report.Warnings...)
+	report.AuthorityWarnings = append([]string(nil), report.AuthorityWarnings...)
+	report.TombstoneIDs = append([]string(nil), report.TombstoneIDs...)
+	return report
+}
+
+func (r *LoadReport) addWarning(message string) {
+	r.WarningCount++
+	if len(r.Warnings) < maxLoadReportWarnings {
+		r.Warnings = append(r.Warnings, message)
 	}
-	cp := *lastLoadReport
-	cp.Warnings = append([]string(nil), lastLoadReport.Warnings...)
-	return &cp
-}
-
-func recordLoadReport(rep LoadReport) {
-	lastLoadReportMu.Lock()
-	defer lastLoadReportMu.Unlock()
-	lastLoadReport = &rep
-}
-
-var (
-	lastSourceMu sync.Mutex
-	lastSource   *DataSource
-)
-
-// LastSource returns the source (JSONL or SQLite) the most recent successful
-// load in this process read from, so robot payloads can name the file that
-// actually backed them. ok is false when no load has completed.
-func LastSource() (DataSource, bool) {
-	lastSourceMu.Lock()
-	defer lastSourceMu.Unlock()
-	if lastSource == nil {
-		return DataSource{}, false
-	}
-	return *lastSource, true
-}
-
-func recordLastSource(src DataSource) {
-	lastSourceMu.Lock()
-	defer lastSourceMu.Unlock()
-	cp := src
-	lastSource = &cp
 }
 
 // loadRecorder wires a single JSONL parse to a LoadReport: it collects
@@ -93,11 +73,12 @@ func recordLastSource(src DataSource) {
 // robot stdout/stderr stay clean — the accounting surfaces in the JSON
 // payload instead).
 type loadRecorder struct {
-	path     string
-	stats    loader.ParseStats
-	warnings []string // capped copy kept for the LoadReport
-	pending  []string // every warning, replayed to stderr only if this candidate is selected
-	robot    bool
+	path         string
+	stats        loader.ParseStats
+	warnings     []string // capped copy kept for the LoadReport
+	warningCount int
+	pending      []string // every warning, replayed to stderr only if this candidate is selected
+	robot        bool
 }
 
 func newLoadRecorder(path string) *loadRecorder {
@@ -108,12 +89,13 @@ func newLoadRecorder(path string) *loadRecorder {
 // printed: the smart loader probes candidates freshest-first and discards the
 // ones that fail the gate, and a discarded candidate's warnings must never
 // reach the user (they used to print "skipping invalid issue on line 1" for a
-// file that was then rejected). commit replays them for the selected source.
+// file that was then rejected). finish replays them for the selected source.
 func (r *loadRecorder) options() loader.ParseOptions {
 	return loader.ParseOptions{
 		Stats:      &r.stats,
 		BufferSize: loader.MaxLineSizeFromEnv(),
 		WarningHandler: func(msg string) {
+			r.warningCount++
 			if len(r.warnings) < maxLoadReportWarnings {
 				r.warnings = append(r.warnings, msg)
 			}
@@ -124,22 +106,35 @@ func (r *loadRecorder) options() loader.ParseOptions {
 	}
 }
 
-// commit records the parse accounting as the process-wide last load report and
-// replays the buffered warnings to stderr in interactive mode. Call only after
-// the load succeeded — failed candidates in the smart-load fallthrough must not
-// pollute the report (or stderr) for the source actually used.
-func (r *loadRecorder) commit() {
-	for _, msg := range r.pending {
-		fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
+// finish returns this read's accounting. Only a selected source replays its
+// buffered warnings to stderr in interactive mode; rejected-source accounting
+// remains available to the caller without printing it as the selected source.
+func (r *loadRecorder) finish(issues []model.Issue, selected bool) LoadReport {
+	if selected {
+		for _, msg := range r.pending {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
+		}
 	}
 	r.pending = nil
-	recordLoadReport(LoadReport{
-		Path:     r.path,
-		Valid:    r.stats.Valid,
-		Errors:   r.stats.Errors,
-		Skipped:  r.stats.Skipped,
-		Warnings: append([]string(nil), r.warnings...),
-	})
+	return LoadReport{
+		Path:         r.path,
+		Valid:        r.stats.Valid,
+		Errors:       r.stats.Errors,
+		Skipped:      r.stats.Skipped,
+		Warnings:     append([]string(nil), r.warnings...),
+		WarningCount: r.warningCount,
+		TombstoneIDs: tombstoneIDs(issues),
+	}
+}
+
+func tombstoneIDs(issues []model.Issue) []string {
+	var ids []string
+	for _, issue := range issues {
+		if issue.Status.IsTombstone() {
+			ids = append(ids, issue.ID)
+		}
+	}
+	return ids
 }
 
 // LoadIssues performs smart multi-source detection and loading.
@@ -150,21 +145,17 @@ func (r *loadRecorder) commit() {
 //
 // Falls back to legacy JSONL-only loading via loader.LoadIssues if smart
 // detection finds no valid sources.
-func LoadIssues(repoPath string) ([]model.Issue, error) {
+func LoadIssues(repoPath string) (result LoadResult, err error) {
+	defer func() { result.bindOrigins(err) }()
 	if source, ok, err := ExplicitBeadsDBSource(); err != nil {
-		return nil, err
+		return LoadResult{}, err
 	} else if ok {
-		issues, err := LoadFromSource(source)
-		if err != nil {
-			return nil, err
-		}
-		recordLastSource(source)
-		return issues, nil
+		return LoadFromSource(source)
 	}
 
 	beadsDir, err := loader.GetBeadsDir(repoPath)
 	if err != nil {
-		return nil, err
+		return LoadResult{}, err
 	}
 
 	// bd/Dolt workspaces (#189): the issue data lives in a Dolt database that
@@ -182,33 +173,45 @@ func LoadIssues(repoPath string) ([]model.Issue, error) {
 	}
 
 	// Fall back to legacy JSONL-only loading
-	return loadLegacyJSONL(beadsDir)
+	fallback, err := loadLegacyJSONL(beadsDir)
+	if fallback.Source.Path != issues.Source.Path && issues.Source.Path != "" {
+		fallback.Report.Stale = true
+		fallback.Report.AuthorityWarnings = append(fallback.Report.AuthorityWarnings, fmt.Sprintf("source selection failed before fallback: %v", smartErr))
+	}
+	return fallback, err
 }
 
-// loadLegacyJSONL mirrors loader.LoadIssues' legacy behavior (tolerant parse,
-// no tombstone filtering) while publishing parse accounting via LastLoadReport.
+// loadLegacyJSONL keeps the tolerant parse while returning its accounting and
+// retaining tombstone authority separately from visible issue rows.
 // This path is reached when the smart loader rejected every candidate — e.g. a
 // small JSONL whose only records fail validation trips the error-rate gate —
 // which is exactly when dropped records MUST stay visible instead of the load
 // silently yielding fewer (or zero) issues (#190).
-func loadLegacyJSONL(beadsDir string) ([]model.Issue, error) {
+func loadLegacyJSONL(beadsDir string) (LoadResult, error) {
 	jsonlPath, err := loader.FindJSONLPath(beadsDir)
 	if err != nil {
-		return nil, err
+		return LoadResult{}, err
 	}
 	rec := newLoadRecorder(jsonlPath)
 	issues, err := loader.LoadIssuesFromFileWithOptions(jsonlPath, rec.options())
-	if err != nil {
-		return nil, err
+	report := rec.finish(issues, err == nil)
+	visible := make([]model.Issue, 0, len(issues))
+	for _, issue := range issues {
+		if !issue.Status.IsTombstone() {
+			visible = append(visible, issue)
+		}
 	}
-	rec.commit()
-	recordLastSource(DataSource{Type: SourceTypeJSONLLocal, Path: jsonlPath, Priority: PriorityJSONLLocal})
-	return issues, nil
+	return LoadResult{
+		Issues: visible,
+		Source: DataSource{Type: SourceTypeJSONLLocal, Path: jsonlPath, Priority: PriorityJSONLLocal},
+		Report: report,
+	}, err
 }
 
 // LoadIssuesFromDir performs smart source detection within a known beads directory.
 // This is useful when the caller already knows the .beads path.
-func LoadIssuesFromDir(beadsDir string) ([]model.Issue, error) {
+func LoadIssuesFromDir(beadsDir string) (result LoadResult, err error) {
+	defer func() { result.bindOrigins(err) }()
 	// bd/Dolt workspaces (#189): see LoadIssues.
 	if loader.IsBDWorkspace(beadsDir) {
 		return loadBDWorkspace(beadsDir)
@@ -220,7 +223,12 @@ func LoadIssuesFromDir(beadsDir string) ([]model.Issue, error) {
 	}
 
 	// Fall back to JSONL (legacy tolerant parse, with load accounting; #190)
-	return loadLegacyJSONL(beadsDir)
+	fallback, err := loadLegacyJSONL(beadsDir)
+	if fallback.Source.Path != issues.Source.Path && issues.Source.Path != "" {
+		fallback.Report.Stale = true
+		fallback.Report.AuthorityWarnings = append(fallback.Report.AuthorityWarnings, fmt.Sprintf("source selection failed before fallback: %v", smartErr))
+	}
+	return fallback, err
 }
 
 // loadBDWorkspace loads issues from a bd (Dolt-backed) workspace by resolving
@@ -230,25 +238,27 @@ func LoadIssuesFromDir(beadsDir string) ([]model.Issue, error) {
 // fails, and returns a hard error when no compatibility JSONL can be produced.
 // This guarantees bd workspaces either load real data or fail loudly — never
 // a silently-empty result from a stray non-issue JSONL (#189).
-func loadBDWorkspace(beadsDir string) ([]model.Issue, error) {
+func loadBDWorkspace(beadsDir string) (LoadResult, error) {
+	var authorityWarnings []string
 	warn := func(msg string) {
-		fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
+		authorityWarnings = append(authorityWarnings, msg)
+		if !env.Robot.Bool() {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
+		}
 	}
 	jsonlPath, err := loader.PrepareBeadsDirForRead(beadsDir, true, warn)
 	if err != nil {
-		return nil, fmt.Errorf("bd/Dolt workspace detected at %s: %w", beadsDir, err)
+		return LoadResult{Report: LoadReport{Path: beadsDir, AuthorityWarnings: authorityWarnings}}, fmt.Errorf("bd/Dolt workspace detected at %s: %w", beadsDir, err)
 	}
 	src := DataSource{
 		Type:     SourceTypeJSONLLocal,
 		Path:     jsonlPath,
 		Priority: PriorityJSONLLocal,
 	}
-	issues, err := loadAndValidateJSONL(src)
-	if err != nil {
-		return nil, err
-	}
-	recordLastSource(src)
-	return issues, nil
+	result, err := loadAndValidateJSONL(src)
+	result.Report.AuthorityWarnings = authorityWarnings
+	result.Report.Stale = len(authorityWarnings) > 0
+	return result, err
 }
 
 // ExplicitBeadsDBSource returns the direct source named by BEADS_DB when it
@@ -316,17 +326,17 @@ func explicitBeadsDBFileType(dbPath string) (SourceType, int, bool) {
 // pass: the same 10% malformed-error-rate gate is applied to the loader's parse
 // stats post-load. A genuinely-corrupt JSONL is still rejected (and we fall
 // through to the next candidate), but the happy path reads the file exactly once.
-func loadSmart(beadsDir, repoPath string) ([]model.Issue, error) {
+func loadSmart(beadsDir, repoPath string) (LoadResult, error) {
 	sources, err := DiscoverSources(DiscoveryOptions{
 		BeadsDir:               beadsDir,
 		RepoPath:               repoPath,
 		ValidateAfterDiscovery: false,
 	})
 	if err != nil {
-		return nil, err
+		return LoadResult{}, err
 	}
 	if len(sources) == 0 {
-		return nil, fmt.Errorf("no valid sources discovered")
+		return LoadResult{}, fmt.Errorf("no valid sources discovered")
 	}
 
 	// Order candidates exactly as SelectBestSource would (freshest, then
@@ -337,19 +347,28 @@ func loadSmart(beadsDir, repoPath string) ([]model.Issue, error) {
 	sortByFreshnessThenPriority(ordered)
 
 	var lastErr error
+	var lastResult LoadResult
+	var rejected []string
 	for i := range ordered {
-		issues, err := loadAndValidate(ordered[i])
+		result, err := loadAndValidate(ordered[i])
 		if err != nil {
 			lastErr = err
+			lastResult = result
+			if len(rejected) < maxLoadReportWarnings {
+				rejected = append(rejected, fmt.Sprintf("rejected source %s: %v", ordered[i].Path, err))
+			}
 			continue
 		}
-		return issues, nil
+		result.Report.AuthorityWarnings = rejected
+		result.Report.Stale = len(rejected) > 0
+		return result, nil
 	}
 
 	if lastErr != nil {
-		return nil, fmt.Errorf("no valid sources discovered: %w", lastErr)
+		lastResult.Report.AuthorityWarnings = rejected
+		return lastResult, fmt.Errorf("no valid sources discovered: %w", lastErr)
 	}
-	return nil, fmt.Errorf("no valid sources discovered")
+	return LoadResult{}, fmt.Errorf("no valid sources discovered")
 }
 
 // loadAndValidate loads a single source while applying the validation gate in the
@@ -357,27 +376,23 @@ func loadSmart(beadsDir, repoPath string) ([]model.Issue, error) {
 // independent of the row read, so it runs first. For JSONL the loader's tolerant
 // parse IS the validation pass: a single read materializes issues and yields the
 // parse stats used to apply the malformed-error-rate gate.
-func loadAndValidate(source DataSource) ([]model.Issue, error) {
+func loadAndValidate(source DataSource) (LoadResult, error) {
 	var (
-		issues []model.Issue
+		result LoadResult
 		err    error
 	)
 	switch source.Type {
 	case SourceTypeSQLite:
 		if err := ValidateSource(&source); err != nil {
-			return nil, err
+			return LoadResult{Source: source, Report: LoadReport{Path: source.Path}}, err
 		}
-		issues, err = LoadFromSource(source)
+		result, err = LoadFromSource(source)
 	case SourceTypeJSONLLocal, SourceTypeJSONLWorktree:
-		issues, err = loadAndValidateJSONL(source)
+		result, err = loadAndValidateJSONL(source)
 	default:
-		return nil, fmt.Errorf("unsupported source type: %s", source.Type)
+		return LoadResult{Source: source}, fmt.Errorf("unsupported source type: %s", source.Type)
 	}
-	if err != nil {
-		return nil, err
-	}
-	recordLastSource(source)
-	return issues, nil
+	return result, err
 }
 
 // loadAndValidateJSONL performs the fused validate-and-materialize pass for a
@@ -385,11 +400,11 @@ func loadAndValidate(source DataSource) ([]model.Issue, error) {
 // malformed-error-rate gate that validateJSONL uses, and filters tombstones to
 // honor the IssueReader contract. Reading the file a single time replaces the
 // previous validate-then-load double parse.
-func loadAndValidateJSONL(source DataSource) ([]model.Issue, error) {
+func loadAndValidateJSONL(source DataSource) (LoadResult, error) {
 	rec := newLoadRecorder(source.Path)
 	all, err := loader.LoadIssuesFromFileWithOptions(source.Path, rec.options())
 	if err != nil {
-		return nil, err
+		return LoadResult{Source: source, Report: rec.finish(all, false)}, err
 	}
 	stats := rec.stats
 
@@ -399,7 +414,7 @@ func loadAndValidateJSONL(source DataSource) ([]model.Issue, error) {
 	// the next candidate.
 	maxRate := DefaultValidationOptions().MaxJSONLErrorRate
 	if rate := stats.ErrorRate(); rate > maxRate {
-		return nil, fmt.Errorf("%s: too many errors: %.1f%% (max %.1f%%)", source.Path, rate*100, maxRate*100)
+		return LoadResult{Source: source, Report: rec.finish(all, false)}, fmt.Errorf("%s: too many errors: %.1f%% (max %.1f%%)", source.Path, rate*100, maxRate*100)
 	}
 
 	// Reject a source that contained records but yielded ZERO valid issues — e.g.
@@ -413,12 +428,12 @@ func loadAndValidateJSONL(source DataSource) ([]model.Issue, error) {
 	// project — matching validateJSONL's empty-file behavior. A file with Valid>0
 	// whose issues are all tombstones is a real issues file and is accepted.
 	if stats.Valid == 0 && stats.Errors+stats.Skipped > 0 {
-		return nil, fmt.Errorf("%s: no issue records (%d non-issue/error lines, 0 valid issues)", source.Path, stats.Errors+stats.Skipped)
+		return LoadResult{Source: source, Report: rec.finish(all, false)}, fmt.Errorf("%s: no issue records (%d non-issue/error lines, 0 valid issues)", source.Path, stats.Errors+stats.Skipped)
 	}
 
 	// This source is the one actually being used: publish its parse accounting
 	// so robot payloads can surface any dropped records (#190).
-	rec.commit()
+	report := rec.finish(all, true)
 
 	// Filter out tombstone issues to match the IssueReader contract (the same
 	// filtering JSONLReader.LoadIssues applies).
@@ -428,16 +443,25 @@ func loadAndValidateJSONL(source DataSource) ([]model.Issue, error) {
 			out = append(out, all[i])
 		}
 	}
-	return out, nil
+	return LoadResult{Issues: out, Source: source, Report: report}, nil
 }
 
 // LoadFromSource loads issues from a specific DataSource via the IssueReader
 // interface, dispatching to the appropriate backend based on source type.
-func LoadFromSource(source DataSource) ([]model.Issue, error) {
+func LoadFromSource(source DataSource) (result LoadResult, err error) {
+	defer func() { result.bindOrigins(err) }()
 	reader, err := NewReader(source)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open source %s: %w", source.Path, err)
+		return LoadResult{Source: source, Report: LoadReport{Path: source.Path}}, fmt.Errorf("failed to open source %s: %w", source.Path, err)
 	}
 	defer reader.Close()
-	return reader.LoadIssues()
+	issues, err := reader.LoadIssues()
+	return LoadResult{Issues: issues, Source: source, Report: reader.LoadReport()}, err
+}
+
+func (r *LoadResult) bindOrigins(err error) {
+	if err == nil {
+		complete := r.Report.Errors == 0 && r.Report.ReadErrors == 0 && !r.Report.Stale && len(r.Report.AuthorityWarnings) == 0
+		loader.AttachIssueOrigins(r.Issues, r.Source.Path, complete)
+	}
 }

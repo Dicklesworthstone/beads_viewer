@@ -3,6 +3,7 @@ package loader_test
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -17,6 +18,25 @@ import (
 // =============================================================================
 // FindJSONLPath Tests
 // =============================================================================
+
+func TestIssueOriginsRejectUnknownTrackerBackend(t *testing.T) {
+	dir := t.TempDir()
+	for name, data := range map[string]string{
+		"metadata.json": `{"backend":"unknown-tracker","database":"beads.db","jsonl_export":"issues.jsonl"}`,
+		"beads.db":      "not a supported tracker",
+		"issues.jsonl":  "",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	issues := []model.Issue{{ID: "local-1", Title: "Readable analysis"}}
+	loader.AttachIssueOrigins(issues, filepath.Join(dir, "issues.jsonl"), true)
+	actions := issues[0].Actions(true)
+	if actions.Show != nil || actions.Claim != nil || !strings.Contains(actions.UnavailableReason, "unsupported tracker backend") {
+		t.Fatalf("unknown backend borrowed br authority: %+v", actions)
+	}
+}
 
 func TestFindJSONLPath_NonExistentDirectory(t *testing.T) {
 	_, err := loader.FindJSONLPath("/nonexistent/path/to/beads")
@@ -827,6 +847,11 @@ func TestFindJSONLPath_FollowsSymlink(t *testing.T) {
 
 func TestLoadIssues_NonExistentBeadsDir(t *testing.T) {
 	dir := t.TempDir()
+	// Keep this missing-tracker fixture independent of a repository-nested
+	// TMPDIR. Ancestor discovery is exercised by TestGetBeadsDir_FindsBeadsInGitRepo.
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(dir))
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BEADS_DIR", "")
 	// Don't create .beads directory
 	_, err := loader.LoadIssues(dir)
 	if err == nil {
@@ -1415,9 +1440,11 @@ func TestGetBeadsDir_EmptyRepoPath_UsesCwd(t *testing.T) {
 		}
 	}()
 
-	// Use a temp directory outside git to test pure cwd fallback behavior
-	// (within a git repo, GetBeadsDir now intelligently finds .beads in the repo root)
+	// Explicitly bound Git discovery: t.TempDir can be inside the checkout
+	// when a remote worker supplies TMPDIR. This test owns only the cwd fallback.
 	tmpDir := t.TempDir()
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(tmpDir))
+	t.Setenv("BEADS_DB", "")
 	oldCwd, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("Failed to get cwd: %v", err)
@@ -1485,35 +1512,41 @@ func TestGetBeadsDir_BeadsDBMissingSQLiteFileUsesParentDir(t *testing.T) {
 }
 
 func TestGetBeadsDir_FindsBeadsInGitRepo(t *testing.T) {
-	// Unset environment variable
-	oldVal := os.Getenv(loader.BeadsDirEnvVar)
-	os.Unsetenv(loader.BeadsDirEnvVar)
-	defer func() {
-		if oldVal != "" {
-			os.Setenv(loader.BeadsDirEnvVar, oldVal)
+	// Exercise real ancestor discovery against an owned repository. A result
+	// borrowed from the source checkout must never satisfy this assertion.
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BEADS_DIR", "")
+	root := t.TempDir()
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(root))
+	cmd := exec.Command("git", "init", "-b", "main", root)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "services", "api")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, start := range []string{root, nested} {
+		result, err := loader.GetBeadsDir(start)
+		if err != nil {
+			t.Fatalf("GetBeadsDir(%q): %v", start, err)
 		}
-	}()
-
-	// When running from a subdirectory within a git repo that has .beads,
-	// GetBeadsDir should find .beads in the repo root (even via symlinks/worktrees)
-
-	result, err := loader.GetBeadsDir("")
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	// Verify the returned path exists and is a directory
-	info, err := os.Stat(result)
-	if err != nil {
-		t.Fatalf("Returned beads dir does not exist: %s, error: %v", result, err)
-	}
-	if !info.IsDir() {
-		t.Fatalf("Returned beads dir is not a directory: %s", result)
-	}
-
-	// Verify the path ends with .beads
-	if filepath.Base(result) != ".beads" {
-		t.Errorf("Returned path should end with .beads: got %s", result)
+		// Git resolves symlinks in its reported root (notably /var on macOS).
+		resolved, err := filepath.EvalSymlinks(result)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := filepath.EvalSymlinks(beadsDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resolved != want {
+			t.Fatalf("GetBeadsDir(%q) = %q, want owned ancestor %q", start, resolved, want)
+		}
 	}
 }
 

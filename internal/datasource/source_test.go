@@ -215,7 +215,8 @@ func TestLoadIssues_RespectsBeadsDBSpecificJSONL(t *testing.T) {
 	createTestSQLiteDB(t, filepath.Join(beadsDir, "beads.db"))
 	t.Setenv(loader.BeadsDBEnvVar, jsonlPath)
 
-	issues, err := LoadIssues(tmpDir)
+	loaded, err := LoadIssues(tmpDir)
+	issues := loaded.Issues
 	if err != nil {
 		t.Fatalf("LoadIssues: %v", err)
 	}
@@ -239,7 +240,8 @@ func TestLoadIssues_RespectsBeadsDBSpecificSQLite(t *testing.T) {
 	createSingleIssueSQLiteDB(t, dbPath, "SQLITE-1")
 	t.Setenv(loader.BeadsDBEnvVar, dbPath)
 
-	issues, err := LoadIssues(tmpDir)
+	loaded, err := LoadIssues(tmpDir)
+	issues := loaded.Issues
 	if err != nil {
 		t.Fatalf("LoadIssues: %v", err)
 	}

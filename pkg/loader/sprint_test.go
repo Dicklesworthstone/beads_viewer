@@ -1,6 +1,7 @@
 package loader
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,11 @@ import (
 
 func TestLoadSprintsMissingFileIsOK(t *testing.T) {
 	tmp := t.TempDir()
+	// RCH may put TMPDIR beneath a real repository. This fixture explicitly
+	// has no ancestor tracker; do not discover the checkout's sprint file.
+	t.Setenv("GIT_CEILING_DIRECTORIES", filepath.Dir(tmp))
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BEADS_DIR", "")
 	got, err := LoadSprints(tmp)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
