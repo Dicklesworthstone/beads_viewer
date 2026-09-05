@@ -259,7 +259,21 @@ func TestError_ReadOnlyBeadsFile(t *testing.T) {
 // TestError_NotGitRepository tests behavior in non-git directory.
 func TestError_NotGitRepository(t *testing.T) {
 	bv := buildBvBinary(t)
+	// Historical loading intentionally ignores ambient Git routing variables,
+	// including GIT_CEILING_DIRECTORIES. Use the platform's default temp root
+	// instead of RCH's checkout-local TMPDIR, and verify the fixture is non-Git.
+	t.Setenv("TMPDIR", "")
+	t.Setenv("TMP", "")
+	t.Setenv("TEMP", "")
 	env := t.TempDir()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Fatalf("Git is required to verify the non-Git fixture: %v", err)
+	}
+	probe := exec.Command("git", "rev-parse", "--show-toplevel")
+	probe.Dir = env
+	if output, err := probe.CombinedOutput(); err == nil {
+		t.Fatalf("non-Git fixture inherited a repository: %s", output)
+	}
 
 	// Create .beads but no .git
 	beadsDir := filepath.Join(env, ".beads")
@@ -290,7 +304,7 @@ func TestError_NotGitRepository(t *testing.T) {
 	err = cmd.Run()
 
 	if err == nil {
-		t.Log("--robot-diff succeeded without git (may have fallback)")
+		t.Fatal("--robot-diff must fail without a Git repository")
 	} else {
 		stderrStr := stderr.String()
 		// Should mention git

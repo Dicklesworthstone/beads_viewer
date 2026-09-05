@@ -291,7 +291,9 @@ func TestBoardWithDependencies(t *testing.T) {
 	// Create issues with blocking dependencies
 	beads := `{"id":"blocker","title":"Blocker task","status":"in_progress","priority":1,"issue_type":"task"}
 {"id":"blocked-1","title":"Blocked 1","status":"blocked","priority":2,"issue_type":"task","dependencies":[{"issue_id":"blocked-1","depends_on_id":"blocker","type":"blocks"}]}
-{"id":"blocked-2","title":"Blocked 2","status":"blocked","priority":2,"issue_type":"task","dependencies":[{"issue_id":"blocked-2","depends_on_id":"blocker","type":"blocks"}]}`
+{"id":"blocked-2","title":"Blocked 2","status":"blocked","priority":2,"issue_type":"task","dependencies":[{"issue_id":"blocked-2","depends_on_id":"blocker","type":"blocks"}]}
+{"id":"open-1","title":"Open dependency-gated work 1","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"open-1","depends_on_id":"blocker","type":"blocks"}]}
+{"id":"open-2","title":"Open dependency-gated work 2","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"open-2","depends_on_id":"blocker","type":"blocks"}]}`
 
 	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(beads), 0o644); err != nil {
 		t.Fatalf("write beads: %v", err)
@@ -338,6 +340,11 @@ func TestBoardWithDependencies(t *testing.T) {
 			found = true
 			if blocker.UnblocksCount != 2 {
 				t.Errorf("Expected blocker to unblock 2 issues, got %d", blocker.UnblocksCount)
+			}
+			// Completion releases dependency-gated open work but cannot change
+			// either explicitly parked issue's status.
+			if len(blocker.UnblocksIDs) != 2 || blocker.UnblocksIDs[0] != "open-1" || blocker.UnblocksIDs[1] != "open-2" {
+				t.Errorf("Expected only open work to unblock, got %v", blocker.UnblocksIDs)
 			}
 		}
 	}

@@ -445,6 +445,9 @@ func TestSwimlaneDependencyVisualIndicators(t *testing.T) {
 {"id":"blocked-1","title":"Blocked by root","status":"blocked","priority":2,"issue_type":"task","dependencies":[{"issue_id":"blocked-1","depends_on_id":"root","type":"blocks"}]}
 {"id":"blocked-2","title":"Also blocked by root","status":"blocked","priority":2,"issue_type":"task","dependencies":[{"issue_id":"blocked-2","depends_on_id":"root","type":"blocks"}]}
 {"id":"blocked-3","title":"Blocked by blocked-1","status":"blocked","priority":3,"issue_type":"task","dependencies":[{"issue_id":"blocked-3","depends_on_id":"blocked-1","type":"blocks"}]}
+{"id":"open-1","title":"Open work gated by root","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"open-1","depends_on_id":"root","type":"blocks"}]}
+{"id":"open-2","title":"More open work gated by root","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"open-2","depends_on_id":"root","type":"blocks"}]}
+{"id":"open-3","title":"Open work gated by open-1","status":"open","priority":3,"issue_type":"task","dependencies":[{"issue_id":"open-3","depends_on_id":"open-1","type":"blocks"}]}
 {"id":"ready","title":"Ready to work","status":"open","priority":2,"issue_type":"task"}`
 
 	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(beads), 0o644); err != nil {
@@ -469,8 +472,9 @@ func TestSwimlaneDependencyVisualIndicators(t *testing.T) {
 				} `json:"counts"`
 			} `json:"project_health"`
 			BlockersToClear []struct {
-				ID            string `json:"id"`
-				UnblocksCount int    `json:"unblocks_count"`
+				ID            string   `json:"id"`
+				UnblocksCount int      `json:"unblocks_count"`
+				UnblocksIDs   []string `json:"unblocks_ids"`
 			} `json:"blockers_to_clear"`
 		} `json:"triage"`
 	}
@@ -489,9 +493,13 @@ func TestSwimlaneDependencyVisualIndicators(t *testing.T) {
 	for _, blocker := range result.Triage.BlockersToClear {
 		if blocker.ID == "root" {
 			found = true
-			// root blocks 2 directly, plus 1 transitively through blocked-1
-			if blocker.UnblocksCount < 2 {
-				t.Errorf("Root unblocks count: got %d, want at least 2", blocker.UnblocksCount)
+			// Only the two open direct dependents resume; parked status and
+			// the still-blocked grandchild are not immediate unblocks.
+			if blocker.UnblocksCount != 2 {
+				t.Errorf("Root unblocks count: got %d, want 2", blocker.UnblocksCount)
+			}
+			if len(blocker.UnblocksIDs) != 2 || blocker.UnblocksIDs[0] != "open-1" || blocker.UnblocksIDs[1] != "open-2" {
+				t.Errorf("Root unblocks IDs: got %v, want [open-1 open-2]", blocker.UnblocksIDs)
 			}
 		}
 	}

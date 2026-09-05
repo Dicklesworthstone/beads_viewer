@@ -1,18 +1,287 @@
 package main_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/agents"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 )
+
+func TestDocsParity_CopiedRecipeHasEffectiveBehavior(t *testing.T) {
+	readme := repoFile(t, "README.md")
+	block := regexp.MustCompile("(?s)```yaml\\n(# \\.bv/recipes\\.yaml\\n.*?)\\n```").FindStringSubmatch(readme)
+	if len(block) != 2 {
+		t.Fatal("README must contain the copyable project recipe YAML")
+	}
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".bv", "recipes.yaml"), []byte(block[1]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loader := recipe.NewLoader(recipe.WithProjectDir(dir), recipe.WithUserPath(filepath.Join(dir, "absent-user.yaml")))
+	if err := loader.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if warnings := loader.Warnings(); len(warnings) != 0 {
+		t.Fatalf("copied recipe rejected: %v", warnings)
+	}
+	r := loader.Get("sprint-review")
+	if r == nil || !reflect.DeepEqual(r.View.Columns, []string{"id", "title", "status", "priority", "updated"}) ||
+		!r.View.ShowMetrics || r.View.MaxItems != 50 || r.Export.Format != "markdown" ||
+		r.Export.IncludeGraph == nil || !*r.Export.IncludeGraph {
+		t.Fatalf("copied recipe lost presentation/export settings: %+v", r)
+	}
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "old", Status: model.StatusOpen, UpdatedAt: now.Add(-15 * 24 * time.Hour)},
+		{ID: "backlog", Status: model.StatusOpen, UpdatedAt: now, Labels: []string{"backlog"}},
+		{ID: "icebox", Status: model.StatusOpen, UpdatedAt: now, Labels: []string{"icebox"}},
+		{ID: "parked", Status: model.StatusBlocked, UpdatedAt: now},
+		{ID: "recent", Status: model.StatusInProgress, UpdatedAt: now.Add(-time.Hour)},
+		{ID: "tie-low", Status: model.StatusOpen, Priority: 3, UpdatedAt: now.Add(-2 * time.Hour)},
+		{ID: "tie-high", Status: model.StatusClosed, Priority: 1, UpdatedAt: now.Add(-2 * time.Hour)},
+	}
+	for i := 0; i < 60; i++ {
+		issues = append(issues, model.Issue{ID: fmt.Sprintf("tail-%02d", i), Status: model.StatusOpen, UpdatedAt: now.Add(-time.Duration(i+3) * time.Hour)})
+	}
+	selected, err := recipe.Apply(issues, recipe.Metrics{}, r, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIDs := []string{"recent", "tie-high", "tie-low"}
+	for i := 0; i <= 46; i++ {
+		wantIDs = append(wantIDs, fmt.Sprintf("tail-%02d", i))
+	}
+	var gotIDs []string
+	for _, issue := range selected {
+		gotIDs = append(gotIDs, issue.ID)
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("copied recipe failed filters, complete secondary ordering, or cap: got %v want %v", gotIDs, wantIDs)
+	}
+}
+
+func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
+	for _, name := range []string{"BEADS_DIR", "BEADS_DB", "BD_DB", "BEADS_JSONL"} {
+		t.Setenv(name, "")
+	}
+	jq, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("actual copied jq examples require jq on PATH")
+	}
+	bv := buildBvBinary(t)
+	dir := t.TempDir()
+	writeBeads(t, dir, `{"id":"ROOT","title":"Unblocker","status":"open","priority":4,"issue_type":"task"}
+{"id":"MID","title":"Bridge","status":"open","priority":4,"issue_type":"task","dependencies":[{"issue_id":"MID","depends_on_id":"ROOT","type":"blocks"}]}
+{"id":"LEAF","title":"Dependent","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"LEAF","depends_on_id":"MID","type":"blocks"}]}`)
+	for _, tc := range []struct {
+		document string
+		prefix   string
+		check    func([]any) bool
+	}{
+		{"README.md", "bv --robot-plan | jq ", func(rows []any) bool {
+			row, ok := rows[0].(map[string]any)
+			return ok && len(rows) == 1 && row["id"] == "ROOT" && reflect.DeepEqual(row["unblocks"], []any{"MID"})
+		}},
+		{"README.md", "bv --robot-insights | jq '.full_stats.core_number", func(rows []any) bool {
+			entries, ok := rows[0].([]any)
+			if !ok || len(rows) != 1 || len(entries) != 3 {
+				return false
+			}
+			keys := make(map[string]bool)
+			for _, entry := range entries {
+				row, ok := entry.(map[string]any)
+				if !ok || row["value"] != float64(1) {
+					return false
+				}
+				key, ok := row["key"].(string)
+				if !ok || keys[key] {
+					return false
+				}
+				keys[key] = true
+			}
+			return reflect.DeepEqual(keys, map[string]bool{"ROOT": true, "MID": true, "LEAF": true})
+		}},
+		{"README.md", "bv --robot-insights | jq '.Articulation", func(rows []any) bool {
+			return reflect.DeepEqual(rows, []any{[]any{"MID"}})
+		}},
+		{"README.md", "bv --robot-priority | jq ", func(rows []any) bool {
+			foundBridge := false
+			for _, entry := range rows {
+				row, ok := entry.(map[string]any)
+				if !ok {
+					return false
+				}
+				confidence, ok := row["confidence"].(float64)
+				if !ok || confidence <= 0.6 {
+					return false
+				}
+				if row["issue_id"] == "MID" {
+					foundBridge = true
+				}
+			}
+			return foundBridge
+		}},
+		{"AGENTS.md", "bv --robot-triage | jq ", func(rows []any) bool {
+			row, ok := rows[0].(map[string]any)
+			if !ok || len(rows) != 1 || row["open_count"] != float64(3) || row["actionable_count"] != float64(1) {
+				return false
+			}
+			picks, ok := row["top_picks"].([]any)
+			if !ok || len(picks) != 1 {
+				return false
+			}
+			pick, ok := picks[0].(map[string]any)
+			return ok && pick["id"] == "ROOT"
+		}},
+	} {
+		t.Run(tc.document+"/"+tc.prefix, func(t *testing.T) {
+			var line string
+			for _, candidate := range strings.Split(repoFile(t, tc.document), "\n") {
+				if strings.HasPrefix(candidate, tc.prefix) {
+					line = candidate
+					break
+				}
+			}
+			parts := strings.SplitN(line, " | jq ", 2)
+			if len(parts) != 2 {
+				t.Fatalf("missing copyable quoted jq example for %q", tc.prefix)
+			}
+			quoted := regexp.MustCompile(`^'([^']*)'(?:\s+#.*)?$`).FindStringSubmatch(parts[1])
+			if len(quoted) != 2 {
+				t.Fatalf("invalid copied jq expression: %s", parts[1])
+			}
+			cmd := exec.Command(bv, strings.Fields(strings.TrimPrefix(parts[0], "bv "))...)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(), "SOURCE_DATE_EPOCH=1788220800")
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			payload, err := cmd.Output()
+			if err != nil {
+				t.Fatalf("copied bv command: %v\n%s", err, stderr.String())
+			}
+			query := exec.Command(jq, "-c", quoted[1])
+			query.Stdin = bytes.NewReader(payload)
+			query.Stderr = &stderr
+			output, err := query.Output()
+			if err != nil {
+				t.Fatalf("copied jq expression: %v\n%s", err, stderr.String())
+			}
+			if stderr.Len() != 0 {
+				t.Logf("command diagnostics: %s", stderr.String())
+			}
+			var rows []any
+			decoder := json.NewDecoder(bytes.NewReader(output))
+			for {
+				var row any
+				if err := decoder.Decode(&row); err == io.EOF {
+					break
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				rows = append(rows, row)
+			}
+			if len(rows) == 0 || !tc.check(rows) {
+				t.Fatalf("documented query returned the wrong fixture result: %s", output)
+			}
+		})
+	}
+}
+
+func TestDocsParity_ForecastWorkedExamples(t *testing.T) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	closedAt, explicit, completed := now.Add(-24*time.Hour), 120, 240
+	issues := []model.Issue{
+		{ID: "explicit", Status: model.StatusOpen, IssueType: model.TypeFeature, Description: strings.Repeat("界", 1000), EstimatedMinutes: &explicit},
+		{ID: "median", Status: model.StatusOpen, IssueType: model.TypeFeature, Description: strings.Repeat("界", 1000)},
+		{ID: "explicit-child", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "explicit", Type: model.DepBlocks}}},
+		{ID: "median-child", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "median", Type: model.DepBlocks}}},
+		{ID: "completed", Status: model.StatusClosed, IssueType: model.TypeTask, EstimatedMinutes: &completed, ClosedAt: &closedAt},
+	}
+	stats := analysis.NewAnalyzer(issues).Analyze()
+	readme := repoFile(t, "README.md")
+	for _, tc := range []struct {
+		id      string
+		minutes int
+		days    float64
+	}{{"explicit", 280, 17.5}, {"median", 421, 26.3125}} {
+		// Values are independently worked from base 120/180, feature 1.3,
+		// depth 2 => 1.2, 1000 runes => 1.5; integer minutes / (8 * 2).
+		row := regexp.MustCompile(`(?m)^\| ` + tc.id + ` \| ([0-9]+) \| ([0-9.]+) \|$`).FindStringSubmatch(readme)
+		if len(row) != 3 {
+			t.Errorf("README is missing its executable %s forecast example", tc.id)
+			continue
+		}
+		minutes, _ := strconv.Atoi(row[1])
+		days, _ := strconv.ParseFloat(row[2], 64)
+		eta, err := analysis.EstimateETAForIssue(issues, &stats, tc.id, 2, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.GetCriticalPathScore(tc.id) != 2 || minutes != tc.minutes || days != tc.days ||
+			eta.EstimatedMinutes != minutes || eta.EstimatedDays != days || eta.VelocityMinutesPerDay != 8 {
+			t.Errorf("%s documented=%dm/%gd runtime=%+v, independently expected=%dm/%gd", tc.id, minutes, days, eta, tc.minutes, tc.days)
+		}
+	}
+}
+
+func TestDocsParity_RecipeKeyDispatchesPicker(t *testing.T) {
+	readme := repoFile(t, "README.md")
+	row := regexp.MustCompile("(?m)^\\| .*\\| `([^`]+)` \\| Recipe picker \\|$").FindStringSubmatch(readme)
+	if len(row) != 2 || len([]rune(row[1])) != 1 {
+		t.Fatal("README must document a single recipe-picker key")
+	}
+	m := ui.NewModel([]model.Issue{{ID: "doc-key", Title: "Visible issue", Status: model.StatusOpen}}, nil, "")
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
+	if strings.Contains(m.View(), "Select Recipe") {
+		t.Fatal("picker was already open before the documented key")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(row[1])})
+	if !strings.Contains(m.View(), "Select Recipe") {
+		t.Fatalf("documented key %q did not open the actual picker", row[1])
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if strings.Contains(m.View(), "Select Recipe") {
+		t.Fatal("Escape did not return from the picker")
+	}
+}
+
+func TestDocsParity_ConfiguredCoverageThresholds(t *testing.T) {
+	workflow := repoFile(t, ".github/workflows/ci.yml")
+	document := repoFile(t, "docs/testing.md")
+	configured := make(map[string]string)
+	for _, row := range regexp.MustCompile(`github\.com/Dicklesworthstone/beads_viewer/(pkg/[a-z_]+)\) req=([0-9]+)`).FindAllStringSubmatch(workflow, -1) {
+		configured[row[1]] = row[2]
+	}
+	documented := make(map[string]string)
+	for _, row := range regexp.MustCompile("(?m)^\\| `(pkg/[a-z_]+)` \\| ([0-9]+)% \\|$").FindAllStringSubmatch(document, -1) {
+		documented[row[1]] = row[2]
+	}
+	if len(configured) < 8 || !reflect.DeepEqual(documented, configured) {
+		t.Fatalf("documented coverage thresholds do not match configured workflow: documented=%v configured=%v", documented, configured)
+	}
+}
 
 // repoFile reads a file relative to the repository root (tests/e2e/..).
 func repoFile(t *testing.T, rel string) string {

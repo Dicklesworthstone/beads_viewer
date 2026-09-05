@@ -1,6 +1,7 @@
 package main_test
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,206 @@ import (
 
 	_ "modernc.org/sqlite"
 )
+
+func TestExportPagesSourceAuthorityAndWatchReload(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+	root := t.TempDir()
+	beads := filepath.Join(root, ".beads")
+	if err := os.MkdirAll(beads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(beads, "issues.jsonl")
+	valid := []byte(`{"id":"safe","title":"Exportable work","status":"open","issue_type":"task"}` + "\n")
+	if err := os.WriteFile(path, valid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(root, "export")
+	logPath := filepath.Join(root, "watch.log")
+	log, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	cmd := exec.Command(bv, "--export-pages", output, "--watch-export", "--pages-include-history=false", "--no-hooks")
+	cmd.Dir = root
+	cmd.Stdout, cmd.Stderr = log, log
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait(); close(done) }()
+	t.Cleanup(func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+		}
+	})
+	type payload struct {
+		DataHash      string `json:"data_hash"`
+		AuthorityHash string `json:"authority_hash"`
+		Authority     struct {
+			State     string `json:"state"`
+			ClaimSafe bool   `json:"claim_safe"`
+		} `json:"source_authority"`
+		Commands struct {
+			ClaimTop string `json:"claim_top"`
+		} `json:"commands"`
+		Recommendations []struct {
+			ID        string `json:"id"`
+			Claimable bool   `json:"claimable"`
+		} `json:"recommendations"`
+	}
+	waitForState := func(state string) payload {
+		t.Helper()
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			data, err := os.ReadFile(filepath.Join(output, "data", "triage.json"))
+			var got payload
+			if err == nil && json.Unmarshal(data, &got) == nil && got.Authority.State == state {
+				complete := true
+				for _, name := range []string{"meta.json", "project_health.json", "graph_layout.json"} {
+					otherData, readErr := os.ReadFile(filepath.Join(output, "data", name))
+					var other payload
+					if readErr != nil || json.Unmarshal(otherData, &other) != nil || other.AuthorityHash != got.AuthorityHash {
+						complete = false
+						break
+					}
+				}
+				if complete {
+					return got
+				}
+			}
+			select {
+			case err := <-done:
+				logs, _ := os.ReadFile(logPath)
+				t.Fatalf("watch exited before %s: %v\n%s", state, err, logs)
+			default:
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		logs, _ := os.ReadFile(logPath)
+		t.Fatalf("watch did not publish %s authority\n%s", state, logs)
+		return payload{}
+	}
+	healthy := waitForState("complete")
+	if !healthy.Authority.ClaimSafe || healthy.Commands.ClaimTop != "" || len(healthy.Recommendations) != 1 || healthy.Recommendations[0].ID != "safe" || !healthy.Recommendations[0].Claimable {
+		t.Fatalf("healthy graph must retain the ready issue without inventing a tracker route: %+v", healthy)
+	}
+	if err := os.WriteFile(path, append(append([]byte(nil), valid...), []byte("{invalid\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	partial := waitForState("partial")
+	if partial.Authority.ClaimSafe || partial.Commands.ClaimTop != "" || len(partial.Recommendations) != 1 || partial.Recommendations[0].ID != "safe" || partial.Recommendations[0].Claimable {
+		t.Fatalf("partial export must retain useful work but withhold claims: %+v", partial)
+	}
+	if partial.DataHash != healthy.DataHash || partial.AuthorityHash == healthy.AuthorityHash {
+		t.Fatalf("hidden parse loss did not trigger authority-aware re-export: healthy=%+v partial=%+v", healthy, partial)
+	}
+	for _, name := range []string{"meta.json", "project_health.json", "graph_layout.json"} {
+		data, err := os.ReadFile(filepath.Join(output, "data", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var exported payload
+		if err := json.Unmarshal(data, &exported); err != nil {
+			t.Fatal(err)
+		}
+		if exported.Authority.State != "partial" || exported.AuthorityHash != partial.AuthorityHash {
+			t.Fatalf("%s lost current authority: %s", name, data)
+		}
+	}
+	if err := os.Rename(path, path+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	failed := waitForState("unknown")
+	if failed.Authority.ClaimSafe || failed.Commands.ClaimTop != "" {
+		t.Fatalf("failed reload left proven claims in the bundle: %+v", failed)
+	}
+	if err := os.WriteFile(path, valid, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recovered := waitForState("complete")
+	if !recovered.Authority.ClaimSafe || recovered.Commands.ClaimTop != "" || recovered.AuthorityHash != healthy.AuthorityHash || len(recovered.Recommendations) != 1 || recovered.Recommendations[0].ID != "safe" || !recovered.Recommendations[0].Claimable {
+		t.Fatalf("restored source did not restore graph readiness without an unbound command: %+v", recovered)
+	}
+}
+
+func TestPartialWorkspaceExportArtifactsRetainAuthority(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+	root := writeWorkspaceFixture(t)
+	config := filepath.Join(root, ".bv", "workspace.yaml")
+	contents, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = bytes.Replace(contents, []byte("path: apps/web"), []byte("path: missing-web"), 1)
+	if err := os.WriteFile(config, contents, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"pages", "graph", "brief", "script"} {
+		t.Run(format, func(t *testing.T) {
+			output := filepath.Join(root, format)
+			args := []string{"--workspace", config}
+			switch format {
+			case "pages":
+				args = append(args, "--export-pages", output, "--pages-include-history=false", "--no-hooks")
+			case "graph":
+				output += ".html"
+				args = append(args, "--export-graph", output)
+			case "brief":
+				args = append(args, "--agent-brief", output)
+			case "script":
+				args = append(args, "--emit-script")
+			}
+			cmd := exec.Command(bv, args...)
+			cmd.Dir = root
+			logs, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("%v\n%s", err, logs)
+			}
+			var data []byte
+			switch format {
+			case "pages":
+				data, err = os.ReadFile(filepath.Join(output, "data", "triage.json"))
+			case "graph":
+				data, err = os.ReadFile(output)
+				if err == nil {
+					match := regexp.MustCompile(`const DATA = (\{[^\n]+\});`).FindSubmatch(data)
+					if len(match) != 2 {
+						t.Fatalf("missing embedded graph JSON")
+					}
+					data = match[1]
+				}
+			case "brief":
+				data, err = os.ReadFile(filepath.Join(output, "triage.json"))
+			case "script":
+				if bytes.Contains(logs, []byte("br update")) || !bytes.Contains(logs, []byte(`"claim_safe":false`)) || !bytes.Contains(logs, []byte("br show api-AUTH-1")) {
+					t.Fatalf("partial script must preserve inspection and withhold claim commands:\n%s", logs)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(data, &payload); err != nil {
+				t.Fatalf("%v\n%s", err, data)
+			}
+			authority, ok := payload["source_authority"].(map[string]any)
+			if !ok || authority["state"] != "partial" || authority["claim_safe"] != false || !bytes.Contains(data, []byte("api-AUTH-1")) {
+				t.Fatalf("export lost useful source data or diagnostics: %s", data)
+			}
+			if regexp.MustCompile(`"claimable"\s*:\s*true`).Match(data) || regexp.MustCompile(`"claim_top"\s*:\s*"[^\"]+"`).Match(data) {
+				t.Fatalf("partial artifact emitted claim: %s", data)
+			}
+		})
+	}
+}
 
 func TestExportPages_IncludesHistoryAndRunsHooks(t *testing.T) {
 	bv := buildBvBinary(t)

@@ -41,6 +41,22 @@ func TestMain(m *testing.M) {
 	os.Setenv("HOME", homeDir)
 	os.Setenv("XDG_CONFIG_HOME", filepath.Join(homeDir, ".config"))
 
+	// Some RCH workers run as a different uid from the copied checkout owner.
+	// Keep VCS stamping enabled and trust only this checkout in the test HOME.
+	repoDir, err := filepath.Abs(filepath.Join("..", ".."))
+	if err == nil {
+		repoDir, err = filepath.EvalSymlinks(repoDir)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to resolve test checkout: %v\n", err)
+		os.Exit(1)
+	}
+	gitConfig := exec.Command("git", "config", "--file", filepath.Join(homeDir, ".gitconfig"), "--add", "safe.directory", repoDir)
+	if out, err := gitConfig.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to configure isolated checkout trust: %v\n%s", err, out)
+		os.Exit(1)
+	}
+
 	// Build the binary once for all tests
 	if err := buildBvOnce(); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to build bv binary: %v\n", err)

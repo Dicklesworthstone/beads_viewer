@@ -2,14 +2,20 @@ package main_test
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 )
 
 // Performance Regression Tests for bv-ut9x
@@ -27,8 +33,8 @@ const (
 	maxPlanLatencyMS         = 2000 // 2 seconds for plan
 	maxSmallDatasetLatencyMS = 1000 // 1 second for small datasets (<50 issues)
 
-	// Memory thresholds (not directly measurable in E2E, but latency correlates)
-	maxLargeDatasetLatencyMS = 5000 // 5 seconds for large datasets (1000 issues)
+	// A wall-time smoke bound, not a memory proxy or a tail-latency claim.
+	maxLargeDatasetLatencyMS = 5000
 )
 
 // =============================================================================
@@ -178,21 +184,297 @@ func TestPerf_LargeDatasetLatency(t *testing.T) {
 	}
 
 	bv := buildBvBinary(t)
-	env := t.TempDir()
-
-	createTestDataset(t, env, 500)
-
-	start := time.Now()
-	cmd := exec.Command(bv, "--robot-triage")
-	cmd.Dir = env
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("failed: %v", err)
+	for _, size := range []int{1000, 5000, 10000} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			dir := t.TempDir()
+			writePerformanceFixture(t, dir, "realistic", size)
+			output, elapsed := runPerformanceCLI(t, bv, dir, filepath.Join(dir, "cold-cache"), "smoke")
+			var result struct {
+				Triage struct {
+					Meta struct {
+						IssueCount int `json:"issue_count"`
+					} `json:"meta"`
+				} `json:"triage"`
+			}
+			if err := json.Unmarshal(output, &result); err != nil || result.Triage.Meta.IssueCount != size {
+				t.Fatalf("large fixture was not fully analyzed: count=%d want=%d, error=%v", result.Triage.Meta.IssueCount, size, err)
+			}
+			if _, err := performanceCLIBehavior(output); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("large dataset (%d issues) cold application-cache latency: %v", size, elapsed)
+			if elapsed.Milliseconds() > maxLargeDatasetLatencyMS {
+				t.Errorf("large dataset too slow: %v > %dms threshold", elapsed, maxLargeDatasetLatencyMS)
+			}
+		})
 	}
-	elapsed := time.Since(start)
+}
 
-	t.Logf("large dataset (500 issues) latency: %v", elapsed)
-	if elapsed.Milliseconds() > maxLargeDatasetLatencyMS {
-		t.Errorf("large dataset too slow: %v > %dms threshold", elapsed, maxLargeDatasetLatencyMS)
+func writePerformanceFixture(t testing.TB, dir, kind string, size int) string {
+	t.Helper()
+	issues, err := testutil.PerformanceIssues(kind, size, 20260904)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var data bytes.Buffer
+	encoder := json.NewEncoder(&data)
+	for _, issue := range issues {
+		if err := encoder.Encode(issue); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "issues.jsonl"), data.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data.Bytes()))
+}
+
+func runPerformanceCLI(t testing.TB, binary, dir, cache, sample string) ([]byte, time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "--robot-triage")
+	cmd.Dir = dir
+	// A pinned SOURCE_DATE_EPOCH runs metrics to completion. Removing it is
+	// essential here: production timeouts/degradation must remain observable.
+	for _, value := range os.Environ() {
+		key, _, _ := strings.Cut(value, "=")
+		if !strings.HasPrefix(key, "BV_") && !strings.HasPrefix(key, "BEADS_") && key != "SOURCE_DATE_EPOCH" {
+			cmd.Env = append(cmd.Env, value)
+		}
+	}
+	cmd.Env = append(cmd.Env, "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "BV_NO_SAVED_CONFIG=1", "BEADS_DIR="+filepath.Join(dir, ".beads"), "BV_CACHE_DIR="+cache)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	started := time.Now()
+	output, err := cmd.Output()
+	elapsed := time.Since(started)
+	// Retain actual stdout/stderr, including failures. Each sample has a unique
+	// name inside an isolated destination; the runner retains the directory.
+	for suffix, content := range map[string][]byte{"stdout.json": output, "stderr.log": stderr.Bytes()} {
+		path := filepath.Join(dir, sample+"."+suffix)
+		if filepath.IsAbs(sample) {
+			path = sample + "." + suffix
+		}
+		if writeErr := os.WriteFile(path, content, 0o600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+	if err != nil {
+		t.Fatalf("%s --robot-triage failed: %v\nstderr: %s\nstdout: %s", binary, err, stderr.String(), output)
+	}
+	return output, elapsed
+}
+
+// Compare the decision IDs in order, readiness/claim fields, source identity,
+// and every metric state/reason/sample. Raw outputs remain available for score
+// review; this projection does not claim bitwise floating-point score parity.
+func performanceCLIBehavior(output []byte) ([]byte, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(output, &envelope); err != nil {
+		return nil, fmt.Errorf("decode robot envelope: %w", err)
+	}
+	var triage map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["triage"], &triage); err != nil {
+		return nil, fmt.Errorf("decode triage: %w", err)
+	}
+	states, err := testutil.PerformanceMetricStates(triage["status"])
+	if err != nil {
+		return nil, err
+	}
+	decision := map[string]any{"status": states, "data_hash": envelope["data_hash"], "authority_hash": envelope["authority_hash"], "source_authority": envelope["source_authority"], "commands": triage["commands"]}
+	for _, field := range []string{"recommendations", "quick_wins", "blockers_to_clear"} {
+		var rows []map[string]json.RawMessage
+		if err := json.Unmarshal(triage[field], &rows); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", field, err)
+		}
+		projected := make([]map[string]json.RawMessage, 0, len(rows))
+		for _, row := range rows {
+			item := make(map[string]json.RawMessage)
+			for _, key := range []string{"id", "status", "claimable", "actionable", "claim_command", "unblocks_ids", "blocked_by"} {
+				if value, ok := row[key]; ok {
+					item[key] = value
+				}
+			}
+			if len(item["id"]) == 0 {
+				return nil, fmt.Errorf("%s entry has no ID", field)
+			}
+			projected = append(projected, item)
+		}
+		decision[field] = projected
+	}
+	var quick map[string]json.RawMessage
+	if err := json.Unmarshal(triage["quick_ref"], &quick); err != nil {
+		return nil, fmt.Errorf("decode quick_ref: %w", err)
+	}
+	var picks []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(quick["top_picks"], &picks); err != nil {
+		return nil, fmt.Errorf("decode top picks: %w", err)
+	}
+	decision["top_picks"] = picks
+	return json.Marshal(decision)
+}
+
+func TestPerformanceCLIParityControls(t *testing.T) {
+	dir := t.TempDir()
+	writePerformanceFixture(t, dir, "realistic", 20)
+	output, _ := runPerformanceCLI(t, buildBvBinary(t), dir, filepath.Join(dir, "cache"), "parity-control")
+	baseline, err := performanceCLIBehavior(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range []string{"reordered-ids", "skipped-metric", "missing-metric"} {
+		t.Run(mutation, func(t *testing.T) {
+			var envelope map[string]any
+			if err := json.Unmarshal(output, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			triage := envelope["triage"].(map[string]any)
+			status := triage["status"].(map[string]any)
+			switch mutation {
+			case "reordered-ids":
+				rows := triage["recommendations"].([]any)
+				if len(rows) < 2 {
+					t.Fatal("parity fixture must exercise at least two recommendations")
+				}
+				rows[0], rows[1] = rows[1], rows[0]
+			case "skipped-metric":
+				status["PageRank"] = map[string]any{"state": "skipped", "reason": "planted parity negative"}
+			case "missing-metric":
+				delete(status, "Cycles")
+			}
+			mutated, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			behavior, err := performanceCLIBehavior(mutated)
+			if mutation == "missing-metric" {
+				if err == nil {
+					t.Fatal("missing metric accepted as measured work")
+				}
+			} else if err != nil || bytes.Equal(behavior, baseline) {
+				t.Fatalf("%s did not change behavior parity: %v", mutation, err)
+			}
+		})
+	}
+}
+
+// TestPerformanceCLICohorts runs same-host alternating baseline/current pairs.
+// Both cohorts start a new OS process; only the application's disk-cache state
+// differs. No OS page-cache drop, CPU tuning, or best-of-N selection is involved.
+func TestPerformanceCLICohorts(t *testing.T) {
+	outDir := os.Getenv("BV_PERF_DIR")
+	if outDir == "" {
+		t.Skip("opt-in measurement: scripts/benchmark.sh latency")
+	}
+	baseline := os.Getenv("BV_PERF_BASELINE_BINARY")
+	current := os.Getenv("BV_PERF_CURRENT_BINARY")
+	if baseline == "" || current == "" {
+		t.Fatal("both BV_PERF_BASELINE_BINARY and BV_PERF_CURRENT_BINARY are required")
+	}
+	samples := 200
+	if value := os.Getenv("BV_PERF_CLI_SAMPLES"); value != "" {
+		var err error
+		samples, err = strconv.Atoi(value)
+		if err != nil || samples < 200 {
+			t.Fatal("BV_PERF_CLI_SAMPLES must be at least 200; p99 is descriptive")
+		}
+	}
+	for _, kind := range testutil.PerformanceWorkloadNames() {
+		for _, size := range []int{1000, 5000, 10000} {
+			t.Run(fmt.Sprintf("%s/%d", kind, size), func(t *testing.T) {
+				for _, warm := range []bool{false, true} {
+					mode := "cold-application-cache"
+					if warm {
+						mode = "warm-application-cache"
+					}
+					t.Run(mode, func(t *testing.T) {
+						var durations [2][]time.Duration
+						var dirs [2]string
+						var binaryHashes [2]string
+						// Both binaries must read the same physical source path:
+						// source-authority identity intentionally includes provenance.
+						fixtureDir := filepath.Join(outDir, fmt.Sprintf("cli-%s-%d-%s-source", kind, size, mode))
+						if err := os.Mkdir(fixtureDir, 0o700); err != nil {
+							t.Fatal(err)
+						}
+						fixtureHash := writePerformanceFixture(t, fixtureDir, kind, size)
+						binaries := [2]string{baseline, current}
+						for side, binary := range binaries {
+							dir := filepath.Join(outDir, fmt.Sprintf("cli-%s-%d-%s-%d", kind, size, mode, side))
+							if err := os.Mkdir(dir, 0o700); err != nil {
+								t.Fatal(err)
+							}
+							dirs[side] = dir
+							binaryBytes, err := os.ReadFile(binary)
+							if err != nil {
+								t.Fatal(err)
+							}
+							binaryHashes[side] = fmt.Sprintf("%x", sha256.Sum256(binaryBytes))
+							if warm {
+								runPerformanceCLI(t, binary, fixtureDir, filepath.Join(dir, "cache"), filepath.Join(dir, "warmup"))
+								entries, err := filepath.Glob(filepath.Join(dir, "cache", "*", "*.json"))
+								if err != nil || len(entries) == 0 {
+									t.Fatalf("warmup did not create an actual analysis cache entry: %v", err)
+								}
+							}
+						}
+						var expected []byte
+						var mismatches []string
+						for sample := 0; sample < samples; sample++ {
+							for position := 0; position < 2; position++ {
+								side := (sample + position) % 2
+								cache := filepath.Join(dirs[side], "cache")
+								if !warm {
+									cache = filepath.Join(dirs[side], fmt.Sprintf("cold-%04d", sample))
+									if _, err := os.Stat(cache); !os.IsNotExist(err) {
+										t.Fatalf("cold cache already exists or cannot be checked: %v", err)
+									}
+								}
+								output, elapsed := runPerformanceCLI(t, binaries[side], fixtureDir, cache, filepath.Join(dirs[side], fmt.Sprintf("sample-%04d", sample)))
+								durations[side] = append(durations[side], elapsed)
+								behavior, err := performanceCLIBehavior(output)
+								if err != nil {
+									t.Fatal(err)
+								}
+								if expected == nil {
+									expected = behavior
+								} else if !bytes.Equal(expected, behavior) {
+									mismatches = append(mismatches, fmt.Sprintf("side=%d sample=%d", side, sample))
+								}
+							}
+						}
+						for side := range binaries {
+							summary, err := testutil.SummarizeLatency(durations[side])
+							if err != nil {
+								t.Fatal(err)
+							}
+							record := map[string]any{"workload": kind, "issues": size, "seed": 20260904, "fixture_sha256": fixtureHash,
+								"mode": mode, "side": side, "binary_sha256": binaryHashes[side], "distribution": summary, "sample_ns": durations[side],
+								"decision_behavior": json.RawMessage(expected), "parity_mismatches": mismatches,
+								"go_version": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
+								"interpretation": "empirical new-process wall time; application cache isolated; OS page cache uncontrolled; ID/order/metric-state parity only"}
+							data, err := json.MarshalIndent(record, "", "  ")
+							if err != nil {
+								t.Fatal(err)
+							}
+							if err := os.WriteFile(filepath.Join(dirs[side], "result.json"), data, 0o600); err != nil {
+								t.Fatal(err)
+							}
+							t.Logf("%s side=%d p50=%.3fms p95=%.3fms p99=%.3fms", mode, side, summary.P50MS, summary.P95MS, summary.P99MS)
+						}
+						if len(mismatches) != 0 {
+							t.Errorf("%d samples changed ordered IDs/readiness/metric states; timing comparison is inconclusive; first: %s", len(mismatches), mismatches[0])
+						}
+					})
+				}
+			})
+		}
 	}
 }
 

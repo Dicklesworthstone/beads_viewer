@@ -525,20 +525,32 @@ func TestRobotNextContractNoActionable(t *testing.T) {
 func TestRobotNextContractActionable(t *testing.T) {
 	bv := buildBvBinary(t)
 	env := t.TempDir()
-	// A is actionable and should be picked; B is blocked by A.
+	// A is graph-ready and should be picked; B is blocked by A. This JSONL
+	// fixture has no live tracker, so A must be a diagnostic candidate.
 	writeBeads(t, env, `{"id":"A","title":"Unblocker","status":"open","priority":1,"issue_type":"task"}
 {"id":"B","title":"Blocked","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"B","depends_on_id":"A","type":"blocks"}]}`)
 
 	var payload struct {
-		GeneratedAt string   `json:"generated_at"`
-		DataHash    string   `json:"data_hash"`
-		ID          string   `json:"id"`
-		Title       string   `json:"title"`
-		Score       float64  `json:"score"`
-		Reasons     []string `json:"reasons"`
-		Unblocks    int      `json:"unblocks"`
-		ClaimCmd    string   `json:"claim_command"`
-		ShowCmd     string   `json:"show_command"`
+		GeneratedAt string `json:"generated_at"`
+		DataHash    string `json:"data_hash"`
+		Actionable  bool   `json:"actionable"`
+		ID          string `json:"id"`
+		ClaimCmd    string `json:"claim_command"`
+		ShowCmd     string `json:"show_command"`
+		Diagnostic  *struct {
+			ID       string   `json:"id"`
+			Title    string   `json:"title"`
+			Score    float64  `json:"score"`
+			Reasons  []string `json:"reasons"`
+			Unblocks int      `json:"unblocks"`
+		} `json:"diagnostic_top_pick"`
+		Authority struct {
+			ClaimSafe bool `json:"claim_safe"`
+		} `json:"source_authority"`
+		Actions struct {
+			Claim any `json:"claim"`
+			Show  any `json:"show"`
+		} `json:"actions"`
 	}
 	runRobotJSON(t, bv, env, "--robot-next", &payload)
 
@@ -548,23 +560,23 @@ func TestRobotNextContractActionable(t *testing.T) {
 	if payload.DataHash == "" {
 		t.Fatalf("robot-next missing data_hash")
 	}
-	if payload.ID != "A" {
-		t.Fatalf("expected robot-next to pick A, got %q", payload.ID)
+	if payload.Diagnostic == nil || payload.Diagnostic.ID != "A" {
+		t.Fatalf("expected robot-next to retain diagnostic candidate A: %+v", payload)
 	}
-	if payload.Title == "" {
+	if payload.Diagnostic.Title != "Unblocker" {
 		t.Fatalf("robot-next missing title")
 	}
-	if payload.Score == 0 {
+	if payload.Diagnostic.Score == 0 {
 		t.Fatalf("robot-next missing score")
 	}
-	if len(payload.Reasons) == 0 {
+	if len(payload.Diagnostic.Reasons) == 0 {
 		t.Fatalf("robot-next missing reasons")
 	}
-	if payload.ClaimCmd != "br update A --status=in_progress" {
-		t.Fatalf("unexpected claim_command: %q", payload.ClaimCmd)
+	if payload.Diagnostic.Unblocks != 1 || !payload.Authority.ClaimSafe {
+		t.Fatalf("complete fixture lost graph readiness or its unblocking effect: %+v", payload)
 	}
-	if payload.ShowCmd != "br show A" {
-		t.Fatalf("unexpected show_command: %q", payload.ShowCmd)
+	if payload.Actionable || payload.ID != "" || payload.ClaimCmd != "" || payload.ShowCmd != "" || payload.Actions.Claim != nil || payload.Actions.Show != nil {
+		t.Fatalf("metadata-free fixture invented a live tracker route: %+v", payload)
 	}
 }
 
