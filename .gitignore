@@ -38,8 +38,9 @@ test-results/
 .beads/.write.lock
 pkg/ui/.beads/
 
-# Large benchmark test data (generated)
-tests/testdata/benchmark/
+# Generated benchmark data, except the frozen release-gate input
+tests/testdata/benchmark/*
+!tests/testdata/benchmark/medium.jsonl
 *.prof
 
 # E2E test logs

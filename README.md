@@ -52,6 +52,9 @@ scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bu
 scoop install dicklesworthstone/bv
 ```
 
+As of September 5, 2026, Homebrew and Scoop list v0.22.0. To install v0.23.0,
+use a verified release archive below. See the [distribution checks](docs/RELEASING.md#native-installation-and-package-stores) for version and checksum details.
+
 ### Alternative: Direct Download
 
 Pick the archive for your platform from the [latest release page](https://github.com/Dicklesworthstone/beads_viewer/releases/latest). Archives are named `bv_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows), for example `bv_0.23.0_linux_amd64.tar.gz`, `bv_0.23.0_darwin_arm64.tar.gz`, `bv_0.23.0_windows_amd64.zip`, so a downloaded file always says which release it came from. Every release also ships `checksums.txt`; verify before extracting:
@@ -79,7 +82,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/03f
 # Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/d0d9f331ff4d46dc1063fda6a3fb4695c75b3ce3/install.ps1
 irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/d0d9f331ff4d46dc1063fda6a3fb4695c75b3ce3/install.ps1" | iex
 ```
-> **Note:** `install.ps1` downloads the release zip for Windows, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses to install anything that does not verify; no Go toolchain is needed. Pass `-Version v0.23.0` to pin a release, `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`), or `-FromSource` to build with `go install` pinned to that same tag. Scoop installs the same prebuilt archive. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
+> **Note:** `install.ps1` downloads the release zip for Windows, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses to install anything that does not verify; no Go toolchain is needed. Pass `-Version v0.23.0` to pin a release, `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`), or `-FromSource` to build with `go install` pinned to that same tag. Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
 
 ---
 

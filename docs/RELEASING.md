@@ -44,18 +44,22 @@ and each stage's command, duration, exit code, and outcome. Ignored files under
 as undeclared build inputs. Commit intended inputs before running the final
 gate. Symlink inputs must resolve to files inside the checkout.
 
-Stage 8 has no dependency outside the Go toolchain: `scripts/benchmark.sh`
+Stage 8 requires Go, Git and standard shell tools: `scripts/benchmark.sh`
 runs the ten tracked benchmarks (`BenchmarkRealData_*`, `BenchmarkFullAnalysis_*`,
 `BenchmarkSnapshotSwap`, `BenchmarkKeyPressLatency`, `BenchmarkListItemBuild`,
 `BenchmarkParseIssuesPoolComparison`) against the frozen dataset
 `tests/testdata/benchmark/medium.jsonl`, four rounds per package alternating
 between the baseline commit's tree and HEAD with the pair order swapped each
 round (always running one tree first biased identical code by 10-20%), and
-compares the best observed `ns/op` of each side (contention only inflates
-samples, so the minimum is the closest to the uncontended time). The stored
+compares the best observed `ns/op` of each side. Taking the minimum reduces
+the effect of slow outliers; shared-host scheduling, cache state and CPU
+frequency can still affect either side. The stored
 `benchmarks/baseline.txt` carries a
 provenance header (date, Go version, CPU, OS, commit, dataset hash) and is
 regenerated only on the reference machine with `scripts/benchmark.sh baseline`.
+The frozen `medium.jsonl` input is tracked with the source and matches that
+header's SHA256. Keep those exact bytes in clean checkouts; regenerating the
+fixture changes the workload and invalidates the recorded baseline.
 `BENCH_PCT` (gate: `RELEASE_GATE_BENCH_PCT`) sets the threshold;
 `tests/scripts/benchmark_compare_test.sh` proves the comparison turns red on a
 benchmark doubled in every sample, stays green on one contended sample, and
@@ -65,9 +69,11 @@ same code read +38% against the stored file and 0% against a fresh build of
 the baseline commit), `compare` first builds and runs the tracked set for the
 commit named in the baseline header, in a detached worktree, and judges HEAD
 against that contemporaneous run; the stored file is the fallback when that
-commit is not in the clone (`BENCH_REFERENCE=stored` forces it). A stage-8
-failure is therefore a code regression relative to the baseline commit, not
-a busy host, and is never a licence to raise the threshold.
+commit is not in the clone (`BENCH_REFERENCE=stored` forces it). A reported
+threshold breach does not by itself establish the cause. Missing benchmark
+results and build errors can also fail the stage. Inspect the retained samples and
+reference-build identity before attributing a regression to code or host
+conditions. A failed comparison is never a licence to raise the threshold.
 
 ## Where the gate runs
 
@@ -168,12 +174,14 @@ arm64, and a supported Nix build remain unverified by that run.
 
 Check the public [Homebrew formula](https://github.com/Dicklesworthstone/homebrew-tap/blob/main/Formula/bv.rb)
 and [Scoop manifest](https://github.com/Dicklesworthstone/scoop-bucket/blob/main/bv.json)
-separately. On 2026-09-04 both still selected v0.22.0, while the latest GitHub
+separately. On 2026-09-05 both still selected v0.22.0, while the latest GitHub
 release was v0.23.0; all five store archive hashes matched the v0.22.0 checksum
 manifest. `skip_upload: true` means publishing a GitHub Release does not update
 either store. After explicit authorization, update the formula's four platform
 URLs/hashes and Scoop's Windows URL/hash and version from the same verified
-release, publish those changes to the respective repositories' `main` branches,
+release. Use its actual asset names: v0.23.0 adds `bv_0.23.0_` to the archive
+names, so replacing only the tag in a v0.22.0 URL is insufficient.
+Publish those changes to the respective repositories' `main` branches,
 then fetch the public manifests again and verify their version and hashes.
 Until that separate step completes, do not describe the package-store install
 as installing the latest GitHub release.

@@ -6,9 +6,11 @@ This is the rescore after the implementation and independent verification campai
 The complete September 4 assessment and earlier records remain below as historical
 baselines. Their defect descriptions and task statuses are not the current verdict.
 
-**Source boundary:** `main` at `7393a06b48388a1aecca895557888281b6e3d4e2`, with
-uncommitted implementation, test, documentation and asset changes. This assesses
-that working tree and the explicitly identified earlier test snapshots, not a new
+**Source boundary:** the implementation, tests, documentation and assets were
+committed on `main` through `20d2841da5cb9a57df2bb6ea29dd4c2bf705d35a`.
+The September 5 continuation adds the previously ignored frozen benchmark input
+and corrects release documentation. Earlier runtime evidence remains bound to its
+identified source snapshots; these commits do not establish a new packaged or
 published release. The 34 campaign beads currently comprise **24 closed, seven
 open and three blocked**. The 10 remaining items include three epics and the final
 verification task; they are not 10 independent product defects.
@@ -31,8 +33,8 @@ Neither these counts nor the status table imply a percentage of product completi
    Search has a useful fixed evaluation, not human-reviewed field-quality evidence.
    Documentation has verified examples but still awaits the final capability freeze.
 3. **What is blocking completion:** S5 needs an authorized, fixed live tracker;
-   V5 needs actual unavailable native targets and completion of the distribution
-   checks. The final source must then
+   V5 needs known login routes for the reachable Macs and an actual Linux ARM64
+   runner. Public package-store versions and hashes have been checked. The final source must then
    be frozen and pass the bound release gate. None can be replaced by more reports,
    cross-compilation, a loading frame, or an external draft's green tests.
 4. **Would the remaining beads finish the accepted vision?** They cover the known
@@ -91,12 +93,12 @@ for each numbered goal are retained in the September 4 table below.
 | 34 | Offline/mobile dashboard search, graph and persistence | WORKING | V4 used actual Chromium desktop and 360px viewport journeys, stopped-server offline reload, graph/search and persistence, with missing/corrupt asset negatives. Physical phones, Safari and every browser remain untested. |
 | 35 | Hooks, failure propagation and browser opt-out | WORKING | Actual report/hook ordering, failure paths and browser opt-out tests pass. Browser automation was separately explicit, not silently launched by ordinary tests. |
 | 36 | Verified updater and versioned downloads | WORKING | Native Linux amd64 and Windows x64 install/update/no-update paths and corrupt/wrong-version preservation controls pass. Remaining native/distribution scope is row 39. |
-| 37 | Release bytes correspond to a fully checked source commit | PARTIAL | V1 now rejects skipped/missing/dirty evidence and binds real package bytes to source. This dirty working tree has no completed clean packaged gate or new published artifact. |
+| 37 | Release bytes correspond to a fully checked source commit | PARTIAL | V1 now rejects skipped/missing/dirty evidence and binds real package bytes to source. The implementation is committed, but no complete gate or package covers the final source. The frozen dataset now survives source archiving and loads through the real CLI; its bytes and baseline remain unchanged. |
 | 38 | Vendored assets correspond to reviewed source | WORKING | V2 rebuilds graph WASM/glue with the pinned pipeline and checks source/output identity plus graph parity. Local Go rendering patches have explicit provenance and do not reach version-suffixed `go install`; see limits below. |
-| 39 | Supported Windows/macOS/Linux installation and upgrades | PARTIAL | Native Linux amd64, Windows x64 and isolated Linux amd64 Nix subsets pass. Native macOS amd64/arm64, Linux ARM64 and remaining distribution checks are outstanding (V5). |
+| 39 | Supported Windows/macOS/Linux installation and upgrades | PARTIAL | Native Linux amd64, Windows x64 and isolated Linux amd64 Nix subsets pass. Public Homebrew/Scoop URLs and hashes match v0.22.0, behind GitHub v0.23.0. Native macOS amd64/arm64 and Linux ARM64 execution remain outstanding (V5). |
 | 40 | Dependable local/remote release verification | PARTIAL | V3 isolation/trust/ancestor/editor controls pass. Latest local and fresh-source RCH suites each pass all 29 packages with the isolated fixed tracker; their 36 and 56 skips remain explicit. Installed-br suites retain the stale-claim failure, and the clean packaged gate is not complete. |
 | 41 | 10k+ browsing and the advertised frame-rate experience | WORKING | The full 1k/5k/10k reference-host matrix passes: 144 current UI cohorts, 144,000 observations, worst cohort p99 30.862ms and maximum snapshot/Phase 2 handlers 12.255/19.050ms. Independent review retains 57.616ms individual interactions, configured degradation and extra unpaired generations. This does not establish terminal paint, universal 60fps or behavior beyond the measured workloads. |
-| 42 | Reference docs/examples match running behavior | PARTIAL | Actual copied YAML, jq, forecast, key-dispatch and configured-threshold examples pass. P2 remains blocked until final performance, live-action and native-delivery claims can be settled. |
+| 42 | Reference docs/examples match running behavior | PARTIAL | Actual copied YAML, jq, forecast, key-dispatch and configured-threshold examples pass. Performance claims are settled; P2 remains blocked until final live-action and native-delivery claims can be settled. |
 
 ### Evidence that changes the verdict, and its boundaries
 
@@ -168,8 +170,11 @@ for each numbered goal are retained in the September 4 table below.
   (112.638 seconds), then version/capabilities and a hand-checked dependency fixture
   passed independently. That Nix run is not the full Go suite and predates the latest
   rendering/startup edits. Missing macOS and Linux ARM64 runs cannot be substituted
-  with cross-builds or emulation. Recorded store-version drift still needs final
-  checking; no store publication or host profile modification was performed.
+  with cross-builds or emulation. The September 5 public-store check independently
+  matches all five Homebrew/Scoop URLs and hashes to the v0.22.0 release manifest;
+  the current GitHub release remains v0.23.0. Both Macs now answer SSH handshakes,
+  but no known authorized login was recovered, so neither architecture nor native
+  execution is established. No store publication or host profile change occurred.
 - **External tracker draft (S5):** installed br remains unsafe at the atomic claim
   boundary. A fix exists only in an owned external `beads_rust` copy: transactional
   closed-state rejection plus a closed/tombstone CAS exclusion. Four real regressions
@@ -179,7 +184,23 @@ for each numbered goal are retained in the September 4 table below.
   Root independently reran all 14 live-route cases successfully against that
   same draft, including competing claims and the stale-claim rejection.
   Initial source-receipt, build-resource and default-debug-output failures remain
-  recorded. No upstream source or installed br was changed, so S5 stays blocked.
+  recorded. A fresh run against committed bv `20d2841d` and the currently installed
+  br (`bf8e0c9c42fc966d8e1134206de7201cfe07a14e6b3c8527df650b87ae48f797`)
+  still passes 13 routing children and fails the stale-closed claim: the tracker
+  returns zero and changes the issue to `in_progress`. The reviewed external
+  production and test patches still apply to the newer Rust source. This campaign
+  has not changed upstream source or installed br, so S5 stays blocked.
+- **Clean-checkout gate input:** the frozen 1,000-issue benchmark dataset was
+  excluded by `.gitignore` and absent from a fresh `20d2841d` checkout. The existing
+  synthetic fixture's SHA256 is
+  `f87a5b80817b5b7e3320911c920235cc8df2ad9cac6a9d564c48e83dcf19f2a3`, exactly
+  the hash in the tracked baseline. The source-inclusion repair preserves those
+  bytes and the original comparison threshold. Independent archived-source
+  verification and a separate root CLI run each load all 1,000 issues with complete
+  source authority and the expected status counts. The three existing RealData
+  benchmarks execute, and build/vet/format checks pass. This repairs a missing
+  release input; it does not regenerate a baseline or turn the incomplete release
+  gate green. Exact source and runtime evidence stays in `bv-oonu.11`.
 - **Rendering/performance (P1):** profile-driven allocation fixes and compact
   dependency details preserve frozen decisions; the original full acceptance and
   independent proof are complete. Rejected
@@ -268,7 +289,7 @@ matrix remains on `hz3` at
 | Work | Current state | Concrete completion still required |
 |---|---|---|
 | S5: `bv-xbvo.9` / `.10` | Blocked / open | Authorization and application of the reviewed external tracker fix, then independent real live tracker claim/close-race and bv route proof. Retain ordinary claim positives; no draft-only closure. |
-| V5: `bv-oonu.9` / `.10` | Blocked / open | Obtain native macOS amd64/arm64 and Linux ARM64 execution plus remaining distribution evidence. Recheck affected current-source build paths; no substitute-platform credit. |
+| V5: `bv-oonu.9` / `.10` | Blocked / open | Obtain known Mac login routes and native macOS amd64/arm64 and Linux ARM64 execution. Store manifest identity and prior Nix behavior are verified; publication remains separate. Recheck affected current-source build paths; no substitute-platform credit. |
 | P2: `bv-apal.3` / `.4` | Blocked / open | Performance claims now have complete evidence. Reconcile final supported capabilities, limits and examples after S5/V5 settle; independently verify the resulting claims. Existing corrected examples need no process-only rewrite. |
 | Epics `bv-xbvo`, `bv-oonu`, `bv-apal`; final `bv-oonu.11` | Open | Complete their original child acceptance, review final source changes, run the clean source-bound packaged gate and independently verify it. This rescore completes only the report portion of the final task. |
 
