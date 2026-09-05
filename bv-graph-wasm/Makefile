@@ -4,16 +4,9 @@
 build:
 	wasm-pack build --target web --dev
 
-# Release build (optimized)
+# Release verification uses the same pinned external build as the release gate.
 build-release:
-	wasm-pack build --target web --release
-	@if command -v wasm-opt >/dev/null 2>&1; then \
-		echo "Optimizing with wasm-opt..."; \
-		wasm-opt -Os -o pkg/bv_graph_wasm_bg_opt.wasm pkg/bv_graph_wasm_bg.wasm; \
-		mv pkg/bv_graph_wasm_bg_opt.wasm pkg/bv_graph_wasm_bg.wasm; \
-	else \
-		echo "wasm-opt not found, skipping optimization"; \
-	fi
+	../scripts/build_graph_wasm.sh
 
 # Run Rust unit tests (not WASM)
 test:
@@ -31,9 +24,9 @@ clean:
 # Check size
 size: build-release
 	@echo "WASM size:"
-	@wc -c pkg/bv_graph_wasm_bg.wasm
+	@wc -c ../pkg/export/viewer_assets/vendor/bv_graph_bg.wasm
 	@echo "Gzipped:"
-	@gzip -c pkg/bv_graph_wasm_bg.wasm | wc -c
+	@gzip -c ../pkg/export/viewer_assets/vendor/bv_graph_bg.wasm | wc -c
 
 # Format code
 fmt:

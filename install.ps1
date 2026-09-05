@@ -130,6 +130,44 @@ function Get-ExpectedChecksum {
     return $null
 }
 
+function Assert-BinaryVersion {
+    param([string]$Binary, [string]$Tag)
+    # The portable fixture harness can check archive handling on Linux, but
+    # executable identity must be checked by the native Windows harness.
+    if (-not (Test-IsWindowsHost)) { return }
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $Binary
+    $start.Arguments = '--version'
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { Fail "Could not run $Binary --version" }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(10000)) {
+            $process.Kill()
+            Fail "$Binary --version timed out; existing installation was not changed"
+        }
+        $reported = $stdout.GetAwaiter().GetResult().Trim()
+        $diagnostic = $stderr.GetAwaiter().GetResult().Trim()
+        if ($process.ExitCode -ne 0) {
+            Fail "$Binary --version exited with code $($process.ExitCode): $diagnostic"
+        }
+        if ($reported.Length -gt 4096 -or $reported -notmatch '^bv\s+(v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$') {
+            Fail "Unexpected --version output from downloaded binary; existing installation was not changed"
+        }
+        if ($Matches[1].TrimStart('v') -cne $Tag.TrimStart('v')) {
+            Fail "Downloaded binary reports $reported, expected $Tag; existing installation was not changed"
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function Install-FromRelease {
     param([string]$Tag, [string]$TargetDir)
 
@@ -165,6 +203,7 @@ function Install-FromRelease {
         Expand-Archive -Path $archivePath -DestinationPath $extractDir -Force
         $exe = Get-ChildItem -Path $extractDir -Recurse -Filter "$BIN_NAME.exe" | Select-Object -First 1
         if (-not $exe) { Fail "$assetName does not contain $BIN_NAME.exe" }
+        Assert-BinaryVersion $exe.FullName $Tag
 
         New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
         $destination = Join-Path $TargetDir "$BIN_NAME.exe"
@@ -203,15 +242,30 @@ function Install-FromSource {
     if (-not $goVersion) { Fail "Go is not installed or not in PATH (needed only for -FromSource). Install Go $MIN_GO_VERSION+ from https://go.dev/dl/" }
     if (-not (Test-GoVersion $goVersion $MIN_GO_VERSION)) { Fail "Go $MIN_GO_VERSION or later is required for -FromSource. Found: go$goVersion" }
     Write-Info "Building $BIN_NAME $Tag from source with Go $goVersion (pinned, not @latest)"
-    New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
-    $env:CGO_ENABLED = "0"
-    $env:GOBIN = $TargetDir
+    $work = Join-Path ([System.IO.Path]::GetTempPath()) ("bv-build-" + [System.IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Path $work | Out-Null
+    $previousCGO = $env:CGO_ENABLED
+    $previousGOBIN = $env:GOBIN
     $prev = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    & go install "$MODULE/cmd/$BIN_NAME@$Tag" 2>&1 | ForEach-Object { Write-Host $_ }
-    $ErrorActionPreference = $prev
-    if ($LASTEXITCODE -ne 0) { Fail "go install exited with code $LASTEXITCODE" }
-    return (Join-Path $TargetDir "$BIN_NAME.exe")
+    try {
+        $env:CGO_ENABLED = "0"
+        $env:GOBIN = $work
+        $ErrorActionPreference = 'Continue'
+        & go install "$MODULE/cmd/$BIN_NAME@$Tag" 2>&1 | ForEach-Object { Write-Host $_ }
+        $ErrorActionPreference = $prev
+        if ($LASTEXITCODE -ne 0) { Fail "go install exited with code $LASTEXITCODE" }
+        $binary = Join-Path $work "$BIN_NAME.exe"
+        Assert-BinaryVersion $binary $Tag
+        New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+        $destination = Join-Path $TargetDir "$BIN_NAME.exe"
+        Copy-Item -LiteralPath $binary -Destination $destination -Force
+        return $destination
+    } finally {
+        $ErrorActionPreference = $prev
+        $env:CGO_ENABLED = $previousCGO
+        $env:GOBIN = $previousGOBIN
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Add-ToPathIfNeeded {

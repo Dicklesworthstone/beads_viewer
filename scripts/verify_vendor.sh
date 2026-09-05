@@ -5,11 +5,19 @@
 # Run by scripts/release_gate.sh (stage 7); pkg/export/vendor_manifest_test.go
 # performs the same check in Go so `go test` catches drift too.
 #
-# Usage: scripts/verify_vendor.sh [vendor-dir]   (default: pkg/export/viewer_assets/vendor)
+# Usage: scripts/verify_vendor.sh [--source] [vendor-dir]
+# --source also rebuilds the graph module and verifies source correspondence.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+source_check=0
+if [ "${1:-}" = --source ]; then source_check=1; shift; fi
 dir="${1:-pkg/export/viewer_assets/vendor}"
+[ "$#" -le 1 ] || { echo 'verify_vendor: unexpected arguments' >&2; exit 2; }
+if [ "$source_check" -eq 1 ] && [ "$dir" != pkg/export/viewer_assets/vendor ]; then
+  echo 'verify_vendor: --source requires the repository vendor directory' >&2
+  exit 2
+fi
 manifest="$dir/MANIFEST.json"
 [ -f "$manifest" ] || { echo "verify_vendor: missing $manifest" >&2; exit 1; }
 command -v jq >/dev/null || { echo "verify_vendor: jq is required" >&2; exit 2; }
@@ -41,3 +49,6 @@ done < <(find "$dir" -maxdepth 1 -type f | sort)
 
 echo "verify_vendor: $listed manifest entries checked, $problems problem(s)"
 [ "$problems" -eq 0 ]
+if [ "$source_check" -eq 1 ]; then
+  bash scripts/build_graph_wasm.sh
+fi

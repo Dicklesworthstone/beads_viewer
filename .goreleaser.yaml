@@ -2,9 +2,24 @@ version: 2
 
 project_name: bv
 dist: /tmp/bv-dist
+before:
+  hooks:
+    - bash scripts/release_gate.sh verify-source
+# Packaging and publication are separate: release_gate.sh package seals the
+# final archive hashes before an explicitly authorized publication operation.
+release:
+  disable: true
 builds:
   - main: ./cmd/bv
     binary: bv
+    env:
+      - CGO_ENABLED=0
+      - GOWORK=off
+    flags:
+      - -buildvcs=true
+    hooks:
+      post:
+        - bash scripts/release_gate.sh verify-binary "{{ .Path }}"
     ldflags:
       - -s -w
       - -X github.com/Dicklesworthstone/beads_viewer/pkg/version.version=v{{.Version}}

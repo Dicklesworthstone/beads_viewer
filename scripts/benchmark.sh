@@ -8,6 +8,9 @@
 #   scripts/benchmark.sh compare-files BASE CUR   # compare two existing `go test -bench` outputs
 #   scripts/benchmark.sh run                      # run the tracked set into benchmarks/current.txt
 #   scripts/benchmark.sh quick                    # one-shot subset for a fast local sanity check
+#   scripts/benchmark.sh latency BASE_BV BASE_UI_TEST OUTPUT_DIR
+#                        same-host cold/warm CLI and Update+View cohorts;
+#                        BASE_UI_TEST is built with go test -c ./pkg/ui
 #
 # Environment:
 #   BENCH_COUNT=5        -count per benchmark (the best observed time per side is compared)
@@ -55,10 +58,9 @@ ref_dir=""
 # Plain ifs (not `[ ] &&`) so the trap's status never overrides the script's exit code.
 cleanup() {
   if [ -n "$ref_dir" ]; then
-    git worktree remove --force "$ref_dir/tree" >/dev/null 2>&1
-    rm -rf "$ref_dir"
+    echo "Retained reference worktree and evidence: $ref_dir" >&2
   fi
-  if [ -n "$dataset_dir" ]; then rm -rf "$dataset_dir"; fi
+  if [ -n "$dataset_dir" ]; then echo "Retained benchmark dataset: $dataset_dir" >&2; fi
 }
 trap cleanup EXIT
 
@@ -250,11 +252,71 @@ run_quick() {
   go test -run '^$' -bench '^BenchmarkFullAnalysis_(Sparse100|Dense100|ManyCycles20)$' -benchmem -count=1 ./pkg/analysis 2>&1 | tee "$CURRENT_FILE"
 }
 
+run_latency() {
+  local baseline_bv="${1:?baseline bv binary}" baseline_ui="${2:?baseline UI test binary}" out="${3:?new output directory}"
+  if [ ! -x "$baseline_bv" ] || [ ! -x "$baseline_ui" ]; then
+    echo "latency: both baseline binaries must be executable" >&2
+    return 2
+  fi
+  case "$baseline_bv:$baseline_ui:$out" in
+    /*:/*:/*) ;;
+    *) echo "latency: use absolute paths for both binaries and the new output directory" >&2; return 2 ;;
+  esac
+  [ ! -e "$out" ] || { echo "latency: output directory already exists; choose a new retained destination" >&2; return 2; }
+  mkdir -p "$out"
+  {
+    date -u '+utc=%Y-%m-%dT%H:%M:%SZ'
+    uname -a
+    go version
+    git rev-parse HEAD
+    git diff --stat -- '*.go' go.mod go.sum
+    if command -v lscpu >/dev/null 2>&1; then lscpu; fi
+  } > "$out/source-host.txt"
+  git diff --binary -- '*.go' go.mod go.sum > "$out/source.patch"
+  {
+    sha256sum "$out/source.patch" "$baseline_bv" "$baseline_ui"
+    while IFS= read -r file; do sha256sum "$file"; done < <(git ls-files --others --exclude-standard -- '*.go')
+  } > "$out/source.sha256"
+  go build -o "$out/current-bv" ./cmd/bv
+  go test -c -o "$out/current-ui.test" ./pkg/ui
+  go test -c -o "$out/current-e2e.test" ./tests/e2e
+  sha256sum "$out/current-bv" "$out/current-ui.test" "$out/current-e2e.test" >> "$out/source.sha256"
+  local result=0 round position side binary dir enforce
+  # Four pairs give repeated, alternating order. Each UI cohort independently
+  # settles the production model; all observed samples are retained.
+  for round in 0 1 2 3; do
+    for position in 0 1; do
+      side=$(( (round + position) % 2 ))
+      binary="$baseline_ui"
+      if [ "$side" -eq 1 ]; then binary="$out/current-ui.test"; fi
+      dir="$out/ui-round-$round-side-$side"
+      mkdir "$dir"
+      enforce=0
+      if [ "$side" -eq 1 ]; then enforce="${BV_PERF_ENFORCE_SLO:-1}"; fi
+      BV_PERF_DIR="$dir" BV_PERF_ENFORCE_SLO="$enforce" \
+        "$binary" -test.run '^TestPerformanceNavigationCohorts$' -test.timeout 2h -test.v \
+        > "$dir/run.log" 2>&1 || result=1
+      cat "$dir/run.log"
+    done
+  done
+  mkdir "$out/cli"
+  # E2E TestMain resolves the source checkout relative to tests/e2e.
+  (cd "$root/tests/e2e" && BV_PERF_DIR="$out/cli" BV_PERF_BASELINE_BINARY="$baseline_bv" \
+    BV_PERF_CURRENT_BINARY="$out/current-bv" "$out/current-e2e.test" \
+    -test.run '^TestPerformanceCLICohorts$' -test.timeout 4h -test.v) \
+    > "$out/cli/run.log" 2>&1 || result=1
+  cat "$out/cli/run.log"
+  bash tests/artifacts/perf/verify.sh "$out" || result=1
+  echo "Retained all latency evidence: $out"
+  return "$result"
+}
+
 case "${1:-run}" in
   baseline) save_baseline ;;
   compare) compare_benchmarks ;;
   compare-files) compare_files "${2:?base file}" "${3:?current file}" ;;
   quick) run_quick ;;
+  latency) run_latency "${2:?baseline bv}" "${3:?baseline UI test}" "${4:?output directory}" ;;
   run) run_benchmarks ;;
-  *) echo "usage: $0 {baseline|compare|compare-files BASE CUR|run|quick}" >&2; exit 2 ;;
+  *) echo "usage: $0 {baseline|compare|compare-files BASE CUR|run|quick|latency BASE_BV BASE_UI_TEST OUTPUT_DIR}" >&2; exit 2 ;;
 esac

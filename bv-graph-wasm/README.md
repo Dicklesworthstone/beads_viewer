@@ -4,16 +4,10 @@ High-performance graph algorithms for the bv static viewer, compiled to WebAssem
 
 ## Prerequisites
 
-```bash
-rustup --version          # Rust toolchain
-cargo --version           # Rust package manager
-wasm-pack --version       # WASM build tool (>= 0.12)
-```
-
-Install wasm-pack if needed:
-```bash
-cargo install wasm-pack
-```
+Release verification requires the pinned Rust toolchain and WASM target,
+wasm-bindgen 0.2.121, Binaryen 132, Python 3 and cached locked crates. See
+[PROVENANCE.md](../docs/PROVENANCE.md) for exact tool hashes and installation
+requirements. `wasm-pack` is used only by the separate development workflow.
 
 ## Building
 
@@ -30,7 +24,10 @@ make test
 
 ## Output
 
-After building, the `pkg/` directory contains:
+The pinned release command reports a fresh external build directory containing
+`pkg/bv_graph.js`, `pkg/bv_graph_bg.wasm`, full logs and `receipt.json`.
+
+After a development build, the local `pkg/` directory contains:
 - `bv_graph_wasm.js` - JavaScript bindings
 - `bv_graph_wasm_bg.wasm` - WebAssembly binary
 - `bv_graph_wasm.d.ts` - TypeScript definitions
@@ -96,9 +93,12 @@ main();
 
 | Component | Raw | Gzipped | Budget |
 |-----------|-----|---------|--------|
-| WASM binary | ~213KB | ~94KB | <80KB |
-| JS glue | ~36KB | ~7KB | <25KB |
-| **Total** | ~249KB | ~101KB | **<120KB** |
+| WASM binary | 221 KiB | 95 KiB | <80 KiB |
+| JS glue | 33 KiB | 7 KiB | <25 KiB |
+| **Total** | **254 KiB** | **102 KiB** | **<120 KiB** |
+
+Measured with `gzip -n -9` on the reviewed pair. The total compressed size is
+within budget; the separate WASM size target remains unmet.
 
 ### Size Optimization
 
@@ -110,18 +110,16 @@ The build pipeline applies multiple optimizations:
    - `codegen-units = 1` - Better optimization
    - `panic = "abort"` - Remove panic unwinding
 
-2. **wasm-pack optimization**:
-   - Built-in wasm-opt pass during `--release` builds
+2. **Pinned release tools**:
+   - `nightly-2026-08-31` Rust with `wasm32-unknown-unknown`
+   - wasm-bindgen 0.2.121 and Binaryen 132, with a required `wasm-opt -Os` pass
+   - Locked, offline compilation in a fresh external directory
 
-3. **Optional: Additional wasm-opt** (if installed):
-   ```bash
-   # Install binaryen for standalone wasm-opt
-   brew install binaryen  # macOS
-   apt install binaryen   # Ubuntu
-
-   # Run with extra optimization passes
-   wasm-opt -Os -o pkg/bv_graph_wasm_bg.wasm pkg/bv_graph_wasm_bg.wasm
-   ```
+`make build-release` rebuilds and checks both shipped files against the
+manifest. To produce a candidate for review, run
+`../scripts/build_graph_wasm.sh --build-only`. Neither command writes the
+vendor directory. Tool installation, exact hashes and the review workflow are
+documented in [PROVENANCE.md](../docs/PROVENANCE.md).
 
 ### Checking Size
 
@@ -131,7 +129,9 @@ make size  # Shows raw and gzipped sizes
 
 ### Feature Flags
 
-The crate supports feature flags for optional algorithms:
+The crate declares the following feature names. Algorithm modules are currently
+exported unconditionally, so selecting these flags does not trim the exported
+API or establish a smaller release pipeline. The reviewed build uses defaults.
 
 | Feature | Description | Default |
 |---------|-------------|---------|
@@ -142,11 +142,6 @@ The crate supports feature flags for optional algorithms:
 | `hits` | HITS algorithm | No |
 | `reachability` | Reachability queries | No |
 | `full` | All algorithms | No |
-
-Build with specific features:
-```bash
-wasm-pack build --target web --release -- --features "core,eigenvector"
-```
 
 ## License
 

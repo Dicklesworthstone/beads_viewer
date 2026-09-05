@@ -1,92 +1,60 @@
 #!/usr/bin/env bash
-# dashboard_browser_smoke.sh: load an exported dashboard in a headless
-# Chromium and fail on any Content-Security-Policy refusal or uncaught error,
-# while requiring the app's own boot markers (database cached, WASM graph
-# engine loaded, charts initialised, triage loaded) to appear in the console.
+# Explicit opt-in real Chromium desktop/mobile/offline regression journeys.
 #
 # Usage: BV_HEADLESS_BROWSER=/path/to/chrome scripts/dashboard_browser_smoke.sh [repo-dir]
-#        BV_BIN=/path/to/bv skips the build.  BV_BROWSER_SECONDS=30 sets the window.
-# The bundle is served over loopback with COOP/COEP so the page is
-# cross-origin isolated on first load (the state a real deployment reaches
-# after the service worker installs); the COI bootstrap therefore does not
-# reload, which is what makes a fixed observation window sufficient.
+# BV_BIN=/path/to/bv skips the build. Artifacts are retained outside the tree.
+# The optional repo-dir receives an additional real bundle boot check; the
+# adversarial four-issue fixture always supplies known journey expectations.
+# The remaining CSP unsafe-eval is required by Alpine; this test does not
+# claim its removal or substitute for a future CSP migration review.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-target="${1:-$root}"
+target="${1:-}"
 browser="${BV_HEADLESS_BROWSER:-}"
-seconds="${BV_BROWSER_SECONDS:-30}"
-[ -n "$browser" ] && [ -x "$browser" ] || { echo "dashboard_browser_smoke: set BV_HEADLESS_BROWSER to a Chromium/Chrome binary"; exit 2; }
-command -v python3 >/dev/null || { echo "dashboard_browser_smoke: python3 is required"; exit 2; }
+if [ -z "$browser" ] || [ ! -x "$browser" ]; then
+  echo "INCOMPLETE: set BV_HEADLESS_BROWSER to a Chromium/Chrome binary" >&2
+  exit 2
+fi
+for tool in node python3; do
+  command -v "$tool" >/dev/null || { echo "INCOMPLETE: $tool is required" >&2; exit 2; }
+done
+node -e 'if (typeof WebSocket !== "function") process.exit(2)' || { echo "INCOMPLETE: Node with native WebSocket is required" >&2; exit 2; }
 export BV_NO_BROWSER=1 BV_TEST_MODE=1 BV_NO_UPDATE_CHECK=1 BV_NO_SAVED_CONFIG=1
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/bv-browser-smoke.XXXXXX")"
-server_pid=""
-cleanup() { [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null; rm -rf "$tmp"; }
-trap cleanup EXIT
+echo "dashboard_browser_smoke artifacts: $tmp"
+trap 'echo "Retained browser artifacts: $tmp"' EXIT
 
 bv="${BV_BIN:-}"
 if [ -z "$bv" ]; then
   bv="$tmp/bv"
   (cd "$root" && go build -o "$bv" ./cmd/bv)
 fi
-(cd "$target" && "$bv" --export-pages "$tmp/bundle" --pages-title "browser smoke" >"$tmp/export.log" 2>&1) || { echo "export failed:"; tail -5 "$tmp/export.log"; exit 1; }
-
-port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-python3 - "$tmp/bundle" "$port" >"$tmp/server.log" 2>&1 <<'PY' &
-import http.server, os, sys
-class H(http.server.SimpleHTTPRequestHandler):
-    def end_headers(self):
-        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
-        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
-        self.send_header("Cache-Control", "no-store")
-        super().end_headers()
-    def log_message(self, *a): pass
-os.chdir(sys.argv[1])
-http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[2])), H).serve_forever()
+mkdir -p "$tmp/fixture/.beads" "$tmp/updated-fixture/.beads"
+python3 - "$tmp/fixture/.beads/issues.jsonl" "$tmp/updated-fixture/.beads/issues.jsonl" <<'PY'
+import json, pathlib, sys
+base = dict(status='open', priority=1, issue_type='task',
+            created_at='2026-09-01T12:00:00Z', updated_at='2026-09-03T12:00:00Z')
+issues = [
+    dict(base, id='browser-root', title='Orchid root infrastructure', labels=['backend']),
+    dict(base, id='browser-detail', title='Orchid searchable detail', labels=['frontend'],
+         description='Visible **markdown**.\n\n<script>window.__unsafeDisplay=true</script>\n<img src=x onerror="window.__unsafeDisplay=true">',
+         comments=[dict(id='c1', issue_id='browser-detail', author='Reviewer', text='Verified comment violet', created_at='2026-09-03T12:00:00Z')],
+         dependencies=[dict(issue_id='browser-detail', depends_on_id='browser-root', type='blocks')]),
+    dict(base, id='browser-closed', title='Orchid completed', status='closed', closed_at='2026-09-03T12:00:00Z'),
+    dict(base, id='browser-other', title='Unrelated saffron task', priority=2),
+]
+pathlib.Path(sys.argv[1]).write_text(''.join(json.dumps(issue) + '\n' for issue in issues))
+issues[1]['title'] = 'Orchid searchable detail updated'
+pathlib.Path(sys.argv[2]).write_text(''.join(json.dumps(issue) + '\n' for issue in issues))
 PY
-server_pid=$!
-for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$port/" && break; sleep 0.1; done
-
-# Headless Chromium keeps running until killed; the console goes to stderr.
-set +e
-timeout -s INT "$seconds" "$browser" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
-  --enable-logging=stderr --v=0 --log-level=0 \
-  --no-first-run --disable-background-networking --disable-sync --disable-component-update \
-  --user-data-dir="$tmp/profile" "http://127.0.0.1:$port/" >/dev/null 2>"$tmp/console.log"
-set -e
-
-fail=0
-echo "== CSP refusals"
-if rg -n 'Refused to|Content Security Policy|violates the following' "$tmp/console.log" | cut -c1-200; then fail=1; else echo "(none)"; fi
-echo "== uncaught errors"
-if rg -n 'Uncaught|ReferenceError|TypeError|ERROR:CONSOLE' "$tmp/console.log" | cut -c1-200; then fail=1; else echo "(none)"; fi
-echo "== boot markers"
-for marker in '\[OPFS\] Cached' '\[Graph\] WASM engine loaded' '\[bv-charts\] Dashboard initialized' '\[Viewer\] Triage data loaded'; do
-  if rg -q "$marker" "$tmp/console.log"; then
-    printf '  ok      %s\n' "$(rg -o "$marker[^\"]*" "$tmp/console.log" | head -1)"
-  else
-    printf '  MISSING %s\n' "$marker"; fail=1
-  fi
-done
-# Time from the first console line of the page to the triage-loaded marker,
-# from Chromium's own log timestamps (MMDD/HHMMSS.micro). Informational: it
-# is the closest thing to first-render this harness can measure without a
-# DevTools client, and it is what tests/artifacts/perf/pages_load.json means
-# by first_render_ms when a browser is available.
-awk '
-  function secs(ts,   h, m, s) { h = substr(ts, 6, 2); m = substr(ts, 8, 2); s = substr(ts, 10); return h * 3600 + m * 60 + s }
-  match($0, /[0-9]{4}\/[0-9]{6}\.[0-9]+/) {
-    ts = substr($0, RSTART, RLENGTH)
-    if (first == "" && $0 ~ /CONSOLE/) first = ts
-    if ($0 ~ /\[Viewer\] Triage data loaded/ && first != "") { printf "== time to triage loaded: %.0f ms (page console start to [Viewer] Triage data loaded)\n", (secs(ts) - secs(first)) * 1000; exit }
-  }
-' "$tmp/console.log"
-
-if [ "$fail" -eq 0 ]; then
-  echo "dashboard_browser_smoke: PASS (no CSP refusals, no uncaught errors, app booted)"
+(cd "$tmp/fixture" && "$bv" --export-pages "$tmp/bundle" --pages-title "Browser journeys" >"$tmp/export.log" 2>&1) || { cat "$tmp/export.log"; exit 1; }
+(cd "$tmp/updated-fixture" && "$bv" --export-pages "$tmp/updated-bundle" --pages-title "Browser journeys" >"$tmp/updated-export.log" 2>&1) || { cat "$tmp/updated-export.log"; exit 1; }
+if [ -n "$target" ]; then
+  (cd "$target" && "$bv" --export-pages "$tmp/project-bundle" --pages-title "Project browser check" >"$tmp/project-export.log" 2>&1) || { cat "$tmp/project-export.log"; exit 1; }
+  project_bundle="$tmp/project-bundle"
 else
-  echo "dashboard_browser_smoke: FAIL (console: $tmp/console.log kept? no - rerun with BV_BROWSER_KEEP=1)"
-  if [ "${BV_BROWSER_KEEP:-0}" = "1" ]; then trap - EXIT; echo "kept $tmp"; fi
+  project_bundle=""
 fi
-exit "$fail"
+node "$root/tests/scripts/dashboard_browser_test.mjs" "$browser" "$tmp/bundle" "$tmp/browser" journeys "$tmp/updated-bundle" "$project_bundle"

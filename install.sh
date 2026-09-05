@@ -493,13 +493,19 @@ try_binary_install() {
 
     if [[ "$ext" == ".zip" ]]; then
         if command -v unzip >/dev/null 2>&1; then
-            unzip -q "$archive_path" -d "$tmp_dir"
+            if ! unzip -q "$archive_path" -d "$tmp_dir"; then
+                print_error "Release archive could not be extracted; existing installation was not changed"
+                exit 1
+            fi
         else
             print_warn "unzip not found"
             return 1
         fi
     else
-        tar -xzf "$archive_path" -C "$tmp_dir"
+        if ! tar -xzf "$archive_path" -C "$tmp_dir"; then
+            print_error "Release archive could not be extracted; existing installation was not changed"
+            exit 1
+        fi
     fi
 
     # Find the binary in extracted contents
@@ -516,11 +522,30 @@ try_binary_install() {
     fi
 
     if [ -z "$binary_path" ]; then
-        print_warn "Binary not found in archive"
-        return 1
+        print_error "Binary not found in release archive; existing installation was not changed"
+        exit 1
     fi
 
     chmod +x "$binary_path"
+
+    # A valid archive checksum does not prove it contains the requested release.
+    # Verify before replacing a working installation, and never fall back to a
+    # source build after an identity failure.
+    local reported reported_version
+    if ! reported=$("$binary_path" --version 2>&1); then
+        print_error "Downloaded binary could not report its version: $reported"
+        exit 1
+    fi
+    if [[ "$reported" =~ ^bv[[:space:]]+(v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
+        reported_version="${BASH_REMATCH[1]}"
+    else
+        print_error "Unexpected --version output from downloaded binary: $reported"
+        exit 1
+    fi
+    if [ "${reported_version#v}" != "${version#v}" ]; then
+        print_error "Downloaded binary reports $reported_version, expected $version; existing installation was not changed"
+        exit 1
+    fi
 
     # Install to destination
     ensure_install_dir "$INSTALL_DIR"
