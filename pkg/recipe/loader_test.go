@@ -681,3 +681,33 @@ func TestLoader_BuiltinsValidateAndApply(t *testing.T) {
 		t.Error("only the triage builtin should need triage scores")
 	}
 }
+
+func TestLoader_InvalidPresentationValues(t *testing.T) {
+	for _, tc := range []struct{ field, yaml string }{
+		{"view.columns", "view:\n  columns: [assignee_typo]\n"},
+		{"view.group_by", "view:\n  group_by: guessed\n"},
+		{"view.truncate_title", "view:\n  truncate_title: -1\n"},
+		{"view.collapsed", "view:\n  collapsed: true\n"},
+		{"metrics", "metrics: [pagerank_typo]\n"},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "invalid.yaml")
+			writeFile(t, path, "name: invalid\n"+tc.yaml)
+			l := recipe.NewLoader(recipe.WithUserPath(filepath.Join(dir, "none.yaml")), recipe.WithProjectDir(dir))
+			if err := l.Load(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := l.Resolve(path); err == nil || !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("explicit invalid recipe must fail with field %s: %v", tc.field, err)
+			}
+			writeFile(t, filepath.Join(dir, ".beads", "recipes", "invalid.yaml"), "name: invalid\n"+tc.yaml)
+			if err := l.Load(); err != nil {
+				t.Fatal(err)
+			}
+			if l.Get("invalid") != nil || !hasWarningContaining(l.Warnings(), tc.field) {
+				t.Fatalf("discovered invalid recipe was accepted or silently ignored: warnings=%v", l.Warnings())
+			}
+		})
+	}
+}

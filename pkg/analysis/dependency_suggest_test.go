@@ -140,6 +140,9 @@ func TestDetectMissingDependencies_SharedKeywords(t *testing.T) {
 		},
 	}
 
+	for i := range issues {
+		issues[i].Origin = suggestionTestOrigin(issues[i].ID)
+	}
 	suggestions := DetectMissingDependencies(issues, config)
 	// Should find suggestion due to shared keywords: user, authentication, jwt
 	if len(suggestions) == 0 {
@@ -155,8 +158,8 @@ func TestDetectMissingDependencies_SharedKeywords(t *testing.T) {
 		if sug.ActionCommand == "" {
 			t.Error("expected action command to be set")
 		}
-		if !strings.Contains(sug.ActionCommand, "br dep add") {
-			t.Errorf("expected action to contain 'br dep add', got %s", sug.ActionCommand)
+		if !strings.Contains(sug.ActionCommand, "'dep' 'add'") {
+			t.Errorf("expected routed dependency add command, got %s", sug.ActionCommand)
 		}
 	}
 }

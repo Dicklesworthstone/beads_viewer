@@ -2,11 +2,277 @@ package model
 
 import (
 	"encoding/json"
+	"fmt"
+	"math/rand"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestIssueActionsPreserveLiteralArguments(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("literal POSIX shell test requires sh")
+	}
+	dir := filepath.Join(t.TempDir(), "tracker ' with $ spaces")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recorder := filepath.Join(dir, "record argv.sh")
+	if err := os.WriteFile(recorder, []byte("#!/bin/sh\nprintf '%s\\000' \"$PWD\" \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issue := Issue{ID: "display-prefix-original", Origin: &IssueOrigin{
+		LocalID: "id'$(touch MUST_NOT_EXIST);`false`", WorkingDirectory: dir,
+		TrackerDirectory: filepath.Join(dir, ".beads"), Database: filepath.Join(dir, ".beads", "custom ' db"),
+		Tracker: "br", Executable: recorder, SupportsClaim: true,
+	}}
+	actions := issue.Actions(true)
+	labelCommand, reason := issue.MutationAction(MutationAddLabel, nil, "--force'$(touch MUST_NOT_EXIST);`false`")
+	if reason != "" {
+		t.Fatal(reason)
+	}
+	for name, command := range map[string]*IssueCommand{"show": actions.Show, "claim": actions.Claim, "label": labelCommand} {
+		t.Run(name, func(t *testing.T) {
+			if command == nil {
+				t.Fatal("missing verified command")
+			}
+			if command.WorkingDirectory != dir {
+				t.Fatal("typed command lost its working directory")
+			}
+			cmd := exec.Command(sh, "-c", command.Shell)
+			cmd.Dir = t.TempDir()
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("literal recorder: %v: %s", err, out)
+			}
+			got := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+			want := append([]string{dir}, command.Argv[5:]...)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("shell argv differs: got%q want%q; command=%s", got, want, command.Shell)
+			}
+			if got[len(got)-1] != issue.Origin.LocalID {
+				t.Fatal("display namespace was used as the mutation ID")
+			}
+		})
+	}
+	if _, err := os.Stat(filepath.Join(dir, "MUST_NOT_EXIST")); !os.IsNotExist(err) {
+		t.Fatalf("shell substitution executed: %v", err)
+	}
+	cloned := issue.Clone()
+	cloned.Origin.LocalID = "changed"
+	if issue.Origin.LocalID == "changed" {
+		t.Fatal("clone shares mutable origin")
+	}
+	for _, mutate := range []func(*Issue){
+		func(i *Issue) { i.Origin = nil },
+		func(i *Issue) { i.Origin.SupportsClaim = false },
+		func(i *Issue) { i.Origin.ReadOnlyReason = "partial source" },
+	} {
+		copy := issue.Clone()
+		mutate(&copy)
+		if copy.Actions(true).Claim != nil {
+			t.Fatal("unverified or read-only origin emitted a mutation")
+		}
+	}
+	if issue.Actions(false).Claim != nil {
+		t.Fatal("unready issue emitted a mutation")
+	}
+}
+
+func TestMutationActionRequiresSameLiveTracker(t *testing.T) {
+	// Synthetic origin tests the pure argv builder; live tracker and loader
+	// behavior are exercised separately in tests/e2e.
+	issue := Issue{ID: "api-display-a", Origin: &IssueOrigin{LocalID: "a", Tracker: "br", Executable: "/tools/br",
+		WorkingDirectory: "/repo", TrackerDirectory: "/repo/.beads", Database: "/repo/.beads/custom.db"}}
+	peer := issue.Clone()
+	peer.ID, peer.Origin.LocalID = "api-display-b", "b"
+	for _, kind := range []MutationKind{MutationAddDependency, MutationRelate, MutationRemoveDependency} {
+		cmd, reason := issue.MutationAction(kind, &peer, "")
+		if cmd == nil || reason != "" {
+			t.Fatalf("same live tracker %s: %v %s", kind, cmd, reason)
+		}
+		if got := cmd.Argv[len(cmd.Argv)-3:]; !reflect.DeepEqual(got, []string{"--", "a", "b"}) {
+			t.Fatalf("display IDs leaked into %s: %q", kind, got)
+		}
+		if strings.Contains(cmd.Shell, "--no-auto-flush") {
+			t.Fatal("mutation disabled tracker export")
+		}
+	}
+	for name, mutate := range map[string]func(*Issue){
+		"absent":     func(p *Issue) { p.Origin = nil },
+		"database":   func(p *Issue) { p.Origin.Database = "/elsewhere/beads.db" },
+		"directory":  func(p *Issue) { p.Origin.WorkingDirectory = "/elsewhere" },
+		"tracker":    func(p *Issue) { p.Origin.Tracker = "bd" },
+		"executable": func(p *Issue) { p.Origin.Executable = "/tools/other-br" },
+		"partial":    func(p *Issue) { p.Origin.ReadOnlyReason = "incomplete source" },
+		"self":       func(p *Issue) { p.Origin.LocalID = "a" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			other := peer.Clone()
+			mutate(&other)
+			if cmd, reason := issue.MutationAction(MutationAddDependency, &other, ""); cmd != nil || reason == "" {
+				t.Fatalf("unbound peer accepted: %v %s", cmd, reason)
+			}
+		})
+	}
+	for _, kind := range []MutationKind{MutationAddLabel, "arbitrary-command"} {
+		if cmd, reason := issue.MutationAction(kind, nil, ""); cmd != nil || reason == "" {
+			t.Fatalf("empty label/unknown operation accepted: %v %s", cmd, reason)
+		}
+	}
+	issue.Origin.ReadOnlyReason = "historical source"
+	if cmd, reason := issue.MutationAction(MutationAddLabel, nil, "backend"); cmd != nil || reason != "historical source" {
+		t.Fatalf("read-only route accepted: %v %s", cmd, reason)
+	}
+}
+
+func TestIssueOriginCannotBeImported(t *testing.T) {
+	var issue Issue
+	if err := json.Unmarshal([]byte(`{"id":"a","origin":{"LocalID":"other","Executable":"br","SupportsClaim":true}}`), &issue); err != nil {
+		t.Fatal(err)
+	}
+	if issue.Origin != nil || issue.Actions(true).Claim != nil {
+		t.Fatal("serialized issue manufactured a live action route")
+	}
+}
+
+// A recursive oracle deliberately differs from the production topological
+// propagation. It checks small arbitrary graphs and simulated completions.
+func TestReadinessAgainstDependencyOracle(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	statuses := []Status{StatusOpen, StatusInProgress, StatusClosed, StatusTombstone, StatusDeferred, StatusBlocked, StatusDraft}
+	edgeTypes := []DependencyType{DepBlocks, DepParentChild, DepRelated, ""}
+	random := rand.New(rand.NewSource(7042))
+	for sample := 0; sample < 128; sample++ {
+		issues := make([]Issue, 8)
+		byID := make(map[string]Issue)
+		for i := range issues {
+			issue := Issue{ID: fmt.Sprintf("n%d", i), Status: statuses[random.Intn(len(statuses))], IssueType: TypeTask}
+			if random.Intn(5) == 0 {
+				issue.Assignee = "owner"
+			}
+			if random.Intn(5) == 0 {
+				issue.IssueType = TypeEpic
+			}
+			if random.Intn(4) == 0 {
+				issue.DeferUntil = &future
+			}
+			for edge := 0; edge < random.Intn(4); edge++ {
+				issue.Dependencies = append(issue.Dependencies, &Dependency{DependsOnID: fmt.Sprintf("n%d", random.Intn(10)), Type: edgeTypes[random.Intn(len(edgeTypes))]})
+			}
+			issues[i], byID[issue.ID] = issue, issue
+		}
+		index := NewReadinessIndex(issues)
+		completed := map[string]bool{"n0": true, "n2": true}
+		for _, completion := range []map[string]bool{nil, completed} {
+			var satisfied func(string, map[string]bool) bool
+			satisfied = func(id string, ancestors map[string]bool) bool {
+				if completion[id] {
+					return true
+				}
+				issue, exists := byID[id]
+				if !exists || ancestors[id] {
+					return false
+				}
+				if issue.Status == StatusClosed || issue.Status == StatusTombstone {
+					return true
+				}
+				path := make(map[string]bool, len(ancestors)+1)
+				for id := range ancestors {
+					path[id] = true
+				}
+				path[id] = true
+				for _, dep := range issue.Dependencies {
+					if completion[dep.DependsOnID] {
+						continue
+					}
+					if dep.Type == DepBlocks || dep.Type == "" {
+						blocker, exists := byID[dep.DependsOnID]
+						if !exists || blocker.Status != StatusClosed && blocker.Status != StatusTombstone {
+							return false
+						}
+					} else if dep.Type == DepParentChild && !satisfied(dep.DependsOnID, path) {
+						return false
+					}
+				}
+				return true
+			}
+			for _, issue := range issues {
+				want := !completion[issue.ID] && (issue.Status == StatusOpen || issue.Status == StatusInProgress) &&
+					(issue.DeferUntil == nil || !issue.DeferUntil.After(now)) && satisfied(issue.ID, nil)
+				if got := index.ReadyAfter(issue.ID, now, completion); got != want {
+					t.Fatalf("sample=%d id=%s completed=%v ready=%v want=%v graph=%+v", sample, issue.ID, completion, got, want, issues)
+				}
+				if completion != nil {
+					continue
+				}
+				hasChildren := false
+				for _, child := range issues {
+					if child.Status == StatusClosed || child.Status == StatusTombstone {
+						continue
+					}
+					for _, dep := range child.Dependencies {
+						if dep.Type == DepParentChild && dep.DependsOnID == issue.ID {
+							hasChildren = true
+						}
+					}
+				}
+				wantClaim := want && issue.Status == StatusOpen && issue.Assignee == "" && issue.IssueType != TypeEpic && !hasChildren
+				if got := index.Claimable(issue.ID, now); got != wantClaim {
+					t.Fatalf("sample=%d id=%s claimable=%v want=%v", sample, issue.ID, got, wantClaim)
+				}
+			}
+		}
+		// Loading the same snapshot in reverse order must not affect authority.
+		for i, j := 0, len(issues)-1; i < j; i, j = i+1, j-1 {
+			issues[i], issues[j] = issues[j], issues[i]
+		}
+		reversed := NewReadinessIndex(issues)
+		for _, issue := range issues {
+			if index.DependencyState(issue.ID) != reversed.DependencyState(issue.ID) {
+				t.Fatalf("order changed %s state", issue.ID)
+			}
+		}
+	}
+}
+
+func TestReadinessDeepParentsAndClockBoundary(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	issues := []Issue{{ID: "blocker", Status: StatusOpen}, {ID: "p0", Status: StatusOpen, Dependencies: []*Dependency{{DependsOnID: "blocker", Type: DepBlocks}}}}
+	for depth := 1; depth <= 10000; depth++ {
+		issues = append(issues, Issue{ID: fmt.Sprintf("p%d", depth), Status: StatusOpen, Dependencies: []*Dependency{{DependsOnID: fmt.Sprintf("p%d", depth-1), Type: DepParentChild}}})
+	}
+	index := NewReadinessIndex(issues)
+	for _, id := range []string{"p49", "p50", "p51", "p10000"} {
+		if index.Ready(id, now) {
+			t.Fatalf("blocked ancestor lost at %s", id)
+		}
+		if !index.ReadyAfter(id, now, map[string]bool{"blocker": true}) {
+			t.Fatalf("completion did not unblock %s", id)
+		}
+	}
+	issue := Issue{ID: "ready", Status: StatusOpen, IssueType: TypeTask, DeferUntil: &now}
+	index = NewReadinessIndex([]Issue{issue})
+	if index.Ready(issue.ID, now.Add(-time.Nanosecond)) || !index.Claimable(issue.ID, now) {
+		t.Fatal("deferral boundary is not inclusive")
+	}
+	issue.Status = StatusClosed
+	if !index.Claimable("ready", now) {
+		t.Fatal("caller mutation changed owned readiness snapshot")
+	}
+	for _, edgeType := range []DependencyType{DepBlocks, DepParentChild} {
+		index := NewReadinessIndex([]Issue{{ID: "child", Status: StatusOpen, Dependencies: []*Dependency{{DependsOnID: "missing", Type: edgeType}}}})
+		if index.ReadyAfter("child", now, map[string]bool{"missing": true}) {
+			t.Fatalf("simulated completion fabricated authority for missing %s reference", edgeType)
+		}
+	}
+}
 
 func TestStatus_IsValid(t *testing.T) {
 	tests := []struct {

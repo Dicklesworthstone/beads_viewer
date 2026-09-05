@@ -184,8 +184,7 @@ func TestGetActionableIssuesParallelTracks(t *testing.T) {
 }
 
 func TestGetActionableIssuesMissingBlocker(t *testing.T) {
-	// A depends on "missing" (doesn't exist) → A is actionable
-	// Missing blockers don't block (graceful degradation)
+	// Missing blockers are unknown, so A cannot be proven actionable.
 	issues := []model.Issue{
 		{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "missing", Type: model.DepBlocks},
@@ -196,8 +195,8 @@ func TestGetActionableIssuesMissingBlocker(t *testing.T) {
 	actionable := an.GetActionableIssues()
 
 	ids := getIDs(actionable)
-	if len(ids) != 1 || ids[0] != "A" {
-		t.Errorf("Expected A actionable (missing blocker), got %v", ids)
+	if len(ids) != 0 {
+		t.Errorf("Expected unknown blocker to withhold A, got %v", ids)
 	}
 }
 

@@ -26,8 +26,9 @@ type GraphMetrics interface {
 // that want a meaningful metric order must supply the corresponding source;
 // Recipe.NeedsGraphMetrics and NeedsTriageScores say which are required.
 type Metrics struct {
-	Graph  GraphMetrics
-	Triage map[string]float64 // issue ID -> triage score
+	Graph     GraphMetrics
+	Triage    map[string]float64    // issue ID -> triage score
+	Readiness *model.ReadinessIndex // Full dependency authority before display scoping
 }
 
 func (m Metrics) score(field, id string) float64 {
@@ -61,7 +62,7 @@ func Apply(issues []model.Issue, metrics Metrics, r *Recipe, now time.Time) ([]m
 	if r == nil {
 		return issues, nil
 	}
-	filtered, err := Filter(issues, r, now)
+	filtered, err := filter(issues, r, now, metrics.Readiness)
 	if err != nil {
 		return nil, err
 	}
@@ -78,6 +79,10 @@ func Apply(issues []model.Issue, metrics Metrics, r *Recipe, now time.Time) ([]m
 // without a created/updated timestamp are not excluded by the date filters.
 // Malformed time filters are reported rather than skipped.
 func Filter(issues []model.Issue, r *Recipe, now time.Time) ([]model.Issue, error) {
+	return filter(issues, r, now, nil)
+}
+
+func filter(issues []model.Issue, r *Recipe, now time.Time, readiness *model.ReadinessIndex) ([]model.Issue, error) {
 	if r == nil {
 		return append([]model.Issue(nil), issues...), nil
 	}
@@ -91,11 +96,8 @@ func Filter(issues []model.Issue, r *Recipe, now time.Time) ([]model.Issue, erro
 		return nil, err
 	}
 
-	openBlockers := make(map[string]bool, len(issues))
-	for _, issue := range issues {
-		if !isClosedLike(issue.Status) {
-			openBlockers[issue.ID] = true
-		}
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
 	}
 
 	result := make([]model.Issue, 0, len(issues))
@@ -107,13 +109,11 @@ func Filter(issues []model.Issue, r *Recipe, now time.Time) ([]model.Issue, erro
 			!thresholds.matches(issue) {
 			continue
 		}
-		if f.HasBlockers != nil && *f.HasBlockers != hasOpenBlocker(issue, openBlockers) {
+		if f.HasBlockers != nil && *f.HasBlockers != (readiness.DependencyState(issue.ID) != model.DependenciesSatisfied) {
 			continue
 		}
 		if f.Actionable != nil {
-			// Parity with `br ready` (issue #191): a future defer_until withholds
-			// the bead exactly like an open blocker does.
-			actionable := !issue.IsDeferredAt(now) && !hasOpenBlocker(issue, openBlockers)
+			actionable := readiness.Ready(issue.ID, now)
 			if *f.Actionable != actionable {
 				continue
 			}
@@ -178,10 +178,6 @@ func (t timeThresholds) matches(issue model.Issue) bool {
 	return true
 }
 
-func isClosedLike(status model.Status) bool {
-	return status == model.StatusClosed || status == model.StatusTombstone
-}
-
 func matchesStatus(issue model.Issue, statuses []string) bool {
 	if len(statuses) == 0 {
 		return true
@@ -227,15 +223,6 @@ func hasAllTags(issue model.Issue, tags []string) bool {
 func hasAnyTag(issue model.Issue, tags []string) bool {
 	for _, tag := range tags {
 		if hasLabel(issue, tag) {
-			return true
-		}
-	}
-	return false
-}
-
-func hasOpenBlocker(issue model.Issue, openBlockers map[string]bool) bool {
-	for _, dep := range issue.Dependencies {
-		if dep != nil && dep.Type.IsBlocking() && openBlockers[dep.DependsOnID] {
 			return true
 		}
 	}

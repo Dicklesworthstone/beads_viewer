@@ -199,11 +199,7 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 
 		// Add action command if both are open
 		if !isClosedLikeDuplicateStatus(issue1.Status) && !isClosedLikeDuplicateStatus(issue2.Status) {
-			issue1Arg, issue1OK := quoteBeadsCommandID(pair.Issue1)
-			issue2Arg, issue2OK := quoteBeadsCommandID(pair.Issue2)
-			if issue1OK && issue2OK {
-				sug = sug.WithAction(fmt.Sprintf("br dep add %s %s --type=related", issue1Arg, issue2Arg))
-			}
+			sug = sug.withMutationAction(*issue1, model.MutationRelate, issue2, "")
 		}
 
 		suggestions = append(suggestions, sug)

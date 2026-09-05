@@ -59,6 +59,10 @@ func DetectCycleWarnings(issues []model.Issue, config CycleWarningConfig) []Sugg
 	}
 
 	var suggestions []Suggestion
+	byID := make(map[string]model.Issue, len(issues))
+	for _, issue := range issues {
+		byID[issue.ID] = issue
+	}
 
 	for _, cycle := range cycles {
 		// Skip self-loops if configured
@@ -110,11 +114,8 @@ func DetectCycleWarnings(issues []model.Issue, config CycleWarningConfig) []Sugg
 			// Suggest removing the last edge in the cycle
 			from := cycle[cycleLen-1]
 			to := cycle[0]
-			fromArg, fromOK := quoteBeadsCommandID(from)
-			toArg, toOK := quoteBeadsCommandID(to)
-			if fromOK && toOK {
-				sug = sug.WithAction(fmt.Sprintf("br dep remove %s %s", fromArg, toArg))
-			}
+			peer := byID[to]
+			sug = sug.withMutationAction(byID[from], model.MutationRemoveDependency, &peer, "")
 		}
 
 		// If there's a second issue, mark it as related

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"math"
 	"os"
@@ -189,7 +190,7 @@ func ComputeDataHash(issues []model.Issue) string {
 		return fingerprints[i].position < fingerprints[j].position
 	})
 
-	h := sha256.New()
+	h := newFingerprintWriter()
 	writeUintHash(h, uint64(len(fingerprints)))
 	for _, fingerprint := range fingerprints {
 		writeStringHash(h, fingerprint.ID)
@@ -197,7 +198,7 @@ func ComputeDataHash(issues []model.Issue) string {
 		writeStringHash(h, fingerprint.DependencyHash)
 	}
 
-	return hex.EncodeToString(h.Sum(nil))
+	return h.sumHex()
 }
 
 // IssueFingerprint represents a per-issue hash split across content and dependencies.
@@ -294,7 +295,7 @@ func ComputeIssueDiff(oldIssues, newIssues []model.Issue) IssueDiff {
 }
 
 func computeIssueContentHash(issue model.Issue) string {
-	h := sha256.New()
+	h := newFingerprintWriter()
 
 	writeStringHash(h, issue.Title)
 	writeStringHash(h, issue.Description)
@@ -363,7 +364,7 @@ func computeIssueContentHash(issue model.Issue) string {
 		writeTimeHash(h, comment.CreatedAt)
 	}
 
-	return hex.EncodeToString(h.Sum(nil))
+	return h.sumHex()
 }
 
 func computeIssueDependencyHash(issue model.Issue) string {
@@ -409,7 +410,7 @@ func computeIssueDependencyHash(issue model.Issue) string {
 		return deps[i].createdBy < deps[j].createdBy
 	})
 
-	h := sha256.New()
+	h := newFingerprintWriter()
 	writeUintHash(h, uint64(len(deps)))
 	for _, dep := range deps {
 		writeStringHash(h, dep.issueID)
@@ -418,49 +419,92 @@ func computeIssueDependencyHash(issue model.Issue) string {
 		writeStringHash(h, dep.createdAt)
 		writeStringHash(h, dep.createdBy)
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	return h.sumHex()
 }
 
-func writeStringHash(w io.Writer, v string) {
+// fingerprintWriter streams the canonical encoding through one small buffer.
+// In particular, long descriptions never allocate a temporary []byte, and
+// scalar fields do not each allocate a slice merely to cross io.Writer.
+// This changes only write batching; field bytes and SHA256 remain unchanged.
+type fingerprintWriter struct {
+	hash   hash.Hash
+	buffer [256]byte
+	used   int
+}
+
+func newFingerprintWriter() *fingerprintWriter {
+	return &fingerprintWriter{hash: sha256.New()}
+}
+
+func (w *fingerprintWriter) flush() {
+	if w.used > 0 {
+		_, _ = w.hash.Write(w.buffer[:w.used])
+		w.used = 0
+	}
+}
+
+func (w *fingerprintWriter) writeByte(v byte) {
+	if w.used == len(w.buffer) {
+		w.flush()
+	}
+	w.buffer[w.used] = v
+	w.used++
+}
+
+func (w *fingerprintWriter) sumHex() string {
+	w.flush()
+	return hex.EncodeToString(w.hash.Sum(nil))
+}
+
+func writeStringHash(w *fingerprintWriter, v string) {
 	writeUintHash(w, uint64(len(v)))
-	_, _ = io.WriteString(w, v)
+	for len(v) > 0 {
+		if w.used == len(w.buffer) {
+			w.flush()
+		}
+		n := copy(w.buffer[w.used:], v)
+		w.used += n
+		v = v[n:]
+	}
 }
 
-func writeStringPtrHash(w io.Writer, v *string) {
+func writeStringPtrHash(w *fingerprintWriter, v *string) {
 	if v == nil {
-		_, _ = w.Write([]byte{0})
+		w.writeByte(0)
 		return
 	}
-	_, _ = w.Write([]byte{1})
+	w.writeByte(1)
 	writeStringHash(w, *v)
 }
 
-func writeIntHash(w io.Writer, v int) {
+func writeIntHash(w *fingerprintWriter, v int) {
 	writeInt64Hash(w, int64(v))
 }
 
-func writeIntPtrHash(w io.Writer, v *int) {
+func writeIntPtrHash(w *fingerprintWriter, v *int) {
 	if v == nil {
-		_, _ = w.Write([]byte{0})
+		w.writeByte(0)
 		return
 	}
-	_, _ = w.Write([]byte{1})
+	w.writeByte(1)
 	writeIntHash(w, *v)
 }
 
-func writeInt64Hash(w io.Writer, v int64) {
-	var buf [binary.MaxVarintLen64]byte
-	n := binary.PutVarint(buf[:], v)
-	_, _ = w.Write(buf[:n])
+func writeInt64Hash(w *fingerprintWriter, v int64) {
+	if len(w.buffer)-w.used < binary.MaxVarintLen64 {
+		w.flush()
+	}
+	w.used += binary.PutVarint(w.buffer[w.used:], v)
 }
 
-func writeUintHash(w io.Writer, v uint64) {
-	var buf [binary.MaxVarintLen64]byte
-	n := binary.PutUvarint(buf[:], v)
-	_, _ = w.Write(buf[:n])
+func writeUintHash(w *fingerprintWriter, v uint64) {
+	if len(w.buffer)-w.used < binary.MaxVarintLen64 {
+		w.flush()
+	}
+	w.used += binary.PutUvarint(w.buffer[w.used:], v)
 }
 
-func writeTimeHash(w io.Writer, t time.Time) {
+func writeTimeHash(w *fingerprintWriter, t time.Time) {
 	formatted := ""
 	if !t.IsZero() {
 		formatted = t.UTC().Format(time.RFC3339Nano)
@@ -468,12 +512,12 @@ func writeTimeHash(w io.Writer, t time.Time) {
 	writeStringHash(w, formatted)
 }
 
-func writeTimePtrHash(w io.Writer, t *time.Time) {
+func writeTimePtrHash(w *fingerprintWriter, t *time.Time) {
 	if t == nil {
-		_, _ = w.Write([]byte{0})
+		w.writeByte(0)
 		return
 	}
-	_, _ = w.Write([]byte{1})
+	w.writeByte(1)
 	writeTimeHash(w, *t)
 }
 

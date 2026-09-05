@@ -68,9 +68,9 @@ func TestComputeTriage_BasicIssues(t *testing.T) {
 		t.Error("expected at least one recommendation")
 	}
 
-	// Commands should be populated
-	if triage.Commands.ListReady != "CI=1 br ready --json" {
-		t.Errorf("expected 'CI=1 br ready --json' command, got %s", triage.Commands.ListReady)
+	// Pure graph data does not identify an executable live tracker route.
+	if triage.Commands.ListReady != "" {
+		t.Errorf("unexpected unbound tracker command: %s", triage.Commands.ListReady)
 	}
 }
 
@@ -295,9 +295,8 @@ func TestClaimableRecommendationRejectsCommandUnsafeID(t *testing.T) {
 	if isClaimableRecommendation(rec, time.Time{}, nil, nil) {
 		t.Fatal("option-shaped bead ID was exposed as a claimable recommendation")
 	}
-	commands := buildCommands(rec.ID)
-	if commands.ClaimTop != "CI=1 br ready --json  # No top pick available" ||
-		commands.ShowTop != "CI=1 br ready --json  # No top pick available" {
+	commands := buildCommands(model.Issue{ID: rec.ID}.Actions(false))
+	if commands.ClaimTop != "" || commands.ShowTop != "" {
 		t.Fatalf("unsafe bead ID leaked into commands: %+v", commands)
 	}
 }
@@ -468,7 +467,7 @@ func TestTriageEmptyCommands(t *testing.T) {
 
 	triage := ComputeTriage(issues)
 
-	if triage.Commands.ClaimTop != "CI=1 br ready --json  # No top pick available" {
+	if triage.Commands.ClaimTop != "" {
 		t.Errorf("unexpected ClaimTop fallback: %q", triage.Commands.ClaimTop)
 	}
 }
@@ -477,11 +476,11 @@ func TestTriageNoRecommendationsCommands(t *testing.T) {
 	// Empty project
 	triage := ComputeTriage(nil)
 
-	// Commands should be valid even with no recommendations
-	if triage.Commands.ListReady != "CI=1 br ready --json" {
-		t.Errorf("expected 'CI=1 br ready --json', got %s", triage.Commands.ListReady)
+	// Empty input has no verified repository for tracker inspection.
+	if triage.Commands.ListReady != "" {
+		t.Errorf("unexpected unbound tracker command: %s", triage.Commands.ListReady)
 	}
-	if triage.Commands.ClaimTop != "CI=1 br ready --json  # No top pick available" {
+	if triage.Commands.ClaimTop != "" {
 		t.Errorf("unexpected ClaimTop fallback: %q", triage.Commands.ClaimTop)
 	}
 }
@@ -545,7 +544,8 @@ func TestComputeTriage_ParentBlockedChildNotTopPickOrClaim(t *testing.T) {
 		t.Fatalf("expected blocker to be the top actionable pick, got %+v", triage.QuickRef.TopPicks)
 	}
 
-	expectedClaim := "CI=1 br update blocker --status in_progress --json"
+	// Graph readiness alone cannot manufacture a live tracker route.
+	expectedClaim := ""
 	if triage.Commands.ClaimTop != expectedClaim {
 		t.Fatalf("expected claim_top %q, got %q", expectedClaim, triage.Commands.ClaimTop)
 	}

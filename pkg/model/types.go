@@ -38,11 +38,162 @@ type Issue struct {
 	Dependencies       []*Dependency `json:"dependencies,omitempty"`
 	Comments           []*Comment    `json:"comments,omitempty"`
 	SourceRepo         string        `json:"source_repo,omitempty"`
+	// Origin is established by the live loader before workspace namespacing.
+	// Serialized input cannot manufacture authority to emit tracker commands.
+	Origin *IssueOrigin `json:"-"`
+}
+
+// IssueOrigin identifies the exact tracker that supplied a displayed issue.
+// It is transient: exporting and reimporting an issue never preserves a live
+// mutation route. Capabilities describe the installed executable at load time.
+type IssueOrigin struct {
+	LocalID          string
+	WorkingDirectory string
+	TrackerDirectory string
+	Database         string
+	Tracker          string
+	Executable       string
+	SupportsClaim    bool
+	ReadOnlyReason   string
+}
+
+// IssueCommand carries executable argv as well as its POSIX-shell rendering.
+// WorkingDirectory applies when executing Argv directly.
+type IssueCommand struct {
+	WorkingDirectory string   `json:"working_directory"`
+	Argv             []string `json:"argv"`
+	Shell            string   `json:"shell"`
+}
+
+type IssueActions struct {
+	WorkingDirectory  string        `json:"working_directory,omitempty"`
+	LocalID           string        `json:"local_id,omitempty"`
+	Tracker           string        `json:"tracker,omitempty"`
+	Show              *IssueCommand `json:"show,omitempty"`
+	Claim             *IssueCommand `json:"claim,omitempty"`
+	UnavailableReason string        `json:"unavailable_reason,omitempty"`
+}
+
+// ShellQuote preserves one literal argument, including quotes and newlines.
+func ShellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func (o *IssueOrigin) routeAvailable() bool {
+	return o != nil && o.Executable != "" && o.Database != "" && o.WorkingDirectory != "" &&
+		o.TrackerDirectory != "" && o.LocalID != "" && (o.Tracker == "br" || o.Tracker == "bd")
+}
+
+// command uses only an established origin and literal argv. Read-only inspection
+// must not import or flush stale exports; successful mutations keep normal export
+// behavior so subsequent viewers can observe the tracker change.
+func (o *IssueOrigin) command(mutating bool, operation ...string) *IssueCommand {
+	args := []string{"env", "BEADS_DIR=" + o.TrackerDirectory, "BEADS_DB=" + o.Database, "BD_DB=" + o.Database,
+		o.Executable, "--db", o.Database}
+	if o.Tracker == "br" {
+		args = append(args, "--no-auto-import")
+		if !mutating {
+			args = append(args, "--no-auto-flush")
+		}
+	}
+	args = append(args, operation...)
+	quoted := make([]string, len(args))
+	for n, arg := range args {
+		quoted[n] = ShellQuote(arg)
+	}
+	return &IssueCommand{WorkingDirectory: o.WorkingDirectory, Argv: args,
+		Shell: "cd -- " + ShellQuote(o.WorkingDirectory) + " && " + strings.Join(quoted, " ")}
+}
+
+type MutationKind string
+
+const (
+	MutationAddDependency    MutationKind = "add_dependency"
+	MutationRelate           MutationKind = "relate"
+	MutationRemoveDependency MutationKind = "remove_dependency"
+	MutationAddLabel         MutationKind = "add_label"
+)
+
+// MutationAction binds a hygiene suggestion to live local IDs. Dependencies
+// across trackers remain analytical suggestions because one tracker's CLI cannot
+// safely interpret another tracker's ID. This never executes the suggestion.
+func (i Issue) MutationAction(kind MutationKind, peer *Issue, value string) (*IssueCommand, string) {
+	o := i.Origin
+	if !o.routeAvailable() {
+		return nil, "source has no verified live tracker route"
+	}
+	if o.ReadOnlyReason != "" {
+		return nil, o.ReadOnlyReason
+	}
+	if kind == MutationAddLabel {
+		if strings.TrimSpace(value) == "" || strings.ContainsRune(value, '\x00') {
+			return nil, "suggested label is empty or contains a NUL byte"
+		}
+		return o.command(true, "update", "--json", "--add-label="+value, "--", o.LocalID), ""
+	}
+	if kind != MutationAddDependency && kind != MutationRelate && kind != MutationRemoveDependency {
+		return nil, "unsupported tracker mutation"
+	}
+	if peer == nil || !peer.Origin.routeAvailable() {
+		return nil, "related issue has no verified live tracker route"
+	}
+	p := peer.Origin
+	if p.ReadOnlyReason != "" {
+		return nil, p.ReadOnlyReason
+	}
+	if o.Tracker != p.Tracker || o.Database != p.Database || o.WorkingDirectory != p.WorkingDirectory ||
+		o.TrackerDirectory != p.TrackerDirectory || o.Executable != p.Executable {
+		return nil, "related issues belong to different trackers"
+	}
+	if o.LocalID == p.LocalID {
+		return nil, "dependency action refers to the same local issue"
+	}
+	operation := []string{"dep", "add", "--json"}
+	if kind == MutationRemoveDependency {
+		operation[1] = "remove"
+	} else if kind == MutationRelate {
+		operation = append(operation, "--type", "related")
+	}
+	operation = append(operation, "--", o.LocalID, p.LocalID)
+	return o.command(true, operation...), ""
+}
+
+// Actions constructs suggestions only. The tracker rechecks an atomic claim
+// when executed; the snapshot is never a reservation of future work.
+func (i Issue) Actions(claimable bool) IssueActions {
+	o := i.Origin
+	if o == nil {
+		return IssueActions{UnavailableReason: "source has no verified live tracker"}
+	}
+	a := IssueActions{WorkingDirectory: o.WorkingDirectory, LocalID: o.LocalID, Tracker: o.Tracker}
+	if !o.routeAvailable() {
+		a.UnavailableReason = o.ReadOnlyReason
+		if a.UnavailableReason == "" {
+			a.UnavailableReason = "live tracker route is incomplete"
+		}
+		return a
+	}
+	a.Show = o.command(false, "show", "--json", "--", o.LocalID)
+	switch {
+	case o.ReadOnlyReason != "":
+		a.UnavailableReason = o.ReadOnlyReason
+	case !claimable:
+		a.UnavailableReason = "snapshot does not establish claim readiness"
+	case !o.SupportsClaim:
+		a.UnavailableReason = "installed tracker does not advertise atomic --claim"
+	default:
+		a.Claim = o.command(true, "update", "--json", "--claim", "--", o.LocalID)
+	}
+	return a
 }
 
 // Clone creates a deep copy of the issue
 func (i Issue) Clone() Issue {
 	clone := i
+	if i.Origin != nil {
+		origin := *i.Origin
+		clone.Origin = &origin
+	}
 
 	if i.EstimatedMinutes != nil {
 		v := *i.EstimatedMinutes

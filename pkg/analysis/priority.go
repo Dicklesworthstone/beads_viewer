@@ -168,6 +168,25 @@ func (a *Analyzer) Weights() Weights {
 	return a.weights
 }
 
+// ScoringSnapshot carries an analyzer's exact scoring state across an ownership
+// boundary. Its fields are private: restoring it cannot supply arbitrary weights
+// or normalize already-normalized weights a second time.
+type ScoringSnapshot struct {
+	weights    Weights
+	weightsSet bool
+	now        time.Time
+}
+
+// CaptureScoring must be called by the analyzer's owner before background work.
+func (a *Analyzer) CaptureScoring() ScoringSnapshot {
+	return ScoringSnapshot{weights: a.weights, weightsSet: a.weightsSet, now: a.now}
+}
+
+// RestoreScoring installs captured state into an unpublished analyzer.
+func (a *Analyzer) RestoreScoring(state ScoringSnapshot) {
+	a.weights, a.weightsSet, a.now = state.weights, state.weightsSet, state.now
+}
+
 // UrgencyLabels are labels that indicate high urgency
 var UrgencyLabels = []string{"urgent", "critical", "blocker", "hotfix", "asap"}
 
@@ -619,12 +638,23 @@ func (a *Analyzer) GenerateRecommendations() []PriorityRecommendation {
 
 // GenerateRecommendationsWithThresholds generates recommendations with custom thresholds
 func (a *Analyzer) GenerateRecommendationsWithThresholds(thresholds RecommendationThresholds) []PriorityRecommendation {
-	scores := a.ComputeImpactScoresAt(a.Now())
+	return a.GenerateRecommendationsFromStats(nil, thresholds)
+}
+
+// GenerateRecommendationsFromStats reuses a caller's completed analysis for
+// the whole recommendation batch. Nil requests one synchronous analysis.
+// Readiness, source scope, weights, and reference time still belong to a.
+func (a *Analyzer) GenerateRecommendationsFromStats(stats *GraphStats, thresholds RecommendationThresholds) []PriorityRecommendation {
+	now := a.Now()
+	if stats == nil {
+		analyzed := a.Analyze()
+		stats = &analyzed
+	}
+	scores := a.ComputeImpactScoresFromStats(stats, now)
 	if len(scores) == 0 {
 		return nil
 	}
 
-	stats := a.Analyze()
 	coreMap := stats.CoreNumber()
 	slackMap := stats.Slack()
 	artSet := make(map[string]bool)
@@ -660,7 +690,7 @@ func (a *Analyzer) GenerateRecommendationsWithThresholds(thresholds Recommendati
 		if rec != nil {
 			if rec.Confidence >= thresholds.MinConfidence {
 				// Compute what-if delta for this recommendation (bv-83)
-				rec.WhatIf = a.computeWhatIfDelta(score.IssueID)
+				rec.WhatIf = a.computeWhatIfDeltaFromStats(score.IssueID, stats)
 				recommendations = append(recommendations, *rec)
 			}
 		}
@@ -909,13 +939,12 @@ func (a *Analyzer) computeWhatIfDeltaFromStats(issueID string, stats *GraphStats
 	// Compute transitive unblocks (cascade effect)
 	transitiveCount := a.countTransitiveUnblocks(issueID)
 
-	// Compute blocked reduction (how many items in blocked status would become unblocked)
+	// Count dependency-blocked work that becomes ready. A parked "blocked"
+	// status does not itself transition to open in a completion simulation.
 	blockedReduction := 0
 	for _, unblockID := range directUnblocks {
-		if issue, ok := a.issueMap[unblockID]; ok {
-			if issue.Status == model.StatusBlocked {
-				blockedReduction++
-			}
+		if a.Readiness().DependencyState(unblockID) != model.DependenciesSatisfied {
+			blockedReduction++
 		}
 	}
 
@@ -973,13 +1002,6 @@ func (a *Analyzer) countTransitiveUnblocks(issueID string) int {
 	// Set of "conceptually closed" issues: initially just the starting issue
 	simulatedClosed := map[string]bool{issueID: true}
 
-	// Existing actionable work is not an effect of this hypothetical completion
-	// and must not be counted or auto-completed as part of the cascade.
-	baselineActionable := make(map[string]bool)
-	for _, actionable := range a.getActionableIssuesAfterCompletions(nil) {
-		baselineActionable[actionable.ID] = true
-	}
-
 	queue := []string{issueID}
 	count := 0
 
@@ -1005,7 +1027,10 @@ func (a *Analyzer) countTransitiveUnblocks(issueID string) int {
 		sort.Strings(candidateIDs)
 
 		for _, candidateID := range candidateIDs {
-			if simulatedClosed[candidateID] || baselineActionable[candidateID] {
+			// Existing ready work is not caused by this completion. Check only
+			// the affected frontier with the same source scope/reference time;
+			// enumerating every ready issue here made a batch quadratic in N.
+			if simulatedClosed[candidateID] || a.isActionableAfterCompletions(candidateID, nil) {
 				continue
 			}
 			if a.isActionableAfterCompletions(candidateID, simulatedClosed) {

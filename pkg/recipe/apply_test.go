@@ -277,18 +277,18 @@ func TestFilter_BlockersActionableAndDeferral(t *testing.T) {
 	}
 
 	r := &recipe.Recipe{Filters: recipe.FilterConfig{HasBlockers: ptrBool(true)}}
-	requireIDs(t, mustFilter(t, issues, r, now), "blocked")
+	requireIDs(t, mustFilter(t, issues, r, now), "blocked", "dangling")
 
 	r = &recipe.Recipe{Filters: recipe.FilterConfig{HasBlockers: ptrBool(false)}}
-	requireIDs(t, mustFilter(t, issues, r, now), "root", "closed-root", "gone-root", "unblocked", "unblocked-tombstone", "dangling", "related", "deferred", "undeferred")
+	requireIDs(t, mustFilter(t, issues, r, now), "root", "closed-root", "gone-root", "unblocked", "unblocked-tombstone", "related", "deferred", "undeferred")
 
-	// actionable: no open blocker and not deferred (issue #191 parity with br ready).
+	// actionable: open/ongoing, proven dependency-ready, and not deferred.
 	r = &recipe.Recipe{Filters: recipe.FilterConfig{Actionable: ptrBool(true)}}
-	requireIDs(t, mustFilter(t, issues, r, now), "root", "closed-root", "gone-root", "unblocked", "unblocked-tombstone", "dangling", "related", "undeferred")
+	requireIDs(t, mustFilter(t, issues, r, now), "root", "unblocked", "unblocked-tombstone", "related", "undeferred")
 
 	// actionable: false is the complement, not a no-op.
 	r = &recipe.Recipe{Filters: recipe.FilterConfig{Actionable: ptrBool(false)}}
-	requireIDs(t, mustFilter(t, issues, r, now), "blocked", "deferred")
+	requireIDs(t, mustFilter(t, issues, r, now), "closed-root", "gone-root", "blocked", "dangling", "deferred")
 
 	// A blocker hidden by the status filter still blocks.
 	r = &recipe.Recipe{Filters: recipe.FilterConfig{Status: []string{"open"}, Actionable: ptrBool(true), IDPrefix: "block"}}
@@ -296,7 +296,50 @@ func TestFilter_BlockersActionableAndDeferral(t *testing.T) {
 
 	// The builtin actionable recipe combines status + actionable.
 	got := mustApply(t, issues, recipe.Metrics{}, builtin(t, "actionable"), now)
-	requireIDs(t, got, "dangling", "related", "root", "unblocked", "unblocked-tombstone", "undeferred")
+	requireIDs(t, got, "related", "root", "unblocked", "unblocked-tombstone", "undeferred")
+}
+
+func TestApplyActionableRetainsFullDependencyAuthority(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	blocks := func(id string) []*model.Dependency {
+		return []*model.Dependency{{DependsOnID: id, Type: model.DepBlocks}}
+	}
+	visible := []model.Issue{
+		{ID: "api-chain", Status: model.StatusOpen, Dependencies: blocks("web")},
+		{ID: "api-closed", Status: model.StatusOpen, Dependencies: blocks("done")},
+		{ID: "api-tombstone", Status: model.StatusOpen, Dependencies: blocks("gone")},
+		{ID: "api-child", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "parent", Type: model.DepParentChild}}},
+		{ID: "api-missing", Status: model.StatusOpen, Dependencies: blocks("missing")},
+		{ID: "api-ongoing", Status: model.StatusInProgress},
+		{ID: "api-parked", Status: model.StatusBlocked},
+	}
+	full := append(append([]model.Issue{}, visible...), []model.Issue{
+		{ID: "web", Status: model.StatusOpen, Dependencies: blocks("ops")},
+		{ID: "ops", Status: model.StatusOpen},
+		{ID: "done", Status: model.StatusClosed},
+		{ID: "gone", Status: model.StatusTombstone},
+		{ID: "parent", Status: model.StatusOpen, Dependencies: blocks("ops")},
+	}...)
+	r := &recipe.Recipe{Filters: recipe.FilterConfig{Actionable: ptrBool(true)}, Sort: recipe.SortConfig{Field: "id", Direction: "asc"}}
+	metrics := recipe.Metrics{Readiness: model.NewReadinessIndex(full)}
+	requireIDs(t, mustApply(t, visible, metrics, r, now), "api-closed", "api-ongoing", "api-tombstone")
+
+	// The full-authority filter can prove closed predecessors satisfied even
+	// when they are hidden. Without authority they remain unknown, not ready.
+	requireIDs(t, mustApply(t, visible, recipe.Metrics{}, r, now), "api-ongoing")
+
+	// Closing the inherited external blocker releases the child. The direct
+	// web predecessor remains open, so api-chain is still withheld.
+	for i := range full {
+		if full[i].ID == "ops" {
+			full[i].Status = model.StatusClosed
+		}
+	}
+	metrics.Readiness = model.NewReadinessIndex(full)
+	requireIDs(t, mustApply(t, visible, metrics, r, now), "api-child", "api-closed", "api-ongoing", "api-tombstone")
+
+	// No selected candidates means no output, even with useful context.
+	requireIDs(t, mustApply(t, nil, metrics, r, now))
 }
 
 func TestSortIssues_DefaultsAndFields(t *testing.T) {
@@ -375,39 +418,31 @@ func TestValidate_RejectsUnusableRecipes(t *testing.T) {
 	}
 }
 
-func TestUnappliedFields(t *testing.T) {
-	applied := recipe.Recipe{
-		Filters: recipe.FilterConfig{Status: []string{"open"}},
-		Sort:    recipe.SortConfig{Field: "priority"},
-		View:    recipe.ViewConfig{MaxItems: 10},
-	}
-	if got := applied.UnappliedFields(); len(got) != 0 {
-		t.Fatalf("fully applied recipe reported %v", got)
-	}
-
+func TestCompleteRecipeFieldsValidation(t *testing.T) {
+	includeGraph := true
 	full := recipe.Recipe{
 		View: recipe.ViewConfig{
 			Columns: []string{"id"}, ShowGraph: true, ShowMetrics: true, GroupBy: "status", Collapsed: true, MaxItems: 5, TruncateTitle: 40,
 		},
-		Export:  recipe.ExportConfig{Format: "markdown", IncludeGraph: true, Template: "t.tmpl"},
+		Export:  recipe.ExportConfig{Format: "markdown", IncludeGraph: &includeGraph, Template: "t.tmpl"},
 		Metrics: []string{"pagerank"},
 	}
-	want := []string{
-		"view.columns", "view.show_graph", "view.show_metrics", "view.group_by", "view.collapsed", "view.truncate_title",
-		"export.format", "export.include_graph", "export.template", "metrics",
+	if err := full.Validate(); err != nil {
+		t.Fatalf("valid combined presentation/export fields rejected: %v", err)
 	}
-	if got := full.UnappliedFields(); strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("UnappliedFields() = %v, want %v", got, want)
+	full.Export.Format = "shell"
+	if err := full.Validate(); err == nil || !strings.Contains(err.Error(), "export.format") {
+		t.Fatalf("invalid export format accepted: %v", err)
 	}
 
-	// Builtins only declare fields that are applied, so they never warn.
+	// Builtins continue to validate with the complete field schema.
 	loader := recipe.NewLoader(recipe.WithUserPath("/nonexistent/recipes.yaml"), recipe.WithProjectDir("/nonexistent/project"))
 	if err := loader.Load(); err != nil {
 		t.Fatalf("load builtins: %v", err)
 	}
 	for _, r := range loader.List() {
-		if fields := r.UnappliedFields(); len(fields) != 0 {
-			t.Fatalf("builtin %s sets unapplied fields %v", r.Name, fields)
+		if err := r.Validate(); err != nil {
+			t.Fatalf("builtin %s is invalid: %v", r.Name, err)
 		}
 	}
 }

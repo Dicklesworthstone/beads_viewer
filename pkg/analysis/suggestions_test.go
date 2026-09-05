@@ -2,9 +2,90 @@ package analysis
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+// Synthetic origins exercise command construction only. Real tracker execution
+// and exported-state readback are covered by the CLI suggestion tests.
+func suggestionTestOrigin(id string) *model.IssueOrigin {
+	return &model.IssueOrigin{LocalID: id, WorkingDirectory: "/work/owner's repo", TrackerDirectory: "/work/owner's repo/.beads",
+		Database: "/work/owner's repo/.beads/beads.db", Tracker: "br", Executable: "/tools/br"}
+}
+
+func TestSuggestionMutationRoutes(t *testing.T) {
+	for _, detector := range []struct {
+		name string
+		run  func([]model.Issue) []Suggestion
+	}{
+		{"dependency", func(issues []model.Issue) []Suggestion {
+			cfg := DefaultDependencySuggestionConfig()
+			cfg.MinConfidence = 0.1
+			return DetectMissingDependencies(issues, cfg)
+		}},
+		{"duplicate", func(issues []model.Issue) []Suggestion { return DetectDuplicates(issues, DefaultDuplicateConfig()) }},
+		{"label", func(issues []model.Issue) []Suggestion {
+			cfg := DefaultLabelSuggestionConfig()
+			cfg.MinConfidence = 0.1
+			return SuggestLabels(issues, cfg)
+		}},
+		{"cycle", func(issues []model.Issue) []Suggestion {
+			issues[0].Dependencies = []*model.Dependency{{DependsOnID: issues[1].ID, Type: model.DepBlocks}}
+			issues[1].Dependencies = []*model.Dependency{{DependsOnID: issues[0].ID, Type: model.DepBlocks}}
+			return DetectCycleWarnings(issues, DefaultCycleWarningConfig())
+		}},
+	} {
+		for _, scope := range []string{"same tracker", "unknown", "historical", "partial", "different tracker"} {
+			t.Run(detector.name+"/"+scope, func(t *testing.T) {
+				issues := []model.Issue{
+					{ID: "api-display-a", Title: "Fix authentication login bug", Status: model.StatusOpen, CreatedAt: time.Unix(1, 0), Origin: suggestionTestOrigin("local-a")},
+					{ID: "api-display-b", Title: "Fix authentication login bug", Status: model.StatusOpen, CreatedAt: time.Unix(2, 0), Labels: []string{"bug", "auth"}, Origin: suggestionTestOrigin("local-b")},
+				}
+				switch scope {
+				case "unknown":
+					issues[0].Origin, issues[1].Origin = nil, nil
+				case "historical", "partial":
+					issues[0].Origin.ReadOnlyReason, issues[1].Origin.ReadOnlyReason = scope+" source", scope+" source"
+				case "different tracker":
+					issues[1].Origin.Database = "/other/beads.db"
+				}
+				suggestions := detector.run(issues)
+				if len(suggestions) == 0 {
+					t.Fatal("route refusal must retain useful analyses")
+				}
+				allowed := scope == "same tracker" || (scope == "different tracker" && detector.name == "label")
+				for _, suggestion := range suggestions {
+					if suggestion.Summary == "" || suggestion.Reason == "" || suggestion.Confidence <= 0 {
+						t.Fatalf("lost useful analysis: %+v", suggestion)
+					}
+					if allowed {
+						if suggestion.ActionCommand == "" || !strings.Contains(suggestion.ActionCommand, "local-") || strings.Contains(suggestion.ActionCommand, "api-display-") || !strings.Contains(suggestion.ActionCommand, "cd --") {
+							t.Errorf("command must target original local ID and directory: %+v", suggestion)
+						}
+						if suggestion.Action == nil || suggestion.Action.WorkingDirectory != issues[0].Origin.WorkingDirectory || suggestion.Action.Shell != suggestion.ActionCommand || len(suggestion.Action.Argv) == 0 {
+							t.Errorf("typed argv route missing: %+v", suggestion)
+						}
+						if detector.name == "cycle" && suggestion.Action != nil {
+							path := suggestion.Metadata["cycle_path"].([]string)
+							localIDs := map[string]string{"api-display-a": "local-a", "api-display-b": "local-b"}
+							args := suggestion.Action.Argv
+							if len(args) < 2 || args[len(args)-2] != localIDs[path[len(path)-1]] || args[len(args)-1] != localIDs[path[0]] {
+								t.Fatalf("removal must use the last cycle edge's source, not the summary target: %+v", suggestion)
+							}
+						}
+					} else if suggestion.ActionCommand != "" {
+						t.Errorf("%s source emitted mutation: %+v", scope, suggestion)
+					} else if suggestion.Action != nil || suggestion.Metadata["action_unavailable_reason"] == nil {
+						t.Errorf("refusal must remove typed action and explain why: %+v", suggestion)
+					}
+				}
+			})
+		}
+	}
+}
 
 func TestSuggestionType_Constants(t *testing.T) {
 	// Verify all suggestion types have expected string values
@@ -180,11 +261,11 @@ func TestSuggestion_WithRelatedBead(t *testing.T) {
 func TestSuggestion_WithAction(t *testing.T) {
 	s := NewSuggestion(SuggestionCycleWarning, "BEAD-1", "Break cycle", "Cycle detected", 0.95)
 
-	s2 := s.WithAction("br unblock BEAD-1 --from BEAD-2")
+	s2 := s.WithAction(&model.IssueCommand{Shell: "br dep remove BEAD-1 BEAD-2"})
 	if s.ActionCommand != "" {
 		t.Error("Original suggestion should not be modified")
 	}
-	if s2.ActionCommand != "br unblock BEAD-1 --from BEAD-2" {
+	if s2.ActionCommand != "br dep remove BEAD-1 BEAD-2" {
 		t.Errorf("WithAction() ActionCommand mismatch")
 	}
 
@@ -234,7 +315,7 @@ func TestSuggestion_WithMetadata(t *testing.T) {
 func TestSuggestion_JSON(t *testing.T) {
 	s := NewSuggestion(SuggestionMissingDependency, "BEAD-1", "Add dep", "Content match", 0.75).
 		WithRelatedBead("BEAD-2").
-		WithAction("br dep add BEAD-1 BEAD-2").
+		WithAction(&model.IssueCommand{Shell: "br dep add BEAD-1 BEAD-2"}).
 		WithMetadata("source", "content_analysis")
 
 	// Serialize
@@ -292,7 +373,7 @@ func TestNewSuggestionSet_Empty(t *testing.T) {
 
 func TestNewSuggestionSet_SingleSuggestion(t *testing.T) {
 	s := NewSuggestion(SuggestionMissingDependency, "BEAD-1", "Add dep", "Reason", 0.8).
-		WithAction("br dep add BEAD-1 BEAD-2")
+		WithAction(&model.IssueCommand{Shell: "br dep add BEAD-1 BEAD-2"})
 
 	set := NewSuggestionSet([]Suggestion{s}, "hash456")
 
@@ -315,9 +396,9 @@ func TestNewSuggestionSet_SingleSuggestion(t *testing.T) {
 
 func TestNewSuggestionSet_MultipleSuggestions(t *testing.T) {
 	suggestions := []Suggestion{
-		NewSuggestion(SuggestionMissingDependency, "B1", "S1", "R1", 0.9).WithAction("cmd1"),
+		NewSuggestion(SuggestionMissingDependency, "B1", "S1", "R1", 0.9).WithAction(&model.IssueCommand{Shell: "cmd1"}),
 		NewSuggestion(SuggestionMissingDependency, "B2", "S2", "R2", 0.5),
-		NewSuggestion(SuggestionPotentialDuplicate, "B3", "S3", "R3", 0.8).WithAction("cmd2"),
+		NewSuggestion(SuggestionPotentialDuplicate, "B3", "S3", "R3", 0.8).WithAction(&model.IssueCommand{Shell: "cmd2"}),
 		NewSuggestion(SuggestionLabelSuggestion, "B4", "S4", "R4", 0.3),
 		NewSuggestion(SuggestionCycleWarning, "B5", "S5", "R5", 0.95),
 	}

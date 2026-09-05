@@ -1,6 +1,8 @@
 package analysis
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -9,6 +11,107 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func TestWaitForPhase2ContextCancellationAndCompletion(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		done := make(chan struct{})
+		stats := &GraphStats{phase2Done: done}
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan error, 1)
+		go func() { result <- stats.WaitForPhase2Context(ctx) }()
+		if complete {
+			close(done)
+		} else {
+			cancel()
+		}
+		select {
+		case err := <-result:
+			if complete && err != nil || !complete && !errors.Is(err, context.Canceled) {
+				t.Fatalf("completion=%v: got %v", complete, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("phase wait did not finish after completion/cancellation")
+		}
+		cancel()
+		if err := stats.WaitForPhase2Context(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("already-canceled wait returned %v", err)
+		}
+	}
+}
+
+func TestTransitiveUnblocksWorkTracksAffectedFrontier(t *testing.T) {
+	measure := func(unrelated int) float64 {
+		issues := []model.Issue{
+			{ID: "root", Status: model.StatusOpen},
+			{ID: "child", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+			{ID: "grandchild", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "child", Type: model.DepBlocks}}},
+			// An unblocked parent does not prevent its child being ready already.
+			// This pre-existing ready child is not new work caused by completion.
+			{ID: "already-ready", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepParentChild}}},
+			{ID: "parked", Status: model.StatusBlocked, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+			{ID: "missing", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}, {DependsOnID: "absent", Type: model.DepBlocks}}},
+		}
+		for i := 0; i < unrelated; i++ {
+			issues = append(issues, model.Issue{ID: fmt.Sprintf("unrelated-%05d", i), Status: model.StatusOpen})
+		}
+		analyzer := NewAnalyzer(issues)
+		if got := analyzer.countTransitiveUnblocks("root"); got != 2 {
+			t.Fatalf("cascade counted pre-existing/parked/missing work: got %d want 2", got)
+		}
+		return testing.AllocsPerRun(5, func() {
+			if got := analyzer.countTransitiveUnblocks("root"); got != 2 {
+				t.Fatalf("repeated cascade=%d want2", got)
+			}
+		})
+	}
+	small, large := measure(1000), measure(10000)
+	t.Logf("same two-node affected frontier:1k unrelated %.0f allocations,10k unrelated %.0f", small, large)
+	if large > small+5 {
+		t.Fatalf("unrelated ready work expanded cascade allocations: %.0f -> %.0f", small, large)
+	}
+}
+
+func TestPriorityRecommendationsFromStatsPreserveResultsAndSourceReadiness(t *testing.T) {
+	issues := []model.Issue{{ID: "ROOT", Status: model.StatusOpen, Priority: 4}}
+	for i := 0; i < 8; i++ {
+		issues = append(issues, model.Issue{
+			ID: fmt.Sprintf("CHILD-%d", i), Status: model.StatusOpen, Priority: 2,
+			Dependencies: []*model.Dependency{{DependsOnID: "ROOT", Type: model.DepBlocks}},
+		})
+	}
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	stats := analyzer.Analyze()
+	thresholds := DefaultThresholds()
+	want := analyzer.GenerateRecommendationsWithThresholds(thresholds)
+	got := analyzer.GenerateRecommendationsFromStats(&stats, thresholds)
+	if len(got) == 0 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("provided analysis changed recommendations:\ngot=%+v\nwant=%+v", got, want)
+	}
+	// Deliberately supplied critical-path data must be used in each what-if,
+	// not replaced by a hidden per-recommendation re-analysis of the graph.
+	provided := &GraphStats{criticalPathScore: map[string]float64{"ROOT": MaxCriticalPathDepth}}
+	thresholds.MinConfidence = 0
+	fromProvided := analyzer.GenerateRecommendationsFromStats(provided, thresholds)
+	var root *PriorityRecommendation
+	for i := range fromProvided {
+		if fromProvided[i].IssueID == "ROOT" {
+			root = &fromProvided[i]
+		}
+	}
+	if root == nil || root.WhatIf == nil || root.WhatIf.DepthReduction != 1 || root.WhatIf.DirectUnblocks != 8 {
+		t.Fatalf("provided stats were not consumed with real dependency effects: %+v", root)
+	}
+	for i := 1; i < len(issues); i++ {
+		issues[i].Status = model.StatusBlocked
+	}
+	parked := NewAnalyzer(issues).GenerateRecommendationsFromStats(provided, thresholds)
+	for _, rec := range parked {
+		if rec.WhatIf != nil && (rec.WhatIf.DirectUnblocks != 0 || rec.WhatIf.TransitiveUnblocks != 0) {
+			t.Fatalf("provided metrics resumed parked source rows: %+v", rec)
+		}
+	}
+}
 
 func TestGenerateTopReasons_Empty(t *testing.T) {
 	score := ImpactScore{
@@ -331,10 +434,10 @@ func TestWhatIfDeltaExcludesDeferredAndParentGatedCascade(t *testing.T) {
 		{ID: "PARENT", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "PARENT-BLOCKER", Type: model.DepBlocks},
 		}},
-		{ID: "DEFERRED", Status: model.StatusBlocked, DeferUntil: &future, Dependencies: []*model.Dependency{
+		{ID: "DEFERRED", Status: model.StatusOpen, DeferUntil: &future, Dependencies: []*model.Dependency{
 			{DependsOnID: "ROOT", Type: model.DepBlocks},
 		}},
-		{ID: "PARENT-GATED", Status: model.StatusBlocked, Dependencies: []*model.Dependency{
+		{ID: "PARENT-GATED", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "ROOT", Type: model.DepBlocks},
 			{DependsOnID: "PARENT", Type: model.DepParentChild},
 		}},
@@ -351,10 +454,10 @@ func TestWhatIfDeltaExcludesDeferredAndParentGatedCascade(t *testing.T) {
 func TestWhatIfDeltaCountsParentPropagationCascade(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "ROOT", Status: model.StatusOpen},
-		{ID: "PARENT", Status: model.StatusBlocked, Dependencies: []*model.Dependency{
+		{ID: "PARENT", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "ROOT", Type: model.DepBlocks},
 		}},
-		{ID: "CHILD", Status: model.StatusBlocked, Dependencies: []*model.Dependency{
+		{ID: "CHILD", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "PARENT", Type: model.DepParentChild},
 		}},
 	}
@@ -363,6 +466,12 @@ func TestWhatIfDeltaCountsParentPropagationCascade(t *testing.T) {
 	delta := analyzer.computeWhatIfDeltaFromStats("ROOT", &GraphStats{})
 	if delta.DirectUnblocks != 1 || delta.TransitiveUnblocks != 2 {
 		t.Fatalf("what-if parent cascade = %+v, want direct=1 transitive=2", delta)
+	}
+	issues[1].Status = model.StatusBlocked
+	issues[2].Status = model.StatusBlocked
+	parked := NewAnalyzer(issues).computeWhatIfDeltaFromStats("ROOT", &GraphStats{})
+	if parked.DirectUnblocks != 0 || parked.TransitiveUnblocks != 0 || parked.BlockedReduction != 0 {
+		t.Fatalf("parent cascade cannot resume parked work: %+v", parked)
 	}
 }
 
@@ -375,7 +484,7 @@ func TestTopWhatIfDeltasFromStats_UsesProvidedStatsAndPreservesOutput(t *testing
 		issues = append(issues, model.Issue{
 			ID:     id,
 			Title:  id,
-			Status: model.StatusBlocked,
+			Status: model.StatusOpen,
 			Dependencies: []*model.Dependency{
 				{IssueID: id, DependsOnID: "ROOT", Type: model.DepBlocks},
 			},
@@ -384,7 +493,7 @@ func TestTopWhatIfDeltasFromStats_UsesProvidedStatsAndPreservesOutput(t *testing
 	issues = append(issues, model.Issue{
 		ID:     "CASCADE",
 		Title:  "Cascade leaf",
-		Status: model.StatusBlocked,
+		Status: model.StatusOpen,
 		Dependencies: []*model.Dependency{
 			{IssueID: "CASCADE", DependsOnID: "DEPENDENT-000", Type: model.DepBlocks},
 		},
@@ -424,6 +533,15 @@ func TestTopWhatIfDeltasFromStats_UsesProvidedStatsAndPreservesOutput(t *testing
 	fromNil := analyzer.TopWhatIfDeltasFromStats(nil, 0)
 	if !reflect.DeepEqual(fromNil, want) {
 		t.Fatalf("nil stats fallback differs from ordinary output:\n got: %#v\nwant: %#v", fromNil, want)
+	}
+	for i := range issues {
+		if issues[i].ID != "ROOT" {
+			issues[i].Status = model.StatusBlocked
+		}
+	}
+	parked := NewAnalyzer(issues).TopWhatIfDeltasFromStats(&stats, 0)
+	if len(parked) != 0 {
+		t.Fatalf("provided graph stats cannot make parked dependents actionable: %#v", parked)
 	}
 }
 

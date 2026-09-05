@@ -13,10 +13,8 @@ import (
 
 // Recipe defines a reusable view configuration for beads.
 //
-// Filters, Sort (primary and secondary, including the graph-metric fields)
-// and View.MaxItems are applied by Apply. Every other View field, the Export
-// block and Metrics are parsed and reported by UnappliedFields but not yet
-// honoured anywhere; the CLI warns when a recipe sets them.
+// Apply resolves membership, ordering and limits. The TUI consumes View and
+// Metrics as presentation defaults when selecting a recipe.
 type Recipe struct {
 	Name        string       `yaml:"name" json:"name"`
 	Description string       `yaml:"description,omitempty" json:"description,omitempty"`
@@ -25,7 +23,7 @@ type Recipe struct {
 	View        ViewConfig   `yaml:"view,omitempty" json:"view,omitempty"`
 	Export      ExportConfig `yaml:"export,omitempty" json:"export,omitempty"`
 	// Metrics lists analysis metrics a view should surface.
-	// Not yet applied: no list or export path reads it.
+	// Setting Metrics also enables metric display in the TUI.
 	Metrics []string `yaml:"metrics,omitempty" json:"metrics,omitempty"`
 }
 
@@ -62,27 +60,27 @@ type SortConfig struct {
 
 // ViewConfig controls display options.
 //
-// Only MaxItems is applied today (by Apply). The remaining fields are parsed
-// so recipe files round-trip, but no list, board or export path reads them
-// yet; UnappliedFields names the ones a recipe sets.
+// MaxItems is applied by Apply. Other fields configure the existing TUI list,
+// detail and graph views. Later navigation wins until another recipe is chosen.
 type ViewConfig struct {
-	Columns       []string `yaml:"columns,omitempty" json:"columns,omitempty"`               // Not yet applied: id, title, status, priority, created, updated, tags, blockers
-	ShowGraph     bool     `yaml:"show_graph,omitempty" json:"show_graph,omitempty"`         // Not yet applied: show dependency graph in TUI
-	ShowMetrics   bool     `yaml:"show_metrics,omitempty" json:"show_metrics,omitempty"`     // Not yet applied: show analysis metrics
-	GroupBy       string   `yaml:"group_by,omitempty" json:"group_by,omitempty"`             // Not yet applied: status, priority, tag, none
-	Collapsed     bool     `yaml:"collapsed,omitempty" json:"collapsed,omitempty"`           // Not yet applied: start with groups collapsed
+	Columns       []string `yaml:"columns,omitempty" json:"columns,omitempty"`               // Ordered list columns; empty keeps the normal adaptive row
+	ShowGraph     bool     `yaml:"show_graph,omitempty" json:"show_graph,omitempty"`         // Start in the dependency graph
+	ShowMetrics   bool     `yaml:"show_metrics,omitempty" json:"show_metrics,omitempty"`     // Show selected metric values on list rows and in issue details
+	GroupBy       string   `yaml:"group_by,omitempty" json:"group_by,omitempty"`             // List groups: status, priority, tag (first sorted label), none
+	Collapsed     bool     `yaml:"collapsed,omitempty" json:"collapsed,omitempty"`           // Start list groups collapsed; Enter toggles a group
 	MaxItems      int      `yaml:"max_items,omitempty" json:"max_items,omitempty"`           // Keep only the first N issues after sorting (0 = unlimited)
-	TruncateTitle int      `yaml:"truncate_title,omitempty" json:"truncate_title,omitempty"` // Not yet applied: max title length
+	TruncateTitle int      `yaml:"truncate_title,omitempty" json:"truncate_title,omitempty"` // Maximum title display cells; 0 uses available width
 }
 
-// ExportConfig controls output format options.
-//
-// Not yet applied: no export path consults a recipe. The fields are kept so
-// files that set them still parse; UnappliedFields reports them.
+// Presentation field names are shared by validation and the TUI renderer.
+var ViewColumns = []string{"id", "title", "status", "priority", "created", "updated", "tags", "blockers"}
+var ViewMetrics = []string{"pagerank", "betweenness", "impact", "triage", "hub", "authority", "eigenvector", "kcore", "slack"}
+
+// ExportConfig supplies defaults only when an export is explicitly requested.
 type ExportConfig struct {
-	Format       string `yaml:"format,omitempty" json:"format,omitempty"`               // Not yet applied: markdown, json, csv, mermaid
-	IncludeGraph bool   `yaml:"include_graph,omitempty" json:"include_graph,omitempty"` // Not yet applied: include Mermaid diagram
-	Template     string `yaml:"template,omitempty" json:"template,omitempty"`           // Not yet applied: custom template path
+	Format       string `yaml:"format,omitempty" json:"format,omitempty"`               // markdown, json, csv, mermaid
+	IncludeGraph *bool  `yaml:"include_graph,omitempty" json:"include_graph,omitempty"` // nil uses the format default
+	Template     string `yaml:"template,omitempty" json:"template,omitempty"`           // Markdown template path, relative to the working directory
 }
 
 // Sort fields accepted by SortConfig.Field.
@@ -162,8 +160,7 @@ func (r *Recipe) NeedsTriageScores() bool {
 
 // Validate rejects recipes Apply cannot honour: unknown sort fields or
 // directions, malformed time filters, unknown status values and a negative
-// max_items. Fields that are parsed but not yet applied are not errors; see
-// UnappliedFields.
+// max_items, plus unsupported presentation fields.
 func (r *Recipe) Validate() error {
 	if r == nil {
 		return errors.New("recipe is nil")
@@ -201,6 +198,47 @@ func (r *Recipe) Validate() error {
 	if r.View.MaxItems < 0 {
 		problems = append(problems, fmt.Sprintf("view.max_items %d must not be negative", r.View.MaxItems))
 	}
+	if r.View.TruncateTitle < 0 {
+		problems = append(problems, "view.truncate_title must not be negative")
+	}
+	for _, field := range []struct {
+		name          string
+		values, known []string
+	}{
+		{"view.columns", r.View.Columns, ViewColumns},
+		{"metrics", r.Metrics, ViewMetrics},
+	} {
+		seen := make(map[string]bool)
+		for _, value := range field.values {
+			valid := false
+			for _, known := range field.known {
+				if value == known {
+					valid = true
+					break
+				}
+			}
+			if !valid {
+				problems = append(problems, fmt.Sprintf("%s %q must be one of %s", field.name, value, strings.Join(field.known, ", ")))
+			}
+			if seen[value] {
+				problems = append(problems, fmt.Sprintf("%s repeats %q", field.name, value))
+			}
+			seen[value] = true
+		}
+	}
+	switch r.View.GroupBy {
+	case "", "none", "status", "priority", "tag":
+	default:
+		problems = append(problems, fmt.Sprintf("view.group_by %q must be status, priority, tag or none", r.View.GroupBy))
+	}
+	if r.View.Collapsed && (r.View.GroupBy == "" || r.View.GroupBy == "none") {
+		problems = append(problems, "view.collapsed requires view.group_by")
+	}
+	switch r.Export.Format {
+	case "", "markdown", "json", "csv", "mermaid":
+	default:
+		problems = append(problems, fmt.Sprintf("export.format %q must be markdown, json, csv or mermaid", r.Export.Format))
+	}
 	if len(problems) == 0 {
 		return nil
 	}
@@ -210,47 +248,6 @@ func (r *Recipe) Validate() error {
 func knownSortFields() []string {
 	return []string{SortFieldPriority, SortFieldCreated, SortFieldUpdated, SortFieldTitle, SortFieldID, SortFieldStatus,
 		SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage}
-}
-
-// UnappliedFields lists the dotted names of fields this recipe sets that no
-// code path honours yet (view.columns, export.format, metrics, ...). Callers
-// surface them so a recipe author is never silently ignored.
-func (r *Recipe) UnappliedFields() []string {
-	if r == nil {
-		return nil
-	}
-	var fields []string
-	if len(r.View.Columns) > 0 {
-		fields = append(fields, "view.columns")
-	}
-	if r.View.ShowGraph {
-		fields = append(fields, "view.show_graph")
-	}
-	if r.View.ShowMetrics {
-		fields = append(fields, "view.show_metrics")
-	}
-	if r.View.GroupBy != "" {
-		fields = append(fields, "view.group_by")
-	}
-	if r.View.Collapsed {
-		fields = append(fields, "view.collapsed")
-	}
-	if r.View.TruncateTitle != 0 {
-		fields = append(fields, "view.truncate_title")
-	}
-	if r.Export.Format != "" {
-		fields = append(fields, "export.format")
-	}
-	if r.Export.IncludeGraph {
-		fields = append(fields, "export.include_graph")
-	}
-	if r.Export.Template != "" {
-		fields = append(fields, "export.template")
-	}
-	if len(r.Metrics) > 0 {
-		fields = append(fields, "metrics")
-	}
-	return fields
 }
 
 // relativeTimePattern matches relative time expressions like "14d", "2w", "1m", "1y"

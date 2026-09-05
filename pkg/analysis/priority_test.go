@@ -608,15 +608,16 @@ func TestMedianEstimatedMinutes(t *testing.T) {
 
 func TestWhatIfDeltaDirectUnblocks(t *testing.T) {
 	// Create a chain: A blocks B, B blocks C
-	// Completing A should unblock B directly
+	// B and C are open work gated by dependencies, not parked by status.
+	// Completing A should unblock B directly.
 	issues := []model.Issue{
 		{ID: "A", Title: "Root Blocker", Status: model.StatusOpen, Priority: 0},
 		{
-			ID: "B", Title: "Middle", Status: model.StatusBlocked, Priority: 1,
+			ID: "B", Title: "Middle", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
 		},
 		{
-			ID: "C", Title: "Leaf", Status: model.StatusBlocked, Priority: 2,
+			ID: "C", Title: "Leaf", Status: model.StatusOpen, Priority: 2,
 			Dependencies: []*model.Dependency{{IssueID: "C", DependsOnID: "B", Type: model.DepBlocks}},
 		},
 	}
@@ -650,6 +651,7 @@ func TestWhatIfDeltaDirectUnblocks(t *testing.T) {
 	if recA.WhatIf.BlockedReduction < 1 {
 		t.Errorf("Completing A should reduce blocked count, got %d", recA.WhatIf.BlockedReduction)
 	}
+	assertParkedDependentsStayWithheld(t, issues, "A")
 }
 
 func TestWhatIfDeltaNoDownstream(t *testing.T) {
@@ -679,7 +681,7 @@ func TestWhatIfDeltaEstimatedDays(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Title: "Blocker", Status: model.StatusOpen, Priority: 0},
 		{
-			ID: "B", Title: "Blocked", Status: model.StatusBlocked, Priority: 1,
+			ID: "B", Title: "Dependency gated", Status: model.StatusOpen, Priority: 1,
 			EstimatedMinutes: &est,
 			Dependencies:     []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
 		},
@@ -704,6 +706,7 @@ func TestWhatIfDeltaEstimatedDays(t *testing.T) {
 	if recA.WhatIf.EstimatedDaysSaved < 0.9 || recA.WhatIf.EstimatedDaysSaved > 1.1 {
 		t.Errorf("Expected ~1 day saved, got %.2f", recA.WhatIf.EstimatedDaysSaved)
 	}
+	assertParkedDependentsStayWithheld(t, issues, "A")
 }
 
 func TestReasoningCapAtThree(t *testing.T) {
@@ -800,15 +803,15 @@ func TestParallelizationGain(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Title: "Root Blocker", Status: model.StatusOpen, Priority: 0},
 		{
-			ID: "B", Title: "Blocked 1", Status: model.StatusBlocked, Priority: 1,
+			ID: "B", Title: "Dependency gated 1", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
 		},
 		{
-			ID: "C", Title: "Blocked 2", Status: model.StatusBlocked, Priority: 1,
+			ID: "C", Title: "Dependency gated 2", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "C", DependsOnID: "A", Type: model.DepBlocks}},
 		},
 		{
-			ID: "D", Title: "Blocked 3", Status: model.StatusBlocked, Priority: 1,
+			ID: "D", Title: "Dependency gated 3", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "D", DependsOnID: "A", Type: model.DepBlocks}},
 		},
 	}
@@ -837,6 +840,7 @@ func TestParallelizationGain(t *testing.T) {
 	if *recA.WhatIf.ParallelizationGain != expectedGain {
 		t.Errorf("Expected ParallelizationGain=%d, got %d", expectedGain, *recA.WhatIf.ParallelizationGain)
 	}
+	assertParkedDependentsStayWithheld(t, issues, "A")
 }
 
 // TestParallelizationGainNegative verifies negative parallelization gain (bv-129)
@@ -879,7 +883,7 @@ func TestParallelizationGainZero(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Title: "Single Blocker", Status: model.StatusOpen, Priority: 0},
 		{
-			ID: "B", Title: "Blocked", Status: model.StatusBlocked, Priority: 1,
+			ID: "B", Title: "Dependency gated", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
 		},
 	}
@@ -907,4 +911,35 @@ func TestParallelizationGainZero(t *testing.T) {
 	if *recA.WhatIf.ParallelizationGain != expectedGain {
 		t.Errorf("Expected ParallelizationGain=%d, got %d", expectedGain, *recA.WhatIf.ParallelizationGain)
 	}
+	assertParkedDependentsStayWithheld(t, issues, "A")
+}
+
+// Every dependency-only fixture above has a parked-status counterexample:
+// completing the root may satisfy edges but cannot resume explicitly blocked work.
+func assertParkedDependentsStayWithheld(t *testing.T, issues []model.Issue, rootID string) {
+	t.Helper()
+	parked := make([]model.Issue, len(issues))
+	for i, issue := range issues {
+		parked[i] = issue.Clone()
+		if issue.ID != rootID {
+			parked[i].Status = model.StatusBlocked
+		}
+	}
+	an := analysis.NewAnalyzer(parked)
+	if got := an.ComputeUnblocks(rootID); len(got) != 0 {
+		t.Errorf("Completing %s must not resume parked dependents: %v", rootID, got)
+	}
+	for _, rec := range an.GenerateRecommendations() {
+		if rec.IssueID != rootID {
+			continue
+		}
+		if rec.WhatIf == nil {
+			t.Fatal("Expected what-if result for root of parked fixture")
+		}
+		if rec.WhatIf.DirectUnblocks != 0 || rec.WhatIf.TransitiveUnblocks != 0 || rec.WhatIf.BlockedReduction != 0 || rec.WhatIf.EstimatedDaysSaved != 0 {
+			t.Errorf("Completing %s must not credit parked work: %+v", rootID, rec.WhatIf)
+		}
+		return
+	}
+	t.Fatalf("Missing recommendation for root %s in parked fixture", rootID)
 }

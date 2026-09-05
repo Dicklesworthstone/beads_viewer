@@ -89,6 +89,9 @@ func TestDetectCycleWarnings_SkippedSelfLoopsDoNotConsumeLimit(t *testing.T) {
 func TestDetectCycleWarnings_SimpleCycle(t *testing.T) {
 	config := DefaultCycleWarningConfig()
 	issues := testutil.QuickCycle(3)
+	for i := range issues {
+		issues[i].Origin = suggestionTestOrigin(issues[i].ID)
+	}
 
 	suggestions := DetectCycleWarnings(issues, config)
 	if len(suggestions) == 0 {
@@ -104,8 +107,8 @@ func TestDetectCycleWarnings_SimpleCycle(t *testing.T) {
 		if sug.ActionCommand == "" {
 			t.Error("expected action command to be set")
 		}
-		if !strings.Contains(sug.ActionCommand, "br dep remove") {
-			t.Errorf("expected action to contain 'br dep remove', got %s", sug.ActionCommand)
+		if !strings.Contains(sug.ActionCommand, "'dep' 'remove'") {
+			t.Errorf("expected routed dependency removal, got %s", sug.ActionCommand)
 		}
 	}
 }

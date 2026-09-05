@@ -369,10 +369,11 @@ func TestGenerateAllSuggestions_NoDuplicateSuggestions(t *testing.T) {
 
 	set := GenerateAllSuggestions(issues, config, "dedup-hash")
 
-	// Check for duplicate suggestions (same target + type + suggested action)
+	// Semantic identity survives an unavailable mutation route. Distinct label
+	// recommendations must not collapse into one empty action command.
 	seen := make(map[string]bool)
 	for _, sug := range set.Suggestions {
-		key := sug.TargetBead + "|" + string(sug.Type) + "|" + sug.ActionCommand
+		key := sug.TargetBead + "|" + string(sug.Type) + "|" + sug.RelatedBead + "|" + sug.Summary
 		if seen[key] {
 			t.Errorf("duplicate suggestion found: %s", key)
 		}

@@ -1,11 +1,39 @@
 package recipe_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 )
+
+func TestPresentationValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		r    recipe.Recipe
+		want string
+	}{
+		{"column", recipe.Recipe{View: recipe.ViewConfig{Columns: []string{"secret"}}}, "view.columns"},
+		{"duplicate column", recipe.Recipe{View: recipe.ViewConfig{Columns: []string{"id", "id"}}}, "repeats"},
+		{"group", recipe.Recipe{View: recipe.ViewConfig{GroupBy: "assignee"}}, "view.group_by"},
+		{"collapse without groups", recipe.Recipe{View: recipe.ViewConfig{Collapsed: true}}, "view.collapsed"},
+		{"negative width", recipe.Recipe{View: recipe.ViewConfig{TruncateTitle: -1}}, "view.truncate_title"},
+		{"metric", recipe.Recipe{Metrics: []string{"invented"}}, "metrics"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.r.Validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want %s validation error, got %v", tc.want, err)
+			}
+		})
+	}
+	for _, group := range []string{"", "none", "status", "priority", "tag"} {
+		r := recipe.Recipe{View: recipe.ViewConfig{Columns: recipe.ViewColumns, GroupBy: group, TruncateTitle: 1}, Metrics: recipe.ViewMetrics}
+		if err := r.Validate(); err != nil {
+			t.Fatalf("valid presentation: %v", err)
+		}
+	}
+}
 
 func TestParseRelativeTimeDays(t *testing.T) {
 	now := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)

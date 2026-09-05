@@ -4,6 +4,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 func quoteBeadsCommandID(id string) (string, bool) {
@@ -75,6 +77,9 @@ type Suggestion struct {
 
 	// ActionCommand is an optional CLI command to act on this suggestion
 	ActionCommand string `json:"action_command,omitempty"`
+	// Action preserves the source-bound argv and working directory. The shell
+	// command above is a rendering of the same action, never parsed as input.
+	Action *model.IssueCommand `json:"action,omitempty"`
 
 	// GeneratedAt is when this suggestion was created
 	GeneratedAt time.Time `json:"generated_at"`
@@ -183,8 +188,21 @@ func (s Suggestion) WithRelatedBead(beadID string) Suggestion {
 }
 
 // WithAction adds an action command to the suggestion
-func (s Suggestion) WithAction(cmd string) Suggestion {
-	s.ActionCommand = cmd
+func (s Suggestion) WithAction(cmd *model.IssueCommand) Suggestion {
+	s.Action = cmd
+	s.ActionCommand = ""
+	if cmd != nil {
+		s.ActionCommand = cmd.Shell
+	}
+	return s
+}
+
+func (s Suggestion) withMutationAction(issue model.Issue, kind model.MutationKind, peer *model.Issue, value string) Suggestion {
+	command, reason := issue.MutationAction(kind, peer, value)
+	s = s.WithAction(command)
+	if reason != "" {
+		s = s.WithMetadata("action_unavailable_reason", reason)
+	}
 	return s
 }
 

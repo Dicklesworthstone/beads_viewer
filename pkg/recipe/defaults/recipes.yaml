@@ -1,10 +1,9 @@
 # Built-in bv recipes
 # These are embedded into the binary and serve as defaults.
 #
-# Only fields that Apply honours appear here: filters, sort (primary and
-# secondary, including the pagerank/betweenness/impact/triage metric fields)
-# and view.max_items. view.columns, view.show_metrics, export.* and metrics
-# are parsed but not applied yet, so builtins do not set them.
+# Builtins keep the adaptive TUI layout. Custom recipes can also configure
+# columns, metrics, graph, grouping and title width. Apply resolves filters,
+# the complete sort chain and view.max_items for CLI and TUI consumers.
 
 recipes:
   default:

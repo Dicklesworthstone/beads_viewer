@@ -483,6 +483,9 @@ func TestSuggestLabels_SuggestionFormat(t *testing.T) {
 
 	config := DefaultLabelSuggestionConfig()
 	config.MinConfidence = 0.1
+	for i := range issues {
+		issues[i].Origin = suggestionTestOrigin(issues[i].ID)
+	}
 
 	suggestions := SuggestLabels(issues, config)
 
@@ -508,8 +511,8 @@ func TestSuggestLabels_SuggestionFormat(t *testing.T) {
 	if sug.ActionCommand == "" {
 		t.Error("ActionCommand is empty")
 	}
-	if !strings.Contains(sug.ActionCommand, "br update") {
-		t.Errorf("ActionCommand should contain 'br update', got: %s", sug.ActionCommand)
+	if !strings.Contains(sug.ActionCommand, "'update' '--json'") {
+		t.Errorf("ActionCommand should contain routed update, got: %s", sug.ActionCommand)
 	}
 	if !strings.Contains(sug.ActionCommand, "--add-label") {
 		t.Errorf("ActionCommand should contain '--add-label', got: %s", sug.ActionCommand)

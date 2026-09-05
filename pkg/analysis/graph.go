@@ -268,6 +268,25 @@ func (s *GraphStats) WaitForPhase2() {
 	}
 }
 
+// WaitForPhase2Context waits for completion without keeping a UI command alive
+// after its source is replaced or the application shuts down. Completion alone
+// does not imply every metric succeeded; callers must still inspect Status.
+func (s *GraphStats) WaitForPhase2Context(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	done := s.phase2Done
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return ctx.Err()
+	}
+}
+
 // GetPageRankScore returns the PageRank score for a single issue.
 // Returns 0 if Phase 2 is not yet complete or if the issue is not found.
 func (s *GraphStats) GetPageRankScore(id string) float64 {
@@ -1290,6 +1309,9 @@ type Analyzer struct {
 	blockerCounts    []int
 	blockerCountsMax int
 	config           *AnalysisConfig // Optional custom config, nil means use size-based defaults
+	readinessOnce    sync.Once
+	readiness        *model.ReadinessIndex
+	candidateIDs     map[string]bool // nil = every analysis issue; empty = no candidates
 
 	// now is the reference instant for time-gated readiness and scoring.
 	// Defaults to wall-clock time at construction; robot entrypoints with a
@@ -1304,6 +1326,33 @@ type Analyzer struct {
 
 	dataHashOnce sync.Once
 	dataHash     string
+}
+
+// SetReadinessScope separates dependency authority and candidate eligibility
+// from the graph used for scoped metrics. Set it before starting analysis.
+func (a *Analyzer) SetReadinessScope(authority *model.ReadinessIndex, candidateIDs map[string]bool) {
+	a.readinessOnce.Do(func() {
+		if authority == nil {
+			authority = model.NewReadinessIndex(a.issues)
+		}
+		a.readiness = authority
+	})
+	if candidateIDs != nil {
+		a.candidateIDs = make(map[string]bool, len(candidateIDs))
+		for id, selected := range candidateIDs {
+			a.candidateIDs[id] = selected
+		}
+	}
+}
+
+func (a *Analyzer) Readiness() *model.ReadinessIndex {
+	a.readinessOnce.Do(func() { a.readiness = model.NewReadinessIndex(a.issues) })
+	return a.readiness
+}
+
+// IsCandidate reports output eligibility independently of dependency state.
+func (a *Analyzer) IsCandidate(id string) bool {
+	return a.candidateIDs == nil || a.candidateIDs[id]
 }
 
 // SetNow overrides the reference instant used for time-gated readiness checks
@@ -2726,7 +2775,7 @@ func findArticulationPoints(adj undirectedAdjacency) map[int64]bool {
 //     (transitive parent-blocked propagation, matching br's behavior)
 //  4. It is not scheduler-deferred (defer_until in the future)
 //
-// Missing blockers don't block (graceful degradation).
+// Missing blockers or unresolved parent chains withhold readiness.
 // Returns list sorted by ID for determinism.
 func (a *Analyzer) GetActionableIssues() []model.Issue {
 	issues := a.getActionableIssuesAfterCompletions(nil)
@@ -2741,81 +2790,6 @@ func (a *Analyzer) GetActionableIssues() []model.Issue {
 // to simulate a sequence of completions without mutating the analyzer's source
 // issues or maintaining a second, subtly different definition of actionable.
 func (a *Analyzer) getActionableIssuesAfterCompletions(completed map[string]bool) []model.Issue {
-	isCompleted := func(id string) bool {
-		return completed != nil && completed[id]
-	}
-	isUnavailable := func(id string, issue model.Issue) bool {
-		return isCompleted(id) || isClosedLikeStatus(issue.Status)
-	}
-
-	// Phase 1: Compute the set of directly blocked issues.
-	// An issue is directly blocked if it has an open blocking-type dependency.
-	directlyBlocked := make(map[string]bool)
-	for id, issue := range a.issueMap {
-		if isUnavailable(id, issue) {
-			continue
-		}
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
-				continue
-			}
-			blocker, exists := a.issueMap[dep.DependsOnID]
-			if !exists {
-				continue
-			}
-			if !isUnavailable(dep.DependsOnID, blocker) {
-				directlyBlocked[id] = true
-				break
-			}
-		}
-	}
-
-	// Phase 2: Propagate blocked status through the immutable parent→children
-	// index built with the graph. If a parent is blocked, its children are also
-	// blocked (transitively).
-	// Use BFS to propagate efficiently (not N^2). Cap depth at 50 to match br.
-	blocked := make(map[string]bool, len(directlyBlocked))
-	type blockedQueueEntry struct {
-		id    string
-		depth int
-	}
-	queue := make([]blockedQueueEntry, 0, len(directlyBlocked))
-	for id := range directlyBlocked {
-		blocked[id] = true
-		queue = append(queue, blockedQueueEntry{id: id})
-	}
-
-	const maxDepth = 50
-	for head := 0; head < len(queue); head++ {
-		current := queue[head]
-		if current.depth >= maxDepth {
-			continue
-		}
-		for _, childID := range a.childrenByParent[current.id] {
-			if blocked[childID] || isUnavailable(childID, a.issueMap[childID]) {
-				continue
-			}
-			blocked[childID] = true
-			queue = append(queue, blockedQueueEntry{id: childID, depth: current.depth + 1})
-		}
-	}
-
-	// Phase 4: Collect actionable issues (actionable status, not blocked, not
-	// scheduler-deferred). A bead with a future defer_until is withheld for
-	// parity with `br ready` (issue #191): it is neither claimable nor part of
-	// the actionable plan until the deferral lapses, even though nothing in
-	// the graph blocks it. Likewise a bead parked in a non-actionable status
-	// (deferred/draft/blocked/...) is withheld exactly as `br ready` withholds
-	// it (issue #199); such a bead still acts as a blocker for its dependents
-	// in Phase 1 because it is not closed.
-	//
-	// NOTE: a standalone open parent with open children remains actionable here
-	// (parent-child is a rollup edge that never gates the parent's own
-	// readiness; see beads_viewer#158 and the ParentChildDoesntBlock tests).
-	// ActionableCount is a health metric and keeps that contract. The separate
-	// "don't surface a parent-with-open-children as a *claimable top pick*"
-	// rule (issue #17 parity) is enforced at the recommendation chokepoint via
-	// ParentsWithOpenChildren + isClaimableRecommendation, not here.
 	var ids []string
 	for id := range a.issueMap {
 		ids = append(ids, id)
@@ -2823,18 +2797,11 @@ func (a *Analyzer) getActionableIssuesAfterCompletions(completed map[string]bool
 	sort.Strings(ids)
 
 	var actionable []model.Issue
+	readiness := a.Readiness()
 	for _, id := range ids {
-		issue := a.issueMap[id]
-		if isUnavailable(id, issue) || !isActionableStatus(issue.Status) {
-			continue
+		if a.IsCandidate(id) && readiness.ReadyAfter(id, a.now, completed) {
+			actionable = append(actionable, a.issueMap[id])
 		}
-		if blocked[id] {
-			continue
-		}
-		if issue.IsDeferredAt(a.now) {
-			continue
-		}
-		actionable = append(actionable, issue)
 	}
 
 	return actionable
@@ -2850,13 +2817,9 @@ func (a *Analyzer) getActionableIssuesAfterCompletions(completed map[string]bool
 // while never withholding a genuinely-leaf epic.
 func (a *Analyzer) ParentsWithOpenChildren() map[string]bool {
 	result := make(map[string]bool)
-	for parentID, childIDs := range a.childrenByParent {
-		for _, childID := range childIDs {
-			child := a.issueMap[childID]
-			if !isClosedLikeStatus(child.Status) {
-				result[parentID] = true
-				break
-			}
+	for id := range a.issueMap {
+		if a.Readiness().HasOpenChildren(id) {
+			result[id] = true
 		}
 	}
 	return result
@@ -2900,24 +2863,10 @@ func (a *Analyzer) GetBlockers(issueID string) []string {
 	return sortedUniqueIssueIDs(blockers)
 }
 
-// GetOpenBlockers returns the IDs of non-closed issues that block the given issue
+// GetOpenBlockers returns blocking or unresolved predecessors, including
+// inherited parent blockage, from the full readiness authority.
 func (a *Analyzer) GetOpenBlockers(issueID string) []string {
-	issue, ok := a.issueMap[issueID]
-	if !ok {
-		return nil
-	}
-
-	var openBlockers []string
-	for _, dep := range issue.Dependencies {
-		if dep != nil && dep.Type.IsBlocking() {
-			if blocker, exists := a.issueMap[dep.DependsOnID]; exists {
-				if !isClosedLikeStatus(blocker.Status) {
-					openBlockers = append(openBlockers, dep.DependsOnID)
-				}
-			}
-		}
-	}
-	return sortedUniqueIssueIDs(openBlockers)
+	return a.Readiness().Blockers(issueID)
 }
 
 func sortedUniqueIssueIDs(ids []string) []string {

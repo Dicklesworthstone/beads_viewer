@@ -25,7 +25,7 @@ type ETAEstimate struct {
 }
 
 // EstimateETAForIssue estimates an ETA for a single issue using:
-// - Complexity minutes: estimated_minutes (explicit) or derived from median estimate × type weight × depth × description length.
+// - Complexity minutes: explicit estimate or median base, then type × depth × description-length multipliers for either base.
 // - Velocity minutes/day: derived from recent closures of issues sharing labels (fallback to global, then default).
 // - ETA days = minutes / (velocity * agents), with a simple confidence interval.
 func EstimateETAForIssue(issues []model.Issue, stats *GraphStats, issueID string, agents int, now time.Time) (ETAEstimate, error) {

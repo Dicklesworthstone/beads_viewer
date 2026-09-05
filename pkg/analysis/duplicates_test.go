@@ -373,6 +373,9 @@ func TestDetectDuplicates_SuggestionStructure(t *testing.T) {
 	}
 
 	config := DefaultDuplicateConfig()
+	for i := range issues {
+		issues[i].Origin = suggestionTestOrigin(issues[i].ID)
+	}
 	suggestions := DetectDuplicates(issues, config)
 
 	if len(suggestions) == 0 {

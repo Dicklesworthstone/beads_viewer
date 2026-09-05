@@ -156,7 +156,7 @@ func TestTriageUnblocksMap_ExcludesFutureDeferredSuccessor(t *testing.T) {
 	future := now.Add(time.Hour)
 	issues := []model.Issue{
 		{ID: "BLOCKER", Status: model.StatusOpen},
-		{ID: "PARKED", Status: model.StatusBlocked, DeferUntil: &future, Dependencies: []*model.Dependency{
+		{ID: "DEFERRED", Status: model.StatusOpen, DeferUntil: &future, Dependencies: []*model.Dependency{
 			{DependsOnID: "BLOCKER", Type: model.DepBlocks},
 		}},
 	}
@@ -168,8 +168,15 @@ func TestTriageUnblocksMap_ExcludesFutureDeferredSuccessor(t *testing.T) {
 	}
 
 	analyzer.SetNow(future)
-	if got := NewTriageContext(analyzer).Unblocks("BLOCKER"); len(got) != 1 || got[0] != "PARKED" {
+	if got := NewTriageContext(analyzer).Unblocks("BLOCKER"); len(got) != 1 || got[0] != "DEFERRED" {
 		t.Fatalf("elapsed successor should be unblocked, got %v", got)
+	}
+
+	issues[1].Status = model.StatusBlocked
+	parked := NewAnalyzer(issues)
+	parked.SetNow(future)
+	if got := NewTriageContext(parked).Unblocks("BLOCKER"); len(got) != 0 {
+		t.Fatalf("elapsed deferral must not resume explicitly parked status: %v", got)
 	}
 }
 

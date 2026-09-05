@@ -14,10 +14,11 @@ import (
 //
 // Spec (must match production semantics):
 // - Only blocking deps count (dep.Type.IsBlocking()).
-// - Missing blockers do not block and should be ignored.
+// - Missing blockers withhold readiness; their completion is not assumed.
 // - Duplicate deps must not double-count (graph edges are unique).
-// - Closing blocker B unblocks dependent D iff all other existing blocking deps of D are closed.
-// - Closed dependents are ignored.
+// - Closing blocker B unblocks dependent D iff all other blocking deps of D are closed/tombstoned.
+// - Only open/in-progress dependents are eligible; parked status is not changed.
+// - These fixtures exercise direct dependencies; parent inheritance has separate tests.
 // - Output lists are sorted for determinism.
 func referenceUnblocksMap(issues []model.Issue) map[string][]string {
 	issueByID := make(map[string]model.Issue, len(issues))
@@ -38,7 +39,7 @@ func referenceUnblocksMap(issues []model.Issue) map[string][]string {
 				continue
 			}
 			if _, exists := issueByID[blockerID]; !exists {
-				continue // missing blockers do not block
+				continue // there is no known blocker whose completion can be simulated
 			}
 			if _, dup := seen[blockerID]; dup {
 				continue
@@ -54,14 +55,14 @@ func referenceUnblocksMap(issues []model.Issue) map[string][]string {
 
 	out := make(map[string][]string, len(issues))
 	for _, blocker := range issues {
-		if blocker.Status == model.StatusClosed {
+		if blocker.Status == model.StatusClosed || blocker.Status == model.StatusTombstone {
 			continue
 		}
 
 		var unblocks []string
 		for dependentID := range dependents[blocker.ID] {
 			dependent := issueByID[dependentID]
-			if dependent.Status == model.StatusClosed {
+			if dependent.Status != model.StatusOpen && dependent.Status != model.StatusInProgress {
 				continue
 			}
 
@@ -72,18 +73,19 @@ func referenceUnblocksMap(issues []model.Issue) map[string][]string {
 					continue
 				}
 				otherID := dep.DependsOnID
-				if otherID == "" || otherID == blocker.ID {
+				if otherID == blocker.ID {
 					continue
 				}
 				if _, exists := issueByID[otherID]; !exists {
-					continue
+					stillBlocked = true
+					break
 				}
 				if _, dup := seenOther[otherID]; dup {
 					continue
 				}
 				seenOther[otherID] = struct{}{}
 
-				if issueByID[otherID].Status != model.StatusClosed {
+				if status := issueByID[otherID].Status; status != model.StatusClosed && status != model.StatusTombstone {
 					stillBlocked = true
 					break
 				}
@@ -119,7 +121,7 @@ func TestBuildUnblocksMap_MatchesReference(t *testing.T) {
 		{ID: "C", Title: "Depends on A and X", Status: model.StatusInProgress, IssueType: model.TypeTask, Priority: 2,
 			Dependencies: []*model.Dependency{mkDep("C", "A", model.DepBlocks), mkDep("C", "X", model.DepBlocks)}},
 
-		// Missing blocker should be ignored; unblocked by A.
+		// Completing A does not prove the other missing blocker satisfied.
 		{ID: "D", Title: "Depends on A and missing", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
 			Dependencies: []*model.Dependency{mkDep("D", "A", model.DepBlocks), mkDep("D", "MISSING", model.DepBlocks)}},
 
@@ -138,6 +140,10 @@ func TestBuildUnblocksMap_MatchesReference(t *testing.T) {
 		// Closed dependent should never be returned in unblocks lists.
 		{ID: "G", Title: "Closed dependent", Status: model.StatusClosed, IssueType: model.TypeTask, Priority: 2,
 			Dependencies: []*model.Dependency{mkDep("G", "A", model.DepBlocks)}},
+
+		// Completing A does not move explicitly parked work back to open.
+		{ID: "H", Title: "Parked dependent", Status: model.StatusBlocked, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{mkDep("H", "A", model.DepBlocks)}},
 	}
 
 	analyzer := NewAnalyzer(issues)
@@ -148,7 +154,7 @@ func TestBuildUnblocksMap_MatchesReference(t *testing.T) {
 	want := referenceUnblocksMap(issues)
 
 	// Sanity-check the reference expectations (guards the guardrail).
-	if !reflect.DeepEqual(want["A"], []string{"B", "D", "F"}) {
+	if !reflect.DeepEqual(want["A"], []string{"B", "F"}) {
 		t.Fatalf("reference sanity failed for A: got %v", want["A"])
 	}
 	if want["X"] != nil && len(want["X"]) != 0 {

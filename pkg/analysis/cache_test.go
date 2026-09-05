@@ -17,6 +17,54 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
+func TestComputeIssueFingerprintFrozenEncoding(t *testing.T) {
+	stamp := time.Date(2026, 1, 2, 3, 4, 5, 123456789, time.FixedZone("source", 3*60*60))
+	empty := ""
+	zero := 0
+	zeroTime := time.Time{}
+	issue := model.Issue{
+		ID: "日本語\x00id", Title: "title\x00suffix", Description: strings.Repeat("日本語 🚀 e\u0301\x00", 700),
+		Design: "design", AcceptanceCriteria: "criteria", Notes: "notes", Assignee: "agent", SourceRepo: "source",
+		ExternalRef: &empty, Status: model.StatusDeferred, IssueType: model.TypeTask, Priority: -3,
+		EstimatedMinutes: &zero, CreatedAt: stamp, UpdatedAt: stamp.Add(time.Second),
+		DueDate: &zeroTime, DeferUntil: &stamp, ClosedAt: &stamp,
+		CompactionLevel: 2, CompactedAt: &stamp, CompactedAtCommit: &empty, OriginalSize: 90000,
+		Labels:       []string{"z", "日本語", "a\x00b"},
+		Comments:     []*model.Comment{nil, {ID: "comment", IssueID: "日本語\x00id", Author: "author", Text: "text\x00日本語", CreatedAt: stamp}},
+		Dependencies: []*model.Dependency{nil, {IssueID: "日本語\x00id", DependsOnID: "other\x00id", Type: model.DepBlocks, CreatedAt: stamp, CreatedBy: "author"}},
+	}
+	cases := []struct {
+		name  string
+		issue model.Issue
+		want  analysis.IssueFingerprint
+	}{
+		{"full", issue, analysis.IssueFingerprint{ID: issue.ID, ContentHash: "409f52831c37769a082b292147e99152f3e29f24f1e395ec5f240b628d2d261c", DependencyHash: "b89e88e96400f10e7296f0319cfba764cb78245c27bc64b7bba291c4b3c752d3"}},
+		{"empty", model.Issue{ID: "empty"}, analysis.IssueFingerprint{ID: "empty", ContentHash: "015275e61fa0d0751c1d9f45541c7804c895404455470710ade3786f282f2da0", DependencyHash: "none"}},
+		{"present-empty", model.Issue{ID: "empty", ExternalRef: &empty, EstimatedMinutes: &zero, DueDate: &zeroTime}, analysis.IssueFingerprint{ID: "empty", ContentHash: "a0cc0a4c136fec7227b35a22316e2378b008333354da97463122196231c33b8f", DependencyHash: "none"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := analysis.ComputeIssueFingerprint(tc.issue); got != tc.want {
+				t.Fatalf("canonical fingerprint changed: got %#v want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+func BenchmarkComputeIssueFingerprintText(b *testing.B) {
+	for _, size := range []int{64, 512, 10000, 100000} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			issue := model.Issue{ID: "hash", Title: "Unicode fingerprint", Description: strings.Repeat("日本語🚀\x00", size/14+1), Status: model.StatusOpen}
+			b.ReportAllocs()
+			b.SetBytes(int64(len(issue.Description)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				analysis.ComputeIssueFingerprint(issue)
+			}
+		})
+	}
+}
+
 // robotCacheEntryPath mirrors the v3 per-entry disk-cache layout (issue #192):
 // one JSON file per key, named by the first 16 bytes of sha256(key), under
 // <cacheDir>/analysis_cache/.

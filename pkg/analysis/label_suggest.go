@@ -231,6 +231,10 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 
 	// Convert to suggestions
 	suggestions := make([]Suggestion, 0, len(matches))
+	byID := make(map[string]model.Issue, len(issues))
+	for _, issue := range issues {
+		byID[issue.ID] = issue
+	}
 	for _, match := range matches {
 		sug := NewSuggestion(
 			SuggestionLabelSuggestion,
@@ -240,11 +244,7 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 			match.Confidence,
 		).WithMetadata("suggested_label", match.Label).
 			WithMetadata("matched_keywords", match.MatchedWords)
-		issueArg, issueOK := quoteBeadsCommandID(match.IssueID)
-		labelArg, labelOK := quoteBeadsFlagValue(match.Label)
-		if issueOK && labelOK {
-			sug = sug.WithAction(fmt.Sprintf("br update %s --add-label=%s", issueArg, labelArg))
-		}
+		sug = sug.withMutationAction(byID[match.IssueID], model.MutationAddLabel, nil, match.Label)
 
 		suggestions = append(suggestions, sug)
 	}

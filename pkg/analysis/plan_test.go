@@ -1,7 +1,10 @@
 package analysis_test
 
 import (
+	"reflect"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -372,7 +375,7 @@ func TestGetExecutionPlanItemHasDetails(t *testing.T) {
 
 func TestGetExecutionPlanMissingBlocker(t *testing.T) {
 	// A depends on "nonexistent" which doesn't exist
-	// Should NOT block A since the blocker doesn't exist
+	// Unknown dependency state must withhold A from an execution plan.
 	issues := []model.Issue{
 		{ID: "A", Title: "Task A", Status: model.StatusOpen, Priority: 1, Dependencies: []*model.Dependency{
 			{DependsOnID: "nonexistent", Type: model.DepBlocks},
@@ -382,12 +385,121 @@ func TestGetExecutionPlanMissingBlocker(t *testing.T) {
 	an := analysis.NewAnalyzer(issues)
 	plan := an.GetExecutionPlan()
 
-	// A should be actionable because the blocker doesn't exist
-	if plan.TotalActionable != 1 {
-		t.Errorf("Expected 1 actionable (missing blocker shouldn't block), got %d", plan.TotalActionable)
+	if plan.TotalActionable != 0 {
+		t.Errorf("Expected 0 actionable with an unknown blocker, got %d", plan.TotalActionable)
 	}
-	if plan.TotalBlocked != 0 {
-		t.Errorf("Expected 0 blocked, got %d", plan.TotalBlocked)
+	if plan.TotalBlocked != 1 {
+		t.Errorf("Expected 1 withheld issue, got %d", plan.TotalBlocked)
+	}
+	if len(plan.Tracks) != 0 || plan.Summary.HighestImpact != "" {
+		t.Errorf("Unknown blocker must not produce an execution item: %+v", plan)
+	}
+}
+
+func TestReadinessScopeUsesAuthorityAndSelectedCandidates(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	dep := func(id string, typ model.DependencyType) []*model.Dependency {
+		return []*model.Dependency{{DependsOnID: id, Type: typ}}
+	}
+	issues := []model.Issue{
+		{ID: "api-chain", Status: model.StatusOpen, Dependencies: dep("web", model.DepBlocks)},
+		{ID: "web", Status: model.StatusOpen, Dependencies: dep("ops", model.DepBlocks)},
+		{ID: "ops", Status: model.StatusOpen},
+		{ID: "api-ready", Status: model.StatusOpen, Dependencies: dep("done", model.DepBlocks)},
+		{ID: "done", Status: model.StatusClosed},
+		{ID: "api-child", Status: model.StatusOpen, Dependencies: dep("parent", model.DepParentChild)},
+		{ID: "parent", Status: model.StatusOpen, Dependencies: dep("ops", model.DepBlocks)},
+		{ID: "api-free-child", Status: model.StatusOpen, Dependencies: dep("free-parent", model.DepParentChild)},
+		{ID: "free-parent", Status: model.StatusOpen},
+		{ID: "api-missing", Status: model.StatusOpen, Dependencies: dep("missing", model.DepBlocks)},
+		{ID: "api-parked", Status: model.StatusBlocked},
+		{ID: "api-ongoing", Status: model.StatusInProgress},
+		{ID: "api-epic", Status: model.StatusOpen, IssueType: model.TypeEpic},
+		{ID: "api-assigned", Status: model.StatusOpen, Assignee: "owner"},
+	}
+	authority := model.NewReadinessIndex(issues)
+	selected := map[string]bool{}
+	var projected []model.Issue
+	for _, issue := range issues {
+		if len(issue.ID) >= 4 && issue.ID[:4] == "api-" {
+			selected[issue.ID] = true
+			projected = append(projected, issue)
+		}
+	}
+	global := analysis.NewAnalyzer(issues)
+	global.SetNow(now)
+	globalReady := getIDs(global.GetActionableIssues())
+	sort.Strings(globalReady)
+	wantGlobal := []string{"api-assigned", "api-epic", "api-free-child", "api-ongoing", "api-ready", "free-parent", "ops"}
+	if !reflect.DeepEqual(globalReady, wantGlobal) {
+		t.Fatalf("global fixture readiness = %v, want %v", globalReady, wantGlobal)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		visible    []model.Issue
+		candidates map[string]bool
+	}{
+		{"full graph retains exploratory context", issues, selected},
+		{"projection hides all external dependencies", projected, selected},
+		{"empty selection retains only exploratory context", issues, map[string]bool{}},
+		{"selection contains one blocked and one ready task", issues, map[string]bool{"api-chain": true, "api-ready": true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			an := analysis.NewAnalyzer(tc.visible)
+			an.SetNow(now)
+			an.SetReadinessScope(authority, tc.candidates)
+			var want []string
+			for _, id := range globalReady {
+				if tc.candidates[id] {
+					want = append(want, id)
+				}
+			}
+			var got []string
+			plan := an.GetExecutionPlan()
+			for _, track := range plan.Tracks {
+				for _, item := range track.Items {
+					got = append(got, item.ID)
+				}
+			}
+			sort.Strings(got)
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("scoped plan = %v, want global readiness intersect selection %v", got, want)
+			}
+			if plan.TotalActionable != len(want) || plan.TotalBlocked != len(tc.candidates)-len(want) {
+				t.Errorf("plan counts include context or lose withheld candidates: %+v", plan)
+			}
+			triage := analysis.ComputeTriageWithOptionsAndTime(tc.visible, analysis.TriageOptions{
+				Readiness: authority, CandidateIDs: tc.candidates, TopN: len(issues),
+			}, now)
+			if triage.QuickRef.ActionableCount != len(want) {
+				t.Errorf("triage ready count = %d, want %d", triage.QuickRef.ActionableCount, len(want))
+			}
+			var claimable []string
+			for _, recommendation := range triage.Recommendations {
+				if !tc.candidates[recommendation.ID] {
+					t.Errorf("context-only recommendation escaped scope: %s", recommendation.ID)
+				}
+				if recommendation.Claimable {
+					claimable = append(claimable, recommendation.ID)
+				}
+			}
+			sort.Strings(claimable)
+			var wantClaims []string
+			for _, id := range []string{"api-free-child", "api-ready"} {
+				if tc.candidates[id] {
+					wantClaims = append(wantClaims, id)
+				}
+			}
+			if !reflect.DeepEqual(claimable, wantClaims) {
+				t.Errorf("claimable recommendations = %v, want %v", claimable, wantClaims)
+			}
+			for _, pick := range triage.QuickRef.TopPicks {
+				if !contains(wantClaims, pick.ID) {
+					t.Errorf("top pick %s is outside proven selected claimable set %v", pick.ID, wantClaims)
+				}
+			}
+		})
 	}
 }
 

@@ -246,15 +246,11 @@ func DetectMissingDependencies(issues []model.Issue, config DependencySuggestion
 			match.Confidence,
 		).WithRelatedBead(match.To).
 			WithMetadata("shared_keywords", match.SharedKeywords)
-		fromArg, fromOK := quoteBeadsCommandID(match.From)
-		toArg, toOK := quoteBeadsCommandID(match.To)
-		if fromOK && toOK {
-			if canAdd, cyclePath, warning := CheckDependencyAddition(issues, match.From, match.To); canAdd {
-				sug = sug.WithAction(fmt.Sprintf("br dep add %s %s", fromArg, toArg))
-			} else {
-				sug = sug.WithMetadata("action_unavailable_reason", warning).
-					WithMetadata("cycle_path", cyclePath)
-			}
+		if canAdd, cyclePath, warning := CheckDependencyAddition(issues, match.From, match.To); canAdd {
+			sug = sug.withMutationAction(issues[idToIndex[match.From]], model.MutationAddDependency, &issues[idToIndex[match.To]], "")
+		} else {
+			sug = sug.WithMetadata("action_unavailable_reason", warning).
+				WithMetadata("cycle_path", cyclePath)
 		}
 
 		if len(match.SharedLabels) > 0 {

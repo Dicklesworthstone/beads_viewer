@@ -63,7 +63,7 @@ func (a *Analyzer) GetExecutionPlan() ExecutionPlan {
 	// Calculate totals
 	totalOpen := 0
 	for _, issue := range a.issueMap {
-		if !isClosedLikeStatus(issue.Status) {
+		if a.IsCandidate(issue.ID) && !isClosedLikeStatus(issue.Status) {
 			totalOpen++
 		}
 	}
@@ -117,52 +117,8 @@ func (a *Analyzer) computeUnblocks(issueID string) []string {
 // It is used by bounded what-if traversals where only a small affected frontier
 // needs to be checked.
 func (a *Analyzer) isActionableAfterCompletions(issueID string, completed map[string]bool) bool {
-	issue, ok := a.issueMap[issueID]
-	if !ok || completed[issueID] || isClosedLikeStatus(issue.Status) || issue.IsDeferredAt(a.now) {
-		return false
-	}
-	return !a.isBlockedAfterCompletions(issueID, completed, make(map[string]bool), 0)
-}
-
-// isBlockedAfterCompletions checks direct blocking dependencies and then
-// propagates a blocked parent down parent-child relationships. The traversal is
-// cycle-safe and uses the same depth bound as GetActionableIssues and br.
-func (a *Analyzer) isBlockedAfterCompletions(issueID string, completed, visiting map[string]bool, depth int) bool {
-	issue, ok := a.issueMap[issueID]
-	if !ok || completed[issueID] || isClosedLikeStatus(issue.Status) {
-		return false
-	}
-
-	for _, dep := range issue.Dependencies {
-		if dep == nil || !dep.Type.IsBlocking() {
-			continue
-		}
-		blocker, exists := a.issueMap[dep.DependsOnID]
-		if exists && !completed[dep.DependsOnID] && !isClosedLikeStatus(blocker.Status) {
-			return true
-		}
-	}
-
-	const maxParentBlockDepth = 50
-	if depth >= maxParentBlockDepth || visiting[issueID] {
-		return false
-	}
-	visiting[issueID] = true
-	defer delete(visiting, issueID)
-
-	for _, dep := range issue.Dependencies {
-		if dep == nil || dep.Type != model.DepParentChild {
-			continue
-		}
-		parent, exists := a.issueMap[dep.DependsOnID]
-		if !exists || completed[dep.DependsOnID] || isClosedLikeStatus(parent.Status) || visiting[parent.ID] {
-			continue
-		}
-		if a.isBlockedAfterCompletions(parent.ID, completed, visiting, depth+1) {
-			return true
-		}
-	}
-	return false
+	_, exists := a.issueMap[issueID]
+	return exists && a.IsCandidate(issueID) && a.Readiness().ReadyAfter(issueID, a.now, completed)
 }
 
 // ComputeUnblocks is an exported wrapper for computeUnblocks for consumers outside analysis.

@@ -268,19 +268,17 @@ type BetweennessResult struct {
 //   - "A Faster Algorithm for Betweenness Centrality" (Brandes, 2001)
 //   - "Approximating Betweenness Centrality" (Bader et al., 2007)
 func ApproxBetweenness(g graph.Directed, sampleSize int, seed int64) BetweennessResult {
-	return approxBetweenness(g, sampleSize, seed, false)
+	return approxBetweenness(g, sampleSize, seed, runtime.GOMAXPROCS(0))
 }
 
 // approxBetweennessDeterministic performs the same seeded sampling while
-// reducing pivot contributions in sample order. The ordinary implementation
-// keeps its parallel fast path; reproducible robot mode uses this serial
-// reduction because floating-point addition in goroutine completion order is
-// not associative and can otherwise change output bytes between runs.
+// computing and reducing pivot contributions serially. Both paths reduce in
+// sample order, so worker scheduling cannot change their floating-point scores.
 func approxBetweennessDeterministic(g graph.Directed, sampleSize int, seed int64) BetweennessResult {
-	return approxBetweenness(g, sampleSize, seed, true)
+	return approxBetweenness(g, sampleSize, seed, 1)
 }
 
-func approxBetweenness(g graph.Directed, sampleSize int, seed int64, deterministic bool) BetweennessResult {
+func approxBetweenness(g graph.Directed, sampleSize int, seed int64, workers int) BetweennessResult {
 	start := time.Now()
 	nodes := pooledNodesOf(g.Nodes())
 	defer putPooledNodes(nodes)
@@ -332,7 +330,8 @@ func approxBetweenness(g graph.Directed, sampleSize int, seed int64, determinist
 
 	// Compute partial betweenness from sampled pivots.
 	partialBC := make([]float64, n)
-	if deterministic {
+	workers = max(1, min(workers, len(pivots)))
+	if workers == 1 {
 		buf := brandesPool.Get().(*brandesBuffers)
 		for _, pivot := range pivots {
 			singleSourceBetweennessDense(adj, pivot, buf)
@@ -342,34 +341,37 @@ func approxBetweenness(g graph.Directed, sampleSize int, seed int64, determinist
 		}
 		brandesPool.Put(buf)
 	} else {
-		var mu sync.Mutex
+		// Bound each batch to one contribution buffer per worker. Even if an
+		// early pivot is slow, later results cannot accumulate O(sampleSize*n)
+		// storage. Buffers are reused only after the whole batch is reduced.
+		buffers := make([]*brandesBuffers, workers)
+		for worker := range buffers {
+			buffers[worker] = brandesPool.Get().(*brandesBuffers)
+		}
+		defer func() {
+			for _, buf := range buffers {
+				brandesPool.Put(buf)
+			}
+		}()
 		var wg sync.WaitGroup
-
-		// Limit concurrency to avoid excessive goroutines
-		sem := make(chan struct{}, runtime.NumCPU())
-
-		for _, pivot := range pivots {
-			wg.Add(1)
-			go func(sourceIdx int) {
-				defer wg.Done()
-				sem <- struct{}{} // Acquire token
-				defer func() { <-sem }()
-
-				buf := brandesPool.Get().(*brandesBuffers)
-				defer brandesPool.Put(buf)
-
-				// Compute local contribution into pooled buffers (buf.bc)
-				singleSourceBetweennessDense(adj, sourceIdx, buf)
-
-				// Merge into global result using visited nodes only.
-				mu.Lock()
+		for first := 0; first < len(pivots); first += workers {
+			count := min(workers, len(pivots)-first)
+			wg.Add(count)
+			for worker := 0; worker < count; worker++ {
+				go func(buf *brandesBuffers, pivot int) {
+					defer wg.Done()
+					singleSourceBetweennessDense(adj, pivot, buf)
+				}(buffers[worker], pivots[first+worker])
+			}
+			wg.Wait()
+			// Strict sample order matches the serial path, including sparse
+			// visited-node accumulation; floating-point addition is not associative.
+			for _, buf := range buffers[:count] {
 				for _, w := range buf.stack {
 					partialBC[w] += buf.bc[w]
 				}
-				mu.Unlock()
-			}(pivot)
+			}
 		}
-		wg.Wait()
 	}
 
 	// Scale up: BC_approx = BC_partial * (n / k)
