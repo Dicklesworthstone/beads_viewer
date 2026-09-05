@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2113,7 +2114,9 @@ func mustApplyRecipe(t *testing.T, issues []model.Issue, r *recipe.Recipe) []mod
 // (apply_test.go); this proves the CLI path routes every FilterConfig field,
 // the sort chain and view.max_items through that one engine.
 func TestApplyRecipe_FiltersSortAndLimitThroughSharedEngine(t *testing.T) {
-	now := time.Now()
+	// Own the relative-date clock instead of inheriting a packaging epoch.
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	t.Setenv("SOURCE_DATE_EPOCH", strconv.FormatInt(now.Unix(), 10))
 	issues := []model.Issue{
 		{ID: "A", Title: "Root", Status: model.StatusOpen, Priority: 2, CreatedAt: now, UpdatedAt: now},
 		{ID: "B", Title: "Blocked by A", Status: model.StatusOpen, Priority: 0, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),

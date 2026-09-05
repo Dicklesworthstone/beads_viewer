@@ -1126,7 +1126,6 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			analyzer := ctx.Analyzer()
-			analyzer.SetNow(robotNow())
 			stats := analyzer.Analyze()
 
 			openCount, closedCount, blockedCount := 0, 0, 0
@@ -1140,7 +1139,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					openCount++
 				}
 			}
-			actionableCount := len(analyzer.GetActionableIssues())
+			actionableCount := analyzer.CountActionableIssues()
 			cycles := stats.Cycles()
 			curStats := baseline.GraphStats{
 				NodeCount:       stats.NodeCount,
@@ -1175,8 +1174,11 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			calc := drift.NewCalculator(bl, cur, driftConfig)
-			calc.SetNow(robotNow())
+			calc.SetNow(analyzer.Now())
 			calc.SetIssues(ctx.Issues)
+			if !calc.ReuseAnalyzer(analyzer) {
+				return fmt.Errorf("preparing alerts: issue rows do not match the scoped analyzer")
+			}
 			driftResult := calc.Calculate()
 
 			filtered := driftResult.Alerts[:0]

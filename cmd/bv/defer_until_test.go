@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,10 @@ import (
 // bead whose defer_until is still in the future — the closest bv analog to
 // `br ready` — while an elapsed or absent deferral keeps it visible.
 func TestApplyRecipeFilters_ActionableHonoursDeferUntil(t *testing.T) {
-	now := time.Now()
+	// The fixture and CLI must share a clock even when the build environment
+	// supplies SOURCE_DATE_EPOCH (as Nix does).
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	t.Setenv("SOURCE_DATE_EPOCH", strconv.FormatInt(now.Unix(), 10))
 	future := now.Add(90 * 24 * time.Hour)
 	elapsed := now.Add(-time.Minute)
 	// RFC3339 with a non-UTC offset, parsed the way JSONL records arrive.

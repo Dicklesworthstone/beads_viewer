@@ -4105,7 +4105,7 @@ func main() {
 			} else {
 				// Generate commands for each recommendation
 				for i, rec := range recs {
-					sb.WriteString(fmt.Sprintf("# %d. %s (score: %.3f)\n", i+1, strings.NewReplacer("\n", " ", "\r", " ").Replace(rec.Title), rec.Score))
+					sb.WriteString(fmt.Sprintf("# %d. %s (score: %.3f)\n", i+1, strings.NewReplacer("\n", " ", "\r", " ").Replace(rec.ID+": "+rec.Title), rec.Score))
 					if len(rec.Reasons) > 0 {
 						sb.WriteString(fmt.Sprintf("#    Reason: %s\n", strings.NewReplacer("\n", " ", "\r", " ").Replace(rec.Reasons[0])))
 					}
