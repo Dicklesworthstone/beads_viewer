@@ -10,6 +10,96 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
+func TestAnalyzerMatchesIssuesRequiresExactUnambiguousRows(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	minutes := 15
+	rows := []model.Issue{
+		{ID: "z", Title: "日本語\x00🙂", Labels: []string{"z", "a"}, EstimatedMinutes: &minutes,
+			Origin: &model.IssueOrigin{Database: "/actual/source"}, DeferUntil: &now,
+			Comments: []*model.Comment{nil, {Text: "comment"}}, Dependencies: []*model.Dependency{nil, {DependsOnID: "a", Type: model.DepBlocks}}},
+		{ID: "a", Status: model.StatusClosed, Labels: []string{}},
+	}
+	a := analysis.NewAnalyzer(rows)
+	if !a.MatchesIssues([]model.Issue{rows[1], rows[0]}) {
+		t.Fatal("equal rows in different outer order rejected")
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func([]model.Issue)
+	}{
+		{"label-order", func(r []model.Issue) { r[0].Labels[0], r[0].Labels[1] = r[0].Labels[1], r[0].Labels[0] }},
+		{"nil-versus-empty", func(r []model.Issue) { r[1].Labels = nil }},
+		{"dependency", func(r []model.Issue) { r[0].Dependencies[1].DependsOnID = "missing" }},
+		{"comment", func(r []model.Issue) { r[0].Comments[1].Text = "changed" }},
+		{"estimate-pointer", func(r []model.Issue) { *r[0].EstimatedMinutes++ }},
+		{"clock-pointer", func(r []model.Issue) { *r[0].DeferUntil = now.Add(time.Hour) }},
+		{"origin", func(r []model.Issue) { r[0].Origin.Database = "/different/source" }},
+		{"embedded-nul", func(r []model.Issue) { r[0].Title = "日本語🙂" }},
+		{"duplicate", func(r []model.Issue) { r[1] = r[0] }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := []model.Issue{rows[0].Clone(), rows[1].Clone()}
+			tc.mutate(changed)
+			if a.MatchesIssues(changed) {
+				t.Fatal("different rows accepted")
+			}
+			if !a.MatchesIssues(rows) {
+				t.Fatal("validation mutated source")
+			}
+		})
+	}
+	duplicate := []model.Issue{rows[0], rows[0]}
+	if analysis.NewAnalyzer(duplicate).MatchesIssues(duplicate) || a.MatchesIssues(rows[:1]) {
+		t.Fatal("ambiguous or missing row accepted")
+	}
+	if !analysis.NewAnalyzer(nil).MatchesIssues([]model.Issue{}) {
+		t.Fatal("empty sources differ")
+	}
+}
+
+func TestCountActionableIssuesMatchesScopedMaterializedResults(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "open", Status: model.StatusOpen},
+		{ID: "owned", Status: model.StatusInProgress},
+		{ID: "parked", Status: model.StatusBlocked},
+		{ID: "later", Status: model.StatusOpen, DeferUntil: &future},
+		{ID: "missing", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "absent", Type: model.DepBlocks}}},
+		{ID: "safe", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "hidden", Type: model.DepBlocks}}},
+		{ID: "cycle-a", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "cycle-b", Type: model.DepBlocks}}},
+		{ID: "cycle-b", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "cycle-a", Type: model.DepBlocks}}},
+	}
+	authorityIssues := append(append([]model.Issue(nil), issues...), model.Issue{ID: "hidden", Status: model.StatusTombstone})
+	for _, tc := range []struct {
+		name       string
+		candidates map[string]bool
+		now        time.Time
+		want       int
+	}{
+		{"all", nil, now, 3},
+		{"after-deferral", nil, future, 4},
+		{"scoped", map[string]bool{"open": true, "later": true, "missing": true}, now, 1},
+		{"scoped-after-deferral", map[string]bool{"open": true, "later": true, "missing": true}, future, 2},
+		{"empty-scope", map[string]bool{}, now, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := analysis.NewAnalyzer(issues)
+			a.SetReadinessScope(model.NewReadinessIndex(authorityIssues), tc.candidates)
+			a.SetNow(tc.now)
+			if got, materialized := a.CountActionableIssues(), len(a.GetActionableIssues()); got != tc.want || got != materialized {
+				t.Fatalf("count=%d materialized=%d want=%d", got, materialized, tc.want)
+			}
+			if allocs := testing.AllocsPerRun(25, func() { a.CountActionableIssues() }); allocs != 0 {
+				t.Fatalf("count materialized issue data: %g allocations", allocs)
+			}
+		})
+	}
+	if got := analysis.NewAnalyzer(nil).CountActionableIssues(); got != 0 {
+		t.Fatalf("empty analyzer count=%d", got)
+	}
+}
+
 // Helper to extract IDs from issues and sort them for comparison
 func getIDs(issues []model.Issue) []string {
 	ids := make([]string, len(issues))

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -1365,6 +1366,33 @@ func (a *Analyzer) SetNow(now time.Time) {
 // Now returns the analyzer's reference instant for readiness and scoring.
 func (a *Analyzer) Now() time.Time {
 	return a.now
+}
+
+// MatchesIssues checks exact source rows independently of their outer ordering.
+// Unlike DataHash, this preserves nested ordering and nil/empty distinctions.
+// Duplicate IDs are rejected because they cannot identify one unambiguous row.
+// Callers must not mutate issues while this check runs.
+func (a *Analyzer) MatchesIssues(issues []model.Issue) bool {
+	if a == nil || len(issues) != len(a.issues) {
+		return false
+	}
+	rows := make(map[string]*model.Issue, len(a.issues))
+	for i := range a.issues {
+		row := &a.issues[i]
+		if _, exists := rows[row.ID]; exists {
+			return false
+		}
+		rows[row.ID] = row
+	}
+	for i := range issues {
+		row := &issues[i]
+		source, exists := rows[row.ID]
+		if !exists || !reflect.DeepEqual(source, row) {
+			return false
+		}
+		delete(rows, row.ID)
+	}
+	return true
 }
 
 // SeedDataHash records a pre-computed ComputeDataHash for the analyzer's input
@@ -2783,6 +2811,18 @@ func (a *Analyzer) GetActionableIssues() []model.Issue {
 		issues[i] = issues[i].Clone()
 	}
 	return issues
+}
+
+// CountActionableIssues uses the same readiness and candidate contract without
+// sorting IDs or cloning issue bodies for consumers that only need a count.
+func (a *Analyzer) CountActionableIssues() int {
+	count := 0
+	for id := range a.issueMap {
+		if a.isActionableAfterCompletions(id, nil) {
+			count++
+		}
+	}
+	return count
 }
 
 // getActionableIssuesAfterCompletions applies the canonical readiness rules

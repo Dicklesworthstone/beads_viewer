@@ -251,8 +251,29 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 	// Factor weights: defaults unless SetWeights applied feedback-adjusted ones.
 	w := a.Weights()
 
-	// Compute impact scores from stats
-	var scores []ImpactScore
+	// Reserve only rows that receive a score. Fully closed graphs retain a nil
+	// result without allocating a backing array for excluded context rows.
+	scoreCount := 0
+	if len(a.issues) == len(a.issueMap) {
+		// The immutable source has no duplicates. Indexing avoids copying each
+		// large issue value just to read its status on mostly-closed graphs.
+		for i := range a.issues {
+			if !isClosedLikeStatus(a.issues[i].Status) {
+				scoreCount++
+			}
+		}
+	} else {
+		// Duplicate IDs use the same final row as score emission below.
+		for _, issue := range a.issueMap {
+			if !isClosedLikeStatus(issue.Status) {
+				scoreCount++
+			}
+		}
+	}
+	if scoreCount == 0 {
+		return nil
+	}
+	scores := make([]ImpactScore, 0, scoreCount)
 
 	for id, issue := range a.issueMap {
 		// Skip closed/tombstone issues

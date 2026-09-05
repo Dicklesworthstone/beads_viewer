@@ -40,7 +40,7 @@ type AnalysisConfig struct {
 	HITSTimeout    time.Duration
 	HITSSkipReason string
 
-	// Cycle detection (potentially exponential)
+	// Representative cycles from strongly connected components (not full enumeration)
 	ComputeCycles    bool
 	CyclesTimeout    time.Duration
 	MaxCyclesToStore int
@@ -91,10 +91,10 @@ func DefaultConfig() AnalysisConfig {
 // Larger graphs get more aggressive timeouts and may use approximate algorithms.
 //
 // Size tiers:
-//   - Small (<100 nodes): Full analysis with exact algorithms, generous timeouts
-//   - Medium (100-500 nodes): Exact algorithms with standard timeouts
-//   - Large (500-2000 nodes): Approximate betweenness for sparse graphs, skip for dense
-//   - XL (>2000 nodes): Approximate betweenness, skip cycles and HITS for dense graphs
+//   - Small (<100 nodes): Exact betweenness, generous timeouts
+//   - Medium (100-499 nodes): Exact betweenness with standard timeouts
+//   - Large (500-1999 nodes): Approximate betweenness for sparse graphs, skip for dense
+//   - XL (>=2000 nodes): Approximate betweenness, skip cycles and HITS for dense graphs
 func ConfigForSize(nodeCount, edgeCount int) AnalysisConfig {
 	density := 0.0
 	if nodeCount > 1 {

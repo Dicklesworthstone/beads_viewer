@@ -1,12 +1,134 @@
 package analysis_test
 
 import (
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 )
+
+func TestImpactScoresRetainContextRowsAndNilResults(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	rows := []model.Issue{
+		{ID: "open", Status: model.StatusOpen},
+		{ID: "closed", Status: model.StatusClosed},
+		{ID: "owned", Status: model.StatusInProgress},
+		{ID: "parked", Status: model.StatusBlocked},
+		{ID: "later", Status: model.StatusOpen, DeferUntil: &future},
+		{ID: "deleted", Status: model.StatusTombstone},
+		{ID: "custom", Status: model.Status("custom")},
+	}
+	for i := range rows {
+		rows[i].Title = "日本語\x00🙂 " + rows[i].ID
+		rows[i].Priority = i % 5
+		rows[i].UpdatedAt = now
+	}
+	for _, tc := range []struct {
+		name    string
+		rows    []model.Issue
+		wantIDs []string
+	}{
+		{"nil", nil, nil},
+		{"empty", []model.Issue{}, nil},
+		{"closed-and-deleted", []model.Issue{rows[1], rows[5]}, nil},
+		{"context-includes-withheld", rows, []string{"custom", "later", "open", "owned", "parked"}},
+		{"duplicate-last-row-closed", []model.Issue{rows[0], {ID: "open", Status: model.StatusClosed}}, nil},
+		{"duplicate-last-row-open", []model.Issue{{ID: "open", Status: model.StatusClosed}, rows[0]}, []string{"open"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := analysis.NewAnalyzer(tc.rows)
+			a.SetNow(now)
+			// Output eligibility does not remove context from impact scoring.
+			a.SetReadinessScope(model.NewReadinessIndex(tc.rows), map[string]bool{})
+			weights := analysis.DefaultWeights()
+			weights.PageRank += .05
+			weights.PriorityBoost -= .05
+			a.SetWeights(weights)
+			stats := a.AnalyzeWithConfig(analysis.AnalysisConfig{})
+			got := a.ComputeImpactScoresFromStats(&stats, now)
+			if len(tc.wantIDs) == 0 && got != nil {
+				t.Fatalf("empty result changed from nil: %#v", got)
+			}
+			var ids []string
+			for _, score := range got {
+				ids = append(ids, score.IssueID)
+				row := a.GetIssue(score.IssueID)
+				if row == nil || score.Status != string(row.Status) || score.Title != row.Title || score.Priority != row.Priority {
+					t.Fatalf("impact row lost exact metadata: %+v", score)
+				}
+			}
+			sort.Strings(ids)
+			if !reflect.DeepEqual(ids, tc.wantIDs) {
+				t.Fatalf("impact IDs=%v want %v", ids, tc.wantIDs)
+			}
+			// Rebuild the unique source in the opposite order. Reuse the same
+			// completed stats and exact captured weights to isolate ordering.
+			var reversed []model.Issue
+			for i := len(ids) - 1; i >= 0; i-- {
+				reversed = append(reversed, *a.GetIssue(ids[i]))
+			}
+			// Closed context contributes to graph/risk normalization, so retain it.
+			for _, row := range tc.rows {
+				current := a.GetIssue(row.ID)
+				if current != nil && (current.Status == model.StatusClosed || current.Status == model.StatusTombstone) {
+					reversed = append(reversed, *current)
+				}
+			}
+			other := analysis.NewAnalyzer(reversed)
+			other.RestoreScoring(a.CaptureScoring())
+			if want := other.ComputeImpactScoresFromStats(&stats, now); !reflect.DeepEqual(got, want) {
+				t.Fatalf("same stats/scoring changed exact output after source permutation: got %#v want %#v", got, want)
+			}
+		})
+	}
+}
+
+func BenchmarkImpactScoreCapacity(b *testing.B) {
+	for _, tc := range []struct {
+		name string
+		kind string
+		size int
+	}{
+		{"realistic-1000", "realistic", 1000},
+		{"realistic-5000", "realistic", 5000},
+		{"realistic-10000", "realistic", 10000},
+		{"unicode-10000", "unicode", 10000},
+		{"mostly-closed-10000", "mostly-closed", 10000},
+		{"all-closed-10000", "realistic", 10000},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			rows, err := testutil.PerformanceIssues(tc.kind, tc.size, 20260904)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if tc.name == "all-closed-10000" {
+				for i := range rows {
+					rows[i].Status = model.StatusClosed
+				}
+			}
+			a := analysis.NewAnalyzer(rows)
+			now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+			a.SetNow(now)
+			stats := a.AnalyzeWithConfig(analysis.AnalysisConfig{})
+			want := a.ComputeImpactScoresFromStats(&stats, now)
+			b.ReportAllocs()
+			b.ResetTimer()
+			var got []analysis.ImpactScore
+			for i := 0; i < b.N; i++ {
+				got = a.ComputeImpactScoresFromStats(&stats, now)
+			}
+			b.StopTimer()
+			if !reflect.DeepEqual(got, want) {
+				b.Fatalf("exact impact output changed for %s", tc.name)
+			}
+		})
+	}
+}
 
 func TestComputeImpactScoresEmpty(t *testing.T) {
 	an := analysis.NewAnalyzer([]model.Issue{})

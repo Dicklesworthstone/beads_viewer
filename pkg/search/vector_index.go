@@ -145,6 +145,12 @@ func LoadVectorIndex(path string) (*VectorIndex, error) {
 	}
 
 	idx := NewVectorIndex(int(dimU32))
+	// The validated dimension bounds this reusable buffer to 4 MiB. Read one
+	// vector at a time: scalar binary.Read allocates for every component.
+	var vectorBytes []byte
+	if count > 0 {
+		vectorBytes = make([]byte, idx.Dim*4)
+	}
 	for i := uint32(0); i < count; i++ {
 		var idLen uint16
 		if err := binary.Read(r, binary.LittleEndian, &idLen); err != nil {
@@ -168,13 +174,12 @@ func LoadVectorIndex(path string) (*VectorIndex, error) {
 			return nil, fmt.Errorf("read content hash: %w", err)
 		}
 
+		if _, err := io.ReadFull(r, vectorBytes); err != nil {
+			return nil, fmt.Errorf("read vector: %w", err)
+		}
 		vec := make([]float32, idx.Dim)
-		for j := 0; j < idx.Dim; j++ {
-			var bits uint32
-			if err := binary.Read(r, binary.LittleEndian, &bits); err != nil {
-				return nil, fmt.Errorf("read vector: %w", err)
-			}
-			vec[j] = math.Float32frombits(bits)
+		for j := range vec {
+			vec[j] = math.Float32frombits(binary.LittleEndian.Uint32(vectorBytes[j*4:]))
 		}
 
 		if err := idx.Upsert(issueID, ch, vec); err != nil {
@@ -275,6 +280,10 @@ func (idx *VectorIndex) Save(path string) error {
 		return fmt.Errorf("write count: %w", err)
 	}
 
+	var vectorBytes []byte
+	if len(ids) > 0 {
+		vectorBytes = make([]byte, idx.Dim*4)
+	}
 	for _, issueID := range ids {
 		entry, ok := idx.entries[issueID]
 		if !ok {
@@ -290,10 +299,11 @@ func (idx *VectorIndex) Save(path string) error {
 		if _, err := w.Write(entry.ContentHash[:]); err != nil {
 			return fmt.Errorf("write content hash: %w", err)
 		}
-		for _, v := range entry.Vector {
-			if err := binary.Write(w, binary.LittleEndian, math.Float32bits(v)); err != nil {
-				return fmt.Errorf("write vector: %w", err)
-			}
+		for j, v := range entry.Vector {
+			binary.LittleEndian.PutUint32(vectorBytes[j*4:], math.Float32bits(v))
+		}
+		if _, err := w.Write(vectorBytes); err != nil {
+			return fmt.Errorf("write vector: %w", err)
 		}
 	}
 

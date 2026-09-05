@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -35,6 +36,70 @@ func TestIssueOriginsRejectUnknownTrackerBackend(t *testing.T) {
 	actions := issues[0].Actions(true)
 	if actions.Show != nil || actions.Claim != nil || !strings.Contains(actions.UnavailableReason, "unsupported tracker backend") {
 		t.Fatalf("unknown backend borrowed br authority: %+v", actions)
+	}
+}
+
+func TestIssueOriginsStyledTrackerCapabilities(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("controlled tracker help fixture uses a POSIX executable")
+	}
+	for _, tc := range []struct {
+		name      string
+		flags     string
+		wantRoute bool
+		wantClaim bool
+	}{
+		{"supported", "--db --json --no-auto-import --no-auto-flush --claim", true, true},
+		{"no claim", "--db --json --no-auto-import --no-auto-flush", true, false},
+		{"missing database", "--json --no-auto-import --no-auto-flush --claim", false, false},
+		{"missing json", "--db --no-auto-import --no-auto-flush --claim", false, false},
+		{"missing import control", "--db --json --no-auto-flush --claim", false, false},
+		{"missing flush control", "--db --json --no-auto-import --claim", false, false},
+		{"different flag token", "--db-other --json --no-auto-import --no-auto-flush --claim", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			beadsDir := filepath.Join(root, ".beads")
+			if err := os.Mkdir(beadsDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for name, data := range map[string]string{
+				"metadata.json": `{"backend":"sqlite","database":"beads.db","jsonl_export":"issues.jsonl"}`,
+				"beads.db":      "capability-routing fixture; no tracker commands execute against this file",
+				"issues.jsonl":  "",
+			} {
+				if err := os.WriteFile(filepath.Join(beadsDir, name), []byte(data), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The fixture only implements help. Real installed tracker routes are
+			// exercised separately by TestRobotActionRoutesLiveTrackers.
+			help := "#!/bin/sh\n[ \"$1\" = update ] && [ \"$2\" = --help ] && [ \"$#\" = 2 ] || exit 17\n"
+			for _, flag := range strings.Fields(tc.flags) {
+				help += "printf '\\033[1m" + flag + "\\033[0m <VALUE>\\n'\n"
+			}
+			executable := filepath.Join(root, "br")
+			if err := os.WriteFile(executable, []byte(help), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", root)
+			issues := []model.Issue{{ID: "local-1", Title: "Readable analysis"}}
+			loader.AttachIssueOrigins(issues, filepath.Join(beadsDir, "issues.jsonl"), true)
+			actions := issues[0].Actions(true)
+			if tc.wantRoute {
+				if actions.Show == nil || (actions.Claim != nil) != tc.wantClaim || actions.WorkingDirectory != root {
+					t.Fatalf("styled supported flags lost exact source route: %+v", actions)
+				}
+				database := filepath.Join(beadsDir, "beads.db")
+				wantArgv := []string{"env", "BEADS_DIR=" + beadsDir, "BEADS_DB=" + database, "BD_DB=" + database,
+					executable, "--db", database, "--no-auto-import", "--no-auto-flush", "show", "--json", "--", "local-1"}
+				if !reflect.DeepEqual(actions.Show.Argv, wantArgv) {
+					t.Fatalf("styled help changed exact inspection route: got %q, want %q", actions.Show.Argv, wantArgv)
+				}
+			} else if actions.Show != nil || actions.Claim != nil || !strings.Contains(actions.UnavailableReason, "required explicit database route") {
+				t.Fatalf("absent exact capability gained a source route: %+v", actions)
+			}
+		})
 	}
 }
 

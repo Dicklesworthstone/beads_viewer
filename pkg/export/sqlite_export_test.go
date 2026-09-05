@@ -59,6 +59,51 @@ func TestSetGitHash(t *testing.T) {
 	}
 }
 
+func TestWriteRobotJSONPreservesPayloadTimestamp(t *testing.T) {
+	const precise = "2026-09-05T02:00:00.123456789Z"
+	const envelopeTime = "2026-09-05T02:00:00Z"
+	for _, tc := range []struct {
+		name    string
+		payload map[string]any
+		want    string
+	}{
+		{"precise payload", map[string]any{"generated_at": precise, "issue_count": 2}, precise},
+		{"envelope fallback", map[string]any{"issue_count": 2}, envelopeTime},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exporter := NewSQLiteExporter(nil, nil, nil, nil)
+			exporter.Config.RobotEnvelope = map[string]json.RawMessage{
+				"generated_at":     json.RawMessage(`"` + envelopeTime + `"`),
+				"source_authority": json.RawMessage(`{"state":"partial","claim_safe":false}`),
+				"authority_hash":   json.RawMessage(`"source-fingerprint"`),
+			}
+			path := filepath.Join(t.TempDir(), "meta.json")
+			if err := exporter.writeRobotJSON(path, tc.payload); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got struct {
+				GeneratedAt   string `json:"generated_at"`
+				IssueCount    int    `json:"issue_count"`
+				AuthorityHash string `json:"authority_hash"`
+				Authority     struct {
+					State     string `json:"state"`
+					ClaimSafe bool   `json:"claim_safe"`
+				} `json:"source_authority"`
+			}
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.GeneratedAt != tc.want || got.IssueCount != 2 || got.AuthorityHash != "source-fingerprint" || got.Authority.State != "partial" || got.Authority.ClaimSafe {
+				t.Fatalf("payload timestamp or shared authority changed: got %s, want timestamp %q, count2 and partial authority", data, tc.want)
+			}
+		})
+	}
+}
+
 func TestExport_CreatesDatabase(t *testing.T) {
 	tmpDir := t.TempDir()
 

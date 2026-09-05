@@ -1,10 +1,13 @@
 package search
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -43,6 +46,134 @@ func TestVectorIndex_SaveLoad_RoundTrip(t *testing.T) {
 	}
 	if len(a.Vector) != 4 || a.Vector[0] != 1 {
 		t.Fatalf("Vector mismatch for A: %#v", a.Vector)
+	}
+}
+
+// Encode the published version-1 layout independently, using the original
+// scalar binary writer. Comparing bytes catches a matching reader/writer bug
+// that a round trip alone would miss.
+func scalarVectorIndexBytes(t *testing.T, dim int, ids []string, vectors [][]float32) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	out.WriteString("BVVI")
+	write := func(value any) {
+		t.Helper()
+		if err := binary.Write(&out, binary.LittleEndian, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(uint16(1))
+	write(uint16(0))
+	write(uint32(dim))
+	write(uint32(len(ids)))
+	for i, id := range ids {
+		write(uint16(len(id)))
+		out.WriteString(id)
+		hash := ComputeContentHash(id)
+		out.Write(hash[:])
+		for _, value := range vectors[i] {
+			write(math.Float32bits(value))
+		}
+	}
+	return out.Bytes()
+}
+
+func TestVectorIndexBinaryFormatExact(t *testing.T) {
+	for _, dim := range []int{1, 17, 2048} {
+		t.Run(fmt.Sprint(dim), func(t *testing.T) {
+			ids := []string{"A", "z-last", "é/third"}
+			patterns := []uint32{0, 0x80000000, 1, 0x80000001, 0x007fffff, 0x00800000, 0x3f800000, 0xbf800000, 0x7f7fffff, 0xff7fffff, 0x3eaaaaab}
+			vectors := make([][]float32, len(ids))
+			idx := NewVectorIndex(dim)
+			for i := len(ids) - 1; i >= 0; i-- {
+				vectors[i] = make([]float32, dim)
+				for j := range vectors[i] {
+					vectors[i][j] = math.Float32frombits(patterns[(i+j)%len(patterns)])
+				}
+				if err := idx.Upsert(ids[i], ComputeContentHash(ids[i]), vectors[i]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := scalarVectorIndexBytes(t, dim, ids, vectors)
+			dir := t.TempDir()
+			path := filepath.Join(dir, "saved.bvvi")
+			if err := idx.Save(path); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("version-1 bytes changed: dim=%d got=%d bytes want=%d err=%v", dim, len(got), len(want), err)
+			}
+			// Load the independent scalar bytes, not output from Save.
+			scalarPath := filepath.Join(dir, "scalar.bvvi")
+			if err := os.WriteFile(scalarPath, want, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := LoadVectorIndex(scalarPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loaded.Dim != dim || loaded.Size() != len(ids) {
+				t.Fatalf("loaded dim=%d size=%d, want dim=%d size=%d", loaded.Dim, loaded.Size(), dim, len(ids))
+			}
+			for i, id := range ids {
+				entry, ok := loaded.Get(id)
+				if !ok || entry.ContentHash != ComputeContentHash(id) || len(entry.Vector) != dim {
+					t.Fatalf("loaded entry %q is missing or changed: %+v", id, entry)
+				}
+				for j, value := range vectors[i] {
+					if math.Float32bits(entry.Vector[j]) != math.Float32bits(value) {
+						t.Fatalf("%s[%d] bits=%08x want=%08x", id, j, math.Float32bits(entry.Vector[j]), math.Float32bits(value))
+					}
+				}
+			}
+		})
+	}
+	// An empty index still writes exactly its header, including at the largest
+	// accepted dimension; no vector body is needed.
+	for _, dim := range []int{1, int(maxVectorIndexDimension)} {
+		idx := NewVectorIndex(dim)
+		path := filepath.Join(t.TempDir(), "empty.bvvi")
+		if err := idx.Save(path); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, scalarVectorIndexBytes(t, dim, nil, nil)) {
+			t.Fatalf("empty index format changed at dim=%d: %v", dim, err)
+		}
+		loaded, err := LoadVectorIndex(path)
+		if err != nil || loaded.Dim != dim || loaded.Size() != 0 {
+			t.Fatalf("empty index load changed at dim=%d: %+v %v", dim, loaded, err)
+		}
+	}
+}
+
+func TestVectorIndexBinaryBodyRejectsTruncationAndNonFinite(t *testing.T) {
+	// A long ID leaves enough bytes to pass the minimum-body-size check even
+	// when the vector is truncated. This exercises actual vector read errors.
+	const dim = 17
+	id := strings.Repeat("long-id-", 8)
+	data := scalarVectorIndexBytes(t, dim, []string{id}, [][]float32{make([]float32, dim)})
+	path := filepath.Join(t.TempDir(), "body.bvvi")
+	for length := 0; length < len(data); length++ {
+		if err := os.WriteFile(path, data[:length], 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadVectorIndex(path); err == nil {
+			t.Fatalf("accepted truncated version-1 file: bytes=%d of %d", length, len(data))
+		} else if length >= len(data)-4 && !strings.Contains(err.Error(), "read vector") {
+			t.Fatalf("last-component truncation missed vector read: bytes=%d err=%v", length, err)
+		}
+	}
+	for _, bits := range []uint32{0x7f800000, 0xff800000, 0x7fc00001} {
+		malformed := bytes.Clone(data)
+		binary.LittleEndian.PutUint32(malformed[len(malformed)-4:], bits)
+		if err := os.WriteFile(path, malformed, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadVectorIndex(path); err == nil || err.Error() != fmt.Sprintf("vector component %d must be finite", dim-1) {
+			t.Fatalf("accepted non-finite last component %08x or wrong error: %v", bits, err)
+		}
 	}
 }
 

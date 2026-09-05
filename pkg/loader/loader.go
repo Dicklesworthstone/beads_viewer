@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/x/ansi"
 	json "github.com/goccy/go-json"
 
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
@@ -68,7 +69,9 @@ func installedTrackerCapabilities(tracker string) trackerCapabilities {
 	if err != nil {
 		caps.Error = "cannot establish installed tracker capabilities"
 	} else {
-		fields := strings.Fields(string(help))
+		// Trackers may honor inherited forced-color settings even when help is
+		// piped. Styling must not change exact capability-token recognition.
+		fields := strings.Fields(ansi.Strip(string(help)))
 		has := func(flag string) bool {
 			for _, field := range fields {
 				if field == flag {

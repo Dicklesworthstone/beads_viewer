@@ -560,6 +560,14 @@ func (e *SQLiteExporter) writeRobotJSON(path string, payload any) error {
 		return fmt.Errorf("reading export payload fields: %w", err)
 	}
 	for key, value := range e.Config.RobotEnvelope {
+		// A payload may record its own generation instant with nanosecond
+		// precision. Keep that value instead of replacing it with the shared
+		// analysis timestamp; payloads without one still inherit the envelope.
+		if key == "generated_at" {
+			if _, present := fields[key]; present {
+				continue
+			}
+		}
 		fields[key] = value
 	}
 	return writeJSON(path, fields)
