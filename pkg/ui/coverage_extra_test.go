@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -713,42 +715,87 @@ func TestOpenInEditorTerminalEditorGuard(t *testing.T) {
 }
 
 func TestOpenInEditorWithArguments(t *testing.T) {
-	// Test that EDITOR with arguments (e.g., "cursor -w") works correctly
-	// This tests the fix for GitHub issue #47
-	if runtime.GOOS == "windows" {
-		t.Skip("shell execution test unreliable on Windows CI")
-	}
+	// GUI editor arguments must be parsed without treating the entire command
+	// as an executable name (GitHub #47). The allowlisted GUI launch contract
+	// supplies only the target path; terminal editors retain user arguments.
 	tmp := t.TempDir()
-	oldCwd, _ := os.Getwd()
-	defer os.Chdir(oldCwd)
-	_ = os.MkdirAll(filepath.Join(tmp, ".beads"), 0755)
-	_ = os.WriteFile(filepath.Join(tmp, ".beads", "beads.jsonl"), []byte("{}"), 0644)
-	_ = os.Chdir(tmp)
+	beadsFile := filepath.Join(tmp, "issues with spaces.jsonl")
+	if err := os.WriteFile(beadsFile, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	capture := installTestGUIEditor(t)
+	t.Setenv("EDITOR", "gedit --wait")
 
-	origEditor := os.Getenv("EDITOR")
-	defer os.Setenv("EDITOR", origEditor)
-
-	// Test with EDITOR containing arguments - "true" is a POSIX command that just exits 0
-	// Using "true --" simulates EDITOR with arguments like "cursor -w"
-	_ = os.Setenv("EDITOR", "true --")
-
-	m := NewModel(nil, nil, "")
+	m := NewModel(nil, nil, beadsFile)
 	m.openInEditor()
-	// Should succeed - the shell should parse "true --" correctly
 	if m.statusIsError {
 		t.Fatalf("expected success with EDITOR containing arguments, got error: %q", m.statusMsg)
 	}
 	if !strings.Contains(m.statusMsg, "Opened in") {
 		t.Fatalf("expected 'Opened in' message, got %q", m.statusMsg)
 	}
+	assertTestGUIEditorArgs(t, capture, []string{beadsFile})
 
 	// Also test terminal editor detection with arguments (e.g., "vim -u NONE")
 	// Now dispatches via TUI suspend (bv-134); with no issue selected, returns error
-	_ = os.Setenv("EDITOR", "vim -u NONE")
-	m2 := NewModel(nil, nil, "")
+	t.Setenv("EDITOR", "vim -u NONE")
+	m2 := NewModel(nil, nil, beadsFile)
 	m2.openInEditor()
 	if !m2.statusIsError || !strings.Contains(m2.statusMsg, "No issue selected") {
 		t.Fatalf("expected 'No issue selected' for 'vim -u NONE', got %q", m2.statusMsg)
+	}
+}
+
+// installTestGUIEditor controls both executable lookup and argv capture. No
+// installed desktop editor can be launched, and no shell is required.
+func installTestGUIEditor(t *testing.T) string {
+	t.Helper()
+	binDir := t.TempDir()
+	name := "gedit"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.Open(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	editor, err := os.OpenFile(filepath.Join(binDir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(editor, source)
+	closeErr := editor.Close()
+	if copyErr != nil || closeErr != nil {
+		t.Fatalf("copy controlled editor: copy=%v close=%v", copyErr, closeErr)
+	}
+	capture := filepath.Join(binDir, "argv.json")
+	t.Setenv("PATH", binDir)
+	t.Setenv("VISUAL", "")
+	t.Setenv("BV_TEST_EDITOR_CAPTURE", capture)
+	return capture
+}
+
+func assertTestGUIEditorArgs(t *testing.T, capture string, want []string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		data, readErr := os.ReadFile(capture)
+		var got []string
+		if readErr == nil && json.Unmarshal(data, &got) == nil {
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("editor argv = %q, want %q", got, want)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("editor did not record complete argv: read=%v data=%q", readErr, data)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -910,14 +957,16 @@ func TestBoardAndInsightsExtraKeys(t *testing.T) {
 }
 
 func TestOpenInEditorMissingAndGUI(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("openInEditor GUI path is unreliable on headless Windows CI")
-	}
 	// Missing beads file branch
 	tmp := t.TempDir()
 	origWD, _ := os.Getwd()
 	t.Cleanup(func() { _ = os.Chdir(origWD) })
-	_ = os.Chdir(tmp)
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("EDITOR", "gedit")
+	t.Setenv("VISUAL", "")
 
 	m := NewModel([]model.Issue{{ID: "1", Title: "x", Status: model.StatusOpen}}, nil, "")
 	m.openInEditor()
@@ -927,17 +976,26 @@ func TestOpenInEditorMissingAndGUI(t *testing.T) {
 
 	// Success branch with GUI-ish editor
 	beadsDir := filepath.Join(tmp, ".beads")
-	_ = os.Mkdir(beadsDir, 0o755)
-	_ = os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(`{}`), 0o644)
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsFile := filepath.Join(beadsDir, "beads.jsonl")
+	if err := os.WriteFile(beadsFile, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	origEditor := os.Getenv("EDITOR")
-	t.Cleanup(func() { _ = os.Setenv("EDITOR", origEditor) })
-	_ = os.Setenv("EDITOR", "true") // present on POSIX; not in terminal editor block
+	// A missing executable must fail even though the beads file exists.
+	m.openInEditor()
+	if !m.statusIsError || !strings.Contains(m.statusMsg, "Failed to open editor") {
+		t.Fatalf("expected missing editor error, got %q", m.statusMsg)
+	}
+	capture := installTestGUIEditor(t)
 
 	m.openInEditor()
 	if m.statusIsError || !strings.Contains(m.statusMsg, "Opened in") {
 		t.Fatalf("expected success opening editor, got %q", m.statusMsg)
 	}
+	assertTestGUIEditorArgs(t, capture, []string{beadsFile})
 }
 
 func TestExportToMarkdownCreatesFile(t *testing.T) {

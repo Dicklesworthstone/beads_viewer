@@ -1,11 +1,16 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
-	"regexp"
+	"math"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
 )
@@ -19,28 +24,77 @@ type robotSearchResult struct {
 }
 
 type robotSearchOutput struct {
-	GeneratedAt  string                `json:"generated_at"`
-	DataHash     string                `json:"data_hash"`
-	OutputFormat string                `json:"output_format,omitempty"`
-	Version      string                `json:"version,omitempty"`
-	Query        string                `json:"query"`
-	Provider     search.Provider       `json:"provider"`
-	Model        string                `json:"model,omitempty"`
-	Dim          int                   `json:"dim"`
-	IndexPath    string                `json:"index_path"`
-	Index        search.IndexSyncStats `json:"index"`
-	Loaded       bool                  `json:"loaded"`
-	Limit        int                   `json:"limit"`
-	Mode         search.SearchMode     `json:"mode"`
-	Preset       search.PresetName     `json:"preset,omitempty"`
-	Weights      *search.Weights       `json:"weights,omitempty"`
-	Results      []robotSearchResult   `json:"results"`
-	UsageHints   []string              `json:"usage_hints,omitempty"`
+	RobotEnvelope
+	IndexDataHash string                `json:"index_data_hash"`
+	CandidateHash string                `json:"candidate_hash"`
+	RankingHash   string                `json:"ranking_hash"`
+	RankingTime   *time.Time            `json:"ranking_time,omitempty"`
+	MinScore      *float64              `json:"min_score,omitempty"`
+	Query         string                `json:"query"`
+	Provider      search.Provider       `json:"provider"`
+	Model         string                `json:"model,omitempty"`
+	Dim           int                   `json:"dim"`
+	IndexPath     string                `json:"index_path"`
+	Index         search.IndexSyncStats `json:"index"`
+	Loaded        bool                  `json:"loaded"`
+	Limit         int                   `json:"limit"`
+	Mode          search.SearchMode     `json:"mode"`
+	Preset        search.PresetName     `json:"preset,omitempty"`
+	Weights       *search.Weights       `json:"weights,omitempty"`
+	Results       []robotSearchResult   `json:"results"`
+	UsageHints    []string              `json:"usage_hints,omitempty"`
+}
+
+func searchRankingHash(out robotSearchOutput) (string, error) {
+	identity := map[string]any{
+		"index_data_hash": out.IndexDataHash, "candidate_hash": out.CandidateHash,
+		"scope": out.Scope, "source_path": out.SourcePath, "source_kind": out.SourceKind,
+		"as_of_commit": out.AsOfCommit, "query": out.Query, "mode": out.Mode,
+		"preset": out.Preset, "weights": out.Weights, "min_score": out.MinScore,
+		"limit": out.Limit, "provider": out.Provider, "model": out.Model, "dim": out.Dim,
+		"ranking_time": out.RankingTime,
+	}
+	encoded, err := json.Marshal(identity)
+	if err != nil {
+		return "", fmt.Errorf("encode search ranking identity: %w", err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(encoded)), nil
+}
+
+func parseSearchMinScore(raw string) (*float64, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	score, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(score) || math.IsInf(score, 0) || score < -1 || score > 1 {
+		return nil, fmt.Errorf("invalid --search-min-score %q (expected a finite number from -1 to 1)", raw)
+	}
+	return &score, nil
 }
 
 func writeRobotSearchOutput(w io.Writer, out robotSearchOutput) error {
 	enc := newRobotEncoder(w)
 	return enc.Encode(out)
+}
+
+func resolveSearchConfig(modeFlag, presetFlag, weightsFlag string) (search.SearchConfig, error) {
+	mode, preset, weights := os.Getenv(search.EnvSearchMode), os.Getenv(search.EnvSearchPreset), os.Getenv(search.EnvSearchWeights)
+	// Validate only inherited values. A selected preset owns the implied mode,
+	// and explicit text mode makes an inherited hybrid preset irrelevant.
+	if modeFlag != "" || presetFlag != "" {
+		mode = ""
+	}
+	if presetFlag != "" || strings.EqualFold(modeFlag, "text") {
+		preset = ""
+	}
+	if weightsFlag != "" {
+		weights = ""
+	}
+	cfg, err := search.ParseSearchConfig(mode, preset, weights)
+	if err != nil {
+		return search.SearchConfig{}, err
+	}
+	return applySearchConfigOverrides(cfg, modeFlag, presetFlag, weightsFlag)
 }
 
 func applySearchConfigOverrides(cfg search.SearchConfig, modeFlag, presetFlag, weightsFlag string) (search.SearchConfig, error) {
@@ -119,19 +173,13 @@ func buildHybridScores(results []search.SearchResult, scorer search.HybridScorer
 	return out, nil
 }
 
-var issueIDPattern = regexp.MustCompile(`^[A-Za-z]+-[A-Za-z0-9]+$`)
-
-func isLikelyIssueID(query string) bool {
-	return issueIDPattern.MatchString(strings.TrimSpace(query))
-}
-
 func promoteExactSearchResult(query string, results []search.SearchResult) []search.SearchResult {
 	needle := strings.TrimSpace(query)
 	if needle == "" || len(results) == 0 {
 		return results
 	}
 	for i := range results {
-		if strings.EqualFold(results[i].IssueID, needle) {
+		if results[i].IssueID == needle {
 			if i == 0 {
 				return results
 			}
@@ -150,7 +198,7 @@ func promoteExactHybridResult(query string, results []search.HybridScore) []sear
 		return results
 	}
 	for i := range results {
-		if strings.EqualFold(results[i].IssueID, needle) {
+		if results[i].IssueID == needle {
 			if i == 0 {
 				return results
 			}

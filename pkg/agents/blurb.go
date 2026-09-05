@@ -46,7 +46,7 @@ bv is a graph-aware triage engine for Beads projects. Instead of parsing .beads/
 
 #### The Workflow: Start With Triage
 
-**` + "`" + `bv --robot-triage` + "`" + ` is your single entry point.** It returns everything you need in one call:
+**` + "`" + `bv --robot-triage` + "`" + ` is your single entry point.** Its ` + "`" + `triage` + "`" + ` object contains:
 - ` + "`" + `quick_ref` + "`" + `: at-a-glance counts + top 3 picks
 - ` + "`" + `recommendations` + "`" + `: ranked actionable items with scores, reasons, unblock info
 - ` + "`" + `quick_wins` + "`" + `: low-effort high-impact items
@@ -66,7 +66,7 @@ bv --robot-graph --format toon
 bv --robot-triage --format toon --stats
 ` + "```" + `
 
-Before claiming, verify current state with the selected tracker: ` + "`" + `br show <id> --json` + "`" + `/` + "`" + `br ready --json` + "`" + ` or ` + "`" + `bd show <id> --json` + "`" + `/` + "`" + `bd ready --json` + "`" + `. ` + "`" + `recommendations` + "`" + ` can include graph-important blocked or assigned work; only ` + "`" + `quick_ref.top_picks` + "`" + ` and non-empty ` + "`" + `claim_command` + "`" + ` fields represent claimable work.
+Recommendations can include blocked or assigned work; ` + "`" + `triage.quick_ref.top_picks` + "`" + ` reflects snapshot readiness. A suggested action records its original local ID, working directory, and tracker route. Use that route rather than a namespaced display ID or an unrelated current directory. Inspect current tracker state before execution: analysis does not reserve work or guarantee that a later claim succeeds.
 
 #### Other bv Commands
 

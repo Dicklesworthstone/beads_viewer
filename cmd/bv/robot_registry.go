@@ -51,6 +51,8 @@ type RobotContext struct {
 	AsOfCommit            string
 	LabelScope            string
 	LabelContext          *analysis.LabelHealth
+	Readiness             *model.ReadinessIndex
+	CandidateIDs          map[string]bool
 	// Command is the normalized robot flag being dispatched (set by
 	// DispatchFlag) so Envelope can declare which scoping flags this command
 	// cannot honour.
@@ -59,8 +61,9 @@ type RobotContext struct {
 	// SQLite file selected by discovery, "<file>@<rev>" for --as-of, or the
 	// workspace config. Every payload carries them so a consumer can see when a
 	// different file than expected was analysed.
-	SourcePath string
-	SourceKind string
+	SourcePath      string
+	SourceKind      string
+	SourceAuthority *RobotSourceAuthority
 	// Recipe and Repo mirror the --recipe and --repo scoping already applied to
 	// Issues (LabelScope covers --label).
 	Recipe               string
@@ -217,9 +220,17 @@ func newRobotRegistry() RobotRegistry {
 	return RobotRegistry{}
 }
 
+// Analyzer uses the visible graph for metrics and the retained full source for
+// readiness. Every registry handler must keep these two scopes distinct.
+func (ctx RobotContext) Analyzer() *analysis.Analyzer {
+	analyzer := analysis.NewAnalyzer(ctx.Issues)
+	analyzer.SetReadinessScope(ctx.Readiness, ctx.CandidateIDs)
+	analyzer.SetNow(robotNow())
+	return analyzer
+}
+
 // Envelope builds the shared robot payload header for this dispatch: data
-// hash, source, time-travel metadata, and active scoping. Every handler embeds
-// it so "every payload carries X" is true by construction.
+// hash, source, time-travel metadata, and active scoping.
 func (ctx RobotContext) Envelope() RobotEnvelope {
 	return ctx.EnvelopeWithHash(ctx.DataHash)
 }
@@ -230,6 +241,20 @@ func (ctx RobotContext) EnvelopeWithHash(dataHash string) RobotEnvelope {
 	env := NewRobotEnvelope(dataHash)
 	env.SourcePath = ctx.SourcePath
 	env.SourceKind = ctx.SourceKind
+	env.SourceAuthority = ctx.SourceAuthority
+	if env.SourceAuthority == nil {
+		env.SourceAuthority = newRobotSourceAuthority(nil)
+	}
+	env.AuthorityHash = robotAuthorityHash(env.SourceAuthority)
+	env.LoadStats = robotLoadStats(ctx.SourceAuthority)
+	ids := make([]string, 0, len(ctx.Issues))
+	for _, issue := range ctx.Issues {
+		if ctx.CandidateIDs == nil || ctx.CandidateIDs[issue.ID] {
+			ids = append(ids, issue.ID)
+		}
+	}
+	sort.Strings(ids)
+	env.ScopeHash = robotScopeHash(ctx.LabelScope, ctx.Recipe, ctx.Repo, dataHash, ids)
 	env.AsOf = ctx.AsOf
 	env.AsOfCommit = ctx.AsOfCommit
 	unsupported := unsupportedScopeFor(ctx.Command, ctx)
@@ -242,6 +267,38 @@ func (ctx RobotContext) EnvelopeWithHash(dataHash string) RobotEnvelope {
 		}
 	}
 	return env
+}
+
+func (ctx RobotContext) claimsProven() bool {
+	return ctx.SourceAuthority != nil && ctx.SourceAuthority.ClaimSafe
+}
+
+func suppressUnprovenTriageClaims(triage *analysis.TriageResult) {
+	triage.Commands.ClaimTop = ""
+	triage.QuickRef.TopPicks = []analysis.TopPick{}
+	triage.QuickWins = []analysis.QuickWin{}
+	suppressRecommendations := func(recs []analysis.Recommendation) {
+		for i := range recs {
+			recs[i].Claimable = false
+			recs[i].Actions.Claim = nil
+			recs[i].Actions.UnavailableReason = "source authority is incomplete or stale"
+			recs[i].Action = "Inspect source diagnostics before claiming work"
+		}
+	}
+	suppressRecommendations(triage.Recommendations)
+	for i := range triage.BlockersToClear {
+		triage.BlockersToClear[i].Actionable = false
+	}
+	for i := range triage.RecommendationsByTrack {
+		group := &triage.RecommendationsByTrack[i]
+		group.TopPick, group.ClaimCommand = nil, ""
+		suppressRecommendations(group.Recommendations)
+	}
+	for i := range triage.RecommendationsByLabel {
+		group := &triage.RecommendationsByLabel[i]
+		group.TopPick, group.ClaimCommand = nil, ""
+		suppressRecommendations(group.Recommendations)
+	}
 }
 
 // withEnvelope overlays the shared envelope onto a payload that already
@@ -511,6 +568,9 @@ Every payload carries: generated_at, data_hash, source_path, source_kind,
 as_of/as_of_commit (with --as-of), scope (with --label/--recipe/--repo, plus
 scope.unsupported for flags a command cannot honour), load_stats (when records
 were dropped during load).
+Issue-backed responses also carry source_authority, authority_hash, and
+scope_hash. Partial or stale sources retain exploratory output with provisional
+readiness; source_authority.claim_safe must be true before claiming work.
 
 `)
 	if err != nil {
@@ -787,7 +847,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		FlagPtr:     cfg.RobotPlanFlag,
 		Description: "Output dependency-respecting execution plan",
 		Handler: func(ctx RobotContext) error {
-			analyzer := analysis.NewAnalyzer(ctx.Issues)
+			analyzer := ctx.Analyzer()
 			analyzer.SetNow(robotNow())
 			if ctx.DataHashMatchesIssues {
 				analyzer.SeedDataHash(ctx.DataHash)
@@ -851,7 +911,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		FlagPtr:     cfg.RobotPriorityFlag,
 		Description: "Output enhanced priority recommendations",
 		Handler: func(ctx RobotContext) error {
-			analyzer := analysis.NewAnalyzer(ctx.Issues)
+			analyzer := ctx.Analyzer()
 			analyzer.SetNow(robotNow())
 			if _, w := loadRobotFeedback(); w != nil {
 				analyzer.SetWeights(*w)
@@ -979,7 +1039,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		FlagPtr:     cfg.RobotGraphFlag,
 		Description: "Output dependency graph in JSON, DOT, or Mermaid",
 		Handler: func(ctx RobotContext) error {
-			analyzer := analysis.NewAnalyzer(ctx.Issues)
+			analyzer := ctx.Analyzer()
 			analyzer.SetNow(robotNow())
 			stats := analyzer.Analyze()
 
@@ -995,7 +1055,6 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 
 			config := export.GraphExportConfig{
 				Format:   format,
-				Label:    ctx.LabelScope,
 				DataHash: ctx.DataHash,
 			}
 			if cfg.GraphRoot != nil {
@@ -1008,6 +1067,14 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			result, err := export.ExportGraph(ctx.Issues, &stats, config)
 			if err != nil {
 				return fmt.Errorf("exporting graph: %w", err)
+			}
+			// The loader already selected the label subgraph, including direct
+			// dependency context. Filtering by label again would erase its edges.
+			if ctx.LabelScope != "" {
+				if result.FiltersApplied == nil {
+					result.FiltersApplied = make(map[string]string)
+				}
+				result.FiltersApplied["label"] = ctx.LabelScope
 			}
 			// Same keys as before plus the shared envelope (source, scope,
 			// as_of). GraphExportResult carries its own data_hash, so copy
@@ -1022,7 +1089,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				Explanation    export.GraphExplanation `json:"explanation"`
 				Adjacency      *export.AdjacencyGraph  `json:"adjacency,omitempty"`
 			}{
-				RobotEnvelope:  ctx.EnvelopeWithHash(result.DataHash),
+				RobotEnvelope:  ctx.Envelope(),
 				Format:         result.Format,
 				Graph:          result.Graph,
 				Nodes:          result.Nodes,
@@ -1058,7 +1125,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				return fmt.Errorf("loading drift config: %w", err)
 			}
 
-			analyzer := analysis.NewAnalyzer(ctx.Issues)
+			analyzer := ctx.Analyzer()
 			analyzer.SetNow(robotNow())
 			stats := analyzer.Analyze()
 
@@ -1226,6 +1293,16 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			suggest := analysis.GenerateRobotSuggestOutputAt(ctx.Issues, config, ctx.DataHash, robotNow())
+			if !ctx.claimsProven() || ctx.AsOf != "" {
+				reason := "source authority is incomplete or unknown"
+				if ctx.AsOf != "" {
+					reason = "historical snapshots cannot authorize tracker mutations"
+				}
+				for i, suggestion := range suggest.Set.Suggestions {
+					suggest.Set.Suggestions[i] = suggestion.WithAction(nil).WithMetadata("action_unavailable_reason", reason)
+				}
+				suggest.Set = analysis.NewSuggestionSetAt(suggest.Set.Suggestions, suggest.Set.DataHash, suggest.Set.GeneratedAt)
+			}
 			// Re-host the payload under the shared envelope (same top-level
 			// keys plus source/scope metadata). Embedding the analysis struct
 			// directly would collide on generated_at/data_hash, which
@@ -1355,7 +1432,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				return fmt.Errorf("getting current directory: %w", err)
 			}
 
-			analyzer := analysis.NewAnalyzer(ctx.Issues)
+			analyzer := ctx.Analyzer()
 			analyzer.SetNow(robotNow())
 			graphStats := analyzer.Analyze()
 
@@ -1502,7 +1579,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		Name:        "robot-search",
 		FlagName:    "robot-search",
 		FlagPtr:     cfg.RobotSearchFlag,
-		Description: "Output semantic search results as JSON",
+		Description: "Output keyword or hybrid search results as JSON",
 		Handler: func(ctx RobotContext) error {
 			if ctx.SearchOutput == nil {
 				return fmt.Errorf("robot search output not initialized")
@@ -1756,7 +1833,7 @@ func handleRobotLabelAttention(ctx RobotContext, cfg phaseThreeRobotHandlerConfi
 }
 
 func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	analyzer := analysis.NewAnalyzer(ctx.Issues)
+	analyzer := ctx.Analyzer()
 	analyzer.SetNow(robotNow())
 	if ctx.DataHashMatchesIssues {
 		analyzer.SeedDataHash(ctx.DataHash)
@@ -1893,7 +1970,7 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		AdvancedInsights: analyzer.GenerateAdvancedInsightsFromStats(&stats, analysis.DefaultAdvancedInsightsConfig()),
 		UsageHints: []string{
 			"jq '.Bottlenecks[:5] | map(.ID)' - Top 5 bottleneck IDs",
-			"jq '.CriticalPath[:3]' - Top 3 critical path items",
+			"jq '.Keystones[:3]' - Top 3 critical path scores",
 			"jq '.top_what_ifs[] | select(.delta.direct_unblocks > 2)' - High-impact items",
 			"jq '.full_stats.pagerank | to_entries | sort_by(-.value)[:5]' - Top PageRank",
 			"jq '.full_stats.core_number | to_entries | sort_by(-.value)[:5]' - Strongly embedded nodes (k-core)",
@@ -2105,6 +2182,8 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	feedbackData, feedbackWeights := loadRobotFeedback()
 	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
 		GroupByTrack:   cfg.RobotTriageByTrackFlag != nil && *cfg.RobotTriageByTrackFlag,
+		Readiness:      ctx.Readiness,
+		CandidateIDs:   ctx.CandidateIDs,
 		GroupByLabel:   cfg.RobotTriageByLabelFlag != nil && *cfg.RobotTriageByLabelFlag,
 		WaitForPhase2:  true,
 		UseFastConfig:  true,
@@ -2116,6 +2195,9 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	}, now)
 	stabilizeRobotTriageForPinnedClock(&triage)
 	triage.Meta.HistoryStatus = historyStatus
+	if !ctx.claimsProven() {
+		suppressUnprovenTriageClaims(&triage)
+	}
 
 	// --brief (#183): emit only the decision-relevant fields agents actually
 	// consume at session start (id/title/status, blockers/unblocks, claim
@@ -2166,13 +2248,14 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 // briefTriageRecommendation carries only the fields agents use for work
 // selection (#183): identity, claim state, and the dependency edges.
 type briefTriageRecommendation struct {
-	ID        string   `json:"id"`
-	Title     string   `json:"title"`
-	Status    string   `json:"status"`
-	Assignee  string   `json:"assignee,omitempty"`
-	Score     float64  `json:"score"`
-	Unblocks  []string `json:"unblocks,omitempty"`
-	BlockedBy []string `json:"blocked_by,omitempty"`
+	ID        string             `json:"id"`
+	Title     string             `json:"title"`
+	Status    string             `json:"status"`
+	Assignee  string             `json:"assignee,omitempty"`
+	Score     float64            `json:"score"`
+	Unblocks  []string           `json:"unblocks,omitempty"`
+	BlockedBy []string           `json:"blocked_by,omitempty"`
+	Actions   model.IssueActions `json:"actions"`
 }
 
 // briefTriageOutput is the compact --robot-triage --brief payload (#183).
@@ -2200,6 +2283,7 @@ func encodeBriefTriage(ctx RobotContext, triage analysis.TriageResult, now time.
 			Score:     rec.Score,
 			Unblocks:  rec.UnblocksIDs,
 			BlockedBy: rec.BlockedBy,
+			Actions:   rec.Actions,
 		})
 	}
 	output := briefTriageOutput{
@@ -2245,6 +2329,7 @@ type robotNextOutput struct {
 	DiagnosticTopPick *robotNextDiagnosticPick `json:"diagnostic_top_pick,omitempty"`
 	ClaimCmd          string                   `json:"claim_command,omitempty"`
 	ShowCmd           string                   `json:"show_command,omitempty"`
+	Actions           *model.IssueActions      `json:"actions,omitempty"`
 	Degraded          []robotNextDegradation   `json:"degraded,omitempty"`
 	UsageHints        []string                 `json:"usage_hints,omitempty"`
 }
@@ -2257,7 +2342,7 @@ func robotNextIssueIndex(issues []model.Issue) map[string]model.Issue {
 	return issueByID
 }
 
-func robotNextClaimabilityReasons(pick analysis.TopPick, issueByID map[string]model.Issue, now time.Time) []string {
+func robotNextClaimabilityReasons(pick analysis.TopPick, issueByID map[string]model.Issue, readiness *model.ReadinessIndex, now time.Time) []string {
 	issue, ok := issueByID[pick.ID]
 	if !ok {
 		return []string{fmt.Sprintf("%s is absent from loaded Beads records", pick.ID)}
@@ -2279,28 +2364,15 @@ func robotNextClaimabilityReasons(pick analysis.TopPick, issueByID map[string]mo
 		reasons = append(reasons, fmt.Sprintf("%s is deferred until %s", pick.ID, issue.DeferUntil.UTC().Format(time.RFC3339)))
 	}
 
-	var openBlockers []string
-	for _, dep := range issue.Dependencies {
-		if dep == nil || !dep.Type.IsBlocking() {
-			continue
-		}
-		blockerID := strings.TrimSpace(dep.DependsOnID)
-		if blockerID == "" {
-			openBlockers = append(openBlockers, "<missing blocker id>")
-			continue
-		}
-		blocker, ok := issueByID[blockerID]
-		if !ok {
-			openBlockers = append(openBlockers, blockerID+" (missing)")
-			continue
-		}
-		if blocker.Status != model.StatusClosed && blocker.Status != model.StatusTombstone {
-			openBlockers = append(openBlockers, blockerID)
-		}
-	}
+	openBlockers := readiness.Blockers(issue.ID)
 	if len(openBlockers) > 0 {
-		sort.Strings(openBlockers)
 		reasons = append(reasons, fmt.Sprintf("%s is blocked by %s", pick.ID, strings.Join(openBlockers, ", ")))
+	}
+	if readiness.DependencyState(issue.ID) == model.DependenciesUnknown {
+		reasons = append(reasons, "dependency authority is missing or unresolved")
+	}
+	if readiness.HasOpenChildren(issue.ID) {
+		reasons = append(reasons, "parent still has open children")
 	}
 
 	return reasons
@@ -2316,16 +2388,19 @@ func robotNextDiagnosticFromPick(pick analysis.TopPick) robotNextDiagnosticPick 
 	}
 }
 
-func robotNextClaimablePick(picks []analysis.TopPick, issues []model.Issue, now time.Time) (analysis.TopPick, *robotNextDiagnosticPick, []string, bool) {
+func robotNextClaimablePick(picks []analysis.TopPick, issues []model.Issue, readiness *model.ReadinessIndex, now time.Time) (analysis.TopPick, *robotNextDiagnosticPick, []string, bool) {
 	if len(picks) == 0 {
 		return analysis.TopPick{}, nil, nil, false
 	}
 
 	issueByID := robotNextIssueIndex(issues)
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
 	firstDiagnostic := robotNextDiagnosticFromPick(picks[0])
 	var firstUnsafeReasons []string
 	for _, pick := range picks {
-		reasons := robotNextClaimabilityReasons(pick, issueByID, now)
+		reasons := robotNextClaimabilityReasons(pick, issueByID, readiness, now)
 		if len(reasons) == 0 {
 			return pick, &firstDiagnostic, nil, true
 		}
@@ -2369,6 +2444,8 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	_, feedbackWeights := loadRobotFeedback()
 	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
 		WaitForPhase2:  true,
+		Readiness:      ctx.Readiness,
+		CandidateIDs:   ctx.CandidateIDs,
 		UseFastConfig:  true,
 		RootIssueID:    rootIssueID,
 		NotReadyLabels: resolveNotReadyLabels(cfg),
@@ -2386,6 +2463,20 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 			"Inspect .status for skipped, timeout, or pending graph phases.",
 		},
 	}
+	if !ctx.claimsProven() {
+		output.Message = "No claim command emitted because source authority is incomplete or stale"
+		if len(triage.QuickRef.TopPicks) > 0 {
+			diagnostic := robotNextDiagnosticFromPick(triage.QuickRef.TopPicks[0])
+			output.DiagnosticTopPick = &diagnostic
+		}
+		output.Degraded = []robotNextDegradation{{Code: "source_authority_incomplete", Severity: "warning",
+			Message: "Readiness is provisional; inspect source_authority for failed sources, dropped records, or stale fallback.",
+			Repair:  "Restore or refresh the affected sources and rerun the command before claiming work."}}
+		if err := ctx.EncoderOrDefault().Encode(output); err != nil {
+			return fmt.Errorf("encoding robot-next: %w", err)
+		}
+		return nil
+	}
 
 	if len(triage.QuickRef.TopPicks) == 0 {
 		output.Message = "No proven actionable item available"
@@ -2401,7 +2492,7 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 		return nil
 	}
 
-	top, diagnostic, unsafePickReasons, ok := robotNextClaimablePick(triage.QuickRef.TopPicks, ctx.Issues, now)
+	top, diagnostic, unsafePickReasons, ok := robotNextClaimablePick(triage.QuickRef.TopPicks, ctx.Issues, ctx.Readiness, now)
 	if !ok {
 		output.Message = "No claim command emitted because the top recommendation was not claim-safe"
 		output.DiagnosticTopPick = diagnostic
@@ -2432,14 +2523,28 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 		return nil
 	}
 
+	issue := robotNextIssueIndex(ctx.Issues)[top.ID]
+	actions := issue.Actions(true)
+	output.Actions = &actions
+	if actions.Show != nil {
+		output.ShowCmd = actions.Show.Shell
+	}
+	if actions.Claim == nil {
+		output.Message = "No claim command emitted: " + actions.UnavailableReason
+		output.DiagnosticTopPick = diagnostic
+		output.Degraded = []robotNextDegradation{{Code: "live_action_route_unavailable", Severity: "info", Message: actions.UnavailableReason}}
+		if err := ctx.EncoderOrDefault().Encode(output); err != nil {
+			return fmt.Errorf("encoding robot-next: %w", err)
+		}
+		return nil
+	}
 	output.Actionable = true
 	output.ID = top.ID
 	output.Title = top.Title
 	output.Score = top.Score
 	output.Reasons = top.Reasons
 	output.Unblocks = top.Unblocks
-	output.ClaimCmd = fmt.Sprintf("br update %s --status=in_progress", top.ID)
-	output.ShowCmd = fmt.Sprintf("br show %s", top.ID)
+	output.ClaimCmd = actions.Claim.Shell
 
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding robot-next: %w", err)
@@ -3367,7 +3472,7 @@ func handleRobotSprintShow(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) e
 }
 
 func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	analyzer := analysis.NewAnalyzer(ctx.Issues)
+	analyzer := ctx.Analyzer()
 	analyzer.SetNow(robotNow())
 	graphStats := analyzer.Analyze()
 

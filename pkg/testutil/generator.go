@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -599,6 +600,163 @@ func QuickDisconnected(components, size int) []model.Issue {
 func QuickRandom(size int, density float64) []model.Issue {
 	gen := NewDefault()
 	return gen.ToIssues(gen.RandomDAG(size, density))
+}
+
+// PerformanceWorkloadNames identifies the frozen workload families shared by
+// CLI and UI measurements. Refresh is an execution mode applied to each family.
+func PerformanceWorkloadNames() []string {
+	return []string{"realistic", "deep-chain", "wide-dag", "cyclic-dense", "mostly-closed", "unicode"}
+}
+
+// PerformanceIssues generates bounded, reproducible project data. Its fixed
+// clock and explicit seed are part of the measurement identity; callers also
+// hash the serialized issues so a generator change cannot reuse old results.
+func PerformanceIssues(kind string, size int, seed int64) ([]model.Issue, error) {
+	if size < 2 {
+		return nil, fmt.Errorf("performance workload needs at least two issues, got %d", size)
+	}
+	known := false
+	for _, name := range PerformanceWorkloadNames() {
+		known = known || name == kind
+	}
+	if !known {
+		return nil, fmt.Errorf("unknown performance workload %q", kind)
+	}
+	rng := rand.New(rand.NewSource(seed))
+	clock := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	issues := make([]model.Issue, size)
+	for i := range issues {
+		issues[i] = model.Issue{
+			ID:          fmt.Sprintf("PERF-%06d", i),
+			Title:       fmt.Sprintf("Work item %06d: implement and verify component", i),
+			Description: "## Acceptance\nImplement the behavior and verify dependency handling.\n",
+			Status:      model.StatusOpen,
+			Priority:    rng.Intn(5),
+			IssueType:   model.TypeTask,
+			CreatedAt:   clock.Add(-30 * 24 * time.Hour),
+			UpdatedAt:   clock.Add(-time.Duration(i%14) * 24 * time.Hour),
+			Labels:      []string{kind, fmt.Sprintf("team-%d", i%6)},
+		}
+		if kind == "mostly-closed" && i%20 != 0 {
+			issues[i].Status = model.StatusClosed
+			closed := clock.Add(-24 * time.Hour)
+			issues[i].ClosedAt = &closed
+		} else if kind == "realistic" && i%5 == 0 {
+			issues[i].Status = model.StatusClosed
+			closed := clock.Add(-48 * time.Hour)
+			issues[i].ClosedAt = &closed
+		}
+		if kind == "unicode" {
+			issues[i].Title = fmt.Sprintf("Work item %06d: 日本語 🚀 café e\u0301 العربية", i)
+			issues[i].Description = strings.Repeat("### 日本語 🚀 café e\u0301 العربية\nUnicode text with **Markdown**, `code`, and a dependency explanation.\n", 48)
+		}
+	}
+	for i := range issues {
+		parents := make(map[int]bool)
+		switch kind {
+		case "deep-chain":
+			if i > 0 {
+				parents[i-1] = true
+			}
+		case "wide-dag":
+			if i >= 32 {
+				parents[i%32] = true
+				parents[(i+7)%32] = true
+			}
+		case "cyclic-dense":
+			start := i / 32 * 32
+			end := min(start+32, size)
+			for step := 1; step <= 12 && step < end-start; step++ {
+				parents[start+(i-start+step)%(end-start)] = true
+			}
+		default:
+			if i > 0 && i%7 != 0 {
+				for j := 0; j < 3; j++ {
+					parents[rng.Intn(i)] = true
+				}
+			}
+		}
+		// Iterate IDs in order rather than map order: exact serialized bytes and
+		// dependency traversal order must remain reproducible across processes.
+		ordered := make([]int, 0, len(parents))
+		for parent := range parents {
+			ordered = append(ordered, parent)
+		}
+		sort.Ints(ordered)
+		for _, parent := range ordered {
+			issues[i].Dependencies = append(issues[i].Dependencies, &model.Dependency{
+				IssueID: issues[i].ID, DependsOnID: issues[parent].ID, Type: model.DepBlocks,
+			})
+		}
+	}
+	return issues, nil
+}
+
+// LatencyDistribution reports empirical nearest-rank quantiles. These describe
+// the observed cohort, not a population confidence bound or a frame rate.
+type LatencyDistribution struct {
+	Samples int     `json:"samples"`
+	P50MS   float64 `json:"p50_ms"`
+	P95MS   float64 `json:"p95_ms"`
+	P99MS   float64 `json:"p99_ms"`
+	MaxMS   float64 `json:"max_ms"`
+}
+
+func SummarizeLatency(samples []time.Duration) (LatencyDistribution, error) {
+	if len(samples) == 0 {
+		return LatencyDistribution{}, fmt.Errorf("cannot summarize an empty latency cohort")
+	}
+	ordered := append([]time.Duration(nil), samples...)
+	for _, elapsed := range ordered {
+		if elapsed < 0 {
+			return LatencyDistribution{}, fmt.Errorf("negative latency %s", elapsed)
+		}
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	quantile := func(percent int) float64 {
+		return float64(ordered[(percent*len(ordered)+99)/100-1]) / float64(time.Millisecond)
+	}
+	return LatencyDistribution{len(samples), quantile(50), quantile(95), quantile(99), quantile(100)}, nil
+}
+
+// CheckInteractionLatency applies the reference-host interaction SLO. The
+// 16.67ms frame budget is a separate target; Update+View does not measure paint.
+func CheckInteractionLatency(samples []time.Duration) error {
+	stats, err := SummarizeLatency(samples)
+	if err != nil {
+		return err
+	}
+	if stats.P99MS > 50 {
+		return fmt.Errorf("interaction p99 %.3fms exceeds 50ms SLO (%d samples)", stats.P99MS, stats.Samples)
+	}
+	return nil
+}
+
+// PerformanceMetricStates strips only each metric's measured elapsed time.
+// States, reasons and approximation sample sizes remain part of parity. A
+// missing/unknown metric is an error; skipped/timeout metrics remain explicit.
+func PerformanceMetricStates(raw []byte) (json.RawMessage, error) {
+	var entries map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil, fmt.Errorf("decode metric status: %w", err)
+	}
+	for _, name := range []string{"PageRank", "Betweenness", "Eigenvector", "HITS", "Critical", "Cycles", "KCore", "Articulation", "Slack"} {
+		entry, ok := entries[name]
+		if !ok {
+			return nil, fmt.Errorf("missing metric status %s", name)
+		}
+		var state string
+		if err := json.Unmarshal(entry["state"], &state); err != nil {
+			return nil, fmt.Errorf("decode %s state: %w", name, err)
+		}
+		switch state {
+		case "computed", "approx", "timeout", "skipped":
+		default:
+			return nil, fmt.Errorf("unknown %s state %q", name, state)
+		}
+		delete(entry, "ms")
+	}
+	return json.Marshal(entries)
 }
 
 // Empty returns an empty issue slice for edge case testing.

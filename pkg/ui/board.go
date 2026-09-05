@@ -290,52 +290,19 @@ func buildBlocksIndex(issues []model.Issue) map[string][]string {
 // groupIssuesByMode distributes issues into 4 columns based on swimlane mode (bv-wjs0)
 func groupIssuesByMode(issues []model.Issue, mode SwimLaneMode) [4][]model.Issue {
 	var cols [4][]model.Issue
-
-	for _, issue := range issues {
-		var colIdx int
-		switch mode {
-		case SwimByStatus:
-			// Default: Open | In Progress | Blocked | Closed
-			switch {
-			case isClosedLikeStatus(issue.Status):
-				colIdx = 3
-			case issue.Status == model.StatusOpen:
-				colIdx = 0
-			case issue.Status == model.StatusInProgress:
-				colIdx = 1
-			case issue.Status == model.StatusBlocked:
-				colIdx = 2
-			default:
-				colIdx = 0
-			}
-		case SwimByPriority:
-			// P0 Critical | P1 High | P2 Medium | P3+ Other
-			switch {
-			case issue.Priority == 0:
-				colIdx = 0 // Critical
-			case issue.Priority == 1:
-				colIdx = 1 // High
-			case issue.Priority == 2:
-				colIdx = 2 // Medium
-			default:
-				colIdx = 3 // P3+ Other
-			}
-		case SwimByType:
-			// Bug | Feature | Task | Epic
-			switch issue.IssueType {
-			case model.TypeBug:
-				colIdx = 0
-			case model.TypeFeature:
-				colIdx = 1
-			case model.TypeTask:
-				colIdx = 2
-			case model.TypeEpic:
-				colIdx = 3
-			default:
-				colIdx = 2 // Default to Task
-			}
+	var counts [4]int
+	for i := range issues {
+		counts[boardColumnForIssue(&issues[i], mode)]++
+	}
+	for i, count := range counts {
+		if count > 0 {
+			cols[i] = make([]model.Issue, 0, count)
 		}
-		cols[colIdx] = append(cols[colIdx], issue)
+	}
+
+	for i := range issues {
+		colIdx := boardColumnForIssue(&issues[i], mode)
+		cols[colIdx] = append(cols[colIdx], issues[i])
 	}
 
 	// Sort each column
@@ -344,6 +311,40 @@ func groupIssuesByMode(issues []model.Issue, mode SwimLaneMode) [4][]model.Issue
 	}
 
 	return cols
+}
+
+func boardColumnForIssue(issue *model.Issue, mode SwimLaneMode) int {
+	switch mode {
+	case SwimByStatus:
+		switch {
+		case isClosedLikeStatus(issue.Status):
+			return 3
+		case issue.Status == model.StatusInProgress:
+			return 1
+		case issue.Status == model.StatusBlocked:
+			return 2
+		default:
+			return 0
+		}
+	case SwimByPriority:
+		if issue.Priority >= 0 && issue.Priority <= 2 {
+			return issue.Priority
+		}
+		return 3
+	case SwimByType:
+		switch issue.IssueType {
+		case model.TypeBug:
+			return 0
+		case model.TypeFeature:
+			return 1
+		case model.TypeEpic:
+			return 3
+		default:
+			return 2
+		}
+	default:
+		return 0
+	}
 }
 
 // GetSwimLaneModeName returns the display name for the current swimlane mode (bv-wjs0)

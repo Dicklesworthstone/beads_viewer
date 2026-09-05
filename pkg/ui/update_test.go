@@ -591,6 +591,64 @@ func TestUpdateFileChangedReloadsSQLiteSource(t *testing.T) {
 	}
 }
 
+func TestReloadPreservesHiddenTombstoneAuthority(t *testing.T) {
+	for _, kind := range []string{"jsonl", "sqlite3"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "issues."+kind)
+			if kind == "jsonl" {
+				content := `{"id":"READY","title":"Satisfied predecessor","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"DELETED","type":"blocks"}]}` + "\n" +
+					`{"id":"UNKNOWN","title":"Missing predecessor","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"ABSENT","type":"blocks"}]}` + "\n" +
+					`{"id":"DELETED","title":"Deleted","status":"tombstone","issue_type":"task"}` + "\n"
+				if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				db, err := sql.Open("sqlite", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				if _, err := db.Exec(`
+					CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL);
+					CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT);
+					INSERT INTO issues VALUES ('READY', 'Satisfied predecessor', 'open'), ('UNKNOWN', 'Missing predecessor', 'open'), ('DELETED', 'Deleted', 'tombstone');
+					INSERT INTO dependencies VALUES ('READY', 'DELETED', 'blocks'), ('UNKNOWN', 'ABSENT', 'blocks');
+				`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m := NewModel(nil, nil, "")
+			m.beadsPath = path
+			updated, _ := m.Update(FileChangedMsg{})
+			m = updated.(*Model)
+			defer loader.ReturnIssuePtrsToPool(m.pooledIssues)
+			if m.statusIsError || len(m.issues) != 2 || m.issueMap["DELETED"] != nil {
+				t.Fatalf("deleted issue was resurrected or reload failed: rows=%v status=%q", m.issues, m.statusMsg)
+			}
+			m.SetFilter("ready")
+			if got := m.FilteredIssues(); len(got) != 1 || got[0].ID != "READY" || m.countReady != 1 {
+				t.Errorf("synchronous reload lost dependency authority: ready=%d rows=%v", m.countReady, got)
+			}
+			worker, err := NewBackgroundWorker(WorkerConfig{BeadsPath: path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer worker.Stop()
+			snapshot := worker.buildSnapshot(false)
+			if snapshot == nil {
+				t.Fatal("background reload failed")
+			}
+			defer snapshot.releasePooledIssues()
+			if len(snapshot.Issues) != 2 || snapshot.IssueMap["DELETED"] != nil || snapshot.CountReady != 1 {
+				t.Errorf("background reload lost hidden dependency authority: rows=%v ready=%d", snapshot.Issues, snapshot.CountReady)
+			}
+			if !snapshot.Analyzer.Readiness().Ready("READY", time.Now()) || snapshot.Analyzer.Readiness().Ready("UNKNOWN", time.Now()) {
+				t.Fatal("background readiness confused deleted and absent predecessors")
+			}
+		})
+	}
+}
+
 func TestLoadIssuesForReloadSQLiteHonorsIssueFilter(t *testing.T) {
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "beads.sqlite3")
@@ -604,9 +662,12 @@ func TestLoadIssuesForReloadSQLiteHonorsIssueFilter(t *testing.T) {
 			title TEXT NOT NULL,
 			status TEXT NOT NULL
 		);
+		CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT);
 		INSERT INTO issues (id, title, status) VALUES
 			('OPEN-1', 'Open issue', 'open'),
-			('CLOSED-1', 'Closed issue', 'closed');
+			('CLOSED-1', 'Closed issue', 'closed'),
+			('DELETED-1', 'Deleted issue', 'tombstone');
+		INSERT INTO dependencies VALUES ('OPEN-1', 'CLOSED-1', 'blocks'), ('OPEN-1', 'DELETED-1', 'blocks');
 	`); err != nil {
 		_ = db.Close()
 		t.Fatalf("seed sqlite: %v", err)
@@ -625,6 +686,9 @@ func TestLoadIssuesForReloadSQLiteHonorsIssueFilter(t *testing.T) {
 	}
 	if len(loaded.Issues) != 1 || loaded.Issues[0].ID != "OPEN-1" {
 		t.Fatalf("unexpected filtered sqlite issues: %#v", loaded.Issues)
+	}
+	if loaded.Authority == nil || !loaded.Authority.Ready("OPEN-1", time.Now()) {
+		t.Fatal("SQLite display filter discarded closed/deleted dependency authority")
 	}
 }
 

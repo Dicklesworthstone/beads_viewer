@@ -1,12 +1,141 @@
 package testutil
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func TestPerformanceMeasurementControls(t *testing.T) {
+	values := make([]time.Duration, 1000)
+	for i := range values {
+		values[i] = time.Duration(i+1) * time.Microsecond
+	}
+	summary, err := SummarizeLatency(values)
+	if err != nil || summary.Samples != 1000 || summary.P50MS != .5 || summary.P95MS != .95 || summary.P99MS != .99 || summary.MaxMS != 1 {
+		t.Fatalf("nearest-rank distribution = %+v, error=%v", summary, err)
+	}
+	if err := CheckInteractionLatency(values); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SummarizeLatency(nil); err == nil {
+		t.Fatal("empty samples accepted")
+	}
+	if _, err := SummarizeLatency([]time.Duration{-1}); err == nil {
+		t.Fatal("negative latency accepted")
+	}
+	entries := make(map[string]map[string]any)
+	for _, name := range []string{"PageRank", "Betweenness", "Eigenvector", "HITS", "Critical", "Cycles", "KCore", "Articulation", "Slack"} {
+		entries[name] = map[string]any{"state": "computed", "ms": 42}
+	}
+	raw, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete, err := PerformanceMetricStates(raw)
+	if err != nil || bytes.Contains(complete, []byte(`"ms"`)) {
+		t.Fatalf("metric timing removal failed: %s, %v", complete, err)
+	}
+	entries["PageRank"] = map[string]any{"state": "skipped", "reason": "injected negative"}
+	raw, err = json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	degraded, err := PerformanceMetricStates(raw)
+	if err != nil || bytes.Equal(complete, degraded) || !bytes.Contains(degraded, []byte("injected negative")) {
+		t.Fatalf("skipped metric disappeared from parity: %s, %v", degraded, err)
+	}
+	delete(entries, "Cycles")
+	raw, err = json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PerformanceMetricStates(raw); err == nil {
+		t.Fatal("missing metric passed parity prerequisites")
+	}
+}
+
+func TestPerformanceIssuesFrozenWorkloads(t *testing.T) {
+	for _, name := range PerformanceWorkloadNames() {
+		t.Run(name, func(t *testing.T) {
+			issues, err := PerformanceIssues(name, 1000, 20260904)
+			if err != nil {
+				t.Fatal(err)
+			}
+			AssertIssueCount(t, issues, 1000)
+			AssertNoDuplicateIDs(t, issues)
+			AssertAllValid(t, issues)
+			repeated, err := PerformanceIssues(name, 1000, 20260904)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, err := json.Marshal(issues)
+			if err != nil {
+				t.Fatal(err)
+			}
+			second, err := json.Marshal(repeated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(first, second) {
+				t.Fatal("same seed and fixed clock changed serialized workload")
+			}
+			known := make(map[string]bool, len(issues))
+			for _, issue := range issues {
+				known[issue.ID] = true
+			}
+			for _, issue := range issues {
+				for _, dependency := range issue.Dependencies {
+					if dependency.IssueID != issue.ID || dependency.DependsOnID == issue.ID || !known[dependency.DependsOnID] {
+						t.Fatalf("invalid workload dependency: %+v", dependency)
+					}
+				}
+			}
+			switch name {
+			case "deep-chain":
+				for i := 1; i < len(issues); i++ {
+					if len(issues[i].Dependencies) != 1 || issues[i].Dependencies[0].DependsOnID != issues[i-1].ID {
+						t.Fatalf("chain broken at %s", issues[i].ID)
+					}
+				}
+			case "wide-dag":
+				AssertNoCycles(t, issues)
+				if len(issues[32].Dependencies) != 2 || len(issues[0].Dependencies) != 0 {
+					t.Fatal("wide DAG lost its root/leaf structure")
+				}
+			case "cyclic-dense":
+				AssertHasCycle(t, issues)
+				if len(issues[0].Dependencies) != 12 {
+					t.Fatal("dense component lost its edge fanout")
+				}
+			case "mostly-closed":
+				closed := 0
+				for _, issue := range issues {
+					if issue.Status == model.StatusClosed {
+						closed++
+					}
+				}
+				if closed != 950 {
+					t.Fatalf("closed count=%d, want 950", closed)
+				}
+			case "unicode":
+				if !strings.Contains(issues[0].Title, "日本語") || len(issues[0].Description) < 4000 {
+					t.Fatal("long Unicode workload lost its text stressor")
+				}
+			}
+		})
+	}
+	if _, err := PerformanceIssues("unknown", 1000, 1); err == nil {
+		t.Fatal("unknown workload accepted")
+	}
+	if _, err := PerformanceIssues("realistic", 1, 1); err == nil {
+		t.Fatal("single-item workload accepted despite navigation requirement")
+	}
+}
 
 func TestChain(t *testing.T) {
 	gen := NewDefault()

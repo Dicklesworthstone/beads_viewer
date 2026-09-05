@@ -6,6 +6,10 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// ANSI styles can expand a few KiB of Markdown into hundreds of KiB. Keep
+// one output within a fixed half-MiB budget, independent of issue count.
+const maxRememberedMarkdownBytes = 512 * 1024
+
 // MarkdownRenderer provides theme-aware markdown rendering using glamour.
 // It detects the terminal's color scheme and uses appropriate styles.
 type MarkdownRenderer struct {
@@ -14,6 +18,14 @@ type MarkdownRenderer struct {
 	isDark   bool
 	theme    *Theme // nil if using built-in styles, non-nil if using custom theme
 	useTheme bool   // true if created with NewMarkdownRendererWithTheme
+
+	// Remember only the last exact render. Snapshot delivery often refreshes
+	// unchanged selected details; a following key still renders its new issue.
+	// Renderer identity includes width and theme, so their replacement cannot
+	// reuse stale styling. Both strings together are bounded by the limit above.
+	lastRenderer *glamour.TermRenderer
+	lastMarkdown string
+	lastRendered string
 }
 
 // NewMarkdownRenderer creates a new markdown renderer using built-in styles.
@@ -81,7 +93,19 @@ func (mr *MarkdownRenderer) Render(markdown string) (string, error) {
 	if mr.renderer == nil {
 		return markdown, nil
 	}
-	return mr.renderer.Render(markdown)
+	if mr.lastRenderer == mr.renderer && mr.lastMarkdown == markdown {
+		return mr.lastRendered, nil
+	}
+	rendered, err := mr.renderer.Render(markdown)
+	mr.lastRenderer = nil
+	mr.lastMarkdown = ""
+	mr.lastRendered = ""
+	if err == nil && len(markdown)+len(rendered) <= maxRememberedMarkdownBytes {
+		mr.lastRenderer = mr.renderer
+		mr.lastMarkdown = markdown
+		mr.lastRendered = rendered
+	}
+	return rendered, err
 }
 
 // SetWidth updates the word wrap width and recreates the renderer.

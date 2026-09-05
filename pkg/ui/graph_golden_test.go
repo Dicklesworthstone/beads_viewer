@@ -11,6 +11,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 type testGraphFile struct {
@@ -82,7 +83,12 @@ func selectGraphID(t *testing.T, g *GraphModel, id string) {
 }
 
 func TestGraphView_GoldenASCII(t *testing.T) {
-	t.Parallel()
+	// Some graph metric styles use Lip Gloss's shared renderer. Pin that as
+	// well as the theme renderer; serialize this test while changing global
+	// capability, then restore it so color-sensitive tests retain coverage.
+	previousProfile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.Ascii)
+	t.Cleanup(func() { lipgloss.SetColorProfile(previousProfile) })
 
 	cases := []struct {
 		fixture    string
@@ -97,8 +103,6 @@ func TestGraphView_GoldenASCII(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.fixture, func(t *testing.T) {
-			t.Parallel()
-
 			issues := loadGraphFixture(t, tc.fixture)
 			analyzer := analysis.NewAnalyzer(issues)
 			stats := analyzer.AnalyzeWithConfig(analysis.FullAnalysisConfig())
@@ -106,6 +110,7 @@ func TestGraphView_GoldenASCII(t *testing.T) {
 
 			// Use deterministic renderer with forced settings
 			renderer := lipgloss.NewRenderer(io.Discard)
+			renderer.SetColorProfile(termenv.Ascii)
 			renderer.SetHasDarkBackground(true) // Force dark mode for consistency
 			theme := DefaultTheme(renderer)
 

@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 )
 
 func TestNewMarkdownRenderer(t *testing.T) {
@@ -52,6 +54,107 @@ func TestMarkdownRenderer_Render(t *testing.T) {
 	// Should contain "Hello" somewhere in the rendered output
 	if !strings.Contains(result, "Hello") {
 		t.Errorf("expected result to contain 'Hello', got: %s", result)
+	}
+}
+
+func TestMarkdownRenderer_RepeatedExactContentDoesNotRenderAgain(t *testing.T) {
+	mr := NewMarkdownRenderer(80)
+	content := "# Selected issue\n\n" + strings.Repeat("日本語 🚀 café **Markdown** and dependency details.\n\n", 30)
+	want, err := mr.Render(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocations := testing.AllocsPerRun(3, func() {
+		got, err := mr.Render(content)
+		if err != nil || got != want {
+			t.Fatalf("identical detail changed: error=%v", err)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("unchanged selected detail allocated %.0f objects; want zero repeated rendering work", allocations)
+	}
+}
+
+func TestMarkdownRenderer_ReusedOutputMatchesFreshAfterChanges(t *testing.T) {
+	theme := DefaultTheme(lipgloss.DefaultRenderer())
+	mr := NewMarkdownRendererWithTheme(80, theme)
+	base := "# Original selected issue\n\n" + strings.Repeat("日本語 café Markdown text for wrapping. ", 10)
+	if _, err := mr.Render(base); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, content string
+		width         int
+		changeTheme   bool
+	}{
+		{"changed-selected-body", base + "\n\nNew dependency and changed body", 80, false},
+		{"new-selection", "# Different issue\n\nCompletely different description", 80, false},
+		{"narrower-width", base, 37, false},
+		{"same-width-new-theme", base, 37, true},
+		{"return-to-previous-body", base, 80, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.changeTheme {
+				theme.Primary = lipgloss.AdaptiveColor{Light: "#ff0000", Dark: "#00ff00"}
+				mr.SetWidthWithTheme(tc.width, theme)
+			} else {
+				mr.SetWidth(tc.width)
+			}
+			fresh := NewMarkdownRendererWithTheme(tc.width, theme)
+			want, err := fresh.Render(tc.content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := mr.Render(tc.content)
+			if err != nil || got != want {
+				t.Fatalf("output differs from a fresh renderer after %s: error=%v", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestMarkdownRenderer_LastOutputMemoryIsBounded(t *testing.T) {
+	mr := NewMarkdownRenderer(80)
+	if _, err := mr.Render("# Small selected issue"); err != nil {
+		t.Fatal(err)
+	}
+	if mr.lastRenderer == nil {
+		t.Fatal("small exact output was not retained")
+	}
+	large := strings.Repeat("large description ", maxRememberedMarkdownBytes/10)
+	if _, err := mr.Render(large); err != nil {
+		t.Fatal(err)
+	}
+	if mr.lastRenderer != nil || len(mr.lastMarkdown)+len(mr.lastRendered) != 0 {
+		t.Fatal("oversized detail retained additional cache memory")
+	}
+}
+
+func TestSelectedDependencyTreeUsesPlainTextWithoutChangingOutput(t *testing.T) {
+	for _, kind := range []string{"realistic", "unicode"} {
+		t.Run(kind, func(t *testing.T) {
+			issues, err := testutil.PerformanceIssues(kind, 64, 20260904)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := settledPerformanceModel(t, issues)
+			for i, value := range m.list.Items() {
+				if item, ok := value.(IssueItem); ok && len(item.Issue.Dependencies) > 0 {
+					m.list.Select(i)
+					break
+				}
+			}
+			m.updateViewportContent()
+			markdown, rendered := m.renderer.lastMarkdown, m.renderer.lastRendered
+			if !strings.Contains(markdown, "```text\n") {
+				t.Fatal("generated dependency tree still asks the highlighter to infer a language")
+			}
+			before := strings.Replace(markdown, "```text\n", "```\n", 1)
+			want, err := m.renderer.renderer.Render(before)
+			if err != nil || rendered != want {
+				t.Fatalf("explicit plain-text dependency tree changed terminal output: error=%v", err)
+			}
+		})
 	}
 }
 

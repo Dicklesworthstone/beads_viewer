@@ -2123,7 +2123,8 @@ func TestApplyRecipe_FiltersSortAndLimitThroughSharedEngine(t *testing.T) {
 	}
 
 	r := &recipe.Recipe{Filters: recipe.FilterConfig{Actionable: ptrBool(true)}}
-	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "A", "C")
+	// Closed records are not ready work, even without an explicit status filter.
+	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "A")
 	r = &recipe.Recipe{Filters: recipe.FilterConfig{Status: []string{"open"}, HasBlockers: ptrBool(true)}}
 	requireIssueIDs(t, mustApplyRecipe(t, issues, r), "B")
 	r = &recipe.Recipe{Filters: recipe.FilterConfig{Priority: []int{1, 2}, TitleContains: "login", Tags: []string{"BACKEND"}, IDPrefix: "C"}}
@@ -2375,6 +2376,22 @@ func TestMain(m *testing.M) {
 	os.Setenv("HOME", tmp)
 	os.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, ".config"))
 	os.Setenv("BV_NO_BROWSER", "1")
+
+	// RCH can execute as a different uid from the copied checkout's owner.
+	// Trust only this checkout in the disposable HOME so nested builds retain
+	// VCS stamping without depending on the worker's real Git configuration.
+	repoDir, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		panic("resolving test checkout: " + err.Error())
+	}
+	repoDir, err = filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		panic("resolving test checkout symlinks: " + err.Error())
+	}
+	gitConfig := exec.Command("git", "config", "--file", filepath.Join(tmp, ".gitconfig"), "--add", "safe.directory", repoDir)
+	if out, err := gitConfig.CombinedOutput(); err != nil {
+		panic(fmt.Sprintf("configuring isolated checkout trust: %v\n%s", err, out))
+	}
 
 	code := m.Run()
 

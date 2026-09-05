@@ -406,7 +406,7 @@ func RenderPresetsTable() string {
 		"bug-hunting":     "Prioritizes open issues with high impact and recency",
 		"sprint-planning": "Heavily weights PageRank and blocker impact for sprint grooming",
 		"impact-first":    "Centrality-first: PageRank and graph impact dominate text matches",
-		"text-only":       "Pure keyword/semantic similarity with zero graph metric weighting",
+		"text-only":       "Hashed keyword similarity with zero graph metric weighting",
 	}
 
 	for _, name := range presets {

@@ -43,8 +43,8 @@ func TestModelFiltering(t *testing.T) {
 	m := ui.NewModel(issues, nil, "")
 
 	// Test "All"
-	if len(m.FilteredIssues()) != 8 {
-		t.Errorf("Expected 8 issues for 'all', got %d", len(m.FilteredIssues()))
+	if len(m.FilteredIssues()) != 7 {
+		t.Errorf("Expected 7 visible issues for 'all', got %d", len(m.FilteredIssues()))
 	}
 
 	// Test "Open" (includes Open, InProgress, Blocked)
@@ -56,15 +56,14 @@ func TestModelFiltering(t *testing.T) {
 	// Test "Closed"
 	m.SetFilter("closed")
 	closedIssues := m.FilteredIssues()
-	if len(closedIssues) != 2 {
-		t.Errorf("Expected 2 issues for 'closed', got %d", len(closedIssues))
+	if len(closedIssues) != 1 {
+		t.Errorf("Expected one visible issue for 'closed', got %d", len(closedIssues))
 	} else {
 		got := map[string]bool{
 			closedIssues[0].ID: true,
-			closedIssues[1].ID: true,
 		}
-		if !got["2"] || !got["6"] {
-			t.Errorf("Expected closed issues to include IDs 2 and 6, got %#v", got)
+		if !got["2"] || got["6"] {
+			t.Errorf("Expected closed ID 2 while tombstone ID 6 stays hidden, got %#v", got)
 		}
 	}
 

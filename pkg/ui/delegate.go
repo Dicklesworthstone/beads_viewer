@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -19,7 +21,22 @@ type IssueDelegate struct {
 	PriorityHints     map[string]*analysis.PriorityRecommendation
 	WorkspaceMode     bool // When true, shows repo prefix badges
 	ShowSearchScores  bool // Show semantic/hybrid score badge when search is active
+	Columns           []string
+	TruncateTitle     int
+	MetricNames       []string
+	MetricValues      map[string]map[string]float64
+	BlockerCounts     map[string]int
 }
+
+// IssueGroupItem is a navigable header in the existing issue list. It carries
+// no issue identity; opening it toggles its rows instead of opening a detail.
+type IssueGroupItem struct {
+	Key       string
+	Count     int
+	Collapsed bool
+}
+
+func (i IssueGroupItem) FilterValue() string { return "" }
 
 func (d IssueDelegate) Height() int {
 	return 1
@@ -34,8 +51,21 @@ func (d IssueDelegate) Update(msg tea.Msg, m *list.Model) tea.Cmd {
 }
 
 func (d IssueDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
+	if group, ok := listItem.(IssueGroupItem); ok {
+		marker := "▾"
+		if group.Collapsed {
+			marker = "▸"
+		}
+		row := fmt.Sprintf("%s %s (%d) · Enter to toggle", marker, group.Key, group.Count)
+		fmt.Fprint(w, d.styleRow(row, max(1, m.Width()-1), index == m.Index()))
+		return
+	}
 	i, ok := listItem.(IssueItem)
 	if !ok {
+		return
+	}
+	if len(d.Columns) > 0 || len(d.MetricNames) > 0 {
+		d.renderConfiguredRow(w, m, index, i)
 		return
 	}
 
@@ -175,6 +205,9 @@ func (d IssueDelegate) Render(w io.Writer, m list.Model, index int, listItem lis
 	if titleWidth < 5 {
 		titleWidth = 5
 	}
+	if d.TruncateTitle > 0 {
+		titleWidth = min(titleWidth, d.TruncateTitle)
+	}
 
 	// Truncate title if needed
 	title = truncateRunesHelper(title, titleWidth, "…")
@@ -295,4 +328,98 @@ func (d IssueDelegate) Render(w io.Writer, m list.Model, index int, listItem lis
 	}
 
 	fmt.Fprint(w, row)
+}
+
+func (d IssueDelegate) styleRow(row string, width int, selected bool) string {
+	style := d.Theme.Renderer.NewStyle().Width(width).MaxWidth(width)
+	if selected {
+		style = style.Background(d.Theme.Highlight).Bold(true)
+	}
+	return style.Render(truncateRunesHelper(row, width, "…"))
+}
+
+// Configured columns share the normal delegate, selection and width handling.
+// All metric/dependency values are prepared once when data changes.
+func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int, item IssueItem) {
+	width := max(1, m.Width()-1)
+	columns := d.Columns
+	if len(columns) == 0 {
+		columns = []string{"id", "title", "status", "priority"}
+	}
+	values := make([]string, len(columns))
+	date := func(t time.Time) string {
+		if t.IsZero() {
+			return "—"
+		}
+		return t.Format("2006-01-02")
+	}
+	fixedWidth := 2
+	titleIndex := -1
+	for n, column := range columns {
+		switch column {
+		case "id":
+			values[n] = item.Issue.ID
+		case "title":
+			titleIndex = n
+		case "status":
+			values[n] = string(item.Issue.Status)
+		case "priority":
+			values[n] = fmt.Sprintf("P%d", item.Issue.Priority)
+		case "created":
+			values[n] = date(item.Issue.CreatedAt)
+		case "updated":
+			values[n] = date(item.Issue.UpdatedAt)
+		case "tags":
+			values[n] = strings.Join(item.Issue.Labels, ",")
+		case "blockers":
+			values[n] = fmt.Sprintf("blockers:%d", d.BlockerCounts[item.Issue.ID])
+		}
+		if column != "title" {
+			values[n] = truncateRunesHelper(values[n], max(4, width/3), "…")
+			fixedWidth += lipgloss.Width(values[n])
+		}
+	}
+	var metrics []string
+	for _, name := range d.MetricNames {
+		value, available := d.MetricValues[name][item.Issue.ID]
+		text := name + ":—"
+		if available {
+			text = fmt.Sprintf("%s:%.3g", name, value)
+		}
+		metrics = append(metrics, text)
+	}
+	if titleIndex >= 0 {
+		available := max(1, width-fixedWidth-(len(columns)-1)*3)
+		// Reserve space for metrics when the terminal can still show a title.
+		metricWidth := lipgloss.Width(strings.Join(metrics, " "))
+		if metricWidth+12 < available {
+			available -= metricWidth + 3
+		}
+		if d.TruncateTitle > 0 {
+			available = min(available, d.TruncateTitle)
+		}
+		values[titleIndex] = truncateRunesHelper(item.Issue.Title, available, "…")
+	}
+	prefix := "  "
+	if index == m.Index() {
+		prefix = "▸ "
+	}
+	row := prefix + strings.Join(values, " │ ")
+	if len(metrics) > 0 {
+		row += " │ " + strings.Join(metrics, " ")
+	}
+	fmt.Fprint(w, d.styleRow(row, width, index == m.Index()))
+}
+
+func recipeMetricNames(r *recipe.Recipe) []string {
+	if r == nil {
+		return nil
+	}
+	if len(r.Metrics) > 0 {
+		return append([]string(nil), r.Metrics...)
+	}
+	if r.View.ShowMetrics {
+		return []string{"pagerank", "impact", "triage"}
+	}
+	return nil
 }

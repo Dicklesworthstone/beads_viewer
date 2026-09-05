@@ -986,7 +986,16 @@ func TestBackgroundWorker_HugeDatasetOpenOnly(t *testing.T) {
 		} else {
 			openCount++
 		}
-		line := fmt.Sprintf(`{"id":"issue-%d","title":"Issue %d","status":"%s","priority":1,"issue_type":"task"}`+"\n", i, i, status)
+		if i == 2 {
+			status = "tombstone"
+		}
+		dependencies := ""
+		if i == 1 {
+			dependencies = `,"dependencies":[{"depends_on_id":"issue-0","type":"blocks"},{"depends_on_id":"issue-2","type":"blocks"}]`
+		} else if i == 3 {
+			dependencies = `,"dependencies":[{"depends_on_id":"absent","type":"blocks"}]`
+		}
+		line := fmt.Sprintf(`{"id":"issue-%d","title":"Issue %d","status":"%s","priority":1,"issue_type":"task"%s}`+"\n", i, i, status, dependencies)
 		if _, err := writer.WriteString(line); err != nil {
 			_ = f.Close()
 			t.Fatalf("Failed to write test file: %v", err)
@@ -1035,12 +1044,44 @@ func TestBackgroundWorker_HugeDatasetOpenOnly(t *testing.T) {
 	if len(snapshot.Issues) != openCount {
 		t.Fatalf("expected %d open issues, got %d", openCount, len(snapshot.Issues))
 	}
+	if !snapshot.Analyzer.Readiness().Ready("issue-1", time.Now()) || snapshot.Analyzer.Readiness().Ready("issue-3", time.Now()) {
+		t.Fatal("huge-tier filtering lost closed/tombstone authority or permitted an absent predecessor")
+	}
 	expectedTruncated := issueCount - openCount
 	if snapshot.TruncatedCount != expectedTruncated {
 		t.Fatalf("expected TruncatedCount=%d, got %d", expectedTruncated, snapshot.TruncatedCount)
 	}
 	if !strings.Contains(snapshot.LargeDatasetWarning, "open-only") {
 		t.Fatalf("expected LargeDatasetWarning to mention open-only, got %q", snapshot.LargeDatasetWarning)
+	}
+
+	// Only the hidden tombstone's ID changes. Visible rows, source count,
+	// warnings and tier stay identical, but issue-1's predecessor is now absent.
+	content, err := os.ReadFile(beadsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := strings.Replace(string(content), `"id":"issue-2"`, `"id":"retired-2"`, 1)
+	if changed == string(content) {
+		t.Fatal("fixture did not contain the expected hidden tombstone")
+	}
+	if err := os.WriteFile(beadsPath, []byte(changed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hiddenResult := worker.buildSnapshotResult(false)
+	if hiddenResult.err != nil || hiddenResult.snapshot == nil {
+		t.Fatalf("same-count authority change was lost to visible-row dedup: %+v", hiddenResult)
+	}
+	hiddenSnapshot := hiddenResult.snapshot
+	defer hiddenSnapshot.releasePooledIssues()
+	if hiddenSnapshot.DataHash != snapshot.DataHash || hiddenSnapshot.AuthorityHash == snapshot.AuthorityHash {
+		t.Fatal("visible identity and full authority identity were not kept separate")
+	}
+	if hiddenSnapshot.SourceIssueCountHint != snapshot.SourceIssueCountHint || hiddenSnapshot.LoadWarningCount != snapshot.LoadWarningCount {
+		t.Fatal("fixture changed count/warnings; it must isolate hidden authority dedup")
+	}
+	if hiddenSnapshot.Analyzer.Readiness().Ready("issue-1", time.Now()) {
+		t.Fatal("hidden predecessor removal left stale ready work")
 	}
 
 	// Changes that affect only filtered-out rows and load diagnostics keep the

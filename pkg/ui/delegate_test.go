@@ -9,6 +9,7 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/lipgloss"
@@ -137,5 +138,39 @@ func TestIssueDelegate_RenderNarrow(t *testing.T) {
 	}
 	if strings.Contains(out, "💬") {
 		t.Fatalf("narrow output should hide comments count: %q", out)
+	}
+}
+
+func TestIssueDelegate_RecipeColumnsAndWidth(t *testing.T) {
+	item := newTestIssueItem("view-1")
+	item.Issue.Title = "界界界界界 Alpha"
+	item.Issue.CreatedAt = time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	item.Issue.UpdatedAt = item.Issue.CreatedAt.Add(24 * time.Hour)
+	want := map[string]string{"id": "view-1", "title": "界界…", "status": "open", "priority": "P1", "created": "2026-01-02", "updated": "2026-01-03", "tags": "one,two", "blockers": "blockers:2"}
+	for _, column := range recipe.ViewColumns {
+		t.Run(column, func(t *testing.T) {
+			d := IssueDelegate{Theme: DefaultTheme(lipgloss.NewRenderer(nil)), Columns: []string{column}, TruncateTitle: 5, BlockerCounts: map[string]int{"view-1": 2}}
+			l := list.New([]list.Item{item}, d, 80, 10)
+			var out bytes.Buffer
+			d.Render(&out, l, 0, item)
+			if !strings.Contains(out.String(), want[column]) {
+				t.Fatalf("column %s = %q, want %q", column, out.String(), want[column])
+			}
+		})
+	}
+	for _, width := range []int{1, 8, 20, 40, 80, 150} {
+		d := IssueDelegate{Theme: DefaultTheme(lipgloss.NewRenderer(nil)), Columns: []string{"priority", "title", "id", "updated"}, TruncateTitle: 5}
+		l := list.New([]list.Item{item}, d, width, 10)
+		var out bytes.Buffer
+		d.Render(&out, l, 0, item)
+		if actual := lipgloss.Width(out.String()); actual > width {
+			t.Errorf("width=%d rendered=%d: %q", width, actual, out.String())
+		}
+		if width >= 80 {
+			row := out.String()
+			if !(strings.Index(row, "P1") < strings.Index(row, "界界…") && strings.Index(row, "界界…") < strings.Index(row, "view-1") && strings.Index(row, "view-1") < strings.Index(row, "2026-01-03")) {
+				t.Fatalf("configured column order lost: %q", row)
+			}
+		}
 	}
 }

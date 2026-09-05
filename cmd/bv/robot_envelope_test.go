@@ -1,9 +1,109 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"reflect"
 	"testing"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func TestRobotSuggestionsRequireCompleteLiveAuthority(t *testing.T) {
+	for _, name := range []string{"complete", "absent", "unknown", "partial", "stale", "historical"} {
+		t.Run(name, func(t *testing.T) {
+			report := RobotSourceReport{SourceKind: "memory", Status: "loaded", Valid: 2, Visible: 2}
+			if name == "partial" {
+				report.Errors = 1
+			}
+			if name == "stale" {
+				report.Stale = true
+			}
+			authority := newRobotSourceAuthority([]RobotSourceReport{report})
+			if name == "absent" {
+				authority = nil
+			} else if name == "unknown" {
+				authority = newRobotSourceAuthority(nil)
+			}
+			issues := []model.Issue{{ID: "display-a", Title: "Implement user authentication system", Status: model.StatusOpen}, {ID: "display-b", Title: "Implement user authentication system", Status: model.StatusOpen}}
+			for i := range issues {
+				issues[i].Origin = &model.IssueOrigin{LocalID: "local-" + issues[i].ID, WorkingDirectory: "/tracker", TrackerDirectory: "/tracker/.beads", Database: "/tracker/.beads/beads.db", Tracker: "br", Executable: "/tools/br"}
+			}
+			var output bytes.Buffer
+			ctx := RobotContext{Issues: issues, SourceAuthority: authority, Encoder: json.NewEncoder(&output)}
+			if name == "historical" {
+				ctx.AsOf = "HEAD~1"
+			}
+			active, kind := true, "duplicate"
+			registry := newRobotRegistry()
+			registerPhaseTwoRobotHandlers(&registry, phaseTwoRobotHandlerConfig{RobotSuggestFlag: &active, SuggestType: &kind})
+			if handled, err := registry.DispatchFlag("robot-suggest", ctx); err != nil || !handled {
+				t.Fatalf("dispatch handled=%v error=%v", handled, err)
+			}
+			var result struct {
+				Set analysis.SuggestionSet `json:"suggestions"`
+			}
+			if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Set.Suggestions) != 1 || result.Set.Stats.Total != 1 {
+				t.Fatalf("authority guard erased useful analysis: %s", output.String())
+			}
+			suggestion := result.Set.Suggestions[0]
+			if name == "complete" {
+				if suggestion.Action == nil || suggestion.ActionCommand == "" || result.Set.Stats.ActionableCount != 1 {
+					t.Fatalf("complete live source lost mutation: %s", output.String())
+				}
+			} else if suggestion.Action != nil || suggestion.ActionCommand != "" || result.Set.Stats.ActionableCount != 0 || suggestion.Metadata["action_unavailable_reason"] == nil {
+				t.Fatalf("incomplete/historical context authorized mutation: %s", output.String())
+			}
+		})
+	}
+}
+
+func TestRobotNextRequiresExplicitCompleteSourceAuthority(t *testing.T) {
+	t.Setenv("BEADS_DIR", t.TempDir())
+	t.Setenv("BEADS_DB", "")
+	for _, tc := range []struct {
+		name      string
+		authority *RobotSourceAuthority
+		complete  bool
+	}{
+		{"absent", nil, false},
+		{"unknown", newRobotSourceAuthority(nil), false},
+		{"incomplete", newRobotSourceAuthority([]RobotSourceReport{{Status: "loaded", Valid: 1, Visible: 1, Errors: 1}}), false},
+		{"stale", newRobotSourceAuthority([]RobotSourceReport{{Status: "loaded", Valid: 1, Visible: 1, Stale: true}}), false},
+		{"complete_in_memory", newRobotSourceAuthority([]RobotSourceReport{{SourceKind: "memory", Status: "loaded", Valid: 1, Visible: 1}}), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			ctx := RobotContext{Issues: []model.Issue{{ID: "safe", Title: "Known candidate", Status: model.StatusOpen, IssueType: model.TypeTask}},
+				SourceAuthority: tc.authority, Encoder: json.NewEncoder(&output)}
+			if err := handleRobotNext(ctx, phaseThreeRobotHandlerConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			var result robotNextOutput
+			if err := json.Unmarshal(output.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			// Complete graph authority does not manufacture a live tracker route
+			// for an in-memory issue. The ready candidate remains diagnostic.
+			if result.Actionable || result.ClaimCmd != "" || result.ShowCmd != "" || result.ID != "" {
+				t.Fatalf("unbound in-memory source emitted a live action: %+v", result)
+			}
+			if result.SourceAuthority == nil || result.SourceAuthority.ClaimSafe != tc.complete {
+				t.Fatalf("missing explicit authority: %+v", result)
+			}
+			if result.DiagnosticTopPick == nil || result.DiagnosticTopPick.ID != "safe" {
+				t.Fatalf("source authority must preserve the same useful diagnostic candidate: %+v", result)
+			}
+			if result.Actions != nil && (result.Actions.Claim != nil || result.Actions.Show != nil) {
+				t.Fatalf("unbound source emitted a nested live action: %+v", result.Actions)
+			}
+		})
+	}
+}
 
 // Every robot payload embeds the envelope built from the dispatch context, so
 // the source, time-travel, and scoping metadata cannot be forgotten per handler.

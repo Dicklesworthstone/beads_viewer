@@ -15,7 +15,211 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 )
+
+func TestPreparedPhase2PreservesResultsAndCurrentPresentation(t *testing.T) {
+	issues := recipePresentationIssues()
+	analyzer := analysis.NewAnalyzer(issues)
+	stats := analyzer.Analyze()
+	makeModel := func() *Model {
+		builder := NewSnapshotBuilder(cloneIssuesForAsync(issues)).WithAnalysis(&stats)
+		builder.analyzer.SetNow(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+		snapshot := builder.Build()
+		m := NewModel(cloneIssuesForAsync(issues), nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 150, Height: 40})
+		m.Update(SnapshotReadyMsg{Snapshot: snapshot})
+		return m
+	}
+	legacy, prepared := makeModel(), makeModel()
+	cmd := prepared.preparePhase2Cmd()
+	// The user changes presentation after the command captured its inputs.
+	r := &recipe.Recipe{Name: "current", Filters: recipe.FilterConfig{ExcludeTags: []string{"beta"}}, View: recipe.ViewConfig{Columns: []string{"title"}, TruncateTitle: 5}}
+	for _, m := range []*Model{legacy, prepared} {
+		m.setActiveRecipe(r)
+		m.applyRecipe(r)
+		m.list.Select(1)
+	}
+	selected := prepared.selectedListIssueID(false, "")
+	legacy.Update(WaitForPhase2Cmd(&stats)())
+	msg, ok := cmd().(Phase2ReadyMsg)
+	if !ok || msg.prepared == nil {
+		t.Fatal("production command did not prepare Phase2 results off the UI loop")
+	}
+	prepared.Update(msg)
+	if got := prepared.selectedListIssueID(false, ""); got != selected {
+		t.Fatalf("late preparation changed user selection: got %q want %q", got, selected)
+	}
+	if !reflect.DeepEqual(prepared.priorityHints, legacy.priorityHints) || !reflect.DeepEqual(performanceListIDs(prepared), performanceListIDs(legacy)) {
+		t.Fatal("prepared Phase2 changed priority results or current recipe membership/order")
+	}
+	if !reflect.DeepEqual(prepared.snapshot.TriageScores, legacy.snapshot.TriageScores) ||
+		!reflect.DeepEqual(prepared.snapshot.phase2Triage.Recommendations, legacy.snapshot.phase2Triage.Recommendations) ||
+		!reflect.DeepEqual(prepared.snapshot.phase2Triage.QuickRef, legacy.snapshot.phase2Triage.QuickRef) {
+		t.Fatal("prepared Phase2 changed exact triage scores, recommendations, or readiness")
+	}
+	if prepared.View() != legacy.View() {
+		t.Fatal("prepared Phase2 changed the rendered current recipe/selection")
+	}
+}
+
+func TestSnapshotBuilderAndPreparedPhase2UseSourceClock(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	deferred := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "ready", Title: "Ready", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "later", Title: "Later", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, DeferUntil: &deferred},
+	}
+	builder := NewSnapshotBuilder(issues)
+	builder.analyzer.SetNow(now)
+	stats := builder.analyzer.Analyze()
+	builder.WithAnalysis(&stats)
+	started := time.Now()
+	snapshot := builder.Build()
+	if snapshot.CountReady != 1 {
+		t.Fatalf("Phase1 ignored source clock: ready=%d triage=%v", snapshot.CountReady, snapshot.TriageScores)
+	}
+	if snapshot.CreatedAt.Before(started) || snapshot.CreatedAt.After(time.Now()) {
+		t.Fatal("snapshot freshness timestamp must remain actual build time")
+	}
+	m := NewModel(cloneIssuesForAsync(issues), nil, "")
+	t.Cleanup(m.Stop)
+	m.candidateIDs = map[string]bool{"ready": true, "later": true}
+	m.Update(SnapshotReadyMsg{Snapshot: snapshot})
+	if !m.analyzer.Now().Equal(now) || m.countReady != 1 {
+		t.Fatal("candidate-scoped reload discarded the source scoring clock")
+	}
+	wantTriage := analysis.ComputeTriageFromAnalyzer(m.analyzer, &stats, m.issues, analysis.TriageOptions{}, now)
+	for _, rec := range wantTriage.Recommendations {
+		if m.triageScores[rec.ID] != rec.Score {
+			t.Fatalf("scoped Phase1 score ignored source clock: %s got %.17g want %.17g", rec.ID, m.triageScores[rec.ID], rec.Score)
+		}
+	}
+	stale := m.preparePhase2Cmd()()
+	if stale.(Phase2ReadyMsg).prepared.phase2Triage.QuickRef.ActionableCount != 1 {
+		t.Fatal("Phase2 ignored source clock for deferred readiness")
+	}
+	// A changed scoring instant must not install a result for the old clock.
+	m.analyzer.SetNow(deferred.Add(time.Second))
+	_, retry := m.Update(stale)
+	if retry == nil || m.snapshot != snapshot {
+		t.Fatal("changed source clock installed stale preparation instead of scheduling current scoring")
+	}
+	msg, ok := retry().(Phase2ReadyMsg)
+	if !ok || msg.prepared.phase2Triage.QuickRef.ActionableCount != 2 {
+		t.Fatal("new scoring instant did not admit the now-ready deferred issue")
+	}
+	m.Update(msg)
+	if m.snapshot.phase2Triage.QuickRef.ActionableCount != 2 {
+		t.Fatal("current-clock completion did not install deferred issue triage")
+	}
+}
+
+func TestPreparedPhase2RejectsChangedWeightsWithoutRenormalizing(t *testing.T) {
+	m := newRecipePresentationModel(t, nil)
+	m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(cloneIssuesForAsync(m.issues)).WithAnalysis(m.analysis).Build()})
+	source := m.snapshot
+	stale := m.preparePhase2Cmd()()
+	weights := m.analyzer.Weights()
+	weights.PageRank += 0.05
+	weights.PriorityBoost -= 0.05
+	m.analyzer.SetWeights(weights)
+	weights = m.analyzer.Weights()
+	_, retry := m.Update(stale)
+	if m.snapshot != source || retry == nil {
+		t.Fatal("changed weights installed stale preparation")
+	}
+	msg, ok := retry().(Phase2ReadyMsg)
+	if !ok || msg.sourceWeights != weights {
+		t.Fatal("retry did not capture current weights")
+	}
+	m.Update(msg)
+	want := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analyzer.Now())
+	if !reflect.DeepEqual(m.snapshot.phase2Triage.Recommendations, want.Recommendations) {
+		t.Fatal("prepared triage changed exact source weights/components through a second normalization")
+	}
+}
+
+func TestPreparedPhase2PreservesWorkerMetadataAndSinglePoolLease(t *testing.T) {
+	issues := recipePresentationIssues()
+	snapshot := NewSnapshotBuilder(cloneIssuesForAsync(issues)).Build()
+	if snapshot.phase2Input == nil || snapshot.phase2Input.phase2Input != nil {
+		t.Fatal("builder must retain one detached input, without a snapshot history chain")
+	}
+	// These fields are filled by the worker after Build has detached its inputs.
+	snapshot.DataHash, snapshot.AuthorityHash = "source-data", "source-authority"
+	snapshot.LoadWarningCount, snapshot.StaleWarning = 3, true
+	releases := 0
+	snapshot.pooledIssues = &pooledIssueLease{refs: []*model.Issue{{ID: "parser-owned"}}, release: func(refs []*model.Issue) { releases++ }}
+	m := NewModel(cloneIssuesForAsync(issues), nil, "")
+	t.Cleanup(m.Stop)
+	m.Update(SnapshotReadyMsg{Snapshot: snapshot})
+	msg := m.preparePhase2Cmd()().(Phase2ReadyMsg)
+	if msg.prepared.DataHash != snapshot.DataHash || msg.prepared.AuthorityHash != snapshot.AuthorityHash ||
+		msg.prepared.LoadWarningCount != 3 || !msg.prepared.StaleWarning {
+		t.Fatal("preparation dropped worker metadata assigned after input detachment")
+	}
+	if msg.prepared.phase2Input != nil || msg.prepared.pooledIssues != snapshot.pooledIssues {
+		t.Fatal("Phase2 retained an input history or changed parser ownership")
+	}
+	m.Update(msg)
+	m.Stop()
+	snapshot.releasePooledIssues()
+	if releases != 1 {
+		t.Fatalf("shared source/prepared lease released %d times, want exactly once", releases)
+	}
+}
+
+func TestPreparedPhase2RejectsReplacedSourceAndShutdown(t *testing.T) {
+	m := newRecipePresentationModel(t, nil)
+	oldCmd := m.preparePhase2Cmd()
+	oldMsg := oldCmd()
+	changed := recipePresentationIssues()
+	changed[0].Title = "NEW_SOURCE_TITLE"
+	// Reuse the Stats pointer deliberately: source identity must still reject
+	// completion for the previous snapshot, even when analysis is cached.
+	next := NewSnapshotBuilder(changed).WithAnalysis(m.analysis).Build()
+	m.Update(SnapshotReadyMsg{Snapshot: next, SnapshotVer: 1})
+	before := m.snapshot
+	m.Update(oldMsg)
+	if m.snapshot != before || m.issueMap["view-1"].Title != "NEW_SOURCE_TITLE" {
+		t.Fatal("old Phase2 completion installed stale source data")
+	}
+	pending := m.preparePhase2Cmd()
+	m.Stop()
+	if msg := pending(); msg != nil {
+		t.Fatalf("shutdown preparation returned an installable result: %T", msg)
+	}
+}
+
+func TestPreparedPhase2CapturesMutableIssueAndTreeInputs(t *testing.T) {
+	issues, err := testutil.PerformanceIssues("realistic", 128, 20260904)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewModel(cloneIssuesForAsync(issues), nil, "")
+	t.Cleanup(m.Stop)
+	snapshot := NewSnapshotBuilder(cloneIssuesForAsync(issues)).Build()
+	m.Update(SnapshotReadyMsg{Snapshot: snapshot})
+	cmd := m.preparePhase2Cmd()
+	want := snapshot.Issues[0].Description
+	result := make(chan tea.Msg, 1)
+	go func() { result <- cmd() }()
+	for i := 0; i < 100; i++ {
+		snapshot.Issues[0].Description = fmt.Sprintf("mutation %d", i)
+		if len(snapshot.ListItems) > 0 {
+			snapshot.ListItems[0].Issue.Labels[0] = fmt.Sprintf("changed-%d", i)
+		}
+		for _, node := range snapshot.TreeNodeMap {
+			node.Expanded = !node.Expanded
+		}
+	}
+	msg, ok := (<-result).(Phase2ReadyMsg)
+	if !ok || msg.prepared == nil || msg.prepared.Issues[0].Description != want {
+		t.Fatal("asynchronous preparation read mutable live issue data")
+	}
+}
 
 func TestDataSnapshot_Empty(t *testing.T) {
 	var s *DataSnapshot
@@ -206,16 +410,113 @@ func TestSnapshotBuilder_ReadyUsesExecutableStatusesAndDeferral(t *testing.T) {
 		t.Fatalf("CountBlocked = %d, want 1", snapshot.CountBlocked)
 	}
 
-	m := Model{currentFilter: "ready", issueMap: snapshot.IssueMap}
+	m := Model{currentFilter: "ready", issueMap: snapshot.IssueMap, analyzer: snapshot.Analyzer}
+	now := time.Now()
 	for _, id := range []string{"ready", "active"} {
-		if !m.matchesCurrentFilter(*snapshot.IssueMap[id]) {
+		if !m.matchesCurrentFilter(*snapshot.IssueMap[id], now) {
 			t.Errorf("ready filter rejected executable issue %q", id)
 		}
 	}
 	for _, id := range []string{"scheduled", "draft", "deferred", "blocked", "pinned", "hooked", "review"} {
-		if m.matchesCurrentFilter(*snapshot.IssueMap[id]) {
+		if m.matchesCurrentFilter(*snapshot.IssueMap[id], now) {
 			t.Errorf("ready filter accepted non-executable issue %q", id)
 		}
+	}
+}
+
+func TestReadinessViews_PreserveDependencyAuthorityAcrossReload(t *testing.T) {
+	deferUntil := time.Now().Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "external-open", Status: model.StatusOpen, SourceRepo: "ops"},
+		{ID: "external-closed", Status: model.StatusClosed, SourceRepo: "ops"},
+		{ID: "parent-blocked", Status: model.StatusOpen, SourceRepo: "api", Dependencies: []*model.Dependency{{DependsOnID: "external-open", Type: model.DepBlocks}}},
+		{ID: "child-blocked", Status: model.StatusOpen, SourceRepo: "api", Labels: []string{"child"}, Dependencies: []*model.Dependency{{DependsOnID: "parent-blocked", Type: model.DepParentChild}}},
+		{ID: "parent-ready", Status: model.StatusOpen, SourceRepo: "api", Dependencies: []*model.Dependency{{DependsOnID: "external-closed", Type: model.DepBlocks}}},
+		{ID: "child-ready", Status: model.StatusOpen, SourceRepo: "api", Labels: []string{"child"}, Dependencies: []*model.Dependency{{DependsOnID: "parent-ready", Type: model.DepParentChild}}},
+		{ID: "child-missing-parent", Status: model.StatusOpen, SourceRepo: "api", Labels: []string{"child"}, Dependencies: []*model.Dependency{{DependsOnID: "absent-parent", Type: model.DepParentChild}}},
+		{ID: "child-missing-blocker", Status: model.StatusOpen, SourceRepo: "api", Labels: []string{"child"}, Dependencies: []*model.Dependency{{DependsOnID: "absent-blocker", Type: model.DepBlocks}}},
+		{ID: "child-scheduled", Status: model.StatusOpen, SourceRepo: "api", Labels: []string{"child"}, DeferUntil: &deferUntil},
+		{ID: "child-draft", Status: model.StatusDraft, SourceRepo: "api", Labels: []string{"child"}},
+		{ID: "active", Status: model.StatusInProgress, SourceRepo: "api"},
+	}
+	assertIDs := func(t *testing.T, got []model.Issue, want ...string) {
+		t.Helper()
+		gotIDs := make(map[string]bool, len(got))
+		for _, issue := range got {
+			gotIDs[issue.ID] = true
+		}
+		wantIDs := make(map[string]bool, len(want))
+		for _, id := range want {
+			wantIDs[id] = true
+		}
+		if !reflect.DeepEqual(gotIDs, wantIDs) {
+			t.Errorf("visible IDs = %v, want %v", gotIDs, wantIDs)
+		}
+	}
+	actionable := true
+	r := &recipe.Recipe{Name: "children", Filters: recipe.FilterConfig{Tags: []string{"child"}, Actionable: &actionable}}
+	for _, view := range []string{"ready", "recipe"} {
+		t.Run(view, func(t *testing.T) {
+			m := NewModel(copyIssues(issues), nil, "")
+			m.workspaceMode = true
+			m.activeRepos = map[string]bool{"api": true}
+			if m.countReady != 4 {
+				t.Errorf("startup ready count = %d, want 4", m.countReady)
+			}
+			if view == "recipe" {
+				m.activeRecipe = r
+				m.applyRecipe(r)
+				assertIDs(t, m.FilteredIssues(), "child-ready")
+				assertIDs(t, m.filteredIssuesForActiveView(), "child-ready")
+			} else {
+				m.SetFilter("ready")
+				assertIDs(t, m.FilteredIssues(), "parent-ready", "child-ready", "active")
+			}
+
+			builder := NewSnapshotBuilder(copyIssues(issues))
+			if view == "recipe" {
+				builder.WithRecipe(r)
+			}
+			snapshot := builder.Build()
+			if snapshot.CountReady != 4 {
+				t.Errorf("snapshot ready count = %d, want 4", snapshot.CountReady)
+			}
+			updated, _ := m.Update(SnapshotReadyMsg{Snapshot: snapshot})
+			m = updated.(*Model)
+			if view == "recipe" {
+				assertIDs(t, m.FilteredIssues(), "child-ready")
+			} else {
+				assertIDs(t, m.FilteredIssues(), "parent-ready", "child-ready", "active")
+			}
+
+			// A closed blocker now permits one family, while a missing source
+			// record makes the previously ready family's authority incomplete.
+			var reloaded []model.Issue
+			for _, issue := range copyIssues(issues) {
+				if issue.ID == "external-closed" {
+					continue
+				}
+				if issue.ID == "external-open" {
+					issue.Status = model.StatusClosed
+				}
+				reloaded = append(reloaded, issue)
+			}
+			builder = NewSnapshotBuilder(reloaded)
+			if view == "recipe" {
+				builder.WithRecipe(r)
+			}
+			updated, _ = m.Update(SnapshotReadyMsg{Snapshot: builder.Build()})
+			m = updated.(*Model)
+			if m.countReady != 3 {
+				t.Errorf("reloaded ready count = %d, want 3", m.countReady)
+			}
+			if view == "recipe" {
+				assertIDs(t, m.FilteredIssues(), "child-blocked")
+				assertIDs(t, m.filteredIssuesForActiveView(), "child-blocked")
+			} else {
+				assertIDs(t, m.FilteredIssues(), "parent-blocked", "child-blocked", "active")
+			}
+		})
 	}
 }
 
@@ -250,8 +551,11 @@ func TestSnapshotBuilder_TombstoneCounts(t *testing.T) {
 	if snapshot.CountOpen != 3 {
 		t.Errorf("Expected 3 open issues (tombstone excluded), got %d", snapshot.CountOpen)
 	}
-	if snapshot.CountClosed != 2 {
-		t.Errorf("Expected 2 closed issues (closed+tombstone), got %d", snapshot.CountClosed)
+	if snapshot.CountClosed != 1 {
+		t.Errorf("Expected one visible closed issue, got %d", snapshot.CountClosed)
+	}
+	if len(snapshot.Issues) != 4 || snapshot.IssueMap["tomb-1"] != nil {
+		t.Errorf("snapshot resurrected a deleted record: %v", snapshot.Issues)
 	}
 	if snapshot.CountReady != 2 {
 		t.Errorf("Expected 2 ready issues (open-1, open-2), got %d", snapshot.CountReady)
@@ -280,7 +584,7 @@ func TestDatasetTierForIssueCount_Boundaries(t *testing.T) {
 	}
 }
 
-func TestSnapshotBuilder_WithBuildConfig_SkipsPrecomputesForLargeTier(t *testing.T) {
+func TestSnapshotBuilder_WithBuildConfig_PreparesInstallSurfacesForLargeTier(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "test-1", Title: "Issue 1", Status: model.StatusOpen, Priority: 1},
 		{ID: "test-2", Title: "Issue 2", Status: model.StatusClosed, Priority: 2},
@@ -304,11 +608,11 @@ func TestSnapshotBuilder_WithBuildConfig_SkipsPrecomputesForLargeTier(t *testing
 	if snapshot.TreeRoots != nil || snapshot.TreeNodeMap != nil {
 		t.Fatalf("expected tree precompute to be skipped")
 	}
-	if snapshot.BoardState != nil {
-		t.Fatalf("expected board precompute to be skipped")
+	if snapshot.BoardState == nil || len(snapshot.BoardState.ByStatus[0])+len(snapshot.BoardState.ByStatus[3]) != 2 {
+		t.Fatalf("large-tier snapshot did not prepare the board's open/closed rows")
 	}
-	if snapshot.GetGraphLayout() != nil {
-		t.Fatalf("expected graph layout precompute to be skipped")
+	if snapshot.GetGraphLayout() == nil || len(snapshot.GetGraphLayout().SortedIDs) != 2 {
+		t.Fatalf("large-tier snapshot did not prepare both graph nodes")
 	}
 	if snapshot.GetInsights().Stats != snapshot.Analysis {
 		t.Fatalf("expected Insights.Stats to reference Analysis")
@@ -1231,7 +1535,11 @@ func TestSortIssuesByRecipe_PriorityAsc(t *testing.T) {
 	}
 
 	r := &recipe.Recipe{Sort: recipe.SortConfig{Field: "priority", Direction: "asc"}}
-	sortIssuesByRecipe(issues, nil, r)
+	selected, err := applyRecipeToIssues(issues, nil, nil, nil, r, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	issues = selected
 
 	if issues[0].ID != "Z" || issues[1].ID != "A" {
 		t.Fatalf("expected Z then A, got %s then %s", issues[0].ID, issues[1].ID)
@@ -1245,7 +1553,11 @@ func TestSortIssuesByRecipe_PriorityDesc_TieBreakByID(t *testing.T) {
 	}
 
 	r := &recipe.Recipe{Sort: recipe.SortConfig{Field: "priority", Direction: "desc"}}
-	sortIssuesByRecipe(issues, nil, r)
+	selected, err := applyRecipeToIssues(issues, nil, nil, nil, r, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	issues = selected
 
 	if issues[0].ID != "A" || issues[1].ID != "B" {
 		t.Fatalf("expected A then B, got %s then %s", issues[0].ID, issues[1].ID)

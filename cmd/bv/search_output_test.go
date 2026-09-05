@@ -2,9 +2,53 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
 )
+
+func TestSearchMinScoreAndRankingIdentity(t *testing.T) {
+	for _, raw := range []string{"NaN", "Inf", "-Inf", "1.01", "-1.01", "invalid"} {
+		if _, err := parseSearchMinScore(raw); err == nil {
+			t.Errorf("accepted minimum %q", raw)
+		}
+	}
+	for _, raw := range []string{"-1", "0", "0.5", "1"} {
+		if got, err := parseSearchMinScore(raw); err != nil || got == nil {
+			t.Errorf("minimum %q: %v %v", raw, got, err)
+		}
+	}
+	if got, err := parseSearchMinScore(""); err != nil || got != nil {
+		t.Errorf("unset threshold: %v %v", got, err)
+	}
+	base := robotSearchOutput{RobotEnvelope: RobotEnvelope{DataHash: "data", SourcePath: "issues.jsonl", SourceKind: "jsonl_local"}, CandidateHash: "selected", IndexDataHash: "full", Query: "query", Mode: search.SearchModeText, Limit: 1}
+	first, err := searchRankingHash(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.GeneratedAt = "a later invocation"
+	base.Loaded = true
+	again, err := searchRankingHash(base)
+	if err != nil || first != again {
+		t.Fatal("volatile invocation/cache state changed ranking identity")
+	}
+	for _, change := range []func(*robotSearchOutput){
+		func(out *robotSearchOutput) { out.CandidateHash = "other selection" },
+		func(out *robotSearchOutput) { out.IndexDataHash = "other source" },
+		func(out *robotSearchOutput) { out.Query = "other query" },
+		func(out *robotSearchOutput) { out.Mode = search.SearchModeHybrid },
+		func(out *robotSearchOutput) { score := 0.5; out.MinScore = &score },
+		func(out *robotSearchOutput) { out.Limit = 2 },
+		func(out *robotSearchOutput) { now := time.Unix(1700000000, 0).UTC(); out.RankingTime = &now },
+	} {
+		changed := base
+		change(&changed)
+		hash, err := searchRankingHash(changed)
+		if err != nil || hash == first {
+			t.Fatalf("different retrieval configuration shares identity: %+v err=%v", changed, err)
+		}
+	}
+}
 
 // --search-preset used to be silently ignored unless --search-mode hybrid was
 // also given: the flag "worked" while the ranking never changed. A preset now

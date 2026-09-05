@@ -35,15 +35,15 @@ func TestApplyRecipe_StatusFilter(t *testing.T) {
 	m.applyRecipe(r)
 
 	filtered := m.FilteredIssues()
-	if len(filtered) != 2 {
-		t.Fatalf("Expected 2 filtered issues, got %d", len(filtered))
+	if len(filtered) != 1 {
+		t.Fatalf("Expected one visible closed issue, got %d", len(filtered))
 	}
 	got := map[string]bool{}
 	for _, iss := range filtered {
 		got[iss.ID] = true
 	}
-	if !got["closed"] || !got["tombstone"] {
-		t.Errorf("Expected issues 'closed' and 'tombstone', got %+v", got)
+	if !got["closed"] || got["tombstone"] {
+		t.Errorf("Expected 'closed' only; deleted records must stay hidden, got %+v", got)
 	}
 }
 
@@ -96,6 +96,225 @@ func TestApplyRecipe_ActionableFilter(t *testing.T) {
 	}
 	if filtered[0].ID != "A" {
 		t.Errorf("Expected A (actionable), got %s", filtered[0].ID)
+	}
+}
+
+func TestNewModel_ScopedReadinessAuthority(t *testing.T) {
+	full := []model.Issue{
+		{ID: "closed-external", Status: model.StatusClosed},
+		{ID: "open-external", Status: model.StatusOpen},
+		{ID: "parent", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "closed-external", Type: model.DepBlocks}}},
+		{ID: "allowed", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "parent", Type: model.DepParentChild}}},
+		{ID: "blocked", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "open-external", Type: model.DepBlocks}}},
+		{ID: "unknown", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "absent", Type: model.DepBlocks}}},
+	}
+	selected := full[3:]
+	yes := true
+	r := &recipe.Recipe{Name: "actionable", Filters: recipe.FilterConfig{Actionable: &yes}}
+	m := NewModel(copyIssues(selected), r, "", ReadinessScope{Authority: model.NewReadinessIndex(full)})
+	if got := m.FilteredIssues(); len(got) != 1 || got[0].ID != "allowed" {
+		t.Errorf("initial actionable recipe = %v, want allowed only", got)
+	}
+	if m.countReady != 1 {
+		t.Errorf("ready count = %d, want 1", m.countReady)
+	}
+	m.SetFilter("ready")
+	if got := m.FilteredIssues(); len(got) != 1 || got[0].ID != "allowed" {
+		t.Errorf("ready filter = %v, want allowed only", got)
+	}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = updated.(*Model)
+	plan := m.actionableView.plan
+	if plan.TotalActionable != 1 || len(plan.Tracks) != 1 || len(plan.Tracks[0].Items) != 1 || plan.Tracks[0].Items[0].ID != "allowed" {
+		t.Errorf("actionable panel lost full dependency authority: %+v", plan)
+	}
+}
+
+func TestNewModel_LabelContextIsNotCandidateWork(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "api-blocked", Status: model.StatusOpen, Labels: []string{"backend"}, Dependencies: []*model.Dependency{{DependsOnID: "web-ready", Type: model.DepBlocks}}},
+		{ID: "web-ready", Status: model.StatusOpen, Labels: []string{"frontend"}},
+		{ID: "api-ready", Status: model.StatusOpen, Labels: []string{"backend"}},
+	}
+	candidates := map[string]bool{"api-blocked": true, "api-ready": true}
+	m := NewModel(copyIssues(issues), nil, "", ReadinessScope{Authority: model.NewReadinessIndex(issues), CandidateIDs: candidates})
+	if m.countReady != 1 {
+		t.Errorf("ready count includes graph context: %d, want 1", m.countReady)
+	}
+	if m.issueMap["web-ready"] == nil || len(m.FilteredIssues()) != 3 {
+		t.Fatal("dependency context must remain available for exploration")
+	}
+	assertSelectedWork := func(t *testing.T, m *Model) {
+		t.Helper()
+		m.SetFilter("ready")
+		if got := m.FilteredIssues(); len(got) != 1 || got[0].ID != "api-ready" {
+			t.Errorf("ready filter included context: %v", got)
+		}
+		m.rebuildInsightsPanel()
+		if got := m.insightsPanel.topPicks; len(got) != 1 || got[0].ID != "api-ready" {
+			t.Errorf("triage top picks included context: %v", got)
+		}
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+		m = updated.(*Model)
+		plan := m.actionableView.plan
+		if plan.TotalActionable != 1 || len(plan.Tracks) != 1 || len(plan.Tracks[0].Items) != 1 || plan.Tracks[0].Items[0].ID != "api-ready" {
+			t.Errorf("actionable panel included context: %+v", plan)
+		}
+		m.isActionableView = false
+		m.focused = focusList
+		yes := true
+		r := &recipe.Recipe{Name: "actionable", Filters: recipe.FilterConfig{Actionable: &yes}}
+		m.activeRecipe = r
+		m.applyRecipe(r)
+		if got := m.FilteredIssues(); len(got) != 1 || got[0].ID != "api-ready" {
+			t.Errorf("actionable recipe included context: %v", got)
+		}
+		if got := m.filteredIssuesForActiveView(); len(got) != 1 || got[0].ID != "api-ready" {
+			t.Errorf("actionable board/graph included context: %v", got)
+		}
+	}
+	assertSelectedWork(t, m)
+	// Mutating the caller's map must not widen the model's owned selection.
+	candidates["web-ready"] = true
+	assertSelectedWork(t, m)
+	updated, _ := m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(copyIssues(issues)).WithRecipe(m.activeRecipe).Build()})
+	m = updated.(*Model)
+	if m.countReady != 1 {
+		t.Errorf("reloaded ready count includes graph context: %d, want 1", m.countReady)
+	}
+	if got := m.FilteredIssues(); len(got) != 1 || got[0].ID != "api-ready" {
+		t.Errorf("reloaded actionable recipe included context: %v", got)
+	}
+	assertSelectedWork(t, m)
+
+	m.setActiveRecipe(nil)
+	m.SetFilter("all")
+	updated, _ = m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(copyIssues(issues)).Build()})
+	m = updated.(*Model)
+	if len(m.FilteredIssues()) != 3 {
+		t.Fatal("reloaded graph context should remain available in the all view")
+	}
+	for _, row := range m.list.Items() {
+		item := row.(IssueItem)
+		if item.Issue.ID == "web-ready" && (item.IsQuickWin || item.TriageScore != 0 || len(item.TriageReasons) > 0) {
+			t.Errorf("context retained recommendation badges from unscoped worker: %+v", item)
+		}
+	}
+	if got := m.insightsPanel.topPicks; len(got) != 1 || got[0].ID != "api-ready" {
+		t.Errorf("snapshot triage included context before phase 2: %v", got)
+	}
+	m.analysis.WaitForPhase2()
+	updated, _ = m.Update(Phase2ReadyMsg{Stats: m.analysis, Insights: m.analysis.GenerateInsights(len(issues))})
+	m = updated.(*Model)
+	if got := m.insightsPanel.topPicks; len(got) != 1 || got[0].ID != "api-ready" {
+		t.Errorf("phase 2 triage included context: %v", got)
+	}
+	for _, row := range m.list.Items() {
+		item := row.(IssueItem)
+		if item.Issue.ID == "web-ready" && (item.IsQuickWin || item.TriageScore != 0 || len(item.TriageReasons) > 0) {
+			t.Errorf("phase 2 restored recommendation badges for context: %+v", item)
+		}
+	}
+
+	reloaded := cloneIssuesForAsync(issues)
+	for i := range reloaded {
+		if reloaded[i].ID == "web-ready" {
+			reloaded[i].Status = model.StatusClosed
+		}
+	}
+	updated, _ = m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(reloaded).Build()})
+	m = updated.(*Model)
+	m.SetFilter("ready")
+	if got := m.FilteredIssues(); len(got) != 2 || m.countReady != 2 {
+		t.Errorf("freshly closed external blocker should permit both selected backend issues: ready=%d, rows=%v", m.countReady, got)
+	}
+}
+
+func TestNewModel_EmptyReadinessSelectionDoesNotSelectContext(t *testing.T) {
+	issues := []model.Issue{{ID: "context", Status: model.StatusOpen}}
+	m := NewModel(copyIssues(issues), nil, "", ReadinessScope{CandidateIDs: map[string]bool{}})
+	if len(m.FilteredIssues()) != 1 {
+		t.Fatal("empty work selection must preserve exploration context")
+	}
+	m.SetFilter("ready")
+	if len(m.FilteredIssues()) != 0 || m.countReady != 0 {
+		t.Fatal("empty candidate map must select no ready work")
+	}
+	updated, _ := m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(copyIssues(issues)).Build()})
+	m = updated.(*Model)
+	if len(m.FilteredIssues()) != 0 || m.countReady != 0 || len(m.insightsPanel.topPicks) != 0 {
+		t.Fatal("reload widened empty candidate selection")
+	}
+}
+
+func TestNewModel_RepoSelectionSurvivesFullSourceReload(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "api-ready", Status: model.StatusOpen, SourceRepo: "api"},
+		{ID: "api-blocked", Status: model.StatusOpen, SourceRepo: "api", Dependencies: []*model.Dependency{{DependsOnID: "web-ready", Type: model.DepBlocks}}},
+		{ID: "web-ready", Status: model.StatusOpen, SourceRepo: "web"},
+		{ID: "ops-ready", Status: model.StatusOpen, SourceRepo: "ops"},
+	}
+	// --repo initially supplies only selected rows to NewModel, while its
+	// watcher later reloads the complete source containing other repositories.
+	selected := copyIssues(issues[:2])
+	candidateIDs := map[string]bool{"api-ready": true, "api-blocked": true}
+	m := NewModel(selected, nil, "", ReadinessScope{Authority: model.NewReadinessIndex(issues), CandidateIDs: candidateIDs})
+	m.SetFilter("ready")
+	if got := m.FilteredIssues(); len(got) != 1 || got[0].ID != "api-ready" {
+		t.Fatalf("initial repository selection = %v, want api-ready", got)
+	}
+	for _, closeExternalBlocker := range []bool{false, true} {
+		loaded := cloneIssuesForAsync(issues)
+		wantReady := 1
+		if closeExternalBlocker {
+			loaded[2].Status = model.StatusClosed
+			wantReady = 2
+		}
+		updated, _ := m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(loaded).Build()})
+		m = updated.(*Model)
+		if len(m.issues) != len(issues) {
+			t.Fatal("regression must exercise a complete source reload")
+		}
+		got := m.FilteredIssues()
+		if len(got) != wantReady || m.countReady != wantReady {
+			t.Errorf("closed external blocker=%t: ready count=%d, rows=%v, want %d selected issues", closeExternalBlocker, m.countReady, got, wantReady)
+		}
+		for _, issue := range got {
+			if !candidateIDs[issue.ID] {
+				t.Errorf("external repository became ready work after reload: %s", issue.ID)
+			}
+		}
+		if len(m.insightsPanel.topPicks) != wantReady {
+			t.Errorf("closed external blocker=%t: triage picks=%v, want %d selected issues", closeExternalBlocker, m.insightsPanel.topPicks, wantReady)
+		}
+		for _, pick := range m.insightsPanel.topPicks {
+			if !candidateIDs[pick.ID] {
+				t.Errorf("external repository became a triage pick after reload: %s", pick.ID)
+			}
+		}
+	}
+}
+
+func TestReadinessFilters_UseOneClockIncludingDeferralBoundary(t *testing.T) {
+	deadline := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	issue := model.Issue{ID: "scheduled", Status: model.StatusOpen, DeferUntil: &deadline}
+	m := NewModel([]model.Issue{issue}, nil, "")
+	m.currentFilter = "ready"
+	for _, now := range []time.Time{deadline.Add(-time.Nanosecond), deadline, deadline.Add(time.Nanosecond)} {
+		want := !now.Before(deadline)
+		if got := m.matchesCurrentFilter(issue, now); got != want {
+			t.Errorf("ready at %v = %t, want %t", now, got, want)
+		}
+		for _, actionable := range []bool{false, true} {
+			r := &recipe.Recipe{Filters: recipe.FilterConfig{Actionable: &actionable}}
+			selected, err := applyRecipeToIssues([]model.Issue{issue}, m.analyzer, m.analysis, nil, r, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(selected) == 1; got != (actionable == want) {
+				t.Errorf("recipe actionable=%t at %v = %t, want %t", actionable, now, got, actionable == want)
+			}
+		}
 	}
 }
 

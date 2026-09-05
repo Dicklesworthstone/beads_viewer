@@ -64,25 +64,6 @@ func isClosedLikeStatus(status model.Status) bool {
 	return status == model.StatusClosed || status == model.StatusTombstone
 }
 
-// isIssueReadyAt centralizes the TUI's ready semantics. Only open or
-// in-progress issues are executable work, and an otherwise-ready issue with a
-// future defer_until is withheld until that instant passes (parity with br
-// ready and the actionable recipe).
-func isIssueReadyAt(issue model.Issue, issueMap map[string]*model.Issue, now time.Time) bool {
-	if !issue.Status.IsOpen() || issue.IsDeferredAt(now) {
-		return false
-	}
-	for _, dep := range issue.Dependencies {
-		if dep == nil || !dep.Type.IsBlocking() {
-			continue
-		}
-		if blocker, exists := issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-			return false
-		}
-	}
-	return true
-}
-
 type snapshotBuildConfig struct {
 	PrecomputeTriage      bool
 	PrecomputeTree        bool
@@ -109,8 +90,8 @@ func snapshotBuildConfigForTier(tier datasetTier) snapshotBuildConfig {
 	case datasetTierLarge:
 		cfg.PrecomputeTriage = false
 		cfg.PrecomputeTree = false
-		cfg.PrecomputeBoard = false
-		cfg.PrecomputeGraphLayout = false
+		// The UI needs these structures to install a snapshot. Preparing them
+		// here keeps their O(N) construction off the event loop at 5k–20k rows.
 		cfg.PrecomputeInsights = false
 	case datasetTierHuge:
 		cfg.PrecomputeTriage = false
@@ -223,11 +204,15 @@ type DataSnapshot struct {
 	alertsCritical int
 	alertsWarning  int
 	alertsInfo     int
-	TriageScores   map[string]float64
-	TriageReasons  map[string]analysis.TriageReasons
-	QuickWinSet    map[string]bool
-	BlockerSet     map[string]bool
-	UnblocksMap    map[string][]string
+	phase2Triage   *analysis.TriageResult
+	// Detached mutable inputs are prepared before publication, so starting a
+	// Phase2 command does not deep-copy every view on the event loop.
+	phase2Input   *DataSnapshot
+	TriageScores  map[string]float64
+	TriageReasons map[string]analysis.TriageReasons
+	QuickWinSet   map[string]bool
+	BlockerSet    map[string]bool
+	UnblocksMap   map[string][]string
 	// TreeRoots and TreeNodeMap contain a pre-built parent/child tree for the Tree view.
 	// These are computed off-thread by SnapshotBuilder to avoid UI-thread work when
 	// entering the tree view for large datasets.
@@ -241,10 +226,11 @@ type DataSnapshot struct {
 	graphLayout *GraphLayout
 
 	// Metadata
-	CreatedAt  time.Time // When this snapshot was built
-	DataHash   string    // Hash of source data for cache validation
-	RecipeName string    // Active recipe name for this snapshot (bv-2h40)
-	RecipeHash string    // Fingerprint of active recipe for this snapshot (bv-4ilb)
+	CreatedAt     time.Time // When this snapshot was built
+	DataHash      string    // Hash of source data for cache validation
+	AuthorityHash string    // Full source identity, including hidden dependency records.
+	RecipeName    string    // Active recipe name for this snapshot (bv-2h40)
+	RecipeHash    string    // Fingerprint of active recipe for this snapshot (bv-4ilb)
 	// DatasetTier is a tiered performance mode for large datasets (bv-9thm).
 	// When unknown, normal behavior applies.
 	DatasetTier datasetTier
@@ -399,12 +385,39 @@ type SnapshotBuilder struct {
 }
 
 // NewSnapshotBuilder creates a builder for constructing a DataSnapshot.
-func NewSnapshotBuilder(issues []model.Issue) *SnapshotBuilder {
+func NewSnapshotBuilder(issues []model.Issue, authority ...*model.ReadinessIndex) *SnapshotBuilder {
+	var readiness *model.ReadinessIndex
+	if len(authority) > 0 {
+		readiness = authority[0]
+	}
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
+	issues = issuesWithoutTombstones(issues)
+	analyzer := analysis.NewAnalyzer(issues)
+	analyzer.SetReadinessScope(readiness, nil)
 	return &SnapshotBuilder{
 		issues:   issues,
-		analyzer: analysis.NewAnalyzer(issues),
+		analyzer: analyzer,
 		cfg:      snapshotBuildConfigDefault(),
 	}
+}
+
+func issuesWithoutTombstones(issues []model.Issue) []model.Issue {
+	for i, issue := range issues {
+		if !issue.Status.IsTombstone() {
+			continue
+		}
+		visible := make([]model.Issue, 0, len(issues)-1)
+		visible = append(visible, issues[:i]...)
+		for _, remaining := range issues[i+1:] {
+			if !remaining.Status.IsTombstone() {
+				visible = append(visible, remaining)
+			}
+		}
+		return visible
+	}
+	return issues
 }
 
 // WithWeights installs feedback-adjusted factor weights on the builder's
@@ -465,7 +478,10 @@ func (b *SnapshotBuilder) WithPreviousSnapshot(prev *DataSnapshot, diff *analysi
 // or call GetGraphStats().WaitForPhase2() if you need Phase 2 data immediately.
 func (b *SnapshotBuilder) Build() *DataSnapshot {
 	issues := b.issues
-	now := time.Now()
+	createdAt := time.Now()
+	// Readiness, recipes, and scoring share the analyzer's reference instant.
+	// Freshness still describes when this snapshot was actually constructed.
+	now := b.analyzer.Now()
 
 	// Apply default sorting to match the legacy reload path:
 	// Open first, then priority (ascending), then created date (newest first).
@@ -508,6 +524,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 
 	// Compute statistics
 	cOpen, cReady, cBlocked, cClosed := 0, 0, 0, 0
+	readiness := b.analyzer.Readiness()
 	for i := range issues {
 		issue := &issues[i]
 		if isClosedLikeStatus(issue.Status) {
@@ -519,20 +536,24 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		if issue.Status == model.StatusBlocked {
 			cBlocked++
 		}
-		if isIssueReadyAt(*issue, issueMap, now) {
+		if b.analyzer.IsCandidate(issue.ID) && readiness.Ready(issue.ID, now) {
 			cReady++
 		}
 	}
 
-	viewIssues := issues
-	if b.recipe != nil {
-		viewIssues = make([]model.Issue, 0, len(issues))
-		for i := range issues {
-			if issueMatchesRecipe(issues[i], issueMap, b.recipe) {
-				viewIssues = append(viewIssues, issues[i])
-			}
+	var recipeTriage map[string]float64
+	var triageResult analysis.TriageResult
+	if b.cfg.PrecomputeTriage || (b.recipe != nil && b.recipe.NeedsTriageScores()) {
+		triageResult = analysis.ComputeTriageFromAnalyzer(b.analyzer, graphStats, issues, analysis.TriageOptions{}, now)
+		recipeTriage = make(map[string]float64, len(triageResult.Recommendations))
+		for _, rec := range triageResult.Recommendations {
+			recipeTriage[rec.ID] = rec.Score
 		}
-		sortIssuesByRecipe(viewIssues, graphStats, b.recipe)
+	}
+	viewIssues := issues
+	var recipeErr error
+	if b.recipe != nil {
+		viewIssues, recipeErr = applyRecipeToIssues(issues, b.analyzer, graphStats, recipeTriage, b.recipe, now)
 	}
 
 	// Build list items with graph scores (respecting recipe filtering/sorting when present).
@@ -561,8 +582,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	)
 
 	// Compute triage insights (may be skipped for large/huge datasets; bv-9thm).
-	if b.cfg.PrecomputeTriage {
-		triageResult := analysis.ComputeTriageFromAnalyzer(b.analyzer, graphStats, issues, analysis.TriageOptions{}, now)
+	if b.cfg.PrecomputeTriage || (b.recipe != nil && b.recipe.NeedsTriageScores()) {
 		triageScores = make(map[string]float64, len(triageResult.Recommendations))
 		triageReasons = make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
 		quickWinSet = make(map[string]bool, len(triageResult.QuickWins))
@@ -639,7 +659,8 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 
 	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlerts(issues, graphStats, b.analyzer)
 
-	return &DataSnapshot{
+	snapshot := &DataSnapshot{
+		LoadError:      recipeErr,
 		Issues:         issues,
 		IssueMap:       issueMap,
 		ViewIssues:     viewIssues,
@@ -669,7 +690,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		TreeNodeMap:    treeNodeMap,
 		BoardState:     boardState,
 		graphLayout:    graphLayout,
-		CreatedAt:      now,
+		CreatedAt:      createdAt,
 		RecipeName:     recipeName(b.recipe),
 		RecipeHash:     recipeFingerprint(b.recipe),
 		phase2Ready:    graphStats.IsPhase2Ready(),
@@ -681,6 +702,8 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		},
 		IncrementalListUsed: listItemsIncremental,
 	}
+	snapshot.phase2Input = snapshot.detachedPhase2Input()
+	return snapshot
 }
 
 func listOrderFingerprint(items []IssueItem) uint64 {
@@ -826,164 +849,30 @@ func recipeName(r *recipe.Recipe) string {
 	return r.Name
 }
 
-func issueMatchesRecipe(issue model.Issue, issueMap map[string]*model.Issue, r *recipe.Recipe) bool {
+func applyRecipeToIssues(issues []model.Issue, analyzer *analysis.Analyzer, stats *analysis.GraphStats, triage map[string]float64, r *recipe.Recipe, now time.Time) ([]model.Issue, error) {
 	if r == nil {
-		return true
+		return append([]model.Issue(nil), issues...), nil
 	}
-
-	// Status filter
-	if len(r.Filters.Status) > 0 {
-		statusMatch := false
-		for _, s := range r.Filters.Status {
-			if matchesRecipeStatus(issue.Status, s) {
-				statusMatch = true
-				break
-			}
-		}
-		if !statusMatch {
-			return false
-		}
+	if err := r.Validate(); err != nil {
+		return nil, err
 	}
-
-	// Priority filter
-	if len(r.Filters.Priority) > 0 {
-		prioMatch := false
-		for _, p := range r.Filters.Priority {
-			if issue.Priority == p {
-				prioMatch = true
-				break
-			}
-		}
-		if !prioMatch {
-			return false
-		}
+	metrics := recipe.Metrics{Triage: triage}
+	if stats != nil {
+		metrics.Graph = stats
 	}
-
-	// Tags filter (must have ALL specified tags)
-	if len(r.Filters.Tags) > 0 {
-		for _, required := range r.Filters.Tags {
-			found := false
-			for _, label := range issue.Labels {
-				if label == required {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return false
+	if analyzer != nil {
+		metrics.Readiness = analyzer.Readiness()
+	}
+	candidates := issues
+	if r.Filters.Actionable != nil && analyzer != nil {
+		candidates = make([]model.Issue, 0, len(issues))
+		for _, issue := range issues {
+			if analyzer.IsCandidate(issue.ID) {
+				candidates = append(candidates, issue)
 			}
 		}
 	}
-
-	// Actionable filter (true = no open blockers and not scheduler-deferred;
-	// issue #191 parity with `br ready`)
-	if r.Filters.Actionable != nil && *r.Filters.Actionable {
-		if issue.IsDeferredAt(time.Now()) {
-			return false
-		}
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
-				continue
-			}
-			if blocker, exists := issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-				return false
-			}
-		}
-	}
-
-	return true
-}
-
-func sortIssuesByRecipe(issues []model.Issue, stats *analysis.GraphStats, r *recipe.Recipe) {
-	if r == nil || r.Sort.Field == "" {
-		return
-	}
-
-	desc := r.Sort.Direction == "desc"
-	field := r.Sort.Field
-
-	sort.Slice(issues, func(i, j int) bool {
-		ii := issues[i]
-		jj := issues[j]
-
-		var cmp int
-		switch field {
-		case "priority":
-			switch {
-			case ii.Priority < jj.Priority:
-				cmp = -1
-			case ii.Priority > jj.Priority:
-				cmp = 1
-			}
-		case "created", "created_at":
-			switch {
-			case ii.CreatedAt.Before(jj.CreatedAt):
-				cmp = -1
-			case ii.CreatedAt.After(jj.CreatedAt):
-				cmp = 1
-			}
-		case "updated", "updated_at":
-			switch {
-			case ii.UpdatedAt.Before(jj.UpdatedAt):
-				cmp = -1
-			case ii.UpdatedAt.After(jj.UpdatedAt):
-				cmp = 1
-			}
-		case "impact":
-			if stats == nil {
-				switch {
-				case ii.Priority < jj.Priority:
-					cmp = -1
-				case ii.Priority > jj.Priority:
-					cmp = 1
-				}
-				break
-			}
-			iScore := stats.GetCriticalPathScore(ii.ID)
-			jScore := stats.GetCriticalPathScore(jj.ID)
-			switch {
-			case iScore < jScore:
-				cmp = -1
-			case iScore > jScore:
-				cmp = 1
-			}
-		case "pagerank":
-			if stats == nil {
-				switch {
-				case ii.Priority < jj.Priority:
-					cmp = -1
-				case ii.Priority > jj.Priority:
-					cmp = 1
-				}
-				break
-			}
-			iScore := stats.GetPageRankScore(ii.ID)
-			jScore := stats.GetPageRankScore(jj.ID)
-			switch {
-			case iScore < jScore:
-				cmp = -1
-			case iScore > jScore:
-				cmp = 1
-			}
-		default:
-			switch {
-			case ii.Priority < jj.Priority:
-				cmp = -1
-			case ii.Priority > jj.Priority:
-				cmp = 1
-			}
-		}
-
-		// Tie-breaker for determinism.
-		if cmp == 0 {
-			return ii.ID < jj.ID
-		}
-
-		if desc {
-			return cmp > 0
-		}
-		return cmp < 0
-	})
+	return recipe.Apply(candidates, metrics, r, now)
 }
 
 func buildGraphLayout(issues []model.Issue, stats *analysis.GraphStats) *GraphLayout {
@@ -1281,6 +1170,36 @@ func graphLayoutWithRanks(old *GraphLayout, stats *analysis.GraphStats) *GraphLa
 	}
 }
 
+// detachedPhase2Input captures the mutable issue-backed surfaces on the UI
+// thread before asynchronous preparation. Layout ranks and semantic documents
+// are immutable snapshot data; the preparation only reads them.
+func (s *DataSnapshot) detachedPhase2Input() *DataSnapshot {
+	if s == nil {
+		return nil
+	}
+	cloned := *s
+	cloned.phase2Input = nil
+	if input := s.phase2Input; input != nil {
+		// Keep current source metadata (the worker fills hashes/load warnings
+		// after Build), while reusing private detached issue-backed inputs.
+		cloned.Issues, cloned.IssueMap = input.Issues, input.IssueMap
+		cloned.ViewIssues, cloned.ListItems = input.ViewIssues, input.ListItems
+		cloned.TreeRoots, cloned.TreeNodeMap = input.TreeRoots, input.TreeNodeMap
+		cloned.BoardState = input.BoardState
+		return &cloned
+	}
+	cloned.Issues = cloneIssuesForAsync(s.Issues)
+	cloned.IssueMap = make(map[string]*model.Issue, len(cloned.Issues))
+	for i := range cloned.Issues {
+		cloned.IssueMap[cloned.Issues[i].ID] = &cloned.Issues[i]
+	}
+	cloned.ViewIssues = cloneIssuesForAsync(s.ViewIssues)
+	cloned.ListItems = deepCopyListItems(s.ListItems)
+	cloned.TreeRoots, cloned.TreeNodeMap = deepCopyTree(s.TreeRoots, s.TreeNodeMap, cloned.IssueMap)
+	cloned.BoardState = deepCopyBoardState(s.BoardState)
+	return &cloned
+}
+
 // WithPhase2 returns a new DataSnapshot with Phase 2 analysis results populated.
 // It keeps read-only Phase 1 structures where safe, but clones issue-backed and
 // tree-backed state so the returned snapshot remains detached from any legacy UI
@@ -1303,9 +1222,11 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 	var quickWinSet map[string]bool
 	var blockerSet map[string]bool
 	var unblocksMap map[string][]string
+	var completedTriage *analysis.TriageResult
 
 	if stats != nil && analyzer != nil && len(issues) > 0 {
-		triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, stats, issues, analysis.TriageOptions{}, time.Now())
+		triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, stats, issues, analysis.TriageOptions{}, analyzer.Now())
+		completedTriage = &triageResult
 		triageScores = make(map[string]float64, len(triageResult.Recommendations))
 		triageReasons = make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
 		quickWinSet = make(map[string]bool, len(triageResult.QuickWins))
@@ -1361,6 +1282,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		alertsCritical: alertsCritical,
 		alertsWarning:  alertsWarning,
 		alertsInfo:     alertsInfo,
+		phase2Triage:   completedTriage,
 		TreeRoots:      treeRoots,                        // Deep copy - tree view mutates these
 		TreeNodeMap:    treeNodeMap,                      // Deep copy - tree view mutates these
 		BoardState:     deepCopyBoardState(s.BoardState), // Deep copy - contains mutable [4][]model.Issue arrays
@@ -1384,6 +1306,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		CountClosed:          s.CountClosed,
 		CreatedAt:            s.CreatedAt,
 		DataHash:             s.DataHash,
+		AuthorityHash:        s.AuthorityHash,
 		RecipeName:           s.RecipeName,
 		RecipeHash:           s.RecipeHash,
 		DatasetTier:          s.DatasetTier,

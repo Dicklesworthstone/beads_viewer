@@ -144,8 +144,15 @@ type UpdateMsg struct {
 
 // Phase2ReadyMsg is sent when async graph analysis Phase 2 completes
 type Phase2ReadyMsg struct {
-	Stats    *analysis.GraphStats // The stats that completed, to detect stale messages
-	Insights analysis.Insights    // Precomputed insights for Phase 2 metrics
+	Stats          *analysis.GraphStats // The stats that completed, to detect stale messages
+	Insights       analysis.Insights    // Precomputed insights for Phase 2 metrics
+	prepared       *DataSnapshot
+	priorityHints  map[string]*analysis.PriorityRecommendation
+	sourceSnapshot *DataSnapshot
+	sourceAnalyzer *analysis.Analyzer
+	sourceWeights  analysis.Weights
+	sourceNow      time.Time
+	preparationCtx context.Context
 }
 
 // WaitForPhase2Cmd returns a command that waits for Phase 2 and sends Phase2ReadyMsg
@@ -157,6 +164,77 @@ func WaitForPhase2Cmd(stats *analysis.GraphStats) tea.Cmd {
 		stats.WaitForPhase2()
 		ins := stats.GenerateInsights(stats.NodeCount)
 		return Phase2ReadyMsg{Stats: stats, Insights: ins}
+	}
+}
+
+// preparePhase2Cmd captures detached UI inputs before starting background work.
+// The command never reads Model state: filters and selection are applied from
+// the current model only when the prepared result is accepted by Update.
+func (m *Model) preparePhase2Cmd() tea.Cmd {
+	m.cancelPhase2Preparation()
+	if m.analysis == nil || m.analyzer == nil {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.phase2PreparationCancel = cancel
+	stats, source, sourceAnalyzer := m.analysis, m.snapshot, m.analyzer
+	input := source.detachedPhase2Input()
+	var issues []model.Issue
+	if input != nil {
+		issues = input.Issues
+	} else {
+		issues = cloneIssuesForAsync(m.issues)
+	}
+	authority := sourceAnalyzer.Readiness()
+	scoring := sourceAnalyzer.CaptureScoring()
+	weights, now := sourceAnalyzer.Weights(), sourceAnalyzer.Now()
+	var candidates map[string]bool
+	if m.candidateIDs != nil {
+		candidates = make(map[string]bool, len(m.candidateIDs))
+		for id, selected := range m.candidateIDs {
+			candidates[id] = selected
+		}
+	}
+	return func() tea.Msg {
+		if err := stats.WaitForPhase2Context(ctx); err != nil {
+			return nil
+		}
+		analyzer := analysis.NewAnalyzer(issues)
+		analyzer.SetReadinessScope(authority, candidates)
+		analyzer.RestoreScoring(scoring)
+		insights := stats.GenerateInsights(stats.NodeCount)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if input == nil {
+			builder := NewSnapshotBuilder(issues, authority).WithAnalysis(stats)
+			builder.analyzer.RestoreScoring(scoring)
+			builder.analyzer.SetReadinessScope(authority, candidates)
+			input = builder.Build()
+		}
+		prepared := input.WithPhase2(stats, insights, issues, analyzer)
+		if ctx.Err() != nil {
+			return nil
+		}
+		recommendations := analyzer.GenerateRecommendationsFromStats(stats, analysis.DefaultThresholds())
+		priorityHints := make(map[string]*analysis.PriorityRecommendation, len(recommendations))
+		for i := range recommendations {
+			priorityHints[recommendations[i].IssueID] = &recommendations[i]
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		return Phase2ReadyMsg{
+			Stats: stats, Insights: insights, prepared: prepared, priorityHints: priorityHints,
+			sourceSnapshot: source, sourceAnalyzer: sourceAnalyzer, sourceWeights: weights, sourceNow: now, preparationCtx: ctx,
+		}
+	}
+}
+
+func (m *Model) cancelPhase2Preparation() {
+	if m.phase2PreparationCancel != nil {
+		m.phase2PreparationCancel()
+		m.phase2PreparationCancel = nil
 	}
 }
 
@@ -271,29 +349,58 @@ func WatchFileCmd(w *watcher.Watcher) tea.Cmd {
 	}
 }
 
-func loadIssuesForReload(path string, opts loader.ParseOptions) (loader.PooledIssues, error) {
+type reloadIssueData struct {
+	loader.PooledIssues
+	Authority     *model.ReadinessIndex
+	AuthorityHash string
+}
+
+func loadIssuesForReload(path string, opts loader.ParseOptions) (reloadIssueData, error) {
+	var loaded loader.PooledIssues
+	var err error
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".db", ".sqlite", ".sqlite3":
 		source, ok, err := datasource.SourceFromFile(path)
 		if err != nil {
-			return loader.PooledIssues{}, err
+			return reloadIssueData{}, err
 		}
 		if !ok {
-			return loader.PooledIssues{}, fmt.Errorf("unsupported SQLite source path: %s", path)
+			return reloadIssueData{}, fmt.Errorf("unsupported SQLite source path: %s", path)
 		}
-		reader, err := datasource.NewReader(source)
+		reader, err := datasource.NewSQLiteReader(source)
 		if err != nil {
-			return loader.PooledIssues{}, err
+			return reloadIssueData{}, err
 		}
 		defer reader.Close()
-		issues, err := reader.LoadIssuesFiltered(opts.IssueFilter)
+		loaded.Issues, err = reader.LoadIssueAuthority()
 		if err != nil {
-			return loader.PooledIssues{}, err
+			return reloadIssueData{}, err
 		}
-		return loader.PooledIssues{Issues: issues}, nil
 	default:
-		return loader.LoadIssuesFromFileWithOptionsPooled(path, opts)
+		fullOpts := opts
+		fullOpts.IssueFilter = nil
+		loaded, err = loader.LoadIssuesFromFileWithOptionsPooled(path, fullOpts)
 	}
+	if err != nil {
+		return reloadIssueData{}, err
+	}
+	result := reloadIssueData{
+		Authority:     model.NewReadinessIndex(loaded.Issues),
+		AuthorityHash: analysis.ComputeDataHash(loaded.Issues),
+	}
+	loaded.Issues = issuesWithoutTombstones(loaded.Issues)
+	if opts.IssueFilter != nil {
+		visible := loaded.Issues[:0]
+		for i := range loaded.Issues {
+			if opts.IssueFilter(&loaded.Issues[i]) {
+				visible = append(visible, loaded.Issues[i])
+			}
+		}
+		clear(loaded.Issues[len(visible):])
+		loaded.Issues = visible
+	}
+	result.PooledIssues = loaded
+	return result, nil
 }
 
 func countIssuesForReload(path string) (int, error) {
@@ -602,17 +709,26 @@ func cloneIssuesForAsync(issues []model.Issue) []model.Issue {
 	return clones
 }
 
+// ReadinessScope keeps selected work separate from graph context. A nil
+// CandidateIDs map selects all issues; an empty map selects no work.
+type ReadinessScope struct {
+	Authority    *model.ReadinessIndex
+	CandidateIDs map[string]bool
+}
+
 // Model is the main Bubble Tea model for the beads viewer
 type Model struct {
 	// Data
-	issues       []model.Issue
-	pooledIssues []*model.Issue // Issue pool refs for sync reloads (return to pool on replace)
-	issueMap     map[string]*model.Issue
-	analyzer     *analysis.Analyzer
-	analysis     *analysis.GraphStats
-	beadsPath    string           // Path to beads.jsonl for reloading
-	watcher      *watcher.Watcher // File watcher for live reload
-	instanceLock *instance.Lock   // Multi-instance coordination lock
+	issues                  []model.Issue
+	pooledIssues            []*model.Issue // Issue pool refs for sync reloads (return to pool on replace)
+	issueMap                map[string]*model.Issue
+	analyzer                *analysis.Analyzer
+	analysis                *analysis.GraphStats
+	phase2PreparationCancel context.CancelFunc
+	candidateIDs            map[string]bool  // Owned selection; graph context remains in issues.
+	beadsPath               string           // Path to beads.jsonl for reloading
+	watcher                 *watcher.Watcher // File watcher for live reload
+	instanceLock            *instance.Lock   // Multi-instance coordination lock
 
 	// Background Worker (Phase 2 architecture - bv-m7v8)
 	// snapshot is the current immutable data snapshot from BackgroundWorker.
@@ -750,10 +866,15 @@ type Model struct {
 	blockerSet    map[string]bool                   // issueID -> true if significant blocker
 
 	// Recipe picker
-	showRecipePicker bool
-	recipePicker     RecipePickerModel
-	activeRecipe     *recipe.Recipe
-	recipeLoader     *recipe.Loader
+	showRecipePicker    bool
+	recipePicker        RecipePickerModel
+	activeRecipe        *recipe.Recipe
+	recipeLoader        *recipe.Loader
+	recipeListItems     []list.Item
+	recipeCollapsed     map[string]bool
+	recipeMetricValues  map[string]map[string]float64
+	recipeBlockerCounts map[string]int
+	recipeGraphOwned    bool
 
 	// Label picker (bv-126)
 	showLabelPicker bool
@@ -1217,10 +1338,15 @@ func (m *Model) setListItems(items []list.Item) tea.Cmd {
 	filterState := m.list.FilterState()
 	filterTerm := m.list.FilterInput.Value()
 	selectedID := m.selectedListIssueID(filterState != list.Unfiltered, filterTerm)
+	m.recipeListItems = append([]list.Item(nil), items...)
+	if filterState == list.Unfiltered {
+		items = m.groupRecipeItems(items)
+	}
 	m.listDataGeneration++
 	cmd := m.list.SetItems(items)
 	m.updateSemanticIDs(items)
 	if filterState == list.Unfiltered {
+		m.selectVisibleListItemByID(selectedID)
 		return cmd
 	}
 
@@ -1277,13 +1403,21 @@ func (m *Model) shouldShowSearchScores() bool {
 }
 
 func (m *Model) updateListDelegate() {
-	m.list.SetDelegate(IssueDelegate{
+	delegate := IssueDelegate{
 		Theme:             m.theme,
 		ShowPriorityHints: m.showPriorityHints,
 		PriorityHints:     m.priorityHints,
 		WorkspaceMode:     m.workspaceMode,
 		ShowSearchScores:  m.shouldShowSearchScores(),
-	})
+		MetricNames:       recipeMetricNames(m.activeRecipe),
+		MetricValues:      m.recipeMetricValues,
+		BlockerCounts:     m.recipeBlockerCounts,
+	}
+	if m.activeRecipe != nil {
+		delegate.Columns = m.activeRecipe.View.Columns
+		delegate.TruncateTitle = m.activeRecipe.View.TruncateTitle
+	}
+	m.list.SetDelegate(delegate)
 }
 
 func (m *Model) applySemanticScores(term string) {
@@ -1434,14 +1568,34 @@ func (m *Model) cancelHistoryLoad() {
 
 func (m *Model) quitCommand() tea.Cmd {
 	m.cancelHistoryLoad()
+	m.cancelPhase2Preparation()
 	return tea.Quit
 }
 
 // NewModel creates a new Model from the given issues
 // beadsPath is the path to the beads.jsonl file for live reload support
-func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath string) *Model {
+// An optional scope retains dependency authority and selected work separately.
+func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath string, scope ...ReadinessScope) *Model {
+	var authority *model.ReadinessIndex
+	if len(scope) > 0 {
+		authority = scope[0].Authority
+	}
+	if authority == nil {
+		authority = model.NewReadinessIndex(issues)
+	}
+	issues = issuesWithoutTombstones(issues)
 	// Graph Analysis - Phase 1 is instant, Phase 2 runs in background
 	analyzer := analysis.NewAnalyzer(issues)
+	var candidateIDs map[string]bool
+	if len(scope) > 0 {
+		if scope[0].CandidateIDs != nil {
+			candidateIDs = make(map[string]bool, len(scope[0].CandidateIDs))
+			for id, selected := range scope[0].CandidateIDs {
+				candidateIDs[id] = selected
+			}
+		}
+	}
+	analyzer.SetReadinessScope(authority, candidateIDs)
 	// bv-90: accept/ignore feedback tunes the factor weights the priority
 	// hints and actionable view rank with, exactly as --robot-triage does.
 	if w := feedbackWeightsForBeadsPath(beadsPath); w != nil {
@@ -1451,69 +1605,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 
 	// Sort issues
 	if activeRecipe != nil && activeRecipe.Sort.Field != "" {
-		r := activeRecipe
-		descending := r.Sort.Direction == "desc"
-
-		sort.Slice(issues, func(i, j int) bool {
-			ii := issues[i]
-			jj := issues[j]
-			cmp := 0
-			switch r.Sort.Field {
-			case "priority":
-				switch {
-				case ii.Priority < jj.Priority:
-					cmp = -1
-				case ii.Priority > jj.Priority:
-					cmp = 1
-				}
-			case "created", "created_at":
-				switch {
-				case ii.CreatedAt.Before(jj.CreatedAt):
-					cmp = -1
-				case ii.CreatedAt.After(jj.CreatedAt):
-					cmp = 1
-				}
-			case "updated", "updated_at":
-				switch {
-				case ii.UpdatedAt.Before(jj.UpdatedAt):
-					cmp = -1
-				case ii.UpdatedAt.After(jj.UpdatedAt):
-					cmp = 1
-				}
-			case "impact":
-				iScore := graphStats.GetCriticalPathScore(ii.ID)
-				jScore := graphStats.GetCriticalPathScore(jj.ID)
-				switch {
-				case iScore < jScore:
-					cmp = -1
-				case iScore > jScore:
-					cmp = 1
-				}
-			case "pagerank":
-				iScore := graphStats.GetPageRankScore(ii.ID)
-				jScore := graphStats.GetPageRankScore(jj.ID)
-				switch {
-				case iScore < jScore:
-					cmp = -1
-				case iScore > jScore:
-					cmp = 1
-				}
-			default:
-				switch {
-				case ii.Priority < jj.Priority:
-					cmp = -1
-				case ii.Priority > jj.Priority:
-					cmp = 1
-				}
-			}
-			if cmp == 0 {
-				return ii.ID < jj.ID
-			}
-			if descending {
-				return cmp > 0
-			}
-			return cmp < 0
-		})
+		recipe.SortIssues(issues, recipe.Metrics{Graph: graphStats}, activeRecipe)
 	} else {
 		// Default Sort: Open first, then by Priority (ascending), then by date (newest first)
 		sort.Slice(issues, func(i, j int) bool {
@@ -1550,6 +1642,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 
 	// Compute stats
 	cOpen, cReady, cBlocked, cClosed := 0, 0, 0, 0
+	readiness := analyzer.Readiness()
+	readyNow := time.Now()
 	for i := range issues {
 		issue := &issues[i]
 		if isClosedLikeStatus(issue.Status) {
@@ -1560,21 +1654,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		cOpen++
 		if issue.Status == model.StatusBlocked {
 			cBlocked++
-			continue
 		}
-
-		// Check if blocked by open dependencies
-		isBlocked := false
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
-				continue
-			}
-			if blocker, exists := issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-				isBlocked = true
-				break
-			}
-		}
-		if !isBlocked {
+		if analyzer.IsCandidate(issue.ID) && readiness.Ready(issue.ID, readyNow) {
 			cReady++
 		}
 	}
@@ -1635,7 +1716,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	priorityHints := make(map[string]*analysis.PriorityRecommendation)
 
 	// Compute triage insights (bv-151) - reuse existing analyzer/stats (bv-runn.12)
-	triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, graphStats, issues, analysis.TriageOptions{}, time.Now())
+	triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, graphStats, issues, analysis.TriageOptions{}, analyzer.Now())
 	triageScores := make(map[string]float64, len(triageResult.Recommendations))
 	triageReasons := make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
 	quickWinSet := make(map[string]bool, len(triageResult.QuickWins))
@@ -1794,6 +1875,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		issues:                  issues,
 		issueMap:                issueMap,
 		analyzer:                analyzer,
+		candidateIDs:            candidateIDs,
 		analysis:                graphStats,
 		beadsPath:               beadsPath,
 		watcher:                 fileWatcher,
@@ -1874,7 +1956,39 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 
 	m.installBackgroundWorker(backgroundWorker)
 	m.registerKeyBindings()
+	if activeRecipe != nil {
+		m.setActiveRecipe(activeRecipe)
+		m.applyRecipe(activeRecipe)
+	}
 	return &m
+}
+
+// refreshScopedTriageData replaces worker rankings computed without the UI's
+// selected IDs. Context nodes still contribute graph metrics, but cannot be
+// promoted to recommended work after a reload.
+func (m *Model) refreshScopedTriageData() {
+	triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analyzer.Now())
+	m.triageScores = make(map[string]float64, len(triage.Recommendations))
+	m.triageReasons = make(map[string]analysis.TriageReasons, len(triage.Recommendations))
+	m.unblocksMap = make(map[string][]string, len(triage.Recommendations))
+	m.quickWinSet = make(map[string]bool, len(triage.QuickWins))
+	m.blockerSet = make(map[string]bool, len(triage.BlockersToClear))
+	for _, rec := range triage.Recommendations {
+		m.triageScores[rec.ID] = rec.Score
+		if len(rec.Reasons) > 0 {
+			m.triageReasons[rec.ID] = analysis.TriageReasons{Primary: rec.Reasons[0], All: rec.Reasons, ActionHint: rec.Action}
+		}
+		m.unblocksMap[rec.ID] = rec.UnblocksIDs
+	}
+	for _, quickWin := range triage.QuickWins {
+		m.quickWinSet[quickWin.ID] = true
+	}
+	for _, blocker := range triage.BlockersToClear {
+		m.blockerSet[blocker.ID] = true
+	}
+	m.insightsPanel.SetTopPicks(triage.QuickRef.TopPicks)
+	dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
+	m.insightsPanel.SetRecommendations(triage.Recommendations, dataHash)
 }
 
 // rebuildInsightsPanel refreshes the underlying insights view model from the
@@ -1903,7 +2017,7 @@ func (m *Model) rebuildInsightsPanel() {
 	panel.showHeatmap = prev.showHeatmap
 
 	if m.analyzer != nil && m.analysis != nil {
-		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, time.Now())
+		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analyzer.Now())
 		panel.SetTopPicks(triage.QuickRef.TopPicks)
 		dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
 		panel.SetRecommendations(triage.Recommendations, dataHash)
@@ -1922,7 +2036,7 @@ func (m *Model) Init() tea.Cmd {
 	// initialized as ready with default dimensions in NewModel().
 	// This eliminates the "Initializing..." phase entirely.
 	cmds := []tea.Cmd{
-		WaitForPhase2Cmd(m.analysis),
+		m.preparePhase2Cmd(),
 	}
 	// The automatic release check is opt-out (BV_NO_UPDATE_CHECK=1 or
 	// updates.check: false in ~/.config/bv/config.yaml); explicit
@@ -2506,6 +2620,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Stats != m.analysis {
 			return m, nil
 		}
+		if msg.prepared != nil {
+			if msg.preparationCtx == nil || msg.preparationCtx.Err() != nil ||
+				msg.sourceSnapshot != m.snapshot || msg.sourceAnalyzer != m.analyzer {
+				return m, nil
+			}
+			if msg.sourceWeights != m.analyzer.Weights() || !msg.sourceNow.Equal(m.analyzer.Now()) {
+				return m, m.preparePhase2Cmd()
+			}
+			m.cancelPhase2Preparation()
+		}
 		listFilterActive := m.list.FilterState() != list.Unfiltered
 		listFilterTerm := m.list.FilterInput.Value()
 		selectedID := m.selectedListIssueID(listFilterActive, listFilterTerm)
@@ -2513,7 +2637,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Create new immutable snapshot with Phase 2 data (bv-b5q1)
 		ins := msg.Insights
 		if m.snapshot != nil {
-			newSnap := m.snapshot.WithPhase2(msg.Stats, ins, m.issues, m.analyzer)
+			newSnap := msg.prepared
+			if newSnap == nil {
+				newSnap = m.snapshot.WithPhase2(msg.Stats, ins, m.issues, m.analyzer)
+			}
 			m.snapshot = newSnap
 			m.triageScores = newSnap.TriageScores
 			m.triageReasons = newSnap.TriageReasons
@@ -2532,12 +2659,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.insightsPanel.SetSize(m.width, bodyHeight)
 		if m.snapshot != nil {
 			m.graphView.SetSnapshot(m.snapshot)
+		} else if msg.prepared != nil {
+			m.graphView.SetSnapshot(msg.prepared)
 		} else {
 			m.graphView.SetIssues(m.issues, &ins)
 		}
 
 		// Compute triage for insights panel (separate from snapshot triage for UI-specific features)
-		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, time.Now())
+		var triage analysis.TriageResult
+		if msg.prepared != nil && msg.prepared.phase2Triage != nil {
+			triage = *msg.prepared.phase2Triage
+		} else {
+			triage = analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analyzer.Now())
+		}
 		m.insightsPanel.SetTopPicks(triage.QuickRef.TopPicks)
 
 		// Set full recommendations with breakdown for priority radar (bv-93)
@@ -2545,14 +2679,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.insightsPanel.SetRecommendations(triage.Recommendations, dataHash)
 
 		// Generate priority recommendations now that Phase 2 is ready
-		recommendations := m.analyzer.GenerateRecommendations()
-		m.priorityHints = make(map[string]*analysis.PriorityRecommendation, len(recommendations))
-		for i := range recommendations {
-			m.priorityHints[recommendations[i].IssueID] = &recommendations[i]
+		if msg.prepared != nil {
+			m.priorityHints = msg.priorityHints
+		} else {
+			recommendations := m.analyzer.GenerateRecommendationsFromStats(m.analysis, analysis.DefaultThresholds())
+			m.priorityHints = make(map[string]*analysis.PriorityRecommendation, len(recommendations))
+			for i := range recommendations {
+				m.priorityHints[recommendations[i].IssueID] = &recommendations[i]
+			}
 		}
 
 		// Refresh alerts now that full Phase 2 metrics (cycles, etc.) are available
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlerts(m.issues, m.analysis, m.analyzer)
+		if msg.prepared != nil {
+			m.alerts = msg.prepared.alerts
+			m.alertsCritical, m.alertsWarning, m.alertsInfo = msg.prepared.alertsCritical, msg.prepared.alertsWarning, msg.prepared.alertsInfo
+		} else {
+			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlerts(m.issues, m.analysis, m.analyzer)
+		}
 
 		// Invalidate label health cache since we have new graph metrics (criticality)
 		m.labelHealthCached = false
@@ -2562,49 +2705,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.labelHealthCached = true
 			m.labelDashboard.SetData(m.labelHealthCache.Labels)
 			m.statusMsg = fmt.Sprintf("Labels: %d total • critical %d • warning %d", m.labelHealthCache.TotalLabels, m.labelHealthCache.CriticalCount, m.labelHealthCache.WarningCount)
-		}
-
-		// Re-sort issues if sorting by Phase 2 metrics (impact/pagerank)
-		if m.activeRecipe != nil {
-			switch m.activeRecipe.Sort.Field {
-			case "impact", "pagerank":
-				field := m.activeRecipe.Sort.Field
-				descending := m.activeRecipe.Sort.Direction == "desc"
-				sort.Slice(m.issues, func(i, j int) bool {
-					ii := m.issues[i]
-					jj := m.issues[j]
-
-					var iScore, jScore float64
-					if m.analysis != nil {
-						if field == "impact" {
-							iScore = m.analysis.GetCriticalPathScore(ii.ID)
-							jScore = m.analysis.GetCriticalPathScore(jj.ID)
-						} else {
-							iScore = m.analysis.GetPageRankScore(ii.ID)
-							jScore = m.analysis.GetPageRankScore(jj.ID)
-						}
-					}
-
-					var cmp int
-					switch {
-					case iScore < jScore:
-						cmp = -1
-					case iScore > jScore:
-						cmp = 1
-					}
-					if cmp == 0 {
-						return ii.ID < jj.ID
-					}
-					if descending {
-						return cmp > 0
-					}
-					return cmp < 0
-				})
-				// Rebuild issueMap after re-sort (pointers become stale after sorting)
-				for i := range m.issues {
-					m.issueMap[m.issues[i].ID] = &m.issues[i]
-				}
-			}
 		}
 
 		// Re-apply recipe filter if active (to update scores while preserving filter)
@@ -2783,17 +2883,32 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.issueMap = msg.Snapshot.IssueMap
 		m.analyzer = msg.Snapshot.Analyzer
 		m.analysis = msg.Snapshot.Analysis
+		if m.candidateIDs != nil {
+			// The worker owns its analyzer. Bind a UI-owned analyzer to the
+			// fresh authority without mutating analysis still used off-thread.
+			m.analyzer = analysis.NewAnalyzer(m.issues)
+			m.analyzer.SetReadinessScope(msg.Snapshot.Analyzer.Readiness(), m.candidateIDs)
+			m.analyzer.RestoreScoring(msg.Snapshot.Analyzer.CaptureScoring())
+			if w := feedbackWeightsForBeadsPath(m.beadsPath); w != nil {
+				m.analyzer.SetWeights(*w)
+			}
+		}
 		m.countOpen = msg.Snapshot.CountOpen
 		m.countReady = msg.Snapshot.CountReady
 		m.countBlocked = msg.Snapshot.CountBlocked
 		m.countClosed = msg.Snapshot.CountClosed
+		if m.candidateIDs != nil {
+			m.countReady = len(m.analyzer.GetActionableIssues())
+		}
 		if len(m.pooledIssues) > 0 {
 			go loader.ReturnIssuePtrsToPool(m.pooledIssues)
 			m.pooledIssues = nil
 		}
 		// Preserve existing triage data unless the snapshot has Phase 2 results.
 		// Avoid flicker when Phase 1 snapshots arrive without triage data.
-		if msg.Snapshot.IsPhase2Ready() || len(msg.Snapshot.TriageScores) > 0 {
+		if m.candidateIDs != nil {
+			m.refreshScopedTriageData()
+		} else if msg.Snapshot.IsPhase2Ready() || len(msg.Snapshot.TriageScores) > 0 {
 			m.triageScores = msg.Snapshot.TriageScores
 			m.triageReasons = msg.Snapshot.TriageReasons
 			m.unblocksMap = msg.Snapshot.UnblocksMap
@@ -2857,6 +2972,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				for _, item := range msg.Snapshot.ListItems {
 					issue := item.Issue
+					if m.candidateIDs != nil {
+						item = m.itemWithTriage(item)
+					}
+					if m.activeRecipe.Filters.Actionable != nil && !m.analyzer.IsCandidate(issue.ID) {
+						continue
+					}
 
 					// Workspace repo filter (nil = all repos)
 					if m.workspaceMode && m.activeRepos != nil {
@@ -2872,6 +2993,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				listRefilterCmd = m.setListItems(filteredItems)
 				m.board.SetIssues(filteredIssues)
+				m.refreshRecipeMetrics()
+				m.updateListDelegate()
 
 				recipeIns := analysis.Insights{}
 				if m.analysis != nil {
@@ -2882,7 +3005,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentFilter = "recipe:" + m.activeRecipe.Name
 
 				// Keep selection in bounds
-				if len(filteredItems) > 0 && m.list.Index() >= len(filteredItems) {
+				if len(m.list.Items()) > 0 && m.list.Index() >= len(m.list.Items()) {
 					m.list.Select(0)
 				}
 			} else {
@@ -2891,6 +3014,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			fastDefaultView := (m.currentFilter == "" || m.currentFilter == "all") &&
 				m.sortMode == SortDefault &&
+				m.candidateIDs == nil &&
 				(!m.workspaceMode || m.activeRepos == nil) &&
 				len(msg.Snapshot.listModelItems) == len(msg.Snapshot.ListItems) &&
 				msg.Snapshot.BoardState != nil && msg.Snapshot.GetGraphLayout() != nil
@@ -2914,6 +3038,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				for _, item := range msg.Snapshot.ListItems {
 					issue := item.Issue
+					if m.candidateIDs != nil {
+						item = m.itemWithTriage(item)
+					}
 
 					// Workspace repo filter (nil = all repos)
 					if m.workspaceMode && m.activeRepos != nil {
@@ -2932,7 +3059,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					case "closed":
 						include = isClosedLikeStatus(issue.Status)
 					case "ready":
-						include = isIssueReadyAt(issue, m.issueMap, filterNow)
+						include = m.analyzer.IsCandidate(issue.ID) && m.analyzer.Readiness().Ready(issue.ID, filterNow)
 					default:
 						if strings.HasPrefix(m.currentFilter, "label:") {
 							label := strings.TrimPrefix(m.currentFilter, "label:")
@@ -3067,7 +3194,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Wait for Phase 2 if not ready
 		if msg.Snapshot.Analysis != nil {
-			cmds = append(cmds, WaitForPhase2Cmd(msg.Snapshot.Analysis))
+			cmds = append(cmds, m.preparePhase2Cmd())
 		}
 
 		if m.backgroundWorker != nil {
@@ -3233,6 +3360,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		cachedAnalyzer := analysis.NewCachedAnalyzer(newIssues, nil)
 		m.analyzer = cachedAnalyzer.Analyzer
+		m.analyzer.SetReadinessScope(loadedIssues.Authority, m.candidateIDs)
 		m.analysis = cachedAnalyzer.AnalyzeAsync(context.Background())
 		cacheHit := cachedAnalyzer.WasCacheHit()
 		if profileRefresh {
@@ -3263,6 +3391,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			statsStart = time.Now()
 		}
 		m.countOpen, m.countReady, m.countBlocked, m.countClosed = 0, 0, 0, 0
+		readiness := m.analyzer.Readiness()
+		readyNow := time.Now()
 		for i := range m.issues {
 			issue := &m.issues[i]
 			if isClosedLikeStatus(issue.Status) {
@@ -3272,19 +3402,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.countOpen++
 			if issue.Status == model.StatusBlocked {
 				m.countBlocked++
-				continue
 			}
-			isBlocked := false
-			for _, dep := range issue.Dependencies {
-				if dep == nil || !dep.Type.IsBlocking() {
-					continue
-				}
-				if blocker, exists := m.issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-					isBlocked = true
-					break
-				}
-			}
-			if !isBlocked {
+			if m.analyzer.IsCandidate(issue.ID) && readiness.Ready(issue.ID, readyNow) {
 				m.countReady++
 			}
 		}
@@ -3305,6 +3424,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.showAlertsPanel = false
 
 		// Rebuild list items (preserve triage data to avoid flicker)
+		if m.candidateIDs != nil {
+			m.refreshScopedTriageData()
+		}
 		var listStart time.Time
 		if profileRefresh {
 			listStart = time.Now()
@@ -3519,7 +3641,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.watcher != nil && !autoEnabled {
 			cmds = append(cmds, WatchFileCmd(m.watcher))
 		}
-		cmds = append(cmds, WaitForPhase2Cmd(m.analysis))
+		cmds = append(cmds, m.preparePhase2Cmd())
 		return m, tea.Batch(cmds...)
 
 	case tea.KeyMsg:
@@ -3714,6 +3836,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.alertsCursor < len(activeAlerts) {
 					issueID := activeAlerts[m.alertsCursor].IssueID
 					if issueID != "" {
+						m.revealRecipeIssue(issueID)
 						// Find the issue in the list and select it
 						for i, item := range m.list.Items() {
 							if it, ok := item.(IssueItem); ok && it.Issue.ID == issueID {
@@ -4208,7 +4331,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case "tab":
-				if m.isSplitView && !m.isBoardView {
+				if m.isSplitView && !m.isBoardView && (m.focused == focusList || m.focused == focusDetail) {
 					if m.focused == focusList {
 						m.focused = focusDetail
 					} else {
@@ -4466,7 +4589,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 
 			case focusList:
-				// Fall through to list-level view toggles below
+				if group, ok := m.list.SelectedItem().(IssueGroupItem); ok && (keyStr == "enter" || keyStr == " ") {
+					m.recipeCollapsed[group.Key] = !group.Collapsed
+					m.setListItems(m.recipeListItems)
+					for i, raw := range m.list.Items() {
+						if header, ok := raw.(IssueGroupItem); ok && header.Key == group.Key {
+							m.list.Select(i)
+							break
+						}
+					}
+					m.updateViewportContent()
+					return m, nil
+				}
+				if keyStr == "/" && m.recipeGroupingActive() {
+					// Search includes collapsed rows. The list filter and semantic
+					// IDs must see the same header-free item order.
+					m.listDataGeneration++
+					m.list.SetItems(append([]list.Item(nil), m.recipeListItems...))
+					m.updateSemanticIDs(m.recipeListItems)
+				}
 			}
 
 			if viewToggleHandled {
@@ -4481,6 +4622,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// other views when the key isn't claimed by their handler
 			// (enabling cross-view switching, e.g. 'g' from board -> graph).
 			// ═══════════════════════════════════════════════════════════════
+			switch msg.String() {
+			case "b", "g", "a", "i", "E", "f", "P", "h", "t", "l":
+				m.recipeGraphOwned = false
+			}
 			switch msg.String() {
 			case "P":
 				// Sprint dashboard (bv-161). Only the list and detail views
@@ -4527,6 +4672,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.isActionableView {
 					// Build execution plan
 					analyzer := analysis.NewAnalyzer(m.issues)
+					analyzer.SetReadinessScope(m.analyzer.Readiness(), m.candidateIDs)
 					plan := analyzer.GetExecutionPlan()
 					m.actionableView = NewActionableModel(plan, m.theme)
 					m.actionableView.SetSize(m.width, m.height-2)
@@ -4833,8 +4979,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Only forward keyboard messages to list when list has focus (bv-hmkz fix)
 	// This prevents j/k keys in detail view from changing list selection
 	if m.focused == focusList {
+		wasFiltering := m.list.FilterState() != list.Unfiltered
 		if _, isWindowSize := msg.(tea.WindowSizeMsg); !isWindowSize {
 			m.list, cmd = m.list.Update(msg)
+		}
+		if wasFiltering && m.list.FilterState() == list.Unfiltered && m.recipeGroupingActive() {
+			m.setListItems(m.recipeListItems)
 		}
 		// A list command captures the items/filter state at the instant Update
 		// creates it. Preserve those generations before semantic score cleanup or
@@ -5064,6 +5214,7 @@ func (m *Model) handleBoardKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 	// Exit to detail view
 	case "enter":
 		if selected := m.board.SelectedIssue(); selected != nil {
+			m.revealRecipeIssue(selected.ID)
 			for i, item := range m.list.Items() {
 				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selected.ID {
 					m.list.Select(i)
@@ -5106,6 +5257,7 @@ func (m *Model) handleGraphKeys(msg tea.KeyMsg) *Model {
 		m.graphView.ScrollRight()
 	case "enter":
 		if selected := m.graphView.SelectedIssue(); selected != nil {
+			m.revealRecipeIssue(selected.ID)
 			// Find and select in list
 			for i, item := range m.list.Items() {
 				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selected.ID {
@@ -5156,17 +5308,20 @@ func (m *Model) handleTreeKeys(msg tea.KeyMsg) *Model {
 		m.focused = focusList
 	case "tab":
 		// Toggle detail panel (sync selection and jump to detail)
-		if m.isSplitView {
-			if selected := m.tree.SelectedIssue(); selected != nil {
-				// Sync detail panel with tree selection
-				for i, item := range m.list.Items() {
-					if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selected.ID {
-						m.list.Select(i)
-						break
-					}
+		if selected := m.tree.SelectedIssue(); selected != nil {
+			m.revealRecipeIssue(selected.ID)
+			// Sync detail panel with tree selection
+			for i, item := range m.list.Items() {
+				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selected.ID {
+					m.list.Select(i)
+					break
 				}
-				m.updateViewportContent()
-				m.focused = focusDetail
+			}
+			m.updateViewportContent()
+			m.focused = focusDetail
+			if !m.isSplitView {
+				m.showDetails = true
+				m.viewport.GotoTop()
 			}
 		}
 	}
@@ -5184,6 +5339,7 @@ func (m *Model) handleActionableKeys(msg tea.KeyMsg) *Model {
 		// Jump to selected issue in list view
 		selectedID := m.actionableView.SelectedIssueID()
 		if selectedID != "" {
+			m.revealRecipeIssue(selectedID)
 			for i, item := range m.list.Items() {
 				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selectedID {
 					m.list.Select(i)
@@ -5343,6 +5499,7 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			selectedID = m.historyView.SelectedBeadID()
 		}
 		if selectedID != "" {
+			m.revealRecipeIssue(selectedID)
 			for i, item := range m.list.Items() {
 				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selectedID {
 					m.list.Select(i)
@@ -5462,6 +5619,7 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			selectedID = m.historyView.SelectedBeadID()
 		}
 		if selectedID != "" {
+			m.revealRecipeIssue(selectedID)
 			// Find and select the bead in the main list
 			for i, item := range m.list.Items() {
 				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selectedID {
@@ -5611,6 +5769,7 @@ func (m *Model) handleFlowMatrixKeys(msg tea.KeyMsg) *Model {
 		if m.flowMatrix.showDrilldown {
 			// Jump to selected issue from drilldown
 			if selectedIssue := m.flowMatrix.SelectedDrilldownIssue(); selectedIssue != nil {
+				m.revealRecipeIssue(selectedIssue.ID)
 				for i, item := range m.list.Items() {
 					if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selectedIssue.ID {
 						m.list.Select(i)
@@ -5656,7 +5815,11 @@ func (m *Model) handleRecipePickerKeys(msg tea.KeyMsg) *Model {
 			m.applyRecipe(selected)
 		}
 		m.showRecipePicker = false
-		m.focused = focusList
+		if m.isGraphView {
+			m.focused = focusGraph
+		} else {
+			m.focused = focusList
+		}
 	}
 	return m
 }
@@ -5766,6 +5929,7 @@ func (m *Model) handleInsightsKeys(msg tea.KeyMsg) *Model {
 		// Jump to selected issue in list view
 		selectedID := m.insightsPanel.SelectedIssueID()
 		if selectedID != "" {
+			m.revealRecipeIssue(selectedID)
 			for i, item := range m.list.Items() {
 				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selectedID {
 					m.list.Select(i)
@@ -7776,13 +7940,172 @@ func (m *Model) clearAllFilters() {
 }
 
 func (m *Model) setActiveRecipe(r *recipe.Recipe) {
+	if r != nil {
+		if err := r.Validate(); err != nil {
+			m.statusMsg = "Recipe: " + err.Error()
+			return
+		}
+	}
+	if m.recipeGraphOwned && m.isGraphView {
+		m.isGraphView = false
+		if m.focused == focusGraph {
+			m.focused = focusList
+		}
+	}
 	m.activeRecipe = r
+	m.recipeGraphOwned = false
+	m.recipeCollapsed = make(map[string]bool)
+	if r != nil && r.View.ShowGraph {
+		m.recipeGraphOwned = true
+		m.isGraphView, m.isBoardView, m.isActionableView, m.isHistoryView = true, false, false, false
+		m.focused = focusGraph
+	}
+	m.refreshRecipeMetrics()
+	m.updateListDelegate()
 	if m.backgroundWorker != nil {
 		m.backgroundWorker.SetRecipe(r)
 	}
 }
 
-func (m *Model) matchesCurrentFilter(issue model.Issue) bool {
+func (m *Model) recipeGroupingActive() bool {
+	return m.activeRecipe != nil && m.activeRecipe.View.GroupBy != "" && m.activeRecipe.View.GroupBy != "none"
+}
+
+func (m *Model) recipeGroupKey(issue model.Issue) string {
+	switch m.activeRecipe.View.GroupBy {
+	case "status":
+		return string(issue.Status)
+	case "priority":
+		return fmt.Sprintf("P%d", issue.Priority)
+	case "tag":
+		labels := append([]string(nil), issue.Labels...)
+		sort.Strings(labels)
+		if len(labels) > 0 {
+			return labels[0]
+		}
+		return "untagged"
+	}
+	return ""
+}
+
+// Cross-view jumps must expose their issue even in a collapsed list group.
+func (m *Model) revealRecipeIssue(id string) {
+	if !m.recipeGroupingActive() {
+		return
+	}
+	for _, raw := range m.recipeListItems {
+		if item, ok := raw.(IssueItem); ok && item.Issue.ID == id {
+			m.recipeCollapsed[m.recipeGroupKey(item.Issue)] = false
+			m.list.ResetFilter()
+			m.setListItems(m.recipeListItems)
+			return
+		}
+	}
+}
+
+func (m *Model) groupRecipeItems(items []list.Item) []list.Item {
+	if !m.recipeGroupingActive() {
+		return items
+	}
+	if m.recipeCollapsed == nil {
+		m.recipeCollapsed = make(map[string]bool)
+	}
+	groups := make(map[string][]list.Item)
+	for _, raw := range items {
+		item, ok := raw.(IssueItem)
+		if !ok {
+			continue
+		}
+		key := m.recipeGroupKey(item.Issue)
+		groups[key] = append(groups[key], item)
+	}
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	grouped := make([]list.Item, 0, len(items)+len(keys))
+	for _, key := range keys {
+		collapsed, exists := m.recipeCollapsed[key]
+		if !exists {
+			collapsed = m.activeRecipe.View.Collapsed
+			m.recipeCollapsed[key] = collapsed
+		}
+		grouped = append(grouped, IssueGroupItem{Key: key, Count: len(groups[key]), Collapsed: collapsed})
+		if !collapsed {
+			grouped = append(grouped, groups[key]...)
+		}
+	}
+	return grouped
+}
+
+func (m *Model) refreshRecipeMetrics() {
+	m.recipeMetricValues = make(map[string]map[string]float64)
+	m.recipeBlockerCounts = nil
+	if m.activeRecipe == nil {
+		return
+	}
+	if m.analysis != nil {
+		status := m.analysis.Status()
+		states := map[string]string{
+			"pagerank": status.PageRank.State, "betweenness": status.Betweenness.State,
+			"impact": status.Critical.State, "eigenvector": status.Eigenvector.State,
+			"hub": status.HITS.State, "authority": status.HITS.State,
+			"slack": status.Slack.State, "kcore": status.KCore.State,
+		}
+		for _, name := range recipeMetricNames(m.activeRecipe) {
+			if state, known := states[name]; known && state != "computed" && state != "approx" {
+				continue
+			}
+			switch name {
+			case "pagerank":
+				m.recipeMetricValues[name] = m.analysis.PageRank()
+			case "betweenness":
+				values := m.analysis.Betweenness()
+				if values == nil {
+					values = make(map[string]float64)
+				}
+				// Gonum returns only non-zero entries. Once the metric is
+				// computed, absent graph nodes have zero centrality.
+				for _, issue := range m.issues {
+					if _, exists := values[issue.ID]; !exists {
+						values[issue.ID] = 0
+					}
+				}
+				m.recipeMetricValues[name] = values
+			case "impact":
+				m.recipeMetricValues[name] = m.analysis.CriticalPathScore()
+			case "eigenvector":
+				m.recipeMetricValues[name] = m.analysis.Eigenvector()
+			case "hub":
+				m.recipeMetricValues[name] = m.analysis.Hubs()
+			case "authority":
+				m.recipeMetricValues[name] = m.analysis.Authorities()
+			case "slack":
+				m.recipeMetricValues[name] = m.analysis.Slack()
+			case "triage":
+				m.recipeMetricValues[name] = m.triageScores
+			case "kcore":
+				values := make(map[string]float64)
+				for id, value := range m.analysis.CoreNumber() {
+					values[id] = float64(value)
+				}
+				m.recipeMetricValues[name] = values
+			}
+		}
+	}
+	for _, column := range m.activeRecipe.View.Columns {
+		if column == "blockers" && m.analyzer != nil {
+			m.recipeBlockerCounts = make(map[string]int, len(m.issues))
+			for _, issue := range m.issues {
+				m.recipeBlockerCounts[issue.ID] = len(m.analyzer.Readiness().Blockers(issue.ID))
+			}
+			break
+		}
+	}
+}
+
+func (m *Model) matchesCurrentFilter(issue model.Issue, now time.Time) bool {
 	// Workspace repo filter (nil = all repos)
 	if m.workspaceMode && m.activeRepos != nil {
 		repoKey := issueRepoKey(issue)
@@ -7799,7 +8122,7 @@ func (m *Model) matchesCurrentFilter(issue model.Issue) bool {
 	case "closed":
 		return isClosedLikeStatus(issue.Status)
 	case "ready":
-		return isIssueReadyAt(issue, m.issueMap, time.Now())
+		return m.analyzer != nil && m.analyzer.IsCandidate(issue.ID) && m.analyzer.Readiness().Ready(issue.ID, now)
 	default:
 		if strings.HasPrefix(m.currentFilter, "label:") {
 			label := strings.TrimPrefix(m.currentFilter, "label:")
@@ -7815,6 +8138,7 @@ func (m *Model) matchesCurrentFilter(issue model.Issue) bool {
 
 func (m *Model) filteredIssuesForActiveView() []model.Issue {
 	filtered := make([]model.Issue, 0, len(m.issues))
+	filterNow := time.Now()
 	recipeFilterActive := m.activeRecipe != nil && strings.HasPrefix(m.currentFilter, "recipe:")
 	if recipeFilterActive {
 		for _, issue := range m.issues {
@@ -7824,15 +8148,17 @@ func (m *Model) filteredIssuesForActiveView() []model.Issue {
 					continue
 				}
 			}
-			if issueMatchesRecipe(issue, m.issueMap, m.activeRecipe) {
-				filtered = append(filtered, issue)
-			}
+			filtered = append(filtered, issue)
 		}
-		sortIssuesByRecipe(filtered, m.analysis, m.activeRecipe)
-		return filtered
+		selected, err := applyRecipeToIssues(filtered, m.analyzer, m.analysis, m.triageScores, m.activeRecipe, filterNow)
+		if err != nil {
+			m.statusMsg = "Recipe: " + err.Error()
+			return nil
+		}
+		return selected
 	}
 	for _, issue := range m.issues {
-		if m.matchesCurrentFilter(issue) {
+		if m.matchesCurrentFilter(issue, filterNow) {
 			filtered = append(filtered, issue)
 		}
 	}
@@ -7883,9 +8209,10 @@ func (m *Model) refreshBoardAndGraphForCurrentFilter() {
 func (m *Model) applyFilter() {
 	var filteredItems []list.Item
 	var filteredIssues []model.Issue
+	filterNow := time.Now()
 
 	for _, issue := range m.issues {
-		if m.matchesCurrentFilter(issue) {
+		if m.matchesCurrentFilter(issue, filterNow) {
 			// Use pre-computed graph scores (avoid redundant calculation)
 			item := IssueItem{
 				Issue:      issue,
@@ -7932,6 +8259,22 @@ func (m *Model) applyFilter() {
 	m.updateViewportContent()
 }
 
+func (m *Model) itemWithTriage(item IssueItem) IssueItem {
+	id := item.Issue.ID
+	item.TriageScore = m.triageScores[id]
+	if reasons, exists := m.triageReasons[id]; exists {
+		item.TriageReason = reasons.Primary
+		item.TriageReasons = reasons.All
+	} else {
+		item.TriageReason = ""
+		item.TriageReasons = nil
+	}
+	item.IsQuickWin = m.quickWinSet[id]
+	item.IsBlocker = m.blockerSet[id]
+	item.UnblocksCount = len(m.unblocksMap[id])
+	return item
+}
+
 // refreshListItemsPhase2 updates visible items with Phase 2 scores and triage data
 // without rebuilding the filtered set.
 func (m *Model) refreshListItemsPhase2() {
@@ -7952,18 +8295,7 @@ func (m *Model) refreshListItemsPhase2() {
 			item.GraphScore = m.analysis.GetPageRankScore(issueID)
 			item.Impact = m.analysis.GetCriticalPathScore(issueID)
 		}
-		item.TriageScore = m.triageScores[issueID]
-		if reasons, exists := m.triageReasons[issueID]; exists {
-			item.TriageReason = reasons.Primary
-			item.TriageReasons = reasons.All
-		} else {
-			item.TriageReason = ""
-			item.TriageReasons = nil
-		}
-		item.IsQuickWin = m.quickWinSet[issueID]
-		item.IsBlocker = m.blockerSet[issueID]
-		item.UnblocksCount = len(m.unblocksMap[issueID])
-		items[i] = item
+		items[i] = m.itemWithTriage(item)
 	}
 
 	m.replaceListPresentation(items, selectedID)
@@ -8044,250 +8376,57 @@ func (m *Model) sortFilteredItems(items []list.Item, issues []model.Issue) {
 	copy(issues, sortedIssues)
 }
 
-func matchesRecipeStatus(status model.Status, filter string) bool {
-	normalized := strings.ToLower(strings.TrimSpace(filter))
-	statusKey := strings.ToLower(string(status))
-	switch normalized {
-	case string(model.StatusClosed):
-		return isClosedLikeStatus(status)
-	case string(model.StatusTombstone):
-		return status == model.StatusTombstone
-	case string(model.StatusOpen):
-		return status == model.StatusOpen
-	case string(model.StatusInProgress):
-		return status == model.StatusInProgress
-	case string(model.StatusBlocked):
-		return status == model.StatusBlocked
-	default:
-		return statusKey == normalized
-	}
-}
-
 // applyRecipe applies a recipe's filters and sort to the current view
 func (m *Model) applyRecipe(r *recipe.Recipe) {
 	if r == nil {
 		return
 	}
+	if err := r.Validate(); err != nil {
+		m.statusMsg = "Recipe: " + err.Error()
+		return
+	}
+	m.refreshRecipeMetrics()
+	m.updateListDelegate()
 
-	var filteredItems []list.Item
-	var filteredIssues []model.Issue
-
+	candidates := make([]model.Issue, 0, len(m.issues))
 	for _, issue := range m.issues {
-		include := true
-
-		// Workspace repo filter (nil = all repos)
 		if m.workspaceMode && m.activeRepos != nil {
 			repoKey := issueRepoKey(issue)
 			if repoKey != "" && !m.activeRepos[repoKey] {
-				include = false
+				continue
 			}
 		}
-
-		// Apply status filter
-		if len(r.Filters.Status) > 0 {
-			statusMatch := false
-			for _, s := range r.Filters.Status {
-				if matchesRecipeStatus(issue.Status, s) {
-					statusMatch = true
-					break
-				}
-			}
-			include = include && statusMatch
-		}
-
-		// Apply priority filter
-		if include && len(r.Filters.Priority) > 0 {
-			prioMatch := false
-			for _, p := range r.Filters.Priority {
-				if issue.Priority == p {
-					prioMatch = true
-					break
-				}
-			}
-			include = include && prioMatch
-		}
-
-		// Apply tags filter (must have ALL specified tags)
-		if include && len(r.Filters.Tags) > 0 {
-			labelSet := make(map[string]bool)
-			for _, l := range issue.Labels {
-				labelSet[l] = true
-			}
-			for _, required := range r.Filters.Tags {
-				if !labelSet[required] {
-					include = false
-					break
-				}
-			}
-		}
-
-		// Apply actionable filter (no open blockers, not scheduler-deferred;
-		// issue #191 parity with `br ready`)
-		if include && r.Filters.Actionable != nil && *r.Filters.Actionable {
-			// Check if issue is blocked
-			isBlocked := issue.IsDeferredAt(time.Now())
-			for _, dep := range issue.Dependencies {
-				if dep == nil || !dep.Type.IsBlocking() {
-					continue
-				}
-				if blocker, exists := m.issueMap[dep.DependsOnID]; exists && !isClosedLikeStatus(blocker.Status) {
-					isBlocked = true
-					break
-				}
-			}
-			include = !isBlocked
-		}
-
-		if include {
-			item := IssueItem{
-				Issue:      issue,
-				GraphScore: m.analysis.GetPageRankScore(issue.ID),
-				Impact:     m.analysis.GetCriticalPathScore(issue.ID),
-				DiffStatus: m.getDiffStatus(issue.ID),
-				RepoPrefix: issueRepoKey(issue),
-			}
-			// Add triage data (bv-151)
-			item.TriageScore = m.triageScores[issue.ID]
-			if reasons, exists := m.triageReasons[issue.ID]; exists {
-				item.TriageReason = reasons.Primary
-				item.TriageReasons = reasons.All
-			}
-			item.IsQuickWin = m.quickWinSet[issue.ID]
-			item.IsBlocker = m.blockerSet[issue.ID]
-			item.UnblocksCount = len(m.unblocksMap[issue.ID])
-			filteredItems = append(filteredItems, item)
-			filteredIssues = append(filteredIssues, issue)
-		}
+		candidates = append(candidates, issue)
 	}
-
-	// Apply sort
-	field := r.Sort.Field
-	descending := r.Sort.Direction == "desc"
-	if field != "" {
-		compare := func(a, b model.Issue) int {
-			switch field {
-			case "priority":
-				switch {
-				case a.Priority < b.Priority:
-					return -1
-				case a.Priority > b.Priority:
-					return 1
-				default:
-					return 0
-				}
-			case "created", "created_at":
-				switch {
-				case a.CreatedAt.Before(b.CreatedAt):
-					return -1
-				case a.CreatedAt.After(b.CreatedAt):
-					return 1
-				default:
-					return 0
-				}
-			case "updated", "updated_at":
-				switch {
-				case a.UpdatedAt.Before(b.UpdatedAt):
-					return -1
-				case a.UpdatedAt.After(b.UpdatedAt):
-					return 1
-				default:
-					return 0
-				}
-			case "impact":
-				if m.analysis == nil {
-					switch {
-					case a.Priority < b.Priority:
-						return -1
-					case a.Priority > b.Priority:
-						return 1
-					default:
-						return 0
-					}
-				}
-				aScore := m.analysis.GetCriticalPathScore(a.ID)
-				bScore := m.analysis.GetCriticalPathScore(b.ID)
-				switch {
-				case aScore < bScore:
-					return -1
-				case aScore > bScore:
-					return 1
-				default:
-					return 0
-				}
-			case "pagerank":
-				if m.analysis == nil {
-					switch {
-					case a.Priority < b.Priority:
-						return -1
-					case a.Priority > b.Priority:
-						return 1
-					default:
-						return 0
-					}
-				}
-				aScore := m.analysis.GetPageRankScore(a.ID)
-				bScore := m.analysis.GetPageRankScore(b.ID)
-				switch {
-				case aScore < bScore:
-					return -1
-				case aScore > bScore:
-					return 1
-				default:
-					return 0
-				}
-			default:
-				switch {
-				case a.Priority < b.Priority:
-					return -1
-				case a.Priority > b.Priority:
-					return 1
-				default:
-					return 0
-				}
-			}
+	filteredIssues, err := applyRecipeToIssues(candidates, m.analyzer, m.analysis, m.triageScores, r, time.Now())
+	if err != nil {
+		m.statusMsg = "Recipe: " + err.Error()
+		return
+	}
+	filteredItems := make([]list.Item, 0, len(filteredIssues))
+	for _, issue := range filteredIssues {
+		item := IssueItem{Issue: issue, DiffStatus: m.getDiffStatus(issue.ID), RepoPrefix: issueRepoKey(issue)}
+		if m.analysis != nil {
+			item.GraphScore = m.analysis.GetPageRankScore(issue.ID)
+			item.Impact = m.analysis.GetCriticalPathScore(issue.ID)
 		}
-
-		sort.Slice(filteredItems, func(i, j int) bool {
-			iItem := filteredItems[i].(IssueItem)
-			jItem := filteredItems[j].(IssueItem)
-
-			cmp := compare(iItem.Issue, jItem.Issue)
-			if cmp == 0 {
-				return iItem.Issue.ID < jItem.Issue.ID
-			}
-			if descending {
-				return cmp > 0
-			}
-			return cmp < 0
-		})
-
-		// Re-sort issues list too
-		sort.Slice(filteredIssues, func(i, j int) bool {
-			ii := filteredIssues[i]
-			jj := filteredIssues[j]
-
-			cmp := compare(ii, jj)
-			if cmp == 0 {
-				return ii.ID < jj.ID
-			}
-			if descending {
-				return cmp > 0
-			}
-			return cmp < 0
-		})
+		filteredItems = append(filteredItems, m.itemWithTriage(item))
 	}
 
 	m.setListItems(filteredItems)
 	m.board.SetIssues(filteredIssues)
 	// Generate insights for graph view (for metric rankings and sorting)
-	recipeIns := m.analysis.GenerateInsights(len(filteredIssues))
+	var recipeIns analysis.Insights
+	if m.analysis != nil {
+		recipeIns = m.analysis.GenerateInsights(len(filteredIssues))
+	}
 	m.graphView.SetIssues(filteredIssues, &recipeIns)
 
 	// Update filter indicator
 	m.currentFilter = "recipe:" + r.Name
 
 	// Keep selection in bounds
-	if len(filteredItems) > 0 && m.list.Index() >= len(filteredItems) {
+	if len(m.list.Items()) > 0 && m.list.Index() >= len(m.list.Items()) {
 		m.list.Select(0)
 	}
 	m.updateViewportContent()
@@ -8567,6 +8706,10 @@ func (m *Model) updateViewportContent() {
 		m.viewport.SetContent("No issues selected")
 		return
 	}
+	if group, ok := selectedItem.(IssueGroupItem); ok {
+		m.viewport.SetContent(fmt.Sprintf("%s · %d issues\nPress Enter to expand or collapse this group.", group.Key, group.Count))
+		return
+	}
 
 	// Safe type assertion
 	issueItem, ok := selectedItem.(IssueItem)
@@ -8598,6 +8741,17 @@ func (m *Model) updateViewportContent() {
 	// Labels (bv-f103 fix: display labels in detail view)
 	if len(item.Labels) > 0 {
 		sb.WriteString(fmt.Sprintf("**Labels:** %s\n\n", strings.Join(item.Labels, ", ")))
+	}
+	if names := recipeMetricNames(m.activeRecipe); len(names) > 0 {
+		sb.WriteString("### Recipe metrics\n\n")
+		for _, name := range names {
+			if value, ok := m.recipeMetricValues[name][item.ID]; ok {
+				fmt.Fprintf(&sb, "- **%s:** %.5g\n", name, value)
+			} else {
+				fmt.Fprintf(&sb, "- **%s:** unavailable\n", name)
+			}
+		}
+		sb.WriteString("\n")
 	}
 
 	// Triage Insights (bv-151)
@@ -8700,7 +8854,9 @@ func (m *Model) updateViewportContent() {
 	if len(item.Dependencies) > 0 {
 		rootNode := BuildDependencyTree(item.ID, m.issueMap, 3) // Max depth 3
 		treeStr := RenderDependencyTree(rootNode)
-		sb.WriteString("```\n" + treeStr + "```\n\n")
+		// This generated tree is plain text. An unspecified language makes the
+		// highlighter scan its lexer registry again on every selected issue.
+		sb.WriteString("```text\n" + treeStr + "```\n\n")
 	}
 
 	// Comments
@@ -9951,6 +10107,7 @@ func parseBodyFromFrontmatter(content string) string {
 // Should be called when the program exits
 func (m *Model) Stop() {
 	m.cancelHistoryLoad()
+	m.cancelPhase2Preparation()
 	if m.backgroundWorker != nil {
 		m.backgroundWorker.Stop()
 	}

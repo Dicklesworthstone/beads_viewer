@@ -1496,6 +1496,8 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 	// Load issues from file with panic recovery
 	var issues []model.Issue
 	var pooledRefs []*model.Issue
+	var authority *model.ReadinessIndex
+	var authorityHash string
 	loadWarningCount := 0
 	var loadStart time.Time
 	if profileSnapshot {
@@ -1503,7 +1505,7 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 	}
 	loadErr := w.safeCompute("load", func() error {
 		var err error
-		var loaded loader.PooledIssues
+		var loaded reloadIssueData
 		opts := loader.ParseOptions{
 			WarningHandler: func(string) {
 				loadWarningCount++
@@ -1519,6 +1521,8 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 		if err == nil {
 			issues = loaded.Issues
 			pooledRefs = loaded.PoolRefs
+			authority = loaded.Authority
+			authorityHash = loaded.AuthorityHash
 		}
 		return err
 	})
@@ -1542,6 +1546,7 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 	w.mu.RUnlock()
 
 	loadMetadataUnchanged := prevSnapshot != nil &&
+		prevSnapshot.AuthorityHash == authorityHash &&
 		prevSnapshot.SourceIssueCountHint == sourceLineCount &&
 		prevSnapshot.LoadWarningCount == loadWarningCount &&
 		prevSnapshot.DatasetTier == tier &&
@@ -1576,7 +1581,7 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 	var snapshot *DataSnapshot
 	analyzeStart := time.Now()
 	analyzeErr := w.safeCompute("analyze_phase1", func() error {
-		builder := NewSnapshotBuilder(issues).
+		builder := NewSnapshotBuilder(issues, authority).
 			WithRecipe(currentRecipe).
 			WithWeights(feedbackWeightsForBeadsPath(w.beadsPath)).
 			WithBuildConfig(snapshotBuildConfigForTier(tier))
@@ -1603,6 +1608,7 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 	// Store hash in snapshot for external access
 	if snapshot != nil {
 		snapshot.DataHash = hash
+		snapshot.AuthorityHash = authorityHash
 		snapshot.LoadWarningCount = loadWarningCount
 		snapshot.RecipeName = recipeID
 		snapshot.RecipeHash = recipeHash

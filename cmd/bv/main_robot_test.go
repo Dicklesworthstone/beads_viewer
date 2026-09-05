@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -12,6 +13,47 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+func TestRobotNextSchemaRequiredFieldsMatchActualOutcomes(t *testing.T) {
+	t.Setenv("BEADS_DIR", t.TempDir())
+	t.Setenv("BEADS_DB", "")
+	schema := generateRobotSchemas().Commands["robot-next"]
+	for _, name := range []string{"empty", "unbound", "partial", "bound"} {
+		t.Run(name, func(t *testing.T) {
+			issues := []model.Issue{{ID: "test-1", Title: "Inspect ready work", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1}}
+			if name == "empty" {
+				issues = nil
+			} else if name == "bound" {
+				// Explicit synthetic origin tests handler/schema agreement only;
+				// real loader/executable routing belongs to the live E2E suite.
+				issues[0].Origin = &model.IssueOrigin{LocalID: "test-1", WorkingDirectory: "/fixture", TrackerDirectory: "/fixture/.beads",
+					Database: "/fixture/.beads/beads.db", Tracker: "br", Executable: "/fixture/br", SupportsClaim: true}
+			}
+			source := RobotSourceReport{Status: "loaded", Valid: len(issues), Visible: len(issues)}
+			if name == "partial" {
+				source.Errors = 1
+			}
+			var out bytes.Buffer
+			ctx := RobotContext{Issues: issues, SourceAuthority: newRobotSourceAuthority([]RobotSourceReport{source}), Encoder: json.NewEncoder(&out)}
+			if err := handleRobotNext(ctx, phaseThreeRobotHandlerConfig{}); err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(out.Bytes(), &fields); err != nil {
+				t.Fatal(err)
+			}
+			for _, field := range schema["required"].([]string) {
+				if _, ok := fields[field]; !ok {
+					t.Errorf("documented required field %q is absent in actual %s response: %s", field, name, out.String())
+				}
+			}
+			var actionable bool
+			if err := json.Unmarshal(fields["actionable"], &actionable); err != nil || actionable != (name == "bound") {
+				t.Fatalf("wrong handler branch: actionable%v err%v output%s", actionable, err, out.String())
+			}
+		})
+	}
+}
 
 // TestRobotPlanAndPriorityIncludeMetadata runs the built binary against a tiny fixture project
 // to assert that robot-plan and robot-priority include data_hash, analysis_config, and status.
@@ -185,7 +227,14 @@ func TestRobotNextFailClosedWhenNoClaimableItem(t *testing.T) {
 	}
 }
 
-func TestRobotNextEmitsClaimOnlyForSafeTopPick(t *testing.T) {
+func TestRobotNextPreservesSafeUnboundTopPick(t *testing.T) {
+	// This metadata-free input tests diagnostic readiness. Actual command
+	// emission belongs to TestRobotActionRoutesLiveTrackers, which initializes
+	// and inspects real trackers; ordinary Go tests need no installed br.
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BD_DB", "")
+	t.Setenv("BV_NO_GITIGNORE", "1")
 	dir := t.TempDir()
 	beadsDir := filepath.Join(dir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
@@ -194,13 +243,14 @@ func TestRobotNextEmitsClaimOnlyForSafeTopPick(t *testing.T) {
 
 	beads := `{"id":"READY-1","title":"Ready work","status":"open","priority":1,"issue_type":"task"}
 `
-	if err := os.WriteFile(filepath.Join(beadsDir, "beads.jsonl"), []byte(beads), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(beads), 0o644); err != nil {
 		t.Fatalf("write beads: %v", err)
 	}
 
 	exe := buildTestBinary(t)
 	cmd := exec.Command(exe, "--robot-next", "--format=json")
 	cmd.Dir = dir
+	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("robot-next failed: %v", err)
@@ -210,15 +260,23 @@ func TestRobotNextEmitsClaimOnlyForSafeTopPick(t *testing.T) {
 	if err := json.Unmarshal(out, &payload); err != nil {
 		t.Fatalf("robot-next json: %v\n%s", err, out)
 	}
-	if got := payload["actionable"]; got != true {
-		t.Fatalf("actionable = %v, want true; payload=%v", got, payload)
+	if payload["actionable"] != false || payload["id"] != nil || payload["claim_command"] != nil || payload["show_command"] != nil {
+		t.Fatalf("unbound issue emitted a live tracker command: %s", out)
 	}
-	if got := payload["id"]; got != "READY-1" {
-		t.Fatalf("id = %v, want READY-1; payload=%v", got, payload)
+	diagnostic, ok := payload["diagnostic_top_pick"].(map[string]any)
+	if !ok || diagnostic["id"] != "READY-1" || diagnostic["title"] != "Ready work" {
+		t.Fatalf("ready issue must remain the useful diagnostic candidate: %s", out)
 	}
-	claim, ok := payload["claim_command"].(string)
-	if !ok || !strings.Contains(claim, "READY-1") {
-		t.Fatalf("safe robot-next missing claim command for READY-1: %s", out)
+	authority, ok := payload["source_authority"].(map[string]any)
+	if !ok || authority["claim_safe"] != true {
+		t.Fatalf("unbound route must not erase complete graph authority: %s", out)
+	}
+	actions, ok := payload["actions"].(map[string]any)
+	if !ok || actions["claim"] != nil || actions["show"] != nil {
+		t.Fatalf("unbound route must explicitly withhold nested commands: %s", out)
+	}
+	if reason, ok := actions["unavailable_reason"].(string); !ok || reason == "" {
+		t.Fatalf("unbound route must explain why commands are unavailable: %s", out)
 	}
 	if _, ok := payload["status"].(map[string]any); !ok {
 		t.Fatalf("robot-next missing metric status: %s", out)
@@ -239,7 +297,7 @@ func TestRobotNextClaimablePickRejectsAssignedTopPick(t *testing.T) {
 		Assignee:  " cc11 ",
 	}}
 
-	_, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues, time.Time{})
+	_, diagnostic, reasons, ok := robotNextClaimablePick(picks, issues, nil, time.Time{})
 	if ok {
 		t.Fatalf("assigned top pick must not be claimable")
 	}
