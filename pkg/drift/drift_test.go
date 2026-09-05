@@ -5,6 +5,7 @@ import (
 	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +13,279 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 )
+
+func driftReuseFixture(now time.Time) []model.Issue {
+	issues := []model.Issue{{ID: "gate", Title: "Release integration", Status: model.StatusOpen, Priority: 1,
+		UpdatedAt: now.Add(-40 * 24 * time.Hour), Labels: []string{"z", "a"}}}
+	for _, id := range []string{"third", "first", "second"} {
+		issues = append(issues, model.Issue{ID: id, Title: id, Status: model.StatusOpen, Priority: 0,
+			UpdatedAt: now.Add(-40 * 24 * time.Hour), Dependencies: []*model.Dependency{{DependsOnID: "gate", Type: model.DepBlocks}}})
+	}
+	return issues
+}
+
+func newDriftReuseCalculator(issues []model.Issue, now time.Time) *Calculator {
+	bl := &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: len(issues), OpenCount: len(issues)}}
+	c := NewCalculator(bl, bl, nil)
+	c.SetNow(now)
+	c.SetIssues(issues)
+	return c
+}
+
+func TestCalculatorReuseAnalyzerPreservesExactAlertsAndOrder(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	issues := driftReuseFixture(now)
+	// The graph snapshot and current presentation have different outer orders.
+	source := []model.Issue{issues[2], issues[1], issues[0], issues[3]}
+	a := analysis.NewAnalyzer(source)
+	a.SetNow(now)
+	c := newDriftReuseCalculator(issues, now)
+	if !c.ReuseAnalyzer(a) || c.analyzerCache != a {
+		t.Fatal("matching graph was not reused")
+	}
+	want := newDriftReuseCalculator(driftReuseFixture(now), now).Calculate()
+	got := c.Calculate()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("reused alerts differ from ordinary full rebuild:\ngot %#v\nwant %#v", got, want)
+	}
+	var staleIDs []string
+	gate := false
+	for _, alert := range got.Alerts {
+		if alert.Type == AlertStaleIssue {
+			staleIDs = append(staleIDs, alert.IssueID)
+		}
+		if alert.Type == AlertBlockingCascade && alert.IssueID == "gate" && alert.UnblocksCount == 3 {
+			gate = true
+		}
+	}
+	if !gate || !reflect.DeepEqual(staleIDs, []string{"gate", "third", "first", "second"}) {
+		t.Fatalf("missing real cascade or presentation order: gate=%v stale=%v", gate, staleIDs)
+	}
+	issues[0].Labels[0] = "changed"
+	issues[1].Dependencies[0].DependsOnID = "missing"
+	issues[2].Title = "mutated caller row"
+	if got := c.Calculate(); !reflect.DeepEqual(got, want) {
+		t.Fatal("accepted source still aliases caller-owned issue rows")
+	}
+}
+
+func TestCalculatorLookupAlertsUseLatestDuplicateMetadata(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	rows := []model.Issue{{ID: "gate", Status: model.StatusOpen, Priority: 4, UpdatedAt: now, Labels: []string{"日本語", "a"}}}
+	for i := 0; i < 8; i++ {
+		rows = append(rows, model.Issue{ID: fmt.Sprintf("leaf-%d", i), Status: model.StatusOpen, Priority: 0, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "gate", Type: model.DepBlocks}}})
+	}
+	latest := rows[1].Clone()
+	rows[1].Priority = 4
+	rows = append(rows, latest)
+	result := newDriftReuseCalculator(rows, now).Calculate()
+	found := map[AlertType]bool{}
+	for _, alert := range result.Alerts {
+		if alert.IssueID != "gate" {
+			continue
+		}
+		switch alert.Type {
+		case AlertBlockingCascade:
+			if alert.UnblocksCount != 8 || alert.DownstreamPrioritySum != 0 {
+				t.Fatalf("duplicate metadata changed unblock priorities: %+v", alert)
+			}
+		case AlertHighImpactUnblock:
+			if alert.UnblocksCount != 8 || len(alert.Details) != 8 {
+				t.Fatalf("duplicate metadata lost urgent successors: %+v", alert)
+			}
+		case AlertPriorityMismatch:
+			if !reflect.DeepEqual(alert.Labels, rows[0].Labels) || alert.BaselineVal != 4 || alert.CurrentVal >= 4 {
+				t.Fatalf("priority alert lost source metadata: %+v", alert)
+			}
+		default:
+			continue
+		}
+		found[alert.Type] = true
+	}
+	if len(found) != 3 {
+		t.Fatalf("expected all three lookup consumers to emit, got %v", found)
+	}
+}
+
+func TestCalculatorReuseAnalyzerRejectsDifferentSource(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		change func([]model.Issue) []model.Issue
+	}{
+		{"same-id-title", func(rows []model.Issue) []model.Issue { rows[0].Title += " changed"; return rows }},
+		{"nested-dependency", func(rows []model.Issue) []model.Issue { rows[1].Dependencies[0].DependsOnID = "missing"; return rows }},
+		{"ordered-labels", func(rows []model.Issue) []model.Issue {
+			rows[0].Labels[0], rows[0].Labels[1] = rows[0].Labels[1], rows[0].Labels[0]
+			return rows
+		}},
+		{"missing-row", func(rows []model.Issue) []model.Issue { return rows[:len(rows)-1] }},
+		{"new-id", func(rows []model.Issue) []model.Issue { rows[1].ID = "replacement"; return rows }},
+		{"duplicate", func(rows []model.Issue) []model.Issue { rows[1] = rows[0]; return rows }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := driftReuseFixture(now)
+			a := analysis.NewAnalyzer(rows)
+			a.SetNow(now)
+			rows = tc.change(rows)
+			c := newDriftReuseCalculator(rows, now)
+			if c.ReuseAnalyzer(a) {
+				t.Fatal("different source accepted")
+			}
+			if got, want := c.Calculate(), newDriftReuseCalculator(rows, now).Calculate(); !reflect.DeepEqual(got, want) {
+				t.Fatal("rejected source did not retain ordinary calculation")
+			}
+		})
+	}
+	rows := driftReuseFixture(now)
+	rows[1] = rows[0]
+	a := analysis.NewAnalyzer(rows)
+	a.SetNow(now)
+	if newDriftReuseCalculator(rows, now).ReuseAnalyzer(a) {
+		t.Fatal("matching duplicate IDs must still reject reuse")
+	}
+	if newDriftReuseCalculator(nil, now).ReuseAnalyzer(nil) {
+		t.Fatal("nil analyzer accepted")
+	}
+	a = analysis.NewAnalyzer(nil)
+	a.SetNow(now)
+	if !newDriftReuseCalculator(nil, now).ReuseAnalyzer(a) {
+		t.Fatal("empty matching source rejected")
+	}
+	if newDriftReuseCalculator(nil, now.Add(time.Hour)).ReuseAnalyzer(a) {
+		t.Fatal("mismatched reference clock accepted")
+	}
+}
+
+func TestCalculatorReuseAnalyzerDetachesChangedBorrower(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, mutation := range []string{"clock", "weights", "candidates"} {
+		t.Run(mutation, func(t *testing.T) {
+			rows := driftReuseFixture(now)
+			rows[0].Dependencies = []*model.Dependency{{DependsOnID: "hidden", Type: model.DepBlocks}}
+			full := append(append([]model.Issue(nil), rows...), model.Issue{ID: "hidden", Status: model.StatusTombstone})
+			a := analysis.NewAnalyzer(rows)
+			a.SetNow(now)
+			a.SetReadinessScope(model.NewReadinessIndex(full), map[string]bool{"gate": true})
+			weights := analysis.DefaultWeights()
+			weights.PageRank += .05
+			weights.PriorityBoost -= .05
+			a.SetWeights(weights)
+			c := newDriftReuseCalculator(rows, now)
+			if !c.ReuseAnalyzer(a) {
+				t.Fatal("matching scoped analyzer rejected")
+			}
+			captured := a.CaptureScoring()
+			want := c.Calculate()
+			switch mutation {
+			case "clock":
+				a.SetNow(now.Add(365 * 24 * time.Hour))
+			case "weights":
+				a.SetWeights(analysis.DefaultWeights())
+			case "candidates":
+				a.SetReadinessScope(a.Readiness(), map[string]bool{})
+			}
+			changed := a.CaptureScoring()
+			selected := a.IsCandidate("gate")
+			got := c.Calculate()
+			if c.analyzerCache == a || c.analyzerSource != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("changed borrowed analyzer not detached with exact captured results: got %#v want %#v", got, want)
+			}
+			if c.analyzerCache.CaptureScoring() != captured || a.CaptureScoring() != changed || a.IsCandidate("gate") != selected {
+				t.Fatal("detaching changed exact scoring or mutated borrowed analyzer")
+			}
+			if c.analyzerCache.CountActionableIssues() != 1 || c.analyzerCache.IsCandidate("third") {
+				t.Fatal("detached analyzer lost hidden authority or candidate scope")
+			}
+		})
+	}
+}
+
+func TestCalculatorSetNowInvalidatesReadinessAndSetIssuesDropsScope(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	boundary := now.Add(time.Hour)
+	for _, reuse := range []bool{false, true} {
+		t.Run(fmt.Sprint(reuse), func(t *testing.T) {
+			rows := driftReuseFixture(now)
+			rows[0].DeferUntil = &boundary
+			if reuse {
+				rows[0].Dependencies = []*model.Dependency{{DependsOnID: "hidden", Type: model.DepBlocks}}
+			}
+			c := newDriftReuseCalculator(rows, now)
+			a := analysis.NewAnalyzer(rows)
+			a.SetNow(now)
+			if reuse {
+				full := append(append([]model.Issue(nil), rows...), model.Issue{ID: "hidden", Status: model.StatusTombstone})
+				a.SetReadinessScope(model.NewReadinessIndex(full), map[string]bool{"gate": true, "third": true, "first": true, "second": true})
+				if !c.ReuseAnalyzer(a) {
+					t.Fatal("matching analyzer rejected")
+				}
+			}
+			before := c.Calculate()
+			for _, alert := range before.Alerts {
+				if alert.Type == AlertBlockingCascade && alert.IssueID == "gate" {
+					t.Fatal("future-deferred gate advertised")
+				}
+			}
+			c.SetNow(boundary)
+			found := false
+			for _, alert := range c.Calculate().Alerts {
+				if alert.Type == AlertBlockingCascade && alert.IssueID == "gate" && alert.UnblocksCount == 3 {
+					found = true
+				}
+				if !alert.DetectedAt.Equal(boundary) {
+					t.Fatal("alert timestamp did not advance")
+				}
+			}
+			if !found || !a.Now().Equal(now) {
+				t.Fatal("boundary lost ready gate or mutated borrowed clock")
+			}
+			c.SetIssues([]model.Issue{{ID: "replacement", Status: model.StatusOpen}})
+			c.Calculate()
+			if c.analyzer().CountActionableIssues() != 1 || c.analyzerReadiness != nil || c.analyzerSource != nil {
+				t.Fatal("SetIssues retained stale source scope")
+			}
+		})
+	}
+}
+
+func BenchmarkCalculatorReuseAnalyzer(b *testing.B) {
+	rows, err := testutil.PerformanceIssues("unicode", 10000, 20260904)
+	if err != nil {
+		b.Fatal(err)
+	}
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	a := analysis.NewAnalyzer(rows)
+	a.SetNow(now)
+	a.Readiness()
+	want := newDriftReuseCalculator(rows, now).Calculate()
+	c := newDriftReuseCalculator(rows, now)
+	if !c.ReuseAnalyzer(a) || !reflect.DeepEqual(c.Calculate(), want) {
+		b.Fatal("full result parity failed before timing")
+	}
+	for _, name := range []string{"source-validation", "fresh", "reuse"} {
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if name == "source-validation" {
+					if !a.MatchesIssues(rows) {
+						b.Fatal("source mismatch")
+					}
+					continue
+				}
+				c := newDriftReuseCalculator(rows, now)
+				if name == "reuse" && !c.ReuseAnalyzer(a) {
+					b.Fatal("source mismatch")
+				}
+				c.Calculate()
+			}
+		})
+	}
+}
 
 func TestCalculatorNoDrift(t *testing.T) {
 	bl := &baseline.Baseline{
@@ -260,6 +533,133 @@ func TestCalculatorStalenessWarningAndCritical(t *testing.T) {
 	}
 	if critCount != 1 {
 		t.Fatalf("expected 1 critical staleness alert, got %d", critCount)
+	}
+}
+
+func TestCalculatorStalenessPreservesBoundariesOrderAndPrefix(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	old := now.Add(-40 * 24 * time.Hour)
+	cfg := DefaultConfig()
+	cfg.LabelOverrides = map[string]*LabelConfig{
+		"slow":  {StaleWarningDays: 20, StaleCriticalDays: 60},
+		"tight": {StaleWarningDays: 4, StaleCriticalDays: 8, InProgressStaleMultiplier: .25},
+	}
+	var issues []model.Issue
+	prefix := Alert{Type: AlertNewCycle, Severity: SeverityCritical, IssueID: "existing", Details: []string{"keep", "order"}}
+	want := []Alert{prefix}
+	for _, tc := range []struct {
+		id       string
+		status   model.Status
+		updated  time.Time
+		created  time.Time
+		labels   []string
+		severity Severity
+		days     int
+	}{
+		{id: "under-warning", updated: now.Add(-14*24*time.Hour + time.Second)},
+		{id: "at-warning", updated: now.Add(-14 * 24 * time.Hour), severity: SeverityWarning, days: 14},
+		{id: "at-critical", updated: now.Add(-30 * 24 * time.Hour), severity: SeverityCritical, days: 30},
+		{id: "progress-warning", status: model.StatusInProgress, updated: now.Add(-7 * 24 * time.Hour), severity: SeverityWarning, days: 7},
+		{id: "progress-critical", status: model.StatusInProgress, updated: now.Add(-15 * 24 * time.Hour), severity: SeverityCritical, days: 15},
+		{id: "created-fallback", created: old, severity: SeverityCritical, days: 40},
+		{id: "looser-label", updated: old, labels: []string{"slow"}, severity: SeverityWarning, days: 40},
+		{id: "tightest-label", status: model.StatusInProgress, updated: now.Add(-24 * time.Hour), labels: []string{"slow", "tight"}, severity: SeverityWarning, days: 1},
+		{id: "unknown-label", updated: old, labels: []string{"日本語"}, severity: SeverityCritical, days: 40},
+		{id: "empty-labels", updated: old, labels: []string{}, severity: SeverityCritical, days: 40},
+		{id: "future", updated: now.Add(time.Hour)},
+		{id: "closed", status: model.StatusClosed, updated: old},
+		{id: "tombstone", status: model.StatusTombstone, updated: old},
+		{id: "unknown-time"},
+	} {
+		status := tc.status
+		if status == "" {
+			status = model.StatusOpen
+		}
+		issues = append(issues, model.Issue{ID: tc.id, Status: status, UpdatedAt: tc.updated, CreatedAt: tc.created, Labels: tc.labels})
+		if tc.severity == "" {
+			continue
+		}
+		lastActive := tc.updated
+		if lastActive.IsZero() {
+			lastActive = tc.created
+		}
+		want = append(want, Alert{
+			Type: AlertStaleIssue, Severity: tc.severity, Labels: tc.labels,
+			SuggestedAction: "Update, close, or re-triage the issue; stale work hides real priorities",
+			Message:         fmt.Sprintf("Issue %s inactive for %d days", tc.id, tc.days),
+			IssueID:         tc.id, DetectedAt: now,
+			Details: []string{fmt.Sprintf("status=%s", status), "last_update=" + lastActive.Format(time.RFC3339)},
+		})
+	}
+	calc := newDriftReuseCalculator(issues, now)
+	calc.config = cfg
+	result := Result{Alerts: []Alert{prefix}}
+	calc.checkStaleness(&result)
+	if !reflect.DeepEqual(result.Alerts, want) {
+		t.Fatalf("staleness boundaries, metadata or prefix changed:\ngot %#v\nwant %#v", result.Alerts, want)
+	}
+	for _, tc := range []struct {
+		name     string
+		rows     []model.Issue
+		disabled bool
+	}{
+		{name: "nil-issues"},
+		{name: "empty-issues", rows: []model.Issue{}},
+		{name: "no-matches", rows: []model.Issue{{ID: "fresh", Status: model.StatusOpen, UpdatedAt: now}}},
+		{name: "disabled", rows: issues, disabled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newDriftReuseCalculator(tc.rows, now)
+			if tc.disabled {
+				c.config.DisabledAlerts = []string{string(AlertStaleIssue)}
+			}
+			for _, initial := range [][]Alert{nil, {}, {prefix}} {
+				result := Result{Alerts: initial}
+				c.checkStaleness(&result)
+				if !reflect.DeepEqual(result.Alerts, initial) {
+					t.Fatalf("no-op changed existing/nil/empty alerts: got %#v want %#v", result.Alerts, initial)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkCalculatorStaleness(b *testing.B) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		staleStep int
+		overrides bool
+	}{
+		{name: "all-stale", staleStep: 1},
+		{name: "sparse-stale", staleStep: 100},
+		{name: "all-fresh"},
+		{name: "label-overrides", staleStep: 1, overrides: true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			rows := make([]model.Issue, 10000)
+			wantCount := 0
+			for i := range rows {
+				rows[i] = model.Issue{ID: fmt.Sprintf("stale-%05d", i), Status: model.StatusOpen, UpdatedAt: now, Labels: []string{"日本語"}}
+				if tc.staleStep != 0 && i%tc.staleStep == 0 {
+					rows[i].UpdatedAt = now.Add(-40 * 24 * time.Hour)
+					wantCount++
+				}
+			}
+			c := newDriftReuseCalculator(rows, now)
+			if tc.overrides {
+				c.config.LabelOverrides = map[string]*LabelConfig{"日本語": {StaleWarningDays: 20, StaleCriticalDays: 60}}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				result := Result{}
+				c.checkStaleness(&result)
+				if len(result.Alerts) != wantCount {
+					b.Fatalf("stale alert count=%d, want %d", len(result.Alerts), wantCount)
+				}
+			}
+		})
 	}
 }
 

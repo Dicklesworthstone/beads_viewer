@@ -142,6 +142,15 @@ type Calculator struct {
 	// analyzerCache is the graph analyzer over issues, built on first use so
 	// the issue-level checks share unblock/actionable/impact computations.
 	analyzerCache *analysis.Analyzer
+
+	// A borrowed analyzer is used only while its captured scope and scoring
+	// remain unchanged. Issues are owned, in the caller's order; readiness is
+	// immutable. A later source mutation detaches the cache without changing
+	// this calculator's captured inputs or mutating the source analyzer.
+	analyzerSource     *analysis.Analyzer
+	analyzerReadiness  *model.ReadinessIndex
+	analyzerCandidates map[string]bool
+	analyzerScoring    analysis.ScoringSnapshot
 }
 
 // NewCalculator creates a drift calculator with the given baseline and current snapshot.
@@ -163,6 +172,10 @@ func NewCalculator(bl *baseline.Baseline, current *baseline.Baseline, cfg *Confi
 // drift checks. The zero Go time is valid because SOURCE_DATE_EPOCH can map to
 // year 1 exactly.
 func (c *Calculator) SetNow(now time.Time) {
+	if !c.now.Equal(now) {
+		c.analyzerCache = nil
+		c.analyzerSource = nil
+	}
 	c.now = now.UTC()
 }
 
@@ -175,6 +188,55 @@ func (c *Calculator) nowUTC() time.Time {
 func (c *Calculator) SetIssues(issues []model.Issue) {
 	c.issues = issues
 	c.analyzerCache = nil
+	c.analyzerSource = nil
+	c.analyzerReadiness = nil
+	c.analyzerCandidates = nil
+	c.analyzerScoring = analysis.ScoringSnapshot{}
+}
+
+// ReuseAnalyzer borrows an analyzer for the exact attached issue rows and
+// reference instant, preserving the attached rows' order. On success the
+// calculator owns those rows and captures the analyzer's dependency authority,
+// candidate eligibility, and scoring state. A mismatch leaves the ordinary
+// SetIssues path intact. Call from the analyzer's owning goroutine; neither its
+// scope nor the attached rows may change concurrently with this calculator.
+func (c *Calculator) ReuseAnalyzer(a *analysis.Analyzer) bool {
+	if a == nil || !c.now.Equal(a.Now()) || !a.MatchesIssues(c.issues) {
+		return false
+	}
+	issues := make([]model.Issue, len(c.issues))
+	candidates := make(map[string]bool, len(c.issues))
+	for i := range c.issues {
+		issues[i] = c.issues[i].Clone()
+		candidates[issues[i].ID] = a.IsCandidate(issues[i].ID)
+	}
+	c.issues = issues
+	c.analyzerReadiness = a.Readiness()
+	c.analyzerCandidates = candidates
+	c.analyzerScoring = a.CaptureScoring()
+	c.analyzerSource = a
+	c.analyzerCache = a
+	return true
+}
+
+func (c *Calculator) validateBorrowedAnalyzer() {
+	a := c.analyzerSource
+	if a == nil {
+		return
+	}
+	valid := a.CaptureScoring() == c.analyzerScoring && a.Readiness() == c.analyzerReadiness
+	if valid {
+		for id, selected := range c.analyzerCandidates {
+			if a.IsCandidate(id) != selected {
+				valid = false
+				break
+			}
+		}
+	}
+	if !valid {
+		c.analyzerSource = nil
+		c.analyzerCache = nil
+	}
 }
 
 // analyzer returns the shared graph analyzer over the attached issues (nil
@@ -182,6 +244,10 @@ func (c *Calculator) SetIssues(issues []model.Issue) {
 func (c *Calculator) analyzer() *analysis.Analyzer {
 	if c.analyzerCache == nil && len(c.issues) > 0 {
 		a := analysis.NewAnalyzer(c.issues)
+		if c.analyzerReadiness != nil {
+			a.SetReadinessScope(c.analyzerReadiness, c.analyzerCandidates)
+			a.RestoreScoring(c.analyzerScoring)
+		}
 		a.SetNow(c.nowUTC())
 		c.analyzerCache = a
 	}
@@ -198,6 +264,7 @@ func (c *Calculator) Calculate() *Result {
 	if c.baseline == nil || c.current == nil {
 		return result
 	}
+	c.validateBorrowedAnalyzer()
 
 	// Check for new cycles (critical)
 	c.checkCycles(result)
@@ -511,37 +578,25 @@ func (c *Calculator) checkStaleness(result *Result) {
 		return
 	}
 	now := c.nowUTC()
-	for _, issue := range c.issues {
-		if issue.Status == model.StatusClosed || issue.Status == model.StatusTombstone {
-			continue
+	staleCount := 0
+	for i := range c.issues {
+		if severity, _, _ := c.stalenessSeverity(&c.issues[i], now); severity != "" {
+			staleCount++
 		}
-
-		lastActive := issue.UpdatedAt
-		if lastActive.IsZero() {
-			lastActive = issue.CreatedAt
-		}
-		if lastActive.IsZero() {
-			continue
-		}
-
-		// Get label-specific thresholds (bv-167)
-		warnDays, critDays, inProgressMult := c.config.GetStalenessThresholds(issue.Labels)
-		warn := float64(warnDays)
-		crit := float64(critDays)
-
-		// Tighten thresholds for in-progress items
-		if issue.Status == model.StatusInProgress && inProgressMult > 0 {
-			warn *= inProgressMult
-			crit *= inProgressMult
-		}
-
-		days := now.Sub(lastActive).Hours() / 24.0
-		severity := Severity("")
-		if days >= crit {
-			severity = SeverityCritical
-		} else if days >= warn {
-			severity = SeverityWarning
-		}
+	}
+	if staleCount == 0 {
+		return
+	}
+	// Alert values are large. Reserve only eligible rows, preserving any
+	// preceding drift alerts and avoiding repeated backing-array copies.
+	if required := len(result.Alerts) + staleCount; cap(result.Alerts) < required {
+		alerts := make([]Alert, len(result.Alerts), required)
+		copy(alerts, result.Alerts)
+		result.Alerts = alerts
+	}
+	for i := range c.issues {
+		issue := &c.issues[i]
+		severity, lastActive, days := c.stalenessSeverity(issue, now)
 		if severity == "" {
 			continue
 		}
@@ -560,6 +615,36 @@ func (c *Calculator) checkStaleness(result *Result) {
 			},
 		})
 	}
+}
+
+// stalenessSeverity is shared by capacity counting and emission so label
+// overrides, status multipliers and inclusive time boundaries stay identical.
+func (c *Calculator) stalenessSeverity(issue *model.Issue, now time.Time) (Severity, time.Time, float64) {
+	if issue.Status == model.StatusClosed || issue.Status == model.StatusTombstone {
+		return "", time.Time{}, 0
+	}
+	lastActive := issue.UpdatedAt
+	if lastActive.IsZero() {
+		lastActive = issue.CreatedAt
+	}
+	if lastActive.IsZero() {
+		return "", time.Time{}, 0
+	}
+	warnDays, critDays, inProgressMult := c.config.GetStalenessThresholds(issue.Labels)
+	warn := float64(warnDays)
+	crit := float64(critDays)
+	if issue.Status == model.StatusInProgress && inProgressMult > 0 {
+		warn *= inProgressMult
+		crit *= inProgressMult
+	}
+	days := now.Sub(lastActive).Hours() / 24.0
+	if days >= crit {
+		return SeverityCritical, lastActive, days
+	}
+	if days >= warn {
+		return SeverityWarning, lastActive, days
+	}
+	return "", lastActive, days
 }
 
 // checkBlockingCascade raises alerts for issues whose completion would unblock many dependents.
@@ -581,10 +666,7 @@ func (c *Calculator) checkBlockingCascade(result *Result) {
 	}
 
 	// Build issue lookup map for priority calculation (bv-165)
-	issueMap := make(map[string]model.Issue, len(c.issues))
-	for _, iss := range c.issues {
-		issueMap[iss.ID] = iss
-	}
+	issueMap := c.issueMap()
 
 	analyzer := c.analyzer()
 	actionable := sortedByID(analyzer.GetActionableIssues())
@@ -736,10 +818,12 @@ func sortedByID(issues []model.Issue) []model.Issue {
 	return out
 }
 
-func (c *Calculator) issueMap() map[string]model.Issue {
-	m := make(map[string]model.Issue, len(c.issues))
-	for _, iss := range c.issues {
-		m[iss.ID] = iss
+// issueMap borrows rows for read-only lookups during one calculation. The
+// calculator keeps the slice stable; duplicate IDs retain the last row.
+func (c *Calculator) issueMap() map[string]*model.Issue {
+	m := make(map[string]*model.Issue, len(c.issues))
+	for i := range c.issues {
+		m[c.issues[i].ID] = &c.issues[i]
 	}
 	return m
 }
@@ -994,12 +1078,16 @@ func (c *Calculator) checkPriorityMismatch(result *Result) {
 		if rec.Confidence < minConfidence || rec.Direction != "increase" {
 			continue
 		}
+		var labels []string
+		if issue := issueMap[rec.IssueID]; issue != nil {
+			labels = issue.Labels
+		}
 		result.Alerts = append(result.Alerts, Alert{
 			Type:            AlertPriorityMismatch,
 			Severity:        SeverityWarning,
 			Message:         fmt.Sprintf("%s is P%d but graph impact suggests P%d (confidence %.2f)", rec.IssueID, rec.CurrentPriority, rec.SuggestedPriority, rec.Confidence),
 			IssueID:         rec.IssueID,
-			Labels:          issueMap[rec.IssueID].Labels,
+			Labels:          labels,
 			BaselineVal:     float64(rec.CurrentPriority),
 			CurrentVal:      float64(rec.SuggestedPriority),
 			Delta:           float64(rec.SuggestedPriority - rec.CurrentPriority),
