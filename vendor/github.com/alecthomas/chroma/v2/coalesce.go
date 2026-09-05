@@ -1,5 +1,7 @@
 package chroma
 
+import "strings"
+
 // Coalesce is a Lexer interceptor that collapses runs of common types into a single token.
 func Coalesce(lexer Lexer) Lexer { return &coalescer{lexer} }
 
@@ -7,6 +9,7 @@ type coalescer struct{ Lexer }
 
 func (d *coalescer) Tokenise(options *TokeniseOptions, text string) (Iterator, error) {
 	var prev Token
+	var merged strings.Builder
 	it, err := d.Lexer.Tokenise(options, text)
 	if err != nil {
 		return nil, err
@@ -20,16 +23,22 @@ func (d *coalescer) Tokenise(options *TokeniseOptions, text string) (Iterator, e
 				prev = token
 			} else {
 				if prev.Type == token.Type && len(prev.Value) < 8192 {
-					prev.Value += token.Value
+					if merged.Len() == 0 {
+						merged.WriteString(prev.Value)
+					}
+					merged.WriteString(token.Value)
+					prev.Value = merged.String()
 				} else {
 					out := prev
 					prev = token
+					merged.Reset()
 					return out
 				}
 			}
 		}
 		out := prev
 		prev = EOF
+		merged.Reset()
 		return out
 	}, nil
 }

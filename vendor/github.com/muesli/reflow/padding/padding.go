@@ -71,7 +71,7 @@ func (w *Writer) Write(b []byte) (int, error) {
 				w.ansi = false
 			}
 		} else {
-			w.lineLen += runewidth.StringWidth(string(c))
+			w.lineLen += runewidth.RuneWidth(c)
 
 			if c == '\n' {
 				// end of current line

@@ -331,15 +331,15 @@ func (tr *ANSIRenderer) NewElement(node ast.Node, source []byte) Element {
 	case ast.KindFencedCodeBlock:
 		n := node.(*ast.FencedCodeBlock)
 		l := n.Lines().Len()
-		s := ""
+		var s strings.Builder
 		for i := 0; i < l; i++ {
 			line := n.Lines().At(i)
-			s += string(line.Value(source))
+			s.Write(line.Value(source))
 		}
 		return Element{
 			Entering: "\n",
 			Renderer: &CodeBlockElement{
-				Code:     s,
+				Code:     s.String(),
 				Language: string(n.Language(source)),
 			},
 		}
@@ -347,15 +347,15 @@ func (tr *ANSIRenderer) NewElement(node ast.Node, source []byte) Element {
 	case ast.KindCodeBlock:
 		n := node.(*ast.CodeBlock)
 		l := n.Lines().Len()
-		s := ""
+		var s strings.Builder
 		for i := 0; i < l; i++ {
 			line := n.Lines().At(i)
-			s += string(line.Value(source))
+			s.Write(line.Value(source))
 		}
 		return Element{
 			Entering: "\n",
 			Renderer: &CodeBlockElement{
-				Code: s,
+				Code: s.String(),
 			},
 		}
 
