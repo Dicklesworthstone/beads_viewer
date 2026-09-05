@@ -160,12 +160,26 @@ func TestWorkflow_TriageAndRecommendations(t *testing.T) {
 		t.Fatalf("invalid JSON: %v", err)
 	}
 
-	// Verify next recommendation has claim command
-	if _, ok := next["claim_command"]; !ok {
-		t.Error("missing claim_command in robot-next output")
+	// This JSONL-only project still supplies a useful ready recommendation,
+	// but cannot authorize commands against an unverified live database.
+	diagnostic, ok := next["diagnostic_top_pick"].(map[string]interface{})
+	if !ok || diagnostic["id"] == "" || diagnostic["id"] == nil {
+		t.Fatalf("unbound next omitted its diagnostic recommendation: %s", out)
 	}
-	if _, ok := next["show_command"]; !ok {
-		t.Error("missing show_command in robot-next output")
+	topPicks, ok := quickRef["top_picks"].([]interface{})
+	if !ok || len(topPicks) == 0 {
+		t.Fatal("triage omitted ready top picks")
+	}
+	triageTop, ok := topPicks[0].(map[string]interface{})
+	if !ok || diagnostic["id"] != triageTop["id"] {
+		t.Errorf("next diagnostic %v differs from triage top %v", diagnostic, topPicks[0])
+	}
+	if next["actionable"] != false || next["id"] != nil || next["claim_command"] != nil || next["show_command"] != nil {
+		t.Errorf("unbound next emitted an actionable command: %s", out)
+	}
+	actions, ok := next["actions"].(map[string]interface{})
+	if !ok || actions["local_id"] != diagnostic["id"] || actions["unavailable_reason"] == "" || actions["unavailable_reason"] == nil || actions["claim"] != nil || actions["show"] != nil {
+		t.Errorf("unbound next lost route diagnostics or invented a command: %s", out)
 	}
 
 	// Step 3: Verify blockers_to_clear in triage

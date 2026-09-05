@@ -194,8 +194,8 @@ func TestPartialWorkspaceExportArtifactsRetainAuthority(t *testing.T) {
 			case "brief":
 				data, err = os.ReadFile(filepath.Join(output, "triage.json"))
 			case "script":
-				if bytes.Contains(logs, []byte("br update")) || !bytes.Contains(logs, []byte(`"claim_safe":false`)) || !bytes.Contains(logs, []byte("br show api-AUTH-1")) {
-					t.Fatalf("partial script must preserve inspection and withhold claim commands:\n%s", logs)
+				if bytes.Contains(logs, []byte("--claim")) || !bytes.Contains(logs, []byte(`"claim_safe":false`)) || !bytes.Contains(logs, []byte("api-AUTH-1:")) || !bytes.Contains(logs, []byte("# No verified live tracker route")) {
+					t.Fatalf("partial unbound script must preserve issue identity and withhold unverified commands:\n%s", logs)
 				}
 				return
 			}
@@ -1139,6 +1139,46 @@ func TestExportPages_ExcludeHistory(t *testing.T) {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("missing expected artifact %s: %v", p, err)
 		}
+	}
+}
+
+func TestExportPages_WithoutGitHistory(t *testing.T) {
+	bv := buildBvBinary(t)
+	stageViewerAssets(t, bv)
+	repo := createSimpleRepo(t, 2)
+	if _, err := os.Stat(filepath.Join(repo, ".git")); !os.IsNotExist(err) {
+		t.Fatalf("expected fixture without local Git history, got %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "bundle")
+	cmd := exec.Command(bv, "--export-pages", out)
+	cmd.Dir = repo
+	combined, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("export without Git history failed: %v\n%s", err, combined)
+	}
+	warning := "Warning: failed to generate history: not a git repository: " + repo
+	if !strings.Contains(string(combined), warning) {
+		t.Fatalf("missing optional-history warning %q:\n%s", warning, combined)
+	}
+	if _, err := os.Stat(filepath.Join(out, "data", "history.json")); !os.IsNotExist(err) {
+		t.Fatalf("history.json should be absent without Git history, got %v", err)
+	}
+	for _, name := range []string{"index.html", "beads.sqlite3", "data/meta.json", "data/triage.json", "data/graph_layout.json"} {
+		info, err := os.Stat(filepath.Join(out, filepath.FromSlash(name)))
+		if err != nil {
+			t.Fatalf("required bundle file %s: %v", name, err)
+		}
+		if info.Size() == 0 {
+			t.Fatalf("required bundle file %s is empty", name)
+		}
+	}
+	issues := queryAllIssues(t, filepath.Join(out, "beads.sqlite3"))
+	ids := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		ids[issue.ID] = true
+	}
+	if len(issues) != 2 || !ids["issue-1"] || !ids["issue-2"] {
+		t.Fatalf("export without history lost fixture issues: %+v", issues)
 	}
 }
 
@@ -2205,7 +2245,8 @@ func TestExportPages_RecordsLoadSizes(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "bundle")
 	cmd := exec.Command(bv, "--export-pages", out)
 	cmd.Dir = repo
-	if combined, err := cmd.CombinedOutput(); err != nil {
+	combined, err := cmd.CombinedOutput()
+	if err != nil {
 		t.Fatalf("export failed: %v\n%s", err, combined)
 	}
 
@@ -2215,6 +2256,26 @@ func TestExportPages_RecordsLoadSizes(t *testing.T) {
 			t.Fatalf("bundle file %s: %v", rel, err)
 		}
 		return info.Size()
+	}
+	// A source archive has no local Git history. Production still exports the
+	// repository's complete current graph and warns that time-travel is absent.
+	// With Git present, a missing history file remains a regression.
+	var historyBytes *int64
+	historyStatus := "available"
+	if _, err := os.Stat(filepath.Join(repo, ".git")); err == nil {
+		n := size(filepath.Join("data", "history.json"))
+		historyBytes = &n
+	} else if os.IsNotExist(err) {
+		historyStatus = "unavailable_no_git"
+		warning := "Warning: failed to generate history: not a git repository: " + repo
+		if !strings.Contains(string(combined), warning) {
+			t.Fatalf("missing optional-history warning %q:\n%s", warning, combined)
+		}
+		if _, err := os.Stat(filepath.Join(out, "data", "history.json")); !os.IsNotExist(err) {
+			t.Fatalf("history.json should be absent without Git history, got %v", err)
+		}
+	} else {
+		t.Fatalf("stat repository Git metadata: %v", err)
 	}
 	var total, vendor int64
 	if err := filepath.Walk(out, func(path string, info os.FileInfo, err error) error {
@@ -2242,15 +2303,16 @@ func TestExportPages_RecordsLoadSizes(t *testing.T) {
 	}
 
 	record := map[string]any{
-		"generated_at": time.Now().UTC().Format(time.RFC3339),
-		"issues":       layout.NodeCount,
-		"edges":        layout.EdgeCount,
-		"bytes": map[string]int64{
+		"generated_at":   time.Now().UTC().Format(time.RFC3339),
+		"issues":         layout.NodeCount,
+		"edges":          layout.EdgeCount,
+		"history_status": historyStatus,
+		"bytes": map[string]any{
 			"index_html":        size("index.html"),
 			"beads_sqlite3":     size("beads.sqlite3"),
 			"graph_layout_json": int64(len(layoutBytes)),
 			"triage_json":       size(filepath.Join("data", "triage.json")),
-			"history_json":      size(filepath.Join("data", "history.json")),
+			"history_json":      historyBytes,
 			"vendor_total":      vendor,
 			"bundle_total":      total,
 		},

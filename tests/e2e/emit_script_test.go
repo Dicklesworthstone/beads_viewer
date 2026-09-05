@@ -10,7 +10,7 @@ func TestEmitScript_BashAndFish(t *testing.T) {
 	bv := buildBvBinary(t)
 	env := t.TempDir()
 
-	// Ensure at least one actionable recommendation.
+	// JSONL alone supplies recommendations, but cannot prove a live tracker route.
 	writeBeads(t, env, `{"id":"A","title":"Unblocker","status":"open","priority":1,"issue_type":"task"}
 {"id":"B","title":"Blocked","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"B","depends_on_id":"A","type":"blocks"}]}`)
 
@@ -39,8 +39,14 @@ func TestEmitScript_BashAndFish(t *testing.T) {
 			if tt.wantExtra != "" && !strings.Contains(s, tt.wantExtra) {
 				t.Fatalf("missing %q:\n%s", tt.wantExtra, s)
 			}
-			if !strings.Contains(s, "br show A") {
-				t.Fatalf("missing br show command for A:\n%s", s)
+			if !strings.Contains(s, "# 1. A: Unblocker (score:") || !strings.Contains(s, "# No verified live tracker route") {
+				t.Fatalf("unbound script lost the useful issue identity or route diagnostic:\n%s", s)
+			}
+			for _, line := range strings.Split(s, "\n") {
+				line = strings.TrimSpace(line)
+				if line != "" && !strings.HasPrefix(line, "#") && line != tt.wantExtra {
+					t.Fatalf("unbound script contains an executable action %q:\n%s", line, s)
+				}
 			}
 			if !strings.Contains(s, "# Data hash:") {
 				t.Fatalf("missing data hash header:\n%s", s)

@@ -258,12 +258,23 @@ func TestRobotSearchJudgedRelevance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"BEADS_DIR", "BEADS_DB", "BV_SEARCH_MODE", "BV_SEARCH_PRESET", "BV_SEARCH_WEIGHTS", "BV_SEMANTIC_MODEL"} {
-		t.Setenv(key, "")
+	// Each scale owns its source and caches. Pass the fixed search environment
+	// only to child processes so independent scales can run concurrently without
+	// changing the test process environment or reducing the evaluation matrix.
+	environment := append(os.Environ(),
+		"BEADS_DIR=", "BEADS_DB=", "BD_DB=", "BV_SEARCH_MODE=",
+		"BV_SEARCH_PRESET=", "BV_SEARCH_WEIGHTS=", "BV_SEMANTIC_MODEL=",
+		"SOURCE_DATE_EPOCH="+fmt.Sprint(fixture.ReferenceTime.Unix()),
+		"BV_SEMANTIC_EMBEDDER=hash", "BV_SEMANTIC_DIM=2048",
+	)
+	runSearch := func(dir string, args ...string) scopedRun {
+		cmd := exec.Command(bv, args...)
+		cmd.Dir, cmd.Env = dir, environment
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		err := cmd.Run()
+		return scopedRun{exit: err, stdout: stdout.String(), stderr: stderr.String()}
 	}
-	t.Setenv("SOURCE_DATE_EPOCH", fmt.Sprint(fixture.ReferenceTime.Unix()))
-	t.Setenv("BV_SEMANTIC_EMBEDDER", "hash")
-	t.Setenv("BV_SEMANTIC_DIM", "2048")
 	report := struct {
 		FixtureHash  string                         `json:"fixture_hash"`
 		BinaryHash   string                         `json:"binary_hash"`
@@ -308,160 +319,179 @@ func TestRobotSearchJudgedRelevance(t *testing.T) {
 			t.Logf("QUALITY %s %s", key, summary)
 		}
 	}()
-	for _, distractors := range []int{0, 5000, 10000} {
-		dir := t.TempDir()
-		issues := append([]model.Issue(nil), fixture.Issues...)
-		for i := 0; i < distractors; i++ {
-			issues = append(issues, model.Issue{ID: fmt.Sprintf("distractor-%05d", i),
-				Title:       fmt.Sprintf("%s %d", fixture.DistractorTemplates[i%len(fixture.DistractorTemplates)], i),
-				Description: "Administrative physical inventory record; no software implementation work.",
-				Status:      []model.Status{model.StatusOpen, model.StatusInProgress, model.StatusClosed}[i%3], Priority: i % 5, IssueType: model.TypeTask})
-		}
-		var corpus bytes.Buffer
-		zeroIDs := make([]string, 0, len(issues))
-		for _, issue := range issues {
-			if err := json.NewEncoder(&corpus).Encode(issue); err != nil {
-				t.Fatal(err)
-			}
-			zeroIDs = append(zeroIDs, issue.ID)
-		}
-		sort.Strings(zeroIDs)
-		zeroIDs = zeroIDs[:min(10, len(zeroIDs))]
-		corpusHash := fmt.Sprintf("%x", sha256.Sum256(corpus.Bytes()))
-		writeIssuesJSONL(t, dir, corpus.String())
-		indexHash := ""
-		for _, configuration := range []string{"text", "default", "bug-hunting", "sprint-planning", "impact-first"} {
-			actualNDCG, brokenNDCG := 0.0, 0.0
-			for _, query := range fixture.Queries {
-				args := []string{"--robot-search", "--search", query.Query, "--search-limit", "10", "--search-mode", "text"}
-				if configuration != "text" {
-					args = []string{"--robot-search", "--search", query.Query, "--search-limit", "10", "--search-mode", "hybrid", "--search-preset", configuration}
+	var scales [3]struct {
+		observations []relevanceObservation
+		byClass      map[string]*relevanceAggregate
+	}
+	t.Run("scales", func(t *testing.T) {
+		for scaleIndex, distractors := range []int{0, 5000, 10000} {
+			t.Run(fmt.Sprint(distractors), func(t *testing.T) {
+				t.Parallel()
+				scale := &scales[scaleIndex]
+				scale.byClass = make(map[string]*relevanceAggregate)
+				dir := t.TempDir()
+				issues := append([]model.Issue(nil), fixture.Issues...)
+				for i := 0; i < distractors; i++ {
+					issues = append(issues, model.Issue{ID: fmt.Sprintf("distractor-%05d", i),
+						Title:       fmt.Sprintf("%s %d", fixture.DistractorTemplates[i%len(fixture.DistractorTemplates)], i),
+						Description: "Administrative physical inventory record; no software implementation work.",
+						Status:      []model.Status{model.StatusOpen, model.StatusInProgress, model.StatusClosed}[i%3], Priority: i % 5, IssueType: model.TypeTask})
 				}
-				run := runScoped(t, bv, dir, args...)
-				// The CLI rejects blank input before opening an index. Record
-				// that explicit input contract, not a fabricated empty JSON
-				// search response or a successful retrieval observation.
-				exitCode := 0
-				if exitErr, ok := run.exit.(*exec.ExitError); ok {
-					exitCode = exitErr.ExitCode()
-				}
-				rejectedBlank := strings.TrimSpace(query.Query) == "" && exitCode == 1 && run.stdout == "" && strings.Contains(run.stderr, "--robot-search requires --search")
-				if run.exit != nil && !rejectedBlank {
-					t.Fatalf("scale=%d config=%s query=%s argv=%q: %v\nstdout=%s\nstderr=%s", distractors, configuration, query.ID, args, run.exit, run.stdout, run.stderr)
-				}
-				observation := relevanceObservation{QueryID: query.ID, Split: query.Split, Class: query.Class,
-					QueryHash: relevanceHash(struct{ ID, Query, Intent string }{query.ID, query.Query, query.Intent}),
-					JudgmentHash: relevanceHash(struct {
-						Relevant  map[string]int
-						Rationale string
-					}{query.Relevant, query.Rationale}),
-					CorpusHash: corpusHash, Distractors: distractors, CorpusSize: len(issues), Configuration: configuration, Stderr: run.stderr,
-					ExitCode: exitCode, RejectedBlank: rejectedBlank,
-					IDs: make([]string, 0, 10)}
-				if !rejectedBlank {
-					if err := json.Unmarshal([]byte(run.stdout), &observation.Output); err != nil {
+				var corpus bytes.Buffer
+				zeroIDs := make([]string, 0, len(issues))
+				for _, issue := range issues {
+					if err := json.NewEncoder(&corpus).Encode(issue); err != nil {
 						t.Fatal(err)
 					}
+					zeroIDs = append(zeroIDs, issue.ID)
 				}
-				out := observation.Output
-				if indexHash == "" {
-					indexHash = out.IndexDataHash
-				}
-				if !rejectedBlank && (out.IndexDataHash == "" || out.IndexDataHash != indexHash || out.CandidateHash != indexHash || out.RankingHash == "" || out.Provider != "hash" || out.Dim != 2048 || len(out.Results) > 10) {
-					t.Fatalf("missing/inconsistent real CLI identity for %s: %s", query.ID, run.stdout)
-				}
-				observation.ConfigHash = relevanceHash(struct {
-					Arguments              []string
-					Mode, Preset, Provider string
-					Dim                    int
-					Weights                map[string]float64
-					Time                   time.Time
-				}{args, out.Mode, out.Preset, out.Provider, out.Dim, out.Weights, fixture.ReferenceTime})
-				seen := make(map[string]bool)
-				for i, result := range out.Results {
-					if seen[result.ID] || math.IsNaN(result.Score) || math.IsInf(result.Score, 0) {
-						t.Fatalf("invalid ranked result: %+v", result)
-					}
-					if i > 0 && !(i == 1 && query.ExactID != "" && out.Results[0].ID == query.ExactID) {
-						previous := out.Results[i-1]
-						if previous.Score < result.Score || (previous.Score == result.Score && previous.ID > result.ID) {
-							t.Fatalf("score ordering or deterministic ID tie-break failed: query=%s previous=%+v next=%+v", query.ID, previous, result)
+				sort.Strings(zeroIDs)
+				zeroIDs = zeroIDs[:min(10, len(zeroIDs))]
+				corpusHash := fmt.Sprintf("%x", sha256.Sum256(corpus.Bytes()))
+				writeIssuesJSONL(t, dir, corpus.String())
+				indexHash := ""
+				for _, configuration := range []string{"text", "default", "bug-hunting", "sprint-planning", "impact-first"} {
+					actualNDCG, brokenNDCG := 0.0, 0.0
+					for _, query := range fixture.Queries {
+						args := []string{"--robot-search", "--search", query.Query, "--search-limit", "10", "--search-mode", "text"}
+						if configuration != "text" {
+							args = []string{"--robot-search", "--search", query.Query, "--search-limit", "10", "--search-mode", "hybrid", "--search-preset", configuration}
 						}
-					}
-					seen[result.ID] = true
-					observation.IDs = append(observation.IDs, result.ID)
-				}
-				for id := range query.Relevant {
-					if !seen[id] {
-						observation.MissingIDs = append(observation.MissingIDs, id)
-					}
-				}
-				sort.Strings(observation.MissingIDs)
-				if len(query.Relevant) > 0 {
-					recall, ndcg := judgedMetrics(observation.IDs, query.Relevant, 10)
-					zeroRecall, zeroNDCG := judgedMetrics(zeroIDs, query.Relevant, 10)
-					observation.RecallAt10, observation.NDCGAt10 = &recall, &ndcg
-					observation.ZeroRecall, observation.ZeroNDCG = &zeroRecall, &zeroNDCG
-					if query.Split == "evaluation" {
-						actualNDCG += ndcg
-						brokenNDCG += zeroNDCG
-					}
-				}
-				if query.ExactID != "" {
-					correct := len(observation.IDs) > 0 && observation.IDs[0] == query.ExactID
-					observation.ExactIDFirst = &correct
-					if !correct {
-						t.Errorf("exact-ID contract failed: scale=%d config=%s query=%s want=%s got=%v", distractors, configuration, query.ID, query.ExactID, observation.IDs)
-					}
-				}
-				if query.ExpectEmpty {
-					correct := len(observation.IDs) == 0
-					observation.EmptyCorrect = &correct
-				}
-				if query.CLIProbe {
-					repeat := runScoped(t, bv, dir, args...)
-					var replay relevanceCLIOutput
-					if rejectedBlank {
-						if repeatedExit, ok := repeat.exit.(*exec.ExitError); !ok || repeatedExit.ExitCode() != 1 || repeat.stdout != "" || repeat.stderr != run.stderr {
-							t.Errorf("blank-query rejection changed: first=%+v second=%+v", run, repeat)
+						run := runSearch(dir, args...)
+						// The CLI rejects blank input before opening an index. Record
+						// that explicit input contract, not a fabricated empty JSON
+						// search response or a successful retrieval observation.
+						exitCode := 0
+						if exitErr, ok := run.exit.(*exec.ExitError); ok {
+							exitCode = exitErr.ExitCode()
 						}
-					} else if repeat.exit != nil || json.Unmarshal([]byte(repeat.stdout), &replay) != nil || !reflect.DeepEqual(replay, out) {
-						t.Errorf("cached CLI ranking changed: scale=%d config=%s query=%s\nfirst=%s\nsecond=%s\nstderr=%s", distractors, configuration, query.ID, run.stdout, repeat.stdout, repeat.stderr)
+						rejectedBlank := strings.TrimSpace(query.Query) == "" && exitCode == 1 && run.stdout == "" && strings.Contains(run.stderr, "--robot-search requires --search")
+						if run.exit != nil && !rejectedBlank {
+							t.Fatalf("scale=%d config=%s query=%s argv=%q: %v\nstdout=%s\nstderr=%s", distractors, configuration, query.ID, args, run.exit, run.stdout, run.stderr)
+						}
+						observation := relevanceObservation{QueryID: query.ID, Split: query.Split, Class: query.Class,
+							QueryHash: relevanceHash(struct{ ID, Query, Intent string }{query.ID, query.Query, query.Intent}),
+							JudgmentHash: relevanceHash(struct {
+								Relevant  map[string]int
+								Rationale string
+							}{query.Relevant, query.Rationale}),
+							CorpusHash: corpusHash, Distractors: distractors, CorpusSize: len(issues), Configuration: configuration, Stderr: run.stderr,
+							ExitCode: exitCode, RejectedBlank: rejectedBlank,
+							IDs: make([]string, 0, 10)}
+						if !rejectedBlank {
+							if err := json.Unmarshal([]byte(run.stdout), &observation.Output); err != nil {
+								t.Fatal(err)
+							}
+						}
+						out := observation.Output
+						if indexHash == "" {
+							indexHash = out.IndexDataHash
+						}
+						if !rejectedBlank && (out.IndexDataHash == "" || out.IndexDataHash != indexHash || out.CandidateHash != indexHash || out.RankingHash == "" || out.Provider != "hash" || out.Dim != 2048 || len(out.Results) > 10) {
+							t.Fatalf("missing/inconsistent real CLI identity for %s: %s", query.ID, run.stdout)
+						}
+						observation.ConfigHash = relevanceHash(struct {
+							Arguments              []string
+							Mode, Preset, Provider string
+							Dim                    int
+							Weights                map[string]float64
+							Time                   time.Time
+						}{args, out.Mode, out.Preset, out.Provider, out.Dim, out.Weights, fixture.ReferenceTime})
+						seen := make(map[string]bool)
+						for i, result := range out.Results {
+							if seen[result.ID] || math.IsNaN(result.Score) || math.IsInf(result.Score, 0) {
+								t.Fatalf("invalid ranked result: %+v", result)
+							}
+							if i > 0 && !(i == 1 && query.ExactID != "" && out.Results[0].ID == query.ExactID) {
+								previous := out.Results[i-1]
+								if previous.Score < result.Score || (previous.Score == result.Score && previous.ID > result.ID) {
+									t.Fatalf("score ordering or deterministic ID tie-break failed: query=%s previous=%+v next=%+v", query.ID, previous, result)
+								}
+							}
+							seen[result.ID] = true
+							observation.IDs = append(observation.IDs, result.ID)
+						}
+						for id := range query.Relevant {
+							if !seen[id] {
+								observation.MissingIDs = append(observation.MissingIDs, id)
+							}
+						}
+						sort.Strings(observation.MissingIDs)
+						if len(query.Relevant) > 0 {
+							recall, ndcg := judgedMetrics(observation.IDs, query.Relevant, 10)
+							zeroRecall, zeroNDCG := judgedMetrics(zeroIDs, query.Relevant, 10)
+							observation.RecallAt10, observation.NDCGAt10 = &recall, &ndcg
+							observation.ZeroRecall, observation.ZeroNDCG = &zeroRecall, &zeroNDCG
+							if query.Split == "evaluation" {
+								actualNDCG += ndcg
+								brokenNDCG += zeroNDCG
+							}
+						}
+						if query.ExactID != "" {
+							correct := len(observation.IDs) > 0 && observation.IDs[0] == query.ExactID
+							observation.ExactIDFirst = &correct
+							if !correct {
+								t.Errorf("exact-ID contract failed: scale=%d config=%s query=%s want=%s got=%v", distractors, configuration, query.ID, query.ExactID, observation.IDs)
+							}
+						}
+						if query.ExpectEmpty {
+							correct := len(observation.IDs) == 0
+							observation.EmptyCorrect = &correct
+						}
+						if query.CLIProbe {
+							repeat := runSearch(dir, args...)
+							var replay relevanceCLIOutput
+							if rejectedBlank {
+								if repeatedExit, ok := repeat.exit.(*exec.ExitError); !ok || repeatedExit.ExitCode() != 1 || repeat.stdout != "" || repeat.stderr != run.stderr {
+									t.Errorf("blank-query rejection changed: first=%+v second=%+v", run, repeat)
+								}
+							} else if repeat.exit != nil || json.Unmarshal([]byte(repeat.stdout), &replay) != nil || !reflect.DeepEqual(replay, out) {
+								t.Errorf("cached CLI ranking changed: scale=%d config=%s query=%s\nfirst=%s\nsecond=%s\nstderr=%s", distractors, configuration, query.ID, run.stdout, repeat.stdout, repeat.stderr)
+							}
+						}
+						scale.observations = append(scale.observations, observation)
+						key := fmt.Sprintf("%d/%s/%s/%s", distractors, configuration, query.Split, query.Class)
+						aggregate := scale.byClass[key]
+						if aggregate == nil {
+							aggregate = &relevanceAggregate{}
+							scale.byClass[key] = aggregate
+						}
+						aggregate.Queries++
+						if observation.RecallAt10 != nil {
+							aggregate.JudgedQueries++
+							aggregate.RecallAt10 += *observation.RecallAt10
+							aggregate.NDCGAt10 += *observation.NDCGAt10
+							aggregate.ZeroRecall += *observation.ZeroRecall
+							aggregate.ZeroNDCG += *observation.ZeroNDCG
+						}
+						if observation.ExactIDFirst != nil {
+							aggregate.ExactQueries++
+							if *observation.ExactIDFirst {
+								aggregate.ExactSuccesses++
+							}
+						}
+						if observation.EmptyCorrect != nil {
+							aggregate.EmptyQueries++
+							if *observation.EmptyCorrect {
+								aggregate.EmptySuccesses++
+							}
+						}
+						raw, _ := json.Marshal(observation)
+						t.Logf("QUERY %s", raw)
+					}
+					if actualNDCG <= brokenNDCG {
+						t.Errorf("zero-score ID-sorted negative control was not worse at scale=%d config=%s: actual=%g broken=%g", distractors, configuration, actualNDCG, brokenNDCG)
 					}
 				}
-				report.Observations = append(report.Observations, observation)
-				key := fmt.Sprintf("%d/%s/%s/%s", distractors, configuration, query.Split, query.Class)
-				aggregate := report.ByClass[key]
-				if aggregate == nil {
-					aggregate = &relevanceAggregate{}
-					report.ByClass[key] = aggregate
-				}
-				aggregate.Queries++
-				if observation.RecallAt10 != nil {
-					aggregate.JudgedQueries++
-					aggregate.RecallAt10 += *observation.RecallAt10
-					aggregate.NDCGAt10 += *observation.NDCGAt10
-					aggregate.ZeroRecall += *observation.ZeroRecall
-					aggregate.ZeroNDCG += *observation.ZeroNDCG
-				}
-				if observation.ExactIDFirst != nil {
-					aggregate.ExactQueries++
-					if *observation.ExactIDFirst {
-						aggregate.ExactSuccesses++
-					}
-				}
-				if observation.EmptyCorrect != nil {
-					aggregate.EmptyQueries++
-					if *observation.EmptyCorrect {
-						aggregate.EmptySuccesses++
-					}
-				}
-				raw, _ := json.Marshal(observation)
-				t.Logf("QUERY %s", raw)
-			}
-			if actualNDCG <= brokenNDCG {
-				t.Errorf("zero-score ID-sorted negative control was not worse at scale=%d config=%s: actual=%g broken=%g", distractors, configuration, actualNDCG, brokenNDCG)
-			}
+			})
+		}
+	})
+	// The parent waits for every parallel scale, then preserves the original
+	// scale/configuration/query order in the report regardless of scheduling.
+	for _, scale := range scales {
+		report.Observations = append(report.Observations, scale.observations...)
+		for key, aggregate := range scale.byClass {
+			report.ByClass[key] = aggregate
 		}
 	}
 	if len(report.Observations) != 600 {

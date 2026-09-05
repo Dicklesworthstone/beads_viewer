@@ -533,8 +533,10 @@ func TestOffline_CrossOriginIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read head_init.js: %v", err)
 	}
-	if !strings.Contains(string(headInit), "serviceWorker.register('./coi-serviceworker.js')") {
-		t.Error("head_init.js should register coi-serviceworker.js for cross-origin isolation")
+	// Static contract coverage; actual browser control/offline behavior is
+	// exercised separately rather than requiring a browser for this Go suite.
+	if !strings.Contains(string(headInit), "serviceWorker.register('./coi-serviceworker.js', { updateViaCache: 'none' })") {
+		t.Error("head_init.js should register coi-serviceworker.js with updateViaCache none for cross-origin isolation")
 	}
 }
 

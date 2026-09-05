@@ -5,6 +5,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -39,6 +41,7 @@ func TestExportIncremental_AddNewIssues(t *testing.T) {
 	if initialMeta.IssueCount != 2 {
 		t.Fatalf("initial export issue_count = %d, want 2", initialMeta.IssueCount)
 	}
+	assertExportedIssueIDs(t, exportDir, []string{"issue-1", "issue-2"})
 
 	// Add 3 new issues
 	updatedData := initialData + `
@@ -59,6 +62,7 @@ func TestExportIncremental_AddNewIssues(t *testing.T) {
 	if updatedMeta.GeneratedAt == initialMeta.GeneratedAt {
 		t.Error("generated_at should change after re-export")
 	}
+	assertExportedIssueIDs(t, exportDir, []string{"issue-1", "issue-2", "issue-3", "issue-4", "issue-5"})
 
 	// Verify triage includes new issues
 	triage := readTriageJSON(t, exportDir)
@@ -225,6 +229,9 @@ func TestExportIncremental_AddDependency(t *testing.T) {
 
 	runExportPages(t, bv, repoDir, exportDir)
 	initialMeta := readMetaJSON(t, exportDir)
+	if got := queryExportedDependencyRows(t, exportDir); len(got) != 0 {
+		t.Fatalf("initial database should contain no dependencies, got %v", got)
+	}
 
 	// Add dependency relationship
 	updatedData := `{"id": "parent", "title": "Parent Issue", "status": "open", "priority": 0, "issue_type": "epic"}
@@ -241,6 +248,10 @@ func TestExportIncremental_AddDependency(t *testing.T) {
 	if updatedMeta.GeneratedAt == initialMeta.GeneratedAt {
 		t.Error("generated_at should change after re-export with deps")
 	}
+	if got, want := queryExportedDependencyRows(t, exportDir), [][3]string{{"child", "parent", "blocks"}}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("re-exported dependency rows = %v, want %v", got, want)
+	}
+	assertExportedIssueIDs(t, exportDir, []string{"child", "parent"})
 
 	// Verify triage reflects blocked status
 	triage := readTriageJSON(t, exportDir)
@@ -708,6 +719,45 @@ func TestExportIncremental_MultipleReexports(t *testing.T) {
 // =============================================================================
 // Test Helpers
 // =============================================================================
+
+// assertExportedIssueIDs verifies the database contents after each export.
+func assertExportedIssueIDs(t *testing.T, exportDir string, want []string) {
+	t.Helper()
+	var got []string
+	for _, issue := range queryAllIssues(t, filepath.Join(exportDir, "beads.sqlite3")) {
+		got = append(got, issue.ID)
+	}
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("exported database issue IDs = %v, want %v", got, want)
+	}
+}
+
+func queryExportedDependencyRows(t *testing.T, exportDir string) [][3]string {
+	t.Helper()
+	db, err := openSQLiteDB(filepath.Join(exportDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query("SELECT issue_id, depends_on_id, type FROM dependencies ORDER BY issue_id, depends_on_id, type")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result [][3]string
+	for rows.Next() {
+		var row [3]string
+		if err := rows.Scan(&row[0], &row[1], &row[2]); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
 
 // runExportPages runs --export-pages with optional extra args.
 func runExportPages(t *testing.T, bv, repoDir, exportDir string, extraArgs ...string) {

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -84,14 +85,20 @@ func TestRobotActionRoutesLiveTrackers(t *testing.T) {
 		}
 		return out
 	}
-	verifyShow := func(actions model.IssueActions, dir, title string) {
+	verifyShow := func(actions model.IssueActions, dir, title, database string) {
 		t.Helper()
 		if actions.LocalID != "same-1" || actions.WorkingDirectory != dir || actions.Show == nil || actions.Claim == nil {
 			t.Fatalf("wrong live action route: %+v, want cwd%q localIDsame-1", actions, dir)
 		}
-		for _, command := range []*model.IssueCommand{actions.Show, actions.Claim} {
-			if command.Argv[len(command.Argv)-1] != "same-1" || strings.Contains(command.Shell, "/data/projects/beads_viewer") {
-				t.Fatalf("command escaped isolated tracker: %+v", command)
+		for index, command := range []*model.IssueCommand{actions.Show, actions.Claim} {
+			want := []string{"env", "BEADS_DIR=" + filepath.Join(dir, ".beads"), "BEADS_DB=" + database, "BD_DB=" + database, br, "--db", database, "--no-auto-import"}
+			if index == 0 {
+				want = append(want, "--no-auto-flush", "show", "--json", "--", "same-1")
+			} else {
+				want = append(want, "update", "--json", "--claim", "--", "same-1")
+			}
+			if command.WorkingDirectory != dir || !slices.Equal(command.Argv, want) {
+				t.Fatalf("command escaped exact fixture route: got %+v, want cwd%q argv%q", command, dir, want)
 			}
 		}
 		if !strings.Contains(actions.Claim.Shell, "'--claim'") {
@@ -138,7 +145,7 @@ func TestRobotActionRoutesLiveTrackers(t *testing.T) {
 		} else if rec.ID != "api-same-1" {
 			t.Fatalf("wrong namespace: %s", rec.ID)
 		}
-		verifyShow(rec.Actions, repos[i], fmt.Sprintf("Repository %d", i))
+		verifyShow(rec.Actions, repos[i], fmt.Sprintf("Repository %d", i), filepath.Join(repos[i], ".beads", "beads.db"))
 	}
 	for _, tc := range []struct {
 		name              string
@@ -158,7 +165,7 @@ func TestRobotActionRoutesLiveTrackers(t *testing.T) {
 			if err := json.Unmarshal(out, &next); err != nil || !next.Actionable {
 				t.Fatalf("live route missing: %s", out)
 			}
-			verifyShow(next.Actions, repos[0], "Repository 0")
+			verifyShow(next.Actions, repos[0], "Repository 0", filepath.Join(repos[0], ".beads", "beads.db"))
 		})
 	}
 	t.Run("script_executes_only_bound_inspection", func(t *testing.T) {
@@ -226,7 +233,7 @@ func TestRobotActionRoutesLiveTrackers(t *testing.T) {
 		if err := json.Unmarshal(run(root, nil, "--db", customDB, "--robot-next"), &next); err != nil {
 			t.Fatal(err)
 		}
-		verifyShow(next.Actions, dir, "Repository 0")
+		verifyShow(next.Actions, dir, "Repository 0", customDB)
 		if next.Actions.Show.Argv[6] != customDB || next.Actions.Claim.Argv[6] != customDB {
 			t.Fatalf("metadata database replaced by default: %+v", next.Actions)
 		}
@@ -284,7 +291,7 @@ func TestRobotActionRoutesLiveTrackers(t *testing.T) {
 		if err := json.Unmarshal(data, &report); err != nil || len(report.Issues) != 1 {
 			t.Fatalf("live JSON report: err%v out%s", err, data)
 		}
-		verifyShow(report.Issues[0].Actions, repos[0], "Repository 0")
+		verifyShow(report.Issues[0].Actions, repos[0], "Repository 0", filepath.Join(repos[0], ".beads", "beads.db"))
 		bundle := filepath.Join(root, "live-agent-brief")
 		run(repos[0], nil, "--agent-brief", bundle)
 		data, err = os.ReadFile(filepath.Join(bundle, "triage.json"))
@@ -299,7 +306,7 @@ func TestRobotActionRoutesLiveTrackers(t *testing.T) {
 		if err := json.Unmarshal(data, &brief); err != nil || len(brief.Recommendations) != 1 {
 			t.Fatalf("live agent brief: err%v out%s", err, data)
 		}
-		verifyShow(brief.Recommendations[0].Actions, repos[0], "Repository 0")
+		verifyShow(brief.Recommendations[0].Actions, repos[0], "Repository 0", filepath.Join(repos[0], ".beads", "beads.db"))
 	})
 	assertNoMutation := func(t *testing.T, out []byte) {
 		t.Helper()
@@ -331,7 +338,7 @@ func TestRobotActionRoutesLiveTrackers(t *testing.T) {
 		if err := json.Unmarshal(run(dir, nil, "--robot-next"), &next); err != nil {
 			t.Fatal(err)
 		}
-		verifyShow(next.Actions, repos[0], "Repository 0")
+		verifyShow(next.Actions, repos[0], "Repository 0", filepath.Join(repos[0], ".beads", "beads.db"))
 	})
 	t.Run("undeclared_sidecar", func(t *testing.T) {
 		data, err := os.ReadFile(filepath.Join(repos[0], ".beads", "issues.jsonl"))
@@ -368,7 +375,7 @@ func TestRobotActionRoutesLiveTrackers(t *testing.T) {
 		if err := json.Unmarshal(run(worktree, []string{"BEADS_DIR=" + filepath.Join(repos[1], ".beads")}, "--robot-next"), &next); err != nil {
 			t.Fatal(err)
 		}
-		verifyShow(next.Actions, repos[1], "Repository 1")
+		verifyShow(next.Actions, repos[1], "Repository 1", filepath.Join(repos[1], ".beads", "beads.db"))
 		assertNoMutation(t, run(worktree, nil, "--robot-next", "--db", filepath.Join(worktree, ".beads", "issues.jsonl")))
 	})
 	t.Run("historical_now_closed", func(t *testing.T) {

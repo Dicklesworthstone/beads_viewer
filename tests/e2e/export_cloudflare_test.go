@@ -190,8 +190,10 @@ func TestCloudflare_ServiceWorkerForCOI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read head_init.js: %v", err)
 	}
-	if !strings.Contains(string(headInit), "serviceWorker.register('./coi-serviceworker.js')") {
-		t.Error("head_init.js should register coi-serviceworker.js")
+	// This is static inspection of the shipped registration contract; the
+	// separate browser suite exercises activation and offline behavior.
+	if !strings.Contains(string(headInit), "serviceWorker.register('./coi-serviceworker.js', { updateViaCache: 'none' })") {
+		t.Error("head_init.js should register coi-serviceworker.js with updateViaCache none")
 	}
 }
 

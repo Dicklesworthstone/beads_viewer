@@ -5,11 +5,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
-// writeBeads creates a minimal current-br fixture, including the metadata that
-// proves where live claim commands would be routed.
+// writeBeads creates current-br JSONL and metadata. Without a real database it
+// remains an unbound snapshot; live tracker proofs initialize br separately.
 func writeBeads(t *testing.T, dir, content string) {
 	t.Helper()
 	beadsDir := filepath.Join(dir, ".beads")
@@ -269,7 +270,8 @@ func TestRobotTriageBriefContract(t *testing.T) {
 func TestRobotTriageByTrackContract(t *testing.T) {
 	bv := buildBvBinary(t)
 	env := t.TempDir()
-	// Two independent tracks: A->A2 and B->B2.
+	// Two independent components produce two execution layers: ready A/B in
+	// track-A, blocked A2/B2 in track-B. There is no verified tracker database.
 	writeBeads(t, env, `{"id":"A","title":"Track A root","status":"open","priority":1,"issue_type":"task","labels":["api"]}
 {"id":"A2","title":"Track A blocked","status":"open","priority":2,"issue_type":"task","labels":["api"],"dependencies":[{"issue_id":"A2","depends_on_id":"A","type":"blocks"}]}
 {"id":"B","title":"Track B root","status":"open","priority":1,"issue_type":"task","labels":["web"]}
@@ -283,7 +285,10 @@ func TestRobotTriageByTrackContract(t *testing.T) {
 				TopPick *struct {
 					ID string `json:"id"`
 				} `json:"top_pick"`
-				ClaimCommand string `json:"claim_command"`
+				ClaimCommand    string `json:"claim_command"`
+				Recommendations []struct {
+					ID string `json:"id"`
+				} `json:"recommendations"`
 			} `json:"recommendations_by_track"`
 		} `json:"triage"`
 	}
@@ -292,8 +297,8 @@ func TestRobotTriageByTrackContract(t *testing.T) {
 	if payload.DataHash == "" {
 		t.Fatalf("triage-by-track missing data_hash")
 	}
-	if len(payload.Triage.RecommendationsByTrack) < 2 {
-		t.Fatalf("expected >=2 track groups, got %d", len(payload.Triage.RecommendationsByTrack))
+	if len(payload.Triage.RecommendationsByTrack) != 2 {
+		t.Fatalf("expected exactly 2 execution layers, got %d", len(payload.Triage.RecommendationsByTrack))
 	}
 	byID := make(map[string]struct {
 		topID string
@@ -302,6 +307,15 @@ func TestRobotTriageByTrackContract(t *testing.T) {
 	for _, g := range payload.Triage.RecommendationsByTrack {
 		if g.TrackID == "" {
 			t.Fatalf("track group missing track_id")
+		}
+		ids := make([]string, len(g.Recommendations))
+		for i, rec := range g.Recommendations {
+			ids[i] = rec.ID
+		}
+		slices.Sort(ids)
+		want := map[string][]string{"track-A": {"A", "B"}, "track-B": {"A2", "B2"}}[g.TrackID]
+		if !slices.Equal(ids, want) || want == nil {
+			t.Fatalf("execution layer %q contains %v, want %v", g.TrackID, ids, want)
 		}
 		topID := ""
 		if g.TopPick != nil {
@@ -317,11 +331,11 @@ func TestRobotTriageByTrackContract(t *testing.T) {
 	if !ok {
 		t.Fatalf("missing track group %q", "track-A")
 	}
-	if rootTrack.topID == "" {
-		t.Fatalf("track group %q missing top_pick.id", "track-A")
+	if rootTrack.topID != "A" && rootTrack.topID != "B" {
+		t.Fatalf("ready layer top pick %q must be A or B", rootTrack.topID)
 	}
-	if rootTrack.claim == "" {
-		t.Fatalf("track group %q missing claim_command", "track-A")
+	if rootTrack.claim != "" {
+		t.Fatalf("unbound track %q exposed an unverified claim: %q", "track-A", rootTrack.claim)
 	}
 
 	blockedTrack, ok := byID["track-B"]
@@ -386,11 +400,12 @@ func TestRobotTriageByLabelContract(t *testing.T) {
 		if !ok {
 			t.Fatalf("missing label group %q", want)
 		}
-		if g.topID == "" {
-			t.Fatalf("label group %q missing top_pick.id", want)
+		wantID := map[string]string{"api": "API-1", "web": "WEB-1"}[want]
+		if g.topID != wantID {
+			t.Fatalf("label group %q top pick = %q, want ready issue %q", want, g.topID, wantID)
 		}
-		if g.claim == "" {
-			t.Fatalf("label group %q missing claim_command", want)
+		if g.claim != "" {
+			t.Fatalf("unbound label group %q exposed an unverified claim: %q", want, g.claim)
 		}
 	}
 }

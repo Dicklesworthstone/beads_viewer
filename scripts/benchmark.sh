@@ -275,12 +275,18 @@ run_latency() {
   git diff --binary -- '*.go' go.mod go.sum > "$out/source.patch"
   {
     sha256sum "$out/source.patch" "$baseline_bv" "$baseline_ui"
+    printf '# baseline_bv %s\n' "$(sha256sum "$baseline_bv" | cut -d ' ' -f 1)"
+    printf '# baseline_ui %s\n' "$(sha256sum "$baseline_ui" | cut -d ' ' -f 1)"
     while IFS= read -r file; do sha256sum "$file"; done < <(git ls-files --others --exclude-standard -- '*.go')
   } > "$out/source.sha256"
   go build -o "$out/current-bv" ./cmd/bv
   go test -c -o "$out/current-ui.test" ./pkg/ui
   go test -c -o "$out/current-e2e.test" ./tests/e2e
   sha256sum "$out/current-bv" "$out/current-ui.test" "$out/current-e2e.test" >> "$out/source.sha256"
+  {
+    printf '# current_bv %s\n' "$(sha256sum "$out/current-bv" | cut -d ' ' -f 1)"
+    printf '# current_ui %s\n' "$(sha256sum "$out/current-ui.test" | cut -d ' ' -f 1)"
+  } >> "$out/source.sha256"
   local result=0 round position side binary dir enforce
   # Four pairs give repeated, alternating order. Each UI cohort independently
   # settles the production model; all observed samples are retained.
@@ -306,6 +312,14 @@ run_latency() {
     -test.run '^TestPerformanceCLICohorts$' -test.timeout 4h -test.v) \
     > "$out/cli/run.log" 2>&1 || result=1
   cat "$out/cli/run.log"
+  mkdir "$out/cli-exact"
+  # Fixed-clock full-result parity is deliberately separate: SOURCE_DATE_EPOCH
+  # runs metrics to completion and cannot receive production-timeout SLO credit.
+  (cd "$root/tests/e2e" && BV_PERF_DIR="$out/cli-exact" BV_PERF_BASELINE_BINARY="$baseline_bv" \
+    BV_PERF_CURRENT_BINARY="$out/current-bv" "$out/current-e2e.test" \
+    -test.run '^TestPerformanceCLIExactCohorts$' -test.timeout 10m -test.v) \
+    > "$out/cli-exact/run.log" 2>&1 || result=1
+  cat "$out/cli-exact/run.log"
   bash tests/artifacts/perf/verify.sh "$out" || result=1
   echo "Retained all latency evidence: $out"
   return "$result"

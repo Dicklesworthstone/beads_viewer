@@ -182,7 +182,9 @@ func TestRace_DataConsistency(t *testing.T) {
 	}
 
 	// A's deferral is active at the pinned epoch but expired in real time. D is
-	// therefore the only claimable top pick at the pinned epoch. E closed one
+	// therefore the only ready diagnostic top pick at the pinned epoch. This
+	// JSONL fixture has no verified live tracker, so it must not emit a claim.
+	// E closed one
 	// day before that epoch, so both triage and insights must count it in their
 	// seven-day velocity windows. These values make failures to plumb the pinned
 	// clock into analysis observable instead of merely checking stable bytes.
@@ -210,10 +212,21 @@ func TestRace_DataConsistency(t *testing.T) {
 		ClosedLast7Days int `json:"closed_last_7_days"`
 	}
 	type robotProjection struct {
-		GeneratedAt string              `json:"generated_at"`
-		ID          string              `json:"id"`
-		Velocity    *velocityProjection `json:"Velocity"`
-		Triage      *struct {
+		GeneratedAt  string `json:"generated_at"`
+		ID           string `json:"id"`
+		Actionable   bool   `json:"actionable"`
+		ClaimCommand string `json:"claim_command"`
+		Actions      *struct {
+			LocalID           string          `json:"local_id"`
+			UnavailableReason string          `json:"unavailable_reason"`
+			Show              json.RawMessage `json:"show"`
+			Claim             json.RawMessage `json:"claim"`
+		} `json:"actions"`
+		DiagnosticTopPick *struct {
+			ID string `json:"id"`
+		} `json:"diagnostic_top_pick"`
+		Velocity *velocityProjection `json:"Velocity"`
+		Triage   *struct {
 			Meta struct {
 				HistoryStatus string `json:"history_status"`
 			} `json:"meta"`
@@ -239,8 +252,11 @@ func TestRace_DataConsistency(t *testing.T) {
 
 		switch command {
 		case "next":
-			if payload.ID != "D" {
-				return fmt.Errorf("next selected %q, want D while A is deferred at %s", payload.ID, pinnedGeneratedAt)
+			if payload.DiagnosticTopPick == nil || payload.DiagnosticTopPick.ID != "D" {
+				return fmt.Errorf("next diagnostic pick = %+v, want D while A is deferred at %s", payload.DiagnosticTopPick, pinnedGeneratedAt)
+			}
+			if payload.Actionable || payload.ID != "" || payload.ClaimCommand != "" || payload.Actions == nil || payload.Actions.LocalID != "D" || payload.Actions.UnavailableReason == "" || len(payload.Actions.Show) != 0 || len(payload.Actions.Claim) != 0 {
+				return fmt.Errorf("unbound next response emitted an actionable route: %s", output)
 			}
 		case "triage":
 			if payload.Triage == nil {

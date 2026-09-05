@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/buildinfo"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -188,7 +191,7 @@ func TestPerf_LargeDatasetLatency(t *testing.T) {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
 			dir := t.TempDir()
 			writePerformanceFixture(t, dir, "realistic", size)
-			output, elapsed := runPerformanceCLI(t, bv, dir, filepath.Join(dir, "cold-cache"), "smoke")
+			output, elapsed := runPerformanceCLI(t, bv, dir, filepath.Join(dir, "cold-cache"), "smoke", "")
 			var result struct {
 				Triage struct {
 					Meta struct {
@@ -232,7 +235,7 @@ func writePerformanceFixture(t testing.TB, dir, kind string, size int) string {
 	return fmt.Sprintf("%x", sha256.Sum256(data.Bytes()))
 }
 
-func runPerformanceCLI(t testing.TB, binary, dir, cache, sample string) ([]byte, time.Duration) {
+func runPerformanceCLI(t testing.TB, binary, dir, cache, sample, epoch string) ([]byte, time.Duration) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -242,11 +245,17 @@ func runPerformanceCLI(t testing.TB, binary, dir, cache, sample string) ([]byte,
 	// essential here: production timeouts/degradation must remain observable.
 	for _, value := range os.Environ() {
 		key, _, _ := strings.Cut(value, "=")
-		if !strings.HasPrefix(key, "BV_") && !strings.HasPrefix(key, "BEADS_") && key != "SOURCE_DATE_EPOCH" {
+		if !strings.HasPrefix(key, "BV_") && !strings.HasPrefix(key, "BEADS_") && key != "SOURCE_DATE_EPOCH" && key != "GOMAXPROCS" {
 			cmd.Env = append(cmd.Env, value)
 		}
 	}
-	cmd.Env = append(cmd.Env, "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "BV_NO_SAVED_CONFIG=1", "BEADS_DIR="+filepath.Join(dir, ".beads"), "BV_CACHE_DIR="+cache)
+	cmd.Env = append(cmd.Env, "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "BV_NO_SAVED_CONFIG=1", "BEADS_DIR="+filepath.Join(dir, ".beads"), "BV_CACHE_DIR="+cache,
+		"GOMAXPROCS="+strconv.Itoa(runtime.GOMAXPROCS(0)))
+	if epoch != "" {
+		// Only the separate exact-result cohort supplies this. Its durations
+		// receive no latency credit because metrics run to completion.
+		cmd.Env = append(cmd.Env, "SOURCE_DATE_EPOCH="+epoch)
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	started := time.Now()
@@ -323,7 +332,7 @@ func performanceCLIBehavior(output []byte) ([]byte, error) {
 func TestPerformanceCLIParityControls(t *testing.T) {
 	dir := t.TempDir()
 	writePerformanceFixture(t, dir, "realistic", 20)
-	output, _ := runPerformanceCLI(t, buildBvBinary(t), dir, filepath.Join(dir, "cache"), "parity-control")
+	output, _ := runPerformanceCLI(t, buildBvBinary(t), dir, filepath.Join(dir, "cache"), "parity-control", "")
 	baseline, err := performanceCLIBehavior(output)
 	if err != nil {
 		t.Fatal(err)
@@ -364,6 +373,251 @@ func TestPerformanceCLIParityControls(t *testing.T) {
 	}
 }
 
+const performanceCLIReferenceEpoch = "1788220800" // 2026-09-01T00:00:00Z
+
+// Preserve the complete result, including exact JSON numbers and array order.
+// Only these named duration fields are excluded; new fields remain compared.
+func performanceCLIExactBehavior(output []byte) ([]byte, error) {
+	if _, err := performanceCLIBehavior(output); err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	decoder.UseNumber()
+	var envelope map[string]any
+	if err := decoder.Decode(&envelope); err != nil {
+		return nil, err
+	}
+	triage, ok := envelope["triage"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("missing full triage result")
+	}
+	meta, ok := triage["meta"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("missing full triage metadata")
+	}
+	const reference = "2026-09-01T00:00:00Z"
+	if envelope["generated_at"] != reference || meta["generated_at"] != reference {
+		return nil, fmt.Errorf("exact-result cohort did not preserve fixed clock: envelope=%v triage=%v", envelope["generated_at"], meta["generated_at"])
+	}
+	delete(meta, "compute_time_ms")
+	status := triage["status"].(map[string]any) // validated by performanceCLIBehavior
+	for _, name := range []string{"PageRank", "Betweenness", "Eigenvector", "HITS", "Critical", "Cycles", "KCore", "Articulation", "Slack"} {
+		delete(status[name].(map[string]any), "ms")
+	}
+	return json.Marshal(envelope)
+}
+
+func TestPerformanceCLIExactParityControls(t *testing.T) {
+	dir := t.TempDir()
+	writePerformanceFixture(t, dir, "realistic", 20)
+	binary := buildBvBinary(t)
+	output, _ := runPerformanceCLI(t, binary, dir, filepath.Join(dir, "cache"), "exact-cold", performanceCLIReferenceEpoch)
+	baseline, err := performanceCLIExactBehavior(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warm, _ := runPerformanceCLI(t, binary, dir, filepath.Join(dir, "cache"), "exact-warm", performanceCLIReferenceEpoch)
+	behavior, err := performanceCLIExactBehavior(warm)
+	if err != nil || !bytes.Equal(behavior, baseline) {
+		t.Fatalf("actual fixed-clock cold/warm complete results differ: %v\ncold: %s\nwarm: %s", err, baseline, behavior)
+	}
+	for _, mutation := range []string{"elapsed-only", "score-ulp", "component-ulp", "reordered-ids", "skipped-metric", "missing-metric", "source-authority", "generated-at", "unknown-ms-field"} {
+		t.Run(mutation, func(t *testing.T) {
+			decoder := json.NewDecoder(bytes.NewReader(output))
+			decoder.UseNumber()
+			var envelope map[string]any
+			if err := decoder.Decode(&envelope); err != nil {
+				t.Fatal(err)
+			}
+			triage := envelope["triage"].(map[string]any)
+			status := triage["status"].(map[string]any)
+			rows := triage["recommendations"].([]any)
+			if len(rows) < 2 {
+				t.Fatal("exact parity fixture must include multiple scored recommendations")
+			}
+			switch mutation {
+			case "elapsed-only":
+				triage["meta"].(map[string]any)["compute_time_ms"] = json.Number("987654321")
+				status["PageRank"].(map[string]any)["ms"] = json.Number("123456789.5")
+			case "score-ulp", "component-ulp":
+				row, field := rows[0].(map[string]any), "score"
+				if mutation == "component-ulp" {
+					row, field = row["breakdown"].(map[string]any), "pagerank"
+				}
+				number, err := row[field].(json.Number).Float64()
+				if err != nil {
+					t.Fatal(err)
+				}
+				row[field] = json.Number(strconv.FormatFloat(math.Nextafter(number, math.Inf(1)), 'g', -1, 64))
+			case "reordered-ids":
+				rows[0], rows[1] = rows[1], rows[0]
+			case "skipped-metric":
+				status["PageRank"] = map[string]any{"state": "skipped", "reason": "planted exact parity negative"}
+			case "missing-metric":
+				delete(status, "Cycles")
+			case "source-authority":
+				envelope["source_authority"].(map[string]any)["claim_safe"] = false
+			case "generated-at":
+				envelope["generated_at"] = "2001-01-01T00:00:00Z"
+			case "unknown-ms-field":
+				triage["future_result_ms"] = json.Number("17")
+			}
+			changed, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			behavior, err := performanceCLIExactBehavior(changed)
+			if mutation == "elapsed-only" {
+				if err != nil || !bytes.Equal(behavior, baseline) {
+					t.Fatalf("declared duration-only change altered exact parity: %v", err)
+				}
+			} else if err == nil && bytes.Equal(behavior, baseline) {
+				t.Fatalf("%s escaped complete-result comparison", mutation)
+			}
+		})
+	}
+}
+
+type performanceBinaryIdentity struct {
+	SHA256    string `json:"binary_sha256"`
+	GoVersion string `json:"go_version"`
+	GOOS      string `json:"goos"`
+	GOARCH    string `json:"goarch"`
+}
+
+func readPerformanceBinary(t testing.TB, binary string) performanceBinaryIdentity {
+	t.Helper()
+	file, err := os.Open(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.New()
+	_, hashErr := io.Copy(hash, file)
+	closeErr := file.Close()
+	if hashErr != nil || closeErr != nil {
+		t.Fatalf("hash measurement executable: %v; close: %v", hashErr, closeErr)
+	}
+	info, err := buildinfo.ReadFile(binary)
+	if err != nil {
+		t.Fatalf("read measured CLI toolchain: %v", err)
+	}
+	identity := performanceBinaryIdentity{SHA256: fmt.Sprintf("%x", hash.Sum(nil)), GoVersion: info.GoVersion}
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "GOOS":
+			identity.GOOS = setting.Value
+		case "GOARCH":
+			identity.GOARCH = setting.Value
+		}
+	}
+	if identity.GOOS == "" || identity.GOARCH == "" {
+		t.Fatal("measured CLI build info lacks GOOS/GOARCH")
+	}
+	return identity
+}
+
+// Exact semantic proof is separate from timed production-timeout cohorts.
+// Two repeats per side give 72 paired comparisons across 18 workloads and two
+// cache modes. The 144 invocations and 36 warmups earn no latency/SLO credit.
+func TestPerformanceCLIExactCohorts(t *testing.T) {
+	outDir := os.Getenv("BV_PERF_DIR")
+	if outDir == "" {
+		t.Skip("opt-in exact-result measurement: scripts/benchmark.sh latency")
+	}
+	binaries := [2]string{os.Getenv("BV_PERF_BASELINE_BINARY"), os.Getenv("BV_PERF_CURRENT_BINARY")}
+	if binaries[0] == "" || binaries[1] == "" {
+		t.Fatal("both BV_PERF_BASELINE_BINARY and BV_PERF_CURRENT_BINARY are required")
+	}
+	identities := [2]performanceBinaryIdentity{readPerformanceBinary(t, binaries[0]), readPerformanceBinary(t, binaries[1])}
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range testutil.PerformanceWorkloadNames() {
+		for _, size := range []int{1000, 5000, 10000} {
+			t.Run(fmt.Sprintf("%s/%d", kind, size), func(t *testing.T) {
+				for _, warm := range []bool{false, true} {
+					mode := "cold-application-cache"
+					if warm {
+						mode = "warm-application-cache"
+					}
+					t.Run(mode, func(t *testing.T) {
+						dir := filepath.Join(outDir, fmt.Sprintf("exact-%s-%d-%s", kind, size, mode))
+						if err := os.Mkdir(dir, 0o700); err != nil {
+							t.Fatal(err)
+						}
+						fixtureHash := writePerformanceFixture(t, dir, kind, size)
+						var outputs [2][]json.RawMessage
+						var expected []byte
+						var loadedIssues int
+						var mismatches []string
+						for repeat := 0; repeat < 2; repeat++ {
+							for position := 0; position < 2; position++ {
+								side := (repeat + position) % 2
+								cache := filepath.Join(dir, fmt.Sprintf("cache-side-%d", side))
+								if !warm {
+									cache += fmt.Sprintf("-cold-%d", repeat)
+								}
+								if !warm || repeat == 0 {
+									if _, err := os.Stat(cache); !os.IsNotExist(err) {
+										t.Fatalf("fresh cache already exists or cannot be checked: %v", err)
+									}
+								}
+								if warm && repeat == 0 {
+									runPerformanceCLI(t, binaries[side], dir, cache, fmt.Sprintf("warmup-side-%d", side), performanceCLIReferenceEpoch)
+									entries, err := filepath.Glob(filepath.Join(cache, "*", "*.json"))
+									if err != nil || len(entries) == 0 {
+										t.Fatalf("exact warmup did not populate the analysis cache: %v", err)
+									}
+								}
+								name := fmt.Sprintf("repeat-%d-side-%d", repeat, side)
+								output, _ := runPerformanceCLI(t, binaries[side], dir, cache, name, performanceCLIReferenceEpoch)
+								behavior, err := performanceCLIExactBehavior(output)
+								if err != nil {
+									t.Fatalf("%s: %v", name, err)
+								}
+								var count struct {
+									Triage struct {
+										Meta struct {
+											IssueCount int `json:"issue_count"`
+										} `json:"meta"`
+									} `json:"triage"`
+								}
+								if err := json.Unmarshal(behavior, &count); err != nil || count.Triage.Meta.IssueCount != size {
+									t.Fatalf("%s: loaded_issues=%d want=%d: %v", name, count.Triage.Meta.IssueCount, size, err)
+								}
+								loadedIssues = count.Triage.Meta.IssueCount
+								outputs[side] = append(outputs[side], behavior)
+								if expected == nil {
+									expected = behavior
+								} else if !bytes.Equal(expected, behavior) {
+									mismatches = append(mismatches, name)
+								}
+							}
+						}
+						record := map[string]any{"workload": kind, "issues": size, "loaded_issues": loadedIssues,
+							"mode": mode, "seed": 20260904, "fixture_sha256": fixtureHash,
+							"host": host, "gomaxprocs": runtime.GOMAXPROCS(0), "binaries": identities,
+							"reference_epoch": performanceCLIReferenceEpoch, "outputs": outputs, "parity_mismatches": mismatches,
+							"interpretation": "complete fixed-clock JSON parity excluding named elapsed fields only; no latency credit"}
+						data, err := json.MarshalIndent(record, "", "  ")
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(filepath.Join(dir, "result.json"), data, 0o600); err != nil {
+							t.Fatal(err)
+						}
+						if len(mismatches) != 0 {
+							t.Errorf("complete result mismatch: %v; actual outputs retained in %s", mismatches, dir)
+						}
+						t.Logf("%s: 2 paired repeats, 4 actual full results retained", dir)
+					})
+				}
+			})
+		}
+	}
+}
+
 // TestPerformanceCLICohorts runs same-host alternating baseline/current pairs.
 // Both cohorts start a new OS process; only the application's disk-cache state
 // differs. No OS page-cache drop, CPU tuning, or best-of-N selection is involved.
@@ -376,6 +630,10 @@ func TestPerformanceCLICohorts(t *testing.T) {
 	current := os.Getenv("BV_PERF_CURRENT_BINARY")
 	if baseline == "" || current == "" {
 		t.Fatal("both BV_PERF_BASELINE_BINARY and BV_PERF_CURRENT_BINARY are required")
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
 	}
 	samples := 200
 	if value := os.Getenv("BV_PERF_CLI_SAMPLES"); value != "" {
@@ -396,7 +654,8 @@ func TestPerformanceCLICohorts(t *testing.T) {
 					t.Run(mode, func(t *testing.T) {
 						var durations [2][]time.Duration
 						var dirs [2]string
-						var binaryHashes [2]string
+						var identities [2]performanceBinaryIdentity
+						var loadedIssues [2]int
 						// Both binaries must read the same physical source path:
 						// source-authority identity intentionally includes provenance.
 						fixtureDir := filepath.Join(outDir, fmt.Sprintf("cli-%s-%d-%s-source", kind, size, mode))
@@ -411,13 +670,9 @@ func TestPerformanceCLICohorts(t *testing.T) {
 								t.Fatal(err)
 							}
 							dirs[side] = dir
-							binaryBytes, err := os.ReadFile(binary)
-							if err != nil {
-								t.Fatal(err)
-							}
-							binaryHashes[side] = fmt.Sprintf("%x", sha256.Sum256(binaryBytes))
+							identities[side] = readPerformanceBinary(t, binary)
 							if warm {
-								runPerformanceCLI(t, binary, fixtureDir, filepath.Join(dir, "cache"), filepath.Join(dir, "warmup"))
+								runPerformanceCLI(t, binary, fixtureDir, filepath.Join(dir, "cache"), filepath.Join(dir, "warmup"), "")
 								entries, err := filepath.Glob(filepath.Join(dir, "cache", "*", "*.json"))
 								if err != nil || len(entries) == 0 {
 									t.Fatalf("warmup did not create an actual analysis cache entry: %v", err)
@@ -436,8 +691,19 @@ func TestPerformanceCLICohorts(t *testing.T) {
 										t.Fatalf("cold cache already exists or cannot be checked: %v", err)
 									}
 								}
-								output, elapsed := runPerformanceCLI(t, binaries[side], fixtureDir, cache, filepath.Join(dirs[side], fmt.Sprintf("sample-%04d", sample)))
+								output, elapsed := runPerformanceCLI(t, binaries[side], fixtureDir, cache, filepath.Join(dirs[side], fmt.Sprintf("sample-%04d", sample)), "")
 								durations[side] = append(durations[side], elapsed)
+								var measured struct {
+									Triage struct {
+										Meta struct {
+											IssueCount int `json:"issue_count"`
+										} `json:"meta"`
+									} `json:"triage"`
+								}
+								if err := json.Unmarshal(output, &measured); err != nil || measured.Triage.Meta.IssueCount != size {
+									t.Fatalf("side=%d sample=%d loaded_issues=%d want=%d: %v", side, sample, measured.Triage.Meta.IssueCount, size, err)
+								}
+								loadedIssues[side] = measured.Triage.Meta.IssueCount
 								behavior, err := performanceCLIBehavior(output)
 								if err != nil {
 									t.Fatal(err)
@@ -455,9 +721,10 @@ func TestPerformanceCLICohorts(t *testing.T) {
 								t.Fatal(err)
 							}
 							record := map[string]any{"workload": kind, "issues": size, "seed": 20260904, "fixture_sha256": fixtureHash,
-								"mode": mode, "side": side, "binary_sha256": binaryHashes[side], "distribution": summary, "sample_ns": durations[side],
+								"mode": mode, "side": side, "binary_sha256": identities[side].SHA256, "distribution": summary, "sample_ns": durations[side],
+								"loaded_issues": loadedIssues[side], "host": host, "gomaxprocs": runtime.GOMAXPROCS(0),
 								"decision_behavior": json.RawMessage(expected), "parity_mismatches": mismatches,
-								"go_version": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
+								"go_version": identities[side].GoVersion, "goos": identities[side].GOOS, "goarch": identities[side].GOARCH,
 								"interpretation": "empirical new-process wall time; application cache isolated; OS page cache uncontrolled; ID/order/metric-state parity only"}
 							data, err := json.MarshalIndent(record, "", "  ")
 							if err != nil {
