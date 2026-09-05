@@ -77,69 +77,99 @@ func truncate(s string, maxRunes int) string {
 
 // DependencyNode represents a visual node in the dependency tree
 type DependencyNode struct {
-	ID       string
-	Title    string
-	Status   string
-	Type     string // "root", "blocks", "related", etc.
-	Children []*DependencyNode
+	ID        string
+	Title     string
+	Status    string
+	Type      string // "root", "blocks", "related", etc.
+	Children  []*DependencyNode
+	Reference bool // The target is also shown at its canonical occurrence.
+	Cycle     bool // This edge closes a directed DFS cycle in the displayed graph.
 }
 
 // BuildDependencyTree constructs a tree from dependencies for visualization.
-// maxDepth limits recursion to prevent infinite loops and performance issues.
-// Set maxDepth to 0 for unlimited depth (use with caution).
+// Each reachable issue is expanded once, at its shortest distance from the root.
+// All dependency edges within maxDepth remain visible; repeated targets become
+// reference rows. A zero maxDepth includes the entire reachable graph.
 func BuildDependencyTree(rootID string, issueMap map[string]*model.Issue, maxDepth int) *DependencyNode {
-	visited := make(map[string]bool)
-	return buildTreeRecursive(rootID, issueMap, "root", visited, 0, maxDepth)
-}
-
-func buildTreeRecursive(id string, issueMap map[string]*model.Issue, depType string, visited map[string]bool, depth, maxDepth int) *DependencyNode {
-	// Check depth limit (0 = unlimited)
-	if maxDepth > 0 && depth > maxDepth {
-		return nil
-	}
-
-	// Cycle detection
-	if visited[id] {
-		return &DependencyNode{
-			ID:     id,
-			Title:  "(cycle)",
-			Status: "?",
-			Type:   depType,
-		}
-	}
-
-	issue, exists := issueMap[id]
-	if !exists {
-		return &DependencyNode{
-			ID:     id,
-			Title:  "(not found)",
-			Status: "?",
-			Type:   depType,
-		}
-	}
-
-	visited[id] = true
-	defer func() { visited[id] = false }() // Allow revisiting in different branches
-
-	node := &DependencyNode{
-		ID:     issue.ID,
-		Title:  issue.Title,
-		Status: string(issue.Status),
-		Type:   depType,
-	}
-
-	// Recursively add children (dependencies)
-	for _, dep := range issue.Dependencies {
-		if dep == nil {
+	// Discover minimum depths first. A deep occurrence visited before a short
+	// path must not consume the expansion and hide descendants at the limit.
+	depths := map[string]int{rootID: 0}
+	order := []string{rootID}
+	for i := 0; i < len(order); i++ {
+		id := order[i]
+		issue := issueMap[id]
+		if issue == nil || (maxDepth > 0 && depths[id] >= maxDepth) {
 			continue
 		}
-		childNode := buildTreeRecursive(dep.DependsOnID, issueMap, string(dep.Type), visited, depth+1, maxDepth)
-		if childNode != nil {
-			node.Children = append(node.Children, childNode)
+		for _, dep := range issue.Dependencies {
+			if dep == nil {
+				continue
+			}
+			if _, exists := depths[dep.DependsOnID]; !exists {
+				depths[dep.DependsOnID] = depths[id] + 1
+				order = append(order, dep.DependsOnID)
+			}
 		}
 	}
 
-	return node
+	// Reference rows alone do not identify cycles between sibling branches.
+	// Mark DFS backedges over the displayed edge union, in stable source order.
+	// These are cycle-closing edges, not an enumeration of every cycle/SCC edge.
+	state := make(map[string]uint8, len(order))
+	cycleEdges := make(map[string]map[string]bool)
+	var visit func(string)
+	visit = func(id string) {
+		state[id] = 1
+		issue := issueMap[id]
+		if issue != nil && (maxDepth <= 0 || depths[id] < maxDepth) {
+			for _, dep := range issue.Dependencies {
+				if dep == nil {
+					continue
+				}
+				switch state[dep.DependsOnID] {
+				case 0:
+					visit(dep.DependsOnID)
+				case 1:
+					if cycleEdges[id] == nil {
+						cycleEdges[id] = make(map[string]bool)
+					}
+					cycleEdges[id][dep.DependsOnID] = true
+				}
+			}
+		}
+		state[id] = 2
+	}
+	visit(rootID)
+
+	makeNode := func(id, depType string) *DependencyNode {
+		node := &DependencyNode{ID: id, Title: "(not found)", Status: "?", Type: depType}
+		if issue := issueMap[id]; issue != nil {
+			node.ID, node.Title, node.Status = issue.ID, issue.Title, string(issue.Status)
+		}
+		return node
+	}
+	root := makeNode(rootID, "root")
+	expanded := map[string]*DependencyNode{rootID: root}
+	for _, id := range order {
+		issue := issueMap[id]
+		if issue == nil || (maxDepth > 0 && depths[id] >= maxDepth) {
+			continue
+		}
+		for _, dep := range issue.Dependencies {
+			if dep == nil {
+				continue
+			}
+			child := makeNode(dep.DependsOnID, string(dep.Type))
+			child.Cycle = cycleEdges[id][dep.DependsOnID]
+			if _, exists := expanded[dep.DependsOnID]; exists {
+				child.Reference = true
+			} else {
+				expanded[dep.DependsOnID] = child
+			}
+			expanded[id].Children = append(expanded[id].Children, child)
+		}
+	}
+	return root
 }
 
 // RenderDependencyTree renders a dependency tree as a formatted string
@@ -177,16 +207,27 @@ func renderTreeNode(sb *strings.Builder, node *DependencyNode, prefix string, is
 	title := truncateRunesHelper(node.Title, 40, "...")
 
 	// Render this node
-	sb.WriteString(fmt.Sprintf("%s%s%s %s %s %s (%s) [%s]\n",
-		prefix,
-		connector,
-		statusIcon,
-		typeIcon,
-		node.ID,
-		title,
-		node.Status,
-		node.Type,
-	))
+	sb.WriteString(prefix)
+	sb.WriteString(connector)
+	sb.WriteString(statusIcon)
+	sb.WriteByte(' ')
+	sb.WriteString(typeIcon)
+	sb.WriteByte(' ')
+	sb.WriteString(node.ID)
+	sb.WriteByte(' ')
+	sb.WriteString(title)
+	sb.WriteString(" (")
+	sb.WriteString(node.Status)
+	sb.WriteString(") [")
+	sb.WriteString(node.Type)
+	sb.WriteByte(']')
+	if node.Cycle {
+		sb.WriteString(" (cycle)")
+	}
+	if node.Reference {
+		sb.WriteString(" (reference: shown elsewhere)")
+	}
+	sb.WriteByte('\n')
 
 	// Calculate prefix for children
 	var childPrefix string

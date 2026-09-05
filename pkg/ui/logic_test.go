@@ -16,6 +16,69 @@ import (
 
 // White-box testing of UI model logic
 
+func TestComputeAlertsPreservesSourceAuthorityScopeAndClock(t *testing.T) {
+	t.Chdir(t.TempDir())
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	for _, tc := range []struct {
+		name       string
+		hidden     bool
+		visible    bool
+		deferred   bool
+		candidates map[string]bool
+		now        time.Time
+		wantGate   bool
+	}{
+		{"hidden-tombstone", true, false, false, nil, now, true},
+		{"missing-predecessor", false, false, false, nil, now, false},
+		{"excluded-candidate", false, true, false, map[string]bool{}, now, false},
+		{"future-deferral", false, true, true, nil, now, false},
+		{"deferral-boundary", false, true, true, nil, future, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			issues := []model.Issue{{ID: "gate", Status: model.StatusOpen, Priority: 1, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{DependsOnID: "hidden", Type: model.DepBlocks}}}}
+			if tc.deferred {
+				issues[0].DeferUntil = &future
+			}
+			for _, id := range []string{"third", "first", "second"} {
+				issues = append(issues, model.Issue{ID: id, Status: model.StatusOpen, Priority: 0, UpdatedAt: now,
+					Dependencies: []*model.Dependency{{DependsOnID: "gate", Type: model.DepBlocks}}})
+			}
+			if tc.visible {
+				issues = append(issues, model.Issue{ID: "hidden", Status: model.StatusClosed, UpdatedAt: now})
+			}
+			authorityIssues := append([]model.Issue(nil), issues...)
+			if tc.hidden {
+				authorityIssues = append(authorityIssues, model.Issue{ID: "hidden", Status: model.StatusTombstone})
+			}
+			a := analysis.NewAnalyzer(issues)
+			a.SetReadinessScope(model.NewReadinessIndex(authorityIssues), tc.candidates)
+			a.SetNow(tc.now)
+			stats := a.AnalyzeWithConfig(analysis.AnalysisConfig{})
+			alerts, _, _, _ := computeAlerts(issues, &stats, a)
+			gate := false
+			for _, alert := range alerts {
+				if alert.Type == drift.AlertBlockingCascade && alert.IssueID == "gate" {
+					gate = true
+					if alert.UnblocksCount != 3 {
+						t.Errorf("gate unblocks=%d, want 3", alert.UnblocksCount)
+					}
+				}
+				if alert.Type == drift.AlertStaleIssue {
+					t.Errorf("fresh issue became stale at source clock %v: %#v", tc.now, alert)
+				}
+				if !alert.DetectedAt.Equal(tc.now) {
+					t.Errorf("alert clock=%v, want source %v", alert.DetectedAt, tc.now)
+				}
+			}
+			if gate != tc.wantGate {
+				t.Errorf("gate blocking-cascade alert=%v, want %v", gate, tc.wantGate)
+			}
+		})
+	}
+}
+
 func TestApplyRecipe_StatusFilter(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "open", Status: model.StatusOpen},
@@ -314,6 +377,74 @@ func TestReadinessFilters_UseOneClockIncludingDeferralBoundary(t *testing.T) {
 			if got := len(selected) == 1; got != (actionable == want) {
 				t.Errorf("recipe actionable=%t at %v = %t, want %t", actionable, now, got, actionable == want)
 			}
+		}
+	}
+}
+
+func TestReadyViewsPreserveSnapshotDeferralClock(t *testing.T) {
+	t.Chdir(t.TempDir())
+	for _, year := range []int{2001, 2030} {
+		deadline := time.Date(year, 1, 2, 3, 4, 5, 0, time.UTC)
+		for _, atBoundary := range []bool{false, true} {
+			name := deadline.Format("2006") + "/before"
+			now, wantCount := deadline.Add(-time.Nanosecond), 1
+			if atBoundary {
+				name = deadline.Format("2006") + "/at-boundary"
+				now, wantCount = deadline, 2
+			}
+			t.Run(name, func(t *testing.T) {
+				expectScheduled := atBoundary
+				rows := []model.Issue{
+					{ID: "ready", Title: "Ready now", Status: model.StatusOpen, UpdatedAt: now},
+					{ID: "scheduled", Title: "Scheduled work", Status: model.StatusOpen, UpdatedAt: now, DeferUntil: &deadline},
+				}
+				builder := NewSnapshotBuilder(rows)
+				builder.analyzer.SetNow(now)
+				snapshot := builder.Build()
+				snapshot.Analysis.WaitForPhase2()
+				m := NewModel(rows, nil, "")
+				t.Cleanup(m.Stop)
+				m.currentFilter = "ready"
+				m.Update(SnapshotReadyMsg{Snapshot: snapshot})
+				check := func(stage string, visible []model.Issue) {
+					t.Helper()
+					if m.countReady != wantCount || len(visible) != wantCount {
+						t.Errorf("%s: snapshot ready=%d, visible=%v, want %d at %v", stage, m.countReady, visible, wantCount, now)
+					}
+					for _, row := range visible {
+						if row.ID != "ready" && (row.ID != "scheduled" || !expectScheduled) {
+							t.Errorf("%s: unexpected ready issue %s", stage, row.ID)
+						}
+					}
+				}
+				check("snapshot delivery", m.FilteredIssues())
+				m.applyFilter()
+				check("ready filter", m.FilteredIssues())
+				check("active view", m.filteredIssuesForActiveView())
+				actionable := true
+				r := &recipe.Recipe{Name: "ready-clock", Filters: recipe.FilterConfig{Actionable: &actionable}}
+				m.applyRecipe(r)
+				check("actionable recipe", m.FilteredIssues())
+				m.activeRecipe = r
+				check("active recipe view", m.filteredIssuesForActiveView())
+				if !atBoundary {
+					// A new snapshot advances the same visible view to the exact
+					// boundary; no wall-clock wait or source metadata edit is needed.
+					builder := NewSnapshotBuilder(rows)
+					builder.analyzer.SetNow(deadline)
+					next := builder.Build()
+					next.Analysis.WaitForPhase2()
+					m.Update(SnapshotReadyMsg{Snapshot: next})
+					now, wantCount, expectScheduled = deadline, 2, true
+					check("new snapshot at boundary", m.FilteredIssues())
+					cmd := m.preparePhase2Cmd()
+					if cmd == nil {
+						t.Fatal("new snapshot did not prepare Phase 2")
+					}
+					m.Update(cmd())
+					check("completed Phase 2 at boundary", m.FilteredIssues())
+				}
+			})
 		}
 	}
 }

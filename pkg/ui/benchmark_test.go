@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -45,6 +47,58 @@ func BenchmarkPerformanceBoardGrouping(b *testing.B) {
 				groupIssuesByMode(issues, mode)
 			}
 		})
+	}
+}
+
+func BenchmarkPerformanceFooterAlerts(b *testing.B) {
+	issues, err := testutil.PerformanceIssues("unicode", 10000, 20260904)
+	if err != nil {
+		b.Fatal(err)
+	}
+	m := settledPerformanceModel(b, issues)
+	if len(m.alerts) == 0 {
+		b.Fatal("fixture must exercise actual computed alert badge")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.renderFooter()
+	}
+}
+
+func TestPerformanceFooterAlertDismissalParity(t *testing.T) {
+	issues, err := testutil.PerformanceIssues("realistic", 128, 20260904)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := settledPerformanceModel(t, issues)
+	if len(m.alerts) == 0 {
+		t.Fatal("fixture must exercise actual computed alerts")
+	}
+	wantCount := len(m.alerts)
+	empty := m.renderFooter()
+	if !strings.Contains(ansi.Strip(empty), fmt.Sprintf("%d alerts", wantCount)) {
+		t.Fatal("empty dismissal map lost actual active alert count")
+	}
+	m.dismissedAlerts = map[string]bool{"not-a-current-alert": true}
+	if got := m.renderFooter(); got != empty {
+		t.Fatal("empty dismissal fast path changed exact footer compared with active map lookup")
+	}
+	firstKey := alertKey(m.alerts[0])
+	m.dismissedAlerts[firstKey] = true
+	for _, alert := range m.alerts {
+		if alertKey(alert) == firstKey {
+			wantCount--
+		}
+	}
+	if got := ansi.Strip(m.renderFooter()); !strings.Contains(got, fmt.Sprintf("%d alerts", wantCount)) {
+		t.Fatalf("dismissed alert still counted in footer: %s", got)
+	}
+	for _, alert := range m.alerts {
+		m.dismissedAlerts[alertKey(alert)] = true
+	}
+	if got := ansi.Strip(m.renderFooter()); strings.Contains(got, " alerts (!)") {
+		t.Fatal("all-dismissed alerts still showed a badge")
 	}
 }
 
@@ -218,8 +272,16 @@ func settledPerformanceModel(t testing.TB, issues []model.Issue) *Model {
 	// preserving production size-tiered metric timeouts and wall-clock timing.
 	m.analyzer.SetNow(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
 	m.Update(tea.WindowSizeMsg{Width: 140, Height: 45})
-	m.Update(m.preparePhase2Cmd()())
 	t.Cleanup(m.Stop)
+	completion, ok := m.preparePhase2Cmd()().(Phase2ReadyMsg)
+	if !ok || completion.prepared == nil {
+		t.Fatal("performance setup did not prepare a Phase2 snapshot")
+	}
+	m.Update(completion)
+	if m.snapshot != completion.prepared || !m.snapshot.IsPhase2Ready() ||
+		!m.snapshot.Analyzer.Now().Equal(m.analyzer.Now()) || !completion.sourceNow.Equal(m.analyzer.Now()) {
+		t.Fatal("performance setup did not install the completed snapshot at the captured clock")
+	}
 	m.list.Select(0)
 	if !m.ready || !m.analysis.IsPhase2Ready() || len(m.list.Items()) < 2 {
 		t.Fatal("performance model must be sized, settled, and navigable")
@@ -375,6 +437,25 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 	if outDir == "" {
 		t.Skip("opt-in measurement: scripts/benchmark.sh latency")
 	}
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.Open(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryHash := sha256.New()
+	_, hashErr := io.Copy(binaryHash, binary)
+	closeErr := binary.Close()
+	if hashErr != nil || closeErr != nil {
+		t.Fatalf("hash measurement executable: %v; close: %v", hashErr, closeErr)
+	}
+	executableHash := fmt.Sprintf("%x", binaryHash.Sum(nil))
 	samples := 1000
 	if value := os.Getenv("BV_PERF_UI_SAMPLES"); value != "" {
 		var err error
@@ -403,6 +484,7 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 						setupStarted := time.Now()
 						m := settledPerformanceModel(t, issues)
 						setupElapsed := time.Since(setupStarted)
+						configHash := analysis.ComputeConfigHash(&m.analysis.Config)
 						priorityHints := make([]analysis.PriorityRecommendation, 0, len(m.priorityHints))
 						for _, rec := range m.priorityHints {
 							priorityHints = append(priorityHints, *rec)
@@ -419,8 +501,9 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 						// Build real immutable snapshots concurrently with the UI loop.
 						// No fsnotify timing is claimed: delivery enters at SnapshotReadyMsg.
 						type refreshDelivery struct {
-							snapshot  *DataSnapshot
-							buildTime time.Duration
+							snapshot   *DataSnapshot
+							buildTime  time.Duration
+							generation int
 						}
 						ready := make(chan refreshDelivery, 1)
 						stop := make(chan struct{})
@@ -450,7 +533,7 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 									snapshot.Analysis.WaitForPhase2()
 									previous = snapshot
 									select {
-									case ready <- refreshDelivery{snapshot: snapshot, buildTime: time.Since(buildStarted)}:
+									case ready <- refreshDelivery{snapshot: snapshot, buildTime: time.Since(buildStarted), generation: generation}:
 									case <-stop:
 										return
 									}
@@ -472,6 +555,7 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 						var refreshStatuses []json.RawMessage
 						var refreshOrders []string
 						var refreshDecisions []string
+						var refreshGenerations []int
 						type phase2Result struct {
 							messages []tea.Msg
 							err      error
@@ -479,6 +563,7 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 						}
 						phase2Ready := make(chan phase2Result, 1)
 						var pendingSnapshot *DataSnapshot
+						var pendingGeneration int
 						for i := 0; i < samples; i++ {
 							var swapTime time.Duration
 							handledPhase2 := false
@@ -514,8 +599,18 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 									if phase2Count != 1 {
 										t.Fatalf("snapshot command returned %d Phase2 completions, want 1", phase2Count)
 									}
-									if installed == nil || m.snapshot != installed || !m.snapshot.IsPhase2Ready() || m.analysis != pendingSnapshot.Analysis {
+									// A historical binary can do preparation in Update and emit
+									// a raw Phase2ReadyMsg. It must still install a new completed
+									// snapshot for this actual source, rather than merely emit
+									// the message or retain its Phase1 snapshot.
+									if m.snapshot == nil || m.snapshot == pendingSnapshot || !m.snapshot.IsPhase2Ready() ||
+										m.analysis != pendingSnapshot.Analysis || m.snapshot.Analysis != pendingSnapshot.Analysis ||
+										(installed != nil && m.snapshot != installed) {
 										t.Fatal("actual Phase2 command did not install the delivered source generation")
+									}
+									changedID := issues[len(issues)-1].ID
+									if current := m.snapshot.IssueMap[changedID]; current == nil || current.Title != pendingSnapshot.IssueMap[changedID].Title {
+										t.Fatal("completed Phase2 snapshot lost the actual generation's changed source title")
 									}
 									phase2Handlers = append(phase2Handlers, swapTime)
 									commandTimes = append(commandTimes, result.elapsed)
@@ -528,6 +623,9 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 										t.Fatal(err)
 									}
 									refreshStatuses = append(refreshStatuses, state)
+									if analysis.ComputeConfigHash(&m.analysis.Config) != configHash {
+										t.Fatal("refresh changed the effective analysis configuration")
+									}
 									orderJSON, err := json.Marshal(performanceListIDs(m))
 									if err != nil {
 										t.Fatal(err)
@@ -538,6 +636,7 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 										t.Fatal(err)
 									}
 									refreshDecisions = append(refreshDecisions, fmt.Sprintf("%x", sha256.Sum256(decisionJSON)))
+									refreshGenerations = append(refreshGenerations, pendingGeneration)
 									pendingSnapshot = nil
 									handledPhase2 = true
 								}
@@ -558,6 +657,7 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 								swaps = append(swaps, swapTime)
 								buildTimes = append(buildTimes, delivery.buildTime)
 								pendingSnapshot = snapshot
+								pendingGeneration = delivery.generation
 								go func() {
 									started := time.Now()
 									messages, err := performancePhase2Command(phase2Cmd)
@@ -578,13 +678,16 @@ func TestPerformanceNavigationCohorts(t *testing.T) {
 						}
 						record := map[string]any{
 							"workload": kind, "issues": size, "seed": 20260904, "fixture_sha256": fmt.Sprintf("%x", sha256.Sum256(fixture)),
-							"mode": mode, "terminal_columns": 140, "terminal_rows": 45, "distribution": summary,
+							"loaded_issues": len(m.issues), "host": host, "binary_sha256": executableHash,
+							"analysis_config_hash": configHash,
+							"mode":                 mode, "terminal_columns": 140, "terminal_rows": 45, "distribution": summary,
 							"settled_setup_ns": setupElapsed, "priority_recommendations": priorityHints,
 							"priority_reference_time": "2026-09-01T00:00:00Z",
 							"sample_ns":               durations, "snapshot_swap_ns": swaps, "phase2_handler_ns": phase2Handlers,
 							"snapshot_build_ns": buildTimes, "phase2_command_ns": commandTimes,
 							"selected_ids": selected, "list_ids": listIDs, "refresh_order_sha256": refreshOrders,
 							"refresh_decisions_sha256": refreshDecisions,
+							"refresh_generations":      refreshGenerations,
 							"metric_status":            status, "refresh_metric_status": refreshStatuses,
 							"allocated_bytes": after.TotalAlloc - before.TotalAlloc, "allocations": after.Mallocs - before.Mallocs,
 							"heap_before_bytes": before.HeapAlloc, "heap_after_bytes": after.HeapAlloc,
@@ -681,6 +784,45 @@ func BenchmarkListItemBuild(b *testing.B) {
 			}
 		}
 	})
+}
+
+func BenchmarkSnapshotSearchDocuments(b *testing.B) {
+	issues, err := testutil.PerformanceIssues("unicode", 10000, 20260904)
+	if err != nil {
+		b.Fatal(err)
+	}
+	items := buildListItems(issues, nil)
+	_, previousDocs := buildSnapshotSearchDocuments(items, nil, nil)
+	previous := &DataSnapshot{semanticDocs: previousDocs, IssueMap: make(map[string]*model.Issue, len(issues))}
+	for i := range issues {
+		previous.IssueMap[issues[i].ID] = &issues[i]
+	}
+	changed := copyIssues(issues)
+	changed[len(changed)-1].Title += " changed"
+	diff := analysis.ComputeIssueDiff(issues, changed)
+	items = buildListItems(changed, nil)
+	wantIDs, wantDocs := buildSnapshotSearchDocuments(items, nil, nil)
+	for _, incremental := range []bool{false, true} {
+		name := "full"
+		var prev *DataSnapshot
+		var changes *analysis.IssueDiff
+		if incremental {
+			name, prev, changes = "one-of-10000-changed", previous, &diff
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			var ids []string
+			var docs map[string]string
+			for i := 0; i < b.N; i++ {
+				ids, docs = buildSnapshotSearchDocuments(items, prev, changes)
+			}
+			b.StopTimer()
+			if !reflect.DeepEqual(ids, wantIDs) || !reflect.DeepEqual(docs, wantDocs) {
+				b.Fatal("search documents differ from the complete current-source rebuild")
+			}
+		})
+	}
 }
 
 func BenchmarkBackgroundWorkerBuildSnapshot(b *testing.B) {

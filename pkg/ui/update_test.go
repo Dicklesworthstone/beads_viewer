@@ -203,7 +203,7 @@ func TestHistoryLoadCancelsInjectedBlockingLoader(t *testing.T) {
 	defer m.cancelHistoryLoad()
 	m.historyLoadCommand = func(
 		ctx context.Context,
-		_ []model.Issue,
+		_ []correlation.BeadInfo,
 		_ string,
 		dataGeneration, requestGeneration uint64,
 	) tea.Cmd {
@@ -330,7 +330,7 @@ func TestQuitCommandCancelsHistoryLoad(t *testing.T) {
 	m := NewModel([]model.Issue{{ID: "A", Status: model.StatusOpen}}, nil, "")
 	m.historyLoadCommand = func(
 		ctx context.Context,
-		_ []model.Issue,
+		_ []correlation.BeadInfo,
 		_ string,
 		_, _ uint64,
 	) tea.Cmd {
@@ -361,7 +361,7 @@ func TestStopCancelsHistoryLoad(t *testing.T) {
 	m := NewModel([]model.Issue{{ID: "A", Status: model.StatusOpen}}, nil, "")
 	m.historyLoadCommand = func(
 		ctx context.Context,
-		_ []model.Issue,
+		_ []correlation.BeadInfo,
 		_ string,
 		_, _ uint64,
 	) tea.Cmd {
@@ -390,7 +390,7 @@ func TestEnterHistoryViewSchedulesAsyncRetryWithoutGitWorkOnUpdateLoop(t *testin
 	m.historyLoadFailed = true
 	m.historyLoadCommand = func(
 		_ context.Context,
-		_ []model.Issue,
+		_ []correlation.BeadInfo,
 		_ string,
 		_, _ uint64,
 	) tea.Cmd {
@@ -416,7 +416,7 @@ func TestGlobalHistoryToggleSchedulesRetryAndKeepsTinyTerminalUsable(t *testing.
 	m.historyLoadFailed = true
 	m.historyLoadCommand = func(
 		_ context.Context,
-		_ []model.Issue,
+		_ []correlation.BeadInfo,
 		_ string,
 		_, _ uint64,
 	) tea.Cmd {
@@ -446,7 +446,7 @@ func TestHistoryRefreshHidesAndDisablesPreviousDatasetReport(t *testing.T) {
 	m.historyLoading = false
 	m.historyLoadCommand = func(
 		_ context.Context,
-		_ []model.Issue,
+		_ []correlation.BeadInfo,
 		_ string,
 		_, _ uint64,
 	) tea.Cmd {
@@ -486,7 +486,7 @@ func TestHistoryFailureRetainsHiddenSelectionAndHRetriesInPlace(t *testing.T) {
 	m.beginSemanticDatasetUpdate()
 	m.historyLoadCommand = func(
 		_ context.Context,
-		_ []model.Issue,
+		_ []correlation.BeadInfo,
 		_ string,
 		_, _ uint64,
 	) tea.Cmd {

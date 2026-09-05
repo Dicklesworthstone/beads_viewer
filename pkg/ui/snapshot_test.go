@@ -6,17 +6,289 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
 )
+
+func newPhase2ListReuseModel(t *testing.T, count int) *Model {
+	t.Helper()
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	issues := make([]model.Issue, count)
+	for i := range issues {
+		issues[i] = model.Issue{ID: fmt.Sprintf("row-%04d", i), Title: fmt.Sprintf("Row %04d", i), Status: model.StatusOpen, Priority: i % 3, CreatedAt: now, UpdatedAt: now}
+	}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 45})
+	m.analysis.WaitForPhase2()
+	builder := NewSnapshotBuilder(cloneIssuesForAsync(issues)).WithAnalysis(m.analysis)
+	builder.analyzer.SetNow(now)
+	m.Update(SnapshotReadyMsg{Snapshot: builder.Build()})
+	return m
+}
+
+func TestPreparedPhase2PristineListPreservesSelectionAndFilterFence(t *testing.T) {
+	m := newPhase2ListReuseModel(t, 8)
+	source := m.snapshot
+	m.list.Select(3)
+	selected := m.selectedListIssueID(false, "")
+	oldRows := m.list.Items()
+	oldValues := append([]list.Item(nil), oldRows...)
+	dataGeneration, queryGeneration := m.listDataGeneration, m.listQueryGeneration
+	// This real asynchronous filter owns the old row slice. Its result must
+	// remain harmless after Phase2 installs a different detached list.
+	oldList := m.list
+	oldList.SetFilterText("Row")
+	filterCmd := waitForSnapshotListFilterCmd(source, dataGeneration, queryGeneration, "Row", selected, oldList.SetItems(oldRows))
+	filterResult := make(chan tea.Msg, 1)
+	go func() { filterResult <- filterCmd() }()
+	completion := m.preparePhase2Cmd()().(Phase2ReadyMsg)
+	m.Update(completion)
+	if !reflect.DeepEqual(m.list.Items(), completion.prepared.listModelItems) {
+		t.Fatal("completed default list differs from exact prepared issue/metric/triage rows")
+	}
+	if &m.list.Items()[0] == &oldRows[0] || &m.list.Items()[0] == &completion.prepared.listModelItems[0] || !reflect.DeepEqual(oldRows, oldValues) {
+		t.Fatal("completion mutated or reused a slice owned by snapshot/filter readers")
+	}
+	if got := m.selectedListIssueID(false, ""); got != selected || m.listDataGeneration != dataGeneration+1 || m.listQueryGeneration != queryGeneration {
+		t.Fatalf("completion changed selection or filter generations: selected=%s data=%d query=%d", got, m.listDataGeneration, m.listQueryGeneration)
+	}
+	stale := <-filterResult
+	m.list.SetFilterText("Row")
+	before := append([]list.Item(nil), m.list.VisibleItems()...)
+	m.Update(stale)
+	if !reflect.DeepEqual(m.list.VisibleItems(), before) || m.snapshot != completion.prepared {
+		t.Fatal("old asynchronous filter replaced completed rows")
+	}
+}
+
+func TestPreparedPhase2PreservesChangedListPresentation(t *testing.T) {
+	for _, change := range []string{"search-and-diff", "reordered", "subset", "active-filter"} {
+		t.Run(change, func(t *testing.T) {
+			m := newPhase2ListReuseModel(t, 8)
+			cmd := m.preparePhase2Cmd()
+			items := append([]list.Item(nil), m.list.Items()...)
+			switch change {
+			case "search-and-diff":
+				item := items[0].(IssueItem)
+				item.SearchScore, item.SearchTextScore, item.SearchScoreSet = 0.83, 0.79, true
+				item.SearchComponents = map[string]float64{"text": 0.79, "pagerank": 0.04}
+				item.DiffStatus = DiffStatusModified
+				items[0] = item
+				m.replaceListPresentation(items, item.Issue.ID)
+			case "reordered":
+				for left, right := 0, len(items)-1; left < right; left, right = left+1, right-1 {
+					items[left], items[right] = items[right], items[left]
+				}
+				m.setListItems(items)
+			case "subset":
+				m.setListItems(items[2:5])
+			case "active-filter":
+				m.list.SetFilterText("0003")
+			}
+			m.list.Select(0)
+			selected := m.selectedListIssueID(m.list.FilterState() != list.Unfiltered, m.list.FilterInput.Value())
+			before := append([]list.Item(nil), m.list.Items()...)
+			completion := cmd().(Phase2ReadyMsg)
+			m.Update(completion)
+			want := make([]list.Item, len(before))
+			for i, raw := range before {
+				item := raw.(IssueItem)
+				id := item.Issue.ID
+				item.GraphScore = m.analysis.GetPageRankScore(id)
+				item.Impact = m.analysis.GetCriticalPathScore(id)
+				item.TriageScore = completion.prepared.TriageScores[id]
+				reasons := completion.prepared.TriageReasons[id]
+				item.TriageReason, item.TriageReasons = reasons.Primary, reasons.All
+				item.IsQuickWin, item.IsBlocker = completion.prepared.QuickWinSet[id], completion.prepared.BlockerSet[id]
+				item.UnblocksCount = len(completion.prepared.UnblocksMap[id])
+				want[i] = item
+			}
+			if !reflect.DeepEqual(m.list.Items(), want) {
+				t.Fatal("Phase2 discarded current membership/order/search/diff presentation")
+			}
+			if got := m.selectedListIssueID(m.list.FilterState() != list.Unfiltered, m.list.FilterInput.Value()); got != selected {
+				t.Fatalf("Phase2 changed selected ID: got %s want %s", got, selected)
+			}
+			if change == "active-filter" && (m.list.FilterInput.Value() != "0003" || len(m.list.VisibleItems()) != 1) {
+				t.Fatal("Phase2 lost the active filter and its actual match")
+			}
+		})
+	}
+}
+
+func TestPreparedPhase2PreservesScopedList(t *testing.T) {
+	for _, scope := range []string{"workspace", "candidate", "recipe"} {
+		t.Run(scope, func(t *testing.T) {
+			issues := recipePresentationIssues()
+			issues[0].SourceRepo, issues[1].SourceRepo, issues[2].SourceRepo = "api", "web", "api"
+			var readinessScope []ReadinessScope
+			if scope == "candidate" {
+				readinessScope = []ReadinessScope{{Authority: model.NewReadinessIndex(issues), CandidateIDs: map[string]bool{"view-1": true, "view-3": true}}}
+			}
+			m := NewModel(cloneIssuesForAsync(issues), nil, "", readinessScope...)
+			t.Cleanup(m.Stop)
+			builder := NewSnapshotBuilder(cloneIssuesForAsync(issues)).WithAnalysis(m.analysis)
+			builder.analyzer.SetNow(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+			wantIDs := []string{"view-1", "view-3"}
+			switch scope {
+			case "workspace":
+				m.workspaceMode = true
+				m.activeRepos = map[string]bool{"api": true}
+			case "candidate":
+				m.SetFilter("ready")
+				wantIDs = []string{"view-1"}
+			case "recipe":
+				r := &recipe.Recipe{Name: "api-items", Filters: recipe.FilterConfig{ExcludeTags: []string{"beta"}}}
+				m.setActiveRecipe(r)
+				builder.WithRecipe(r)
+			}
+			m.Update(SnapshotReadyMsg{Snapshot: builder.Build()})
+			if !reflect.DeepEqual(performanceListIDs(m), wantIDs) {
+				t.Fatalf("scope setup: IDs=%v want=%v", performanceListIDs(m), wantIDs)
+			}
+			m.list.Select(len(wantIDs) - 1)
+			selected := m.selectedListIssueID(false, "")
+			completion := m.preparePhase2Cmd()().(Phase2ReadyMsg)
+			m.Update(completion)
+			if !reflect.DeepEqual(performanceListIDs(m), wantIDs) || m.selectedListIssueID(false, "") != selected {
+				t.Fatal("Phase2 replaced scoped membership, order or selection with full snapshot rows")
+			}
+			for _, raw := range m.list.Items() {
+				item := raw.(IssueItem)
+				if item.GraphScore != m.analysis.GetPageRankScore(item.Issue.ID) || item.TriageScore != completion.prepared.TriageScores[item.Issue.ID] {
+					t.Fatalf("scoped row %s did not receive completed metrics/triage", item.Issue.ID)
+				}
+			}
+		})
+	}
+}
+
+func TestRawPhase2PristineListMatchesCompletedSnapshot(t *testing.T) {
+	m := newPhase2ListReuseModel(t, 8)
+	source := m.snapshot
+	m.list.Select(3)
+	selected := m.selectedListIssueID(false, "")
+	generation := m.listDataGeneration
+	message := WaitForPhase2Cmd(m.analysis)().(Phase2ReadyMsg)
+	if message.prepared != nil {
+		t.Fatal("raw completion control unexpectedly contains prepared data")
+	}
+	want := source.WithPhase2(message.Stats, message.Insights, m.issues, m.analyzer)
+	m.Update(message)
+	if m.snapshot == source || !m.snapshot.IsPhase2Ready() || !reflect.DeepEqual(m.list.Items(), want.listModelItems) {
+		t.Fatal("valid raw completion failed to install current completed rows")
+	}
+	if m.selectedListIssueID(false, "") != selected || m.listDataGeneration != generation+1 {
+		t.Fatal("valid raw completion changed selection or list generation semantics")
+	}
+}
+
+func TestPreparedPhase2ListAvoidsReboxingEveryRow(t *testing.T) {
+	m := newPhase2ListReuseModel(t, 1024)
+	m.Update(m.preparePhase2Cmd()())
+	want := append([]list.Item(nil), m.list.Items()...)
+	selected := m.selectedListIssueID(false, "")
+	allocations := testing.AllocsPerRun(1, func() { m.refreshListItemsPhase2() })
+	if !reflect.DeepEqual(m.list.Items(), want) || m.selectedListIssueID(false, "") != selected {
+		t.Fatal("allocation probe changed completed rows or selection")
+	}
+	// Reboxing each of1024 already prepared rows alone exceeds this bound.
+	// The real refresh still copies its slice and updates the selected detail.
+	if allocations >= 512 {
+		t.Fatalf("pristine1024-row Phase2 refresh allocated %.0f times, want <512", allocations)
+	}
+	t.Logf("pristine1024-row Phase2 refresh allocations=%.0f", allocations)
+}
+
+func TestInitialPreparedPhase2InstallsCompletedTriage(t *testing.T) {
+	now := time.Date(2001, 1, 2, 0, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "a", Title: "Dependent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour), Dependencies: []*model.Dependency{{DependsOnID: "b", Type: model.DepBlocks}}},
+		{ID: "b", Title: "Prerequisite", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour)},
+		{ID: "c", Title: "Independent", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour)},
+	}
+	m := NewModel(cloneIssuesForAsync(issues), nil, "")
+	t.Cleanup(m.Stop)
+	if m.snapshot != nil {
+		t.Fatal("initial lifecycle fixture unexpectedly already has a snapshot")
+	}
+	m.Update(tea.WindowSizeMsg{Width: 180, Height: 60})
+	if !m.selectVisibleListItemByID("b") {
+		t.Fatal("startup list is missing the prerequisite issue")
+	}
+	m.analysis.WaitForPhase2()
+	m.analyzer.SetNow(now)
+	want := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, now)
+	msg, ok := m.preparePhase2Cmd()().(Phase2ReadyMsg)
+	if !ok || msg.prepared == nil || msg.sourceSnapshot != nil {
+		t.Fatal("initial production command did not create a prepared snapshot")
+	}
+	if !reflect.DeepEqual(msg.prepared.phase2Triage.Recommendations, want.Recommendations) {
+		t.Fatal("off-loop preparation did not use the completed Stats and captured clock")
+	}
+	_, followup := m.Update(msg)
+	t.Logf("clock=%s status=%+v source_nil=%v installed=%v cancelled=%v followup=%v", m.analyzer.Now(), m.analysis.Status(), msg.sourceSnapshot == nil, m.snapshot == msg.prepared, msg.preparationCtx.Err(), followup != nil)
+	if m.snapshot != msg.prepared || !m.snapshot.IsPhase2Ready() {
+		t.Error("accepted initial completion did not install its prepared snapshot")
+	}
+	if !reflect.DeepEqual(m.triageScores, msg.prepared.TriageScores) || !reflect.DeepEqual(m.triageReasons, msg.prepared.TriageReasons) {
+		t.Errorf("initial completion kept startup triage: scores=%v want=%v reasons=%+v want=%+v", m.triageScores, msg.prepared.TriageScores, m.triageReasons, msg.prepared.TriageReasons)
+	}
+	for _, raw := range m.list.Items() {
+		item := raw.(IssueItem)
+		id := item.Issue.ID
+		reasons := msg.prepared.TriageReasons[id]
+		if item.TriageScore != msg.prepared.TriageScores[id] || item.TriageReason != reasons.Primary || !reflect.DeepEqual(item.TriageReasons, reasons.All) {
+			t.Errorf("visible item %s retained startup triage: %+v", id, item)
+		}
+	}
+	if got := m.selectedListIssueID(false, ""); got != "b" {
+		t.Fatalf("initial completion changed selected issue: got %q want b", got)
+	}
+	m.viewport.Height = m.viewport.TotalLineCount()
+	m.viewport.GotoTop()
+	detail := ansi.Strip(m.viewport.View())
+	if !strings.Contains(detail, fmt.Sprintf("%.2f/1.00", msg.prepared.TriageScores["b"])) ||
+		!strings.Contains(detail, msg.prepared.TriageReasons["b"].Primary) || strings.Contains(detail, "No activity in") {
+		t.Errorf("selected detail did not render the completed score and captured-clock reasons:\n%s", detail)
+	}
+}
+
+func TestWithPhase2ListItemsContainCompletedResults(t *testing.T) {
+	issues := recipePresentationIssues()
+	builder := NewSnapshotBuilder(cloneIssuesForAsync(issues))
+	builder.analyzer.SetNow(time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC))
+	source := builder.Build()
+	source.Analysis.WaitForPhase2()
+	before := deepCopyListItems(source.ListItems)
+	completed := source.WithPhase2(source.Analysis, source.Analysis.GenerateInsights(len(issues)), source.Issues, source.Analyzer)
+	if !reflect.DeepEqual(source.ListItems, before) {
+		t.Fatal("completion mutated its source list items")
+	}
+	for i, item := range completed.ListItems {
+		id := item.Issue.ID
+		reasons := completed.TriageReasons[id]
+		if item.GraphScore != completed.Analysis.GetPageRankScore(id) || item.Impact != completed.Analysis.GetCriticalPathScore(id) || item.TriageScore != completed.TriageScores[id] || item.TriageReason != reasons.Primary || !reflect.DeepEqual(item.TriageReasons, reasons.All) || item.IsQuickWin != completed.QuickWinSet[id] || item.IsBlocker != completed.BlockerSet[id] || item.UnblocksCount != len(completed.UnblocksMap[id]) {
+			t.Errorf("prepared list item %s retains Phase1 metrics/triage: %+v", id, item)
+		}
+		if !reflect.DeepEqual(completed.listModelItems[i], item) || completed.listIndexByID[id] != i {
+			t.Errorf("prepared list caches disagree for %s", id)
+		}
+	}
+}
 
 func TestPreparedPhase2PreservesResultsAndCurrentPresentation(t *testing.T) {
 	issues := recipePresentationIssues()
@@ -1712,6 +1984,100 @@ func TestSnapshotSwap_InstallsPrecomputedSearchDocuments(t *testing.T) {
 	got := m.semanticSearch.Snapshot()
 	if got.Docs["test-1"] != sentinel {
 		t.Fatalf("expected precomputed search document, got %q", got.Docs["test-1"])
+	}
+}
+
+func TestSnapshotBuilder_SearchDocumentsMatchFullRebuild(t *testing.T) {
+	now := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	base := []model.Issue{
+		{ID: "unchanged", Title: "Unchanged 日本語", Description: "Keep **Unicode** 👋", Status: model.StatusOpen, Labels: []string{"api"}},
+		{ID: "title", Title: "Old title", Status: model.StatusOpen},
+		{ID: "description", Description: "Old description", Status: model.StatusOpen},
+		{ID: "labels", Labels: []string{"old", "labels"}, Status: model.StatusOpen,
+			Comments:     []*model.Comment{{ID: "1", Text: "first"}, {ID: "2", Text: "second"}},
+			Dependencies: []*model.Dependency{{DependsOnID: "title", Type: model.DepRelated}, {DependsOnID: "description", Type: model.DepRelated}}},
+		{ID: "metadata", Status: model.StatusOpen, Priority: 1},
+		{ID: "removed", Title: "Must disappear", Status: model.StatusClosed},
+	}
+	build := func(issues []model.Issue, prev *DataSnapshot, diff *analysis.IssueDiff, r *recipe.Recipe) *DataSnapshot {
+		b := NewSnapshotBuilder(copyIssues(issues)).WithRecipe(r).WithPreviousSnapshot(prev, diff)
+		b.analyzer.SetNow(now)
+		s := b.Build()
+		s.Analysis.WaitForPhase2()
+		return s
+	}
+	for _, name := range []string{"text-and-metadata", "label-order-only", "added-removed-reordered", "recipe-membership", "missing-cached-document", "missing-previous-issue", "missing-diff", "duplicate-ids", "clock-only"} {
+		t.Run(name, func(t *testing.T) {
+			previousIssues, changed := copyIssues(base), copyIssues(base)
+			var previousRecipe, currentRecipe *recipe.Recipe
+			switch name {
+			case "label-order-only":
+				changed[3].Labels = []string{"labels", "old"}
+				changed[3].Comments = []*model.Comment{base[3].Comments[1], base[3].Comments[0]}
+				changed[3].Dependencies = []*model.Dependency{base[3].Dependencies[1], base[3].Dependencies[0]}
+			case "text-and-metadata", "missing-diff":
+				changed[1].Title = "New title\x00日本語"
+				changed[2].Description = "New **description** 👋"
+				changed[3].Labels = []string{"new", "labels"}
+				changed[4].Priority, changed[4].Notes = 2, "Metadata also changed"
+			case "added-removed-reordered":
+				changed = append([]model.Issue{{ID: "added", Title: "New document", Status: model.StatusOpen}}, changed[:len(changed)-1]...)
+				changed[1], changed[2] = changed[2], changed[1]
+			case "recipe-membership":
+				previousRecipe = &recipe.Recipe{Name: "open", Filters: recipe.FilterConfig{Status: []string{"open"}}}
+				currentRecipe = &recipe.Recipe{Name: "closed", Filters: recipe.FilterConfig{Status: []string{"closed"}}}
+			case "duplicate-ids":
+				previousIssues = append(previousIssues, model.Issue{ID: "title", Title: "Old duplicate", Status: model.StatusOpen})
+				changed = append(changed, model.Issue{ID: "title", Title: "Changed duplicate", Status: model.StatusOpen})
+			}
+			previous := build(previousIssues, nil, nil, previousRecipe)
+			if name == "missing-cached-document" {
+				delete(previous.semanticDocs, "unchanged")
+			}
+			if name == "missing-previous-issue" {
+				delete(previous.IssueMap, "title")
+				previous.semanticDocs["title"] = "Do not reuse a cache entry without its source issue"
+			}
+			diff := analysis.ComputeIssueDiff(previous.Issues, changed)
+			if name == "label-order-only" && len(diff.Unchanged) != len(changed) {
+				t.Fatal("collection-order fixture must exercise the canonical-unchanged path")
+			}
+			diffPtr := &diff
+			if name == "missing-diff" {
+				diffPtr = nil
+			}
+			if name == "clock-only" {
+				now = now.Add(time.Hour)
+			}
+			next := build(changed, previous, diffPtr, currentRecipe)
+			full := build(changed, nil, nil, currentRecipe)
+			if !reflect.DeepEqual(next.semanticIDs, full.semanticIDs) || !reflect.DeepEqual(next.semanticDocs, full.semanticDocs) {
+				t.Fatalf("incremental search documents differ from full rebuild: got=%q want=%q", next.semanticDocs, full.semanticDocs)
+			}
+			for i := range next.ListItems {
+				if !reflect.DeepEqual(next.ListItems[i].Issue, full.ListItems[i].Issue) {
+					t.Fatalf("list row %d retained stale source collection order", i)
+				}
+			}
+			for _, item := range next.ListItems {
+				// Duplicate IDs retain the full rebuild's existing last-row behavior.
+				if !diff.HasDuplicateIDs && next.semanticDocs[item.Issue.ID] != search.IssueDocument(item.Issue) {
+					t.Fatalf("document for %s does not match current source", item.Issue.ID)
+				}
+			}
+			m := NewModel(copyIssues(changed), nil, "")
+			t.Cleanup(m.Stop)
+			m.currentFilter = "all"
+			m.Update(SnapshotReadyMsg{Snapshot: next})
+			if got := m.semanticSearch.Snapshot().Docs; !reflect.DeepEqual(got, full.semanticDocs) {
+				t.Fatalf("installed search documents differ from full rebuild: got=%q want=%q", got, full.semanticDocs)
+			}
+			old := previous.semanticDocs["unchanged"]
+			next.semanticDocs["unchanged"] = "independent map mutation"
+			if previous.semanticDocs["unchanged"] != old {
+				t.Fatal("new document map aliases previous snapshot")
+			}
+		})
 	}
 }
 

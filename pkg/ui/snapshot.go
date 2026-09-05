@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -646,16 +647,13 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 
 	listModelItems := make([]list.Item, len(listItems))
 	listIndexByID := make(map[string]int, len(listItems))
-	semanticIDs := make([]string, len(listItems))
-	semanticDocs := make(map[string]string, len(listItems))
 	for i := range listItems {
 		item := listItems[i]
 		listModelItems[i] = item
 		id := item.Issue.ID
 		listIndexByID[id] = i
-		semanticIDs[i] = id
-		semanticDocs[id] = search.IssueDocument(item.Issue)
 	}
+	semanticIDs, semanticDocs := buildSnapshotSearchDocuments(listItems, b.prevSnapshot, b.diff)
 
 	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlerts(issues, graphStats, b.analyzer)
 
@@ -704,6 +702,35 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	}
 	snapshot.phase2Input = snapshot.detachedPhase2Input()
 	return snapshot
+}
+
+// buildSnapshotSearchDocuments owns its ID slice and map. Document strings are
+// immutable and can be shared only when the complete source diff says the issue
+// is unchanged. Iterating the current list keeps removed and filtered rows out.
+func buildSnapshotSearchDocuments(items []IssueItem, previous *DataSnapshot, diff *analysis.IssueDiff) ([]string, map[string]string) {
+	var unchanged map[string]bool
+	if previous != nil && diff != nil && !diff.HasDuplicateIDs {
+		unchanged = make(map[string]bool, len(diff.Unchanged))
+		for _, id := range diff.Unchanged {
+			unchanged[id] = true
+		}
+	}
+	ids := make([]string, len(items))
+	docs := make(map[string]string, len(items))
+	for i, item := range items {
+		id := item.Issue.ID
+		ids[i] = id
+		// Canonical fingerprints treat labels as a set; search text preserves
+		// their order. Require that order too before sharing the old string.
+		if unchanged[id] && previous.IssueMap[id] != nil && slices.Equal(previous.IssueMap[id].Labels, item.Issue.Labels) {
+			if document, exists := previous.semanticDocs[id]; exists {
+				docs[id] = document
+				continue
+			}
+		}
+		docs[id] = search.IssueDocument(item.Issue)
+	}
+	return ids, docs
 }
 
 func listOrderFingerprint(items []IssueItem) uint64 {
@@ -795,6 +822,9 @@ func buildListItemsIncremental(issues []model.Issue, stats *analysis.GraphStats,
 	listItems := make([]IssueItem, len(issues))
 	copy(listItems, prev.ListItems)
 	for i := range listItems {
+		// Fingerprints canonicalize collection order. Keep derived metrics, but
+		// publish the current source order for labels, comments and dependencies.
+		listItems[i].Issue = issues[i]
 		clearIssueItemEphemeral(&listItems[i])
 	}
 	for _, id := range diff.Modified {
@@ -1260,6 +1290,19 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 	listModelItems := make([]list.Item, len(listItems))
 	listIndexByID := make(map[string]int, len(listItems))
 	for i := range listItems {
+		item := &listItems[i]
+		id := item.Issue.ID
+		if stats != nil {
+			item.GraphScore = stats.GetPageRankScore(id)
+			item.Impact = stats.GetCriticalPathScore(id)
+		}
+		item.TriageScore = triageScores[id]
+		reasons := triageReasons[id]
+		item.TriageReason = reasons.Primary
+		item.TriageReasons = reasons.All
+		item.IsQuickWin = quickWinSet[id]
+		item.IsBlocker = blockerSet[id]
+		item.UnblocksCount = len(unblocksMap[id])
 		listModelItems[i] = listItems[i]
 		listIndexByID[listItems[i].Issue.ID] = i
 	}

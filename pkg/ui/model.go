@@ -566,7 +566,7 @@ func CheckAgentFileCmd(workDir string) tea.Cmd {
 
 type historyLoadCommandFactory func(
 	context.Context,
-	[]model.Issue,
+	[]correlation.BeadInfo,
 	string,
 	uint64,
 	uint64,
@@ -574,9 +574,10 @@ type historyLoadCommandFactory func(
 
 // LoadHistoryCmd returns a command that loads history data in the background.
 // The caller owns ctx and cancels it when a newer dataset supersedes this load.
+// beads must be an owned snapshot of the current ID, title and status fields.
 func LoadHistoryCmd(
 	ctx context.Context,
-	issues []model.Issue,
+	beads []correlation.BeadInfo,
 	beadsPath string,
 	dataGeneration, requestGeneration uint64,
 ) tea.Cmd {
@@ -625,16 +626,6 @@ func LoadHistoryCmd(
 		// the JSONL preference to *this* (correlation) path only and resolve the
 		// git-tracked JSONL ourselves whenever beadsPath is not already one.
 		correlationPath := resolveHistoryCorrelationPath(beadsPath, repoPath)
-
-		// Convert model.Issue to correlation.BeadInfo
-		beads := make([]correlation.BeadInfo, len(issues))
-		for i, issue := range issues {
-			beads[i] = correlation.BeadInfo{
-				ID:     issue.ID,
-				Title:  issue.Title,
-				Status: string(issue.Status),
-			}
-		}
 
 		correlator := correlation.NewCorrelator(repoPath, correlationPath).WithContext(ctx)
 		// The History view is a read path: stored confirm/reject feedback lives
@@ -746,25 +737,26 @@ type Model struct {
 	lastForceRefresh       time.Time
 
 	// UI Components
-	list                list.Model
-	listItemsBuffer     []list.Item
-	listOrderHash       uint64
-	listDataGeneration  uint64
-	listQueryGeneration uint64
-	pendingFilterTerm   string
-	pendingSelectedID   string
-	viewport            viewport.Model
-	renderer            *MarkdownRenderer
-	board               BoardModel
-	labelDashboard      LabelDashboardModel
-	velocityComparison  VelocityComparisonModel // bv-125
-	shortcutsSidebar    ShortcutsSidebar        // bv-3qi5
-	graphView           GraphModel
-	tree                TreeModel // Hierarchical tree view (bv-gllx)
-	insightsPanel       InsightsModel
-	flowMatrix          FlowMatrixModel // Cross-label flow matrix
-	theme               Theme
-	keyRegistry         *KeyRegistry // Centralized key dispatch (bv-3bsx)
+	list                   list.Model
+	listItemsBuffer        []list.Item
+	listOrderHash          uint64
+	snapshotListGeneration uint64 // Pristine rows installed from the current snapshot.
+	listDataGeneration     uint64
+	listQueryGeneration    uint64
+	pendingFilterTerm      string
+	pendingSelectedID      string
+	viewport               viewport.Model
+	renderer               *MarkdownRenderer
+	board                  BoardModel
+	labelDashboard         LabelDashboardModel
+	velocityComparison     VelocityComparisonModel // bv-125
+	shortcutsSidebar       ShortcutsSidebar        // bv-3qi5
+	graphView              GraphModel
+	tree                   TreeModel // Hierarchical tree view (bv-gllx)
+	insightsPanel          InsightsModel
+	flowMatrix             FlowMatrixModel // Cross-label flow matrix
+	theme                  Theme
+	keyRegistry            *KeyRegistry // Centralized key dispatch (bv-3bsx)
 
 	// Update State
 	updateAvailable bool
@@ -1331,6 +1323,7 @@ func (m *Model) installSnapshotListItems(snapshot *DataSnapshot) tea.Cmd {
 	m.listItemsBuffer = append([]list.Item(nil), items...)
 	cmd := m.list.SetItems(m.listItemsBuffer)
 	m.listOrderHash = snapshot.listOrderHash
+	m.snapshotListGeneration = m.listDataGeneration
 	return cmd
 }
 
@@ -1543,9 +1536,20 @@ func (m *Model) startHistoryLoad() tea.Cmd {
 	if loadCommand == nil {
 		loadCommand = LoadHistoryCmd
 	}
+	// Correlation reads only current ID/title/status; lifecycle and assignee
+	// evidence come from Git. Copy these immutable string values into an owned
+	// slice before the command can run alongside later row edits or sorting.
+	beads := make([]correlation.BeadInfo, len(m.issues))
+	for i := range m.issues {
+		beads[i] = correlation.BeadInfo{
+			ID:     m.issues[i].ID,
+			Title:  m.issues[i].Title,
+			Status: string(m.issues[i].Status),
+		}
+	}
 	cmd := loadCommand(
 		ctx,
-		m.issuesForAsync(),
+		beads,
 		m.beadsPath,
 		m.historyLoadDataGeneration,
 		m.historyLoadRequestGeneration,
@@ -1643,7 +1647,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	// Compute stats
 	cOpen, cReady, cBlocked, cClosed := 0, 0, 0, 0
 	readiness := analyzer.Readiness()
-	readyNow := time.Now()
+	readyNow := analyzer.Now()
 	for i := range issues {
 		issue := &issues[i]
 		if isClosedLikeStatus(issue.Status) {
@@ -2636,7 +2640,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Create new immutable snapshot with Phase 2 data (bv-b5q1)
 		ins := msg.Insights
-		if m.snapshot != nil {
+		if msg.prepared != nil || m.snapshot != nil {
 			newSnap := msg.prepared
 			if newSnap == nil {
 				newSnap = m.snapshot.WithPhase2(msg.Stats, ins, m.issues, m.analyzer)
@@ -2659,8 +2663,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.insightsPanel.SetSize(m.width, bodyHeight)
 		if m.snapshot != nil {
 			m.graphView.SetSnapshot(m.snapshot)
-		} else if msg.prepared != nil {
-			m.graphView.SetSnapshot(msg.prepared)
 		} else {
 			m.graphView.SetIssues(m.issues, &ins)
 		}
@@ -3034,7 +3036,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				filteredItems = make([]list.Item, 0, len(msg.Snapshot.ListItems))
 				filteredIssues = make([]model.Issue, 0, len(msg.Snapshot.ListItems))
-				filterNow := time.Now()
+				filterNow := m.analysisReferenceTime()
 
 				for _, item := range msg.Snapshot.ListItems {
 					issue := item.Issue
@@ -3392,7 +3394,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.countOpen, m.countReady, m.countBlocked, m.countClosed = 0, 0, 0, 0
 		readiness := m.analyzer.Readiness()
-		readyNow := time.Now()
+		readyNow := m.analysisReferenceTime()
 		for i := range m.issues {
 			issue := &m.issues[i]
 			if isClosedLikeStatus(issue.Status) {
@@ -7562,7 +7564,7 @@ func (m *Model) renderFooter() string {
 	activeCritical := 0
 	activeWarning := 0
 	for _, a := range m.alerts {
-		if !m.dismissedAlerts[alertKey(a)] {
+		if len(m.dismissedAlerts) == 0 || !m.dismissedAlerts[alertKey(a)] {
 			activeAlerts++
 			switch a.Severity {
 			case drift.SeverityCritical:
@@ -8105,6 +8107,16 @@ func (m *Model) refreshRecipeMetrics() {
 	}
 }
 
+// analysisReferenceTime keeps readiness and recipe projections consistent with
+// the snapshot's counts and triage, even if a deferral expires while it is shown.
+// A newly loaded snapshot advances the reference instant with its analyzer.
+func (m *Model) analysisReferenceTime() time.Time {
+	if m.analyzer != nil {
+		return m.analyzer.Now()
+	}
+	return time.Now()
+}
+
 func (m *Model) matchesCurrentFilter(issue model.Issue, now time.Time) bool {
 	// Workspace repo filter (nil = all repos)
 	if m.workspaceMode && m.activeRepos != nil {
@@ -8138,7 +8150,7 @@ func (m *Model) matchesCurrentFilter(issue model.Issue, now time.Time) bool {
 
 func (m *Model) filteredIssuesForActiveView() []model.Issue {
 	filtered := make([]model.Issue, 0, len(m.issues))
-	filterNow := time.Now()
+	filterNow := m.analysisReferenceTime()
 	recipeFilterActive := m.activeRecipe != nil && strings.HasPrefix(m.currentFilter, "recipe:")
 	if recipeFilterActive {
 		for _, issue := range m.issues {
@@ -8209,7 +8221,7 @@ func (m *Model) refreshBoardAndGraphForCurrentFilter() {
 func (m *Model) applyFilter() {
 	var filteredItems []list.Item
 	var filteredIssues []model.Issue
-	filterNow := time.Now()
+	filterNow := m.analysisReferenceTime()
 
 	for _, issue := range m.issues {
 		if m.matchesCurrentFilter(issue, filterNow) {
@@ -8280,6 +8292,19 @@ func (m *Model) itemWithTriage(item IssueItem) IssueItem {
 func (m *Model) refreshListItemsPhase2() {
 	current := m.list.Items()
 	if len(current) == 0 {
+		return
+	}
+	if m.snapshot != nil && m.snapshot.IsPhase2Ready() &&
+		m.snapshotListGeneration != 0 && m.snapshotListGeneration == m.listDataGeneration &&
+		m.list.FilterState() == list.Unfiltered && len(m.snapshot.listModelItems) == len(current) {
+		// Every presentation mutation advances listDataGeneration. Only pristine
+		// snapshot rows can use the detached, already boxed Phase2 replacements.
+		selectedID := m.selectedListIssueID(false, "")
+		m.installSnapshotListItems(m.snapshot)
+		if index, ok := m.snapshot.listIndexByID[selectedID]; ok {
+			m.list.Select(index)
+		}
+		m.updateViewportContent()
 		return
 	}
 	items := append([]list.Item(nil), current...)
@@ -8398,7 +8423,7 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 		}
 		candidates = append(candidates, issue)
 	}
-	filteredIssues, err := applyRecipeToIssues(candidates, m.analyzer, m.analysis, m.triageScores, r, time.Now())
+	filteredIssues, err := applyRecipeToIssues(candidates, m.analyzer, m.analysis, m.triageScores, r, m.analysisReferenceTime())
 	if err != nil {
 		m.statusMsg = "Recipe: " + err.Error()
 		return
@@ -10223,14 +10248,16 @@ func computeAlerts(issues []model.Issue, stats *analysis.GraphStats, analyzer *a
 		ClosedCount:     closedCount,
 		BlockedCount:    blockedCount,
 		CycleCount:      len(stats.Cycles()),
-		ActionableCount: len(analyzer.GetActionableIssues()),
+		ActionableCount: analyzer.CountActionableIssues(),
 	}
 
 	bl := &baseline.Baseline{Stats: curStats}
 	cur := &baseline.Baseline{Stats: curStats, Cycles: stats.Cycles()}
 
 	calc := drift.NewCalculator(bl, cur, driftConfig)
+	calc.SetNow(analyzer.Now())
 	calc.SetIssues(issues)
+	calc.ReuseAnalyzer(analyzer)
 	result := calc.Calculate()
 
 	critical, warning, info := 0, 0, 0
