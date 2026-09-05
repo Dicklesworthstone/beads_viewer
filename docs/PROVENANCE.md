@@ -1,4 +1,44 @@
-# Vendored asset provenance
+# Vendored source and asset provenance
+
+## Go source patches
+
+The vendored `github.com/charmbracelet/glamour` v1.0.0 contains a local
+patch in `ansi/elements.go`: fenced and indented code blocks append their
+logical line segments to a `strings.Builder`. The upstream growing-string
+loop copied every preceding line again, making long dependency trees expensive
+to render. Segment padding, synthetic final newlines, language selection and
+rendering remain unchanged. The upstream version and license are unchanged.
+
+The vendored `github.com/alecthomas/chroma/v2` v2.24.1 also uses a
+`strings.Builder` in `coalesce.go` when merging adjacent tokens of the same
+type. It preserves the existing 8192-byte pre-append boundary, empty-token
+handling, token types and error propagation. Resetting the builder when a
+group is emitted keeps previously returned strings immutable.
+
+The vendored `github.com/muesli/reflow` v0.3.0 measures each already decoded
+rune directly in `padding/padding.go`, avoiding a temporary single-rune string.
+All valid Unicode scalar values were checked against the previous operation
+under all four East Asian/emoji width settings. Existing writer output, chunk
+handling and downstream errors were compared exactly, including malformed UTF-8
+and terminal escape sequences.
+
+`pkg/ui/markdown_test.go` checks actual parsed blocks, padded segments, complete
+content, token boundaries, scalar widths and allocation bounds. The original
+operations fail their respective bounds for both block types, a real plaintext
+lexer and a Unicode padding writer. The two builder patches were each compared
+against their originals on 256 common-input rendering records. The padding
+change was checked on 248 common-input records and four actual detail frames,
+including dense trees, with both builder patches enabled on both sides. These
+comparisons retain complete raw ANSI output.
+
+These patches apply to builds using this checkout's vendor directory,
+including the Nix build. `go mod vendor` replaces them, so review and reapply
+them until upstream versions include the fixes. Version-suffixed
+[`go install`](https://go.dev/ref/mod#go-install) ignores vendored dependencies;
+those installations do not include these optimizations. No timing claim for a
+vendored build applies automatically to them.
+
+## Dashboard assets
 
 The static dashboard that `bv --export-pages` produces ships a set of
 third-party JavaScript libraries, two WebAssembly modules, and two fonts from

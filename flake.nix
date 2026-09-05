@@ -35,6 +35,11 @@
 
             subPackages = [ "cmd/bv" ];
 
+            # CLI tests create isolated Git repositories and configure checkout
+            # trust. Declare Git in the test environment instead of relying on
+            # a host installation outside the Nix sandbox.
+            nativeCheckInputs = [ pkgs.gitMinimal ];
+
             ldflags = [
               "-s"
               "-w"

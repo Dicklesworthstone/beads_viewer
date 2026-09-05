@@ -1,9 +1,288 @@
 # Bridge Plan: beads_viewer (bv)
 
-## Current reality check — 2026-09-04
+## Current reality check — 2026-09-05
 
-This section supersedes the September 1 baseline and September 2–3 rescore below.
-Those records are retained as history, not as the current backlog or verdict.
+This is the rescore after the implementation and independent verification campaign.
+The complete September 4 assessment and earlier records remain below as historical
+baselines. Their defect descriptions and task statuses are not the current verdict.
+
+**Source boundary:** `main` at `7393a06b48388a1aecca895557888281b6e3d4e2`, with
+uncommitted implementation, test, documentation and asset changes. This assesses
+that working tree and the explicitly identified earlier test snapshots, not a new
+published release. The 34 campaign beads currently comprise **24 closed, seven
+open and three blocked**. The 10 remaining items include three epics and the final
+verification task; they are not 10 independent product defects.
+Neither these counts nor the status table imply a percentage of product completion.
+
+### Answers to the five reality-check questions
+
+1. **What works now:** the previously disconnected scope, dependency-authority,
+   source-diagnostic and recipe paths now have real consumers and independent
+   positive and negative tests. Empty scopes stay empty; context records cannot
+   become selected work; known closed and tombstoned predecessors remain available
+   to establish readiness. Recipes control actual TUI presentation and reports.
+   Browser journeys, judged keyword retrieval, asset-source correspondence, release
+   gate enforcement, and native Linux/Windows installer subsets have concrete proof.
+   The original reference-host responsiveness matrix and independent raw review
+   also pass, with CLI regressions and memory costs explicitly retained.
+2. **What still does not meet the vision:** installed `br --claim` can reopen a
+   stale closed issue, the native platform matrix is incomplete, and no clean
+   packaged release contains all these changes.
+   Search has a useful fixed evaluation, not human-reviewed field-quality evidence.
+   Documentation has verified examples but still awaits the final capability freeze.
+3. **What is blocking completion:** S5 needs an authorized, fixed live tracker;
+   V5 needs actual unavailable native targets and completion of the distribution
+   checks. The final source must then
+   be frozen and pass the bound release gate. None can be replaced by more reports,
+   cross-compilation, a loading frame, or an external draft's green tests.
+4. **Would the remaining beads finish the accepted vision?** They cover the known
+   residuals of the deliberately narrowed product, provided their original positive
+   acceptance criteria pass. Their closure alone would not establish learned semantic
+   search, calibrated forecasts, all-browser support or universal 60fps. Those were
+   never demonstrated by this campaign and are not silently counted as delivered.
+5. **Which known goals lack active coverage?** None of the identified residuals is
+   `NO_BEAD`: P1 covers responsiveness, S5 live action safety, V5 native delivery,
+   P2 final documentation, and `bv-oonu.11` the final source/package check and rescore.
+   The latest startup handoff defect was corrected within the existing P1 work.
+
+### Rescored vision: all 42 original rows
+
+`WORKING` means the stated path has implementation and relevant execution evidence,
+within the limits recorded here. `PARTIAL` retains a known implementation or proof
+gap. A closed pair refers to its original bounded acceptance; it does not make an
+entire platform, external service, or release proven. Original documentation sources
+for each numbered goal are retained in the September 4 table below.
+
+| # | Original testable goal | Current status | Current evidence and remaining limit |
+|---|---|---|---|
+| 1 | Read current br and legacy JSONL | WORKING | Loader/datasource and actual CLI paths pass; both issue filenames remain supported. |
+| 2 | Tolerate BOM/CRLF, large lines and malformed records | WORKING | Parser controls remain; S4 counts record loss and makes incomplete authority visible. Concurrent append/replacement retries preserve the identity guard and persistent-error reporting. |
+| 3 | Select issue sources; explicit DB, redirects and worktrees | WORKING | Actual source-routing and explicit database tests pass, including namespaced/local IDs and native Windows SQLite paths. Native target limits remain row 39. |
+| 4 | Aggregate workspaces with namespaces and collision checks | WORKING | S4 preserves per-source results, closed/tombstone authority and cross-repository dependencies; collisions fail. Partial loads retain exploratory output with diagnostics and no proven claims. |
+| 5 | Immediate degree/topology/density and asynchronous expensive metrics | WORKING | Graph analysis and metric-state tests pass. The newly found initial prepared-result handoff is fixed and included in the latest full UI race run; no universal timing bound follows. |
+| 6 | PageRank, betweenness, HITS, eigenvector and critical path | WORKING | Algorithms, invariance controls and ordinary suites pass. Configured approximation, skips and timeouts remain visible; exactness is not promised for approximate metrics. |
+| 7 | Cycles, k-core, articulation points and slack | WORKING | Actual graph paths and controls pass. Cycle output remains representative SCC cycles, not enumeration of every simple cycle. |
+| 8 | Repeatable analysis with visible computation status | WORKING | Canonical hash old/current parity, scoped ranking identity and fixed-clock controls pass. Generated times, elapsed durations and configured approximation retain their documented meanings. |
+| 9 | Rank ordinary work and explain recommendations | WORKING | Triage/priority paths retain positive recommendation tests; scoped candidates and provisional source authority are explicit. Scores remain heuristics. |
+| 10 | Safe ready queue, parallel tracks and unblock counts | WORKING | S3 tests parent inheritance, unknown blockers, closed/tombstone predecessors, scoped context, deferral boundaries and actual reload. Computational readiness is distinct from safe execution of an external claim (row 11). |
+| 11 | `--robot-next` emits only justified next actions | PARTIAL | Typed origin-bound routes and historical/partial/unknown refusals work. Installed br still reopens stale closed work during claim; the unchanged required live test remains red (S5). |
+| 12 | Feedback changes rankings and reset restores defaults | WORKING | Existing feedback and correlation tests remain in the completed ordinary suites; no new learning/calibration claim. |
+| 13 | Issue-backed robots share truthful source/scope metadata | WORKING | S4 envelopes reach search, briefs, graphs, reports and watch/export callbacks. Malformed SQLite rows/edges, failed workspace sources and stale data cannot silently claim complete authority. |
+| 14 | Label/repo/recipe scopes compose without widening | WORKING | S1–S3 actual CLI controls preserve empty intersections, eligible-before-top-k search and full dependency context. TUI ready/recipe/triage consumers exclude context-only candidates after reload. |
+| 15 | Time travel and diff compare intended snapshots | WORKING | Actual historical/scoped paths pass; historical actions are withheld. Declared live-history and sprint exceptions remain explicit. |
+| 16 | Discoverable help, capabilities, schema and formats | WORKING | Actual schema controls include non-actionable next output, typed commands and source diagnostics; registry/help and format tests pass. Schema validity alone is not action safety. |
+| 17 | TOON without universal savings claims | WORKING | Existing encoding/format controls pass; payload-dependent size tradeoffs remain documented. |
+| 18 | Recipe precedence, filtering and metric sort | WORKING | Shared `recipe.Apply` drives initial/reloaded TUI and report selection; full-authority readiness, ordering, caps and explicit overrides have actual-path tests. |
+| 19 | Recipe columns, grouping, metrics and initial presentation | WORKING | P3 independently verified Unicode columns, groups, collapse/reveal, selection and cross-view navigation. Actual PTY recipe selection can recover initially excluded backlog work. |
+| 20 | Recipe export format, graph inclusion and templates | WORKING | P4 actual Markdown/JSON/CSV/Mermaid reports, template resolution, graph options, hooks and override tests pass. Rendered-output controls preserve literal issue data and intentional template Markdown. |
+| 21 | Hashed text retrieval plus configurable graph ranking | WORKING | S2 keeps eligible candidates before limits, raw text thresholds before boosts, exact-ID behavior and full-source index identity. This remains keyword hashing, not learned semantic embeddings. |
+| 22 | Useful search quality at scale | PARTIAL | P5 now has frozen reasoned judgments and 600 actual CLI observations across three sizes and five configurations, independently replayed. Prefix ranking defects improved; human review and real-workload generalization remain unproven. |
+| 23 | Git history through three correlation strategies | WORKING | Co-commit, explicit-ID and temporal paths plus feedback remain implemented and tested. Evidence confidence remains heuristic. |
+| 24 | Orphans, file relations, related issues and impact networks | WORKING | Existing extractors, indexes, network tests and ordinary CLI paths pass; no calibrated prediction claim. |
+| 25 | Sprints, burndown, scope changes and risk | WORKING | Sprint and scoped burndown paths remain covered; declared historical sprint limitations remain. |
+| 26 | Forecast and capacity as documented heuristics | WORKING | Actual documented explicit-estimate and missing-estimate examples now match hand-computed outputs. This is not a scheduler or a calibrated confidence interval. |
+| 27 | Label health, cross-label flow and attention | WORKING | Existing analysis/views and robot paths retain tests; full authority and selected-candidate scope are preserved. |
+| 28 | Alerts, baselines and hygiene suggestions | WORKING | Actual seven-case alerts regression proves shared authority, scope and clock. Typed hygiene actions have real isolated mutation/readback positives, including legacy-cycle repair; installed claim safety remains separately red. |
+| 29 | Responsive list/detail, board/tree/graph/insights navigation | WORKING | Actual navigation, rendered content and full UI race tests pass. Prepared-row reuse, compact dependency details and detached history input have completed the original repeated acceptance matrix and independent raw review. Timing scope remains the measured list/detail paths and reference host. |
+| 30 | Live reload, background snapshots and stale-result rejection | WORKING | Scope/authority hashes, hidden-row changes, append/rename retries, force-refresh clock, cancellation and stale-result controls pass. Latest full UI race includes startup prepared-analysis delivery; performance is row 41. |
+| 31 | Tutorial, help, sidebar and cass | WORKING | Existing UI and integration paths remain; actual external cass availability is environmental, not established on every host. |
+| 32 | Markdown/Mermaid/SVG/PNG and standalone graph exports | WORKING | Report/graph/export paths pass; source diagnostics and exact payload timestamps survive export. Live action routes have the S5 limit. |
+| 33 | SQLite FTS5 dashboard bundle and assets | WORKING | Native exported database, issue/edge readback and assets are tested. Browser SQL lacks FTS5 and uses the disclosed candidate fallback; native FTS5 is not browser FTS5 proof. |
+| 34 | Offline/mobile dashboard search, graph and persistence | WORKING | V4 used actual Chromium desktop and 360px viewport journeys, stopped-server offline reload, graph/search and persistence, with missing/corrupt asset negatives. Physical phones, Safari and every browser remain untested. |
+| 35 | Hooks, failure propagation and browser opt-out | WORKING | Actual report/hook ordering, failure paths and browser opt-out tests pass. Browser automation was separately explicit, not silently launched by ordinary tests. |
+| 36 | Verified updater and versioned downloads | WORKING | Native Linux amd64 and Windows x64 install/update/no-update paths and corrupt/wrong-version preservation controls pass. Remaining native/distribution scope is row 39. |
+| 37 | Release bytes correspond to a fully checked source commit | PARTIAL | V1 now rejects skipped/missing/dirty evidence and binds real package bytes to source. This dirty working tree has no completed clean packaged gate or new published artifact. |
+| 38 | Vendored assets correspond to reviewed source | WORKING | V2 rebuilds graph WASM/glue with the pinned pipeline and checks source/output identity plus graph parity. Local Go rendering patches have explicit provenance and do not reach version-suffixed `go install`; see limits below. |
+| 39 | Supported Windows/macOS/Linux installation and upgrades | PARTIAL | Native Linux amd64, Windows x64 and isolated Linux amd64 Nix subsets pass. Native macOS amd64/arm64, Linux ARM64 and remaining distribution checks are outstanding (V5). |
+| 40 | Dependable local/remote release verification | PARTIAL | V3 isolation/trust/ancestor/editor controls pass. Latest local and fresh-source RCH suites each pass all 29 packages with the isolated fixed tracker; their 36 and 56 skips remain explicit. Installed-br suites retain the stale-claim failure, and the clean packaged gate is not complete. |
+| 41 | 10k+ browsing and the advertised frame-rate experience | WORKING | The full 1k/5k/10k reference-host matrix passes: 144 current UI cohorts, 144,000 observations, worst cohort p99 30.862ms and maximum snapshot/Phase 2 handlers 12.255/19.050ms. Independent review retains 57.616ms individual interactions, configured degradation and extra unpaired generations. This does not establish terminal paint, universal 60fps or behavior beyond the measured workloads. |
+| 42 | Reference docs/examples match running behavior | PARTIAL | Actual copied YAML, jq, forecast, key-dispatch and configured-threshold examples pass. P2 remains blocked until final performance, live-action and native-delivery claims can be settled. |
+
+### Evidence that changes the verdict, and its boundaries
+
+- **Scope and readiness (S1–S4):** independent closures cover positive selected
+  work alongside excluded/unknown/blocked near-neighbors, rather than refusal-only
+  output. Full source authority is retained before display filtering, including
+  huge-tier reloads. The TUI uses a snapshot clock; it does not claim an idle timer
+  automatically expires deferrals. Ctrl+R/F5 obtains a fresh clock even when source
+  bytes are unchanged. S3 was reopened when missed consumers were found and closed
+  only after new real CLI/UI controls and independent re-execution.
+- **Complete suites with the installed tracker:** both local and RCH runs used actual Go
+  1.25.5 and the original default 10-minute timeout. Their 4,176-file source manifest
+  was `17888d94a145a003dd540e8c68f6978a0bc468d7d7a767df16b0fcaaa7c01664`.
+  Both had 28 passing packages and E2E failing only the required stale-closed claim
+  child and its parent. Local: 6,905 passes, 36 skips, two failures; remote: 6,892
+  passes, 49 skips, two failures. All 600 relevance observations completed. Four
+  previously skipped sample tests then passed against the real 51-row sample;
+  other optional/native skips remain untested. Earlier remote timeouts and wrong
+  toolchain observations were retained, not relabeled green.
+- **Changes after that full-suite snapshot:** the latest actual Go 1.25.5 full UI
+  race run includes initial prepared-analysis delivery, all three vendored rendering
+  fixes, compact dependency details, prepared-row reuse and detached history input:
+  1,019 top-level passes, 1,983 passes including children, eight existing skips,
+  zero failures, 111.455 seconds. Source hashes
+  remained unchanged. Build and vet pass; formatting retains only the 49 pre-existing
+  vendor findings, with none in first-party or edited files. This is not a new full
+  `go test ./...` or packaged gate.
+- **Latest full source suite with the isolated tracker fix:** actual Go 1.25.5 on
+  RCH worker `vmi1156319` passes all 29 packages: 7,016 tests pass, 56 skip and none
+  fail; E2E takes 451.226 seconds under the unchanged default Go timeout. The clean
+  source overlay is bound to `7393a06b` with fingerprint
+  `d01c66e8ed508413f3fed8738c8ce1b23707c07a758949385d7085123da34042`.
+  This run uses the isolated draft br through a scoped PATH; the installed tracker
+  is unchanged. A preceding fresh-archive run exposed an export-size test that
+  incorrectly required Git history. Its correction records unavailable history
+  as null only when local Git metadata is absent and the actual export warns.
+  Git-present missing history and all other required assets remain failures;
+  the actual repository measurement and 25% bundle-growth limit are unchanged.
+  Four real export cases pass, and a deliberately omitted Git-backed history
+  artifact still fails. One conditional Phase 2 transition test skipped because
+  analysis had already completed; other platform, prerequisite and opt-in skips
+  remain unproven. This is a source-suite pass, not an installed-tracker or packaged
+  release pass.
+- **Latest separate local source suite:** actual Go 1.25.5 on `hetzner1` passes
+  all 29 packages: 7,036 tests pass, 36 skip and none fail; E2E takes 246.512
+  seconds under the unchanged default timeout. All 4,193 source files and the
+  issue export remain identical before and after the run. The exact same draft
+  tracker bytes are used through a scoped PATH, without changing installed br.
+  All 14 real action-route cases, all 600 judged relevance observations and the
+  real Git-backed repository export-size check pass. Root independently recounts
+  the raw log and checks the source identities. Platform, optional-performance,
+  missing-prerequisite and conditional asynchronous-transition skips are retained;
+  this local result does not replace the separate RCH environment or package gate.
+- **Search and recipes (P3–P5):** independent reviewers replayed real CLI/PTY
+  consumers and rendered report output. P5's judgments were agent-authored and
+  frozen before ranking, with six tuning and 34 evaluation queries. Independent
+  checks reconciled all 1,200 before/after observations; only 22 of 600 result arrays
+  changed and the other 578 stayed identical. No-match cases, misses and synthetic
+  distractor limits remain reported. These are not human-reviewed judgments.
+- **Browser and asset proof (V2/V4):** pinned graph-WASM builds and source checks
+  pass; actual Chromium journeys exercise the exported bundle, offline reload and
+  update failures. Browser search uses substring candidates followed by the real
+  JavaScript hybrid scorer. Neither native SQLite FTS5 nor a narrow viewport proves
+  browser FTS5, Safari or a physical mobile device. CSP `unsafe-eval` and the lack of
+  independent Rust compiler archive-digest verification remain documented limits.
+- **Native subset (V5):** actual Linux/Windows installers preserve existing binaries
+  on corrupt and wrong-version input; native Windows SQLite special-character
+  paths work. The isolated Nix build completed its configured `cmd/bv` checks
+  (112.638 seconds), then version/capabilities and a hand-checked dependency fixture
+  passed independently. That Nix run is not the full Go suite and predates the latest
+  rendering/startup edits. Missing macOS and Linux ARM64 runs cannot be substituted
+  with cross-builds or emulation. Recorded store-version drift still needs final
+  checking; no store publication or host profile modification was performed.
+- **External tracker draft (S5):** installed br remains unsafe at the atomic claim
+  boundary. A fix exists only in an owned external `beads_rust` copy: transactional
+  closed-state rejection plus a closed/tombstone CAS exclusion. Four real regressions
+  fail the original and pass the draft; an independent run checked 13 actual claim
+  tests. The unchanged bv live-route test then passed all 14 children against the
+  draft using scoped PATH and `RUST_LOG=error`, including closed-state readback.
+  Root independently reran all 14 live-route cases successfully against that
+  same draft, including competing claims and the stale-claim rejection.
+  Initial source-receipt, build-resource and default-debug-output failures remain
+  recorded. No upstream source or installed br was changed, so S5 stays blocked.
+- **Rendering/performance (P1):** profile-driven allocation fixes and compact
+  dependency details preserve frozen decisions; the original full acceptance and
+  independent proof are complete. Rejected
+  Glamour v2, unsafe padding-style shortcuts and ineffective rune-buffer experiments
+  were not adopted to manufacture a win. The compact-tree, same-host dense
+  1,000-issue pair used 200 navigation messages per side. Median latency changed
+  from 64.4 to 16.6 ms and p99 from 81.0 to 25.9 ms. Allocated bytes fell from
+  3.16 to 0.77 GB; peak resident memory increased from 448,168 to 461,204 KiB.
+  All 24 non-resource comparison fields matched. Compact references intentionally
+  change tree presentation: independent graph checks retain every bounded typed
+  edge, and 24 actual UI captures preserve raw body/analysis prefixes while showing
+  references and cycle metadata. Dense detail has 301 rows for 300 typed edges,
+  replacing 1,885 repeated path occurrences; small trees need not shrink.
+  Across all six workloads, three sizes and navigation/refresh modes, 35 of 36
+  current diagnostic cells pass. Unicode10k refresh has interaction p99 39.5 ms
+  but a 56.5 ms Phase 2 handler, which fails the separate unchanged 50 ms bound.
+  A distinct instrumented run also fails snapshot delivery at 61.7 ms; its profile
+  points to UI-thread list rebuilding and history-input copying. The next changes
+  reuse prepared rows only when presentation is unchanged, and capture only the
+  owned ID/title/status values required by history loading. Allocation regressions
+  change from 1,078 to 56 allocations for row refresh and from 44,271 to four for
+  the 10k history capture. Real Git correlation output, selection, changed-list
+  fallbacks, cancellation and stale-result controls pass. One new same-host
+  Unicode10k refresh pair retains the original 200-message diagnostic and 50 ms
+  gates. Before: snapshot handler 56.2 ms, a failure. After: maximum snapshot
+  handler 10.5 ms, maximum Phase 2 handler 4.6 ms, interaction p99 31.2 ms, all
+  passing. Root independently recomputed the raw samples and verified 20 static
+  fields plus exact decisions, order and metric states for common generations
+  one through six. The new side's seventh completion is explicitly unpaired.
+  Total allocation increased from 3.31 to 3.57 GB with that extra completion,
+  and peak resident memory increased from 1,367,800 to 1,368,980 KiB; the isolated
+  capture reduction is not a total-memory improvement claim. The earlier 7,200
+  diagnostic messages and this pair are not the default repeated full matrix.
+  The unchanged original runner completed in 2h41m25s with exit zero. All 288 UI
+  cohorts and 288,000 observations are retained; all four current passes meet the
+  36 workload/size/mode gates at 1,000 samples each. Worst current cohort p99 is
+  30.862 ms, maximum snapshot delivery 12.255 ms and maximum Phase 2 handler
+  19.050 ms. Individual current interactions reach 57.616 ms. The final baseline
+  dense10k snapshot handler takes 54.978 ms and fails its bound; that failure is
+  retained. Actual refresh completions number 547 baseline and 555 current,
+  with eight pairs containing additional unpaired generations. Aggregate measured
+  UI allocation rises from 813.09 to 817.51 GB; whole-run peak resident memory is
+  1,963,168 KiB. These are not aggregate-memory improvement or memory-cap claims.
+  All 14,400 timed CLI outputs preserve ordered decisions, readiness and metric
+  states. The separate 144 fixed-clock outputs preserve complete JSON except the
+  named elapsed fields. CLI tails remain mixed: 22 of 36 current p99s are slower,
+  including dense10k warm at 1,478.982 ms versus baseline 908.890 ms.
+  Root independently re-executed the unchanged verifier and separately read every
+  UI record and CLI output, including all 72 warmups. Raw quantiles, 20 static UI
+  fields, all common-generation decisions/order/states, actual fixture bytes and
+  counts, full fixed-clock JSON, four executable hashes and 499 transferred
+  receipts match. All 4,193 measured source files remained unchanged. The only
+  later Go-source difference is the separately verified export-history test fix;
+  production and performance-harness bytes match the measured source. This baseline
+  already includes compact
+  dependency trees; the current side adds prepared-row reuse and detached history
+  input. The CLI cohorts exercise `--robot-triage`, so this comparison does not
+  establish a cumulative pre-campaign speedup or a search-speed improvement.
+  Current vendored code-block assembly, token coalescing and rune-width fixes are
+  documented in [PROVENANCE.md](../PROVENANCE.md). `go mod vendor` replaces local patches and
+  version-suffixed `go install` ignores them; there is no module-install performance
+  claim. Microbenchmarks and terminal-string captures do not prove native-terminal
+  fidelity or the complete latency matrix.
+
+The durable detailed evidence is in the existing implementation/proof bead pairs.
+Useful raw records include `/tmp/bv-v3-final-integration-uIIMTj/`,
+`/tmp/bv-reality-20260904-jfGFtf/`,
+`/data/tmp/bv-work-20260905/delivery-reuse-full-ui-race.log`,
+`/data/tmp/bv-work-20260905/current-source-all-history-contract-fixed-summary.json`,
+`/data/tmp/bv-local-full-draft.KWs1Iz/`,
+`/data/tmp/bv-p1-compact-tree-xhljkheq/`,
+`/data/tmp/bv-p1-delivery-reuse-f7ee178h/`, and the external draft
+patch/tests/logs under `/data/tmp/bv-br-stale-claim.gy0W2L/`. These temporary paths
+are session evidence, not distributable release attestations. Assertions from older
+snapshots are bounded to those snapshots; a hash or a written report is not itself
+a successful behavior test.
+
+The complete P1 handoff is under
+`/data/tmp/bv-p1-delivery-reuse-f7ee178h/full-matrix-final/`; independent raw and
+identity reviews are under `/data/tmp/bv-full-matrix-root.8GEc7G/`. The full raw
+matrix remains on `hz3` at
+`/data/tmp/bv-p1-delivery-reuse.S5eOf9eR/full-latency-default/`.
+
+### Remaining work in the existing beads
+
+| Work | Current state | Concrete completion still required |
+|---|---|---|
+| S5: `bv-xbvo.9` / `.10` | Blocked / open | Authorization and application of the reviewed external tracker fix, then independent real live tracker claim/close-race and bv route proof. Retain ordinary claim positives; no draft-only closure. |
+| V5: `bv-oonu.9` / `.10` | Blocked / open | Obtain native macOS amd64/arm64 and Linux ARM64 execution plus remaining distribution evidence. Recheck affected current-source build paths; no substitute-platform credit. |
+| P2: `bv-apal.3` / `.4` | Blocked / open | Performance claims now have complete evidence. Reconcile final supported capabilities, limits and examples after S5/V5 settle; independently verify the resulting claims. Existing corrected examples need no process-only rewrite. |
+| Epics `bv-xbvo`, `bv-oonu`, `bv-apal`; final `bv-oonu.11` | Open | Complete their original child acceptance, review final source changes, run the clean source-bound packaged gate and independently verify it. This rescore completes only the report portion of the final task. |
+
+Work should proceed on those actual blockers, with small measured fixes and the
+existing tests. No new feature campaign, duplicate task graph, closure audit loop
+or replacement report is needed. The source freeze and release gate come after
+the capabilities work; neither a dirty-tree override nor skipped verification may
+convert the remaining red or unavailable evidence into completion.
+
+## Assessment baseline — 2026-09-04
+
+This is the original September 4 assessment, preserved separately from the current
+rescore above. It superseded the September 1–3 records at that time; its statuses,
+reproductions and then-new backlog describe that baseline, not today's verdict.
 
 **Assessment baseline:** clean `main`, `a90029b8`; Go 1.25.5; 615 closed beads,
 zero open and zero in progress before this audit. The released `v0.23.0` tag is

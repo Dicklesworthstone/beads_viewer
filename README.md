@@ -142,7 +142,7 @@ bv --robot-help
 At its heart, `bv` is about **viewing your work nicely**.
 
 ### ⚡ Fast, Fluid Browsing
-No web page loads, no heavy clients. `bv` starts instantly and lets you fly through your issue backlog using standard Vim keys (`j`/`k`).
+Browse your issue backlog in the terminal using standard Vim keys (`j`/`k`). Startup and navigation time depend on the workload; measured limits are described under Performance.
 *   **Split-View Dashboard:** On wider screens, see your list on the left and full details on the right.
 *   **Markdown Rendering:** Issue descriptions, comments, and notes are beautifully rendered with syntax highlighting, headers, and lists.
 *   **Keyboard Filtering:** Press `o` for Open, `c` for Closed, or `r` for Ready (unblocked) tasks.
@@ -153,6 +153,7 @@ Don't just read the title. `bv` gives you the full picture:
 *   **Comments & History:** Scroll through the full conversation history of any task.
 *   **Metadata:** Instantly see Assignees, Labels, Priority badges, and creation dates.
 *   **Search:** Powerful fuzzy search (`/`) finds issues by ID, title, or content instantly.
+*   **Dependency Details:** The detail pane shows dependencies up to three edges from the selected issue. Each issue's dependencies appear once along a shortest path; other occurrences say `(reference: shown elsewhere)`. Every relationship within that limit retains its type and target metadata. Cycle-closing edges carry a separate `(cycle)` marker.
 
 ### 🎯 Focused Workflows
 *   **Kanban Board:** Press `b` to switch to a columnar view (Open, In Progress, Blocked, Closed) to visualize flow.
@@ -626,11 +627,11 @@ flowchart LR
     *   `> 140 cols`: **Ultra-Wide**. Label tags are added to each row.
 *   **Padding Awareness:** The layout engine explicitly accounts for borders (2 chars) and padding (2 chars) to prevent "off-by-one" wrapping errors that plague many TUIs.
 
-### 2. Zero-Latency Virtualization
-Rendering 10,000 issues would choke a naive terminal app. `bv` implements **Viewport Virtualization**:
+### 2. Viewport Virtualization
+`bv` limits list rendering to visible rows, including when browsing 10,000 issues:
 *   **Windowing:** We only render the slice of rows currently visible in the terminal window.
-*   **Pre-Computation:** Graph metrics (PageRank, etc.) are computed *once* at startup in a separate goroutine, not on every frame. The underlying graph uses a compact adjacency-list implementation that's 50-100× faster than naive map-backed approaches.
-*   **Detail Caching:** The Markdown renderer is instantiated lazily and reused, avoiding expensive regex recompilation.
+*   **Pre-Computation:** Expensive graph metrics are computed asynchronously at startup and when source snapshots change. Navigation reuses the completed results.
+*   **Detail Caching:** The Markdown renderer is reused. It can retain the last exact render within a 512 KiB input/output budget; selecting a different issue renders its actual details. Virtualizing the list does not eliminate the cost of rendering long details or analyzing a large graph.
 
 ### 3. Visual Graph Engine (`pkg/ui/graph.go`)
 We built a custom 2D ASCII/Unicode rendering engine from scratch to visualize the dependency graph.
@@ -3815,7 +3816,7 @@ In complex software projects, tasks are not isolated. They are deeply interconne
 `bv` is engineered for speed. We believe that latency is the enemy of flow.
 
 *   **Startup Time:** about 20 ms of graph analysis (`bv --profile-startup`) for this repository's 611 issues. Wall time per robot command on the shared reference VM (AMD EPYC-Milan, Go 1.25) is 40-50 ms for `bv --version`, roughly 180-250 ms for `--robot-next`, `--robot-triage`, and `--robot-insights` with warm caches, and 500-700 ms for a first cold run; the per-command numbers are recorded by `scripts/robot_smoke.sh` in `tests/artifacts/perf/robot_wall.json` (single cold run per command). Engine benchmarks (`BenchmarkRealData_*`: full triage 1.2 ms, graph build 0.7 ms, exact full analysis 43 ms) are in `tests/artifacts/perf/analysis_bench.md`, and dashboard bundle sizes in `tests/artifacts/perf/pages_load.json`. All of these are point measurements on a shared machine. Regressions are caught by release-gate stage 8: `scripts/benchmark.sh compare` runs ten tracked benchmarks against the frozen `tests/testdata/benchmark/medium.jsonl` dataset and fails when any benchmark's best observed `ns/op` is more than 20% above a fresh, interleaved run of the baseline commit on the same machine (`benchmarks/baseline.txt` records that commit, the machine, Go version, and dataset hash, and is the fallback when the commit is not in the clone).
-*   **Rendering:** [Bubble Tea](https://github.com/charmbracelet/bubbletea) drives the UI. The 16.67 ms frame target and the reference-host 50 ms p99 interaction SLO are distinct. `Update` + `View` measurements cover event handling and string rendering; they do not measure physical terminal paint.
+*   **Rendering:** [Bubble Tea](https://github.com/charmbracelet/bubbletea) drives the UI. The 16.67 ms frame target and the reference-host 50 ms p99 interaction SLO are distinct. The September 5 source verification passed all 144 current-code UI cohorts, with a worst cohort p99 of 30.9 ms; [the performance guide](docs/performance.md#september-5-2026-source-verification) records the source, workloads and limits. `Update` + `View` measurements cover event handling and string rendering; they do not measure physical terminal paint.
 *   **Virtualization:** List and Markdown views render visible windows. Frozen 1k/5k/10k workloads exercise navigation, Unicode text, dense/cyclic dependencies, and concurrent snapshot refresh. This is test coverage, not a guarantee of lag-free operation or bounded RAM on every host; inspect the retained distributions and metric states described in [the performance guide](docs/performance.md).
 *   **Graph Compute:** A two-phase analyzer computes topo/degree/density instantly, then PageRank/Betweenness/HITS/Critical Path/Cycles asynchronously with size-aware timeouts.
 *   **Caching:** Repeated analyses reuse hashed results automatically, avoiding recomputation when the bead graph hasn’t changed.
