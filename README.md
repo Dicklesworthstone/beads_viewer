@@ -130,7 +130,7 @@ bv --robot-help
 `bv` is a high-performance **Terminal User Interface (TUI)** for browsing and managing tasks in projects that use the **Beads** issue tracking system. 
 
 **Why you'd care:**
-*   **Speed:** Browse thousands of issues instantly with zero network latency.
+*   **Local browsing:** Browse thousands of issues without a network round trip. Response time depends on the graph, selected view, and host.
 *   **Focus:** Stay in your terminal and use Vim-style keys (`j`/`k`) to navigate.
 *   **Intelligence:** It visualizes your project as a **dependency graph**, automatically highlighting bottlenecks, cycles, and critical paths that traditional list-based trackers miss.
 *   **AI-Ready:** It provides structured, pre-computed insights for AI coding agents, acting as a "brain" for your project's task management.
@@ -145,7 +145,7 @@ At its heart, `bv` is about **viewing your work nicely**.
 No web page loads, no heavy clients. `bv` starts instantly and lets you fly through your issue backlog using standard Vim keys (`j`/`k`).
 *   **Split-View Dashboard:** On wider screens, see your list on the left and full details on the right.
 *   **Markdown Rendering:** Issue descriptions, comments, and notes are beautifully rendered with syntax highlighting, headers, and lists.
-*   **Instant Filtering:** Zero-latency filtering. Press `o` for Open, `c` for Closed, or `r` for Ready (unblocked) tasks.
+*   **Keyboard Filtering:** Press `o` for Open, `c` for Closed, or `r` for Ready (unblocked) tasks.
 *   **Live Reload:** Watches the active Beads JSONL file and refreshes lists, details, and insights automatically when the file changes—no restart needed.
 
 ### 🔎 Rich Context
@@ -200,7 +200,7 @@ bv is a graph-aware triage engine for Beads projects. Instead of parsing .beads/
 
 #### The Workflow: Start With Triage
 
-**`bv --robot-triage` is your single entry point.** It returns everything you need in one call:
+**`bv --robot-triage` is your single entry point.** Its `triage` object contains:
 - `quick_ref`: at-a-glance counts + top 3 picks
 - `recommendations`: ranked actionable items with scores, reasons, unblock info
 - `quick_wins`: low-effort high-impact items
@@ -220,7 +220,7 @@ bv --robot-graph --format toon
 bv --robot-triage --format toon --stats
 ```
 
-Before claiming, verify current state with the selected tracker: `br show <id> --json`/`br ready --json` or `bd show <id> --json`/`bd ready --json`. `recommendations` can include graph-important blocked or assigned work; only `quick_ref.top_picks` and non-empty `claim_command` fields represent claimable work.
+Recommendations can include blocked or assigned work; `triage.quick_ref.top_picks` reflects snapshot readiness. A suggested action records its original local ID, working directory, and tracker route. Use that route rather than a namespaced display ID or an unrelated current directory. Inspect current tracker state before execution: analysis does not reserve work or guarantee that a later claim succeeds.
 
 #### Other bv Commands
 
@@ -588,7 +588,7 @@ The output is designed to be strictly typed and easily parseable by tools like `
 
 ## 🎨 TUI Engineering & Craftsmanship
 
-`bv` is built with the **Bubble Tea** framework, ensuring a glitch-free, 60fps experience. It features an adaptive layout engine that responds to terminal resize events and a custom ASCII/Unicode graph renderer.
+`bv` is built with the **Bubble Tea** framework. Its adaptive layout responds to terminal resize events, and its custom graph renderer supports ASCII and Unicode. A 60fps frame budget is a design target; actual interaction latency depends on the graph, view, terminal, and host.
 
 ```mermaid
 flowchart LR
@@ -602,7 +602,7 @@ flowchart LR
     GRAPH["🧮 Graph Engine<br/>PageRank · HITS · Cycles"]:::engine
     VIEWS["🖼️ Views<br/>List · Board · Graph · Tree · Insights"]:::ui
     LAYOUT["📐 Layout<br/>Mobile · Split · Wide"]:::ui
-    TERM["🖥️ Terminal<br/>60fps Output"]:::output
+    TERM["🖥️ Terminal<br/>Rendered Output"]:::output
 
     INPUT -->|tea.Msg| MODEL
     GRAPH -->|metrics| MODEL
@@ -785,7 +785,7 @@ For large projects, extract focused views around specific issues:
 
 ## 🌌 Interactive Graph Visualization (`--export-graph`)
 
-For deep exploration of complex dependency structures, `bv` generates **single-file HTML visualizations** powered by a force-directed graph engine. Unlike static exports, these are fully interactive—pan, zoom, filter, and drill into individual beads without any server. The only external reference in the file is a Google Fonts stylesheet link (Inter and JetBrains Mono); offline, the browser falls back to system fonts.
+For deep exploration of complex dependency structures, `bv` generates **single-file HTML visualizations** powered by a force-directed graph engine. Pan, zoom, filter, and drill into individual beads without a server. Scripts and styles are embedded, fonts use the system stack, and the standalone graph makes no external requests.
 
 ```bash
 # Generate interactive HTML graph
@@ -1029,31 +1029,82 @@ Recipes are loaded from four sources, later ones overriding earlier ones by name
 ```yaml
 # .bv/recipes.yaml
 recipes:
- sprint-review:
-  name: sprint-review
-  description: "Issues touched in the current sprint"
-
-filters:
-  status: [open, in_progress, closed]
-  updated_after: "14d"              # Relative time: 14 days ago
-  exclude_tags: [backlog, icebox]
-
-sort:
-  field: updated
-  direction: desc
-  secondary:
-    field: priority
-    direction: asc
-
-view:
-  columns: [id, title, status, priority, updated]
-  show_metrics: true
-  max_items: 50
-
-export:
-  format: markdown
-  include_graph: true
+  sprint-review:
+    name: sprint-review
+    description: "Issues touched in the current sprint"
+    filters:
+      status: [open, in_progress, closed]
+      updated_after: "14d"           # Relative time: 14 days ago
+      exclude_tags: [backlog, icebox]
+    sort:
+      field: updated
+      direction: desc
+      secondary:
+        field: priority
+        direction: asc
+    view:
+      columns: [id, title, status, priority, updated]
+      show_metrics: true
+      max_items: 50
+    export:
+      format: markdown
+      include_graph: true
 ```
+
+The TUI applies recipe filters, the complete sort chain, and `max_items` to its
+view while retaining the loaded issues for subsequent recipe changes. Custom
+presentation fields configure the existing list, details, and graph:
+
+| Field | Behavior |
+|-------|----------|
+| `view.columns` | Ordered columns: `id`, `title`, `status`, `priority`, `created`, `updated`, `tags`, `blockers`. Empty uses the ordinary adaptive row. |
+| `view.show_graph` | Opens the dependency graph when selecting the recipe. Later keyboard navigation is preserved across refreshes. |
+| `view.show_metrics` | Shows PageRank, impact, and triage values in rows and issue details. Unavailable metrics display an em dash in rows and `unavailable` in details. |
+| `metrics` | Selects displayed metrics and enables metric display: `pagerank`, `betweenness`, `impact`, `triage`, `hub`, `authority`, `eigenvector`, `kcore`, `slack`. |
+| `view.group_by` | Groups the list by `status`, `priority`, or `tag`; `none` disables groups. Tag grouping uses the first alphabetically sorted label, or `untagged`. |
+| `view.collapsed` | Starts groups collapsed. Enter or Space on a group expands/collapses it; search still includes collapsed issues. |
+| `view.truncate_title` | Maximum title display cells, including ellipsis; respects wide Unicode characters. Zero uses available width. |
+
+Grouping preserves recipe order within each group. A refresh keeps selected
+issue IDs and expanded groups; changing recipes resets recipe-owned grouping
+and display defaults. Narrow rows fit the available width, and full issue
+details remain accessible. Invalid columns, metrics, group names, and negative
+widths fail recipe validation.
+
+### Recipe exports
+
+Export settings take effect only with an explicit output request:
+
+```bash
+bv --recipe sprint-review --export review.md
+bv --recipe sprint-review --export review.json --export-format json
+bv --recipe sprint-review --export review.csv --export-format csv --export-include-graph=false
+bv --recipe sprint-review --export review.mmd --export-format mermaid
+```
+
+Explicit export flags override recipe defaults. Without either, the format is
+Markdown and graphs are included; CSV defaults to no graph. `--export-md PATH`
+explicitly selects Markdown. `--export-include-graph=false` disables a recipe
+graph, and `--export-template=` clears a recipe template. CSV with a graph,
+Mermaid without a graph, and custom templates for other formats are errors.
+Selecting a recipe for the TUI or robot analysis creates no export file.
+
+Report bodies retain recipe membership, ordering, and `max_items`. Graphs also
+include recursively referenced dependency context, without adding those issue
+bodies to the report. JSON reports preserve source completeness and provenance
+alongside selected issues and their verified action routes. An explicit
+`SOURCE_DATE_EPOCH` fixes the generation time for reproducible reports. Pre-export
+hooks run before writing; post-export hooks run afterward, including their
+configured failure policy.
+
+`export.template` and `--export-template PATH` read a Markdown template relative
+to the working directory. Templates receive `.Title`, `.GeneratedAt`, `.Issues`,
+and `.Graph` (Mermaid text when graphs are enabled). Each issue exposes `.ID`,
+`.Title`, `.Status`, `.IssueType`, `.Priority`, `.Description`, and `.Labels`.
+Issue text is escaped for literal Markdown/HTML display. Templates have no
+command, environment, filesystem, or issue-method access; missing fields and
+parse/render errors fail before writing. Template input is limited to 1 MiB
+and rendered output to 16 MiB.
 
 ### Filter Capabilities
 
@@ -1065,8 +1116,8 @@ export:
 | `exclude_tags` | Array | `[wontfix, duplicate]` |
 | `created_after` | Relative/ISO | `"7d"`, `"2w"`, `"2024-01-01"` |
 | `updated_before` | Relative/ISO | `"30d"`, `"1m"` |
-| `actionable` | Boolean | `true` = no open blockers |
-| `has_blockers` | Boolean | `true` = waiting on dependencies |
+| `actionable` | Boolean | `true` = eligible status, elapsed deferral, and satisfied dependencies, including inherited parent gates; missing dependency records withhold readiness |
+| `has_blockers` | Boolean | `true` = unresolved dependency state, including missing records or inherited parent gates |
 | `id_prefix` | String | `"bv-"` for project filtering |
 | `title_contains` | String | Substring search |
 
@@ -1247,7 +1298,7 @@ graph TD
 ```
 
 ### The Algorithm
-1. **Identify Actionable Issues:** Filter to non-closed issues with no open blockers.
+1. **Identify Actionable Issues:** Require an actionable status, elapsed deferral, and satisfied dependencies in the full loaded source; retain candidate filters separately.
 2. **Compute Unblocks:** For each actionable issue, calculate what becomes unblocked if it's completed.
 3. **Find Connected Components:** Use Union-Find to group issues by their dependency relationships.
 4. **Build Tracks:** Create parallel tracks from each component, sorted by priority within each track.
@@ -1255,7 +1306,7 @@ graph TD
 
 ### Benefits for AI Agents
 - **Deterministic:** Same input always produces same plan (no LLM hallucination).
-- **Parallelism-Aware:** Multiple agents can grab different tracks without conflicts.
+- **Parallelism-Aware:** Tracks separate dependency components. They do not detect overlapping file edits or reserve work; coordinate claims and file access separately.
 - **Impact-Ranked:** The `highest_impact` field tells agents exactly where to start.
 
 ---
@@ -2843,12 +2894,12 @@ Click any node to open a **400px sliding detail pane**:
 
 ### Features
 
-- **Full-Text Search**: SQLite FTS5 powers instant search across all issue titles and descriptions. Results appear as you type—no server required.
+- **Search**: Search titles and descriptions without a server. The shipped browser SQLite engine uses substring matching; the export also contains an FTS5 index for engines that support it. Hybrid mode adds graph and issue-metadata ranking to either text backend, and the viewer identifies substring matching when active.
 - **Interactive Graph**: Visualize dependencies with D3.js force-graph, featuring zoom, pan, and node selection
 - **Detail Pane**: Click any node to see full issue details with dependency info
 - **Comments**: Issue discussion threads render in the detail view with author, timestamp, and markdown (#187)
 - **Triage View**: Same recommendations as `--robot-triage`
-- **Offline Support**: Works without network after initial load
+- **Offline Support**: A service worker verifies and caches the complete exported bundle before activation. After that first online load, ordinary offline reloads preserve search, detail routes and graph access. A new export installs a separate cache before switching to its updated files and database.
 - **Mobile Responsive**: Adapts to phone/tablet screens with touch-friendly interactions
 
 ### Technical Notes
@@ -3022,7 +3073,7 @@ These commands output **structured JSON** designed for programmatic consumption:
 | `--robot-docs <topic>` | Machine-readable JSON docs: `guide`, `commands`, `examples`, `env`, `exit-codes`, `all` | Agent onboarding |
 | `--robot-help` | Detailed AI agent documentation | Agent onboarding |
 
-All robot commands support `--as-of <ref>` for historical analysis. Output includes `as_of` and `as_of_commit` metadata fields when specified.
+Issue-backed analysis commands support `--as-of <ref>` and include `as_of` and `as_of_commit` metadata. Commands such as capabilities, schemas, and recipes describe the current installation or configuration rather than a historical issue snapshot.
 
 Output tuning flags that apply across robot commands:
 
@@ -3054,9 +3105,13 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--debug-render` | string | (empty) | Render a view and output to file (views: insights, board) | Export & Reporting |
 | `--debug-width` | int | `180` | Width for debug render | Export & Reporting |
 | `--emit-script` | bool | `false` | Emit shell script for top-N recommendations (agent workflows) | Export & Reporting |
+| `--export` | string | (empty) | Export a report using recipe defaults or explicit export options | Export & Reporting |
+| `--export-format` | string | (empty) | Report format: markdown, json, csv or mermaid | Export & Reporting |
 | `--export-graph` | string | (empty) | Export graph: .html for interactive, .png/.svg for static (auto-names if empty) | Export & Reporting |
+| `--export-include-graph` | bool | `true` | Include dependency context in the report (explicit false overrides recipe) | Export & Reporting |
 | `--export-md` | string | (empty) | Export issues to a Markdown file (e.g., report.md) | Export & Reporting |
 | `--export-pages` | string | (empty) | Export static site to directory (e.g., ./bv-pages) | Export & Reporting |
+| `--export-template` | string | (empty) | Markdown template path; explicit empty disables a recipe template | Export & Reporting |
 | `--graph-preset` | string | `compact` | Graph layout preset: compact (default) or roomy | Export & Reporting |
 | `--graph-title` | string | (empty) | Title for graph export (default: project name) | Export & Reporting |
 | `--no-hooks` | bool | `false` | Skip running hooks during export | Export & Reporting |
@@ -3159,7 +3214,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--robot-reject-correlation` | string | (empty) | Reject an incorrect correlation (format: SHA:beadID) | Robot & Planning Flags |
 | `--robot-related` | string | (empty) | Output beads related to a specific bead ID as JSON | Robot & Planning Flags |
 | `--robot-schema` | bool | `false` | Output JSON Schema definitions for all robot commands | Robot & Planning Flags |
-| `--robot-search` | bool | `false` | Output semantic search results as JSON for AI agents (use with --search) | Robot & Planning Flags |
+| `--robot-search` | bool | `false` | Output keyword or hybrid search results as JSON for AI agents (use with --search) | Robot & Planning Flags |
 | `--robot-sprint-list` | bool | `false` | Output sprints as JSON | Robot & Planning Flags |
 | `--robot-sprint-show` | string | (empty) | Output specific sprint details as JSON | Robot & Planning Flags |
 | `--robot-suggest` | bool | `false` | Output smart suggestions (duplicates, dependencies, labels, cycles) as JSON | Robot & Planning Flags |
@@ -3179,8 +3234,9 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--robot-by-label` | string | (empty) | Filter robot outputs by label (exact match) | Search & Filters |
 | `--robot-max-results` | int | `0` | Limit robot output count (0 = use defaults) | Search & Filters |
 | `--robot-min-confidence` | float64 | `0` | Filter robot outputs by minimum confidence (0.0-1.0) | Search & Filters |
-| `--search` | string | (empty) | Semantic search query (vector-based; builds/updates index on first run) | Search & Filters |
+| `--search` | string | (empty) | Hashed keyword search query (builds/updates index on first run) | Search & Filters |
 | `--search-limit` | int | `10` | Max results for --search/--robot-search | Search & Filters |
+| `--search-min-score` | string | (empty) | Minimum text similarity before hybrid ranking (-1..1); exact IDs also obey this threshold | Search & Filters |
 | `--search-mode` | string | (empty) | Search ranking mode: text or hybrid (default: BV_SEARCH_MODE or text) | Search & Filters |
 | `--search-preset` | string | (empty) | Hybrid preset name (default: BV_SEARCH_PRESET or default) | Search & Filters |
 | `--search-weights` | string | (empty) | Hybrid weights JSON (overrides preset; keys: text,pagerank,status,impact,priority,recency) | Search & Filters |
@@ -3190,7 +3246,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 
 ### Time-Travel Commands
 
-The `--as-of` flag lets you view project state at any historical point without modifying your working tree. It works with both the interactive TUI and all robot commands.
+The `--as-of` flag loads issue state from a Git revision without modifying your working tree. It works with the interactive TUI and issue-backed robot analysis commands; the revision must contain a readable tracked Beads export.
 
 ```bash
 # View historical state (TUI)
@@ -3256,7 +3312,20 @@ bv --agent-brief ./agent-bundle/
 
 ### ETA Forecasting & Capacity Planning
 
-These are heuristics, not a scheduler. Per issue, `--robot-forecast` estimates work as `estimated_minutes` when the bead carries one, otherwise the median estimate across beads times a type weight, a dependency-depth factor (up to 2x), and a description-length factor; velocity is minutes closed in the last 30 days per day (falling back to median/5 and then 60 min/day); ETA days = minutes / (velocity x agents) with a rule-based confidence band. `--robot-capacity` sums serial work on the critical path with the remaining parallel work divided by `--agents`; it does not assign issues to agents or respect per-agent availability. Every payload lists its `factors` so the numbers can be audited.
+These are heuristics, not a scheduler. For `--robot-forecast`, choose a base from a positive `estimated_minutes`, otherwise the median positive estimate in the loaded issues (default 60 minutes). **Both explicit and inferred bases receive all multipliers:** type (`task`/`bug`: 1, `chore`: 0.8, `feature`: 1.3, `epic`: 2), dependency depth (`1 + min(1, depth/10)`), and description length (`1 + min(1, Unicode runes/2000)`). The product is truncated to integer minutes. Depth uses the available critical-path score; unavailable scores contribute zero depth.
+
+Velocity is estimated minutes closed in the last 30 days divided by 30, using the slowest nonzero matching-label velocity, then global velocity, then median/5 (with 60 min/day as a final fallback). ETA days = work minutes / (velocity × agents). Its confidence band is rule-based and has not been calibrated as a statistical probability. `--robot-capacity` sums serial work on the critical path with remaining parallel work divided by `--agents`; it does not assign issues to agents or account for their availability. Payloads expose the factors behind these estimates.
+
+For a worked example, take two feature issues with depth 2 and descriptions of
+1,000 Unicode characters. One has an explicit 120-minute estimate; the other
+has none. The only other positive estimate is a 240-minute issue closed within
+the last 30 days, so the median is 180 minutes and velocity is 8 min/day.
+With two agents, applying all multipliers gives:
+
+| Estimate source | Work minutes | ETA days |
+|-----------------|--------------|----------|
+| explicit | 280 | 17.5 |
+| median | 421 | 26.3125 |
 
 ```bash
 # Forecast completion ETA for a specific issue
@@ -3346,10 +3415,10 @@ bv --check-drift                    # Exit codes: 0=OK, 1=critical, 2=warning
 bv --check-drift --robot-drift      # JSON output
 ```
 
-### Semantic Search
+### Keyword and Hybrid Search
 
 ```bash
-# Semantic vector search over titles/descriptions
+# Hashed keyword search over weighted issue text
 bv --search "login oauth"
 
 # JSON output for automation
@@ -3366,9 +3435,45 @@ bv --search "login oauth" --search-mode hybrid \
 
 "Semantic" search builds a lightweight vector index from a weighted issue document (ID and title repeated, labels and description included). The vectors are **hashed keyword features** (FNV-1a feature hashing, `pkg/search/hash_embedder.go`), not a learned language model: two issues score as similar when they share words, not when they share meaning. That keeps the index dependency-free and instant to build, and it is the only embedder that ships; `BV_SEMANTIC_EMBEDDER` accepts `hash` only, and the `python-sentence-transformers` / `openai` provider names are reserved placeholders that fail with "not implemented".
 
-Hybrid mode is a two-stage pipeline: it first retrieves the top candidates by semantic similarity, then re-ranks those candidates using graph-aware signals (PageRank, status, impact, priority, recency). That keeps results anchored to your query while surfacing items that matter most in the dependency graph—a good fit for bv’s goal of making the “why this matters” visible.
+Hybrid mode first retrieves candidates by hashed keyword similarity and literal prefix evidence, then re-ranks them using graph signals (PageRank, status, impact, priority, recency). It combines textual matches with project importance; learned embeddings and synonym understanding are not implemented.
 
 Short, intent-heavy queries (e.g., “benchmarks”, “oauth”) are treated differently on purpose. bv widens the candidate pool, boosts literal matches, and raises the text weight so quick lookups behave like a precise search. Longer, descriptive queries lean more on graph signals for smart tie‑breaking and prioritization.
+
+The CLI applies literal prefix evidence before selecting candidates, so a prefix
+match can enter the result set even when its raw hash similarity is zero.
+Scope and `--search-min-score` still apply first; the threshold uses raw text
+similarity. Exact issue-ID navigation retains priority within eligible results.
+
+The frozen [relevance corpus](tests/testdata/search_relevance.json) contains
+40 agent-authored intents with graded rationales: six tuning examples and
+34 evaluation queries. These are **not human-reviewed judgments**. At 10,000
+administrative distractors, the 30 evaluation queries with positive judgments
+produced the following means (the four absent/empty queries are reported
+separately):
+
+| Configuration | Recall@10 | nDCG@10 |
+|---------------|-----------|---------|
+| Text | 1.000 | 0.950 |
+| Default hybrid | 1.000 | 0.962 |
+| Bug hunting | 1.000 | 0.942 |
+| Sprint planning | 0.972 | 0.955 |
+| Impact first | 1.000 | 0.954 |
+
+The prefix wiring improved both evaluation prefix intents without changing any
+other query's returned IDs or scores in the 600-run comparison. Exact-ID cases
+ranked first in all 105 runs across both subsets. Sprint planning still omits
+some completed-issue context, and unmatched nonblank queries return nearest
+candidates rather than guaranteeing an empty result. Blank queries are rejected.
+Human usefulness and synonym understanding remain unproven. To retain all
+per-query results, corpus/configuration hashes, and broken-ranking controls:
+
+```bash
+BV_SEARCH_RELEVANCE_REPORT=/tmp/bv-relevance-new.json \
+  go test ./tests/e2e -run '^(TestSearchRelevance.*|TestRobotSearchJudgedRelevance)$' -count=1 -v
+```
+
+The report path must be new; existing evidence is never overwritten. This is a
+retrieval-quality evaluation, separate from the performance benchmarks.
 
 Hybrid defaults can be set via:
 - `BV_SEARCH_MODE` (text|hybrid)
@@ -3386,7 +3491,7 @@ In `--robot-search` JSON, hybrid results include `mode`, `preset`, `weights`, pl
 | `bug-hunting` | 0.30 | 0.15 | 0.15 | 0.15 | 0.20 | 0.05 | Prioritizes open issues with high impact and recency |
 | `sprint-planning` | 0.30 | 0.20 | 0.25 | 0.15 | 0.05 | 0.05 | Heavily weights PageRank and blocker impact for sprint grooming |
 | `impact-first` | 0.25 | 0.30 | 0.10 | 0.20 | 0.10 | 0.05 | Centrality-first: PageRank and graph impact dominate text matches |
-| `text-only` | 1.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | Pure keyword/semantic similarity with zero graph metric weighting |
+| `text-only` | 1.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | Hashed keyword similarity with zero graph metric weighting |
 <!-- /bv:generated -->
 
 ### Example: AI Agent Workflow
@@ -3404,7 +3509,7 @@ TASK=$(echo "$PLAN" | jq -r '.plan.summary.highest_impact')
 # 3. Get full insights for context
 INSIGHTS=$(bv --robot-insights)
 
-# 4. Check if completing this introduces regressions
+# 4. Inspect recorded changes since the prior commit (not a prediction)
 BASELINE=$(bv --diff-since HEAD~1 --robot-diff)
 
 echo "Working on: $TASK"
@@ -3710,8 +3815,8 @@ In complex software projects, tasks are not isolated. They are deeply interconne
 `bv` is engineered for speed. We believe that latency is the enemy of flow.
 
 *   **Startup Time:** about 20 ms of graph analysis (`bv --profile-startup`) for this repository's 611 issues. Wall time per robot command on the shared reference VM (AMD EPYC-Milan, Go 1.25) is 40-50 ms for `bv --version`, roughly 180-250 ms for `--robot-next`, `--robot-triage`, and `--robot-insights` with warm caches, and 500-700 ms for a first cold run; the per-command numbers are recorded by `scripts/robot_smoke.sh` in `tests/artifacts/perf/robot_wall.json` (single cold run per command). Engine benchmarks (`BenchmarkRealData_*`: full triage 1.2 ms, graph build 0.7 ms, exact full analysis 43 ms) are in `tests/artifacts/perf/analysis_bench.md`, and dashboard bundle sizes in `tests/artifacts/perf/pages_load.json`. All of these are point measurements on a shared machine. Regressions are caught by release-gate stage 8: `scripts/benchmark.sh compare` runs ten tracked benchmarks against the frozen `tests/testdata/benchmark/medium.jsonl` dataset and fails when any benchmark's best observed `ns/op` is more than 20% above a fresh, interleaved run of the baseline commit on the same machine (`benchmarks/baseline.txt` records that commit, the machine, Go version, and dataset hash, and is the fallback when the commit is not in the clone).
-*   **Rendering:** 60 FPS UI updates using [Bubble Tea](https://github.com/charmbracelet/bubbletea).
-*   **Virtualization:** List views and Markdown renderers are fully windowed. `bv` can handle repositories with **10,000+ issues** without UI lag, consuming minimal RAM.
+*   **Rendering:** [Bubble Tea](https://github.com/charmbracelet/bubbletea) drives the UI. The 16.67 ms frame target and the reference-host 50 ms p99 interaction SLO are distinct. `Update` + `View` measurements cover event handling and string rendering; they do not measure physical terminal paint.
+*   **Virtualization:** List and Markdown views render visible windows. Frozen 1k/5k/10k workloads exercise navigation, Unicode text, dense/cyclic dependencies, and concurrent snapshot refresh. This is test coverage, not a guarantee of lag-free operation or bounded RAM on every host; inspect the retained distributions and metric states described in [the performance guide](docs/performance.md).
 *   **Graph Compute:** A two-phase analyzer computes topo/degree/density instantly, then PageRank/Betweenness/HITS/Critical Path/Cycles asynchronously with size-aware timeouts.
 *   **Caching:** Repeated analyses reuse hashed results automatically, avoiding recomputation when the bead graph hasn’t changed.
 
@@ -3721,7 +3826,7 @@ Robot commands (`BV_ROBOT=1`, which every `--robot-*` flag sets) keep a disk cac
 
 ### Performance Benchmarking
 
-`bv` includes a comprehensive benchmark suite for performance validation:
+`bv` includes engine microbenchmarks and a separate latency harness. The release gate's best observed `ns/op` comparison does not establish p95/p99 interaction latency:
 
 ```bash
 # Run all benchmarks
@@ -4142,7 +4247,7 @@ Copyright (c) 2026 Jeffrey Emanuel
 ## 🤖 Why Robots Love bv
 - Deterministic JSON contracts: robot commands emit stable field names, stable ordering (ties broken by ID), and include `data_hash`, `analysis_config`, and `generated_at` so multiple calls can be correlated safely.
 - Health flags: every expensive metric reports status (`computed`, `timeout`, `skipped`) plus elapsed ms; sampled betweenness stays `computed` with `reason: "approximate"` and the `sample` size used.
-- Consistent cache: robot subcommands share the same analyzer/cache keyed by the issue data hash, avoiding divergent outputs across `--robot-insights`, `--robot-plan`, and `--robot-priority`.
+- Consistent analysis: robot subcommands use common analysis and cache code. Cache reuse depends on issue data and analysis configuration; different candidate scopes, reference clocks, or metric timeouts can legitimately produce different outputs.
 - Instant + eventual completeness: Phase 1 metrics are available immediately; Phase 2 fills in and the status flags tell you when it is done or if it degraded.
 
 ## 🧭 Data Flow at a Glance
@@ -4288,16 +4393,25 @@ by the named parties; see [LICENSE](LICENSE) for the complete controlling terms.
 
 ## 🤖 Robot JSON contract — quick cheat sheet
 
-**Shared across all robots**
-- `data_hash`: hash of the beads file driving the response (use to correlate multiple calls).
+**Issue-backed analysis envelopes**
+- `data_hash`: fingerprint of issue data used by the response (use alongside scope, configuration, and reference time when comparing calls).
 - `analysis_config`: exact analysis settings (timeouts, modes, cycle caps) for reproducibility.
 - `status`: per-metric state `computed|timeout|skipped` (plus `pending` while Phase 2 runs) with elapsed ms/reason, keyed by capitalized metric name; sampled betweenness is `computed` with `reason: "approximate"`. Always check before trusting heavy metrics like PageRank/Betweenness/HITS.
 - `as_of` / `as_of_commit`: present when using `--as-of`; contains the ref you specified and the resolved commit SHA for reproducibility.
 
+Metric-bearing commands such as insights, plan, and priority include
+`analysis_config` and `status`. Graph export and metadata-only commands such
+as capabilities and recipes have their own schemas. Use `--robot-schema` for
+the exact fields required by each command.
+
+Issue-backed robot responses also include `source_authority`: per-source loaded, failed, or disabled status; valid, dropped, metadata, and tombstone record counts; related-record read errors; and stale fallback diagnostics. Warnings retain their total count and at most 10 messages per source. `authority_hash` fingerprints those sources and their completeness before filtering; `scope_hash` identifies the selected candidates and active filters.
+
+When authority is `partial` or `unknown`, readiness is labeled `provisional`. Exploratory recommendations, counts, and graphs remain available, but claim commands and proven actionable picks are withheld. Check `source_authority.claim_safe` before claiming work. Local Pages exports and agent briefs carry the same diagnostics; watch exports refresh them even when the visible issue data stays unchanged.
+
 **Schemas in 5 seconds (jq-friendly)**
-- `bv --robot-insights` → `.status`, `.analysis_config`, metric maps (capped by `BV_INSIGHTS_MAP_LIMIT`), `Bottlenecks`, `CriticalPath`, `Cycles`, plus advanced signals: `Cores` (k-core), `Articulation` (cut vertices), `Slack` (longest-path slack).
-- `bv --robot-plan` → `.plan.tracks[].items[].{id,unblocks}` for downstream unlocks; `.plan.summary.highest_impact`.
-- `bv --robot-priority` → `.recommendations[].{id,current_priority,suggested_priority,confidence,reasoning}`.
+- `bv --robot-insights` → `.status`, `.analysis_config`, metric maps (capped by `BV_INSIGHTS_MAP_LIMIT`), `Bottlenecks`, `Keystones` (critical-path scores), `Cycles`, plus advanced signals: `Cores` (k-core), `Articulation` (cut vertices), `Slack` (longest-path slack).
+- `bv --robot-plan` → `.plan.tracks[].items[] | {id,unblocks}` for downstream unlocks; `.plan.summary.highest_impact`.
+- `bv --robot-priority` → `.recommendations[] | {issue_id,current_priority,suggested_priority,confidence,reasoning}`.
 - `bv --robot-suggest` → `.suggestions.suggestions[]` (ranked suggestions) + `.suggestions.stats` (counts) + `.usage_hints`.
 - `bv --robot-diff --diff-since <ref>` → `{from_data_hash,to_data_hash,diff.summary,diff.new_issues,diff.cycle_*}`.
 - `bv --robot-history` → `.histories[ID].events` + `.commit_index` for reverse lookup; `.stats.method_distribution` shows how correlations were inferred.

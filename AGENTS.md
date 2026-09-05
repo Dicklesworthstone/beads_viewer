@@ -240,7 +240,7 @@ Analyzes Beads issue graphs to produce actionable triage recommendations, parall
 
 ```
 .beads/{issues,beads}.jsonl → Loader → Graph Build → ┬─ Phase 1 (instant): degree, topo sort, density
-                                              └─ Phase 2 (async, 500ms): PageRank, betweenness,
+                                              └─ Phase 2 (async, size-tiered): PageRank, betweenness,
                                                                           HITS, eigenvector, cycles
                                                               │
                                               ┌───────────────┴───────────────┐
@@ -259,7 +259,7 @@ Analyzes Beads issue graphs to produce actionable triage recommendations, parall
 ```
 beads_viewer/
 ├── go.mod                          # Module root (Go 1.25+)
-├── cmd/bv/                         # CLI entry point (cobra)
+├── cmd/bv/                         # CLI entry point (Cobra/pflag and robot registry)
 ├── pkg/
 │   ├── analysis/                   # Graph metrics, triage, planning, priority, forecasting
 │   ├── search/                     # Hybrid semantic search (text + graph metrics)
@@ -530,7 +530,7 @@ bv is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in c
 
 ### The Workflow: Start With Triage
 
-**`bv --robot-triage` is your single entry point.** It returns:
+**`bv --robot-triage` is your single entry point.** Its `triage` object contains:
 - `quick_ref`: at-a-glance counts + top 3 picks
 - `recommendations`: ranked actionable items with scores, reasons, unblock info
 - `quick_wins`: low-effort high-impact items
@@ -588,20 +588,25 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 
 ### Understanding Robot Output
 
-**All robot JSON includes:**
-- `data_hash` — Fingerprint of the source JSONL issue file
-- `status` — Per-metric state: `computed|approx|timeout|skipped` + elapsed ms
-- `as_of` / `as_of_commit` — Present when using `--as-of`
+**Issue-backed analysis output:**
+- `data_hash` — Fingerprint of issue data used by the response
+- `status` — For metric-bearing commands such as insights, plan, and priority: `computed|pending|timeout|skipped` + elapsed ms; sampled betweenness is `computed` with `reason: "approximate"`
+- `as_of` / `as_of_commit` — Present for historical issue analysis using `--as-of`
+- `source_authority`, `authority_hash`, `scope_hash` — Loaded-source completeness, full authority identity, and selected-candidate scope
+
+Metadata-only commands have their own schemas. Check `--robot-schema` for
+command-specific required fields. Source completeness does not establish a
+live tracker route; inspect the suggested action's original ID and directory.
 
 **Two-phase analysis:**
 - **Phase 1 (instant):** degree, topo sort, density
-- **Phase 2 (async, 500ms timeout):** PageRank, betweenness, HITS, eigenvector, cycles
+- **Phase 2 (async, size-tiered timeouts):** PageRank, betweenness, HITS, eigenvector, cycles. See `ConfigForSize`; check each metric's status. An empty cycle list after skipped or timed-out analysis does not prove acyclicity, and stored cycles may be capped.
 
 ### jq Quick Reference
 
 ```bash
-bv --robot-triage | jq '.quick_ref'                        # At-a-glance summary
-bv --robot-triage | jq '.recommendations[0]'               # Top recommendation
+bv --robot-triage | jq '.triage.quick_ref'                 # At-a-glance summary
+bv --robot-triage | jq '.triage.recommendations[0]'         # Top recommendation
 bv --robot-plan | jq '.plan.summary.highest_impact'        # Best unblock target
 bv --robot-insights | jq '.status'                         # Check metric readiness
 bv --robot-insights | jq '.Cycles'                         # Circular deps (must fix!)
@@ -887,7 +892,7 @@ bv is a graph-aware triage engine for Beads projects. Instead of parsing .beads/
 
 #### The Workflow: Start With Triage
 
-**`bv --robot-triage` is your single entry point.** It returns everything you need in one call:
+**`bv --robot-triage` is your single entry point.** Its `triage` object contains:
 - `quick_ref`: at-a-glance counts + top 3 picks
 - `recommendations`: ranked actionable items with scores, reasons, unblock info
 - `quick_wins`: low-effort high-impact items
@@ -907,7 +912,7 @@ bv --robot-graph --format toon
 bv --robot-triage --format toon --stats
 ```
 
-Before claiming, verify current state with the selected tracker: `br show <id> --json`/`br ready --json` or `bd show <id> --json`/`bd ready --json`. `recommendations` can include graph-important blocked or assigned work; only `quick_ref.top_picks` and non-empty `claim_command` fields represent claimable work.
+Recommendations can include blocked or assigned work; `triage.quick_ref.top_picks` reflects snapshot readiness. A suggested action records its original local ID, working directory, and tracker route. Use that route rather than a namespaced display ID or an unrelated current directory. Inspect current tracker state before execution: analysis does not reserve work or guarantee that a later claim succeeds.
 
 #### Other bv Commands
 

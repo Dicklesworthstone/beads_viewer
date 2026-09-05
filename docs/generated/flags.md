@@ -13,9 +13,13 @@
 | `--debug-render` | string | (empty) | Render a view and output to file (views: insights, board) | Export & Reporting |
 | `--debug-width` | int | `180` | Width for debug render | Export & Reporting |
 | `--emit-script` | bool | `false` | Emit shell script for top-N recommendations (agent workflows) | Export & Reporting |
+| `--export` | string | (empty) | Export a report using recipe defaults or explicit export options | Export & Reporting |
+| `--export-format` | string | (empty) | Report format: markdown, json, csv or mermaid | Export & Reporting |
 | `--export-graph` | string | (empty) | Export graph: .html for interactive, .png/.svg for static (auto-names if empty) | Export & Reporting |
+| `--export-include-graph` | bool | `true` | Include dependency context in the report (explicit false overrides recipe) | Export & Reporting |
 | `--export-md` | string | (empty) | Export issues to a Markdown file (e.g., report.md) | Export & Reporting |
 | `--export-pages` | string | (empty) | Export static site to directory (e.g., ./bv-pages) | Export & Reporting |
+| `--export-template` | string | (empty) | Markdown template path; explicit empty disables a recipe template | Export & Reporting |
 | `--graph-preset` | string | `compact` | Graph layout preset: compact (default) or roomy | Export & Reporting |
 | `--graph-title` | string | (empty) | Title for graph export (default: project name) | Export & Reporting |
 | `--no-hooks` | bool | `false` | Skip running hooks during export | Export & Reporting |
@@ -118,7 +122,7 @@
 | `--robot-reject-correlation` | string | (empty) | Reject an incorrect correlation (format: SHA:beadID) | Robot & Planning Flags |
 | `--robot-related` | string | (empty) | Output beads related to a specific bead ID as JSON | Robot & Planning Flags |
 | `--robot-schema` | bool | `false` | Output JSON Schema definitions for all robot commands | Robot & Planning Flags |
-| `--robot-search` | bool | `false` | Output semantic search results as JSON for AI agents (use with --search) | Robot & Planning Flags |
+| `--robot-search` | bool | `false` | Output keyword or hybrid search results as JSON for AI agents (use with --search) | Robot & Planning Flags |
 | `--robot-sprint-list` | bool | `false` | Output sprints as JSON | Robot & Planning Flags |
 | `--robot-sprint-show` | string | (empty) | Output specific sprint details as JSON | Robot & Planning Flags |
 | `--robot-suggest` | bool | `false` | Output smart suggestions (duplicates, dependencies, labels, cycles) as JSON | Robot & Planning Flags |
@@ -138,8 +142,9 @@
 | `--robot-by-label` | string | (empty) | Filter robot outputs by label (exact match) | Search & Filters |
 | `--robot-max-results` | int | `0` | Limit robot output count (0 = use defaults) | Search & Filters |
 | `--robot-min-confidence` | float64 | `0` | Filter robot outputs by minimum confidence (0.0-1.0) | Search & Filters |
-| `--search` | string | (empty) | Semantic search query (vector-based; builds/updates index on first run) | Search & Filters |
+| `--search` | string | (empty) | Hashed keyword search query (builds/updates index on first run) | Search & Filters |
 | `--search-limit` | int | `10` | Max results for --search/--robot-search | Search & Filters |
+| `--search-min-score` | string | (empty) | Minimum text similarity before hybrid ranking (-1..1); exact IDs also obey this threshold | Search & Filters |
 | `--search-mode` | string | (empty) | Search ranking mode: text or hybrid (default: BV_SEARCH_MODE or text) | Search & Filters |
 | `--search-preset` | string | (empty) | Hybrid preset name (default: BV_SEARCH_PRESET or default) | Search & Filters |
 | `--search-weights` | string | (empty) | Hybrid weights JSON (overrides preset; keys: text,pagerank,status,impact,priority,recency) | Search & Filters |

@@ -2,9 +2,34 @@
 
 This guide explains `bv`'s performance characteristics, how to diagnose slow startup, and available tuning options.
 
+## Responsiveness acceptance
+
+A 60fps frame target allows 16.67 ms per frame. The reference-host interaction SLO is **p99 ≤50 ms** for ordinary list navigation and navigation while snapshots are built in the background. Every delivered snapshot must also take ≤50 ms on the event loop: sparse slow deliveries cannot hide below the p99 rank. These are acceptance targets, not universal guarantees. The harness times the production `Update` and `View` methods at 140 columns ×45 rows; it does not observe terminal paint or input-device latency.
+
+`scripts/benchmark.sh latency` exercises six frozen workload families—realistic sparse graphs, deep chains, wide DAGs, clustered dense cycles, 95% closed issues, and long Unicode/Markdown text—at **1,000, 5,000, and 10,000 issues**. Seed `20260904`, fixed issue timestamps, serialized fixture hashes, binary hashes, source patch identity, Go version, and host metadata identify a run. Snapshot refresh uses real concurrent construction with the worker's size-tier configuration and previous-snapshot diff reuse. Both `SnapshotReadyMsg` and the subsequent `Phase2ReadyMsg` enter the production `Update` handler, and both handler durations count toward the measured interaction. The harness executes the actual returned command batch, including history completion, while navigation continues. Background build and command durations are recorded separately. Filesystem watcher latency is outside this measurement.
+
+Build baseline binaries from the source state you want to compare, with this same harness present, then run on the same host:
+
+```bash
+go build -o /absolute/retained/baseline-bv ./cmd/bv
+go test -c -o /absolute/retained/baseline-ui.test ./pkg/ui
+# After the proposed change, choose a NEW output directory:
+bash scripts/benchmark.sh latency \
+  /absolute/retained/baseline-bv /absolute/retained/baseline-ui.test \
+  /absolute/retained/latency-run
+```
+
+The runner retains temporary datasets, binaries, raw stdout/stderr, and samples. It runs four alternating baseline/current UI pairs, with 1,000 samples per workload and mode, and 200 alternating baseline/current CLI pairs per workload and cache mode. `BV_PERF_UI_SAMPLES` and `BV_PERF_CLI_SAMPLES` may increase these counts; both reject values below 200. Empirical nearest-rank p50/p95/p99 describe the observed cohorts. At 200 samples only two observations occupy the top 1%; repeated runs help expose noise but do not establish a population p99 confidence bound. Shared-host contention remains a limitation. Baseline SLO misses remain visible; the acceptance gate enforces the SLO on the current binary and requires valid samples and result parity from both.
+
+Both CLI cache modes start a fresh process. Cold runs use a previously nonexistent application cache; warm runs first populate a separate cache and verify an actual analysis entry exists. The OS page cache is uncontrolled. `SOURCE_DATE_EPOCH` is deliberately removed because its robot reproducibility mode runs metrics to completion and would change the timeout behavior under test. Fixed fixture timestamps contain no active deferrals; the production wall clock remains active.
+
+The verifier compares ordered decision IDs, claim/readiness fields, full list order, and metric states/reasons/approximation samples. It removes only per-metric elapsed time; skipped or timed-out metrics remain visible and a change makes the speed comparison inconclusive. Raw CLI output is retained for score review; the CLI check does not assert bitwise floating-point score equality. UI priority recommendations are compared in full, using the analyzer's existing clock seam fixed at `2026-09-01T00:00:00Z` for both preparation phases; metric timeouts remain active. Each accepted Phase2 completion records final list order, metric status, and an exact fingerprint of priorities, triage scores, and unblocks. UI records include settled setup time, allocation bytes/counts, heap before/after, GC cycles and pauses, including the background builder and measurement instrumentation. These are process statistics, not peak RSS or a memory limit.
+
+Normal `go test` runs exercise navigation beyond the issue count, a deliberate 60 ms slow-handler rejection, missing/degraded metric controls, and real 1k/5k/10k CLI smoke cases. Complete distributions require the explicit latency runner; a skipped opt-in cohort is not performance acceptance. Search relevance is evaluated separately against judged queries; a timing pass says nothing about semantic quality.
+
 ## Graph Analysis Performance
 
-`bv` computes 9 graph-theoretic metrics on startup. Their computational complexity varies significantly:
+`bv` computes 9 graph-theoretic metrics on startup. The timing values below are historical rough examples without a frozen host/fixture identity; use the retained harness output for acceptance. Their computational complexity varies significantly:
 
 | Metric | Complexity | 100 nodes | 500 nodes | 1000 nodes | 2000 nodes |
 |--------|-----------|-----------|-----------|------------|------------|
@@ -23,13 +48,13 @@ This guide explains `bv`'s performance characteristics, how to diagnose slow sta
 
 `bv` uses a two-phase startup to ensure responsive UI:
 
-### Phase 1: Instant (<50ms)
+### Phase 1: Blocking (target <50ms)
 Computes metrics needed for initial render:
 - Degree centrality (blocking indicators)
 - Topological sort (execution order)
 - Basic stats (counts, density)
 
-**Result:** You see the issue list immediately.
+**Result:** The issue list can render after Phase 1, while expensive metrics continue in the background.
 
 ### Phase 2: Background (async)
 Computes expensive metrics in a background goroutine:
@@ -285,14 +310,14 @@ For very large graphs:
    - Each cycle stores full path
    - Limited to `MaxCyclesToStore` (default: 100)
 
-2. **Graph structure** uses gonum's sparse representation
-   - Efficient for sparse graphs
-   - ~100 bytes per node + ~50 bytes per edge
+2. **Graph structure** uses a compact adjacency representation
+   - Sparse graphs generally require less storage than dense graphs
+   - Issue text, indexes, derived metrics, and concurrent snapshots also consume memory
 
-3. **Typical memory usage**
-   - 1000 issues, 3000 deps: ~5MB
-   - 5000 issues, 15000 deps: ~25MB
-   - 10000 issues, 30000 deps: ~50MB
+3. **Measure the whole workload**
+   - The latency harness reports allocated bytes, heap snapshots, and GC activity
+   - Use a host profiler for peak RSS; these counters are not interchangeable
+   - Issue count alone cannot establish a memory bound, especially with long descriptions or overlapping snapshots
 
 ## Benchmarking
 

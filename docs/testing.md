@@ -320,13 +320,17 @@ if _, ok := result["generated_at"]; !ok {
 
 ## CI Integration
 
-Tests run automatically on CI for every push and PR:
+The checked-in CI workflow is configured for pushes and pull requests, but
+the CI, Release, Fuzz, and Flake Update workflows were `disabled_manually`
+when checked on 2026-09-05 with `gh workflow list --all`. A workflow file or
+badge does not establish that a run occurred. Check the live workflow state
+and run results before relying on CI or Codecov coverage.
 
-1. **Unit tests** with coverage (`go test -coverprofile`)
-2. **Coverage threshold** check (pkg/* ≥ 75%, plus per-package thresholds)
-3. **Quick benchmarks** for performance regression detection
-
-Coverage is uploaded to Codecov for tracking trends and PR diffs.
+Run the source tests locally or through RCH. Releases require the complete
+local gate described in [RELEASING.md](RELEASING.md). The checked-in CI gate
+invocation skips benchmarks and allows missing checks; it is diagnostic and
+cannot authorize packaging. Its log-upload path also needs updating before
+the workflow is re-enabled. No workflow was re-enabled by this change.
 
 For local stress-testing, consider running the race detector:
 
@@ -336,15 +340,19 @@ go test -race ./...
 
 ### Coverage Thresholds
 
+The following table describes configured per-package CI thresholds. They are
+enforced only when the corresponding workflow actually runs; the configured
+aggregate threshold for `pkg/*` is 71%.
+
 | Package | Minimum |
 |---------|---------|
 | `pkg/analysis` | 75% |
-| `pkg/export` | 80% |
+| `pkg/export` | 69% |
 | `pkg/recipe` | 90% |
 | `pkg/ui` | 55% |
 | `pkg/loader` | 80% |
 | `pkg/updater` | 55% |
-| `pkg/watcher` | 80% |
+| `pkg/watcher` | 60% |
 | `pkg/workspace` | 85% |
 
 ## Best Practices
