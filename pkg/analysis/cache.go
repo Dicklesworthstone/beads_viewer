@@ -1709,12 +1709,15 @@ func putRobotDiskCachedStats(fullKey, dataHash, configHash string, stats *GraphS
 	}
 	tmpName := tmp.Name()
 	_, werr := tmp.Write(raw)
-	serr := tmp.Sync()
 	cerr := tmp.Close()
-	if werr != nil || serr != nil || cerr != nil {
+	if werr != nil || cerr != nil {
 		_ = os.Remove(tmpName)
 		return
 	}
+	// Cache entries are regenerable, not durable user data. Closing before
+	// rename preserves complete publication to readers without forcing a disk
+	// flush on the robot response path. A lost or corrupt entry after a crash
+	// is rejected by getRobotDiskCachedStats and recomputed from the source.
 	final := filepath.Join(dir, robotAnalysisEntryFileName(fullKey))
 	if err := os.Rename(tmpName, final); err != nil {
 		// Windows cannot rename onto a file another process holds open; retry
