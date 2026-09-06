@@ -583,11 +583,15 @@ func (a *Analyzer) computeMarginalUnblocksFromBefore(issueID string, alreadyComp
 	completedAfter[issueID] = true
 
 	var unblocks []string
-	for _, issue := range a.getActionableIssuesAfterCompletions(completedAfter) {
-		if !before[issue.ID] {
-			unblocks = append(unblocks, issue.ID)
+	readiness := a.Readiness()
+	for id := range a.issueMap {
+		// Already-actionable issues cannot be new unlocks. Select only the IDs
+		// we need instead of copying every ready issue for each what-if candidate.
+		if !before[id] && a.IsCandidate(id) && readiness.ReadyAfter(id, a.now, completedAfter) {
+			unblocks = append(unblocks, id)
 		}
 	}
+	sort.Strings(unblocks)
 	return unblocks
 }
 
