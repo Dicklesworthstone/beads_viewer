@@ -308,6 +308,7 @@ func TestTreeExpandCollapse(t *testing.T) {
 	}
 
 	tree := NewTreeModel(newTreeTestTheme())
+	tree.SetBeadsDir(t.TempDir())
 	tree.Build(issues)
 
 	// Initially auto-expanded (depth < 2)
@@ -543,6 +544,7 @@ func TestTreeExpandOrMoveToChild(t *testing.T) {
 	}
 
 	tree := NewTreeModel(newTreeTestTheme())
+	tree.SetBeadsDir(t.TempDir())
 	tree.Build(issues)
 
 	// Root is initially expanded (auto-expand depth < 2)
@@ -584,6 +586,7 @@ func TestTreeCollapseOrJumpToParent(t *testing.T) {
 	}
 
 	tree := NewTreeModel(newTreeTestTheme())
+	tree.SetBeadsDir(t.TempDir())
 	tree.Build(issues)
 
 	// Root is expanded - CollapseOrJumpToParent should collapse

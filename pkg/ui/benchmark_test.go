@@ -214,6 +214,31 @@ func BenchmarkSnapshotViewSyncComponents(b *testing.B) {
 }
 
 func BenchmarkKeyPressLatency(b *testing.B) {
+	issues := testutil.QuickRandom(1000, 0.01)
+	m := NewModel(issues, nil, "")
+	durations := make([]time.Duration, 0, b.N)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		start := time.Now()
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = updated.(*Model)
+		if view := m.View(); view == "" {
+			b.Fatal("View returned empty output")
+		}
+		durations = append(durations, time.Since(start))
+	}
+	b.StopTimer()
+
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	p99Index := (99*len(durations)+99)/100 - 1
+	b.ReportMetric(float64(durations[p99Index].Nanoseconds()), "p99-ns/op")
+}
+
+// Keep the settled workload separate from the original tracked benchmark so
+// release comparisons retain identical inputs, dimensions, and key sequences.
+func BenchmarkSettledKeyPressLatency(b *testing.B) {
 	issues, err := testutil.PerformanceIssues("realistic", 1000, 20260904)
 	if err != nil {
 		b.Fatal(err)
@@ -238,6 +263,26 @@ func BenchmarkKeyPressLatency(b *testing.B) {
 }
 
 func BenchmarkKeyPressUpdateLatency(b *testing.B) {
+	issues := testutil.QuickRandom(1000, 0.01)
+	m := NewModel(issues, nil, "")
+	durations := make([]time.Duration, 0, b.N)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		start := time.Now()
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = updated.(*Model)
+		durations = append(durations, time.Since(start))
+	}
+	b.StopTimer()
+
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	p99Index := (99*len(durations)+99)/100 - 1
+	b.ReportMetric(float64(durations[p99Index].Nanoseconds()), "p99-ns/op")
+}
+
+func BenchmarkSettledKeyPressUpdateLatency(b *testing.B) {
 	issues, err := testutil.PerformanceIssues("realistic", 1000, 20260904)
 	if err != nil {
 		b.Fatal(err)
