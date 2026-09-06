@@ -1210,6 +1210,51 @@ func TestSnapshotBuilder_IncrementalListMatchesFull(t *testing.T) {
 	}
 }
 
+func TestBuildListItemsPreservesExactSourceAndMetrics(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "API-A", Title: "First", Status: model.StatusOpen, SourceRepo: " Web- ", Labels: []string{"second", "first"},
+			Comments:     []*model.Comment{{ID: "2", Text: "second"}, {ID: "1", Text: "first"}},
+			Dependencies: []*model.Dependency{{DependsOnID: "missing", Type: model.DepBlocks}, nil}},
+		{ID: "OPS-B", Title: "Second", Status: model.StatusClosed},
+		{ID: "plain", Title: "No repository"},
+	}
+	before := copyIssues(issues)
+	stats := analysis.NewGraphStatsForTest(
+		map[string]float64{"API-A": 0.125, "OPS-B": 0.25}, nil, nil, nil, nil,
+		map[string]float64{"API-A": 3, "OPS-B": 4}, nil, nil, nil, 0, nil,
+	)
+	for _, tc := range []struct {
+		name  string
+		stats *analysis.GraphStats
+	}{
+		{"without-stats", nil},
+		{"with-stats", stats},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := []IssueItem{
+				{Issue: issues[0], RepoPrefix: "web"},
+				{Issue: issues[1], RepoPrefix: "ops"},
+				{Issue: issues[2]},
+			}
+			if tc.stats != nil {
+				want[0].GraphScore, want[0].Impact = 0.125, 3
+				want[1].GraphScore, want[1].Impact = 0.25, 4
+			}
+			got := buildListItems(issues, tc.stats)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("list rows differ from exact expected state:\ngot=%#v\nwant=%#v", got, want)
+			}
+			got[0].Issue.Title = "Presentation copy"
+			if !reflect.DeepEqual(issues, before) {
+				t.Fatal("list build or row assignment mutated source issues")
+			}
+			if empty := buildListItems(nil, tc.stats); empty == nil || len(empty) != 0 {
+				t.Fatalf("empty input must retain an empty non-nil row slice, got %#v", empty)
+			}
+		})
+	}
+}
+
 func TestBuildListItemsIncrementalPreservesExactCurrentRows(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "api-A", Title: "Unchanged", Status: model.StatusOpen, SourceRepo: "api", Labels: []string{"first", "second"},

@@ -809,7 +809,7 @@ func shouldUseIncrementalList(prev *DataSnapshot, diff *analysis.IssueDiff, r *r
 func buildListItems(issues []model.Issue, stats *analysis.GraphStats) []IssueItem {
 	listItems := make([]IssueItem, len(issues))
 	for i := range issues {
-		listItems[i] = buildIssueItemForSnapshot(issues[i], stats)
+		resetIssueItemForSnapshot(&listItems[i], issues[i], stats)
 	}
 	return listItems
 }
