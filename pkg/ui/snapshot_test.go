@@ -1210,6 +1210,63 @@ func TestSnapshotBuilder_IncrementalListMatchesFull(t *testing.T) {
 	}
 }
 
+func TestBuildListItemsIncrementalPreservesExactCurrentRows(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "api-A", Title: "Unchanged", Status: model.StatusOpen, SourceRepo: "api", Labels: []string{"first", "second"},
+			Comments:     []*model.Comment{{ID: "1", Text: "first"}, {ID: "2", Text: "second"}},
+			Dependencies: []*model.Dependency{{DependsOnID: "web-B", Type: model.DepRelated}, {DependsOnID: "missing", Type: model.DepRelated}}},
+		{ID: "web-B", Title: "Before", Status: model.StatusOpen, SourceRepo: "web"},
+	}
+	previous := &DataSnapshot{
+		ListItems: []IssueItem{
+			{Issue: issues[0], GraphScore: 0.125, Impact: 3, RepoPrefix: "api"},
+			{Issue: issues[1], GraphScore: 0.25, Impact: 4, RepoPrefix: "web"},
+		},
+		listIndexByID: map[string]int{"api-A": 0, "web-B": 1},
+	}
+	for i := range previous.ListItems {
+		item := &previous.ListItems[i]
+		item.DiffStatus = DiffStatusModified
+		item.SearchScore, item.SearchTextScore, item.SearchScoreSet = 0.9, 0.8, true
+		item.SearchComponents = map[string]float64{"text": 0.8}
+		item.TriageScore, item.TriageReason = 0.7, "previous reason"
+		item.TriageReasons = []string{"previous reason"}
+		item.IsQuickWin, item.IsBlocker, item.UnblocksCount = true, true, 2
+	}
+	before := deepCopyListItems(previous.ListItems)
+	current := []model.Issue{issues[0].Clone(), issues[1].Clone()}
+	current[0].Labels[0], current[0].Labels[1] = current[0].Labels[1], current[0].Labels[0]
+	current[0].Comments[0], current[0].Comments[1] = current[0].Comments[1], current[0].Comments[0]
+	current[0].Dependencies[0], current[0].Dependencies[1] = current[0].Dependencies[1], current[0].Dependencies[0]
+	current[1].Title, current[1].SourceRepo = "After", "ops"
+	diff := analysis.ComputeIssueDiff(issues, current)
+	if !reflect.DeepEqual(diff.Unchanged, []string{"api-A"}) || !reflect.DeepEqual(diff.Modified, []string{"web-B"}) {
+		t.Fatalf("fixture must exercise unchanged collection order and one modified row: %+v", diff)
+	}
+	stats := analysis.NewGraphStatsForTest(
+		map[string]float64{"api-A": 0.5, "web-B": 0.75}, nil, nil, nil, nil,
+		map[string]float64{"api-A": 7, "web-B": 8}, nil, nil, nil, 0, nil,
+	)
+	got := buildListItemsIncremental(current, stats, previous, &diff)
+	// Unchanged rows retain their previous metrics; the modified row rebuilds
+	// from current stats. Every row uses current source data and zero transient
+	// presentation state, including scores that are not visible while inactive.
+	want := []IssueItem{
+		{Issue: current[0], GraphScore: 0.125, Impact: 3, RepoPrefix: "api"},
+		{Issue: current[1], GraphScore: 0.75, Impact: 8, RepoPrefix: "ops"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("incremental rows differ from exact expected state:\ngot=%#v\nwant=%#v", got, want)
+	}
+	if !reflect.DeepEqual(previous.ListItems, before) {
+		t.Fatal("incremental build mutated previous rows")
+	}
+	got[0].GraphScore = 99
+	if !reflect.DeepEqual(previous.ListItems, before) {
+		t.Fatal("incremental rows share the previous backing array")
+	}
+}
+
 func TestSnapshotBuilder_IncrementalListFallsBackForTopologyChanges(t *testing.T) {
 	base := make([]model.Issue, 10)
 	for i := range base {

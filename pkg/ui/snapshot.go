@@ -820,12 +820,15 @@ func buildListItemsIncremental(issues []model.Issue, stats *analysis.GraphStats,
 	}
 
 	listItems := make([]IssueItem, len(issues))
-	copy(listItems, prev.ListItems)
 	for i := range listItems {
 		// Fingerprints canonicalize collection order. Keep derived metrics, but
 		// publish the current source order for labels, comments and dependencies.
+		// New rows already have zero transient presentation state, so copying
+		// the previous issue and transient fields would only overwrite them again.
 		listItems[i].Issue = issues[i]
-		clearIssueItemEphemeral(&listItems[i])
+		listItems[i].GraphScore = prev.ListItems[i].GraphScore
+		listItems[i].Impact = prev.ListItems[i].Impact
+		listItems[i].RepoPrefix = prev.ListItems[i].RepoPrefix
 	}
 	for _, id := range diff.Modified {
 		index, ok := prev.listIndexByID[id]
