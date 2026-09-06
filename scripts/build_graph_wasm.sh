@@ -53,6 +53,8 @@ rust_version="$($rustup run "$toolchain" rustc -vV)"
 [[ "$rust_version" == "$want_rustc"$'\n'* ]] || fail "compiler version differs from pinned $want_rustc"
 [[ "$rust_version" == *"commit-hash: $want_commit"* ]] || fail 'compiler commit differs'
 [[ "$rust_version" == *'host: x86_64-unknown-linux-gnu'* ]] || fail 'compiler host differs'
+rust_sysroot="$($rustup run "$toolchain" rustc --print sysroot)"
+resolved_sysroot="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$rust_sysroot")"
 [ "$($rustup run "$toolchain" cargo --version)" = "$want_cargo" ] || fail 'cargo version differs'
 installed_targets="$($rustup target list --installed --toolchain "$toolchain")"
 [[ "$installed_targets" == *"$target"* ]] || incomplete "missing target $target for $toolchain"
@@ -73,6 +75,7 @@ else
 fi
 echo "graph-WASM build artifacts: $out"
 printf '%s\n' "$rust_version" >"$out/rustc.txt"
+printf '%s\n' "$rust_sysroot" "$resolved_sysroot" >"$out/rust-sysroot.txt"
 
 # Fingerprint all compilation inputs and the pipeline, independently of checkout
 # path or unrelated project edits. The manifest cannot be its own hash input.
@@ -127,13 +130,16 @@ while :; do
   ancestor="$(dirname "$ancestor")"
 done
 echo '== cargo build (locked, offline, default features, isolated local compiler)'
+# Unit-separated flags preserve paths containing spaces. Remap the compiler
+# sysroot as well as project/dependency paths: inlined standard-library panic
+# locations otherwise make the WASM depend on where rustup was installed.
 (
   cd "$out/source/bv-graph-wasm"
   env -i HOME="$HOME" PATH="$PATH" LC_ALL=C \
     RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="$out/cargo" \
     CARGO_TARGET_DIR="$out/target" CARGO_HTTP_USER_AGENT='OpenAI File Downloader, XaiImageApiFetch/1.0' \
     RCH_CARGO_WRAPPER_BYPASS=1 \
-    RUSTFLAGS="--remap-path-prefix=$out=/bv-build --remap-path-prefix=$cargo_cache=/cargo" \
+    CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$out=/bv-build"$'\x1f'"--remap-path-prefix=$cargo_cache=/cargo"$'\x1f'"--remap-path-prefix=$rust_sysroot=/rust-toolchain"$'\x1f'"--remap-path-prefix=$resolved_sysroot=/rust-toolchain" \
     "$rustup" run "$toolchain" cargo build --locked --offline --release --target "$target" -j 2
 ) 2>&1 | tee "$out/cargo.log"
 raw="$out/target/$target/release/bv_graph_wasm.wasm"
@@ -159,10 +165,16 @@ receipt.update(schema=1, status='built', pipeline={
     'cargo_flags': '--locked --offline --release --target wasm32-unknown-unknown -j 2',
     'wasm_bindgen': '0.2.121', 'bindgen_flags': '--target web --out-name bv_graph',
     'wasm_opt': '132', 'optimizer_flags': '-Os', 'path_remapping': True,
+    'sysroot_remapping': '/rust-toolchain', 'rustflags_transport': 'CARGO_ENCODED_RUSTFLAGS',
     'bindgen_executable_sha256': '778ec413ee7c3ea501d49b376fef3c390bf1f6e64ece888ed30472f09c3a1923',
     'optimizer_executable_sha256': '1014958e6f20d412f1542320b43970214b0fb1ed780595e8f7c0d8761ed53725'},
     artifacts={name: {'sha256': sha(out/'pkg'/name), 'bytes': (out/'pkg'/name).stat().st_size}
                for name in ('bv_graph.js', 'bv_graph_bg.wasm')})
+# Observed locations are evidence, not pipeline identity: relocating the same
+# compiler must preserve the normalized artifacts. Keep both aliases because
+# Rust library panic locations can contain either spelling of the sysroot.
+sysroots = (out/'rust-sysroot.txt').read_text().splitlines()
+receipt['rust_sysroot'] = {'reported': sysroots[0], 'resolved': sysroots[1]}
 problems = []
 if mode == 'verify':
     manifest = json.loads((vendor/'MANIFEST.json').read_text())

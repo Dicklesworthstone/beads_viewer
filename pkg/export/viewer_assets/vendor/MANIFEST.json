@@ -1,9 +1,9 @@
 {
   "_comment": "Provenance of every vendored viewer asset. scripts/verify_vendor.sh and pkg/export/vendor_manifest_test.go recompute the sha256 of each file and fail on any mismatch or unlisted file. A version of \"unknown\" means the artifact carries no version marker; the hash still pins the exact bytes shipped. Update this file (hash, version, date, reviewed_by) whenever an asset is replaced.",
-  "reviewed_by": "reality-check 2026-09-04 (graph pair: pinned rebuild and five real graph fixtures; other entries retain 2026-09-02 review)",
-  "date": "2026-09-04",
+  "reviewed_by": "reality-check 2026-09-05 (graph pair: byte-identical rebuilds from distinct physical Rust homes and five real graph fixtures; other entries retain 2026-09-02 review)",
+  "date": "2026-09-05",
   "graph_wasm": {
-    "source_sha256": "ea7b88f95e4b397e6a0654b1cc4180bc39b91f1de8fd64d41905afd6d53d24f2",
+    "source_sha256": "f43e07c1faab375fc396ddc132d89870847ee7c07d6adac5e8d471e6fbdbff24",
     "cargo_lock_sha256": "03c9ee83a2503e7b7a22a81547ca1a9f45413827ab80ea071e01a9225e74ec87",
     "pipeline": {
       "bindgen_executable_sha256": "778ec413ee7c3ea501d49b376fef3c390bf1f6e64ece888ed30472f09c3a1923",
@@ -15,6 +15,8 @@
       "optimizer_flags": "-Os",
       "path_remapping": true,
       "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)\nbinary: rustc\ncommit-hash: 90850177249efe0321573c569aec5d12b257f8d6\ncommit-date: 2026-08-30\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0",
+      "rustflags_transport": "CARGO_ENCODED_RUSTFLAGS",
+      "sysroot_remapping": "/rust-toolchain",
       "target": "wasm32-unknown-unknown",
       "wasm_bindgen": "0.2.121",
       "wasm_opt": "132"
@@ -53,7 +55,7 @@
       "upstream": "bv-graph-wasm (this repository)",
       "version": "bv-graph-wasm 0.1.0; paired pinned source rebuild recorded in graph_wasm",
       "license": "MIT (repository license)",
-      "sha256": "d80480e9241e6a71beee560638875c10b313ac8bd4f090ed1dc7e19db6964bb6",
+      "sha256": "46aac677dd75a63d767c4436ad942367483858e7adfa8ae6342a68fdc016b6fe",
       "source_url": "bv-graph-wasm/src",
       "build_command": "scripts/build_graph_wasm.sh (pinned rustc, locked Cargo, wasm-bindgen 0.2.121, Binaryen 132 -Os); see graph_wasm and docs/PROVENANCE.md"
     },

@@ -95,6 +95,7 @@ rebuilds `bv_graph.js` and `bv_graph_bg.wasm` together. The reviewed pipeline is
 | Cargo profile | release, size optimization, LTO, one codegen unit, abort on panic |
 | Bindgen | 0.2.121, Linux musl executable; `--target web --out-name bv_graph` |
 | Binaryen | 132, Linux x86-64 executable; exactly `wasm-opt -Os` |
+| Source paths | Project and Cargo paths remapped; reported and resolved Rust sysroots remapped to `/rust-toolchain`, using unit-separated `CARGO_ENCODED_RUSTFLAGS` to preserve spaces |
 
 The script checks the compiler's full version/commit and the bindgen and
 optimizer executable hashes. It refuses missing tools/target with
@@ -121,16 +122,23 @@ reproducibility controls, not attestations against a malicious build host.
 Each run copies source into a fresh external directory, uses an empty compiler
 output cache and isolated Cargo configuration, remaps filesystem paths, and
 retains its full Cargo log and `receipt.json`. The receipt binds every source
-and pipeline input hash, tool versions/options, and both output hashes. The
-manifest's `graph_wasm` entry binds that source fingerprint and pipeline to
-the two shipped hashes. Unrelated working-tree edits do not change this
-fingerprint; the release gate separately requires the entire checkout clean.
+and pipeline input hash, tool versions/options, and both output hashes. It also
+records the reported and resolved physical Rust sysroot outside the normalized
+pipeline identity. The manifest's `graph_wasm` entry binds that source
+fingerprint and pipeline to the two shipped hashes. Unrelated working-tree
+edits do not change this fingerprint; the release gate separately requires the
+entire checkout clean.
 
 For a source update, first run `scripts/build_graph_wasm.sh --build-only`.
 This produces a review candidate and a `built` receipt, without claiming that
 the shipped artifact matches. Review the API and graph results, then update
 both vendor files and the manifest together. The default verification command
-must then succeed. `tests/scripts/graph_wasm_test.sh` runs two isolated builds,
+must then succeed. `tests/scripts/graph_wasm_test.sh` runs two isolated builds
+from distinct physical Rust homes with byte-identical installed compiler
+components, while preserving the user's `HOME`. The original check varied
+checkout and output directories but shared a Rust home; a later clean release
+build exposed seven embedded standard-library source paths that still depended
+on that location. Explicit sysroot remapping removes that dependency. The test
 executes the actual modules against all five committed graph fixtures, tests
 the viewer's HITS field adapter, and rejects tool, source, glue and byte drift.
 Existing Go goldens constrain shared graph semantics; eigenvector and some

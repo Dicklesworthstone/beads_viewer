@@ -39,11 +39,49 @@ fixture() {
   printf '%s\n' "$path"
 }
 
-# Separate copies, output roots and empty compiler target caches.
+# Separate copies, output roots and empty compiler target caches. The second
+# compiler has identical component bytes at a different physical sysroot. A
+# shared Rust home missed embedded rust-src panic paths in the original proof.
 first="$(fixture 'first source')"
 second="$(fixture 'second source')"
 run_build build-a "$first"
-run_build build-b "$second"
+toolchain=nightly-2026-08-31
+host=x86_64-unknown-linux-gnu
+pinned_sysroot="$(rustup run "$toolchain" rustc --print sysroot)"
+relocated_home="$tmp/relocated rust home"
+relocated_sysroot="$relocated_home/toolchains/$toolchain-$host"
+mkdir -p "$relocated_sysroot/bin" "$relocated_sysroot/lib/rustlib"
+# Copy only compiler/Cargo, their libraries, the host and WASM target, and
+# optional installed Rust sources. No tool installation, user HOME change,
+# docs, other compilation targets, downloads or shared toolchain edits.
+for name in rustc cargo cargo-rch-real; do
+  if [ -e "$pinned_sysroot/bin/$name" ]; then
+    cp -a --reflink=auto "$pinned_sysroot/bin/$name" "$relocated_sysroot/bin/"
+  fi
+done
+for path in "$pinned_sysroot/lib/"* "$pinned_sysroot/lib/rustlib/"*; do
+  if [ -f "$path" ]; then
+    relative="${path#"$pinned_sysroot/"}"
+    cp -a --reflink=auto "$path" "$relocated_sysroot/$relative"
+  fi
+done
+for name in "$host" wasm32-unknown-unknown src; do
+  if [ -d "$pinned_sysroot/lib/rustlib/$name" ]; then
+    cp -a --reflink=auto "$pinned_sysroot/lib/rustlib/$name" "$relocated_sysroot/lib/rustlib/"
+  fi
+done
+python3 - "$pinned_sysroot" "$relocated_sysroot" <<'PY'
+import pathlib, sys
+original, relocated = [pathlib.Path(p).resolve() for p in sys.argv[1:]]
+assert original != relocated, 'compiler was not physically relocated'
+files = [p for p in relocated.rglob('*') if p.is_file()]
+assert files, 'relocated compiler is empty'
+for p in files:
+    relative = p.relative_to(relocated)
+    assert p.read_bytes() == (original/relative).read_bytes(), relative
+print(f'ok: {len(files)} relocated compiler component files exactly match {original}')
+PY
+RUSTUP_HOME="$relocated_home" run_build build-b "$second"
 python3 - "$tmp/build-a/receipt.json" "$tmp/build-b/receipt.json" <<'PY'
 import json, sys
 a, b = [json.load(open(p)) for p in sys.argv[1:]]
@@ -51,7 +89,9 @@ assert a['status'] == b['status'] == 'verified'
 assert a['source_sha256'] == b['source_sha256']
 assert a['pipeline'] == b['pipeline']
 assert a['artifacts'] == b['artifacts']
-print('ok: two isolated source rebuilds produce identical glue/WASM and verified receipts')
+assert a['rust_sysroot']['resolved'] != b['rust_sysroot']['resolved']
+assert a['pipeline']['sysroot_remapping'] == '/rust-toolchain'
+print('ok: two physical Rust homes produce identical glue/WASM and verified receipts')
 PY
 
 # All five committed graph fixtures execute in the actual shipped and rebuilt
