@@ -15,23 +15,62 @@ const (
 	DependenciesUnknown     DependencyState = "unknown"
 )
 
-// ReadinessIndex owns the full source snapshot independently of display and
+// ReadinessIndex owns readiness data for the full source independently of display and
 // ranking scopes. Construction is O(issues + edges); readiness lookups are O(1).
 // It does not compute expensive graph metrics or mutate the caller's issues.
 type ReadinessIndex struct {
-	issues   map[string]Issue
+	issues   map[string]readinessIssue
 	states   map[string]DependencyState
 	children map[string][]string
 }
 
+// Keep only decision inputs. Copy dependency values into one slice per issue
+// instead of cloning display text, comments and separately allocated edges.
+type readinessIssue struct {
+	Status       Status
+	IssueType    IssueType
+	Assignee     string
+	DeferUntil   *time.Time
+	Dependencies []readinessDependency
+}
+
+type readinessDependency struct {
+	DependsOnID string
+	Type        DependencyType
+}
+
+func (issue readinessIssue) isDeferredAt(now time.Time) bool {
+	return issue.DeferUntil != nil && issue.DeferUntil.After(now)
+}
+
 func NewReadinessIndex(issues []Issue) *ReadinessIndex {
 	r := &ReadinessIndex{
-		issues:   make(map[string]Issue, len(issues)),
+		issues:   make(map[string]readinessIssue, len(issues)),
 		states:   make(map[string]DependencyState, len(issues)),
 		children: make(map[string][]string),
 	}
 	for _, issue := range issues {
-		r.issues[issue.ID] = issue.Clone()
+		owned := readinessIssue{
+			Status:    issue.Status,
+			IssueType: issue.IssueType,
+			Assignee:  issue.Assignee,
+		}
+		if issue.DeferUntil != nil {
+			deferUntil := *issue.DeferUntil
+			owned.DeferUntil = &deferUntil
+		}
+		if len(issue.Dependencies) > 0 {
+			owned.Dependencies = make([]readinessDependency, 0, len(issue.Dependencies))
+			for _, dep := range issue.Dependencies {
+				if dep != nil {
+					owned.Dependencies = append(owned.Dependencies, readinessDependency{
+						DependsOnID: dep.DependsOnID,
+						Type:        dep.Type,
+					})
+				}
+			}
+		}
+		r.issues[issue.ID] = owned
 	}
 	r.compute()
 	return r
@@ -56,9 +95,6 @@ func (r *ReadinessIndex) compute() {
 	for id, issue := range r.issues {
 		r.states[id] = DependenciesSatisfied
 		for _, dep := range issue.Dependencies {
-			if dep == nil {
-				continue
-			}
 			if dep.Type == DepParentChild {
 				r.children[dep.DependsOnID] = append(r.children[dep.DependsOnID], id)
 			}
@@ -123,7 +159,7 @@ func (r *ReadinessIndex) DependencyState(id string) DependencyState {
 func (r *ReadinessIndex) Ready(id string, now time.Time) bool {
 	issue, exists := r.issues[id]
 	return exists && (issue.Status == StatusOpen || issue.Status == StatusInProgress) &&
-		!issue.IsDeferredAt(now) && r.DependencyState(id) == DependenciesSatisfied
+		!issue.isDeferredAt(now) && r.DependencyState(id) == DependenciesSatisfied
 }
 
 func (r *ReadinessIndex) Claimable(id string, now time.Time) bool {
@@ -151,9 +187,6 @@ func (r *ReadinessIndex) Blockers(id string) []string {
 	}
 	set := make(map[string]bool)
 	for _, dep := range issue.Dependencies {
-		if dep == nil {
-			continue
-		}
 		other, exists := r.issues[dep.DependsOnID]
 		if dep.Type.IsBlocking() && (!exists || !closedForReadiness(other.Status)) ||
 			dep.Type == DepParentChild && r.DependencyState(dep.DependsOnID) != DependenciesSatisfied {
@@ -176,7 +209,7 @@ func (r *ReadinessIndex) ReadyAfter(id string, now time.Time, completed map[stri
 		return r.Ready(id, now)
 	}
 	issue, exists := r.issues[id]
-	if !exists || completed[id] || (issue.Status != StatusOpen && issue.Status != StatusInProgress) || issue.IsDeferredAt(now) {
+	if !exists || completed[id] || (issue.Status != StatusOpen && issue.Status != StatusInProgress) || issue.isDeferredAt(now) {
 		return false
 	}
 	states := make(map[string]DependencyState)
@@ -196,9 +229,6 @@ func (r *ReadinessIndex) ReadyAfter(id string, now time.Time, completed map[stri
 		visiting[id] = true
 		state := DependenciesSatisfied
 		for _, dep := range issue.Dependencies {
-			if dep == nil {
-				continue
-			}
 			if dep.Type.IsBlocking() {
 				other, exists := r.issues[dep.DependsOnID]
 				if !exists {

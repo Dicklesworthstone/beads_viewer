@@ -274,6 +274,57 @@ func TestReadinessDeepParentsAndClockBoundary(t *testing.T) {
 	}
 }
 
+func TestReadinessOwnsMutableDecisionInputs(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	deferred := now.Add(time.Hour)
+	issues := []Issue{
+		{ID: "gate", Status: StatusOpen, IssueType: TypeTask},
+		{ID: "parent", Status: StatusOpen, IssueType: TypeTask, Dependencies: []*Dependency{nil, {DependsOnID: "gate", Type: DepBlocks}}},
+		{ID: "child", Status: StatusOpen, IssueType: TypeTask, Dependencies: []*Dependency{{DependsOnID: "parent", Type: DepParentChild}}},
+		{ID: "deferred", Status: StatusOpen, IssueType: TypeTask, DeferUntil: &deferred},
+		{ID: "assigned", Status: StatusOpen, IssueType: TypeTask, Assignee: "owner"},
+		{ID: "epic", Status: StatusOpen, IssueType: TypeEpic},
+	}
+	index := NewReadinessIndex(issues)
+	verify := func() {
+		t.Helper()
+		for _, tc := range []struct {
+			id        string
+			ready     bool
+			claimable bool
+		}{
+			{"gate", true, true}, {"parent", false, false}, {"child", false, false},
+			{"deferred", false, false}, {"assigned", true, false}, {"epic", true, false},
+		} {
+			if index.Ready(tc.id, now) != tc.ready || index.Claimable(tc.id, now) != tc.claimable {
+				t.Fatalf("readiness changed for %s: ready=%v claimable=%v", tc.id, index.Ready(tc.id, now), index.Claimable(tc.id, now))
+			}
+		}
+		if got := index.Blockers("parent"); len(got) != 1 || got[0] != "gate" {
+			t.Fatalf("parent blockers changed: %v", got)
+		}
+		if got := index.Blockers("child"); len(got) != 1 || got[0] != "parent" {
+			t.Fatalf("inherited blockers changed: %v", got)
+		}
+		if !index.ReadyAfter("child", now, map[string]bool{"gate": true}) ||
+			!index.HasOpenChildren("parent") || !index.Claimable("deferred", now.Add(time.Hour)) {
+			t.Fatal("completion, parent, or deferral boundary changed")
+		}
+	}
+	verify()
+	// Mutate the caller's values, pointed-to timestamp, dependency objects and
+	// slices. A readiness snapshot must retain every original decision.
+	issues[0].Status = StatusClosed
+	issues[1].Dependencies[1].DependsOnID = "missing"
+	issues[1].Dependencies[1].Type = DepRelated
+	issues[2].Dependencies[0] = &Dependency{DependsOnID: "missing", Type: DepBlocks}
+	issues[2].Dependencies = append(issues[2].Dependencies, &Dependency{DependsOnID: "other", Type: DepParentChild})
+	deferred = now.Add(-time.Hour)
+	issues[4].Assignee = ""
+	issues[5].IssueType = TypeTask
+	verify()
+}
+
 func TestStatus_IsValid(t *testing.T) {
 	tests := []struct {
 		name   string
