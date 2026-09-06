@@ -1,13 +1,18 @@
 package export
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 // containsString is a helper for checking error messages (case-insensitive)
@@ -25,13 +30,69 @@ func TestCreateSchema(t *testing.T) {
 		t.Fatalf("Failed to open database: %v", err)
 	}
 	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA synchronous=FULL`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA journal_mode=DELETE`); err != nil {
+		t.Fatal(err)
+	}
+	// Observe actual SQLite commits on this database's sole connection.
+	var commits atomic.Int64
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = conn.Raw(func(raw any) error {
+		hooks, ok := raw.(interface{ RegisterCommitHook(sqlite.CommitHookFn) })
+		if !ok {
+			return fmt.Errorf("SQLite connection does not expose commit hooks: %T", raw)
+		}
+		hooks.RegisterCommitHook(func() int32 {
+			commits.Add(1)
+			return 0
+		})
+		return nil
+	})
+	closeErr := conn.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
 
 	// Create schema
 	if err := CreateSchema(db); err != nil {
 		t.Fatalf("CreateSchema failed: %v", err)
 	}
+	if got := commits.Load(); got != 1 {
+		t.Errorf("schema creation committed %d times; want one durable transaction", got)
+	}
+	if err := CreateSchema(db); err != nil {
+		t.Fatalf("repeated CreateSchema failed: %v", err)
+	}
+	var synchronous int
+	var journalMode string
+	if err := db.QueryRow(`PRAGMA synchronous`).Scan(&synchronous); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`PRAGMA journal_mode`).Scan(&journalMode); err != nil {
+		t.Fatal(err)
+	}
+	if synchronous != 2 || journalMode != "delete" {
+		t.Fatalf("schema creation changed durability: synchronous=%d journal_mode=%s", synchronous, journalMode)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
 
-	// Verify tables exist (comments added in bv-52)
+	// Verify the complete schema survives closing and reopening the database.
 	tables := []string{"issues", "dependencies", "comments", "issue_metrics", "triage_recommendations", "export_meta"}
 	for _, table := range tables {
 		var name string
@@ -42,13 +103,126 @@ func TestCreateSchema(t *testing.T) {
 	}
 
 	// Verify indexes exist (comments indexes added in bv-52)
-	indexes := []string{"idx_issues_status", "idx_issues_priority", "idx_deps_issue", "idx_comments_issue", "idx_comments_created"}
+	indexes := []string{
+		"idx_issues_status", "idx_issues_priority", "idx_issues_updated", "idx_issues_type_status",
+		"idx_deps_issue", "idx_deps_depends", "idx_deps_type",
+		"idx_comments_issue", "idx_comments_created", "idx_metrics_score", "idx_metrics_pagerank",
+	}
 	for _, idx := range indexes {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, idx).Scan(&name)
 		if err != nil {
 			t.Errorf("Index %s not found: %v", idx, err)
 		}
+	}
+}
+
+func TestCreateSchemaRollsBackFailedDDL(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "rollback.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	// This existing table permits the earlier DDL but rejects a late index
+	// because triage_score is absent. Existing schema and user rows must survive.
+	if _, err := db.Exec(`CREATE TABLE issue_metrics (issue_id TEXT PRIMARY KEY, sentinel TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO issue_metrics VALUES ('existing', 'preserve me')`); err != nil {
+		t.Fatal(err)
+	}
+	readSchema := func() [][4]string {
+		t.Helper()
+		rows, err := db.Query(`SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema ORDER BY type, name`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var schema [][4]string
+		for rows.Next() {
+			var entry [4]string
+			if err := rows.Scan(&entry[0], &entry[1], &entry[2], &entry[3]); err != nil {
+				t.Fatal(err)
+			}
+			schema = append(schema, entry)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return schema
+	}
+	before := readSchema()
+	err = CreateSchema(db)
+	var sqliteErr *sqlite.Error
+	if err == nil || !strings.Contains(err.Error(), "create indexes: create index:") || !errors.As(err, &sqliteErr) {
+		t.Fatalf("expected wrapped SQLite index error, got %v", err)
+	}
+	if after := readSchema(); !reflect.DeepEqual(after, before) {
+		t.Fatalf("failed schema creation left partial DDL: before=%v after=%v", before, after)
+	}
+	var sentinel string
+	if err := db.QueryRow(`SELECT sentinel FROM issue_metrics WHERE issue_id='existing'`).Scan(&sentinel); err != nil {
+		t.Fatal(err)
+	}
+	if sentinel != "preserve me" {
+		t.Fatalf("existing row changed: %q", sentinel)
+	}
+	if db.Stats().InUse != 0 {
+		t.Fatal("failed schema creation retained its connection")
+	}
+}
+
+func TestCreateSchemaCommitFailureRollsBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "locked.sqlite3")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`CREATE TABLE existing (value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO existing VALUES ('preserve me')`); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	readTx, err := reader.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readTx.Rollback()
+	var value string
+	if err := readTx.QueryRow(`SELECT value FROM existing`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	// The real reader's shared lock permits schema writes in a transaction,
+	// but prevents their commit until the reader releases that lock.
+	err = CreateSchema(db)
+	var sqliteErr *sqlite.Error
+	if err == nil || !strings.Contains(err.Error(), "commit schema:") || !errors.As(err, &sqliteErr) {
+		t.Fatalf("expected wrapped SQLite commit failure, got %v", err)
+	}
+	if err := readTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	var added int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_schema WHERE name <> 'existing'`).Scan(&added); err != nil {
+		t.Fatal(err)
+	}
+	if added != 0 {
+		t.Fatalf("failed commit left %d schema objects", added)
+	}
+	if err := db.QueryRow(`SELECT value FROM existing`).Scan(&value); err != nil || value != "preserve me" {
+		t.Fatalf("existing data lost: %q, %v", value, err)
+	}
+	if err := CreateSchema(db); err != nil {
+		t.Fatalf("schema retry after releasing reader failed: %v", err)
 	}
 }
 

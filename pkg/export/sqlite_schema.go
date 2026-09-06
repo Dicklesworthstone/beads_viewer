@@ -12,30 +12,39 @@ import (
 // Schema version for tracking migrations
 const SchemaVersion = 1
 
-// CreateSchema creates all tables, indexes, and triggers in the database.
+// CreateSchema creates all tables and indexes in one durable transaction.
 func CreateSchema(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin schema: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Create tables in order of dependencies
-	if err := createCoreTables(db); err != nil {
+	if err := createCoreTables(tx); err != nil {
 		return fmt.Errorf("create core tables: %w", err)
 	}
 
-	if err := createMetricsTables(db); err != nil {
+	if err := createMetricsTables(tx); err != nil {
 		return fmt.Errorf("create metrics tables: %w", err)
 	}
 
-	if err := createIndexes(db); err != nil {
+	if err := createIndexes(tx); err != nil {
 		return fmt.Errorf("create indexes: %w", err)
 	}
 
-	if err := createMetaTable(db); err != nil {
+	if err := createMetaTable(tx); err != nil {
 		return fmt.Errorf("create meta table: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit schema: %w", err)
 	}
 
 	return nil
 }
 
 // createCoreTables creates the issues, dependencies, and comments tables.
-func createCoreTables(db *sql.DB) error {
+func createCoreTables(tx *sql.Tx) error {
 	// Issues table - core issue data
 	issuesSQL := `
 		CREATE TABLE IF NOT EXISTS issues (
@@ -55,7 +64,7 @@ func createCoreTables(db *sql.DB) error {
 			closed_at TEXT
 		)
 	`
-	if _, err := db.Exec(issuesSQL); err != nil {
+	if _, err := tx.Exec(issuesSQL); err != nil {
 		return fmt.Errorf("create issues table: %w", err)
 	}
 
@@ -70,7 +79,7 @@ func createCoreTables(db *sql.DB) error {
 			FOREIGN KEY (depends_on_id) REFERENCES issues(id)
 		)
 	`
-	if _, err := db.Exec(depsSQL); err != nil {
+	if _, err := tx.Exec(depsSQL); err != nil {
 		return fmt.Errorf("create dependencies table: %w", err)
 	}
 
@@ -86,7 +95,7 @@ func createCoreTables(db *sql.DB) error {
 			FOREIGN KEY (issue_id) REFERENCES issues(id)
 		)
 	`
-	if _, err := db.Exec(commentsSQL); err != nil {
+	if _, err := tx.Exec(commentsSQL); err != nil {
 		return fmt.Errorf("create comments table: %w", err)
 	}
 
@@ -94,7 +103,7 @@ func createCoreTables(db *sql.DB) error {
 }
 
 // createMetricsTables creates tables for computed graph metrics.
-func createMetricsTables(db *sql.DB) error {
+func createMetricsTables(tx *sql.Tx) error {
 	// Issue metrics - computed by bv analysis
 	metricsSQL := `
 		CREATE TABLE IF NOT EXISTS issue_metrics (
@@ -108,7 +117,7 @@ func createMetricsTables(db *sql.DB) error {
 			FOREIGN KEY (issue_id) REFERENCES issues(id)
 		)
 	`
-	if _, err := db.Exec(metricsSQL); err != nil {
+	if _, err := tx.Exec(metricsSQL); err != nil {
 		return fmt.Errorf("create issue_metrics table: %w", err)
 	}
 
@@ -124,7 +133,7 @@ func createMetricsTables(db *sql.DB) error {
 			FOREIGN KEY (issue_id) REFERENCES issues(id)
 		)
 	`
-	if _, err := db.Exec(triageSQL); err != nil {
+	if _, err := tx.Exec(triageSQL); err != nil {
 		return fmt.Errorf("create triage_recommendations table: %w", err)
 	}
 
@@ -132,7 +141,7 @@ func createMetricsTables(db *sql.DB) error {
 }
 
 // createIndexes creates performance indexes for common queries.
-func createIndexes(db *sql.DB) error {
+func createIndexes(tx *sql.Tx) error {
 	indexes := []string{
 		// Issues indexes
 		`CREATE INDEX IF NOT EXISTS idx_issues_status ON issues(status)`,
@@ -155,7 +164,7 @@ func createIndexes(db *sql.DB) error {
 	}
 
 	for _, sql := range indexes {
-		if _, err := db.Exec(sql); err != nil {
+		if _, err := tx.Exec(sql); err != nil {
 			return fmt.Errorf("create index: %w", err)
 		}
 	}
@@ -164,14 +173,14 @@ func createIndexes(db *sql.DB) error {
 }
 
 // createMetaTable creates the export metadata table.
-func createMetaTable(db *sql.DB) error {
+func createMetaTable(tx *sql.Tx) error {
 	metaSQL := `
 		CREATE TABLE IF NOT EXISTS export_meta (
 			key TEXT PRIMARY KEY,
 			value TEXT
 		)
 	`
-	if _, err := db.Exec(metaSQL); err != nil {
+	if _, err := tx.Exec(metaSQL); err != nil {
 		return fmt.Errorf("create export_meta table: %w", err)
 	}
 
