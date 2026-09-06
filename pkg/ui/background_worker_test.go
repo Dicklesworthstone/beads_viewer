@@ -949,7 +949,7 @@ func TestBackgroundWorker_LargeDatasetWarning(t *testing.T) {
 
 	snapshot := worker.GetSnapshot()
 	if snapshot == nil {
-		t.Fatal("Expected snapshot after refresh")
+		t.Fatalf("Expected snapshot after refresh: state=%v metrics=%+v error=%v", worker.State(), worker.Metrics(), worker.LastError())
 	}
 	if snapshot.DatasetTier != datasetTierLarge {
 		t.Fatalf("expected datasetTierLarge, got %v", snapshot.DatasetTier)
