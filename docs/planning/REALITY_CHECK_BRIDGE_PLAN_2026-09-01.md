@@ -7,13 +7,15 @@ The complete September 4 assessment and earlier records remain below as historic
 baselines. Their defect descriptions and task statuses are not the current verdict.
 
 **Source boundary:** the implementation, tests, documentation and assets were
-committed on `main` through `809c2ea8`.
+committed on `main` through `84603abf` (runtime through `a07d2a7b`).
 The continuation adds compact readiness data, incremental UI rows, atomic SQLite
 schema creation, reproducible WASM sysroot mapping, benchmark isolation, and removal
 of a durable flush for regenerable analysis cache data. It also removes redundant
 ready-set construction and issue copies from parallel-gain analysis, replaces
 reflection-based integer sorting, and fixes elapsed-time leakage in pinned-clock
-robot insights. Earlier runtime evidence remains bound to its
+robot insights. Full list construction now initializes destination rows directly;
+the real-history correlation test freezes its original input and retains its
+original thresholds. Earlier runtime evidence remains bound to its
 identified source snapshots; these commits do not establish a new packaged or
 published release. The 34 campaign beads currently comprise **22 closed, eight
 open, one in progress and three blocked**. The 12 remaining items include three
@@ -34,9 +36,13 @@ Neither these counts nor the status table imply a percentage of product completi
 2. **What still does not meet the vision:** installed `br --claim` can reopen a
    stale closed issue, the native platform matrix is incomplete, and no clean
    packaged release contains all these changes. The latest complete release gate
-   fails an insights cold/warm elapsed-field comparison; its 14 benchmarks pass.
-   The elapsed-field repair passes focused independent tests, but still needs a
-   complete combined-source gate. Current-source responsiveness acceptance remains open.
+   has eight passing stages and two failures: a drifting real-history fixture and
+   a 30.6% full-list benchmark regression against a 20% limit. The elapsed-field
+   repair passes that gate's E2E coverage. Subsequent row initialization improves
+   a bounded benchmark, but independent checks retain a three-second snapshot
+   deadline miss and an 18.65-second correlation run against a 15-second limit.
+   A complete gate on the combined source and current-source responsiveness
+   acceptance remain open.
    Search has a useful fixed evaluation, not human-reviewed field-quality evidence.
    Documentation has verified examples but still awaits the final capability freeze.
 3. **What is blocking completion:** S5 needs an authorized, fixed live tracker;
@@ -72,7 +78,7 @@ for each numbered goal are retained in the September 4 table below.
 | 5 | Immediate degree/topology/density and asynchronous expensive metrics | WORKING | Graph analysis and metric-state tests pass. The newly found initial prepared-result handoff is fixed and included in the latest full UI race run; no universal timing bound follows. |
 | 6 | PageRank, betweenness, HITS, eigenvector and critical path | WORKING | Algorithms, invariance controls and ordinary suites pass. Configured approximation, skips and timeouts remain visible; exactness is not promised for approximate metrics. |
 | 7 | Cycles, k-core, articulation points and slack | WORKING | Actual graph paths and controls pass. Cycle output remains representative SCC cycles, not enumeration of every simple cycle. |
-| 8 | Repeatable analysis with visible computation status | WORKING | Canonical hash old/current parity, scoped ranking identity and fixed-clock controls pass. The latest gate exposed parallel-gain elapsed time in pinned output; the repair passes the actual failing-before/passing-after CLI test and retains ordinary timing. Configured approximation remains visible. |
+| 8 | Repeatable analysis with visible computation status | WORKING | Canonical hash old/current parity, scoped ranking identity and fixed-clock controls pass. An earlier gate exposed parallel-gain elapsed time in pinned output; the repair passes focused tests and the latest complete gate's relevant E2E coverage while retaining ordinary timing. Configured approximation remains visible. |
 | 9 | Rank ordinary work and explain recommendations | WORKING | Triage/priority paths retain positive recommendation tests; scoped candidates and provisional source authority are explicit. Scores remain heuristics. |
 | 10 | Safe ready queue, parallel tracks and unblock counts | WORKING | S3 tests parent inheritance, unknown blockers, closed/tombstone predecessors, scoped context, deferral boundaries and actual reload. Computational readiness is distinct from safe execution of an external claim (row 11). |
 | 11 | `--robot-next` emits only justified next actions | PARTIAL | Typed origin-bound routes and historical/partial/unknown refusals work. Installed br still reopens stale closed work during claim; the unchanged required live test remains red (S5). |
@@ -87,13 +93,13 @@ for each numbered goal are retained in the September 4 table below.
 | 20 | Recipe export format, graph inclusion and templates | WORKING | P4 actual Markdown/JSON/CSV/Mermaid reports, template resolution, graph options, hooks and override tests pass. Rendered-output controls preserve literal issue data and intentional template Markdown. |
 | 21 | Hashed text retrieval plus configurable graph ranking | WORKING | S2 keeps eligible candidates before limits, raw text thresholds before boosts, exact-ID behavior and full-source index identity. This remains keyword hashing, not learned semantic embeddings. |
 | 22 | Useful search quality at scale | PARTIAL | P5 now has frozen reasoned judgments and 600 actual CLI observations across three sizes and five configurations, independently replayed. Prefix ranking defects improved; human review and real-workload generalization remain unproven. |
-| 23 | Git history through three correlation strategies | WORKING | Co-commit, explicit-ID and temporal paths plus feedback remain implemented and tested. Evidence confidence remains heuristic. |
+| 23 | Git history through three correlation strategies | WORKING | Co-commit, explicit-ID and temporal paths plus feedback remain implemented and tested. The real-history fixture now binds the original 500-commit window and its boundary match; all semantic assertions pass, but its 15-second timing requirement remains unmet on one verification host. Evidence confidence remains heuristic. |
 | 24 | Orphans, file relations, related issues and impact networks | WORKING | Existing extractors, indexes, network tests and ordinary CLI paths pass; no calibrated prediction claim. |
 | 25 | Sprints, burndown, scope changes and risk | WORKING | Sprint and scoped burndown paths remain covered; declared historical sprint limitations remain. |
 | 26 | Forecast and capacity as documented heuristics | WORKING | Actual documented explicit-estimate and missing-estimate examples now match hand-computed outputs. This is not a scheduler or a calibrated confidence interval. |
 | 27 | Label health, cross-label flow and attention | WORKING | Existing analysis/views and robot paths retain tests; full authority and selected-candidate scope are preserved. |
 | 28 | Alerts, baselines and hygiene suggestions | WORKING | Actual seven-case alerts regression proves shared authority, scope and clock. Typed hygiene actions have real isolated mutation/readback positives, including legacy-cycle repair; installed claim safety remains separately red. |
-| 29 | Responsive list/detail, board/tree/graph/insights navigation | WORKING | Actual navigation, rendered content and full UI race tests pass. Prepared-row reuse, compact dependency details and detached history input have completed the original repeated acceptance matrix and independent raw review. Timing scope remains the measured list/detail paths and reference host. |
+| 29 | Responsive list/detail, board/tree/graph/insights navigation | WORKING | Actual navigation and rendered-content paths pass. Prepared-row reuse, compact dependency details and detached history input have completed the original repeated acceptance matrix and independent raw review. The latest full UI race run retains one 5,000-row snapshot delivery deadline miss; current-source timing remains row 41. |
 | 30 | Live reload, background snapshots and stale-result rejection | WORKING | Scope/authority hashes, hidden-row changes, append/rename retries, force-refresh clock, cancellation and stale-result controls pass. Latest full UI race includes startup prepared-analysis delivery; performance is row 41. |
 | 31 | Tutorial, help, sidebar and cass | WORKING | Existing UI and integration paths remain; actual external cass availability is environmental, not established on every host. |
 | 32 | Markdown/Mermaid/SVG/PNG and standalone graph exports | WORKING | Report/graph/export paths pass; source diagnostics and exact payload timestamps survive export. Live action routes have the S5 limit. |
@@ -101,23 +107,44 @@ for each numbered goal are retained in the September 4 table below.
 | 34 | Offline/mobile dashboard search, graph and persistence | WORKING | V4 used actual Chromium desktop and 360px viewport journeys, stopped-server offline reload, graph/search and persistence, with missing/corrupt asset negatives. Physical phones, Safari and every browser remain untested. |
 | 35 | Hooks, failure propagation and browser opt-out | WORKING | Actual report/hook ordering, failure paths and browser opt-out tests pass. Browser automation was separately explicit, not silently launched by ordinary tests. |
 | 36 | Verified updater and versioned downloads | WORKING | Native Linux amd64 and Windows x64 install/update/no-update paths and corrupt/wrong-version preservation controls pass. Remaining native/distribution scope is row 39. |
-| 37 | Release bytes correspond to a fully checked source commit | PARTIAL | V1 rejects skipped/missing/dirty evidence and binds real package bytes to source. The latest complete `f46d62a2` gate has nine passing stages and one E2E elapsed-field failure; its receipt is ineligible. The subsequent repair and optimizations need a new complete gate before packaging. The frozen dataset survives source archiving and loads through the real CLI; its bytes and baseline remain unchanged. |
+| 37 | Release bytes correspond to a fully checked source commit | PARTIAL | V1 rejects skipped/missing/dirty evidence and binds real package bytes to source. The latest complete `0eb30ee2` gate has eight passing stages, a real-history fixture failure and a full-list benchmark failure; its receipt is ineligible. Subsequent changes need a new complete gate before packaging. The frozen dataset survives source archiving and loads through the real CLI; its bytes and baseline remain unchanged. |
 | 38 | Vendored assets correspond to reviewed source | WORKING | V2 rebuilds graph WASM/glue with the pinned pipeline and checks source/output identity plus graph parity. Local Go rendering patches have explicit provenance and do not reach version-suffixed `go install`; see limits below. |
 | 39 | Supported Windows/macOS/Linux installation and upgrades | PARTIAL | Native Linux amd64, Windows x64 and isolated Linux amd64 Nix subsets pass. Public Homebrew/Scoop URLs and hashes match v0.22.0, behind GitHub v0.23.0. Native macOS amd64/arm64 and Linux ARM64 execution remain outstanding (V5). |
 | 40 | Dependable local/remote release verification | PARTIAL | V3 isolation/trust/ancestor/editor controls pass. Latest local and fresh-source RCH suites each pass all 29 packages with the isolated fixed tracker; their 36 and 56 skips remain explicit. Installed-br suites retain the stale-claim failure, and the clean packaged gate is not complete. |
-| 41 | 10k+ browsing and the advertised frame-rate experience | PARTIAL | The earlier full 1k/5k/10k reference-host matrix passes: 144 current UI cohorts, 144,000 observations, worst cohort p99 30.862ms and maximum snapshot/Phase 2 handlers 12.255/19.050ms. Independent review retains 57.616ms individual interactions, configured degradation and extra unpaired generations. P1 was reopened for later changes. At September 6 06:57 UTC, the `809714c3` run has all 288 UI records (current worst p99 32.136ms) and 34 of 72 timed CLI records; current realistic-10k warm p99 is 10.988s. Exact-output and slowdown-canary stages remain pending. This run is not bound to `809c2ea8`, and neither matrix establishes terminal paint, universal 60fps or unmeasured workloads. |
+| 41 | 10k+ browsing and the advertised frame-rate experience | PARTIAL | The earlier reference-host matrix passes within its recorded limits. The complete `809714c3` run now also passes: 288 UI records with 1,000 samples each, 72 timed CLI records with 200 samples each, 36 exact records/144 repeated outputs, and the slowdown canary. Root re-verifies the original artifacts. Current UI worst p99 is 32.136ms; realistic-10k warm CLI p99 is 10.988s and maximum 27.566s. Highest post-cohort heap is 1.438GB versus baseline 1.368GB; skipped metrics and a seven-second transfer overlap remain disclosed. The separate `0eb30ee2` run continues. Later full-row initialization affects setup and concurrent reloads, so neither completed matrix establishes current-source acceptance, terminal paint, universal 60fps or unmeasured workloads. |
 | 42 | Reference docs/examples match running behavior | PARTIAL | Actual copied YAML, jq, forecast, key-dispatch and configured-threshold examples pass. P2 remains blocked until current-source performance, live-action and native-delivery claims can be settled. |
 
 ### Evidence that changes the verdict, and its boundaries
 
-- **Latest complete source gate:** the original ten-stage gate on clean `f46d62a2`
-  finishes in 1489.657 seconds on `vmi1153651`: nine stages pass, E2E fails, and
-  no stage skips. All 14 original best-of-four benchmark comparisons pass within
-  the unchanged 20% limit (worst 10.3%). The sole E2E failure is
-  `TestRace_DataConsistency/insights`: parallel-gain `duration_ms` is 1 on the cold
-  call and omitted on the warm call. Other decoded fields match. Its receipt
-  remains ineligible under
-  `/data/tmp/bv-release-9a36de53.XMDoZf13/gate-f46d62a2.B859JgWW/`.
+- **Latest complete source gate:** the original ten-stage gate on clean `0eb30ee2`
+  finishes in 848.078 seconds on `vmi1149989`: eight stages pass, E2E and benchmarks
+  fail, and no stage skips. The real-history test observes five explicit matches
+  against its floor of six. Full-list construction regresses 30.6%, beyond the
+  unchanged 20% limit; the other 13 tracked benchmarks pass. All raw rounds remain
+  retained, including shared-host contention. The receipt is ineligible under
+  `/data/tmp/bv-release-final-preflight-5hdryndn/complete-gate-c0eplo35/`.
+  The preceding `f46d62a2` gate remains a separate nine-pass/one-failure result:
+  its pinned-clock elapsed-field defect is repaired in the later source.
+- **Full-row initialization (`a07d2a7b`):** the profile identifies avoidable row
+  copying. The same reset helper now initializes each allocated row directly.
+  A hand-computed row-content control passes before and after the change. The
+  original full-list benchmark, run for ten seconds in each A/B/B/A observation
+  on one host, reports 265,625/243,560/256,769/291,543 ns per operation. Both new
+  observations beat both old observations; allocations remain 532,288 bytes and
+  1,001 allocations. The unchanged incremental control overlaps. Build/vet and
+  first-party formatting pass. Full UI race checks report 1,986 passes, eight
+  existing skips and one existing three-second snapshot deadline failure. This
+  is a bounded improvement, not a passing full suite or replacement gate.
+- **Stable real-history input (`84603abf`):** four new commits moved the known
+  `bv-142` explicit match from position 500 to 504 without changing correlation
+  code. The test now uses the original real `f46d62a2` history with the current
+  CLI, requires that boundary pair, and preserves all original floors and the
+  15-second interval. Its semantic assertions pass, but a focused run on
+  `vmi1156319` takes 18.647 seconds and fails. A diagnostic profile on another
+  host does not clear that failure. Explain intentionally walks the full history
+  and remains unrestricted. No speculative correlation optimization or focused
+  retry was added. Existing failed CLI and worker-deadline messages now retain
+  stderr and worker state respectively; these diagnostics change no verdict.
 - **Pinned-clock repair (`0a7ec4ab`):** valid `SOURCE_DATE_EPOCH` now omits measured
   parallel-gain elapsed time, matching core metric status. Normal and invalid-epoch
   calls retain timing. The real 200-issue CLI test fails the original on elapsed
