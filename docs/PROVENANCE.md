@@ -31,12 +31,28 @@ change was checked on 248 common-input records and four actual detail frames,
 including dense trees, with both builder patches enabled on both sides. These
 comparisons retain complete raw ANSI output.
 
+The vendored `github.com/goccy/go-json` v0.10.6 uses its existing race-build
+`sync.RWMutex` scheme in `internal/decoder/compile_norace.go` too. Its upstream
+normal build reads and writes a cached `Decoder` interface without synchronization.
+Concurrent first use can observe a partially published interface; a real 10,000-issue
+CLI run panicked with a nil `*structDecoder` receiver. The patch protects cache
+lookup and publication while retaining compilation outside the lock, the existing
+slow path, and all decoder semantics. It covers all callers of this cache, including
+the loader's issue, record-type and nested dependency decoders. Ordinary `-race`
+tests select the already protected upstream variant, so fresh normal-binary CLI
+checks are necessary to exercise the repaired path. See the upstream
+[normal build](https://github.com/goccy/go-json/blob/v0.10.6/internal/decoder/compile_norace.go),
+[race build](https://github.com/goccy/go-json/blob/v0.10.6/internal/decoder/compile_race.go)
+and [concurrent-decoding crash report](https://github.com/goccy/go-json/issues/474).
+
 These patches apply to builds using this checkout's vendor directory,
 including the Nix build. `go mod vendor` replaces them, so review and reapply
 them until upstream versions include the fixes. Version-suffixed
 [`go install`](https://go.dev/ref/mod#go-install) ignores vendored dependencies;
-those installations do not include these optimizations. No timing claim for a
-vendored build applies automatically to them.
+those installations include neither these optimizations nor the decoder-cache
+safety repair. Build from this checkout with vendoring to include the repair.
+No correctness or timing claim for a locally patched dependency applies
+automatically to an installation that bypasses it.
 
 ## Dashboard assets
 

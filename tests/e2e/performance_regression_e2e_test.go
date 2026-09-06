@@ -213,6 +213,171 @@ func TestPerf_LargeDatasetLatency(t *testing.T) {
 	}
 }
 
+// TestParallelLoaderColdStartPreservesGraph exercises the decoder used by an
+// ordinary executable. go-json historically selected a different cache under
+// -race, and serial-before-parallel comparisons warmed that cache. Each child
+// below starts a new process with a large file as its first issue input. This
+// bounded cohort is future coverage, not a guarantee of reproducing every race
+// schedule; the observed production crash remains the original negative.
+func TestParallelLoaderColdStartPreservesGraph(t *testing.T) {
+	bv := buildBvBinary(t)
+	info, err := buildinfo.ReadFile(bv)
+	if err != nil {
+		t.Fatalf("read actual CLI build information: %v", err)
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "-race" && setting.Value != "false" {
+			t.Fatalf("cold decoder regression requires an ordinary non-race CLI: %+v", setting)
+		}
+		if setting.Key == "-tags" {
+			for _, tag := range strings.FieldsFunc(setting.Value, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+				if tag == "race" {
+					t.Fatal("explicit race build tag selects the wrong decoder implementation")
+				}
+			}
+		}
+	}
+	t.Logf("actual non-race CLI=%q go=%s", bv, info.GoVersion)
+
+	const issueCount, freshRuns = 2000, 8
+	type graphNode struct {
+		ID       string   `json:"id"`
+		Title    string   `json:"title"`
+		Status   string   `json:"status"`
+		Priority int      `json:"priority"`
+		Labels   []string `json:"labels"`
+	}
+	type graphEdge struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+		Type string `json:"type"`
+	}
+	for _, kind := range []string{"issue-only", "explicit-type", "dependencies"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			beadsDir := filepath.Join(dir, ".beads")
+			if err := os.Mkdir(beadsDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			var data bytes.Buffer
+			encoder := json.NewEncoder(&data) // stdlib fixture encoding cannot warm a child decoder.
+			wantNodes := make([]graphNode, issueCount)
+			var wantEdges []graphEdge
+			for i := 0; i < issueCount; i++ {
+				id := fmt.Sprintf("cold-%04d", i)
+				node := graphNode{
+					ID: id, Title: fmt.Sprintf("Cold decode %04d α", i),
+					Status: []string{"open", "in_progress", "closed"}[i%3], Priority: i % 5,
+					Labels: []string{"cold", fmt.Sprintf("group-%d", i%7)},
+				}
+				wantNodes[i] = node
+				row := map[string]any{
+					"id": id, "title": node.Title, "status": node.Status, "priority": node.Priority,
+					"labels": node.Labels, "issue_type": "task",
+					"description": strings.Repeat("decoder padding ", 160),
+					"created_at":  "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+				}
+				if node.Status == "closed" {
+					row["closed_at"] = "2026-01-01T00:00:00Z"
+				}
+				if kind == "explicit-type" {
+					row["_type"] = "issue"
+				}
+				if kind == "dependencies" && i%2 == 1 {
+					target := fmt.Sprintf("cold-%04d", i-1)
+					edgeType := []string{"blocks", "related", "parent-child", "discovered-from"}[(i/2)%4]
+					dependency := map[string]any{
+						"issue_id": id, "type": edgeType,
+						"created_at": "2026-01-01T00:00:00Z", "created_by": "cold-start",
+					}
+					// All three accepted target spellings enter the custom dependency decoder.
+					dependency[[]string{"depends_on_id", "depends_on", "target_id"}[(i/2)%3]] = target
+					row["dependencies"] = []any{dependency}
+					wantEdges = append(wantEdges, graphEdge{From: id, To: target, Type: edgeType})
+				}
+				if err := encoder.Encode(row); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// These are the public loader's byte/line dispatch thresholds. Do not
+			// force an internal parser or warm a decoder before invoking the CLI.
+			if data.Len() <= 4<<20 || bytes.Count(data.Bytes(), []byte{'\n'}) != issueCount || issueCount <= 512 {
+				t.Fatalf("fixture does not reach parallel dispatch: bytes=%d rows=%d", data.Len(), issueCount)
+			}
+			path := filepath.Join(beadsDir, "issues.jsonl")
+			if err := os.WriteFile(path, data.Bytes(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			inputHash := sha256.Sum256(data.Bytes())
+			for run := 0; run < freshRuns; run++ {
+				t.Run(fmt.Sprintf("fresh-%02d", run+1), func(t *testing.T) {
+					cache := t.TempDir()
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					cmd := exec.CommandContext(ctx, bv, "--robot-graph", "--graph-format=json", "--db", path)
+					cmd.Dir = dir
+					for _, value := range os.Environ() {
+						key, _, _ := strings.Cut(value, "=")
+						if !strings.HasPrefix(key, "BV_") && !strings.HasPrefix(key, "BEADS_") && !strings.HasPrefix(key, "BD_") && key != "SOURCE_DATE_EPOCH" {
+							cmd.Env = append(cmd.Env, value)
+						}
+					}
+					cmd.Env = append(cmd.Env, "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "BV_NO_SAVED_CONFIG=1", "BV_CACHE_DIR="+cache)
+					var stderr bytes.Buffer
+					cmd.Stderr = &stderr
+					output, err := cmd.Output()
+					t.Logf("binary=%q argv=%q input_sha256=%x stdout_sha256=%x exit=%v stderr=%q", bv, cmd.Args[1:], inputHash, sha256.Sum256(output), err, stderr.String())
+					if err != nil || stderr.Len() != 0 {
+						t.Fatalf("fresh CLI failed: %v, deadline=%v\nstdout: %s\nstderr: %s", err, ctx.Err(), output, stderr.String())
+					}
+					var got struct {
+						Format          string         `json:"format"`
+						Nodes           int            `json:"nodes"`
+						Edges           int            `json:"edges"`
+						SourceAuthority map[string]any `json:"source_authority"`
+						Adjacency       struct {
+							Nodes []graphNode `json:"nodes"`
+							Edges []graphEdge `json:"edges"`
+						} `json:"adjacency"`
+					}
+					if err := json.Unmarshal(output, &got); err != nil {
+						t.Fatalf("invalid graph JSON: %v\n%s", err, output)
+					}
+					if got.Format != "json" || got.Nodes != issueCount || len(got.Adjacency.Nodes) != issueCount || got.Edges != len(wantEdges) || len(got.Adjacency.Edges) != len(wantEdges) {
+						t.Fatalf("incomplete graph: format=%s nodes=%d/%d edges=%d/%d, want %d nodes/%d edges", got.Format, got.Nodes, len(got.Adjacency.Nodes), got.Edges, len(got.Adjacency.Edges), issueCount, len(wantEdges))
+					}
+					for field, want := range map[string]any{
+						"state": "complete", "valid": float64(issueCount), "visible": float64(issueCount), "loaded": float64(1),
+						"failed": float64(0), "disabled": float64(0), "errors": float64(0), "skipped": float64(0),
+						"read_errors": float64(0), "tombstones": float64(0), "warning_count": float64(0),
+					} {
+						if value, exists := got.SourceAuthority[field]; !exists || value != want {
+							t.Fatalf("source accounting %s=%v (present=%v), want %v", field, value, exists, want)
+						}
+					}
+					// Graph export exposes these source fields, not description or
+					// timestamps. Check every row and edge against the fixture oracle.
+					for i, node := range got.Adjacency.Nodes {
+						want := wantNodes[i]
+						if node.ID != want.ID || node.Title != want.Title || node.Status != want.Status || node.Priority != want.Priority || len(node.Labels) != 2 || node.Labels[0] != want.Labels[0] || node.Labels[1] != want.Labels[1] {
+							t.Fatalf("node %d differs: got %+v, want %+v", i, node, want)
+						}
+					}
+					for i, edge := range got.Adjacency.Edges {
+						if edge != wantEdges[i] {
+							t.Fatalf("edge %d differs: got %+v, want %+v", i, edge, wantEdges[i])
+						}
+					}
+					after, err := os.ReadFile(path)
+					if err != nil || sha256.Sum256(after) != inputHash {
+						t.Fatalf("CLI changed the input fixture: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
 func writePerformanceFixture(t testing.TB, dir, kind string, size int) string {
 	t.Helper()
 	issues, err := testutil.PerformanceIssues(kind, size, 20260904)

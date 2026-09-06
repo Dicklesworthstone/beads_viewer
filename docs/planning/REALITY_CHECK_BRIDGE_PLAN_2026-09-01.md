@@ -17,9 +17,12 @@ robot insights. Full list construction now initializes destination rows directly
 the real-history correlation test freezes its original input and retains its
 original thresholds. Earlier runtime evidence remains bound to its
 identified source snapshots. The complete ten-stage gate and five unpublished
-archives now bind to clean `15bd2a1d`; extracted Linux and native Windows runtime
-checks pass. The final-source responsiveness matrix remains in progress. No release
-was published. The 34 campaign
+archives bind to clean `15bd2a1d`; extracted Linux and native Windows runtime
+checks pass. Its completed responsiveness matrix subsequently exposed a real
+parallel-loader crash. The archives contain that defect and have not been released.
+The current repair synchronizes decoder-cache publication and corrects automatic
+pseudo-version filtering; focused checks pass, with committed-source and full
+acceptance checks still required. The 34 campaign
 beads currently comprise **22 closed, eight
 open, one in progress and three blocked**. The 12 remaining items include three
 epics and the final verification task; they are not 12 independent product defects.
@@ -45,14 +48,19 @@ Neither these counts nor the status table imply a percentage of product completi
    Earlier failed gates and independent three-second snapshot and 18.65-second
    correlation deadline misses remain retained. This passing host does not prove
    universal deadlines. Extracted Linux and native Windows archive checks pass;
-   current-source responsiveness acceptance remains open.
+   the later full responsiveness run fails with a nil decoder receiver during
+   a real 10,000-issue CLI load. A separate full run also reveals automatic
+   pseudo-version leakage and eight metric timeouts. The candidate decoder and
+   version repairs pass focused checks; they are absent from those archives.
+   Current-source responsiveness acceptance remains open.
    Search has a useful fixed evaluation, not human-reviewed field-quality evidence.
    Documentation has verified examples but still awaits the final capability freeze.
 3. **What is blocking completion:** S5 needs an authorized, fixed live tracker;
    V5 needs known login routes for the reachable Macs and an actual Linux ARM64
    runner. Public package-store versions and hashes have been checked. P1 needs
-   the current-source performance evidence. The source-bound archives pass the
-   available Linux/Windows runtime subset. None can be replaced by more reports,
+   verification of the decoder/version repairs and current-source performance
+   evidence. The source-bound archives pass the available Linux/Windows runtime
+   subset but retain the subsequently observed decoder defect. None can be replaced by more reports,
    cross-compilation, a loading frame, or an external draft's green tests.
 4. **Would the remaining beads finish the accepted vision?** They cover the known
    residuals of the deliberately narrowed product, provided their original positive
@@ -62,7 +70,8 @@ Neither these counts nor the status table imply a percentage of product completi
 5. **Which known goals lack active coverage?** None of the identified residuals is
    `NO_BEAD`: P1 covers responsiveness, S5 live action safety, V5 native delivery,
    P2 final documentation, and `bv-oonu.11` the final source/package check and rescore.
-   The latest startup handoff defect was corrected within the existing P1 work.
+   Startup handoff, decoder publication and automatic version filtering are covered
+   within the existing P1 work.
 
 ### Rescored vision: all 42 original rows
 
@@ -74,14 +83,14 @@ for each numbered goal are retained in the September 4 table below.
 
 | # | Original testable goal | Current status | Current evidence and remaining limit |
 |---|---|---|---|
-| 1 | Read current br and legacy JSONL | WORKING | Loader/datasource and actual CLI paths pass; both issue filenames remain supported. |
+| 1 | Read current br and legacy JSONL | PARTIAL | Both issue filenames remain supported. A full normal-binary run exposes a concurrent decoder-cache crash. The candidate cache repair passes 24 fresh-process graph checks and affected-package tests; full current-source acceptance remains pending. |
 | 2 | Tolerate BOM/CRLF, large lines and malformed records | WORKING | Parser controls remain; S4 counts record loss and makes incomplete authority visible. Concurrent append/replacement retries preserve the identity guard and persistent-error reporting. |
 | 3 | Select issue sources; explicit DB, redirects and worktrees | WORKING | Actual source-routing and explicit database tests pass, including namespaced/local IDs and native Windows SQLite paths. Native target limits remain row 39. |
 | 4 | Aggregate workspaces with namespaces and collision checks | WORKING | S4 preserves per-source results, closed/tombstone authority and cross-repository dependencies; collisions fail. Partial loads retain exploratory output with diagnostics and no proven claims. |
 | 5 | Immediate degree/topology/density and asynchronous expensive metrics | WORKING | Graph analysis and metric-state tests pass. The newly found initial prepared-result handoff is fixed and included in the latest full UI race run; no universal timing bound follows. |
 | 6 | PageRank, betweenness, HITS, eigenvector and critical path | WORKING | Algorithms, invariance controls and ordinary suites pass. Configured approximation, skips and timeouts remain visible; exactness is not promised for approximate metrics. |
 | 7 | Cycles, k-core, articulation points and slack | WORKING | Actual graph paths and controls pass. Cycle output remains representative SCC cycles, not enumeration of every simple cycle. |
-| 8 | Repeatable analysis with visible computation status | WORKING | Canonical hash old/current parity, scoped ranking identity and fixed-clock controls pass. An earlier gate exposed parallel-gain elapsed time in pinned output; the repair passes focused tests and the latest complete gate's relevant E2E coverage while retaining ordinary timing. Configured approximation remains visible. |
+| 8 | Repeatable analysis with visible computation status | PARTIAL | Canonical hash, scoped ranking and fixed-clock controls pass, and elapsed-field leakage is repaired. The full 0eb run retains eight timeout mismatches and automatic pseudo-version leakage; a timeout can change recommendations even with unchanged inputs. Status remains visible, but repeatability across timeout boundaries is not established. The version repair passes focused old/new controls. |
 | 9 | Rank ordinary work and explain recommendations | WORKING | Triage/priority paths retain positive recommendation tests; scoped candidates and provisional source authority are explicit. Scores remain heuristics. |
 | 10 | Safe ready queue, parallel tracks and unblock counts | WORKING | S3 tests parent inheritance, unknown blockers, closed/tombstone predecessors, scoped context, deferral boundaries and actual reload. Computational readiness is distinct from safe execution of an external claim (row 11). |
 | 11 | `--robot-next` emits only justified next actions | PARTIAL | Typed origin-bound routes and historical/partial/unknown refusals work. Installed br still reopens stale closed work during claim; the unchanged required live test remains red (S5). |
@@ -110,16 +119,65 @@ for each numbered goal are retained in the September 4 table below.
 | 34 | Offline/mobile dashboard search, graph and persistence | WORKING | V4 used actual Chromium desktop and 360px viewport journeys, stopped-server offline reload, graph/search and persistence, with missing/corrupt asset negatives. Physical phones, Safari and every browser remain untested. |
 | 35 | Hooks, failure propagation and browser opt-out | WORKING | Actual report/hook ordering, failure paths and browser opt-out tests pass. Browser automation was separately explicit, not silently launched by ordinary tests. |
 | 36 | Verified updater and versioned downloads | WORKING | Native Linux amd64 and Windows x64 install/update/no-update paths and corrupt/wrong-version preservation controls pass. Remaining native/distribution scope is row 39. |
-| 37 | Release bytes correspond to a fully checked source commit | WORKING | The original complete `15bd2a1d` gate passes all ten stages without skips. The original package wrapper seals five actual Go 1.25.5/CGO-disabled archives to that clean source, verifies embedded revision and checksums, and retains an eligible receipt. Extracted Linux smoke/scope/partial/action-route checks and native Windows JSONL/SQLite execution pass. A local scratch tag identifies these unpublished archives; cross-compilation is not native Mac/ARM proof. Earlier ineligible receipts remain unchanged. |
-| 38 | Vendored assets correspond to reviewed source | WORKING | V2 rebuilds graph WASM/glue with the pinned pipeline and checks source/output identity plus graph parity. Local Go rendering patches have explicit provenance and do not reach version-suffixed `go install`; see limits below. |
+| 37 | Release bytes correspond to a fully checked source commit | WORKING | The original complete `15bd2a1d` gate passes all ten stages without skips, and its package wrapper seals five actual Go 1.25.5/CGO-disabled archives to that clean source. Embedded revision, checksums, extracted Linux and native Windows subsets pass. Source identity does not establish freedom from defects: the later full P1 run crashes, so these unpublished archives remain affected and do not contain the candidate repair. Earlier receipts remain unchanged. |
+| 38 | Vendored assets correspond to reviewed source | WORKING | V2 rebuilds graph WASM/glue with the pinned pipeline and checks source/output identity plus graph parity. Local Go rendering and decoder safety patches have explicit provenance. Version-suffixed `go install` excludes these patches, including the safety repair; checkout builds using vendor include them. |
 | 39 | Supported Windows/macOS/Linux installation and upgrades | PARTIAL | Native Linux amd64, Windows x64 and isolated Linux amd64 Nix subsets pass. Public Homebrew/Scoop URLs and hashes match v0.22.0, behind GitHub v0.23.0. Native macOS amd64/arm64 and Linux ARM64 execution remain outstanding (V5). |
 | 40 | Dependable local/remote release verification | PARTIAL | V3 isolation/trust/ancestor/editor controls pass. Earlier local and fresh-source RCH suites each pass all 29 packages with the isolated fixed tracker; their 36 and 56 skips remain explicit. The clean 15bd gate, source-bound packaging and extracted Linux action routes now pass on a maintainer worker with that isolated tracker. Installed-br suites retain the stale-claim failure. |
-| 41 | 10k+ browsing and the advertised frame-rate experience | PARTIAL | The earlier reference-host matrix passes within its recorded limits. The complete `809714c3` run also passes: 288 UI records with 1,000 samples each, 72 timed CLI records with 200 samples each, 36 exact records/144 repeated outputs, and the slowdown canary. Root re-verifies the original artifacts. Current UI worst p99 is 32.136ms; realistic-10k warm CLI p99 is 10.988s and maximum 27.566s. Highest post-cohort heap is 1.438GB versus baseline 1.368GB; skipped metrics and a seven-second transfer overlap remain disclosed. Separate original `0eb30ee2` and final-source `15bd2a1d` runs continue. Later full-row initialization affects setup and concurrent reloads, so neither completed matrix establishes current-source acceptance, terminal paint, universal 60fps or unmeasured workloads. |
+| 41 | 10k+ browsing and the advertised frame-rate experience | PARTIAL | Earlier reference-host and `809714c3` matrices pass within their recorded limits. Both later full runs finish red: `0eb30ee2` has version/parity and timeout failures; `15bd2a1d` has a parallel-loader panic and only 70/72 complete CLI records. All 288 UI records on 15bd pass, with worst cell p99 31.437ms but an individual interaction reaching 89.487ms; exact-output and slowdown controls pass. None establishes current repaired-source acceptance, terminal paint, universal 60fps or unmeasured workloads. |
 | 42 | Reference docs/examples match running behavior | PARTIAL | Actual copied YAML, jq, forecast, key-dispatch and configured-threshold examples pass. P2 remains blocked until current-source performance, live-action and native-delivery claims can be settled. |
 
 ### Evidence that changes the verdict, and its boundaries
 
-- **Current source and archive binding:** the original ten-stage gate on clean
+- **Completed 15bd matrix failure and repair:** the original run at
+  `hz3:/data/tmp/bv-p1-latency-15bd2a1d-default` finishes red after 2h56m38s.
+  All 288 UI records/288,000 interactions and 36 exact records/144 outputs pass,
+  as does the slowdown control. Timed CLI output has 70 complete records/14,000
+  samples. Realistic-10k warm current sample 0094 panics in
+  `(*structDecoder).Decode(nil)` during parallel loading; its pair retains 190
+  attempted outputs, including one empty output, without invented summaries for
+  either incomplete record. The original verifier correctly rejects both missing
+  summaries. The panic stream SHA-256 is
+  `c90f6e8a8993ffe99a606ea46a9dfdaaeb8042804aed063e4d1eaf7574211e5b`;
+  the original 6,641,707-byte input hash is
+  `715da9267c995a2ec291e654282833fac10bd2282a344efdfe1fd47eafad8596`.
+  The normal go-json build publishes multiword decoder interfaces without
+  synchronization; its race build already locks this cache and therefore masks
+  this production path in ordinary race tests. The candidate applies that same
+  lock scheme to the normal build, with compilation and decoding outside the lock.
+  No prewarming, error recovery or parser-threshold change substitutes for the fix.
+  The earlier archives and their receipts remain intact, with a local known-issues
+  note identifying the affected source.
+- **Completed 0eb matrix failure:** the separate original run at
+  `vmi1227854:/data/tmp/bv-p1-final-0eb30ee2.HgVLTVCP/full-latency-default`
+  finishes red after 9,420.670 seconds. All 72 timed records/14,400 samples exist,
+  but eight actual betweenness timeout mismatches make six pairs inconclusive;
+  seven change recommendations. All 36 exact records fail because the tagless
+  clean build reports `v0.0.0-20260906065919-0eb30ee2824b` instead of the fallback
+  version. Full JSON comparison finds no other exact-output difference. The
+  original 200ms metric limits and all failures remain unchanged. UI has all
+  288 records, with three unpaired refresh generations disclosed; the slowdown
+  control passes. The version repair recognizes all three Go pseudo-version forms
+  while retaining legitimate prereleases and explicit injected version labels.
+  The old filter fails nine focused controls; the new table passes all 25.
+- **Focused candidate verification:** the combined five-file candidate passes
+  all-package build/vet and formatting on actual Go 1.25.5. Its new normal-CLI
+  regression executes 24 fresh processes across issue-only, explicit-type and
+  nested-dependency inputs; every exported node, edge and source count agrees.
+  Affected loader/model/version/analysis/correlation race suites report 2,139
+  passes and 20 existing skips, with no failures. Evidence remains under
+  `vmi1149989:/data/tmp/bv-release-final-preflight-5hdryndn/decoder-fix-review-bfuf7ana`.
+  These are focused checks of the recorded candidate hashes, not a complete
+  release gate or performance matrix. A separate 201-call original-binary
+  diagnostic does not reproduce the intermittent crash and does not clear it.
+  The candidate also completes 201 fresh CLI calls with all 10,000 issues,
+  empty stderr and no timeout. The existing 5,000-issue loader benchmark runs
+  once in A/B/B/A order: 106.962/111.245/109.463/106.713 ms per operation.
+  The candidate mean is 3.3% higher, a measured cost accepted for the safety fix;
+  allocated bytes are 174,385,701/174,388,923/174,389,867/174,385,400 and
+  allocations are 651,164/651,201/651,215/651,152. These four observations
+  are descriptive, not a universal bound. All raw streams remain at
+  `hz3:/data/tmp/bv-loader-cache-lock-20260906`.
+- **Earlier source and archive binding:** the original ten-stage gate on clean
   `15bd2a1d` finishes with ten passes and no failures or skips on `vmi1149989`.
   Source fingerprints agree before and after; both full race suites, generated
   docs, pinned actions, the actual locked WASM rebuild, all 14 benchmark comparisons,
@@ -133,9 +191,9 @@ for each numbered goal are retained in the September 4 table below.
   `d57ba0b92210f666babd4f4b9b84be917d101b694b313f9da619ef0fdc428503`, under
   `/data/tmp/bv-release-final-preflight-5hdryndn/complete-gate-15bd2a1d-syttpk3t/`.
   A scratch-only `v0.23.1-rc.20260906.15bd2a1d` tag identifies the archives;
-  nothing was pushed or installed. The full final-source P1 run remains separate
-  work in progress. Later tracker/report commits do not change
-  the source identity these archives prove.
+  nothing was pushed or installed. Its later full P1 run fails as recorded above.
+  Later tracker/report commits and the candidate runtime repair do not change
+  the source identity or known defect in these archives.
 - **Actual archive execution:** the extracted Linux executable passes the original
   58-command smoke, all 40 six-issue scope cases, the partial-workspace old/current
   control, and all 14 live-route subcases. Root checks the raw hashes, results and
@@ -410,11 +468,11 @@ matrix remains on `hz3` at
 
 | Work | Current state | Concrete completion still required |
 |---|---|---|
-| P1: `bv-apal.1` / `.2` | In progress / open | Finish the unchanged current-source responsiveness matrix, preserve exact result/status parity and the deliberate slowdown control, and evaluate only profiled optimizations. The latest original release benchmark passes; earlier failed gates remain retained. |
+| P1: `bv-apal.1` / `.2` | In progress / open | Measure and freeze the decoder/version repairs; verify actual clean tagless CLI behavior, then run the original complete gate and repaired-source responsiveness matrix. Preserve the failed 0eb/15bd runs, all result/status parity, original deadlines and slowdown control. No retry-to-green or independent-regression closure. |
 | S5: `bv-xbvo.9` / `.10` | Blocked / open | Authorization and application of the reviewed external tracker fix, then independent real live tracker claim/close-race and bv route proof. Retain ordinary claim positives; no draft-only closure. |
 | V5: `bv-oonu.9` / `.10` | Blocked / open | Obtain known Mac login routes and native macOS amd64/arm64 and Linux ARM64 execution. Store manifest identity and prior Nix behavior are verified; publication remains separate. Recheck affected current-source build paths; no substitute-platform credit. |
 | P2: `bv-apal.3` / `.4` | Blocked / open | Reconcile final supported capabilities, limits and examples after current-source P1 and S5/V5 settle; independently verify the resulting claims. Existing corrected examples need no process-only rewrite. |
-| Epics `bv-xbvo`, `bv-oonu`, `bv-apal`; final `bv-oonu.11` | Open | Complete their original child acceptance. The original complete source gate, packaging, extracted Linux regressions and native Windows runtime subset pass on 15bd; current-source performance and external prerequisites remain pending. This rescore does not close unmet child criteria. |
+| Epics `bv-xbvo`, `bv-oonu`, `bv-apal`; final `bv-oonu.11` | Open | Complete their original child acceptance. Earlier source-bound packaging and Linux/Windows subsets pass, but those 15bd archives retain the discovered crash. Repaired-source gate, performance and artifact verification plus external prerequisites remain pending. This rescore does not close unmet child criteria. |
 
 Work should proceed on those actual blockers, with small measured fixes and the
 existing tests. No new feature campaign, duplicate task graph, closure audit loop
