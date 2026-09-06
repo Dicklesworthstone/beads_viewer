@@ -7,10 +7,13 @@ The complete September 4 assessment and earlier records remain below as historic
 baselines. Their defect descriptions and task statuses are not the current verdict.
 
 **Source boundary:** the implementation, tests, documentation and assets were
-committed on `main` through `809714c3f0755bbd024207cd5bb4bce6d8715971`.
+committed on `main` through `809c2ea8`.
 The continuation adds compact readiness data, incremental UI rows, atomic SQLite
 schema creation, reproducible WASM sysroot mapping, benchmark isolation, and removal
-of a durable flush for regenerable analysis cache data. Earlier runtime evidence remains bound to its
+of a durable flush for regenerable analysis cache data. It also removes redundant
+ready-set construction and issue copies from parallel-gain analysis, replaces
+reflection-based integer sorting, and fixes elapsed-time leakage in pinned-clock
+robot insights. Earlier runtime evidence remains bound to its
 identified source snapshots; these commits do not establish a new packaged or
 published release. The 34 campaign beads currently comprise **22 closed, eight
 open, one in progress and three blocked**. The 12 remaining items include three
@@ -31,7 +34,9 @@ Neither these counts nor the status table imply a percentage of product completi
 2. **What still does not meet the vision:** installed `br --claim` can reopen a
    stale closed issue, the native platform matrix is incomplete, and no clean
    packaged release contains all these changes. The latest complete release gate
-   fails one benchmark; current-source responsiveness acceptance remains open.
+   fails an insights cold/warm elapsed-field comparison; its 14 benchmarks pass.
+   The elapsed-field repair passes focused independent tests, but still needs a
+   complete combined-source gate. Current-source responsiveness acceptance remains open.
    Search has a useful fixed evaluation, not human-reviewed field-quality evidence.
    Documentation has verified examples but still awaits the final capability freeze.
 3. **What is blocking completion:** S5 needs an authorized, fixed live tracker;
@@ -67,7 +72,7 @@ for each numbered goal are retained in the September 4 table below.
 | 5 | Immediate degree/topology/density and asynchronous expensive metrics | WORKING | Graph analysis and metric-state tests pass. The newly found initial prepared-result handoff is fixed and included in the latest full UI race run; no universal timing bound follows. |
 | 6 | PageRank, betweenness, HITS, eigenvector and critical path | WORKING | Algorithms, invariance controls and ordinary suites pass. Configured approximation, skips and timeouts remain visible; exactness is not promised for approximate metrics. |
 | 7 | Cycles, k-core, articulation points and slack | WORKING | Actual graph paths and controls pass. Cycle output remains representative SCC cycles, not enumeration of every simple cycle. |
-| 8 | Repeatable analysis with visible computation status | WORKING | Canonical hash old/current parity, scoped ranking identity and fixed-clock controls pass. Generated times, elapsed durations and configured approximation retain their documented meanings. |
+| 8 | Repeatable analysis with visible computation status | WORKING | Canonical hash old/current parity, scoped ranking identity and fixed-clock controls pass. The latest gate exposed parallel-gain elapsed time in pinned output; the repair passes the actual failing-before/passing-after CLI test and retains ordinary timing. Configured approximation remains visible. |
 | 9 | Rank ordinary work and explain recommendations | WORKING | Triage/priority paths retain positive recommendation tests; scoped candidates and provisional source authority are explicit. Scores remain heuristics. |
 | 10 | Safe ready queue, parallel tracks and unblock counts | WORKING | S3 tests parent inheritance, unknown blockers, closed/tombstone predecessors, scoped context, deferral boundaries and actual reload. Computational readiness is distinct from safe execution of an external claim (row 11). |
 | 11 | `--robot-next` emits only justified next actions | PARTIAL | Typed origin-bound routes and historical/partial/unknown refusals work. Installed br still reopens stale closed work during claim; the unchanged required live test remains red (S5). |
@@ -96,16 +101,49 @@ for each numbered goal are retained in the September 4 table below.
 | 34 | Offline/mobile dashboard search, graph and persistence | WORKING | V4 used actual Chromium desktop and 360px viewport journeys, stopped-server offline reload, graph/search and persistence, with missing/corrupt asset negatives. Physical phones, Safari and every browser remain untested. |
 | 35 | Hooks, failure propagation and browser opt-out | WORKING | Actual report/hook ordering, failure paths and browser opt-out tests pass. Browser automation was separately explicit, not silently launched by ordinary tests. |
 | 36 | Verified updater and versioned downloads | WORKING | Native Linux amd64 and Windows x64 install/update/no-update paths and corrupt/wrong-version preservation controls pass. Remaining native/distribution scope is row 39. |
-| 37 | Release bytes correspond to a fully checked source commit | PARTIAL | V1 rejects skipped/missing/dirty evidence and binds real package bytes to source. The complete `809714c3` gate has nine passing stages and one benchmark failure; its receipt is ineligible and no package was produced. The frozen dataset survives source archiving and loads through the real CLI; its bytes and baseline remain unchanged. |
+| 37 | Release bytes correspond to a fully checked source commit | PARTIAL | V1 rejects skipped/missing/dirty evidence and binds real package bytes to source. The latest complete `f46d62a2` gate has nine passing stages and one E2E elapsed-field failure; its receipt is ineligible. The subsequent repair and optimizations need a new complete gate before packaging. The frozen dataset survives source archiving and loads through the real CLI; its bytes and baseline remain unchanged. |
 | 38 | Vendored assets correspond to reviewed source | WORKING | V2 rebuilds graph WASM/glue with the pinned pipeline and checks source/output identity plus graph parity. Local Go rendering patches have explicit provenance and do not reach version-suffixed `go install`; see limits below. |
 | 39 | Supported Windows/macOS/Linux installation and upgrades | PARTIAL | Native Linux amd64, Windows x64 and isolated Linux amd64 Nix subsets pass. Public Homebrew/Scoop URLs and hashes match v0.22.0, behind GitHub v0.23.0. Native macOS amd64/arm64 and Linux ARM64 execution remain outstanding (V5). |
 | 40 | Dependable local/remote release verification | PARTIAL | V3 isolation/trust/ancestor/editor controls pass. Latest local and fresh-source RCH suites each pass all 29 packages with the isolated fixed tracker; their 36 and 56 skips remain explicit. Installed-br suites retain the stale-claim failure, and the clean packaged gate is not complete. |
-| 41 | 10k+ browsing and the advertised frame-rate experience | PARTIAL | The earlier full 1k/5k/10k reference-host matrix passes: 144 current UI cohorts, 144,000 observations, worst cohort p99 30.862ms and maximum snapshot/Phase 2 handlers 12.255/19.050ms. Independent review retains 57.616ms individual interactions, configured degradation and extra unpaired generations. P1 was reopened for later implementation changes; the original-size `809714c3` matrix is still running. Neither result establishes terminal paint, universal 60fps or unmeasured workloads. |
+| 41 | 10k+ browsing and the advertised frame-rate experience | PARTIAL | The earlier full 1k/5k/10k reference-host matrix passes: 144 current UI cohorts, 144,000 observations, worst cohort p99 30.862ms and maximum snapshot/Phase 2 handlers 12.255/19.050ms. Independent review retains 57.616ms individual interactions, configured degradation and extra unpaired generations. P1 was reopened for later changes. At September 6 06:57 UTC, the `809714c3` run has all 288 UI records (current worst p99 32.136ms) and 34 of 72 timed CLI records; current realistic-10k warm p99 is 10.988s. Exact-output and slowdown-canary stages remain pending. This run is not bound to `809c2ea8`, and neither matrix establishes terminal paint, universal 60fps or unmeasured workloads. |
 | 42 | Reference docs/examples match running behavior | PARTIAL | Actual copied YAML, jq, forecast, key-dispatch and configured-threshold examples pass. P2 remains blocked until current-source performance, live-action and native-delivery claims can be settled. |
 
 ### Evidence that changes the verdict, and its boundaries
 
-- **September 6 source gate:** the unchanged ten-stage gate on clean `809714c3`,
+- **Latest complete source gate:** the original ten-stage gate on clean `f46d62a2`
+  finishes in 1489.657 seconds on `vmi1153651`: nine stages pass, E2E fails, and
+  no stage skips. All 14 original best-of-four benchmark comparisons pass within
+  the unchanged 20% limit (worst 10.3%). The sole E2E failure is
+  `TestRace_DataConsistency/insights`: parallel-gain `duration_ms` is 1 on the cold
+  call and omitted on the warm call. Other decoded fields match. Its receipt
+  remains ineligible under
+  `/data/tmp/bv-release-9a36de53.XMDoZf13/gate-f46d62a2.B859JgWW/`.
+- **Pinned-clock repair (`0a7ec4ab`):** valid `SOURCE_DATE_EPOCH` now omits measured
+  parallel-gain elapsed time, matching core metric status. Normal and invalid-epoch
+  calls retain timing. The real 200-issue CLI test fails the original on elapsed
+  time and passes the repair; original cold/warm assertions also pass independently
+  and on root replay. The new test was calibrated from 1,000 to 200 issues after
+  the original 1,000-issue call exceeded its unchanged 30-second deadline; that
+  timeout remains recorded, not counted as the intended negative proof. No
+  original gate deadline, assertion or workload changed.
+- **Profiled parallel-gain cost (`c52fdc8f`, `809c2ea8`):** the first change selects
+  newly ready IDs without copying full issues; the second reuses the ready set
+  already computed for independent candidates. A direct hand-computed fork,
+  scope and deferral control passes both before and after reuse. The combined
+  source passes 1,069 analysis race checks, with 16 existing skips, eight E2E
+  checks, build/vet and eight literal CLI output pairs over four fixtures.
+  Root independently reads the raw evidence and reruns the direct control.
+  In the first predeclared 1,000-issue A/B/B/A, both old calls exceed 30 seconds
+  while both ID-only calls finish in 6.516/5.499 seconds; no old/new byte parity
+  is claimed where the old process produced no output. A second same-host cohort
+  compares ID-only against reuse: 1,000-issue calls take 8.812/6.617/6.877/10.856
+  seconds, with all four outputs byte-identical. All four 200-issue outputs also
+  match. The host changed before any second-cohort sample; both sides ran on
+  `vmi1156319`. CPU/I/O pressure and overlapping 1,000-issue peak RSS remain
+  explicit. These bounded observations do not complete P1 or establish a general
+  latency or memory guarantee. Evidence and granular remaining work are in
+  `bv-apal.1`; no campaign bead was closed on these measurements.
+- **Earlier September 6 source gate:** the unchanged ten-stage gate on clean `809714c3`,
   with actual Go 1.25.5 on `vmi1153651`, finishes in 1657.77 seconds with nine
   stages passing, one failing and no skipped stages. Build/vet, unit and E2E race
   suites, documentation, action pins, rebuilt WASM, robot smoke and script controls
