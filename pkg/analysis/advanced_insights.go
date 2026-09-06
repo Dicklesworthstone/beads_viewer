@@ -556,13 +556,6 @@ func (a *Analyzer) generateTopKSet(k int) *TopKSetResult {
 	}
 }
 
-// computeMarginalUnblocks computes which issues would become actionable if we complete
-// the given issue, assuming the issues in 'alreadyCompleted' are also done.
-func (a *Analyzer) computeMarginalUnblocks(issueID string, alreadyCompleted map[string]bool) []string {
-	before := issueIDSet(a.getActionableIssuesAfterCompletions(alreadyCompleted))
-	return a.computeMarginalUnblocksFromBefore(issueID, alreadyCompleted, before)
-}
-
 func issueIDSet(issues []model.Issue) map[string]bool {
 	result := make(map[string]bool, len(issues))
 	for _, issue := range issues {
@@ -571,10 +564,9 @@ func issueIDSet(issues []model.Issue) map[string]bool {
 	return result
 }
 
-// computeMarginalUnblocksFromBefore is the batch form of
-// computeMarginalUnblocks. Callers evaluating several candidates against the
-// same completion state can reuse the baseline set instead of rebuilding the
-// entire actionable graph for every candidate.
+// computeMarginalUnblocksFromBefore returns newly actionable IDs after completing
+// issueID on top of alreadyCompleted. before is the actionable ID set for
+// alreadyCompleted, shared by callers evaluating independent candidates.
 func (a *Analyzer) computeMarginalUnblocksFromBefore(issueID string, alreadyCompleted, before map[string]bool) []string {
 	completedAfter := make(map[string]bool, len(alreadyCompleted)+1)
 	for id, done := range alreadyCompleted {
@@ -1182,7 +1174,6 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 		deadline = start.Add(budget)
 	}
 
-	none := map[string]bool{}
 	var items []ParallelGainItem
 	evaluated := 0
 	for _, id := range actionableIDs {
@@ -1191,7 +1182,7 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 		}
 		evaluated++
 
-		unblocks := a.computeMarginalUnblocks(id, none)
+		unblocks := a.computeMarginalUnblocksFromBefore(id, nil, actionableSet)
 		after := make(map[string]bool, len(actionableSet)+len(unblocks))
 		for k := range actionableSet {
 			if k != id {

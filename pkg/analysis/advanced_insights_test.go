@@ -1573,3 +1573,59 @@ func TestParallelCutDiamondNoGain(t *testing.T) {
 		t.Errorf("expected gain 1, got %d", insights.ParallelCut.Suggestions[0].ParallelGain)
 	}
 }
+
+func TestParallelGainEvaluatesCandidatesIndependently(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	for _, tc := range []struct {
+		name        string
+		candidates  map[string]bool
+		deferSecond bool
+		wantIDs     []string
+	}{
+		{name: "two independent forks", wantIDs: []string{"H", "J"}},
+		{name: "scoped sibling", candidates: map[string]bool{"H": true, "J": true, "A": true, "C": true, "D": true}, wantIDs: []string{"J"}},
+		{name: "deferred sibling", deferSecond: true, wantIDs: []string{"J"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Each hub starts a separate work track. Closing either hub splits
+			// only its own fork; the other hypothetical completion is not applied.
+			issues := []model.Issue{
+				{ID: "H", Status: model.StatusOpen},
+				{ID: "J", Status: model.StatusOpen},
+				{ID: "A", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "H", Type: model.DepBlocks}}},
+				{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "H", Type: model.DepBlocks}}},
+				{ID: "C", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "J", Type: model.DepBlocks}}},
+				{ID: "D", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "J", Type: model.DepBlocks}}},
+				{ID: "PARKED", Status: model.StatusBlocked, Dependencies: []*model.Dependency{{DependsOnID: "H", Type: model.DepBlocks}}},
+				{ID: "LATER", Status: model.StatusOpen, DeferUntil: &future, Dependencies: []*model.Dependency{{DependsOnID: "H", Type: model.DepBlocks}}},
+				{ID: "UNKNOWN", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "H", Type: model.DepBlocks}, {DependsOnID: "missing", Type: model.DepBlocks}}},
+			}
+			if tc.deferSecond {
+				issues[3].DeferUntil = &future
+			}
+			an := NewAnalyzer(issues)
+			an.SetNow(now)
+			an.SetReadinessScope(model.NewReadinessIndex(issues), tc.candidates)
+			cfg := DefaultConfig()
+			cfg.RunToCompletion = true
+			an.SetConfig(&cfg)
+			for run := 0; run < 2; run++ {
+				got := an.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig()).ParallelGain
+				if got == nil || got.CurrentParallel != 2 || got.Status.State != "computed" || got.Status.Capped {
+					t.Fatalf("run %d: expected two complete independent tracks, got %+v", run, got)
+				}
+				if len(got.Metrics) != len(tc.wantIDs) || got.Status.Count != len(tc.wantIDs) {
+					t.Fatalf("run %d: expected gains for %v, got %+v", run, tc.wantIDs, got)
+				}
+				for i, id := range tc.wantIDs {
+					item := got.Metrics[i]
+					wantUnblocks := map[string]string{"H": "A,B", "J": "C,D"}[id]
+					if item.ID != id || item.CurrentParallel != 2 || item.PotentialParallel != 3 || item.Gain != 1 || item.GainPercent != 50 || strings.Join(item.Unblocks, ",") != wantUnblocks {
+						t.Fatalf("run %d: %s must independently add one track and unblock %s, got %+v", run, id, wantUnblocks, item)
+					}
+				}
+			}
+		})
+	}
+}
