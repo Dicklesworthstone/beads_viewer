@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -1626,7 +1627,7 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 				childrenByParent[parentID] = append(childrenByParent[parentID], issueID)
 			}
 		}
-		sort.Slice(blockingTargets, func(i, j int) bool { return blockingTargets[i] < blockingTargets[j] })
+		slices.Sort(blockingTargets)
 		for _, v := range blockingTargets {
 			if v < 0 || int(v) >= len(blockerCounts) {
 				continue
