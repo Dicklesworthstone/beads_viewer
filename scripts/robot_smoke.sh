@@ -15,7 +15,7 @@ target="${1:-$root}"
 export BV_NO_BROWSER=1 BV_TEST_MODE=1 BV_NO_SAVED_CONFIG=1 BV_NO_UPDATE_CHECK=1
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/bv-robot-smoke.XXXXXX")"
-trap 'rm -rf "$tmp"' EXIT
+trap 'printf "robot_smoke: retained artifacts at %s\n" "$tmp"' EXIT
 
 bv="${ROBOT_SMOKE_BV:-}"
 if [ -z "$bv" ]; then

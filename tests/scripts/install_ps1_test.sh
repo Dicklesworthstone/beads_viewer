@@ -19,7 +19,7 @@ tmp="$(mktemp -d "${TMPDIR:-/tmp}/bv-install-ps1-test.XXXXXX")"
 server_pid=""
 cleanup() {
   [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null
-  rm -rf "$tmp"
+  printf 'install_ps1_test: retained artifacts at %s\n' "$tmp"
 }
 trap cleanup EXIT
 
