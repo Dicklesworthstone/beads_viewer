@@ -405,8 +405,8 @@ script_stage() {
 
 benchmarks() {
   # scripts/benchmark.sh runs the tracked set against the frozen dataset and
-  # compares median sec/op per benchmark with benchmarks/baseline.txt; it
-  # exits non-zero above the threshold or when a tracked benchmark is missing.
+  # compares best-of-N sec/op with a fresh build of the baseline revision,
+  # falling back to stored timings. Missing benchmarks or excess regression fail.
   [ -f benchmarks/baseline.txt ] || { echo "no benchmarks/baseline.txt (run scripts/benchmark.sh baseline)"; return 1; }
   BENCH_PCT="${RELEASE_GATE_BENCH_PCT:-20}" scripts/benchmark.sh compare
 }

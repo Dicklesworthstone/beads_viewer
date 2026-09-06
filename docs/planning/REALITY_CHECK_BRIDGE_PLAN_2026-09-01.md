@@ -1,19 +1,20 @@
 # Bridge Plan: beads_viewer (bv)
 
-## Current reality check — 2026-09-05
+## Current reality check — 2026-09-06
 
 This is the rescore after the implementation and independent verification campaign.
 The complete September 4 assessment and earlier records remain below as historical
 baselines. Their defect descriptions and task statuses are not the current verdict.
 
 **Source boundary:** the implementation, tests, documentation and assets were
-committed on `main` through `20d2841da5cb9a57df2bb6ea29dd4c2bf705d35a`.
-The September 5 continuation adds the previously ignored frozen benchmark input
-and corrects release documentation. Earlier runtime evidence remains bound to its
+committed on `main` through `809714c3f0755bbd024207cd5bb4bce6d8715971`.
+The continuation adds compact readiness data, incremental UI rows, atomic SQLite
+schema creation, reproducible WASM sysroot mapping, benchmark isolation, and removal
+of a durable flush for regenerable analysis cache data. Earlier runtime evidence remains bound to its
 identified source snapshots; these commits do not establish a new packaged or
-published release. The 34 campaign beads currently comprise **24 closed, seven
-open and three blocked**. The 10 remaining items include three epics and the final
-verification task; they are not 10 independent product defects.
+published release. The 34 campaign beads currently comprise **22 closed, eight
+open, one in progress and three blocked**. The 12 remaining items include three
+epics and the final verification task; they are not 12 independent product defects.
 Neither these counts nor the status table imply a percentage of product completion.
 
 ### Answers to the five reality-check questions
@@ -29,12 +30,14 @@ Neither these counts nor the status table imply a percentage of product completi
    also pass, with CLI regressions and memory costs explicitly retained.
 2. **What still does not meet the vision:** installed `br --claim` can reopen a
    stale closed issue, the native platform matrix is incomplete, and no clean
-   packaged release contains all these changes.
+   packaged release contains all these changes. The latest complete release gate
+   fails one benchmark; current-source responsiveness acceptance remains open.
    Search has a useful fixed evaluation, not human-reviewed field-quality evidence.
    Documentation has verified examples but still awaits the final capability freeze.
 3. **What is blocking completion:** S5 needs an authorized, fixed live tracker;
    V5 needs known login routes for the reachable Macs and an actual Linux ARM64
-   runner. Public package-store versions and hashes have been checked. The final source must then
+   runner. Public package-store versions and hashes have been checked. P1 needs
+   the current-source performance evidence, and the final source must then
    be frozen and pass the bound release gate. None can be replaced by more reports,
    cross-compilation, a loading frame, or an external draft's green tests.
 4. **Would the remaining beads finish the accepted vision?** They cover the known
@@ -93,15 +96,33 @@ for each numbered goal are retained in the September 4 table below.
 | 34 | Offline/mobile dashboard search, graph and persistence | WORKING | V4 used actual Chromium desktop and 360px viewport journeys, stopped-server offline reload, graph/search and persistence, with missing/corrupt asset negatives. Physical phones, Safari and every browser remain untested. |
 | 35 | Hooks, failure propagation and browser opt-out | WORKING | Actual report/hook ordering, failure paths and browser opt-out tests pass. Browser automation was separately explicit, not silently launched by ordinary tests. |
 | 36 | Verified updater and versioned downloads | WORKING | Native Linux amd64 and Windows x64 install/update/no-update paths and corrupt/wrong-version preservation controls pass. Remaining native/distribution scope is row 39. |
-| 37 | Release bytes correspond to a fully checked source commit | PARTIAL | V1 now rejects skipped/missing/dirty evidence and binds real package bytes to source. The implementation is committed, but no complete gate or package covers the final source. The frozen dataset now survives source archiving and loads through the real CLI; its bytes and baseline remain unchanged. |
+| 37 | Release bytes correspond to a fully checked source commit | PARTIAL | V1 rejects skipped/missing/dirty evidence and binds real package bytes to source. The complete `809714c3` gate has nine passing stages and one benchmark failure; its receipt is ineligible and no package was produced. The frozen dataset survives source archiving and loads through the real CLI; its bytes and baseline remain unchanged. |
 | 38 | Vendored assets correspond to reviewed source | WORKING | V2 rebuilds graph WASM/glue with the pinned pipeline and checks source/output identity plus graph parity. Local Go rendering patches have explicit provenance and do not reach version-suffixed `go install`; see limits below. |
 | 39 | Supported Windows/macOS/Linux installation and upgrades | PARTIAL | Native Linux amd64, Windows x64 and isolated Linux amd64 Nix subsets pass. Public Homebrew/Scoop URLs and hashes match v0.22.0, behind GitHub v0.23.0. Native macOS amd64/arm64 and Linux ARM64 execution remain outstanding (V5). |
 | 40 | Dependable local/remote release verification | PARTIAL | V3 isolation/trust/ancestor/editor controls pass. Latest local and fresh-source RCH suites each pass all 29 packages with the isolated fixed tracker; their 36 and 56 skips remain explicit. Installed-br suites retain the stale-claim failure, and the clean packaged gate is not complete. |
-| 41 | 10k+ browsing and the advertised frame-rate experience | WORKING | The full 1k/5k/10k reference-host matrix passes: 144 current UI cohorts, 144,000 observations, worst cohort p99 30.862ms and maximum snapshot/Phase 2 handlers 12.255/19.050ms. Independent review retains 57.616ms individual interactions, configured degradation and extra unpaired generations. This does not establish terminal paint, universal 60fps or behavior beyond the measured workloads. |
-| 42 | Reference docs/examples match running behavior | PARTIAL | Actual copied YAML, jq, forecast, key-dispatch and configured-threshold examples pass. Performance claims are settled; P2 remains blocked until final live-action and native-delivery claims can be settled. |
+| 41 | 10k+ browsing and the advertised frame-rate experience | PARTIAL | The earlier full 1k/5k/10k reference-host matrix passes: 144 current UI cohorts, 144,000 observations, worst cohort p99 30.862ms and maximum snapshot/Phase 2 handlers 12.255/19.050ms. Independent review retains 57.616ms individual interactions, configured degradation and extra unpaired generations. P1 was reopened for later implementation changes; the original-size `809714c3` matrix is still running. Neither result establishes terminal paint, universal 60fps or unmeasured workloads. |
+| 42 | Reference docs/examples match running behavior | PARTIAL | Actual copied YAML, jq, forecast, key-dispatch and configured-threshold examples pass. P2 remains blocked until current-source performance, live-action and native-delivery claims can be settled. |
 
 ### Evidence that changes the verdict, and its boundaries
 
+- **September 6 source gate:** the unchanged ten-stage gate on clean `809714c3`,
+  with actual Go 1.25.5 on `vmi1153651`, finishes in 1657.77 seconds with nine
+  stages passing, one failing and no skipped stages. Build/vet, unit and E2E race
+  suites, documentation, action pins, rebuilt WASM, robot smoke and script controls
+  pass. The original best-of-four benchmark comparison reports Sparse100 at
+  661,020ns versus 536,527ns, a 23.2% regression above the unchanged 20% limit;
+  the other 13 tracked benchmarks pass. This is an ineligible receipt, not a release
+  pass. Diagnostic profiles and candidate optimizations cannot replace it.
+  The complete gate record is on that worker under
+  `/data/tmp/bv-release-9a36de53.XMDoZf13/gate-809714c3.Dx8FhJzJ/`.
+- **Regenerable cache flush:** a controlled six-second `fsync` delay makes the
+  previous real robot process exceed its original five-second deadline. The
+  `809714c3` process completes in 265ms and publishes a readable cache; fresh warm
+  reads preserve cache bytes and timestamps. Paired fixed-clock insights and
+  triage outputs remain byte-identical. This establishes the injected flush-stall
+  repair, not a general disk-latency guarantee; checked writes, closes, atomic
+  replacement and user-data durability remain intact. Existing cache controls
+  and the full analysis race suite pass independently.
 - **Scope and readiness (S1–S4):** independent closures cover positive selected
   work alongside excluded/unknown/blocked near-neighbors, rather than refusal-only
   output. Full source authority is retained before display filtering, including
@@ -288,9 +309,10 @@ matrix remains on `hz3` at
 
 | Work | Current state | Concrete completion still required |
 |---|---|---|
+| P1: `bv-apal.1` / `.2` | In progress / open | Finish the unchanged current-source responsiveness matrix, preserve exact result/status parity and the deliberate slowdown control, and evaluate only profiled optimizations. The latest release benchmark failure remains a separate failed gate. |
 | S5: `bv-xbvo.9` / `.10` | Blocked / open | Authorization and application of the reviewed external tracker fix, then independent real live tracker claim/close-race and bv route proof. Retain ordinary claim positives; no draft-only closure. |
 | V5: `bv-oonu.9` / `.10` | Blocked / open | Obtain known Mac login routes and native macOS amd64/arm64 and Linux ARM64 execution. Store manifest identity and prior Nix behavior are verified; publication remains separate. Recheck affected current-source build paths; no substitute-platform credit. |
-| P2: `bv-apal.3` / `.4` | Blocked / open | Performance claims now have complete evidence. Reconcile final supported capabilities, limits and examples after S5/V5 settle; independently verify the resulting claims. Existing corrected examples need no process-only rewrite. |
+| P2: `bv-apal.3` / `.4` | Blocked / open | Reconcile final supported capabilities, limits and examples after current-source P1 and S5/V5 settle; independently verify the resulting claims. Existing corrected examples need no process-only rewrite. |
 | Epics `bv-xbvo`, `bv-oonu`, `bv-apal`; final `bv-oonu.11` | Open | Complete their original child acceptance, review final source changes, run the clean source-bound packaged gate and independently verify it. This rescore completes only the report portion of the final task. |
 
 Work should proceed on those actual blockers, with small measured fixes and the
