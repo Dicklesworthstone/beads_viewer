@@ -405,6 +405,88 @@ func TestRace_DataConsistency(t *testing.T) {
 	}
 }
 
+func TestRobotInsightsPinnedClockOmitsParallelGainDuration(t *testing.T) {
+	bv := buildBvBinary(t)
+	project := t.TempDir()
+	beadsDir := filepath.Join(project, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Independent issues require a real O(n²) parallel-gain sweep. The tiny
+	// consistency fixture can finish within one millisecond and hide a leaked
+	// duration behind omitempty; this workload also checks ordinary timing survives.
+	const issueCount = 200
+	var issues strings.Builder
+	for i := 0; i < issueCount; i++ {
+		fmt.Fprintf(&issues, "{\"id\":\"independent-%04d\",\"title\":\"Independent task\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2,\"created_at\":\"2009-02-01T00:00:00Z\",\"updated_at\":\"2009-02-01T00:00:00Z\"}\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(issues.String()), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		name   string
+		epoch  string
+		pinned bool
+	}{
+		{name: "ordinary"},
+		{name: "invalid epoch", epoch: "not-an-epoch"},
+		{name: "pinned", epoch: "1234567890", pinned: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("SOURCE_DATE_EPOCH", tt.epoch)
+			cacheDir := t.TempDir()
+			run := func() []byte {
+				t.Helper()
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, bv, "--robot-insights")
+				cmd.Dir = project
+				cmd.Env = append(os.Environ(), "BV_CACHE_DIR="+cacheDir, "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &stdout, &stderr
+				if err := cmd.Run(); err != nil {
+					t.Fatalf("insights failed: %v; stdout=%s; stderr=%s", err, stdout.String(), stderr.String())
+				}
+				var payload struct {
+					AdvancedInsights struct {
+						ParallelGain *struct {
+							CurrentParallel int `json:"current_parallel"`
+							Status          struct {
+								State      string `json:"state"`
+								Capped     bool   `json:"capped"`
+								DurationMs *int64 `json:"duration_ms"`
+							} `json:"status"`
+						} `json:"parallel_gain"`
+					} `json:"advanced_insights"`
+				}
+				if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+					t.Fatalf("decode insights: %v; stdout=%s; stderr=%s", err, stdout.String(), stderr.String())
+				}
+				gain := payload.AdvancedInsights.ParallelGain
+				if gain == nil || gain.Status.State != "computed" || gain.CurrentParallel != issueCount {
+					t.Fatalf("parallel gain did not compute %d independent tracks: %s", issueCount, stdout.String())
+				}
+				if tt.pinned {
+					if gain.Status.DurationMs != nil || gain.Status.Capped {
+						t.Fatalf("pinned parallel gain leaked timing or capped computation: %s", stdout.String())
+					}
+				} else if gain.Status.DurationMs == nil || *gain.Status.DurationMs <= 0 {
+					t.Fatalf("ordinary parallel gain lost its measured duration: %s", stdout.String())
+				}
+				return stdout.Bytes()
+			}
+			cold := run()
+			if tt.pinned {
+				if warm := run(); !bytes.Equal(cold, warm) {
+					t.Fatalf("pinned insights changed between cold and warm cache\ncold: %s\nwarm: %s", cold, warm)
+				}
+			}
+		})
+	}
+}
+
 // =============================================================================
 // 3. Concurrent Analysis and Graph Commands
 // =============================================================================

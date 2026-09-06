@@ -1984,6 +1984,12 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		},
 	}
 
+	if sourceDateEpochActive() && output.AdvancedInsights.ParallelGain != nil {
+		// Match the core metric status: measured wall time is not reproducible,
+		// even when the analysis itself runs deterministically to completion.
+		output.AdvancedInsights.ParallelGain.Status.DurationMs = 0
+	}
+
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding insights: %w", err)
 	}
