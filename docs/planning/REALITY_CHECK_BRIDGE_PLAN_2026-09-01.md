@@ -6,7 +6,24 @@ This is the rescore after the implementation and independent verification campai
 The complete September 4 assessment and earlier records remain below as historical
 baselines. Their defect descriptions and task statuses are not the current verdict.
 
-**Source boundary:** the implementation, tests, documentation and assets were
+**Fresh comprehensive review:** the September 6 reread covers all 989 lines of
+AGENTS.md and all 4,444 lines of README.md, plus the complete first-party plan/spec
+corpus. Two read-only investigation agents check history/labels/recipes and
+performance/release plans while the original P1 run continues on its separate host.
+The earlier assertion that every residual already had active ownership was wrong:
+closed task `bv-j74w` does not deliver recorded blocked intervals or evidence-based
+causal links, and closed graph tasks `bv-173` / `bv-7bob` leave advertised panning
+and original expansion behavior unimplemented. Their original acceptance is restored.
+
+**Current checkout boundary:** this review inspects clean `a41cc042`, tree
+`33333a2a`, whose first-party runtime/test/script bytes match `f4f86f62` but whose
+Go dependency cohort differs. Commit `1e8acace` updates x/image, x/sync, x/sys,
+x/term, x/net and x/text and re-vendors them. The retained f4f gate and ongoing
+f4f latency run therefore do not certify this checkout. The checks below remain
+bound to their actual source; final acceptance must also cover the current
+dependency cohort. No upgrade, rebase or dependency change was made by this audit.
+
+**Earlier measured source:** the implementation, tests, documentation and assets were
 committed on `main` through `f4f86f62`, including the decoder and version repairs.
 The continuation adds compact readiness data, incremental UI rows, atomic SQLite
 schema creation, reproducible WASM sysroot mapping, benchmark isolation, and removal
@@ -24,10 +41,11 @@ The current repair synchronizes decoder-cache publication and corrects automatic
 pseudo-version filtering. Focused checks, clean tagless runtime checks and the
 original complete ten-stage gate pass on `f4f86f62`. The repaired-source full
 responsiveness run has started; no repaired archives are packaged.
-The 34 campaign
-beads currently comprise **22 closed, eight
-open, one in progress and three blocked**. The 12 remaining items include three
-epics and the final verification task; they are not 12 independent product defects.
+The revised campaign has 38 beads: **22 closed, 12 open, one in progress and
+three blocked**. It adds reopened causality `bv-j74w`, new proof `bv-apal.11`,
+and the reopened graph implementation/proof pair `bv-173` / `bv-7bob` to the
+original 34. Three epics and the final verification task are coordination items,
+not independent product defects.
 Neither these counts nor the status table imply a percentage of product completion.
 
 ### Answers to the five reality-check questions
@@ -57,25 +75,38 @@ Neither these counts nor the status table imply a percentage of product completi
    Current-source responsiveness acceptance remains open.
    Search has a useful fixed evaluation, not human-reviewed field-quality evidence.
    Documentation has verified examples but still awaits the final capability freeze.
+   Causality is incomplete: on a four-commit repository with a known six-hour
+   blocked interval inside a ten-hour lifecycle, the actual f4f CLI reports zero
+   blocked time and "No significant issues detected in the causal flow."
+   Graph selection/rendering works, but the advertised H/L panning handlers are
+   empty and original expand/collapse behavior is absent.
 3. **What is blocking completion:** S5 needs an authorized, fixed live tracker;
    V5 needs known login routes for the reachable Macs and an actual Linux ARM64
    runner. Public package-store versions and hashes have been checked. P1 needs
    current-source performance evidence after the verified decoder/version repairs.
+   Causality needs historical status and dependency evidence retained by the
+   extractor and consumed by the interval/link analysis. The Windows source
+   installer also bypasses the vendored decoder repair through version-suffixed
+   `go install`; provenance disclosure does not repair that advertised path.
    The source-bound archives pass the available Linux/Windows runtime
    subset but retain the subsequently observed decoder defect. None can be replaced by more reports,
    cross-compilation, a loading frame, or an external draft's green tests.
-4. **Would the remaining beads finish the accepted vision?** They cover the known
-   residuals of the deliberately narrowed product, provided their original positive
-   acceptance criteria pass. Their closure alone would not establish learned semantic
+4. **Would the remaining beads finish the accepted vision?** Before this fresh
+   review, no: causality was false-closed and not covered by the 42-row checklist,
+   and graph navigation had been credited despite empty public handlers.
+   The revised backlog restores it and expands the existing delivery/documentation
+   criteria. Completion requires the original positive acceptance criteria to pass.
+   Their closure alone would not establish learned semantic
    search, calibrated forecasts, all-browser support or universal 60fps. Those were
    never demonstrated by this campaign and are not silently counted as delivered.
-5. **Which known goals lack active coverage?** None of the identified residuals is
-   `NO_BEAD`: P1 covers responsiveness, S5 live action safety, V5 native delivery,
-   P2 final documentation, and `bv-oonu.11` the final source/package check and rescore.
-   Startup handoff, decoder publication and automatic version filtering are covered
-   within the existing P1 work.
+5. **Which known goals lack active coverage?** Causality had no active owner despite
+   the historical `bv-j74w` record. Reopening that original task and adding its
+   proof companion closes the tracking gap, not the implementation gap. The original
+   graph implementation/proof pair is also reopened. P1 covers
+   responsiveness, S5 live action safety, V5 native/source-install delivery, P2
+   documentation, and `bv-oonu.11` the final source/package check and rescore.
 
-### Rescored vision: all 42 original rows
+### Rescored vision: all 42 original rows plus the missed causality goal
 
 `WORKING` means the stated path has implementation and relevant execution evidence,
 within the limits recorded here. `PARTIAL` retains a known implementation or proof
@@ -113,7 +144,7 @@ for each numbered goal are retained in the September 4 table below.
 | 26 | Forecast and capacity as documented heuristics | WORKING | Actual documented explicit-estimate and missing-estimate examples now match hand-computed outputs. This is not a scheduler or a calibrated confidence interval. |
 | 27 | Label health, cross-label flow and attention | WORKING | Existing analysis/views and robot paths retain tests; full authority and selected-candidate scope are preserved. |
 | 28 | Alerts, baselines and hygiene suggestions | WORKING | Actual seven-case alerts regression proves shared authority, scope and clock. Typed hygiene actions have real isolated mutation/readback positives, including legacy-cycle repair; installed claim safety remains separately red. |
-| 29 | Responsive list/detail, board/tree/graph/insights navigation | WORKING | Actual navigation and rendered-content paths pass. Prepared-row reuse, compact dependency details and detached history input have completed the original repeated acceptance matrix and independent raw review. The complete f4f source gate passes the unfiltered UI race package; an earlier other-host 5,000-row snapshot delivery deadline miss remains retained. Current-source timing remains row 41. |
+| 29 | Responsive list/detail, board/tree/graph/insights navigation | PARTIAL | Actual selection and rendered-content paths pass, but advertised graph H/L scrolling is a no-op and original expansion/collapse remains absent. Reopened bv-173/bv-7bob own this. Prepared-row reuse, compact dependency details and detached history input have completed the earlier repeated acceptance matrix; that proves neither graph viewport controls nor the current dependency cohort. Current-source timing remains row 41. |
 | 30 | Live reload, background snapshots and stale-result rejection | WORKING | Scope/authority hashes, hidden-row changes, append/rename retries, force-refresh clock, cancellation and stale-result controls pass. Latest full UI race includes startup prepared-analysis delivery; performance is row 41. |
 | 31 | Tutorial, help, sidebar and cass | WORKING | Existing UI and integration paths remain; actual external cass availability is environmental, not established on every host. |
 | 32 | Markdown/Mermaid/SVG/PNG and standalone graph exports | WORKING | Report/graph/export paths pass; source diagnostics and exact payload timestamps survive export. Live action routes have the S5 limit. |
@@ -127,6 +158,119 @@ for each numbered goal are retained in the September 4 table below.
 | 40 | Dependable local/remote release verification | PARTIAL | V3 isolation/trust/ancestor/editor controls pass. Earlier local and fresh-source RCH suites each pass all 29 packages with the isolated fixed tracker; their 36 and 56 skips remain explicit. The clean repaired f4f gate passes on a maintainer worker with that isolated tracker; packaging still binds the earlier affected 15bd source. Installed-br suites retain the stale-claim failure. |
 | 41 | 10k+ browsing and the advertised frame-rate experience | PARTIAL | Earlier reference-host and `809714c3` matrices pass within their recorded limits. Both later full runs finish red: `0eb30ee2` has version/parity and timeout failures; `15bd2a1d` has a parallel-loader panic and only 70/72 complete CLI records. All 288 UI records on 15bd pass, with worst cell p99 31.437ms but an individual interaction reaching 89.487ms; exact-output and slowdown controls pass. None establishes current repaired-source acceptance, terminal paint, universal 60fps or unmeasured workloads. |
 | 42 | Reference docs/examples match running behavior | PARTIAL | Actual copied YAML, jq, forecast, key-dispatch and configured-threshold examples pass. P2 remains blocked until current-source performance, live-action and native-delivery claims can be settled. |
+| 43 | Explain recorded blocking time and causal dependency transitions; README "Causal Chain Analysis", original bv-j74w | PARTIAL | The actual four-commit CLI reproduction reports 0h/0% instead of 6h/60%. `extractor.go` drops dependency and old/new status metadata; `causality.go` drops modified events, never produces blocked/unblocked events, and links every chronological neighbor as causal. Its critical path is the entire timeline. The original implementation task must remain open until real producer and CLI proof meet its acceptance. |
+
+### Fresh findings and bridge changes
+
+| Finding | Concrete work and proof | Existing owner / size |
+|---|---|---|
+| Causality output invents causal certainty and loses recorded wait time | Preserve status/dependency transitions in both history extraction paths and cache formats; distinguish chronology from evidenced gate transitions; compute the union of observed waiting intervals, including ongoing tails and unknown window boundaries. A real Git fixture must prove 6h/60%, preserve ordinary lifecycle output, and reject an unrelated preceding event as the cause. Preserve commit order when author clocks go backward and expose duration uncertainty. | `bv-j74w` / `bv-apal.11`; M/L |
+| Advertised graph controls are stubs | Extend the existing useful ego view with observable bounded panning and expansion/collapse; preserve selection, metrics, scope and Unicode rendering. Actual key-dispatch and PTY tests must reveal hidden content and fail the old empty handlers. | Reopened `bv-173` / `bv-7bob`; M |
+| Windows `-FromSource` omits local vendor repairs | Replace the version-suffixed module-install path with a verified, tag-bound source checkout/archive build that uses its vendor tree. Preserve installed bytes on download, build, identity or version failure. Execute the real resulting binary natively and identify the build inputs; Linux shell simulation is insufficient. | V5 `bv-oonu.9` / `.10`; M |
+| Current checkout differs from the passing source freeze | Bind final full verification and packaging to the actual dependency cohort; retain the ongoing f4f run as useful evidence for f4f only. Do not relabel receipts or restart the long run solely to obtain a new label. | P1 and `bv-oonu.11`; existing full verification cost |
+| Public examples contradict current contracts | Fix README and root SKILL examples for envelope nesting, case-sensitive fields, graph adjacency, source authority, reference clocks and safe typed actions. Correct cycle enumeration, fuzzy matching/allocation/order, incomplete readiness rules, correlation feedback, cass activity, accessor locking and TOON executable detection. | P2 `bv-apal.3` / `.4`; S/M |
+| Published bytes lag the repaired source | Keep explicit GitHub v0.23.0 versus Homebrew/Scoop v0.22.0 identities and disabled workflow state; no claim that unpublished repaired code is installed. Preserve native Mac/Linux ARM64 requirements and separate publication authorization. | V5 and final; external prerequisites |
+
+The causality reproduction is retained on `vmi1227854` under
+`/data/tmp/bv-causality-reality-f4f-sq5ymp1w`. It creates a two-issue Git repository
+with fixed commits at 00:00, 02:00, 08:00 and 10:00 UTC on September 1: the target
+enters blocked state and gains a blocker at 02:00; the blocker closes and the
+target returns open at 08:00; the target closes at 10:00. The ordinary history
+command retains both intermediate transitions only as `modified`; causality drops
+them. Supported-command stdout SHA-256 is
+`f5df5ba1c277569efe2e1d919838dea8e8e19919b3abc49015121124fb414375`.
+An initial causality invocation with unsupported `--history-limit` fails argument
+validation; that failed call remains separate from the supported invocation.
+This is an actual CLI run on a controlled Git fixture, not a production-history
+measurement or a repaired behavior. Its producer code is byte-identical at a41.
+
+Initial read-only triage/plan/insights/graph runs on that same verified f4f binary
+load all 649 records, report complete authority and no cycles, and identify P1 as
+the highest-impact plan item. Raw streams remain under
+`/data/tmp/bv-reality-readonly-f4f-vdc6u7wx`. They directly confirm the documented
+schema drifts: `.triage.quick_ref`, capitalized `Bottlenecks[].ID/Value`, and
+numeric graph counts with records under `.adjacency`. These successful calls
+do not establish the correctness of every payload or the upgraded dependency set.
+
+After the backlog changes, triage, plan and insights on the 650-record snapshot
+all exit zero with empty stderr. Triage's two available top picks are `bv-173`
+and `bv-j74w`; plan identifies `bv-173` as highest impact. Insights reports no
+cycles, consistent with `br dep cycles --include-closed`. The plan's six actionable
+records include three epics and the already-running P1 task; `br ready` correctly
+offers the two unclaimed implementation tasks. The copied snapshot has no live
+tracker metadata, so the robot supplies no executable claim helper. Raw streams
+remain on `vmi1227854` under `/data/tmp/bv-reality-final-beads.XB8G8tK5`; input
+SHA-256 is `3468947d914bb3065fc3d80f371b1e52af6d8e2ecdfab85c825495d559f25a87`.
+This validates the revised task graph with the identified f4f executable; it is
+not a build or runtime certification of a41.
+
+### Fresh ambition rounds
+
+1. **Follow the actual user journey through the advertised control.** The graph
+   view has real selection and ego-graph rendering, but current README/help `H`/`L`
+   bindings dispatch to empty `ScrollLeft`/`ScrollRight` methods. Existing tests
+   call those methods without proving any viewport movement. Reconcile original
+   `bv-173` and `bv-7bob` acceptance before crediting row 29 as complete; preserve
+   the useful present view while requiring positive visible navigation behavior.
+   The older arbitrary-Mermaid terminal request is a separate historical ambition,
+   not something a panning fix would implement. P2 should correct already-known
+   false examples while final capability closure remains blocked; dependency edges
+   need not prevent useful partial documentation work.
+2. **Follow the repaired bytes through every install path.** A source-version
+   string cannot prove the vendor lock is present. V5 must build tag-bound source
+   with its vendor tree, preserve installed bytes through failed fetch/build/version
+   checks, and run the produced binary natively. Final acceptance must distinguish
+   the f4f dependency cohort from a41's upgraded parser/Unicode/font dependencies.
+   Keep the already-running f4f matrix intact, then use the current full gate and
+   artifact path when the new runtime work is ready. This avoids speculative
+   package generation that would immediately become stale after the next fix.
+3. **Use the strongest defensible model, with a hand-computed oracle.** Causality
+   is a partial order of evidenced constraints, not a total order of timestamps.
+   Compute overlapping waiting intervals by union, preserve simultaneous events
+   deterministically, and mark intervals cut by the history window as incomplete.
+   Explicit blocked status and inferred dependency waiting can differ: if B closes
+   at 06:00 but A remains explicitly blocked until 08:00, the two durations must
+   not be conflated. Report observed nonblocked elapsed time without calling it
+   labor or counterfactual completion time. A longest evidenced constraint path
+   needs actual links; an unrelated preceding commit is the negative control.
+   No new generic event platform, speculative embedding service or mathematical
+   machinery is needed for this repair. Keep original positive capability criteria
+   and useful ordinary timelines while correcting the unsupported inference.
+
+### Fresh bead refinement and stopping point
+
+The frozen bead-generation prompt was applied before and after the three ambition
+rounds. Five subsequent passes used the frozen refinement prompt:
+
+1. Check all 38 campaign records for original goal coverage, active ownership,
+   self-contained instructions and implementation/proof pairing.
+2. Check dependency direction and execution order; preserve external prerequisites
+   while allowing independent implementation work and partial documentation fixes.
+3. Bind positive/negative proof to actual source/dependency cohorts, original full
+   performance denominators, and real supported TOON encoder discovery.
+4. Have an independent reader check every campaign description, acceptance field,
+   design/notes and recent refinement comment. Its one additional finding was
+   nonmonotonic Git author time; both causality records now require that real fixture.
+5. Recheck all modified criteria and original scope, inspect the semantic tracker
+   diff, and run actual robot triage/plan/insights plus tracker cycle validation.
+   No further material scope or dependency change was identified.
+
+There are seventeen implementation/proof pairs. Every proof depends on its
+implementation and blocks final acceptance; no issue was deleted or closed in this
+review. The only new issue is the missing independent causality proof. Detailed
+implementation TODOs remain in the existing beads. Further planning rounds stop
+here: the requested assessment is complete, while the restored capabilities and
+release prerequisites remain open.
+
+Historical decisions stay separate from missing accepted behavior. Hash-only
+search, heuristic capacity and three correlation strategies have explicit scope
+records. The graph-WASM 80KiB component aspiration differs from the accepted
+120KiB aggregate gzip gate; the reported aggregate is 102KiB. The strict no-eval
+CSP target was not implemented: its closure records an accepted `unsafe-eval`
+residual while its design retains older in-progress wording. P2 must reconcile
+that conflicting record, not portray current browser journeys as strict-CSP proof.
+The original arbitrary-Mermaid terminal renderer is also unimplemented; current
+issue-derived graph/export functionality does not silently earn that capability.
 
 ### Evidence that changes the verdict, and its boundaries
 
@@ -501,11 +645,13 @@ matrix remains on `hz3` at
 
 | Work | Current state | Concrete completion still required |
 |---|---|---|
-| P1: `bv-apal.1` / `.2` | In progress / open | Decoder/version repairs are frozen on f4f; clean tagless CLI and original complete gate pass. Execute and independently review the repaired-source responsiveness matrix. Preserve the failed 0eb/15bd runs, all result/status parity, original deadlines and slowdown control. No retry-to-green or independent-regression closure. |
+| Causality: `bv-j74w` / `bv-apal.11` | Open / open; implementation ready | Retain historical status/dependencies, compute real blocked intervals, distinguish observed waiting from inferred dependency constraints, and support useful evidence-backed links and paths. Independently recover the known six-hour interval through the actual CLI; cover missing/truncated evidence, overlapping blockers, caches and nonmonotonic Git author clocks. |
+| Graph: `bv-173` / `bv-7bob` | Open / open; implementation ready | Implement visible horizontal panning and original expand/collapse behavior through real key dispatch. Verify rendered movement, clipping, selection, empty/boundary cases and PTY behavior; calls that merely avoid panics do not prove navigation. |
+| P1: `bv-apal.1` / `.2` | In progress / open | Decoder/version repairs are frozen on f4f; clean tagless CLI and original complete gate pass. Execute and independently review the repaired-source responsiveness matrix. Preserve failed 0eb/15bd runs, result/status parity, original deadlines and slowdown control. Final acceptance also requires the final source and dependency cohort: f4f evidence cannot certify the later dependency changes in a41. |
 | S5: `bv-xbvo.9` / `.10` | Blocked / open | Authorization and application of the reviewed external tracker fix, then independent real live tracker claim/close-race and bv route proof. Retain ordinary claim positives; no draft-only closure. |
-| V5: `bv-oonu.9` / `.10` | Blocked / open | Obtain known Mac login routes and native macOS amd64/arm64 and Linux ARM64 execution. Store manifest identity and prior Nix behavior are verified; publication remains separate. Recheck affected current-source build paths; no substitute-platform credit. |
-| P2: `bv-apal.3` / `.4` | Blocked / open | Reconcile final supported capabilities, limits and examples after current-source P1 and S5/V5 settle; independently verify the resulting claims. Existing corrected examples need no process-only rewrite. |
-| Epics `bv-xbvo`, `bv-oonu`, `bv-apal`; final `bv-oonu.11` | Open | Complete their original child acceptance. Earlier source-bound packaging and Linux/Windows subsets pass, but those 15bd archives retain the discovered crash. Repaired f4f source gate passes; its performance and artifact verification plus external prerequisites remain pending. This rescore does not close unmet child criteria. |
+| V5: `bv-oonu.9` / `.10` | Blocked / open | Repair the PowerShell source path so a verified tag-bound vendor build includes the decoder fix and preserves the old binary on failure. Obtain known Mac login routes and native macOS amd64/arm64 and Linux ARM64 execution. Verify artifacts built from the final source and dependency cohort. Store manifest identity and prior Nix behavior are verified; publication remains separate. |
+| P2: `bv-apal.3` / `.4` | Blocked / open | Reconcile the fourteen recorded claim classes, including actual JSON schemas, readiness, fuzzy search, causality, graph controls and encoder discovery. Correct independent inaccuracies now; freeze capability claims after the restored proofs and P1/S5/V5 settle. Independently execute copied examples and actual encoder positives. |
+| Epics `bv-xbvo`, `bv-oonu`, `bv-apal`; final `bv-oonu.11` | Open | Complete all seventeen implementation/proof pairs. Earlier source-bound packaging and Linux/Windows subsets pass, but those 15bd archives retain the discovered crash. Repaired f4f source gate passes; final source/dependency performance, restored capabilities, artifacts and external prerequisites remain pending. This rescore does not close unmet child criteria. |
 
 Work should proceed on those actual blockers, with small measured fixes and the
 existing tests. No new feature campaign, duplicate task graph, closure audit loop
