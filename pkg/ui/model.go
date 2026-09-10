@@ -520,6 +520,23 @@ type CassHealthMsg struct {
 	Detector *cass.Detector
 }
 
+// A request owns its cancellation and the selection that may receive its result.
+// Commands only read these captured values, never the live model.
+type cassSessionRequest struct {
+	cancel         context.CancelFunc
+	beadID         string
+	focus          focus
+	dataGeneration uint64
+	workDir        string
+	status         string
+}
+
+type cassSessionsLoadedMsg struct {
+	request *cassSessionRequest
+	status  cass.Status
+	result  cass.CorrelationResult
+}
+
 // CheckCassHealthCmd probes cass once at startup with a 2 s bound so a slow
 // or hung `cass health` can never delay the UI.
 func CheckCassHealthCmd() tea.Cmd {
@@ -926,11 +943,14 @@ type Model struct {
 	tutorialModel TutorialModel
 
 	// Cass session preview modal (bv-5bqh)
-	showCassModal  bool
-	cassModal      CassSessionModal
-	cassCorrelator *cass.Correlator
-	cassDetector   *cass.Detector // set by the startup health check; reused by V
-	cassStatus     cass.Status    // startup detection result shown in the footer
+	showCassModal   bool
+	cassModal       CassSessionModal
+	cassCorrelator  *cass.Correlator
+	cassWorkspace   string
+	cassDetector    *cass.Detector // set by the startup health check; reused by V
+	cassStatus      cass.Status    // startup detection result shown in the footer
+	cassRequest     *cassSessionRequest
+	cassReturnFocus focus
 
 	// Self-update modal (bv-182)
 	showUpdateModal bool
@@ -1069,6 +1089,10 @@ func (m *Model) invalidateSemanticFilter() {
 }
 
 func (m *Model) beginSemanticDatasetUpdate() {
+	m.cancelCassLookup()
+	// A command already running retains its old correlator/cache. Its results
+	// cannot seed a lookup for refreshed title or timestamp metadata.
+	m.cassCorrelator = nil
 	m.semanticDataGeneration++
 	m.invalidateSemanticFilter()
 	m.semanticIndexBuilding = false
@@ -1574,6 +1598,7 @@ func (m *Model) cancelHistoryLoad() {
 func (m *Model) quitCommand() tea.Cmd {
 	m.cancelHistoryLoad()
 	m.cancelPhase2Preparation()
+	m.cancelCassLookup()
 	return tea.Quit
 }
 
@@ -2180,6 +2205,15 @@ func (m *Model) updateEmbeddedTextInput(msg embeddedTextInputMsg) tea.Cmd {
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
+	defer func() {
+		if m.cassRequest != nil {
+			if !m.cassLookupIsCurrent(m.cassRequest) {
+				m.cancelCassLookup()
+			} else if m.statusMsg == "" {
+				m.statusMsg = m.cassRequest.status
+			}
+		}
+	}()
 
 	if m.backgroundWorker != nil {
 		switch msg.(type) {
@@ -2785,9 +2819,46 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case CassHealthMsg:
-		m.cassStatus = msg.Status
-		m.cassDetector = msg.Detector
+		// V can start before the startup probe returns. Keep the detector
+		// already used by that lookup instead of replacing it underneath it.
+		if m.cassDetector == nil {
+			m.cassDetector = msg.Detector
+		}
+		if m.cassStatus == cass.StatusUnknown || m.cassDetector == msg.Detector {
+			m.cassStatus = msg.Status
+		}
 		return m, tea.Batch(cmds...)
+
+	case cassSessionsLoadedMsg:
+		if !m.cassLookupIsCurrent(msg.request) {
+			return m, nil
+		}
+		m.cancelCassLookup()
+		m.cassStatus = msg.status
+		if msg.status != cass.StatusHealthy && msg.status != cass.StatusNeedsIndex {
+			m.statusMsg = "⚠️ cass not available (install it for session correlation)"
+			m.statusIsError = false
+			return m, nil
+		}
+		if len(msg.result.TopSessions) == 0 {
+			if msg.result.Error != "" {
+				m.statusMsg = "⚠️ Session lookup incomplete; press V to retry"
+			} else {
+				m.statusMsg = "No correlated sessions found for " + msg.request.beadID
+			}
+			m.statusIsError = false
+			return m, nil
+		}
+		if msg.result.Error != "" {
+			m.statusMsg = "⚠️ Session lookup incomplete; showing available matches"
+			m.statusIsError = false
+		}
+		m.cassModal = NewCassSessionModal(msg.request.beadID, msg.result, m.theme)
+		m.cassModal.SetSize(m.width, m.height)
+		m.showCassModal = true
+		m.cassReturnFocus = msg.request.focus
+		m.focused = focusCassModal
+		return m, nil
 
 	case AgentFileCheckMsg:
 		// AGENTS.md integration check (bv-i8dk)
@@ -3657,6 +3728,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Clear status message on any keypress
 		m.statusMsg = ""
 		m.statusIsError = false
+		if m.cassRequest != nil && (msg.String() == "V" || msg.String() == "esc") {
+			m.cancelCassLookup()
+			m.statusMsg = "Session lookup cancelled"
+			return m, nil
+		}
 
 		// Handle AGENTS.md prompt modal (bv-i8dk)
 		if m.showAgentPrompt {
@@ -3700,7 +3776,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "V", "esc", "enter", "q":
 				m.showCassModal = false
-				m.focused = focusList
+				m.focused = m.cassReturnFocus
 				return m, tea.Batch(cmds...)
 			}
 			return m, tea.Batch(cmds...)
@@ -4456,7 +4532,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					viewToggleHandled = true
 				case "V":
 					// Session preview for the focused board card (E4)
-					m.showCassSessionModal()
+					cmds = append(cmds, m.showCassSessionModal())
 					viewToggleHandled = true
 				}
 
@@ -4537,7 +4613,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					viewToggleHandled = true
 				case "V":
 					// Session preview for the focused tree node (E4)
-					m.showCassSessionModal()
+					cmds = append(cmds, m.showCassSessionModal())
 					viewToggleHandled = true
 				}
 
@@ -4576,7 +4652,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						viewToggleHandled = true
 					case "V":
 						// Session preview for the focused history row (E4)
-						m.showCassSessionModal()
+						cmds = append(cmds, m.showCassSessionModal())
 						viewToggleHandled = true
 					}
 				}
@@ -4602,6 +4678,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case focusDetail:
+				if keyStr == "V" {
+					return m, m.showCassSessionModal()
+				}
 				// Intercept "O" in detail view for editor dispatch (bv-134)
 				if keyStr == "O" {
 					if editorCmd := m.openInEditor(); editorCmd != nil {
@@ -4994,6 +5073,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.isSplitView = msg.Width > SplitViewThreshold
 		m.ready = true
 		m.applyContentSizing()
+		if m.showCassModal {
+			m.cassModal.SetSize(m.width, m.height)
+		}
 		if m.isSprintView && m.selectedSprint != nil {
 			// The dashboard is pre-rendered at its width; refresh on resize.
 			m.sprintViewText = m.renderSprintDashboard()
@@ -6079,7 +6161,7 @@ func (m *Model) handleListKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		m.cycleSortMode()
 	case "V":
 		// Show cass session preview modal (bv-5bqh)
-		m.showCassSessionModal()
+		cmd = m.showCassSessionModal()
 	case "U":
 		// Show self-update modal (bv-182)
 		m.showSelfUpdateModal()
@@ -9483,67 +9565,75 @@ func (m *Model) copyIssueToClipboard() tea.Cmd {
 	)
 }
 
-// showCassSessionModal shows the cass session preview modal for the selected issue (bv-5bqh)
-func (m *Model) showCassSessionModal() {
+// showCassSessionModal queues a lookup without running external processes in Update.
+func (m *Model) showCassSessionModal() tea.Cmd {
 	issuePtr := m.focusedIssueForSessions()
 	if issuePtr == nil {
 		m.statusMsg = "No issue selected"
 		m.statusIsError = false
-		return
+		return nil
 	}
-	issue := *issuePtr
-
-	// Check if cass is available
-	if m.cassCorrelator == nil {
-		// Initialize correlator lazily, reusing the startup detector when the
-		// health check already ran.
-		detector := m.cassDetector
-		if detector == nil {
-			detector = cass.NewDetector()
-			m.cassDetector = detector
+	issue := issuePtr.Clone()
+	m.cancelCassLookup()
+	if m.cassDetector == nil {
+		m.cassDetector = cass.NewDetector()
+	}
+	if m.cassCorrelator == nil || m.cassWorkspace != m.workDir {
+		m.cassCorrelator = cass.NewCorrelator(cass.NewSearcher(m.cassDetector), cass.NewCache(), m.workDir)
+		m.cassWorkspace = m.workDir
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	request := &cassSessionRequest{
+		cancel: cancel, beadID: issue.ID, focus: m.focused,
+		dataGeneration: m.semanticDataGeneration, workDir: m.workDir,
+		status: "Looking up sessions for " + issue.ID + "… (V/Esc cancel)",
+	}
+	m.cassRequest = request
+	m.statusMsg = request.status
+	m.statusIsError = false
+	detector, correlator := m.cassDetector, m.cassCorrelator
+	return func() tea.Msg {
+		defer cancel()
+		msg := cassSessionsLoadedMsg{request: request}
+		if ctx.Err() != nil {
+			return msg
 		}
-		status := detector.Check()
-		m.cassStatus = status
-		switch status {
-		case cass.StatusHealthy, cass.StatusNeedsIndex:
-			// A stale/rebuilding archive can still answer searches. Retain its
-			// health badge and let the bounded query try the existing index.
-		default:
-			m.statusMsg = "⚠️ cass not available (install it for session correlation)"
-			m.statusIsError = false
-			return
+		// Health has its own two-second bound; cancellation suppresses any
+		// subsequent query even if the health probe was already running.
+		msg.status = detector.Check()
+		if ctx.Err() != nil || (msg.status != cass.StatusHealthy && msg.status != cass.StatusNeedsIndex) {
+			return msg
 		}
-		searcher := cass.NewSearcher(detector)
-		cache := cass.NewCache()
-		m.cassCorrelator = cass.NewCorrelator(searcher, cache, m.workDir)
+		searchCtx, searchCancel := context.WithTimeout(ctx, 3*time.Second)
+		defer searchCancel()
+		msg.result = correlator.Correlate(searchCtx, &issue)
+		return msg
 	}
+}
 
-	// Run correlation
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+func (m *Model) cassLookupIsCurrent(request *cassSessionRequest) bool {
+	if request == nil || request != m.cassRequest || request.focus != m.focused ||
+		request.dataGeneration != m.semanticDataGeneration || request.workDir != m.workDir ||
+		m.showQuitConfirm || m.showHelp || m.showTutorial || m.showAgentPrompt || m.showUpdateModal ||
+		m.showAlertsPanel || m.showLabelHealthDetail || m.showLabelGraphAnalysis || m.showLabelDrilldown ||
+		m.showTimeTravelPrompt || m.showRecipePicker || m.showRepoPicker || m.showLabelPicker ||
+		(m.focused == focusList && m.list.FilterState() == list.Filtering) ||
+		(m.focused == focusBoard && m.board.IsSearchMode()) ||
+		(m.focused == focusHistory && (m.historyView.IsSearchActive() || m.historyView.FileTreeHasFocus())) {
+		return false
+	}
+	issue := m.focusedIssueForSessions()
+	return issue != nil && issue.ID == request.beadID
+}
 
-	result := m.cassCorrelator.Correlate(ctx, &issue)
-
-	// If no sessions found, just show a status message
-	if len(result.TopSessions) == 0 {
-		if result.Error != "" {
-			m.statusMsg = "⚠️ Session lookup incomplete; press V to retry"
-		} else {
-			m.statusMsg = "No correlated sessions found for " + issue.ID
+func (m *Model) cancelCassLookup() {
+	if request := m.cassRequest; request != nil {
+		request.cancel()
+		if m.statusMsg == request.status {
+			m.statusMsg = ""
 		}
-		m.statusIsError = false
-		return
+		m.cassRequest = nil
 	}
-	if result.Error != "" {
-		m.statusMsg = "⚠️ Session lookup incomplete; showing available matches"
-		m.statusIsError = false
-	}
-
-	// Create and show the modal
-	m.cassModal = NewCassSessionModal(issue.ID, result, m.theme)
-	m.cassModal.SetSize(m.width, m.height)
-	m.showCassModal = true
-	m.focused = focusCassModal
 }
 
 // showSelfUpdateModal shows the self-update modal (bv-182)
@@ -10188,6 +10278,7 @@ func parseBodyFromFrontmatter(content string) string {
 func (m *Model) Stop() {
 	m.cancelHistoryLoad()
 	m.cancelPhase2Preparation()
+	m.cancelCassLookup()
 	if m.backgroundWorker != nil {
 		m.backgroundWorker.Stop()
 	}

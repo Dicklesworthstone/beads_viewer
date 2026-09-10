@@ -2531,7 +2531,7 @@ graph LR
     class CASS,BV,CORR tool
 ```
 
-**Graceful Degradation:** If cass is not installed, `bv` works normally—no errors, broken UI, or loading states. Cass features simply become unavailable.
+**Graceful Degradation:** If cass is not installed, `bv` works normally. Pressing `V` reports that session correlation is unavailable after the background availability check.
 
 ### Detection & Status
 
@@ -2548,6 +2548,13 @@ The startup check runs `cass health` with a 2-second timeout. Its result is cach
 ### Session Preview Modal (`V` Key)
 
 Press `V` on any bead to open the **Session Preview Modal**—a view of AI coding sessions that may have contributed to that issue. `V` acts on whatever the current view has selected: the list or detail item, the board card, the tree node, or the history row.
+
+The lookup runs in the background, so navigation and resizing remain available.
+Press `V` again or Esc to cancel a pending lookup. Changing the selected issue,
+leaving the view or refreshing its data discards the pending result. Closing
+the completed modal returns to the view that opened it. A health probe already
+running may finish within its own two-second timeout after cancellation; no
+subsequent session search is started for that cancelled request.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐

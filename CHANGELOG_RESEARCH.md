@@ -10,6 +10,57 @@ checked-in Beads history, retained release receipts, then existing release
 documentation. Public source links belong in the changelog; local execution
 evidence supplements them here.
 
+## September 10 Cass responsiveness follow-up
+
+The `bv-xiyd` follow-up starts from `ff451598`. The previous repair restored
+real session results, but all four `V` dispatch paths still called health
+detection and correlation before `Model.Update` returned. A strict-RCH run
+of the new regression against that old source fails with `command=false`,
+`modal=true`: the subprocess work completed inside the input handler.
+
+The repair moves health and search work into a Bubble Tea command that owns
+a copied issue and cancellable request. Completion is bound to the request,
+selected issue, view, data generation and workspace. Pending lookups cancel
+on `V`/Esc, selection/view changes, refresh, quit and shutdown. The original
+bounded health check remains separately bounded; cancellation suppresses a
+subsequent query rather than interrupting an already-running health probe.
+Completed modals restore their originating view when dismissed.
+
+Independent review also found the detail pane swallowed `V`, a stale command
+could populate a cache subsequently reused after refresh, and unchanged focus
+could let a reply interrupt alerts or embedded search. Those paths now dispatch
+the lookup, isolate caches by dataset/workspace, and cancel when another input
+or overlay opens. A cancelled early lookup still accepts startup health without
+letting a late startup probe replace the newer lookup's health result.
+
+Controlled subprocess tests block health or search while resizing, rendering
+and navigating the real model. They are distinct from the installed-Cass
+archive replay. Exact run output is retained in
+`/data/tmp/bv-cass-async-20260910-ZTUc4a`; final verification and closure are
+recorded on `bv-xiyd`. This change adds no release or native/installed-tracker
+qualification and does not complete the original P1 performance matrix.
+
+The final strict-RCH UI race run records 2,048 passing test events, nine
+explicit skips and no failures; full-package build and vet also pass. All three
+receipts bind base `ff451598` and overlay fingerprint
+`c6cc180567d5e891c9a23384ee3dfd1690eb7cd789c06f4892ed294893f2f7d5`.
+The worker's two changed source hashes match the reviewed files. The resulting
+UI test binary is SHA256
+`aedf4b43dd612453da05a087fed18a3e36ebddd8744c356b52580102e0957875`.
+Independent execution passes 64 focused cases with one live-test opt-in skip,
+then passes the opt-in installed-Cass test: three direct archive hits become
+three modal sessions with the original preview and timestamp assertions.
+
+Initial failures remain visible in the same evidence directory: the detail
+dispatch defect, incomplete tree/alert test setup, and RCH receipt/admission
+and transfer refusals. Test setup was corrected without weakening assertions.
+Changed-file formatting and whitespace checks pass; whole-tree formatting
+still lists 49 unchanged vendor files. UBS exits 1 on the final files, reporting
+158 critical findings, four warnings and 138 informational findings. Manual
+and independent review traced these to ordinary comparisons, a fixed executable
+invoked with separate arguments, and explicitly owned asynchronous cancellation
+lifetimes; this is not reported as a passing scanner run.
+
 ## September 10 Cass lookup and generated claim guidance
 
 This bounded follow-up covers the changes after `65cfc346`, beginning with
@@ -55,8 +106,9 @@ three direct hits become three rendered modal sessions with matching fields.
 Independent replay of the same test executable also passes. Its SHA-256 is
 `ce7a4abd787a707bc6999df7928f88d554532ca3219df2eb6ed692f130b29d19`;
 it was built remotely with Go 1.26.0 for Linux amd64. The archive stayed local.
-The UI lookup remains synchronous, with a separate initial health-probe timeout;
-these checks do not establish an end-to-end latency guarantee.
+At that revision the UI lookup remained synchronous, with a separate initial
+health-probe timeout; the later responsiveness follow-up is described above.
+These checks do not establish an end-to-end latency guarantee.
 
 Independent agents-package verification passes 326 test entries with three
 Darwin-only skips. All 24 documentation-parity test entries pass. The old v5

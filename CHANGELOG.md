@@ -147,6 +147,11 @@ the latest tag, including installer changes usable with already released binarie
 
 ### Dependency inspection and documentation
 
+- Cass session lookups now run in the background, keeping navigation and
+  resizing available while Cass responds. `V` or Esc cancels a pending lookup;
+  results from an older selection or dataset cannot open a stale modal.
+  Refreshed data receives a fresh correlation cache. `V` also works from the
+  detail pane, and closing the modal restores its originating view (`bv-xiyd`).
 - Cass session lookup now reads the actual `hits` response and requests the
   title, preview, workspace and millisecond timestamp fields used by the UI.
   Pressing `V` can show sessions from a searchable stale or rebuilding index
