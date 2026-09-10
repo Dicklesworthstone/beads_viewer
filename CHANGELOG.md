@@ -151,7 +151,8 @@ the latest tag, including installer changes usable with already released binarie
   resizing available while Cass responds. `V` or Esc cancels a pending lookup;
   results from an older selection or dataset cannot open a stale modal.
   Refreshed data receives a fresh correlation cache. `V` also works from the
-  detail pane, and closing the modal restores its originating view (`bv-xiyd`).
+  detail pane, and closing the modal restores its originating view (`bv-xiyd`;
+  [responsiveness repair](https://github.com/Dicklesworthstone/beads_viewer/commit/4ffc37c6f162d3e5b9de6f35511744ca12a0a2eb)).
 - Cass session lookup now reads the actual `hits` response and requests the
   title, preview, workspace and millisecond timestamp fields used by the UI.
   Pressing `V` can show sessions from a searchable stale or rebuilding index
