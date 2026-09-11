@@ -91,7 +91,9 @@ Profile the actual slow path. Betweenness can dominate graph analysis, while ind
 
 ## Two-Phase Startup Architecture
 
-`bv` uses a two-phase startup to ensure responsive UI:
+`bv` computes graph metrics in two phases. This separates graph analysis from
+the event loop, but does not bound total TUI startup time: model construction
+also prepares views and computes alerts before the first render.
 
 ### Phase 1: Blocking (target <50ms)
 Computes metrics needed for initial render:
@@ -99,7 +101,8 @@ Computes metrics needed for initial render:
 - Topological sort (execution order)
 - Basic stats (counts, density)
 
-**Result:** The issue list can render after Phase 1, while expensive metrics continue in the background.
+**Result:** Phase 1 makes the initial graph data available while expensive metrics
+continue in the background. It is not a measurement of time to the first render.
 
 ### Phase 2: Background (async)
 Computes expensive metrics in a background goroutine:
@@ -112,6 +115,22 @@ Computes expensive metrics in a background goroutine:
 - k-core, articulation points, and slack
 
 **Result:** Insights dashboard shows "Computing..." until Phase 2 completes.
+
+Priority recommendations and refreshed alerts are prepared in a background
+command after the metrics finish. That preparation can outlast the metric
+timeouts, particularly on deep dependency chains: each priority recommendation
+currently simulates its transitive unblocks separately. The responsiveness
+harness records this work as `phase2_command_ns`; `phase2_handler_ns` measures
+the event-loop work to install the completed result. Its `settled_setup_ns`
+includes waiting for preparation and is not a first-render measurement.
+
+An additional startup limitation remains: initial model construction and the
+synchronous file-reload path compute alerts directly. By default, projects with
+up to 2,000 issues can run priority-mismatch and duplicate checks there; the
+priority check requests synchronous graph analysis and recommendations. The
+background preparation path subsequently refreshes alerts again. A settled
+navigation benchmark therefore does not establish fast startup or a bounded
+synchronous reload.
 
 ## Factors Affecting Performance
 
