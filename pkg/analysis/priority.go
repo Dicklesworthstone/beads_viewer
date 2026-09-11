@@ -1008,6 +1008,34 @@ func (a *Analyzer) computeWhatIfDeltaFromStats(issueID string, stats *GraphStats
 	}
 }
 
+// cascadeCandidates indexes the immutable graph once across completion simulations.
+// Readiness and simulated completions remain query-local; only adjacency is shared.
+func (a *Analyzer) cascadeCandidates(issueID string) []string {
+	a.cascadeOnce.Do(func() {
+		a.cascadeFrontiers = make(map[string][]string, len(a.issueMap))
+		for id, nodeID := range a.idToNode {
+			candidateSet := make(map[string]bool)
+			dependents := a.g.To(nodeID)
+			for dependents.Next() {
+				candidateSet[a.nodeToID[dependents.Node().ID()]] = true
+			}
+			for _, childID := range a.childrenByParent[id] {
+				candidateSet[childID] = true
+			}
+			if len(candidateSet) == 0 {
+				continue
+			}
+			ids := make([]string, 0, len(candidateSet))
+			for candidateID := range candidateSet {
+				ids = append(ids, candidateID)
+			}
+			sort.Strings(ids)
+			a.cascadeFrontiers[id] = ids
+		}
+	})
+	return a.cascadeFrontiers[issueID]
+}
+
 // countTransitiveUnblocks counts total issues unblocked by a hypothetical completion of issueID,
 // including cascading effects (diamonds, chains) via simulation.
 func (a *Analyzer) countTransitiveUnblocks(issueID string) int {
@@ -1030,24 +1058,7 @@ func (a *Analyzer) countTransitiveUnblocks(issueID string) int {
 		curr := queue[0]
 		queue = queue[1:]
 
-		candidateSet := make(map[string]bool)
-		if nodeID, ok := a.idToNode[curr]; ok {
-			dependents := a.g.To(nodeID)
-			for dependents.Next() {
-				candidateSet[a.nodeToID[dependents.Node().ID()]] = true
-			}
-		}
-		for _, childID := range a.childrenByParent[curr] {
-			candidateSet[childID] = true
-		}
-
-		candidateIDs := make([]string, 0, len(candidateSet))
-		for candidateID := range candidateSet {
-			candidateIDs = append(candidateIDs, candidateID)
-		}
-		sort.Strings(candidateIDs)
-
-		for _, candidateID := range candidateIDs {
+		for _, candidateID := range a.cascadeCandidates(curr) {
 			// Existing ready work is not caused by this completion. Check only
 			// the affected frontier with the same source scope/reference time;
 			// enumerating every ready issue here made a batch quadratic in N.

@@ -1308,6 +1308,8 @@ type Analyzer struct {
 	issueMap         map[string]model.Issue
 	issues           []model.Issue // Analyzer-owned snapshot retained for data-hash memoization
 	childrenByParent map[string][]string
+	cascadeOnce      sync.Once
+	cascadeFrontiers map[string][]string // Immutable sorted graph dependents plus hierarchy children
 	blockerCounts    []int
 	blockerCountsMax int
 	config           *AnalysisConfig // Optional custom config, nil means use size-based defaults

@@ -73,6 +73,51 @@ func TestTransitiveUnblocksWorkTracksAffectedFrontier(t *testing.T) {
 	}
 }
 
+func TestTransitiveUnblocksConcurrentFrontiersAndClock(t *testing.T) {
+	now := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "root", Status: model.StatusOpen},
+		{ID: "a", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "root", Type: model.DepBlocks},
+			{DependsOnID: "root", Type: model.DepBlocks},
+			{DependsOnID: "root", Type: model.DepParentChild},
+		}},
+		{ID: "b", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+		{ID: "join", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "a", Type: model.DepBlocks}, {DependsOnID: "b", Type: model.DepBlocks},
+		}},
+		{ID: "hierarchy", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "a", Type: model.DepParentChild}}},
+		{ID: "deferred", Status: model.StatusOpen, DeferUntil: &future, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+		{ID: "parked", Status: model.StatusBlocked, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+		{ID: "missing-parent", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "root", Type: model.DepBlocks}, {DependsOnID: "absent", Type: model.DepParentChild},
+		}},
+	}
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(now)
+	const workers = 12
+	results := make(chan int, workers)
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			results <- analyzer.countTransitiveUnblocks("root")
+		}()
+	}
+	close(start)
+	for i := 0; i < workers; i++ {
+		if got := <-results; got != 4 {
+			t.Errorf("concurrent cascade=%d, want a, b, join and hierarchy", got)
+		}
+	}
+	// Adjacency reuse must not freeze readiness at the first query's clock.
+	analyzer.SetNow(future)
+	if got := analyzer.countTransitiveUnblocks("root"); got != 5 {
+		t.Fatalf("cascade at deferral boundary=%d, want 5", got)
+	}
+}
+
 func TestPriorityRecommendationsFromStatsPreserveResultsAndSourceReadiness(t *testing.T) {
 	issues := []model.Issue{{ID: "ROOT", Status: model.StatusOpen, Priority: 4}}
 	for i := 0; i < 8; i++ {
@@ -715,6 +760,32 @@ func BenchmarkTopWhatIfDeltas_StatsReuse(b *testing.B) {
 		if len(got) != 1 || got[0].IssueID != "ROOT" || got[0].Delta.TransitiveUnblocks != issueCount-1 {
 			b.Fatalf("unexpected top what-if result: %+v", got)
 		}
+	}
+}
+
+// BenchmarkTransitiveUnblocksChainBatch checks every starting point in a chain.
+func BenchmarkTransitiveUnblocksChainBatch(b *testing.B) {
+	const size = 540
+	issues := make([]model.Issue, size)
+	for i := range issues {
+		issues[i] = model.Issue{ID: fmt.Sprintf("chain-%03d", i), Status: model.StatusOpen}
+		if i > 0 {
+			issues[i].Dependencies = []*model.Dependency{{DependsOnID: issues[i-1].ID, Type: model.DepBlocks}}
+		}
+	}
+	analyzer := NewAnalyzer(issues)
+	check := func() {
+		for i, issue := range issues {
+			if got := analyzer.countTransitiveUnblocks(issue.ID); got != size-i-1 {
+				b.Fatalf("%s cascade=%d, want %d", issue.ID, got, size-i-1)
+			}
+		}
+	}
+	check()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		check()
 	}
 }
 
