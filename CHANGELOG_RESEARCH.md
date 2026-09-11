@@ -10,6 +10,54 @@ checked-in Beads history, retained release receipts, then existing release
 documentation. Public source links belong in the changelog; local execution
 evidence supplements them here.
 
+## September 11 cascade frontier reuse
+
+Follow-up `01383eb6` caches the sorted, deduplicated union of blocking dependents
+and hierarchy children once per Analyzer. It changes only adjacency lookup:
+each simulation still owns its completed set, uses the same FIFO order and
+rechecks readiness with the current clock and candidate scope. Floating-point
+scoring, tie-breaking and random seeds are unchanged. Independent source review
+confirmed graph ownership and `sync.Once` publication; it did not run tests.
+
+The preceding 10k profile attributed 100.57 seconds of cumulative sampled CPU
+(53.54%) to `countTransitiveUnblocks`, including repeated frontier construction.
+The selected opportunity scored 3 × 5 / 2 = 7.5 for impact, confidence and effort.
+The cache is lazy, but its first non-leaf query scans the full graph and sorts
+each frontier, retaining O(V+E) storage for the Analyzer lifetime. Missing, closed and leaf roots still
+return before that initialization. Warm batch measurements exclude this cold cost.
+
+The first baseline launch was refused before remote execution because the test
+overlay changed during admission; its exit 103 log is retained. A frozen retry
+against `957c9abe` with only the new tests overlaid passed. Three 540-node chain
+batch samples took 535.5–990.5 ms, allocated 24.63 MB and 296,836–296,842 objects.
+Every starting node's cascade count was checked against the chain length.
+The optimized samples on the same worker with Go 1.25.5 took 124.7–290.1 ms,
+allocated 15.32 MB and 151,305–151,306 objects. The unchanged complete enhanced
+output SHA regression passed three executions. These are three one-operation
+samples of warmed synthetic batches, not latency quantiles or a 10k acceptance.
+Successful receipts bind old base `957c9abe` plus test-only fingerprint
+`870791ecae9a535b75739f307b40440feaad71885f2c114003e7073d0a3daa8c`
+and optimized fingerprint
+`a490965134089d0dc04569d3393e81ec6fc41db85fe0dec255279f1e8d0959e6`.
+Logs for this follow-up are retained under `/data/tmp/bv-cascade-frontier-*20260911.log`.
+
+Full analysis/model tests passed. The final asymmetric-diamond regression forces
+a failed readiness check followed by a successful revisit, while also checking
+duplicate blocking/parent edges, hierarchy propagation, deferred/parked/missing
+exclusions and concurrent first use. Targeted race tests, including the frozen
+output regression, passed with Go 1.25.5. Full build and vet also passed. Final-test
+receipts bind base `49b97739` and overlay fingerprint
+`c2ef1b4b4f22e59795639da5af299c7350a3f8eb2938d9e444638a1adfeb52fc`.
+RCH reported downloaded-toolchain cleanup residue after successful package and
+build commands; local launchers exited zero, and no manual cleanup was attempted.
+
+UBS returned exit 1: its 21 critical reports concern existing graph-ID, index
+and score comparisons misclassified as secret comparisons. Reviewed warnings
+include existing deferred recover/cancel patterns and a new goroutine-loop
+warning whose loop variable is not captured. No findings were suppressed.
+Formatting reports zero non-vendor entries and 49 pre-existing vendor entries.
+This checkpoint does not complete the original P1 matrix or native qualification.
+
 ## September 11 enhanced-priority snapshot reuse
 
 Narrow follow-up: `c3091424` wires the existing statistics-aware scoring,

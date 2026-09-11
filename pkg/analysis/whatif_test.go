@@ -83,7 +83,9 @@ func TestTransitiveUnblocksConcurrentFrontiersAndClock(t *testing.T) {
 			{DependsOnID: "root", Type: model.DepBlocks},
 			{DependsOnID: "root", Type: model.DepParentChild},
 		}},
-		{ID: "b", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+		// a visits join before bridge completes b, so join must be retried.
+		{ID: "bridge", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "root", Type: model.DepBlocks}}},
+		{ID: "b", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "bridge", Type: model.DepBlocks}}},
 		{ID: "join", Status: model.StatusOpen, Dependencies: []*model.Dependency{
 			{DependsOnID: "a", Type: model.DepBlocks}, {DependsOnID: "b", Type: model.DepBlocks},
 		}},
@@ -107,14 +109,14 @@ func TestTransitiveUnblocksConcurrentFrontiersAndClock(t *testing.T) {
 	}
 	close(start)
 	for i := 0; i < workers; i++ {
-		if got := <-results; got != 4 {
-			t.Errorf("concurrent cascade=%d, want a, b, join and hierarchy", got)
+		if got := <-results; got != 5 {
+			t.Errorf("concurrent cascade=%d, want a, bridge, b, join and hierarchy", got)
 		}
 	}
 	// Adjacency reuse must not freeze readiness at the first query's clock.
 	analyzer.SetNow(future)
-	if got := analyzer.countTransitiveUnblocks("root"); got != 5 {
-		t.Fatalf("cascade at deferral boundary=%d, want 5", got)
+	if got := analyzer.countTransitiveUnblocks("root"); got != 6 {
+		t.Fatalf("cascade at deferral boundary=%d, want 6", got)
 	}
 }
 

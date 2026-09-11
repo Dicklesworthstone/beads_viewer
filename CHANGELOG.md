@@ -31,6 +31,9 @@ the latest tag, including installer changes usable with already released binarie
 
 ### Priority recommendation performance
 
+- Cascade simulations now reuse sorted dependency and hierarchy adjacency
+  instead of rebuilding it at every step. Completion state and readiness checks
+  remain specific to each query ([frontier reuse](https://github.com/Dicklesworthstone/beads_viewer/commit/01383eb6a3ab2f5bac5a95f7596aa3f89ecb510f)).
 - Enhanced priority recommendations, used by `--robot-priority`, now reuse one
   completed analysis snapshot across the batch instead of rereading the analysis
   cache for every issue. Scoring, explanation fields, ordering, and output caps
