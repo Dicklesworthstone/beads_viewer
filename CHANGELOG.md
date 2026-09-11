@@ -4,7 +4,8 @@ All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are
 
 Scope window: this update verifies `v0.24.0..v0.24.1` and the post-release
 commits through [`80450e34`](https://github.com/Dicklesworthstone/beads_viewer/commit/80450e345e6b2061fd1e17c6eee007bcb49d56c6).
-The September 10 canonical-source and Cass repairs are covered separately below.
+The September 10 canonical-source and Cass repairs and September 11 performance
+measurement are covered separately below.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
 and release receipts; [research notes](CHANGELOG_RESEARCH.md) record coverage.
@@ -27,6 +28,20 @@ the latest tag, including installer changes usable with already released binarie
 ---
 
 ## [Unreleased]
+
+### Performance verification and documentation
+
+- The September 11 source measurement passed all 144 current UI cohorts at
+  the original 50 ms p99 and delivered-handler limits; the worst cohort p99
+  was 46.472 ms. The overall matrix failed when a baseline process was killed
+  in the last timed CLI cohort, leaving 70 of 72 records complete. The README
+  and [performance guide](docs/performance.md#september-11-2026-measurement-attempt)
+  distinguish those outcomes and keep the P1 work open. This adds measurement
+  evidence, not a runtime optimization or release qualification.
+- Documentation now distinguishes settled navigation from startup and
+  background preparation, and makes dependent readiness conditional on
+  remaining prerequisites and eligibility. The v0.22.0 entry names the
+  50 ms interaction target while preserving its original measurements.
 
 ### Workflow data and static dashboards
 
@@ -381,7 +396,7 @@ falls back to a full rebuild whenever graph topology, recipe membership, sort or
   bytes per operation fell by about **99.8%**. See
   [`96029793`](https://github.com/Dicklesworthstone/beads_viewer/commit/96029793) and
   [`1a90b016`](https://github.com/Dicklesworthstone/beads_viewer/commit/1a90b016).
-- **Keep interactive latency inside the frame budget.** Five update-only keypress runs measured
+- **Measure interactive latency against the 50 ms target.** Five update-only keypress runs measured
   p99 at **148-160 us**. Three isolated update-plus-render runs measured p99 at
   **33.05-35.54 ms**, below the 50 ms interaction target. Isolated GC validation measured maximum
   pauses of **0.879-1.374 ms**. The benchmarks live with the code in

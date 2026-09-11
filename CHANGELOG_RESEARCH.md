@@ -10,6 +10,166 @@ checked-in Beads history, retained release receipts, then existing release
 documentation. Public source links belong in the changelog; local execution
 evidence supplements them here.
 
+## September 11 incomplete performance matrix
+
+This bounded follow-up records measurements of current source `4ffc37c6`,
+with no runtime changes during the run. The September 10–11 UI matrix passed
+its original current-code gates. The overall matrix failed in the last timed
+CLI cohort; `bv-apal.1` and its proof task `bv-apal.2` remain open. Earlier
+release failures and September 5 measurements retain their original scope.
+
+The baseline is reconstructed from `7393a06b` plus the original working-tree
+changes, rather than substituted with a newer convenient commit. Recovered
+patch SHA-256 is
+`b24b00b39e170e575b4b8d77b2326bd6370b1d088fb3581a6d01e18c71b3f18f`;
+the untracked readiness source is
+`8c4761428888b247c11dcfa041ea607c6fbbc956ae3847a6f894982fdf275905`.
+The reconstructed input manifest is
+`a3f432bf218d46c74d35112f60a02cce05e53750ef10f08645a55d641bc8b7ff`.
+Independent review checked all 3,212 Go/module/vendor inputs and six embedded
+asset roots against recovered evidence. Four nonbuild files are exceptions:
+the historical README and performance guide use available later bytes, and
+the original tracker and bridge-plan hashes could not be recovered. The
+rebuilt baseline is not claimed byte-identical to the missing old executables.
+
+Strict RCH builds ran on Linux amd64 `hz3`, with Go 1.25.5, `GOMAXPROCS=64`,
+CGO enabled and `GOAMD64=v1`. Current build receipts agree on all 4,800
+transmitted source-file entries; the frozen checkout has 4,810 tracked files,
+including ten tracker files excluded by RCH. Both CLI builds use the explicit
+benchmark label `v0.0.0-p1.20260910`; version fields remain in exact comparison.
+This controls benchmark metadata without claiming released-binary equivalence.
+
+| Measured executable | SHA-256 |
+|---|---|
+| Rebuilt baseline CLI | `620ef252d7c5b47b7b62afe72d9d0bb6746283c16ab25b318677f4216199d00f` |
+| Rebuilt baseline UI test | `c5a3b7e7864269e7df6bb871c9ba924af4cf2f5c196cc029c3acda80a45c5e54` |
+| Current CLI | `69dbf11f4335f7bb23ecf1d24e773346fde58828bbb69fa107e1e9d00e285167` |
+| Current UI test | `4d6b478afa6928519b95a8c9d98f89009a27e6c4800a02fbd896f5b4d5b7f605` |
+
+The steps of `scripts/benchmark.sh latency` were dispatched separately through
+strict RCH to keep compilation remote. No GitHub Actions ran. Its original
+workloads, order, sample counts, timeout limits, parity projections and SLOs
+were preserved. Runner SHA-256 is
+`896d7e2518217e484b41d53176e6fb4d354a0317840d812f26c0a9061c168f7b`;
+unchanged verifier SHA-256 is
+`939b66ccb210c92927044c05760fc2d206c4eeb170ce48debb6de17bda5b2199`.
+Original positive and deliberate-failure controls remain bound to the qualified
+sources and binaries; a skipped opt-in test receives no matrix credit.
+
+Independent UI readback checked 304 original files totaling 682,433,712 bytes,
+with no missing or changed files. Their canonical path/size/hash map is
+`b19be8dcf361f41a6c5ec61c712224cc3bdd645a406901f50ef7bad7b8f5c3cc`.
+All eight processes exited zero: 288 records and 288,000 samples. The worst
+current p99 is 46.472034 ms; every delivered snapshot and Phase 2 handler
+passes 50 ms. The slowest individual interaction is 94.027194 ms. Baseline
+misses, all raw outliers, sampled/skipped metrics and unpaired generations
+are retained; [the guide](docs/performance.md#september-11-2026-measurement-attempt)
+reports their counts and interpretation.
+
+Measured UI allocation totals are 1,561,563,406,448 baseline bytes and
+1,541,086,120,632 current bytes. GC counts are 8,974 and 8,893; cumulative GC
+pause times are 2,441,823,234 and 2,532,533,278 ns. Those include background
+work and measurement overhead, with different completion counts, and do not
+establish a causal memory reduction. No new peak-RSS observation was collected.
+
+Timed CLI RCH job `30015430739361967` recorded remote exit 1 at
+`2026-09-11T05:22:05.951649Z`, after 7,096,881 ms including Go setup. Its test
+ran for 6,864.73 seconds. The first 70 records contain 14,000 complete measured
+calls. Unicode 10k warm-cache outputs 0000–0135 exist for both binaries;
+baseline `sample-0136.stdout.json` and stderr are empty. No final result record
+exists for either side of that pair. The previous baseline output timestamp
+is `05:20:00.188265Z`, and the failure file is `05:22:01.851341Z`.
+The 121.663-second interval is consistent with the unchanged two-minute
+`CommandContext` limit, but the harness did not retain `ctx.Err()` or the
+failed call's elapsed duration. `signal: killed` alone cannot establish OOM,
+an external kill, or context expiry. No selective retry or timeout increase
+was used, and the partial pair receives no completed-cohort credit.
+
+After the remote test exited, RCH's checksum comparison of the source tree
+timed out at its 303,000 ms limit. The local wrapper therefore exited 103,
+separately from the test's exit 1, without emitting a final source-content
+receipt. Both failures are retained; earlier build receipts are not described
+as a successful post-test source check. Strict RCH did not fall back locally.
+Independent manual readback later verified all 4,800 timed-job source files,
+285,732,185 bytes and executable modes against the qualified input manifest,
+with no extra files outside the excluded Git, tracker and Go-cache paths.
+That is separate post-run evidence, not a replacement RCH receipt.
+
+Independent readback covers all 70 terminal CLI records: source and fixture
+identities, every raw decision/status projection, all 14,000 durations and
+their quantiles. All 35 complete current p99 values are lower than baseline;
+there are no equal or higher pairs in that completed subset. Baseline's
+worst p99 is 26,885.120095 ms (Unicode 10k cold), and its maximum sample is
+45,643.976476 ms (Unicode 5k cold, sample 147). Current's worst p99 is
+743.587494 ms, with a maximum sample of 11,189.315648 ms (Unicode 10k cold,
+sample 154). The missing pair is explicitly incomplete, not an excluded
+outlier. Its 272 successful outputs establish no duration distribution.
+
+The separately prescribed exact-output test ran through strict RCH job
+`30015430739361983` and recorded remote exit 0 at
+`2026-09-11T05:33:40.512614Z`; the Go package reports 96.489 seconds.
+All 36 records completed, with 144 compared outputs and 36 warmups at
+`SOURCE_DATE_EPOCH=1788220800`. Only the original named elapsed fields are
+removed; complete scores, statuses, source authority, timestamps, version and
+array order remain compared. This result receives no latency credit and
+does not replace either missing timed record.
+
+The exact test's final source receipt is
+`a87ba22320bad6ca20137539cea843ae7e15e8b121e478e9724c80a9681f37f2`.
+All 4,800 file entries match the qualified current binary-build inputs, and
+local frozen files were rehashed against the receipt. Both remote test and
+local RCH wrapper exited zero. The retained exact log is 848,952 bytes,
+SHA-256 `ed9ae54df27a10518325b270d04672d48f09942ac1589501fd2c8c1790020546`.
+Independent readback verified all 144 full raw results and 36 warmups, with
+180 empty stderr files. Only `triage.meta.compute_time_ms` was present among
+the allowed elapsed fields; metric `ms` fields were absent. Number lexemes,
+array order, version and actual source paths remain compared. All exact
+outputs retain sampled betweenness with 50 pivots and seven skipped metrics.
+The complete exact subtree has 650 files and 374,347,740 bytes; its canonical
+path/size/hash map is
+`65202561bd1160c33ab9dffd6a3719a7795e8509ce55d85d32473f2e120be8da`.
+
+The original whole-matrix verifier then ran without modified inputs or filters
+through strict RCH and exited 1. Its only two `FAIL` reports are the missing
+baseline and current Unicode 10k warm-cache `result.json` files. Configured
+metric degradation and unpaired refresh generations remain visible in its
+complete output; no missing record was replaced or synthesized.
+
+Shared-host build activity, verification reads and evidence transfers remain
+part of the run. The observed I/O pressure is recorded without assigning
+causation to individual tails. Raw measurements are retained under
+`/data/tmp/bv-p1-final-20260910.Gtw1Rb5t/matrix.CRrcJzPH` on `hz3`; source
+recovery and orchestration evidence is in
+`/data/tmp/bv-cass-async-20260910-ZTUc4a`. This performance record includes
+only the named P1 provenance, not the unrelated live Cass archive material.
+
+The complete inventory retains 44,198 files totaling 4,069,001,097 bytes,
+including actual baseline/current binaries, unchanged harness files, source
+recovery/build/control evidence, all measurements and the failed empty output.
+The sibling manifest `matrix.CRrcJzPH.raw-files.jsonl` is 10,455,180 bytes,
+SHA-256 `4e8cdac2ca7abf995119707a1be4adbbbc31b4bbda6cd47ada1b120004202b54`.
+The lossless sibling archive `matrix.CRrcJzPH.tar.zst` is 169,092,402 bytes,
+SHA-256 `4cc4e8d088816214ebf2b18a9b90e5d977ba39cb34915deac1fd569713b678c6`.
+Streaming decompression verified every file's hash, size and mode, plus 14,932
+directories, against the inventory without extraction. Both files are retained
+locally in `/data/tmp/bv-p1-final-20260910.Gtw1Rb5t` with identical worker
+copies; the complete worker raw tree also remains. No failed sample or earlier
+artifact was deleted, and the archive is outside the tree it contains.
+Independent review reconciled the archive with every previously verified
+measurement map and the retained harness, binary and execution provenance,
+with no missing, extra or duplicate members. Agent Mail 708 records that
+retention verdict separately from the failed matrix verdict.
+
+The v0.22.0 wording correction changes “inside the frame budget” to the
+50 ms interaction target. Its historical 33.05–35.54 ms values are unchanged;
+this is not a new audit or rerun of that release.
+
+Documentation whitespace checks and the skill's changelog structural validator
+pass. The validator retains its warning about bare commit hashes in earlier
+entries. UBS classifies the five changed Markdown/JSONL files as Bash, then
+exits 2 with `MODULE_EXIT_2` and zero files scanned. No partial-scan override
+was enabled, and that tooling failure is not reported as a passing scan.
+
 ## September 10 Cass responsiveness follow-up
 
 The `bv-xiyd` follow-up starts from `ff451598`. The previous repair restored

@@ -35,6 +35,75 @@ Each refresh generation changes the final issue's title. Exact decision comparis
 
 Normal `go test` runs exercise navigation beyond the issue count, a deliberate 60 ms slow-handler rejection, missing/degraded metric controls, and real 1k/5k/10k CLI smoke cases. Complete distributions require the explicit latency runner; a skipped opt-in cohort is not performance acceptance. Search relevance is evaluated separately against judged queries; a timing pass says nothing about semantic quality.
 
+### September 11, 2026 measurement attempt
+
+The September 10–11 run completed the original UI matrix, but **the overall
+latency matrix failed**. The final timed CLI cohort stopped when a baseline
+process was killed. The remaining CLI evidence cannot be replaced by the UI
+pass, and the P1 implementation and proof beads remain open.
+
+The measured current source is
+[`4ffc37c6`](https://github.com/Dicklesworthstone/beads_viewer/commit/4ffc37c6f162d3e5b9de6f35511744ca12a0a2eb),
+on Linux amd64 host `hz3`, Go 1.25.5, `GOMAXPROCS=64`, CGO enabled, at
+140×45 terminal cells. The baseline was rebuilt from the original `7393a06b`
+source and recovered working-tree changes. Its Go, module, vendor and embedded
+inputs were independently checked; this does not establish byte identity with
+the missing historical executables. Both CLI builds use the controlled version
+label `v0.0.0-p1.20260910`, with distinct source and executable hashes retained
+in the [research record](../CHANGELOG_RESEARCH.md). These are source-build
+measurements, not release or native-installer qualification.
+
+All eight alternating baseline/current UI processes completed: **288 records,
+288,000 observations**, with 1,000 samples per workload and mode. Independent
+review verified the raw samples, fixture and executable identities, quantiles,
+decision parity and the existing slowdown controls. All 144 current-code
+cohorts met the unchanged p99 and delivered-handler gates.
+
+| Current-code observation | Worst observed value | Acceptance |
+|---|---:|---|
+| Per-cohort interaction p99 | 46.472 ms | All 144 cohorts ≤50 ms |
+| Snapshot delivery handler | 13.532 ms | Every delivered handler ≤50 ms |
+| Phase 2 completion handler | 15.364 ms | Every delivered handler ≤50 ms |
+| Individual interaction | 94.027 ms | No every-interaction ≤50 ms claim |
+
+The baseline retained eight cohort p99 misses, all dense 5k/10k refresh cases,
+and 23 snapshot deliveries above 50 ms. Its worst cohort p99 was 67.252 ms;
+its slowest snapshot handler took 101.271 ms. No samples were excluded.
+The current runs delivered 4,741 snapshots and corresponding Phase 2 results.
+Across the same-round pairs, 4,525 matching refresh generations preserved exact
+decision fingerprints. Another 216 current-only and 37 baseline-only
+completions receive no cross-binary parity credit. Sampled and skipped metric
+states remain visible.
+
+The timed CLI test completed **70 of 72 records**, containing 14,000 measured
+calls, before failing in the Unicode 10k warm-cache baseline. Partial outputs
+from that last pair include 272 successful calls, followed by an empty baseline
+output for sample 136. They receive no complete-cohort credit. The helper
+imposes a two-minute per-call limit; about 122 seconds separate the preceding
+baseline output and failed sample file. That is consistent with the limit,
+but the failure message records only `signal: killed`, with empty stdout and
+stderr, and does not identify the killing mechanism.
+
+Among the 35 complete baseline/current CLI pairs, every current p99 was lower.
+The worst observed cohort p99 was 743.587 ms for current and 26,885.120 ms
+for baseline. Individual calls reached 11,189.316 ms and 45,643.976 ms,
+respectively. These describe the completed records only; the partial final
+pair has no retained duration distribution and receives no timing credit.
+
+The separately prescribed fixed-clock test completed all 36 exact-comparison
+records and passed: 144 compared calls plus 36 warmups, with only the original
+named elapsed fields removed from JSON. That result receives no latency credit
+and does not fill the missing timed cohort. The unchanged whole-matrix verifier
+exited 1, reporting the two missing Unicode warm-cache result records.
+
+Other builds, verification and evidence transfers shared this host. Observed
+I/O pressure and large baseline tails remain part of the record; these results
+do not isolate a causal speedup. UI allocation and GC statistics include
+background work and instrumentation, with different completion counts between
+the binaries. No new peak-RSS measurement was collected. The observations do
+not establish a memory cap, bounded startup, physical terminal paint, universal
+60fps, population tail bounds or search relevance.
+
 ### September 5, 2026 source verification
 
 The complete default matrix passed on Linux amd64 host `hz3`, Go 1.25.5,
