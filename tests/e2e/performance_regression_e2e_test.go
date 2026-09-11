@@ -426,6 +426,9 @@ func runPerformanceCLI(t testing.TB, binary, dir, cache, sample, epoch string) (
 	started := time.Now()
 	output, err := cmd.Output()
 	elapsed := time.Since(started)
+	// Capture cancellation before artifact writes: slow filesystem operations
+	// must not make an earlier process failure look like a command timeout.
+	contextErr := ctx.Err()
 	// Retain actual stdout/stderr, including failures. Each sample has a unique
 	// name inside an isolated destination; the runner retains the directory.
 	for suffix, content := range map[string][]byte{"stdout.json": output, "stderr.log": stderr.Bytes()} {
@@ -438,7 +441,8 @@ func runPerformanceCLI(t testing.TB, binary, dir, cache, sample, epoch string) (
 		}
 	}
 	if err != nil {
-		t.Fatalf("%s --robot-triage failed: %v\nstderr: %s\nstdout: %s", binary, err, stderr.String(), output)
+		t.Fatalf("%s --robot-triage failed: %v (sample=%s, elapsed=%s, context_error=%v)\nstderr: %s\nstdout: %s",
+			binary, err, sample, elapsed, contextErr, stderr.String(), output)
 	}
 	return output, elapsed
 }
