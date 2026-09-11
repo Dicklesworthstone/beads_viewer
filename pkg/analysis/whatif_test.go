@@ -2,6 +2,8 @@ package analysis
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -713,5 +715,74 @@ func BenchmarkTopWhatIfDeltas_StatsReuse(b *testing.B) {
 		if len(got) != 1 || got[0].IssueID != "ROOT" || got[0].Delta.TransitiveUnblocks != issueCount-1 {
 			b.Fatalf("unexpected top what-if result: %+v", got)
 		}
+	}
+}
+
+// BenchmarkEnhancedPriorityBatch isolates batch analysis reuse from long
+// cascades: every dependent has only the root as its prerequisite.
+func BenchmarkEnhancedPriorityBatch(b *testing.B) {
+	b.Setenv("BV_ROBOT", "1")
+	b.Setenv("BV_CACHE_DIR", b.TempDir())
+	analyzer := enhancedPriorityBatchFixture()
+	want := analyzer.GenerateEnhancedRecommendations()
+	if len(want) != 10 {
+		b.Fatalf("expected capped enhanced recommendations, got %d", len(want))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	var got []EnhancedPriorityRecommendation
+	for i := 0; i < b.N; i++ {
+		got = analyzer.GenerateEnhancedRecommendations()
+	}
+	b.StopTimer()
+	if !reflect.DeepEqual(got, want) {
+		b.Fatal("enhanced recommendations changed across identical calls")
+	}
+}
+
+func enhancedPriorityBatchFixture() *Analyzer {
+	const issueCount = 540
+	issues := make([]model.Issue, issueCount)
+	issues[0] = model.Issue{ID: "ROOT", Status: model.StatusOpen, Priority: 4}
+	for i := 1; i < issueCount; i++ {
+		id := fmt.Sprintf("DEPENDENT-%03d", i)
+		issues[i] = model.Issue{
+			ID: id, Status: model.StatusOpen, Priority: i % 5,
+			Dependencies: []*model.Dependency{{DependsOnID: "ROOT", Type: model.DepBlocks}},
+		}
+	}
+	analyzer := NewAnalyzer(issues)
+	analyzer.SetNow(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	return analyzer
+}
+
+func TestEnhancedPriorityBatchRegression(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	analyzer := enhancedPriorityBatchFixture()
+	// Pin metric policy as well as scoring time for the output golden. The
+	// separate benchmark retains the ordinary size-tiered production policy.
+	config := AnalysisConfig{
+		RunToCompletion: true, ComputeBetweenness: true, BetweennessMode: BetweennessExact,
+		ComputePageRank: true, ComputeHITS: true, ComputeCycles: true, MaxCyclesToStore: 10000,
+		ComputeEigenvector: true, ComputeCriticalPath: true,
+		ComputeKCore: true, ComputeArticulation: true, ComputeSlack: true,
+	}
+	analyzer.SetConfig(&config)
+	got := analyzer.GenerateEnhancedRecommendations()
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("complete enhanced output SHA256: %x", sha256.Sum256(encoded))
+	allocs := testing.AllocsPerRun(1, func() {
+		if repeated := analyzer.GenerateEnhancedRecommendations(); !reflect.DeepEqual(repeated, got) {
+			t.Fatal("identical batch changed complete recommendations")
+		}
+	})
+	// The old path allocated over three million objects to reread the same
+	// analysis for 540 issues. Leave ample room for actual scoring and output.
+	if allocs > 250000 {
+		t.Fatalf("enhanced batch allocated %.0f objects; want at most 250000", allocs)
 	}
 }

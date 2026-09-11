@@ -123,13 +123,16 @@ func (a *Analyzer) GenerateEnhancedRecommendations() []EnhancedPriorityRecommend
 
 // GenerateEnhancedRecommendationsWithThresholds generates enhanced recommendations
 func (a *Analyzer) GenerateEnhancedRecommendationsWithThresholds(thresholds RecommendationThresholds) []EnhancedPriorityRecommendation {
-	scores := a.ComputeImpactScores()
+	// Keep the whole batch on one completed snapshot. Reanalyzing each score
+	// rereads and reconstructs the same robot disk cache for every issue.
+	stats := a.Analyze()
+	scores := a.ComputeImpactScoresFromStats(&stats, a.Now())
 	if len(scores) == 0 {
 		return nil
 	}
 
 	// Get basic recommendations
-	basicRecs := a.GenerateRecommendationsWithThresholds(thresholds)
+	basicRecs := a.GenerateRecommendationsFromStats(&stats, thresholds)
 
 	// Create a map for quick lookup
 	recMap := make(map[string]*PriorityRecommendation)
@@ -145,7 +148,7 @@ func (a *Analyzer) GenerateEnhancedRecommendationsWithThresholds(thresholds Reco
 		rec, hasRec := recMap[score.IssueID]
 
 		// Generate what-if for all scores (not just those with recommendations)
-		whatIf := a.computeWhatIfDelta(score.IssueID)
+		whatIf := a.computeWhatIfDeltaFromStats(score.IssueID, &stats)
 		topReasons := GenerateTopReasons(score)
 
 		// Determine if caps were applied
