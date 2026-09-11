@@ -774,7 +774,12 @@ func TestEnhancedPriorityBatchRegression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("complete enhanced output SHA256: %x", sha256.Sum256(encoded))
+	// Captured from the pre-reuse implementation at 52853c6a with this exact
+	// fixture and explicit metric policy; includes every serialized field.
+	const wantSHA = "0910d7fe9597707b58c50d594a33bdca75698ca5da0b29ce59a92243c0bcab46"
+	if gotSHA := fmt.Sprintf("%x", sha256.Sum256(encoded)); gotSHA != wantSHA {
+		t.Fatalf("complete enhanced output SHA256=%s want %s\n%s", gotSHA, wantSHA, encoded)
+	}
 	allocs := testing.AllocsPerRun(1, func() {
 		if repeated := analyzer.GenerateEnhancedRecommendations(); !reflect.DeepEqual(repeated, got) {
 			t.Fatal("identical batch changed complete recommendations")
