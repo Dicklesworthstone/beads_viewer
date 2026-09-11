@@ -4279,7 +4279,7 @@ experimental:
 
 When background mode or live reload is enabled, the footer may display these indicators:
 
-- `◌ metrics…` — Phase 2 metrics are still computing; the UI renders immediately with Phase 1 data.
+- `◌ metrics…` — Phase 2 metrics are still computing; the view uses Phase 1 data while awaiting the prepared results. [Total startup includes additional work](docs/performance.md#two-phase-startup-architecture).
 - `⚠ 45s ago` — snapshot age warning (data is getting stale).
 - `⚠ STALE: 3m ago` — snapshot is stale.
 - `✗ bg <phase> (3x)` — background worker hit repeated errors building snapshots (phase shown; retry count in parentheses).
