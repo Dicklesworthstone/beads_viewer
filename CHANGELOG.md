@@ -4,8 +4,8 @@ All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are
 
 Scope window: this update verifies `v0.24.0..v0.24.1` and the post-release
 commits through [`80450e34`](https://github.com/Dicklesworthstone/beads_viewer/commit/80450e345e6b2061fd1e17c6eee007bcb49d56c6).
-The September 10 canonical-source and Cass repairs and September 11 performance
-measurement are covered separately below.
+The September 10 canonical-source and Cass repairs, September 11 performance
+measurement, and subsequent enhanced-priority optimization are covered separately below.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
 and release receipts; [research notes](CHANGELOG_RESEARCH.md) record coverage.
@@ -28,6 +28,14 @@ the latest tag, including installer changes usable with already released binarie
 ---
 
 ## [Unreleased]
+
+### Priority recommendation performance
+
+- Enhanced priority recommendations, used by `--robot-priority`, now reuse one
+  completed analysis snapshot across the batch instead of rereading the analysis
+  cache for every issue. Scoring, explanation fields, ordering, and output caps
+  are preserved ([snapshot reuse](https://github.com/Dicklesworthstone/beads_viewer/commit/c3091424a5895e62e1aa8c59ca8ca41fa7f24ee0);
+  [full-output regression](https://github.com/Dicklesworthstone/beads_viewer/commit/10666a6a74980ba4c39fa0f67081cab510b0e0cf)).
 
 ### Performance verification and documentation
 

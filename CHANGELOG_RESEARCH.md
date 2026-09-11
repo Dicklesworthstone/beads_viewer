@@ -10,6 +10,58 @@ checked-in Beads history, retained release receipts, then existing release
 documentation. Public source links belong in the changelog; local execution
 evidence supplements them here.
 
+## September 11 enhanced-priority snapshot reuse
+
+Narrow follow-up: `c3091424` wires the existing statistics-aware scoring,
+recommendation, and what-if methods into the enhanced-priority batch;
+`10666a6a` pins the complete serialized output. The reviewed runtime diff is
+three substitutions plus one completed analysis snapshot. It retains all scored
+candidates, both what-if representations, ordering, and the final ten-item cap.
+
+The 540-issue wide-graph benchmark ran through strict RCH on Linux amd64 `hz3`:
+three one-operation samples before were 1.213–1.314 seconds and 648–651 MB
+allocated; afterward they were 8.679–10.316 milliseconds and 3.581–3.601 MB.
+These are focused synthetic-batch observations under shared-worker I/O pressure.
+The before CPU profile attributes 60.60% of sampled CPU to repeated analysis.
+The after profile has only 430 ms of samples and also includes regression tests;
+it is unsuitable for a precise whole-profile percentage comparison.
+
+The explicit all-metrics, run-to-completion regression fixes scoring time and
+checks output SHA-256 `0910d7fe9597707b58c50d594a33bdca75698ca5da0b29ce59a92243c0bcab46`.
+The observed old-base invocation failed at 3,379,150 allocations against the
+unchanged 250,000 ceiling; the optimized regression passed three executions.
+The failed old-base log lacks a successful clean-overlay receipt; its source
+binding is the recorded launcher (`52853c6a` plus the test-only overlay), not
+an independent worker-source attestation. The successful optimized receipt
+binds base `c3091424` and overlay fingerprint
+`cca270357f7823fe8b4062396ec939798b51fa34130ce0fd5b39c9a0b87aff9d`.
+Logs and profiles are retained under `/data/tmp/bv-enhanced-priority-*20260911*`.
+
+The focused measurements and initial package/CLI checks used unpinned worker
+defaults; their compiler versions were not captured directly. A later binary
+readback identified Go 1.26.0, prompting explicit Go 1.25.5 qualification with
+`GOTOOLCHAIN` forwarded through RCH's per-run environment allowlist. The pinned
+full build, full vet, and analysis/model package tests passed with the same
+source receipt above, including the frozen-output regression. The pinned CLI
+binary is Linux amd64 with CGO enabled and SHA-256
+`3c4655ae262794bb64c786cb961ee68472dd0bc50c5e3e74b55814cc68ded161`.
+Initial priority CLI contract, schema, metadata and CPU-profile tests also
+passed. RCH reported read-only downloaded-toolchain residue during vet cleanup;
+the command and local launcher both exited zero. No manual cleanup was attempted.
+
+An earlier 10,000-issue priority diagnostic hit its separate 300-second RCH
+limit and returned 137 with empty profile/output artifacts, retained under
+`.rch-go/priority-profile-20260911-2003`. It earns no completed-run evidence.
+The optimized Go 1.25.5 binary subsequently completed one cold-cache run on
+the same 10,000-issue deep-chain fixture in 102.32 seconds, within the unchanged
+300-second bound (remote and local exit zero). Its retained JSON contains ten
+recommendations, sampled betweenness and explicitly skipped cycles; its CPU
+profile parses successfully. Artifacts are in
+`.rch-go/priority-smoke-go1255-20260911`. This is a single completion check,
+not a paired benchmark or a responsiveness pass.
+The original P1 matrix below remains incomplete; this later runtime change
+requires its own full qualification. No release or native-platform claim is added.
+
 ## September 11 incomplete performance matrix
 
 This bounded follow-up records measurements of current source `4ffc37c6`,
