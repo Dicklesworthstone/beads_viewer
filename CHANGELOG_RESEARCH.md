@@ -1,7 +1,7 @@
 # Changelog research: v0.24.1 and its follow-ups
 
 Scope: the complete `v0.24.0..v0.24.1` and `v0.24.1..80450e34` commit
-windows, extended by the dated follow-up sections through `f2495035` and
+windows, extended by the dated follow-up sections through `b0ce5669` and
 the current dependency preparation. Earlier changelog entries are preserved,
 not re-audited by this update.
 This is a bounded application of `changelog-md-workmanship`, requested after
@@ -14,7 +14,10 @@ evidence supplements them here.
 
 ## September 12 release preparation
 
-Reviewed the follow-up history through `f2495035` against the Unreleased entry.
+Reviewed the follow-up history through `b0ce5669` against the v0.25.0 candidate entry.
+This includes the final Rust lock transitions, rebuilt embedded graph pair,
+and the two test-only timing repairs. The candidate has no publication date
+until the final gate and release upload succeed.
 The Windows installer paragraph describes its first pin historically;
 the current README uses `a43b8e85`, which contains the Go 1.26 minimum.
 Commit `3bc5c15c` captures command cancellation immediately after the child

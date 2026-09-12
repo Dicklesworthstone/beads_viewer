@@ -16,10 +16,24 @@ GitHub Actions must not run. Existing incomplete P1/native evidence remains open
 - [x] Inventory Go requirements and upstream stable versions.
 - [x] Research and update each eligible declared requirement, testing each.
 - [x] Inspect the two Rust/WASM manifests and embedded asset requirements.
-- [ ] Run final full tests and vulnerability audit.
-- [ ] Update changelog/version and pass the complete release gate.
-- [ ] Build and verify all five configured release targets.
-- [ ] Publish GitHub release, Homebrew tap and Scoop bucket; verify installers.
+- [x] Run Go vulnerability and RustSec/registry audits.
+- [x] Rebuild the embedded WASM pair and verify independent reproduction.
+- [x] Repair the two final race-suite timing failures; verify affected packages.
+- [ ] Complete UBS rerun and commit v0.25.0 candidate version/changelog.
+- [ ] Pass all ten stages on a clean complete Git clone through strict RCH.
+- [ ] Tag the exact gated source commit.
+- [ ] Package Linux amd64/arm64, macOS amd64/arm64 and Windows amd64.
+- [ ] Seal and verify all five archives against the gate receipt.
+- [ ] Generate the SBOM from the actual packaged Linux amd64 binary.
+- [ ] Upload 14 assets to a DSR draft with dispatch disabled.
+- [ ] Download and verify every draft asset before publication.
+- [ ] Publish GitHub release and check public asset identity.
+- [ ] Update Homebrew's four platform hashes; validate, push and read back.
+- [ ] Update Scoop's Windows hash; validate, push and read back.
+- [ ] Run native Linux/macOS installer and upgrade checks.
+- [ ] Run native Windows installer, upgrade and failure-preservation checks.
+- [ ] Verify Go proxy and Nix version identity.
+- [ ] Record venue/native evidence and close bv-8tym only after completion.
 
 ### github.com/charmbracelet/x/ansi v0.11.7 → v0.11.8
 
@@ -428,9 +442,9 @@ Modules used only by dependency tooling are not promoted into BV requirements.
   sanitized Git clone; transfer Git history and tracked Beads data.
 - [x] Align source installers, README, Go tooling and Nix lock with the final
   Go minimum; retain historical benchmark toolchain identities unchanged.
-- [ ] Resolve required UBS execution: installed runner and Go module have no
-  supported retention option and remove temporary files. Its Go helper also
-  compiles, so a complete scan needs RCH. Do not substitute a partial scanner.
+- [x] Run the complete installed UBS through strict RCH, including its Go
+  lifecycle helper. Review its findings and rerun after documenting the fixed
+  shell program's quoted-argument false positive; final result recorded below.
 - [ ] Preserve the complete original release gate, benchmark thresholds and
   provenance checks. Retrieve receipts and archives outside the source tree.
 - [x] Resolve local disk exhaustion and fleet admission; continue monitoring space.
@@ -476,11 +490,32 @@ as the repaired-package tests. Formatting and `git diff --check` also pass.
 The generated clean-overlay archive was moved intact out of the checkout to
 `/data/tmp/bv-release-clean-overlay-base-20260912.tar`.
 
-The release remains unpublished. The remaining permission issue is confined
-to the required UBS/installer tools' normal deletion of their own new scratch
-files: AGENTS.md forbids deletion of any file without written permission, and
-the installed UBS runner has no retention option. No UBS scan, final commit,
-eligible clean-source gate, version tag, or release publication is claimed.
+The release remains unpublished. After the user repeated the instruction to
+continue in response to the narrow scratch-cleanup question, release checks
+resumed with cleanup limited to tools' newly created temporary files. Repository
+files and retained evidence remain preserved.
+
+### UBS and v0.25.0 candidate preparation
+
+The complete installed UBS 5.4.2 with its verified Go 7.1.4 module scanned six
+task-related Go files through strict RCH, including the Go lifecycle helper.
+The first scan reported two critical findings at the same umask test command:
+the program is fixed, masks are literal test cases, and arguments are quoted
+positional parameters. An inline explanation documents this false positive.
+All seven mutex warnings have matching unlocks before assertions/blocking calls;
+one already uses deferred Unlock. Informational results are test-parallelism
+suggestions, syntax inventories, test error discards and local SQLite calls
+without contexts. No production defect was identified in this scan.
+Initial log: `/tmp/bv-release-ubs-20260912-1628.log`.
+Both final JSONL and text runs retain one critical taint false positive despite
+the documented inline suppression; their scanner exit is 1 (Make reports 2).
+The analyzer conflates the child branch's environment-derived `mask` with the
+parent loop's separate literal `mask`. The command also quotes its positional
+parameters rather than interpolating shell code. No clean UBS exit is claimed.
+Logs: `/tmp/bv-release-ubs-final-20260912-1630.log` and
+`/tmp/bv-release-ubs-text-20260912-1633.log`. This reviewed scanner limitation
+does not waive any release-gate stage or change application behavior.
+The fallback and Nix version are now v0.25.0; changelog publication stays pending.
 
 ### Recovery and verification follow-up
 

@@ -15,7 +15,7 @@ var version string
 
 // fallback is the hardcoded version kept in sync with the latest release tag.
 // Used only when both ldflags and debug.ReadBuildInfo fail to provide a version.
-const fallback = "v0.24.1"
+const fallback = "v0.25.0"
 
 // Version is the resolved application version, populated by init().
 var Version string

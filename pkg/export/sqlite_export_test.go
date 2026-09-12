@@ -246,7 +246,7 @@ func TestSQLiteExportRespectsUmask(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Change the mask only in a subprocess, never in the concurrent test runner.
-			command := exec.Command("sh", "-c", `umask "$1"; shift; exec "$@"`, "sh", mask, os.Args[0], "-test.run=^TestSQLiteExportRespectsUmask$")
+			command := exec.Command("sh", "-c", `umask "$1"; shift; exec "$@"`, "sh", mask, os.Args[0], "-test.run=^TestSQLiteExportRespectsUmask$") // ubs:ignore — fixed shell program; literal test masks and executable are passed as quoted positional arguments.
 			command.Env = append(os.Environ(), directoryEnv+"="+directory, maskEnv+"="+mask)
 			if output, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("umask %s export failed: %v\n%s", mask, err, output)
