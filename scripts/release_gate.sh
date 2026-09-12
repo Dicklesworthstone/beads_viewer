@@ -9,7 +9,7 @@
 #   1 gofmt            gofmt -l over repo Go files (vendor excluded) is empty
 #   2 build+vet        go build ./... && go vet ./...
 #   3 unit tests       go test ./... -race -count=1 (pkg/, cmd/, internal/)
-#   4 e2e tests        go test ./tests/e2e -race -count=1
+#   4 e2e tests        go test ./tests/e2e -race -count=1 -timeout=30m
 #   5 docs parity      go generate ./... leaves the tree unchanged
 #   6 action pins      scripts/check_action_pins.sh (40-hex SHAs only)
 #   7 vendor hashes    scripts/verify_vendor.sh --source (hashes and graph rebuild)
@@ -371,7 +371,9 @@ unit_tests() {
   CGO_ENABLED=1 go test -race -count=1 "${package_args[@]}"
 }
 
-e2e_tests() { CGO_ENABLED=1 go test ./tests/e2e -race -count=1; }
+# The full suite includes 600 CLI search judgments across three dataset sizes.
+# Budget the aggregate suite separately from per-test assertions and benchmarks.
+e2e_tests() { CGO_ENABLED=1 go test ./tests/e2e -race -count=1 -timeout=30m; }
 
 docs_parity() {
   # Compare the working tree with itself before and after go generate, so
