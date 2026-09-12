@@ -271,6 +271,19 @@ no application migration. All 234 release-profile tests passed remotely in
 66.793 seconds. Log `/tmp/bv-upgrade-quote-tests-20260912.log`, overlay
 `a456bce770a4041e25e35e8d7225163a1108cef3b81bf42b7ee929f210e069d4`.
 
+### Rust memchr 2.8.0 → 2.8.3
+
+Upstream fixes big-endian AArch64 and a lower-level unsafe API; no evidence
+establishes that BV reaches the latter defect. Both locks updated and all 234
+release-profile tests passed remotely in 84.714 seconds. Log
+`/tmp/bv-upgrade-memchr-tests-20260912.log`, overlay
+`e2393a27e573d75c4be52790ca49d3547bc47eeb1f28c745e6057604bfb01ac2`.
+
+The concurrent commit sweep landed work through `2acf8f04` during the updates.
+Those commits are retained, but are not release qualification. Subsequent RCH
+tests use that base plus explicit overlays, including the now-smaller vendor
+tree. The sweep was asked to hold further release commits/publication.
+
 ### Release execution remaining
 
 - [ ] Rust: update getrandom 0.4.3 first and verify removal of obsolete WASI
