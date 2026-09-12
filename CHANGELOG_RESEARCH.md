@@ -1,7 +1,9 @@
 # Changelog research: v0.24.1 and its follow-ups
 
 Scope: the complete `v0.24.0..v0.24.1` and `v0.24.1..80450e34` commit
-windows. Earlier changelog entries are preserved, not re-audited by this update.
+windows, extended by the dated follow-up sections through `f2495035` and
+the current dependency preparation. Earlier changelog entries are preserved,
+not re-audited by this update.
 This is a bounded application of `changelog-md-workmanship`, requested after
 publication of v0.24.1. Dates use UTC publication dates for GitHub Releases.
 
@@ -12,19 +14,23 @@ evidence supplements them here.
 
 ## September 12 release preparation
 
-Reviewed the follow-up history through `42a208ab` against the Unreleased entry.
-The Windows installer paragraph now describes its first pin historically;
-the current README uses `80450e34`, as stated in the preceding paragraph.
+Reviewed the follow-up history through `f2495035` against the Unreleased entry.
+The Windows installer paragraph describes its first pin historically;
+the current README uses `a43b8e85`, which contains the Go 1.26 minimum.
 Commit `3bc5c15c` captures command cancellation immediately after the child
 returns, before writing diagnostic artifacts. It also reports sample identity
 and elapsed time. This improves failed-matrix evidence; it neither attributes
 the original stall nor completes P1 acceptance.
 
-The ANSI 0.11.8 candidate is committed but vendor regeneration and final release
-qualification remain pending. A newly added SQLite preservation regression
+The Go and Rust dependency transitions passed their individually recorded
+affected-package tests. Vendor regeneration preserves all four local patches;
+all 546 replacement files match their `third_party` sources. Final release
+qualification remains pending. A newly added SQLite preservation regression
 fails against the old exporter and passes three times with private construction
 and rename publication. The selected existing watch and claim E2E cases also
-pass three times through strict RCH. These are working-tree results, not a
+pass three times through strict RCH; the final SQLite 1.58.0 transition also
+passes export/loader/UI race tests and the watched-export E2E cases. These are
+source-check results, not a
 published release or proof of native Windows rename behavior. Detailed command
 logs and outstanding release tasks are in `UPGRADE_LOG.md`.
 

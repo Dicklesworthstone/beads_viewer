@@ -14,7 +14,7 @@ Release preparation uses DSR/RCH and the complete repository release gate;
 GitHub Actions must not run. Existing incomplete P1/native evidence remains open.
 
 - [x] Inventory Go requirements and upstream stable versions.
-- [ ] Research and update each eligible declared requirement, testing each.
+- [x] Research and update each eligible declared requirement, testing each.
 - [x] Inspect the two Rust/WASM manifests and embedded asset requirements.
 - [ ] Run final full tests and vulnerability audit.
 - [ ] Update changelog/version and pass the complete release gate.
@@ -292,24 +292,134 @@ through RCH in 82.813 seconds. Log `/tmp/bv-upgrade-zmij-tests-20260912.log`,
 base `2acf8f04`, overlay
 `448d7a786dc5d0a6cdecd4516a0e6e6b780ae71bd8cfce88020653dbe92a2505`.
 
+### Rust bumpalo 3.20.2 → 3.20.3
+
+Upstream allocation rollback and panic/drop corrections require no BV API
+migration. Optional allocator-API fixes are not evidence of exposed BV UB.
+All 234 release-profile tests passed remotely in 89.098 seconds. Log
+`/tmp/bv-upgrade-bumpalo-tests-20260912.log`, base `2acf8f04`, overlay
+`94aa1b317879f63cfb74ab35bfb0254cc732db07355cc22586a48f26efa11f0e`.
+
+### Rust rustversion 1.0.22 → 1.0.23
+
+The compiler probe now sets RUSTVERSION=1. Both locks updated, and all 234
+release-profile tests passed remotely in 130.578 seconds. Log
+`/tmp/bv-upgrade-rustversion-tests-20260912.log`, base `2acf8f04`, overlay
+`204b368f7d629e8f40f84240ddfd3316693fa5b10830aeb97cdb4fc184191c6b`.
+
+### Rust futures core/task/util 0.3.32 → 0.3.34
+
+The coupled crates were updated together. Their broader iterator/waker/leak
+fixes are not evidence of reachable BV defects; js-sys uses FutureExt. All
+234 release-profile tests passed remotely in 99.890 seconds. Log
+`/tmp/bv-upgrade-futures-tests-20260912.log`, base `2acf8f04`, overlay
+`535bdd999a975c164f2cef78b8726b32806ec673a742aa376d16c1e2dbf1c583`.
+
+### Rust libc 0.2.186 → 0.2.189
+
+Platform bindings and Windows time-symbol linkage change upstream; Linux
+qualification does not establish native Windows behavior. All 234 release-profile
+tests passed remotely in 102.529 seconds. Log
+`/tmp/bv-upgrade-rust-libc-tests-20260912.log`, base `2acf8f04`, overlay
+`f8d720a6700a8db80c2cdff0bbae02ad498d33b81839780a9448b5a49101d4c3`.
+
+### Rust autocfg 1.5.0 → 1.5.1
+
+Upstream improves test-wrapper portability; no application migration. All 234
+release-profile tests passed remotely in 73.584 seconds. Log
+`/tmp/bv-upgrade-autocfg-tests-20260912.log`, base `2acf8f04`, overlay
+`2d482d5547f85908dd495897d0dd703f4799391310cf53a83a282e326b35c435`.
+
+### Rust cc 1.2.62 → 1.4.5 with required shlex/find-msvc-tools
+
+Cargo selected shlex 2.0.1 and find-msvc-tools 0.1.12 as cc requires. All 234
+release-profile tests passed remotely in 85.273 seconds. Log
+`/tmp/bv-upgrade-cc-tests-20260912.log`, base `2acf8f04`, overlay
+`19f805dcc5d4c2c41fc74f13f7be3b8ad6bce1ea8761ca9fe7f1e7767f3b9da2`.
+This helper chain belongs to minicov's conditional coverage support; normal
+graph/scorer tests do not qualify that optional coverage path.
+
+### Final Rust dependency audits
+
+Cargo-audit 0.22.2 checked 1,243 RustSec advisories with no vulnerabilities or
+warnings in either lock (51 graph and 20 scorer package entries). The retained
+database is commit `b50980aad8b8f14f77e25a97b32dd94bf008b0af`. Audit used
+`--no-fetch --no-yanked`; a separate official crates.io metadata check verified
+all 50 registry package checksums and that none is yanked. No advisories were
+ignored and no target/severity filters applied. Below-latest exceptions are
+parent-required minicov 0.3.8, r-efi 6.0.0, and windows-link 0.2.1.
+Evidence: `/tmp/bv-rust-audit-{graph,scorer}-20260912.json` and
+`/tmp/bv-rust-registry-audit-20260912.json` (includes exact lock hashes).
+
+### Graph artifact refresh
+
+The strict RCH candidate build passed in 77.800 seconds, using the pinned
+nightly compiler, wasm-bindgen 0.2.128 and Binaryen 132. Both actual outputs
+were downloaded and hashed before replacing the shipped pair; the old pair
+and manifest remain at `/data/tmp/bv-release-graph-pair-before-20260912`.
+Receipt: `/tmp/bv-release-graph-candidate-receipt-20260912.json`.
+Source fingerprint: `1fdf29973770716aa220520e3e4ecc275e324227ae2a482f91644ccbcbadccf7`.
+Glue: `93de4c67d0c240662dec03efe48107aefef296e0379be55b3a0f494f94262aa5`.
+WASM: `833799c32a00ba2ae16aa6caced25347c709b4b8be2ba9661074d8bd7468076e`.
+All 15 manifest entries pass the local hash check. The full two-home harness
+passed through strict RCH in 268.950 seconds: identical assets from two physical
+compiler homes, all five graph fixtures with 12 metrics and independent Go
+goldens/viewer HITS checks, JS fallback, and all negative controls.
+Log: `/tmp/bv-release-graph-reproducibility-20260912.log`; base `2acf8f04`,
+overlay `5c7d1912e37adaed526dd715afb34e15fe8790b1aa83337fd498a568060f1f72`.
+Verified receipts: `/tmp/bv-release-graph-verified-{a,b}-20260912.json`.
+This is Node WebAssembly execution, not a browser qualification.
+
+The first two attempts stopped before compilation because RCH's isolated
+Cargo home lacked a registry, then the explicitly selected root cache lacked
+locked packages. A dedicated cache was populated with `cargo fetch --locked`;
+the successful build remained offline and locked. Original failure logs are
+retained as `/tmp/bv-release-wasm-candidate{,-cache}-20260912.log`.
+
+### Final Go vulnerability audit
+
+`govulncheck` 1.8.0 checked `./...` with Go 1.26.8 and reported
+`No vulnerabilities found.` The strict RCH command exited zero in 52.889
+seconds. Log: `/tmp/bv-release-go-audit-20260912.log`; base `2acf8f04`,
+overlay `cc9d31ace64ed5ee55fcc55c5d7cc0a176a7e237fb9a830a949a7d27388727d4`.
+The audit tool runs outside the application's module requirements.
+
+Reconciliation with the original registry inventory leaves only intentional
+exceptions among declared requirements: Chroma remains the local patched
+2.24.1 module rather than upstream 2.27.0; the pinned golden/slice, terminfo
+and x/exp revisions remain preserved under the skill's version rule; libc
+stays at SQLite's required 1.75.6 rather than independently taking 1.75.7.
+Modules used only by dependency tooling are not promoted into BV requirements.
+
 ### Release execution remaining
 
-- [ ] Rust: update getrandom 0.4.3 first and verify removal of obsolete WASI
+- [x] Rust: update getrandom 0.4.3 first and verify removal of obsolete WASI
   chains; then serde_json 1.0.151, serde 1.0.229 and bindgen 0.2.128 cohorts.
-- [ ] Rust: reinspect the solver result, then update remaining eligible
+- [x] Rust: reinspect the solver result, then update remaining eligible
   proc-macro2 1.0.107, quote 1.0.47, async-trait 0.1.92, memchr 2.8.3,
   zmij 1.0.23, bumpalo 3.20.3, rustversion 1.0.23, futures 0.3.34,
   libc 0.2.189, autocfg 1.5.1 and cc 1.4.5, testing each transition.
   Serde/bindgen require Syn 3.0.5; cc requires shlex 2.0.1 and
   find-msvc-tools 0.1.12. Preserve exact minicov 0.3.8 and parent-constrained
-  r-efi 6.0.0/windows-link 0.2.1. These are researched targets, not updates.
-- [ ] Generate and review both graph assets, copy actual receipt values into
+  r-efi 6.0.0/windows-link 0.2.1. Each transition passed all 234 release-profile tests.
+- [x] Both Rust crates pass formatting and Clippy with warnings denied.
+  Remote logs: `/tmp/bv-release-{graph,scorer}-clippy-20260912.log`.
+- [x] Audit both Rust locks against RustSec and verify official registry checksums/yank status.
+- [x] Go vulnerability audit reports no vulnerabilities; see the retained command above.
+- [x] Benchmark comparator self-tests pass, including failure controls. These
+  synthetic controls are not performance measurements. Log:
+  `/tmp/bv-release-benchmark-comparator-20260912.log`; retained fixtures:
+  `/data/tmp/bv-bench-test.afArWZ`.
+- [x] Generate and review both graph assets, copy actual receipt values into
   the manifest, then run fresh source verification and the existing two-home
-  reproducibility/graph fixture harness. New Make targets dispatch the existing
-  scripts through RCH; they are not yet execution evidence.
+  reproducibility/graph fixture harness. The existing scripts passed through
+  the new Make targets and strict RCH as recorded above.
 - [x] Verify the stale assertion correction and diagnose watched-export failure.
 - [x] Complete affected-package verification for ANSI and the exporter fix.
-- [ ] Run the final complete suite with the documented aggregate E2E budget.
+- [x] Run the complete vendored race suite with the documented E2E budget;
+  retain its two failures and verify both repaired packages fully afterward.
+- [ ] Obtain a passing complete clean-source release-gate receipt after the
+  required scan and final version/changelog commit.
 - [x] Refresh vendor through a fresh staging directory, preserving old files.
   Old tree retained at `/data/tmp/bv-vendor-before-20260912`; native candidate
   at `/data/tmp/bv-vendor-candidate-20260912` copied into vendor. The result is
@@ -326,6 +436,51 @@ base `2acf8f04`, overlay
 - [x] Resolve local disk exhaustion and fleet admission; continue monitoring space.
 
 No version/tag bump or new release publication has occurred.
+
+### Final vendored race-suite repair
+
+The first final run found two test failures. All other packages passed, including
+the complete E2E suite in 750.627 seconds. Overall remote exit was 1 after
+947.906 seconds, so this is a failed full-suite run.
+Log: `/tmp/bv-release-final-go-race-20260912.log`.
+
+- `TestCachedCorrelator_SingleflightLogsSharedErrors` observed two underlying
+  calls instead of one. Its `started` counter precedes a real Git lookup, so
+  sleeping 50 ms does not establish that both callers joined the same flight.
+  The test now uses `testing/synctest` to wait for both callers to block before
+  releasing the shared error. It retains the real Git lookup, both calls and
+  all error/count/shared-log assertions. This is logical-clock concurrency
+  verification, not a wall-clock latency claim.
+- `TestBackgroundWorker_HugeDatasetOpenOnly` exhausted its five-second polling
+  wait. It now executes the real generation-fenced refresh synchronously before
+  asserting the 20k-row tier, filtered counts, hidden closed/tombstone authority,
+  absent prerequisites and metadata-only rebuilds. It no longer asserts a
+  five-second async completion bound. Existing refresh/coalescing/Phase2 tests
+  and the separate performance acceptance criteria remain unchanged.
+
+Both test-only repairs pass three race-enabled executions through strict RCH
+(correlation 1.841 seconds, huge-tier UI 23.109 seconds; 120.488 seconds total
+including compilation). Log: `/tmp/bv-release-race-repairs-focused-20260912.log`,
+base `2acf8f04`, overlay
+`f61cf2711f4c2b533385e1bff11af753be1320dffe8e8060f9537d0f0e0a731f`.
+Both full affected packages subsequently passed with the race detector:
+correlation 17.050 seconds and UI 154.350 seconds (259.487 seconds including
+compilation). Log: `/tmp/bv-release-race-repaired-packages-20260912.log`,
+same base and overlay fingerprint. The failed full run remains failed;
+the final complete clean-source release gate is still required.
+
+Final `go build ./...` and `go vet ./...` both passed through strict RCH with
+Go 1.26.8, `-mod=vendor` and `CGO_ENABLED=0`. Log:
+`/tmp/bv-release-final-build-vet-20260912.log`, same base and overlay fingerprint
+as the repaired-package tests. Formatting and `git diff --check` also pass.
+The generated clean-overlay archive was moved intact out of the checkout to
+`/data/tmp/bv-release-clean-overlay-base-20260912.tar`.
+
+The release remains unpublished. The remaining permission issue is confined
+to the required UBS/installer tools' normal deletion of their own new scratch
+files: AGENTS.md forbids deletion of any file without written permission, and
+the installed UBS runner has no retention option. No UBS scan, final commit,
+eligible clean-source gate, version tag, or release publication is claimed.
 
 ### Recovery and verification follow-up
 

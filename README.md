@@ -72,15 +72,15 @@ Prefer Homebrew, Scoop, or a checksum-verified release archive above. If you do 
 
 ```bash
 # Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/03f92509bceb9da31540167c223c10f16c279767/install.sh
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/03f92509bceb9da31540167c223c10f16c279767/install.sh" | bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.sh" | bash
 ```
 
 > **Warning:** `curl ... | bash` runs whatever the URL serves at that moment. The pinned form above cannot change under you; the `main` form can. `install.sh` downloads the release archive for your platform, verifies it against the release `checksums.txt`, and refuses to install on a mismatch.
 
 **Windows (PowerShell):**
 ```powershell
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/80450e345e6b2061fd1e17c6eee007bcb49d56c6/install.ps1
-irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/80450e345e6b2061fd1e17c6eee007bcb49d56c6/install.ps1" | iex
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.ps1
+irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.ps1" | iex
 ```
 > **Note:** The pinned installer above downloads the Windows release zip, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses anything that does not verify; no Go toolchain is needed. Pass `-Version v0.24.1` to pin a release or `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`). Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
 
@@ -4000,7 +4000,7 @@ Prefer Homebrew, Scoop, or a checksum-verified release archive above. If you do 
 
 ```bash
 # Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/03f92509bceb9da31540167c223c10f16c279767/install.sh
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/03f92509bceb9da31540167c223c10f16c279767/install.sh" | bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.sh" | bash
 ```
 
 > **Warning:** `curl ... | bash` runs whatever the URL serves at that moment. The pinned form above cannot change under you; the `main` form can. `install.sh` downloads the release archive for your platform, verifies it against the release `checksums.txt`, and refuses to install on a mismatch.
@@ -4009,8 +4009,8 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/03f
 For Windows users using PowerShell:
 
 ```powershell
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/80450e345e6b2061fd1e17c6eee007bcb49d56c6/install.ps1
-irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/80450e345e6b2061fd1e17c6eee007bcb49d56c6/install.ps1" | iex
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.ps1
+irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.ps1" | iex
 ```
 
 **Requirements:**

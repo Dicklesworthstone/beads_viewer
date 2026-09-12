@@ -3,9 +3,9 @@
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
 Scope window: this update verifies `v0.24.0..v0.24.1` and the post-release
-commits through [`80450e34`](https://github.com/Dicklesworthstone/beads_viewer/commit/80450e345e6b2061fd1e17c6eee007bcb49d56c6).
-The September 10 canonical-source and Cass repairs, September 11 performance
-measurement, and subsequent enhanced-priority optimization are covered separately below.
+commits through [`f2495035`](https://github.com/Dicklesworthstone/beads_viewer/commit/f2495035ffc1f38daaa53b38f49df90c308437fc), including the September 10 canonical-source and Cass
+repairs, September 11 performance work, and September 12 dependency campaign.
+Current release preparation is identified as Unreleased until publication.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
 and release receipts; [research notes](CHANGELOG_RESEARCH.md) record coverage.
@@ -16,7 +16,7 @@ the latest tag, including installer changes usable with already released binarie
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
-| [Unreleased] | — | Commits after v0.24.1 | Workflow dependency support, dashboard readiness/rankings/simulations, directed Flow inspection, and installer/documentation repairs. |
+| [Unreleased] | — | Commits after v0.24.1 | Workflow readiness, source integrity and live dashboards, responsive Cass search, priority performance, and Go 1.26 dependency refresh. |
 | [`v0.24.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.1) | 2026-09-08 | GitHub Release | Reuse loaded source hashes and avoid waiting for a busy analysis-cache writer. |
 | [`v0.24.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.0) | 2026-09-07 | GitHub Release | Latency campaign across analysis, loader and TUI, graph-navigation and causality repairs, release-gate isolation, and the x/text GO-2026-5970 dependency fix. |
 | [`v0.23.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.23.0) | 2026-09-04 | GitHub Release | Reality Check hardening sweep, 10-stage release gate, proactive drift alerts, typed env registry, docgen, and full tracker completion. |
@@ -174,6 +174,12 @@ the latest tag, including installer changes usable with already released binarie
 - Terminal rendering, Unicode normalization, HTML parsing and graph-image
   dependencies are updated. The four local dependency patches remain in place;
   [upgrade notes](UPGRADE_LOG.md) record the individual transitions and tests.
+- The SQLite module moves from 1.52.0 to 1.58.0, updating the embedded engine
+  from SQLite 3.53.2 to 3.53.4 with the module's required libc version.
+- The bundled graph WASM and JavaScript glue are rebuilt with wasm-bindgen
+  0.2.128 and refreshed Rust dependencies. Independent builds from two compiler
+  locations produce identical assets; the graph fixtures, viewer HITS adapter
+  and corruption controls pass in Node WebAssembly execution.
 
 ### Vendored dependency patches
 
@@ -258,8 +264,8 @@ the latest tag, including installer changes usable with already released binarie
 
 ### Verification and remaining limits
 
-- With the repaired installer, the complete default native Windows suite
-  passes against public release archives: installation, readiness,
+- With installer `3ca2176f`, the complete default native Windows suite
+  passed against the public v0.24.0 and v0.24.1 archives: installation, readiness,
   update/no-update, and preservation of the installed executable and user PATH
   on failure. Readback covers 28 command logs, eight capability results, and
   five specific rejection cases; it does not count a transport timeout as a
