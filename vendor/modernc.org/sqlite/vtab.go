@@ -29,12 +29,20 @@ var (
 		mu  sync.RWMutex
 		m   map[uintptr]*goModule
 		ids idGen
-		// name2id keeps stable IDs per module name to avoid unbounded growth
-		// across connections.
-		name2id map[string]uintptr
+		// name2id keeps stable IDs per registering driver and module name, to
+		// avoid unbounded growth across connections. The driver is part of the
+		// key because two Drivers may each register a different implementation
+		// under the same name; keying by name alone gives both the same pAux,
+		// so whichever registration reaches a connection last silently
+		// replaces the other for every connection in the process.
+		//
+		// The keys keep a *Driver, and through it its modules and their
+		// implementations, reachable for the life of the process once a
+		// connection has been opened on it. Entries are never reclaimed.
+		name2id map[moduleKey]uintptr
 	}{
 		m:       make(map[uintptr]*goModule),
-		name2id: make(map[string]uintptr),
+		name2id: make(map[moduleKey]uintptr),
 	}
 
 	// nativeModules holds sqlite3_module instances for registered modules,
@@ -64,6 +72,18 @@ var (
 		m: make(map[uintptr]*goCursor),
 	}
 )
+
+// vtab.RegisterModule reaches *Driver through a runtime type assertion on
+// this interface. Asserting it here turns a signature change into a build
+// failure instead of a silent fall-through to the package-level driver.
+var _ vtab.ModuleRegisterer = (*Driver)(nil)
+
+// moduleKey identifies a module registration: the Driver it was registered on
+// and the name it was registered under.
+type moduleKey struct {
+	d    *Driver
+	name string
+}
 
 // goModule wraps a vtab.Module implementation with its name.
 //
@@ -95,8 +115,42 @@ type cIndexConstraint = sqlite3.Tsqlite3_index_constraint
 type cIndexOrderBy = sqlite3.Tsqlite3_index_orderby
 type cConstraintUsage = sqlite3.Tsqlite3_index_constraint_usage
 
-// registerModule is installed as the hook for vtab.RegisterModule.
+// registerModule is installed as the hook for vtab.RegisterModule. It targets
+// the package-level driver, which is what a nil *sql.DB resolves to.
 func registerModule(name string, m vtab.Module) error {
+	return defaultDriver().RegisterModule(name, m)
+}
+
+// RegisterModule registers a virtual table module on d alone, so it reaches
+// only the connections d opens. It is the per-driver counterpart of
+// [modernc.org/sqlite/vtab.RegisterModule], which reaches it by way of the
+// *sql.DB passed as that function's first argument.
+//
+// Connections d opens also receive every module registered through the
+// package-level path, and where both paths registered the same name the
+// package-level implementation wins.
+//
+// That collision is worth spelling out, because this method reports no error
+// for it. Registering a name the package-level driver already holds - or
+// acquires later - returns nil, and every connection d opens then resolves
+// that name to the package-level implementation rather than to m. Pick names
+// that cannot collide, or register through the package-level path instead.
+//
+// Registration applies to new connections only; see
+// [modernc.org/sqlite/vtab.RegisterModule] for the full contract.
+func (d *Driver) RegisterModule(name string, m vtab.Module) (err error) {
+	if dmesgs {
+		defer func() {
+			dmesg("d %p, name %q, m %T: err %v", d, name, m, err)
+		}()
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.modules == nil {
+		d.modules = map[string]vtab.Module{}
+	}
 	if _, exists := d.modules[name]; exists {
 		return fmt.Errorf("sqlite: module %q already registered", name)
 	}
@@ -104,24 +158,53 @@ func registerModule(name string, m vtab.Module) error {
 	return nil
 }
 
-// registerModules installs all globally registered vtab modules on this
-// connection by calling sqlite3_create_module_v2 for each one.
-func (c *conn) registerModules() error {
+// registerModules installs the vtab modules visible to d on this connection by
+// calling sqlite3_create_module_v2 for each one.
+//
+// The set is the union of the modules registered on the package-level driver
+// and those registered on d itself. The package-level set is included
+// unconditionally because that is what every connection has received since
+// module support was added, whichever Driver opened it; d's own set is what
+// [Driver.RegisterModule] adds on top.
+//
+// A name held by both resolves to the package-level implementation. Before
+// per-Driver registration existed the two sets could still both be populated,
+// through a vtab.RegisterModule call whose *sql.DB argument was discarded, and
+// there the winner was whichever registration ran first, the second being
+// refused as already registered. No order-independent rule reproduces that, so
+// this one is a choice rather than a continuation: it keeps the process-wide
+// implementation authoritative, which is the safer half to preserve when the
+// two disagree.
+func (c *conn) registerModules(d *Driver) error {
+	global := defaultDriver()
+	for name, mod := range global.modules {
+		if err := c.registerSingleModule(global, name, mod); err != nil {
+			return err
+		}
+	}
+	if d == global {
+		return nil
+	}
 	for name, mod := range d.modules {
-		if err := c.registerSingleModule(name, mod); err != nil {
+		if _, done := global.modules[name]; done {
+			continue
+		}
+		if err := c.registerSingleModule(d, name, mod); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *conn) registerSingleModule(name string, m vtab.Module) error {
-	// Allocate or reuse a stable ID for this module name and remember the Go implementation.
+func (c *conn) registerSingleModule(owner *Driver, name string, m vtab.Module) error {
+	// Allocate or reuse a stable ID for this registration and remember the Go
+	// implementation.
+	key := moduleKey{owner, name}
 	vtabModules.mu.Lock()
-	modID, ok := vtabModules.name2id[name]
+	modID, ok := vtabModules.name2id[key]
 	if !ok {
 		modID = vtabModules.ids.next()
-		vtabModules.name2id[name] = modID
+		vtabModules.name2id[key] = modID
 	}
 	gm := &goModule{name: name, impl: m}
 	if v, ok := m.(vtab.VolatileArgsOpter); ok {
@@ -142,7 +225,7 @@ func (c *conn) registerSingleModule(name string, m vtab.Module) error {
 		if modPtr == 0 {
 			if !ok {
 				vtabModules.mu.Lock()
-				delete(vtabModules.name2id, name)
+				delete(vtabModules.name2id, key)
 				delete(vtabModules.m, modID)
 				vtabModules.mu.Unlock()
 			}

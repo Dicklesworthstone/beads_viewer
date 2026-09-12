@@ -200,6 +200,25 @@ func (r *rows) Next(dest []driver.Value) (err error) {
 					}
 					dest[i] = val
 				default:
+					// A TEXT column with no declared type. SQLite reports an
+					// empty decltype not only for aggregates and expressions
+					// over a date column (MAX/MIN/COALESCE, upper(x), x||''),
+					// but also for subqueries and for typeless real columns
+					// (CREATE TABLE t(x)). Any of these would be delivered as
+					// a raw string that Scan cannot store into *time.Time
+					// (#248). Under _texttotime, best-effort parse the value:
+					// on success deliver time.Time, otherwise fall back to the
+					// original string, so no Scan that worked before can newly
+					// fail.
+					if r.c.textToTime && r.decltypes[i] == "" {
+						if val, ok, idx := r.c.parseTime(v, int(r.parseFmtIdx[i])); ok {
+							if r.parseFmtIdx[i] < 0 && idx >= 0 {
+								r.parseFmtIdx[i] = int8(idx)
+							}
+							dest[i] = val
+							continue
+						}
+					}
 					dest[i] = v
 				}
 			case sqlite3.SQLITE_BLOB:

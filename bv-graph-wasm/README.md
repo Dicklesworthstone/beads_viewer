@@ -5,7 +5,7 @@ High-performance graph algorithms for the bv static viewer, compiled to WebAssem
 ## Prerequisites
 
 Release verification requires the pinned Rust toolchain and WASM target,
-wasm-bindgen 0.2.121, Binaryen 132, Python 3 and cached locked crates. See
+wasm-bindgen 0.2.128, Binaryen 132, Python 3 and cached locked crates. See
 [PROVENANCE.md](../docs/PROVENANCE.md) for exact tool hashes and installation
 requirements. `wasm-pack` is used only by the separate development workflow.
 
@@ -119,7 +119,7 @@ The build pipeline applies multiple optimizations:
 
 2. **Pinned release tools**:
    - `nightly-2026-08-31` Rust with `wasm32-unknown-unknown`
-   - wasm-bindgen 0.2.121 and Binaryen 132, with a required `wasm-opt -Os` pass
+   - wasm-bindgen 0.2.128 and Binaryen 132, with a required `wasm-opt -Os` pass
    - Locked, offline compilation in a fresh external directory
 
 `make build-release` rebuilds and checks both shipped files against the

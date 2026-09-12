@@ -11,13 +11,13 @@ The hand-written Go on top of that transpiled core implements the `database/sql/
 ## Repository layout (the parts that aren't self-evident)
 
 - `sqlite.go`, `conn.go`, `driver.go`, `stmt.go`, `rows.go`, `tx.go`, `backup.go`, `error.go`, `result.go`, `convert.go` — hand-written `database/sql/driver` implementation calling into `lib/`.
-- `vtab.go`, `pre_update_hook.go`, `fcntl.go`, `mutex.go` — Go-facing extensions wired to SQLite hooks/trampolines.
-- `lib/` — transpiled SQLite 3.53.1. One `sqlite_<goos>_<goarch>.go` per supported triple; `defs.go`, `hooks.go`, `hooks_linux_arm64.go`, `mutex.go`, plus `libsqlite3_freebsd.go`/`libsqlite3_windows.go` hold hand-written patches that augment the generated code. Import as `sqlite3 "modernc.org/sqlite/lib"`.
-- `vec/` — transpiled `sqlite-vec` v0.1.9, auto-registers via `sqlite3_auto_extension` in `patches.go` on package init. Activate by blank-importing: `_ "modernc.org/sqlite/vec"`. Not all platforms have a `vec_*.go` (e.g. no `linux/s390x` in `vec_test.go`'s `//go:build`).
+- `vtab.go`, `pre_update_hook.go`, `fcntl.go`, `mutex.go`, `ofd.go` — Go-facing extensions wired to SQLite hooks/trampolines (`ofd.go`: the process-wide opt-in switch to Linux OFD locks, backed by `modernc_ofd_locking()` in the transpiled library; the C side lives in `../libsqlite3/internal/sqlite_issue255.patch{,2}`).
+- `lib/` — transpiled SQLite 3.53.4. One `sqlite_<goos>_<goarch>.go` per supported triple plus build-tagged `sqlite_g_*.go` files holding declarations `modernc.org/undup` deduplicated across triples (so to check what code a target compiles, resolve its full GoFiles via `go list`, not by filename); `defs.go`, `hooks.go`, `hooks_linux_arm64.go`, `mutex.go`, plus `libsqlite3_freebsd.go`/`libsqlite3_windows.go` hold hand-written patches that augment the generated code. Import as `sqlite3 "modernc.org/sqlite/lib"`.
+- `vec/` — transpiled `sqlite-vec` v0.1.9, auto-registers via `sqlite3_auto_extension` in `patches.go` on package init. Activate by blank-importing: `_ "modernc.org/sqlite/vec"`. Covers the same 19 targets `lib/` does; `vec_test.go`'s `//go:build` constrains by GOOS only.
 - `vfs/` — exposes a Go `fs.FS` as a read-only SQLite VFS. `vfs.New(fsys)` returns a registered VFS name; open with `?vfs=<name>`. C side is transpiled per platform from `vfs/c/vfs.c` via the `vfs/Makefile`.
-- `vtab/` — Go-facing virtual-table API (no dependency on the transpiled C). `vtab.RegisterModule(db, name, module)` registers modules on **new connections only**; the bridge to C lives in the top-level `vtab.go`. See `vtab/doc.go` for the contract (Updater/Renamer/Transactional optional interfaces, re-entrancy rules, ArgIndex/Omit semantics).
+- `vtab/` — Go-facing virtual-table API (no dependency on the transpiled C). `vtab.RegisterModule(db, name, module)` registers modules on **new connections only**; a nil `db` targets the driver registered as `sqlite`, a non-nil `db` the driver backing it (via `vtab.ModuleRegisterer`). The bridge to C lives in the top-level `vtab.go`. See `vtab/doc.go` for the contract (Updater/Renamer/Transactional optional interfaces, re-entrancy rules, ArgIndex/Omit semantics).
 - `vendor_libs/main.go` (build tag `none`) — regeneration tool. Reads transpiled `ccgo_<goos>_<goarch>.go` from sibling repos `../libsqlite3` and `../libsqlite_vec`, rewrites package names and imports, and writes `lib/sqlite_*.go` / `vec/vec_*.go`. Invoked by `make vendor`.
-- `examples/` — runnable samples: `example1`, `vtab_basic`, `vtab_csv`, `vtab_match`, `vtab_regexp`.
+- `examples/` — runnable samples: `example1`, `connector`, `vtab_basic`, `vtab_csv`, `vtab_match`, `vtab_regexp`.
 - `addport.go`, `issue198/`, `issue120.diff` — porting/regression scaffolding kept around for reference; not built.
 
 ## Commands
@@ -37,7 +37,8 @@ Single test: `go test -v -run TestScalar` (pattern is a regexp; tests live in `a
 Build/debug tags:
 - `-tags=sqlite.dmesg` — enables this package's `dmesg(...)` (writes to `/tmp/libc.log`); see `dmesg.go` / `nodmesg.go`.
 - `-tags=libc.dmesg` — enables debug logs from `modernc.org/libc` (must be combined with patching `libc` itself — see the worked example in `doc.go`).
-- `GO_GENERATE=-DSQLITE_DEBUG,-DSQLITE_MEM_DEBUG` for `go generate` to produce a debug-instrumented transpilation (requires `modernc.org/ccgo/v4` installed locally).
+
+There is no `go generate` in this repo — `generator.go` lives in `../libsqlite3`, which owns the transpilation and its SQLite compile-time options. To produce a debug-instrumented transpilation, change the options there, `make generate` in that repo, then `make vendor` here.
 
 ## Fragile `modernc.org/libc` coupling
 
@@ -53,6 +54,6 @@ When debugging into `libc`, use `make work` (or a manual `go work init && go wor
 
 ## Driver registration model
 
-`init()` in `sqlite.go` calls `sql.Register("sqlite", newDriver())` with a single package-level `*Driver` (`var d` in `driver.go`). Global UDFs (`RegisterFunction`, `RegisterScalarFunction`, `RegisterDeterministicScalarFunction`), collations (`RegisterCollationUtf8`), connection hooks (`Driver.RegisterConnectionHook`), and vtab modules (`vtab.RegisterModule`) all attach to that singleton and are applied to every connection opened **afterwards**. Registrations made after a connection is open do not affect that connection — open a new one. This applies in particular to vtab modules; see `driver.go:120` and `vtab/doc.go`.
+`init()` in `sqlite.go` calls `sql.Register("sqlite", defaultDriver())` with a single package-level `*Driver` (`var d` in `driver.go`). The package-level registration functions (`RegisterFunction`, `RegisterScalarFunction`, `RegisterDeterministicScalarFunction`, `RegisterCollationUtf8`, `RegisterConnectionHook`) attach to that driver alone; its vtab modules — `vtab.RegisterModule` with a nil `db` — are the one category held process-globally and reach every driver's connections. A caller-constructed `Driver` carries its own registrations through the mirroring `*Driver` methods (`RegisterFunction`, `RegisterScalarFunction`, `RegisterDeterministicScalarFunction`, `RegisterCollationUtf8`, `RegisterConnectionHook`, `RegisterModule`, plus `Must*` variants), and `vtab.RegisterModule` with a non-nil `db` lands on the driver backing that `db`. Same-name module on both: the package-level implementation wins on that driver's connections. All registration applies to connections opened **afterwards**; registrations made after a connection is open do not affect it — open a new one. See the `Driver` type doc in `driver.go` and `vtab/doc.go`.
 
 DSN query params are parsed in `conn.go`/`driver.go`: `_pragma`, `_time_format`, `_time_integer_format`, `_inttotime`, `_texttotime`, `_timezone`, `_txlock`, plus `vfs=<name>` to select a VFS registered via `vfs.New`.

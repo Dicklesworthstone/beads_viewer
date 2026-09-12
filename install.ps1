@@ -47,7 +47,7 @@ $REPO_OWNER = "Dicklesworthstone"
 $REPO_NAME = "beads_viewer"
 $MODULE = "github.com/$REPO_OWNER/$REPO_NAME"
 $BIN_NAME = "bv"
-$MIN_GO_VERSION = "1.25"
+$MIN_GO_VERSION = "1.26"
 
 $apiBase = if ($env:BV_INSTALL_API_URL) { $env:BV_INSTALL_API_URL.TrimEnd('/') } else { "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME" }
 $downloadBase = if ($env:BV_INSTALL_DOWNLOAD_URL) { $env:BV_INSTALL_DOWNLOAD_URL.TrimEnd('/') } else { "https://github.com/$REPO_OWNER/$REPO_NAME/releases/download" }

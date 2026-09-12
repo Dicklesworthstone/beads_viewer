@@ -58,13 +58,13 @@ resolved_sysroot="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[
 [ "$($rustup run "$toolchain" cargo --version)" = "$want_cargo" ] || fail 'cargo version differs'
 installed_targets="$($rustup target list --installed --toolchain "$toolchain")"
 [[ "$installed_targets" == *"$target"* ]] || incomplete "missing target $target for $toolchain"
-[ "$("$bindgen" --version)" = 'wasm-bindgen 0.2.121' ] || fail 'wasm-bindgen version differs: expected 0.2.121'
+[ "$("$bindgen" --version)" = 'wasm-bindgen 0.2.128' ] || fail 'wasm-bindgen version differs: expected 0.2.128'
 [ "$("$wasmopt" --version)" = 'wasm-opt version 132 (version_132)' ] || fail 'optimizer version differs: expected Binaryen 132'
-[ "$(sha256sum "$bindgen" | cut -d' ' -f1)" = 778ec413ee7c3ea501d49b376fef3c390bf1f6e64ece888ed30472f09c3a1923 ] || fail 'wasm-bindgen executable hash differs'
+[ "$(sha256sum "$bindgen" | cut -d' ' -f1)" = dc9e4f1e03996c26fb8bfedfded73d81120a37251c3f19eb87bb460f1f89a5be ] || fail 'wasm-bindgen executable hash differs'
 [ "$(sha256sum "$wasmopt" | cut -d' ' -f1)" = 1014958e6f20d412f1542320b43970214b0fb1ed780595e8f7c0d8761ed53725 ] || fail 'optimizer executable hash differs'
 
 want_bindgen="$(awk '/^name = "wasm-bindgen"$/{getline; sub(/version = "/, "", $0); sub(/"$/, "", $0); print; exit}' "$crate/Cargo.lock")"
-[ "$want_bindgen" = 0.2.121 ] || fail 'Cargo.lock wasm-bindgen differs from pinned CLI'
+[ "$want_bindgen" = 0.2.128 ] || fail 'Cargo.lock wasm-bindgen differs from pinned CLI'
 if [ -z "$out" ]; then
   out="$(mktemp -d /tmp/bv-graph-wasm.XXXXXX)"
 else
@@ -163,10 +163,10 @@ receipt.update(schema=1, status='built', pipeline={
     'rustc': (out/'rustc.txt').read_text().strip(), 'cargo': cargo,
     'target': 'wasm32-unknown-unknown', 'features': 'default',
     'cargo_flags': '--locked --offline --release --target wasm32-unknown-unknown -j 2',
-    'wasm_bindgen': '0.2.121', 'bindgen_flags': '--target web --out-name bv_graph',
+    'wasm_bindgen': '0.2.128', 'bindgen_flags': '--target web --out-name bv_graph',
     'wasm_opt': '132', 'optimizer_flags': '-Os', 'path_remapping': True,
     'sysroot_remapping': '/rust-toolchain', 'rustflags_transport': 'CARGO_ENCODED_RUSTFLAGS',
-    'bindgen_executable_sha256': '778ec413ee7c3ea501d49b376fef3c390bf1f6e64ece888ed30472f09c3a1923',
+    'bindgen_executable_sha256': 'dc9e4f1e03996c26fb8bfedfded73d81120a37251c3f19eb87bb460f1f89a5be',
     'optimizer_executable_sha256': '1014958e6f20d412f1542320b43970214b0fb1ed780595e8f7c0d8761ed53725'},
     artifacts={name: {'sha256': sha(out/'pkg'/name), 'bytes': (out/'pkg'/name).stat().st_size}
                for name in ('bv_graph.js', 'bv_graph_bg.wasm')})

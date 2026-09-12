@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:generate go run generator.go -full-path-comments
-
 package sqlite // import "modernc.org/sqlite"
 
 import (
@@ -29,8 +27,9 @@ import (
 )
 
 var (
-	_ driver.Conn   = (*conn)(nil)
-	_ driver.Driver = (*Driver)(nil)
+	_ driver.Conn      = (*conn)(nil)
+	_ driver.Connector = (*connector)(nil)
+	_ driver.Driver    = (*Driver)(nil)
 	//lint:ignore SA1019 TODO implement ExecerContext
 	_ driver.Execer = (*conn)(nil)
 	//lint:ignore SA1019 TODO implement QueryerContext
@@ -54,7 +53,7 @@ const (
 )
 
 func init() {
-	sql.Register(driverName, newDriver())
+	sql.Register(driverName, defaultDriver())
 	sqlite3.PatchIssue199() // https://gitlab.com/cznic/sqlite/-/issues/199
 
 }
@@ -133,34 +132,225 @@ func getVFSName(query string) (r string, err error) {
 	return r, nil
 }
 
-func applyQueryParams(c *conn, query string) error {
+// applyDQSConfig consults the _dqs DSN query parameter and, when set to a
+// false value, disables SQLite's double-quoted string literal compatibility
+// quirk on the connection by calling sqlite3_db_config with both
+// SQLITE_DBCONFIG_DQS_DDL and SQLITE_DBCONFIG_DQS_DML. Absence or a true
+// value leaves SQLite's default (DQS enabled) untouched.
+//
+// Called from newConn after sqlite3_open_v2 and before applyQueryParams.
+// The DBCONFIG_DQS_* flags are required to be set before any statement is
+// prepared on the connection, and applyQueryParams runs user-supplied
+// PRAGMA statements, so this must come first.
+//
+// See https://www.sqlite.org/quirks.html#dblquote and
+// https://gitlab.com/cznic/sqlite/-/issues/61.
+func applyDQSConfig(c *conn, query string) error {
+	q, err := url.ParseQuery(query)
+	if err != nil {
+		return err
+	}
+	v := q.Get("_dqs")
+	if v == "" {
+		return nil
+	}
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		return fmt.Errorf("invalid _dqs value %q: %w", v, err)
+	}
+	if on {
+		// _dqs=1 is the SQLite default; nothing to do.
+		return nil
+	}
+	for _, op := range []int32{
+		sqlite3.SQLITE_DBCONFIG_DQS_DDL,
+		sqlite3.SQLITE_DBCONFIG_DQS_DML,
+	} {
+		if rc := c.dbConfigBool(op, false); rc != sqlite3.SQLITE_OK {
+			return fmt.Errorf("sqlite3_db_config(op=%d, off) returned %d", op, rc)
+		}
+	}
+	return nil
+}
+
+// getDefensiveMode validates the _defensive DSN query parameter before
+// sqlite3_open_v2 can create or mutate a database. Absence or a false value
+// preserves SQLite's default behavior for backwards compatibility.
+//
+// The parameter is intentionally single-valued. Accepting duplicate values
+// would make the security posture depend on url.Values.Get choosing the first
+// value, so duplicates fail the connection before any query parameter is
+// applied.
+func getDefensiveMode(query string) (bool, error) {
+	q, err := url.ParseQuery(query)
+	if err != nil {
+		return false, err
+	}
+	values, ok := q["_defensive"]
+	if !ok {
+		return false, nil
+	}
+	if len(values) != 1 {
+		return false, fmt.Errorf("_defensive must be specified exactly once, got %d values", len(values))
+	}
+	on, err := strconv.ParseBool(values[0])
+	if err != nil {
+		return false, fmt.Errorf("invalid _defensive value %q: %w", values[0], err)
+	}
+	return on, nil
+}
+
+// applyDefensiveConfig enables SQLite's defensive connection mode after
+// sqlite3_open_v2 and before any user-supplied PRAGMA or statement can run.
+// See https://www.sqlite.org/c3ref/c_dbconfig_defensive.html.
+func applyDefensiveConfig(c *conn, on bool) error {
+	if !on {
+		return nil
+	}
+	if rc := c.dbConfigBool(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, true); rc != sqlite3.SQLITE_OK {
+		return fmt.Errorf("sqlite3_db_config(SQLITE_DBCONFIG_DEFENSIVE, on) returned %d", rc)
+	}
+	return nil
+}
+
+// getErrorRcMode reads the _error_rc DSN query parameter and returns
+// the parsed boolean. Called from newConn before sqlite3_open_v2 so
+// open-time failures get the conditional errmsg treatment too: the
+// temporary db handle that openV2 may leave behind on failure carries
+// a stale errmsg from earlier initialisation, and the legacy
+// "errstr: errmsg" form surfaces that as a misleading message.
+//
+// Absent parameter or false value preserves the SQLite-default error
+// reporting byte-for-byte (legacy behavior). A true value switches
+// the connection into the conditional mode described on
+// errstrForDB. An unparseable value is reported as a descriptive
+// error.
+//
+// See #230.
+func getErrorRcMode(query string) (bool, error) {
+	q, err := url.ParseQuery(query)
+	if err != nil {
+		return false, err
+	}
+	v := q.Get("_error_rc")
+	if v == "" {
+		return false, nil
+	}
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("invalid _error_rc value %q: %w", v, err)
+	}
+	return on, nil
+}
+
+// dsnPick returns the value and key name for a mattn-compatible shorthand DSN
+// parameter and its alias. When both are present the alias wins, matching
+// github.com/mattn/go-sqlite3. Selection is by presence, not by value, so an
+// alias supplied with an empty value ("_foreign_keys=on&_fk=") selects the
+// alias and yields an empty value, suppressing the PRAGMA entirely rather than
+// falling back to the primary key. That too matches mattn.
+func dsnPick(q url.Values, primary, alias string) (key, val string) {
+	if _, ok := q[primary]; ok {
+		key, val = primary, q.Get(primary)
+	}
+	if _, ok := q[alias]; ok {
+		key, val = alias, q.Get(alias)
+	}
+	return key, val
+}
+
+// dsnBool reports an error unless val is a mattn-compatible boolean DSN value.
+func dsnBool(key, val string) error {
+	switch strings.ToLower(val) {
+	case "0", "no", "false", "off", "1", "yes", "true", "on":
+		return nil
+	}
+	return fmt.Errorf("invalid %s %q, expecting one of: 0 1 false true no yes off on", key, val)
+}
+
+// dsnEnum reports an error unless val matches one of allowed, case-insensitively.
+func dsnEnum(key, val string, allowed []string) error {
+	for _, a := range allowed {
+		if strings.EqualFold(val, a) {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid %s %q, expecting one of: %s", key, val, strings.Join(allowed, " "))
+}
+
+// applyQueryParams validates and applies the DSN query parameters. defensive
+// is the _defensive value newConn parsed and already acted on; the validation
+// phase below needs it to tell whether a parameter it is about to accept can
+// still take effect on the connection.
+func applyQueryParams(c *conn, query string, defensive bool) error {
 	q, err := url.ParseQuery(query)
 	if err != nil {
 		return err
 	}
 
-	var a []string
-	for _, v := range q["_pragma"] {
-		a = append(a, v)
+	// Validation phase. Everything that can be rejected is rejected here, before
+	// the apply phase below executes a single statement. PRAGMA journal_mode and
+	// auto_vacuum are persistent changes to the database file, so validating
+	// lazily as each key is applied would let a typo in a later parameter fail
+	// the connection only after the file had already been converted -- a failed
+	// Open must not leave the database half-configured. Assignments to c are
+	// exempt from that concern: newConn closes and discards the connection when
+	// this returns an error, so they cannot outlive the failure.
+	//
+	// Each shorthand value is validated against the same set
+	// github.com/mattn/go-sqlite3 accepts (case-insensitive). When a key and its
+	// alias are both present the alias wins, matching mattn. See the Driver
+	// documentation in driver.go for the full apply order and precedence.
+	//
+	// _pragma values are the one exception: they are executed verbatim and
+	// cannot be checked here, so a malformed _pragma can still fail partway.
+	busyKey, busyTimeout := dsnPick(q, "_busy_timeout", "_timeout")
+	if busyTimeout != "" {
+		if _, err := strconv.ParseInt(busyTimeout, 10, 64); err != nil {
+			return fmt.Errorf("invalid %s %q: %w", busyKey, busyTimeout, err)
+		}
 	}
-	// Push 'busy_timeout' first, the rest in lexicographic order, case insenstive.
-	// See https://gitlab.com/cznic/sqlite/-/issues/198#note_2233423463 for
-	// discussion.
-	sort.Slice(a, func(i, j int) bool {
-		x, y := strings.TrimSpace(strings.ToLower(a[i])), strings.TrimSpace(strings.ToLower(a[j]))
-		if strings.HasPrefix(x, "busy_timeout") {
-			return true
-		}
-		if strings.HasPrefix(y, "busy_timeout") {
-			return false
-		}
 
-		return x < y
-	})
-	for _, v := range a {
-		cmd := "pragma " + v
-		_, err := c.exec(context.Background(), cmd, nil)
-		if err != nil {
+	autoVacuumKey, autoVacuum := dsnPick(q, "_auto_vacuum", "_vacuum")
+	if autoVacuum != "" {
+		if err := dsnEnum(autoVacuumKey, autoVacuum, []string{"0", "NONE", "1", "FULL", "2", "INCREMENTAL"}); err != nil {
+			return err
+		}
+	}
+
+	foreignKeysKey, foreignKeys := dsnPick(q, "_foreign_keys", "_fk")
+	if foreignKeys != "" {
+		if err := dsnBool(foreignKeysKey, foreignKeys); err != nil {
+			return err
+		}
+	}
+
+	journalModeKey, journalMode := dsnPick(q, "_journal_mode", "_journal")
+	if journalMode != "" {
+		if err := dsnEnum(journalModeKey, journalMode, []string{"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}); err != nil {
+			return err
+		}
+		// PRAGMA journal_mode=OFF is one of the operations defensive mode
+		// suppresses, and SQLite suppresses it silently: the statement
+		// succeeds and reports the unchanged mode. Accepting the
+		// combination would mean honouring neither parameter without
+		// telling anyone, so reject it here, alongside the other checks
+		// that run before a single statement is executed.
+		if defensive && strings.EqualFold(journalMode, "OFF") {
+			return fmt.Errorf("conflicting DSN parameters: %s=%s cannot take effect under _defensive", journalModeKey, journalMode)
+		}
+	}
+
+	synchronousKey, synchronous := dsnPick(q, "_synchronous", "_sync")
+	if synchronous != "" {
+		if err := dsnEnum(synchronousKey, synchronous, []string{"0", "OFF", "1", "NORMAL", "2", "FULL", "3", "EXTRA"}); err != nil {
+			return err
+		}
+	}
+
+	queryOnly := q.Get("_query_only")
+	if queryOnly != "" {
+		if err := dsnBool("_query_only", queryOnly); err != nil {
 			return err
 		}
 	}
@@ -216,6 +406,79 @@ func applyQueryParams(c *conn, query string) error {
 				v)
 		}
 		c.textToTime = onoff
+	}
+
+	// Apply phase. The order here is the documented one and is independent of
+	// the order the keys appear in the DSN.
+	//
+	// Busy timeout must be one of the first PRAGMAs set from query params as some
+	// that make changes to the database might otherwise unexpectedly fail with
+	// SQLITE_BUSY.
+	if busyTimeout != "" {
+		if _, err := c.exec(context.Background(), "pragma busy_timeout = "+busyTimeout, nil); err != nil {
+			return err
+		}
+	}
+
+	// auto_vacuum must be applied while the database is still new: a journal_mode
+	// change or the first table materialises page 1 and locks the setting in, so
+	// it runs before the _pragma list and the other shorthand keys.
+	if autoVacuum != "" {
+		if _, err := c.exec(context.Background(), "pragma auto_vacuum = "+autoVacuum, nil); err != nil {
+			return err
+		}
+	}
+
+	var a []string
+	for _, v := range q["_pragma"] {
+		a = append(a, v)
+	}
+	// Push 'busy_timeout' first, the rest in lexicographic order, case insenstive.
+	// See https://gitlab.com/cznic/sqlite/-/issues/198#note_2233423463 for
+	// discussion.
+	sort.Slice(a, func(i, j int) bool {
+		x, y := strings.TrimSpace(strings.ToLower(a[i])), strings.TrimSpace(strings.ToLower(a[j]))
+		if strings.HasPrefix(x, "busy_timeout") {
+			return true
+		}
+		if strings.HasPrefix(y, "busy_timeout") {
+			return false
+		}
+
+		return x < y
+	})
+	for _, v := range a {
+		cmd := "pragma " + v
+		_, err := c.exec(context.Background(), cmd, nil)
+		if err != nil {
+			return err
+		}
+	}
+
+	if foreignKeys != "" {
+		if _, err := c.exec(context.Background(), "pragma foreign_keys = "+foreignKeys, nil); err != nil {
+			return err
+		}
+	}
+
+	if journalMode != "" {
+		if _, err := c.exec(context.Background(), "pragma journal_mode = "+journalMode, nil); err != nil {
+			return err
+		}
+	}
+
+	if synchronous != "" {
+		if _, err := c.exec(context.Background(), "pragma synchronous = "+synchronous, nil); err != nil {
+			return err
+		}
+	}
+
+	// query_only is applied last: it makes the connection read-only, so it must
+	// not precede the write-capable pragmas above (notably auto_vacuum).
+	if queryOnly != "" {
+		if _, err := c.exec(context.Background(), "pragma query_only = "+queryOnly, nil); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -352,13 +615,13 @@ type collation struct {
 // - if A<B, then B>A
 // - if A<B and B<C, then A<C.
 //
-// The new collation will be available to all new connections opened after
-// executing RegisterCollationUtf8.
+// The new collation will be available to all new connections the driver
+// registered as "sqlite" opens after executing RegisterCollationUtf8.
 func RegisterCollationUtf8(
 	zName string,
 	impl func(left, right string) int,
 ) error {
-	return registerCollation(zName, impl, sqlite3.SQLITE_UTF8)
+	return d.registerCollation(zName, impl, sqlite3.SQLITE_UTF8)
 }
 
 // MustRegisterCollationUtf8 is like RegisterCollationUtf8 but panics on error.
@@ -371,11 +634,17 @@ func MustRegisterCollationUtf8(
 	}
 }
 
-func registerCollation(
+func (d *Driver) registerCollation(
 	zName string,
 	impl func(left, right string) int,
 	enc int32,
 ) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.collations == nil {
+		d.collations = map[string]*collation{}
+	}
 	if _, ok := d.collations[zName]; ok {
 		return fmt.Errorf("a collation %q is already registered", zName)
 	}
@@ -433,13 +702,13 @@ const sqliteValPtrSize = unsafe.Sizeof(&sqlite3.Sqlite3_value{})
 // scalar function (when Scalar is defined) or an aggregate function (when
 // Scalar is not defined and MakeAggregate is defined).
 //
-// The new function will be available to all new connections opened after
-// executing RegisterFunction.
+// The new function will be available to all new connections the driver
+// registered as "sqlite" opens after executing RegisterFunction.
 func RegisterFunction(
 	zFuncName string,
 	impl *FunctionImpl,
 ) error {
-	return registerFunction(zFuncName, impl)
+	return d.registerFunction(zFuncName, impl)
 }
 
 // MustRegisterFunction is like RegisterFunction but panics on error.
@@ -455,8 +724,8 @@ func MustRegisterFunction(
 // RegisterScalarFunction registers a scalar function named zFuncName with nArg
 // arguments. Passing -1 for nArg indicates the function is variadic.
 //
-// The new function will be available to all new connections opened after
-// executing RegisterScalarFunction.
+// The new function will be available to all new connections the driver
+// registered as "sqlite" opens after executing RegisterScalarFunction.
 func RegisterScalarFunction(
 	zFuncName string,
 	nArg int32,
@@ -467,7 +736,7 @@ func RegisterScalarFunction(
 			dmesg("zFuncName %q, nArg %v, xFunc %p: err %v", zFuncName, nArg, xFunc, err)
 		}()
 	}
-	return registerFunction(zFuncName, &FunctionImpl{NArgs: nArg, Scalar: xFunc, Deterministic: false})
+	return d.registerFunction(zFuncName, &FunctionImpl{NArgs: nArg, Scalar: xFunc, Deterministic: false})
 }
 
 // MustRegisterScalarFunction is like RegisterScalarFunction but panics on
@@ -505,8 +774,9 @@ func MustRegisterDeterministicScalarFunction(
 // the function is variadic. A deterministic function means that the function
 // always gives the same output when the input parameters are the same.
 //
-// The new function will be available to all new connections opened after
-// executing RegisterDeterministicScalarFunction.
+// The new function will be available to all new connections the driver
+// registered as "sqlite" opens after executing
+// RegisterDeterministicScalarFunction.
 func RegisterDeterministicScalarFunction(
 	zFuncName string,
 	nArg int32,
@@ -517,14 +787,19 @@ func RegisterDeterministicScalarFunction(
 			dmesg("zFuncName %q, nArg %v, xFunc %p: err %v", zFuncName, nArg, xFunc, err)
 		}()
 	}
-	return registerFunction(zFuncName, &FunctionImpl{NArgs: nArg, Scalar: xFunc, Deterministic: true})
+	return d.registerFunction(zFuncName, &FunctionImpl{NArgs: nArg, Scalar: xFunc, Deterministic: true})
 }
 
-func registerFunction(
+func (d *Driver) registerFunction(
 	zFuncName string,
 	impl *FunctionImpl,
 ) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
+	if d.udfs == nil {
+		d.udfs = map[string]*userDefinedFunction{}
+	}
 	if _, ok := d.udfs[zFuncName]; ok {
 		return fmt.Errorf("a function named %q is already registered", zFuncName)
 	}
@@ -569,8 +844,10 @@ func registerFunction(
 	return nil
 }
 
-// RegisterConnectionHook registers a function to be called after each connection
-// is opened. This is called after all the connection has been set up.
+// RegisterConnectionHook registers a function to be called after each
+// connection the driver registered as "sqlite" opens. This is called after all
+// the connection has been set up. Use [Driver.RegisterConnectionHook] to hook
+// the connections of a caller-constructed Driver instead.
 func RegisterConnectionHook(fn ConnectionHookFn) {
 	d.RegisterConnectionHook(fn)
 }

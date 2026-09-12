@@ -41,6 +41,16 @@ type conn struct {
 	// connection just because an in-flight query was interrupted.
 	// See #196.
 	inMemory bool
+
+	// errorRcMode is the opt-in error-string reporting mode toggled by
+	// the _error_rc DSN parameter. When true, error strings synthesised
+	// from a (rc, db) pair only append sqlite3_errmsg(db) when
+	// sqlite3_extended_errcode(db) matches the operation rc (full, then
+	// primary code); on mismatch the canonical sqlite3_errstr(rc) is used
+	// alone. Default false keeps the legacy "errstr: errmsg" form
+	// byte-for-byte so existing callers parsing error strings are
+	// unaffected. See #230.
+	errorRcMode bool
 }
 
 func newConn(dsn string) (*conn, error) {
@@ -63,17 +73,40 @@ func newConn(dsn string) (*conn, error) {
 		}
 	}
 
-	c := &conn{tls: libc.NewTLS()}
-	db, err := c.openV2(
-		dsn,
-		vfsName,
-		sqlite3.SQLITE_OPEN_READWRITE|sqlite3.SQLITE_OPEN_CREATE|
-			sqlite3.SQLITE_OPEN_FULLMUTEX|
-			sqlite3.SQLITE_OPEN_URI,
-	)
+	// _error_rc is parsed before openV2 so open-time failures (e.g.
+	// SQLITE_CANTOPEN on a path the process cannot create) get the
+	// conditional errmsg treatment too. The temporary db handle that
+	// sqlite3_open_v2 leaves behind on failure carries a stale
+	// errmsg from earlier initialisation, and the legacy "errstr:
+	// errmsg" form surfaces that as a misleading message. See #230.
+	errorRcMode, err := getErrorRcMode(query)
 	if err != nil {
-		c.tls.Close()
 		return nil, err
+	}
+	defensiveMode, err := getDefensiveMode(query)
+	if err != nil {
+		return nil, err
+	}
+	c := &conn{tls: libc.NewTLS(), errorRcMode: errorRcMode}
+	// The withOpenGate wrapper marks the page-cache opened flag and holds
+	// pcacheState.openGate.RLock for the duration of sqlite3_open_v2, so
+	// any concurrent RegisterPageCache blocks until this Open
+	// completes. sqlite3_initialize fires implicitly inside openV2 the
+	// first time; after that point SQLITE_CONFIG_PCACHE2 can no longer be
+	// installed. See pagecache.go for the lifecycle contract.
+	var db uintptr
+	if gateErr := withOpenGate(func() error {
+		db, err = c.openV2(
+			dsn,
+			vfsName,
+			sqlite3.SQLITE_OPEN_READWRITE|sqlite3.SQLITE_OPEN_CREATE|
+				sqlite3.SQLITE_OPEN_FULLMUTEX|
+				sqlite3.SQLITE_OPEN_URI,
+		)
+		return err
+	}); gateErr != nil {
+		c.tls.Close()
+		return nil, gateErr
 	}
 
 	c.db = db
@@ -94,7 +127,28 @@ func newConn(dsn string) (*conn, error) {
 	defer libc.Xfree(c.tls, zMain)
 	c.inMemory = libc.GoString(sqlite3.Xsqlite3_db_filename(c.tls, c.db, zMain)) == ""
 
-	if err = applyQueryParams(c, query); err != nil {
+	// _defensive is applied first so that everything the driver and the
+	// caller run afterwards is already subject to the restriction: the
+	// PRAGMAs applyQueryParams executes, the _pragma list, and every
+	// statement prepared on the connection. Unlike the DBCONFIG_DQS_*
+	// flags below this ordering is a choice rather than an API contract;
+	// SQLITE_DBCONFIG_DEFENSIVE may be toggled at any point in a
+	// connection's life.
+	if err = applyDefensiveConfig(c, defensiveMode); err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	// _dqs is applied before applyQueryParams because the SQLite contract
+	// requires sqlite3_db_config(SQLITE_DBCONFIG_DQS_*) to be set before
+	// any statement is prepared on the connection. applyQueryParams runs
+	// user-supplied PRAGMA statements, so it must come after.
+	if err = applyDQSConfig(c, query); err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	if err = applyQueryParams(c, query, defensiveMode); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -739,7 +793,7 @@ func (c *conn) openV2(name, vfsName string, flags int32) (uintptr, error) {
 		// be closed to avoid leaking resources.
 		var err error
 		if dbh != 0 {
-			err = errstrForDB(c.tls, rc, dbh)
+			err = errstrForDB(c.tls, rc, dbh, c.errorRcMode)
 			sqlite3.Xsqlite3_close_v2(c.tls, dbh)
 		} else {
 			err = c.errstr(rc)
@@ -770,14 +824,48 @@ func (c *conn) freeAllocs(allocs []uintptr) {
 	}
 }
 
+// dbConfigBool calls sqlite3_db_config with the (int onoff, int *pRes)
+// vararg form, used by the boolean-toggle ops such as
+// SQLITE_DBCONFIG_DQS_DDL / DQS_DML / ENABLE_FKEY / ENABLE_TRIGGER. pRes
+// is passed as NULL because callers in this driver only need the side
+// effect on the connection, not the post-set value.
+//
+// The vararg payload is one int followed by one pointer. libc.VaList packs
+// every argument into a fixed 8-byte slot regardless of the target's pointer
+// width (an int is widened to 8 bytes), so the two-argument list needs 2*8
+// bytes. Returns the underlying SQLite result code (SQLITE_OK on success).
+func (c *conn) dbConfigBool(op int32, onoff bool) int32 {
+	var v int32
+	if onoff {
+		v = 1
+	}
+	const vaSlot = 8 // libc.VaList stride per argument, all targets
+	bp := libc.Xmalloc(c.tls, types.Size_t(2*vaSlot))
+	if bp == 0 {
+		return sqlite3.SQLITE_NOMEM
+	}
+	defer libc.Xfree(c.tls, bp)
+	return sqlite3.Xsqlite3_db_config(c.tls, c.db, op,
+		libc.VaList(bp, v, uintptr(0)))
+}
+
 // C documentation
 //
 //	const char *sqlite3_errstr(int);
 func (c *conn) errstr(rc int32) error {
-	return errstrForDB(c.tls, rc, c.db)
+	return errstrForDB(c.tls, rc, c.db, c.errorRcMode)
 }
 
-func errstrForDB(tls *libc.TLS, rc int32, db uintptr) error {
+// errstrForDB synthesises a Go error from a (rc, db) pair. When
+// errorRcMode is true, the appended sqlite3_errmsg(db) is suppressed if
+// sqlite3_extended_errcode(db) is inconsistent with rc; the canonical
+// sqlite3_errstr(rc) string is used alone in that case. The match check
+// tries the full extended code first and falls back to the primary code
+// (rc & 0xff), matching SQLite's own guidance that the operation return
+// code is authoritative. When errorRcMode is false the legacy
+// "errstr: errmsg" form is preserved byte-for-byte so existing callers
+// parsing the error string are unaffected. See #230.
+func errstrForDB(tls *libc.TLS, rc int32, db uintptr, errorRcMode bool) error {
 	pStr := sqlite3.Xsqlite3_errstr(tls, rc)
 	str := libc.GoString(pStr)
 	var s string
@@ -786,6 +874,14 @@ func errstrForDB(tls *libc.TLS, rc int32, db uintptr) error {
 	}
 	if db == 0 {
 		return &Error{msg: fmt.Sprintf("%s (%v)%s", str, rc, s), code: int(rc)}
+	}
+	if errorRcMode {
+		ext := sqlite3.Xsqlite3_extended_errcode(tls, db)
+		if ext != rc && (ext&0xff) != (rc&0xff) {
+			// Mismatch: errmsg on the db handle reflects a different
+			// operation. Use the canonical errstr(rc) alone.
+			return &Error{msg: fmt.Sprintf("%s (%v)%s", str, rc, s), code: int(rc)}
+		}
 	}
 	pMsg := sqlite3.Xsqlite3_errmsg(tls, db)
 	switch msg := libc.GoString(pMsg); {
@@ -1154,11 +1250,13 @@ func (c *conn) backup(remoteConn *conn, restore bool) (_ *Backup, finalErr error
 	}
 	if pBackup <= 0 {
 		destDb := remoteConn.db
+		destMode := remoteConn.errorRcMode
 		if restore {
 			destDb = c.db
+			destMode = c.errorRcMode
 		}
 		rc := sqlite3.Xsqlite3_errcode(c.tls, destDb)
-		return nil, errstrForDB(c.tls, rc, destDb)
+		return nil, errstrForDB(c.tls, rc, destDb, destMode)
 	}
 
 	return &Backup{srcConn: c, dstConn: remoteConn, pBackup: pBackup}, nil

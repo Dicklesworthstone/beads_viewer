@@ -298,6 +298,10 @@ var registerHook func(name string, m Module) error
 // SetRegisterFunc is intended to be called by the engine package to provide
 // the concrete implementation of module registration. External callers
 // should use RegisterModule instead.
+//
+// The hook is the fallback of [RegisterModule], not its front door: a non-nil
+// db whose driver implements [ModuleRegisterer] is routed to that driver and
+// does not consult the hook.
 func SetRegisterFunc(fn func(name string, m Module) error) { registerHook = fn }
 
 // RegisterModule registers a virtual table module with the provided *sql.DB.
@@ -310,19 +314,41 @@ func SetRegisterFunc(fn func(name string, m Module) error) { registerHook = fn }
 // that error. This fail-fast behavior prevents partially-initialized
 // connections when a module cannot be installed.
 //
-// The db parameter is currently unused by the engine; it is available so
-// module implementations can capture it if they need a *sql.DB for their own
-// internal queries.
+// The db parameter selects which driver the module is registered on. A nil db
+// registers on the driver this package's engine registers as "sqlite", which
+// is what every caller got before db was honoured. A non-nil db registers on
+// the driver backing it, as reported by (*sql.DB).Driver, when that driver
+// implements [ModuleRegisterer]; for a db opened against the "sqlite" driver
+// that is the same driver as the nil case, so the outcome is unchanged.
+// Otherwise the engine's driver is used, so a db wrapped by another driver
+// still registers somewhere useful rather than failing.
+//
+// The routing trusts (*sql.DB).Driver to name the driver db actually connects
+// through. A connector whose Driver method reports a driver its Connect does
+// not use -- a database/sql anti-pattern -- makes the module land on a driver
+// that never opens a connection, so it reaches nothing and no error reports
+// that. A hook installed with [SetRegisterFunc] is likewise consulted only
+// when the db argument does not resolve to a [ModuleRegisterer].
 func RegisterModule(db *sql.DB, name string, m Module) error {
-	_ = db
-	if registerHook == nil {
-		return ErrNotImplemented
-	}
 	if name == "" {
 		return errors.New("vtab: module name must be non-empty")
 	}
 	if m == nil {
 		return errors.New("vtab: module implementation is nil")
 	}
+	if db != nil {
+		if r, ok := db.Driver().(ModuleRegisterer); ok {
+			return r.RegisterModule(name, m)
+		}
+	}
+	if registerHook == nil {
+		return ErrNotImplemented
+	}
 	return registerHook(name, m)
+}
+
+// ModuleRegisterer is implemented by a driver that can register a virtual
+// table module on itself. [RegisterModule] uses it to honour its db argument.
+type ModuleRegisterer interface {
+	RegisterModule(name string, m Module) error
 }

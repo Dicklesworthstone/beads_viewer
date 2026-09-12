@@ -2,9 +2,8 @@
   description = "bv - Terminal UI for the Beads issue tracker";
 
   inputs = {
-    # Use nixpkgs unstable for Go 1.25+ support
-    # go.mod requires go 1.25, which isn't in stable nixpkgs yet
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Go 1.26 support while retaining the existing Intel macOS package.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
