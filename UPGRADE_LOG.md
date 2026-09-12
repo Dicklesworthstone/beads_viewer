@@ -1,5 +1,33 @@
 # Dependency Upgrade Log
 
+**Date:** 2026-09-12 UTC | **Project:** beads_viewer | **Status:** in progress
+
+## September release update
+
+The user requested `library-updater` followed by a new release. Each selected
+dependency is researched and tested separately. Local replacements and
+pseudo-version pins are preserved; modules present only in dependency tooling
+graphs are distinguished from this project's declared requirements. The raw
+registry inventory is `/data/tmp/bv-release-module-inventory-20260911.json`.
+Release preparation uses DSR/RCH and the complete repository release gate;
+GitHub Actions must not run. Existing incomplete P1/native evidence remains open.
+
+- [x] Inventory Go requirements and upstream stable versions.
+- [ ] Research and update each eligible declared requirement, testing each.
+- [ ] Inspect the two Rust/WASM manifests and embedded asset requirements.
+- [ ] Run final full tests and vulnerability audit.
+- [ ] Update changelog/version and pass the complete release gate.
+- [ ] Build and verify all five configured release targets.
+- [ ] Publish GitHub release, Homebrew tap and Scoop bucket; verify installers.
+
+### Current candidate: github.com/charmbracelet/x/ansi v0.11.7 → v0.11.8
+
+Research and unchanged-source baseline testing are in progress. Upstream source
+is tag `ansi/v0.11.8`, commit `00c6608f106b9c6cd8a1a77156f7901f41265e64`.
+[Upstream comparison](https://github.com/charmbracelet/x/compare/ansi/v0.11.7...ansi/v0.11.8).
+
+---
+
 **Date:** 2026-06-08 | **Project:** beads_viewer | **Language:** Go | **Release:** v0.17.0
 
 ## Summary
