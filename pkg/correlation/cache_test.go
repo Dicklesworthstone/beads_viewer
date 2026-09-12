@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
@@ -767,103 +768,108 @@ func TestCachedCorrelator_XFetchUsesClonedInputs(t *testing.T) {
 
 func TestCachedCorrelator_SingleflightLogsSharedErrors(t *testing.T) {
 	repoPath := initTempGitRepo(t)
-	correlator := NewCachedCorrelator(repoPath)
-	beads := []BeadInfo{{ID: "test-1", Status: "open"}}
-	opts := CorrelatorOptions{Limit: 10}
+	synctest.Test(t, func(t *testing.T) {
+		correlator := NewCachedCorrelator(repoPath)
+		beads := []BeadInfo{{ID: "test-1", Status: "open"}}
+		opts := CorrelatorOptions{Limit: 10}
 
-	wantErr := errors.New("shared singleflight failure")
-	var calls atomic.Int32
-	var started atomic.Int32
-	generateStarted := make(chan struct{})
-	releaseGenerate := make(chan struct{})
+		wantErr := errors.New("shared singleflight failure")
+		var calls atomic.Int32
+		var started atomic.Int32
+		generateStarted := make(chan struct{})
+		releaseGenerate := make(chan struct{})
 
-	correlator.generateReportFn = func([]BeadInfo, CorrelatorOptions) (*HistoryReport, error) {
-		calls.Add(1)
+		correlator.generateReportFn = func([]BeadInfo, CorrelatorOptions) (*HistoryReport, error) {
+			calls.Add(1)
+			select {
+			case <-generateStarted:
+			default:
+				close(generateStarted)
+			}
+			<-releaseGenerate
+			return nil, wantErr
+		}
+
+		var logMu sync.Mutex
+		logs := make([]string, 0, 2)
+		originalLogf := correlationCacheLogf
+		correlationCacheLogf = func(format string, args ...any) {
+			logMu.Lock()
+			logs = append(logs, fmt.Sprintf(format, args...))
+			logMu.Unlock()
+		}
+		defer func() {
+			correlationCacheLogf = originalLogf
+		}()
+
+		const workers = 2
+		start := make(chan struct{})
+		var ready sync.WaitGroup
+		ready.Add(workers)
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		errCh := make(chan error, workers)
+
+		for i := 0; i < workers; i++ {
+			go func() {
+				defer wg.Done()
+				ready.Done()
+				<-start
+				started.Add(1)
+				_, err := correlator.GenerateReport(beads, opts)
+				errCh <- err
+			}()
+		}
+
+		ready.Wait()
+		close(start)
+
 		select {
 		case <-generateStarted:
-		default:
-			close(generateStarted)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for report generation to start")
 		}
-		<-releaseGenerate
-		return nil, wantErr
-	}
 
-	var logMu sync.Mutex
-	logs := make([]string, 0, 2)
-	originalLogf := correlationCacheLogf
-	correlationCacheLogf = func(format string, args ...any) {
+		deadline := time.Now().Add(2 * time.Second)
+		for started.Load() != workers {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for workers to start, got %d of %d", started.Load(), workers)
+			}
+			time.Sleep(time.Millisecond)
+		}
+
+		// Starting GenerateReport does not mean the caller has finished resolving
+		// Git HEAD or joined the flight. Wait for both callers to be blocked: the
+		// leader on releaseGenerate and the follower inside singleflight.
+		synctest.Wait()
+		close(releaseGenerate)
+		wg.Wait()
+		close(errCh)
+
+		for err := range errCh {
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("GenerateReport error = %v, want %v", err, wantErr)
+			}
+		}
+
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("underlying GenerateReport calls = %d, want 1", got)
+		}
+
 		logMu.Lock()
-		logs = append(logs, fmt.Sprintf(format, args...))
+		joinedLogs := strings.Join(logs, "\n")
+		logCount := len(logs)
 		logMu.Unlock()
-	}
-	defer func() {
-		correlationCacheLogf = originalLogf
-	}()
-
-	const workers = 2
-	start := make(chan struct{})
-	var ready sync.WaitGroup
-	ready.Add(workers)
-	var wg sync.WaitGroup
-	wg.Add(workers)
-	errCh := make(chan error, workers)
-
-	for i := 0; i < workers; i++ {
-		go func() {
-			defer wg.Done()
-			ready.Done()
-			<-start
-			started.Add(1)
-			_, err := correlator.GenerateReport(beads, opts)
-			errCh <- err
-		}()
-	}
-
-	ready.Wait()
-	close(start)
-
-	select {
-	case <-generateStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for report generation to start")
-	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for started.Load() != workers {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for workers to start, got %d of %d", started.Load(), workers)
+		if logCount == 0 {
+			t.Fatal("expected singleflight error to be logged")
 		}
-		time.Sleep(time.Millisecond)
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	close(releaseGenerate)
-	wg.Wait()
-	close(errCh)
-
-	for err := range errCh {
-		if !errors.Is(err, wantErr) {
-			t.Fatalf("GenerateReport error = %v, want %v", err, wantErr)
+		if !strings.Contains(joinedLogs, "shared=true") {
+			t.Fatalf("expected shared singleflight error log, got %q", joinedLogs)
 		}
-	}
-
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("underlying GenerateReport calls = %d, want 1", got)
-	}
-
-	logMu.Lock()
-	joinedLogs := strings.Join(logs, "\n")
-	logCount := len(logs)
-	logMu.Unlock()
-	if logCount == 0 {
-		t.Fatal("expected singleflight error to be logged")
-	}
-	if !strings.Contains(joinedLogs, "shared=true") {
-		t.Fatalf("expected shared singleflight error log, got %q", joinedLogs)
-	}
-	if !strings.Contains(joinedLogs, wantErr.Error()) {
-		t.Fatalf("expected logged error %q, got %q", wantErr, joinedLogs)
-	}
+		if !strings.Contains(joinedLogs, wantErr.Error()) {
+			t.Fatalf("expected logged error %q, got %q", wantErr, joinedLogs)
+		}
+	})
 }
 
 func TestCachedCorrelator_XFetchRefreshLogsErrors(t *testing.T) {
