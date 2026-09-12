@@ -3,9 +3,9 @@
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
 Scope window: this update verifies `v0.24.0..v0.24.1` and the post-release
-commits through [`b0ce5669`](https://github.com/Dicklesworthstone/beads_viewer/commit/b0ce5669), including the September 10 canonical-source and Cass
+commits through [`87cee258`](https://github.com/Dicklesworthstone/beads_viewer/commit/87cee258), including the September 10 canonical-source and Cass
 repairs, September 11 performance work, and September 12 dependency campaign.
-The v0.25.0 candidate remains unpublished until its complete release gate passes.
+v0.25.0 was published after its complete clean-source release gate passed.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
 and release receipts; [research notes](CHANGELOG_RESEARCH.md) record coverage.
@@ -16,7 +16,7 @@ the latest tag, including installer changes usable with already released binarie
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
-| v0.25.0 (candidate) | — | Not yet published | Workflow readiness, source integrity and live dashboards, responsive Cass search, priority performance, and Go 1.26 dependency refresh. |
+| [`v0.25.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.0) | 2026-09-12 | GitHub Release | Workflow readiness, source integrity and live dashboards, responsive Cass search, priority performance, and Go 1.26 dependency refresh. |
 | [`v0.24.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.1) | 2026-09-08 | GitHub Release | Reuse loaded source hashes and avoid waiting for a busy analysis-cache writer. |
 | [`v0.24.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.0) | 2026-09-07 | GitHub Release | Latency campaign across analysis, loader and TUI, graph-navigation and causality repairs, release-gate isolation, and the x/text GO-2026-5970 dependency fix. |
 | [`v0.23.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.23.0) | 2026-09-04 | GitHub Release | Reality Check hardening sweep, 10-stage release gate, proactive drift alerts, typed env registry, docgen, and full tracker completion. |
@@ -27,7 +27,15 @@ the latest tag, including installer changes usable with already released binarie
 
 ---
 
-## v0.25.0 — release candidate
+## v0.25.0 — 2026-09-12
+
+Published from `87cee258` after all ten release-gate stages passed through
+RCH with no skips. Five platform archives, checksums, the sealed gate receipt
+and a packaged-binary SBOM were uploaded with DSR; all 14 assets were downloaded
+and verified before publication. Homebrew and Scoop manifests were updated.
+Native Linux amd64, macOS arm64 and Windows amd64 installer/update checks passed,
+as did the packaged binary's desktop/mobile/offline browser journeys. Native
+source-build acceptance and the incomplete P1 performance matrix remain open.
 
 ### Priority recommendation performance
 

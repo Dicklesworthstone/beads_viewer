@@ -1,6 +1,6 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-09-12 UTC | **Project:** beads_viewer | **Status:** in progress
+**Date:** 2026-09-12 UTC | **Project:** beads_viewer | **Status:** v0.25.0 published
 
 ## September release update
 
@@ -30,20 +30,80 @@ GitHub Actions must not run. Existing incomplete P1/native evidence remains open
 - [x] Commit the verified SQLite batching change and record release evidence.
 - [x] Verify live saved-claim guards three times using isolated br 0.6.0.
 - [x] Recheck the unchanged correlation deadline three times on vmi1264463.
-- [ ] Pass all ten stages on a clean complete Git clone through strict RCH.
-- [ ] Tag the exact gated source commit.
-- [ ] Package Linux amd64/arm64, macOS amd64/arm64 and Windows amd64.
-- [ ] Seal and verify all five archives against the gate receipt.
-- [ ] Generate the SBOM from the actual packaged Linux amd64 binary.
-- [ ] Upload 14 assets to a DSR draft with dispatch disabled.
-- [ ] Download and verify every draft asset before publication.
-- [ ] Publish GitHub release and check public asset identity.
-- [ ] Update Homebrew's four platform hashes; validate, push and read back.
-- [ ] Update Scoop's Windows hash; validate, push and read back.
-- [ ] Run native Linux/macOS installer and upgrade checks.
-- [ ] Run native Windows installer, upgrade and failure-preservation checks.
-- [ ] Verify Go proxy and Nix version identity.
-- [ ] Record venue/native evidence and close bv-8tym only after completion.
+- [x] Pass all ten stages on a clean complete Git clone through strict RCH.
+- [x] Tag the exact gated source commit.
+- [x] Package Linux amd64/arm64, macOS amd64/arm64 and Windows amd64.
+- [x] Seal and verify all five archives against the gate receipt.
+- [x] Generate the SBOM from the actual packaged Linux amd64 binary.
+- [x] Upload 14 assets to a DSR draft with dispatch disabled.
+- [x] Download and verify every draft asset before publication.
+- [x] Publish GitHub release and check public asset identity.
+- [x] Update Homebrew's four platform hashes; validate, push and read back.
+- [x] Update Scoop's Windows hash; validate, push and read back.
+- [x] Run native Linux/macOS installer and upgrade checks.
+- [x] Run native Windows installer, upgrade and failure-preservation checks.
+- [x] Verify Go proxy and Nix version identity.
+- [x] Record venue/native evidence and close bv-8tym only after completion.
+
+### Published release evidence
+
+`v0.25.0` was published at **2026-09-12T19:39:38Z** from
+`87cee25886915ab1d072d807abc234b743899f7c`. The complete clean-source gate
+passed all ten stages in 1833 seconds, with zero failures or skips, on
+vmi1264463 using Go 1.26.8 and isolated br 0.6.0. The eligible receipt and log
+are `/data/tmp/bv-release-gate-20260912T185754Z.lb7mwm/{receipt.json,gate.log}`;
+local pre-packaging evidence is `/data/tmp/bv-v0.25.0-qualified-evidence-20260912/`.
+The frozen reference was built and compared; no stored-reference fallback ran.
+
+Strict RCH packaging completed in 242.090 seconds, sealed all five archives and
+passed its final `verify` operation. Every embedded binary has the exact source
+revision, `vcs.modified=false`, Go 1.26.8 and CGO disabled. Subsequent standalone
+verification attempts were refused by RCH memory-pressure admission (exit 103),
+without local fallback; the completed package verification is the release proof.
+Logs: `/tmp/bv-release-package-v0250-20260912.log` and the two
+`/tmp/bv-release-verify-v0250*20260912.log` attempts.
+
+The upload set at `/data/tmp/bv-v0.25.0-release-assets-20260912/` contains exactly
+14 files: five archives, five individual checksums, `checksums.txt`, `SHA256SUMS`,
+the sealed receipt and an SPDX 2.3 SBOM with 60 packages from the actual Linux
+binary. DSR uploaded the draft with `--verify-tag --no-dispatch`. Every draft
+file was downloaded and compared by hash, size and name before publication;
+`/data/tmp/bv-v0250-draft-verification-20260912.json` records the result. All 14
+public API digests also match. No signing key was available; no signature claim
+is made. GitHub Actions remained disabled in all three publishing repositories.
+
+The packaged binary passed real desktop/mobile/offline/update browser journeys
+and negative controls (`/tmp/bv-v0250-packaged-browser-20260912.log`, retained
+artifacts `/data/tmp/bv-browser-smoke.jAelix`). Linux amd64 and macOS arm64 passed
+all shell-installer archive controls, live public installation, capabilities,
+tiny-source readiness JSON, self-update from 0.24.1 and no-update checks. Logs
+are `/tmp/bv-v0250-{linux,mac}-*20260912.log`. The tiny-source fixture has no live
+tracker metadata, so its correct result proves readiness but emits no claim.
+Windows amd64 passed the complete default native installer suite, including
+live install, tiny project, self-update/no-update and failed-install preservation;
+`/tmp/bv-v0250-windows-live-20260912.log`, remote evidence
+`C:\Users\jeffr\bv-v0250-native-20260912-1642\live-installer-v0250-1940`.
+The controlled source-version negative fixture is not a native source-build proof.
+
+Homebrew `4b2e5aa` and Scoop `c06a555` publish the sealed hashes on main and their
+legacy mirrors; public file bytes match local files. Ruby syntax and formula
+validation passed on macOS (Ruby is absent locally); its existing Hardware::CPU
+branch style produces one heuristic warning. UBS on the formula passed with
+zero critical/warning findings. Scoop JSON and its archive identity passed.
+These checks do not claim native Homebrew/Scoop installation. Go proxy `.info`
+points to the exact tagged revision and `.mod` matches the tag. The unchanged
+Nix flake was evaluated for all four platforms at version 0.25.0 using Go 1.26.7
+(`/tmp/bv-release-flake-v0250-platforms-20260912.json`); this is not a Nix build.
+P1 completion, native source-build acceptance and native macOS amd64/Linux arm64
+execution remain outside the completed release proof.
+
+The publication-only documentation diff passes whitespace and progress-JSON
+validation. UBS selected a Bash module for the Markdown/JSON set, scanned zero
+files and exited 2 with a module environment error
+(`/tmp/bv-v0250-publication-docs-ubs-20260912.log`); this is not a clean scan.
+
+The remaining paragraphs retain preparation history. Their pending statements
+describe intermediate checkpoints, not the final published status above.
 
 The `f6e7e899` gate at `/data/tmp/bv-release-gate-20260912T181541Z.wkK2wu`
 passed unit race tests, watched exports, documentation parity and the real WASM

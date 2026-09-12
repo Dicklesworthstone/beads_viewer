@@ -14,6 +14,21 @@ evidence supplements them here.
 
 ## September 12 release preparation
 
+Publication completed at **2026-09-12T19:39:38Z**, tag `v0.25.0`, source
+`87cee25886915ab1d072d807abc234b743899f7c`. GitHub release API reports 14 assets;
+every public digest matches the local sealed set and every draft asset was
+downloaded and compared before publication. The Go proxy identifies the same
+tagged revision. Homebrew `4b2e5aa` and Scoop `c06a555` publish matching hashes.
+The clean gate passed all ten stages in 1833 seconds; package-time archive
+verification passed. Later standalone verification attempts were refused by
+RCH memory-pressure admission, with no local fallback; they do not replace or
+invalidate the completed package verification. Native Linux/macOS/Windows
+binary installer and update checks and packaged-browser journeys passed.
+Detailed retained paths and limits are recorded in `UPGRADE_LOG.md`.
+
+The following paragraphs preserve the preparation history and its intermediate
+failures; pending statements below describe those earlier checkpoints.
+
 Saved claim execution requires br 0.6.0 or newer: the live gate exposed the
 older worker tracker's missing deferral guard. The official 0.6.0 binary passed
 all live tracker cases three times with the race detector. This is a tracker

@@ -53,11 +53,11 @@ scoop install dicklesworthstone/bv
 ```
 
 Homebrew and Scoop select the version in their published manifests. To pin
-v0.24.1, use a verified release archive below. See the [distribution checks](docs/RELEASING.md#native-installation-and-package-stores) for version and checksum details.
+v0.25.0, use a verified release archive below. See the [distribution checks](docs/RELEASING.md#native-installation-and-package-stores) for version and checksum details.
 
 ### Alternative: Direct Download
 
-Pick the archive for your platform from the [latest release page](https://github.com/Dicklesworthstone/beads_viewer/releases/latest). Archives are named `bv_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows), for example `bv_0.23.0_linux_amd64.tar.gz`, `bv_0.23.0_darwin_arm64.tar.gz`, `bv_0.23.0_windows_amd64.zip`, so a downloaded file always says which release it came from. Every release also ships `checksums.txt`; verify before extracting:
+Pick the archive for your platform from the [latest release page](https://github.com/Dicklesworthstone/beads_viewer/releases/latest). Archives are named `bv_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows), for example `bv_0.25.0_linux_amd64.tar.gz`, `bv_0.25.0_darwin_arm64.tar.gz`, `bv_0.25.0_windows_amd64.zip`, so a downloaded file always says which release it came from. Every release also ships `checksums.txt`; verify before extracting:
 
 ```bash
 sha256sum -c --ignore-missing checksums.txt
@@ -71,7 +71,7 @@ Releases up to v0.22.0 used unversioned names (`bv_linux_amd64.tar.gz`); `bv --u
 Prefer Homebrew, Scoop, or a checksum-verified release archive above. If you do pipe the script, pin it to a commit you have read instead of the moving `main` branch:
 
 ```bash
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/03f92509bceb9da31540167c223c10f16c279767/install.sh
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.sh
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.sh" | bash
 ```
 
@@ -82,12 +82,12 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43
 # Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.ps1
 irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.ps1" | iex
 ```
-> **Note:** The pinned installer above downloads the Windows release zip, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses anything that does not verify; no Go toolchain is needed. Pass `-Version v0.24.1` to pin a release or `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`). Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
+> **Note:** The pinned installer above downloads the Windows release zip, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses anything that does not verify; no Go toolchain is needed. Pass `-Version v0.25.0` to pin a release or `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`). Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
 
 For a source build, use `install.ps1` from this checkout (requires Git and Go 1.26+):
 
 ```powershell
-.\install.ps1 -FromSource -Version v0.24.1
+.\install.ps1 -FromSource -Version v0.25.0
 ```
 
 This source path builds a verified checkout of the requested tag with that tag's vendored dependencies, checks the executable's version and Git revision before installation, and retains diagnostics on failure. The pinned installer above uses the same verified source-build path. Selecting an older release tag does not include later, unreleased fixes from this checkout.

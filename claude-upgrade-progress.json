@@ -2,14 +2,12 @@
   "schema_version": "1.0",
   "started": "2026-09-12T00:38:00Z",
   "project": "beads_viewer",
-  "status": "in_progress",
-  "current": "Run the complete clean-source release gate with verified br 0.6.0 on vmi1264463",
+  "status": "completed",
+  "current": "v0.25.0 published; GitHub, Homebrew, Scoop and native binary installer verification complete",
   "working_checkout": "/data/projects/beads_viewer",
   "retained_staging_checkout": "/tmp/bv-release-20260912",
-  "verification_status": "sequential_tests_and_graph_reproduction_passed_final_gate_pending",
-  "blockers": [
-    "Complete clean-source gate remains required; unchanged correlation and live tracker checks with isolated br 0.6.0 each pass three focused repetitions"
-  ],
+  "verification_status": "complete_clean_gate_packaged_artifact_browser_native_binary_and_public_venue_checks_passed",
+  "blockers": [],
   "prepared_fixes": [
     "Correct stale br claim assertion; focused E2E verification passed three times",
     "Add Make targets for unchanged release gate/package/verify; dry run and diff checks passed, remote execution pending",
@@ -19,8 +17,8 @@
   "rust_completed": ["getrandom 0.4.3", "serde_json 1.0.151", "serde/core/derive 1.0.229 with required Syn 3.0.5", "wasm-bindgen 0.2.128 with matching js-sys/futures/test crates", "async-trait 0.1.92", "proc-macro2 1.0.107", "quote 1.0.47", "memchr 2.8.3", "zmij 1.0.23", "bumpalo 3.20.3", "rustversion 1.0.23", "futures core/task/util 0.3.34", "Rust libc 0.2.189", "autocfg 1.5.1", "cc 1.4.5 with shlex 2.0.1/find-msvc-tools 0.1.12"],
   "failed": [],
   "ubs_status": "Full scan completed; exit 1 retains one reviewed shell-test taint false positive and seven paired-lock warnings; no clean scanner exit claimed",
-  "pending": ["Full clean-source release gate", "Five-target packaging", "Publication and native verification"],
+  "pending": [],
   "preserved": ["local path replacements", "pseudo-version pins except SQLite-required google/pprof transition"],
-  "remaining": ["Final full Go tests", "full release gate", "five target builds", "GitHub/Homebrew/Scoop publication and installer verification"],
+  "remaining": [],
   "circuit_breaker": {"consecutive_failures": 0, "total_failures": 2, "triggered": false}
 }

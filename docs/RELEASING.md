@@ -161,6 +161,23 @@ or when that release is superseded; retention/deletion follows maintainer policy
 
 ## Native installation and package stores
 
+### v0.25.0 verification (2026-09-12)
+
+Published at 19:39:38 UTC from `87cee258` after all ten clean-source gate
+stages passed through RCH. Packaging sealed and verified all five archives.
+DSR uploaded 14 draft assets without dispatch; every asset was downloaded and
+compared before publication, and public asset digests matched afterward.
+Homebrew `4b2e5aa` and Scoop `c06a555` publish the verified archive hashes.
+
+Native Linux amd64, macOS arm64 and Windows amd64 passed binary installation,
+capabilities, tiny-project/readiness output, update from 0.24.1, no-update and
+failed-install preservation checks. The actual packaged Linux binary passed
+the desktop/mobile/offline/update browser harness. Go proxy metadata identifies
+the tagged revision; Nix evaluation reports 0.25.0 on all four platforms.
+These checks do not establish a native source build, Homebrew/Scoop installation,
+Nix build, native macOS amd64/Linux arm64 execution, or P1 performance completion.
+`UPGRADE_LOG.md` records the commands, retained artifacts and earlier failures.
+
 Run `tests/scripts/install_native_test.ps1` on native Windows x64 as part of
 release verification. It installs two real published releases into fresh temporary
 directories containing spaces, checks version/capabilities and a tiny Beads
