@@ -284,6 +284,14 @@ Those commits are retained, but are not release qualification. Subsequent RCH
 tests use that base plus explicit overlays, including the now-smaller vendor
 tree. The sweep was asked to hold further release commits/publication.
 
+### Rust zmij 1.0.21 → 1.0.23
+
+The float formatter now selects compressed tables at optimization levels s/z.
+Both actual release profiles (graph s, scorer 3) passed all 234 existing tests
+through RCH in 82.813 seconds. Log `/tmp/bv-upgrade-zmij-tests-20260912.log`,
+base `2acf8f04`, overlay
+`448d7a786dc5d0a6cdecd4516a0e6e6b780ae71bd8cfce88020653dbe92a2505`.
+
 ### Release execution remaining
 
 - [ ] Rust: update getrandom 0.4.3 first and verify removal of obsolete WASI
