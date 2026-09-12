@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0",
+  "started": "2026-09-12T00:38:00Z",
+  "project": "beads_viewer",
+  "status": "in_progress",
+  "current": "github.com/charmbracelet/x/ansi",
+  "completed": [],
+  "failed": [],
+  "pending": [
+    "github.com/charmbracelet/x/ansi",
+    "github.com/charmbracelet/x/xpty",
+    "github.com/lucasb-eyer/go-colorful",
+    "github.com/mattn/go-isatty",
+    "github.com/mattn/go-runewidth",
+    "github.com/rogpeppe/go-internal",
+    "github.com/sahilm/fuzzy",
+    "github.com/yuin/goldmark",
+    "golang.org/x/image",
+    "golang.org/x/net",
+    "golang.org/x/sync",
+    "golang.org/x/sys",
+    "golang.org/x/term",
+    "golang.org/x/text",
+    "modernc.org/gc/v3",
+    "modernc.org/libc",
+    "modernc.org/memory",
+    "modernc.org/sqlite"
+  ],
+  "preserved": ["local path replacements", "pseudo-version pins"],
+  "remaining": ["Rust/WASM inventory", "security audit", "full release gate", "five target builds", "GitHub/Homebrew/Scoop publication and installer verification"],
+  "circuit_breaker": {"consecutive_failures": 0, "total_failures": 0, "triggered": false}
+}

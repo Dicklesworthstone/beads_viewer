@@ -17,7 +17,7 @@ require (
 	github.com/charmbracelet/glamour v1.0.0
 	github.com/charmbracelet/huh v1.0.0
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
-	github.com/charmbracelet/x/ansi v0.11.7
+	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/charmbracelet/x/cellbuf v0.0.15
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/goccy/go-json v0.10.6
