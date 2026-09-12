@@ -65,6 +65,9 @@ the latest tag, including installer changes usable with already released binarie
   A failed construction preserves the last good database, and readers no
   longer lock a partially populated export. On Windows, an open reader may
   still prevent replacement; that failure preserves the prior database.
+- FTS indexing, materialized-view creation and export metadata now each use
+  one transaction. This reduces repeated disk syncs and rolls back the related
+  writes if a later statement fails, without disabling SQLite durability.
 - Source discovery now honors `issues.jsonl`, then `beads.jsonl`, then
   `beads.base.jsonl` before comparing the selected export with SQLite and
   worktree sources. A newer sync snapshot cannot replace current issue state,

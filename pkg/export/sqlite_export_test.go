@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,7 +15,7 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 // makeTestIssue creates a test issue with given parameters.
@@ -165,6 +166,57 @@ func TestSQLiteExportStandaloneReadinessRefresh(t *testing.T) {
 	}
 	if len(child.Dependencies) != 1 || len(missing.Dependencies) != 0 {
 		t.Fatal("export mutated caller dependency slices")
+	}
+}
+
+func TestSQLiteExportMetadataRollsBackFailedInsert(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "metadata-rollback.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if err := CreateSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := InsertMetaValue(db, "sentinel", "preserve me"); err != nil {
+		t.Fatal(err)
+	}
+	// Reject the second new metadata row regardless of Go map iteration
+	// order. ABORT rolls back only that statement, so the caller must roll
+	// back the earlier successful write as part of its own transaction.
+	if _, err := db.Exec(`CREATE TRIGGER reject_second_metadata
+		BEFORE INSERT ON export_meta
+		WHEN (SELECT COUNT(*) FROM export_meta WHERE key <> 'sentinel') >= 1
+		BEGIN
+			SELECT RAISE(ABORT, 'reject second metadata row');
+		END`); err != nil {
+		t.Fatal(err)
+	}
+	exporter := NewSQLiteExporter(nil, nil, nil, nil)
+	exporter.readiness = model.NewReadinessIndex(nil)
+	exporter.readinessAt = time.Date(2026, 9, 12, 0, 0, 0, 0, time.UTC)
+	err = exporter.insertMeta(db)
+	var sqliteErr *sqlite.Error
+	if err == nil || !strings.Contains(err.Error(), "reject second metadata row") || !errors.As(err, &sqliteErr) {
+		t.Fatalf("expected SQLite trigger refusal after the first metadata write, got %v", err)
+	}
+	if db.Stats().InUse != 0 {
+		t.Fatal("failed metadata insertion retained its connection")
+	}
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM export_meta`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("failed metadata insertion left %d rows; want only the original sentinel", count)
+	}
+	var value string
+	if err := db.QueryRow(`SELECT value FROM export_meta WHERE key = 'sentinel'`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "preserve me" {
+		t.Fatalf("existing metadata changed: %q", value)
 	}
 }
 

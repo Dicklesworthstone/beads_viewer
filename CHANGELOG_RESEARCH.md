@@ -43,6 +43,20 @@ source-check results, not a
 published release or proof of native Windows rename behavior. Detailed command
 logs and outstanding release tasks are in `UPGRADE_LOG.md`.
 
+The later `a35fc2a3` full gate passed documentation parity and the actual
+offline WASM rebuild but hit the unchanged 15-second watched-export deadline.
+The log proves the second notification entered database export; it does not
+identify the stall's cause. A retained earlier executable with identical
+SQLite export source made 80 filesystem sync calls for one issue. The candidate
+batches FTS, materialized-view and metadata writes into transactions without
+changing durability pragmas or watch deadlines. All three new rollback
+regressions fail on the earlier implementation and pass ten times each with
+the race detector after batching. The full export race suite, all watched-source
+cases repeated three times, build and vet also pass. The same one-issue trace
+on the remote-built candidate records 40 sync calls, half the original count;
+the single samples are not a latency distribution or an attribution of the
+earlier worker stall. The complete release gate still remains required.
+
 ## September 11 cascade frontier reuse
 
 Follow-up `01383eb6` caches the sorted, deduplicated union of blocking dependents

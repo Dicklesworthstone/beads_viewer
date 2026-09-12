@@ -3,13 +3,12 @@
   "started": "2026-09-12T00:38:00Z",
   "project": "beads_viewer",
   "status": "in_progress",
-  "current": "Correct generated documentation parity and investigate frozen correlation timing before the next complete gate",
+  "current": "Commit verified SQLite batching and run the complete clean-source release gate on vmi1264463",
   "working_checkout": "/data/projects/beads_viewer",
   "retained_staging_checkout": "/tmp/bv-release-20260912",
   "verification_status": "sequential_tests_and_graph_reproduction_passed_final_gate_pending",
   "blockers": [
-    "Complete clean-source gate remains required after generated insights-limit documentation correction",
-    "Older diagnostic worker exceeded the unchanged correlation E2E 15-second limit; current hz3 run is still pending"
+    "Complete clean-source gate remains required after SQLite batching; regressions, export race suite, watched exports repeated three times, build and vet pass"
   ],
   "prepared_fixes": [
     "Correct stale br claim assertion; focused E2E verification passed three times",
@@ -20,7 +19,7 @@
   "rust_completed": ["getrandom 0.4.3", "serde_json 1.0.151", "serde/core/derive 1.0.229 with required Syn 3.0.5", "wasm-bindgen 0.2.128 with matching js-sys/futures/test crates", "async-trait 0.1.92", "proc-macro2 1.0.107", "quote 1.0.47", "memchr 2.8.3", "zmij 1.0.23", "bumpalo 3.20.3", "rustversion 1.0.23", "futures core/task/util 0.3.34", "Rust libc 0.2.189", "autocfg 1.5.1", "cc 1.4.5 with shlex 2.0.1/find-msvc-tools 0.1.12"],
   "failed": [],
   "ubs_status": "Full scan completed; exit 1 retains one reviewed shell-test taint false positive and seven paired-lock warnings; no clean scanner exit claimed",
-  "pending": ["Commit generated documentation correction", "Full clean-source release gate", "Five-target packaging", "Publication and native verification"],
+  "pending": ["Full clean-source release gate", "Five-target packaging", "Publication and native verification"],
   "preserved": ["local path replacements", "pseudo-version pins except SQLite-required google/pprof transition"],
   "remaining": ["Final full Go tests", "full release gate", "five target builds", "GitHub/Homebrew/Scoop publication and installer verification"],
   "circuit_breaker": {"consecutive_failures": 0, "total_failures": 2, "triggered": false}

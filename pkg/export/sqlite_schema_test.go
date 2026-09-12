@@ -20,6 +20,27 @@ func containsString(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
 
+func sqliteSchemaSnapshot(t *testing.T, db *sql.DB) [][4]string {
+	t.Helper()
+	rows, err := db.Query(`SELECT type, name, tbl_name, COALESCE(sql, '') FROM sqlite_schema ORDER BY type, name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var schema [][4]string
+	for rows.Next() {
+		var entry [4]string
+		if err := rows.Scan(&entry[0], &entry[1], &entry[2], &entry[3]); err != nil {
+			t.Fatal(err)
+		}
+		schema = append(schema, entry)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return schema
+}
+
 func TestCreateSchema(t *testing.T) {
 	// Create temp file for test database
 	tmpDir := t.TempDir()
@@ -427,6 +448,43 @@ func TestCreateFTSIndex(t *testing.T) {
 	}
 }
 
+func TestCreateFTSIndexRollsBackFailedRebuild(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "fts-rollback.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	// FTS table creation accepts this external content table, but rebuilding
+	// fails when it tries to read the deliberately absent assignee column.
+	if _, err := db.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, description TEXT, labels TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO issues VALUES ('existing', 'Preserve me', 'Existing description', '[]')`); err != nil {
+		t.Fatal(err)
+	}
+	before := sqliteSchemaSnapshot(t, db)
+	err = CreateFTSIndex(db)
+	var sqliteErr *sqlite.Error
+	if err == nil || !strings.Contains(err.Error(), "populate FTS index:") || !strings.Contains(err.Error(), "assignee") || !errors.As(err, &sqliteErr) {
+		t.Fatalf("expected wrapped SQLite rebuild error for missing assignee, got %v", err)
+	}
+	if db.Stats().InUse != 0 {
+		t.Fatal("failed FTS rebuild retained its connection")
+	}
+	// This includes every FTS shadow table and index, not just issues_fts.
+	if after := sqliteSchemaSnapshot(t, db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("failed FTS rebuild left partial schema: before=%v after=%v", before, after)
+	}
+	var id, title, description, labels string
+	if err := db.QueryRow(`SELECT id, title, description, labels FROM issues`).Scan(&id, &title, &description, &labels); err != nil {
+		t.Fatal(err)
+	}
+	if id != "existing" || title != "Preserve me" || description != "Existing description" || labels != "[]" {
+		t.Fatalf("existing content changed: id=%q title=%q description=%q labels=%q", id, title, description, labels)
+	}
+}
+
 func TestCreateMaterializedViews(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.sqlite3")
@@ -547,6 +605,45 @@ func TestCreateMaterializedViews(t *testing.T) {
 	}
 	if !blockedByIDs.Valid || blockedByIDs.String != "mv-2" {
 		t.Errorf("Unexpected mv-3 blocked_by_ids: valid=%v value=%q", blockedByIDs.Valid, blockedByIDs.String)
+	}
+}
+
+func TestCreateMaterializedViewsRollsBackFailedIndex(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "views-rollback.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if err := CreateSchema(db); err != nil {
+		t.Fatal(err)
+	}
+	// The overview table and its first index can be created. The second
+	// index must fail because its name already belongs to this user table.
+	if _, err := db.Exec(`CREATE TABLE idx_mv_priority (sentinel TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO idx_mv_priority VALUES ('preserve me')`); err != nil {
+		t.Fatal(err)
+	}
+	before := sqliteSchemaSnapshot(t, db)
+	err = CreateMaterializedViews(db)
+	var sqliteErr *sqlite.Error
+	if err == nil || !strings.Contains(err.Error(), "create mv index:") || !strings.Contains(err.Error(), "idx_mv_priority") || !errors.As(err, &sqliteErr) {
+		t.Fatalf("expected wrapped SQLite index-name collision, got %v", err)
+	}
+	if db.Stats().InUse != 0 {
+		t.Fatal("failed materialized-view creation retained its connection")
+	}
+	if after := sqliteSchemaSnapshot(t, db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("failed materialized-view creation left partial schema: before=%v after=%v", before, after)
+	}
+	var sentinel string
+	if err := db.QueryRow(`SELECT sentinel FROM idx_mv_priority`).Scan(&sentinel); err != nil {
+		t.Fatal(err)
+	}
+	if sentinel != "preserve me" {
+		t.Fatalf("existing row changed: %q", sentinel)
 	}
 }
 

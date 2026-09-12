@@ -592,12 +592,23 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 		meta["resolved_issue_ids"] = string(resolved)
 	}
 
+	// Metadata belongs to one snapshot. Commit it together to avoid partial
+	// updates on failure and a separate durable commit for every key.
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin metadata: %w", err)
+	}
+	defer tx.Rollback()
+
 	for key, value := range meta {
-		if err := InsertMetaValue(db, key, value); err != nil {
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO export_meta (key, value) VALUES (?, ?)`, key, value); err != nil {
 			return fmt.Errorf("insert meta %s: %w", key, err)
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit metadata: %w", err)
+	}
 	return nil
 }
 

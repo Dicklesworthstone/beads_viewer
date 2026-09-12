@@ -22,8 +22,12 @@ GitHub Actions must not run. Existing incomplete P1/native evidence remains open
 - [x] Complete UBS rerun and commit v0.25.0 candidate version/changelog (reviewed scanner findings recorded below).
 - [x] Repair both Cass timeout tests using logical time; focused repetitions and package race tests pass.
 - [x] Correct generated insights-limit documentation to match the registered default of 200.
-- [ ] Confirm generated documentation parity on the next clean-source gate.
-- [ ] Resolve or qualify the frozen correlation E2E's unchanged 15-second limit.
+- [x] Confirm generated documentation parity on the next clean-source gate.
+- [x] Qualify the frozen correlation E2E's unchanged 15-second limit on hz3 (full E2E passed at f851d15c).
+- [x] Verify SQLite batching rollback regressions fail against the original code.
+- [x] Verify batching regressions and the full export race suite pass.
+- [x] Measure sync-call reduction and rerun unchanged watched-export cases.
+- [x] Commit the verified SQLite batching change and record release evidence.
 - [ ] Pass all ten stages on a clean complete Git clone through strict RCH.
 - [ ] Tag the exact gated source commit.
 - [ ] Package Linux amd64/arm64, macOS amd64/arm64 and Windows amd64.
@@ -49,6 +53,59 @@ on hz3 uses a verified Cargo cache and passed build/vet plus all unit race
 tests; its source still contains the stale documentation row, so it also
 cannot qualify the corrected release source. The documentation correction
 preserves the existing production behavior and needs a new complete receipt.
+
+The corrected `a35fc2a3` run at
+`/data/tmp/bv-release-gate-20260912T173325Z.XfSKbe` passed formatting,
+build/vet, all unit race tests (228 seconds), documentation parity and the real
+offline graph-WASM rebuild (23 seconds). Its E2E suite failed only the second
+`invalid-sqlite` watched-export publication's unchanged 15-second deadline.
+The watcher had detected the change and entered database export. This does
+not establish the cause of the delay. The known-failed gate was interrupted
+with SIGTERM to its verified owned process group 1018351 during benchmarks;
+its incomplete receipt and logs remain diagnostic, never eligible for release.
+
+A retained pre-batching executable exported a one-issue fixture locally under
+`strace`: 80 export filesystem sync calls, totaling 0.072515 seconds (largest
+0.007058 seconds), in a 0.222-second traced command. Evidence remains at
+`/data/tmp/bv-export-sync-baseline.axx8Xu`. This demonstrates reducible work,
+not the cause of the earlier worker timeout. FTS, materialized-view and
+metadata writes are now prepared as separate transactions, with durability
+pragmas, VACUUM placement and timeout assertions unchanged. Three regression
+tests force real SQLite failures after successful earlier writes and verify
+rollback. Their remote verification and repeated watch tests remain pending.
+The hz3 admission retry was refused under critical disk pressure (RCH-I002,
+exit 103); no local build fallback ran. A worker with adequate space is being
+prepared at vmi1264463 for the remaining qualification.
+
+The three rollback regressions all failed against `a35fc2a3` with only the
+new tests overlaid: metadata left two rows instead of the original sentinel,
+and FTS/materialized-view errors left partial schema. Strict RCH used verified
+Go 1.26.8 on vmi1264463, exit 2 in 73.099 seconds;
+`/tmp/bv-export-batch-negative-vmi126-20260912.log`. The earlier traced remote
+watch attempt was stopped during compilation (verified owned process group
+3248046); it provides no watched-export timing evidence. Both interrupted
+diagnostic runs and their artifacts remain preserved.
+
+The batching candidate passed all three rollback regressions ten times with
+the race detector (5.563 seconds), the full export race suite (62.698 seconds),
+and all six watched-source cases three times under their unchanged deadlines
+(93.027 seconds). Build and vet also passed. Strict RCH returned exit 0 in
+312.909 seconds on vmi1264463; log
+`/tmp/bv-export-batch-candidate-vmi126-20260912.log`, baseline `a35fc2a3`,
+overlay fingerprint `e1f96ebc9cfd499b9b672430c743e961a3760710db048886e2cfb15945c8740e`.
+The remote-built diagnostic executable was copied locally for the same one-issue
+export trace: sync calls fell from 80 to 40. Observed sync time was 0.072515
+versus 0.041586 seconds; these single traced runs are not latency quantiles or
+proof of the original worker stall's cause. Both traces and the comparison
+JSON remain in `/data/tmp/bv-export-sync-baseline.axx8Xu`.
+The full UBS scan of the four changed Go files ran through RCH and reported
+one critical finding, zero warnings and 143 informational items. The finding
+is the already reviewed umask-test taint false positive: the analyzer conflates
+the child's environment-derived mask with the parent's separate literal mask
+argument. The fixed shell program passes the mask and executable as quoted
+positional arguments, and its existing suppression explains this boundary.
+No new critical finding was introduced. UBS exit 1 (Make exit 2) is retained
+in `/tmp/bv-export-batch-ubs-20260912.log`; no clean scanner exit is claimed.
 
 ### github.com/charmbracelet/x/ansi v0.11.7 → v0.11.8
 

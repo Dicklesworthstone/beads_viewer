@@ -190,6 +190,12 @@ func createMetaTable(tx *sql.Tx) error {
 // CreateFTSIndex creates the FTS5 full-text search virtual table.
 // This must be called after issues are inserted.
 func CreateFTSIndex(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin FTS index: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Create FTS5 virtual table for full-text search
 	ftsSQL := `
 		CREATE VIRTUAL TABLE IF NOT EXISTS issues_fts USING fts5(
@@ -203,7 +209,7 @@ func CreateFTSIndex(db *sql.DB) error {
 			tokenize='porter unicode61'
 		)
 	`
-	if _, err := db.Exec(ftsSQL); err != nil {
+	if _, err := tx.Exec(ftsSQL); err != nil {
 		return fmt.Errorf("create FTS5 table: %w", err)
 	}
 
@@ -211,16 +217,27 @@ func CreateFTSIndex(db *sql.DB) error {
 	populateSQL := `
 		INSERT INTO issues_fts(issues_fts) VALUES('rebuild')
 	`
-	if _, err := db.Exec(populateSQL); err != nil {
+	if _, err := tx.Exec(populateSQL); err != nil {
 		return fmt.Errorf("populate FTS index: %w", err)
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit FTS index: %w", err)
+	}
 	return nil
 }
 
 // CreateMaterializedViews creates denormalized views for fast queries.
 // This must be called after all data is inserted.
 func CreateMaterializedViews(db *sql.DB) error {
+	// Publish the overview table and its indexes together, using one durable
+	// commit rather than syncing the database after every DDL statement.
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin materialized views: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Issue overview materialized view - denormalized for fast list queries
 	overviewSQL := `
 		CREATE TABLE IF NOT EXISTS issue_overview_mv AS
@@ -282,7 +299,7 @@ func CreateMaterializedViews(db *sql.DB) error {
 			FROM issues i
 			LEFT JOIN issue_metrics m ON i.id = m.issue_id
 		`
-	if _, err := db.Exec(overviewSQL); err != nil {
+	if _, err := tx.Exec(overviewSQL); err != nil {
 		return fmt.Errorf("create issue_overview_mv: %w", err)
 	}
 
@@ -295,11 +312,14 @@ func CreateMaterializedViews(db *sql.DB) error {
 	}
 
 	for _, sql := range mvIndexes {
-		if _, err := db.Exec(sql); err != nil {
+		if _, err := tx.Exec(sql); err != nil {
 			return fmt.Errorf("create mv index: %w", err)
 		}
 	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit materialized views: %w", err)
+	}
 	return nil
 }
 
