@@ -112,13 +112,20 @@ func (e *SQLiteExporter) Export(outputDir string) error {
 
 	dbPath := filepath.Join(outputDir, "beads.sqlite3")
 
-	// Remove existing database if present
-	if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove existing database: %w", err)
+	// Build a separate snapshot so readers never lock an in-progress export or
+	// observe a partial database. Construction or publication failures preserve
+	// the previous snapshot.
+	temporaryDir, err := os.MkdirTemp(outputDir, ".beads-*")
+	if err != nil {
+		return fmt.Errorf("create temporary database directory: %w", err)
 	}
+	defer os.RemoveAll(temporaryDir)
+	// SQLite applies its normal creation mode and the caller's umask. The
+	// private parent keeps the unfinished database and journal inaccessible.
+	temporaryPath := filepath.Join(temporaryDir, "beads.sqlite3")
 
 	// Open database
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", temporaryPath)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -193,6 +200,9 @@ func (e *SQLiteExporter) Export(outputDir string) error {
 		return fmt.Errorf("close database: %w", err)
 	}
 	dbClosed = true
+	if err := os.Rename(temporaryPath, dbPath); err != nil {
+		return fmt.Errorf("publish database: %w", err)
+	}
 
 	// Write robot JSON outputs
 	if e.Config.IncludeRobotOutputs {

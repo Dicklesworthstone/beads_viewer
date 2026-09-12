@@ -1,10 +1,14 @@
 package export
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -161,6 +165,93 @@ func TestSQLiteExportStandaloneReadinessRefresh(t *testing.T) {
 	}
 	if len(child.Dependencies) != 1 || len(missing.Dependencies) != 0 {
 		t.Fatal("export mutated caller dependency slices")
+	}
+}
+
+func TestSQLiteExportFailedRebuildPreservesPublishedDatabase(t *testing.T) {
+	output := t.TempDir()
+	issue := makeTestIssue("published", "Original", model.StatusOpen, 1, model.TypeTask)
+	exporter := NewSQLiteExporter([]*model.Issue{issue}, nil, nil, nil)
+	if err := exporter.Export(output); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(output, "beads.sqlite3")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real primary-key violation fails after schema creation and partial
+	// inserts. The previously published snapshot must remain byte-for-byte intact.
+	broken := NewSQLiteExporter([]*model.Issue{issue, issue}, nil, nil, nil)
+	if err := broken.Export(output); err == nil || !strings.Contains(err.Error(), "UNIQUE constraint failed: issues.id") {
+		t.Fatalf("expected duplicate issue primary-key failure, got %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("failed rebuild changed published database: %v", err)
+	}
+	issue.Title = "Rebuilt"
+	if err := exporter.Export(output); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var title string
+	if err := db.QueryRow(`SELECT title FROM issues WHERE id='published'`).Scan(&title); err != nil || title != "Rebuilt" {
+		t.Fatalf("successful rebuild not published: title=%q err=%v", title, err)
+	}
+	remaining, err := filepath.Glob(filepath.Join(output, ".beads-*"))
+	if err != nil || len(remaining) != 0 {
+		t.Fatalf("temporary databases remain: %v err=%v", remaining, err)
+	}
+}
+
+func TestSQLiteExportRespectsUmask(t *testing.T) {
+	const directoryEnv = "BV_TEST_EXPORT_UMASK_DIR"
+	const maskEnv = "BV_TEST_EXPORT_UMASK"
+	if directory := os.Getenv(directoryEnv); directory != "" {
+		mask := os.Getenv(maskEnv)
+		want := os.FileMode(0644)
+		if mask == "077" {
+			want = 0600
+		} else if mask != "022" {
+			t.Fatalf("unsupported test umask %q", mask)
+		}
+		issue := makeTestIssue("private", "Private issue", model.StatusOpen, 1, model.TypeTask)
+		exporter := NewSQLiteExporter([]*model.Issue{issue}, nil, nil, nil)
+		for range 2 {
+			if err := exporter.Export(directory); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(filepath.Join(directory, "beads.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode().Perm(); got != want {
+				t.Fatalf("database mode under umask %s = %04o, want %04o", mask, got, want)
+			}
+		}
+		return
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix umask semantics")
+	}
+	for _, mask := range []string{"077", "022"} {
+		t.Run(mask, func(t *testing.T) {
+			directory := t.TempDir()
+			if err := os.Chmod(directory, 0755); err != nil {
+				t.Fatal(err)
+			}
+			// Change the mask only in a subprocess, never in the concurrent test runner.
+			command := exec.Command("sh", "-c", `umask "$1"; shift; exec "$@"`, "sh", mask, os.Args[0], "-test.run=^TestSQLiteExportRespectsUmask$")
+			command.Env = append(os.Environ(), directoryEnv+"="+directory, maskEnv+"="+mask)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("umask %s export failed: %v\n%s", mask, err, output)
+			}
+		})
 	}
 }
 
