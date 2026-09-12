@@ -304,8 +304,9 @@ exit /b %errorlevel%
         $env:BV_TEST_SOURCE_BINARY = $previousSourceBinary
     }
     $unchanged = (Get-FileHash $sourceBinary -Algorithm SHA256).Hash -ceq $goodHash
-    if ($result.ExitCode -eq 0 -or -not $unchanged) {
-        $failures += "controlled source version expected refusal and preserved install; exit=$($result.ExitCode), preserved=$unchanged"
+    $versionRefused = $result.Output.Contains("Downloaded binary reports bv $PreviousVersion, expected $Version; existing installation was not changed")
+    if ($result.ExitCode -eq 0 -or -not $unchanged -or -not $versionRefused) {
+        $failures += "controlled source version expected version-mismatch refusal and preserved install; exit=$($result.ExitCode), preserved=$unchanged, versionRefused=$versionRefused"
     } else {
         Assert-Version 'preserved-source-version' $sourceBinary $Version
         Write-Host 'PASS controlled wrong-version source output refused and existing installation preserved'
