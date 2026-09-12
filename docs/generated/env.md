@@ -14,7 +14,7 @@
 | `BV_FRESHNESS_STALE_S` | Snapshot staleness critical threshold (seconds). | `120` |
 | `BV_FRESHNESS_WARN_S` | Snapshot staleness warning threshold (seconds). | `30` |
 | `BV_HEARTBEAT_INTERVAL_S` | Background worker heartbeat interval (seconds). | `5` |
-| `BV_INSIGHTS_MAP_LIMIT` | Cap on the number of entries in each `--robot-insights` metric map. | (all) |
+| `BV_INSIGHTS_MAP_LIMIT` | Positive entry limit for each `--robot-insights` metric map; zero or invalid values use the default. | `200` |
 | `BV_MAX_LINE_SIZE_MB` | Max JSONL line size in MB (lines larger than this are skipped with a warning). Applies to the TUI, the background worker, and robot loads. | `10` |
 | `BV_METRICS` | Set to `0` to disable internal timing metrics collection (`--robot-metrics`). | (enabled) |
 | `BV_NO_BROWSER` | Any value: never open a browser after exports or deployments. | (unset) |

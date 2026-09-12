@@ -19,7 +19,11 @@ GitHub Actions must not run. Existing incomplete P1/native evidence remains open
 - [x] Run Go vulnerability and RustSec/registry audits.
 - [x] Rebuild the embedded WASM pair and verify independent reproduction.
 - [x] Repair the two final race-suite timing failures; verify affected packages.
-- [ ] Complete UBS rerun and commit v0.25.0 candidate version/changelog.
+- [x] Complete UBS rerun and commit v0.25.0 candidate version/changelog (reviewed scanner findings recorded below).
+- [x] Repair both Cass timeout tests using logical time; focused repetitions and package race tests pass.
+- [x] Correct generated insights-limit documentation to match the registered default of 200.
+- [ ] Confirm generated documentation parity on the next clean-source gate.
+- [ ] Resolve or qualify the frozen correlation E2E's unchanged 15-second limit.
 - [ ] Pass all ten stages on a clean complete Git clone through strict RCH.
 - [ ] Tag the exact gated source commit.
 - [ ] Package Linux amd64/arm64, macOS amd64/arm64 and Windows amd64.
@@ -34,6 +38,17 @@ GitHub Actions must not run. Existing incomplete P1/native evidence remains open
 - [ ] Run native Windows installer, upgrade and failure-preservation checks.
 - [ ] Verify Go proxy and Nix version identity.
 - [ ] Record venue/native evidence and close bv-8tym only after completion.
+
+The diagnostic gate on `b218b119` at
+`/data/tmp/bv-release-gate-20260912T165140Z.QtxK0l` failed the Cass timeout
+test (repaired in `f851d15c`), the frozen correlation E2E timing assertion
+(21.369 seconds against 15 seconds), generated environment documentation
+parity, and the graph rebuild because that worker lacked its configured Cargo
+registry cache. These results do not authorize packaging. The `f851d15c` run
+on hz3 uses a verified Cargo cache and passed build/vet plus all unit race
+tests; its source still contains the stale documentation row, so it also
+cannot qualify the corrected release source. The documentation correction
+preserves the existing production behavior and needs a new complete receipt.
 
 ### github.com/charmbracelet/x/ansi v0.11.7 → v0.11.8
 
