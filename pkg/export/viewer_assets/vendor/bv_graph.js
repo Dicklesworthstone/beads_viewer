@@ -78,16 +78,6 @@ export class DiGraph {
         return ret;
     }
     /**
-     * Compute exact betweenness centrality using Brandes' algorithm.
-     * Returns array of scores in node index order.
-     * Complexity: O(V*E) - use betweenness_approx for large graphs.
-     * @returns {any}
-     */
-    betweenness() {
-        const ret = wasm.digraph_betweenness(this.__wbg_ptr);
-        return ret;
-    }
-    /**
      * Compute approximate betweenness centrality using sampling.
      * Returns array of scores in node index order.
      * Error: O(1/sqrt(k)) - with k=100, ~10% error in ranking.
@@ -96,6 +86,16 @@ export class DiGraph {
      */
     betweennessApprox(sample_size) {
         const ret = wasm.digraph_betweennessApprox(this.__wbg_ptr, sample_size);
+        return ret;
+    }
+    /**
+     * Compute exact betweenness centrality using Brandes' algorithm.
+     * Returns array of scores in node index order.
+     * Complexity: O(V*E) - use betweenness_approx for large graphs.
+     * @returns {any}
+     */
+    betweenness() {
+        const ret = wasm.digraph_betweenness(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -128,6 +128,14 @@ export class DiGraph {
         return ret;
     }
     /**
+     * Compute coverage set with default limit of 10.
+     * @returns {any}
+     */
+    coverageSetDefault() {
+        const ret = wasm.digraph_coverageSetDefault(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * Compute coverage set (greedy vertex cover).
      * Finds nodes that collectively "cover" all edges in the graph.
      * Returns JSON: { items: [{node, edges_added}], edges_covered, total_edges, coverage_ratio }
@@ -136,14 +144,6 @@ export class DiGraph {
      */
     coverageSet(limit) {
         const ret = wasm.digraph_coverageSet(this.__wbg_ptr, limit);
-        return ret;
-    }
-    /**
-     * Compute coverage set with default limit of 10.
-     * @returns {any}
-     */
-    coverageSetDefault() {
-        const ret = wasm.digraph_coverageSetDefault(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -227,6 +227,14 @@ export class DiGraph {
         return ret >>> 0;
     }
     /**
+     * Compute eigenvector centrality with default parameters (50 iterations).
+     * @returns {any}
+     */
+    eigenvectorDefault() {
+        const ret = wasm.digraph_eigenvectorDefault(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * Compute eigenvector centrality using power iteration.
      * Returns array of scores in node index order, normalized to unit length.
      * @param {number} iterations
@@ -234,14 +242,6 @@ export class DiGraph {
      */
     eigenvector(iterations) {
         const ret = wasm.digraph_eigenvector(this.__wbg_ptr, iterations);
-        return ret;
-    }
-    /**
-     * Compute eigenvector centrality with default parameters (50 iterations).
-     * @returns {any}
-     */
-    eigenvectorDefault() {
-        const ret = wasm.digraph_eigenvectorDefault(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -277,6 +277,14 @@ export class DiGraph {
         return ret !== 0;
     }
     /**
+     * Compute HITS with default parameters (tolerance=1e-6, max_iterations=100).
+     * @returns {any}
+     */
+    hitsDefault() {
+        const ret = wasm.digraph_hitsDefault(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * Compute HITS hub and authority scores.
      * Returns JSON object: { hubs: number[], authorities: number[], iterations: number }
      * @param {number} tolerance
@@ -285,14 +293,6 @@ export class DiGraph {
      */
     hits(tolerance, max_iterations) {
         const ret = wasm.digraph_hits(this.__wbg_ptr, tolerance, max_iterations);
-        return ret;
-    }
-    /**
-     * Compute HITS with default parameters (tolerance=1e-6, max_iterations=100).
-     * @returns {any}
-     */
-    hitsDefault() {
-        const ret = wasm.digraph_hitsDefault(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -321,6 +321,14 @@ export class DiGraph {
         return ret !== 0;
     }
     /**
+     * Find k longest paths with default k=5.
+     * @returns {any}
+     */
+    kCriticalPathsDefault() {
+        const ret = wasm.digraph_kCriticalPathsDefault(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * Find k longest paths through the DAG.
      * Returns JSON: { paths: [{nodes, length}], total_nodes, max_length }
      * @param {number} k
@@ -328,14 +336,6 @@ export class DiGraph {
      */
     kCriticalPaths(k) {
         const ret = wasm.digraph_kCriticalPaths(this.__wbg_ptr, k);
-        return ret;
-    }
-    /**
-     * Find k longest paths with default k=5.
-     * @returns {any}
-     */
-    kCriticalPathsDefault() {
-        const ret = wasm.digraph_kCriticalPathsDefault(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -374,7 +374,7 @@ export class DiGraph {
         const ret = wasm.digraph_nodeId(this.__wbg_ptr, idx);
         let v1;
         if (ret[0] !== 0) {
-            v1 = getStringFromWasm0(ret[0], ret[1]).slice();
+            v1 = getStringFromWasm0(ret[0], ret[1]);
             wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         }
         return v1;
@@ -442,6 +442,14 @@ export class DiGraph {
         return ret;
     }
     /**
+     * Compute PageRank with default parameters (damping=0.85, max_iterations=100).
+     * @returns {any}
+     */
+    pagerankDefault() {
+        const ret = wasm.digraph_pagerankDefault(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * Compute PageRank scores for all nodes.
      * Returns array of scores in node index order.
      * @param {number} damping
@@ -450,14 +458,6 @@ export class DiGraph {
      */
     pagerank(damping, max_iterations) {
         const ret = wasm.digraph_pagerank(this.__wbg_ptr, damping, max_iterations);
-        return ret;
-    }
-    /**
-     * Compute PageRank with default parameters (damping=0.85, max_iterations=100).
-     * @returns {any}
-     */
-    pagerankDefault() {
-        const ret = wasm.digraph_pagerankDefault(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -601,6 +601,18 @@ export class DiGraph {
         return ret;
     }
     /**
+     * TopK Set with default k=5.
+     * closed_set is an array of bytes where non-zero means closed.
+     * @param {Uint8Array} closed_set
+     * @returns {any}
+     */
+    topkSetDefault(closed_set) {
+        const ptr0 = passArray8ToWasm0(closed_set, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.digraph_topkSetDefault(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
      * Greedy submodular selection for maximum unlock.
      * Finds k issues that, when completed, maximize total downstream unlocks.
      * Returns JSON: { items: [{node, marginal_gain, unblocked_ids}], total_gain, open_nodes }
@@ -618,18 +630,6 @@ export class DiGraph {
         var ptr1 = isLikeNone(candidate_set) ? 0 : passArray8ToWasm0(candidate_set, wasm.__wbindgen_malloc);
         var len1 = WASM_VECTOR_LEN;
         const ret = wasm.digraph_topkSet(this.__wbg_ptr, ptr0, len0, k, ptr1, len1);
-        return ret;
-    }
-    /**
-     * TopK Set with default k=5.
-     * closed_set is an array of bytes where non-zero means closed.
-     * @param {Uint8Array} closed_set
-     * @returns {any}
-     */
-    topkSetDefault(closed_set) {
-        const ptr0 = passArray8ToWasm0(closed_set, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.digraph_topkSetDefault(this.__wbg_ptr, ptr0, len0);
         return ret;
     }
     /**
@@ -664,20 +664,6 @@ export class DiGraph {
         return ret;
     }
     /**
-     * What-if analysis: compute cascade impact of closing a node.
-     * Returns JSON with direct_unblocks, transitive_unblocks, unblocked_ids, cascade_ids, parallel_gain.
-     * closed_set is an array of bytes where non-zero means closed.
-     * @param {number} node
-     * @param {Uint8Array} closed_set
-     * @returns {any}
-     */
-    whatIfClose(node, closed_set) {
-        const ptr0 = passArray8ToWasm0(closed_set, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.digraph_whatIfClose(this.__wbg_ptr, node, ptr0, len0);
-        return ret;
-    }
-    /**
      * Batch what-if: compute impact of closing multiple nodes together.
      * Returns JSON with combined cascade impact.
      * @param {Uint32Array} nodes
@@ -690,6 +676,20 @@ export class DiGraph {
         const ptr1 = passArray8ToWasm0(closed_set, wasm.__wbindgen_malloc);
         const len1 = WASM_VECTOR_LEN;
         const ret = wasm.digraph_whatIfCloseBatch(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        return ret;
+    }
+    /**
+     * What-if analysis: compute cascade impact of closing a node.
+     * Returns JSON with direct_unblocks, transitive_unblocks, unblocked_ids, cascade_ids, parallel_gain.
+     * closed_set is an array of bytes where non-zero means closed.
+     * @param {number} node
+     * @param {Uint8Array} closed_set
+     * @returns {any}
+     */
+    whatIfClose(node, closed_set) {
+        const ptr0 = passArray8ToWasm0(closed_set, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.digraph_whatIfClose(this.__wbg_ptr, node, ptr0, len0);
         return ret;
     }
     /**
@@ -731,14 +731,14 @@ export function version() {
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
-        __wbg_Error_bce6d499ff0a4aff: function(arg0, arg1) {
+        __wbg_Error_67e7344beaa85059: function(arg0, arg1) {
             const ret = Error(getStringFromWasm0(arg0, arg1));
             return ret;
         },
-        __wbg___wbindgen_throw_9c31b086c2b26051: function(arg0, arg1) {
+        __wbg___wbindgen_throw_5d9e815e6fdf150f: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
-        __wbg_error_a6fa202b58aa1cd3: function(arg0, arg1) {
+        __wbg_error_757e9472f8410341: function(arg0, arg1) {
             let deferred0_0;
             let deferred0_1;
             try {
@@ -749,26 +749,26 @@ function __wbg_get_imports() {
                 wasm.__wbindgen_free(deferred0_0, deferred0_1, 1);
             }
         },
-        __wbg_getRandomValues_76dfc69825c9c552: function() { return handleError(function (arg0, arg1) {
+        __wbg_getRandomValues_436a51d0629d84e1: function() { return handleError(function (arg0, arg1) {
             globalThis.crypto.getRandomValues(getArrayU8FromWasm0(arg0, arg1));
         }, arguments); },
-        __wbg_new_02d162bc6cf02f60: function() {
-            const ret = new Object();
-            return ret;
-        },
         __wbg_new_227d7c05414eb861: function() {
             const ret = new Error();
             return ret;
         },
-        __wbg_new_310879b66b6e95e1: function() {
+        __wbg_new_bebc3f4757acf305: function() {
+            const ret = new Object();
+            return ret;
+        },
+        __wbg_new_ffa92086ea89f79c: function() {
             const ret = new Array();
             return ret;
         },
+        __wbg_set_13d25b81ab403f5e: function(arg0, arg1, arg2) {
+            arg0[arg1 >>> 0] = arg2;
+        },
         __wbg_set_6be42768c690e380: function(arg0, arg1, arg2) {
             arg0[arg1] = arg2;
-        },
-        __wbg_set_78ea6a19f4818587: function(arg0, arg1, arg2) {
-            arg0[arg1 >>> 0] = arg2;
         },
         __wbg_stack_3b0d974bbf31e44f: function(arg0, arg1) {
             const ret = arg1.stack;
@@ -777,17 +777,17 @@ function __wbg_get_imports() {
             getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
         },
-        __wbindgen_cast_0000000000000001: function(arg0) {
+        __wbindgen_generic_0000000000000001: function(arg0) {
             // Cast intrinsic for `F64 -> Externref`.
             const ret = arg0;
             return ret;
         },
-        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
+        __wbindgen_generic_0000000000000002: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
             return ret;
         },
-        __wbindgen_cast_0000000000000003: function(arg0) {
+        __wbindgen_generic_0000000000000003: function(arg0) {
             // Cast intrinsic for `U64 -> Externref`.
             const ret = BigInt.asUintN(64, arg0);
             return ret;
@@ -964,11 +964,15 @@ function __wbg_finalize_init(instance, module) {
 
 async function __wbg_load(module, imports) {
     if (typeof Response === 'function' && module instanceof Response) {
+        if (!module.ok) {
+            throw new Error(`failed to fetch Wasm: ${module.status} ${module.statusText} fetching '${module.url}'`);
+        }
+
         if (typeof WebAssembly.instantiateStreaming === 'function') {
             try {
                 return await WebAssembly.instantiateStreaming(module, imports);
             } catch (e) {
-                const validResponse = module.ok && expectedResponseType(module.type);
+                const validResponse = expectedResponseType(module.type);
 
                 if (validResponse && module.headers.get('Content-Type') !== 'application/wasm') {
                     console.warn("`WebAssembly.instantiateStreaming` failed because your server does not serve Wasm with `application/wasm` MIME type. Falling back to `WebAssembly.instantiate` which is slower. Original error:\n", e);
