@@ -49,8 +49,8 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Go Modules** in this project, NEVER any other package manager.
 
-- **Version:** Go 1.25+ (check `go.mod` for exact version)
-- **Toolchain:** `go1.25.5` (see `go.mod`)
+- **Version:** Go 1.26+ (check `go.mod` for exact version)
+- **Toolchain:** `go1.26.8` (see `go.mod`)
 - **Dependency versions:** Managed via `go.mod` / `go.sum`
 - **Lockfile:** `go.sum` (auto-managed by `go mod`)
 
@@ -258,7 +258,7 @@ Analyzes Beads issue graphs to produce actionable triage recommendations, parall
 
 ```
 beads_viewer/
-├── go.mod                          # Module root (Go 1.25+)
+├── go.mod                          # Module root (Go 1.26+)
 ├── cmd/bv/                         # CLI entry point (Cobra/pflag and robot registry)
 ├── pkg/
 │   ├── analysis/                   # Graph metrics, triage, planning, priority, forecasting

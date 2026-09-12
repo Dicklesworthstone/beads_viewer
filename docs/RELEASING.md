@@ -27,6 +27,10 @@ receipt ineligible. The gate also requires Python 3 for receipt and archive
 verification and GoReleaser for the packaging regression tests. Race tests
 enable CGO; packaged binaries use `CGO_ENABLED=0`.
 
+The complete E2E stage has a 30-minute aggregate timeout, including the full
+600-query search evaluation. This replaces Go's default ten-minute suite limit;
+per-test assertions, evaluation cases and benchmark thresholds remain unchanged.
+
 Each run prints a fresh directory under `/tmp` containing `gate.log` and
 `receipt.json`. Set `RELEASE_GATE_OUTPUT_DIR` to another existing directory
 outside the checkout. Outputs never enter the source hash. A failed stage

@@ -42,6 +42,11 @@ the latest tag, including installer changes usable with already released binarie
 
 ### Performance verification and documentation
 
+- Failed CLI measurements now report sample identity, elapsed command time,
+  and cancellation state captured before diagnostic files are written. Slow
+  artifact writes cannot retroactively make a command failure look like a
+  timeout ([diagnostics](https://github.com/Dicklesworthstone/beads_viewer/commit/3bc5c15c481b299a4fbec20ca9f1ab513dd1f096)).
+  The original incomplete P1 matrix remains open.
 - The September 11 source measurement passed all 144 current UI cohorts at
   the original 50 ms p99 and delivered-handler limits; the worst cohort p99
   was 46.472 ms. The overall matrix failed when a baseline process was killed
@@ -56,6 +61,10 @@ the latest tag, including installer changes usable with already released binarie
 
 ### Workflow data and static dashboards
 
+- SQLite dashboard rebuilds construct a private database before publishing it.
+  A failed construction preserves the last good database, and readers no
+  longer lock a partially populated export. On Windows, an open reader may
+  still prevent replacement; that failure preserves the prior database.
 - Source discovery now honors `issues.jsonl`, then `beads.jsonl`, then
   `beads.base.jsonl` before comparing the selected export with SQLite and
   worktree sources. A newer sync snapshot cannot replace current issue state,
@@ -157,6 +166,15 @@ the latest tag, including installer changes usable with already released binarie
   dependency and closure context (`bv-xbvo.13`;
   [forecast scope repair](https://github.com/Dicklesworthstone/beads_viewer/commit/9de473f47d66ec36c2103af928915f9fef5204b2)).
 
+### Build requirements
+
+- Source builds now require Go 1.26 or newer, with Go 1.26.8 selected by
+  `go.mod`. Both source installers enforce the same minimum. The Nix flake
+  moves to the 26.05 package set, which supplies Go 1.26.7.
+- Terminal rendering, Unicode normalization, HTML parsing and graph-image
+  dependencies are updated. The four local dependency patches remain in place;
+  [upgrade notes](UPGRADE_LOG.md) record the individual transitions and tests.
+
 ### Vendored dependency patches
 
 - The four locally patched dependencies (`chroma`, `glamour`, `reflow`,
@@ -231,7 +249,7 @@ the latest tag, including installer changes usable with already released binarie
   `diagnostic_top_pick` and metadata-free claim refusal instead of an obsolete
   top-level ID ([`3ca2176f`](https://github.com/Dicklesworthstone/beads_viewer/commit/3ca2176f11cc6106be452815e03fc4164b581761)).
   This fixes installer behavior and its test; it does not change robot output.
-- README's Windows commands pin that installer revision
+- README's Windows commands initially pinned that installer revision
   ([`87756815`](https://github.com/Dicklesworthstone/beads_viewer/commit/87756815cb55e8450cc559a74b29677327f830b6)).
   The pinned source option uses a verified tagged checkout and vendored
   dependencies; the stale reference to its older `go install` path is corrected.

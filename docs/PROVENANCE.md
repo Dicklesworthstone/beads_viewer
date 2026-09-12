@@ -117,7 +117,7 @@ rebuilds `bv_graph.js` and `bv_graph_bg.wasm` together. The reviewed pipeline is
 | Target | `wasm32-unknown-unknown`, required in `rust-toolchain.toml` |
 | Dependencies/features | `Cargo.lock`, default features, `--locked --offline` |
 | Cargo profile | release, size optimization, LTO, one codegen unit, abort on panic |
-| Bindgen | 0.2.121, Linux musl executable; `--target web --out-name bv_graph` |
+| Bindgen | 0.2.128, Linux musl executable; `--target web --out-name bv_graph` |
 | Binaryen | 132, Linux x86-64 executable; exactly `wasm-opt -Os` |
 | Source paths | Project and Cargo paths remapped; reported and resolved Rust sysroots remapped to `/rust-toolchain`, using unit-separated `CARGO_ENCODED_RUSTFLAGS` to preserve spaces |
 
@@ -134,8 +134,8 @@ build itself makes no network requests. Downloads must use the User-Agent
 were fetched from immutable release URLs and checked against GitHub's release
 digests:
 
-- [wasm-bindgen 0.2.121 Linux musl](https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.121/wasm-bindgen-0.2.121-x86_64-unknown-linux-musl.tar.gz):
-  `3039f38f65fe237b640cf06a140c919ca8d717ec5012146d145d3f27bb4d6b28`.
+- [wasm-bindgen 0.2.128 Linux musl](https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.128/wasm-bindgen-0.2.128-x86_64-unknown-linux-musl.tar.gz):
+  `b51f0208fdff83515a787bd8ab9ac5865ed84dabb66d0c709957bb59793c645f`.
 - [Binaryen 132 Linux x86-64](https://github.com/WebAssembly/binaryen/releases/download/version_132/binaryen-version_132-x86_64-linux.tar.gz):
   `195ddc94f9bc89f45abdabb0b9eea86023d727ba90eac8b35b80f2544fc30572`.
 

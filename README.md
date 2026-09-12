@@ -84,7 +84,7 @@ irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/80450e345e
 ```
 > **Note:** The pinned installer above downloads the Windows release zip, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses anything that does not verify; no Go toolchain is needed. Pass `-Version v0.24.1` to pin a release or `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`). Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
 
-For a source build, use `install.ps1` from this checkout (requires Git and Go 1.25+):
+For a source build, use `install.ps1` from this checkout (requires Git and Go 1.26+):
 
 ```powershell
 .\install.ps1 -FromSource -Version v0.24.1
@@ -4018,7 +4018,7 @@ irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/80450e345e
 - For best display, use [Windows Terminal](https://aka.ms/terminal) with a [Nerd Font](https://www.nerdfonts.com/)
 
 ### Build from Source
-Requires Go 1.25+ (see `go.mod`).
+Requires Go 1.26+ (see `go.mod`).
 
 ```bash
 git clone https://github.com/Dicklesworthstone/beads_viewer.git

@@ -10,6 +10,24 @@ checked-in Beads history, retained release receipts, then existing release
 documentation. Public source links belong in the changelog; local execution
 evidence supplements them here.
 
+## September 12 release preparation
+
+Reviewed the follow-up history through `42a208ab` against the Unreleased entry.
+The Windows installer paragraph now describes its first pin historically;
+the current README uses `80450e34`, as stated in the preceding paragraph.
+Commit `3bc5c15c` captures command cancellation immediately after the child
+returns, before writing diagnostic artifacts. It also reports sample identity
+and elapsed time. This improves failed-matrix evidence; it neither attributes
+the original stall nor completes P1 acceptance.
+
+The ANSI 0.11.8 candidate is committed but vendor regeneration and final release
+qualification remain pending. A newly added SQLite preservation regression
+fails against the old exporter and passes three times with private construction
+and rename publication. The selected existing watch and claim E2E cases also
+pass three times through strict RCH. These are working-tree results, not a
+published release or proof of native Windows rename behavior. Detailed command
+logs and outstanding release tasks are in `UPGRADE_LOG.md`.
+
 ## September 11 cascade frontier reuse
 
 Follow-up `01383eb6` caches the sorted, deduplicated union of blocking dependents

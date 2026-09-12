@@ -3,30 +3,24 @@
   "started": "2026-09-12T00:38:00Z",
   "project": "beads_viewer",
   "status": "in_progress",
-  "current": "github.com/charmbracelet/x/ansi",
-  "completed": [],
-  "failed": [],
-  "pending": [
-    "github.com/charmbracelet/x/ansi",
-    "github.com/charmbracelet/x/xpty",
-    "github.com/lucasb-eyer/go-colorful",
-    "github.com/mattn/go-isatty",
-    "github.com/mattn/go-runewidth",
-    "github.com/rogpeppe/go-internal",
-    "github.com/sahilm/fuzzy",
-    "github.com/yuin/goldmark",
-    "golang.org/x/image",
-    "golang.org/x/net",
-    "golang.org/x/sync",
-    "golang.org/x/sys",
-    "golang.org/x/term",
-    "golang.org/x/text",
-    "modernc.org/gc/v3",
-    "modernc.org/libc",
-    "modernc.org/memory",
-    "modernc.org/sqlite"
+  "current": "Rust memchr 2.8.3 release-profile tests",
+  "working_checkout": "/data/projects/beads_viewer",
+  "retained_staging_checkout": "/tmp/bv-release-20260912",
+  "verification_status": "sequential_dependency_tests_in_progress_final_gate_pending",
+  "blockers": [
+    "Initial full suite failed; identified export/assertion fixes pass focused tests, final full suite remains required",
+    "Required UBS runner has no temporary-file retention option under the user's no-deletion rule"
   ],
-  "preserved": ["local path replacements", "pseudo-version pins"],
-  "remaining": ["Rust/WASM inventory", "security audit", "full release gate", "five target builds", "GitHub/Homebrew/Scoop publication and installer verification"],
-  "circuit_breaker": {"consecutive_failures": 0, "total_failures": 0, "triggered": false}
+  "prepared_fixes": [
+    "Correct stale br claim assertion; focused E2E verification passed three times",
+    "Add Make targets for unchanged release gate/package/verify; dry run and diff checks passed, remote execution pending",
+    "Build SQLite snapshots privately before replacement; old-code negative control fails, regression and watch cases pass three times; build/vet and full UI/export suites pass"
+  ],
+  "completed": ["github.com/charmbracelet/x/ansi v0.11.8", "github.com/lucasb-eyer/go-colorful v1.4.1", "github.com/mattn/go-isatty v0.0.24", "github.com/mattn/go-runewidth v0.0.30", "github.com/sahilm/fuzzy v0.1.3", "github.com/yuin/goldmark v1.8.6", "Go 1.26.8 (language floor 1.26.0)", "golang.org/x/sys v0.48.0", "golang.org/x/sync v0.23.0", "golang.org/x/term v0.46.0", "golang.org/x/text v0.42.0", "golang.org/x/image v0.46.0", "golang.org/x/net v0.59.0", "github.com/charmbracelet/x/xpty v0.1.4", "github.com/rogpeppe/go-internal v1.16.0", "modernc.org/gc/v3 v3.1.5", "modernc.org/sqlite v1.58.0 + libc v1.75.6 + memory v1.12.1"],
+  "rust_completed": ["getrandom 0.4.3", "serde_json 1.0.151", "serde/core/derive 1.0.229 with required Syn 3.0.5", "wasm-bindgen 0.2.128 with matching js-sys/futures/test crates", "async-trait 0.1.92", "proc-macro2 1.0.107", "quote 1.0.47"],
+  "failed": [],
+  "pending": ["Rust/WASM dependency transitions listed in UPGRADE_LOG.md"],
+  "preserved": ["local path replacements", "pseudo-version pins except SQLite-required google/pprof transition"],
+  "remaining": ["Final Go vendor refresh and full tests", "Rust/WASM updates and paired embedded artifact regeneration", "security audit", "full release gate", "five target builds", "GitHub/Homebrew/Scoop publication and installer verification"],
+  "circuit_breaker": {"consecutive_failures": 0, "total_failures": 1, "triggered": false}
 }
