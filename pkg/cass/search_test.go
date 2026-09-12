@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -285,68 +286,98 @@ func TestSearcher_PartialJSON(t *testing.T) {
 }
 
 func TestSearcher_Timeout(t *testing.T) {
-	d := NewDetector()
-	d.lookPath = func(name string) (string, error) {
-		return "/usr/local/bin/cass", nil
-	}
-	d.runCommand = func(ctx context.Context, name string, args ...string) (int, error) {
-		return 0, nil
-	}
-	d.Check()
-
-	s := NewSearcherWithOptions(d, WithSearchTimeout(50*time.Millisecond))
-	s.runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		// Simulate slow command
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(200 * time.Millisecond):
-			return []byte(`{"hits":[]}`), nil
+	// This checks timeout ordering and elapsed logical time, not subprocess
+	// latency under host scheduling delays.
+	synctest.Test(t, func(t *testing.T) {
+		d := NewDetector()
+		d.lookPath = func(name string) (string, error) {
+			return "/usr/local/bin/cass", nil
 		}
-	}
+		d.runCommand = func(ctx context.Context, name string, args ...string) (int, error) {
+			return 0, nil
+		}
+		d.Check()
 
-	start := time.Now()
-	resp := s.Search(context.Background(), SearchOptions{Query: "test"})
-	elapsed := time.Since(start)
+		var commandErr error
+		s := NewSearcherWithOptions(d, WithSearchTimeout(50*time.Millisecond))
+		s.runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			// Simulate slow command.
+			select {
+			case <-ctx.Done():
+				commandErr = ctx.Err()
+				return nil, commandErr
+			case <-time.After(200 * time.Millisecond):
+				return []byte(`{"hits":[]}`), nil
+			}
+		}
 
-	if len(resp.Results) != 0 {
-		t.Errorf("Results = %d items, want 0", len(resp.Results))
-	}
-	if elapsed > 150*time.Millisecond {
-		t.Errorf("Search took %v, should have timed out around 50ms", elapsed)
-	}
+		start := time.Now()
+		resp := s.Search(context.Background(), SearchOptions{Query: "test"})
+		elapsed := time.Since(start)
+
+		if !errors.Is(commandErr, context.DeadlineExceeded) {
+			t.Errorf("command error = %v, want context deadline exceeded", commandErr)
+		}
+		if resp.Meta.Error == "" {
+			t.Error("Expected timeout error with searcher timeout")
+		}
+		if len(resp.Results) != 0 {
+			t.Errorf("Results = %d items, want 0", len(resp.Results))
+		}
+		if elapsed > 150*time.Millisecond {
+			t.Errorf("Search took %v, should have timed out around 50ms", elapsed)
+		}
+	})
 }
 
 func TestSearcher_CustomTimeout(t *testing.T) {
-	d := NewDetector()
-	d.lookPath = func(name string) (string, error) {
-		return "/usr/local/bin/cass", nil
-	}
-	d.runCommand = func(ctx context.Context, name string, args ...string) (int, error) {
-		return 0, nil
-	}
-	d.Check()
-
-	s := NewSearcherWithOptions(d, WithSearchTimeout(200*time.Millisecond))
-	s.runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
-		// Simulate command that takes 100ms but respects context
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-			return []byte(`{"hits":[{"source_path":"/test"}]}`), nil
+	// Wall-clock starvation can make both select cases ready before this test
+	// resumes. Advance the existing timeout and command timers deterministically.
+	synctest.Test(t, func(t *testing.T) {
+		d := NewDetector()
+		d.lookPath = func(name string) (string, error) {
+			return "/usr/local/bin/cass", nil
 		}
-	}
+		d.runCommand = func(ctx context.Context, name string, args ...string) (int, error) {
+			return 0, nil
+		}
+		d.Check()
 
-	resp := s.Search(context.Background(), SearchOptions{
-		Query:   "test",
-		Timeout: 30 * time.Millisecond, // Override with shorter timeout
+		var commandErr error
+		s := NewSearcherWithOptions(d, WithSearchTimeout(200*time.Millisecond))
+		s.runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			// Simulate command that takes 100ms but respects context.
+			select {
+			case <-ctx.Done():
+				commandErr = ctx.Err()
+				return nil, commandErr
+			case <-time.After(100 * time.Millisecond):
+				return []byte(`{"hits":[{"source_path":"/test"}]}`), nil
+			}
+		}
+
+		resp := s.Search(context.Background(), SearchOptions{
+			Query:   "test",
+			Timeout: 30 * time.Millisecond, // Override with shorter timeout
+		})
+
+		if !errors.Is(commandErr, context.DeadlineExceeded) {
+			t.Errorf("command error = %v, want context deadline exceeded", commandErr)
+		}
+		if resp.Meta.Error == "" {
+			t.Error("Expected timeout error with custom short timeout")
+		}
+		if resp.Results == nil || len(resp.Results) != 0 || resp.Meta.ElapsedMs != 30 {
+			t.Errorf("custom timeout response = %+v, want empty results after 30ms", resp)
+		}
+
+		// The same command succeeds under the unchanged 200ms default; failure
+		// above must come from the per-search override, not an unusable searcher.
+		resp = s.Search(context.Background(), SearchOptions{Query: "test"})
+		if resp.Meta.Error != "" || len(resp.Results) != 1 || resp.Results[0].SourcePath != "/test" || resp.Meta.ElapsedMs != 100 {
+			t.Errorf("default timeout response = %+v, want the command's hit after 100ms", resp)
+		}
 	})
-
-	// Should timeout due to custom timeout being shorter than command time
-	if resp.Meta.Error == "" {
-		t.Error("Expected timeout error with custom short timeout")
-	}
 }
 
 func TestSearcher_ConcurrencyLimit(t *testing.T) {

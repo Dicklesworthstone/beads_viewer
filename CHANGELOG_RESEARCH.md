@@ -18,6 +18,12 @@ Reviewed the follow-up history through `b0ce5669` against the v0.25.0 candidate 
 This includes the final Rust lock transitions, rebuilt embedded graph pair,
 and the two test-only timing repairs. The candidate has no publication date
 until the final gate and release upload succeed.
+The subsequent gate found a scheduler-dependent Cass timeout test. Both timeout
+unit tests now retain their durations and assertions under a deterministic test
+clock, with deadline checks and a default-timeout success control. Repeated race
+tests and the full Cass package pass; this changes test reliability, not runtime
+timeout behavior. RCH release instructions also require an external temporary
+directory to keep generated test artifacts out of source provenance.
 The Windows installer paragraph describes its first pin historically;
 the current README uses `a43b8e85`, which contains the Go 1.26 minimum.
 Commit `3bc5c15c` captures command cancellation immediately after the child

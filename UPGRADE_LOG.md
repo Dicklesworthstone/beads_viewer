@@ -517,6 +517,51 @@ Logs: `/tmp/bv-release-ubs-final-20260912-1630.log` and
 does not waive any release-gate stage or change application behavior.
 The fallback and Nix version are now v0.25.0; changelog publication stays pending.
 
+### Clean-clone gate and Cass timeout repair
+
+Candidate `b218b119` passed formatting, build/vet and the complete unit race
+suite in the first clean-clone attempt (unit stage 395 seconds). During E2E,
+the binary's VCS metadata exposed RCH's default in-checkout `.rch-tmp` output.
+There was no tracked source diff, but retained helper outputs would prevent a
+clean final receipt. Only the verified owned process group was stopped; the
+ineligible receipt and log remain at
+`/data/tmp/bv-release-gate-interrupted-20260912/`. The remote originals and all
+scratch evidence are retained. Release instructions now require an explicit
+external remote `TMPDIR`.
+
+The same candidate's fresh-clone rerun confirms `TMPDIR=/data/tmp` and an empty
+initial dirty list. It passed formatting/build/vet, then failed only
+`TestSearcher_CustomTimeout`: its wall-clock double could select completion
+when both its 30 ms timeout and 100 ms simulated-work timers were ready after
+scheduling delay. Other unit packages passed. The gate continues remaining
+stages for diagnostic coverage; its failure is not an eligible release result.
+Log: `/tmp/bv-release-clean-gate-external-tmp-20260912.log`.
+
+Both Cass timeout-option unit tests now use `testing/synctest`, preserving
+their original durations and assertions. They additionally require actual
+deadline errors; the custom-timeout test verifies the same command succeeds
+with the unchanged 200 ms default. This verifies logical timeout semantics
+using the existing command double, not real subprocess wall-clock performance.
+The custom-timeout repair passed 20 race repetitions and the full Cass package
+through strict RCH on hz3 with the supported minimum Go 1.26.0; final combined
+tests and the Go 1.26.8 complete release gate remain required.
+Log: `/tmp/bv-release-cass-timeout-fix-20260912.log`.
+The combined timeout repairs subsequently passed 20 race repetitions and the
+full Cass package. Complete UBS scanned the changed file with zero critical
+findings, zero warnings and exit 0. Log:
+`/tmp/bv-release-cass-timeouts-final-20260912.log`; base `b218b119`, overlay
+`18e4630a92613f5b84703d9cbde34c04ea72f34b4a039436ee51b9e1e3b6737f`.
+
+The E2E-built candidate also passed the real desktop/mobile/offline/update
+Chromium journey and negative controls. It is a diagnostic CGO-enabled binary
+with dirty temporary-file metadata, not a distributable archive. The packaged
+binary will repeat this check. Evidence: `/data/tmp/bv-browser-smoke.6wrrlu`;
+log `/tmp/bv-release-browser-candidate-20260912.log`.
+
+Nix evaluation reports version 0.25.0 and Go 1.26.7 for x86_64/aarch64 Linux
+and Darwin. This is evaluation, not a native Nix build. Evidence:
+`/tmp/bv-release-flake-v0250-platforms-20260912.json`.
+
 ### Recovery and verification follow-up
 
 - The old exporter fails the new preservation regression as intended:

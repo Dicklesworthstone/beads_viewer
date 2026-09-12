@@ -27,6 +27,15 @@ receipt ineligible. The gate also requires Python 3 for receipt and archive
 verification and GoReleaser for the packaging regression tests. Race tests
 enable CGO; packaged binaries use `CGO_ENABLED=0`.
 
+For RCH, use a complete sanitized clone and transfer settings that preserve
+Git history and tracked Beads data. Set `TMPDIR` in the remote command to an
+existing directory outside that clone, for example
+`RCH_REQUIRE_REMOTE=1 rch exec -- env TMPDIR=/data/tmp make release-gate`.
+RCH's default `.rch-tmp` directory puts test and retained helper artifacts
+inside the checkout, which marks binaries dirty and prevents a clean receipt.
+Keep the same external temporary directory and toolchain settings for packaging
+and verification.
+
 The complete E2E stage has a 30-minute aggregate timeout, including the full
 600-query search evaluation. This replaces Go's default ten-minute suite limit;
 per-test assertions, evaluation cases and benchmark thresholds remain unchanged.
