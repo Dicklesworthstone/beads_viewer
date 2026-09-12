@@ -1018,19 +1018,13 @@ func TestBackgroundWorker_HugeDatasetOpenOnly(t *testing.T) {
 	}
 	defer worker.Stop()
 
-	worker.TriggerRefresh()
-
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if worker.GetSnapshot() != nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// Complete the real refresh before checking huge-tier filtering and hidden
+	// authority. Refresh scheduling and coalescing have dedicated tests.
+	worker.process()
 
 	snapshot := worker.GetSnapshot()
 	if snapshot == nil {
-		t.Fatal("Expected snapshot after refresh")
+		t.Fatalf("Expected snapshot after refresh: state=%v metrics=%+v error=%v", worker.State(), worker.Metrics(), worker.LastError())
 	}
 	if snapshot.DatasetTier != datasetTierHuge {
 		t.Fatalf("expected datasetTierHuge, got %v", snapshot.DatasetTier)
