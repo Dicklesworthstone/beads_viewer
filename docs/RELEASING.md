@@ -27,6 +27,12 @@ receipt ineligible. The gate also requires Python 3 for receipt and archive
 verification and GoReleaser for the packaging regression tests. Race tests
 enable CGO; packaged binaries use `CGO_ENABLED=0`.
 
+Put `br` 0.6.0 or newer on the gate's PATH for live tracker verification.
+Those tests execute saved claims after an issue becomes deferred; older
+trackers can accept those stale claims. The guard shipped in
+[br v0.6.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.6.0).
+A per-run tools directory is sufficient; the tests create fresh tracker fixtures.
+
 For RCH, use a complete sanitized clone and transfer settings that preserve
 Git history and tracked Beads data. Set `TMPDIR` in the remote command to an
 existing directory outside that clone, for example

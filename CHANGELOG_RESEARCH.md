@@ -14,6 +14,12 @@ evidence supplements them here.
 
 ## September 12 release preparation
 
+Saved claim execution requires br 0.6.0 or newer: the live gate exposed the
+older worker tracker's missing deferral guard. The official 0.6.0 binary passed
+all live tracker cases three times with the race detector. This is a tracker
+execution prerequisite, not a minimum version for reading existing issue files.
+No shared tracker database was migrated. Full release qualification is pending.
+
 Reviewed the follow-up history through `b0ce5669` against the v0.25.0 candidate entry.
 This includes the final Rust lock transitions, rebuilt embedded graph pair,
 and the two test-only timing repairs. The candidate has no publication date

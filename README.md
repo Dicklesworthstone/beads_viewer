@@ -265,6 +265,11 @@ Use exactly one command family, matching the tracker configured for the reposito
 
 #### Rust beads_rust (`br`)
 
+Use `br` 0.6.0 or newer when executing saved claim commands. It rechecks
+deferred status and future `defer_until` values when the claim runs, so a
+recommendation captured before a deferral cannot bypass it. This requirement
+applies to executing tracker claims.
+
 ```bash
 br ready --json                       # Show issues ready to work (no blockers)
 br list --status=open --json          # All open issues

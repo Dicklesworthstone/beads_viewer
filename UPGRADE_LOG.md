@@ -28,6 +28,8 @@ GitHub Actions must not run. Existing incomplete P1/native evidence remains open
 - [x] Verify batching regressions and the full export race suite pass.
 - [x] Measure sync-call reduction and rerun unchanged watched-export cases.
 - [x] Commit the verified SQLite batching change and record release evidence.
+- [x] Verify live saved-claim guards three times using isolated br 0.6.0.
+- [x] Recheck the unchanged correlation deadline three times on vmi1264463.
 - [ ] Pass all ten stages on a clean complete Git clone through strict RCH.
 - [ ] Tag the exact gated source commit.
 - [ ] Package Linux amd64/arm64, macOS amd64/arm64 and Windows amd64.
@@ -42,6 +44,21 @@ GitHub Actions must not run. Existing incomplete P1/native evidence remains open
 - [ ] Run native Windows installer, upgrade and failure-preservation checks.
 - [ ] Verify Go proxy and Nix version identity.
 - [ ] Record venue/native evidence and close bv-8tym only after completion.
+
+The `f6e7e899` gate at `/data/tmp/bv-release-gate-20260912T181541Z.wkK2wu`
+passed unit race tests, watched exports, documentation parity and the real WASM
+rebuild. E2E failed the correlation window at 15.003351592 seconds against its
+unchanged 15-second limit and live saved-claim guards with the worker's br
+0.5.12. The known-failed gate was stopped during benchmarks; its receipt is
+ineligible. The unchanged correlation test then passed three race-enabled
+repetitions (`/tmp/bv-correlation-qualification-20260912.log`).
+
+An isolated official br 0.6.0 binary was verified against its release checksum
+and asset digest, without replacing the shared tracker or migrating its database.
+With that binary first on PATH, live tracker tests passed three race-enabled
+repetitions in 88.907 seconds (`/tmp/bv-live-tracker-qualification-20260912.log`).
+README and release prerequisites now state this saved-claim requirement. A new
+complete gate still must pass; these focused checks do not replace it.
 
 The diagnostic gate on `b218b119` at
 `/data/tmp/bv-release-gate-20260912T165140Z.QtxK0l` failed the Cass timeout
