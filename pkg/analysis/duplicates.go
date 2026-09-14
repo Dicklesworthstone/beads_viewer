@@ -100,7 +100,13 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 		}
 	}
 
-	var pairs []DuplicatePair
+	// Retain source indices until selection is complete. Keyword explanations
+	// do not affect ranking and need not be allocated for discarded candidates.
+	type candidate struct {
+		DuplicatePair
+		left, right int
+	}
+	var pairs []candidate
 
 	// 2. Iterate through issues and find candidates
 	for i := range issues {
@@ -152,25 +158,26 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 				}
 			}
 
-			// Reconstruct common keywords for display (only for passing pairs)
-			common := intersectKeywords(keywords[i], keywords[j])
-
 			issue1ID, issue2ID := issue1.ID, issue2.ID
 			if issue2ID < issue1ID {
 				issue1ID, issue2ID = issue2ID, issue1ID
 			}
-			pairs = append(pairs, DuplicatePair{
-				Issue1:     issue1ID,
-				Issue2:     issue2ID,
-				Similarity: similarity,
-				Method:     "jaccard",
-				Keywords:   common,
+			pairs = append(pairs, candidate{
+				DuplicatePair: DuplicatePair{
+					Issue1:     issue1ID,
+					Issue2:     issue2ID,
+					Similarity: similarity,
+					Method:     "jaccard",
+				},
+				left: i, right: j,
 			})
 		}
 	}
 
 	// Sort by similarity (highest first) and limit
-	sortPairsBySimilarity(pairs)
+	sort.Slice(pairs, func(i, j int) bool {
+		return duplicatePairLess(pairs[i].DuplicatePair, pairs[j].DuplicatePair)
+	})
 	if len(pairs) > config.MaxSuggestions {
 		pairs = pairs[:config.MaxSuggestions]
 	}
@@ -184,6 +191,7 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 	// Convert to suggestions
 	suggestions := make([]Suggestion, 0, len(pairs))
 	for _, pair := range pairs {
+		pair.Keywords = intersectKeywords(keywords[pair.left], keywords[pair.right])
 		issue1 := issueMap[pair.Issue1]
 		issue2 := issueMap[pair.Issue2]
 
@@ -265,14 +273,18 @@ func extractKeywords(title, description string) []string {
 // Uses sort.Slice for O(n log n) performance instead of bubble sort O(n²)
 func sortPairsBySimilarity(pairs []DuplicatePair) {
 	sort.Slice(pairs, func(i, j int) bool {
-		if pairs[i].Similarity != pairs[j].Similarity {
-			return pairs[i].Similarity > pairs[j].Similarity
-		}
-		if pairs[i].Issue1 != pairs[j].Issue1 {
-			return pairs[i].Issue1 < pairs[j].Issue1
-		}
-		return pairs[i].Issue2 < pairs[j].Issue2
+		return duplicatePairLess(pairs[i], pairs[j])
 	})
+}
+
+func duplicatePairLess(a, b DuplicatePair) bool {
+	if a.Similarity != b.Similarity {
+		return a.Similarity > b.Similarity
+	}
+	if a.Issue1 != b.Issue1 {
+		return a.Issue1 < b.Issue1
+	}
+	return a.Issue2 < b.Issue2
 }
 
 // truncateStringSlice truncates a string slice to max length
