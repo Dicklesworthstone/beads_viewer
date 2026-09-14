@@ -4045,9 +4045,10 @@ NIXPKGS_ALLOW_UNFREE=1 nix profile install --impure github:Dicklesworthstone/bea
 NIXPKGS_ALLOW_UNFREE=1 nix develop --impure github:Dicklesworthstone/beads_viewer
 ```
 
-The explicit unfree allowance is required because Nix correctly treats the OpenAI/Anthropic rider as nonfree. When
-adding `bv` as a flake input, configure the consuming `nixpkgs` import with `allowUnfree = true`
-or a narrow `allowUnfreePredicate` for `bv`.
+The explicit unfree allowance is required because Nix correctly treats the OpenAI/Anthropic rider as nonfree.
+When using `bv.packages.${system}.default` from another flake, keep
+`NIXPKGS_ALLOW_UNFREE=1` and `--impure` on your Nix invocation. Configuring a
+separate `nixpkgs` import in the consuming flake does not configure `bv`'s own import.
 
 Or add to your flake inputs:
 ```nix
