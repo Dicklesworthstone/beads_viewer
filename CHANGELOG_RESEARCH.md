@@ -43,8 +43,11 @@ actual Nix build/executable checks and the distinct RCH timeout. `017ea57a`
 records v0.25.0 publication already covered by the released entry. Beads
 `bv-apal.1` and `bv-oonu.9` remain incomplete. The latest single UI cohort's
 33.641960 ms p99 and seven refreshes do not replace the full paired matrix.
-The current-only UI sweep started during this documentation update is not
-credited before its result, and cannot itself complete the original matrix.
+The requested current-only UI sweep on the reference host was refused before
+execution because hz4 had less than 5% disk space free. A complete diagnostic
+sweep was reassigned to vmi126 with the same fixtures, samples, and limits.
+It receives no credit before its result, and a different-host, current-only
+run cannot itself complete the original paired matrix.
 
 ## September 12 release preparation
 
