@@ -191,6 +191,17 @@ This proves the observed Linux amd64 Nix build and execution, not Nix profile in
 platform. Bead `bv-oonu.9` retains the build log, smoke evidence and receipt
 failure separately.
 
+On 2026-09-15, that existing store package was installed offline into a fresh,
+isolated Nix profile on Linux amd64. The active profile entry and executable
+resolved to the same store path and SHA-256 above. Invoking the profile's `bv`
+returned v0.25.0, 41 robot capabilities, and the expected diagnostic pick from
+a tiny JSONL project. That project intentionally had no tracker metadata, so
+no live claim command was expected or emitted. The check changed neither the
+user's default profile nor PATH and performed no compilation. It establishes
+existing-store profile installation, not the public GitHub-flake download path,
+profile upgrades, another native platform, or a completed RCH source receipt.
+Bead `bv-oonu.9` retains the profile manifest and native command logs.
+
 Run `tests/scripts/install_native_test.ps1` on native Windows x64 as part of
 release verification. It installs two real published releases into fresh temporary
 directories containing spaces, checks version/capabilities and a tiny Beads
