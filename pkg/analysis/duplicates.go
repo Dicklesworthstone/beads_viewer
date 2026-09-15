@@ -102,9 +102,11 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 
 	// Retain source indices until selection is complete. Keyword explanations
 	// do not affect ranking and need not be allocated for discarded candidates.
+	// Keep display-only fields out of this potentially quadratic slice too.
 	type candidate struct {
-		DuplicatePair
-		left, right int
+		issue1, issue2 string
+		similarity     float64
+		left, right    int
 	}
 	var pairs []candidate
 
@@ -163,12 +165,7 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 				issue1ID, issue2ID = issue2ID, issue1ID
 			}
 			pairs = append(pairs, candidate{
-				DuplicatePair: DuplicatePair{
-					Issue1:     issue1ID,
-					Issue2:     issue2ID,
-					Similarity: similarity,
-					Method:     "jaccard",
-				},
+				issue1: issue1ID, issue2: issue2ID, similarity: similarity,
 				left: i, right: j,
 			})
 		}
@@ -176,7 +173,10 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 
 	// Sort by similarity (highest first) and limit
 	sort.Slice(pairs, func(i, j int) bool {
-		return duplicatePairLess(pairs[i].DuplicatePair, pairs[j].DuplicatePair)
+		return duplicatePairLess(
+			DuplicatePair{Issue1: pairs[i].issue1, Issue2: pairs[i].issue2, Similarity: pairs[i].similarity},
+			DuplicatePair{Issue1: pairs[j].issue1, Issue2: pairs[j].issue2, Similarity: pairs[j].similarity},
+		)
 	})
 	if len(pairs) > config.MaxSuggestions {
 		pairs = pairs[:config.MaxSuggestions]
@@ -190,8 +190,12 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 
 	// Convert to suggestions
 	suggestions := make([]Suggestion, 0, len(pairs))
-	for _, pair := range pairs {
-		pair.Keywords = intersectKeywords(keywords[pair.left], keywords[pair.right])
+	for _, candidate := range pairs {
+		pair := DuplicatePair{
+			Issue1: candidate.issue1, Issue2: candidate.issue2, Similarity: candidate.similarity,
+			Method:   "jaccard",
+			Keywords: intersectKeywords(keywords[candidate.left], keywords[candidate.right]),
+		}
 		issue1 := issueMap[pair.Issue1]
 		issue2 := issueMap[pair.Issue2]
 
