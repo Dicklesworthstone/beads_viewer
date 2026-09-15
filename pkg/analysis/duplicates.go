@@ -109,6 +109,8 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 		left, right    int
 	}
 	var pairs []candidate
+	// Reuse scratch storage; overlap counts belong only to the current issue.
+	overlaps := make(map[int]int)
 
 	// 2. Iterate through issues and find candidates
 	for i := range issues {
@@ -119,7 +121,7 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 
 		// Count overlaps with other issues
 		// candidateIdx -> intersection count
-		overlaps := make(map[int]int)
+		clear(overlaps)
 
 		for _, w := range keywords[i] {
 			for _, matchIdx := range index[w] {
