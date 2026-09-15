@@ -36,6 +36,19 @@ refresh delivered 39 snapshots. Raw records are retained in
 open; these targeted runs do not replace its paired matrix. Earlier checkpoint
 statements below retain their historical scope.
 
+The subsequent full current-only hz4 run passed all 36 cohorts and 36,000
+samples at the same runtime revision. Root and independent readbacks matched
+all raw-file hashes and recalculated percentiles: worst p99 34.469134 ms,
+largest sample 45.950603 ms, and 902 snapshot/Phase 2 deliveries with maxima
+17.766892/10.992415 ms. No skips or threshold changes; strict RCH exited zero.
+Evidence: `/tmp/bv-p1-current-ui-hz4-20260915-1zuz4ufd/` (run log, raw files,
+and native hash manifest). A separate pre-panel run on contended vmi126 failed
+all 36 p99 checks; its complete records remain under
+`/tmp/bv-p1-current-ui-vmi126-resume-20260915-s2xrno0_/`. The source and host
+differences preclude attributing that contrast to the panel patch. Neither
+current-only run completes the original paired qualification, and neither
+requested a sealed source-content receipt.
+
 Coverage: complete non-tracker history `v0.25.0..f513f019`, eleven commits.
 Reviewed the existing v0.25.0 publication entry, Nix instruction/verification
 diffs, duplicate detector and tests, theme conversion and tests, and the

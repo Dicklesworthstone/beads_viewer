@@ -63,8 +63,9 @@ the latest tag, including installer changes usable with already released binarie
   ([fixture clock](https://github.com/Dicklesworthstone/beads_viewer/commit/f513f0194383deceb938aa3656c27898c47d3047)).
 
 These changes advance `bv-apal.1`; its full performance qualification remains
-open. An earlier targeted Unicode/1,000-issue background-refresh run passed at
-33.6 ms p99 over 1,000 samples, but does not replace the original full matrix.
+open. All 36 current-only UI cohorts passed the unchanged 50 ms limits on
+hz4, with 36,000 samples and a worst p99 of 34.47 ms. This does not replace
+the original paired UI and CLI matrix.
 
 ### Nix usage and verification
 
