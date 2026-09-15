@@ -1630,7 +1630,7 @@ The tree construction uses a **parent-child only** filter with intelligent root 
 
 **Handling Edge Cases:**
 - **Orphan References**: If an issue references a parent that doesn't exist, it becomes a root node (not silently dropped)
-- **Cycles**: Traversal guards prevent infinite recursion, but a parent-child component with no root is omitted from the tree. Use the issue list to inspect those records and correct their parent links; this view does not prove the hierarchy is acyclic.
+- **Cycles**: Components with no natural root receive a deterministic display root from a parent-child cycle, keeping their issues inspectable. Traversal guards stop repeated ancestry without changing source dependencies. Correct invalid parent links in the tracker; displaying the tree does not prove the hierarchy is acyclic.
 - **Deep Hierarchies**: No depth limit—the tree faithfully represents arbitrarily nested structures
 
 ### Tree Navigation
