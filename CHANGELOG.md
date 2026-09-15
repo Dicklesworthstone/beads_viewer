@@ -3,7 +3,7 @@
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
 Scope window: this update verifies `v0.24.0..v0.24.1` and the post-release
-commits through [`f513f019`](https://github.com/Dicklesworthstone/beads_viewer/commit/f513f019), including the September 10 canonical-source and Cass
+commits through [`5614d89e`](https://github.com/Dicklesworthstone/beads_viewer/commit/5614d89e), including the September 10 canonical-source and Cass
 repairs, September 11 performance work, September 12 dependency campaign,
 and September 14–15 duplicate-detection, theme-rendering, and Nix documentation changes.
 v0.25.0 was published after its complete clean-source release gate passed.
@@ -50,13 +50,20 @@ the latest tag, including installer changes usable with already released binarie
   lazy behavior. The focused ANSI256 label benchmark uses nine allocations
   instead of ten; it does not establish an application-wide latency gain
   ([palette conversion](https://github.com/Dicklesworthstone/beads_viewer/commit/174b1d3aea10bc6e95b21cba35d1e0b2bc371cdd)).
+- Panel borders now reuse that palette conversion instead of repeating it for
+  each border character. Exact comparisons preserve output across profiles,
+  light/dark settings, and narrow layouts. In five runs rendering two 65×40
+  panels with ANSI256 dark colors, median time fell from 0.780 ms to 0.443 ms
+  and allocations from 1,658 to 1,494 per iteration. This measures panel
+  rendering, not complete UI latency
+  ([panel borders](https://github.com/Dicklesworthstone/beads_viewer/commit/5614d89e55baefcbdfbdb72f4a27b0493bead01a)).
 - A priority-confidence test now uses the calculator's fixed clock when
   selecting its fixture, preventing calendar-dependent staleness from
   invalidating the test. Its confidence thresholds and assertions are unchanged
   ([fixture clock](https://github.com/Dicklesworthstone/beads_viewer/commit/f513f0194383deceb938aa3656c27898c47d3047)).
 
 These changes advance `bv-apal.1`; its full performance qualification remains
-open. The targeted Unicode/1,000-issue background-refresh run passed at
+open. An earlier targeted Unicode/1,000-issue background-refresh run passed at
 33.6 ms p99 over 1,000 samples, but does not replace the original full matrix.
 
 ### Nix usage and verification

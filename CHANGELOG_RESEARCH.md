@@ -14,6 +14,28 @@ evidence supplements them here.
 
 ## September 15 post-release update
 
+Follow-up `5614d89e` wires the existing palette helper into the two panel
+border styles. Independent source review found no output-semantic change.
+Tests compare 32 actual panel renderings against the previous styles and
+expand the helper matrix to 88 comparisons; the original seven numeric-color
+cases remain. Strict RCH on hz4 passed build, vet, the UI suite (13.275 s),
+and focused race checks (3.044 s). UBS scanned both changed files with zero
+critical findings or warnings; its optional Go tools were disabled, with
+build/vet run separately. First-party formatting is clean.
+
+The five-run ANSI256/dark benchmark renders two 65×40 panels per iteration,
+excluding style construction equally from both arms. Legacy/current medians
+are 779,595/443,043 ns, 83,691/81,696 B, and 1,658/1,494 allocations. Raw log:
+`/tmp/bv-panel-verify-20260915.log`, SHA-256
+`ddbe54620d1a477390ead3cc2648bc23ad7cbe66cb7b70bb8c8f78d8023e17c5`.
+This is a steady-state panel benchmark, not an application-wide claim.
+Separate actual Unicode/1k navigation and refresh runs each collected 1,000
+samples on hz4 and passed unchanged gates at p99 24.506414/28.132545 ms;
+refresh delivered 39 snapshots. Raw records are retained in
+`/data/tmp/bv-panel-evidence-20260915`. Full performance qualification remains
+open; these targeted runs do not replace its paired matrix. Earlier checkpoint
+statements below retain their historical scope.
+
 Coverage: complete non-tracker history `v0.25.0..f513f019`, eleven commits.
 Reviewed the existing v0.25.0 publication entry, Nix instruction/verification
 diffs, duplicate detector and tests, theme conversion and tests, and the
