@@ -2719,3 +2719,108 @@ func TestWithPhase2_TreeDeepCopy(t *testing.T) {
 		}
 	}
 }
+
+func TestWithPhase2_PreservesTreeOccurrences(t *testing.T) {
+	issue := func(id string, parents ...string) model.Issue {
+		result := model.Issue{ID: id, Title: id, Status: model.StatusOpen, IssueType: model.TypeTask}
+		for _, parent := range parents {
+			result.Dependencies = append(result.Dependencies, &model.Dependency{
+				IssueID: id, DependsOnID: parent, Type: model.DepParentChild,
+			})
+		}
+		return result
+	}
+	for _, tc := range []struct {
+		name   string
+		issues []model.Issue
+		paths  []string
+	}{
+		{
+			name:   "terminal cycle occurrence",
+			issues: []model.Issue{issue("root"), issue("a", "root", "b"), issue("b", "a")},
+			paths:  []string{"root", "root/a", "root/a/b", "root/a/b/a"},
+		},
+		{
+			name:   "diamond shared child",
+			issues: []model.Issue{issue("root"), issue("a", "root"), issue("b", "root"), issue("child", "a", "b")},
+			paths:  []string{"root", "root/a", "root/a/child", "root/b", "root/b/child"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := NewSnapshotBuilder(tc.issues).Build()
+			original.Analysis.WaitForPhase2()
+			updated := original.WithPhase2(original.Analysis, original.Analysis.GenerateInsights(len(tc.issues)), original.Issues, original.Analyzer)
+			collect := func(snapshot *DataSnapshot) map[string]*IssueTreeNode {
+				t.Helper()
+				paths := make(map[string]*IssueTreeNode)
+				seen := make(map[*IssueTreeNode]bool)
+				var visit func(*IssueTreeNode, *IssueTreeNode, string, int)
+				visit = func(node, parent *IssueTreeNode, prefix string, depth int) {
+					t.Helper()
+					if node == nil || node.Issue == nil || seen[node] {
+						t.Fatalf("invalid or repeated node pointer beneath %q", prefix)
+					}
+					seen[node] = true
+					path := prefix + node.Issue.ID
+					if node.Parent != parent || node.Depth != depth {
+						t.Fatalf("incorrect parent or depth at %s", path)
+					}
+					paths[path] = node
+					for _, child := range node.Children {
+						visit(child, node, path+"/", depth+1)
+					}
+				}
+				for _, root := range snapshot.TreeRoots {
+					visit(root, nil, "", 0)
+				}
+				if len(paths) != len(tc.paths) {
+					t.Fatalf("tree paths = %v, want %v", paths, tc.paths)
+				}
+				for _, path := range tc.paths {
+					if paths[path] == nil {
+						t.Fatalf("missing tree occurrence %s", path)
+					}
+				}
+				return paths
+			}
+			originalNodes, updatedNodes := collect(original), collect(updated)
+			for path, oldNode := range originalNodes {
+				newNode := updatedNodes[path]
+				if newNode == oldNode || newNode.Issue == oldNode.Issue || newNode.Issue != updated.IssueMap[oldNode.Issue.ID] {
+					t.Fatalf("occurrence %s was not detached and rebound", path)
+				}
+				if newNode.Expanded != oldNode.Expanded {
+					t.Fatalf("copy changed expansion at %s", path)
+				}
+				if original.TreeNodeMap[oldNode.Issue.ID] == oldNode && updated.TreeNodeMap[oldNode.Issue.ID] != newNode {
+					t.Fatalf("copy changed ID-map occurrence for %s", oldNode.Issue.ID)
+				}
+				oldExpanded := oldNode.Expanded
+				newNode.Expanded = !newNode.Expanded
+				if oldNode.Expanded != oldExpanded {
+					t.Fatalf("expansion mutation leaked to source at %s", path)
+				}
+				if len(newNode.Children) > 0 {
+					oldChild, newChild := oldNode.Children[0], newNode.Children[0]
+					newNode.Children[0] = nil
+					if oldNode.Children[0] != oldChild {
+						t.Fatalf("child-slice mutation leaked to source at %s", path)
+					}
+					newNode.Children[0] = newChild
+				}
+			}
+			tree := NewTreeModel(newTreeTestTheme())
+			tree.SetBeadsDir(t.TempDir())
+			tree.BuildFromSnapshot(updated)
+			tree.ExpandAll()
+			if tree.NodeCount() != len(tc.paths) {
+				t.Fatalf("snapshot consumer shows %d occurrences, want %d", tree.NodeCount(), len(tc.paths))
+			}
+			for _, iss := range tc.issues {
+				if !tree.SelectByID(iss.ID) || tree.SelectedIssue().ID != iss.ID {
+					t.Fatalf("snapshot issue %s is not inspectable", iss.ID)
+				}
+			}
+		})
+	}
+}

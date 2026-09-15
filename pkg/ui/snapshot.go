@@ -1049,10 +1049,14 @@ func deepCopyTree(roots []*IssueTreeNode, nodeMap map[string]*IssueTreeNode, iss
 	// Build a mapping from old node pointers to new node pointers
 	oldToNew := make(map[*IssueTreeNode]*IssueTreeNode, len(nodeMap))
 
-	// First pass: create shallow copies of all nodes (without Children/Parent links)
-	for _, oldNode := range nodeMap {
-		if oldNode == nil {
-			continue
+	// The ID map contains only one occurrence per issue. Walk the actual tree
+	// too, so shared children and terminal cycle occurrences remain visible.
+	// Deduplicate by pointer, not ID, and install each copy before following
+	// links so Parent back-references cannot recurse indefinitely.
+	var copyNode func(*IssueTreeNode)
+	copyNode = func(oldNode *IssueTreeNode) {
+		if oldNode == nil || oldToNew[oldNode] != nil {
+			return
 		}
 		issue := oldNode.Issue
 		if oldNode.Issue != nil && issueMap != nil {
@@ -1067,6 +1071,16 @@ func deepCopyTree(roots []*IssueTreeNode, nodeMap map[string]*IssueTreeNode, iss
 			// Children and Parent set in second pass
 		}
 		oldToNew[oldNode] = newNode
+		for _, child := range oldNode.Children {
+			copyNode(child)
+		}
+		copyNode(oldNode.Parent)
+	}
+	for _, root := range roots {
+		copyNode(root)
+	}
+	for _, node := range nodeMap {
+		copyNode(node)
 	}
 
 	// Second pass: rebuild Children slices and Parent pointers
