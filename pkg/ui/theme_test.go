@@ -12,7 +12,7 @@ import (
 
 func TestPaletteColorRenderParity(t *testing.T) {
 	colors := []lipgloss.AdaptiveColor{
-		ColorMuted, ColorInfo,
+		ColorMuted, ColorInfo, ColorBgHighlight, ColorPrimary,
 		{Light: "#555555", Dark: "#6272A4"},
 		{Light: "#6B47D9", Dark: "#BD93F9"},
 		{Light: "#E0E0E0", Dark: "#44475A"},
@@ -38,6 +38,60 @@ func TestPaletteColorRenderParity(t *testing.T) {
 					if got, want := cached.Render("界 alpha\nbeta"), original.Render("界 alpha\nbeta"); got != want {
 						t.Fatalf("profile=%v dark=%v: got %q want %q", profile, dark, got, want)
 					}
+				}
+			}
+		})
+	}
+}
+
+func TestPanelPaletteRenderParity(t *testing.T) {
+	for _, panel := range []struct {
+		name  string
+		style lipgloss.Style
+		color lipgloss.AdaptiveColor
+	}{
+		{"normal", PanelStyle, ColorBgHighlight},
+		{"focused", FocusedPanelStyle, ColorPrimary},
+	} {
+		t.Run(panel.name, func(t *testing.T) {
+			r := lipgloss.NewRenderer(io.Discard)
+			original := r.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(panel.color)
+			cached := panel.style.Renderer(r)
+			for _, profile := range []termenv.Profile{termenv.TrueColor, termenv.ANSI256, termenv.ANSI, termenv.Ascii} {
+				r.SetColorProfile(profile)
+				for _, dark := range []bool{false, true} {
+					r.SetHasDarkBackground(dark)
+					for _, width := range []int{3, 65} {
+						content := "界 alpha\n\x1b[31mbeta\x1b[0m"
+						got := cached.Width(width).Height(40).Render(content)
+						want := original.Width(width).Height(40).Render(content)
+						if got != want {
+							t.Fatalf("profile=%v dark=%v width=%d: got %q want %q", profile, dark, width, got, want)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkPanelPaletteRender(b *testing.B) {
+	for _, cached := range []bool{false, true} {
+		b.Run(fmt.Sprintf("precomputed=%v", cached), func(b *testing.B) {
+			r := lipgloss.NewRenderer(io.Discard)
+			r.SetColorProfile(termenv.ANSI256)
+			r.SetHasDarkBackground(true)
+			normal := r.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(ColorBgHighlight)
+			focused := r.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(ColorPrimary)
+			if cached {
+				normal, focused = PanelStyle.Renderer(r), FocusedPanelStyle.Renderer(r)
+			}
+			normal, focused = normal.Width(65).Height(40), focused.Width(65).Height(40)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if normal.Render("界 alpha\nbeta") == "" || focused.Render("界 alpha\nbeta") == "" {
+					b.Fatal("empty rendered panel")
 				}
 			}
 		})

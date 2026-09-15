@@ -101,12 +101,12 @@ var (
 	// PanelStyle is the default style for unfocused panels
 	PanelStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(ColorBgHighlight)
+			BorderForeground(paletteColor(ColorBgHighlight))
 
 	// FocusedPanelStyle is the style for focused panels
 	FocusedPanelStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
-				BorderForeground(ColorPrimary)
+				BorderForeground(paletteColor(ColorPrimary))
 )
 
 // ══════════════════════════════════════════════════════════════════════════════
