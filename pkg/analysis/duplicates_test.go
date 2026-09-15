@@ -383,6 +383,60 @@ func TestDetectDuplicates_MaxSuggestions(t *testing.T) {
 	}
 }
 
+func TestDetectDuplicates_LimitedMatchesFullRanking(t *testing.T) {
+	issues := make([]model.Issue, 48)
+	for i := range issues {
+		issues[i] = model.Issue{
+			ID: fmt.Sprintf("rank-%02d", i), Status: model.StatusOpen,
+			Title:       "alpha beta gamma " + strings.Repeat("delta ", i%3),
+			Description: fmt.Sprintf("group%d token%d", i%5, i%7),
+		}
+		if i%11 == 0 {
+			issues[i].Status = model.StatusClosed
+		}
+	}
+	normalize := func(suggestions []Suggestion) string {
+		t.Helper()
+		for i := range suggestions {
+			suggestions[i].GeneratedAt = time.Time{}
+		}
+		data, err := json.Marshal(suggestions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	for _, threshold := range []float64{0.1, 0.7} {
+		config := DefaultDuplicateConfig()
+		config.JaccardThreshold = threshold
+		config.MaxSuggestions = len(issues) * len(issues)
+		// Keeping every pair then sorting supplies the complete-ranking
+		// reference independently of the bounded replacement decisions.
+		all := DetectDuplicates(issues, config)
+		if len(all) < 20 {
+			t.Fatalf("fixture has only %d candidates", len(all))
+		}
+		for order := 0; order < 3; order++ {
+			input := slices.Clone(issues)
+			if order == 1 {
+				slices.Reverse(input)
+			} else if order == 2 {
+				for i := range input {
+					input[i] = issues[(i*17)%len(issues)]
+				}
+			}
+			for _, limit := range []int{1, 2, 3, 7, 20, 63, 64, len(all), len(all) + 1} {
+				config.MaxSuggestions = limit
+				got := DetectDuplicates(input, config)
+				want := all[:min(limit, len(all))]
+				if normalize(got) != normalize(want) {
+					t.Fatalf("threshold=%g order=%d limit=%d: bounded ranking differs from complete ranking", threshold, order, limit)
+				}
+			}
+		}
+	}
+}
+
 func TestDetectDuplicates_NonPositiveMaxIsSafe(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "A", Title: "Implement user authentication system", Status: model.StatusOpen},
@@ -393,6 +447,44 @@ func TestDetectDuplicates_NonPositiveMaxIsSafe(t *testing.T) {
 		config.MaxSuggestions = limit
 		if suggestions := DetectDuplicates(issues, config); len(suggestions) != 0 {
 			t.Fatalf("MaxSuggestions=%d returned %d suggestions", limit, len(suggestions))
+		}
+	}
+}
+
+func TestDetectDuplicates_RepeatedIDsKeepAllSourcePairs(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "alpha beta gamma", Status: model.StatusOpen},
+		{ID: "A", Title: "alpha beta delta epsilon", Status: model.StatusOpen},
+		{ID: "B", Title: "alpha beta gamma delta", Status: model.StatusOpen},
+	}
+	config := DefaultDuplicateConfig()
+	config.JaccardThreshold = 0.1
+	config.MaxSuggestions = 10
+	all := DetectDuplicates(issues, config)
+	if len(all) != 3 {
+		t.Fatalf("repeated IDs lost source pairs: got %d want 3", len(all))
+	}
+	// The source pairs have distinct scores, so no unspecified equal-key
+	// ordering is asserted. Their separate keyword explanations must survive.
+	for i := range all {
+		all[i].GeneratedAt = time.Time{}
+	}
+	for _, limit := range []int{1, 2, 3, 4} {
+		config.MaxSuggestions = limit
+		got := DetectDuplicates(issues, config)
+		for i := range got {
+			got[i].GeneratedAt = time.Time{}
+		}
+		gotJSON, err := json.Marshal(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantJSON, err := json.Marshal(all[:min(limit, len(all))])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotJSON) != string(wantJSON) {
+			t.Fatalf("limit=%d: repeated-ID source pair payload changed", limit)
 		}
 	}
 }

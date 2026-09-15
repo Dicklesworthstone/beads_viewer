@@ -100,15 +100,67 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 		}
 	}
 
-	// Retain source indices until selection is complete. Keyword explanations
-	// do not affect ranking and need not be allocated for discarded candidates.
-	// Keep display-only fields out of this potentially quadratic slice too.
+	// With unique IDs, score and canonical IDs totally order the pairs. Retain
+	// only the requested best pairs in a worst-first heap. Repeated IDs can
+	// leave indistinguishable sort keys with different explanations; keep the
+	// existing full-sort path for those inputs.
+	issueMap := make(map[string]*model.Issue, len(issues))
+	repeatedIDs := false
+	for i := range issues {
+		if _, exists := issueMap[issues[i].ID]; exists {
+			repeatedIDs = true
+		}
+		issueMap[issues[i].ID] = &issues[i]
+	}
+	// Explanations are generated only after selection, using source indices.
 	type candidate struct {
 		issue1, issue2 string
 		similarity     float64
 		left, right    int
 	}
 	var pairs []candidate
+	better := func(a, b candidate) bool {
+		return duplicatePairLess(
+			DuplicatePair{Issue1: a.issue1, Issue2: a.issue2, Similarity: a.similarity},
+			DuplicatePair{Issue1: b.issue1, Issue2: b.issue2, Similarity: b.similarity},
+		)
+	}
+	retain := func(c candidate) {
+		if repeatedIDs {
+			pairs = append(pairs, c)
+			return
+		}
+		if len(pairs) < config.MaxSuggestions {
+			pairs = append(pairs, c)
+			for child := len(pairs) - 1; child > 0; {
+				parent := (child - 1) / 2
+				if !better(pairs[parent], pairs[child]) {
+					break
+				}
+				pairs[parent], pairs[child] = pairs[child], pairs[parent]
+				child = parent
+			}
+			return
+		}
+		if !better(c, pairs[0]) {
+			return
+		}
+		pairs[0] = c
+		for parent := 0; ; {
+			child := parent*2 + 1
+			if child >= len(pairs) {
+				break
+			}
+			if right := child + 1; right < len(pairs) && better(pairs[child], pairs[right]) {
+				child = right
+			}
+			if !better(pairs[parent], pairs[child]) {
+				break
+			}
+			pairs[parent], pairs[child] = pairs[child], pairs[parent]
+			parent = child
+		}
+	}
 	// Reuse scratch storage; overlap counts belong only to the current issue.
 	overlaps := make(map[int]int)
 
@@ -166,7 +218,7 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 			if issue2ID < issue1ID {
 				issue1ID, issue2ID = issue2ID, issue1ID
 			}
-			pairs = append(pairs, candidate{
+			retain(candidate{
 				issue1: issue1ID, issue2: issue2ID, similarity: similarity,
 				left: i, right: j,
 			})
@@ -175,19 +227,10 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 
 	// Sort by similarity (highest first) and limit
 	sort.Slice(pairs, func(i, j int) bool {
-		return duplicatePairLess(
-			DuplicatePair{Issue1: pairs[i].issue1, Issue2: pairs[i].issue2, Similarity: pairs[i].similarity},
-			DuplicatePair{Issue1: pairs[j].issue1, Issue2: pairs[j].issue2, Similarity: pairs[j].similarity},
-		)
+		return better(pairs[i], pairs[j])
 	})
 	if len(pairs) > config.MaxSuggestions {
 		pairs = pairs[:config.MaxSuggestions]
-	}
-
-	// Issue lookup map for constructing suggestions
-	issueMap := make(map[string]*model.Issue, len(issues))
-	for i := range issues {
-		issueMap[issues[i].ID] = &issues[i]
 	}
 
 	// Convert to suggestions
