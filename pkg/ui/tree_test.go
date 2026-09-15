@@ -152,15 +152,105 @@ func TestTreeBuildCycleDetection(t *testing.T) {
 
 	// This should not hang or panic
 	tree := NewTreeModel(newTreeTestTheme())
+	tree.SetBeadsDir(t.TempDir())
 	tree.Build(issues)
 
-	// Both issues have parents, so neither is a root in the normal sense
-	// But they form a cycle, which the algorithm handles
 	if !tree.IsBuilt() {
 		t.Error("expected tree to be built despite cycle")
 	}
-	// With the cycle, both have parents, so there are no roots
-	// This is correct behavior - a pure cycle has no entry point
+	if tree.RootCount() != 1 {
+		t.Fatalf("expected a display root for the cycle, got %d", tree.RootCount())
+	}
+	tree.ExpandAll()
+	visible := make(map[string]bool)
+	for _, node := range tree.flatList {
+		visible[node.Issue.ID] = true
+	}
+	if !visible["cycle-a"] || !visible["cycle-b"] {
+		t.Fatalf("cycle members disappeared: %v", visible)
+	}
+}
+
+func TestTreeBuildRootlessComponents(t *testing.T) {
+	issue := func(id string, parents ...string) model.Issue {
+		result := model.Issue{ID: id, Title: id, IssueType: model.TypeTask}
+		for _, parent := range parents {
+			result.Dependencies = append(result.Dependencies, &model.Dependency{
+				IssueID: id, DependsOnID: parent, Type: model.DepParentChild,
+			})
+		}
+		return result
+	}
+	for _, tc := range []struct {
+		name   string
+		issues []model.Issue
+		roots  []string
+	}{
+		{"self parent", []model.Issue{issue("self", "self")}, []string{"self"}},
+		{"descendant before cycle", []model.Issue{issue("a-child", "b"), issue("b", "c"), issue("c", "b")}, []string{"b"}},
+		{"mixed components", []model.Issue{issue("root"), issue("child", "root"), issue("orphan", "missing"), issue("b", "c"), issue("c", "b"), issue("self", "self")}, []string{"root", "orphan", "b", "self"}},
+		{"reachable cycle", []model.Issue{issue("root"), issue("b", "c", "root"), issue("c", "b")}, []string{"root"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, reverse := range []bool{false, true} {
+				issues := append([]model.Issue(nil), tc.issues...)
+				if reverse {
+					for i, j := 0, len(issues)-1; i < j; i, j = i+1, j-1 {
+						issues[i], issues[j] = issues[j], issues[i]
+					}
+				}
+				before, err := json.Marshal(issues)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, snapshot := range []bool{false, true} {
+					tree := NewTreeModel(newTreeTestTheme())
+					tree.SetBeadsDir(t.TempDir())
+					if snapshot {
+						roots, nodes := buildIssueTreeNodes(issues)
+						tree.BuildFromSnapshot(&DataSnapshot{Issues: issues, TreeRoots: roots, TreeNodeMap: nodes, DataHash: "cycle-fixture"})
+					} else {
+						tree.Build(issues)
+					}
+					if tree.RootCount() != len(tc.roots) {
+						t.Fatalf("reverse=%v snapshot=%v: roots=%d, want %v", reverse, snapshot, tree.RootCount(), tc.roots)
+					}
+					roots := make(map[string]bool)
+					for _, node := range tree.roots {
+						roots[node.Issue.ID] = true
+					}
+					for _, id := range tc.roots {
+						if !roots[id] {
+							t.Fatalf("missing root %s: %v", id, roots)
+						}
+					}
+					for repeat := 0; repeat < 2; repeat++ {
+						tree.ExpandAll()
+						visible := make(map[string]bool)
+						for _, node := range tree.flatList {
+							visible[node.Issue.ID] = true
+						}
+						for _, iss := range issues {
+							if !visible[iss.ID] {
+								t.Fatalf("reverse=%v snapshot=%v: issue %s disappeared", reverse, snapshot, iss.ID)
+							}
+						}
+						if tree.NodeCount() > 3*len(issues) {
+							t.Fatalf("cycle traversal grew unexpectedly: %d nodes", tree.NodeCount())
+						}
+						tree.CollapseAll()
+						if tree.NodeCount() != len(tc.roots) {
+							t.Fatalf("collapsed tree contains %d nodes", tree.NodeCount())
+						}
+					}
+				}
+				after, err := json.Marshal(issues)
+				if err != nil || string(before) != string(after) {
+					t.Fatalf("tree changed source issues: %v", err)
+				}
+			}
+		})
+	}
 }
 
 // TestTreeBuildChildSorting verifies children are sorted by priority, type, date
