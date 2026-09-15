@@ -37,9 +37,10 @@ the latest tag, including installer changes usable with already released binarie
   preserves score/ID ordering and source-specific keyword explanations;
   repeated IDs retain the existing full-sort behavior. Earlier changes defer
   explanations until selection, compact candidate storage, and reuse overlap
-  counts. The final bounded-selection step reduced the dense 500-issue
-  benchmark's median allocation from 42.8 MB to 2.18 MB and time from 232 ms
-  to 31 ms across five runs on the same Linux worker with Go 1.26.8 and
+  counts. In the dense 500-issue benchmark requesting 20 suggestions, the
+  final bounded-selection step reduced median allocated bytes from 42.8 MB
+  to 2.18 MB and median time from 232 ms to 31 ms across five runs on the
+  same Linux worker with Go 1.26.8 and
   GOMAXPROCS=4. Overlap enumeration can still be quadratic
   ([bounded selection](https://github.com/Dicklesworthstone/beads_viewer/commit/f4c7310f6a64ab8fe964cf3ba877874a020d9abb);
   [source-pair regression](https://github.com/Dicklesworthstone/beads_viewer/commit/2d57b6ae)).
