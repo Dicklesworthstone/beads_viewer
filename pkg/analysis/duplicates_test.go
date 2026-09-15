@@ -464,6 +464,17 @@ func TestDetectDuplicates_RepeatedIDsKeepAllSourcePairs(t *testing.T) {
 	if len(all) != 3 {
 		t.Fatalf("repeated IDs lost source pairs: got %d want 3", len(all))
 	}
+	wantScores := []float64{0.75, 0.6, 0.4}
+	wantReasons := []string{
+		"75% keyword similarity; common: alpha, beta, gamma",
+		"60% keyword similarity; common: alpha, beta, delta",
+		"40% keyword similarity; common: alpha, beta",
+	}
+	for i := range all {
+		if all[i].Confidence != wantScores[i] || all[i].Reason != wantReasons[i] {
+			t.Fatalf("pair %d lost source score/explanation: got %g %q", i, all[i].Confidence, all[i].Reason)
+		}
+	}
 	// The source pairs have distinct scores, so no unspecified equal-key
 	// ordering is asserted. Their separate keyword explanations must survive.
 	for i := range all {
