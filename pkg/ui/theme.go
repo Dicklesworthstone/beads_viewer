@@ -2,10 +2,12 @@ package ui
 
 import (
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
@@ -135,6 +137,33 @@ type Theme struct {
 	TriageUnblocksAlt lipgloss.Style // Secondary unblocks ↪
 }
 
+// paletteColor computes terminal palette reductions once, while leaving the
+// renderer free to select its current profile and light/dark background.
+func paletteColor(c lipgloss.AdaptiveColor) lipgloss.TerminalColor {
+	for _, value := range []string{c.Light, c.Dark} {
+		// termenv's ANSI reduction indexes a 256-entry palette. Leave
+		// out-of-range numeric colors lazy, as AdaptiveColor does, so an
+		// inactive variant cannot panic while constructing a theme.
+		if n, err := strconv.Atoi(value); err == nil && n >= 256 {
+			return c
+		}
+	}
+	convert := func(value string) lipgloss.CompleteColor {
+		index := func(profile termenv.Profile) string {
+			switch color := profile.Color(value).(type) {
+			case termenv.ANSIColor:
+				return strconv.Itoa(int(color))
+			case termenv.ANSI256Color:
+				return strconv.Itoa(int(color))
+			default:
+				return ""
+			}
+		}
+		return lipgloss.CompleteColor{TrueColor: value, ANSI256: index(termenv.ANSI256), ANSI: index(termenv.ANSI)}
+	}
+	return lipgloss.CompleteAdaptiveColor{Light: convert(c.Light), Dark: convert(c.Dark)}
+}
+
 // DefaultTheme returns the standard Dracula-inspired theme (adaptive).
 // Respects BV_THEME=light|dark to override background detection. (bv-128)
 func DefaultTheme(r *lipgloss.Renderer) Theme {
@@ -172,28 +201,28 @@ func DefaultTheme(r *lipgloss.Renderer) Theme {
 		Muted:     lipgloss.AdaptiveColor{Light: "#555555", Dark: "#6272A4"}, // Dimmed text (was #888888, now ~7:1)
 	}
 
-	t.Base = r.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#000000", Dark: "#F8F8F2"})
+	t.Base = r.NewStyle().Foreground(paletteColor(lipgloss.AdaptiveColor{Light: "#000000", Dark: "#F8F8F2"}))
 
 	t.Selected = r.NewStyle().
-		Background(t.Highlight).
+		Background(paletteColor(t.Highlight)).
 		Border(lipgloss.ThickBorder(), false, false, false, true).
-		BorderForeground(t.Primary).
+		BorderForeground(paletteColor(t.Primary)).
 		PaddingLeft(1).
 		Bold(true)
 
 	t.Header = r.NewStyle().
-		Background(t.Primary).
-		Foreground(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#282A36"}).
+		Background(paletteColor(t.Primary)).
+		Foreground(paletteColor(lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#282A36"})).
 		Bold(true).
 		Padding(0, 1)
 
 	// Pre-computed delegate styles (bv-o4cj optimization)
 	// Reduces ~16 NewStyle() allocations per visible item per frame
-	t.MutedText = r.NewStyle().Foreground(ColorMuted)
-	t.InfoText = r.NewStyle().Foreground(ColorInfo)
-	t.InfoBold = r.NewStyle().Foreground(ColorInfo).Bold(true)
-	t.SecondaryText = r.NewStyle().Foreground(t.Secondary)
-	t.PrimaryBold = r.NewStyle().Foreground(t.Primary).Bold(true)
+	t.MutedText = r.NewStyle().Foreground(paletteColor(ColorMuted))
+	t.InfoText = r.NewStyle().Foreground(paletteColor(ColorInfo))
+	t.InfoBold = r.NewStyle().Foreground(paletteColor(ColorInfo)).Bold(true)
+	t.SecondaryText = r.NewStyle().Foreground(paletteColor(t.Secondary))
+	t.PrimaryBold = r.NewStyle().Foreground(paletteColor(t.Primary)).Bold(true)
 	t.PriorityUpArrow = r.NewStyle().Foreground(ThemeFg("#FF6B6B")).Bold(true)
 	t.PriorityDownArrow = r.NewStyle().Foreground(ThemeFg("#4ECDC4")).Bold(true)
 	t.TriageStar = r.NewStyle().Foreground(ThemeFg("#FFD700"))

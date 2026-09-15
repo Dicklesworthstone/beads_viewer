@@ -1,11 +1,91 @@
 package ui
 
 import (
+	"fmt"
+	"io"
 	"testing"
 
 	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
+
+func TestPaletteColorRenderParity(t *testing.T) {
+	colors := []lipgloss.AdaptiveColor{
+		ColorMuted, ColorInfo,
+		{Light: "#555555", Dark: "#6272A4"},
+		{Light: "#6B47D9", Dark: "#BD93F9"},
+		{Light: "#E0E0E0", Dark: "#44475A"},
+		{Light: "#000000", Dark: "#F8F8F2"},
+		{Light: "#FFFFFF", Dark: "#282A36"},
+		{Light: "1", Dark: "240"},
+		{Light: "", Dark: "invalid"},
+	}
+	for i, color := range colors {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			r := lipgloss.NewRenderer(io.Discard)
+			style := func(c lipgloss.TerminalColor) lipgloss.Style {
+				return r.NewStyle().Foreground(c).Background(c).
+					Border(lipgloss.NormalBorder()).BorderForeground(c).Bold(true)
+			}
+			original, cached := style(color), style(paletteColor(color))
+			// Change the renderer after creating both styles: adaptation must
+			// remain live rather than freezing the initial terminal settings.
+			for _, profile := range []termenv.Profile{termenv.TrueColor, termenv.ANSI256, termenv.ANSI, termenv.Ascii} {
+				r.SetColorProfile(profile)
+				for _, dark := range []bool{false, true} {
+					r.SetHasDarkBackground(dark)
+					if got, want := cached.Render("界 alpha\nbeta"), original.Render("界 alpha\nbeta"); got != want {
+						t.Fatalf("profile=%v dark=%v: got %q want %q", profile, dark, got, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestPaletteColorOutOfRangeStaysLazy(t *testing.T) {
+	r := lipgloss.NewRenderer(io.Discard)
+	color := lipgloss.AdaptiveColor{Light: "256", Dark: "1"}
+	original := r.NewStyle().Foreground(color)
+	cached := r.NewStyle().Foreground(paletteColor(color))
+	for _, profile := range []termenv.Profile{termenv.TrueColor, termenv.ANSI256, termenv.Ascii, termenv.ANSI} {
+		r.SetColorProfile(profile)
+		for _, dark := range []bool{false, true} {
+			// The original library itself panics for an active out-of-range
+			// ANSI color. Exercise only its supported rendering paths here.
+			if profile == termenv.ANSI && !dark {
+				continue
+			}
+			r.SetHasDarkBackground(dark)
+			if got, want := cached.Render("label"), original.Render("label"); got != want {
+				t.Fatalf("profile=%v dark=%v: got %q want %q", profile, dark, got, want)
+			}
+		}
+	}
+}
+
+func BenchmarkAdaptivePaletteRender(b *testing.B) {
+	for _, cached := range []bool{false, true} {
+		b.Run(fmt.Sprintf("precomputed=%v", cached), func(b *testing.B) {
+			r := lipgloss.NewRenderer(io.Discard)
+			r.SetColorProfile(termenv.ANSI256)
+			r.SetHasDarkBackground(true)
+			var color lipgloss.TerminalColor = ColorMuted
+			if cached {
+				color = paletteColor(ColorMuted)
+			}
+			style := r.NewStyle().Foreground(color)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if style.Render("BV-123") == "" {
+					b.Fatal("empty rendered label")
+				}
+			}
+		})
+	}
+}
 
 func TestDefaultTheme(t *testing.T) {
 	renderer := lipgloss.NewRenderer(nil)
