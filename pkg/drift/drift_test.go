@@ -2301,7 +2301,11 @@ func TestDrift_NewEmitterSemantics(t *testing.T) {
 					id := fmt.Sprintf("LEAF-%d", i)
 					candidate = append(candidate, model.Issue{ID: id, Status: model.StatusOpen, Priority: 1, UpdatedAt: fresh, Dependencies: []*model.Dependency{blocksOn(id, "HUB")}})
 				}
-				for _, rec := range analysis.NewAnalyzer(candidate).GenerateRecommendations() {
+				analyzer := analysis.NewAnalyzer(candidate)
+				// Probe with the calculator's clock, so these fresh fixtures
+				// cannot acquire staleness confidence as the calendar advances.
+				analyzer.SetNow(now)
+				for _, rec := range analyzer.GenerateRecommendations() {
 					if rec.IssueID != "HUB" || rec.Direction != "increase" {
 						continue
 					}
