@@ -235,15 +235,15 @@ func TestDetectAgentFileReportsMalformedAndDuplicateBlurbs(t *testing.T) {
 
 func TestDetectAgentFileReportsHighestAndFutureBlurbVersion(t *testing.T) {
 	tmpDir := t.TempDir()
-	content := "<!-- bv-agent-instructions-v5 -->\ncurrent\n<!-- end-bv-agent-instructions -->\n" +
-		"<!-- bv-agent-instructions-v7 -->\nfuture\n<!-- end-bv-agent-instructions -->\n"
+	futureVersion := BlurbVersion + 1
+	content := AgentBlurb + "\n" + fmt.Sprintf("<!-- bv-agent-instructions-v%d -->\nfuture\n<!-- end-bv-agent-instructions -->\n", futureVersion)
 	if err := os.WriteFile(filepath.Join(tmpDir, "AGENTS.md"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	detection := DetectAgentFile(tmpDir)
-	if detection.BlurbVersion != 7 {
-		t.Fatalf("BlurbVersion=%d, want highest version 7", detection.BlurbVersion)
+	if detection.BlurbVersion != futureVersion {
+		t.Fatalf("BlurbVersion=%d, want highest version %d", detection.BlurbVersion, futureVersion)
 	}
 	if !detection.HasFutureBlurb() || !detection.NeedsUpgrade() {
 		t.Fatalf("future detection=%+v, want future and needs-attention state", detection)

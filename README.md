@@ -179,11 +179,11 @@ Don't just read the title. `bv` gives you the full picture:
 *   **Export:** Press `x` to export all issues to a timestamped Markdown file with Mermaid diagrams (`E` opens the tree view).
 *   **Graph Export (CLI):** `bv --robot-graph` outputs the dependency graph as JSON, DOT (Graphviz), or Mermaid format. Use `--graph-format=dot` for rendering with Graphviz, or `--graph-root=ID --graph-depth=3` to extract focused subgraphs.
 *   **Copy:** Press `C` to copy the selected issue as formatted Markdown to your clipboard.
-*   **Edit:** Press `O` to open the active Beads JSONL file in your preferred GUI editor.
+*   **Edit:** Press `O` to open the loaded source in a GUI editor, or edit the focused issue's frontmatter in a terminal editor while the TUI is suspended.
 *   **Time-Travel:** Press `t` to compare against any git revision, or `T` for quick HEAD~5 comparison. Combined with History view (`h`), you can navigate to any commit and see exactly what changed.
 
 ### 🔌 Automation Hooks
-Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, notifications, or uploads. Hooks run automatically whenever that file exists; pass `--no-hooks` to skip them for one export. Defaults: pre-export hooks fail fast on errors (`on_error: fail`), post-export hooks log and continue (`on_error: continue`). A post-export hook declared `on_error: fail` makes the export exit 1 even though the bundle has already been written. Empty commands are ignored with a warning for safety. Hook env includes `BV_EXPORT_PATH`, `BV_EXPORT_FORMAT`, `BV_ISSUE_COUNT`, `BV_TIMESTAMP`, plus any custom `env` entries.
+Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, notifications, or uploads. Report exports (`--export` / `--export-md`) and Pages exports run configured hooks; pass `--no-hooks` to skip them for one export. Defaults: pre-export hooks fail fast on errors (`on_error: fail`), post-export hooks log and continue (`on_error: continue`). A post-export hook declared `on_error: fail` makes the export exit 1 even though the bundle has already been written. Empty commands are ignored with a warning for safety. Hook env includes `BV_EXPORT_PATH`, `BV_EXPORT_FORMAT`, `BV_ISSUE_COUNT`, `BV_TIMESTAMP`, plus any custom `env` entries.
 
 **Security:** hooks are shell commands defined by the project you are exporting, so treat `.bv/hooks.yaml` in an unfamiliar repository as untrusted code and review it before exporting (or pass `--no-hooks`). To limit blast radius, bv strips credential-bearing environment variables (names containing `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, `PRIVATE_KEY`, etc., plus `SSH_AUTH_SOCK`) from hook subprocesses. A hook that legitimately needs one must re-grant it explicitly, e.g. `env: { GITHUB_TOKEN: "${GITHUB_TOKEN}" }`.
 
@@ -194,7 +194,7 @@ Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, not
 The text below is exactly what `bv --agents-add` (and the TUI's AGENTS.md prompt) installs (`pkg/agents/blurb.go`, `AgentBlurb`); a docs parity test keeps this copy identical to it.
 
 ````markdown
-<!-- bv-agent-instructions-v6 -->
+<!-- bv-agent-instructions-v7 -->
 
 ---
 
@@ -248,7 +248,7 @@ Recommendations can include blocked or assigned work; `triage.quick_ref.top_pick
 | `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues |
 | `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
 
-Every robot command emits one JSON object; with `--graph-format=dot` or `mermaid` the diagram text is the `graph` field (`bv --robot-graph --graph-format=dot | jq -r .graph`), not the whole output.
+Robot analysis commands default to JSON; `--format toon` selects TOON, and `--robot-help` defaults to text. In JSON mode, `--graph-format=dot` or `mermaid` puts diagram text in the `graph` field (`bv --robot-graph --graph-format=dot | jq -r .graph`).
 
 #### Scoping & Filtering
 
@@ -320,7 +320,7 @@ Tracker commands do not grant permission to commit or push application code. Fol
 
 The blurb uses HTML comment markers for version tracking:
 ```
-<!-- bv-agent-instructions-v6 -->
+<!-- bv-agent-instructions-v7 -->
 ... content ...
 <!-- end-bv-agent-instructions -->
 ```
@@ -331,7 +331,7 @@ When a new version of the blurb is released, `bv` can detect the outdated versio
 
 ## 📐 Architecture & Design
 
-`bv` treats your project as a **Directed Acyclic Graph (DAG)**, not just a list. This allows it to derive insights about what is *truly* important.
+`bv` treats your project as a **directed dependency graph**, including cycles when present. Its graph metrics help identify blockers and structural importance.
 
 ```mermaid
 graph TD
@@ -636,12 +636,9 @@ flowchart LR
 
 ### 1. Adaptive Layout Engine
 `bv` doesn't just dump text; it calculates geometry on every render cycle.
-*   **Dynamic Resizing:** The `View()` function inspects the current terminal width (`msg.Width`) on every frame.
-*   **Breakpoint Logic:**
-    *   `< 100 cols`: **Mobile Mode**. List takes 100% width.
-    *   `> 100 cols`: **Split Mode**. List takes 40%, Details take 60%; the assignee column appears.
-    *   `> 120 cols`: the **Sparkline** (graph score) column appears.
-    *   `> 140 cols`: **Ultra-Wide**. Label tags are added to each row.
+*   **Dynamic Resizing:** `Update()` handles terminal-size messages and resizes the views.
+*   **Terminal Breakpoint:** At 100 columns or fewer, the list uses a single pane. Above 100 columns, the default split allocates 40% of the available content width to the list and 60% to details, after panel overhead. The pane ratio is adjustable.
+*   **Optional Row Columns:** The default list delegate uses the actual list-row width, not terminal width: above 100 cells it can show an assignee, above 120 a graph-score sparkline, and above 140 label tags. A 140-column terminal with the default split does not have room for these columns.
 *   **Padding Awareness:** The layout engine explicitly accounts for borders (2 chars) and padding (2 chars) to prevent "off-by-one" wrapping errors that plague many TUIs.
 
 ### 2. Viewport Virtualization
@@ -652,9 +649,9 @@ flowchart LR
 
 ### 3. Visual Graph Engine (`pkg/ui/graph.go`)
 We built a custom 2D ASCII/Unicode rendering engine from scratch to visualize the dependency graph.
-*   **Canvas Abstraction:** A 2D grid of `rune` cells and `style` pointers allows us to draw "pixels" in the terminal.
-*   **Manhattan Routing:** Edges are drawn using orthogonal lines with proper Unicode corner characters ( `╭`, `─`, `╮`, `│`, `╰`, `╯`) to minimize visual noise.
-*   **Topological Layering:** Nodes are arranged in layers based on their "Impact Depth," ensuring that dependencies always flow downwards.
+*   **Line Canvas:** The renderer assembles styled strings into a line-based canvas and clips it to the viewport.
+*   **Dependency Neighborhood:** The selected issue appears between its blockers above and its dependents below, joined by Unicode connectors. Impact scores order the node selector; this is not a whole-graph topological layout.
+*   **Panning:** Horizontal and vertical scrolling reveal portions of the selected neighborhood outside the viewport.
 
 ### 4. Thematic Consistency
 We use **[Lipgloss](https://github.com/charmbracelet/lipgloss)** to enforce a strict design system.
@@ -673,12 +670,12 @@ When viewing the list in Ultra-Wide mode, `bv` renders a "Graph Score" column us
 *   **The Utility:** This allows you to scan a list of 50 issues and instantly spot the "spikes" in complexity or centrality without reading a single number.
 
 ### 2. Semantic Heatmaps
-We don't just use random colors. `pkg/ui/visuals.go` implements a perceptually uniform color ramp (`GetHeatmapColor`) that maps metric intensity to a gradient:
-*   `0.0 - 0.2`: **Low** (Gray/Dim)
-*   `0.2 - 0.5`: **Mid** (Blue/Cool)
-*   `0.5 - 0.8`: **High** (Purple/Warm)
-*   `0.8 - 1.0`: **Peak** (Pink/Hot)
-This visual encoding is applied to badges in the Insights Dashboard, allowing you to differentiate between "somewhat important" and "critically urgent" tasks at a glance.
+`GetHeatmapColor` in `pkg/ui/visuals.go` maps scores to four discrete themed bands:
+*   `≤ 0.2`: **Low** (`Theme.Secondary`)
+*   `> 0.2` through `0.5`: **Mid** (`Theme.InProgress`)
+*   `> 0.5` through `0.8`: **High** (`Theme.Feature`)
+*   `> 0.8`: **Peak** (`Theme.Primary`)
+These colors style the list's graph-score sparklines; they indicate score bands, not an independent urgency classification.
 
 ---
 
@@ -752,8 +749,8 @@ bv --robot-graph                              # JSON (default)
 bv --robot-graph --graph-format=dot           # JSON envelope; DOT text in .graph
 bv --robot-graph --graph-format=mermaid       # JSON envelope; Mermaid text in .graph
 
-# Every robot command emits one JSON object (data_hash, generated_at, source_path, ...),
-# so the DOT or Mermaid text is a field to extract, not the whole output:
+# In default JSON mode, robot-graph wraps DOT or Mermaid text in an envelope.
+# Extract its graph field:
 bv --robot-graph --graph-format=dot | jq -r .graph > graph.dot
 bv --robot-graph --graph-format=mermaid | jq -r .graph > graph.mmd
 
@@ -973,7 +970,7 @@ The exporter (`pkg/export/markdown.go`) constructs a document that bridges human
 We don't just dump JSON values. The exporter applies specific formatting rules to ensure the report looks professional:
 *   **Metadata Tables:** Key fields (Assignee, Priority, Status) are aligned in GFM (GitHub Flavored Markdown) tables with emoji indicators.
 *   **Conversation threading:** Comments are rendered as blockquotes (`>`) with the author and the absolute date (`YYYY-MM-DD`), preserving the flow of discussion distinct from the technical spec.
-*   **Intelligent Sorting:** The report doesn't list issues ID-sequentially. It applies the same priority logic as the TUI: **Open Critical** issues appear first, ensuring the reader focuses on what matters now.
+*   **Selected Order:** `--export-md` preserves the selected recipe's order and `max_items` limit. Without a recipe, it retains the loaded issue order.
 
 ---
 
@@ -1222,7 +1219,7 @@ Each factor is normalized to 0-1 before weighting (the `*_norm` fields in the br
 {
   "issue_id": "CORE-123",
   "title": "Refactor auth module",
-  "score": 0.847,
+  "score": 0.87,
   "breakdown": {
     "pagerank": 0.20,
     "betweenness": 0.17,
@@ -1263,7 +1260,7 @@ This provides at-a-glance feedback on whether your priority assignments match th
 
 ## 🛤️ Parallel Execution Planning
 
-When you ask "What should I work on next?", `bv` doesn't just pick the highest-priority item. It generates a **complete execution plan** that respects dependencies and identifies opportunities for parallel work.
+When you ask "What should I work on next?", `bv` generates a plan for **currently actionable work**, respecting dependency gates and identifying opportunities for parallel work. Blocked issues provide context and counts but do not appear as actionable track items.
 
 ### Track-Based Planning
 The planner uses **Union-Find** to identify connected components in the dependency graph, grouping related issues into independent "tracks" that can be worked on concurrently.
@@ -1305,14 +1302,14 @@ Abbreviated example; the response also includes source identity and metric statu
     "tracks": [
       {
         "track_id": "track-A",
-        "reason": "Independent work stream",
+        "reason": "Single actionable item",
         "items": [
           { "id": "AUTH-001", "priority": 1, "unblocks": ["AUTH-002", "AUTH-003", "API-005"] }
         ]
       },
       {
         "track_id": "track-B",
-        "reason": "Independent work stream",
+        "reason": "Single actionable item",
         "items": [
           { "id": "UI-101", "priority": 2, "unblocks": ["UI-102"] }
         ]
@@ -1322,7 +1319,7 @@ Abbreviated example; the response also includes source identity and metric statu
     "total_blocked": 5,
     "summary": {
       "highest_impact": "AUTH-001",
-      "impact_reason": "Unblocks 3 tasks",
+      "impact_reason": "Unblocks multiple tasks",
       "unblocks_count": 3
     }
   }
@@ -1347,7 +1344,11 @@ Abbreviated example; the response also includes source identity and metric statu
 
 The Insights Dashboard (`i`) transforms abstract graph metrics into an **interactive exploration interface**. Instead of just showing numbers, it lets you drill into *why* a bead scores high and *what* that means for your project.
 
-### The 6-Panel Layout
+### The 10-Panel Layout
+
+The dashboard includes Bottlenecks, Keystones, Influencers, Hubs, Authorities,
+Cores, Cut Points, Slack, Cycles, and Priority. The illustration below shows
+six of those panels; the actual layout adapts to the available height.
 
 ```
 ┌─────────────────────┬─────────────────────┬─────────────────────┐
@@ -1415,7 +1416,7 @@ other beads, making it a critical junction.
 
 ## 📋 Kanban Board: Visual Workflow State
 
-The Kanban Board (`b`) provides a **columnar workflow view** with intelligent swimlane grouping, visual dependency indicators, and rich card details. Empty columns automatically collapse to maximize screen real estate.
+The Kanban Board (`b`) provides a **columnar workflow view** with swimlane grouping, visual dependency indicators, and card details. By default, Status mode keeps empty columns visible; Priority and Type modes hide them. Press `e` to cycle automatic, show-all, and hide-empty behavior.
 
 ### Swimlane Grouping Modes
 
@@ -1572,13 +1573,13 @@ The `[Created ↓]` badge instantly communicates the active sort mode without re
 
 ## 🌲 Hierarchical Tree View: Parent-Child Visualization
 
-Press `E` to open the **Hierarchical Tree View**—a collapsible tree that visualizes parent-child relationships between issues. Unlike the Graph View which shows all dependency types, the Tree View focuses exclusively on **structural hierarchy**: which issues are "part of" other issues.
+Press `E` to open the **Hierarchical Tree View**—a collapsible tree that visualizes parent-child relationships between issues. The Graph View shows blocking dependency edges; the Tree View focuses exclusively on **structural hierarchy**: which issues are "part of" other issues.
 
 ### Why Parent-Child Matters
 
 In complex projects, issues often have two distinct relationship types:
-- **Blocking dependencies** (`blocks`/`blocked_by`): Task B cannot start until Task A completes
-- **Parent-child relationships** (`parent`): Feature X contains Tasks A, B, and C as sub-work
+- **Blocking dependencies** (`blocks`, `conditional-blocks`, `waits-for`): predecessor completion gates readiness according to the dependency type
+- **Parent-child relationships** (`parent-child`): Feature X contains Tasks A, B, and C as sub-work
 
 The Tree View renders only parent-child relationships, creating a work breakdown structure (WBS) that answers questions like:
 - "What sub-tasks make up this epic?"
@@ -1625,11 +1626,11 @@ The tree construction uses a **parent-child only** filter with intelligent root 
 2. **Build Index**: Create a parent → children mapping for efficient traversal
 3. **Identify Roots**: Issues with no parent (or whose parent doesn't exist in the dataset) become root nodes
 4. **Recursive Build**: Depth-first traversal with cycle detection prevents infinite loops
-5. **Sort Children**: Within each parent, children are sorted by: Priority (ascending) → Type (epic > feature > bug > task) → Creation Date (newest first)
+5. **Sort Children**: Within each parent, children are sorted by priority (ascending), then type (epic → feature → task → bug → chore → other), then creation date (oldest first).
 
 **Handling Edge Cases:**
 - **Orphan References**: If an issue references a parent that doesn't exist, it becomes a root node (not silently dropped)
-- **Cycles**: Detected during traversal; cyclic nodes are rendered without recursing further
+- **Cycles**: Traversal guards prevent infinite recursion, but a parent-child component with no root is omitted from the tree. Use the issue list to inspect those records and correct their parent links; this view does not prove the hierarchy is acyclic.
 - **Deep Hierarchies**: No depth limit—the tree faithfully represents arbitrarily nested structures
 
 ### Tree Navigation
@@ -1838,7 +1839,7 @@ Press `]` (or `F4`) to open the **Attention View**—a ranked table of labels by
 
 ### Attention Score Formula
 
-The attention score (`ComputeLabelAttentionScore` in `pkg/analysis/label_health.go`) combines multiple signals to surface neglected or problematic areas:
+The attention score (`ComputeLabelAttentionScores` in `pkg/analysis/label_health.go`) combines multiple signals to surface neglected or problematic areas:
 
 $$
 \text{Attention} = \frac{\text{PageRank}_{\text{sum}} \times \left(1 + \frac{\text{Stale}}{\text{Open}}\right) \times (1 + \text{BlockImpact})}{\text{ClosedLast30Days} + 1}
@@ -1861,11 +1862,11 @@ High attention scores indicate labels that are both important and neglected—th
 ├──────┬────────────┬───────────┬─────────────────────────────────────────────┤
 │ Rank │ Label      │ Attention │ Reason                                      │
 ├──────┼────────────┼───────────┼─────────────────────────────────────────────┤
-│  1   │ api        │    2.45   │ blocked=5 stale=3 vel=0.8                   │
-│  2   │ auth       │    1.89   │ blocked=2 stale=4 vel=1.2                   │
-│  3   │ infra      │    1.23   │ blocked=1 stale=6 vel=0.5                   │
-│  4   │ frontend   │    0.67   │ blocked=0 stale=1 vel=3.5                   │
-│  5   │ docs       │    0.34   │ blocked=0 stale=2 vel=2.1                   │
+│  1   │ api        │    2.45   │ pr=0.49 stale=1.00 block=4 closed30=0      │
+│  2   │ auth       │    1.89   │ pr=0.63 stale=1.00 block=2 closed30=0      │
+│  3   │ infra      │    1.23   │ pr=0.41 stale=1.50 block=1 closed30=0      │
+│  4   │ frontend   │    0.67   │ pr=0.67 stale=1.00 block=0 closed30=0      │
+│  5   │ docs       │    0.34   │ pr=0.34 stale=1.00 block=0 closed30=0      │
 └──────┴────────────┴───────────┴─────────────────────────────────────────────┘
 ```
 
@@ -2018,10 +2019,10 @@ Progress persists across sessions: pages you have seen are recorded in the user 
 | Key | Action |
 |-----|--------|
 | `h` / `l`, `←` / `→`, `p` / `n`, `Shift+Tab` / `Space` | Previous / Next page |
-| `j` / `k` | Scroll content up / down |
+| `j` / `k` | Scroll content down / up |
 | `Ctrl+D` / `Ctrl+U` | Page content down / up |
 | `t` | Toggle Table of Contents |
-| `g` / `G` | First / Last page |
+| `g` / `G` | Scroll current page to top / bottom (in the TOC, first / last entry) |
 | `1` - `9` | Jump to page |
 | `q` / `Esc` | Close tutorial |
 
@@ -2089,15 +2090,15 @@ graph TD
 
 | Method | Confidence range | How It Works |
 |--------|------------------|--------------|
-| `co_committed` | 0.85 – 0.99 | The commit changed source files and the beads JSONL for this bead in the same commit |
+| `co_committed` | 0.80 – 0.99 | The commit changed source files and the beads JSONL for this bead in the same commit |
 | `explicit_id` | 0.70 – 0.99 | Commit message contains the bead ID (custom ID shapes via `--id-pattern`) |
-| `temporal_author` | 0.20 – 0.85 | Commit by the bead's assignee inside the bead's in-progress window |
+| `temporal_author` | 0.20 – 0.85 | Code commit by the author of the recorded claim, between retained claim and close events; both milestones are required |
 
 There is no path-matching strategy; label-to-path hints only nudge temporal scores inside `temporal.go`.
 
 ### Confidence Scoring
 
-Each correlation carries a **confidence score** (0.0–1.0) inside its method's range (`MethodRanges` in `pkg/correlation/scorer.go`). `--robot-explain-correlation` breaks a score into additive signals: co-commit 50, explicit message match 40, timing 25 plus author match 15, file overlap 5 per file (capped at 15), and proximity 7 when the score sits near the top of its range. When more than one method matches the same commit, `CombineConfidence` takes the strongest signal and adds diminishing credit for the others.
+Each correlation carries a **confidence score** (0.0–1.0). The table gives single-strategy ranges; combining strategies can boost the strongest score, and confirming a pair pins it to 1.0. `--robot-explain-correlation` also reports heuristic signal weights: co-commit 50, explicit message match 40, timing 25 plus author match 15, file overlap 5 per file (capped at 15), and proximity 7 near the top of the method's range. Those explanatory weights are not an arithmetic derivation of the confidence score.
 
 ### History View Layout
 
@@ -2106,34 +2107,29 @@ The History View uses a **responsive layout** that adapts to terminal width (`la
 | Width | Layout |
 |-------|--------|
 | **< 100** | Two panes: List + Detail |
-| **100-150** | Three panes: Beads + Commits + Detail |
-| **> 150** | Wide: adds the Timeline pane (bead mode) |
+| **100–149** | Three panes: Beads + Commits + Detail |
+| **≥ 150** | Wide: adds the Timeline pane (bead mode) |
 
-**Wide Terminal (3-pane) Layout:**
+**Standard Terminal (3-pane) Layout, abbreviated:**
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │  📜 HISTORY VIEW                                          [Bead Mode] [≥ 0.5]   │
 ├───────────────────────┬───────────────────┬─────────────────────────────────────┤
-│  BEADS                │  TIMELINE         │  COMMIT DETAIL                      │
+│  BEADS                │  COMMITS          │  COMMIT DETAIL                      │
 │  ─────────────────    │  ─────────────    │  ─────────────────────────          │
-│ ▸ BV-123 (3 commits)  │    ┃              │  abc1234 - Fix auth race            │
-│   🎯 BV-456 (1)       │   ━╋━ Jan 15      │  Author: alice@example.com          │
-│   🔗 BV-789 (5)       │    ┃   ▪▪▪        │  Date:   2025-01-15 14:32           │
-│   📁 BV-100 (2)       │   ━╋━ Jan 14      │  Confidence: 0.85 (explicit)        │
-│                       │    ┃   ▪          │                                      │
-│                       │   ━╋━ Jan 13      │  Files changed:                      │
-│                       │    ┃   ▪▪▪▪▪      │    M pkg/auth/session.go            │
+│ ▸ BV-123 (3 commits)  │ ▸ abc1234 Fix…    │  abc1234 - Fix auth race            │
+│   🎯 BV-456 (1)       │   def5678 Add…    │  Author: alice@example.com          │
+│   🔗 BV-789 (5)       │   fed4321 Test…   │  Date:   2025-01-15 14:32           │
+│   📁 BV-100 (2)       │                   │  Confidence: 0.85 (explicit)        │
+│                       │                   │                                      │
+│                       │                   │  Files changed:                      │
+│                       │                   │    M pkg/auth/session.go            │
 └───────────────────────┴───────────────────┴─────────────────────────────────────┘
 ```
 
 ### Timeline Panel
 
-On terminals wider than 150 columns (bead mode), the **Timeline Panel** appears automatically as a fourth pane, a visual density chart of project activity:
-
-- **Vertical axis**: Time (newest at top)
-- **Horizontal bars**: Activity density (commits per day)
-- **Bar magnitude**: ▪ = 1-2, ▪▪ = 3-5, ▪▪▪ = 6-10, ▪▪▪▪ = 11+
-- **Highlights**: Selected bead's commits are marked with `━`
+At 150 columns or wider in bead mode, the **Timeline Panel** appears automatically as a fourth pane. It lists the selected bead's lifecycle events and correlated commits chronologically, oldest first, with timestamps and event or commit details. It is not a project-wide activity-density chart.
 
 The pane is on by default at 150 columns or wider; press `t` in the History view to toggle it for the session (it needs bead mode and at least 100 columns).
 
@@ -2144,8 +2140,8 @@ Each bead-commit correlation shows its **detection method** as a visual marker:
 | Marker | Meaning | Confidence |
 |--------|---------|------------|
 | **🎯 Direct** | Commit message explicitly mentions bead ID (`explicit_id`) | 0.70-0.99 |
-| **🔗 Temporal** | Commit by the assignee inside the bead's active window (`temporal_author`) | 0.20-0.85 |
-| **📁 File** | Commit changed code and the beads file together (`co_committed`) | 0.85-0.99 |
+| **🔗 Temporal** | Code commit by the recorded claim author between retained claim and close events (`temporal_author`) | 0.20-0.85 |
+| **📁 File** | Commit changed code and the beads file together (`co_committed`) | 0.80-0.99 |
 
 A pair matched by more than one strategy shows the highest-confidence marker; a confirmed pair (`--robot-confirm-correlation`) is pinned to confidence 1.0 and flagged `confirmed`.
 
@@ -2192,7 +2188,7 @@ Navigate to a file and press `Enter` to see all beads and commits that touched i
 | `v` | Toggle Bead Mode ↔ Git Mode |
 | `f` | Toggle File-centric drill-down |
 | **Filtering** | |
-| `c` | Cycle confidence threshold (0.0 → 0.3 → 0.5 → 0.7) |
+| `c` | Cycle confidence threshold (0.0 → 0.5 → 0.75 → 0.9) |
 | `/` | Search commits or beads |
 | **Actions** | |
 | `y` | Copy selected commit SHA to clipboard |
@@ -2357,7 +2353,7 @@ Returns candidate commits with probable bead matches:
 **Use cases:**
 - **Hygiene**: Find commits that slipped through without proper linking
 - **Audit**: Ensure all code changes are tracked to work items
-- **Correlation improvement**: Train the system by confirming/rejecting suggestions
+- **Correlation improvement**: Confirm or reject a specific commit/bead pair; feedback changes that pair's treatment, not a learned model for other pairs.
 
 ### Related Work Discovery
 
@@ -2591,13 +2587,13 @@ The search adapter reads cass's `.hits`, requests preview and timestamp fields, 
 
 ### Status Bar Indicator
 
-The footer carries two cass indicators: the health badge from the startup check (`🤖 cass` or `⚠ cass index`) and, once a session lookup has run, a `📎N` count of correlated sessions for the selected bead. bv does not show per-model "active" agent activity; that information is not part of the cass integration.
+The footer carries two cass indicators: the health badge from the startup check (`🤖 cass` or `⚠ cass index`) and, once a session lookup succeeds, a `📎N` count of search hits for the selected bead before correlation filtering. The preview contains at most three qualifying sessions, so its count can differ. bv does not show per-model "active" agent activity; that information is not part of the cass integration.
 
 | State | Display | Meaning |
 |-------|---------|---------|
 | **Available** | 🤖 cass | Startup health check found a usable cass index |
 | **Index needs attention** | ⚠ cass index | Startup check reported an unhealthy or stale index |
-| **Correlated sessions** | 📎N | Session count for the selected bead after lookup; counts above nine display as 9+ |
+| **Search hits** | 📎N | Cached search total before correlation filtering; counts above nine display as 9+ |
 
 ### Installing Cass
 
@@ -2622,68 +2618,34 @@ When cass is available, press `V` in History to open the separate session modal 
 
 ## 📅 Sprint Dashboard: Burndown & Progress Tracking
 
-The **Sprint Dashboard** (`pkg/ui/sprint_view.go`) shows sprint progress with burndown visualization, scope change tracking, and at-risk detection, driven by `.beads/sprints.jsonl`. Press `P` from the list or detail view to open it on the sprint active today (the status line says so when no sprints are defined); `j`/`k` step between sprints, and `P`, `Esc`, or `q` close it.
+The **Sprint Dashboard** (`pkg/ui/sprint_view.go`) shows sprint progress, a simple burndown chart, at-risk items, and sprint beads, driven by `.beads/sprints.jsonl`. Historical scope changes are available through `--robot-burndown`, not this dashboard. Press `P` from the list or detail view to open it on the sprint active today (the status line says so when no sprints are defined); `j`/`k` step between sprints, and `P`, `Esc`, or `q` close it.
 
 ### Dashboard Layout
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  📅 Sprint: January 2025                                                │
-│  ───────────────────────────────────────────────────────────────────    │
-│  Dates:     Jan 6 → Jan 20                                              │
-│  Remaining: 5 days                                                      │
-│                                                                         │
-│  ══════════════════════════════════════════════════════════════════    │
-│                          PROGRESS                                       │
-│  ══════════════════════════════════════════════════════════════════    │
-│                                                                         │
-│  Total: 24 beads    Closed: 18 (75%)    Remaining: 6                    │
-│  [████████████████████░░░░░░] 75%                                       │
-│                                                                         │
-│  ══════════════════════════════════════════════════════════════════    │
-│                          BURNDOWN                                       │
-│  ══════════════════════════════════════════════════════════════════    │
-│                                                                         │
-│  24 ┤ ·                                                                 │
-│  20 ┤  ·····                                                            │
-│  16 ┤       ····▸                                                       │
-│  12 ┤            ╲    (ideal)                                           │
-│   8 ┤             ╲                                                     │
-│   4 ┤              ╲                                                    │
-│   0 ┼──────────────────────────────────────────────────────────────    │
-│     Jan 6          Jan 13                Jan 20                         │
-│                                                                         │
-│  Legend: · = Actual    ╲ = Ideal    ▸ = Today                           │
-│                                                                         │
-│  ══════════════════════════════════════════════════════════════════    │
-│                       SCOPE CHANGES                                     │
-│  ══════════════════════════════════════════════════════════════════    │
-│                                                                         │
-│  Jan 8:  +2 beads added (BV-456, BV-457)                                │
-│  Jan 10: -1 bead removed (BV-100 moved to backlog)                      │
-│                                                                         │
-│  ══════════════════════════════════════════════════════════════════    │
-│                        AT-RISK ITEMS                                    │
-│  ══════════════════════════════════════════════════════════════════    │
-│                                                                         │
-│  ⚠ BV-789 - Auth refactor (3d stale)                                    │
-│  ⚠ BV-234 - Token rotation (5d stale)                                   │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+The dashboard presents these sections in order:
+
+| Section | Display |
+|---------|---------|
+| Sprint header | Name, date range, days remaining |
+| Progress | Closed/total count, percentage, progress bar |
+| Status | Closed, in-progress, blocked, and other open counts |
+| Burndown | `·` linear ideal and `●` current remaining count |
+| At Risk | Up to five flagged beads and their reasons |
+| Beads | Sprint issue rows |
 
 ### Burndown Calculation
 
-The burndown chart tracks completion velocity and records scope changes:
+The TUI draws a linear ideal from the current sprint total and marks today's remaining count. The richer `--robot-burndown` output provides completion rates and historical scope changes:
 
 1. **Ideal Burn Rate:** `Total Beads / Sprint Duration`
 2. **Actual Burn Rate:** `Closed Beads / Days Elapsed`
 3. **Scope Events:** Added/removed beads are listed with their dates
 
-The ideal line is scope-aware: it starts from the scope the sprint began with, and at each scope-change date the remaining count moves by the added or removed beads and the line re-linearizes from that day's count to zero at the sprint end, so a mid-sprint addition shows as a slope change instead of a false "behind schedule" gap.
+The robot output's `ideal_line` is scope-aware: it starts from the scope the sprint began with, and at each scope-change date the remaining count moves by the added or removed beads and the line re-linearizes from that day's count to zero at the end of the inclusive sprint window. The TUI's simpler chart does not display this historical line.
 
 ### At-Risk Detection
 
-At-risk detection (`analysis.DetectAtRisk`, shared by the dashboard and `--robot-burndown`'s `at_risk` array) flags any open sprint bead that trips one or more of four signals: `blocked_too_long` (blocked for 2+ days), `no_activity` (no update for 4+ days), `critical_blocked` (a P0/P1 bead that is blocked at all), and `blockers_not_closing` (an open blocker that has itself been idle 4+ days). Each item reports its signals, the instant it has been at risk since, and a one-line detail; the dashboard lists up to five.
+At-risk detection (`analysis.DetectAtRisk`, shared by the dashboard and `--robot-burndown`'s `at_risk` array) flags any open sprint bead that trips one or more of four signals: `blocked_too_long` (blocked for 2+ days), `no_activity` (no update for 4+ days), `critical_blocked` (a P0/P1 bead that is blocked at all), and `blockers_not_closing` (an open blocker that has itself been idle 4+ days). Each item reports its signals, a reference timestamp for the triggering condition, and a one-line detail; blocked duration is estimated from available issue/dependency timestamps. The dashboard lists up to five.
 
 ### Robot Commands
 
@@ -2694,25 +2656,25 @@ bv --robot-burndown current           # Burndown for active sprint
 bv --robot-burndown sprint-1          # Burndown for specific sprint
 ```
 
-**Burndown Output** (`BurndownOutput` in `cmd/bv/main.go`):
+**Burndown Output** (illustrative excerpt from `BurndownOutput` in `cmd/bv/main.go`; metadata and additional daily points omitted):
 ```json
 {
   "sprint_id": "sprint-1",
   "sprint_name": "January 2025",
   "start_date": "2025-01-06T00:00:00Z",
   "end_date": "2025-01-20T00:00:00Z",
-  "total_days": 14,
+  "total_days": 15,
   "elapsed_days": 9,
-  "remaining_days": 5,
+  "remaining_days": 6,
   "total_issues": 24,
   "completed_issues": 18,
   "remaining_issues": 6,
-  "ideal_burn_rate": 1.71,
+  "ideal_burn_rate": 1.6,
   "actual_burn_rate": 2.0,
   "projected_complete": "2025-01-18T00:00:00Z",
   "on_track": true,
   "daily_points": [{"date": "2025-01-06T00:00:00Z", "remaining": 24, "completed": 0}],
-  "ideal_line": [{"date": "2025-01-06T00:00:00Z", "remaining": 24, "completed": 0}],
+  "ideal_line": [{"date": "2025-01-06T00:00:00Z", "remaining": 23, "completed": 1}],
   "scope_changes": [
     {"date": "2025-01-08T00:00:00Z", "issue_id": "BV-456", "issue_title": "Add OAuth scopes", "action": "added"}
   ]
@@ -2728,17 +2690,12 @@ Press `[` (or `F3`) to open the **Label Dashboard**—a table view showing healt
 ### Label Dashboard Layout
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  🏷️ LABEL HEALTH                                                        │
-├──────────────┬────────┬────────┬────────┬────────┬────────┬────────────┤
-│  Label       │ Health │ Status │ Open   │ Blocked│ Stale  │ Velocity   │
-├──────────────┼────────┼────────┼────────┼────────┼────────┼────────────┤
-│  🔴 api      │   32   │ CRIT   │   12   │   5    │   3    │   0.8/wk   │
-│  🟡 auth     │   58   │ WARN   │    8   │   2    │   1    │   2.1/wk   │
-│  🟢 ui       │   85   │ OK     │    4   │   0    │   0    │   4.2/wk   │
-│  🟢 docs     │   92   │ OK     │    2   │   0    │   0    │   1.5/wk   │
-│  🟡 infra    │   61   │ WARN   │    6   │   1    │   2    │   1.2/wk   │
-└──────────────┴────────┴────────┴────────┴────────┴────────┴────────────┘
+Label    Health           Blocked  Velocity 7d/30d  Stale
+api       32 ███░░░░░░░    5        1/4              3
+auth      58 █████░░░░░    2        2/8              1
+infra     61 ██████░░░░    1        1/5              2
+ui        85 ████████░░    0        4/16             0
+docs      92 █████████░    0        1/6              0
 ```
 
 ### Health Score Calculation
@@ -2752,7 +2709,7 @@ $$
 | Component | Weight | Meaning |
 |-----------|--------|---------|
 | **Velocity** | 0.25 | Throughput of closed issues (recent closes score higher) |
-| **Freshness** | 0.25 | Share of issues updated within the stale threshold (14 days) |
+| **Freshness** | 0.25 | `100 - 100 × average_update_age_days / (2 × stale_threshold_days)`, truncated to an integer and clamped to 0–100. Averages nonzero update timestamps across all statuses; no timestamps yields 100. |
 | **Flow** | 0.25 | `100 - 5 x incoming cross-label dependencies` (fewer external blockers score higher) |
 | **Criticality** | 0.25 | Up to 50 points from the label's average PageRank relative to the project maximum, plus up to 50 from its highest betweenness |
 
@@ -2903,7 +2860,7 @@ If the `wasm/` assets are missing, the viewer automatically falls back to the JS
 
 ### Graph Visualization: Pre-computed Layout
 
-The export uses a **hybrid architecture** so the graph can render before the database has loaded:
+The export includes both graph-layout data and a SQLite database:
 
 | Component | Size | Purpose |
 |-----------|------|---------|
@@ -2912,13 +2869,9 @@ The export uses a **hybrid architecture** so the graph can render before the dat
 
 Sizes are measured, not estimated: `tests/e2e/export_pages_test.go` re-exports this repository on every e2e run and checks the bundle against `tests/artifacts/perf/pages_load.json` (whole bundle 9.7 MB, of which 5.6 MB is the vendored viewer libraries); the record is rewritten only when the test runs with `BV_RECORD_PERF=1`, and a bundle that grows by more than a quarter fails the run.
 
-**How it works:**
-1. Browser loads the small `graph_layout.json` first
-2. Graph renders with pre-computed `fx`/`fy` fixed positions
-3. SQLite loads in parallel for search and detail functionality
-4. Force simulation is bypassed—no jittering, no layout delay
+**Current viewer behavior:** `viewer.js` waits for SQLite to load, then initializes the graph with live force simulation. Although `graph.js` supports loading pre-computed positions, the viewer currently passes no pre-computed layout. Exporting `graph_layout.json` therefore does not make the graph render before the database, fix node positions, or bypass simulation.
 
-Load-time figures are not measured in the repository yet; the sizes above are from this repository's own export.
+Load-time figures are not measured in the repository yet; the sizes above are from the retained September 2, 2026 export, not a measurement of the current checkout.
 
 ### Detail Pane
 
@@ -2947,7 +2900,7 @@ Click any node to open a **400px sliding detail pane**:
 - Priority, type, status with visual indicators
 - **Blockers count** ("⛔ 3 blockers")—issues that must complete first
 - **Blocks count** ("📤 blocks 5 issues")—downstream work waiting on this
-- PageRank, betweenness metrics (from pre-computed data)
+- PageRank, betweenness metrics (current graph metrics)
 
 ### Features
 
@@ -3603,7 +3556,7 @@ Each typed action contains `argv` and `working_directory`. Inspect `.actions.sho
 
 ### Output Examples
 
-**`--robot-priority` Output:**
+**`--robot-priority` Output (illustrative excerpt; metadata and score details omitted):**
 ```json
 {
   "generated_at": "2025-01-15T10:30:00Z",
@@ -3619,8 +3572,8 @@ Each typed action contains `argv` and `working_directory`. Inspect `.actions.sho
   ],
   "summary": {
     "total_issues": 58,
-    "recommendations": 12,
-    "high_confidence": 5
+    "recommendations": 1,
+    "high_confidence": 1
   }
 }
 ```
@@ -3894,7 +3847,7 @@ In complex software projects, tasks are not isolated. They are deeply interconne
 
 `bv` adopts a **Graph-First** philosophy:
 1.  **Structure is Reality:** The dependency graph *is* the project. The list view is just a projection of that graph.
-2.  **Explicit Blocking:** We don't just "relate" tasks; we define strict "blocks". If A blocks B, you literally cannot mark B as "Ready" in `bv` until A is Closed.
+2.  **Explicit Blocking:** If A blocks B, `bv` withholds B from ready work until A is closed or tombstoned. Other direct and inherited dependency gates, status, and deferral must also permit readiness.
 3.  **Local-First, Text-Based:** Your project data lives in your repo (`.beads/issues.jsonl`, or legacy `.beads/beads.jsonl`), not on a remote server. It travels with your code, branches with your git, and merges with your PRs.
 
 ---
@@ -3918,16 +3871,16 @@ Robot commands (`BV_ROBOT=1`, which every `--robot-*` flag sets) keep a disk cac
 `bv` includes engine microbenchmarks and a separate latency harness. The release gate's best observed `ns/op` comparison does not establish p95/p99 interaction latency:
 
 ```bash
-# Run all benchmarks
+# Run the ten tracked benchmarks
 ./scripts/benchmark.sh
 
 # Save current performance as baseline
 ./scripts/benchmark.sh baseline
 
-# Compare against baseline (requires benchstat)
+# Compare against baseline (built-in comparison; no benchstat required)
 ./scripts/benchmark.sh compare
 
-# Quick benchmarks (CI mode)
+# Run a one-shot subset
 ./scripts/benchmark.sh quick
 ```
 
@@ -3938,7 +3891,7 @@ Robot commands (`BV_ROBOT=1`, which every `--robot-*` flag sets) keep a disk cac
 - **Timeout Verification**: Ensures large graphs don't hang
 
 **Timeout Protection:**
-All expensive algorithms (Betweenness, PageRank, HITS, Cycle detection) have per-metric timeouts chosen by graph size (2 s under 100 nodes, 500 ms under 500, 300 ms under 2,000, 200 ms above; see `ConfigForSize` in `pkg/analysis/config.go`) to prevent blocking on large or pathological graphs.
+Betweenness, PageRank, HITS, and cycle detection use size-based timeouts or skip rules. Below 100 nodes the timeout is 2 s; below 500 it is 500 ms. At 500–1,999 nodes, sampled betweenness gets 500 ms on sparse graphs and is skipped on dense graphs; the other three get 300 ms. At 2,000 or more nodes, sampled betweenness gets 500 ms, PageRank gets 200 ms, cycles are skipped, and HITS gets 200 ms only on sufficiently sparse graphs. See `ConfigForSize` in `pkg/analysis/config.go` and [Timeout & Approximation Semantics](#️-timeout--approximation-semantics) for overrides.
 
 **Detailed Tuning Guide:**
 For comprehensive performance documentation including troubleshooting, size-based algorithm selection, and tuning options, see [docs/performance.md](docs/performance.md).
@@ -4004,7 +3957,7 @@ The fastest way to get started. Detects your OS and architecture automatically.
 Prefer Homebrew, Scoop, or a checksum-verified release archive above. If you do pipe the script, pin it to a commit you have read instead of the moving `main` branch:
 
 ```bash
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/03f92509bceb9da31540167c223c10f16c279767/install.sh
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.sh
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.sh" | bash
 ```
 
@@ -4337,7 +4290,7 @@ Copyright (c) 2026 Jeffrey Emanuel
 ---
 
 ## 🤖 Why Robots Love bv
-- Deterministic JSON contracts: robot commands emit stable field names, stable ordering (ties broken by ID), and include `data_hash`, `analysis_config`, and `generated_at` so multiple calls can be correlated safely.
+- Robot JSON contracts use stable field names and explicit ordering. Issue-backed responses include `data_hash` and `generated_at`; metric-bearing commands also include `analysis_config` and `status`. Metadata-only commands have their own schemas, and `--robot-help` emits text. Use `--robot-schema` for each command's contract.
 - Health flags: every expensive metric reports status (`computed`, `timeout`, `skipped`) plus elapsed ms; sampled betweenness stays `computed` with `reason: "approximate"` and the `sample` size used.
 - Consistent analysis: robot subcommands use common analysis and cache code. Cache reuse depends on issue data and analysis configuration; different candidate scopes, reference clocks, or metric timeouts can legitimately produce different outputs.
 - Instant + eventual completeness: Phase 1 metrics are available immediately; Phase 2 fills in and the status flags tell you when it is done or if it degraded.
@@ -4427,7 +4380,7 @@ Copyright (c) 2026 Jeffrey Emanuel
 
 ## 🔒 Security & Privacy Notes
 - Local-first: all analysis happens on your repo's JSONL; no network required for robots.
-- Exports run only when you ask for them; hooks run whenever `.bv/hooks.yaml` exists in the project (`--no-hooks` skips them, and credential-bearing environment variables are scrubbed from hook subprocesses). Update checks are silent and tolerate network failures without impacting startup.
+- Exports run only when you ask for them. Report exports (`--export` / `--export-md`) and Pages exports can run configured pre/post-export hooks from `.bv/hooks.yaml` (`--no-hooks` skips them, and credential-bearing environment variables are scrubbed from hook subprocesses). Merely starting `bv` or running a robot analysis does not run export hooks. Update checks are silent and tolerate network failures without impacting startup.
 
 ---
 

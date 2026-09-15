@@ -419,6 +419,18 @@ func TestAgentsMD_HasRCHTrustBoundary(t *testing.T) {
 // without the other fails here.
 func TestDocsParity_ReadmeBlurbMatchesGenerated(t *testing.T) {
 	readme := repoFile(t, "README.md")
+	start := strings.Index(readme, agents.BlurbStartMarker)
+	if start < 0 {
+		t.Fatalf("README is missing current blurb marker %s", agents.BlurbStartMarker)
+	}
+	end := strings.Index(readme[start:], agents.BlurbEndMarker)
+	if end < 0 {
+		t.Fatal("README blurb is missing its end marker")
+	}
+	copied := readme[start : start+end+len(agents.BlurbEndMarker)]
+	if copied != strings.TrimSpace(agents.AgentBlurb) {
+		t.Fatal("README copied blurb differs from AgentBlurb; additions and omissions must be synchronized in both directions")
+	}
 	var missing []string
 	for _, line := range strings.Split(agents.AgentBlurb, "\n") {
 		trimmed := strings.TrimSpace(line)

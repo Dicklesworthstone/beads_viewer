@@ -12,10 +12,10 @@ import (
 
 // BlurbVersion is the current version of the agent instructions blurb.
 // Increment this whenever the instructions change so installed blocks refresh.
-const BlurbVersion = 6
+const BlurbVersion = 7
 
 // BlurbStartMarker marks the beginning of injected agent instructions.
-const BlurbStartMarker = "<!-- bv-agent-instructions-v6 -->"
+const BlurbStartMarker = "<!-- bv-agent-instructions-v7 -->"
 
 // BlurbEndMarker marks the end of injected agent instructions.
 const BlurbEndMarker = "<!-- end-bv-agent-instructions -->"
@@ -23,10 +23,10 @@ const BlurbEndMarker = "<!-- end-bv-agent-instructions -->"
 const blurbStartPrefix = "<!-- bv-agent-instructions-v"
 
 // AgentBlurb contains the instructions to be appended to AGENTS.md files.
-// This is the v6 blurb: v5 plus atomic br claim guidance.
+// This is the v7 blurb: v6 plus explicit robot output-format exceptions.
 // Bump the version whenever the text
 // changes: --agents-add refreshes installed blocks by version, not content.
-const AgentBlurb = `<!-- bv-agent-instructions-v6 -->
+const AgentBlurb = `<!-- bv-agent-instructions-v7 -->
 
 ---
 
@@ -80,7 +80,7 @@ Recommendations can include blocked or assigned work; ` + "`" + `triage.quick_re
 | ` + "`" + `--robot-diff --diff-since <ref>` + "`" + ` | Changes since ref: new/closed/modified issues |
 | ` + "`" + `--robot-graph [--graph-format=json\|dot\|mermaid]` + "`" + ` | Dependency graph export |
 
-Every robot command emits one JSON object; with ` + "`" + `--graph-format=dot` + "`" + ` or ` + "`" + `mermaid` + "`" + ` the diagram text is the ` + "`" + `graph` + "`" + ` field (` + "`" + `bv --robot-graph --graph-format=dot | jq -r .graph` + "`" + `), not the whole output.
+Robot analysis commands default to JSON; ` + "`" + `--format toon` + "`" + ` selects TOON, and ` + "`" + `--robot-help` + "`" + ` defaults to text. In JSON mode, ` + "`" + `--graph-format=dot` + "`" + ` or ` + "`" + `mermaid` + "`" + ` puts diagram text in the ` + "`" + `graph` + "`" + ` field (` + "`" + `bv --robot-graph --graph-format=dot | jq -r .graph` + "`" + `).
 
 #### Scoping & Filtering
 
@@ -96,6 +96,11 @@ bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank scores
 Use exactly one command family, matching the tracker configured for the repository.
 
 #### Rust beads_rust (` + "`" + `br` + "`" + `)
+
+Use ` + "`" + `br` + "`" + ` 0.6.0 or newer when executing saved claim commands. It rechecks
+deferred status and future ` + "`" + `defer_until` + "`" + ` values when the claim runs, so a
+recommendation captured before a deferral cannot bypass it. This requirement
+applies to executing tracker claims.
 
 ` + "```" + `bash
 br ready --json                       # Show issues ready to work (no blockers)

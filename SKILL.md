@@ -194,9 +194,9 @@ When running `bv` interactively (not for agents):
 |-----|------|
 | `l` | Label picker (quick filter by label) |
 | `b` | Kanban board |
-| `g` | Graph view (dependency DAG) |
+| `g` | Graph view (directed dependencies, including cycles) |
 | `E` | Tree view (parent-child hierarchy) |
-| `i` | Insights dashboard (6-panel metrics) |
+| `i` | Insights dashboard (10 panels, including priority recommendations) |
 | `h` | History view (bead-to-commit correlation) |
 | `a` | Actionable plan (parallel tracks) |
 | `f` | Flow matrix (cross-label dependencies) |
