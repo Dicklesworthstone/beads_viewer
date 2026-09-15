@@ -12,6 +12,40 @@ checked-in Beads history, retained release receipts, then existing release
 documentation. Public source links belong in the changelog; local execution
 evidence supplements them here.
 
+## September 15 post-release update
+
+Coverage: complete non-tracker history `v0.25.0..f513f019`, eleven commits.
+Reviewed the existing v0.25.0 publication entry, Nix instruction/verification
+diffs, duplicate detector and tests, theme conversion and tests, and the
+clock-only drift regression repair. The live GitHub API still identifies
+v0.25.0 as published on 2026-09-12T19:39:38Z; its tag resolves to `87cee258`.
+The new capabilities are therefore Unreleased, not another published version.
+
+The duplicate campaign comprises `d30cceef`, `340dc1c5`, `78b62358`,
+`cb004dce`, `f4c7310f`, and `2d57b6ae`. The changelog quantifies only the
+last bounded-selection step, using `/tmp/bv-topk-before-20260915.log` and
+`/tmp/bv-topk-after-20260915.log`: five runs each, median 42,843,184 to
+2,182,064 B/op and 232,327,096 to 30,666,439 ns/op. The original 48-case
+fingerprint, 54 limit/order/threshold comparisons, and explicit repeated-ID
+source scores/explanations passed. The remaining overlap-counting work is
+not bounded by the requested result count.
+
+`174b1d3a` precomputes reusable theme palette values. Its final tests cover
+72 ordinary profile/background/color combinations and seven supported
+out-of-range numeric cases. Label rendering uses 168 to 152 B/op and ten to
+nine allocations; timing varied across runs. The pre/post UI diagnostic did
+not establish a latency improvement, so none is claimed for this change.
+`f513f019` aligns a fixture analyzer with the existing calculator clock;
+the failed September 15 confidence probe is retained, and no threshold changed.
+
+`c938d400` corrects consumer-flake unfree configuration; `d1de341f` records
+actual Nix build/executable checks and the distinct RCH timeout. `017ea57a`
+records v0.25.0 publication already covered by the released entry. Beads
+`bv-apal.1` and `bv-oonu.9` remain incomplete. The latest single UI cohort's
+33.641960 ms p99 and seven refreshes do not replace the full paired matrix.
+The current-only UI sweep started during this documentation update is not
+credited before its result, and cannot itself complete the original matrix.
+
 ## September 12 release preparation
 
 Publication completed at **2026-09-12T19:39:38Z**, tag `v0.25.0`, source

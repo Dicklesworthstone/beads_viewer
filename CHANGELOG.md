@@ -3,8 +3,9 @@
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
 Scope window: this update verifies `v0.24.0..v0.24.1` and the post-release
-commits through [`87cee258`](https://github.com/Dicklesworthstone/beads_viewer/commit/87cee258), including the September 10 canonical-source and Cass
-repairs, September 11 performance work, and September 12 dependency campaign.
+commits through [`f513f019`](https://github.com/Dicklesworthstone/beads_viewer/commit/f513f019), including the September 10 canonical-source and Cass
+repairs, September 11 performance work, September 12 dependency campaign,
+and September 14–15 duplicate-detection, theme-rendering, and Nix documentation changes.
 v0.25.0 was published after its complete clean-source release gate passed.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
@@ -26,6 +27,47 @@ the latest tag, including installer changes usable with already released binarie
 | [`v0.21.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.21.0) | 2026-08-23 | GitHub Release | Strict robot-count semantics, bounded history liveness, theme selection, and cache-path repairs. |
 
 ---
+
+## Unreleased
+
+### Duplicate detection and rendering
+
+- Duplicate detection now retains only the requested best candidates for
+  unique issue IDs instead of storing and sorting every matching pair. It
+  preserves score/ID ordering and source-specific keyword explanations;
+  repeated IDs retain the existing full-sort behavior. Earlier changes defer
+  explanations until selection, compact candidate storage, and reuse overlap
+  counts. The final bounded-selection step reduced the dense 500-issue
+  benchmark's median allocation from 42.8 MB to 2.18 MB and time from 232 ms
+  to 31 ms across five runs on the same Linux worker with Go 1.26.8 and
+  GOMAXPROCS=4. Overlap enumeration can still be quadratic
+  ([bounded selection](https://github.com/Dicklesworthstone/beads_viewer/commit/f4c7310f6a64ab8fe964cf3ba877874a020d9abb);
+  [source-pair regression](https://github.com/Dicklesworthstone/beads_viewer/commit/2d57b6ae)).
+- Reusable theme styles precompute ANSI palette conversions while retaining
+  live light/dark and terminal-profile selection. Exact rendering comparisons
+  cover all four profiles; out-of-range numeric colors preserve their original
+  lazy behavior. The focused ANSI256 label benchmark uses nine allocations
+  instead of ten; it does not establish an application-wide latency gain
+  ([palette conversion](https://github.com/Dicklesworthstone/beads_viewer/commit/174b1d3aea10bc6e95b21cba35d1e0b2bc371cdd)).
+- A priority-confidence test now uses the calculator's fixed clock when
+  selecting its fixture, preventing calendar-dependent staleness from
+  invalidating the test. Its confidence thresholds and assertions are unchanged
+  ([fixture clock](https://github.com/Dicklesworthstone/beads_viewer/commit/f513f0194383deceb938aa3656c27898c47d3047)).
+
+These changes advance `bv-apal.1`; its full performance qualification remains
+open. The targeted Unicode/1,000-issue background-refresh run passed at
+33.6 ms p99 over 1,000 samples, but does not replace the original full matrix.
+
+### Nix usage and verification
+
+- The README now explains that another flake's `nixpkgs` configuration does
+  not configure `bv`'s own import. Consumers of its exported package must keep
+  the documented explicit unfree allowance
+  ([corrected instructions](https://github.com/Dicklesworthstone/beads_viewer/commit/c938d4000fa9fe8c646f9ef8eae4f44205c23053)).
+- Native Linux amd64 Nix build and executable checks were completed against
+  the v0.25.0 source. The subsequent RCH source-verification timeout and the
+  remaining native-platform gaps are recorded separately in
+  [release verification](docs/RELEASING.md); this does not close `bv-oonu.9`.
 
 ## v0.25.0 — 2026-09-12
 
