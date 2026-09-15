@@ -188,6 +188,7 @@ func TestTreeBuildRootlessComponents(t *testing.T) {
 	}{
 		{"self parent", []model.Issue{issue("self", "self")}, []string{"self"}},
 		{"descendant before cycle", []model.Issue{issue("a-child", "b"), issue("b", "c"), issue("c", "b")}, []string{"b"}},
+		{"multiple cycle parents", []model.Issue{issue("a-child", "missing", "c", "b"), issue("b", "c"), issue("c", "b")}, []string{"b"}},
 		{"mixed components", []model.Issue{issue("root"), issue("child", "root"), issue("orphan", "missing"), issue("b", "c"), issue("c", "b"), issue("self", "self")}, []string{"root", "orphan", "b", "self"}},
 		{"reachable cycle", []model.Issue{issue("root"), issue("b", "c", "root"), issue("c", "b")}, []string{"root"}},
 	} {
@@ -198,6 +199,13 @@ func TestTreeBuildRootlessComponents(t *testing.T) {
 					for i, j := 0, len(issues)-1; i < j; i, j = i+1, j-1 {
 						issues[i], issues[j] = issues[j], issues[i]
 					}
+					for i := range issues {
+						deps := append([]*model.Dependency(nil), issues[i].Dependencies...)
+						for j, k := 0, len(deps)-1; j < k; j, k = j+1, k-1 {
+							deps[j], deps[k] = deps[k], deps[j]
+						}
+						issues[i].Dependencies = deps
+					}
 				}
 				before, err := json.Marshal(issues)
 				if err != nil {
@@ -206,8 +214,10 @@ func TestTreeBuildRootlessComponents(t *testing.T) {
 				for _, snapshot := range []bool{false, true} {
 					tree := NewTreeModel(newTreeTestTheme())
 					tree.SetBeadsDir(t.TempDir())
+					tree.SetSize(100, 40)
 					if snapshot {
 						roots, nodes := buildIssueTreeNodes(issues)
+						roots, nodes = deepCopyTree(roots, nodes, nil)
 						tree.BuildFromSnapshot(&DataSnapshot{Issues: issues, TreeRoots: roots, TreeNodeMap: nodes, DataHash: "cycle-fixture"})
 					} else {
 						tree.Build(issues)
@@ -233,6 +243,12 @@ func TestTreeBuildRootlessComponents(t *testing.T) {
 						for _, iss := range issues {
 							if !visible[iss.ID] {
 								t.Fatalf("reverse=%v snapshot=%v: issue %s disappeared", reverse, snapshot, iss.ID)
+							}
+						}
+						view := tree.View()
+						for _, iss := range issues {
+							if !strings.Contains(view, iss.ID) {
+								t.Fatalf("expanded view omits %s", iss.ID)
 							}
 						}
 						if tree.NodeCount() > 3*len(issues) {

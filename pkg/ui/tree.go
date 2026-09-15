@@ -308,6 +308,49 @@ func buildIssueTreeNodes(issues []model.Issue) ([]*IssueTreeNode, map[string]*Is
 		}
 	}
 
+	// A component made entirely of parent-child cycles has no natural root.
+	// Follow a deterministic parent chain from each unrepresented issue to a
+	// cycle member and use that member as a display root. Starting at an
+	// arbitrary descendant would unnecessarily split its hierarchy into roots.
+	// The existing path guard keeps the resulting tree finite; source
+	// dependencies are not changed.
+	var remaining []string
+	if len(t.issueMap) < len(issueByID) {
+		for id := range issueByID {
+			if t.issueMap[id] == nil {
+				remaining = append(remaining, id)
+			}
+		}
+	}
+	sort.Strings(remaining)
+	for _, id := range remaining {
+		if t.issueMap[id] != nil {
+			continue
+		}
+		onPath := make(map[string]bool)
+		for !onPath[id] {
+			onPath[id] = true
+			parent := ""
+			foundParent := false
+			for _, dep := range issueByID[id].Dependencies {
+				if dep == nil || dep.Type != model.DepParentChild || issueByID[dep.DependsOnID] == nil {
+					continue
+				}
+				if !foundParent || dep.DependsOnID < parent {
+					parent = dep.DependsOnID
+					foundParent = true
+				}
+			}
+			if !foundParent {
+				break
+			}
+			id = parent
+		}
+		if node := t.buildNode(issueByID[id], 0, childrenOf, nil, visited); node != nil {
+			t.roots = append(t.roots, node)
+		}
+	}
+
 	// Step 4: Sort roots by priority, type, then created date
 	t.sortNodes(t.roots)
 
