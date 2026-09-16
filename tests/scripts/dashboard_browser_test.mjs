@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 
 const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
@@ -188,6 +188,41 @@ function clean(page) {
 }
 async function resultIDs(page, expected) {
   await waitFor(page, `JSON.stringify([...document.querySelectorAll('[aria-label^="View issue "]')].filter(${visible}).map(e => e.getAttribute('aria-label').split(':')[0].slice(11)).sort()) === ${JSON.stringify(JSON.stringify([...expected].sort()))}`, `visible issue IDs ${expected}`);
+}
+
+async function graphReloadJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'reload fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'initial graph loaded');
+  const metrics = `(() => {const m=${app}.forceGraphModule.getMetrics();return {
+    vectors:{...Object.fromEntries(['pagerank','betweenness','criticalPath','eigenvector','kcore','slack'].map(k=>[k,m[k] === null ? null : Array.from(m[k])])),
+      hitsHub:m.hits === null ? null : Array.from(m.hits.hub),hitsAuthority:m.hits === null ? null : Array.from(m.hits.authority)},
+    cycles:m.cycles.cycles,articulation:[...m.articulationPoints],
+    nodes:${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>({id:n.id,pagerank:n.pagerank,betweenness:n.betweenness}))};})()`;
+  const before = await evaluate(page, metrics);
+  assert.equal(before.vectors.betweenness.length, 4, 'initial real WASM metric covers four nodes');
+  for (let cycle = 0; cycle < 2; cycle++) {
+    await evaluate(page, `${app}.forceGraphModule.loadData([],[],null)`);
+    const empty = await evaluate(page, metrics);
+    assert.equal(empty.vectors.betweenness, null, 'skipped empty-graph metric must not retain old scores');
+    for (const [name, values] of Object.entries(empty.vectors)) {
+      assert.ok(values === null || values.length === 0, `${name}: no scores from the previous graph`);
+    }
+    assert.deepEqual(empty.cycles, []);
+    assert.deepEqual(empty.articulation, []);
+    assert.deepEqual(empty.nodes, []);
+    assert.equal(await evaluate(page, `${app}.forceGraphModule.getWasmGraph().nodeCount()`), 0);
+    await evaluate(page, `(() => {const d=getGraphViewData();${app}.forceGraphModule.loadData(d.issues,d.dependencies,null);})()`);
+    const restored = await evaluate(page, metrics);
+    assert.deepEqual(restored, before, 'fresh computation restores exact metrics and node scores');
+    records.push({graphReload:cycle,page:page.name,empty,restored});
+  }
+  await capture(page, 'graph-reload');
+  clean(page);
+  console.log(`PASS: ${page.name} repeated populated/empty/restored graphs with fresh real WASM metrics`);
 }
 
 async function layoutSeedsJourney(page, edgeless = false) {
@@ -742,7 +777,10 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'layout-seeds') {
+  if (mode === 'graph-reload') {
+    await graphReloadJourney(desktop);
+    await graphReloadJourney(await openPage('mobile-360',360));
+  } else if (mode === 'layout-seeds') {
     await layoutSeedsJourney(desktop);
     await layoutSeedsJourney(await openPage('mobile-360', 360));
     if (updatedBundle) {
