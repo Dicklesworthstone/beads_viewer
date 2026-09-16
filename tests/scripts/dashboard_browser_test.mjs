@@ -263,6 +263,21 @@ async function graphReloadJourney(page) {
   assert.equal(cleanup.graph,null);
   assert.equal(cleanup.path.active,false);
   records.push({navigationCleanup:cleanup,page:page.name});
+  const cleanupPath = await evaluate(page, `(async () => {
+    const m=${app}.forceGraphModule,d=getGraphViewData();
+    await m.initGraph('graph-container');
+    m.loadData(d.issues,d.dependencies,null);
+    const path=m.animateCriticalPath(true);
+    m.cleanup();
+    window.__oldPathEvents=[];
+    return path;
+  })()`);
+  assert.ok(cleanupPath?.path.length >= 2, 'real animation started immediately before cleanup');
+  await delay(1000);
+  const afterCleanup = await evaluate(page, `({state:${app}.forceGraphModule.getCriticalPathState(),events:window.__oldPathEvents,graph:${app}.forceGraphModule.getGraph()})`);
+  assert.deepEqual(afterCleanup,{state:{active:false,path:[],length:0,currentStep:0},events:[],graph:null},
+    'cleanup cancels active traversal and its delayed completion');
+  records.push({activePathCleanup:afterCleanup,page:page.name});
   await capture(page, 'graph-reload');
   clean(page);
   console.log(`PASS: ${page.name} fresh metrics, replacement cycle navigation, cancelled path animation and cleanup`);

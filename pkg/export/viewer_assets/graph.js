@@ -940,6 +940,8 @@ function validateLayout(layout, issues, dependencies) {
  */
 export function loadData(issues, dependencies, layout = null) {
     resetWhatIf();
+    resetCriticalPath();
+    resetCycleNavigator();
     store.reset();
     store.issues = issues;
     store.dependencies = dependencies;
@@ -2319,6 +2321,7 @@ export function zoomToCycle(index = cycleNavigatorState.currentIndex) {
  */
 export function resetCycleNavigator() {
     cycleNavigatorState.active = false;
+    cycleNavigatorState.cycles = [];
     cycleNavigatorState.currentIndex = 0;
     cycleNavigatorState.highlightedCycleNodes.clear();
     cycleNavigatorState.highlightedCycleEdges.clear();
@@ -3242,6 +3245,8 @@ export function setConfig(key, value) {
 
 export function cleanup() {
     resetWhatIf();
+    resetCriticalPath();
+    resetCycleNavigator();
     store.resizeObserver?.disconnect();
     store.resizeObserver = null;
     store.graph?.pauseAnimation();
