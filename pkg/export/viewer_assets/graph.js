@@ -3638,7 +3638,7 @@ function goToCommit(idx) {
     timeTravelState.currentIdx = idx;
 
     // Calculate which nodes should be visible at this point
-    const visibleNodes = new Set();
+    const visibleNodes = new Set(timeTravelState.history.initial_beads || []);
     const visibleLinks = new Set();
 
     // Walk through history up to current index

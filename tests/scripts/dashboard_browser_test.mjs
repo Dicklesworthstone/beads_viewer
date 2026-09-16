@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 
 const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
@@ -199,6 +199,37 @@ function clean(page) {
 }
 async function resultIDs(page, expected) {
   await waitFor(page, `JSON.stringify([...document.querySelectorAll('[aria-label^="View issue "]')].filter(${visible}).map(e => e.getAttribute('aria-label').split(':')[0].slice(11)).sort()) === ${JSON.stringify(JSON.stringify([...expected].sort()))}`, `visible issue IDs ${expected}`);
+}
+
+async function timelineBaselineJourney(page) {
+  const history = JSON.parse(fs.readFileSync(path.join(bundle, 'data/history.json')));
+  assert.equal(history.commits.length, 500, 'real export reaches retained history limit');
+  const baseline = ['browser-detail', 'browser-root'];
+  assert.deepEqual(history.initial_beads, baseline, 'observed prior open issues seed baseline');
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'baseline fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'baseline graph loaded');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  const nodes = `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`;
+  await key(page, 't', 'KeyT');
+  await waitFor(page, `${state}.active`, 'keyboard enters retained timeline');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 0);
+  assert.deepEqual(await evaluate(page, nodes), baseline, 'first retained record includes older open issues, excludes closed and future creation');
+  await evaluate(page, `document.querySelector('#tt-slider').focus()`);
+  await key(page, 'End');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 499);
+  assert.deepEqual(await evaluate(page, nodes), ['browser-other', 'browser-root'], 'later creation and closure update baseline');
+  await key(page, 'Home');
+  assert.deepEqual(await evaluate(page, nodes), baseline, 'rewinding reconstructs initial visibility');
+  await click(page, '.timeline-close');
+  assert.deepEqual(await evaluate(page, nodes), ['browser-closed', 'browser-detail', 'browser-other', 'browser-root'], 'exit restores all current issues');
+  records.push({timelineBaseline:{initial:history.initial_beads,commits:history.commits.length},page:page.name});
+  await capture(page, 'timeline-baseline');
+  clean(page);
+  console.log(`PASS: ${page.name} retained baseline, later creation/closure, rewind and exit`);
 }
 
 async function timelineControlsJourney(page) {
@@ -1009,7 +1040,10 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'timeline-controls') {
+  if (mode === 'timeline-baseline') {
+    await timelineBaselineJourney(desktop);
+    await timelineBaselineJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-controls') {
     await timelineControlsJourney(desktop);
     await timelineControlsJourney(await openPage('mobile-360',360));
   } else if (mode === 'timeline') {

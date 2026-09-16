@@ -112,7 +112,52 @@ func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 		if !reflect.DeepEqual(history.Commits, want) {
 			t.Fatalf("run %d: lifecycle timeline mismatch\n got: %#v\nwant: %#v", run, history.Commits, want)
 		}
+		if len(history.InitialBeads) != 0 {
+			t.Fatalf("creation inside the retained window must not seed earlier visibility: %v", history.InitialBeads)
+		}
 	}
+	t.Run("retained_window", func(t *testing.T) {
+		// Push creation outside the real 500-source-commit window. The target
+		// is open at its boundary but closed now; current status is no baseline.
+		for i := 0; i <= 500; i++ {
+			status := "open"
+			if i == 500 {
+				status = "closed"
+			}
+			data := fmt.Sprintf("{\"id\":\"bv-a\",\"title\":\"Target %d\",\"status\":%q}\n{\"id\":\"bv-z\",\"title\":\"Closed %d\",\"status\":\"closed\"}\n", i, status, i)
+			if i >= 499 {
+				data += "{\"id\":\"bv-new\",\"title\":\"Created inside window\",\"status\":\"open\"}\n"
+			}
+			if err := os.WriteFile(".beads/issues.jsonl", []byte(data), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			git(i, "add", ".beads/issues.jsonl")
+			git(i, "commit", "-m", fmt.Sprintf("retained record %d", i))
+		}
+		history, err := generateHistoryForExport([]model.Issue{
+			{ID: "bv-a", Status: model.StatusClosed}, {ID: "bv-z", Status: model.StatusClosed},
+			{ID: "bv-new", Status: model.StatusOpen}, {ID: "bv-unknown", Status: model.StatusOpen},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(history)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var exported struct {
+			InitialBeads []string `json:"initial_beads"`
+		}
+		if err := json.Unmarshal(data, &exported); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(exported.InitialBeads, []string{"bv-a"}) {
+			t.Fatalf("observed unresolved baseline: got %v, want only bv-a (not closed, newly created, or unknown records)", exported.InitialBeads)
+		}
+		if len(history.Commits) != 500 || history.Commits[0].Message != "retained record 1" || !reflect.DeepEqual(history.Commits[499].BeadsClosed, []string{"bv-a"}) {
+			t.Fatalf("retained window or final closure incorrect: %#v", history)
+		}
+	})
 }
 
 func TestFilterByRepo_CaseInsensitiveAndFlexibleSeparators(t *testing.T) {

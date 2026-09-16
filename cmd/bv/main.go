@@ -7017,6 +7017,8 @@ jq -r '.recommendations[] | [.id, .score, .action] | @csv' triage.json
 type TimeTravelHistory struct {
 	GeneratedAt string             `json:"generated_at"`
 	Commits     []TimeTravelCommit `json:"commits"`
+	// InitialBeads were observed unresolved before their first retained event.
+	InitialBeads []string `json:"initial_beads,omitempty"`
 }
 
 // TimeTravelCommit represents a single commit in the time-travel history
@@ -7148,9 +7150,34 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		return order[commits[i].SHA] < order[commits[j].SHA]
 	})
 
+	var initialBeads []string
+	for beadID, history := range report.Histories {
+		var first *correlation.BeadEvent
+		for i := range history.Events {
+			event := &history.Events[i]
+			if _, ok := commitMap[event.CommitSHA]; !ok {
+				continue
+			}
+			if first == nil || order[event.CommitSHA] < order[first.CommitSHA] {
+				first = event
+			}
+		}
+		// A later observation or the current issue status cannot fill an unknown
+		// boundary. Only the first retained, successfully parsed transition can.
+		if first == nil || !first.TransitionObserved || first.Before == nil {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(first.Before.Status))
+		if status != "" && status != "closed" && status != "tombstone" {
+			initialBeads = append(initialBeads, beadID)
+		}
+	}
+	sort.Strings(initialBeads)
+
 	return &TimeTravelHistory{
-		GeneratedAt: robotNow().Format(time.RFC3339),
-		Commits:     commits,
+		GeneratedAt:  robotNow().Format(time.RFC3339),
+		Commits:      commits,
+		InitialBeads: initialBeads,
 	}, nil
 }
 

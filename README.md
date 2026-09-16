@@ -2862,8 +2862,10 @@ When history is included, graph time travel replays recorded issue creation,
 closure, and reopening in Git ancestry order. Editing a closed issue does not
 reopen it, and an inferred code correlation does not create a timeline event.
 This is a bounded view of the current exported issues, not a complete historical
-snapshot: history is limited to 500 source commits, issues whose creation falls
-outside that window may be absent, and deleted records are not reconstructed.
+snapshot: history is limited to 500 source commits. An issue whose creation
+predates that window starts visible when its earliest retained transition records
+an unresolved prior state. Issues without that evidence may be absent, and
+deleted records are not reconstructed.
 
 ### Graph Visualization: Pre-computed Layout
 
