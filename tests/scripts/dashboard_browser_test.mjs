@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 
 const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline', 'timeline-removal'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline', 'timeline-removal', 'timeline-animation'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
@@ -199,6 +199,82 @@ function clean(page) {
 }
 async function resultIDs(page, expected) {
   await waitFor(page, `JSON.stringify([...document.querySelectorAll('[aria-label^="View issue "]')].filter(${visible}).map(e => e.getAttribute('aria-label').split(':')[0].slice(11)).sort()) === ${JSON.stringify(JSON.stringify([...expected].sort()))}`, `visible issue IDs ${expected}`);
+}
+
+async function timelineAnimationJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'animation fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'animation graph loaded');
+  // Observe actual visible-canvas arcs without replacing the renderer or clock.
+  await evaluate(page, `(() => {
+    window.__paintedNode=${app}.forceGraphModule.getGraph().graphData().nodes.find(n=>n.id==='browser-detail');
+    window.__timelinePaint=[];
+    const arc=CanvasRenderingContext2D.prototype.arc;
+    CanvasRenderingContext2D.prototype.arc=function(x,y,r,...args) {
+      const n=window.__paintedNode;
+      if (this.canvas.isConnected && n && x===n.x && y===n.y) {
+        window.__timelinePaint.push({alpha:this.globalAlpha,r,at:performance.now()});
+      }
+      return arc.call(this,x,y,r,...args);
+    };
+  })()`);
+  const graph = `${app}.forceGraphModule.getGraph()`;
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  await key(page, 't', 'KeyT');
+  await delay(400);
+  const appearing = await evaluate(page, 'window.__timelinePaint');
+  assert.ok(appearing.some(p=>p.alpha>0 && p.alpha<0.9), 'actual canvas paints intermediate appearance alpha');
+  const fullRadius = Math.min(...appearing.filter(p=>p.alpha===1).map(p=>p.r));
+  assert.ok(Number.isFinite(fullRadius), 'appearance reaches full size and opacity');
+  await evaluate(page, `window.__timelinePaint=[]; document.querySelector('#tt-slider').focus()`);
+  await key(page, 'ArrowRight');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 1);
+  assert.equal(await evaluate(page, `${graph}.graphData().nodes.some(n=>n.id==='browser-detail')`), false, 'removed node immediately leaves interactive graph');
+  await delay(400);
+  const disappearing = await evaluate(page, 'window.__timelinePaint');
+  assert.ok(disappearing.some(p=>p.alpha>0 && p.alpha<0.9 && p.r<fullRadius), 'removed node actually fades and shrinks on canvas');
+  assert.equal(await evaluate(page, `${graph}.autoPauseRedraw()`), true, 'redraw returns to idle policy');
+  await evaluate(page, 'window.__timelinePaint=[]');
+  await delay(150);
+  assert.deepEqual(await evaluate(page, 'window.__timelinePaint'), [], 'no stale disappearing overlay');
+  // Reverse an unfinished appearance; it must fade from its current size.
+  await key(page, 'ArrowRight');
+  await delay(70);
+  await key(page, 'ArrowLeft');
+  await evaluate(page, 'window.__timelinePaint=[]');
+  await delay(300);
+  const reversed = await evaluate(page, 'window.__timelinePaint');
+  assert.ok(reversed.some(p=>p.alpha>0 && p.alpha<0.9), 'interrupted reverse scrub continues a partial fade');
+  assert.ok(reversed.every(p=>p.alpha<0.9), 'reverse scrub does not flash back to full opacity');
+  await key(page, 'ArrowRight');
+  await delay(50);
+  await click(page, '.timeline-close');
+  assert.equal(await evaluate(page, `${graph}.autoPauseRedraw()`), true, 'exit cancels transition redraw');
+  await evaluate(page, `${graph}.autoPauseRedraw(false)`);
+  await key(page, 't', 'KeyT');
+  await delay(300);
+  assert.equal(await evaluate(page, `${graph}.autoPauseRedraw()`), false, 'settling preserves an existing continuous-redraw policy');
+  await click(page, '.timeline-close');
+  assert.equal(await evaluate(page, `${graph}.autoPauseRedraw()`), false, 'exit preserves the previous redraw policy');
+  await evaluate(page, `${graph}.autoPauseRedraw(true)`);
+  await send('Emulation.setEmulatedMedia', {features:[{name:'prefers-reduced-motion',value:'reduce'}]}, page.session);
+  await evaluate(page, 'window.__timelinePaint=[]');
+  await key(page, 't', 'KeyT');
+  await delay(100);
+  const reducedPaint = await evaluate(page, 'window.__timelinePaint');
+  assert.ok(reducedPaint.length > 0 && reducedPaint.every(p=>p.alpha===1), 'reduced motion paints at full opacity without intermediate appearance');
+  await evaluate(page, `window.__timelinePaint=[]; document.querySelector('#tt-slider').focus()`);
+  await key(page, 'ArrowRight');
+  await evaluate(page, 'window.__timelinePaint=[]');
+  await delay(100);
+  assert.deepEqual(await evaluate(page, 'window.__timelinePaint'), [], 'reduced motion skips disappearing overlay');
+  records.push({timelineAnimation:{appearing,disappearing,reversed,fullRadius},page:page.name});
+  await capture(page, 'timeline-animation');
+  clean(page);
+  console.log(`PASS: ${page.name} real canvas fade/shrink, cleanup and reduced motion`);
 }
 
 async function timelineRemovalJourney(page) {
@@ -1079,7 +1155,10 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'timeline-removal') {
+  if (mode === 'timeline-animation') {
+    await timelineAnimationJourney(desktop);
+    await timelineAnimationJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-removal') {
     await timelineRemovalJourney(desktop);
     await timelineRemovalJourney(await openPage('mobile-360',360));
   } else if (mode === 'timeline-baseline') {

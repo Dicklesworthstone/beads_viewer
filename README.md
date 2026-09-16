@@ -2869,6 +2869,9 @@ an unresolved prior state. Issues without that evidence may be absent. Removal
 hides a record without treating it as completed. Reintroduced closed records stay
 hidden until reopened.
 Issues absent from the current export are not reconstructed from deleted records.
+Visible nodes fade and grow into view; closing or removing a node briefly fades
+and shrinks its image after removing it from the interactive graph. Scrubbing
+backward uses the same transitions. Reduced-motion preferences skip these effects.
 
 ### Graph Visualization: Pre-computed Layout
 

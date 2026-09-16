@@ -857,6 +857,15 @@ export async function initGraph(containerId, options = {}) {
             if (labelClusterState.active && labelClusterState.showHulls) {
                 drawClusterHulls(ctx, globalScale);
             }
+        })
+        .onRenderFramePost((ctx, globalScale) => {
+            if (!timeTravelState.active) return;
+            for (const node of timeTravelState.originalNodes) {
+                const state = timeTravelState.nodeStates.get(node.id);
+                if (state && !state.visible && timelineOpacity(state) > 0) {
+                    drawNode(node, ctx, globalScale);
+                }
+            }
         });
 
     // Follow actual container dimensions, including the detail pane's CSS
@@ -1168,9 +1177,12 @@ function getNodeOpacity(node) {
 }
 
 function drawNode(node, ctx, globalScale) {
-    const size = getNodeSize(node);
+    const transition = timeTravelState.active ? timeTravelState.nodeStates.get(node.id) : null;
+    const fade = transition ? timelineOpacity(transition) : 1;
+    if (fade <= 0) return;
+    const size = getNodeSize(node) * (0.2 + 0.8 * fade);
     const color = getNodeColor(node);
-    const opacity = getNodeOpacity(node);
+    const opacity = getNodeOpacity(node) * fade;
     const isHovered = store.hoveredNode?.id === node.id;
     const isSelected = store.selectedNode?.id === node.id;
     const isInConnectedSubgraph = store.connectedNodes.has(node.id);
@@ -3308,12 +3320,44 @@ const timeTravelState = {
     history: null,        // { commits: [{sha, date, beads_added[], beads_closed[], ...}] }
     speed: 1,
     animationFrame: null,
+    transitionFrame: null,
+    autoPauseRedraw: true,
     lastFrameTime: 0,
     originalNodes: [],    // Snapshot of nodes before time-travel
     originalLinks: [],    // Snapshot of links before time-travel
-    nodeStates: new Map(), // node.id -> { visible, opacity, animation }
+    nodeStates: new Map(), // node.id -> { visible, from, startedAt, duration }
     controlsEl: null,
 };
+
+function timelineOpacity(state, now = performance.now()) {
+    const progress = state.duration ? Math.min(1, Math.max(0, (now - state.startedAt) / state.duration)) : 1;
+    return state.from + ((state.visible ? 1 : 0) - state.from) * progress;
+}
+
+function stopTimelineTransition() {
+    if (timeTravelState.transitionFrame !== null) {
+        cancelAnimationFrame(timeTravelState.transitionFrame);
+        timeTravelState.transitionFrame = null;
+    }
+    if (timeTravelState.active && store.graph) {
+        store.graph.autoPauseRedraw(timeTravelState.autoPauseRedraw);
+    }
+}
+
+function redrawTimelineTransition() {
+    const now = performance.now();
+    const pending = [...timeTravelState.nodeStates.values()].some(state => now < state.startedAt + state.duration);
+    if (!timeTravelState.active) {
+        stopTimelineTransition();
+        return;
+    }
+    if (!pending) {
+        // Allow one final canvas frame to clear the last disappearing pixels.
+        timeTravelState.transitionFrame = requestAnimationFrame(stopTimelineTransition);
+        return;
+    }
+    timeTravelState.transitionFrame = requestAnimationFrame(redrawTimelineTransition);
+}
 
 /**
  * Initialize time-travel with history data
@@ -3548,19 +3592,22 @@ export function startTimeTravel() {
         console.warn('[TimeTravel] No history loaded');
         return;
     }
+    if (timeTravelState.active) return;
 
     // Save original state
     const graphData = store.graph?.graphData() || { nodes: [], links: [] };
     timeTravelState.originalNodes = [...graphData.nodes];
     timeTravelState.originalLinks = [...graphData.links];
     timeTravelState.nodeStates.clear();
+    timeTravelState.autoPauseRedraw = store.graph?.autoPauseRedraw() ?? true;
 
     // Initialize all nodes as hidden
     graphData.nodes.forEach(node => {
         timeTravelState.nodeStates.set(node.id, {
             visible: false,
-            opacity: 0,
-            animation: null
+            from: 0,
+            startedAt: 0,
+            duration: 0
         });
     });
 
@@ -3596,6 +3643,7 @@ function resetTimeTravel() {
  * Stop time-travel mode and restore the current graph.
  */
 export function stopTimeTravel() {
+    stopTimelineTransition();
     if (timeTravelState.animationFrame !== null) {
         cancelAnimationFrame(timeTravelState.animationFrame);
         timeTravelState.animationFrame = null;
@@ -3660,16 +3708,17 @@ function goToCommit(idx) {
         }
     }
 
-    // Update node visibility with animation
+    // Animate from the currently rendered state, including interrupted scrubs.
+    stopTimelineTransition();
+    const now = performance.now();
+    const duration = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 250;
     const currentCommit = commits[idx];
     timeTravelState.nodeStates.forEach((state, nodeId) => {
         const shouldBeVisible = visibleNodes.has(nodeId);
-        const wasJustAdded = currentCommit.beads_added?.includes(nodeId);
-        const wasJustRemoved = currentCommit.beads_closed?.includes(nodeId) || currentCommit.beads_removed?.includes(nodeId);
-
+        state.from = timelineOpacity(state, now);
         state.visible = shouldBeVisible;
-        state.opacity = shouldBeVisible ? 1 : 0;
-        state.animation = wasJustRemoved ? 'disappear' : (wasJustAdded ? 'appear' : null);
+        state.startedAt = now;
+        state.duration = state.from === (shouldBeVisible ? 1 : 0) ? 0 : duration;
     });
 
     // Build visible links (both endpoints must be visible)
@@ -3686,6 +3735,10 @@ function goToCommit(idx) {
             nodes: visibleNodesArr,
             links: visibleLinksArr
         });
+        if (duration > 0) {
+            store.graph.autoPauseRedraw(false);
+            redrawTimelineTransition();
+        }
     }
 
     // Update UI
