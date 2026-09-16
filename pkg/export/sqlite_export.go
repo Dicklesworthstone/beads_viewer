@@ -1020,7 +1020,7 @@ func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
 	} else {
 		// Without a topological order (for example, when cycles exist), use
 		// shortest distance from any root. Revising visited depths makes the
-		// result depend on edge order and can move parents beyond their children.
+		// result depend on edge order without propagating changes to descendants.
 		var roots []string
 		for _, issue := range e.Issues {
 			if len(blockedBy[issue.ID]) == 0 {
