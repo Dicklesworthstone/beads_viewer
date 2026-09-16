@@ -220,9 +220,52 @@ async function graphReloadJourney(page) {
     assert.deepEqual(restored, before, 'fresh computation restores exact metrics and node scores');
     records.push({graphReload:cycle,page:page.name,empty,restored});
   }
+  const navigation = await evaluate(page, `(() => {
+    const m=${app}.forceGraphModule, d=getGraphViewData();
+    m.loadData(d.issues,[...d.dependencies,{issue_id:'browser-root',depends_on_id:'browser-detail',type:'blocks'}],null);
+    m.initCycleNavigator();m.highlightCycle(0,false);
+    const selected=m.getCycleNavigatorState();
+    m.loadData(d.issues,d.dependencies,null);
+    const afterReload=m.getCycleNavigatorState();
+    m.resetCycleNavigator();
+    window.__oldPathEvents=[];
+    for(const type of ['criticalPathStep','criticalPathComplete']) document.addEventListener('bv-graph:'+type,e=>window.__oldPathEvents.push({type,detail:e.detail}));
+    const path=m.animateCriticalPath(true);
+    m.loadData(d.issues,d.dependencies,null);
+    window.__oldPathEvents=[];
+    return {selected,afterReload,path};
+  })()`);
+  assert.equal(navigation.selected.active,true);
+  assert.equal(navigation.selected.cycleCount,1);
+  assert.deepEqual([...navigation.selected.currentCycle].sort(),['browser-detail','browser-root']);
+  assert.ok(navigation.path?.path.length >= 2, 'real critical path animation started');
+  await delay(1000); // Includes both traversal ticks and the delayed completion callback.
+  const afterPath = await evaluate(page, `({state:${app}.forceGraphModule.getCriticalPathState(),events:window.__oldPathEvents})`);
+  records.push({navigationReload:navigation,afterPath,page:page.name});
+  assert.deepEqual({cycle:navigation.afterReload,path:afterPath}, {
+    cycle:{active:false,cycleCount:0,currentIndex:0,currentCycle:[],currentPath:''},
+    path:{state:{active:false,path:[],length:0,currentStep:0},events:[]}
+  }, 'graph replacement drops old cycle IDs and cancels old critical-path callbacks');
+  const cleanup = await evaluate(page, `(() => {
+    const m=${app}.forceGraphModule,d=getGraphViewData();
+    m.loadData(d.issues,[...d.dependencies,{issue_id:'browser-root',depends_on_id:'browser-other',type:'blocks'},
+      {issue_id:'browser-other',depends_on_id:'browser-root',type:'blocks'}],null);
+    m.initCycleNavigator();m.highlightCycle(0,false);
+    const selected=m.getCycleNavigatorState();
+    const next=m.nextCycle(),prev=m.prevCycle();
+    m.cleanup();
+    return {selected,next,prev,after:m.getCycleNavigatorState(),graph:m.getGraph(),path:m.getCriticalPathState()};
+  })()`);
+  for(const cycle of [cleanup.selected.currentCycle,cleanup.next.cycle,cleanup.prev.cycle]) {
+    assert.deepEqual([...cycle].sort(),['browser-other','browser-root'], 'new navigation uses only the replacement cycle');
+  }
+  assert.deepEqual(cleanup.after,{active:false,cycleCount:0,currentIndex:0,currentCycle:[],currentPath:''});
+  assert.equal(cleanup.graph,null);
+  assert.equal(cleanup.path.active,false);
+  records.push({navigationCleanup:cleanup,page:page.name});
   await capture(page, 'graph-reload');
   clean(page);
-  console.log(`PASS: ${page.name} repeated populated/empty/restored graphs with fresh real WASM metrics`);
+  console.log(`PASS: ${page.name} fresh metrics, replacement cycle navigation, cancelled path animation and cleanup`);
 }
 
 async function layoutSeedsJourney(page, edgeless = false) {
