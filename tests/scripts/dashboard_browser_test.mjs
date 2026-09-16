@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 
 const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline', 'timeline-removal'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
@@ -199,6 +199,45 @@ function clean(page) {
 }
 async function resultIDs(page, expected) {
   await waitFor(page, `JSON.stringify([...document.querySelectorAll('[aria-label^="View issue "]')].filter(${visible}).map(e => e.getAttribute('aria-label').split(':')[0].slice(11)).sort()) === ${JSON.stringify(JSON.stringify([...expected].sort()))}`, `visible issue IDs ${expected}`);
+}
+
+async function timelineRemovalJourney(page) {
+  const history = JSON.parse(fs.readFileSync(path.join(bundle, 'data/history.json')));
+  assert.equal(history.commits.length, 7, 'actual recorded deletion/reintroduction fixture');
+  for (const i of [1, 4]) {
+    assert.deepEqual(history.commits[i].beads_removed, ['browser-detail']);
+    assert.equal(history.commits[i].beads_closed, undefined, 'removal is not completion');
+  }
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'removal fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'removal graph loaded');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  await key(page, 't', 'KeyT');
+  await waitFor(page, `${state}.active`, 'keyboard enters removal timeline');
+  await evaluate(page, `document.querySelector('#tt-slider').focus()`);
+  const present = ['browser-detail', 'browser-other', 'browser-root'];
+  const absent = ['browser-other', 'browser-root'];
+  const expected = [present, absent, present, absent, absent, absent, present];
+  // Native range keys exercise both directions, including closed reintroduction.
+  for (const indices of [[0,1,2,3,4,5,6], [5,4,3,2,1,0]]) {
+    for (const i of indices) {
+      if (await evaluate(page, `${state}.currentIdx`) !== i) {
+        await key(page, indices[0] === 0 ? 'ArrowRight' : 'ArrowLeft');
+      }
+      assert.equal(await evaluate(page, `${state}.currentIdx`), i);
+      assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`), expected[i], `record ${i} visibility`);
+      const links = await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().links.length`);
+      assert.equal(links, expected[i] === present ? 1 : 0, 'absent nodes have no dangling dependency links');
+    }
+  }
+  await click(page, '.timeline-close');
+  assert.equal(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.length`), 4);
+  await capture(page, 'timeline-removal');
+  clean(page);
+  console.log(`PASS: ${page.name} deletion, open/closed reintroduction, reopening and reverse replay`);
 }
 
 async function timelineBaselineJourney(page) {
@@ -1040,7 +1079,10 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'timeline-baseline') {
+  if (mode === 'timeline-removal') {
+    await timelineRemovalJourney(desktop);
+    await timelineRemovalJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-baseline') {
     await timelineBaselineJourney(desktop);
     await timelineBaselineJourney(await openPage('mobile-360',360));
   } else if (mode === 'timeline-controls') {
