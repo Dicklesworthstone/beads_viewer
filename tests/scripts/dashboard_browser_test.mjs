@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 
 const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading', 'timeline'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
@@ -183,7 +183,8 @@ async function click(page, selector, text) {
   for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...point, button: 'left', clickCount: 1 }, page.session);
 }
 async function key(page, key, code = key) {
-  for (const type of ['keyDown', 'keyUp']) await send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode: key === 'Enter' ? 13 : key === 'Escape' ? 27 : 0 }, page.session);
+  const codes = {Enter:13,Escape:27,Home:36,End:35,ArrowLeft:37,ArrowUp:38,ArrowRight:39,ArrowDown:40};
+  for (const type of ['keyDown', 'keyUp']) await send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode: codes[key] || 0 }, page.session);
 }
 async function search(page, text) {
   await click(page, 'input[placeholder="Search issues..."]');
@@ -198,6 +199,53 @@ function clean(page) {
 }
 async function resultIDs(page, expected) {
   await waitFor(page, `JSON.stringify([...document.querySelectorAll('[aria-label^="View issue "]')].filter(${visible}).map(e => e.getAttribute('aria-label').split(':')[0].slice(11)).sort()) === ${JSON.stringify(JSON.stringify([...expected].sort()))}`, `visible issue IDs ${expected}`);
+}
+
+async function timelineControlsJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'controls fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'controls graph loaded');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  await key(page, 't', 'KeyT');
+  await evaluate(page, `document.querySelector('#tt-slider').focus()`);
+  await key(page, 'End');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 3, 'native range End reaches final commit');
+  await key(page, 'Home');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 0, 'native range Home reaches first commit');
+  await key(page, 'ArrowRight');
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 1, 'native range keys reach an intermediate commit');
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`),
+    ['browser-other','browser-root'], 'scrubbing applies recorded closure');
+  await evaluate(page, `document.querySelector('#tt-speed').focus()`);
+  await key(page, 'End');
+  assert.equal(await evaluate(page, `${state}.speed`), 10, 'native selector chooses fastest speed');
+  await key(page, 'ArrowUp');
+  const selectedSpeed = await evaluate(page, `${state}.speed`);
+  await evaluate(page, `${app}.initForceGraphView()`);
+  const refreshed = await evaluate(page, `({speed:${state}.speed,control:document.querySelector('#tt-speed').value})`);
+  await evaluate(page, `(async () => {
+    const h=await (await fetch('./data/history.json')).json();
+    ${app}.forceGraphModule.initTimeTravel({...h,commits:h.commits.slice(0,1)});
+    ${app}.forceGraphModule.startTimeTravel();
+  })()`);
+  const single = await evaluate(page, `({index:${state}.currentIdx,slider:document.querySelector('#tt-slider').value,
+    position:document.querySelector('#tt-position').textContent})`);
+  records.push({timelineControls:{selectedSpeed,refreshed,single},page:page.name});
+  assert.deepEqual({selectedSpeed,refreshed,single},{selectedSpeed:5,refreshed:{speed:5,control:'5'},
+    single:{index:0,slider:'0',position:'1 / 1'}}, 'keyboard speed, refreshed preference and single-commit boundary agree');
+  await evaluate(page, `${app}.initForceGraphView()`);
+  await key(page, 't', 'KeyT');
+  await click(page, '#tt-play');
+  assert.equal(await evaluate(page, `${state}.playing`), true);
+  await waitFor(page, `${state}.currentIdx === 3 && !${state}.playing`, '5x playback reaches end and stops', 2000);
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`),
+    ['browser-detail','browser-other','browser-root']);
+  await capture(page, 'timeline-controls');
+  clean(page);
+  console.log(`PASS: ${page.name} native scrubber, keyboard speed, retained preference, single commit and playback completion`);
 }
 
 async function timelineJourney(page) {
@@ -961,7 +1009,10 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'timeline') {
+  if (mode === 'timeline-controls') {
+    await timelineControlsJourney(desktop);
+    await timelineControlsJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline') {
     await timelineJourney(desktop);
     await timelineJourney(await openPage('mobile-360',360));
   } else if (mode === 'history-loading') {
