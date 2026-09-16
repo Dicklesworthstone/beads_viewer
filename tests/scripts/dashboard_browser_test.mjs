@@ -212,6 +212,7 @@ async function historyLoadingJourney(page) {
   let loads = 0;
   for (const variant of ['stalled-headers','empty','stalled-body','empty','malformed','missing','empty']) {
     historyVariant = variant;
+    const requestsBefore = records.filter(r => r.historyRequest).length;
     const start = Date.now();
     // Start without awaiting: an unbounded request must fail our browser assertion,
     // rather than hang the CDP evaluation waiting for the app's promise.
@@ -219,6 +220,9 @@ async function historyLoadingJourney(page) {
     await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading && !${app}.forceGraphError`,
       `${variant}: optional history must release graph loading`, 6000);
     loads++;
+    const requests = records.filter(r => r.historyRequest).slice(requestsBefore);
+    assert.equal(requests.length, 1, 'refresh reaches the optional history endpoint');
+    assert.equal(requests[0].variant, variant);
     assert.equal(await evaluate(page, 'window.__historyGraphLoads'), loads, 'every refresh must actually run');
     assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`),
       ['browser-closed','browser-detail','browser-other','browser-root']);
