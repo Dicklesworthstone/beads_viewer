@@ -2859,13 +2859,16 @@ If the `wasm/` assets are missing, the viewer automatically falls back to the JS
 ```
 
 When history is included, graph time travel replays recorded issue creation,
-closure, and reopening in Git ancestry order. Editing a closed issue does not
-reopen it, and an inferred code correlation does not create a timeline event.
+closure, reopening, removal, and reintroduction in Git ancestry order. Editing a
+closed issue does not reopen it, and an inferred code correlation does not create
+a timeline event.
 This is a bounded view of the current exported issues, not a complete historical
 snapshot: history is limited to 500 source commits. An issue whose creation
 predates that window starts visible when its earliest retained transition records
-an unresolved prior state. Issues without that evidence may be absent, and
-deleted records are not reconstructed.
+an unresolved prior state. Issues without that evidence may be absent. Removal
+hides a record without treating it as completed. Reintroduced closed records stay
+hidden until reopened.
+Issues absent from the current export are not reconstructed from deleted records.
 
 ### Graph Visualization: Pre-computed Layout
 

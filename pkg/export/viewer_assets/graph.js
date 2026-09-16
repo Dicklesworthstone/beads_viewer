@@ -3654,6 +3654,10 @@ function goToCommit(idx) {
         if (commit.beads_closed) {
             commit.beads_closed.forEach(id => visibleNodes.delete(id));
         }
+        // Record removal is distinct from completion; either hides the node.
+        if (commit.beads_removed) {
+            commit.beads_removed.forEach(id => visibleNodes.delete(id));
+        }
     }
 
     // Update node visibility with animation
@@ -3661,11 +3665,11 @@ function goToCommit(idx) {
     timeTravelState.nodeStates.forEach((state, nodeId) => {
         const shouldBeVisible = visibleNodes.has(nodeId);
         const wasJustAdded = currentCommit.beads_added?.includes(nodeId);
-        const wasJustClosed = currentCommit.beads_closed?.includes(nodeId);
+        const wasJustRemoved = currentCommit.beads_closed?.includes(nodeId) || currentCommit.beads_removed?.includes(nodeId);
 
         state.visible = shouldBeVisible;
         state.opacity = shouldBeVisible ? 1 : 0;
-        state.animation = wasJustAdded ? 'appear' : (wasJustClosed ? 'disappear' : null);
+        state.animation = wasJustRemoved ? 'disappear' : (wasJustAdded ? 'appear' : null);
     });
 
     // Build visible links (both endpoints must be visible)

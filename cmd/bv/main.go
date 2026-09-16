@@ -7023,11 +7023,12 @@ type TimeTravelHistory struct {
 
 // TimeTravelCommit represents a single commit in the time-travel history
 type TimeTravelCommit struct {
-	SHA         string   `json:"sha"`
-	Date        string   `json:"date"`
-	Message     string   `json:"message,omitempty"`
-	BeadsAdded  []string `json:"beads_added,omitempty"`
-	BeadsClosed []string `json:"beads_closed,omitempty"`
+	SHA          string   `json:"sha"`
+	Date         string   `json:"date"`
+	Message      string   `json:"message,omitempty"`
+	BeadsAdded   []string `json:"beads_added,omitempty"`
+	BeadsClosed  []string `json:"beads_closed,omitempty"`
+	BeadsRemoved []string `json:"beads_removed,omitempty"`
 }
 
 // generateHistoryForExport creates time-travel history data from git history
@@ -7115,6 +7116,8 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 				}
 			case correlation.EventClosed:
 				ttCommit.BeadsClosed = append(ttCommit.BeadsClosed, beadID)
+			case correlation.EventDeleted:
+				ttCommit.BeadsRemoved = append(ttCommit.BeadsRemoved, beadID)
 			}
 		}
 	}
@@ -7124,6 +7127,7 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 	for _, commit := range commitMap {
 		sort.Strings(commit.BeadsAdded)
 		sort.Strings(commit.BeadsClosed)
+		sort.Strings(commit.BeadsRemoved)
 		commits = append(commits, *commit)
 	}
 
