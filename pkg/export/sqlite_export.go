@@ -1104,7 +1104,7 @@ func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
 		}
 	}
 
-	var links [][2]string
+	links := make([][2]string, 0)
 	for _, dep := range e.Deps {
 		if dep != nil && dep.Type.IsBlocking() {
 			links = append(links, [2]string{dep.DependsOnID, dep.IssueID})

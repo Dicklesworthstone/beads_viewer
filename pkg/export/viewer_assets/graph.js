@@ -214,6 +214,7 @@ class GraphStore {
         this.wasmGraph = null;
         this.wasmReady = false;
         this.container = null;
+        this.resizeObserver = null;
 
         // Data
         this.issues = [];
@@ -855,6 +856,22 @@ export async function initGraph(containerId, options = {}) {
             }
         });
 
+    // Follow actual container dimensions, including the detail pane's CSS
+    // transition and viewport changes, rather than racing a fixed timeout.
+    store.resizeObserver?.disconnect();
+    const graph = store.graph;
+    const container = store.container;
+    store.resizeObserver = new ResizeObserver(() => {
+        if (store.graph !== graph) return;
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+        if (width > 0 && height > 0) {
+            if (graph.width() !== width) graph.width(width);
+            if (graph.height() !== height) graph.height(height);
+        }
+    });
+    store.resizeObserver.observe(container);
+
     // Setup keyboard shortcuts
     setupKeyboardShortcuts();
 
@@ -877,7 +894,7 @@ export async function initGraph(containerId, options = {}) {
  */
 export async function loadPrecomputedLayout(issues, dependencies) {
     try {
-        const response = await fetch('data/graph_layout.json');
+        const response = await fetch('data/graph_layout.json', { signal: AbortSignal.timeout(3000) });
         if (!response.ok) return null;
         return validateLayout(await response.json(), issues, dependencies);
     } catch (e) {
@@ -3222,6 +3239,8 @@ export function setConfig(key, value) {
 
 export function cleanup() {
     resetWhatIf();
+    store.resizeObserver?.disconnect();
+    store.resizeObserver = null;
     store.graph?.pauseAnimation();
     hideTooltip();
     if (tooltipEl) {

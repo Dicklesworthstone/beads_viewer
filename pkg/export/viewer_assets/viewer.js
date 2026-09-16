@@ -2396,6 +2396,7 @@ function beadsApp() {
     // Graph simulation progress (0-100, null = not simulating)
     graphSimulationProgress: null,
     graphSimulationDone: false,
+    graphStageTimer: null,
 
     // Heatmap & metrics mode
     graphHeatmapActive: false,
@@ -2786,6 +2787,9 @@ function beadsApp() {
 
       this.forceGraphLoading = true;
       this.forceGraphError = null;
+      clearTimeout(this.graphStageTimer);
+      this.graphStageTimer = null;
+      this.graphLoadingStage = 'init';
 
       try {
         // Check that required dependencies are available
@@ -2882,11 +2886,14 @@ function beadsApp() {
 
           // Track simulation progress for loading indicator
           document.addEventListener('bv-graph:simulationProgress', (e) => {
+            if (this.graphLoadingStage !== 'simulating') return;
             this.graphSimulationProgress = e.detail?.progress ?? 0;
             this.graphSimulationDone = e.detail?.done ?? false;
-            if (e.detail?.done) {
-              // Clear progress and stage after a short delay
-              setTimeout(() => {
+            if (e.detail?.done && this.graphStageTimer === null) {
+              // Schedule once per load. Old tick timers must not hide a newer
+              // load's overlay or repeatedly cancel its Alpine transition.
+              this.graphStageTimer = setTimeout(() => {
+                this.graphStageTimer = null;
                 this.graphSimulationProgress = null;
                 this.graphLoadingStage = null;
               }, 500);
@@ -2926,6 +2933,9 @@ function beadsApp() {
           graph.height(container.clientHeight);
         }
       } catch (err) {
+        clearTimeout(this.graphStageTimer);
+        this.graphStageTimer = null;
+        this.graphLoadingStage = null;
         console.error('[ForceGraph] init failed:', err);
         this.forceGraphError = err?.message || String(err);
         this.forceGraphReady = false;

@@ -94,6 +94,23 @@ func TestGraphLayoutDeterministicPositions(t *testing.T) {
 			t.Fatalf("layout topology disagrees with exported issues: %+v", layout)
 		}
 	}
+	t.Run("edgeless", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := NewSQLiteExporter(issues, nil, nil, nil).writeGraphLayout(dir); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var layout GraphLayout
+		if err := json.Unmarshal(data, &layout); err != nil {
+			t.Fatal(err)
+		}
+		if layout.Links == nil || len(layout.Links) != 0 || layout.EdgeCount != 0 || len(layout.Positions) != 3 {
+			t.Fatalf("edgeless layout must expose an empty link array: %+v", layout)
+		}
+	})
 }
 
 func TestSQLiteExportFullSourceReadiness(t *testing.T) {
