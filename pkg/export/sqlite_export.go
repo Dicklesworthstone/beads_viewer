@@ -1018,6 +1018,9 @@ func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
 			}
 		}
 	} else {
+		// Without a topological order (for example, when cycles exist), use
+		// shortest distance from any root. Revising visited depths makes the
+		// result depend on edge order and can move parents beyond their children.
 		var roots []string
 		for _, issue := range e.Issues {
 			if len(blockedBy[issue.ID]) == 0 {
@@ -1035,8 +1038,6 @@ func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
 				if _, visited := depth[child]; !visited {
 					depth[child] = currentDepth + 1
 					queue = append(queue, child)
-				} else if depth[child] < currentDepth+1 {
-					depth[child] = currentDepth + 1
 				}
 			}
 		}
@@ -1050,8 +1051,11 @@ func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
 
 	depthGroups := make(map[int][]string)
 	maxDepth := 0
-	for id, d := range depth {
-		depthGroups[d] = append(depthGroups[d], id)
+	// Analysis and dependencies can include missing endpoints. Keep them as
+	// graph context, but only real exported issues have drawable positions.
+	for _, issue := range e.Issues {
+		d := depth[issue.ID]
+		depthGroups[d] = append(depthGroups[d], issue.ID)
 		if d > maxDepth {
 			maxDepth = d
 		}

@@ -177,7 +177,7 @@ func TestGraphLayoutFallbackLayers(t *testing.T) {
 				if tc.topological != nil {
 					stats = &analysis.GraphStats{TopologicalOrder: tc.topological}
 				}
-				if err := NewSQLiteExporter(issues, deps, nil, stats).writeGraphLayout(dir); err != nil {
+				if err := NewSQLiteExporter(issues, deps, stats, nil).writeGraphLayout(dir); err != nil {
 					t.Fatal(err)
 				}
 				data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
