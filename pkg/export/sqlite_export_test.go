@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -61,6 +62,37 @@ func TestSetGitHash(t *testing.T) {
 
 	if exp.gitHash != "abc123" {
 		t.Errorf("Expected git hash abc123, got %s", exp.gitHash)
+	}
+}
+
+func TestGraphLayoutDeterministicPositions(t *testing.T) {
+	issues := []*model.Issue{
+		makeTestIssue("z-root", "Root", model.StatusOpen, 2, model.TypeTask),
+		makeTestIssue("a-root", "Root", model.StatusOpen, 2, model.TypeTask),
+		makeTestIssue("child", "Child", model.StatusOpen, 2, model.TypeTask),
+	}
+	deps := []*model.Dependency{{IssueID: "child", DependsOnID: "z-root", Type: model.DepBlocks}}
+	want := map[string][2]float64{"a-root": {0, -40}, "z-root": {0, 40}, "child": {200, 0}}
+	for i := 0; i < 20; i++ {
+		issues[0], issues[2] = issues[2], issues[0]
+		dir := t.TempDir()
+		if err := NewSQLiteExporter(issues, deps, nil, nil).writeGraphLayout(dir); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var layout GraphLayout
+		if err := json.Unmarshal(data, &layout); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(layout.Positions, want) {
+			t.Fatalf("iteration %d: positions %v, want %v", i, layout.Positions, want)
+		}
+		if layout.NodeCount != 3 || layout.EdgeCount != 1 || !reflect.DeepEqual(layout.Links, [][2]string{{"z-root", "child"}}) {
+			t.Fatalf("layout topology disagrees with exported issues: %+v", layout)
+		}
 	}
 }
 
