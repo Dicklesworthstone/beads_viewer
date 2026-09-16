@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1062,6 +1063,7 @@ func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
 
 	for d := 0; d <= maxDepth; d++ {
 		nodesAtDepth := depthGroups[d]
+		sort.Strings(nodesAtDepth)
 		count := len(nodesAtDepth)
 		startY := -float64(count-1) * ySpacing / 2
 		for i, id := range nodesAtDepth {

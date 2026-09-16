@@ -868,34 +868,57 @@ export async function initGraph(containerId, options = {}) {
 // DATA LOADING
 // ============================================================================
 
-// Pre-computed layout cache
-let precomputedLayout = null;
-
 /**
- * Load pre-computed graph layout for instant rendering.
- * This fetches the compact layout file (~30KB) which contains positions and metrics.
+ * Load optional starting coordinates. Only topology affects these coordinates,
+ * so compare every node and directed blocking edge with the loaded database.
+ * Exported metrics are deliberately not reused: they may be partial or sampled
+ * and do not include all the metrics used by the browser.
  * @returns {Promise<object|null>} Layout data or null if not available
  */
-export async function loadPrecomputedLayout() {
+export async function loadPrecomputedLayout(issues, dependencies) {
     try {
         const response = await fetch('data/graph_layout.json');
         if (!response.ok) return null;
-        precomputedLayout = await response.json();
-        console.log(`[bv-graph] Pre-computed layout: ${precomputedLayout.node_count} nodes`);
-        return precomputedLayout;
+        return validateLayout(await response.json(), issues, dependencies);
     } catch (e) {
         console.log('[bv-graph] No pre-computed layout, will use dynamic simulation');
         return null;
     }
 }
 
+function validateLayout(layout, issues, dependencies) {
+    if (!layout || !Array.isArray(issues) || !Array.isArray(dependencies)) return null;
+    const positions = layout.positions;
+    const ids = new Set(issues.map(issue => issue.id));
+    if (!positions || typeof positions !== 'object' || Array.isArray(positions)
+        || ids.size !== issues.length || layout.node_count !== ids.size
+        || Object.keys(positions).length !== ids.size) return null;
+    for (const id of ids) {
+        const pos = Object.hasOwn(positions, id) ? positions[id] : null;
+        if (!Array.isArray(pos) || pos.length !== 2 || !pos.every(Number.isFinite)) return null;
+    }
+    const edges = dependencies.filter(isBlockingDependency)
+        .map(dep => JSON.stringify([dep.depends_on_id, dep.issue_id])).sort();
+    if (!Array.isArray(layout.links) || layout.edge_count !== edges.length
+        || layout.links.length !== edges.length) return null;
+    const links = [];
+    for (const link of layout.links) {
+        if (!Array.isArray(link) || link.length !== 2
+            || !link.every(id => typeof id === 'string')) return null;
+        links.push(JSON.stringify(link));
+    }
+    links.sort();
+    if (links.some((link, i) => link !== edges[i])) return null;
+    return { positions };
+}
+
 /**
- * Load data with optional pre-computed layout for instant rendering.
+ * Load data with optional starting coordinates and live force simulation.
  * @param {Array} issues - Issue objects from SQLite
  * @param {Array} dependencies - Dependency objects from SQLite
  * @param {object} [layout] - Optional pre-computed layout
  */
-export function loadData(issues, dependencies, layout = precomputedLayout) {
+export function loadData(issues, dependencies, layout = null) {
     resetWhatIf();
     store.reset();
     store.issues = issues;
@@ -907,38 +930,10 @@ export function loadData(issues, dependencies, layout = precomputedLayout) {
         store.nodeIndexMap.set(issue.id, idx);
     });
 
-    // Merge pre-computed metrics if available
-    if (layout?.metrics) {
-        issues.forEach(issue => {
-            const m = layout.metrics[issue.id];
-            if (m) {
-                issue._precomputed = {
-                    pagerank: m[0],
-                    betweenness: m[1],
-                    inDegree: m[2],
-                    outDegree: m[3],
-                    inCycle: m[4] === 1
-                };
-            }
-        });
-    }
-
-    // Build WASM graph structure (always, for cycle navigator etc.)
-    // Only skip metric computation if we have pre-computed metrics
+    // Always compute browser metrics, including critical path and cycle navigation.
     if (store.wasmReady) {
         buildWasmGraph();
-        if (!layout?.metrics) {
-            computeMetrics();
-        } else {
-            console.log('[bv-graph] Using pre-computed metrics, skipping WASM computation');
-            // Convert pre-computed cycle IDs to WASM indices for cycle navigator compatibility
-            if (layout.cycles && store.wasmGraph) {
-                const cyclesAsIndices = layout.cycles.map(cycle =>
-                    cycle.map(id => store.wasmGraph.nodeIdx(id)).filter(idx => idx !== undefined)
-                ).filter(cycle => cycle.length > 0);
-                store.metrics.cycles = { cycles: cyclesAsIndices, count: cyclesAsIndices.length };
-            }
-        }
+        computeMetrics();
     }
 
     // Build label color map for galaxy view
@@ -1018,7 +1013,6 @@ function prepareGraphData(layout = null) {
     // Enrich nodes with computed data
     nodes = nodes.map(issue => {
         const idx = store.wasmReady ? store.wasmGraph?.nodeIdx(issue.id) : undefined;
-        const pre = issue._precomputed; // Pre-computed metrics from layout
         const pos = layout?.positions?.[issue.id]; // Pre-computed position
 
         return {
@@ -1033,36 +1027,33 @@ function prepareGraphData(layout = null) {
             createdAt: issue.created_at,
             updatedAt: issue.updated_at,
 
-            // Computed metrics (prefer pre-computed)
-            pagerank: pre?.pagerank ?? (idx !== undefined && metrics.pagerank ? metrics.pagerank[idx] : 0),
-            betweenness: pre?.betweenness ?? (idx !== undefined && metrics.betweenness ? metrics.betweenness[idx] : 0),
+            // Metrics computed on the currently loaded graph.
+            pagerank: idx !== undefined && metrics.pagerank ? metrics.pagerank[idx] : 0,
+            betweenness: idx !== undefined && metrics.betweenness ? metrics.betweenness[idx] : 0,
             criticalDepth: idx !== undefined && metrics.criticalPath ? metrics.criticalPath[idx] : 0,
             eigenvector: idx !== undefined && metrics.eigenvector ? metrics.eigenvector[idx] : 0,
             kcore: idx !== undefined && metrics.kcore ? metrics.kcore[idx] : 0,
-            inCycle: pre?.inCycle ?? false,
+            inCycle: false,
 
             // Dependency counts. Prefer the active-blocker count from the
             // materialized view (issue.blocker_count / dependent_count) so
             // closed blockers don't keep their dependents looking blocked
-            // (bv-issue#143/#144). Fall back to pre-computed graph degrees,
-            // then to a raw dependency-row count.
+            // (bv-issue#143/#144). Fall back to blocking dependency-row counts.
             blockerCount: issue.blocker_count
-                ?? pre?.inDegree
-                ?? dependencies.filter(d => d.issue_id === issue.id).length,
+                ?? dependencies.filter(d => isBlockingDependency(d) && d.issue_id === issue.id).length,
             dependentCount: issue.dependent_count
-                ?? pre?.outDegree
-                ?? dependencies.filter(d => d.depends_on_id === issue.id).length,
+                ?? dependencies.filter(d => isBlockingDependency(d) && d.depends_on_id === issue.id).length,
 
-            // Position: pre-computed uses fx/fy to skip simulation
+            // Seed the simulation without pinning nodes or preventing dragging.
             x: pos ? pos[0] : undefined,
             y: pos ? pos[1] : undefined,
-            fx: pos ? pos[0] : null,
-            fy: pos ? pos[1] : null
+            fx: null,
+            fy: null
         };
     });
 
-    // Mark cycle nodes (if not from pre-computed)
-    if (!layout?.cycles && metrics.cycles?.cycles) {
+    // Mark cycle nodes from the current graph.
+    if (metrics.cycles?.cycles) {
         const cycleNodes = new Set(metrics.cycles.cycles.flat());
         nodes.forEach(node => {
             const idx = store.wasmGraph?.nodeIdx(node.id);

@@ -2842,10 +2842,9 @@ function beadsApp() {
           this.forceGraphModule = await import('./graph.js');
         }
 
-        // Always use dynamic force simulation - it produces much better layouts
-        // Pre-computed positions are still exported but only used for metrics, not positions
-        let precomputedLayout = null;
-        console.log('[ForceGraph] Using live force simulation for optimal layout');
+        // Seed live physics only when the exported topology matches this database.
+        // Missing or stale layouts fall back to ordinary force initialization.
+        const precomputedLayout = await this.forceGraphModule.loadPrecomputedLayout(issues, dependencies);
 
         // Stage 3: Initializing graph visualization
         this.graphLoadingStage = 'init';
