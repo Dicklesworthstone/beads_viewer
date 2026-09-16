@@ -13,12 +13,13 @@ import { spawn } from 'node:child_process';
 
 const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
 let activeBundle = bundle;
 let layoutVariant = null;
+let historyVariant = null;
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
   '.json': 'application/json', '.wasm': 'application/wasm', '.svg': 'image/svg+xml' };
 server = http.createServer((req, res) => {
@@ -30,6 +31,15 @@ server = http.createServer((req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  if (name === '/data/history.json' && mode === 'history-loading' && historyVariant) {
+    records.push({historyRequest:req.url,variant:historyVariant});
+    res.setHeader('Content-Type', 'application/json');
+    if (historyVariant === 'stalled-headers') return;
+    if (historyVariant === 'stalled-body') { res.write('{"commits":'); return; }
+    if (historyVariant === 'missing') { res.writeHead(404); res.end('missing optional history'); return; }
+    res.end(historyVariant === 'malformed' ? '{' : '{"commits":[]}');
+    return;
+  }
   if (!file.startsWith(path.resolve(activeBundle) + path.sep) || name === brokenAsset || !fs.existsSync(file)) {
     res.writeHead(404); res.end('Required file unavailable'); return;
   }
@@ -188,6 +198,36 @@ function clean(page) {
 }
 async function resultIDs(page, expected) {
   await waitFor(page, `JSON.stringify([...document.querySelectorAll('[aria-label^="View issue "]')].filter(${visible}).map(e => e.getAttribute('aria-label').split(':')[0].slice(11)).sort()) === ${JSON.stringify(JSON.stringify([...expected].sort()))}`, `visible issue IDs ${expected}`);
+}
+
+async function historyLoadingJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'history fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await send('Network.setBypassServiceWorker', {bypass:true}, page.session);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'initial graph loaded');
+  await evaluate(page, `(() => {window.__historyGraphLoads=0;document.addEventListener('bv-graph:dataLoaded',()=>window.__historyGraphLoads++);})()`);
+  let loads = 0;
+  for (const variant of ['stalled-headers','empty','stalled-body','empty','malformed','missing','empty']) {
+    historyVariant = variant;
+    const start = Date.now();
+    // Start without awaiting: an unbounded request must fail our browser assertion,
+    // rather than hang the CDP evaluation waiting for the app's promise.
+    await evaluate(page, `void ${app}.initForceGraphView()`);
+    await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading && !${app}.forceGraphError`,
+      `${variant}: optional history must release graph loading`, 6000);
+    loads++;
+    assert.equal(await evaluate(page, 'window.__historyGraphLoads'), loads, 'every refresh must actually run');
+    assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`),
+      ['browser-closed','browser-detail','browser-other','browser-root']);
+    records.push({historyLoading:variant,page:page.name,elapsedMs:Date.now()-start,loads});
+  }
+  historyVariant = null;
+  await capture(page, 'history-loading');
+  clean(page);
+  console.log(`PASS: ${page.name} optional history stalls, malformed/missing fallback and refresh recovery`);
 }
 
 async function graphReloadJourney(page) {
@@ -835,7 +875,10 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'graph-reload') {
+  if (mode === 'history-loading') {
+    await historyLoadingJourney(desktop);
+    await historyLoadingJourney(await openPage('mobile-360',360));
+  } else if (mode === 'graph-reload') {
     await graphReloadJourney(desktop);
     await graphReloadJourney(await openPage('mobile-360',360));
   } else if (mode === 'layout-seeds') {
