@@ -409,6 +409,12 @@ func copyToClipboard(ctx context.Context, text string) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("clipboard helper timed out: %w", ctxErr)
 		}
+		// The helper looked usable and still failed. The copy landing matters
+		// more than which mechanism landed it, so try the terminal before
+		// reporting nothing happened.
+		if osc52Err := osc52Copy(text); osc52Err == nil {
+			return nil
+		}
 		return fmt.Errorf("run clipboard helper: %w", err)
 	}
 	return nil
@@ -426,22 +432,34 @@ const osc52Limit = 74994
 // the local terminal emulator. It is written to the controlling terminal rather
 // than stdout so it does not pass through Bubble Tea's frame buffer, and the
 // sequence is emitted in a single write so a concurrent repaint cannot split it.
-func osc52Copy(text string) error {
+func osc52Sequence(text string) (string, error) {
 	encoded := base64.StdEncoding.EncodeToString([]byte(text))
 	if len(encoded) > osc52Limit {
-		return fmt.Errorf("selection too large for terminal clipboard (%d bytes encoded, limit %d)",
+		return "", fmt.Errorf("selection too large for terminal clipboard (%d bytes encoded, limit %d)",
 			len(encoded), osc52Limit)
 	}
 	sequence := "\x1b]52;c;" + encoded + "\x07"
 
-	// Inside tmux or screen the sequence has to be wrapped in a DCS passthrough
-	// or the multiplexer consumes it instead of forwarding it outward. tmux
-	// additionally requires each ESC in the payload to be doubled.
-	switch {
-	case os.Getenv("TMUX") != "":
-		sequence = "\x1bPtmux;" + strings.ReplaceAll(sequence, "\x1b", "\x1b\x1b") + "\x1b\\"
-	case strings.HasPrefix(os.Getenv("TERM"), "screen"):
+	// tmux implements OSC 52 itself: it sets its own paste buffer and forwards
+	// the sequence to the outer terminal. Wrapping it in a `\ePtmux;` DCS
+	// passthrough instead tells tmux *not* to interpret it, which additionally
+	// requires `allow-passthrough`; verified against a live tmux, the wrapped
+	// form leaves the clipboard untouched while the raw form sets it. So tmux
+	// gets it raw.
+	//
+	// GNU screen does not implement OSC 52, so there the DCS passthrough is the
+	// only way to reach the outer terminal. tmux sets TERM to screen-* as well,
+	// hence the explicit $TMUX test first.
+	if os.Getenv("TMUX") == "" && strings.HasPrefix(os.Getenv("TERM"), "screen") {
 		sequence = "\x1bP" + sequence + "\x1b\\"
+	}
+	return sequence, nil
+}
+
+func osc52Copy(text string) error {
+	sequence, err := osc52Sequence(text)
+	if err != nil {
+		return err
 	}
 
 	// The controlling terminal is the right sink even when stdout is a pipe.

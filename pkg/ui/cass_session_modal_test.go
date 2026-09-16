@@ -1386,3 +1386,49 @@ func TestOSC52CopyRefusesAnOversizedSelection(t *testing.T) {
 		t.Fatal("expected an error for a selection past the OSC 52 limit")
 	}
 }
+
+// TestOSC52LiveTerminal is a manual end-to-end probe: run it inside a terminal
+// (or a tmux pane) with BV_OSC52_LIVE set to the text to copy, then inspect the
+// terminal's clipboard. It exercises the real writer and wrapping, which a
+// captured-pipe test cannot.
+func TestOSC52LiveTerminal(t *testing.T) {
+	payload := os.Getenv("BV_OSC52_LIVE")
+	if payload == "" {
+		t.Skip("set BV_OSC52_LIVE to run the live terminal probe")
+	}
+	if err := osc52Copy(payload); err != nil {
+		t.Fatalf("osc52Copy: %v", err)
+	}
+}
+
+// The wrapping decision is the part that is easy to get wrong: tmux understands
+// OSC 52 natively, so wrapping it in a DCS passthrough suppresses tmux's own
+// handling (and needs allow-passthrough). Verified against a live tmux: raw
+// sets the paste buffer, wrapped leaves it untouched.
+func TestOSC52SequenceWrapping(t *testing.T) {
+	raw := "\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte("hi")) + "\x07"
+
+	for _, tc := range []struct {
+		name string
+		tmux string
+		term string
+		want string
+	}{
+		{"plain terminal", "", "xterm-256color", raw},
+		{"tmux sends raw", "/tmp/tmux-1000/default,123,0", "screen-256color", raw},
+		{"screen wraps in DCS", "", "screen.xterm-256color", "\x1bP" + raw + "\x1b\\"},
+		{"screen bare TERM wraps", "", "screen", "\x1bP" + raw + "\x1b\\"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TMUX", tc.tmux)
+			t.Setenv("TERM", tc.term)
+			got, err := osc52Sequence("hi")
+			if err != nil {
+				t.Fatalf("osc52Sequence: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("sequence:\n got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
