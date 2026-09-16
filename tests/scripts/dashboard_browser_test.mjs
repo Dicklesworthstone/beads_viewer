@@ -240,6 +240,7 @@ async function timelineJourney(page) {
   assert.equal(await evaluate(page, `${state}.currentIdx`), paused.currentIdx, 'pause stops advancement');
   await click(page, '#tt-start');
   await click(page, '#tt-play');
+  assert.equal(await evaluate(page, `${state}.playing`), true, 'playback active before data replacement');
   await evaluate(page, `(() => {
     window.__timelineTicks=0;
     document.addEventListener('bv-graph:timeTravelCommit',()=>window.__timelineTicks++);
@@ -256,16 +257,29 @@ async function timelineJourney(page) {
   assert.equal(await evaluate(page, `${state}.totalCommits`), 4, 'fresh export history can be loaded again');
   await key(page, 't', 'KeyT');
   await click(page, '#tt-play');
+  assert.equal(await evaluate(page, `${state}.playing`), true, 'playback active before history replacement');
+  await evaluate(page, `(() => {${app}.forceGraphModule.initTimeTravel(null);window.__timelineTicks=0;})()`);
+  await delay(1200);
+  const cleared = await evaluate(page, `({state:${state},ticks:window.__timelineTicks,
+    nodes:${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort(),
+    controls:!!document.querySelector('#time-travel-controls')})`);
+  assert.deepEqual(cleared,{state:{active:false,playing:false,currentIdx:0,totalCommits:0,speed:1},
+    ticks:0,nodes:['browser-closed','browser-detail','browser-other','browser-root'],controls:false},
+    'missing replacement history stops playback and restores the current graph');
+  await evaluate(page, `${app}.initForceGraphView()`);
+  await key(page, 't', 'KeyT');
+  await click(page, '#tt-play');
+  assert.equal(await evaluate(page, `${state}.playing`), true, 'playback active before cleanup');
   await evaluate(page, `(() => {${app}.forceGraphModule.cleanup();window.__timelineTicks=0;})()`);
   await delay(1200);
   const cleaned = await evaluate(page, `({state:${state},ticks:window.__timelineTicks,
     graph:${app}.forceGraphModule.getGraph(),controls:!!document.querySelector('#time-travel-controls')})`);
   assert.deepEqual(cleaned,{state:{active:false,playing:false,currentIdx:0,totalCommits:0,speed:1},
     ticks:0,graph:null,controls:false}, 'cleanup cancels active playback and releases history');
-  records.push({timelineReplacement:replaced,timelineCleanup:cleaned,page:page.name});
+  records.push({timelineReplacement:replaced,timelineHistoryCleared:cleared,timelineCleanup:cleaned,page:page.name});
   await capture(page, 'timeline');
   clean(page);
-  console.log(`PASS: ${page.name} exported lifecycle timeline, backward navigation and current graph restoration`);
+  console.log(`PASS: ${page.name} exported timeline navigation, play/pause, replacement recovery and active cleanup`);
 }
 
 async function historyLoadingJourney(page) {
