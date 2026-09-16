@@ -2869,7 +2869,7 @@ The export includes both graph-layout data and a SQLite database:
 
 Sizes are measured, not estimated: `tests/e2e/export_pages_test.go` re-exports this repository on every e2e run and checks the bundle against `tests/artifacts/perf/pages_load.json` (whole bundle 9.7 MB, of which 5.6 MB is the vendored viewer libraries); the record is rewritten only when the test runs with `BV_RECORD_PERF=1`, and a bundle that grows by more than a quarter fails the run.
 
-**Current viewer behavior:** `viewer.js` waits for SQLite to load, then initializes the graph with live force simulation. Although `graph.js` supports loading pre-computed positions, the viewer currently passes no pre-computed layout. Exporting `graph_layout.json` therefore does not make the graph render before the database, fix node positions, or bypass simulation.
+**Current viewer behavior:** `viewer.js` waits for SQLite to load, then uses exported coordinates to seed live force simulation if every node and directed blocking edge matches the database. Missing, malformed, or mismatched layouts fall back to ordinary force initialization. Nodes remain movable, and the browser computes its own metrics, including critical path and cycles. The layout does not make the graph render before the database or bypass simulation.
 
 Load-time figures are not measured in the repository yet; the sizes above are from the retained September 2, 2026 export, not a measurement of the current checkout.
 
