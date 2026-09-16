@@ -2912,7 +2912,11 @@ function beadsApp() {
         // Try to load history data for time-travel feature (bv-z38b)
         // Use cache-busting to avoid stale data from CDN
         try {
-          const historyResp = await fetch(`./data/history.json?_t=${Date.now()}`);
+          // Optional history must not leave graph refresh locked on a stalled
+          // response. The deadline also covers consumption of the JSON body.
+          const historyResp = await fetch(`./data/history.json?_t=${Date.now()}`, {
+            signal: AbortSignal.timeout(3000),
+          });
           if (historyResp.ok) {
             const historyData = await historyResp.json();
             if (this.forceGraphModule.initTimeTravel) {
