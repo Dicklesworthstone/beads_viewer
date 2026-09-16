@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -1306,5 +1307,82 @@ func TestModel_VUsesFocusedSelection(t *testing.T) {
 		if got := m.focusedIssueForSessions(); got == nil || got.ID != want.ID {
 			t.Fatalf("tree selection: got %+v want %s", got, want.ID)
 		}
+	}
+}
+
+// Issue #201: on a display-less host — the ordinary case for a server you SSH
+// into — xclip and xsel are on PATH but cannot open a display and exit 1, so
+// being installed is not evidence they can run.
+func TestClipboardCommandRequiresADisplayForXHelpers(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("X helper gating is only consulted on the unix branch")
+	}
+	if _, err := exec.LookPath("xclip"); err != nil {
+		if _, err := exec.LookPath("xsel"); err != nil {
+			t.Skip("neither xclip nor xsel is installed")
+		}
+	}
+
+	t.Setenv("WAYLAND_DISPLAY", "")
+	t.Setenv("DISPLAY", "")
+	cmd, err := clipboardCommand(context.Background())
+	if err == nil {
+		base := filepath.Base(cmd.Path)
+		if base == "xclip" || base == "xsel" {
+			t.Fatalf("selected %s with no DISPLAY; it cannot open a display", base)
+		}
+	}
+
+	t.Setenv("DISPLAY", ":0")
+	cmd, err = clipboardCommand(context.Background())
+	if err != nil {
+		t.Fatalf("with DISPLAY set an installed X helper must be selectable: %v", err)
+	}
+	if base := filepath.Base(cmd.Path); base != "xclip" && base != "xsel" {
+		t.Fatalf("with DISPLAY set, got %s, want xclip or xsel", base)
+	}
+}
+
+func TestOSC52CopyEmitsAClipboardSequence(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer read.Close()
+
+	saved := os.Stdout
+	os.Stdout = write
+	t.Cleanup(func() { os.Stdout = saved })
+
+	// /dev/tty is preferred when it opens; under `go test` it usually does not,
+	// but skip rather than assert on a captured stdout that never received the
+	// write when it does.
+	if tty, ttyErr := os.OpenFile("/dev/tty", os.O_WRONLY, 0); ttyErr == nil {
+		tty.Close()
+		write.Close()
+		t.Skip("controlling terminal is available; sequence goes there, not stdout")
+	}
+
+	t.Setenv("TMUX", "")
+	t.Setenv("TERM", "xterm-256color")
+	if err := osc52Copy("hello"); err != nil {
+		t.Fatalf("osc52Copy: %v", err)
+	}
+	write.Close()
+
+	buf := make([]byte, 256)
+	n, _ := read.Read(buf)
+	got := string(buf[:n])
+	want := "\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte("hello")) + "\x07"
+	if got != want {
+		t.Fatalf("OSC 52 sequence: got %q want %q", got, want)
+	}
+}
+
+func TestOSC52CopyRefusesAnOversizedSelection(t *testing.T) {
+	// A payload past the terminal's buffer is dropped rather than truncated, so
+	// a copy that cannot land must say so instead of reporting success.
+	if err := osc52Copy(strings.Repeat("x", osc52Limit)); err == nil {
+		t.Fatal("expected an error for a selection past the OSC 52 limit")
 	}
 }
