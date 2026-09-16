@@ -284,6 +284,9 @@ class GraphStore {
         this.dependencies = [];
         this.nodeMap.clear();
         this.nodeIndexMap.clear();
+        // A skipped or failed computation belongs to this load, not the
+        // previous graph. In particular, empty graphs skip betweenness.
+        for (const metric of Object.keys(this.metrics)) this.metrics[metric] = null;
         this.selectedNode = null;
         this.hoveredNode = null;
         this.highlightedNodes.clear();
