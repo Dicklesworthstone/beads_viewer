@@ -939,6 +939,7 @@ function validateLayout(layout, issues, dependencies) {
  * @param {object} [layout] - Optional pre-computed layout
  */
 export function loadData(issues, dependencies, layout = null) {
+    resetTimeTravel();
     resetWhatIf();
     resetCriticalPath();
     resetCycleNavigator();
@@ -3244,6 +3245,7 @@ export function setConfig(key, value) {
 }
 
 export function cleanup() {
+    resetTimeTravel();
     resetWhatIf();
     resetCriticalPath();
     resetCycleNavigator();
@@ -3318,6 +3320,7 @@ const timeTravelState = {
  * @param {Object} history - History data from --robot-history
  */
 export function initTimeTravel(history) {
+    resetTimeTravel();
     if (!history || !history.commits || history.commits.length === 0) {
         console.warn('[TimeTravel] No history data provided');
         return false;
@@ -3573,9 +3576,27 @@ export function startTimeTravel() {
 }
 
 /**
- * Stop time-travel mode and restore original state
+ * Discard timeline state before replacing its graph or history.
+ */
+function resetTimeTravel() {
+    stopTimeTravel();
+    timeTravelState.history = null;
+    timeTravelState.currentIdx = 0;
+    timeTravelState.originalNodes = [];
+    timeTravelState.originalLinks = [];
+    timeTravelState.nodeStates.clear();
+    timeTravelState.controlsEl?.remove();
+    timeTravelState.controlsEl = null;
+}
+
+/**
+ * Stop time-travel mode and restore the current graph.
  */
 export function stopTimeTravel() {
+    if (timeTravelState.animationFrame !== null) {
+        cancelAnimationFrame(timeTravelState.animationFrame);
+        timeTravelState.animationFrame = null;
+    }
     if (!timeTravelState.active) return;
 
     // Stop playing
@@ -3696,6 +3717,9 @@ function togglePlay() {
     if (timeTravelState.playing) {
         timeTravelState.lastFrameTime = Date.now();
         playAnimation();
+    } else if (timeTravelState.animationFrame !== null) {
+        cancelAnimationFrame(timeTravelState.animationFrame);
+        timeTravelState.animationFrame = null;
     }
 
     dispatchEvent('timeTravelPlayState', { playing: timeTravelState.playing });
