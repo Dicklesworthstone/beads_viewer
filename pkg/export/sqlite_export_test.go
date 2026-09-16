@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
 	"modernc.org/sqlite"
@@ -111,6 +112,88 @@ func TestGraphLayoutDeterministicPositions(t *testing.T) {
 			t.Fatalf("edgeless layout must expose an empty link array: %+v", layout)
 		}
 	})
+}
+
+func TestGraphLayoutFallbackLayers(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		links       [][2]string // prerequisite, dependent
+		topological []string
+		want        map[string][2]float64
+	}{
+		{
+			name:  "reachable cycle",
+			links: [][2]string{{"root", "left"}, {"root", "right"}, {"left", "right"}, {"right", "left"}, {"left", "leaf"}},
+			want:  map[string][2]float64{"root": {0, 0}, "left": {200, -40}, "right": {200, 40}, "leaf": {400, 0}},
+		},
+		{
+			name:  "shortcut",
+			links: [][2]string{{"root", "left"}, {"left", "right"}, {"root", "right"}, {"right", "leaf"}},
+			want:  map[string][2]float64{"root": {0, 0}, "left": {200, -40}, "right": {200, 40}, "leaf": {400, 0}},
+		},
+		{
+			name:  "external dependent",
+			links: [][2]string{{"root", "absent"}},
+			want:  map[string][2]float64{"leaf": {0, -120}, "left": {0, -40}, "right": {0, 40}, "root": {0, 120}},
+		},
+		{
+			name:  "rootless cycle",
+			links: [][2]string{{"left", "right"}, {"right", "left"}, {"left", "leaf"}},
+			want:  map[string][2]float64{"leaf": {0, -120}, "left": {0, -40}, "right": {0, 40}, "root": {0, 120}},
+		},
+		{
+			name:        "topological longest path preserved",
+			links:       [][2]string{{"root", "left"}, {"left", "right"}, {"root", "right"}, {"right", "leaf"}},
+			topological: []string{"root", "left", "right", "leaf"},
+			want:        map[string][2]float64{"root": {0, 0}, "left": {200, 0}, "right": {400, 0}, "leaf": {600, 0}},
+		},
+		{
+			name:        "topological external prerequisite",
+			links:       [][2]string{{"absent", "left"}},
+			topological: []string{"absent", "left", "root", "right", "leaf"},
+			want:        map[string][2]float64{"leaf": {0, -80}, "right": {0, 0}, "root": {0, 80}, "left": {200, 0}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for permutation := 0; permutation < 4; permutation++ {
+				ids := []string{"root", "left", "right", "leaf"}
+				var issues []*model.Issue
+				for i := range ids {
+					if permutation&1 != 0 {
+						i = len(ids) - 1 - i
+					}
+					issues = append(issues, makeTestIssue(ids[i], ids[i], model.StatusOpen, 2, model.TypeTask))
+				}
+				var deps []*model.Dependency
+				for i := range tc.links {
+					if permutation&2 != 0 {
+						i = len(tc.links) - 1 - i
+					}
+					link := tc.links[i]
+					deps = append(deps, &model.Dependency{IssueID: link[1], DependsOnID: link[0], Type: model.DepBlocks})
+				}
+				dir := t.TempDir()
+				var stats *analysis.GraphStats
+				if tc.topological != nil {
+					stats = &analysis.GraphStats{TopologicalOrder: tc.topological}
+				}
+				if err := NewSQLiteExporter(issues, deps, nil, stats).writeGraphLayout(dir); err != nil {
+					t.Fatal(err)
+				}
+				data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var layout GraphLayout
+				if err := json.Unmarshal(data, &layout); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(layout.Positions, tc.want) {
+					t.Errorf("permutation %d: positions %v, want %v", permutation, layout.Positions, tc.want)
+				}
+			}
+		})
+	}
 }
 
 func TestSQLiteExportFullSourceReadiness(t *testing.T) {
