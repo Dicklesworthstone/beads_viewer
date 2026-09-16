@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -112,6 +113,55 @@ func TestGraphLayoutDeterministicPositions(t *testing.T) {
 			t.Fatalf("edgeless layout must expose an empty link array: %+v", layout)
 		}
 	})
+}
+
+func TestGraphLayoutCentralityUsesExportedTopology(t *testing.T) {
+	issues := []*model.Issue{
+		makeTestIssue("a", "A", model.StatusOpen, 2, model.TypeTask),
+		makeTestIssue("b", "B", model.StatusClosed, 2, model.TypeTask),
+	}
+	deps := []*model.Dependency{
+		{IssueID: "a", DependsOnID: "b", Type: model.DepBlocks},
+		{IssueID: "b", DependsOnID: "missing", Type: model.DepBlocks},
+		{IssueID: "a", DependsOnID: "ignored", Type: model.DepRelated},
+	}
+	// Deliberately unrelated supplied stats must never become cached metrics.
+	unrelated := analysis.NewAnalyzer([]model.Issue{{ID: "other"}}).Analyze()
+	exporter := NewSQLiteExporter(issues, deps, &unrelated, nil)
+	dir := t.TempDir()
+	if err := exporter.writeGraphLayout(dir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var layout GraphLayout
+	if err := json.Unmarshal(data, &layout); err != nil {
+		t.Fatal(err)
+	}
+	got := layout.Centrality
+	if got == nil || got.Version != 1 || got.Status.PageRank.State != "computed" || got.Status.Betweenness.State != "computed" {
+		t.Fatalf("missing completed centrality: %+v", got)
+	}
+	if len(got.PageRank) != 3 || len(got.Betweenness) != 3 || got.Betweenness["b"] != 1 || got.Betweenness["a"] != 0 || got.Betweenness["missing"] != 0 {
+		t.Fatalf("directed three-node chain with omitted endpoint: %+v", got)
+	}
+	if !(got.PageRank["missing"] > got.PageRank["b"] && got.PageRank["b"] > got.PageRank["a"]) {
+		t.Fatalf("prerequisite rank ordering lost: %v", got.PageRank)
+	}
+	if math.Abs(got.PageRank["a"]+got.PageRank["b"]+got.PageRank["missing"]-1) > 0.000001 {
+		t.Fatalf("rank mass not conserved: %v", got.PageRank)
+	}
+	if _, exists := got.PageRank["ignored"]; exists {
+		t.Fatal("nonblocking edge polluted centrality")
+	}
+	if _, exists := layout.Positions["missing"]; exists {
+		t.Fatal("analysis-only endpoint became a drawable issue")
+	}
+	if len(issues[0].Dependencies) != 0 {
+		t.Fatal("centrality export mutated caller issues")
+	}
 }
 
 func TestGraphLayoutFallbackLayers(t *testing.T) {

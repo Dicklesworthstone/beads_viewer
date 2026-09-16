@@ -46,9 +46,11 @@ import (
 //	that changed the followed blob pair for an existing SHA falls back to a miss
 //	rather than serving stale events.
 //
-// Storage discipline mirrors disk_cache.go / head_artifact_cache.go exactly:
-// same XDG cache dir (BV_CACHE_DIR override, else UserCacheDir under "bv"), goccy
-// JSON codec, flock, age bound, and the pass-1 no-rewrite-on-pure-hit rule. The
+// Storage uses the same XDG cache dir as disk_cache.go / head_artifact_cache.go
+// (BV_CACHE_DIR override, else UserCacheDir under "bv"), goccy JSON codec, flock,
+// age bound, and the pass-1 no-rewrite-on-pure-hit rule. Unlike authoritative
+// data, this rebuildable cache does not require a synchronous durability flush.
+// Missing or malformed cache data is a miss and is reconstructed from Git. The
 // per-commit map is bounded by entry count (oldest CreatedAt evicted first) and a
 // serialized-size ceiling so it cannot grow without bound.
 
@@ -155,7 +157,10 @@ func writePerCommitEventCacheLocked(f *os.File, cf perCommitEventCacheFile) erro
 			if _, err := f.Write(data); err != nil {
 				return err
 			}
-			return f.Sync()
+			// The checked write is visible to readers after the caller releases
+			// the file lock. Power-loss durability is unnecessary for derived
+			// events and can stall a history request behind unrelated disk I/O.
+			return nil
 		}
 	}
 }

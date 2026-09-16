@@ -694,7 +694,7 @@ function computeMetrics() {
 
     try {
         // PageRank (importance)
-        store.metrics.pagerank = store.wasmGraph.pagerankDefault();
+        if (!store.metrics.pagerank) store.metrics.pagerank = store.wasmGraph.pagerankDefault();
 
         // Critical path heights (depth)
         store.metrics.criticalPath = store.wasmGraph.criticalPathHeights();
@@ -707,9 +707,9 @@ function computeMetrics() {
 
         // Betweenness (bottleneck) - use approx for large graphs
         const nodeCount = store.wasmGraph.nodeCount();
-        if (nodeCount > 500) {
+        if (!store.metrics.betweenness && nodeCount > 500) {
             store.metrics.betweenness = store.wasmGraph.betweennessApprox(Math.min(100, nodeCount));
-        } else if (nodeCount > 0) {
+        } else if (!store.metrics.betweenness && nodeCount > 0) {
             store.metrics.betweenness = store.wasmGraph.betweenness();
         }
 
@@ -900,8 +900,8 @@ export async function initGraph(containerId, options = {}) {
 /**
  * Load optional starting coordinates. Only topology affects these coordinates,
  * so compare every node and directed blocking edge with the loaded database.
- * Exported metrics are deliberately not reused: they may be partial or sampled
- * and do not include all the metrics used by the browser.
+ * Reuse only complete, validated centrality snapshots. Legacy metric tuples
+ * lack computation status and are never trusted as a computation result.
  * @returns {Promise<object|null>} Layout data or null if not available
  */
 export async function loadPrecomputedLayout(issues, dependencies) {
@@ -938,7 +938,30 @@ function validateLayout(layout, issues, dependencies) {
     }
     links.sort();
     if (links.some((link, i) => link !== edges[i])) return null;
-    return { positions };
+    const nodeIDs = new Set(ids);
+    for (const dependency of dependencies.filter(isBlockingDependency)) {
+        nodeIDs.add(dependency.issue_id);
+        nodeIDs.add(dependency.depends_on_id);
+    }
+    const centrality = {};
+    const snapshot = layout.centrality;
+    if (snapshot?.version === 1) {
+        for (const [name, statusName] of [['pagerank', 'PageRank'], ['betweenness', 'Betweenness']]) {
+            const values = snapshot[name];
+            const status = snapshot.status?.[statusName];
+            if (status?.state !== 'computed' || !values || typeof values !== 'object' || Array.isArray(values)
+                || Object.keys(values).length !== nodeIDs.size) continue;
+            // Native and browser sampling use different pivots and thresholds.
+            // Only exact betweenness has the same contract in both engines.
+            if (name === 'betweenness' && status.reason === 'approximate') continue;
+            const bound = name === 'pagerank' ? 1 : nodeIDs.size * nodeIDs.size;
+            if (![...nodeIDs].every(id => Object.hasOwn(values, id) && Number.isFinite(values[id]) && values[id] >= 0 && values[id] <= bound)) continue;
+            if (name === 'pagerank' && nodeIDs.size && Math.abs(Object.values(values).reduce((sum, n) => sum + n, 0) - 1) > 0.0001) continue;
+            centrality[name] = values;
+        }
+    }
+    return { positions, links: layout.links, node_count: layout.node_count,
+        edge_count: layout.edge_count, centrality: snapshot, centralityValues: centrality };
 }
 
 /**
@@ -955,6 +978,8 @@ export function loadData(issues, dependencies, layout = null) {
     store.reset();
     store.issues = issues;
     store.dependencies = dependencies;
+    // Public callers receive the same topology/status validation as fetches.
+    layout = layout ? validateLayout(layout, issues, dependencies) : null;
 
     // Build lookup maps
     issues.forEach((issue, idx) => {
@@ -962,9 +987,20 @@ export function loadData(issues, dependencies, layout = null) {
         store.nodeIndexMap.set(issue.id, idx);
     });
 
-    // Always compute browser metrics, including critical path and cycle navigation.
+    const precomputedMetrics = [];
+    // Reuse validated centrality, while retaining the live graph and computing
+    // browser-specific metrics such as critical path and cycle enumeration.
     if (store.wasmReady) {
         buildWasmGraph();
+        const centrality = layout?.centralityValues;
+        if (store.wasmGraph && centrality) {
+            for (const name of ['pagerank', 'betweenness']) {
+                if (centrality[name]) {
+                    store.metrics[name] = Array.from({length: store.wasmGraph.nodeCount()}, (_, i) => centrality[name][store.wasmGraph.nodeId(i)]);
+                    precomputedMetrics.push(name);
+                }
+            }
+        }
         computeMetrics();
     }
 
@@ -975,6 +1011,9 @@ export function loadData(issues, dependencies, layout = null) {
     const graphData = prepareGraphData(layout);
 
     // Update graph
+    // Valid starting coordinates make synchronous warmup redundant. Paint the
+    // seeded graph immediately and let subsequent frames refine the layout.
+    store.graph.warmupTicks(layout ? 0 : store.config.warmupTicks);
     store.graph.graphData(graphData);
 
     // Compute max metric values for heatmap normalization (after graph data is set)
@@ -995,6 +1034,7 @@ export function loadData(issues, dependencies, layout = null) {
         nodeCount: graphData.nodes.length,
         linkCount: graphData.links.length,
         metrics: store.metrics,
+        precomputedMetrics,
         precomputed: !!layout
     });
 
@@ -1180,7 +1220,8 @@ function drawNode(node, ctx, globalScale) {
     const transition = timeTravelState.active ? timeTravelState.nodeStates.get(node.id) : null;
     const fade = transition ? timelineOpacity(transition) : 1;
     if (fade <= 0) return;
-    const size = getNodeSize(node) * (0.2 + 0.8 * fade);
+    const pulse = transition?.visible && fade < 1 ? 0.35 * Math.sin(Math.PI * fade) : 0;
+    const size = getNodeSize(node) * (0.2 + 0.8 * fade + pulse);
     const color = getNodeColor(node);
     const opacity = getNodeOpacity(node) * fade;
     const isHovered = store.hoveredNode?.id === node.id;
@@ -2596,6 +2637,12 @@ function applyPreset(presetName) {
     // Update store config with preset values
     Object.assign(store.config, preset.config);
     store.currentPreset = presetName;
+    if (timeTravelState.active) {
+        timeTravelState.warmupTicks = store.config.warmupTicks;
+    }
+    store.graph
+        .warmupTicks(timeTravelState.active ? 0 : store.config.warmupTicks)
+        .cooldownTicks(store.config.cooldownTicks);
 
     // Update view mode if specified
     if (preset.viewMode && preset.viewMode !== store.viewMode) {
@@ -2618,8 +2665,6 @@ function applyPreset(presetName) {
                 .strength(store.config.centerStrength))
             .d3Force('y', d3.forceY()
                 .strength(store.config.centerStrength))
-            .warmupTicks(store.config.warmupTicks)
-            .cooldownTicks(store.config.cooldownTicks)
             .d3ReheatSimulation();
     }
 
@@ -3322,6 +3367,7 @@ const timeTravelState = {
     animationFrame: null,
     transitionFrame: null,
     autoPauseRedraw: true,
+    warmupTicks: 0,
     lastFrameTime: 0,
     originalNodes: [],    // Snapshot of nodes before time-travel
     originalLinks: [],    // Snapshot of links before time-travel
@@ -3416,6 +3462,7 @@ function createTimelineControls() {
             <div class="timeline-scrubber">
                 <input type="range" id="tt-slider" min="0" max="100" value="0">
             </div>
+            <div class="timeline-sprints" aria-label="Sprint boundaries from current definitions"></div>
             <div class="timeline-info">
                 <span id="tt-date">--</span>
                 <span id="tt-position">0 / 0</span>
@@ -3435,6 +3482,24 @@ function createTimelineControls() {
 
     controls.querySelector('#tt-speed').value = String(timeTravelState.speed);
     controls.querySelector('#tt-slider').max = String(timeTravelState.history.commits.length - 1);
+    const commits = timeTravelState.history.commits;
+    const dated = commits.map((commit, idx) => ({idx, at: Date.parse(commit.date)}))
+        .filter(commit => Number.isFinite(commit.at)).sort((a, b) => a.at - b.at || a.idx - b.idx);
+    const markers = controls.querySelector('.timeline-sprints');
+    for (const sprint of timeTravelState.history.sprints || []) {
+        for (const [field, label] of [['start_date', 'Start'], ['end_date', 'End']]) {
+            const at = Date.parse(sprint[field]);
+            if (!Number.isFinite(at) || !dated.length || at < dated[0].at || at > dated[dated.length - 1].at) continue;
+            const target = dated.find(commit => commit.at >= at);
+            const button = document.createElement('button');
+            button.className = 'timeline-btn';
+            button.textContent = `${label}: ${sprint.name}`;
+            button.title = `${new Date(at).toISOString()} — nearest following recorded commit; current sprint definition`;
+            button.addEventListener('click', () => goToCommit(target.idx));
+            markers.appendChild(button);
+        }
+    }
+    markers.hidden = !markers.childElementCount;
 
     // Add styles
     const style = document.createElement('style');
@@ -3502,6 +3567,20 @@ function createTimelineControls() {
         }
         .timeline-scrubber {
             margin-bottom: 8px;
+        }
+        .timeline-sprints:not([hidden]) {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            max-width: 300px;
+            max-height: 100px;
+            overflow-y: auto;
+            margin-bottom: 8px;
+        }
+        .timeline-sprints button {
+            max-width: 100%;
+            overflow-wrap: anywhere;
+            font-size: 11px;
         }
         .timeline-scrubber input[type="range"] {
             width: 100%;
@@ -3600,6 +3679,11 @@ export function startTimeTravel() {
     timeTravelState.originalLinks = [...graphData.links];
     timeTravelState.nodeStates.clear();
     timeTravelState.autoPauseRedraw = store.graph?.autoPauseRedraw() ?? true;
+    timeTravelState.warmupTicks = store.graph?.warmupTicks() ?? 0;
+    // Nodes already have positions. Re-running synchronous layout warmup on
+    // every history step blocks both controls and transition painting. Keep
+    // the normal per-frame simulation running instead.
+    store.graph?.warmupTicks(0);
 
     // Initialize all nodes as hidden
     graphData.nodes.forEach(node => {
@@ -3656,6 +3740,7 @@ export function stopTimeTravel() {
     }
 
     // Restore original nodes
+    store.graph?.warmupTicks(timeTravelState.warmupTicks);
     if (store.graph && timeTravelState.originalNodes.length > 0) {
         store.graph.graphData({
             nodes: timeTravelState.originalNodes,

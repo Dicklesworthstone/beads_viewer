@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"golang.org/x/sys/windows"
 	"golang.org/x/term"
 )
@@ -28,7 +29,7 @@ const backgroundQueryBudget = 300 * time.Millisecond
 // existing answer, so this can only improve detection, never replace a working
 // one with a worse guess.
 func platformHasDarkBackground() (isDark bool, ok bool) {
-	if os.Getenv("BV_NO_BG_QUERY") != "" || os.Getenv("WT_SESSION") == "" {
+	if env.NoBackgroundQuery.Get() != "" || os.Getenv("WT_SESSION") == "" {
 		return false, false
 	}
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {

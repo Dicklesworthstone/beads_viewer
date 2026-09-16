@@ -982,6 +982,7 @@ func stringSliceContains(slice []string, val string) bool {
 // GraphLayout is a compact representation of pre-computed graph layout data.
 // This is much smaller than full node data (~30KB vs ~200KB) for fast initial load.
 type GraphLayout struct {
+	Centrality  *GraphCentrality      `json:"centrality,omitempty"`
 	Positions   map[string][2]float64 `json:"positions"`
 	Metrics     map[string][5]float64 `json:"metrics"`
 	Links       [][2]string           `json:"links"`
@@ -990,6 +991,68 @@ type GraphLayout struct {
 	GeneratedAt string                `json:"generated_at"`
 	NodeCount   int                   `json:"node_count"`
 	EdgeCount   int                   `json:"edge_count"`
+}
+
+// GraphCentrality binds reusable centrality to the layout's complete topology.
+// Other browser algorithms retain their own semantics and are not cached here.
+type GraphCentrality struct {
+	Version     int                   `json:"version"`
+	PageRank    map[string]float64    `json:"pagerank,omitempty"`
+	Betweenness map[string]float64    `json:"betweenness,omitempty"`
+	Status      analysis.MetricStatus `json:"status"`
+}
+
+func (e *SQLiteExporter) graphCentrality() *GraphCentrality {
+	// Analyze the exported topology rather than borrowing possibly scoped or
+	// incomplete caller stats. Include omitted endpoints just as WASM does.
+	byID := make(map[string]*model.Issue, len(e.Issues))
+	for _, issue := range e.Issues {
+		byID[issue.ID] = &model.Issue{ID: issue.ID, Status: model.StatusOpen}
+	}
+	for _, dep := range e.Deps {
+		if dep == nil || !dep.Type.IsBlocking() {
+			continue
+		}
+		for _, id := range []string{dep.IssueID, dep.DependsOnID} {
+			if byID[id] == nil {
+				byID[id] = &model.Issue{ID: id, Status: model.StatusOpen}
+			}
+		}
+		byID[dep.IssueID].Dependencies = append(byID[dep.IssueID].Dependencies, dep)
+	}
+	issues := make([]model.Issue, 0, len(byID))
+	for _, issue := range byID {
+		issues = append(issues, *issue)
+	}
+	cfg := analysis.ConfigForSize(len(issues), len(e.Deps))
+	// Browser sampling has different pivots and thresholds, so it cannot reuse
+	// native approximations. Avoid spending export time producing unused scores.
+	if cfg.BetweennessMode == analysis.BetweennessApproximate {
+		cfg.ComputeBetweenness = false
+	}
+	cfg.ComputeHITS = false
+	cfg.ComputeEigenvector = false
+	cfg.ComputeCriticalPath = false
+	cfg.ComputeCycles = false
+	cfg.ComputeKCore = false
+	cfg.ComputeArticulation = false
+	cfg.ComputeSlack = false
+	stats := analysis.NewAnalyzer(issues).AnalyzeWithConfig(cfg)
+	result := &GraphCentrality{Version: 1, Status: stats.Status()}
+	if result.Status.PageRank.State == "computed" {
+		result.PageRank = stats.PageRank()
+	}
+	if result.Status.Betweenness.State == "computed" {
+		result.Betweenness = stats.Betweenness()
+		// Exact Brandes stores only nonzero scores. A completed run makes its
+		// omitted zero entries known, unlike a pending or timed-out calculation.
+		for id := range byID {
+			if _, exists := result.Betweenness[id]; !exists {
+				result.Betweenness[id] = 0
+			}
+		}
+	}
+	return result
 }
 
 // writeGraphLayout generates compact pre-computed graph layout data.
@@ -1116,6 +1179,7 @@ func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
 	}
 
 	layout := GraphLayout{
+		Centrality:  e.graphCentrality(),
 		Positions:   positions,
 		Metrics:     metrics,
 		Links:       links,

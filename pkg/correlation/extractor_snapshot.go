@@ -339,6 +339,8 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 	// advance only reads + diffs the NEW commits' blobs instead of all ~200.
 	namespace := perCommitEventCacheNamespace(e.primaryBeadsFile(), opts.BeadID)
 	cached := loadPerCommitEvents(namespace)
+	var unfilteredCache map[string]perCommitEventEntry
+	unfilteredLoaded := false
 
 	// Per-commit events in git-log (newest-first) order; nil means "must compute".
 	perCommitEvents := make([][]BeadEvent, len(commits))
@@ -373,6 +375,28 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 		if ce, ok := cached[c.info.SHA]; ok && ce.OldSHA == c.oldSHA && ce.NewSHA == c.newSHA {
 			perCommitEvents[i] = ce.Events
 			continue
+		}
+		if opts.BeadID != "" {
+			// A prior full-history request already parsed these exact records.
+			// parseDiff's bead filter selects events; it does not change their
+			// contents or the whole-diff TransitionObserved flag. Reuse only in
+			// this direction, retaining freshness and both blob-OID checks.
+			if !unfilteredLoaded {
+				unfilteredCache = loadPerCommitEvents(perCommitEventCacheNamespace(e.primaryBeadsFile(), ""))
+				unfilteredLoaded = true
+			}
+			if ce, ok := unfilteredCache[c.info.SHA]; ok && ce.OldSHA == c.oldSHA && ce.NewSHA == c.newSHA {
+				selected := make([]BeadEvent, 0)
+				for _, event := range ce.Events {
+					if event.BeadID == opts.BeadID {
+						selected = append(selected, event)
+					}
+				}
+				// Non-nil marks even an empty selection as a cache hit. Do not
+				// write a second persisted copy under the filtered namespace.
+				perCommitEvents[i] = selected
+				continue
+			}
 		}
 		noteUse(c.oldSHA, i)
 		noteUse(c.newSHA, i)

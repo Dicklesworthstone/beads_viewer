@@ -17,6 +17,7 @@
 | `BV_INSIGHTS_MAP_LIMIT` | Positive entry limit for each `--robot-insights` metric map; zero or invalid values use the default. | `200` |
 | `BV_MAX_LINE_SIZE_MB` | Max JSONL line size in MB (lines larger than this are skipped with a warning). Applies to the TUI, the background worker, and robot loads. | `10` |
 | `BV_METRICS` | Set to `0` to disable internal timing metrics collection (`--robot-metrics`). | (enabled) |
+| `BV_NO_BG_QUERY` | Any non-empty value skips bv's Windows Terminal background-color query; the existing terminal-color fallback remains in use. No effect on other platforms. | (unset) |
 | `BV_NO_BROWSER` | Any value: never open a browser after exports or deployments. | (unset) |
 | `BV_NO_CACHE` | Set to `1` to bypass the robot analysis and correlation disk caches (`--no-cache` sets it). | (cache on) |
 | `BV_NO_GITIGNORE` | Disable automatic ignore-file management for `.bv/` entirely (any non-empty value). See [Automatic `.bv/` ignore handling](#automatic-bv-ignore-handling). | (enabled) |

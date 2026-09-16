@@ -2203,6 +2203,7 @@ bv --robot-history                          # Full history report
 bv --robot-history --bead-history BV-123    # Single bead focus
 bv --robot-history --history-since '30 days ago'
 bv --robot-history --min-confidence 0.7     # High-confidence only
+bv --robot-history | jq '{avg_cycle_time_days: .stats.avg_cycle_time_days, beads: [.histories | to_entries[] | {id: .key, claim_to_close_ns: .value.cycle_time.claim_to_close}]}'
 ```
 
 **Abbreviated output example:** lifecycle events, commits and additional metadata are omitted here. `milestones` is an object keyed by lifecycle event; `cycle_time` durations are nanoseconds, while the aggregate average uses days.
@@ -2869,9 +2870,16 @@ an unresolved prior state. Issues without that evidence may be absent. Removal
 hides a record without treating it as completed. Reintroduced closed records stay
 hidden until reopened.
 Issues absent from the current export are not reconstructed from deleted records.
-Visible nodes fade and grow into view; closing or removing a node briefly fades
+Visible nodes fade, grow, and pulse into view; closing or removing a node briefly fades
 and shrinks its image after removing it from the interactive graph. Scrubbing
 backward uses the same transitions. Reduced-motion preferences skip these effects.
+Sprint start/end buttons use current sprint definitions and jump to the first
+recorded commit at or after each boundary within the retained date range.
+
+The graph uses exported starting positions when every node and directed blocking
+edge matches the loaded database. It also reuses completed PageRank and exact
+betweenness values from that topology. Missing, invalid, or sampled results fall
+back to browser computation; other browser graph algorithms still run normally.
 
 ### Graph Visualization: Pre-computed Layout
 
@@ -4161,6 +4169,7 @@ bv has a comprehensive built-in help system:
 | `BV_INSIGHTS_MAP_LIMIT` | Positive entry limit for each `--robot-insights` metric map; zero or invalid values use the default. | `200` |
 | `BV_MAX_LINE_SIZE_MB` | Max JSONL line size in MB (lines larger than this are skipped with a warning). Applies to the TUI, the background worker, and robot loads. | `10` |
 | `BV_METRICS` | Set to `0` to disable internal timing metrics collection (`--robot-metrics`). | (enabled) |
+| `BV_NO_BG_QUERY` | Any non-empty value skips bv's Windows Terminal background-color query; the existing terminal-color fallback remains in use. No effect on other platforms. | (unset) |
 | `BV_NO_BROWSER` | Any value: never open a browser after exports or deployments. | (unset) |
 | `BV_NO_CACHE` | Set to `1` to bypass the robot analysis and correlation disk caches (`--no-cache` sets it). | (cache on) |
 | `BV_NO_GITIGNORE` | Disable automatic ignore-file management for `.bv/` entirely (any non-empty value). See [Automatic `.bv/` ignore handling](#automatic-bv-ignore-handling). | (enabled) |

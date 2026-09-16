@@ -146,6 +146,12 @@ var (
 		Default:     "(enabled)",
 	})
 
+	NoBackgroundQuery = register(Var{
+		Name:        "BV_NO_BG_QUERY",
+		Description: "Any non-empty value skips bv's Windows Terminal background-color query; the existing terminal-color fallback remains in use. No effect on other platforms.",
+		Default:     "(unset)",
+	})
+
 	NoBrowser = register(Var{
 		Name:        "BV_NO_BROWSER",
 		Description: "Any value: never open a browser after exports or deployments.",

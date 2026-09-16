@@ -7018,7 +7018,8 @@ type TimeTravelHistory struct {
 	GeneratedAt string             `json:"generated_at"`
 	Commits     []TimeTravelCommit `json:"commits"`
 	// InitialBeads were observed unresolved before their first retained event.
-	InitialBeads []string `json:"initial_beads,omitempty"`
+	InitialBeads []string       `json:"initial_beads,omitempty"`
+	Sprints      []model.Sprint `json:"sprints,omitempty"`
 }
 
 // TimeTravelCommit represents a single commit in the time-travel history
@@ -7177,11 +7178,22 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		}
 	}
 	sort.Strings(initialBeads)
+	sprints, err := loader.LoadSprints(cwd)
+	if err != nil {
+		return nil, fmt.Errorf("loading timeline sprints: %w", err)
+	}
+	sort.Slice(sprints, func(i, j int) bool {
+		if !sprints[i].StartDate.Equal(sprints[j].StartDate) {
+			return sprints[i].StartDate.Before(sprints[j].StartDate)
+		}
+		return sprints[i].ID < sprints[j].ID
+	})
 
 	return &TimeTravelHistory{
 		GeneratedAt:  robotNow().Format(time.RFC3339),
 		Commits:      commits,
 		InitialBeads: initialBeads,
+		Sprints:      sprints,
 	}, nil
 }
 

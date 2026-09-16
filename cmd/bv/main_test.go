@@ -109,6 +109,9 @@ func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 	git(4, "add", "feature.go")
 	git(4, "commit", "-m", "bv-a: follow-up code work")
 	issues := []model.Issue{{ID: "bv-a", Title: "Target revision 3", Status: model.StatusOpen}, {ID: "bv-z", Title: "Already closed", Status: model.StatusClosed}}
+	if err := os.WriteFile(".beads/sprints.jsonl", []byte("{\"id\":\"sprint-1\",\"name\":\"Recorded sprint\",\"start_date\":\"2026-01-01T00:00:00Z\",\"end_date\":\"2026-01-08T00:00:00Z\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	for run := 0; run < 2; run++ {
 		history, err := generateHistoryForExport(issues)
 		if err != nil {
@@ -119,6 +122,9 @@ func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 		}
 		if len(history.InitialBeads) != 0 {
 			t.Fatalf("creation inside the retained window must not seed earlier visibility: %v", history.InitialBeads)
+		}
+		if len(history.Sprints) != 1 || history.Sprints[0].ID != "sprint-1" || !history.Sprints[0].StartDate.Equal(start) {
+			t.Fatalf("timeline sprint definitions: %#v", history.Sprints)
 		}
 	}
 	t.Run("retained_window", func(t *testing.T) {

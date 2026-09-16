@@ -1,9 +1,12 @@
 package correlation
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -180,14 +183,249 @@ func evictNewestKFromCache(t *testing.T, namespace string, commits []snapshotCom
 	}
 }
 
-// TestPerCommitCacheNamespaceIsolation verifies BeadID-filtered and unfiltered
-// extractions do not share cached entries (their parseDiff output differs).
+// TestPerCommitCacheNamespaceIsolation verifies filtered contributions cannot
+// overwrite the full extraction's namespace. Reuse from full to filtered must
+// explicitly select the requested bead's events.
 func TestPerCommitCacheNamespaceIsolation(t *testing.T) {
 	e := NewExtractor("/tmp/repo")
 	a := perCommitEventCacheNamespace(e.primaryBeadsFile(), "")
 	b := perCommitEventCacheNamespace(e.primaryBeadsFile(), "bv-123")
 	if a == b {
 		t.Fatalf("namespaces collide for different BeadID filters: %q", a)
+	}
+}
+
+func TestPerCommitCacheFilteredReuse(t *testing.T) {
+	repo := initTempGitRepo(t)
+	t.Setenv("BV_ROBOT", "1")
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Keep the actual dispatcher on the snapshot path. Padding belongs to an
+	// unrelated record and is not part of the extracted event payload.
+	padding := strings.Repeat("x", snapshotBlobSizeThreshold)
+	steps := []struct {
+		target, other, deps, malformed string
+	}{
+		{"open", "open", "[]", ""},
+		{"in_progress", "open", `[{"depends_on_id":"other","type":"blocks"}]`, ""},
+		{"in_progress", "closed", `[{"depends_on_id":"other","type":"blocks"}]`, ""},
+		{"closed", "closed", `[{"depends_on_id":"other","type":"blocks"}]`, "{\"broken\":\n"},
+		{"open", "closed", "[]", "{\"broken\":\n"},
+	}
+	for i, step := range steps {
+		content := fmt.Sprintf("{\"id\":\"target\",\"title\":\"Target\",\"status\":%q,\"dependencies\":%s}\n{\"id\":\"other\",\"title\":\"Other\",\"status\":%q}\n{\"id\":\"padding\",\"status\":\"open\",\"description\":%q}\n%s", step.target, step.deps, step.other, padding, step.malformed)
+		if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, repo, "add", ".beads/issues.jsonl")
+		runGit(t, repo, "commit", "-m", fmt.Sprintf("lifecycle step %d", i))
+	}
+	e := NewExtractor(repo)
+	t.Setenv("BV_NO_CACHE", "1")
+	oracles := make(map[string][]BeadEvent)
+	for _, filter := range []string{"", "target", "absent"} {
+		var err error
+		oracles[filter], err = e.Extract(ExtractOptions{BeadID: filter})
+		if err != nil {
+			t.Fatalf("uncached filter=%q: %v", filter, err)
+		}
+	}
+	var eventTypes []EventType
+	for _, event := range oracles["target"] {
+		eventTypes = append(eventTypes, event.EventType)
+	}
+	if !reflect.DeepEqual(eventTypes, []EventType{EventCreated, EventClaimed, EventClosed, EventReopened}) {
+		t.Fatalf("fixture lifecycle=%v", eventTypes)
+	}
+	closed := oracles["target"][2]
+	if closed.TransitionObserved || closed.Before == nil || closed.After == nil ||
+		closed.Before.Status != "in_progress" || closed.After.Status != "closed" ||
+		len(closed.After.Dependencies) != 1 || closed.After.Dependencies[0].DependsOnID != "other" {
+		t.Fatalf("fixture must retain before/after/dependency evidence and unrelated malformed-record incompleteness: %+v", closed)
+	}
+	if len(oracles[""]) <= len(oracles["target"]) || len(oracles["absent"]) != 0 {
+		t.Fatal("fixture must distinguish full, filtered, and empty results")
+	}
+	for _, tc := range []struct {
+		name, warmFilter, filter, corrupt string
+		wantZeroBlobs                     bool
+	}{
+		{"full to target", "", "target", "", true},
+		{"full to absent", "", "absent", "", true},
+		{"expired full entry", "", "target", "expired", false},
+		{"future full entry", "", "target", "future", false},
+		{"zero timestamp", "", "target", "zero", false},
+		{"wrong parent blob", "", "target", "old_oid", false},
+		{"wrong child blob", "", "target", "new_oid", false},
+		{"different source file", "", "target", "source", false},
+		{"filtered cannot fill full", "target", "", "", false},
+		{"truncated full cache", "", "", "truncated", false},
+		{"empty full cache", "", "", "empty", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BV_CACHE_DIR", t.TempDir())
+			t.Setenv("BV_NO_CACHE", "")
+			if _, err := e.Extract(ExtractOptions{BeadID: tc.warmFilter}); err != nil {
+				t.Fatalf("populate actual cache: %v", err)
+			}
+			path, err := perCommitEventCachePath(false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.corrupt != "" {
+				f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cf := readPerCommitEventCacheLocked(f)
+				namespace := perCommitEventCacheNamespace(e.primaryBeadsFile(), "")
+				bucket := cf.Entries[namespace]
+				if len(bucket.Commits) != len(steps) {
+					_ = f.Close()
+					t.Fatalf("actual cache has %d commits, want %d", len(bucket.Commits), len(steps))
+				}
+				for sha, entry := range bucket.Commits {
+					switch tc.corrupt {
+					case "expired":
+						entry.CreatedAt = time.Now().Add(-perCommitEventCacheMaxAge - time.Hour)
+					case "future":
+						entry.CreatedAt = time.Now().Add(time.Hour)
+					case "zero":
+						entry.CreatedAt = time.Time{}
+					case "old_oid":
+						entry.OldSHA = strings.Repeat("f", 40)
+					case "new_oid":
+						entry.NewSHA = strings.Repeat("f", 40)
+					}
+					bucket.Commits[sha] = entry
+				}
+				if tc.corrupt == "source" {
+					cf.Entries = map[string]perCommitNamespaceBucket{perCommitEventCacheNamespace(".beads/different.jsonl", ""): bucket}
+				}
+				switch tc.corrupt {
+				case "truncated", "empty":
+					// Simulate an interrupted cache rewrite using an actual
+					// previously populated file, not fabricated event data.
+					info, statErr := f.Stat()
+					if statErr != nil {
+						_ = f.Close()
+						t.Fatal(statErr)
+					}
+					length := info.Size() / 2
+					if tc.corrupt == "empty" {
+						length = 0
+					}
+					err = f.Truncate(length)
+				default:
+					err = writePerCommitEventCacheLocked(f, cf)
+				}
+				closeErr := f.Close()
+				if err != nil || closeErr != nil {
+					t.Fatalf("plant cache negative: write=%v close=%v", err, closeErr)
+				}
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			atomic.StoreInt64(&blobsReadCounter, 0)
+			got, err := e.Extract(ExtractOptions{BeadID: tc.filter})
+			reads := atomic.LoadInt64(&blobsReadCounter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Compare EVERY field, including Before/After and TransitionObserved;
+			// the older eventKey helper intentionally does not cover those fields.
+			if !reflect.DeepEqual(got, oracles[tc.filter]) {
+				t.Fatalf("filtered extraction changed event contents/order: got=%+v want=%+v", got, oracles[tc.filter])
+			}
+			t.Logf("filter=%q warm_filter=%q negative=%q events=%d blobs_read=%d want_zero=%v", tc.filter, tc.warmFilter, tc.corrupt, len(got), reads, tc.wantZeroBlobs)
+			if (reads == 0) != tc.wantZeroBlobs {
+				t.Fatalf("blob reads=%d, want_zero=%v", reads, tc.wantZeroBlobs)
+			}
+			if tc.wantZeroBlobs {
+				after, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(before, after) {
+					t.Fatal("pure full-cache hit rewrote the persisted cache")
+				}
+			}
+			if tc.corrupt == "truncated" || tc.corrupt == "empty" {
+				atomic.StoreInt64(&blobsReadCounter, 0)
+				recovered, err := e.Extract(ExtractOptions{BeadID: tc.filter})
+				if err != nil {
+					t.Fatalf("read rebuilt cache: %v", err)
+				}
+				if !reflect.DeepEqual(recovered, oracles[tc.filter]) {
+					t.Fatal("rebuilt cache changed event contents/order")
+				}
+				if reads := atomic.LoadInt64(&blobsReadCounter); reads != 0 {
+					t.Fatalf("rebuilt cache read %d blobs, want 0", reads)
+				}
+			}
+		})
+	}
+}
+
+func TestPerCommitEventCacheWriter(t *testing.T) {
+	cache := perCommitEventCacheFile{
+		Version: perCommitEventCacheVersion,
+		Entries: map[string]perCommitNamespaceBucket{
+			"namespace": {Commits: map[string]perCommitEventEntry{
+				"commit": {
+					CreatedAt: time.Now().UTC(), OldSHA: "parent", NewSHA: "child",
+					Events: []BeadEvent{{BeadID: "target", EventType: EventClosed}},
+				},
+			}},
+		},
+	}
+	for _, state := range []string{"writable", "read-only", "closed"} {
+		t.Run(state, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "cache.json")
+			original := []byte("existing cache contents")
+			if err := os.WriteFile(path, original, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			mode := os.O_RDWR
+			if state == "read-only" {
+				mode = os.O_RDONLY
+			}
+			f, err := os.OpenFile(path, mode, 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state == "closed" {
+				if err := f.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				defer f.Close()
+			}
+			err = writePerCommitEventCacheLocked(f, cache)
+			if state == "writable" {
+				if err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				if got := readPerCommitEventCacheLocked(f); !reflect.DeepEqual(got, cache) {
+					t.Fatalf("cache round trip changed contents: got=%+v want=%+v", got, cache)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("%s descriptor must return a write error", state)
+			}
+			got, readErr := os.ReadFile(path)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !bytes.Equal(got, original) {
+				t.Fatalf("%s descriptor changed file despite failed write", state)
+			}
+		})
 	}
 }
 

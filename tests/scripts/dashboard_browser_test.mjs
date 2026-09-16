@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 
 const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline', 'timeline-removal', 'timeline-animation'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'precomputed-metrics', 'graph-startup', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline', 'timeline-removal', 'timeline-animation', 'timeline-sprints', 'timeline-performance'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
@@ -45,7 +45,7 @@ server = http.createServer((req, res) => {
   }
   res.setHeader('Content-Type', mime[path.extname(file)] || 'application/octet-stream');
   let body = fs.readFileSync(file);
-  if (name === '/data/graph_layout.json' && mode === 'layout-seeds' && layoutVariant) {
+  if (name === '/data/graph_layout.json' && ['layout-seeds','precomputed-metrics','graph-startup'].includes(mode) && layoutVariant) {
     if (layoutVariant === 'stalled-headers') return;
     if (layoutVariant === 'stalled-body') { res.write('{"positions":'); return; }
     if (layoutVariant === 'missing') { res.writeHead(404); res.end('missing optional layout'); return; }
@@ -59,6 +59,11 @@ server = http.createServer((req, res) => {
       delete layout.positions[id];
     }
     if (layoutVariant === 'invalid-coordinate') layout.positions[Object.keys(layout.positions)[0]][0] = '100';
+    if (layoutVariant === 'metric-missing') delete layout.centrality.pagerank[Object.keys(layout.centrality.pagerank)[0]];
+    if (layoutVariant === 'metric-invalid') layout.centrality.betweenness[Object.keys(layout.centrality.betweenness)[0]] = 999;
+    if (layoutVariant === 'metric-timeout') layout.centrality.status.PageRank.state = 'timeout';
+    if (layoutVariant === 'metric-approximate') layout.centrality.status.Betweenness.reason = 'approximate';
+    if (layoutVariant === 'metric-old-version') layout.centrality.version = 0;
     // A matching artifact with bogus metrics must never suppress real computation.
     for (const tuple of Object.values(layout.metrics)) tuple.fill(999);
     body = Buffer.from(JSON.stringify(layout));
@@ -201,6 +206,85 @@ async function resultIDs(page, expected) {
   await waitFor(page, `JSON.stringify([...document.querySelectorAll('[aria-label^="View issue "]')].filter(${visible}).map(e => e.getAttribute('aria-label').split(':')[0].slice(11)).sort()) === ${JSON.stringify(JSON.stringify([...expected].sort()))}`, `visible issue IDs ${expected}`);
 }
 
+async function timelineSprintsJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'sprint fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'sprint graph loaded');
+  await key(page, 't', 'KeyT');
+  const markers = '.timeline-sprints button';
+  const texts = await evaluate(page, `[...document.querySelectorAll('${markers}')].map(e=>e.textContent)`);
+  assert.deepEqual(texts, ['Start: Review <em>phase</em>', 'End: Review <em>phase</em>'], 'only retained boundaries appear as literal text');
+  assert.equal(await evaluate(page, `document.querySelectorAll('.timeline-sprints em').length`), 0, 'sprint names are not interpreted as markup');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  await click(page, markers, texts[0]);
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 2, 'backdated source commit is selected by boundary time');
+  assert.equal(await evaluate(page, `document.querySelector('#tt-date').textContent`), 'Sep 2, 2026');
+  await click(page, markers, texts[1]);
+  assert.equal(await evaluate(page, `${state}.currentIdx`), 5);
+  assert.equal(await evaluate(page, `document.querySelector('#tt-date').textContent`), 'Sep 6, 2026', 'date changes with boundary navigation');
+  await capture(page, 'timeline-sprints');
+  clean(page);
+  console.log(`PASS: ${page.name} sprint boundaries, backdated chronology, date updates and literal names`);
+}
+
+async function timelinePerformanceJourney(page) {
+  const history = JSON.parse(fs.readFileSync(path.join(bundle,'data/history.json'),'utf8'));
+  assert.equal(history.commits.length, 21, 'twenty real recorded transitions');
+  const readyLarge = `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total === 1000 && ${app}.graphReady`;
+  await waitFor(page, readyLarge, '1000 exported issues and actual graph WASM ready');
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'performance fixture worker controls page');
+  await delay(500);
+  await waitFor(page, readyLarge, 'large fixture after worker activation');
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading && ${app}.graphLoadingStage === null`, 'large graph loaded');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  const priorWarmup = await evaluate(page,`${app}.forceGraphModule.getGraph().warmupTicks()`);
+  await key(page,'t','KeyT');
+  await delay(500);
+  await evaluate(page, `document.querySelector('#tt-speed').focus()`);
+  await key(page,'End');
+  await key(page,'ArrowUp');
+  assert.equal(await evaluate(page,`${state}.speed`),5);
+  await evaluate(page, `(() => {
+    window.__timelinePerf={frames:[],ticks:[],paints:0};
+    const p=window.__timelinePerf, arc=CanvasRenderingContext2D.prototype.arc;
+    CanvasRenderingContext2D.prototype.arc=function(...args){if(p.active && this.canvas.isConnected)p.paints++;return arc.apply(this,args);};
+    document.addEventListener('bv-graph:timeTravelCommit',e=>{
+      if(p.active)p.ticks.push({index:e.detail.idx,at:performance.now(),nodes:${app}.forceGraphModule.getGraph().graphData().nodes.length});
+    });
+    document.querySelector('#tt-play').addEventListener('click',()=>{
+      p.active=true;p.started=performance.now();let previous=p.started;
+      const sample=t=>{if(!p.active)return;p.frames.push(t-previous);previous=t;requestAnimationFrame(sample);};
+      requestAnimationFrame(sample);
+    },{once:true});
+  })()`);
+  await send('Profiler.enable',{},page.session);
+  await send('Profiler.start',{},page.session);
+  await click(page,'#tt-play');
+  await waitFor(page,`${state}.currentIdx===20 && !${state}.playing`,'complete 5x playback',10000);
+  await evaluate(page,`new Promise(resolve=>setTimeout(resolve,Math.max(0,window.__timelinePerf.ticks.at(-1).at+250-performance.now())))`);
+  const result=await evaluate(page,`(() => {const p=window.__timelinePerf;p.active=false;p.elapsed=performance.now()-p.started;return p;})()`);
+  const profile=await send('Profiler.stop',{},page.session);
+  fs.writeFileSync(path.join(artifacts,`${page.name}-timeline.cpuprofile`),JSON.stringify(profile.profile));
+  const sorted=result.frames.filter(n=>n>=0).sort((a,b)=>a-b);
+  const percentile=q=>sorted[Math.min(sorted.length-1,Math.ceil(q*sorted.length)-1)];
+  const summary={frames:sorted.length,p95:percentile(.95),p99:percentile(.99),max:sorted.at(-1),paints:result.paints,elapsed:result.elapsed};
+  records.push({timelinePerformance:{result,summary},page:page.name});
+  console.log(`Timeline performance ${page.name}: ${JSON.stringify(summary)}`);
+  assert.equal(result.ticks.length,20,'all twenty transitions observed, no skipped steps');
+  assert.ok(result.ticks.every((t,i)=>t.index===i+1 && t.nodes===(i%2===0?950:1000)),'every recorded closure/reopen applied');
+  assert.ok(sorted.length>=120 && result.paints>=1000,'measure actual rendering throughout playback');
+  // These are browser-animation bounds, not CLI/TUI latency or physical-device claims.
+  assert.ok(summary.p95<=33.4 && summary.p99<=50,'1000-node playback frame intervals: p95 <=33.4ms, p99 <=50ms');
+  await click(page,'.timeline-close');
+  assert.equal(await evaluate(page,`${app}.forceGraphModule.getGraph().warmupTicks()`),priorWarmup,'exit restores configured layout warmup');
+  clean(page);
+  console.log(`PASS: ${page.name} 1000-node timeline playback frame budget`);
+}
+
 async function timelineAnimationJourney(page) {
   await ready(page);
   await waitFor(page, '!!navigator.serviceWorker.controller', 'animation fixture worker controls page');
@@ -229,6 +313,7 @@ async function timelineAnimationJourney(page) {
   assert.ok(appearing.some(p=>p.alpha>0 && p.alpha<0.9), 'actual canvas paints intermediate appearance alpha');
   const fullRadius = Math.min(...appearing.filter(p=>p.alpha===1).map(p=>p.r));
   assert.ok(Number.isFinite(fullRadius), 'appearance reaches full size and opacity');
+  assert.ok(appearing.some(p=>p.alpha<1 && p.r>fullRadius*1.01), 'appearing node briefly pulses above settled size');
   await evaluate(page, `window.__timelinePaint=[]; document.querySelector('#tt-slider').focus()`);
   await key(page, 'ArrowRight');
   assert.equal(await evaluate(page, `${state}.currentIdx`), 1);
@@ -271,6 +356,13 @@ async function timelineAnimationJourney(page) {
   await evaluate(page, 'window.__timelinePaint=[]');
   await delay(100);
   assert.deepEqual(await evaluate(page, 'window.__timelinePaint'), [], 'reduced motion skips disappearing overlay');
+  for (const preset of ['spread','compact']) {
+    await evaluate(page,`${app}.forceGraphModule.applyPreset('${preset}')`);
+    assert.equal(await evaluate(page,`${graph}.warmupTicks()`),0,'preset changes keep playback warmup disabled');
+    await click(page,'.timeline-close');
+    assert.equal(await evaluate(page,`${graph}.warmupTicks()`),preset==='spread'?150:50,'exit restores the newly chosen standard or custom preset');
+    await key(page,'t','KeyT');
+  }
   records.push({timelineAnimation:{appearing,disappearing,reversed,fullRadius},page:page.name});
   await capture(page, 'timeline-animation');
   clean(page);
@@ -601,6 +693,107 @@ async function graphReloadJourney(page) {
   await capture(page, 'graph-reload');
   clean(page);
   console.log(`PASS: ${page.name} fresh metrics, replacement cycle navigation, cancelled path animation and cleanup`);
+}
+
+async function graphStartupJourney(page) {
+  const readyLarge=`typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total===1000 && ${app}.graphReady`;
+  await waitFor(page,readyLarge,'1000-node startup fixture ready');
+  await waitFor(page,'!!navigator.serviceWorker.controller','startup worker controls page');
+  await delay(500);
+  await waitFor(page,readyLarge,'startup fixture after worker activation');
+  await send('Network.setBypassServiceWorker',{bypass:true},page.session);
+  await click(page,'a[href="#/graph"]');
+  await waitFor(page,`${app}.forceGraphReady && !${app}.forceGraphLoading`,'initial graph loaded');
+  await evaluate(page,`(() => {
+    const g=${app}.forceGraphModule.getGraph(),draw=g.nodeCanvasObject();
+    g.nodeCanvasObject(function(node,...args){
+      const p=window.__startupSample;
+      if(p?.loaded && !p.paint && window.__startupNodes.has(node)
+        && Number.isFinite(node.x) && Number.isFinite(node.y))p.paint=performance.now();
+      return draw.call(this,node,...args);
+    });
+  })()`);
+  const samples={valid:[],missing:[]};
+  for(let round=0;round<5;round++) {
+    for(const variant of round%2?['missing','valid']:['valid','missing']) {
+      layoutVariant=variant;
+      await evaluate(page,`(() => {
+        window.__startupSample={started:performance.now()};
+        document.addEventListener('bv-graph:dataLoaded',e=>{
+          const p=window.__startupSample,g=${app}.forceGraphModule.getGraph();
+          p.loaded=performance.now();p.precomputed=e.detail.precomputed;
+          p.nodes=g.graphData().nodes.length;p.links=g.graphData().links.length;
+          p.warmup=g.warmupTicks();
+          window.__startupNodes=new WeakSet(g.graphData().nodes);
+        },{once:true});
+        ${app}.initForceGraphView();
+      })()`);
+      await waitFor(page,'!!window.__startupSample.paint','actual first canvas paint');
+      const result=await evaluate(page,'window.__startupSample');
+      assert.deepEqual([result.nodes,result.links,result.precomputed],[1000,900,variant==='valid'],'same full graph rendered for both startup paths');
+      samples[variant].push(result.paint-result.started);
+      records.push({graphStartup:{round,variant,result},page:page.name});
+      await waitFor(page,`!${app}.forceGraphLoading`,'startup view ready');
+    }
+  }
+  const median=a=>[...a].sort((a,b)=>a-b)[2];
+  const summary={samples,seededMedian:median(samples.valid),fallbackMedian:median(samples.missing)};
+  records.push({graphStartupSummary:summary,page:page.name});
+  console.log(`Graph startup ${page.name}: ${JSON.stringify(summary)}`);
+  assert.ok(summary.seededMedian<summary.fallbackMedian*.8,'validated seeds reduce median force-view first-paint latency by at least20%');
+  layoutVariant=null;
+  clean(page);
+  console.log(`PASS: ${page.name} measured precomputed startup benefit with full graph parity`);
+}
+
+async function precomputedMetricsJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'centrality worker controls page');
+  await delay(500);
+  await ready(page);
+  await send('Network.setBypassServiceWorker', {bypass:true}, page.session);
+  const oracle = await evaluate(page, `(() => {
+    const g=GRAPH_STATE.graph, pr=g.pagerankDefault(), bt=g.betweenness();
+    return Object.fromEntries([...GRAPH_STATE.nodeMap].map(([id,i])=>[id,{pr:pr[i],bt:bt[i]}]));
+  })()`);
+  await evaluate(page, `(() => {
+    const p=window.bvGraphWasm.DiGraph.prototype;
+    window.__centralityCalls={};
+    for(const name of ['pagerankDefault','betweenness','betweennessApprox']) {
+      const original=p[name];
+      p[name]=function(...args){window.__centralityCalls[name]=(window.__centralityCalls[name]||0)+1;return original.apply(this,args);};
+    }
+  })()`);
+  const variants = ['valid','metric-missing','metric-invalid','metric-timeout','metric-approximate','metric-old-version','stale-edge','missing','valid'];
+  for (const variant of variants) {
+    layoutVariant = variant;
+    await evaluate(page, `(() => {
+      window.__centralityCalls={};window.__centralityLoad=null;
+      document.addEventListener('bv-graph:dataLoaded',e=>{
+        window.__centralityLoad={reused:e.detail.precomputedMetrics,calls:{...window.__centralityCalls},
+          nodes:${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>({id:n.id,pr:n.pagerank,bt:n.betweenness}))};
+      },{once:true});
+    })()`);
+    if (await evaluate(page, `${app}.view !== 'graph'`)) await click(page, 'a[href="#/graph"]');
+    else await evaluate(page, `${app}.initForceGraphView()`);
+    await waitFor(page, '!!window.__centralityLoad', `${variant} centrality loaded`);
+    const result = await evaluate(page, 'window.__centralityLoad');
+    const expected = variant === 'valid' ? ['pagerank','betweenness']
+      : ['metric-missing','metric-timeout'].includes(variant) ? ['betweenness']
+      : ['metric-invalid','metric-approximate'].includes(variant) ? ['pagerank'] : [];
+    assert.deepEqual(result.reused, expected, `${variant}: only complete computed centrality is reused`);
+    assert.equal(result.calls.pagerankDefault || 0, expected.includes('pagerank') ? 0 : 1);
+    assert.equal(result.calls.betweenness || 0, expected.includes('betweenness') ? 0 : 1);
+    for (const n of result.nodes) {
+      assert.ok(Math.abs(n.pr-oracle[n.id].pr)<0.00001, `${variant}: ${n.id} PageRank agrees within algorithm convergence tolerance`);
+      assert.equal(n.bt, oracle[n.id].bt, `${variant}: exact directed betweenness agrees`);
+    }
+    records.push({centrality:{variant,result},page:page.name});
+    await waitFor(page, `!${app}.forceGraphLoading`, 'centrality view finishes');
+  }
+  clean(page);
+  layoutVariant = null;
+  console.log(`PASS: ${page.name} centrality reuse, actual avoided WASM calls, parity and fallback`);
 }
 
 async function layoutSeedsJourney(page, edgeless = false) {
@@ -1155,7 +1348,21 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'timeline-animation') {
+  if (mode === 'graph-startup') {
+    await graphStartupJourney(desktop);
+    await send('Target.closeTarget',{targetId:desktop.target});
+    await graphStartupJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-performance') {
+    await timelinePerformanceJourney(desktop);
+    await send('Target.closeTarget',{targetId:desktop.target});
+    await timelinePerformanceJourney(await openPage('mobile-360',360));
+  } else if (mode === 'precomputed-metrics') {
+    await precomputedMetricsJourney(desktop);
+    await precomputedMetricsJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-sprints') {
+    await timelineSprintsJourney(desktop);
+    await timelineSprintsJourney(await openPage('mobile-360',360));
+  } else if (mode === 'timeline-animation') {
     await timelineAnimationJourney(desktop);
     await timelineAnimationJourney(await openPage('mobile-360',360));
   } else if (mode === 'timeline-removal') {

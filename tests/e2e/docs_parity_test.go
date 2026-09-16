@@ -97,13 +97,14 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 	for _, tc := range []struct {
 		document string
 		prefix   string
+		stale    string
 		check    func([]any) bool
 	}{
-		{"README.md", "bv --robot-plan | jq ", func(rows []any) bool {
+		{"README.md", "bv --robot-plan | jq ", ".tracks[].items[] | {id, unblocks}", func(rows []any) bool {
 			row, ok := rows[0].(map[string]any)
 			return ok && len(rows) == 1 && row["id"] == "ROOT" && reflect.DeepEqual(row["unblocks"], []any{"MID"})
 		}},
-		{"README.md", "bv --robot-insights | jq '.full_stats.core_number", func(rows []any) bool {
+		{"README.md", "bv --robot-insights | jq '.full_stats.core_number", ".cores | to_entries | sort_by(-.value)[:5]", func(rows []any) bool {
 			entries, ok := rows[0].([]any)
 			if !ok || len(rows) != 1 || len(entries) != 3 {
 				return false
@@ -122,10 +123,10 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			}
 			return reflect.DeepEqual(keys, map[string]bool{"ROOT": true, "MID": true, "LEAF": true})
 		}},
-		{"README.md", "bv --robot-insights | jq '.Articulation", func(rows []any) bool {
+		{"README.md", "bv --robot-insights | jq '.Articulation", ".articulation", func(rows []any) bool {
 			return reflect.DeepEqual(rows, []any{[]any{"MID"}})
 		}},
-		{"README.md", "bv --robot-priority | jq ", func(rows []any) bool {
+		{"README.md", "bv --robot-priority | jq ", ".priority.recommendations[] | select(.confidence > 0.6)", func(rows []any) bool {
 			foundBridge := false
 			for _, entry := range rows {
 				row, ok := entry.(map[string]any)
@@ -142,7 +143,7 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			}
 			return foundBridge
 		}},
-		{"AGENTS.md", "bv --robot-triage | jq ", func(rows []any) bool {
+		{"AGENTS.md", "bv --robot-triage | jq ", ".quick_ref", func(rows []any) bool {
 			row, ok := rows[0].(map[string]any)
 			if !ok || len(rows) != 1 || row["open_count"] != float64(3) || row["actionable_count"] != float64(1) {
 				return false
@@ -153,6 +154,16 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			}
 			pick, ok := picks[0].(map[string]any)
 			return ok && pick["id"] == "ROOT"
+		}},
+		{"SKILL.md", "bv --robot-plan | jq ", ".summary.highest_impact", func(rows []any) bool {
+			return reflect.DeepEqual(rows, []any{"ROOT"})
+		}},
+		{"SKILL.md", "bv --robot-triage | jq '.triage.recommendations[0]", ".recommendations[0]", func(rows []any) bool {
+			row, ok := rows[0].(map[string]any)
+			// Recommendations rank impact, while quick_ref above selects ready
+			// work. This is the documented "not necessarily claimable" case.
+			return ok && len(rows) == 1 && row["id"] == "MID" && row["claimable"] == false &&
+				reflect.DeepEqual(row["blocked_by"], []any{"ROOT"}) && reflect.DeepEqual(row["unblocks_ids"], []any{"LEAF"})
 		}},
 	} {
 		t.Run(tc.document+"/"+tc.prefix, func(t *testing.T) {
@@ -180,6 +191,7 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			if err != nil {
 				t.Fatalf("copied bv command: %v\n%s", err, stderr.String())
 			}
+			t.Logf("fixture=ROOT<-MID<-LEAF argv=%q SOURCE_DATE_EPOCH=1788220800 exit=0 stdout=%s stderr=%s", cmd.Args, payload, stderr.String())
 			query := exec.Command(jq, "-c", quoted[1])
 			query.Stdin = bytes.NewReader(payload)
 			query.Stderr = &stderr
@@ -203,6 +215,164 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			}
 			if len(rows) == 0 || !tc.check(rows) {
 				t.Fatalf("documented query returned the wrong fixture result: %s", output)
+			}
+			// These deliberately stale paths previously bypassed the actual robot
+			// envelopes or used the wrong metric casing. The same fixture and
+			// consumer must reject them rather than accepting an empty/null result.
+			stale := exec.Command(jq, "-c", tc.stale)
+			stale.Stdin = bytes.NewReader(payload)
+			var staleStderr bytes.Buffer
+			stale.Stderr = &staleStderr
+			staleOutput, staleErr := stale.Output()
+			t.Logf("copied jq=%q expected fixture result observed=%s; stale jq=%q exit=%v stdout=%s stderr=%s", quoted[1], output, tc.stale, staleErr, staleOutput, staleStderr.String())
+			if staleErr == nil {
+				var staleRows []any
+				decoder := json.NewDecoder(bytes.NewReader(staleOutput))
+				for {
+					var row any
+					if err := decoder.Decode(&row); err == io.EOF {
+						break
+					} else if err != nil {
+						t.Fatalf("decode stale-query control: %v", err)
+					}
+					staleRows = append(staleRows, row)
+				}
+				if len(staleRows) > 0 && tc.check(staleRows) {
+					t.Fatalf("stale query unexpectedly satisfied the documented behavior: %s", staleOutput)
+				}
+			} else if _, ok := staleErr.(*exec.ExitError); !ok {
+				t.Fatalf("stale query did not execute: %v", staleErr)
+			}
+		})
+	}
+}
+
+func TestDocsParity_CopiedHistoryQueryPreservesUnits(t *testing.T) {
+	for _, name := range []string{"BEADS_DIR", "BEADS_DB", "BD_DB", "BEADS_JSONL"} {
+		t.Setenv(name, "")
+	}
+	jq, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("actual copied history query requires jq on PATH")
+	}
+	bv := buildBvBinary(t)
+	dir := t.TempDir()
+	git := func(date string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
+			"GIT_AUTHOR_NAME=Docs Test", "GIT_AUTHOR_EMAIL=docs@example.invalid",
+			"GIT_COMMITTER_NAME=Docs Test", "GIT_COMMITTER_EMAIL=docs@example.invalid",
+			"GIT_AUTHOR_DATE="+date, "GIT_COMMITTER_DATE="+date)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("fixture git argv=%q date=%s exit=%v output=%s", cmd.Args, date, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("2026-06-01T00:00:00Z", "init", "--initial-branch=main")
+	steps := []struct {
+		status string
+		event  string
+		date   string
+	}{
+		{"open", "created", "2026-06-01T00:00:00Z"},
+		{"in_progress", "claimed", "2026-06-02T00:00:00Z"},
+		{"closed", "closed", "2026-06-04T00:00:00Z"},
+	}
+	commits := make(map[string]string)
+	for _, step := range steps {
+		writeBeads(t, dir, fmt.Sprintf(`{"id":"BV-123","title":"Documented lifecycle","status":%q,"priority":1,"issue_type":"task"}`, step.status))
+		if err := os.WriteFile(filepath.Join(dir, "work.go"), []byte(fmt.Sprintf("package work\nconst State = %q\n", step.status)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		git(step.date, "add", ".beads", "work.go")
+		git(step.date, "-c", "commit.gpgsign=false", "commit", "-m", "BV-123 "+step.event)
+		commits[step.event] = git(step.date, "rev-parse", "HEAD")
+	}
+	readme := repoFile(t, "README.md")
+	line := regexp.MustCompile(`(?m)^bv --robot-history \| jq '([^']+)'$`).FindStringSubmatch(readme)
+	if len(line) != 2 {
+		t.Fatal("README must contain a copyable robot-history query with explicit duration units")
+	}
+	cmd := exec.Command(bv, "--robot-history")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "SOURCE_DATE_EPOCH=1788220800")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	payload, err := cmd.Output()
+	t.Logf("fixture=BV-123 created June 1, claimed June 2, closed June 4 UTC commits=%v argv=%q SOURCE_DATE_EPOCH=1788220800 exit=%v stdout=%s stderr=%s", commits, cmd.Args, err, payload, stderr.String())
+	if err != nil {
+		t.Fatal("copied robot-history command failed")
+	}
+	var report struct {
+		Histories map[string]struct {
+			Events []struct {
+				EventType string `json:"event_type"`
+				CommitSHA string `json:"commit_sha"`
+			} `json:"events"`
+			Milestones map[string]struct {
+				Timestamp string `json:"timestamp"`
+				CommitSHA string `json:"commit_sha"`
+			} `json:"milestones"`
+		} `json:"histories"`
+		CommitIndex map[string][]string `json:"commit_index"`
+	}
+	if err := json.Unmarshal(payload, &report); err != nil {
+		t.Fatal(err)
+	}
+	history := report.Histories["BV-123"]
+	if len(report.Histories) != 1 || len(history.Events) != 3 || len(history.Milestones) != 3 {
+		t.Fatalf("history must contain one bead with its three actual lifecycle events and named milestones: %+v", report)
+	}
+	for i, step := range steps {
+		event := history.Events[i]
+		milestone := history.Milestones[step.event]
+		if event.EventType != step.event || event.CommitSHA != commits[step.event] ||
+			milestone.Timestamp != step.date || milestone.CommitSHA != commits[step.event] {
+			t.Fatalf("event or milestone lost actual %s commit %s: event=%+v milestone=%+v", step.event, commits[step.event], event, milestone)
+		}
+	}
+	// The reverse index maps correlated code commits, not every lifecycle
+	// event. Co-commit correlation covers the actual claim/close edits here.
+	for _, event := range []string{"claimed", "closed"} {
+		if !reflect.DeepEqual(report.CommitIndex[commits[event]], []string{"BV-123"}) {
+			t.Fatalf("reverse lookup lost the %s code commit %s: %v", event, commits[event], report.CommitIndex)
+		}
+	}
+	want := map[string]any{
+		"avg_cycle_time_days": float64(2),
+		"beads":               []any{map[string]any{"id": "BV-123", "claim_to_close_ns": float64(48 * time.Hour)}},
+	}
+	for _, tc := range []struct {
+		name  string
+		query string
+		valid bool
+	}{
+		{"copied", line[1], true},
+		{"missing histories envelope", `{avg_cycle_time_days: .stats.avg_cycle_time_days, beads: [.history | to_entries[] | {id: .key, claim_to_close_ns: .value.cycle_time.claim_to_close}]}`, false},
+		{"duration mistaken for seconds", `{avg_cycle_time_days: .stats.avg_cycle_time_days, beads: [.histories | to_entries[] | {id: .key, claim_to_close_ns: (.value.cycle_time.claim_to_close / 1000000000)}]}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query := exec.Command(jq, "-c", tc.query)
+			query.Stdin = bytes.NewReader(payload)
+			var diagnostics bytes.Buffer
+			query.Stderr = &diagnostics
+			output, err := query.Output()
+			t.Logf("jq argv=%q exit=%v stdout=%s stderr=%s want=%v valid=%v", query.Args, err, output, diagnostics.String(), want, tc.valid)
+			if err != nil {
+				if _, exited := err.(*exec.ExitError); !tc.valid && exited {
+					return
+				}
+				t.Fatalf("query failed: %v", err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(output, &got); err != nil {
+				t.Fatal(err)
+			}
+			if matches := reflect.DeepEqual(got, want); matches != tc.valid {
+				t.Fatalf("query validity=%v, got %v, want %v", tc.valid, got, want)
 			}
 		})
 	}
