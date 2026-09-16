@@ -61,8 +61,13 @@ func SetThemeOverride(pref string) {
 		lipgloss.SetHasDarkBackground(true)
 	default:
 		// "auto" / empty / unknown: no pin; adaptive colors follow the
-		// terminal's detected background.
+		// terminal's detected background, except on Windows where the
+		// underlying termenv query is a hardcoded stub (see
+		// platformHasDarkBackground) and needs its own detection.
 		BVThemeOverride = ""
+		if isDark, ok := platformHasDarkBackground(); ok {
+			lipgloss.SetHasDarkBackground(isDark)
+		}
 	}
 }
 
