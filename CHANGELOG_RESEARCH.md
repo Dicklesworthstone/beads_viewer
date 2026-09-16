@@ -12,6 +12,34 @@ checked-in Beads history, retained release receipts, then existing release
 documentation. Public source links belong in the changelog; local execution
 evidence supplements them here.
 
+## September 16 post-release update
+
+Coverage: all non-merge commit subjects and file summaries in
+`5614d89e..04a0107b`, grouped into graph/timeline, tree snapshots, terminal
+integration, history caching, and documentation. Implementation diffs, current
+consumers, real-browser records, and original `bv-643f`/`bv-z38b` criteria were
+reviewed; tracker-only commits add no capability credit. Representative commit
+links resolve to pushed Git objects. Live GitHub metadata still reports
+v0.25.0 published at 2026-09-12T19:39:38Z, so these changes are Unreleased.
+
+Final standard-version strict RCH build, vet, full Go suite and focused cache
+race checks pass in `/tmp/bv-standard-final-tests-20260916.log` (SHA-256
+`c653f204167b66b0f04b50906f2301452a3c00bb04fcbc79cbe670f313c8d20e`).
+Nonverbose package success does not establish execution of environment-gated
+live-tracker or native-terminal tests. UBS remains nonzero with reviewed false
+positives and existing full-file findings; it is not a clean scanner result.
+Actual full browser journeys pass in `/tmp/bv-final-general-browser-20260916.log`;
+specialized final playback evidence is in
+`/tmp/bv-timeline-performance-frozen-20260916.log`. Both viewport records include
+all twenty transitions and the final animation tail. Earlier failed attempts
+remain retained. The changelog's 33.3 ms p99 describes that fixture only.
+
+`bv-643f` and `bv-z38b` closed after original acceptance and independent
+source/raw-record review. The separate paired CLI/TUI matrix and native-platform
+gaps remain open. Windows background-query evidence is parser/cross-build only;
+the full Linux suite does not prove real Windows Terminal I/O. No new release,
+package publication, universal speedup, or physical-phone claim is made.
+
 ## September 15 post-release update
 
 Follow-up `5614d89e` wires the existing palette helper into the two panel

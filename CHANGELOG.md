@@ -3,9 +3,9 @@
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
 Scope window: this update verifies `v0.24.0..v0.24.1` and the post-release
-commits through [`5614d89e`](https://github.com/Dicklesworthstone/beads_viewer/commit/5614d89e), including the September 10 canonical-source and Cass
+commits through [`04a0107b`](https://github.com/Dicklesworthstone/beads_viewer/commit/04a0107b), including the September 10 canonical-source and Cass
 repairs, September 11 performance work, September 12 dependency campaign,
-and September 14–15 duplicate-detection, theme-rendering, and Nix documentation changes.
+and September 14–16 duplicate-detection, theme, graph, timeline, and history-cache changes.
 v0.25.0 was published after its complete clean-source release gate passed.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
@@ -29,6 +29,55 @@ the latest tag, including installer changes usable with already released binarie
 ---
 
 ## Unreleased
+
+### Dashboard graph and timeline
+
+- The force graph now validates exported node positions and blocking edges
+  against the loaded database, then paints matching positions without synchronous
+  layout warmup. Completed PageRank and exact betweenness results can be reused;
+  missing, invalid, or sampled results fall back to browser computation. Live
+  physics and other browser algorithms remain enabled. Detail-pane resizing,
+  cyclic fallback layouts, and graph-state resets are also repaired
+  ([layout integration](https://github.com/Dicklesworthstone/beads_viewer/commit/2849f125),
+  [rendering and metric reuse](https://github.com/Dicklesworthstone/beads_viewer/commit/04a0107b)).
+- Timeline playback follows recorded Git lifecycle events, distinguishes removal
+  from closure, preserves the observed baseline at the retained history boundary,
+  and supports reverse scrubbing. Nodes fade, grow, pulse, and shrink; reduced
+  motion skips transitions. Sprint buttons use current definitions. Playback
+  resets on graph replacement and avoids repeated synchronous layout warmup
+  ([recorded events](https://github.com/Dicklesworthstone/beads_viewer/commit/ae8bc598),
+  [removal](https://github.com/Dicklesworthstone/beads_viewer/commit/53d97f69),
+  [canvas animation](https://github.com/Dicklesworthstone/beads_viewer/commit/a689e4f6)).
+  History remains bounded to 500 commits and the current export's issue universe.
+- Real Chromium desktop/mobile-viewport journeys verify controls, drawing,
+  fallbacks, detail interaction, and offline updates. A 1,000-node, 21-commit
+  fixture measured playback p99 at 33.3 ms in both viewports. This is not a
+  physical-phone result or the separate CLI/TUI performance qualification.
+  Original workstreams `bv-643f` and `bv-z38b` are complete.
+
+### Tree visibility, terminal integration, and history
+
+- Tree view keeps rootless parent-child cycles visible and preserves repeated
+  cycle/diamond occurrences when replacing analysis snapshots
+  ([display roots](https://github.com/Dicklesworthstone/beads_viewer/commit/6a7252b1),
+  [snapshot copying](https://github.com/Dicklesworthstone/beads_viewer/commit/6334631d)).
+- Clipboard copy can fall back to OSC 52 over SSH when local helpers are absent
+  or fail. tmux receives the raw sequence; GNU screen retains its passthrough
+  wrapping ([clipboard repair](https://github.com/Dicklesworthstone/beads_viewer/commit/bc475f3c)).
+- Windows automatic theme selection can query Windows Terminal's background;
+  `BV_NO_BG_QUERY` disables the query. Parser and cross-build checks pass, but
+  actual Windows Terminal console I/O remains unverified
+  ([background query](https://github.com/Dicklesworthstone/beads_viewer/commit/240b0fa0)).
+- Filtered history requests can reuse fresh full-history event caches when
+  both Git blob identities match. Rebuildable event caches no longer require
+  a durability flush; corruption still triggers reconstruction. Real Git
+  regression tests cover freshness, identity, filtering, and interrupted writes
+  ([cache and documentation checks](https://github.com/Dicklesworthstone/beads_viewer/commit/04a0107b)).
+- Public guidance now describes actual search, history, routing, and forecasting
+  behavior. Copied recipe and robot queries execute against real fixtures,
+  including lifecycle duration units. Overall documentation qualification still
+  depends on the open performance and native-platform work
+  ([guidance corrections](https://github.com/Dicklesworthstone/beads_viewer/commit/c2093e57)).
 
 ### Duplicate detection and rendering
 

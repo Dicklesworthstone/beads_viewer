@@ -507,6 +507,16 @@ installed `br` is 0.5.11, SHA-256
 
 ### Rescore of all 43 accepted goals
 
+Updated 2026-09-16 against runtime `04a0107b`; dated assessments below remain
+historical records. The retained `/tmp/bv-standard-final-tests-20260916.log`
+records strict-RCH build/vet, the focused correlation-cache race checks and
+`go test ./... -count=1 -timeout=30m` passing. Its nonverbose package results
+do not inventory skips or prove live `br` was on PATH. The final binary's
+desktop/mobile/offline/update browser journeys also passed, retained in
+`/tmp/bv-final-general-browser-20260916.log`. Neither result is the pending
+clean-source release gate, sealed package proof, original P1 matrix or missing
+native qualification.
+
 `Working` means the bounded implemented behavior has supporting evidence;
 it does not mean every platform or input was freshly retested. Prior detailed
 goal definitions and scope decisions remain below. Fresh negative evidence
@@ -516,7 +526,7 @@ overrides an earlier working classification.
 |---|---|---|
 | 1 | Current and legacy issue loading | Working; vendored decoder repair shipped; source installs must retain vendor |
 | 2 | Robust JSONL parsing | Working; incomplete-source diagnostics retained |
-| 3 | Source/DB/worktree selection | Working within tested targets; V5 covers missing native runs |
+| 3 | Source/DB/worktree selection | Working; canonical JSONL precedence, explicit overrides and selected-source/WAL refresh repaired; V5 covers missing native runs |
 | 4 | Namespaced workspace aggregation | Working; partial authority remains explicit |
 | 5 | Two-phase graph analysis | Working; size-tiered status, not a universal deadline |
 | 6 | Centrality and critical path metrics | Working within exact/approximate status contract |
@@ -524,46 +534,46 @@ overrides an earlier working classification.
 | 8 | Repeatability and computation status | Partial; timeout-boundary/full-cohort proof, P1 |
 | 9 | Ranked triage and reasons | Working; heuristic scores |
 | 10 | Readiness, tracks and unblock counts | Working; external claim safety is row 11 |
-| 11 | Justified next actions | Partial; fresh stale-claim failure, S5 |
+| 11 | Justified next actions | Working with br >=0.6.0; original routes, stale closed/claimed/deferred refusals and native concurrent claims verified in closed S5 pair; final-source live replay remains part of final acceptance |
 | 12 | Feedback and reset | Working within existing tested behavior |
 | 13 | Shared robot source/scope metadata | Working; shape smoke alone is insufficient proof |
 | 14 | Composed scopes | Working within existing positive and empty-intersection controls |
 | 15 | Historical analysis and diffs | Working with declared historical exceptions |
-| 16 | Help/schema/formats | Working; defaults/prose corrections remain row 42 |
+| 16 | Help/schema/formats | Working; corrected defaults/examples have executable checks; final documentation proof remains row 42 |
 | 17 | TOON | Working when actual encoder available; no universal token saving |
 | 18 | Recipe loading/filtering/sort | Working |
 | 19 | Recipe presentation/navigation | Working within recorded rendered/PTY checks |
 | 20 | Recipe exports/templates | Working |
 | 21 | Hash retrieval and graph ranking | Working; not learned semantic embeddings |
 | 22 | Search quality at scale | Partial; frozen agent-authored corpus is not human generalization, P5 scope retained |
-| 23 | Git correlation | Working; heuristic evidence and recorded host timing limit |
+| 23 | Git correlation | Working; guarded full-to-filtered cache reuse and truncated-cache recovery verified; final standard suite passes the unchanged repository timing assertion, without a universal latency claim |
 | 24 | Orphans/file relations/impact | Working within existing tests |
-| 25 | Sprint/burndown/risk | Working with historical limits |
+| 25 | Sprint/burndown/risk | Working; exported timeline includes current sprint-definition markers, not reconstructed historical sprint definitions |
 | 26 | Forecast/capacity | Working as duration/velocity heuristics, not a scheduler |
-| 27 | Label health/flow/attention | Partial; newly reproduced drilldown integration gap |
-| 28 | Alerts/baselines/hygiene | Working; claims retain S5 limitation |
-| 29 | List/detail/board/tree/graph/insights | Working; original graph repair now shipped; timing is row 41 |
-| 30 | Reload/snapshot/stale-result handling | Partial for Flow Matrix lifecycle; other existing consumers retain prior proof |
-| 31 | Tutorial/help/sidebar/cass | Working for health/count and separate session modal; false prose is P2 |
-| 32 | Report and graph exports | Working within recorded formats and source authority |
-| 33 | SQLite dashboard/assets | Working; browser fallback differs from native FTS5 |
+| 27 | Label health/flow/attention | Working; actual directed pairs, endpoint detail/navigation and refresh proven by closed bv-apal.12/.13; no invented critical-path annotation |
+| 28 | Alerts/baselines/hygiene | Working; advisory suggestions and source-bound actions retain their separate contracts |
+| 29 | List/detail/board/tree/graph/insights | Working; rootless hierarchy components and detached snapshot occurrences repaired; responsiveness remains row 41 |
+| 30 | Reload/snapshot/stale-result handling | Working within tested consumers; Flow refresh, selected SQLite WAL updates and browser graph/timeline cleanup have regressions; large-load timing remains P1 |
+| 31 | Tutorial/help/sidebar/cass | Working; real cass hit/preview/time adapter and separate asynchronous session modal; advisory index health remains visible and external availability is required |
+| 32 | Report and graph exports | Working; validated topology-bound layout/complete centrality reuse and fallback retain source authority; bounded browser startup proof is not P1 |
+| 33 | SQLite dashboard/assets | Working; SQLite batch rollback and actual lifecycle-event timeline with retained-window baseline, removals/reintroduction and canvas transitions; deleted-only nodes absent from current export are not reconstructed; browser search fallback differs from native FTS5 |
 | 34 | Offline/mobile dashboard | Working in recorded Chromium desktop/mobile viewport; other browsers/physical phones unproven |
 | 35 | Hooks/browser opt-out | Working |
 | 36 | Verified update/download | Working in recorded Linux/Windows journeys |
-| 37 | Source-bound release bytes | Working; fresh public receipt identity verified, runtime may still contain defects |
+| 37 | Source-bound release bytes | Working for published v0.25.0; final runtime 04a0107b still needs its own complete clean gate and sealed package verification, bv-oonu.11 |
 | 38 | Vendored asset provenance | Working; version-suffixed go install bypasses vendor repairs |
-| 39 | Native installs/upgrades | Partial; Mac/ARM/current Nix and Windows source first-start, V5 |
-| 40 | Local/remote verification | Partial; isolated fixed tracker evidence differs from installed tracker, S5/final |
+| 39 | Native installs/upgrades | Partial; v0.25.0 Linux amd64/macOS arm64/Windows amd64 archives and Linux Nix build/existing-store profile verified; missing native macOS amd64/Linux arm64 and current Windows source first-start remain V5, with public Nix route/upgrade scope explicit |
+| 40 | Local/remote verification | Partial final acceptance; standard full suite/build/vet and focused cache race pass through strict RCH, installed br 0.6.0 has separate S5 proof; current complete release receipt and explicit live/skip inventory remain required |
 | 41 | Large-project responsiveness | Partial; original final P1 gate still red; no terminal-paint guarantee |
-| 42 | Accurate executable documentation | Partial; fresh contradictions, P2 |
+| 42 | Accurate executable documentation | Corrected README/SKILL prose, copied YAML/jq, duration units and runtime defaults have source/CLI checks; P2 final proof remains open behind original P1/native dependencies |
 | 43 | Recorded waits and evidenced causal links | Working within original repaired four-commit producer/CLI acceptance |
 
 ### Bridge and granular TODO
 
-Order by dependency and user benefit: S5 is the highest correctness risk;
-Flow is the best bounded integration improvement. P2 corrections can proceed
-while external prerequisites remain open. Final P1/native/source-package proof
-comes after the relevant implementation freeze, not after each plan edit.
+S5 and Flow implementation/proof pairs are complete. Remaining acceptance is
+the original P1 matrix, missing native qualification, dependent P2 proof and
+the final clean-source/package cohort. Existing checked work remains bounded
+to its recorded revision and environment.
 
 - [x] Read full root instructions/README and the plan/spec corpus; map goals
   to producer, consumer, tests, previous acceptance and released runtime.
@@ -582,11 +592,12 @@ comes after the relevant implementation freeze, not after each plan edit.
   record each change and stop only on a pass finding no material improvement.
 - [x] Phase 6: validate `br` dependency cycles and `bv --robot-triage`, plan and
   metric status; close only this completed assessment and flush task state.
-- [ ] S5: preserve positive ready claims, reject stale/closed/deferred/claimed
-  races atomically with the installed tracker; rerun existing real route suite.
-- [ ] Flow: consume existing `BlockingPairs`, show actual directed relationships
-  and endpoint details, preserve navigation, refresh safely, then prove the
-  original three-issue negative fails before and passes after the repair.
+- [x] S5: preserve positive ready claims and reject stale/closed/deferred/claimed
+  actions with installed official br 0.6.0; original route suite, native paired
+  claims and authoritative transaction review support closed bv-xbvo.9/.10.
+- [x] Flow: consume existing `BlockingPairs`, show actual directed relationships
+  and endpoint details, preserve navigation and refresh safely; original
+  negative and repaired positive support closed bv-apal.12/.13.
 - [ ] P2: correct all identified prose/default/example contradictions in place;
   verify copied examples and actual key/modal/default behavior, then settle
   final capability claims only when their existing dependencies pass.
@@ -597,6 +608,10 @@ comes after the relevant implementation freeze, not after each plan edit.
   without replacing it with warm-start success or raising the original bound.
 - [ ] Final: inspect all original and new acceptance on one final source/package
   cohort; preserve unproven populations/platforms and do not force-close.
+  Run the unchanged complete release gate with required tools and br >=0.6.0,
+  retain explicit live/skip and per-query relevance evidence, then package and
+  verify the same clean revision. Exercise the actual extracted archive binary;
+  E2E TestMain builds a separate binary and cannot substitute for that check.
 
 ### Ambition round 1 — complete the flow journey
 
