@@ -13,11 +13,12 @@ import { spawn } from 'node:child_process';
 
 const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
 let activeBundle = bundle;
+let layoutVariant = 'valid';
 const mime = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
   '.json': 'application/json', '.wasm': 'application/wasm', '.svg': 'image/svg+xml' };
 server = http.createServer((req, res) => {
@@ -34,6 +35,22 @@ server = http.createServer((req, res) => {
   }
   res.setHeader('Content-Type', mime[path.extname(file)] || 'application/octet-stream');
   let body = fs.readFileSync(file);
+  if (name === '/data/graph_layout.json' && mode === 'layout-seeds') {
+    if (layoutVariant === 'missing') { res.writeHead(404); res.end('missing optional layout'); return; }
+    if (layoutVariant === 'malformed') { res.end('{'); return; }
+    const layout = JSON.parse(body);
+    if (layoutVariant === 'partial') delete layout.positions[Object.keys(layout.positions)[0]];
+    if (layoutVariant === 'stale-edge') layout.links[0].reverse();
+    if (layoutVariant === 'stale-node') {
+      const id = Object.keys(layout.positions)[0];
+      layout.positions['absent-from-database'] = layout.positions[id];
+      delete layout.positions[id];
+    }
+    if (layoutVariant === 'invalid-coordinate') layout.positions[Object.keys(layout.positions)[0]][0] = '100';
+    // A matching artifact with bogus metrics must never suppress real computation.
+    for (const tuple of Object.values(layout.metrics)) tuple.fill(999);
+    body = Buffer.from(JSON.stringify(layout));
+  }
   if (name === changedAsset) body = Buffer.concat([body, Buffer.from('\n// changed after export\n')]);
   if (name === '/coi-serviceworker.js' && workerRevision) {
     body = Buffer.concat([body, Buffer.from(`\n// Browser update control ${workerRevision}\n`)]);
@@ -169,6 +186,60 @@ function clean(page) {
 }
 async function resultIDs(page, expected) {
   await waitFor(page, `JSON.stringify([...document.querySelectorAll('[aria-label^="View issue "]')].filter(${visible}).map(e => e.getAttribute('aria-label').split(':')[0].slice(11)).sort()) === ${JSON.stringify(JSON.stringify([...expected].sort()))}`, `visible issue IDs ${expected}`);
+}
+
+async function layoutSeedsJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'layout worker controls page');
+  await delay(500);
+  await ready(page);
+  // Exercise each optional artifact response against the same real SQLite/WASM
+  // source. Bypass the worker cache so stale/corrupt origin responses reach fetch.
+  await send('Network.setBypassServiceWorker', { bypass: true }, page.session);
+  const expected = JSON.parse(fs.readFileSync(path.join(bundle, 'data/graph_layout.json'), 'utf8')).positions;
+  for (const variant of ['valid', 'missing', 'malformed', 'partial', 'stale-edge', 'stale-node', 'invalid-coordinate', 'valid']) {
+    layoutVariant = variant;
+    await evaluate(page, `(() => {
+      window.__layoutLoaded = null;
+      document.addEventListener('bv-graph:dataLoaded', e => {
+        const m=${app}.forceGraphModule;
+        window.__layoutLoaded = {precomputed:e.detail.precomputed,
+          nodes:m.getGraph().graphData().nodes.map(n=>({id:n.id,x:n.x,y:n.y,fx:n.fx,fy:n.fy,pagerank:n.pagerank})),
+          metrics:Object.fromEntries(Object.entries(m.getMetrics()).map(([k,v])=>[k,v != null]))};
+      }, {once:true});
+    })()`);
+    if (await evaluate(page, `${app}.view !== 'graph'`)) await click(page, 'a[href="#/graph"]');
+    else await evaluate(page, `${app}.initForceGraphView()`);
+    await waitFor(page, '!!window.__layoutLoaded', `${variant}: actual viewer graph load`);
+    const initial = await evaluate(page, 'window.__layoutLoaded');
+    assert.equal(initial.precomputed, variant === 'valid', `${variant}: accepted only matching layout`);
+    assert.equal(initial.nodes.length, 4);
+    for (const n of initial.nodes) {
+      assert.equal(n.fx, null, `${variant}: ${n.id} free on x`);
+      assert.equal(n.fy, null, `${variant}: ${n.id} free on y`);
+      assert.ok(Number.isFinite(n.pagerank) && n.pagerank !== 999, 'actual browser metric, not exported sentinel');
+      if (variant === 'valid') assert.deepEqual([n.x,n.y], expected[n.id], `${n.id}: exact exported seed at dataLoaded`);
+    }
+    for (const metric of ['pagerank','betweenness','criticalPath','eigenvector','kcore','cycles']) {
+      assert.equal(initial.metrics[metric], true, `${metric} remains computed`);
+    }
+    records.push({ layoutVariant:variant, initial });
+    await waitFor(page, `!${app}.forceGraphLoading`, 'viewer finishes graph initialization');
+  }
+  await delay(1000);
+  assert.ok(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.some(n=>{const p=${JSON.stringify(expected)}[n.id];return n.x!==p[0] || n.y!==p[1];})`), 'live simulation moves seeded nodes');
+  await evaluate(page, `${app}.forceGraphModule.setFilter('search','Orchid root')`);
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id)`), ['browser-root']);
+  await evaluate(page, `${app}.forceGraphModule.setFilter('search','')`);
+  await delay(1000);
+  const point = await evaluate(page, `(() => {const g=${app}.forceGraphModule.getGraph();g.zoomToFit(0,50);const n=g.graphData().nodes.find(n=>n.id==='browser-root');const p=g.graph2ScreenCoords(n.x,n.y);const r=document.querySelector('#graph-container canvas').getBoundingClientRect();return {x:r.x+p.x,y:r.y+p.y};})()`);
+  await delay(100);
+  for (const type of ['mousePressed','mouseReleased']) await send('Input.dispatchMouseEvent', {type,...point,button:'left',clickCount:1},page.session);
+  await waitFor(page, `${app}.graphDetailNode?.id === 'browser-root'`, 'seeded graph pointer opens detail after filter');
+  await capture(page, 'layout-seeds');
+  clean(page);
+  assert.ok(records.some(r=>r.serverRequest === '/data/graph_layout.json'), 'actual layout HTTP request');
+  console.log(`PASS: ${page.name} matching seeds, seven fallback/recovery transitions, metrics, movement, filter and detail`);
 }
 async function blockingTypesJourney(page) {
   await waitFor(page, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total === 7 && ${app}.graphReady`, 'seven workflow issues and actual graph WASM');
@@ -635,7 +706,10 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'blocking-types') {
+  if (mode === 'layout-seeds') {
+    await layoutSeedsJourney(desktop);
+    await layoutSeedsJourney(await openPage('mobile-360', 360));
+  } else if (mode === 'blocking-types') {
     await blockingTypesJourney(desktop);
   } else if (mode === 'readiness') {
     await readinessJourney(desktop);
