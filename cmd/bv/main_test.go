@@ -45,6 +45,64 @@ func runCommandWithTimeout(t *testing.T, dir, exe string, args ...string) (strin
 	return stdout.String(), stderr.String(), err
 }
 
+func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
+	repo := t.TempDir()
+	t.Chdir(repo)
+	t.Setenv("BV_NO_CACHE", "1")
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	git := func(hour int, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid", "GIT_AUTHOR_DATE="+at, "GIT_COMMITTER_DATE="+at)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git(0, "init", "-b", "main")
+	if err := os.Mkdir(".beads", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var want []TimeTravelCommit
+	for hour, status := range []string{"open", "closed", "closed", "open"} {
+		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
+		data := fmt.Sprintf("{\"id\":\"bv-a\",\"title\":\"Target revision %d\",\"status\":%q,\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", hour, status, start.Format(time.RFC3339), at)
+		data += fmt.Sprintf("{\"id\":\"bv-z\",\"title\":\"Already closed\",\"status\":\"closed\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", start.Format(time.RFC3339), start.Format(time.RFC3339))
+		if err := os.WriteFile(".beads/issues.jsonl", []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git(hour, "add", ".beads/issues.jsonl")
+		message := fmt.Sprintf("record lifecycle %d", hour)
+		git(hour, "commit", "-m", message)
+		commit := TimeTravelCommit{SHA: git(hour, "rev-parse", "HEAD"), Date: at, Message: message}
+		switch hour {
+		case 0:
+			commit.BeadsAdded = []string{"bv-a", "bv-z"}
+			commit.BeadsClosed = []string{"bv-z"}
+		case 1:
+			commit.BeadsClosed = []string{"bv-a"}
+		case 3:
+			commit.BeadsAdded = []string{"bv-a"}
+		}
+		want = append(want, commit)
+	}
+	// A correlated code-only commit is not an observed lifecycle transition.
+	git(4, "commit", "--allow-empty", "-m", "bv-a: follow-up code work")
+	issues := []model.Issue{{ID: "bv-a", Title: "Target revision 3", Status: model.StatusOpen}, {ID: "bv-z", Title: "Already closed", Status: model.StatusClosed}}
+	for run := 0; run < 2; run++ {
+		history, err := generateHistoryForExport(issues)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(history.Commits, want) {
+			t.Fatalf("run %d: lifecycle timeline mismatch\n got: %#v\nwant: %#v", run, history.Commits, want)
+		}
+	}
+}
+
 func TestFilterByRepo_CaseInsensitiveAndFlexibleSeparators(t *testing.T) {
 	issues := []model.Issue{
 		{ID: "api-AUTH-1", SourceRepo: "services/api"},
