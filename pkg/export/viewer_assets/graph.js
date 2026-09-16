@@ -2677,8 +2677,8 @@ function getDefaultExportPreset() {
 
 function setupKeyboardShortcuts() {
     document.addEventListener('keydown', (e) => {
-        // Ignore if typing in input
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        // Leave native editing and selection keys to form controls.
+        if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
 
         switch (e.key) {
             case 'Escape':
@@ -3389,6 +3389,9 @@ function createTimelineControls() {
         </div>
     `;
 
+    controls.querySelector('#tt-speed').value = String(timeTravelState.speed);
+    controls.querySelector('#tt-slider').max = String(timeTravelState.history.commits.length - 1);
+
     // Add styles
     const style = document.createElement('style');
     style.textContent = `
@@ -3527,7 +3530,7 @@ function setupTimeTravelListeners() {
 
     controls.querySelector('#tt-slider').addEventListener('input', (e) => {
         if (timeTravelState.history) {
-            const idx = Math.round((e.target.value / 100) * (timeTravelState.history.commits.length - 1));
+            const idx = Number(e.target.value);
             goToCommit(idx);
         }
     });
@@ -3763,7 +3766,7 @@ function updateTimeTravelUI() {
     // Update slider
     const slider = timeTravelState.controlsEl.querySelector('#tt-slider');
     if (slider) {
-        slider.value = (idx / (commits.length - 1)) * 100;
+        slider.value = idx;
     }
 
     // Update date
