@@ -230,6 +230,39 @@ async function timelineJourney(page) {
   assert.equal(await evaluate(page, `${state}.active`), false);
   assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`),
     ['browser-closed','browser-detail','browser-other','browser-root'], 'exiting restores current graph');
+  await key(page, 't', 'KeyT');
+  await click(page, '#tt-play');
+  await waitFor(page, `${state}.currentIdx > 0`, 'playback advances real history');
+  await click(page, '#tt-play');
+  const paused = await evaluate(page, state);
+  assert.equal(paused.playing, false);
+  await delay(1200);
+  assert.equal(await evaluate(page, `${state}.currentIdx`), paused.currentIdx, 'pause stops advancement');
+  await click(page, '#tt-start');
+  await click(page, '#tt-play');
+  await evaluate(page, `(() => {
+    window.__timelineTicks=0;
+    document.addEventListener('bv-graph:timeTravelCommit',()=>window.__timelineTicks++);
+    const d=getGraphViewData();
+    ${app}.forceGraphModule.loadData(d.issues.filter(i=>i.id==='browser-other'),[],null);
+  })()`);
+  await delay(1200);
+  const replaced = await evaluate(page, `({state:${state},ticks:window.__timelineTicks,
+    nodes:${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id),
+    controls:!!document.querySelector('#time-travel-controls')})`);
+  assert.deepEqual(replaced,{state:{active:false,playing:false,currentIdx:0,totalCommits:0,speed:1},
+    ticks:0,nodes:['browser-other'],controls:false}, 'old playback cannot overwrite replacement data');
+  await evaluate(page, `${app}.initForceGraphView()`);
+  assert.equal(await evaluate(page, `${state}.totalCommits`), 4, 'fresh export history can be loaded again');
+  await key(page, 't', 'KeyT');
+  await click(page, '#tt-play');
+  await evaluate(page, `(() => {${app}.forceGraphModule.cleanup();window.__timelineTicks=0;})()`);
+  await delay(1200);
+  const cleaned = await evaluate(page, `({state:${state},ticks:window.__timelineTicks,
+    graph:${app}.forceGraphModule.getGraph(),controls:!!document.querySelector('#time-travel-controls')})`);
+  assert.deepEqual(cleaned,{state:{active:false,playing:false,currentIdx:0,totalCommits:0,speed:1},
+    ticks:0,graph:null,controls:false}, 'cleanup cancels active playback and releases history');
+  records.push({timelineReplacement:replaced,timelineCleanup:cleaned,page:page.name});
   await capture(page, 'timeline');
   clean(page);
   console.log(`PASS: ${page.name} exported lifecycle timeline, backward navigation and current graph restoration`);
