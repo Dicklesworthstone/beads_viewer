@@ -49,12 +49,15 @@ func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 	repo := t.TempDir()
 	t.Chdir(repo)
 	t.Setenv("BV_NO_CACHE", "1")
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	git := func(hour int, args ...string) string {
 		t.Helper()
 		cmd := exec.Command("git", args...)
 		cmd.Dir = repo
-		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
+		// Distinct commits can share Git's one-second timestamp resolution.
+		at := start.Format(time.RFC3339)
 		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid", "GIT_AUTHOR_DATE="+at, "GIT_COMMITTER_DATE="+at)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -71,13 +74,13 @@ func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
 		data := fmt.Sprintf("{\"id\":\"bv-a\",\"title\":\"Target revision %d\",\"status\":%q,\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", hour, status, start.Format(time.RFC3339), at)
 		data += fmt.Sprintf("{\"id\":\"bv-z\",\"title\":\"Already closed\",\"status\":\"closed\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", start.Format(time.RFC3339), start.Format(time.RFC3339))
-		if err := os.WriteFile(".beads/issues.jsonl", []byte(data), 0o644); err != nil {
+		if err := os.WriteFile(".beads/beads.jsonl", []byte(data), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		git(hour, "add", ".beads/issues.jsonl")
+		git(hour, "add", ".beads/beads.jsonl")
 		message := fmt.Sprintf("record lifecycle %d", hour)
 		git(hour, "commit", "-m", message)
-		commit := TimeTravelCommit{SHA: git(hour, "rev-parse", "HEAD"), Date: at, Message: message}
+		commit := TimeTravelCommit{SHA: git(hour, "rev-parse", "HEAD"), Date: start.Format(time.RFC3339), Message: message}
 		switch hour {
 		case 0:
 			commit.BeadsAdded = []string{"bv-a", "bv-z"}
@@ -89,8 +92,17 @@ func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 		}
 		want = append(want, commit)
 	}
+	if err := os.Rename(".beads/beads.jsonl", ".beads/issues.jsonl"); err != nil {
+		t.Fatal(err)
+	}
+	git(4, "add", ".beads")
+	git(4, "commit", "-m", "rename issue source")
 	// A correlated code-only commit is not an observed lifecycle transition.
-	git(4, "commit", "--allow-empty", "-m", "bv-a: follow-up code work")
+	if err := os.WriteFile("feature.go", []byte("package fixture\nconst Ready = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(4, "add", "feature.go")
+	git(4, "commit", "-m", "bv-a: follow-up code work")
 	issues := []model.Issue{{ID: "bv-a", Title: "Target revision 3", Status: model.StatusOpen}, {ID: "bv-z", Title: "Already closed", Status: model.StatusClosed}}
 	for run := 0; run < 2; run++ {
 		history, err := generateHistoryForExport(issues)

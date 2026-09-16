@@ -2851,12 +2851,19 @@ If the `wasm/` assets are missing, the viewer automatically falls back to the JS
 │   ├── graph_layout.json   # Pre-computed positions + metrics (116 KB for 611 issues / 746 edges)
 │   ├── meta.json           # Export metadata
 │   ├── triage.json         # Triage recommendations
-│   └── history.json        # Bead-commit correlation data
+│   └── history.json        # Recorded issue lifecycle for graph time travel
 └── vendor/
     ├── d3.v7.min.js        # Visualization library
     ├── force-graph.min.js  # Graph rendering
     └── bv_graph.js         # WASM graph engine
 ```
+
+When history is included, graph time travel replays recorded issue creation,
+closure, and reopening in Git ancestry order. Editing a closed issue does not
+reopen it, and an inferred code correlation does not create a timeline event.
+This is a bounded view of the current exported issues, not a complete historical
+snapshot: history is limited to 500 source commits, issues whose creation falls
+outside that window may be absent, and deleted records are not reconstructed.
 
 ### Graph Visualization: Pre-computed Layout
 

@@ -13,7 +13,7 @@ import { spawn } from 'node:child_process';
 
 const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'graph-reload', 'history-loading', 'timeline'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
@@ -198,6 +198,41 @@ function clean(page) {
 }
 async function resultIDs(page, expected) {
   await waitFor(page, `JSON.stringify([...document.querySelectorAll('[aria-label^="View issue "]')].filter(${visible}).map(e => e.getAttribute('aria-label').split(':')[0].slice(11)).sort()) === ${JSON.stringify(JSON.stringify([...expected].sort()))}`, `visible issue IDs ${expected}`);
+}
+
+async function timelineJourney(page) {
+  await ready(page);
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'timeline fixture worker controls page');
+  await delay(500);
+  await ready(page);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'timeline graph loaded');
+  const state = `${app}.forceGraphModule.getTimeTravelState()`;
+  assert.equal(await evaluate(page, `${state}.totalCommits`), 4, 'actual exported lifecycle history loaded');
+  await key(page, 't', 'KeyT');
+  await waitFor(page, `${state}.active`, 'keyboard enters timeline');
+  const expected = [
+    ['browser-detail','browser-other','browser-root'],
+    ['browser-other','browser-root'],
+    ['browser-other','browser-root'],
+    ['browser-detail','browser-other','browser-root'],
+  ];
+  for (let idx = 0; idx < expected.length; idx++) {
+    if (idx) await click(page, '#tt-forward');
+    assert.equal(await evaluate(page, `${state}.currentIdx`), idx);
+    assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`), expected[idx],
+      'create, close, closed edit and reopen visibility follows recorded states');
+    records.push({timeline:idx,page:page.name,visible:expected[idx]});
+  }
+  await click(page, '#tt-back');
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`), expected[2]);
+  await click(page, '.timeline-close');
+  assert.equal(await evaluate(page, `${state}.active`), false);
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`),
+    ['browser-closed','browser-detail','browser-other','browser-root'], 'exiting restores current graph');
+  await capture(page, 'timeline');
+  clean(page);
+  console.log(`PASS: ${page.name} exported lifecycle timeline, backward navigation and current graph restoration`);
 }
 
 async function historyLoadingJourney(page) {
@@ -879,7 +914,10 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'history-loading') {
+  if (mode === 'timeline') {
+    await timelineJourney(desktop);
+    await timelineJourney(await openPage('mobile-360',360));
+  } else if (mode === 'history-loading') {
     await historyLoadingJourney(desktop);
     await historyLoadingJourney(await openPage('mobile-360',360));
   } else if (mode === 'graph-reload') {

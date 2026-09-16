@@ -7071,8 +7071,8 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 	// the per-commit event cache. Without this the watcher re-materialized the
 	// entire blob history on every re-export. BV_NO_CACHE=1 still opts out.
 	correlation.SetDiskCacheEnabled(true)
-	// The exported history is a read path: stored confirm/reject feedback
-	// shapes it exactly as it shapes --robot-history.
+	// Load the same report as robot history. Feedback affects inferred code
+	// correlations, but the timeline below uses the recorded issue events.
 	feedbackStore := correlation.NewFeedbackStore(beadsDir)
 	if err := feedbackStore.Load(); err != nil {
 		return nil, fmt.Errorf("loading correlation feedback: %w", err)
@@ -7085,82 +7085,67 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		return nil, err
 	}
 
-	// Convert to time-travel format
-	// Group by commit date and track bead changes
+	// Timeline visibility follows observed issue records, not inferred code
+	// correlations or today's status. A closed issue can be reopened, and an
+	// ordinary edit to a closed record must not make it visible again.
 	commitMap := make(map[string]*TimeTravelCommit)
 
 	for beadID, history := range report.Histories {
-		for _, commit := range history.Commits {
-			ttCommit, exists := commitMap[commit.SHA]
+		for _, event := range history.Events {
+			if event.CommitSHA == "" || event.Timestamp.IsZero() {
+				continue
+			}
+			ttCommit, exists := commitMap[event.CommitSHA]
 			if !exists {
 				ttCommit = &TimeTravelCommit{
-					SHA:     commit.SHA,
-					Date:    commit.Timestamp.Format(time.RFC3339),
-					Message: commit.Message,
+					SHA:     event.CommitSHA,
+					Date:    event.Timestamp.Format(time.RFC3339),
+					Message: event.CommitMsg,
 				}
-				commitMap[commit.SHA] = ttCommit
+				commitMap[event.CommitSHA] = ttCommit
 			}
 
-			// Determine if this bead was added or modified in this commit
-			// For simplicity, we consider any commit touching a bead as "adding" it
-			// (the first time it appears in history)
-			ttCommit.BeadsAdded = append(ttCommit.BeadsAdded, beadID)
-		}
-	}
-
-	// Build map of bead ID -> latest commit SHA that touched it before/at ClosedAt.
-	// This attributes closure only to the most relevant commit, not every commit.
-	closedBeadCommit := make(map[string]string) // beadID -> commitSHA
-	for _, issue := range issues {
-		if issue.Status != model.StatusClosed || issue.ClosedAt == nil {
-			continue
-		}
-		// Find the commit closest to (but not after) the closure time
-		var bestSHA string
-		var bestDist time.Duration = -1
-		for sha, commit := range commitMap {
-			for _, id := range commit.BeadsAdded {
-				if id != issue.ID {
-					continue
+			switch event.EventType {
+			case correlation.EventCreated, correlation.EventReopened:
+				ttCommit.BeadsAdded = append(ttCommit.BeadsAdded, beadID)
+				if event.After != nil && (strings.EqualFold(strings.TrimSpace(event.After.Status), "closed") || strings.EqualFold(strings.TrimSpace(event.After.Status), "tombstone")) {
+					ttCommit.BeadsClosed = append(ttCommit.BeadsClosed, beadID)
 				}
-				commitDate, _ := time.Parse(time.RFC3339, commit.Date)
-				if commitDate.IsZero() {
-					continue
-				}
-				dist := issue.ClosedAt.Sub(commitDate)
-				if dist >= 0 && (bestDist < 0 || dist < bestDist) {
-					bestSHA = sha
-					bestDist = dist
-				}
+			case correlation.EventClosed:
+				ttCommit.BeadsClosed = append(ttCommit.BeadsClosed, beadID)
 			}
-		}
-		if bestSHA != "" {
-			closedBeadCommit[issue.ID] = bestSHA
 		}
 	}
 
 	// Convert map to sorted slice
 	var commits []TimeTravelCommit
 	for _, commit := range commitMap {
-		// Deduplicate beads_added
-		seen := make(map[string]bool)
-		var dedupedAdded []string
-		for _, id := range commit.BeadsAdded {
-			if !seen[id] {
-				seen[id] = true
-				dedupedAdded = append(dedupedAdded, id)
-				if closedBeadCommit[id] == commit.SHA {
-					commit.BeadsClosed = append(commit.BeadsClosed, id)
-				}
-			}
-		}
-		commit.BeadsAdded = dedupedAdded
+		sort.Strings(commit.BeadsAdded)
+		sort.Strings(commit.BeadsClosed)
 		commits = append(commits, *commit)
 	}
 
-	// Sort commits by date
+	// Keep Git ancestry order, including equal or backdated author timestamps.
+	// Sorting timestamps or hashes can replay a close before its creation.
+	// Match the extractor's bounded rename-following walk. Reverse by rank
+	// afterward: --reverse can interfere with following the source's old name.
+	orderCmd := exec.Command("git", "log", "--format=%H", "--topo-order", "--follow", "-n", "500", "HEAD", "--", beadsPath)
+	orderCmd.Dir = cwd
+	orderOutput, err := orderCmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("ordering timeline commits: %w", err)
+	}
+	order := make(map[string]int)
+	for i, sha := range strings.Fields(string(orderOutput)) {
+		order[sha] = -i
+	}
+	for _, commit := range commits {
+		if _, ok := order[commit.SHA]; !ok {
+			return nil, fmt.Errorf("timeline commit %s missing from source history", commit.SHA)
+		}
+	}
 	sort.Slice(commits, func(i, j int) bool {
-		return commits[i].Date < commits[j].Date
+		return order[commits[i].SHA] < order[commits[j].SHA]
 	})
 
 	return &TimeTravelHistory{

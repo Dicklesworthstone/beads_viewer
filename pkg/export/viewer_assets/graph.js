@@ -3323,8 +3323,8 @@ export function initTimeTravel(history) {
         return false;
     }
 
-    // Sort commits by date
-    history.commits.sort((a, b) => new Date(a.date) - new Date(b.date));
+    // The exporter supplies Git ancestry order. Author timestamps can be
+    // equal or backdated, so sorting them would change lifecycle replay.
 
     timeTravelState.history = history;
     timeTravelState.currentIdx = 0;
