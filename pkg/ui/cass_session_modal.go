@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -395,7 +396,12 @@ func copyToClipboardStatusCmd(text, success string, requestID uint64) tea.Cmd {
 func copyToClipboard(ctx context.Context, text string) error {
 	cmd, err := clipboardCommand(ctx)
 	if err != nil {
-		return err
+		// No helper can run here — a display-less SSH session is the usual
+		// reason. Ask the terminal itself to set the clipboard (#201).
+		if osc52Err := osc52Copy(text); osc52Err != nil {
+			return fmt.Errorf("%w (OSC 52 fallback: %w)", err, osc52Err)
+		}
+		return nil
 	}
 
 	cmd.Stdin = strings.NewReader(text)
@@ -404,6 +410,50 @@ func copyToClipboard(ctx context.Context, text string) error {
 			return fmt.Errorf("clipboard helper timed out: %w", ctxErr)
 		}
 		return fmt.Errorf("run clipboard helper: %w", err)
+	}
+	return nil
+}
+
+// osc52Limit bounds the base64 payload of an OSC 52 write. tmux refuses
+// sequences past its own buffer limit and several terminals silently drop
+// oversized ones, so a copy that cannot land is reported rather than half-sent.
+const osc52Limit = 74994
+
+// osc52Copy asks the terminal to set the system clipboard with OSC 52.
+//
+// This is the only mechanism that reaches the clipboard of the machine the user
+// is sitting at: the escape sequence travels back over SSH and is executed by
+// the local terminal emulator. It is written to the controlling terminal rather
+// than stdout so it does not pass through Bubble Tea's frame buffer, and the
+// sequence is emitted in a single write so a concurrent repaint cannot split it.
+func osc52Copy(text string) error {
+	encoded := base64.StdEncoding.EncodeToString([]byte(text))
+	if len(encoded) > osc52Limit {
+		return fmt.Errorf("selection too large for terminal clipboard (%d bytes encoded, limit %d)",
+			len(encoded), osc52Limit)
+	}
+	sequence := "\x1b]52;c;" + encoded + "\x07"
+
+	// Inside tmux or screen the sequence has to be wrapped in a DCS passthrough
+	// or the multiplexer consumes it instead of forwarding it outward. tmux
+	// additionally requires each ESC in the payload to be doubled.
+	switch {
+	case os.Getenv("TMUX") != "":
+		sequence = "\x1bPtmux;" + strings.ReplaceAll(sequence, "\x1b", "\x1b\x1b") + "\x1b\\"
+	case strings.HasPrefix(os.Getenv("TERM"), "screen"):
+		sequence = "\x1bP" + sequence + "\x1b\\"
+	}
+
+	// The controlling terminal is the right sink even when stdout is a pipe.
+	if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
+		defer tty.Close()
+		if _, writeErr := tty.WriteString(sequence); writeErr != nil {
+			return fmt.Errorf("write OSC 52 to terminal: %w", writeErr)
+		}
+		return nil
+	}
+	if _, err := os.Stdout.WriteString(sequence); err != nil {
+		return fmt.Errorf("write OSC 52 to stdout: %w", err)
 	}
 	return nil
 }
@@ -420,11 +470,18 @@ func clipboardCommand(ctx context.Context) (*exec.Cmd, error) {
 				return exec.CommandContext(ctx, "wl-copy"), nil
 			}
 		}
-		if _, err := exec.LookPath("xclip"); err == nil {
-			return exec.CommandContext(ctx, "xclip", "-in", "-selection", "clipboard"), nil
-		}
-		if _, err := exec.LookPath("xsel"); err == nil {
-			return exec.CommandContext(ctx, "xsel", "--input", "--clipboard"), nil
+		// xclip and xsel are X clients: without a display they exit 1 with
+		// "Can't open display", which is the common case on a server you SSH
+		// into. Being on PATH is not evidence they can run (#201), so gate them
+		// the way wl-copy is already gated and let the caller fall back to
+		// OSC 52, which reaches the clipboard at the *local* end of the session.
+		if os.Getenv("DISPLAY") != "" {
+			if _, err := exec.LookPath("xclip"); err == nil {
+				return exec.CommandContext(ctx, "xclip", "-in", "-selection", "clipboard"), nil
+			}
+			if _, err := exec.LookPath("xsel"); err == nil {
+				return exec.CommandContext(ctx, "xsel", "--input", "--clipboard"), nil
+			}
 		}
 		if _, err := exec.LookPath("termux-clipboard-set"); err == nil {
 			return exec.CommandContext(ctx, "termux-clipboard-set"), nil
