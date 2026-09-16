@@ -420,18 +420,14 @@ func copyToClipboard(ctx context.Context, text string) error {
 	return nil
 }
 
-// osc52Limit bounds the base64 payload of an OSC 52 write. tmux refuses
-// sequences past its own buffer limit and several terminals silently drop
-// oversized ones, so a copy that cannot land is reported rather than half-sent.
+// osc52Limit bounds the base64 payload of an OSC 52 write. Terminals and
+// multiplexers cap how much they will accept and several drop an oversized
+// sequence outright rather than truncating it, so a copy that cannot land is
+// reported as failed instead of sent and silently lost.
 const osc52Limit = 74994
 
-// osc52Copy asks the terminal to set the system clipboard with OSC 52.
-//
-// This is the only mechanism that reaches the clipboard of the machine the user
-// is sitting at: the escape sequence travels back over SSH and is executed by
-// the local terminal emulator. It is written to the controlling terminal rather
-// than stdout so it does not pass through Bubble Tea's frame buffer, and the
-// sequence is emitted in a single write so a concurrent repaint cannot split it.
+// osc52Sequence builds the OSC 52 escape sequence for text, wrapped for the
+// multiplexer in use.
 func osc52Sequence(text string) (string, error) {
 	encoded := base64.StdEncoding.EncodeToString([]byte(text))
 	if len(encoded) > osc52Limit {
@@ -456,6 +452,13 @@ func osc52Sequence(text string) (string, error) {
 	return sequence, nil
 }
 
+// osc52Copy asks the terminal to set the system clipboard with OSC 52.
+//
+// This is the only mechanism that reaches the clipboard of the machine the user
+// is sitting at: the escape sequence travels back over SSH and is executed by
+// the local terminal emulator. It is written to the controlling terminal rather
+// than stdout so it does not pass through Bubble Tea's frame buffer, and the
+// sequence is emitted in a single write so a concurrent repaint cannot split it.
 func osc52Copy(text string) error {
 	sequence, err := osc52Sequence(text)
 	if err != nil {
