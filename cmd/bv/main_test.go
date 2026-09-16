@@ -70,9 +70,12 @@ func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	var want []TimeTravelCommit
-	for hour, status := range []string{"open", "closed", "closed", "open"} {
+	for hour, status := range []string{"open", "closed", "closed", "open", "absent", "open"} {
 		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
 		data := fmt.Sprintf("{\"id\":\"bv-a\",\"title\":\"Target revision %d\",\"status\":%q,\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", hour, status, start.Format(time.RFC3339), at)
+		if status == "absent" {
+			data = ""
+		}
 		data += fmt.Sprintf("{\"id\":\"bv-z\",\"title\":\"Already closed\",\"status\":\"closed\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", start.Format(time.RFC3339), start.Format(time.RFC3339))
 		if err := os.WriteFile(".beads/beads.jsonl", []byte(data), 0o644); err != nil {
 			t.Fatal(err)
@@ -87,8 +90,10 @@ func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 			commit.BeadsClosed = []string{"bv-z"}
 		case 1:
 			commit.BeadsClosed = []string{"bv-a"}
-		case 3:
+		case 3, 5:
 			commit.BeadsAdded = []string{"bv-a"}
+		case 4:
+			commit.BeadsRemoved = []string{"bv-a"}
 		}
 		want = append(want, commit)
 	}
