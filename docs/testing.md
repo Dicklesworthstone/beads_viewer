@@ -267,8 +267,21 @@ The E2E suite includes a few large-scale/stress scenarios guarded by `testing.Sh
 go test -short ./tests/e2e
 
 # Full run
-go test ./tests/e2e
+go test ./tests/e2e -timeout=45m
 ```
+
+The full package can exceed Go's default ten-minute package timeout. This
+package-level allowance does not change individual test assertions or the
+performance qualification's latency gates.
+
+`TestCorrelationOnThisRepository_StrategyCounts` requires the repository's
+tracker and full Git history, including commit
+`347134f1f5e2b63183a90934deda5c88fe9e41c3`. A shallow or incomplete remote
+checkout cannot exercise that fixture. For RCH runs, transfer the required Git
+objects while excluding credentials, Git configuration, and hooks. Verify the
+object with `git cat-file -t` on the worker before running the suite. If a result
+directory is declared, the command must create it and write its logs there;
+otherwise a retrieval failure can obscure the underlying test exit status.
 
 ### Pattern
 
