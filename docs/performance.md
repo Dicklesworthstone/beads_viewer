@@ -35,6 +35,26 @@ Each refresh generation changes the final issue's title. Exact decision comparis
 
 Normal `go test` runs exercise navigation beyond the issue count, a deliberate 60 ms slow-handler rejection, missing/degraded metric controls, and real 1k/5k/10k CLI smoke cases. Complete distributions require the explicit latency runner; a skipped opt-in cohort is not performance acceptance. Search relevance is evaluated separately against judged queries; a timing pass says nothing about semantic quality.
 
+### September 17, 2026 viewport refresh diagnostic
+
+The separately identified decoder-repaired comparator run in
+`benchmarks/bluegate-comparator-full-20260917` recorded current-side cyclic-dense
+refresh SLO failures, including p99 values of 51.659, 54.123, 53.422, and
+68.502 ms. The run was deliberately interrupted during timed CLI measurement
+(exit 130); its recovered partial artifacts do not constitute qualification.
+
+A focused profile of the retained current binary measured 1.37 CPU-seconds in
+viewport `SetContent` across the 1,000-sample cyclic-dense/10,000 refresh run.
+Repeated unchanged detail updates produced identical output but still performed
+viewport line splitting and width scans. The model now remembers the exact
+installed content and skips identical installations; recreating the viewport
+invalidates that memory. A temporary actual-call counter measured zero
+`SetContent` calls across 6,816 unchanged updates after initial installation.
+The counter and diagnostic benchmark were removed; behavioral coverage retains
+selection changes, repeated updates, empty content, and viewport recreation.
+This bounded optimization does not establish that the refresh SLO failures are
+resolved. No full post-change qualification is claimed.
+
 ### September 11, 2026 measurement attempt
 
 The September 10–11 run completed the original UI matrix, but **the overall
