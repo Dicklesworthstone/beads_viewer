@@ -802,6 +802,35 @@ func TestSelectedDependencyTreeUsesPlainTextWithoutChangingOutput(t *testing.T) 
 	}
 }
 
+func TestDetailViewportRepeatedUpdateAndRecreation(t *testing.T) {
+	issues, err := testutil.PerformanceIssues("cyclic-dense", 64, 20260904)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := settledPerformanceModel(t, issues)
+	m.updateViewportContent()
+	wantView, wantLines := m.viewport.View(), m.viewport.TotalLineCount()
+	m.updateViewportContent()
+	if m.viewport.View() != wantView || m.viewport.TotalLineCount() != wantLines {
+		t.Fatal("unchanged detail update changed viewport output")
+	}
+	m.list.Select(1)
+	m.updateViewportContent()
+	changedView := m.viewport.View()
+	if changedView == wantView {
+		t.Fatal("selection change retained stale detail output")
+	}
+	// Recreating at the same dimensions must reinstall identical content.
+	m.recalculateSplitPaneSizes()
+	if m.viewport.View() != changedView {
+		t.Fatal("viewport recreation lost selected detail output")
+	}
+	m.setViewportContent("")
+	if strings.TrimSpace(m.viewport.View()) != "" {
+		t.Fatal("empty content retained stale detail output")
+	}
+}
+
 func TestMarkdownRenderer_RenderNilRenderer(t *testing.T) {
 	mr := &MarkdownRenderer{
 		renderer: nil,

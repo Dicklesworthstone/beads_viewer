@@ -763,6 +763,7 @@ type Model struct {
 	pendingFilterTerm      string
 	pendingSelectedID      string
 	viewport               viewport.Model
+	viewportContent        string // Exact bytes last installed; cleared when recreating the viewport.
 	renderer               *MarkdownRenderer
 	board                  BoardModel
 	labelDashboard         LabelDashboardModel
@@ -2450,6 +2451,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ready = true
 			m.list.SetSize(m.width, m.height-3)
 			m.viewport = viewport.New(m.width, m.height-2)
+			m.viewportContent = ""
 			m.insightsPanel.SetSize(m.width, m.height-1)
 			m.labelDashboard.SetSize(m.width, m.height-1)
 		}
@@ -8630,6 +8632,7 @@ func (m *Model) applyContentSizing() {
 
 	if m.focused == focusFlowMatrix && m.flowDetailID != "" {
 		m.viewport = viewport.New(m.width, bodyHeight)
+		m.viewportContent = ""
 		m.renderer.SetWidthWithTheme(m.width, m.theme)
 	} else if m.isSplitView {
 		// Calculate dimensions accounting for 2 panels with borders(2)+padding(2) = 4 overhead each
@@ -8651,6 +8654,7 @@ func (m *Model) applyContentSizing() {
 
 		m.list.SetSize(listInnerWidth, listHeight)
 		m.viewport = viewport.New(detailInnerWidth, bodyHeight-2) // Account for border
+		m.viewportContent = ""
 
 		m.renderer.SetWidthWithTheme(detailInnerWidth, m.theme)
 	} else {
@@ -8660,6 +8664,7 @@ func (m *Model) applyContentSizing() {
 		}
 		m.list.SetSize(contentWidth, listHeight)
 		m.viewport = viewport.New(contentWidth, bodyHeight-1)
+		m.viewportContent = ""
 
 		// Update renderer for full width
 		m.renderer.SetWidthWithTheme(contentWidth, m.theme)
@@ -8704,6 +8709,7 @@ func (m *Model) recalculateSplitPaneSizes() {
 
 	m.list.SetSize(listInnerWidth, listHeight)
 	m.viewport = viewport.New(detailInnerWidth, bodyHeight-2)
+	m.viewportContent = ""
 	m.renderer.SetWidthWithTheme(detailInnerWidth, m.theme)
 	m.updateViewportContent()
 }
@@ -8848,29 +8854,37 @@ func (m *Model) handleLeftClick(x, y int) *Model {
 	return m
 }
 
+func (m *Model) setViewportContent(content string) {
+	if content == m.viewportContent {
+		return
+	}
+	m.viewport.SetContent(content)
+	m.viewportContent = content
+}
+
 func (m *Model) updateViewportContent() {
 	selectedItem := m.list.SelectedItem()
 	if m.flowDetailID != "" && (m.focused == focusFlowMatrix || (m.focused == focusHelp && m.focusBeforeHelp == focusFlowMatrix)) {
 		issue := m.issueMap[m.flowDetailID]
 		if issue == nil {
-			m.viewport.SetContent("Issue no longer available")
+			m.setViewportContent("Issue no longer available")
 			return
 		}
 		selectedItem = m.itemWithTriage(IssueItem{Issue: *issue})
 	}
 	if selectedItem == nil {
-		m.viewport.SetContent("No issues selected")
+		m.setViewportContent("No issues selected")
 		return
 	}
 	if group, ok := selectedItem.(IssueGroupItem); ok {
-		m.viewport.SetContent(fmt.Sprintf("%s · %d issues\nPress Enter to expand or collapse this group.", group.Key, group.Count))
+		m.setViewportContent(fmt.Sprintf("%s · %d issues\nPress Enter to expand or collapse this group.", group.Key, group.Count))
 		return
 	}
 
 	// Safe type assertion
 	issueItem, ok := selectedItem.(IssueItem)
 	if !ok {
-		m.viewport.SetContent("Error: invalid item type")
+		m.setViewportContent("Error: invalid item type")
 		return
 	}
 	item := issueItem.Issue
@@ -9039,9 +9053,9 @@ func (m *Model) updateViewportContent() {
 
 	rendered, err := m.renderer.Render(sb.String())
 	if err != nil {
-		m.viewport.SetContent(fmt.Sprintf("Error rendering markdown: %v", err))
+		m.setViewportContent(fmt.Sprintf("Error rendering markdown: %v", err))
 	} else {
-		m.viewport.SetContent(rendered)
+		m.setViewportContent(rendered)
 	}
 }
 
