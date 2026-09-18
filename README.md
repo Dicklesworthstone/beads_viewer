@@ -92,6 +92,8 @@ For a source build, use `install.ps1` from this checkout (requires Git and Go 1.
 
 This source path builds a verified checkout of the requested tag with that tag's vendored dependencies, checks the executable's version and Git revision before installation, and retains diagnostics on failure. The pinned installer above uses the same verified source-build path. Selecting an older release tag does not include later, unreleased fixes from this checkout.
 
+Vendoring covers the Go module dependencies, not the compiler. When your Go differs from the `toolchain` directive in that tag's `go.mod`, Go downloads the pinned toolchain before compiling, so the source build needs network access even though the dependencies are vendored, and on a slow machine that download alone can take several minutes. The installer's progress line reports the Go it was launched with, not the toolchain it ends up building with; `go version -m` on the installed executable reports the one actually used.
+
 ---
 
 ## Generating the JSONL File (`br` and `bd`)
@@ -165,7 +167,7 @@ Browse your issue backlog in the terminal using standard Vim keys (`j`/`k`). Sta
 Don't just read the title. `bv` gives you the full picture:
 *   **Comments & History:** Scroll through the full conversation history of any task.
 *   **Metadata:** Instantly see Assignees, Labels, Priority badges, and creation dates.
-*   **Search:** Fuzzy list filtering (`/`) matches titles, IDs and displayed metadata. CLI keyword search (`--search`) also indexes descriptions and can combine text scores with graph metrics.
+*   **Search:** Fuzzy list filtering (`/`) matches the title, ID, status, issue type, assignee, labels and repo prefix, whether or not the current terminal width displays them. CLI keyword search (`--search`) also indexes descriptions and can combine text scores with graph metrics.
 *   **Dependency Details:** The detail pane shows dependencies up to three edges from the selected issue. Each issue's dependencies appear once along a shortest path; other occurrences say `(reference: shown elsewhere)`. Every relationship within that limit retains its type and target metadata. Cycle-closing edges carry a separate `(cycle)` marker.
 
 ### 🎯 Focused Workflows
@@ -230,6 +232,9 @@ bv --robot-next          # Minimal: just the single top pick + claim command
 # repository it is 7% smaller than JSON for --robot-graph but 9-15% LARGER for
 # nested payloads (--robot-triage, --robot-plan, --robot-insights,
 # --robot-label-health); use --stats to see both sizes before adopting it.
+# TOON encoding shells out to the tru binary. With no encoder installed,
+# --format toon prints a fallback warning, emits JSON with output_format "json",
+# and --stats prints no sizes at all.
 bv --robot-graph --format toon
 bv --robot-triage --format toon --stats
 ```
@@ -776,7 +781,7 @@ For large projects, extract focused views around specific issues:
 
 ### JSON Output Excerpt
 
-Top-level `nodes` and `edges` are counts. Node and edge records live under `adjacency`; other envelope fields are omitted here. Edges run from the issue to its referenced dependency and retain the recorded dependency type. Empty output can omit `adjacency`.
+Top-level `nodes` and `edges` are counts. Node and edge records live under `adjacency`; other envelope fields are omitted here, and the node records below are abbreviated too — each real record also carries `labels` and `pagerank`. Edges run from the issue to its referenced dependency and retain the recorded dependency type. Empty output can omit `adjacency`.
 
 ```json
 {
@@ -898,7 +903,7 @@ The visualization is fully keyboard-driven:
 ### Features
 
 **Filtering & Search**
-- **Full-text search**: Find beads by ID, title, or content with live preview
+- **Full-text search**: Dropdown search over ID, title, description, design, notes, acceptance criteria, labels and assignee, with live preview (2-character minimum, top 8 results). The graph filter itself dims nodes by ID and title only.
 - **Status filter**: Open, In Progress, Blocked, Closed
 - **Type filter**: Feature, Bug, Task, Epic
 - **Priority filter**: P0 (Critical) through P4 (Backlog)
@@ -1468,7 +1473,7 @@ Each card displays comprehensive metadata in a compact format:
 |---------|---------|
 | **Type Icon** | 🐛 Bug, ✨ Feature, 📝 Task, 🎯 Epic, 🔧 Chore |
 | **Priority** | P0 (red), P1 (red), P2 (muted), P3+ (gray) |
-| **Age Color** | 🟢 <7d (fresh), 🟡 7-30d (aging), 🔴 >30d (stale) |
+| **Age Color** | 🟢 <7d (fresh), 🟡 7-29d (aging), 🔴 ≥30d (stale) |
 | **⛔N** | Blocked by N issues |
 | **→N** | Blocks N downstream issues |
 | **🏷️N** | Has N labels |
@@ -1578,7 +1583,7 @@ Press `E` to open the **Hierarchical Tree View**—a collapsible tree that visua
 ### Why Parent-Child Matters
 
 In complex projects, issues often have two distinct relationship types:
-- **Blocking dependencies** (`blocks`, `conditional-blocks`, `waits-for`): predecessor completion gates readiness according to the dependency type
+- **Blocking dependencies** (`blocks`, `conditional-blocks`, `waits-for`, and any dependency written without a `type`, which stays blocking for legacy data): predecessor completion gates readiness according to the dependency type
 - **Parent-child relationships** (`parent-child`): Feature X contains Tasks A, B, and C as sub-work
 
 The Tree View renders only parent-child relationships, creating a work breakdown structure (WBS) that answers questions like:
@@ -1711,7 +1716,7 @@ Traditional priority lists show tasks in a single ordered queue. But in complex 
 
 ### What Makes an Item "Actionable"
 
-An issue appears in the Actionable Plan when it is in the selected candidate scope, its status is `open` or `in_progress`, its deferral has elapsed, and its dependency gates are satisfied. Direct blockers and inherited parent gates are checked against the full loaded source. Closed or tombstoned predecessors satisfy a gate; a missing dependency record does not. Parked statuses such as `blocked`, `deferred` and `draft` are not ready merely because they have no edges.
+An issue appears in the Actionable Plan when it is in the selected candidate scope, its status is `open` or `in_progress`, its deferral has elapsed, and its dependency gates are satisfied. Direct blockers and inherited parent gates are checked against the full loaded source. Closed or tombstoned predecessors satisfy a gate; a missing dependency record does not. Parked statuses such as `blocked`, `deferred` and `draft` are not ready merely because they have no edges. Only blocking types (`blocks`, `conditional-blocks`, `waits-for`, untyped) and `parent-child` inheritance gate readiness: `related`, `discovered-from` and any unrecognised type are informational, and they neither gate readiness nor enter the analysis graph.
 
 Planning readiness includes ongoing or assigned work. A new claim additionally requires an open, unassigned, non-epic issue without open children or configured not-ready labels. `--robot-next` also requires complete source authority and a usable live tracker route before emitting a claim. These checks describe the snapshot; they do not reserve work or guarantee a later tracker mutation succeeds.
 
@@ -2464,7 +2469,7 @@ bv --robot-reject-correlation abc1234:bv-xyz
 bv --robot-correlation-stats
 ```
 
-**Feedback Stats Output:**
+**Feedback Stats Output:** selected fields; the response also carries `ignored`, `generated_at`, `output_format` and `version`.
 ```json
 {
   "total_feedback": 15,
@@ -2476,7 +2481,7 @@ bv --robot-correlation-stats
 }
 ```
 
-Stored feedback applies to the identified commit/issue pair: confirmation pins confidence to 1.0, rejection removes that pair from the report and derived index, and ignore leaves it unchanged. These decisions do not train patterns for unrelated pairs or establish calibrated accuracy.
+Stored feedback applies to the identified commit/issue pair: confirmation pins confidence to 1.0 and rejection removes that pair from the report and derived index. A third `ignore` type exists in the stored format and is counted when present, but no `bv` command records one — only `--robot-confirm-correlation` and `--robot-reject-correlation` write feedback. These decisions do not train patterns for unrelated pairs or establish calibrated accuracy.
 
 **Impact Network Output Excerpt:**
 Selected fields from `--robot-impact-network all`; clusters and edges belong to `.network`, while `.top_clusters` is a separate shortlist.
@@ -2560,23 +2565,27 @@ subsequent session search is started for that cancelled request.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  🤖 Related Coding Sessions for BV-123                                  │
-├─────────────────────────────────────────────────────────────────────────┤
+│  📎 Related Coding Sessions  BV-123                                     │
 │                                                                         │
-│  ▸ Session 1 (claude-opus-4)                         Dec 15, 2:30 PM   │
-│    "Implementing session refresh timeout handling..."                   │
-│    Matched via: bead ID mentioned (BV-123)                              │
+│  [1] claude-opus-4 • 3 hours ago                                        │
+│      Matched via: bead ID mentioned (BV-123)                            │
+│      ┌───────────────────────────────────────────────────────────────┐  │
+│      │ Implementing session refresh timeout handling...              │  │
+│      └───────────────────────────────────────────────────────────────┘  │
 │                                                                         │
-│    Session 2 (claude-opus-4)                         Dec 14, 10:15 AM  │
-│    "Refactoring token validation middleware..."                         │
-│    Matched via: bead ID mentioned (BV-123)                              │
+│  [2] claude-opus-4 • yesterday                                          │
+│      Matched via: bead ID mentioned (BV-123)                            │
+│      ┌───────────────────────────────────────────────────────────────┐  │
+│      │ Refactoring token validation middleware...                    │  │
+│      └───────────────────────────────────────────────────────────────┘  │
 │                                                                         │
-│    Session 3 (claude-opus-4)                         Dec 13, 4:45 PM   │
-│    "Adding retry logic to auth service..."                              │
-│    Matched via: bead ID mentioned (BV-123)                              │
+│  [3] claude-opus-4 • 2 weeks ago                                        │
+│      Matched via: bead ID mentioned (BV-123)                            │
+│      ┌───────────────────────────────────────────────────────────────┐  │
+│      │ Adding retry logic to auth service...                         │  │
+│      └───────────────────────────────────────────────────────────────┘  │
 │                                                                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│  j/k: Navigate   y: Copy search command   V/Esc: Close                  │
+│  [j/k] Navigate    [y] Copy search cmd    [V/Esc] Close                 │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -2584,7 +2593,7 @@ subsequent session search is started for that cancelled request.
 
 The correlator tries a quoted bead-ID search first, then title keywords, then a broader time-window search. It returns up to three sessions from the first strategy with qualifying results. ID matches start at 100 points; keyword and timestamp matches use lower point scores, with recency and workspace adjustments. These are ranking heuristics, not calibrated confidence probabilities. There is no file-overlap strategy in this session correlator.
 
-The search adapter reads cass's `.hits`, requests preview and timestamp fields, and converts `created_at` milliseconds into session timestamps. The modal shows agent, time, match reason and preview text. `y` copies a search command for further inspection; Enter, `V`, Esc and `q` dismiss the modal.
+The search adapter reads cass's `.hits`, requests preview and timestamp fields, and converts `created_at` milliseconds into session timestamps. The modal shows agent, time, match reason and preview text. Times are relative ("just now", "3 hours ago", "2 weeks ago"); only sessions older than 30 days fall back to an absolute `Jan 2, 2006` date, and a clock time is never printed. `y` copies a search command for further inspection; Enter, `V`, Esc and `q` dismiss the modal.
 
 ### Status Bar Indicator
 
@@ -3350,7 +3359,7 @@ bv --agent-brief ./agent-bundle/
 
 These are heuristics, not a scheduler. For `--robot-forecast`, choose a base from a positive `estimated_minutes`, otherwise the median positive estimate in the loaded issues (default 60 minutes). **Both explicit and inferred bases receive all multipliers:** type (`task`/`bug`: 1, `chore`: 0.8, `feature`: 1.3, `epic`: 2), dependency depth (`1 + min(1, depth/10)`), and description length (`1 + min(1, Unicode runes/2000)`). The product is truncated to integer minutes. Depth uses the available critical-path score; unavailable scores contribute zero depth.
 
-Velocity is estimated minutes closed in the last 30 days divided by 30, using the slowest nonzero matching-label velocity, then global velocity, then median/5 (with 60 min/day as a final fallback). ETA days = work minutes / (velocity × agents). Its confidence band is rule-based and has not been calibrated as a statistical probability. `--robot-capacity` sums serial work on the critical path with remaining parallel work divided by `--agents`; it does not assign issues to agents or account for their availability. Payloads expose the factors behind these estimates.
+Velocity is estimated minutes closed in the last 30 days divided by 30, using the slowest nonzero matching-label velocity, then global velocity, then median/5 (with 60 min/day as a final fallback). ETA days = work minutes / (velocity × agents). Its confidence band is rule-based and has not been calibrated as a statistical probability. `--robot-capacity` sums serial work on the critical path with remaining parallel work divided by `--agents`; it does not assign issues to agents or account for their availability. Payloads expose the factors behind these estimates. Note that the per-issue `estimated_days` of `--robot-forecast` is the only field that uses the formula above: `--robot-capacity`'s `estimated_days`/`total_days` and `--robot-forecast`'s `summary.total_days` convert minutes at a fixed eight-hour workday (`minutes / 480`) instead, they do not use the velocity estimate, and `summary.total_days` ignores `--forecast-agents`.
 
 Forecast output applies the global issue selection and intersects it with
 `--forecast-label` and `--forecast-sprint`, when supplied. These filters also
@@ -3490,7 +3499,7 @@ bv --search "login oauth" --search-mode hybrid \
 
 Hybrid mode first retrieves candidates by hashed keyword similarity and literal prefix evidence, then re-ranks them using graph signals (PageRank, status, impact, priority, recency). It combines textual matches with project importance; learned embeddings and synonym understanding are not implemented.
 
-Short, intent-heavy queries (e.g., “benchmarks”, “oauth”) are treated differently on purpose. bv widens the candidate pool, boosts literal matches, and raises the text weight so quick lookups behave like a precise search. Longer, descriptive queries lean more on graph signals for smart tie‑breaking and prioritization.
+Short, intent-heavy queries (e.g., “benchmarks”, “oauth”) are treated differently on purpose. In hybrid mode bv widens the candidate pool and raises the text weight so quick lookups behave like a precise search, and longer descriptive queries lean more on graph signals for smart tie‑breaking and prioritization. In the default text mode only the literal-match boost applies: the candidate pool stays at `--search-limit` and the weights are never consulted.
 
 The CLI applies literal prefix evidence before selecting candidates, so a prefix
 match can enter the result set even when its raw hash similarity is zero.
@@ -3605,8 +3614,8 @@ Each typed action contains `argv` and `working_directory`. Inspect `.actions.sho
 ```json
 {
   "recipes": [
-    { "name": "actionable", "description": "Ready to work (no blockers)", "source": "builtin" },
-    { "name": "high-impact", "description": "Top PageRank scores", "source": "builtin" },
+    { "name": "actionable", "description": "Issues ready to work on (no open blockers)", "source": "builtin" },
+    { "name": "high-impact", "description": "Issues with highest blocking impact (PageRank)", "source": "builtin" },
     { "name": "sprint-review", "description": "Current sprint issues", "source": "project" }
   ]
 }
@@ -3879,7 +3888,7 @@ In complex software projects, tasks are not isolated. They are deeply interconne
 
 `bv` is engineered for speed. We believe that latency is the enemy of flow.
 
-*   **Startup Time:** about 20 ms of graph analysis (`bv --profile-startup`) for this repository's 611 issues. Wall time per robot command on the shared reference VM (AMD EPYC-Milan, Go 1.25) is 40-50 ms for `bv --version`, roughly 180-250 ms for `--robot-next`, `--robot-triage`, and `--robot-insights` with warm caches, and 500-700 ms for a first cold run; the per-command numbers are recorded by `scripts/robot_smoke.sh` in `tests/artifacts/perf/robot_wall.json` (single cold run per command). Engine benchmarks (`BenchmarkRealData_*`: full triage 1.2 ms, graph build 0.7 ms, exact full analysis 43 ms) are in `tests/artifacts/perf/analysis_bench.md`, and dashboard bundle sizes in `tests/artifacts/perf/pages_load.json`. All of these are point measurements on a shared machine. Regressions are caught by release-gate stage 8: `scripts/benchmark.sh compare` runs ten tracked benchmarks against the frozen `tests/testdata/benchmark/medium.jsonl` dataset and fails when any benchmark's best observed `ns/op` is more than 20% above a fresh, interleaved run of the baseline commit on the same machine (`benchmarks/baseline.txt` records that commit, the machine, Go version, and dataset hash, and is the fallback when the commit is not in the clone).
+*   **Startup Time:** about 20 ms of graph analysis (`bv --profile-startup`), measured when this repository held 611 issues. `scripts/robot_smoke.sh` records per-command wall time in `tests/artifacts/perf/robot_wall.json`: that artifact is one run of each of 29 commands on the shared reference VM (AMD EPYC-Milan, Go 1.25.5, 2026-09-02), spanning 110-718 ms, with `--robot-next` at 212 ms, `--robot-insights` at 312 ms and `--robot-triage` at 510 ms. It does not separate warm from cold caches and does not time `bv --version`, so treat those figures as a single-pass snapshot rather than a warm/cold characterisation. Engine benchmarks (`BenchmarkRealData_*`: full triage 1.2 ms, graph build 0.7 ms, exact full analysis 43 ms) are in `tests/artifacts/perf/analysis_bench.md`, and dashboard bundle sizes in `tests/artifacts/perf/pages_load.json`. All of these are point measurements on a shared machine. Regressions are caught by release-gate stage 8: `scripts/benchmark.sh compare` runs ten tracked benchmarks against the frozen `tests/testdata/benchmark/medium.jsonl` dataset and fails when any benchmark's best observed `ns/op` is more than 20% above a fresh, interleaved run of the baseline commit on the same machine (`benchmarks/baseline.txt` records that commit, the machine, Go version, and dataset hash, and is the fallback when the commit is not in the clone).
 *   **Rendering:** [Bubble Tea](https://github.com/charmbracelet/bubbletea) drives the UI. The 16.67 ms frame target and the reference-host 50 ms p99 interaction SLO are distinct. The September 11 measurement passed all 144 current-code UI cohorts, with a worst cohort p99 of 46.5 ms. Its overall latency matrix failed in the final baseline CLI cohort; [the performance guide](docs/performance.md#september-11-2026-measurement-attempt) records both outcomes, source identities and limits. `Update` + `View` measurements cover event handling and string rendering; they do not measure physical terminal paint.
 *   **Virtualization:** List and Markdown views render visible windows. Frozen 1k/5k/10k workloads exercise navigation, Unicode text, dense/cyclic dependencies, and concurrent snapshot refresh. This is test coverage, not a guarantee of lag-free operation or bounded RAM on every host; inspect the retained distributions and metric states described in [the performance guide](docs/performance.md).
 *   **Graph Compute:** A two-phase analyzer computes topo/degree/density instantly, then PageRank/Betweenness/HITS/Critical Path/Cycles asynchronously with size-aware timeouts.
@@ -4353,10 +4362,13 @@ Copyright (c) 2026 Jeffrey Emanuel
     "status": {
       "PageRank": {"state":"computed","ms":142},
       "Betweenness": {"state":"computed","ms":480,"reason":"approximate","sample":120},
-      "Cycles": {"state":"skipped","ms":0,"reason":"graph too large (>2000 nodes)"}
+      "Cycles": {"state":"skipped","reason":"graph too large (>2000 nodes)"}
     }
   }
   ```
+- `ms` is omitted whenever the metric recorded no elapsed time, so a skipped or
+  pending entry has no `ms` key at all. Detect those states from `state`, not
+  from `ms == 0`.
 
 ## 🧮 Execution Plan Logic
 - Actionable set: selected open/in-progress issues whose deferral has elapsed and whose direct/inherited dependency gates are satisfied in the full source. Missing blockers withhold readiness; closed/tombstoned predecessors satisfy gates.
@@ -4486,7 +4498,7 @@ When authority is `partial` or `unknown`, readiness is labeled `provisional`. Ex
 - `bv --robot-plan` → `.plan.tracks[].items[] | {id,unblocks}` for downstream unlocks; `.plan.summary.highest_impact`.
 - `bv --robot-priority` → `.recommendations[] | {issue_id,current_priority,suggested_priority,confidence,reasoning}`.
 - `bv --robot-suggest` → `.suggestions.suggestions[]` (ranked suggestions) + `.suggestions.stats` (counts) + `.usage_hints`.
-- `bv --robot-diff --diff-since <ref>` → `{from_data_hash,to_data_hash,diff.summary,diff.new_issues,diff.cycle_*}`.
+- `bv --robot-diff --diff-since <ref>` → `{from_data_hash,to_data_hash,diff.summary,diff.new_issues,diff.new_cycles,diff.resolved_cycles}`; `diff.summary` carries `cycles_introduced`/`cycles_resolved` and `diff.metric_deltas` carries `cycle_count`.
 - `bv --robot-history` → `.histories[ID].events` + `.commit_index` for reverse lookup; `.stats.method_distribution` shows how correlations were inferred.
 
 **Copy/paste guardrails**

@@ -793,3 +793,350 @@ func TestDocsParity_KeyBindingsDocumented(t *testing.T) {
 		t.Fatalf("%d registered key binding(s) are not documented in README.md:\n%s", len(missing), strings.Join(missing, "\n"))
 	}
 }
+
+// TestDocsParity_ToonAdviceMatchesMeasuredSizes (bv-apal.3): the binary's own
+// agent-facing docs must not sell TOON as a uniform token saving. TOON is
+// measured smaller than JSON only for the wide --robot-graph payload and
+// 9-15% larger for the nested ones (tests/artifacts/perf/toon_vs_json.md), so
+// any --robot-docs example that advertises a saving has to name a payload the
+// artifact records as a win. The old text ("saves ~30-50% tokens", with
+// `bv robot-triage --toon` as the saving example) fails this test.
+func TestDocsParity_ToonAdviceMatchesMeasuredSizes(t *testing.T) {
+	artifact := repoFile(t, filepath.Join("tests", "artifacts", "perf", "toon_vs_json.md"))
+	// The artifact table records TOON/JSON ratios per command in the
+	// "TOON / JSON" column. A command is a documented win only when its
+	// recorded ratio is below 1.
+	wins := map[string]bool{}
+	for _, line := range strings.Split(artifact, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "| `--robot-") {
+			continue
+		}
+		cells := strings.Split(strings.Trim(strings.TrimSpace(line), "|"), "|")
+		if len(cells) < 4 {
+			t.Fatalf("unexpected artifact row shape: %q", line)
+		}
+		command := strings.Trim(strings.TrimSpace(cells[0]), "`")
+		ratio, err := strconv.ParseFloat(strings.TrimSpace(cells[3]), 64)
+		if err != nil {
+			t.Fatalf("unparsable TOON/JSON ratio %q for %s in row %q", cells[3], command, line)
+		}
+		wins[command] = ratio < 1.0
+		t.Logf("artifact ratio %-24s %.2f win=%v", command, ratio, ratio < 1.0)
+	}
+	if len(wins) == 0 {
+		t.Fatalf("no TOON/JSON ratio rows parsed from tests/artifacts/perf/toon_vs_json.md")
+	}
+	if !wins["--robot-graph"] {
+		t.Fatalf("artifact no longer records --robot-graph as the TOON win; refresh README and this test together")
+	}
+
+	bv := buildBvBinary(t)
+	out, err := exec.Command(bv, "--robot-docs", "all").Output()
+	if err != nil {
+		t.Fatalf("argv=%q exit=%v stdout=%s", []string{bv, "--robot-docs", "all"}, err, out)
+	}
+	var docs struct {
+		Guide struct {
+			OutputModes map[string]string `json:"output_modes"`
+		} `json:"guide"`
+		Examples []struct {
+			Description string `json:"description"`
+			Command     string `json:"command"`
+		} `json:"examples"`
+	}
+	if err := json.Unmarshal(out, &docs); err != nil {
+		t.Fatalf("decode --robot-docs all: %v\nstdout=%s", err, out)
+	}
+	modes := docs.Guide.OutputModes
+	toonBlurb, ok := modes["toon"]
+	if !ok {
+		t.Fatalf("--robot-docs no longer describes the toon output mode; modes=%v", modes)
+	}
+	t.Logf("output_modes.toon = %q", toonBlurb)
+	// An unqualified savings claim is the defect: the blurb has to name the
+	// payload shape that actually wins, not a blanket percentage.
+	if !strings.Contains(toonBlurb, "--robot-graph") {
+		t.Errorf("output_modes.toon must name the payload TOON actually shrinks (--robot-graph), got %q", toonBlurb)
+	}
+	if !strings.Contains(strings.ToLower(toonBlurb), "larger") {
+		t.Errorf("output_modes.toon must state that nested payloads are larger, got %q", toonBlurb)
+	}
+
+	// Any example whose description promises a saving must use a measured win.
+	savingWords := []string{"saves", "saving", "smaller"}
+	commandRe := regexp.MustCompile(`\b(robot-[a-z-]+)\b`)
+	for _, example := range docs.Examples {
+		if !strings.Contains(example.Command, "toon") && !strings.Contains(example.Command, "TOON") {
+			continue
+		}
+		lowerDesc := strings.ToLower(example.Description)
+		promises := false
+		for _, word := range savingWords {
+			if strings.Contains(lowerDesc, word) {
+				promises = true
+			}
+		}
+		if !promises {
+			continue
+		}
+		named := commandRe.FindStringSubmatch(example.Command)
+		if named == nil {
+			t.Errorf("TOON saving example names no robot command: %+v", example)
+			continue
+		}
+		flag := "--" + named[1]
+		if !wins[flag] {
+			t.Errorf("example %q promises a TOON saving but %s is measured at ratio >= 1 in toon_vs_json.md", example.Command, flag)
+			continue
+		}
+		t.Logf("saving example %q -> %s (measured win)", example.Command, flag)
+	}
+}
+
+// TestDocsParity_ToonFallbackDeclaresJSONOutputFormat (bv-apal.3): TOON
+// encoding shells out to the `tru` binary. When no encoder is discoverable the
+// payload falls back to JSON, and the envelope's own output_format field must
+// say so rather than claiming "toon" over JSON bytes.
+func TestDocsParity_ToonFallbackDeclaresJSONOutputFormat(t *testing.T) {
+	dir := t.TempDir()
+	writeIssuesJSONL(t, dir, "{\"id\":\"toon-1\",\"title\":\"Fallback fixture\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2}\n")
+	bv := buildBvBinary(t)
+
+	cmd := exec.Command(bv, "--robot-next", "--format", "toon")
+	cmd.Dir = dir
+	// Strip PATH and every TOON discovery override so production discovery
+	// (TOON_TRU_BIN, TOON_BIN, PATH lookup, well-known paths) finds nothing.
+	cmd.Env = []string{"HOME=" + filepath.Join(dir, "nonexistent"), "PATH=", "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "TOON_STATS=1"}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("argv=%q exit=%v stderr=%s stdout=%s", cmd.Args, err, stderr.String(), out)
+	}
+	if !json.Valid(out) {
+		t.Fatalf("expected the JSON fallback with no encoder present, got:\n%s\nstderr=%s", out, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "falling back to JSON") {
+		t.Errorf("expected the fallback warning on stderr, got %q", stderr.String())
+	}
+	var envelope struct {
+		OutputFormat string `json:"output_format"`
+	}
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		t.Fatalf("decode fallback payload: %v\nstdout=%s", err, out)
+	}
+	if envelope.OutputFormat != "json" {
+		t.Fatalf("fallback payload declares output_format=%q but the bytes are JSON; agents keying on the envelope are misled", envelope.OutputFormat)
+	}
+	t.Logf("argv=%q output_format=%q stderr=%q", cmd.Args, envelope.OutputFormat, strings.TrimSpace(stderr.String()))
+}
+
+// TestDocsParity_RobotSchemaTypesMatchRuntime (bv-apal.3): README points agents
+// at `bv --robot-schema` as "the complete contract", so a declared JSON type
+// that disagrees with what the command actually emits is a lie in the contract
+// an agent is told to trust. For each command exercised here, every schema
+// property that the real payload also carries must agree on array vs object vs
+// string vs number. The insights Cores/Slack properties were declared "object"
+// while the command emits arrays; that state fails this test.
+func TestDocsParity_RobotSchemaTypesMatchRuntime(t *testing.T) {
+	dir := t.TempDir()
+	var fixture strings.Builder
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&fixture, "{\"id\":\"sch-%03d\",\"title\":\"Issue %d\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2}\n", i, i)
+	}
+	// A couple of dependencies so cycle/critical-path style fields are populated.
+	fmt.Fprintf(&fixture, "{\"id\":\"sch-dep\",\"title\":\"Dependent\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":1,\"dependencies\":[{\"id\":\"sch-000\",\"type\":\"blocks\"}]}\n")
+	writeIssuesJSONL(t, dir, fixture.String())
+	bv := buildBvBinary(t)
+
+	run := func(args ...string) []byte {
+		t.Helper()
+		cmd := exec.Command(bv, args...)
+		cmd.Dir = dir
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("argv=%q exit=%v stderr=%s", cmd.Args, err, stderr.String())
+		}
+		return out
+	}
+
+	// A property's "type" is either a string or, for nullable fields, a list
+	// such as ["string","null"]. Accept both and treat a list as a set of
+	// permitted kinds.
+	var schema struct {
+		Commands map[string]struct {
+			Properties map[string]struct {
+				Type json.RawMessage `json:"type"`
+			} `json:"properties"`
+		} `json:"commands"`
+	}
+	permittedKinds := func(raw json.RawMessage) []string {
+		if len(raw) == 0 {
+			return nil
+		}
+		var single string
+		if err := json.Unmarshal(raw, &single); err == nil {
+			return []string{single}
+		}
+		var many []string
+		if err := json.Unmarshal(raw, &many); err == nil {
+			return many
+		}
+		return nil
+	}
+	if err := json.Unmarshal(run("--robot-schema"), &schema); err != nil {
+		t.Fatalf("decode --robot-schema: %v", err)
+	}
+	if len(schema.Commands) == 0 {
+		t.Fatal("--robot-schema declared no commands")
+	}
+
+	// jsonKind reports the JSON Schema type name for a decoded value.
+	jsonKind := func(v any) string {
+		switch v.(type) {
+		case []any:
+			return "array"
+		case map[string]any:
+			return "object"
+		case string:
+			return "string"
+		case float64, json.Number:
+			return "number"
+		case bool:
+			return "boolean"
+		case nil:
+			return "null"
+		}
+		return "unknown"
+	}
+
+	// Commands whose payload this fixture reliably populates.
+	for _, command := range []string{"robot-insights", "robot-plan", "robot-triage", "robot-alerts", "robot-graph"} {
+		declared, ok := schema.Commands[command]
+		if !ok {
+			t.Errorf("--robot-schema declares no entry for %s", command)
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(run("--"+command), &payload); err != nil {
+			t.Fatalf("decode --%s: %v", command, err)
+		}
+		checked := 0
+		for name, spec := range declared.Properties {
+			kinds := permittedKinds(spec.Type)
+			if len(kinds) == 0 {
+				continue
+			}
+			value, present := payload[name]
+			if !present {
+				// Optional/omitempty fields are not evidence of drift.
+				continue
+			}
+			actual := jsonKind(value)
+			// null means the runtime omitted a value rather than
+			// contradicting the declared type.
+			if actual == "null" {
+				continue
+			}
+			checked++
+			allowed := false
+			for _, kind := range kinds {
+				if kind == actual || (kind == "integer" && actual == "number") {
+					allowed = true
+				}
+			}
+			if !allowed {
+				t.Errorf("--%s: schema declares %q as %v but the command emits %q", command, name, kinds, actual)
+			}
+		}
+		if checked == 0 {
+			t.Errorf("--%s: no declared property was present in the real payload; the fixture or the schema entry is wrong", command)
+		}
+		t.Logf("--%s: %d declared properties checked against real output", command, checked)
+	}
+}
+
+// TestDocsParity_RobotWallProseMatchesArtifact (bv-apal.3 / bv-q0po): the
+// README's startup paragraph cites tests/artifacts/perf/robot_wall.json for
+// per-command wall times. That prose previously claimed a warm/cold split and
+// a `bv --version` figure the artifact does not contain. Rather than police
+// wording, this pins the numbers: every fact the paragraph states about the
+// artifact must be derivable from the artifact itself.
+func TestDocsParity_RobotWallProseMatchesArtifact(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "tests", "artifacts", "perf", "robot_wall.json"))
+	if err != nil {
+		t.Fatalf("read robot_wall.json: %v", err)
+	}
+	var artifact struct {
+		Go       string `json:"go"`
+		Commands []struct {
+			Command string `json:"command"`
+			MS      int    `json:"ms"`
+		} `json:"commands"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("decode robot_wall.json: %v", err)
+	}
+	if len(artifact.Commands) == 0 {
+		t.Fatal("robot_wall.json records no commands")
+	}
+
+	byCommand := map[string]int{}
+	minMS, maxMS := artifact.Commands[0].MS, artifact.Commands[0].MS
+	for _, entry := range artifact.Commands {
+		byCommand[entry.Command] = entry.MS
+		if entry.MS < minMS {
+			minMS = entry.MS
+		}
+		if entry.MS > maxMS {
+			maxMS = entry.MS
+		}
+	}
+
+	readme := repoFile(t, "README.md")
+	var paragraph string
+	for _, line := range strings.Split(readme, "\n") {
+		if strings.Contains(line, "robot_wall.json") {
+			paragraph = line
+			break
+		}
+	}
+	if paragraph == "" {
+		t.Fatal("README no longer cites tests/artifacts/perf/robot_wall.json")
+	}
+
+	// The artifact is a single pass per command. Prose must not claim a
+	// warm/cold characterisation the artifact cannot support.
+	for _, forbidden := range []string{"with warm caches", "first cold run"} {
+		if strings.Contains(paragraph, forbidden) {
+			t.Errorf("README claims %q but robot_wall.json records one run per command with no warm/cold split", forbidden)
+		}
+	}
+	// The artifact does not time `bv --version`.
+	if _, timed := byCommand["--version"]; !timed && regexp.MustCompile(`ms for \x60bv --version\x60`).MatchString(paragraph) {
+		t.Error("README gives a bv --version wall time, but robot_wall.json does not time it")
+	}
+
+	// The artifact writes "go1.25.5"; prose reads better as "Go 1.25.5", so
+	// compare on the version number rather than the exact token.
+	mustContain := map[string]string{
+		"the artifact's Go version": strings.TrimPrefix(artifact.Go, "go"),
+		"the command count":         fmt.Sprintf("%d commands", len(artifact.Commands)),
+		"the observed span":         fmt.Sprintf("%d-%d ms", minMS, maxMS),
+	}
+	for _, command := range []string{"--robot-next", "--robot-insights", "--robot-triage"} {
+		ms, ok := byCommand[command]
+		if !ok {
+			continue
+		}
+		mustContain[command+" timing"] = fmt.Sprintf("`%s` at %d ms", command, ms)
+	}
+	for what, want := range mustContain {
+		if !strings.Contains(paragraph, want) {
+			t.Errorf("README startup paragraph does not state %s (%q) as recorded in robot_wall.json", what, want)
+		}
+	}
+	t.Logf("artifact: go=%s commands=%d span=%d-%d ms", artifact.Go, len(artifact.Commands), minMS, maxMS)
+}
