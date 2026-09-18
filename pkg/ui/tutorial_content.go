@@ -350,8 +350,8 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Spacer{Lines: 1},
 				Section{Title: "Searching"},
 				KeyTable{Bindings: []KeyHint{
-					{Key: "/", Desc: "Fuzzy search (fast, typo-tolerant)"},
-					{Key: "Ctrl+S", Desc: "Semantic search (vector index)"},
+					{Key: "/", Desc: "Fuzzy search (fast subsequence match)"},
+					{Key: "Ctrl+S", Desc: "Semantic search (shared-word vector index)"},
 					{Key: "H", Desc: "Hybrid ranking (semantic)"},
 					{Key: "Alt+H", Desc: "Cycle hybrid preset"},
 					{Key: "n / N", Desc: "Next / prev result"},
