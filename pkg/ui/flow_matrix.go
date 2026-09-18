@@ -42,7 +42,6 @@ type labelFlowStats struct {
 	IncomingLabels  []string // Labels that block this
 	BottleneckScore float64  // Normalized blocking power
 	IsBottleneck    bool     // In top bottlenecks
-	OnCriticalPath  bool
 }
 
 // NewFlowMatrixModel creates a new flow matrix dashboard
