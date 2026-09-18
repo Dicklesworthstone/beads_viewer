@@ -2033,6 +2033,13 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Invalid --format %q (expected json|toon)\n", robotOutputFormat)
 			os.Exit(2)
 		}
+		// TOON encoding shells out to the `tru` binary. Downgrade here rather than
+		// inside the encoder so the payload's own output_format field does not
+		// claim "toon" while the bytes on stdout are JSON.
+		if robotOutputFormat == "toon" && !toon.Available() {
+			fmt.Fprintln(os.Stderr, "warning: tru not available; falling back to JSON")
+			robotOutputFormat = "json"
+		}
 
 		// --robot-help lists every registered command from these registries.
 		robotHelpRegistries = []*RobotRegistry{&phaseOneRobotRegistry, &phaseTwoRobotRegistry, &phaseThreeRobotRegistry}
@@ -7547,7 +7554,9 @@ func newJSONRobotEncoder(w io.Writer) *json.Encoder {
 // newRobotEncoder creates an encoder for robot mode output.
 //
 // Default output is JSON. Use `--format toon` (or BV_OUTPUT_FORMAT/TOON_DEFAULT_FORMAT)
-// to emit TOON for agent-friendly token savings.
+// to emit TOON. TOON is not uniformly smaller: tests/artifacts/perf/toon_vs_json.md
+// measures it ~7% smaller than JSON for the wide --robot-graph payload and 9-15%
+// larger for nested ones, so callers should check --stats for their own payload.
 func newRobotEncoder(w io.Writer) robotEncoder {
 	if robotOutputFormat == "toon" {
 		return &toonRobotEncoder{w: w}
@@ -8156,7 +8165,7 @@ func generateRobotDocs(topic string) map[string]interface{} {
 		"data_source": ".beads/beads.jsonl, .beads/issues.jsonl, or BEADS_DB plus git history (correlations)",
 		"output_modes": map[string]string{
 			"json": "Default structured output",
-			"toon": "Token-optimized notation (saves ~30-50% tokens)",
+			"toon": "Tabular notation; measured smaller than JSON only for wide payloads such as --robot-graph (~7%), and 9-15% larger for nested ones (--robot-triage, --robot-plan, --robot-insights, --robot-label-health). See tests/artifacts/perf/toon_vs_json.md and check --stats before adopting it.",
 		},
 		"agent_intent_aliases": agentIntentAliasDocs(),
 	}
@@ -8171,9 +8180,9 @@ func generateRobotDocs(topic string) map[string]interface{} {
 		{"description": "Multi-agent: top pick per parallel track", "command": "bv robot-triage-by-track --json | jq '.triage.recommendations_by_track[].top_pick'"},
 		{"description": "Find beads related to a specific file", "command": "bv robot-file-beads README.md --json"},
 		{"description": "Search for issues by keyword", "command": `bv robot-search "authentication" --json`},
-		{"description": "Get TOON output (saves tokens)", "command": "bv robot-triage --toon"},
+		{"description": "Get TOON output for a wide payload (measured ~7% smaller than JSON)", "command": "bv robot-graph --toon"},
 		{"description": "Use env for default format", "command": "BV_OUTPUT_FORMAT=toon bv robot-triage"},
-		{"description": "Show token savings estimate", "command": "TOON_STATS=1 bv robot-triage --toon"},
+		{"description": "Compare JSON and TOON size for this payload (TOON can be larger)", "command": "TOON_STATS=1 bv robot-triage --toon"},
 	}
 
 	envVars := robotEnvVars()
@@ -8469,9 +8478,9 @@ func generateRobotSchemas() RobotSchemas {
 				"Hubs":              map[string]interface{}{"type": "array"},
 				"Authorities":       map[string]interface{}{"type": "array"},
 				"Orphans":           map[string]interface{}{"type": "array"},
-				"Cores":             map[string]interface{}{"type": "object"},
+				"Cores":             map[string]interface{}{"type": "array"},
 				"Articulation":      map[string]interface{}{"type": "array"},
-				"Slack":             map[string]interface{}{"type": "object"},
+				"Slack":             map[string]interface{}{"type": "array"},
 				"Velocity":          map[string]interface{}{"type": "object"},
 				"status":            map[string]interface{}{"type": "object"},
 				"advanced_insights": map[string]interface{}{"type": "object"},

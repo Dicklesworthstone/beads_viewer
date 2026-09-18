@@ -908,6 +908,9 @@ bv --robot-next          # Minimal: just the single top pick + claim command
 # repository it is 7% smaller than JSON for --robot-graph but 9-15% LARGER for
 # nested payloads (--robot-triage, --robot-plan, --robot-insights,
 # --robot-label-health); use --stats to see both sizes before adopting it.
+# TOON encoding shells out to the tru binary. With no encoder installed,
+# --format toon prints a fallback warning, emits JSON with output_format "json",
+# and --stats prints no sizes at all.
 bv --robot-graph --format toon
 bv --robot-triage --format toon --stats
 ```

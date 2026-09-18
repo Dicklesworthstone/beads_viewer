@@ -1555,8 +1555,8 @@ Quickly narrow down what you see:
 
 | Key | Search Type |
 |-----|-------------|
-| **/** | Fuzzy search (fast, typo-tolerant) |
-| **Ctrl+S** | Semantic search (meaning-based) |
+| **/** | Fuzzy search (fast subsequence match) |
+| **Ctrl+S** | Semantic search (shared-word vector index) |
 | **H** | Hybrid ranking (semantic + graph) |
 | **Alt+H** | Cycle hybrid preset |
 | **n/N** | Next/previous search result |
@@ -1832,8 +1832,8 @@ impact in the dependency graph.
 
 | Mode | Key | What it does |
 |------|-----|-------------|
-| Fuzzy | **/** | Literal text match (fast) |
-| Semantic | **Ctrl+S** | Meaning-based retrieval |
+| Fuzzy | **/** | Subsequence match over the visible row text (fast) |
+| Semantic | **Ctrl+S** | Hashed keyword-feature retrieval |
 | Hybrid | **H** | Semantic + graph-aware ranking |
 | Preset | **Alt+H** | Cycle hybrid presets |
 
@@ -1850,8 +1850,10 @@ impact in the dependency graph.
 
 Searching for "permissions":
 
-- **Fuzzy** finds issues containing the word permissions
-- **Semantic** finds access control, roles, authorization, ACLs
+- **Fuzzy** finds rows whose text contains p-e-r-m-i-s-s-i-o-n-s in order
+- **Semantic** scores by shared words, so it also reaches issues that repeat
+  "permissions" in the description or labels — it is hashed keyword features,
+  not a learned model, so it will not reach "ACLs" or "roles" on meaning alone
 - **Hybrid** floats the items that block other work
 
 ### When to Use It

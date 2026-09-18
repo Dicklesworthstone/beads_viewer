@@ -569,6 +569,12 @@ func performanceCLIExactBehavior(output []byte) ([]byte, error) {
 		return nil, fmt.Errorf("exact-result cohort did not preserve fixed clock: envelope=%v triage=%v", envelope["generated_at"], meta["generated_at"])
 	}
 	delete(meta, "compute_time_ms")
+	// The envelope's version is the ldflags build label, not a result. A paired
+	// cohort compares two deliberately different revisions, so retaining it
+	// would report every pair as a mismatch on the one field that is required
+	// to differ. The two binaries' distinct identities are asserted separately
+	// and recorded under "binaries" in each cohort's result.json.
+	delete(envelope, "version")
 	status := triage["status"].(map[string]any) // validated by performanceCLIBehavior
 	for _, name := range []string{"PageRank", "Betweenness", "Eigenvector", "HITS", "Critical", "Cycles", "KCore", "Articulation", "Slack"} {
 		delete(status[name].(map[string]any), "ms")
@@ -590,7 +596,7 @@ func TestPerformanceCLIExactParityControls(t *testing.T) {
 	if err != nil || !bytes.Equal(behavior, baseline) {
 		t.Fatalf("actual fixed-clock cold/warm complete results differ: %v\ncold: %s\nwarm: %s", err, baseline, behavior)
 	}
-	for _, mutation := range []string{"elapsed-only", "score-ulp", "component-ulp", "reordered-ids", "skipped-metric", "missing-metric", "source-authority", "generated-at", "unknown-ms-field"} {
+	for _, mutation := range []string{"elapsed-only", "build-version-only", "build-version-and-score", "score-ulp", "component-ulp", "reordered-ids", "skipped-metric", "missing-metric", "source-authority", "generated-at", "unknown-ms-field"} {
 		t.Run(mutation, func(t *testing.T) {
 			decoder := json.NewDecoder(bytes.NewReader(output))
 			decoder.UseNumber()
@@ -608,6 +614,17 @@ func TestPerformanceCLIExactParityControls(t *testing.T) {
 			case "elapsed-only":
 				triage["meta"].(map[string]any)["compute_time_ms"] = json.Number("987654321")
 				status["PageRank"].(map[string]any)["ms"] = json.Number("123456789.5")
+			case "build-version-only":
+				envelope["version"] = "v0.0.0-p1.20260910"
+			case "build-version-and-score":
+				// Excluding the build label must not give cover to a real
+				// difference that travels with it.
+				envelope["version"] = "v0.0.0-p1.20260910"
+				number, err := rows[0].(map[string]any)["score"].(json.Number).Float64()
+				if err != nil {
+					t.Fatal(err)
+				}
+				rows[0].(map[string]any)["score"] = json.Number(strconv.FormatFloat(math.Nextafter(number, math.Inf(1)), 'g', -1, 64))
 			case "score-ulp", "component-ulp":
 				row, field := rows[0].(map[string]any), "score"
 				if mutation == "component-ulp" {
@@ -636,9 +653,9 @@ func TestPerformanceCLIExactParityControls(t *testing.T) {
 				t.Fatal(err)
 			}
 			behavior, err := performanceCLIExactBehavior(changed)
-			if mutation == "elapsed-only" {
+			if mutation == "elapsed-only" || mutation == "build-version-only" {
 				if err != nil || !bytes.Equal(behavior, baseline) {
-					t.Fatalf("declared duration-only change altered exact parity: %v", err)
+					t.Fatalf("declared %s change altered exact parity: %v", mutation, err)
 				}
 			} else if err == nil && bytes.Equal(behavior, baseline) {
 				t.Fatalf("%s escaped complete-result comparison", mutation)
@@ -768,7 +785,7 @@ func TestPerformanceCLIExactCohorts(t *testing.T) {
 							"mode": mode, "seed": 20260904, "fixture_sha256": fixtureHash,
 							"host": host, "gomaxprocs": runtime.GOMAXPROCS(0), "binaries": identities,
 							"reference_epoch": performanceCLIReferenceEpoch, "outputs": outputs, "parity_mismatches": mismatches,
-							"interpretation": "complete fixed-clock JSON parity excluding named elapsed fields only; no latency credit"}
+							"interpretation": "complete fixed-clock JSON parity excluding named elapsed fields and the ldflags build version label only; no latency credit"}
 						data, err := json.MarshalIndent(record, "", "  ")
 						if err != nil {
 							t.Fatal(err)

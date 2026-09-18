@@ -78,6 +78,27 @@ the latest tag, including installer changes usable with already released binarie
   including lifecycle duration units. Overall documentation qualification still
   depends on the open performance and native-platform work
   ([guidance corrections](https://github.com/Dicklesworthstone/beads_viewer/commit/c2093e57)).
+- `--robot-docs` no longer tells agents that TOON "saves ~30-50% tokens" and no
+  longer offers `bv robot-triage --toon` as the token-saving example. The
+  measured artifact records TOON at 0.93x JSON for `--robot-graph` and 1.09x to
+  1.15x for the nested payloads, and the guidance now says so and points at
+  `--stats`. When no `tru` encoder is discoverable, `--format toon` also stops
+  declaring `output_format: "toon"` over JSON bytes; the envelope now reports
+  `json`, matching the fallback warning already printed on stderr. The
+  `--robot-schema` entry for `Cores` and `Slack` is corrected from `object` to
+  `array`, which is what `--robot-insights` emits.
+- A full README and root `SKILL.md` audit against the current code corrected the
+  fuzzy-filter field set, the HTML export's search fields and its 2-character /
+  8-result limits, the board age band at exactly 30 days, the untyped dependency
+  as a blocking type, the informational status of `related` and
+  `discovered-from`, the correlation feedback stats fields and the unwritable
+  `ignore` decision, the Cass session modal mock and its relative timestamps,
+  the eight-hour workday used by `--robot-capacity` and `--robot-forecast`
+  summary days, the hybrid-only candidate widening, the impossible `"ms": 0` on a
+  skipped metric, the `--robot-diff` cycle field names, the `--robot-recipes`
+  example descriptions, and `SKILL.md`'s claim that `.status` is top-level on
+  `--robot-triage`. The in-app tutorial no longer advertises fuzzy search as
+  typo-tolerant or the hashed-keyword embedder as meaning-based.
 
 ### Duplicate detection and rendering
 

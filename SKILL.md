@@ -54,7 +54,7 @@ BV uses async computation with timeouts:
 - **Phase 1 (instant):** degree, topo sort, density
 - **Phase 2:** PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core, articulation points and slack. `ConfigForSize` selects per-metric budgets and size/density skips; this is not one 500 ms end-to-end deadline.
 
-Check the capitalized metric keys in `.status`, such as `.status.Betweenness`. Normal states are `pending`, `computed`, `timeout` or `skipped`; sampled betweenness reports `computed` with `reason: "approximate"`. Treat an error or unknown state as unavailable. Cycle detection stores one representative per cyclic component, subject to limits, rather than every simple cycle.
+Check the capitalized metric keys in the metric-status object, such as `.status.Betweenness`. That object is top-level for `--robot-insights`, `--robot-plan`, `--robot-priority` and `--robot-next`, but `--robot-triage` carries it at `.triage.status` and `--robot-triage --brief` omits it entirely. Normal states are `pending`, `computed`, `timeout` or `skipped`; sampled betweenness reports `computed` with `reason: "approximate"`. Treat an error or unknown state as unavailable. Cycle detection stores one representative per cyclic component, subject to limits, rather than every simple cycle.
 
 ## Robot Commands Reference
 
@@ -107,20 +107,27 @@ bv --robot-triage --robot-triage-by-label    # Group by domain
 
 ## Built-in Recipes
 
+Purposes below are the built-in recipe descriptions `bv --robot-recipes` reports.
+"No blockers" is shorthand for the full readiness rule stated above: open or in
+progress, deferral elapsed, and direct plus inherited parent gates satisfied.
+
 | Recipe | Purpose |
 |--------|---------|
-| `default` | All open issues sorted by priority |
-| `actionable` | Ready to work (no blockers) |
-| `high-impact` | Top PageRank scores |
-| `blocked` | Waiting on dependencies |
-| `stale` | Open but untouched for 30+ days |
-| `triage` | Sorted by computed triage score |
-| `quick-wins` | Easy P2/P3 items with no blockers |
-| `bottlenecks` | High betweenness nodes |
+| `default` | Default view showing all open issues sorted by priority |
+| `actionable` | Issues ready to work on (no open blockers) |
+| `recent` | Issues updated in the last 7 days |
+| `blocked` | Issues waiting on dependencies |
+| `high-impact` | Issues with highest blocking impact (PageRank) |
+| `stale` | Open issues not updated in 30+ days |
+| `triage` | Issues sorted by computed triage score (high impact + unblocking potential) |
+| `closed` | Recently closed issues |
+| `release-cut` | Recently closed items for changelog generation |
+| `quick-wins` | Easy items with no blockers - good for quick progress |
+| `bottlenecks` | High betweenness nodes - potential project bottlenecks |
 
 ## Robot Output Structure
 
-Issue-backed responses include `data_hash`, `source_authority`, `authority_hash` and `scope_hash`. Use these alongside the reference clock and effective configuration. Metric-bearing commands include `.status`; graph export and metadata commands such as capabilities have their own schemas. Use `bv --robot-schema` for command-specific contracts. Historical issue analysis includes `as_of` / `as_of_commit`.
+Issue-backed responses include `data_hash`, `source_authority`, `authority_hash` and `scope_hash`. Use these alongside the reference clock and effective configuration. `--robot-insights`, `--robot-plan`, `--robot-priority` and `--robot-next` include a top-level `.status`; `--robot-triage` puts the same object at `.triage.status` and emits no `analysis_config`; graph export and metadata commands such as capabilities have their own schemas. Use `bv --robot-schema` for command-specific contracts. Historical issue analysis includes `as_of` / `as_of_commit`.
 
 Partial or unknown authority permits exploratory results but withholds proven picks and claim commands. A computationally ready issue must be open or in progress, have no future deferral, and have satisfied direct and inherited parent dependency gates. Closed/tombstoned predecessors satisfy gates; missing records do not. Candidate filters stay separate from this full-source dependency context.
 
@@ -260,13 +267,13 @@ bv --robot-diff --diff-since HEAD~30  # Changes in last 30 commits
 | Issue | Fix |
 |-------|-----|
 | TUI blocks agent | Use `--robot-*` flags only |
-| Stale metrics | Compare data/configuration hashes, reference clock and `.status` |
-| Missing cycles | Check `.status.Cycles` and `.Cycles`; skips/timeouts do not prove acyclicity |
+| Stale metrics | Compare data/configuration hashes, reference clock and `.status` (`.triage.status` for `--robot-triage`) |
+| Missing cycles | Check `.status.Cycles` and `.Cycles` on `--robot-insights`; skips/timeouts do not prove acyclicity |
 | Need a claimable pick | Use `--robot-next`; inspect authority and typed action availability |
 
 ## Performance Notes
 
 - Phase 1 metrics (degree, topo, density): instant
-- Phase 2 uses per-metric size/density budgets; see `.analysis_config` and `.status`
+- Phase 2 uses per-metric size/density budgets; see `.analysis_config` and `.status` on `--robot-insights`, `--robot-plan` or `--robot-priority` (`--robot-triage` has neither at top level)
 - Graph-stat caches use both data and analysis-configuration hashes; readiness and rankings also depend on scope and the reference clock
 - Prefer `--robot-plan` over `--robot-insights` when speed matters
