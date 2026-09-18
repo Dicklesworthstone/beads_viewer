@@ -1057,3 +1057,86 @@ func TestDocsParity_RobotSchemaTypesMatchRuntime(t *testing.T) {
 		t.Logf("--%s: %d declared properties checked against real output", command, checked)
 	}
 }
+
+// TestDocsParity_RobotWallProseMatchesArtifact (bv-apal.3 / bv-q0po): the
+// README's startup paragraph cites tests/artifacts/perf/robot_wall.json for
+// per-command wall times. That prose previously claimed a warm/cold split and
+// a `bv --version` figure the artifact does not contain. Rather than police
+// wording, this pins the numbers: every fact the paragraph states about the
+// artifact must be derivable from the artifact itself.
+func TestDocsParity_RobotWallProseMatchesArtifact(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "tests", "artifacts", "perf", "robot_wall.json"))
+	if err != nil {
+		t.Fatalf("read robot_wall.json: %v", err)
+	}
+	var artifact struct {
+		Go       string `json:"go"`
+		Commands []struct {
+			Command string `json:"command"`
+			MS      int    `json:"ms"`
+		} `json:"commands"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("decode robot_wall.json: %v", err)
+	}
+	if len(artifact.Commands) == 0 {
+		t.Fatal("robot_wall.json records no commands")
+	}
+
+	byCommand := map[string]int{}
+	minMS, maxMS := artifact.Commands[0].MS, artifact.Commands[0].MS
+	for _, entry := range artifact.Commands {
+		byCommand[entry.Command] = entry.MS
+		if entry.MS < minMS {
+			minMS = entry.MS
+		}
+		if entry.MS > maxMS {
+			maxMS = entry.MS
+		}
+	}
+
+	readme := repoFile(t, "README.md")
+	var paragraph string
+	for _, line := range strings.Split(readme, "\n") {
+		if strings.Contains(line, "robot_wall.json") {
+			paragraph = line
+			break
+		}
+	}
+	if paragraph == "" {
+		t.Fatal("README no longer cites tests/artifacts/perf/robot_wall.json")
+	}
+
+	// The artifact is a single pass per command. Prose must not claim a
+	// warm/cold characterisation the artifact cannot support.
+	for _, forbidden := range []string{"with warm caches", "first cold run"} {
+		if strings.Contains(paragraph, forbidden) {
+			t.Errorf("README claims %q but robot_wall.json records one run per command with no warm/cold split", forbidden)
+		}
+	}
+	// The artifact does not time `bv --version`.
+	if _, timed := byCommand["--version"]; !timed && regexp.MustCompile(`ms for \x60bv --version\x60`).MatchString(paragraph) {
+		t.Error("README gives a bv --version wall time, but robot_wall.json does not time it")
+	}
+
+	// The artifact writes "go1.25.5"; prose reads better as "Go 1.25.5", so
+	// compare on the version number rather than the exact token.
+	mustContain := map[string]string{
+		"the artifact's Go version": strings.TrimPrefix(artifact.Go, "go"),
+		"the command count":         fmt.Sprintf("%d commands", len(artifact.Commands)),
+		"the observed span":         fmt.Sprintf("%d-%d ms", minMS, maxMS),
+	}
+	for _, command := range []string{"--robot-next", "--robot-insights", "--robot-triage"} {
+		ms, ok := byCommand[command]
+		if !ok {
+			continue
+		}
+		mustContain[command+" timing"] = fmt.Sprintf("`%s` at %d ms", command, ms)
+	}
+	for what, want := range mustContain {
+		if !strings.Contains(paragraph, want) {
+			t.Errorf("README startup paragraph does not state %s (%q) as recorded in robot_wall.json", what, want)
+		}
+	}
+	t.Logf("artifact: go=%s commands=%d span=%d-%d ms", artifact.Go, len(artifact.Commands), minMS, maxMS)
+}
