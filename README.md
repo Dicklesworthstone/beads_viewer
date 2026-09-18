@@ -92,6 +92,8 @@ For a source build, use `install.ps1` from this checkout (requires Git and Go 1.
 
 This source path builds a verified checkout of the requested tag with that tag's vendored dependencies, checks the executable's version and Git revision before installation, and retains diagnostics on failure. The pinned installer above uses the same verified source-build path. Selecting an older release tag does not include later, unreleased fixes from this checkout.
 
+Vendoring covers the Go module dependencies, not the compiler. When your Go differs from the `toolchain` directive in that tag's `go.mod`, Go downloads the pinned toolchain before compiling, so the source build needs network access even though the dependencies are vendored, and on a slow machine that download alone can take several minutes. The installer's progress line reports the Go it was launched with, not the toolchain it ends up building with; `go version -m` on the installed executable reports the one actually used.
+
 ---
 
 ## Generating the JSONL File (`br` and `bd`)
