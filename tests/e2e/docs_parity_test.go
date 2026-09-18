@@ -793,3 +793,140 @@ func TestDocsParity_KeyBindingsDocumented(t *testing.T) {
 		t.Fatalf("%d registered key binding(s) are not documented in README.md:\n%s", len(missing), strings.Join(missing, "\n"))
 	}
 }
+
+// TestDocsParity_ToonAdviceMatchesMeasuredSizes (bv-apal.3): the binary's own
+// agent-facing docs must not sell TOON as a uniform token saving. TOON is
+// measured smaller than JSON only for the wide --robot-graph payload and
+// 9-15% larger for the nested ones (tests/artifacts/perf/toon_vs_json.md), so
+// any --robot-docs example that advertises a saving has to name a payload the
+// artifact records as a win. The old text ("saves ~30-50% tokens", with
+// `bv robot-triage --toon` as the saving example) fails this test.
+func TestDocsParity_ToonAdviceMatchesMeasuredSizes(t *testing.T) {
+	artifact := repoFile(t, filepath.Join("tests", "artifacts", "perf", "toon_vs_json.md"))
+	// The artifact table records TOON/JSON ratios per command in the
+	// "TOON / JSON" column. A command is a documented win only when its
+	// recorded ratio is below 1.
+	wins := map[string]bool{}
+	for _, line := range strings.Split(artifact, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "| `--robot-") {
+			continue
+		}
+		cells := strings.Split(strings.Trim(strings.TrimSpace(line), "|"), "|")
+		if len(cells) < 4 {
+			t.Fatalf("unexpected artifact row shape: %q", line)
+		}
+		command := strings.Trim(strings.TrimSpace(cells[0]), "`")
+		ratio, err := strconv.ParseFloat(strings.TrimSpace(cells[3]), 64)
+		if err != nil {
+			t.Fatalf("unparsable TOON/JSON ratio %q for %s in row %q", cells[3], command, line)
+		}
+		wins[command] = ratio < 1.0
+		t.Logf("artifact ratio %-24s %.2f win=%v", command, ratio, ratio < 1.0)
+	}
+	if len(wins) == 0 {
+		t.Fatalf("no TOON/JSON ratio rows parsed from tests/artifacts/perf/toon_vs_json.md")
+	}
+	if !wins["--robot-graph"] {
+		t.Fatalf("artifact no longer records --robot-graph as the TOON win; refresh README and this test together")
+	}
+
+	bv := buildBvBinary(t)
+	out, err := exec.Command(bv, "--robot-docs", "all").Output()
+	if err != nil {
+		t.Fatalf("argv=%q exit=%v stdout=%s", []string{bv, "--robot-docs", "all"}, err, out)
+	}
+	var docs struct {
+		Guide struct {
+			OutputModes map[string]string `json:"output_modes"`
+		} `json:"guide"`
+		Examples []struct {
+			Description string `json:"description"`
+			Command     string `json:"command"`
+		} `json:"examples"`
+	}
+	if err := json.Unmarshal(out, &docs); err != nil {
+		t.Fatalf("decode --robot-docs all: %v\nstdout=%s", err, out)
+	}
+	modes := docs.Guide.OutputModes
+	toonBlurb, ok := modes["toon"]
+	if !ok {
+		t.Fatalf("--robot-docs no longer describes the toon output mode; modes=%v", modes)
+	}
+	t.Logf("output_modes.toon = %q", toonBlurb)
+	// An unqualified savings claim is the defect: the blurb has to name the
+	// payload shape that actually wins, not a blanket percentage.
+	if !strings.Contains(toonBlurb, "--robot-graph") {
+		t.Errorf("output_modes.toon must name the payload TOON actually shrinks (--robot-graph), got %q", toonBlurb)
+	}
+	if !strings.Contains(strings.ToLower(toonBlurb), "larger") {
+		t.Errorf("output_modes.toon must state that nested payloads are larger, got %q", toonBlurb)
+	}
+
+	// Any example whose description promises a saving must use a measured win.
+	savingWords := []string{"saves", "saving", "smaller"}
+	commandRe := regexp.MustCompile(`\b(robot-[a-z-]+)\b`)
+	for _, example := range docs.Examples {
+		if !strings.Contains(example.Command, "toon") && !strings.Contains(example.Command, "TOON") {
+			continue
+		}
+		lowerDesc := strings.ToLower(example.Description)
+		promises := false
+		for _, word := range savingWords {
+			if strings.Contains(lowerDesc, word) {
+				promises = true
+			}
+		}
+		if !promises {
+			continue
+		}
+		named := commandRe.FindStringSubmatch(example.Command)
+		if named == nil {
+			t.Errorf("TOON saving example names no robot command: %+v", example)
+			continue
+		}
+		flag := "--" + named[1]
+		if !wins[flag] {
+			t.Errorf("example %q promises a TOON saving but %s is measured at ratio >= 1 in toon_vs_json.md", example.Command, flag)
+			continue
+		}
+		t.Logf("saving example %q -> %s (measured win)", example.Command, flag)
+	}
+}
+
+// TestDocsParity_ToonFallbackDeclaresJSONOutputFormat (bv-apal.3): TOON
+// encoding shells out to the `tru` binary. When no encoder is discoverable the
+// payload falls back to JSON, and the envelope's own output_format field must
+// say so rather than claiming "toon" over JSON bytes.
+func TestDocsParity_ToonFallbackDeclaresJSONOutputFormat(t *testing.T) {
+	dir := t.TempDir()
+	writeIssuesJSONL(t, dir, "{\"id\":\"toon-1\",\"title\":\"Fallback fixture\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2}\n")
+	bv := buildBvBinary(t)
+
+	cmd := exec.Command(bv, "--robot-next", "--format", "toon")
+	cmd.Dir = dir
+	// Strip PATH and every TOON discovery override so production discovery
+	// (TOON_TRU_BIN, TOON_BIN, PATH lookup, well-known paths) finds nothing.
+	cmd.Env = []string{"HOME=" + filepath.Join(dir, "nonexistent"), "PATH=", "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "TOON_STATS=1"}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("argv=%q exit=%v stderr=%s stdout=%s", cmd.Args, err, stderr.String(), out)
+	}
+	if !json.Valid(out) {
+		t.Fatalf("expected the JSON fallback with no encoder present, got:\n%s\nstderr=%s", out, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "falling back to JSON") {
+		t.Errorf("expected the fallback warning on stderr, got %q", stderr.String())
+	}
+	var envelope struct {
+		OutputFormat string `json:"output_format"`
+	}
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		t.Fatalf("decode fallback payload: %v\nstdout=%s", err, out)
+	}
+	if envelope.OutputFormat != "json" {
+		t.Fatalf("fallback payload declares output_format=%q but the bytes are JSON; agents keying on the envelope are misled", envelope.OutputFormat)
+	}
+	t.Logf("argv=%q output_format=%q stderr=%q", cmd.Args, envelope.OutputFormat, strings.TrimSpace(stderr.String()))
+}
