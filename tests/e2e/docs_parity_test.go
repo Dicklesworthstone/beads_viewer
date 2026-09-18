@@ -930,3 +930,130 @@ func TestDocsParity_ToonFallbackDeclaresJSONOutputFormat(t *testing.T) {
 	}
 	t.Logf("argv=%q output_format=%q stderr=%q", cmd.Args, envelope.OutputFormat, strings.TrimSpace(stderr.String()))
 }
+
+// TestDocsParity_RobotSchemaTypesMatchRuntime (bv-apal.3): README points agents
+// at `bv --robot-schema` as "the complete contract", so a declared JSON type
+// that disagrees with what the command actually emits is a lie in the contract
+// an agent is told to trust. For each command exercised here, every schema
+// property that the real payload also carries must agree on array vs object vs
+// string vs number. The insights Cores/Slack properties were declared "object"
+// while the command emits arrays; that state fails this test.
+func TestDocsParity_RobotSchemaTypesMatchRuntime(t *testing.T) {
+	dir := t.TempDir()
+	var fixture strings.Builder
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&fixture, "{\"id\":\"sch-%03d\",\"title\":\"Issue %d\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2}\n", i, i)
+	}
+	// A couple of dependencies so cycle/critical-path style fields are populated.
+	fmt.Fprintf(&fixture, "{\"id\":\"sch-dep\",\"title\":\"Dependent\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":1,\"dependencies\":[{\"id\":\"sch-000\",\"type\":\"blocks\"}]}\n")
+	writeIssuesJSONL(t, dir, fixture.String())
+	bv := buildBvBinary(t)
+
+	run := func(args ...string) []byte {
+		t.Helper()
+		cmd := exec.Command(bv, args...)
+		cmd.Dir = dir
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("argv=%q exit=%v stderr=%s", cmd.Args, err, stderr.String())
+		}
+		return out
+	}
+
+	// A property's "type" is either a string or, for nullable fields, a list
+	// such as ["string","null"]. Accept both and treat a list as a set of
+	// permitted kinds.
+	var schema struct {
+		Commands map[string]struct {
+			Properties map[string]struct {
+				Type json.RawMessage `json:"type"`
+			} `json:"properties"`
+		} `json:"commands"`
+	}
+	permittedKinds := func(raw json.RawMessage) []string {
+		if len(raw) == 0 {
+			return nil
+		}
+		var single string
+		if err := json.Unmarshal(raw, &single); err == nil {
+			return []string{single}
+		}
+		var many []string
+		if err := json.Unmarshal(raw, &many); err == nil {
+			return many
+		}
+		return nil
+	}
+	if err := json.Unmarshal(run("--robot-schema"), &schema); err != nil {
+		t.Fatalf("decode --robot-schema: %v", err)
+	}
+	if len(schema.Commands) == 0 {
+		t.Fatal("--robot-schema declared no commands")
+	}
+
+	// jsonKind reports the JSON Schema type name for a decoded value.
+	jsonKind := func(v any) string {
+		switch v.(type) {
+		case []any:
+			return "array"
+		case map[string]any:
+			return "object"
+		case string:
+			return "string"
+		case float64, json.Number:
+			return "number"
+		case bool:
+			return "boolean"
+		case nil:
+			return "null"
+		}
+		return "unknown"
+	}
+
+	// Commands whose payload this fixture reliably populates.
+	for _, command := range []string{"robot-insights", "robot-plan", "robot-triage", "robot-alerts", "robot-graph"} {
+		declared, ok := schema.Commands[command]
+		if !ok {
+			t.Errorf("--robot-schema declares no entry for %s", command)
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(run("--"+command), &payload); err != nil {
+			t.Fatalf("decode --%s: %v", command, err)
+		}
+		checked := 0
+		for name, spec := range declared.Properties {
+			kinds := permittedKinds(spec.Type)
+			if len(kinds) == 0 {
+				continue
+			}
+			value, present := payload[name]
+			if !present {
+				// Optional/omitempty fields are not evidence of drift.
+				continue
+			}
+			actual := jsonKind(value)
+			// null means the runtime omitted a value rather than
+			// contradicting the declared type.
+			if actual == "null" {
+				continue
+			}
+			checked++
+			allowed := false
+			for _, kind := range kinds {
+				if kind == actual || (kind == "integer" && actual == "number") {
+					allowed = true
+				}
+			}
+			if !allowed {
+				t.Errorf("--%s: schema declares %q as %v but the command emits %q", command, name, kinds, actual)
+			}
+		}
+		if checked == 0 {
+			t.Errorf("--%s: no declared property was present in the real payload; the fixture or the schema entry is wrong", command)
+		}
+		t.Logf("--%s: %d declared properties checked against real output", command, checked)
+	}
+}
