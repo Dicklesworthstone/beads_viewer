@@ -1152,9 +1152,12 @@ func TestBackgroundWorker_ResetHash(t *testing.T) {
 	}
 	defer worker.Stop()
 
-	// First refresh
+	// First refresh. Wait on the published snapshot version rather than a fixed
+	// sleep: the debounced async build can take longer than any wall-clock guess
+	// under -race or load, which made this test flake in the full package run.
+	startVer := worker.Metrics().SnapshotVersion
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, startVer+1)
 
 	snapshot1 := worker.GetSnapshot()
 	hash1 := worker.LastHash()
@@ -1168,9 +1171,10 @@ func TestBackgroundWorker_ResetHash(t *testing.T) {
 		t.Error("Expected empty hash after reset")
 	}
 
-	// Refresh should rebuild even though content unchanged
+	// Refresh should rebuild even though content unchanged.
+	midVer := worker.Metrics().SnapshotVersion
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, midVer+1)
 
 	snapshot2 := worker.GetSnapshot()
 	hash2 := worker.LastHash()
