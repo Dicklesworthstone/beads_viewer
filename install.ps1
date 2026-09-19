@@ -323,7 +323,7 @@ function Install-FromSource {
     if (-not (Test-GoVersion $goVersion $MIN_GO_VERSION)) { Fail "Go $MIN_GO_VERSION or later is required for -FromSource. Found: go$goVersion" }
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Fail "Git is required for -FromSource to verify the tagged checkout" }
     if ($Tag -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') { Fail "Source version '$Tag' is not a release tag" }
-    Write-Info "Building $BIN_NAME $Tag from its vendored source with Go $goVersion"
+    Write-Info "Launching the $BIN_NAME $Tag source build with Go $goVersion (the module's toolchain directive may select another)"
     $work = Join-Path ([System.IO.Path]::GetTempPath()) ("bv-build-" + [System.IO.Path]::GetRandomFileName())
     New-Item -ItemType Directory -Path $work | Out-Null
     Write-Info "Preparing source build at $work"
@@ -392,6 +392,11 @@ function Install-FromSource {
             -not ($buildInfo -match '^\s*build\s+vcs.modified=false$')) {
             Fail 'Built executable does not identify the clean resolved source; existing installation was not changed'
         }
+        # Report the toolchain the build actually used. `go version -m` prints
+        # "<binary>: go1.x.y" on its first line; the module's toolchain directive
+        # can make that differ from the launcher Go named above.
+        $builtGo = if ($buildInfo.Count -gt 0 -and $buildInfo[0] -match '\bgo\d+\.\d+(?:\.\d+)?\b') { $Matches[0] } else { $null }
+        if ($builtGo) { Write-Info "Built with $builtGo" }
         Write-Info "Built executable SHA256=$((Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant())"
         New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
         $destination = Join-Path $TargetDir "$BIN_NAME.exe"

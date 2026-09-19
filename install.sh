@@ -571,7 +571,7 @@ try_go_install() {
         exit 1
     fi
 
-    print_info "Using Go $go_version"
+    print_info "Using Go $go_version to launch the build (the module's toolchain directive may select another)"
 
     local tmp_dir src_dir repo_url tarball_url tarball_path build_output fetched=0
     tmp_dir=$(make_tmp_dir)
@@ -608,6 +608,14 @@ try_go_install() {
     if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 go build -o "$build_output" "./cmd/$BIN_NAME"); then
         print_error "Go build failed."
         exit 1
+    fi
+
+    # Report the toolchain the build actually used, which the module's `toolchain`
+    # directive can make differ from the launcher's Go reported above.
+    local built_go
+    built_go=$(go version -m "$build_output" 2>/dev/null | awk 'NR==1{print $2}')
+    if [ -n "$built_go" ]; then
+        print_info "Built with $built_go"
     fi
 
     ensure_install_dir "$INSTALL_DIR"

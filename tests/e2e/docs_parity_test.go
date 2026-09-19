@@ -1140,3 +1140,38 @@ func TestDocsParity_RobotWallProseMatchesArtifact(t *testing.T) {
 	}
 	t.Logf("artifact: go=%s commands=%d span=%d-%d ms", artifact.Go, len(artifact.Commands), minMS, maxMS)
 }
+
+// TestDocsParity_InstallersReportBuiltToolchain (bv-y3m9): both installers built
+// the source with the module's `toolchain` directive (go1.26.8 for v0.25.0)
+// while printing the launcher's Go version, so a user on go1.26.5 was told the
+// build used 1.26.5. The source-build path cannot run inside `go test` (it needs
+// a full network build and, on Windows, a live console), so this is a structural
+// guard on the behaviour-defining lines: each installer must derive a reported
+// build toolchain from `go version -m` on the built binary, and must not present
+// the launcher version as the build compiler. Real-host verification is recorded
+// on bv-y3m9 (install.sh via RCH; install.ps1 on Windows against a 1.26.5-launched
+// build of go1.26.8 source).
+func TestDocsParity_InstallersReportBuiltToolchain(t *testing.T) {
+	for _, tc := range []struct {
+		file      string
+		derives   string // the command that reads the real toolchain from the artifact
+		builtLine string // the report of the toolchain actually used
+		stale     string // the old wording that presented the launcher as the build Go
+	}{
+		{"install.sh", "go version -m", "Built with $built_go", "Using Go $go_version\""},
+		{"install.ps1", "go version -m $binary", "Built with $builtGo", "vendored source with Go $goVersion"},
+	} {
+		t.Run(tc.file, func(t *testing.T) {
+			body := repoFile(t, tc.file)
+			if !strings.Contains(body, tc.derives) {
+				t.Errorf("%s must read the real toolchain from the built binary via %q", tc.file, tc.derives)
+			}
+			if !strings.Contains(body, tc.builtLine) {
+				t.Errorf("%s must report the toolchain actually used (%q)", tc.file, tc.builtLine)
+			}
+			if strings.Contains(body, tc.stale) {
+				t.Errorf("%s still presents the launcher Go as the build compiler (%q); it must be qualified", tc.file, tc.stale)
+			}
+		})
+	}
+}
