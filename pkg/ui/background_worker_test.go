@@ -548,11 +548,10 @@ func TestBackgroundWorker_TriggerRefresh(t *testing.T) {
 	}
 	defer worker.Stop()
 
-	// Trigger refresh and wait for processing
+	// Trigger refresh and wait for the published snapshot rather than guessing
+	// a wall-clock delay (flaky under -race/load).
 	worker.TriggerRefresh()
-
-	// Wait for processing to complete
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 1)
 
 	snapshot := worker.GetSnapshot()
 	if snapshot == nil {
@@ -1212,23 +1211,25 @@ func TestBackgroundWorker_ForceRefreshBypassesDedup(t *testing.T) {
 
 	// Build initial snapshot and set hash.
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 1)
+	waitForWorkerIdle(t, worker, 1)
 
 	snapshot1 := worker.GetSnapshot()
 	if snapshot1 == nil {
 		t.Fatal("Expected snapshot after initial refresh")
 	}
 
-	// Second refresh with same content should be deduped.
+	// Second refresh with same content should be deduped: wait for the trigger
+	// to be processed (processing count reaches 2), then assert nothing changed.
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForWorkerIdle(t, worker, 2)
 	if worker.GetSnapshot() != snapshot1 {
 		t.Fatal("Expected snapshot pointer to be unchanged after dedup")
 	}
 
 	// Force refresh should rebuild even though content is unchanged.
 	worker.ForceRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 2)
 	if worker.GetSnapshot() == snapshot1 {
 		t.Fatal("Expected new snapshot after ForceRefresh")
 	}
@@ -1320,7 +1321,7 @@ func TestBackgroundWorker_SnapshotHasDataHash(t *testing.T) {
 	defer worker.Stop()
 
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 1)
 
 	snapshot := worker.GetSnapshot()
 	if snapshot == nil {
@@ -1444,9 +1445,10 @@ func TestBackgroundWorker_LoadError(t *testing.T) {
 	}
 	defer worker.Stop()
 
-	// Trigger refresh
+	// Trigger refresh; wait for the failed load to be processed (processing
+	// count reaches 1) rather than a fixed sleep, then assert no snapshot.
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForWorkerIdle(t, worker, 1)
 
 	// Should have no snapshot (load failed)
 	if worker.GetSnapshot() != nil {
@@ -1480,9 +1482,9 @@ func TestBackgroundWorker_ErrorRecovery(t *testing.T) {
 	}
 	defer worker.Stop()
 
-	// First refresh should fail (no file)
+	// First refresh should fail (no file); wait for that processing to complete.
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForWorkerIdle(t, worker, 1)
 
 	if worker.GetSnapshot() != nil {
 		t.Error("Expected nil snapshot when file doesn't exist")
@@ -1497,9 +1499,10 @@ func TestBackgroundWorker_ErrorRecovery(t *testing.T) {
 	// Reset hash to force reload
 	worker.ResetHash()
 
-	// Second refresh should succeed
+	// Second refresh should succeed: this is the first published snapshot, so
+	// wait for snapshot version 1 rather than a fixed sleep.
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 1)
 
 	snapshot := worker.GetSnapshot()
 	if snapshot == nil {
@@ -1545,9 +1548,11 @@ func TestBackgroundWorker_SafeCompute(t *testing.T) {
 		t.Errorf("Expected phase 'test', got %q", err2.Phase)
 	}
 
-	// Verify worker still functional after panic
+	// Verify worker still functional after panic. safeCompute above is a direct
+	// synchronous call and does not publish a snapshot, so this refresh produces
+	// the first one (version 1).
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 1)
 
 	if worker.GetSnapshot() == nil {
 		t.Error("Worker should still be functional after panic recovery")
@@ -2168,9 +2173,9 @@ func TestBackgroundWorker_Phase2Async(t *testing.T) {
 	}
 	defer worker.Stop()
 
-	// Trigger refresh and wait for snapshot
+	// Trigger refresh and wait for the published snapshot.
 	worker.TriggerRefresh()
-	time.Sleep(200 * time.Millisecond)
+	waitForSnapshotVersion(t, worker, 1)
 
 	snapshot := worker.GetSnapshot()
 	if snapshot == nil {
@@ -2637,8 +2642,17 @@ func TestBackgroundWorker_HeartbeatUpdatesHealth(t *testing.T) {
 		t.Fatalf("expected started+alive health, got: %+v", h1)
 	}
 
-	time.Sleep(30 * time.Millisecond)
-	h2 := worker.Health()
+	// Poll for the heartbeat to advance rather than assuming one ticks within a
+	// fixed window; under -race/load the ticker goroutine can be starved briefly.
+	var h2 WorkerHealth
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		h2 = worker.Health()
+		if h2.LastHeartbeat.After(h1.LastHeartbeat) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if !h2.LastHeartbeat.After(h1.LastHeartbeat) {
 		t.Fatalf("expected heartbeat to advance: %v -> %v", h1.LastHeartbeat, h2.LastHeartbeat)
 	}
