@@ -612,8 +612,10 @@ try_go_install() {
 
     # Report the toolchain the build actually used, which the module's `toolchain`
     # directive can make differ from the launcher's Go reported above.
+    # Match the go<version> token on the first line regardless of its position,
+    # so a build path containing spaces cannot shift the field index.
     local built_go
-    built_go=$(go version -m "$build_output" 2>/dev/null | awk 'NR==1{print $2}')
+    built_go=$(go version -m "$build_output" 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++) if($i ~ /^go[0-9]/){print $i; exit}}')
     if [ -n "$built_go" ]; then
         print_info "Built with $built_go"
     fi

@@ -904,9 +904,18 @@ func TestDocsParity_ToonFallbackDeclaresJSONOutputFormat(t *testing.T) {
 
 	cmd := exec.Command(bv, "--robot-next", "--format", "toon")
 	cmd.Dir = dir
-	// Strip PATH and every TOON discovery override so production discovery
-	// (TOON_TRU_BIN, TOON_BIN, PATH lookup, well-known paths) finds nothing.
-	cmd.Env = []string{"HOME=" + filepath.Join(dir, "nonexistent"), "PATH=", "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "TOON_STATS=1"}
+	// Force TOON discovery to fail deterministically on any host. Pointing
+	// TOON_TRU_BIN at a nonexistent path short-circuits findTruBinary (it
+	// returns immediately rather than falling through to PATH or the
+	// well-known /usr/bin/tru style locations), so a host that happens to have
+	// tru installed cannot make this assert a false premise. PATH is also
+	// stripped as a second guard.
+	cmd.Env = []string{
+		"HOME=" + filepath.Join(dir, "nonexistent"),
+		"PATH=",
+		"TOON_TRU_BIN=" + filepath.Join(dir, "no-such-tru"),
+		"BV_NO_BROWSER=1", "BV_TEST_MODE=1", "TOON_STATS=1",
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -939,6 +948,10 @@ func TestDocsParity_ToonFallbackDeclaresJSONOutputFormat(t *testing.T) {
 // string vs number. The insights Cores/Slack properties were declared "object"
 // while the command emits arrays; that state fails this test.
 func TestDocsParity_RobotSchemaTypesMatchRuntime(t *testing.T) {
+	// Load only the temp fixture, not whatever tracker the host env points at.
+	for _, name := range []string{"BEADS_DIR", "BEADS_DB", "BD_DB", "BEADS_JSONL"} {
+		t.Setenv(name, "")
+	}
 	dir := t.TempDir()
 	var fixture strings.Builder
 	for i := 0; i < 40; i++ {
