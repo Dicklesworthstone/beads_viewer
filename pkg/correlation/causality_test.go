@@ -557,6 +557,55 @@ func TestBuildCausalityChain_BasicChain(t *testing.T) {
 	}
 }
 
+// TestBuildCausalityChain_RecordsDeletion covers the simple chronology path
+// (no recorded CausalHistory). The extractor emits EventDeleted for a bead
+// removed from the source, the rich path and the dashboard export both surface
+// it, and this path previously dropped it via the default:continue arm, so a
+// deleted bead's chronology ended silently at its last claim. The deletion must
+// appear as a CausalDeleted event and the chain must end at its timestamp.
+func TestBuildCausalityChain_RecordsDeletion(t *testing.T) {
+	report := &HistoryReport{
+		DataHash: "test-hash",
+		Histories: map[string]BeadHistory{
+			"bv-gone": {
+				BeadID: "bv-gone",
+				Title:  "Removed Bead",
+				Status: "tombstone",
+				Events: []BeadEvent{
+					{EventType: EventCreated, Timestamp: testTime(0)},
+					{EventType: EventClaimed, Timestamp: testTime(2)},
+					{EventType: EventDeleted, Timestamp: testTime(6)},
+				},
+			},
+		},
+	}
+
+	result := report.BuildCausalityChain("bv-gone", DefaultCausalityOptions())
+	if result == nil {
+		t.Fatal("expected non-nil result")
+	}
+	if !result.Chain.IsComplete {
+		t.Error("a tombstoned bead should be complete, not treated as ongoing")
+	}
+	types := make([]CausalEventType, len(result.Chain.Events))
+	for i, e := range result.Chain.Events {
+		types[i] = e.Type
+	}
+	want := []CausalEventType{CausalCreated, CausalClaimed, CausalDeleted}
+	if len(types) != len(want) {
+		t.Fatalf("expected %v, got %v", want, types)
+	}
+	for i := range want {
+		if types[i] != want[i] {
+			t.Fatalf("event %d: expected %q, got %q (full: %v)", i, want[i], types[i], types)
+		}
+	}
+	// The chain must end at the deletion, not at the last claim.
+	if !result.Chain.EndTime.Equal(testTime(6)) {
+		t.Errorf("expected chain to end at the deletion timestamp %v, got %v", testTime(6), result.Chain.EndTime)
+	}
+}
+
 func TestBuildCausalityChainAtPinsOpenDurationAndTieOrder(t *testing.T) {
 	pinned := testTime(24)
 	start := testTime(0)

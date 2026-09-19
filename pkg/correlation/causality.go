@@ -275,6 +275,9 @@ func (hr *HistoryReport) BuildCausalityChainAt(beadID string, opts CausalityOpti
 		case EventReopened:
 			causalType = CausalReopened
 			desc = "Bead reopened"
+		case EventDeleted:
+			causalType = CausalDeleted
+			desc = "Bead removed from the historical source"
 		default:
 			continue // Skip modified events for now
 		}
