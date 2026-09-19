@@ -1,0 +1,12 @@
+UI records:    288   (acceptance: 288)
+CLI records:   72  (acceptance: 72)
+EXACT records: 36 (acceptance: 36)
+UI per side:   baseline(side0)=144  current(side1)=144   total samples=288000
+UI max p99:    baseline=34.278 ms   current=35.694 ms   (50 ms SLO, enforced on current only)
+UI current-side SLO breaches: 0
+CLI samples:   14400 (acceptance: 14400)   parity-mismatched records: 0   max p99=97222.704 ms
+EXACT outputs: 144 (acceptance: 144)   parity-mismatched records: 0
+--- verifier verdict ---
+PASS: complete timed cohorts and separate fixed-clock full CLI results agree; current UI empirical p99 <=50ms.
+--- harness exit ---
+HARNESS_RC=0
