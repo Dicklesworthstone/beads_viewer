@@ -24,13 +24,13 @@ function toInt(value, fallback = 0) {
 
 function statusToCode(status) {
   switch (status) {
-    case 'open':
+    case "open":
       return 0;
-    case 'in_progress':
+    case "in_progress":
       return 1;
-    case 'blocked':
+    case "blocked":
       return 2;
-    case 'closed':
+    case "closed":
       return 3;
     default:
       return 255;
@@ -55,33 +55,33 @@ async function initHybridWasmScorer(issueCount) {
   }
   HYBRID_WASM_STATE.attempted = true;
 
-  if (typeof issueCount === 'number' && issueCount < HYBRID_WASM_STATE.threshold) {
-    HYBRID_WASM_STATE.reason = 'dataset below threshold';
+  if (typeof issueCount === "number" && issueCount < HYBRID_WASM_STATE.threshold) {
+    HYBRID_WASM_STATE.reason = "dataset below threshold";
     return false;
   }
 
-  if (typeof WebAssembly !== 'object') {
-    HYBRID_WASM_STATE.reason = 'WebAssembly not available';
+  if (typeof WebAssembly !== "object") {
+    HYBRID_WASM_STATE.reason = "WebAssembly not available";
     return false;
   }
 
   try {
-    const wasmModule = await import('./wasm/bv_hybrid_scorer.js');
+    const wasmModule = await import("./wasm/bv_hybrid_scorer.js");
     await wasmModule.default();
     HybridWasmCtor = wasmModule.HybridScorer;
     HYBRID_WASM_STATE.ready = true;
     HYBRID_WASM_STATE.reason = null;
-    console.log('[HybridScorer] WASM loaded');
+    console.log("[HybridScorer] WASM loaded");
     return true;
   } catch (err) {
-    HYBRID_WASM_STATE.reason = err?.message || 'Failed to load WASM module';
-    console.warn('[HybridScorer] WASM unavailable, using JS fallback', err);
+    HYBRID_WASM_STATE.reason = err?.message || "Failed to load WASM module";
+    console.warn("[HybridScorer] WASM unavailable, using JS fallback", err);
     return false;
   }
 }
 
 function scoreBatchHybridFallback(results, weights) {
-  if (typeof HybridScorer === 'undefined') {
+  if (typeof HybridScorer === "undefined") {
     return results;
   }
   const scorer = new HybridScorer(weights);
@@ -97,8 +97,8 @@ function scoreBatchHybrid(results, weights) {
     return scoreBatchHybridFallback(results, weights);
   }
 
-  const payload = results.map(r => ({
-    id: String(r.id ?? r.issue_id ?? ''),
+  const payload = results.map((r) => ({
+    id: String(r.id ?? r.issue_id ?? ""),
     text_score: toNumber(r.textScore ?? r.text_score, 0),
     pagerank: toNumber(r.pagerank, 0.5),
     status: statusToCode(r.status),
@@ -116,9 +116,7 @@ function scoreBatchHybrid(results, weights) {
       return scoreBatchHybridFallback(results, weights);
     }
 
-    const byId = new Map(
-      results.map(r => [String(r.id ?? r.issue_id ?? ''), r])
-    );
+    const byId = new Map(results.map((r) => [String(r.id ?? r.issue_id ?? ""), r]));
     const merged = [];
     for (const item of parsed) {
       const base = byId.get(item.id);
@@ -140,10 +138,10 @@ function scoreBatchHybrid(results, weights) {
     }
     return merged;
   } catch (err) {
-    console.warn('[HybridScorer] WASM scoring failed, using JS fallback', err);
+    console.warn("[HybridScorer] WASM scoring failed, using JS fallback", err);
     return scoreBatchHybridFallback(results, weights);
   } finally {
-    if (scorer && typeof scorer.free === 'function') {
+    if (scorer && typeof scorer.free === "function") {
       scorer.free();
     }
   }

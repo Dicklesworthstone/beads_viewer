@@ -1,7 +1,7 @@
 /* eslint-disable no-console */
 (function runHybridScorerTests() {
-  if (typeof HybridScorer === 'undefined') {
-    console.warn('HybridScorer not available; skipping tests.');
+  if (typeof HybridScorer === "undefined") {
+    console.warn("HybridScorer not available; skipping tests.");
     return;
   }
 
@@ -13,18 +13,20 @@
 
   const scorer = new HybridScorer(HYBRID_PRESETS.default);
   const now = new Date();
-  const result = scorer.scoreAndRank([{
-    id: 'test-1',
-    textScore: 0.8,
-    pagerank: 0.5,
-    status: 'open',
-    priority: 1,
-    blockerCount: 3,
-    updatedAt: now.toISOString(),
-  }])[0];
+  const result = scorer.scoreAndRank([
+    {
+      id: "test-1",
+      textScore: 0.8,
+      pagerank: 0.5,
+      status: "open",
+      priority: 1,
+      blockerCount: 3,
+      updatedAt: now.toISOString(),
+    },
+  ])[0];
 
   if (!result.component_scores) {
-    throw new Error('component_scores missing from result');
+    throw new Error("component_scores missing from result");
   }
 
   // Expected score computed from weights + normalization.
@@ -40,6 +42,6 @@
     0.1 * priorityScore +
     0.05 * recencyScore;
 
-  assertClose(result.hybrid_score, expected, 0.01, 'hybrid score mismatch');
-  console.log('HybridScorer tests passed');
+  assertClose(result.hybrid_score, expected, 0.01, "hybrid score mismatch");
+  console.log("HybridScorer tests passed");
 })();

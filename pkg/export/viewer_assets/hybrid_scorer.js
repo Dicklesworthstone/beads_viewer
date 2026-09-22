@@ -4,11 +4,32 @@
  */
 
 const HYBRID_PRESETS = {
-  default: { text: 0.40, pagerank: 0.20, status: 0.15, impact: 0.10, priority: 0.10, recency: 0.05 },
-  'bug-hunting': { text: 0.30, pagerank: 0.15, status: 0.15, impact: 0.15, priority: 0.20, recency: 0.05 },
-  'sprint-planning': { text: 0.30, pagerank: 0.20, status: 0.25, impact: 0.15, priority: 0.05, recency: 0.05 },
-  'impact-first': { text: 0.25, pagerank: 0.30, status: 0.10, impact: 0.20, priority: 0.10, recency: 0.05 },
-  'text-only': { text: 1.00, pagerank: 0.00, status: 0.00, impact: 0.00, priority: 0.00, recency: 0.00 }
+  default: { text: 0.4, pagerank: 0.2, status: 0.15, impact: 0.1, priority: 0.1, recency: 0.05 },
+  "bug-hunting": {
+    text: 0.3,
+    pagerank: 0.15,
+    status: 0.15,
+    impact: 0.15,
+    priority: 0.2,
+    recency: 0.05,
+  },
+  "sprint-planning": {
+    text: 0.3,
+    pagerank: 0.2,
+    status: 0.25,
+    impact: 0.15,
+    priority: 0.05,
+    recency: 0.05,
+  },
+  "impact-first": {
+    text: 0.25,
+    pagerank: 0.3,
+    status: 0.1,
+    impact: 0.2,
+    priority: 0.1,
+    recency: 0.05,
+  },
+  "text-only": { text: 1.0, pagerank: 0.0, status: 0.0, impact: 0.0, priority: 0.0, recency: 0.0 },
 };
 
 class HybridScorer {
@@ -22,7 +43,7 @@ class HybridScorer {
     const priorityScore = this.normalizePriority(result.priority);
     const impactScore = this.normalizeImpact(result.blockerCount || 0);
     const recencyScore = this.normalizeRecency(result.updatedAt);
-    const pagerank = typeof result.pagerank === 'number' ? result.pagerank : 0.5;
+    const pagerank = typeof result.pagerank === "number" ? result.pagerank : 0.5;
 
     const finalScore =
       this.weights.text * result.textScore +
@@ -49,15 +70,10 @@ class HybridScorer {
     if (!Array.isArray(results) || results.length === 0) {
       return [];
     }
-    const maxBlocker = results.reduce(
-      (max, r) => Math.max(max, r.blockerCount || 0),
-      0
-    );
+    const maxBlocker = results.reduce((max, r) => Math.max(max, r.blockerCount || 0), 0);
     this.maxBlockerCount = maxBlocker;
 
-    return results
-      .map(r => this.score(r))
-      .sort((a, b) => b.hybrid_score - a.hybrid_score);
+    return results.map((r) => this.score(r)).sort((a, b) => b.hybrid_score - a.hybrid_score);
   }
 
   normalizeStatus(status) {

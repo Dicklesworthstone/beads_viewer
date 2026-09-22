@@ -17,55 +17,57 @@
 // Theme-aware Mermaid config: Dracula-inspired colours in dark mode,
 // GitHub-inspired in light mode.
 function getMermaidConfig() {
-  const dark = document.documentElement.classList.contains('dark');
+  const dark = document.documentElement.classList.contains("dark");
   return {
     startOnLoad: false,
-    theme: dark ? 'dark' : 'neutral',
-    flowchart: { curve: 'basis', padding: 10 },
-    securityLevel: 'strict',
-    themeVariables: dark ? {
-      primaryColor: '#bd93f9',      // Purple
-      primaryTextColor: '#f8f8f2',  // Foreground
-      primaryBorderColor: '#ff79c6', // Pink
-      lineColor: '#6272a4',         // Muted (comment)
-      secondaryColor: '#44475a',    // Background secondary
-      tertiaryColor: '#282a36',     // Background
-      background: '#282a36',
-      mainBkg: '#282a36',
-      nodeBorder: '#bd93f9',
-      clusterBkg: '#44475a',
-      clusterBorder: '#6272a4',
-      titleColor: '#f8f8f2',
-      edgeLabelBackground: '#44475a',
-      nodeTextColor: '#f8f8f2'
-    } : {
-      primaryColor: '#8250df',      // Purple
-      primaryTextColor: '#24292f',  // Foreground
-      primaryBorderColor: '#bf3989', // Pink
-      lineColor: '#57606a',         // Muted
-      secondaryColor: '#f6f8fa',    // Background secondary
-      tertiaryColor: '#ffffff',     // Background
-      background: '#ffffff',
-      mainBkg: '#ffffff',
-      nodeBorder: '#8250df',
-      clusterBkg: '#f6f8fa',
-      clusterBorder: '#d0d7de',
-      titleColor: '#24292f',
-      edgeLabelBackground: '#f6f8fa',
-      nodeTextColor: '#24292f'
-    }
+    theme: dark ? "dark" : "neutral",
+    flowchart: { curve: "basis", padding: 10 },
+    securityLevel: "strict",
+    themeVariables: dark
+      ? {
+          primaryColor: "#bd93f9", // Purple
+          primaryTextColor: "#f8f8f2", // Foreground
+          primaryBorderColor: "#ff79c6", // Pink
+          lineColor: "#6272a4", // Muted (comment)
+          secondaryColor: "#44475a", // Background secondary
+          tertiaryColor: "#282a36", // Background
+          background: "#282a36",
+          mainBkg: "#282a36",
+          nodeBorder: "#bd93f9",
+          clusterBkg: "#44475a",
+          clusterBorder: "#6272a4",
+          titleColor: "#f8f8f2",
+          edgeLabelBackground: "#44475a",
+          nodeTextColor: "#f8f8f2",
+        }
+      : {
+          primaryColor: "#8250df", // Purple
+          primaryTextColor: "#24292f", // Foreground
+          primaryBorderColor: "#bf3989", // Pink
+          lineColor: "#57606a", // Muted
+          secondaryColor: "#f6f8fa", // Background secondary
+          tertiaryColor: "#ffffff", // Background
+          background: "#ffffff",
+          mainBkg: "#ffffff",
+          nodeBorder: "#8250df",
+          clusterBkg: "#f6f8fa",
+          clusterBorder: "#d0d7de",
+          titleColor: "#24292f",
+          edgeLabelBackground: "#f6f8fa",
+          nodeTextColor: "#24292f",
+        },
   };
 }
 
-if (typeof mermaid !== 'undefined') {
+if (typeof mermaid !== "undefined") {
   mermaid.initialize(getMermaidConfig());
 } else {
-  console.warn('[bv] mermaid is not loaded; diagram rendering is disabled');
+  console.warn("[bv] mermaid is not loaded; diagram rendering is disabled");
 }
 
 // Exposed for the theme toggle, which re-initialises Mermaid after switching.
-window.reinitializeMermaid = function () {
-  if (typeof mermaid !== 'undefined') {
+window.reinitializeMermaid = () => {
+  if (typeof mermaid !== "undefined") {
     mermaid.initialize(getMermaidConfig());
   }
 };
@@ -78,26 +80,26 @@ window.reinitializeMermaid = function () {
  * Global error state for the application
  */
 const ERROR_STATE = {
-  error: null,           // Current error object or null
-  errors: [],            // Error history
+  error: null, // Current error object or null
+  errors: [], // Error history
 };
 
 /**
  * Diagnostics state for debugging
  */
 const DIAGNOSTICS = {
-  wasm: false,           // sql.js WASM loaded
-  opfs: null,            // OPFS available (null = not checked, true/false)
-  graphWasm: false,      // bv_graph WASM loaded
-  hybridWasm: false,     // hybrid scorer WASM loaded
+  wasm: false, // sql.js WASM loaded
+  opfs: null, // OPFS available (null = not checked, true/false)
+  graphWasm: false, // bv_graph WASM loaded
+  hybridWasm: false, // hybrid scorer WASM loaded
   hybridWasmReason: null, // Reason when hybrid WASM disabled
-  dbSource: 'unknown',   // 'network' | 'cache' | 'chunks'
-  dbSizeBytes: 0,        // Database size in bytes
-  issueCount: 0,         // Number of issues
-  loadTimeMs: 0,         // Total load time
+  dbSource: "unknown", // 'network' | 'cache' | 'chunks'
+  dbSizeBytes: 0, // Database size in bytes
+  issueCount: 0, // Number of issues
+  loadTimeMs: 0, // Total load time
   startTime: Date.now(), // When loading started
-  queryCount: 0,         // Number of queries executed
-  queryErrors: 0,        // Number of query errors
+  queryCount: 0, // Number of queries executed
+  queryErrors: 0, // Number of query errors
 };
 
 /**
@@ -145,8 +147,8 @@ function clearError() {
  */
 function safeQuery(sql, params = [], fallback = []) {
   if (!DB_STATE.db) {
-    console.warn('[safeQuery] Database not loaded');
-    return { success: false, data: fallback, error: 'Database not loaded' };
+    console.warn("[safeQuery] Database not loaded");
+    return { success: false, data: fallback, error: "Database not loaded" };
   }
 
   DIAGNOSTICS.queryCount++;
@@ -156,7 +158,7 @@ function safeQuery(sql, params = [], fallback = []) {
     if (!result.length) return { success: true, data: [] };
 
     const { columns, values } = result[0];
-    const data = values.map(row => {
+    const data = values.map((row) => {
       const obj = {};
       columns.forEach((col, i) => {
         obj[col] = row[i];
@@ -167,7 +169,7 @@ function safeQuery(sql, params = [], fallback = []) {
     return { success: true, data };
   } catch (err) {
     DIAGNOSTICS.queryErrors++;
-    console.error('[safeQuery] Query failed:', sql, err);
+    console.error("[safeQuery] Query failed:", sql, err);
     return { success: false, data: fallback, error: err.message };
   }
 }
@@ -177,39 +179,41 @@ function safeQuery(sql, params = [], fallback = []) {
  * @param {string} message - Toast message
  * @param {string} type - Toast type: 'info' | 'success' | 'warning' | 'error'
  */
-function showToast(message, type = 'info') {
+function showToast(message, type = "info") {
   // This will be picked up by the Alpine toast component
-  window.dispatchEvent(new CustomEvent('show-toast', {
-    detail: { message, type, id: Date.now() }
-  }));
+  window.dispatchEvent(
+    new CustomEvent("show-toast", {
+      detail: { message, type, id: Date.now() },
+    }),
+  );
 }
 
 // Database state
 const DB_STATE = {
-  sql: null,          // sql.js library instance
-  db: null,           // Database instance
-  cacheKey: null,     // OPFS cache key (hash)
-  source: 'unknown',  // 'network' | 'cache' | 'chunks'
-  fts5: null,         // Actual browser SQLite capability, not exported schema.
+  sql: null, // sql.js library instance
+  db: null, // Database instance
+  cacheKey: null, // OPFS cache key (hash)
+  source: "unknown", // 'network' | 'cache' | 'chunks'
+  fts5: null, // Actual browser SQLite capability, not exported schema.
 };
 
 // Graph engine state (WASM)
 const GRAPH_STATE = {
-  wasm: null,         // WASM module (bv_graph.js)
-  graph: null,        // DiGraph instance
-  nodeMap: null,      // Map<string, number> - issue ID to node index
-  ready: false,       // true when graph is loaded
+  wasm: null, // WASM module (bv_graph.js)
+  graph: null, // DiGraph instance
+  nodeMap: null, // Map<string, number> - issue ID to node index
+  ready: false, // true when graph is loaded
 };
 
 // WASM support detection
 const WASM_STATUS = {
-  supported: null,    // null = not checked, true/false = checked
-  reason: null,       // Reason for failure if not supported
+  supported: null, // null = not checked, true/false = checked
+  reason: null, // Reason for failure if not supported
   fallbackMode: false, // true when using pre-computed data only
   features: {
-    basic: null,      // Basic WASM support
-    simd: null,       // SIMD support
-    threads: null,    // Thread support (SharedArrayBuffer)
+    basic: null, // Basic WASM support
+    simd: null, // SIMD support
+    threads: null, // Thread support (SharedArrayBuffer)
   },
 };
 
@@ -224,9 +228,9 @@ async function checkWASMSupport() {
   }
 
   // Check basic WASM support
-  if (typeof WebAssembly !== 'object') {
+  if (typeof WebAssembly !== "object") {
     WASM_STATUS.supported = false;
-    WASM_STATUS.reason = 'WebAssembly not available in this browser';
+    WASM_STATUS.reason = "WebAssembly not available in this browser";
     WASM_STATUS.fallbackMode = true;
     return WASM_STATUS;
   }
@@ -234,10 +238,10 @@ async function checkWASMSupport() {
   // Check WebAssembly APIs
   try {
     const testModule = new WebAssembly.Module(
-      new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])
+      new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]),
     );
     if (!(testModule instanceof WebAssembly.Module)) {
-      throw new Error('WebAssembly.Module validation failed');
+      throw new Error("WebAssembly.Module validation failed");
     }
     WASM_STATUS.features.basic = true;
   } catch (e) {
@@ -249,16 +253,17 @@ async function checkWASMSupport() {
   }
 
   // Check SharedArrayBuffer (needed for some WASM features)
-  WASM_STATUS.features.threads = typeof SharedArrayBuffer !== 'undefined';
+  WASM_STATUS.features.threads = typeof SharedArrayBuffer !== "undefined";
 
   // SIMD detection (optional, not required)
   try {
-    WASM_STATUS.features.simd = WebAssembly.validate(new Uint8Array([
-      0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-      0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b, 0x03,
-      0x02, 0x01, 0x00, 0x0a, 0x0a, 0x01, 0x08, 0x00,
-      0xfd, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x0b
-    ]));
+    WASM_STATUS.features.simd = WebAssembly.validate(
+      new Uint8Array([
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7b,
+        0x03, 0x02, 0x01, 0x00, 0x0a, 0x0a, 0x01, 0x08, 0x00, 0xfd, 0x0c, 0x00, 0x00, 0x00, 0x00,
+        0x0b,
+      ]),
+    );
   } catch {
     WASM_STATUS.features.simd = false;
   }
@@ -276,8 +281,8 @@ function enableFallbackMode(reason) {
   WASM_STATUS.reason = reason;
   GRAPH_STATE.ready = false;
   DIAGNOSTICS.graphWasm = false;
-  console.warn('[WASM] Fallback mode enabled:', reason);
-  showToast('Using pre-computed metrics only', 'warning');
+  console.warn("[WASM] Fallback mode enabled:", reason);
+  showToast("Using pre-computed metrics only", "warning");
 }
 
 // ============================================================================
@@ -289,9 +294,9 @@ function enableFallbackMode(reason) {
  * WASM objects allocated via wasm-bindgen are NOT garbage collected by JS
  */
 const WASM_ALLOCATIONS = {
-  subgraphs: [],   // Temporary subgraph objects
-  trackCount: 0,   // Total allocations tracked
-  freedCount: 0,   // Total objects freed
+  subgraphs: [], // Temporary subgraph objects
+  trackCount: 0, // Total allocations tracked
+  freedCount: 0, // Total objects freed
 };
 
 /**
@@ -309,13 +314,11 @@ const WASM_ALLOCATIONS = {
  */
 function withSubgraph(indices, fn) {
   if (!GRAPH_STATE.ready || !GRAPH_STATE.graph) {
-    console.warn('[WASM Memory] Cannot create subgraph: graph not ready');
+    console.warn("[WASM Memory] Cannot create subgraph: graph not ready");
     return null;
   }
 
-  const indicesArray = indices instanceof Uint32Array
-    ? indices
-    : new Uint32Array(indices);
+  const indicesArray = indices instanceof Uint32Array ? indices : new Uint32Array(indices);
 
   const subgraph = GRAPH_STATE.graph.subgraph(indicesArray);
   WASM_ALLOCATIONS.trackCount++;
@@ -324,7 +327,7 @@ function withSubgraph(indices, fn) {
     return fn(subgraph);
   } finally {
     // Always free the subgraph, even if fn throws
-    if (subgraph && typeof subgraph.free === 'function') {
+    if (subgraph && typeof subgraph.free === "function") {
       subgraph.free();
       WASM_ALLOCATIONS.freedCount++;
     }
@@ -336,35 +339,37 @@ function withSubgraph(indices, fn) {
  * Call on page unload or when reinitializing
  */
 function cleanupWasm() {
-  console.log('[WASM Memory] Cleaning up resources...');
+  console.log("[WASM Memory] Cleaning up resources...");
 
   // Free tracked subgraphs (shouldn't be any if withSubgraph is used correctly)
   for (const subgraph of WASM_ALLOCATIONS.subgraphs) {
-    if (subgraph && typeof subgraph.free === 'function') {
+    if (subgraph && typeof subgraph.free === "function") {
       try {
         subgraph.free();
         WASM_ALLOCATIONS.freedCount++;
       } catch (e) {
-        console.warn('[WASM Memory] Error freeing subgraph:', e);
+        console.warn("[WASM Memory] Error freeing subgraph:", e);
       }
     }
   }
   WASM_ALLOCATIONS.subgraphs = [];
 
   // Free the main graph
-  if (GRAPH_STATE.graph && typeof GRAPH_STATE.graph.free === 'function') {
+  if (GRAPH_STATE.graph && typeof GRAPH_STATE.graph.free === "function") {
     try {
       GRAPH_STATE.graph.free();
-      console.log('[WASM Memory] Main graph freed');
+      console.log("[WASM Memory] Main graph freed");
     } catch (e) {
-      console.warn('[WASM Memory] Error freeing main graph:', e);
+      console.warn("[WASM Memory] Error freeing main graph:", e);
     }
     GRAPH_STATE.graph = null;
     GRAPH_STATE.ready = false;
     GRAPH_STATE.nodeMap = null;
   }
 
-  console.log(`[WASM Memory] Cleanup complete. Tracked: ${WASM_ALLOCATIONS.trackCount}, Freed: ${WASM_ALLOCATIONS.freedCount}`);
+  console.log(
+    `[WASM Memory] Cleanup complete. Tracked: ${WASM_ALLOCATIONS.trackCount}, Freed: ${WASM_ALLOCATIONS.freedCount}`,
+  );
 }
 
 /**
@@ -376,19 +381,20 @@ function getWasmMemoryStats() {
     freed: WASM_ALLOCATIONS.freedCount,
     pendingSubgraphs: WASM_ALLOCATIONS.subgraphs.length,
     graphActive: GRAPH_STATE.graph !== null,
-    leakEstimate: WASM_ALLOCATIONS.trackCount - WASM_ALLOCATIONS.freedCount - WASM_ALLOCATIONS.subgraphs.length,
+    leakEstimate:
+      WASM_ALLOCATIONS.trackCount - WASM_ALLOCATIONS.freedCount - WASM_ALLOCATIONS.subgraphs.length,
   };
 }
 
 // Register cleanup on page unload
-if (typeof window !== 'undefined') {
-  window.addEventListener('beforeunload', () => {
+if (typeof window !== "undefined") {
+  window.addEventListener("beforeunload", () => {
     cleanupWasm();
   });
 
   // Also cleanup on visibility change (mobile browsers)
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
       // Could optionally free resources here for memory-constrained devices
       // cleanupWasm();
     }
@@ -405,61 +411,63 @@ async function initSqlJs() {
   }
 
   // Load sql.js from CDN (with WASM)
-  const sqlPromise = initSqlJs.cached || (initSqlJs.cached = new Promise(async (resolve, reject) => {
-    try {
-      let usedLocal = false;
-      // Try loading from local vendor first
-      let sqlJs;
+  const sqlPromise =
+    initSqlJs.cached ||
+    (initSqlJs.cached = new Promise(async (resolve, reject) => {
       try {
-        const script = document.createElement('script');
-        script.src = './vendor/sql-wasm.js';
-        document.head.appendChild(script);
-        await new Promise((res, rej) => {
-          script.onload = res;
-          script.onerror = rej;
-        });
-        sqlJs = window.initSqlJs;
-        usedLocal = true;
-      } catch {
-        // Fallback to CDN
-        const script = document.createElement('script');
-        script.src = 'https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js';
-        document.head.appendChild(script);
-        await new Promise((res, rej) => {
-          script.onload = res;
-          script.onerror = rej;
-        });
-        sqlJs = window.initSqlJs;
-        usedLocal = false;
-      }
-
-      const SQL = await sqlJs({
-        locateFile: file => {
-          // Prefer local vendored wasm when available for offline use
-          if (usedLocal) {
-            return `./vendor/${file}`;
-          }
-          return `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}`;
+        let usedLocal = false;
+        // Try loading from local vendor first
+        let sqlJs;
+        try {
+          const script = document.createElement("script");
+          script.src = "./vendor/sql-wasm.js";
+          document.head.appendChild(script);
+          await new Promise((res, rej) => {
+            script.onload = res;
+            script.onerror = rej;
+          });
+          sqlJs = window.initSqlJs;
+          usedLocal = true;
+        } catch {
+          // Fallback to CDN
+          const script = document.createElement("script");
+          script.src = "https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js";
+          document.head.appendChild(script);
+          await new Promise((res, rej) => {
+            script.onload = res;
+            script.onerror = rej;
+          });
+          sqlJs = window.initSqlJs;
+          usedLocal = false;
         }
-      });
 
-      DIAGNOSTICS.wasm = true;
-      resolve(SQL);
-    } catch (err) {
-      DIAGNOSTICS.wasm = false;
-      showError({
-        title: 'Browser Compatibility Issue',
-        message: 'This viewer requires WebAssembly support to run SQL queries.',
-        details: err.message,
-        actions: [
-          { label: 'Check Browser Support', url: 'https://caniuse.com/wasm' },
-          { label: 'Reload Page', action: () => location.reload() },
-        ],
-        dismissible: false,
-      });
-      reject(err);
-    }
-  }));
+        const SQL = await sqlJs({
+          locateFile: (file) => {
+            // Prefer local vendored wasm when available for offline use
+            if (usedLocal) {
+              return `./vendor/${file}`;
+            }
+            return `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}`;
+          },
+        });
+
+        DIAGNOSTICS.wasm = true;
+        resolve(SQL);
+      } catch (err) {
+        DIAGNOSTICS.wasm = false;
+        showError({
+          title: "Browser Compatibility Issue",
+          message: "This viewer requires WebAssembly support to run SQL queries.",
+          details: err.message,
+          actions: [
+            { label: "Check Browser Support", url: "https://caniuse.com/wasm" },
+            { label: "Reload Page", action: () => location.reload() },
+          ],
+          dismissible: false,
+        });
+        reject(err);
+      }
+    }));
 
   DB_STATE.sql = await sqlPromise;
   return DB_STATE.sql;
@@ -469,15 +477,15 @@ async function initSqlJs() {
  * Load database from OPFS cache
  */
 async function loadFromOPFS(cacheKey) {
-  if (!('storage' in navigator) || !navigator.storage.getDirectory) {
+  if (!("storage" in navigator) || !navigator.storage.getDirectory) {
     DIAGNOSTICS.opfs = false;
-    console.info('[OPFS] Not available in this browser');
+    console.info("[OPFS] Not available in this browser");
     return null;
   }
 
   try {
     const root = await navigator.storage.getDirectory();
-    const filename = `beads-${cacheKey || 'default'}.sqlite3`;
+    const filename = `beads-${cacheKey || "default"}.sqlite3`;
     const handle = await root.getFileHandle(filename, { create: false });
     const file = await handle.getFile();
     const buffer = await file.arrayBuffer();
@@ -486,12 +494,12 @@ async function loadFromOPFS(cacheKey) {
     console.log(`[OPFS] Loaded ${buffer.byteLength} bytes from cache`);
     return new Uint8Array(buffer);
   } catch (err) {
-    if (err.name === 'NotFoundError') {
+    if (err.name === "NotFoundError") {
       DIAGNOSTICS.opfs = true; // OPFS available, just no cache yet
     } else {
       // Private browsing or permission denied
       DIAGNOSTICS.opfs = false;
-      console.info('[OPFS] Cache unavailable:', err.message);
+      console.info("[OPFS] Cache unavailable:", err.message);
     }
     return null;
   }
@@ -501,13 +509,13 @@ async function loadFromOPFS(cacheKey) {
  * Cache database to OPFS
  */
 async function cacheToOPFS(data, cacheKey) {
-  if (!('storage' in navigator) || !navigator.storage.getDirectory) {
+  if (!("storage" in navigator) || !navigator.storage.getDirectory) {
     return false;
   }
 
   try {
     const root = await navigator.storage.getDirectory();
-    const filename = `beads-${cacheKey || 'default'}.sqlite3`;
+    const filename = `beads-${cacheKey || "default"}.sqlite3`;
     const handle = await root.getFileHandle(filename, { create: true });
     const writable = await handle.createWritable();
     await writable.write(data);
@@ -515,7 +523,7 @@ async function cacheToOPFS(data, cacheKey) {
     console.log(`[OPFS] Cached ${data.byteLength} bytes`);
     return true;
   } catch (err) {
-    console.warn('[OPFS] Cache failed:', err);
+    console.warn("[OPFS] Cache failed:", err);
     return false;
   }
 }
@@ -525,14 +533,14 @@ async function cacheToOPFS(data, cacheKey) {
  * Runs in the background after a successful cache hit to free storage.
  */
 async function cleanStaleOPFS(currentCacheKey) {
-  if (!('storage' in navigator) || !navigator.storage.getDirectory) return;
+  if (!("storage" in navigator) || !navigator.storage.getDirectory) return;
   try {
     const root = await navigator.storage.getDirectory();
     const currentFile = `beads-${currentCacheKey}.sqlite3`;
     // Collect stale names first to avoid mutating directory during iteration
     const stale = [];
     for await (const [name] of root.entries()) {
-      if (name.startsWith('beads-') && name.endsWith('.sqlite3') && name !== currentFile) {
+      if (name.startsWith("beads-") && name.endsWith(".sqlite3") && name !== currentFile) {
         stale.push(name);
       }
     }
@@ -564,7 +572,7 @@ async function loadChunks(config) {
   const cacheBuster = `?_t=${Date.now()}`;
 
   for (let i = 0; i < totalChunks; i++) {
-    const chunkPath = `./chunks/${String(i).padStart(5, '0')}.bin${cacheBuster}`;
+    const chunkPath = `./chunks/${String(i).padStart(5, "0")}.bin${cacheBuster}`;
     const response = await fetch(chunkPath);
     if (!response.ok) throw new Error(`Failed to load chunk ${i}`);
     const buffer = await response.arrayBuffer();
@@ -590,7 +598,7 @@ async function loadChunks(config) {
 async function loadDatabase(updateStatus) {
   const SQL = await initSqlJs();
 
-  updateStatus?.('Checking cache...');
+  updateStatus?.("Checking cache...");
 
   // Load config to get cache key
   // Use cache-busting query param to ensure we always get the latest config
@@ -599,7 +607,7 @@ async function loadDatabase(updateStatus) {
   let config = null;
   try {
     const cacheBuster = `?_t=${Date.now()}`;
-    config = await fetchJSON('./beads.sqlite3.config.json' + cacheBuster);
+    config = await fetchJSON("./beads.sqlite3.config.json" + cacheBuster);
     DB_STATE.cacheKey = config.hash || null;
   } catch {
     // Config file may not exist for small DBs
@@ -610,15 +618,15 @@ async function loadDatabase(updateStatus) {
     const cached = await loadFromOPFS(DB_STATE.cacheKey);
     if (cached) {
       DB_STATE.db = new SQL.Database(cached);
-      DB_STATE.source = 'cache';
-      DIAGNOSTICS.dbSource = 'cache';
+      DB_STATE.source = "cache";
+      DIAGNOSTICS.dbSource = "cache";
       // Clean up stale cache entries in the background
       cleanStaleOPFS(DB_STATE.cacheKey).catch(() => {});
       return DB_STATE.db;
     }
   }
 
-  updateStatus?.('Loading database...');
+  updateStatus?.("Loading database...");
 
   // Check if database is chunked
   let dbData;
@@ -626,13 +634,13 @@ async function loadDatabase(updateStatus) {
     if (config?.chunked) {
       updateStatus?.(`Loading ${config.chunk_count} chunks...`);
       dbData = await loadChunks(config);
-      DB_STATE.source = 'chunks';
-      DIAGNOSTICS.dbSource = 'chunks';
+      DB_STATE.source = "chunks";
+      DIAGNOSTICS.dbSource = "chunks";
     } else {
       // Load single file - try multiple paths
       // Add cache-busting to avoid CDN serving stale database
       const cacheBuster = `?_t=${Date.now()}`;
-      const paths = ['./beads.sqlite3' + cacheBuster, './data/beads.sqlite3' + cacheBuster];
+      const paths = ["./beads.sqlite3" + cacheBuster, "./data/beads.sqlite3" + cacheBuster];
       let loaded = false;
 
       for (const path of paths) {
@@ -642,8 +650,8 @@ async function loadDatabase(updateStatus) {
             const buffer = await response.arrayBuffer();
             dbData = new Uint8Array(buffer);
             DIAGNOSTICS.dbSizeBytes = buffer.byteLength;
-            DB_STATE.source = 'network';
-            DIAGNOSTICS.dbSource = 'network';
+            DB_STATE.source = "network";
+            DIAGNOSTICS.dbSource = "network";
             loaded = true;
             break;
           }
@@ -653,17 +661,15 @@ async function loadDatabase(updateStatus) {
       }
 
       if (!loaded) {
-        throw new Error('Database not found at any known path');
+        throw new Error("Database not found at any known path");
       }
     }
   } catch (err) {
     showError({
-      title: 'Database Not Found',
-      message: 'Could not load the issues database.',
+      title: "Database Not Found",
+      message: "Could not load the issues database.",
       details: `${err.message}\n\nThe beads.sqlite3 file may be missing or corrupted.`,
-      actions: [
-        { label: 'Reload Page', action: () => location.reload() },
-      ],
+      actions: [{ label: "Reload Page", action: () => location.reload() }],
       dismissible: false,
     });
     throw err;
@@ -673,12 +679,10 @@ async function loadDatabase(updateStatus) {
     DB_STATE.db = new SQL.Database(dbData);
   } catch (err) {
     showError({
-      title: 'Database Corrupted',
-      message: 'The database file could not be opened.',
+      title: "Database Corrupted",
+      message: "The database file could not be opened.",
       details: err.message,
-      actions: [
-        { label: 'Reload Page', action: () => location.reload() },
-      ],
+      actions: [{ label: "Reload Page", action: () => location.reload() }],
       dismissible: false,
     });
     throw err;
@@ -686,7 +690,7 @@ async function loadDatabase(updateStatus) {
 
   // Cache for next time and clean up stale entries (e.g., legacy "default" key)
   if (DB_STATE.cacheKey) {
-    updateStatus?.('Caching for offline...');
+    updateStatus?.("Caching for offline...");
     await cacheToOPFS(DB_STATE.db.export(), DB_STATE.cacheKey);
     cleanStaleOPFS(DB_STATE.cacheKey).catch(() => {});
   }
@@ -698,14 +702,14 @@ async function loadDatabase(updateStatus) {
  * Execute a SQL query and return results as array of objects
  */
 function execQuery(sql, params = []) {
-  if (!DB_STATE.db) throw new Error('Database not loaded');
+  if (!DB_STATE.db) throw new Error("Database not loaded");
 
   try {
     const result = DB_STATE.db.exec(sql, params);
     if (!result.length) return [];
 
     const { columns, values } = result[0];
-    return values.map(row => {
+    return values.map((row) => {
       const obj = {};
       columns.forEach((col, i) => {
         obj[col] = row[i];
@@ -713,7 +717,7 @@ function execQuery(sql, params = []) {
       return obj;
     });
   } catch (err) {
-    console.error('Query error:', err, sql);
+    console.error("Query error:", err, sql);
     throw err;
   }
 }
@@ -742,7 +746,7 @@ async function initGraphEngine() {
 
   // Check if we're already in fallback mode
   if (WASM_STATUS.fallbackMode) {
-    console.log('[Graph] Fallback mode active, skipping WASM init');
+    console.log("[Graph] Fallback mode active, skipping WASM init");
     return false;
   }
 
@@ -755,7 +759,7 @@ async function initGraphEngine() {
 
   try {
     // Dynamic import of the WASM module
-    const wasmModule = await import('./vendor/bv_graph.js');
+    const wasmModule = await import("./vendor/bv_graph.js");
     await wasmModule.default(); // Initialize WASM
 
     // Expose for other modules (e.g., graph.js force-graph view) to reuse.
@@ -767,12 +771,12 @@ async function initGraphEngine() {
 
     // Load graph data from SQLite
     if (!DB_STATE.db) {
-      console.warn('[Graph] Database not loaded yet');
+      console.warn("[Graph] Database not loaded yet");
       return false;
     }
 
     // Isolated issues participate in metrics too. Edges alone omit them.
-    for (const row of execQuery('SELECT id FROM issues ORDER BY id')) {
+    for (const row of execQuery("SELECT id FROM issues ORDER BY id")) {
       GRAPH_STATE.nodeMap.set(row.id, GRAPH_STATE.graph.addNode(row.id));
     }
 
@@ -796,10 +800,7 @@ async function initGraphEngine() {
         GRAPH_STATE.nodeMap.set(to, idx);
       }
 
-      GRAPH_STATE.graph.addEdge(
-        GRAPH_STATE.nodeMap.get(from),
-        GRAPH_STATE.nodeMap.get(to)
-      );
+      GRAPH_STATE.graph.addEdge(GRAPH_STATE.nodeMap.get(from), GRAPH_STATE.nodeMap.get(to));
     }
 
     GRAPH_STATE.ready = true;
@@ -807,13 +808,13 @@ async function initGraphEngine() {
     const nodeCount = GRAPH_STATE.graph.nodeCount();
     const edgeCount = GRAPH_STATE.graph.edgeCount();
     if (nodeCount === 0) {
-      console.log('[Graph] WASM engine ready (empty project)');
+      console.log("[Graph] WASM engine ready (empty project)");
     } else {
       console.log(`[Graph] WASM engine loaded: ${nodeCount} nodes, ${edgeCount} edges`);
     }
     return true;
   } catch (err) {
-    console.warn('[Graph] WASM init failed:', err.message);
+    console.warn("[Graph] WASM init failed:", err.message);
     enableFallbackMode(`WASM load failed: ${err.message}`);
     return false;
   }
@@ -823,7 +824,9 @@ async function initGraphEngine() {
  * Preserve resolved prerequisite identities even when their rows are omitted.
  */
 function getResolvedIssueIDs() {
-  const ids = new Set(execQuery("SELECT id FROM issues WHERE status IN ('closed', 'tombstone')").map(row => row.id));
+  const ids = new Set(
+    execQuery("SELECT id FROM issues WHERE status IN ('closed', 'tombstone')").map((row) => row.id),
+  );
   const metadata = getMeta().resolved_issue_ids;
   if (metadata) {
     for (const id of JSON.parse(metadata)) ids.add(id);
@@ -851,7 +854,9 @@ function buildClosedSet() {
 /** Restrict selectable issues without marking excluded prerequisites closed. */
 function buildCandidateSet(actionableOnly = false) {
   const candidates = new Uint8Array(GRAPH_STATE.graph.nodeCount());
-  const rows = execQuery(`SELECT id FROM issue_overview_mv${actionableOnly ? ' WHERE is_actionable = 1' : ''} ORDER BY id`);
+  const rows = execQuery(
+    `SELECT id FROM issue_overview_mv${actionableOnly ? " WHERE is_actionable = 1" : ""} ORDER BY id`,
+  );
   for (const { id } of rows) {
     const idx = GRAPH_STATE.nodeMap.get(id);
     if (idx !== undefined) candidates[idx] = 1;
@@ -867,13 +872,13 @@ function recalculateMetrics(issueIds) {
 
   const start = performance.now();
   const indices = issueIds
-    .map(id => GRAPH_STATE.nodeMap.get(id))
-    .filter(idx => idx !== undefined);
+    .map((id) => GRAPH_STATE.nodeMap.get(id))
+    .filter((idx) => idx !== undefined);
 
   if (indices.length === 0) return null;
 
   // Extract subgraph for filtered issues - use withSubgraph for automatic cleanup
-  const result = withSubgraph(indices, subgraph => ({
+  const result = withSubgraph(indices, (subgraph) => ({
     nodeCount: subgraph.nodeCount(),
     edgeCount: subgraph.edgeCount(),
     pagerank: subgraph.pagerankDefault(),
@@ -903,7 +908,7 @@ function whatIfClose(issueId) {
   // Convert node indices back to issue IDs
   if (result && result.cascade_ids) {
     result.cascade_issue_ids = result.cascade_ids
-      .map(i => GRAPH_STATE.graph.nodeId(i))
+      .map((i) => GRAPH_STATE.graph.nodeId(i))
       .filter(Boolean);
   }
 
@@ -920,7 +925,7 @@ function topWhatIf(limit = 10) {
   const results = GRAPH_STATE.graph.topWhatIf(closedSet, limit, buildCandidateSet(true));
 
   // Enrich with issue IDs
-  return (results || []).map(item => ({
+  return (results || []).map((item) => ({
     ...item,
     issueId: GRAPH_STATE.graph.nodeId(item.node),
     result: item.result,
@@ -933,8 +938,9 @@ function topWhatIf(limit = 10) {
 function getActionableIssues() {
   if (!GRAPH_STATE.ready) return [];
 
-  return execQuery('SELECT id FROM issue_overview_mv WHERE is_actionable = 1 ORDER BY id')
-    .map(row => row.id);
+  return execQuery("SELECT id FROM issue_overview_mv WHERE is_actionable = 1 ORDER BY id").map(
+    (row) => row.id,
+  );
 }
 
 /**
@@ -958,11 +964,11 @@ function getTopKSet(k = 5) {
 
   // Enrich with issue IDs
   if (result && result.items) {
-    result.items = result.items.map(item => ({
+    result.items = result.items.map((item) => ({
       ...item,
       issueId: GRAPH_STATE.graph.nodeId(item.node),
       unblocked_issue_ids: (item.unblocked_ids || [])
-        .map(i => GRAPH_STATE.graph.nodeId(i))
+        .map((i) => GRAPH_STATE.graph.nodeId(i))
         .filter(Boolean),
     }));
   }
@@ -977,7 +983,7 @@ function getTopKSet(k = 5) {
 /**
  * Build WHERE clauses from filters (shared between query and count)
  */
-function buildFilterClauses(filters = {}, tableAlias = '') {
+function buildFilterClauses(filters = {}, tableAlias = "") {
   const clauses = [];
   const params = [];
   const col = (name) => (tableAlias ? `${tableAlias}.${name}` : name);
@@ -986,10 +992,10 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
   if (filters.status?.length) {
     const statuses = Array.isArray(filters.status) ? filters.status : [filters.status];
     if (statuses.length === 1) {
-      clauses.push(`${col('status')} = ?`);
+      clauses.push(`${col("status")} = ?`);
       params.push(statuses[0]);
     } else {
-      clauses.push(`${col('status')} IN (${statuses.map(() => '?').join(',')})`);
+      clauses.push(`${col("status")} IN (${statuses.map(() => "?").join(",")})`);
       params.push(...statuses);
     }
   }
@@ -998,57 +1004,57 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
   if (filters.type?.length) {
     const types = Array.isArray(filters.type) ? filters.type : [filters.type];
     if (types.length === 1) {
-      clauses.push(`${col('issue_type')} = ?`);
+      clauses.push(`${col("issue_type")} = ?`);
       params.push(types[0]);
     } else {
-      clauses.push(`${col('issue_type')} IN (${types.map(() => '?').join(',')})`);
+      clauses.push(`${col("issue_type")} IN (${types.map(() => "?").join(",")})`);
       params.push(...types);
     }
   }
 
-	  // Priority filter (supports array for multi-select)
-	  if (filters.priority?.length) {
-	    const priorities = (Array.isArray(filters.priority) ? filters.priority : [filters.priority])
-	      .map(p => parseInt(p, 10))
-	      .filter(p => !isNaN(p));
-	    if (priorities.length === 1) {
-      clauses.push(`${col('priority')} = ?`);
+  // Priority filter (supports array for multi-select)
+  if (filters.priority?.length) {
+    const priorities = (Array.isArray(filters.priority) ? filters.priority : [filters.priority])
+      .map((p) => parseInt(p, 10))
+      .filter((p) => !isNaN(p));
+    if (priorities.length === 1) {
+      clauses.push(`${col("priority")} = ?`);
       params.push(priorities[0]);
     } else if (priorities.length > 1) {
-      clauses.push(`${col('priority')} IN (${priorities.map(() => '?').join(',')})`);
+      clauses.push(`${col("priority")} IN (${priorities.map(() => "?").join(",")})`);
       params.push(...priorities);
     }
   }
 
   // Assignee filter
   if (filters.assignee) {
-    clauses.push(`${col('assignee')} = ?`);
+    clauses.push(`${col("assignee")} = ?`);
     params.push(filters.assignee);
   }
 
   // Readiness comes from the full-source export snapshot, not visible edges.
-  if (filters.hasBlockers === true || filters.hasBlockers === 'true') {
-    clauses.push(`${col('dependency_state')} <> 'satisfied'`);
-  } else if (filters.hasBlockers === false || filters.hasBlockers === 'false') {
-    clauses.push(`${col('is_actionable')} = 1`);
+  if (filters.hasBlockers === true || filters.hasBlockers === "true") {
+    clauses.push(`${col("dependency_state")} <> 'satisfied'`);
+  } else if (filters.hasBlockers === false || filters.hasBlockers === "false") {
+    clauses.push(`${col("is_actionable")} = 1`);
   }
 
   // Blocking filter (has items depending on it)
-  if (filters.isBlocking === true || filters.isBlocking === 'true') {
-    clauses.push(`${col('blocks_count')} > 0`);
+  if (filters.isBlocking === true || filters.isBlocking === "true") {
+    clauses.push(`${col("blocks_count")} > 0`);
   }
 
   // Label filter (JSON array contains)
   if (filters.labels?.length) {
     const labels = Array.isArray(filters.labels) ? filters.labels : [filters.labels];
-    const labelClauses = labels.map(() => `${col('labels')} LIKE ?`);
-    clauses.push(`(${labelClauses.join(' OR ')})`);
-    params.push(...labels.map(l => `%"${l}"%`));
+    const labelClauses = labels.map(() => `${col("labels")} LIKE ?`);
+    clauses.push(`(${labelClauses.join(" OR ")})`);
+    params.push(...labels.map((l) => `%"${l}"%`));
   }
 
   // Search filter (LIKE-based, FTS5 handled separately)
   if (filters.search) {
-    clauses.push(`(${col('title')} LIKE ? OR ${col('description')} LIKE ? OR ${col('id')} LIKE ?)`);
+    clauses.push(`(${col("title")} LIKE ? OR ${col("description")} LIKE ? OR ${col("id")} LIKE ?)`);
     const searchTerm = `%${filters.search}%`;
     params.push(searchTerm, searchTerm, searchTerm);
   }
@@ -1059,23 +1065,23 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
 /**
  * Query issues with filters, sorting, and pagination
  */
-function queryIssues(filters = {}, sort = 'priority', limit = 50, offset = 0) {
+function queryIssues(filters = {}, sort = "priority", limit = 50, offset = 0) {
   const { clauses, params } = buildFilterClauses(filters);
 
   let sql = `SELECT * FROM issue_overview_mv`;
   if (clauses.length > 0) {
-    sql += ` WHERE ${clauses.join(' AND ')}`;
+    sql += ` WHERE ${clauses.join(" AND ")}`;
   }
 
   // Sorting
   const sortMap = {
-    'priority': 'priority ASC, triage_score DESC',
-    'updated': 'updated_at DESC',
-    'score': 'triage_score DESC',
-    'blocks': 'blocks_count DESC',
-    'created': 'created_at DESC',
-    'title': 'title ASC',
-    'id': 'id ASC',
+    priority: "priority ASC, triage_score DESC",
+    updated: "updated_at DESC",
+    score: "triage_score DESC",
+    blocks: "blocks_count DESC",
+    created: "created_at DESC",
+    title: "title ASC",
+    id: "id ASC",
   };
   sql += ` ORDER BY ${sortMap[sort] || sortMap.priority}`;
   sql += ` LIMIT ? OFFSET ?`;
@@ -1092,7 +1098,7 @@ function countIssues(filters = {}) {
 
   let sql = `SELECT COUNT(*) as count FROM issue_overview_mv`;
   if (clauses.length > 0) {
-    sql += ` WHERE ${clauses.join(' AND ')}`;
+    sql += ` WHERE ${clauses.join(" AND ")}`;
   }
 
   return execScalar(sql, params) || 0;
@@ -1101,29 +1107,41 @@ function countIssues(filters = {}) {
 /**
  * Get unique values for filter dropdowns
  */
-	function getFilterOptions() {
-	  return {
-	    statuses: execQuery(`SELECT DISTINCT status FROM issue_overview_mv ORDER BY status`).map(r => r.status),
-	    types: execQuery(`SELECT DISTINCT issue_type FROM issue_overview_mv ORDER BY issue_type`).map(r => r.issue_type),
-	    priorities: execQuery(`SELECT DISTINCT priority FROM issue_overview_mv ORDER BY priority`).map(r => r.priority),
-	    assignees: execQuery(`SELECT DISTINCT assignee FROM issue_overview_mv WHERE assignee IS NOT NULL AND assignee <> '' ORDER BY assignee`).map(r => r.assignee),
-	    labels: getUniqueLabels(),
-	  };
-	}
+function getFilterOptions() {
+  return {
+    statuses: execQuery(`SELECT DISTINCT status FROM issue_overview_mv ORDER BY status`).map(
+      (r) => r.status,
+    ),
+    types: execQuery(`SELECT DISTINCT issue_type FROM issue_overview_mv ORDER BY issue_type`).map(
+      (r) => r.issue_type,
+    ),
+    priorities: execQuery(`SELECT DISTINCT priority FROM issue_overview_mv ORDER BY priority`).map(
+      (r) => r.priority,
+    ),
+    assignees: execQuery(
+      `SELECT DISTINCT assignee FROM issue_overview_mv WHERE assignee IS NOT NULL AND assignee <> '' ORDER BY assignee`,
+    ).map((r) => r.assignee),
+    labels: getUniqueLabels(),
+  };
+}
 
 /**
  * Get unique labels from all issues
  */
-	function getUniqueLabels() {
-	  const results = execQuery(`SELECT labels FROM issue_overview_mv WHERE labels IS NOT NULL AND labels <> ''`);
-	  const labelSet = new Set();
-	  for (const row of results) {
-	    try {
-	      const labels = JSON.parse(row.labels);
-	      if (Array.isArray(labels)) {
-        labels.forEach(l => labelSet.add(l));
+function getUniqueLabels() {
+  const results = execQuery(
+    `SELECT labels FROM issue_overview_mv WHERE labels IS NOT NULL AND labels <> ''`,
+  );
+  const labelSet = new Set();
+  for (const row of results) {
+    try {
+      const labels = JSON.parse(row.labels);
+      if (Array.isArray(labels)) {
+        labels.forEach((l) => labelSet.add(l));
       }
-    } catch { /* ignore parse errors */ }
+    } catch {
+      /* ignore parse errors */
+    }
   }
   return Array.from(labelSet).sort();
 }
@@ -1149,7 +1167,7 @@ function getIssueComments(id) {
   try {
     return execQuery(
       `SELECT author, text, created_at FROM comments WHERE issue_id = ? ORDER BY created_at ASC, id ASC`,
-      [id]
+      [id],
     );
   } catch {
     return [];
@@ -1179,14 +1197,14 @@ function getGraphViewData() {
     SELECT id, title, description, status, priority, issue_type, assignee, labels,
            created_at, updated_at, blocker_count, dependent_count
     FROM issue_overview_mv
-  `).map(row => ({
+  `).map((row) => ({
     id: row.id,
-    title: row.title || '',
-    description: row.description || '',
-    status: row.status || 'open',
+    title: row.title || "",
+    description: row.description || "",
+    status: row.status || "open",
     priority: row.priority ?? 2,
-    type: row.issue_type || 'task',
-    assignee: row.assignee || '',
+    type: row.issue_type || "task",
+    assignee: row.assignee || "",
     labels: parseLabelsJSON(row.labels),
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -1208,17 +1226,17 @@ function getGraphViewData() {
 /**
  * Full-text search using FTS5 (if available)
  */
-const BM25_WEIGHTS = '3.0, 2.0, 1.0, 1.5, 0.5'; // id, title, description, labels, assignee
+const BM25_WEIGHTS = "3.0, 2.0, 1.0, 1.5, 0.5"; // id, title, description, labels, assignee
 const BM25_EXPR = `bm25(issues_fts, ${BM25_WEIGHTS})`;
 
 function isLikelyIssueID(term) {
-  return /^[A-Za-z]+-[A-Za-z0-9]+$/.test((term || '').trim());
+  return /^[A-Za-z]+-[A-Za-z0-9]+$/.test((term || "").trim());
 }
 
 function promoteExactID(term, rows) {
-  const needle = (term || '').trim().toLowerCase();
+  const needle = (term || "").trim().toLowerCase();
   if (!needle || rows.length === 0) return rows;
-  const idx = rows.findIndex(r => String(r.id || r.issue_id || '').toLowerCase() === needle);
+  const idx = rows.findIndex((r) => String(r.id || r.issue_id || "").toLowerCase() === needle);
   if (idx > 0) {
     const match = rows.splice(idx, 1)[0];
     rows.unshift(match);
@@ -1239,7 +1257,7 @@ function countTokens(term) {
 }
 
 function isShortQuery(term) {
-  const trimmed = (term || '').trim();
+  const trimmed = (term || "").trim();
   if (!trimmed) return true;
   const tokens = countTokens(trimmed);
   return tokens <= SHORT_QUERY_TOKEN_LIMIT || trimmed.length <= SHORT_QUERY_LENGTH_LIMIT;
@@ -1250,11 +1268,12 @@ function adjustHybridWeightsForQuery(baseWeights, term) {
   const currentText = Number(baseWeights.text ?? 0);
   if (currentText >= SHORT_QUERY_MIN_TEXT_WEIGHT) return baseWeights;
   const targetText = SHORT_QUERY_MIN_TEXT_WEIGHT;
-  const remainder = (Number(baseWeights.pagerank ?? 0) +
+  const remainder =
+    Number(baseWeights.pagerank ?? 0) +
     Number(baseWeights.status ?? 0) +
     Number(baseWeights.impact ?? 0) +
     Number(baseWeights.priority ?? 0) +
-    Number(baseWeights.recency ?? 0));
+    Number(baseWeights.recency ?? 0);
   if (remainder <= 0 || targetText >= 1) {
     return {
       text: 1,
@@ -1278,24 +1297,18 @@ function adjustHybridWeightsForQuery(baseWeights, term) {
 
 function supportsFTS5() {
   if (DB_STATE.fts5 === null) {
-    DB_STATE.fts5 = execQuery('PRAGMA module_list').some(row => row.name === 'fts5');
+    DB_STATE.fts5 = execQuery("PRAGMA module_list").some((row) => row.name === "fts5");
   }
   return DB_STATE.fts5;
 }
 
 function searchIssues(term, options = {}) {
-  const {
-    mode = 'text',
-    preset = 'default',
-    limit = 50,
-    offset = 0,
-    filters = {},
-  } = options;
+  const { mode = "text", preset = "default", limit = 50, offset = 0, filters = {} } = options;
 
   const searchFilters = { ...filters };
   delete searchFilters.search;
 
-  const { clauses, params } = buildFilterClauses(searchFilters, 'i');
+  const { clauses, params } = buildFilterClauses(searchFilters, "i");
   const baseSQL = `
       SELECT i.*,
              snippet(issues_fts, 2, '<mark>', '</mark>', '...', 32) as snippet,
@@ -1305,18 +1318,18 @@ function searchIssues(term, options = {}) {
       WHERE issues_fts MATCH ?
     `;
   let sql = baseSQL;
-  const queryParams = [term + '*'];
+  const queryParams = [term + "*"];
   if (clauses.length > 0) {
-    sql += ` AND ${clauses.join(' AND ')}`;
+    sql += ` AND ${clauses.join(" AND ")}`;
     queryParams.push(...params);
   }
 
   let fetchLimit = limit;
-  if (mode === 'hybrid') {
+  if (mode === "hybrid") {
     const minCandidates = isShortQuery(term) ? HYBRID_CANDIDATE_MIN_SHORT : HYBRID_CANDIDATE_MIN;
     fetchLimit = Math.max(limit * 2, offset + limit, minCandidates);
   }
-  const fetchOffset = mode === 'hybrid' ? 0 : offset;
+  const fetchOffset = mode === "hybrid" ? 0 : offset;
   sql += ` ORDER BY ${BM25_EXPR} LIMIT ? OFFSET ?`;
   queryParams.push(fetchLimit, fetchOffset);
 
@@ -1327,23 +1340,27 @@ function searchIssues(term, options = {}) {
     } catch {
       // Invalid FTS syntax can still use plain substring matching. Continue
       // through the same hybrid scorer instead of silently losing ranking.
-      rows = queryIssues({ ...searchFilters, search: term }, 'score', fetchLimit, fetchOffset);
+      rows = queryIssues({ ...searchFilters, search: term }, "score", fetchLimit, fetchOffset);
     }
   } else {
-    rows = queryIssues({ ...searchFilters, search: term }, 'score', fetchLimit, fetchOffset);
+    rows = queryIssues({ ...searchFilters, search: term }, "score", fetchLimit, fetchOffset);
   }
   if (isLikelyIssueID(term)) {
     rows = promoteExactID(term, rows);
   }
 
-  if (mode !== 'hybrid' || typeof HybridScorer === 'undefined' || typeof HYBRID_PRESETS === 'undefined') {
+  if (
+    mode !== "hybrid" ||
+    typeof HybridScorer === "undefined" ||
+    typeof HYBRID_PRESETS === "undefined"
+  ) {
     return rows.slice(0, limit);
   }
 
-  const maxBM25 = Math.max(...rows.map(r => Math.abs(r.bm25_score ?? 0)), 0);
-  const normalized = rows.map(r => ({
+  const maxBM25 = Math.max(...rows.map((r) => Math.abs(r.bm25_score ?? 0)), 0);
+  const normalized = rows.map((r) => ({
     ...r,
-    textScore: maxBM25 > 0 ? (1 - Math.min(Math.abs(r.bm25_score ?? 0) / maxBM25, 1)) : 0.5,
+    textScore: maxBM25 > 0 ? 1 - Math.min(Math.abs(r.bm25_score ?? 0) / maxBM25, 1) : 0.5,
     blockerCount: r.blocker_count ?? r.blocked_by_count ?? 0,
     updatedAt: r.updated_at,
     pagerank: r.pagerank,
@@ -1354,7 +1371,7 @@ function searchIssues(term, options = {}) {
   const baseWeights = HYBRID_PRESETS[preset] || HYBRID_PRESETS.default;
   const weights = adjustHybridWeightsForQuery(baseWeights, term);
   let ranked = null;
-  if (typeof window.scoreBatchHybrid === 'function') {
+  if (typeof window.scoreBatchHybrid === "function") {
     ranked = window.scoreBatchHybrid(normalized, weights);
   }
   if (!Array.isArray(ranked)) {
@@ -1365,19 +1382,17 @@ function searchIssues(term, options = {}) {
     ranked = promoteExactID(term, ranked);
   }
 
-  return ranked
-    .slice(offset, offset + limit)
-    .map(r => ({
-      ...r,
-      text_score: r.textScore,
-    }));
+  return ranked.slice(offset, offset + limit).map((r) => ({
+    ...r,
+    text_score: r.textScore,
+  }));
 }
 
 function countSearchIssues(term, filters = {}) {
   const searchFilters = { ...filters };
   delete searchFilters.search;
   if (!supportsFTS5()) return countIssues({ ...searchFilters, search: term });
-  const { clauses, params } = buildFilterClauses(searchFilters, 'i');
+  const { clauses, params } = buildFilterClauses(searchFilters, "i");
 
   let sql = `
       SELECT COUNT(*) as count
@@ -1385,9 +1400,9 @@ function countSearchIssues(term, filters = {}) {
       JOIN issue_overview_mv i ON issues_fts.id = i.id
       WHERE issues_fts MATCH ?
     `;
-  const queryParams = [term + '*'];
+  const queryParams = [term + "*"];
   if (clauses.length > 0) {
-    sql += ` AND ${clauses.join(' AND ')}`;
+    sql += ` AND ${clauses.join(" AND ")}`;
     queryParams.push(...params);
   }
 
@@ -1411,24 +1426,26 @@ function getStats() {
       FROM issue_overview_mv
       GROUP BY status
     `);
-    console.log('[Stats] Status counts:', statusCounts);
-    statusCounts.forEach(row => {
+    console.log("[Stats] Status counts:", statusCounts);
+    statusCounts.forEach((row) => {
       stats[row.status] = row.count;
     });
-    console.log('[Stats] Parsed stats:', stats);
+    console.log("[Stats] Parsed stats:", stats);
   } catch (err) {
-    console.error('[Stats] Error loading status counts:', err);
+    console.error("[Stats] Error loading status counts:", err);
   }
 
   // Missing prerequisites and inherited parent gates also withhold readiness.
-  stats.blocked = execScalar(`
+  stats.blocked =
+    execScalar(`
     SELECT COUNT(*) FROM issue_overview_mv
     WHERE dependency_state <> 'satisfied'
     AND status IN ('open', 'in_progress')
   `) || 0;
 
   // Planning readiness includes deferral and lifecycle at the export clock.
-  stats.actionable = execScalar(`
+  stats.actionable =
+    execScalar(`
     SELECT COUNT(*) FROM issue_overview_mv
     WHERE is_actionable = 1
   `) || 0;
@@ -1444,110 +1461,131 @@ function getStats() {
  * Get quick wins - actionable issues that unblock the most items
  */
 function getQuickWins(limit = 5) {
-  return execQuery(`
+  return execQuery(
+    `
     SELECT * FROM issue_overview_mv
     WHERE is_actionable = 1
     ORDER BY blocks_count DESC, triage_score DESC
     LIMIT ?
-  `, [limit]);
+  `,
+    [limit],
+  );
 }
 
 /**
  * Get blockers to clear - issues blocking the most other issues
  */
 function getBlockersToClose(limit = 5) {
-  return execQuery(`
+  return execQuery(
+    `
     SELECT * FROM issue_overview_mv
     WHERE status IN ('open', 'in_progress')
     AND blocks_count > 0
     ORDER BY blocks_count DESC, triage_score DESC
     LIMIT ?
-  `, [limit]);
+  `,
+    [limit],
+  );
 }
 
 /**
  * Get distribution by type
  */
 function getDistributionByType() {
-	  return execQuery(`
+  return execQuery(`
 	    SELECT issue_type as type, COUNT(*) as count
 	    FROM issue_overview_mv
 	    WHERE status <> 'closed'
 	    GROUP BY issue_type
 	    ORDER BY count DESC
 	  `);
-	}
+}
 
 /**
  * Get distribution by priority
  */
 function getDistributionByPriority() {
-	  return execQuery(`
+  return execQuery(`
 	    SELECT priority, COUNT(*) as count
 	    FROM issue_overview_mv
 	    WHERE status <> 'closed'
 	    GROUP BY priority
 	    ORDER BY priority ASC
 	  `);
-	}
+}
 
 /**
  * Get top issues by triage score
  */
 function getTopPicks(limit = 5) {
-  return execQuery(`
+  return execQuery(
+    `
     SELECT * FROM issue_overview_mv
     WHERE status IN ('open', 'in_progress')
     ORDER BY triage_score DESC
     LIMIT ?
-  `, [limit]);
+  `,
+    [limit],
+  );
 }
 
 /**
  * Get recent issues by update time
  */
 function getRecentIssues(limit = 10) {
-  return execQuery(`
+  return execQuery(
+    `
     SELECT * FROM issue_overview_mv
     ORDER BY updated_at DESC
     LIMIT ?
-  `, [limit]);
+  `,
+    [limit],
+  );
 }
 
 /**
  * Get top issues by PageRank
  */
 function getTopByPageRank(limit = 10) {
-  return execQuery(`
+  return execQuery(
+    `
     SELECT * FROM issue_overview_mv
     WHERE pagerank > 0
     ORDER BY pagerank DESC
     LIMIT ?
-  `, [limit]);
+  `,
+    [limit],
+  );
 }
 
 /**
  * Get top issues by triage score
  */
 function getTopByTriageScore(limit = 10) {
-  return execQuery(`
+  return execQuery(
+    `
     SELECT * FROM issue_overview_mv
     WHERE triage_score > 0
     ORDER BY triage_score DESC
     LIMIT ?
-  `, [limit]);
+  `,
+    [limit],
+  );
 }
 
 /**
  * Get top blocking issues
  */
 function getTopBlockers(limit = 10) {
-  return execQuery(`
+  return execQuery(
+    `
     SELECT * FROM issue_overview_mv
     WHERE blocks_count > 0
     ORDER BY blocks_count DESC
     LIMIT ?
-  `, [limit]);
+  `,
+    [limit],
+  );
 }
 
 /**
@@ -1557,12 +1595,12 @@ function getTopBlockers(limit = 10) {
 function getRankedGraphIssues(values, field, limit, include = () => true) {
   if (!GRAPH_STATE.ready || !values?.length || limit <= 0) return [];
 
-  const ranked = execQuery('SELECT id FROM issue_overview_mv ORDER BY id')
+  const ranked = execQuery("SELECT id FROM issue_overview_mv ORDER BY id")
     .map(({ id }) => ({ id, value: values[GRAPH_STATE.nodeMap.get(id)] }))
-    .filter(row => row.value !== undefined && include(row.value));
+    .filter((row) => row.value !== undefined && include(row.value));
   ranked.sort((a, b) => b.value - a.value);
 
-  return ranked.slice(0, limit).map(row => {
+  return ranked.slice(0, limit).map((row) => {
     const issue = getIssue(row.id);
     issue[field] = row.value;
     return issue;
@@ -1575,12 +1613,15 @@ function getRankedGraphIssues(values, field, limit, include = () => true) {
 function getTopByBetweenness(limit = 10) {
   // Try betweenness column if it exists
   try {
-    const results = execQuery(`
+    const results = execQuery(
+      `
       SELECT * FROM issue_overview_mv
       WHERE betweenness > 0
       ORDER BY betweenness DESC
       LIMIT ?
-    `, [limit]);
+    `,
+      [limit],
+    );
     if (results.length > 0) return results;
   } catch {
     // Column may not exist
@@ -1590,7 +1631,7 @@ function getTopByBetweenness(limit = 10) {
   if (GRAPH_STATE.ready) {
     const betweenness = GRAPH_STATE.graph.betweenness();
     if (betweenness && betweenness.length > 0) {
-      return getRankedGraphIssues(betweenness, 'betweenness', limit);
+      return getRankedGraphIssues(betweenness, "betweenness", limit);
     }
   }
 
@@ -1603,12 +1644,15 @@ function getTopByBetweenness(limit = 10) {
 function getTopByCriticalPath(limit = 10) {
   // Try critical_path_depth column if it exists
   try {
-    const results = execQuery(`
+    const results = execQuery(
+      `
       SELECT * FROM issue_overview_mv
       WHERE critical_path_depth > 0
       ORDER BY critical_path_depth DESC
       LIMIT ?
-    `, [limit]);
+    `,
+      [limit],
+    );
     if (results.length > 0) return results;
   } catch {
     // Column may not exist
@@ -1618,7 +1662,7 @@ function getTopByCriticalPath(limit = 10) {
   if (GRAPH_STATE.ready) {
     const heights = GRAPH_STATE.graph.criticalPathHeights();
     if (heights && heights.length > 0) {
-      return getRankedGraphIssues(heights, 'critical_path_depth', limit);
+      return getRankedGraphIssues(heights, "critical_path_depth", limit);
     }
   }
 
@@ -1636,9 +1680,9 @@ function getTopByHITSHub(limit = 10) {
     const hitsResult = GRAPH_STATE.graph.hitsDefault();
     if (!hitsResult || !hitsResult.hubs) return [];
 
-    return getRankedGraphIssues(hitsResult.hubs, 'hits_hub', limit);
+    return getRankedGraphIssues(hitsResult.hubs, "hits_hub", limit);
   } catch (e) {
-    console.warn('[viewer] getTopByHITSHub failed:', e);
+    console.warn("[viewer] getTopByHITSHub failed:", e);
     return [];
   }
 }
@@ -1654,9 +1698,9 @@ function getTopByHITSAuth(limit = 10) {
     const hitsResult = GRAPH_STATE.graph.hitsDefault();
     if (!hitsResult || !hitsResult.authorities) return [];
 
-    return getRankedGraphIssues(hitsResult.authorities, 'hits_auth', limit);
+    return getRankedGraphIssues(hitsResult.authorities, "hits_auth", limit);
   } catch (e) {
-    console.warn('[viewer] getTopByHITSAuth failed:', e);
+    console.warn("[viewer] getTopByHITSAuth failed:", e);
     return [];
   }
 }
@@ -1672,9 +1716,9 @@ function getTopByKCore(limit = 10) {
     const kcoreValues = GRAPH_STATE.graph.kcore();
     if (!kcoreValues || kcoreValues.length === 0) return [];
 
-    return getRankedGraphIssues(kcoreValues, 'kcore', limit);
+    return getRankedGraphIssues(kcoreValues, "kcore", limit);
   } catch (e) {
-    console.warn('[viewer] getTopByKCore failed:', e);
+    console.warn("[viewer] getTopByKCore failed:", e);
     return [];
   }
 }
@@ -1690,16 +1734,18 @@ function getArticulationPoints() {
     const artPoints = GRAPH_STATE.graph.articulationPoints();
     if (!artPoints || artPoints.length === 0) return [];
 
-    return Array.from(artPoints).map(idx => {
-      const id = GRAPH_STATE.graph.nodeId(idx);
-      const issue = getIssue(id);
-      if (issue) {
-        issue.is_articulation = true;
-      }
-      return issue;
-    }).filter(Boolean);
+    return Array.from(artPoints)
+      .map((idx) => {
+        const id = GRAPH_STATE.graph.nodeId(idx);
+        const issue = getIssue(id);
+        if (issue) {
+          issue.is_articulation = true;
+        }
+        return issue;
+      })
+      .filter(Boolean);
   } catch (e) {
-    console.warn('[viewer] getArticulationPoints failed:', e);
+    console.warn("[viewer] getArticulationPoints failed:", e);
     return [];
   }
 }
@@ -1715,14 +1761,18 @@ function getIssuesBySlack(limit = 10, showZeroSlack = true) {
     const slackValues = GRAPH_STATE.graph.slack();
     if (!slackValues || slackValues.length === 0) return [];
 
-    const issues = getRankedGraphIssues(slackValues, 'slack', limit,
-      value => !showZeroSlack || value === 0);
+    const issues = getRankedGraphIssues(
+      slackValues,
+      "slack",
+      limit,
+      (value) => !showZeroSlack || value === 0,
+    );
     for (const issue of issues) {
       issue.on_critical_path = issue.slack === 0;
     }
     return issues;
   } catch (e) {
-    console.warn('[viewer] getIssuesBySlack failed:', e);
+    console.warn("[viewer] getIssuesBySlack failed:", e);
     return [];
   }
 }
@@ -1807,7 +1857,7 @@ function getCriticalPathSequence() {
 function getMeta() {
   const meta = {};
   const rows = execQuery(`SELECT key, value FROM export_meta`);
-  rows.forEach(row => {
+  rows.forEach((row) => {
     meta[row.key] = row.value;
   });
   return meta;
@@ -1817,19 +1867,25 @@ function getMeta() {
  * Get dependencies for an issue
  */
 function getIssueDependencies(id) {
-  const blockedBy = execQuery(`
+  const blockedBy = execQuery(
+    `
     SELECT i.* FROM issue_overview_mv i
     JOIN dependencies d ON i.id = d.depends_on_id
     WHERE d.issue_id = ? AND d.type IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
     ORDER BY i.id
-  `, [id]);
+  `,
+    [id],
+  );
 
-  const blocks = execQuery(`
+  const blocks = execQuery(
+    `
     SELECT i.* FROM issue_overview_mv i
     JOIN dependencies d ON i.id = d.issue_id
     WHERE d.depends_on_id = ? AND d.type IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
     ORDER BY i.id
-  `, [id]);
+  `,
+    [id],
+  );
 
   return { blocks, blockedBy };
 }
@@ -1847,49 +1903,49 @@ function filtersToURL(filters, sort, searchQuery) {
   if (filters.status?.length) {
     const statuses = Array.isArray(filters.status) ? filters.status : [filters.status];
     if (statuses.length > 0 && statuses[0]) {
-      params.set('status', statuses.join(','));
+      params.set("status", statuses.join(","));
     }
   }
 
   if (filters.type?.length) {
     const types = Array.isArray(filters.type) ? filters.type : [filters.type];
     if (types.length > 0 && types[0]) {
-      params.set('type', types.join(','));
+      params.set("type", types.join(","));
     }
   }
 
   if (filters.priority?.length) {
     const priorities = Array.isArray(filters.priority) ? filters.priority : [filters.priority];
-    const validPriorities = priorities.filter(p => p !== '' && p !== null && p !== undefined);
+    const validPriorities = priorities.filter((p) => p !== "" && p !== null && p !== undefined);
     if (validPriorities.length > 0) {
-      params.set('priority', validPriorities.join(','));
+      params.set("priority", validPriorities.join(","));
     }
   }
 
   if (filters.labels?.length) {
-    params.set('labels', filters.labels.join(','));
+    params.set("labels", filters.labels.join(","));
   }
 
   if (filters.assignee) {
-    params.set('assignee', filters.assignee);
+    params.set("assignee", filters.assignee);
   }
 
-  if (filters.hasBlockers === true || filters.hasBlockers === 'true') {
-    params.set('blocked', 'true');
-  } else if (filters.hasBlockers === false || filters.hasBlockers === 'false') {
-    params.set('blocked', 'false');
+  if (filters.hasBlockers === true || filters.hasBlockers === "true") {
+    params.set("blocked", "true");
+  } else if (filters.hasBlockers === false || filters.hasBlockers === "false") {
+    params.set("blocked", "false");
   }
 
-  if (filters.isBlocking === true || filters.isBlocking === 'true') {
-    params.set('blocking', 'true');
+  if (filters.isBlocking === true || filters.isBlocking === "true") {
+    params.set("blocking", "true");
   }
 
   if (searchQuery) {
-    params.set('q', searchQuery);
+    params.set("q", searchQuery);
   }
 
-  if (sort && sort !== 'priority') {
-    params.set('sort', sort);
+  if (sort && sort !== "priority") {
+    params.set("sort", sort);
   }
 
   return params.toString();
@@ -1900,54 +1956,57 @@ function filtersToURL(filters, sort, searchQuery) {
  */
 function filtersFromURL() {
   const hash = window.location.hash;
-  const queryIndex = hash.indexOf('?');
-  if (queryIndex === -1) return { filters: {}, sort: 'priority', searchQuery: '' };
+  const queryIndex = hash.indexOf("?");
+  if (queryIndex === -1) return { filters: {}, sort: "priority", searchQuery: "" };
 
   const params = new URLSearchParams(hash.slice(queryIndex + 1));
 
   const filters = {};
 
-  const statusParam = params.get('status');
+  const statusParam = params.get("status");
   if (statusParam) {
-    filters.status = statusParam.split(',').filter(Boolean);
+    filters.status = statusParam.split(",").filter(Boolean);
   }
 
-  const typeParam = params.get('type');
+  const typeParam = params.get("type");
   if (typeParam) {
-    filters.type = typeParam.split(',').filter(Boolean);
+    filters.type = typeParam.split(",").filter(Boolean);
   }
 
-  const priorityParam = params.get('priority');
+  const priorityParam = params.get("priority");
   if (priorityParam) {
-    filters.priority = priorityParam.split(',').map(Number).filter(n => !isNaN(n));
+    filters.priority = priorityParam
+      .split(",")
+      .map(Number)
+      .filter((n) => !isNaN(n));
   }
 
-  const labelsParam = params.get('labels');
+  const labelsParam = params.get("labels");
   if (labelsParam) {
-    filters.labels = labelsParam.split(',').filter(Boolean);
+    filters.labels = labelsParam.split(",").filter(Boolean);
   }
 
-  const assigneeParam = params.get('assignee');
+  const assigneeParam = params.get("assignee");
   if (assigneeParam) {
     filters.assignee = assigneeParam;
   }
 
-  const blockedParam = params.get('blocked');
-  if (blockedParam === 'true') {
+  const blockedParam = params.get("blocked");
+  if (blockedParam === "true") {
     filters.hasBlockers = true;
-  } else if (blockedParam === 'false') {
+  } else if (blockedParam === "false") {
     filters.hasBlockers = false;
   }
 
-  const blockingParam = params.get('blocking');
-  if (blockingParam === 'true') {
+  const blockingParam = params.get("blocking");
+  if (blockingParam === "true") {
     filters.isBlocking = true;
   }
 
   return {
     filters,
-    sort: params.get('sort') || 'priority',
-    searchQuery: params.get('q') || '',
+    sort: params.get("sort") || "priority",
+    searchQuery: params.get("q") || "",
   };
 }
 
@@ -1955,13 +2014,13 @@ function filtersFromURL() {
  * Update URL with current filter state (without page reload)
  */
 function syncFiltersToURL(view, filters, sort, searchQuery) {
-  if (window.location.hash.startsWith('#/issue/')) return;
+  if (window.location.hash.startsWith("#/issue/")) return;
   const paramString = filtersToURL(filters, sort, searchQuery);
   const baseHash = `#/${view}`;
   const newHash = paramString ? `${baseHash}?${paramString}` : baseHash;
 
   if (window.location.hash !== newHash) {
-    history.replaceState(null, '', newHash);
+    history.replaceState(null, "", newHash);
   }
 }
 
@@ -1974,14 +2033,14 @@ function syncFiltersToURL(view, filters, sort, searchQuery) {
  * :param syntax for dynamic segments
  */
 const ROUTES = [
-  { pattern: '/', view: 'dashboard' },
-  { pattern: '/issues', view: 'issues' },
-  { pattern: '/issue/:id', view: 'issue' },
-  { pattern: '/insights', view: 'insights' },
-  { pattern: '/graph', view: 'graph' },
+  { pattern: "/", view: "dashboard" },
+  { pattern: "/issues", view: "issues" },
+  { pattern: "/issue/:id", view: "issue" },
+  { pattern: "/insights", view: "insights" },
+  { pattern: "/graph", view: "graph" },
 ];
 
-const DIRECT_VIEW_ROUTES = new Set(['issues', 'insights', 'graph']);
+const DIRECT_VIEW_ROUTES = new Set(["issues", "insights", "graph"]);
 
 /**
  * Resolve a static view from the final URL path segment.
@@ -1991,14 +2050,14 @@ const DIRECT_VIEW_ROUTES = new Set(['issues', 'insights', 'graph']);
  * on the initial load when no hash route is present.
  */
 function routeHashFromPathname(pathname) {
-  const segments = (pathname || '/').split('/').filter(Boolean);
-  const finalSegment = segments[segments.length - 1] || '';
+  const segments = (pathname || "/").split("/").filter(Boolean);
+  const finalSegment = segments[segments.length - 1] || "";
 
   if (DIRECT_VIEW_ROUTES.has(finalSegment)) {
     return `#/${finalSegment}`;
   }
 
-  return '#/';
+  return "#/";
 }
 
 /**
@@ -2006,9 +2065,9 @@ function routeHashFromPathname(pathname) {
  */
 function parseRoute(hash) {
   // Remove leading # and extract path vs query
-  const hashContent = hash.slice(1) || '/';
-  const [path, query] = hashContent.split('?');
-  const normalizedPath = path.startsWith('/') ? path : '/' + path;
+  const hashContent = hash.slice(1) || "/";
+  const [path, query] = hashContent.split("?");
+  const normalizedPath = path.startsWith("/") ? path : "/" + path;
 
   // Try to match each route pattern
   for (const route of ROUTES) {
@@ -2023,15 +2082,15 @@ function parseRoute(hash) {
   }
 
   // Default to dashboard
-  return { view: 'dashboard', params: {}, query: new URLSearchParams() };
+  return { view: "dashboard", params: {}, query: new URLSearchParams() };
 }
 
 /**
  * Match a URL path against a pattern with :param placeholders
  */
 function matchPattern(pattern, path) {
-  const patternParts = pattern.split('/').filter(Boolean);
-  const pathParts = path.split('/').filter(Boolean);
+  const patternParts = pattern.split("/").filter(Boolean);
+  const pathParts = path.split("/").filter(Boolean);
 
   // Handle root route
   if (patternParts.length === 0 && pathParts.length === 0) {
@@ -2047,7 +2106,7 @@ function matchPattern(pattern, path) {
     const patternPart = patternParts[i];
     const pathPart = pathParts[i];
 
-    if (patternPart.startsWith(':')) {
+    if (patternPart.startsWith(":")) {
       // Dynamic segment - capture as param
       params[patternPart.slice(1)] = decodeURIComponent(pathPart);
     } else if (patternPart !== pathPart) {
@@ -2063,7 +2122,7 @@ function matchPattern(pattern, path) {
  * Navigate to a route (pushes to history)
  */
 function navigate(path) {
-  const newHash = path.startsWith('#') ? path : '#' + path;
+  const newHash = path.startsWith("#") ? path : "#" + path;
   if (window.location.hash !== newHash) {
     window.location.hash = newHash;
   }
@@ -2079,22 +2138,22 @@ function navigateToIssue(id) {
 /**
  * Navigate to issues list with filters
  */
-function navigateToIssues(filters = {}, sort = 'priority', search = '') {
+function navigateToIssues(filters = {}, sort = "priority", search = "") {
   const params = filtersToURL(filters, sort, search);
-  navigate(`/issues${params ? '?' + params : ''}`);
+  navigate(`/issues${params ? "?" + params : ""}`);
 }
 
 /**
  * Navigate to dashboard
  */
 function navigateToDashboard() {
-  navigate('/');
+  navigate("/");
 }
 
 /**
  * Go back in history, or to a fallback
  */
-function goBack(fallback = '/') {
+function goBack(fallback = "/") {
   if (window.history.length > 1) {
     window.history.back();
   } else {
@@ -2110,7 +2169,7 @@ function goBack(fallback = '/') {
  * Format ISO date to readable string with relative time for recent dates
  */
 function formatDate(isoString) {
-  if (!isoString) return '';
+  if (!isoString) return "";
   try {
     const date = new Date(isoString);
     if (isNaN(date.getTime())) return isoString; // Invalid date
@@ -2120,10 +2179,10 @@ function formatDate(isoString) {
 
     // Future dates or very recent: show absolute date
     if (diffMs < 0) {
-      return date.toLocaleDateString('en-US', {
-        year: 'numeric',
-        month: 'short',
-        day: 'numeric',
+      return date.toLocaleDateString("en-US", {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
       });
     }
 
@@ -2133,17 +2192,17 @@ function formatDate(isoString) {
     const diffDays = Math.floor(diffHours / 24);
 
     // Relative time for recent dates (< 7 days)
-    if (diffSecs < 60) return 'just now';
+    if (diffSecs < 60) return "just now";
     if (diffMins < 60) return `${diffMins}m ago`;
     if (diffHours < 24) return `${diffHours}h ago`;
-    if (diffDays === 1) return 'yesterday';
+    if (diffDays === 1) return "yesterday";
     if (diffDays < 7) return `${diffDays}d ago`;
 
     // Absolute date for older items
-    return date.toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
+    return date.toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
     });
   } catch {
     return isoString;
@@ -2154,16 +2213,16 @@ function formatDate(isoString) {
  * Format ISO date to full readable string (always absolute, with time)
  */
 function formatDateFull(isoString) {
-  if (!isoString) return '';
+  if (!isoString) return "";
   try {
     const date = new Date(isoString);
     if (isNaN(date.getTime())) return isoString; // Invalid date
-    return date.toLocaleDateString('en-US', {
-      year: 'numeric',
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
+    return date.toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
     });
   } catch {
     return isoString;
@@ -2177,9 +2236,9 @@ function formatDateFull(isoString) {
  * @param {string} suffix - Optional suffix like '%' (default '')
  * @returns {string} Formatted number or em-dash
  */
-function safeNum(value, decimals = 2, suffix = '') {
-  if (value === undefined || value === null || typeof value !== 'number' || !isFinite(value)) {
-    return '—';
+function safeNum(value, decimals = 2, suffix = "") {
+  if (value === undefined || value === null || typeof value !== "number" || !isFinite(value)) {
+    return "—";
   }
   return value.toFixed(decimals) + suffix;
 }
@@ -2192,29 +2251,29 @@ function getScoreBreakdownBars(breakdown) {
   if (!breakdown) return [];
 
   const components = [
-    { name: 'PageRank', key: 'pagerank', color: '#3b82f6', weight: 0.22 },
-    { name: 'Betweenness', key: 'betweenness', color: '#f97316', weight: 0.20 },
-    { name: 'Blocker Ratio', key: 'blocker_ratio', color: '#ef4444', weight: 0.13 },
-    { name: 'Priority', key: 'priority_boost', color: '#8b5cf6', weight: 0.10 },
-    { name: 'Time Impact', key: 'time_to_impact', color: '#06b6d4', weight: 0.10 },
-    { name: 'Urgency', key: 'urgency', color: '#ec4899', weight: 0.10 },
-    { name: 'Risk', key: 'risk', color: '#f59e0b', weight: 0.10 },
-    { name: 'Staleness', key: 'staleness', color: '#6b7280', weight: 0.05 },
+    { name: "PageRank", key: "pagerank", color: "#3b82f6", weight: 0.22 },
+    { name: "Betweenness", key: "betweenness", color: "#f97316", weight: 0.2 },
+    { name: "Blocker Ratio", key: "blocker_ratio", color: "#ef4444", weight: 0.13 },
+    { name: "Priority", key: "priority_boost", color: "#8b5cf6", weight: 0.1 },
+    { name: "Time Impact", key: "time_to_impact", color: "#06b6d4", weight: 0.1 },
+    { name: "Urgency", key: "urgency", color: "#ec4899", weight: 0.1 },
+    { name: "Risk", key: "risk", color: "#f59e0b", weight: 0.1 },
+    { name: "Staleness", key: "staleness", color: "#6b7280", weight: 0.05 },
   ];
 
   const total = components.reduce((sum, c) => sum + (breakdown[c.key] || 0), 0);
 
   return components
-    .map(c => ({
+    .map((c) => ({
       name: c.name,
       value: breakdown[c.key] || 0,
-      percent: total > 0 ? ((breakdown[c.key] || 0) / total * 100) : 0,
+      percent: total > 0 ? ((breakdown[c.key] || 0) / total) * 100 : 0,
       color: c.color,
       weight: c.weight,
       // Normalized value for bar width (0-100)
-      normalized: (breakdown[c.key + '_norm'] || 0) * 100
+      normalized: (breakdown[c.key + "_norm"] || 0) * 100,
     }))
-    .filter(c => c.value > 0)
+    .filter((c) => c.value > 0)
     .sort((a, b) => b.value - a.value);
 }
 
@@ -2222,7 +2281,7 @@ function getScoreBreakdownBars(breakdown) {
  * Format JSON with syntax highlighting for display
  */
 function formatJsonWithHighlight(obj) {
-  if (!obj) return '';
+  if (!obj) return "";
   try {
     const json = JSON.stringify(obj, null, 2);
     // Add syntax highlighting classes
@@ -2241,7 +2300,7 @@ function formatJsonWithHighlight(obj) {
  * Render markdown safely
  */
 function renderMarkdown(text) {
-  if (!text) return '';
+  if (!text) return "";
   try {
     const html = marked.parse(text);
     return DOMPurify.sanitize(html);
@@ -2255,7 +2314,7 @@ function renderMarkdown(text) {
  * Converts markdown to HTML but wraps in a span to work with line-clamp
  */
 function renderMarkdownInline(text) {
-  if (!text) return '';
+  if (!text) return "";
   try {
     // Use marked's parseInline to avoid block elements like <p>
     const html = marked.parseInline(text);
@@ -2270,33 +2329,35 @@ function renderMarkdownInline(text) {
  * Preserves readable text content without markdown syntax
  */
 function stripMarkdownToText(text) {
-  if (!text) return '';
+  if (!text) return "";
   try {
     // Remove common markdown syntax while preserving text
-    return text
-      // Remove code blocks (```...```)
-      .replace(/```[\s\S]*?```/g, ' ')
-      // Remove inline code (`...`)
-      .replace(/`([^`]+)`/g, '$1')
-      // Remove images ![alt](url)
-      .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
-      // Convert links [text](url) to just text
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-      // Remove bold/italic (**, *, __, _)
-      .replace(/(\*\*|__)(.*?)\1/g, '$2')
-      .replace(/(\*|_)(.*?)\1/g, '$2')
-      // Remove headers (# ## ###)
-      .replace(/^#{1,6}\s+/gm, '')
-      // Remove blockquotes
-      .replace(/^>\s+/gm, '')
-      // Remove horizontal rules
-      .replace(/^[-*_]{3,}\s*$/gm, '')
-      // Remove list markers
-      .replace(/^[\s]*[-*+]\s+/gm, '')
-      .replace(/^[\s]*\d+\.\s+/gm, '')
-      // Collapse multiple whitespace/newlines
-      .replace(/\s+/g, ' ')
-      .trim();
+    return (
+      text
+        // Remove code blocks (```...```)
+        .replace(/```[\s\S]*?```/g, " ")
+        // Remove inline code (`...`)
+        .replace(/`([^`]+)`/g, "$1")
+        // Remove images ![alt](url)
+        .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+        // Convert links [text](url) to just text
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+        // Remove bold/italic (**, *, __, _)
+        .replace(/(\*\*|__)(.*?)\1/g, "$2")
+        .replace(/(\*|_)(.*?)\1/g, "$2")
+        // Remove headers (# ## ###)
+        .replace(/^#{1,6}\s+/gm, "")
+        // Remove blockquotes
+        .replace(/^>\s+/gm, "")
+        // Remove horizontal rules
+        .replace(/^[-*_]{3,}\s*$/gm, "")
+        // Remove list markers
+        .replace(/^[\s]*[-*+]\s+/gm, "")
+        .replace(/^[\s]*\d+\.\s+/gm, "")
+        // Collapse multiple whitespace/newlines
+        .replace(/\s+/g, " ")
+        .trim()
+    );
   } catch {
     return text;
   }
@@ -2309,26 +2370,27 @@ function beadsApp() {
   return {
     // State
     loading: true,
-    loadingMessage: 'Initializing...',
+    loadingMessage: "Initializing...",
     error: null,
-    globalError: null,       // Modal error from ERROR_STATE
-    showDiagnostics: false,  // Toggle for diagnostics panel (press 'd')
+    globalError: null, // Modal error from ERROR_STATE
+    showDiagnostics: false, // Toggle for diagnostics panel (press 'd')
     diagnostics: DIAGNOSTICS, // Reference to global diagnostics
-    wasmStatus: WASM_STATUS,  // WASM support status
-    toasts: [],              // Toast notifications
-    view: 'dashboard',
-    mobileMenuOpen: false,   // Mobile hamburger menu state
+    wasmStatus: WASM_STATUS, // WASM support status
+    toasts: [], // Toast notifications
+    view: "dashboard",
+    mobileMenuOpen: false, // Mobile hamburger menu state
     mobileSearchOpen: false, // Mobile search bar state
-    filtersExpanded: false,  // Collapsible filters on mobile
-    darkMode: localStorage.getItem('darkMode') !== null
-      ? localStorage.getItem('darkMode') === 'true'
-      : true, // Default to dark mode
+    filtersExpanded: false, // Collapsible filters on mobile
+    darkMode:
+      localStorage.getItem("darkMode") !== null
+        ? localStorage.getItem("darkMode") === "true"
+        : true, // Default to dark mode
 
     // Data
     stats: {},
     meta: {},
-    dbSource: 'loading',
-    searchBackend: '',
+    dbSource: "loading",
+    searchBackend: "",
 
     // Issues list
     issues: [],
@@ -2347,18 +2409,18 @@ function beadsApp() {
 
     // Filters (supports multi-select arrays)
     filters: {
-      status: [],      // Array for multi-select
-      type: [],        // Array for multi-select
-      priority: [],    // Array for multi-select
-      labels: [],      // Array for multi-select
-      assignee: '',    // Single select
+      status: [], // Array for multi-select
+      type: [], // Array for multi-select
+      priority: [], // Array for multi-select
+      labels: [], // Array for multi-select
+      assignee: "", // Single select
       hasBlockers: null, // true/false/null
-      isBlocking: null,  // true/false/null
+      isBlocking: null, // true/false/null
     },
-    sort: 'priority',
-    searchQuery: '',
-    searchMode: 'text',
-    searchPreset: 'default',
+    sort: "priority",
+    searchQuery: "",
+    searchMode: "text",
+    searchPreset: "default",
 
     // Dashboard data
     topPicks: [],
@@ -2373,7 +2435,7 @@ function beadsApp() {
 
     // Selected issue
     selectedIssue: null,
-    copyLinkMessage: '',
+    copyLinkMessage: "",
     showDepGraph: false,
     issueNavList: [], // List of issue IDs for j/k navigation
     showKeyboardHelp: false, // Keyboard shortcuts help modal
@@ -2400,7 +2462,7 @@ function beadsApp() {
 
     // Heatmap & metrics mode
     graphHeatmapActive: false,
-    graphSizeMetric: 'pagerank', // pagerank | betweenness | critical | indegree
+    graphSizeMetric: "pagerank", // pagerank | betweenness | critical | indegree
 
     // Critical path highlighting
     showCriticalPath: false,
@@ -2428,7 +2490,7 @@ function beadsApp() {
     async init() {
       // Apply dark mode
       if (this.darkMode) {
-        document.documentElement.classList.add('dark');
+        document.documentElement.classList.add("dark");
       }
 
       // Body scroll lock for modals (iOS scroll bleed fix)
@@ -2437,35 +2499,37 @@ function beadsApp() {
         const hasModal = !!(this.selectedIssue || this.graphDetailNode);
         if (hasModal) {
           // Save scroll position before locking
-          document.body.style.setProperty('--scroll-y', `${window.scrollY}px`);
-          document.body.classList.add('modal-open');
+          document.body.style.setProperty("--scroll-y", `${window.scrollY}px`);
+          document.body.classList.add("modal-open");
         } else {
           // Restore scroll position after unlocking
-          const scrollY = document.body.style.getPropertyValue('--scroll-y');
-          document.body.classList.remove('modal-open');
+          const scrollY = document.body.style.getPropertyValue("--scroll-y");
+          document.body.classList.remove("modal-open");
           if (scrollY) {
-            window.scrollTo(0, parseInt(scrollY || '0', 10));
+            window.scrollTo(0, parseInt(scrollY || "0", 10));
           }
         }
       };
 
       // Watch for modal state changes using Alpine's $watch
-      this.$watch('selectedIssue', updateBodyScrollLock);
-      this.$watch('graphDetailNode', updateBodyScrollLock);
+      this.$watch("selectedIssue", updateBodyScrollLock);
+      this.$watch("graphDetailNode", updateBodyScrollLock);
 
       // Scroll to top on view change (respect reduced motion preference)
-      this.$watch('view', (newView, oldView) => {
+      this.$watch("view", (newView, oldView) => {
         if (newView !== oldView && !this.selectedIssue && !this.graphDetailNode) {
-          const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-          window.scrollTo({ top: 0, behavior: prefersReducedMotion ? 'auto' : 'smooth' });
+          const prefersReducedMotion = window.matchMedia(
+            "(prefers-reduced-motion: reduce)",
+          ).matches;
+          window.scrollTo({ top: 0, behavior: prefersReducedMotion ? "auto" : "smooth" });
         }
       });
 
       // Listen for system preference changes (only if no stored preference)
-      window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
-        if (localStorage.getItem('darkMode') === null) {
+      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+        if (localStorage.getItem("darkMode") === null) {
           this.darkMode = e.matches;
-          document.documentElement.classList.toggle('dark', this.darkMode);
+          document.documentElement.classList.toggle("dark", this.darkMode);
           // Re-render Mermaid graphs if visible
           if (this.showDepGraph && this.selectedIssue) {
             this.renderDepGraph();
@@ -2474,32 +2538,32 @@ function beadsApp() {
       });
 
       // Listen for toast events
-      window.addEventListener('show-toast', (e) => {
+      window.addEventListener("show-toast", (e) => {
         // Validate toast data to prevent template errors
         const toast = e.detail;
-        if (!toast || typeof toast.message !== 'string') {
-          console.warn('[Toast] Invalid toast data:', toast);
+        if (!toast || typeof toast.message !== "string") {
+          console.warn("[Toast] Invalid toast data:", toast);
           return;
         }
         // Ensure required properties
         const validToast = {
           id: toast.id || Date.now(),
           message: toast.message,
-          type: toast.type || 'info'
+          type: toast.type || "info",
         };
         this.toasts.push(validToast);
         setTimeout(() => {
-          this.toasts = this.toasts.filter(t => t.id !== validToast.id);
+          this.toasts = this.toasts.filter((t) => t.id !== validToast.id);
         }, 5000);
       });
 
       // Listen for keyboard shortcuts (vim-style navigation)
-      window.addEventListener('keydown', (e) => {
+      window.addEventListener("keydown", (e) => {
         // Skip if typing in input fields
-        const isInput = ['INPUT', 'TEXTAREA'].includes(e.target.tagName);
+        const isInput = ["INPUT", "TEXTAREA"].includes(e.target.tagName);
 
         // '/' focuses search (works globally)
-        if (e.key === '/' && !isInput) {
+        if (e.key === "/" && !isInput) {
           e.preventDefault();
           const searchInput = document.querySelector('input[x-model="searchQuery"]');
           if (searchInput) {
@@ -2510,26 +2574,26 @@ function beadsApp() {
         }
 
         // '?' shows keyboard help
-        if (e.key === '?' && !isInput) {
+        if (e.key === "?" && !isInput) {
           e.preventDefault();
           this.showKeyboardHelp = true;
           return;
         }
 
         // 'd' toggles diagnostics panel
-        if (e.key === 'd' && !isInput) {
+        if (e.key === "d" && !isInput) {
           this.showDiagnostics = !this.showDiagnostics;
           return;
         }
 
         // 'c' toggles critical path highlighting
-        if (e.key === 'c' && !isInput) {
+        if (e.key === "c" && !isInput) {
           this.toggleCriticalPath();
           return;
         }
 
         // 'h' navigates to first blocker (blocked-by) - when issue modal open
-        if (e.key === 'h' && !isInput && this.selectedIssue) {
+        if (e.key === "h" && !isInput && this.selectedIssue) {
           const deps = getIssueDependencies(this.selectedIssue.id);
           if (deps && deps.blockedBy && deps.blockedBy.length > 0) {
             this.selectIssue(deps.blockedBy[0].id);
@@ -2538,7 +2602,7 @@ function beadsApp() {
         }
 
         // 'l' navigates to first dependent (blocks) - when issue modal open
-        if (e.key === 'l' && !isInput && this.selectedIssue) {
+        if (e.key === "l" && !isInput && this.selectedIssue) {
           const deps = getIssueDependencies(this.selectedIssue.id);
           if (deps && deps.blocks && deps.blocks.length > 0) {
             this.selectIssue(deps.blocks[0].id);
@@ -2547,7 +2611,7 @@ function beadsApp() {
         }
 
         // 'o' opens issue detail in list view (when row is focused)
-        if (e.key === 'o' && !isInput && this.view === 'issues' && !this.selectedIssue) {
+        if (e.key === "o" && !isInput && this.view === "issues" && !this.selectedIssue) {
           // Focus the first issue if none selected
           if (this.issues.length > 0) {
             this.selectIssue(this.issues[0].id);
@@ -2564,7 +2628,7 @@ function beadsApp() {
       // bv-142).
       const DBLCLICK_MS = 350;
       let _lastNodeClick = { id: null, t: 0 };
-      document.addEventListener('bv-graph:nodeClick', (e) => {
+      document.addEventListener("bv-graph:nodeClick", (e) => {
         const nodeId = e?.detail?.node?.id;
         const ev = e?.detail?.event;
         if (!nodeId) return;
@@ -2578,9 +2642,7 @@ function beadsApp() {
         }
 
         const now = Date.now();
-        const isDouble =
-          _lastNodeClick.id === nodeId &&
-          now - _lastNodeClick.t < DBLCLICK_MS;
+        const isDouble = _lastNodeClick.id === nodeId && now - _lastNodeClick.t < DBLCLICK_MS;
 
         if (isDouble) {
           _lastNodeClick = { id: null, t: 0 };
@@ -2591,7 +2653,7 @@ function beadsApp() {
       });
 
       try {
-        this.loadingMessage = 'Loading sql.js WebAssembly...';
+        this.loadingMessage = "Loading sql.js WebAssembly...";
         await loadDatabase((msg) => {
           this.loadingMessage = msg;
         });
@@ -2604,24 +2666,25 @@ function beadsApp() {
         }
 
         this.dbSource = DB_STATE.source;
-        this.searchBackend = supportsFTS5() ? 'FTS5' : 'substring';
-        this.loadingMessage = 'Loading data...';
+        this.searchBackend = supportsFTS5() ? "FTS5" : "substring";
+        this.loadingMessage = "Loading data...";
 
         // Load initial data
         this.meta = getMeta();
         this.stats = getStats();
         DIAGNOSTICS.issueCount = this.stats.total || 0;
-        if (typeof window.initHybridWasmScorer === 'function') {
-          window.initHybridWasmScorer(DIAGNOSTICS.issueCount)
+        if (typeof window.initHybridWasmScorer === "function") {
+          window
+            .initHybridWasmScorer(DIAGNOSTICS.issueCount)
             .then((enabled) => {
               DIAGNOSTICS.hybridWasm = !!enabled;
-              if (!enabled && typeof window.getHybridWasmStatus === 'function') {
+              if (!enabled && typeof window.getHybridWasmStatus === "function") {
                 DIAGNOSTICS.hybridWasmReason = window.getHybridWasmStatus().reason;
               }
             })
             .catch((err) => {
               DIAGNOSTICS.hybridWasm = false;
-              DIAGNOSTICS.hybridWasmReason = err?.message || 'Hybrid WASM init failed';
+              DIAGNOSTICS.hybridWasmReason = err?.message || "Hybrid WASM init failed";
             });
         }
 
@@ -2644,7 +2707,7 @@ function beadsApp() {
         this.loadIssues();
 
         // Initialize WASM graph engine (non-blocking)
-        this.loadingMessage = 'Loading graph engine...';
+        this.loadingMessage = "Loading graph engine...";
         this.graphReady = await initGraphEngine();
         DIAGNOSTICS.graphWasm = this.graphReady;
         if (this.graphReady) {
@@ -2667,18 +2730,18 @@ function beadsApp() {
         this.handleHashChange();
 
         // Listen for hash changes (browser back/forward)
-        window.addEventListener('hashchange', () => this.handleHashChange());
+        window.addEventListener("hashchange", () => this.handleHashChange());
 
         // Record load time
         DIAGNOSTICS.loadTimeMs = Date.now() - DIAGNOSTICS.startTime;
 
         // Initialize charts dashboard (bv-wb6h)
-        if (typeof window.bvCharts !== 'undefined') {
+        if (typeof window.bvCharts !== "undefined") {
           try {
             const graphData = getGraphViewData();
             window.bvCharts.init(graphData.issues, graphData.dependencies);
           } catch (e) {
-            console.warn('[Charts] Init failed:', e);
+            console.warn("[Charts] Init failed:", e);
           }
         }
 
@@ -2688,16 +2751,20 @@ function beadsApp() {
           const triageResp = await fetch(`./data/triage.json?_t=${Date.now()}`);
           if (triageResp.ok) {
             this.triageData = await triageResp.json();
-            console.log('[Viewer] Triage data loaded:', this.triageData?.meta?.issue_count, 'issues');
+            console.log(
+              "[Viewer] Triage data loaded:",
+              this.triageData?.meta?.issue_count,
+              "issues",
+            );
           }
         } catch (triageErr) {
-          console.log('[Viewer] No triage.json found (optional for insights)');
+          console.log("[Viewer] No triage.json found (optional for insights)");
         }
 
         this.loading = false;
       } catch (err) {
-        console.error('Init failed:', err);
-        this.error = err.message || 'Failed to load database';
+        console.error("Init failed:", err);
+        this.error = err.message || "Failed to load database";
         // Sync global error state
         if (ERROR_STATE.error) {
           this.globalError = ERROR_STATE.error;
@@ -2707,15 +2774,15 @@ function beadsApp() {
     },
 
     async copyIssueLink() {
-      this.copyLinkMessage = '';
+      this.copyLinkMessage = "";
       if (!this.selectedIssue) return;
       const url = new URL(window.location.href);
-      url.hash = '#/issue/' + encodeURIComponent(this.selectedIssue.id);
+      url.hash = "#/issue/" + encodeURIComponent(this.selectedIssue.id);
       try {
         await navigator.clipboard.writeText(url.href);
-        this.copyLinkMessage = 'Link copied';
+        this.copyLinkMessage = "Link copied";
       } catch (err) {
-        this.copyLinkMessage = 'Could not copy. Select the issue link to copy it manually.';
+        this.copyLinkMessage = "Could not copy. Select the issue link to copy it manually.";
       }
     },
 
@@ -2723,7 +2790,7 @@ function beadsApp() {
      * Handle hash change (browser back/forward navigation)
      */
     handleHashChange() {
-      this.copyLinkMessage = '';
+      this.copyLinkMessage = "";
       const urlState = filtersFromURL();
       const hash = window.location.hash;
 
@@ -2732,9 +2799,9 @@ function beadsApp() {
 
       // Handle route
       switch (route.view) {
-        case 'issue':
+        case "issue":
           // Issue detail view
-          this.view = 'issues'; // Keep issues as backdrop
+          this.view = "issues"; // Keep issues as backdrop
           if (route.params.id) {
             // Reset state when switching issues
             this.showDepGraph = false;
@@ -2742,13 +2809,13 @@ function beadsApp() {
             this.selectedIssue = getIssue(route.params.id);
             // Update nav list from current issues
             if (this.issues.length) {
-              this.issueNavList = this.issues.map(i => i.id);
+              this.issueNavList = this.issues.map((i) => i.id);
             }
           }
           break;
 
-        case 'issues':
-          this.view = 'issues';
+        case "issues":
+          this.view = "issues";
           this.selectedIssue = null;
           this.showDepGraph = false;
           this.whatIfResult = null;
@@ -2759,13 +2826,13 @@ function beadsApp() {
           this.loadIssues();
           break;
 
-        case 'insights':
-          this.view = 'insights';
+        case "insights":
+          this.view = "insights";
           this.selectedIssue = null;
           break;
 
-        case 'graph':
-          this.view = 'graph';
+        case "graph":
+          this.view = "graph";
           this.selectedIssue = null;
           this.$nextTick(() => {
             this.initForceGraphView();
@@ -2773,7 +2840,7 @@ function beadsApp() {
           break;
 
         default:
-          this.view = 'dashboard';
+          this.view = "dashboard";
           this.selectedIssue = null;
       }
     },
@@ -2789,36 +2856,36 @@ function beadsApp() {
       this.forceGraphError = null;
       clearTimeout(this.graphStageTimer);
       this.graphStageTimer = null;
-      this.graphLoadingStage = 'init';
+      this.graphLoadingStage = "init";
 
       try {
         // Check that required dependencies are available
-        if (typeof window.ForceGraph !== 'function' || typeof window.d3 === 'undefined') {
-          throw new Error('force-graph dependencies not loaded');
+        if (typeof window.ForceGraph !== "function" || typeof window.d3 === "undefined") {
+          throw new Error("force-graph dependencies not loaded");
         }
 
         // Check database is ready
         if (!DB_STATE.db) {
-          throw new Error('Database not loaded yet');
+          throw new Error("Database not loaded yet");
         }
 
         // Wait for container to be visible (Alpine x-show transition)
-        const container = document.getElementById('graph-container');
+        const container = document.getElementById("graph-container");
         if (!container) {
-          throw new Error('Graph container not found');
+          throw new Error("Graph container not found");
         }
 
         // Small delay to ensure container is visible after x-show transition
-        await new Promise(resolve => setTimeout(resolve, 50));
+        await new Promise((resolve) => setTimeout(resolve, 50));
 
         // Stage 1: Loading data from database
-        this.graphLoadingStage = 'loading-data';
+        this.graphLoadingStage = "loading-data";
 
         // Check for empty data BEFORE initializing ForceGraph to avoid wasteful init
         const { issues, dependencies } = getGraphViewData();
 
         if (!issues || issues.length === 0) {
-          console.warn('[ForceGraph] No issues to display');
+          console.warn("[ForceGraph] No issues to display");
           container.innerHTML = `
             <div class="flex flex-col items-center justify-center h-full text-gray-500 dark:text-gray-400">
               <svg class="w-16 h-16 mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2834,59 +2901,62 @@ function beadsApp() {
         }
 
         // Stage 2: Initializing graph engine and computing metrics
-        this.graphLoadingStage = 'computing-metrics';
+        this.graphLoadingStage = "computing-metrics";
 
         // Best-effort: ensure the graph WASM module is available for graph.js.
-        if (typeof window.bvGraphWasm === 'undefined') {
+        if (typeof window.bvGraphWasm === "undefined") {
           this.graphReady = await initGraphEngine();
           DIAGNOSTICS.graphWasm = this.graphReady;
         }
 
         if (!this.forceGraphModule) {
-          this.forceGraphModule = await import('./graph.js');
+          this.forceGraphModule = await import("./graph.js");
         }
 
         // Seed live physics only when the exported topology matches this database.
         // Missing or stale layouts fall back to ordinary force initialization.
-        const precomputedLayout = await this.forceGraphModule.loadPrecomputedLayout(issues, dependencies);
+        const precomputedLayout = await this.forceGraphModule.loadPrecomputedLayout(
+          issues,
+          dependencies,
+        );
 
         // Stage 3: Initializing graph visualization
-        this.graphLoadingStage = 'init';
+        this.graphLoadingStage = "init";
 
         if (!this.forceGraphReady) {
-          await this.forceGraphModule.initGraph('graph-container');
+          await this.forceGraphModule.initGraph("graph-container");
           this.forceGraphReady = true;
 
           // Register event listeners once (inside forceGraphReady check to avoid duplicates)
           // Events are dispatched on document, so listen there
-          document.addEventListener('bv-graph:nodeClick', (e) => {
+          document.addEventListener("bv-graph:nodeClick", (e) => {
             const node = e.detail?.node;
             if (node) {
               this.graphDetailNode = node;
-              console.log('[Viewer] Node selected for detail:', node.id);
+              console.log("[Viewer] Node selected for detail:", node.id);
               // Resize graph after detail pane opens (wait for transition)
               setTimeout(() => this.resizeForceGraph(), 350);
             }
           });
-          document.addEventListener('bv-graph:backgroundClick', () => {
+          document.addEventListener("bv-graph:backgroundClick", () => {
             this.graphDetailNode = null;
             // Resize graph after detail pane closes
             setTimeout(() => this.resizeForceGraph(), 250);
           });
 
           // Sync heatmap state when toggled via keyboard shortcut
-          document.addEventListener('bv-graph:heatmapToggle', (e) => {
+          document.addEventListener("bv-graph:heatmapToggle", (e) => {
             this.graphHeatmapActive = e.detail?.active ?? false;
           });
 
           // Sync metric state when changed
-          document.addEventListener('bv-graph:metricChange', (e) => {
-            this.graphSizeMetric = e.detail?.metric ?? 'pagerank';
+          document.addEventListener("bv-graph:metricChange", (e) => {
+            this.graphSizeMetric = e.detail?.metric ?? "pagerank";
           });
 
           // Track simulation progress for loading indicator
-          document.addEventListener('bv-graph:simulationProgress', (e) => {
-            if (this.graphLoadingStage !== 'simulating') return;
+          document.addEventListener("bv-graph:simulationProgress", (e) => {
+            if (this.graphLoadingStage !== "simulating") return;
             this.graphSimulationProgress = e.detail?.progress ?? 0;
             this.graphSimulationDone = e.detail?.done ?? false;
             if (e.detail?.done && this.graphStageTimer === null) {
@@ -2902,11 +2972,13 @@ function beadsApp() {
         }
 
         // Stage 4: Running force simulation
-        this.graphLoadingStage = 'simulating';
+        this.graphLoadingStage = "simulating";
         this.graphSimulationProgress = 0;
         this.graphSimulationDone = false;
 
-        console.log(`[ForceGraph] Loading ${issues.length} issues, ${dependencies.length} dependencies`);
+        console.log(
+          `[ForceGraph] Loading ${issues.length} issues, ${dependencies.length} dependencies`,
+        );
         this.forceGraphModule.loadData(issues, dependencies, precomputedLayout);
 
         // Try to load history data for time-travel feature (bv-z38b)
@@ -2921,18 +2993,23 @@ function beadsApp() {
             const historyData = await historyResp.json();
             if (this.forceGraphModule.initTimeTravel) {
               this.forceGraphModule.initTimeTravel(historyData);
-              console.log('[Viewer] Time-travel history loaded');
+              console.log("[Viewer] Time-travel history loaded");
             }
           }
         } catch (histErr) {
           // history.json is optional, silently ignore if not found
-          console.log('[Viewer] No history.json found (optional for time-travel)');
+          console.log("[Viewer] No history.json found (optional for time-travel)");
         }
 
         // Match canvas size to container for crisp rendering.
         // (reuse container from earlier in this scope)
         const graph = this.forceGraphModule.getGraph?.();
-        if (container && graph && typeof graph.width === 'function' && typeof graph.height === 'function') {
+        if (
+          container &&
+          graph &&
+          typeof graph.width === "function" &&
+          typeof graph.height === "function"
+        ) {
           graph.width(container.clientWidth);
           graph.height(container.clientHeight);
         }
@@ -2940,14 +3017,15 @@ function beadsApp() {
         clearTimeout(this.graphStageTimer);
         this.graphStageTimer = null;
         this.graphLoadingStage = null;
-        console.error('[ForceGraph] init failed:', err);
+        console.error("[ForceGraph] init failed:", err);
         this.forceGraphError = err?.message || String(err);
         this.forceGraphReady = false;
-        showToast(`Graph view failed: ${this.forceGraphError}`, 'error');
+        showToast(`Graph view failed: ${this.forceGraphError}`, "error");
 
-        const container = document.getElementById('graph-container');
+        const container = document.getElementById("graph-container");
         if (container) {
-          container.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-center py-8">Graph failed to load.</p>';
+          container.innerHTML =
+            '<p class="text-gray-500 dark:text-gray-400 text-center py-8">Graph failed to load.</p>';
         }
       } finally {
         this.forceGraphLoading = false;
@@ -2961,10 +3039,10 @@ function beadsApp() {
     resizeForceGraph() {
       if (!this.forceGraphModule || !this.forceGraphReady) return;
 
-      const container = document.getElementById('graph-container');
+      const container = document.getElementById("graph-container");
       const graph = this.forceGraphModule.getGraph?.();
 
-      if (container && graph && typeof graph.width === 'function') {
+      if (container && graph && typeof graph.width === "function") {
         graph.width(container.clientWidth);
         graph.height(container.clientHeight);
       }
@@ -2976,7 +3054,7 @@ function beadsApp() {
     graphZoomIn() {
       if (!this.forceGraphModule || !this.forceGraphReady) return;
       const graph = this.forceGraphModule.getGraph?.();
-      if (graph && typeof graph.zoom === 'function') {
+      if (graph && typeof graph.zoom === "function") {
         const currentZoom = graph.zoom();
         graph.zoom(currentZoom * 1.5, 300);
       }
@@ -2988,7 +3066,7 @@ function beadsApp() {
     graphZoomOut() {
       if (!this.forceGraphModule || !this.forceGraphReady) return;
       const graph = this.forceGraphModule.getGraph?.();
-      if (graph && typeof graph.zoom === 'function') {
+      if (graph && typeof graph.zoom === "function") {
         const currentZoom = graph.zoom();
         graph.zoom(currentZoom / 1.5, 300);
       }
@@ -3000,7 +3078,7 @@ function beadsApp() {
     graphZoomToFit() {
       if (!this.forceGraphModule || !this.forceGraphReady) return;
       const graph = this.forceGraphModule.getGraph?.();
-      if (graph && typeof graph.zoomToFit === 'function') {
+      if (graph && typeof graph.zoomToFit === "function") {
         graph.zoomToFit(400, 50);
       }
     },
@@ -3021,12 +3099,13 @@ function beadsApp() {
       const q = query.toLowerCase().trim();
       if (!q) return null;
 
-      const found = graphData.nodes.find(n =>
-        (n.id && n.id.toLowerCase().includes(q)) ||
-        (n.title && n.title.toLowerCase().includes(q))
+      const found = graphData.nodes.find(
+        (n) =>
+          (n.id && n.id.toLowerCase().includes(q)) ||
+          (n.title && n.title.toLowerCase().includes(q)),
       );
 
-      if (found && typeof found.x === 'number' && typeof found.y === 'number') {
+      if (found && typeof found.x === "number" && typeof found.y === "number") {
         // Center view on the node
         graph.centerAt(found.x, found.y, 500);
         graph.zoom(2, 500);
@@ -3064,8 +3143,8 @@ function beadsApp() {
       }
 
       // Sync URL state (only on issues view)
-      if (this.view === 'issues') {
-        syncFiltersToURL('issues', this.filters, this.sort, this.searchQuery);
+      if (this.view === "issues") {
+        syncFiltersToURL("issues", this.filters, this.sort, this.searchQuery);
       }
     },
 
@@ -3093,12 +3172,12 @@ function beadsApp() {
         type: [],
         priority: [],
         labels: [],
-        assignee: '',
+        assignee: "",
         hasBlockers: null,
         isBlocking: null,
       };
-      this.searchQuery = '';
-      this.sort = 'priority';
+      this.searchQuery = "";
+      this.sort = "priority";
       this.page = 1;
       this.loadIssues();
     },
@@ -3107,14 +3186,16 @@ function beadsApp() {
      * Check if any filters are active
      */
     get hasActiveFilters() {
-      return this.filters.status?.length > 0 ||
-             this.filters.type?.length > 0 ||
-             this.filters.priority?.length > 0 ||
-             this.filters.labels?.length > 0 ||
-             this.filters.assignee ||
-             this.filters.hasBlockers !== null ||
-             this.filters.isBlocking !== null ||
-             this.searchQuery;
+      return (
+        this.filters.status?.length > 0 ||
+        this.filters.type?.length > 0 ||
+        this.filters.priority?.length > 0 ||
+        this.filters.labels?.length > 0 ||
+        this.filters.assignee ||
+        this.filters.hasBlockers !== null ||
+        this.filters.isBlocking !== null ||
+        this.searchQuery
+      );
     },
 
     /**
@@ -3174,7 +3255,7 @@ function beadsApp() {
       if (!id) return;
       const issue = getIssue(id);
       if (!issue) {
-        showToast(`Issue not found: ${id}`, 'warning');
+        showToast(`Issue not found: ${id}`, "warning");
         return;
       }
 
@@ -3183,7 +3264,7 @@ function beadsApp() {
       this.selectedIssue = issue;
 
       if (this.issues.length) {
-        this.issueNavList = this.issues.map(i => i.id);
+        this.issueNavList = this.issues.map((i) => i.id);
       }
     },
 
@@ -3205,10 +3286,10 @@ function beadsApp() {
 
       // Navigate back
       const currentView = this.view;
-      if (currentView === 'issues') {
+      if (currentView === "issues") {
         navigateToIssues(this.filters, this.sort, this.searchQuery);
       } else {
-        navigate('/' + currentView);
+        navigate("/" + currentView);
       }
     },
 
@@ -3221,7 +3302,7 @@ function beadsApp() {
 
       // Build navigation list from current issues if not set
       if (!this.issueNavList.length && this.issues.length) {
-        this.issueNavList = this.issues.map(i => i.id);
+        this.issueNavList = this.issues.map((i) => i.id);
       }
 
       // Find current position
@@ -3234,14 +3315,15 @@ function beadsApp() {
       }
 
       // Calculate new index with wrapping
-      const newIndex = (currentIndex + direction + this.issueNavList.length) % this.issueNavList.length;
+      const newIndex =
+        (currentIndex + direction + this.issueNavList.length) % this.issueNavList.length;
       const newId = this.issueNavList[newIndex];
 
       // Reset state and navigate/select
       this.showDepGraph = false;
       this.whatIfResult = null;
       const route = parseRoute(window.location.hash);
-      if (route.view === 'issue') {
+      if (route.view === "issue") {
         navigateToIssue(newId);
       } else {
         this.selectIssue(newId);
@@ -3268,19 +3350,26 @@ function beadsApp() {
       if (!this.selectedIssue || !this.$refs.depGraph) return;
 
       const issue = this.selectedIssue;
-      const blockedBy = (issue.blocked_by_ids || '').split(',').filter(Boolean).map(s => s.trim());
-      const blocks = (issue.blocks_ids || '').split(',').filter(Boolean).map(s => s.trim());
+      const blockedBy = (issue.blocked_by_ids || "")
+        .split(",")
+        .filter(Boolean)
+        .map((s) => s.trim());
+      const blocks = (issue.blocks_ids || "")
+        .split(",")
+        .filter(Boolean)
+        .map((s) => s.trim());
 
       if (blockedBy.length === 0 && blocks.length === 0) {
-        this.$refs.depGraph.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-center">No dependencies</p>';
+        this.$refs.depGraph.innerHTML =
+          '<p class="text-gray-500 dark:text-gray-400 text-center">No dependencies</p>';
         return;
       }
 
       // Build Mermaid flowchart
-      let diagram = 'flowchart TB\n';
+      let diagram = "flowchart TB\n";
 
       // Sanitize ID for mermaid (replace special chars)
-      const sanitizeId = (id) => id.replace(/[^a-zA-Z0-9]/g, '_');
+      const sanitizeId = (id) => id.replace(/[^a-zA-Z0-9]/g, "_");
       const currentId = sanitizeId(issue.id);
 
       // Style for current node
@@ -3312,11 +3401,12 @@ function beadsApp() {
 
       try {
         // Render the diagram
-        const { svg } = await mermaid.render('dep-graph-' + Date.now(), diagram);
+        const { svg } = await mermaid.render("dep-graph-" + Date.now(), diagram);
         this.$refs.depGraph.innerHTML = svg;
       } catch (err) {
-        console.warn('Mermaid render failed:', err);
-        this.$refs.depGraph.innerHTML = '<p class="text-red-500 text-center text-sm">Failed to render graph</p>';
+        console.warn("Mermaid render failed:", err);
+        this.$refs.depGraph.innerHTML =
+          '<p class="text-red-500 text-center text-sm">Failed to render graph</p>';
       }
     },
 
@@ -3325,8 +3415,8 @@ function beadsApp() {
      */
     toggleDarkMode() {
       this.darkMode = !this.darkMode;
-      localStorage.setItem('darkMode', this.darkMode);
-      document.documentElement.classList.toggle('dark', this.darkMode);
+      localStorage.setItem("darkMode", this.darkMode);
+      document.documentElement.classList.toggle("dark", this.darkMode);
 
       // Re-initialize Mermaid with new theme
       if (window.reinitializeMermaid) {
@@ -3348,7 +3438,7 @@ function beadsApp() {
      */
     recalculateForFilter() {
       if (!this.graphReady) return;
-      const ids = this.issues.map(i => i.id);
+      const ids = this.issues.map((i) => i.id);
       this.graphMetrics = recalculateMetrics(ids);
     },
 
@@ -3396,7 +3486,7 @@ function beadsApp() {
      */
     toggleCriticalPath() {
       if (!this.graphReady) {
-        showToast('Graph engine not ready', 'warning');
+        showToast("Graph engine not ready", "warning");
         return;
       }
 
@@ -3405,11 +3495,11 @@ function beadsApp() {
       if (this.showCriticalPath) {
         this.criticalPathData = getCriticalPathSequence();
         if (!this.criticalPathData || this.criticalPathData.path.length === 0) {
-          showToast('No critical path found (may have cycles)', 'info');
+          showToast("No critical path found (may have cycles)", "info");
           this.showCriticalPath = false;
           return;
         }
-        showToast(`Critical path: ${this.criticalPathData.length} issues deep`, 'success');
+        showToast(`Critical path: ${this.criticalPathData.length} issues deep`, "success");
         // Start animation
         this.animateCriticalPath();
       } else {
@@ -3432,7 +3522,7 @@ function beadsApp() {
         if (!this.showCriticalPath) break; // Stop if toggled off
 
         this.criticalPathAnimationStep = i;
-        await new Promise(resolve => setTimeout(resolve, 300));
+        await new Promise((resolve) => setTimeout(resolve, 300));
       }
 
       // Keep final state highlighted
@@ -3445,7 +3535,7 @@ function beadsApp() {
      */
     applyGraphPreset(presetName) {
       if (!this.forceGraphModule) {
-        showToast('Graph not initialized', 'warning');
+        showToast("Graph not initialized", "warning");
         return;
       }
       if (this.forceGraphModule.applyPreset) {
@@ -3453,10 +3543,10 @@ function beadsApp() {
         if (success) {
           const presets = this.forceGraphModule.getLayoutPresets?.() || {};
           const preset = presets[presetName];
-          showToast(`Layout: ${preset?.name || presetName}`, 'info');
+          showToast(`Layout: ${preset?.name || presetName}`, "info");
         }
       } else {
-        showToast('Presets not available', 'warning');
+        showToast("Presets not available", "warning");
       }
     },
 
@@ -3473,11 +3563,11 @@ function beadsApp() {
      */
     toggleGraphHeatmap() {
       if (!this.forceGraphModule?.toggleHeatmap) {
-        showToast('Heatmap not available', 'warning');
+        showToast("Heatmap not available", "warning");
         return;
       }
       this.graphHeatmapActive = this.forceGraphModule.toggleHeatmap();
-      showToast(this.graphHeatmapActive ? 'Heatmap ON' : 'Heatmap OFF', 'info');
+      showToast(this.graphHeatmapActive ? "Heatmap ON" : "Heatmap OFF", "info");
     },
 
     /**
@@ -3485,18 +3575,18 @@ function beadsApp() {
      */
     setGraphSizeMetric(metric) {
       if (!this.forceGraphModule?.setSizeMetric) {
-        showToast('Metric selection not available', 'warning');
+        showToast("Metric selection not available", "warning");
         return;
       }
       this.forceGraphModule.setSizeMetric(metric);
       this.graphSizeMetric = metric;
       const metricLabels = {
-        pagerank: 'PageRank',
-        betweenness: 'Betweenness Centrality',
-        critical: 'Critical Path Depth',
-        indegree: 'In-Degree (Blockers)'
+        pagerank: "PageRank",
+        betweenness: "Betweenness Centrality",
+        critical: "Critical Path Depth",
+        indegree: "In-Degree (Blockers)",
       };
-      showToast(`Metric: ${metricLabels[metric] || metric}`, 'info');
+      showToast(`Metric: ${metricLabels[metric] || metric}`, "info");
     },
 
     /**
@@ -3574,7 +3664,7 @@ function beadsApp() {
      * Remove a toast notification
      */
     removeToast(id) {
-      this.toasts = this.toasts.filter(t => t.id !== id);
+      this.toasts = this.toasts.filter((t) => t.id !== id);
     },
   };
 }
