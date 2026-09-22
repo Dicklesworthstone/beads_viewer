@@ -64,18 +64,7 @@
     "n8": 1,
     "n9": 1
   },
-  "topological_order": [
-    "n0",
-    "n2",
-    "n4",
-    "n5",
-    "n6",
-    "n7",
-    "n8",
-    "n3",
-    "n9",
-    "n1"
-  ],
+  "topological_order": ["n0", "n2", "n4", "n5", "n6", "n7", "n8", "n3", "n9", "n1"],
   "core_number": {
     "n0": 1,
     "n1": 1,

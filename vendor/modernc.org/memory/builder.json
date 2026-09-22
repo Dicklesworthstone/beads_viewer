@@ -1,6 +1,6 @@
 {
-	"autogen": "<none>",
-	"autoupdate": ".",
-	"autotag": ".",
-	"test": "."
+  "autogen": "<none>",
+  "autoupdate": ".",
+  "autotag": ".",
+  "test": "."
 }

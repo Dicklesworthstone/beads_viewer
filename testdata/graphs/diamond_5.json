@@ -1,7 +1,5 @@
 {
   "description": "Diamond DAG: n0 is source, n1/n2 branch, n3 merges, n4 is sink. Tests betweenness.",
   "nodes": ["n0", "n1", "n2", "n3", "n4"],
-  "edges": [
-    [0, 1], [0, 2], [1, 3], [2, 3], [3, 4]
-  ]
+  "edges": [[0, 1], [0, 2], [1, 3], [2, 3], [3, 4]]
 }

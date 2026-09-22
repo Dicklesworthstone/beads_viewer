@@ -1,6 +1,6 @@
 {
-	"$schema": "https://biomejs.dev/schemas/2.0.5/schema.json",
-	"formatter": {
-		"indentStyle": "space"
-	}
+  "$schema": "https://biomejs.dev/schemas/2.0.5/schema.json",
+  "formatter": {
+    "indentStyle": "space"
+  }
 }
