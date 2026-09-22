@@ -135,7 +135,7 @@
 | `--suggest-type` | string | (empty) | Filter suggestions by type: duplicate, dependency, label, cycle | Robot & Planning Flags |
 | `--alert-label` | string | (empty) | Filter robot alerts by label match | Search & Filters |
 | `--alert-type` | string | (empty) | Filter robot alerts by alert type (e.g., stale_issue) | Search & Filters |
-| `--label` | string | (empty) | Scope analysis to label's subgraph (affects --robot-insights, --robot-plan, --robot-priority) | Search & Filters |
+| `--label` | string | (empty) | Scope analysis to label's subgraph (applies to every --robot-* command that loads issues, e.g. --robot-insights, --robot-plan, --robot-priority, --robot-orphans) | Search & Filters |
 | `--recipe` | string | (empty) | Apply a recipe by name (e.g., triage, actionable, high-impact) or by .yaml/.yml file path (e.g., .beads/recipes/sprint.yaml) | Search & Filters |
 | `--repo` | string | (empty) | Filter issues by repository prefix (e.g., 'api-' or 'api') | Search & Filters |
 | `--robot-by-assignee` | string | (empty) | Filter robot outputs by assignee (exact match) | Search & Filters |

@@ -1517,7 +1517,7 @@ func main() {
 	robotByLabel := flag.String("robot-by-label", "", "Filter robot outputs by label (exact match)")
 	robotByAssignee := flag.String("robot-by-assignee", "", "Filter robot outputs by assignee (exact match)")
 	// Label subgraph scoping (bv-122)
-	labelScope := flag.StringP("label", "l", "", "Scope analysis to label's subgraph (affects --robot-insights, --robot-plan, --robot-priority)")
+	labelScope := flag.StringP("label", "l", "", "Scope analysis to label's subgraph (applies to every --robot-* command that loads issues, e.g. --robot-insights, --robot-plan, --robot-priority, --robot-orphans)")
 	alertSeverity := flag.String("severity", "", "Filter robot alerts by severity (info|warning|critical)")
 	alertType := flag.String("alert-type", "", "Filter robot alerts by alert type (e.g., stale_issue)")
 	alertLabel := flag.String("alert-label", "", "Filter robot alerts by label match")
@@ -7805,7 +7805,7 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		"robot-orphans": {
 			Flag: "--robot-orphans", Description: "Orphan commit candidates that should be linked to beads.",
 			KeyFields:   []string{"git_range", "stats.candidate_count", "candidates", "candidates[].probable_beads", "by_bead"},
-			Params:      []string{"--orphans-min-score 0-100"},
+			Params:      []string{"--orphans-min-score 0-100", "--label <label>"},
 			NeedsIssues: true,
 			NeedsGit:    true,
 		},
