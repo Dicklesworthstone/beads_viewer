@@ -16,7 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// validationCacheEntry records a result for one observable file identity.
+// validationCacheEntry records a prior validation result for one source identity.
 type validationCacheEntry struct {
 	identity   validationFileIdentity
 	valid      bool
@@ -68,8 +68,8 @@ func (identity validationPathIdentity) equal(other validationPathIdentity) bool 
 // validationCache memoizes validation results within a single process. The hot
 // robot CLI paths (LoadIssues + resolveSingleRepoWatchFile) each discover and
 // validate the same source files; without this cache the 1.9MB issues.jsonl is
-// fully re-parsed 2-3x per invocation. The key includes source type, and the
-// identity includes the main file plus a SQLite WAL when present.
+// fully re-parsed 2-3x per invocation. The cache also tracks SQLite's WAL and
+// available file identity/change-time metadata so stale verdicts are not reused.
 var (
 	validationCacheMu sync.Mutex
 	validationCache   = map[validationCacheKey]validationCacheEntry{}
@@ -79,8 +79,7 @@ func sourceValidationCacheKey(source *DataSource) validationCacheKey {
 	return validationCacheKey{path: source.Path, sourceType: source.Type}
 }
 
-// lookupValidationCache returns a cached validation result for source if one
-// exists and the complete file identity still matches.
+// lookupValidationCache returns a cached result only for the same source state.
 func lookupValidationCache(source *DataSource, opts ValidationOptions) (bool, error) {
 	identity, err := sourceValidationIdentity(source)
 	if err != nil {
@@ -144,12 +143,11 @@ func sourceValidationIdentity(source *DataSource) (validationFileIdentity, error
 	if source.Type != SourceTypeSQLite {
 		return identity, nil
 	}
-
 	walInfo, err := os.Stat(source.Path + "-wal")
+	if os.IsNotExist(err) {
+		return identity, nil
+	}
 	if err != nil {
-		if os.IsNotExist(err) {
-			return identity, nil
-		}
 		return validationFileIdentity{}, err
 	}
 	identity.wal = validationPathIdentityFromInfo(walInfo)
@@ -160,20 +158,20 @@ func validationPathIdentityFromInfo(info os.FileInfo) validationPathIdentity {
 	if info == nil {
 		return validationPathIdentity{}
 	}
-	changeSec, changeNsec, hasChangeAt := validationFileChangeTime(info)
+	seconds, nanoseconds, hasChangeAt := validationFileChangeTime(info)
 	return validationPathIdentity{
 		exists:      true,
 		modTime:     info.ModTime(),
 		size:        info.Size(),
 		info:        info,
-		changeSec:   changeSec,
-		changeNsec:  changeNsec,
+		changeSec:   seconds,
+		changeNsec:  nanoseconds,
 		hasChangeAt: hasChangeAt,
 	}
 }
 
-// validationFileChangeTime extracts the inode metadata-change timestamp from
-// Unix file info. Other platforms retain the identity and size/mtime guards.
+// validationFileChangeTime reads Unix inode change-time metadata when the
+// platform exposes it. Other platforms retain size, mtime, and file identity.
 func validationFileChangeTime(info os.FileInfo) (seconds, nanoseconds int64, ok bool) {
 	if info == nil || info.Sys() == nil {
 		return 0, 0, false
@@ -188,8 +186,8 @@ func validationFileChangeTime(info os.FileInfo) (seconds, nanoseconds int64, ok 
 	if !value.IsValid() || value.Kind() != reflect.Struct {
 		return 0, 0, false
 	}
-	for _, fieldName := range []string{"Ctim", "Ctimespec"} {
-		stamp := value.FieldByName(fieldName)
+	for _, name := range []string{"Ctim", "Ctimespec"} {
+		stamp := value.FieldByName(name)
 		if !stamp.IsValid() || stamp.Kind() != reflect.Struct {
 			continue
 		}

@@ -88,6 +88,10 @@ type DiscoveryOptions struct {
 	ValidateAfterDiscovery bool
 	// IncludeInvalid includes sources that failed validation in results
 	IncludeInvalid bool
+	// SkipWorktreeSources confines discovery to the selected BeadsDir. An
+	// explicit tracker directory must not be overridden by a newer export
+	// in the caller repository's unrelated Git worktree area.
+	SkipWorktreeSources bool
 	// Verbose enables detailed logging during discovery
 	Verbose bool
 	// Logger receives log messages when Verbose is true
@@ -153,8 +157,8 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 
 	// Discover SQLite database
 	sqliteSources, err := discoverSQLiteSources(beadsDir, opts)
-	if err != nil && opts.Verbose {
-		opts.Logger(fmt.Sprintf("SQLite discovery warning: %v", err))
+	if err != nil {
+		return nil, err
 	}
 	sources = append(sources, sqliteSources...)
 
@@ -165,12 +169,14 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 	}
 	sources = append(sources, localSources...)
 
-	// Discover worktree JSONL files
-	worktreeSources, err := discoverWorktreeSources(opts.RepoPath, opts)
-	if err != nil && opts.Verbose {
-		opts.Logger(fmt.Sprintf("Worktree discovery warning: %v", err))
+	// Discover worktree JSONL only when the tracker directory was inferred.
+	if !opts.SkipWorktreeSources {
+		worktreeSources, err := discoverWorktreeSources(opts.RepoPath, opts)
+		if err != nil && opts.Verbose {
+			opts.Logger(fmt.Sprintf("Worktree discovery warning: %v", err))
+		}
+		sources = append(sources, worktreeSources...)
 	}
-	sources = append(sources, worktreeSources...)
 
 	// Validate sources if requested
 	if opts.ValidateAfterDiscovery {
@@ -232,17 +238,34 @@ func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource
 	// Look for beads.db
 	dbPath := filepath.Join(beadsDir, "beads.db")
 	info, err := os.Stat(dbPath)
-	if err == nil {
-		sources = append(sources, DataSource{
-			Type:     SourceTypeSQLite,
-			Path:     dbPath,
-			Priority: PrioritySQLite,
-			ModTime:  info.ModTime(),
-			Size:     info.Size(),
-		})
-		if opts.Verbose {
-			opts.Logger(fmt.Sprintf("Found SQLite: %s (mod=%s)", dbPath, info.ModTime().Format(time.RFC3339)))
+	if os.IsNotExist(err) {
+		return sources, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat SQLite source %s: %w", dbPath, err)
+	}
+
+	// A committed transaction can advance the WAL without checkpointing the
+	// main database. Compare the effective SQLite freshness with JSONL exports.
+	modTime := info.ModTime()
+	walPath := dbPath + "-wal"
+	walInfo, walErr := os.Stat(walPath)
+	if walErr == nil {
+		if walInfo.ModTime().After(modTime) {
+			modTime = walInfo.ModTime()
 		}
+	} else if !os.IsNotExist(walErr) {
+		return nil, fmt.Errorf("stat SQLite WAL source %s: %w", walPath, walErr)
+	}
+	sources = append(sources, DataSource{
+		Type:     SourceTypeSQLite,
+		Path:     dbPath,
+		Priority: PrioritySQLite,
+		ModTime:  modTime,
+		Size:     info.Size(),
+	})
+	if opts.Verbose {
+		opts.Logger(fmt.Sprintf("Found SQLite: %s (mod=%s)", dbPath, modTime.Format(time.RFC3339)))
 	}
 
 	return sources, nil
