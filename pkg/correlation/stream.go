@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -328,8 +329,13 @@ func (s *StreamExtractor) parseBufferedDiff(lines []string, info commitInfo, fil
 		}
 	}
 
-	// Generate events
+	// Generate events in a stable order within each commit.
+	beadIDs := make([]string, 0, len(seenBeads))
 	for beadID := range seenBeads {
+		beadIDs = append(beadIDs, beadID)
+	}
+	sort.Strings(beadIDs)
+	for _, beadID := range beadIDs {
 		oldSnap, hadOld := oldBeads[beadID]
 		newSnap, hasNew := newBeads[beadID]
 
