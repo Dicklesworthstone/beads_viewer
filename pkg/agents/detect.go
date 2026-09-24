@@ -107,20 +107,36 @@ func DetectAgentFile(workDir string) AgentFileDetection {
 
 // checkAgentFile checks a specific file path for agent configuration.
 func checkAgentFile(filePath, fileType string) AgentFileDetection {
-	// Check if file exists
-	info, err := os.Stat(filePath)
-	if err != nil || info.IsDir() {
+	// Inspect the path object itself before opening it. Following a symlink
+	// here could disclose unrelated file contents through Content.
+	info, err := agentFilePathInfo(filePath)
+	if err != nil {
 		return AgentFileDetection{}
 	}
-
-	// Read file content
-	content, err := os.ReadFile(filePath)
+	detection := AgentFileDetection{FilePath: filePath, FileType: fileType}
+	if !info.Mode().IsRegular() {
+		return detection
+	}
+	file, err := openAgentFileForInspection(filePath)
 	if err != nil {
-		// File exists but not readable - return detection without content
-		return AgentFileDetection{
-			FilePath: filePath,
-			FileType: fileType,
-		}
+		return detection
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !sameAgentFileSnapshot(info, openedInfo) {
+		return detection
+	}
+	content, err := readAgentFileExactly(file, openedInfo.Size())
+	if err != nil {
+		return detection
+	}
+	afterInfo, err := file.Stat()
+	if err != nil || !sameAgentFileSnapshot(openedInfo, afterInfo) {
+		return detection
+	}
+	currentInfo, err := agentFilePathInfo(filePath)
+	if err != nil || !sameAgentFileSnapshot(afterInfo, currentInfo) {
+		return detection
 	}
 
 	contentStr := string(content)

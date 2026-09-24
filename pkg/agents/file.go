@@ -11,11 +11,15 @@ import (
 )
 
 var (
-	errAgentFileBusy    = errors.New("agent file is busy with another bv edit")
-	errAgentFileChanged = errors.New("agent file changed while the bv edit was being prepared")
+	errAgentFileBusy     = errors.New("agent file is busy with another bv edit")
+	errAgentFileChanged  = errors.New("agent file changed while the bv edit was being prepared")
+	errAgentFileTooLarge = errors.New("agent file exceeds the safe mutation size limit")
 )
 
-const agentFileLockTimeout = 2 * time.Second
+const (
+	agentFileLockTimeout = 2 * time.Second
+	maxAgentFileBytes    = 16 << 20
+)
 
 type lockedAgentFile struct {
 	requestedPath string
@@ -89,11 +93,7 @@ func lockAgentFileForMutation(filePath string) (*lockedAgentFile, error) {
 			closeLocked()
 			return nil, fmt.Errorf("%w: requested regular file changed during path resolution", errAgentFileChanged)
 		}
-		if _, err := file.Seek(0, io.SeekStart); err != nil {
-			closeLocked()
-			return nil, err
-		}
-		content, readErr := io.ReadAll(file)
+		content, readErr := readAgentFileExactly(file, beforeInfo.Size())
 		afterInfo, afterStatErr := file.Stat()
 		pathInfo, pathStatErr = agentFilePathInfo(mutationPath)
 		if readErr != nil || afterStatErr != nil || pathStatErr != nil {
@@ -182,10 +182,7 @@ func (f *lockedAgentFile) verifyUnchanged() error {
 	if f.info.Mode() != currentInfo.Mode() {
 		return fmt.Errorf("%w: destination mode changed from %s to %s", errAgentFileChanged, f.info.Mode(), currentInfo.Mode())
 	}
-	if _, err := f.file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("%w: seek locked source: %v", errAgentFileChanged, err)
-	}
-	content, err := io.ReadAll(f.file)
+	content, err := readAgentFileExactly(f.file, currentInfo.Size())
 	if err != nil {
 		return fmt.Errorf("%w: reread locked source: %v", errAgentFileChanged, err)
 	}
@@ -236,6 +233,28 @@ func sameAgentFileSnapshot(a, b os.FileInfo) bool {
 		a.Size() == b.Size() &&
 		a.Mode() == b.Mode() &&
 		a.ModTime().Equal(b.ModTime())
+}
+
+// readAgentFileExactly bounds allocation before reading and detects growth or
+// truncation while the caller holds its file descriptor.
+func readAgentFileExactly(file *os.File, expectedSize int64) ([]byte, error) {
+	if file == nil || expectedSize < 0 {
+		return nil, fmt.Errorf("%w: invalid agent-file handle or size", errAgentFileChanged)
+	}
+	if expectedSize > maxAgentFileBytes {
+		return nil, fmt.Errorf("%w: %d bytes exceeds %d", errAgentFileTooLarge, expectedSize, maxAgentFileBytes)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	content, err := io.ReadAll(&io.LimitedReader{R: file, N: expectedSize + 1})
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) != expectedSize {
+		return nil, fmt.Errorf("%w: read %d bytes, expected %d", errAgentFileChanged, len(content), expectedSize)
+	}
+	return content, nil
 }
 
 func (f *lockedAgentFile) replace(content []byte) error {
@@ -343,9 +362,36 @@ func CreateAgentFile(filePath string) error {
 // VerifyBlurbPresent checks that exactly one structurally valid versioned blurb
 // is present and that no legacy blurb remains.
 func VerifyBlurbPresent(filePath string) (bool, error) {
-	content, err := os.ReadFile(filePath)
+	pathInfo, err := agentFilePathInfo(filePath)
 	if err != nil {
 		return false, err
+	}
+	if !pathInfo.Mode().IsRegular() {
+		return false, fmt.Errorf("refusing to inspect non-regular agent file %q", filePath)
+	}
+	file, err := openAgentFileForInspection(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || !sameAgentFileSnapshot(pathInfo, info) {
+		return false, errAgentFileChanged
+	}
+	content, err := readAgentFileExactly(file, info.Size())
+	if err != nil {
+		return false, err
+	}
+	afterInfo, err := file.Stat()
+	if err != nil || !sameAgentFileSnapshot(info, afterInfo) {
+		return false, errAgentFileChanged
+	}
+	currentInfo, err := agentFilePathInfo(filePath)
+	if err != nil || !sameAgentFileSnapshot(afterInfo, currentInfo) {
+		return false, errAgentFileChanged
 	}
 	contentStr := string(content)
 	count, err := inspectBlurbStructure(contentStr)
@@ -382,6 +428,9 @@ func writeNewFileExclusive(filePath string, content []byte) error {
 // exFAT/FAT32 and injectable test failures keep the same no-replacement
 // guarantee. link is injectable so tests can force the fallback path.
 func writeNewFileExclusiveUsing(filePath string, content []byte, link func(string, string) error) error {
+	if len(content) > maxAgentFileBytes {
+		return fmt.Errorf("%w: %d bytes exceeds %d", errAgentFileTooLarge, len(content), maxAgentFileBytes)
+	}
 	dir := filepath.Dir(filePath)
 	tmp, err := os.CreateTemp(dir, ".bv-create-*")
 	if err != nil {
@@ -434,6 +483,9 @@ func writeNewFileExclusiveUsing(filePath string, content []byte, link func(strin
 }
 
 func writeFileDirectExclusive(filePath string, content []byte) error {
+	if len(content) > maxAgentFileBytes {
+		return fmt.Errorf("%w: %d bytes exceeds %d", errAgentFileTooLarge, len(content), maxAgentFileBytes)
+	}
 	file, err := os.CreateTemp(filepath.Dir(filePath), ".bv-create-*")
 	if err != nil {
 		return fmt.Errorf("create private destination: %w", err)
@@ -535,6 +587,9 @@ func writeFileDirectExclusive(filePath string, content []byte) error {
 func writeVerifiedReplacement(locked *lockedAgentFile, content []byte) error {
 	if locked == nil || locked.file == nil || locked.unlock == nil {
 		return fmt.Errorf("replacement requires a live locked source")
+	}
+	if len(content) > maxAgentFileBytes {
+		return fmt.Errorf("%w: %d bytes exceeds %d", errAgentFileTooLarge, len(content), maxAgentFileBytes)
 	}
 	// Create the replacement in the same directory so the commit stays on one
 	// filesystem. Platform implementations establish a handle-derived identity

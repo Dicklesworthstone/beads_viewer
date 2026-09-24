@@ -15,6 +15,10 @@ func agentFilePathInfo(path string) (os.FileInfo, error) {
 	return os.Lstat(path)
 }
 
+func openAgentFileForInspection(path string) (*os.File, error) {
+	return nil, fmt.Errorf("race-safe agent-file inspection is unsupported on %s: %s", runtime.GOOS, path)
+}
+
 func openAndLockAgentFileForMutation(_ string, _ time.Duration) (*os.File, func() error, error) {
 	return nil, nil, fmt.Errorf("safe agent-file replacement is unsupported on %s", runtime.GOOS)
 }
