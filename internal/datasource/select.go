@@ -3,8 +3,11 @@ package datasource
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 // ErrNoValidSources is returned when no valid sources are found
@@ -51,15 +54,52 @@ type SelectionResult struct {
 }
 
 // sortByFreshnessThenPriority orders sources in place the same way the default
-// selection does: freshest ModTime first, ties broken by higher Priority. The
-// fused load path uses this to try candidates in selection order.
+// selection does: freshest ModTime first, then higher Priority, then the
+// canonical JSONL filename order. The fused load path uses this to try
+// candidates in selection order.
 func sortByFreshnessThenPriority(sources []DataSource) {
+	sortBySelectionPreference(sources, true)
+}
+
+func sortBySelectionPreference(sources []DataSource, preferFreshest bool) {
 	sort.Slice(sources, func(i, j int) bool {
-		if sources[i].ModTime.Equal(sources[j].ModTime) {
-			return sources[i].Priority > sources[j].Priority
+		left, right := sources[i], sources[j]
+		if preferFreshest {
+			if !left.ModTime.Equal(right.ModTime) {
+				return left.ModTime.After(right.ModTime)
+			}
+			if left.Priority != right.Priority {
+				return left.Priority > right.Priority
+			}
+		} else {
+			if left.Priority != right.Priority {
+				return left.Priority > right.Priority
+			}
+			if !left.ModTime.Equal(right.ModTime) {
+				return left.ModTime.After(right.ModTime)
+			}
 		}
-		return sources[i].ModTime.After(sources[j].ModTime)
+
+		leftRank, rightRank := jsonlFilenameAuthorityRank(left), jsonlFilenameAuthorityRank(right)
+		if leftRank != rightRank {
+			return leftRank > rightRank
+		}
+		return left.Path < right.Path
 	})
+}
+
+func jsonlFilenameAuthorityRank(source DataSource) int {
+	if source.Type != SourceTypeJSONLLocal && source.Type != SourceTypeJSONLWorktree {
+		return 0
+	}
+
+	name := filepath.Base(source.Path)
+	for i, preferred := range loader.PreferredJSONLNames {
+		if name == preferred {
+			return len(loader.PreferredJSONLNames) - i
+		}
+	}
+	return 0
 }
 
 // SelectBestSource chooses the best data source from the given list
@@ -99,23 +139,7 @@ func SelectBestSourceDetailed(sources []DataSource, opts SelectionOptions) (*Sel
 	}
 
 	// Sort by preference
-	if opts.PreferFreshest {
-		// Sort by: ModTime desc, then Priority desc
-		sort.Slice(valid, func(i, j int) bool {
-			if valid[i].ModTime.Equal(valid[j].ModTime) {
-				return valid[i].Priority > valid[j].Priority
-			}
-			return valid[i].ModTime.After(valid[j].ModTime)
-		})
-	} else {
-		// Sort by: Priority desc, then ModTime desc
-		sort.Slice(valid, func(i, j int) bool {
-			if valid[i].Priority == valid[j].Priority {
-				return valid[i].ModTime.After(valid[j].ModTime)
-			}
-			return valid[i].Priority > valid[j].Priority
-		})
-	}
+	sortBySelectionPreference(valid, opts.PreferFreshest)
 
 	// Apply age delta filter if specified
 	if opts.MaxAgeDelta > 0 && len(valid) > 0 {
@@ -218,21 +242,7 @@ func SelectWithFallback(sources []DataSource, loadFunc func(DataSource) error, o
 	sorted := make([]DataSource, len(sources))
 	copy(sorted, sources)
 
-	if opts.PreferFreshest {
-		sort.Slice(sorted, func(i, j int) bool {
-			if sorted[i].ModTime.Equal(sorted[j].ModTime) {
-				return sorted[i].Priority > sorted[j].Priority
-			}
-			return sorted[i].ModTime.After(sorted[j].ModTime)
-		})
-	} else {
-		sort.Slice(sorted, func(i, j int) bool {
-			if sorted[i].Priority == sorted[j].Priority {
-				return sorted[i].ModTime.After(sorted[j].ModTime)
-			}
-			return sorted[i].Priority > sorted[j].Priority
-		})
-	}
+	sortBySelectionPreference(sorted, opts.PreferFreshest)
 
 	// Try each source in order
 	var lastErr error

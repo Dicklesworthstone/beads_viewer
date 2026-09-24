@@ -592,6 +592,43 @@ func TestSelectBestSource_PriorityTiebreaker(t *testing.T) {
 	}
 }
 
+func TestSelectionCanonicalJSONLNameBreaksEqualTies(t *testing.T) {
+	now := time.Now()
+	sources := []DataSource{
+		{Type: SourceTypeJSONLLocal, Path: "/test/beads.base.jsonl", Priority: PriorityJSONLLocal, ModTime: now, Valid: true},
+		{Type: SourceTypeJSONLLocal, Path: "/test/beads.jsonl", Priority: PriorityJSONLLocal, ModTime: now, Valid: true},
+		{Type: SourceTypeJSONLLocal, Path: "/test/issues.jsonl", Priority: PriorityJSONLLocal, ModTime: now, Valid: true},
+	}
+	want := "/test/issues.jsonl"
+
+	for _, preferFreshest := range []bool{true, false} {
+		opts := DefaultSelectionOptions()
+		opts.PreferFreshest = preferFreshest
+
+		selected, err := SelectBestSourceWithOptions(sources, opts)
+		if err != nil {
+			t.Fatalf("SelectBestSourceWithOptions(preferFreshest=%t): %v", preferFreshest, err)
+		}
+		if selected.Path != want {
+			t.Errorf("SelectBestSourceWithOptions(preferFreshest=%t) = %q, want %q", preferFreshest, selected.Path, want)
+		}
+
+		loaded, err := SelectWithFallback(sources, func(DataSource) error { return nil }, opts)
+		if err != nil {
+			t.Fatalf("SelectWithFallback(preferFreshest=%t): %v", preferFreshest, err)
+		}
+		if loaded.Path != want {
+			t.Errorf("SelectWithFallback(preferFreshest=%t) = %q, want %q", preferFreshest, loaded.Path, want)
+		}
+	}
+
+	fused := append([]DataSource(nil), sources...)
+	sortByFreshnessThenPriority(fused)
+	if fused[0].Path != want {
+		t.Errorf("sortByFreshnessThenPriority first = %q, want %q", fused[0].Path, want)
+	}
+}
+
 func TestSelectBestSource_MaxAgeDeltaUsesNewestWhenPriorityPreferred(t *testing.T) {
 	now := time.Now()
 	sources := []DataSource{

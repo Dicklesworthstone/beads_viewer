@@ -111,6 +111,33 @@ func TestBuildFileIndex(t *testing.T) {
 	}
 }
 
+func TestBuildFileIndexCommitIDsUseFullSHA(t *testing.T) {
+	shaA := "abcdefg" + strings.Repeat("1", 33)
+	shaB := "abcdefg" + strings.Repeat("2", 33)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-1": {
+			BeadID: "bv-1",
+			Status: "open",
+			Commits: []CorrelatedCommit{
+				{SHA: shaA, ShortSHA: shaA[:7], Files: []FileChange{{Path: "shared.go"}}},
+				{SHA: shaB, ShortSHA: shaB[:7], Files: []FileChange{{Path: "shared.go"}}},
+			},
+		},
+	}}
+
+	refs := BuildFileIndex(report).FileToBeads["shared.go"]
+	if len(refs) != 1 {
+		t.Fatalf("file references = %#v, want one bead", refs)
+	}
+	got := refs[0].CommitSHAs
+	if len(got) != 2 || got[0] != shaA || got[1] != shaB {
+		t.Fatalf("commit_shas = %#v, want sorted full SHAs [%q %q]", got, shaA, shaB)
+	}
+	if hasStringValue(got, shaA[:7]) {
+		t.Fatalf("commit_shas retained collision-prone short SHA %q", shaA[:7])
+	}
+}
+
 func TestBuildFileIndexEmpty(t *testing.T) {
 	// Nil report
 	index := BuildFileIndex(nil)
@@ -129,6 +156,31 @@ func TestBuildFileIndexEmpty(t *testing.T) {
 	index = BuildFileIndex(emptyReport)
 	if len(index.FileToBeads) != 0 {
 		t.Errorf("Expected empty FileToBeads for empty report, got %d entries", len(index.FileToBeads))
+	}
+}
+
+func TestBuildFileIndexSkipsEmptyNormalizedPaths(t *testing.T) {
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-1": {
+			BeadID: "bv-1",
+			Status: "open",
+			Commits: []CorrelatedCommit{{
+				SHA: "full-sha",
+				Files: []FileChange{
+					{Path: ""},
+					{Path: "./"},
+					{Path: "real.go"},
+				},
+			}},
+		},
+	}}
+
+	index := BuildFileIndex(report)
+	if _, ok := index.FileToBeads[""]; ok {
+		t.Fatal("empty normalized path was indexed")
+	}
+	if len(index.FileToBeads) != 1 || len(index.FileToBeads["real.go"]) != 1 {
+		t.Fatalf("file index = %#v, want only real.go", index.FileToBeads)
 	}
 }
 
@@ -223,6 +275,36 @@ func TestFileLookupByFile(t *testing.T) {
 	result = lookup.LookupByFile("nonexistent.go")
 	if result.TotalBeads != 0 {
 		t.Errorf("Expected 0 beads for nonexistent file, got %d", result.TotalBeads)
+	}
+}
+
+func TestFileLookupByFileReturnsCallerOwnedCommitSHAs(t *testing.T) {
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-owned": {
+				BeadID: "bv-owned",
+				Title:  "Owned lookup result",
+				Status: "open",
+				Commits: []CorrelatedCommit{
+					{
+						SHA:      "abcdef1234567890",
+						ShortSHA: "abcdef1",
+						Files:    []FileChange{{Path: "pkg/owned.go", Insertions: 1}},
+					},
+				},
+			},
+		},
+	}
+	lookup := NewFileLookup(report)
+	first := lookup.LookupByFile("pkg/owned.go")
+	if len(first.OpenBeads) != 1 || len(first.OpenBeads[0].CommitSHAs) != 1 {
+		t.Fatalf("first lookup = %+v, want one open bead with one commit", first)
+	}
+	first.OpenBeads[0].CommitSHAs[0] = "caller-mutated"
+
+	second := lookup.LookupByFile("pkg/owned.go")
+	if got := second.OpenBeads[0].CommitSHAs[0]; got != "abcdef1234567890" {
+		t.Fatalf("caller mutation leaked into exact-path index: got %q", got)
 	}
 }
 
@@ -866,6 +948,72 @@ func TestImpactAnalysisWithOpenBeads(t *testing.T) {
 	}
 }
 
+func TestImpactAnalysisNormalizesStatusForRiskAndOrdering(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	mkHistory := func(id, status, sha string) BeadHistory {
+		return BeadHistory{
+			BeadID: id,
+			Title:  id,
+			Status: status,
+			Commits: []CorrelatedCommit{{
+				SHA:       sha,
+				ShortSHA:  sha,
+				Timestamp: now.Add(-time.Hour),
+				Files:     []FileChange{{Path: "shared.go"}},
+			}},
+		}
+	}
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-progress": mkHistory("bv-progress", " IN_PROGRESS ", "progress-sha"),
+		"bv-open":     mkHistory("bv-open", " Open ", "open-sha"),
+		"bv-closed":   mkHistory("bv-closed", " CLOSED ", "closed-sha"),
+	}}
+
+	result := NewFileLookup(report).ImpactAnalysisAt([]string{"shared.go"}, now)
+	if diff := result.RiskScore - 0.65; result.RiskLevel != "high" || diff < -1e-9 || diff > 1e-9 {
+		t.Fatalf("normalized status risk = %s/%v, want high/0.65: %+v", result.RiskLevel, result.RiskScore, result)
+	}
+	if len(result.Warnings) != 2 {
+		t.Fatalf("warnings = %#v, want active-work and open-bead warnings", result.Warnings)
+	}
+	wantOrder := []string{"bv-progress", "bv-open", "bv-closed"}
+	if len(result.AffectedBeads) != len(wantOrder) {
+		t.Fatalf("affected beads = %#v, want %v", result.AffectedBeads, wantOrder)
+	}
+	for i, want := range wantOrder {
+		if result.AffectedBeads[i].BeadID != want {
+			t.Fatalf("affected_beads[%d] = %q, want %q", i, result.AffectedBeads[i].BeadID, want)
+		}
+	}
+}
+
+func TestImpactAnalysisTreatsOtherLiveStatusesAsOpen(t *testing.T) {
+	now := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-blocked": {
+			BeadID: "bv-blocked",
+			Status: " Blocked ",
+			Commits: []CorrelatedCommit{{
+				SHA:       "blocked-sha",
+				ShortSHA:  "blocked",
+				Timestamp: now,
+				Files:     []FileChange{{Path: "shared.go"}},
+			}},
+		},
+	}}
+
+	result := NewFileLookup(report).ImpactAnalysisAt([]string{"shared.go"}, now)
+	if result.RiskLevel != "medium" || result.RiskScore != 0.2 {
+		t.Fatalf("live nonstandard status was scored as closed: %+v", result)
+	}
+	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "Open beads") {
+		t.Fatalf("live nonstandard status did not produce open-work warning: %#v", result.Warnings)
+	}
+	if !strings.Contains(result.Summary, "1 open bead") {
+		t.Fatalf("live nonstandard status summary = %q, want open bead", result.Summary)
+	}
+}
+
 func TestImpactAnalysisRiskLevels(t *testing.T) {
 	now := time.Now()
 
@@ -1037,6 +1185,40 @@ func TestBuildCoChangeMatrixSamplesUseFullSHA(t *testing.T) {
 	got := result.RelatedFiles[0].SampleCommits
 	if len(got) != 2 || got[0] != shaA || got[1] != shaB {
 		t.Fatalf("sample commits = %#v, want sorted full SHAs [%q %q]", got, shaA, shaB)
+	}
+}
+
+func TestBuildCoChangeMatrixUnionsComplementarySameSHAObservations(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	report := &HistoryReport{Histories: map[string]BeadHistory{
+		"bv-source": {
+			BeadID: "bv-source",
+			Commits: []CorrelatedCommit{{
+				SHA: sha, ShortSHA: sha[:7], Files: []FileChange{{Path: "./source.go"}},
+			}},
+		},
+		"bv-related": {
+			BeadID: "bv-related",
+			Commits: []CorrelatedCommit{{
+				SHA: sha, ShortSHA: sha[:7], Files: []FileChange{{Path: "related.go"}},
+			}},
+		},
+	}}
+
+	matrix := BuildCoChangeMatrix(report)
+	files := matrix.CommitFiles[sha]
+	if len(files) != 2 || files[0] != "related.go" || files[1] != "source.go" {
+		t.Fatalf("same-SHA file union = %#v, want [related.go source.go]", files)
+	}
+	if matrix.FileCommitCounts["source.go"] != 1 || matrix.FileCommitCounts["related.go"] != 1 {
+		t.Fatalf("same commit was counted more than once: %#v", matrix.FileCommitCounts)
+	}
+	if matrix.Matrix["source.go"]["related.go"] != 1 || matrix.Matrix["related.go"]["source.go"] != 1 {
+		t.Fatalf("complementary observations did not form co-change pair: %#v", matrix.Matrix)
+	}
+	result := matrix.GetRelatedFiles("source.go", 1, 10)
+	if len(result.RelatedFiles) != 1 || len(result.RelatedFiles[0].SampleCommits) != 1 || result.RelatedFiles[0].SampleCommits[0] != sha {
+		t.Fatalf("related-file sample did not retain full SHA: %+v", result)
 	}
 }
 

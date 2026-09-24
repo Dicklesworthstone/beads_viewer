@@ -361,6 +361,87 @@ func TestSemanticSearchFilterLimit(t *testing.T) {
 	}
 }
 
+func TestSemanticSearchExactOpaqueIDSurvivesLimitAndHybridCandidateCap(t *testing.T) {
+	ss := NewSemanticSearch()
+	idx := search.NewVectorIndex(2)
+	embedder := &mockEmbedder{
+		dim: 2,
+		embedFunc: func(ctx context.Context, texts []string) ([][]float32, error) {
+			return [][]float32{{1, 0}}, nil
+		},
+	}
+
+	const ordinaryCount = 300
+	ids := make([]string, 0, ordinaryCount+1)
+	metrics := make(map[string]search.IssueMetrics, ordinaryCount+1)
+	for i := 0; i < ordinaryCount; i++ {
+		id := fmt.Sprintf("issue-%03d", i)
+		ids = append(ids, id)
+		if err := idx.Upsert(id, search.ContentHash{}, []float32{1, 0}); err != nil {
+			t.Fatalf("Upsert(%q): %v", id, err)
+		}
+		metrics[id] = search.IssueMetrics{}
+	}
+	exactID := "bv-9gf.3"
+	ids = append(ids, exactID)
+	if err := idx.Upsert(exactID, search.ContentHash{}, []float32{0, 1}); err != nil {
+		t.Fatalf("Upsert exact ID: %v", err)
+	}
+	metrics[exactID] = search.IssueMetrics{}
+
+	ss.SetIndex(idx, embedder)
+	ss.SetIDs(ids)
+	ss.SetHybridConfig(true, search.PresetDefault)
+	ss.SetMetricsCache(&staticMetricsCache{metrics: metrics})
+
+	ranks := ss.ComputeSemanticResults(" BV-9GF.3 ")
+	if len(ranks) != 75 {
+		t.Fatalf("rank count = %d, want bounded 75", len(ranks))
+	}
+	if ranks[0].Index != ordinaryCount {
+		t.Fatalf("exact opaque ID rank = %#v, want source index %d first", ranks[0], ordinaryCount)
+	}
+	scores, ok := ss.Scores(" BV-9GF.3 ")
+	if !ok || scores[exactID].Components == nil {
+		t.Fatalf("exact ID was promoted without hybrid scoring: %#v, %t", scores[exactID], ok)
+	}
+}
+
+func TestSemanticSearchExactIDCaseFoldCollisionIsNotArbitrarilyPromoted(t *testing.T) {
+	ss := NewSemanticSearch()
+	idx := search.NewVectorIndex(2)
+	embedder := &mockEmbedder{
+		dim: 2,
+		embedFunc: func(context.Context, []string) ([][]float32, error) {
+			return [][]float32{{1, 0}}, nil
+		},
+	}
+
+	ids := []string{"Task-1", "task-1"}
+	if err := idx.Upsert(ids[0], search.ContentHash{}, []float32{0, 1}); err != nil {
+		t.Fatalf("Upsert(%q): %v", ids[0], err)
+	}
+	if err := idx.Upsert(ids[1], search.ContentHash{}, []float32{1, 0}); err != nil {
+		t.Fatalf("Upsert(%q): %v", ids[1], err)
+	}
+	ss.SetIndex(idx, embedder)
+	ss.SetIDs(ids)
+
+	// With no exact-case match, the case-fold collision is ambiguous and normal
+	// semantic ranking must decide; iteration order must not force Task-1 first.
+	ranks := ss.ComputeSemanticResults("TASK-1")
+	if len(ranks) != 2 || ranks[0].Index != 1 {
+		t.Fatalf("ambiguous folded-ID ranks = %#v, want semantically stronger source index 1 first", ranks)
+	}
+
+	// A byte-exact match remains an unambiguous navigation intent even when a
+	// differently-cased ID also exists.
+	ranks = ss.ComputeSemanticResults("Task-1")
+	if len(ranks) != 2 || ranks[0].Index != 0 {
+		t.Fatalf("exact-case ID ranks = %#v, want exact source index 0 first", ranks)
+	}
+}
+
 func TestSemanticSearchFilterMissingID(t *testing.T) {
 	ss := NewSemanticSearch()
 
