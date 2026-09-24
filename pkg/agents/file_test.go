@@ -43,6 +43,74 @@ func TestAppendBlurbToFile(t *testing.T) {
 	}
 }
 
+func TestOversizedAgentFileIsNotReadOrReplaced(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "AGENTS.md")
+	file, err := os.Create(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("keep these bytes"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxAgentFileBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AppendBlurbToFile(filePath); !errors.Is(err, errAgentFileTooLarge) {
+		t.Fatalf("append should refuse oversized input before allocation: %v", err)
+	}
+	if _, err := VerifyBlurbPresent(filePath); !errors.Is(err, errAgentFileTooLarge) {
+		t.Fatalf("verification should refuse oversized input before allocation: %v", err)
+	}
+	after, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || after.Size() != maxAgentFileBytes+1 {
+		t.Fatal("oversized-file refusal replaced or truncated the original")
+	}
+	content, err := os.Open(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer content.Close()
+	prefix := make([]byte, len("keep these bytes"))
+	if _, err := content.Read(prefix); err != nil || string(prefix) != "keep these bytes" {
+		t.Fatalf("original prefix changed: %q, %v", prefix, err)
+	}
+}
+
+func TestOversizedExclusiveCreateDoesNotPublish(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "AGENTS.md")
+	if err := writeFileDirectExclusive(filePath, make([]byte, maxAgentFileBytes+1)); !errors.Is(err, errAgentFileTooLarge) {
+		t.Fatalf("exclusive create should reject oversized content: %v", err)
+	}
+	if _, err := os.Lstat(filePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("oversized create unexpectedly published a file: %v", err)
+	}
+}
+
+func TestVerifyBlurbPresentDoesNotFollowSymlink(t *testing.T) {
+	targetPath := filepath.Join(t.TempDir(), "outside.md")
+	if err := os.WriteFile(targetPath, []byte(AgentBlurb), 0600); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := filepath.Join(t.TempDir(), "AGENTS.md")
+	if err := os.Symlink(targetPath, linkPath); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	if present, err := VerifyBlurbPresent(linkPath); err == nil || present {
+		t.Fatalf("verification followed a symlink: present=%v err=%v", present, err)
+	}
+}
+
 func TestAppendBlurbToEmptyFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	filePath := filepath.Join(tmpDir, "AGENTS.md")
