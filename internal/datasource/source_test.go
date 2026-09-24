@@ -12,6 +12,100 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
+func TestValidationCacheSeparatesSourceTypesAndSQLiteWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.data")
+	if err := os.WriteFile(path, []byte("same file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	jsonl := DataSource{Type: SourceTypeJSONLLocal, Path: path, Valid: true, IssueCount: 1}
+	storeValidationCache(&jsonl)
+	sqlite := DataSource{Type: SourceTypeSQLite, Path: path}
+	if hit, err := lookupValidationCache(&sqlite, DefaultValidationOptions()); hit || err != nil {
+		t.Fatalf("SQLite reused JSONL verdict: hit=%t err=%v", hit, err)
+	}
+
+	sqlite.ValidationError = "failure before WAL appeared"
+	storeValidationCache(&sqlite)
+	if hit, err := lookupValidationCache(&sqlite, DefaultValidationOptions()); !hit || err == nil {
+		t.Fatalf("initial SQLite cache entry: hit=%t err=%v", hit, err)
+	}
+	if err := os.WriteFile(path+"-wal", []byte("new WAL state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if hit, err := lookupValidationCache(&sqlite, DefaultValidationOptions()); hit || err != nil {
+		t.Fatalf("SQLite reused pre-WAL verdict: hit=%t err=%v", hit, err)
+	}
+}
+
+func TestValidationCacheRejectsSameSizeRewriteWithRestoredMtime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	mtime := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.WriteFile(path, []byte("aaaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := validationPathIdentityFromInfo(beforeInfo)
+	if !before.hasChangeAt {
+		t.Skip("filesystem does not expose change time")
+	}
+	source := DataSource{Type: SourceTypeJSONLLocal, Path: path, Valid: true}
+	storeValidationCache(&source)
+	if err := os.WriteFile(path, []byte("bbbb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := validationPathIdentityFromInfo(afterInfo)
+	if !os.SameFile(beforeInfo, afterInfo) || before.size != after.size || !before.modTime.Equal(after.modTime) {
+		t.Fatal("fixture did not preserve inode, size, and mtime")
+	}
+	if before.changeSec == after.changeSec && before.changeNsec == after.changeNsec {
+		t.Skip("filesystem did not advance change time at test resolution")
+	}
+	changed := DataSource{Type: SourceTypeJSONLLocal, Path: path}
+	if hit, err := lookupValidationCache(&changed, DefaultValidationOptions()); hit || err != nil {
+		t.Fatalf("reused verdict after rewrite: hit=%t err=%v", hit, err)
+	}
+}
+
+func TestValidationCacheDoesNotStoreVerdictForChangedInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := os.WriteFile(path, []byte(`{"id":"VALID-1","title":"valid","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source := DataSource{Type: SourceTypeJSONLLocal, Path: path}
+	opts := DefaultValidationOptions()
+	opts.Verbose = true
+	var rewriteErr error
+	opts.Logger = func(string) {
+		if rewriteErr == nil {
+			rewriteErr = os.WriteFile(path, []byte("invalid JSONL now\n"), 0o644)
+		}
+	}
+	if err := ValidateSourceWithOptions(&source, opts); err != nil {
+		t.Fatalf("validation before rewrite: %v", err)
+	}
+	if rewriteErr != nil {
+		t.Fatal(rewriteErr)
+	}
+	changed := DataSource{Type: SourceTypeJSONLLocal, Path: path}
+	if hit, err := lookupValidationCache(&changed, DefaultValidationOptions()); hit || err != nil {
+		t.Fatalf("cached verdict for changed input: hit=%t err=%v", hit, err)
+	}
+}
+
 // TestDiscoverSources_OnlySQLite tests discovery with only a SQLite source
 func TestDiscoverSources_OnlySQLite(t *testing.T) {
 	tmpDir := t.TempDir()

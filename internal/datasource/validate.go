@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -15,39 +16,80 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// validationCacheEntry records a prior validation result for a specific file
-// identity (path + modtime + size). It is keyed so that any on-disk change
-// invalidates the cache and forces a fresh validation.
+// validationCacheEntry records a result for one observable file identity.
 type validationCacheEntry struct {
-	modTime    time.Time
-	size       int64
+	identity   validationFileIdentity
 	valid      bool
 	validErr   string
 	issueCount int
 }
 
+type validationCacheKey struct {
+	path       string
+	sourceType SourceType
+}
+
+type validationFileIdentity struct {
+	main validationPathIdentity
+	wal  validationPathIdentity
+}
+
+func (identity validationFileIdentity) equal(other validationFileIdentity) bool {
+	return identity.main.equal(other.main) && identity.wal.equal(other.wal)
+}
+
+type validationPathIdentity struct {
+	exists      bool
+	modTime     time.Time
+	size        int64
+	info        os.FileInfo
+	changeSec   int64
+	changeNsec  int64
+	hasChangeAt bool
+}
+
+func (identity validationPathIdentity) equal(other validationPathIdentity) bool {
+	if identity.exists != other.exists {
+		return false
+	}
+	if !identity.exists {
+		return true
+	}
+	if !identity.modTime.Equal(other.modTime) || identity.size != other.size {
+		return false
+	}
+	if identity.info != nil && other.info != nil && !os.SameFile(identity.info, other.info) {
+		return false
+	}
+	return !identity.hasChangeAt || !other.hasChangeAt ||
+		(identity.changeSec == other.changeSec && identity.changeNsec == other.changeNsec)
+}
+
 // validationCache memoizes validation results within a single process. The hot
 // robot CLI paths (LoadIssues + resolveSingleRepoWatchFile) each discover and
 // validate the same source files; without this cache the 1.9MB issues.jsonl is
-// fully re-parsed 2-3x per invocation. Keyed by absolute path with a
-// modtime+size guard so a changed file is always re-validated (correctness is
-// preserved across a watch session; within one CLI run the file cannot change).
+// fully re-parsed 2-3x per invocation. The key includes source type, and the
+// identity includes the main file plus a SQLite WAL when present.
 var (
 	validationCacheMu sync.Mutex
-	validationCache   = map[string]validationCacheEntry{}
+	validationCache   = map[validationCacheKey]validationCacheEntry{}
 )
 
+func sourceValidationCacheKey(source *DataSource) validationCacheKey {
+	return validationCacheKey{path: source.Path, sourceType: source.Type}
+}
+
 // lookupValidationCache returns a cached validation result for source if one
-// exists and the file identity (modtime+size) still matches.
+// exists and the complete file identity still matches.
 func lookupValidationCache(source *DataSource, opts ValidationOptions) (bool, error) {
-	info, err := os.Stat(source.Path)
+	identity, err := sourceValidationIdentity(source)
 	if err != nil {
 		return false, nil
 	}
 	validationCacheMu.Lock()
-	entry, ok := validationCache[source.Path]
+	entry, ok := validationCache[sourceValidationCacheKey(source)]
 	validationCacheMu.Unlock()
-	if !ok || !entry.modTime.Equal(info.ModTime()) || entry.size != info.Size() {
+	if !ok || !entry.identity.equal(identity) {
 		return false, nil
 	}
 	// Cache hit: replay the recorded result onto the source.
@@ -64,19 +106,124 @@ func lookupValidationCache(source *DataSource, opts ValidationOptions) (bool, er
 
 // storeValidationCache records the outcome of a validation for later reuse.
 func storeValidationCache(source *DataSource) {
-	info, err := os.Stat(source.Path)
+	identity, err := sourceValidationIdentity(source)
 	if err != nil {
 		return
 	}
+	storeValidationCacheWithIdentity(source, identity)
+}
+
+func storeValidationCacheWithIdentity(source *DataSource, identity validationFileIdentity) {
 	validationCacheMu.Lock()
-	validationCache[source.Path] = validationCacheEntry{
-		modTime:    info.ModTime(),
-		size:       info.Size(),
+	validationCache[sourceValidationCacheKey(source)] = validationCacheEntry{
+		identity:   identity,
 		valid:      source.Valid,
 		validErr:   source.ValidationError,
 		issueCount: source.IssueCount,
 	}
 	validationCacheMu.Unlock()
+}
+
+func storeValidationCacheIfUnchanged(source *DataSource, before validationFileIdentity, haveBefore bool) {
+	if !haveBefore {
+		return
+	}
+	after, err := sourceValidationIdentity(source)
+	if err != nil || !before.equal(after) {
+		return
+	}
+	storeValidationCacheWithIdentity(source, after)
+}
+
+func sourceValidationIdentity(source *DataSource) (validationFileIdentity, error) {
+	info, err := os.Stat(source.Path)
+	if err != nil {
+		return validationFileIdentity{}, err
+	}
+	identity := validationFileIdentity{main: validationPathIdentityFromInfo(info)}
+	if source.Type != SourceTypeSQLite {
+		return identity, nil
+	}
+
+	walInfo, err := os.Stat(source.Path + "-wal")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return identity, nil
+		}
+		return validationFileIdentity{}, err
+	}
+	identity.wal = validationPathIdentityFromInfo(walInfo)
+	return identity, nil
+}
+
+func validationPathIdentityFromInfo(info os.FileInfo) validationPathIdentity {
+	if info == nil {
+		return validationPathIdentity{}
+	}
+	changeSec, changeNsec, hasChangeAt := validationFileChangeTime(info)
+	return validationPathIdentity{
+		exists:      true,
+		modTime:     info.ModTime(),
+		size:        info.Size(),
+		info:        info,
+		changeSec:   changeSec,
+		changeNsec:  changeNsec,
+		hasChangeAt: hasChangeAt,
+	}
+}
+
+// validationFileChangeTime extracts the inode metadata-change timestamp from
+// Unix file info. Other platforms retain the identity and size/mtime guards.
+func validationFileChangeTime(info os.FileInfo) (seconds, nanoseconds int64, ok bool) {
+	if info == nil || info.Sys() == nil {
+		return 0, 0, false
+	}
+	value := reflect.ValueOf(info.Sys())
+	for value.IsValid() && value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return 0, 0, false
+		}
+		value = value.Elem()
+	}
+	if !value.IsValid() || value.Kind() != reflect.Struct {
+		return 0, 0, false
+	}
+	for _, fieldName := range []string{"Ctim", "Ctimespec"} {
+		stamp := value.FieldByName(fieldName)
+		if !stamp.IsValid() || stamp.Kind() != reflect.Struct {
+			continue
+		}
+		seconds, secondsOK := validationSignedIntegerField(stamp, "Sec")
+		nanoseconds, nanosOK := validationSignedIntegerField(stamp, "Nsec")
+		if secondsOK && nanosOK {
+			return seconds, nanoseconds, true
+		}
+	}
+	seconds, secondsOK := validationSignedIntegerField(value, "Ctime")
+	nanoseconds, nanosOK := validationSignedIntegerField(value, "Ctimensec")
+	if secondsOK {
+		return seconds, nanoseconds, !nanosOK || nanoseconds >= 0
+	}
+	return 0, 0, false
+}
+
+func validationSignedIntegerField(value reflect.Value, name string) (int64, bool) {
+	field := value.FieldByName(name)
+	if !field.IsValid() {
+		return 0, false
+	}
+	switch field.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return field.Int(), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		unsigned := field.Uint()
+		if unsigned > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(unsigned), true
+	default:
+		return 0, false
+	}
 }
 
 // ValidationOptions configures source validation behavior
@@ -131,7 +278,12 @@ func ValidateSourceWithOptions(source *DataSource, opts ValidationOptions) error
 	cacheable := opts.CountIssues &&
 		opts.MaxJSONLErrorRate == DefaultValidationOptions().MaxJSONLErrorRate &&
 		isDefaultRequiredFields(opts.RequiredFields)
+	var validationStart validationFileIdentity
+	haveValidationStart := false
 	if cacheable {
+		var identityErr error
+		validationStart, identityErr = sourceValidationIdentity(source)
+		haveValidationStart = identityErr == nil
 		if hit, hitErr := lookupValidationCache(source, opts); hit {
 			return hitErr
 		}
@@ -151,7 +303,7 @@ func ValidateSourceWithOptions(source *DataSource, opts ValidationOptions) error
 		source.Valid = false
 		source.ValidationError = err.Error()
 		if cacheable {
-			storeValidationCache(source)
+			storeValidationCacheIfUnchanged(source, validationStart, haveValidationStart)
 		}
 		return err
 	}
@@ -159,7 +311,7 @@ func ValidateSourceWithOptions(source *DataSource, opts ValidationOptions) error
 	source.Valid = true
 	source.ValidationError = ""
 	if cacheable {
-		storeValidationCache(source)
+		storeValidationCacheIfUnchanged(source, validationStart, haveValidationStart)
 	}
 	return nil
 }
