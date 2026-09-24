@@ -167,7 +167,7 @@ func LoadIssues(repoPath string) (result LoadResult, err error) {
 		return loadBDWorkspace(beadsDir)
 	}
 
-	issues, smartErr := loadSmart(beadsDir, repoPath)
+	issues, smartErr := loadSmart(beadsDir, repoPath, explicitBeadsDirectorySelectorActive())
 	if smartErr == nil {
 		return issues, nil
 	}
@@ -217,7 +217,7 @@ func LoadIssuesFromDir(beadsDir string) (result LoadResult, err error) {
 		return loadBDWorkspace(beadsDir)
 	}
 
-	issues, smartErr := loadSmart(beadsDir, "")
+	issues, smartErr := loadSmart(beadsDir, "", true)
 	if smartErr == nil {
 		return issues, nil
 	}
@@ -326,7 +326,7 @@ func explicitBeadsDBFileType(dbPath string) (SourceType, int, bool) {
 // pass: the same 10% malformed-error-rate gate is applied to the loader's parse
 // stats post-load. A genuinely-corrupt JSONL is still rejected (and we fall
 // through to the next candidate), but the happy path reads the file exactly once.
-func loadSmart(beadsDir, repoPath string) (LoadResult, error) {
+func loadSmart(beadsDir, repoPath string, skipWorktreeSources bool) (LoadResult, error) {
 	var warn func(string)
 	if !env.Robot.Bool() {
 		warn = func(message string) {
@@ -337,6 +337,7 @@ func loadSmart(beadsDir, repoPath string) (LoadResult, error) {
 		BeadsDir:               beadsDir,
 		RepoPath:               repoPath,
 		ValidateAfterDiscovery: false,
+		SkipWorktreeSources:    skipWorktreeSources,
 		WarningHandler:         warn,
 	})
 	if err != nil {
@@ -376,6 +377,11 @@ func loadSmart(beadsDir, repoPath string) (LoadResult, error) {
 		return lastResult, fmt.Errorf("no valid sources discovered: %w", lastErr)
 	}
 	return LoadResult{}, fmt.Errorf("no valid sources discovered")
+}
+
+func explicitBeadsDirectorySelectorActive() bool {
+	return strings.TrimSpace(env.BeadsDB.Get()) != "" ||
+		strings.TrimSpace(env.BeadsDir.Get()) != ""
 }
 
 // loadAndValidate loads a single source while applying the validation gate in the

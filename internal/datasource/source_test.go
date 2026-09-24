@@ -3,6 +3,7 @@ package datasource
 import (
 	"database/sql"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -161,6 +162,76 @@ func TestDiscoverSources_Empty(t *testing.T) {
 
 	if len(sources) != 0 {
 		t.Errorf("Expected 0 sources, got %d", len(sources))
+	}
+}
+
+func TestLoadIssues_ExplicitDirectoryIgnoresCallerWorktree(t *testing.T) {
+	for _, envName := range []string{loader.BeadsDBEnvVar, loader.BeadsDirEnvVar} {
+		t.Run(envName, func(t *testing.T) {
+			t.Setenv(loader.BeadsDBEnvVar, "")
+			t.Setenv(loader.BeadsDirEnvVar, "")
+
+			repoDir := t.TempDir()
+			git := exec.Command("git", "init", "-b", "main")
+			git.Dir = repoDir
+			if output, err := git.CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v\n%s", err, output)
+			}
+			foreignDir := filepath.Join(repoDir, ".git", "beads-worktrees", "foreign")
+			if err := os.MkdirAll(foreignDir, 0o755); err != nil {
+				t.Fatalf("mkdir foreign worktree export: %v", err)
+			}
+			foreignPath := filepath.Join(foreignDir, "issues.jsonl")
+			if err := os.WriteFile(foreignPath, []byte(`{"id":"FOREIGN-1","title":"Wrong repository","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+				t.Fatalf("write foreign worktree export: %v", err)
+			}
+
+			selectedDir := filepath.Join(t.TempDir(), ".beads")
+			if err := os.MkdirAll(selectedDir, 0o755); err != nil {
+				t.Fatalf("mkdir selected tracker: %v", err)
+			}
+			selectedPath := filepath.Join(selectedDir, "issues.jsonl")
+			if err := os.WriteFile(selectedPath, []byte(`{"id":"SELECTED-1","title":"Selected repository","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+				t.Fatalf("write selected tracker export: %v", err)
+			}
+			older := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+			newer := older.Add(time.Hour)
+			if err := os.Chtimes(selectedPath, older, older); err != nil {
+				t.Fatalf("age selected tracker export: %v", err)
+			}
+			if err := os.Chtimes(foreignPath, newer, newer); err != nil {
+				t.Fatalf("freshen foreign worktree export: %v", err)
+			}
+
+			t.Setenv(envName, selectedDir)
+			loaded, err := LoadIssues(repoDir)
+			if err != nil {
+				t.Fatalf("LoadIssues with explicit directory: %v", err)
+			}
+			if len(loaded.Issues) != 1 || loaded.Issues[0].ID != "SELECTED-1" {
+				t.Fatalf("explicit directory loaded issues = %#v, want only SELECTED-1", loaded.Issues)
+			}
+			if loaded.Source.Path != selectedPath {
+				t.Fatalf("selected source = %s, want %s", loaded.Source.Path, selectedPath)
+			}
+
+			fromDir, err := LoadIssuesFromDir(selectedDir)
+			if err != nil {
+				t.Fatalf("LoadIssuesFromDir: %v", err)
+			}
+			if len(fromDir.Issues) != 1 || fromDir.Issues[0].ID != "SELECTED-1" {
+				t.Fatalf("explicit LoadIssuesFromDir issues = %#v, want only SELECTED-1", fromDir.Issues)
+			}
+
+			t.Setenv(envName, "")
+			inferred, err := LoadIssues(repoDir)
+			if err != nil {
+				t.Fatalf("LoadIssues with inferred tracker: %v", err)
+			}
+			if len(inferred.Issues) != 1 || inferred.Issues[0].ID != "FOREIGN-1" {
+				t.Fatalf("inferred tracker loaded issues = %#v, want worktree source", inferred.Issues)
+			}
+		})
 	}
 }
 
