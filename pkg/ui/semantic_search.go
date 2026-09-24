@@ -460,7 +460,18 @@ func (s *SemanticSearch) computeSemanticResults(term string) ([]list.Rank, map[s
 
 	scoredItems := make([]scored, len(snap.IDs))
 	scoreMap := make(map[string]SemanticScore, len(snap.IDs))
+	exactQuery := strings.TrimSpace(term)
+	exactIssueID := ""
+	foldedIssueID := ""
+	foldedIssueIDCount := 0
 	for i, id := range snap.IDs {
+		if exactQuery != "" && strings.EqualFold(id, exactQuery) {
+			foldedIssueID = id
+			foldedIssueIDCount++
+			if id == exactQuery {
+				exactIssueID = id
+			}
+		}
 		entry, ok := snap.Index.Get(id)
 		textScore := 0.0
 		score := 0.0
@@ -488,6 +499,9 @@ func (s *SemanticSearch) computeSemanticResults(term string) ([]list.Rank, map[s
 			TextScore: textScore,
 		}
 	}
+	if exactIssueID == "" && foldedIssueIDCount == 1 {
+		exactIssueID = foldedIssueID
+	}
 
 	limit := 75
 	if scorer != nil {
@@ -509,6 +523,14 @@ func (s *SemanticSearch) computeSemanticResults(term string) ([]list.Rank, map[s
 			for _, item := range candidates {
 				if item.hasVector {
 					candidateIDs[item.id] = struct{}{}
+				}
+			}
+			// An exact issue-ID lookup is a navigation intent, not merely another
+			// semantic candidate. Include it in hybrid scoring even when its vector
+			// score falls just outside the bounded candidate pool.
+			if exactIssueID != "" {
+				if entry, ok := snap.Index.Get(exactIssueID); ok && len(entry.Vector) > 0 {
+					candidateIDs[exactIssueID] = struct{}{}
 				}
 			}
 		}
@@ -542,6 +564,18 @@ func (s *SemanticSearch) computeSemanticResults(term string) ([]list.Rank, map[s
 		}
 		return scoredItems[i].score > scoredItems[j].score
 	})
+	if exactIssueID != "" {
+		for i := range scoredItems {
+			if scoredItems[i].id == exactIssueID {
+				if i > 0 {
+					exact := scoredItems[i]
+					copy(scoredItems[1:i+1], scoredItems[:i])
+					scoredItems[0] = exact
+				}
+				break
+			}
+		}
+	}
 
 	if len(scoredItems) > limit {
 		scoredItems = scoredItems[:limit]
