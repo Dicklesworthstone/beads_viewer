@@ -8677,7 +8677,7 @@ const minMainContentWidth = 20
 // sidebarVisible reports whether the shortcuts sidebar is both toggled on and
 // actually drawn: it is suppressed when the terminal is too narrow to leave
 // minMainContentWidth columns for the main body next to it (GH #209).
-func (m Model) sidebarVisible() bool {
+func (m *Model) sidebarVisible() bool {
 	return m.showShortcutsSidebar &&
 		m.width-(m.shortcutsSidebar.Width()+shortcutsSidebarGap) >= minMainContentWidth
 }
@@ -8691,7 +8691,7 @@ func (m Model) sidebarVisible() bool {
 //
 // It never returns less than a small floor so downstream sizing math stays
 // positive on very narrow terminals.
-func (m Model) mainContentWidth() int {
+func (m *Model) mainContentWidth() int {
 	w := m.width
 	if m.sidebarVisible() {
 		w -= m.shortcutsSidebar.Width() + shortcutsSidebarGap

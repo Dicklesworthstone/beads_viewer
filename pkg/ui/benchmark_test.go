@@ -136,25 +136,31 @@ func TestPerformanceBoardGroupingPreservesFallbackColumns(t *testing.T) {
 	}
 }
 
+// snapshotSwapFixture returns a model that has installed one of two snapshots
+// differing in a single modified issue, for measuring live-reload swaps.
+func snapshotSwapFixture(size int) (*Model, [2]*DataSnapshot) {
+	issues := testutil.QuickRandom(size, 0.01)
+	modifiedIssues := copyIssues(issues)
+	modifiedID := modifiedIssues[len(modifiedIssues)/2].ID
+	modifiedIssues[len(modifiedIssues)/2].Title += " updated"
+
+	m := NewModel(copyIssues(issues), nil, "")
+	snapshots := [2]*DataSnapshot{
+		NewSnapshotBuilder(copyIssues(issues)).Build(),
+		NewSnapshotBuilder(modifiedIssues).Build(),
+	}
+	for _, snapshot := range snapshots {
+		snapshot.IssueDiff = &analysis.IssueDiff{Modified: []string{modifiedID}}
+	}
+
+	tm, _ := m.Update(SnapshotReadyMsg{Snapshot: snapshots[0]})
+	return tm.(*Model), snapshots
+}
+
 func BenchmarkSnapshotSwap(b *testing.B) {
 	for _, size := range []int{100, 1000, 5000} {
 		b.Run(fmt.Sprintf("issues=%d", size), func(b *testing.B) {
-			issues := testutil.QuickRandom(size, 0.01)
-			modifiedIssues := copyIssues(issues)
-			modifiedID := modifiedIssues[len(modifiedIssues)/2].ID
-			modifiedIssues[len(modifiedIssues)/2].Title += " updated"
-
-			m := NewModel(copyIssues(issues), nil, "")
-			snapshots := [2]*DataSnapshot{
-				NewSnapshotBuilder(copyIssues(issues)).Build(),
-				NewSnapshotBuilder(modifiedIssues).Build(),
-			}
-			for _, snapshot := range snapshots {
-				snapshot.IssueDiff = &analysis.IssueDiff{Modified: []string{modifiedID}}
-			}
-
-			tm, _ := m.Update(SnapshotReadyMsg{Snapshot: snapshots[0]})
-			m = tm.(*Model)
+			m, snapshots := snapshotSwapFixture(size)
 
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -163,6 +169,24 @@ func BenchmarkSnapshotSwap(b *testing.B) {
 				m = tm.(*Model)
 			}
 		})
+	}
+}
+
+// A snapshot swap on a small project allocates about 10 KB. Calling a
+// value-receiver Model method on the swap path copies the whole Model struct
+// (over 200 KB per swap, a 10x slowdown for 100 issues, seen after the GH #209
+// layout change), so bound the bytes allocated per swap.
+func TestSnapshotSwapDoesNotCopyModel(t *testing.T) {
+	m, snapshots := snapshotSwapFixture(100)
+	result := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			tm, _ := m.Update(SnapshotReadyMsg{Snapshot: snapshots[i&1]})
+			m = tm.(*Model)
+		}
+	})
+	if got := result.AllocedBytesPerOp(); got > 64<<10 {
+		t.Fatalf("snapshot swap allocated %d bytes per op for 100 issues; want at most %d", got, 64<<10)
 	}
 }
 
