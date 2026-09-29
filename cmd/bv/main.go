@@ -7145,13 +7145,15 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 
 	// Keep Git ancestry order, including equal or backdated author timestamps.
 	// Sorting timestamps or hashes can replay a close before its creation.
-	// Rank the whole rename-following history, not just its first
-	// timeTravelCommitLimit entries: the extractor takes its bounded window in
-	// date order, and once a side branch that touched the tracker is merged,
-	// the first N commits in topological order are a different set, so a
-	// retained commit could be missing from the ranking. Reverse by rank
-	// afterward: --reverse can interfere with following the source's old name.
-	orderCmd := exec.Command("git", "log", "--format=%H", "--topo-order", "--follow", "HEAD", "--", beadsPath)
+	// Rank every commit reachable from HEAD rather than re-walking the tracker
+	// path. A second path walk does not select the same commits as the
+	// extractor: a bounded walk in topological order is a different set from
+	// the extractor's date-ordered window once a side branch that touched the
+	// tracker is merged, and --follow switches to a renamed tracker's old name
+	// at a point that depends on walk order, so an older side branch that
+	// edited the old name can be dropped. Every extracted commit is reachable
+	// from HEAD, so each one has a rank. Reverse by rank afterward.
+	orderCmd := exec.Command("git", "log", "--format=%H", "--topo-order", "HEAD")
 	orderCmd.Dir = cwd
 	orderOutput, err := orderCmd.Output()
 	if err != nil {

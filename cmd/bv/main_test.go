@@ -137,6 +137,89 @@ func TestHistoryExportRanksRetainedCommitsAfterMergedSideBranch(t *testing.T) {
 	}
 }
 
+// The tracker is renamed on main while an older side branch still edits the
+// old name, and that branch is merged afterwards. The extractor's date-ordered
+// --follow walk reaches the rename first and keeps the side commit; a
+// --follow walk in topological order lists the side branch while still on the
+// new name and drops it, so ranking by a path walk failed with "timeline
+// commit ... missing from source history".
+func TestHistoryExportRanksRenamedTrackerSideBranch(t *testing.T) {
+	repo := t.TempDir()
+	t.Chdir(repo)
+	t.Setenv("BV_NO_CACHE", "1")
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	git := func(hour int, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid", "GIT_AUTHOR_DATE="+at, "GIT_COMMITTER_DATE="+at)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	write := func(name string, ids ...string) {
+		t.Helper()
+		var data strings.Builder
+		for _, id := range ids {
+			fmt.Fprintf(&data, "{\"id\":%q,\"title\":\"Issue %s\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", id, id, start.Format(time.RFC3339), start.Format(time.RFC3339))
+		}
+		if err := os.WriteFile(name, []byte(data.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git(0, "init", "-b", "main")
+	if err := os.Mkdir(".beads", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(".beads/beads.jsonl", "bv-a")
+	git(0, "add", "-A")
+	git(0, "commit", "-m", "base")
+	write(".beads/beads.jsonl", "bv-a", "bv-b")
+	git(1, "commit", "-am", "main old name")
+	mainOld := git(1, "rev-parse", "HEAD")
+	git(1, "checkout", "-b", "side")
+	write(".beads/beads.jsonl", "bv-a", "bv-b", "bv-s")
+	git(2, "commit", "-am", "side old name")
+	side := git(2, "rev-parse", "HEAD")
+	git(2, "checkout", "main")
+	git(3, "mv", ".beads/beads.jsonl", ".beads/issues.jsonl")
+	git(3, "commit", "-m", "rename tracker")
+	write(".beads/issues.jsonl", "bv-a", "bv-b", "bv-c")
+	git(4, "commit", "-am", "main new name")
+	mainNew := git(4, "rev-parse", "HEAD")
+	git(7, "merge", "--no-commit", "-X", "ours", "side")
+	write(".beads/issues.jsonl", "bv-a", "bv-b", "bv-s", "bv-c")
+	git(7, "add", "-A")
+	git(7, "commit", "-m", "merge side")
+
+	issues := []model.Issue{{ID: "bv-a"}, {ID: "bv-b"}, {ID: "bv-c"}, {ID: "bv-s"}}
+	history, err := generateHistoryForExport(issues)
+	if err != nil {
+		t.Fatalf("history export failed after merging a side branch that edited the old tracker name: %v", err)
+	}
+	position := map[string]int{}
+	for i, commit := range history.Commits {
+		position[commit.SHA] = i
+	}
+	for sha, id := range map[string]string{mainOld: "bv-b", side: "bv-s", mainNew: "bv-c"} {
+		i, ok := position[sha]
+		if !ok {
+			t.Fatalf("commit %s (adds %s) missing from timeline: %#v", sha, id, history.Commits)
+		}
+		if got := history.Commits[i].BeadsAdded; !reflect.DeepEqual(got, []string{id}) {
+			t.Fatalf("commit %s added %v, want [%s]", sha, got, id)
+		}
+	}
+	if position[mainOld] >= position[side] || position[mainOld] >= position[mainNew] {
+		t.Fatalf("timeline replays a commit before its parent: %#v", history.Commits)
+	}
+}
+
 func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 	repo := t.TempDir()
 	t.Chdir(repo)
