@@ -320,13 +320,18 @@ func (s *ShortcutsSidebar) View() string {
 		}
 	}
 
-	// Build content lines for scrolling
-	fullContent := sb.String()
+	// Build content lines for scrolling. Wrap to the box's inner width first
+	// (width minus 1 cell of padding on each side) so a long description that
+	// wraps is counted as the lines it really occupies; otherwise the box grows
+	// past its height and the final MaxHeight clips its bottom border.
+	innerWidth := max(s.width-2, 1)
+	fullContent := t.Renderer.NewStyle().Width(innerWidth).Render(strings.TrimSuffix(sb.String(), "\n"))
 	lines := strings.Split(fullContent, "\n")
 	totalLines := len(lines)
 
-	// Calculate visible area
-	availableHeight := s.height - 4 // Reserve for border/padding and hint
+	// Calculate visible area: s.height is the sidebar's total rendered height,
+	// which includes the top and bottom border rows and the scroll-hint row.
+	availableHeight := s.height - 3
 	if availableHeight < 5 {
 		availableHeight = 5
 	}
@@ -364,14 +369,16 @@ func (s *ShortcutsSidebar) View() string {
 	// Combine content and footer
 	content := visibleContent + "\n" + footer
 
-	// Create the sidebar box
+	// Create the sidebar box. Height is the content height inside the border,
+	// so the rendered box (border included) is exactly s.height rows tall.
 	boxStyle := t.Renderer.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(t.Secondary).
 		Padding(0, 1).
-		Width(s.width).
-		Height(s.height - 1).
-		MaxHeight(s.height - 1)
+		Width(s.width)
+	if s.height > 0 {
+		boxStyle = boxStyle.Height(max(s.height-2, 1)).MaxHeight(s.height)
+	}
 
 	return boxStyle.Render(content)
 }

@@ -19,7 +19,10 @@ func (m Model) renderSprintDashboard() string {
 	}
 	sprint := m.selectedSprint
 
-	innerWidth := m.width - 6
+	// Laid out in the main content width (not m.width) so the shortcuts
+	// sidebar, when open, fits beside it (GH #209).
+	bodyWidth := m.mainContentWidth()
+	innerWidth := bodyWidth - 6
 	if innerWidth < 40 {
 		innerWidth = 40
 	}
@@ -235,11 +238,11 @@ func (m Model) renderSprintDashboard() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(t.Primary).
 		Padding(1, 2).
-		Width(min(80, m.width-4)).
+		Width(min(80, bodyWidth-4)).
 		MaxHeight(m.height - 2)
 
 	return lipgloss.Place(
-		m.width,
+		bodyWidth,
 		m.height-1,
 		lipgloss.Center,
 		lipgloss.Top,

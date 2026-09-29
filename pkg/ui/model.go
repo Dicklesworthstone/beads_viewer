@@ -36,6 +36,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // View width thresholds for adaptive layout
@@ -2058,7 +2059,7 @@ func (m *Model) rebuildInsightsPanel() {
 	if panelHeight < 3 {
 		panelHeight = 3
 	}
-	panel.SetSize(m.width, panelHeight)
+	panel.SetSize(m.mainContentWidth(), panelHeight)
 	m.insightsPanel = panel
 }
 
@@ -2697,7 +2698,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if bodyHeight < 5 {
 			bodyHeight = 5
 		}
-		m.insightsPanel.SetSize(m.width, bodyHeight)
+		m.insightsPanel.SetSize(m.mainContentWidth(), bodyHeight)
 		if m.snapshot != nil {
 			m.graphView.SetSnapshot(m.snapshot)
 		} else {
@@ -2813,7 +2814,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.historyLoadFailed = false
 			m.historyView.SetReport(msg.Report)
 			m.historyReportDataGeneration = msg.DataGeneration
-			m.historyView.SetSize(m.width, m.height-1)
+			m.historyView.SetSize(m.mainContentWidth(), m.height-1)
 			// Refresh detail pane if visible
 			if m.isSplitView || m.showDetails {
 				m.updateViewportContent()
@@ -3036,7 +3037,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if bodyHeight < 5 {
 			bodyHeight = 5
 		}
-		m.insightsPanel.SetSize(m.width, bodyHeight)
+		m.insightsPanel.SetSize(m.mainContentWidth(), bodyHeight)
 
 		// Update list/board/graph views while preserving the current recipe/filter state.
 		var listRefilterCmd tea.Cmd
@@ -3215,7 +3216,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// user state (selection + persisted expand/collapse) (bv-6n4c).
 		if underlyingFocus == focusTree {
 			m.tree.BuildFromSnapshot(m.snapshot)
-			m.tree.SetSize(m.width, m.height-2)
+			m.tree.SetSize(m.mainContentWidth(), m.height-2)
 		}
 		if underlyingFocus == focusFlowMatrix {
 			m.refreshFlowMatrix()
@@ -3578,7 +3579,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if bodyHeight < 5 {
 				bodyHeight = 5
 			}
-			m.insightsPanel.SetSize(m.width, bodyHeight)
+			m.insightsPanel.SetSize(m.mainContentWidth(), bodyHeight)
 		}
 		if m.focused == focusAttention {
 			var attentionStart time.Time
@@ -4063,7 +4064,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// panes (#168). Without this the body stays sized to the full width
 			// and the appended sidebar pushes lines past the terminal edge.
 			m.applyContentSizing()
-			if m.showShortcutsSidebar {
+			if m.showShortcutsSidebar && !m.sidebarVisible() {
+				// Too narrow to show it beside the body (GH #209); it appears
+				// once the terminal is widened.
+				m.statusMsg = fmt.Sprintf("Shortcuts sidebar needs a terminal at least %d columns wide (; to turn off)",
+					m.shortcutsSidebar.Width()+shortcutsSidebarGap+minMainContentWidth)
+				m.statusIsError = false
+			} else if m.showShortcutsSidebar {
 				m.shortcutsSidebar.ResetScroll()
 				m.statusMsg = "Shortcuts sidebar: ; hide | ctrl+j/k scroll"
 				m.statusIsError = false
@@ -4781,7 +4788,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					analyzer.SetReadinessScope(m.analyzer.Readiness(), m.candidateIDs)
 					plan := analyzer.GetExecutionPlan()
 					m.actionableView = NewActionableModel(plan, m.theme)
-					m.actionableView.SetSize(m.width, m.height-2)
+					m.actionableView.SetSize(m.mainContentWidth(), m.height-2)
 					m.focused = focusActionable
 				} else {
 					m.focused = focusList
@@ -4803,7 +4810,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						m.tree.Build(m.issues)
 					}
-					m.tree.SetSize(m.width, m.height-2)
+					m.tree.SetSize(m.mainContentWidth(), m.height-2)
 					m.focused = focusTree
 				}
 				return m, nil
@@ -4868,7 +4875,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.labelHealthCached = true
 				}
 				m.labelDashboard.SetData(m.labelHealthCache.Labels)
-				m.labelDashboard.SetSize(m.width, m.height-1)
+				m.labelDashboard.SetSize(m.mainContentWidth(), m.height-1)
 				m.statusMsg = fmt.Sprintf("Labels: %d total • critical %d • warning %d", m.labelHealthCache.TotalLabels, m.labelHealthCache.CriticalCount, m.labelHealthCache.WarningCount)
 				m.statusIsError = false
 				return m, nil
@@ -4901,7 +4908,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if panelHeight < 3 {
 					panelHeight = 3
 				}
-				m.flowMatrix.SetSize(m.width, panelHeight)
+				m.flowMatrix.SetSize(m.mainContentWidth(), panelHeight)
 				return m, nil
 
 			case "!":
@@ -5074,13 +5081,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.isSplitView = msg.Width > SplitViewThreshold
 		m.ready = true
-		m.applyContentSizing()
+		m.applyContentSizing() // also refreshes the pre-rendered sprint dashboard
 		if m.showCassModal {
 			m.cassModal.SetSize(m.width, m.height)
-		}
-		if m.isSprintView && m.selectedSprint != nil {
-			// The dashboard is pre-rendered at its width; refresh on resize.
-			m.sprintViewText = m.renderSprintDashboard()
 		}
 	}
 
@@ -6289,7 +6292,63 @@ func (m *Model) View() string {
 		return "Initializing..."
 	}
 
-	var body string
+	body := m.renderBody()
+	footer := m.renderFooter()
+
+	// Ensure the final output fits exactly in the terminal height
+	// This prevents the header from being pushed off the top
+	finalStyle := lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height).
+		MaxHeight(m.height)
+
+	return finalStyle.Render(lipgloss.JoinVertical(lipgloss.Left, body, footer))
+}
+
+// renderBody renders everything above the footer: the active view or overlay,
+// plus the shortcuts sidebar when it is visible. With the sidebar, the result
+// is exactly m.width cells wide and m.height-1 rows tall (GH #209).
+func (m *Model) renderBody() string {
+	body, overlay := m.renderMainView()
+
+	// Add shortcuts sidebar if enabled and there is room for it (bv-3qi5).
+	if !overlay && m.sidebarVisible() {
+		bodyWidth := m.mainContentWidth()
+		bodyHeight := max(m.height-1, 1)
+		// Update sidebar focus for registry-based bindings (bv-xl6g)
+		m.shortcutsSidebar.SetFocus(m.focused)
+		// The sidebar spans the full body height (border included), leaving
+		// the last row for the footer.
+		m.shortcutsSidebar.SetSize(m.shortcutsSidebar.Width(), bodyHeight)
+		sidebar := m.shortcutsSidebar.View()
+		// Hard-clamp the body to its reserved box before joining. Views are
+		// laid out in bodyWidth, but some have minimum widths (e.g. fixed-width
+		// columns) they cannot shrink below on a narrow terminal. An over-wide
+		// or over-tall line must be clipped here rather than wrapped by the
+		// final clamp in View(), which would interleave sidebar rows with body
+		// rows and push the footer off-screen (GH #209). Padding to bodyWidth
+		// keeps the sidebar pinned to the right edge.
+		body = fitBlock(body, bodyWidth, bodyHeight)
+		body = lipgloss.JoinHorizontal(lipgloss.Top, body, sidebar)
+		body = fitBlock(body, m.width, bodyHeight)
+	}
+	return body
+}
+
+// renderMainView renders the active view, or the full-screen overlay covering
+// it, without the shortcuts sidebar. overlay reports whether an overlay
+// (modal, picker, prompt, help, tutorial, loading screen) was rendered: those
+// replace the whole body at the full terminal width, and the sidebar, which
+// lists shortcuts for the underlying view, is not appended to them.
+func (m *Model) renderMainView() (body string, overlay bool) {
+	// Width/height available to the main view. When the shortcuts sidebar is
+	// visible, mainContentWidth() reserves its column so every view is laid out
+	// into the remaining width rather than drawn full-width and then pushed past
+	// the terminal edge by the appended sidebar (#168, GH #209).
+	bodyWidth := m.mainContentWidth()
+	bodyHeight := m.height - 1
+
+	overlay = true
 
 	// Quit confirmation overlay takes highest priority
 	if m.showQuitConfirm {
@@ -6326,76 +6385,91 @@ func (m *Model) View() string {
 		body = m.tutorialModel.View()
 	} else if m.snapshotInitPending && m.snapshot == nil {
 		body = m.renderLoadingScreen()
-	} else if m.focused == focusAttention {
-		m.attentionView.SetSize(m.width, m.height-1)
-		body = m.attentionView.View()
-	} else if m.focused == focusInsights {
-		m.insightsPanel.SetSize(m.width, m.height-1)
-		body = m.insightsPanel.View()
-	} else if m.focused == focusFlowMatrix {
-		m.flowMatrix.SetSize(m.width, m.height-1)
-		if m.flowDetailID != "" {
-			body = m.viewport.View()
-		} else {
-			body = m.flowMatrix.View()
-		}
-	} else if m.focused == focusTree {
-		// Hierarchical tree view (bv-gllx)
-		m.tree.SetSize(m.width, m.height-1)
-		body = m.tree.View()
-	} else if m.isGraphView {
-		body = m.graphView.View(m.width, m.height-1)
-	} else if m.isBoardView {
-		body = m.board.View(m.width, m.height-1)
-	} else if m.isActionableView {
-		m.actionableView.SetSize(m.width, m.height-2)
-		body = m.actionableView.Render()
-	} else if m.isHistoryView {
-		if m.historyReportIsCurrent() {
-			m.historyView.SetSize(m.width, m.height-1)
-			body = m.historyView.View()
-		} else {
-			message := "Loading history…"
-			if m.historyLoadFailed {
-				message = "History unavailable; press h to retry"
-			}
-			body = lipgloss.Place(max(m.width, 1), max(m.height-1, 1), lipgloss.Center, lipgloss.Center, message)
-		}
-	} else if m.isSprintView {
-		body = m.sprintViewText
-	} else if m.isSplitView {
-		body = m.renderSplitView()
-	} else if m.focused == focusLabelDashboard {
-		m.labelDashboard.SetSize(m.width, m.height-1)
-		body = m.labelDashboard.View()
 	} else {
-		// Mobile view
-		if m.showDetails {
-			body = m.viewport.View()
-		} else {
-			body = m.renderListWithHeader()
+		overlay = false
+		switch {
+		case m.focused == focusAttention:
+			m.attentionView.SetSize(bodyWidth, bodyHeight)
+			body = m.attentionView.View()
+		case m.focused == focusInsights:
+			m.insightsPanel.SetSize(bodyWidth, bodyHeight)
+			body = m.insightsPanel.View()
+		case m.focused == focusFlowMatrix:
+			m.flowMatrix.SetSize(bodyWidth, bodyHeight)
+			if m.flowDetailID != "" {
+				body = m.viewport.View()
+			} else {
+				body = m.flowMatrix.View()
+			}
+		case m.focused == focusTree:
+			// Hierarchical tree view (bv-gllx)
+			m.tree.SetSize(bodyWidth, bodyHeight)
+			body = m.tree.View()
+		case m.isGraphView:
+			body = m.graphView.View(bodyWidth, bodyHeight)
+		case m.isBoardView:
+			body = m.board.View(bodyWidth, bodyHeight)
+		case m.isActionableView:
+			m.actionableView.SetSize(bodyWidth, m.height-2)
+			body = m.actionableView.Render()
+		case m.isHistoryView:
+			if m.historyReportIsCurrent() {
+				m.historyView.SetSize(bodyWidth, bodyHeight)
+				body = m.historyView.View()
+			} else {
+				message := "Loading history…"
+				if m.historyLoadFailed {
+					message = "History unavailable; press h to retry"
+				}
+				body = lipgloss.Place(max(bodyWidth, 1), max(bodyHeight, 1), lipgloss.Center, lipgloss.Center, message)
+			}
+		case m.isSprintView:
+			body = m.sprintViewText
+		case m.isSplitView:
+			body = m.renderSplitView()
+		case m.focused == focusLabelDashboard:
+			m.labelDashboard.SetSize(bodyWidth, bodyHeight)
+			body = m.labelDashboard.View()
+		default:
+			// Mobile view
+			if m.showDetails {
+				body = m.viewport.View()
+			} else {
+				body = m.renderListWithHeader()
+			}
 		}
 	}
+	return body, overlay
+}
 
-	// Add shortcuts sidebar if enabled (bv-3qi5)
-	if m.showShortcutsSidebar {
-		// Update sidebar focus for registry-based bindings (bv-xl6g)
-		m.shortcutsSidebar.SetFocus(m.focused)
-		m.shortcutsSidebar.SetSize(m.shortcutsSidebar.Width(), m.height-2)
-		sidebar := m.shortcutsSidebar.View()
-		body = lipgloss.JoinHorizontal(lipgloss.Top, body, sidebar)
+// fitBlock clips a rendered block to at most width display cells per line and
+// at most height lines, then pads it to exactly width x height cells. Clipping
+// is ANSI-aware (escape sequences never count toward the width and are never
+// split), so styled content keeps its colors.
+func fitBlock(s string, width, height int) string {
+	if width < 1 {
+		width = 1
 	}
-
-	footer := m.renderFooter()
-
-	// Ensure the final output fits exactly in the terminal height
-	// This prevents the header from being pushed off the top
-	finalStyle := lipgloss.NewStyle().
-		Width(m.width).
-		Height(m.height).
-		MaxHeight(m.height)
-
-	return finalStyle.Render(lipgloss.JoinVertical(lipgloss.Left, body, footer))
+	if height < 1 {
+		height = 1
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	for i, ln := range lines {
+		if ansi.StringWidth(ln) > width {
+			ln = ansi.Truncate(ln, width, "")
+		}
+		if pad := width - ansi.StringWidth(ln); pad > 0 {
+			ln += strings.Repeat(" ", pad)
+		}
+		lines[i] = ln
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) renderQuitConfirm() string {
@@ -8594,21 +8668,36 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 // sidebar still overflowed by its right border on a real TTY.)
 const shortcutsSidebarGap = 2
 
-// mainContentWidth returns the width available to the main body (list/detail
-// panes and full-screen views). When the shortcuts sidebar is open it reserves
-// the sidebar's column so the body is laid out into the remaining width instead
-// of being drawn full-width and then overflowing once the sidebar is appended.
+// minMainContentWidth is the narrowest main body the layout will produce. When
+// the terminal is too narrow to fit the shortcuts sidebar next to a body at
+// least this wide, the sidebar is not drawn (see sidebarVisible) instead of
+// overflowing the terminal.
+const minMainContentWidth = 20
+
+// sidebarVisible reports whether the shortcuts sidebar is both toggled on and
+// actually drawn: it is suppressed when the terminal is too narrow to leave
+// minMainContentWidth columns for the main body next to it (GH #209).
+func (m Model) sidebarVisible() bool {
+	return m.showShortcutsSidebar &&
+		m.width-(m.shortcutsSidebar.Width()+shortcutsSidebarGap) >= minMainContentWidth
+}
+
+// mainContentWidth returns the width available to the main body: list/detail
+// panes and every full-screen view (board, graph, insights, actionable,
+// history, tree, attention, flow matrix, label dashboard, sprint). When the
+// shortcuts sidebar is visible it reserves the sidebar's column so the body is
+// laid out into the remaining width instead of being drawn full-width and then
+// overflowing once the sidebar is appended (#168, GH #209).
 //
 // It never returns less than a small floor so downstream sizing math stays
-// positive on very narrow terminals (where the sidebar realistically can't be
-// shown anyway, but we must not produce negative widths).
+// positive on very narrow terminals.
 func (m Model) mainContentWidth() int {
 	w := m.width
-	if m.showShortcutsSidebar {
+	if m.sidebarVisible() {
 		w -= m.shortcutsSidebar.Width() + shortcutsSidebarGap
 	}
-	if w < 20 {
-		w = 20
+	if w < minMainContentWidth {
+		w = minMainContentWidth
 	}
 	return w
 }
@@ -8631,9 +8720,9 @@ func (m *Model) applyContentSizing() {
 	contentWidth := m.mainContentWidth()
 
 	if m.focused == focusFlowMatrix && m.flowDetailID != "" {
-		m.viewport = viewport.New(m.width, bodyHeight)
+		m.viewport = viewport.New(contentWidth, bodyHeight)
 		m.viewportContent = ""
-		m.renderer.SetWidthWithTheme(m.width, m.theme)
+		m.renderer.SetWidthWithTheme(contentWidth, m.theme)
 	} else if m.isSplitView {
 		// Calculate dimensions accounting for 2 panels with borders(2)+padding(2) = 4 overhead each
 		// Total overhead = 8
@@ -8672,11 +8761,23 @@ func (m *Model) applyContentSizing() {
 
 	m.updateListDelegate()
 
-	// Resize label dashboard table and modal overlay sizing. These full-screen
-	// panels are drawn at full m.width (the sidebar does not currently overlay
-	// them), so they keep using m.width rather than the reserved content width.
-	m.labelDashboard.SetSize(m.width, bodyHeight)
-	m.insightsPanel.SetSize(m.width, bodyHeight)
+	// Resize the full-screen views too. View() appends the shortcuts sidebar to
+	// them as well, so they must use the reserved content width, not m.width,
+	// or the joined line overflows the terminal (GH #209). View() re-applies
+	// these sizes on every render; doing it here keeps key handling that reads
+	// the panel dimensions between renders (paging, cursor visibility) in step
+	// with a resize or sidebar toggle.
+	m.labelDashboard.SetSize(contentWidth, bodyHeight)
+	m.insightsPanel.SetSize(contentWidth, bodyHeight)
+	m.attentionView.SetSize(contentWidth, bodyHeight)
+	m.flowMatrix.SetSize(contentWidth, bodyHeight)
+	m.tree.SetSize(contentWidth, bodyHeight)
+	m.actionableView.SetSize(contentWidth, m.height-2)
+	m.historyView.SetSize(contentWidth, bodyHeight)
+	if m.isSprintView && m.selectedSprint != nil {
+		// The sprint dashboard is pre-rendered at its width.
+		m.sprintViewText = m.renderSprintDashboard()
+	}
 	m.updateViewportContent()
 }
 
@@ -9220,7 +9321,7 @@ func (m *Model) enterHistoryView() tea.Cmd {
 	if bodyHeight < 5 {
 		bodyHeight = 5
 	}
-	m.historyView.SetSize(m.width, bodyHeight)
+	m.historyView.SetSize(m.mainContentWidth(), bodyHeight)
 	m.isHistoryView = true
 	m.focused = focusHistory
 
@@ -10331,7 +10432,7 @@ func (m *Model) refreshAttentionView() {
 	if height < 3 {
 		height = 3
 	}
-	m.attentionView.SetSize(m.width, height)
+	m.attentionView.SetSize(m.mainContentWidth(), height)
 }
 
 // handleAttentionKeys handles keys while the attention view has focus:
