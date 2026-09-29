@@ -2,11 +2,11 @@
 
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
-Scope window: this update verifies `v0.24.0..v0.24.1` and the post-release
-commits through [`04a0107b`](https://github.com/Dicklesworthstone/beads_viewer/commit/04a0107b), including the September 10 canonical-source and Cass
-repairs, September 11 performance work, September 12 dependency campaign,
-and September 14–16 duplicate-detection, theme, graph, timeline, and history-cache changes.
-v0.25.0 was published after its complete clean-source release gate passed.
+Scope window: this update verifies `v0.25.0..v0.25.1`, including the
+September 14–16 graph, timeline, duplicate-detection and history-cache work and
+the September 17–29 source-selection, correlation, search, agent-file and
+layout fixes. v0.25.1 was published after its complete clean-source release
+gate passed.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
 and release receipts; [research notes](CHANGELOG_RESEARCH.md) record coverage.
@@ -17,6 +17,7 @@ the latest tag, including installer changes usable with already released binarie
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
+| [`v0.25.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.1) | 2026-09-29 | GitHub Release | Views laid out beside the shortcuts sidebar, restored time-travel export, tracker-source selection and correlation fixes, and the September graph/timeline work. |
 | [`v0.25.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.0) | 2026-09-12 | GitHub Release | Workflow readiness, source integrity and live dashboards, responsive Cass search, priority performance, and Go 1.26 dependency refresh. |
 | [`v0.24.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.1) | 2026-09-08 | GitHub Release | Reuse loaded source hashes and avoid waiting for a busy analysis-cache writer. |
 | [`v0.24.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.0) | 2026-09-07 | GitHub Release | Latency campaign across analysis, loader and TUI, graph-navigation and causality repairs, release-gate isolation, and the x/text GO-2026-5970 dependency fix. |
@@ -28,7 +29,58 @@ the latest tag, including installer changes usable with already released binarie
 
 ---
 
-## Unreleased
+## v0.25.1 — 2026-09-29
+
+### Fixes since the September 16 entries
+
+- **Shortcuts sidebar no longer breaks other views (GH #209).** With the
+  sidebar open (`;`), only the list view made room for it. Board, graph,
+  insights, actionable, history, tree, label dashboard, attention, flow matrix
+  and the sprint dashboard were drawn at full width with the sidebar added on,
+  so rows wrapped into each other and the footer was pushed off screen. Every
+  view is now laid out in the space left beside the sidebar, overlays such as
+  help and the pickers no longer get the sidebar next to them, and on a
+  terminal too narrow for it the sidebar is hidden and the status line says why
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/d404af74),
+  [row tests](https://github.com/Dicklesworthstone/beads_viewer/commit/1dd7282f)).
+- **Dashboard time travel works again after merges.** `--export-pages` could
+  skip `history.json` with the warning "timeline commit … missing from source
+  history" once a branch that edited the tracker had been merged, so the
+  exported dashboard had no time travel. The timeline now orders every commit
+  it reads ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/bbe40d02)).
+- **The right tracker is loaded.** When `BEADS_DB`, `BEADS_DIR` or `--db` names
+  a tracker directory, a newer export in an unrelated Git worktree can no
+  longer win. A SQLite tracker whose recent writes are still in its WAL file is
+  treated as fresh instead of losing to an older JSONL export, and when two
+  files are equally fresh `issues.jsonl` is preferred over legacy names. The
+  cached validation result is dropped whenever the source actually changes
+  ([worktrees](https://github.com/Dicklesworthstone/beads_viewer/commit/9d829c05),
+  [WAL freshness](https://github.com/Dicklesworthstone/beads_viewer/commit/b2ca798a),
+  [name ties](https://github.com/Dicklesworthstone/beads_viewer/commit/c4d5afb6),
+  [cache identity](https://github.com/Dicklesworthstone/beads_viewer/commit/76a55e12)).
+- **Stable history and correlation output.** Several beads changed in one
+  commit are reported in the same order on every run, commit references keep
+  the full SHA, a commit seen through several bead histories is counted once,
+  and a deleted bead's history now ends with its deletion
+  ([ordering](https://github.com/Dicklesworthstone/beads_viewer/commit/61bbc9a4),
+  [commit identity](https://github.com/Dicklesworthstone/beads_viewer/commit/04ea45c6),
+  [deletion](https://github.com/Dicklesworthstone/beads_viewer/commit/d49d0e0f)).
+- **Searching for an issue ID finds it.** Typing an exact issue ID now always
+  shows that issue, even with hybrid ranking and more than 75 matches
+  ([search](https://github.com/Dicklesworthstone/beads_viewer/commit/00225577)).
+- **Agent-file reads are bounded.** Inspecting or updating `AGENTS.md` refuses
+  files over 16 MiB, rejects a file that changes size while being read, and no
+  longer follows a symlink to an unrelated file
+  ([agent files](https://github.com/Dicklesworthstone/beads_viewer/commit/6faa297c)).
+- **Source installs report the real compiler.** `install.sh` and `install.ps1`
+  now print the Go version the build actually used (the module's pinned
+  toolchain), not the version of the `go` command that launched it
+  ([installer](https://github.com/Dicklesworthstone/beads_viewer/commit/be0e8beb)).
+- Vendored dashboard libraries, the graph WASM glue and frozen test fixtures
+  are byte-identical to their recorded hashes again; a formatting pass had
+  rewritten them
+  ([assets](https://github.com/Dicklesworthstone/beads_viewer/commit/d4e51d83),
+  [fixtures](https://github.com/Dicklesworthstone/beads_viewer/commit/f9f0283f)).
 
 ### Dashboard graph and timeline
 
