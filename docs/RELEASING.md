@@ -161,6 +161,35 @@ or when that release is superseded; retention/deletion follows maintainer policy
 
 ## Native installation and package stores
 
+### v0.25.1 verification (2026-09-29)
+
+Published at 17:22 UTC from `4db2f8dc` after all ten gate stages passed
+without skips on vmi1152480 (Go 1.26.8, GoReleaser 2.18.1, PowerShell 7.6.5,
+br 0.6.0, the pinned wasm-bindgen 0.2.128 and Binaryen 132). Packaging sealed
+and verified all five archives. DSR uploaded the archives, `checksums.txt`,
+the sealed receipt and an SPDX SBOM of the packaged Linux amd64 binary as a
+draft without dispatch; `SHA256SUMS` and the per-archive `.sha256` files were
+added from the sealed `checksums.txt`, giving the same 14-asset set as
+v0.25.0. Every draft asset was downloaded and byte-compared before publication.
+Homebrew `cbca153` and Scoop `c96fc70` publish the same archive hashes.
+
+Checked after publication: `install.sh` into a fresh directory on Linux amd64
+and arm64 (Debian containers) installs v0.25.1 and a tiny project gets the
+expected pick; the v0.25.0 binary's `--update --yes` moves to v0.25.1 and a
+second run reports it is up to date; the macOS arm64 archive runs and reports
+v0.25.1. Native Windows execution, native macOS amd64 and Linux arm64 hardware,
+and Nix were not run for this release.
+
+Gate-host notes from this release: the default `br` 0.7.1 fails
+`TestRobotActionRoutesLiveTrackers/db` (a read-only `br --db … show` on a fresh
+tracker exits 2 with "database is busy (recovery in progress)"), so the gate
+used br 0.6.0 from a per-run tools directory. On trj the graph-WASM rebuild
+produced a `bv_graph_bg.wasm` 8 bytes shorter than the manifest with the same
+pinned tools; vmi1152480 and hz4 reproduce it exactly. On heavily loaded hosts
+the timing-bound watch/correlation e2e tests and the benchmark stage can fail
+from contention alone. `install.sh` needs `python3` for binary installs; with
+only `jq` it falls back to a source build.
+
 ### v0.25.0 verification (2026-09-12)
 
 Published at 19:39:38 UTC from `87cee258` after all ten clean-source gate
