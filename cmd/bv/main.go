@@ -7039,6 +7039,10 @@ type TimeTravelCommit struct {
 	BeadsRemoved []string `json:"beads_removed,omitempty"`
 }
 
+// timeTravelCommitLimit bounds how many tracker commits the time-travel
+// history reads. It is a variable only so tests can use a small window.
+var timeTravelCommitLimit = 500
+
 // generateHistoryForExport creates time-travel history data from git history
 func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) {
 	cwd, err := os.Getwd()
@@ -7090,7 +7094,7 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 	}
 	correlator := correlation.NewCorrelator(cwd, beadsPath).WithFeedbackStore(feedbackStore)
 	report, err := correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{
-		Limit: 500, // Reasonable limit for time-travel
+		Limit: timeTravelCommitLimit,
 	})
 	if err != nil {
 		return nil, err
@@ -7141,9 +7145,13 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 
 	// Keep Git ancestry order, including equal or backdated author timestamps.
 	// Sorting timestamps or hashes can replay a close before its creation.
-	// Match the extractor's bounded rename-following walk. Reverse by rank
+	// Rank the whole rename-following history, not just its first
+	// timeTravelCommitLimit entries: the extractor takes its bounded window in
+	// date order, and once a side branch that touched the tracker is merged,
+	// the first N commits in topological order are a different set, so a
+	// retained commit could be missing from the ranking. Reverse by rank
 	// afterward: --reverse can interfere with following the source's old name.
-	orderCmd := exec.Command("git", "log", "--format=%H", "--topo-order", "--follow", "-n", "500", "HEAD", "--", beadsPath)
+	orderCmd := exec.Command("git", "log", "--format=%H", "--topo-order", "--follow", "HEAD", "--", beadsPath)
 	orderCmd.Dir = cwd
 	orderOutput, err := orderCmd.Output()
 	if err != nil {

@@ -45,6 +45,98 @@ func runCommandWithTimeout(t *testing.T, dir, exe string, args ...string) (strin
 	return stdout.String(), stderr.String(), err
 }
 
+// A merged side branch that touched the tracker makes the first N commits in
+// topological order a different set from the first N in date order, which is
+// the window the extractor reads. Every retained commit must still be ranked;
+// before the fix the export failed with "timeline commit ... missing from
+// source history" and shipped no history.json.
+func TestHistoryExportRanksRetainedCommitsAfterMergedSideBranch(t *testing.T) {
+	repo := t.TempDir()
+	t.Chdir(repo)
+	t.Setenv("BV_NO_CACHE", "1")
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	previousLimit := timeTravelCommitLimit
+	timeTravelCommitLimit = 3
+	t.Cleanup(func() { timeTravelCommitLimit = previousLimit })
+
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	git := func(hour int, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid", "GIT_AUTHOR_DATE="+at, "GIT_COMMITTER_DATE="+at)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	line := func(id string) string {
+		return fmt.Sprintf("{\"id\":%q,\"title\":\"Issue %s\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", id, id, start.Format(time.RFC3339), start.Format(time.RFC3339))
+	}
+	record := func(hour int, message string, ids ...string) string {
+		t.Helper()
+		var data strings.Builder
+		for _, id := range ids {
+			data.WriteString(line(id))
+		}
+		if err := os.WriteFile(".beads/issues.jsonl", []byte(data.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git(hour, "add", ".beads/issues.jsonl")
+		git(hour, "commit", "-m", message)
+		return git(hour, "rev-parse", "HEAD")
+	}
+
+	git(0, "init", "-b", "main")
+	if err := os.Mkdir(".beads", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record(0, "base", "bv-base")
+	// The side branch is older than the main-line work, so date order puts it
+	// after main, while topological order lists it first.
+	git(0, "checkout", "-b", "side")
+	record(1, "side 1", "bv-base", "bv-s1")
+	record(2, "side 2", "bv-base", "bv-s1", "bv-s2")
+	record(3, "side 3", "bv-base", "bv-s1", "bv-s2", "bv-s3")
+	git(3, "checkout", "main")
+	m1 := record(10, "main 1", "bv-base", "bv-m1")
+	m2 := record(11, "main 2", "bv-base", "bv-m1", "bv-m2")
+	git(20, "merge", "--no-ff", "--no-commit", "-X", "ours", "side")
+	record(20, "merge side", "bv-base", "bv-m1", "bv-m2", "bv-s1", "bv-s2", "bv-s3")
+
+	// Precondition: a bounded topological walk really does omit main-line
+	// commits that the date-ordered window keeps.
+	bounded := git(20, "log", "--format=%H", "--topo-order", "--follow", "-n", strconv.Itoa(timeTravelCommitLimit), "HEAD", "--", ".beads/issues.jsonl")
+	if strings.Contains(bounded, m1) || strings.Contains(bounded, m2) {
+		t.Fatalf("fixture no longer separates the two walks; bounded topological walk:\n%s", bounded)
+	}
+
+	issues := []model.Issue{{ID: "bv-base"}, {ID: "bv-m1"}, {ID: "bv-m2"}, {ID: "bv-s1"}, {ID: "bv-s2"}, {ID: "bv-s3"}}
+	history, err := generateHistoryForExport(issues)
+	if err != nil {
+		t.Fatalf("history export failed after merging a side branch: %v", err)
+	}
+	position := map[string]int{}
+	for i, commit := range history.Commits {
+		position[commit.SHA] = i
+	}
+	for sha, id := range map[string]string{m1: "bv-m1", m2: "bv-m2"} {
+		i, ok := position[sha]
+		if !ok {
+			t.Fatalf("retained commit %s (%s) missing from timeline: %#v", sha, id, history.Commits)
+		}
+		if got := history.Commits[i].BeadsAdded; !reflect.DeepEqual(got, []string{id}) {
+			t.Fatalf("commit %s added %v, want [%s]", sha, got, id)
+		}
+	}
+	if position[m1] >= position[m2] {
+		t.Fatalf("timeline replays main 2 before its parent main 1: %#v", history.Commits)
+	}
+}
+
 func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 	repo := t.TempDir()
 	t.Chdir(repo)
