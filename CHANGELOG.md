@@ -42,12 +42,17 @@ the latest tag, including installer changes usable with already released binarie
   help and the pickers no longer get the sidebar next to them, and on a
   terminal too narrow for it the sidebar is hidden and the status line says why
   ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/d404af74),
-  [row tests](https://github.com/Dicklesworthstone/beads_viewer/commit/1dd7282f)).
+  [row tests](https://github.com/Dicklesworthstone/beads_viewer/commit/1dd7282f),
+  [live-reload speed](https://github.com/Dicklesworthstone/beads_viewer/commit/3924cdda)).
 - **Dashboard time travel works again after merges.** `--export-pages` could
   skip `history.json` with the warning "timeline commit … missing from source
   history" once a branch that edited the tracker had been merged, so the
-  exported dashboard had no time travel. The timeline now orders every commit
-  it reads ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/bbe40d02)).
+  exported dashboard had no time travel. The same happened when the tracker
+  had been renamed (for example `beads.jsonl` to `issues.jsonl`) and an older
+  branch that edited the old name was merged later. The timeline now orders
+  its commits by their full Git ancestry
+  ([merged branches](https://github.com/Dicklesworthstone/beads_viewer/commit/bbe40d02),
+  [renamed tracker](https://github.com/Dicklesworthstone/beads_viewer/commit/d81990f4)).
 - **The right tracker is loaded.** When `BEADS_DB`, `BEADS_DIR` or `--db` names
   a tracker directory, a newer export in an unrelated Git worktree can no
   longer win. A SQLite tracker whose recent writes are still in its WAL file is
@@ -81,6 +86,11 @@ the latest tag, including installer changes usable with already released binarie
   rewritten them
   ([assets](https://github.com/Dicklesworthstone/beads_viewer/commit/d4e51d83),
   [fixtures](https://github.com/Dicklesworthstone/beads_viewer/commit/f9f0283f)).
+- The exported dashboard of this repository now ships its database twice (as
+  one file and as 1 MiB chunks) because the tracker passed the 5 MiB chunking
+  threshold, so the recorded bundle size in `tests/artifacts/perf/pages_load.json`
+  was re-measured (9.8 MB to 17.5 MB). The export code is unchanged; v0.25.0
+  produces the same bundle for the same tracker.
 
 ### Dashboard graph and timeline
 

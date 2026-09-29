@@ -1,16 +1,17 @@
 {
   "bytes": {
-    "beads_sqlite3": 3369984,
-    "bundle_total": 9806430,
-    "graph_layout_json": 116153,
-    "history_json": 88396,
-    "index_html": 302929,
-    "triage_json": 21331,
-    "vendor_total": 5577759
+    "beads_sqlite3": 5500928,
+    "bundle_total": 17529729,
+    "graph_layout_json": 157507,
+    "history_json": 122304,
+    "index_html": 303477,
+    "triage_json": 19422,
+    "vendor_total": 5574598
   },
-  "edges": 746,
+  "edges": 816,
   "first_render_ms": null,
-  "generated_at": "2026-09-02T21:18:06Z",
-  "issues": 611,
+  "generated_at": "2026-09-29T15:43:32Z",
+  "history_status": "available",
+  "issues": 676,
   "note": "first_render_ms is measured only when BV_HEADLESS_BROWSER names a browser; absent here"
 }
