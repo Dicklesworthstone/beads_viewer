@@ -259,6 +259,26 @@ func assertSidebarLayoutFits(t *testing.T, m *Model) {
 	if first := ansi.Strip(bodyLines[0]); !strings.HasSuffix(first, sidebarTop) {
 		t.Errorf("sidebar not pinned to the right edge; first row: %q", first)
 	}
+	// Every row above the footer must end in the sidebar's right border, and
+	// the last one in its bottom corner: an over-wide body row would push the
+	// sidebar right (and get it clipped), and an over-tall sidebar box would
+	// lose its bottom border to the height clamp.
+	if len(bodyLines) != m.height-1 {
+		t.Errorf("body+sidebar has %d rows, want exactly %d", len(bodyLines), m.height-1)
+	}
+	for i, ln := range bodyLines {
+		want := "│"
+		switch i {
+		case 0:
+			want = "╮"
+		case len(bodyLines) - 1:
+			want = "╯"
+		}
+		if got := strings.TrimRight(ansi.Strip(ln), " "); !strings.HasSuffix(got, want) {
+			t.Errorf("body row %d does not end in the sidebar border %q: %q", i, want, got)
+			break
+		}
+	}
 	if !strings.Contains(ansi.Strip(body), "Shortcuts") {
 		t.Errorf("sidebar title missing from body")
 	}
