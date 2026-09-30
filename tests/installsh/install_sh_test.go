@@ -173,28 +173,31 @@ func TestVersionGE(t *testing.T) {
 	}
 }
 
-func TestFetchLatestGoPkgJQ(t *testing.T) {
-	if _, err := exec.LookPath("jq"); err != nil {
-		t.Skip("jq not available")
-	}
+// go.dev's ?mode=json has no URL field (files are served from
+// https://go.dev/dl/<filename>); the fixture has the real shape. Both backends
+// must build the URL from the filename and pass the SHA-256 through.
+func TestFetchLatestGoPkgBackendsAgree(t *testing.T) {
 	goJSON := `[{"version":"go1.99rc1","stable":false,"files":[]},` +
 		`{"version":"go1.98.2","stable":true,"files":[` +
-		`{"filename":"go1.98.2.darwin-arm64.tar.gz","os":"darwin","arch":"arm64","url":"https://example.test/tgz"},` +
-		`{"filename":"go1.98.2.darwin-arm64.pkg","os":"darwin","arch":"arm64","url":"https://example.test/arm64.pkg"},` +
-		`{"filename":"go1.98.2.darwin-amd64.pkg","os":"darwin","arch":"amd64","url":"https://example.test/amd64.pkg"}]}]`
-	setup := `JSON_TOOL=jq
+		`{"filename":"go1.98.2.darwin-arm64.tar.gz","os":"darwin","arch":"arm64","sha256":"aaaa","kind":"archive"},` +
+		`{"filename":"go1.98.2.darwin-arm64.pkg","os":"darwin","arch":"arm64","sha256":"bbbb","kind":"installer"},` +
+		`{"filename":"go1.98.2.darwin-amd64.pkg","os":"darwin","arch":"amd64","sha256":"cccc","kind":"installer"}]}]`
+	for name, backend := range backends(t) {
+		setup := backend + `
 uname() { echo arm64; }
 curl() { printf '%s' "$GO_JSON"; }`
-	out, stderr, code := runInstallFunc(t, []string{"GO_JSON=" + goJSON, "PATH=" + os.Getenv("PATH")}, setup, `fetch_latest_go_pkg`, "")
-	if code != 0 || out != "go1.98.2\nhttps://example.test/arm64.pkg\n" {
-		t.Fatalf("got (%q, exit %d); stderr=%s", out, code, stderr)
+		out, stderr, code := runInstallFunc(t, []string{"GO_JSON=" + goJSON, "PATH=" + os.Getenv("PATH")}, setup, `fetch_latest_go_pkg`, "")
+		want := "go1.98.2\nhttps://go.dev/dl/go1.98.2.darwin-arm64.pkg\nbbbb\n"
+		if code != 0 || out != want {
+			t.Errorf("%s: got (%q, exit %d), want %q; stderr=%s", name, out, code, want, stderr)
+		}
 	}
 }
 
-// install_go_from_pkg must read both lines fetch_latest_go_pkg prints; it used
+// install_go_from_pkg must read every line fetch_latest_go_pkg prints; it used
 // to read only the first and always gave up before downloading.
 func TestInstallGoFromPkgReadsVersionAndURL(t *testing.T) {
-	setup := `fetch_latest_go_pkg() { printf 'go1.98.2\nhttps://example.test/arm64.pkg\n'; }
+	setup := `fetch_latest_go_pkg() { printf 'go1.98.2\nhttps://example.test/arm64.pkg\nbbbb\n'; }
 curl() { echo "curl $*" >&2; return 22; }`
 	_, stderr, code := runInstallFunc(t, nil, setup, `install_go_from_pkg`, "")
 	if code == 0 {
@@ -202,5 +205,23 @@ curl() { echo "curl $*" >&2; return 22; }`
 	}
 	if !strings.Contains(stderr, "curl -fsSL https://example.test/arm64.pkg") {
 		t.Errorf("install_go_from_pkg did not try to download the pkg URL; stderr=%s", stderr)
+	}
+}
+
+// The .pkg runs under sudo, so a download that does not match go.dev's SHA-256
+// must never reach the installer.
+func TestInstallGoFromPkgRefusesChecksumMismatch(t *testing.T) {
+	setup := `fetch_latest_go_pkg() { printf 'go1.98.2\nhttps://example.test/arm64.pkg\n%064d\n' 0; }
+curl() { local out=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done; printf 'tampered' > "$out"; }
+sudo() { echo "SUDO $*" >&2; return 0; }`
+	stdout, stderr, code := runInstallFunc(t, nil, setup, `install_go_from_pkg`, "")
+	if code == 0 {
+		t.Fatalf("install_go_from_pkg accepted a pkg with the wrong checksum; stdout=%s stderr=%s", stdout, stderr)
+	}
+	if strings.Contains(stderr, "SUDO") {
+		t.Errorf("sudo installer ran on a pkg with the wrong checksum; stderr=%s", stderr)
+	}
+	if !strings.Contains(stdout+stderr, "checksum mismatch") {
+		t.Errorf("expected a checksum mismatch error; stdout=%s stderr=%s", stdout, stderr)
 	}
 }

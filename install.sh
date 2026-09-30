@@ -180,8 +180,9 @@ ensure_json_tool() {
     return 1
 }
 
-# fetch_latest_go_pkg prints the latest stable Go version on line 1 and the
-# macOS .pkg URL for this machine's architecture on line 2.
+# fetch_latest_go_pkg prints three lines for the latest stable Go release's
+# macOS .pkg for this machine's architecture: version, download URL, SHA-256.
+# go.dev's JSON has no URL field; files are served from https://go.dev/dl/<filename>.
 fetch_latest_go_pkg() {
     ensure_json_tool || return 1
 
@@ -193,35 +194,36 @@ fetch_latest_go_pkg() {
         *) print_error "Unsupported macOS architecture for Go install: $arch" >&2; return 1 ;;
     esac
 
+    local releases
+    releases=$(curl -fsSL "https://go.dev/dl/?mode=json") || {
+        print_error "Failed to fetch Go releases from go.dev" >&2
+        return 1
+    }
+
     if [ "$JSON_TOOL" = "jq" ]; then
-        local releases
-        releases=$(curl -fsSL "https://go.dev/dl/?mode=json") || {
-            print_error "Failed to fetch Go releases from go.dev" >&2
-            return 1
-        }
         printf '%s' "$releases" | jq -re --arg arch "$arch" '
             (map(select(.stable == true)) | .[0]) as $rel
             | if $rel == null then empty else
                 ([($rel.files // [])[]
                   | select(.os == "darwin" and .arch == $arch and ((.filename // "") | endswith(".pkg")))][0]) as $pkg
-                | if $pkg == null then empty else ($rel.version // ""), ($pkg.url // "") end
+                | if $pkg == null or ($pkg.sha256 // "") == "" then empty
+                  else ($rel.version // ""), ("https://go.dev/dl/" + $pkg.filename), $pkg.sha256 end
               end'
         return
     fi
 
-    "$PYTHON_CMD" - "$arch" <<'PY'
+    GO_RELEASES_JSON="$releases" "$PYTHON_CMD" - "$arch" <<'PY'
 import json
+import os
 import sys
-import urllib.request
 
 
 def main() -> int:
     arch = sys.argv[1]
     try:
-        with urllib.request.urlopen("https://go.dev/dl/?mode=json") as resp:
-            data = json.load(resp)
+        data = json.loads(os.environ.get("GO_RELEASES_JSON", ""))
     except Exception as exc:
-        sys.stderr.write(f"Failed to fetch Go releases: {exc}\n")
+        sys.stderr.write(f"Failed to parse Go releases: {exc}\n")
         return 1
 
     release = next((r for r in data if r.get("stable")), None)
@@ -231,16 +233,16 @@ def main() -> int:
     version = release.get("version") or ""
     files = release.get("files") or []
     pkg = next(
-        (f for f in files if f.get("os") == "darwin" and f.get("arch") == arch and f.get("filename", "").endswith(".pkg")),
+        (f for f in files if f.get("os") == "darwin" and f.get("arch") == arch and (f.get("filename") or "").endswith(".pkg")),
         None,
     )
 
-    if not pkg:
+    if not pkg or not pkg.get("sha256"):
         return 1
 
-    url = pkg.get("url") or ""
     print(version)
-    print(url)
+    print("https://go.dev/dl/" + pkg["filename"])
+    print(pkg["sha256"])
     return 0
 
 
@@ -250,12 +252,12 @@ PY
 }
 
 install_go_from_pkg() {
-    local version="" url="" tmpdir pkg_path
+    local version="" url="" expected_sha="" actual_sha="" tmpdir pkg_path
 
-    # fetch_latest_go_pkg prints version and URL on separate lines.
-    { read -r version; read -r url; } < <(fetch_latest_go_pkg) || true
+    # fetch_latest_go_pkg prints version, URL and SHA-256 on separate lines.
+    { read -r version; read -r url; read -r expected_sha; } < <(fetch_latest_go_pkg) || true
 
-    if [ -z "$version" ] || [ -z "$url" ]; then
+    if [ -z "$version" ] || [ -z "$url" ] || [ -z "$expected_sha" ]; then
         return 1
     fi
 
@@ -265,6 +267,18 @@ install_go_from_pkg() {
 
     if ! curl -fsSL "$url" -o "$pkg_path"; then
         print_error "Failed to download Go installer from $url"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # The .pkg is installed with sudo: refuse it unless it matches go.dev's checksum.
+    if command -v shasum >/dev/null 2>&1; then
+        actual_sha=$(shasum -a 256 "$pkg_path" | awk '{print $1}')
+    elif command -v sha256sum >/dev/null 2>&1; then
+        actual_sha=$(sha256sum "$pkg_path" | awk '{print $1}')
+    fi
+    if [ -z "$actual_sha" ] || [ "$actual_sha" != "$expected_sha" ]; then
+        print_error "Go installer checksum mismatch (expected $expected_sha, got ${actual_sha:-none}); not installing"
         rm -rf "$tmpdir"
         return 1
     fi
