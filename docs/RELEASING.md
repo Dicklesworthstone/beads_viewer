@@ -188,7 +188,8 @@ produced a `bv_graph_bg.wasm` 8 bytes shorter than the manifest with the same
 pinned tools; vmi1152480 and hz4 reproduce it exactly. On heavily loaded hosts
 the timing-bound watch/correlation e2e tests and the benchmark stage can fail
 from contention alone. `install.sh` needs `python3` for binary installs; with
-only `jq` it falls back to a source build.
+only `jq` it falls back to a source build. (Fixed after v0.25.1: the installer
+now parses release metadata with `jq` when `python3` is missing.)
 
 ### v0.25.0 verification (2026-09-12)
 
