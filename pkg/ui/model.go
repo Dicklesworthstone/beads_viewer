@@ -6306,8 +6306,8 @@ func (m *Model) View() string {
 }
 
 // renderBody renders everything above the footer: the active view or overlay,
-// plus the shortcuts sidebar when it is visible. With the sidebar, the result
-// is exactly m.width cells wide and m.height-1 rows tall (GH #209).
+// plus the shortcuts sidebar when it is visible. The result is always exactly
+// m.width cells wide and m.height-1 rows tall (GH #209).
 func (m *Model) renderBody() string {
 	body, overlay := m.renderMainView()
 
@@ -6330,9 +6330,12 @@ func (m *Model) renderBody() string {
 		// keeps the sidebar pinned to the right edge.
 		body = fitBlock(body, bodyWidth, bodyHeight)
 		body = lipgloss.JoinHorizontal(lipgloss.Top, body, sidebar)
-		body = fitBlock(body, m.width, bodyHeight)
 	}
-	return body
+	// Clip every body, with or without the sidebar, to the rows above the
+	// footer. Views size themselves to fit, but one that draws a line too
+	// many (or too wide) must be cut here: the final clamp in View() would
+	// wrap wide lines and cut from the bottom, dropping the footer.
+	return fitBlock(body, m.width, max(m.height-1, 1))
 }
 
 // renderMainView renders the active view, or the full-screen overlay covering
@@ -6402,8 +6405,10 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 				body = m.flowMatrix.View()
 			}
 		case m.focused == focusTree:
-			// Hierarchical tree view (bv-gllx)
-			m.tree.SetSize(bodyWidth, bodyHeight)
+			// Hierarchical tree view (bv-gllx). The tree's height counts
+			// node rows; its scroll-position line is drawn below them, so
+			// reserve that row (as the other SetSize calls do).
+			m.tree.SetSize(bodyWidth, max(bodyHeight-1, 1))
 			body = m.tree.View()
 		case m.isGraphView:
 			body = m.graphView.View(bodyWidth, bodyHeight)
@@ -7412,7 +7417,7 @@ func (m *Model) renderFooter() string {
 			remaining = 0
 		}
 		filler := lipgloss.NewStyle().Width(remaining).Render("")
-		return lipgloss.JoinHorizontal(lipgloss.Bottom, msgSection, filler)
+		return ansi.Truncate(lipgloss.JoinHorizontal(lipgloss.Bottom, msgSection, filler), max(m.width, 1), "…")
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
@@ -7494,10 +7499,13 @@ func (m *Model) renderFooter() string {
 			Render(fmt.Sprintf("↕ %s", m.sortMode.String()))
 	}
 
-	labelHint := lipgloss.NewStyle().
+	// labelHints are joined with " • " into labelHint. genericLabelHint marks
+	// the default pair, the first thing dropped when the footer is too wide.
+	labelHintStyle := lipgloss.NewStyle().
 		Foreground(ColorFooterHint).
-		Padding(0, 1).
-		Render("L:labels • h:detail")
+		Padding(0, 1)
+	labelHints := []string{"L:labels", "h:detail"}
+	genericLabelHint := true
 
 	// Board-specific hints (bv-yg39, bv-naov)
 	if m.isBoardView {
@@ -7507,10 +7515,8 @@ func (m *Model) renderFooter() string {
 			if m.board.SearchMatchCount() > 0 {
 				matchInfo = fmt.Sprintf(" [%d/%d]", m.board.SearchCursorPos(), m.board.SearchMatchCount())
 			}
-			labelHint = lipgloss.NewStyle().
-				Foreground(ColorFooterHint).
-				Padding(0, 1).
-				Render(fmt.Sprintf("/%s%s • n/N:match • enter:done • esc:cancel", m.board.SearchQuery(), matchInfo))
+			labelHints = []string{fmt.Sprintf("/%s%s", m.board.SearchQuery(), matchInfo), "n/N:match", "enter:done", "esc:cancel"}
+			genericLabelHint = false
 		} else {
 			// Normal board mode - show navigation hints with filter indicator (bv-naov)
 			filterInfo := ""
@@ -7519,17 +7525,14 @@ func (m *Model) renderFooter() string {
 				total := len(m.issues)
 				filterInfo = fmt.Sprintf("[%s:%d/%d] ", m.currentFilter, shown, total)
 			}
-			labelHint = lipgloss.NewStyle().
-				Foreground(ColorFooterHint).
-				Padding(0, 1).
-				Render(fmt.Sprintf("%s1-4:col • o/c/r:filter • L:labels • /:search • ?:help", filterInfo))
+			labelHints = []string{filterInfo + "1-4:col", "o/c/r:filter", "L:labels", "/:search", "?:help"}
+			genericLabelHint = false
 		}
 	} else if m.focused == focusAttention {
-		labelHint = lipgloss.NewStyle().
-			Foreground(ColorFooterHint).
-			Padding(0, 1).
-			Render("j/k:move • enter:drilldown • 1-9:filter • ]/esc:close")
+		labelHints = []string{"j/k:move", "enter:drilldown", "1-9:filter", "]/esc:close"}
+		genericLabelHint = false
 	}
+	labelHint := labelHintStyle.Render(strings.Join(labelHints, " • "))
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// STATS SECTION - Issue counts with visual indicators
@@ -7926,10 +7929,10 @@ func (m *Model) renderFooter() string {
 		}
 	}
 
-	keysSection := lipgloss.NewStyle().
+	keysStyle := lipgloss.NewStyle().
 		Foreground(ColorFooterHint).
-		Padding(0, 1).
-		Render(strings.Join(keyHints, sep))
+		Padding(0, 1)
+	keysSection := keysStyle.Render(strings.Join(keyHints, sep))
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// COUNT BADGE - Total issues displayed
@@ -7942,7 +7945,7 @@ func (m *Model) renderFooter() string {
 	// ─────────────────────────────────────────────────────────────────────────
 	// ASSEMBLE FOOTER with proper spacing
 	// ─────────────────────────────────────────────────────────────────────────
-	leftWidth := lipgloss.Width(filterBadge) + lipgloss.Width(labelHint) + lipgloss.Width(statsSection)
+	leftWidth := lipgloss.Width(filterBadge) + lipgloss.Width(statsSection)
 	if phase2Section != "" {
 		leftWidth += lipgloss.Width(phase2Section) + 1
 	}
@@ -7982,9 +7985,43 @@ func (m *Model) renderFooter() string {
 	if datasetSection != "" {
 		leftWidth += lipgloss.Width(datasetSection) + 1
 	}
+	// Fit the footer in the terminal width. When everything does not fit,
+	// drop the least useful pieces whole rather than letting the final clamp
+	// cut the line in the middle of a hint: the issue count, then the generic
+	// label hint, then hints from the end of each list ("? help" last),
+	// trimming the view's key hints to two before its label hints.
+	fits := func() bool {
+		return leftWidth+lipgloss.Width(labelHint)+lipgloss.Width(countBadge)+lipgloss.Width(keysSection)+1 <= m.width
+	}
+fitFooter:
+	for !fits() {
+		switch {
+		case countBadge != "":
+			countBadge = ""
+		case genericLabelHint && len(labelHints) > 0:
+			labelHints = nil
+		case len(keyHints) > 2:
+			keyHints = dropLastFooterHint(keyHints)
+		case len(labelHints) > 2:
+			labelHints = dropLastFooterHint(labelHints)
+		case len(keyHints) > 0:
+			keyHints = dropLastFooterHint(keyHints)
+		case len(labelHints) > 0:
+			labelHints = dropLastFooterHint(labelHints)
+		default:
+			break fitFooter
+		}
+		labelHint, keysSection = "", ""
+		if len(labelHints) > 0 {
+			labelHint = labelHintStyle.Render(strings.Join(labelHints, " • "))
+		}
+		if len(keyHints) > 0 {
+			keysSection = keysStyle.Render(strings.Join(keyHints, sep))
+		}
+	}
 	rightWidth := lipgloss.Width(countBadge) + lipgloss.Width(keysSection)
 
-	remaining := m.width - leftWidth - rightWidth - 1
+	remaining := m.width - leftWidth - lipgloss.Width(labelHint) - rightWidth - 1
 	if remaining < 0 {
 		remaining = 0
 	}
@@ -7999,7 +8036,9 @@ func (m *Model) renderFooter() string {
 	if sortBadge != "" {
 		parts = append(parts, sortBadge)
 	}
-	parts = append(parts, labelHint)
+	if labelHint != "" {
+		parts = append(parts, labelHint)
+	}
 	if alertsSection != "" {
 		parts = append(parts, alertsSection)
 	}
@@ -8034,9 +8073,31 @@ func (m *Model) renderFooter() string {
 	if workerSection != "" {
 		parts = append(parts, workerSection)
 	}
-	parts = append(parts, filler, countBadge, keysSection)
+	parts = append(parts, filler)
+	if countBadge != "" {
+		parts = append(parts, countBadge)
+	}
+	if keysSection != "" {
+		parts = append(parts, keysSection)
+	}
 
-	return lipgloss.JoinHorizontal(lipgloss.Bottom, parts...)
+	// The status badges alone can still be wider than a very narrow
+	// terminal; cut those with an ellipsis instead of wrapping.
+	return ansi.Truncate(lipgloss.JoinHorizontal(lipgloss.Bottom, parts...), max(m.width, 1), "…")
+}
+
+// dropLastFooterHint removes the last footer hint, keeping the help hint
+// ("? help" / "?:help") until it is the only hint left.
+func dropLastFooterHint(hints []string) []string {
+	for i := len(hints) - 1; i >= 0; i-- {
+		plain := strings.TrimSpace(ansi.Strip(hints[i]))
+		if len(hints) == 1 || (plain != "? help" && plain != "?:help") {
+			out := make([]string, 0, len(hints)-1)
+			out = append(out, hints[:i]...)
+			return append(out, hints[i+1:]...)
+		}
+	}
+	return hints[:len(hints)-1]
 }
 
 func nextHybridPreset(current search.PresetName) search.PresetName {

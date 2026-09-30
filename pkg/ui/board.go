@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // BoardModel represents the Kanban board view with adaptive columns
@@ -1103,7 +1104,9 @@ func (b BoardModel) View(width, height int) string {
 				Foreground(columnColors[colIdx])
 		}
 
-		header := headerStyle.Render(headerText)
+		// Keep the header on one line: a header wider than the column
+		// would wrap and push the column (and the footer) down.
+		header := headerStyle.Render(ansi.Truncate(headerText, max(baseWidth, 1), "…"))
 
 		// Calculate visible rows (bv-1daf: 3 content lines)
 		// Card height breakdown:
@@ -1177,8 +1180,11 @@ func (b BoardModel) View(width, height int) string {
 			cards = append(cards, scrollStyle.Render(scrollInfo))
 		}
 
-		// Column content
-		content := lipgloss.JoinVertical(lipgloss.Left, cards...)
+		// Column content, clipped to the column box. Cards are sized to
+		// fit, but an expanded card can be taller than the 6 rows the
+		// scrolling assumes; without the clip the column would grow past
+		// the terminal and push the footer off-screen.
+		content := fitBlock(lipgloss.JoinVertical(lipgloss.Left, cards...), max(baseWidth-2, 1), colHeight)
 
 		// Column container
 		colStyle := t.Renderer.NewStyle().
@@ -1445,8 +1451,15 @@ func (b BoardModel) renderCard(issue model.Issue, width int, selected bool, colI
 		line3 = strings.Join(meta, " ")
 	}
 
-	// Render card with 3 content lines (line4 removed to eliminate extra vertical gap)
-	return cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left, line1, line2, line3))
+	// Render card with 3 content lines (line4 removed to eliminate extra
+	// vertical gap). Each line is cut to the card's inner width: a wider line
+	// (long labels, a blocker badge) would wrap, making the card taller than
+	// the 6 rows the column's scrolling reserves for it.
+	inner := max(width-2, 1)
+	return cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left,
+		ansi.Truncate(line1, inner, "…"),
+		ansi.Truncate(line2, inner, "…"),
+		ansi.Truncate(line3, inner, "…")))
 }
 
 // renderExpandedCard creates an expanded inline view of a card (bv-i3ii)

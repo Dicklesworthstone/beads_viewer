@@ -666,17 +666,18 @@ func (m *InsightsModel) View() string {
 		mainWidth = m.width - detailWidth - 1
 	}
 
-	// 3-column layout; 4 rows (3 metric rows + 1 priority row)
-	colWidth := (mainWidth - 6) / 3
-	if colWidth < 25 {
-		colWidth = 25
-	}
+	// 3-column layout; 4 rows (3 metric rows + 1 priority row). Every panel
+	// is exactly (width+2) x (height+2) cells including its border, so the
+	// three columns span mainWidth and the rows fit the height given to
+	// SetSize. When the terminal is too short for all four rows at a usable
+	// height, only a window of rows containing the focused panel is drawn.
+	colWidth := max((mainWidth-6)/3, 8)
 
-	// With 4 rows, reduce individual row height
-	rowHeight := (m.height - 8) / 4
-	if rowHeight < 6 {
-		rowHeight = 6
+	velocityLines := 0
+	if velocityLine != "" {
+		velocityLines = 1
 	}
+	rowCount, firstRow, rowHeight := insightsRowLayout(m.height-velocityLines, insightsPanelRow(m.focusedPanel))
 
 	panels := []string{
 		m.renderMetricPanel(PanelBottlenecks, colWidth, rowHeight, t),
@@ -702,22 +703,69 @@ func (m *InsightsModel) View() string {
 		row4 = m.renderPriorityPanel(mainWidth-2, rowHeight, t)
 	}
 
-	mainContent := lipgloss.JoinVertical(lipgloss.Left, row1, row2, row3, row4)
+	rows := []string{row1, row2, row3, row4}
+	mainContent := lipgloss.JoinVertical(lipgloss.Left, rows[firstRow:firstRow+rowCount]...)
 
 	// Add detail panel if enabled
+	view := mainContent
 	if detailWidth > 0 {
-		detailPanel := m.renderDetailPanel(detailWidth, m.height-2, t)
-		view := lipgloss.JoinHorizontal(lipgloss.Top, mainContent, detailPanel)
-		if velocityLine != "" {
-			view = lipgloss.JoinVertical(lipgloss.Left, velocityLine, view)
-		}
-		return view
+		detailPanel := m.renderDetailPanel(detailWidth, m.height-2-velocityLines, t)
+		view = lipgloss.JoinHorizontal(lipgloss.Top, mainContent, detailPanel)
 	}
-
 	if velocityLine != "" {
-		return lipgloss.JoinVertical(lipgloss.Left, velocityLine, mainContent)
+		view = lipgloss.JoinVertical(lipgloss.Left, velocityLine, view)
 	}
-	return mainContent
+	// Hard bound: the view never draws outside the area it was given.
+	return fitBlock(view, max(m.width, 1), max(m.height, 1))
+}
+
+// insightsMinPanelHeight is the smallest useful content height for a panel
+// row: title, subtitle, two items and a scroll indicator.
+const insightsMinPanelHeight = 5
+
+// insightsPanelRow returns the layout row (0-3) that holds a panel.
+func insightsPanelRow(p MetricPanel) int {
+	return min(int(p)/3, 3)
+}
+
+// insightsRowLayout decides how many of the four panel rows fit in height
+// lines, which one comes first so focusedRow stays visible, and the content
+// height of each panel (excluding its 2-line border).
+func insightsRowLayout(height, focusedRow int) (rowCount, firstRow, panelHeight int) {
+	rowCount = min(max(height/(insightsMinPanelHeight+2), 1), 4)
+	panelHeight = max(height/rowCount-2, 1)
+	firstRow = 0
+	if focusedRow >= rowCount {
+		firstRow = focusedRow - rowCount + 1
+	}
+	return rowCount, firstRow, panelHeight
+}
+
+// fitPanelBody lays out panel content lines in a panel whose lipgloss Width is
+// width (1 column of padding each side) and whose content is height lines, so
+// the rendered panel never wraps or grows past its box.
+func fitPanelBody(lines []string, width, height int) string {
+	return fitBlock(strings.Join(lines, "\n"), max(width-2, 1), max(height, 1))
+}
+
+// panelListRows splits the lines left in a panel after its fixed header
+// between an optional explanation and a scrolling list of total items. The
+// explanation is shortened so at least a few items stay visible. It returns
+// the explanation lines to keep, how many items to show, and whether a scroll
+// indicator line is needed.
+func panelListRows(avail int, explanation []string, total int) (keep []string, visible int, indicator bool) {
+	minItems := min(total, 3)
+	reserve := minItems
+	if total > minItems {
+		reserve++ // scroll indicator
+	}
+	keepN := min(len(explanation), max(avail-reserve, 0))
+	keep = explanation[:keepN]
+	rows := avail - keepN
+	if total <= rows {
+		return keep, total, false
+	}
+	return keep, max(rows-1, 1), true
 }
 
 func (m *InsightsModel) renderMetricPanel(panel MetricPanel, width, height int, t Theme) string {
@@ -775,13 +823,14 @@ func (m *InsightsModel) renderMetricPanel(panel MetricPanel, width, height int, 
 	lines = append(lines, subtitleStyle.Render(info.ShortDesc))
 
 	// Explanation (if enabled) - render as markdown for **bold** etc.
+	var explanation []string
 	if m.showExplanations {
-		explanation := m.renderMarkdownExplanation(info.WhatIs, width-4)
-		lines = append(lines, explanation)
+		explanation = strings.Split(strings.TrimRight(m.renderMarkdownExplanation(info.WhatIs, width-4), "\n"), "\n")
 	}
 
 	// If metric was skipped, show skip reason instead of items
 	if skipped {
+		lines = append(lines, explanation...)
 		skipStyle := t.Renderer.NewStyle().
 			Foreground(t.Subtext).
 			Italic(true).
@@ -795,20 +844,12 @@ func (m *InsightsModel) renderMetricPanel(panel MetricPanel, width, height int, 
 		lines = append(lines, skipStyle.Render(reason))
 		lines = append(lines, skipStyle.Render("Use --force-full-analysis to compute"))
 
-		return panelStyle.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+		return panelStyle.Render(fitPanelBody(lines, width, height))
 	}
 
-	// Items list
-	// Calculate visible rows more conservatively
-	// Header(1) + Subtitle(1) + Explain(2-3 lines typically) + Spacer(1) + Scroll(1) = ~7 lines overhead
-	visibleRows := height - 7
-	if m.showExplanations {
-		// Explanations can wrap, so give more buffer
-		visibleRows -= 1
-	}
-	if visibleRows < 3 {
-		visibleRows = 3
-	}
+	// Items list: whatever the header and explanation leave of the panel.
+	keptExplanation, visibleRows, needIndicator := panelListRows(height-len(lines), explanation, len(items))
+	lines = append(lines, keptExplanation...)
 
 	// Scrolling
 	startIdx := m.scrollOffset[panel]
@@ -834,7 +875,7 @@ func (m *InsightsModel) renderMetricPanel(panel MetricPanel, width, height int, 
 	}
 
 	// Scroll indicator
-	if len(items) > visibleRows {
+	if needIndicator {
 		scrollInfo := fmt.Sprintf("↕ %d/%d", selectedIdx+1, len(items))
 		scrollStyle := t.Renderer.NewStyle().
 			Foreground(t.Subtext).
@@ -843,7 +884,7 @@ func (m *InsightsModel) renderMetricPanel(panel MetricPanel, width, height int, 
 		lines = append(lines, scrollStyle.Render(scrollInfo))
 	}
 
-	return panelStyle.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+	return panelStyle.Render(fitPanelBody(lines, width, height))
 }
 
 func (m *InsightsModel) renderInsightRow(id string, value float64, width int, isSelected bool, t Theme) string {
@@ -985,13 +1026,14 @@ func (m *InsightsModel) renderCyclesPanel(width, height int, t Theme) string {
 	lines = append(lines, subtitleStyle.Render(info.ShortDesc))
 
 	// Explanation (if enabled) - render as markdown for **bold** etc.
+	var explanation []string
 	if m.showExplanations {
-		explanation := m.renderMarkdownExplanation(info.WhatIs, width-4)
-		lines = append(lines, explanation)
+		explanation = strings.Split(strings.TrimRight(m.renderMarkdownExplanation(info.WhatIs, width-4), "\n"), "\n")
 	}
 
 	// If skipped, show skip reason
 	if skipped {
+		lines = append(lines, explanation...)
 		skipStyle := t.Renderer.NewStyle().
 			Foreground(t.Subtext).
 			Italic(true).
@@ -1005,10 +1047,11 @@ func (m *InsightsModel) renderCyclesPanel(width, height int, t Theme) string {
 		lines = append(lines, skipStyle.Render(reason))
 		lines = append(lines, skipStyle.Render("Use --force-full-analysis to compute"))
 
-		return panelStyle.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+		return panelStyle.Render(fitPanelBody(lines, width, height))
 	}
 
 	if len(cycles) == 0 {
+		lines = append(lines, explanation...)
 		healthyStyle := t.Renderer.NewStyle().
 			Foreground(t.Open).
 			Bold(true)
@@ -1016,13 +1059,8 @@ func (m *InsightsModel) renderCyclesPanel(width, height int, t Theme) string {
 		lines = append(lines, t.Renderer.NewStyle().Foreground(t.Subtext).Render("Graph is acyclic (DAG)"))
 	} else {
 		selectedIdx := m.selectedIndex[PanelCycles]
-		visibleRows := height - 6
-		if m.showExplanations {
-			visibleRows -= 2
-		}
-		if visibleRows < 3 {
-			visibleRows = 3
-		}
+		keptExplanation, visibleRows, needIndicator := panelListRows(height-len(lines), explanation, len(cycles))
+		lines = append(lines, keptExplanation...)
 
 		// Scrolling support for cycles (same logic as metric panels)
 		startIdx := m.scrollOffset[PanelCycles]
@@ -1059,7 +1097,7 @@ func (m *InsightsModel) renderCyclesPanel(width, height int, t Theme) string {
 		}
 
 		// Scroll indicator
-		if len(cycles) > visibleRows {
+		if needIndicator {
 			scrollInfo := fmt.Sprintf("↕ %d/%d", selectedIdx+1, len(cycles))
 			scrollStyle := t.Renderer.NewStyle().
 				Foreground(t.Subtext).
@@ -1069,7 +1107,7 @@ func (m *InsightsModel) renderCyclesPanel(width, height int, t Theme) string {
 		}
 	}
 
-	return panelStyle.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+	return panelStyle.Render(fitPanelBody(lines, width, height))
 }
 
 // renderPriorityPanel renders the priority recommendations panel (bv-91)
@@ -1111,18 +1149,15 @@ func (m *InsightsModel) renderPriorityPanel(width, height int, t Theme) string {
 			Foreground(t.Subtext).
 			Italic(true)
 		lines = append(lines, emptyStyle.Render("No priority recommendations available. Run 'bv --robot-triage' to generate."))
-		return panelStyle.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+		return panelStyle.Render(fitPanelBody(lines, width, height))
 	}
 
 	selectedIdx := m.selectedIndex[PanelPriority]
-	// For horizontal layout, show items side by side
-	visibleItems := min(len(picks), 5) // Show up to 5 items horizontally
-
-	// Calculate width per item
-	itemWidth := (width - 4) / visibleItems
-	if itemWidth < 30 {
-		itemWidth = 30
-	}
+	// For horizontal layout, show items side by side: up to 5, each at least
+	// 30 cells wide, within the panel's content width.
+	contentWidth := max(width-2, 1)
+	visibleItems := min(len(picks), 5, max(contentWidth/30, 1))
+	itemWidth := contentWidth / visibleItems
 
 	// Scrolling for selection
 	startIdx := m.scrollOffset[PanelPriority]
@@ -1139,12 +1174,23 @@ func (m *InsightsModel) renderPriorityPanel(width, height int, t Theme) string {
 		endIdx = len(picks)
 	}
 
+	// The item cards get whatever the header, scroll indicator and hash
+	// footer leave; each card's border takes 2 of those lines.
+	footerLines := 0
+	if len(picks) > visibleItems {
+		footerLines++
+	}
+	if m.triageDataHash != "" {
+		footerLines++
+	}
+	itemHeight := max(height-1-footerLines-2, 1)
+
 	// Render picks horizontally
 	var pickRenderings []string
 	for i := startIdx; i < endIdx; i++ {
 		pick := picks[i]
 		isSelected := isFocused && i == selectedIdx
-		pickRenderings = append(pickRenderings, m.renderPriorityItem(pick, itemWidth, height-3, isSelected, t))
+		pickRenderings = append(pickRenderings, m.renderPriorityItem(pick, itemWidth, itemHeight, isSelected, t))
 	}
 
 	lines = append(lines, lipgloss.JoinHorizontal(lipgloss.Top, pickRenderings...))
@@ -1169,7 +1215,7 @@ func (m *InsightsModel) renderPriorityPanel(width, height int, t Theme) string {
 		lines = append(lines, hashStyle.Render("📊 "+m.triageDataHash))
 	}
 
-	return panelStyle.Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
+	return panelStyle.Render(fitPanelBody(lines, width, height))
 }
 
 // renderMiniBar renders a compact progress bar for metric visualization (bv-93)
@@ -1327,7 +1373,8 @@ func (m *InsightsModel) renderPriorityItem(pick analysis.TopPick, width, height 
 		sb.WriteString("\n")
 	}
 
-	return itemStyle.Render(sb.String())
+	// width-2 is the card's lipgloss Width; its content is 2 narrower.
+	return itemStyle.Render(fitBlock(strings.TrimRight(sb.String(), "\n"), max(width-4, 1), max(height, 1)))
 }
 
 // renderHeatmapPanel renders a priority/depth heatmap visualization (bv-95)
@@ -1350,7 +1397,7 @@ func (m *InsightsModel) renderHeatmapPanel(width, height int, t Theme) string {
 
 	// If in drill-down mode, delegate to drill-down renderer
 	if m.heatmapDrill {
-		return panelStyle.Render(m.renderHeatmapDrillDown(width-4, t))
+		return panelStyle.Render(fitPanelBody([]string{m.renderHeatmapDrillDown(width-4, t)}, width, height))
 	}
 
 	var sb strings.Builder
@@ -1373,7 +1420,7 @@ func (m *InsightsModel) renderHeatmapPanel(width, height int, t Theme) string {
 			Foreground(t.Subtext).
 			Italic(true)
 		sb.WriteString(strings.TrimRight(emptyStyle.Render("No data available. Run 'bv --robot-triage' to generate."), "\n\r"))
-		return panelStyle.Render(sb.String())
+		return panelStyle.Render(fitPanelBody([]string{sb.String()}, width, height))
 	}
 
 	// Use cached grid data (populated by rebuildHeatmapGrid)
@@ -1485,7 +1532,7 @@ func (m *InsightsModel) renderHeatmapPanel(width, height int, t Theme) string {
 	sb.WriteString("\n")
 	sb.WriteString(m.renderHeatmapLegend(t))
 
-	return panelStyle.Render(sb.String())
+	return panelStyle.Render(fitPanelBody([]string{sb.String()}, width, height))
 }
 
 // renderHeatmapCell renders a single cell with background gradient color (bv-t4yg)
