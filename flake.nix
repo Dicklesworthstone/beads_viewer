@@ -12,7 +12,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        version = "0.25.1";
+        version = "0.25.2";
 
         # To update vendorHash after go.mod/go.sum changes:
         # 1. Set vendorHash to: pkgs.lib.fakeHash

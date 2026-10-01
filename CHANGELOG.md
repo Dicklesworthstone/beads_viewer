@@ -2,11 +2,12 @@
 
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
-Scope window: this update verifies `v0.25.0..v0.25.1`, including the
+Scope window: this update verifies `v0.25.1..v0.25.2` (installer and
+terminal-layout fixes) on top of the `v0.25.0..v0.25.1` audit, which covered the
 September 14–16 graph, timeline, duplicate-detection and history-cache work and
 the September 17–29 source-selection, correlation, search, agent-file and
-layout fixes. v0.25.1 was published after its complete clean-source release
-gate passed.
+layout fixes. Each release was published after its complete clean-source
+release gate passed.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
 and release receipts; [research notes](CHANGELOG_RESEARCH.md) record coverage.
@@ -17,6 +18,7 @@ the latest tag, including installer changes usable with already released binarie
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
+| [`v0.25.2`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.2) | 2026-09-30 | GitHub Release | Every view and the footer stay inside the terminal; `install.sh` installs the release binary with only `jq`, and its Go `.pkg` fallback works and checks the download. |
 | [`v0.25.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.1) | 2026-09-29 | GitHub Release | Views laid out beside the shortcuts sidebar, restored time-travel export, tracker-source selection and correlation fixes, and the September graph/timeline work. |
 | [`v0.25.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.0) | 2026-09-12 | GitHub Release | Workflow readiness, source integrity and live dashboards, responsive Cass search, priority performance, and Go 1.26 dependency refresh. |
 | [`v0.24.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.24.1) | 2026-09-08 | GitHub Release | Reuse loaded source hashes and avoid waiting for a busy analysis-cache writer. |
@@ -28,6 +30,33 @@ the latest tag, including installer changes usable with already released binarie
 | [`v0.21.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.21.0) | 2026-08-23 | GitHub Release | Strict robot-count semantics, bounded history liveness, theme selection, and cache-path repairs. |
 
 ---
+
+## v0.25.2 — 2026-09-30
+
+### Fixes
+
+- **Views and the footer stay inside the terminal.** With the shortcuts
+  sidebar off (the default), nothing stopped a view from drawing more rows or
+  columns than the terminal has, so the footer could be pushed off screen and
+  long lines wrapped. Insights drew about 67 rows in a 30-row terminal; board
+  cards with long label or blocker lines grew taller than the space reserved
+  for them; the tree view was one row too tall. Each view is now sized to fit,
+  every view is clipped to the window as a last resort, and at 100 columns and
+  below the footer drops whole hints (keeping `? help` to the last) instead of
+  being cut mid-word
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/12ae9975)).
+- **`install.sh` works with only `jq`.** The installer said "install python3 or
+  jq", but picking the release archive only worked with Python, so a machine
+  with just `jq` fell back to building from source. Both tools now work and
+  are tested to give the same answer
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/409f0409)).
+- **The macOS Go installer fallback runs and is checked.** When `install.sh`
+  needs Go on macOS and offers the official `.pkg`, it never actually got a
+  download URL, so that path silently did nothing. It now builds the URL from
+  go.dev's file list and refuses to run the package unless its SHA-256 matches
+  the one go.dev publishes
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/409f0409),
+  [URL and checksum](https://github.com/Dicklesworthstone/beads_viewer/commit/a84e7081)).
 
 ## v0.25.1 — 2026-09-29
 
