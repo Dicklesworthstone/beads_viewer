@@ -229,7 +229,10 @@ func TestHistoryExportUsesRecordedLifecycle(t *testing.T) {
 	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	git := func(hour int, args ...string) string {
 		t.Helper()
-		cmd := exec.Command("git", args...)
+		// The retained_window subtest makes 500 commits. With automatic
+		// maintenance on, git 2.54 runs it mid-sequence and a later commit
+		// fails with "fatal: unable to read <object>"; the fixture never needs it.
+		cmd := exec.Command("git", append([]string{"-c", "gc.auto=0", "-c", "maintenance.auto=false"}, args...)...)
 		cmd.Dir = repo
 		// Distinct commits can share Git's one-second timestamp resolution.
 		at := start.Format(time.RFC3339)
