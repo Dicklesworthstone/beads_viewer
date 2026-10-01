@@ -227,10 +227,7 @@ func (m *ActionableModel) Render() string {
 			Foreground(t.Secondary).
 			Italic(true)
 
-		trackNum := track.TrackID
-		if len(trackNum) > 6 {
-			trackNum = trackNum[6:] // Strip "track-" prefix
-		}
+		trackNum := strings.TrimPrefix(track.TrackID, "track-")
 
 		trackLine := trackBadgeStyle.Render(fmt.Sprintf("TRACK %s", trackNum)) +
 			" " + trackReasonStyle.Render(track.Reason)

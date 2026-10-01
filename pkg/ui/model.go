@@ -1341,6 +1341,77 @@ func (m *Model) selectVisibleListItemByID(id string) bool {
 	return false
 }
 
+// selectListIndex selects row i of the rows the list currently shows, clamped
+// to that range. list.Select takes an index into VisibleItems(), not Items():
+// while a fuzzy filter is applied the two differ, and an index past the visible
+// rows leaves the paginator on a page that does not exist, which panics inside
+// list.View with "slice bounds out of range" (GH #210).
+func (m *Model) selectListIndex(i int) {
+	n := len(m.list.VisibleItems())
+	if i >= n {
+		i = n - 1
+	}
+	if i < 0 {
+		i = 0
+	}
+	m.list.Select(i)
+}
+
+// selectListIssueByID selects the issue with this ID when another view jumps
+// to it. If only the fuzzy list filter hides the issue, the filter is cleared
+// so the jump still lands on it; an issue outside the list entirely (status
+// filter, recipe) leaves the selection unchanged. It reports whether the issue
+// is now selected.
+func (m *Model) selectListIssueByID(id string) bool {
+	if m.selectVisibleListItemByID(id) {
+		return true
+	}
+	if id == "" || m.list.FilterState() == list.Unfiltered {
+		return false
+	}
+	found := false
+	for _, raw := range m.list.Items() {
+		if item, ok := raw.(IssueItem); ok && item.Issue.ID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+	m.clearListFuzzyFilter()
+	return m.selectVisibleListItemByID(id)
+}
+
+// clearListFuzzyFilter drops the list's fuzzy filter with the same follow-up
+// Update performs when the list leaves filtering: regroup recipe rows and
+// retire every filter and semantic-search result computed for the old term.
+func (m *Model) clearListFuzzyFilter() {
+	m.list.ResetFilter()
+	if m.recipeGroupingActive() {
+		m.setListItems(m.recipeListItems)
+	}
+	m.lastSearchTerm = ""
+	m.listQueryGeneration++
+	m.pendingFilterTerm = ""
+	m.pendingSelectedID = ""
+	m.invalidateSemanticFilter()
+	if m.semanticSearchEnabled {
+		m.clearSemanticScores()
+	}
+}
+
+// listViewInBounds renders the list from a copy whose selection is clamped to
+// the visible rows. list.View slices VisibleItems() by the paginator's page
+// without checking it, so a stale page must never reach it (GH #210).
+func (m Model) listViewInBounds() string {
+	l := m.list
+	if n := len(l.VisibleItems()); n > 0 && l.Index() >= n {
+		l.Select(n - 1)
+	}
+	return l.View()
+}
+
 // installSnapshotListItems installs detached precomputed snapshot items. Every
 // list filtering command captures the then-current items slice and can execute
 // off-thread, so reloads must never reuse or mutate its backing array.
@@ -3082,7 +3153,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.currentFilter = "recipe:" + m.activeRecipe.Name
 
 				// Keep selection in bounds
-				if len(m.list.Items()) > 0 && m.list.Index() >= len(m.list.Items()) {
+				if visible := len(m.list.VisibleItems()); visible > 0 && m.list.Index() >= visible {
 					m.list.Select(0)
 				}
 			} else {
@@ -3171,16 +3242,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				// Restore selection if possible
 				if !listFilterActive && selectedID != "" {
-					for i, it := range filteredItems {
-						if item, ok := it.(IssueItem); ok && item.Issue.ID == selectedID {
-							m.list.Select(i)
-							break
-						}
-					}
+					m.selectVisibleListItemByID(selectedID)
 				}
 
 				// Keep selection in bounds
-				if len(filteredItems) > 0 && m.list.Index() >= len(filteredItems) {
+				if visible := len(m.list.VisibleItems()); visible > 0 && m.list.Index() >= visible {
 					m.list.Select(0)
 				}
 			}
@@ -3188,13 +3254,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Restore selection in recipe mode (applyRecipe rebuilds list items)
 		if m.activeRecipe != nil && !listFilterActive && selectedID != "" {
-			items := m.list.Items()
-			for i := range items {
-				if item, ok := items[i].(IssueItem); ok && item.Issue.ID == selectedID {
-					m.list.Select(i)
-					break
-				}
-			}
+			m.selectVisibleListItemByID(selectedID)
 		}
 		if listFilterActive && listRefilterCmd != nil {
 			cmds = append(cmds, m.prepareSnapshotListFilterCmd(
@@ -3540,14 +3600,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setListItems(items)
 
 		// Restore selection position
-		if selectedID != "" {
-			for i, item := range m.list.Items() {
-				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selectedID {
-					m.list.Select(i)
-					break
-				}
-			}
-		}
+		m.selectVisibleListItemByID(selectedID)
 
 		// Regenerate sub-views (with Phase 1 data; Phase 2 will update via Phase2ReadyMsg)
 		// Preserve triage data already computed to avoid UI flicker.
@@ -3925,13 +3978,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					issueID := activeAlerts[m.alertsCursor].IssueID
 					if issueID != "" {
 						m.revealRecipeIssue(issueID)
-						// Find the issue in the list and select it
-						for i, item := range m.list.Items() {
-							if it, ok := item.(IssueItem); ok && it.Issue.ID == issueID {
-								m.list.Select(i)
-								break
-							}
-						}
+						m.selectListIssueByID(issueID)
 					}
 				}
 				m.showAlertsPanel = false
@@ -4705,7 +4752,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if group, ok := m.list.SelectedItem().(IssueGroupItem); ok && (keyStr == "enter" || keyStr == " ") {
 					m.recipeCollapsed[group.Key] = !group.Collapsed
 					m.setListItems(m.recipeListItems)
-					for i, raw := range m.list.Items() {
+					for i, raw := range m.list.VisibleItems() {
 						if header, ok := raw.(IssueGroupItem); ok && header.Key == group.Key {
 							m.list.Select(i)
 							break
@@ -5035,7 +5082,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Scroll down based on current focus
 			switch m.focused {
 			case focusList:
-				if m.list.Index() < len(m.list.Items())-1 {
+				if m.list.Index() < len(m.list.VisibleItems())-1 {
 					m.list.Select(m.list.Index() + 1)
 					// Sync detail panel in split view mode
 					if m.isSplitView {
@@ -5328,12 +5375,7 @@ func (m *Model) handleBoardKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 	case "enter":
 		if selected := m.board.SelectedIssue(); selected != nil {
 			m.revealRecipeIssue(selected.ID)
-			for i, item := range m.list.Items() {
-				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selected.ID {
-					m.list.Select(i)
-					break
-				}
-			}
+			m.selectListIssueByID(selected.ID)
 			m.isBoardView = false
 			m.focused = focusList
 			if m.isSplitView {
@@ -5378,12 +5420,7 @@ func (m *Model) handleGraphKeys(msg tea.KeyMsg) *Model {
 		if selected := m.graphView.SelectedIssue(); selected != nil {
 			m.revealRecipeIssue(selected.ID)
 			// Find and select in list
-			for i, item := range m.list.Items() {
-				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selected.ID {
-					m.list.Select(i)
-					break
-				}
-			}
+			m.selectListIssueByID(selected.ID)
 			m.isGraphView = false
 			m.focused = focusList
 			if m.isSplitView {
@@ -5430,12 +5467,7 @@ func (m *Model) handleTreeKeys(msg tea.KeyMsg) *Model {
 		if selected := m.tree.SelectedIssue(); selected != nil {
 			m.revealRecipeIssue(selected.ID)
 			// Sync detail panel with tree selection
-			for i, item := range m.list.Items() {
-				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selected.ID {
-					m.list.Select(i)
-					break
-				}
-			}
+			m.selectListIssueByID(selected.ID)
 			m.updateViewportContent()
 			m.focused = focusDetail
 			if !m.isSplitView {
@@ -5459,12 +5491,7 @@ func (m *Model) handleActionableKeys(msg tea.KeyMsg) *Model {
 		selectedID := m.actionableView.SelectedIssueID()
 		if selectedID != "" {
 			m.revealRecipeIssue(selectedID)
-			for i, item := range m.list.Items() {
-				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selectedID {
-					m.list.Select(i)
-					break
-				}
-			}
+			m.selectListIssueByID(selectedID)
 			m.isActionableView = false
 			m.focused = focusList
 			if m.isSplitView {
@@ -5619,12 +5646,7 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		}
 		if selectedID != "" {
 			m.revealRecipeIssue(selectedID)
-			for i, item := range m.list.Items() {
-				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selectedID {
-					m.list.Select(i)
-					break
-				}
-			}
+			m.selectListIssueByID(selectedID)
 			m.isHistoryView = false
 			m.focused = focusList
 			if m.isSplitView {
@@ -5740,12 +5762,7 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		if selectedID != "" {
 			m.revealRecipeIssue(selectedID)
 			// Find and select the bead in the main list
-			for i, item := range m.list.Items() {
-				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selectedID {
-					m.list.Select(i)
-					break
-				}
-			}
+			m.selectListIssueByID(selectedID)
 			// Switch to graph view focused on this bead
 			m.isHistoryView = false
 			m.graphView.SelectByID(selectedID)
@@ -6050,12 +6067,7 @@ func (m *Model) handleInsightsKeys(msg tea.KeyMsg) *Model {
 		selectedID := m.insightsPanel.SelectedIssueID()
 		if selectedID != "" {
 			m.revealRecipeIssue(selectedID)
-			for i, item := range m.list.Items() {
-				if issueItem, ok := item.(IssueItem); ok && issueItem.Issue.ID == selectedID {
-					m.list.Select(i)
-					break
-				}
-			}
+			m.selectListIssueByID(selectedID)
 			m.focused = focusList
 			if m.isSplitView {
 				m.focused = focusDetail
@@ -6085,30 +6097,13 @@ func (m *Model) handleListKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 	case "home":
 		m.list.Select(0)
 	case "G", "end":
-		if len(m.list.Items()) > 0 {
-			m.list.Select(len(m.list.Items()) - 1)
-		}
+		m.selectListIndex(len(m.list.VisibleItems()) - 1)
 	case "ctrl+d":
 		// Page down
-		itemCount := len(m.list.Items())
-		if itemCount > 0 {
-			currentIdx := m.list.Index()
-			newIdx := currentIdx + m.height/3
-			if newIdx >= itemCount {
-				newIdx = itemCount - 1
-			}
-			m.list.Select(newIdx)
-		}
+		m.selectListIndex(m.list.Index() + m.height/3)
 	case "ctrl+u":
 		// Page up
-		if len(m.list.Items()) > 0 {
-			currentIdx := m.list.Index()
-			newIdx := currentIdx - m.height/3
-			if newIdx < 0 {
-				newIdx = 0
-			}
-			m.list.Select(newIdx)
-		}
+		m.selectListIndex(m.list.Index() - m.height/3)
 	case "o":
 		m.currentFilter = "open"
 		m.applyFilter()
@@ -6552,7 +6547,7 @@ func (m Model) renderListWithHeader() string {
 	header := headerStyle.Render(headerText)
 
 	// Page info
-	totalItems := len(m.list.Items())
+	totalItems := len(m.list.VisibleItems())
 	currentIdx := m.list.Index()
 	itemsPerPage := availableHeight
 	if itemsPerPage < 1 {
@@ -6585,7 +6580,7 @@ func (m Model) renderListWithHeader() string {
 	)
 
 	// List view - just render it normally since bubbles handles scrolling
-	listView := m.list.View()
+	listView := m.listViewInBounds()
 
 	// Page indicator line
 	pageLine := pageStyle.Render(pageInfo)
@@ -6647,7 +6642,7 @@ func (m Model) renderSplitView() string {
 	header := headerStyle.Render("  TYPE PRI STATUS      ID                     TITLE")
 
 	// Page info for list
-	totalItems := len(m.list.Items())
+	totalItems := len(m.list.VisibleItems())
 	currentIdx := m.list.Index()
 	listHeight := m.list.Height()
 	if listHeight == 0 {
@@ -6680,7 +6675,7 @@ func (m Model) renderSplitView() string {
 	pageLine := pageStyle.Render(pageInfo)
 
 	// Combine header + list + page indicator
-	listContent := lipgloss.JoinVertical(lipgloss.Left, header, m.list.View(), pageLine)
+	listContent := lipgloss.JoinVertical(lipgloss.Left, header, m.listViewInBounds(), pageLine)
 
 	// List Panel Width: Inner + 2 (Padding). Border adds another 2.
 	// Use MaxHeight to ensure content doesn't overflow
@@ -8135,7 +8130,7 @@ func (m Model) getDiffStatus(id string) DiffStatus {
 // the ends. "Changed" means the issue is new, closed, or modified in the
 // SnapshotDiff, i.e. exactly the rows the list marks.
 func (m *Model) jumpToChangedIssue(forward bool) {
-	items := m.list.Items()
+	items := m.list.VisibleItems()
 	n := len(items)
 	if n == 0 || m.timeTravelDiff == nil {
 		m.statusMsg = "⏱ No changed issues in the current view"
@@ -8708,7 +8703,7 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 	m.currentFilter = "recipe:" + r.Name
 
 	// Keep selection in bounds
-	if len(m.list.Items()) > 0 && m.list.Index() >= len(m.list.Items()) {
+	if visible := len(m.list.VisibleItems()); visible > 0 && m.list.Index() >= visible {
 		m.list.Select(0)
 	}
 	m.updateViewportContent()
@@ -8976,7 +8971,7 @@ func (m *Model) handleLeftClick(x, y int) *Model {
 		if rowOffset < 0 {
 			return
 		}
-		total := len(m.list.Items())
+		total := len(m.list.VisibleItems())
 		if total == 0 {
 			return
 		}
