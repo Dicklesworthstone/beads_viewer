@@ -161,6 +161,32 @@ or when that release is superseded; retention/deletion follows maintainer policy
 
 ## Native installation and package stores
 
+### v0.25.2 verification (2026-10-01)
+
+Published at 04:07 UTC from `721353e7` after all ten gate stages passed
+without skips on vmi1149989 (Go 1.26.8, GoReleaser 2.18.1, PowerShell 7.6.5,
+br 0.6.0, wasm-bindgen 0.2.128, Binaryen 132). Packaging sealed and verified
+all five archives; DSR uploaded them with `checksums.txt`, the receipt and an
+SPDX SBOM of the packaged Linux amd64 binary as a draft without dispatch, and
+`SHA256SUMS` plus the per-archive `.sha256` files completed the same 14-asset
+set as v0.25.1. Every draft asset was byte-compared before publication.
+Homebrew `16accca` and Scoop `3a34742` publish the same archive hashes.
+
+Checked after publication in Debian containers (Linux amd64 and arm64):
+`install.sh` installs v0.25.2 with `python3` and, after removing it, with only
+`jq` and no Go; a tiny project's `--robot-next` reports `t-1` as the
+diagnostic pick; the v0.25.1 binary's `--update --yes` moves to v0.25.2 and a
+second run reports it is up to date. The macOS arm64 archive runs and reports
+v0.25.2. Native Windows, native macOS amd64 and Nix were not run.
+
+Gate-host notes: on hosts with git 2.54.0, `TestHistoryExportUsesRecordedLifecycle`
+failed in most runs (also at v0.25.1) because automatic maintenance ran in
+the middle of its 500-commit fixture; `721353e7` turns it off for that fixture.
+Hosts under I/O pressure (hz4, ~50% `some`) failed the timing-bound watch and
+correlation e2e tests, and shared VPS hosts can fail stage 8 on benchmarks of
+unchanged code (one run reported +34% on `BenchmarkRealData_FullAnalysis`, the
+previous run on the same host -23%); a rerun on the same commit passed.
+
 ### v0.25.1 verification (2026-09-29)
 
 Published at 17:22 UTC from `4db2f8dc` after all ten gate stages passed
