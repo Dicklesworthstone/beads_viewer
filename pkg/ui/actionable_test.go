@@ -2,16 +2,20 @@ package ui
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func newTestTheme() Theme {
@@ -200,6 +204,79 @@ func TestListViewInBoundsClampsStalePage(t *testing.T) {
 	out := m.listViewInBounds()
 	if !strings.Contains(out, "zebra 0077") {
 		t.Fatalf("clamped list view does not show the last visible row:\n%s", out)
+	}
+	_ = m.View()
+}
+
+func TestPageInfoClampsStaleIndex(t *testing.T) {
+	pageInfo := regexp.MustCompile(`Page (\d+)(?:/| of )(\d+) \((?:items )?(\d+)-(\d+) of (\d+)\)`)
+	for _, width := range []int{140, 60} {
+		m := newFilteredListModel(t)
+		m.Update(tea.WindowSizeMsg{Width: width, Height: 45})
+		// The stale state GH #210 reached: an index past the six visible rows.
+		m.list.Select(77)
+		got := pageInfo.FindStringSubmatch(ansi.Strip(m.View()))
+		if got == nil {
+			t.Fatalf("width %d: no page-info line found", width)
+		}
+		n := make([]int, len(got))
+		for i := 1; i < len(got); i++ {
+			n[i], _ = strconv.Atoi(got[i])
+		}
+		if n[1] > n[2] || n[3] > n[4] || n[4] != 6 || n[5] != 6 {
+			t.Fatalf("width %d: page info %q points past the six visible rows", width, got[0])
+		}
+	}
+}
+
+// newGroupedFilteredRecipeModel builds a collapsed, status-grouped recipe list
+// whose fuzzy filter "zebra" leaves only the open issue zebra-1 visible.
+func newGroupedFilteredRecipeModel(t *testing.T) *Model {
+	t.Helper()
+	now := time.Date(2026, 9, 30, 0, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "zebra-1", Title: "zebra visible", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "other-2", Title: "hidden by filter", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	}
+	r := &recipe.Recipe{Name: "groups", View: recipe.ViewConfig{GroupBy: "status", Collapsed: true}}
+	m := NewModel(issues, r, "")
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 150, Height: 40})
+	m.semanticSearchEnabled = false
+	m.list.Filter = list.DefaultFilter
+	// Search shows header-free recipe rows, as the "/" key does.
+	m.setListItems(m.recipeListItems)
+	m.list.SetItems(append([]list.Item(nil), m.recipeListItems...))
+	m.list.SetFilterText("zebra")
+	if got := len(m.list.VisibleItems()); got != 1 {
+		t.Fatalf("visible items=%d, want 1", got)
+	}
+	return m
+}
+
+func TestRecipeJumpToVisibleIssueKeepsFuzzyFilter(t *testing.T) {
+	m := newGroupedFilteredRecipeModel(t)
+	m.revealRecipeIssue("zebra-1")
+	if !m.selectListIssueByID("zebra-1") {
+		t.Fatal("jump did not select the visible issue")
+	}
+	if m.list.FilterState() == list.Unfiltered {
+		t.Fatal("jump cleared a fuzzy filter that did not hide the target")
+	}
+	_ = m.View()
+}
+
+func TestRecipeJumpToFilteredOutIssueRegroupsExpanded(t *testing.T) {
+	m := newGroupedFilteredRecipeModel(t)
+	m.revealRecipeIssue("other-2")
+	if !m.selectListIssueByID("other-2") {
+		t.Fatal("jump did not select the filtered-out issue")
+	}
+	if m.list.FilterState() != list.Unfiltered {
+		t.Fatal("fuzzy filter still hides the jump target")
+	}
+	if got := selectedListID(t, m); got != "other-2" {
+		t.Fatalf("selected %s, want other-2", got)
 	}
 	_ = m.View()
 }

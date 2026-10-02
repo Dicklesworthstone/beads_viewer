@@ -1412,6 +1412,19 @@ func (m Model) listViewInBounds() string {
 	return l.View()
 }
 
+// listIndexInBounds is the selected row as listViewInBounds draws it, so the
+// page-info line never reports a page past the visible rows.
+func (m Model) listIndexInBounds() int {
+	idx := m.list.Index()
+	if n := len(m.list.VisibleItems()); idx >= n {
+		idx = n - 1
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	return idx
+}
+
 // installSnapshotListItems installs detached precomputed snapshot items. Every
 // list filtering command captures the then-current items slice and can execute
 // off-thread, so reloads must never reuse or mutate its backing array.
@@ -6548,7 +6561,7 @@ func (m Model) renderListWithHeader() string {
 
 	// Page info
 	totalItems := len(m.list.VisibleItems())
-	currentIdx := m.list.Index()
+	currentIdx := m.listIndexInBounds()
 	itemsPerPage := availableHeight
 	if itemsPerPage < 1 {
 		itemsPerPage = 1
@@ -6643,7 +6656,7 @@ func (m Model) renderSplitView() string {
 
 	// Page info for list
 	totalItems := len(m.list.VisibleItems())
-	currentIdx := m.list.Index()
+	currentIdx := m.listIndexInBounds()
 	listHeight := m.list.Height()
 	if listHeight == 0 {
 		listHeight = panelHeight - 3 // fallback
@@ -8250,8 +8263,13 @@ func (m *Model) revealRecipeIssue(id string) {
 	for _, raw := range m.recipeListItems {
 		if item, ok := raw.(IssueItem); ok && item.Issue.ID == id {
 			m.recipeCollapsed[m.recipeGroupKey(item.Issue)] = false
-			m.list.ResetFilter()
-			m.setListItems(m.recipeListItems)
+			// A filtered list shows recipe rows without group headers, so a
+			// collapsed group hides nothing there. Leave the fuzzy filter to
+			// selectListIssueByID, which clears it only when it hides the target
+			// and regroups with this group expanded.
+			if m.list.FilterState() == list.Unfiltered {
+				m.setListItems(m.recipeListItems)
+			}
 			return
 		}
 	}
