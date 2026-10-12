@@ -3,8 +3,10 @@ package datasource
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -560,6 +562,110 @@ func TestSQLiteReader_ConfiguresEveryPooledConnection(t *testing.T) {
 		if queryOnly != 1 {
 			t.Errorf("connection %d query_only = %d, want 1", i+1, queryOnly)
 		}
+	}
+}
+
+// GH#555: exercise the actual modernc reader against a built br, including
+// the pooled reader kept open by interactive sessions. Run with BR_TEST_BIN
+// pointing at the br under test; ordinary unit runs do not require Rust.
+func TestSQLiteReader_BeadsRustWALInterop(t *testing.T) {
+	br := os.Getenv("BR_TEST_BIN")
+	if br == "" {
+		t.Skip("set BR_TEST_BIN to run the cross-engine WAL regression")
+	}
+	for _, longLived := range []bool{false, true} {
+		t.Run(fmt.Sprintf("long_lived_%t", longLived), func(t *testing.T) {
+			dir := t.TempDir()
+			beadsDir := filepath.Join(dir, ".beads")
+			dbPath := filepath.Join(beadsDir, "beads.db")
+			runBR := func(args ...string) {
+				t.Helper()
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, br, append([]string{"--db", dbPath, "--no-auto-import", "--no-auto-flush"}, args...)...)
+				cmd.Dir = dir
+				// Pin discovery to the isolated fixture, independent of the
+				// developer's or remote build worker's parent tracker.
+				cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("br %v: %v\n%s", args, err, output)
+				}
+			}
+			runBR("init", "--prefix", "interop")
+			runBR("create", "seed issue")
+			openReader := func() *SQLiteReader {
+				t.Helper()
+				r, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: dbPath})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return r
+			}
+			var interactive *SQLiteReader
+			if longLived {
+				interactive = openReader()
+				defer interactive.Close()
+			}
+			for i := 0; i < 12; i++ {
+				r := interactive
+				if r == nil {
+					r = openReader()
+				}
+				issues, err := r.LoadIssues()
+				if err != nil || len(issues) != i+1 {
+					t.Fatalf("read %d: got %d issues, want %d: %v", i, len(issues), i+1, err)
+				}
+				if !longLived {
+					if err := r.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				runBR("list", "--json")
+				runBR("create", fmt.Sprintf("fresh issue %d", i))
+			}
+			r := openReader()
+			defer r.Close()
+			issues, err := r.LoadIssues()
+			if err != nil || len(issues) != 13 {
+				t.Fatalf("final read: got %d issues: %v", len(issues), err)
+			}
+			if longLived {
+				// Keep a real SQLite reader lease while br commits. The old
+				// quarantine path tried exclusive recovery here. The reader
+				// must retain its snapshot, then see the committed WAL row
+				// after releasing it, without any -shm restoration.
+				tx, err := interactive.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback()
+				var before, after int
+				if err := tx.QueryRow("SELECT count(*) FROM issues").Scan(&before); err != nil {
+					t.Fatal(err)
+				}
+				runBR("create", "committed with a pinned reader")
+				if err := tx.QueryRow("SELECT count(*) FROM issues").Scan(&after); err != nil || after != before {
+					t.Fatalf("pinned snapshot changed: before=%d after=%d: %v", before, after, err)
+				}
+				if err := tx.Rollback(); err != nil {
+					t.Fatal(err)
+				}
+				issues, err = interactive.LoadIssues()
+				if err != nil || len(issues) != 14 {
+					t.Fatalf("fresh read after reader release: got %d issues: %v", len(issues), err)
+				}
+			}
+			var integrity string
+			if err := r.db.QueryRow("PRAGMA integrity_check").Scan(&integrity); err != nil || integrity != "ok" {
+				t.Fatalf("integrity_check: %q: %v", integrity, err)
+			}
+			for _, pattern := range []string{".br-wal-index-*", ".br_recovery/schema-migrations/*"} {
+				matches, err := filepath.Glob(filepath.Join(beadsDir, pattern))
+				if err != nil || len(matches) != 0 {
+					t.Fatalf("unexpected recovery %s: %v: %v", pattern, matches, err)
+				}
+			}
+		})
 	}
 }
 

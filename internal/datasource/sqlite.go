@@ -59,6 +59,9 @@ func NewSQLiteReader(source DataSource) (*SQLiteReader, error) {
 func sqliteReadOnlyDSN(path string) string {
 	query := url.Values{}
 	query.Set("mode", "ro")
+	// Read-only SQLite still maintains the shared WAL index and reader locks
+	// (br GH#555). Do not use immutable=1 or restore -shm bytes: the tracker
+	// remains live, and WAL commits and concurrent readers must stay visible.
 	// SAFETY: SQLite PRAGMAs are connection-local. database/sql may open new
 	// pooled connections after NewSQLiteReader returns, so configuring one
 	// borrowed connection with db.Exec does not configure the pool. modernc's

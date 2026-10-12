@@ -2,14 +2,125 @@ package main_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/x/ansi"
 )
+
+// GH#555: keep the real interactive bv process alive while br repeatedly
+// reads and writes the same SQLite family. The datasource unit regression
+// additionally pins a SQLite transaction and checks WAL snapshot freshness.
+func TestInteractiveSQLiteSessionWithBeadsRust(t *testing.T) {
+	br := os.Getenv("BR_TEST_BIN")
+	if br == "" {
+		t.Skip("set BR_TEST_BIN to run the cross-engine TUI regression")
+	}
+	skipIfNoScript(t)
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	db := filepath.Join(beadsDir, "beads.db")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	runBR := func(args ...string) {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, br, append([]string{"--db", db, "--no-auto-import", "--no-auto-flush"}, args...)...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("br %v: %v\n%s", args, err, out)
+		}
+	}
+	runBR("init", "--prefix", "tui")
+	runBR("create", "interactive WAL seed")
+	bv := buildBvBinary(t)
+	quote := func(value string) string {
+		return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+	}
+	// A script-created PTY otherwise inherits zero rows/columns on headless
+	// workers; bv then renders only an ellipsis, not the loaded dataset.
+	launch := "stty cols 120 rows 40; exec " + quote(bv) + " --db " + quote(db)
+	cmd := exec.CommandContext(ctx, "script", "-q", "/dev/null", "sh", "-c", launch)
+	if runtime.GOOS == "linux" {
+		cmd = exec.CommandContext(ctx, "script", "-q", "-e", "-f", "-c", launch, "/dev/null")
+	}
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "BEADS_DIR="+beadsDir, "TERM=xterm-256color", "BV_NO_BROWSER=1", "BV_TUI_AUTOCLOSE_MS=0")
+	input, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	outputPath := filepath.Join(dir, "tui-output")
+	output, err := os.Create(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	cmd.Stdout, cmd.Stderr = output, output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		out, err := os.ReadFile(outputPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(ansi.Strip(string(out)), "interactive WAL seed") {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("TUI exited before loading SQLite: %v\n%s", err, out)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("TUI did not render the database issue: %s", out)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for i := 0; i < 8; i++ {
+		runBR("list", "--json")
+		runBR("create", fmt.Sprintf("while bv is interactive %d", i))
+		select {
+		case err := <-done:
+			t.Fatalf("interactive session exited during writes: %v", err)
+		default:
+		}
+	}
+	if _, err := input.Write([]byte("q")); err != nil {
+		t.Fatal(err)
+	}
+	if err := input.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("TUI close: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("interactive session did not exit")
+	}
+	runBR("list", "--json")
+	for _, pattern := range []string{".br-wal-index-*", ".br_recovery/schema-migrations/*"} {
+		matches, err := filepath.Glob(filepath.Join(beadsDir, pattern))
+		if err != nil || len(matches) != 0 {
+			t.Fatalf("unexpected recovery %s: %v: %v", pattern, matches, err)
+		}
+	}
+}
 
 // Sidecar files that live beside issues.jsonl and used to hijack loading when
 // fresher: br's base snapshots, a leftover legacy export, bv's own sprints.jsonl
