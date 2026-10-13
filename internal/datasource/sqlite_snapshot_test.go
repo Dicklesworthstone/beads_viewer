@@ -24,10 +24,11 @@ import (
 // The wrapper deliberately uses database/sql's standard prepared-statement
 // fallback, so every statement and transaction still executes in modernc.
 type snapshotInterleaveDriver struct {
-	inner driver.Driver
-	onRow func() error
-	once  sync.Once
-	err   error
+	inner      driver.Driver
+	onRow      func() error
+	prepareErr func(string) error
+	once       sync.Once
+	err        error
 }
 
 func (d *snapshotInterleaveDriver) Open(name string) (driver.Conn, error) {
@@ -44,6 +45,11 @@ type snapshotInterleaveConn struct {
 }
 
 func (c *snapshotInterleaveConn) Prepare(query string) (driver.Stmt, error) {
+	if c.owner.prepareErr != nil {
+		if err := c.owner.prepareErr(query); err != nil {
+			return nil, err
+		}
+	}
 	stmt, err := c.Conn.Prepare(query)
 	if err != nil {
 		return nil, err
@@ -84,8 +90,13 @@ var snapshotDriverSequence atomic.Uint64
 
 func snapshotReaderWithInterleave(t *testing.T, path string, onRow func() error) *SQLiteReader {
 	t.Helper()
+	return snapshotReaderUsingDriver(t, path, &snapshotInterleaveDriver{inner: &sqlite.Driver{}, onRow: onRow})
+}
+
+func snapshotReaderUsingDriver(t *testing.T, path string, d *snapshotInterleaveDriver) *SQLiteReader {
+	t.Helper()
 	name := fmt.Sprintf("bv-snapshot-interleave-%d", snapshotDriverSequence.Add(1))
-	sql.Register(name, &snapshotInterleaveDriver{inner: &sqlite.Driver{}, onRow: onRow})
+	sql.Register(name, d)
 	db, err := sql.Open(name, sqliteReadOnlyDSN(path))
 	if err != nil {
 		t.Fatal(err)
@@ -242,4 +253,161 @@ func TestSQLiteIssueSnapshotReleasesFailedRead(t *testing.T) {
 		t.Fatal("unreadable source was accepted")
 	}
 	assertSnapshotReaderReleased(t, reader, writer)
+}
+
+// br has due_at and rich issue metadata without all of the legacy viewer's
+// columns. Previously one absent column selected a fallback that silently
+// dropped deadlines, estimates, design, acceptance criteria and notes.
+func TestSQLiteIssueSnapshotPreservesNativeBrDetails(t *testing.T) {
+	for _, dateType := range []string{"TEXT", "DATETIME"} {
+		t.Run(dateType, func(t *testing.T) {
+			path, writer := snapshotFixture(t, false)
+			for _, definition := range []string{
+				"description TEXT", "design TEXT", "acceptance_criteria TEXT", "notes TEXT",
+				"assignee TEXT", "estimated_minutes INTEGER", "external_ref TEXT", "source_repo TEXT",
+				"created_at " + dateType, "updated_at " + dateType, "closed_at " + dateType,
+				"due_at " + dateType, "defer_until " + dateType,
+				"compaction_level INTEGER", "compacted_at " + dateType,
+				"compacted_at_commit TEXT", "original_size INTEGER",
+			} {
+				if _, err := writer.Exec("ALTER TABLE issues ADD COLUMN " + definition); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := writer.Exec(`UPDATE issues SET
+ description='Detailed task', design='Design evidence', acceptance_criteria='Acceptance evidence',
+ notes='Operator notes', assignee='worker', estimated_minutes=90, external_ref='external-1', source_repo='local',
+ created_at='2026-01-01T01:02:03Z', updated_at='2026-01-02T01:02:03Z', closed_at='2026-01-02T01:02:03Z',
+ due_at='2026-02-01T01:02:03Z', defer_until='2026-01-03T01:02:03Z', status='closed',
+ compaction_level=2, compacted_at='2026-01-02T01:02:03Z', compacted_at_commit='abc123', original_size=400
+ WHERE id='a-job'`); err != nil {
+				t.Fatal(err)
+			}
+			reader, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			issue, err := reader.GetIssueByID("a-job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if issue.Description != "Detailed task" || issue.Design != "Design evidence" || issue.AcceptanceCriteria != "Acceptance evidence" || issue.Notes != "Operator notes" || issue.Assignee != "worker" || issue.SourceRepo != "local" {
+				t.Fatalf("native br details were dropped: %+v", issue)
+			}
+			if issue.EstimatedMinutes == nil || *issue.EstimatedMinutes != 90 || issue.ExternalRef == nil || *issue.ExternalRef != "external-1" || issue.CompactionLevel != 2 || issue.OriginalSize != 400 || issue.CompactedAtCommit == nil || *issue.CompactedAtCommit != "abc123" {
+				t.Fatalf("optional structured details were dropped: %+v", issue)
+			}
+			for _, field := range []struct {
+				name string
+				got  *time.Time
+				want string
+			}{
+				{"created_at", &issue.CreatedAt, "2026-01-01T01:02:03Z"},
+				{"updated_at", &issue.UpdatedAt, "2026-01-02T01:02:03Z"},
+				{"closed_at", issue.ClosedAt, "2026-01-02T01:02:03Z"},
+				{"due_at", issue.DueDate, "2026-02-01T01:02:03Z"},
+				{"defer_until", issue.DeferUntil, "2026-01-03T01:02:03Z"},
+				{"compacted_at", issue.CompactedAt, "2026-01-02T01:02:03Z"},
+			} {
+				if field.got == nil || field.got.UTC().Format(time.RFC3339) != field.want {
+					t.Fatalf("%s: got %v, want %s", field.name, field.got, field.want)
+				}
+			}
+			if report := reader.LoadReport(); report.WarningCount != 0 || report.Valid != 3 {
+				t.Fatalf("native schema lost read authority: %+v", report)
+			}
+			assertSnapshotReaderReleased(t, reader, writer)
+		})
+	}
+}
+
+func TestSQLiteIssueSnapshotDeadlineColumnAuthority(t *testing.T) {
+	path, writer := snapshotFixture(t, false)
+	if _, err := writer.Exec(`ALTER TABLE issues ADD COLUMN due_date TEXT;
+UPDATE issues SET due_date='2026-02-01T00:00:00Z' WHERE id='a-job'`); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	for _, tc := range []struct {
+		change string
+		want   string
+		errors int
+	}{
+		{"", "2026-02-01T00:00:00Z", 0},
+		{"ALTER TABLE issues ADD COLUMN due_at TEXT", "", 0},
+		{"UPDATE issues SET due_at='bad-date' WHERE id='a-job'", "", 1},
+		{"UPDATE issues SET due_at='2026-03-01T00:00:00Z' WHERE id='a-job'", "2026-03-01T00:00:00Z", 0},
+	} {
+		if tc.change != "" {
+			if _, err := writer.Exec(tc.change); err != nil {
+				t.Fatal(err)
+			}
+		}
+		issue, err := reader.GetIssueByID("a-job")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := ""
+		if issue.DueDate != nil {
+			got = issue.DueDate.UTC().Format(time.RFC3339)
+		}
+		if got != tc.want || reader.LoadReport().ReadErrors != tc.errors {
+			t.Fatalf("deadline after %q: got %q, want %q; report=%+v", tc.change, got, tc.want, reader.LoadReport())
+		}
+		assertSnapshotReaderReleased(t, reader, writer)
+	}
+}
+
+func TestSQLiteSchemaReadFailureIsNotMissingOptionalColumns(t *testing.T) {
+	path, writer := snapshotFixture(t, false)
+	injected := errors.New("injected schema read failure")
+	reader := snapshotReaderUsingDriver(t, path, &snapshotInterleaveDriver{
+		inner: &sqlite.Driver{},
+		onRow: func() error { return nil },
+		prepareErr: func(query string) error {
+			if query == "PRAGMA table_info(issues)" {
+				return injected
+			}
+			return nil
+		},
+	})
+	if issues, err := reader.LoadIssueAuthority(); !errors.Is(err, injected) || len(issues) != 0 {
+		t.Fatalf("schema read failure became an incomplete successful load: %+v, %v", issues, err)
+	}
+	if _, err := reader.CountIssues(); !errors.Is(err, injected) {
+		t.Fatalf("count silently ignored schema failure: %v", err)
+	}
+	if _, err := reader.GetLastModified(); !errors.Is(err, injected) {
+		t.Fatalf("timestamp silently ignored schema failure: %v", err)
+	}
+	assertSnapshotReaderReleased(t, reader, writer)
+}
+
+func TestSQLiteIssueSnapshotReportsMalformedTableLabels(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		t.Run(fmt.Sprintf("full_schema_%t", full), func(t *testing.T) {
+			path, writer := snapshotFixture(t, full)
+			if _, err := writer.Exec("INSERT INTO labels VALUES ('a-job', NULL)"); err != nil {
+				t.Fatal(err)
+			}
+			reader, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: path})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			issue, err := reader.GetIssueByID("a-job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(issue.Labels) != 1 || issue.Labels[0] != "before" || reader.LoadReport().ReadErrors != 1 {
+				t.Fatalf("malformed label disguised as complete authority: %+v; report=%+v", issue.Labels, reader.LoadReport())
+			}
+			assertSnapshotReaderReleased(t, reader, writer)
+		})
+	}
 }

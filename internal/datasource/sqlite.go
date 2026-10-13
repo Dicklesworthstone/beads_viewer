@@ -151,35 +151,11 @@ func (r *SQLiteReader) Close() error {
 	return nil
 }
 
-// hasLabelsColumn checks whether the issues table has a "labels" column.
-// beads-rs (br) stores labels in a separate table instead.
-func (r *sqliteReadSession) hasLabelsColumn() bool {
-	rows, err := r.db.Query("PRAGMA table_info(issues)")
-	if err != nil {
-		return false
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var cid int
-		var name, colType string
-		var notNull, pk int
-		var dflt interface{}
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
-			continue
-		}
-		if strings.EqualFold(name, "labels") {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *sqliteReadSession) issuesColumns() map[string]bool {
+func (r *sqliteReadSession) issuesColumns() (map[string]bool, error) {
 	return r.tableColumns("issues")
 }
 
-func (r *sqliteReadSession) tableColumns(table string) map[string]bool {
+func (r *sqliteReadSession) tableColumns(table string) (map[string]bool, error) {
 	var query string
 	switch table {
 	case "dependencies":
@@ -187,12 +163,12 @@ func (r *sqliteReadSession) tableColumns(table string) map[string]bool {
 	case "issues":
 		query = "PRAGMA table_info(issues)"
 	default:
-		return map[string]bool{}
+		return nil, fmt.Errorf("unsupported schema table %q", table)
 	}
 
 	rows, err := r.db.Query(query)
 	if err != nil {
-		return map[string]bool{}
+		return nil, fmt.Errorf("inspecting %s columns: %w", table, err)
 	}
 	defer rows.Close()
 
@@ -203,19 +179,14 @@ func (r *sqliteReadSession) tableColumns(table string) map[string]bool {
 		var notNull, pk int
 		var dflt interface{}
 		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
-			continue
+			return nil, fmt.Errorf("reading %s column: %w", table, err)
 		}
 		columns[strings.ToLower(name)] = true
 	}
-	return columns
-}
-
-// hasLabelsTable checks whether a separate "labels" table exists.
-// beads-rs (br) databases use this schema instead of a JSON column on issues.
-func (r *sqliteReadSession) hasLabelsTable() bool {
-	var name string
-	err := r.db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='labels'").Scan(&name)
-	return err == nil && name == "labels"
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating %s columns: %w", table, err)
+	}
+	return columns, nil
 }
 
 // LoadIssues reads all issues from the database
@@ -300,6 +271,10 @@ func (r *SQLiteReader) readIssueSnapshot(report *LoadReport) ([]model.Issue, err
 }
 
 func (r *sqliteReadSession) loadIssueAuthority(report *LoadReport) ([]model.Issue, error) {
+	columns, err := r.issuesColumns()
+	if err != nil {
+		return nil, err
+	}
 	dependencyTypeExpr, dependencyErr := r.dependencyTypeExpr()
 	if dependencyErr != nil {
 		report.ReadErrors++
@@ -317,40 +292,49 @@ func (r *sqliteReadSession) loadIssueAuthority(report *LoadReport) ([]model.Issu
 		}
 		*table.destination = exists
 	}
-	// Detect schema: beads-rs (br) databases store labels in a separate
-	// "labels" table rather than a JSON column on "issues". We substitute
-	// a subquery so that labels are loaded transparently.
-	labelsExpr := "i.labels"
-	if !r.hasLabelsColumn() && schema.labelsTable {
-		labelsExpr = "(SELECT json_group_array(label) FROM labels WHERE issue_id = i.id)"
+	// Select every available field independently. A missing optional column
+	// must not downgrade the entire issue to a reduced, lossy fallback query.
+	// All identifiers below are hard-coded, never interpolated from schema data.
+	expr := func(name, fallback string) string {
+		if columns[name] {
+			return "i." + name
+		}
+		return fallback
 	}
-
-	// defer_until was added to the beads schema after this query was written;
-	// older databases lack the column, and selecting a missing column would
-	// fail the whole query (and silently downgrade to loadIssuesSimple). Probe
-	// the schema once and substitute NULL when absent.
-	deferUntilExpr := "NULL"
-	if r.issuesColumns()["defer_until"] {
-		deferUntilExpr = "i.defer_until"
+	coalesceExpr := func(name, fallback string) string {
+		if columns[name] {
+			return fmt.Sprintf("COALESCE(i.%s, %s)", name, fallback)
+		}
+		return fallback
 	}
-
-	// Query all source records, including tombstones. Use table alias "i" to avoid
-	// column ambiguity when a labels subquery references issue_id.
-	query := fmt.Sprintf(`
-		SELECT
-			i.id, i.title, i.description, i.status, i.priority, i.issue_type,
-			i.assignee, i.estimated_minutes, i.created_at, i.updated_at,
-			i.due_date, %s, i.closed_at, i.external_ref, i.compaction_level,
-			i.compacted_at, i.compacted_at_commit, i.original_size,
-			%s, i.design, i.acceptance_criteria, i.notes, i.source_repo, i.tombstone
-		FROM issues i
-		ORDER BY i.updated_at DESC
-	`, deferUntilExpr, labelsExpr)
+	// br's native deadline is due_at; older viewer/Go snapshots use due_date.
+	// A present due_at column is authoritative even when this row is NULL.
+	dueField := "due_date"
+	if columns["due_at"] {
+		dueField = "due_at"
+	}
+	fields := []string{
+		"i.id", "i.title", expr("description", "NULL"), "i.status",
+		coalesceExpr("priority", "3"), coalesceExpr("issue_type", "'task'"),
+		expr("assignee", "NULL"), expr("estimated_minutes", "NULL"),
+		expr("created_at", "NULL"), expr("updated_at", "NULL"),
+		expr(dueField, "NULL"), expr("defer_until", "NULL"), expr("closed_at", "NULL"),
+		expr("external_ref", "NULL"), expr("compaction_level", "NULL"),
+		expr("compacted_at", "NULL"), expr("compacted_at_commit", "NULL"),
+		expr("original_size", "NULL"), expr("labels", "NULL"), expr("design", "NULL"),
+		expr("acceptance_criteria", "NULL"), expr("notes", "NULL"),
+		expr("source_repo", "NULL"), expr("tombstone", "NULL"),
+	}
+	orderBy := "i.id"
+	if columns["updated_at"] {
+		orderBy = "i.updated_at DESC, i.id"
+	}
+	// Include tombstones: dependencies must retain their source authority.
+	query := "SELECT " + strings.Join(fields, ", ") + " FROM issues i ORDER BY " + orderBy
 
 	rows, err := r.db.Query(query)
 	if err != nil {
-		// Try simpler query if some columns don't exist
-		return r.loadIssuesSimple(report, schema)
+		return nil, fmt.Errorf("query failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -358,7 +342,9 @@ func (r *sqliteReadSession) loadIssueAuthority(report *LoadReport) ([]model.Issu
 	for rows.Next() {
 		var issue model.Issue
 		var estimatedMinutes, compactionLevel, originalSize sql.NullInt64
-		var createdAt, updatedAt, dueDate, deferUntil, closedAt, compactedAt sql.NullTime
+		// modernc returns time.Time for DATETIME and strings for TEXT or
+		// expressions. NullString accepts both, unlike NullTime on TEXT.
+		var createdAt, updatedAt, dueDate, deferUntil, closedAt, compactedAt sql.NullString
 		var description, assignee, externalRef, design, acceptanceCriteria, notes, sourceRepo, compactedAtCommit sql.NullString
 		var labelsJSON sql.NullString
 		var issueType string
@@ -392,24 +378,15 @@ func (r *sqliteReadSession) loadIssueAuthority(report *LoadReport) ([]model.Issu
 			v := int(estimatedMinutes.Int64)
 			issue.EstimatedMinutes = &v
 		}
-		if createdAt.Valid {
-			issue.CreatedAt = createdAt.Time
+		if value := sqliteIssueTime(createdAt, issue.ID, "created_at", report); value != nil {
+			issue.CreatedAt = *value
 		}
-		if updatedAt.Valid {
-			issue.UpdatedAt = updatedAt.Time
+		if value := sqliteIssueTime(updatedAt, issue.ID, "updated_at", report); value != nil {
+			issue.UpdatedAt = *value
 		}
-		if dueDate.Valid {
-			t := dueDate.Time
-			issue.DueDate = &t
-		}
-		if deferUntil.Valid {
-			t := deferUntil.Time
-			issue.DeferUntil = &t
-		}
-		if closedAt.Valid {
-			t := closedAt.Time
-			issue.ClosedAt = &t
-		}
+		issue.DueDate = sqliteIssueTime(dueDate, issue.ID, dueField, report)
+		issue.DeferUntil = sqliteIssueTime(deferUntil, issue.ID, "defer_until", report)
+		issue.ClosedAt = sqliteIssueTime(closedAt, issue.ID, "closed_at", report)
 		if externalRef.Valid {
 			s := externalRef.String
 			issue.ExternalRef = &s
@@ -417,10 +394,7 @@ func (r *sqliteReadSession) loadIssueAuthority(report *LoadReport) ([]model.Issu
 		if compactionLevel.Valid {
 			issue.CompactionLevel = int(compactionLevel.Int64)
 		}
-		if compactedAt.Valid {
-			t := compactedAt.Time
-			issue.CompactedAt = &t
-		}
+		issue.CompactedAt = sqliteIssueTime(compactedAt, issue.ID, "compacted_at", report)
 		if compactedAtCommit.Valid {
 			s := compactedAtCommit.String
 			issue.CompactedAtCommit = &s
@@ -445,6 +419,11 @@ func (r *sqliteReadSession) loadIssueAuthority(report *LoadReport) ([]model.Issu
 		if labelsJSON.Valid && labelsJSON.String != "" && labelsJSON.String != "null" {
 			issue.Labels = parseSQLiteLabels(labelsJSON.String, issue.ID, report)
 		}
+		// Read table labels as rows, not a JSON aggregate that can turn a
+		// malformed NULL label into an apparently valid empty string.
+		if schema.labelsTable && len(issue.Labels) == 0 {
+			issue.Labels = r.loadLabelsFromTable(issue.ID, report)
+		}
 
 		// Load dependencies for this issue
 		issue.Dependencies = r.loadDependencies(issue.ID, dependencyTypeExpr, report)
@@ -463,122 +442,16 @@ func (r *sqliteReadSession) loadIssueAuthority(report *LoadReport) ([]model.Issu
 	return issues, nil
 }
 
-// loadIssuesSimple is a fallback for databases with fewer columns
-func (r *sqliteReadSession) loadIssuesSimple(report *LoadReport, schema sqliteReadSchema) ([]model.Issue, error) {
-	columns := r.issuesColumns()
-	expr := func(name, fallback string) string {
-		if columns[name] {
-			return name
-		}
-		return fallback
+func sqliteIssueTime(raw sql.NullString, issueID, field string, report *LoadReport) *time.Time {
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return nil
 	}
-	coalesceExpr := func(name, fallback string) string {
-		if columns[name] {
-			return fmt.Sprintf("COALESCE(%s, %s)", name, fallback)
-		}
-		return fallback
+	if value, ok := parseSQLiteTime(raw.String); ok {
+		return &value
 	}
-	orderBy := "ORDER BY id"
-	if columns["updated_at"] {
-		orderBy = "ORDER BY updated_at DESC"
-	}
-	query := fmt.Sprintf(`
-		SELECT id, title, %s, status, %s, %s, %s, %s, %s, %s, %s, %s
-		FROM issues
-		%s
-	`,
-		expr("description", "NULL"),
-		coalesceExpr("priority", "3"),
-		coalesceExpr("issue_type", "'task'"),
-		expr("assignee", "NULL"),
-		expr("created_at", "NULL"),
-		expr("updated_at", "NULL"),
-		expr("defer_until", "NULL"),
-		expr("labels", "NULL"),
-		expr("tombstone", "NULL"),
-		orderBy,
-	)
-
-	rows, err := r.db.Query(query)
-	if err != nil {
-		return nil, fmt.Errorf("query failed: %w", err)
-	}
-	defer rows.Close()
-
-	var issues []model.Issue
-	for rows.Next() {
-		var issue model.Issue
-		var description, assignee sql.NullString
-		var createdAt, updatedAt, deferUntil sql.NullString
-		var labelsJSON sql.NullString
-		var issueType string
-		var tombstone sql.NullInt64
-
-		err := rows.Scan(
-			&issue.ID, &issue.Title, &description, &issue.Status, &issue.Priority, &issueType,
-			&assignee, &createdAt, &updatedAt, &deferUntil, &labelsJSON, &tombstone,
-		)
-		if err != nil {
-			report.Errors++
-			report.addWarning(fmt.Sprintf("reading issue row: %v", err))
-			continue
-		}
-		if tombstone.Valid && tombstone.Int64 != 0 {
-			issue.Status = model.StatusTombstone
-		}
-
-		if description.Valid {
-			issue.Description = description.String
-		}
-		issue.IssueType = model.IssueType(issueType)
-		if assignee.Valid {
-			issue.Assignee = assignee.String
-		}
-		if createdAt.Valid {
-			if t, ok := parseSQLiteTime(createdAt.String); ok {
-				issue.CreatedAt = t
-			} else if strings.TrimSpace(createdAt.String) != "" {
-				report.ReadErrors++
-				report.addWarning(fmt.Sprintf("issue %q has invalid created_at %q", issue.ID, createdAt.String))
-			}
-		}
-		if updatedAt.Valid {
-			if t, ok := parseSQLiteTime(updatedAt.String); ok {
-				issue.UpdatedAt = t
-			} else if strings.TrimSpace(updatedAt.String) != "" {
-				report.ReadErrors++
-				report.addWarning(fmt.Sprintf("issue %q has invalid updated_at %q", issue.ID, updatedAt.String))
-			}
-		}
-		if deferUntil.Valid {
-			if t, ok := parseSQLiteTime(deferUntil.String); ok {
-				issue.DeferUntil = &t
-			} else if strings.TrimSpace(deferUntil.String) != "" {
-				report.ReadErrors++
-				report.addWarning(fmt.Sprintf("issue %q has invalid defer_until %q", issue.ID, deferUntil.String))
-			}
-		}
-		if labelsJSON.Valid && labelsJSON.String != "" && labelsJSON.String != "null" {
-			issue.Labels = parseSQLiteLabels(labelsJSON.String, issue.ID, report)
-		}
-
-		// Load labels from separate table if present (beads-rs compatibility)
-		if schema.labelsTable && len(issue.Labels) == 0 {
-			issue.Labels = r.loadLabelsFromTable(issue.ID, report)
-		}
-
-		issue.Dependencies = r.loadDependencies(issue.ID, schema.dependencyType, report)
-		if schema.commentsTable {
-			issue.Comments = r.loadComments(issue.ID, report)
-		}
-
-		issues = append(issues, issue)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating issues: %w", err)
-	}
-
-	return issues, nil
+	report.ReadErrors++
+	report.addWarning(fmt.Sprintf("issue %q has invalid %s %q", issueID, field, raw.String))
+	return nil
 }
 
 // loadLabelsFromTable loads labels for an issue from the separate labels table
@@ -664,7 +537,10 @@ func (r *sqliteReadSession) dependencyTypeExpr() (string, error) {
 	if !exists {
 		return "", nil
 	}
-	columns := r.tableColumns("dependencies")
+	columns, err := r.tableColumns("dependencies")
+	if err != nil {
+		return "", err
+	}
 	if !columns["issue_id"] || !columns["depends_on_id"] {
 		return "", fmt.Errorf("dependency table is missing issue_id or depends_on_id")
 	}
@@ -733,9 +609,13 @@ func (r *SQLiteReader) CountIssues() (int, error) {
 	}
 	defer tx.Rollback()
 	session := sqliteReadSession{db: tx}
+	columns, err := session.issuesColumns()
+	if err != nil {
+		return 0, err
+	}
 	var count int
 	query := "SELECT COUNT(*) FROM issues WHERE status != 'tombstone'"
-	if session.issuesColumns()["tombstone"] {
+	if columns["tombstone"] {
 		query += " AND (tombstone IS NULL OR tombstone = 0)"
 	}
 	if err := tx.QueryRow(query).Scan(&count); err != nil {
@@ -771,7 +651,11 @@ func (r *SQLiteReader) GetLastModified() (time.Time, error) {
 	}
 	defer tx.Rollback()
 	session := sqliteReadSession{db: tx}
-	if !session.issuesColumns()["updated_at"] {
+	columns, err := session.issuesColumns()
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !columns["updated_at"] {
 		return time.Time{}, nil
 	}
 	var raw sql.NullString
