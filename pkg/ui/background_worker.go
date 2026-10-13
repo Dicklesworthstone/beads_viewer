@@ -1069,7 +1069,9 @@ func (w *BackgroundWorker) processLoop(loopCtx context.Context, done chan struct
 			return
 
 		case <-heartbeatTicker.C:
-			w.recordHeartbeat(time.Now())
+			now := time.Now()
+			w.recordHeartbeat(now)
+			w.retryFailedLoad(loopCtx, now)
 
 		case <-wch.Changed():
 			w.noteFileChange(time.Now())
@@ -1086,7 +1088,19 @@ func (w *BackgroundWorker) process() {
 // processWithSnapshotBuilder keeps the generation-fenced completion path
 // independently testable without relying on filesystem timing.
 func (w *BackgroundWorker) processWithSnapshotBuilder(build func(bool) snapshotBuildResult) {
+	w.processSnapshotAttempt(build, nil)
+}
+
+// Automatic retries must be admitted atomically with entering processing.
+// A stopped/replaced loop or a newer result invalidates a queued retry.
+func (w *BackgroundWorker) processSnapshotAttempt(build func(bool) snapshotBuildResult, retry *loadRetryAttempt) {
 	w.mu.Lock()
+	if retry != nil {
+		if !retry.validLocked(w) {
+			w.mu.Unlock()
+			return
+		}
+	}
 	w.processScheduled = false
 	if w.state != WorkerIdle {
 		// Already stopped or processing
@@ -1099,7 +1113,10 @@ func (w *BackgroundWorker) processWithSnapshotBuilder(build func(bool) snapshotB
 	}
 	w.state = WorkerProcessing
 	w.dirty = false
-	forceNext := w.forceNext
+	// Recovery must reach the UI even when the data hash did not change.
+	// This applies to file events and manual requests too: either can beat
+	// the heartbeat retry and would otherwise silently clear lastError.
+	forceNext := w.forceNext || (w.lastError != nil && w.lastError.Phase == "load")
 	w.forceNext = false
 	now := time.Now()
 	w.processingStart = now
@@ -1850,7 +1867,7 @@ type SnapshotReadyMsg struct {
 // SnapshotErrorMsg is sent to the UI when snapshot building fails.
 type SnapshotErrorMsg struct {
 	Err              error
-	Recoverable      bool // True if we expect to recover on next file change
+	Recoverable      bool // True if a later refresh may recover; load errors are retried
 	WorkerGeneration uint64
 }
 
