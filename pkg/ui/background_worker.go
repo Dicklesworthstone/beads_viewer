@@ -1993,7 +1993,37 @@ func (w *BackgroundWorker) workerMessageIsCurrent(msg tea.Msg) bool {
 	generation, tagged := workerMessageGeneration(msg)
 	// Generation zero denotes a manually constructed or non-worker message and
 	// preserves direct Model.Update/test compatibility.
-	return !tagged || generation == 0 || generation == w.Generation()
+	if !tagged || generation == 0 {
+		return true
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if generation != w.generation {
+		return false
+	}
+	// A build returns to Idle before sending its result. Another build can
+	// finish and enqueue a newer result while the first sender is delayed.
+	// Reject that stale sender BEFORE it can evict the one-slot mailbox's
+	// newest message. Hash equality is insufficient for forced refreshes.
+	publishedVersion := w.metrics.snapshotVersion.Load()
+	switch typed := msg.(type) {
+	case SnapshotReadyMsg:
+		// Before the first published build, direct mailbox users have no
+		// snapshot watermark. Preserve those and explicitly unversioned messages.
+		return typed.SnapshotVer == 0 || publishedVersion == 0 ||
+			(typed.Snapshot != nil && typed.Snapshot == w.snapshot && typed.SnapshotVer == publishedVersion)
+	case Phase2UpdateMsg:
+		return typed.SnapshotVer == 0 || publishedVersion == 0 ||
+			(typed.Snapshot != nil && typed.Snapshot == w.snapshot && typed.SnapshotVer == publishedVersion)
+	case SnapshotErrorMsg:
+		// Late load/analysis failures must not replace a newer diagnosis or
+		// reintroduce an error after successful recovery. Terminal signals
+		// and non-worker errors retain their existing delivery semantics.
+		if failure, ok := typed.Err.(*WorkerError); ok && typed.Recoverable {
+			return failure != nil && failure == w.lastError
+		}
+	}
+	return true
 }
 
 func (w *BackgroundWorker) releaseDroppedMessage(msg tea.Msg) {
