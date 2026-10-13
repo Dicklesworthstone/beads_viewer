@@ -1,16 +1,20 @@
 package ui
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	_ "modernc.org/sqlite"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/watcher"
 )
@@ -358,5 +362,148 @@ func TestBackgroundWorkerEventRecoversSameHashBeforeHeartbeat(t *testing.T) {
 		case <-deadline.C:
 			t.Fatal("event recovery silently cleared the load failure without notifying the UI")
 		}
+	}
+}
+
+// Exercise a real SQLite lock, not a synthetic WorkerError. The file watcher
+// never starts: releasing contention must restore the live WAL snapshot via
+// the heartbeat alone, without another file event or a JSONL fallback.
+func TestBackgroundWorkerHeartbeatRecoversSQLiteAfterLockRelease(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "beads.db")
+	t.Setenv("BEADS_DIR", dir)
+	t.Setenv("BEADS_DB", path)
+	t.Setenv("BD_DB", path)
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	writer.SetMaxOpenConns(1)
+	const title = "WAL-only load retry sentinel"
+	if _, err := writer.Exec(`PRAGMA journal_mode=WAL;
+PRAGMA wal_autocheckpoint=0;
+CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, status TEXT, priority INTEGER, issue_type TEXT);
+INSERT INTO issues VALUES ('wal-retry-1', 'WAL-only load retry sentinel', 'open', 2, 'task');`); err != nil {
+		t.Fatal(err)
+	}
+	w := loadRetryWorker(t)
+	w.beadsPath = path
+	w.watcher, err = watcher.NewWatcher(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.process()
+	old := w.GetSnapshot()
+	if old == nil || len(old.Issues) != 1 || old.Issues[0].Title != title {
+		t.Fatal("initial live SQLite snapshot was not loaded")
+	}
+	protected := func() [2][]byte {
+		t.Helper()
+		var result [2][]byte
+		for i, suffix := range []string{"", "-wal"} {
+			var err error
+			result[i], err = os.ReadFile(path + suffix)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		return result
+	}
+	before := protected()
+	if len(before[1]) <= 32 || bytes.Contains(before[0], []byte(title)) || !bytes.Contains(before[1], []byte(title)) {
+		t.Fatal("fixture must retain the committed issue only in WAL, not the main file")
+	}
+	unchanged := func(stage string) {
+		t.Helper()
+		after := protected()
+		if !bytes.Equal(before[0], after[0]) || !bytes.Equal(before[1], after[1]) {
+			t.Fatalf("%s changed protected main/WAL bytes", stage)
+		}
+	}
+	if _, err := writer.Exec("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;"); err != nil {
+		t.Fatal(err)
+	}
+	// Use the production reader's normal busy timeout. Both the count probe
+	// and the load may time out; the accepted error must be a real load error.
+	w.process()
+	failure := w.LastError()
+	if failure == nil || failure.Phase != "load" ||
+		(!strings.Contains(strings.ToLower(failure.Error()), "locked") && !strings.Contains(strings.ToLower(failure.Error()), "busy")) {
+		t.Fatalf("SQLite contention did not produce a real load failure: %v", failure)
+	}
+	if w.GetSnapshot() != old || w.LastHash() != old.DataHash {
+		t.Fatal("failed SQLite read replaced the last usable snapshot")
+	}
+	unchanged("failed load")
+	if _, err := writer.Exec("PRAGMA locking_mode=NORMAL"); err != nil {
+		t.Fatal(err)
+	}
+	// The pragma alone does not release a retained EXCLUSIVE lock. A finished
+	// read on this same connection releases it without changing main/WAL bytes.
+	var count int
+	if err := writer.QueryRow("SELECT count(*) FROM issues").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("releasing SQLite lock: count=%d, %v", count, err)
+	}
+	unchanged("lock release")
+	// Backoff boundaries have a separate exact-clock test. Age this genuine
+	// accepted error to avoid another five-second sleep; do not trigger a read.
+	w.mu.Lock()
+	w.lastError.Time = time.Now().Add(-time.Minute)
+	w.mu.Unlock()
+	for len(w.msgCh) != 0 {
+		<-w.msgCh
+	}
+	done := make(chan struct{})
+	go w.processLoop(w.loopCtx, done)
+	defer func() {
+		w.loopCancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("SQLite retry loop failed to stop")
+		}
+	}()
+	waitForSnapshot := func() *DataSnapshot {
+		t.Helper()
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case msg := <-w.msgCh:
+				if ready, ok := msg.(SnapshotReadyMsg); ok {
+					return ready.Snapshot
+				}
+			case <-timer.C:
+				t.Fatalf("SQLite retry did not publish a snapshot: %v", w.LastError())
+			}
+		}
+	}
+	fresh := waitForSnapshot()
+	if fresh == nil || fresh == old || fresh.DataHash != old.DataHash ||
+		len(fresh.Issues) != 1 || fresh.Issues[0].Title != title || w.LastError() != nil {
+		t.Fatal("heartbeat failed to republish the unchanged committed SQLite issue")
+	}
+	if w.watcher.IsStarted() {
+		t.Fatal("fixture accidentally enabled filesystem notifications")
+	}
+	unchanged("heartbeat recovery")
+	// Later writes must remain visible through the same worker. This explicit
+	// refresh happens only AFTER the missing-event recovery has been proved.
+	if _, err := writer.Exec("INSERT INTO issues VALUES ('wal-retry-2', 'Later committed issue', 'open', 2, 'task')"); err != nil {
+		t.Fatal(err)
+	}
+	w.TriggerRefresh()
+	later := waitForSnapshot()
+	if later == nil || len(later.Issues) != 2 || later.DataHash == fresh.DataHash {
+		t.Fatal("subsequent SQLite commit was not visible after recovery")
+	}
+	var integrity string
+	if err := writer.QueryRow("PRAGMA integrity_check").Scan(&integrity); err != nil || integrity != "ok" {
+		t.Fatalf("integrity after recovery: %q, %v", integrity, err)
+	}
+	var busy, frames, checkpointed int
+	if err := writer.QueryRow("PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &frames, &checkpointed); err != nil || busy != 0 {
+		t.Fatalf("recovered worker retained a reader mark: busy=%d frames=%d backfill=%d, %v", busy, frames, checkpointed, err)
 	}
 }
