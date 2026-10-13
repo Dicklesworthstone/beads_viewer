@@ -17,9 +17,10 @@ const DefaultPollInterval = 2 * time.Second
 
 // Common errors.
 var (
-	ErrFileRemoved    = errors.New("watched file was removed")
-	ErrPermission     = errors.New("permission denied")
-	ErrAlreadyStarted = errors.New("watcher already started")
+	ErrFileRemoved      = errors.New("watched file was removed")
+	ErrPermission       = errors.New("permission denied")
+	ErrAlreadyStarted   = errors.New("watcher already started")
+	ErrWatchUnavailable = errors.New("file notification watch lost; using polling")
 )
 
 var stoppedWatcherDone = func() <-chan struct{} {
@@ -349,6 +350,15 @@ func (w *Watcher) watchFsnotify(
 
 		case event, ok := <-events:
 			if !ok {
+				w.fallbackToPolling(ctx, runGeneration, ErrWatchUnavailable)
+				return
+			}
+			// fsnotify removes a directory watch when that directory moves or
+			// disappears, without necessarily closing the notification stream.
+			// Poll the selected path so recreating the directory can recover.
+			if filepath.Clean(event.Name) == filepath.Dir(w.path) &&
+				event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+				w.fallbackToPolling(ctx, runGeneration, ErrWatchUnavailable)
 				return
 			}
 
@@ -369,12 +379,45 @@ func (w *Watcher) watchFsnotify(
 			w.handleFsnotifyFileEvent(runGeneration, event.Op)
 
 		case err, ok := <-errors:
-			if !ok {
-				return
+			if !ok || err == nil {
+				err = ErrWatchUnavailable
 			}
-			w.reportError(runGeneration, err)
+			// An overflow means events have already been lost. Other backend
+			// errors likewise cannot promise continued delivery. Reporting an
+			// error alone leaves a live TUI stale until another event arrives.
+			w.fallbackToPolling(ctx, runGeneration, err)
+			return
 		}
 	}
+}
+
+// fallbackToPolling hands one active run from a failed notification backend to
+// polling. It neither stops the logical watcher nor replaces its Changed/Done
+// channels, so the TUI's existing consumer keeps receiving future updates.
+func (w *Watcher) fallbackToPolling(ctx context.Context, runGeneration uint64, cause error) {
+	w.mu.Lock()
+	if !w.runIsActiveLocked(runGeneration) || w.useFallback {
+		w.mu.Unlock()
+		return
+	}
+	w.useFallback = true
+	failed := w.fsWatcher
+	w.fsWatcher = nil
+	// Keep the existing fingerprints: re-baselining here could swallow a
+	// commit made between the lost event and the first poll. Only one caller
+	// can start this poller, and Stop cancels this same run's context.
+	go w.watchPolling(ctx, runGeneration)
+	w.mu.Unlock()
+
+	// Lost notifications demand a rescan even if mtime/size did not advance.
+	// Queue it and start polling BEFORE caller-controlled error reporting.
+	w.scheduleChange(runGeneration)
+	if failed != nil {
+		failed.Close()
+	}
+	// Close only the detached backend, never one installed by a later Start.
+	// No external callback runs under mu; OnError may call Stop or Start.
+	w.reportError(runGeneration, cause)
 }
 
 func (w *Watcher) handleFsnotifyFileEvent(runGeneration uint64, op fsnotify.Op) {
