@@ -300,7 +300,16 @@ func ValidateSourceWithOptions(source *DataSource, opts ValidationOptions) error
 	if err != nil {
 		source.Valid = false
 		source.ValidationError = err.Error()
-		if cacheable {
+		if source.Type == SourceTypeSQLite {
+			// A busy/recovering reader can fail without changing main or WAL
+			// bytes. Even an index-only repair leaves this cache key unchanged
+			// (br GH#555). Never freeze that failure into every later refresh.
+			// Invalidate any older success too, including after an uncached
+			// recheck. Do not key on -shm: ordinary reader marks change it.
+			validationCacheMu.Lock()
+			delete(validationCache, sourceValidationCacheKey(source))
+			validationCacheMu.Unlock()
+		} else if cacheable {
 			storeValidationCacheIfUnchanged(source, validationStart, haveValidationStart)
 		}
 		return err

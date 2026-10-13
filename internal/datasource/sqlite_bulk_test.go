@@ -4,12 +4,156 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"modernc.org/sqlite"
 )
+
+// A WAL validator can encounter contention without any main/WAL identity
+// change. Releasing that lock (or repairing only -shm) must allow the next
+// refresh to retry SQLite, not keep serving a cached failure or older JSONL.
+func TestSQLiteValidationRetriesAfterUnchangedWALLock(t *testing.T) {
+	path, writer := sqliteValidationLockFixture(t)
+	source := DataSource{Type: SourceTypeSQLite, Path: path}
+	before, err := sourceValidationIdentity(&source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateSource(&source); err == nil ||
+		(!strings.Contains(strings.ToLower(err.Error()), "locked") && !strings.Contains(strings.ToLower(err.Error()), "busy")) {
+		t.Fatalf("fixture must cause real SQLite contention: %v", err)
+	}
+	if source.Valid || source.ValidationError == "" {
+		t.Fatalf("failed read was reported valid: %+v", source)
+	}
+	releaseSQLiteValidationLock(t, writer)
+	after, err := sourceValidationIdentity(&source)
+	if err != nil || !before.equal(after) {
+		t.Fatalf("lock release must not invalidate the database/WAL cache identity: %v", err)
+	}
+	// Reuse the same process and path, just as an interactive reload does.
+	for i := 0; i < 3; i++ {
+		if err := ValidateSource(&source); err != nil || !source.Valid || source.ValidationError != "" || source.IssueCount != 1 {
+			t.Fatalf("refresh %d retained a failure after the lock was released: %+v, %v", i, source, err)
+		}
+	}
+	reader, err := NewSQLiteReader(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	issues, err := reader.LoadIssues()
+	if err != nil || len(issues) != 1 || issues[0].ID != "wal-only" {
+		t.Fatalf("retry lost the live WAL issue: %+v, %v", issues, err)
+	}
+	assertSnapshotReaderReleased(t, reader, writer)
+}
+
+// A custom, uncached validation may fail after an earlier default validation
+// succeeded. That failure must evict the older success, not just skip storing
+// a new negative entry, so the next default request actually validates again.
+func TestSQLiteValidationFailureEvictsPreviousVerdict(t *testing.T) {
+	path, writer := sqliteValidationLockFixture(t)
+	releaseSQLiteValidationLock(t, writer)
+	// Cover retained locks in rollback-journal mode as well as the WAL
+	// family above. No other connection is open while changing the mode.
+	if _, err := writer.Exec("PRAGMA journal_mode=DELETE"); err != nil {
+		t.Fatal(err)
+	}
+	source := DataSource{Type: SourceTypeSQLite, Path: path}
+	if err := ValidateSource(&source); err != nil {
+		t.Fatal(err)
+	}
+	if hit, err := lookupValidationCache(&source, DefaultValidationOptions()); !hit || err != nil {
+		t.Fatalf("fixture must cache a successful validation: hit=%t, %v", hit, err)
+	}
+	if _, err := writer.Exec("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;"); err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultValidationOptions()
+	opts.CountIssues = false // force a real read instead of the warm cache
+	if err := ValidateSourceWithOptions(&source, opts); err == nil {
+		t.Fatal("locked validation unexpectedly succeeded")
+	}
+	releaseSQLiteValidationLock(t, writer)
+	if hit, err := lookupValidationCache(&source, DefaultValidationOptions()); hit || err != nil {
+		t.Fatalf("failed validation retained an earlier verdict: hit=%t, %v", hit, err)
+	}
+	if err := ValidateSource(&source); err != nil || !source.Valid || source.IssueCount != 1 {
+		t.Fatalf("fresh validation after failed recheck: %+v, %v", source, err)
+	}
+}
+
+func sqliteValidationLockFixture(t *testing.T) (string, *sql.DB) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "beads.db")
+	writer, err := sql.Open("sqlite", sqliteFileDSN(path, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { writer.Close() })
+	writer.SetMaxOpenConns(1)
+	// Enter WAL in NORMAL mode first, so EXCLUSIVE can be released without
+	// closing/checkpointing the writer or changing the journal mode.
+	if _, err := writer.Exec(`PRAGMA journal_mode=WAL;
+PRAGMA wal_autocheckpoint=0;
+CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, status TEXT);
+INSERT INTO issues VALUES ('wal-only', 'Live issue absent from JSONL', 'open');
+PRAGMA locking_mode=EXCLUSIVE;
+BEGIN EXCLUSIVE;
+COMMIT;`); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(path + "-wal"); err != nil || info.Size() <= 32 {
+		t.Fatalf("fixture must retain committed WAL frames: %v", err)
+	}
+	return path, writer
+}
+
+func releaseSQLiteValidationLock(t *testing.T, writer *sql.DB) {
+	t.Helper()
+	if _, err := writer.Exec("PRAGMA locking_mode=NORMAL"); err != nil {
+		t.Fatal(err)
+	}
+	// SQLite does not release EXCLUSIVE just by changing the pragma. Finish
+	// a subsequent read on that same connection to release the retained lock.
+	var count int
+	if err := writer.QueryRow("SELECT count(*) FROM issues").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("release exclusive lock: count=%d, %v", count, err)
+	}
+}
+
+func TestSQLiteValidationDoesNotCacheCorruptionAsRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "beads.db")
+	if err := os.WriteFile(path, []byte("not a SQLite database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := DataSource{Type: SourceTypeSQLite, Path: path}
+	for i := 0; i < 2; i++ {
+		if err := ValidateSource(&source); err == nil || source.Valid {
+			t.Fatal("retry policy must not admit a corrupt database")
+		}
+		if hit, err := lookupValidationCache(&source, DefaultValidationOptions()); hit || err != nil {
+			t.Fatalf("SQLite failures must be retried, never cached: hit=%t, %v", hit, err)
+		}
+	}
+	// JSONL's content-derived failures remain cacheable; the policy change is
+	// specific to a SQLite family whose lock/index state is not in the key.
+	jsonlPath := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte("{bad json}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	jsonl := DataSource{Type: SourceTypeJSONLLocal, Path: jsonlPath}
+	if err := ValidateSource(&jsonl); err == nil {
+		t.Fatal("invalid JSONL unexpectedly validated")
+	}
+	if hit, err := lookupValidationCache(&jsonl, DefaultValidationOptions()); !hit || err == nil {
+		t.Fatalf("JSONL failure cache was lost: hit=%t, %v", hit, err)
+	}
+}
 
 // Count actual prepared statements, not elapsed time. The underlying driver
 // still executes every statement against SQLite, including BEGIN/COMMIT and
