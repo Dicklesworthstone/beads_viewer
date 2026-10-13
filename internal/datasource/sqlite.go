@@ -419,24 +419,39 @@ func (r *sqliteReadSession) loadIssueAuthority(report *LoadReport) ([]model.Issu
 		if labelsJSON.Valid && labelsJSON.String != "" && labelsJSON.String != "null" {
 			issue.Labels = parseSQLiteLabels(labelsJSON.String, issue.ID, report)
 		}
-		// Read table labels as rows, not a JSON aggregate that can turn a
-		// malformed NULL label into an apparently valid empty string.
-		if schema.labelsTable && len(issue.Labels) == 0 {
-			issue.Labels = r.loadLabelsFromTable(issue.ID, report)
-		}
-
-		// Load dependencies for this issue
-		issue.Dependencies = r.loadDependencies(issue.ID, dependencyTypeExpr, report)
-
-		// Load comments for this issue
-		if schema.commentsTable {
-			issue.Comments = r.loadComments(issue.ID, report)
-		}
-
 		issues = append(issues, issue)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating issues: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("closing issue rows: %w", err)
+	}
+
+	// Read each related table once, not once per issue. Besides avoiding N+1
+	// SQL work, this shortens the WAL reader lease that prevents checkpoints
+	// from completing. All queries still use this one transaction's snapshot.
+	// Keep every row for an ID until validation has rejected duplicates: an
+	// invalid first issue must not steal the valid duplicate's relationships.
+	byID := make(map[string][]int, len(issues))
+	labelsByID := make(map[string][]int)
+	for i := range issues {
+		id := issues[i].ID
+		byID[id] = append(byID[id], i)
+		if len(issues[i].Labels) == 0 {
+			labelsByID[id] = append(labelsByID[id], i)
+		}
+	}
+	if len(issues) != 0 {
+		if schema.labelsTable && len(labelsByID) != 0 {
+			r.loadLabelsFromTable(issues, labelsByID, report)
+		}
+		if schema.dependencyType != "" {
+			r.loadDependencies(issues, byID, schema.dependencyType, report)
+		}
+		if schema.commentsTable {
+			r.loadComments(issues, byID, report)
+		}
 	}
 
 	return issues, nil
@@ -454,71 +469,68 @@ func sqliteIssueTime(raw sql.NullString, issueID, field string, report *LoadRepo
 	return nil
 }
 
-// loadLabelsFromTable loads labels for an issue from the separate labels table
-// used by beads-rs (br) databases.
-func (r *sqliteReadSession) loadLabelsFromTable(issueID string, report *LoadReport) []string {
-	rows, err := r.db.Query("SELECT label FROM labels WHERE issue_id = ?", issueID)
+// loadLabelsFromTable streams table labels into issues without inline labels.
+// byID is fixed before loading, so a first label never suppresses later labels.
+func (r *sqliteReadSession) loadLabelsFromTable(issues []model.Issue, byID map[string][]int, report *LoadReport) {
+	rows, err := r.db.Query("SELECT issue_id, label FROM labels")
 	if err != nil {
 		report.ReadErrors++
-		report.addWarning(fmt.Sprintf("reading labels for %q: %v", issueID, err))
-		return []string{}
+		report.addWarning(fmt.Sprintf("reading labels: %v", err))
+		return
 	}
 	defer rows.Close()
 
-	var labels []string
 	for rows.Next() {
-		var label string
-		if err := rows.Scan(&label); err != nil {
+		var issueID, label string
+		if err := rows.Scan(&issueID, &label); err != nil {
 			report.ReadErrors++
 			report.addWarning(fmt.Sprintf("reading label for %q: %v", issueID, err))
 			continue
 		}
-		labels = append(labels, label)
+		for _, i := range byID[issueID] {
+			issues[i].Labels = append(issues[i].Labels, label)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		report.ReadErrors++
-		report.addWarning(fmt.Sprintf("iterating labels for %q: %v", issueID, err))
+		report.addWarning(fmt.Sprintf("iterating labels: %v", err))
 	}
-	return labels
 }
 
-// loadDependencies loads dependencies for an issue
-func (r *sqliteReadSession) loadDependencies(issueID, dependencyTypeExpr string, report *LoadReport) []*model.Dependency {
-	if dependencyTypeExpr == "" {
-		return []*model.Dependency{}
-	}
-	query := fmt.Sprintf(`SELECT depends_on_id, %s FROM dependencies WHERE issue_id = ?`, dependencyTypeExpr)
-	rows, err := r.db.Query(query, issueID)
+// loadDependencies keeps missing targets as edges; they must still block work.
+// Orphan source IDs do not create synthetic issues or unbounded side maps.
+func (r *sqliteReadSession) loadDependencies(issues []model.Issue, byID map[string][]int, dependencyTypeExpr string, report *LoadReport) {
+	query := fmt.Sprintf(`SELECT issue_id, depends_on_id, %s FROM dependencies`, dependencyTypeExpr)
+	rows, err := r.db.Query(query)
 	if err != nil {
 		report.ReadErrors++
-		report.addWarning(fmt.Sprintf("reading dependencies for %q: %v", issueID, err))
-		return []*model.Dependency{}
+		report.addWarning(fmt.Sprintf("reading dependencies: %v", err))
+		return
 	}
 	defer rows.Close()
 
-	var deps []*model.Dependency
 	for rows.Next() {
 		var dep model.Dependency
 		var depType string
-		if err := rows.Scan(&dep.DependsOnID, &depType); err != nil {
+		if err := rows.Scan(&dep.IssueID, &dep.DependsOnID, &depType); err != nil {
 			report.ReadErrors++
-			report.addWarning(fmt.Sprintf("reading dependency for %q: %v", issueID, err))
+			report.addWarning(fmt.Sprintf("reading dependency for %q: %v", dep.IssueID, err))
 			continue
 		}
-		dep.IssueID = issueID
 		dep.Type = model.DependencyType(depType)
 		if strings.TrimSpace(dep.DependsOnID) == "" || (dep.Type != "" && !dep.Type.IsValid()) {
 			report.ReadErrors++
-			report.addWarning(fmt.Sprintf("invalid dependency for %q: target %q, type %q", issueID, dep.DependsOnID, depType))
+			report.addWarning(fmt.Sprintf("invalid dependency for %q: target %q, type %q", dep.IssueID, dep.DependsOnID, depType))
 			continue
 		}
-		deps = append(deps, &dep)
+		for _, i := range byID[dep.IssueID] {
+			issues[i].Dependencies = append(issues[i].Dependencies, &dep)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		report.ReadErrors++
-		report.addWarning(fmt.Sprintf("iterating dependencies for %q: %v", issueID, err))
+		report.addWarning(fmt.Sprintf("iterating dependencies: %v", err))
 	}
-	return deps
 }
 
 func (r *sqliteReadSession) tableExists(name string) (bool, error) {
@@ -556,24 +568,23 @@ func (r *sqliteReadSession) dependencyTypeExpr() (string, error) {
 	}
 }
 
-// loadComments loads comments for an issue
-func (r *sqliteReadSession) loadComments(issueID string, report *LoadReport) []*model.Comment {
-	query := `SELECT id, author, text, created_at FROM comments WHERE issue_id = ? ORDER BY created_at`
-	rows, err := r.db.Query(query, issueID)
+// loadComments preserves per-issue chronological order in one table read.
+func (r *sqliteReadSession) loadComments(issues []model.Issue, byID map[string][]int, report *LoadReport) {
+	query := `SELECT issue_id, id, author, text, created_at FROM comments ORDER BY issue_id, created_at, id`
+	rows, err := r.db.Query(query)
 	if err != nil {
 		report.ReadErrors++
-		report.addWarning(fmt.Sprintf("reading comments for %q: %v", issueID, err))
-		return []*model.Comment{}
+		report.addWarning(fmt.Sprintf("reading comments: %v", err))
+		return
 	}
 	defer rows.Close()
 
-	var comments []*model.Comment
 	for rows.Next() {
 		var comment model.Comment
 		var createdAt sql.NullString
-		if err := rows.Scan(&comment.ID, &comment.Author, &comment.Text, &createdAt); err != nil {
+		if err := rows.Scan(&comment.IssueID, &comment.ID, &comment.Author, &comment.Text, &createdAt); err != nil {
 			report.ReadErrors++
-			report.addWarning(fmt.Sprintf("reading comment for %q: %v", issueID, err))
+			report.addWarning(fmt.Sprintf("reading comment for %q: %v", comment.IssueID, err))
 			continue
 		}
 		if createdAt.Valid {
@@ -581,14 +592,14 @@ func (r *sqliteReadSession) loadComments(issueID string, report *LoadReport) []*
 				comment.CreatedAt = t
 			}
 		}
-		comment.IssueID = issueID
-		comments = append(comments, &comment)
+		for _, i := range byID[comment.IssueID] {
+			issues[i].Comments = append(issues[i].Comments, &comment)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		report.ReadErrors++
-		report.addWarning(fmt.Sprintf("iterating comments for %q: %v", issueID, err))
+		report.addWarning(fmt.Sprintf("iterating comments: %v", err))
 	}
-	return comments
 }
 
 func parseSQLiteLabels(raw, issueID string, report *LoadReport) []string {
