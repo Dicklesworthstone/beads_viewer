@@ -1082,7 +1082,7 @@ func (w *BackgroundWorker) processLoop(loopCtx context.Context, done chan struct
 
 // process builds a new snapshot from the current file.
 func (w *BackgroundWorker) process() {
-	w.processWithSnapshotBuilder(w.buildSnapshotResult)
+	w.processSnapshotContext(w.buildSnapshotResultContext, nil)
 }
 
 // processWithSnapshotBuilder keeps the generation-fenced completion path
@@ -1094,6 +1094,14 @@ func (w *BackgroundWorker) processWithSnapshotBuilder(build func(bool) snapshotB
 // Automatic retries must be admitted atomically with entering processing.
 // A stopped/replaced loop or a newer result invalidates a queued retry.
 func (w *BackgroundWorker) processSnapshotAttempt(build func(bool) snapshotBuildResult, retry *loadRetryAttempt) {
+	w.processSnapshotContext(func(_ context.Context, force bool) snapshotBuildResult {
+		return build(force)
+	}, retry)
+}
+
+// Capture the read lifetime at admission, not inside a later goroutine: a
+// watchdog recovery may replace loopCtx before that goroutine gets to run.
+func (w *BackgroundWorker) processSnapshotContext(build func(context.Context, bool) snapshotBuildResult, retry *loadRetryAttempt) {
 	w.mu.Lock()
 	if retry != nil {
 		if !retry.validLocked(w) {
@@ -1122,6 +1130,8 @@ func (w *BackgroundWorker) processSnapshotAttempt(build func(bool) snapshotBuild
 	w.processingStart = now
 	w.lastHeartbeat = now
 	gen := w.generation
+	buildCtx, cancelBuild := w.buildContextLocked()
+	defer cancelBuild()
 	w.mu.Unlock()
 	w.logEvent(LogLevelDebug, "state_change", map[string]any{
 		"state": "processing",
@@ -1138,7 +1148,21 @@ func (w *BackgroundWorker) processSnapshotAttempt(build func(bool) snapshotBuild
 	// Load and build snapshot. Error publication is deliberately deferred until
 	// after the generation fence below: a timed-out build may continue after
 	// recovery has already started a replacement generation.
-	result := build(forceNext)
+	var result snapshotBuildResult
+	if err := buildCtx.Err(); err != nil {
+		result.err = &WorkerError{Phase: "load", Cause: err, Time: time.Now()}
+	} else {
+		result = build(buildCtx, forceNext)
+	}
+	if err := buildCtx.Err(); err != nil && result.err == nil {
+		// A computation that finished after its deadline is not a new usable
+		// snapshot. Load cancellations already carry Phase=load and retry;
+		// a timed-out analysis keeps the existing non-retrying error policy.
+		if result.snapshot != nil {
+			result.snapshot.releasePooledIssues()
+		}
+		result = snapshotBuildResult{err: &WorkerError{Phase: "analyze_phase1", Cause: err, Time: time.Now()}}
+	}
 	snapshot := result.snapshot
 
 	w.mu.Lock()
@@ -1448,6 +1472,14 @@ func (w *BackgroundWorker) buildSnapshot(forceNext bool) *DataSnapshot {
 // It is intentionally side-effect free with respect to worker error state and
 // UI messages: process owns those effects after its generation fence.
 func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResult {
+	w.mu.RLock()
+	ctx, cancel := w.buildContextLocked()
+	w.mu.RUnlock()
+	defer cancel()
+	return w.buildSnapshotResultContext(ctx, forceNext)
+}
+
+func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, forceNext bool) snapshotBuildResult {
 	if w.beadsPath == "" {
 		return snapshotBuildResult{}
 	}
@@ -1489,7 +1521,7 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 		countStart = time.Now()
 	}
 	countErr := w.safeCompute("count_lines", func() error {
-		n, err := countIssuesForReload(w.beadsPath)
+		n, err := countIssuesForReloadContext(ctx, w.beadsPath)
 		if err != nil {
 			return err
 		}
@@ -1534,7 +1566,7 @@ func (w *BackgroundWorker) buildSnapshotResult(forceNext bool) snapshotBuildResu
 				return i.Status != model.StatusClosed && i.Status != model.StatusTombstone
 			}
 		}
-		loaded, err = loadIssuesForReload(w.beadsPath, opts)
+		loaded, err = loadIssuesForReloadContext(ctx, w.beadsPath, opts)
 		if err == nil {
 			issues = loaded.Issues
 			pooledRefs = loaded.PoolRefs

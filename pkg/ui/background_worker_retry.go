@@ -52,6 +52,6 @@ func (a *loadRetryAttempt) validLocked(w *BackgroundWorker) bool {
 
 func (w *BackgroundWorker) retryFailedLoad(loopCtx context.Context, now time.Time) {
 	if attempt := w.reserveLoadRetry(loopCtx, now); attempt != nil {
-		go w.processSnapshotAttempt(w.buildSnapshotResult, attempt)
+		go w.processSnapshotContext(w.buildSnapshotResultContext, attempt)
 	}
 }
