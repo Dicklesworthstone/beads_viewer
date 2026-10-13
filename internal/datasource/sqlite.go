@@ -31,6 +31,14 @@ type sqliteReadSchema struct {
 	commentsTable  bool
 }
 
+// Every query that contributes to one issue graph must use the same WAL
+// snapshot. Keep the transaction on a separate, load-local receiver so a
+// helper cannot accidentally borrow a different connection from the pool.
+// The persistent SQLiteReader never retains a transaction between refreshes.
+type sqliteReadSession struct {
+	db *sql.Tx
+}
+
 // NewSQLiteReader opens a SQLite database for reading
 func NewSQLiteReader(source DataSource) (*SQLiteReader, error) {
 	if source.Type != SourceTypeSQLite {
@@ -145,7 +153,7 @@ func (r *SQLiteReader) Close() error {
 
 // hasLabelsColumn checks whether the issues table has a "labels" column.
 // beads-rs (br) stores labels in a separate table instead.
-func (r *SQLiteReader) hasLabelsColumn() bool {
+func (r *sqliteReadSession) hasLabelsColumn() bool {
 	rows, err := r.db.Query("PRAGMA table_info(issues)")
 	if err != nil {
 		return false
@@ -167,11 +175,11 @@ func (r *SQLiteReader) hasLabelsColumn() bool {
 	return false
 }
 
-func (r *SQLiteReader) issuesColumns() map[string]bool {
+func (r *sqliteReadSession) issuesColumns() map[string]bool {
 	return r.tableColumns("issues")
 }
 
-func (r *SQLiteReader) tableColumns(table string) map[string]bool {
+func (r *sqliteReadSession) tableColumns(table string) map[string]bool {
 	var query string
 	switch table {
 	case "dependencies":
@@ -204,7 +212,7 @@ func (r *SQLiteReader) tableColumns(table string) map[string]bool {
 
 // hasLabelsTable checks whether a separate "labels" table exists.
 // beads-rs (br) databases use this schema instead of a JSON column on issues.
-func (r *SQLiteReader) hasLabelsTable() bool {
+func (r *sqliteReadSession) hasLabelsTable() bool {
 	var name string
 	err := r.db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='labels'").Scan(&name)
 	return err == nil && name == "labels"
@@ -235,7 +243,7 @@ func (r *SQLiteReader) LoadIssuesFiltered(filter func(*model.Issue) bool) ([]mod
 // only after retaining this dependency authority.
 func (r *SQLiteReader) LoadIssueAuthority() ([]model.Issue, error) {
 	report := LoadReport{Path: r.path}
-	issues, err := r.loadIssueAuthority(&report)
+	issues, err := r.readIssueSnapshot(&report)
 	seen := make(map[string]bool, len(issues))
 	unique := make([]model.Issue, 0, len(issues))
 	for _, issue := range issues {
@@ -270,7 +278,28 @@ func (r *SQLiteReader) LoadReport() LoadReport {
 	return cloneLoadReport(r.report)
 }
 
-func (r *SQLiteReader) loadIssueAuthority(report *LoadReport) ([]model.Issue, error) {
+func (r *SQLiteReader) readIssueSnapshot(report *LoadReport) ([]model.Issue, error) {
+	// mode=ro/query_only are already set on every pooled connection. BEGIN
+	// is deferred, not IMMEDIATE: this pins a read snapshot, not a writer lock.
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("beginning SQLite read snapshot: %w", err)
+	}
+	defer tx.Rollback()
+	session := sqliteReadSession{db: tx}
+	issues, err := session.loadIssueAuthority(report)
+	if err != nil {
+		return nil, err
+	}
+	// Release the reader mark before validation, filtering, graph analysis or
+	// the TUI wait loop. The next load must acquire a fresh committed snapshot.
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("ending SQLite read snapshot: %w", err)
+	}
+	return issues, nil
+}
+
+func (r *sqliteReadSession) loadIssueAuthority(report *LoadReport) ([]model.Issue, error) {
 	dependencyTypeExpr, dependencyErr := r.dependencyTypeExpr()
 	if dependencyErr != nil {
 		report.ReadErrors++
@@ -435,7 +464,7 @@ func (r *SQLiteReader) loadIssueAuthority(report *LoadReport) ([]model.Issue, er
 }
 
 // loadIssuesSimple is a fallback for databases with fewer columns
-func (r *SQLiteReader) loadIssuesSimple(report *LoadReport, schema sqliteReadSchema) ([]model.Issue, error) {
+func (r *sqliteReadSession) loadIssuesSimple(report *LoadReport, schema sqliteReadSchema) ([]model.Issue, error) {
 	columns := r.issuesColumns()
 	expr := func(name, fallback string) string {
 		if columns[name] {
@@ -554,7 +583,7 @@ func (r *SQLiteReader) loadIssuesSimple(report *LoadReport, schema sqliteReadSch
 
 // loadLabelsFromTable loads labels for an issue from the separate labels table
 // used by beads-rs (br) databases.
-func (r *SQLiteReader) loadLabelsFromTable(issueID string, report *LoadReport) []string {
+func (r *sqliteReadSession) loadLabelsFromTable(issueID string, report *LoadReport) []string {
 	rows, err := r.db.Query("SELECT label FROM labels WHERE issue_id = ?", issueID)
 	if err != nil {
 		report.ReadErrors++
@@ -581,7 +610,7 @@ func (r *SQLiteReader) loadLabelsFromTable(issueID string, report *LoadReport) [
 }
 
 // loadDependencies loads dependencies for an issue
-func (r *SQLiteReader) loadDependencies(issueID, dependencyTypeExpr string, report *LoadReport) []*model.Dependency {
+func (r *sqliteReadSession) loadDependencies(issueID, dependencyTypeExpr string, report *LoadReport) []*model.Dependency {
 	if dependencyTypeExpr == "" {
 		return []*model.Dependency{}
 	}
@@ -619,13 +648,13 @@ func (r *SQLiteReader) loadDependencies(issueID, dependencyTypeExpr string, repo
 	return deps
 }
 
-func (r *SQLiteReader) tableExists(name string) (bool, error) {
+func (r *sqliteReadSession) tableExists(name string) (bool, error) {
 	var exists int
 	err := r.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?", name).Scan(&exists)
 	return exists > 0, err
 }
 
-func (r *SQLiteReader) dependencyTypeExpr() (string, error) {
+func (r *sqliteReadSession) dependencyTypeExpr() (string, error) {
 	// Minimal snapshots may omit this optional table. Inspect it once per load,
 	// so missing schema and unreadable schema do not become the same authority.
 	exists, err := r.tableExists("dependencies")
@@ -652,7 +681,7 @@ func (r *SQLiteReader) dependencyTypeExpr() (string, error) {
 }
 
 // loadComments loads comments for an issue
-func (r *SQLiteReader) loadComments(issueID string, report *LoadReport) []*model.Comment {
+func (r *sqliteReadSession) loadComments(issueID string, report *LoadReport) []*model.Comment {
 	query := `SELECT id, author, text, created_at FROM comments WHERE issue_id = ? ORDER BY created_at`
 	rows, err := r.db.Query(query, issueID)
 	if err != nil {
@@ -698,13 +727,21 @@ func parseSQLiteLabels(raw, issueID string, report *LoadReport) []string {
 
 // CountIssues returns the count of non-tombstone issues
 func (r *SQLiteReader) CountIssues() (int, error) {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	session := sqliteReadSession{db: tx}
 	var count int
 	query := "SELECT COUNT(*) FROM issues WHERE status != 'tombstone'"
-	if r.issuesColumns()["tombstone"] {
+	if session.issuesColumns()["tombstone"] {
 		query += " AND (tombstone IS NULL OR tombstone = 0)"
 	}
-	err := r.db.QueryRow(query).Scan(&count)
-	if err != nil {
+	if err := tx.QueryRow(query).Scan(&count); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return count, nil
@@ -728,12 +765,20 @@ func (r *SQLiteReader) GetIssueByID(id string) (*model.Issue, error) {
 // modernc.org/sqlite stores DATETIME columns as text, so we scan as string
 // and parse manually.
 func (r *SQLiteReader) GetLastModified() (time.Time, error) {
-	if !r.issuesColumns()["updated_at"] {
+	tx, err := r.db.Begin()
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer tx.Rollback()
+	session := sqliteReadSession{db: tx}
+	if !session.issuesColumns()["updated_at"] {
 		return time.Time{}, nil
 	}
 	var raw sql.NullString
-	err := r.db.QueryRow("SELECT MAX(updated_at) FROM issues").Scan(&raw)
-	if err != nil {
+	if err := tx.QueryRow("SELECT MAX(updated_at) FROM issues").Scan(&raw); err != nil {
+		return time.Time{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return time.Time{}, err
 	}
 	if !raw.Valid || raw.String == "" {
