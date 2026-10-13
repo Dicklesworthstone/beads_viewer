@@ -12,6 +12,40 @@ import (
 	"modernc.org/sqlite"
 )
 
+func TestSQLiteSnapshotReportBelongsToItsRead(t *testing.T) {
+	path, writer := snapshotFixture(t, false)
+	if _, err := writer.Exec("UPDATE dependencies SET depends_on_id=NULL"); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewSQLiteReader(DataSource{Type: SourceTypeSQLite, Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	partial, partialReport, err := reader.LoadIssueSnapshot()
+	if err != nil || len(partial) != 3 || partialReport.ReadErrors != 1 || len(partialReport.Warnings) != 1 {
+		t.Fatalf("partial inspection lost its report: count=%d report=%+v err=%v", len(partial), partialReport, err)
+	}
+	warning := partialReport.Warnings[0]
+	partialReport.Warnings[0] = "caller mutation"
+	partialReport.TombstoneIDs[0] = "not a tombstone"
+	retained := reader.LoadReport()
+	if retained.Warnings[0] != warning || retained.TombstoneIDs[0] != "deleted" {
+		t.Fatal("snapshot report shared mutable slices with the reader")
+	}
+	if _, err := writer.Exec("UPDATE dependencies SET depends_on_id='blocker'"); err != nil {
+		t.Fatal(err)
+	}
+	complete, report, err := reader.LoadIssueSnapshot()
+	if err != nil || len(complete) != 3 || report.ReadErrors != 0 || report.WarningCount != 0 {
+		t.Fatalf("fresh snapshot did not carry its own successful verdict: %+v, %v", report, err)
+	}
+	if partialReport.ReadErrors != 1 || partialReport.Warnings[0] != "caller mutation" || len(partial[0].Dependencies) != 0 {
+		t.Fatal("a later successful load retroactively certified or mutated the partial snapshot")
+	}
+	assertSnapshotReaderReleased(t, reader, writer)
+}
+
 // A WAL validator can encounter contention without any main/WAL identity
 // change. Releasing that lock (or repairing only -shm) must allow the next
 // refresh to retry SQLite, not keep serving a cached failure or older JSONL.
@@ -275,7 +309,7 @@ INSERT INTO comments VALUES (1, 'duplicate', 'fixture', 'kept comment', '2026-01
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	issues, err := reader.LoadIssueAuthority()
+	issues, report, err := reader.LoadIssueSnapshot()
 	if err != nil || len(issues) != 3 {
 		t.Fatalf("load: %+v, %v", issues, err)
 	}
@@ -297,8 +331,11 @@ INSERT INTO comments VALUES (1, 'duplicate', 'fixture', 'kept comment', '2026-01
 			t.Fatalf("orphan relation invented an issue: %+v", issue)
 		}
 	}
-	if report := reader.LoadReport(); report.Errors != 1 || report.ReadErrors != 0 || report.WarningCount != 1 {
+	if report.Errors != 1 || report.ReadErrors != 0 || report.WarningCount != 1 {
 		t.Fatalf("duplicate/error accounting changed: %+v", report)
+	}
+	if authority, err := reader.LoadIssueAuthority(); err == nil || authority != nil {
+		t.Fatal("diagnostic duplicate handling must not certify a partial graph")
 	}
 	assertSnapshotReaderReleased(t, reader, writer)
 }
@@ -316,12 +353,15 @@ func TestSQLiteBulkGraphReportsRelatedReadFailures(t *testing.T) {
 					return nil
 				},
 			})
-			issues, err := reader.LoadIssueAuthority()
+			issues, report, err := reader.LoadIssueSnapshot()
 			if err != nil || len(issues) != 3 {
 				t.Fatalf("readable issues must remain inspectable: %d, %v", len(issues), err)
 			}
-			if report := reader.LoadReport(); report.ReadErrors != 1 || report.WarningCount != 1 || !strings.Contains(report.Warnings[0], "injected unreadable") {
+			if report.ReadErrors != 1 || report.WarningCount != 1 || !strings.Contains(report.Warnings[0], "injected unreadable") {
 				t.Fatalf("failed table read was hidden or repeated per issue: %+v", report)
+			}
+			if authority, err := reader.LoadIssueAuthority(); err == nil || authority != nil {
+				t.Fatal("unreadable related records must withhold live authority")
 			}
 			assertSnapshotReaderReleased(t, reader, writer)
 		})
@@ -340,17 +380,20 @@ INSERT INTO comments VALUES (2, 'a-job', NULL, 'bad author', NULL);`); err != ni
 		t.Fatal(err)
 	}
 	defer reader.Close()
-	issues, err := reader.LoadIssueAuthority()
+	issues, report, err := reader.LoadIssueSnapshot()
 	if err != nil || len(issues) != 3 {
 		t.Fatalf("readable issues lost: %d, %v", len(issues), err)
 	}
-	if report := reader.LoadReport(); report.ReadErrors != 4 || report.WarningCount != 4 {
+	if report.ReadErrors != 4 || report.WarningCount != 4 {
 		t.Fatalf("malformed related rows lost their authority warnings: %+v", report)
 	}
 	for _, issue := range issues {
 		if issue.ID == "a-job" && (len(issue.Dependencies) != 1 || len(issue.Labels) != 1 || len(issue.Comments) != 1) {
 			t.Fatalf("valid related rows were lost with invalid ones: %+v", issue)
 		}
+	}
+	if authority, err := reader.LoadIssueAuthority(); err == nil || authority != nil {
+		t.Fatal("malformed related records must withhold live authority")
 	}
 	assertSnapshotReaderReleased(t, reader, writer)
 }

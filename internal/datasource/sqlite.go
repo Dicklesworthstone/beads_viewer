@@ -196,7 +196,9 @@ func (r *SQLiteReader) LoadIssues() ([]model.Issue, error) {
 
 // LoadIssuesFiltered reads issues matching the filter function
 func (r *SQLiteReader) LoadIssuesFiltered(filter func(*model.Issue) bool) ([]model.Issue, error) {
-	all, err := r.LoadIssueAuthority()
+	// Diagnostic reads remain tolerant; callers receive their loss accounting
+	// through LoadReport. Live readiness reloads use LoadIssueAuthority instead.
+	all, _, err := r.LoadIssueSnapshot()
 	if err != nil {
 		return nil, err
 	}
@@ -209,10 +211,30 @@ func (r *SQLiteReader) LoadIssuesFiltered(filter func(*model.Issue) bool) ([]mod
 	return out, nil
 }
 
-// LoadIssueAuthority includes tombstones so a snapshot can distinguish a
-// satisfied predecessor from a missing record. Display readers filter them
-// only after retaining this dependency authority.
+// LoadIssueAuthority returns a complete graph, including tombstones, or an
+// error. Live reloads construct readiness directly from this result: returning
+// successfully read issues after losing an edge or deferral would invent ready
+// work. A refusal returns no issues, so callers retain their previous snapshot
+// and retry instead of publishing a partial graph. Diagnostic readers can use
+// LoadIssueSnapshot or LoadIssues to inspect partial data and its loss report.
 func (r *SQLiteReader) LoadIssueAuthority() ([]model.Issue, error) {
+	issues, report, err := r.LoadIssueSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	if report.Errors != 0 || report.ReadErrors != 0 {
+		return nil, fmt.Errorf("incomplete SQLite issue snapshot %q (%d rejected issues, %d read errors): %s",
+			r.path, report.Errors, report.ReadErrors, strings.Join(report.Warnings, "; "))
+	}
+	return issues, nil
+}
+
+// LoadIssueSnapshot returns inspectable rows (including tombstones) and the
+// report from that exact read. A nil error does NOT imply complete authority:
+// the report records any skipped or unreadable data. The report is detached
+// from the reader's last-report cache, so concurrent loads cannot change this
+// result's completeness or let an unrelated successful read certify it.
+func (r *SQLiteReader) LoadIssueSnapshot() ([]model.Issue, LoadReport, error) {
 	report := LoadReport{Path: r.path}
 	issues, err := r.readIssueSnapshot(&report)
 	seen := make(map[string]bool, len(issues))
@@ -238,9 +260,9 @@ func (r *SQLiteReader) LoadIssueAuthority() ([]model.Issue, error) {
 	r.report = report
 	r.reportMu.Unlock()
 	if err != nil {
-		return nil, err
+		return nil, cloneLoadReport(report), err
 	}
-	return issues, nil
+	return issues, cloneLoadReport(report), nil
 }
 
 func (r *SQLiteReader) LoadReport() LoadReport {
