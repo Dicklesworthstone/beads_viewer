@@ -1254,7 +1254,7 @@ try {
   chrome = spawn(browser, ['--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
     '--no-first-run', '--disable-background-networking', '--disable-sync', '--disable-component-update',
     '--remote-debugging-port=0', `--user-data-dir=${path.join(artifacts, 'profile')}`,
-    '--user-agent=OpenAI File Downloader, XaiImageApiFetch/1.0', 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
+    '--user-agent=beads_viewer-test (+https://github.com/Dicklesworthstone/beads_viewer)', 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
   const endpoint = await new Promise((resolve, reject) => {
     let output = '';
     const timer = setTimeout(() => reject(new Error('Chrome DevTools endpoint missing')), 15000);
