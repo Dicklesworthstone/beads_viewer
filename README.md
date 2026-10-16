@@ -71,16 +71,16 @@ Releases up to v0.22.0 used unversioned names (`bv_linux_amd64.tar.gz`); `bv --u
 Prefer Homebrew, Scoop, or a checksum-verified release archive above. If you do pipe the script, pin it to a commit you have read instead of the moving `main` branch:
 
 ```bash
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.sh
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.sh" | bash
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/ee81c286e89ed6f9d5d10c62da307cafe95c710b/install.sh
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/ee81c286e89ed6f9d5d10c62da307cafe95c710b/install.sh" | bash
 ```
 
 > **Warning:** `curl ... | bash` runs whatever the URL serves at that moment. The pinned form above cannot change under you; the `main` form can. `install.sh` downloads the release archive for your platform, verifies it against the release `checksums.txt`, and refuses to install on a mismatch.
 
 **Windows (PowerShell):**
 ```powershell
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.ps1
-irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.ps1" | iex
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/ee81c286e89ed6f9d5d10c62da307cafe95c710b/install.ps1
+irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/ee81c286e89ed6f9d5d10c62da307cafe95c710b/install.ps1" | iex
 ```
 > **Note:** The pinned installer above downloads the Windows release zip, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses anything that does not verify; no Go toolchain is needed. Pass `-Version v0.25.2` to pin a release or `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`). Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
 
@@ -2855,13 +2855,13 @@ If the `wasm/` assets are missing, the viewer automatically falls back to the JS
 
 ```
 ./bv-pages/
-├── index.html              # Main dashboard with Alpine.js + Tailwind
-├── beads.sqlite3           # Full SQLite database (3.3 MB for this repository's 611 issues)
+├── index.html              # Main dashboard with Alpine.js + Tailwind (303 KB)
+├── beads.sqlite3           # Full SQLite database (5.5 MB for this repository's 676 issues, plus 1 MiB chunk files above the 5 MiB threshold)
 ├── data/
-│   ├── graph_layout.json   # Pre-computed positions + metrics (116 KB for 611 issues / 746 edges)
+│   ├── graph_layout.json   # Pre-computed positions + metrics (158 KB for 676 issues / 816 edges)
 │   ├── meta.json           # Export metadata
-│   ├── triage.json         # Triage recommendations
-│   └── history.json        # Recorded issue lifecycle for graph time travel
+│   ├── triage.json         # Triage recommendations (19 KB)
+│   └── history.json        # Recorded issue lifecycle for graph time travel (122 KB)
 └── vendor/
     ├── d3.v7.min.js        # Visualization library
     ├── force-graph.min.js  # Graph rendering
@@ -2896,14 +2896,14 @@ The export includes both graph-layout data and a SQLite database:
 
 | Component | Size | Purpose |
 |-----------|------|---------|
-| `graph_layout.json` | 116 KB for 611 issues / 746 edges | Pre-computed node positions + graph metrics |
-| `beads.sqlite3` | 3.3 MB for 611 issues | Full issue data for detail pane, search, tables |
+| `graph_layout.json` | 158 KB for 676 issues / 816 edges | Pre-computed node positions + graph metrics |
+| `beads.sqlite3` | 5.5 MB for 676 issues | Full issue data for detail pane, search, tables |
 
-Sizes are measured, not estimated: `tests/e2e/export_pages_test.go` re-exports this repository on every e2e run and checks the bundle against `tests/artifacts/perf/pages_load.json` (whole bundle 9.7 MB, of which 5.6 MB is the vendored viewer libraries); the record is rewritten only when the test runs with `BV_RECORD_PERF=1`, and a bundle that grows by more than a quarter fails the run.
+Sizes are measured, not estimated: `tests/e2e/export_pages_test.go` re-exports this repository on every e2e run and checks the bundle against `tests/artifacts/perf/pages_load.json` (whole bundle 17.5 MB, of which 5.6 MB is the vendored viewer libraries; crossing the 5 MiB SQLite chunking threshold adds 1 MiB chunk files alongside `beads.sqlite3`); the record is rewritten only when the test runs with `BV_RECORD_PERF=1`, and a bundle that grows by more than a quarter fails the run.
 
 **Current viewer behavior:** `viewer.js` waits for SQLite to load, then uses exported coordinates to seed live force simulation if every node and directed blocking edge matches the database. Missing, malformed, or mismatched layouts fall back to ordinary force initialization. Nodes remain movable, and the browser computes its own metrics, including critical path and cycles. The layout does not make the graph render before the database or bypass simulation.
 
-Load-time figures are not measured in the repository yet; the sizes above are from the retained September 2, 2026 export, not a measurement of the current checkout.
+Load-time figures are not measured in the repository yet; the sizes above are from the retained September 29, 2026 export, not a measurement of the current checkout.
 
 ### Detail Pane
 
@@ -3989,8 +3989,8 @@ The fastest way to get started. Detects your OS and architecture automatically.
 Prefer Homebrew, Scoop, or a checksum-verified release archive above. If you do pipe the script, pin it to a commit you have read instead of the moving `main` branch:
 
 ```bash
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.sh
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.sh" | bash
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/ee81c286e89ed6f9d5d10c62da307cafe95c710b/install.sh
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/ee81c286e89ed6f9d5d10c62da307cafe95c710b/install.sh" | bash
 ```
 
 > **Warning:** `curl ... | bash` runs whatever the URL serves at that moment. The pinned form above cannot change under you; the `main` form can. `install.sh` downloads the release archive for your platform, verifies it against the release `checksums.txt`, and refuses to install on a mismatch.
@@ -3999,8 +3999,8 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43
 For Windows users using PowerShell:
 
 ```powershell
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.ps1
-irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/a43b8e85a39664381566abdfd85dc8fcbfdcb773/install.ps1" | iex
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/ee81c286e89ed6f9d5d10c62da307cafe95c710b/install.ps1
+irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/ee81c286e89ed6f9d5d10c62da307cafe95c710b/install.ps1" | iex
 ```
 
 **Requirements:**

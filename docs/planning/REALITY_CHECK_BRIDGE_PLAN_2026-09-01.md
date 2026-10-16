@@ -1,5 +1,283 @@
 # Bridge Plan: beads_viewer (bv)
 
+## Post-v0.25.2 reality check execution and gap closure — 2026-10-14
+
+Building on the `ee81c286e89ed6f9d5d10c62da307cafe95c710b` audit below, we executed the full high-leverage implementation and proof chain (`bv-apal.16` $\to$ `bv-apal.17` $\to$ `bv-apal.14` $\to$ `bv-apal.15` $\to$ `bv-apal.18` $\to$ `bv-apal.19` $\to$ `bv-apal.20`):
+
+- **Closed `bv-apal.16` (`[RC-C1]` — Correlation/Triage `--as-of` & SQLite-only workspace parity + dead-code removal):**
+  - Updated `Correlator.ValidateRepository` (`pkg/correlation/correlator.go`) so valid Git repositories whose live tracker is SQLite-only (`.beads/beads.db` without a live `.beads/issues.jsonl`) can still correlate historical `.beads/` commits.
+  - Wired `resolveCorrelationBeadsPathForContext` and `Revision: ctx.AsOfCommit` across all 9 correlation/triage robot handlers in `cmd/bv/robot_registry.go` (`--robot-history`, `--robot-related`, `--robot-file-beads`, `--robot-file-relations`, `--robot-orphans`, `--robot-blocker-chain`, `--robot-impact-network`, `--robot-causality`, `--robot-triage`) and `generateHistoryForExport` in `cmd/bv/main.go`.
+  - Removed 3 unreachable duplicate robot handler blocks (~270 lines) in `cmd/bv/main.go`.
+  - Verified with `TestRobotCorrelationHandlersRespectAsOfAndSQLiteWorkspace` (`cmd/bv/main_test.go`).
+- **Closed `bv-apal.17` (`[RC-C2]` — Native `br` `due_at` JSONL decoding, `DueDate`/`DeferUntil`/`ExternalRef` surfacing, and GH #210 visible-bounds clamping):**
+  - Added `unmarshalIssueLine` in `pkg/loader/loader.go` so JSONL ingestion decodes `br`'s native `"due_at"` field (authoritative over legacy `"due_date"` when present, matching `internal/datasource/sqlite.go:364-369`), while preserving the `goccy/go-json` fast path when `"due_at"` is absent.
+  - Surfaced `DueDate`, `DeferUntil`, and `ExternalRef` across the TUI detail viewport and clipboard export (`pkg/ui/model.go`), Insights detail markdown (`pkg/ui/insights.go`), Markdown export (`pkg/export/markdown.go`), SQLite static export (`pkg/export/sqlite_types.go`, `pkg/export/sqlite_schema.go`, `pkg/export/sqlite_export.go`), interactive HTML graph export (`pkg/export/graph_interactive.go`, `pkg/export/graph_render_beautiful.go`), and semantic search document text (`pkg/search/documents.go`).
+  - Clamped the remaining 4 GH #210 fuzzy-filter selection sites in `pkg/ui/model.go` (`MouseButtonWheelUp`/`Down`, `ctrl+d`/`ctrl+u`, `jumpToChangedIssue`, `applyFilter`, and `handleLeftClick`) to `m.list.VisibleItems()` and `m.listIndexInBounds()`.
+- **Closed `bv-apal.14` & `bv-apal.15` (`[RC-P2a]` & `[RC-P2a proof]` — `AGENTS.md` `v7` blurb, `README.md` installer pins & `pages_load.json` parity, `CHANGELOG.md` `Unreleased`, and doc-parity guards):**
+  - Updated repository `AGENTS.md` to `v7` (`bv --agents-check` exits 0).
+  - Updated `README.md` pinned installer URLs to `ee81c286e89ed6f9d5d10c62da307cafe95c710b` and synchronized static-export size/date prose with `tests/artifacts/perf/pages_load.json` (`676 issues`, `816 edges`, `5.5 MB` `beads.sqlite3` + `>5 MiB` chunk files, `5.6 MB` `vendor/`, `303 KB` `index.html`, `17.5 MB` bundle, `September 29, 2026`).
+  - Added `## Unreleased` to `CHANGELOG.md` covering `4dacc3ea`..`ee81c286` and `bv-apal.14`..`bv-apal.20`.
+  - Added `TestDocsParity_RepoAgentsMDHasCurrentBlurb`, `TestDocsParity_PagesLoadProseMatchesArtifact`, and extended `TestReadme_NoUnpinnedPipedInstallers` in `tests/e2e/docs_parity_test.go`, each with a built-in `negative_control_ee81c286` subtest verifying that the pre-fix `ee81c286` markdown fails and the repaired working tree passes. Checked items 8 (`bv-apal.3`) and 10 (`bv-apal.4`).
+- **Closed `bv-apal.18` (`[RC-C3]` — Wire finished TUI & robot components: Insights heatmap 2D navigation/drill-down, context-sensitive tutorial (`~` / `CurrentContext`) & focus restoration, History timeline Cass session cache, and raw correlation `--as-of` path):**
+  - Wired `InsightsModel`'s 2D heatmap navigation (`HeatmapMoveUp/Down/Left/Right`), cell drill-down (`HeatmapEnter`, `HeatmapBack`, `IsHeatmapDrillDown`), `H` toggle, and live detail-pane updates (`SelectedIssueID()` + `updateDetailContent()`) into `handleInsightsKeys` (`pkg/ui/insights.go`, `pkg/ui/model.go`).
+  - Wired `IsContextHelpTrigger` (`~`), `Model.CurrentContext()`, `TutorialModel.SetContext`, and `TutorialModel.SetContextMode` into `Model.Update`, and added `focusBeforeTutorial` / `restoreFocusFromTutorial()` so closing the tutorial restores the caller's view focus (`pkg/ui/model.go`).
+  - Connected `cassSessionsLoadedMsg`, `enterHistoryView` (`syncHistoryCassSessions`), and `beginSemanticDatasetUpdate` (`ClearSessionCache`) in `pkg/ui/model.go` to `HistoryModel.SetSessionsForBead` (`pkg/ui/history.go`).
+  - Updated `generateRawCorrelationReport` in `cmd/bv/robot_registry.go` (`--robot-explain-correlation`, `--robot-confirm-correlation`, `--robot-reject-correlation`) to accept `RobotContext`, resolve historical beads paths via `resolveCorrelationBeadsPathForContext(ctx, workDir)`, and default `opts.Revision = ctx.AsOfCommit`.
+  - Verified with `TestInsightsHeatmapNavigationAndDrilldown`, `TestContextTutorialAndFocusRestoration`, and `TestHistoryCassSessionsWiredFromModel` (`pkg/ui/main_test.go`) plus extended `TestRobotCorrelationHandlersRespectAsOfAndSQLiteWorkspace` (`cmd/bv/main_test.go`).
+- **Closed `bv-apal.19` (`[RC-C4]` — Wire `VelocityComparisonModel` (`bv-125`), wide-terminal `focusLabelDashboard` rendering, `Model.Update` Insights heatmap dispatch, live-reload view refreshes, text-input overlay guards, cross-view keybinding parity, and `BuildSemanticIndexCmd` `workDir` resolution):**
+  - Wired the finished 341-line `VelocityComparisonModel` (`pkg/ui/velocity_comparison.go`, `bv-125`) into `Model.Update`, `Model.renderMainView`, `Model.renderFooter`, and `GetKeyBindingDocs` (`pkg/ui/model.go`, `pkg/ui/keybindings.go`): pressing `v` in `focusLabelDashboard` (`[`) opens the 4-week sparkline velocity comparison sub-view, `j`/`k`/`up`/`down` navigate labels, `enter` filters the main list by `"label:" + SelectedLabel()`, and `esc`/`q`/`v` return to `focusLabelDashboard`.
+  - Fixed a view-precedence bug in `Model.renderMainView` (`pkg/ui/model.go:6651-6655`) where `case m.isSplitView:` preceded `case m.focused == focusLabelDashboard:`, causing wide terminals (`width > 100`) to render `renderSplitView()` instead of `m.labelDashboard.View()` when pressing `[`.
+  - Fixed `Model.Update` key dispatch for `focusInsights` (`pkg/ui/model.go:4480-4550`, `4662-4665`) so pressing `esc` or `q` while in heatmap cell drill-down calls `m.insightsPanel.HeatmapBack()` instead of exiting `focusInsights`, and added `"H"` and `"backspace"` to `case focusInsights:`.
+  - Added `refreshActionableView()` and `refreshLabelViews(underlyingFocus)` (`pkg/ui/model.go`) and wired them into `Phase2ReadyMsg`, `SnapshotReadyMsg`, and `FileChangedMsg` (plus invalidated `m.attentionCached` and cleared `m.labelDrilldownCache`) so live reloads keep `actionableView`, `attentionView`, `labelDashboard`, `labelHealthDetail`, `labelDrilldownIssues`, and `velocityComparison` synchronized.
+  - Added `isTextInputActive()` (`pkg/ui/model.go`) to guard single-character global overlay triggers (`?`, `` ` ``, `~`, `;`) when typing in `focusTimeTravelInput`, `focusLabelPicker`, `focusBoard` search, or `focusHistory` search, and unified tutorial close teardown into `m.closeTutorial()`.
+  - Added `GoToStart()`, `GoToEnd()`, and `SelectIssueByID()` to `ActionableModel` (`pkg/ui/actionable.go`), wired `ctrl+d`/`pgdown`, `ctrl+u`/`pgup`, `home`, `G`/`end`, and `y` in `focusActionable`, and wired `y` (`copyIssueIDByIDCmd`) across `focusGraph`, `focusInsights`, `focusTree`, `focusFlowMatrix`, and `focusDetail` (`C` and `y`).
+  - Updated `BuildSemanticIndexCmd` (`pkg/ui/semantic_search.go`) to accept `m.workDir` so the `.bv/semantic` vector index is stored in the target project root rather than `os.Getwd()`.
+  - Verified with `TestVelocityComparisonWiredInLabelDashboard`, `TestInsightsHeatmapAndDrilldownViaModelUpdate`, `TestLiveReloadRefreshesActionableAttentionAndLabelViews`, `TestTextInputsConsumeGlobalOverlayTriggerKeys`, `TestCrossViewPageJumpAndCopyKeybindings`, and `TestBuildSemanticIndexCmdUsesProvidedWorkDir` (`pkg/ui/main_test.go`).
+- **Closed `bv-apal.20` (`[RC-C5]` — Wire `search.SearchConfigFromEnv()` in TUI, interactive graph export git history correlation, symmetric `--diff-since` & non-TUI CLI `--recipe` scoping, and `FileChangedMsg`/`Phase2ReadyMsg`/`DataSnapshot.WithPhase2` filter/recipe/sprint sync):**
+  - Wired `search.SearchConfigFromEnv()` (`pkg/search/config.go:73`) into `ui.NewModel` (`pkg/ui/model.go`), added `SetHybridConfigWithWeights` to `SemanticSearch` (`pkg/ui/semantic_search.go`), and scheduled `startSemanticHybridBuild()` in `Model.Init()` when hybrid search is enabled via `BV_SEARCH_MODE` / `BV_SEARCH_PRESET` / `BV_SEARCH_WEIGHTS`.
+  - Wired `generateCorrelationReportForContext` into `--export-graph` (`cmd/bv/main.go`) so interactive HTML graph exports (`export.GenerateInteractiveGraphHTML` / `generateUltimateHTML`) receive `History` correlation data (`commit_count`, `last_author`, `commits`, `history_stats`), and moved `analysis.NewAnalyzer(exportIssues)` after label filtering with `SetNow(robotNow())`, `SetReadinessScope`, and `--force-full-analysis`.
+  - Included non-TUI CLI modes (`--priority-brief`, `--agent-brief`, `--emit-script`, `--search`, `--check-drift`, `--save-baseline`, `--diff-since`) in `recipeForScope` (`cmd/bv/main.go:2782`), scoped `historicalIssues` symmetrically in `--diff-since` so out-of-scope historical issues are never reported in `RemovedIssues`, wired `SetReadinessScope` + `SetNow` in `--save-baseline` and `--check-drift`, and added `--debug-render` support to the `--as-of` TUI branch.
+  - Updated `FileChangedMsg`, `Phase2ReadyMsg`, `SnapshotReadyMsg`, `matchesCurrentFilter`, and `DataSnapshot.WithPhase2` (`pkg/ui/model.go`, `pkg/ui/snapshot.go`) to preserve active filters, sorts, Phase 2 recipe ordering, selected issue IDs, `InsightsModel` state (`rebuildInsightsPanel`), and `sprintViewText` across reloads, and wired `cass.WorkspaceFromBeadsPath(beadsPath)` in `ui.NewModel`.
+  - Verified with `TestNewModelHonorsSearchConfigFromEnvAndCustomWeights` and `TestFileChangedAndPhase2PreserveFilterSortRecipeAndSprintDashboard` (`pkg/ui/main_test.go`), `TestGraphExportHTML_IncludesGitHistoryCorrelation` (`tests/e2e/graph_export_e2e_test.go`), and `TestRobotDiffAppliesLabelAndRepoScopeToBothSnapshots` (`tests/e2e/robot_diff_test.go`).
+
+### Idea-Wizard (30 $\to$ 5 $\to$ 15), Modes-of-Reasoning Audit & Brenner Hypothesis Opportunity Matrix (2026-10-14)
+
+| Rank | Candidate (`idea-wizard` top picks) | Modes of Reasoning (Primary / Secondary) | Brenner Score ($\text{Impact} \times \text{Plausibility} \times \text{Discriminative Power} / \text{Cost}$) | Disposition |
+|---|---|---|---|---|
+| **1** | Wire finished 341-line `VelocityComparisonModel` (`bv-125`) + fix wide-terminal `focusLabelDashboard` split-view shadowing (`pkg/ui/model.go`, `pkg/ui/velocity_comparison.go`) | 10.2 Deductive / 5.4 Invariant & Contract | $5 \times 5 \times 5 / 1 = \mathbf{125.0}$ | **IMPLEMENTED & PROVEN (`bv-apal.19`)** |
+| **2** | Fix `Model.Update` `focusInsights` heatmap drill-down `esc`/`q`/`H`/`backspace` interception (`pkg/ui/model.go:4480-4665`) | 3.1 Mechanistic / 1.4 Counterfactual | $5 \times 5 \times 5 / 1 = \mathbf{125.0}$ | **IMPLEMENTED & PROVEN (`bv-apal.19`)** |
+| **3** | Wire `search.SearchConfigFromEnv()` + `SetHybridConfigWithWeights` in TUI (`pkg/ui/model.go`, `pkg/ui/semantic_search.go`) and git history correlation (`opts.History`) in `--export-graph` (`cmd/bv/main.go`) | 10.2 Deductive / 5.4 Contract Parity | $5 \times 5 \times 5 / 1 = \mathbf{125.0}$ | **IMPLEMENTED & PROVEN (`bv-apal.20`)** |
+| **4** | Symmetric `--diff-since` historical snapshot scoping + non-TUI CLI `--recipe` scoping + `--save-baseline`/`--check-drift` readiness scope (`cmd/bv/main.go`) | 5.4 Invariant & Contract / 2.1 Adversarial | $5 \times 5 \times 5 / 1 = \mathbf{125.0}$ | **IMPLEMENTED & PROVEN (`bv-apal.20`)** |
+| **5** | Live-reload (`SnapshotReadyMsg`, `FileChangedMsg`, `Phase2ReadyMsg`, `DataSnapshot.WithPhase2`) state synchronization for subviews, filters, sorts, recipes, and sprint dashboard (`pkg/ui/model.go`, `pkg/ui/snapshot.go`) | 5.2 Temporal & Monotonicity / 3.4 Causal Graph | $5 \times 5 \times 4 / 1 = \mathbf{100.0}$ | **IMPLEMENTED & PROVEN (`bv-apal.19`, `bv-apal.20`)** |
+| **6** | Guard global single-character overlay keys (`?`, `` ` ``, `~`, `;`) against active text inputs (`isTextInputActive`) & unify `closeTutorial()` | 2.1 Adversarial Red-Teaming / 5.4 Invariant | $4 \times 5 \times 5 / 1 = \mathbf{100.0}$ | **IMPLEMENTED & PROVEN (`bv-apal.19`)** |
+| **7** | Wire `ActionableModel` page/start/end navigation (`ctrl+d`/`ctrl+u`/`home`/`G`), cross-view `y`/`C` clipboard copy, `BuildSemanticIndexCmd` `workDir`, and `cass.WorkspaceFromBeadsPath` | 7.1 Analogical Transfer / 5.4 Contract Parity | $4 \times 5 \times 4 / 1 = \mathbf{80.0}$ | **IMPLEMENTED & PROVEN (`bv-apal.19`, `bv-apal.20`)** |
+
+## Post-v0.25.2 reality check and bridge plan — 2026-10-13
+
+Baseline: `ee81c286e89ed6f9d5d10c62da307cafe95c710b` on `main` (16 commits
+ahead of tag `v0.25.2` at `721353e7`). Since the 2026-09-16 rescore (`04a0107b`),
+the project closed eight reality-check and hardening beads (`bv-643f`, `bv-z38b`,
+`bv-q0po`, `bv-lbmh`, `bv-apal.1`, `bv-apal.2`, `bv-y3m9`, `bv-f22j`), published
+two verified releases (`v0.25.1` at `4db2f8dc` and `v0.25.2` at `721353e7`),
+completed native `darwin/arm64` (`mac-mini-max`) and native Windows `-FromSource`
+(`615 ms` first invocation on `oldsurface`) verification on `bv-oonu.9`, and
+landed 16 post-`v0.25.2` runtime commits (`4dacc3ea`..`ee81c286`) repairing TUI
+fuzzy-filter visible-row selection/clamping (GH #210) and SQLite WAL
+single-snapshot loading, transient retry, continuous-write non-starvation,
+polling recovery, mailbox generation fencing, and per-operation worker-lifetime
+context cancellation (GH #555).
+
+### Fresh verification at `ee81c286` (Go 1.26.8, `br 0.7.4`)
+
+- **Compiler, static analysis, and docgen:** `gofmt -l cmd pkg internal tests`
+  (empty), `go build ./...` (exit 0), `go vet ./...` (exit 0), and
+  `go generate ./...` (zero working-tree diff) all pass on `go1.26.8 linux/amd64`.
+- **Action pins, vendor provenance, and 58-command robot smoke:**
+  `scripts/check_action_pins.sh` (23 action references in 8 files, 0 unpinned),
+  `scripts/verify_vendor.sh` (15 manifest entries, 0 problems), and
+  `scripts/robot_smoke.sh` (29 target-repo commands + 29 synthetic-fixture
+  commands, 0 failures; retained at `/data/tmp/bv-robot-smoke.3pmEwV`) all pass.
+- **Documentation parity E2E suite:**
+  `go test ./tests/e2e -run "TestDocsParity|TestReadme|TestAgents" -v` passes
+  all 17 existing test functions in 7.831s.
+- **Post-`v0.25.2` SQLite and worker context race suites on Go 1.26.8:**
+  `CGO_ENABLED=1 go test -race -count=1 ./internal/datasource -run "TestSQLiteContext|TestSQLiteCancelled"`
+  (ok, 3.093s) and `CGO_ENABLED=1 go test -race -count=1 ./pkg/ui -run "TestWorker"`
+  (ok, 1.550s) pass on `go1.26.8` with `modernc.org/sqlite`, verifying the
+  `ac479059` and `ee81c286` changes against the full repository toolchain.
+
+### The five answers (2026-10-13)
+
+1. **What actually works right now?**
+   - **Graph-aware triage and robot surface (`pkg/analysis`, `cmd/bv`):**
+     Two-phase analysis (instant Phase 1 degree/topological sort/density;
+     size-tiered Phase 2 PageRank, betweenness, HITS, eigenvector, k-core,
+     articulation points, slack, representative SCC cycles) and all 41
+     advertised robot flags are operational and pass the 58-command smoke suite.
+   - **10k responsiveness and paired latency matrix (`bv-apal.1` / `bv-apal.2`,
+     CLOSED 2026-09-19):** The complete paired matrix passed on `hz3` at
+     `3f02433e` (`benchmarks/bb-p1-matrix-20260918-evidence/`): 288 UI records
+     (288,000 samples, current-side max p99 `35.694 ms <= 50 ms` SLO, 0 breaches),
+     72 timed CLI records (14,400 samples, 0 parity mismatches), 36 exact
+     records (144 outputs, 0 parity mismatches), and the 60 ms slowdown
+     negative control (`TestPerformanceInteractionGateTripsOnSlowHandler`),
+     independently verified by a separate agent in `bv-apal.2`.
+   - **Source loading, readiness authority, and SQLite WAL live reload
+     (`internal/datasource`, `pkg/loader`, `pkg/watcher`, `pkg/ui`):** Canonical
+     JSONL/SQLite discovery, worktree isolation, atomic `br >= 0.6.0` claim
+     routing (`bv-xbvo.9` / `bv-xbvo.10`), single-snapshot SQLite authority
+     loading, transient WAL retry, continuous WAL write non-starvation, polling
+     recovery, incomplete-authority withholding, superseded worker mailbox
+     rejection, and per-operation context cancellation (`0ee3a2ad`..`ee81c286`)
+     are implemented and race-tested.
+   - **Interactive TUI and static dashboard export (`pkg/ui`, `pkg/export`):**
+     Terminal-bounded views and sidebar layout (`12ae9975`, `d404af74`),
+     visible-row fuzzy-filter selection (`4dacc3ea`, `6c6efa15`), Flow Matrix
+     directed blocker/dependent drilldown (`bv-apal.12` / `bv-apal.13`),
+     pre-computed graph layouts (`bv-643f`), and full-ancestry time-travel
+     playback (`bv-z38b`, `bbe40d02`, `d81990f4`) are implemented and verified.
+   - **Release pipeline and 4/5 native targets (`v0.25.0`..`v0.25.2`,
+     `bv-oonu.9`):** Native installation, capabilities, and update preservation
+     are proven on `linux/amd64`, `darwin/arm64` (`mac-mini-max`, SHA-256
+     `99f39263...`, first start `1251 ms`), `windows/amd64` (`oldsurface`,
+     including foreground `-FromSource` Attempt 6 SHA-256 `567b57e3...`, first
+     start `615 ms < 10000 ms`), and sandboxed Linux `amd64` Nix.
+
+2. **What doesn't work — or is broken, incomplete, or drifted at `ee81c286`?**
+   - **D1 — Repository `AGENTS.md` Blurb Version Drift (`v5` vs `v7`):**
+     `go run ./cmd/bv --agents-check` on this repository reports:
+     `Found AGENTS.md at /data/projects/beads_viewer/AGENTS.md (blurb v5, current v7 — needs update)`.
+     `AGENTS.md:897-1014` still carries `<!-- bv-agent-instructions-v5 -->`,
+     instructing agents at lines 976 and 998 to run
+     `br update <id> --status=in_progress --json` instead of atomic
+     `br update <id> --claim --json`, omitting the `br >= 0.6.0` stale-deferral
+     warning in `v7` (`pkg/agents/blurb.go:103-106`), and claiming at line 954
+     that `"Every robot command emits one JSON object"` (contradicting
+     `--robot-help` text output and `--format toon`, fixed in `v7` at
+     `pkg/agents/blurb.go:86`). `TestDocsParity_ReadmeBlurbMatchesGenerated`
+     (`tests/e2e/docs_parity_test.go:590`) checks `README.md` against
+     `agents.AgentBlurb` (`v7`) but never checks `AGENTS.md`.
+   - **D2 — `README.md` Pinned Installer Commit (`a43b8e85`) Predates 4 Shipped
+     Installer Fixes:** `README.md:74-83` and `README.md:2667-2668` pin
+     `install.sh` and `install.ps1` to `a43b8e85a39664381566abdfd85dc8fcbfdcb773`.
+     Four installer commits landed after `a43b8e85`: `be0e8beb` (report built Go
+     toolchain via `go version -m` instead of launcher Go, `bv-y3m9`),
+     `508d429d` (installer `awk` hardening), `409f0409` (`install.sh` release
+     metadata parsing with `jq` when `python3` is missing), and `a84e7081`
+     (macOS Go `.pkg` URL construction and SHA-256 verification). `CHANGELOG.md`
+     under `v0.25.1` and `v0.25.2` advertises these fixes as shipped, yet
+     copying the pinned `curl`/`irm` commands from `README.md` downloads the
+     pre-fix `a43b8e85` scripts. `TestReadme_NoUnpinnedPipedInstallers`
+     (`tests/e2e/docs_parity_test.go:625`) only checks that the URL contains
+     any 40-hex SHA, not that the pinned commit matches `HEAD:install.sh` /
+     `HEAD:install.ps1`.
+   - **D3 — `README.md` Static Export Size Prose Contradicts Cited
+     `tests/artifacts/perf/pages_load.json`:** `README.md:2859-2914` cites
+     `tests/artifacts/perf/pages_load.json` as measuring `611 issues, 581 edges`,
+     `3.3 MB` SQLite database, and `9.7 MB` total bundle size (Sept 2, 2026).
+     Commit `4db2f8dc` (`v0.25.1`, 2026-09-29) updated
+     `tests/artifacts/perf/pages_load.json` after the tracker crossed the 5 MiB
+     SQLite chunking threshold: the artifact actually records `676 issues`,
+     `816 edges`, `beads_sqlite3: 5500928` (`5.5 MB`), `vendor_total: 5574598`
+     (`5.6 MB`), `index_html: 303477` (`303 KB`), and `bundle_total: 17529729`
+     (`17.5 MB`, because bundles over 5 MiB carry both `beads.sqlite3` and 1 MiB
+     `beads.sqlite3.chunk.*` files plus `data.json`). Unlike `robot_wall.json`
+     (`TestDocsParity_RobotWallProseMatchesArtifact`), `pages_load.json` has no
+     parity test in `tests/e2e/docs_parity_test.go`.
+   - **D4 — Post-`v0.25.2` Runtime Cohort (`4dacc3ea`..`ee81c286`, 16 Commits)
+     Unrecorded in `CHANGELOG.md` (`Unreleased`) and Unsealed by a Release
+     Receipt:** `CHANGELOG.md` starts at `## v0.25.2 — 2026-09-30` with no
+     `## Unreleased` section for the 16 post-`v0.25.2` commits (GH #210 and
+     GH #555), and `HEAD` (`ee81c286`) has moved beyond the `v0.25.2` release
+     receipt (`721353e7`).
+   - **D5 — Missing Native Runners for 2 of 5 Advertised Targets (`bv-oonu.9` /
+     `bv-oonu.10`):** Native `darwin/amd64` (`mac-mini-old` requires interactive
+     Tailscale SSH browser approval) and native `linux/arm64` (no ARM64 Linux
+     host in the fleet) remain unproven on physical native hardware.
+
+3. **What blocks us from reaching the full vision?**
+   - Local documentation/blurb/installer-pin/changelog accuracy (`D1`–`D4`) had
+     no unblocked leaf bead because `bv-apal.3` was blocked by `bv-oonu.10`
+     (which is blocked by `bv-oonu.9`'s external hardware gate).
+   - Native `darwin/amd64` and `linux/arm64` verification (`D5`, `bv-oonu.9`
+     item 1) requires either maintainer Tailscale SSH device-auth approval /
+     ARM64 runner provisioning or an explicit maintainer scope disposition.
+   - Final cohort closure (`bv-oonu.11`) requires completing `bv-apal.14` /
+     `bv-apal.15`, `bv-oonu.9` / `bv-oonu.10`, `bv-apal.3` / `bv-apal.4`, and
+     a fresh 10-stage clean-source `scripts/release_gate.sh run` + `package` +
+     `verify` receipt on the final post-`ee81c286` revision.
+
+4. **Will completing the previously open beads actually get us to the vision?**
+   - No. Before this update, all 5 leaf beads (`bv-oonu.9`, `bv-oonu.10`,
+     `bv-apal.3`, `bv-apal.4`, `bv-oonu.11`) were transitively blocked on
+     `bv-oonu.9`, leaving **zero ready leaf tasks** in `br ready` and
+     `bv --robot-triage`, and none of their acceptance checklists named the four
+     concrete post-`v0.25.2` drifts (`D1`–`D4`).
+
+5. **What parts of the vision lacked bead coverage?**
+   - Goal 42 (Accurate executable documentation) and Goal 39 (Native
+     installs/upgrades) lacked an immediately actionable, hardware-independent
+     implementation/proof pair covering `D1`–`D4` (`AGENTS.md` `v7` currency,
+     `README.md` installer SHA blob parity, `README.md` `pages_load.json`
+     17.5 MB chunked-bundle parity, and `CHANGELOG.md` `Unreleased` coverage for
+     `4dacc3ea`..`ee81c286`), and `bv-oonu.11` needed an explicit criterion
+     binding the 16 post-`v0.25.2` commits into the final clean-source gate.
+
+### Bridge plan and workstreams (2026-10-13)
+
+| Workstream | Implementation | Companion proof | Scope and unblocking role |
+|---|---|---|---|
+| **RC-P2a (Local Docs, Blurb, Installer Pins & Unreleased Cohort)** | `bv-apal.14` (P1, **READY**) | `bv-apal.15` (P1) | Repairs `D1`–`D4` in `AGENTS.md`, `README.md`, `CHANGELOG.md`, and `tests/e2e/docs_parity_test.go`; immediately actionable with no external hardware dependency; blocks `bv-apal.3`, `bv-apal.4`, `bv-oonu.11`. |
+| **RC-V5 (Native Distribution Proof — Remaining 2/5 Targets)** | `bv-oonu.9` (P2, blocked on runner access) | `bv-oonu.10` (P2) | Retains 4/5 proven native targets (`linux/amd64`, `darwin/arm64`, `windows/amd64` including `615 ms` `-FromSource` first start, Linux `amd64` Nix); awaits `darwin/amd64` Tailscale auth and `linux/arm64` runner or maintainer scope decision; blocks `bv-apal.3`, `bv-oonu.11`. |
+| **RC-P2 (Final Public Examples & Capability Prose Settlement)** | `bv-apal.3` (P2, blocked by `bv-apal.15`, `bv-oonu.10`) | `bv-apal.4` (P2) | Finalizes public capability/platform prose after `bv-apal.15` and `bv-oonu.10` settle; items 8 and 9 on `bv-apal.4` are now ticked per the 2026-09-18 independent verification (`50218e8d...`) and closed `bv-lbmh` (`27b1e48e`). |
+| **RC-Final (Clean-Source Release Gate & Packaged Binary Acceptance)** | `bv-oonu.11` (P1, blocked by all 19 proofs) | — | Runs the complete 10-stage `scripts/release_gate.sh run` + `package` + `verify` receipt on the final post-`ee81c286` revision (binding GH #210, GH #555, and `RC-P2a`), verifies packaged archive bytes, and rescores all 43 vision goals and 19 implementation/proof pairs. |
+
+### Ambition round 1 — structural parity guards over point edits
+
+Point-editing `AGENTS.md`, `README.md`, and `CHANGELOG.md` without structural
+regression guards would allow the exact same drift to recur on the next blurb
+bump, installer fix, or `BV_RECORD_PERF=1` export re-measurement. `bv-apal.14`
+and `bv-apal.15` therefore require three permanent guards in
+`tests/e2e/docs_parity_test.go`:
+
+1. `TestDocsParity_RepoAgentsMDHasCurrentBlurb`: runs
+   `agents.DetectAgentFile("../..")` and asserts `Found()`, `HasBlurb`,
+   `!NeedsUpgrade()`, `BlurbVersion == agents.BlurbVersion`, `BlurbCount == 1`,
+   and `BlurbStructureError == ""`, plus verifies that the pre-marker section
+   (`AGENTS.md:545-635`) contains no stale `--status=in_progress` claim command
+   or blanket single-JSON-object claim.
+2. Extended `TestReadme_NoUnpinnedPipedInstallers`: for every pinned
+   `raw.githubusercontent.com/Dicklesworthstone/beads_viewer/<40-hex>/install.(sh|ps1)`
+   URL in `README.md`, when `git cat-file -e <sha>^{commit}` succeeds (required
+   in full-history checkouts per `docs/testing.md`), asserts that
+   `git rev-parse <sha>:install.<ext>` equals `git rev-parse HEAD:install.<ext>`.
+3. `TestDocsParity_PagesLoadProseMatchesArtifact`: unmarshals
+   `tests/artifacts/perf/pages_load.json` and asserts that `README.md`'s
+   static-export directory tree and performance table state the artifact's
+   recorded `issues` (`676`), `edges` (`816`), `beads_sqlite3` (`5.5 MB`),
+   `vendor_total` (`5.6 MB`), `index_html` (`303 KB`), and `bundle_total`
+   (`17.5 MB`), and explain the >5 MiB SQLite chunking threshold.
+
+### Ambition round 2 — decouple local progress from external runner provisioning
+
+Prior to this revision, `bv-apal.3` depended on `bv-oonu.10` while `bv-oonu.9`
+was marked `blocked` waiting on external runner provisioning (`darwin/amd64`
+Tailscale interactive browser auth on `mac-mini-old` and absent `linux/arm64`
+hardware), leaving `br ready` with zero leaf tasks. Splitting the local,
+runner-independent `ee81c286` repairs into `bv-apal.14` / `bv-apal.15` (`RC-P2a`)
+makes `bv-apal.14` immediately claimable (`br ready` and `bv --robot-triage` top
+pick) without weakening any gate on `bv-oonu.9`, `bv-oonu.10`, `bv-apal.3`,
+`bv-apal.4`, or `bv-oonu.11`.
+
+### Ambition round 3 — bind the post-`v0.25.2` SQLite WAL and worker-context cohort
+
+The 16 commits since `v0.25.2` (`4dacc3ea`..`ee81c286`) substantially reworked
+SQLite WAL snapshot isolation (`2b43691b`, `c604edc7`), transient WAL retry
+(`678a6e8e`), continuous-write non-starvation (`90138b0f`), polling recovery
+(`78a0d368`, `581700b7`), incomplete-authority withholding (`d1ef8fbf`),
+superseded mailbox fencing (`a5acc7be`), and worker-lifetime context
+cancellation (`ac479059`, `ee81c286`). The last two commit messages noted that
+full `go1.26.8` / `modernc.org/sqlite` repository validation had not yet run in
+their isolated commit harness. This reality check executed and passed the
+`-race` unit tests for `internal/datasource` (`TestSQLiteContext*`) and
+`pkg/ui` (`TestWorker*`) plus the 58-command `robot_smoke.sh` suite on
+`go1.26.8`, and `bv-oonu.11` now explicitly binds the `4dacc3ea`..`ee81c286`+
+cohort into the final clean-source release gate and sealed package verification.
+
+### Phase 5 — five plan-space refinement passes (2026-10-13)
+
+Each pass applied the frozen Phase 5 template verbatim across all 9 non-closed
+beads (`bv-apal`, `bv-apal.3`, `bv-apal.4`, `bv-apal.14`, `bv-apal.15`,
+`bv-oonu`, `bv-oonu.9`, `bv-oonu.10`, `bv-oonu.11`):
+
+| Pass | Findings and revisions applied via `br` |
+|---|---|
+| 1 | Reconciled `bv-apal.4` checked items against BrightBison's 2026-09-18 independent verification (`50218e8d...`) and closed `bv-lbmh` (`27b1e48e`): ticked items 8 and 9 in place via `br update bv-apal.4 --check-acceptance 8,9` and appended the `RC-P2a` (`bv-apal.15`) verification criterion. Updated `bv-apal.3` notes and acceptance to record closed `bv-apal.1`/`bv-apal.2` (`3f02433e`) and depend on `bv-apal.15`. |
+| 2 | Updated `bv-oonu.9` and `bv-oonu.10` notes to reflect the 4/5 proven native platforms (including Windows Attempt 6 foreground `-FromSource` first invocation in `615 ms` on `oldsurface`, SHA-256 `567b57e3...`, and `darwin/arm64` on `mac-mini-max`, SHA-256 `99f39263...`), the four post-`a43b8e85` installer fixes (`be0e8beb`, `508d429d`, `409f0409`, `a84e7081`), and the exact remaining runner gap (`darwin/amd64` Tailscale browser auth and absent `linux/arm64` host). |
+| 3 | Extended `bv-oonu.11` acceptance criteria (item 10) and notes to bind the 16 post-`v0.25.2` commits (`4dacc3ea`..`ee81c286`, GH #210 and GH #555) and the new 19th implementation/proof pair (`bv-apal.14` / `bv-apal.15`) into the final clean-source release gate (`scripts/release_gate.sh run` + `package` + `verify` on `go1.26.8` with `br >= 0.6.0`). |
+| 4 | Hardened `bv-apal.14` and `bv-apal.15` edge-case specifications: shallow-clone fallback (`git cat-file -e <sha>^{commit}`) in `TestReadme_NoUnpinnedPipedInstallers`, artifact-driven expected values in `TestDocsParity_PagesLoadProseMatchesArtifact` so future `BV_RECORD_PERF=1` runs stay synchronized, reconciliation of the unmarked `AGENTS.md:545-635` section alongside `AGENTS.md:897-1014`, and explicit negative-control commands against `git show ee81c286:AGENTS.md` and `git show ee81c286:README.md`. |
+| 5 | Verified whole-graph convergence across all 678 beads (669 closed, 7 open, 2 blocked, 0 in_progress): `br dep cycles --json` reports 0 cycles; `br ready --json` surfaces `bv-apal.14` (P1) as the ready executable leaf task; `bv --robot-triage` selects `bv-apal.14` as `#1` in `quick_ref.top_picks` (`score: 0.1374`, `claimable: true`, unblocks `bv-apal.15`). No further substantive plan-space changes needed. |
+
 ## Installer diagnostics and live tracker recheck — 2026-09-10
 
 - [x] Read the complete AGENTS/README, inspect loading, readiness and action
@@ -507,15 +785,22 @@ installed `br` is 0.5.11, SHA-256
 
 ### Rescore of all 43 accepted goals
 
-Updated 2026-09-16 against runtime `04a0107b`; dated assessments below remain
-historical records. The retained `/tmp/bv-standard-final-tests-20260916.log`
-records strict-RCH build/vet, the focused correlation-cache race checks and
-`go test ./... -count=1 -timeout=30m` passing. Its nonverbose package results
-do not inventory skips or prove live `br` was on PATH. The final binary's
-desktop/mobile/offline/update browser journeys also passed, retained in
-`/tmp/bv-final-general-browser-20260916.log`. Neither result is the pending
-clean-source release gate, sealed package proof, original P1 matrix or missing
-native qualification.
+Updated 2026-10-13 against runtime `ee81c286` (superseding the 2026-09-16
+`04a0107b` snapshot while retaining dated assessments below as historical
+records). Since `04a0107b`, `bv-643f`, `bv-z38b`, `bv-q0po`, `bv-lbmh`,
+`bv-apal.1`, `bv-apal.2`, `bv-y3m9`, and `bv-f22j` closed with verified
+evidence; `v0.25.1` (`4db2f8dc`) and `v0.25.2` (`721353e7`) shipped with
+complete 10-stage release receipts; native `darwin/arm64` (`mac-mini-max`) and
+native Windows `-FromSource` first start (`615 ms` on `oldsurface`) passed on
+`bv-oonu.9`; and 16 post-`v0.25.2` commits (`4dacc3ea`..`ee81c286`) repaired
+fuzzy-filter visible-row selection (GH #210) and SQLite WAL single-snapshot
+authority, transient retry, non-starvation, polling recovery, mailbox fencing,
+and worker-lifetime context cancellation (GH #555). Fresh `go1.26.8` checks at
+`ee81c286` pass `gofmt`, `go build ./...`, `go vet ./...`, `go generate ./...`,
+`check_action_pins.sh`, `verify_vendor.sh`, 58/58 `robot_smoke.sh` cases
+(`/data/tmp/bv-robot-smoke.3pmEwV`), 17/17 `TestDocsParity_*` E2E tests, and
+`-race` runs of `internal/datasource` (`TestSQLiteContext*`) and `pkg/ui`
+(`TestWorker*`).
 
 `Working` means the bounded implemented behavior has supporting evidence;
 it does not mean every platform or input was freshly retested. Prior detailed
@@ -526,47 +811,47 @@ overrides an earlier working classification.
 |---|---|---|
 | 1 | Current and legacy issue loading | Working; vendored decoder repair shipped; source installs must retain vendor |
 | 2 | Robust JSONL parsing | Working; incomplete-source diagnostics retained |
-| 3 | Source/DB/worktree selection | Working; canonical JSONL precedence, explicit overrides and selected-source/WAL refresh repaired; V5 covers missing native runs |
+| 3 | Source/DB/worktree selection | Working; canonical JSONL precedence, explicit overrides, single-snapshot SQLite authority (`2b43691b`, `d1ef8fbf`) and WAL refresh repaired; V5 covers missing native runs |
 | 4 | Namespaced workspace aggregation | Working; partial authority remains explicit |
 | 5 | Two-phase graph analysis | Working; size-tiered status, not a universal deadline |
 | 6 | Centrality and critical path metrics | Working within exact/approximate status contract |
 | 7 | Cycles/core/articulation/slack | Working; representative SCC cycles, not all cycles |
-| 8 | Repeatability and computation status | Partial; timeout-boundary/full-cohort proof, P1 |
+| 8 | Repeatability and computation status | Working; 72 timed CLI + 36 exact parity records (0 mismatches) and metric-state parity verified in closed `bv-apal.1` / `bv-apal.2` (`benchmarks/bb-p1-matrix-20260918-evidence/`) |
 | 9 | Ranked triage and reasons | Working; heuristic scores |
 | 10 | Readiness, tracks and unblock counts | Working; external claim safety is row 11 |
-| 11 | Justified next actions | Working with br >=0.6.0; original routes, stale closed/claimed/deferred refusals and native concurrent claims verified in closed S5 pair; final-source live replay remains part of final acceptance |
+| 11 | Justified next actions | Working with `br >= 0.6.0` (`br 0.7.4` installed); original routes, stale closed/claimed/deferred refusals and native concurrent claims verified in closed S5 pair; final-source live replay remains part of `bv-oonu.11` |
 | 12 | Feedback and reset | Working within existing tested behavior |
 | 13 | Shared robot source/scope metadata | Working; shape smoke alone is insufficient proof |
 | 14 | Composed scopes | Working within existing positive and empty-intersection controls |
 | 15 | Historical analysis and diffs | Working with declared historical exceptions |
-| 16 | Help/schema/formats | Working; corrected defaults/examples have executable checks; final documentation proof remains row 42 |
-| 17 | TOON | Working when actual encoder available; no universal token saving |
+| 16 | Help/schema/formats | Working; `--robot-schema` runtime type parity (`435b8755`) and corrected defaults/examples have executable checks; final documentation proof remains row 42 |
+| 17 | TOON | Working when actual encoder available; JSON fallback self-describes `output_format: "json"` (`5194cb18`); no universal token saving |
 | 18 | Recipe loading/filtering/sort | Working |
 | 19 | Recipe presentation/navigation | Working within recorded rendered/PTY checks |
 | 20 | Recipe exports/templates | Working |
-| 21 | Hash retrieval and graph ranking | Working; not learned semantic embeddings |
-| 22 | Search quality at scale | Partial; frozen agent-authored corpus is not human generalization, P5 scope retained |
-| 23 | Git correlation | Working; guarded full-to-filtered cache reuse and truncated-cache recovery verified; final standard suite passes the unchanged repository timing assertion, without a universal latency claim |
+| 21 | Hash retrieval and graph ranking | Working; exact ID search preserved across >75 hybrid matches (`00225577`); not learned semantic embeddings |
+| 22 | Search quality at scale | Partial; frozen agent-authored corpus is not human generalization, P5 scope retained (`bv-apal.9` / `bv-apal.10` closed within narrowed scope) |
+| 23 | Git correlation | Working; deterministic multi-bead ordering (`61bbc9a4`), full-SHA commit identity (`04ea45c6`), and deletion lifecycle event (`d49d0e0f`) verified |
 | 24 | Orphans/file relations/impact | Working within existing tests |
 | 25 | Sprint/burndown/risk | Working; exported timeline includes current sprint-definition markers, not reconstructed historical sprint definitions |
-| 26 | Forecast/capacity | Working as duration/velocity heuristics, not a scheduler |
-| 27 | Label health/flow/attention | Working; actual directed pairs, endpoint detail/navigation and refresh proven by closed bv-apal.12/.13; no invented critical-path annotation |
+| 26 | Forecast/capacity | Working as duration/velocity heuristics (8-hour workday divisor documented), not a scheduler |
+| 27 | Label health/flow/attention | Working; actual directed pairs, endpoint detail/navigation and refresh proven by closed `bv-apal.12`/`.13`; dead `LabelStat.OnCriticalPath` removed in `bv-lbmh` (`27b1e48e`) |
 | 28 | Alerts/baselines/hygiene | Working; advisory suggestions and source-bound actions retain their separate contracts |
-| 29 | List/detail/board/tree/graph/insights | Working; rootless hierarchy components and detached snapshot occurrences repaired; responsiveness remains row 41 |
-| 30 | Reload/snapshot/stale-result handling | Working within tested consumers; Flow refresh, selected SQLite WAL updates and browser graph/timeline cleanup have regressions; large-load timing remains P1 |
+| 29 | List/detail/board/tree/graph/insights | Working; terminal bounds (`12ae9975`), sidebar layout (`d404af74`), visible-row fuzzy selection (`4dacc3ea`, `6c6efa15`), and rootless hierarchy components (`6a7252b1`, `6334631d`) repaired |
+| 30 | Reload/snapshot/stale-result handling | Working; single-snapshot SQLite authority, transient WAL retry, continuous-write non-starvation, polling recovery, mailbox generation fencing, and per-operation worker-lifetime context cancellation verified (`0ee3a2ad`..`ee81c286`, GH #555) |
 | 31 | Tutorial/help/sidebar/cass | Working; real cass hit/preview/time adapter and separate asynchronous session modal; advisory index health remains visible and external availability is required |
-| 32 | Report and graph exports | Working; validated topology-bound layout/complete centrality reuse and fallback retain source authority; bounded browser startup proof is not P1 |
-| 33 | SQLite dashboard/assets | Working; SQLite batch rollback and actual lifecycle-event timeline with retained-window baseline, removals/reintroduction and canvas transitions; deleted-only nodes absent from current export are not reconstructed; browser search fallback differs from native FTS5 |
+| 32 | Report and graph exports | Working; validated topology-bound layout/complete centrality reuse and fallback retain source authority (`bv-643f` closed `04a0107b`) |
+| 33 | SQLite dashboard/assets | Working; full-ancestry time-travel commit ordering across merges and renamed trackers (`bbe40d02`, `d81990f4`) and 1,000-node/21-commit playback p99 `33.335 ms` verified (`bv-z38b` closed `04a0107b`) |
 | 34 | Offline/mobile dashboard | Working in recorded Chromium desktop/mobile viewport; other browsers/physical phones unproven |
 | 35 | Hooks/browser opt-out | Working |
-| 36 | Verified update/download | Working in recorded Linux/Windows journeys |
-| 37 | Source-bound release bytes | Working for published v0.25.0; final runtime 04a0107b still needs its own complete clean gate and sealed package verification, bv-oonu.11 |
-| 38 | Vendored asset provenance | Working; version-suffixed go install bypasses vendor repairs |
-| 39 | Native installs/upgrades | Partial; v0.25.0 Linux amd64/macOS arm64/Windows amd64 archives and Linux Nix build/existing-store profile verified; missing native macOS amd64/Linux arm64 and current Windows source first-start remain V5, with public Nix route/upgrade scope explicit |
-| 40 | Local/remote verification | Partial final acceptance; standard full suite/build/vet and focused cache race pass through strict RCH, installed br 0.6.0 has separate S5 proof; current complete release receipt and explicit live/skip inventory remain required |
-| 41 | Large-project responsiveness | Partial; original final P1 gate still red; no terminal-paint guarantee |
-| 42 | Accurate executable documentation | Corrected README/SKILL prose, copied YAML/jq, duration units and runtime defaults have source/CLI checks; P2 final proof remains open behind original P1/native dependencies |
-| 43 | Recorded waits and evidenced causal links | Working within original repaired four-commit producer/CLI acceptance |
+| 36 | Verified update/download | Working in recorded Linux/Windows/macOS journeys; `install.sh` `jq`-only release parsing (`409f0409`) and macOS Go `.pkg` SHA-256 check (`a84e7081`) shipped in `v0.25.2` |
+| 37 | Source-bound release bytes | Working for published `v0.25.0`, `v0.25.1` (`4db2f8dc`), and `v0.25.2` (`721353e7`); post-`v0.25.2` runtime `ee81c286`+ awaits its own complete clean gate and sealed package verification in `bv-oonu.11` |
+| 38 | Vendored asset provenance | Working; `verify_vendor.sh` (15 entries, 0 problems) and `third_party/` vendor replacements verified; version-suffixed `go install` bypasses vendor repairs |
+| 39 | Native installs/upgrades | Partial; 4 of 5 advertised platforms natively proven (`linux/amd64`, `darwin/arm64` on `mac-mini-max` in `1251 ms`, `windows/amd64` including Attempt 6 foreground `-FromSource` first start in `615 ms` on `oldsurface` and `bv-y3m9` built-toolchain reporting, plus Linux `amd64` Nix); missing native `darwin/amd64` (`mac-mini-old` Tailscale auth) and `linux/arm64` (no fleet host) remain in `bv-oonu.9` / `bv-oonu.10`, and `README.md` `a43b8e85` installer pin drift is owned by `bv-apal.14` / `bv-apal.15` |
+| 40 | Local/remote verification | Partial final acceptance; `v0.25.2` passed all 10 gate stages on `vmi1149989`, and `ee81c286` passes local `go1.26.8` build/vet/docgen/smoke and SQLite/worker `-race` suites; final post-`ee81c286` clean-source release receipt and skip inventory remain in `bv-oonu.11` |
+| 41 | Large-project responsiveness | Working; paired 1k/5k/10k latency matrix (`288` UI records / `288,000` samples, current max p99 `35.694 ms <= 50 ms` SLO with `0` breaches, `90127f77` `SetContent` skip, `3924cdda` pointer snapshot swap) passed and was independently verified in closed `bv-apal.1` / `bv-apal.2` (`benchmarks/bb-p1-matrix-20260918-evidence/`); descriptive `Update+View` cohort, not a terminal-paint guarantee |
+| 42 | Accurate executable documentation | Partial; copied YAML/jq, `robot_wall.json` (`bv-q0po`), `--robot-schema` (`435b8755`), and Flow/recipe/cass/insights-limit checks (`bv-apal.4` items 8–9) pass, while `bv-apal.14` / `bv-apal.15` own the four `ee81c286` drifts (`AGENTS.md` `v5` vs `v7`, `README.md` `a43b8e85` installer pin, `README.md` `pages_load.json` `9.7 MB` vs `17.5 MB` table/tree, and `CHANGELOG.md` `Unreleased` for `4dacc3ea`..`ee81c286`) ahead of `bv-apal.3` / `bv-apal.4` |
+| 43 | Recorded waits and evidenced causal links | Working within original repaired four-commit producer/CLI acceptance and deletion chronology (`d49d0e0f`) |
 
 ### Bridge and granular TODO
 

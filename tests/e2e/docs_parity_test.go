@@ -619,18 +619,75 @@ func TestDocsParity_ReadmeBlurbMatchesGenerated(t *testing.T) {
 	}
 }
 
-// TestReadme_NoUnpinnedPipedInstallers (G1): the README must never tell
-// users to pipe a script from the moving main branch into a shell; every
-// raw.githubusercontent.com installer URL has to name a commit SHA.
+// TestReadme_NoUnpinnedPipedInstallers (G1 / bv-apal.14): the README must never
+// tell users to pipe a script from the moving main branch into a shell; every
+// raw.githubusercontent.com installer URL has to name a commit SHA whose
+// install.sh / install.ps1 blob matches HEAD.
 func TestReadme_NoUnpinnedPipedInstallers(t *testing.T) {
-	readme := repoFile(t, "README.md")
-	if strings.Contains(readme, "beads_viewer/main/install") {
-		t.Fatalf("README pipes an installer from the moving main branch; pin it to a commit SHA")
+	repo, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
 	}
-	pinned := regexp.MustCompile(`raw\.githubusercontent\.com/Dicklesworthstone/beads_viewer/([0-9a-f]{40})/install\.(sh|ps1)`)
-	if len(pinned.FindAllString(readme, -1)) < 2 {
-		t.Fatalf("expected the install.sh and install.ps1 examples to be pinned to a 40-hex commit")
+	checkReadme := func(readme string) error {
+		if strings.Contains(readme, "beads_viewer/main/install") {
+			return fmt.Errorf("README pipes an installer from the moving main branch; pin it to a commit SHA")
+		}
+		pinned := regexp.MustCompile(`(?:github\.com/Dicklesworthstone/beads_viewer/blob|raw\.githubusercontent\.com/Dicklesworthstone/beads_viewer)/([0-9a-f]{40})/(install\.(?:sh|ps1))`)
+		matches := pinned.FindAllStringSubmatch(readme, -1)
+		if len(matches) < 4 {
+			return fmt.Errorf("expected the install.sh and install.ps1 examples to be pinned to a 40-hex commit, found %d", len(matches))
+		}
+		if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+			return nil
+		}
+		for _, m := range matches {
+			sha, script := m[1], m[2]
+			catCmd := exec.Command("git", "cat-file", "-e", sha+"^{commit}")
+			catCmd.Dir = repo
+			if err := catCmd.Run(); err != nil {
+				t.Logf("skipping blob check for %s:%s (commit not in local history): %v", sha, script, err)
+				continue
+			}
+			pinnedCmd := exec.Command("git", "rev-parse", fmt.Sprintf("%s:%s", sha, script))
+			pinnedCmd.Dir = repo
+			pinnedBlob, err := pinnedCmd.Output()
+			if err != nil {
+				return fmt.Errorf("git rev-parse %s:%s failed: %w", sha, script, err)
+			}
+			headCmd := exec.Command("git", "rev-parse", fmt.Sprintf("HEAD:%s", script))
+			headCmd.Dir = repo
+			headBlob, err := headCmd.Output()
+			if err != nil {
+				return fmt.Errorf("git rev-parse HEAD:%s failed: %w", script, err)
+			}
+			if strings.TrimSpace(string(pinnedBlob)) != strings.TrimSpace(string(headBlob)) {
+				return fmt.Errorf("README.md pins %s to commit %s (blob %s), which does not match HEAD:%s (blob %s)",
+					script, sha, strings.TrimSpace(string(pinnedBlob)), script, strings.TrimSpace(string(headBlob)))
+			}
+		}
+		return nil
 	}
+
+	if err := checkReadme(repoFile(t, "README.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("negative_control_ee81c286", func(t *testing.T) {
+		if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+			t.Skip("git repository metadata not present")
+		}
+		cmd := exec.Command("git", "show", "ee81c286e89ed6f9d5d10c62da307cafe95c710b:README.md")
+		cmd.Dir = repo
+		oldReadme, err := cmd.Output()
+		if err != nil {
+			t.Skipf("pre-fix commit ee81c286 not available in clone: %v", err)
+		}
+		err = checkReadme(string(oldReadme))
+		if err == nil {
+			t.Fatal("expected pre-fix ee81c286 README.md (pinned to a43b8e85) to fail blob parity check, but it passed")
+		}
+		t.Logf("negative control rejected stale ee81c286 README.md as expected: %v", err)
+	})
 }
 
 // TestDocsParity_NoStaleBehaviourPhrases (F4): wording that once described
@@ -1187,4 +1244,146 @@ func TestDocsParity_InstallersReportBuiltToolchain(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDocsParity_RepoAgentsMDHasCurrentBlurb (bv-apal.14): guards against
+// bumping pkg/agents.BlurbVersion without running --agents-update on the
+// repository's own AGENTS.md.
+func TestDocsParity_RepoAgentsMDHasCurrentBlurb(t *testing.T) {
+	repo, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAgentsDir := func(dir string) error {
+		detection := agents.DetectAgentFile(dir)
+		if !detection.Found() {
+			return fmt.Errorf("AGENTS.md not found in %s", dir)
+		}
+		if !detection.HasBlurb || detection.NeedsBlurb() || detection.NeedsUpgrade() || detection.HasMalformedBlurb() {
+			return fmt.Errorf("AGENTS.md blurb is out of date or malformed: version=%d want=%d needsUpgrade=%v err=%q",
+				detection.BlurbVersion, agents.BlurbVersion, detection.NeedsUpgrade(), detection.BlurbStructureError)
+		}
+		if detection.BlurbVersion != agents.BlurbVersion || detection.BlurbCount != 1 || detection.BlurbStructureError != "" {
+			return fmt.Errorf("AGENTS.md BlurbVersion=%d (want %d), BlurbCount=%d (want 1), err=%q",
+				detection.BlurbVersion, agents.BlurbVersion, detection.BlurbCount, detection.BlurbStructureError)
+		}
+		if !strings.Contains(detection.Content, agents.AgentBlurb) {
+			return fmt.Errorf("AGENTS.md does not contain the exact current agents.AgentBlurb text")
+		}
+		if strings.Contains(detection.Content, "br update <id> --status=in_progress") {
+			return fmt.Errorf("AGENTS.md still contains stale '--status=in_progress' claim guidance instead of '--claim'")
+		}
+		return nil
+	}
+
+	if err := checkAgentsDir(repo); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("negative_control_ee81c286", func(t *testing.T) {
+		if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+			t.Skip("git repository metadata not present")
+		}
+		cmd := exec.Command("git", "show", "ee81c286e89ed6f9d5d10c62da307cafe95c710b:AGENTS.md")
+		cmd.Dir = repo
+		oldAgents, err := cmd.Output()
+		if err != nil {
+			t.Skipf("pre-fix commit ee81c286 not available in clone: %v", err)
+		}
+		tmp := t.TempDir()
+		if err := os.WriteFile(filepath.Join(tmp, "AGENTS.md"), oldAgents, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err = checkAgentsDir(tmp)
+		if err == nil {
+			t.Fatal("expected pre-fix ee81c286 AGENTS.md (v5 blurb) to fail currency check, but it passed")
+		}
+		t.Logf("negative control rejected stale ee81c286 AGENTS.md as expected: %v", err)
+	})
+}
+
+// TestDocsParity_PagesLoadProseMatchesArtifact (bv-apal.14): guards README.md's
+// static-export size and date citations against drift from
+// tests/artifacts/perf/pages_load.json (mirroring TestDocsParity_RobotWallProseMatchesArtifact).
+func TestDocsParity_PagesLoadProseMatchesArtifact(t *testing.T) {
+	repo, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(repo, "tests", "artifacts", "perf", "pages_load.json"))
+	if err != nil {
+		t.Fatalf("read pages_load.json: %v", err)
+	}
+	var artifact struct {
+		GeneratedAt string `json:"generated_at"`
+		Issues      int    `json:"issues"`
+		Edges       int    `json:"edges"`
+		Bytes       struct {
+			IndexHTML       int64 `json:"index_html"`
+			BeadsSQLite3    int64 `json:"beads_sqlite3"`
+			GraphLayoutJSON int64 `json:"graph_layout_json"`
+			TriageJSON      int64 `json:"triage_json"`
+			HistoryJSON     int64 `json:"history_json"`
+			VendorTotal     int64 `json:"vendor_total"`
+			BundleTotal     int64 `json:"bundle_total"`
+		} `json:"bytes"`
+	}
+	if err := json.Unmarshal(raw, &artifact); err != nil {
+		t.Fatalf("decode pages_load.json: %v", err)
+	}
+	genTime, err := time.Parse(time.RFC3339, artifact.GeneratedAt)
+	if err != nil {
+		t.Fatalf("parse pages_load.json generated_at %q: %v", artifact.GeneratedAt, err)
+	}
+
+	indexKB := fmt.Sprintf("%d KB", (artifact.Bytes.IndexHTML+500)/1000)
+	layoutKB := fmt.Sprintf("%d KB", (artifact.Bytes.GraphLayoutJSON+500)/1000)
+	triageKB := fmt.Sprintf("%d KB", (artifact.Bytes.TriageJSON+500)/1000)
+	historyKB := fmt.Sprintf("%d KB", (artifact.Bytes.HistoryJSON+500)/1000)
+	sqliteMB := fmt.Sprintf("%.1f MB", float64(artifact.Bytes.BeadsSQLite3)/1e6)
+	bundleMB := fmt.Sprintf("%.1f MB", float64(artifact.Bytes.BundleTotal)/1e6)
+	vendorMB := fmt.Sprintf("%.1f MB", float64(artifact.Bytes.VendorTotal)/1e6)
+	dateStr := genTime.UTC().Format("January 2, 2006")
+
+	mustContain := map[string]string{
+		"tree index.html size":                    fmt.Sprintf("(%s)", indexKB),
+		"tree beads.sqlite3 size and issue count": fmt.Sprintf("%s for this repository's %d issues", sqliteMB, artifact.Issues),
+		"tree graph_layout.json size and counts":  fmt.Sprintf("(%s for %d issues / %d edges)", layoutKB, artifact.Issues, artifact.Edges),
+		"tree triage.json size":                   fmt.Sprintf("(%s)", triageKB),
+		"tree history.json size":                  fmt.Sprintf("(%s)", historyKB),
+		"table graph_layout.json row":             fmt.Sprintf("| `graph_layout.json` | %s for %d issues / %d edges |", layoutKB, artifact.Issues, artifact.Edges),
+		"table beads.sqlite3 row":                 fmt.Sprintf("| `beads.sqlite3` | %s for %d issues |", sqliteMB, artifact.Issues),
+		"bundle_total and vendor_total prose":     fmt.Sprintf("whole bundle %s, of which %s is the vendored viewer libraries", bundleMB, vendorMB),
+		"5 MiB SQLite chunking explanation":       "5 MiB",
+		"retained export date":                    fmt.Sprintf("retained %s export", dateStr),
+	}
+	checkReadme := func(readme string) error {
+		for what, want := range mustContain {
+			if !strings.Contains(readme, want) {
+				return fmt.Errorf("README static-export section does not match pages_load.json for %s: missing %q", what, want)
+			}
+		}
+		return nil
+	}
+
+	if err := checkReadme(repoFile(t, "README.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("negative_control_ee81c286", func(t *testing.T) {
+		if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+			t.Skip("git repository metadata not present")
+		}
+		cmd := exec.Command("git", "show", "ee81c286e89ed6f9d5d10c62da307cafe95c710b:README.md")
+		cmd.Dir = repo
+		oldReadme, err := cmd.Output()
+		if err != nil {
+			t.Skipf("pre-fix commit ee81c286 not available in clone: %v", err)
+		}
+		err = checkReadme(string(oldReadme))
+		if err == nil {
+			t.Fatal("expected pre-fix ee81c286 README.md (9.7 MB / 611 issues) to fail pages_load.json parity check, but it passed")
+		}
+		t.Logf("negative control rejected stale ee81c286 README.md as expected: %v", err)
+	})
 }

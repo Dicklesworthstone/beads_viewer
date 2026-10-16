@@ -894,7 +894,7 @@ Also, if I ask you to explicitly use your built-in TODO functionality, don't com
 
 For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
 
-<!-- bv-agent-instructions-v5 -->
+<!-- bv-agent-instructions-v7 -->
 
 ---
 
@@ -951,7 +951,7 @@ Recommendations can include blocked or assigned work; `triage.quick_ref.top_pick
 | `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues |
 | `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
 
-Every robot command emits one JSON object; with `--graph-format=dot` or `mermaid` the diagram text is the `graph` field (`bv --robot-graph --graph-format=dot | jq -r .graph`), not the whole output.
+Robot analysis commands default to JSON; `--format toon` selects TOON, and `--robot-help` defaults to text. In JSON mode, `--graph-format=dot` or `mermaid` puts diagram text in the `graph` field (`bv --robot-graph --graph-format=dot | jq -r .graph`).
 
 #### Scoping & Filtering
 
@@ -968,12 +968,17 @@ Use exactly one command family, matching the tracker configured for the reposito
 
 #### Rust beads_rust (`br`)
 
+Use `br` 0.6.0 or newer when executing saved claim commands. It rechecks
+deferred status and future `defer_until` values when the claim runs, so a
+recommendation captured before a deferral cannot bypass it. This requirement
+applies to executing tracker claims.
+
 ```bash
 br ready --json                       # Show issues ready to work (no blockers)
 br list --status=open --json          # All open issues
 br show <id> --json                   # Full issue details with dependencies
 br create --title="..." --type=task --priority=2 --json
-br update <id> --status=in_progress --json
+br update <id> --claim --json         # Claim for the current actor and start work
 br close <id> --reason="Completed" --json
 br close <id1> <id2> --reason="Completed" --json
 br sync --flush-only                  # Export DB to JSONL after Beads mutations
@@ -995,7 +1000,7 @@ bd export -o .beads/issues.jsonl        # Refresh the compatibility export read 
 
 1. **Triage**: Run `bv --robot-triage` to find the highest-impact actionable work
 2. **Verify**: Check the selected tracker's `show`/`ready` output before claiming
-3. **Claim**: Use `br update <id> --status=in_progress --json` or `bd update <id> --claim --json`
+3. **Claim**: Use `br update <id> --claim --json` or `bd update <id> --claim --json`
 4. **Work**: Implement the task
 5. **Complete**: Use the selected tracker's `close` command
 6. **Refresh for bv**: Run `br sync --flush-only` or the `bd export` command above so the JSONL export is current
