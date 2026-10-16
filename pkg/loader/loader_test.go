@@ -1911,3 +1911,28 @@ func TestMetrics_LoaderParseRecorded(t *testing.T) {
 		t.Fatalf("loader.parse count advanced by %d, want 1", got)
 	}
 }
+
+func TestParseIssues_NativeDueAtAndPrecedence(t *testing.T) {
+	jsonl := strings.Join([]string{
+		`{"id":"DUE-1","title":"Native due_at","status":"open","priority":1,"issue_type":"task","due_at":"2026-11-15T00:00:00Z"}`,
+		`{"id":"DUE-2","title":"Both due_date and due_at","status":"open","priority":1,"issue_type":"task","due_date":"2026-10-01T00:00:00Z","due_at":"2026-12-01T00:00:00Z"}`,
+		`{"id":"DUE-3","title":"Explicit null due_at overrides legacy due_date","status":"open","priority":1,"issue_type":"task","due_date":"2026-10-01T00:00:00Z","due_at":null}`,
+	}, "\n") + "\n"
+
+	issues, err := loader.ParseIssuesWithOptions(strings.NewReader(jsonl), loader.ParseOptions{})
+	if err != nil {
+		t.Fatalf("ParseIssuesWithOptions failed: %v", err)
+	}
+	if len(issues) != 3 {
+		t.Fatalf("got %d issues, want 3", len(issues))
+	}
+	if issues[0].DueDate == nil || issues[0].DueDate.Format("2006-01-02") != "2026-11-15" {
+		t.Fatalf("DUE-1 DueDate = %v, want 2026-11-15", issues[0].DueDate)
+	}
+	if issues[1].DueDate == nil || issues[1].DueDate.Format("2006-01-02") != "2026-12-01" {
+		t.Fatalf("DUE-2 DueDate = %v, want 2026-12-01 (due_at authoritative)", issues[1].DueDate)
+	}
+	if issues[2].DueDate != nil {
+		t.Fatalf("DUE-3 DueDate = %v, want nil when due_at is explicitly null", issues[2].DueDate)
+	}
+}

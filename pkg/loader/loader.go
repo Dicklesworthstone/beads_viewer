@@ -1209,7 +1209,7 @@ func processIssueLine(
 
 	if usePool {
 		issue := GetIssue()
-		if err := json.Unmarshal(line, issue); err != nil {
+		if err := unmarshalIssueLine(line, issue); err != nil {
 			PutIssue(issue)
 			if stats != nil {
 				stats.Errors++
@@ -1249,7 +1249,7 @@ func processIssueLine(
 	}
 
 	var issue model.Issue
-	if err := json.Unmarshal(line, &issue); err != nil {
+	if err := unmarshalIssueLine(line, &issue); err != nil {
 		if stats != nil {
 			stats.Errors++
 		}
@@ -1279,6 +1279,39 @@ func processIssueLine(
 
 	issues = append(issues, issue)
 	return issues, poolRefs
+}
+
+type dueAtProbe struct {
+	DueAt stdjson.RawMessage `json:"due_at"`
+}
+
+// unmarshalIssueLine decodes a JSONL issue record while honoring br's native
+// "due_at" deadline field alongside "due_date". Mirrors internal/datasource/sqlite.go:
+// when "due_at" is present on the JSON object, it is authoritative over "due_date"
+// (even when "due_at": null).
+func unmarshalIssueLine(line []byte, issue *model.Issue) error {
+	if err := json.Unmarshal(line, issue); err != nil {
+		return err
+	}
+	if bytes.Contains(line, []byte(`"due_at"`)) {
+		var probe dueAtProbe
+		if err := json.Unmarshal(line, &probe); err != nil {
+			return err
+		}
+		if len(probe.DueAt) > 0 {
+			raw := bytes.TrimSpace(probe.DueAt)
+			if bytes.Equal(raw, []byte("null")) {
+				issue.DueDate = nil
+			} else {
+				var due time.Time
+				if err := json.Unmarshal(raw, &due); err != nil {
+					return err
+				}
+				issue.DueDate = &due
+			}
+		}
+	}
+	return nil
 }
 
 // Parallel-parse tuning. JSONL is line-independent, so for large files the

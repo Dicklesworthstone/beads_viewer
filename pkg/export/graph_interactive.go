@@ -54,11 +54,13 @@ type graphNode struct {
 	Labels   []string `json:"labels"`
 	Assignee string   `json:"assignee,omitempty"`
 
-	// Timestamps
-	CreatedAt string `json:"created_at,omitempty"`
-	UpdatedAt string `json:"updated_at,omitempty"`
-	ClosedAt  string `json:"closed_at,omitempty"`
-	DueDate   string `json:"due_date,omitempty"`
+	// Timestamps & external reference
+	CreatedAt   string `json:"created_at,omitempty"`
+	UpdatedAt   string `json:"updated_at,omitempty"`
+	ClosedAt    string `json:"closed_at,omitempty"`
+	DueDate     string `json:"due_date,omitempty"`
+	DeferUntil  string `json:"defer_until,omitempty"`
+	ExternalRef string `json:"external_ref,omitempty"`
 
 	// Dependencies
 	BlockedBy []string `json:"blocked_by,omitempty"`
@@ -196,6 +198,14 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		if iss.DueDate != nil {
 			dueDate = iss.DueDate.Format("2006-01-02")
 		}
+		deferUntil := ""
+		if iss.DeferUntil != nil {
+			deferUntil = iss.DeferUntil.Format("2006-01-02")
+		}
+		externalRef := ""
+		if iss.ExternalRef != nil {
+			externalRef = *iss.ExternalRef
+		}
 
 		// Get history data if available
 		var commits []correlation.CorrelatedCommit
@@ -227,11 +237,13 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			Labels:   iss.Labels,
 			Assignee: iss.Assignee,
 
-			// Timestamps
-			CreatedAt: createdAt,
-			UpdatedAt: updatedAt,
-			ClosedAt:  closedAt,
-			DueDate:   dueDate,
+			// Timestamps & external reference
+			CreatedAt:   createdAt,
+			UpdatedAt:   updatedAt,
+			ClosedAt:    closedAt,
+			DueDate:     dueDate,
+			DeferUntil:  deferUntil,
+			ExternalRef: externalRef,
 
 			// Dependencies
 			BlockedBy: blockedBy,

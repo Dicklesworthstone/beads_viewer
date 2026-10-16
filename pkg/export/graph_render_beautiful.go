@@ -1274,6 +1274,8 @@ function populatePanelContent(prefix, node) {
     addMeta('Created', node.created_at);
     addMeta('Updated', node.updated_at);
     addMeta('Due Date', node.due_date);
+    addMeta('Deferred Until', node.defer_until);
+    addMeta('External Ref', node.external_ref);
     if (node.closed_at) addMeta('Closed', node.closed_at);
 
     // Blocked By

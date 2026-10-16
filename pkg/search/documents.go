@@ -26,6 +26,12 @@ func IssueDocument(issue model.Issue) string {
 		parts = append(parts, labels)
 	}
 
+	if issue.ExternalRef != nil {
+		if extRef := strings.TrimSpace(*issue.ExternalRef); extRef != "" {
+			parts = append(parts, extRef)
+		}
+	}
+
 	desc := strings.TrimSpace(issue.Description)
 	if desc != "" {
 		parts = append(parts, desc)

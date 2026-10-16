@@ -124,6 +124,20 @@ Line 3`,
 			},
 			expected: "bv-123\nbv-123\nbv-123\nSearch boost\nSearch boost\nsearch hybrid\nLabels should be included",
 		},
+		{
+			name: "external_ref included when non-empty",
+			issue: func() model.Issue {
+				ref := "JIRA-4242"
+				return model.Issue{
+					ID:          "bv-424",
+					Title:       "External ref indexing",
+					Description: "Body text",
+					Labels:      []string{"tracker"},
+					ExternalRef: &ref,
+				}
+			}(),
+			expected: "bv-424\nbv-424\nbv-424\nExternal ref indexing\nExternal ref indexing\ntracker\nJIRA-4242\nBody text",
+		},
 	}
 
 	for _, tt := range tests {

@@ -1799,3 +1799,76 @@ func TestGenerateMarkdown_TombstoneIssueNoCommands(t *testing.T) {
 		t.Error("Tombstone issue should not have command snippets")
 	}
 }
+
+func TestExportSurfaces_DueDateDeferUntilExternalRef(t *testing.T) {
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	due := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
+	deferUntil := time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)
+	extRef := "GH-210|spec"
+	issue := model.Issue{
+		ID:          "EXP-1",
+		Title:       "Full metadata export",
+		Status:      model.StatusOpen,
+		Priority:    1,
+		IssueType:   model.TypeTask,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+		DueDate:     &due,
+		DeferUntil:  &deferUntil,
+		ExternalRef: &extRef,
+	}
+
+	md, err := GenerateMarkdown([]model.Issue{issue}, "Metadata Report")
+	if err != nil {
+		t.Fatalf("GenerateMarkdown failed: %v", err)
+	}
+	for _, want := range []string{
+		"| **Due** | 2026-11-20 |",
+		"| **Deferred Until** | 2026-10-25 |",
+		"| **External Ref** | `GH-210\\|spec` |",
+	} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("markdown export missing %q:\n%s", want, md)
+		}
+	}
+
+	sqliteExp := NewSQLiteExporter([]*model.Issue{&issue}, nil, nil, nil)
+	exported := sqliteExp.GetExportedIssues()
+	if len(exported) != 1 {
+		t.Fatalf("GetExportedIssues returned %d items, want 1", len(exported))
+	}
+	if exported[0].DueDate == nil || !exported[0].DueDate.Equal(due) {
+		t.Fatalf("ExportIssue.DueDate = %v, want %v", exported[0].DueDate, due)
+	}
+	if exported[0].DeferUntil == nil || !exported[0].DeferUntil.Equal(deferUntil) {
+		t.Fatalf("ExportIssue.DeferUntil = %v, want %v", exported[0].DeferUntil, deferUntil)
+	}
+	if exported[0].ExternalRef != extRef {
+		t.Fatalf("ExportIssue.ExternalRef = %q, want %q", exported[0].ExternalRef, extRef)
+	}
+
+	outPath, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues: []model.Issue{issue},
+		Title:  "Interactive Metadata",
+		Path:   filepath.Join(t.TempDir(), "graph.html"),
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML failed: %v", err)
+	}
+	htmlBytes, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) failed: %v", outPath, err)
+	}
+	htmlOut := string(htmlBytes)
+	for _, want := range []string{
+		`"due_date":"2026-11-20"`,
+		`"defer_until":"2026-10-25"`,
+		`"external_ref":"GH-210|spec"`,
+		`addMeta('Deferred Until', node.defer_until);`,
+		`addMeta('External Ref', node.external_ref);`,
+	} {
+		if !strings.Contains(htmlOut, want) {
+			t.Fatalf("interactive graph HTML missing %q", want)
+		}
+	}
+}

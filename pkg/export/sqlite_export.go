@@ -234,8 +234,8 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at, due_date, defer_until, external_ref)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -254,6 +254,21 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 			s := issue.ClosedAt.Format(time.RFC3339)
 			closedAt = &s
 		}
+		var dueDate *string
+		if issue.DueDate != nil {
+			s := issue.DueDate.Format(time.RFC3339)
+			dueDate = &s
+		}
+		var deferUntil *string
+		if issue.DeferUntil != nil {
+			s := issue.DeferUntil.Format(time.RFC3339)
+			deferUntil = &s
+		}
+		var externalRef *string
+		if issue.ExternalRef != nil && *issue.ExternalRef != "" {
+			s := *issue.ExternalRef
+			externalRef = &s
+		}
 
 		_, err := stmt.Exec(
 			issue.ID,
@@ -270,6 +285,9 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 			issue.CreatedAt.Format(time.RFC3339),
 			issue.UpdatedAt.Format(time.RFC3339),
 			closedAt,
+			dueDate,
+			deferUntil,
+			externalRef,
 		)
 		if err != nil {
 			return fmt.Errorf("insert issue %s: %w", issue.ID, err)
@@ -882,6 +900,10 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 
 	result := make([]ExportIssue, len(e.Issues))
 	for i, issue := range e.Issues {
+		extRef := ""
+		if issue.ExternalRef != nil {
+			extRef = *issue.ExternalRef
+		}
 		exp := ExportIssue{
 			ID:                 issue.ID,
 			Title:              issue.Title,
@@ -897,6 +919,9 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 			CreatedAt:          issue.CreatedAt,
 			UpdatedAt:          issue.UpdatedAt,
 			ClosedAt:           issue.ClosedAt,
+			DueDate:            issue.DueDate,
+			DeferUntil:         issue.DeferUntil,
+			ExternalRef:        extRef,
 		}
 
 		if m := e.Metrics; m != nil {

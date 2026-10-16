@@ -29,6 +29,9 @@ type ExportIssue struct {
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
 	ClosedAt           *time.Time      `json:"closed_at,omitempty"`
+	DueDate            *time.Time      `json:"due_date,omitempty"`
+	DeferUntil         *time.Time      `json:"defer_until,omitempty"`
+	ExternalRef        string          `json:"external_ref,omitempty"`
 
 	// Computed graph metrics
 	PageRank       float64  `json:"pagerank"`

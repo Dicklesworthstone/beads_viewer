@@ -452,8 +452,20 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 		}
 		sb.WriteString(fmt.Sprintf("| **Created** | %s |\n", i.CreatedAt.Format("2006-01-02 15:04")))
 		sb.WriteString(fmt.Sprintf("| **Updated** | %s |\n", i.UpdatedAt.Format("2006-01-02 15:04")))
+		if i.DueDate != nil {
+			sb.WriteString(fmt.Sprintf("| **Due** | %s |\n", i.DueDate.Format("2006-01-02")))
+		}
+		if i.DeferUntil != nil {
+			sb.WriteString(fmt.Sprintf("| **Deferred Until** | %s |\n", i.DeferUntil.Format("2006-01-02")))
+		}
 		if i.ClosedAt != nil {
 			sb.WriteString(fmt.Sprintf("| **Closed** | %s |\n", i.ClosedAt.Format("2006-01-02 15:04")))
+		}
+		if i.ExternalRef != nil && *i.ExternalRef != "" {
+			cleanRef := strings.ReplaceAll(*i.ExternalRef, "\n", " ")
+			cleanRef = strings.ReplaceAll(cleanRef, "\r", "")
+			escapedRef := strings.ReplaceAll(cleanRef, "|", "\\|")
+			sb.WriteString(fmt.Sprintf("| **External Ref** | `%s` |\n", escapedRef))
 		}
 		if len(i.Labels) > 0 {
 			// Escape pipe characters and sanitize newlines in labels
