@@ -137,7 +137,7 @@ echo '== cargo build (locked, offline, default features, isolated local compiler
   cd "$out/source/bv-graph-wasm"
   env -i HOME="$HOME" PATH="$PATH" LC_ALL=C \
     RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="$out/cargo" \
-    CARGO_TARGET_DIR="$out/target" CARGO_HTTP_USER_AGENT='OpenAI File Downloader, XaiImageApiFetch/1.0' \
+    CARGO_TARGET_DIR="$out/target" CARGO_HTTP_USER_AGENT='beads_viewer-build (+https://github.com/Dicklesworthstone/beads_viewer)' \
     RCH_CARGO_WRAPPER_BYPASS=1 \
     CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$out=/bv-build"$'\x1f'"--remap-path-prefix=$cargo_cache=/cargo"$'\x1f'"--remap-path-prefix=$rust_sysroot=/rust-toolchain"$'\x1f'"--remap-path-prefix=$resolved_sysroot=/rust-toolchain" \
     "$rustup" run "$toolchain" cargo build --locked --offline --release --target "$target" -j 2
