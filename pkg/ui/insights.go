@@ -394,7 +394,17 @@ func (m *InsightsModel) ToggleHeatmap() {
 	m.showHeatmap = !m.showHeatmap
 	if m.showHeatmap {
 		m.rebuildHeatmapGrid() // Refresh grid data when entering heatmap view
+	} else {
+		m.heatmapDrill = false
+		m.heatmapIssues = nil
+		m.heatmapDrillIdx = 0
 	}
+	m.updateDetailContent()
+}
+
+// IsHeatmapActive returns true when the Priority panel is focused and showing the heatmap.
+func (m *InsightsModel) IsHeatmapActive() bool {
+	return m.focusedPanel == PanelPriority && m.showHeatmap
 }
 
 // Heatmap navigation methods (bv-t4yg)
@@ -408,11 +418,13 @@ func (m *InsightsModel) HeatmapMoveUp() {
 	if m.heatmapDrill {
 		if m.heatmapDrillIdx > 0 {
 			m.heatmapDrillIdx--
+			m.updateDetailContent()
 		}
 		return
 	}
 	if m.heatmapRow > 0 {
 		m.heatmapRow--
+		m.updateDetailContent()
 	}
 }
 
@@ -421,11 +433,13 @@ func (m *InsightsModel) HeatmapMoveDown() {
 	if m.heatmapDrill {
 		if m.heatmapDrillIdx < len(m.heatmapIssues)-1 {
 			m.heatmapDrillIdx++
+			m.updateDetailContent()
 		}
 		return
 	}
 	if m.heatmapRow < heatmapDepthBuckets-1 {
 		m.heatmapRow++
+		m.updateDetailContent()
 	}
 }
 
@@ -436,6 +450,7 @@ func (m *InsightsModel) HeatmapMoveLeft() {
 	}
 	if m.heatmapCol > 0 {
 		m.heatmapCol--
+		m.updateDetailContent()
 	}
 }
 
@@ -446,6 +461,7 @@ func (m *InsightsModel) HeatmapMoveRight() {
 	}
 	if m.heatmapCol < heatmapScoreBuckets-1 {
 		m.heatmapCol++
+		m.updateDetailContent()
 	}
 }
 
@@ -462,6 +478,7 @@ func (m *InsightsModel) HeatmapEnter() {
 			m.heatmapIssues = issues
 			m.heatmapDrillIdx = 0
 			m.heatmapDrill = true
+			m.updateDetailContent()
 		}
 	}
 }
@@ -472,6 +489,7 @@ func (m *InsightsModel) HeatmapBack() {
 		m.heatmapDrill = false
 		m.heatmapIssues = nil
 		m.heatmapDrillIdx = 0
+		m.updateDetailContent()
 	}
 }
 
@@ -611,8 +629,20 @@ func (m *InsightsModel) SelectedIssueID() string {
 		return ""
 	}
 
-	// For priority panel, return selected TopPick's ID
+	// For priority panel, return selected heatmap issue (if heatmap active) or TopPick's ID
 	if m.focusedPanel == PanelPriority {
+		if m.showHeatmap {
+			if m.heatmapDrill {
+				return m.HeatmapSelectedIssueID()
+			}
+			if m.heatmapIssueMap != nil &&
+				m.heatmapRow >= 0 && m.heatmapRow < len(m.heatmapIssueMap) &&
+				m.heatmapCol >= 0 && m.heatmapCol < len(m.heatmapIssueMap[m.heatmapRow]) &&
+				len(m.heatmapIssueMap[m.heatmapRow][m.heatmapCol]) > 0 {
+				return m.heatmapIssueMap[m.heatmapRow][m.heatmapCol][0]
+			}
+			return ""
+		}
 		idx := m.selectedIndex[PanelPriority]
 		if idx >= 0 && idx < len(m.topPicks) {
 			return m.topPicks[idx].ID
@@ -1772,6 +1802,12 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 		sb.WriteString(fmt.Sprintf("| **Assignee** | @%s |\n", issue.Assignee))
 	}
 	sb.WriteString(fmt.Sprintf("| **Created** | %s |\n", issue.CreatedAt.Format("2006-01-02")))
+	if issue.DueDate != nil {
+		sb.WriteString(fmt.Sprintf("| **Due** | %s |\n", issue.DueDate.Format("2006-01-02")))
+	}
+	if issue.DeferUntil != nil {
+		sb.WriteString(fmt.Sprintf("| **Deferred Until** | %s |\n", issue.DeferUntil.Format("2006-01-02")))
+	}
 	// External reference (e.g. a linked spec/report path or JIRA ticket).
 	// `br show` surfaces this as a "Ref:" line; mirror it here so the link is
 	// visible in the TUI instead of forcing it into the description (#172).

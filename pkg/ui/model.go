@@ -803,6 +803,7 @@ type Model struct {
 	height                   int
 	showLabelHealthDetail    bool
 	showLabelDrilldown       bool
+	showVelocityComparison   bool
 	labelHealthDetail        *analysis.LabelHealth
 	labelHealthDetailFlow    labelFlowSummary
 	labelDrilldownLabel      string
@@ -941,8 +942,9 @@ type Model struct {
 	workDir          string // Working directory for agent file detection
 
 	// Tutorial integration (bv-8y31)
-	showTutorial  bool
-	tutorialModel TutorialModel
+	showTutorial        bool
+	tutorialModel       TutorialModel
+	focusBeforeTutorial focus
 
 	// Cass session preview modal (bv-5bqh)
 	showCassModal   bool
@@ -1095,6 +1097,7 @@ func (m *Model) beginSemanticDatasetUpdate() {
 	// A command already running retains its old correlator/cache. Its results
 	// cannot seed a lookup for refreshed title or timestamp metadata.
 	m.cassCorrelator = nil
+	m.historyView.ClearSessionCache()
 	m.semanticDataGeneration++
 	m.invalidateSemanticFilter()
 	m.semanticIndexBuilding = false
@@ -1127,7 +1130,7 @@ func (m *Model) startSemanticIndexBuild() tea.Cmd {
 	m.semanticIndexBuilding = true
 	m.semanticIndexBuildGen++
 	m.semanticIndexBuildData = m.semanticDataGeneration
-	return BuildSemanticIndexCmd(m.issuesForAsync(), m.semanticDataGeneration, m.semanticIndexBuildGen)
+	return BuildSemanticIndexCmd(m.issuesForAsync(), m.semanticDataGeneration, m.semanticIndexBuildGen, m.workDir)
 }
 
 func (m *Model) queueSemanticIndexSave(request semanticIndexSaveRequest) tea.Cmd {
@@ -1954,6 +1957,17 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		}
 	}
 	semanticSearch.SetDocuments(semanticIDs, semanticDocs)
+	semanticHybridEnabled := false
+	semanticHybridPreset := search.PresetDefault
+	if searchCfg, err := search.SearchConfigFromEnv(); err == nil {
+		semanticHybridEnabled = searchCfg.Mode == search.SearchModeHybrid
+		semanticHybridPreset = searchCfg.Preset
+		if searchCfg.HasWeights {
+			semanticSearch.SetHybridConfigWithWeights(semanticHybridEnabled, semanticHybridPreset, searchCfg.Weights)
+		} else if semanticHybridEnabled || semanticHybridPreset != search.PresetDefault {
+			semanticSearch.SetHybridConfig(semanticHybridEnabled, semanticHybridPreset)
+		}
+	}
 
 	// Build initial status message if watcher failed
 	var initialStatus string
@@ -2018,8 +2032,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		semanticIndexSaver:      saveSemanticIndex,
 		semanticDataGeneration:  1,
 		semanticQueryGeneration: 1,
-		semanticHybridEnabled:   false,
-		semanticHybridPreset:    search.PresetDefault,
+		semanticHybridEnabled:   semanticHybridEnabled,
+		semanticHybridPreset:    semanticHybridPreset,
 		semanticHybridBuilding:  false,
 		semanticHybridReady:     false,
 		lastSearchTerm:          "",
@@ -2058,14 +2072,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		// Sprint view (bv-161)
 		sprints: sprints,
 		// AGENTS.md integration (bv-i8dk) - workDir derived from beadsPath
-		workDir: func() string {
-			if beadsPath != "" {
-				// beadsPath is like /path/to/project/.beads/beads.jsonl
-				// workDir is /path/to/project
-				return filepath.Dir(filepath.Dir(beadsPath))
-			}
-			return ""
-		}(),
+		workDir: cass.WorkspaceFromBeadsPath(beadsPath),
 		// Tutorial integration (bv-8y31)
 		tutorialModel: NewTutorialModel(theme),
 	}
@@ -2153,6 +2160,11 @@ func (m *Model) Init() tea.Cmd {
 	// This eliminates the "Initializing..." phase entirely.
 	cmds := []tea.Cmd{
 		m.preparePhase2Cmd(),
+	}
+	if m.semanticHybridEnabled && !m.semanticHybridReady {
+		if hybridCmd := m.startSemanticHybridBuild(); hybridCmd != nil {
+			cmds = append(cmds, hybridCmd)
+		}
 	}
 	// The automatic release check is opt-out (BV_NO_UPDATE_CHECK=1 or
 	// updates.check: false in ~/.config/bv/config.yaml); explicit
@@ -2821,27 +2833,42 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlerts(m.issues, m.analysis, m.analyzer)
 		}
 
-		// Invalidate label health cache since we have new graph metrics (criticality)
+		// Invalidate label health and attention caches since we have new graph metrics (criticality)
 		m.labelHealthCached = false
-		if m.focused == focusLabelDashboard {
-			cfg := analysis.DefaultLabelHealthConfig()
-			m.labelHealthCache = analysis.ComputeAllLabelHealth(m.issues, cfg, time.Now().UTC(), m.analysis)
-			m.labelHealthCached = true
-			m.labelDashboard.SetData(m.labelHealthCache.Labels)
+		m.attentionCached = false
+		underlyingFocus := m.focused
+		if underlyingFocus == focusHelp {
+			underlyingFocus = m.focusBeforeHelp
+		} else if underlyingFocus == focusTutorial {
+			underlyingFocus = m.restoreFocusFromTutorial()
+		}
+		m.refreshLabelViews(underlyingFocus)
+		if underlyingFocus == focusLabelDashboard {
 			m.statusMsg = fmt.Sprintf("Labels: %d total • critical %d • warning %d", m.labelHealthCache.TotalLabels, m.labelHealthCache.CriticalCount, m.labelHealthCache.WarningCount)
+		}
+		if underlyingFocus == focusAttention {
+			m.refreshAttentionView()
 		}
 
 		// Re-apply recipe filter if active (to update scores while preserving filter)
-		// Otherwise, update list respecting current filter (open/ready/etc.)
+		// Otherwise, update list respecting current filter (open/ready/etc.) and sort mode
 		if m.activeRecipe != nil {
 			m.applyRecipe(m.activeRecipe)
-		} else if m.currentFilter == "" || m.currentFilter == "all" {
+		} else if (m.currentFilter == "" || m.currentFilter == "all") && m.sortMode == SortDefault && (!m.workspaceMode || m.activeRepos == nil) {
 			m.refreshListItemsPhase2()
 		} else {
 			m.applyFilter()
 		}
-		if listFilterActive && !m.selectVisibleListItemByID(selectedID) && len(m.list.VisibleItems()) > 0 {
+		if !listFilterActive && selectedID != "" {
+			m.selectVisibleListItemByID(selectedID)
+		} else if listFilterActive && !m.selectVisibleListItemByID(selectedID) && len(m.list.VisibleItems()) > 0 {
 			m.list.Select(0)
+		}
+		if visible := len(m.list.VisibleItems()); visible > 0 && m.list.Index() >= visible {
+			m.list.Select(0)
+		}
+		if m.isSplitView || m.showDetails {
+			m.updateViewportContent()
 		}
 
 	case Phase2UpdateMsg:
@@ -2897,6 +2924,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.historyLoadFailed = false
 			m.historyView.SetReport(msg.Report)
+			m.syncHistoryCassSessions()
 			m.historyReportDataGeneration = msg.DataGeneration
 			m.historyView.SetSize(m.mainContentWidth(), m.height-1)
 			// Refresh detail pane if visible
@@ -2936,6 +2964,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusIsError = false
 			return m, nil
 		}
+		m.historyView.SetSessionsForBead(msg.request.beadID, msg.result.TopSessions)
 		if msg.result.Error != "" {
 			m.statusMsg = "⚠️ Session lookup incomplete; showing available matches"
 			m.statusIsError = false
@@ -3011,6 +3040,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		underlyingFocus := m.focused
 		if underlyingFocus == focusHelp {
 			underlyingFocus = m.focusBeforeHelp
+		} else if underlyingFocus == focusTutorial {
+			underlyingFocus = m.restoreFocusFromTutorial()
 		}
 
 		// Preserve board selection by issue ID (bv-6n4c).
@@ -3079,6 +3110,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Clear caches that need recomputation
 		m.labelHealthCached = false
+		m.attentionCached = false
 		if m.priorityHints == nil {
 			m.priorityHints = make(map[string]*analysis.PriorityRecommendation)
 		} else {
@@ -3213,7 +3245,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 					include := false
 					switch m.currentFilter {
-					case "all":
+					case "", "all":
 						include = true
 					case "open":
 						include = !isClosedLikeStatus(issue.Status)
@@ -3294,6 +3326,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if underlyingFocus == focusFlowMatrix {
 			m.refreshFlowMatrix()
 		}
+		if underlyingFocus == focusAttention {
+			m.refreshAttentionView()
+		}
+		if m.isActionableView || underlyingFocus == focusActionable {
+			m.refreshActionableView()
+		}
+		m.refreshLabelViews(underlyingFocus)
 
 		// Refresh detail pane if visible
 		if m.isSplitView || m.showDetails {
@@ -3308,27 +3347,34 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Reload sprints (bv-161)
+		sprintsReloaded := false
 		if m.beadsPath != "" {
-			beadsDir := filepath.Dir(m.beadsPath)
-			if loaded, err := loader.LoadSprintsFromFile(filepath.Join(beadsDir, loader.SprintsFileName)); err == nil {
-				m.sprints = loaded
-				// If we have a selected sprint, try to refresh it
-				if m.selectedSprint != nil {
-					found := false
-					for i := range m.sprints {
-						if m.sprints[i].ID == m.selectedSprint.ID {
-							m.selectedSprint = &m.sprints[i]
-							m.sprintViewText = m.renderSprintDashboard()
-							found = true
-							break
+			sprintsPath := filepath.Join(filepath.Dir(m.beadsPath), loader.SprintsFileName)
+			if _, statErr := os.Stat(sprintsPath); statErr == nil {
+				if loaded, err := loader.LoadSprintsFromFile(sprintsPath); err == nil {
+					m.sprints = loaded
+					sprintsReloaded = true
+					// If we have a selected sprint, try to refresh it
+					if m.selectedSprint != nil {
+						found := false
+						for i := range m.sprints {
+							if m.sprints[i].ID == m.selectedSprint.ID {
+								m.selectedSprint = &m.sprints[i]
+								m.sprintViewText = m.renderSprintDashboard()
+								found = true
+								break
+							}
 						}
-					}
-					if !found {
-						m.selectedSprint = nil
-						m.sprintViewText = "Sprint not found"
+						if !found {
+							m.selectedSprint = nil
+							m.sprintViewText = "Sprint not found"
+						}
 					}
 				}
 			}
+		}
+		if !sprintsReloaded && m.selectedSprint != nil {
+			m.sprintViewText = m.renderSprintDashboard()
 		}
 
 		if firstSnapshot {
@@ -3521,6 +3567,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			debug.Log("refresh.phase1_cache_hit=%t issues=%d", cacheHit, len(newIssues))
 		}
 		m.labelHealthCached = false
+		m.attentionCached = false
+		if m.labelDrilldownCache == nil {
+			m.labelDrilldownCache = make(map[string][]model.Issue)
+		} else {
+			clear(m.labelDrilldownCache)
+		}
 
 		// Rebuild lookup map
 		var mapStart time.Time
@@ -3610,44 +3662,28 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, hybridCmd)
 			}
 		}
-		m.setListItems(items)
-
-		// Restore selection position
-		m.selectVisibleListItemByID(selectedID)
 
 		// Regenerate sub-views (with Phase 1 data; Phase 2 will update via Phase2ReadyMsg)
 		// Preserve triage data already computed to avoid UI flicker.
-		needsInsights := m.focused == focusInsights
+		underlyingFocus := m.focused
+		if underlyingFocus == focusHelp {
+			underlyingFocus = m.focusBeforeHelp
+		} else if underlyingFocus == focusTutorial {
+			underlyingFocus = m.restoreFocusFromTutorial()
+		}
+		needsInsights := underlyingFocus == focusInsights
 		needsGraph := m.isGraphView
-		var ins analysis.Insights
-		if needsInsights || needsGraph {
+		if needsInsights {
 			var insightsStart time.Time
 			if profileRefresh {
 				insightsStart = time.Now()
 			}
-			ins = m.analysis.GenerateInsights(len(m.issues))
+			m.rebuildInsightsPanel()
 			if profileRefresh {
 				recordTiming("insights_generate", time.Since(insightsStart))
 			}
 		}
-		if needsInsights {
-			oldTopPicks := m.insightsPanel.topPicks
-			oldRecs := m.insightsPanel.recommendations
-			oldRecMap := m.insightsPanel.recommendationMap
-			oldHash := m.insightsPanel.triageDataHash
-
-			m.insightsPanel = NewInsightsModel(ins, m.issueMap, m.theme)
-			m.insightsPanel.topPicks = oldTopPicks
-			m.insightsPanel.recommendations = oldRecs
-			m.insightsPanel.recommendationMap = oldRecMap
-			m.insightsPanel.triageDataHash = oldHash
-			bodyHeight := m.height - 1
-			if bodyHeight < 5 {
-				bodyHeight = 5
-			}
-			m.insightsPanel.SetSize(m.mainContentWidth(), bodyHeight)
-		}
-		if m.focused == focusAttention {
+		if underlyingFocus == focusAttention {
 			var attentionStart time.Time
 			if profileRefresh {
 				attentionStart = time.Now()
@@ -3657,9 +3693,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				recordTiming("attention_view", time.Since(attentionStart))
 			}
 		}
-		if m.focused == focusFlowMatrix || (m.focused == focusHelp && m.focusBeforeHelp == focusFlowMatrix) {
+		if underlyingFocus == focusFlowMatrix {
 			m.refreshFlowMatrix()
 		}
+		if underlyingFocus == focusTree {
+			m.tree.Build(m.issues)
+			m.tree.SetSize(m.mainContentWidth(), m.height-2)
+		}
+		if m.isActionableView || underlyingFocus == focusActionable {
+			m.refreshActionableView()
+		}
+		m.refreshLabelViews(underlyingFocus)
 		if needsGraph || m.isBoardView {
 			var graphStart time.Time
 			if profileRefresh {
@@ -3671,36 +3715,55 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Re-apply recipe filter if active
+		// Re-apply recipe or filter/sort if active; otherwise install full item list
 		if m.activeRecipe != nil {
 			m.applyRecipe(m.activeRecipe)
+		} else if (m.currentFilter == "" || m.currentFilter == "all") && m.sortMode == SortDefault && (!m.workspaceMode || m.activeRepos == nil) {
+			m.setListItems(items)
+		} else {
+			m.applyFilter()
 		}
-		if listFilterActive && !m.selectVisibleListItemByID(selectedID) && len(m.list.VisibleItems()) > 0 {
+		if !listFilterActive && selectedID != "" {
+			m.selectVisibleListItemByID(selectedID)
+		} else if listFilterActive && !m.selectVisibleListItemByID(selectedID) && len(m.list.VisibleItems()) > 0 {
 			m.list.Select(0)
+		}
+		if visible := len(m.list.VisibleItems()); visible > 0 && m.list.Index() >= visible {
+			m.list.Select(0)
+		}
+		if m.isSplitView || m.showDetails {
+			m.updateViewportContent()
 		}
 
 		// Reload sprints (bv-161)
+		sprintsReloaded := false
 		if m.beadsPath != "" {
-			beadsDir := filepath.Dir(m.beadsPath)
-			if loaded, err := loader.LoadSprintsFromFile(filepath.Join(beadsDir, loader.SprintsFileName)); err == nil {
-				m.sprints = loaded
-				// If we have a selected sprint, try to refresh it
-				if m.selectedSprint != nil {
-					found := false
-					for i := range m.sprints {
-						if m.sprints[i].ID == m.selectedSprint.ID {
-							m.selectedSprint = &m.sprints[i]
-							m.sprintViewText = m.renderSprintDashboard()
-							found = true
-							break
+			sprintsPath := filepath.Join(filepath.Dir(m.beadsPath), loader.SprintsFileName)
+			if _, statErr := os.Stat(sprintsPath); statErr == nil {
+				if loaded, err := loader.LoadSprintsFromFile(sprintsPath); err == nil {
+					m.sprints = loaded
+					sprintsReloaded = true
+					// If we have a selected sprint, try to refresh it
+					if m.selectedSprint != nil {
+						found := false
+						for i := range m.sprints {
+							if m.sprints[i].ID == m.selectedSprint.ID {
+								m.selectedSprint = &m.sprints[i]
+								m.sprintViewText = m.renderSprintDashboard()
+								found = true
+								break
+							}
 						}
-					}
-					if !found {
-						m.selectedSprint = nil
-						m.sprintViewText = "Sprint not found"
+						if !found {
+							m.selectedSprint = nil
+							m.sprintViewText = "Sprint not found"
+						}
 					}
 				}
 			}
+		}
+		if !sprintsReloaded && m.selectedSprint != nil {
+			m.sprintViewText = m.renderSprintDashboard()
 		}
 
 		// Keep semantic index current when enabled.
@@ -3956,6 +4019,31 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// Handle velocity comparison sub-view if open (bv-125)
+		if m.showVelocityComparison {
+			s := msg.String()
+			switch s {
+			case "j", "down":
+				m.velocityComparison.MoveDown()
+				return m, nil
+			case "k", "up":
+				m.velocityComparison.MoveUp()
+				return m, nil
+			case "enter":
+				if selectedLabel := m.velocityComparison.SelectedLabel(); selectedLabel != "" {
+					m.currentFilter = "label:" + selectedLabel
+					m.applyFilter()
+					m.focused = focusList
+				}
+				m.showVelocityComparison = false
+				return m, m.pendingSemanticFilterCmd()
+			case "esc", "q", "v":
+				m.showVelocityComparison = false
+				return m, nil
+			}
+			return m, nil
+		}
+
 		// Attention view (bv-117): cursor navigation, drilldown, quick filters.
 		// Unhandled keys (ctrl+c, ?, ;, view switches) fall through.
 		if m.focused == focusAttention {
@@ -4058,7 +4146,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Handle help overlay toggle (? or F1)
-		if (msg.String() == "?" || msg.String() == "f1") && m.list.FilterState() != list.Filtering {
+		if ((msg.String() == "?" && !m.isTextInputActive()) || msg.String() == "f1") && m.list.FilterState() != list.Filtering {
 			m.showHelp = !m.showHelp
 			if m.showHelp {
 				m.focusBeforeHelp = m.focused // Store current focus before switching to help
@@ -4071,16 +4159,48 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Handle tutorial toggle (backtick `) - bv-8y31
-		if msg.String() == "`" && m.list.FilterState() != list.Filtering {
-			m.showTutorial = !m.showTutorial
-			if m.showTutorial {
+		if msg.String() == "`" && !m.isTextInputActive() {
+			if !m.showTutorial {
+				if m.showHelp {
+					m.focusBeforeTutorial = m.focusBeforeHelp
+				} else {
+					m.focusBeforeTutorial = m.focused
+				}
+				m.showTutorial = true
 				m.showHelp = false // Close help if open
+				m.helpScroll = 0
+				m.tutorialModel.SetContextMode(false)
 				m.tutorialModel.SetSize(m.width, m.height)
 				m.tutorialModel.markCurrentPageViewed() // the resumed page counts as viewed
 				m.focused = focusTutorial
 			} else {
-				m.focused = focusList
+				m.closeTutorial()
 			}
+			return m, nil
+		}
+
+		// Handle context-sensitive tutorial trigger (~) - bv-324s, bv-8y31
+		if IsContextHelpTrigger(msg) && !m.isTextInputActive() {
+			if m.showTutorial && m.tutorialModel.contextMode {
+				m.closeTutorial()
+				return m, nil
+			}
+			if !m.showTutorial {
+				if m.showHelp {
+					m.focusBeforeTutorial = m.focusBeforeHelp
+				} else {
+					m.focusBeforeTutorial = m.focused
+				}
+			}
+			ctx := string(m.CurrentContext())
+			m.showHelp = false
+			m.helpScroll = 0
+			m.showTutorial = true
+			m.tutorialModel.SetContext(ctx)
+			m.tutorialModel.SetContextMode(true)
+			m.tutorialModel.SetSize(m.width, m.height)
+			m.tutorialModel.markCurrentPageViewed()
+			m.focused = focusTutorial
 			return m, nil
 		}
 
@@ -4117,7 +4237,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 		// Handle shortcuts sidebar toggle (; or F2) - bv-3qi5
-		if (msg.String() == ";" || msg.String() == "f2") && m.list.FilterState() != list.Filtering {
+		if ((msg.String() == ";" && !m.isTextInputActive()) || msg.String() == "f2") && m.list.FilterState() != list.Filtering {
 			m.showShortcutsSidebar = !m.showShortcutsSidebar
 			// Reflow the main panes for the new content width so the sidebar
 			// reserves its own column instead of overflowing/wrapping into the
@@ -4289,15 +4409,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.tutorialModel, tutorialCmd = m.tutorialModel.Update(msg)
 			// Check if tutorial wants to close
 			if m.tutorialModel.ShouldClose() {
-				m.showTutorial = false
-				m.focused = focusList
 				// Persist progress and keep the instance so reopening resumes
 				// on the same page (bv-8y31). Save is a no-op under
 				// BV_NO_SAVED_CONFIG.
-				if err := m.tutorialModel.SaveProgress(); err != nil {
-					debug.Log("tutorial: saving progress failed: %v", err)
-				}
-				m.tutorialModel.ResetClose()
+				m.closeTutorial()
 			}
 			return m, tutorialCmd
 		}
@@ -4381,6 +4496,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if m.focused == focusInsights {
+					if m.insightsPanel.IsHeatmapActive() && m.insightsPanel.IsHeatmapDrillDown() {
+						m.insightsPanel.HeatmapBack()
+						return m, nil
+					}
 					m.focused = focusList
 					return m, nil
 				}
@@ -4440,6 +4559,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if m.focused == focusInsights {
+					if m.insightsPanel.IsHeatmapActive() && m.insightsPanel.IsHeatmapDrillDown() {
+						m.insightsPanel.HeatmapBack()
+						return m, nil
+					}
 					m.focused = focusList
 					return m, nil
 				}
@@ -4563,8 +4686,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "h", "l",
 					"j", "k", "up", "down", "left", "right",
 					"ctrl+j", "ctrl+k", "tab", "shift+tab",
-					"e", "x", "m", "enter", "esc":
+					"e", "x", "m", "H", "backspace", "enter", "esc":
 					m = m.handleInsightsKeys(msg)
+					viewToggleHandled = true
+				case "y":
+					cmds = append(cmds, m.copyIssueIDByIDCmd(m.insightsPanel.SelectedIssueID()))
 					viewToggleHandled = true
 				}
 
@@ -4636,6 +4762,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, nil
 					}
 				}
+				// Open velocity comparison sub-view on 'v' (bv-125)
+				if keyStr == "v" {
+					m.velocityComparison.SetData(m.issues)
+					bodyHeight := m.height - 1
+					if bodyHeight < 5 {
+						bodyHeight = 5
+					}
+					m.velocityComparison.SetSize(m.mainContentWidth(), bodyHeight)
+					m.showVelocityComparison = true
+					return m, nil
+				}
 				return m, nil
 
 			case focusGraph:
@@ -4647,6 +4784,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					"H", "L", "ctrl+d", "ctrl+u", "pgup", "pgdown",
 					"J", "K", " ", "enter":
 					m = m.handleGraphKeys(msg)
+					viewToggleHandled = true
+				case "y":
+					var selectedID string
+					if selected := m.graphView.SelectedIssue(); selected != nil {
+						selectedID = selected.ID
+					}
+					cmds = append(cmds, m.copyIssueIDByIDCmd(selectedID))
 					viewToggleHandled = true
 				}
 
@@ -4680,6 +4824,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pendingComboKey = ""
 					m = m.handleTreeKeys(msg)
 					viewToggleHandled = true
+				case "y":
+					m.pendingComboKey = ""
+					var selectedID string
+					if selected := m.tree.SelectedIssue(); selected != nil {
+						selectedID = selected.ID
+					}
+					cmds = append(cmds, m.copyIssueIDByIDCmd(selectedID))
+					viewToggleHandled = true
 				case "V":
 					// Session preview for the focused tree node (E4)
 					cmds = append(cmds, m.showCassSessionModal())
@@ -4687,10 +4839,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case focusActionable:
-				// Actionable uses j/k/enter — no conflicts with view-toggles.
+				// Actionable uses j/k/page/home/end/enter/y — no conflicts with view-toggles.
 				switch keyStr {
-				case "j", "k", "up", "down", "enter":
+				case "j", "k", "up", "down",
+					"ctrl+d", "ctrl+u", "pgdown", "pgup",
+					"home", "G", "end", "enter":
 					m = m.handleActionableKeys(msg)
+					viewToggleHandled = true
+				case "y":
+					cmds = append(cmds, m.copyIssueIDByIDCmd(m.actionableView.SelectedIssueID()))
 					viewToggleHandled = true
 				}
 
@@ -4744,11 +4901,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					"tab", "enter", "esc", "q":
 					m = m.handleFlowMatrixKeys(msg)
 					viewToggleHandled = true
+				case "y":
+					var selectedID string
+					if m.flowMatrix.showDrilldown {
+						if selected := m.flowMatrix.SelectedDrilldownIssue(); selected != nil {
+							selectedID = selected.ID
+						}
+					}
+					cmds = append(cmds, m.copyIssueIDByIDCmd(selectedID))
+					viewToggleHandled = true
 				}
 
 			case focusDetail:
 				if keyStr == "V" {
 					return m, m.showCassSessionModal()
+				}
+				if keyStr == "C" {
+					return m, m.copyIssueToClipboard()
+				}
+				if keyStr == "y" {
+					var selectedID string
+					if selectedItem, ok := m.list.SelectedItem().(IssueItem); ok {
+						selectedID = selectedItem.Issue.ID
+					}
+					return m, m.copyIssueIDByIDCmd(selectedID)
 				}
 				// Intercept "O" in detail view for editor dispatch (bv-134)
 				if keyStr == "O" {
@@ -5062,8 +5238,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Scroll up based on current focus
 			switch m.focused {
 			case focusList:
-				if m.list.Index() > 0 {
-					m.list.Select(m.list.Index() - 1)
+				cur := m.listIndexInBounds()
+				if cur > 0 {
+					cur--
+				}
+				if m.list.Index() != cur {
+					m.selectListIndex(cur)
 					// Sync detail panel in split view mode
 					if m.isSplitView {
 						m.updateViewportContent()
@@ -5095,8 +5275,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Scroll down based on current focus
 			switch m.focused {
 			case focusList:
-				if m.list.Index() < len(m.list.VisibleItems())-1 {
-					m.list.Select(m.list.Index() + 1)
+				cur := m.listIndexInBounds()
+				if cur < len(m.list.VisibleItems())-1 {
+					cur++
+				}
+				if m.list.Index() != cur {
+					m.selectListIndex(cur)
 					// Sync detail panel in split view mode
 					if m.isSplitView {
 						m.updateViewportContent()
@@ -5499,6 +5683,14 @@ func (m *Model) handleActionableKeys(msg tea.KeyMsg) *Model {
 		m.actionableView.MoveDown()
 	case "k", "up":
 		m.actionableView.MoveUp()
+	case "ctrl+d", "pgdown":
+		m.actionableView.PageDown()
+	case "ctrl+u", "pgup":
+		m.actionableView.PageUp()
+	case "home":
+		m.actionableView.GoToStart()
+	case "G", "end":
+		m.actionableView.GoToEnd()
 	case "enter":
 		// Jump to selected issue in list view
 		selectedID := m.actionableView.SelectedIssueID()
@@ -6050,21 +6242,47 @@ func (m *Model) handleLabelPickerKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 // handleInsightsKeys handles keyboard input when insights panel is focused
 func (m *Model) handleInsightsKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
-	case "esc":
-		m.focused = focusList
+	case "esc", "backspace":
+		if m.insightsPanel.IsHeatmapActive() && m.insightsPanel.IsHeatmapDrillDown() {
+			m.insightsPanel.HeatmapBack()
+			return m
+		}
+		if msg.String() == "esc" {
+			m.focused = focusList
+		}
 	case "j", "down":
-		m.insightsPanel.MoveDown()
+		if m.insightsPanel.IsHeatmapActive() {
+			m.insightsPanel.HeatmapMoveDown()
+		} else {
+			m.insightsPanel.MoveDown()
+		}
 	case "k", "up":
-		m.insightsPanel.MoveUp()
+		if m.insightsPanel.IsHeatmapActive() {
+			m.insightsPanel.HeatmapMoveUp()
+		} else {
+			m.insightsPanel.MoveUp()
+		}
 	case "ctrl+j":
 		// Scroll detail panel down
 		m.insightsPanel.ScrollDetailDown()
 	case "ctrl+k":
 		// Scroll detail panel up
 		m.insightsPanel.ScrollDetailUp()
-	case "h", "left", "shift+tab":
+	case "h", "left":
+		if m.insightsPanel.IsHeatmapActive() && !m.insightsPanel.IsHeatmapDrillDown() {
+			m.insightsPanel.HeatmapMoveLeft()
+		} else {
+			m.insightsPanel.PrevPanel()
+		}
+	case "shift+tab":
 		m.insightsPanel.PrevPanel()
-	case "l", "right", "tab":
+	case "l", "right":
+		if m.insightsPanel.IsHeatmapActive() && !m.insightsPanel.IsHeatmapDrillDown() {
+			m.insightsPanel.HeatmapMoveRight()
+		} else {
+			m.insightsPanel.NextPanel()
+		}
+	case "tab":
 		m.insightsPanel.NextPanel()
 	case "e":
 		// Toggle explanations
@@ -6072,10 +6290,14 @@ func (m *Model) handleInsightsKeys(msg tea.KeyMsg) *Model {
 	case "x":
 		// Toggle calculation details
 		m.insightsPanel.ToggleCalculation()
-	case "m":
-		// Toggle heatmap view (bv-95) - "m" for heatMap
+	case "m", "H":
+		// Toggle heatmap view (bv-95, bv-t4yg) - "m" (footer) or "H" (heatmap header hint)
 		m.insightsPanel.ToggleHeatmap()
 	case "enter":
+		if m.insightsPanel.IsHeatmapActive() && !m.insightsPanel.IsHeatmapDrillDown() {
+			m.insightsPanel.HeatmapEnter()
+			return m
+		}
 		// Jump to selected issue in list view
 		selectedID := m.insightsPanel.SelectedIssueID()
 		if selectedID != "" {
@@ -6113,10 +6335,10 @@ func (m *Model) handleListKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		m.selectListIndex(len(m.list.VisibleItems()) - 1)
 	case "ctrl+d":
 		// Page down
-		m.selectListIndex(m.list.Index() + m.height/3)
+		m.selectListIndex(m.listIndexInBounds() + m.height/3)
 	case "ctrl+u":
 		// Page up
-		m.selectListIndex(m.list.Index() - m.height/3)
+		m.selectListIndex(m.listIndexInBounds() - m.height/3)
 	case "o":
 		m.currentFilter = "open"
 		m.applyFilter()
@@ -6230,6 +6452,14 @@ func (m Model) restoreFocusFromHelp() focus {
 	return m.focusBeforeHelp
 }
 
+// restoreFocusFromTutorial returns the focus that was active before the tutorial opened.
+func (m Model) restoreFocusFromTutorial() focus {
+	if m.focusBeforeTutorial == focusTutorial || m.focusBeforeTutorial == focusHelp {
+		return focusList
+	}
+	return m.focusBeforeTutorial
+}
+
 // handleHelpKeys handles keyboard input when the help overlay is focused
 func (m *Model) handleHelpKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
@@ -6257,9 +6487,11 @@ func (m *Model) handleHelpKeys(msg tea.KeyMsg) *Model {
 		m.helpScroll = 0
 		m.focused = m.restoreFocusFromHelp()
 	case " ": // Space opens interactive tutorial (bv-0trk, bv-8y31)
+		m.focusBeforeTutorial = m.focusBeforeHelp
 		m.showHelp = false
 		m.helpScroll = 0
 		m.showTutorial = true
+		m.tutorialModel.SetContextMode(false)
 		m.tutorialModel.SetSize(m.width, m.height)
 		m.tutorialModel.markCurrentPageViewed()
 		m.focused = focusTutorial
@@ -6379,6 +6611,9 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 		body = m.renderLabelGraphAnalysis()
 	} else if m.showLabelDrilldown && m.labelDrilldownLabel != "" {
 		body = m.renderLabelDrilldown()
+	} else if m.showVelocityComparison {
+		m.velocityComparison.SetSize(m.width, m.height-1)
+		body = m.velocityComparison.View()
 	} else if m.showAlertsPanel {
 		body = m.renderAlertsPanel()
 	} else if m.showTimeTravelPrompt {
@@ -6438,11 +6673,11 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 			}
 		case m.isSprintView:
 			body = m.sprintViewText
-		case m.isSplitView:
-			body = m.renderSplitView()
 		case m.focused == focusLabelDashboard:
 			m.labelDashboard.SetSize(bodyWidth, bodyHeight)
 			body = m.labelDashboard.View()
+		case m.isSplitView:
+			body = m.renderSplitView()
 		default:
 			// Mobile view
 			if m.showDetails {
@@ -7433,8 +7668,11 @@ func (m *Model) renderFooter() string {
 	// ─────────────────────────────────────────────────────────────────────────
 	var filterTxt string
 	var filterIcon string
-	if m.focused == focusLabelDashboard {
-		filterTxt = "LABELS: j/k nav • h detail • d drilldown • enter filter"
+	if m.showVelocityComparison {
+		filterTxt = "VELOCITY: j/k select • enter filter • v/esc close"
+		filterIcon = "📈"
+	} else if m.focused == focusLabelDashboard {
+		filterTxt = "LABELS: j/k nav • h detail • d drilldown • v velocity • enter filter"
 		filterIcon = "🏷️"
 	} else if m.showLabelGraphAnalysis && m.labelGraphAnalysisResult != nil {
 		filterTxt = fmt.Sprintf("GRAPH %s: esc/q/g close", m.labelGraphAnalysisResult.Label)
@@ -8150,7 +8388,7 @@ func (m *Model) jumpToChangedIssue(forward bool) {
 		m.statusIsError = false
 		return
 	}
-	cur := m.list.Index()
+	cur := m.listIndexInBounds()
 	for step := 1; step <= n; step++ {
 		idx := (cur + step) % n
 		if !forward {
@@ -8160,7 +8398,7 @@ func (m *Model) jumpToChangedIssue(forward bool) {
 		if !ok || m.getDiffStatus(issueItem.Issue.ID) == DiffStatusNone {
 			continue
 		}
-		m.list.Select(idx)
+		m.selectListIndex(idx)
 		if m.isSplitView {
 			m.updateViewportContent()
 		}
@@ -8397,7 +8635,7 @@ func (m *Model) matchesCurrentFilter(issue model.Issue, now time.Time) bool {
 	}
 
 	switch m.currentFilter {
-	case "all":
+	case "", "all":
 		return true
 	case "open":
 		return !isClosedLikeStatus(issue.Status)
@@ -8534,9 +8772,9 @@ func (m *Model) applyFilter() {
 		m.graphView.SetIssues(filteredIssues, &filterIns)
 	}
 
-	// Keep selection in bounds
-	if len(filteredItems) > 0 && m.list.Index() >= len(filteredItems) {
-		m.list.Select(0)
+	// Keep selection in bounds of visible items (GH #210)
+	if visible := len(m.list.VisibleItems()); visible > 0 && m.list.Index() >= visible {
+		m.selectListIndex(0)
 	}
 	m.updateViewportContent()
 }
@@ -8993,12 +9231,17 @@ func (m *Model) handleLeftClick(x, y int) *Model {
 		if total == 0 {
 			return
 		}
-		start := m.list.Paginator.Page * m.list.Paginator.PerPage
+		perPage := m.list.Paginator.PerPage
+		if perPage <= 0 {
+			perPage = 1
+		}
+		page := m.listIndexInBounds() / perPage
+		start := page * perPage
 		idx := start + rowOffset
-		if idx < 0 || idx >= total || idx >= start+m.list.Paginator.PerPage {
+		if idx < 0 || idx >= total || idx >= start+perPage {
 			return
 		}
-		m.list.Select(idx)
+		m.selectListIndex(idx)
 		if m.isSplitView {
 			m.updateViewportContent()
 		}
@@ -9039,7 +9282,7 @@ func (m *Model) setViewportContent(content string) {
 
 func (m *Model) updateViewportContent() {
 	selectedItem := m.list.SelectedItem()
-	if m.flowDetailID != "" && (m.focused == focusFlowMatrix || (m.focused == focusHelp && m.focusBeforeHelp == focusFlowMatrix)) {
+	if m.flowDetailID != "" && (m.focused == focusFlowMatrix || (m.focused == focusHelp && m.focusBeforeHelp == focusFlowMatrix) || (m.focused == focusTutorial && m.restoreFocusFromTutorial() == focusFlowMatrix)) {
 		issue := m.issueMap[m.flowDetailID]
 		if issue == nil {
 			m.setViewportContent("Issue no longer available")
@@ -9082,6 +9325,15 @@ func (m *Model) updateViewportContent() {
 		item.Assignee,
 		item.CreatedAt.Format("2006-01-02"),
 	))
+	if item.DueDate != nil {
+		sb.WriteString(fmt.Sprintf("**Due:** %s\n\n", item.DueDate.Format("2006-01-02")))
+	}
+	if item.DeferUntil != nil {
+		sb.WriteString(fmt.Sprintf("**Deferred Until:** %s\n\n", item.DeferUntil.Format("2006-01-02")))
+	}
+	if item.ExternalRef != nil && *item.ExternalRef != "" {
+		sb.WriteString(fmt.Sprintf("**External Ref:** `%s`\n\n", *item.ExternalRef))
+	}
 
 	// Labels (bv-f103 fix: display labels in detail view)
 	if len(item.Labels) > 0 {
@@ -9395,6 +9647,7 @@ func (m *Model) enterHistoryView() tea.Cmd {
 	if bodyHeight < 5 {
 		bodyHeight = 5
 	}
+	m.syncHistoryCassSessions()
 	m.historyView.SetSize(m.mainContentWidth(), bodyHeight)
 	m.isHistoryView = true
 	m.focused = focusHistory
@@ -9418,6 +9671,18 @@ func (m *Model) enterHistoryView() tea.Cmd {
 	m.statusMsg = "Loading history…"
 	m.statusIsError = false
 	return m.startHistoryLoad()
+}
+
+func (m *Model) syncHistoryCassSessions() {
+	if m == nil || m.cassCorrelator == nil {
+		return
+	}
+	for i := range m.issues {
+		id := m.issues[i].ID
+		if hint := m.cassCorrelator.GetCached(id); hint != nil && len(hint.Results) > 0 {
+			m.historyView.SetSessionsForBead(id, hint.Results)
+		}
+	}
 }
 
 func (m *Model) historyReportIsCurrent() bool {
@@ -9695,6 +9960,18 @@ func (m *Model) copyTextToClipboardCmd(text, success string) tea.Cmd {
 	return copyToClipboardStatusCmd(text, success, m.clipboardRequestID)
 }
 
+func (m *Model) copyIssueIDByIDCmd(issueID string) tea.Cmd {
+	if issueID == "" {
+		m.statusMsg = "❌ No issue selected"
+		m.statusIsError = true
+		return nil
+	}
+	return m.copyTextToClipboardCmd(
+		issueID,
+		fmt.Sprintf("📋 Copied %s to clipboard", issueID),
+	)
+}
+
 // copyIssueToClipboard formats the selected issue as Markdown and returns a
 // bounded asynchronous clipboard command.
 func (m *Model) copyIssueToClipboard() tea.Cmd {
@@ -9724,6 +10001,15 @@ func (m *Model) copyIssueToClipboard() tea.Cmd {
 		sb.WriteString(fmt.Sprintf("**Assignee:** @%s  \n", issue.Assignee))
 	}
 	sb.WriteString(fmt.Sprintf("**Created:** %s  \n", issue.CreatedAt.Format("2006-01-02")))
+	if issue.DueDate != nil {
+		sb.WriteString(fmt.Sprintf("**Due:** %s  \n", issue.DueDate.Format("2006-01-02")))
+	}
+	if issue.DeferUntil != nil {
+		sb.WriteString(fmt.Sprintf("**Deferred Until:** %s  \n", issue.DeferUntil.Format("2006-01-02")))
+	}
+	if issue.ExternalRef != nil && *issue.ExternalRef != "" {
+		sb.WriteString(fmt.Sprintf("**External Ref:** %s  \n", *issue.ExternalRef))
+	}
 
 	if len(issue.Labels) > 0 {
 		sb.WriteString(fmt.Sprintf("**Labels:** %s  \n", strings.Join(issue.Labels, ", ")))
@@ -10507,6 +10793,107 @@ func (m *Model) refreshAttentionView() {
 		height = 3
 	}
 	m.attentionView.SetSize(m.mainContentWidth(), height)
+}
+
+// refreshActionableView rebuilds the execution plan for the current issue set
+// while preserving the selected issue ID when still present.
+func (m *Model) refreshActionableView() {
+	prevSelectedID := m.actionableView.SelectedIssueID()
+	analyzer := analysis.NewAnalyzer(m.issues)
+	if m.analyzer != nil {
+		analyzer.SetReadinessScope(m.analyzer.Readiness(), m.candidateIDs)
+	}
+	plan := analyzer.GetExecutionPlan()
+	m.actionableView = NewActionableModel(plan, m.theme)
+	m.actionableView.SetSize(m.mainContentWidth(), m.height-2)
+	if prevSelectedID != "" {
+		_ = m.actionableView.SelectIssueByID(prevSelectedID)
+	}
+}
+
+// refreshLabelViews refreshes active label dashboard, health detail, drilldown,
+// and velocity comparison sub-views when underlying data or Phase 2 metrics update.
+func (m *Model) refreshLabelViews(underlyingFocus focus) {
+	if underlyingFocus == focusLabelDashboard || m.showLabelHealthDetail || m.showLabelDrilldown {
+		cfg := analysis.DefaultLabelHealthConfig()
+		m.labelHealthCache = analysis.ComputeAllLabelHealth(m.issues, cfg, time.Now().UTC(), m.analysis)
+		m.labelHealthCached = true
+		m.labelDashboard.SetData(m.labelHealthCache.Labels)
+		m.labelDashboard.SetSize(m.mainContentWidth(), m.height-1)
+	}
+	if m.showLabelHealthDetail && m.labelHealthDetail != nil {
+		target := m.labelHealthDetail.Label
+		var updated *analysis.LabelHealth
+		for i := range m.labelHealthCache.Labels {
+			if m.labelHealthCache.Labels[i].Label == target {
+				lh := m.labelHealthCache.Labels[i]
+				updated = &lh
+				break
+			}
+		}
+		if updated != nil {
+			m.labelHealthDetail = updated
+			m.labelHealthDetailFlow = m.getCrossFlowsForLabel(target)
+		} else {
+			m.showLabelHealthDetail = false
+			m.labelHealthDetail = nil
+		}
+	}
+	if m.showLabelDrilldown && m.labelDrilldownLabel != "" {
+		m.labelDrilldownIssues = m.filterIssuesByLabel(m.labelDrilldownLabel)
+		if m.showLabelGraphAnalysis {
+			sg := analysis.ComputeLabelSubgraph(m.issues, m.labelDrilldownLabel)
+			pr := analysis.ComputeLabelPageRank(sg)
+			cp := analysis.ComputeLabelCriticalPath(sg)
+			m.labelGraphAnalysisResult = &LabelGraphAnalysisResult{
+				Label:        m.labelDrilldownLabel,
+				Subgraph:     sg,
+				PageRank:     pr,
+				CriticalPath: cp,
+			}
+		}
+	}
+	if m.showVelocityComparison {
+		m.velocityComparison.SetData(m.issues)
+		bodyHeight := m.height - 1
+		if bodyHeight < 5 {
+			bodyHeight = 5
+		}
+		m.velocityComparison.SetSize(m.mainContentWidth(), bodyHeight)
+	}
+}
+
+// isTextInputActive reports whether an embedded text input (list filter, time-travel
+// prompt, label picker, board search, or history search) is currently capturing printable runes.
+func (m Model) isTextInputActive() bool {
+	if m.list.FilterState() == list.Filtering {
+		return true
+	}
+	if m.focused == focusTimeTravelInput {
+		return true
+	}
+	if m.focused == focusLabelPicker && m.showLabelPicker {
+		return true
+	}
+	if m.focused == focusBoard && m.board.IsSearchMode() {
+		return true
+	}
+	if m.focused == focusHistory && m.historyReportIsCurrent() && m.historyView.IsSearchActive() {
+		return true
+	}
+	return false
+}
+
+// closeTutorial persists tutorial progress, resets close state, and restores
+// the focus active before the tutorial opened.
+func (m *Model) closeTutorial() {
+	m.showTutorial = false
+	m.tutorialModel.SetContextMode(false)
+	m.focused = m.restoreFocusFromTutorial()
+	if err := m.tutorialModel.SaveProgress(); err != nil {
+		debug.Log("tutorial: saving progress failed: %v", err)
+	}
+	m.tutorialModel.ResetClose()
 }
 
 // handleAttentionKeys handles keys while the attention view has focus:

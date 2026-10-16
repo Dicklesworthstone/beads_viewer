@@ -116,6 +116,49 @@ func (m *ActionableModel) SelectedIssueID() string {
 	return track.Items[m.selectedItem].ID
 }
 
+// GoToStart jumps to the first actionable item in the first non-empty track.
+func (m *ActionableModel) GoToStart() {
+	if len(m.plan.Tracks) == 0 {
+		return
+	}
+	m.selectedTrack = 0
+	m.selectedItem = 0
+	m.ensureVisible()
+}
+
+// GoToEnd jumps to the last actionable item in the last track.
+func (m *ActionableModel) GoToEnd() {
+	if len(m.plan.Tracks) == 0 {
+		return
+	}
+	m.selectedTrack = len(m.plan.Tracks) - 1
+	items := len(m.plan.Tracks[m.selectedTrack].Items)
+	if items > 0 {
+		m.selectedItem = items - 1
+	} else {
+		m.selectedItem = 0
+	}
+	m.ensureVisible()
+}
+
+// SelectIssueByID selects the specified issue ID if present in any execution track.
+func (m *ActionableModel) SelectIssueByID(id string) bool {
+	if id == "" || len(m.plan.Tracks) == 0 {
+		return false
+	}
+	for tIdx, track := range m.plan.Tracks {
+		for iIdx, item := range track.Items {
+			if item.ID == id {
+				m.selectedTrack = tIdx
+				m.selectedItem = iIdx
+				m.ensureVisible()
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ensureVisible adjusts scroll to keep selection visible
 func (m *ActionableModel) ensureVisible() {
 	// Calculate the line number of the current selection

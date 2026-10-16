@@ -34,9 +34,10 @@ type semanticResultCache struct {
 }
 
 type semanticHybridConfig struct {
-	Enabled bool
-	Preset  search.PresetName
-	Weights search.Weights
+	Enabled       bool
+	Preset        search.PresetName
+	Weights       search.Weights
+	CustomWeights bool
 }
 
 type semanticScoreCache struct {
@@ -189,6 +190,17 @@ func (s *SemanticSearch) getHybridConfig() semanticHybridConfig {
 
 // SetHybridConfig updates hybrid scoring configuration.
 func (s *SemanticSearch) SetHybridConfig(enabled bool, preset search.PresetName) {
+	current := s.getHybridConfig()
+	if current.CustomWeights && preset == current.Preset {
+		s.hybridConfig.Store(semanticHybridConfig{
+			Enabled:       enabled,
+			Preset:        preset,
+			Weights:       current.Weights,
+			CustomWeights: true,
+		})
+		s.ResetCache()
+		return
+	}
 	weights, err := search.GetPreset(preset)
 	if err != nil {
 		weights, _ = search.GetPreset(search.PresetDefault)
@@ -198,6 +210,20 @@ func (s *SemanticSearch) SetHybridConfig(enabled bool, preset search.PresetName)
 		Enabled: enabled,
 		Preset:  preset,
 		Weights: weights.Normalize(),
+	})
+	s.ResetCache()
+}
+
+// SetHybridConfigWithWeights updates hybrid scoring configuration with explicit custom weights.
+func (s *SemanticSearch) SetHybridConfigWithWeights(enabled bool, preset search.PresetName, weights search.Weights) {
+	if _, err := search.GetPreset(preset); err != nil {
+		preset = search.PresetDefault
+	}
+	s.hybridConfig.Store(semanticHybridConfig{
+		Enabled:       enabled,
+		Preset:        preset,
+		Weights:       weights.Normalize(),
+		CustomWeights: true,
 	})
 	s.ResetCache()
 }
@@ -692,7 +718,7 @@ func BuildHybridMetricsCmd(issues []model.Issue, dataGen, buildGen uint64) tea.C
 }
 
 // BuildSemanticIndexCmd builds or updates the semantic index for the given issues.
-func BuildSemanticIndexCmd(issues []model.Issue, dataGen, buildGen uint64) tea.Cmd {
+func BuildSemanticIndexCmd(issues []model.Issue, dataGen, buildGen uint64, workDir ...string) tea.Cmd {
 	return func() tea.Msg {
 		cfg := search.EmbeddingConfigFromEnv()
 		embedder, err := search.NewEmbedderFromConfig(cfg)
@@ -700,9 +726,16 @@ func BuildSemanticIndexCmd(issues []model.Issue, dataGen, buildGen uint64) tea.C
 			return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
 		}
 
-		projectDir, err := os.Getwd()
-		if err != nil {
-			return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
+		projectDir := ""
+		if len(workDir) > 0 {
+			projectDir = strings.TrimSpace(workDir[0])
+		}
+		if projectDir == "" {
+			var err error
+			projectDir, err = os.Getwd()
+			if err != nil {
+				return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
+			}
 		}
 
 		indexPath := search.DefaultIndexPath(projectDir, cfg)

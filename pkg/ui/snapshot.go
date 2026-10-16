@@ -227,11 +227,12 @@ type DataSnapshot struct {
 	graphLayout *GraphLayout
 
 	// Metadata
-	CreatedAt     time.Time // When this snapshot was built
-	DataHash      string    // Hash of source data for cache validation
-	AuthorityHash string    // Full source identity, including hidden dependency records.
-	RecipeName    string    // Active recipe name for this snapshot (bv-2h40)
-	RecipeHash    string    // Fingerprint of active recipe for this snapshot (bv-4ilb)
+	CreatedAt     time.Time      // When this snapshot was built
+	DataHash      string         // Hash of source data for cache validation
+	AuthorityHash string         // Full source identity, including hidden dependency records.
+	RecipeName    string         // Active recipe name for this snapshot (bv-2h40)
+	RecipeHash    string         // Fingerprint of active recipe for this snapshot (bv-4ilb)
+	recipe        *recipe.Recipe // Retained to re-sort ViewIssues/ListItems when Phase 2 completes
 	// DatasetTier is a tiered performance mode for large datasets (bv-9thm).
 	// When unknown, normal behavior applies.
 	DatasetTier datasetTier
@@ -696,6 +697,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		CreatedAt:      createdAt,
 		RecipeName:     recipeName(b.recipe),
 		RecipeHash:     recipeFingerprint(b.recipe),
+		recipe:         b.recipe,
 		phase2Ready:    graphStats.IsPhase2Ready(),
 		IssueDiff:      b.diff,
 		IssueDiffStats: IssueDiffStats{
@@ -1313,7 +1315,18 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 	// Rebind tree nodes to cloned issues so the new snapshot stays detached from
 	// legacy m.issues sorting and pointer churn.
 	treeRoots, treeNodeMap := deepCopyTree(s.TreeRoots, s.TreeNodeMap, clonedIssueMap)
-	listItems := deepCopyListItems(s.ListItems)
+	viewIssues := cloneIssuesForAsync(s.ViewIssues)
+	var listItems []IssueItem
+	if s.recipe != nil && (s.recipe.NeedsGraphMetrics() || s.recipe.NeedsTriageScores()) && analyzer != nil && stats != nil {
+		if applied, err := applyRecipeToIssues(issuesClone, analyzer, stats, triageScores, s.recipe, analyzer.Now()); err == nil {
+			viewIssues = applied
+			listItems = buildListItems(viewIssues, stats)
+		} else {
+			listItems = deepCopyListItems(s.ListItems)
+		}
+	} else {
+		listItems = deepCopyListItems(s.ListItems)
+	}
 	listModelItems := make([]list.Item, len(listItems))
 	listIndexByID := make(map[string]int, len(listItems))
 	for i := range listItems {
@@ -1341,11 +1354,11 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		Issues:         issuesClone,
 		IssueMap:       clonedIssueMap,
 		pooledIssues:   s.pooledIssues,
-		ViewIssues:     cloneIssuesForAsync(s.ViewIssues),
+		ViewIssues:     viewIssues,
 		ListItems:      listItems, // Deep copy - contains mutable SearchComponents/TriageReasons
 		listModelItems: listModelItems,
 		listIndexByID:  listIndexByID,
-		listOrderHash:  s.listOrderHash,
+		listOrderHash:  listOrderFingerprint(listItems),
 		semanticIDs:    s.semanticIDs,
 		semanticDocs:   s.semanticDocs,
 		alerts:         alerts,
@@ -1379,6 +1392,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		AuthorityHash:        s.AuthorityHash,
 		RecipeName:           s.RecipeName,
 		RecipeHash:           s.RecipeHash,
+		recipe:               s.recipe,
 		DatasetTier:          s.DatasetTier,
 		SourceIssueCountHint: s.SourceIssueCountHint,
 		LoadedOpenOnly:       s.LoadedOpenOnly,

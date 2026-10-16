@@ -317,6 +317,11 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"1-9", "Filter list by rank", "Attention", "attention"},
 		{"]", "Close attention view", "Attention", "attention"},
 
+		// Label Dashboard ([)
+		{"h", "Label health detail", "Label", "label"},
+		{"d", "Label drilldown", "Label", "label"},
+		{"v", "Velocity comparison", "Label", "label"},
+
 		// Sprint Dashboard (P)
 		{"P", "Close sprint dashboard", "Sprint", "sprint"},
 		{"j", "Next sprint", "Sprint", "sprint"},
