@@ -882,11 +882,13 @@ func ValidateRepository(repoPath string) error {
 		return fmt.Errorf("not a git repository: %s", repoPath)
 	}
 
-	// Check if any beads file exists (multiple possible names)
+	// Check if any beads file exists (multiple possible names, including SQLite-backed workspaces)
 	beadsFiles := []string{
 		filepath.Join(repoPath, ".beads", "issues.jsonl"),
 		filepath.Join(repoPath, ".beads", "beads.jsonl"),
 		filepath.Join(repoPath, ".beads", "beads.base.jsonl"),
+		filepath.Join(repoPath, ".beads", "beads.db"),
+		filepath.Join(repoPath, ".beads", "metadata.json"),
 	}
 
 	found := false

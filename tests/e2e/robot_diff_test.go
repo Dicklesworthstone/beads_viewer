@@ -261,6 +261,9 @@ func TestRobotDiffAppliesLabelAndRepoScopeToBothSnapshots(t *testing.T) {
 					ClosedIssues []struct {
 						ID string `json:"id"`
 					} `json:"closed_issues"`
+					RemovedIssues []struct {
+						ID string `json:"id"`
+					} `json:"removed_issues"`
 				} `json:"diff"`
 			}
 			if err := json.Unmarshal(out, &payload); err != nil {
@@ -268,6 +271,9 @@ func TestRobotDiffAppliesLabelAndRepoScopeToBothSnapshots(t *testing.T) {
 			}
 			if len(payload.Diff.ClosedIssues) != 1 || payload.Diff.ClosedIssues[0].ID != "app-A" {
 				t.Fatalf("scoped closed issues = %+v, want only app-A", payload.Diff.ClosedIssues)
+			}
+			if len(payload.Diff.RemovedIssues) != 0 {
+				t.Fatalf("scoped removed issues = %+v, want empty (historical snapshot must be scoped symmetrically)", payload.Diff.RemovedIssues)
 			}
 		})
 	}

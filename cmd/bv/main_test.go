@@ -1945,6 +1945,134 @@ func TestRobotCausalityUsesHistoricalSourcePath(t *testing.T) {
 	}
 }
 
+func TestRobotCorrelationHandlersRespectAsOfAndSQLiteWorkspace(t *testing.T) {
+	exe := buildTestBinary(t)
+	repo := t.TempDir()
+	start := time.Date(2025, 1, 15, 0, 0, 0, 0, time.UTC)
+	t.Setenv("SOURCE_DATE_EPOCH", strconv.FormatInt(start.Add(12*time.Hour).Unix(), 10))
+	git := func(hour int, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		at := start.Add(time.Duration(hour) * time.Hour).Format(time.RFC3339)
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Fixture", "GIT_AUTHOR_EMAIL=fixture@example.invalid", "GIT_COMMITTER_NAME=Fixture", "GIT_COMMITTER_EMAIL=fixture@example.invalid", "GIT_AUTHOR_DATE="+at, "GIT_COMMITTER_DATE="+at)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git(0, "init", "-b", "main")
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.Mkdir(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeStep := func(hour int, beadsFile, status, codeLine, commitMsg string) {
+		data := fmt.Sprintf("{\"id\":\"A\",\"title\":\"Historical target\",\"status\":%q,\"priority\":2,\"issue_type\":\"task\",\"created_at\":%q,\"updated_at\":%q}\n", status, start.Format(time.RFC3339), start.Add(time.Duration(hour)*time.Hour).Format(time.RFC3339))
+		if err := os.WriteFile(filepath.Join(beadsDir, beadsFile), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "svc.go"), []byte("package main\n"+codeLine+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git(hour, "add", ".beads/"+beadsFile, "svc.go")
+		git(hour, "commit", "-m", commitMsg)
+	}
+
+	writeStep(0, "beads.jsonl", "open", "// A: initial", "A: initial open")
+	writeStep(2, "beads.jsonl", "in_progress", "// A: historical fix", "A: historical blocked fix")
+	historicalSHA := git(2, "rev-parse", "HEAD")
+
+	// Hour 8 adds a future commit touching svc.go and an unrelated orphan file.
+	if err := os.WriteFile(filepath.Join(repo, "orphan.go"), []byte("package main\n// future orphan\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(8, "add", "orphan.go")
+	writeStep(8, "issues.jsonl", "closed", "// A: future close", "unrelated future change and close")
+	futureSHA := git(8, "rev-parse", "HEAD")
+
+	for _, live := range []bool{true, false} {
+		t.Run(fmt.Sprintf("live_directory_%v", live), func(t *testing.T) {
+			preservedDir := filepath.Join(repo, "preserved-live-beads")
+			if !live {
+				if err := os.Rename(beadsDir, preservedDir); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					_ = os.Rename(preservedDir, beadsDir)
+				})
+			}
+
+			histOut, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-history", "--as-of", historicalSHA)
+			if err != nil {
+				t.Fatalf("robot-history --as-of failed: %v\n%s\n%s", err, histOut, stderr)
+			}
+			if !strings.Contains(histOut, "historical blocked fix") {
+				t.Fatalf("robot-history --as-of missing historical commit:\n%s", histOut)
+			}
+			if strings.Contains(histOut, "unrelated future change") || strings.Contains(histOut, futureSHA) {
+				t.Fatalf("robot-history --as-of leaked future commit:\n%s", histOut)
+			}
+
+			orphansOut, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-orphans", "--as-of", historicalSHA)
+			if err != nil {
+				t.Fatalf("robot-orphans --as-of failed: %v\n%s\n%s", err, orphansOut, stderr)
+			}
+			if strings.Contains(orphansOut, "orphan.go") || strings.Contains(orphansOut, futureSHA) {
+				t.Fatalf("robot-orphans --as-of leaked future orphan commit:\n%s", orphansOut)
+			}
+
+			fileBeadsOut, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-file-beads", "svc.go", "--as-of", historicalSHA)
+			if err != nil {
+				t.Fatalf("robot-file-beads --as-of failed: %v\n%s\n%s", err, fileBeadsOut, stderr)
+			}
+			if strings.Contains(fileBeadsOut, "unrelated future change") || strings.Contains(fileBeadsOut, futureSHA) {
+				t.Fatalf("robot-file-beads --as-of leaked future commit:\n%s", fileBeadsOut)
+			}
+
+			if live {
+				explainOut, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-explain-correlation", historicalSHA+":A", "--as-of", historicalSHA)
+				if err != nil {
+					t.Fatalf("robot-explain-correlation --as-of failed: %v\n%s\n%s", err, explainOut, stderr)
+				}
+				if !strings.Contains(explainOut, historicalSHA) || !strings.Contains(explainOut, `"bead_id":"A"`) {
+					t.Fatalf("robot-explain-correlation --as-of missing expected explanation:\n%s", explainOut)
+				}
+			}
+		})
+	}
+
+	t.Run("sqlite_only_working_tree", func(t *testing.T) {
+		if err := os.Remove(filepath.Join(beadsDir, "beads.jsonl")); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(beadsDir, "issues.jsonl")); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"database":"beads.db"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := correlation.ValidateRepository(repo); err != nil {
+			t.Fatalf("ValidateRepository rejected SQLite-backed workspace: %v", err)
+		}
+		_, resolved, err := resolveCorrelationBeadsPath(repo)
+		if err != nil {
+			t.Fatalf("resolveCorrelationBeadsPath failed in SQLite-backed workspace: %v", err)
+		}
+		if filepath.Base(resolved) != "issues.jsonl" {
+			t.Fatalf("expected issues.jsonl from git HEAD fallback, got %q", resolved)
+		}
+		explainOut, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-explain-correlation", historicalSHA+":A", "--as-of", historicalSHA)
+		if err != nil {
+			t.Fatalf("robot-explain-correlation --as-of in SQLite-only workspace failed: %v\n%s\n%s", err, explainOut, stderr)
+		}
+		if !strings.Contains(explainOut, historicalSHA) {
+			t.Fatalf("robot-explain-correlation --as-of in SQLite-only workspace missing commit SHA:\n%s", explainOut)
+		}
+	})
+}
+
 func TestRobotRelationshipWorkflowDocsExposeLiveJSONPaths(t *testing.T) {
 	docs := robotCommandDocs()
 	expectations := map[string][]string{

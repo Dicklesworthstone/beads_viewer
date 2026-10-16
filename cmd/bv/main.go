@@ -2780,7 +2780,9 @@ func main() {
 		// The TUI retains source rows for its recipe picker. Robot and export
 		// consumers apply the recipe before producing their output.
 		recipeForScope := activeRecipe
-		if !(envRobot || *exportFile != "" || *exportReport != "" || *exportPages != "" || *exportGraph != "") {
+		if !(envRobot || *exportFile != "" || *exportReport != "" || *exportPages != "" || *exportGraph != "" ||
+			*priorityBrief != "" || *agentBrief != "" || *emitScript || *semanticQuery != "" ||
+			*checkDrift || *saveBaseline != "" || *diffSince != "") {
 			recipeForScope = nil
 		}
 		scopedContext, scopeErr := scopeLoadedIssues(robotDispatchContext, recipeForScope)
@@ -3465,9 +3467,6 @@ func main() {
 
 		// Handle --export-graph (bv-94) - PNG/SVG/HTML export
 		if *exportGraph != "" {
-			analyzer := analysis.NewAnalyzer(issues)
-			stats := analyzer.Analyze()
-
 			// Apply label filter if specified
 			exportIssues := issues
 			if *labelScope != "" {
@@ -3488,6 +3487,15 @@ func main() {
 				os.Exit(1)
 			}
 
+			analyzer := analysis.NewAnalyzer(exportIssues)
+			analyzer.SetNow(robotNow())
+			analyzer.SetReadinessScope(robotDispatchContext.Readiness, robotDispatchContext.CandidateIDs)
+			if *forceFullAnalysis {
+				cfg := analysis.FullAnalysisConfig()
+				analyzer.SetConfig(&cfg)
+			}
+			stats := analyzer.Analyze()
+
 			// Get project name from current directory
 			cwd, cwdErr := os.Getwd()
 			projectName := "project"
@@ -3502,8 +3510,23 @@ func main() {
 					title = projectName
 				}
 
+				var historyReport *correlation.HistoryReport
+				if cwdErr == nil && correlation.ValidateRepository(cwd) == nil {
+					correlation.SetDiskCacheEnabled(true)
+					historyCtx := robotDispatchContext
+					historyCtx.Issues = exportIssues
+					if report, err := generateCorrelationReportForContext(historyCtx, cwd, correlation.CorrelatorOptions{Limit: timeTravelCommitLimit}); err == nil {
+						historyReport = report
+					}
+				}
+
 				// Compute triage for the graph export
-				triageOpts := analysis.TriageOptions{WaitForPhase2: true, Readiness: robotDispatchContext.Readiness, CandidateIDs: robotDispatchContext.CandidateIDs}
+				triageOpts := analysis.TriageOptions{
+					WaitForPhase2: true,
+					Readiness:     robotDispatchContext.Readiness,
+					CandidateIDs:  robotDispatchContext.CandidateIDs,
+					History:       historyReport,
+				}
 				triage := analysis.ComputeTriageWithOptions(exportIssues, triageOpts)
 				if !robotDispatchContext.claimsProven() {
 					suppressUnprovenTriageClaims(&triage)
@@ -3518,6 +3541,7 @@ func main() {
 					Issues:        exportIssues,
 					Stats:         &stats,
 					Triage:        &triage,
+					History:       historyReport,
 					Title:         title,
 					DataHash:      dataHash,
 					Path:          *exportGraph,
@@ -3572,6 +3596,8 @@ func main() {
 		// Handle --save-baseline
 		if *saveBaseline != "" {
 			analyzer := analysis.NewAnalyzer(issues)
+			analyzer.SetNow(robotNow())
+			analyzer.SetReadinessScope(robotDispatchContext.Readiness, robotDispatchContext.CandidateIDs)
 			if *forceFullAnalysis {
 				cfg := analysis.FullAnalysisConfig()
 				analyzer.SetConfig(&cfg)
@@ -3651,6 +3677,7 @@ func main() {
 			driftNow := robotNow()
 			analyzer := analysis.NewAnalyzer(issues)
 			analyzer.SetNow(driftNow)
+			analyzer.SetReadinessScope(robotDispatchContext.Readiness, robotDispatchContext.CandidateIDs)
 			if *forceFullAnalysis {
 				cfg := analysis.FullAnalysisConfig()
 				analyzer.SetConfig(&cfg)
@@ -3755,124 +3782,6 @@ func main() {
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage-by-track", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage-by-label", robotDispatchContext)
-
-		if *robotTriage || *robotNext || *robotTriageByTrack || *robotTriageByLabel {
-			// Attempt to load history for staleness analysis
-			// We use a best-effort approach here - if history isn't available or fails,
-			// we just proceed without staleness data.
-			var historyReport *correlation.HistoryReport
-
-			// bv-perf: Skip history loading if no open issues exist
-			// ComputeStaleness only processes open issues, so loading git history
-			// is wasted work when all issues are closed.
-			hasOpenIssues := false
-			for _, issue := range issues {
-				if issue.Status != model.StatusClosed && issue.Status != model.StatusTombstone {
-					hasOpenIssues = true
-					break
-				}
-			}
-
-			if hasOpenIssues {
-				if cwd, err := os.Getwd(); err == nil {
-					if beadsDir, err := loader.GetBeadsDir(""); err == nil {
-						if beadsPath, err := loader.FindJSONLPath(beadsDir); err == nil {
-							// Use a smaller limit for triage to keep it fast, unless overridden
-							limit := *historyLimit
-							if limit == 500 { // If default
-								limit = 200 // Use smaller default for triage
-							}
-
-							// Validate repo first
-							if correlation.ValidateRepository(cwd) == nil {
-								beadInfos := make([]correlation.BeadInfo, len(issues))
-								for i, issue := range issues {
-									beadInfos[i] = correlation.BeadInfo{
-										ID:     issue.ID,
-										Title:  issue.Title,
-										Status: string(issue.Status),
-									}
-								}
-
-								correlator := correlation.NewCorrelator(cwd, beadsPath)
-								opts := correlation.CorrelatorOptions{Limit: limit}
-
-								// Swallow errors for triage flow - staleness is optional
-								if report, err := correlator.GenerateReport(beadInfos, opts); err == nil {
-									historyReport = report
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// bv-87: Support track/label-aware grouping for multi-agent coordination
-			opts := analysis.TriageOptions{
-				GroupByTrack:  *robotTriageByTrack,
-				GroupByLabel:  *robotTriageByLabel,
-				WaitForPhase2: true, // Triage needs full graph metrics
-				UseFastConfig: true, // Use minimal Phase 2 config for robot mode (bv-t1js)
-				History:       historyReport,
-			}
-			triage := analysis.ComputeTriageWithOptions(issues, opts)
-			if !robotDispatchContext.claimsProven() {
-				suppressUnprovenTriageClaims(&triage)
-			}
-
-			// bv-90: Load feedback data for output
-			var feedbackInfo *analysis.FeedbackJSON
-			if robotTriageBeadsDir, err := loader.GetBeadsDir(""); err == nil {
-				if feedbackData, err := analysis.LoadFeedback(robotTriageBeadsDir); err == nil && len(feedbackData.Events) > 0 {
-					info := feedbackData.ToJSON()
-					feedbackInfo = &info
-				}
-			}
-
-			if *robotNext {
-				if err := handleRobotNext(robotDispatchContext, phaseThreeRobotHandlerConfig{
-					RobotNextFlag:  robotNext,
-					GraphRoot:      graphRoot,
-					NotReadyLabels: robotNotReadyLabels,
-				}); err != nil {
-					fmt.Fprintf(os.Stderr, "Error encoding robot-next: %v\n", err)
-					os.Exit(1)
-				}
-				os.Exit(0)
-			}
-
-			// Full triage output with usage hints
-			output := struct {
-				RobotEnvelope
-				Triage     analysis.TriageResult  `json:"triage"`
-				Feedback   *analysis.FeedbackJSON `json:"feedback,omitempty"` // bv-90: Feedback loop state
-				UsageHints []string               `json:"usage_hints"`        // bv-84: Agent-friendly hints
-			}{
-				RobotEnvelope: robotDispatchContext.Envelope(),
-				Triage:        triage,
-				Feedback:      feedbackInfo,
-				UsageHints: []string{
-					"jq '.triage.quick_ref.top_picks[:3]' - Top 3 picks for immediate work",
-					"jq '.triage.recommendations[3:10] | map({id,title,score})' - Next candidates after top picks",
-					"jq '.triage.blockers_to_clear | map(.id)' - High-impact blockers to clear",
-					"jq '.triage.recommendations[] | select(.type == \"bug\")' - Bug-focused recommendations",
-					"jq '.triage.quick_ref.top_picks[] | select(.unblocks > 2)' - High-impact picks",
-					"jq '.triage.quick_wins' - Low-effort, high-impact items",
-					"--robot-next - Get only the single top recommendation",
-					"--robot-triage-by-track - Group by execution track for multi-agent coordination",
-					"--robot-triage-by-label - Group by label for area-focused agents",
-					"jq '.triage.recommendations_by_track[].top_pick' - Top pick per track",
-					"jq '.triage.recommendations_by_label[].claim_command' - Claim commands per label",
-					"jq '.feedback.weight_adjustments' - View feedback-adjusted weights (bv-90)",
-				},
-			}
-			encoder := newRobotEncoder(os.Stdout)
-			if err := encoder.Encode(output); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding robot-triage: %v\n", err)
-				os.Exit(1)
-			}
-			os.Exit(0)
-		}
 
 		// Handle --priority-brief flag (bv-96)
 		if *priorityBrief != "" {
@@ -4101,95 +4010,6 @@ func main() {
 
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-history", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "bead-history", robotDispatchContext)
-
-		// Handle --robot-history flag
-		if *robotHistory || *beadHistory != "" {
-			cwd, err := os.Getwd()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Validate repository
-			if err := correlation.ValidateRepository(cwd); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Resolve beads file path (bv-history fix, respects BEADS_DIR)
-			beadsDir, err := loader.GetBeadsDir("")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-				os.Exit(1)
-			}
-			beadsPath, err := loader.FindJSONLPath(beadsDir)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error finding beads file: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Build correlator options
-			opts := correlation.CorrelatorOptions{
-				BeadID: *beadHistory,
-				Limit:  *historyLimit,
-			}
-
-			// Parse --history-since if provided
-			if *historySince != "" {
-				since, err := recipe.ParseRelativeTime(*historySince, robotNow())
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error parsing --history-since: %v\n", err)
-					os.Exit(1)
-				}
-				if !since.IsZero() {
-					opts.Since = &since
-				}
-			}
-
-			// Convert issues to BeadInfo for correlator
-			beadInfos := make([]correlation.BeadInfo, len(issues))
-			for i, issue := range issues {
-				beadInfos[i] = correlation.BeadInfo{
-					ID:     issue.ID,
-					Title:  issue.Title,
-					Status: string(issue.Status),
-				}
-			}
-
-			// Generate report with explicit beads path
-			correlator := correlation.NewCorrelator(cwd, beadsPath)
-			report, err := correlator.GenerateReport(beadInfos, opts)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error generating history report: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Apply confidence filter if specified
-			if *minConfidence > 0 {
-				scorer := correlation.NewScorer()
-				report.Histories = scorer.FilterHistoriesByConfidence(report.Histories, *minConfidence)
-
-				// Rebuild commit index after filtering
-				report.CommitIndex = correlation.BuildCommitIndex(report.Histories)
-
-				// Update stats
-				report.Stats.BeadsWithCommits = 0
-				for _, history := range report.Histories {
-					if len(history.Commits) > 0 {
-						report.Stats.BeadsWithCommits++
-					}
-				}
-			}
-
-			// Output JSON
-			encoder := newRobotEncoder(os.Stdout)
-			if err := encoder.Encode(report); err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding history report: %v\n", err)
-				os.Exit(1)
-			}
-			os.Exit(0)
-		}
-
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-correlation-stats", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-explain-correlation", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-confirm-correlation", robotDispatchContext)
@@ -4225,73 +4045,6 @@ func main() {
 		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-sprint-list", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-sprint-show", robotDispatchContext)
 
-		// Handle --robot-sprint-list and --robot-sprint-show flags (bv-156)
-		if *robotSprintList || *robotSprintShow != "" {
-			if *robotSprintShow == "" {
-				dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-sprint-list", robotDispatchContext)
-			}
-
-			cwd, err := os.Getwd()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-				os.Exit(1)
-			}
-
-			sprints, err := loader.LoadSprints(cwd)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading sprints: %v\n", err)
-				os.Exit(1)
-			}
-
-			dataHash := analysis.ComputeDataHash(issues)
-
-			if *robotSprintShow != "" {
-				// Find specific sprint
-				var found *model.Sprint
-				for i := range sprints {
-					if sprints[i].ID == *robotSprintShow {
-						found = &sprints[i]
-						break
-					}
-				}
-				if found == nil {
-					fmt.Fprintf(os.Stderr, "Sprint not found: %s\n", *robotSprintShow)
-					os.Exit(1)
-				}
-				// Wrap sprint with standard envelope
-				type SprintShowOutput struct {
-					RobotEnvelope
-					Sprint *model.Sprint `json:"sprint"`
-				}
-				output := SprintShowOutput{
-					RobotEnvelope: robotDispatchContext.EnvelopeWithHash(dataHash),
-					Sprint:        found,
-				}
-				encoder := newRobotEncoder(os.Stdout)
-				if err := encoder.Encode(output); err != nil {
-					fmt.Fprintf(os.Stderr, "Error encoding sprint: %v\n", err)
-					os.Exit(1)
-				}
-			} else {
-				// Output all sprints as JSON
-				output := struct {
-					RobotEnvelope
-					SprintCount int            `json:"sprint_count"`
-					Sprints     []model.Sprint `json:"sprints"`
-				}{
-					RobotEnvelope: robotDispatchContext.EnvelopeWithHash(dataHash),
-					SprintCount:   len(sprints),
-					Sprints:       sprints,
-				}
-				encoder := newRobotEncoder(os.Stdout)
-				if err := encoder.Encode(output); err != nil {
-					fmt.Fprintf(os.Stderr, "Error encoding sprints: %v\n", err)
-					os.Exit(1)
-				}
-			}
-			os.Exit(0)
-		}
-
 		// Handle --robot-burndown flag (bv-159)
 		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-burndown", robotDispatchContext)
 
@@ -4319,11 +4072,40 @@ func main() {
 
 			gitLoader := loader.NewGitLoader(cwd)
 
-			// Load historical issues
+			// Load historical issues and apply the same scope as current issues
 			historicalIssues, err := gitLoader.LoadAt(*diffSince)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error loading issues at %s: %v\n", *diffSince, err)
 				os.Exit(1)
+			}
+			historicalCtx, scopeErr := scopeLoadedIssues(RobotContext{
+				Issues:     historicalIssues,
+				Readiness:  model.NewReadinessIndex(historicalIssues),
+				Repo:       *repoFilter,
+				LabelScope: *labelScope,
+				Recipe:     *recipeName,
+			}, recipeForScope)
+			if scopeErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", scopeErr)
+				os.Exit(1)
+			}
+			fromIssues := historicalCtx.Issues
+			if recipeForScope == nil && historicalCtx.CandidateIDs != nil {
+				fromIssues = make([]model.Issue, 0, len(historicalCtx.Issues))
+				for _, issue := range historicalCtx.Issues {
+					if historicalCtx.CandidateIDs[issue.ID] {
+						fromIssues = append(fromIssues, issue)
+					}
+				}
+			}
+			toIssues := issues
+			if recipeForScope == nil && candidateIDs != nil {
+				toIssues = make([]model.Issue, 0, len(issues))
+				for _, issue := range issues {
+					if candidateIDs[issue.ID] {
+						toIssues = append(toIssues, issue)
+					}
+				}
 			}
 
 			// Get revision info for timestamp
@@ -4333,8 +4115,8 @@ func main() {
 			}
 
 			// Create snapshots
-			fromSnapshot := analysis.NewSnapshotAt(historicalIssues, time.Time{}, revision)
-			toSnapshot := analysis.NewSnapshot(issues)
+			fromSnapshot := analysis.NewSnapshotAt(fromIssues, time.Time{}, revision)
+			toSnapshot := analysis.NewSnapshot(toIssues)
 
 			// Compute diff
 			diff := analysis.CompareSnapshots(fromSnapshot, toSnapshot)
@@ -4342,7 +4124,7 @@ func main() {
 			if *robotDiff {
 				diffDispatchContext := robotDispatchContext
 				diffDispatchContext.Diff = diff
-				diffDispatchContext.DiffHistoricalIssues = historicalIssues
+				diffDispatchContext.DiffHistoricalIssues = fromIssues
 				diffDispatchContext.DiffResolvedRevision = revision
 				dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-diff", diffDispatchContext)
 			} else {
@@ -4362,6 +4144,11 @@ func main() {
 			// Launch TUI with historical issues (already loaded, no live reload)
 			m := ui.NewModel(issues, activeRecipe, "", ui.ReadinessScope{Authority: readiness, CandidateIDs: candidateIDs})
 			defer m.Stop()
+			if *debugRender != "" {
+				output := m.RenderDebugView(*debugRender, *debugWidth, *debugHeight)
+				fmt.Println(output)
+				os.Exit(0)
+			}
 			if err := runTUIProgram(m); err != nil {
 				fmt.Printf("Error running beads viewer: %v\n", err)
 				os.Exit(1)
@@ -7055,12 +6842,8 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		return nil, err
 	}
 
-	// Get beads path
-	beadsDir, err := loader.GetBeadsDir("")
-	if err != nil {
-		return nil, err
-	}
-	beadsPath, err := loader.FindJSONLPath(beadsDir)
+	// Get beads path (supports both JSONL and SQLite-backed workspaces)
+	beadsDir, beadsPath, err := resolveCorrelationBeadsPath(cwd)
 	if err != nil {
 		return nil, err
 	}

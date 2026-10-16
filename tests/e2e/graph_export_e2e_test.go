@@ -823,3 +823,74 @@ func createGraphTestRepoWithLabels(t *testing.T) string {
 	}
 	return repoDir
 }
+
+func TestGraphExportHTML_IncludesGitHistoryCorrelation(t *testing.T) {
+	bv := buildBvBinary(t)
+	repoDir := t.TempDir()
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir beads: %v", err)
+	}
+	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	jsonl := `{"id":"hist-1","title":"History correlated node","status":"open","priority":1,"issue_type":"task"}` + "\n"
+	if err := os.WriteFile(issuesPath, []byte(jsonl), 0o644); err != nil {
+		t.Fatalf("write issues.jsonl: %v", err)
+	}
+	codePath := filepath.Join(repoDir, "feature.go")
+	if err := os.WriteFile(codePath, []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("write feature.go: %v", err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Alice",
+			"GIT_AUTHOR_EMAIL=alice@example.com",
+			"GIT_COMMITTER_NAME=Alice",
+			"GIT_COMMITTER_EMAIL=alice@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init", "-b", "main")
+	git("add", ".beads/issues.jsonl", "feature.go")
+	git("commit", "-m", "feat(hist-1): wire git history into interactive graph export")
+
+	htmlPath := filepath.Join(repoDir, "graph.html")
+	cmd := exec.Command(bv, "--export-graph", htmlPath)
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("--export-graph failed: %v\n%s", err, out)
+	}
+
+	raw, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatalf("read exported html: %v", err)
+	}
+	_, data, found := strings.Cut(string(raw), "const DATA = ")
+	if !found {
+		t.Fatal("missing embedded const DATA in exported HTML")
+	}
+	var graph struct {
+		Nodes []struct {
+			ID          string `json:"id"`
+			CommitCount int    `json:"commit_count"`
+			LastAuthor  string `json:"last_author"`
+		} `json:"nodes"`
+		HistoryStats *struct {
+			TotalBeads       int `json:"total_beads"`
+			BeadsWithCommits int `json:"beads_with_commits"`
+		} `json:"history_stats"`
+	}
+	if err := json.NewDecoder(strings.NewReader(data)).Decode(&graph); err != nil {
+		t.Fatalf("decode embedded graph DATA: %v", err)
+	}
+	if len(graph.Nodes) != 1 || graph.Nodes[0].ID != "hist-1" || graph.Nodes[0].CommitCount < 1 {
+		t.Fatalf("expected hist-1 node with commit_count >= 1, got %+v", graph.Nodes)
+	}
+	if graph.HistoryStats == nil || graph.HistoryStats.BeadsWithCommits < 1 {
+		t.Fatalf("expected history_stats with beads_with_commits >= 1, got %+v", graph.HistoryStats)
+	}
+}
