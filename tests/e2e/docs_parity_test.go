@@ -507,6 +507,44 @@ func TestDocsParity_ConfiguredCoverageThresholds(t *testing.T) {
 	}
 }
 
+// workflowUsesRef matches the action reference of a workflow `uses:` line.
+var workflowUsesRef = regexp.MustCompile(`(?m)^\s*(?:-\s+)?uses:\s*["']?([^\s"'#]+)`)
+
+// pinnedActionRef is an action pinned to a full commit SHA. A tag or branch
+// can be moved upstream to run different code with the job's secrets.
+var pinnedActionRef = regexp.MustCompile(`^[^@\s]+@[0-9a-f]{40}$`)
+
+// TestRepoPolicy_WorkflowActionsArePinned keeps every GitHub Action in this
+// repository's workflows pinned to a full commit SHA (#197). Local actions
+// (./path) and digest-pinned Docker images are allowed.
+func TestRepoPolicy_WorkflowActionsArePinned(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join("..", "..", ".github", "workflows", "*.y*ml"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("no workflows found: %v", err)
+	}
+	checked := 0
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		for _, match := range workflowUsesRef.FindAllStringSubmatch(string(data), -1) {
+			ref := match[1]
+			checked++
+			switch {
+			case strings.HasPrefix(ref, "./"):
+			case strings.HasPrefix(ref, "docker://") && strings.Contains(ref, "@sha256:"):
+			case pinnedActionRef.MatchString(ref):
+			default:
+				t.Errorf("%s: action %q is not pinned to a full commit SHA", filepath.Base(path), ref)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("found no `uses:` lines; the pattern no longer matches the workflows")
+	}
+}
+
 // repoFile reads a file relative to the repository root (tests/e2e/..).
 func repoFile(t *testing.T, rel string) string {
 	t.Helper()

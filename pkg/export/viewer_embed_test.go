@@ -133,6 +133,35 @@ func TestEmbeddedIndex_CSPHasNoInlineScripts(t *testing.T) {
 	}
 }
 
+// TestEmbeddedViewerScripts_NoInlineEventHandlers: markup the viewer's own
+// scripts build at runtime is subject to the same CSP, so an onclick="..."
+// attribute in it never runs (the label legend's close button was dead).
+func TestEmbeddedViewerScripts_NoInlineEventHandlers(t *testing.T) {
+	entries, err := ViewerAssetsFS.ReadDir("viewer_assets")
+	if err != nil {
+		t.Fatalf("read embedded viewer_assets: %v", err)
+	}
+	handler := regexp.MustCompile(`(?i)<[a-z][^>]*\son[a-z]+\s*=\s*["']`)
+	scanned := 0
+	for _, entry := range entries {
+		// graph-demo.html and *.test.js are excluded from exports.
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".js") || strings.HasSuffix(entry.Name(), ".test.js") {
+			continue
+		}
+		content, err := ViewerAssetsFS.ReadFile("viewer_assets/" + entry.Name())
+		if err != nil {
+			t.Fatalf("read %s: %v", entry.Name(), err)
+		}
+		scanned++
+		if bad := handler.FindString(string(content)); bad != "" {
+			t.Errorf("%s builds an inline event handler, which the CSP blocks: %s", entry.Name(), bad)
+		}
+	}
+	if scanned == 0 {
+		t.Fatal("no viewer scripts scanned")
+	}
+}
+
 func assertEmbeddedAssetExists(t *testing.T, ref string) {
 	t.Helper()
 	if strings.Contains(ref, "://") || strings.HasPrefix(ref, "//") {

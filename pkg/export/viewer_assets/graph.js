@@ -3116,10 +3116,15 @@ function showLabelLegend() {
         justify-content: space-between;
         align-items: center;
     `;
-    title.innerHTML = `
-        <span>Labels</span>
-        <span style="cursor: pointer; opacity: 0.6;" onclick="window.bvGraph?.hideLabelLegend()">×</span>
-    `;
+    const heading = document.createElement('span');
+    heading.textContent = 'Labels';
+    // A listener, not an onclick attribute: the page's CSP has no
+    // 'unsafe-inline' in script-src, so inline handlers never run.
+    const close = document.createElement('span');
+    close.textContent = '×';
+    close.style.cssText = 'cursor: pointer; opacity: 0.6;';
+    close.addEventListener('click', hideLabelLegend);
+    title.append(heading, close);
     labelLegendEl.appendChild(title);
 
     // Add label items

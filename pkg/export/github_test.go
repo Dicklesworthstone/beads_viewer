@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -287,6 +288,22 @@ func TestWriteGitHubActionsWorkflow(t *testing.T) {
 	for _, check := range checks {
 		if !strings.Contains(contentStr, check) {
 			t.Errorf("Workflow missing expected content: %s", check)
+		}
+	}
+}
+
+// TestGitHubActionsWorkflowPinsEveryAction: every action in the generated
+// Pages workflow, not just the four listed above, is pinned to a full commit
+// SHA, so a newly added step cannot reintroduce a mutable tag (#197).
+func TestGitHubActionsWorkflowPinsEveryAction(t *testing.T) {
+	uses := regexp.MustCompile(`(?m)^\s*(?:-\s+)?uses:\s*["']?([^\s"'#]+)`).FindAllStringSubmatch(GitHubActionsWorkflowContent, -1)
+	if len(uses) == 0 {
+		t.Fatal("generated workflow has no `uses:` lines")
+	}
+	pinned := regexp.MustCompile(`^[^@\s]+@[0-9a-f]{40}$`)
+	for _, match := range uses {
+		if !pinned.MatchString(match[1]) {
+			t.Errorf("generated workflow action %q is not pinned to a full commit SHA", match[1])
 		}
 	}
 }
