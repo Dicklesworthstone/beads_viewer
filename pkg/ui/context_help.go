@@ -182,6 +182,7 @@ const contextHelpInsights = `## Insights Panel
 **Details**
   e         Toggle explanations
   x         Toggle calculations
+  < / >     Widen / narrow the detail panel
 
 **Attention Indicators**
 • Stale: Open too long

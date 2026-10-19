@@ -301,6 +301,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"e", "Toggle explanations", "Insights", "insights"},
 		{"x", "Calculation proof", "Insights", "insights"},
 		{"m", "Heatmap toggle", "Insights", "insights"},
+		{"<", "Widen detail panel", "Insights", "insights"},
+		{">", "Narrow detail panel", "Insights", "insights"},
 
 		// History View
 		{"v", "Toggle git/bead mode", "History", "history"},

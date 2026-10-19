@@ -731,6 +731,44 @@ func TestLabelPickerNonKeyUpdatesKeepSelection(t *testing.T) {
 	}
 }
 
+// TestKeyDispatch_InsightsResizesDetailPanel covers #214: in Insights, `<`
+// and `>` resize the detail panel instead of the hidden list/detail split.
+func TestKeyDispatch_InsightsResizesDetailPanel(t *testing.T) {
+	m := setupTestModel(t)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 50})
+	m = updated.(*Model)
+	updated, _ = m.Update(keyMsg("i"))
+	m = updated.(*Model)
+	if m.focused != focusInsights {
+		t.Fatalf("expected insights focus after 'i', got %v", m.focused)
+	}
+	split := m.splitPaneRatio
+	initial := m.insightsPanel.detailPanelWidth()
+
+	updated, _ = m.Update(keyMsg("<"))
+	m = updated.(*Model)
+	if got := m.insightsPanel.detailPanelWidth(); got <= initial {
+		t.Fatalf("'<' left the detail panel at %d columns (was %d)", got, initial)
+	}
+	updated, _ = m.Update(keyMsg(">"))
+	m = updated.(*Model)
+	updated, _ = m.Update(keyMsg(">"))
+	m = updated.(*Model)
+	if got := m.insightsPanel.detailPanelWidth(); got >= initial {
+		t.Fatalf("'>' left the detail panel at %d columns (was %d)", got, initial)
+	}
+	if m.splitPaneRatio != split {
+		t.Fatalf("Insights resize changed the list split ratio: %v -> %v", split, m.splitPaneRatio)
+	}
+
+	// A rebuilt panel (snapshot refresh) keeps the chosen width.
+	chosen := m.insightsPanel.detailPanelWidth()
+	m.rebuildInsightsPanel()
+	if got := m.insightsPanel.detailPanelWidth(); got != chosen {
+		t.Fatalf("rebuild reset the detail panel to %d columns, want %d", got, chosen)
+	}
+}
+
 func TestKeyDispatch_Regression_HistorySearchEnterKeepsFilter(t *testing.T) {
 	m := setupTestModel(t)
 

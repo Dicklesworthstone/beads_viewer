@@ -4136,6 +4136,8 @@ bv has a comprehensive built-in help system:
 |  | `e` | Toggle explanations |
 |  | `x` | Calculation proof |
 |  | `m` | Heatmap toggle |
+|  | `<` | Widen detail panel |
+|  | `>` | Narrow detail panel |
 | **history** | `v` | Toggle git/bead mode |
 |  | `tab` | Toggle focus |
 |  | `t` | Toggle timeline pane |

@@ -2138,6 +2138,7 @@ func (m *Model) rebuildInsightsPanel() {
 	panel.showCalculation = prev.showCalculation
 	panel.showDetailPanel = prev.showDetailPanel
 	panel.showHeatmap = prev.showHeatmap
+	panel.detailRatio = prev.detailRatio
 
 	if m.analyzer != nil && m.analysis != nil {
 		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analyzer.Now())
@@ -4633,8 +4634,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case "<":
-				// Shrink list pane (move divider left)
-				if m.isSplitView {
+				// Shrink list pane (move divider left). In Insights the
+				// divider sits before the detail panel, which grows (#214).
+				if m.focused == focusInsights {
+					m.insightsPanel.WidenDetailPanel()
+				} else if m.isSplitView {
 					m.splitPaneRatio -= 0.05
 					if m.splitPaneRatio < 0.2 {
 						m.splitPaneRatio = 0.2
@@ -4643,8 +4647,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case ">":
-				// Expand list pane (move divider right)
-				if m.isSplitView {
+				// Expand list pane (move divider right); in Insights the
+				// detail panel shrinks (#214).
+				if m.focused == focusInsights {
+					m.insightsPanel.NarrowDetailPanel()
+				} else if m.isSplitView {
 					m.splitPaneRatio += 0.05
 					if m.splitPaneRatio > 0.8 {
 						m.splitPaneRatio = 0.8

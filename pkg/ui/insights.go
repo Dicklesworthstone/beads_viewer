@@ -167,10 +167,15 @@ type InsightsModel struct {
 	showDetailPanel  bool
 	showHeatmap      bool // Toggle between list and heatmap view (bv-95)
 
-	// Markdown rendering for detail panel (bv-ui-polish)
-	mdRenderer    *MarkdownRenderer
-	detailVP      viewport.Model
-	detailContent string // cached markdown content
+	// Markdown rendering for detail panel (bv-ui-polish). mdRenderer always
+	// wraps at the detail viewport's width; the metric panels' explanations
+	// use their own renderer at the column width, so drawing them never
+	// leaves the detail renderer at the wrong width (#214).
+	mdRenderer      *MarkdownRenderer
+	explainRenderer *MarkdownRenderer
+	detailVP        viewport.Model
+	detailContent   string  // cached markdown content
+	detailRatio     float64 // detail panel share of the width; `<` / `>` adjust it
 
 	// Dimensions
 	width  int
@@ -180,15 +185,14 @@ type InsightsModel struct {
 
 // NewInsightsModel creates a new interactive insights model
 func NewInsightsModel(ins analysis.Insights, issueMap map[string]*model.Issue, theme Theme) InsightsModel {
-	// Initialize markdown renderer with theme for consistent styling
+	// Initialize markdown renderers with theme for consistent styling
 	mdRenderer := NewMarkdownRendererWithTheme(50, theme)
+	explainRenderer := NewMarkdownRendererWithTheme(50, theme)
 
-	// Initialize viewport for detail panel scrolling
+	// Initialize viewport for detail panel scrolling. renderDetailPanel draws
+	// the panel's border and padding, so the viewport itself has no frame and
+	// its width is the content width.
 	vp := viewport.New(50, 20)
-	vp.Style = theme.Renderer.NewStyle().
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(theme.Primary).
-		Padding(0, 1)
 
 	return InsightsModel{
 		insights:         ins,
@@ -198,24 +202,91 @@ func NewInsightsModel(ins analysis.Insights, issueMap map[string]*model.Issue, t
 		showCalculation:  true, // Always show calculation details
 		showDetailPanel:  true,
 		mdRenderer:       mdRenderer,
+		explainRenderer:  explainRenderer,
 		detailVP:         vp,
+		detailRatio:      insightsDetailDefaultRatio,
 	}
+}
+
+// Detail panel geometry (#214). The panel appears on terminals wider than
+// insightsDetailMinTerminal columns and takes detailRatio of the width, which
+// `<` / `>` adjust like the list/detail split (#89). The metric columns keep at
+// least insightsMainMinWidth columns.
+const (
+	insightsDetailMinTerminal  = 120
+	insightsDetailDefaultRatio = 1.0 / 3.0
+	insightsDetailMinRatio     = 0.2
+	insightsDetailMaxRatio     = 0.6
+	insightsDetailRatioStep    = 0.05
+	insightsDetailMinWidth     = 30
+	insightsMainMinWidth       = 60
+	insightsDetailFrame        = 4 // rounded border (2) + horizontal padding (2)
+)
+
+// detailPanelWidth is the detail panel's total width including its frame, or
+// 0 when the panel is hidden. View, SetSize and renderDetailPanel all derive
+// their widths from it.
+func (m *InsightsModel) detailPanelWidth() int {
+	if !m.showDetailPanel || m.width <= insightsDetailMinTerminal {
+		return 0
+	}
+	ratio := m.detailRatio
+	if ratio <= 0 {
+		ratio = insightsDetailDefaultRatio
+	}
+	width := int(float64(m.width) * ratio)
+	width = min(width, m.width-1-insightsMainMinWidth)
+	return max(width, insightsDetailMinWidth)
+}
+
+// detailContentWidth is the width the detail markdown wraps at: the panel
+// width minus its border and padding.
+func detailContentWidth(panelWidth int) int {
+	return max(panelWidth-insightsDetailFrame, 20)
 }
 
 func (m *InsightsModel) SetSize(w, h int) {
 	m.width = w
 	m.height = h
 	m.ready = true
+	m.syncDetailWidth()
+}
 
-	// Update detail panel viewport and markdown renderer dimensions
-	if m.showDetailPanel && w > 120 {
-		detailWidth := min(60, w/3)
-		m.detailVP.Width = detailWidth - 4 // Account for border/padding
-		m.detailVP.Height = h - 4
-		if m.mdRenderer != nil {
-			m.mdRenderer.SetWidthWithTheme(detailWidth-6, m.theme)
-		}
+// syncDetailWidth sizes the detail viewport and its markdown renderer to the
+// panel's content width. When that width changes, the cached detail is
+// dropped so the next View re-renders it at the new width.
+func (m *InsightsModel) syncDetailWidth() {
+	panelWidth := m.detailPanelWidth()
+	if panelWidth == 0 {
+		return
 	}
+	contentWidth := detailContentWidth(panelWidth)
+	m.detailVP.Width = contentWidth
+	if m.mdRenderer != nil && m.mdRenderer.width != contentWidth {
+		m.mdRenderer.SetWidthWithTheme(contentWidth, m.theme)
+		m.detailContent = ""
+	}
+}
+
+// WidenDetailPanel moves the divider left, giving the detail panel more of
+// the width (`<`).
+func (m *InsightsModel) WidenDetailPanel() {
+	m.adjustDetailRatio(insightsDetailRatioStep)
+}
+
+// NarrowDetailPanel moves the divider right, giving the metric panels more
+// of the width (`>`).
+func (m *InsightsModel) NarrowDetailPanel() {
+	m.adjustDetailRatio(-insightsDetailRatioStep)
+}
+
+func (m *InsightsModel) adjustDetailRatio(delta float64) {
+	ratio := m.detailRatio
+	if ratio <= 0 {
+		ratio = insightsDetailDefaultRatio
+	}
+	m.detailRatio = min(max(ratio+delta, insightsDetailMinRatio), insightsDetailMaxRatio)
+	m.syncDetailWidth()
 }
 
 func (m *InsightsModel) SetInsights(ins analysis.Insights) {
@@ -349,16 +420,18 @@ func (m *InsightsModel) updateDetailContent() {
 }
 
 // renderMarkdownExplanation renders markdown text for panel explanations.
-// It uses the mdRenderer with the specified width and strips trailing whitespace.
+// It uses the explanation renderer at the specified width (the detail
+// renderer keeps its own width) and strips trailing whitespace.
 func (m *InsightsModel) renderMarkdownExplanation(text string, width int) string {
-	if m.mdRenderer == nil || width <= 0 {
+	if m.explainRenderer == nil || width <= 0 {
 		return text
 	}
 
-	// Temporarily adjust renderer width for this explanation
-	m.mdRenderer.SetWidthWithTheme(width, m.theme)
+	// SetWidth rebuilds the renderer only when the width actually changes;
+	// every metric panel shares one column width.
+	m.explainRenderer.SetWidth(width)
 
-	rendered, err := m.mdRenderer.Render(text)
+	rendered, err := m.explainRenderer.Render(text)
 	if err != nil {
 		return text
 	}
@@ -690,9 +763,8 @@ func (m *InsightsModel) View() string {
 
 	// Calculate layout dimensions
 	mainWidth := m.width
-	detailWidth := 0
-	if m.showDetailPanel && m.width > 120 {
-		detailWidth = min(50, m.width/3)
+	detailWidth := m.detailPanelWidth()
+	if detailWidth > 0 {
 		mainWidth = m.width - detailWidth - 1
 	}
 
@@ -1793,26 +1865,33 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 	// === HEADER: Title with Type Icon ===
 	sb.WriteString(fmt.Sprintf("# %s %s\n\n", GetTypeIconMD(string(issue.IssueType)), issue.Title))
 
-	// === Meta Table ===
-	sb.WriteString("| Field | Value |\n|---|---|\n")
-	sb.WriteString(fmt.Sprintf("| **ID** | `%s` |\n", issue.ID))
-	sb.WriteString(fmt.Sprintf("| **Status** | **%s** |\n", strings.ToUpper(string(issue.Status))))
-	sb.WriteString(fmt.Sprintf("| **Priority** | %s P%d |\n", GetPriorityIcon(issue.Priority), issue.Priority))
-	if issue.Assignee != "" {
-		sb.WriteString(fmt.Sprintf("| **Assignee** | @%s |\n", issue.Assignee))
+	// === Meta fields ===
+	// One "**Field:** value" list item each, so every value gets the rest of
+	// its line. A Markdown table here was stretched to the renderer width with
+	// its columns widened evenly, leaving a wide label column and a narrow
+	// value column (#214). (Glamour joins hard-line-break lines, so a list it
+	// is.)
+	meta := func(field, value string) {
+		sb.WriteString(fmt.Sprintf("- **%s:** %s\n", field, value))
 	}
-	sb.WriteString(fmt.Sprintf("| **Created** | %s |\n", issue.CreatedAt.Format("2006-01-02")))
+	meta("ID", fmt.Sprintf("`%s`", issue.ID))
+	meta("Status", fmt.Sprintf("**%s**", strings.ToUpper(string(issue.Status))))
+	meta("Priority", fmt.Sprintf("%s P%d", GetPriorityIcon(issue.Priority), issue.Priority))
+	if issue.Assignee != "" {
+		meta("Assignee", "@"+issue.Assignee)
+	}
+	meta("Created", issue.CreatedAt.Format("2006-01-02"))
 	if issue.DueDate != nil {
-		sb.WriteString(fmt.Sprintf("| **Due** | %s |\n", issue.DueDate.Format("2006-01-02")))
+		meta("Due", issue.DueDate.Format("2006-01-02"))
 	}
 	if issue.DeferUntil != nil {
-		sb.WriteString(fmt.Sprintf("| **Deferred Until** | %s |\n", issue.DeferUntil.Format("2006-01-02")))
+		meta("Deferred Until", issue.DeferUntil.Format("2006-01-02"))
 	}
 	// External reference (e.g. a linked spec/report path or JIRA ticket).
 	// `br show` surfaces this as a "Ref:" line; mirror it here so the link is
 	// visible in the TUI instead of forcing it into the description (#172).
 	if issue.ExternalRef != nil && *issue.ExternalRef != "" {
-		sb.WriteString(fmt.Sprintf("| **External Ref** | `%s` |\n", *issue.ExternalRef))
+		meta("External Ref", fmt.Sprintf("`%s`", *issue.ExternalRef))
 	}
 	sb.WriteString("\n")
 
@@ -2011,16 +2090,13 @@ func (m *InsightsModel) renderCalculationProofMD(selectedID string) string {
 }
 
 func (m *InsightsModel) renderDetailPanel(width, height int, t Theme) string {
-	// Update viewport dimensions
-	vpWidth := width - 4   // Account for border
+	// width is detailPanelWidth(): size the viewport and the markdown
+	// renderer to its content area (border and padding excluded).
+	m.syncDetailWidth()
 	vpHeight := height - 4 // Account for border and scroll hint
-	if vpWidth < 20 {
-		vpWidth = 20
-	}
 	if vpHeight < 5 {
 		vpHeight = 5
 	}
-	m.detailVP.Width = vpWidth
 	m.detailVP.Height = vpHeight
 
 	selectedID := m.SelectedIssueID()
@@ -2067,12 +2143,15 @@ Navigate to a metric panel and select an item to view its details here.
 	// Panel border style
 	// Note: Width is omitted intentionally - lipgloss Width() on bordered content
 	// with embedded newlines causes extra blank lines to appear due to per-line
-	// width padding. The border + content naturally determines the panel width.
+	// width padding. The border + content naturally determines the panel width:
+	// the viewport pads its lines to the content width, so the panel is exactly
+	// width columns. MaxWidth is only a hard bound.
 	// Height is safe to set for vertical space utilization.
 	panelStyle := t.Renderer.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(t.Primary).
 		Height(height).
+		MaxWidth(width).
 		Padding(0, 1)
 
 	return panelStyle.Render(sb.String())

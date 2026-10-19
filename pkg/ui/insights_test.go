@@ -1,11 +1,13 @@
 package ui_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // createTestInsights creates a test Insights struct with sample data
@@ -579,5 +581,113 @@ func TestInsightsModelScrolling(t *testing.T) {
 	for i := 0; i < 55; i++ {
 		m.MoveUp()
 		_ = m.View()
+	}
+}
+
+// gh214DetailModel builds an insights model whose first bottleneck has a long
+// description, so its rendered width shows where the detail markdown wraps.
+func gh214DetailModel(t *testing.T) ui.InsightsModel {
+	t.Helper()
+	issue := model.Issue{
+		ID:          "wide-1",
+		Title:       "Detail width",
+		Description: strings.Repeat("alpha beta gamma delta epsilon ", 12),
+		Status:      model.StatusInProgress,
+		IssueType:   model.TypeTask,
+		Priority:    1,
+		Assignee:    "someone",
+	}
+	m := ui.NewInsightsModel(analysis.Insights{
+		Bottlenecks: []analysis.InsightItem{{ID: issue.ID, Value: 1}},
+	}, map[string]*model.Issue{issue.ID: &issue}, createTheme())
+	m.SetSize(200, 50)
+	return m
+}
+
+// detailPanelLeftEdge returns the column of the detail panel's top-left
+// corner: the last rounded corner on the view's first panel line.
+func detailPanelLeftEdge(t *testing.T, view string) int {
+	t.Helper()
+	for _, line := range strings.Split(ansi.Strip(view), "\n") {
+		if idx := strings.LastIndex(line, "╭"); idx >= 0 {
+			return ansi.StringWidth(line[:idx])
+		}
+	}
+	t.Fatalf("no panel corner in view:\n%s", ansi.Strip(view))
+	return 0
+}
+
+// TestInsightsDetailPanelUsesItsOwnWidth_GH214: the detail markdown wraps at
+// the detail viewport's width, not at the metric column width the panel
+// explanations were last rendered with, and the meta fields are compact
+// "Field: value" lines instead of an evenly stretched two-column table.
+func TestInsightsDetailPanelUsesItsOwnWidth_GH214(t *testing.T) {
+	m := gh214DetailModel(t)
+	view := ansi.Strip(m.View())
+	left := detailPanelLeftEdge(t, view)
+
+	longest := 0
+	sawStatus := false
+	for _, line := range strings.Split(view, "\n") {
+		if w := ansi.StringWidth(line); w > 200 {
+			t.Fatalf("view line is %d columns wide, over the 200 given:\n%s", w, line)
+		}
+		if ansi.StringWidth(line) <= left {
+			continue
+		}
+		detail := strings.Trim(ansi.Cut(line, left, 200), " │╭╮╰╯─")
+		if strings.Contains(detail, "Status: IN_PROGRESS") {
+			sawStatus = true
+			// Each field has its own line, sized to its content.
+			if strings.Contains(detail, "ID:") || strings.Contains(detail, "Priority:") {
+				t.Fatalf("meta fields share a line: %q", detail)
+			}
+		}
+		if strings.Contains(detail, "alpha") {
+			longest = max(longest, ansi.StringWidth(strings.TrimSpace(detail)))
+		}
+	}
+	if !sawStatus {
+		t.Fatalf("detail panel has no %q line:\n%s", "Status: IN_PROGRESS", view)
+	}
+	// The panel is 66 columns wide (a third of 200), so its content wraps at
+	// 62. The metric explanations wrap near 36 columns.
+	if longest < 50 {
+		t.Fatalf("description wraps at %d columns; want the detail content width (~62):\n%s", longest, view)
+	}
+}
+
+// TestInsightsDetailPanelResize_GH214: `<` widens and `>` narrows the detail
+// panel within bounds, like the list/detail split (#89).
+func TestInsightsDetailPanelResize_GH214(t *testing.T) {
+	m := gh214DetailModel(t)
+	initial := detailPanelLeftEdge(t, m.View())
+
+	m.WidenDetailPanel()
+	wider := detailPanelLeftEdge(t, m.View())
+	if wider >= initial {
+		t.Fatalf("WidenDetailPanel: left edge %d, want < %d", wider, initial)
+	}
+
+	m.NarrowDetailPanel()
+	m.NarrowDetailPanel()
+	narrower := detailPanelLeftEdge(t, m.View())
+	if narrower <= initial {
+		t.Fatalf("NarrowDetailPanel: left edge %d, want > %d", narrower, initial)
+	}
+
+	// Bounds: the panel never shrinks below a usable width or crowds out the
+	// metric columns.
+	for i := 0; i < 40; i++ {
+		m.NarrowDetailPanel()
+	}
+	if edge := detailPanelLeftEdge(t, m.View()); 200-edge < 30 {
+		t.Fatalf("detail panel narrowed to %d columns", 200-edge)
+	}
+	for i := 0; i < 40; i++ {
+		m.WidenDetailPanel()
+	}
+	if edge := detailPanelLeftEdge(t, m.View()); edge < 60 {
+		t.Fatalf("metric columns squeezed to %d columns", edge)
 	}
 }

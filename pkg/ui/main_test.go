@@ -88,9 +88,9 @@ func TestViewportAndInsightsDetailSurfaceDueDeferAndExternalRef(t *testing.T) {
 	}, map[string]*model.Issue{issue.ID: &issue}, m.theme)
 	detailMD := insModel.buildDetailMarkdown(issue.ID)
 	for _, want := range []string{
-		"| **Due** | 2026-11-20 |",
-		"| **Deferred Until** | 2026-10-25 |",
-		"| **External Ref** | `JIRA-9001` |",
+		"- **Due:** 2026-11-20",
+		"- **Deferred Until:** 2026-10-25",
+		"- **External Ref:** `JIRA-9001`",
 	} {
 		if !strings.Contains(detailMD, want) {
 			t.Fatalf("insights buildDetailMarkdown missing %q:\n%s", want, detailMD)
