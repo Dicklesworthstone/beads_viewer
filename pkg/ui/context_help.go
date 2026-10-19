@@ -272,18 +272,13 @@ const contextHelpFilter = `## Filter Mode
 const contextHelpLabelPicker = `## Label Picker
 
 **Navigation**
-  j/k       Move selection
-  Enter     Apply label
-  Space     Toggle multi-select
+  ↑/↓       Move selection (also Ctrl+P / Ctrl+N)
+  Enter     Filter the list by the selected label
   Esc       Cancel
 
 **Search**
-  /         Filter labels
-
-**Actions**
-  n         Create new label
-  d         Delete label
-  e         Edit label`
+  Type      Every printable key, including j, k and q,
+            goes into the fuzzy filter`
 
 const contextHelpRecipePicker = `## Recipe Picker
 

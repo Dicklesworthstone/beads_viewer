@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -627,6 +628,106 @@ func TestKeyDispatch_Regression_LabelPickerConsumesQKey(t *testing.T) {
 	m = updated.(*Model)
 	if m.showLabelPicker || m.focused != focusList {
 		t.Fatalf("expected esc to cancel label picker, got focused=%v showLabelPicker=%v", m.focused, m.showLabelPicker)
+	}
+}
+
+// openLabelPickerWithLabels returns a model whose label picker is open over
+// issues carrying the given labels (one issue per label, equal counts, so the
+// picker lists them alphabetically).
+func openLabelPickerWithLabels(t *testing.T, labels ...string) *Model {
+	t.Helper()
+	issues := make([]model.Issue, 0, len(labels))
+	for i, label := range labels {
+		issues = append(issues, model.Issue{
+			ID:     "lp-" + string(rune('a'+i)),
+			Title:  "Label picker issue " + label,
+			Status: model.StatusOpen,
+			Labels: []string{label},
+		})
+	}
+	m := NewModel(issues, nil, "")
+	updated, _ := m.Update(keyMsg("l"))
+	m = updated.(*Model)
+	if m.focused != focusLabelPicker || !m.showLabelPicker {
+		t.Fatalf("expected label picker after 'l', got focused=%v showLabelPicker=%v", m.focused, m.showLabelPicker)
+	}
+	return m
+}
+
+// TestKeyDispatch_Regression_LabelPickerTypesJAndK guards issue #213: the
+// picker's filter input is always focused, so lowercase j and k must be typed
+// into the query (labels such as "backend" contain them) instead of moving
+// the selection. The arrow keys and ctrl+n/ctrl+p still navigate.
+func TestKeyDispatch_Regression_LabelPickerTypesJAndK(t *testing.T) {
+	m := openLabelPickerWithLabels(t, "api", "backend", "jobs")
+
+	for _, r := range "backend" {
+		updated, _ := m.Update(keyMsg(string(r)))
+		m = updated.(*Model)
+	}
+	if got := m.labelPicker.InputValue(); got != "backend" {
+		t.Fatalf("label filter input = %q, want %q", got, "backend")
+	}
+	if got := m.labelPicker.SelectedLabel(); got != "backend" {
+		t.Fatalf("selected label = %q, want %q", got, "backend")
+	}
+
+	// Clear the query, then check that j is typed as well.
+	for range "backend" {
+		updated, _ := m.Update(keyMsg("backspace"))
+		m = updated.(*Model)
+	}
+	updated, _ := m.Update(keyMsg("j"))
+	m = updated.(*Model)
+	if got := m.labelPicker.InputValue(); got != "j" {
+		t.Fatalf("label filter input = %q after typing j, want %q", got, "j")
+	}
+	if got := m.labelPicker.SelectedLabel(); got != "jobs" {
+		t.Fatalf("selected label = %q after typing j, want %q", got, "jobs")
+	}
+
+	// Navigation keys still move the selection without editing the query.
+	updated, _ = m.Update(keyMsg("backspace"))
+	m = updated.(*Model)
+	for _, key := range []tea.KeyMsg{keyMsg("down"), {Type: tea.KeyCtrlN}} {
+		updated, _ = m.Update(key)
+		m = updated.(*Model)
+	}
+	if got := m.labelPicker.SelectedLabel(); got != "jobs" {
+		t.Fatalf("selected label = %q after down, ctrl+n; want %q", got, "jobs")
+	}
+	for _, key := range []tea.KeyMsg{keyMsg("up"), {Type: tea.KeyCtrlP}} {
+		updated, _ = m.Update(key)
+		m = updated.(*Model)
+	}
+	if got := m.labelPicker.SelectedLabel(); got != "api" {
+		t.Fatalf("selected label = %q after up, ctrl+p; want %q", got, "api")
+	}
+	if got := m.labelPicker.InputValue(); got != "" {
+		t.Fatalf("navigation edited the query: %q", got)
+	}
+}
+
+// TestLabelPickerNonKeyUpdatesKeepSelection guards issue #213: cursor-blink
+// messages reach the picker's text input while it is focused. With an empty
+// query they used to re-filter and snap the selection back to the first label.
+func TestLabelPickerNonKeyUpdatesKeepSelection(t *testing.T) {
+	m := openLabelPickerWithLabels(t, "api", "backend", "jobs")
+
+	updated, _ := m.Update(keyMsg("down"))
+	m = updated.(*Model)
+	updated, _ = m.Update(keyMsg("down"))
+	m = updated.(*Model)
+	if got := m.labelPicker.SelectedLabel(); got != "jobs" {
+		t.Fatalf("selected label = %q after two downs, want %q", got, "jobs")
+	}
+
+	for i := 0; i < 3; i++ {
+		updated, _ = m.Update(embeddedTextInputMsg{session: m.embeddedTextInputSession, msg: textinput.Blink()})
+		m = updated.(*Model)
+	}
+	if got := m.labelPicker.SelectedLabel(); got != "jobs" {
+		t.Fatalf("cursor blink moved the selection to %q, want %q", got, "jobs")
 	}
 }
 

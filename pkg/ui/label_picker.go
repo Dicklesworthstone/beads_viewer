@@ -74,11 +74,28 @@ func (m *LabelPickerModel) SetSize(width, height int) {
 	m.height = height
 }
 
-// SetLabels updates the available labels with their counts
+// SetLabels updates the available labels with their counts. The query is
+// unchanged, so the highlighted label stays selected while it still matches.
 func (m *LabelPickerModel) SetLabels(labels []string, counts map[string]int) {
+	selected := m.SelectedLabel()
 	m.labelCounts = counts
 	m.allLabels = sortLabelsByCountDesc(labels, counts)
 	m.filterLabels()
+	m.selectLabel(selected)
+}
+
+// selectLabel highlights label if it is in the filtered list; otherwise the
+// selection filterLabels left in place stays.
+func (m *LabelPickerModel) selectLabel(label string) {
+	if label == "" {
+		return
+	}
+	for i, candidate := range m.filtered {
+		if candidate == label {
+			m.selectedIndex = i
+			return
+		}
+	}
 }
 
 // MoveUp moves selection up
@@ -103,12 +120,21 @@ func (m *LabelPickerModel) SelectedLabel() string {
 	return m.filtered[m.selectedIndex]
 }
 
-// UpdateInput processes a key message for the text input and returns any
+// UpdateInput processes a message for the text input and returns any
 // follow-up command (for example, an asynchronous clipboard paste).
+//
+// The list is re-filtered only when the query text changes. Cursor-blink and
+// other non-editing messages also arrive here, and re-filtering on them would
+// reset the selection to the first label while the query is empty (#213).
 func (m *LabelPickerModel) UpdateInput(msg tea.Msg) tea.Cmd {
+	previous := m.input.Value()
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
-	m.filterLabels()
+	if m.input.Value() != previous {
+		m.filterLabels()
+		// A new query ranks the labels afresh: highlight the best match.
+		m.selectedIndex = 0
+	}
 	return cmd
 }
 
@@ -331,7 +357,8 @@ func (m *LabelPickerModel) View() string {
 	footerStyle := t.Renderer.NewStyle().
 		Foreground(ColorFooterHint).
 		Italic(true)
-	lines = append(lines, footerStyle.Render("j/k: navigate | enter: apply | esc: cancel"))
+	// j/k are typed into the filter, so the arrows are the navigation keys.
+	lines = append(lines, footerStyle.Render("↑/↓ move · enter apply · esc cancel"))
 
 	content := strings.Join(lines, "\n")
 

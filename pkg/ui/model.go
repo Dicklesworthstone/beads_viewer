@@ -6216,9 +6216,12 @@ func (m *Model) handleLabelPickerKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		m.labelPicker.Blur()
 		m.endEmbeddedTextInputSession(embeddedTextInputLabelPicker)
 		m.focused = focusList
-	case "j", "down", "ctrl+n":
+	// Only non-printable keys move the selection. The filter input is always
+	// focused, so j and k, like every other printable key, are typed into the
+	// query (#213; q was fixed the same way in #176).
+	case "down", "ctrl+n":
 		m.labelPicker.MoveDown()
-	case "k", "up", "ctrl+p":
+	case "up", "ctrl+p":
 		m.labelPicker.MoveUp()
 	case "enter":
 		if selected := m.labelPicker.SelectedLabel(); selected != "" {

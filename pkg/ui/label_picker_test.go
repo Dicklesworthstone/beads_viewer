@@ -1,6 +1,10 @@
 package ui
 
-import "testing"
+import (
+	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
 
 func TestFuzzyScoreExactMatch(t *testing.T) {
 	score := fuzzyScore("api", "api")
@@ -150,6 +154,57 @@ func TestLabelPickerReset(t *testing.T) {
 	}
 	if picker.selectedIndex != 0 {
 		t.Errorf("Expected selectedIndex 0 after Reset, got %d", picker.selectedIndex)
+	}
+}
+
+// TestLabelPickerUpdateInputRefiltersOnlyOnQueryChange covers #213 at the
+// model level: a message that leaves the query unchanged keeps the selection,
+// while an edited query highlights its best match.
+func TestLabelPickerUpdateInputRefiltersOnlyOnQueryChange(t *testing.T) {
+	labels := []string{"api", "backend", "core"}
+	counts := map[string]int{"api": 5, "backend": 5, "core": 5}
+	picker := NewLabelPickerModel(labels, counts, Theme{})
+	_ = picker.Focus()
+
+	picker.MoveDown()
+	picker.MoveDown()
+	type unrelatedMsg struct{}
+	_ = picker.UpdateInput(unrelatedMsg{})
+	if got := picker.SelectedLabel(); got != "core" {
+		t.Fatalf("selection after a non-editing message = %q, want %q", got, "core")
+	}
+
+	_ = picker.UpdateInput(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	if got := picker.SelectedLabel(); got != "api" {
+		t.Fatalf("selection after typing %q = %q, want best match %q", "a", got, "api")
+	}
+}
+
+// TestLabelPickerSetLabelsKeepsSelectedLabel: reloading the labels while the
+// query is unchanged keeps the highlighted label, even when its row moves.
+func TestLabelPickerSetLabelsKeepsSelectedLabel(t *testing.T) {
+	picker := NewLabelPickerModel(
+		[]string{"api", "backend", "core"},
+		map[string]int{"api": 5, "backend": 5, "core": 5},
+		Theme{},
+	)
+	picker.MoveDown()
+	if got := picker.SelectedLabel(); got != "backend" {
+		t.Fatalf("selected = %q, want backend", got)
+	}
+
+	picker.SetLabels(
+		[]string{"api", "backend", "core", "aaa"},
+		map[string]int{"api": 5, "backend": 5, "core": 5, "aaa": 9},
+	)
+	if got := picker.SelectedLabel(); got != "backend" {
+		t.Fatalf("selected after reload = %q, want backend", got)
+	}
+
+	// A selected label that disappears falls back to a valid row.
+	picker.SetLabels([]string{"api"}, map[string]int{"api": 1})
+	if got := picker.SelectedLabel(); got != "api" {
+		t.Fatalf("selected after removal = %q, want api", got)
 	}
 }
 
