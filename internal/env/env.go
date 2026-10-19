@@ -80,6 +80,12 @@ var (
 		Default:     "(skip)",
 	})
 
+	CassSearchTimeoutMS = register(Var{
+		Name:        "BV_CASS_SEARCH_TIMEOUT_MS",
+		Description: "Time budget in milliseconds for the TUI's cass session lookup (`V`), shared by all of its searches. Raise it when cass searches are slow on a large archive or a loaded host.",
+		Default:     "`3000`",
+	})
+
 	CacheDir = register(Var{
 		Name:        "BV_CACHE_DIR",
 		Description: "Base directory for the disk caches (`analysis_cache/` and correlation caches live under it).",

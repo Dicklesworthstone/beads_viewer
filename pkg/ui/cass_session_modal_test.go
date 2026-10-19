@@ -845,7 +845,9 @@ func TestCassSessionModal_UnhandledKeyIgnored(t *testing.T) {
 func writeStubCass(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	script := "#!/bin/sh\nif [ \"$1\" = \"health\" ]; then exit \"${CASS_STUB_EXIT:-0}\"; fi\nif [ \"$1\" = \"search\" ]; then printf '%s' \"${CASS_STUB_SEARCH:-}\"; exit \"${CASS_STUB_SEARCH_EXIT:-0}\"; fi\nexit 0\n"
+	// CASS_STUB_SEARCH_SLEEP makes a search hang; exec keeps it one process,
+	// so a deadline kill ends it (and closes its stdout) at once.
+	script := "#!/bin/sh\nif [ \"$1\" = \"health\" ]; then exit \"${CASS_STUB_EXIT:-0}\"; fi\nif [ \"$1\" = \"search\" ]; then if [ -n \"${CASS_STUB_SEARCH_SLEEP:-}\" ]; then exec /bin/sleep \"$CASS_STUB_SEARCH_SLEEP\"; fi; printf '%s' \"${CASS_STUB_SEARCH:-}\"; exit \"${CASS_STUB_SEARCH_EXIT:-0}\"; fi\nexit 0\n"
 	if err := os.WriteFile(filepath.Join(dir, "cass"), []byte(script), 0o755); err != nil {
 		t.Fatalf("write stub cass: %v", err)
 	}
@@ -1180,6 +1182,48 @@ func TestModel_CassLookupUsesSearchOutcome(t *testing.T) {
 				t.Fatal("modal lost preview text or agent")
 			}
 		})
+	}
+}
+
+// TestModel_CassLookupTimeoutIsReportedAndConfigurable (#212): a lookup that
+// outlives BV_CASS_SEARCH_TIMEOUT_MS reports a timeout with the budget used,
+// not an "incomplete" lookup or an absence of sessions.
+func TestModel_CassLookupTimeoutIsReportedAndConfigurable(t *testing.T) {
+	t.Setenv("PATH", writeStubCass(t))
+	t.Setenv("CASS_STUB_EXIT", "0")
+	t.Setenv("CASS_STUB_SEARCH_SLEEP", "5")
+	t.Setenv("BV_CASS_SEARCH_TIMEOUT_MS", "300")
+	m := NewModel([]model.Issue{{ID: "bv-slow", Title: "OAuth preview", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+	m.width, m.height = 120, 40
+
+	start := time.Now()
+	updated, lookup := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	got := completeCassLookup(t, asModelPtr(t, updated), lookup)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("lookup took %v; the 300ms budget was not applied", elapsed)
+	}
+	if got.showCassModal || !strings.Contains(got.statusMsg, "timed out after 300ms") {
+		t.Fatalf("modal=%v status=%q, want a 300ms timeout report", got.showCassModal, got.statusMsg)
+	}
+}
+
+func TestCassLookupBudget(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", defaultCassLookupBudget},
+		{"60000", time.Minute},
+		{" 250 ", 250 * time.Millisecond},
+		{"0", defaultCassLookupBudget},
+		{"-5", defaultCassLookupBudget},
+		{"soon", defaultCassLookupBudget},
+		{"99999999999999999", maxCassLookupBudget},
+	} {
+		t.Setenv("BV_CASS_SEARCH_TIMEOUT_MS", tc.raw)
+		if got := cassLookupBudget(); got != tc.want {
+			t.Errorf("BV_CASS_SEARCH_TIMEOUT_MS=%q: budget %v, want %v", tc.raw, got, tc.want)
+		}
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -530,6 +531,32 @@ type cassSessionRequest struct {
 	dataGeneration uint64
 	workDir        string
 	status         string
+	budget         time.Duration // time allowed for all of the lookup's searches
+}
+
+// defaultCassLookupBudget bounds a `V` session lookup across all of its
+// search strategies unless BV_CASS_SEARCH_TIMEOUT_MS says otherwise.
+const defaultCassLookupBudget = 3 * time.Second
+
+// maxCassLookupBudget caps BV_CASS_SEARCH_TIMEOUT_MS so an oversized value
+// cannot overflow the duration.
+const maxCassLookupBudget = time.Hour
+
+// cassLookupBudget returns the session lookup's time budget: a positive
+// BV_CASS_SEARCH_TIMEOUT_MS in milliseconds, else the default (#212).
+func cassLookupBudget() time.Duration {
+	raw := strings.TrimSpace(env.CassSearchTimeoutMS.Get())
+	if raw == "" {
+		return defaultCassLookupBudget
+	}
+	ms, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || ms <= 0 {
+		return defaultCassLookupBudget
+	}
+	if ms >= maxCassLookupBudget.Milliseconds() {
+		return maxCassLookupBudget
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 type cassSessionsLoadedMsg struct {
@@ -2957,9 +2984,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if len(msg.result.TopSessions) == 0 {
-			if msg.result.Error != "" {
+			switch {
+			case msg.result.TimedOut:
+				// Not "no sessions": the searches did not finish (#212).
+				m.statusMsg = fmt.Sprintf("⚠️ Session lookup timed out after %s (BV_CASS_SEARCH_TIMEOUT_MS); press V to retry", msg.request.budget)
+			case msg.result.Error != "":
 				m.statusMsg = "⚠️ Session lookup incomplete; press V to retry"
-			} else {
+			default:
 				m.statusMsg = "No correlated sessions found for " + msg.request.beadID
 			}
 			m.statusIsError = false
@@ -10063,8 +10094,12 @@ func (m *Model) showCassSessionModal() tea.Cmd {
 	if m.cassDetector == nil {
 		m.cassDetector = cass.NewDetector()
 	}
+	budget := cassLookupBudget()
 	if m.cassCorrelator == nil || m.cassWorkspace != m.workDir {
-		m.cassCorrelator = cass.NewCorrelator(cass.NewSearcher(m.cassDetector), cass.NewCache(), m.workDir)
+		// Each search may use the whole budget: a slow first search must not
+		// be cut short by the searcher's own shorter default (#212).
+		searcher := cass.NewSearcherWithOptions(m.cassDetector, cass.WithSearchTimeout(max(budget, cass.DefaultSearchTimeout)))
+		m.cassCorrelator = cass.NewCorrelator(searcher, cass.NewCache(), m.workDir)
 		m.cassWorkspace = m.workDir
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -10072,6 +10107,7 @@ func (m *Model) showCassSessionModal() tea.Cmd {
 		cancel: cancel, beadID: issue.ID, focus: m.focused,
 		dataGeneration: m.semanticDataGeneration, workDir: m.workDir,
 		status: "Looking up sessions for " + issue.ID + "… (V/Esc cancel)",
+		budget: budget,
 	}
 	m.cassRequest = request
 	m.statusMsg = request.status
@@ -10089,7 +10125,7 @@ func (m *Model) showCassSessionModal() tea.Cmd {
 		if ctx.Err() != nil || (msg.status != cass.StatusHealthy && msg.status != cass.StatusNeedsIndex) {
 			return msg
 		}
-		searchCtx, searchCancel := context.WithTimeout(ctx, 3*time.Second)
+		searchCtx, searchCancel := context.WithTimeout(ctx, request.budget)
 		defer searchCancel()
 		msg.result = correlator.Correlate(searchCtx, &issue)
 		return msg

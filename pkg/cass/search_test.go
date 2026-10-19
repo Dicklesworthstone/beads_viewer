@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -327,7 +328,28 @@ func TestSearcher_Timeout(t *testing.T) {
 		if elapsed > 150*time.Millisecond {
 			t.Errorf("Search took %v, should have timed out around 50ms", elapsed)
 		}
+		// #212: a deadline is reported as a timeout, not as a failed search
+		// or an absence of sessions.
+		if !resp.Meta.TimedOut || !strings.Contains(resp.Meta.Error, "timed out after 50ms") {
+			t.Errorf("timeout meta = %+v, want TimedOut and \"timed out after 50ms\"", resp.Meta)
+		}
 	})
+}
+
+// TestSearcher_FailureIsNotTimeout (#212): a search that exits with an error
+// before any deadline is a failure, not a timeout.
+func TestSearcher_FailureIsNotTimeout(t *testing.T) {
+	d := NewDetector()
+	d.lookPath = func(string) (string, error) { return "/usr/local/bin/cass", nil }
+	d.runCommand = func(context.Context, string, ...string) (int, error) { return 0, nil }
+	s := NewSearcher(d)
+	s.runCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return nil, errors.New("exit status 1")
+	}
+	resp := s.Search(context.Background(), SearchOptions{Query: "test"})
+	if resp.Meta.TimedOut || resp.Meta.Error != "search execution failed" {
+		t.Errorf("failure meta = %+v, want a non-timeout execution failure", resp.Meta)
+	}
 }
 
 func TestSearcher_CustomTimeout(t *testing.T) {

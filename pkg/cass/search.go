@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os/exec"
 	"strconv"
@@ -51,6 +52,9 @@ type SearchMeta struct {
 	Total     int    `json:"total"`
 	Truncated bool   `json:"truncated"`
 	Error     string `json:"error,omitempty"` // Non-empty if partial failure
+	// TimedOut reports that bv's own deadline stopped the search: the search
+	// did not finish, which is different from finding no sessions.
+	TimedOut bool `json:"timed_out,omitempty"`
 }
 
 // SearchResponse contains results and metadata from a cass search.
@@ -118,10 +122,12 @@ func (s *Searcher) Search(ctx context.Context, opts SearchOptions) SearchRespons
 	case s.semaphore <- struct{}{}:
 		defer func() { <-s.semaphore }()
 	case <-ctx.Done():
-		return SearchResponse{
-			Results: []SearchResult{},
-			Meta:    SearchMeta{Error: "context cancelled waiting for semaphore"},
+		meta := SearchMeta{Error: "context cancelled waiting for semaphore"}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			meta.Error = "search timed out waiting for a free cass slot"
+			meta.TimedOut = true
 		}
+		return SearchResponse{Results: []SearchResult{}, Meta: meta}
 	}
 
 	// Determine timeout
@@ -143,13 +149,17 @@ func (s *Searcher) Search(ctx context.Context, opts SearchOptions) SearchRespons
 	elapsed := time.Since(start)
 
 	if err != nil {
-		return SearchResponse{
-			Results: []SearchResult{},
-			Meta: SearchMeta{
-				ElapsedMs: int(elapsed.Milliseconds()),
-				Error:     "search execution failed",
-			},
+		meta := SearchMeta{
+			ElapsedMs: int(elapsed.Milliseconds()),
+			Error:     "search execution failed",
 		}
+		// The deadline is this search's own timeout or the caller's budget,
+		// whichever came first; either way the search did not complete.
+		if errors.Is(searchCtx.Err(), context.DeadlineExceeded) {
+			meta.Error = "search timed out after " + elapsed.Round(time.Millisecond).String()
+			meta.TimedOut = true
+		}
+		return SearchResponse{Results: []SearchResult{}, Meta: meta}
 	}
 
 	// Parse response

@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -527,6 +528,41 @@ func TestCorrelator_FailedSearchIsRetryable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCorrelator_TimeoutStopsStrategiesAndIsReported (#212): when the shared
+// lookup budget runs out during the ID search, the result says so, the later
+// strategies are not attempted, and nothing is cached.
+func TestCorrelator_TimeoutStopsStrategiesAndIsReported(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		detector := NewDetector()
+		detector.lookPath = func(string) (string, error) { return "/usr/bin/cass", nil }
+		detector.runCommand = func(context.Context, string, ...string) (int, error) { return 0, nil }
+		searcher := NewSearcher(detector)
+		var queries []string
+		searcher.runCommand = func(ctx context.Context, _ string, args ...string) ([]byte, error) {
+			queries = append(queries, args[1])
+			<-ctx.Done() // a search slower than the budget
+			return nil, ctx.Err()
+		}
+		cache := NewCache()
+		correlator := NewCorrelator(searcher, cache, "/work/project")
+		issue := &model.Issue{ID: "bv-slow", Title: "OAuth authentication", CreatedAt: time.Now()}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		result := correlator.Correlate(ctx, issue)
+
+		if !result.TimedOut || !strings.Contains(result.Error, "ID search: search timed out") {
+			t.Fatalf("result = %+v, want a reported ID-search timeout", result)
+		}
+		if len(queries) != 1 {
+			t.Fatalf("searches attempted = %q, want only the ID search", queries)
+		}
+		if cache.Get(issue.ID) != nil {
+			t.Fatal("a timed-out correlation was cached")
+		}
+	})
 }
 
 func TestCorrelator_EmptySuccessIsCached(t *testing.T) {

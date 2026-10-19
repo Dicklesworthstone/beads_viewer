@@ -85,6 +85,9 @@ type CorrelationResult struct {
 	Keywords      []string            // Keywords used (for display)
 	ComputeTimeMs int                 // Time spent computing correlation
 	Error         string              // Diagnostic if any search failed or returned partial results
+	// TimedOut reports that the caller's time budget ran out before the
+	// strategies finished, so an empty result is not "no sessions".
+	TimedOut bool
 }
 
 // Correlator intelligently matches cass sessions to beads using multiple strategies.
@@ -172,16 +175,28 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 		c.cacheResult(issue.ID, &result)
 		return result
 	}
+	// note records a strategy's diagnostic and reports whether the budget is
+	// spent: the strategies share ctx, so later ones cannot run either.
+	note := func(strategy string, meta SearchMeta) bool {
+		if meta.Error != "" {
+			diagnostics = append(diagnostics, strategy+": "+meta.Error)
+		}
+		if meta.TimedOut {
+			result.TimedOut = true
+		}
+		return ctx.Err() != nil
+	}
 
 	// Strategy 1: ID mention search (definitive match)
 	idResults, idMeta := c.searchByID(ctx, issue.ID)
 	result.TotalFound = idMeta.Total
-	if idMeta.Error != "" {
-		diagnostics = append(diagnostics, "ID search: "+idMeta.Error)
-	}
+	stop := note("ID search", idMeta)
 	if len(idResults) > 0 {
 		result.TopSessions = idResults
 		result.Strategy = StrategyIDMention
+		return finish()
+	}
+	if stop {
 		return finish()
 	}
 
@@ -192,12 +207,13 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 	if len(keywords) > 0 {
 		keywordResults, keywordMeta := c.searchByKeywords(ctx, issue, keywords)
 		result.TotalFound = keywordMeta.Total
-		if keywordMeta.Error != "" {
-			diagnostics = append(diagnostics, "keyword search: "+keywordMeta.Error)
-		}
+		stop := note("keyword search", keywordMeta)
 		if len(keywordResults) > 0 {
 			result.TopSessions = keywordResults
 			result.Strategy = StrategyKeywords
+			return finish()
+		}
+		if stop {
 			return finish()
 		}
 	}
@@ -206,9 +222,7 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 	if issue.ClosedAt != nil || !issue.CreatedAt.IsZero() {
 		timestampResults, timestampMeta := c.searchByTimestamp(ctx, issue)
 		result.TotalFound = timestampMeta.Total
-		if timestampMeta.Error != "" {
-			diagnostics = append(diagnostics, "timestamp search: "+timestampMeta.Error)
-		}
+		note("timestamp search", timestampMeta)
 		if len(timestampResults) > 0 {
 			result.TopSessions = timestampResults
 			result.Strategy = StrategyTimestamp

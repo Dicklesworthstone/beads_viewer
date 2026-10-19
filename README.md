@@ -2563,6 +2563,13 @@ the completed modal returns to the view that opened it. A health probe already
 running may finish within its own two-second timeout after cancellation; no
 subsequent session search is started for that cancelled request.
 
+All of a lookup's searches share one time budget, 3 seconds by default. On a
+large archive or a loaded host a cass search can take longer; set
+`BV_CASS_SEARCH_TIMEOUT_MS` (milliseconds) to raise it, for example
+`BV_CASS_SEARCH_TIMEOUT_MS=30000 bv`. A lookup that runs out of time says
+"Session lookup timed out after 3s" rather than reporting that no sessions
+were found.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  📎 Related Coding Sessions  BV-123                                     │
@@ -4173,6 +4180,7 @@ bv has a comprehensive built-in help system:
 | `BV_BACKGROUND_MODE` | Startup default for the background snapshot worker (`1` on, `0` off). At runtime the TUI promotes itself to the worker after any synchronous reload that takes 1 s or longer; `0` pins synchronous reload and disables that promotion. | sync at startup, auto-promote after a slow reload |
 | `BV_BUILD_HYBRID_WASM` | Set to `1` to build the hybrid search WASM scorer during `--export-pages` (requires wasm-pack). | (skip) |
 | `BV_CACHE_DIR` | Base directory for the disk caches (`analysis_cache/` and correlation caches live under it). | `<user cache dir>/bv` |
+| `BV_CASS_SEARCH_TIMEOUT_MS` | Time budget in milliseconds for the TUI's cass session lookup (`V`), shared by all of its searches. Raise it when cass searches are slow on a large archive or a loaded host. | `3000` |
 | `BV_DEBOUNCE_MS` | Debounce window (milliseconds) for live reload events in background mode. | `200` |
 | `BV_DEBUG` | Any value: write `[BV_DEBUG]` diagnostics to stderr. | (off) |
 | `BV_FORCE_POLL` | Alias for `BV_FORCE_POLLING`. | (auto) |
