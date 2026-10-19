@@ -138,10 +138,10 @@
 | `--label` | string | (empty) | Scope analysis to label's subgraph (applies to every --robot-* command that loads issues, e.g. --robot-insights, --robot-plan, --robot-priority, --robot-orphans) | Search & Filters |
 | `--recipe` | string | (empty) | Apply a recipe by name (e.g., triage, actionable, high-impact) or by .yaml/.yml file path (e.g., .beads/recipes/sprint.yaml) | Search & Filters |
 | `--repo` | string | (empty) | Filter issues by repository prefix (e.g., 'api-' or 'api') | Search & Filters |
-| `--robot-by-assignee` | string | (empty) | Filter robot outputs by assignee (exact match) | Search & Filters |
-| `--robot-by-label` | string | (empty) | Filter robot outputs by label (exact match) | Search & Filters |
+| `--robot-by-assignee` | string | (empty) | Filter --robot-priority recommendations by assignee (exact match) | Search & Filters |
+| `--robot-by-label` | string | (empty) | Filter --robot-priority recommendations by label (exact match); use --label to scope other robot commands | Search & Filters |
 | `--robot-max-results` | int | `0` | Limit robot output count (0 = use defaults) | Search & Filters |
-| `--robot-min-confidence` | float64 | `0` | Filter robot outputs by minimum confidence (0.0-1.0) | Search & Filters |
+| `--robot-min-confidence` | float64 | `0` | Filter --robot-priority recommendations by minimum confidence (0.0-1.0) | Search & Filters |
 | `--search` | string | (empty) | Hashed keyword search query (builds/updates index on first run) | Search & Filters |
 | `--search-limit` | int | `10` | Max results for --search/--robot-search | Search & Filters |
 | `--search-min-score` | string | (empty) | Minimum text similarity before hybrid ranking (-1..1); exact IDs also obey this threshold | Search & Filters |

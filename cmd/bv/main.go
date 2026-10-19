@@ -300,8 +300,15 @@ func modifierRecoveryExamples(modifier string) []string {
 		return []string{"bv robot-forecast all --forecast-agents 3 --json"}
 	case "agents", "capacity-label":
 		return []string{"bv robot-capacity --agents 3 --json"}
-	case "robot-by-label", "robot-by-assignee":
-		return []string{"bv robot-priority --robot-by-label backend --json"}
+	case "robot-by-label":
+		// Other robot commands are scoped by label with --label, which is
+		// easy to miss when --robot-by-label reads like the general filter.
+		return []string{
+			"bv robot-priority --robot-by-label backend --json",
+			"bv robot-triage --label backend --json",
+		}
+	case "robot-by-assignee":
+		return []string{"bv robot-priority --robot-by-assignee alice --json"}
 	case "script-limit", "script-format":
 		return []string{"bv --emit-script --script-limit 5"}
 	case "pages-title", "pages-include-closed", "pages-include-history":
@@ -1512,10 +1519,10 @@ func main() {
 	graphPreset := flag.String("graph-preset", "compact", "Graph layout preset: compact (default) or roomy")
 	graphTitle := flag.String("graph-title", "", "Title for graph export (default: project name)")
 	// Robot output filters (bv-84)
-	robotMinConf := flag.Float64("robot-min-confidence", 0.0, "Filter robot outputs by minimum confidence (0.0-1.0)")
+	robotMinConf := flag.Float64("robot-min-confidence", 0.0, "Filter --robot-priority recommendations by minimum confidence (0.0-1.0)")
 	robotMaxResults := flag.Int("robot-max-results", 0, "Limit robot output count (0 = use defaults)")
-	robotByLabel := flag.String("robot-by-label", "", "Filter robot outputs by label (exact match)")
-	robotByAssignee := flag.String("robot-by-assignee", "", "Filter robot outputs by assignee (exact match)")
+	robotByLabel := flag.String("robot-by-label", "", "Filter --robot-priority recommendations by label (exact match); use --label to scope other robot commands")
+	robotByAssignee := flag.String("robot-by-assignee", "", "Filter --robot-priority recommendations by assignee (exact match)")
 	// Label subgraph scoping (bv-122)
 	labelScope := flag.StringP("label", "l", "", "Scope analysis to label's subgraph (applies to every --robot-* command that loads issues, e.g. --robot-insights, --robot-plan, --robot-priority, --robot-orphans)")
 	alertSeverity := flag.String("severity", "", "Filter robot alerts by severity (info|warning|critical)")

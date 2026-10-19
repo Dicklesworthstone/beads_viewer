@@ -79,6 +79,9 @@
 |  | `enter` | Label drilldown |
 |  | `1-9` | Filter list by rank |
 |  | `]` | Close attention view |
+| **label** | `h` | Label health detail |
+|  | `d` | Label drilldown |
+|  | `v` | Velocity comparison |
 | **sprint** | `P` | Close sprint dashboard |
 |  | `j` | Next sprint |
 |  | `k` | Previous sprint |

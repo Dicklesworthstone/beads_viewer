@@ -2736,6 +2736,26 @@ func TestModifierFlagValidation(t *testing.T) {
 				"Try: `bv robot-capacity --agents 3 --json`.",
 			},
 		},
+		{
+			// #211: the label filter points at --label for other commands.
+			name: "robot by label requires robot priority",
+			args: []string{"--robot-by-label", "backend"},
+			wantMessages: []string{
+				"Error: --robot-by-label requires --robot-priority",
+				"Try one of:",
+				"`bv robot-priority --robot-by-label backend --json`",
+				"`bv robot-triage --label backend --json`",
+			},
+		},
+		{
+			// #211: the assignee hint must show the assignee flag, not the label flag.
+			name: "robot by assignee requires robot priority",
+			args: []string{"--robot-by-assignee", "alice"},
+			wantMessages: []string{
+				"Error: --robot-by-assignee requires --robot-priority",
+				"Try: `bv robot-priority --robot-by-assignee alice --json`.",
+			},
+		},
 	}
 
 	for _, tt := range tests {
