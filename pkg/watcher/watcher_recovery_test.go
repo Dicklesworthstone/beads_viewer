@@ -78,6 +78,89 @@ func requireWatchQuiet(t *testing.T, w *Watcher) {
 	}
 }
 
+// settleAfterWrite replaces requireWatchChange after a write the test makes while
+// the poller runs. The poller stats the selected family without coordinating
+// with writers, so it can see a write made of several syscalls half-done:
+// os.WriteFile truncates before it writes, and an SQLite commit that creates the
+// WAL shows it empty, then with its header, then with a frame header, then with
+// the page. Each distinct state it sees is a real change and may refresh, so
+// "exactly one refresh per write" is not a polling guarantee. "An unchanged
+// family produces no refresh" is, and the requireWatchQuiet that follows checks
+// it from the moment the poller has recorded the finished write.
+//
+// It requires at least one refresh, then waits until the poller's recorded
+// fingerprint matches the family on disk, no debounce timer is pending and no
+// refresh is queued, on three consecutive checks one poll interval apart.
+// Refreshes drained meanwhile belong to the write's intermediate states; more
+// than maxRefreshesPerWrite of them, or no settle within 2s, fails the test.
+func settleAfterWrite(t *testing.T, w *Watcher) {
+	t.Helper()
+	const maxRefreshesPerWrite = 4
+	requireWatchChange(t, w)
+	refreshes, clean := 1, 0
+	deadline := time.Now().Add(2 * time.Second)
+	for clean < 3 {
+		select {
+		case <-w.Changed():
+			refreshes++
+			clean = 0
+			if refreshes > maxRefreshesPerWrite {
+				t.Fatalf("one write produced %d refreshes, more than the %d states it can show", refreshes, maxRefreshesPerWrite)
+			}
+			continue
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("poller did not settle on the written family within 2s (%d refreshes)", refreshes)
+		}
+		if watchRecordedFamily(t, w) {
+			clean++
+		} else {
+			clean = 0
+		}
+		time.Sleep(w.pollInterval)
+	}
+	walSize := int64(-1)
+	if info, err := os.Stat(w.walPath); err == nil {
+		walSize = info.Size()
+	}
+	t.Logf("settled after %d refresh(es); selected WAL now %d bytes", refreshes, walSize)
+}
+
+// watchRecordedFamily reports whether the poller has recorded the selected
+// family as it is on disk now, with no debounce timer pending and no refresh
+// queued. It reads the debouncer while holding w.mu, the same lock order as
+// scheduleChange, so it never sees a Trigger half-done.
+func watchRecordedFamily(t *testing.T, w *Watcher) bool {
+	t.Helper()
+	mainInfo, err := os.Stat(w.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var walInfo os.FileInfo
+	if w.walPath != "" {
+		if walInfo, err = os.Stat(w.walPath); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if !w.lastExists || !w.lastMtime.Equal(mainInfo.ModTime()) || w.lastSize != mainInfo.Size() {
+		return false
+	}
+	if (w.lastWALInfo == nil) != (walInfo == nil) {
+		return false
+	}
+	if walInfo != nil && (!os.SameFile(w.lastWALInfo, walInfo) ||
+		!w.lastWALInfo.ModTime().Equal(walInfo.ModTime()) || w.lastWALInfo.Size() != walInfo.Size()) {
+		return false
+	}
+	w.debouncer.mu.Lock()
+	pending := w.debouncer.timer != nil || w.debouncer.deadline != nil
+	w.debouncer.mu.Unlock()
+	return !pending && len(w.changeCh) == 0
+}
+
 func TestWatcherNotificationFailuresResumePolling(t *testing.T) {
 	for _, failure := range []string{"overflow", "io_error", "events_closed", "errors_closed", "directory_renamed", "directory_removed"} {
 		t.Run(failure, func(t *testing.T) {
@@ -123,7 +206,7 @@ func TestWatcherNotificationFailuresResumePolling(t *testing.T) {
 				if err := os.WriteFile(path+"-wal", bytes.Repeat([]byte{byte(i)}, i+1), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				requireWatchChange(t, w)
+				settleAfterWrite(t, w)
 				requireWatchQuiet(t, w)
 			}
 			// Reader coordination and unrelated siblings must not create loops.
@@ -178,7 +261,7 @@ PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;`); err != nil {
 		if _, err := db.Exec("UPDATE issues SET title=?", title); err != nil {
 			t.Fatal(err)
 		}
-		requireWatchChange(t, w)
+		settleAfterWrite(t, w)
 		var got string
 		if err := reader.QueryRow("SELECT title FROM issues").Scan(&got); err != nil || got != title {
 			t.Fatalf("fresh snapshot after fallback: %q, %v; want %q", got, err, title)
