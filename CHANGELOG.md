@@ -2,8 +2,10 @@
 
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
-Scope window: this update verifies `v0.25.1..v0.25.2` (installer and
-terminal-layout fixes) on top of the `v0.25.0..v0.25.1` audit, which covered the
+Scope window: this update verifies `v0.25.2..v0.26.0` (live SQLite tracker
+reliability, source-bound correlation and exports, TUI state preservation, and
+the October issue fixes) on top of the `v0.25.1..v0.25.2` audit (installer and
+terminal-layout fixes) and the `v0.25.0..v0.25.1` audit, which covered the
 September 14–16 graph, timeline, duplicate-detection and history-cache work and
 the September 17–29 source-selection, correlation, search, agent-file and
 layout fixes. Each release was published after its complete clean-source
@@ -18,7 +20,7 @@ the latest tag, including installer changes usable with already released binarie
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
-| `Unreleased` | — | `main` | Fuzzy-filter visible-bounds clamping (GH #210), `v7` agent blurb and claim-command deferral recheck (`br` 0.6.0+), historical `--as-of` and SQLite-only workspace correlation parity, native `due_at`/`DueDate`/`DeferUntil`/`ExternalRef` surfacing, and PowerShell installer signature enforcement. |
+| [`v0.26.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.26.0) | 2026-11-02 | GitHub Release | Live SQLite trackers load from one consistent snapshot and recover from lost notifications and transient failures; correlation and exports stay on the selected source; TUI state survives refreshes; native deadlines and external references everywhere; GH #210–#214 and a #197 export fix. |
 | [`v0.25.2`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.2) | 2026-09-30 | GitHub Release | Every view and the footer stay inside the terminal; `install.sh` installs the release binary with only `jq`, and its Go `.pkg` fallback works and checks the download. |
 | [`v0.25.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.1) | 2026-09-29 | GitHub Release | Views laid out beside the shortcuts sidebar, restored time-travel export, tracker-source selection and correlation fixes, and the September graph/timeline work. |
 | [`v0.25.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.0) | 2026-09-12 | GitHub Release | Workflow readiness, source integrity and live dashboards, responsive Cass search, priority performance, and Go 1.26 dependency refresh. |
@@ -32,18 +34,124 @@ the latest tag, including installer changes usable with already released binarie
 
 ---
 
-## Unreleased
+## v0.26.0 — 2026-11-02
 
-### Fixes
+### Fixes: live SQLite trackers
 
-- **Fuzzy-filtered list selection stays within visible rows (GH #210).** `list.Select` indexes `VisibleItems()`, not `Items()`, so selecting by unfiltered length, stale paginator page, mouse wheel/click, `ctrl+d`/`ctrl+u`, filter reset, or time-travel jump while a fuzzy filter was active could leave the paginator on a nonexistent page and panic inside `list.View` ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/ee81c286), `bv-apal.17`).
-- **Correlation and causality commands honor `--as-of` and SQLite-only workspaces (`bv-apal.16`, `bv-apal.18`).** `--robot-history`, `--robot-related`, `--robot-file-beads`, `--robot-file-relations`, `--robot-orphans`, `--robot-blocker-chain`, `--robot-impact-network`, `--robot-causality`, `--robot-triage`, `--robot-explain-correlation`, `--robot-confirm-correlation`, `--robot-reject-correlation`, and `--export-pages` history now resolve historical paths via `resolveCorrelationBeadsPathForContext`, bound `git log` to `ctx.AsOfCommit`, and accept valid Git repositories whose live tracker is SQLite-only without requiring a live `.beads/issues.jsonl` on disk.
-- **Native `br` `due_at` decoding and `DueDate` / `DeferUntil` / `ExternalRef` surfacing (`bv-apal.17`).** JSONL loading now decodes `br`'s native `"due_at"` field (with `"due_at"` authoritative over legacy `"due_date"` when present, matching SQLite ingestion), and surfaces `DueDate`, `DeferUntil`, and `ExternalRef` across the TUI detail viewport, clipboard export, Insights detail pane, Markdown export, SQLite static export (`beads.sqlite3`), interactive HTML graph export, and semantic search index.
-- **Insights Priority Heatmap 2D navigation/drill-down, context-sensitive tutorial (`~`), and History timeline Cass session cache wired into TUI (`bv-apal.18`, `bv-apal.19`).** Connected `InsightsModel`'s 2D heatmap navigation (`j`/`k`/`h`/`l`), cell drill-down (`enter`/`esc`/`backspace`), `H` toggle, and live detail-pane updates in `Model.Update` and `handleInsightsKeys`; wired `IsContextHelpTrigger` (`~`) and `Model.CurrentContext()` into `TutorialModel` with unified `closeTutorial()` progress persistence and prior-view focus restoration (`focusBeforeTutorial`); and connected `cassSessionsLoadedMsg` and cached Cass sessions to `HistoryModel.SetSessionsForBead` for timeline rendering.
-- **Velocity Comparison view (`bv-125`), wide-terminal Label Dashboard rendering, live-reload view refreshes, text-input key guards, and cross-view keybinding parity (`bv-apal.19`).** Wired `VelocityComparisonModel` (`v` in Label Dashboard `[`) with 4-week sparkline trends and Enter-to-filter; moved `focusLabelDashboard` ahead of `isSplitView` in `renderMainView` so wide terminals (`>100` cols) render the Label Dashboard table; refreshed `actionableView`, `attentionView`, `labelDashboard`, `labelDrilldownIssues`, and `velocityComparison` across `SnapshotReadyMsg`, `FileChangedMsg`, and `Phase2ReadyMsg`; guarded single-character overlay keys (`?`, `` ` ``, `~`, `;`) against active text inputs (`isTextInputActive()`); wired `ctrl+d`/`ctrl+u`/`home`/`G` in Actionable view and `y`/`C` clipboard copy across views; and passed `workDir` to `BuildSemanticIndexCmd`.
-- **TUI hybrid search environment configuration (`BV_SEARCH_*`), interactive graph export git history correlation, symmetric `--diff-since` & non-TUI `--recipe` scoping, and `FileChangedMsg`/`Phase2` filter/recipe/sprint sync (`bv-apal.20`).** Wired `search.SearchConfigFromEnv()` and `SetHybridConfigWithWeights` into `ui.NewModel` and `Model.Init()`; populated `History` correlation data and scoped `Analyzer` in `--export-graph`; symmetrically scoped historical and current snapshots in `--diff-since` and honored `--recipe` across non-TUI CLI commands; and preserved active filters, sorts, Phase 2 recipe ordering (`DataSnapshot.WithPhase2`), selected issue IDs, and sprint dashboard text across `FileChangedMsg` and `Phase2ReadyMsg`.
-- **Agent instructions `v7` blurb and `br update <id> --claim` guidance (`bv-apal.14`).** Bumped the agent blurb to `v7` with explicit robot output-format rules (`--format toon` and `--robot-help` text exception) and `br` 0.6.0+ `--claim` deferral recheck guidance ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/292de1bd), [fix](https://github.com/Dicklesworthstone/beads_viewer/commit/7cf4592c)).
-- **Windows installer Authenticode signature check.** `install.ps1` now verifies Authenticode signatures when present alongside SHA-256 release checksum verification ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/ee81c286)).
+- **A load reads one consistent snapshot.** The issue cursor held one pooled
+  connection while labels, dependencies and comments were read on another, so a
+  `br` write landing mid-load could produce an open issue with no blocker:
+  work shown as ready that was not. Every table is now read inside one
+  read transaction, related records in one streaming pass per table, and the
+  snapshot is released before validation
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/2b43691b),
+  [related records](https://github.com/Dicklesworthstone/beads_viewer/commit/c604edc7)).
+- **Native `br` deadlines and full issue details from SQLite.** When legacy
+  columns were absent, the reader dropped metadata. It now preserves `due_at`,
+  legacy `due_date`, estimates, design, acceptance criteria, notes and external
+  references
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/3b8849ed)).
+- **A partial read no longer yields a "complete" graph.** A skipped blocker, an
+  invalid deferral or a failed related-table read used to become a successful
+  but incomplete live graph. Live reloads now fail closed and keep the previous
+  snapshot
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/d1ef8fbf)).
+- **Live refresh keeps up and recovers.**
+  - Continuous WAL writes could postpone a refresh indefinitely; each burst now
+    has a maximum wait
+    ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/90138b0f)).
+  - After a notification overflow, a watcher error or loss of the watched
+    directory, bv falls back to polling
+    ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/78a0d368)).
+  - A failed load is retried on a 5/10/20/30-second backoff without waiting for
+    another file event
+    ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/581700b7),
+    [test](https://github.com/Dicklesworthstone/beads_viewer/commit/999bf792)).
+  - A transient lock or WAL recovery is retried rather than cached as invalid
+    ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/678a6e8e)).
+  - A slow, superseded load can no longer overwrite a newer snapshot
+    ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/a5acc7be)),
+    and obsolete loads are cancelled with their worker
+    ([cancellable reads](https://github.com/Dicklesworthstone/beads_viewer/commit/ac479059),
+    [fix](https://github.com/Dicklesworthstone/beads_viewer/commit/ee81c286)).
+- Opt-in regression tests against a real `br` binary (`BR_TEST_BIN`) cover the
+  reader/`br` WAL-index interplay from beads_rust
+  [#555](https://github.com/Dicklesworthstone/beads_rust/issues/555)
+  ([tests](https://github.com/Dicklesworthstone/beads_viewer/commit/0ee3a2ad),
+  [TUI sessions](https://github.com/Dicklesworthstone/beads_viewer/commit/f1354fca)).
+
+### Fixes: correlation, exports and CLI
+
+- **Correlation and exports stay on the selected source (`bv-apal.16`,
+  `bv-apal.20`).** Several paths rediscovered the live JSONL file or walked
+  current history after `--as-of` or a SQLite-only workspace had selected
+  another source. History, triage, file relations, orphans, impact, causality,
+  hotspots and graph export now use the selected source and revision, and
+  SQLite-only workspaces count as valid live stores
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/0d624f9b)).
+- **Visible output changes:** `--recipe` now applies to more non-TUI modes, and
+  `--diff-since` scopes both snapshots the same way, so rows a recipe filters out
+  of the historical side no longer show up as removals
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/0d624f9b)).
+- **Native deadlines and external references everywhere (`bv-apal.17`).** JSONL
+  loading decodes `br`'s `due_at` (authoritative over legacy `due_date`, as in
+  SQLite). Due dates, deferral times and external references appear in the TUI
+  details, Markdown export, the interactive graph export and search. The Pages
+  SQLite export gains `due_date`, `defer_until` and `external_ref` columns
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/084f61e0)).
+- **`--robot-by-label`, `--robot-by-assignee` and `--robot-min-confidence`
+  help says they filter `--robot-priority` only** (GH #211), and the
+  `--robot-by-assignee` rejection hint no longer suggests the label flag
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/719b8192)).
+- **The exported page's label-legend close button works** (GH #197). It used an
+  inline `onclick`, which the page's own CSP blocks; it now uses a listener, and
+  a test keeps the viewer's scripts free of inline handlers
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/c6994875)).
+
+### Fixes: TUI
+
+- **A fuzzy filter can no longer crash the list** (GH #210). Jumps from other
+  views, mouse wheel and clicks, `ctrl+d`/`ctrl+u`, `n`/`N` in time travel and
+  the page-info line indexed all rows instead of the visible ones, which left
+  the list on a page that does not exist and panicked on the next draw. They now
+  select among visible rows, and the filter is cleared only when it hides the
+  target
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/4dacc3ea),
+  [follow-up](https://github.com/Dicklesworthstone/beads_viewer/commit/6c6efa15)).
+- **View state survives refreshes; finished views are wired in (`bv-apal.18`,
+  `bv-apal.19`, `bv-apal.20`).** Asynchronous updates no longer reset filters,
+  sorts, recipes, selection or the sprint view. Also connected:
+  - Insights heatmap navigation and drill-down;
+  - context help (`~`), restoring the previous view;
+  - the Label Dashboard velocity comparison, and the dashboard on wide terminals;
+  - Actionable view paging and consistent clipboard keys;
+  - `BV_SEARCH_*` hybrid-search settings, and the semantic index built in the
+    selected workspace.
+
+  Overlay shortcuts no longer eat characters typed into a text field
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/77df2300)).
+- **The label picker accepts `j` and `k`** (GH #213). They were bound to
+  movement ahead of the input, so "backend" became "bacend". Use up/down or
+  `ctrl+p`/`ctrl+n` to move
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/4d8e32a0)).
+- **The Insights detail panel has one width, and `<` / `>` resize it**
+  (GH #214)
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/428e856e)).
+
+### Added
+
+- **`BV_CASS_SEARCH_TIMEOUT_MS`** (default `3000`) sets the time budget for the
+  TUI's cass session lookup (`V`). A lookup that runs out of time now says it
+  timed out (GH #212)
+  ([feature](https://github.com/Dicklesworthstone/beads_viewer/commit/000226d2)).
+
+### Other
+
+- HTTP requests from the graph WASM build and the dashboard browser test name
+  the project in their User-Agent
+  ([fix](https://github.com/Dicklesworthstone/beads_viewer/commit/c8ed9a40)).
+- Releases go through DSR; GitHub Actions is not used
+  ([policy](https://github.com/Dicklesworthstone/beads_viewer/commit/efc1e251)).
 
 ---
 
