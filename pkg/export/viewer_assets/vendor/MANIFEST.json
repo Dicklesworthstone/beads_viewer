@@ -3,7 +3,7 @@
   "reviewed_by": "library-updater 2026-09-12 (graph pair: locked dependency refresh and pinned source rebuild; other entries retain 2026-09-02 review)",
   "date": "2026-09-12",
   "graph_wasm": {
-    "source_sha256": "1fdf29973770716aa220520e3e4ecc275e324227ae2a482f91644ccbcbadccf7",
+    "source_sha256": "584083a0237e07afd1d06a4ae276dd21e67ae7865972896e40e849a612f190c7",
     "cargo_lock_sha256": "dfe6b9df8c27da85d65a3bebd14931130e57c11653d1b39f0a507e0923df7cf7",
     "pipeline": {
       "bindgen_executable_sha256": "dc9e4f1e03996c26fb8bfedfded73d81120a37251c3f19eb87bb460f1f89a5be",
