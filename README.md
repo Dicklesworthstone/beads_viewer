@@ -3902,7 +3902,11 @@ bv --update-dry-run      # Show what an update would do without installing (bv u
 bv --rollback            # Rollback to the previous version (from backup)
 ```
 
-The startup check is opt-out: set `BV_NO_UPDATE_CHECK=1` or put `updates: {check: false}` in `~/.config/bv/config.yaml` to skip it (explicit `--check-update` / `--update` still work). The check never sends an ambient GitHub token unless `BV_UPDATE_USE_TOKEN=1` or `updates: {use_token: true}` is set, and the first time it runs the TUI footer discloses once that github.com was contacted.
+The startup check is opt-out: set `BV_NO_UPDATE_CHECK=1` or put `updates: {check: false}` in `~/.config/bv/config.yaml` to skip it. Explicit `--check-update` / `--update` still work. The first time the startup check runs, the TUI footer discloses once that github.com was contacted.
+
+Sending an ambient `GITHUB_TOKEN` or `GH_TOKEN` is separately opt-in through `BV_UPDATE_USE_TOKEN=1` or `updates: {use_token: true}` in the user configuration. Set `BV_UPDATE_USE_TOKEN=0` to withhold those credentials for an invocation even when the saved configuration permits them.
+
+Both environment variables accept `1`, `true`, `yes`, or `on` and `0`, `false`, `no`, or `off`, ignoring case and surrounding whitespace. A nonempty value overrides the saved setting in either direction: `BV_NO_UPDATE_CHECK=0` enables the startup check even when the configuration disables it, while `BV_UPDATE_USE_TOKEN=0` disables token use even when the configuration enables it. An unrecognized nonempty value disables the corresponding behavior: `BV_NO_UPDATE_CHECK` suppresses automatic checks, and `BV_UPDATE_USE_TOKEN` denies token use. Unset, empty, or whitespace-only values preserve the saved setting, or the defaults of automatic checks enabled and token use disabled when no setting is saved.
 
 ---
 
@@ -4246,7 +4250,7 @@ bv has a comprehensive built-in help system:
 | `BV_NO_CACHE` | Set to `1` to bypass the robot analysis and correlation disk caches (`--no-cache` sets it). | (cache on) |
 | `BV_NO_GITIGNORE` | Disable automatic ignore-file management for `.bv/` entirely (any non-empty value). See [Automatic `.bv/` ignore handling](#automatic-bv-ignore-handling). | (enabled) |
 | `BV_NO_SAVED_CONFIG` | Any value: the `--pages` wizard ignores the saved deployment configuration. | (unset) |
-| `BV_NO_UPDATE_CHECK` | Set to `1` to skip the TUI's startup release check (`updates: {check: false}` in `~/.config/bv/config.yaml` does the same); explicit `--check-update` / `--update` still work. | (check on) |
+| `BV_NO_UPDATE_CHECK` | Skip the TUI's startup release check with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` enables it. Nonempty values override `updates.check` in user config (case-insensitive, trimmed); invalid values skip the check, and empty values preserve config. Explicit `--check-update` / `--update` still work. | (check on) |
 | `BV_OUTPUT_FORMAT` | Default robot output format: `json` or `toon` (overridden by `--format`). | `json` |
 | `BV_PHASE2_TIMEOUT_S` | Override per-metric Phase 2 timeouts (seconds). | (size-based) |
 | `BV_PRETTY_JSON` | Set to `1` for indented JSON output. | (compact) |
@@ -4263,7 +4267,7 @@ bv has a comprehensive built-in help system:
 | `BV_TEST_MODE` | Any value: test harness mode; suppresses browser opening, terminal capability queries, and the background worker's idle GC tuning. | (unset) |
 | `BV_THEME` | Pin the TUI palette: `light` or `dark` (overridden by `--theme`). | (auto-detect) |
 | `BV_TUI_AUTOCLOSE_MS` | Quit the TUI automatically after this many milliseconds (for automated tests). | (unset) |
-| `BV_UPDATE_USE_TOKEN` | Set to `1` to let the update check and `--update` send the ambient `GITHUB_TOKEN` / `GH_TOKEN` to api.github.com (`updates: {use_token: true}` in config.yaml does the same). | (never sent) |
+| `BV_UPDATE_USE_TOKEN` | Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` to api.github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config. | (never sent) |
 | `BV_WATCHDOG_INTERVAL_S` | Background worker watchdog interval (seconds). | `10` |
 | `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker. | (default) |
 | `BV_WORKER_METRICS` | Truthy value: the background worker records its own metrics. | (off) |

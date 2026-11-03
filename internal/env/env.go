@@ -184,7 +184,7 @@ var (
 
 	NoUpdateCheck = register(Var{
 		Name:        "BV_NO_UPDATE_CHECK",
-		Description: "Set to `1` to skip the TUI's startup release check (`updates: {check: false}` in `~/.config/bv/config.yaml` does the same); explicit `--check-update` / `--update` still work.",
+		Description: "Skip the TUI's startup release check with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` enables it. Nonempty values override `updates.check` in user config (case-insensitive, trimmed); invalid values skip the check, and empty values preserve config. Explicit `--check-update` / `--update` still work.",
 		Default:     "(check on)",
 	})
 
@@ -286,7 +286,7 @@ var (
 
 	UpdateUseToken = register(Var{
 		Name:        "BV_UPDATE_USE_TOKEN",
-		Description: "Set to `1` to let the update check and `--update` send the ambient `GITHUB_TOKEN` / `GH_TOKEN` to api.github.com (`updates: {use_token: true}` in config.yaml does the same).",
+		Description: "Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` to api.github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config.",
 		Default:     "(never sent)",
 	})
 

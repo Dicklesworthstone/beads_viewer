@@ -41,11 +41,13 @@ var maxExtractedBinaryBytes int64 = maxDownloadBytes
 
 // Environment variables that control the updater's network behaviour.
 const (
-	// EnvNoUpdateCheck disables the TUI's startup release check when set to a
-	// truthy value. Explicit --check-update / --update invocations ignore it.
+	// EnvNoUpdateCheck overrides the TUI's startup release check. True or
+	// invalid nonempty values disable it; explicit false values enable it.
+	// Explicit --check-update / --update invocations ignore this setting.
 	EnvNoUpdateCheck = "BV_NO_UPDATE_CHECK"
-	// EnvUseToken opts in to sending the ambient GITHUB_TOKEN / GH_TOKEN with
-	// GitHub requests. Without it the updater talks to GitHub anonymously.
+	// EnvUseToken overrides permission to send GITHUB_TOKEN / GH_TOKEN with
+	// GitHub requests. Only recognized true values opt in; false or invalid
+	// nonempty values revoke even a saved config grant.
 	EnvUseToken = "BV_UPDATE_USE_TOKEN"
 	// envNoSavedConfig is the project-wide switch that makes bv ignore every
 	// file under the user config directory (read and write).
@@ -81,15 +83,16 @@ type userUpdateConfig struct {
 	} `yaml:"updates"`
 }
 
-// envTruthy treats any non-empty value other than an explicit "0"/"false"/
-// "no"/"off" as enabled, so BV_NO_UPDATE_CHECK=1 and BV_NO_UPDATE_CHECK=true
-// both work while BV_NO_UPDATE_CHECK=0 re-enables the default.
-func envTruthy(value string) bool {
+// parseEnvBoolean accepts explicit boolean values without interpreting typos
+// as consent. Callers apply the privacy-preserving policy on invalid input.
+func parseEnvBoolean(value string) (enabled, valid bool) {
 	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "", "0", "false", "no", "off":
-		return false
+	case "1", "true", "yes", "on":
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
 	}
-	return true
+	return false, false
 }
 
 func savedConfigDisabled() bool {
@@ -136,7 +139,9 @@ func loadUserUpdateConfig() userUpdateConfig {
 
 // LoadPreferences resolves the update policy. Defaults are "check on startup,
 // never send the ambient token"; config.yaml can flip either, and the
-// environment (BV_NO_UPDATE_CHECK, BV_UPDATE_USE_TOKEN) wins over both.
+// nonempty environment (BV_NO_UPDATE_CHECK, BV_UPDATE_USE_TOKEN) wins over both.
+// Empty/unset values preserve saved policy. Invalid values suppress automatic
+// checks and deny credentials, without logging potentially sensitive input.
 func LoadPreferences() Preferences {
 	prefs := Preferences{CheckOnStartup: true, UseAmbientToken: false}
 	cfg := loadUserUpdateConfig()
@@ -146,11 +151,13 @@ func LoadPreferences() Preferences {
 	if cfg.Updates.UseToken != nil {
 		prefs.UseAmbientToken = *cfg.Updates.UseToken
 	}
-	if envTruthy(os.Getenv(EnvNoUpdateCheck)) {
-		prefs.CheckOnStartup = false
+	if value := strings.TrimSpace(os.Getenv(EnvNoUpdateCheck)); value != "" {
+		disabled, valid := parseEnvBoolean(value)
+		prefs.CheckOnStartup = valid && !disabled
 	}
-	if envTruthy(os.Getenv(EnvUseToken)) {
-		prefs.UseAmbientToken = true
+	if value := strings.TrimSpace(os.Getenv(EnvUseToken)); value != "" {
+		enabled, valid := parseEnvBoolean(value)
+		prefs.UseAmbientToken = valid && enabled
 	}
 	return prefs
 }
@@ -233,6 +240,9 @@ func isGitHubHost(u *url.URL) bool {
 // and the request targets a GitHub domain. This prevents leaking tokens to
 // non-GitHub hosts (e.g. CDN redirects).
 func setGitHubAuth(req *http.Request) {
+	// Re-evaluating policy must also revoke a header added by an earlier call.
+	// This helper owns updater authentication; denial never preserves stale auth.
+	req.Header.Del("Authorization")
 	if tok := githubToken(); tok != "" && isGitHubHost(req.URL) {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}

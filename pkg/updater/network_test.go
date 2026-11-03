@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -375,7 +376,7 @@ func writeUpdaterConfig(t *testing.T, configDir, body string) {
 // TestUpdater_OptOutEnvAndConfig covers the startup-check opt-outs: the
 // default is on, config.yaml `updates: {check: false}` turns it off,
 // BV_NO_UPDATE_CHECK=1 turns it off even when config says on, and
-// BV_NO_UPDATE_CHECK=0 is not an opt-out.
+// BV_NO_UPDATE_CHECK=0 explicitly enables the check, overriding saved policy.
 func TestUpdater_OptOutEnvAndConfig(t *testing.T) {
 	configDir := isolateUpdaterConfig(t)
 
@@ -421,6 +422,139 @@ func TestUpdater_OptOutEnvAndConfig(t *testing.T) {
 	writeUpdaterConfig(t, configDir, "updates: [not a mapping")
 	if !StartupCheckEnabled() {
 		t.Fatal("unparseable config.yaml should fall back to the default (enabled)")
+	}
+}
+
+func TestUpdater_EnvironmentBooleanOverridesSavedPolicy(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		override bool
+		want     Preferences
+	}{
+		{name: "empty"},
+		{name: "whitespace", value: " \t\n"},
+		{name: "one", value: "1", override: true, want: Preferences{CheckOnStartup: false, UseAmbientToken: true}},
+		{name: "true", value: " TrUe ", override: true, want: Preferences{CheckOnStartup: false, UseAmbientToken: true}},
+		{name: "yes", value: "YES", override: true, want: Preferences{CheckOnStartup: false, UseAmbientToken: true}},
+		{name: "on", value: "on", override: true, want: Preferences{CheckOnStartup: false, UseAmbientToken: true}},
+		{name: "zero", value: "0", override: true, want: Preferences{CheckOnStartup: true, UseAmbientToken: false}},
+		{name: "false", value: " FaLsE ", override: true, want: Preferences{CheckOnStartup: true, UseAmbientToken: false}},
+		{name: "no", value: "NO", override: true, want: Preferences{CheckOnStartup: true, UseAmbientToken: false}},
+		{name: "off", value: "off", override: true, want: Preferences{CheckOnStartup: true, UseAmbientToken: false}},
+		{name: "typo", value: "flase", override: true, want: Preferences{CheckOnStartup: false, UseAmbientToken: false}},
+		{name: "invalid_number", value: "2", override: true, want: Preferences{CheckOnStartup: false, UseAmbientToken: false}},
+		{name: "invalid_word", value: "enable", override: true, want: Preferences{CheckOnStartup: false, UseAmbientToken: false}},
+	}
+	for _, saved := range []bool{false, true} {
+		t.Run(fmt.Sprintf("saved_%t", saved), func(t *testing.T) {
+			configDir := isolateUpdaterConfig(t)
+			writeUpdaterConfig(t, configDir, fmt.Sprintf("updates:\n  check: %t\n  use_token: %t\n", saved, saved))
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					t.Setenv(EnvNoUpdateCheck, tt.value)
+					t.Setenv(EnvUseToken, tt.value)
+					want := tt.want
+					if !tt.override {
+						want = Preferences{CheckOnStartup: saved, UseAmbientToken: saved}
+					}
+					if got := LoadPreferences(); got != want {
+						t.Fatalf("resolved policy = %+v, want %+v", got, want)
+					}
+					if got := StartupCheckEnabled(); got != want.CheckOnStartup {
+						t.Fatalf("startup check enabled = %v, want %v", got, want.CheckOnStartup)
+					}
+				})
+			}
+		})
+	}
+}
+
+// Exercise the actual outgoing request, not merely the resolved preference:
+// explicit denial must override saved consent for both ambient token sources.
+func TestUpdater_TokenEnvironmentPolicyReachesOutgoingRequest(t *testing.T) {
+	server := olderReleaseServer(t)
+	tests := []struct {
+		name      string
+		value     string
+		saved     bool
+		wantToken bool
+	}{
+		{name: "deny_zero_over_saved_grant", value: "0", saved: true},
+		{name: "deny_false_over_saved_grant", value: " FaLsE ", saved: true},
+		{name: "deny_no_over_saved_grant", value: "NO", saved: true},
+		{name: "deny_off_over_saved_grant", value: "off", saved: true},
+		{name: "invalid_over_saved_grant", value: "flase", saved: true},
+		{name: "invalid_is_not_consent", value: "flase", saved: false},
+		{name: "invalid_number_is_not_consent", value: "2", saved: false},
+		{name: "allow_one_over_saved_denial", value: "1", wantToken: true},
+		{name: "allow_true_over_saved_denial", value: " TRUE ", wantToken: true},
+		{name: "allow_yes_over_saved_denial", value: "yes", wantToken: true},
+		{name: "allow_on_over_saved_denial", value: "ON", wantToken: true},
+		{name: "empty_retains_saved_grant", saved: true, wantToken: true},
+		{name: "empty_retains_saved_denial", saved: false},
+	}
+	for _, tokenName := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
+		for _, tt := range tests {
+			t.Run(tokenName+"/"+tt.name, func(t *testing.T) {
+				configDir := isolateUpdaterConfig(t)
+				writeUpdaterConfig(t, configDir, fmt.Sprintf("updates:\n  check: false\n  use_token: %t\n", tt.saved))
+				t.Setenv(tokenName, "bounded-fake-policy-sentinel")
+				t.Setenv(EnvUseToken, tt.value)
+				t.Setenv(EnvNoUpdateCheck, "1")
+				var seen http.Header
+				client := rewriteAPIToServer(t, server.URL, &seen)
+				if _, _, err := checkForUpdates(client, baseURL+"/releases/latest"); err != nil {
+					t.Fatalf("explicit update check: %v", err)
+				}
+				if seen == nil {
+					t.Fatal("explicit check did not reach the transport with automatic checks disabled")
+				}
+				want := ""
+				if tt.wantToken {
+					want = "Bearer bounded-fake-policy-sentinel"
+				}
+				if got := seen.Get("Authorization"); got != want {
+					// Do not print an authorization value, even in diagnostics.
+					t.Fatalf("outgoing authentication did not follow user policy: present=%v, expected token=%v", got != "", tt.wantToken)
+				}
+				if StartupCheckEnabled() {
+					t.Fatal("explicit operation unexpectedly changed automatic-check policy")
+				}
+			})
+		}
+	}
+}
+
+func TestSetGitHubAuthRevokesPriorAuthorization(t *testing.T) {
+	for _, reason := range []string{"explicit_denial", "invalid_consent", "missing_token", "different_host"} {
+		t.Run(reason, func(t *testing.T) {
+			configDir := isolateUpdaterConfig(t)
+			writeUpdaterConfig(t, configDir, "updates:\n  use_token: true\n")
+			t.Setenv("GITHUB_TOKEN", "bounded-fake-revocation-sentinel")
+			req, err := http.NewRequest(http.MethodGet, baseURL+"/releases/latest", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			setGitHubAuth(req)
+			if req.Header.Get("Authorization") == "" {
+				t.Fatal("positive control did not attach the saved-authorized fake token")
+			}
+			switch reason {
+			case "explicit_denial":
+				t.Setenv(EnvUseToken, "0")
+			case "invalid_consent":
+				t.Setenv(EnvUseToken, "flase")
+			case "missing_token":
+				t.Setenv("GITHUB_TOKEN", "")
+			case "different_host":
+				req.URL.Host = "example.invalid"
+			}
+			setGitHubAuth(req)
+			if req.Header.Get("Authorization") != "" {
+				t.Fatal("denied request retained an earlier authorization header")
+			}
+		})
 	}
 }
 
