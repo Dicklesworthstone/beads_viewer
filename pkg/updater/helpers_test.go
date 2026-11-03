@@ -3,16 +3,52 @@ package updater
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
 const (
-	testSHA256DigestA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	testSHA256DigestB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	testSHA256DigestA   = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testSHA256DigestB   = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	testVersionProbeEnv = "BV_UPDATER_TEST_VERSION_PROBE"
 )
+
+// TestMain also provides a portable candidate binary for verifyBinaryVersion.
+// The exact argument and environment gate keep ordinary test runs unaffected.
+func TestMain(m *testing.M) {
+	if len(os.Args) == 2 && os.Args[1] == "--version" && os.Getenv(testVersionProbeEnv) != "" {
+		output := "bv v1.2.3\n"
+		switch os.Getenv(testVersionProbeEnv) {
+		case "normal":
+		case "at-limit":
+			output += strings.Repeat(" ", maxBinaryVersionOutputBytes-len(output))
+		case "over-limit":
+			output += strings.Repeat(" ", maxBinaryVersionOutputBytes+1-len(output))
+		case "large-output":
+			output += strings.Repeat(" ", 16*maxBinaryVersionOutputBytes-len(output))
+		case "failing-stderr":
+			_, err := io.WriteString(os.Stderr, strings.Repeat("E", 256<<10)+"unretained-stderr-tail")
+			if err != nil {
+				os.Exit(99)
+			}
+			os.Exit(17)
+		default:
+			os.Exit(98)
+		}
+		if _, err := io.WriteString(os.Stdout, output); err != nil {
+			os.Exit(99)
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 func TestRelease_FindPlatformAsset(t *testing.T) {
 	rel := &Release{TagName: "v1.2.3"}
@@ -280,8 +316,67 @@ func TestLimitedOutputBufferCapsData(t *testing.T) {
 	if written != len(data) {
 		t.Fatalf("Write reported %d bytes, want %d", written, len(data))
 	}
-	if !buffer.truncated || buffer.Len() != maxBinaryVersionOutputBytes {
-		t.Fatalf("buffer state: truncated=%v len=%d", buffer.truncated, buffer.Len())
+	if !buffer.truncated || buffer.data.Len() != maxBinaryVersionOutputBytes {
+		t.Fatalf("buffer state: truncated=%v len=%d", buffer.truncated, buffer.data.Len())
+	}
+}
+
+func TestLimitedOutputBufferCapsIOCopy(t *testing.T) {
+	for _, size := range []int{0, maxBinaryVersionOutputBytes, maxBinaryVersionOutputBytes + 1, 16 * maxBinaryVersionOutputBytes} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			payload := strings.Repeat("x", size)
+			var buffer limitedOutputBuffer
+			// LimitReader hides strings.Reader.WriteTo so io.Copy takes the same
+			// destination-interface path used when os/exec drains child pipes.
+			written, err := io.Copy(&buffer, io.LimitReader(strings.NewReader(payload), int64(size)))
+			if err != nil || written != int64(size) {
+				t.Fatalf("Copy = (%d, %v), want (%d, nil)", written, err, size)
+			}
+			wantSize := min(size, maxBinaryVersionOutputBytes)
+			if buffer.data.Len() != wantSize || buffer.data.String() != payload[:wantSize] {
+				t.Fatalf("stored %d bytes, want the first %d bytes", buffer.data.Len(), wantSize)
+			}
+			if buffer.truncated != (size > maxBinaryVersionOutputBytes) {
+				t.Fatalf("truncated = %v for %d-byte output", buffer.truncated, size)
+			}
+		})
+	}
+}
+
+func TestVerifyBinaryVersionBoundsChildOutput(t *testing.T) {
+	binaryPath, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	for _, mode := range []string{"normal", "at-limit", "over-limit", "large-output", "failing-stderr"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv(testVersionProbeEnv, mode)
+			err := verifyBinaryVersion(binaryPath, "v1.2.3")
+			switch mode {
+			case "normal", "at-limit":
+				if err != nil {
+					t.Fatalf("valid candidate rejected: %v", err)
+				}
+			case "over-limit", "large-output":
+				if err == nil || !strings.Contains(err.Error(), "--version output exceeds") {
+					t.Fatalf("oversized version output returned %v", err)
+				}
+			case "failing-stderr":
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 17 {
+					t.Fatalf("candidate exit status was lost: %v", err)
+				}
+				if len(err.Error()) > maxBinaryVersionOutputBytes+256 {
+					t.Fatalf("stderr diagnostic contains %d bytes, exceeding the capture limit", len(err.Error()))
+				}
+				if !strings.Contains(err.Error(), strings.Repeat("E", maxBinaryVersionOutputBytes)) {
+					t.Fatal("stderr diagnostic lost the retained prefix")
+				}
+				if strings.Contains(err.Error(), "unretained-stderr-tail") {
+					t.Fatal("stderr diagnostic includes output beyond the capture limit")
+				}
+			}
+		})
 	}
 }
 

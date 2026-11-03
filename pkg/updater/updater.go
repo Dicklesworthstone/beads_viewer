@@ -1454,13 +1454,14 @@ func parseBinaryVersionOutput(output []byte) (string, error) {
 const maxBinaryVersionOutputBytes = 4 << 10
 
 type limitedOutputBuffer struct {
-	bytes.Buffer
+	// Embedding bytes.Buffer would promote ReadFrom and let io.Copy bypass Write.
+	data      bytes.Buffer
 	truncated bool
 }
 
 func (buffer *limitedOutputBuffer) Write(data []byte) (int, error) {
 	written := len(data)
-	remaining := maxBinaryVersionOutputBytes - buffer.Len()
+	remaining := maxBinaryVersionOutputBytes - buffer.data.Len()
 	if remaining <= 0 {
 		buffer.truncated = true
 		return written, nil
@@ -1469,7 +1470,7 @@ func (buffer *limitedOutputBuffer) Write(data []byte) (int, error) {
 		data = data[:remaining]
 		buffer.truncated = true
 	}
-	_, err := buffer.Buffer.Write(data)
+	_, err := buffer.data.Write(data)
 	return written, err
 }
 
@@ -1487,12 +1488,12 @@ func verifyBinaryVersion(binaryPath, expectedVersion string) error {
 		if ctx.Err() != nil {
 			return fmt.Errorf("--version timed out: %w", ctx.Err())
 		}
-		return fmt.Errorf("run --version: %w (stderr: %q)", err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("run --version: %w (stderr: %q)", err, strings.TrimSpace(stderr.data.String()))
 	}
 	if stdout.truncated {
 		return fmt.Errorf("--version output exceeds %d bytes", maxBinaryVersionOutputBytes)
 	}
-	reportedVersion, err := parseBinaryVersionOutput(stdout.Bytes())
+	reportedVersion, err := parseBinaryVersionOutput(stdout.data.Bytes())
 	if err != nil {
 		return err
 	}
