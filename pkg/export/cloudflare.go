@@ -281,8 +281,12 @@ func GenerateHeadersFile(bundlePath string) error {
 		"/*.css\n" +
 		"  Content-Type: text/css; charset=utf-8\n"
 
-	headersPath := filepath.Join(bundlePath, "_headers")
-	if err := os.WriteFile(headersPath, []byte(headersContent), 0644); err != nil {
+	bundle, err := OpenBundle(bundlePath)
+	if err != nil {
+		return err
+	}
+	defer bundle.Close()
+	if err := bundle.WriteFile("_headers", []byte(headersContent), 0644); err != nil {
 		return fmt.Errorf("failed to write _headers file: %w", err)
 	}
 

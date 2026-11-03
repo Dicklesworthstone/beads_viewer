@@ -70,7 +70,7 @@ func TestChunkIfNeeded_PrunesOrphanedChunksOnShrink(t *testing.T) {
 		t.Fatal(err)
 	}
 	chunksDir := filepath.Join(outputDir, "chunks")
-	dbPath := filepath.Join(tmp, "beads.db")
+	dbPath := filepath.Join(outputDir, "beads.sqlite3")
 
 	// Tiny threshold/chunk-size so byte fixtures chunk deterministically.
 	exp := &SQLiteExporter{
@@ -82,7 +82,7 @@ func TestChunkIfNeeded_PrunesOrphanedChunksOnShrink(t *testing.T) {
 	if err := os.WriteFile(dbPath, big, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := exp.chunkIfNeeded(outputDir, dbPath); err != nil {
+	if err := exp.chunkIfNeeded(openTestBundle(t, outputDir), filepath.Base(dbPath)); err != nil {
 		t.Fatalf("export#1: %v", err)
 	}
 	c1 := readChunkConfig(t, outputDir)
@@ -99,7 +99,7 @@ func TestChunkIfNeeded_PrunesOrphanedChunksOnShrink(t *testing.T) {
 	if err := os.WriteFile(dbPath, small, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := exp.chunkIfNeeded(outputDir, dbPath); err != nil {
+	if err := exp.chunkIfNeeded(openTestBundle(t, outputDir), filepath.Base(dbPath)); err != nil {
 		t.Fatalf("export#2: %v", err)
 	}
 	c2 := readChunkConfig(t, outputDir)
@@ -126,7 +126,7 @@ func TestChunkIfNeeded_PrunesOrphanedChunksOnShrink(t *testing.T) {
 	if err := os.WriteFile(dbPath, tiny, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := exp.chunkIfNeeded(outputDir, dbPath); err != nil {
+	if err := exp.chunkIfNeeded(openTestBundle(t, outputDir), filepath.Base(dbPath)); err != nil {
 		t.Fatalf("export#3: %v", err)
 	}
 	c3 := readChunkConfig(t, outputDir)
@@ -161,12 +161,12 @@ func TestChunkArtifactCleanup_PreservesNonChunkFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dbPath := filepath.Join(tmp, "beads.db")
+	dbPath := filepath.Join(outputDir, "beads.sqlite3")
 	if err := os.WriteFile(dbPath, []byte("hi"), 0o644); err != nil { // below threshold -> unchunked
 		t.Fatal(err)
 	}
 	exp := &SQLiteExporter{Config: SQLiteExportConfig{ChunkThreshold: 4, ChunkSize: 4}}
-	if err := exp.chunkIfNeeded(outputDir, dbPath); err != nil {
+	if err := exp.chunkIfNeeded(openTestBundle(t, outputDir), filepath.Base(dbPath)); err != nil {
 		t.Fatalf("export: %v", err)
 	}
 

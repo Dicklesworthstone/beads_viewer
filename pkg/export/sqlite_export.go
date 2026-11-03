@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -70,6 +71,17 @@ func (e *SQLiteExporter) SetGitHash(hash string) {
 
 // Export writes the SQLite database and supporting files to the output directory.
 func (e *SQLiteExporter) Export(outputDir string) error {
+	bundle, err := OpenBundle(outputDir)
+	if err != nil {
+		return err
+	}
+	defer bundle.Close()
+	return e.ExportBundle(bundle)
+}
+
+// ExportBundle writes a complete database and its supporting files through an
+// already opened bundle, preserving that directory boundary for the caller.
+func (e *SQLiteExporter) ExportBundle(bundle *Bundle) error {
 	e.readiness = e.Config.Readiness
 	if e.readiness == nil {
 		// Standalone callers may supply relationships on issues, separately in
@@ -100,23 +112,20 @@ func (e *SQLiteExporter) Export(outputDir string) error {
 		e.readinessAt = time.Now().UTC()
 	}
 
-	// Ensure output directory exists
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("create output dir: %w", err)
-	}
-
 	// Create data subdirectory for JSON outputs
-	dataDir := filepath.Join(outputDir, "data")
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	dataDir := "data"
+	if err := bundle.root.MkdirAll(dataDir, 0755); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
-	dbPath := filepath.Join(outputDir, "beads.sqlite3")
+	dbPath := "beads.sqlite3"
 
 	// Build a separate snapshot so readers never lock an in-progress export or
 	// observe a partial database. Construction or publication failures preserve
-	// the previous snapshot.
-	temporaryDir, err := os.MkdirTemp(outputDir, ".beads-*")
+	// the previous snapshot. SQLite opens its database by pathname, so construct
+	// it in a private OS temporary directory instead of reopening a path below
+	// the project-controlled export tree. Publication streams through os.Root.
+	temporaryDir, err := os.MkdirTemp("", "bv-export-db-*")
 	if err != nil {
 		return fmt.Errorf("create temporary database directory: %w", err)
 	}
@@ -201,24 +210,32 @@ func (e *SQLiteExporter) Export(outputDir string) error {
 		return fmt.Errorf("close database: %w", err)
 	}
 	dbClosed = true
-	if err := os.Rename(temporaryPath, dbPath); err != nil {
+	snapshot, err := os.Open(temporaryPath)
+	if err != nil {
+		return fmt.Errorf("open completed database: %w", err)
+	}
+	defer snapshot.Close()
+	if err := bundle.writeFile(dbPath, 0o644, func(w io.Writer) error {
+		_, err := io.Copy(w, snapshot)
+		return err
+	}); err != nil {
 		return fmt.Errorf("publish database: %w", err)
 	}
 
 	// Write robot JSON outputs
 	if e.Config.IncludeRobotOutputs {
-		if err := e.writeRobotOutputs(dataDir); err != nil {
+		if err := e.writeRobotOutputs(bundle, dataDir); err != nil {
 			return fmt.Errorf("write robot outputs: %w", err)
 		}
 	}
 
 	// Write pre-computed graph layout for fast client-side rendering
-	if err := e.writeGraphLayout(dataDir); err != nil {
+	if err := e.writeGraphLayout(bundle, dataDir); err != nil {
 		return fmt.Errorf("write graph layout: %w", err)
 	}
 
 	// Chunk if needed
-	if err := e.chunkIfNeeded(outputDir, dbPath); err != nil {
+	if err := e.chunkIfNeeded(bundle, dbPath); err != nil {
 		return fmt.Errorf("chunk database: %w", err)
 	}
 
@@ -632,15 +649,15 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 }
 
 // writeRobotOutputs writes JSON files for robot outputs.
-func (e *SQLiteExporter) writeRobotOutputs(dataDir string) error {
+func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error {
 	// Write triage output
 	if e.Triage != nil {
-		if err := e.writeRobotJSON(filepath.Join(dataDir, "triage.json"), e.Triage); err != nil {
+		if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "triage.json"), e.Triage); err != nil {
 			return fmt.Errorf("write triage.json: %w", err)
 		}
 
 		// Also emit a compact project_health.json for fast robot consumption
-		if err := e.writeRobotJSON(filepath.Join(dataDir, "project_health.json"), e.Triage.ProjectHealth); err != nil {
+		if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "project_health.json"), e.Triage.ProjectHealth); err != nil {
 			return fmt.Errorf("write project_health.json: %w", err)
 		}
 	}
@@ -654,14 +671,14 @@ func (e *SQLiteExporter) writeRobotOutputs(dataDir string) error {
 		DepCount:    len(e.Deps),
 		Title:       e.Config.Title,
 	}
-	if err := e.writeRobotJSON(filepath.Join(dataDir, "meta.json"), meta); err != nil {
+	if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)
 	}
 
 	return nil
 }
 
-func (e *SQLiteExporter) writeRobotJSON(path string, payload any) error {
+func (e *SQLiteExporter) writeRobotJSON(bundle *Bundle, path string, payload any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("encoding export payload: %w", err)
@@ -681,12 +698,12 @@ func (e *SQLiteExporter) writeRobotJSON(path string, payload any) error {
 		}
 		fields[key] = value
 	}
-	return writeJSON(path, fields)
+	return writeJSON(bundle, path, fields)
 }
 
 // chunkIfNeeded splits the database into chunks if it exceeds the threshold.
-func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
-	info, err := os.Stat(dbPath)
+func (e *SQLiteExporter) chunkIfNeeded(bundle *Bundle, dbPath string) error {
+	info, err := bundle.root.Stat(dbPath)
 	if err != nil {
 		return err
 	}
@@ -699,7 +716,7 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
 	// Always compute hash for cache invalidation (bv-pages-cache-fix)
 	// The hash is used by viewer.js OPFS caching to determine if cached data is stale.
 	// Without this, all deployments use the same "default" cache key and old data persists.
-	f, err := os.Open(dbPath)
+	f, err := bundle.root.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("open database for hashing: %w", err)
 	}
@@ -719,10 +736,10 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
 		// holding the prior chunked config would reassemble a malformed DB image
 		// ("database disk image is malformed", #175). Remove the chunk artifacts
 		// this exporter owns so the unchunked export leaves nothing behind.
-		if err := removeChunkArtifacts(filepath.Join(outputDir, "chunks")); err != nil {
+		if err := removeChunkArtifacts(bundle, "chunks"); err != nil {
 			return err
 		}
-		return writeJSON(filepath.Join(outputDir, "beads.sqlite3.config.json"), config)
+		return writeJSON(bundle, "beads.sqlite3.config.json", config)
 	}
 
 	// Reset file position for chunking
@@ -732,8 +749,8 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
 
 	// Chunk the database (file f is already open and seeked to start)
 
-	chunksDir := filepath.Join(outputDir, "chunks")
-	if err := os.MkdirAll(chunksDir, 0755); err != nil {
+	chunksDir := "chunks"
+	if err := bundle.root.MkdirAll(chunksDir, 0755); err != nil {
 		return fmt.Errorf("create chunks dir: %w", err)
 	}
 
@@ -745,7 +762,7 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
 		n, err := f.Read(buf)
 		if n > 0 {
 			chunkPath := filepath.Join(chunksDir, fmt.Sprintf("%05d.bin", chunkNum))
-			if err := os.WriteFile(chunkPath, buf[:n], 0644); err != nil {
+			if err := bundle.WriteFile(chunkPath, buf[:n], 0644); err != nil {
 				return fmt.Errorf("write chunk %d: %w", chunkNum, err)
 			}
 			chunkNum++
@@ -765,7 +782,7 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
 	// chunk config then splices new[0..N-1] + stale[N..M-1] into a malformed
 	// SQLite image (#175). Pruning happens after the new chunks are written so a
 	// reader is never left without the low-numbered chunks mid-export.
-	if err := pruneStaleChunks(chunksDir, chunkNum); err != nil {
+	if err := pruneStaleChunks(bundle, chunksDir, chunkNum); err != nil {
 		return err
 	}
 
@@ -779,8 +796,7 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
 	for i := 0; i < chunkNum; i++ {
 		name := fmt.Sprintf("%05d.bin", i)
 		path := filepath.Join("chunks", name)
-		fullPath := filepath.Join(outputDir, path)
-		data, err := os.ReadFile(fullPath)
+		data, err := bundle.root.ReadFile(path)
 		if err != nil {
 			return fmt.Errorf("hash chunk %d: %w", i, err)
 		}
@@ -792,7 +808,7 @@ func (e *SQLiteExporter) chunkIfNeeded(outputDir, dbPath string) error {
 		})
 	}
 
-	return writeJSON(filepath.Join(outputDir, "beads.sqlite3.config.json"), config)
+	return writeJSON(bundle, "beads.sqlite3.config.json", config)
 }
 
 // chunkFileIndex returns the chunk index encoded in a "NNNNN.bin" file name and
@@ -821,8 +837,8 @@ func chunkFileIndex(name string) (int, bool) {
 // >= keep. It only removes files matching the exporter's own chunk naming
 // (chunkFileIndex), so it never deletes unrelated content. A missing chunks
 // directory is not an error.
-func pruneStaleChunks(chunksDir string, keep int) error {
-	entries, err := os.ReadDir(chunksDir)
+func pruneStaleChunks(bundle *Bundle, chunksDir string, keep int) error {
+	entries, err := fs.ReadDir(bundle.root.FS(), filepath.ToSlash(chunksDir))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -837,7 +853,7 @@ func pruneStaleChunks(chunksDir string, keep int) error {
 		if !ok || idx < keep {
 			continue
 		}
-		if err := os.Remove(filepath.Join(chunksDir, entry.Name())); err != nil && !os.IsNotExist(err) {
+		if err := bundle.root.Remove(filepath.Join(chunksDir, entry.Name())); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove stale chunk %s: %w", entry.Name(), err)
 		}
 	}
@@ -850,29 +866,22 @@ func pruneStaleChunks(chunksDir string, keep int) error {
 // behind (#175). os.Remove on the directory only succeeds when it is empty, so
 // any unrelated user file keeps both the file and the directory intact — this
 // never does a recursive delete.
-func removeChunkArtifacts(chunksDir string) error {
-	if err := pruneStaleChunks(chunksDir, 0); err != nil {
+func removeChunkArtifacts(bundle *Bundle, chunksDir string) error {
+	if err := pruneStaleChunks(bundle, chunksDir, 0); err != nil {
 		return err
 	}
 	// Best-effort: drop the directory only if our chunks were the only contents.
-	_ = os.Remove(chunksDir)
+	_ = bundle.root.Remove(chunksDir)
 	return nil
 }
 
 // writeJSON writes data as JSON to a file.
-func writeJSON(path string, data interface{}) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	err = enc.Encode(data)
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	return err
+func writeJSON(bundle *Bundle, path string, data interface{}) error {
+	return bundle.writeFile(path, 0o666, func(w io.Writer) error {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(data)
+	})
 }
 
 // GetExportedIssues converts issues to ExportIssue format.
@@ -991,7 +1000,12 @@ func (e *SQLiteExporter) ExportToJSON(path string) error {
 		Issues: issues,
 	}
 
-	return e.writeRobotJSON(path, output)
+	bundle, name, err := openFileBundle(path)
+	if err != nil {
+		return err
+	}
+	defer bundle.Close()
+	return e.writeRobotJSON(bundle, name, output)
 }
 
 // stringSliceContains checks if a string slice contains a value.
@@ -1081,7 +1095,7 @@ func (e *SQLiteExporter) graphCentrality() *GraphCentrality {
 }
 
 // writeGraphLayout generates compact pre-computed graph layout data.
-func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
+func (e *SQLiteExporter) writeGraphLayout(bundle *Bundle, dataDir string) error {
 	blockedBy := make(map[string][]string)
 	blocks := make(map[string][]string)
 
@@ -1215,5 +1229,5 @@ func (e *SQLiteExporter) writeGraphLayout(dataDir string) error {
 		EdgeCount:   len(links),
 	}
 
-	return e.writeRobotJSON(filepath.Join(dataDir, "graph_layout.json"), layout)
+	return e.writeRobotJSON(bundle, filepath.Join(dataDir, "graph_layout.json"), layout)
 }

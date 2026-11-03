@@ -785,13 +785,14 @@ jobs:
 // This ensures GitHub Pages deployment always triggers via an explicit workflow,
 // not relying on the built-in Pages workflow which may not auto-trigger.
 func WriteGitHubActionsWorkflow(bundlePath string) error {
-	workflowDir := filepath.Join(bundlePath, ".github", "workflows")
-	if err := os.MkdirAll(workflowDir, 0755); err != nil {
-		return fmt.Errorf("create workflow directory: %w", err)
+	bundle, err := OpenBundle(bundlePath)
+	if err != nil {
+		return err
 	}
+	defer bundle.Close()
 
-	workflowPath := filepath.Join(workflowDir, "static.yml")
-	if err := os.WriteFile(workflowPath, []byte(GitHubActionsWorkflowContent), 0644); err != nil {
+	workflowPath := filepath.Join(".github", "workflows", "static.yml")
+	if err := bundle.WriteFile(workflowPath, []byte(GitHubActionsWorkflowContent), 0644); err != nil {
 		return fmt.Errorf("write workflow file: %w", err)
 	}
 

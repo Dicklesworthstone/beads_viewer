@@ -133,6 +133,56 @@ export:
 	}
 }
 
+func TestReportExportReplacesLinkedDestinations(t *testing.T) {
+	for _, kind := range []string{"symlink", "hardlink"} {
+		for _, format := range []string{"markdown", "json", "csv", "mermaid"} {
+			t.Run(kind+"/"+format, func(t *testing.T) {
+				dir := recipeProject(t)
+				outside := filepath.Join(t.TempDir(), "outside.txt")
+				const sentinel = "report export must preserve this outside file\n"
+				if err := os.WriteFile(outside, []byte(sentinel), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(dir, "report.out")
+				link := os.Symlink
+				if kind == "hardlink" {
+					link = os.Link
+				}
+				if err := link(outside, path); err != nil {
+					t.Skipf("%s unavailable: %v", kind, err)
+				}
+				args := []string{"--export", path, "--export-format", format, "--no-hooks"}
+				if format == "markdown" {
+					args = []string{"--export-md", path, "--no-hooks"}
+				}
+				stdout, stderr, err := runBVSplit(t, dir, args...)
+				if err != nil {
+					t.Fatalf("export failed: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+				}
+				outsideContent, err := os.ReadFile(outside)
+				if err != nil || string(outsideContent) != sentinel {
+					t.Fatalf("outside target changed: %v content=%q", err, outsideContent)
+				}
+				content, err := os.ReadFile(path)
+				if err != nil || !bytes.Contains(content, []byte("Sprint root")) {
+					t.Fatalf("generated report missing: %v content=%q", err, content)
+				}
+				info, err := os.Lstat(path)
+				if err != nil || !info.Mode().IsRegular() {
+					t.Fatalf("report is not a regular replacement: %v", err)
+				}
+				outsideInfo, err := os.Stat(outside)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if os.SameFile(info, outsideInfo) {
+					t.Fatal("report still shares the outside file inode")
+				}
+			})
+		}
+	}
+}
+
 func TestRecipeReportFormatsAndOverrides(t *testing.T) {
 	t.Setenv("SOURCE_DATE_EPOCH", "1788220800")
 	for _, format := range []string{"markdown", "json", "csv", "mermaid"} {

@@ -2,11 +2,13 @@
 package export
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"embed"
 	"encoding/json"
 	"fmt"
 	"html"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -24,9 +26,132 @@ import (
 //go:embed viewer_assets
 var ViewerAssetsFS embed.FS
 
+// Bundle anchors all generated files to the output directory selected by the
+// invoking user. Keep it open across an export so later path replacements cannot
+// redirect writes, reads, or cleanup through a different directory.
+type Bundle struct {
+	root *os.Root
+}
+
+// OpenBundle creates the selected output directory if necessary and opens its
+// resolved directory as the boundary for all subsequent bundle operations.
+func OpenBundle(outputDir string) (*Bundle, error) {
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create export directory: %w", err)
+	}
+	root, err := os.OpenRoot(outputDir)
+	if err != nil {
+		return nil, fmt.Errorf("open export directory: %w", err)
+	}
+	return &Bundle{root: root}, nil
+}
+
+// openFileBundle anchors a standalone output file to its existing parent. Unlike
+// a Pages bundle, writing a single file must not create missing parent folders
+// or interpret a trailing separator as a filename.
+func openFileBundle(path string) (*Bundle, string, error) {
+	parent, name := filepath.Split(path)
+	if name == "" {
+		return nil, "", fmt.Errorf("export output must name a file: %q", path)
+	}
+	if parent == "" {
+		parent = "."
+	}
+	root, err := os.OpenRoot(parent)
+	if err != nil {
+		return nil, "", fmt.Errorf("open export file directory: %w", err)
+	}
+	return &Bundle{root: root}, name, nil
+}
+
+// Close releases the bundle's directory handle.
+func (b *Bundle) Close() error {
+	return b.root.Close()
+}
+
+// MkdirAll creates relative directories without allowing traversal outside the bundle.
+func (b *Bundle) MkdirAll(name string, perm os.FileMode) error {
+	return b.root.MkdirAll(name, perm)
+}
+
+// WriteFile atomically replaces a file relative to the selected bundle root.
+// Replacing the directory entry avoids following a leaf symlink or modifying a
+// hard-linked file outside the bundle. os.Root confines parent traversal too.
+func (b *Bundle) WriteFile(name string, content []byte, perm os.FileMode) error {
+	return b.writeFile(name, perm, func(w io.Writer) error {
+		_, err := w.Write(content)
+		return err
+	})
+}
+
+// CopyFile streams a file into an atomic replacement within the bundle.
+func (b *Bundle) CopyFile(name string, source io.Reader, perm os.FileMode) error {
+	return b.writeFile(name, perm, func(w io.Writer) error {
+		_, err := io.Copy(w, source)
+		return err
+	})
+}
+
+func (b *Bundle) writeFile(name string, perm os.FileMode, write func(io.Writer) error) error {
+	if !filepath.IsLocal(name) {
+		return fmt.Errorf("export path must remain within the selected directory: %q", name)
+	}
+	if err := b.root.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+		return fmt.Errorf("create export parent for %s: %w", name, err)
+	}
+	preserveMode := false
+	if info, err := b.root.Lstat(name); err == nil {
+		// In-place writes retained an existing file's permissions. Preserve
+		// those bits when replacing a regular file, including a hard link,
+		// without borrowing permissions from an untrusted symlink target.
+		if info.Mode().IsRegular() {
+			perm = info.Mode().Perm()
+			preserveMode = true
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect export destination %s: %w", name, err)
+	}
+	temporary := ".bv-export-" + rand.Text()
+	file, err := b.root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, perm)
+	if err != nil {
+		return fmt.Errorf("create temporary export file: %w", err)
+	}
+	defer b.root.Remove(temporary)
+	if err := write(file); err != nil {
+		file.Close()
+		return err
+	}
+	if preserveMode {
+		// OpenFile applies umask to a new inode. Restore the already existing
+		// permissions on the held temporary file so replacement neither widens
+		// private files nor removes explicitly configured group access.
+		if err := file.Chmod(perm); err != nil {
+			file.Close()
+			return err
+		}
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := b.root.Rename(temporary, name); err != nil {
+		return fmt.Errorf("publish export file %s: %w", name, err)
+	}
+	return nil
+}
+
 // CopyEmbeddedAssets copies all embedded viewer assets to the specified output directory.
 // If title is provided, it replaces "Beads Viewer" in index.html.
 func CopyEmbeddedAssets(outputDir, title string) error {
+	bundle, err := OpenBundle(outputDir)
+	if err != nil {
+		return err
+	}
+	defer bundle.Close()
+	return bundle.CopyEmbeddedAssets(title)
+}
+
+// CopyEmbeddedAssets writes viewer assets through the held bundle boundary.
+func (b *Bundle) CopyEmbeddedAssets(title string) error {
 	var offlineFiles []string
 	// Walk the embedded filesystem and copy all files
 	err := fs.WalkDir(ViewerAssetsFS, "viewer_assets", func(path string, d fs.DirEntry, err error) error {
@@ -51,10 +176,10 @@ func CopyEmbeddedAssets(outputDir, title string) error {
 		}
 
 		// Convert to platform-specific path separator for the destination
-		destPath := filepath.Join(outputDir, filepath.FromSlash(relPath))
+		destPath := filepath.FromSlash(relPath)
 
 		if d.IsDir() {
-			return os.MkdirAll(destPath, 0755)
+			return b.root.MkdirAll(destPath, 0755)
 		}
 
 		// Read the embedded file
@@ -74,16 +199,11 @@ func CopyEmbeddedAssets(outputDir, title string) error {
 			content = []byte(contentStr)
 		}
 
-		// Ensure parent directory exists
-		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-			return err
-		}
-
 		// Write the file
 		if relPath != "coi-serviceworker.js" {
 			offlineFiles = append(offlineFiles, relPath)
 		}
-		return os.WriteFile(destPath, content, 0644)
+		return b.WriteFile(destPath, content, 0644)
 	})
 
 	if err != nil {
@@ -93,33 +213,33 @@ func CopyEmbeddedAssets(outputDir, title string) error {
 	// SQLite export precedes asset copying. Bind the worker's offline cache to
 	// this exact bundle, including config/chunks, before a browser can activate it.
 	for _, name := range []string{"beads.sqlite3", "beads.sqlite3.config.json", "chunks", "data"} {
-		base := filepath.Join(outputDir, name)
-		if _, err := os.Stat(base); os.IsNotExist(err) {
+		if _, err := b.root.Stat(name); os.IsNotExist(err) {
 			continue // CopyEmbeddedAssets also supports standalone asset callers.
+		} else if err != nil {
+			return fmt.Errorf("inspect offline asset %s: %w", name, err)
 		}
-		if err := filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+		if err := fs.WalkDir(b.root.FS(), name, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 			if !d.IsDir() {
-				rel, err := filepath.Rel(outputDir, p)
-				if err != nil {
-					return err
+				if !d.Type().IsRegular() {
+					return fmt.Errorf("offline asset %s is not a regular file", p)
 				}
-				offlineFiles = append(offlineFiles, filepath.ToSlash(rel))
+				offlineFiles = append(offlineFiles, p)
 			}
 			return nil
 		}); err != nil {
 			return fmt.Errorf("collecting offline database assets: %w", err)
 		}
 	}
-	if err := bindOfflineAssets(outputDir, offlineFiles); err != nil {
+	if err := bindOfflineAssets(b, offlineFiles); err != nil {
 		return err
 	}
 
 	// Always add GitHub Actions workflow for reliable Pages deployment
 	// This ensures deployments trigger even if the built-in Pages workflow doesn't auto-trigger
-	if wfErr := WriteGitHubActionsWorkflow(outputDir); wfErr != nil {
+	if wfErr := b.WriteFile(filepath.Join(".github", "workflows", "static.yml"), []byte(GitHubActionsWorkflowContent), 0644); wfErr != nil {
 		// Non-fatal - just log a warning (fmt is already imported via other usage)
 		fmt.Printf("  Warning: Could not add GitHub Actions workflow: %v\n", wfErr)
 	}
@@ -130,7 +250,7 @@ func CopyEmbeddedAssets(outputDir, title string) error {
 // bindOfflineAssets embeds the exact file hashes consumed by SW installation.
 // A missing or changed asset prevents activation; it cannot create a verified
 // partial offline bundle. This list exists only to serve the offline cache.
-func bindOfflineAssets(outputDir string, files []string) error {
+func bindOfflineAssets(bundle *Bundle, files []string) error {
 	sort.Strings(files)
 	type asset struct {
 		Path string `json:"path"`
@@ -138,7 +258,7 @@ func bindOfflineAssets(outputDir string, files []string) error {
 	}
 	assets := make([]asset, 0, len(files))
 	for _, name := range files {
-		data, err := os.ReadFile(filepath.Join(outputDir, filepath.FromSlash(name)))
+		data, err := bundle.root.ReadFile(filepath.FromSlash(name))
 		if err != nil {
 			return fmt.Errorf("hashing offline asset %s: %w", name, err)
 		}
@@ -157,7 +277,7 @@ func bindOfflineAssets(outputDir string, files []string) error {
 	hash.Write(encoded)
 	content := strings.Replace(string(worker), "const OFFLINE_ASSETS = [];", "const OFFLINE_ASSETS = "+string(encoded)+";", 1)
 	content = strings.Replace(content, "const CACHE_REVISION = 'development';", fmt.Sprintf("const CACHE_REVISION = '%x';", hash.Sum(nil)), 1)
-	return os.WriteFile(filepath.Join(outputDir, "coi-serviceworker.js"), []byte(content), 0644)
+	return bundle.WriteFile("coi-serviceworker.js", []byte(content), 0644)
 }
 
 // isDevOnlyAsset reports whether a viewer asset is development-only and must

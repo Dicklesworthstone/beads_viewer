@@ -3135,6 +3135,11 @@ func main() {
 						return fmt.Errorf("pre-export hook failed: %w", err)
 					}
 				}
+				bundle, err := export.OpenBundle(*exportPages)
+				if err != nil {
+					return fmt.Errorf("open export directory: %w", err)
+				}
+				defer bundle.Close()
 
 				// Build graph and compute stats
 				fmt.Println("  → Running graph analysis...")
@@ -3184,19 +3189,13 @@ func main() {
 
 				// Export SQLite database
 				fmt.Println("  → Writing database and JSON files...")
-				if err := exporter.Export(*exportPages); err != nil {
+				if err := exporter.ExportBundle(bundle); err != nil {
 					return fmt.Errorf("exporting: %w", err)
-				}
-
-				// Copy viewer assets
-				fmt.Println("  → Copying viewer assets...")
-				if err := copyViewerAssets(*exportPages, *pagesTitle); err != nil {
-					return fmt.Errorf("copying assets: %w", err)
 				}
 
 				// Generate README.md with project stats (useful for GitHub Pages deployment)
 				fmt.Println("  → Generating README.md...")
-				if err := generateREADME(*exportPages, *pagesTitle, "", exportIssues, &triage, stats); err != nil {
+				if err := generateREADME(bundle, *pagesTitle, "", exportIssues, &triage, stats); err != nil {
 					fmt.Printf("  → Warning: failed to generate README: %v\n", err)
 				}
 
@@ -3204,9 +3203,8 @@ func main() {
 				if *pagesIncludeHistory {
 					fmt.Println("  → Generating time-travel history data...")
 					if historyReport, err := generateHistoryForExport(allIssues); err == nil && historyReport != nil {
-						historyPath := filepath.Join(*exportPages, "data", "history.json")
 						if historyJSON, err := json.MarshalIndent(historyReport, "", "  "); err == nil {
-							if err := os.WriteFile(historyPath, historyJSON, 0644); err != nil {
+							if err := bundle.WriteFile("data/history.json", historyJSON, 0644); err != nil {
 								fmt.Printf("  → Warning: failed to write history.json: %v\n", err)
 							} else {
 								fmt.Printf("  → history.json (%d commits)\n", len(historyReport.Commits))
@@ -3215,6 +3213,17 @@ func main() {
 					} else if err != nil {
 						fmt.Printf("  → Warning: failed to generate history: %v\n", err)
 					}
+				}
+
+				// Bind the offline viewer to the completed data, including history.
+				fmt.Println("  → Copying viewer assets...")
+				if err := copyViewerAssets(bundle, *pagesTitle); err != nil {
+					return fmt.Errorf("copying assets: %w", err)
+				}
+				// Windows holds the directory against renames while open. Release
+				// it before approved hooks may move the completed bundle.
+				if err := bundle.Close(); err != nil {
+					return fmt.Errorf("close export directory: %w", err)
 				}
 
 				// Run post-export hooks (bv-qjc.3)
@@ -4253,7 +4262,7 @@ func main() {
 			}
 
 			// Perform the export
-			if err := os.WriteFile(reportPath, content, 0o644); err != nil {
+			if err := export.WriteReportFile(reportPath, content); err != nil {
 				fmt.Printf("Error exporting: %v\n", err)
 				os.Exit(1)
 			}
@@ -5100,15 +5109,15 @@ func buildAttentionReason(score analysis.LabelAttentionScore) string {
 
 // copyViewerAssets copies the viewer HTML/JS/CSS assets to the output directory.
 // If title is provided, it replaces the default title in index.html.
-func copyViewerAssets(outputDir, title string) error {
+func copyViewerAssets(bundle *export.Bundle, title string) error {
 	// First try to use embedded assets (production builds)
 	if export.HasEmbeddedAssets() {
-		if err := export.CopyEmbeddedAssets(outputDir, title); err != nil {
+		if err := bundle.CopyEmbeddedAssets(title); err != nil {
 			return err
 		}
 		// The optional hybrid scorer is built from source straight into the
 		// bundle so BV_BUILD_HYBRID_WASM works in the released binary too.
-		return maybeBuildHybridWasmAssets(outputDir)
+		return maybeBuildHybridWasmAssets(bundle)
 	}
 
 	// Fall back to filesystem-based approach (development mode)
@@ -5131,17 +5140,16 @@ func copyViewerAssets(outputDir, title string) error {
 
 	for _, file := range files {
 		src := filepath.Join(assetsDir, file)
-		dst := filepath.Join(outputDir, file)
 
 		// Special handling for index.html to replace title and add cache-busting
 		if file == "index.html" {
-			if err := copyFileWithTitleAndCacheBusting(src, dst, title); err != nil {
+			if err := copyFileWithTitleAndCacheBusting(src, bundle, file, title); err != nil {
 				return fmt.Errorf("copy %s: %w", file, err)
 			}
 			continue
 		}
 
-		if err := copyFile(src, dst); err != nil {
+		if err := copyFile(src, bundle, file); err != nil {
 			// Skip missing optional files
 			if os.IsNotExist(err) {
 				continue
@@ -5152,8 +5160,7 @@ func copyViewerAssets(outputDir, title string) error {
 
 	// Copy vendor directory
 	vendorSrc := filepath.Join(assetsDir, "vendor")
-	vendorDst := filepath.Join(outputDir, "vendor")
-	if err := copyDir(vendorSrc, vendorDst); err != nil {
+	if err := copyDir(vendorSrc, bundle, "vendor"); err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("copy vendor: %w", err)
 		}
@@ -5161,19 +5168,18 @@ func copyViewerAssets(outputDir, title string) error {
 
 	// Copy optional WASM directory
 	wasmSrc := filepath.Join(assetsDir, "wasm")
-	wasmDst := filepath.Join(outputDir, "wasm")
-	if err := copyDir(wasmSrc, wasmDst); err != nil {
+	if err := copyDir(wasmSrc, bundle, "wasm"); err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("copy wasm: %w", err)
 		}
 	}
-	if err := maybeBuildHybridWasmAssets(outputDir); err != nil {
+	if err := maybeBuildHybridWasmAssets(bundle); err != nil {
 		return err
 	}
 
 	// Always add GitHub Actions workflow for reliable Pages deployment
 	// This ensures the workflow is in the bundle regardless of deployment target
-	if err := export.WriteGitHubActionsWorkflow(outputDir); err != nil {
+	if err := bundle.WriteFile(".github/workflows/static.yml", []byte(export.GitHubActionsWorkflowContent), 0644); err != nil {
 		// Non-fatal - just log a warning
 		fmt.Printf("  Warning: Could not add GitHub Actions workflow: %v\n", err)
 	}
@@ -5182,12 +5188,12 @@ func copyViewerAssets(outputDir, title string) error {
 }
 
 // maybeBuildHybridWasmAssets builds the optional hybrid search scorer with
-// wasm-pack when BV_BUILD_HYBRID_WASM is set, writing the artifacts into
-// <outputDir>/wasm of the bundle being exported. The Rust source lives next
+// wasm-pack when BV_BUILD_HYBRID_WASM is set, publishing the artifacts into
+// wasm/ through the held bundle directory. The Rust source lives next
 // to the viewer assets in a source checkout (pkg/export/wasm_scorer); the
 // embedded assets of a released binary do not carry it, so the checkout must
 // be reachable from the working directory.
-func maybeBuildHybridWasmAssets(outputDir string) error {
+func maybeBuildHybridWasmAssets(bundle *export.Bundle) error {
 	if env.BuildHybridWasm.Get() == "" {
 		return nil
 	}
@@ -5207,7 +5213,13 @@ func maybeBuildHybridWasmAssets(outputDir string) error {
 		return fmt.Errorf("hybrid wasm source directory not found at %s", wasmSrc)
 	}
 
-	outDir := filepath.Join(outputDir, "wasm")
+	// Stage the build artifacts privately, then publish them through the same
+	// confined writer as the rest of the bundle.
+	outDir, err := os.MkdirTemp("", "bv-hybrid-wasm-*")
+	if err != nil {
+		return fmt.Errorf("create hybrid wasm staging directory: %w", err)
+	}
+	defer os.RemoveAll(outDir)
 	cmd := exec.Command(wasmPackPath, "build", "--release", "--target", "web", "--out-dir", outDir)
 	cmd.Dir = wasmSrc
 	cmd.Stdout = os.Stdout
@@ -5215,7 +5227,7 @@ func maybeBuildHybridWasmAssets(outputDir string) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("build hybrid wasm: %w", err)
 	}
-	return nil
+	return copyDir(outDir, bundle, "wasm")
 }
 
 // findViewerAssetsDir locates the viewer assets directory.
@@ -5247,28 +5259,19 @@ func findViewerAssetsDir() string {
 }
 
 // copyFile copies a single file.
-func copyFile(src, dst string) error {
+func copyFile(src string, bundle *export.Bundle, name string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer srcFile.Close()
 
-	dstFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-
-	_, err = io.Copy(dstFile, srcFile)
-	if closeErr := dstFile.Close(); err == nil {
-		err = closeErr
-	}
-	return err
+	return bundle.CopyFile(name, srcFile, 0666)
 }
 
 // copyFileWithTitleAndCacheBusting copies a file while replacing the default title
 // and adding cache-busting query parameters to script tags.
-func copyFileWithTitleAndCacheBusting(src, dst, title string) error {
+func copyFileWithTitleAndCacheBusting(src string, bundle *export.Bundle, name, title string) error {
 	content, err := os.ReadFile(src)
 	if err != nil {
 		return err
@@ -5286,17 +5289,17 @@ func copyFileWithTitleAndCacheBusting(src, dst, title string) error {
 	// Always add cache-busting to script tags to prevent CDN from serving stale JS files
 	result = export.AddScriptCacheBusting(result)
 
-	return os.WriteFile(dst, []byte(result), 0644)
+	return bundle.WriteFile(name, []byte(result), 0644)
 }
 
 // copyDir recursively copies a directory.
-func copyDir(src, dst string) error {
+func copyDir(src string, bundle *export.Bundle, name string) error {
 	srcInfo, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
 
-	if err := os.MkdirAll(dst, srcInfo.Mode()); err != nil {
+	if err := bundle.MkdirAll(name, srcInfo.Mode().Perm()); err != nil {
 		return err
 	}
 
@@ -5307,14 +5310,14 @@ func copyDir(src, dst string) error {
 
 	for _, entry := range entries {
 		srcPath := filepath.Join(src, entry.Name())
-		dstPath := filepath.Join(dst, entry.Name())
+		dstPath := filepath.Join(name, entry.Name())
 
 		if entry.IsDir() {
-			if err := copyDir(srcPath, dstPath); err != nil {
+			if err := copyDir(srcPath, bundle, dstPath); err != nil {
 				return err
 			}
 		} else {
-			if err := copyFile(srcPath, dstPath); err != nil {
+			if err := copyFile(srcPath, bundle, dstPath); err != nil {
 				return err
 			}
 		}
@@ -5325,7 +5328,7 @@ func copyDir(src, dst string) error {
 
 // generateREADME creates a README.md file for the GitHub Pages repository.
 // It includes actionable insights, graph analysis, and a direct link to the live site.
-func generateREADME(bundlePath, title, pagesURL string, issues []model.Issue, triage *analysis.TriageResult, stats *analysis.GraphStats) error {
+func generateREADME(bundle *export.Bundle, title, pagesURL string, issues []model.Issue, triage *analysis.TriageResult, stats *analysis.GraphStats) error {
 	var b strings.Builder
 
 	// Title
@@ -5561,8 +5564,7 @@ func generateREADME(bundlePath, title, pagesURL string, issues []model.Issue, tr
 	}
 
 	// Write to file
-	readmePath := filepath.Join(bundlePath, "README.md")
-	return os.WriteFile(readmePath, []byte(b.String()), 0644)
+	return bundle.WriteFile("README.md", []byte(b.String()), 0644)
 }
 
 // truncateTitle truncates a title to maxLen runes, adding ellipsis if needed.
@@ -5638,10 +5640,12 @@ func runPagesWizard(beadsPath string) error {
 		bundlePath = tmpDir
 	}
 
-	// Ensure output directory exists
-	if err := os.MkdirAll(bundlePath, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
+	// Hold the selected directory across every bundle write.
+	bundle, err := export.OpenBundle(bundlePath)
+	if err != nil {
+		return fmt.Errorf("failed to open output directory: %w", err)
 	}
+	defer bundle.Close()
 
 	// Perform export
 	wizard.PerformExport(bundlePath)
@@ -5703,14 +5707,8 @@ func runPagesWizard(beadsPath string) error {
 
 	// Export SQLite database
 	fmt.Println("  -> Writing database and JSON files...")
-	if err := exporter.Export(bundlePath); err != nil {
+	if err := exporter.ExportBundle(bundle); err != nil {
 		return fmt.Errorf("export failed: %w", err)
-	}
-
-	// Copy viewer assets
-	fmt.Println("  -> Copying viewer assets...")
-	if err := copyViewerAssets(bundlePath, config.Title); err != nil {
-		return fmt.Errorf("failed to copy assets: %w", err)
 	}
 
 	// Generate README.md with project stats (for GitHub Pages)
@@ -5737,7 +5735,7 @@ func runPagesWizard(beadsPath string) error {
 				}
 			}
 		}
-		if err := generateREADME(bundlePath, config.Title, pagesURL, exportIssues, &triage, stats); err != nil {
+		if err := generateREADME(bundle, config.Title, pagesURL, exportIssues, &triage, stats); err != nil {
 			fmt.Printf("  -> Warning: failed to generate README: %v\n", err)
 		}
 	}
@@ -5746,9 +5744,8 @@ func runPagesWizard(beadsPath string) error {
 	if config.IncludeHistory {
 		fmt.Println("  -> Generating time-travel history data...")
 		if historyReport, err := generateHistoryForExport(exportIssues); err == nil && historyReport != nil {
-			historyPath := filepath.Join(bundlePath, "data", "history.json")
 			if historyJSON, err := json.MarshalIndent(historyReport, "", "  "); err == nil {
-				if err := os.WriteFile(historyPath, historyJSON, 0644); err != nil {
+				if err := bundle.WriteFile("data/history.json", historyJSON, 0644); err != nil {
 					fmt.Printf("  -> Warning: failed to write history.json: %v\n", err)
 				} else {
 					fmt.Printf("  -> history.json (%d commits)\n", len(historyReport.Commits))
@@ -5757,6 +5754,15 @@ func runPagesWizard(beadsPath string) error {
 		} else if err != nil {
 			fmt.Printf("  -> Warning: failed to generate history: %v\n", err)
 		}
+	}
+
+	// Bind the offline viewer after all database/history data has been published.
+	fmt.Println("  -> Copying viewer assets...")
+	if err := copyViewerAssets(bundle, config.Title); err != nil {
+		return fmt.Errorf("failed to copy assets: %w", err)
+	}
+	if err := bundle.Close(); err != nil {
+		return fmt.Errorf("close export directory: %w", err)
 	}
 
 	fmt.Printf("  -> Bundle created: %s\n", bundlePath)

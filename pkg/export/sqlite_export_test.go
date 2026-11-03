@@ -78,7 +78,7 @@ func TestGraphLayoutDeterministicPositions(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		issues[0], issues[2] = issues[2], issues[0]
 		dir := t.TempDir()
-		if err := NewSQLiteExporter(issues, deps, nil, nil).writeGraphLayout(dir); err != nil {
+		if err := NewSQLiteExporter(issues, deps, nil, nil).writeGraphLayout(openTestBundle(t, dir), "."); err != nil {
 			t.Fatal(err)
 		}
 		data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
@@ -98,7 +98,7 @@ func TestGraphLayoutDeterministicPositions(t *testing.T) {
 	}
 	t.Run("edgeless", func(t *testing.T) {
 		dir := t.TempDir()
-		if err := NewSQLiteExporter(issues, nil, nil, nil).writeGraphLayout(dir); err != nil {
+		if err := NewSQLiteExporter(issues, nil, nil, nil).writeGraphLayout(openTestBundle(t, dir), "."); err != nil {
 			t.Fatal(err)
 		}
 		data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
@@ -129,7 +129,7 @@ func TestGraphLayoutCentralityUsesExportedTopology(t *testing.T) {
 	unrelated := analysis.NewAnalyzer([]model.Issue{{ID: "other"}}).Analyze()
 	exporter := NewSQLiteExporter(issues, deps, &unrelated, nil)
 	dir := t.TempDir()
-	if err := exporter.writeGraphLayout(dir); err != nil {
+	if err := exporter.writeGraphLayout(openTestBundle(t, dir), "."); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
@@ -227,7 +227,7 @@ func TestGraphLayoutFallbackLayers(t *testing.T) {
 				if tc.topological != nil {
 					stats = &analysis.GraphStats{TopologicalOrder: tc.topological}
 				}
-				if err := NewSQLiteExporter(issues, deps, stats, nil).writeGraphLayout(dir); err != nil {
+				if err := NewSQLiteExporter(issues, deps, stats, nil).writeGraphLayout(openTestBundle(t, dir), "."); err != nil {
 					t.Fatal(err)
 				}
 				data, err := os.ReadFile(filepath.Join(dir, "graph_layout.json"))
@@ -443,14 +443,92 @@ func TestSQLiteExportFailedRebuildPreservesPublishedDatabase(t *testing.T) {
 	}
 }
 
+func TestSQLiteExportConfinesFilesAndChunkCleanup(t *testing.T) {
+	for _, kind := range []string{"data parent", "chunks parent", "metadata hardlink", "chunk hardlink", "stale chunk hardlink", "database hardlink"} {
+		t.Run(kind, func(t *testing.T) {
+			out := t.TempDir()
+			outside := t.TempDir()
+			const sentinel = "FAKE-PRIVATE-OUTSIDE-DATABASE-CONTENT"
+			target := filepath.Join(outside, "00000.bin")
+			if kind == "data parent" {
+				target = filepath.Join(outside, "meta.json")
+			}
+			if err := os.WriteFile(target, []byte(sentinel), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			exporter := NewSQLiteExporter([]*model.Issue{makeTestIssue("safe-1", "Safe issue", model.StatusOpen, 1, model.TypeTask)}, nil, nil, nil)
+			var linkErr error
+			switch kind {
+			case "data parent":
+				linkErr = os.Symlink(outside, filepath.Join(out, "data"))
+			case "chunks parent":
+				linkErr = os.Symlink(outside, filepath.Join(out, "chunks"))
+			case "metadata hardlink":
+				if err := os.Mkdir(filepath.Join(out, "data"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				linkErr = os.Link(target, filepath.Join(out, "data", "meta.json"))
+			case "chunk hardlink", "stale chunk hardlink":
+				if err := os.Mkdir(filepath.Join(out, "chunks"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				linkErr = os.Link(target, filepath.Join(out, "chunks", "00000.bin"))
+				if kind == "chunk hardlink" {
+					exporter.Config.ChunkThreshold = 1
+					exporter.Config.ChunkSize = 4096
+				}
+			case "database hardlink":
+				linkErr = os.Link(target, filepath.Join(out, "beads.sqlite3"))
+			}
+			if linkErr != nil {
+				if runtime.GOOS == "windows" {
+					t.Skipf("link unavailable: %v", linkErr)
+				}
+				t.Fatal(linkErr)
+			}
+			err := exporter.Export(out)
+			if kind == "data parent" || kind == "chunks parent" {
+				if err == nil {
+					t.Fatal("outside parent symlink was accepted")
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if content, err := os.ReadFile(target); err != nil || string(content) != sentinel {
+				t.Fatalf("export or cleanup changed outside target: %q, %v", content, err)
+			}
+			entries, err := os.ReadDir(outside)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("export wrote outside its root: %v, %v", entries, err)
+			}
+			if kind == "chunk hardlink" {
+				config := readChunkConfig(t, out)
+				database, err := os.ReadFile(filepath.Join(out, "beads.sqlite3"))
+				if err != nil || !bytes.Equal(database, reassembleChunks(t, out, config)) {
+					t.Fatalf("safe chunk replacement changed reconstructed database: %v", err)
+				}
+			}
+			if kind == "stale chunk hardlink" {
+				if _, err := os.Lstat(filepath.Join(out, "chunks", "00000.bin")); !os.IsNotExist(err) {
+					t.Fatalf("owned stale chunk was not removed: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestSQLiteExportRespectsUmask(t *testing.T) {
 	const directoryEnv = "BV_TEST_EXPORT_UMASK_DIR"
 	const maskEnv = "BV_TEST_EXPORT_UMASK"
 	if directory := os.Getenv(directoryEnv); directory != "" {
 		mask := os.Getenv(maskEnv)
 		want := os.FileMode(0644)
+		wantJSON := os.FileMode(0644)
 		if mask == "077" {
 			want = 0600
+			wantJSON = 0600
+		} else if mask == "002" {
+			wantJSON = 0664
 		} else if mask != "022" {
 			t.Fatalf("unsupported test umask %q", mask)
 		}
@@ -467,13 +545,33 @@ func TestSQLiteExportRespectsUmask(t *testing.T) {
 			if got := info.Mode().Perm(); got != want {
 				t.Fatalf("database mode under umask %s = %04o, want %04o", mask, got, want)
 			}
+			info, err = os.Stat(filepath.Join(directory, "data", "meta.json"))
+			if err != nil || info.Mode().Perm() != wantJSON {
+				t.Fatalf("JSON mode under umask %s: info=%v err=%v, want %04o", mask, info, err, wantJSON)
+			}
+		}
+		// Atomic replacement must retain explicit group access even when the
+		// current process umask would remove it from a newly created inode.
+		shared := filepath.Join(directory, "shared-report.md")
+		if err := os.WriteFile(shared, []byte("previous report"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(shared, 0o660); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteReportFile(shared, []byte("updated report")); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(shared)
+		if err != nil || info.Mode().Perm() != 0o660 {
+			t.Fatalf("replacement changed configured group access under umask %s: info=%v err=%v", mask, info, err)
 		}
 		return
 	}
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix umask semantics")
 	}
-	for _, mask := range []string{"077", "022"} {
+	for _, mask := range []string{"077", "022", "002"} {
 		t.Run(mask, func(t *testing.T) {
 			directory := t.TempDir()
 			if err := os.Chmod(directory, 0755); err != nil {
@@ -508,7 +606,7 @@ func TestWriteRobotJSONPreservesPayloadTimestamp(t *testing.T) {
 				"authority_hash":   json.RawMessage(`"source-fingerprint"`),
 			}
 			path := filepath.Join(t.TempDir(), "meta.json")
-			if err := exporter.writeRobotJSON(path, tc.payload); err != nil {
+			if err := exporter.writeRobotJSON(openTestBundle(t, filepath.Dir(path)), filepath.Base(path), tc.payload); err != nil {
 				t.Fatal(err)
 			}
 			data, err := os.ReadFile(path)

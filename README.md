@@ -1206,6 +1206,10 @@ including their configured failure policy. Configured hooks require
 `--trust-hooks` with the reviewed digest, or `--no-hooks` to skip them; see
 [Automation Hooks](#-automation-hooks).
 
+Report files are published by atomic replacement within their explicitly
+selected parent directory, which must already exist. Existing symlinks and
+hardlinks at the output filename cannot redirect writes to another file.
+
 Project recipes with `export.template` require explicit file-read authorization
 on each export, including noninteractive exports. Review the template and pass
 its path yourself, or select the built-in report:
@@ -2920,6 +2924,20 @@ the digest reviewed through `bv --hooks-info`, or `--no-hooks` to skip them.
 This also applies to noninteractive and watch exports. A changed hook
 configuration is rejected on the next export until explicitly approved again;
 see [Automation Hooks](#-automation-hooks) for credential grants and CI usage.
+
+Pages exports hold the selected output directory open while generating the
+bundle. Nested file writes, offline asset reads, and stale-chunk cleanup are
+confined to that directory. Each generated file is published by atomic
+replacement, protecting the targets of pre-existing symlinks and hardlinks.
+An explicitly selected directory that is itself a symlink resolves to its target
+when the export begins. The directory handle is released before approved
+post-export hooks, so automation can move the completed bundle.
+
+Replacement preserves ordinary permission bits on existing regular files and
+honors the process umask for new files. It creates new inodes; ownership,
+extended ACLs, and other inode metadata are not copied. An entire Pages export
+is not a single transaction: if a later file fails, earlier published files
+can remain. These filesystem protections do not sandbox approved hooks.
 
 Direct exports apply recipe filters and their complete sort chain before
 `view.max_items` chooses the exported issues. Recipe membership intersects

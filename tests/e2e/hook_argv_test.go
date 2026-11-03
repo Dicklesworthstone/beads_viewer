@@ -3,6 +3,7 @@ package main_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -107,6 +108,61 @@ func readHookArgvProbe(t *testing.T, path string) hookArgvProbeRecord {
 		t.Fatalf("decode argv probe: %v\n%s", err, data)
 	}
 	return record
+}
+
+func renameCompletedPagesExport(destination string) error {
+	source := os.Getenv("BV_EXPORT_PATH")
+	if source == "" || os.Getenv("BV_EXPORT_FORMAT") != "html" {
+		return fmt.Errorf("post-export rename fixture did not receive the Pages context")
+	}
+	for _, name := range []string{"beads.sqlite3", "beads.sqlite3.config.json", "index.html", "coi-serviceworker.js", "README.md", "data/meta.json"} {
+		info, err := os.Stat(filepath.Join(source, filepath.FromSlash(name)))
+		if err != nil {
+			return fmt.Errorf("post-export artifact %s: %w", name, err)
+		}
+		if !info.Mode().IsRegular() || info.Size() == 0 {
+			return fmt.Errorf("post-export artifact %s is not a completed regular file", name)
+		}
+	}
+	if err := os.Rename(source, destination); err != nil {
+		return fmt.Errorf("move completed Pages bundle: %w", err)
+	}
+	return nil
+}
+
+// Windows prevents renaming a directory while os.OpenRoot holds it open.
+// Approved post hooks must receive the finished bundle after its handle closes,
+// so publishing or archiving it continues to work on Unix and Windows alike.
+func TestHookArgvPostExportCanMoveCompletedBundle(t *testing.T) {
+	t.Setenv("BV_BUILD_HYBRID_WASM", "")
+	dir := hookProject(t)
+	program, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(dir, "completed bundle")
+	destination := filepath.Join(dir, "published bundle")
+	writeArgvHookFixture(t, dir, nil, []map[string]any{{
+		"name":     "move completed Pages bundle",
+		"argv":     []string{program, "--bv-e2e-rename-completed-pages", destination},
+		"on_error": "fail",
+	}})
+	args := append(hookExportArgs("pages", output), "--trust-hooks", reviewedHookDigest(t, dir))
+	stdout, stderr, err := runHookBV(t, dir, args...)
+	if err != nil {
+		t.Fatalf("approved post hook could not move the completed bundle: %v\n%s\n%s", err, stdout, stderr)
+	}
+	requireHookFileAbsent(t, output)
+	metadata, err := os.ReadFile(filepath.Join(destination, "data", "meta.json"))
+	if err != nil {
+		t.Fatalf("read moved bundle metadata: %v", err)
+	}
+	var meta struct {
+		IssueCount int `json:"issue_count"`
+	}
+	if err := json.Unmarshal(metadata, &meta); err != nil || meta.IssueCount != 1 {
+		t.Fatalf("moved bundle lost exported fixture: issue_count=%d error=%v", meta.IssueCount, err)
+	}
 }
 
 func TestHookArgvExports(t *testing.T) {

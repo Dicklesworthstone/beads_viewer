@@ -618,6 +618,17 @@ func getPriorityLabel(priority int) string {
 	}
 }
 
+// WriteReportFile replaces a report without following a leaf symlink or
+// modifying a hard-linked target. Its explicitly selected parent must exist.
+func WriteReportFile(path string, content []byte) error {
+	bundle, name, err := openFileBundle(path)
+	if err != nil {
+		return err
+	}
+	defer bundle.Close()
+	return bundle.WriteFile(name, content, 0o644)
+}
+
 // SaveMarkdownToFile writes the generated markdown to a file
 func SaveMarkdownToFile(issues []model.Issue, filename string) error {
 	// Make a copy to avoid mutating the caller's slice
@@ -641,7 +652,7 @@ func SaveMarkdownToFile(issues []model.Issue, filename string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filename, []byte(content), 0644)
+	return WriteReportFile(filename, []byte(content))
 }
 
 // generateQuickActions offers inspection commands bound to each live tracker.

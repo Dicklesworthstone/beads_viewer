@@ -8,6 +8,7 @@ import (
 	"html"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -982,6 +983,83 @@ func TestGenerateMarkdown_MermaidClassDefs(t *testing.T) {
 }
 
 // ============================================================================
+func TestReportWritersReplaceLinks(t *testing.T) {
+	for _, writer := range []struct {
+		name  string
+		write func(string) error
+	}{
+		{"report", func(path string) error { return WriteReportFile(path, []byte("new report")) }},
+		{"markdown", func(path string) error {
+			return SaveMarkdownToFile([]model.Issue{{ID: "linked-report", Title: "new report", Status: model.StatusOpen}}, path)
+		}},
+		{"standalone JSON", func(path string) error {
+			exporter := NewSQLiteExporter([]*model.Issue{{ID: "linked-report", Title: "new report", Status: model.StatusOpen}}, nil, nil, nil)
+			return exporter.ExportToJSON(path)
+		}},
+	} {
+		for _, kind := range []string{"symlink", "hardlink"} {
+			t.Run(writer.name+"/"+kind, func(t *testing.T) {
+				dir := t.TempDir()
+				target := filepath.Join(dir, "outside-report")
+				const sentinel = "outside fake report must remain unchanged"
+				if err := os.WriteFile(target, []byte(sentinel), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				output := filepath.Join(dir, "reports")
+				if err := os.Mkdir(output, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(output, "report.md")
+				link := os.Symlink
+				if kind == "hardlink" {
+					link = os.Link
+				}
+				if err := link(target, path); err != nil {
+					if runtime.GOOS == "windows" {
+						t.Skipf("link unavailable: %v", err)
+					}
+					t.Fatal(err)
+				}
+				if err := writer.write(path); err != nil {
+					t.Fatal(err)
+				}
+				if content, err := os.ReadFile(target); err != nil || string(content) != sentinel {
+					t.Fatalf("report overwrote outside target: %q, %v", content, err)
+				}
+				if content, err := os.ReadFile(path); err != nil || !bytes.Contains(content, []byte("new report")) {
+					t.Fatalf("report not published: %q, %v", content, err)
+				}
+				info, err := os.Lstat(path)
+				if err != nil || !info.Mode().IsRegular() {
+					t.Fatalf("report output is not a regular file: %v, %v", info, err)
+				}
+			})
+		}
+	}
+}
+
+func TestFileExportsRejectInvalidPaths(t *testing.T) {
+	for _, write := range []func(string) error{
+		func(path string) error { return WriteReportFile(path, []byte("must not be written")) },
+		NewSQLiteExporter(nil, nil, nil, nil).ExportToJSON,
+	} {
+		dir := t.TempDir()
+		missingParent := filepath.Join(dir, "missing")
+		for _, path := range []string{"", dir + string(os.PathSeparator), dir, filepath.Join(missingParent, "report.md")} {
+			if err := write(path); err == nil {
+				t.Errorf("invalid export destination %q accepted", path)
+			}
+		}
+		if _, err := os.Stat(missingParent); !os.IsNotExist(err) {
+			t.Fatalf("export unexpectedly created missing parent: %v", err)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("invalid export destination created files: %v, %v", entries, err)
+		}
+	}
+}
+
 // SaveMarkdownToFile tests
 // ============================================================================
 

@@ -26,6 +26,16 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	// The post-export hook fixture reuses this native executable on every OS.
+	// Dispatch only its exact argv before test setup could build bv recursively.
+	if len(os.Args) == 3 && os.Args[1] == "--bv-e2e-rename-completed-pages" {
+		if err := renameCompletedPagesExport(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	// Prevent any test from accidentally opening a browser
 	os.Setenv("BV_NO_BROWSER", "1")
 	os.Setenv("BV_TEST_MODE", "1")

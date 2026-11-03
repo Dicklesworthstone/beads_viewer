@@ -1,15 +1,253 @@
 package export
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+func openTestBundle(t *testing.T, dir string) *Bundle {
+	t.Helper()
+	bundle, err := OpenBundle(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { bundle.Close() })
+	return bundle
+}
+
+func TestBundleAtomicWritesPreserveOutsideFiles(t *testing.T) {
+	const original = "FAKE-PRIVATE-OUTSIDE-CONTENT"
+	for _, kind := range []string{"leaf symlink", "parent symlink", "hardlink", "existing private file"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			out := filepath.Join(dir, "bundle")
+			outside := filepath.Join(dir, "outside")
+			if err := os.MkdirAll(outside, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			bundle := openTestBundle(t, out)
+			target := filepath.Join(outside, "report.md")
+			if err := os.WriteFile(target, []byte(original), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			name := "report.md"
+			var linkErr error
+			switch kind {
+			case "leaf symlink":
+				linkErr = os.Symlink(target, filepath.Join(out, name))
+			case "parent symlink":
+				linkErr = os.Symlink(outside, filepath.Join(out, "nested"))
+				name = filepath.Join("nested", name)
+			case "hardlink":
+				linkErr = os.Link(target, filepath.Join(out, name))
+			case "existing private file":
+				if err := os.WriteFile(filepath.Join(out, name), []byte("old report"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if linkErr != nil {
+				if runtime.GOOS == "windows" {
+					t.Skipf("link unavailable: %v", linkErr)
+				}
+				t.Fatal(linkErr)
+			}
+			err := bundle.WriteFile(name, []byte("new report"), 0o644)
+			if kind == "parent symlink" {
+				if err == nil {
+					t.Fatal("outside parent symlink was accepted")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				content, err := os.ReadFile(filepath.Join(out, name))
+				if err != nil || string(content) != "new report" {
+					t.Fatalf("bundle replacement = %q, %v", content, err)
+				}
+				info, err := os.Lstat(filepath.Join(out, name))
+				if err != nil || !info.Mode().IsRegular() {
+					t.Fatalf("replacement must be a regular file: %v", err)
+				}
+				if runtime.GOOS != "windows" && (kind == "hardlink" || kind == "existing private file") && info.Mode().Perm() != 0o600 {
+					t.Fatalf("replacement widened private-file permissions to %o", info.Mode().Perm())
+				}
+			}
+			if content, err := os.ReadFile(target); err != nil || string(content) != original {
+				t.Fatalf("outside file changed: %q, %v", content, err)
+			}
+		})
+	}
+}
+
+func TestBundleFailedWritePreservesPreviousFile(t *testing.T) {
+	out := t.TempDir()
+	bundle := openTestBundle(t, out)
+	if err := bundle.WriteFile("report.md", []byte("previous report"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("fake incomplete source")
+	err := bundle.writeFile("report.md", 0o644, func(w io.Writer) error {
+		if _, err := io.WriteString(w, "incomplete report"); err != nil {
+			return err
+		}
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("lost source error: %v", err)
+	}
+	if content, err := os.ReadFile(filepath.Join(out, "report.md")); err != nil || string(content) != "previous report" {
+		t.Fatalf("failed write changed previous report: %q, %v", content, err)
+	}
+	entries, err := os.ReadDir(out)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "report.md" {
+		t.Fatalf("failed write left temporary artifacts: %v, %v", entries, err)
+	}
+}
+
+func TestBundleHeldRootAndParentReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture renames open directories and creates symlinks")
+	}
+	dir := t.TempDir()
+	out := filepath.Join(dir, "bundle")
+	outside := filepath.Join(dir, "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bundle := openTestBundle(t, out)
+	moved := filepath.Join(dir, "original-bundle")
+	if err := os.Rename(out, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, out); err != nil {
+		t.Fatal(err)
+	}
+	if err := bundle.CopyFile("anchored.txt", bytes.NewBufferString("held root"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := os.ReadFile(filepath.Join(moved, "anchored.txt")); err != nil || string(content) != "held root" {
+		t.Fatalf("held root did not retain selected directory: %q, %v", content, err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "anchored.txt")); !os.IsNotExist(err) {
+		t.Fatalf("replacement root received a write: %v", err)
+	}
+	if err := bundle.MkdirAll("nested", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "item.txt"), []byte("outside sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := bundle.writeFile(filepath.Join("nested", "item.txt"), 0o600, func(w io.Writer) error {
+		// Swap the parent after directory preparation but before publication.
+		// A path precheck followed by ordinary Rename would escape here.
+		if err := os.Rename(filepath.Join(moved, "nested"), filepath.Join(moved, "original-nested")); err != nil {
+			return err
+		}
+		if err := os.Symlink(outside, filepath.Join(moved, "nested")); err != nil {
+			return err
+		}
+		_, err := io.WriteString(w, "must not escape")
+		return err
+	})
+	if err == nil {
+		t.Fatal("parent replacement escaped the held root")
+	}
+	if content, err := os.ReadFile(filepath.Join(outside, "item.txt")); err != nil || string(content) != "outside sentinel" {
+		t.Fatalf("outside target changed during parent replacement: %q, %v", content, err)
+	}
+}
+
+func TestCopyEmbeddedAssetsConfinesPaths(t *testing.T) {
+	for _, kind := range []string{"leaf symlink", "hardlink", "vendor parent", "offline data symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			out := t.TempDir()
+			outside := t.TempDir()
+			target := filepath.Join(outside, "index.html")
+			const sentinel = "FAKE-OUTSIDE-EXPORT-CONTENT"
+			if err := os.WriteFile(target, []byte(sentinel), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var linkErr error
+			switch kind {
+			case "leaf symlink":
+				linkErr = os.Symlink(target, filepath.Join(out, "index.html"))
+			case "hardlink":
+				linkErr = os.Link(target, filepath.Join(out, "index.html"))
+			case "vendor parent":
+				linkErr = os.Symlink(outside, filepath.Join(out, "vendor"))
+			case "offline data symlink":
+				if err := os.Mkdir(filepath.Join(out, "data"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				linkErr = os.Symlink(target, filepath.Join(out, "data", "private.json"))
+			}
+			if linkErr != nil {
+				if runtime.GOOS == "windows" {
+					t.Skipf("link unavailable: %v", linkErr)
+				}
+				t.Fatal(linkErr)
+			}
+			err := CopyEmbeddedAssets(out, "Safe bundle")
+			if kind == "vendor parent" || kind == "offline data symlink" {
+				if err == nil {
+					t.Fatal("unsafe asset path accepted")
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if content, err := os.ReadFile(target); err != nil || string(content) != sentinel {
+				t.Fatalf("outside asset target changed: %q, %v", content, err)
+			}
+			entries, err := os.ReadDir(outside)
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("export added files outside its root: %v, %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestDeploymentMetadataReplacesHardlinks(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		write      func(string) error
+	}{
+		{"workflow", filepath.Join(".github", "workflows", "static.yml"), WriteGitHubActionsWorkflow},
+		{"headers", "_headers", GenerateHeadersFile},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := t.TempDir()
+			target := filepath.Join(t.TempDir(), "private-fixture")
+			if err := os.WriteFile(target, []byte("outside sentinel"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(out, tc.path)), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Link(target, filepath.Join(out, tc.path)); err != nil {
+				if runtime.GOOS == "windows" {
+					t.Skipf("hardlink unavailable: %v", err)
+				}
+				t.Fatal(err)
+			}
+			if err := tc.write(out); err != nil {
+				t.Fatal(err)
+			}
+			if content, err := os.ReadFile(target); err != nil || string(content) != "outside sentinel" {
+				t.Fatalf("deployment metadata changed outside file: %q, %v", content, err)
+			}
+		})
+	}
+}
 
 func TestCopyEmbeddedAssets_BindsCompleteOfflineBundle(t *testing.T) {
 	out := t.TempDir()

@@ -433,7 +433,7 @@ func TestSQLiteExporter_writeRobotOutputs_WritesExpectedFiles(t *testing.T) {
 	exporter.SetGitHash("deadbeef")
 
 	dataDir := t.TempDir()
-	if err := exporter.writeRobotOutputs(dataDir); err != nil {
+	if err := exporter.writeRobotOutputs(openTestBundle(t, dataDir), "."); err != nil {
 		t.Fatalf("writeRobotOutputs returned error: %v", err)
 	}
 
