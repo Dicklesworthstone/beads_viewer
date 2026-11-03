@@ -733,7 +733,6 @@ func TestReadme_NoUnpinnedPipedInstallers(t *testing.T) {
 func TestDocsParity_NoStaleBehaviourPhrases(t *testing.T) {
 	readme := repoFile(t, "README.md")
 	for _, stale := range []string{
-		"hooks are opt-in",    // hooks run whenever .bv/hooks.yaml exists; --no-hooks is the opt-out
 		"relative timestamps", // markdown export writes absolute dates for comments
 		"Windows requires Go 1.21",
 		"dependency-aware scheduling", // forecast/capacity are heuristics, not a scheduler

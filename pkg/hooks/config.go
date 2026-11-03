@@ -4,6 +4,7 @@
 package hooks
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"math"
 	"os"
@@ -37,6 +38,11 @@ type Hook struct {
 // Config holds all hook configurations
 type Config struct {
 	Hooks HooksByPhase `yaml:"hooks" json:"hooks"`
+
+	// Provenance belongs to the loader, never to project-controlled YAML.
+	projectDir string
+	configPath string
+	sourceHash string
 }
 
 // HooksByPhase organizes hooks by their execution phase
@@ -101,13 +107,23 @@ func NewLoader(opts ...LoaderOption) *Loader {
 // Load loads hook configuration from .bv/hooks.yaml
 func (l *Loader) Load() error {
 	l.warnings = nil
+	l.config = nil // A failed reload must not leave a previously approved config usable.
+	projectDir, err := filepath.Abs(l.projectDir)
+	if err != nil {
+		return fmt.Errorf("resolving hooks project directory: %w", err)
+	}
+	projectDir, err = filepath.EvalSymlinks(projectDir)
+	if err != nil {
+		return fmt.Errorf("resolving hooks project directory: %w", err)
+	}
+	l.projectDir = projectDir
 	configPath := filepath.Join(l.projectDir, ".bv", "hooks.yaml")
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// No config file means no hooks - this is OK
-			l.config = &Config{}
+			l.config = &Config{projectDir: projectDir, configPath: configPath}
 			return nil
 		}
 		return fmt.Errorf("reading hooks config: %w", err)
@@ -120,6 +136,9 @@ func (l *Loader) Load() error {
 
 	// Apply defaults and validate
 	l.normalizeConfig(&config)
+	config.projectDir = projectDir
+	config.configPath = configPath
+	config.sourceHash = fmt.Sprintf("%x", sha256.Sum256(data))
 
 	l.config = &config
 	return nil

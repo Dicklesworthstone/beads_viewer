@@ -3,12 +3,17 @@ package hooks
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
 
 // TestRunPreExportTimeout ensures hook timeouts fail pre-export with on_error=fail.
 func TestRunPreExportTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("timeout fixture uses the Unix sleep command")
+	}
 	cfg := &Config{
 		Hooks: HooksByPhase{
 			PreExport: []Hook{
@@ -21,7 +26,7 @@ func TestRunPreExportTimeout(t *testing.T) {
 			},
 		},
 	}
-	ex := NewExecutor(cfg, ExportContext{})
+	ex := newApprovedExecutor(t, cfg, ExportContext{})
 	err := ex.RunPreExport()
 	if err == nil {
 		t.Fatalf("expected timeout error")
@@ -29,6 +34,9 @@ func TestRunPreExportTimeout(t *testing.T) {
 	results := ex.Results()
 	if len(results) != 1 || results[0].Error == nil {
 		t.Fatalf("expected result with error")
+	}
+	if !strings.Contains(results[0].Error.Error(), "timeout") {
+		t.Fatalf("expected a timeout rather than an unrelated failure, got %v", results[0].Error)
 	}
 }
 
@@ -46,7 +54,7 @@ func TestRunPostExportContinue(t *testing.T) {
 			},
 		},
 	}
-	ex := NewExecutor(cfg, ExportContext{})
+	ex := newApprovedExecutor(t, cfg, ExportContext{})
 	if err := ex.RunPostExport(); err != nil {
 		t.Fatalf("post-export should not surface error, got %v", err)
 	}

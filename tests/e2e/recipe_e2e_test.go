@@ -429,7 +429,7 @@ func TestRecipeReportHookOrderingAndExitPolicy(t *testing.T) {
 				t.Fatal(err)
 			}
 			path := filepath.Join(dir, "report.json")
-			stdout, stderr, err := runBVSplit(t, dir, "--recipe", "report", "--export", path)
+			stdout, stderr, err := runBVSplit(t, dir, "--recipe", "report", "--export", path, "--trust-hooks", reviewedHookDigest(t, dir))
 			if (err != nil) != tc.wantFailure {
 				t.Fatalf("hook exit policy: got %v want failure=%v\nstdout=%s\nstderr=%s", err, tc.wantFailure, stdout, stderr)
 			}

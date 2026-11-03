@@ -2,11 +2,15 @@
 
 package hooks
 
-import "testing"
+import (
+	"reflect"
+	"runtime"
+	"testing"
+)
 
 func TestGetShellCommand_Windows(t *testing.T) {
-	shell, flag := getShellCommand()
-	if shell != "cmd" || flag != "/C" {
-		t.Fatalf("getShellCommand() = (%q, %q); want (\"cmd\", \"/C\")", shell, flag)
+	shell, args := shellInvocation(runtime.GOOS, "echo approved")
+	if shell != "cmd" || !reflect.DeepEqual(args, []string{"/D", "/C", "echo approved"}) {
+		t.Fatalf("unexpected Windows shell invocation: %q %q", shell, args)
 	}
 }

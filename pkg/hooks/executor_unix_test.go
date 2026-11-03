@@ -2,11 +2,15 @@
 
 package hooks
 
-import "testing"
+import (
+	"reflect"
+	"runtime"
+	"testing"
+)
 
 func TestGetShellCommand_Unix(t *testing.T) {
-	shell, flag := getShellCommand()
-	if shell != "sh" || flag != "-c" {
-		t.Fatalf("getShellCommand() = (%q, %q); want (\"sh\", \"-c\")", shell, flag)
+	shell, args := shellInvocation(runtime.GOOS, "echo approved")
+	if shell != "sh" || !reflect.DeepEqual(args, []string{"-c", "echo approved"}) {
+		t.Fatalf("unexpected Unix shell invocation: %q %q", shell, args)
 	}
 }

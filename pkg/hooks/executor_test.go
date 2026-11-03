@@ -3,6 +3,7 @@ package hooks
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -147,7 +148,7 @@ func TestExecutorRunSimpleHook(t *testing.T) {
 		Timestamp:    time.Now(),
 	}
 
-	executor := NewExecutor(config, ctx)
+	executor := newApprovedExecutor(t, config, ctx)
 	err := executor.RunPreExport()
 	if err != nil {
 		t.Fatalf("expected hook to succeed, got: %v", err)
@@ -188,7 +189,7 @@ func TestExecutorHookFailure(t *testing.T) {
 		Timestamp:    time.Now(),
 	}
 
-	executor := NewExecutor(config, ctx)
+	executor := newApprovedExecutor(t, config, ctx)
 	err := executor.RunPreExport()
 	if err == nil {
 		t.Error("expected error for failing pre-export hook")
@@ -222,7 +223,7 @@ func TestExecutorHookFailureContinue(t *testing.T) {
 		Timestamp:    time.Now(),
 	}
 
-	executor := NewExecutor(config, ctx)
+	executor := newApprovedExecutor(t, config, ctx)
 	err := executor.RunPostExport()
 	if err != nil {
 		t.Errorf("expected no error with on_error=continue, got: %v", err)
@@ -248,6 +249,9 @@ func TestExecutorHookFailureContinue(t *testing.T) {
 }
 
 func TestExecutorHookTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("timeout fixture uses the Unix sleep command")
+	}
 	config := &Config{
 		Hooks: HooksByPhase{
 			PreExport: []Hook{
@@ -268,7 +272,7 @@ func TestExecutorHookTimeout(t *testing.T) {
 		Timestamp:    time.Now(),
 	}
 
-	executor := NewExecutor(config, ctx)
+	executor := newApprovedExecutor(t, config, ctx)
 	err := executor.RunPreExport()
 	if err == nil {
 		t.Error("expected timeout error")
@@ -289,12 +293,16 @@ func TestExecutorHookTimeout(t *testing.T) {
 }
 
 func TestExecutorEnvironmentVariables(t *testing.T) {
+	command := "echo $BV_EXPORT_PATH $BV_ISSUE_COUNT"
+	if runtime.GOOS == "windows" {
+		command = "echo %BV_EXPORT_PATH% %BV_ISSUE_COUNT%"
+	}
 	config := &Config{
 		Hooks: HooksByPhase{
 			PreExport: []Hook{
 				{
 					Name:    "env-test",
-					Command: "echo $BV_EXPORT_PATH $BV_ISSUE_COUNT",
+					Command: command,
 					Timeout: 5 * time.Second,
 					OnError: "fail",
 				},
@@ -309,7 +317,7 @@ func TestExecutorEnvironmentVariables(t *testing.T) {
 		Timestamp:    time.Now(),
 	}
 
-	executor := NewExecutor(config, ctx)
+	executor := newApprovedExecutor(t, config, ctx)
 	err := executor.RunPreExport()
 	if err != nil {
 		t.Fatalf("expected success, got: %v", err)
@@ -323,15 +331,18 @@ func TestExecutorEnvironmentVariables(t *testing.T) {
 
 func TestExecutorCustomEnvExpansion(t *testing.T) {
 	// Set an env var to be expanded
-	os.Setenv("TEST_HOOK_VAR", "expanded_value")
-	defer os.Unsetenv("TEST_HOOK_VAR")
+	t.Setenv("TEST_HOOK_VAR", "expanded_value")
+	command := "echo $CUSTOM_VAR"
+	if runtime.GOOS == "windows" {
+		command = "echo %CUSTOM_VAR%"
+	}
 
 	config := &Config{
 		Hooks: HooksByPhase{
 			PreExport: []Hook{
 				{
 					Name:    "env-expand",
-					Command: "echo $CUSTOM_VAR",
+					Command: command,
 					Timeout: 5 * time.Second,
 					OnError: "fail",
 					Env: map[string]string{
@@ -349,7 +360,7 @@ func TestExecutorCustomEnvExpansion(t *testing.T) {
 		Timestamp:    time.Now(),
 	}
 
-	executor := NewExecutor(config, ctx)
+	executor := newApprovedExecutor(t, config, ctx)
 	err := executor.RunPreExport()
 	if err != nil {
 		t.Fatalf("expected success, got: %v", err)
@@ -364,17 +375,15 @@ func TestExecutorCustomEnvExpansion(t *testing.T) {
 func TestExecutorScrubsCredentialEnvVars(t *testing.T) {
 	// Credential-looking vars must NOT reach hook subprocesses by default,
 	// since hooks come from project-controlled .bv/hooks.yaml.
-	os.Setenv("BV_TEST_GITHUB_TOKEN", "supersecret")
-	os.Setenv("BV_TEST_AWS_SECRET_THING", "alsosecret")
-	defer os.Unsetenv("BV_TEST_GITHUB_TOKEN")
-	defer os.Unsetenv("BV_TEST_AWS_SECRET_THING")
+	t.Setenv("BV_TEST_GITHUB_TOKEN", "supersecret")
+	t.Setenv("BV_TEST_AWS_SECRET_THING", "alsosecret")
 
 	config := &Config{
 		Hooks: HooksByPhase{
 			PreExport: []Hook{
 				{
 					Name:    "scrub-test",
-					Command: "echo [$BV_TEST_GITHUB_TOKEN][$BV_TEST_AWS_SECRET_THING]",
+					Command: hookEnvEcho("BV_TEST_GITHUB_TOKEN", "BV_TEST_AWS_SECRET_THING"),
 					Timeout: 5 * time.Second,
 					OnError: "fail",
 				},
@@ -382,46 +391,71 @@ func TestExecutorScrubsCredentialEnvVars(t *testing.T) {
 		},
 	}
 
-	executor := NewExecutor(config, ExportContext{ExportPath: "/tmp/t.md", ExportFormat: "markdown", IssueCount: 1, Timestamp: time.Now()})
+	executor := newApprovedExecutor(t, config, ExportContext{ExportPath: "/tmp/t.md", ExportFormat: "markdown", IssueCount: 1, Timestamp: time.Now()})
 	if err := executor.RunPreExport(); err != nil {
 		t.Fatalf("expected success, got: %v", err)
 	}
 
 	got := executor.Results()[0].Stdout
-	if got != "[][]" {
+	if strings.Join(strings.Fields(got), "") != "[][]" {
 		t.Errorf("expected credential env vars to be scrubbed, got %q", got)
 	}
 }
 
-func TestExecutorExplicitCredentialRegrant(t *testing.T) {
-	// A hook can explicitly re-grant a scrubbed credential via its env map.
-	os.Setenv("BV_TEST_REGRANT_TOKEN", "granted")
-	defer os.Unsetenv("BV_TEST_REGRANT_TOKEN")
+// hookEnvEcho prints bracketed values through the native shell. cmd.exe can
+// leave an undefined %NAME% literal in a command, so test absence explicitly.
+func hookEnvEcho(keys ...string) string {
+	commands := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if runtime.GOOS == "windows" {
+			commands = append(commands, "if defined "+key+" (echo [%"+key+"%]) else (echo [])")
+		} else {
+			commands = append(commands, "printf '[%s]\\n' \"$"+key+"\"")
+		}
+	}
+	if runtime.GOOS == "windows" {
+		return strings.Join(commands, " & ")
+	}
+	return strings.Join(commands, "; ")
+}
 
-	config := &Config{
-		Hooks: HooksByPhase{
-			PreExport: []Hook{
-				{
-					Name:    "regrant-test",
-					Command: "echo $HOOK_TOKEN",
-					Timeout: 5 * time.Second,
-					OnError: "fail",
-					Env: map[string]string{
-						"HOOK_TOKEN": "${BV_TEST_REGRANT_TOKEN}",
-					},
+func TestExecutorCredentialGrantRequiresInvokingUser(t *testing.T) {
+	t.Setenv("BV_TEST_REGRANT_TOKEN", "granted")
+	t.Setenv("BV_TEST_OTHER_SECRET", "withheld")
+	for _, tc := range []struct {
+		name   string
+		grants []string
+		want   string
+	}{
+		{name: "project env cannot regrant", want: "[][][][]"},
+		{name: "granting alias cannot recover source", grants: []string{"BV_TEST_A_ALIAS"}, want: "[][][][]"},
+		{name: "explicit source grant", grants: []string{"BV_TEST_REGRANT_TOKEN"}, want: "[granted][granted][granted][]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := &Config{Hooks: HooksByPhase{PreExport: []Hook{{
+				Name:    "credential-grant",
+				Command: hookEnvEcho("BV_TEST_REGRANT_TOKEN", "BV_TEST_A_ALIAS", "BV_TEST_B_CHAIN", "BV_TEST_Z_OTHER"),
+				Timeout: 5 * time.Second,
+				OnError: "fail",
+				Env: map[string]string{
+					"BV_TEST_REGRANT_TOKEN": "${BV_TEST_REGRANT_TOKEN}",
+					"BV_TEST_A_ALIAS":       "${BV_TEST_REGRANT_TOKEN}",
+					"BV_TEST_B_CHAIN":       "${BV_TEST_A_ALIAS}",
+					"BV_TEST_Z_OTHER":       "${BV_TEST_OTHER_SECRET}",
 				},
-			},
-		},
-	}
-
-	executor := NewExecutor(config, ExportContext{ExportPath: "/tmp/t.md", ExportFormat: "markdown", IssueCount: 1, Timestamp: time.Now()})
-	if err := executor.RunPreExport(); err != nil {
-		t.Fatalf("expected success, got: %v", err)
-	}
-
-	got := executor.Results()[0].Stdout
-	if got != "granted" {
-		t.Errorf("expected explicit re-grant to expand, got %q", got)
+			}}}}
+			executor := newApprovedExecutor(t, config, ExportContext{}, tc.grants...)
+			if err := executor.RunPreExport(); err != nil {
+				t.Fatalf("approved hook failed: %v", err)
+			}
+			results := executor.Results()
+			if len(results) != 1 || !results[0].Success {
+				t.Fatalf("expected one successful hook subprocess, got %+v", results)
+			}
+			if got := strings.Join(strings.Fields(results[0].Stdout), ""); got != tc.want {
+				t.Fatalf("hook subprocess received %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -469,7 +503,7 @@ func TestExecutorSummary(t *testing.T) {
 		Timestamp:    time.Now(),
 	}
 
-	executor := NewExecutor(config, ctx)
+	executor := newApprovedExecutor(t, config, ctx)
 	_ = executor.RunPreExport()
 	_ = executor.RunPostExport()
 
@@ -626,7 +660,7 @@ func TestRunPreExportStopsOnFail(t *testing.T) {
 		},
 	}
 
-	executor := NewExecutor(config, ExportContext{})
+	executor := newApprovedExecutor(t, config, ExportContext{})
 	err := executor.RunPreExport()
 	if err == nil {
 		t.Fatal("expected error from failing pre-export hook")
@@ -651,7 +685,7 @@ func TestRunPostExportFailOnErrorStillRunsAll(t *testing.T) {
 		},
 	}
 
-	executor := NewExecutor(config, ExportContext{})
+	executor := newApprovedExecutor(t, config, ExportContext{})
 	err := executor.RunPostExport()
 	if err == nil {
 		t.Fatal("expected error for post-export hook with on_error=fail")
@@ -732,7 +766,7 @@ func TestExecutorCommandNotFound(t *testing.T) {
 		},
 	}
 
-	exec := NewExecutor(config, ExportContext{})
+	exec := newApprovedExecutor(t, config, ExportContext{})
 	err := exec.RunPreExport()
 	if err == nil {
 		t.Fatalf("expected error for missing command")
@@ -747,6 +781,9 @@ func TestExecutorCommandNotFound(t *testing.T) {
 }
 
 func TestExecutorPermissionDenied(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture exercises Unix execute permission bits")
+	}
 	tmp := t.TempDir()
 	script := filepath.Join(tmp, "script.sh")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\necho nope\n"), 0644); err != nil {
@@ -761,7 +798,7 @@ func TestExecutorPermissionDenied(t *testing.T) {
 		},
 	}
 
-	exec := NewExecutor(config, ExportContext{})
+	exec := newApprovedExecutor(t, config, ExportContext{})
 	err := exec.RunPreExport()
 	if err == nil {
 		t.Fatalf("expected permission error")
@@ -773,12 +810,17 @@ func TestExecutorPermissionDenied(t *testing.T) {
 }
 
 func TestExecutorLargeStderrTruncatedInSummary(t *testing.T) {
+	separator := "; "
+	if runtime.GOOS == "windows" {
+		separator = " & "
+	}
+	command := "echo " + strings.Repeat("0", 300) + " 1>&2" + separator + "exit 1"
 	config := &Config{
 		Hooks: HooksByPhase{
 			PostExport: []Hook{
 				{
 					Name:    "noisy",
-					Command: "printf '%0300d' 0 1>&2; exit 1",
+					Command: command,
 					OnError: "continue",
 					Timeout: time.Second,
 				},
@@ -786,7 +828,7 @@ func TestExecutorLargeStderrTruncatedInSummary(t *testing.T) {
 		},
 	}
 
-	exec := NewExecutor(config, ExportContext{})
+	exec := newApprovedExecutor(t, config, ExportContext{})
 	_ = exec.RunPostExport()
 
 	summary := exec.Summary()

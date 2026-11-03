@@ -41,7 +41,11 @@ hooks:
 `)
 
 	ctx := ExportContext{ExportPath: "out.md", ExportFormat: "markdown", IssueCount: 1, Timestamp: time.Now()}
-	exec, err := RunHooks(tmp, ctx, false)
+	loader := NewLoader(WithProjectDir(tmp))
+	if err := loader.Load(); err != nil {
+		t.Fatalf("load hooks for approval: %v", err)
+	}
+	exec, err := RunHooks(tmp, ctx, false, approvedOptions(t, loader.Config()))
 	if err != nil {
 		t.Fatalf("RunHooks returned error: %v", err)
 	}
@@ -49,7 +53,7 @@ hooks:
 		t.Fatalf("expected executor when hooks present")
 	}
 
-	// Config() should return same pointer after load
+	// Execution retains a private copy of the approved configuration.
 	if exec.config == nil || len(exec.config.Hooks.PreExport) != 1 {
 		t.Fatalf("executor config not initialized correctly")
 	}
@@ -83,7 +87,7 @@ func TestRunPostExportFailStopsOnFail(t *testing.T) {
 		{Name: "skip", Command: "echo ok", Timeout: 200 * time.Millisecond, OnError: "continue"},
 	}}}
 
-	exec := NewExecutor(config, ExportContext{})
+	exec := newApprovedExecutor(t, config, ExportContext{})
 	err := exec.RunPostExport()
 	if err == nil {
 		t.Fatalf("expected error when post-export hook fails with on_error=fail")

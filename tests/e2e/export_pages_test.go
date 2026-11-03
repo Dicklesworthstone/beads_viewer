@@ -735,6 +735,7 @@ func TestExportPages_IncludesHistoryAndRunsHooks(t *testing.T) {
 		"--export-pages", exportDir,
 		"--pages-include-history",
 		"--pages-include-closed",
+		"--trust-hooks", reviewedHookDigest(t, repoDir),
 	)
 	cmd.Dir = repoDir
 	out, err := cmd.CombinedOutput()

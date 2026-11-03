@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"runtime"
-	"sort"
 	"strings"
 	"time"
 )
@@ -25,20 +25,61 @@ type HookResult struct {
 
 // Executor runs hooks with proper environment and timeout handling
 type Executor struct {
-	config  *Config
-	context ExportContext
-	results []HookResult
-	logger  func(string)
+	config           *Config
+	context          ExportContext
+	results          []HookResult
+	logger           func(string)
+	allowEnv         []string
+	authorizationErr error
 }
 
-// NewExecutor creates a new hook executor
-func NewExecutor(config *Config, ctx ExportContext) *Executor {
-	return &Executor{
-		config:  config,
+// NewExecutor freezes the supplied configuration and requires explicit approval
+// before either phase can run. Omitting options denies execution of all hooks.
+func NewExecutor(config *Config, ctx ExportContext, options ...ExecutionOptions) *Executor {
+	e := &Executor{
+		config:  cloneConfig(config),
 		context: ctx,
 		results: make([]HookResult, 0),
 		logger:  func(string) {}, // No-op default
 	}
+	var opts ExecutionOptions
+	if len(options) > 1 {
+		e.authorizationErr = fmt.Errorf("expected at most one hook execution policy")
+		return e
+	}
+	if len(options) == 1 {
+		opts = options[0]
+	}
+	e.allowEnv = append([]string(nil), opts.AllowEnv...)
+	if err := e.config.authorize(opts.TrustDigest); err != nil {
+		e.authorizationErr = err
+		return e
+	}
+	if !e.config.hasHooks() {
+		return e
+	}
+	if err := validateEnvGrants(e.allowEnv); err != nil {
+		e.authorizationErr = err
+		return e
+	}
+	// Validate every declaration before running any hook. An invalid post-hook
+	// must not allow a pre-hook to run, even with on_error: continue.
+	for _, phase := range [][]Hook{e.config.Hooks.PreExport, e.config.Hooks.PostExport} {
+		for _, hook := range phase {
+			if err := validateHookEnv(hook.Env, runtime.GOOS == "windows"); err != nil {
+				e.authorizationErr = fmt.Errorf("hook %q: %w", hook.Name, err)
+				return e
+			}
+		}
+	}
+	if e.config.projectDir == "" {
+		var err error
+		e.config.projectDir, err = os.Getwd()
+		if err != nil {
+			e.authorizationErr = fmt.Errorf("resolving hook working directory: %w", err)
+		}
+	}
+	return e
 }
 
 // SetLogger sets the logger function for hook execution details
@@ -53,12 +94,15 @@ func (e *Executor) SetLogger(logger func(string)) {
 // RunPreExport executes all pre-export hooks
 // Returns error if any hook fails with on_error="fail"
 func (e *Executor) RunPreExport() error {
+	if e.authorizationErr != nil {
+		return e.authorizationErr
+	}
 	if e.config == nil {
 		return nil
 	}
 
 	for _, hook := range e.config.Hooks.PreExport {
-		e.logger(fmt.Sprintf("Running pre-export hook %q: %s", hook.Name, hook.Command))
+		e.logger(fmt.Sprintf("Running pre-export hook %q: %q", hook.Name, hook.Command))
 		result := e.runHook(hook, PreExport)
 		e.results = append(e.results, result)
 
@@ -73,13 +117,16 @@ func (e *Executor) RunPreExport() error {
 // RunPostExport executes all post-export hooks
 // Errors are logged but don't fail (unless on_error="fail")
 func (e *Executor) RunPostExport() error {
+	if e.authorizationErr != nil {
+		return e.authorizationErr
+	}
 	if e.config == nil {
 		return nil
 	}
 
 	var firstError error
 	for _, hook := range e.config.Hooks.PostExport {
-		e.logger(fmt.Sprintf("Running post-export hook %q: %s", hook.Name, hook.Command))
+		e.logger(fmt.Sprintf("Running post-export hook %q: %q", hook.Name, hook.Command))
 		result := e.runHook(hook, PostExport)
 		e.results = append(e.results, result)
 
@@ -91,12 +138,13 @@ func (e *Executor) RunPostExport() error {
 	return firstError
 }
 
-// getShellCommand returns the shell and flag to use for executing commands
-func getShellCommand() (string, string) {
-	if runtime.GOOS == "windows" {
-		return "cmd", "/C"
+// shellInvocation preserves the approved command as one argument. On Windows,
+// /D suppresses registry AutoRun commands before the approved hook executes.
+func shellInvocation(platform, command string) (string, []string) {
+	if platform == "windows" {
+		return "cmd", []string{"/D", "/C", command}
 	}
-	return "sh", "-c"
+	return "sh", []string{"-c", command}
 }
 
 // runHook executes a single hook with timeout and environment
@@ -104,6 +152,11 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 	result := HookResult{
 		Hook:  hook,
 		Phase: phase,
+	}
+	result.Hook.Env = maps.Clone(hook.Env)
+	if e.authorizationErr != nil {
+		result.Error = e.authorizationErr
+		return result
 	}
 
 	start := time.Now()
@@ -117,42 +170,17 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 	defer cancel()
 
 	// Create command - use shell to interpret the command
-	shell, flag := getShellCommand()
-	cmd := exec.CommandContext(ctx, shell, flag, hook.Command)
+	shell, args := shellInvocation(runtime.GOOS, hook.Command)
+	cmd := exec.CommandContext(ctx, shell, args...)
+	cmd.Dir = e.config.projectDir
 
-	// Build environment.
-	// The full (unfiltered) environment is used only for ${VAR} expansion in
-	// hook-specific env declarations; the subprocess itself gets a scrubbed
-	// environment with credential-bearing variables removed. Hooks live in the
-	// project's .bv/hooks.yaml, which may come from an untrusted repository, so
-	// ambient tokens must not leak into them by default. A hook that
-	// legitimately needs a credential can re-grant it explicitly, e.g.:
-	//   env:
-	//     GITHUB_TOKEN: "${GITHUB_TOKEN}"
-	fullEnv := append(os.Environ(), e.context.ToEnv()...)
-	cmd.Env = scrubEnviron(os.Environ())
-
-	// Add export context variables
-	cmd.Env = append(cmd.Env, e.context.ToEnv()...)
-
-	// Add hook-specific env vars (with ${VAR} expansion from current env)
-	// Sort keys for deterministic environment order
-	envKeys := make([]string, 0, len(hook.Env))
-	for k := range hook.Env {
-		envKeys = append(envKeys, k)
-	}
-	sort.Strings(envKeys)
-
-	expansionEnv := fullEnv
-	for _, key := range envKeys {
-		value := hook.Env[key]
-		// Use custom expansion that sees both OS env and context variables,
-		// including scrubbed credentials (explicit re-grant by the hook author),
-		// plus hook env vars declared earlier in sorted order.
-		expandedValue := expandEnv(value, expansionEnv)
-		pair := fmt.Sprintf("%s=%s", key, expandedValue)
-		cmd.Env = append(cmd.Env, pair)
-		expansionEnv = append(expansionEnv, pair)
+	// Expansion and execution see the same filtered environment. Only a grant
+	// supplied by the invoking user can restore a protected parent variable.
+	var err error
+	cmd.Env, err = buildHookEnvironment(os.Environ(), e.context.ToEnv(), hook.Env, e.allowEnv, runtime.GOOS == "windows")
+	if err != nil {
+		result.Error = err
+		return result
 	}
 
 	// Capture output
@@ -161,7 +189,7 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 	cmd.Stderr = &stderr
 
 	// Run the command
-	err := cmd.Run()
+	err = cmd.Run()
 	result.Duration = time.Since(start)
 	result.Stdout = strings.TrimSpace(stdout.String())
 	result.Stderr = strings.TrimSpace(stderr.String())
@@ -182,8 +210,7 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 
 // sensitiveEnvMarkers are substrings that, when present in an (upper-cased)
 // environment variable name, mark it as credential-bearing. Matching variables
-// are stripped from hook subprocess environments; see runHook for the explicit
-// re-grant mechanism.
+// are withheld unless the invoking user explicitly grants the source variable.
 var sensitiveEnvMarkers = []string{
 	"TOKEN",
 	"SECRET",
@@ -217,38 +244,13 @@ func isSensitiveEnvKey(key string) bool {
 	return false
 }
 
-// scrubEnviron returns a copy of env with credential-bearing variables removed.
-func scrubEnviron(env []string) []string {
-	scrubbed := make([]string, 0, len(env))
-	for _, kv := range env {
-		key, _, ok := strings.Cut(kv, "=")
-		if ok && isSensitiveEnvKey(key) {
-			continue
-		}
-		scrubbed = append(scrubbed, kv)
-	}
-	return scrubbed
-}
-
-// expandEnv replaces ${VAR} or $VAR in the string using values from the env slice
-// Note: This only supports standard shell variable expansion. It does not support
-// complex shell parameter expansion like ${VAR:-default} or ${VAR:offset}.
-func expandEnv(s string, env []string) string {
-	return os.Expand(s, func(key string) string {
-		// Search env slice from end to beginning (to respect precedence if duplicates exist)
-		prefix := key + "="
-		for i := len(env) - 1; i >= 0; i-- {
-			if strings.HasPrefix(env[i], prefix) {
-				return env[i][len(prefix):]
-			}
-		}
-		return ""
-	})
-}
-
 // Results returns all hook execution results
 func (e *Executor) Results() []HookResult {
-	return e.results
+	results := append([]HookResult(nil), e.results...)
+	for i := range results {
+		results[i].Hook.Env = maps.Clone(results[i].Hook.Env)
+	}
+	return results
 }
 
 // Summary returns a human-readable summary of hook execution
@@ -293,7 +295,7 @@ func truncate(s string, max int) string {
 }
 
 // RunHooks is a convenience function that runs all hooks for an export operation
-func RunHooks(projectDir string, ctx ExportContext, noHooks bool) (*Executor, error) {
+func RunHooks(projectDir string, ctx ExportContext, noHooks bool, options ...ExecutionOptions) (*Executor, error) {
 	if noHooks {
 		return nil, nil
 	}
@@ -307,6 +309,9 @@ func RunHooks(projectDir string, ctx ExportContext, noHooks bool) (*Executor, er
 		return nil, nil
 	}
 
-	executor := NewExecutor(loader.Config(), ctx)
+	executor := NewExecutor(loader.Config(), ctx, options...)
+	if executor.authorizationErr != nil {
+		return nil, executor.authorizationErr
+	}
 	return executor, nil
 }

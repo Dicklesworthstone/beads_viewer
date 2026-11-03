@@ -22,6 +22,8 @@
 | `--export-template` | string | (empty) | Markdown template path; explicit empty disables a recipe template | Export & Reporting |
 | `--graph-preset` | string | `compact` | Graph layout preset: compact (default) or roomy | Export & Reporting |
 | `--graph-title` | string | (empty) | Title for graph export (default: project name) | Export & Reporting |
+| `--hook-env` | stringArray | `[]` | Grant an approved hook a parent environment variable by name (repeatable; never NAME=value) | Export & Reporting |
+| `--hooks-info` | bool | `false` | Inspect project hooks and their approval digest as JSON without executing them | Export & Reporting |
 | `--no-hooks` | bool | `false` | Skip running hooks during export | Export & Reporting |
 | `--no-live-reload` | bool | `false` | Disable live-reload in preview mode | Export & Reporting |
 | `--pages` | bool | `false` | Launch interactive Pages deployment wizard | Export & Reporting |
@@ -32,6 +34,7 @@
 | `--priority-brief` | string | (empty) | Export priority brief to Markdown file (e.g., brief.md) | Export & Reporting |
 | `--script-format` | string | `bash` | Script format: bash, fish, or zsh (use with --emit-script) | Export & Reporting |
 | `--script-limit` | int | `5` | Limit number of items in emitted script (use with --emit-script) | Export & Reporting |
+| `--trust-hooks` | string | (empty) | Approve the exact digest from --hooks-info for this export invocation | Export & Reporting |
 | `--watch-export` | bool | `false` | Watch for beads changes and auto-regenerate export (use with --export-pages) | Export & Reporting |
 | `--background-mode` | bool | `false` | Enable experimental background snapshot loading (TUI only) | General Flags |
 | `--check-update` | bool | `false` | Check if a new version is available | General Flags |

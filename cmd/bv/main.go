@@ -163,6 +163,9 @@ var rootHelpSections = []flagHelpSection{
 				"export-template",
 				"export-md",
 				"no-hooks",
+				"hooks-info",
+				"trust-hooks",
+				"hook-env",
 				"export-graph",
 				"graph-preset",
 				"graph-title",
@@ -1013,7 +1016,7 @@ func hasNonRobotPrimaryArg(args []string) bool {
 	for _, arg := range args {
 		name := strings.TrimPrefix(strings.SplitN(arg, "=", 2)[0], "--")
 		switch name {
-		case "version", "help", "check-update", "update", "update-dry-run", "rollback", "pages", "export-pages", "preview-pages", "export", "export-md", "export-graph":
+		case "version", "help", "check-update", "update", "update-dry-run", "rollback", "pages", "export-pages", "preview-pages", "export", "export-md", "export-graph", "hooks-info":
 			return true
 		}
 	}
@@ -1543,6 +1546,9 @@ func main() {
 	profileStartup := flag.Bool("profile-startup", false, "Output detailed startup timing profile for diagnostics")
 	profileJSON := flag.Bool("profile-json", false, "Output profile in JSON format (use with --profile-startup)")
 	noHooks := flag.Bool("no-hooks", false, "Skip running hooks during export")
+	hooksInfo := flag.Bool("hooks-info", false, "Inspect project hooks and their approval digest as JSON without executing them")
+	trustHooks := flag.String("trust-hooks", "", "Approve the exact digest from --hooks-info for this export invocation")
+	hookEnv := flag.StringArray("hook-env", nil, "Grant an approved hook a parent environment variable by name (repeatable; never NAME=value)")
 	workspaceConfig := flag.String("workspace", "", "Load issues from workspace config file (.bv/workspace.yaml)")
 	repoFilter := flag.String("repo", "", "Filter issues by repository prefix (e.g., 'api-' or 'api')")
 	saveBaseline := flag.String("save-baseline", "", "Save current metrics as baseline with optional description")
@@ -1790,6 +1796,8 @@ func main() {
 		}
 
 		modifierRules := []modifierFlagRule{
+			{modifier: "trust-hooks", requires: []string{"export", "export-md", "export-pages"}},
+			{modifier: "hook-env", requires: []string{"export", "export-md", "export-pages"}},
 			{modifier: "export-format", requires: []string{"export", "export-md"}},
 			{modifier: "export-include-graph", requires: []string{"export", "export-md"}},
 			{modifier: "export-template", requires: []string{"export", "export-md"}},
@@ -1911,6 +1919,23 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Error: --watch-export cannot be combined with --as-of; omit --watch-export to export a fixed historical snapshot.")
 			os.Exit(1)
 		}
+
+		// Inspection is deliberately independent of issue loading and never
+		// expands YAML values against the invoking user's environment.
+		if *hooksInfo {
+			hookLoader := hooks.NewLoader()
+			if err := hookLoader.Load(); err != nil {
+				return fmt.Errorf("inspecting hooks: %w", err)
+			}
+			inspection, err := hookLoader.Inspect()
+			if err != nil {
+				return err
+			}
+			encoder := json.NewEncoder(os.Stdout)
+			encoder.SetIndent("", "  ")
+			return encoder.Encode(inspection)
+		}
+		hookOptions := hooks.ExecutionOptions{TrustDigest: *trustHooks, AllowEnv: *hookEnv}
 
 		// CPU profiling support
 		var stopCPUProfile func()
@@ -3091,32 +3116,23 @@ func main() {
 					fmt.Printf("  → Filtering to %d open issues\n", len(exportIssues))
 				}
 
-				// Load and run pre-export hooks (bv-qjc.3)
-				cwd, cwdErr := os.Getwd()
-				if cwdErr != nil {
-					fmt.Fprintf(os.Stderr, "Warning: could not get working directory for hooks: %v\n", cwdErr)
+				// Each watch iteration reloads and verifies the same user-supplied
+				// digest before executing either phase or writing the bundle.
+				pagesExecutor, err := hooks.RunHooks("", hooks.ExportContext{
+					ExportPath:   *exportPages,
+					ExportFormat: "html",
+					IssueCount:   len(exportIssues),
+					Timestamp:    time.Now(),
+				}, *noHooks, hookOptions)
+				if err != nil {
+					return err
 				}
-				var pagesExecutor *hooks.Executor
-				if !*noHooks {
-					hookLoader := hooks.NewLoader(hooks.WithProjectDir(cwd))
-					if err := hookLoader.Load(); err != nil {
-						fmt.Printf("  → Warning: failed to load hooks: %v\n", err)
-					} else if hookLoader.HasHooks() {
-						fmt.Println("  → Running pre-export hooks...")
-						ctx := hooks.ExportContext{
-							ExportPath:   *exportPages,
-							ExportFormat: "html",
-							IssueCount:   len(exportIssues),
-							Timestamp:    time.Now(),
-						}
-						pagesExecutor = hooks.NewExecutor(hookLoader.Config(), ctx)
-						pagesExecutor.SetLogger(func(msg string) {
-							fmt.Printf("  → %s\n", msg)
-						})
-
-						if err := pagesExecutor.RunPreExport(); err != nil {
-							return fmt.Errorf("pre-export hook failed: %w", err)
-						}
+				if pagesExecutor != nil {
+					pagesExecutor.SetLogger(func(msg string) {
+						fmt.Printf("  → %s\n", msg)
+					})
+					if err := pagesExecutor.RunPreExport(); err != nil {
+						return fmt.Errorf("pre-export hook failed: %w", err)
 					}
 				}
 
@@ -4217,33 +4233,22 @@ func main() {
 			}
 			fmt.Printf("Exporting %d issues to %s...\n", len(reportIssues), reportPath)
 
-			// Load and run pre-export hooks
-			cwd, cwdErr := os.Getwd()
-			if cwdErr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not get working directory for hooks: %v\n", cwdErr)
+			// Authorization errors always fail closed, regardless of on_error.
+			executor, err := hooks.RunHooks("", hooks.ExportContext{
+				ExportPath:   reportPath,
+				ExportFormat: options.Format,
+				IssueCount:   len(reportIssues),
+				Timestamp:    options.GeneratedAt,
+			}, *noHooks, hookOptions)
+			if err != nil {
+				return err
 			}
-			var executor *hooks.Executor
-			if !*noHooks {
-				hookLoader := hooks.NewLoader(hooks.WithProjectDir(cwd))
-				if err := hookLoader.Load(); err != nil {
-					fmt.Printf("Warning: failed to load hooks: %v\n", err)
-				} else if hookLoader.HasHooks() {
-					ctx := hooks.ExportContext{
-						ExportPath:   reportPath,
-						ExportFormat: options.Format,
-						IssueCount:   len(reportIssues),
-						Timestamp:    options.GeneratedAt,
-					}
-					executor = hooks.NewExecutor(hookLoader.Config(), ctx)
-					executor.SetLogger(func(msg string) {
-						fmt.Printf("  → %s\n", msg)
-					})
-
-					// Run pre-export hooks
-					if err := executor.RunPreExport(); err != nil {
-						fmt.Printf("Error: pre-export hook failed: %v\n", err)
-						os.Exit(1)
-					}
+			if executor != nil {
+				executor.SetLogger(func(msg string) {
+					fmt.Printf("  → %s\n", msg)
+				})
+				if err := executor.RunPreExport(); err != nil {
+					return fmt.Errorf("pre-export hook failed: %w", err)
 				}
 			}
 

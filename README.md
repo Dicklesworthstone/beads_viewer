@@ -185,9 +185,40 @@ Don't just read the title. `bv` gives you the full picture:
 *   **Time-Travel:** Press `t` to compare against any git revision, or `T` for quick HEAD~5 comparison. Combined with History view (`h`), you can navigate to any commit and see exactly what changed.
 
 ### 🔌 Automation Hooks
-Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, notifications, or uploads. Report exports (`--export` / `--export-md`) and Pages exports run configured hooks; pass `--no-hooks` to skip them for one export. Defaults: pre-export hooks fail fast on errors (`on_error: fail`), post-export hooks log and continue (`on_error: continue`). A post-export hook declared `on_error: fail` makes the export exit 1 even though the bundle has already been written. Empty commands are ignored with a warning for safety. Hook env includes `BV_EXPORT_PATH`, `BV_EXPORT_FORMAT`, `BV_ISSUE_COUNT`, `BV_TIMESTAMP`, plus any custom `env` entries.
 
-**Security:** hooks are shell commands defined by the project you are exporting, so treat `.bv/hooks.yaml` in an unfamiliar repository as untrusted code and review it before exporting (or pass `--no-hooks`). To limit blast radius, bv strips credential-bearing environment variables (names containing `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, `PRIVATE_KEY`, etc., plus `SSH_AUTH_SOCK`) from hook subprocesses. A hook that legitimately needs one must re-grant it explicitly, e.g. `env: { GITHUB_TOKEN: "${GITHUB_TOKEN}" }`.
+Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, notifications, or uploads. **Project hooks require explicit approval by the invoking user.** Report exports (`--export` / `--export-md`) and direct Pages exports (`--export-pages`) fail before running hooks or writing the export when configured hooks have not been approved. Projects without hooks export normally. To export without running any project hooks, pass `--no-hooks`; this also bypasses hook configuration parsing, so it works with invalid YAML.
+
+Review the hooks from the project directory before approving them:
+
+```bash
+# Inspect only: prints JSON; does not run hooks or export anything.
+bv --hooks-info
+
+# After review, replace this placeholder with the complete digest from that output.
+bv --export-md report.md --trust-hooks 'sha256:REVIEWED_64_HEX_DIGEST'
+
+# The same approval mechanism works for direct Pages exports and CI.
+bv --export-pages ./bv-pages --trust-hooks 'sha256:REVIEWED_64_HEX_DIGEST'
+```
+
+`--hooks-info` shows the canonical project directory, configuration file path, execution platform, exact commands, declared environment values, normalized timeouts and error policies, warnings, and a `digest`. Environment declarations are shown without expanding values from your process. Review both hook phases and the scripts or programs they invoke. The digest covers the YAML bytes, effective hook configuration, execution platform, and trust-policy version. Changes to commands, environment declarations, ordering, timeouts, error policies, or even YAML comments invalidate the previous digest.
+
+`--trust-hooks` authorizes only the current invocation. It creates no persistent approval file and has no project-YAML or environment-variable equivalent. `--yes` does not approve hooks, and noninteractive exports never prompt for approval. For automation, keep the reviewed, fixed digest in configuration controlled by the invoking user, and supply it explicitly on each run. Do not automatically compute the current digest and immediately pass it back as approval: that would approve any newly introduced commands without review. The digest does not include the checkout's absolute path, so a reviewed digest can be reused explicitly in ephemeral CI checkouts on the same platform. With `--watch-export`, each export checks the newly loaded hooks against the same fixed digest; changed hooks require a fresh invocation with renewed approval.
+
+**Credential grants are separate from hook approval.** bv strips credential-bearing environment variables (names containing `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, `PRIVATE_KEY`, etc., plus `SSH_AUTH_SOCK`) from hook subprocesses. Hook YAML cannot restore these values, including through renamed variables or chains of `${VAR}` expansions. A hook that needs a parent-process credential requires an explicit invoking-user grant:
+
+```bash
+# Grant only the named variable already present in the invoking process environment.
+bv --export-pages ./bv-pages \
+  --trust-hooks 'sha256:REVIEWED_64_HEX_DIGEST' \
+  --hook-env GITHUB_TOKEN
+```
+
+Repeat `--hook-env NAME` to grant additional variables; supply names, never `NAME=value` assignments or wildcards. Grants apply to all approved hooks in this invocation and do not themselves authorize hooks. YAML `env` entries remain useful for literal values and `$VAR`/`${VAR}` expansion, but expansion sees only the filtered environment, user-granted variables, export context, and earlier entries in sorted key order. Environment name matching follows the platform: case-sensitive on Unix and case-insensitive on Windows. Hook context still provides `BV_EXPORT_PATH`, `BV_EXPORT_FORMAT`, `BV_ISSUE_COUNT`, and `BV_TIMESTAMP`.
+
+Approved hooks retain shell command syntax, timeouts, and failure policies. By default, pre-export hooks fail fast on errors (`on_error: fail`), while post-export hooks log and continue (`on_error: continue`). A post-export hook declared `on_error: fail` makes the export exit 1 even though the output has already been written. Empty commands are omitted; `--hooks-info` reports normalization warnings. `--no-hooks` takes precedence over approval and credential grants.
+
+**Approval permits arbitrary code execution with your operating-system privileges.** Environment filtering is not a sandbox: an approved hook can access files, launch programs, and use the network. The digest approves hook declarations, not the transitive contents of referenced scripts or executables. Review changes to those dependencies before running approved hooks again. The interactive `--pages` wizard, TUI exports, and robot analysis do not run this hook pipeline.
 
 ---
 
@@ -1124,9 +1155,11 @@ Report bodies retain recipe membership, ordering, and `max_items`. Graphs also
 include recursively referenced dependency context, without adding those issue
 bodies to the report. JSON reports preserve source completeness and provenance
 alongside selected issues and their verified action routes. An explicit
-`SOURCE_DATE_EPOCH` fixes the generation time for reproducible reports. Pre-export
-hooks run before writing; post-export hooks run afterward, including their
-configured failure policy.
+`SOURCE_DATE_EPOCH` fixes the generation time for reproducible reports. Approved
+pre-export hooks run before writing; approved post-export hooks run afterward,
+including their configured failure policy. Configured hooks require
+`--trust-hooks` with the reviewed digest, or `--no-hooks` to skip them; see
+[Automation Hooks](#-automation-hooks).
 
 `export.template` and `--export-template PATH` read a Markdown template relative
 to the working directory. Templates receive `.Title`, `.GeneratedAt`, `.Issues`,
@@ -2821,6 +2854,12 @@ bv --export-pages ./bv-pages --no-hooks                     # Skip .bv/hooks.yam
 bv --preview-pages ./bv-pages                   # Serve at localhost:9000 (or next available port)
 ```
 
+If `.bv/hooks.yaml` defines hooks, direct exports require `--trust-hooks` with
+the digest reviewed through `bv --hooks-info`, or `--no-hooks` to skip them.
+This also applies to noninteractive and watch exports. A changed hook
+configuration is rejected on the next export until explicitly approved again;
+see [Automation Hooks](#-automation-hooks) for credential grants and CI usage.
+
 Direct exports apply recipe filters and their complete sort chain before
 `view.max_items` chooses the exported issues. Recipe membership intersects
 `--repo` and `--label`; dependency readiness and recipe ranking still use the
@@ -3166,6 +3205,8 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--export-template` | string | (empty) | Markdown template path; explicit empty disables a recipe template | Export & Reporting |
 | `--graph-preset` | string | `compact` | Graph layout preset: compact (default) or roomy | Export & Reporting |
 | `--graph-title` | string | (empty) | Title for graph export (default: project name) | Export & Reporting |
+| `--hook-env` | stringArray | `[]` | Grant an approved hook a parent environment variable by name (repeatable; never NAME=value) | Export & Reporting |
+| `--hooks-info` | bool | `false` | Inspect project hooks and their approval digest as JSON without executing them | Export & Reporting |
 | `--no-hooks` | bool | `false` | Skip running hooks during export | Export & Reporting |
 | `--no-live-reload` | bool | `false` | Disable live-reload in preview mode | Export & Reporting |
 | `--pages` | bool | `false` | Launch interactive Pages deployment wizard | Export & Reporting |
@@ -3176,6 +3217,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--priority-brief` | string | (empty) | Export priority brief to Markdown file (e.g., brief.md) | Export & Reporting |
 | `--script-format` | string | `bash` | Script format: bash, fish, or zsh (use with --emit-script) | Export & Reporting |
 | `--script-limit` | int | `5` | Limit number of items in emitted script (use with --emit-script) | Export & Reporting |
+| `--trust-hooks` | string | (empty) | Approve the exact digest from --hooks-info for this export invocation | Export & Reporting |
 | `--watch-export` | bool | `false` | Watch for beads changes and auto-regenerate export (use with --export-pages) | Export & Reporting |
 | `--background-mode` | bool | `false` | Enable experimental background snapshot loading (TUI only) | General Flags |
 | `--check-update` | bool | `false` | Check if a new version is available | General Flags |
@@ -4429,7 +4471,9 @@ Copyright (c) 2026 Jeffrey Emanuel
 
 ## 🔒 Security & Privacy Notes
 - Local-first: all analysis happens on your repo's JSONL; no network required for robots.
-- Exports run only when you ask for them. Report exports (`--export` / `--export-md`) and Pages exports can run configured pre/post-export hooks from `.bv/hooks.yaml` (`--no-hooks` skips them, and credential-bearing environment variables are scrubbed from hook subprocesses). Merely starting `bv` or running a robot analysis does not run export hooks. Update checks are silent and tolerate network failures without impacting startup.
+- Exports run only when you ask for them. Project hooks are denied by default: report exports (`--export` / `--export-md`) and direct Pages exports (`--export-pages`) require explicit `--trust-hooks` approval of the reviewed configuration digest. `--no-hooks` bypasses the hook pipeline entirely. Merely starting `bv` or running a robot analysis does not run export hooks.
+- Hook credentials require separate invoking-user `--hook-env NAME` grants. Project YAML cannot restore scrubbed parent-process credentials through environment expansion or aliases. Approved shell commands still have your operating-system privileges; filtering is not a sandbox, and configuration approval does not freeze scripts they invoke. See [Automation Hooks](#-automation-hooks).
+- Update checks are silent and tolerate network failures without impacting startup.
 
 ---
 
