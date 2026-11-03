@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,7 @@ const (
 type Hook struct {
 	Name    string            `yaml:"name" json:"name"`                             // Human-readable name
 	Command string            `yaml:"command" json:"command"`                       // Shell command to run
+	Argv    []string          `yaml:"argv,omitempty" json:"argv,omitempty"`         // Literal program and arguments; mutually exclusive with Command
 	Timeout time.Duration     `yaml:"timeout,omitempty" json:"timeout,omitempty"`   // Execution timeout (default: 30s)
 	Env     map[string]string `yaml:"env,omitempty" json:"env,omitempty"`           // Additional environment variables
 	OnError string            `yaml:"on_error,omitempty" json:"on_error,omitempty"` // "fail" (default for pre) or "continue" (default for post)
@@ -136,6 +138,13 @@ func (l *Loader) Load() error {
 
 	// Apply defaults and validate
 	l.normalizeConfig(&config)
+	for _, phase := range [][]Hook{config.Hooks.PreExport, config.Hooks.PostExport} {
+		for _, hook := range phase {
+			if err := validateHookExecution(hook, runtime.GOOS); err != nil {
+				return fmt.Errorf("hook %q in %s: %w", hook.Name, configPath, err)
+			}
+		}
+	}
 	config.projectDir = projectDir
 	config.configPath = configPath
 	config.sourceHash = fmt.Sprintf("%x", sha256.Sum256(data))
@@ -150,12 +159,13 @@ func (l *Loader) normalizeConfig(config *Config) {
 	config.Hooks.PostExport, l.warnings = normalizeHooks(config.Hooks.PostExport, PostExport, l.warnings)
 }
 
-// normalizeHooks applies defaults, drops empty commands, and accumulates warnings.
+// normalizeHooks applies defaults, drops empty legacy shell declarations, and
+// accumulates warnings. Invalid argv declarations are retained for validation.
 func normalizeHooks(hooks []Hook, phase HookPhase, warnings []string) ([]Hook, []string) {
 	var out []Hook
 	for i := range hooks {
 		hook := hooks[i]
-		if strings.TrimSpace(hook.Command) == "" {
+		if hook.Argv == nil && strings.TrimSpace(hook.Command) == "" {
 			warnings = append(warnings, fmt.Sprintf("%s hook %d has empty command; skipping", phase, i+1))
 			continue
 		}
@@ -234,13 +244,14 @@ func LoadDefault() (*Loader, error) {
 	return loader, nil
 }
 
-// UnmarshalYAML implements custom YAML unmarshalling for Duration
+// UnmarshalYAML parses durations and the strict literal-argument declaration.
 func (h *Hook) UnmarshalYAML(node *yaml.Node) error {
-	// WARNING: This struct must match Hook definition exactly, except for Timeout which is string.
+	// Keep this DTO aligned with Hook; Timeout and Argv need custom decoding.
 	// If you add a field to Hook, you MUST add it here too.
 	type hookDTO struct {
 		Name    string            `yaml:"name"`
 		Command string            `yaml:"command"`
+		Argv    yaml.Node         `yaml:"argv,omitempty"`
 		Timeout string            `yaml:"timeout,omitempty"`
 		Env     map[string]string `yaml:"env,omitempty"`
 		OnError string            `yaml:"on_error,omitempty"`
@@ -253,6 +264,11 @@ func (h *Hook) UnmarshalYAML(node *yaml.Node) error {
 
 	h.Name = dto.Name
 	h.Command = dto.Command
+	argv, err := decodeHookArgv(&dto.Argv)
+	if err != nil {
+		return err
+	}
+	h.Argv = argv
 	h.Env = dto.Env
 	h.OnError = dto.OnError
 
@@ -279,4 +295,46 @@ func (h *Hook) UnmarshalYAML(node *yaml.Node) error {
 	}
 
 	return nil
+}
+
+// Decode argv strictly rather than allowing YAML's scalar-to-string coercion.
+// Missing argv retains the legacy command form; an explicit null or empty
+// list is a declaration error, never an instruction to silently skip a hook.
+func decodeHookArgv(node *yaml.Node) ([]string, error) {
+	if node.Kind == 0 {
+		return nil, nil
+	}
+	resolve := func(node *yaml.Node) (*yaml.Node, error) {
+		seen := make(map[*yaml.Node]bool)
+		for node != nil && node.Kind == yaml.AliasNode {
+			if seen[node] {
+				return nil, fmt.Errorf("argv contains a cyclic YAML alias")
+			}
+			seen[node] = true
+			node = node.Alias
+		}
+		if node == nil {
+			return nil, fmt.Errorf("argv contains an invalid YAML alias")
+		}
+		return node, nil
+	}
+	list, err := resolve(node)
+	if err != nil {
+		return nil, err
+	}
+	if list.Kind != yaml.SequenceNode || len(list.Content) == 0 {
+		return nil, fmt.Errorf("argv must be a nonempty list of strings")
+	}
+	argv := make([]string, len(list.Content))
+	for i, item := range list.Content {
+		value, err := resolve(item)
+		if err != nil {
+			return nil, err
+		}
+		if value.Kind != yaml.ScalarNode || value.Tag != "!!str" {
+			return nil, fmt.Errorf("argv element %d must be a string", i+1)
+		}
+		argv[i] = value.Value
+	}
+	return argv, nil
 }

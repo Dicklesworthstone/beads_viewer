@@ -43,11 +43,14 @@ func TestExecutorBoundsOutputWithoutChangingExitStatus(t *testing.T) {
 		name     string
 		size     int
 		exitCode int
+		direct   bool
 	}{
-		{"small", 31, 0},
-		{"exact-limit", HookOutputLimit, 0},
-		{"over-limit", 3*HookOutputLimit + 7, 0},
-		{"over-limit-failure", 3*HookOutputLimit + 7, 7},
+		{"small", 31, 0, false},
+		{"exact-limit", HookOutputLimit, 0, false},
+		{"over-limit", 3*HookOutputLimit + 7, 0, false},
+		{"over-limit-failure", 3*HookOutputLimit + 7, 7, false},
+		{"argv-over-limit", 3*HookOutputLimit + 7, 0, true},
+		{"argv-over-limit-failure", 3*HookOutputLimit + 7, 7, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			marker := filepath.Join(t.TempDir(), "fully-written")
@@ -59,6 +62,10 @@ func TestExecutorBoundsOutputWithoutChangingExitStatus(t *testing.T) {
 					"BV_HOOK_OUTPUT_EXIT": strconv.Itoa(tc.exitCode),
 				},
 			}}}}
+			if tc.direct {
+				config.Hooks.PreExport[0].Command = ""
+				config.Hooks.PreExport[0].Argv = []string{executable, "-test.run=^TestHookOutputSubprocessProbe$"}
+			}
 			executor := newApprovedExecutor(t, config, ExportContext{ExportPath: marker})
 			err := executor.RunPreExport()
 			if tc.exitCode == 0 && err != nil {

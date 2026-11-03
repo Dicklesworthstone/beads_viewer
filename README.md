@@ -188,6 +188,32 @@ Don't just read the title. `bv` gives you the full picture:
 
 Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, notifications, or uploads. **Project hooks require explicit approval by the invoking user.** Report exports (`--export` / `--export-md`) and direct Pages exports (`--export-pages`) fail before running hooks or writing the export when configured hooks have not been approved. Projects without hooks export normally. To export without running any project hooks, pass `--no-hooks`; this also bypasses hook configuration parsing, so it works with invalid YAML.
 
+A runnable hook selects exactly one execution form: `command` for a shell command, or `argv` to invoke a program directly. `argv` must be a nonempty list of strings with a nonempty executable name as its first element. Each subsequent element is one literal argument, including empty strings or values containing spaces. For example:
+
+```yaml
+hooks:
+  pre-export:
+    - name: check-whitespace
+      argv: [git, diff, --check]
+  post-export:
+    - name: describe-export
+      argv: [python3, ./scripts/describe_export.py]
+      timeout: 30s
+```
+
+The project script can read export context directly from its environment. For the Python example above, `scripts/describe_export.py` could contain:
+
+```python
+import os
+
+print(f"{os.environ['BV_EXPORT_FORMAT']} export: {os.environ['BV_EXPORT_PATH']}")
+print(f"Issues: {os.environ['BV_ISSUE_COUNT']}; created: {os.environ['BV_TIMESTAMP']}")
+```
+
+Choose the interpreter executable installed on your machine. bv performs **no expansion or shell parsing of `argv`**: `$VAR`, `${VAR}`, `%VAR%`, wildcards, pipes, redirection, and command substitution remain literal argument text. It does not split an argument on spaces. To use shell syntax, keep the existing `command` form; no implicit shell fallback occurs if a direct invocation fails. On Windows, `.bat` and `.cmd` files require `command` mode or an explicitly selected interpreter.
+
+Bare executable names such as `git` are resolved using the invoking user's `PATH`, with Go's `ErrDot` protection against implicit current-directory lookup. A hook's `env: {PATH: ...}` affects the launched program's environment but does not change this initial executable lookup. Explicit relative executable paths such as `./tools/publish` (or `.\tools\publish.exe` on Windows) resolve from the project directory. Windows drive-relative paths such as `C:tool.exe` and root-relative paths such as `\tools\tool.exe` are rejected. The program also runs with the project directory as its working directory.
+
 Review the hooks from the project directory before approving them:
 
 ```bash
@@ -201,9 +227,9 @@ bv --export-md report.md --trust-hooks 'sha256:REVIEWED_64_HEX_DIGEST'
 bv --export-pages ./bv-pages --trust-hooks 'sha256:REVIEWED_64_HEX_DIGEST'
 ```
 
-`--hooks-info` shows the canonical project directory, configuration file path, execution platform, exact commands, declared environment values, normalized timeouts and error policies, warnings, and a `digest`. Environment declarations are shown without expanding values from your process. Review both hook phases and the scripts or programs they invoke. The digest covers the YAML bytes, effective hook configuration, execution platform, and trust-policy version. Changes to commands, environment declarations, ordering, timeouts, error policies, or even YAML comments invalidate the previous digest.
+`--hooks-info` shows the canonical project directory, configuration file path, execution platform, exact `command` or `argv` declarations, declared environment values, normalized timeouts and error policies, warnings, and a `digest`. Environment declarations are shown without expanding values from your process. Review both hook phases and the scripts or programs they invoke. The digest covers the YAML bytes, effective hook configuration, execution platform, and trust-policy version. Changes to commands, executables, arguments, execution form, environment declarations, ordering, timeouts, error policies, or even YAML comments invalidate the previous digest.
 
-The current trust policy is **v2**. Digests approved under v1 are rejected even when the YAML is unchanged. Review the process-lifetime and credential rules below, run `bv --hooks-info` again, and explicitly supply the new digest.
+The current trust policy is **v3**. Digests approved under v1 or v2 are rejected even when the YAML is unchanged. Review the execution forms and the process-lifetime and credential rules below, run `bv --hooks-info` again, and explicitly supply the new digest.
 
 `--trust-hooks` authorizes only the current invocation. It creates no persistent approval file and has no project-YAML or environment-variable equivalent. `--yes` does not approve hooks, and noninteractive exports never prompt for approval. For automation, keep the reviewed, fixed digest in configuration controlled by the invoking user, and supply it explicitly on each run. Do not automatically compute the current digest and immediately pass it back as approval: that would approve any newly introduced commands without review. The digest does not include the checkout's absolute path, so a reviewed digest can be reused explicitly in ephemeral CI checkouts on the same platform. With `--watch-export`, each export checks the newly loaded hooks against the same fixed digest; changed hooks require a fresh invocation with renewed approval.
 
@@ -220,13 +246,13 @@ Repeat `--hook-env NAME` to grant additional variables; supply names, never `NAM
 
 Known credential containers are also withheld unless explicitly granted: `DOCKER_AUTH_CONFIG`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, and numbered `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` variables. To forward indexed Git configuration, grant `GIT_CONFIG_COUNT` and each required key/value variable by its exact name. Granting the count does not grant the entries; an incomplete set can make Git reject its configuration. A value-only grant can support a YAML alias without enabling the indexed Git configuration. The packed `GIT_CONFIG_PARAMETERS` format requires its own explicit grant.
 
-Approved hooks retain shell command syntax, timeouts, and failure policies. By default, pre-export hooks fail fast on errors (`on_error: fail`), while post-export hooks log and continue (`on_error: continue`). A post-export hook declared `on_error: fail` makes the export exit 1 even though the output has already been written. Empty commands are omitted; `--hooks-info` reports normalization warnings. `--no-hooks` takes precedence over approval and credential grants.
+Both execution forms require the same explicit approval and credential grants and receive the same export context. Existing `command` hooks retain their shell syntax. Timeouts and failure policies apply to both forms: by default, pre-export hooks fail fast on errors (`on_error: fail`), while post-export hooks log and continue (`on_error: continue`). A post-export hook declared `on_error: fail` makes the export exit 1 even though the output has already been written. Combining a nonempty `command` with `argv`, or supplying an empty, null, or malformed `argv`, rejects the configuration before any hook runs. Legacy entries with an empty command and no `argv` are still omitted with normalization warnings in `--hooks-info`. `--no-hooks` takes precedence over approval and credential grants.
 
-**Hooks run synchronously on Linux, macOS, and Windows.** Remaining processes in the hook's process group (Linux/macOS) or Job Object (Windows) are terminated when the shell exits or its timeout expires, including background children that keep output pipes open. Start long-lived services outside the export hook pipeline. On Linux/macOS, a command that deliberately leaves its process group can escape that cleanup; approved code retains your operating-system privileges. Hook execution on other platforms is refused; use `--no-hooks` to export there.
+**Hooks run synchronously on Linux, macOS, and Windows.** Remaining processes in the hook's process group (Linux/macOS) or Job Object (Windows) are terminated when the initial shell or program exits or its timeout expires, including background children that keep output pipes open. Start long-lived services outside the export hook pipeline. On Linux/macOS, a command that deliberately leaves its process group can escape that cleanup; approved code retains your operating-system privileges. Hook execution on other platforms is refused; use `--no-hooks` to export there.
 
 Each hook retains at most **1 MiB (1,048,576 bytes) of stdout and 1 MiB of stderr**. Excess output is drained and discarded. Hook results expose `StdoutTruncated` and `StderrTruncated`, and the execution summary identifies truncated streams. Truncation alone does not fail a hook or change its `on_error` policy.
 
-**Approval permits arbitrary code execution with your operating-system privileges.** Environment filtering is not a sandbox: an approved hook can access files, launch programs, and use the network. The digest approves hook declarations, not the transitive contents of referenced scripts or executables. Review changes to those dependencies before running approved hooks again. The interactive `--pages` wizard, TUI exports, and robot analysis do not run this hook pipeline.
+**Approval permits arbitrary code execution with your operating-system privileges.** Direct `argv` execution and environment filtering are not sandboxes: an approved program or explicitly selected interpreter can access files, launch programs, and use the network. The digest approves hook declarations, not the transitive contents of referenced scripts or executables. Review changes to those dependencies before running approved hooks again. The interactive `--pages` wizard, TUI exports, and robot analysis do not run this hook pipeline.
 
 ---
 
@@ -4484,7 +4510,7 @@ Copyright (c) 2026 Jeffrey Emanuel
 ## 🔒 Security & Privacy Notes
 - Local-first: all analysis happens on your repo's JSONL; no network required for robots.
 - Exports run only when you ask for them. Project hooks are denied by default: report exports (`--export` / `--export-md`) and direct Pages exports (`--export-pages`) require explicit `--trust-hooks` approval of the reviewed configuration digest. `--no-hooks` bypasses the hook pipeline entirely. Merely starting `bv` or running a robot analysis does not run export hooks.
-- Hook credentials require separate invoking-user `--hook-env NAME` grants. Project YAML cannot restore scrubbed parent-process credentials through environment expansion or aliases. Approved shell commands still have your operating-system privileges; filtering is not a sandbox, and configuration approval does not freeze scripts they invoke. See [Automation Hooks](#-automation-hooks).
+- Hook credentials require separate invoking-user `--hook-env NAME` grants. Project YAML cannot restore scrubbed parent-process credentials through environment expansion or aliases. Approved hooks still have your operating-system privileges; direct `argv` execution and filtering are not sandboxes, and configuration approval does not freeze scripts they invoke. See [Automation Hooks](#-automation-hooks).
 - Update checks are silent and tolerate network failures without impacting startup.
 
 ---

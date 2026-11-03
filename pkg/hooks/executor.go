@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"os/exec"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 )
@@ -98,6 +98,10 @@ func NewExecutor(config *Config, ctx ExportContext, options ...ExecutionOptions)
 	// must not allow a pre-hook to run, even with on_error: continue.
 	for _, phase := range [][]Hook{e.config.Hooks.PreExport, e.config.Hooks.PostExport} {
 		for _, hook := range phase {
+			if err := validateHookExecution(hook, runtime.GOOS); err != nil {
+				e.authorizationErr = fmt.Errorf("hook %q: %w", hook.Name, err)
+				return e
+			}
 			if err := validateHookEnv(hook.Env, runtime.GOOS == "windows"); err != nil {
 				e.authorizationErr = fmt.Errorf("hook %q: %w", hook.Name, err)
 				return e
@@ -134,7 +138,7 @@ func (e *Executor) RunPreExport() error {
 	}
 
 	for _, hook := range e.config.Hooks.PreExport {
-		e.logger(fmt.Sprintf("Running pre-export hook %q: %q", hook.Name, hook.Command))
+		e.logger(fmt.Sprintf("Running pre-export hook %q: %s", hook.Name, hookInvocationDescription(hook)))
 		result := e.runHook(hook, PreExport)
 		e.results = append(e.results, result)
 
@@ -158,7 +162,7 @@ func (e *Executor) RunPostExport() error {
 
 	var firstError error
 	for _, hook := range e.config.Hooks.PostExport {
-		e.logger(fmt.Sprintf("Running post-export hook %q: %q", hook.Name, hook.Command))
+		e.logger(fmt.Sprintf("Running post-export hook %q: %s", hook.Name, hookInvocationDescription(hook)))
 		result := e.runHook(hook, PostExport)
 		e.results = append(e.results, result)
 
@@ -187,6 +191,7 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 		Phase: phase,
 	}
 	result.Hook.Env = maps.Clone(hook.Env)
+	result.Hook.Argv = slices.Clone(hook.Argv)
 	if e.authorizationErr != nil {
 		result.Error = e.authorizationErr
 		return result
@@ -202,16 +207,17 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	// Create command - use shell to interpret the command
-	shell, args := shellInvocation(runtime.GOOS, hook.Command)
-	cmd := exec.CommandContext(ctx, shell, args...)
-	configureHookShell(cmd, hook.Command)
+	cmd, err := newHookCommand(ctx, hook, e.config.projectDir)
+	if err != nil {
+		result.Error = err
+		result.Duration = time.Since(start)
+		return result
+	}
 	cmd.Dir = e.config.projectDir
 	cmd.WaitDelay = hookWaitDelay
 
 	// Expansion and execution see the same filtered environment. Only a grant
 	// supplied by the invoking user can restore a protected parent variable.
-	var err error
 	cmd.Env, err = buildHookEnvironment(os.Environ(), e.context.ToEnv(), hook.Env, e.allowEnv, runtime.GOOS == "windows")
 	if err != nil {
 		result.Error = err
@@ -283,6 +289,7 @@ func (e *Executor) Results() []HookResult {
 	results := append([]HookResult(nil), e.results...)
 	for i := range results {
 		results[i].Hook.Env = maps.Clone(results[i].Hook.Env)
+		results[i].Hook.Argv = slices.Clone(results[i].Hook.Argv)
 	}
 	return results
 }

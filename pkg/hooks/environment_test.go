@@ -373,7 +373,7 @@ func TestBuildHookEnvironmentRejectsInvalidGrants(t *testing.T) {
 }
 
 func TestBuildHookEnvironmentRejectsAmbiguousOrInvalidOverrides(t *testing.T) {
-	for _, overrides := range []map[string]string{{"": "value"}, {"A=B": "value"}, {"A\x00": "value"}, {"A": "value\x00tail"}, {"=C:": "value"}} {
+	for _, overrides := range []map[string]string{{"": "value"}, {"A=B": "value"}, {"A\x00": "value"}, {"A": "value\x00tail"}, {"=C:": "value"}, {"A\xff": "value"}, {"A": "value\xff"}} {
 		for _, windows := range []bool{false, true} {
 			if env, err := buildHookEnvironment(nil, nil, overrides, nil, windows); err == nil || env != nil {
 				t.Errorf("invalid override accepted (windows=%v): %v, %v", windows, env, err)

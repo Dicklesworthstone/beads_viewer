@@ -5,6 +5,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // buildHookEnvironment constructs the one environment visible to both YAML
@@ -154,11 +155,14 @@ func validateHookEnv(overrides map[string]string, windows bool) error {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if name == "" || strings.ContainsAny(name, "=\x00") {
+		if name == "" || strings.ContainsAny(name, "=\x00") || !utf8.ValidString(name) {
 			return fmt.Errorf("invalid hook environment variable name %q", name)
 		}
 		if strings.ContainsRune(overrides[name], '\x00') {
 			return fmt.Errorf("hook environment variable %q contains a NUL byte", name)
+		}
+		if !utf8.ValidString(overrides[name]) {
+			return fmt.Errorf("hook environment variable %q contains invalid UTF-8", name)
 		}
 		if windows {
 			key := strings.ToLower(name)

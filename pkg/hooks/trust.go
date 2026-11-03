@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"runtime"
+	"slices"
 )
 
 // ErrUntrustedHooks means the invoking user has not approved these declarations.
@@ -47,7 +48,7 @@ func (c *Config) Digest() (string, error) {
 		Platform   string       `json:"platform"`
 		SourceHash string       `json:"source_hash"`
 		Hooks      HooksByPhase `json:"hooks"`
-	}{"bv-project-hooks-v2", runtime.GOOS, c.sourceHash, c.Hooks})
+	}{"bv-project-hooks-v3", runtime.GOOS, c.sourceHash, c.Hooks})
 	if err != nil {
 		return "", fmt.Errorf("fingerprinting hooks: %w", err)
 	}
@@ -111,6 +112,7 @@ func cloneHooks(hooks []Hook) []Hook {
 	for i, hook := range hooks {
 		cloned[i] = hook
 		cloned[i].Env = maps.Clone(hook.Env)
+		cloned[i].Argv = slices.Clone(hook.Argv)
 	}
 	return cloned
 }
