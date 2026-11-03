@@ -40,7 +40,7 @@
 | `BV_TEST_MODE` | Any value: test harness mode; suppresses browser opening, terminal capability queries, and the background worker's idle GC tuning. | (unset) |
 | `BV_THEME` | Pin the TUI palette: `light` or `dark` (overridden by `--theme`). | (auto-detect) |
 | `BV_TUI_AUTOCLOSE_MS` | Quit the TUI automatically after this many milliseconds (for automated tests). | (unset) |
-| `BV_UPDATE_USE_TOKEN` | Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` to api.github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config. | (never sent) |
+| `BV_UPDATE_USE_TOKEN` | Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` only to the exact HTTPS origins api.github.com and github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Cross-origin redirects receive no token. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config. | (never sent) |
 | `BV_WATCHDOG_INTERVAL_S` | Background worker watchdog interval (seconds). | `10` |
 | `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker. | (default) |
 | `BV_WORKER_METRICS` | Truthy value: the background worker records its own metrics. | (off) |

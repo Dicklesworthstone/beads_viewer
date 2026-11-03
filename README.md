@@ -3934,6 +3934,8 @@ The startup check is opt-out: set `BV_NO_UPDATE_CHECK=1` or put `updates: {check
 
 Sending an ambient `GITHUB_TOKEN` or `GH_TOKEN` is separately opt-in through `BV_UPDATE_USE_TOKEN=1` or `updates: {use_token: true}` in the user configuration. Set `BV_UPDATE_USE_TOKEN=0` to withhold those credentials for an invocation even when the saved configuration permits them.
 
+When enabled, tokens are sent only to the exact HTTPS origins `api.github.com` and `github.com`. Every redirect must retain HTTPS on its standard port and contain no URL credentials. A redirect keeps the token only while the entire chain stays on the same original origin; subdomains, other origins, and download CDNs receive no token, and returning to the original origin does not restore it. Normal HTTPS CDN downloads remain supported. Initial release URLs reject Unicode lookalike hosts, and request diagnostics omit raw redirect locations that could contain passwords or signed query strings.
+
 Both environment variables accept `1`, `true`, `yes`, or `on` and `0`, `false`, `no`, or `off`, ignoring case and surrounding whitespace. A nonempty value overrides the saved setting in either direction: `BV_NO_UPDATE_CHECK=0` enables the startup check even when the configuration disables it, while `BV_UPDATE_USE_TOKEN=0` disables token use even when the configuration enables it. An unrecognized nonempty value disables the corresponding behavior: `BV_NO_UPDATE_CHECK` suppresses automatic checks, and `BV_UPDATE_USE_TOKEN` denies token use. Unset, empty, or whitespace-only values preserve the saved setting, or the defaults of automatic checks enabled and token use disabled when no setting is saved.
 
 ---
@@ -4295,7 +4297,7 @@ bv has a comprehensive built-in help system:
 | `BV_TEST_MODE` | Any value: test harness mode; suppresses browser opening, terminal capability queries, and the background worker's idle GC tuning. | (unset) |
 | `BV_THEME` | Pin the TUI palette: `light` or `dark` (overridden by `--theme`). | (auto-detect) |
 | `BV_TUI_AUTOCLOSE_MS` | Quit the TUI automatically after this many milliseconds (for automated tests). | (unset) |
-| `BV_UPDATE_USE_TOKEN` | Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` to api.github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config. | (never sent) |
+| `BV_UPDATE_USE_TOKEN` | Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` only to the exact HTTPS origins api.github.com and github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Cross-origin redirects receive no token. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config. | (never sent) |
 | `BV_WATCHDOG_INTERVAL_S` | Background worker watchdog interval (seconds). | `10` |
 | `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker. | (default) |
 | `BV_WORKER_METRICS` | Truthy value: the background worker records its own metrics. | (off) |

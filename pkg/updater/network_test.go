@@ -46,33 +46,54 @@ func rewriteGitHubDownloadsToServer(t *testing.T, client *http.Client, serverURL
 	})
 }
 
-// TestIsGitHubHost verifies the domain allow-list for token transmission.
-func TestIsGitHubHost(t *testing.T) {
+// TestGitHubCredentialOrigin verifies the exact authorities allowed to receive
+// ambient credentials. A GitHub suffix or Unicode case fold is not authority.
+func TestGitHubCredentialOrigin(t *testing.T) {
 	tests := []struct {
 		rawURL string
 		want   bool
 	}{
 		{"https://api.github.com/repos/foo/bar", true},
 		{"https://github.com/releases/download/v1.0/file.tar.gz", true},
-		{"https://objects.githubusercontent.com/something", true},
-		{"https://raw.githubusercontent.com/foo/bar/main/file", true},
-		{"https://githubusercontent.com/something", true},
+		{"https://API.GITHUB.COM:443/repos/foo/bar", true},
+		{"https://GITHUB.COM:443/releases/download/v1.0/file.tar.gz", true},
+		{"http://api.github.com/repos/foo/bar", false},
+		{"http://github.com/releases/download/v1.0/file.tar.gz", false},
+		{"https://api.github.com:444/repos/foo/bar", false},
+		{"https://github.com:80/releases/download/v1.0/file.tar.gz", false},
+		{"https://github.com:/file", false},
+		{"https://github.com:0443/file", false},
+		{"https://fixture:fake@api.github.com/repos/foo/bar", false},
+		{"https://gİthub.com/file", false},
+		{"https://apİ.github.com/file", false},
+		{"https://github.com./file", false},
+		{"https://child.github.com/file", false},
+		{"https://child.api.github.com/file", false},
+		{"https://objects.githubusercontent.com/something", false},
+		{"https://raw.githubusercontent.com/foo/bar/main/file", false},
+		{"https://githubusercontent.com/something", false},
 		{"https://evil.com", false},
 		{"https://notgithub.com/repos", false},
 		{"https://github.com.evil.com/phish", false},
 		{"http://localhost:8080/test", false},
 		{"https://example.com", false},
+		{"https:github.com/file", false},
+		{"https:///file", false},
+		{"/relative", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.rawURL, func(t *testing.T) {
-			req, err := http.NewRequest(http.MethodGet, tt.rawURL, nil)
+			parsed, err := url.Parse(tt.rawURL)
 			if err != nil {
 				t.Fatalf("bad test URL %q: %v", tt.rawURL, err)
 			}
-			if got := isGitHubHost(req.URL); got != tt.want {
-				t.Errorf("isGitHubHost(%q) = %v, want %v", tt.rawURL, got, tt.want)
+			if got := githubCredentialOrigin(parsed) != ""; got != tt.want {
+				t.Errorf("githubCredentialOrigin(%q) allowed = %v, want %v", tt.rawURL, got, tt.want)
 			}
 		})
+	}
+	if githubCredentialOrigin(nil) != "" {
+		t.Error("nil URL has credential authority")
 	}
 }
 
@@ -527,7 +548,10 @@ func TestUpdater_TokenEnvironmentPolicyReachesOutgoingRequest(t *testing.T) {
 }
 
 func TestSetGitHubAuthRevokesPriorAuthorization(t *testing.T) {
-	for _, reason := range []string{"explicit_denial", "invalid_consent", "missing_token", "different_host"} {
+	for _, reason := range []string{
+		"explicit_denial", "invalid_consent", "missing_token", "different_host",
+		"plaintext", "other_port", "userinfo", "subdomain", "cdn", "unicode_case_fold",
+	} {
 		t.Run(reason, func(t *testing.T) {
 			configDir := isolateUpdaterConfig(t)
 			writeUpdaterConfig(t, configDir, "updates:\n  use_token: true\n")
@@ -549,6 +573,18 @@ func TestSetGitHubAuthRevokesPriorAuthorization(t *testing.T) {
 				t.Setenv("GITHUB_TOKEN", "")
 			case "different_host":
 				req.URL.Host = "example.invalid"
+			case "plaintext":
+				req.URL.Scheme = "http"
+			case "other_port":
+				req.URL.Host = "api.github.com:444"
+			case "userinfo":
+				req.URL.User = url.UserPassword("fixture", "fake")
+			case "subdomain":
+				req.URL.Host = "child.api.github.com"
+			case "cdn":
+				req.URL.Host = "objects.githubusercontent.com"
+			case "unicode_case_fold":
+				req.URL.Host = "apİ.github.com"
 			}
 			setGitHubAuth(req)
 			if req.Header.Get("Authorization") != "" {

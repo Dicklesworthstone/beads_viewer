@@ -226,24 +226,15 @@ func githubToken() string {
 	return ambientGitHubToken()
 }
 
-// isGitHubHost returns true if the given URL points to a github.com or
-// githubusercontent.com domain (including subdomains like api.github.com,
-// objects.githubusercontent.com, etc.).
-func isGitHubHost(u *url.URL) bool {
-	host := strings.ToLower(u.Hostname())
-	return host == "github.com" || strings.HasSuffix(host, ".github.com") ||
-		host == "githubusercontent.com" || strings.HasSuffix(host, ".githubusercontent.com")
-}
-
 // setGitHubAuth adds an Authorization header to a request when the user has
 // opted in to using the ambient GITHUB_TOKEN / GH_TOKEN (see githubToken)
-// and the request targets a GitHub domain. This prevents leaking tokens to
-// non-GitHub hosts (e.g. CDN redirects).
+// and the request targets the exact HTTPS GitHub API or release-download origin.
+// Subdomains and download CDNs never receive the ambient token.
 func setGitHubAuth(req *http.Request) {
 	// Re-evaluating policy must also revoke a header added by an earlier call.
 	// This helper owns updater authentication; denial never preserves stale auth.
 	req.Header.Del("Authorization")
-	if tok := githubToken(); tok != "" && isGitHubHost(req.URL) {
+	if tok := githubToken(); tok != "" && githubCredentialOrigin(req.URL) != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 }
@@ -342,7 +333,7 @@ func checkForUpdates(client *http.Client, url string) (string, string, error) {
 	}
 	setGitHubAPIHeaders(req, "beads-viewer-update-check")
 
-	resp, err := client.Do(req)
+	resp, err := doUpdaterRequest(client, req)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			resp.Body.Close()
@@ -631,7 +622,7 @@ func GetLatestRelease() (*Release, error) {
 	}
 	setGitHubAPIHeaders(req, "beads-viewer-updater")
 
-	resp, err := client.Do(req)
+	resp, err := doUpdaterRequest(client, req)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			resp.Body.Close()
@@ -746,7 +737,7 @@ func parseGitHubHTTPSURL(rawURL, field string) (*url.URL, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid %s URL: %w", field, err)
 	}
-	if parsed.Scheme != "https" || strings.ToLower(parsed.Hostname()) != "github.com" || parsed.Port() != "" {
+	if githubCredentialOrigin(parsed) != "https://github.com" || parsed.Port() != "" {
 		return nil, fmt.Errorf("%s URL must use HTTPS on github.com", field)
 	}
 	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
@@ -914,7 +905,7 @@ func downloadReleaseAssetBytes(ctx context.Context, client *http.Client, asset *
 	req.Header.Set("User-Agent", "beads-viewer-update-check")
 	setGitHubAuth(req)
 
-	resp, err := client.Do(req)
+	resp, err := doUpdaterRequest(client, req)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
 			resp.Body.Close()
@@ -978,17 +969,6 @@ func downloadFile(url, destPath string, expectedSize int64) error {
 
 	client := &http.Client{
 		Timeout: 5 * time.Minute,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("too many redirects")
-			}
-			// Strip Authorization header when redirecting to non-GitHub hosts
-			// to avoid leaking tokens to third-party CDNs.
-			if !isGitHubHost(req.URL) {
-				req.Header.Del("Authorization")
-			}
-			return nil
-		},
 	}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -997,7 +977,7 @@ func downloadFile(url, destPath string, expectedSize int64) error {
 	req.Header.Set("User-Agent", "beads-viewer-updater")
 	setGitHubAuth(req)
 
-	resp, err := client.Do(req)
+	resp, err := doUpdaterRequest(client, req)
 	if err != nil {
 		// When CheckRedirect returns a non-nil error, resp may be non-nil
 		// with an unclosed Body. Close it to avoid leaking connections.

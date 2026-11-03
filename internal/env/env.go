@@ -286,7 +286,7 @@ var (
 
 	UpdateUseToken = register(Var{
 		Name:        "BV_UPDATE_USE_TOKEN",
-		Description: "Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` to api.github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config.",
+		Description: "Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` only to the exact HTTPS origins api.github.com and github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Cross-origin redirects receive no token. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config.",
 		Default:     "(never sent)",
 	})
 
