@@ -146,11 +146,18 @@ func (h *LiveReloadHub) notifyClients() {
 // SSEHandler returns an HTTP handler for the SSE endpoint.
 func (h *LiveReloadHub) SSEHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		// Set SSE headers
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if r.Method == http.MethodHead {
+			return
+		}
 
 		// Ensure we can flush
 		flusher, ok := w.(http.Flusher)

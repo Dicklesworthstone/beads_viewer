@@ -1,6 +1,7 @@
 package export
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,297 @@ import (
 	"testing"
 	"time"
 )
+
+func TestPreviewRequestGuard(t *testing.T) {
+	for _, tc := range []struct {
+		name, host, method string
+		origins            []string
+		want               int
+	}{
+		{name: "IPv4", host: "127.0.0.1:9000", want: 200},
+		{name: "localhost", host: "localhost:9000", origins: []string{"http://localhost:9000"}, want: 200},
+		{name: "domain case", host: "LOCALHOST:9000", origins: []string{"http://localhost:9000"}, want: 200},
+		{name: "IPv6", host: "[::1]:9000", origins: []string{"http://[::1]:9000"}, want: 200},
+		{name: "same origin", host: "127.0.0.1:9000", origins: []string{"http://127.0.0.1:9000"}, want: 200},
+		{name: "HEAD", host: "127.0.0.1:9000", method: "HEAD", want: 200},
+		{name: "rebinding", host: "rebind.invalid:9000", origins: []string{"http://rebind.invalid:9000"}, want: 403},
+		{name: "rebinding without origin", host: "rebind.invalid:9000", want: 403},
+		{name: "localhost suffix", host: "localhost.evil.invalid:9000", want: 403},
+		{name: "nonloopback", host: "192.0.2.1:9000", want: 403},
+		{name: "wrong port", host: "127.0.0.1:9001", want: 403},
+		{name: "missing port", host: "localhost", want: 403},
+		{name: "signed port", host: "127.0.0.1:+9000", want: 403},
+		{name: "empty authority", want: 403},
+		{name: "host userinfo", host: "user@localhost:9000", want: 403},
+		{name: "remote origin", host: "127.0.0.1:9000", origins: []string{"https://untrusted.invalid"}, want: 403},
+		{name: "null origin", host: "127.0.0.1:9000", origins: []string{"null"}, want: 403},
+		{name: "empty origin", host: "127.0.0.1:9000", origins: []string{""}, want: 403},
+		{name: "different local origin", host: "127.0.0.1:9000", origins: []string{"http://localhost:9000"}, want: 403},
+		{name: "origin port", host: "127.0.0.1:9000", origins: []string{"http://127.0.0.1:9001"}, want: 403},
+		{name: "origin scheme", host: "127.0.0.1:9000", origins: []string{"https://127.0.0.1:9000"}, want: 403},
+		{name: "origin credentials", host: "127.0.0.1:9000", origins: []string{"http://user@127.0.0.1:9000"}, want: 403},
+		{name: "origin path", host: "127.0.0.1:9000", origins: []string{"http://127.0.0.1:9000/"}, want: 403},
+		{name: "origin query", host: "127.0.0.1:9000", origins: []string{"http://127.0.0.1:9000?"}, want: 403},
+		{name: "origin fragment", host: "127.0.0.1:9000", origins: []string{"http://127.0.0.1:9000#"}, want: 403},
+		{name: "multiple origins", host: "127.0.0.1:9000", origins: []string{"http://127.0.0.1:9000", "https://untrusted.invalid"}, want: 403},
+		{name: "origin list", host: "127.0.0.1:9000", origins: []string{"http://127.0.0.1:9000 https://untrusted.invalid"}, want: 403},
+		{name: "POST", host: "127.0.0.1:9000", method: "POST", want: 405},
+		{name: "OPTIONS", host: "127.0.0.1:9000", method: "OPTIONS", want: 405},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			method := tc.method
+			if method == "" {
+				method = http.MethodGet
+			}
+			req := httptest.NewRequest(method, "http://127.0.0.1:9000/beads.sqlite3", nil)
+			req.Host = tc.host
+			for _, origin := range tc.origins {
+				req.Header.Add("Origin", origin)
+			}
+			recorder := httptest.NewRecorder()
+			called := false
+			previewRequestGuard(9000, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				_, _ = io.WriteString(w, "fake private project data")
+			})).ServeHTTP(recorder, req)
+			if recorder.Code != tc.want || called != (tc.want == 200) {
+				t.Fatalf("status=%d handler called=%v want=%d", recorder.Code, called, tc.want)
+			}
+			if recorder.Header().Get("Access-Control-Allow-Origin") != "" || recorder.Header().Get("Cross-Origin-Resource-Policy") != "same-origin" {
+				t.Fatalf("unexpected browser policy headers: %v", recorder.Header())
+			}
+			if tc.want != 200 && strings.Contains(recorder.Body.String(), "fake private") {
+				t.Fatal("denied request exposed project bytes")
+			}
+		})
+	}
+}
+
+func startPreviewTestServer(t *testing.T, bundle string, live bool) (*PreviewServer, <-chan struct{}) {
+	t.Helper()
+	server := NewPreviewServer(bundle, 0)
+	done := make(chan struct{})
+	var serveErr error
+	go func() {
+		serveErr = server.startWithGracefulShutdown(PreviewConfig{Quiet: true, LiveReload: live})
+		close(done)
+	}()
+	t.Cleanup(func() {
+		if err := server.Stop(); err != nil {
+			t.Errorf("stop preview: %v", err)
+		}
+		select {
+		case <-done:
+			if serveErr != nil {
+				t.Errorf("preview serve: %v", serveErr)
+			}
+		case <-time.After(6 * time.Second):
+			t.Error("preview owner did not finish")
+		}
+	})
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for server.Port() == 0 {
+		select {
+		case <-done:
+			t.Fatalf("preview exited before publishing its port: %v", serveErr)
+		case <-deadline.C:
+			t.Fatal("preview did not publish its bound port")
+		case <-poll.C:
+		}
+	}
+	return server, done
+}
+
+func TestPreviewServerLocalOriginAndRequests(t *testing.T) {
+	for _, live := range []bool{false, true} {
+		t.Run(fmt.Sprintf("live=%t", live), func(t *testing.T) {
+			bundle := t.TempDir()
+			const data = "FAKE-PREVIEW-DATABASE-SENTINEL"
+			for name, content := range map[string]string{
+				"index.html":    "<!doctype html><html><body>Preview fixture</body></html>",
+				"beads.sqlite3": data,
+			} {
+				if err := os.WriteFile(filepath.Join(bundle, name), []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			server, done := startPreviewTestServer(t, bundle, live)
+			client := &http.Client{Timeout: 2 * time.Second}
+			for _, target := range []string{"/", "/beads.sqlite3", "/__preview__/status", "/__preview__/events", LiveReloadScriptPath} {
+				for _, hostileHost := range []bool{true, false} {
+					req, err := http.NewRequest(http.MethodGet, server.URL()+target, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if hostileHost {
+						req.Host = fmt.Sprintf("rebind.invalid:%d", server.Port())
+						req.Header.Set("Origin", "http://"+req.Host)
+					} else {
+						req.Header.Set("Origin", "https://untrusted.invalid")
+					}
+					resp, err := client.Do(req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1024))
+					resp.Body.Close()
+					if readErr != nil || resp.StatusCode != http.StatusForbidden || strings.Contains(string(body), data) || strings.Contains(string(body), bundle) {
+						t.Fatalf("hostile request %s: status=%d body=%q error=%v", target, resp.StatusCode, body, readErr)
+					}
+				}
+			}
+			for _, method := range []string{http.MethodGet, http.MethodHead} {
+				req, err := http.NewRequest(method, server.URL()+"/beads.sqlite3", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Host = fmt.Sprintf("localhost:%d", server.Port())
+				req.Header.Set("Origin", "http://"+req.Host)
+				if method == http.MethodGet {
+					req.Header.Set("Range", "bytes=2-5")
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if method == http.MethodGet && (resp.StatusCode != http.StatusPartialContent || string(body) != data[2:6]) {
+					t.Fatalf("range request: status=%d body=%q", resp.StatusCode, body)
+				}
+				if method == http.MethodHead && (resp.StatusCode != http.StatusOK || len(body) != 0 || resp.ContentLength != int64(len(data))) {
+					t.Fatalf("HEAD request: status=%d body=%q length=%d", resp.StatusCode, body, resp.ContentLength)
+				}
+			}
+			if live {
+				resp, err := client.Get(server.URL() + "/__preview__/events")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer resp.Body.Close()
+				line, err := bufio.NewReader(resp.Body).ReadString('\n')
+				if err != nil || line != "event: connected\n" || resp.Header.Get("Access-Control-Allow-Origin") != "" {
+					t.Fatalf("same-origin SSE: line=%q headers=%v err=%v", line, resp.Header, err)
+				}
+				// Stop must close SSE before waiting for handlers and releasing
+				// the root. Keep this connection open while stopping the server.
+				if err := server.Stop(); err != nil {
+					t.Fatalf("shutdown with active SSE: %v", err)
+				}
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("active SSE prevented preview owner from finishing")
+				}
+				if err := os.Rename(bundle, bundle+"-closed"); err != nil {
+					t.Fatalf("preview retained the bundle directory after shutdown: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestPreviewFileSystemKeepsSelectedRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows prevents renaming open root directories")
+	}
+	base := t.TempDir()
+	bundle := filepath.Join(base, "selected")
+	if err := os.MkdirAll(filepath.Join(bundle, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"index.html", "data/issue.json"} {
+		if err := os.WriteFile(filepath.Join(bundle, name), []byte("selected bundle"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	previewFS, err := validatePreviewBundle(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previewFS.Close()
+	moved := filepath.Join(base, "moved")
+	if err := os.Rename(bundle, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(bundle, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "index.html"), []byte("unselected replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := previewFS.Open("/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, readErr := io.ReadAll(file)
+	file.Close()
+	if readErr != nil || string(content) != "selected bundle" {
+		t.Fatalf("root replacement redirected preview: %q, %v", content, readErr)
+	}
+	recorder := httptest.NewRecorder()
+	NewPreviewServer(bundle, 9000).statusHandler(previewFS)(recorder, httptest.NewRequest("GET", "/__preview__/status", nil))
+	var status struct {
+		HasIndex  bool `json:"has_index"`
+		FileCount int  `json:"file_count"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil || !status.HasIndex || status.FileCount != 2 {
+		t.Fatalf("status changed its root after replacement: %s (%v)", recorder.Body.String(), err)
+	}
+	if err := os.Rename(filepath.Join(moved, "data"), filepath.Join(moved, "old-data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(bundle, filepath.Join(moved, "data")); err != nil {
+		t.Fatal(err)
+	}
+	file, err = previewFS.Open("/data/index.html")
+	if err == nil {
+		file.Close()
+		t.Fatal("parent replacement let preview escape its held root")
+	}
+}
+
+func TestPreviewFileSystemAllowsContainedRelativeSymlinks(t *testing.T) {
+	base := t.TempDir()
+	bundle := filepath.Join(base, "bundle")
+	if err := os.MkdirAll(filepath.Join(bundle, "assets"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "page.html"), []byte("contained page"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for path, target := range map[string]string{
+		filepath.Join(bundle, "index.html"):            "page.html",
+		filepath.Join(bundle, "assets", "linked.html"): "../page.html",
+		filepath.Join(base, "selected"):                "bundle",
+	} {
+		if err := os.Symlink(target, path); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+	}
+	previewFS, err := validatePreviewBundle(filepath.Join(base, "selected"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previewFS.Close()
+	for _, name := range []string{"/index.html", "/assets/linked.html"} {
+		file, err := previewFS.Open(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		content, readErr := io.ReadAll(file)
+		file.Close()
+		if readErr != nil || string(content) != "contained page" {
+			t.Fatalf("contained relative link %s: %q (%v)", name, content, readErr)
+		}
+	}
+}
 
 func TestNewPreviewServer(t *testing.T) {
 	server := NewPreviewServer("/tmp/test", 8080)
@@ -178,6 +470,7 @@ func TestPreviewFileServer_RejectsEscapedSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create preview filesystem: %v", err)
 	}
+	defer previewFS.Close()
 	server := httptest.NewServer(noCacheMiddleware(http.FileServer(previewFS)))
 	defer server.Close()
 
@@ -213,6 +506,7 @@ func TestSafePreviewDir_RejectsBackslashTraversalOnWindows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create preview filesystem: %v", err)
 	}
+	defer previewFS.Close()
 	file, err := previewFS.Open(`/..\secret.txt`)
 	if err == nil {
 		file.Close()
@@ -294,9 +588,14 @@ func TestPreviewServer_StatusHandler_DoesNotCountEscapedIndexSymlink(t *testing.
 	}
 
 	server := NewPreviewServer(bundleDir, 1234)
+	previewFS, err := newSafePreviewFileSystem(bundleDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previewFS.Close()
 	req := httptest.NewRequest(http.MethodGet, "/__preview__/status", nil)
 	rec := httptest.NewRecorder()
-	server.statusHandler(rec, req)
+	server.statusHandler(previewFS)(rec, req)
 
 	type statusResponse struct {
 		HasIndex bool `json:"has_index"`
@@ -429,10 +728,15 @@ func TestPreviewServer_StatusHandler_EmitsValidJSON(t *testing.T) {
 	}
 
 	server := NewPreviewServer(bundleDir, 1234)
+	previewFS, err := newSafePreviewFileSystem(bundleDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer previewFS.Close()
 
 	req := httptest.NewRequest(http.MethodGet, "/__preview__/status", nil)
 	rec := httptest.NewRecorder()
-	server.statusHandler(rec, req)
+	server.statusHandler(previewFS)(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rec.Code)
@@ -511,7 +815,7 @@ func TestPreviewServer_StatusJSONEncoding(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/__preview__/status", nil)
 	rec := httptest.NewRecorder()
 
-	server.statusHandler(rec, req)
+	server.statusHandler(nil)(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rec.Code)

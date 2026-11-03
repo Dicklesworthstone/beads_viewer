@@ -12,10 +12,12 @@ import (
 	iofs "io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -47,62 +49,15 @@ func NewPreviewServer(bundlePath string, port int) *PreviewServer {
 
 // Start starts the preview server and blocks until stopped.
 func (p *PreviewServer) Start() error {
-	previewFS, err := validatePreviewBundle(p.bundlePath)
-	if err != nil {
-		return err
-	}
-
-	mux := http.NewServeMux()
-
-	// Static file server with no-cache middleware
-	mux.Handle("/", noCacheMiddleware(http.FileServer(previewFS)))
-
-	// Status endpoint
-	mux.HandleFunc("/__preview__/status", p.statusHandler)
-
-	httpServer := &http.Server{
-		Addr:              fmt.Sprintf("127.0.0.1:%d", p.port),
-		Handler:           mux,
-		ReadTimeout:       10 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-
-	listener, err := net.Listen("tcp", httpServer.Addr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", httpServer.Addr, err)
-	}
-	defer listener.Close()
-
-	if err := p.publishServer(httpServer); err != nil {
-		return err
-	}
-
-	// Open browser after a short delay. The command and environment are
-	// resolved now (see prepareBrowserOpen); the goroutine only launches.
-	url := fmt.Sprintf("http://127.0.0.1:%d", p.port)
-	if opener, err := prepareBrowserOpen(url); err != nil {
-		fmt.Printf("Could not open browser: %v\n", err)
-		fmt.Printf("Open %s in your browser\n", url)
-	} else if opener != nil {
-		go func() {
-			time.Sleep(500 * time.Millisecond)
-			if err := opener.Start(); err != nil {
-				fmt.Printf("Could not open browser: %v\n", err)
-				fmt.Printf("Open %s in your browser\n", url)
-			}
-		}()
-	}
-
-	fmt.Printf("\nPreview server running at http://127.0.0.1:%d\n", p.port)
-	fmt.Printf("Serving: %s\n", p.bundlePath)
-	fmt.Println("\nPress Ctrl+C to stop")
-
-	return httpServer.Serve(listener)
+	return p.start(PreviewConfig{OpenBrowser: true})
 }
 
 // StartWithGracefulShutdown starts the server with signal handling for clean shutdown.
 func (p *PreviewServer) StartWithGracefulShutdown() error {
+	return p.startWithGracefulShutdown(PreviewConfig{OpenBrowser: true})
+}
+
+func (p *PreviewServer) startWithGracefulShutdown(config PreviewConfig) error {
 	// Channel to receive OS signals
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -115,17 +70,15 @@ func (p *PreviewServer) StartWithGracefulShutdown() error {
 
 	// Start server in goroutine
 	go func() {
-		err := p.Start()
-		if errors.Is(err, http.ErrServerClosed) {
-			err = nil
-		}
-		serverDone <- err
+		serverDone <- p.start(config)
 	}()
 
 	// Wait for either signal or server completion.
 	select {
 	case <-stop:
-		fmt.Println("\nShutting down preview server...")
+		if !config.Quiet {
+			fmt.Println("\nShutting down preview server...")
+		}
 		stopErr := p.Stop()
 		// Stop force-closes the listener if graceful shutdown times out, so the
 		// owner can always join the server goroutine before returning.
@@ -138,13 +91,19 @@ func (p *PreviewServer) StartWithGracefulShutdown() error {
 
 // Stop gracefully stops the preview server.
 func (p *PreviewServer) Stop() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	server := p.requestStop()
+	server, hub := p.requestStop()
+	if hub != nil {
+		hub.Stop()
+	}
 	if server == nil {
 		return nil
 	}
+	return shutdownPreviewServer(server)
+}
+
+func shutdownPreviewServer(server *http.Server) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		shutdownErr := fmt.Errorf("graceful preview shutdown: %w", err)
 		// Shutdown leaves the server running when its context expires. Close is
@@ -157,7 +116,7 @@ func (p *PreviewServer) Stop() error {
 	return nil
 }
 
-func (p *PreviewServer) publishServer(server *http.Server) error {
+func (p *PreviewServer) publishServer(server *http.Server, port int, hub *LiveReloadHub) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -168,62 +127,71 @@ func (p *PreviewServer) publishServer(server *http.Server) error {
 		return fmt.Errorf("preview server already started")
 	}
 	p.server = server
+	p.port = port
+	p.liveReloadHub = hub
 	return nil
 }
 
-func (p *PreviewServer) requestStop() *http.Server {
+func (p *PreviewServer) requestStop() (*http.Server, *LiveReloadHub) {
 	p.mu.Lock()
 	p.stopRequested = true
 	server := p.server
+	hub := p.liveReloadHub
 	p.mu.Unlock()
-	return server
+	return server, hub
 }
 
 // Port returns the port the server is running on.
 func (p *PreviewServer) Port() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.port
 }
 
 // URL returns the full URL of the preview server.
 func (p *PreviewServer) URL() string {
-	return fmt.Sprintf("http://127.0.0.1:%d", p.port)
+	return fmt.Sprintf("http://127.0.0.1:%d", p.Port())
 }
 
 // statusHandler returns the preview server status as JSON.
-func (p *PreviewServer) statusHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
+func (p *PreviewServer) statusHandler(previewFS *safePreviewDir) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
 
-	hasIndex := hasValidPreviewIndex(p.bundlePath)
+		hasIndex := previewFS != nil && validatePreviewIndex(previewFS, p.bundlePath) == nil
 
-	// Get bundle info
-	var fileCount int
-	filepath.Walk(p.bundlePath, func(path string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() {
-			fileCount++
+		// Get bundle info
+		var fileCount int
+		if previewFS != nil {
+			_ = iofs.WalkDir(previewFS.root.FS(), ".", func(_ string, entry iofs.DirEntry, err error) error {
+				if err == nil && !entry.IsDir() {
+					fileCount++
+				}
+				return nil
+			})
 		}
-		return nil
-	})
 
-	type statusResponse struct {
-		Status     string `json:"status"`
-		Port       int    `json:"port"`
-		BundlePath string `json:"bundle_path"`
-		HasIndex   bool   `json:"has_index"`
-		FileCount  int    `json:"file_count"`
-	}
+		type statusResponse struct {
+			Status     string `json:"status"`
+			Port       int    `json:"port"`
+			BundlePath string `json:"bundle_path"`
+			HasIndex   bool   `json:"has_index"`
+			FileCount  int    `json:"file_count"`
+		}
 
-	resp := statusResponse{
-		Status:     "running",
-		Port:       p.port,
-		BundlePath: strings.ToValidUTF8(p.bundlePath, "?"),
-		HasIndex:   hasIndex,
-		FileCount:  fileCount,
-	}
+		resp := statusResponse{
+			Status:     "running",
+			Port:       p.Port(),
+			BundlePath: strings.ToValidUTF8(p.bundlePath, "?"),
+			HasIndex:   hasIndex,
+			FileCount:  fileCount,
+		}
 
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		http.Error(w, fmt.Sprintf("encode preview status: %v", err), http.StatusInternalServerError)
-		return
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			http.Error(w, fmt.Sprintf("encode preview status: %v", err), http.StatusInternalServerError)
+			return
+		}
 	}
 }
 
@@ -239,23 +207,87 @@ func noCacheMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// previewRequestGuard binds browser access to the listener's local origin.
+// Loopback binding alone does not reject a hostile Host after DNS rebinding.
+// Apply this outside the mux so data, status and live-reload share the policy.
+func previewRequestGuard(port int, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		authority, allowed := previewAuthority(r.Host, port)
+		origins := r.Header.Values("Origin")
+		if allowed && len(origins) != 0 {
+			allowed = len(origins) == 1
+			if allowed {
+				origin, err := url.Parse(origins[0])
+				allowed = err == nil && origin.Scheme == "http" && origin.User == nil && origin.Opaque == "" &&
+					origin.Path == "" && origin.RawQuery == "" && !origin.ForceQuery && !strings.Contains(origins[0], "#")
+				if allowed {
+					originAuthority, local := previewAuthority(origin.Host, port)
+					allowed = local && originAuthority == authority
+				}
+			}
+		}
+		if !allowed {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "preview requests must use the local preview origin", http.StatusForbidden)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func previewAuthority(authority string, port int) (string, bool) {
+	host, rawPort, err := net.SplitHostPort(authority)
+	if err != nil {
+		// An omitted port means HTTP's default, not the preview's chosen port.
+		if strings.ContainsAny(authority, ":[]") {
+			return "", false
+		}
+		host, rawPort = authority, "80"
+	}
+	for _, digit := range rawPort {
+		if digit < '0' || digit > '9' {
+			return "", false
+		}
+	}
+	parsedPort, err := strconv.Atoi(rawPort)
+	if err != nil || parsedPort != port || port <= 0 || port > 65535 {
+		return "", false
+	}
+	host = strings.ToLower(host)
+	if host != "localhost" {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return "", false
+		}
+		host = ip.String()
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), true
+}
+
 type safePreviewDir struct {
-	root string
+	root *os.Root
 }
 
-func newSafePreviewFileSystem(bundlePath string) (http.FileSystem, error) {
-	root, err := filepath.Abs(bundlePath)
+func newSafePreviewFileSystem(bundlePath string) (*safePreviewDir, error) {
+	root, err := os.OpenRoot(bundlePath)
 	if err != nil {
-		return nil, fmt.Errorf("resolve bundle path: %w", err)
+		return nil, fmt.Errorf("open preview directory: %w", err)
 	}
-	root, err = filepath.EvalSymlinks(root)
-	if err != nil {
-		return nil, fmt.Errorf("resolve bundle symlinks: %w", err)
-	}
-	return safePreviewDir{root: root}, nil
+	return &safePreviewDir{root: root}, nil
 }
 
-func validatePreviewBundle(bundlePath string) (http.FileSystem, error) {
+func (d *safePreviewDir) Close() error {
+	return d.root.Close()
+}
+
+func validatePreviewBundle(bundlePath string) (*safePreviewDir, error) {
 	if bundlePath == "" {
 		return nil, fmt.Errorf("bundle path is required")
 	}
@@ -275,6 +307,7 @@ func validatePreviewBundle(bundlePath string) (http.FileSystem, error) {
 		return nil, err
 	}
 	if err := validatePreviewIndex(previewFS, bundlePath); err != nil {
+		previewFS.Close()
 		return nil, err
 	}
 
@@ -309,15 +342,7 @@ func validatePreviewIndex(previewFS http.FileSystem, bundlePath string) error {
 	return nil
 }
 
-func hasValidPreviewIndex(bundlePath string) bool {
-	previewFS, err := newSafePreviewFileSystem(bundlePath)
-	if err != nil {
-		return false
-	}
-	return validatePreviewIndex(previewFS, bundlePath) == nil
-}
-
-func (d safePreviewDir) Open(name string) (http.File, error) {
+func (d *safePreviewDir) Open(name string) (http.File, error) {
 	rel := strings.TrimPrefix(path.Clean("/"+name), "/")
 	if rel == "" {
 		rel = "."
@@ -330,28 +355,17 @@ func (d safePreviewDir) Open(name string) (http.File, error) {
 		return nil, iofs.ErrPermission
 	}
 
-	fullPath := filepath.Join(d.root, localRel)
-	if !pathWithinRoot(d.root, fullPath) {
-		return nil, iofs.ErrPermission
-	}
-
-	resolvedPath, err := filepath.EvalSymlinks(fullPath)
+	file, err := d.root.Open(localRel)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		// Root's path-escape errors intentionally have no public sentinel.
+		// Treat every other failed open as forbidden, without exposing details
+		// about the filesystem beyond the selected directory.
+		return nil, &os.PathError{Op: "open", Path: name, Err: iofs.ErrPermission}
 	}
-	if !pathWithinRoot(d.root, resolvedPath) {
-		return nil, iofs.ErrPermission
-	}
-
-	return os.Open(resolvedPath)
-}
-
-func pathWithinRoot(root, candidate string) bool {
-	rel, err := filepath.Rel(root, candidate)
-	if err != nil {
-		return false
-	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel))
+	return file, nil
 }
 
 // FindAvailablePort finds an available port in the given range.
@@ -414,11 +428,6 @@ func DefaultPreviewConfig() PreviewConfig {
 
 // StartPreviewWithConfig starts a preview server with the given configuration.
 func StartPreviewWithConfig(config PreviewConfig) error {
-	previewFS, err := validatePreviewBundle(config.BundlePath)
-	if err != nil {
-		return err
-	}
-
 	// Auto-select port if needed
 	port := config.Port
 	if port == 0 {
@@ -429,14 +438,27 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 		}
 	}
 
-	// Create server
 	server := NewPreviewServer(config.BundlePath, port)
+	return server.startWithGracefulShutdown(config)
+}
+
+// start owns the selected root until all HTTP handlers have stopped. Both
+// public preview entry points use this same filesystem and request boundary.
+func (p *PreviewServer) start(config PreviewConfig) error {
+	previewFS, err := validatePreviewBundle(p.bundlePath)
+	if err != nil {
+		return err
+	}
+	defer previewFS.Close()
+
+	port := p.Port()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
 	defer listener.Close()
+	port = listener.Addr().(*net.TCPAddr).Port
 
 	// Need to initialize the server first
 	mux := http.NewServeMux()
@@ -446,7 +468,7 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 	var liveReloadHub *LiveReloadHub
 	if config.LiveReload {
 		var err error
-		liveReloadHub, err = NewLiveReloadHub(config.BundlePath)
+		liveReloadHub, err = NewLiveReloadHub(p.bundlePath)
 		if err != nil {
 			if !config.Quiet {
 				fmt.Printf("Warning: Could not enable live-reload: %v\n", err)
@@ -459,6 +481,7 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 				liveReloadHub.Stop()
 				liveReloadHub = nil
 			} else {
+				defer liveReloadHub.Stop()
 				// Add SSE endpoint for live-reload and the script that subscribes
 				// to it (served as a file so the dashboard's CSP, which forbids
 				// inline scripts, still lets it run).
@@ -475,22 +498,27 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 		mux.Handle("/", noCacheMiddleware(fileServer))
 	}
 
-	mux.HandleFunc("/__preview__/status", server.statusHandler)
-	server.liveReloadHub = liveReloadHub
+	mux.HandleFunc("/__preview__/status", p.statusHandler(previewFS))
 
 	httpServer := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
+		Addr:              listener.Addr().String(),
+		Handler:           previewRequestGuard(port, mux),
 		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
+	}
+	if err := p.publishServer(httpServer, port, liveReloadHub); err != nil {
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
 	}
 
 	// Handle opening browser. Resolve the command and environment NOW; the
 	// delayed goroutine must not consult PATH/env later, when a different
 	// caller (or the next test) may have changed them.
 	if config.OpenBrowser {
-		url := server.URL()
+		url := p.URL()
 		opener, err := prepareBrowserOpen(url)
 		if err != nil {
 			if !config.Quiet {
@@ -513,46 +541,21 @@ func StartPreviewWithConfig(config PreviewConfig) error {
 	// Print status message
 	if !config.Quiet {
 		fmt.Printf("\nPreview server running at http://127.0.0.1:%d\n", port)
-		fmt.Printf("Serving: %s\n", config.BundlePath)
+		fmt.Printf("Serving: %s\n", p.bundlePath)
 		if liveReloadHub != nil {
 			fmt.Println("Live-reload: enabled (browser will refresh on file changes)")
 		}
 		fmt.Println("\nPress Ctrl+C to stop")
 	}
 
-	// Channel to receive OS signals
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(stop)
-
-	// Channel to receive server errors
-	errChan := make(chan error, 1)
-
-	// Start server in goroutine
-	go func() {
-		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errChan <- err
-		}
-	}()
-
-	// Wait for either signal or error
-	select {
-	case <-stop:
-		if !config.Quiet {
-			fmt.Println("\nShutting down preview server...")
-		}
-		// Stop live-reload hub if running
-		if liveReloadHub != nil {
-			liveReloadHub.Stop()
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return httpServer.Shutdown(ctx)
-	case err := <-errChan:
-		// Stop live-reload hub on error
-		if liveReloadHub != nil {
-			liveReloadHub.Stop()
-		}
-		return err
+	serveErr := httpServer.Serve(listener)
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		serveErr = nil
 	}
+	if liveReloadHub != nil {
+		liveReloadHub.Stop()
+	}
+	// Serve returns as soon as Shutdown closes the listener, before active
+	// handlers finish. Join that drain before releasing their directory root.
+	return errors.Join(serveErr, shutdownPreviewServer(httpServer))
 }

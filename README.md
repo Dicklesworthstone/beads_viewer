@@ -2919,6 +2919,13 @@ bv --export-pages ./bv-pages --no-hooks                     # Skip .bv/hooks.yam
 bv --preview-pages ./bv-pages                   # Serve at localhost:9000 (or next available port)
 ```
 
+Preview listens on loopback. Use the printed `http://127.0.0.1:PORT` URL or
+`http://localhost:PORT`; requests with unrelated hostnames or a different browser
+origin are rejected, including status and live-reload requests. File reads stay
+within the selected bundle directory. Replacing individual files supports live
+reload; if you replace the entire directory, restart preview to select the new
+directory.
+
 If `.bv/hooks.yaml` defines hooks, direct exports require `--trust-hooks` with
 the digest reviewed through `bv --hooks-info`, or `--no-hooks` to skip them.
 This also applies to noninteractive and watch exports. A changed hook

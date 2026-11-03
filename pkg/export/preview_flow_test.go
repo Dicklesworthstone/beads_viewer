@@ -18,6 +18,42 @@ func TestPreviewServer_StartWithGracefulShutdown_ReturnsStartError(t *testing.T)
 	}
 }
 
+func TestPreviewServerReleasesRootOnFailedOrCanceledStart(t *testing.T) {
+	for _, mode := range []string{"invalid index", "occupied port", "already stopped"} {
+		t.Run(mode, func(t *testing.T) {
+			bundle := t.TempDir()
+			port := 0
+			if mode != "invalid index" {
+				if err := os.WriteFile(filepath.Join(bundle, "index.html"), []byte("<html>fixture</html>"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "occupied port" {
+				listener, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer listener.Close()
+				port = listener.Addr().(*net.TCPAddr).Port
+			}
+			server := NewPreviewServer(bundle, port)
+			if mode == "already stopped" {
+				if err := server.Stop(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := server.StartWithGracefulShutdown()
+			if (err == nil) != (mode == "already stopped") {
+				t.Fatalf("unexpected startup outcome: %v", err)
+			}
+			// On Windows, leaking the directory handle would prevent this move.
+			if err := os.Rename(bundle, bundle+"-released"); err != nil {
+				t.Fatalf("failed startup retained its preview root: %v", err)
+			}
+		})
+	}
+}
+
 func TestPreviewServer_StartWithGracefulShutdown_ReturnsAfterExternalStop(t *testing.T) {
 	bundleDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(bundleDir, "index.html"), []byte("<!doctype html><title>ok</title>"), 0644); err != nil {
