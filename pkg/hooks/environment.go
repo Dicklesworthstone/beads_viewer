@@ -44,7 +44,7 @@ func buildHookEnvironment(parent, contextEnv []string, overrides map[string]stri
 		// sensitive even when upper-casing its original form did not (for
 		// example, BV_TOKEN lower-cases to bv_token). Expansion must never
 		// recover a value through a spelling that escaped the parent filter.
-		sensitive := isSensitiveEnvKey(name) || windows && isSensitiveEnvKey(key)
+		sensitive := isProtectedHookEnvKey(name) || windows && isProtectedHookEnvKey(key)
 		if sensitive && !allowed[key] {
 			continue
 		}
@@ -83,6 +83,39 @@ func buildHookEnvironment(parent, contextEnv []string, overrides map[string]stri
 		env = append(env, entry.name+"="+entry.value)
 	}
 	return env, nil
+}
+
+// isProtectedHookEnvKey includes established credential containers whose names
+// do not contain the ordinary secret markers. Git's indexed configuration is
+// removed as a complete transport by default: retaining GIT_CONFIG_COUNT while
+// withholding its values would break every child Git command. Each name still
+// requires its own explicit user grant; a count or key never grants a value.
+func isProtectedHookEnvKey(name string) bool {
+	if isSensitiveEnvKey(name) {
+		return true
+	}
+	upper := strings.ToUpper(name)
+	switch upper {
+	case "DOCKER_AUTH_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS":
+		return true
+	}
+	for _, prefix := range []string{"GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"} {
+		index, ok := strings.CutPrefix(upper, prefix)
+		if !ok || index == "" {
+			continue
+		}
+		decimal := true
+		for i := 0; i < len(index); i++ {
+			if index[i] < '0' || index[i] > '9' {
+				decimal = false
+				break
+			}
+		}
+		if decimal {
+			return true
+		}
+	}
+	return false
 }
 
 // validateEnvGrants accepts names, never values, patterns, or shell syntax.

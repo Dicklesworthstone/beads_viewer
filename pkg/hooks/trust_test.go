@@ -1,10 +1,13 @@
 package hooks
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -206,7 +209,7 @@ func TestShellInvocationPreservesCommandAndDisablesWindowsAutoRun(t *testing.T) 
 	}{
 		{"linux", "sh", []string{"-c", command}},
 		{"darwin", "sh", []string{"-c", command}},
-		{"windows", "cmd", []string{"/D", "/C", command}},
+		{"windows", "cmd", []string{"/D", "/S", "/C", command}},
 	} {
 		t.Run(tc.platform, func(t *testing.T) {
 			shell, args := shellInvocation(tc.platform, command)
@@ -214,5 +217,21 @@ func TestShellInvocationPreservesCommandAndDisablesWindowsAutoRun(t *testing.T) 
 				t.Fatalf("shell invocation = %q %q, want %q %q", shell, args, tc.shell, tc.args)
 			}
 		})
+	}
+}
+
+func TestExecutorRejectsPreviousLifetimePolicyApproval(t *testing.T) {
+	config := &Config{Hooks: HooksByPhase{PreExport: []Hook{{Name: "reviewed", Command: "echo reviewed"}}}}
+	// Frozen v1 serialized approval for this declaration. Execution now owns
+	// descendant lifetimes and protects additional credential transports, so
+	// approval of the old interpretation must not authorize the new policy.
+	legacy := fmt.Sprintf(`{"policy":"bv-project-hooks-v1","platform":%q,"source_hash":"","hooks":{"pre-export":[{"name":"reviewed","command":"echo reviewed"}]}}`, runtime.GOOS)
+	digest := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(legacy)))
+	executor := NewExecutor(config, ExportContext{}, ExecutionOptions{TrustDigest: digest})
+	if err := executor.RunPreExport(); !errors.Is(err, ErrUntrustedHooks) {
+		t.Fatalf("previous lifetime policy still authorized hook execution: %v", err)
+	}
+	if len(executor.Results()) != 0 {
+		t.Fatal("hook ran with an outdated policy approval")
 	}
 }

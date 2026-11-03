@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -91,6 +92,154 @@ func TestBuildHookEnvironmentUserGrantsOnlySelectedVariables(t *testing.T) {
 			}
 			if got["NORMAL"] != "value" || got["C"] != "" || got["D"] != "" {
 				t.Fatalf("unexpected ordinary or withheld variables: %v", got)
+			}
+		})
+	}
+}
+
+func TestBuildHookEnvironmentCredentialContainersRequireExactGrants(t *testing.T) {
+	parent := []string{
+		"DOCKER_AUTH_CONFIG=fake-docker-sentinel",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=http.extraHeader",
+		"GIT_CONFIG_VALUE_0=fake-git-header-sentinel",
+		"GIT_CONFIG_PARAMETERS=fake-git-parameters-sentinel",
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=ordinary-config-path",
+	}
+	overrides := map[string]string{
+		"A_DOCKER":     "${DOCKER_AUTH_CONFIG}",
+		"B_COUNT":      "${GIT_CONFIG_COUNT}",
+		"C_KEY":        "${GIT_CONFIG_KEY_0}",
+		"D_VALUE":      "${GIT_CONFIG_VALUE_0}",
+		"E_PARAMETERS": "${GIT_CONFIG_PARAMETERS}",
+		"F_CHAIN":      "${D_VALUE}",
+	}
+	aliases := map[string]string{
+		"DOCKER_AUTH_CONFIG":    "A_DOCKER",
+		"GIT_CONFIG_COUNT":      "B_COUNT",
+		"GIT_CONFIG_KEY_0":      "C_KEY",
+		"GIT_CONFIG_VALUE_0":    "D_VALUE",
+		"GIT_CONFIG_PARAMETERS": "E_PARAMETERS",
+	}
+	for _, windows := range []bool{false, true} {
+		for _, tc := range []struct {
+			name   string
+			grants []string
+		}{
+			{name: "none"},
+			{name: "docker_only", grants: []string{"DOCKER_AUTH_CONFIG"}},
+			{name: "git_value_for_alias_only", grants: []string{"GIT_CONFIG_VALUE_0"}},
+			{name: "git_count_is_not_a_value_grant", grants: []string{"GIT_CONFIG_COUNT"}},
+			{name: "complete_indexed_git", grants: []string{"GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"}},
+			{name: "packed_git_only", grants: []string{"GIT_CONFIG_PARAMETERS"}},
+		} {
+			t.Run(map[bool]string{false: "unix", true: "windows"}[windows]+"/"+tc.name, func(t *testing.T) {
+				env, err := buildHookEnvironment(parent, nil, overrides, tc.grants, windows)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := hookEnvironmentValues(t, env, windows)
+				granted := make(map[string]bool, len(tc.grants))
+				for _, name := range tc.grants {
+					granted[name] = true
+				}
+				for _, entry := range parent[:5] {
+					name, value, _ := strings.Cut(entry, "=")
+					actual, exists := got[name]
+					want := ""
+					if granted[name] {
+						want = value
+					}
+					if exists != granted[name] || actual != want {
+						t.Errorf("source %s: value=%q, present=%v; want value=%q, present=%v", name, actual, exists, want, granted[name])
+					}
+					if got[aliases[name]] != want {
+						t.Errorf("alias %s=%q, want %q", aliases[name], got[aliases[name]], want)
+					}
+				}
+				if got["F_CHAIN"] != got["D_VALUE"] {
+					t.Fatal("chained alias did not use the same filtered source")
+				}
+				if got["GIT_CONFIG_NOSYSTEM"] != "1" || got["GIT_CONFIG_GLOBAL"] != "ordinary-config-path" {
+					t.Fatal("ordinary non-transport Git controls were removed")
+				}
+			})
+		}
+	}
+}
+
+func TestBuildHookEnvironmentCredentialContainerCaseFolding(t *testing.T) {
+	for _, windows := range []bool{false, true} {
+		parent := []string{"Docker_Auth_Config=docker-sentinel", "Git_Config_Value_12=git-sentinel"}
+		overrides := map[string]string{"A": "${DOCKER_AUTH_CONFIG}", "B": "${GIT_CONFIG_VALUE_12}"}
+		for _, grant := range []bool{false, true} {
+			var grants []string
+			if grant {
+				grants = []string{"DOCKER_AUTH_CONFIG", "GIT_CONFIG_VALUE_12"}
+			}
+			env, err := buildHookEnvironment(parent, nil, overrides, grants, windows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := hookEnvironmentValues(t, env, windows)
+			if windows && grant {
+				if got["A"] != "docker-sentinel" || got["B"] != "git-sentinel" {
+					t.Fatalf("Windows exact-name grant failed across case variants: %v", got)
+				}
+			} else if strings.Contains(strings.Join(env, "\n"), "sentinel") {
+				t.Fatalf("container grant did not follow platform name semantics (windows=%v, grant=%v): %v", windows, grant, got)
+			}
+		}
+	}
+}
+
+func TestBuildHookEnvironmentGitTransportDoesNotLeaveOrphanCount(t *testing.T) {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git is unavailable for credential transport subprocess regression")
+	}
+	dir := t.TempDir()
+	globalConfig := filepath.Join(dir, "empty.gitconfig")
+	if err := os.WriteFile(globalConfig, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Read only these fake runtime values; no user or system Git config is used.
+	parent := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_CONFIG_GLOBAL=" + globalConfig,
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=bv.audit-auth",
+		"GIT_CONFIG_VALUE_0=fake-indexed-sentinel",
+		"GIT_CONFIG_PARAMETERS='bv.audit-auth=fake-packed-sentinel'",
+	}
+	for _, tc := range []struct {
+		name   string
+		grants []string
+		want   string
+	}{
+		{name: "none"},
+		{name: "value_only_is_not_active_config", grants: []string{"GIT_CONFIG_VALUE_0"}},
+		{name: "complete_indexed", grants: []string{"GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"}, want: "fake-indexed-sentinel"},
+		{name: "packed", grants: []string{"GIT_CONFIG_PARAMETERS"}, want: "fake-packed-sentinel"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, err := buildHookEnvironment(parent, nil, nil, tc.grants, runtime.GOOS == "windows")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(gitPath, "config", "--get", "bv.audit-auth")
+			cmd.Dir = dir
+			cmd.Env = env
+			output, err := cmd.CombinedOutput()
+			if tc.want == "" {
+				exit, ok := err.(*exec.ExitError)
+				if !ok || exit.ExitCode() != 1 || len(output) != 0 {
+					t.Fatalf("Git should report an absent key, without an orphaned config error: err=%v output=%q", err, output)
+				}
+			} else if err != nil || strings.TrimSpace(string(output)) != tc.want {
+				t.Fatalf("explicitly granted Git config unavailable: err=%v output=%q want=%q", err, output, tc.want)
 			}
 		})
 	}

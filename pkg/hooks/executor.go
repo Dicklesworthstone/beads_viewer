@@ -3,6 +3,7 @@ package hooks
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -12,16 +13,47 @@ import (
 	"time"
 )
 
+// HookOutputLimit is the maximum number of bytes retained from each output
+// stream of each hook. Excess output is drained without retaining it.
+const HookOutputLimit = 1 << 20
+
+// A descendant that escapes process cleanup must not keep an export waiting
+// indefinitely for inherited stdout/stderr handles to close.
+const hookWaitDelay = 250 * time.Millisecond
+
 // HookResult contains the result of a hook execution
 type HookResult struct {
-	Hook     Hook
-	Phase    HookPhase
-	Success  bool
-	Stdout   string
-	Stderr   string
-	Duration time.Duration
-	Error    error
+	Hook            Hook
+	Phase           HookPhase
+	Success         bool
+	Stdout          string
+	Stderr          string
+	StdoutTruncated bool
+	StderrTruncated bool
+	Duration        time.Duration
+	Error           error
 }
+
+// cappedHookOutput always accepts the full write so a verbose child cannot
+// deadlock on an undrained pipe or grow the exporter's memory without bound.
+// Each stream has its own writer, used by one os/exec copying goroutine.
+type cappedHookOutput struct {
+	buffer    bytes.Buffer
+	truncated bool
+}
+
+func (b *cappedHookOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	remaining := HookOutputLimit - b.buffer.Len()
+	if len(p) > remaining {
+		p = p[:remaining]
+		b.truncated = true
+	}
+	_, _ = b.buffer.Write(p)
+	return n, nil
+}
+
+func (b *cappedHookOutput) String() string { return b.buffer.String() }
 
 // Executor runs hooks with proper environment and timeout handling
 type Executor struct {
@@ -139,10 +171,11 @@ func (e *Executor) RunPostExport() error {
 }
 
 // shellInvocation preserves the approved command as one argument. On Windows,
-// /D suppresses registry AutoRun commands before the approved hook executes.
+// configureHookShell supplies cmd.exe's raw command line; Go's default Windows
+// argument escaping is intended for a different parser.
 func shellInvocation(platform, command string) (string, []string) {
 	if platform == "windows" {
-		return "cmd", []string{"/D", "/C", command}
+		return "cmd", []string{"/D", "/S", "/C", command}
 	}
 	return "sh", []string{"-c", command}
 }
@@ -172,7 +205,9 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 	// Create command - use shell to interpret the command
 	shell, args := shellInvocation(runtime.GOOS, hook.Command)
 	cmd := exec.CommandContext(ctx, shell, args...)
+	configureHookShell(cmd, hook.Command)
 	cmd.Dir = e.config.projectDir
+	cmd.WaitDelay = hookWaitDelay
 
 	// Expansion and execution see the same filtered environment. Only a grant
 	// supplied by the invoking user can restore a protected parent variable.
@@ -183,27 +218,26 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 		return result
 	}
 
-	// Capture output
-	var stdout, stderr bytes.Buffer
+	// Retain a bounded prefix of each stream and continue draining the rest.
+	var stdout, stderr cappedHookOutput
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	// Run the command
-	err = cmd.Run()
+	// Own the subprocess group/job for the lifetime of this synchronous hook.
+	err = runHookCommand(ctx, cmd)
 	result.Duration = time.Since(start)
 	result.Stdout = strings.TrimSpace(stdout.String())
 	result.Stderr = strings.TrimSpace(stderr.String())
+	result.StdoutTruncated = stdout.truncated
+	result.StderrTruncated = stderr.truncated
 
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			result.Error = fmt.Errorf("timeout after %v", timeout)
-		} else {
-			result.Error = err
-		}
-		result.Success = false
-	} else {
-		result.Success = true
+	// The immediate shell can exit successfully while descendants hold its
+	// pipes open. A nil Wait error must not turn an expired deadline into success.
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		err = errors.Join(fmt.Errorf("timeout after %v: %w", timeout, ctx.Err()), err)
 	}
+	result.Error = err
+	result.Success = err == nil
 
 	return result
 }
@@ -272,6 +306,12 @@ func (e *Executor) Summary() string {
 			if r.Stderr != "" {
 				sb.WriteString(fmt.Sprintf("         stderr: %s\n", truncate(r.Stderr, 200)))
 			}
+		}
+		if r.StdoutTruncated {
+			sb.WriteString(fmt.Sprintf("         stdout truncated after %d bytes\n", HookOutputLimit))
+		}
+		if r.StderrTruncated {
+			sb.WriteString(fmt.Sprintf("         stderr truncated after %d bytes\n", HookOutputLimit))
 		}
 	}
 

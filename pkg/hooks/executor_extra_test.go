@@ -38,6 +38,9 @@ func TestRunPreExportTimeout(t *testing.T) {
 	if !strings.Contains(results[0].Error.Error(), "timeout") {
 		t.Fatalf("expected a timeout rather than an unrelated failure, got %v", results[0].Error)
 	}
+	if results[0].Duration >= 750*time.Millisecond {
+		t.Errorf("timeout waited for the one-second shell descendant: %v", results[0].Duration)
+	}
 }
 
 // TestRunPostExportContinue verifies post-export honors on_error=continue (default).

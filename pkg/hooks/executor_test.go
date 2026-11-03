@@ -257,7 +257,7 @@ func TestExecutorHookTimeout(t *testing.T) {
 			PreExport: []Hook{
 				{
 					Name:    "slow-hook",
-					Command: "sleep 10",
+					Command: "sleep 2",
 					Timeout: 100 * time.Millisecond,
 					OnError: "fail",
 				},
@@ -289,6 +289,9 @@ func TestExecutorHookTimeout(t *testing.T) {
 
 	if results[0].Duration < 100*time.Millisecond {
 		t.Errorf("expected duration >= 100ms, got %v", results[0].Duration)
+	}
+	if results[0].Duration >= time.Second {
+		t.Errorf("timeout waited for the two-second shell descendant: %v", results[0].Duration)
 	}
 }
 

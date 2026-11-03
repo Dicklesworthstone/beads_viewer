@@ -47,7 +47,7 @@ func (c *Config) Digest() (string, error) {
 		Platform   string       `json:"platform"`
 		SourceHash string       `json:"source_hash"`
 		Hooks      HooksByPhase `json:"hooks"`
-	}{"bv-project-hooks-v1", runtime.GOOS, c.sourceHash, c.Hooks})
+	}{"bv-project-hooks-v2", runtime.GOOS, c.sourceHash, c.Hooks})
 	if err != nil {
 		return "", fmt.Errorf("fingerprinting hooks: %w", err)
 	}
