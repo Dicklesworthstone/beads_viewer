@@ -108,7 +108,16 @@ Vendoring covers the Go module dependencies, not the compiler. When your Go diff
 bd export -o .beads/issues.jsonl
 ```
 
-Once the file exists, `bv` works identically regardless of which tool produced it.
+When loading a detected `bd`/Dolt workspace, `bv` refreshes the compatibility
+export automatically. The exporter has a bounded runtime and diagnostic capture.
+Its output is staged separately and published only after successful execution
+and JSONL validation, so a failed or incomplete refresh preserves the previous
+snapshot. Empty exports and mixed issue/non-issue `bd` records remain supported.
+
+If a refresh fails, `bv` can still display the previous export, but reports its
+source as stale and withholds actionable claims. Without a previous export,
+loading fails with guidance to run `bd export` explicitly. Running that command
+after mutations also refreshes an already open viewer's watched JSONL file.
 
 ---
 

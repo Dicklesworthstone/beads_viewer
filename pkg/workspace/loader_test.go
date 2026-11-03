@@ -904,9 +904,9 @@ func TestLoadAllFromRelativeConfigRefreshesCorrectBDRepoWithSanitizedEnvironment
 		t.Fatalf("create fake bd directory: %v", err)
 	}
 	observationPath := filepath.Join(workspaceRoot, "bd-observation.txt")
+	freshFixture := `{"id":"TARGET-FRESH","title":"Target refreshed export","status":"open","issue_type":"task"}` + "\n"
 	script := "#!/bin/sh\n" +
-		// Capability discovery is separate from this fake's deliberately failing
-		// export. Keep the export observation and failure assertions unchanged.
+		// Capability discovery must not overwrite the export observation.
 		"if [ \"$1\" = update ] && [ \"$2\" = --help ]; then printf '%s\\n' '--db --json'; exit 0; fi\n" +
 		"{\n" +
 		"  printf 'command=%s %s\\n' \"$1\" \"$2\"\n" +
@@ -915,11 +915,14 @@ func TestLoadAllFromRelativeConfigRefreshesCorrectBDRepoWithSanitizedEnvironment
 		"  printf 'beads_db=%s\\n' \"${BEADS_DB-unset}\"\n" +
 		"  printf 'output=%s\\n' \"$3\"\n" +
 		"} > '" + observationPath + "'\n" +
-		"printf 'workspace-intentional-refresh-failure\\n' >&2\n" +
-		"exit 23\n"
-	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
-		t.Fatalf("write fake bd: %v", err)
+		"printf '%s\\n' '" + strings.TrimSuffix(freshFixture, "\n") + "' > \"$3\"\n"
+	writeFakeBD := func(ending string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script+ending), 0o755); err != nil {
+			t.Fatalf("write fake bd: %v", err)
+		}
 	}
+	writeFakeBD("printf 'workspace-intentional-refresh-failure\\n' >&2\nexit 23\n")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	oldWD, err := os.Getwd()
@@ -965,21 +968,73 @@ func TestLoadAllFromRelativeConfigRefreshesCorrectBDRepoWithSanitizedEnvironment
 	if err != nil {
 		t.Fatalf("resolve target issues path: %v", err)
 	}
-	observation, err := os.ReadFile(observationPath)
-	if err != nil {
-		t.Fatalf("read fake bd observation: %v", err)
-	}
-	for _, want := range []string{
-		"command=export -o",
-		"pwd=" + filepath.Dir(absTargetBeads),
-		"beads_dir=" + absTargetBeads,
-		"beads_db=unset",
-		"output=" + absTargetIssues,
-	} {
-		if !strings.Contains(string(observation), want+"\n") {
-			t.Fatalf("bd observation %q missing exact line %q", observation, want)
+	checkObservation := func() {
+		t.Helper()
+		observation, err := os.ReadFile(observationPath)
+		if err != nil {
+			t.Fatalf("read fake bd observation: %v", err)
+		}
+		for _, want := range []string{
+			"command=export -o",
+			"pwd=" + filepath.Dir(absTargetBeads),
+			"beads_dir=" + absTargetBeads,
+			"beads_db=unset",
+		} {
+			if !strings.Contains(string(observation), want+"\n") {
+				t.Fatalf("bd observation %q missing exact line %q", observation, want)
+			}
+		}
+		var outputPath string
+		for _, line := range strings.Split(string(observation), "\n") {
+			if output, ok := strings.CutPrefix(line, "output="); ok {
+				outputPath = output
+			}
+		}
+		if !filepath.IsAbs(outputPath) || filepath.Base(outputPath) != "issues.jsonl" ||
+			outputPath == absTargetIssues || filepath.Dir(filepath.Dir(outputPath)) != absTargetBeads {
+			t.Fatalf("bd output = %q, want a staged issues.jsonl in a private child directory of %q", outputPath, absTargetBeads)
 		}
 	}
+	checkSnapshots := func(wantTarget string) {
+		t.Helper()
+		for path, want := range map[string]string{targetIssues: wantTarget, hostileDB: hostileFixture} {
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read snapshot %q: %v", path, err)
+			}
+			if string(got) != want {
+				t.Fatalf("snapshot %q = %q, want %q", path, got, want)
+			}
+		}
+		sourcePath, err := filepath.Abs(results[0].SourcePath)
+		if err != nil {
+			t.Fatalf("resolve workspace source: %v", err)
+		}
+		if sourcePath != absTargetIssues {
+			t.Fatalf("workspace source = %q, want final snapshot %q", results[0].SourcePath, absTargetIssues)
+		}
+	}
+	checkObservation()
+	checkSnapshots(targetFixture)
+
+	writeFakeBD("exit 0\n")
+	stderr = captureWorkspaceStderr(t, func() {
+		issues, results, loadErr = workspace.LoadAllFromConfig(context.Background(), filepath.Join(".bv", "workspace.yaml"))
+	})
+	if loadErr != nil {
+		t.Fatalf("LoadAllFromConfig() after successful refresh: %v", loadErr)
+	}
+	if stderr != "" {
+		t.Fatalf("successful robot workspace load wrote stderr: %q", stderr)
+	}
+	if len(issues) != 1 || issues[0].ID != "api-TARGET-FRESH" {
+		t.Fatalf("workspace loaded wrong refreshed authority: %+v", issues)
+	}
+	if len(results) != 1 || results[0].Error != nil || len(results[0].AuthorityWarnings) != 0 {
+		t.Fatalf("workspace results = %+v, want one fresh result without authority warnings", results)
+	}
+	checkObservation()
+	checkSnapshots(freshFixture)
 }
 
 func TestLoadAllFromConfigWithDiscovery(t *testing.T) {

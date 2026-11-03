@@ -2,10 +2,15 @@ package loader
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +18,303 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
+
+const trackerTestModeEnv = "BV_LOADER_TEST_TRACKER_MODE"
+
+// The test executable doubles as a portable tracker fixture. Require both the
+// private environment gate and the exact command shape before entering it.
+func TestMain(m *testing.M) {
+	mode := os.Getenv(trackerTestModeEnv)
+	probe := len(os.Args) == 2 && os.Args[1] == "--loader-tracker-fixture"
+	help := len(os.Args) == 3 && os.Args[1] == "update" && os.Args[2] == "--help"
+	export := len(os.Args) == 4 && os.Args[1] == "export" && os.Args[2] == "-o"
+	if mode != "" && (probe || help || export) {
+		if export {
+			if runtime.GOOS != "windows" {
+				info, err := os.Stat(filepath.Dir(os.Args[3]))
+				if err != nil || info.Mode().Perm()&0o077 != 0 {
+					os.Exit(95)
+				}
+			}
+			if err := os.WriteFile(os.Args[3], []byte("incomplete export\n"), 0o600); err != nil {
+				os.Exit(96)
+			}
+		}
+		switch mode {
+		case "export":
+			data, err := os.ReadFile(os.Getenv("BV_LOADER_TEST_PAYLOAD"))
+			if !export || err != nil {
+				os.Exit(89)
+			}
+			if err := os.WriteFile(os.Args[3], data, 0o600); err != nil {
+				os.Exit(88)
+			}
+		case "noisy-failure":
+			_, _ = io.WriteString(os.Stdout, strings.Repeat("O", 256<<10)+"UNRETAINED-STDOUT-TAIL")
+			_, _ = io.WriteString(os.Stderr, strings.Repeat("E", 256<<10)+"UNRETAINED-STDERR-TAIL")
+			os.Exit(17)
+		case "hang":
+			if ready := os.Getenv("BV_LOADER_TEST_READY"); ready != "" {
+				if err := os.WriteFile(ready, []byte("ready"), 0o600); err != nil {
+					os.Exit(94)
+				}
+			}
+			time.Sleep(time.Minute)
+		case "help-too-large":
+			_, _ = io.WriteString(os.Stdout, "--db --json --claim --no-auto-import --no-auto-flush\n"+strings.Repeat(" ", trackerHelpOutputLimit))
+		case "help":
+			_, _ = io.WriteString(os.Stdout, "--db --json --claim --no-auto-import --no-auto-flush\n")
+		case "retain-pipe":
+			binary, err := os.Executable()
+			if err != nil {
+				os.Exit(93)
+			}
+			child := exec.Command(binary, "--loader-tracker-fixture")
+			child.Env = append(os.Environ(), trackerTestModeEnv+"=hold-pipe")
+			child.Stdin, child.Stdout, child.Stderr = os.Stdin, os.Stdout, os.Stderr
+			if err := child.Start(); err != nil {
+				os.Exit(92)
+			}
+		case "hold-pipe":
+			_, _ = io.Copy(io.Discard, os.Stdin)
+			if err := os.WriteFile(os.Getenv("BV_LOADER_TEST_READY"), []byte("released"), 0o600); err != nil {
+				os.Exit(91)
+			}
+		default:
+			os.Exit(90)
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+func trackerFixtureBinary(t *testing.T) string {
+	t.Helper()
+	path, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func installTrackerFixture(t *testing.T) {
+	t.Helper()
+	source, err := os.Open(trackerFixtureBinary(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	dir := t.TempDir()
+	name := "bd"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	target, err := os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(target, source)
+	if err := errors.Join(copyErr, target.Close()); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestTrackerCommandOutputCapsIOCopy(t *testing.T) {
+	for _, size := range []int{0, trackerExportOutputLimit, trackerExportOutputLimit + 1, trackerExportOutputLimit * 16} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			out := trackerCommandOutput{limit: trackerExportOutputLimit}
+			// Hide WriterTo to exercise the destination-interface path that an
+			// embedded bytes.Buffer.ReadFrom would otherwise use to bypass Write.
+			n, err := io.Copy(&out, io.LimitReader(strings.NewReader(strings.Repeat("x", size)), int64(size)))
+			if err != nil || n != int64(size) || out.buffer.Len() != min(size, trackerExportOutputLimit) || out.truncated != (size > trackerExportOutputLimit) {
+				t.Fatalf("copy result: drained=%d error=%v retained=%d truncated=%v", n, err, out.buffer.Len(), out.truncated)
+			}
+		})
+	}
+}
+
+func TestTrackerCommandBoundsActualChildOutput(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, trackerFixtureBinary(t), "--loader-tracker-fixture")
+	cmd.Env = append(os.Environ(), trackerTestModeEnv+"=noisy-failure")
+	stdout, stderr, err := runTrackerCommand(ctx, cmd, trackerExportOutputLimit)
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 17 {
+		t.Fatalf("child exit status lost: %v", err)
+	}
+	for name, out := range map[string]trackerCommandOutput{"stdout": stdout, "stderr": stderr} {
+		if !out.truncated || out.buffer.Len() != trackerExportOutputLimit || !strings.Contains(out.diagnostic(), "output truncated") || strings.Contains(out.diagnostic(), "UNRETAINED") {
+			t.Fatalf("%s was not capped: retained=%d truncated=%v", name, out.buffer.Len(), out.truncated)
+		}
+	}
+}
+
+func TestTrackerCommandBoundsInheritedPipes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	input, release, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	defer release.Close()
+	donePath := filepath.Join(t.TempDir(), "released")
+	cmd := exec.CommandContext(ctx, trackerFixtureBinary(t), "--loader-tracker-fixture")
+	cmd.Env = append(os.Environ(), trackerTestModeEnv+"=retain-pipe", "BV_LOADER_TEST_READY="+donePath)
+	cmd.Stdin = input
+	started := time.Now()
+	_, _, runErr := runTrackerCommand(ctx, cmd, trackerExportOutputLimit)
+	elapsed := time.Since(started)
+	// Releasing stdin lets the owned fixture descendant exit even if the
+	// assertion fails. Production does not kill persistent tracker services.
+	_ = release.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(donePath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pipe-holder fixture did not exit after stdin was released")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !errors.Is(runErr, exec.ErrWaitDelay) || elapsed >= 5*time.Second {
+		t.Fatalf("inherited pipe wait was not bounded: elapsed=%v error=%v", elapsed, runErr)
+	}
+}
+
+func TestBDExportCancellationPreservesPreviousSnapshot(t *testing.T) {
+	installTrackerFixture(t)
+	for _, mode := range []string{"already canceled", "deadline", "cancel running", "noisy failure"} {
+		t.Run(mode, func(t *testing.T) {
+			beadsDir := t.TempDir()
+			path := filepath.Join(beadsDir, "issues.jsonl")
+			const previous = "previous compatibility snapshot\n"
+			if err := os.WriteFile(path, []byte(previous), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(trackerTestModeEnv, "hang")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var want error
+			switch mode {
+			case "already canceled":
+				cancel()
+				want = context.Canceled
+			case "deadline":
+				var stop context.CancelFunc
+				ctx, stop = context.WithTimeout(ctx, 100*time.Millisecond)
+				defer stop()
+				want = context.DeadlineExceeded
+			case "cancel running":
+				ready := filepath.Join(beadsDir, "ready")
+				t.Setenv("BV_LOADER_TEST_READY", ready)
+				go func() {
+					deadline := time.Now().Add(5 * time.Second)
+					for time.Now().Before(deadline) {
+						if _, err := os.Stat(ready); err == nil {
+							break
+						}
+						time.Sleep(10 * time.Millisecond)
+					}
+					cancel()
+				}()
+				want = context.Canceled
+			case "noisy failure":
+				t.Setenv(trackerTestModeEnv, "noisy-failure")
+			}
+			started := time.Now()
+			err := exportBDIssuesJSONLContext(ctx, beadsDir, path)
+			if mode == "noisy failure" {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 17 || len(err.Error()) > 2*trackerExportOutputLimit+256 || !strings.Contains(err.Error(), "output truncated") || strings.Contains(err.Error(), "UNRETAINED") {
+					t.Fatalf("failure diagnostic or exit status was not bounded/preserved: %v", err)
+				}
+			} else if !errors.Is(err, want) {
+				t.Fatalf("cancellation cause = %v, want %v", err, want)
+			}
+			if time.Since(started) >= 6*time.Second {
+				t.Fatalf("export cancellation was not bounded: %v", time.Since(started))
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != previous {
+				t.Fatalf("failed export changed previous snapshot: %q %v", got, err)
+			}
+			entries, err := filepath.Glob(filepath.Join(beadsDir, ".bv-bd-export-*"))
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("staged output survived failure: %v %v", entries, err)
+			}
+		})
+	}
+}
+
+func TestInstalledTrackerCapabilitiesRejectsTruncatedHelp(t *testing.T) {
+	for _, mode := range []string{"help", "help-too-large"} {
+		t.Run(mode, func(t *testing.T) {
+			installTrackerFixture(t)
+			t.Setenv(trackerTestModeEnv, mode)
+			caps := installedTrackerCapabilities("bd")
+			if mode == "help" {
+				if caps.Error != "" || !caps.Claim {
+					t.Fatalf("ordinary help lost capabilities: %+v", caps)
+				}
+			} else if !strings.Contains(caps.Error, "output limit") || caps.Claim {
+				t.Fatalf("truncated help granted capabilities: %+v", caps)
+			}
+		})
+	}
+}
+
+func TestBDExportUnchangedPreservesWatchIdentity(t *testing.T) {
+	installTrackerFixture(t)
+	t.Setenv(trackerTestModeEnv, "export")
+	beadsDir := t.TempDir()
+	path := filepath.Join(beadsDir, "issues.jsonl")
+	// Span multiple comparison buffers, with the eventual change near the end.
+	content := `{"id":"bd-1","title":"Current","status":"open","issue_type":"task","notes":"` + strings.Repeat("x", 70<<10) + `"}` + "\n"
+	payload := filepath.Join(t.TempDir(), "payload.jsonl")
+	t.Setenv("BV_LOADER_TEST_PAYLOAD", payload)
+	for _, target := range []string{path, payload} {
+		if err := os.WriteFile(target, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldTime := time.Date(2001, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := exportBDIssuesJSONLContext(ctx, beadsDir, path); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil || !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatalf("identical refresh changed watched identity or timestamp: before=%v after=%v error=%v", before, after, err)
+	}
+	changed := strings.TrimSuffix(content, "x\"}\n") + "y\"}\n"
+	if len(changed) != len(content) || changed == content {
+		t.Fatal("fixture must change bytes without changing their length")
+	}
+	if err := os.WriteFile(payload, []byte(changed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := exportBDIssuesJSONLContext(ctx, beadsDir, path); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != changed {
+		t.Fatalf("changed export was not published: bytes=%d error=%v", len(got), err)
+	}
+	after, err = os.Stat(path)
+	if err != nil || os.SameFile(before, after) || before.ModTime().Equal(after.ModTime()) {
+		t.Fatalf("changed refresh retained the old snapshot: before=%v after=%v error=%v", before, after, err)
+	}
+}
 
 // parseJSONL is a small test helper to parse issues from JSONL data.
 func parseJSONL(data []byte) ([]model.Issue, error) {

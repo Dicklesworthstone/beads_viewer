@@ -41,6 +41,55 @@ type trackerCapabilities struct {
 
 var trackerCapabilityCache sync.Map
 
+const (
+	trackerHelpOutputLimit   = 64 << 10
+	trackerExportOutputLimit = 16 << 10
+	trackerWaitDelay         = time.Second
+	bdExportTimeout          = 30 * time.Second
+)
+
+// trackerCommandOutput retains a bounded prefix while continuing to drain the
+// pipe. A named buffer prevents io.Copy from bypassing Write through ReadFrom.
+type trackerCommandOutput struct {
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (out *trackerCommandOutput) Write(data []byte) (int, error) {
+	n := len(data)
+	remaining := out.limit - out.buffer.Len()
+	if len(data) > remaining {
+		data = data[:remaining]
+		out.truncated = true
+	}
+	_, _ = out.buffer.Write(data)
+	return n, nil
+}
+
+func (out *trackerCommandOutput) diagnostic() string {
+	text := strings.TrimSpace(out.buffer.String())
+	if out.truncated {
+		text += fmt.Sprintf(" [output truncated after %d bytes]", out.limit)
+	}
+	return text
+}
+
+// runTrackerCommand bounds pipe waiting as well as retained diagnostics. It
+// cancels only the command itself: a tracker may own a persistent Dolt service
+// that must outlive this individual read.
+func runTrackerCommand(ctx context.Context, cmd *exec.Cmd, limit int) (trackerCommandOutput, trackerCommandOutput, error) {
+	stdout := trackerCommandOutput{limit: limit}
+	stderr := trackerCommandOutput{limit: limit}
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.WaitDelay = trackerWaitDelay
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		err = errors.Join(ctx.Err(), err)
+	}
+	return stdout, stderr, err
+}
+
 // installedTrackerCapabilities only runs help, never a command that opens or
 // changes a tracker. Include executable identity in the cache key so replacing
 // an installed version during a long-running TUI invalidates its capabilities.
@@ -63,14 +112,16 @@ func installedTrackerCapabilities(tracker string) trackerCapabilities {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	help, err := exec.CommandContext(ctx, executable, "update", "--help").Output()
+	help, _, err := runTrackerCommand(ctx, exec.CommandContext(ctx, executable, "update", "--help"), trackerHelpOutputLimit)
 	caps := trackerCapabilities{Executable: executable}
 	if err != nil {
 		caps.Error = "cannot establish installed tracker capabilities"
+	} else if help.truncated {
+		caps.Error = "installed tracker help exceeds the capability output limit"
 	} else {
 		// Trackers may honor inherited forced-color settings even when help is
 		// piped. Styling must not change exact capability-token recognition.
-		fields := strings.Fields(ansi.Strip(string(help)))
+		fields := strings.Fields(ansi.Strip(help.buffer.String()))
 		has := func(flag string) bool {
 			for _, field := range fields {
 				if field == flag {
@@ -513,10 +564,25 @@ func PrepareBeadsDirForRead(beadsDir string, refreshBDExport bool, warnFunc func
 }
 
 // exportBDIssuesJSONL runs `bd export -o <issuesPath>` to produce a fresh
-// JSONL compatibility file from the bd workspace's Dolt database.
+// JSONL compatibility file from the bd workspace's Dolt database. Failed,
+// interrupted, or invalid exports never replace the previous compatibility file.
 func exportBDIssuesJSONL(beadsDir, issuesPath string) error {
-	if _, err := exec.LookPath("bd"); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), bdExportTimeout)
+	defer cancel()
+	return exportBDIssuesJSONLContext(ctx, beadsDir, issuesPath)
+}
+
+func exportBDIssuesJSONLContext(ctx context.Context, beadsDir, issuesPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	executable, err := exec.LookPath("bd")
+	if err != nil {
 		return fmt.Errorf("bd binary not found in PATH")
+	}
+	executable, err = filepath.Abs(executable)
+	if err != nil {
+		return fmt.Errorf("resolve bd executable: %w", err)
 	}
 	absBeadsDir, err := filepath.Abs(beadsDir)
 	if err != nil {
@@ -527,20 +593,162 @@ func exportBDIssuesJSONL(beadsDir, issuesPath string) error {
 		return fmt.Errorf("resolve bd export path %s: %w", issuesPath, err)
 	}
 
-	repoRoot := filepath.Dir(absBeadsDir)
-	cmd := exec.Command("bd", "export", "-o", absIssuesPath)
-	cmd.Dir = repoRoot
+	// Keep incomplete exports private and on the same filesystem as the final
+	// JSONL. A separate directory also accommodates bd's own atomic writer.
+	stageDir, err := os.MkdirTemp(absBeadsDir, ".bv-bd-export-")
+	if err != nil {
+		return fmt.Errorf("create bd export staging directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(stageDir) }()
+	stagedPath := filepath.Join(stageDir, "issues.jsonl")
+	cmd := exec.CommandContext(ctx, executable, "export", "-o", stagedPath)
+	cmd.Dir = filepath.Dir(absBeadsDir)
 	env := withoutBeadsAuthorityEnv(os.Environ())
 	cmd.Env = append(env, fmt.Sprintf("%s=%s", BeadsDirEnvVar, absBeadsDir))
-	out, err := cmd.CombinedOutput()
+	stdout, stderr, err := runTrackerCommand(ctx, cmd, trackerExportOutputLimit)
 	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			return err
+		diagnostic := ""
+		if text := stdout.diagnostic(); text != "" {
+			diagnostic += " (stdout: " + text + ")"
 		}
-		return fmt.Errorf("%w: %s", err, msg)
+		if text := stderr.diagnostic(); text != "" {
+			diagnostic += " (stderr: " + text + ")"
+		}
+		return fmt.Errorf("bd export: %w%s", err, diagnostic)
+	}
+	validated, err := validateBDExport(ctx, stagedPath)
+	if err != nil {
+		return err
+	}
+	unchanged, err := bdExportUnchanged(ctx, stagedPath, absIssuesPath, validated)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if unchanged {
+		return nil
+	}
+	current, err := os.Lstat(stagedPath)
+	if err != nil || !current.Mode().IsRegular() || !sameFileSnapshot(validated, current) {
+		return fmt.Errorf("bd export changed before publication")
+	}
+	if err := os.Rename(stagedPath, absIssuesPath); err != nil {
+		return fmt.Errorf("publish bd compatibility export: %w", err)
 	}
 	return nil
+}
+
+type trackerContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r trackerContextReader) Read(data []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(data)
+}
+
+// validateBDExport accepts complete loader-compatible issue streams, including
+// an empty project and mixed issue/auxiliary records. It discards decoded issue
+// bodies immediately, retaining only the parser's duplicate-ID accounting.
+func validateBDExport(ctx context.Context, path string) (os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("inspect bd export: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("bd export is not a regular non-symlink file")
+	}
+	file, err := openIssuesFile(path, os.Open)
+	if err != nil {
+		return nil, fmt.Errorf("open bd export: %w", err)
+	}
+	var stats ParseStats
+	_, parseErr := ParseIssuesWithOptions(trackerContextReader{ctx: ctx, reader: file}, ParseOptions{
+		Stats:          &stats,
+		BufferSize:     MaxLineSizeFromEnv(),
+		WarningHandler: func(string) {},
+		IssueFilter:    func(*model.Issue) bool { return false },
+	})
+	finalInfo, statErr := file.Stat()
+	closeErr := file.Close()
+	if err := errors.Join(parseErr, statErr, closeErr, ctx.Err()); err != nil {
+		return nil, fmt.Errorf("validate bd export: %w", err)
+	}
+	if stats.Errors != 0 {
+		return nil, fmt.Errorf("bd export contains %d invalid or duplicate issue records", stats.Errors)
+	}
+	if stats.Valid == 0 && stats.Skipped > 0 {
+		return nil, fmt.Errorf("bd export contains only non-issue records")
+	}
+	currentInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("reinspect bd export: %w", err)
+	}
+	if !currentInfo.Mode().IsRegular() || !sameFileSnapshot(info, finalInfo) || !sameFileSnapshot(finalInfo, currentInfo) {
+		return nil, fmt.Errorf("bd export changed during validation")
+	}
+	return currentInfo, nil
+}
+
+// bdExportUnchanged prevents a refresh from manufacturing another file-watch
+// event when the compatibility bytes are already current. Compare only a stable
+// regular destination, never a symlink, with bounded streaming buffers.
+func bdExportUnchanged(ctx context.Context, stagedPath, path string, validated os.FileInfo) (bool, error) {
+	previous, err := os.Lstat(path)
+	if err != nil || !previous.Mode().IsRegular() || previous.Size() != validated.Size() {
+		return false, nil
+	}
+	oldFile, err := openIssuesFile(path, os.Open)
+	if err != nil {
+		return false, nil
+	}
+	defer oldFile.Close()
+	opened, err := oldFile.Stat()
+	if err != nil || !sameFileSnapshot(previous, opened) {
+		return false, nil
+	}
+	stagedFile, err := openIssuesFile(stagedPath, os.Open)
+	if err != nil {
+		return false, fmt.Errorf("compare staged bd export: %w", err)
+	}
+	defer stagedFile.Close()
+	opened, err = stagedFile.Stat()
+	if err != nil || !sameFileSnapshot(validated, opened) {
+		return false, fmt.Errorf("bd export changed before comparison")
+	}
+	oldReader := trackerContextReader{ctx: ctx, reader: oldFile}
+	stagedReader := trackerContextReader{ctx: ctx, reader: stagedFile}
+	var oldBytes, stagedBytes [32 << 10]byte
+	for {
+		n, readErr := io.ReadFull(stagedReader, stagedBytes[:])
+		oldN, oldErr := io.ReadFull(oldReader, oldBytes[:])
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			return false, fmt.Errorf("compare staged bd export: %w", readErr)
+		}
+		if oldErr != nil && oldErr != io.EOF && oldErr != io.ErrUnexpectedEOF {
+			return false, nil
+		}
+		if n != oldN || !bytes.Equal(stagedBytes[:n], oldBytes[:oldN]) {
+			return false, nil
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	current, err := os.Lstat(stagedPath)
+	if err != nil || !current.Mode().IsRegular() || !sameFileSnapshot(validated, current) {
+		return false, fmt.Errorf("bd export changed during comparison")
+	}
+	current, err = os.Lstat(path)
+	return err == nil && current.Mode().IsRegular() && sameFileSnapshot(previous, current), nil
 }
 
 func withoutBeadsAuthorityEnv(entries []string) []string {

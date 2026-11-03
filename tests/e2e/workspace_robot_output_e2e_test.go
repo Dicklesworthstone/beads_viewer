@@ -2,14 +2,17 @@ package main_test
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -329,7 +332,9 @@ func TestPartialWorkspaceAuthoritySurvivesDerivedOutputs(t *testing.T) {
 
 func runAuthorityFixture(t *testing.T, bv, dir string, extraEnv []string, args ...string) map[string]any {
 	t.Helper()
-	cmd := exec.Command(bv, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bv, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), extraEnv...)
 	var stdout, stderr bytes.Buffer
@@ -476,6 +481,81 @@ func TestRobotSourceAuthorityStaleBDExport(t *testing.T) {
 	}
 	if healthy["data_hash"] != stale["data_hash"] || healthy["authority_hash"] == stale["authority_hash"] {
 		t.Fatalf("stale authority must differ despite identical issue content")
+	}
+}
+
+func TestRobotSourceAuthorityRejectsFailedBDReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("integration fixture uses POSIX sh; portable subprocess cases cover Windows")
+	}
+	bv := buildBvBinary(t)
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	const existing = "{\"id\":\"BD-safe\",\"title\":\"Last good export\",\"status\":\"open\",\"priority\":1,\"issue_type\":\"task\"}\n"
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"partial failure", "printf '%s\\n' '{\"id\":\"BD-partial\",\"title\":\"Incomplete replacement\",\"status\":\"open\",\"issue_type\":\"task\"}' > \"$3\"\nexit 17\n"},
+		{"malformed success", "printf '%s\\n' '{invalid' > \"$3\"\n"},
+		{"missing output success", "exit 0\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			beads := filepath.Join(root, ".beads")
+			if err := os.MkdirAll(filepath.Join(beads, "embeddeddolt"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(beads, "metadata.json"), []byte(`{"backend":"dolt","database":"dolt"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			issuesPath := filepath.Join(beads, "issues.jsonl")
+			if err := os.WriteFile(issuesPath, []byte(existing), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			binDir := filepath.Join(root, "bin")
+			if err := os.Mkdir(binDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			bdPath := filepath.Join(binDir, "bd")
+			writeBD := func(body string) {
+				t.Helper()
+				script := "#!/bin/sh\nif [ \"$#\" = 2 ] && [ \"$1\" = update ] && [ \"$2\" = --help ]; then printf '%s\\n' '--db --json --claim'; exit 0; fi\n[ \"$#\" = 3 ] && [ \"$1\" = export ] && [ \"$2\" = -o ] || exit 97\n" + body
+				if err := os.WriteFile(bdPath, []byte(script), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeBD("printf '%s\\n' '{\"id\":\"BD-safe\",\"title\":\"Last good export\",\"status\":\"open\",\"priority\":1,\"issue_type\":\"task\"}' > \"$3\"\n")
+			pathEnv := []string{"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH")}
+			healthy := runAuthorityFixture(t, bv, root, pathEnv, "--robot-next")
+			healthyAuthority, ok := healthy["source_authority"].(map[string]any)
+			if !ok || healthyAuthority["state"] != "complete" || healthyAuthority["claim_safe"] != true || healthy["actionable"] != true {
+				t.Fatalf("healthy fake tracker did not establish the positive control: %+v", healthy)
+			}
+
+			writeBD(tc.body)
+			stale := runAuthorityFixture(t, bv, root, pathEnv, "--robot-next")
+			authority, ok := stale["source_authority"].(map[string]any)
+			if !ok || authority["state"] != "partial" || authority["claim_safe"] != false || stale["actionable"] != false || stale["claim_command"] != nil {
+				t.Fatalf("failed replacement emitted a proven claim or lost diagnostics: %+v", stale)
+			}
+			if actions, ok := stale["actions"].(map[string]any); ok && actions["claim"] != nil {
+				t.Fatalf("failed replacement retained a nested mutation route: %+v", actions)
+			}
+			diagnostic, ok := stale["diagnostic_top_pick"].(map[string]any)
+			if !ok || diagnostic["id"] != "BD-safe" {
+				t.Fatalf("failed replacement displaced the last good issue: %+v", stale)
+			}
+			source := authority["sources"].([]any)[0].(map[string]any)
+			if source["stale"] != true || source["warning_count"].(float64) == 0 {
+				t.Fatalf("failed replacement lost its stale-source warning: %+v", source)
+			}
+			if healthy["data_hash"] != stale["data_hash"] || healthy["authority_hash"] == stale["authority_hash"] {
+				t.Fatalf("failed replacement changed retained data or failed to change authority: healthy=%+v stale=%+v", healthy, stale)
+			}
+			if content, err := os.ReadFile(issuesPath); err != nil || string(content) != existing {
+				t.Fatalf("robot refresh changed the last good snapshot: %q (%v)", content, err)
+			}
+		})
 	}
 }
 

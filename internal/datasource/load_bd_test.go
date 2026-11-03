@@ -135,6 +135,51 @@ func TestLoadIssuesFromDir_BDWorkspaceFallsBackToExistingExport(t *testing.T) {
 	}
 }
 
+func TestLoadIssuesFromDir_BDRejectedReplacementPreservesStaleAuthority(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("integration fixture uses POSIX sh; portable subprocess cases cover Windows")
+	}
+	const existing = "{\"id\":\"BD-safe\",\"title\":\"Last good export\",\"status\":\"open\",\"priority\":1,\"issue_type\":\"task\"}\n"
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"partial failure", "printf '%s\\n' '{\"id\":\"BD-partial\",\"title\":\"Incomplete replacement\",\"status\":\"open\",\"issue_type\":\"task\"}' > \"$3\"\nexit 17\n"},
+		{"malformed success", "printf '%s\\n' '{invalid' > \"$3\"\n"},
+		{"missing output success", "exit 0\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, beadsDir := makeBDWorkspace(t)
+			issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+			if err := os.WriteFile(issuesPath, []byte(existing), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			binDir := filepath.Join(dir, "bin")
+			if err := os.Mkdir(binDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			script := "#!/bin/sh\nif [ \"$1\" = update ] && [ \"$2\" = --help ]; then printf '%s\\n' '--db --json --claim'; exit 0; fi\n[ \"$#\" = 3 ] && [ \"$1\" = export ] && [ \"$2\" = -o ] || exit 97\n" + tc.body
+			if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			loaded, err := LoadIssuesFromDir(beadsDir)
+			if err != nil || len(loaded.Issues) != 1 || loaded.Issues[0].ID != "BD-safe" {
+				t.Fatalf("failed export discarded the last good issues: %+v (%v)", loaded.Issues, err)
+			}
+			if content, err := os.ReadFile(issuesPath); err != nil || string(content) != existing {
+				t.Fatalf("failed export changed the previous snapshot: %q (%v)", content, err)
+			}
+			if loaded.Source.Path != issuesPath || !loaded.Report.Stale || len(loaded.Report.AuthorityWarnings) != 1 {
+				t.Fatalf("fallback lost its original source or stale authority: %+v", loaded)
+			}
+			actions := loaded.Issues[0].Actions(true)
+			if actions.Claim != nil || !strings.Contains(actions.UnavailableReason, "stale") {
+				t.Fatalf("last good snapshot was incorrectly authorized for mutation: %+v", actions)
+			}
+		})
+	}
+}
+
 // TestLoadIssues_BDWorkspaceViaRepoPath exercises the repo-path entry point
 // used by the CLI (datasource.LoadIssues).
 func TestLoadIssues_BDWorkspaceViaRepoPath(t *testing.T) {

@@ -418,6 +418,147 @@ func TestPrepareWorkspaceForRead_FallsBackToExistingIssuesJSONL(t *testing.T) {
 	}
 }
 
+func TestPrepareBeadsDirForReadRejectsFailedBDReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("integration fixture uses POSIX sh; portable subprocess cases cover Windows")
+	}
+	const original = "{\"id\":\"BD-old\",\"title\":\"Last good export\",\"status\":\"open\",\"priority\":1,\"issue_type\":\"task\"}\n"
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"partial failure", "printf '%s\\n' '{\"id\":\"BD-partial\",\"title\":\"Incomplete replacement\",\"status\":\"open\",\"issue_type\":\"task\"}' > \"$3\"\necho controlled-export-failure >&2\nexit 17\n"},
+		{"malformed success", "printf '%s\\n' '{invalid' > \"$3\"\n"},
+		{"missing output success", "exit 0\n"},
+		{"directory success", "mkdir \"$3\"\n"},
+		{"symlink success", "ln -s \"$BV_TEST_EXPORT_LINK_TARGET\" \"$3\"\n"},
+		{"non-issue only success", "printf '%s\\n' '{\"_type\":\"memory\",\"id\":\"memory-1\"}' > \"$3\"\n"},
+	} {
+		for _, haveSnapshot := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/existing=%t", tc.name, haveSnapshot), func(t *testing.T) {
+				root := t.TempDir()
+				beadsDir := filepath.Join(root, ".beads")
+				if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+				if haveSnapshot {
+					if err := os.WriteFile(issuesPath, []byte(original), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				linkTarget := filepath.Join(root, "unrelated-snapshot.jsonl")
+				if err := os.WriteFile(linkTarget, []byte(original), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("BV_TEST_EXPORT_LINK_TARGET", linkTarget)
+				binDir := filepath.Join(root, "bin")
+				if err := os.Mkdir(binDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				script := "#!/bin/sh\n[ \"$#\" = 3 ] && [ \"$1\" = export ] && [ \"$2\" = -o ] || exit 97\n" + tc.body
+				if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+				var warnings []string
+				path, err := loader.PrepareBeadsDirForRead(beadsDir, true, func(message string) {
+					warnings = append(warnings, message)
+				})
+				if content, err := os.ReadFile(linkTarget); err != nil || string(content) != original {
+					t.Fatalf("export changed an unrelated symlink target: %q (%v)", content, err)
+				}
+				if !haveSnapshot {
+					if err == nil || !strings.Contains(err.Error(), "failed to refresh bd compatibility JSONL") {
+						t.Fatalf("failed first export did not return actionable error: path=%q err=%v", path, err)
+					}
+					if _, err := os.Stat(issuesPath); !os.IsNotExist(err) {
+						t.Fatalf("failed first export published a replacement: %v", err)
+					}
+					return
+				}
+				if err != nil || path != issuesPath {
+					t.Fatalf("last good snapshot unavailable: path=%q err=%v", path, err)
+				}
+				if content, err := os.ReadFile(issuesPath); err != nil || string(content) != original {
+					t.Fatalf("failed replacement changed the last good snapshot: %q (%v)", content, err)
+				}
+				if len(warnings) != 1 || !strings.Contains(warnings[0], "bd export failed") {
+					t.Fatalf("failed refresh lost its stale-fallback warning: %q", warnings)
+				}
+				if tc.name == "partial failure" && (!strings.Contains(warnings[0], "exit status 17") || !strings.Contains(warnings[0], "controlled-export-failure")) {
+					t.Fatalf("export error lost its exit status or diagnostic: %q", warnings)
+				}
+			})
+		}
+	}
+}
+
+func TestPrepareBeadsDirForReadPublishesValidBDExport(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("integration fixture uses POSIX sh; portable subprocess cases cover Windows")
+	}
+	const issue = "{\"id\":\"BD-new\",\"title\":\"Fresh export\",\"status\":\"open\",\"priority\":1,\"issue_type\":\"task\"}\n"
+	const memory = "{\"_type\":\"memory\",\"id\":\"memory-1\",\"content\":\"Non-issue bd record\"}\n"
+	for _, tc := range []struct {
+		name, content string
+		wantIssues    int
+	}{
+		{"fresh", issue, 1},
+		{"empty", "", 0},
+		{"mixed records", memory + issue, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			beadsDir := filepath.Join(root, ".beads")
+			if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+			if err := os.WriteFile(issuesPath, []byte("{\"id\":\"BD-old\",\"title\":\"Previous export\",\"status\":\"open\",\"issue_type\":\"task\"}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			payloadPath := filepath.Join(root, "payload.jsonl")
+			if err := os.WriteFile(payloadPath, []byte(tc.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			binDir := filepath.Join(root, "bin")
+			if err := os.Mkdir(binDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			script := `#!/bin/sh
+[ "$#" = 3 ] && [ "$1" = export ] && [ "$2" = -o ] || exit 97
+[ "$BEADS_DIR" = "$BV_TEST_EXPECTED_BEADS" ] || exit 96
+[ "$PWD" = "$BV_TEST_EXPECTED_ROOT" ] || exit 95
+[ "${BEADS_DB+x}" != x ] || exit 94
+cat "$BV_TEST_EXPORT_PAYLOAD" > "$3"
+`
+			if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("BV_TEST_EXPECTED_BEADS", beadsDir)
+			t.Setenv("BV_TEST_EXPECTED_ROOT", root)
+			t.Setenv("BV_TEST_EXPORT_PAYLOAD", payloadPath)
+			t.Setenv("BEADS_DIR", filepath.Join(root, "wrong-beads"))
+			t.Setenv("BEADS_DB", filepath.Join(root, "wrong-database"))
+			var warnings []string
+			path, err := loader.PrepareBeadsDirForRead(beadsDir, true, func(message string) {
+				warnings = append(warnings, message)
+			})
+			if err != nil || path != issuesPath || len(warnings) != 0 {
+				t.Fatalf("valid export was not published cleanly: path=%q err=%v warnings=%q", path, err, warnings)
+			}
+			if content, err := os.ReadFile(path); err != nil || string(content) != tc.content {
+				t.Fatalf("published export differs from supplied records: %q (%v)", content, err)
+			}
+			issues, err := loader.LoadIssuesFromFile(path)
+			if err != nil || len(issues) != tc.wantIssues {
+				t.Fatalf("fresh/empty/mixed export compatibility changed: issues=%+v err=%v", issues, err)
+			}
+		})
+	}
+}
+
 func TestPrepareWorkspaceForRead_RegularBRFallsThrough(t *testing.T) {
 	dir := t.TempDir()
 	beadsDir := filepath.Join(dir, ".beads")
