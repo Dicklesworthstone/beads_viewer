@@ -8,9 +8,35 @@ import (
 	"unicode/utf8"
 )
 
+// inheritedHookEnvKeys is the operational environment inherited without an
+// explicit user grant. All other names are denied, regardless of whether they
+// look like credentials. Keep this list exact: prefixes such as LC_, XDG_, or
+// tool-specific namespaces can carry arbitrary credentials or startup code.
+// The list is also part of inspection and the approval digest.
+func inheritedHookEnvKeys(windows bool) []string {
+	names := []string{
+		"HOME", "LANG", "LANGUAGE", "LC_ADDRESS", "LC_ALL", "LC_COLLATE",
+		"LC_CTYPE", "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_MESSAGES",
+		"LC_MONETARY", "LC_NAME", "LC_NUMERIC", "LC_PAPER", "LC_TELEPHONE",
+		"LC_TIME", "PATH", "TEMP", "TERM", "TMP", "TMPDIR", "TZ",
+		"XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+	}
+	if windows {
+		names = append(names, "APPDATA", "COMSPEC", "HOMEDRIVE", "HOMEPATH",
+			"LOCALAPPDATA", "PATHEXT", "SYSTEMDRIVE", "SYSTEMROOT", "USERPROFILE", "WINDIR")
+		// Windows uses these hidden entries for per-drive working directories.
+		// Only correctly formed drive entries are accepted from the parent.
+		for drive := 'A'; drive <= 'Z'; drive++ {
+			names = append(names, "="+string(drive)+":")
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 // buildHookEnvironment constructs the one environment visible to both YAML
 // expansion and the child process. Only the invoking user's grants can restore
-// a protected parent variable; declaring an alias in project YAML cannot do so.
+// a non-operational parent variable; declaring an alias in YAML cannot do so.
 // windows is explicit so Windows case-insensitive semantics are testable on all
 // platforms. The returned environment has no duplicate variable names.
 func buildHookEnvironment(parent, contextEnv []string, overrides map[string]string, grants []string, windows bool) ([]string, error) {
@@ -32,6 +58,9 @@ func buildHookEnvironment(parent, contextEnv []string, overrides map[string]stri
 	for _, name := range grants {
 		allowed[keyFor(name)] = true
 	}
+	for _, name := range inheritedHookEnvKeys(windows) {
+		allowed[keyFor(name)] = true
+	}
 
 	type binding struct{ name, value string }
 	values := make(map[string]binding, len(parent)+len(contextEnv)+len(overrides))
@@ -41,12 +70,7 @@ func buildHookEnvironment(parent, contextEnv []string, overrides map[string]stri
 			continue
 		}
 		key := keyFor(name)
-		// Classify both spellings: Windows Unicode folding can make a name
-		// sensitive even when upper-casing its original form did not (for
-		// example, BV_TOKEN lower-cases to bv_token). Expansion must never
-		// recover a value through a spelling that escaped the parent filter.
-		sensitive := isProtectedHookEnvKey(name) || windows && isProtectedHookEnvKey(key)
-		if sensitive && !allowed[key] {
+		if !allowed[key] {
 			continue
 		}
 		values[key] = binding{name, value}
@@ -84,39 +108,6 @@ func buildHookEnvironment(parent, contextEnv []string, overrides map[string]stri
 		env = append(env, entry.name+"="+entry.value)
 	}
 	return env, nil
-}
-
-// isProtectedHookEnvKey includes established credential containers whose names
-// do not contain the ordinary secret markers. Git's indexed configuration is
-// removed as a complete transport by default: retaining GIT_CONFIG_COUNT while
-// withholding its values would break every child Git command. Each name still
-// requires its own explicit user grant; a count or key never grants a value.
-func isProtectedHookEnvKey(name string) bool {
-	if isSensitiveEnvKey(name) {
-		return true
-	}
-	upper := strings.ToUpper(name)
-	switch upper {
-	case "DOCKER_AUTH_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS":
-		return true
-	}
-	for _, prefix := range []string{"GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"} {
-		index, ok := strings.CutPrefix(upper, prefix)
-		if !ok || index == "" {
-			continue
-		}
-		decimal := true
-		for i := 0; i < len(index); i++ {
-			if index[i] < '0' || index[i] > '9' {
-				decimal = false
-				break
-			}
-		}
-		if decimal {
-			return true
-		}
-	}
-	return false
 }
 
 // validateEnvGrants accepts names, never values, patterns, or shell syntax.

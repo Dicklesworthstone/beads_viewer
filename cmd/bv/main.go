@@ -1548,7 +1548,7 @@ func main() {
 	noHooks := flag.Bool("no-hooks", false, "Skip running hooks during export")
 	hooksInfo := flag.Bool("hooks-info", false, "Inspect project hooks and their approval digest as JSON without executing them")
 	trustHooks := flag.String("trust-hooks", "", "Approve the exact digest from --hooks-info for this export invocation")
-	hookEnv := flag.StringArray("hook-env", nil, "Grant an approved hook a parent environment variable by name (repeatable; never NAME=value)")
+	hookEnv := flag.StringArray("hook-env", nil, "Grant an approved hook an additional parent environment variable by exact name (repeatable; never NAME=value)")
 	workspaceConfig := flag.String("workspace", "", "Load issues from workspace config file (.bv/workspace.yaml)")
 	repoFilter := flag.String("repo", "", "Filter issues by repository prefix (e.g., 'api-' or 'api')")
 	saveBaseline := flag.String("save-baseline", "", "Save current metrics as baseline with optional description")

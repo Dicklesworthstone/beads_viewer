@@ -32,11 +32,14 @@ func TestHookProcessGroupStopsDescendants(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			dir := t.TempDir()
-			command := "(printf started > child-ready; sleep 1; printf escaped > late-marker)"
+			// A ready child must also prove the parent output was written. Under
+			// load, the timeout can otherwise interrupt the parent's readiness
+			// loop before it gets a chance to print, without losing any output.
+			command := "printf parent-output; (printf started > child-ready; sleep 1; printf escaped > late-marker)"
 			if tc.redirect {
 				command += " >/dev/null 2>&1"
 			}
-			command += " & while [ ! -f child-ready ]; do sleep 0.01; done; printf parent-output; "
+			command += " & while [ ! -f child-ready ]; do sleep 0.01; done; "
 			timeout := 3 * time.Second
 			if tc.timeout {
 				command += "wait"

@@ -22,7 +22,7 @@
 | `--export-template` | string | (empty) | Markdown template path; explicit empty disables a recipe template | Export & Reporting |
 | `--graph-preset` | string | `compact` | Graph layout preset: compact (default) or roomy | Export & Reporting |
 | `--graph-title` | string | (empty) | Title for graph export (default: project name) | Export & Reporting |
-| `--hook-env` | stringArray | `[]` | Grant an approved hook a parent environment variable by name (repeatable; never NAME=value) | Export & Reporting |
+| `--hook-env` | stringArray | `[]` | Grant an approved hook an additional parent environment variable by exact name (repeatable; never NAME=value) | Export & Reporting |
 | `--hooks-info` | bool | `false` | Inspect project hooks and their approval digest as JSON without executing them | Export & Reporting |
 | `--no-hooks` | bool | `false` | Skip running hooks during export | Export & Reporting |
 | `--no-live-reload` | bool | `false` | Disable live-reload in preview mode | Export & Reporting |

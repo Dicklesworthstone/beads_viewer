@@ -256,9 +256,9 @@ func TestHookArgvExecutionKeepsArgumentBoundariesAndEnvironment(t *testing.T) {
 			hook.Env["BV_ARGV_CHAIN"] = "${BV_ARGV_ALIAS}"
 			config := &Config{Hooks: HooksByPhase{PreExport: []Hook{hook}}, projectDir: dir}
 			ctx := ExportContext{ExportPath: "report with spaces;and&syntax.md", ExportFormat: "markdown", IssueCount: 7, Timestamp: time.Unix(1700000000, 0).UTC()}
-			var grants []string
+			grants := []string{"BV_ARGV_ORDINARY"}
 			if grant {
-				grants = []string{"BV_ARGV_FAKE_SECRET"}
+				grants = append(grants, "BV_ARGV_FAKE_SECRET")
 			}
 			executor := newApprovedExecutor(t, config, ctx, grants...)
 			if err := executor.RunPreExport(); err != nil {

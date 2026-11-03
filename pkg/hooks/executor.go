@@ -248,42 +248,6 @@ func (e *Executor) runHook(hook Hook, phase HookPhase) HookResult {
 	return result
 }
 
-// sensitiveEnvMarkers are substrings that, when present in an (upper-cased)
-// environment variable name, mark it as credential-bearing. Matching variables
-// are withheld unless the invoking user explicitly grants the source variable.
-var sensitiveEnvMarkers = []string{
-	"TOKEN",
-	"SECRET",
-	"PASSWORD",
-	"PASSWD",
-	"CREDENTIAL",
-	"API_KEY",
-	"APIKEY",
-	"ACCESS_KEY",
-	"PRIVATE_KEY",
-}
-
-// sensitiveEnvExact are exact environment variable names that are stripped from
-// hook subprocess environments in addition to marker matches.
-var sensitiveEnvExact = map[string]bool{
-	"SSH_AUTH_SOCK": true, // forwarding the SSH agent grants signing/auth capability
-}
-
-// isSensitiveEnvKey reports whether an environment variable name looks like it
-// carries a credential and should be withheld from project-controlled hooks.
-func isSensitiveEnvKey(key string) bool {
-	upper := strings.ToUpper(key)
-	if sensitiveEnvExact[upper] {
-		return true
-	}
-	for _, marker := range sensitiveEnvMarkers {
-		if strings.Contains(upper, marker) {
-			return true
-		}
-	}
-	return false
-}
-
 // Results returns all hook execution results
 func (e *Executor) Results() []HookResult {
 	results := append([]HookResult(nil), e.results...)

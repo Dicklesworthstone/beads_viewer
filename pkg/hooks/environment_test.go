@@ -60,12 +60,131 @@ func TestBuildHookEnvironmentCannotRecoverProtectedParentValues(t *testing.T) {
 					t.Errorf("project alias %s = %q, present %v; want empty", key, value, exists)
 				}
 			}
-			for key, want := range map[string]string{"B": "prefix::suffix", "NORMAL": "ordinary", "NORMAL_COPY": "ordinary", "OUTPUT": "report.md", "BV_EXPORT_PATH": "report.md", "PATH": "/safe/bin"} {
+			if _, exists := got["NORMAL"]; exists {
+				t.Fatal("ordinary-looking ambient values also require an explicit grant")
+			}
+			for key, want := range map[string]string{"B": "prefix::suffix", "NORMAL_COPY": "", "OUTPUT": "report.md", "BV_EXPORT_PATH": "report.md", "PATH": "/safe/bin"} {
 				if got[key] != want {
 					t.Errorf("%s = %q, want %q", key, got[key], want)
 				}
 			}
 		})
+	}
+}
+
+func TestBuildHookEnvironmentKeepsOperationalDefaultsOnly(t *testing.T) {
+	// These path and locale settings keep ordinary tools usable and preserve
+	// user-selected home/config isolation. No prefix grants arbitrary siblings.
+	common := map[string]string{
+		"PATH": "/safe/bin", "HOME": "/isolated/home", "TMPDIR": "/isolated/tmp",
+		"TMP": "/other/tmp", "TEMP": "/other/temp", "LANG": "en_US.UTF-8", "LANGUAGE": "en",
+		"LC_ALL": "C", "LC_CTYPE": "C.UTF-8", "LC_COLLATE": "C", "LC_MESSAGES": "C",
+		"LC_MONETARY": "C", "LC_NUMERIC": "C", "LC_TIME": "C", "TZ": "UTC", "TERM": "dumb",
+		"LC_ADDRESS": "C", "LC_IDENTIFICATION": "C", "LC_MEASUREMENT": "C", "LC_NAME": "C",
+		"LC_PAPER": "C", "LC_TELEPHONE": "C", "XDG_CONFIG_HOME": "/isolated/config",
+		"XDG_CACHE_HOME": "/isolated/cache", "XDG_DATA_HOME": "/isolated/data", "XDG_STATE_HOME": "/isolated/state",
+	}
+	windowsPaths := map[string]string{
+		"SystemRoot": `C:\Windows`, "windir": `C:\Windows`, "ComSpec": `C:\Windows\System32\cmd.exe`,
+		"PATHEXT": ".EXE;.COM;.BAT;.CMD", "SystemDrive": "C:", "UserProfile": `C:\Users\test`,
+		"HomeDrive": "C:", "HomePath": `\Users\test`, "AppData": `C:\Users\test\Roaming`,
+		"LocalAppData": `C:\Users\test\Local`, "=C:": `C:\work`, "=d:": `D:\work`,
+	}
+	withheld := []string{
+		"DATABASE_URL", "PIP_INDEX_URL", "http_proxy", "BV_PLAIN_DSN", "LC_PRIVATE", "XDG_RUNTIME_DIR", "XDG_CUSTOM",
+		"BASH_ENV", "ENV", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONPATH", "NODE_OPTIONS", "GOFLAGS",
+	}
+	for _, windows := range []bool{false, true} {
+		t.Run(map[bool]string{false: "unix", true: "windows"}[windows], func(t *testing.T) {
+			var parent []string
+			for name, value := range common {
+				parent = append(parent, name+"="+value)
+			}
+			for name, value := range windowsPaths {
+				parent = append(parent, name+"="+value)
+			}
+			for _, name := range withheld {
+				parent = append(parent, name+"=ungranted-sentinel")
+			}
+			env, err := buildHookEnvironment(parent, nil, map[string]string{
+				"A_DSN": "${DATABASE_URL}", "B_CHAIN": "${A_DSN}", "HOME_COPY": "${HOME}",
+				"CONFIG_COPY": "${XDG_CONFIG_HOME}", "WINDOWS_COPY": "${systemroot}", "LOCAL": "project-literal",
+			}, nil, windows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := hookEnvironmentValues(t, env, windows)
+			for name, want := range common {
+				if got[name] != want {
+					t.Errorf("operational %s = %q, want %q", name, got[name], want)
+				}
+			}
+			for name, want := range windowsPaths {
+				key := name
+				if windows {
+					key = strings.ToUpper(name)
+				}
+				value, exists := got[key]
+				if exists != windows || windows && value != want {
+					t.Errorf("platform value %s = %q, exists %v (windows=%v)", key, value, exists, windows)
+				}
+			}
+			for _, name := range withheld {
+				if windows {
+					name = strings.ToUpper(name)
+				}
+				if _, exists := got[name]; exists {
+					t.Errorf("non-operational %s inherited without a user grant", name)
+				}
+			}
+			if strings.Contains(strings.Join(env, "\n"), "ungranted-sentinel") || got["A_DSN"] != "" || got["B_CHAIN"] != "" {
+				t.Fatalf("ungranted source exposed directly or through an alias: %v", env)
+			}
+			if got["HOME_COPY"] != common["HOME"] || got["CONFIG_COPY"] != common["XDG_CONFIG_HOME"] || got["LOCAL"] != "project-literal" {
+				t.Fatalf("operational expansion or project literals changed: %v", got)
+			}
+			if windows && got["WINDOWS_COPY"] != windowsPaths["SystemRoot"] || !windows && got["WINDOWS_COPY"] != "" {
+				t.Fatalf("default inheritance ignored platform name semantics: %v", got)
+			}
+		})
+	}
+}
+
+func TestBuildHookEnvironmentUnmarkedCredentialsRequireSourceGrant(t *testing.T) {
+	for _, windows := range []bool{false, true} {
+		for _, tc := range []struct {
+			name   string
+			grants []string
+			want   string
+		}{
+			{"none", nil, ""},
+			{"alias alone", []string{"A_DSN"}, ""},
+			{"unrelated source", []string{"PIP_INDEX_URL"}, ""},
+			{"exact source", []string{"DATABASE_URL"}, "fake-dsn-sentinel"},
+		} {
+			t.Run(map[bool]string{false: "unix", true: "windows"}[windows]+"/"+tc.name, func(t *testing.T) {
+				env, err := buildHookEnvironment([]string{
+					"DATABASE_URL=fake-dsn-sentinel", "PIP_INDEX_URL=fake-pip-sentinel", "BV_PLAIN_DSN=withheld-custom-sentinel",
+				}, nil, map[string]string{
+					"A_DSN": "${DATABASE_URL}", "B_CHAIN": "${A_DSN}", "C_OTHER": "${BV_PLAIN_DSN}",
+				}, tc.grants, windows)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := hookEnvironmentValues(t, env, windows)
+				for _, name := range []string{"DATABASE_URL", "A_DSN", "B_CHAIN"} {
+					if got[name] != tc.want {
+						t.Errorf("%s=%q, want %q", name, got[name], tc.want)
+					}
+				}
+				if _, exists := got["DATABASE_URL"]; exists != (tc.want != "") {
+					t.Errorf("source presence=%v, want %v", exists, tc.want != "")
+				}
+				if strings.Contains(strings.Join(env, "\n"), "withheld-custom-sentinel") {
+					t.Fatal("a grant exposed an unrelated arbitrarily named credential")
+				}
+			})
+		}
 	}
 }
 
@@ -161,8 +280,11 @@ func TestBuildHookEnvironmentCredentialContainersRequireExactGrants(t *testing.T
 				if got["F_CHAIN"] != got["D_VALUE"] {
 					t.Fatal("chained alias did not use the same filtered source")
 				}
-				if got["GIT_CONFIG_NOSYSTEM"] != "1" || got["GIT_CONFIG_GLOBAL"] != "ordinary-config-path" {
-					t.Fatal("ordinary non-transport Git controls were removed")
+				if _, exists := got["GIT_CONFIG_NOSYSTEM"]; exists {
+					t.Fatal("tool-specific configuration was inherited without a grant")
+				}
+				if _, exists := got["GIT_CONFIG_GLOBAL"]; exists {
+					t.Fatal("tool-specific configuration was inherited without a grant")
 				}
 			})
 		}
@@ -225,7 +347,8 @@ func TestBuildHookEnvironmentGitTransportDoesNotLeaveOrphanCount(t *testing.T) {
 		{name: "packed", grants: []string{"GIT_CONFIG_PARAMETERS"}, want: "fake-packed-sentinel"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			env, err := buildHookEnvironment(parent, nil, nil, tc.grants, runtime.GOOS == "windows")
+			grants := append([]string{"GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL"}, tc.grants...)
+			env, err := buildHookEnvironment(parent, nil, nil, grants, runtime.GOOS == "windows")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -252,7 +375,7 @@ func TestBuildHookEnvironmentPlatformCaseAndPrecedence(t *testing.T) {
 		want      map[string]string
 		wantCount int
 	}{
-		{"unix", false, map[string]string{"Path": "original", "PATH": "upper", "path": "project", "Gh_Token": "", "Alias": "", "After": "upper", "Context": "context", "Drive": ""}, 8},
+		{"unix", false, map[string]string{"PATH": "upper", "path": "project", "Gh_Token": "", "Alias": "", "After": "upper", "Context": "context", "Drive": ""}, 7},
 		{"windows", true, map[string]string{"PATH": "project", "GH_TOKEN": "granted", "ALIAS": "granted", "AFTER": "upper", "CONTEXT": "context", "DRIVE": `C:\work`, "=C:": `C:\work`}, 8},
 	}
 	for _, tc := range tests {
@@ -323,8 +446,8 @@ func TestBuildHookEnvironmentWindowsUnicodeCredentialFold(t *testing.T) {
 					t.Errorf("%s = %q, want %q", name, got[name], want)
 				}
 			}
-			if !tc.windows && got["BV_TOKEN"] != "kelvin-token-sentinel" {
-				t.Fatal("Unix names must retain case-sensitive, non-folding semantics")
+			if !tc.windows && strings.Contains(strings.Join(env, "\n"), "sentinel") {
+				t.Fatal("Unix must withhold both ungranted Unicode names and their ASCII lookalikes")
 			}
 		})
 	}
@@ -335,7 +458,7 @@ func TestBuildHookEnvironmentDuplicateInheritedValuesAndLiteralOverrides(t *test
 		parent := []string{"NORMAL=old", "NORMAL=last", "TEST_SECRET=old-secret", "TEST_SECRET=last-secret", "CHAIN=$TEST_SECRET"}
 		overrides := map[string]string{"A": "${NORMAL}", "B": "${CHAIN}", "C": "${A}/child", "LOCAL_SECRET": "project-literal"}
 		before := append([]string(nil), parent...)
-		env, err := buildHookEnvironment(parent, nil, overrides, []string{"TEST_SECRET", "TEST_SECRET"}, windows)
+		env, err := buildHookEnvironment(parent, nil, overrides, []string{"NORMAL", "CHAIN", "TEST_SECRET", "TEST_SECRET"}, windows)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -349,7 +472,7 @@ func TestBuildHookEnvironmentDuplicateInheritedValuesAndLiteralOverrides(t *test
 		if !reflect.DeepEqual(before, parent) || overrides["A"] != "${NORMAL}" {
 			t.Fatal("environment builder mutated caller-owned input")
 		}
-		again, err := buildHookEnvironment(parent, nil, overrides, []string{"TEST_SECRET"}, windows)
+		again, err := buildHookEnvironment(parent, nil, overrides, []string{"NORMAL", "CHAIN", "TEST_SECRET"}, windows)
 		if err != nil || !reflect.DeepEqual(env, again) {
 			t.Fatalf("environment output is not deterministic: %v, %v", env, again)
 		}
@@ -396,7 +519,7 @@ func TestBuildHookEnvironmentRejectsAmbiguousOrInvalidOverrides(t *testing.T) {
 
 func TestBuildHookEnvironmentMalformedParentAndContext(t *testing.T) {
 	for _, windows := range []bool{false, true} {
-		env, err := buildHookEnvironment([]string{"INVALID", "=invalid", "NUL=value\x00", "GOOD=with=equals", "EMPTY="}, nil, nil, nil, windows)
+		env, err := buildHookEnvironment([]string{"INVALID", "=invalid", "NUL=value\x00", "GOOD=with=equals", "EMPTY="}, nil, nil, []string{"GOOD", "EMPTY", "NUL"}, windows)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -422,9 +545,9 @@ func TestBuildHookEnvironmentSubprocess(t *testing.T) {
 	for _, grant := range []bool{false, true} {
 		t.Run(map[bool]string{false: "withheld", true: "granted"}[grant], func(t *testing.T) {
 			parent := append(os.Environ(), "BV_FAKE_SECRET=bounded-sentinel", "BV_HOOK_ENV_PROBE=1", "BV_ORDINARY=normal")
-			var grants []string
+			grants := []string{"BV_HOOK_ENV_PROBE", "BV_ORDINARY"}
 			if grant {
-				grants = []string{"BV_FAKE_SECRET"}
+				grants = append(grants, "BV_FAKE_SECRET")
 			}
 			env, err := buildHookEnvironment(parent, nil, map[string]string{
 				"BV_ALIAS": "${BV_FAKE_SECRET}", "BV_CHAIN": "${BV_ALIAS}",

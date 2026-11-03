@@ -44,7 +44,7 @@ func main() {
 	for _, name := range []string{
 		"BV_EXPORT_PATH", "BV_EXPORT_FORMAT", "BV_ISSUE_COUNT", "BV_TIMESTAMP",
 		"BV_HOOK_ARGV_VISIBLE", "BV_HOOK_ARGV_TEST_SECRET", "BV_HOOK_ARGV_OTHER_TOKEN",
-		"A_ALIAS", "B_CHAIN", "C_OTHER", "D_CONTEXT", "GITHUB_TOKEN",
+		"A_ALIAS", "B_CHAIN", "C_OTHER", "D_CONTEXT", "E_ORDINARY", "F_ORDINARY_CHAIN", "GITHUB_TOKEN",
 	} {
 		values[name] = os.Getenv(name)
 	}
@@ -203,7 +203,7 @@ func TestHookArgvExports(t *testing.T) {
 					}
 					for key, want := range map[string]string{
 						"BV_EXPORT_PATH": output, "BV_EXPORT_FORMAT": format,
-						"BV_ISSUE_COUNT": "1", "BV_HOOK_ARGV_VISIBLE": "ordinary-argv-value",
+						"BV_ISSUE_COUNT": "1", "BV_HOOK_ARGV_VISIBLE": "",
 					} {
 						if record.Env[key] != want {
 							t.Errorf("context %s = %q, want %q", key, record.Env[key], want)
@@ -310,15 +310,17 @@ func TestHookArgvExports(t *testing.T) {
 			}
 
 			for _, grant := range []struct {
-				name      string
-				keys      []string
-				wantMain  string
-				wantOther string
+				name         string
+				keys         []string
+				wantMain     string
+				wantOther    string
+				wantOrdinary string
 			}{
-				{"none", nil, "", ""},
-				{"alias is not source consent", []string{"A_ALIAS"}, "", ""},
-				{"primary source only", []string{"BV_HOOK_ARGV_TEST_SECRET"}, secret, ""},
-				{"both sources", []string{"BV_HOOK_ARGV_TEST_SECRET", "BV_HOOK_ARGV_OTHER_TOKEN"}, secret, otherSecret},
+				{"none", nil, "", "", ""},
+				{"alias is not source consent", []string{"A_ALIAS", "E_ORDINARY"}, "", "", ""},
+				{"primary source only", []string{"BV_HOOK_ARGV_TEST_SECRET"}, secret, "", ""},
+				{"both sources", []string{"BV_HOOK_ARGV_TEST_SECRET", "BV_HOOK_ARGV_OTHER_TOKEN"}, secret, otherSecret, ""},
+				{"ordinary-looking source requires grant", []string{"BV_HOOK_ARGV_VISIBLE"}, "", "", "ordinary-argv-value"},
 			} {
 				t.Run("credential_grants/"+grant.name, func(t *testing.T) {
 					dir := hookProject(t)
@@ -329,6 +331,8 @@ func TestHookArgvExports(t *testing.T) {
 					env["B_CHAIN"] = "${A_ALIAS}"
 					env["C_OTHER"] = "${BV_HOOK_ARGV_OTHER_TOKEN}"
 					env["D_CONTEXT"] = "${BV_EXPORT_PATH}"
+					env["E_ORDINARY"] = "${BV_HOOK_ARGV_VISIBLE}"
+					env["F_ORDINARY_CHAIN"] = "${E_ORDINARY}"
 					env["GITHUB_TOKEN"] = "${BV_HOOK_ARGV_TEST_SECRET}"
 					writeArgvHookFixture(t, dir, []map[string]any{hook}, nil)
 					digest := reviewedHookDigest(t, dir)
@@ -349,7 +353,8 @@ func TestHookArgvExports(t *testing.T) {
 						"BV_HOOK_ARGV_TEST_SECRET": grant.wantMain, "A_ALIAS": grant.wantMain,
 						"B_CHAIN": grant.wantMain, "GITHUB_TOKEN": grant.wantMain,
 						"BV_HOOK_ARGV_OTHER_TOKEN": grant.wantOther, "C_OTHER": grant.wantOther,
-						"D_CONTEXT": output, "BV_HOOK_ARGV_VISIBLE": "ordinary-argv-value",
+						"D_CONTEXT": output, "BV_HOOK_ARGV_VISIBLE": grant.wantOrdinary,
+						"E_ORDINARY": grant.wantOrdinary, "F_ORDINARY_CHAIN": grant.wantOrdinary,
 					} {
 						if record.Env[key] != want {
 							t.Errorf("argv environment %s = %q, want %q", key, record.Env[key], want)

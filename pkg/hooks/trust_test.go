@@ -224,7 +224,7 @@ func TestExecutorRejectsPreviousLifetimePolicyApproval(t *testing.T) {
 	config := &Config{Hooks: HooksByPhase{PreExport: []Hook{{Name: "reviewed", Command: "echo reviewed"}}}}
 	// Frozen earlier approval encodings for this declaration. New execution
 	// modes and declaration validation require review of the current policy.
-	for _, policy := range []string{"bv-project-hooks-v1", "bv-project-hooks-v2"} {
+	for _, policy := range []string{"bv-project-hooks-v1", "bv-project-hooks-v2", "bv-project-hooks-v3"} {
 		t.Run(policy, func(t *testing.T) {
 			legacy := fmt.Sprintf(`{"policy":%q,"platform":%q,"source_hash":"","hooks":{"pre-export":[{"name":"reviewed","command":"echo reviewed"}]}}`, policy, runtime.GOOS)
 			digest := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(legacy)))

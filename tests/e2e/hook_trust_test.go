@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,11 +25,12 @@ type inspectedHook struct {
 }
 
 type hookInspection struct {
-	Digest     string `json:"digest"`
-	ProjectDir string `json:"project_dir"`
-	ConfigPath string `json:"config_path"`
-	Platform   string `json:"platform"`
-	Hooks      struct {
+	Digest       string   `json:"digest"`
+	ProjectDir   string   `json:"project_dir"`
+	ConfigPath   string   `json:"config_path"`
+	Platform     string   `json:"platform"`
+	InheritedEnv []string `json:"inherited_env"`
+	Hooks        struct {
 		PreExport  []inspectedHook `json:"pre-export"`
 		PostExport []inspectedHook `json:"post-export"`
 	} `json:"hooks"`
@@ -136,6 +138,19 @@ func TestHookTrustInspectionIsReadOnlyAndDoesNotExpandSecrets(t *testing.T) {
 	}
 	if info.ProjectDir != canonical || info.ConfigPath != filepath.Join(canonical, ".bv", "hooks.yaml") || info.Platform != runtime.GOOS {
 		t.Fatalf("inspection lost project/platform identity: %+v", info)
+	}
+	for _, name := range []string{"PATH", "HOME", "LANG", "XDG_CONFIG_HOME"} {
+		if !slices.Contains(info.InheritedEnv, name) {
+			t.Errorf("inspection does not disclose inherited operational variable %s", name)
+		}
+	}
+	for _, name := range []string{"BV_HOOK_TEST_SECRET", "DATABASE_URL", "BV_PLAIN_DSN", "BASH_ENV"} {
+		if slices.Contains(info.InheritedEnv, name) {
+			t.Errorf("inspection permits ungranted ambient variable %s", name)
+		}
+	}
+	if !slices.IsSorted(info.InheritedEnv) || slices.Contains(info.InheritedEnv, "SYSTEMROOT") != (runtime.GOOS == "windows") {
+		t.Fatalf("inspection lost deterministic platform environment policy: %v", info.InheritedEnv)
 	}
 	if len(info.Hooks.PreExport) != 1 || info.Hooks.PreExport[0].Command != "echo inspected > inspection-marker" || info.Hooks.PreExport[0].Env["COPY"] != "${BV_HOOK_TEST_SECRET}" || info.Hooks.PreExport[0].Timeout != 12*time.Second || info.Hooks.PreExport[0].OnError != "continue" {
 		t.Fatalf("inspection lost exact hook declarations: %+v", info)
@@ -267,19 +282,22 @@ func TestHookTrustCredentialGrantsAreSeparateFromYAML(t *testing.T) {
 	t.Setenv("BV_HOOK_TEST_SECRET", secret)
 	t.Setenv("BV_HOOK_OTHER_TOKEN", otherSecret)
 	t.Setenv("BV_HOOK_ORDINARY_VALUE", "ordinary-hook-value")
-	command := `echo [$BV_HOOK_TEST_SECRET][$A_ALIAS][$B_CHAIN][$GITHUB_TOKEN][$C_OTHER][$BV_HOOK_ORDINARY_VALUE] > credential-marker`
+	command := `echo [$BV_HOOK_TEST_SECRET][$A_ALIAS][$B_CHAIN][$GITHUB_TOKEN][$C_OTHER][$BV_HOOK_ORDINARY_VALUE][$D_ORDINARY][$E_ORDINARY_CHAIN] > credential-marker`
 	if runtime.GOOS == "windows" {
-		command = `echo [%BV_HOOK_TEST_SECRET%][%A_ALIAS%][%B_CHAIN%][%GITHUB_TOKEN%][%C_OTHER%][%BV_HOOK_ORDINARY_VALUE%] > credential-marker`
+		command = `echo [%BV_HOOK_TEST_SECRET%][%A_ALIAS%][%B_CHAIN%][%GITHUB_TOKEN%][%C_OTHER%][%BV_HOOK_ORDINARY_VALUE%][%D_ORDINARY%][%E_ORDINARY_CHAIN%] > credential-marker`
 	}
 	for _, tc := range []struct {
-		name       string
-		grants     []string
-		wantSecret bool
-		wantOther  bool
+		name         string
+		grants       []string
+		wantSecret   bool
+		wantOther    bool
+		wantOrdinary bool
 	}{
-		{"no user grants", nil, false, false},
-		{"one user grant", []string{"--hook-env", "BV_HOOK_TEST_SECRET"}, true, false},
-		{"two explicit grants", []string{"--hook-env", "BV_HOOK_TEST_SECRET", "--hook-env", "BV_HOOK_OTHER_TOKEN"}, true, true},
+		{"no user grants", nil, false, false, false},
+		{"alias grant cannot restore ordinary-looking source", []string{"--hook-env", "D_ORDINARY"}, false, false, false},
+		{"one user grant", []string{"--hook-env", "BV_HOOK_TEST_SECRET"}, true, false, false},
+		{"two explicit grants", []string{"--hook-env", "BV_HOOK_TEST_SECRET", "--hook-env", "BV_HOOK_OTHER_TOKEN"}, true, true, false},
+		{"ordinary-looking source requires grant", []string{"--hook-env", "BV_HOOK_ORDINARY_VALUE"}, false, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := hookProject(t)
@@ -292,6 +310,8 @@ func TestHookTrustCredentialGrantsAreSeparateFromYAML(t *testing.T) {
         B_CHAIN: "${A_ALIAS}"
         BV_HOOK_TEST_SECRET: "${BV_HOOK_TEST_SECRET}"
         C_OTHER: "${BV_HOOK_OTHER_TOKEN}"
+        D_ORDINARY: "${BV_HOOK_ORDINARY_VALUE}"
+        E_ORDINARY_CHAIN: "${D_ORDINARY}"
         GITHUB_TOKEN: "${BV_HOOK_TEST_SECRET}"
 `, command))
 			digest := reviewedHookDigest(t, dir)
@@ -309,7 +329,11 @@ func TestHookTrustCredentialGrantsAreSeparateFromYAML(t *testing.T) {
 			if tc.wantSecret {
 				wantCount = 4 // direct name, renamed alias, chained alias, protected destination
 			}
-			if strings.Count(string(data), secret) != wantCount || strings.Contains(string(data), otherSecret) != tc.wantOther || !strings.Contains(string(data), "ordinary-hook-value") {
+			wantOrdinaryCount := 0
+			if tc.wantOrdinary {
+				wantOrdinaryCount = 3 // direct source and both aliases
+			}
+			if strings.Count(string(data), secret) != wantCount || strings.Contains(string(data), otherSecret) != tc.wantOther || strings.Count(string(data), "ordinary-hook-value") != wantOrdinaryCount {
 				t.Fatalf("wrong granted child environment: %q", data)
 			}
 			if strings.Contains(stdout+stderr, secret) || strings.Contains(stdout+stderr, otherSecret) {

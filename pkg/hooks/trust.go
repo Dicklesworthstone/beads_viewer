@@ -25,12 +25,13 @@ type ExecutionOptions struct {
 // Inspection describes the declarations to review without executing or expanding
 // them. JSON encoding escapes terminal control characters in project-authored text.
 type Inspection struct {
-	ProjectDir string       `json:"project_dir"`
-	ConfigPath string       `json:"config_path"`
-	Platform   string       `json:"platform"`
-	Digest     string       `json:"digest"`
-	Hooks      HooksByPhase `json:"hooks"`
-	Warnings   []string     `json:"warnings,omitempty"`
+	ProjectDir   string       `json:"project_dir"`
+	ConfigPath   string       `json:"config_path"`
+	Platform     string       `json:"platform"`
+	Digest       string       `json:"digest"`
+	InheritedEnv []string     `json:"inherited_env"`
+	Hooks        HooksByPhase `json:"hooks"`
+	Warnings     []string     `json:"warnings,omitempty"`
 }
 
 // Digest identifies the complete hook snapshot and its interpretation. It covers
@@ -44,11 +45,12 @@ func (c *Config) Digest() (string, error) {
 		return "", nil
 	}
 	payload, err := json.Marshal(struct {
-		Policy     string       `json:"policy"`
-		Platform   string       `json:"platform"`
-		SourceHash string       `json:"source_hash"`
-		Hooks      HooksByPhase `json:"hooks"`
-	}{"bv-project-hooks-v3", runtime.GOOS, c.sourceHash, c.Hooks})
+		Policy       string       `json:"policy"`
+		Platform     string       `json:"platform"`
+		SourceHash   string       `json:"source_hash"`
+		InheritedEnv []string     `json:"inherited_env"`
+		Hooks        HooksByPhase `json:"hooks"`
+	}{"bv-project-hooks-v4", runtime.GOOS, c.sourceHash, inheritedHookEnvKeys(runtime.GOOS == "windows"), c.Hooks})
 	if err != nil {
 		return "", fmt.Errorf("fingerprinting hooks: %w", err)
 	}
@@ -67,12 +69,13 @@ func (l *Loader) Inspect() (Inspection, error) {
 		return Inspection{}, err
 	}
 	return Inspection{
-		ProjectDir: snapshot.projectDir,
-		ConfigPath: snapshot.configPath,
-		Platform:   runtime.GOOS,
-		Digest:     digest,
-		Hooks:      snapshot.Hooks,
-		Warnings:   append([]string(nil), l.warnings...),
+		ProjectDir:   snapshot.projectDir,
+		ConfigPath:   snapshot.configPath,
+		Platform:     runtime.GOOS,
+		Digest:       digest,
+		InheritedEnv: inheritedHookEnvKeys(runtime.GOOS == "windows"),
+		Hooks:        snapshot.Hooks,
+		Warnings:     append([]string(nil), l.warnings...),
 	}, nil
 }
 

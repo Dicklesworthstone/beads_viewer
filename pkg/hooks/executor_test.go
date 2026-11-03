@@ -363,7 +363,7 @@ func TestExecutorCustomEnvExpansion(t *testing.T) {
 		Timestamp:    time.Now(),
 	}
 
-	executor := newApprovedExecutor(t, config, ctx)
+	executor := newApprovedExecutor(t, config, ctx, "TEST_HOOK_VAR")
 	err := executor.RunPreExport()
 	if err != nil {
 		t.Fatalf("expected success, got: %v", err)
@@ -462,17 +462,17 @@ func TestExecutorCredentialGrantRequiresInvokingUser(t *testing.T) {
 	}
 }
 
-func TestIsSensitiveEnvKey(t *testing.T) {
-	sensitive := []string{"GITHUB_TOKEN", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "SSH_AUTH_SOCK", "NPM_API_KEY", "my_password", "DB_Passwd", "GCP_CREDENTIALS_JSON", "SOME_PRIVATE_KEY", "OPENAI_APIKEY"}
-	for _, k := range sensitive {
-		if !isSensitiveEnvKey(k) {
-			t.Errorf("expected %q to be sensitive", k)
-		}
-	}
-	benign := []string{"HOME", "PATH", "GIT_AUTHOR_NAME", "TERM", "LANG", "BV_EXPORT_PATH"}
-	for _, k := range benign {
-		if isSensitiveEnvKey(k) {
-			t.Errorf("expected %q to be benign", k)
+func TestHookEnvironmentWithholdsAllCredentialNames(t *testing.T) {
+	for _, windows := range []bool{false, true} {
+		for _, name := range []string{"GITHUB_TOKEN", "GH_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "SSH_AUTH_SOCK", "NPM_API_KEY", "my_password", "DB_Passwd", "GCP_CREDENTIALS_JSON", "SOME_PRIVATE_KEY", "OPENAI_APIKEY", "DATABASE_URL", "PIP_INDEX_URL", "BV_PLAIN_DSN"} {
+			parent := []string{name + "=fake-credential-sentinel"}
+			env, err := buildHookEnvironment(parent, nil, map[string]string{"ALIAS": "${" + name + "}"}, nil, windows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(strings.Join(env, "\n"), "fake-credential-sentinel") {
+				t.Errorf("ambient %s reached hook environment without a grant (windows=%v)", name, windows)
+			}
 		}
 	}
 }
