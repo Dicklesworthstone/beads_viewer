@@ -190,6 +190,20 @@ func (l *Loader) loadFromFile(path, source string) error {
 			l.warnings = append(l.warnings, fmt.Sprintf("recipe %s in %s: %v", name, path, err))
 			continue
 		}
+		if source == SourceUser && recipe.Export.Template != "" {
+			// A user default must not select a file relative to an untrusted
+			// project's working directory. Keep it anchored to the user config.
+			templatePath := recipe.Export.Template
+			if !filepath.IsAbs(templatePath) {
+				templatePath = filepath.Join(filepath.Dir(path), templatePath)
+			}
+			templatePath, err := filepath.Abs(templatePath)
+			if err != nil {
+				return fmt.Errorf("resolving template for user recipe %s: %w", name, err)
+			}
+			recipe.Export.Template = templatePath
+			recipe.Export.authorizedTemplate = templatePath
+		}
 		l.set(name, *recipe, source, "")
 	}
 
@@ -231,6 +245,9 @@ func (l *Loader) loadProjectFiles(dir string) {
 }
 
 func (l *Loader) set(name string, recipe Recipe, source, path string) {
+	if source != SourceUser {
+		recipe.Export.authorizedTemplate = ""
+	}
 	l.recipes[name] = recipe
 	l.sources[name] = source
 	if path != "" {

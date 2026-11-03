@@ -50,7 +50,7 @@ func TestReportTemplateLiteralMarkdownBlocks(t *testing.T) {
 }
 
 func TestReportOptionsPrecedence(t *testing.T) {
-	markdown, csvFormat, empty := "markdown", "csv", ""
+	markdown, csvFormat, empty, chosenTemplate := "markdown", "csv", "", "chosen.tmpl"
 	yes, no := true, false
 	for _, tc := range []struct {
 		name      string
@@ -65,6 +65,8 @@ func TestReportOptionsPrecedence(t *testing.T) {
 		{"recipe JSON", recipe.ExportConfig{Format: "json", IncludeGraph: &no}, ReportOverrides{}, "json", false, "", ""},
 		{"explicit Markdown", recipe.ExportConfig{Format: "json", IncludeGraph: &no}, ReportOverrides{Format: &markdown}, "markdown", false, "", ""},
 		{"explicit false and cleared template", recipe.ExportConfig{IncludeGraph: &yes, Template: "missing.tmpl"}, ReportOverrides{IncludeGraph: &no, Template: &empty}, "markdown", false, "", ""},
+		{"untrusted template default", recipe.ExportConfig{Template: "private.txt"}, ReportOverrides{}, "", false, "", "requires explicit --export-template"},
+		{"explicit template choice", recipe.ExportConfig{Template: "private.txt"}, ReportOverrides{Template: &chosenTemplate}, "markdown", true, chosenTemplate, ""},
 		{"CSV default has no graph", recipe.ExportConfig{}, ReportOverrides{Format: &csvFormat}, "csv", false, "", ""},
 		{"CSV graph incompatible", recipe.ExportConfig{IncludeGraph: &yes}, ReportOverrides{Format: &csvFormat}, "", false, "", "CSV cannot include a graph"},
 		{"Mermaid graph disabled", recipe.ExportConfig{Format: "mermaid", IncludeGraph: &no}, ReportOverrides{}, "", false, "", "Mermaid export requires"},
@@ -83,6 +85,50 @@ func TestReportOptionsPrecedence(t *testing.T) {
 				t.Fatalf("got %+v, %v; want format=%s graph=%v template=%q", got, err, tc.format, tc.graph, tc.template)
 			}
 		})
+	}
+}
+
+func TestReportTemplateUserDefaults(t *testing.T) {
+	dir := t.TempDir()
+	userDir := filepath.Join(dir, "user")
+	projectDir := filepath.Join(dir, "project")
+	for _, path := range []string{userDir, projectDir} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	userPath := filepath.Join(userDir, "recipes.yaml")
+	if err := os.WriteFile(userPath, []byte("recipes:\n  report:\n    export:\n      template: report.tmpl\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for path, content := range map[string]string{
+		filepath.Join(userDir, "report.tmpl"):    "USER_AUTHORIZED_TEMPLATE {{.Title}}",
+		filepath.Join(projectDir, "report.tmpl"): "PROJECT_FILE_SENTINEL",
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(projectDir)
+	loader := recipe.NewLoader(recipe.WithUserPath(userPath), recipe.WithProjectDir(projectDir))
+	if err := loader.Load(); err != nil {
+		t.Fatal(err)
+	}
+	defaults := loader.Get("report")
+	if defaults == nil {
+		t.Fatalf("user report missing: %v", loader.Warnings())
+	}
+	opts, err := ResolveReportOptions(defaults.Export, ReportOverrides{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := GenerateReport(nil, nil, opts)
+	if err != nil || !strings.HasPrefix(string(content), "USER_AUTHORIZED_TEMPLATE ") || bytes.Contains(content, []byte("PROJECT_FILE_SENTINEL")) {
+		t.Fatalf("user default must resolve beside the user config, not in the project: %q %v", content, err)
+	}
+	defaults.Export.Template = filepath.Join(projectDir, "report.tmpl")
+	if _, err := ResolveReportOptions(defaults.Export, ReportOverrides{}); err == nil || !strings.Contains(err.Error(), "requires explicit --export-template") {
+		t.Fatalf("replacing the trusted path retained authority: %v", err)
 	}
 }
 

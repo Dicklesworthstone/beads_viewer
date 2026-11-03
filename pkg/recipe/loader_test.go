@@ -1,7 +1,9 @@
 package recipe_test
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoaderBuiltinRecipes(t *testing.T) {
@@ -655,6 +658,133 @@ recipes:
 	}
 	if loader.Path("user-only") != "" {
 		t.Errorf("map-sourced recipe should have no path, got %q", loader.Path("user-only"))
+	}
+}
+
+func TestLoaderTemplateAuthority(t *testing.T) {
+	dir := t.TempDir()
+	userPath := filepath.Join(dir, "user", "recipes.yaml")
+	projectDir := filepath.Join(dir, "project")
+	absoluteTemplate := filepath.Join(dir, "absolute.tmpl")
+	writeFile(t, userPath, fmt.Sprintf(`recipes:
+  user-relative:
+    export:
+      template: templates/report.tmpl
+  user-absolute:
+    export:
+      template: %q
+  default:
+    export:
+      template: templates/report.tmpl
+  file-override:
+    export:
+      template: templates/report.tmpl
+`, absoluteTemplate))
+	writeFile(t, filepath.Join(projectDir, ".bv", "recipes.yaml"), `recipes:
+  default:
+    export:
+      template: private.txt
+  project-only:
+    export:
+      template: private.txt
+`)
+	writeFile(t, filepath.Join(projectDir, ".beads", "recipes", "file-override.yaml"), "export:\n  template: private.txt\n")
+	t.Chdir(projectDir)
+	loader := recipe.NewLoader(recipe.WithUserPath(userPath), recipe.WithProjectDir(projectDir))
+	if err := loader.Load(); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, source, path string
+		authorized         bool
+	}{
+		{"user-relative", recipe.SourceUser, filepath.Join(filepath.Dir(userPath), "templates", "report.tmpl"), true},
+		{"user-absolute", recipe.SourceUser, absoluteTemplate, true},
+		{"default", recipe.SourceProject, "private.txt", false},
+		{"project-only", recipe.SourceProject, "private.txt", false},
+		{"file-override", recipe.SourceProjectFile, "private.txt", false},
+		{"actionable", recipe.SourceBuiltin, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := loader.Get(tc.name)
+			if got == nil {
+				t.Fatal("recipe missing")
+			}
+			if loader.Source(tc.name) != tc.source || got.Export.Template != tc.path || got.Export.TemplateAuthorizedByUser() != tc.authorized {
+				t.Fatalf("source=%s template=%q authorized=%v; want %s %q %v", loader.Source(tc.name), got.Export.Template, got.Export.TemplateAuthorizedByUser(), tc.source, tc.path, tc.authorized)
+			}
+		})
+	}
+
+	// Authority travels with the loaded value, not a lookup by its mutable name.
+	trusted := loader.Get("user-relative")
+	trusted.Name = "renamed"
+	if !trusted.Export.TemplateAuthorizedByUser() {
+		t.Fatal("copying a user recipe lost its explicit template path authority")
+	}
+	trusted.Export.Template = absoluteTemplate
+	if trusted.Export.TemplateAuthorizedByUser() {
+		t.Fatal("changing a trusted recipe's template authorized another file")
+	}
+	if !loader.Get("user-relative").Export.TemplateAuthorizedByUser() {
+		t.Fatal("changing a returned recipe mutated the loader's original authority")
+	}
+
+	// A file argument cannot borrow authority by claiming a loaded user's name,
+	// even if it happens to be located beside the trusted user configuration.
+	spoofPath := filepath.Join(filepath.Dir(userPath), "spoof.yaml")
+	writeFile(t, spoofPath, "name: user-relative\nexport:\n  template: private.txt\n")
+	spoof, err := loader.Resolve(spoofPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spoof.Name != "user-relative" || spoof.Export.TemplateAuthorizedByUser() {
+		t.Fatalf("file argument borrowed user authority: %+v", spoof.Export)
+	}
+}
+
+func TestRecipeTemplateAuthorityCannotBeSerialized(t *testing.T) {
+	dir := t.TempDir()
+	userPath := filepath.Join(dir, "user.yaml")
+	writeFile(t, userPath, "recipes:\n  trusted:\n    export:\n      template: report.tmpl\n")
+	loader := recipe.NewLoader(recipe.WithUserPath(userPath), recipe.WithProjectDir(dir))
+	if err := loader.Load(); err != nil {
+		t.Fatal(err)
+	}
+	trusted := loader.Get("trusted")
+	if trusted == nil || !trusted.Export.TemplateAuthorizedByUser() {
+		t.Fatal("user template was not authorized")
+	}
+	for _, tc := range []struct {
+		name      string
+		marshal   func(any) ([]byte, error)
+		unmarshal func([]byte, any) error
+	}{
+		{"JSON", json.Marshal, json.Unmarshal},
+		{"YAML", yaml.Marshal, yaml.Unmarshal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := tc.marshal(trusted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded recipe.Recipe
+			if err := tc.unmarshal(encoded, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if decoded.Export.Template != trusted.Export.Template || decoded.Export.TemplateAuthorizedByUser() {
+				t.Fatalf("serialized configuration granted template authority: %s", encoded)
+			}
+		})
+	}
+	for _, field := range []string{"authorizedTemplate", "authorized_template", "template_authorized_by_user", "source"} {
+		t.Run(field, func(t *testing.T) {
+			path := filepath.Join(dir, field+".yaml")
+			writeFile(t, path, fmt.Sprintf("name: forged\nexport:\n  template: private.txt\n  %s: user\n", field))
+			if _, err := recipe.LoadFile(path); err == nil || !strings.Contains(err.Error(), field) {
+				t.Fatalf("forged authority field must be rejected by strict YAML decoding: %v", err)
+			}
+		})
 	}
 }
 

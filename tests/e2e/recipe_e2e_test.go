@@ -60,9 +60,13 @@ func writeRecipeFile(t *testing.T, dir, name, content string) string {
 // exit error, for tests that must inspect diagnostics on both outcomes.
 func runBVSplit(t *testing.T, dir string, args ...string) (string, string, error) {
 	t.Helper()
-	cmd := exec.Command(buildBvBinary(t), args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, buildBvBinary(t), args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "TERM=dumb")
+	// Exports must complete without reading an interactive approval from stdin.
+	cmd.Stdin = strings.NewReader("")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -350,11 +354,11 @@ func TestRecipeReportTemplateAndWriteErrors(t *testing.T) {
 		extra []string
 		want  string
 	}{
-		{"missing template", nil, "read export template"},
+		{"missing template", []string{"--export-template", "missing.tmpl"}, "read export template"},
 		{"malformed template", []string{"--export-template", "malformed.tmpl"}, "parse export template"},
 		{"template render error", []string{"--export-template", "unknown-field.tmpl"}, "render export template"},
-		{"unknown format", []string{"--export-format", "shell"}, "export format"},
-		{"incompatible template", []string{"--export-format", "json"}, "templates require markdown"},
+		{"unknown format", []string{"--export-format", "shell", "--export-template="}, "export format"},
+		{"incompatible template", []string{"--export-format", "json", "--export-template", "missing.tmpl"}, "templates require markdown"},
 		{"incompatible CSV graph", []string{"--export-format", "csv", "--export-template=", "--export-include-graph=true"}, "CSV cannot include a graph"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -396,6 +400,171 @@ func TestRecipeReportTemplateAndWriteErrors(t *testing.T) {
 	if err == nil || !strings.Contains(stdout+stderr, "Error exporting") {
 		t.Fatalf("write error not surfaced: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
 	}
+}
+
+func TestRecipeReportTemplateAuthorization(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	const sentinel = "FAKE-PRIVATE-TEMPLATE-SENTINEL"
+	for _, kind := range []string{"inside project", "absolute outside", "parent traversal", "symlink outside"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := recipeProject(t)
+			privatePath := filepath.Join(dir, ".private-fixture")
+			templatePath := ".private-fixture"
+			if kind != "inside project" {
+				privatePath = filepath.Join(t.TempDir(), "private-fixture")
+				templatePath = privatePath
+			}
+			if err := os.WriteFile(privatePath, []byte(sentinel), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "parent traversal":
+				var err error
+				templatePath, err = filepath.Rel(dir, privatePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+			case "symlink outside":
+				templatePath = "project-template.tmpl"
+				if err := os.Symlink(privatePath, filepath.Join(dir, templatePath)); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+			}
+			// Familiar built-in names must not confer authority on project files.
+			writeRecipeFile(t, dir, "default.yaml", fmt.Sprintf("export:\n  template: %q\n", templatePath))
+			for _, exportFlag := range []string{"--export", "--export-md"} {
+				path := filepath.Join(t.TempDir(), "report.md")
+				args := []string{"--recipe", "default", exportFlag, path, "--no-hooks"}
+				if exportFlag == "--export-md" {
+					args = append(args, "--yes")
+				}
+				stdout, stderr, err := runBVSplit(t, dir, args...)
+				if err == nil || !strings.Contains(stderr, "requires explicit --export-template authorization") {
+					t.Fatalf("unapproved %s template accepted: %v\nstdout=%s\nstderr=%s", exportFlag, err, stdout, stderr)
+				}
+				if strings.Contains(stdout+stderr, sentinel) {
+					t.Fatal("denial diagnostic included private file content")
+				}
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("unapproved template created output: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestRecipeReportExplicitTemplateChoice(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	dir := recipeProject(t)
+	const sentinel = "FAKE-USER-SELECTED-TEMPLATE"
+	templatePath := filepath.Join(dir, "selected.tmpl")
+	if err := os.WriteFile(templatePath, []byte(sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeRecipeFile(t, dir, "report.yaml", "export:\n  template: selected.tmpl\n")
+	path := filepath.Join(dir, "report.md")
+	const existing = "keep existing report until authorized"
+	if err := os.WriteFile(path, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err := runBVSplit(t, dir, "--recipe", "report", "--export", path, "--no-hooks")
+	if err == nil || !strings.Contains(stderr, "requires explicit --export-template authorization") {
+		t.Fatalf("unapproved replacement succeeded: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+	}
+	if raw, err := os.ReadFile(path); err != nil || string(raw) != existing {
+		t.Fatalf("unapproved template changed existing report: %q (%v)", raw, err)
+	}
+	if strings.Contains(stdout+stderr, sentinel) {
+		t.Fatal("unapproved template content appeared in diagnostic")
+	}
+	plainPath := filepath.Join(dir, "plain.md")
+	stdout, stderr, err = runBVSplit(t, dir, "--export-md", plainPath, "--no-hooks")
+	if err != nil {
+		t.Fatalf("plain export activated a recipe template: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+	}
+	if raw, err := os.ReadFile(plainPath); err != nil || !bytes.Contains(raw, []byte("Sprint root")) || bytes.Contains(raw, []byte(sentinel)) {
+		t.Fatalf("plain export did not retain built-in report: %q (%v)", raw, err)
+	}
+	// The invoking user's CLI path is an explicit grant, even in automation.
+	stdout, stderr, err = runBVSplit(t, dir, "--recipe", "report", "--export", path, "--export-template", "selected.tmpl", "--no-hooks")
+	if err != nil {
+		t.Fatalf("explicit template grant failed: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+	}
+	if raw, err := os.ReadFile(path); err != nil || string(raw) != sentinel {
+		t.Fatalf("explicitly selected template not rendered: %q (%v)", raw, err)
+	}
+	stdout, stderr, err = runBVSplit(t, dir, "--recipe", "report", "--export", path, "--export-template=", "--no-hooks")
+	if err != nil {
+		t.Fatalf("explicit template clearing failed: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+	}
+	if raw, err := os.ReadFile(path); err != nil || !bytes.Contains(raw, []byte("Sprint root")) || bytes.Contains(raw, []byte(sentinel)) {
+		t.Fatalf("explicit empty template did not restore built-in report: %q (%v)", raw, err)
+	}
+}
+
+func TestRecipeUserTemplateAuthority(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	configDir := filepath.Join(home, ".config", "bv")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const trusted = "USER-AUTHORED-TEMPLATE"
+	const private = "FAKE-PROJECT-PRIVATE-CONTENT"
+	userTemplate := filepath.Join(configDir, "report.tmpl")
+	if err := os.WriteFile(userTemplate, []byte(trusted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	userConfig := fmt.Sprintf("recipes:\n  default:\n    export:\n      template: report.tmpl\n  absolute-report:\n    export:\n      template: %q\n", userTemplate)
+	if err := os.WriteFile(filepath.Join(configDir, "recipes.yaml"), []byte(userConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := recipeProject(t)
+	if err := os.WriteFile(filepath.Join(dir, "report.tmpl"), []byte(private), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"default", "absolute-report"} {
+		path := filepath.Join(t.TempDir(), "report.md")
+		stdout, stderr, err := runBVSplit(t, dir, "--recipe", name, "--export", path, "--no-hooks")
+		if err != nil {
+			t.Fatalf("trusted user template %s failed: %v\nstdout=%s\nstderr=%s", name, err, stdout, stderr)
+		}
+		if raw, err := os.ReadFile(path); err != nil || string(raw) != trusted {
+			t.Fatalf("user template %s resolved through project cwd: %q (%v)", name, raw, err)
+		}
+	}
+	// A standalone file cannot borrow the authority of a trusted recipe name.
+	spoofPath := filepath.Join(dir, "spoof.yaml")
+	if err := os.WriteFile(spoofPath, []byte("name: default\nexport:\n  template: report.tmpl\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertDenied := func(recipeName string) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "report.md")
+		stdout, stderr, err := runBVSplit(t, dir, "--recipe", recipeName, "--export", path, "--no-hooks")
+		if err == nil || !strings.Contains(stderr, "requires explicit --export-template authorization") {
+			t.Fatalf("project recipe inherited user authority: %v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+		}
+		if strings.Contains(stdout+stderr, private) {
+			t.Fatal("private template content appeared in diagnostic")
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("project override created report: %v", err)
+		}
+	}
+	assertDenied(spoofPath)
+	if err := os.MkdirAll(filepath.Join(dir, ".bv"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".bv", "recipes.yaml"), []byte("recipes:\n  default:\n    export:\n      template: report.tmpl\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertDenied("default")
 }
 
 func TestRecipeReportHookOrderingAndExitPolicy(t *testing.T) {

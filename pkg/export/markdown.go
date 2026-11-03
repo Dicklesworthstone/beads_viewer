@@ -68,6 +68,9 @@ func ResolveReportOptions(defaults recipe.ExportConfig, explicit ReportOverrides
 	if err := opts.validate(); err != nil {
 		return ReportOptions{}, err
 	}
+	if opts.Template != "" && explicit.Template == nil && !defaults.TemplateAuthorizedByUser() {
+		return ReportOptions{}, fmt.Errorf("recipe template %q requires explicit --export-template authorization; review the file and pass --export-template=PATH, or --export-template= to use the built-in report", opts.Template)
+	}
 	return opts, nil
 }
 

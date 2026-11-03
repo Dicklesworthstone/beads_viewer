@@ -1197,14 +1197,30 @@ including their configured failure policy. Configured hooks require
 `--trust-hooks` with the reviewed digest, or `--no-hooks` to skip them; see
 [Automation Hooks](#-automation-hooks).
 
-`export.template` and `--export-template PATH` read a Markdown template relative
-to the working directory. Templates receive `.Title`, `.GeneratedAt`, `.Issues`,
-and `.Graph` (Mermaid text when graphs are enabled). Each issue exposes `.ID`,
-`.Title`, `.Status`, `.IssueType`, `.Priority`, `.Description`, and `.Labels`.
-Issue text is escaped for literal Markdown/HTML display. Templates have no
-command, environment, filesystem, or issue-method access; missing fields and
-parse/render errors fail before writing. Template input is limited to 1 MiB
-and rendered output to 16 MiB.
+Project recipes with `export.template` require explicit file-read authorization
+on each export, including noninteractive exports. Review the template and pass
+its path yourself, or select the built-in report:
+
+```bash
+bv --recipe sprint-review --export review.md --export-template ./templates/review.tmpl
+bv --recipe sprint-review --export review.md --export-template=
+```
+
+`--export-template PATH` resolves relative paths from the working directory.
+Templates configured in your own `~/.config/bv/recipes.yaml` are authorized as
+user defaults; their relative paths resolve from that configuration file's
+directory. Absolute paths retain their meaning. Project overrides of a user
+recipe and recipes loaded with `--recipe path.yaml` require an explicit template
+flag even when they reuse a trusted recipe name. `--trust-hooks` and `--no-hooks`
+do not grant template file access. A denied template leaves the output untouched.
+
+Templates receive `.Title`, `.GeneratedAt`, `.Issues`, and `.Graph` (Mermaid text
+when graphs are enabled). Each issue exposes `.ID`, `.Title`, `.Status`,
+`.IssueType`, `.Priority`, `.Description`, and `.Labels`. Issue text is escaped
+for literal Markdown/HTML display. Template expressions have no command,
+environment, filesystem, or issue-method access; missing fields and parse/render
+errors fail before writing. Template input is limited to 1 MiB and rendered
+output to 16 MiB.
 
 ### Filter Capabilities
 
@@ -3238,7 +3254,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--export-include-graph` | bool | `true` | Include dependency context in the report (explicit false overrides recipe) | Export & Reporting |
 | `--export-md` | string | (empty) | Export issues to a Markdown file (e.g., report.md) | Export & Reporting |
 | `--export-pages` | string | (empty) | Export static site to directory (e.g., ./bv-pages) | Export & Reporting |
-| `--export-template` | string | (empty) | Markdown template path; explicit empty disables a recipe template | Export & Reporting |
+| `--export-template` | string | (empty) | Explicitly authorize a Markdown template path; explicit empty disables a recipe template | Export & Reporting |
 | `--graph-preset` | string | `compact` | Graph layout preset: compact (default) or roomy | Export & Reporting |
 | `--graph-title` | string | (empty) | Title for graph export (default: project name) | Export & Reporting |
 | `--hook-env` | stringArray | `[]` | Grant an approved hook an additional parent environment variable by exact name (repeatable; never NAME=value) | Export & Reporting |

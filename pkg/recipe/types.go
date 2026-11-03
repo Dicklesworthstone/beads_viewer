@@ -80,7 +80,20 @@ var ViewMetrics = []string{"pagerank", "betweenness", "impact", "triage", "hub",
 type ExportConfig struct {
 	Format       string `yaml:"format,omitempty" json:"format,omitempty"`               // markdown, json, csv, mermaid
 	IncludeGraph *bool  `yaml:"include_graph,omitempty" json:"include_graph,omitempty"` // nil uses the format default
-	Template     string `yaml:"template,omitempty" json:"template,omitempty"`           // Markdown template path, relative to the working directory
+	Template     string `yaml:"template,omitempty" json:"template,omitempty"`           // Markdown template path; user defaults resolve relative to their config file
+
+	// Only the loader can authorize a default from the invoking user's config.
+	// Bind that authority to the exact resolved path, so copying this value and
+	// replacing Template does not authorize a different file. YAML/JSON cannot
+	// supply this field, and project overrides never inherit it.
+	authorizedTemplate string
+}
+
+// TemplateAuthorizedByUser reports whether Template is the unchanged path
+// loaded from the invoking user's recipe configuration. Project recipes and
+// directly loaded recipe files need an explicit export-template override.
+func (e ExportConfig) TemplateAuthorizedByUser() bool {
+	return e.Template != "" && e.Template == e.authorizedTemplate
 }
 
 // Sort fields accepted by SortConfig.Field.

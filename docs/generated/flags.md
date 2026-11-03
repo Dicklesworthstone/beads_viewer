@@ -19,7 +19,7 @@
 | `--export-include-graph` | bool | `true` | Include dependency context in the report (explicit false overrides recipe) | Export & Reporting |
 | `--export-md` | string | (empty) | Export issues to a Markdown file (e.g., report.md) | Export & Reporting |
 | `--export-pages` | string | (empty) | Export static site to directory (e.g., ./bv-pages) | Export & Reporting |
-| `--export-template` | string | (empty) | Markdown template path; explicit empty disables a recipe template | Export & Reporting |
+| `--export-template` | string | (empty) | Explicitly authorize a Markdown template path; explicit empty disables a recipe template | Export & Reporting |
 | `--graph-preset` | string | `compact` | Graph layout preset: compact (default) or roomy | Export & Reporting |
 | `--graph-title` | string | (empty) | Title for graph export (default: project name) | Export & Reporting |
 | `--hook-env` | stringArray | `[]` | Grant an approved hook an additional parent environment variable by exact name (repeatable; never NAME=value) | Export & Reporting |

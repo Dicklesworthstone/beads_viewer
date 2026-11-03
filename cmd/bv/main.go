@@ -1481,7 +1481,7 @@ func main() {
 	exportReport := flag.String("export", "", "Export a report using recipe defaults or explicit export options")
 	exportFormat := flag.String("export-format", "", "Report format: markdown, json, csv or mermaid")
 	exportIncludeGraph := flag.Bool("export-include-graph", true, "Include dependency context in the report (explicit false overrides recipe)")
-	exportTemplate := flag.String("export-template", "", "Markdown template path; explicit empty disables a recipe template")
+	exportTemplate := flag.String("export-template", "", "Explicitly authorize a Markdown template path; explicit empty disables a recipe template")
 	robotHelp := flag.Bool("robot-help", false, "Show AI agent help")
 	robotCapabilities := flag.Bool("robot-capabilities", false, "Output machine-readable command capabilities for AI agents")
 	robotDocs := flag.String("robot-docs", "", "Machine-readable JSON docs for AI agents. Topics: guide, commands, examples, env, exit-codes, all")
