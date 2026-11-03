@@ -3085,6 +3085,33 @@ func TestIssuesFingerprintDetectsContentChangesOrderIndependently(t *testing.T) 
 	if issuesFingerprint(base) == issuesFingerprint(depChanged) {
 		t.Fatalf("fingerprint must change when a dependency changes without an updated_at bump")
 	}
+	// Metadata can move an identical issue set to another live tracker, or
+	// revoke writable authority, without changing serialized issue content.
+	withOrigin := []model.Issue{{ID: "A", Status: model.StatusOpen, Origin: &model.IssueOrigin{
+		LocalID: "local-A", Database: "/tracker/first.db", Tracker: "br", SupportsClaim: true,
+	}}}
+	copyOrigin := withOrigin[0].Clone()
+	if issuesFingerprint(withOrigin) != issuesFingerprint([]model.Issue{copyOrigin}) {
+		t.Fatal("equivalent origin values must not depend on pointer identity")
+	}
+	copyOrigin.Origin.Database = "/tracker/second.db"
+	if issuesFingerprint(withOrigin) == issuesFingerprint([]model.Issue{copyOrigin}) {
+		t.Fatal("fingerprint must change when identical issues acquire a different tracker route")
+	}
+	copyOrigin = withOrigin[0].Clone()
+	copyOrigin.Origin.ReadOnlyReason = "source authority is incomplete or stale"
+	if issuesFingerprint(withOrigin) == issuesFingerprint([]model.Issue{copyOrigin}) {
+		t.Fatal("fingerprint must change when a source becomes read-only")
+	}
+	copyOrigin = withOrigin[0].Clone()
+	copyOrigin.Origin.SupportsClaim = false
+	if issuesFingerprint(withOrigin) == issuesFingerprint([]model.Issue{copyOrigin}) {
+		t.Fatal("fingerprint must change when installed tracker claim support changes")
+	}
+	copyOrigin.Origin = nil
+	if issuesFingerprint(withOrigin) == issuesFingerprint([]model.Issue{copyOrigin}) {
+		t.Fatal("fingerprint must change when a live tracker route disappears")
+	}
 }
 
 // TestMain isolates HOME and XDG_CONFIG_HOME for every cmd/bv test (and the

@@ -12,10 +12,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
 	_ "modernc.org/sqlite"
 )
@@ -66,6 +69,274 @@ func TestExportPagesRecipeScope(t *testing.T) {
 			}
 			if !slices.Equal(got, tc.want) {
 				t.Fatalf("exported IDs=%v want=%v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExportPagesWorkspaceWatchUsesLoadedRoutes(t *testing.T) {
+	for _, mode := range []string{"redirect", "redirect polling", "discovery", "discovery recovery", "discovery partial recovery", "defaults", "missing source recovery", "tracker metadata"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("BEADS_DIR", "")
+			t.Setenv("BEADS_DB", "")
+			t.Setenv("BV_FORCE_POLL", "")
+			t.Setenv("BV_FORCE_POLLING", "0")
+			t.Setenv("BV_BUILD_HYBRID_WASM", "")
+			if mode == "redirect polling" {
+				t.Setenv("BV_FORCE_POLLING", "1")
+			}
+			root := t.TempDir()
+			configPath := filepath.Join(root, ".bv", "workspace.yaml")
+			if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeSource := func(path, title string) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				data := fmt.Sprintf("{\"id\":\"watch-1\",\"title\":%q,\"status\":\"open\",\"priority\":1,\"issue_type\":\"task\"}\n", title)
+				if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			config := "repos:\n  - path: api\n    prefix: api-\n"
+			source := filepath.Join(root, "api", ".beads", "issues.jsonl")
+			var redirect string
+			extraIssues := make(map[string]string)
+			switch mode {
+			case "redirect", "redirect polling":
+				// The redirect stub deliberately has a stale local copy. Watching
+				// that copy cannot observe mutations in the actual tracker.
+				writeSource(source, "Wrong local authority")
+				redirect = filepath.Join(filepath.Dir(source), "redirect")
+				if err := os.WriteFile(redirect, []byte("../../tracker/.beads\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				source = filepath.Join(root, "tracker", ".beads", "issues.jsonl")
+			case "discovery", "discovery recovery", "discovery partial recovery":
+				source = filepath.Join(root, "packages", "api", ".beads", "issues.jsonl")
+				config = "discovery:\n  enabled: true\n  patterns: [\"packages/*\"]\n"
+				if mode == "discovery partial recovery" {
+					writeSource(filepath.Join(root, "packages", "web", ".beads", "issues.jsonl"), "Other repository")
+					extraIssues["web-watch-1"] = "Other repository"
+				}
+			case "defaults":
+				source = filepath.Join(root, "api", "_beads", "issues.jsonl")
+				config = "defaults:\n  beads_path: _beads\n" + config
+			case "missing source recovery":
+				config += "  - path: missing\n    prefix: missing-\n"
+			}
+			writeSource(source, "Before reload")
+			var wantDatabase, wantUnavailable string
+			writeMetadata := func(backend, database string) {
+				t.Helper()
+				data, err := json.Marshal(map[string]string{"backend": backend, "database": database, "jsonl_export": "issues.jsonl"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(filepath.Dir(source), "metadata.json"), data, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "tracker metadata" {
+				// This native helper only advertises capabilities; a watch reload
+				// must never execute a tracker mutation while updating copy actions.
+				fixture := filepath.Join(root, "tracker.go")
+				if err := os.WriteFile(fixture, []byte(`package main
+import ("fmt"; "os")
+func main() {
+	if len(os.Args) == 3 && os.Args[1] == "update" && os.Args[2] == "--help" {
+		fmt.Println("--db --json --no-auto-import --no-auto-flush --claim")
+		return
+	}
+	os.Exit(19)
+}
+`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				executable := filepath.Join(root, "bin", "br")
+				if runtime.GOOS == "windows" {
+					executable += ".exe"
+				}
+				if out, err := exec.Command("go", "build", "-o", executable, fixture).CombinedOutput(); err != nil {
+					t.Fatalf("build capability fixture: %v\n%s", err, out)
+				}
+				t.Setenv("PATH", filepath.Dir(executable)+string(os.PathListSeparator)+os.Getenv("PATH"))
+				for _, name := range []string{"first.db", "second.db"} {
+					if err := os.WriteFile(filepath.Join(filepath.Dir(source), name), []byte("routing fixture; no database commands execute"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				wantDatabase = filepath.Join(filepath.Dir(source), "first.db")
+				writeMetadata("sqlite", "first.db")
+			}
+			if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			output := filepath.Join(root, "pages")
+			logPath := filepath.Join(root, "watch.log")
+			log, err := os.Create(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer log.Close()
+			cmd := exec.Command(buildBvBinary(t), "--workspace", filepath.Join(".bv", "workspace.yaml"),
+				"--export-pages", output, "--watch-export", "--pages-include-history=false", "--no-hooks")
+			cmd.Dir, cmd.Stdout, cmd.Stderr = root, log, log
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait(); close(done) }()
+			t.Cleanup(func() {
+				_ = cmd.Process.Signal(os.Interrupt)
+				select {
+				case <-done:
+				case <-time.After(3 * time.Second):
+					_ = cmd.Process.Kill()
+					<-done
+				}
+			})
+			waitForIssues := func(want map[string]string, state string) {
+				t.Helper()
+				for id, title := range extraIssues {
+					want[id] = title
+				}
+				deadline := time.Now().Add(15 * time.Second)
+				for time.Now().Before(deadline) {
+					logs, _ := os.ReadFile(logPath)
+					select {
+					case err := <-done:
+						t.Fatalf("watch exited before publishing %v: %v\n%s", want, err, logs)
+					default:
+					}
+					data, readErr := os.ReadFile(filepath.Join(output, "data", "meta.json"))
+					var meta struct {
+						IssueCount int `json:"issue_count"`
+						Authority  struct {
+							State     string `json:"state"`
+							ClaimSafe bool   `json:"claim_safe"`
+						} `json:"source_authority"`
+					}
+					ready := readErr == nil && json.Unmarshal(data, &meta) == nil && meta.IssueCount == len(want) &&
+						meta.Authority.State == state && meta.Authority.ClaimSafe == (state == "complete") &&
+						bytes.Contains(logs, []byte("Press Ctrl+C to stop"))
+					if ready {
+						db, err := sql.Open("sqlite", filepath.Join(output, "beads.sqlite3"))
+						if err == nil {
+							rows, queryErr := db.Query("SELECT id, title FROM issues")
+							got := make(map[string]string)
+							if queryErr == nil {
+								for rows.Next() {
+									var id, title string
+									if err := rows.Scan(&id, &title); err != nil {
+										queryErr = err
+										break
+									}
+									got[id] = title
+								}
+								if queryErr == nil {
+									queryErr = rows.Err()
+								}
+								rows.Close()
+							}
+							db.Close()
+							if queryErr == nil && len(got) == len(want) {
+								matches := true
+								for id, title := range want {
+									matches = matches && got[id] == title
+								}
+								if matches && mode == "tracker metadata" {
+									data, err := os.ReadFile(filepath.Join(output, "data", "triage.json"))
+									var triage struct {
+										Recommendations []struct {
+											ID      string             `json:"id"`
+											Actions model.IssueActions `json:"actions"`
+										} `json:"recommendations"`
+									}
+									matches = err == nil && json.Unmarshal(data, &triage) == nil && len(triage.Recommendations) == 1
+									if matches {
+										actions := triage.Recommendations[0].Actions
+										matches = triage.Recommendations[0].ID == "api-watch-1" && actions.LocalID == "watch-1"
+										if wantUnavailable != "" {
+											matches = matches && actions.Show == nil && actions.Claim == nil && strings.Contains(actions.UnavailableReason, wantUnavailable)
+										} else {
+											for _, action := range []*model.IssueCommand{actions.Show, actions.Claim} {
+												matches = matches && action != nil && slices.Contains(action.Argv, wantDatabase) && slices.Contains(action.Argv, "BEADS_DB="+wantDatabase)
+											}
+										}
+									}
+								}
+								if matches {
+									return
+								}
+							}
+						}
+					}
+					time.Sleep(25 * time.Millisecond)
+				}
+				logs, _ := os.ReadFile(logPath)
+				t.Fatalf("watch did not publish %v with authority %s\n%s", want, state, logs)
+			}
+			state := "complete"
+			if mode == "missing source recovery" {
+				state = "partial"
+			}
+			waitForIssues(map[string]string{"api-watch-1": "Before reload"}, state)
+			writeSource(source, "After reload")
+			waitForIssues(map[string]string{"api-watch-1": "After reload"}, state)
+			if mode == "discovery recovery" || mode == "discovery partial recovery" {
+				if err := os.Rename(source, source+".saved"); err != nil {
+					t.Fatal(err)
+				}
+				missingState := "unknown"
+				if len(extraIssues) > 0 {
+					missingState = "complete"
+				}
+				waitForIssues(map[string]string{}, missingState)
+				// Let any post-reconciliation settle recheck finish. Recovery
+				// must be triggered by the recreated source, not a queued reload.
+				time.Sleep(1500 * time.Millisecond)
+				writeSource(source, "Restored discovery")
+				waitForIssues(map[string]string{"api-watch-1": "Restored discovery"}, "complete")
+				writeSource(source, "Restored source remains watched")
+				waitForIssues(map[string]string{"api-watch-1": "Restored source remains watched"}, "complete")
+			}
+			if redirect != "" {
+				nextSource := filepath.Join(root, "replacement", ".beads", "issues.jsonl")
+				writeSource(nextSource, "Redirect changed")
+				if err := os.WriteFile(redirect, []byte("../../replacement/.beads\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				waitForIssues(map[string]string{"api-watch-1": "Redirect changed"}, "complete")
+				writeSource(nextSource, "New route is watched")
+				waitForIssues(map[string]string{"api-watch-1": "New route is watched"}, "complete")
+			}
+			if mode == "defaults" {
+				nextSource := filepath.Join(root, "other", "_beads", "issues.jsonl")
+				writeSource(nextSource, "Configuration changed")
+				config = strings.Replace(config, "path: api", "path: other", 1)
+				if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				waitForIssues(map[string]string{"api-watch-1": "Configuration changed"}, "complete")
+				writeSource(nextSource, "New configuration is watched")
+				waitForIssues(map[string]string{"api-watch-1": "New configuration is watched"}, "complete")
+			}
+			if mode == "missing source recovery" {
+				writeSource(filepath.Join(root, "missing", ".beads", "issues.jsonl"), "Recovered source")
+				waitForIssues(map[string]string{"api-watch-1": "After reload", "missing-watch-1": "Recovered source"}, "complete")
+			}
+			if mode == "tracker metadata" {
+				// The issue data, path and graph authority stay identical. Only
+				// live mutation routing changes, so content-only hashes miss this.
+				wantDatabase = filepath.Join(filepath.Dir(source), "second.db")
+				writeMetadata("sqlite", "second.db")
+				waitForIssues(map[string]string{"api-watch-1": "After reload"}, "complete")
+				wantUnavailable = "unsupported tracker backend"
+				writeMetadata("unknown-tracker", "second.db")
+				waitForIssues(map[string]string{"api-watch-1": "After reload"}, "complete")
 			}
 		})
 	}

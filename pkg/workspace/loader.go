@@ -31,6 +31,11 @@ type LoadResult struct {
 	SourcePath string
 	Disabled   bool
 
+	// WatchPaths binds live export monitoring to this load's configured route,
+	// including redirects and absent preferred JSONL files that can become the
+	// selected source later. It is operational state, not source authority JSON.
+	WatchPaths []string `json:"-"`
+
 	// Issues are the loaded issues with namespaced IDs
 	Issues []model.Issue
 
@@ -453,7 +458,20 @@ func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[stri
 		SourcePath: filepath.Join(repoPath, repo.GetBeadsPath())}
 
 	// Load raw issues from the repo, respecting custom beads path if provided
-	beadsDir, err := loader.ResolveBeadsDir(filepath.Join(repoPath, repo.GetBeadsPath()))
+	beadsDir, redirects, err := loader.ResolveBeadsDirWithTrace(filepath.Join(repoPath, repo.GetBeadsPath()))
+	result.WatchPaths = append(result.WatchPaths, redirects...)
+	watchDir := beadsDir
+	if watchDir == "" && len(redirects) > 0 {
+		// A missing redirect target can recover while the viewer is running.
+		// Observe its candidate files without treating them as loaded authority.
+		watchDir = filepath.Dir(redirects[len(redirects)-1])
+	}
+	if watchDir != "" {
+		for _, name := range loader.PreferredJSONLNames {
+			result.WatchPaths = append(result.WatchPaths, filepath.Join(watchDir, name))
+		}
+		result.WatchPaths = append(result.WatchPaths, filepath.Join(watchDir, "metadata.json"))
+	}
 	if err != nil {
 		result.Error = fmt.Errorf("failed to resolve tracker for %s: %w", repo.GetName(), err)
 		return result
@@ -482,6 +500,7 @@ func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[stri
 		return result
 	}
 	result.SourcePath = jsonlPath
+	result.WatchPaths = append(result.WatchPaths, jsonlPath)
 	parseOptions := loader.ParseOptions{Stats: &result.ParseStats}
 	parseOptions.WarningHandler = func(message string) {
 		result.WarningCount++

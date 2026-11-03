@@ -1448,12 +1448,17 @@ func printFlagSection(out io.Writer, allFlags *flag.FlagSet, title string, names
 // analysis cache uses for change detection — so it catches title/body/label/
 // priority/dependency edits, not just an updated_at bump. The --watch-export
 // loop uses it to skip a full re-export when a file change didn't actually
-// change any issue content (#159).
+// change any issue content (#159). Transient origin values are included because
+// tracker metadata can change exported copy actions without changing issue rows.
 func issuesFingerprint(issues []model.Issue) string {
 	keys := make([]string, len(issues))
 	for i, iss := range issues {
 		fp := analysis.ComputeIssueFingerprint(iss)
-		keys[i] = fp.ID + "\x1f" + fp.ContentHash + "\x1f" + fp.DependencyHash
+		// IssueOrigin contains only strings and a boolean, so it always has a
+		// deterministic JSON encoding. It remains excluded from issue/source
+		// serialization and cannot confer live authority when reimported.
+		origin, _ := json.Marshal(iss.Origin)
+		keys[i] = fp.ID + "\x1f" + fp.ContentHash + "\x1f" + fp.DependencyHash + "\x1f" + string(origin)
 	}
 	sort.Strings(keys)
 	h := fnv.New64a()
@@ -3258,92 +3263,103 @@ func main() {
 				fmt.Println("")
 				fmt.Println("Watch mode enabled. Monitoring for changes...")
 
-				// Collect all Beads JSONL files to watch
-				var watchFiles []string
-				var watchers []*watcher.Watcher
-
-				if *workspaceConfig != "" {
-					// Workspace mode: watch all repos' discovered Beads JSONL files (bv-79)
-					wsConfig, err := workspace.LoadConfig(*workspaceConfig)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Error loading workspace config: %v\n", err)
-						os.Exit(1)
-					}
-					workspaceRoot := filepath.Dir(filepath.Dir(*workspaceConfig))
-
-					for _, repo := range wsConfig.Repos {
-						if !repo.IsEnabled() {
-							continue
-						}
-						repoPath := repo.Path
-						if !filepath.IsAbs(repoPath) {
-							repoPath = filepath.Join(workspaceRoot, repoPath)
-						}
-						beadsDir := filepath.Join(repoPath, repo.GetBeadsPath())
-						beadsFile, err := loader.FindJSONLPath(beadsDir)
-						if err != nil {
-							fmt.Printf("  → Warning: could not find Beads JSONL for repo %s: %v\n", repo.GetName(), err)
-							continue
-						}
-						watchFiles = append(watchFiles, beadsFile)
-					}
-
-					if len(watchFiles) == 0 {
-						fmt.Fprintf(os.Stderr, "Error: no valid Beads JSONL files found in workspace\n")
-						os.Exit(1)
-					}
-				} else {
-					// Share the successful startup source with the TUI watcher.
-					watchFiles = append(watchFiles, beadsPath)
-				}
-
-				// Print watched files
-				for _, f := range watchFiles {
-					fmt.Printf("  → Watching: %s\n", f)
-				}
-				fmt.Println("  → Press Ctrl+C to stop")
-				fmt.Println("")
-				fmt.Println("To preview with auto-refresh, run in another terminal:")
-				fmt.Printf("  bv --preview-pages %s\n", *exportPages)
-
-				// Create a merged change channel for all watchers
+				// Bind watchers to the same load results used by the export. A
+				// second discovery pass loses defaults, discovered repositories and
+				// redirected worktree trackers, and can watch a stale local copy.
+				watchers := make(map[string]*watcher.Watcher)
 				mergedChangeCh := make(chan struct{}, 1)
-
-				// Create file watchers with 500ms debounce for each file
-				for _, watchFile := range watchFiles {
-					w, err := watcher.NewWatcher(watchFile,
-						watcher.WithDebounceDuration(500*time.Millisecond),
-						watcher.WithOnError(func(err error) {
-							fmt.Printf("  → Watch error: %v\n", err)
-							// Removal and permission failures change source authority
-							// even though the watcher cannot report a readable file.
-							select {
-							case mergedChangeCh <- struct{}{}:
-							default:
-							}
-						}),
-					)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Error creating watcher for %s: %v\n", watchFile, err)
-						os.Exit(1)
+				notifyChange := func() {
+					select {
+					case mergedChangeCh <- struct{}{}:
+					default:
 					}
-
-					if err := w.Start(); err != nil {
-						fmt.Fprintf(os.Stderr, "Error starting watcher for %s: %v\n", watchFile, err)
-						os.Exit(1)
-					}
-					watchers = append(watchers, w)
-
-					// Forward changes to merged channel
-					go func(ch <-chan struct{}) {
-						for range ch {
-							select {
-							case mergedChangeCh <- struct{}{}:
-							default:
-								// Already a change pending, skip
+				}
+				lastSourcePath := beadsPath
+				var watchedWorkspaceConfig []byte
+				observedWorkspacePaths := make(map[string][]string)
+				syncWatchers := func(ctx RobotContext) (bool, error) {
+					var paths []string
+					if *workspaceConfig != "" {
+						paths = append(paths, *workspaceConfig)
+						if data, err := os.ReadFile(*workspaceConfig); err == nil && !bytes.Equal(data, watchedWorkspaceConfig) {
+							// Explicit configuration changes define a new discovery
+							// scope; paths from the old scope can be released.
+							observedWorkspacePaths = make(map[string][]string)
+							watchedWorkspaceConfig = data
+						}
+						if ctx.SourceAuthority != nil {
+							for _, source := range ctx.SourceAuthority.Sources {
+								if source.Status == "disabled" {
+									delete(observedWorkspacePaths, source.RepoPath)
+									continue
+								}
+								sourcePaths := append([]string(nil), source.WatchPaths...)
+								if source.Status == "loaded" {
+									sourcePaths = append(sourcePaths, source.SourcePath)
+								}
+								observedWorkspacePaths[source.RepoPath] = sourcePaths
 							}
 						}
-					}(w.Changed())
+						// Discovery can omit a repository while its issue file or
+						// redirect is unavailable. Retain its recovery listeners,
+						// never its old rows or authority, until configuration changes.
+						for _, sourcePaths := range observedWorkspacePaths {
+							paths = append(paths, sourcePaths...)
+						}
+					} else {
+						if ctx.SourcePath != "" {
+							lastSourcePath = ctx.SourcePath
+						}
+						paths = append(paths, lastSourcePath)
+					}
+					wanted := make(map[string]bool, len(paths))
+					for _, path := range paths {
+						if path == "" {
+							continue
+						}
+						absolute, err := filepath.Abs(path)
+						if err != nil {
+							return false, err
+						}
+						wanted[absolute] = true
+					}
+					var ordered []string
+					for path := range wanted {
+						ordered = append(ordered, path)
+					}
+					sort.Strings(ordered)
+					changed := false
+					for _, path := range ordered {
+						if watchers[path] != nil {
+							continue
+						}
+						w, err := watcher.NewWatcher(path,
+							watcher.WithDebounceDuration(500*time.Millisecond),
+							watcher.WithOnChange(notifyChange),
+							watcher.WithOnError(func(err error) {
+								fmt.Printf("  → Watch error: %v\n", err)
+								// Unreadable or removed sources change authority too.
+								notifyChange()
+							}),
+						)
+						if err != nil {
+							return changed, fmt.Errorf("create watcher for %s: %w", path, err)
+						}
+						if err := w.Start(); err != nil {
+							return changed, fmt.Errorf("start watcher for %s: %w", path, err)
+						}
+						watchers[path] = w
+						changed = true
+						fmt.Printf("  → Watching: %s\n", path)
+					}
+					for path, w := range watchers {
+						if !wanted[path] {
+							w.Stop()
+							delete(watchers, path)
+							changed = true
+						}
+					}
+					return changed, nil
 				}
 
 				// Cleanup all watchers on exit
@@ -3352,6 +3368,14 @@ func main() {
 						w.Stop()
 					}
 				}()
+				if _, err := syncWatchers(robotDispatchContext); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Println("  → Press Ctrl+C to stop")
+				fmt.Println("")
+				fmt.Println("To preview with auto-refresh, run in another terminal:")
+				fmt.Printf("  bv --preview-pages %s\n", *exportPages)
 
 				// Set up signal handling for graceful shutdown
 				sigCh := make(chan os.Signal, 1)
@@ -3438,6 +3462,15 @@ func main() {
 						freshContext, err := reload()
 						if err != nil {
 							fmt.Printf("  → Error reloading issues: %v\n", err)
+						}
+						watchSetChanged, watchErr := syncWatchers(freshContext)
+						if watchErr != nil {
+							fmt.Printf("  → Watch setup error: %v\n", watchErr)
+						}
+						if watchSetChanged {
+							// Recheck after attaching a new route so a write between
+							// loading its data and starting its watcher is not lost.
+							armSettle()
 						}
 						freshContext, err = scopeLoadedIssues(freshContext, activeRecipe)
 						if err != nil {
@@ -7059,6 +7092,7 @@ type RobotSourceReport struct {
 	WarningCount int      `json:"warning_count"`
 	Warnings     []string `json:"warnings,omitempty"`
 	Error        string   `json:"error,omitempty"`
+	WatchPaths   []string `json:"-"`
 }
 
 // RobotSourceAuthority keeps exploratory output useful while distinguishing
@@ -7186,7 +7220,8 @@ func robotWorkspaceAuthority(results []workspace.LoadResult) *RobotSourceAuthori
 	sources := make([]RobotSourceReport, 0, len(results))
 	for _, result := range results {
 		source := RobotSourceReport{Name: result.RepoName, RepoPath: result.RepoPath, SourcePath: result.SourcePath, SourceKind: "jsonl", Status: "loaded",
-			DataHash: sourceIssuesHash(result.Issues, result.TombstoneIDs), Valid: result.ParseStats.Valid, Errors: result.ParseStats.Errors,
+			WatchPaths: append([]string(nil), result.WatchPaths...),
+			DataHash:   sourceIssuesHash(result.Issues, result.TombstoneIDs), Valid: result.ParseStats.Valid, Errors: result.ParseStats.Errors,
 			Skipped: result.ParseStats.Skipped, Visible: len(result.Issues), Tombstones: len(result.TombstoneIDs),
 			Stale: len(result.AuthorityWarnings) > 0, WarningCount: result.WarningCount,
 			Warnings: append(append([]string(nil), result.AuthorityWarnings...), result.ParseWarnings...)}

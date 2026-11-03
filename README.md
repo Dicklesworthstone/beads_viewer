@@ -2953,6 +2953,13 @@ full loaded source. Watch mode reapplies these selections after each source
 reload, including newly matching issues and empty selections. The dashboard
 then uses its own display sort for those exported rows.
 
+Workspace watch exports follow the sources selected by the workspace loader,
+including discovered repositories, custom Beads directories, and worktree
+redirects. Changes to the workspace configuration, redirects, tracker metadata,
+or selected JSONL files trigger a fresh load and update the watched paths.
+Missing configured sources remain watched so they can recover. Tracker route
+changes also refresh exported action commands when issue contents are unchanged.
+
 WASM-backed issue rankings count exported issues toward their display limits.
 Missing or filtered dependency endpoints still contribute to graph metrics,
 but do not take the place of issue cards in the ranking panels.
