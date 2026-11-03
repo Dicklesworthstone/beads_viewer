@@ -3,6 +3,7 @@ package correlation
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 
@@ -181,6 +182,105 @@ func TestPersistentCorrelationCachesIsolateNamespaces(t *testing.T) {
 		if !ok || len(got.Events) != 1 || got.Events[0].BeadID != want {
 			t.Fatalf("artifact cache namespace %q = (%+v, %v), want bead %q", namespace, got, ok, want)
 		}
+	}
+}
+
+func TestPersistentCorrelationCachesIsolateMatcherPolicies(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	repo, jsonl, _ := rootCorrelationRepo(t, "custom-alpha", "feat(custom-alpha): add feature")
+	opts := CorrelatorOptions{Limit: 10}
+	matcher := func(custom bool) *Correlator {
+		c := NewCorrelator(repo, jsonl)
+		if custom {
+			c.explicit.AddPattern(regexp.MustCompile(`\b(custom-[a-z]+)\b`))
+		}
+		return c
+	}
+	for _, layer := range []string{"report", "artifact after bead edit"} {
+		t.Run(layer, func(t *testing.T) {
+			for _, firstCustom := range []bool{false, true} {
+				name := "add pattern"
+				if firstCustom {
+					name = "remove pattern"
+				}
+				t.Run(name, func(t *testing.T) {
+					t.Setenv("BV_CACHE_DIR", t.TempDir())
+					beads := []BeadInfo{{ID: "custom-alpha", Title: "One", Status: "open"}}
+					first := matcher(firstCustom)
+					report, err := first.GenerateReportCached(beads, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					wantFirst := 0
+					if firstCustom {
+						wantFirst = 1
+					}
+					if got := len(report.Histories["custom-alpha"].Commits); got != wantFirst {
+						t.Fatalf("initial policy produced %d commits, want %d", got, wantFirst)
+					}
+					head, err := getGitHead(repo)
+					if err != nil {
+						t.Fatal(err)
+					}
+					namespace, options := first.persistentCacheNamespace(), first.cacheOptionsHash(opts)
+					if _, ok := getCorrelationDiskCachedReport(namespace, head, hashBeads(beads), options); !ok {
+						t.Fatal("fixture did not populate the report cache")
+					}
+					if _, ok := getHeadArtifactCached(namespace, head, options); !ok {
+						t.Fatal("fixture did not populate the HEAD-artifact cache")
+					}
+					if layer == "artifact after bead edit" {
+						// This independently misses the outer report cache while
+						// leaving HEAD and the old artifact available for reuse.
+						beads[0].Title = "Retitled without changing committed history"
+					}
+					second := matcher(!firstCustom)
+					got, err := second.GenerateReportCached(beads, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := 1 - wantFirst
+					if count := len(got.Histories["custom-alpha"].Commits); count != want {
+						t.Fatalf("changed matcher reused %s: got %d commits, want %d", layer, count, want)
+					}
+					if got.Histories["custom-alpha"].Title != beads[0].Title {
+						t.Fatal("cache returned an outdated bead snapshot")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestPersistentCorrelationCachesIgnoreLegacyMatcherKeys(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	repo, jsonl, head := rootCorrelationRepo(t, "hist-1", "feat(hist-1): add feature")
+	beads := []BeadInfo{{ID: "hist-1", Title: "One", Status: "open"}}
+	opts := CorrelatorOptions{Limit: 10}
+	c := NewCorrelator(repo, jsonl)
+	namespace := c.persistentCacheNamespace()
+	for _, layer := range []string{"report", "artifact"} {
+		t.Run(layer, func(t *testing.T) {
+			t.Setenv("BV_CACHE_DIR", t.TempDir())
+			// Pre-fix keys omitted the matching policy and could contain the
+			// old zero-link result for this unchanged repository and bead.
+			if layer == "report" {
+				putCorrelationDiskCachedReport(namespace, head, hashBeads(beads), hashOptions(opts), &HistoryReport{
+					DataHash: hashBeads(beads), Histories: map[string]BeadHistory{"hist-1": {BeadID: "hist-1"}},
+				})
+			} else {
+				putHeadArtifactCached(namespace, head, hashOptions(opts), &historyArtifact{WalkedCommits: 1})
+			}
+			report, err := c.GenerateReportCached(beads, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if commits := report.Histories["hist-1"].Commits; len(commits) != 1 || commits[0].SHA != head {
+				t.Fatalf("legacy %s cache concealed the fixed correlation: %+v", layer, commits)
+			}
+		})
 	}
 }
 

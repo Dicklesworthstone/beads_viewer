@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -730,9 +731,9 @@ func TestCachedCorrelator_XFetchUsesClonedInputs(t *testing.T) {
 	if _, err := correlator.GenerateReport(beads, opts); err != nil {
 		t.Fatalf("initial GenerateReport failed: %v", err)
 	}
-	key, err := BuildCacheKey(repoPath, beads, opts)
+	key, err := correlator.buildKey(beads, opts)
 	if err != nil {
-		t.Fatalf("BuildCacheKey failed: %v", err)
+		t.Fatalf("buildKey failed: %v", err)
 	}
 	report, ok := correlator.cache.Get(key)
 	if !ok {
@@ -912,9 +913,9 @@ func TestCachedCorrelator_XFetchRefreshLogsErrors(t *testing.T) {
 	if _, err := correlator.GenerateReport(beads, opts); err != nil {
 		t.Fatalf("initial GenerateReport failed: %v", err)
 	}
-	key, err := BuildCacheKey(repoPath, beads, opts)
+	key, err := correlator.buildKey(beads, opts)
 	if err != nil {
-		t.Fatalf("BuildCacheKey failed: %v", err)
+		t.Fatalf("buildKey failed: %v", err)
 	}
 	report, ok := correlator.cache.Get(key)
 	if !ok {
@@ -1088,6 +1089,39 @@ func TestCachedCorrelator_FeedbackFingerprintChangesCacheKey(t *testing.T) {
 	}
 	if after.HeadSHA != before.HeadSHA || after.BeadsHash != before.BeadsHash || after.Options != before.Options {
 		t.Fatalf("feedback must not disturb the other key components: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestInMemoryCorrelatorsRespectMatcherPolicyChanges(t *testing.T) {
+	repo, jsonl, _ := rootCorrelationRepo(t, "custom-alpha", "feat(custom-alpha): add feature")
+	beads := []BeadInfo{{ID: "custom-alpha", Title: "One", Status: "open"}}
+	opts := CorrelatorOptions{Limit: 10}
+	for _, kind := range []string{"cached", "incremental"} {
+		t.Run(kind, func(t *testing.T) {
+			var generate func([]BeadInfo, CorrelatorOptions) (*HistoryReport, error)
+			var c *Correlator
+			if kind == "cached" {
+				wrapper := NewCachedCorrelator(repo, jsonl)
+				wrapper.shouldRefreshFn = neverRefreshForTest
+				generate, c = wrapper.GenerateReport, wrapper.correlator
+			} else {
+				wrapper := NewIncrementalCorrelator(repo, jsonl)
+				generate, c = wrapper.GenerateReport, wrapper.correlator
+			}
+			for _, want := range []int{0, 1, 0} {
+				c.explicit = NewExplicitMatcher(repo)
+				if want == 1 {
+					c.explicit.AddPattern(regexp.MustCompile(`\b(custom-[a-z]+)\b`))
+				}
+				report, err := generate(beads, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := len(report.Histories["custom-alpha"].Commits); got != want {
+					t.Fatalf("%s cache reused another matcher's report: got %d commits, want %d", kind, got, want)
+				}
+			}
+		})
 	}
 }
 

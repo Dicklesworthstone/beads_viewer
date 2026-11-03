@@ -95,6 +95,7 @@ func (ic *IncrementalCorrelator) GenerateReportWithDetails(beads []BeadInfo, opt
 			RefreshReason:  "failed to build cache key",
 		}, nil
 	}
+	key.Options = ic.correlator.cacheOptionsHash(opts)
 
 	// Check cache
 	if cached, ok := ic.cache.Get(key); ok {
@@ -171,7 +172,7 @@ func (ic *IncrementalCorrelator) statsSnapshot() (hits, misses, increments, refr
 func (ic *IncrementalCorrelator) findExistingReport(beads []BeadInfo, opts CorrelatorOptions) *HistoryReport {
 	// Look for any cached report with the same beads hash (different HEAD is OK)
 	beadsHash := hashBeads(beads)
-	optsHash := hashOptions(opts)
+	optsHash := ic.correlator.cacheOptionsHash(opts)
 
 	ic.cache.mu.RLock()
 	defer ic.cache.mu.RUnlock()

@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -73,20 +74,23 @@ func builtinPatterns() []*regexp.Regexp {
 		regexp.MustCompile(`\[([A-Za-z]+-\d+)\]`),
 
 		// Closes/Fixes/Refs keywords with optional # prefix
-		// Note: Allow optional colon and whitespace after keyword
-		regexp.MustCompile(`(?i)closes?:?\s*#?([A-Za-z]+-\d+)`),
-		regexp.MustCompile(`(?i)fix(?:es|ed)?:?\s*#?([A-Za-z]+-\d+)`),
-		regexp.MustCompile(`(?i)refs?:?\s*#?([A-Za-z]+-\d+)`),
-		regexp.MustCompile(`(?i)resolves?:?\s*#?([A-Za-z]+-\d+)`),
+		// Allow optional colon and whitespace, but do not treat a substring
+		// such as "fix" in "suffix" as an action or truncate a hash-style ID.
+		regexp.MustCompile(`(?i)\bcloses?\b:?\s*#?([A-Za-z]+-\d+)\b`),
+		regexp.MustCompile(`(?i)\bfix(?:es|ed)?\b:?\s*#?([A-Za-z]+-\d+)\b`),
+		regexp.MustCompile(`(?i)\brefs?\b:?\s*#?([A-Za-z]+-\d+)\b`),
+		regexp.MustCompile(`(?i)\bresolves?\b:?\s*#?([A-Za-z]+-\d+)\b`),
 
 		// beads-123 or bead-123 format (common for this project). The trailing
 		// boundary keeps hash-style ids such as bv-8a4r from yielding a phantom
 		// numeric id ("bv-8") that would link the commit to the wrong bead.
-		regexp.MustCompile(`(?i)beads?[-_](\d+)\b`),
-		regexp.MustCompile(`(?i)bv[-_](\d+)\b`),
+		regexp.MustCompile(`(?i)\bbeads?[-_](\d+)\b`),
+		regexp.MustCompile(`(?i)\bbv[-_](\d+)\b`),
 
-		// Generic ID at word boundary (PROJECT-123 style)
-		regexp.MustCompile(`\b([A-Z]{2,10}-\d+)\b`),
+		// Generic numeric IDs, including lowercase conventional-commit scopes
+		// such as feat(hist-1). Keep both word boundaries so a numeric prefix
+		// inside a hash-style id or another identifier is never extracted.
+		regexp.MustCompile(`\b([A-Za-z]{2,10}-\d+)\b`),
 	}
 }
 
@@ -109,6 +113,21 @@ func NewExplicitMatcherWithPatterns(repoPath string, patterns []*regexp.Regexp) 
 // AddPattern adds a custom pattern to the matcher.
 func (m *ExplicitMatcher) AddPattern(pattern *regexp.Regexp) {
 	m.patterns = append(m.patterns, pattern)
+}
+
+// policyFingerprint identifies the matcher that actually extracts references.
+// Pattern order matters: the first match for an ID determines its match type
+// and confidence. Length prefixes preserve boundaries even when a custom
+// expression contains separators. Version the domain if normalization or
+// scoring semantics change without changing the expressions themselves.
+func (m *ExplicitMatcher) policyFingerprint() string {
+	h := sha256.New()
+	h.Write([]byte("bv-explicit-matcher-v1\x00"))
+	for _, pattern := range m.patterns {
+		expression := pattern.String()
+		fmt.Fprintf(h, "%d:%s", len(expression), expression)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 // ExplicitMatch represents a bead ID found in a commit message.
@@ -173,8 +192,23 @@ func normalizeBeadID(id string) string {
 	if _, err := fmt.Sscanf(id, "%d", new(int)); err == nil {
 		return "bv-" + id
 	}
-	// Convert to lowercase for consistency
-	return strings.ToLower(id)
+	// The generic matcher also recognizes the established numeric bead/beads
+	// aliases. Normalize them before deduplication so one reference cannot
+	// create both bv-123 and beads-123 or lower its own confidence.
+	id = strings.ToLower(id)
+	for _, prefix := range []string{"bead-", "beads-"} {
+		suffix, ok := strings.CutPrefix(id, prefix)
+		if !ok || suffix == "" {
+			continue
+		}
+		for _, digit := range suffix {
+			if digit < '0' || digit > '9' {
+				return id
+			}
+		}
+		return "bv-" + suffix
+	}
+	return id
 }
 
 // classifyMatch determines the type of match based on the raw match string.

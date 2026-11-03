@@ -367,6 +367,15 @@ func hashOptions(opts CorrelatorOptions) string {
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
+// cacheOptionsHash adds the actual matcher policy to extraction options. Both
+// persistent cache layers and in-memory wrappers need this identity: changing
+// --id-pattern changes the committed references without changing HEAD or beads.
+// Using the matcher's snapshot also keeps later global pattern registration
+// from changing the identity of an already-constructed correlator.
+func (c *Correlator) cacheOptionsHash(opts CorrelatorOptions) string {
+	return hashOptions(opts) + ":matcher:" + c.explicit.policyFingerprint()
+}
+
 // CachedCorrelator wraps a Correlator with caching support
 type CachedCorrelator struct {
 	correlator       *Correlator
@@ -411,14 +420,14 @@ func (c *CachedCorrelator) WithFeedbackStore(store *FeedbackStore) *CachedCorrel
 	return c
 }
 
-// buildKey is BuildCacheKey plus the feedback fingerprint of the wrapped
-// correlator (reports are assembled against the store, so the store's state
-// is a report input).
+// buildKey extends BuildCacheKey with the wrapped correlator's matcher policy
+// and feedback fingerprint. Both are inputs to the assembled report.
 func (c *CachedCorrelator) buildKey(beads []BeadInfo, opts CorrelatorOptions) (CacheKey, error) {
 	key, err := BuildCacheKey(c.cache.repoPath, beads, opts)
 	if err != nil {
 		return CacheKey{}, err
 	}
+	key.Options = c.correlator.cacheOptionsHash(opts)
 	key.Feedback = c.correlator.feedbackFingerprint()
 	return key, nil
 }

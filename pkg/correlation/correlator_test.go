@@ -501,6 +501,84 @@ func TestAssembleReport_AppliesFeedback(t *testing.T) {
 	}
 }
 
+// rootCorrelationRepo reproduces bv-pzpv: the only commit creates the bead
+// alongside a code file. There is no claimed/closed event to supply a co-commit
+// correlation, so the message matcher must recognize the explicit reference.
+func rootCorrelationRepo(t *testing.T, beadID, message string) (repo, jsonl, sha string) {
+	t.Helper()
+	repo = t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "init", "-b", "main")
+	runGit(t, repo, "config", "user.email", "alice@example.com")
+	runGit(t, repo, "config", "user.name", "Alice")
+	runGit(t, repo, "config", "commit.gpgsign", "false")
+	jsonl = filepath.Join(beadsDir, "issues.jsonl")
+	data, err := json.Marshal(map[string]any{
+		"id": beadID, "title": "One", "status": "open", "priority": 1, "issue_type": "task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsonl, append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "feature.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl", "feature.go")
+	runGit(t, repo, "commit", "-m", message)
+	sha, err = getGitHead(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return repo, jsonl, sha
+}
+
+func TestCorrelator_CreatingCommitExplicitNumericID(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		message string
+		want    int
+	}{
+		{"lowercase scope", "feat(hist-1): add export history", 1},
+		{"mixed case scope", "feat(Hist-1): add export history", 1},
+		{"body reference", "feat: add export history\n\nImplements the work tracked in hist-1.", 1},
+		{"no reference", "feat: add export history", 0},
+		{"different identifier", "feat(hist-1abc): add unrelated work", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, jsonl, sha := rootCorrelationRepo(t, "hist-1", tc.message)
+			report, err := NewCorrelator(repo, jsonl).GenerateReport(
+				[]BeadInfo{{ID: "hist-1", Title: "One", Status: "open"}}, CorrelatorOptions{Limit: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			history := report.Histories["hist-1"]
+			if len(history.Events) != 1 || history.Events[0].EventType != EventCreated || history.Events[0].CommitSHA != sha {
+				t.Fatalf("fixture did not retain its creating commit: %+v", history.Events)
+			}
+			if len(history.Commits) != tc.want || report.Stats.TotalCommits != tc.want || report.Stats.BeadsWithCommits != tc.want {
+				t.Fatalf("creating-commit correlations=%d stats=%+v, want %d", len(history.Commits), report.Stats, tc.want)
+			}
+			if tc.want == 1 {
+				commit := history.Commits[0]
+				if commit.SHA != sha || commit.Method != MethodExplicitID || len(commit.Files) != 1 || commit.Files[0].Path != "feature.go" {
+					t.Fatalf("creating commit lost its explicit evidence or code files: %+v", commit)
+				}
+				if ids := report.CommitIndex[sha]; len(ids) != 1 || ids[0] != "hist-1" {
+					t.Fatalf("reverse index lost creating-commit link: %v", ids)
+				}
+			}
+			if report.Stats.MethodDistribution[MethodCoCommitted.String()] != 0 {
+				t.Fatal("creation alone synthesized a co-commit correlation")
+			}
+		})
+	}
+}
+
 // multiStrategyRepo builds a git fixture where one code commit is found by
 // two strategies at once (it changes the beads file AND names the bead in
 // its subject), another is explicit-only, and a third is temporal-only

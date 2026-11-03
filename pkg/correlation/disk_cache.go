@@ -48,7 +48,8 @@ func SetDiskCacheEnabled(on bool) { diskCacheForced.Store(on) }
 //   - hashBeads(beads): the ID/Title/Status of the beads embedded in the report
 //     (changes when beads are added/closed/retitled, including uncommitted
 //     working-tree edits, since the bead slice is loaded from the working tree).
-//   - hashOptions(opts): Limit / BeadID / Since / Until.
+//   - cacheOptionsHash(opts): extract options plus the actual explicit-ID
+//     matcher policy, including built-in and custom pattern order.
 //   - schema version: bumps invalidate every stale entry on format changes.
 //
 // Working-tree note: the git-extracted portion of the report only reflects
@@ -398,7 +399,7 @@ func (c *Correlator) GenerateReportCached(beads []BeadInfo, opts CorrelatorOptio
 		return c.GenerateReport(beads, opts)
 	}
 	beadsHash := hashBeads(beads)
-	optsHash := hashOptions(opts)
+	optsHash := c.cacheOptionsHash(opts)
 	namespace := c.persistentCacheNamespace()
 	// The assembled REPORT depends on the feedback store (rejections remove
 	// commits, confirmations pin confidence), the HEAD-only ARTIFACT does not.

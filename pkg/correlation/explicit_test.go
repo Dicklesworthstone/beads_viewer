@@ -57,6 +57,50 @@ func TestExtractIDsFromMessage(t *testing.T) {
 			wantType: "generic",
 		},
 		{
+			name:     "lowercase conventional commit scope",
+			message:  "feat(hist-1): add history to export",
+			wantIDs:  []string{"hist-1"},
+			wantType: "generic",
+		},
+		{
+			name:     "mixed case generic reference",
+			message:  "Follow up on Hist-12 in this commit",
+			wantIDs:  []string{"hist-12"},
+			wantType: "generic",
+		},
+		{
+			name:     "uppercase numeric alias is one reference",
+			message:  "Update BEADS-456 with new status",
+			wantIDs:  []string{"bv-456"},
+			wantType: "bead",
+		},
+		{
+			name:     "bracketed alias preserves canonical identity",
+			message:  "Update [bead-456] with new status",
+			wantIDs:  []string{"bv-456"},
+			wantType: "bracket",
+		},
+		{
+			name:    "generic ID embedded in identifiers",
+			message: "prefix_hist-1 2hist-2 hist-3suffix hist-4_more",
+		},
+		{
+			name:    "hash-style suffix is not a numeric ID",
+			message: "feat(hist-1abc): mention bv-8a4r and PROJ-9abc",
+		},
+		{
+			name:    "action keywords do not truncate identifiers",
+			message: "Fixes hist-1abc and refs BV-8a4r, closes hist-2_more",
+		},
+		{
+			name:    "numeric aliases embedded in identifiers",
+			message: "prefix_bv-12 prefix_beads-34",
+		},
+		{
+			name:    "generic prefix length is still bounded",
+			message: "abcdefghijk-123",
+		},
+		{
 			name:    "no IDs",
 			message: "Just a regular commit message",
 			wantIDs: nil,
@@ -115,6 +159,10 @@ func TestNormalizeBeadID(t *testing.T) {
 		{"123", "bv-123"}, // Numeric only gets bv- prefix
 		{"456", "bv-456"},
 		{"proj-999", "proj-999"},
+		{"bead-123", "bv-123"},
+		{"BEADS-456", "bv-456"},
+		{"beads-001", "bv-001"},
+		{"beads-8a4r", "beads-8a4r"},
 	}
 
 	for _, tt := range tests {
@@ -343,5 +391,33 @@ func TestCustomIDPatterns_DefaultsUnaffectedWhenEmpty(t *testing.T) {
 	t.Cleanup(func() { SetCustomIDPatterns(nil) })
 	if got := len(DefaultPatterns()); got != base+1 {
 		t.Errorf("DefaultPatterns() = %d patterns with one custom set, want %d", got, base+1)
+	}
+}
+
+func TestExplicitMatcherPolicyFingerprintUsesActualOrderedPatterns(t *testing.T) {
+	previous := CustomIDPatterns()
+	SetCustomIDPatterns(nil)
+	t.Cleanup(func() { SetCustomIDPatterns(previous) })
+
+	original := NewExplicitMatcher("")
+	fingerprint := original.policyFingerprint()
+	custom := regexp.MustCompile(`\b(custom-[a-z]+)\b`)
+	SetCustomIDPatterns([]*regexp.Regexp{custom})
+	if got := original.policyFingerprint(); got != fingerprint {
+		t.Fatal("global registration changed an existing matcher's policy identity")
+	}
+	withCustom := NewExplicitMatcher("")
+	if withCustom.policyFingerprint() == fingerprint {
+		t.Fatal("custom pattern did not change matcher identity")
+	}
+	if NewExplicitMatcher("").policyFingerprint() != withCustom.policyFingerprint() {
+		t.Fatal("equivalent matcher policies produced different identities")
+	}
+	left := regexp.MustCompile(`\b(custom-[a-z]+)\b`)
+	right := regexp.MustCompile(`\[([a-z]+-[a-z]+)\]`)
+	forward := NewExplicitMatcherWithPatterns("", []*regexp.Regexp{left, right})
+	reverse := NewExplicitMatcherWithPatterns("", []*regexp.Regexp{right, left})
+	if forward.policyFingerprint() == reverse.policyFingerprint() {
+		t.Fatal("pattern order was omitted from matcher identity")
 	}
 }
