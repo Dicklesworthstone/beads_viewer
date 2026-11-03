@@ -1,24 +1,820 @@
 package ui
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/watcher"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+type editorTrackerInvocation struct {
+	Args []string
+	Dir  string
+	Env  []string
+}
+
+// A native copy of the test executable is the only tracker used by editor
+// regressions. It records actual process routing on both Unix and Windows.
+func runEditorTrackerTestProcess() bool {
+	name := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
+	statePath, capture := os.Getenv("BV_TEST_TRACKER_STATE"), os.Getenv("BV_TEST_TRACKER_CAPTURE")
+	if (name != "br" && name != "bd") || statePath == "" || capture == "" {
+		return false
+	}
+	fail := func(err error) {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
+	}
+	for _, arg := range os.Args[1:] {
+		if arg == "--help" {
+			fmt.Println("--db --json --no-auto-import --no-auto-flush --claim")
+			return true
+		}
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		fail(err)
+	}
+	call := editorTrackerInvocation{Args: os.Args[1:], Dir: dir}
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		switch strings.ToUpper(key) {
+		case "BEADS_DIR", "BEADS_DB", "BD_DB", "BEADS_JSONL":
+			call.Env = append(call.Env, entry)
+		}
+	}
+	data, _ := json.Marshal(call)
+	f, err := os.OpenFile(capture, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		fail(err)
+	}
+	_, err = f.Write(append(data, '\n'))
+	if err != nil {
+		fail(err)
+	}
+	_ = f.Close()
+	data, err = os.ReadFile(statePath)
+	if err != nil {
+		fail(err)
+	}
+	var issue model.Issue
+	if err := json.Unmarshal(data, &issue); err != nil {
+		fail(err)
+	}
+	args := os.Args[1:]
+	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+		if args[0] == "--db" && len(args) > 1 {
+			args = args[2:]
+		} else {
+			args = args[1:]
+		}
+	}
+	if len(args) == 0 {
+		fail(fmt.Errorf("missing tracker operation"))
+	}
+	mode := os.Getenv("BV_TEST_TRACKER_MODE")
+	switch args[0] {
+	case "show":
+		switch mode {
+		case "show-hang":
+			time.Sleep(10 * time.Second)
+		case "show-noisy":
+			fmt.Print(strings.Repeat("x", editorShowLimit+1))
+			return true
+		case "show-invalid":
+			fmt.Print("not-json")
+			return true
+		case "show-wrong-id":
+			issue.ID = "another-issue"
+		}
+		data, _ := json.Marshal([]model.Issue{issue})
+		fmt.Println(string(data))
+	case "update":
+		if mode == "update-fail" {
+			fmt.Fprint(os.Stderr, "\x1b[31mcontrolled failure\x1b[0m")
+			os.Exit(4)
+		}
+		for _, arg := range args[1:] {
+			if arg == "--" {
+				break
+			}
+			key, value, ok := strings.Cut(strings.TrimPrefix(arg, "--"), "=")
+			if !ok {
+				continue
+			}
+			switch key {
+			case "title":
+				issue.Title = value
+			case "description":
+				issue.Description = value
+			case "status":
+				issue.Status = model.Status(value)
+			case "priority":
+				issue.Priority, err = strconv.Atoi(value)
+				if err != nil {
+					fail(err)
+				}
+			case "type":
+				issue.IssueType = model.IssueType(value)
+			case "assignee":
+				issue.Assignee = value
+			}
+		}
+		issue.UpdatedAt = issue.UpdatedAt.Add(time.Second)
+		data, _ = json.Marshal(issue)
+		if err := os.WriteFile(statePath, data, 0o600); err != nil {
+			fail(err)
+		}
+		if name == "br" && mode != "no-auto-flush" && mode != "export-fail" {
+			if err := os.WriteFile(filepath.Join(os.Getenv("BEADS_DIR"), "issues.jsonl"), append(data, '\n'), 0o600); err != nil {
+				fail(err)
+			}
+		}
+		fmt.Println(string(data))
+	case "sync":
+		if mode == "export-fail" {
+			fail(fmt.Errorf("controlled export failure"))
+		}
+		if len(args) != 3 || args[1] != "--flush-only" || args[2] != "--json" {
+			fail(fmt.Errorf("unexpected sync argv: %q", args))
+		}
+		if err := os.WriteFile(filepath.Join(os.Getenv("BEADS_DIR"), "issues.jsonl"), append(data, '\n'), 0o600); err != nil {
+			fail(err)
+		}
+	case "export":
+		if mode == "export-fail" {
+			fail(fmt.Errorf("controlled export failure"))
+		}
+		if len(args) != 3 || args[1] != "-o" {
+			fail(fmt.Errorf("unexpected export argv: %q", args))
+		}
+		if err := os.WriteFile(args[2], append(data, '\n'), 0o600); err != nil {
+			fail(err)
+		}
+	default:
+		fail(fmt.Errorf("unexpected tracker operation: %s", args[0]))
+	}
+	return true
+}
+
+func installEditorTracker(t *testing.T, tracker string) (model.Issue, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	beadsDir := filepath.Join(root, ".beads")
+	if err := os.Mkdir(beadsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binDir := t.TempDir()
+	name := tracker
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := os.Open(self)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(filepath.Join(binDir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, copyErr := io.Copy(dst, src)
+	if err := dst.Close(); err != nil || copyErr != nil {
+		t.Fatalf("install fake tracker: %v, %v", err, copyErr)
+	}
+	state, capture := filepath.Join(root, "tracker-state.json"), filepath.Join(root, "calls.jsonl")
+	t.Setenv("PATH", binDir)
+	t.Setenv("BV_TEST_TRACKER_STATE", state)
+	t.Setenv("BV_TEST_TRACKER_CAPTURE", capture)
+	t.Setenv("BV_TEST_TRACKER_MODE", "")
+	t.Setenv("BV_BACKGROUND_MODE", "0")
+	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	issue := model.Issue{ID: "local-1", Title: "Original title", Description: "Original body", Status: model.StatusOpen,
+		Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Labels: []string{"keep-this-label"}}
+	data, _ := json.Marshal(issue)
+	path := filepath.Join(beadsDir, "issues.jsonl")
+	for target, contents := range map[string][]byte{state: data, path: append(data, '\n'), filepath.Join(beadsDir, "beads.db"): []byte("fixture")} {
+		if err := os.WriteFile(target, contents, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metadata := `{"database":"beads.db","jsonl_export":"issues.jsonl","backend":"sqlite"}`
+	if tracker == "bd" {
+		metadata = `{"backend":"dolt"}`
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	issues := []model.Issue{issue}
+	loader.AttachIssueOrigins(issues, path, true)
+	if err := editorOriginError(issues[0].Origin); err != nil {
+		t.Fatalf("bind controlled tracker: %v", err)
+	}
+	return issues[0], path, capture
+}
+
+func editorTestExit(t *testing.T, m *Model, issue model.Issue, edited string) editorExitMsg {
+	t.Helper()
+	session := &editorSession{issue: issue.Clone(), sourcePath: m.beadsPath, sourceVersion: m.sourceVersion, reload: m.sourceReload}
+	m.editorSession = session
+	path := filepath.Join(t.TempDir(), "draft.md")
+	if err := os.WriteFile(path, []byte(edited), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return editorExitMsg{issueID: issue.ID, original: exportIssueFrontmatter(issue), tmpFile: path, session: session}
+}
+
+func readEditorTrackerCalls(t *testing.T, path string) []editorTrackerInvocation {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result []editorTrackerInvocation
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var call editorTrackerInvocation
+		if err := json.Unmarshal([]byte(line), &call); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, call)
+	}
+	return result
+}
+
+func TestTerminalEditorRequiresLiveAuthority(t *testing.T) {
+	issue, path, capture := installEditorTracker(t, "br")
+	for _, test := range []struct {
+		name  string
+		alter func(*model.Issue)
+	}{
+		{"historical", func(i *model.Issue) { i.Origin = nil }},
+		{"partial", func(i *model.Issue) { i.Origin.ReadOnlyReason = "incomplete source" }},
+		{"relative executable", func(i *model.Issue) { i.Origin.Executable = "br" }},
+		{"missing database", func(i *model.Issue) { i.Origin.Database = "" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := issue.Clone()
+			test.alter(&current)
+			m := NewModel([]model.Issue{current}, nil, path)
+			defer m.Stop()
+			if cmd := m.launchTerminalEditor([]string{"vim"}); cmd != nil || !m.statusIsError {
+				t.Fatalf("unbound editor launch admitted: cmd=%v status=%q", cmd != nil, m.statusMsg)
+			}
+		})
+	}
+	if calls := readEditorTrackerCalls(t, capture); len(calls) != 0 {
+		t.Fatalf("denied edits executed a tracker: %+v", calls)
+	}
+	m := NewModel([]model.Issue{issue}, nil, "")
+	defer m.Stop()
+	if cmd := m.launchTerminalEditor([]string{"vim"}); cmd != nil || !strings.Contains(m.statusMsg, "cannot be reloaded") {
+		t.Fatalf("workspace edit without refresh route admitted: %q", m.statusMsg)
+	}
+}
+
+func TestEditorReturnRejectsChangedAuthorityAndConflicts(t *testing.T) {
+	issue, path, capture := installEditorTracker(t, "br")
+	for _, test := range []struct {
+		name  string
+		alter func(*Model, *editorExitMsg)
+	}{
+		{"missing session", func(m *Model, msg *editorExitMsg) { msg.session = nil }},
+		{"removed", func(m *Model, _ *editorExitMsg) { delete(m.issueMap, issue.ID) }},
+		{"historical", func(m *Model, _ *editorExitMsg) { m.issueMap[issue.ID].Origin = nil }},
+		{"partial", func(m *Model, _ *editorExitMsg) { m.issueMap[issue.ID].Origin.ReadOnlyReason = "partial" }},
+		{"different tracker", func(m *Model, _ *editorExitMsg) { m.issueMap[issue.ID].Origin.Database += "-other" }},
+		{"source switch", func(m *Model, _ *editorExitMsg) { m.beadsPath += "-other" }},
+		{"callback switch", func(m *Model, _ *editorExitMsg) { m.SetSourceReload(nil) }},
+		{"concurrent title", func(m *Model, _ *editorExitMsg) { m.issueMap[issue.ID].Title = "another agent's title" }},
+		{"concurrent status", func(m *Model, _ *editorExitMsg) { m.issueMap[issue.ID].Status = model.StatusClosed }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := issue.Clone()
+			m := NewModel([]model.Issue{current}, nil, path)
+			defer m.Stop()
+			edited := strings.Replace(exportIssueFrontmatter(current), "Original body", "Only my description edit", 1)
+			msg := editorTestExit(t, m, current, edited)
+			test.alter(m, &msg)
+			_, cmd := m.Update(msg)
+			if cmd != nil || !m.statusIsError || !strings.Contains(m.statusMsg, msg.tmpFile) {
+				t.Fatalf("unsafe edit admitted or recovery missing: cmd=%v status=%q", cmd != nil, m.statusMsg)
+			}
+			if _, err := os.Stat(msg.tmpFile); err != nil {
+				t.Fatalf("rejected edit lost its draft: %v", err)
+			}
+		})
+	}
+	if calls := readEditorTrackerCalls(t, capture); len(calls) != 0 {
+		t.Fatalf("conflicting edits executed a tracker: %+v", calls)
+	}
+}
+
+func TestEditorNativeBoundRoutesAndRepeatedWorkspaceEdits(t *testing.T) {
+	for _, tracker := range []string{"br", "bd"} {
+		t.Run(tracker, func(t *testing.T) {
+			issue, path, capture := installEditorTracker(t, tracker)
+			origin := *issue.Origin
+			issue.ID = "api-" + issue.ID
+			t.Setenv("BEADS_DIR", "/wrong/ambient")
+			t.Setenv("BEADS_DB", "/wrong/ambient.db")
+			t.Setenv("BD_DB", "/wrong/bd.db")
+			t.Setenv("bEaDs_DiR", "/wrong/mixed-case")
+			t.Setenv("Bd_Db", "/wrong/mixed-case.db")
+			t.Setenv("BeAdS_JsOnL", "/wrong/alternate-export.jsonl")
+			t.Setenv("BV_TEST_TRACKER_MODE", "no-auto-flush")
+			m := NewModel([]model.Issue{issue}, nil, "")
+			defer m.Stop()
+			m.SetSourceReload(func(ctx context.Context) (SourceReloadResult, error) {
+				loaded, err := loadIssuesForReloadContext(ctx, path, loader.ParseOptions{})
+				defer loader.ReturnIssuePtrsToPool(loaded.PoolRefs)
+				issues := cloneIssuesForAsync(loaded.Issues)
+				for i := range issues {
+					issues[i].ID = "api-" + issues[i].ID
+				}
+				return SourceReloadResult{Issues: issues, Authority: model.NewReadinessIndex(issues)}, err
+			})
+			for _, edit := range []struct{ old, replacement string }{
+				{"Original title", "--db=/wrong; $(no-shell)"},
+				{"Original body", "--title=literal body\nsecond line"},
+			} {
+				current := m.issueMap[issue.ID].Clone()
+				msg := editorTestExit(t, m, current, strings.Replace(exportIssueFrontmatter(current), edit.old, edit.replacement, 1))
+				_, cmd := m.Update(msg)
+				if cmd == nil || m.statusIsError {
+					t.Fatalf("save not scheduled: %s", m.statusMsg)
+				}
+				if _, err := os.Stat(msg.tmpFile); err != nil {
+					t.Fatalf("draft removed before save: %v", err)
+				}
+				result := cmd().(brUpdateResultMsg)
+				if result.err != nil || result.refreshErr != nil {
+					t.Fatalf("bound save failed: %v refresh=%v output=%q", result.err, result.refreshErr, result.output)
+				}
+				_, reload := m.Update(result)
+				if reload == nil {
+					t.Fatal("successful save did not refresh workspace")
+				}
+				m.Update(reload())
+				if m.statusIsError || m.sourceStaleReason != "" || m.issueMap[issue.ID].Origin == nil {
+					t.Fatalf("save left stale or unbound view: %q %q", m.statusMsg, m.sourceStaleReason)
+				}
+				if _, err := os.Stat(msg.tmpFile); !os.IsNotExist(err) {
+					t.Fatalf("confirmed save did not remove draft: %v", err)
+				}
+			}
+			current := m.issueMap[issue.ID]
+			if current.Title != "--db=/wrong; $(no-shell)" || current.Description != "--title=literal body\nsecond line" || !reflect.DeepEqual(current.Labels, []string{"keep-this-label"}) {
+				t.Fatalf("edits changed wrong fields: %+v", current)
+			}
+			calls := readEditorTrackerCalls(t, capture)
+			wantCount := 6
+			if len(calls) != wantCount {
+				t.Fatalf("tracker calls=%d want %d: %+v", len(calls), wantCount, calls)
+			}
+			for _, call := range calls {
+				if call.Dir != origin.WorkingDirectory || len(call.Args) < 3 || call.Args[0] != "--db" || call.Args[1] != origin.Database {
+					t.Fatalf("ambient route escaped: %+v", call)
+				}
+				authority := map[string]string{}
+				for _, entry := range call.Env {
+					key, value, _ := strings.Cut(entry, "=")
+					upper := strings.ToUpper(key)
+					if upper == "BEADS_JSONL" {
+						t.Fatalf("ambient export route survived: %q", entry)
+					}
+					if upper == "BEADS_DIR" || upper == "BEADS_DB" || upper == "BD_DB" {
+						if key != upper || authority[upper] != "" {
+							t.Fatalf("inherited authority alias survived: %q", call.Env)
+						}
+						authority[upper] = value
+					}
+				}
+				if !reflect.DeepEqual(authority, map[string]string{"BEADS_DIR": origin.TrackerDirectory, "BEADS_DB": origin.Database, "BD_DB": origin.Database}) {
+					t.Fatalf("wrong route environment: %v", authority)
+				}
+				if strings.Contains(strings.Join(call.Args, "\n"), "export") || strings.Contains(strings.Join(call.Args, "\n"), "\nsync\n") {
+					continue
+				}
+				if call.Args[len(call.Args)-2] != "--" || call.Args[len(call.Args)-1] != origin.LocalID {
+					t.Fatalf("display ID or option consumed as native ID: %q", call.Args)
+				}
+				joined := strings.Join(call.Args, "\n")
+				if tracker == "br" && (!strings.Contains(joined, "--no-auto-import") || (strings.Contains(joined, "\nupdate\n") && strings.Contains(joined, "--no-auto-flush"))) {
+					t.Fatalf("br import/autoflush semantics lost: %q", call.Args)
+				}
+			}
+		})
+	}
+}
+
+func TestEditorFailedSavesKeepDraftAndDoNotWrite(t *testing.T) {
+	for _, mode := range []string{"show-invalid", "show-wrong-id", "show-noisy", "update-fail", "live-conflict"} {
+		t.Run(mode, func(t *testing.T) {
+			issue, path, capture := installEditorTracker(t, "br")
+			t.Setenv("BV_TEST_TRACKER_MODE", mode)
+			m := NewModel([]model.Issue{issue}, nil, path)
+			defer m.Stop()
+			msg := editorTestExit(t, m, issue, strings.Replace(exportIssueFrontmatter(issue), "Original title", "Edited title", 1))
+			_, cmd := m.Update(msg)
+			if cmd == nil {
+				t.Fatal(m.statusMsg)
+			}
+			if mode == "live-conflict" {
+				other := issue.Clone()
+				other.Title = "New title from another agent"
+				data, _ := json.Marshal(other)
+				if err := os.WriteFile(os.Getenv("BV_TEST_TRACKER_STATE"), data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result := cmd().(brUpdateResultMsg)
+			m.Update(result)
+			if result.err == nil || !m.statusIsError || !strings.Contains(m.statusMsg, msg.tmpFile) {
+				t.Fatalf("failed save lost error/recovery: err=%v status=%q", result.err, m.statusMsg)
+			}
+			if _, err := os.Stat(msg.tmpFile); err != nil {
+				t.Fatalf("failed save deleted draft: %v", err)
+			}
+			calls := readEditorTrackerCalls(t, capture)
+			if mode != "update-fail" && len(calls) != 1 {
+				t.Fatalf("invalid preflight reached mutation: %+v", calls)
+			}
+			if strings.Contains(m.statusMsg, "\x1b") {
+				t.Fatal("tracker diagnostic retained terminal controls")
+			}
+		})
+	}
+}
+
+func TestEditorTrackerTimeoutIsBounded(t *testing.T) {
+	issue, _, _ := installEditorTracker(t, "br")
+	t.Setenv("BV_TEST_TRACKER_MODE", "show-hang")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	start := time.Now()
+	result := runIssueUpdateCmd(ctx, cancel, &editorSession{issue: issue}, map[string]string{"title": "edited"}, "draft.md")().(brUpdateResultMsg)
+	if !errors.Is(result.err, context.DeadlineExceeded) || time.Since(start) > 3*time.Second {
+		t.Fatalf("tracker timeout not bounded: elapsed=%s error=%v", time.Since(start), result.err)
+	}
+}
+
+func TestEditorRevalidatesMetadataButKeepsCapturedExecutable(t *testing.T) {
+	for _, changedMetadata := range []bool{false, true} {
+		t.Run(fmt.Sprint(changedMetadata), func(t *testing.T) {
+			issue, path, capture := installEditorTracker(t, "br")
+			// Mutation uses the selected absolute executable even after PATH no
+			// longer contains a tracker. A metadata route switch still fails.
+			t.Setenv("PATH", t.TempDir())
+			if changedMetadata {
+				metadata := filepath.Join(filepath.Dir(path), "metadata.json")
+				if err := os.WriteFile(metadata, []byte(`{"backend":"dolt"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			result := runIssueUpdateCmd(ctx, cancel, &editorSession{issue: issue, sourcePath: path}, map[string]string{"title": "Changed"}, "draft.md")().(brUpdateResultMsg)
+			if changedMetadata {
+				if result.err == nil || len(readEditorTrackerCalls(t, capture)) != 0 {
+					t.Fatalf("changed metadata reached tracker execution: %+v", result)
+				}
+			} else if result.err != nil {
+				t.Fatalf("captured executable was replaced with PATH lookup: %v", result.err)
+			}
+		})
+	}
+}
+
+func TestGUIEditorRejectsHistoricalSQLiteAndMismatchedSources(t *testing.T) {
+	issue, path, _ := installEditorTracker(t, "br")
+	for _, test := range []struct {
+		name     string
+		path     string
+		readOnly bool
+	}{
+		{"historical", "", false},
+		{"sqlite", issue.Origin.Database, false},
+		{"unrelated export", filepath.Join(filepath.Dir(path), "another.jsonl"), false},
+		{"partial", path, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := issue.Clone()
+			if test.readOnly {
+				current.Origin.ReadOnlyReason = "incomplete read"
+			}
+			if test.name == "unrelated export" {
+				if err := os.WriteFile(test.path, []byte("{}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			m := NewModel([]model.Issue{current}, nil, test.path)
+			defer m.Stop()
+			if got, err := m.guiEditorPath(); err == nil || got != "" {
+				t.Fatalf("GUI accepted unsafe source: %q err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestEditorExportFailureRequiresRealRetry(t *testing.T) {
+	for _, tracker := range []string{"br", "bd"} {
+		t.Run(tracker, func(t *testing.T) {
+			issue, path, _ := installEditorTracker(t, tracker)
+			t.Setenv("BV_TEST_TRACKER_MODE", "export-fail")
+			m := NewModel([]model.Issue{issue}, nil, path)
+			defer m.Stop()
+			msg := editorTestExit(t, m, issue, strings.Replace(exportIssueFrontmatter(issue), "Original title", "Saved title", 1))
+			_, cmd := m.Update(msg)
+			result := cmd().(brUpdateResultMsg)
+			if result.err != nil || result.refreshErr == nil {
+				t.Fatalf("fixture expected saved update + failed export: %+v", result)
+			}
+			m.Update(result)
+			if m.pendingTrackerRefresh == nil || m.sourceStaleReason == "" || m.issueMap[issue.ID].Title != issue.Title {
+				t.Fatalf("failed export reported current view: %q", m.statusMsg)
+			}
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+			if !strings.Contains(m.renderFooter(), "refresh failed") {
+				t.Fatalf("stale warning disappeared on navigation: %q", m.renderFooter())
+			}
+			if edit := m.launchTerminalEditor([]string{"vim"}); edit != nil {
+				t.Fatal("second edit admitted while compatibility export is stale")
+			}
+			t.Setenv("BV_TEST_TRACKER_MODE", "")
+			_, retry := m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+			if retry == nil {
+				t.Fatal("Ctrl+R did not retry failed export")
+			}
+			_, reload := m.Update(retry())
+			if reload == nil {
+				t.Fatal("export retry did not schedule fresh load")
+			}
+			m.Update(reload())
+			if m.sourceStaleReason != "" || m.pendingTrackerRefresh != nil || m.issueMap[issue.ID].Title != "Saved title" || editorOriginError(m.issueMap[issue.ID].Origin) != nil {
+				t.Fatalf("retry did not restore fresh writable view: status=%q issue=%+v", m.statusMsg, m.issueMap[issue.ID])
+			}
+		})
+	}
+}
+
+func TestEditorRevalidatesWorkspaceSelectionBeforeWriting(t *testing.T) {
+	issue, _, capture := installEditorTracker(t, "br")
+	issue.ID = "api-" + issue.ID
+	for _, test := range []struct {
+		name   string
+		change func(*SourceReloadResult) error
+	}{
+		{"removed", func(r *SourceReloadResult) error { r.Issues = nil; return nil }},
+		{"redirected", func(r *SourceReloadResult) error { r.Issues[0].Origin.Database += "-another"; return nil }},
+		{"partial", func(r *SourceReloadResult) error {
+			r.Issues[0].Origin.ReadOnlyReason = "incomplete aggregate"
+			return nil
+		}},
+		{"changed row", func(r *SourceReloadResult) error { r.Issues[0].Title = "Another agent's edit"; return nil }},
+		{"ambiguous", func(r *SourceReloadResult) error { r.Issues = append(r.Issues, r.Issues[0]); return nil }},
+		{"unavailable", func(r *SourceReloadResult) error { return errors.New("workspace load failed") }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := NewModel([]model.Issue{issue.Clone()}, nil, "")
+			defer m.Stop()
+			m.SetSourceReload(func(context.Context) (SourceReloadResult, error) {
+				result := SourceReloadResult{Issues: []model.Issue{issue.Clone()}}
+				err := test.change(&result)
+				return result, err
+			})
+			msg := editorTestExit(t, m, issue, strings.Replace(exportIssueFrontmatter(issue), "Original title", "Edited title", 1))
+			_, cmd := m.Update(msg)
+			if cmd == nil {
+				t.Fatal(m.statusMsg)
+			}
+			result := cmd().(brUpdateResultMsg)
+			m.Update(result)
+			if result.err == nil || !strings.Contains(m.statusMsg, msg.tmpFile) {
+				t.Fatalf("changed suspended workspace selection accepted: %+v status=%q", result, m.statusMsg)
+			}
+		})
+	}
+	if calls := readEditorTrackerCalls(t, capture); len(calls) != 0 {
+		t.Fatalf("changed workspace selection executed tracker: %+v", calls)
+	}
+}
+
+func TestEditorSQLiteViewPreservesConfiguredAutoflush(t *testing.T) {
+	issue, path, capture := installEditorTracker(t, "br")
+	t.Setenv("BV_TEST_TRACKER_MODE", "no-auto-flush")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	result := runIssueUpdateCmd(ctx, cancel, &editorSession{issue: issue, sourcePath: issue.Origin.Database}, map[string]string{"title": "Updated DB title"}, "draft.md")().(brUpdateResultMsg)
+	if result.err != nil || result.refreshErr != nil || len(readEditorTrackerCalls(t, capture)) != 2 {
+		t.Fatalf("direct DB edit forced an optional JSONL export: %+v", result)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("direct DB editor changed disabled JSONL export: %v", err)
+	}
+}
+
+func TestSourceReloadCompletionIsFenced(t *testing.T) {
+	old := model.Issue{ID: "old", Title: "Old", Status: model.StatusOpen}
+	m := NewModel([]model.Issue{old}, nil, "")
+	defer m.Stop()
+	m.SetSourceReload(func(context.Context) (SourceReloadResult, error) {
+		return SourceReloadResult{Issues: []model.Issue{old}}, nil
+	})
+	_, stale := m.Update(FileChangedMsg{})
+	fresh := model.Issue{ID: "api-new", Title: "Fresh", Status: model.StatusOpen}
+	m.SetSourceReload(func(context.Context) (SourceReloadResult, error) {
+		return SourceReloadResult{Issues: []model.Issue{fresh}, CandidateIDs: map[string]bool{fresh.ID: true},
+			Workspace: &WorkspaceInfo{Enabled: true, RepoCount: 2, RepoPrefixes: []string{"api", "web"}}}, nil
+	})
+	_, current := m.Update(FileChangedMsg{})
+	m.Update(current())
+	m.Update(stale())
+	if len(m.issues) != 1 || m.issues[0].ID != fresh.ID || !m.candidateIDs[fresh.ID] || !m.workspaceMode {
+		t.Fatalf("stale completion replaced new source: issues=%+v candidates=%v", m.issues, m.candidateIDs)
+	}
+	m.SetSourceReload(func(context.Context) (SourceReloadResult, error) {
+		return SourceReloadResult{}, errors.New("source offline")
+	})
+	_, failing := m.Update(FileChangedMsg{})
+	m.Update(failing())
+	if !m.statusIsError || m.sourceStaleReason == "" || m.issues[0].ID != fresh.ID {
+		t.Fatalf("failed load lost last view or reported fresh data: %q", m.statusMsg)
+	}
+}
+
+func TestEditorSupersededWriteAndRetryCannotChangeNewSource(t *testing.T) {
+	issue, path, _ := installEditorTracker(t, "bd")
+	m := NewModel([]model.Issue{issue}, nil, path)
+	defer m.Stop()
+	exit := editorTestExit(t, m, issue, strings.Replace(exportIssueFrontmatter(issue), "Original title", "Saved old source", 1))
+	_, save := m.Update(exit)
+	result := save().(brUpdateResultMsg)
+	if result.err != nil || result.refreshErr != nil {
+		t.Fatalf("fixture save failed: %+v", result)
+	}
+	m.SetSourceReload(func(context.Context) (SourceReloadResult, error) { return SourceReloadResult{}, nil })
+	_, reload := m.Update(result)
+	if reload != nil || m.sourceStaleReason != "" || m.pendingTrackerRefresh != nil || m.brUpdateInFlight {
+		t.Fatalf("old save completion changed new source: status=%q stale=%q", m.statusMsg, m.sourceStaleReason)
+	}
+	if _, err := os.Stat(exit.tmpFile); err != nil {
+		t.Fatalf("superseded write removed recovery draft: %v", err)
+	}
+	origin := *issue.Origin
+	m.pendingTrackerRefresh = &origin
+	older := m.retryEditorExport()
+	newer := m.retryEditorExport()
+	m.statusMsg = "new retry owns status"
+	m.Update(older())
+	if m.statusMsg != "new retry owns status" || m.bdRefreshCancel == nil || m.pendingTrackerRefresh == nil {
+		t.Fatalf("canceled retry replaced newer status: %q", m.statusMsg)
+	}
+	_, reload = m.Update(newer())
+	if reload == nil || m.pendingTrackerRefresh != nil {
+		t.Fatalf("latest export retry did not complete: %q", m.statusMsg)
+	}
+}
+
+func TestEditorExportRetryRevalidatesSource(t *testing.T) {
+	issue, path, capture := installEditorTracker(t, "br")
+	m := NewModel([]model.Issue{issue}, nil, path)
+	defer m.Stop()
+	origin := *issue.Origin
+	m.pendingTrackerRefresh, m.pendingExportSource = &origin, path
+	m.sourceStaleReason = "previous export failed"
+	if err := os.WriteFile(filepath.Join(filepath.Dir(path), "metadata.json"), []byte(`{"backend":"dolt"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, cmd := m.Update(m.retryEditorExport()())
+	if cmd != nil || !m.statusIsError || m.pendingTrackerRefresh == nil || len(readEditorTrackerCalls(t, capture)) != 0 {
+		t.Fatalf("export retry used changed source authority: status=%q", m.statusMsg)
+	}
+}
+
+func TestEditorExportRetryRevalidatesWorkspaceRouteWithoutOldFields(t *testing.T) {
+	issue, path, capture := installEditorTracker(t, "br")
+	m := NewModel([]model.Issue{issue}, nil, "")
+	defer m.Stop()
+	retargeted := false
+	m.SetSourceReload(func(ctx context.Context) (SourceReloadResult, error) {
+		loaded, err := loadIssuesForReloadContext(ctx, path, loader.ParseOptions{})
+		defer loader.ReturnIssuePtrsToPool(loaded.PoolRefs)
+		issues := cloneIssuesForAsync(loaded.Issues)
+		if retargeted {
+			issues[0].Origin.Database += "-retargeted"
+		}
+		return SourceReloadResult{Issues: issues}, err
+	})
+	t.Setenv("BV_TEST_TRACKER_MODE", "export-fail")
+	msg := editorTestExit(t, m, issue, strings.Replace(exportIssueFrontmatter(issue), "Original title", "Saved title", 1))
+	_, save := m.Update(msg)
+	result := save().(brUpdateResultMsg)
+	if result.err != nil || result.refreshErr == nil {
+		t.Fatalf("fixture expected completed write and failed export: %+v", result)
+	}
+	m.Update(result)
+	callsBefore := len(readEditorTrackerCalls(t, capture))
+	t.Setenv("BV_TEST_TRACKER_MODE", "")
+	retargeted = true
+	m.Update(m.retryEditorExport()())
+	if m.pendingTrackerRefresh == nil || len(readEditorTrackerCalls(t, capture)) != callsBefore {
+		t.Fatalf("retry flushed a retargeted workspace: %q", m.statusMsg)
+	}
+	retargeted = false
+	// Another reader may have published the completed native write between
+	// retries. Its new fields must not be mistaken for a pre-save conflict.
+	saved, err := os.ReadFile(os.Getenv("BV_TEST_TRACKER_STATE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(saved, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, reload := m.Update(m.retryEditorExport()())
+	if reload == nil || m.pendingTrackerRefresh != nil {
+		t.Fatalf("retry incorrectly compared old edited fields: %q", m.statusMsg)
+	}
+	m.Update(reload())
+	if m.issueMap[issue.ID].Title != "Saved title" || m.sourceStaleReason != "" {
+		t.Fatalf("restored route did not show saved state: %q", m.statusMsg)
+	}
+	if _, err := os.Stat(msg.tmpFile); !os.IsNotExist(err) {
+		t.Fatalf("completed publication retry retained a confirmed draft: %v", err)
+	}
+}
+
+func TestReloadRevalidatesLiveOriginAndCompleteness(t *testing.T) {
+	_, path, _ := installEditorTracker(t, "br")
+	for _, async := range []bool{false, true} {
+		load := func() reloadIssueData {
+			var loaded reloadIssueData
+			var err error
+			if async {
+				loaded, err = loadIssuesForReloadContext(context.Background(), path, loader.ParseOptions{WarningHandler: func(string) {}})
+			} else {
+				loaded, err = loadIssuesForReload(path, loader.ParseOptions{WarningHandler: func(string) {}})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { loader.ReturnIssuePtrsToPool(loaded.PoolRefs) })
+			return loaded
+		}
+		good := load()
+		if len(good.Issues) != 1 || editorOriginError(good.Issues[0].Origin) != nil {
+			t.Fatalf("live reload lost verified origin: %+v", good.Issues)
+		}
+		original, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, append(append([]byte(nil), original...), []byte("{malformed}\n")...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		partial := load()
+		if len(partial.Issues) != 1 || partial.Issues[0].Origin == nil || partial.Issues[0].Origin.ReadOnlyReason == "" {
+			t.Fatalf("partial reload retained writable origin: %+v", partial.Issues)
+		}
+		if err := os.WriteFile(path, original, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metadata := filepath.Join(filepath.Dir(path), "metadata.json")
+	if err := os.WriteFile(metadata, []byte(`{"backend":"unknown"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadIssuesForReload(path, loader.ParseOptions{})
+	defer loader.ReturnIssuePtrsToPool(loaded.PoolRefs)
+	if err != nil || loaded.Issues[0].Origin.ReadOnlyReason == "" {
+		t.Fatalf("changed metadata retained old mutation authority: err=%v issues=%+v", err, loaded.Issues)
+	}
+}
 
 // Basic helpers and tiny behaviours that were previously uncovered.
 func TestIssueItemBasicsAndPrefix(t *testing.T) {
@@ -718,15 +1514,11 @@ func TestOpenInEditorWithArguments(t *testing.T) {
 	// GUI editor arguments must be parsed without treating the entire command
 	// as an executable name (GitHub #47). The allowlisted GUI launch contract
 	// supplies only the target path; terminal editors retain user arguments.
-	tmp := t.TempDir()
-	beadsFile := filepath.Join(tmp, "issues with spaces.jsonl")
-	if err := os.WriteFile(beadsFile, []byte("{}"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	issue, beadsFile, _ := installEditorTracker(t, "br")
 	capture := installTestGUIEditor(t)
 	t.Setenv("EDITOR", "gedit --wait")
 
-	m := NewModel(nil, nil, beadsFile)
+	m := NewModel([]model.Issue{issue}, nil, beadsFile)
 	m.openInEditor()
 	if m.statusIsError {
 		t.Fatalf("expected success with EDITOR containing arguments, got error: %q", m.statusMsg)
@@ -970,19 +1762,14 @@ func TestOpenInEditorMissingAndGUI(t *testing.T) {
 
 	m := NewModel([]model.Issue{{ID: "1", Title: "x", Status: model.StatusOpen}}, nil, "")
 	m.openInEditor()
-	if !m.statusIsError || !strings.Contains(m.statusMsg, "No .beads") {
+	if !m.statusIsError || !strings.Contains(m.statusMsg, "no live JSONL") {
 		t.Fatalf("expected missing beads error, got %q", m.statusMsg)
 	}
 
-	// Success branch with GUI-ish editor
-	beadsDir := filepath.Join(tmp, ".beads")
-	if err := os.Mkdir(beadsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	beadsFile := filepath.Join(beadsDir, "beads.jsonl")
-	if err := os.WriteFile(beadsFile, []byte(`{}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// Explicit verified source permits a GUI editor; the ambient .beads path
+	// never supplies authority for the earlier unbound historical view.
+	issue, beadsFile, _ := installEditorTracker(t, "br")
+	m = NewModel([]model.Issue{issue}, nil, beadsFile)
 
 	// A missing executable must fail even though the beads file exists.
 	m.openInEditor()
@@ -1704,17 +2491,15 @@ Description.
 		t.Fatal(err)
 	}
 
-	m := NewModel([]model.Issue{{
-		ID:        "t1",
-		Title:     "Test",
-		Priority:  1,
-		Status:    model.StatusOpen,
-		IssueType: model.TypeTask,
-	}}, nil, "")
+	issue, source, _ := installEditorTracker(t, "br")
+	issue.ID, issue.Title, issue.Priority = "t1", "Test", 1
+	m := NewModel([]model.Issue{issue}, nil, source)
+	m.editorSession = &editorSession{issue: issue.Clone(), sourcePath: source}
 	result, cmd := m.Update(editorExitMsg{
 		issueID:  "t1",
 		tmpFile:  tmpFile.Name(),
 		original: original,
+		session:  m.editorSession,
 	})
 	if cmd == nil {
 		t.Fatal("changed editor content should schedule br update asynchronously")

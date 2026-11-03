@@ -1,7 +1,10 @@
 package ui
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/url"
@@ -240,15 +243,83 @@ func (m *Model) cancelPhase2Preparation() {
 	}
 }
 
-// FileChangedMsg is sent when the beads file changes on disk
-type FileChangedMsg struct{}
+// FileChangedMsg is sent when the beads file changes on disk. A source reload
+// completion is private and belongs to one callback and request generation.
+type FileChangedMsg struct {
+	source        *SourceReloadResult
+	err           error
+	sourceVersion uint64
+	request       uint64
+}
+
+// SourceReloadResult contains a fresh, consistently scoped source read. The
+// caller must preserve complete dependency authority even for filtered views.
+type SourceReloadResult struct {
+	Issues       []model.Issue
+	Authority    *model.ReadinessIndex
+	CandidateIDs map[string]bool
+	Warnings     []string
+	Workspace    *WorkspaceInfo
+}
+
+// SetSourceReload supplies a live reload route for aggregated sources. Replacing
+// it invalidates pending reloads and edits opened against the old source.
+func (m *Model) SetSourceReload(reload func(context.Context) (SourceReloadResult, error)) {
+	if m.sourceReloadCancel != nil {
+		m.sourceReloadCancel()
+		m.sourceReloadCancel = nil
+	}
+	if m.editorCancel != nil {
+		m.editorCancel()
+	}
+	if m.bdRefreshCancel != nil {
+		m.bdRefreshCancel()
+		m.bdRefreshCancel = nil
+	}
+	m.pendingTrackerRefresh = nil
+	m.pendingExportSession = nil
+	m.sourceStaleReason = ""
+	m.sourceVersion++
+	m.sourceReload = reload
+}
+
+func (m *Model) sourceReloadCmd() tea.Cmd {
+	if m.sourceReload == nil {
+		return nil
+	}
+	if m.sourceReloadCancel != nil {
+		m.sourceReloadCancel()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), brUpdateTimeout)
+	m.sourceReloadCancel = cancel
+	m.sourceReloadRequest++
+	reload, version, request := m.sourceReload, m.sourceVersion, m.sourceReloadRequest
+	return func() tea.Msg {
+		defer cancel()
+		result, err := reload(ctx)
+		if ctx.Err() != nil {
+			err = errors.Join(err, ctx.Err())
+		}
+		return FileChangedMsg{source: &result, err: err, sourceVersion: version, request: request}
+	}
+}
 
 // editorExitMsg is sent when a terminal editor process exits after editing an issue (bv-134).
 type editorExitMsg struct {
 	issueID  string // The issue that was being edited
 	tmpFile  string // Path to the temp file with edited content
 	original string // Original content for diff comparison
-	err      error  // Non-nil if the editor process failed
+	session  *editorSession
+	err      error // Non-nil if the editor process failed
+}
+
+// An edit is bound to the immutable issue and live tracker selected when the
+// editor opened. Display IDs and a later process cwd are never mutation routes.
+type editorSession struct {
+	issue         model.Issue
+	sourcePath    string
+	sourceVersion uint64
+	reload        func(context.Context) (SourceReloadResult, error)
 }
 
 type brUpdateResultMsg struct {
@@ -256,30 +327,331 @@ type brUpdateResultMsg struct {
 	fieldCount int
 	output     string
 	err        error
+	refreshErr error
+	session    *editorSession
+	tmpFile    string
 }
 
-const brUpdateTimeout = 30 * time.Second
+type editorExportRefreshMsg struct {
+	origin        *model.IssueOrigin
+	sourceVersion uint64
+	request       uint64
+	err           error
+}
 
-func runBRUpdateCmd(issueID string, brArgs []string, fieldCount int) tea.Cmd {
-	cmdArgs := append([]string{"update", issueID}, brArgs...)
+func (m *Model) reloadAfterEdit() tea.Cmd {
+	if m.backgroundWorker != nil {
+		m.backgroundWorker.Stop()
+		m.backgroundWorker = nil
+		m.restoreBackgroundAfterEdit = true
+	}
+	if m.sourceReload != nil {
+		return m.sourceReloadCmd()
+	}
+	return func() tea.Msg { return FileChangedMsg{} }
+}
+
+func (m *Model) retryEditorExport() tea.Cmd {
+	if m.bdRefreshCancel != nil {
+		m.bdRefreshCancel()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), brUpdateTimeout)
+	m.bdRefreshCancel = cancel
+	m.bdRefreshRequest++
+	origin, sourcePath, session, version, request := m.pendingTrackerRefresh, m.pendingExportSource, m.pendingExportSession, m.sourceVersion, m.bdRefreshRequest
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), brUpdateTimeout)
 		defer cancel()
+		var err error
+		if session != nil {
+			// The native write already succeeded. Recheck route ownership and
+			// completeness, not the pre-edit field values we intentionally changed.
+			err = revalidateEditorSource(ctx, session, false)
+		}
+		if err == nil {
+			err = refreshEditorExport(ctx, *origin, sourcePath)
+		}
+		return editorExportRefreshMsg{origin: origin, sourceVersion: version, request: request, err: err}
+	}
+}
 
-		cmd := exec.CommandContext(ctx, "br", cmdArgs...)
-		// Bound the rare case where a killed br child leaves a descendant holding
-		// the CombinedOutput pipes open.
-		cmd.WaitDelay = 2 * time.Second
-		output, err := cmd.CombinedOutput()
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			err = fmt.Errorf("br update timed out: %w", ctxErr)
+const (
+	brUpdateTimeout       = 30 * time.Second
+	editorDiagnosticLimit = 16 << 10
+	editorShowLimit       = 8 << 20
+)
+
+type editorCommandOutput struct {
+	buffer    bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (o *editorCommandOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	if remaining := o.limit - o.buffer.Len(); len(p) > remaining {
+		p = p[:remaining]
+		o.truncated = true
+	}
+	_, _ = o.buffer.Write(p)
+	return n, nil
+}
+
+func editorOriginError(origin *model.IssueOrigin) error {
+	if origin == nil {
+		return fmt.Errorf("source has no verified live tracker; historical and imported views are read-only")
+	}
+	if origin.ReadOnlyReason != "" {
+		return fmt.Errorf("source is read-only: %s", origin.ReadOnlyReason)
+	}
+	if (origin.Tracker != "br" && origin.Tracker != "bd") || origin.LocalID == "" ||
+		!filepath.IsAbs(origin.Executable) || !filepath.IsAbs(origin.WorkingDirectory) ||
+		!filepath.IsAbs(origin.TrackerDirectory) || !filepath.IsAbs(origin.Database) {
+		return fmt.Errorf("source has no complete, absolute tracker route")
+	}
+	for _, value := range []string{origin.LocalID, origin.Executable, origin.WorkingDirectory, origin.TrackerDirectory, origin.Database} {
+		if strings.ContainsRune(value, '\x00') {
+			return fmt.Errorf("tracker route contains an invalid NUL byte")
 		}
-		return brUpdateResultMsg{
-			issueID:    issueID,
-			fieldCount: fieldCount,
-			output:     strings.TrimSpace(string(output)),
-			err:        err,
+	}
+	return nil
+}
+
+func editorTrackerEnvironment(parent []string, origin model.IssueOrigin) []string {
+	result := make([]string, 0, len(parent)+3)
+	for _, entry := range parent {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.EqualFold(key, "BEADS_DIR") || strings.EqualFold(key, "BEADS_DB") || strings.EqualFold(key, "BD_DB") || strings.EqualFold(key, "BEADS_JSONL") {
+			continue
 		}
+		result = append(result, entry)
+	}
+	return append(result, "BEADS_DIR="+origin.TrackerDirectory, "BEADS_DB="+origin.Database, "BD_DB="+origin.Database)
+}
+
+func runEditorTracker(ctx context.Context, origin model.IssueOrigin, mutating bool, operation ...string) ([]byte, string, error) {
+	if err := editorOriginError(&origin); err != nil {
+		return nil, "", err
+	}
+	args := []string{"--db", origin.Database}
+	if origin.Tracker == "br" {
+		args = append(args, "--no-auto-import")
+		if !mutating {
+			args = append(args, "--no-auto-flush")
+		}
+	}
+	args = append(args, operation...)
+	cmd := exec.CommandContext(ctx, origin.Executable, args...)
+	cmd.Dir = origin.WorkingDirectory
+	cmd.Env = editorTrackerEnvironment(os.Environ(), origin)
+	cmd.WaitDelay = time.Second
+	limit := editorShowLimit
+	if mutating {
+		limit = editorDiagnosticLimit
+	}
+	stdout := &editorCommandOutput{limit: limit}
+	stderr := &editorCommandOutput{limit: editorDiagnosticLimit}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		err = errors.Join(ctx.Err(), err)
+	}
+	diagnostic := strings.TrimSpace(ansi.Strip(stderr.buffer.String()))
+	if stderr.truncated {
+		diagnostic += " [diagnostics truncated]"
+	}
+	if !mutating && stdout.truncated {
+		err = errors.Join(err, fmt.Errorf("tracker issue response exceeds %d bytes", editorShowLimit))
+	}
+	return stdout.buffer.Bytes(), diagnostic, err
+}
+
+func editorFields(issue model.Issue) map[string]string {
+	return map[string]string{
+		"title": issue.Title, "status": string(issue.Status), "priority": strconv.Itoa(issue.Priority),
+		"assignee": issue.Assignee, "type": string(issue.IssueType), "description": issue.Description,
+	}
+}
+
+func editorIssueUnchanged(original, current model.Issue) bool {
+	return maps.Equal(editorFields(original), editorFields(current)) && original.UpdatedAt.Equal(current.UpdatedAt)
+}
+
+func (m *Model) validateEditorSession(session *editorSession) error {
+	if session == nil || session != m.editorSession {
+		return fmt.Errorf("edit no longer belongs to the selected live source")
+	}
+	if session.sourcePath != m.beadsPath || session.sourceVersion != m.sourceVersion {
+		return fmt.Errorf("source changed while editing")
+	}
+	if m.sourceReload != nil && session.reload == nil {
+		return fmt.Errorf("edit has no captured source revalidation route")
+	}
+	if m.sourceStaleReason != "" {
+		return fmt.Errorf("source needs a successful refresh before editing: %s", m.sourceStaleReason)
+	}
+	current := m.issueMap[session.issue.ID]
+	if current == nil {
+		return fmt.Errorf("issue %s no longer exists in the current view", session.issue.ID)
+	}
+	if err := editorOriginError(current.Origin); err != nil {
+		return err
+	}
+	if err := editorOriginError(session.issue.Origin); err != nil {
+		return err
+	}
+	if *current.Origin != *session.issue.Origin {
+		return fmt.Errorf("issue tracker route changed while editing")
+	}
+	if !editorIssueUnchanged(session.issue, *current) {
+		return fmt.Errorf("issue changed while editing; reopen it and reconcile the saved draft")
+	}
+	return nil
+}
+
+func (m *Model) editorFailure(message, draft string) {
+	m.statusMsg = "❌ " + message
+	if draft != "" {
+		m.statusMsg += "; draft saved at " + draft
+	}
+	m.statusIsError = true
+}
+
+func readEditorLiveIssue(data []byte, localID string) (model.Issue, error) {
+	data = bytes.TrimSpace(data)
+	var issue model.Issue
+	if len(data) == 0 {
+		return issue, fmt.Errorf("tracker returned no issue")
+	}
+	if data[0] == '[' {
+		var issues []model.Issue
+		if err := json.Unmarshal(data, &issues); err != nil {
+			return issue, fmt.Errorf("decode tracker issue: %w", err)
+		}
+		if len(issues) != 1 {
+			return issue, fmt.Errorf("tracker returned %d issues, expected one", len(issues))
+		}
+		issue = issues[0]
+	} else if err := json.Unmarshal(data, &issue); err != nil {
+		return issue, fmt.Errorf("decode tracker issue: %w", err)
+	}
+	if issue.ID != localID {
+		return issue, fmt.Errorf("tracker returned a different issue")
+	}
+	return issue, nil
+}
+
+func editorOriginSource(origin model.IssueOrigin, sourcePath string) string {
+	if sourcePath != "" {
+		return sourcePath
+	}
+	if origin.Tracker == "bd" {
+		return filepath.Join(origin.TrackerDirectory, "issues.jsonl")
+	}
+	return origin.Database
+}
+
+func refreshEditorExport(ctx context.Context, origin model.IssueOrigin, sourcePath string) error {
+	if err := loader.RevalidateIssueOrigin(editorOriginSource(origin, sourcePath), origin); err != nil {
+		return err
+	}
+	if origin.Tracker == "bd" {
+		return loader.RefreshBDExport(ctx, origin)
+	}
+	// An installed br may have sync.auto_flush disabled. An explicit guarded
+	// flush keeps JSONL viewers current without enabling import or bypassing
+	// native stale/empty database protections.
+	_, diagnostic, err := runEditorTracker(ctx, origin, true, "sync", "--flush-only", "--json")
+	if err != nil && diagnostic != "" {
+		return fmt.Errorf("%w: %s", err, diagnostic)
+	}
+	return err
+}
+
+func revalidateEditorSource(ctx context.Context, session *editorSession, compareFields bool) error {
+	if session.reload == nil {
+		return nil
+	}
+	loaded, err := session.reload(ctx)
+	if ctx.Err() != nil {
+		err = errors.Join(err, ctx.Err())
+	}
+	if err != nil {
+		return fmt.Errorf("revalidate selected source before saving: %w", err)
+	}
+	var current *model.Issue
+	for i := range loaded.Issues {
+		if loaded.Issues[i].ID == session.issue.ID {
+			if current != nil {
+				return fmt.Errorf("selected source contains ambiguous issue IDs")
+			}
+			current = &loaded.Issues[i]
+		}
+	}
+	if current == nil {
+		return fmt.Errorf("issue is no longer present in the selected source")
+	}
+	if err := editorOriginError(current.Origin); err != nil {
+		return err
+	}
+	if *current.Origin != *session.issue.Origin {
+		return fmt.Errorf("selected workspace tracker route changed while editing")
+	}
+	if compareFields && !editorIssueUnchanged(session.issue, *current) {
+		return fmt.Errorf("issue changed in the selected source while editing; reconcile the saved draft")
+	}
+	return nil
+}
+
+func runIssueUpdateCmd(ctx context.Context, cancel context.CancelFunc, session *editorSession, fields map[string]string, tmpFile string) tea.Cmd {
+	return func() tea.Msg {
+		defer cancel()
+		result := brUpdateResultMsg{issueID: session.issue.ID, fieldCount: len(fields), session: session, tmpFile: tmpFile}
+		if err := editorOriginError(session.issue.Origin); err != nil {
+			result.err = err
+			return result
+		}
+		if err := revalidateEditorSource(ctx, session, true); err != nil {
+			result.err = err
+			return result
+		}
+		origin := *session.issue.Origin
+		sourcePath := editorOriginSource(origin, session.sourcePath)
+		if err := loader.RevalidateIssueOrigin(sourcePath, origin); err != nil {
+			result.err = err
+			return result
+		}
+		// The TUI may have been suspended in an editor while another agent
+		// changed the tracker. Re-read the same native ID before saving. This is
+		// an optimistic conflict check, not an atomic compare-and-swap promise.
+		data, diagnostic, err := runEditorTracker(ctx, origin, false, "show", "--json", "--", origin.LocalID)
+		if err != nil {
+			result.err, result.output = fmt.Errorf("verify current tracker issue: %w", err), diagnostic
+			return result
+		}
+		current, err := readEditorLiveIssue(data, origin.LocalID)
+		if err != nil {
+			result.err = err
+			return result
+		}
+		if !editorIssueUnchanged(session.issue, current) {
+			result.err = fmt.Errorf("issue changed in the tracker while editing; reopen it and reconcile the saved draft")
+			return result
+		}
+		args := []string{"update", "--json"}
+		for _, key := range []string{"title", "status", "priority", "assignee", "type", "description"} {
+			if value, ok := fields[key]; ok {
+				args = append(args, "--"+key+"="+value)
+			}
+		}
+		args = append(args, "--", origin.LocalID)
+		_, result.output, result.err = runEditorTracker(ctx, origin, true, args...)
+		if result.err != nil {
+			return result
+		}
+		if origin.Tracker == "bd" || session.sourcePath == "" || strings.EqualFold(filepath.Ext(session.sourcePath), ".jsonl") {
+			result.refreshErr = refreshEditorExport(ctx, origin, session.sourcePath)
+		}
+		return result
 	}
 }
 
@@ -360,6 +732,7 @@ type reloadIssueData struct {
 func loadIssuesForReload(path string, opts loader.ParseOptions) (reloadIssueData, error) {
 	var loaded loader.PooledIssues
 	var err error
+	complete := true
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".db", ".sqlite", ".sqlite3":
 		source, ok, err := datasource.SourceFromFile(path)
@@ -378,14 +751,22 @@ func loadIssuesForReload(path string, opts loader.ParseOptions) (reloadIssueData
 		if err != nil {
 			return reloadIssueData{}, err
 		}
+		report := reader.LoadReport()
+		complete = report.Errors == 0 && report.ReadErrors == 0 && !report.Stale && len(report.AuthorityWarnings) == 0
 	default:
 		fullOpts := opts
 		fullOpts.IssueFilter = nil
+		var stats loader.ParseStats
+		if fullOpts.Stats == nil {
+			fullOpts.Stats = &stats
+		}
 		loaded, err = loader.LoadIssuesFromFileWithOptionsPooled(path, fullOpts)
+		complete = fullOpts.Stats.Errors == 0
 	}
 	if err != nil {
 		return reloadIssueData{}, err
 	}
+	loader.AttachIssueOrigins(loaded.Issues, path, complete)
 	result := reloadIssueData{
 		Authority:     model.NewReadinessIndex(loaded.Issues),
 		AuthorityHash: analysis.ComputeDataHash(loaded.Issues),
@@ -937,10 +1318,24 @@ type Model struct {
 	showTimeTravelPrompt bool
 
 	// Status message (for temporary feedback)
-	statusMsg          string
-	statusIsError      bool
-	clipboardRequestID uint64
-	brUpdateInFlight   bool
+	statusMsg                  string
+	statusIsError              bool
+	clipboardRequestID         uint64
+	brUpdateInFlight           bool
+	editorSession              *editorSession
+	editorCancel               context.CancelFunc
+	sourceReload               func(context.Context) (SourceReloadResult, error)
+	sourceVersion              uint64
+	sourceReloadRequest        uint64
+	sourceReloadCancel         context.CancelFunc
+	sourceStaleReason          string
+	pendingTrackerRefresh      *model.IssueOrigin
+	pendingExportSource        string
+	pendingExportSession       *editorSession
+	pendingExportDraft         string
+	bdRefreshCancel            context.CancelFunc
+	bdRefreshRequest           uint64
+	restoreBackgroundAfterEdit bool
 
 	// Workspace mode state
 	workspaceMode    bool            // True when viewing multiple repos
@@ -1715,6 +2110,15 @@ func (m *Model) quitCommand() tea.Cmd {
 	m.cancelHistoryLoad()
 	m.cancelPhase2Preparation()
 	m.cancelCassLookup()
+	if m.editorCancel != nil {
+		m.editorCancel()
+	}
+	if m.sourceReloadCancel != nil {
+		m.sourceReloadCancel()
+	}
+	if m.bdRefreshCancel != nil {
+		m.bdRefreshCancel()
+	}
 	return tea.Quit
 }
 
@@ -2375,18 +2779,58 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case brUpdateResultMsg:
-		m.brUpdateInFlight = false
-		if msg.err != nil {
-			m.statusMsg = fmt.Sprintf("❌ br update failed: %v", msg.err)
-			if msg.output != "" {
-				m.statusMsg += " — " + msg.output
-			}
-			m.statusIsError = true
-		} else {
-			m.statusMsg = fmt.Sprintf("✅ Updated %d field(s) for %s", msg.fieldCount, msg.issueID)
-			m.statusIsError = false
+		if msg.session == nil || msg.session != m.editorSession {
+			return m, nil
 		}
-		return m, nil
+		m.brUpdateInFlight = false
+		m.editorCancel = nil
+		m.editorSession = nil
+		if msg.session.sourceVersion != m.sourceVersion || msg.session.sourcePath != m.beadsPath {
+			// Cancellation can race with a successful tracker write. Keep the
+			// recovery document and leave the replacement source's data/freshness
+			// alone; this completion cannot refresh or approve the new source.
+			m.editorFailure("Source changed before save completion; inspect the original tracker before retrying", msg.tmpFile)
+			return m, nil
+		}
+		if msg.err != nil {
+			message := fmt.Sprintf("Tracker update failed: %v", msg.err)
+			if msg.output != "" {
+				message += " — " + msg.output
+			}
+			m.editorFailure(message, msg.tmpFile)
+			return m, nil
+		}
+		if msg.refreshErr != nil {
+			origin := *msg.session.issue.Origin
+			m.pendingTrackerRefresh = &origin
+			m.pendingExportSource = msg.session.sourcePath
+			m.pendingExportSession = msg.session
+			m.pendingExportDraft = msg.tmpFile
+			m.sourceStaleReason = fmt.Sprintf("Saved %s, but tracker export refresh failed: %v", msg.issueID, msg.refreshErr)
+			m.editorFailure(m.sourceStaleReason, msg.tmpFile)
+			return m, nil
+		}
+		_ = os.Remove(msg.tmpFile)
+		m.sourceStaleReason = fmt.Sprintf("Saved %s; refreshing the view", msg.issueID)
+		m.statusMsg = fmt.Sprintf("✅ Updated %d field(s) for %s; refreshing…", msg.fieldCount, msg.issueID)
+		m.statusIsError = false
+		return m, m.reloadAfterEdit()
+
+	case editorExportRefreshMsg:
+		if msg.origin != m.pendingTrackerRefresh || msg.sourceVersion != m.sourceVersion || msg.request != m.bdRefreshRequest {
+			return m, nil
+		}
+		m.bdRefreshCancel = nil
+		if msg.err != nil {
+			m.sourceStaleReason = fmt.Sprintf("Tracker export refresh failed: %v", msg.err)
+			m.editorFailure(m.sourceStaleReason, m.pendingExportDraft)
+			return m, nil
+		}
+		m.pendingTrackerRefresh = nil
+		m.pendingExportSession = nil
+		_ = os.Remove(m.pendingExportDraft)
+		m.pendingExportDraft = ""
+		return m, m.reloadAfterEdit()
 
 	case backgroundWorkerMsg:
 		if msg.worker == nil || m.backgroundWorker != msg.worker {
@@ -2490,81 +2934,67 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmd, m.pendingSemanticFilterCmd())
 
 	case editorExitMsg:
-		// Terminal editor exited — parse changes and apply via br update (bv-134)
-		defer os.Remove(msg.tmpFile)
 		if msg.err != nil {
-			m.statusMsg = fmt.Sprintf("❌ Editor exited with error: %v", msg.err)
-			m.statusIsError = true
+			m.editorFailure(fmt.Sprintf("Editor exited with error: %v", msg.err), msg.tmpFile)
 			return m, nil
 		}
 		editedBytes, err := os.ReadFile(msg.tmpFile)
 		if err != nil {
-			m.statusMsg = fmt.Sprintf("❌ Failed to read edited file: %v", err)
-			m.statusIsError = true
+			m.editorFailure(fmt.Sprintf("Failed to read edited file: %v", err), msg.tmpFile)
 			return m, nil
 		}
 		editedContent := string(editedBytes)
 		if editedContent == msg.original {
+			_ = os.Remove(msg.tmpFile)
+			if m.editorSession == msg.session {
+				m.editorSession = nil
+			}
 			m.statusMsg = "No changes made"
 			m.statusIsError = false
 			return m, nil
 		}
 
-		// Parse changed frontmatter fields
-		editedFields := parseIssueFrontmatter(editedContent)
-		// Find the original issue to compare against — if the issue was
-		// removed from the map while the editor was open (e.g., file reload),
-		// abort to avoid corrupting data by diffing against zero values.
-		var originalIssue model.Issue
-		if m.issueMap != nil {
-			if orig, ok := m.issueMap[msg.issueID]; ok {
-				originalIssue = *orig
-			} else {
-				m.statusMsg = fmt.Sprintf("❌ Issue %s no longer exists — changes not applied", msg.issueID)
-				m.statusIsError = true
-				return m, nil
-			}
-		} else {
-			m.statusMsg = "❌ Issue map not loaded — changes not applied"
-			m.statusIsError = true
+		if m.brUpdateInFlight {
+			m.editorFailure("Another tracker update is still running", msg.tmpFile)
 			return m, nil
+		}
+		if err := m.validateEditorSession(msg.session); err != nil {
+			m.editorFailure(err.Error(), msg.tmpFile)
+			return m, nil
+		}
+		// Changes are relative to the immutable document opened by this edit,
+		// never a row replaced by a background reload while the editor ran.
+		editedFields := parseIssueFrontmatter(editedContent)
+		originalFields := editorFields(msg.session.issue)
+		fields := make(map[string]string)
+		for _, key := range []string{"title", "status", "priority", "assignee", "type"} {
+			if value, ok := editedFields[key]; ok && value != originalFields[key] {
+				fields[key] = value
+			}
 		}
 
 		// Check for description (body) changes
 		editedBody := parseBodyFromFrontmatter(editedContent)
 		originalBody := parseBodyFromFrontmatter(msg.original)
 
-		var brArgs []string
-		if t, ok := editedFields["title"]; ok && t != originalIssue.Title {
-			brArgs = append(brArgs, "--title", t)
-		}
-		if s, ok := editedFields["status"]; ok && model.Status(s) != originalIssue.Status {
-			brArgs = append(brArgs, "--status", s)
-		}
-		if p, ok := editedFields["priority"]; ok && p != fmt.Sprintf("%d", originalIssue.Priority) {
-			brArgs = append(brArgs, "--priority", p)
-		}
-		if a, ok := editedFields["assignee"]; ok && a != originalIssue.Assignee {
-			brArgs = append(brArgs, "--assignee", a)
-		}
-		if t, ok := editedFields["type"]; ok && model.IssueType(t) != originalIssue.IssueType {
-			brArgs = append(brArgs, "--type", t)
-		}
 		if editedBody != originalBody {
-			brArgs = append(brArgs, "--description", editedBody)
+			fields["description"] = editedBody
 		}
 
-		if len(brArgs) == 0 {
+		if len(fields) == 0 {
+			_ = os.Remove(msg.tmpFile)
+			m.editorSession = nil
 			m.statusMsg = "No field changes detected"
 			m.statusIsError = false
 			return m, nil
 		}
 
-		fieldCount := len(brArgs) / 2
-		m.statusMsg = fmt.Sprintf("Updating %d field(s) for %s...", fieldCount, msg.issueID)
+		m.statusMsg = fmt.Sprintf("Updating %d field(s) for %s...", len(fields), msg.issueID)
 		m.statusIsError = false
 		m.brUpdateInFlight = true
-		return m, runBRUpdateCmd(msg.issueID, brArgs, fieldCount)
+		ctx, cancel := context.WithTimeout(context.Background(), brUpdateTimeout)
+		m.editorCancel = cancel
+		return m, runIssueUpdateCmd(ctx, cancel, msg.session, fields, msg.tmpFile)
 
 	case ReadyTimeoutMsg:
 		// bv-7wl7: Legacy fallback handler (no longer used).
@@ -3469,6 +3899,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case FileChangedMsg:
+		if m.pendingTrackerRefresh != nil {
+			return m, m.retryEditorExport()
+		}
+		if msg.source != nil {
+			if m.sourceReload == nil || msg.sourceVersion != m.sourceVersion || msg.request != m.sourceReloadRequest {
+				return m, nil
+			}
+			m.sourceReloadCancel = nil
+		} else if m.sourceReload != nil {
+			return m, m.sourceReloadCmd()
+		}
 		// File changed on disk - reload issues and recompute analysis
 		// In background mode the BackgroundWorker owns file watching and snapshot building.
 		if m.backgroundWorker != nil {
@@ -3477,7 +3918,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Batch(cmds...)
 		}
-		if m.beadsPath == "" {
+		if m.beadsPath == "" && msg.source == nil {
 			// Re-start watch for next change
 			if m.watcher != nil {
 				cmds = append(cmds, WatchFileCmd(m.watcher))
@@ -3520,23 +3961,45 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if profileRefresh {
 			loadStart = time.Now()
 		}
-		loadedIssues, err := loadIssuesForReload(m.beadsPath, loader.ParseOptions{
-			WarningHandler: func(msg string) {
-				reloadWarnings = append(reloadWarnings, msg)
-			},
-			BufferSize: envMaxLineSizeBytes(),
-		})
+		var loadedIssues reloadIssueData
+		var err error
+		if msg.source != nil {
+			err = msg.err
+			loadedIssues.Issues = issuesWithoutTombstones(msg.source.Issues)
+			loadedIssues.Authority = msg.source.Authority
+			if loadedIssues.Authority == nil {
+				loadedIssues.Authority = model.NewReadinessIndex(msg.source.Issues)
+			}
+			reloadWarnings = msg.source.Warnings
+		} else {
+			loadedIssues, err = loadIssuesForReload(m.beadsPath, loader.ParseOptions{
+				WarningHandler: func(msg string) {
+					reloadWarnings = append(reloadWarnings, msg)
+				},
+				BufferSize: envMaxLineSizeBytes(),
+			})
+		}
 		if profileRefresh {
 			recordTiming("load_issues", time.Since(loadStart))
 		}
 		if err != nil {
 			m.statusMsg = fmt.Sprintf("Reload error: %v", err)
+			m.sourceStaleReason = m.statusMsg
 			m.statusIsError = true
 			// Re-start watch for next change
 			if m.watcher != nil {
 				cmds = append(cmds, WatchFileCmd(m.watcher))
 			}
 			return m, tea.Batch(cmds...)
+		}
+		m.sourceStaleReason = ""
+		if msg.source != nil {
+			m.candidateIDs = maps.Clone(msg.source.CandidateIDs)
+			if msg.source.Workspace != nil {
+				activeRepos := m.activeRepos
+				m.EnableWorkspaceMode(*msg.source.Workspace)
+				m.activeRepos = activeRepos
+			}
 		}
 		// A synchronous reload after background mode stops must not retain the
 		// previous worker snapshot. Its later Phase 2 completion would otherwise
@@ -3839,7 +4302,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Auto-enable background mode after slow sync reloads (opt-out via BV_BACKGROUND_MODE=0).
 		autoEnabled := false
 		slowReload := reloadDuration >= time.Second
-		if slowReload && m.backgroundWorker == nil && m.beadsPath != "" {
+		if (slowReload || m.restoreBackgroundAfterEdit) && m.backgroundWorker == nil && m.beadsPath != "" {
 			autoAllowed := true
 			if v := strings.TrimSpace(env.BackgroundMode.Get()); v != "" {
 				switch strings.ToLower(v) {
@@ -3847,7 +4310,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					autoAllowed = false
 				}
 			}
-			if autoAllowed {
+			if autoAllowed || m.restoreBackgroundAfterEdit {
 				bw, err := NewBackgroundWorker(WorkerConfig{
 					BeadsPath:     m.beadsPath,
 					DebounceDelay: 200 * time.Millisecond,
@@ -3858,6 +4321,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.watcher = nil
 					m.installBackgroundWorker(bw)
+					m.restoreBackgroundAfterEdit = false
 					m.snapshotInitPending = true
 					autoEnabled = true
 					cmds = append(cmds, StartBackgroundWorkerCmd(m.backgroundWorker))
@@ -4246,6 +4710,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.statusMsg = "Refreshing…"
 			m.statusIsError = false
+			if m.pendingTrackerRefresh != nil {
+				return m, m.retryEditorExport()
+			}
 
 			if m.backgroundWorker != nil && m.backgroundWorker.State() != WorkerStopped {
 				m.backgroundWorker.HandleRefreshRequest(RefreshRequestMsg{Force: true})
@@ -4259,7 +4726,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.backgroundWorker = nil
 			}
 
-			if m.beadsPath == "" && m.watcher == nil {
+			if m.beadsPath == "" && m.watcher == nil && m.sourceReload == nil {
 				m.statusMsg = "Refresh unavailable"
 				m.statusIsError = true
 				return m, nil
@@ -7676,9 +8143,13 @@ func (m *Model) renderFooter() string {
 	// ══════════════════════════════════════════════════════════════════════════
 
 	// If there's a status message, show it prominently with polished styling
-	if m.statusMsg != "" {
+	statusMessage, statusError := m.statusMsg, m.statusIsError
+	if statusMessage == "" && m.sourceStaleReason != "" {
+		statusMessage, statusError = m.sourceStaleReason+"; Ctrl+R to retry", true
+	}
+	if statusMessage != "" {
 		var msgStyle lipgloss.Style
-		if m.statusIsError {
+		if statusError {
 			msgStyle = lipgloss.NewStyle().
 				Background(ColorPrioCriticalBg).
 				Foreground(ColorPrioCritical).
@@ -7692,10 +8163,10 @@ func (m *Model) renderFooter() string {
 				Padding(0, 2)
 		}
 		prefix := "✓ "
-		if m.statusIsError {
+		if statusError {
 			prefix = "✗ "
 		}
-		msgSection := msgStyle.Render(prefix + m.statusMsg)
+		msgSection := msgStyle.Render(prefix + statusMessage)
 		remaining := m.width - lipgloss.Width(msgSection)
 		if remaining < 0 {
 			remaining = 0
@@ -10505,27 +10976,8 @@ func startAllowlistedGUIEditor(kind allowlistedGUIEditorKind, targetFile string)
 // Uses m.beadsPath which respects issues.jsonl (canonical per beads upstream).
 func (m *Model) openInEditor() tea.Cmd {
 	if m.brUpdateInFlight {
-		m.statusMsg = "⏳ Finish the current br update before editing another issue"
+		m.statusMsg = "⏳ Finish the current tracker update before editing another issue"
 		m.statusIsError = false
-		return nil
-	}
-
-	// Use the configured beadsPath instead of hardcoded path
-	beadsFile := m.beadsPath
-	if beadsFile == "" {
-		cwd, _ := os.Getwd()
-		if found, err := loader.FindJSONLPath(filepath.Join(cwd, ".beads")); err == nil {
-			beadsFile = found
-		}
-	}
-	if beadsFile == "" {
-		m.statusMsg = "❌ No .beads directory or beads.jsonl found"
-		m.statusIsError = true
-		return nil
-	}
-	if _, err := os.Stat(beadsFile); os.IsNotExist(err) {
-		m.statusMsg = fmt.Sprintf("❌ Beads file not found: %s", beadsFile)
-		m.statusIsError = true
 		return nil
 	}
 
@@ -10565,6 +11017,14 @@ func (m *Model) openInEditor() tea.Cmd {
 				editor = ""
 			}
 		}
+	}
+	// GUI editors operate on a real text export, so require an explicit loaded
+	// JSONL with the same verified writable source. Never discover a different
+	// cwd project for historical/workspace views, or hand SQLite to a text editor.
+	beadsFile, err := m.guiEditorPath()
+	if err != nil {
+		m.editorFailure(err.Error(), "")
+		return nil
 	}
 
 	// If no editor set, try platform-specific GUI options
@@ -10624,7 +11084,26 @@ func (m *Model) launchTerminalEditor(editorArgs []string) tea.Cmd {
 		m.statusIsError = true
 		return nil
 	}
-	issue := issueItem.Issue
+	issue := issueItem.Issue.Clone()
+	if err := editorOriginError(issue.Origin); err != nil {
+		m.editorFailure(err.Error(), "")
+		return nil
+	}
+	if m.beadsPath == "" && m.sourceReload == nil {
+		m.editorFailure("live source cannot be reloaded after editing", "")
+		return nil
+	}
+	if len(editorArgs) == 0 {
+		m.editorFailure("No terminal editor configured", "")
+		return nil
+	}
+	session := &editorSession{issue: issue, sourcePath: m.beadsPath, sourceVersion: m.sourceVersion, reload: m.sourceReload}
+	m.editorSession = session
+	if err := m.validateEditorSession(session); err != nil {
+		m.editorSession = nil
+		m.editorFailure(err.Error(), "")
+		return nil
+	}
 
 	// Export the issue as frontmatter markdown
 	content := exportIssueFrontmatter(issue)
@@ -10643,10 +11122,13 @@ func (m *Model) launchTerminalEditor(editorArgs []string) tea.Cmd {
 		m.statusIsError = true
 		return nil
 	}
-	tmpFile.Close()
+	if err := tmpFile.Close(); err != nil {
+		m.editorFailure(fmt.Sprintf("Failed to close editor draft: %v", err), tmpFile.Name())
+		return nil
+	}
 
 	// Build the editor command: editorArgs[0] is the binary, rest are flags, then the file
-	cmdArgs := append(editorArgs[1:], tmpFile.Name())
+	cmdArgs := append(append([]string(nil), editorArgs[1:]...), tmpFile.Name())
 	editorCmd := exec.Command(editorArgs[0], cmdArgs...)
 	editorCmd.Stdin = os.Stdin
 	editorCmd.Stdout = os.Stdout
@@ -10664,9 +11146,48 @@ func (m *Model) launchTerminalEditor(editorArgs []string) tea.Cmd {
 			issueID:  issueID,
 			tmpFile:  tmpPath,
 			original: originalContent,
+			session:  session,
 			err:      err,
 		}
 	})
+}
+
+func (m *Model) guiEditorPath() (string, error) {
+	if m.beadsPath == "" || !strings.EqualFold(filepath.Ext(m.beadsPath), ".jsonl") {
+		return "", fmt.Errorf("no live JSONL text source; use a terminal $EDITOR for a verified live issue (historical views are read-only)")
+	}
+	selected, ok := m.list.SelectedItem().(IssueItem)
+	if !ok {
+		return "", fmt.Errorf("no issue selected with a verified live source")
+	}
+	current := m.issueMap[selected.Issue.ID]
+	if current == nil {
+		return "", fmt.Errorf("selected issue is no longer loaded")
+	}
+	if err := editorOriginError(current.Origin); err != nil {
+		return "", err
+	}
+	if m.sourceStaleReason != "" {
+		return "", fmt.Errorf("source needs a successful refresh before editing")
+	}
+	path, err := filepath.Abs(m.beadsPath)
+	if err == nil {
+		path, err = filepath.EvalSymlinks(path)
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve live JSONL: %w", err)
+	}
+	if filepath.Dir(path) != current.Origin.TrackerDirectory {
+		return "", fmt.Errorf("JSONL does not belong to the selected tracker; use a terminal $EDITOR")
+	}
+	if err := loader.RevalidateIssueOrigin(path, *current.Origin); err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("live JSONL is not a readable regular file")
+	}
+	return path, nil
 }
 
 // exportIssueFrontmatter renders an issue as a markdown document with YAML frontmatter.
@@ -10800,6 +11321,18 @@ func (m *Model) Stop() {
 	m.cancelHistoryLoad()
 	m.cancelPhase2Preparation()
 	m.cancelCassLookup()
+	if m.editorCancel != nil {
+		m.editorCancel()
+		m.editorCancel = nil
+	}
+	if m.sourceReloadCancel != nil {
+		m.sourceReloadCancel()
+		m.sourceReloadCancel = nil
+	}
+	if m.bdRefreshCancel != nil {
+		m.bdRefreshCancel()
+		m.bdRefreshCancel = nil
+	}
 	if m.backgroundWorker != nil {
 		m.backgroundWorker.Stop()
 	}

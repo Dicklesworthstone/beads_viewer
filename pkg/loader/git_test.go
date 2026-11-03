@@ -413,6 +413,8 @@ func TestWithoutBeadsAuthorityEnvIsCaseInsensitive(t *testing.T) {
 		"PATH=/bin",
 		"beads_dir=/wrong",
 		"BeAdS_Db=/wrong.db",
+		"Bd_dB=/also-wrong.db",
+		"Beads_Jsonl=/wrong.jsonl",
 		"KEEP=value",
 	})
 	want := []string{"PATH=/bin", "KEEP=value"}

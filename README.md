@@ -193,6 +193,20 @@ Don't just read the title. `bv` gives you the full picture:
 *   **Edit:** Press `O` to open the loaded source in a GUI editor, or edit the focused issue's frontmatter in a terminal editor while the TUI is suspended.
 *   **Time-Travel:** Press `t` to compare against any git revision, or `T` for quick HEAD~5 comparison. Combined with History view (`h`), you can navigate to any commit and see exactly what changed.
 
+Terminal editor saves require a verified writable `br` or `bd` source. They
+use the issue's original tracker ID and database, including in workspaces,
+and recheck the source and live issue before writing. Historical, imported,
+and incomplete sources remain read-only. If the source or issue changed while
+you edited, the save is refused and the draft is retained with its path shown.
+This conflict check does not reserve the issue against another concurrent writer.
+
+After a save, `bv` reloads the view. For JSONL-backed views it explicitly
+refreshes the tracker export, even when `br` automatic export is disabled.
+If export refresh fails after the database write, the status explains that the
+save succeeded but the view is stale, and `Ctrl+R` retries the export. GUI editing
+requires an explicitly loaded live JSONL file; use a terminal `$EDITOR` for
+SQLite or aggregated workspace views.
+
 ### 🔌 Automation Hooks
 
 Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, notifications, or uploads. **Project hooks require explicit approval by the invoking user.** Report exports (`--export` / `--export-md`) and direct Pages exports (`--export-pages`) fail before running hooks or writing the export when configured hooks have not been approved. Projects without hooks export normally. To export without running any project hooks, pass `--no-hooks`; this also bypasses hook configuration parsing, so it works with invalid YAML.

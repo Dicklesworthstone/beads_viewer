@@ -20,6 +20,9 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if runEditorTrackerTestProcess() {
+		return
+	}
 	// Editor dispatch tests execute a copy of this test binary under an
 	// allowlisted editor name. Capture the actual argv without opening a GUI;
 	// no platform shell or GUI program is required. Check the executable name

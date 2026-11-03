@@ -20,6 +20,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 	flag "github.com/spf13/pflag"
 )
 
@@ -2945,6 +2946,137 @@ func TestScopeLoadedIssuesKeepsFullSourceMetricContext(t *testing.T) {
 	}
 	if len(empty.Issues) != 0 || len(empty.CandidateIDs) != 0 || empty.LabelContext != nil {
 		t.Fatalf("empty reload retained old scope: %+v", empty)
+	}
+}
+
+func TestWorkspaceUIReloadPreservesScopeAndRefreshesAuthority(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, ".bv", "workspace.yaml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeConfig := func(webPath string) {
+		t.Helper()
+		config := fmt.Sprintf("repos:\n  - path: api\n    prefix: api-\n  - path: %s\n    prefix: web-\n", webPath)
+		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeIssues := func(repo string, issues []model.Issue, corrupt bool) {
+		t.Helper()
+		path := filepath.Join(root, repo, ".beads", "issues.jsonl")
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		var data bytes.Buffer
+		for _, issue := range issues {
+			if issue.IssueType == "" {
+				issue.IssueType = model.TypeTask
+			}
+			if err := json.NewEncoder(&data).Encode(issue); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if corrupt {
+			data.WriteString("{invalid\n")
+		}
+		if err := os.WriteFile(path, data.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	api := []model.Issue{
+		{ID: "blocked", Title: "External prerequisite", Status: model.StatusOpen, Labels: []string{"focus"},
+			Dependencies: []*model.Dependency{{IssueID: "blocked", DependsOnID: "web-gate", Type: model.DepBlocks}}},
+		{ID: "ready", Title: "Resolved prerequisites", Status: model.StatusOpen, Labels: []string{"focus"},
+			Dependencies: []*model.Dependency{
+				{IssueID: "ready", DependsOnID: "gone", Type: model.DepBlocks},
+				{IssueID: "ready", DependsOnID: "context", Type: model.DepBlocks},
+			}},
+		{ID: "context", Title: "Label neighbor", Status: model.StatusClosed},
+		{ID: "outside", Title: "Outside label scope", Status: model.StatusOpen},
+		{ID: "gone", Title: "Deleted prerequisite", Status: model.StatusTombstone},
+	}
+	web := []model.Issue{{ID: "gate", Title: "Hidden repository prerequisite", Status: model.StatusOpen}}
+	writeConfig("web")
+	writeIssues("api", api, false)
+	writeIssues("web", web, false)
+	// Process-wide selectors must not override an explicitly configured source.
+	t.Setenv("BEADS_DIR", filepath.Join(root, "unrelated", ".beads"))
+	t.Setenv("BEADS_DB", filepath.Join(root, "unrelated", "beads.db"))
+	reload := func() ui.SourceReloadResult {
+		t.Helper()
+		got, err := reloadWorkspaceForUI(context.Background(), configPath, "focus", "api")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	got := reload()
+	if len(got.Issues) != 3 || !reflect.DeepEqual(got.CandidateIDs, map[string]bool{"api-blocked": true, "api-ready": true}) {
+		t.Fatalf("CLI repo/label scope or label context changed on reload: %+v", got)
+	}
+	for _, issue := range got.Issues {
+		if issue.SourceRepo != "api" || issue.Origin == nil || issue.Origin.LocalID != strings.TrimPrefix(issue.ID, "api-") {
+			t.Fatalf("reload lost source-local identity: %+v", issue)
+		}
+	}
+	if got.Authority.Ready("api-blocked", time.Now()) || !got.Authority.Ready("api-ready", time.Now()) {
+		t.Fatal("filtered reload lost hidden cross-repository blockers or resolved tombstones")
+	}
+	if got.Workspace == nil || !got.Workspace.Enabled || got.Workspace.RepoCount != 2 || got.Workspace.FailedCount != 0 || got.Workspace.TotalIssues != 5 {
+		t.Fatalf("workspace summary differs from full source: %+v", got.Workspace)
+	}
+	web[0].Status = model.StatusClosed
+	writeIssues("web", web, false)
+	got = reload()
+	if !got.Authority.Ready("api-blocked", time.Now()) {
+		t.Fatal("refresh retained the old state of a hidden repository prerequisite")
+	}
+	api[1].Labels = nil
+	api = append(api, model.Issue{ID: "new", Title: "New selected issue", Status: model.StatusOpen, Labels: []string{"focus"}})
+	writeIssues("api", api, false)
+	got = reload()
+	if !reflect.DeepEqual(got.CandidateIDs, map[string]bool{"api-blocked": true, "api-new": true}) {
+		t.Fatalf("reload retained stale label membership: %+v", got.CandidateIDs)
+	}
+	writeConfig("missing")
+	got = reload()
+	if got.Workspace.FailedCount != 1 || len(got.Warnings) == 0 || got.Authority.DependencyState("api-blocked") != model.DependenciesUnknown {
+		t.Fatalf("partial reload concealed missing authority: %+v", got)
+	}
+	for _, issue := range got.Issues {
+		if issue.Origin == nil || issue.Origin.ReadOnlyReason != "source authority is incomplete or stale" {
+			t.Fatalf("partial workspace retained writable source authority: %+v", issue.Origin)
+		}
+	}
+	writeConfig("web")
+	writeIssues("api", api, true)
+	got = reload()
+	if len(got.Warnings) == 0 || got.Workspace.FailedCount != 0 || len(got.Issues) == 0 {
+		t.Fatalf("parse loss did not preserve useful data and diagnostics: %+v", got)
+	}
+	for _, issue := range got.Issues {
+		if issue.Origin.ReadOnlyReason != "source authority is incomplete or stale" {
+			t.Fatal("parse loss retained writable source authority")
+		}
+	}
+	writeIssues("api", api, false)
+	empty, err := reloadWorkspaceForUI(context.Background(), configPath, "no-such-label", "api")
+	if err != nil || len(empty.Issues) != 0 || empty.CandidateIDs == nil || len(empty.CandidateIDs) != 0 || empty.Authority == nil {
+		t.Fatalf("successful empty selection was confused with a failed source: %+v, %v", empty, err)
+	}
+	if err := os.WriteFile(configPath, []byte("repos:\n  - path: nonexistent\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := reloadWorkspaceForUI(context.Background(), configPath, "focus", "api")
+	if err == nil || failed.Issues != nil || failed.Authority != nil || failed.Workspace != nil {
+		t.Fatalf("failed workspace reload claimed to be a fresh empty source: %+v, %v", failed, err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	failed, err = reloadWorkspaceForUI(cancelled, configPath, "focus", "api")
+	if err != context.Canceled || failed.Authority != nil || failed.Issues != nil {
+		t.Fatalf("cancelled reload returned source authority: %+v, %v", failed, err)
 	}
 }
 

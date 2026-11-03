@@ -155,6 +155,34 @@ func AttachIssueOrigins(issues []model.Issue, sourcePath string, complete bool) 
 }
 
 func resolveIssueOrigin(sourcePath string) model.IssueOrigin {
+	return resolveIssueOriginWithCapabilities(sourcePath, installedTrackerCapabilities)
+}
+
+// RevalidateIssueOrigin checks that an already selected native route still
+// belongs to the same live source. Metadata may change while a terminal editor
+// suspends the viewer. Preserve the captured executable and capabilities rather
+// than discovering (and probing) a different program through a changed PATH.
+func RevalidateIssueOrigin(sourcePath string, expected model.IssueOrigin) error {
+	if expected.ReadOnlyReason != "" || expected.Executable == "" {
+		return fmt.Errorf("source has no writable captured tracker route")
+	}
+	current := resolveIssueOriginWithCapabilities(sourcePath, func(tracker string) trackerCapabilities {
+		if tracker != expected.Tracker {
+			return trackerCapabilities{Error: "source tracker changed while editing"}
+		}
+		return trackerCapabilities{Executable: expected.Executable, Claim: expected.SupportsClaim}
+	})
+	current.LocalID = expected.LocalID
+	if current.ReadOnlyReason != "" {
+		return fmt.Errorf("source route cannot be revalidated: %s", current.ReadOnlyReason)
+	}
+	if current != expected {
+		return fmt.Errorf("source tracker route changed while editing")
+	}
+	return nil
+}
+
+func resolveIssueOriginWithCapabilities(sourcePath string, capabilities func(string) trackerCapabilities) model.IssueOrigin {
 	origin := model.IssueOrigin{}
 	refuse := func(reason string) model.IssueOrigin {
 		origin.ReadOnlyReason = reason
@@ -215,7 +243,7 @@ func resolveIssueOrigin(sourcePath string) model.IssueOrigin {
 		}
 		origin.Database = database
 	}
-	caps := installedTrackerCapabilities(origin.Tracker)
+	caps := capabilities(origin.Tracker)
 	if caps.Error != "" {
 		return refuse(caps.Error)
 	}
@@ -592,6 +620,39 @@ func exportBDIssuesJSONLContext(ctx context.Context, beadsDir, issuesPath string
 	if err != nil {
 		return fmt.Errorf("resolve bd export path %s: %w", issuesPath, err)
 	}
+	return exportBDIssuesJSONLWithRoute(ctx, absBeadsDir, absIssuesPath, func(stagedPath string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, executable, "export", "-o", stagedPath)
+		cmd.Dir = filepath.Dir(absBeadsDir)
+		cmd.Env = append(withoutBeadsAuthorityEnv(os.Environ()), BeadsDirEnvVar+"="+absBeadsDir)
+		return cmd
+	})
+}
+
+// RefreshBDExport refreshes the compatibility file after a mutation through a
+// captured live tracker route. It never resolves another bd from the current
+// PATH, and shares the validated atomic publication used by ordinary refreshes.
+func RefreshBDExport(ctx context.Context, origin model.IssueOrigin) error {
+	if origin.Tracker != "bd" || origin.ReadOnlyReason != "" ||
+		!filepath.IsAbs(origin.Executable) || !filepath.IsAbs(origin.WorkingDirectory) ||
+		!filepath.IsAbs(origin.TrackerDirectory) || !filepath.IsAbs(origin.Database) {
+		return fmt.Errorf("bd refresh requires a verified writable absolute tracker route")
+	}
+	ctx, cancel := context.WithTimeout(ctx, bdExportTimeout)
+	defer cancel()
+	path := filepath.Join(origin.TrackerDirectory, "issues.jsonl")
+	return exportBDIssuesJSONLWithRoute(ctx, origin.TrackerDirectory, path, func(stagedPath string) *exec.Cmd {
+		cmd := exec.CommandContext(ctx, origin.Executable, "--db", origin.Database, "export", "-o", stagedPath)
+		cmd.Dir = origin.WorkingDirectory
+		cmd.Env = append(withoutBeadsAuthorityEnv(os.Environ()),
+			BeadsDirEnvVar+"="+origin.TrackerDirectory, BeadsDBEnvVar+"="+origin.Database, "BD_DB="+origin.Database)
+		return cmd
+	})
+}
+
+func exportBDIssuesJSONLWithRoute(ctx context.Context, absBeadsDir, absIssuesPath string, command func(string) *exec.Cmd) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Keep incomplete exports private and on the same filesystem as the final
 	// JSONL. A separate directory also accommodates bd's own atomic writer.
@@ -601,10 +662,7 @@ func exportBDIssuesJSONLContext(ctx context.Context, beadsDir, issuesPath string
 	}
 	defer func() { _ = os.RemoveAll(stageDir) }()
 	stagedPath := filepath.Join(stageDir, "issues.jsonl")
-	cmd := exec.CommandContext(ctx, executable, "export", "-o", stagedPath)
-	cmd.Dir = filepath.Dir(absBeadsDir)
-	env := withoutBeadsAuthorityEnv(os.Environ())
-	cmd.Env = append(env, fmt.Sprintf("%s=%s", BeadsDirEnvVar, absBeadsDir))
+	cmd := command(stagedPath)
 	stdout, stderr, err := runTrackerCommand(ctx, cmd, trackerExportOutputLimit)
 	if err != nil {
 		diagnostic := ""
@@ -755,7 +813,7 @@ func withoutBeadsAuthorityEnv(entries []string) []string {
 	env := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		key, _, _ := strings.Cut(entry, "=")
-		if strings.EqualFold(key, BeadsDirEnvVar) || strings.EqualFold(key, BeadsDBEnvVar) {
+		if strings.EqualFold(key, BeadsDirEnvVar) || strings.EqualFold(key, BeadsDBEnvVar) || strings.EqualFold(key, "BD_DB") || strings.EqualFold(key, "BEADS_JSONL") {
 			continue
 		}
 		env = append(env, entry)

@@ -78,6 +78,9 @@ func loadIssuesForReloadContext(ctx context.Context, path string, opts loader.Pa
 	if err != nil {
 		return reloadIssueData{}, err
 	}
+	report := reader.LoadReport()
+	complete := report.Errors == 0 && report.ReadErrors == 0 && !report.Stale && len(report.AuthorityWarnings) == 0
+	loader.AttachIssueOrigins(issues, path, complete)
 	// Build authority before hiding satisfied tombstones or recipe-filtered
 	// blockers. The read transaction is already closed before graph work.
 	result := reloadIssueData{

@@ -2748,7 +2748,8 @@ func main() {
 					}
 				}
 			}
-			// No live reload for workspace mode (multiple files)
+			// The workspace reload callback below reloads all configured sources;
+			// no single-file watcher can represent this aggregate authority.
 			beadsPath = ""
 
 			// Automatically ensure .bv/ is git-ignored at the workspace root
@@ -4362,6 +4363,14 @@ func main() {
 				TotalIssues:  workspaceInfo.TotalIssues,
 				RepoPrefixes: workspaceInfo.RepoPrefixes,
 			})
+			reloadPath, pathErr := filepath.Abs(*workspaceConfig)
+			reloadLabel, reloadRepo := *labelScope, *repoFilter
+			m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
+				if pathErr != nil {
+					return ui.SourceReloadResult{}, fmt.Errorf("resolve workspace reload path: %w", pathErr)
+				}
+				return reloadWorkspaceForUI(ctx, reloadPath, reloadLabel, reloadRepo)
+			})
 		}
 
 		// Debug render mode - output a view to file and exit
@@ -4771,6 +4780,68 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 		}
 	}
 	return ctx, nil
+}
+
+// reloadWorkspaceForUI repeats startup source loading and CLI scoping without
+// printing into the terminal while Bubble Tea is rendering. The recipe remains
+// a UI selection, so its picker can still reach all rows in the CLI scope.
+func reloadWorkspaceForUI(ctx context.Context, configPath, label, repo string) (ui.SourceReloadResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ui.SourceReloadResult{}, err
+	}
+	config, err := workspace.LoadConfig(configPath)
+	if err != nil {
+		return ui.SourceReloadResult{}, fmt.Errorf("reload workspace config: %w", err)
+	}
+	aggregate := workspace.NewAggregateLoader(config, filepath.Dir(filepath.Dir(configPath)))
+	aggregate.SetLogger(nil)
+	issues, results, err := aggregate.LoadAll(ctx)
+	if err != nil {
+		return ui.SourceReloadResult{}, fmt.Errorf("reload workspace: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return ui.SourceReloadResult{}, err
+	}
+	authority := robotWorkspaceAuthority(results)
+	var warnings, tombstoneIDs []string
+	for _, source := range authority.Sources {
+		if source.Error != "" {
+			warnings = append(warnings, boundedSourceMessage(source.Name+": "+source.Error))
+		}
+		for _, warning := range source.Warnings {
+			warnings = append(warnings, boundedSourceMessage(source.Name+": "+warning))
+		}
+	}
+	if !authority.ClaimSafe {
+		for i := range issues {
+			if issues[i].Origin != nil {
+				issues[i].Origin.ReadOnlyReason = "source authority is incomplete or stale"
+			}
+		}
+	}
+	for _, result := range results {
+		if result.Error == nil {
+			tombstoneIDs = append(tombstoneIDs, result.TombstoneIDs...)
+		}
+	}
+	readiness := model.NewReadinessIndex(issuesWithTombstones(issues, tombstoneIDs))
+	scoped, err := scopeLoadedIssues(RobotContext{
+		Issues: issues, Readiness: readiness, LabelScope: label, Repo: repo,
+	}, nil)
+	if err != nil {
+		return ui.SourceReloadResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return ui.SourceReloadResult{}, err
+	}
+	summary := workspace.Summarize(results)
+	return ui.SourceReloadResult{
+		Issues: scoped.Issues, Authority: readiness, CandidateIDs: scoped.CandidateIDs, Warnings: warnings,
+		Workspace: &ui.WorkspaceInfo{
+			Enabled: true, RepoCount: summary.TotalRepos, FailedCount: summary.FailedRepos,
+			TotalIssues: summary.TotalIssues, RepoPrefixes: summary.RepoPrefixes,
+		},
+	}, nil
 }
 
 // applyRecipe is the CLI's entry point into the shared recipe engine

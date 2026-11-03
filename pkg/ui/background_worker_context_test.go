@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -189,5 +190,36 @@ INSERT INTO dependencies VALUES ('job', 'blocker', 'blocks');`); err != nil {
 				t.Fatalf("worker read retained WAL reader mark: busy=%d, %v", busy, err)
 			}
 		})
+	}
+}
+
+func TestSQLiteReloadRetainsVerifiedMutationOrigin(t *testing.T) {
+	issue, _, _ := installEditorTracker(t, "br")
+	path := issue.Origin.Database
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, status TEXT, priority INTEGER, issue_type TEXT);
+INSERT INTO issues VALUES ('local-1', 'Live SQLite issue', 'open', 2, 'task');`); err != nil {
+		t.Fatal(err)
+	}
+	for _, async := range []bool{false, true} {
+		var loaded reloadIssueData
+		if async {
+			loaded, err = loadIssuesForReloadContext(context.Background(), path, loader.ParseOptions{})
+		} else {
+			loaded, err = loadIssuesForReload(path, loader.ParseOptions{})
+		}
+		if err != nil || len(loaded.Issues) != 1 || editorOriginError(loaded.Issues[0].Origin) != nil {
+			t.Fatalf("SQLite reload dropped mutation authority (async=%t): err=%v issues=%+v", async, err, loaded.Issues)
+		}
+		if *loaded.Issues[0].Origin != *issue.Origin {
+			t.Fatalf("SQLite reload changed source route (async=%t): got=%+v want=%+v", async, loaded.Issues[0].Origin, issue.Origin)
+		}
 	}
 }
