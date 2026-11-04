@@ -319,8 +319,19 @@ def verify_binary_audit(record, info, value):
             record.get("go_flags") != value["toolchain"]["GOFLAGS"] or
             record.get("tool") != value["source_audit"]["tool"]):
         fail("binary vulnerability evidence differs from archived binary or gate environment")
-    if digest(outside(record["path"])) != record["sha256"]:
+    log_path = outside(record["path"])
+    if digest(log_path) != record["sha256"]:
         fail(f"binary vulnerability evidence changed: {record['path']}")
+    # The receipt's success field must agree with the actual scanner transcript.
+    # Otherwise changing only the receipt could turn a recorded finding/error
+    # into a successful scan without modifying the evidence log.
+    log = log_path.read_bytes()
+    expected_header = (json.dumps({key: record[key] for key in (
+        "mode", "format", "database", "started_at", "tool", "command",
+        "binary_sha256", "goos", "goarch", "go_version", "cgo_enabled",
+        "go_flags")}, sort_keys=True) + "\n").encode()
+    if not log.startswith(expected_header) or not log.endswith(b"\ngovulncheck exit status: 0\n"):
+        fail("binary vulnerability transcript does not match successful scan metadata")
 
 def verify_source(value):
     if value.get("schema") != 1 or value.get("eligible") is not True:

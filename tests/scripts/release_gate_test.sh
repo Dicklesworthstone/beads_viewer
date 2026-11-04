@@ -494,6 +494,21 @@ PY
 reject no-binary-audit 'unsuccessful binary vulnerability evidence' env RELEASE_GATE_RECEIPT="$tmp/no-binary-audit.json" bash "$fixture/scripts/release_gate.sh" verify
 reject wrong-binary-audit 'differs from archived binary' env RELEASE_GATE_RECEIPT="$tmp/wrong-binary-audit.json" bash "$fixture/scripts/release_gate.sh" verify
 reject changed-binary-audit 'binary vulnerability evidence changed' env RELEASE_GATE_RECEIPT="$tmp/changed-binary-audit.json" bash "$fixture/scripts/release_gate.sh" verify
+# A forged success flag cannot override a scanner transcript that records a
+# nonzero result, even if the transcript hash is recomputed in the receipt.
+python3 - "$receipt" "$tmp/forged-binary-success.json" "$tmp/forged-binary-scan.log" <<'PY'
+import hashlib, json, pathlib, sys
+r = json.load(open(sys.argv[1]))
+audit = r['artifacts'][0]['binary_audit']
+original = pathlib.Path(audit['path']).read_bytes()
+assert original.endswith(b'\ngovulncheck exit status: 0\n')
+log = pathlib.Path(sys.argv[3])
+log.write_bytes(original[:-len(b'govulncheck exit status: 0\n')] + b'govulncheck exit status: 3\n')
+audit['path'] = str(log)
+audit['sha256'] = hashlib.sha256(log.read_bytes()).hexdigest()
+json.dump(r, open(sys.argv[2], 'w'))
+PY
+reject forged-binary-success 'transcript does not match successful scan metadata' env RELEASE_GATE_RECEIPT="$tmp/forged-binary-success.json" bash "$fixture/scripts/release_gate.sh" verify
 
 # Keep five rows in these controls: completeness requires the exact target set,
 # and each scan's target must agree with the binary metadata it accompanies.
