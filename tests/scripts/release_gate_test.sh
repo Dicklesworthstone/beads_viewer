@@ -512,15 +512,27 @@ reject forged-binary-success 'transcript does not match successful scan metadata
 
 # Keep five rows in these controls: completeness requires the exact target set,
 # and each scan's target must agree with the binary metadata it accompanies.
-python3 - "$receipt" "$tmp/duplicate-artifact-target.json" "$tmp/unsupported-artifact-target.json" "$tmp/mismatched-audit-target.json" <<'PY'
-import copy, json, sys
+python3 - "$receipt" "$tmp/duplicate-artifact-target.json" \
+  "$tmp/unsupported-artifact-target.json" "$tmp/mismatched-audit-target.json" \
+  "$tmp/unsupported-target-scan.log" <<'PY'
+import copy, hashlib, json, pathlib, sys
 original = json.load(open(sys.argv[1]))
 duplicate = copy.deepcopy(original)
 duplicate['artifacts'][1] = copy.deepcopy(duplicate['artifacts'][0])
 json.dump(duplicate, open(sys.argv[2], 'w'))
 unsupported = copy.deepcopy(original)
 unsupported['artifacts'][0]['binary']['settings']['GOOS'] = 'freebsd'
-unsupported['artifacts'][0]['binary_audit']['goos'] = 'freebsd'
+audit = unsupported['artifacts'][0]['binary_audit']
+audit['goos'] = 'freebsd'
+# Keep this copied fixture transcript consistent with its edited metadata so
+# the control reaches the distinct target-inventory rejection it exercises.
+header, body = pathlib.Path(audit['path']).read_bytes().split(b'\n', 1)
+metadata = json.loads(header)
+metadata['goos'] = 'freebsd'
+log = pathlib.Path(sys.argv[5])
+log.write_bytes((json.dumps(metadata, sort_keys=True) + '\n').encode() + body)
+audit['path'] = str(log)
+audit['sha256'] = hashlib.sha256(log.read_bytes()).hexdigest()
 json.dump(unsupported, open(sys.argv[3], 'w'))
 mismatched = copy.deepcopy(original)
 mismatched['artifacts'][0]['binary_audit']['goos'] = 'freebsd'
