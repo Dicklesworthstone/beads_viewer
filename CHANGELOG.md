@@ -34,6 +34,52 @@ the latest tag, including installer changes usable with already released binarie
 
 ---
 
+## Unreleased — v0.26.1 security-update candidate
+
+This section describes the proposed update after `v0.26.0`; it does not
+establish a published release or a passing release receipt.
+
+### Security build dependencies and release checks
+
+- Address [#215](https://github.com/Dicklesworthstone/beads_viewer/issues/215)
+  by requiring Go **1.26.10** and upgrading `golang.org/x/net` from v0.59.0
+  to **v0.62.0**. Go's module resolver also selects `x/sync` v0.24.0,
+  `x/sys` v0.49.0, `x/term` v0.47.0 and `x/text` v0.43.0. Regenerate the
+  affected Go vendor sources and checksums so offline builds use those versions.
+- Select the compiler explicitly from `go.mod` in the retained DSR/`act`
+  workflow inputs, disable automatic switching in release builds, and reject
+  a compiler that differs from the approved pin. The Nix package and shell
+  select Go 1.26.10 without changing the supported platform set.
+- Require pinned source-mode `govulncheck` analysis for all five release
+  targets. Bind the scanner and successful scan logs to the existing release
+  receipt. Verify each packaged executable's compiler and linked dependency
+  versions in addition to its revision, clean-source flag and checksums.
+  Reject ambient build flags that could supply external source or module
+  inputs outside that receipt.
+- Keep publication separate from packaging. Archive names, target matrix,
+  `CGO_ENABLED=0`, `checksums.txt`, and Homebrew/Scoop compatibility remain
+  unchanged. Source installers verify the compiled toolchain before installation.
+
+The fixes cover the reported certificate-trust, standard-library and HTML
+parser/renderer advisories at their upstream fixed versions. The original
+binary-mode report identifies linked symbols; it does not demonstrate that
+every reported vulnerability has an exploitable execution path in bv.
+
+### Changes already on main after v0.26.0
+
+- Hooks require explicit digest approval and credential grants, support
+  approved direct argument-vector execution, and enforce process/output limits.
+- The updater respects credential denial, confines credentials to secure
+  GitHub origins and redirects, and bounds version-probe output.
+- History matching recognizes lowercase references and scopes cached results
+  to the matcher policy. Tracker refreshes are bounded and preserve validated
+  snapshots.
+- Exports require authorization for recipe template reads, confine output
+  writes, and follow the loaded workspace in watch mode. Preview serving
+  restricts origins and retains the selected directory.
+- Editor saves are bound to a verified tracker and source session, preserving
+  drafts on failure and checking authority again before writes and refreshes.
+
 ## v0.26.0 — 2026-11-02
 
 ### Fixes: live SQLite trackers

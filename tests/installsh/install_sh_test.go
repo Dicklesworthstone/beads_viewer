@@ -173,6 +173,89 @@ func TestVersionGE(t *testing.T) {
 	}
 }
 
+func TestSourceToolchainSecurityFloor(t *testing.T) {
+	cases := []struct {
+		name, module, want string
+	}{
+		{"go directive", "go 1.26.10\n", "go1.26.10\n"},
+		{"toolchain directive", "go 1.26.0\ntoolchain go1.26.10\n", "go1.26.10\n"},
+		{"older source tag", "go 1.26.0\ntoolchain go1.26.8\n", "go1.26.10\n"},
+		{"older language version", "go 1.25\n", "go1.26.10\n"},
+		{"vulnerable newer branch", "go 1.27.0\ntoolchain go1.27.2\n", "go1.27.3\n"},
+		{"patched newer branch", "go 1.27.3\n", "go1.27.3\n"},
+		{"missing", "module example.test/missing\n", ""},
+		{"development compiler", "go 1.26.0\ntoolchain go1.27rc1\n", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			module := filepath.Join(t.TempDir(), "go.mod")
+			if err := os.WriteFile(module, []byte(tc.module), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			out, stderr, code := runInstallFunc(t, []string{"MODULE_FIXTURE=" + module}, "", `source_toolchain "$MODULE_FIXTURE"`, "")
+			if tc.want == "" {
+				if code == 0 {
+					t.Fatalf("invalid compiler declaration accepted: %q", out)
+				}
+			} else if code != 0 || out != tc.want {
+				t.Fatalf("got (%q, exit %d), want %q; stderr=%s", out, code, tc.want, stderr)
+			}
+		})
+	}
+}
+
+// Exercise the production source installer's promotion boundary with controlled
+// compiler metadata. A reported old/missing compiler must preserve an installed
+// binary, even when compilation itself returned success.
+func TestSourceInstallVerifiesBuiltToolchain(t *testing.T) {
+	for _, builtGo := range []string{"go1.26.10", "go1.26.8", "go1.27.2", ""} {
+		t.Run("metadata="+builtGo, func(t *testing.T) {
+			dir := t.TempDir()
+			buildDir := filepath.Join(dir, "build with spaces")
+			installDir := filepath.Join(dir, "install with spaces")
+			for _, path := range []string{buildDir, installDir} {
+				if err := os.MkdirAll(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			installed := filepath.Join(installDir, "bv")
+			if err := os.WriteFile(installed, []byte("existing installation\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			setup := `
+ensure_go() { printf '1.26.10'; }
+make_tmp_dir() { printf '%s\n' "$BUILD_FIXTURE"; }
+git() { mkdir -p "$5"; printf 'module example.test/bv\ngo 1.26.10\n' > "$5/go.mod"; }
+go() {
+    if [ "$1" = version ] && [ "$2" = -m ]; then
+        printf '%s: %s\n' "$3" "$BUILT_GO"
+        return 0
+    fi
+    [ "$1" = build ] || return 93
+    [ "$GOTOOLCHAIN" = go1.26.10 ] || return 94
+    [ "$GOWORK" = off ] || return 95
+    [ "$2" = -o ] || return 96
+    printf 'candidate installation\n' > "$3"
+}`
+			out, stderr, code := runInstallFunc(t, []string{
+				"BUILD_FIXTURE=" + buildDir, "INSTALL_DIR=" + installDir,
+				"BUILT_GO=" + builtGo, "GOTOOLCHAIN=local",
+			}, setup, `try_go_install; [ "$GOTOOLCHAIN" = local ]`, "")
+			content, err := os.ReadFile(installed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if builtGo == "go1.26.10" {
+				if code != 0 || string(content) != "candidate installation\n" {
+					t.Fatalf("verified compiler was not installed: exit=%d, file=%q, out=%s, stderr=%s", code, content, out, stderr)
+				}
+			} else if code == 0 || string(content) != "existing installation\n" || !strings.Contains(stderr, "expected go1.26.10") {
+				t.Fatalf("compiler mismatch did not preserve existing binary: exit=%d, file=%q, out=%s, stderr=%s", code, content, out, stderr)
+			}
+		})
+	}
+}
+
 // go.dev's ?mode=json has no URL field (files are served from
 // https://go.dev/dl/<filename>); the fixture has the real shape. Both backends
 // must build the URL from the filename and pass the SHA-256 through.

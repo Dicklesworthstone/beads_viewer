@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_OWNER="Dicklesworthstone"
 REPO_NAME="beads_viewer"
 BIN_NAME="bv"
+MIN_GO_VERSION="1.26.10"
 
 TMP_DIRS=()
 
@@ -402,8 +403,47 @@ is_tty() {
     [ -t 0 ] && [ -t 1 ]
 }
 
+# Select the checkout's exact compiler, with a security floor for older tags.
+# GOTOOLCHAIN is scoped to the build, so neither a user's `local` setting nor
+# a newer but vulnerable launcher can silently substitute a different version.
+source_toolchain() {
+    local module_file="$1" toolchain version
+    if ! toolchain=$(awk '$1 == "go" { version = "go" $2 } $1 == "toolchain" { toolchain = $2 } END { print toolchain ? toolchain : version }' "$module_file"); then
+        print_error "Cannot read the source Go toolchain" >&2
+        return 1
+    fi
+    if [[ ! "$toolchain" =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        print_error "Source does not declare a stable Go version: $toolchain" >&2
+        return 1
+    fi
+    version="${toolchain#go}"
+    if [[ "$version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        version="$version.0"
+    fi
+    if ! version_ge "$version" "$MIN_GO_VERSION"; then
+        version="$MIN_GO_VERSION"
+    elif [[ "$version" == 1.27.* ]] && ! version_ge "$version" "1.27.3"; then
+        # GO-2026-6809 is also present in Go 1.27.0 through 1.27.2.
+        version="1.27.3"
+    fi
+    printf 'go%s\n' "$version"
+}
+
+verify_source_toolchain() {
+    local binary="$1" expected="$2" built_go
+    if ! built_go=$(GOTOOLCHAIN=local go version -m "$binary" 2>/dev/null | awk 'NR == 1 { print $NF }'); then
+        print_error "Cannot read the built executable's Go version; existing installation was not changed" >&2
+        return 1
+    fi
+    if [ "$built_go" != "$expected" ]; then
+        print_error "Built executable uses ${built_go:-an unknown Go version}, expected $expected; existing installation was not changed" >&2
+        return 1
+    fi
+    print_info "Built with $built_go"
+}
+
 ensure_go() {
-    local min_version="1.26"
+    local min_version="$MIN_GO_VERSION"
     local go_version=""
 
     if command -v go >/dev/null 2>&1; then
@@ -640,11 +680,11 @@ try_go_install() {
 
     local go_version
     if ! go_version=$(ensure_go); then
-        print_error "Go 1.26 or later is required for building from source."
+        print_error "Go $MIN_GO_VERSION or later is required for building from source."
         exit 1
     fi
 
-    print_info "Using Go $go_version to launch the build (the module's toolchain directive may select another)"
+    print_info "Using Go $go_version to launch the source build"
 
     local tmp_dir src_dir repo_url tarball_url tarball_path build_output fetched=0
     tmp_dir=$(make_tmp_dir)
@@ -676,21 +716,19 @@ try_go_install() {
         fi
     fi
 
-    print_info "Building $BIN_NAME from source..."
+    local toolchain
+    if ! toolchain=$(source_toolchain "$src_dir/go.mod"); then
+        exit 1
+    fi
+    print_info "Building $BIN_NAME from source with $toolchain..."
     build_output="$tmp_dir/$BIN_NAME"
-    if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 go build -o "$build_output" "./cmd/$BIN_NAME"); then
+    if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN="$toolchain" go build -o "$build_output" "./cmd/$BIN_NAME"); then
         print_error "Go build failed."
         exit 1
     fi
 
-    # Report the toolchain the build actually used, which the module's `toolchain`
-    # directive can make differ from the launcher's Go reported above.
-    # Match the go<version> token on the first line regardless of its position,
-    # so a build path containing spaces cannot shift the field index.
-    local built_go
-    built_go=$(go version -m "$build_output" 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++) if($i ~ /^go[0-9]/){print $i; exit}}')
-    if [ -n "$built_go" ]; then
-        print_info "Built with $built_go"
+    if ! verify_source_toolchain "$build_output" "$toolchain"; then
+        exit 1
     fi
 
     ensure_install_dir "$INSTALL_DIR"

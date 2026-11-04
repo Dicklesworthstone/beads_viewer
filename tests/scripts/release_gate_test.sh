@@ -3,7 +3,16 @@
 # Fixture helper stages test marker files; they are not evidence that bv's
 # actual benchmark, browser, installer, or native-platform suites have passed.
 # Artifacts are retained for inspection; this harness never publishes/deletes.
+# `audit-environment` runs a focused, offline subprocess-boundary control with
+# an explicitly synthetic scanner observer; `gate-mechanics` uses the observer
+# for all receipt/package controls. The default mode uses real govulncheck.
 set -euo pipefail
+export GOTOOLCHAIN=local
+scope="${1:-all}"
+case "$scope" in
+  all|audit-environment|gate-mechanics) ;;
+  *) echo "usage: $0 [all|audit-environment|gate-mechanics]" >&2; exit 2 ;;
+esac
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 tmp="$(mktemp -d /tmp/bv-release-gate-test.XXXXXX)"
@@ -59,13 +68,36 @@ mkdir -p "$fixture/scripts" "$fixture/cmd/bv" "$fixture/pkg" "$fixture/internal"
   "$fixture/tests/e2e" "$fixture/tests/scripts" "$fixture/tests/testdata/benchmark" "$fixture/benchmarks"
 cp "${RELEASE_GATE_TEST_SCRIPT:-$root/scripts/release_gate.sh}" "$fixture/scripts/release_gate.sh"
 cp "$root/.goreleaser.yaml" "$fixture/.goreleaser.yaml"
-printf 'module example.invalid/gatefixture\n\ngo 1.25.5\n' >"$fixture/go.mod"
+fixture_go="$(command -v go)"
+toolchain="$(go env GOVERSION)"
+net_version="$(awk '$1 == "golang.org/x/net" { print $2 }' "$root/go.mod")"
+printf 'module example.invalid/gatefixture\n\ngo %s\n\nrequire golang.org/x/net %s\n' \
+  "${toolchain#go}" "$net_version" >"$fixture/go.mod"
+# The fixture links a real vendored security dependency so the binary metadata
+# controls cannot accidentally pass while inspecting only a dependency-free Go
+# program. These copies are synthetic fixture inputs, not release artifacts.
+mkdir -p "$fixture/vendor/golang.org/x/net"
+cp -R "$root/vendor/golang.org/x/net/html" "$fixture/vendor/golang.org/x/net/"
+printf '# golang.org/x/net %s\n## explicit; go 1.26.0\ngolang.org/x/net/html\ngolang.org/x/net/html/atom\n' \
+  "$net_version" >"$fixture/vendor/modules.txt"
 printf 'package fixture\n' >"$fixture/pkg/doc.go"
 printf 'package internal\n' >"$fixture/internal/doc.go"
 cat >"$fixture/cmd/bv/main.go" <<'GO'
 package main
 
-func main() { println("bv release-gate fixture") }
+import (
+    "strings"
+
+    "golang.org/x/net/html"
+)
+
+func main() {
+    node, err := html.Parse(strings.NewReader("<p>bv release-gate fixture</p>"))
+    if err != nil || node == nil {
+        panic("fixture HTML parser failed")
+    }
+    println("bv release-gate fixture")
+}
 GO
 cat >"$fixture/cmd/bv/main_test.go" <<'GO'
 package main
@@ -107,6 +139,7 @@ SH
 done
 printf '#!/usr/bin/env bash\nprintf "fixture pwsh runner\\n"\n' >"$tmp/tools/pwsh-fixture"
 chmod +x "$tmp/tools/pwsh-fixture"
+gofmt -w "$fixture/cmd/bv/main.go"
 git -C "$fixture" init -q -b main
 commit_fixture "$fixture" 'release gate fixture'
 revision="$(git -C "$fixture" rev-parse HEAD)"
@@ -114,27 +147,191 @@ git -C "$fixture" remote add origin https://github.com/release-gate-fixture/bv
 git -C "$fixture" tag v0.0.1
 echo "fixture revision: $revision"
 
+if [ "$scope" != all ]; then
+  # Replace only the scanner installation/identity boundary. All Go compiler,
+  # source/receipt checks and the gate's actual scanner subprocess invocation
+  # still execute. The observer reports the environment it really received;
+  # this is not evidence of a vulnerability scan or release eligibility for bv.
+  mkdir -p "$tmp/audit-observer-tools"
+  export REAL_GO_FOR_FIXTURE="$fixture_go"
+  export FIXTURE_SCANNER_OBSERVER="$tmp/scanner-observer.py"
+  cat >"$FIXTURE_SCANNER_OBSERVER" <<'PY'
+#!/usr/bin/env python3
+import json, os, sys
+print("Go: " + os.environ["GOVERSION"])
+print("fixture-only scanner environment: " + json.dumps({
+    key: os.environ[key] for key in ("GOVERSION", "CGO_ENABLED", "GOOS", "GOARCH", "GOFLAGS")
+}, sort_keys=True))
+print("fixture scanner observer completed; no vulnerability analysis performed")
+code = int(os.environ.get("FIXTURE_SCANNER_EXIT", "0"))
+if code:
+    print("fixture planned scanner exit: " + str(code))
+sys.exit(code)
+PY
+  cat >"$tmp/audit-observer-tools/go" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -eq 2 ] && [ "$1" = install ] && [ "$2" = golang.org/x/vuln/cmd/govulncheck@v1.9.0 ]; then
+  printf 'fixture-only scanner install GOFLAGS: %s\n' "$GOFLAGS"
+  scanner="$GOBIN/govulncheck"
+  if [ "$("$REAL_GO_FOR_FIXTURE" env GOHOSTOS)" = windows ]; then scanner="$scanner.exe"; fi
+  cp "$FIXTURE_SCANNER_OBSERVER" "$scanner"
+  chmod +x "$scanner"
+  exit
+fi
+if [ "$#" -eq 3 ] && [ "$1" = version ] && [ "$2" = -m ]; then
+  case "$3" in
+    */govulncheck|*/govulncheck.exe)
+      printf '%s: %s\n\tmod\tgolang.org/x/vuln\tv1.9.0\n' "$3" "$("$REAL_GO_FOR_FIXTURE" env GOVERSION)"
+      exit ;;
+  esac
+fi
+exec "$REAL_GO_FOR_FIXTURE" "$@"
+SH
+  chmod +x "$tmp/audit-observer-tools/go"
+  export PATH="$tmp/audit-observer-tools:$PATH"
+  echo 'offline controls: synthetic scanner observer; no vulnerability database/network access'
+fi
+
+# A fresh receipt must never bless an unsafe compiler just because the same
+# unsafe compiler is then used for packaging. Preflight has its own policy.
+bash "$fixture/scripts/release_gate.sh" verify-toolchain
+env GOFLAGS= GOENV=off bash "$fixture/scripts/release_gate.sh" verify-toolchain
+env GOFLAGS=-p=2 bash "$fixture/scripts/release_gate.sh" verify-toolchain
+echo 'ok: empty GOFLAGS and resource-only -p=2 accepted'
+
+# External files can change while their GOFLAGS path stays identical. Neither
+# source overlays/module substitutions nor tool/profile inputs may escape the
+# tracked source and release configuration through ambient Go flags.
+external="$tmp/external-go-inputs"
+mkdir -p "$external"
+cp "$fixture/go.mod" "$external/external.mod"
+cp "$fixture/cmd/bv/main.go" "$external/overlay-main.go"
+printf '\n// external overlay fixture\n' >>"$external/overlay-main.go"
+python3 - "$fixture/cmd/bv/main.go" "$external/overlay-main.go" "$external/overlay.json" <<'PY'
+import json, sys
+json.dump({'Replace': {sys.argv[1]: sys.argv[2]}}, open(sys.argv[3], 'w'))
+PY
+printf '#!/usr/bin/env bash\nexit 73\n' >"$external/toolexec"
+chmod +x "$external/toolexec"
+printf 'external fixture profile\n' >"$external/profile.pgo"
+reject overlay-flags 'unsupported release GOFLAGS' env GOFLAGS="-overlay=$external/overlay.json" bash "$fixture/scripts/release_gate.sh" verify-toolchain
+reject modfile-flags 'unsupported release GOFLAGS' env GOFLAGS="-modfile=$external/external.mod" bash "$fixture/scripts/release_gate.sh" verify-toolchain
+reject non-vendor-flags 'unsupported release GOFLAGS' env GOFLAGS=-mod=mod bash "$fixture/scripts/release_gate.sh" verify-toolchain
+reject toolexec-flags 'unsupported release GOFLAGS' env GOFLAGS="-toolexec=$external/toolexec" bash "$fixture/scripts/release_gate.sh" verify-toolchain
+reject profile-flags 'unsupported release GOFLAGS' env GOFLAGS="-pgo=$external/profile.pgo" bash "$fixture/scripts/release_gate.sh" verify-toolchain
+printf 'GOFLAGS=-overlay=%s\n' "$external/overlay.json" >"$external/goenv"
+reject persistent-flags 'unsupported release GOFLAGS' env GOFLAGS= GOENV="$external/goenv" bash "$fixture/scripts/release_gate.sh" verify-toolchain
+
+old_toolchain="$(clone_fixture old-toolchain)"
+(cd "$old_toolchain" && go mod edit -toolchain=go1.26.8)
+reject old-toolchain 'below the security floor' bash "$old_toolchain/scripts/release_gate.sh" verify-toolchain
+vulnerable_next_minor="$(clone_fixture vulnerable-next-minor)"
+(cd "$vulnerable_next_minor" && go mod edit -toolchain=go1.27.2)
+reject vulnerable-next-minor 'below the security floor' bash "$vulnerable_next_minor/scripts/release_gate.sh" verify-toolchain
+wrong_toolchain="$(clone_fixture wrong-toolchain)"
+(cd "$wrong_toolchain" && go mod edit -toolchain=go1.26.99)
+reject compiler-selection 'release requires go1.26.99' bash "$wrong_toolchain/scripts/release_gate.sh" verify-toolchain
+old_net="$(clone_fixture old-net)"
+(cd "$old_net" && go mod edit -require=golang.org/x/net@v0.59.0)
+reject old-net 'below the security floor' bash "$old_net/scripts/release_gate.sh" verify-toolchain
+stale_vendor="$(clone_fixture stale-vendor)"
+printf '# golang.org/x/net v0.59.0\n## explicit; go 1.26.0\ngolang.org/x/net/html\ngolang.org/x/net/html/atom\n' \
+  >"$stale_vendor/vendor/modules.txt"
+reject stale-vendor 'inconsistent vendoring' bash "$stale_vendor/scripts/release_gate.sh" verify-toolchain
+replaced_net="$(clone_fixture replaced-net)"
+(cd "$replaced_net" && go mod edit -replace=golang.org/x/net=./vendor/golang.org/x/net)
+reject replaced-net 'must use its verified upstream module' bash "$replaced_net/scripts/release_gate.sh" verify-toolchain
+
 # This first control fails against the old gate: it printed PASSED after skips
 # and did not emit an eligibility receipt.
-run_gate skipped "$fixture" 2 RELEASE_GATE_SKIP='1 2 3 4 5 6 7 8 9 10'
+run_gate skipped "$fixture" 2 RELEASE_GATE_SKIP='1 2 3 4 5 6 7 8 9 10 11'
 if grep -q 'RELEASE GATE PASSED' "$tmp/gate-skipped.log"; then
   fail 'skipped checks were advertised as a passing release gate'
 fi
 reject skipped diagnostic env RELEASE_GATE_RECEIPT="$gate_receipt" bash "$fixture/scripts/release_gate.sh" verify-source
 
-run_gate complete "$fixture" 0
+run_gate complete "$fixture" 0 GOVERSION=go1.99.0
 receipt="$gate_receipt"
 export RELEASE_GATE_RECEIPT="$receipt"
 bash "$fixture/scripts/release_gate.sh" verify-source
-python3 - "$receipt" "$revision" <<'PY'
-import json, sys
+python3 - "$receipt" "$revision" "$scope" <<'PY'
+import json, pathlib, sys
 r = json.load(open(sys.argv[1]))
 assert r['eligible'] is True
 assert r['source']['revision'] == sys.argv[2]
-assert len(r['stages']) == 10 and all(s['status'] == 'passed' for s in r['stages'])
+assert len(r['stages']) == 11 and all(s['status'] == 'passed' for s in r['stages'])
 assert 'go test -race -count=1' in r['stages'][2]['command']
 assert r['dataset']['sha256'] and r['toolchain']['GOVERSION']
+assert r['toolchain']['GOTOOLCHAIN'] == 'local'
+assert r['module_policy']['dependencies']['golang.org/x/net']
+assert len(r['source_audit']['scans']) == 5
+assert all(row['exit_code'] == 0 for row in r['source_audit']['scans'])
+for row in r['source_audit']['scans']:
+    assert row['go_version'] == r['toolchain']['GOVERSION'] != 'go1.99.0'
+    assert row['cgo_enabled'] == r['toolchain']['CGO_ENABLED'] == '0'
+    assert row['go_flags'] == r['toolchain']['GOFLAGS']
+    lines = pathlib.Path(row['path']).read_text().splitlines()
+    assert 'Go: ' + row['go_version'] in lines
+    if sys.argv[3] != 'all':
+        prefix = 'fixture-only scanner environment: '
+        observed = [json.loads(line[len(prefix):]) for line in lines if line.startswith(prefix)]
+        assert observed == [{'GOVERSION': row['go_version'], 'CGO_ENABLED': '0',
+                             'GOFLAGS': r['toolchain']['GOFLAGS'],
+                             'GOOS': row['goos'], 'GOARCH': row['goarch']}]
+if sys.argv[3] != 'all':
+    install_log = pathlib.Path(r['source_audit']['tool']['path']).parent.parent / 'install.log'
+    assert 'fixture-only scanner install GOFLAGS: ' + r['toolchain']['GOFLAGS'] in install_log.read_text().splitlines()
 PY
+echo 'ok: caller GOVERSION=go1.99.0 cannot change the scanner standard-library version'
+python3 - "$receipt" "$tmp/wrong-audit-go.json" "$tmp/wrong-audit-cgo.json" "$tmp/wrong-audit-flags.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+r['source_audit']['scans'][0]['go_version'] = 'go1.99.0'
+json.dump(r, open(sys.argv[2], 'w'))
+r['source_audit']['scans'][0]['go_version'] = r['toolchain']['GOVERSION']
+r['source_audit']['scans'][0]['cgo_enabled'] = '1'
+json.dump(r, open(sys.argv[3], 'w'))
+r['source_audit']['scans'][0]['cgo_enabled'] = r['toolchain']['CGO_ENABLED']
+r['source_audit']['scans'][0]['go_flags'] = '-mod=mod'
+json.dump(r, open(sys.argv[4], 'w'))
+PY
+reject wrong-audit-go 'analysis environment differs' env RELEASE_GATE_RECEIPT="$tmp/wrong-audit-go.json" bash "$fixture/scripts/release_gate.sh" verify-source
+reject wrong-audit-cgo 'analysis environment differs' env RELEASE_GATE_RECEIPT="$tmp/wrong-audit-cgo.json" bash "$fixture/scripts/release_gate.sh" verify-source
+reject wrong-audit-flags 'analysis environment differs' env RELEASE_GATE_RECEIPT="$tmp/wrong-audit-flags.json" bash "$fixture/scripts/release_gate.sh" verify-source
+python3 - "$receipt" "$tmp/wrong-audit-header.json" "$tmp/wrong-audit-scanner-version.log" <<'PY'
+import hashlib, json, pathlib, sys
+r = json.load(open(sys.argv[1]))
+row = r['source_audit']['scans'][0]
+original = pathlib.Path(row['path']).read_text()
+header = 'Go: ' + row['go_version']
+assert header in original.splitlines()
+log = pathlib.Path(sys.argv[3])
+log.write_text(original.replace(header, 'Go: go1.99.0', 1))
+row.update(path=str(log), sha256=hashlib.sha256(log.read_bytes()).hexdigest())
+json.dump(r, open(sys.argv[2], 'w'))
+PY
+reject wrong-audit-header 'scanner Go version differs' env RELEASE_GATE_RECEIPT="$tmp/wrong-audit-header.json" bash "$fixture/scripts/release_gate.sh" verify-source
+if [ "$scope" = audit-environment ]; then
+  echo 'release_gate_test: PASS (focused scanner environment control; synthetic observer, no vulnerability scan/publication)'
+  exit 0
+fi
+if [ "$scope" = gate-mechanics ]; then
+  # govulncheck uses exit 3 for findings and nonzero for scanner failures.
+  # Exercise both subprocess outcomes through the actual stage/receipt path.
+  for code in 3 1; do
+    run_gate "scanner-exit-$code" "$fixture" 1 FIXTURE_SCANNER_EXIT="$code"
+    python3 - "$gate_receipt" "$code" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r['eligible'] is False
+assert r['stages'][10]['name'] == 'source-vulnerabilities'
+assert r['stages'][10]['status'] == 'failed'
+assert all(row['exit_code'] == int(sys.argv[2]) for row in r['source_audit']['scans'])
+PY
+    reject "scanner-exit-$code" diagnostic env RELEASE_GATE_RECEIPT="$gate_receipt" bash "$fixture/scripts/release_gate.sh" verify-source
+  done
+fi
 reject unsealed 'no complete packaged archive evidence' bash "$fixture/scripts/release_gate.sh" verify
 reject missing-receipt 'missing RELEASE_GATE_RECEIPT' env RELEASE_GATE_RECEIPT= bash "$fixture/scripts/release_gate.sh" verify-source
 
@@ -180,6 +377,21 @@ r = json.load(open(sys.argv[1])); r['toolchain']['GOVERSION'] = 'go0.0.0'
 json.dump(r, open(sys.argv[2], 'w'))
 PY
 reject changed-toolchain 'toolchain/build environment differs' env RELEASE_GATE_RECEIPT="$tmp/wrong-toolchain.json" bash "$fixture/scripts/release_gate.sh" verify-source
+python3 - "$receipt" "$tmp/no-audit.json" "$tmp/failed-audit.json" "$tmp/changed-audit.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+missing = dict(r)
+missing.pop('source_audit')
+json.dump(missing, open(sys.argv[2], 'w'))
+r['source_audit']['scans'][0]['exit_code'] = 3
+json.dump(r, open(sys.argv[3], 'w'))
+r['source_audit']['scans'][0]['exit_code'] = 0
+r['source_audit']['scans'][0]['sha256'] = '0' * 64
+json.dump(r, open(sys.argv[4], 'w'))
+PY
+reject no-audit 'source vulnerability evidence' env RELEASE_GATE_RECEIPT="$tmp/no-audit.json" bash "$fixture/scripts/release_gate.sh" verify-source
+reject failed-audit 'source vulnerability evidence' env RELEASE_GATE_RECEIPT="$tmp/failed-audit.json" bash "$fixture/scripts/release_gate.sh" verify-source
+reject changed-audit 'source vulnerability evidence changed' env RELEASE_GATE_RECEIPT="$tmp/changed-audit.json" bash "$fixture/scripts/release_gate.sh" verify-source
 
 # The actual checked-in GoReleaser config must consume the receipt and finish
 # packaging without network publication. Its post hooks inspect all binaries.
@@ -216,6 +428,14 @@ PY
 done
 bash "$fixture/scripts/release_gate.sh" seal "$dist"
 bash "$fixture/scripts/release_gate.sh" verify
+python3 - "$receipt" "$net_version" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert len(r['artifacts']) == 5
+for artifact in r['artifacts']:
+    assert artifact['binary']['dependencies']['golang.org/x/net']['version'] == sys.argv[2]
+    assert artifact['binary']['go_version'] == r['toolchain']['GOVERSION']
+PY
 
 # Archive evidence stays independently reviewable after later negative controls.
 cp "$receipt" "$tmp/receipt-before-tampering.json"
@@ -226,6 +446,49 @@ reject dirty-binary 'dirty/unknown source' bash "$fixture/scripts/release_gate.s
 reject wrong-binary 'binary revision mismatch' bash "$fixture/scripts/release_gate.sh" verify-binary "$tmp/wrong-revision-bv"
 (cd "$fixture" && CGO_ENABLED=0 GOWORK=off go build -buildvcs=false -o "$tmp/no-build-info-bv" ./cmd/bv)
 reject no-build-info 'binary revision mismatch' bash "$fixture/scripts/release_gate.sh" verify-binary "$tmp/no-build-info-bv"
+
+# Feed altered build-info records into the real verification path. These are
+# parser/validation controls; the positive archive controls above use actual
+# unmodified Go metadata from all five cross-built executables.
+mkdir -p "$tmp/metadata-tools"
+export REAL_GO_FOR_FIXTURE="$fixture_go"
+cat >"$tmp/metadata-tools/go" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = version ] && [ "${2:-}" = -m ]; then
+  "$REAL_GO_FOR_FIXTURE" "$@" | python3 -c '
+import os, re, sys
+mode = os.environ["FIXTURE_BINARY_METADATA"]
+for line in sys.stdin:
+    fields = line.split()
+    if mode == "old-compiler" and not line.startswith("\t"):
+        line = re.sub(r"go[0-9]+\.[0-9]+\.[0-9]+", "go1.26.8", line)
+    if fields[:2] == ["dep", "golang.org/x/net"]:
+        if mode == "missing-net":
+            continue
+        if mode == "old-net":
+            line = "\tdep\tgolang.org/x/net\tv0.59.0\n"
+        elif mode == "replaced-net":
+            line += "\t=>\t./unverified-net\t(devel)\n"
+    sys.stdout.write(line)
+'
+  exit
+fi
+exec "$REAL_GO_FOR_FIXTURE" "$@"
+SH
+chmod +x "$tmp/metadata-tools/go"
+reject old-binary-compiler 'binary toolchain mismatch' \
+  env PATH="$tmp/metadata-tools:$PATH" FIXTURE_BINARY_METADATA=old-compiler \
+  bash "$fixture/scripts/release_gate.sh" verify-binary "$tmp/binaries/bv-linux-amd64"
+reject old-binary-net 'binary dependency mismatch' \
+  env PATH="$tmp/metadata-tools:$PATH" FIXTURE_BINARY_METADATA=old-net \
+  bash "$fixture/scripts/release_gate.sh" verify-binary "$tmp/binaries/bv-linux-amd64"
+reject missing-binary-net 'missing golang.org/x/net build information' \
+  env PATH="$tmp/metadata-tools:$PATH" FIXTURE_BINARY_METADATA=missing-net \
+  bash "$fixture/scripts/release_gate.sh" verify-binary "$tmp/binaries/bv-linux-amd64"
+reject replaced-binary-net 'undeclared dependency replacement' \
+  env PATH="$tmp/metadata-tools:$PATH" FIXTURE_BINARY_METADATA=replaced-net \
+  bash "$fixture/scripts/release_gate.sh" verify-binary "$tmp/binaries/bv-linux-amd64"
 
 config_path="$(python3 - "$receipt" <<'PY'
 import json, sys
@@ -248,4 +511,8 @@ PY
 printf 'tamper\n' >>"$dist/bv_fixture_linux_amd64.tar.gz"
 reject changed-archive 'artifact changed' bash "$fixture/scripts/release_gate.sh" verify
 reject changed-checksum 'archive checksum mismatch' bash "$fixture/scripts/release_gate.sh" seal "$dist"
-echo "release_gate_test: PASS (synthetic stages; real Git trees and five Go cross-builds; no publication)"
+if [ "$scope" = gate-mechanics ]; then
+  echo "release_gate_test: PASS (synthetic stages/scanner; real Git, GoReleaser and five Go cross-builds; no vulnerability scan/publication)"
+else
+  echo "release_gate_test: PASS (synthetic helper stages; real govulncheck, Git, GoReleaser and five Go cross-builds; no publication)"
+fi

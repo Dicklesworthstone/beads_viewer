@@ -5,6 +5,52 @@ commit. Publication requires verification of the sealed archive hashes and
 separate authorization. The receipt does not replace the native-platform,
 browser, or WASM proofs listed below.
 
+## Security toolchain and dependencies
+
+The release compiler is selected from `go.mod`: use its `toolchain` directive
+when present, otherwise its exact `go` version. The current pin and source-build
+minimum are **Go 1.26.10**. There is no redundant `toolchain go1.26.10` line:
+`go mod tidy` removes a toolchain directive equal to the `go` directive. The
+retained DSR/`act` workflow inputs use `actions/setup-go`'s `go-version-file`
+support to select the same version explicitly.
+
+Install that compiler on PATH before running the gate. Automatic toolchain
+switching is disabled with `GOTOOLCHAIN=local`; the gate rejects an active
+compiler that differs from the pin. It also rejects an affected compiler
+version or `golang.org/x/net` below v0.62.0, and checks the vendored module
+declarations. Update dependencies with Go's module commands, regenerate the
+affected vendored sources, and retain the verified `go.sum` entries. Both the
+Nix package and its development shell use the fixed Go 1.26.10 compiler.
+
+The gate accepts only empty `GOFLAGS` or one positive parallelism setting
+such as `-p=2`. This applies to both the caller environment and Go's persistent
+environment file. Keep build settings in the tracked release configuration;
+external overlays, alternate module files, tool wrappers and profiles are not
+covered by the source receipt and are rejected.
+
+```bash
+scripts/release_gate.sh verify-toolchain
+make release-audit
+```
+
+The audit installs pinned `golang.org/x/vuln/cmd/govulncheck@v1.9.0` outside
+the checkout and runs source-mode analysis with CGO disabled for all five
+release targets. It queries the official vulnerability database and retains
+the scanner identity and each target's command, output, hash and exit code.
+The scanner's `GOVERSION` is set to the verified compiler version, and its
+reported Go version is checked in the retained output. A caller-provided
+version override cannot change which standard library is analyzed.
+The blocking invocation uses text output: govulncheck's JSON, SARIF and
+OpenVEX modes return zero even when they report vulnerabilities.
+
+Source-mode findings identify vulnerable calls in the selected build; binary
+mode reports linked vulnerable symbols and cannot establish an exploitable
+execution path. After packaging, inspect the actual executables with
+`go version -m` and run `govulncheck -mode=binary` against them. The gate checks
+each binary's compiler and linked dependency versions against the checked
+source, in addition to its revision, clean-source flag and target. A manifest
+change alone is not evidence that a packaged executable was rebuilt.
+
 ## The gate
 
 ```bash
@@ -21,7 +67,13 @@ fails above 20% best-of-N sec/op regression on any tracked benchmark), and the
 robot smoke (`scripts/robot_smoke.sh`: every robot command on this repository
 and on a synthetic fixture), and the gate's own script self-tests
 (`tests/scripts/benchmark_compare_test.sh`, `release_gate_test.sh`, and
-`install_ps1_test.sh`). PowerShell must be on PATH or named by `PWSH` for a
+`install_ps1_test.sh`), followed by required source-mode vulnerability analysis
+for every release target (stage 11). The `release_gate_test.sh gate-mechanics`
+invocation tests receipt, compiler, dependency and archive controls
+with real Git/Go/GoReleaser operations and a synthetic scanner in isolated
+fixtures. It is not vulnerability-analysis evidence for bv. Stage 11 always
+runs the real scanner against the project; network or scanner failures block
+release eligibility. PowerShell must be on PATH or named by `PWSH` for a
 complete gate. A missing PowerShell runner makes stage 10 skipped and the
 receipt ineligible. The gate also requires Python 3 for receipt and archive
 verification and GoReleaser for the packaging regression tests. Race tests
@@ -62,6 +114,8 @@ and each stage's command, duration, exit code, and outcome. Ignored files under
 `cmd`, `pkg`, `internal`, or `vendor`, and ignored `go.work` inputs, are rejected
 as undeclared build inputs. Commit intended inputs before running the final
 gate. Symlink inputs must resolve to files inside the checkout.
+The receipt also binds the pinned vulnerability scanner and successful scan
+logs. Missing, failed or altered security evidence prevents packaging.
 
 Stage 8 requires Go, Git and standard shell tools: `scripts/benchmark.sh`
 runs the ten tracked benchmarks (`BenchmarkRealData_*`, `BenchmarkFullAnalysis_*`,
@@ -96,18 +150,16 @@ conditions. A failed comparison is never a licence to raise the threshold.
 
 ## Where the gate runs
 
-- **Locally, before every release.** This is mandatory and is the step that
-  actually protects releases today, because the GitHub Actions workflows are
-  disabled (`gh workflow list --all` shows `disabled_manually` for CI,
-  Release, Fuzz, and Flake Update since 2026-08-16).
-- **In CI, once re-enabled.** `.github/workflows/ci.yml` already runs the
-  same script with `RELEASE_GATE_SKIP="8" RELEASE_GATE_ALLOW_MISSING=1`.
-  That configuration is diagnostic and cannot authorize release. Its legacy
-  artifact upload path must be changed to the external output directory if
-  the workflow is re-enabled, and the job must explicitly handle diagnostic
-  exit 2 or run the complete gate. Whether to re-enable is the
-  maintainer's call: it costs Actions minutes and Codecov uploads, and it
-  is the only way the README badge becomes live again.
+Run the gate through **DSR**, locally or on the maintainer's configured build
+hosts, before every release. GitHub Actions must remain disabled under the
+repository's permanent automation policy. Existing workflow YAML is retained
+as input for local DSR/`act` execution; it does not authorize Actions execution.
+DSR's `quality` command can execute the gate locally through a tool registration
+whose `required_checks` contains `bash scripts/release_gate.sh run`.
+
+The retained `.github/workflows/ci.yml` invokes the gate with diagnostic skips.
+Those settings cannot authorize release. Final packaging always requires the
+complete gate for the exact clean source commit, with no skipped stages.
 
 ## Release steps
 
@@ -133,14 +185,14 @@ do not ask again when it already does.
 4. Set `RELEASE_GATE_DIST` to a fresh, nonexistent directory outside the
    checkout, then run `scripts/release_gate.sh package`. This runs GoReleaser
    with publication skipped, verifies every embedded binary's revision,
-   clean-source flag and Go version, checks `checksums.txt`, and seals hashes
+   clean-source flag, Go version and dependency versions, checks `checksums.txt`, and seals hashes
    for all five supported target archives into the receipt. Existing output
    directories are refused; the command does not delete them.
    GoReleaser does not template its dist field, so the wrapper derives a
    config beside the receipt that changes only the declared dist path. Its
    hash is recorded and checked; the tracked config stays untouched.
 5. Run `scripts/release_gate.sh verify` immediately before an authorized
-   publication. Changed source, toolchain, receipt stages, checksums, or
+   publication. Changed source, toolchain, vulnerability evidence, receipt stages, checksums, or
    archives fail verification. After the remaining platform/browser/WASM
    checks pass, publish the verified archives, `checksums.txt`, and sealed
    receipt through the maintainer's explicitly authorized GitHub Release

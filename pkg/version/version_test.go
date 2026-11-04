@@ -1,6 +1,7 @@
 package version
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -113,6 +114,58 @@ func TestFallbackHasVPrefix(t *testing.T) {
 	}
 }
 
+// The flake declares both a compiler version and an application version. Bind
+// this invariant to the bv derivation's named release value, not the first
+// attribute called "version" anywhere in the file.
+func flakeBVVersion(flake []byte) (string, error) {
+	bindings := regexp.MustCompile(`(?m)^\s*bvVersion\s*=\s*"([^"]+)"\s*;`).FindAllSubmatch(flake, -1)
+	if len(bindings) != 1 {
+		return "", fmt.Errorf("flake.nix must declare one literal bvVersion binding, found %d", len(bindings))
+	}
+	packageVersion := regexp.MustCompile(`(?m)^\s*bv\s*=\s*(?:pkgs\.)?buildGo(?:[0-9]+)?Module\s*\{\s*pname\s*=\s*"bv"\s*;\s*version\s*=\s*bvVersion\s*;`)
+	if !packageVersion.Match(flake) {
+		return "", fmt.Errorf("flake.nix bv package must use bvVersion as its version")
+	}
+	return string(bindings[0][1]), nil
+}
+
+func TestFlakeBVVersionScope(t *testing.T) {
+	const compiler = `go = pkgs.go_1_26.overrideAttrs (_: {
+  version = "1.26.10";
+});
+`
+	const application = `bv = buildGoModule {
+  pname = "bv";
+  version = bvVersion;
+};
+`
+	cases := []struct {
+		name, flake, want string
+	}{
+		{"compiler first", compiler + "bvVersion = \"0.26.1\";\n" + application, "0.26.1"},
+		{"compiler last", "bvVersion = \"0.26.1\";\n" + application + compiler, "0.26.1"},
+		{"application drift remains visible", compiler + "bvVersion = \"0.26.2\";\n" + application, "0.26.2"},
+		{"missing application binding", compiler + application, ""},
+		{"duplicate application binding", "bvVersion = \"0.26.1\";\nbvVersion = \"0.26.2\";\n" + application, ""},
+		{"package ignores application binding", "bvVersion = \"0.26.1\";\n" + `bv = buildGoModule {
+  pname = "bv";
+  version = "9.9.9";
+};`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := flakeBVVersion([]byte(tc.flake))
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("accepted an unbound application version %q", got)
+				}
+			} else if err != nil || got != tc.want {
+				t.Fatalf("flakeBVVersion = (%q, %v), want %q", got, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestReleaseVersionSourcesStayAligned(t *testing.T) {
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
@@ -124,11 +177,11 @@ func TestReleaseVersionSourcesStayAligned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read flake.nix: %v", err)
 	}
-	match := regexp.MustCompile(`(?m)^\s*version = "([^"]+)";`).FindSubmatch(flake)
-	if len(match) != 2 {
-		t.Fatal("flake.nix must declare a literal package version")
+	flakeVersion, err := flakeBVVersion(flake)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got, want := string(match[1]), strings.TrimPrefix(fallback, "v"); got != want {
+	if got, want := flakeVersion, strings.TrimPrefix(fallback, "v"); got != want {
 		t.Fatalf("flake.nix version %q does not match fallback %q", got, want)
 	}
 

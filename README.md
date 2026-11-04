@@ -84,7 +84,7 @@ irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/ee81c286e8
 ```
 > **Note:** The pinned installer above downloads the Windows release zip, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses anything that does not verify; no Go toolchain is needed. Pass `-Version v0.26.0` to pin a release or `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`). Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
 
-For a source build, use `install.ps1` from this checkout (requires Git and Go 1.26+):
+For a source build, use `install.ps1` from this checkout (requires Git and Go 1.26.10+):
 
 ```powershell
 .\install.ps1 -FromSource -Version v0.26.0
@@ -92,7 +92,7 @@ For a source build, use `install.ps1` from this checkout (requires Git and Go 1.
 
 This source path builds a verified checkout of the requested tag with that tag's vendored dependencies, checks the executable's version and Git revision before installation, and retains diagnostics on failure. The pinned installer above uses the same verified source-build path. Selecting an older release tag does not include later, unreleased fixes from this checkout.
 
-Vendoring covers the Go module dependencies, not the compiler. When your Go differs from the `toolchain` directive in that tag's `go.mod`, Go downloads the pinned toolchain before compiling, so the source build needs network access even though the dependencies are vendored, and on a slow machine that download alone can take several minutes. The installer's progress line reports the Go it was launched with, not the toolchain it ends up building with; `go version -m` on the installed executable reports the one actually used.
+Vendoring covers the Go module dependencies, not the compiler. The source installer in this checkout selects the requested tag's `toolchain` directive, or its exact `go` version when no separate toolchain is declared, subject to the security floors: older declarations use Go 1.26.10, and Go 1.27.0–1.27.2 declarations use Go 1.27.3. It verifies the compiler recorded in the built executable before installation. Go may need to download that compiler, so a source build can require network access even with vendored dependencies; `go version -m` on the installed executable reports the compiler actually used. The security-update source requires Go 1.26.10 or later.
 
 ---
 
@@ -4170,7 +4170,7 @@ irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/ee81c286e8
 - For best display, use [Windows Terminal](https://aka.ms/terminal) with a [Nerd Font](https://www.nerdfonts.com/)
 
 ### Build from Source
-Requires Go 1.26+ (see `go.mod`).
+Requires Go 1.26.10+ (see `go.mod`).
 
 ```bash
 git clone https://github.com/Dicklesworthstone/beads_viewer.git

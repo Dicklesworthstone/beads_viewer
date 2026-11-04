@@ -11,8 +11,10 @@
     directory. Go is not required.
 
     -FromSource resolves the release tag to a Git commit and builds a clean
-    checkout with its vendored dependencies. Git and Go are required. The
-    source and build diagnostics are retained if installation fails.
+    checkout with its vendored dependencies. Git and Go 1.26.10+ are required.
+    The build selects the checkout's compiler subject to the security floor
+    and verifies the executable's embedded Go version before installation.
+    Source and build diagnostics are retained if installation fails.
 .PARAMETER Version
     Release tag to install, e.g. v0.23.0. Default: the latest GitHub release.
 .PARAMETER InstallDir
@@ -47,7 +49,7 @@ $REPO_OWNER = "Dicklesworthstone"
 $REPO_NAME = "beads_viewer"
 $MODULE = "github.com/$REPO_OWNER/$REPO_NAME"
 $BIN_NAME = "bv"
-$MIN_GO_VERSION = "1.26"
+$MIN_GO_VERSION = "1.26.10"
 
 $apiBase = if ($env:BV_INSTALL_API_URL) { $env:BV_INSTALL_API_URL.TrimEnd('/') } else { "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME" }
 $downloadBase = if ($env:BV_INSTALL_DOWNLOAD_URL) { $env:BV_INSTALL_DOWNLOAD_URL.TrimEnd('/') } else { "https://github.com/$REPO_OWNER/$REPO_NAME/releases/download" }
@@ -316,6 +318,39 @@ function Test-GoVersion {
     return $true
 }
 
+function Get-SourceToolchain {
+    param([string]$ModuleFile)
+    $goVersion = $null
+    $toolchain = $null
+    foreach ($line in Get-Content -LiteralPath $ModuleFile) {
+        if ($line -cmatch '^\s*go\s+(\S+)') { $goVersion = "go$($Matches[1])" }
+        if ($line -cmatch '^\s*toolchain\s+(\S+)') { $toolchain = $Matches[1] }
+    }
+    if (-not $toolchain) { $toolchain = $goVersion }
+    if (-not $toolchain -or $toolchain -cnotmatch '^go(\d+\.\d+(?:\.\d+)?)$') {
+        Fail "Source does not declare a stable Go version: $toolchain"
+    }
+    $version = $Matches[1]
+    if ($version -match '^\d+\.\d+$') { $version = "$version.0" }
+    # Preserve older source tag selection while refusing its vulnerable
+    # compiler pin. These floors include both affected supported Go branches.
+    if (-not (Test-GoVersion $version $MIN_GO_VERSION)) {
+        $version = $MIN_GO_VERSION
+    } elseif ($version.StartsWith('1.27.') -and -not (Test-GoVersion $version '1.27.3')) {
+        $version = '1.27.3'
+    }
+    return "go$version"
+}
+
+function Assert-SourceToolchain {
+    param([string[]]$BuildInfo, [string]$Expected)
+    $builtGo = if ($BuildInfo.Count -gt 0 -and $BuildInfo[0] -cmatch ':\s+(go\d+\.\d+\.\d+)$') { $Matches[1] } else { $null }
+    if (-not $builtGo -or $builtGo -cne $Expected) {
+        Fail "Built executable uses '$builtGo', expected $Expected; existing installation was not changed"
+    }
+    Write-Info "Built with $builtGo"
+}
+
 function Install-FromSource {
     param([string]$Tag, [string]$TargetDir)
     $goVersion = Get-GoVersion
@@ -323,14 +358,14 @@ function Install-FromSource {
     if (-not (Test-GoVersion $goVersion $MIN_GO_VERSION)) { Fail "Go $MIN_GO_VERSION or later is required for -FromSource. Found: go$goVersion" }
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Fail "Git is required for -FromSource to verify the tagged checkout" }
     if ($Tag -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') { Fail "Source version '$Tag' is not a release tag" }
-    Write-Info "Launching the $BIN_NAME $Tag source build with Go $goVersion (the module's toolchain directive may select another)"
+    Write-Info "Launching the $BIN_NAME $Tag source build with Go $goVersion"
     $work = Join-Path ([System.IO.Path]::GetTempPath()) ("bv-build-" + [System.IO.Path]::GetRandomFileName())
     New-Item -ItemType Directory -Path $work | Out-Null
     Write-Info "Preparing source build at $work"
     $source = Join-Path $work 'source'
     $installed = $false
     $savedEnv = @{}
-    foreach ($key in @('CGO_ENABLED', 'GOFLAGS', 'GOWORK', 'GOOS', 'GOARCH')) {
+    foreach ($key in @('CGO_ENABLED', 'GOFLAGS', 'GOWORK', 'GOOS', 'GOARCH', 'GOTOOLCHAIN')) {
         $savedEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
     }
     $prev = $ErrorActionPreference
@@ -361,12 +396,15 @@ function Install-FromSource {
         if (-not (Select-String -LiteralPath $moduleFile -Pattern ('^module\s+' + [regex]::Escape($MODULE) + '\s*$') -CaseSensitive -Quiet)) {
             Fail 'Tagged source has an unexpected module identity; existing installation was not changed'
         }
+        $toolchain = Get-SourceToolchain $moduleFile
+        Write-Info "Building with $toolchain"
         Write-Info "Source commit=$commit; vendor/modules.txt SHA256=$((Get-FileHash -LiteralPath $vendorManifest -Algorithm SHA256).Hash.ToLowerInvariant())"
         $env:CGO_ENABLED = "0"
         $env:GOFLAGS = ''
         $env:GOWORK = 'off'
         $env:GOOS = ''
         $env:GOARCH = ''
+        $env:GOTOOLCHAIN = $toolchain
         $binary = Join-Path $work "$BIN_NAME.exe"
         Push-Location $source
         try {
@@ -392,11 +430,7 @@ function Install-FromSource {
             -not ($buildInfo -match '^\s*build\s+vcs.modified=false$')) {
             Fail 'Built executable does not identify the clean resolved source; existing installation was not changed'
         }
-        # Report the toolchain the build actually used. `go version -m` prints
-        # "<binary>: go1.x.y" on its first line; the module's toolchain directive
-        # can make that differ from the launcher Go named above.
-        $builtGo = if ($buildInfo.Count -gt 0 -and $buildInfo[0] -match '\bgo\d+\.\d+(?:\.\d+)?\b') { $Matches[0] } else { $null }
-        if ($builtGo) { Write-Info "Built with $builtGo" }
+        Assert-SourceToolchain $buildInfo $toolchain
         Write-Info "Built executable SHA256=$((Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant())"
         New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
         $destination = Join-Path $TargetDir "$BIN_NAME.exe"

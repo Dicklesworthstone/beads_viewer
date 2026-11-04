@@ -212,6 +212,80 @@ for name, body, expected, markers, timed_out in cases:
     else:
         print(f'ok: {name} (exit {process.returncode}, {elapsed:.3f}s, '
               f'{len(stdout) + len(stderr)} diagnostic bytes)', flush=True)
+
+# Exercise the same toolchain policy and metadata check used before the source
+# installer promotes its executable. This does not claim a native Windows build.
+toolchain_probe = scratch / "toolchain-probe.ps1"
+toolchain_probe.write_text(r'''
+param([string]$Installer, [string]$ModuleFile, [string]$BuildVersion)
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw "Installer parse errors: $errors" }
+$minimumAssignments = @($ast.FindAll({ param($node)
+    $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $node.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+    $node.Left.VariablePath.UserPath -ceq 'MIN_GO_VERSION'
+}, $false))
+if ($minimumAssignments.Count -ne 1) { throw 'Installer must declare one MIN_GO_VERSION assignment' }
+. ([scriptblock]::Create($minimumAssignments[0].Extent.Text))
+foreach ($name in @('Fail', 'Write-Info', 'Test-GoVersion', 'Get-SourceToolchain', 'Assert-SourceToolchain')) {
+    $definition = $ast.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true)
+    if ($null -eq $definition) { throw "Missing production function: $name" }
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+$expected = Get-SourceToolchain $ModuleFile
+Write-Output "selected=$expected"
+Assert-SourceToolchain @("C:\path with spaces\bv.exe: $BuildVersion") $expected
+''')
+toolchain_cases = [
+    ('canonical-go', 'go 1.26.10\n', 'go1.26.10', 0, 'selected=go1.26.10'),
+    ('explicit-pin', 'go 1.26.0\ntoolchain go1.26.10\n', 'go1.26.10', 0, 'selected=go1.26.10'),
+    ('older-tag', 'go 1.26.0\ntoolchain go1.26.8\n', 'go1.26.10', 0, 'selected=go1.26.10'),
+    ('older-language', 'go 1.25\n', 'go1.26.10', 0, 'selected=go1.26.10'),
+    ('newer-vulnerable-pin', 'go 1.27.0\ntoolchain go1.27.2\n', 'go1.27.3', 0, 'selected=go1.27.3'),
+    ('old-built-compiler', 'go 1.26.10\n', 'go1.26.8', 1, 'expected go1.26.10'),
+    ('newer-vulnerable-compiler', 'go 1.26.10\n', 'go1.27.2', 1, 'expected go1.26.10'),
+    ('unknown-built-compiler', 'go 1.26.10\n', 'unknown', 1, 'expected go1.26.10'),
+    ('no-declaration', 'module example.test/missing\n', 'go1.26.10', 1, 'stable Go version'),
+    ('development-compiler', 'go 1.26.0\ntoolchain go1.27rc1\n', 'go1.27rc1', 1, 'stable Go version'),
+]
+for name, module, built_version, expected, marker in toolchain_cases:
+    module_path = scratch / f'{name}.mod'
+    module_path.write_text(module)
+    result = subprocess.run([pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-File', str(toolchain_probe),
+                             '-Installer', installer, '-ModuleFile', str(module_path),
+                             '-BuildVersion', built_version], capture_output=True, text=True, timeout=15)
+    output = result.stdout + result.stderr
+    if result.returncode != expected or marker not in output:
+        failed = True
+        print(f'FAIL: toolchain-{name}: exit={result.returncode}, expected={expected}\n{output}', flush=True)
+    else:
+        print(f'ok: toolchain-{name} (exit {result.returncode})', flush=True)
+
+# Deliberately lower the production constant in an external fixture. The probe
+# must observe that value instead of substituting its own safe constant. This
+# copy is parsed only; it is never executed as an installer.
+installer_text = Path(installer).read_text()
+floor_assignment = '$MIN_GO_VERSION = "1.26.10"'
+if installer_text.count(floor_assignment) != 1:
+    raise SystemExit('Cannot construct the single-assignment source-floor control')
+old_floor_installer = scratch / 'installer-old-floor.ps1'
+old_floor_installer.write_text(installer_text.replace(floor_assignment, '$MIN_GO_VERSION = "1.26.8"', 1))
+old_tag_module = scratch / 'source-floor-control.mod'
+old_tag_module.write_text('go 1.26.0\ntoolchain go1.26.8\n')
+result = subprocess.run([pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-File', str(toolchain_probe),
+                         '-Installer', str(old_floor_installer), '-ModuleFile', str(old_tag_module),
+                         '-BuildVersion', 'go1.26.10'], capture_output=True, text=True, timeout=15)
+output = result.stdout + result.stderr
+if result.returncode != 1 or 'selected=go1.26.8' not in output or 'expected go1.26.8' not in output:
+    failed = True
+    print(f'FAIL: source-floor probe ignored the production assignment: exit={result.returncode}\n{output}', flush=True)
+else:
+    print('ok: source-floor probe detects a controlled production downgrade', flush=True)
 sys.exit(1 if failed else 0)
 PY
 then
@@ -219,6 +293,6 @@ then
 fi
 
 if [ "$fail" -eq 0 ]; then
-  echo "install_ps1_test: PASS (archive fixtures and portable version-check processes; no native Windows proof)"
+  echo "install_ps1_test: PASS (archive fixtures and portable version/toolchain checks; no native Windows proof)"
 fi
 exit "$fail"

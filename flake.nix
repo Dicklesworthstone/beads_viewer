@@ -12,7 +12,19 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        version = "0.26.0";
+        # Keep the locked nixpkgs platform support (including Intel macOS),
+        # but replace its Go 1.26.7 compiler with the security release. This is
+        # the upstream go.dev source archive SHA-256, not a vendor/NAR hash.
+        go = pkgs.go_1_26.overrideAttrs (_: {
+          version = "1.26.10";
+          src = pkgs.fetchurl {
+            url = "https://go.dev/dl/go1.26.10.src.tar.gz";
+            hash = "sha256-/WPog7ovK/ypPBZGsx6+9j4rHk0rMXyXidl2po2B828=";
+          };
+        });
+        buildGoModule = pkgs.buildGo126Module.override { inherit go; };
+
+        bvVersion = "0.26.1";
 
         # To update vendorHash after go.mod/go.sum changes:
         # 1. Set vendorHash to: pkgs.lib.fakeHash
@@ -24,9 +36,9 @@
       in
       {
         packages = {
-          bv = pkgs.buildGoModule {
+          bv = buildGoModule {
             pname = "bv";
-            inherit version;
+            version = bvVersion;
 
             src = ./.;
 
@@ -39,10 +51,34 @@
             # a host installation outside the Nix sandbox.
             nativeCheckInputs = [ pkgs.gitMinimal ];
 
+            # buildGoModule sets GOTOOLCHAIN=local. Refuse a stale compiler
+            # instead of silently ignoring the module's intended toolchain.
+            preBuild = ''
+              expected_go="$(awk '$1 == "go" { version = "go" $2 } $1 == "toolchain" { toolchain = $2 } END { print toolchain ? toolchain : version }' go.mod)"
+              if [ "$(go env GOVERSION)" != "$expected_go" ]; then
+                echo "Nix compiler does not match go.mod: expected $expected_go" >&2
+                exit 1
+              fi
+            '';
+
+            postInstall = ''
+              if [ "$(go version "$out/bin/bv")" != "$out/bin/bv: go${go.version}" ]; then
+                echo "Installed bv has an unexpected Go toolchain" >&2
+                exit 1
+              fi
+              go version -m "$out/bin/bv"
+              expected_net="$(awk '$1 == "golang.org/x/net" { print $2 }' go.mod)"
+              built_net="$(go version -m "$out/bin/bv" | awk '$1 == "dep" && $2 == "golang.org/x/net" { print $3 }')"
+              if [ -z "$expected_net" ] || [ "$built_net" != "$expected_net" ]; then
+                echo "Installed bv does not contain the declared golang.org/x/net" >&2
+                exit 1
+              fi
+            '';
+
             ldflags = [
               "-s"
               "-w"
-              "-X github.com/Dicklesworthstone/beads_viewer/pkg/version.version=v${version}"
+              "-X github.com/Dicklesworthstone/beads_viewer/pkg/version.version=v${bvVersion}"
             ];
 
             meta = with pkgs.lib; {
@@ -51,7 +87,7 @@
               license = {
                 fullName = "MIT License with OpenAI/Anthropic Rider";
                 shortName = "MIT+OpenAI-Anthropic-Rider";
-                url = "https://github.com/Dicklesworthstone/beads_viewer/blob/v${version}/LICENSE";
+                url = "https://github.com/Dicklesworthstone/beads_viewer/blob/v${bvVersion}/LICENSE";
                 free = false;
                 redistributable = false;
               };
@@ -65,12 +101,12 @@
         };
 
         devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
+          buildInputs = [
             go
-            gopls
-            gotools
-            go-tools
-            delve
+            pkgs.gopls
+            pkgs.gotools
+            pkgs.go-tools
+            pkgs.delve
           ];
 
           shellHook = ''

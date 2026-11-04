@@ -2,7 +2,7 @@
 # release_gate.sh: the single pre-release check. Every stage must pass; the
 # gate writes its log and receipt outside the source checkout. Only a clean,
 # complete receipt permits packaging; diagnostic skips never authorize release.
-# Usage: release_gate.sh [run|verify-source|verify-binary PATH|package|seal DIR|verify]
+# Usage: release_gate.sh [run|verify-toolchain|audit|verify-source|verify-binary PATH|package|seal DIR|verify]
 # Set RELEASE_GATE_RECEIPT to the receipt printed by `run` for later commands.
 #
 # Stages:
@@ -20,6 +20,7 @@
 #                      when pwsh is available (PWSH=/path or on PATH). The
 #                      isomorphic-verify self-test clones and builds twice and
 #                      stays a manual run (tests/scripts/verify_isomorphic_test.sh).
+#  11 vulnerabilities  pinned source-mode govulncheck for every release target
 #
 # Environment:
 #   RELEASE_GATE_SKIP="7 8"        skip listed stages (each skip is logged as
@@ -37,21 +38,24 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root" || exit 1
 export BV_NO_BROWSER=1 BV_TEST_MODE=1 BV_NO_SAVED_CONFIG=1 BV_NO_UPDATE_CHECK=1
 export GOFLAGS="${GOFLAGS:-}"
-export GOWORK=off CGO_ENABLED=0
+export GOWORK=off CGO_ENABLED=0 GOTOOLCHAIN=local
 
 # JSON, content hashing, and archive inspection live here rather than in a
 # second gate implementation. This code only reads source and writes evidence
 # outside it. It never executes a packaged binary or extracts archive paths.
 receipt() {
   python3 - "$root" "${RELEASE_GATE_RECEIPT:-}" "$@" <<'PY'
-import hashlib, json, os, pathlib, stat, subprocess, sys, tarfile, tempfile, zipfile
+import hashlib, json, os, pathlib, re, stat, subprocess, sys, tarfile, tempfile, zipfile
 from datetime import datetime, timezone
 
 root = pathlib.Path(sys.argv[1]).resolve()
 receipt_path = pathlib.Path(sys.argv[2]).resolve() if sys.argv[2] else None
 mode, *args = sys.argv[3:]
 stages = ["gofmt", "build+vet", "unit-tests", "e2e-tests", "docs-parity",
-          "action-pins", "vendor-hashes", "benchmarks", "robot-smoke", "script-tests"]
+          "action-pins", "vendor-hashes", "benchmarks", "robot-smoke", "script-tests",
+          "source-vulnerabilities"]
+release_targets = {("linux", "amd64"), ("linux", "arm64"), ("darwin", "amd64"),
+                   ("darwin", "arm64"), ("windows", "amd64")}
 
 def fail(message):
     raise ValueError(message)
@@ -98,9 +102,57 @@ def source():
             "inputs_sha256": h.hexdigest(), "dirty": dirty.splitlines(),
             "ignored_build_inputs": ignored.splitlines()}
 
+def stable_version(version, prefix):
+    match = re.fullmatch(re.escape(prefix) + r"(\d+)\.(\d+)\.(\d+)", version)
+    if not match:
+        fail(f"expected a stable {prefix} version, got {version!r}")
+    return tuple(map(int, match.groups()))
+
+def validate_go_flags(flags):
+    # Overlays, alternate module files, tool wrappers and profiles can supply
+    # inputs outside the source digest. Keep build settings in tracked config;
+    # only compilation concurrency may be adjusted through GOFLAGS.
+    if not re.fullmatch(r"(?:-p=[1-9][0-9]*)?", flags.strip()):
+        fail("unsupported release GOFLAGS: only empty flags or a single -p=N are allowed")
+
+def module_policy():
+    validate_go_flags(os.environ.get("GOFLAGS", ""))
+    # Empty caller GOFLAGS can fall back to settings persisted in GOENV.
+    # Validate those before any module command can consume external inputs.
+    validate_go_flags(run("go", "env", "GOFLAGS"))
+    module = json.loads(run("go", "mod", "edit", "-json"))
+    # `go mod tidy` removes a toolchain directive equal to the go directive.
+    # Both canonical forms select the exact compiler; neither is a floating
+    # major/minor version or permission to auto-upgrade the release toolchain.
+    intended = module.get("Toolchain") or "go" + module.get("Go", "")
+    version = stable_version(intended, "go")
+    # GO-2026-6809 was also present in 1.27.0--1.27.2: an unconditional
+    # >=1.26.10 comparison would accidentally permit those vulnerable releases.
+    if version < (1, 26, 10) or (version[:2] == (1, 27) and version < (1, 27, 3)):
+        fail(f"go.mod toolchain is below the security floor: {intended}")
+    dependencies = {row["Path"]: row["Version"] for row in module.get("Require") or []}
+    net_version = dependencies.get("golang.org/x/net", "")
+    if stable_version(net_version, "v") < (0, 62, 0):
+        fail(f"golang.org/x/net is below the security floor: {net_version}")
+    replacements = {row["Old"]["Path"]: row["New"] for row in module.get("Replace") or []}
+    if "golang.org/x/net" in replacements:
+        fail("golang.org/x/net must use its verified upstream module, not a replacement")
+    # Go validates the complete vendor/modules.txt declaration set before
+    # listing a module, so a stale vendored version cannot pass this preflight.
+    selected = json.loads(run("go", "list", "-mod=vendor", "-m", "-json", "golang.org/x/net"))
+    if selected.get("Version") != net_version or selected.get("Replace"):
+        fail("selected golang.org/x/net does not match go.mod")
+    return {"toolchain": intended, "dependencies": dependencies, "replacements": replacements}
+
 def toolchain():
-    return json.loads(run("go", "env", "-json", "GOVERSION", "GOHOSTOS", "GOHOSTARCH",
-                          "GOEXPERIMENT", "GOTOOLCHAIN", "GOFLAGS", "GOWORK", "CGO_ENABLED"))
+    validate_go_flags(os.environ.get("GOFLAGS", ""))
+    actual = json.loads(run("go", "env", "-json", "GOVERSION", "GOHOSTOS", "GOHOSTARCH",
+                            "GOEXPERIMENT", "GOTOOLCHAIN", "GOFLAGS", "GOWORK", "CGO_ENABLED"))
+    validate_go_flags(actual["GOFLAGS"])
+    intended = module_policy()["toolchain"]
+    if actual["GOVERSION"] != intended or actual["GOTOOLCHAIN"] != "local":
+        fail(f"release requires {intended} with GOTOOLCHAIN=local; selected {actual['GOVERSION']}")
+    return actual
 
 def dataset():
     path = root / "tests/testdata/benchmark/medium.jsonl"
@@ -120,6 +172,78 @@ def save(value):
         json.dump(value, f, indent=2, sort_keys=True)
         f.write("\n")
 
+def audit_source():
+    actual = toolchain()
+    parent = outside(os.environ.get("RELEASE_GATE_OUTPUT_DIR", "/tmp"))
+    output = pathlib.Path(tempfile.mkdtemp(prefix="bv-source-audit-", dir=parent))
+    tool_dir = output / "tools"
+    tool_dir.mkdir()
+    env = dict(os.environ, GOOS=actual["GOHOSTOS"], GOARCH=actual["GOHOSTARCH"],
+               GOFLAGS=actual["GOFLAGS"], GOBIN=str(tool_dir), GOTOOLCHAIN="local", GOWORK="off")
+    install_log = output / "install.log"
+    install_command = ["go", "install", "golang.org/x/vuln/cmd/govulncheck@v1.9.0"]
+    with open(install_log, "wb") as log:
+        installed = subprocess.run(install_command, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT)
+    if installed.returncode:
+        fail(f"could not install pinned govulncheck (exit {installed.returncode}); see {install_log}")
+    scanner = tool_dir / ("govulncheck.exe" if actual["GOHOSTOS"] == "windows" else "govulncheck")
+    build_info = run("go", "version", "-m", str(scanner))
+    if not re.search(r"(?m)^\s*mod\s+golang.org/x/vuln\s+v1\.9\.0(?:\s|$)", build_info):
+        fail(f"govulncheck executable does not identify pinned x/vuln v1.9.0: {scanner}")
+    result = {"started_at": datetime.now(timezone.utc).isoformat(),
+              "tool": {"path": str(scanner), "sha256": digest(scanner), "build_info": build_info},
+              "database": "https://vuln.go.dev", "mode": "source", "format": "text", "scans": []}
+    for goos, goarch in sorted(release_targets):
+        target_log = output / f"govulncheck-{goos}-{goarch}.log"
+        command = [str(scanner), "-db=https://vuln.go.dev", "-mode=source", "-show=version", "./..."]
+        # govulncheck accepts GOVERSION as an override for standard-library
+        # analysis. Bind it to the selected compiler, never the caller's env.
+        scan_env = dict(os.environ, GOOS=goos, GOARCH=goarch, CGO_ENABLED="0",
+                        GOTOOLCHAIN="local", GOWORK="off", GOVERSION=actual["GOVERSION"],
+                        GOFLAGS=actual["GOFLAGS"])
+        with open(target_log, "wb") as log:
+            scanned = subprocess.run(command, cwd=root, env=scan_env, stdout=log, stderr=subprocess.STDOUT)
+        result["scans"].append({"goos": goos, "goarch": goarch, "exit_code": scanned.returncode,
+                                "go_version": scan_env["GOVERSION"], "cgo_enabled": scan_env["CGO_ENABLED"],
+                                "go_flags": scan_env["GOFLAGS"],
+                                "command": command, "path": str(target_log), "sha256": digest(target_log)})
+        print(f"source vulnerability scan {goos}/{goarch}: exit={scanned.returncode}; {target_log}", flush=True)
+    # Text output preserves govulncheck's nonzero exit status for reachable
+    # findings. JSON/SARIF/OpenVEX output alone is not a blocking check.
+    result["finished_at"] = datetime.now(timezone.utc).isoformat()
+    report = output / "audit.json"
+    with open(report, "w") as f:
+        json.dump(result, f, indent=2, sort_keys=True)
+        f.write("\n")
+    if receipt_path is not None:
+        value = load()
+        value["source_audit"] = result
+        save(value)
+    if any(row["exit_code"] != 0 for row in result["scans"]):
+        fail(f"source vulnerability analysis failed; see {report}")
+    print(f"source vulnerability analysis passed for all release targets: {report}")
+
+def verify_audit(value):
+    audit = value.get("source_audit", {})
+    rows = audit.get("scans", [])
+    if (audit.get("mode") != "source" or audit.get("format") != "text" or
+            audit.get("database") != "https://vuln.go.dev" or len(rows) != len(release_targets) or
+            {(row.get("goos"), row.get("goarch")) for row in rows} != release_targets or
+            any(row.get("exit_code") != 0 for row in rows)):
+        fail("missing or unsuccessful source vulnerability evidence for release targets")
+    if any(row.get("go_version") != value["toolchain"]["GOVERSION"] or
+            row.get("cgo_enabled") != value["toolchain"]["CGO_ENABLED"] or
+            row.get("go_flags") != value["toolchain"]["GOFLAGS"] for row in rows):
+        fail("source vulnerability analysis environment differs from gate receipt")
+    for record in [audit["tool"], *rows]:
+        if digest(outside(record["path"])) != record["sha256"]:
+            fail(f"source vulnerability evidence changed: {record['path']}")
+    for row in rows:
+        # -show=version retains text-mode failure semantics and reports the
+        # version the scanner actually used, unlike the early-exit -version.
+        if f"Go: {row['go_version']}" not in pathlib.Path(row["path"]).read_text().splitlines():
+            fail(f"source vulnerability scanner Go version differs from gate receipt: {row['path']}")
+
 def verify_source(value):
     if value.get("schema") != 1 or value.get("eligible") is not True:
         fail("receipt is diagnostic/incomplete, not eligible for release")
@@ -136,6 +260,9 @@ def verify_source(value):
         fail(f"source changed after gate: receipt {value['source']['revision']} / current {current['revision']}")
     if value["toolchain"] != toolchain():
         fail("Go toolchain/build environment differs from gate receipt")
+    if value.get("module_policy") != module_policy():
+        fail("Go dependency policy differs from gate receipt")
+    verify_audit(value)
     if value["dataset"] != dataset():
         fail("benchmark dataset differs from gate receipt")
     config = value.get("packaging_config")
@@ -145,11 +272,21 @@ def verify_source(value):
 def binary_info(path, value):
     output = run("go", "version", "-m", str(path))
     settings = {}
+    dependencies = {}
+    dependency = None
     version = ""
     for line in output.splitlines():
         if line.startswith(str(path) + ": "):
             version = line[len(str(path)) + 2:]
         words = line.strip().split(None, 1)
+        fields = line.strip().split()
+        if len(fields) >= 3 and fields[0] == "dep":
+            dependency = fields[1]
+            dependencies[dependency] = {"version": fields[2]}
+            if len(fields) > 3:
+                dependencies[dependency]["sum"] = fields[3]
+        elif len(fields) >= 2 and fields[0] == "=>" and dependency:
+            dependencies[dependency]["replace"] = fields[1:]
         if len(words) == 2 and words[0] == "build" and "=" in words[1]:
             key, val = words[1].split("=", 1)
             settings[key] = val
@@ -161,16 +298,37 @@ def binary_info(path, value):
         fail(f"binary toolchain mismatch: {path}: {version}")
     if settings.get("CGO_ENABLED") != value["toolchain"]["CGO_ENABLED"]:
         fail(f"binary CGO setting differs from release build environment: {path}")
-    return {"sha256": digest(path), "go_version": version, "settings": settings}
+    policy = value["module_policy"]
+    if "golang.org/x/net" not in dependencies:
+        fail(f"binary is missing golang.org/x/net build information: {path}")
+    for name, metadata in dependencies.items():
+        expected = policy["dependencies"].get(name)
+        if expected is None or metadata["version"] != expected:
+            fail(f"binary dependency mismatch: {path}: {name} {metadata['version']} != {expected}")
+        replacement = policy["replacements"].get(name)
+        if replacement:
+            wanted = [replacement["Path"], replacement.get("Version") or "(devel)"]
+            if metadata.get("replace", [])[:2] != wanted:
+                fail(f"binary replacement mismatch: {path}: {name}")
+        elif "replace" in metadata:
+            fail(f"binary has undeclared dependency replacement: {path}: {name}")
+    return {"sha256": digest(path), "go_version": version, "settings": settings,
+            "dependencies": dependencies}
 
 try:
     if mode == "check-output":
         outside(args[0])
+    elif mode == "verify-toolchain":
+        actual = toolchain()
+        policy = module_policy()
+        print(f"release toolchain verified: {actual['GOVERSION']}; golang.org/x/net {policy['dependencies']['golang.org/x/net']}")
+    elif mode == "audit":
+        audit_source()
     elif mode == "init":
         outside(receipt_path)
         if receipt_path.exists(): fail(f"refusing to reuse receipt: {receipt_path}")
         save({"schema": 1, "eligible": False, "created_at": datetime.now(timezone.utc).isoformat(),
-              "source": source(), "toolchain": toolchain(), "dataset": dataset(),
+              "source": source(), "toolchain": toolchain(), "module_policy": module_policy(), "dataset": dataset(),
               "stages": [], "diagnostic_environment": args})
     elif mode == "stage":
         value = load()
@@ -187,6 +345,8 @@ try:
                 value["toolchain"] == toolchain() and
                 value["dataset"]["sha256"] is not None and len(value["stages"]) == len(stages) and
                 all(row["status"] == "passed" for row in value["stages"]))
+        if value["eligible"]:
+            verify_audit(value)
         save(value)
         print("eligible" if value["eligible"] else "diagnostic")
     elif mode == "verify-source":
@@ -245,7 +405,7 @@ try:
             if target in targets: fail(f"duplicate release target: {target}")
             targets.add(target)
             records.append({"path": str(archive), "sha256": sha, "binary": info})
-        required = {("linux", "amd64"), ("linux", "arm64"), ("darwin", "amd64"), ("darwin", "arm64"), ("windows", "amd64")}
+        required = release_targets
         if targets != required: fail(f"release target set mismatch: got {sorted(targets)}, want {sorted(required)}")
         verify_source(value)
         value["artifacts"] = records
@@ -272,7 +432,8 @@ PY
 }
 
 case "${1:-run}" in
-  verify-source|verify-binary|seal|verify) receipt "$@"; exit $? ;;
+  verify-toolchain|verify-source|verify-binary|seal|verify) receipt "$@"; exit $? ;;
+  audit) RELEASE_GATE_RECEIPT= receipt audit; exit $? ;;
   package)
     receipt verify-source || exit 1
     # GoReleaser creates its dist directory; never clean/delete an existing one.
@@ -288,7 +449,7 @@ case "${1:-run}" in
     exit $?
     ;;
   run) ;;
-  *) echo "usage: $0 [run|verify-source|verify-binary PATH|package|seal DIR|verify]" >&2; exit 2 ;;
+  *) echo "usage: $0 [run|verify-toolchain|audit|verify-source|verify-binary PATH|package|seal DIR|verify]" >&2; exit 2 ;;
 esac
 
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -417,8 +578,10 @@ script_self_tests() {
   # The gate's own helpers have tests; a comparator that mis-parses a column
   # or an installer that stops failing closed must not pass silently.
   tests/scripts/benchmark_compare_test.sh || return 1
-  # This harness executes synthetic Git repositories, never a release publish.
-  tests/scripts/release_gate_test.sh || return 1
+  # Fixture scanner responses are synthetic to test orchestration and failure
+  # rejection; Go/GoReleaser packaging is real. Stage 11 runs the required real
+  # project source vulnerability scans, including access to the real database.
+  bash tests/scripts/release_gate_test.sh gate-mechanics || return 1
   local pwsh="${PWSH:-pwsh}"
   if command -v "$pwsh" >/dev/null 2>&1; then
     PWSH="$pwsh" tests/scripts/install_ps1_test.sh || return 1
@@ -427,6 +590,8 @@ script_self_tests() {
     return 200
   fi
 }
+
+source_vulnerabilities() { receipt audit; }
 
 # Stages that wrap script_stage translate its MISSING_OK sentinel (200) into a skip.
 run_script_stage() {
@@ -456,6 +621,7 @@ run_script_stage 7 vendor-hashes scripts/verify_vendor.sh --source
 stage 8 benchmarks benchmarks
 run_script_stage 9 robot-smoke scripts/robot_smoke.sh
 stage 10 script-tests script_self_tests
+stage 11 source-vulnerabilities source_vulnerabilities
 
 total=$(( $(date +%s) - gate_start ))
 echo "----- release gate finished in ${total}s: ${#failed[@]} failed, ${#skipped[@]} skipped (log: $log)" | tee -a "$log"

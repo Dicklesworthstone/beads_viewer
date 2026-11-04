@@ -33,4 +33,4 @@ release-verify:
 
 # Keep the audit tool outside the application's module requirements.
 release-audit:
-	env -u CGO_CFLAGS go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+	env -u CGO_CFLAGS bash scripts/release_gate.sh audit

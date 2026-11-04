@@ -15,6 +15,7 @@ builds:
     env:
       - CGO_ENABLED=0
       - GOWORK=off
+      - GOTOOLCHAIN=local
     flags:
       - -buildvcs=true
     hooks:
