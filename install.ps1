@@ -205,6 +205,14 @@ function Assert-BinaryVersion {
                 # A descendant may inherit these pipes after the child exits.
                 # Never await EOF indefinitely, including after a timeout kill.
                 if (($streams[0].Done -and $streams[1].Done) -or $drain.ElapsedMilliseconds -ge 1000) { break }
+            }
+            # Completed reads can already contain more buffered output. Drain
+            # those immediately instead of spending the deadline sleeping
+            # between chunks; the next iteration still checks both streams.
+            $readReady = (-not $streams[0].Done -and $streams[0].Pending.IsCompleted) -or
+                (-not $streams[1].Done -and $streams[1].Pending.IsCompleted)
+            if ($readReady) { continue }
+            if ($null -ne $drain) {
                 Start-Sleep -Milliseconds 10
             } else {
                 $remaining = [Math]::Max(0, 10000 - $execution.ElapsedMilliseconds)

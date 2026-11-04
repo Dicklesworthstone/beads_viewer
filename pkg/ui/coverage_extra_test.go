@@ -205,6 +205,11 @@ func installEditorTracker(t *testing.T, tracker string) (model.Issue, string, st
 	}
 	state, capture := filepath.Join(root, "tracker-state.json"), filepath.Join(root, "calls.jsonl")
 	t.Setenv("PATH", binDir)
+	// The copied helpers retain race instrumentation. Skip only the race
+	// runtime's exit sleep, which otherwise consumes the capability probe's
+	// deadline after the helper has answered. The parent runtime has already
+	// initialized; its race checks and the helpers' other GORACE settings remain.
+	t.Setenv("GORACE", strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0"))
 	t.Setenv("BV_TEST_TRACKER_STATE", state)
 	t.Setenv("BV_TEST_TRACKER_CAPTURE", capture)
 	t.Setenv("BV_TEST_TRACKER_MODE", "")

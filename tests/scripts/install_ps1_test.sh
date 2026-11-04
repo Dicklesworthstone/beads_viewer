@@ -101,6 +101,7 @@ if [ "$rc" -eq 0 ] && [ -f "$tmp/install-pinned/bv.exe" ]; then echo "ok: -Versi
 # Only the platform guard is overridden: Fail and Assert-BinaryVersion are
 # extracted unchanged, and every candidate is a real process with real pipes.
 if ! python3 - "$pwsh" "$root/install.ps1" "$tmp" <<'PY'
+import math
 import os
 from pathlib import Path
 import signal
@@ -112,7 +113,7 @@ pwsh, installer, scratch = sys.argv[1:]
 scratch = Path(scratch)
 probe = scratch / "version-probe.ps1"
 probe.write_text(r'''
-param([string]$Installer, [string]$Binary)
+param([string]$Installer, [string]$Binary, [string]$TimingFile)
 $ErrorActionPreference = 'Stop'
 $tokens = $null
 $errors = $null
@@ -126,9 +127,22 @@ foreach ($name in @('Fail', 'Assert-BinaryVersion')) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
 function Test-IsWindowsHost { return $true }
-Assert-BinaryVersion -Binary $Binary -Tag 'v0.0.1'
+$verification = [System.Diagnostics.Stopwatch]::StartNew()
+try {
+    Assert-BinaryVersion -Binary $Binary -Tag 'v0.0.1'
+} finally {
+    $verification.Stop()
+    [IO.File]::WriteAllText($TimingFile, $verification.Elapsed.TotalSeconds.ToString('R', [Globalization.CultureInfo]::InvariantCulture))
+}
 Write-Output 'version accepted'
 ''')
+
+def operation_timing_errors(elapsed, timed_out):
+    if timed_out and elapsed < 10:
+        return [f'returned before original 10-second deadline: {elapsed:.3f}s']
+    if not timed_out and elapsed >= 5:
+        return [f'exited child blocked for {elapsed:.3f}s']
+    return []
 
 cases = [
     ("version-success", "print('bv v0.0.1', flush=True)", 0, ["version accepted"], False),
@@ -137,6 +151,10 @@ cases = [
      ["exited with code 7", "nonzero diagnostic"], False),
     ("version-oversized", "print('bv v0.0.1' + ' ' * 65536, flush=True)", 1,
      ["Unexpected --version output"], False),
+    # Sleeping between 1024-character chunks cannot drain this finite burst
+    # within the execution/drain deadlines. Ready reads must make progress.
+    ("version-stderr-burst", "print('x' * (1024 * 1024), file=sys.stderr, flush=True)\n"
+     "print('bv v0.0.1', flush=True)", 0, ["version accepted"], False),
     ("timeout-diagnostics", "print('timeout stdout marker', flush=True)\n"
      "print('timeout stderr marker', file=sys.stderr, flush=True)\ntime.sleep(30)", 1,
      ["timed out", "timeout stdout marker", "timeout stderr marker"], True),
@@ -150,6 +168,10 @@ cases = [
     ("exited-inherited-pipes", "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
      "print('bv v0.0.1', flush=True)\nprint('exited stderr marker', file=sys.stderr, flush=True)", 1,
      ["incomplete", "bv v0.0.1", "exited stderr marker"], False),
+    # A real slow operation must still fail the unchanged five-second check,
+    # even though PowerShell startup and AST extraction are measured separately.
+    ("slow-version-timing-control", "time.sleep(6)\nprint('bv v0.0.1', flush=True)", 0,
+     ["version accepted"], False),
 ]
 failed = False
 for name, body, expected, markers, timed_out in cases:
@@ -158,9 +180,10 @@ for name, body, expected, markers, timed_out in cases:
                          "Path(__file__ + '.pid').write_text(str(os.getpid()))\n"
                          "if sys.argv[1:] != ['--version']: sys.exit(91)\n" + body + '\n')
     candidate.chmod(0o700)
+    timing_file = scratch / (name + '.seconds')
     started = time.monotonic()
     process = subprocess.Popen([pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-File', str(probe),
-                                '-Installer', installer, '-Binary', str(candidate)],
+                                '-Installer', installer, '-Binary', str(candidate), '-TimingFile', str(timing_file)],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     outer_timeout = False
     child_still_running = False
@@ -190,6 +213,13 @@ for name, body, expected, markers, timed_out in cases:
     (scratch / (name + '.stderr')).write_bytes(stderr)
     output = (stdout + stderr).decode(errors='replace')
     errors = []
+    verification_elapsed = None
+    try:
+        verification_elapsed = float(timing_file.read_text())
+        if not math.isfinite(verification_elapsed) or not 0 <= verification_elapsed <= elapsed:
+            raise ValueError('verification interval is outside the process lifetime')
+    except (OSError, ValueError) as error:
+        errors.append(f'missing or invalid function timing: {error}')
     if outer_timeout:
         errors.append('exceeded 15-second outer guard')
     if child_still_running:
@@ -201,16 +231,24 @@ for name, body, expected, markers, timed_out in cases:
             errors.append(f'missing {marker!r}')
     if len(stdout) + len(stderr) > 10000:
         errors.append('diagnostic output exceeds 10000 bytes')
-    if timed_out and elapsed < 10:
-        errors.append(f'returned before original 10-second deadline: {elapsed:.3f}s')
-    if not timed_out and elapsed >= 5:
-        errors.append(f'exited child blocked for {elapsed:.3f}s')
+    # Include child launch, execution, pipe draining and disposal in the same
+    # original limits, excluding only PowerShell startup and AST extraction.
+    # The fifteen-second outer guard above still bounds the complete process.
+    timing_errors = [] if verification_elapsed is None else operation_timing_errors(verification_elapsed, timed_out)
+    if name == 'slow-version-timing-control':
+        if not timing_errors:
+            errors.append('five-second check accepted the deliberately slow operation')
+    else:
+        errors.extend(timing_errors)
     if errors:
         failed = True
         print(f'FAIL: {name}: {"; ".join(errors)}', flush=True)
         print(output, flush=True)
+    elif name == 'slow-version-timing-control':
+        print(f'ok: {name} (five-second check rejects {verification_elapsed:.3f}s operation, '
+              f'{elapsed:.3f}s overall)', flush=True)
     else:
-        print(f'ok: {name} (exit {process.returncode}, {elapsed:.3f}s, '
+        print(f'ok: {name} (exit {process.returncode}, {verification_elapsed:.3f}s function, {elapsed:.3f}s overall, '
               f'{len(stdout) + len(stderr)} diagnostic bytes)', flush=True)
 
 # Exercise the same toolchain policy and metadata check used before the source
