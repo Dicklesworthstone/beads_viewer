@@ -164,6 +164,16 @@ The retained `.github/workflows/ci.yml` invokes the gate with diagnostic skips.
 Those settings cannot authorize release. Final packaging always requires the
 complete gate for the exact clean source commit, with no skipped stages.
 
+The retained `release.yml` verifies the selected compiler immediately after
+setup, requires the complete receipt, installs GoReleaser **v2.18.1** without
+running it, and calls `scripts/release_gate.sh package` to scan and seal the
+archives. It has read-only permissions and no publication-token bindings.
+For local DSR/`act` execution, supply `RELEASE_GATE_RECEIPT` and
+`RELEASE_GATE_DIST`, with the clean checkout and retained evidence available
+at their recorded paths. The output path must be fresh and outside the
+checkout. Keep the tracked GoReleaser flags, including `-mod=vendor` and
+`-trimpath`; do not add them through `GOFLAGS`.
+
 ## Release steps
 
 The current release route uses the local/SSH gate and GoReleaser packaging,
@@ -187,9 +197,13 @@ Update Homebrew and Scoop directly from the same checksum manifest when
 separately authorized.
 The release request can authorize this entire sequence, including both stores;
 do not ask again when it already does.
+Approval to commit directly to `main` does not itself authorize a tag, draft
+upload, or publication. Obtain the separately requested release approval
+before those actions.
 
 1. Update the version, `CHANGELOG.md`, and release documentation; commit
-   those changes on `main` **before** the final gate. Confirm the tree is clean.
+   those changes on `main` with explicit approval **before** the final gate.
+   Confirm the tree is clean.
 2. Run `scripts/release_gate.sh`; retain the printed `receipt.json` and log.
    Set `RELEASE_GATE_RECEIPT` to that absolute receipt path. Only a summary
    saying `RELEASE GATE PASSED` permits the next step.

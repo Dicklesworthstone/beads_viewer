@@ -1,6 +1,7 @@
 name: Release
 
 # Retained as input for local DSR/act execution. GitHub Actions stays disabled.
+# DSR supplies the complete gate receipt and a fresh output path outside the checkout.
 env:
   GOTOOLCHAIN: local
   GOWORK: 'off'
@@ -11,7 +12,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   goreleaser:
@@ -25,14 +26,16 @@ jobs:
           go-version-file: go.mod
       - name: Verify release toolchain
         run: bash scripts/release_gate.sh verify-toolchain
-      - name: Run GoReleaser
+      - name: Verify release gate receipt
+        run: |
+          : "${RELEASE_GATE_RECEIPT:?DSR must supply a complete gate receipt}"
+          : "${RELEASE_GATE_DIST:?DSR must supply a fresh external output path}"
+          bash scripts/release_gate.sh verify-source
+      - name: Install GoReleaser
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
           distribution: goreleaser
-          version: '~> v2'
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Token with write access to homebrew-tap and scoop-bucket repos
-          # Set this as a repository secret with repo scope
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          version: 'v2.18.1'
+          install-only: true
+      - name: Package and seal verified artifacts
+        run: bash scripts/release_gate.sh package

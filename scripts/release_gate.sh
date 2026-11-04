@@ -433,6 +433,7 @@ try:
     elif mode == "verify-binary":
         value = load(); verify_source(value)
         path = outside(args[0]); info = binary_info(path, value)
+        audit_binary(path, info, value)
         print(f"binary verified: {path} sha256={info['sha256']}")
     elif mode == "package-config":
         value = load(); verify_source(value)
@@ -447,6 +448,10 @@ try:
         config = receipt_path.parent / ("goreleaser-" + hashlib.sha256(str(dist).encode()).hexdigest()[:16] + ".yaml")
         with open(config, "x") as f: f.write(rendered)
         value["packaging_config"] = {"path": str(config), "sha256": digest(config), "dist": str(dist)}
+        # A fresh packaging attempt supersedes earlier artifacts before any
+        # post-build scan runs. A failed hook must not leave an old seal usable.
+        value.pop("artifacts", None)
+        value.pop("checksums", None)
         save(value)
         print(config)
     elif mode == "seal":

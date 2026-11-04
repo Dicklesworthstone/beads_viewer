@@ -20,6 +20,7 @@ builds:
     flags:
       - -buildvcs=true
       - -trimpath
+      - -mod=vendor
     hooks:
       post:
         - bash scripts/release_gate.sh verify-binary "{{ .Path }}"

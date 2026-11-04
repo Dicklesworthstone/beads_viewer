@@ -509,6 +509,25 @@ for artifact in r['artifacts']:
                          'GOFLAGS': r['toolchain']['GOFLAGS'],
                          'GOOS': audit['goos'], 'GOARCH': audit['goarch']}]
 PY
+  # GoReleaser's post-build hook must fail on findings and scanner errors,
+  # before archive sealing can provide a second independent scan.
+  for code in 3 1; do
+    reject "binary-posthook-exit-$code" 'unsuccessful binary vulnerability evidence' \
+      env GOVERSION=go1.99.0 FIXTURE_BINARY_SCANNER_EXIT="$code" \
+      bash "$fixture/scripts/release_gate.sh" verify-binary "$tmp/binaries/bv-linux-amd64"
+  done
+  cp "$receipt" "$tmp/failed-package.json"
+  reject failed-package-posthook 'unsuccessful binary vulnerability evidence' \
+    env RELEASE_GATE_RECEIPT="$tmp/failed-package.json" FIXTURE_BINARY_SCANNER_EXIT=3 \
+    RELEASE_GATE_DIST="$tmp/failed-package-dist" bash "$fixture/scripts/release_gate.sh" package
+  python3 - "$tmp/failed-package.json" "$tmp/failed-package-dist" <<'PY'
+import json, pathlib, sys
+r = json.load(open(sys.argv[1]))
+assert 'artifacts' not in r and 'checksums' not in r
+assert not (pathlib.Path(sys.argv[2]) / 'checksums.txt').exists()
+PY
+  reject failed-package-evidence 'no complete packaged archive evidence' \
+    env RELEASE_GATE_RECEIPT="$tmp/failed-package.json" bash "$fixture/scripts/release_gate.sh" verify
   for code in 3 1; do
     cp "$tmp/receipt-before-tampering.json" "$receipt"
     reject "binary-scan-exit-$code" 'unsuccessful binary vulnerability evidence' \
