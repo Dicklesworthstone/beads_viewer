@@ -157,13 +157,23 @@ if [ "$scope" != all ]; then
   export FIXTURE_SCANNER_OBSERVER="$tmp/scanner-observer.py"
   cat >"$FIXTURE_SCANNER_OBSERVER" <<'PY'
 #!/usr/bin/env python3
-import json, os, sys
+import hashlib, json, os, pathlib, sys
 print("Go: " + os.environ["GOVERSION"])
 print("fixture-only scanner environment: " + json.dumps({
     key: os.environ[key] for key in ("GOVERSION", "CGO_ENABLED", "GOOS", "GOARCH", "GOFLAGS")
 }, sort_keys=True))
 print("fixture scanner observer completed; no vulnerability analysis performed")
-code = int(os.environ.get("FIXTURE_SCANNER_EXIT", "0"))
+binary_mode = "-mode=binary" in sys.argv
+if binary_mode:
+    binary = pathlib.Path(sys.argv[-1])
+    print("fixture binary scan sha256: " + hashlib.sha256(binary.read_bytes()).hexdigest())
+    if os.environ.get("FIXTURE_BINARY_MUTATE") == "1":
+        with binary.open("ab") as f:
+            f.write(b"fixture changed binary during scan")
+if os.environ.get("FIXTURE_SCANNER_MUTATE") == ("binary" if binary_mode else "source"):
+    with open(__file__, "a") as f:
+        f.write("\n# fixture changed scanner during scan\n")
+code = int(os.environ.get("FIXTURE_BINARY_SCANNER_EXIT" if binary_mode else "FIXTURE_SCANNER_EXIT", "0"))
 if code:
     print("fixture planned scanner exit: " + str(code))
 sys.exit(code)
@@ -182,7 +192,18 @@ fi
 if [ "$#" -eq 3 ] && [ "$1" = version ] && [ "$2" = -m ]; then
   case "$3" in
     */govulncheck|*/govulncheck.exe)
-      printf '%s: %s\n\tmod\tgolang.org/x/vuln\tv1.9.0\n' "$3" "$("$REAL_GO_FOR_FIXTURE" env GOVERSION)"
+      compiler="$("$REAL_GO_FOR_FIXTURE" env GOVERSION)"
+      version=v1.9.0
+      command=golang.org/x/vuln/cmd/govulncheck
+      case "${FIXTURE_SCANNER_METADATA:-}" in
+        old-compiler) compiler=go1.26.8 ;;
+        old-version) version=v1.8.0 ;;
+        wrong-command) command=example.invalid/pretend-scanner ;;
+      esac
+      printf '%s: %s\n\tpath\t%s\n\tmod\tgolang.org/x/vuln\t%s\n' "$3" "$compiler" "$command" "$version"
+      if [ "${FIXTURE_SCANNER_METADATA:-}" = replacement ]; then
+        printf '\t=>\t./fixture-scanner-replacement\t(devel)\n'
+      fi
       exit ;;
   esac
 fi
@@ -312,6 +333,16 @@ row.update(path=str(log), sha256=hashlib.sha256(log.read_bytes()).hexdigest())
 json.dump(r, open(sys.argv[2], 'w'))
 PY
 reject wrong-audit-header 'scanner Go version differs' env RELEASE_GATE_RECEIPT="$tmp/wrong-audit-header.json" bash "$fixture/scripts/release_gate.sh" verify-source
+if [ "$scope" != all ]; then
+  # Only the build-info observation is synthetic; the gate must inspect the
+  # actual executable metadata again instead of trusting a stored version.
+  for metadata in old-version wrong-command replacement; do
+    reject "scanner-$metadata" 'must identify upstream x/vuln v1.9.0 without replacement' \
+      env FIXTURE_SCANNER_METADATA="$metadata" bash "$fixture/scripts/release_gate.sh" verify-source
+  done
+  reject scanner-old-compiler 'govulncheck compiler is below the security floor' \
+    env FIXTURE_SCANNER_METADATA=old-compiler bash "$fixture/scripts/release_gate.sh" verify-source
+fi
 if [ "$scope" = audit-environment ]; then
   echo 'release_gate_test: PASS (focused scanner environment control; synthetic observer, no vulnerability scan/publication)'
   exit 0
@@ -435,10 +466,80 @@ assert len(r['artifacts']) == 5
 for artifact in r['artifacts']:
     assert artifact['binary']['dependencies']['golang.org/x/net']['version'] == sys.argv[2]
     assert artifact['binary']['go_version'] == r['toolchain']['GOVERSION']
+    audit = artifact['binary_audit']
+    assert audit['mode'] == 'binary' and audit['format'] == 'text' and audit['exit_code'] == 0
+    assert audit['binary_sha256'] == artifact['binary']['sha256']
+    assert audit['tool'] == r['source_audit']['tool']
+    assert audit['go_version'] == artifact['binary']['go_version']
+    assert audit['started_at'] and audit['finished_at']
 PY
 
 # Archive evidence stays independently reviewable after later negative controls.
 cp "$receipt" "$tmp/receipt-before-tampering.json"
+
+# An archive hash without successful scans of its exact binary is insufficient.
+python3 - "$receipt" "$tmp/no-binary-audit.json" "$tmp/wrong-binary-audit.json" "$tmp/changed-binary-audit.json" <<'PY'
+import copy, json, sys
+original = json.load(open(sys.argv[1]))
+missing = copy.deepcopy(original)
+missing['artifacts'][0].pop('binary_audit')
+json.dump(missing, open(sys.argv[2], 'w'))
+wrong = copy.deepcopy(original)
+wrong['artifacts'][0]['binary_audit']['binary_sha256'] = '0' * 64
+json.dump(wrong, open(sys.argv[3], 'w'))
+changed = copy.deepcopy(original)
+changed['artifacts'][0]['binary_audit']['sha256'] = '0' * 64
+json.dump(changed, open(sys.argv[4], 'w'))
+PY
+reject no-binary-audit 'unsuccessful binary vulnerability evidence' env RELEASE_GATE_RECEIPT="$tmp/no-binary-audit.json" bash "$fixture/scripts/release_gate.sh" verify
+reject wrong-binary-audit 'differs from archived binary' env RELEASE_GATE_RECEIPT="$tmp/wrong-binary-audit.json" bash "$fixture/scripts/release_gate.sh" verify
+reject changed-binary-audit 'binary vulnerability evidence changed' env RELEASE_GATE_RECEIPT="$tmp/changed-binary-audit.json" bash "$fixture/scripts/release_gate.sh" verify
+
+if [ "$scope" = gate-mechanics ]; then
+  python3 - "$receipt" <<'PY'
+import json, pathlib, sys
+r = json.load(open(sys.argv[1]))
+for artifact in r['artifacts']:
+    audit = artifact['binary_audit']
+    lines = pathlib.Path(audit['path']).read_text().splitlines()
+    assert 'fixture binary scan sha256: ' + artifact['binary']['sha256'] in lines
+    prefix = 'fixture-only scanner environment: '
+    observed = [json.loads(line[len(prefix):]) for line in lines if line.startswith(prefix)]
+    assert observed == [{'GOVERSION': artifact['binary']['go_version'], 'CGO_ENABLED': '0',
+                         'GOFLAGS': r['toolchain']['GOFLAGS'],
+                         'GOOS': audit['goos'], 'GOARCH': audit['goarch']}]
+PY
+  for code in 3 1; do
+    cp "$tmp/receipt-before-tampering.json" "$receipt"
+    reject "binary-scan-exit-$code" 'unsuccessful binary vulnerability evidence' \
+      env GOVERSION=go1.99.0 FIXTURE_BINARY_SCANNER_EXIT="$code" bash "$fixture/scripts/release_gate.sh" seal "$dist"
+    reject "failed-reseal-$code" 'no complete packaged archive evidence' bash "$fixture/scripts/release_gate.sh" verify
+    cp "$receipt" "$tmp/failed-reseal-$code.json"
+  done
+  cp "$tmp/receipt-before-tampering.json" "$receipt"
+  reject changed-during-binary-scan 'archived binary changed during vulnerability analysis' \
+    env FIXTURE_BINARY_MUTATE=1 bash "$fixture/scripts/release_gate.sh" seal "$dist"
+  reject changed-binary-reseal 'no complete packaged archive evidence' bash "$fixture/scripts/release_gate.sh" verify
+  cp "$receipt" "$tmp/changed-binary-reseal.json"
+  scanner="$(python3 - "$receipt" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))['source_audit']['tool']['path'])
+PY
+)"
+  cp "$scanner" "$tmp/scanner-before-mutation"
+  cp "$tmp/receipt-before-tampering.json" "$receipt"
+  reject changed-during-scanner-run 'govulncheck executable changed after audit binding' \
+    env FIXTURE_SCANNER_MUTATE=binary bash "$fixture/scripts/release_gate.sh" seal "$dist"
+  mv "$scanner" "$tmp/scanner-after-mutation"
+  cp "$tmp/scanner-before-mutation" "$scanner"
+  chmod +x "$scanner"
+  reject changed-scanner-reseal 'no complete packaged archive evidence' bash "$fixture/scripts/release_gate.sh" verify
+  cp "$receipt" "$tmp/changed-scanner-reseal.json"
+  # Retain the failed-reseal receipts above and finish with a new
+  # real seal operation, never by restoring stale successful archive evidence.
+  GOVERSION=go1.99.0 bash "$fixture/scripts/release_gate.sh" seal "$dist"
+  bash "$fixture/scripts/release_gate.sh" verify
+fi
 
 (cd "$dirty" && CGO_ENABLED=0 GOWORK=off go build -buildvcs=true -o "$tmp/dirty-bv" ./cmd/bv)
 reject dirty-binary 'dirty/unknown source' bash "$fixture/scripts/release_gate.sh" verify-binary "$tmp/dirty-bv"
@@ -452,11 +553,15 @@ reject no-build-info 'binary revision mismatch' bash "$fixture/scripts/release_g
 # unmodified Go metadata from all five cross-built executables.
 mkdir -p "$tmp/metadata-tools"
 export REAL_GO_FOR_FIXTURE="$fixture_go"
+export BUILDINFO_GO_FOR_FIXTURE="$(command -v go)"
 cat >"$tmp/metadata-tools/go" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "${1:-}" = version ] && [ "${2:-}" = -m ]; then
-  "$REAL_GO_FOR_FIXTURE" "$@" | python3 -c '
+  case "${3:-}" in
+    */govulncheck|*/govulncheck.exe) exec "$BUILDINFO_GO_FOR_FIXTURE" "$@" ;;
+  esac
+  "$BUILDINFO_GO_FOR_FIXTURE" "$@" | python3 -c '
 import os, re, sys
 mode = os.environ["FIXTURE_BINARY_METADATA"]
 for line in sys.stdin:
@@ -474,7 +579,7 @@ for line in sys.stdin:
 '
   exit
 fi
-exec "$REAL_GO_FOR_FIXTURE" "$@"
+exec "$BUILDINFO_GO_FOR_FIXTURE" "$@"
 SH
 chmod +x "$tmp/metadata-tools/go"
 reject old-binary-compiler 'binary toolchain mismatch' \

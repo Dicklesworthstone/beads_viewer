@@ -3,6 +3,7 @@ name: CI
 # Retained as input for local DSR/act execution. GitHub Actions stays disabled.
 env:
   GOTOOLCHAIN: local
+  GOWORK: 'off'
 
 on:
   push:

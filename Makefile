@@ -20,7 +20,7 @@ clean:
 test:
 	go test ./...
 
-# These targets let RCH dispatch the complete release workflow as a Make build.
+# These targets let DSR dispatch the complete release workflow as a Make build.
 # The release gate owns toolchain settings; do not inherit the legacy FTS5 flag.
 release-gate:
 	env -u CGO_CFLAGS bash scripts/release_gate.sh run

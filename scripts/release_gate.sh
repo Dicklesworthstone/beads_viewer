@@ -120,7 +120,7 @@ def module_policy():
     # Empty caller GOFLAGS can fall back to settings persisted in GOENV.
     # Validate those before any module command can consume external inputs.
     validate_go_flags(run("go", "env", "GOFLAGS"))
-    module = json.loads(run("go", "mod", "edit", "-json"))
+    module = json.loads(run("go", "mod", "edit", "-json", str(root / "go.mod")))
     # `go mod tidy` removes a toolchain directive equal to the go directive.
     # Both canonical forms select the exact compiler; neither is a floating
     # major/minor version or permission to auto-upgrade the release toolchain.
@@ -172,6 +172,34 @@ def save(value):
         json.dump(value, f, indent=2, sort_keys=True)
         f.write("\n")
 
+def scanner_info(path):
+    path = outside(path)
+    sha = digest(path)
+    output = run("go", "version", "-m", str(path))
+    lines = [line.strip().split() for line in output.splitlines()]
+    command = [row[1] for row in lines if len(row) == 2 and row[0] == "path"]
+    modules = [row for row in lines if row and row[0] == "mod"]
+    if (command != ["golang.org/x/vuln/cmd/govulncheck"] or len(modules) != 1 or
+            modules[0][1:3] != ["golang.org/x/vuln", "v1.9.0"] or
+            any(row and row[0] == "=>" for row in lines)):
+        fail(f"govulncheck executable must identify upstream x/vuln v1.9.0 without replacement: {path}")
+    first = output.splitlines()[0] if output else ""
+    prefix = str(path) + ": "
+    if not first.startswith(prefix):
+        fail(f"govulncheck executable has no Go compiler metadata: {path}")
+    compiler = first[len(prefix):]
+    version = stable_version(compiler, "go")
+    if version < (1, 26, 10) or (version[:2] == (1, 27) and version < (1, 27, 3)):
+        fail(f"govulncheck compiler is below the security floor: {compiler}")
+    if digest(path) != sha:
+        fail("govulncheck executable changed during metadata inspection")
+    return {"path": str(path), "sha256": sha, "build_info": output,
+            "module_version": "v1.9.0", "go_version": compiler}
+
+def verify_scanner(record):
+    if scanner_info(record["path"]) != record:
+        fail("govulncheck executable changed after audit binding")
+
 def audit_source():
     actual = toolchain()
     parent = outside(os.environ.get("RELEASE_GATE_OUTPUT_DIR", "/tmp"))
@@ -187,11 +215,8 @@ def audit_source():
     if installed.returncode:
         fail(f"could not install pinned govulncheck (exit {installed.returncode}); see {install_log}")
     scanner = tool_dir / ("govulncheck.exe" if actual["GOHOSTOS"] == "windows" else "govulncheck")
-    build_info = run("go", "version", "-m", str(scanner))
-    if not re.search(r"(?m)^\s*mod\s+golang.org/x/vuln\s+v1\.9\.0(?:\s|$)", build_info):
-        fail(f"govulncheck executable does not identify pinned x/vuln v1.9.0: {scanner}")
     result = {"started_at": datetime.now(timezone.utc).isoformat(),
-              "tool": {"path": str(scanner), "sha256": digest(scanner), "build_info": build_info},
+              "tool": scanner_info(scanner),
               "database": "https://vuln.go.dev", "mode": "source", "format": "text", "scans": []}
     for goos, goarch in sorted(release_targets):
         target_log = output / f"govulncheck-{goos}-{goarch}.log"
@@ -203,6 +228,7 @@ def audit_source():
                         GOFLAGS=actual["GOFLAGS"])
         with open(target_log, "wb") as log:
             scanned = subprocess.run(command, cwd=root, env=scan_env, stdout=log, stderr=subprocess.STDOUT)
+        verify_scanner(result["tool"])
         result["scans"].append({"goos": goos, "goarch": goarch, "exit_code": scanned.returncode,
                                 "go_version": scan_env["GOVERSION"], "cgo_enabled": scan_env["CGO_ENABLED"],
                                 "go_flags": scan_env["GOFLAGS"],
@@ -227,6 +253,7 @@ def verify_audit(value):
     audit = value.get("source_audit", {})
     rows = audit.get("scans", [])
     if (audit.get("mode") != "source" or audit.get("format") != "text" or
+            not audit.get("started_at") or not audit.get("finished_at") or
             audit.get("database") != "https://vuln.go.dev" or len(rows) != len(release_targets) or
             {(row.get("goos"), row.get("goarch")) for row in rows} != release_targets or
             any(row.get("exit_code") != 0 for row in rows)):
@@ -235,6 +262,7 @@ def verify_audit(value):
             row.get("cgo_enabled") != value["toolchain"]["CGO_ENABLED"] or
             row.get("go_flags") != value["toolchain"]["GOFLAGS"] for row in rows):
         fail("source vulnerability analysis environment differs from gate receipt")
+    verify_scanner(audit["tool"])
     for record in [audit["tool"], *rows]:
         if digest(outside(record["path"])) != record["sha256"]:
             fail(f"source vulnerability evidence changed: {record['path']}")
@@ -243,6 +271,56 @@ def verify_audit(value):
         # version the scanner actually used, unlike the early-exit -version.
         if f"Go: {row['go_version']}" not in pathlib.Path(row["path"]).read_text().splitlines():
             fail(f"source vulnerability scanner Go version differs from gate receipt: {row['path']}")
+
+def audit_binary(path, info, value):
+    # Reuse the pinned, independently inspected scanner installed by the source
+    # audit. Scan the bytes taken from each final archive, including cross-built
+    # executables; none of those executables is run on the host.
+    scanner = value["source_audit"]["tool"]
+    verify_scanner(scanner)
+    command = [scanner["path"], "-db=https://vuln.go.dev", "-mode=binary", "-show=version", str(path)]
+    actual = value["toolchain"]
+    env = dict(os.environ, GOOS=info["settings"]["GOOS"], GOARCH=info["settings"]["GOARCH"],
+               CGO_ENABLED="0", GOTOOLCHAIN="local", GOWORK="off",
+               GOVERSION=info["go_version"], GOFLAGS=actual["GOFLAGS"])
+    record = {"mode": "binary", "format": "text", "database": "https://vuln.go.dev",
+              "started_at": datetime.now(timezone.utc).isoformat(), "tool": scanner,
+              "command": command, "binary_sha256": info["sha256"],
+              "goos": env["GOOS"], "goarch": env["GOARCH"], "go_version": env["GOVERSION"],
+              "cgo_enabled": env["CGO_ENABLED"], "go_flags": env["GOFLAGS"]}
+    descriptor, log_path = tempfile.mkstemp(prefix=f"bv-binary-audit-{env['GOOS']}-{env['GOARCH']}-",
+                                          suffix=".log", dir=outside(receipt_path.parent))
+    with os.fdopen(descriptor, "wb") as log:
+        log.write((json.dumps(record, sort_keys=True) + "\n").encode())
+        log.flush()
+        scanned = subprocess.run(command, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT)
+        log.write(f"\ngovulncheck exit status: {scanned.returncode}\n".encode())
+    record.update(exit_code=scanned.returncode, path=log_path, sha256=digest(log_path),
+                  finished_at=datetime.now(timezone.utc).isoformat())
+    print(f"binary vulnerability scan {env['GOOS']}/{env['GOARCH']}: exit={scanned.returncode}; {log_path}", flush=True)
+    verify_scanner(scanner)
+    if digest(path) != info["sha256"]:
+        fail("archived binary changed during vulnerability analysis")
+    # Linked vulnerable symbols conservatively block a release. Binary mode
+    # cannot establish attacker reachability; its findings get no exemption.
+    verify_binary_audit(record, info, value)
+    return record
+
+def verify_binary_audit(record, info, value):
+    if (not record or record.get("mode") != "binary" or record.get("format") != "text" or
+            record.get("database") != "https://vuln.go.dev" or record.get("exit_code") != 0 or
+            not record.get("started_at") or not record.get("finished_at")):
+        fail("missing or unsuccessful binary vulnerability evidence")
+    if (record.get("binary_sha256") != info["sha256"] or
+            record.get("go_version") != info["go_version"] or
+            record.get("goos") != info["settings"]["GOOS"] or
+            record.get("goarch") != info["settings"]["GOARCH"] or
+            record.get("cgo_enabled") != value["toolchain"]["CGO_ENABLED"] or
+            record.get("go_flags") != value["toolchain"]["GOFLAGS"] or
+            record.get("tool") != value["source_audit"]["tool"]):
+        fail("binary vulnerability evidence differs from archived binary or gate environment")
+    if digest(outside(record["path"])) != record["sha256"]:
+        fail(f"binary vulnerability evidence changed: {record['path']}")
 
 def verify_source(value):
     if value.get("schema") != 1 or value.get("eligible") is not True:
@@ -372,7 +450,13 @@ try:
         save(value)
         print(config)
     elif mode == "seal":
-        value = load(); verify_source(value)
+        value = load()
+        # A failed reseal must not leave an earlier successful artifact seal
+        # reusable. Keep the source-stage evidence, but consume the old seal.
+        value["artifacts"] = []
+        value.pop("checksums", None)
+        save(value)
+        verify_source(value)
         dist = outside(args[0])
         archives = sorted([*dist.glob("*.tar.gz"), *dist.glob("*.zip")])
         if not archives: fail(f"no release archives in {dist}")
@@ -401,10 +485,11 @@ try:
             binary = inspect_dir / f"binary-{i}"
             with open(binary, "xb") as f: f.write(data)
             info = binary_info(binary, value)
+            audit = audit_binary(binary, info, value)
             target = (info["settings"].get("GOOS"), info["settings"].get("GOARCH"))
             if target in targets: fail(f"duplicate release target: {target}")
             targets.add(target)
-            records.append({"path": str(archive), "sha256": sha, "binary": info})
+            records.append({"path": str(archive), "sha256": sha, "binary": info, "binary_audit": audit})
         required = release_targets
         if targets != required: fail(f"release target set mismatch: got {sorted(targets)}, want {sorted(required)}")
         verify_source(value)
@@ -417,6 +502,8 @@ try:
         artifacts = value.get("artifacts", [])
         if len(artifacts) != 5 or "checksums" not in value:
             fail("receipt has no complete packaged archive evidence; run package/seal first")
+        for artifact in artifacts:
+            verify_binary_audit(artifact.get("binary_audit"), artifact["binary"], value)
         for artifact in [*artifacts, value["checksums"], *([value["packaging_config"]] if "packaging_config" in value else [])]:
             path = outside(artifact["path"])
             actual = digest(path)

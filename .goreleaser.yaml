@@ -4,6 +4,7 @@ project_name: bv
 dist: /tmp/bv-dist
 before:
   hooks:
+    - bash scripts/release_gate.sh verify-toolchain
     - bash scripts/release_gate.sh verify-source
 # Packaging and publication are separate: release_gate.sh package seals the
 # final archive hashes before an explicitly authorized publication operation.
@@ -18,6 +19,7 @@ builds:
       - GOTOOLCHAIN=local
     flags:
       - -buildvcs=true
+      - -trimpath
     hooks:
       post:
         - bash scripts/release_gate.sh verify-binary "{{ .Path }}"

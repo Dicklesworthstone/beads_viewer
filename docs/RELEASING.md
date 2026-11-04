@@ -45,11 +45,14 @@ OpenVEX modes return zero even when they report vulnerabilities.
 
 Source-mode findings identify vulnerable calls in the selected build; binary
 mode reports linked vulnerable symbols and cannot establish an exploitable
-execution path. After packaging, inspect the actual executables with
-`go version -m` and run `govulncheck -mode=binary` against them. The gate checks
-each binary's compiler and linked dependency versions against the checked
-source, in addition to its revision, clean-source flag and target. A manifest
-change alone is not evidence that a packaged executable was rebuilt.
+execution path. Packaging extracts the actual executable from each final
+archive, inspects it with `go version -m`, and requires a successful
+`govulncheck -mode=binary` scan before sealing the archive. The gate binds the
+scanner identity and binary scan logs to the receipt, and checks each binary's
+compiler and linked dependency versions against the checked source, in
+addition to its revision, clean-source flag and target. A failed reseal clears
+prior artifact approval. A manifest change alone is not evidence that a
+packaged executable was rebuilt.
 
 ## The gate
 
@@ -170,8 +173,18 @@ artifact inputs. DSR's external-artifact mode does not create a DSR build
 manifest; the original gate receipt and downloaded-asset hash checks establish
 source identity and completeness for this route.
 Publish with `dsr release bv X.Y.Z --artifacts <verified-directory> --draft
---verify-tag --no-dispatch`; verify the uploaded draft assets before publishing
-it. Update Homebrew and Scoop directly from the same checksum manifest.
+--verify-tag --no-dispatch --no-manifest`. The external-artifact path needs
+`--no-manifest`; bv's receipt, seal and checksum verification remain mandatory.
+This mode uploads the directory's top-level files, so prepare a directory
+containing only the approved upload inventory rather than incidental
+GoReleaser metadata. Download and compare every draft asset against its
+verified local bytes. Preserve DSR state and publish that same verified draft
+with `--resume --publish-draft --verify-tag --no-dispatch --no-manifest`.
+The existing 14-asset contract comprises five platform archives, their five
+individual `.sha256` files, `checksums.txt`, `SHA256SUMS`,
+`release-gate-receipt.json`, and an SPDX SBOM of the packaged Linux amd64 binary.
+Update Homebrew and Scoop directly from the same checksum manifest when
+separately authorized.
 The release request can authorize this entire sequence, including both stores;
 do not ask again when it already does.
 
@@ -185,8 +198,9 @@ do not ask again when it already does.
 4. Set `RELEASE_GATE_DIST` to a fresh, nonexistent directory outside the
    checkout, then run `scripts/release_gate.sh package`. This runs GoReleaser
    with publication skipped, verifies every embedded binary's revision,
-   clean-source flag, Go version and dependency versions, checks `checksums.txt`, and seals hashes
-   for all five supported target archives into the receipt. Existing output
+   clean-source flag, Go version and dependency versions, scans the extracted
+   executable from each archive, checks `checksums.txt`, and seals hashes for
+   all five supported target archives into the receipt. Existing output
    directories are refused; the command does not delete them.
    GoReleaser does not template its dist field, so the wrapper derives a
    config beside the receipt that changes only the declared dist path. Its

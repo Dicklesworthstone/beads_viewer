@@ -26,12 +26,9 @@
 
         bvVersion = "0.26.1";
 
-        # To update vendorHash after go.mod/go.sum changes:
-        # 1. Set vendorHash to: pkgs.lib.fakeHash
-        # 2. Run: nix build .#bv 2>&1 | grep "got:"
-        # 3. Replace vendorHash with the hash from "got:"
-        # Updated to include pgregory.net/rapid and github.com/goccy/go-json dependencies
-        # If build fails, use fakeHash method documented above to recalculate
+        # Build from the checked-in vendor tree. Regenerate that tree with
+        # Go tooling when go.mod/go.sum change; do not fetch a second module
+        # graph during the Nix build.
         vendorHash = null;
       in
       {
@@ -43,6 +40,11 @@
             src = ./.;
 
             inherit vendorHash;
+
+            env = {
+              GOTOOLCHAIN = "local";
+              GOWORK = "off";
+            };
 
             subPackages = [ "cmd/bv" ];
 
@@ -101,6 +103,8 @@
         };
 
         devShells.default = pkgs.mkShell {
+          GOTOOLCHAIN = "local";
+          GOWORK = "off";
           buildInputs = [
             go
             pkgs.gopls

@@ -8,8 +8,9 @@ the October issue fixes) on top of the `v0.25.1..v0.25.2` audit (installer and
 terminal-layout fixes) and the `v0.25.0..v0.25.1` audit, which covered the
 September 14–16 graph, timeline, duplicate-detection and history-cache work and
 the September 17–29 source-selection, correlation, search, agent-file and
-layout fixes. Each release was published after its complete clean-source
-release gate passed.
+layout fixes. The v0.26.0 release notes disclose one failed E2E stage and an
+ineligible receipt; that historical exception does not authorize a future
+release to bypass its complete clean-source gate.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
 and release receipts; [research notes](CHANGELOG_RESEARCH.md) record coverage.
@@ -54,6 +55,8 @@ establish a published release or a passing release receipt.
   targets. Bind the scanner and successful scan logs to the existing release
   receipt. Verify each packaged executable's compiler and linked dependency
   versions in addition to its revision, clean-source flag and checksums.
+  Scan the executable extracted from each final archive before sealing it;
+  failed scans or reseals invalidate earlier artifact approval.
   Reject ambient build flags that could supply external source or module
   inputs outside that receipt.
 - Keep publication separate from packaging. Archive names, target matrix,
