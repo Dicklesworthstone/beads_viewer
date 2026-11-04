@@ -505,10 +505,16 @@ try:
     elif mode == "verify":
         value = load(); verify_source(value)
         artifacts = value.get("artifacts", [])
-        if len(artifacts) != 5 or "checksums" not in value:
+        if len(artifacts) != len(release_targets) or "checksums" not in value:
             fail("receipt has no complete packaged archive evidence; run package/seal first")
+        targets = set()
         for artifact in artifacts:
-            verify_binary_audit(artifact.get("binary_audit"), artifact["binary"], value)
+            info = artifact["binary"]
+            verify_binary_audit(artifact.get("binary_audit"), info, value)
+            targets.add((info["settings"]["GOOS"], info["settings"]["GOARCH"]))
+        # Five rows can still omit a platform if a saved artifact is duplicated.
+        if targets != release_targets:
+            fail(f"release target set mismatch: got {sorted(targets)}, want {sorted(release_targets)}")
         for artifact in [*artifacts, value["checksums"], *([value["packaging_config"]] if "packaging_config" in value else [])]:
             path = outside(artifact["path"])
             actual = digest(path)

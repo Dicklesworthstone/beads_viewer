@@ -495,6 +495,26 @@ reject no-binary-audit 'unsuccessful binary vulnerability evidence' env RELEASE_
 reject wrong-binary-audit 'differs from archived binary' env RELEASE_GATE_RECEIPT="$tmp/wrong-binary-audit.json" bash "$fixture/scripts/release_gate.sh" verify
 reject changed-binary-audit 'binary vulnerability evidence changed' env RELEASE_GATE_RECEIPT="$tmp/changed-binary-audit.json" bash "$fixture/scripts/release_gate.sh" verify
 
+# Keep five rows in these controls: completeness requires the exact target set,
+# and each scan's target must agree with the binary metadata it accompanies.
+python3 - "$receipt" "$tmp/duplicate-artifact-target.json" "$tmp/unsupported-artifact-target.json" "$tmp/mismatched-audit-target.json" <<'PY'
+import copy, json, sys
+original = json.load(open(sys.argv[1]))
+duplicate = copy.deepcopy(original)
+duplicate['artifacts'][1] = copy.deepcopy(duplicate['artifacts'][0])
+json.dump(duplicate, open(sys.argv[2], 'w'))
+unsupported = copy.deepcopy(original)
+unsupported['artifacts'][0]['binary']['settings']['GOOS'] = 'freebsd'
+unsupported['artifacts'][0]['binary_audit']['goos'] = 'freebsd'
+json.dump(unsupported, open(sys.argv[3], 'w'))
+mismatched = copy.deepcopy(original)
+mismatched['artifacts'][0]['binary_audit']['goos'] = 'freebsd'
+json.dump(mismatched, open(sys.argv[4], 'w'))
+PY
+reject duplicate-artifact-target 'release target set mismatch' env RELEASE_GATE_RECEIPT="$tmp/duplicate-artifact-target.json" bash "$fixture/scripts/release_gate.sh" verify
+reject unsupported-artifact-target 'release target set mismatch' env RELEASE_GATE_RECEIPT="$tmp/unsupported-artifact-target.json" bash "$fixture/scripts/release_gate.sh" verify
+reject mismatched-audit-target 'differs from archived binary' env RELEASE_GATE_RECEIPT="$tmp/mismatched-audit-target.json" bash "$fixture/scripts/release_gate.sh" verify
+
 if [ "$scope" = gate-mechanics ]; then
   python3 - "$receipt" <<'PY'
 import json, pathlib, sys
