@@ -938,7 +938,7 @@ func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageConte
 			Status:      score.Status,
 			Assignee:    issue.Assignee,
 			Priority:    score.Priority,
-			Labels:      issue.Labels,
+			Labels:      append([]string{}, issue.Labels...),
 			DeferUntil:  issue.DeferUntil,
 			Score:       score.TriageScore,
 			Breakdown:   score.Breakdown,

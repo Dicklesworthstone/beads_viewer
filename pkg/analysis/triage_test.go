@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -71,6 +72,47 @@ func TestComputeTriage_BasicIssues(t *testing.T) {
 	// Pure graph data does not identify an executable live tracker route.
 	if triage.Commands.ListReady != "" {
 		t.Errorf("unexpected unbound tracker command: %s", triage.Commands.ListReady)
+	}
+}
+
+func TestComputeTriageRecommendationLabelsJSON(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		labels []string
+	}{
+		{name: "nil"},
+		{name: "empty", labels: []string{}},
+		{name: "populated", labels: []string{"backend", "machine readable"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := ComputeTriage([]model.Issue{{
+				ID: "labels-1", Title: "Label JSON contract", Status: model.StatusOpen,
+				Priority: 1, IssueType: model.TypeTask, Labels: tc.labels,
+			}})
+			if len(result.Recommendations) != 1 {
+				t.Fatalf("expected one recommendation, got %d", len(result.Recommendations))
+			}
+			encoded, err := json.Marshal(result.Recommendations[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &fields); err != nil {
+				t.Fatal(err)
+			}
+			var labels []string
+			if err := json.Unmarshal(fields["labels"], &labels); err != nil {
+				t.Fatalf("labels is not a JSON array: %s: %v", fields["labels"], err)
+			}
+			if labels == nil || len(labels) != len(tc.labels) {
+				t.Fatalf("expected labels array %v, got %s", tc.labels, fields["labels"])
+			}
+			for i, want := range tc.labels {
+				if labels[i] != want {
+					t.Fatalf("label %d: want %q, got %q", i, want, labels[i])
+				}
+			}
+		})
 	}
 }
 
