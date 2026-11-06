@@ -96,6 +96,42 @@ func TestHookProcessGroupStopsDescendants(t *testing.T) {
 	}
 }
 
+// A hook that leaves no descendants ends with a group holding only its
+// unreaped leader. Darwin refuses that group signal with EPERM rather than
+// ESRCH; cleanup must not turn the finished hook into a failure.
+func TestHookProcessGroupWithoutSurvivorsSucceeds(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		exitCode int
+	}{
+		{name: "direct success", args: []string{"true"}},
+		{name: "shell success", args: []string{"sh", "-c", "exit 0"}},
+		{name: "shell failure", args: []string{"sh", "-c", "exit 3"}, exitCode: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, tc.args[0], tc.args[1:]...)
+			cmd.WaitDelay = 250 * time.Millisecond
+			err := runHookCommand(ctx, cmd)
+			if tc.exitCode == 0 {
+				if err != nil {
+					t.Fatalf("hook without descendants failed: %v", err)
+				}
+				return
+			}
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != tc.exitCode {
+				t.Fatalf("exit status was lost: %v", err)
+			}
+			if strings.Contains(err.Error(), "terminating hook process group") {
+				t.Fatalf("finished group reported a cleanup failure: %v", err)
+			}
+		})
+	}
+}
+
 func TestHookExitObservationRetainsWaitStatus(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

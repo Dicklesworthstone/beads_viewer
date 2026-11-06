@@ -7,6 +7,34 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Process state and flag from Darwin's <sys/proc.h>.
+const (
+	darwinProcessZombie  = 5      // SZOMB: awaiting collection by its parent
+	darwinProcessExiting = 0x2000 // P_WEXIT: working on exiting
+)
+
+// hookGroupHasOnlyExitedMembers reports whether every process still in the
+// group has exited or is irrevocably exiting. Darwin's kill(2) fails with
+// EPERM, not ESRCH, when a process group's only members are exited but
+// unreaped, which is exactly the state of a hook whose leader finished without
+// leaving descendants: the leader is kept unreaped on purpose until group
+// cleanup. NOTE_EXIT can arrive while the leader is still marked P_WEXIT and
+// not yet SZOMB, so both count as exited. A live member that refused the
+// signal, or a failed lookup, keeps the original error.
+func hookGroupHasOnlyExitedMembers(pgid int) bool {
+	procs, err := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pgid)
+	if err != nil {
+		return false
+	}
+	for i := range procs {
+		proc := &procs[i].Proc
+		if proc.P_stat != darwinProcessZombie && proc.P_flag&darwinProcessExiting == 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // kqueue observes exit without consuming the child's wait status. Darwin's
 // filt_procattach looks up live processes and reports ESRCH for a child already
 // on the zombie list. We exclusively own this unreaped child, so ESRCH during

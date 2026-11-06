@@ -55,6 +55,9 @@ func runHookCommandObserved(ctx context.Context, cmd *exec.Cmd, observeExit func
 			if errors.Is(err, syscall.ESRCH) {
 				return os.ErrProcessDone
 			}
+			if errors.Is(err, syscall.EPERM) && hookGroupHasOnlyExitedMembers(cmd.Process.Pid) {
+				return os.ErrProcessDone
+			}
 			return err
 		}
 		return nil
