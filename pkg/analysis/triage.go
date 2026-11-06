@@ -399,6 +399,9 @@ type TriageOptions struct {
 	BlockerN      int                   // Number of blockers to show (default 5)
 	WaitForPhase2 bool                  // Block until Phase 2 metrics ready
 	UseFastConfig bool                  // Use TriageConfig for faster Phase 2 (bv-t1js optimization)
+	// Robot work selection excludes parked and dependency-blocked diagnostics.
+	// Planning consumers retain the complete scored list by default.
+	ActionableOnly bool
 
 	// bv-87: Track/label-aware recommendation grouping for multi-agent coordination
 	GroupByTrack bool // Group recommendations by execution track (connected component)
@@ -636,7 +639,7 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	allRecommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, len(triageScores), now)
 	selectedRecommendations := allRecommendations[:0]
 	for _, rec := range allRecommendations {
-		if analyzer.IsCandidate(rec.ID) {
+		if analyzer.IsCandidate(rec.ID) && (!opts.ActionableOnly || triageCtx.IsActionable(rec.ID)) {
 			selectedRecommendations = append(selectedRecommendations, rec)
 		}
 	}

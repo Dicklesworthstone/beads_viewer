@@ -160,8 +160,13 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 		}},
 		{"SKILL.md", "bv --robot-triage | jq '.triage.recommendations[0]", ".recommendations[0]", func(rows []any) bool {
 			row, ok := rows[0].(map[string]any)
-			// Recommendations rank impact, while quick_ref above selects ready
-			// work. This is the documented "not necessarily claimable" case.
+			return ok && len(rows) == 1 && row["id"] == "ROOT" && row["claimable"] == true &&
+				reflect.DeepEqual(row["unblocks_ids"], []any{"MID"})
+		}},
+		{"SKILL.md", "bv --robot-triage --robot-include-inactive | jq '.triage.recommendations[0]", ".recommendations[0]", func(rows []any) bool {
+			row, ok := rows[0].(map[string]any)
+			// Explicit planning diagnostics retain the original blocked bridge
+			// details without claiming it as ready work.
 			return ok && len(rows) == 1 && row["id"] == "MID" && row["claimable"] == false &&
 				reflect.DeepEqual(row["blocked_by"], []any{"ROOT"}) && reflect.DeepEqual(row["unblocks_ids"], []any{"LEAF"})
 		}},

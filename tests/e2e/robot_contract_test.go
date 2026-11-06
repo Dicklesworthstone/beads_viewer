@@ -205,6 +205,18 @@ func TestRobotTriageBriefContract(t *testing.T) {
 
 	var payload map[string]any
 	runRobotJSON(t, bv, env, "--robot-triage", &payload, "--brief")
+	readyRecs, ok := payload["recommendations"].([]any)
+	if !ok || len(readyRecs) != 1 {
+		t.Fatalf("default brief recommendations must contain only ready A: %v", payload)
+	}
+	ready, ok := readyRecs[0].(map[string]any)
+	if !ok || ready["id"] != "A" {
+		t.Fatalf("default brief recommendation must be ready A: %v", readyRecs)
+	}
+	// Preserve the detailed blocked-item contract for explicitly requested
+	// planning diagnostics, alongside the ready-only default above.
+	payload = nil
+	runRobotJSON(t, bv, env, "--robot-triage", &payload, "--brief", "--robot-include-inactive")
 
 	if payload["data_hash"] == "" || payload["data_hash"] == nil {
 		t.Fatalf("brief triage missing data_hash")
@@ -293,6 +305,20 @@ func TestRobotTriageByTrackContract(t *testing.T) {
 		} `json:"triage"`
 	}
 	runRobotJSON(t, bv, env, "--robot-triage-by-track", &payload)
+	if len(payload.Triage.RecommendationsByTrack) != 1 {
+		t.Fatalf("default track output must contain only its ready layer: %+v", payload)
+	}
+	var readyIDs []string
+	for _, rec := range payload.Triage.RecommendationsByTrack[0].Recommendations {
+		readyIDs = append(readyIDs, rec.ID)
+	}
+	slices.Sort(readyIDs)
+	if !slices.Equal(readyIDs, []string{"A", "B"}) {
+		t.Fatalf("default track recommendations=%v, want ready A/B", readyIDs)
+	}
+	payload.DataHash = ""
+	payload.Triage.RecommendationsByTrack = nil
+	runRobotJSON(t, bv, env, "--robot-triage-by-track", &payload, "--robot-include-inactive")
 
 	if payload.DataHash == "" {
 		t.Fatalf("triage-by-track missing data_hash")

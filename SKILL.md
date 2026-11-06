@@ -169,7 +169,8 @@ Selected fields; names and `ID`/`Value` casing are significant:
 
 ```bash
 bv --robot-triage | jq '.triage.quick_ref'                 # At-a-glance summary
-bv --robot-triage | jq '.triage.recommendations[0]'        # Top recommendation, not necessarily claimable
+bv --robot-triage | jq '.triage.recommendations[0]'        # Top ready recommendation; claims still require a live route
+bv --robot-triage --robot-include-inactive | jq '.triage.recommendations[0]' # Planning diagnostics, including blocked work
 bv --robot-plan | jq '.plan.summary.highest_impact'        # Best unblock target
 bv --robot-insights | jq '.status'                         # Check metric readiness
 bv --robot-insights | jq '{status: .status.Cycles, cycles: .Cycles}' # Stored cycle representatives

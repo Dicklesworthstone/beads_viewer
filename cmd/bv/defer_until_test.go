@@ -137,8 +137,8 @@ func TestRobotCommandsHonourDeferUntilEndToEnd(t *testing.T) {
 		t.Fatalf("JSONL-only fixture emitted a live claim: %s", nextOut)
 	}
 
-	// --robot-triage: top picks exclude FUTURE-1; its recommendation carries
-	// defer_until and wait guidance.
+	// Default robot recommendations exclude future work. Explicit planning
+	// diagnostics retain defer_until and wait guidance without enabling claims.
 	var triage struct {
 		Triage struct {
 			QuickRef struct {
@@ -151,6 +151,15 @@ func TestRobotCommandsHonourDeferUntilEndToEnd(t *testing.T) {
 	triageOut := run("--robot-triage")
 	if err := json.Unmarshal(triageOut, &triage); err != nil {
 		t.Fatalf("robot-triage json: %v\n%s", err, triageOut)
+	}
+	for _, rec := range triage.Triage.Recommendations {
+		if rec.ID == "FUTURE-1" {
+			t.Fatalf("default robot recommendations leaked future work: %s", triageOut)
+		}
+	}
+	triageOut = run("--robot-triage", "--robot-include-inactive")
+	if err := json.Unmarshal(triageOut, &triage); err != nil {
+		t.Fatalf("robot-triage diagnostics json: %v\n%s", err, triageOut)
 	}
 	if triage.Triage.QuickRef.Actionable != 2 {
 		t.Fatalf("quick_ref.actionable = %d, want 2\n%s", triage.Triage.QuickRef.Actionable, triageOut)
@@ -166,6 +175,9 @@ func TestRobotCommandsHonourDeferUntilEndToEnd(t *testing.T) {
 			continue
 		}
 		sawFuture = true
+		if rec.Claimable || rec.Actions.Claim != nil {
+			t.Fatalf("explicit diagnostics enabled a deferred claim: %s", triageOut)
+		}
 		if rec.DeferUntil == nil || !rec.DeferUntil.Equal(time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)) {
 			t.Fatalf("FUTURE-1 recommendation defer_until = %v", rec.DeferUntil)
 		}

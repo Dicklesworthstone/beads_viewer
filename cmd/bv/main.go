@@ -1500,6 +1500,7 @@ func main() {
 	robotTriageByLabel := flag.Bool("robot-triage-by-label", false, "Group triage recommendations by label (bv-87)")
 	robotNext := flag.Bool("robot-next", false, "Output only the top pick recommendation as JSON (minimal triage)")
 	robotTriageBrief := flag.Bool("brief", false, "Compact --robot-triage output: only decision-relevant fields (id, title, status, assignee, blockers, unblocks) (#183)")
+	robotIncludeInactive := flag.Bool("robot-include-inactive", false, "Include parked and blocked planning diagnostics in robot triage recommendations; never enables claims")
 	robotNotReadyLabels := flag.String("robot-not-ready-labels", "", "Comma-separated labels marking a bead not-ready: excluded from claimable --robot-next/--robot-triage top picks (env: BV_ROBOT_NOT_READY_LABELS; #173)")
 	robotDiff := flag.Bool("robot-diff", false, "Output diff as JSON (use with --diff-since)")
 	robotRecipes := flag.Bool("robot-recipes", false, "Output available recipes as JSON for AI agents")
@@ -1717,6 +1718,7 @@ func main() {
 		RobotTriageByLabelFlag:  robotTriageByLabel,
 		RobotNextFlag:           robotNext,
 		RobotTriageBriefFlag:    robotTriageBrief,
+		IncludeInactive:         robotIncludeInactive,
 		RobotHistoryFlag:        robotHistory,
 		GraphRoot:               graphRoot,
 		BeadHistoryFlag:         beadHistory,
@@ -1831,6 +1833,7 @@ func main() {
 			{modifier: "history-since", requires: []string{"robot-history", "bead-history", "robot-causality"}},
 			{modifier: "history-limit", requires: []string{"robot-history", "bead-history", "robot-causality"}},
 			{modifier: "brief", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label"}},
+			{modifier: "robot-include-inactive", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label"}},
 			{modifier: "robot-history-timeout-ms", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
 			{modifier: "robot-not-ready-labels", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
 			{modifier: "min-confidence", requires: []string{"robot-history", "bead-history"}},
@@ -7576,7 +7579,7 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		"robot-triage": {
 			Flag: "--robot-triage", Description: "Unified triage: top picks, recommendations, quick wins, blockers, project health, velocity.",
 			KeyFields:   []string{"triage.quick_ref.top_picks", "triage.recommendations", "triage.quick_wins", "triage.blockers_to_clear", "triage.project_health"},
-			Params:      []string{"--graph-root <id>"},
+			Params:      []string{"--graph-root <id>", "--robot-include-inactive"},
 			NeedsIssues: true,
 		},
 		"robot-next": {
@@ -7603,13 +7606,13 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		"robot-triage-by-track": {
 			Flag: "--robot-triage-by-track", Description: "Triage grouped by independent parallel execution tracks.",
 			KeyFields:   []string{"triage.recommendations_by_track[].track_id", "triage.recommendations_by_track[].top_pick", "triage.recommendations_by_track[].claim_command"},
-			Params:      []string{"--graph-root <id>"},
+			Params:      []string{"--graph-root <id>", "--robot-include-inactive"},
 			NeedsIssues: true,
 		},
 		"robot-triage-by-label": {
 			Flag: "--robot-triage-by-label", Description: "Triage grouped by label for area-focused agents.",
 			KeyFields:   []string{"triage.recommendations_by_label[].label", "triage.recommendations_by_label[].top_pick", "triage.recommendations_by_label[].claim_command"},
-			Params:      []string{"--graph-root <id>"},
+			Params:      []string{"--graph-root <id>", "--robot-include-inactive"},
 			NeedsIssues: true,
 		},
 		"robot-alerts": {

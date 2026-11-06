@@ -3273,6 +3273,11 @@ These commands output **structured JSON** designed for programmatic consumption:
 
 Issue-backed analysis commands support `--as-of <ref>` and include `as_of` and `as_of_commit` metadata. Commands such as capabilities, schemas, and recipes describe the current installation or configuration rather than a historical issue snapshot.
 
+Robot triage recommendations contain ready work by default. Pass
+`--robot-include-inactive` with a triage command to inspect parked, future-deferred,
+or blocked planning diagnostics. Those diagnostics do not enable claims; health
+counts continue to cover the full selected issue inventory.
+
 Output tuning flags that apply across robot commands:
 
 ```bash
@@ -3401,6 +3406,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--robot-history-timeout-ms` | int | `-1` | Budget in ms for the git-history prologue of robot triage (0 = unbounded; default 10000, env BV_ROBOT_HISTORY_TIMEOUT_MS) | Robot & Planning Flags |
 | `--robot-impact` | string | (empty) | Analyze impact of modifying files (comma-separated paths) | Robot & Planning Flags |
 | `--robot-impact-network` | string | (empty) | Output bead impact network as JSON (empty for full, or bead ID for subnetwork) | Robot & Planning Flags |
+| `--robot-include-inactive` | bool | `false` | Include parked and blocked planning diagnostics in robot triage recommendations; never enables claims | Robot & Planning Flags |
 | `--robot-insights` | bool | `false` | Output graph analysis and insights as JSON for AI agents | Robot & Planning Flags |
 | `--robot-label-attention` | bool | `false` | Output attention-ranked labels as JSON for AI agents | Robot & Planning Flags |
 | `--robot-label-flow` | bool | `false` | Output cross-label dependency flow as JSON for AI agents | Robot & Planning Flags |

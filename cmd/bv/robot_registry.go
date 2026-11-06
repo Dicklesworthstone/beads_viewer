@@ -165,6 +165,7 @@ type phaseThreeRobotHandlerConfig struct {
 	RobotInsightsFlag       *bool
 	RobotTriageFlag         *bool
 	RobotTriageBriefFlag    *bool
+	IncludeInactive         *bool
 	RobotTriageByTrackFlag  *bool
 	RobotTriageByLabelFlag  *bool
 	RobotNextFlag           *bool
@@ -2200,6 +2201,7 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	// samples exist; the payload's feedback block reports whether it applied.
 	feedbackData, feedbackWeights := loadRobotFeedback()
 	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
+		ActionableOnly: cfg.IncludeInactive == nil || !*cfg.IncludeInactive,
 		GroupByTrack:   cfg.RobotTriageByTrackFlag != nil && *cfg.RobotTriageByTrackFlag,
 		Readiness:      ctx.Readiness,
 		CandidateIDs:   ctx.CandidateIDs,
@@ -2250,6 +2252,7 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 			"jq '.triage.quick_wins' - Low-effort, high-impact items",
 			"--robot-next - Get only the single top recommendation",
 			"--brief - Compact output: only id/title/status/assignee/blockers/unblocks (#183)",
+			"--robot-include-inactive - Include planning diagnostics without enabling claims",
 			"--robot-triage-by-track - Group by execution track for multi-agent coordination",
 			"--robot-triage-by-label - Group by label for area-focused agents",
 			"jq '.triage.recommendations_by_track[].top_pick' - Top pick per track",

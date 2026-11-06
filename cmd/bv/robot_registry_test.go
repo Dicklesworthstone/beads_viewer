@@ -91,6 +91,107 @@ func TestRobotCapacity_FullSourceReadiness(t *testing.T) {
 	}
 }
 
+func TestRobotTriageRecommendationsUseAuthoritativeActionability(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "1788912000")
+	now := time.Unix(1788912000, 0).UTC()
+	future := now.Add(time.Hour)
+	issues := []model.Issue{
+		{ID: "live", Title: "Ready leaf", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeTask, Labels: []string{"lane"}},
+		{ID: "ongoing", Status: model.StatusInProgress, Priority: 3, IssueType: model.TypeTask, Labels: []string{"lane"}},
+		{ID: "future", Status: model.StatusOpen, DeferUntil: &future, Priority: 0, IssueType: model.TypeTask},
+		{ID: "missing-blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{DependsOnID: "absent", Type: model.DepBlocks}}},
+		{ID: "closed", Status: model.StatusClosed, Priority: 0, IssueType: model.TypeTask},
+		{ID: "tombstone", Status: model.StatusTombstone, Priority: 0, IssueType: model.TypeTask},
+	}
+	// Enough high-priority parked rows to catch filtering after the TopN cap.
+	for i := 0; i < 16; i++ {
+		issues = append(issues, model.Issue{ID: "deferred-" + strconv.Itoa(i), Status: model.StatusDeferred, Priority: 0, IssueType: model.TypeTask, Labels: []string{"lane"}})
+	}
+	for _, inactiveOnly := range []bool{false, true} {
+		for _, mode := range []string{"full", "brief", "track", "label"} {
+			t.Run(strconv.FormatBool(inactiveOnly)+"/"+mode, func(t *testing.T) {
+				rows := append([]model.Issue(nil), issues...)
+				want := []string{"live", "ongoing"}
+				if inactiveOnly {
+					rows[0].Status = model.StatusClosed
+					rows[1].Status = model.StatusClosed
+					want = nil
+				}
+				var out bytes.Buffer
+				brief, track, label := mode == "brief", mode == "track", mode == "label"
+				if err := handleRobotTriage(RobotContext{Issues: rows, Readiness: model.NewReadinessIndex(rows), Encoder: json.NewEncoder(&out)}, phaseThreeRobotHandlerConfig{
+					RobotTriageBriefFlag: &brief, RobotTriageByTrackFlag: &track, RobotTriageByLabelFlag: &label,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				var payload struct {
+					Triage          analysis.TriageResult     `json:"triage"`
+					Recommendations []analysis.Recommendation `json:"recommendations"`
+				}
+				if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+					t.Fatal(err)
+				}
+				if brief {
+					payload.Triage.Recommendations = payload.Recommendations
+				}
+				var ids []string
+				for _, rec := range payload.Triage.Recommendations {
+					ids = append(ids, rec.ID)
+					if !model.NewReadinessIndex(rows).Ready(rec.ID, now) {
+						t.Errorf("nonactionable recommendation %s: %s", rec.ID, out.String())
+					}
+				}
+				slices.Sort(ids)
+				if !slices.Equal(ids, want) {
+					t.Fatalf("recommendations=%v, want %v; output=%s", ids, want, out.String())
+				}
+				if mode != "brief" && payload.Triage.ProjectHealth.Counts.Total != len(rows) {
+					t.Fatalf("filter removed health inventory: %+v", payload.Triage.ProjectHealth.Counts)
+				}
+				for _, group := range payload.Triage.RecommendationsByTrack {
+					for _, rec := range group.Recommendations {
+						if !slices.Contains(want, rec.ID) {
+							t.Errorf("inactive track recommendation %s", rec.ID)
+						}
+					}
+				}
+				for _, group := range payload.Triage.RecommendationsByLabel {
+					for _, rec := range group.Recommendations {
+						if !slices.Contains(want, rec.ID) {
+							t.Errorf("inactive label recommendation %s", rec.ID)
+						}
+					}
+				}
+			})
+		}
+	}
+	t.Run("explicit_inactive_diagnostics", func(t *testing.T) {
+		var out bytes.Buffer
+		include := true
+		if err := handleRobotTriage(RobotContext{Issues: issues[2:], Encoder: json.NewEncoder(&out)}, phaseThreeRobotHandlerConfig{IncludeInactive: &include}); err != nil {
+			t.Fatal(err)
+		}
+		var payload struct {
+			Triage analysis.TriageResult `json:"triage"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload.Triage.Recommendations) == 0 {
+			t.Fatal("explicit diagnostics lost inactive planning guidance")
+		}
+		if payload.Triage.QuickRef.ActionableCount != 0 || len(payload.Triage.QuickRef.TopPicks) != 0 {
+			t.Fatalf("explicit diagnostics made inactive work actionable: %s", out.String())
+		}
+		for _, rec := range payload.Triage.Recommendations {
+			if rec.Claimable || rec.Actions.Claim != nil {
+				t.Fatalf("explicit diagnostics enabled a claim for %s", rec.ID)
+			}
+		}
+	})
+}
+
 func TestRobotCapacity_BlockingEdgesAndOrder(t *testing.T) {
 	t.Setenv("SOURCE_DATE_EPOCH", "1788912000")
 	issues := []model.Issue{
