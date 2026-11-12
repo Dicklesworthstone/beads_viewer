@@ -9,11 +9,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/fsnotify/fsnotify"
 )
 
 // DefaultPollInterval is the default polling interval for fallback mode.
 const DefaultPollInterval = 2 * time.Second
+
+const defaultJSONLSettlePolls = 3
 
 // Common errors.
 var (
@@ -74,6 +77,7 @@ func WithForcePoll(force bool) WatcherOption {
 type Watcher struct {
 	path             string
 	walPath          string
+	isJSONL          bool
 	debounceDuration time.Duration
 	pollInterval     time.Duration
 	onChange         func()
@@ -82,13 +86,27 @@ type Watcher struct {
 	forcePollEnv     bool
 	fsType           FilesystemType
 
-	fsWatcher   *fsnotify.Watcher
-	debouncer   *Debouncer
-	useFallback bool
-	lastExists  bool
-	lastMtime   time.Time
-	lastSize    int64
-	lastWALInfo os.FileInfo
+	fsWatcher           *fsnotify.Watcher
+	debouncer           *Debouncer
+	useFallback         bool
+	lastExists          bool
+	lastInfo            os.FileInfo
+	lastMtime           time.Time
+	lastSize            int64
+	lastEndsWithNewline bool
+	lastWALInfo         os.FileInfo
+
+	unsettledJSONL    bool
+	unsettledSince    time.Time
+	unsettledPolls    int
+	settleTimer       *time.Timer
+	jsonlSettleWindow time.Duration
+	jsonlSettlePolls  int
+
+	// Optional unexported deterministic polling seams for zero-sleep tests.
+	// Both are nil in production and incur zero overhead when unset.
+	pollTicker func(d time.Duration) (<-chan time.Time, func())
+	onPollPass func(runGeneration uint64)
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -124,6 +142,8 @@ func NewWatcher(path string, opts ...WatcherOption) (*Watcher, error) {
 	switch strings.ToLower(filepath.Ext(absPath)) {
 	case ".db", ".sqlite", ".sqlite3":
 		w.walPath = absPath + "-wal"
+	case ".jsonl":
+		w.isJSONL = true
 	}
 
 	for _, opt := range opts {
@@ -148,6 +168,7 @@ func (w *Watcher) Start() error {
 	w.useFallback = false
 	w.forcePollEnv = false
 	w.fsType = FSTypeUnknown
+	w.clearSettleLocked()
 
 	if envBool("BV_FORCE_POLLING") || envBool("BV_FORCE_POLL") {
 		w.forcePollEnv = true
@@ -164,19 +185,23 @@ func (w *Watcher) Start() error {
 	}
 
 	// Get initial file state
-	info, err := os.Stat(w.path)
+	info, endsWithNewline, err := statWatchedFile(w.path, w.isJSONL)
 	if err != nil {
 		if os.IsPermission(err) {
 			return ErrPermission
 		}
 		// File might not exist yet, that's okay
 		w.lastExists = false
+		w.lastInfo = nil
 		w.lastMtime = time.Time{}
 		w.lastSize = 0
+		w.lastEndsWithNewline = false
 	} else {
 		w.lastExists = true
+		w.lastInfo = info
 		w.lastMtime = info.ModTime()
 		w.lastSize = info.Size()
+		w.lastEndsWithNewline = endsWithNewline
 	}
 	w.lastWALInfo = nil
 	if w.walPath != "" {
@@ -248,6 +273,7 @@ func (w *Watcher) Stop() {
 		w.fsWatcher = nil
 	}
 
+	w.clearSettleLocked()
 	w.debouncer.Cancel()
 
 	// An event published before Stop acquired mu may still be buffered even
@@ -317,7 +343,7 @@ func (w *Watcher) PollInterval() time.Duration {
 }
 
 func envBool(name string) bool {
-	v := strings.TrimSpace(os.Getenv(name))
+	v := strings.TrimSpace(env.Get(name))
 	if v == "" {
 		return false
 	}
@@ -432,7 +458,7 @@ func (w *Watcher) handleFsnotifyFileEvent(runGeneration uint64, op fsnotify.Op) 
 		return
 	}
 
-	info, err := os.Stat(w.path)
+	info, endsWithNewline, err := statWatchedFile(w.path, w.isJSONL)
 	if err != nil {
 		if os.IsNotExist(err) {
 			if op&fsnotify.Rename != 0 {
@@ -449,7 +475,8 @@ func (w *Watcher) handleFsnotifyFileEvent(runGeneration uint64, op fsnotify.Op) 
 		return
 	}
 
-	if _, active := w.recordStat(runGeneration, info.ModTime(), info.Size()); !active {
+	_, withheld, active := w.observePathSample(runGeneration, info, endsWithNewline, false)
+	if !active || withheld {
 		return
 	}
 	w.scheduleChange(runGeneration)
@@ -457,38 +484,95 @@ func (w *Watcher) handleFsnotifyFileEvent(runGeneration uint64, op fsnotify.Op) 
 
 // watchPolling monitors using periodic stat checks.
 func (w *Watcher) watchPolling(ctx context.Context, runGeneration uint64) {
-	ticker := time.NewTicker(w.pollInterval)
-	defer ticker.Stop()
+	w.mu.RLock()
+	pollInterval := w.pollInterval
+	tickerFactory := w.pollTicker
+	onPollPass := w.onPollPass
+	w.mu.RUnlock()
+
+	var tickCh <-chan time.Time
+	if tickerFactory != nil {
+		var stopFn func()
+		tickCh, stopFn = tickerFactory(pollInterval)
+		if stopFn != nil {
+			defer stopFn()
+		}
+	} else {
+		ticker := time.NewTicker(pollInterval)
+		defer ticker.Stop()
+		tickCh = ticker.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 
-		case <-ticker.C:
-			info, err := os.Stat(w.path)
-			if err != nil {
-				if os.IsNotExist(err) {
-					hadFile, active := w.recordMissing(runGeneration)
-					if active && hadFile {
-						w.reportError(runGeneration, ErrFileRemoved)
-					}
-				} else if os.IsPermission(err) {
-					w.reportError(runGeneration, ErrPermission)
-				} else {
-					w.reportError(runGeneration, err)
-				}
-				continue
-			}
-
-			changed, active := w.recordStat(runGeneration, info.ModTime(), info.Size())
-			walChanged := w.pollWAL(runGeneration)
-
-			if active && (changed || walChanged) {
-				w.scheduleChange(runGeneration)
+		case <-tickCh:
+			w.pollOnce(runGeneration)
+			if onPollPass != nil {
+				onPollPass(runGeneration)
 			}
 		}
 	}
+}
+
+func (w *Watcher) pollOnce(runGeneration uint64) {
+	info, endsWithNewline, err := statWatchedFile(w.path, w.isJSONL)
+	if err != nil {
+		if os.IsNotExist(err) {
+			hadFile, active := w.recordMissing(runGeneration)
+			if active && hadFile {
+				w.reportError(runGeneration, ErrFileRemoved)
+			}
+		} else if os.IsPermission(err) {
+			w.reportError(runGeneration, ErrPermission)
+		} else {
+			w.reportError(runGeneration, err)
+		}
+		return
+	}
+
+	changed, withheld, active := w.observePathSample(runGeneration, info, endsWithNewline, true)
+	walChanged := w.pollWAL(runGeneration)
+
+	if active && !withheld && (changed || walChanged) {
+		w.scheduleChange(runGeneration)
+	} else if active && withheld && walChanged {
+		w.scheduleChange(runGeneration)
+	}
+}
+
+func statWatchedFile(path string, checkTrailingNewline bool) (os.FileInfo, bool, error) {
+	if !checkTrailingNewline {
+		info, err := os.Stat(path)
+		return info, false, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) || os.IsPermission(err) {
+			return nil, false, err
+		}
+		info, statErr := os.Stat(path)
+		if statErr == nil {
+			return info, false, nil
+		}
+		return nil, false, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	endsWithNewline := false
+	if info.Size() > 0 && info.Mode().IsRegular() {
+		var b [1]byte
+		if n, rerr := f.ReadAt(b[:], info.Size()-1); rerr == nil && n == 1 && b[0] == '\n' {
+			endsWithNewline = true
+		}
+	}
+	return info, endsWithNewline, nil
 }
 
 // pollWAL includes creation, replacement and checkpoint removal in the change
@@ -542,28 +626,213 @@ func (w *Watcher) recordMissing(runGeneration uint64) (hadFile, active bool) {
 	}
 
 	hadFile = w.lastExists
+	w.clearSettleLocked()
 	w.lastExists = false
+	w.lastInfo = nil
 	w.lastMtime = time.Time{}
 	w.lastSize = 0
+	w.lastEndsWithNewline = false
 	return hadFile, true
 }
 
-func (w *Watcher) recordStat(runGeneration uint64, mtime time.Time, size int64) (changed, active bool) {
+func (w *Watcher) recordStat(runGeneration uint64, info os.FileInfo) (changed, active bool) {
+	if info == nil {
+		return false, false
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !w.runIsActiveLocked(runGeneration) {
 		return false, false
 	}
 
-	changed = !w.lastExists || !mtime.Equal(w.lastMtime) || size != w.lastSize
+	mtime := info.ModTime()
+	size := info.Size()
+	changed = !w.lastExists ||
+		!mtime.Equal(w.lastMtime) ||
+		size != w.lastSize ||
+		(w.lastInfo != nil && !os.SameFile(w.lastInfo, info))
 	w.lastExists = true
+	w.lastInfo = info
 	w.lastMtime = mtime
 	w.lastSize = size
 	return changed, true
 }
 
+func (w *Watcher) observePathSample(runGeneration uint64, info os.FileInfo, endsWithNewline bool, fromPoll bool) (changed, withheld, active bool) {
+	if info == nil {
+		return false, false, false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.runIsActiveLocked(runGeneration) {
+		return false, false, false
+	}
+
+	isTransientJSONL := w.isJSONL &&
+		w.lastExists &&
+		w.lastSize > 0 &&
+		(info.Size() == 0 || (w.lastEndsWithNewline && !endsWithNewline))
+
+	if isTransientJSONL {
+		if !w.unsettledJSONL {
+			w.unsettledJSONL = true
+			w.unsettledSince = time.Now()
+			w.unsettledPolls = 0
+			w.debouncer.Cancel()
+		}
+		if fromPoll {
+			w.unsettledPolls++
+		}
+
+		settledFinal := false
+		if w.pollTicker != nil {
+			if fromPoll && w.unsettledPolls >= w.effectiveSettlePollsLocked() {
+				settledFinal = true
+			}
+			if w.jsonlSettleWindow > 0 && time.Since(w.unsettledSince) >= w.jsonlSettleWindow {
+				settledFinal = true
+			}
+		} else if time.Since(w.unsettledSince) >= w.effectiveSettleWindowLocked() {
+			settledFinal = true
+		}
+
+		if !settledFinal {
+			if w.pollTicker == nil {
+				w.armSettleTimerLocked(runGeneration)
+			}
+			return false, true, true
+		}
+
+		w.clearSettleLocked()
+		w.lastExists = true
+		w.lastInfo = info
+		w.lastMtime = info.ModTime()
+		w.lastSize = info.Size()
+		w.lastEndsWithNewline = endsWithNewline
+		return true, false, true
+	}
+
+	wasUnsettled := w.unsettledJSONL
+	w.clearSettleLocked()
+	mtime := info.ModTime()
+	size := info.Size()
+	changed = wasUnsettled ||
+		!w.lastExists ||
+		!mtime.Equal(w.lastMtime) ||
+		size != w.lastSize ||
+		(w.lastInfo != nil && !os.SameFile(w.lastInfo, info)) ||
+		(w.isJSONL && endsWithNewline != w.lastEndsWithNewline)
+	w.lastExists = true
+	w.lastInfo = info
+	w.lastMtime = mtime
+	w.lastSize = size
+	w.lastEndsWithNewline = endsWithNewline
+	return changed, false, true
+}
+
+func (w *Watcher) effectiveSettleWindowLocked() time.Duration {
+	if w.jsonlSettleWindow > 0 {
+		return w.jsonlSettleWindow
+	}
+	return min(max(2*w.debounceDuration, 25*time.Millisecond), 250*time.Millisecond)
+}
+
+func (w *Watcher) effectiveSettleRecheckIntervalLocked() time.Duration {
+	window := w.effectiveSettleWindowLocked()
+	return min(max(window/4, 5*time.Millisecond), 25*time.Millisecond)
+}
+
+func (w *Watcher) effectiveSettlePollsLocked() int {
+	if w.jsonlSettlePolls > 0 {
+		return w.jsonlSettlePolls
+	}
+	return defaultJSONLSettlePolls
+}
+
+func (w *Watcher) clearSettleLocked() {
+	if w.settleTimer != nil {
+		w.settleTimer.Stop()
+		w.settleTimer = nil
+	}
+	w.unsettledJSONL = false
+	w.unsettledSince = time.Time{}
+	w.unsettledPolls = 0
+}
+
+func (w *Watcher) armSettleTimerLocked(runGeneration uint64) {
+	if w.settleTimer != nil {
+		w.settleTimer.Stop()
+	}
+	delay := w.effectiveSettleRecheckIntervalLocked()
+	w.settleTimer = time.AfterFunc(delay, func() {
+		w.recheckUnsettledJSONL(runGeneration)
+	})
+}
+
+func (w *Watcher) recheckUnsettledJSONL(runGeneration uint64) {
+	w.mu.RLock()
+	active := w.runIsActiveLocked(runGeneration)
+	isJSONL := w.isJSONL
+	w.mu.RUnlock()
+	if !active || !isJSONL {
+		return
+	}
+
+	info, endsWithNewline, err := statWatchedFile(w.path, true)
+	if err != nil {
+		if os.IsNotExist(err) {
+			hadFile, stillActive := w.recordMissing(runGeneration)
+			if stillActive && hadFile {
+				w.reportError(runGeneration, ErrFileRemoved)
+			}
+		} else if os.IsPermission(err) {
+			w.reportError(runGeneration, ErrPermission)
+		} else {
+			w.reportError(runGeneration, err)
+		}
+		return
+	}
+
+	changed, withheld, stillActive := w.observePathSample(runGeneration, info, endsWithNewline, false)
+	if stillActive && !withheld && changed {
+		w.scheduleChange(runGeneration)
+	}
+}
+
+func (w *Watcher) shouldDeferJSONLNotify(runGeneration uint64) bool {
+	if !w.isJSONL {
+		return false
+	}
+	info, endsWithNewline, err := statWatchedFile(w.path, true)
+	if err != nil || info == nil {
+		return false
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.runIsActiveLocked(runGeneration) {
+		return true
+	}
+	if w.lastExists && w.lastSize > 0 && (info.Size() == 0 || (w.lastEndsWithNewline && !endsWithNewline)) {
+		if !w.unsettledJSONL {
+			w.unsettledJSONL = true
+			w.unsettledSince = time.Now()
+			w.unsettledPolls = 0
+		}
+		if w.pollTicker == nil {
+			w.armSettleTimerLocked(runGeneration)
+		}
+		return true
+	}
+	return false
+}
+
 // notifyChange invokes the onChange callback and signals the change channel.
 func (w *Watcher) notifyChange(runGeneration uint64) {
+	if w.shouldDeferJSONLNotify(runGeneration) {
+		return
+	}
+
 	w.mu.RLock()
 	active := w.runIsActiveLocked(runGeneration)
 	onChange := w.onChange

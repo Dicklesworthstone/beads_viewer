@@ -4,12 +4,12 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/debug"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
@@ -66,15 +66,36 @@ func TreeStatePath(beadsDir string) string {
 
 // SetBeadsDir sets the beads directory for persistence (bv-19vz).
 // This should be called before any expand/collapse operations if a custom
-// beads directory is desired. If not called, defaults to ".beads" in cwd.
+// beads directory is desired. When empty, persistence is disabled so tree
+// navigation never writes to an unconfigured working directory.
 func (t *TreeModel) SetBeadsDir(dir string) {
 	t.beadsDir = dir
 }
 
+// SetReadOnly marks the tree model as read-only (e.g., during --as-of or
+// time-travel sessions) so expand/collapse changes are never persisted to disk.
+func (t *TreeModel) SetReadOnly(readOnly bool) {
+	t.readOnly = readOnly
+}
+
+// IsReadOnly reports whether persistence is disabled for this tree model.
+func (t *TreeModel) IsReadOnly() bool {
+	return t.readOnly
+}
+
+// persistenceDisabled reports whether reading/writing tree-state.json should be skipped.
+func (t *TreeModel) persistenceDisabled() bool {
+	return savedConfigDisabled() || t.readOnly || t.beadsDir == ""
+}
+
 // saveState persists the current expand/collapse state to disk (bv-19vz).
 // Only stores explicit user changes; nodes not in the map use default behavior.
-// Errors are logged but do not interrupt the user experience.
+// Strict no-op when BV_NO_SAVED_CONFIG is set, when read-only, or when beadsDir is unset.
 func (t *TreeModel) saveState() {
+	if t.persistenceDisabled() {
+		return
+	}
+
 	state := &TreeState{
 		Version:  TreeStateVersion,
 		Expanded: make(map[string]bool),
@@ -105,19 +126,19 @@ func (t *TreeModel) saveState() {
 	// Write to file
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		log.Printf("warning: failed to marshal tree state: %v", err)
+		debug.Log("tree: failed to marshal tree state: %v", err)
 		return
 	}
 
 	path := TreeStatePath(t.beadsDir)
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Printf("warning: failed to create state directory %s: %v", dir, err)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		debug.Log("tree: failed to create state directory %s: %v", dir, err)
 		return
 	}
 
 	if err := writeTreeStateFile(path, data); err != nil {
-		log.Printf("warning: failed to write tree state to %s: %v", path, err)
+		debug.Log("tree: failed to write tree state to %s: %v", path, err)
 		return
 	}
 }
@@ -141,7 +162,7 @@ func writeTreeStateFile(path string, data []byte) error {
 		_ = tmpFile.Close()
 		return fmt.Errorf("write temporary tree state: %w", err)
 	}
-	if err := tmpFile.Chmod(0644); err != nil {
+	if err := tmpFile.Chmod(0o600); err != nil {
 		_ = tmpFile.Close()
 		return fmt.Errorf("chmod temporary tree state: %w", err)
 	}
@@ -157,8 +178,13 @@ func writeTreeStateFile(path string, data []byte) error {
 }
 
 // loadState restores expand/collapse state from disk (bv-afcm).
-// If the file doesn't exist or is corrupted, defaults are used silently.
+// If persistence is disabled, or the file doesn't exist or is corrupted,
+// defaults are used silently without corrupting TUI output.
 func (t *TreeModel) loadState() {
+	if savedConfigDisabled() || t.beadsDir == "" {
+		return
+	}
+
 	path := TreeStatePath(t.beadsDir)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -168,11 +194,11 @@ func (t *TreeModel) loadState() {
 
 	var state TreeState
 	if err := json.Unmarshal(data, &state); err != nil {
-		log.Printf("warning: invalid tree state file, using defaults: %v", err)
+		debug.Log("tree: invalid tree state file, using defaults: %v", err)
 		return
 	}
 	if state.Version != TreeStateVersion {
-		log.Printf("warning: unsupported tree state version %d, using defaults", state.Version)
+		debug.Log("tree: unsupported tree state version %d, using defaults", state.Version)
 		return
 	}
 
@@ -231,6 +257,7 @@ type TreeModel struct {
 
 	// Persistence state (bv-19vz)
 	beadsDir string // Directory containing .beads (for tree-state.json)
+	readOnly bool   // When true, saveState is a strict no-op (e.g., --as-of / time-travel)
 }
 
 // NewTreeModel creates an empty tree model

@@ -214,6 +214,12 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 				}
 			}
 
+			// Skip pairs already explicitly linked in the dependency graph
+			// (blocks, parent-child, related, discovered-from, etc.).
+			if issuesHaveDependencyLink(issue1, issue2) {
+				continue
+			}
+
 			issue1ID, issue2ID := issue1.ID, issue2.ID
 			if issue2ID < issue1ID {
 				issue1ID, issue2ID = issue2ID, issue1ID
@@ -263,6 +269,26 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 	}
 
 	return suggestions
+}
+
+// issuesHaveDependencyLink reports whether two issues already reference each
+// other via any explicit dependency record (related, blocks, parent-child,
+// discovered-from, etc.) in either direction.
+func issuesHaveDependencyLink(a, b *model.Issue) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	for _, dep := range a.Dependencies {
+		if dep != nil && dep.DependsOnID == b.ID {
+			return true
+		}
+	}
+	for _, dep := range b.Dependencies {
+		if dep != nil && dep.DependsOnID == a.ID {
+			return true
+		}
+	}
+	return false
 }
 
 // intersectKeywords finds common strings between two sorted/unsorted slices.

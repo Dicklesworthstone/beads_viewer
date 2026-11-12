@@ -47,7 +47,7 @@ const (
 	// additionally carries historyArtifactFormatVersion and an entry whose
 	// artifact was written by a different format is a miss (see
 	// getHeadArtifactCached). 3 = first file version storing v2 artifacts.
-	headArtifactCacheVersion            = 4
+	headArtifactCacheVersion            = 5
 	headArtifactCacheFileName           = "correlation_head_artifact_cache.json"
 	headArtifactCacheMaxEntries         = 6
 	headArtifactCacheMaxAge             = 24 * time.Hour
@@ -82,9 +82,10 @@ func headArtifactCachePath(create bool) (string, error) {
 		base = filepath.Join(dir, correlationDiskCacheDirName)
 	}
 	if create {
-		if err := os.MkdirAll(base, 0o755); err != nil {
+		if err := os.MkdirAll(base, 0o700); err != nil {
 			return "", err
 		}
+		_ = os.Chmod(base, 0o700)
 	}
 	return filepath.Join(base, headArtifactCacheFileName), nil
 }
@@ -185,7 +186,7 @@ func getHeadArtifactCached(namespace, headSHA, optsHash string) (*historyArtifac
 	if err != nil {
 		return nil, false
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, false
 	}
@@ -241,7 +242,7 @@ func putHeadArtifactCached(namespace, headSHA, optsHash string, art *historyArti
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return
 	}
@@ -250,6 +251,7 @@ func putHeadArtifactCached(namespace, headSHA, optsHash string, art *historyArti
 		return
 	}
 	defer func() { _ = unlockFile(f) }()
+	_ = f.Chmod(0o600)
 
 	now := time.Now().UTC()
 	cf := readHeadArtifactCacheLocked(f)

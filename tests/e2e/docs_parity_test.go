@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -399,9 +400,10 @@ func TestDocsParity_ForecastWorkedExamples(t *testing.T) {
 		id      string
 		minutes int
 		days    float64
-	}{{"explicit", 280, 17.5}, {"median", 421, 26.3125}} {
+	}{{"explicit", 280, 280.0 / 17.6}, {"median", 421, 421.0 / 17.6}} {
 		// Values are independently worked from base 120/180, feature 1.3,
-		// depth 2 => 1.2, 1000 runes => 1.5; integer minutes / (8 * 2).
+		// depth 2 => 1.2, 1000 runes => 1.5; closed task 240 * 1.1 = 264m =>
+		// velocity 264/30 = 8.8 min/day; integer minutes / (8.8 * 2).
 		row := regexp.MustCompile(`(?m)^\| ` + tc.id + ` \| ([0-9]+) \| ([0-9.]+) \|$`).FindStringSubmatch(readme)
 		if len(row) != 3 {
 			t.Errorf("README is missing its executable %s forecast example", tc.id)
@@ -413,8 +415,11 @@ func TestDocsParity_ForecastWorkedExamples(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if stats.GetCriticalPathScore(tc.id) != 2 || minutes != tc.minutes || days != tc.days ||
-			eta.EstimatedMinutes != minutes || eta.EstimatedDays != days || eta.VelocityMinutesPerDay != 8 {
+		if stats.GetCriticalPathScore(tc.id) != 2 || minutes != tc.minutes ||
+			math.Abs(days-tc.days) >= 1e-4 ||
+			eta.EstimatedMinutes != minutes ||
+			math.Abs(eta.EstimatedDays-tc.days) >= 1e-9 ||
+			math.Abs(eta.VelocityMinutesPerDay-8.8) >= 1e-9 {
 			t.Errorf("%s documented=%dm/%gd runtime=%+v, independently expected=%dm/%gd", tc.id, minutes, days, eta, tc.minutes, tc.days)
 		}
 	}
@@ -1342,6 +1347,94 @@ func TestDocsParity_RepoAgentsMDHasCurrentBlurb(t *testing.T) {
 		}
 		t.Logf("negative control rejected stale ee81c286 AGENTS.md as expected: %v", err)
 	})
+
+	t.Run("negative_control_516e96aa_v7", func(t *testing.T) {
+		if _, err := os.Stat(filepath.Join(repo, ".git")); err != nil {
+			t.Skip("git repository metadata not present")
+		}
+		cmd := exec.Command("git", "show", "516e96aa:AGENTS.md")
+		cmd.Dir = repo
+		oldAgents, err := cmd.Output()
+		if err != nil {
+			t.Skipf("pre-v8 commit 516e96aa not available in clone: %v", err)
+		}
+		tmp := t.TempDir()
+		if err := os.WriteFile(filepath.Join(tmp, "AGENTS.md"), oldAgents, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err = checkAgentsDir(tmp)
+		if err == nil {
+			t.Fatal("expected pre-v8 516e96aa AGENTS.md (v7 blurb) to fail v8 currency check, but it passed")
+		}
+		t.Logf("negative control rejected stale 516e96aa AGENTS.md (v7) as expected: %v", err)
+	})
+}
+
+// TestDocsParity_ReleaseAndProvenanceContracts (bv-oonu.24): guards release,
+// provenance, testing, README, flake, and changelog documentation against
+// policy/version/User-Agent/CI drift.
+func TestDocsParity_ReleaseAndProvenanceContracts(t *testing.T) {
+	releasing := repoFile(t, "docs/RELEASING.md")
+	for _, must := range []string{
+		"v0.26.0 verification and receipt qualification",
+		"scripts/release_gate.sh preflight",
+		"govulncheck",
+	} {
+		if !strings.Contains(releasing, must) {
+			t.Errorf("docs/RELEASING.md missing required release contract clause %q", must)
+		}
+	}
+
+	provenance := repoFile(t, "docs/PROVENANCE.md")
+	if strings.Contains(provenance, "OpenAI File Downloader") || strings.Contains(provenance, "XaiImageApiFetch") {
+		t.Error("docs/PROVENANCE.md must never instruct borrowing a third-party User-Agent")
+	}
+	if !strings.Contains(provenance, "beads-viewer-updater") {
+		t.Error("docs/PROVENANCE.md must document honest project User-Agent identifiers")
+	}
+
+	testingDoc := repoFile(t, "docs/testing.md")
+	if strings.Contains(testingDoc, "before\nthe workflow is re-enabled") || strings.Contains(testingDoc, "before the workflow is re-enabled") {
+		t.Error("docs/testing.md must not suggest re-enabling GitHub Actions workflows")
+	}
+	if !strings.Contains(testingDoc, "DSR") {
+		t.Error("docs/testing.md CI Integration section must document permanent DSR-only policy")
+	}
+
+	readme := repoFile(t, "README.md")
+	if strings.Contains(readme, "codecov.io/gh/Dicklesworthstone/beads_viewer") {
+		t.Error("README.md must not display stale Codecov badge")
+	}
+
+	flake := repoFile(t, "flake.nix")
+	if strings.Contains(flake, "blob/v${bvVersion}/LICENSE") || strings.Contains(flake, "blob/v0.26.1/LICENSE") {
+		t.Error("flake.nix must not contain untagged GitHub blob/v<version>/LICENSE URLs")
+	}
+
+	changelog := repoFile(t, "CHANGELOG.md")
+	if !strings.Contains(changelog, "### Post-516e96aa reality-check gap closure") {
+		t.Error("CHANGELOG.md Unreleased section must distinguish Post-516e96aa gap-closure work from v0.26.0..516e96aa history")
+	}
+
+	repo, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git")); err == nil {
+		logCmd := exec.Command("git", "log", "v0.26.0..516e96aa", "--no-merges", "--format=%h")
+		logCmd.Dir = repo
+		if out, err := logCmd.Output(); err == nil {
+			shas := strings.Fields(string(out))
+			if len(shas) == 0 {
+				t.Fatal("expected non-empty git log v0.26.0..516e96aa --no-merges")
+			}
+			for _, sha := range shas {
+				if !strings.Contains(changelog, sha) {
+					t.Errorf("CHANGELOG.md Unreleased section missing post-v0.26.0 commit SHA %s", sha)
+				}
+			}
+		}
+	}
 }
 
 // TestDocsParity_PagesLoadProseMatchesArtifact (bv-apal.14): guards README.md's

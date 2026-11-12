@@ -9,11 +9,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/agents"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/export"
@@ -3243,6 +3245,702 @@ func TestIssuesFingerprintDetectsContentChangesOrderIndependently(t *testing.T) 
 	copyOrigin.Origin = nil
 	if issuesFingerprint(withOrigin) == issuesFingerprint([]model.Issue{copyOrigin}) {
 		t.Fatal("fingerprint must change when a live tracker route disappears")
+	}
+}
+
+func TestRobotRegistry_TotalContract(t *testing.T) {
+	configured := configuredPrimaryRobotFlagNames()
+	primary := primaryRobotFlagNames()
+	docs := robotCommandDocs()
+	schemas := generateRobotSchemas()
+	ttyCanonical := agents.CanonicalRobotFlagNames()
+
+	if !reflect.DeepEqual(configured, ttyCanonical) {
+		t.Fatalf("agents.CanonicalRobotFlagNames() drifted from RobotRegistry.PrimaryRobotFlagNames():\ngot  %v\nwant %v", ttyCanonical, configured)
+	}
+
+	for name := range primary {
+		if _, ok := docs[name]; !ok {
+			t.Errorf("primary robot command %q missing from robotCommandDocs()", name)
+		}
+		if schemas.Commands[name] == nil {
+			t.Errorf("primary robot command %q missing from RobotSchemas.Commands", name)
+		}
+	}
+	for name := range docs {
+		if !primary[name] {
+			t.Errorf("documented robot command %q missing from primaryRobotFlagNames()", name)
+		}
+		if schemas.Commands[name] == nil {
+			t.Errorf("documented robot command %q missing from RobotSchemas.Commands", name)
+		}
+	}
+	for _, mustHave := range []string{
+		"robot-triage",
+		"robot-plan",
+		"robot-priority",
+		"robot-insights",
+		"robot-alerts",
+		"robot-drift",
+		"robot-capacity",
+		"bead-history",
+		"robot-explain-correlation",
+		"robot-confirm-correlation",
+		"robot-reject-correlation",
+		"robot-correlation-stats",
+	} {
+		if !primary[mustHave] {
+			t.Errorf("must-have command %q missing from primaryRobotFlagNames()", mustHave)
+		}
+		if _, ok := docs[mustHave]; !ok {
+			t.Errorf("must-have command %q missing from robotCommandDocs()", mustHave)
+		}
+		if schemas.Commands[mustHave] == nil {
+			t.Errorf("must-have command %q missing from RobotSchemas.Commands", mustHave)
+		}
+	}
+
+	// Live round-trip CLI schema conformance across all 42 registered primary
+	// robot commands against a seeded git + beads + sprint + baseline workspace.
+	exe := buildTestBinary(t)
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	srcDir := filepath.Join(tmpDir, "src")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester",
+			"GIT_AUTHOR_EMAIL=tester@example.com",
+			"GIT_COMMITTER_NAME=Tester",
+			"GIT_COMMITTER_EMAIL=tester@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init", "-b", "main")
+	issuesJSONL := strings.Join([]string{
+		`{"id":"bv-1","title":"Auth login pipeline","description":"Implement OAuth2 login flow","status":"open","priority":1,"issue_type":"task","labels":["auth"],"estimated_minutes":60,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+		`{"id":"bv-2","title":"Session refresh handler","description":"Depends on bv-1","status":"open","priority":2,"issue_type":"task","labels":["auth"],"estimated_minutes":45,"dependencies":[{"issue_id":"bv-2","depends_on_id":"bv-1","type":"blocks"}],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+		`{"id":"bv-3","title":"Initial bootstrap","status":"closed","priority":2,"issue_type":"task","labels":["infra"],"estimated_minutes":30,"created_at":"2025-12-28T00:00:00Z","updated_at":"2025-12-29T00:00:00Z","closed_at":"2025-12-29T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(issuesJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sprintJSONL := `{"id":"sprint-1","name":"Sprint 1","start_date":"2026-01-01T00:00:00Z","end_date":"2026-01-08T00:00:00Z","bead_ids":["bv-1","bv-2"]}` + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "sprints.jsonl"), []byte(sprintJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "app.go"), []byte("package src\nfunc App() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "chore: initial repo seed")
+
+	if err := os.WriteFile(filepath.Join(srcDir, "app.go"), []byte("package src\nfunc App() { Auth() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "lib.go"), []byte("package src\nfunc Auth() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "feat(auth): implement bv-1 OAuth login")
+	headSHA := runGit("rev-parse", "HEAD")
+
+	t.Setenv("SOURCE_DATE_EPOCH", "1767312000") // 2026-01-02T00:00:00Z
+
+	if out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--save-baseline", "contract-baseline"); err != nil {
+		t.Fatalf("--save-baseline failed: %v\nstdout:\n%s\nstderr:\n%s", err, out, stderr)
+	}
+
+	schemaStdout, schemaStderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-schema")
+	if err != nil {
+		t.Fatalf("--robot-schema failed: %v\nstdout:\n%s\nstderr:\n%s", err, schemaStdout, schemaStderr)
+	}
+	var liveSchemas struct {
+		Envelope map[string]any            `json:"envelope"`
+		Commands map[string]map[string]any `json:"commands"`
+	}
+	if err := json.Unmarshal([]byte(schemaStdout), &liveSchemas); err != nil {
+		t.Fatalf("unmarshal live --robot-schema failed: %v", err)
+	}
+
+	invocations := map[string][]string{
+		"robot-help":                {"--robot-help", "--format", "json"},
+		"robot-capabilities":        {"--robot-capabilities"},
+		"robot-docs":                {"--robot-docs", "guide"},
+		"robot-schema":              {"--robot-schema"},
+		"robot-recipes":             {"--robot-recipes"},
+		"robot-metrics":             {"--robot-metrics"},
+		"robot-plan":                {"--robot-plan"},
+		"robot-priority":            {"--robot-priority"},
+		"robot-alerts":              {"--robot-alerts"},
+		"robot-drift":               {"--robot-drift", "--check-drift"},
+		"robot-suggest":             {"--robot-suggest"},
+		"robot-burndown":            {"--robot-burndown", "sprint-1"},
+		"robot-forecast":            {"--robot-forecast", "all"},
+		"robot-sprint-list":         {"--robot-sprint-list"},
+		"robot-graph":               {"--robot-graph"},
+		"robot-search":              {"--robot-search", "--search", "auth"},
+		"robot-diff":                {"--robot-diff", "--diff-since", "HEAD~1"},
+		"robot-insights":            {"--robot-insights"},
+		"robot-next":                {"--robot-next"},
+		"robot-triage":              {"--robot-triage"},
+		"robot-triage-by-track":     {"--robot-triage-by-track"},
+		"robot-triage-by-label":     {"--robot-triage-by-label"},
+		"robot-history":             {"--robot-history"},
+		"bead-history":              {"--bead-history", "bv-1"},
+		"robot-correlation-stats":   {"--robot-correlation-stats"},
+		"robot-explain-correlation": {"--robot-explain-correlation", headSHA + ":bv-1"},
+		"robot-confirm-correlation": {"--robot-confirm-correlation", headSHA + ":bv-1"},
+		"robot-reject-correlation":  {"--robot-reject-correlation", headSHA + ":bv-1"},
+		"robot-label-health":        {"--robot-label-health"},
+		"robot-label-flow":          {"--robot-label-flow"},
+		"robot-label-attention":     {"--robot-label-attention"},
+		"robot-orphans":             {"--robot-orphans"},
+		"robot-file-beads":          {"--robot-file-beads", "src/app.go"},
+		"robot-file-hotspots":       {"--robot-file-hotspots"},
+		"robot-impact":              {"--robot-impact", "src/app.go"},
+		"robot-file-relations":      {"--robot-file-relations", "src/app.go"},
+		"robot-related":             {"--robot-related", "bv-1"},
+		"robot-blocker-chain":       {"--robot-blocker-chain", "bv-2"},
+		"robot-impact-network":      {"--robot-impact-network", "bv-1"},
+		"robot-causality":           {"--robot-causality", "bv-1"},
+		"robot-sprint-show":         {"--robot-sprint-show", "sprint-1"},
+		"robot-capacity":            {"--robot-capacity"},
+	}
+
+	sortedNames := append([]string(nil), configured...)
+	sort.Strings(sortedNames)
+	for _, cmdName := range sortedNames {
+		args, ok := invocations[cmdName]
+		if !ok {
+			t.Fatalf("TestRobotRegistry_TotalContract missing live CLI invocation for registered command %q", cmdName)
+		}
+		cmdSchema := liveSchemas.Commands[cmdName]
+		if cmdSchema == nil {
+			t.Fatalf("live --robot-schema missing command %q", cmdName)
+		}
+		out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, args...)
+		if err != nil {
+			t.Fatalf("live invocation %v (%s) failed: %v\nstdout:\n%s\nstderr:\n%s", args, cmdName, err, out, stderr)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(out), &payload); err != nil {
+			t.Fatalf("live invocation %v (%s) did not emit valid JSON object: %v\nstdout:\n%s", args, cmdName, err, out)
+		}
+		validateJSONObjectAgainstSchema(t, cmdName, payload, cmdSchema, cmdSchema)
+	}
+}
+
+func validateJSONObjectAgainstSchema(t *testing.T, path string, obj map[string]any, schema map[string]any, rootSchema map[string]any) {
+	t.Helper()
+	if reqSlice, ok := schema["required"].([]any); ok {
+		for _, r := range reqSlice {
+			reqKey, _ := r.(string)
+			if _, exists := obj[reqKey]; !exists {
+				t.Errorf("%s: missing required property %q in live output (keys=%v)", path, reqKey, sortedMapKeys(obj))
+			}
+		}
+	}
+	if oneOfSlice, ok := schema["oneOf"].([]any); ok && len(oneOfSlice) > 0 {
+		matchedBranch := false
+		for _, rawBranch := range oneOfSlice {
+			branch, _ := rawBranch.(map[string]any)
+			reqSlice, _ := branch["required"].([]any)
+			allPresent := true
+			for _, r := range reqSlice {
+				reqKey, _ := r.(string)
+				if _, exists := obj[reqKey]; !exists {
+					allPresent = false
+					break
+				}
+			}
+			if allPresent {
+				matchedBranch = true
+				break
+			}
+		}
+		if !matchedBranch {
+			t.Errorf("%s: live output satisfied none of oneOf branches (keys=%v)", path, sortedMapKeys(obj))
+		}
+	}
+	props, _ := schema["properties"].(map[string]any)
+	if addl, ok := schema["additionalProperties"].(bool); ok && !addl && props != nil {
+		for k := range obj {
+			if _, declared := props[k]; !declared {
+				t.Errorf("%s: undeclared property %q when additionalProperties=false", path, k)
+			}
+		}
+	}
+	for k, val := range obj {
+		propSchema, ok := props[k].(map[string]any)
+		if !ok {
+			continue
+		}
+		validateJSONValueAgainstSchema(t, path+"."+k, val, propSchema, rootSchema)
+	}
+}
+
+func validateJSONValueAgainstSchema(t *testing.T, path string, val any, schema map[string]any, rootSchema map[string]any) {
+	t.Helper()
+	if ref, ok := schema["$ref"].(string); ok && strings.HasPrefix(ref, "#/$defs/") {
+		defName := strings.TrimPrefix(ref, "#/$defs/")
+		if defs, ok := rootSchema["$defs"].(map[string]any); ok {
+			if target, ok := defs[defName].(map[string]any); ok {
+				schema = target
+			}
+		}
+	}
+	if constVal, hasConst := schema["const"]; hasConst {
+		if !reflect.DeepEqual(val, constVal) {
+			t.Errorf("%s: expected const %v, got %v", path, constVal, val)
+		}
+	}
+	if enumSlice, ok := schema["enum"].([]any); ok && val != nil {
+		matched := false
+		for _, item := range enumSlice {
+			if reflect.DeepEqual(val, item) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Errorf("%s: value %v not in enum %v", path, val, enumSlice)
+		}
+	}
+
+	var allowedTypes []string
+	switch rawType := schema["type"].(type) {
+	case string:
+		allowedTypes = []string{rawType}
+	case []any:
+		for _, item := range rawType {
+			if s, ok := item.(string); ok {
+				allowedTypes = append(allowedTypes, s)
+			}
+		}
+	}
+	if len(allowedTypes) > 0 {
+		actualType := jsonSchemaValueType(val)
+		typeOK := false
+		for _, want := range allowedTypes {
+			if want == actualType || (want == "number" && actualType == "integer") {
+				typeOK = true
+				break
+			}
+		}
+		if !typeOK {
+			t.Errorf("%s: expected JSON type %v, got %s (%#v)", path, allowedTypes, actualType, val)
+			return
+		}
+	}
+
+	switch typed := val.(type) {
+	case map[string]any:
+		validateJSONObjectAgainstSchema(t, path, typed, schema, rootSchema)
+	case []any:
+		if itemSchema, ok := schema["items"].(map[string]any); ok {
+			for idx, elem := range typed {
+				validateJSONValueAgainstSchema(t, fmt.Sprintf("%s[%d]", path, idx), elem, itemSchema, rootSchema)
+			}
+		}
+	}
+}
+
+func jsonSchemaValueType(v any) string {
+	if v == nil {
+		return "null"
+	}
+	switch n := v.(type) {
+	case bool:
+		return "boolean"
+	case string:
+		return "string"
+	case float64:
+		if float64(int64(n)) == n {
+			return "integer"
+		}
+		return "number"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return fmt.Sprintf("%T", v)
+	}
+}
+
+func sortedMapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func TestRobotDriftRevivesIssueLevelAlertsAndTriageMaxResults(t *testing.T) {
+	exe := buildTestBinary(t)
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	initialJSONL := `{"id":"bv-1","title":"Root authentication refactor","description":"Refactor OAuth2 token validation across handlers","status":"open","priority":3,"issue_type":"task","created_at":"2025-11-01T00:00:00Z","updated_at":"2025-11-01T00:00:00Z"}` + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(initialJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--save-baseline", "initial"); err != nil {
+		t.Fatalf("--save-baseline failed: %v\nstdout:\n%s\nstderr:\n%s", err, out, stderr)
+	}
+
+	evolvedJSONL := strings.Join([]string{
+		`{"id":"bv-1","title":"Root authentication refactor","description":"Refactor OAuth2 token validation across handlers","status":"open","priority":4,"issue_type":"task","created_at":"2025-10-01T00:00:00Z","updated_at":"2025-10-01T00:00:00Z"}`,
+		`{"id":"bv-2","title":"Root authentication refactor","description":"Refactor OAuth2 token validation across handlers","status":"open","priority":2,"issue_type":"task","created_at":"2026-01-10T00:00:00Z","updated_at":"2026-01-10T00:00:00Z"}`,
+		`{"id":"bv-3","title":"Dependent A","status":"open","priority":0,"issue_type":"task","dependencies":[{"issue_id":"bv-3","depends_on_id":"bv-1","type":"blocks"}],"created_at":"2026-01-10T00:00:00Z","updated_at":"2026-01-10T00:00:00Z"}`,
+		`{"id":"bv-4","title":"Dependent B","status":"open","priority":0,"issue_type":"task","dependencies":[{"issue_id":"bv-4","depends_on_id":"bv-1","type":"blocks"}],"created_at":"2026-01-10T00:00:00Z","updated_at":"2026-01-10T00:00:00Z"}`,
+		`{"id":"bv-5","title":"Dependent C","status":"open","priority":0,"issue_type":"task","dependencies":[{"issue_id":"bv-5","depends_on_id":"bv-1","type":"blocks"}],"created_at":"2026-01-10T00:00:00Z","updated_at":"2026-01-10T00:00:00Z"}`,
+		`{"id":"bv-6","title":"Independent Ready 1","status":"open","priority":1,"issue_type":"task","created_at":"2026-01-10T00:00:00Z","updated_at":"2026-01-10T00:00:00Z"}`,
+		`{"id":"bv-7","title":"Independent Ready 2","status":"open","priority":2,"issue_type":"task","created_at":"2026-01-10T00:00:00Z","updated_at":"2026-01-10T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(evolvedJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	driftOut, driftStderr, driftErr := runCommandWithTimeout(t, tmpDir, exe, "--robot-drift", "--check-drift")
+	if driftErr == nil {
+		t.Fatalf("expected non-zero drift exit code when warnings/criticals fire; stdout:\n%s", driftOut)
+	}
+	var driftPayload map[string]any
+	if err := json.Unmarshal([]byte(driftOut), &driftPayload); err != nil {
+		t.Fatalf("--robot-drift JSON decode failed: %v\nstdout:\n%s\nstderr:\n%s", err, driftOut, driftStderr)
+	}
+	for _, field := range []string{"generated_at", "data_hash", "has_drift", "exit_code", "summary", "alerts"} {
+		if driftPayload[field] == nil {
+			t.Fatalf("--robot-drift missing field %q: %#v", field, driftPayload)
+		}
+	}
+	alertsSlice, _ := driftPayload["alerts"].([]any)
+	foundIssueLevelAlert := false
+	for _, raw := range alertsSlice {
+		m, _ := raw.(map[string]any)
+		typ, _ := m["type"].(string)
+		if typ == "potential_duplicate" || typ == "high_impact_unblock" || typ == "stale_issue" || typ == "priority_mismatch" {
+			foundIssueLevelAlert = true
+			break
+		}
+	}
+	if !foundIssueLevelAlert {
+		t.Fatalf("expected revived issue-level alert in --robot-drift output, got alerts=%#v", alertsSlice)
+	}
+
+	triageOut, triageStderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-triage", "--robot-max-results", "2")
+	if err != nil {
+		t.Fatalf("--robot-triage --robot-max-results 2 failed: %v\nstdout:\n%s\nstderr:\n%s", err, triageOut, triageStderr)
+	}
+	var triagePayload struct {
+		Triage struct {
+			QuickRef struct {
+				TopPicks []any `json:"top_picks"`
+			} `json:"quick_ref"`
+			Recommendations []any `json:"recommendations"`
+		} `json:"triage"`
+	}
+	if err := json.Unmarshal([]byte(triageOut), &triagePayload); err != nil {
+		t.Fatalf("unmarshaling triage output: %v", err)
+	}
+	if len(triagePayload.Triage.Recommendations) > 2 || len(triagePayload.Triage.QuickRef.TopPicks) > 2 {
+		t.Fatalf("--robot-max-results 2 not honored: recs=%d top_picks=%d",
+			len(triagePayload.Triage.Recommendations), len(triagePayload.Triage.QuickRef.TopPicks))
+	}
+}
+
+func TestAgentsCLIMutatesUnderBVRobotAndSupportsDryRun(t *testing.T) {
+	exe := buildTestBinary(t)
+	tmpDir := t.TempDir()
+	writeTestBeadsFixture(t, tmpDir)
+
+	runRobotEnv := func(args ...string) (string, string, error) {
+		t.Helper()
+		cmd := exec.Command(exe, args...)
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(), "BV_ROBOT=1", "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		err := cmd.Run()
+		return stdout.String(), stderr.String(), err
+	}
+
+	dryOut, dryErrStr, err := runRobotEnv("--agents-add", "--agents-dry-run")
+	if err != nil {
+		t.Fatalf("BV_ROBOT=1 --agents-add --agents-dry-run failed: %v\nstdout:\n%s\nstderr:\n%s", err, dryOut, dryErrStr)
+	}
+	if _, statErr := os.Stat(filepath.Join(tmpDir, "AGENTS.md")); !os.IsNotExist(statErr) {
+		t.Fatalf("--agents-dry-run unexpectedly created AGENTS.md: %v", statErr)
+	}
+
+	addOut, addErrStr, err := runRobotEnv("--agents-add")
+	if err != nil {
+		t.Fatalf("BV_ROBOT=1 --agents-add failed: %v\nstdout:\n%s\nstderr:\n%s", err, addOut, addErrStr)
+	}
+	content, err := os.ReadFile(filepath.Join(tmpDir, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("AGENTS.md was not written under BV_ROBOT=1 --agents-add: %v", err)
+	}
+	if !agents.ContainsBlurb(string(content)) {
+		t.Fatalf("AGENTS.md missing agent blurb after --agents-add:\n%s", string(content))
+	}
+	var receipt map[string]any
+	if err := json.Unmarshal([]byte(addOut), &receipt); err != nil {
+		t.Fatalf("expected JSON receipt from BV_ROBOT=1 --agents-add, got: %v\n%s", err, addOut)
+	}
+	if receipt["action"] != "add" || receipt["modified"] != true {
+		t.Fatalf("unexpected --agents-add receipt: %#v", receipt)
+	}
+
+	remOut, remErrStr, err := runRobotEnv("--agents-remove")
+	if err != nil {
+		t.Fatalf("BV_ROBOT=1 --agents-remove failed: %v\nstdout:\n%s\nstderr:\n%s", err, remOut, remErrStr)
+	}
+	afterRemove, err := os.ReadFile(filepath.Join(tmpDir, "AGENTS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agents.ContainsBlurb(string(afterRemove)) {
+		t.Fatalf("AGENTS.md still contains blurb after BV_ROBOT=1 --agents-remove")
+	}
+}
+
+func TestBeadHistoryAndCorrelationActionEnvelopes(t *testing.T) {
+	exe := buildTestBinary(t)
+	repo := t.TempDir()
+	gitRun := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester",
+			"GIT_AUTHOR_EMAIL=tester@example.invalid",
+			"GIT_COMMITTER_NAME=Tester",
+			"GIT_COMMITTER_EMAIL=tester@example.invalid",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	gitRun("init", "-b", "main")
+	if err := os.MkdirAll(filepath.Join(repo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issueLine := `{"id":"bv-h1","title":"History envelope test","status":"in_progress","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}` + "\n"
+	if err := os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"), []byte(issueLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "handler.go"), []byte("package sample\nfunc Run() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun("add", ".beads/issues.jsonl", "handler.go")
+	gitRun("commit", "-m", "Fixes bv-h1: wire envelope")
+	sha := gitRun("rev-parse", "HEAD")
+
+	// 1. --bead-history emits RobotEnvelope + history
+	bhOut, bhErr, err := runCommandWithTimeout(t, repo, exe, "--bead-history", "bv-h1")
+	if err != nil {
+		t.Fatalf("--bead-history failed: %v\nstdout:\n%s\nstderr:\n%s", err, bhOut, bhErr)
+	}
+	var bhPayload map[string]any
+	if err := json.Unmarshal([]byte(bhOut), &bhPayload); err != nil {
+		t.Fatalf("--bead-history JSON decode failed: %v\n%s", err, bhOut)
+	}
+	for _, f := range []string{"generated_at", "data_hash", "histories", "stats", "commit_index"} {
+		if bhPayload[f] == nil {
+			t.Fatalf("--bead-history missing %q: %#v", f, bhPayload)
+		}
+	}
+
+	// 2. --robot-explain-correlation, --robot-confirm-correlation, --robot-reject-correlation emit RobotEnvelope
+	pairArg := sha[:8] + ":bv-h1"
+	for _, flagName := range []string{"--robot-explain-correlation", "--robot-confirm-correlation", "--robot-reject-correlation"} {
+		out, stderr, err := runCommandWithTimeout(t, repo, exe, flagName, pairArg)
+		if err != nil {
+			t.Fatalf("%s failed: %v\nstdout:\n%s\nstderr:\n%s", flagName, err, out, stderr)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(out), &payload); err != nil {
+			t.Fatalf("%s JSON decode failed: %v\n%s", flagName, err, out)
+		}
+		for _, envKey := range []string{"generated_at", "data_hash", "version"} {
+			if payload[envKey] == nil {
+				t.Fatalf("%s output missing RobotEnvelope key %q: %#v", flagName, envKey, payload)
+			}
+		}
+	}
+}
+
+func TestSubdirectoryProjectContextParity(t *testing.T) {
+	exe := buildTestBinary(t)
+	repo := t.TempDir()
+	nestedDir := filepath.Join(repo, "cmd", "subpkg")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	gitRun := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=SubdirTest",
+			"GIT_AUTHOR_EMAIL=subdir@example.invalid",
+			"GIT_COMMITTER_NAME=SubdirTest",
+			"GIT_COMMITTER_EMAIL=subdir@example.invalid",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	gitRun("init", "-b", "main")
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+	commit1JSONL := fmt.Sprintf(`{"id":"bv-sub-1","title":"Initial issue","status":"open","priority":2,"issue_type":"task","created_at":%q,"updated_at":%q}`+"\n", nowStr, nowStr)
+	if err := os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"), []byte(commit1JSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun("add", ".beads/issues.jsonl")
+	gitRun("commit", "-m", "initial tracker snapshot")
+
+	commit2JSONL := commit1JSONL + fmt.Sprintf(`{"id":"bv-sub-2","title":"Second issue","status":"open","priority":1,"issue_type":"task","created_at":%q,"updated_at":%q}`+"\n", nowStr, nowStr)
+	if err := os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"), []byte(commit2JSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun("add", ".beads/issues.jsonl")
+	gitRun("commit", "-m", "second tracker snapshot")
+
+	// Configure .bv/hooks.yaml and save baseline at repo root.
+	hooksYAML := "hooks:\n  post-export:\n    - command: \"echo ok\"\n"
+	if err := os.WriteFile(filepath.Join(repo, ".bv", "hooks.yaml"), []byte(hooksYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, stderr, err := runCommandWithTimeout(t, repo, exe, "--save-baseline", "root baseline"); err != nil {
+		t.Fatalf("--save-baseline failed: %v\nstdout:\n%s\nstderr:\n%s", err, out, stderr)
+	}
+
+	// 1. --as-of HEAD~1 from nestedDir must match repo root (returning 1 issue, not failing git show).
+	rootAsOf, _, err := runCommandWithTimeout(t, repo, exe, "--as-of", "HEAD~1", "--robot-triage")
+	if err != nil {
+		t.Fatalf("root --as-of HEAD~1 failed: %v", err)
+	}
+	subAsOf, subStderr, err := runCommandWithTimeout(t, nestedDir, exe, "--as-of", "HEAD~1", "--robot-triage")
+	if err != nil {
+		t.Fatalf("nested --as-of HEAD~1 failed: %v\nstdout:\n%s\nstderr:\n%s", err, subAsOf, subStderr)
+	}
+	var rootTriage, subTriage map[string]any
+	if err := json.Unmarshal([]byte(rootAsOf), &rootTriage); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(subAsOf), &subTriage); err != nil {
+		t.Fatal(err)
+	}
+	if rootTriage["data_hash"] != subTriage["data_hash"] {
+		t.Fatalf("subdirectory --as-of data_hash %v != root data_hash %v", subTriage["data_hash"], rootTriage["data_hash"])
+	}
+
+	// 2. --robot-drift --check-drift from nestedDir must locate <repo>/.bv/baseline.json cleanly.
+	driftOut, driftErrStr, err := runCommandWithTimeout(t, nestedDir, exe, "--robot-drift", "--check-drift")
+	if err != nil {
+		t.Fatalf("nested --robot-drift --check-drift failed: %v\nstdout:\n%s\nstderr:\n%s", err, driftOut, driftErrStr)
+	}
+
+	// 3. --hooks-info from nestedDir must locate <repo>/.bv/hooks.yaml.
+	hooksOut, hooksErrStr, err := runCommandWithTimeout(t, nestedDir, exe, "--hooks-info")
+	if err != nil {
+		t.Fatalf("nested --hooks-info failed: %v\nstdout:\n%s\nstderr:\n%s", err, hooksOut, hooksErrStr)
+	}
+	if !strings.Contains(hooksOut, "echo ok") {
+		t.Fatalf("nested --hooks-info did not inspect root .bv/hooks.yaml:\n%s", hooksOut)
+	}
+
+	// 4. Standalone --workspace config outside .bv/ must resolve relative repo paths against config's parent dir.
+	wsHolder := t.TempDir()
+	wsConfigPath := filepath.Join(wsHolder, "standalone-ws.yaml")
+	relRepo, err := filepath.Rel(wsHolder, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsYAML := fmt.Sprintf("repos:\n  - name: mainrepo\n    path: %s\n    prefix: mr-\n", relRepo)
+	if err := os.WriteFile(wsConfigPath, []byte(wsYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wsOut, wsErrStr, err := runCommandWithTimeout(t, nestedDir, exe, "--workspace", wsConfigPath, "--robot-plan")
+	if err != nil {
+		t.Fatalf("standalone --workspace failed from nestedDir: %v\nstdout:\n%s\nstderr:\n%s", err, wsOut, wsErrStr)
+	}
+	if !strings.Contains(wsOut, "mr-bv-sub-1") {
+		t.Fatalf("expected prefixed workspace issue mr-bv-sub-1 in output:\n%s", wsOut)
+	}
+}
+
+func TestBriefOutputsRefuseSymlinkTargets(t *testing.T) {
+	exe := buildTestBinary(t)
+	tmpDir := t.TempDir()
+	writeTestBeadsFixture(t, tmpDir)
+
+	victim := filepath.Join(tmpDir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("DO NOT OVERWRITE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	symlinkBrief := filepath.Join(tmpDir, "brief-link.md")
+	if err := os.Symlink(victim, symlinkBrief); err != nil {
+		t.Fatal(err)
+	}
+
+	if out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--priority-brief", symlinkBrief); err == nil {
+		t.Fatalf("expected --priority-brief to refuse symlink target; stdout:\n%s\nstderr:\n%s", out, stderr)
+	}
+	victimBytes, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(victimBytes) != "DO NOT OVERWRITE" {
+		t.Fatalf("symlink victim was modified: %q", string(victimBytes))
+	}
+
+	victimDir := filepath.Join(tmpDir, "victim-dir")
+	if err := os.MkdirAll(victimDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkDir := filepath.Join(tmpDir, "bundle-link")
+	if err := os.Symlink(victimDir, symlinkDir); err != nil {
+		t.Fatal(err)
+	}
+	if out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--agent-brief", symlinkDir); err == nil {
+		t.Fatalf("expected --agent-brief to refuse symlink directory; stdout:\n%s\nstderr:\n%s", out, stderr)
 	}
 }
 

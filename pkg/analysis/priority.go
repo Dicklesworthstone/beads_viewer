@@ -14,6 +14,7 @@ import (
 type ImpactScore struct {
 	IssueID   string         `json:"issue_id"`
 	Title     string         `json:"title"`
+	Labels    []string       `json:"labels"`
 	Score     float64        `json:"score"`     // Composite 0-1 score
 	Breakdown ScoreBreakdown `json:"breakdown"` // Individual components
 	Priority  int            `json:"priority"`  // Original priority
@@ -236,14 +237,41 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 		betweenness = stats.Betweenness()
 		criticalPath = stats.CriticalPathScore()
 	}
+	if activeBW, _, _ := a.activeSubgraphMetrics(stats); activeBW != nil {
+		betweenness = activeBW
+	}
 
 	// Precomputed blocker counts (computed in NewAnalyzer for impact scoring).
 	blockerCounts := a.blockerCounts
-	maxBlockers := a.blockerCountsMax
 
-	// Find max values for normalization
-	maxPR := findMax(pageRank)
-	maxBW := findMax(betweenness)
+	// Normalize against active non-closed issues ONLY so long-resolved
+	// historical epics (closed roots/hubs) never compress live impact scores
+	// toward 0. Output candidate eligibility is enforced in recommendation
+	// emission so impact scoring retains full graph context.
+	maxPR := 0.0
+	maxBW := 0.0
+	maxBlockers := 0
+	scoreCount := 0
+	for id, issue := range a.issueMap {
+		if isClosedLikeStatus(issue.Status) {
+			continue
+		}
+		scoreCount++
+		if pr := pageRank[id]; pr > maxPR {
+			maxPR = pr
+		}
+		if bw := betweenness[id]; bw > maxBW {
+			maxBW = bw
+		}
+		if nodeID, ok := a.idToNode[id]; ok && nodeID >= 0 && int(nodeID) < len(blockerCounts) {
+			if bc := blockerCounts[nodeID]; bc > maxBlockers {
+				maxBlockers = bc
+			}
+		}
+	}
+	if scoreCount == 0 {
+		return nil
+	}
 
 	// Compute median estimated minutes for issues without estimates
 	medianMinutes := a.computeMedianEstimatedMinutes()
@@ -251,28 +279,6 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 	// Factor weights: defaults unless SetWeights applied feedback-adjusted ones.
 	w := a.Weights()
 
-	// Reserve only rows that receive a score. Fully closed graphs retain a nil
-	// result without allocating a backing array for excluded context rows.
-	scoreCount := 0
-	if len(a.issues) == len(a.issueMap) {
-		// The immutable source has no duplicates. Indexing avoids copying each
-		// large issue value just to read its status on mostly-closed graphs.
-		for i := range a.issues {
-			if !isClosedLikeStatus(a.issues[i].Status) {
-				scoreCount++
-			}
-		}
-	} else {
-		// Duplicate IDs use the same final row as score emission below.
-		for _, issue := range a.issueMap {
-			if !isClosedLikeStatus(issue.Status) {
-				scoreCount++
-			}
-		}
-	}
-	if scoreCount == 0 {
-		return nil
-	}
 	scores := make([]ImpactScore, 0, scoreCount)
 
 	for id, issue := range a.issueMap {
@@ -345,6 +351,7 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 		scores = append(scores, ImpactScore{
 			IssueID:   id,
 			Title:     issue.Title,
+			Labels:    append([]string{}, issue.Labels...),
 			Score:     score,
 			Breakdown: breakdown,
 			Priority:  issue.Priority,
@@ -623,6 +630,7 @@ type WhatIfDelta struct {
 type PriorityRecommendation struct {
 	IssueID           string       `json:"issue_id"`
 	Title             string       `json:"title"`
+	Labels            []string     `json:"labels"`
 	CurrentPriority   int          `json:"current_priority"`
 	SuggestedPriority int          `json:"suggested_priority"`
 	ImpactScore       float64      `json:"impact_score"`
@@ -699,6 +707,9 @@ func (a *Analyzer) GenerateRecommendationsFromStats(stats *GraphStats, threshold
 	var recommendations []PriorityRecommendation
 
 	for _, score := range scores {
+		if !a.IsCandidate(score.IssueID) {
+			continue
+		}
 		rec := generateRecommendation(
 			score,
 			unblocksMap[score.IssueID],
@@ -859,6 +870,7 @@ func generateRecommendation(score ImpactScore, unblocksCount int, core int, isAr
 	return &PriorityRecommendation{
 		IssueID:           score.IssueID,
 		Title:             score.Title,
+		Labels:            append([]string{}, score.Labels...),
 		CurrentPriority:   score.Priority,
 		SuggestedPriority: suggestedPriority,
 		ImpactScore:       score.Score,

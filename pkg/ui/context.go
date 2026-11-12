@@ -23,15 +23,17 @@ const (
 	ContextCassSession        Context = "cass-session"
 
 	// Views
-	ContextInsights       Context = "insights"
-	ContextFlowMatrix     Context = "flow-matrix"
-	ContextGraph          Context = "graph"
-	ContextBoard          Context = "board"
-	ContextActionable     Context = "actionable"
-	ContextHistory        Context = "history"
-	ContextSprint         Context = "sprint"
-	ContextLabelDashboard Context = "label-dashboard"
-	ContextAttention      Context = "attention"
+	ContextInsights           Context = "insights"
+	ContextFlowMatrix         Context = "flow-matrix"
+	ContextGraph              Context = "graph"
+	ContextBoard              Context = "board"
+	ContextTree               Context = "tree"
+	ContextActionable         Context = "actionable"
+	ContextHistory            Context = "history"
+	ContextSprint             Context = "sprint"
+	ContextLabelDashboard     Context = "label-dashboard"
+	ContextAttention          Context = "attention"
+	ContextVelocityComparison Context = "velocity-comparison"
 
 	// Detail states
 	ContextSplit      Context = "split"
@@ -113,6 +115,11 @@ func (m Model) CurrentContext() Context {
 
 	// === Views (based on focus or view flags) ===
 
+	// Velocity comparison sub-view (opened from Label Dashboard via v)
+	if m.showVelocityComparison || m.focused == focusVelocityComparison {
+		return ContextVelocityComparison
+	}
+
 	// Attention view (bv-117) is its own focus, opened with ]
 	if m.focused == focusAttention {
 		return ContextAttention
@@ -128,33 +135,38 @@ func (m Model) CurrentContext() Context {
 		return ContextFlowMatrix
 	}
 
+	// Hierarchical tree view
+	if m.focused == focusTree {
+		return ContextTree
+	}
+
 	// Label dashboard
 	if m.focused == focusLabelDashboard {
 		return ContextLabelDashboard
 	}
 
 	// Graph view
-	if m.isGraphView {
+	if m.isGraphView || m.focused == focusGraph {
 		return ContextGraph
 	}
 
 	// Board view
-	if m.isBoardView {
+	if m.isBoardView || m.focused == focusBoard {
 		return ContextBoard
 	}
 
 	// Actionable view
-	if m.isActionableView {
+	if m.isActionableView || m.focused == focusActionable {
 		return ContextActionable
 	}
 
 	// History view
-	if m.isHistoryView {
+	if m.isHistoryView || m.focused == focusHistory {
 		return ContextHistory
 	}
 
 	// Sprint view
-	if m.isSprintView {
+	if m.isSprintView || m.focused == focusSprint {
 		return ContextSprint
 	}
 
@@ -206,11 +218,13 @@ func (c Context) Description() string {
 		ContextFlowMatrix:         "Flow matrix",
 		ContextGraph:              "Dependency graph",
 		ContextBoard:              "Kanban board",
+		ContextTree:               "Tree view",
 		ContextActionable:         "Actionable view",
 		ContextHistory:            "History view",
 		ContextSprint:             "Sprint view",
 		ContextLabelDashboard:     "Label dashboard",
 		ContextAttention:          "Attention view",
+		ContextVelocityComparison: "Velocity comparison",
 		ContextSplit:              "Split view",
 		ContextDetail:             "Issue detail",
 		ContextTimeTravel:         "Time-travel mode",
@@ -239,47 +253,64 @@ func (c Context) IsOverlay() bool {
 func (c Context) IsView() bool {
 	switch c {
 	case ContextInsights, ContextFlowMatrix, ContextGraph, ContextBoard,
-		ContextActionable, ContextHistory, ContextSprint, ContextLabelDashboard,
-		ContextAttention, ContextSplit, ContextDetail, ContextTimeTravel:
+		ContextTree, ContextActionable, ContextHistory, ContextSprint,
+		ContextLabelDashboard, ContextAttention, ContextVelocityComparison,
+		ContextSplit, ContextDetail, ContextTimeTravel:
 		return true
 	}
 	return false
 }
 
-// TutorialPages returns the recommended tutorial page IDs for this context.
-// Used to provide context-sensitive help.
+// AllContexts returns every UI Context emitted by Model.CurrentContext().
+func AllContexts() []Context {
+	return []Context{
+		ContextLabelPicker,
+		ContextRecipePicker,
+		ContextHelp,
+		ContextQuitConfirm,
+		ContextLabelHealthDetail,
+		ContextLabelDrilldown,
+		ContextLabelGraphAnalysis,
+		ContextTimeTravelInput,
+		ContextAlerts,
+		ContextRepoPicker,
+		ContextAgentPrompt,
+		ContextCassSession,
+		ContextInsights,
+		ContextFlowMatrix,
+		ContextGraph,
+		ContextBoard,
+		ContextTree,
+		ContextActionable,
+		ContextHistory,
+		ContextSprint,
+		ContextLabelDashboard,
+		ContextAttention,
+		ContextVelocityComparison,
+		ContextSplit,
+		ContextDetail,
+		ContextTimeTravel,
+		ContextFilter,
+		ContextList,
+	}
+}
+
+// TutorialPages returns the recommended tutorial page indices for this context.
+// Indices match defaultTutorialPages(), falling back to page 0 when no page is tagged.
 func (c Context) TutorialPages() []int {
-	// Map contexts to relevant tutorial page indices
-	pageMap := map[Context][]int{
-		ContextList:               {0, 1, 2}, // Intro, Navigation, List View
-		ContextFilter:             {2, 3},    // List View, Filtering
-		ContextDetail:             {4},       // Detail View
-		ContextSplit:              {4, 2},    // Detail View, List View
-		ContextBoard:              {5},       // Board View
-		ContextGraph:              {6},       // Graph View
-		ContextInsights:           {7},       // Insights
-		ContextHistory:            {8},       // History View
-		ContextActionable:         {9},       // Actionable View
-		ContextTimeTravel:         {10},      // Time-Travel
-		ContextLabelDashboard:     {11},      // Labels
-		ContextFlowMatrix:         {11, 12},  // Labels, Advanced
-		ContextHelp:               {13},      // Keyboard Reference
-		ContextSprint:             {14},      // Sprints
-		ContextAttention:          {7},       // Insights (attention is part of insights)
-		ContextAlerts:             {15},      // Alerts
-		ContextLabelPicker:        {11, 3},   // Labels, Filtering
-		ContextRecipePicker:       {3, 12},   // Filtering, Advanced
-		ContextRepoPicker:         {12},      // Advanced (workspace)
-		ContextAgentPrompt:        {16},      // AI Agent Integration
-		ContextLabelHealthDetail:  {11},      // Labels
-		ContextLabelDrilldown:     {11},      // Labels
-		ContextLabelGraphAnalysis: {6, 11},   // Graph, Labels
-		ContextTimeTravelInput:    {10},      // Time-Travel
-		ContextQuitConfirm:        {1},       // Navigation basics
-		ContextCassSession:        {8},       // History (cass integrates with history)
+	target := string(c)
+	pages := defaultTutorialPages()
+	var matches []int
+	for i, page := range pages {
+		for _, ctx := range page.Contexts {
+			if ctx == target {
+				matches = append(matches, i)
+				break
+			}
+		}
 	}
-	if pages, ok := pageMap[c]; ok {
-		return pages
+	if len(matches) > 0 {
+		return matches
 	}
-	return []int{0} // Default to intro page
+	return []int{0}
 }

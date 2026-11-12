@@ -1,6 +1,7 @@
 package analysis_test
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -1064,4 +1065,111 @@ func assertParkedDependentsStayWithheld(t *testing.T, issues []model.Issue, root
 		return
 	}
 	t.Fatalf("Missing recommendation for root %s in parked fixture", rootID)
+}
+
+func TestImpactScores_ClosedArchiveDoesNotCompressActiveScores(t *testing.T) {
+	now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+
+	activeIssues := []model.Issue{
+		{ID: "open-blocker", Title: "Active Blocker", Status: model.StatusOpen, Priority: 3, UpdatedAt: now.Add(-10 * 24 * time.Hour), Labels: []string{"core"}},
+		{ID: "open-dep-1", Title: "Active Dep 1", Status: model.StatusOpen, Priority: 1, UpdatedAt: now, Dependencies: []*model.Dependency{
+			{DependsOnID: "open-blocker", Type: model.DepBlocks},
+		}},
+		{ID: "open-dep-2", Title: "Active Dep 2", Status: model.StatusOpen, Priority: 1, UpdatedAt: now, Dependencies: []*model.Dependency{
+			{DependsOnID: "open-blocker", Type: model.DepBlocks},
+		}},
+	}
+
+	anBaseline := analysis.NewAnalyzer(activeIssues)
+	baseScore := anBaseline.ComputeImpactScore("open-blocker")
+	if baseScore == nil {
+		t.Fatal("missing baseline ImpactScore for open-blocker")
+	}
+
+	// Add 300 disjoint closed historical issues forming a massive closed star hub.
+	withArchive := append([]model.Issue(nil), activeIssues...)
+	withArchive = append(withArchive, model.Issue{
+		ID:        "ancient-hub",
+		Title:     "Ancient Closed Hub",
+		Status:    model.StatusClosed,
+		Priority:  0,
+		UpdatedAt: now.Add(-180 * 24 * time.Hour),
+	})
+	for i := 0; i < 300; i++ {
+		withArchive = append(withArchive, model.Issue{
+			ID:        fmt.Sprintf("ancient-leaf-%03d", i),
+			Title:     "Ancient Closed Leaf",
+			Status:    model.StatusClosed,
+			Priority:  2,
+			UpdatedAt: now.Add(-180 * 24 * time.Hour),
+			Dependencies: []*model.Dependency{
+				{DependsOnID: "ancient-hub", Type: model.DepBlocks},
+			},
+		})
+	}
+
+	anWithArchive := analysis.NewAnalyzer(withArchive)
+	archiveScore := anWithArchive.ComputeImpactScore("open-blocker")
+	if archiveScore == nil {
+		t.Fatal("missing archive ImpactScore for open-blocker")
+	}
+
+	// Normalized active PageRankNorm and BlockerRatioNorm must remain 1.0 (never compressed toward 0 by ancient-hub).
+	if archiveScore.Breakdown.PageRankNorm < 0.99 || archiveScore.Breakdown.BlockerRatioNorm < 0.99 {
+		t.Fatalf("closed historical hub compressed active open-blocker normalization: baseline=%+v withArchive=%+v", baseScore.Breakdown, archiveScore.Breakdown)
+	}
+}
+
+func TestCountStatusPartitionAndRecommendationScoping(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "ready-1", Title: "Ready", Status: model.StatusOpen, Priority: 3},
+		{ID: "in-prog-1", Title: "In Progress", Status: model.StatusInProgress, Priority: 2},
+		{ID: "dep-blocked-1", Title: "Dep Blocked", Status: model.StatusOpen, Priority: 1, Dependencies: []*model.Dependency{
+			{DependsOnID: "ready-1", Type: model.DepBlocks},
+		}},
+		{ID: "explicit-blocked-1", Title: "Explicit Blocked", Status: model.StatusBlocked, Priority: 1},
+		{ID: "deferred-1", Title: "Deferred", Status: model.StatusDeferred, Priority: 4, Dependencies: []*model.Dependency{}},
+		{ID: "pinned-1", Title: "Pinned", Status: model.StatusPinned, Priority: 4},
+		{ID: "closed-1", Title: "Closed", Status: model.StatusClosed, Priority: 2},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+	part := an.CountStatusPartition()
+	if part.Total != 7 || part.Closed != 1 || part.Actionable != 2 || part.InProgress != 1 || part.Blocked != 2 || part.DeferredOrParked != 2 {
+		t.Fatalf("unexpected status partition: %+v", part)
+	}
+	if part.Closed+part.Actionable+part.Blocked+part.DeferredOrParked != part.Total {
+		t.Fatalf("status partition does not sum to Total: %+v", part)
+	}
+
+	recs := an.GenerateEnhancedRecommendationsFromStats(nil, analysis.DefaultThresholds(), 0, false)
+	for _, rec := range recs {
+		switch rec.IssueID {
+		case "closed-1", "dep-blocked-1", "explicit-blocked-1", "deferred-1", "pinned-1":
+			t.Fatalf("default enhanced recommendations leaked non-ready/parked issue %s", rec.IssueID)
+		}
+		if rec.Labels == nil {
+			t.Fatalf("recommendation Labels slice must be non-nil []string{} for %s", rec.IssueID)
+		}
+	}
+
+	readyIDs := an.CandidateIssues(analysis.SelectionReadyLeaf)
+	if len(readyIDs) != 2 || readyIDs[0].ID != "in-prog-1" || readyIDs[1].ID != "ready-1" {
+		t.Fatalf("CandidateIssues(SelectionReadyLeaf) = %+v, want [in-prog-1 ready-1]", readyIDs)
+	}
+
+	withInactive := an.GenerateEnhancedRecommendationsFromStats(nil, analysis.DefaultThresholds(), 0, true)
+	foundDepBlocked := false
+	foundParked := false
+	for _, rec := range withInactive {
+		if rec.IssueID == "dep-blocked-1" {
+			foundDepBlocked = true
+		}
+		if rec.IssueID == "explicit-blocked-1" || rec.IssueID == "deferred-1" || rec.IssueID == "pinned-1" {
+			foundParked = true
+		}
+	}
+	if !foundDepBlocked && !foundParked {
+		t.Fatalf("expected includeInactive=true to surface blocked/parked items, got %+v", withInactive)
+	}
 }

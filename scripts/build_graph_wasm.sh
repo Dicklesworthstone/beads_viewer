@@ -66,7 +66,7 @@ installed_targets="$($rustup target list --installed --toolchain "$toolchain")"
 want_bindgen="$(awk '/^name = "wasm-bindgen"$/{getline; sub(/version = "/, "", $0); sub(/"$/, "", $0); print; exit}' "$crate/Cargo.lock")"
 [ "$want_bindgen" = 0.2.128 ] || fail 'Cargo.lock wasm-bindgen differs from pinned CLI'
 if [ -z "$out" ]; then
-  out="$(mktemp -d /tmp/bv-graph-wasm.XXXXXX)"
+  out="$(mktemp -d "${TMPDIR:-/tmp}/bv-graph-wasm.XXXXXX")"
 else
   out="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve())' "$out")"
   case "$out/" in "$root/"*) incomplete 'build output must be outside the source tree' ;; esac

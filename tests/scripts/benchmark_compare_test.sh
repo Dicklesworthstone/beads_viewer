@@ -74,7 +74,10 @@ check() {
   rc=$?
   set -e
   if [ "$rc" -ne "$want" ]; then
-    echo "FAIL: $name exited $rc, want $want"; echo "$out" | sed 's/^/    /'; fail=1
+    echo "FAIL: $name exited $rc, want $want"
+    # shellcheck disable=SC2001
+    echo "$out" | sed 's/^/    /'
+    fail=1
   else
     echo "ok: $name (exit $rc)"
   fi

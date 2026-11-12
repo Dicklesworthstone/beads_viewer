@@ -3,6 +3,7 @@ package datasource
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	json "github.com/goccy/go-json"
 	_ "modernc.org/sqlite"
 )
@@ -25,8 +27,9 @@ type validationCacheEntry struct {
 }
 
 type validationCacheKey struct {
-	path       string
-	sourceType SourceType
+	path        string
+	sourceType  SourceType
+	maxLineSize int
 }
 
 type validationFileIdentity struct {
@@ -76,7 +79,15 @@ var (
 )
 
 func sourceValidationCacheKey(source *DataSource) validationCacheKey {
-	return validationCacheKey{path: source.Path, sourceType: source.Type}
+	maxLineSize := 0
+	if source.Type != SourceTypeSQLite {
+		maxLineSize = loader.MaxJSONLLineSizeBytes()
+	}
+	return validationCacheKey{
+		path:        source.Path,
+		sourceType:  source.Type,
+		maxLineSize: maxLineSize,
+	}
 }
 
 // lookupValidationCache returns a cached result only for the same source state.
@@ -341,9 +352,18 @@ func validateSQLite(source *DataSource, opts ValidationOptions) error {
 	}
 	defer db.Close()
 
+	// Validate and count inside a single read-only transaction so schema checks,
+	// integrity check, and issue count observe one consistent WAL snapshot.
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("cannot begin read-only transaction: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Run integrity check
 	var integrity string
-	err = db.QueryRow("PRAGMA integrity_check").Scan(&integrity)
+	err = tx.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&integrity)
 	if err != nil {
 		return fmt.Errorf("integrity check failed: %w", err)
 	}
@@ -353,7 +373,7 @@ func validateSQLite(source *DataSource, opts ValidationOptions) error {
 
 	// Check for issues table
 	var tableName string
-	err = db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='issues'").Scan(&tableName)
+	err = tx.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name='issues'").Scan(&tableName)
 	if err == sql.ErrNoRows {
 		return fmt.Errorf("missing issues table")
 	}
@@ -362,7 +382,7 @@ func validateSQLite(source *DataSource, opts ValidationOptions) error {
 	}
 
 	// Check required columns exist
-	rows, err := db.Query("PRAGMA table_info(issues)")
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(issues)")
 	if err != nil {
 		return fmt.Errorf("cannot query table info: %w", err)
 	}
@@ -382,6 +402,9 @@ func validateSQLite(source *DataSource, opts ValidationOptions) error {
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("error iterating column info: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("cannot close table info cursor: %w", err)
+	}
 
 	requiredCols := []string{"id", "title", "status"}
 	for _, col := range requiredCols {
@@ -390,16 +413,16 @@ func validateSQLite(source *DataSource, opts ValidationOptions) error {
 		}
 	}
 
-	// Count issues if requested
+	// Count issues if requested, excluding soft-deleted tombstones identically to
+	// SQLiteReader and model.Status.IsTombstone.
 	if opts.CountIssues {
+		countQuery := "SELECT COUNT(*) FROM issues WHERE LOWER(COALESCE(status, '')) != 'tombstone'"
+		if columns["tombstone"] {
+			countQuery += " AND (tombstone IS NULL OR tombstone = 0)"
+		}
 		var count int
-		err = db.QueryRow("SELECT COUNT(*) FROM issues WHERE (tombstone IS NULL OR tombstone = 0)").Scan(&count)
-		if err != nil {
-			// Try without tombstone filter (column might not exist)
-			err = db.QueryRow("SELECT COUNT(*) FROM issues").Scan(&count)
-			if err != nil {
-				return fmt.Errorf("cannot count issues: %w", err)
-			}
+		if err := tx.QueryRowContext(ctx, countQuery).Scan(&count); err != nil {
+			return fmt.Errorf("cannot count issues: %w", err)
 		}
 		source.IssueCount = count
 	}
@@ -529,11 +552,17 @@ func validateJSONL(source *DataSource, opts ValidationOptions) error {
 	}
 	defer file.Close()
 
-	// Parse and validate each line
-	reader := bufio.NewReaderSize(file, 1024*1024) // 1MB buffer
+	// Parse and validate each line with bounded per-line buffering matching pkg/loader.
+	maxLineBytes := loader.MaxJSONLLineSizeBytes()
+	readBufSize := 1024 * 1024
+	if maxLineBytes < readBufSize {
+		readBufSize = maxLineBytes
+	}
+	reader := bufio.NewReaderSize(file, readBufSize)
 	lineNum := 0
 	validLines := 0
 	errorLines := 0
+	oversizedLines := 0
 
 	for {
 		lineNum++
@@ -545,31 +574,76 @@ func validateJSONL(source *DataSource, opts ValidationOptions) error {
 			return fmt.Errorf("read error at line %d: %w", lineNum, err)
 		}
 
-		// Handle long lines by reading the rest
+		// Handle long lines up to maxLineBytes; drain oversized lines without buffering.
 		if isPrefix {
 			var fullLine []byte
-			fullLine = append(fullLine, line...)
+			tooLong := len(line) >= maxLineBytes
+			if !tooLong {
+				fullLine = append(fullLine, line...)
+			}
 			for isPrefix {
-				line, isPrefix, err = reader.ReadLine()
+				var chunk []byte
+				chunk, isPrefix, err = reader.ReadLine()
 				if err != nil && err != io.EOF {
 					return fmt.Errorf("read error at line %d: %w", lineNum, err)
 				}
-				fullLine = append(fullLine, line...)
+				if !tooLong {
+					if len(fullLine)+len(chunk) >= maxLineBytes {
+						tooLong = true
+						fullLine = nil
+					} else {
+						fullLine = append(fullLine, chunk...)
+					}
+				}
 				if err == io.EOF {
 					break
 				}
 			}
+			if tooLong {
+				errorLines++
+				oversizedLines++
+				if opts.Verbose {
+					opts.Logger(fmt.Sprintf("Line %d exceeds max line size (%d bytes)", lineNum, maxLineBytes))
+				}
+				continue
+			}
 			line = fullLine
+		} else if len(line) >= maxLineBytes {
+			errorLines++
+			oversizedLines++
+			if opts.Verbose {
+				opts.Logger(fmt.Sprintf("Line %d exceeds max line size (%d bytes)", lineNum, maxLineBytes))
+			}
+			continue
 		}
 
 		// Skip empty lines
-		if len(bytes.TrimSpace(line)) == 0 {
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
 			continue
 		}
 
 		// Strip BOM from first line
 		if lineNum == 1 && bytes.HasPrefix(line, []byte{0xEF, 0xBB, 0xBF}) {
 			line = line[3:]
+			trimmed = bytes.TrimSpace(line)
+			if len(trimmed) == 0 {
+				continue
+			}
+		}
+
+		// Skip valid non-issue bd metadata lines (`_type` != "" and != "issue"),
+		// matching pkg/loader's recordTypeOf dispatch so auxiliary records like
+		// memories and sprints are neither counted as issues nor rejected as errors.
+		if bytes.Contains(line, []byte(`"_type"`)) && trimmed[0] == '{' {
+			var typeProbe struct {
+				Type string `json:"_type"`
+			}
+			if err := json.Unmarshal(line, &typeProbe); err == nil && json.Valid(line) {
+				if typeProbe.Type != "" && typeProbe.Type != "issue" {
+					continue
+				}
+			}
 		}
 
 		// Parse JSON.
@@ -621,6 +695,10 @@ func validateJSONL(source *DataSource, opts ValidationOptions) error {
 	if totalLines > 0 {
 		errorRate := float64(errorLines) / float64(totalLines)
 		if errorRate > opts.MaxJSONLErrorRate {
+			if oversizedLines > 0 {
+				return fmt.Errorf("too many errors: %.1f%% (max %.1f%%); %d line(s) exceeded max line size (%d bytes)",
+					errorRate*100, opts.MaxJSONLErrorRate*100, oversizedLines, maxLineBytes)
+			}
 			return fmt.Errorf("too many errors: %.1f%% (max %.1f%%)", errorRate*100, opts.MaxJSONLErrorRate*100)
 		}
 	}

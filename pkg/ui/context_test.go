@@ -125,6 +125,16 @@ func TestCurrentContext_Views(t *testing.T) {
 			expected: ContextLabelDashboard,
 		},
 		{
+			name:     "velocity comparison",
+			setup:    func(m *Model) { m.focused = focusVelocityComparison },
+			expected: ContextVelocityComparison,
+		},
+		{
+			name:     "tree view",
+			setup:    func(m *Model) { m.focused = focusTree },
+			expected: ContextTree,
+		},
+		{
 			name:     "graph view",
 			setup:    func(m *Model) { m.isGraphView = true },
 			expected: ContextGraph,
@@ -280,8 +290,9 @@ func TestContext_IsOverlay(t *testing.T) {
 func TestContext_IsView(t *testing.T) {
 	views := []Context{
 		ContextInsights, ContextFlowMatrix, ContextGraph, ContextBoard,
-		ContextActionable, ContextHistory, ContextSprint, ContextLabelDashboard,
-		ContextAttention, ContextSplit, ContextDetail, ContextTimeTravel,
+		ContextTree, ContextActionable, ContextHistory, ContextSprint,
+		ContextLabelDashboard, ContextAttention, ContextVelocityComparison,
+		ContextSplit, ContextDetail, ContextTimeTravel,
 	}
 
 	for _, c := range views {

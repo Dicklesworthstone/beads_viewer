@@ -181,6 +181,8 @@ func focusesForBindingDoc(doc KeyBindingDoc) []focus {
 			addFocus(focusSprint)
 		case "attention":
 			addFocus(focusAttention)
+		case "velocity", "velocity-comparison":
+			addFocus(focusVelocityComparison)
 		}
 	}
 
@@ -201,6 +203,7 @@ func allDocumentedFocuses() []focus {
 		focusFlowMatrix,
 		focusSprint,
 		focusAttention,
+		focusVelocityComparison,
 	}
 }
 
@@ -218,21 +221,23 @@ type KeyBindingDoc struct {
 func GetKeyBindingDocs() []KeyBindingDoc {
 	// Authoritative keybinding documentation - update when bindings change
 	return []KeyBindingDoc{
-		// Global Navigation
+		// Global Navigation & Help
 		{"j", "Move down", "Navigation", "all"},
 		{"k", "Move up", "Navigation", "all"},
-		{"G", "Go to end", "Navigation", "all"},
-		{"home", "Go to start", "Navigation", "list"},
+		{"G", "Go to end", "Navigation", "list,detail,board,graph,tree,actionable,history,flow,attention,label"},
+		{"home", "Go to start", "Navigation", "list,detail,board,actionable,flow,attention,label"},
 		// gg is a 200 ms combo; only the board and tree implement it. In the
 		// list a single g opens the graph view.
 		{"gg", "Go to start", "Navigation", "board,tree"},
-		{"ctrl+d", "Page down", "Navigation", "all"},
-		{"ctrl+u", "Page up", "Navigation", "all"},
-		{"enter", "Open details", "Navigation", "all"},
+		{"ctrl+d", "Page down", "Navigation", "list,detail,board,graph,tree,actionable,attention"},
+		{"ctrl+u", "Page up", "Navigation", "list,detail,board,graph,tree,actionable,attention"},
+		{"enter", "Open details", "Navigation", "list,detail,board,graph,insights,actionable,history"},
 		{"esc", "Back/close (list: clear filters)", "Navigation", "all"},
-		{"q", "Quit", "Navigation", "all"},
+		{"q", "Quit / close view", "Navigation", "all"},
+		{"ctrl+r", "Refresh issues from disk", "Actions", "all"},
+		{"f5", "Refresh issues from disk", "Actions", "all"},
 
-		// View Switching
+		// View Switching & Help Surfaces
 		{"a", "Actionable view", "Views", "list,detail"},
 		{"b", "Board view", "Views", "list,detail"},
 		{"g", "Graph view", "Views", "list,detail"},
@@ -246,15 +251,20 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"!", "Alerts panel", "Views", "list"},
 		{"w", "Repo picker (workspace mode)", "Views", "list"},
 		{"?", "Help overlay", "Views", "all"},
+		{"`", "Interactive tutorial", "Views", "all"},
+		{"~", "Context-sensitive help", "Views", "all"},
 		{";", "Shortcuts sidebar", "Views", "all"},
 		{"p", "Priority hints", "Views", "list,detail"},
 
-		// Filters
+		// Filters & Search
 		{"o", "Open issues only", "Filters", "list"},
 		{"c", "Closed issues only", "Filters", "list"},
 		{"r", "Ready (unblocked)", "Filters", "list"},
 		{"l", "Label picker", "Filters", "list"},
 		{"/", "Search/filter", "Filters", "list"},
+		{"ctrl+s", "Toggle semantic search", "Filters", "list"},
+		{"H", "Toggle hybrid search ranking", "Filters", "list"},
+		{"alt+h", "Cycle hybrid search preset", "Filters", "list"},
 		{"s", "Cycle sort mode", "Filters", "list"},
 		{"S", "Sort by triage score (triage recipe)", "Filters", "list"},
 
@@ -264,14 +274,14 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"n", "Next changed issue (time travel)", "Actions", "list"},
 		{"N", "Previous changed issue (time travel)", "Actions", "list"},
 		{"x", "Export to markdown", "Actions", "list,detail"},
-		{"y", "Copy issue ID", "Actions", "all"},
-		{"C", "Copy full issue", "Actions", "detail"},
-		{"O", "Open in $EDITOR", "Actions", "detail"},
+		{"y", "Copy issue ID", "Actions", "list,detail,board,graph,insights,tree,actionable,flow"},
+		{"C", "Copy full issue", "Actions", "list,detail"},
+		{"O", "Open in $EDITOR", "Actions", "list,detail"},
 		{"'", "Recipe picker", "Actions", "list"},
-		{"U", "Self-update check", "Actions", "all"},
-		{"V", "Cass sessions", "Actions", "list"},
+		{"U", "Self-update check", "Actions", "list"},
+		{"V", "Cass sessions", "Actions", "list,detail,board,tree,history"},
 
-		// Graph View
+		// Graph View (g)
 		{"hjkl", "Navigate graph", "Graph", "graph"},
 		{"H", "Scroll left", "Graph", "graph"},
 		{"L", "Scroll right", "Graph", "graph"},
@@ -280,38 +290,74 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"PgUp", "Previous 10 nodes", "Graph", "graph"},
 		{"PgDn", "Next 10 nodes", "Graph", "graph"},
 
-		// Board View
+		// Board View (b)
 		{"h", "Previous column", "Board", "board"},
 		{"l", "Next column", "Board", "board"},
 		{"H", "First column", "Board", "board"},
 		{"L", "Last column", "Board", "board"},
+		{"1-4", "Jump to column 1-4", "Board", "board"},
+		{"/", "Search cards", "Board", "board"},
+		{"n", "Next search match", "Board", "board"},
+		{"N", "Previous search match", "Board", "board"},
+		{"o", "Open cards filter", "Board", "board"},
+		{"c", "Closed cards filter", "Board", "board"},
+		{"r", "Ready cards filter", "Board", "board"},
 		{"s", "Cycle swimlane mode", "Board", "board"},
+		{"e", "Toggle empty columns", "Board", "board"},
+		{"d", "Expand/collapse card inline", "Board", "board"},
 		{"tab", "Toggle detail", "Board", "board"},
-
-		// Tree View
-		{"E", "Exit tree view", "Tree", "tree"},
 		{"ctrl+j", "Scroll detail down", "Board", "board"},
 		{"ctrl+k", "Scroll detail up", "Board", "board"},
 
-		// Insights View
+		// Tree View (E)
+		{"enter", "Expand/collapse node", "Tree", "tree"},
+		{"space", "Expand/collapse node", "Tree", "tree"},
+		{"h", "Collapse or jump to parent", "Tree", "tree"},
+		{"l", "Expand or move to child", "Tree", "tree"},
+		{"o", "Expand all nodes", "Tree", "tree"},
+		{"O", "Collapse all nodes", "Tree", "tree"},
+		{"tab", "Toggle detail pane", "Tree", "tree"},
+		{"PgUp", "Page up", "Tree", "tree"},
+		{"PgDn", "Page down", "Tree", "tree"},
+		{"E", "Exit tree view", "Tree", "tree"},
+
+		// Actionable View (a)
+		{"PgUp", "Page up", "Actionable", "actionable"},
+		{"PgDn", "Page down", "Actionable", "actionable"},
+		{"a", "Close actionable view", "Actionable", "actionable"},
+
+		// Insights View (i)
 		{"h", "Previous panel", "Insights", "insights"},
 		{"l", "Next panel", "Insights", "insights"},
 		{"tab", "Next panel", "Insights", "insights"},
 		{"shift+tab", "Previous panel", "Insights", "insights"},
+		{"ctrl+j", "Scroll detail down", "Insights", "insights"},
+		{"ctrl+k", "Scroll detail up", "Insights", "insights"},
 		{"e", "Toggle explanations", "Insights", "insights"},
 		{"x", "Calculation proof", "Insights", "insights"},
 		{"m", "Heatmap toggle", "Insights", "insights"},
+		{"H", "Heatmap toggle", "Insights", "insights"},
 		{"<", "Widen detail panel", "Insights", "insights"},
 		{">", "Narrow detail panel", "Insights", "insights"},
 
-		// History View
+		// History View (h)
 		{"v", "Toggle git/bead mode", "History", "history"},
+		{"/", "Search history", "History", "history"},
+		{"c", "Cycle confidence filter", "History", "history"},
 		{"tab", "Toggle focus", "History", "history"},
 		{"t", "Toggle timeline pane", "History", "history"},
 		{"f", "Toggle file tree", "History", "history"},
 		{"J", "Detail scroll down", "History", "history"},
 		{"K", "Detail scroll up", "History", "history"},
+		{"y", "Copy commit SHA", "History", "history"},
 		{"o", "Open in browser", "History", "history"},
+		{"h", "Close history view", "History", "history"},
+
+		// Flow Matrix (f)
+		{"g", "Go to top", "Flow", "flow"},
+		{"tab", "Switch matrix/list panel", "Flow", "flow"},
+		{"enter", "Label drilldown / issue detail", "Flow", "flow"},
+		{"f", "Back / close flow matrix", "Flow", "flow"},
 
 		// Attention View (])
 		{"g", "Go to top", "Attention", "attention"},
@@ -320,9 +366,17 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"]", "Close attention view", "Attention", "attention"},
 
 		// Label Dashboard ([)
+		{"enter", "Filter list by label", "Label", "label"},
 		{"h", "Label health detail", "Label", "label"},
 		{"d", "Label drilldown", "Label", "label"},
 		{"v", "Velocity comparison", "Label", "label"},
+		{"[", "Close label dashboard", "Label", "label"},
+
+		// Velocity Comparison (v in Label Dashboard)
+		{"j", "Next label row", "Velocity", "velocity"},
+		{"k", "Previous label row", "Velocity", "velocity"},
+		{"enter", "Filter list by label", "Velocity", "velocity"},
+		{"v", "Return to label dashboard", "Velocity", "velocity"},
 
 		// Sprint Dashboard (P)
 		{"P", "Close sprint dashboard", "Sprint", "sprint"},

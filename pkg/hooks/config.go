@@ -4,8 +4,11 @@
 package hooks
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -118,6 +121,7 @@ func (l *Loader) Load() error {
 	if err != nil {
 		return fmt.Errorf("resolving hooks project directory: %w", err)
 	}
+	projectDir = resolveHooksProjectDir(projectDir)
 	l.projectDir = projectDir
 	configPath := filepath.Join(l.projectDir, ".bv", "hooks.yaml")
 
@@ -131,8 +135,8 @@ func (l *Loader) Load() error {
 		return fmt.Errorf("reading hooks config: %w", err)
 	}
 
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	config, err := ParseConfig(data)
+	if err != nil {
 		return fmt.Errorf("parsing %s: %w", configPath, err)
 	}
 
@@ -244,10 +248,91 @@ func LoadDefault() (*Loader, error) {
 	return loader, nil
 }
 
+// ParseConfig strictly decodes raw .bv/hooks.yaml bytes, rejecting unknown or
+// misspelled keys at every level while treating empty or comment-only files as
+// an empty configuration.
+func ParseConfig(data []byte) (Config, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return Config{}, nil
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+
+	var config Config
+	if err := dec.Decode(&config); err != nil {
+		if errors.Is(err, io.EOF) {
+			return Config{}, nil
+		}
+		return Config{}, err
+	}
+
+	var extra yaml.Node
+	if err := dec.Decode(&extra); err != nil {
+		if !errors.Is(err, io.EOF) {
+			return Config{}, err
+		}
+	} else {
+		return Config{}, fmt.Errorf("line %d: multiple YAML documents are not supported", extra.Line)
+	}
+
+	return config, nil
+}
+
+func resolveHooksProjectDir(projectDir string) string {
+	cleanDir := filepath.Clean(projectDir)
+	if _, err := os.Lstat(filepath.Join(cleanDir, ".bv", "hooks.yaml")); err == nil {
+		return cleanDir
+	}
+	if info, err := os.Stat(filepath.Join(cleanDir, ".beads")); err == nil && info.IsDir() {
+		return cleanDir
+	}
+
+	stopDirs := make(map[string]bool)
+	addStop := func(p string) {
+		if strings.TrimSpace(p) == "" {
+			return
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			stopDirs[filepath.Clean(abs)] = true
+		}
+		if eval, err := filepath.EvalSymlinks(p); err == nil {
+			stopDirs[filepath.Clean(eval)] = true
+		}
+	}
+	addStop(os.TempDir())
+	for _, ceiling := range filepath.SplitList(os.Getenv("GIT_CEILING_DIRECTORIES")) {
+		addStop(ceiling)
+	}
+
+	curr := cleanDir
+	for {
+		parent := filepath.Dir(curr)
+		if parent == curr || stopDirs[curr] || stopDirs[parent] {
+			break
+		}
+		if info, err := os.Stat(filepath.Join(parent, ".beads")); err == nil && info.IsDir() {
+			if eval, evalErr := filepath.EvalSymlinks(parent); evalErr == nil {
+				return filepath.Clean(eval)
+			}
+			return parent
+		}
+		if _, gitErr := os.Stat(filepath.Join(parent, ".git")); gitErr == nil {
+			if _, hooksErr := os.Lstat(filepath.Join(parent, ".bv", "hooks.yaml")); hooksErr == nil {
+				if eval, evalErr := filepath.EvalSymlinks(parent); evalErr == nil {
+					return filepath.Clean(eval)
+				}
+				return parent
+			}
+		}
+		curr = parent
+	}
+	return cleanDir
+}
+
 // UnmarshalYAML parses durations and the strict literal-argument declaration.
 func (h *Hook) UnmarshalYAML(node *yaml.Node) error {
 	// Keep this DTO aligned with Hook; Timeout and Argv need custom decoding.
-	// If you add a field to Hook, you MUST add it here too.
+	// If you add a field to Hook, you MUST add it here and to validateHookMappingKeys.
 	type hookDTO struct {
 		Name    string            `yaml:"name"`
 		Command string            `yaml:"command"`
@@ -255,6 +340,10 @@ func (h *Hook) UnmarshalYAML(node *yaml.Node) error {
 		Timeout string            `yaml:"timeout,omitempty"`
 		Env     map[string]string `yaml:"env,omitempty"`
 		OnError string            `yaml:"on_error,omitempty"`
+	}
+
+	if err := validateHookMappingKeys(node); err != nil {
+		return err
 	}
 
 	var dto hookDTO
@@ -294,6 +383,40 @@ func (h *Hook) UnmarshalYAML(node *yaml.Node) error {
 		}
 	}
 
+	return nil
+}
+
+func validateHookMappingKeys(node *yaml.Node) error {
+	target := node
+	seenAliases := make(map[*yaml.Node]bool)
+	for target != nil && target.Kind == yaml.AliasNode {
+		if seenAliases[target] {
+			return fmt.Errorf("line %d: hook entry contains a cyclic YAML alias", target.Line)
+		}
+		seenAliases[target] = true
+		target = target.Alias
+	}
+	if target == nil {
+		return fmt.Errorf("hook entry is nil")
+	}
+	if target.Kind != yaml.MappingNode {
+		return fmt.Errorf("line %d: hook entry must be a YAML mapping", target.Line)
+	}
+
+	seenKeys := make(map[string]bool, len(target.Content)/2)
+	for i := 0; i+1 < len(target.Content); i += 2 {
+		keyNode := target.Content[i]
+		key := keyNode.Value
+		switch key {
+		case "name", "command", "argv", "timeout", "env", "on_error":
+		default:
+			return fmt.Errorf("line %d: field %s not found in type hooks.Hook (valid fields: name, command, argv, timeout, env, on_error)", keyNode.Line, key)
+		}
+		if seenKeys[key] {
+			return fmt.Errorf("line %d: duplicate field %q in hook definition", keyNode.Line, key)
+		}
+		seenKeys[key] = true
+	}
 	return nil
 }
 

@@ -89,7 +89,7 @@
               license = {
                 fullName = "MIT License with OpenAI/Anthropic Rider";
                 shortName = "MIT+OpenAI-Anthropic-Rider";
-                url = "https://github.com/Dicklesworthstone/beads_viewer/blob/v${bvVersion}/LICENSE";
+                url = "https://github.com/Dicklesworthstone/beads_viewer/blob/main/LICENSE";
                 free = false;
                 redistributable = false;
               };

@@ -736,6 +736,8 @@ func rewriteCanonicalRobotCommandIntent(command string, rest []string) ([]string
 		return rewriteRobotValueIntent(rest, "diff", "--robot-diff", "--diff-since", ""), true
 	case "robot-history":
 		return rewriteRobotValueIntent(rest, "history", "--robot-history", "--bead-history", ""), true
+	case "bead-history":
+		return rewriteRobotValueIntent(rest, "history", "", "--bead-history", ""), true
 	case "robot-explain-correlation":
 		return rewriteRobotValueIntent(rest, "correlation", "", "--robot-explain-correlation", ""), true
 	case "robot-confirm-correlation":
@@ -1104,48 +1106,12 @@ func agentIntentCommandNames() []string {
 }
 
 func primaryRobotFlagNames() map[string]bool {
-	return map[string]bool{
-		"robot-help":                true,
-		"robot-capabilities":        true,
-		"robot-docs":                true,
-		"robot-insights":            true,
-		"robot-plan":                true,
-		"robot-priority":            true,
-		"robot-triage":              true,
-		"robot-next":                true,
-		"robot-triage-by-track":     true,
-		"robot-triage-by-label":     true,
-		"robot-diff":                true,
-		"robot-recipes":             true,
-		"robot-metrics":             true,
-		"robot-schema":              true,
-		"robot-suggest":             true,
-		"robot-graph":               true,
-		"robot-search":              true,
-		"robot-drift":               true,
-		"robot-history":             true,
-		"robot-explain-correlation": true,
-		"robot-confirm-correlation": true,
-		"robot-reject-correlation":  true,
-		"robot-correlation-stats":   true,
-		"robot-orphans":             true,
-		"robot-file-beads":          true,
-		"robot-file-hotspots":       true,
-		"robot-impact":              true,
-		"robot-file-relations":      true,
-		"robot-related":             true,
-		"robot-blocker-chain":       true,
-		"robot-impact-network":      true,
-		"robot-causality":           true,
-		"robot-sprint-list":         true,
-		"robot-sprint-show":         true,
-		"robot-forecast":            true,
-		"robot-burndown":            true,
-		"robot-capacity":            true,
-		"robot-label-health":        true,
-		"robot-label-flow":          true,
-		"robot-label-attention":     true,
+	names := configuredPrimaryRobotFlagNames()
+	m := make(map[string]bool, len(names))
+	for _, name := range names {
+		m[name] = true
 	}
+	return m
 }
 
 func isPositionalValue(arg string) bool {
@@ -1173,7 +1139,7 @@ func isGraphFormat(value string) bool {
 }
 
 func robotNow() time.Time {
-	if value := strings.TrimSpace(os.Getenv("SOURCE_DATE_EPOCH")); value != "" {
+	if value := strings.TrimSpace(env.SourceDateEpoch.Get()); value != "" {
 		if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
 			return time.Unix(seconds, 0).UTC()
 		}
@@ -1182,7 +1148,7 @@ func robotNow() time.Time {
 }
 
 func sourceDateEpochActive() bool {
-	value := strings.TrimSpace(os.Getenv("SOURCE_DATE_EPOCH"))
+	value := strings.TrimSpace(env.SourceDateEpoch.Get())
 	if value == "" {
 		return false
 	}
@@ -1500,7 +1466,7 @@ func main() {
 	robotTriageByLabel := flag.Bool("robot-triage-by-label", false, "Group triage recommendations by label (bv-87)")
 	robotNext := flag.Bool("robot-next", false, "Output only the top pick recommendation as JSON (minimal triage)")
 	robotTriageBrief := flag.Bool("brief", false, "Compact --robot-triage output: only decision-relevant fields (id, title, status, assignee, blockers, unblocks) (#183)")
-	robotIncludeInactive := flag.Bool("robot-include-inactive", false, "Include parked and blocked planning diagnostics in robot triage recommendations; never enables claims")
+	robotIncludeInactive := flag.Bool("robot-include-inactive", false, "Include parked, blocked, and container-epic diagnostics in triage, priority, insights, script, and export outputs; never enables claims")
 	robotNotReadyLabels := flag.String("robot-not-ready-labels", "", "Comma-separated labels marking a bead not-ready: excluded from claimable --robot-next/--robot-triage top picks (env: BV_ROBOT_NOT_READY_LABELS; #173)")
 	robotDiff := flag.Bool("robot-diff", false, "Output diff as JSON (use with --diff-since)")
 	robotRecipes := flag.Bool("robot-recipes", false, "Output available recipes as JSON for AI agents")
@@ -1693,6 +1659,9 @@ func main() {
 		RobotSearchFlag:     robotSearch,
 		RobotDiffFlag:       robotDiff,
 		ForceFullAnalysis:   forceFullAnalysis,
+		IncludeInactive:     robotIncludeInactive,
+		RobotDriftFlag:      robotDriftCheck,
+		CheckDriftFlag:      checkDrift,
 		GraphFormat:         graphFormat,
 		GraphRoot:           graphRoot,
 		GraphDepth:          graphDepth,
@@ -1719,6 +1688,7 @@ func main() {
 		RobotNextFlag:           robotNext,
 		RobotTriageBriefFlag:    robotTriageBrief,
 		IncludeInactive:         robotIncludeInactive,
+		RobotMaxResults:         robotMaxResults,
 		RobotHistoryFlag:        robotHistory,
 		GraphRoot:               graphRoot,
 		BeadHistoryFlag:         beadHistory,
@@ -1761,6 +1731,19 @@ func main() {
 		CapacityLabel:           capacityLabel,
 		NotReadyLabels:          robotNotReadyLabels,
 	})
+	robotModifierRegistry := newRobotRegistry()
+	for _, mod := range []RobotCommand{
+		{Name: "format", FlagName: "format", FlagPtr: outputFormat, IsModifier: true, Description: "Structured output format for robot commands (json|toon)"},
+		{Name: "brief", FlagName: "brief", FlagPtr: robotTriageBrief, IsModifier: true, Description: "Emit compact decision-only triage payload (with --robot-triage)"},
+		{Name: "robot-include-inactive", FlagName: "robot-include-inactive", FlagPtr: robotIncludeInactive, IsModifier: true, Description: "Include non-actionable or historical issues in diagnostics"},
+		{Name: "robot-max-results", FlagName: "robot-max-results", FlagPtr: robotMaxResults, IsModifier: true, Description: "Cap recommendations returned by --robot-triage or --robot-priority"},
+		{Name: "robot-min-confidence", FlagName: "robot-min-confidence", FlagPtr: robotMinConf, IsModifier: true, Description: "Filter --robot-priority recommendations by minimum confidence (0.0-1.0)"},
+		{Name: "robot-by-label", FlagName: "robot-by-label", FlagPtr: robotByLabel, IsModifier: true, Description: "Filter --robot-priority recommendations by label"},
+		{Name: "robot-by-assignee", FlagName: "robot-by-assignee", FlagPtr: robotByAssignee, IsModifier: true, Description: "Filter --robot-priority recommendations by assignee"},
+		{Name: "schema-command", FlagName: "schema-command", FlagPtr: schemaCommand, IsModifier: true, Description: "Output JSON Schema for a single robot command (with --robot-schema)"},
+	} {
+		robotModifierRegistry.Register(mod)
+	}
 	rootCmd := newRootCommand(func() error {
 		if *generateDocs {
 			var sections []docgen.FlagSection
@@ -1833,7 +1816,12 @@ func main() {
 			{modifier: "history-since", requires: []string{"robot-history", "bead-history", "robot-causality"}},
 			{modifier: "history-limit", requires: []string{"robot-history", "bead-history", "robot-causality"}},
 			{modifier: "brief", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label"}},
-			{modifier: "robot-include-inactive", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label"}},
+			{modifier: "robot-include-inactive", requires: []string{
+				"robot-triage", "robot-triage-by-track", "robot-triage-by-label",
+				"robot-priority", "robot-insights",
+				"emit-script", "agent-brief", "priority-brief",
+				"export-pages", "pages", "export-graph",
+			}},
 			{modifier: "robot-history-timeout-ms", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
 			{modifier: "robot-not-ready-labels", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
 			{modifier: "min-confidence", requires: []string{"robot-history", "bead-history"}},
@@ -1922,6 +1910,19 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+		if *emitScript {
+			for _, group := range primaryRobotCommandGroups {
+				if len(group.flags) > 0 && group.flags[0] == "robot-triage" {
+					continue
+				}
+				for _, name := range group.flags {
+					if f := flag.CommandLine.Lookup(name); f != nil && f.Changed {
+						fmt.Fprintf(os.Stderr, "Error: --emit-script cannot be combined with --%s (use standalone or with --robot-triage)\n", name)
+						os.Exit(1)
+					}
+				}
+			}
+		}
 
 		if *watchExport && *asOf != "" {
 			fmt.Fprintln(os.Stderr, "Error: --watch-export cannot be combined with --as-of; omit --watch-export to export a fixed historical snapshot.")
@@ -1931,7 +1932,11 @@ func main() {
 		// Inspection is deliberately independent of issue loading and never
 		// expands YAML values against the invoking user's environment.
 		if *hooksInfo {
-			hookLoader := hooks.NewLoader()
+			hookDir, dirErr := resolveCLIProjectDir()
+			if dirErr != nil {
+				return fmt.Errorf("getting project directory: %w", dirErr)
+			}
+			hookLoader := hooks.NewLoader(hooks.WithProjectDir(hookDir))
 			if err := hookLoader.Load(); err != nil {
 				return fmt.Errorf("inspecting hooks: %w", err)
 			}
@@ -2013,48 +2018,9 @@ func main() {
 		envRobot := env.Robot.Bool()
 		stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
 
+		primaryRobotRegistries := []*RobotRegistry{&phaseOneRobotRegistry, &phaseTwoRobotRegistry, &phaseThreeRobotRegistry}
 		robotMode := envRobot ||
-			*robotHelp ||
-			*robotInsights ||
-			*robotPlan ||
-			*robotPriority ||
-			*robotTriage ||
-			*robotTriageByTrack ||
-			*robotTriageByLabel ||
-			*robotNext ||
-			*robotDiff ||
-			*robotRecipes ||
-			*robotLabelHealth ||
-			*robotLabelFlow ||
-			*robotLabelAttention ||
-			*robotAlerts ||
-			*robotMetrics ||
-			*robotSchema ||
-			*robotSuggest ||
-			*robotGraph ||
-			*robotSearch ||
-			*robotDriftCheck ||
-			*robotHistory ||
-			*robotFileBeads != "" ||
-			*fileHotspots ||
-			*robotImpact != "" ||
-			*robotFileRelations != "" ||
-			*robotRelatedWork != "" ||
-			*robotBlockerChain != "" ||
-			*robotImpactNetwork != "" ||
-			*robotCausality != "" ||
-			*robotOrphans ||
-			*robotExplainCorrelation != "" ||
-			*robotConfirmCorrelation != "" ||
-			*robotRejectCorrelation != "" ||
-			*robotCorrelationStats ||
-			*robotSprintList ||
-			*robotSprintShow != "" ||
-			*robotForecast != "" ||
-			*robotBurndown != "" ||
-			*robotCapacity ||
-			*robotCapabilities ||
-			*robotDocs != "" ||
+			anyRobotModeActive(primaryRobotRegistries...) ||
 			// When stdout is non-TTY, --diff-since auto-enables JSON output. Mark this
 			// as robot mode early so parsers keep stdout JSON clean.
 			(*diffSince != "" && !stdoutIsTTY)
@@ -2068,7 +2034,7 @@ func main() {
 		// Structured output format for --robot-* commands.
 		robotOutputFormat = resolveRobotOutputFormat(*outputFormat)
 		robotToonEncodeOptions = resolveToonEncodeOptionsFromEnv()
-		robotShowToonStats = *toonStats || strings.TrimSpace(os.Getenv("TOON_STATS")) == "1"
+		robotShowToonStats = *toonStats || strings.TrimSpace(env.ToonStats.Get()) == "1"
 		if robotOutputFormat != "json" && robotOutputFormat != "toon" {
 			fmt.Fprintf(os.Stderr, "Invalid --format %q (expected json|toon)\n", robotOutputFormat)
 			os.Exit(2)
@@ -2082,7 +2048,7 @@ func main() {
 		}
 
 		// --robot-help lists every registered command from these registries.
-		robotHelpRegistries = []*RobotRegistry{&phaseOneRobotRegistry, &phaseTwoRobotRegistry, &phaseThreeRobotRegistry}
+		robotHelpRegistries = []*RobotRegistry{&phaseOneRobotRegistry, &phaseTwoRobotRegistry, &phaseThreeRobotRegistry, &robotModifierRegistry}
 		robotDispatchContext := RobotContext{
 			Stdout:             os.Stdout,
 			Stderr:             os.Stderr,
@@ -2134,12 +2100,17 @@ func main() {
 				os.Exit(1)
 			}
 
-			fmt.Printf("[dry-run] Would update bv from %s to %s\n", version.Version, newVersion)
 			asset := release.FindPlatformAsset()
+			expectedDigest, err := updater.VerifyReleaseAssetChecksumEntry(release, asset.Name)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Latest release checksum verification failed: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("[dry-run] Would update bv from %s to %s\n", version.Version, newVersion)
 			fmt.Printf("[dry-run] Would download %s (%d bytes) for %s/%s\n",
 				asset.Name, asset.Size, runtime.GOOS, runtime.GOARCH)
 			fmt.Printf("[dry-run] From: %s\n", asset.BrowserDownloadURL)
-			fmt.Printf("[dry-run] Would verify SHA-256 checksum via %s\n", release.FindChecksumAsset().Name)
+			fmt.Printf("[dry-run] Verified SHA-256 checksum via %s: %s\n", release.FindChecksumAsset().Name, expectedDigest)
 			fmt.Println("[dry-run] No changes made. Run 'bv upgrade' to apply.")
 			os.Exit(0)
 		}
@@ -2222,30 +2193,36 @@ func main() {
 
 			detection := agents.DetectAgentFileInParents(workDir, 3)
 
-			if robotMode {
-				// JSON output for AI agents
-				result := map[string]interface{}{
-					"found":                 detection.Found(),
-					"file_path":             detection.FilePath,
-					"file_type":             detection.FileType,
-					"has_blurb":             detection.HasBlurb,
-					"has_legacy_blurb":      detection.HasLegacyBlurb,
-					"blurb_version":         detection.BlurbVersion,
-					"blurb_count":           detection.BlurbCount,
-					"blurb_structure_error": detection.BlurbStructureError,
-					"has_malformed_blurb":   detection.HasMalformedBlurb(),
-					"has_duplicate_blurbs":  detection.HasDuplicateBlurbs(),
-					"has_future_blurb":      detection.HasFutureBlurb(),
-					"current_version":       agents.BlurbVersion,
-					"needs_blurb":           detection.Found() && detection.NeedsBlurb(),
-					"needs_upgrade":         detection.NeedsUpgrade(),
+			emitAgentsRobot := func(payload map[string]interface{}, exitCode int) {
+				encoder := newRobotEncoder(os.Stdout)
+				if err := encoder.Encode(payload); err != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding agents output: %v\n", err)
+					os.Exit(1)
 				}
-				data, _ := json.MarshalIndent(result, "", "  ")
-				fmt.Println(string(data))
-				os.Exit(0)
+				os.Exit(exitCode)
 			}
 
 			if isCheck || *agentsCheck {
+				if robotMode {
+					result := map[string]interface{}{
+						"action":                "check",
+						"found":                 detection.Found(),
+						"file_path":             detection.FilePath,
+						"file_type":             detection.FileType,
+						"has_blurb":             detection.HasBlurb,
+						"has_legacy_blurb":      detection.HasLegacyBlurb,
+						"blurb_version":         detection.BlurbVersion,
+						"blurb_count":           detection.BlurbCount,
+						"blurb_structure_error": detection.BlurbStructureError,
+						"has_malformed_blurb":   detection.HasMalformedBlurb(),
+						"has_duplicate_blurbs":  detection.HasDuplicateBlurbs(),
+						"has_future_blurb":      detection.HasFutureBlurb(),
+						"current_version":       agents.BlurbVersion,
+						"needs_blurb":           detection.Found() && detection.NeedsBlurb(),
+						"needs_upgrade":         detection.NeedsUpgrade(),
+					}
+					emitAgentsRobot(result, 0)
+				}
 				// Check mode: report status
 				if !detection.Found() {
 					fmt.Printf("No agent file found (searched up to 3 parent directories from %s)\n", workDir)
@@ -2303,10 +2280,25 @@ func main() {
 					os.Exit(1)
 				}
 				if detection.Found() && detection.NeedsUpgrade() {
-					fmt.Println("Existing blurb found but it needs update or normalization. Use --agents-update instead.")
+					errOut := os.Stdout
+					if robotMode {
+						errOut = os.Stderr
+					}
+					fmt.Fprintln(errOut, "Existing blurb found but it needs update or normalization. Use --agents-update instead.")
 					os.Exit(1)
 				}
 				if detection.Found() && detection.HasBlurb && detection.BlurbVersion >= agents.BlurbVersion {
+					if robotMode {
+						emitAgentsRobot(map[string]interface{}{
+							"action":           "add",
+							"file_path":        detection.FilePath,
+							"previous_version": detection.BlurbVersion,
+							"new_version":      detection.BlurbVersion,
+							"modified":         false,
+							"created":          false,
+							"dry_run":          *agentsDryRun,
+						}, 0)
+					}
 					fmt.Printf("%s already has current blurb (v%d) — no action needed.\n", detection.FilePath, detection.BlurbVersion)
 					os.Exit(0)
 				}
@@ -2319,6 +2311,19 @@ func main() {
 				}
 
 				if *agentsDryRun {
+					if robotMode {
+						emitAgentsRobot(map[string]interface{}{
+							"action":           "add",
+							"file_path":        targetPath,
+							"previous_version": detection.BlurbVersion,
+							"new_version":      agents.BlurbVersion,
+							"modified":         false,
+							"would_modify":     true,
+							"created":          false,
+							"would_create":     creating,
+							"dry_run":          true,
+						}, 0)
+					}
 					if creating {
 						fmt.Printf("[dry-run] Would create %s with beads workflow instructions.\n", targetPath)
 					} else {
@@ -2327,7 +2332,7 @@ func main() {
 					os.Exit(0)
 				}
 
-				if !*agentsForce {
+				if !*agentsForce && !robotMode {
 					action := "Append blurb to"
 					if creating {
 						action = "Create"
@@ -2347,13 +2352,17 @@ func main() {
 						fmt.Fprintf(os.Stderr, "Error creating agent file: %v\n", err)
 						os.Exit(1)
 					}
-					fmt.Printf("Created %s with beads workflow instructions.\n", targetPath)
+					if !robotMode {
+						fmt.Printf("Created %s with beads workflow instructions.\n", targetPath)
+					}
 				} else {
 					if err := agents.AppendBlurbToFile(targetPath); err != nil {
 						fmt.Fprintf(os.Stderr, "Error appending blurb: %v\n", err)
 						os.Exit(1)
 					}
-					fmt.Printf("Appended beads workflow instructions to %s.\n", targetPath)
+					if !robotMode {
+						fmt.Printf("Appended beads workflow instructions to %s.\n", targetPath)
+					}
 				}
 
 				ok, verifyErr := agents.VerifyBlurbPresent(targetPath)
@@ -2365,12 +2374,27 @@ func main() {
 					fmt.Fprintf(os.Stderr, "Warning: verification failed — blurb may not have been written correctly.\n")
 					os.Exit(1)
 				}
+				if robotMode {
+					emitAgentsRobot(map[string]interface{}{
+						"action":           "add",
+						"file_path":        targetPath,
+						"previous_version": detection.BlurbVersion,
+						"new_version":      agents.BlurbVersion,
+						"modified":         true,
+						"created":          creating,
+						"dry_run":          false,
+					}, 0)
+				}
 				os.Exit(0)
 			}
 
 			if *agentsUpdate {
 				if !detection.Found() {
-					fmt.Println("No agent file found. Use --agents-add to create one.")
+					errOut := os.Stdout
+					if robotMode {
+						errOut = os.Stderr
+					}
+					fmt.Fprintln(errOut, "No agent file found. Use --agents-add to create one.")
 					os.Exit(1)
 				}
 				if detection.HasMalformedBlurb() {
@@ -2383,15 +2407,40 @@ func main() {
 					os.Exit(1)
 				}
 				if !detection.HasBlurb && !detection.HasLegacyBlurb {
-					fmt.Printf("%s has no blurb to update. Use --agents-add to add one.\n", detection.FilePath)
+					errOut := os.Stdout
+					if robotMode {
+						errOut = os.Stderr
+					}
+					fmt.Fprintf(errOut, "%s has no blurb to update. Use --agents-add to add one.\n", detection.FilePath)
 					os.Exit(1)
 				}
 				if !detection.NeedsUpgrade() {
+					if robotMode {
+						emitAgentsRobot(map[string]interface{}{
+							"action":           "update",
+							"file_path":        detection.FilePath,
+							"previous_version": detection.BlurbVersion,
+							"new_version":      detection.BlurbVersion,
+							"modified":         false,
+							"dry_run":          *agentsDryRun,
+						}, 0)
+					}
 					fmt.Printf("%s already has current blurb (v%d) — no update needed.\n", detection.FilePath, detection.BlurbVersion)
 					os.Exit(0)
 				}
 
 				if *agentsDryRun {
+					if robotMode {
+						emitAgentsRobot(map[string]interface{}{
+							"action":           "update",
+							"file_path":        detection.FilePath,
+							"previous_version": detection.BlurbVersion,
+							"new_version":      agents.BlurbVersion,
+							"modified":         false,
+							"would_modify":     true,
+							"dry_run":          true,
+						}, 0)
+					}
 					if detection.HasDuplicateBlurbs() {
 						fmt.Printf("[dry-run] Would consolidate %d versioned blurbs into v%d in %s.\n",
 							detection.BlurbCount, agents.BlurbVersion, detection.FilePath)
@@ -2404,7 +2453,7 @@ func main() {
 					os.Exit(0)
 				}
 
-				if !*agentsForce {
+				if !*agentsForce && !robotMode {
 					fmt.Printf("Update blurb in %s? [Y/n]: ", detection.FilePath)
 					reader := bufio.NewReader(os.Stdin)
 					response, _ := reader.ReadString('\n')
@@ -2419,7 +2468,9 @@ func main() {
 					fmt.Fprintf(os.Stderr, "Error updating blurb: %v\n", err)
 					os.Exit(1)
 				}
-				fmt.Printf("Updated blurb to v%d in %s.\n", agents.BlurbVersion, detection.FilePath)
+				if !robotMode {
+					fmt.Printf("Updated blurb to v%d in %s.\n", agents.BlurbVersion, detection.FilePath)
+				}
 
 				ok, verifyErr := agents.VerifyBlurbPresent(detection.FilePath)
 				if verifyErr != nil {
@@ -2430,11 +2481,31 @@ func main() {
 					fmt.Fprintf(os.Stderr, "Warning: verification failed — blurb may not have been written correctly.\n")
 					os.Exit(1)
 				}
+				if robotMode {
+					emitAgentsRobot(map[string]interface{}{
+						"action":           "update",
+						"file_path":        detection.FilePath,
+						"previous_version": detection.BlurbVersion,
+						"new_version":      agents.BlurbVersion,
+						"modified":         true,
+						"dry_run":          false,
+					}, 0)
+				}
 				os.Exit(0)
 			}
 
 			if *agentsRemove {
 				if !detection.Found() {
+					if robotMode {
+						emitAgentsRobot(map[string]interface{}{
+							"action":           "remove",
+							"file_path":        "",
+							"previous_version": 0,
+							"new_version":      0,
+							"modified":         false,
+							"dry_run":          *agentsDryRun,
+						}, 0)
+					}
 					fmt.Println("No agent file found — nothing to remove.")
 					os.Exit(0)
 				}
@@ -2448,16 +2519,37 @@ func main() {
 					os.Exit(1)
 				}
 				if !detection.HasBlurb && !detection.HasLegacyBlurb {
+					if robotMode {
+						emitAgentsRobot(map[string]interface{}{
+							"action":           "remove",
+							"file_path":        detection.FilePath,
+							"previous_version": 0,
+							"new_version":      0,
+							"modified":         false,
+							"dry_run":          *agentsDryRun,
+						}, 0)
+					}
 					fmt.Printf("%s has no blurb — nothing to remove.\n", detection.FilePath)
 					os.Exit(0)
 				}
 
 				if *agentsDryRun {
+					if robotMode {
+						emitAgentsRobot(map[string]interface{}{
+							"action":           "remove",
+							"file_path":        detection.FilePath,
+							"previous_version": detection.BlurbVersion,
+							"new_version":      0,
+							"modified":         false,
+							"would_modify":     true,
+							"dry_run":          true,
+						}, 0)
+					}
 					fmt.Printf("[dry-run] Would remove blurb from %s.\n", detection.FilePath)
 					os.Exit(0)
 				}
 
-				if !*agentsForce {
+				if !*agentsForce && !robotMode {
 					fmt.Printf("Remove blurb from %s? [Y/n]: ", detection.FilePath)
 					reader := bufio.NewReader(os.Stdin)
 					response, _ := reader.ReadString('\n')
@@ -2471,6 +2563,16 @@ func main() {
 				if err := agents.RemoveBlurbFromFile(detection.FilePath); err != nil {
 					fmt.Fprintf(os.Stderr, "Error removing blurb: %v\n", err)
 					os.Exit(1)
+				}
+				if robotMode {
+					emitAgentsRobot(map[string]interface{}{
+						"action":           "remove",
+						"file_path":        detection.FilePath,
+						"previous_version": detection.BlurbVersion,
+						"new_version":      0,
+						"modified":         true,
+						"dry_run":          false,
+					}, 0)
 				}
 				fmt.Printf("Removed blurb from %s.\n", detection.FilePath)
 				os.Exit(0)
@@ -2569,15 +2671,20 @@ func main() {
 			}
 		}
 
+		// Resolve canonical project directory (handles nested subdirectory invocations)
+		projectDir, err := resolveCLIProjectDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting project directory: %v\n", err)
+			os.Exit(1)
+		}
+
 		// Load recipes (needed for both --robot-recipes and --recipe)
-		var loadErr error
-		recipeLoader, loadErr = recipe.LoadDefault()
-		if loadErr != nil {
+		recipeLoader = recipe.NewLoader(recipe.WithProjectDir(projectDir))
+		if loadErr := recipeLoader.Load(); loadErr != nil {
 			if !envRobot {
 				fmt.Fprintf(os.Stderr, "Warning: Error loading recipes: %v\n", loadErr)
 			}
-			// Create empty loader to continue
-			recipeLoader = recipe.NewLoader()
+			recipeLoader = recipe.NewLoader(recipe.WithProjectDir(projectDir))
 		}
 
 		// Handle --robot-recipes (before loading issues)
@@ -2589,12 +2696,6 @@ func main() {
 		// Machine-readable robot docs (bd-2v50)
 		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "robot-docs", robotDispatchContext)
 
-		// Get project directory for baseline operations (moved up to allow info check without loading issues)
-		projectDir, err := os.Getwd()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-			os.Exit(1)
-		}
 		baselinePath := baseline.DefaultPath(projectDir)
 		robotDispatchContext.WorkDir = projectDir
 		robotDispatchContext.ProjectDir = projectDir
@@ -2676,12 +2777,7 @@ func main() {
 			if *workspaceConfig != "" {
 				fmt.Fprintf(os.Stderr, "Warning: --workspace is ignored when --as-of is specified\n")
 			}
-			cwd, err := os.Getwd()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-				os.Exit(1)
-			}
-			gitLoader := loader.NewGitLoader(cwd)
+			gitLoader := loader.NewGitLoader(projectDir)
 			historical, err := gitLoader.LoadAtWithReport(*asOf)
 			historicalSource := RobotSourceReport{SourcePath: historical.SourcePath, SourceKind: "git", Status: "loaded",
 				DataHash: sourceIssuesHash(historical.Issues, historical.TombstoneIDs), Valid: historical.ParseStats.Valid,
@@ -2757,8 +2853,12 @@ func main() {
 
 			// Automatically ensure .bv/ is git-ignored at the workspace root
 			// (prefers .git/info/exclude; opt out with BV_NO_GITIGNORE=1).
-			// Workspace config is typically at .bv/workspace.yaml, so project root is two levels up
-			workspaceRoot := filepath.Dir(filepath.Dir(*workspaceConfig))
+			workspaceRoot := workspace.ResolveWorkspaceBaseDir(*workspaceConfig)
+			projectDir = workspaceRoot
+			baselinePath = baseline.DefaultPath(projectDir)
+			robotDispatchContext.WorkDir = projectDir
+			robotDispatchContext.ProjectDir = projectDir
+			robotDispatchContext.BaselinePath = baselinePath
 			_ = loader.EnsureBVIgnored(workspaceRoot)
 		} else {
 			// Load from single repo (original behavior)
@@ -2783,14 +2883,21 @@ func main() {
 			// Bind live reload to the source that actually loaded. Rediscovery
 			// could select a fresher candidate that validation already rejected.
 			beadsPath = singleSourceLoad.Source.Path
-			beadsDir, _ := loader.GetBeadsDir("")
+			if beadsDir, bErr := loader.GetBeadsDir(""); bErr == nil && beadsDir != "" {
+				if resolvedRoot := loader.ProjectRootFromBeadsDir(beadsDir); resolvedRoot != "" {
+					projectDir = resolvedRoot
+					baselinePath = baseline.DefaultPath(projectDir)
+					robotDispatchContext.WorkDir = projectDir
+					robotDispatchContext.ProjectDir = projectDir
+					robotDispatchContext.BaselinePath = baselinePath
+				}
+			}
 
 			// Automatically ensure .bv/ is git-ignored to prevent polluting git
 			// with search indexes, baselines, and other bv-specific files.
 			// Prefers .git/info/exclude over the committed .gitignore; skipped
 			// outside git repos and when BV_NO_GITIGNORE=1 is set.
 			// This is done silently and only in single-repo mode.
-			projectDir := filepath.Dir(beadsDir)
 			_ = loader.EnsureBVIgnored(projectDir)
 		}
 		loadDuration := time.Since(loadStart)
@@ -2883,11 +2990,6 @@ func main() {
 				os.Exit(1)
 			}
 
-			projectDir, err := os.Getwd()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
 			indexPath := search.DefaultIndexPath(projectDir, embedCfg)
 			if asOfResolved != "" {
 				indexPath = filepath.Join(filepath.Dir(indexPath), "historical-"+asOfResolved+"-"+filepath.Base(indexPath))
@@ -3082,7 +3184,7 @@ func main() {
 
 		// Handle --pages wizard (bv-10g)
 		if *pagesWizard {
-			if err := runPagesWizard(beadsPath); err != nil {
+			if err := runPagesWizard(beadsPath, *robotIncludeInactive); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -3127,7 +3229,7 @@ func main() {
 
 				// Each watch iteration reloads and verifies the same user-supplied
 				// digest before executing either phase or writing the bundle.
-				pagesExecutor, err := hooks.RunHooks("", hooks.ExportContext{
+				pagesExecutor, err := hooks.RunHooks(projectDir, hooks.ExportContext{
 					ExportPath:   *exportPages,
 					ExportFormat: "html",
 					IssueCount:   len(exportIssues),
@@ -3158,7 +3260,12 @@ func main() {
 
 				// Compute triage
 				fmt.Println("  → Generating triage data...")
-				triage := analysis.ComputeTriageWithOptions(exportIssues, analysis.TriageOptions{Readiness: exportContext.Readiness, CandidateIDs: exportContext.CandidateIDs})
+				triage := analysis.ComputeTriageWithOptionsAndTime(exportIssues, analysis.TriageOptions{
+					WaitForPhase2:  true,
+					ActionableOnly: !*robotIncludeInactive,
+					Readiness:      exportContext.Readiness,
+					CandidateIDs:   exportContext.CandidateIDs,
+				}, robotNow())
 				if !exportContext.claimsProven() {
 					suppressUnprovenTriageClaims(&triage)
 				}
@@ -3565,11 +3672,10 @@ func main() {
 			}
 			stats := analyzer.Analyze()
 
-			// Get project name from current directory
-			cwd, cwdErr := os.Getwd()
+			// Get project name from canonical project directory
 			projectName := "project"
-			if cwdErr == nil {
-				projectName = filepath.Base(cwd)
+			if projectDir != "" {
+				projectName = filepath.Base(projectDir)
 			}
 
 			// Check if HTML export requested (interactive graph)
@@ -3580,23 +3686,24 @@ func main() {
 				}
 
 				var historyReport *correlation.HistoryReport
-				if cwdErr == nil && correlation.ValidateRepository(cwd) == nil {
+				if projectDir != "" && correlation.ValidateRepository(projectDir) == nil {
 					correlation.SetDiskCacheEnabled(true)
 					historyCtx := robotDispatchContext
 					historyCtx.Issues = exportIssues
-					if report, err := generateCorrelationReportForContext(historyCtx, cwd, correlation.CorrelatorOptions{Limit: timeTravelCommitLimit}); err == nil {
+					if report, err := generateCorrelationReportForContext(historyCtx, projectDir, correlation.CorrelatorOptions{Limit: timeTravelCommitLimit}); err == nil {
 						historyReport = report
 					}
 				}
 
 				// Compute triage for the graph export
 				triageOpts := analysis.TriageOptions{
-					WaitForPhase2: true,
-					Readiness:     robotDispatchContext.Readiness,
-					CandidateIDs:  robotDispatchContext.CandidateIDs,
-					History:       historyReport,
+					WaitForPhase2:  true,
+					ActionableOnly: !*robotIncludeInactive,
+					Readiness:      robotDispatchContext.Readiness,
+					CandidateIDs:   robotDispatchContext.CandidateIDs,
+					History:        historyReport,
 				}
-				triage := analysis.ComputeTriageWithOptions(exportIssues, triageOpts)
+				triage := analysis.ComputeTriageWithOptionsAndTime(exportIssues, triageOpts, robotNow())
 				if !robotDispatchContext.claimsProven() {
 					suppressUnprovenTriageClaims(&triage)
 				}
@@ -3673,21 +3780,17 @@ func main() {
 			}
 			stats := analyzer.Analyze()
 
-			// Compute status counts from issues
-			openCount, closedCount, blockedCount := 0, 0, 0
+			// Compute dependency-aware status counts from candidate issues
+			partition := analyzer.CountStatusPartition()
+			openCount := 0
 			for _, issue := range issues {
-				switch issue.Status {
-				case model.StatusOpen, model.StatusInProgress:
+				if !analyzer.IsCandidate(issue.ID) {
+					continue
+				}
+				if issue.Status == model.StatusOpen || issue.Status == model.StatusInProgress {
 					openCount++
-				case model.StatusClosed:
-					closedCount++
-				case model.StatusBlocked:
-					blockedCount++
 				}
 			}
-
-			// Get actionable count from analyzer
-			actionableCount := len(analyzer.GetActionableIssues())
 
 			// Get cycles (method returns a copy)
 			cycles := stats.Cycles()
@@ -3698,10 +3801,10 @@ func main() {
 				EdgeCount:       stats.EdgeCount,
 				Density:         stats.Density,
 				OpenCount:       openCount,
-				ClosedCount:     closedCount,
-				BlockedCount:    blockedCount,
+				ClosedCount:     partition.Closed,
+				BlockedCount:    partition.Blocked,
 				CycleCount:      len(cycles),
-				ActionableCount: actionableCount,
+				ActionableCount: partition.Actionable,
 			}
 
 			// Build TopMetrics from analysis (top 10 for each)
@@ -3728,6 +3831,9 @@ func main() {
 
 		// Handle --check-drift
 		if *checkDrift {
+			if *robotDriftCheck {
+				dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-drift", robotDispatchContext)
+			}
 			if !baseline.Exists(baselinePath) {
 				fmt.Fprintln(os.Stderr, "Error: No baseline found.")
 				fmt.Fprintln(os.Stderr, "Create one with: bv --save-baseline \"description\"")
@@ -3753,19 +3859,16 @@ func main() {
 			}
 			stats := analyzer.Analyze()
 
-			// Compute status counts from issues
-			openCount, closedCount, blockedCount := 0, 0, 0
+			partition := analyzer.CountStatusPartition()
+			openCount := 0
 			for _, issue := range issues {
-				switch issue.Status {
-				case model.StatusOpen, model.StatusInProgress:
+				if !analyzer.IsCandidate(issue.ID) {
+					continue
+				}
+				if issue.Status == model.StatusOpen || issue.Status == model.StatusInProgress {
 					openCount++
-				case model.StatusClosed:
-					closedCount++
-				case model.StatusBlocked:
-					blockedCount++
 				}
 			}
-			actionableCount := len(analyzer.GetActionableIssues())
 			cycles := stats.Cycles()
 
 			// Build current snapshot as baseline for comparison
@@ -3774,10 +3877,10 @@ func main() {
 				EdgeCount:       stats.EdgeCount,
 				Density:         stats.Density,
 				OpenCount:       openCount,
-				ClosedCount:     closedCount,
-				BlockedCount:    blockedCount,
+				ClosedCount:     partition.Closed,
+				BlockedCount:    partition.Blocked,
 				CycleCount:      len(cycles),
-				ActionableCount: actionableCount,
+				ActionableCount: partition.Actionable,
 			}
 			currentMetrics := baseline.TopMetrics{
 				PageRank:     buildMetricItems(stats.PageRank(), 10),
@@ -3799,45 +3902,12 @@ func main() {
 
 			calc := drift.NewCalculator(bl, current, driftConfig)
 			calc.SetNow(driftNow)
+			calc.SetIssues(issues)
+			_ = calc.ReuseAnalyzer(analyzer)
 			result := calc.Calculate()
 
-			if *robotDriftCheck {
-				// JSON output
-				output := struct {
-					GeneratedAt string `json:"generated_at"`
-					HasDrift    bool   `json:"has_drift"`
-					ExitCode    int    `json:"exit_code"`
-					Summary     struct {
-						Critical int `json:"critical"`
-						Warning  int `json:"warning"`
-						Info     int `json:"info"`
-					} `json:"summary"`
-					Alerts   []drift.Alert `json:"alerts"`
-					Baseline struct {
-						CreatedAt string `json:"created_at"`
-						CommitSHA string `json:"commit_sha,omitempty"`
-					} `json:"baseline"`
-				}{
-					GeneratedAt: driftNow.Format(time.RFC3339),
-					HasDrift:    result.HasDrift,
-					ExitCode:    result.ExitCode(),
-					Alerts:      result.Alerts,
-				}
-				output.Summary.Critical = result.CriticalCount
-				output.Summary.Warning = result.WarningCount
-				output.Summary.Info = result.InfoCount
-				output.Baseline.CreatedAt = bl.CreatedAt.Format(time.RFC3339)
-				output.Baseline.CommitSHA = bl.CommitSHA
-
-				encoder := newRobotEncoder(os.Stdout)
-				if err := encoder.Encode(output); err != nil {
-					fmt.Fprintf(os.Stderr, "Error encoding drift result: %v\n", err)
-					os.Exit(1)
-				}
-			} else {
-				// Human-readable output
-				fmt.Print(result.Summary())
-			}
+			// Human-readable output
+			fmt.Print(result.Summary())
 
 			os.Exit(result.ExitCode())
 		}
@@ -3847,148 +3917,16 @@ func main() {
 		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-plan", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-priority", robotDispatchContext)
 
-		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-next", robotDispatchContext)
-		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage", robotDispatchContext)
-		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage-by-track", robotDispatchContext)
-		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage-by-label", robotDispatchContext)
-
-		// Handle --priority-brief flag (bv-96)
-		if *priorityBrief != "" {
-			fmt.Printf("Generating priority brief to %s...\n", *priorityBrief)
-			triage := analysis.ComputeTriageWithOptions(issues, analysis.TriageOptions{Readiness: readiness, CandidateIDs: candidateIDs})
-			if !robotDispatchContext.claimsProven() {
-				suppressUnprovenTriageClaims(&triage)
-			}
-
-			// Marshal triage to JSON for the export function
-			triageJSON, err := json.Marshal(triage)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error marshaling triage data: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Generate the brief
-			config := export.DefaultPriorityBriefConfig()
-			config.DataHash = dataHash
-			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error generating priority brief: %v\n", err)
-				os.Exit(1)
-			}
-			if !robotDispatchContext.claimsProven() {
-				brief = "> Readiness is provisional because source data is incomplete or stale. Restore the affected sources before claiming work.\n\n" + brief
-			}
-
-			// Write to file
-			if err := os.WriteFile(*priorityBrief, []byte(brief), 0644); err != nil {
-				fmt.Fprintf(os.Stderr, "Error writing priority brief: %v\n", err)
-				os.Exit(1)
-			}
-
-			fmt.Printf("Done! Priority brief saved to %s\n", *priorityBrief)
-			os.Exit(0)
-		}
-
-		// Handle --agent-brief flag (bv-131)
-		if *agentBrief != "" {
-			fmt.Printf("Generating agent brief bundle to %s/...\n", *agentBrief)
-
-			// Create output directory
-			if err := os.MkdirAll(*agentBrief, 0755); err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating directory: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Generate triage data
-			triage := analysis.ComputeTriageWithOptions(issues, analysis.TriageOptions{Readiness: readiness, CandidateIDs: candidateIDs})
-			if !robotDispatchContext.claimsProven() {
-				suppressUnprovenTriageClaims(&triage)
-			}
-			triagePayload, err := withEnvelope(robotDispatchContext.Envelope(), triage)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding triage authority: %v\n", err)
-				os.Exit(1)
-			}
-			triageJSON, err := json.MarshalIndent(triagePayload, "", "  ")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error marshaling triage: %v\n", err)
-				os.Exit(1)
-			}
-			if err := os.WriteFile(filepath.Join(*agentBrief, "triage.json"), triageJSON, 0644); err != nil {
-				fmt.Fprintf(os.Stderr, "Error writing triage.json: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("  → triage.json")
-
-			// Generate insights
-			analyzer := analysis.NewAnalyzer(issues)
-			stats := analyzer.Analyze()
-			insights := stats.GenerateInsights(50)
-			insightsPayload, err := withEnvelope(robotDispatchContext.Envelope(), insights)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding insights authority: %v\n", err)
-				os.Exit(1)
-			}
-			insightsJSON, err := json.MarshalIndent(insightsPayload, "", "  ")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error marshaling insights: %v\n", err)
-				os.Exit(1)
-			}
-			if err := os.WriteFile(filepath.Join(*agentBrief, "insights.json"), insightsJSON, 0644); err != nil {
-				fmt.Fprintf(os.Stderr, "Error writing insights.json: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("  → insights.json")
-
-			// Generate priority brief
-			config := export.DefaultPriorityBriefConfig()
-			config.DataHash = dataHash
-			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error generating brief: %v\n", err)
-				os.Exit(1)
-			}
-			if !robotDispatchContext.claimsProven() {
-				brief = "> Readiness is provisional; inspect source_authority in triage.json before claiming work.\n\n" + brief
-			}
-			if err := os.WriteFile(filepath.Join(*agentBrief, "brief.md"), []byte(brief), 0644); err != nil {
-				fmt.Fprintf(os.Stderr, "Error writing brief.md: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("  → brief.md")
-
-			// Generate jq helpers
-			helpers := generateJQHelpers()
-			if err := os.WriteFile(filepath.Join(*agentBrief, "helpers.md"), []byte(helpers), 0644); err != nil {
-				fmt.Fprintf(os.Stderr, "Error writing helpers.md: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("  → helpers.md")
-
-			// Generate meta.json with hash and config
-			meta := struct {
-				RobotEnvelope
-				IssueCount int      `json:"issue_count"`
-				Files      []string `json:"files"`
-			}{
-				RobotEnvelope: robotDispatchContext.Envelope(),
-				IssueCount:    len(issues),
-				Files:         []string{"triage.json", "insights.json", "brief.md", "helpers.md", "meta.json"},
-			}
-			metaJSON, _ := json.MarshalIndent(meta, "", "  ")
-			if err := os.WriteFile(filepath.Join(*agentBrief, "meta.json"), metaJSON, 0644); err != nil {
-				fmt.Fprintf(os.Stderr, "Error writing meta.json: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("  → meta.json")
-
-			fmt.Printf("\nDone! Agent brief bundle saved to %s/\n", *agentBrief)
-			os.Exit(0)
-		}
-
-		// Handle --emit-script flag (bv-89)
+		// Handle --emit-script flag (bv-89, bv-apal.23): runs before robot-triage
+		// dispatch so both `bv --emit-script` and `bv --robot-triage --emit-script`
+		// emit the executable shell script instead of exiting early with JSON.
 		if *emitScript {
-			triage := analysis.ComputeTriageWithOptions(issues, analysis.TriageOptions{Readiness: readiness, CandidateIDs: candidateIDs})
+			triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
+				WaitForPhase2:  true,
+				ActionableOnly: !*robotIncludeInactive,
+				Readiness:      readiness,
+				CandidateIDs:   candidateIDs,
+			}, robotNow())
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
 			}
@@ -4025,7 +3963,11 @@ func main() {
 				os.Exit(1)
 			}
 			sb.WriteString(fmt.Sprintf("# Source authority: %s\n", authorityJSON))
-			sb.WriteString(fmt.Sprintf("# Top %d recommendations from %d actionable items\n", len(recs), len(triage.Recommendations)))
+			if *robotIncludeInactive {
+				sb.WriteString(fmt.Sprintf("# Top %d recommendations from %d items (including inactive diagnostics)\n", len(recs), len(triage.Recommendations)))
+			} else {
+				sb.WriteString(fmt.Sprintf("# Top %d recommendations from %d actionable items\n", len(recs), len(triage.Recommendations)))
+			}
 			sb.WriteString("#\n")
 			sb.WriteString("# Usage: source this script or run it directly\n")
 			sb.WriteString("# Commands show recommendations; claim comments appear only for proven candidates\n")
@@ -4044,14 +3986,21 @@ func main() {
 					if len(rec.UnblocksIDs) > 0 {
 						sb.WriteString(fmt.Sprintf("#    Unblocks: %d downstream items\n", len(rec.UnblocksIDs)))
 					}
+					if !rec.Claimable {
+						sb.WriteString(fmt.Sprintf("#    Inactive / non-claimable: %s\n", strings.NewReplacer("\n", " ", "\r", " ").Replace(rec.Action)))
+					}
 
 					// Claim command
-					if rec.Actions.Claim != nil {
+					if rec.Claimable && rec.Actions.Claim != nil {
 						sb.WriteString("# To claim: " + strings.ReplaceAll(rec.Actions.Claim.Shell, "\n", "\n# ") + "\n")
 					}
-					// Show command
+					// Show command (commented out for inactive items so running the script focuses on ready work unless inspected)
 					if rec.Actions.Show != nil {
-						sb.WriteString(rec.Actions.Show.Shell + "\n")
+						if rec.Claimable {
+							sb.WriteString(rec.Actions.Show.Shell + "\n")
+						} else {
+							sb.WriteString("# " + strings.ReplaceAll(rec.Actions.Show.Shell, "\n", "\n# ") + "\n")
+						}
 					} else {
 						sb.WriteString("# No verified live tracker route\n")
 					}
@@ -4061,19 +4010,175 @@ func main() {
 				// Add summary section
 				sb.WriteString("# === Quick Actions ===\n")
 				sb.WriteString("# To claim the top pick:\n")
-				if len(recs) > 0 && recs[0].Actions.Claim != nil {
-					sb.WriteString("# " + strings.ReplaceAll(recs[0].Actions.Claim.Shell, "\n", "\n# ") + "\n")
+				for _, rec := range recs {
+					if rec.Claimable && rec.Actions.Claim != nil {
+						sb.WriteString("# " + strings.ReplaceAll(rec.Actions.Claim.Shell, "\n", "\n# ") + "\n")
+						break
+					}
 				}
 				sb.WriteString("#\n")
 				sb.WriteString("# To claim all listed items (uncomment to enable):\n")
 				for _, rec := range recs {
-					if rec.Actions.Claim != nil {
+					if rec.Claimable && rec.Actions.Claim != nil {
 						sb.WriteString("# " + strings.ReplaceAll(rec.Actions.Claim.Shell, "\n", "\n# ") + "\n")
 					}
 				}
 			}
 
 			fmt.Print(sb.String())
+			os.Exit(0)
+		}
+
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-next", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage-by-track", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-triage-by-label", robotDispatchContext)
+
+		// Handle --priority-brief flag (bv-96)
+		if *priorityBrief != "" {
+			fmt.Printf("Generating priority brief to %s...\n", *priorityBrief)
+			triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
+				WaitForPhase2:  true,
+				ActionableOnly: !*robotIncludeInactive,
+				Readiness:      readiness,
+				CandidateIDs:   candidateIDs,
+			}, robotNow())
+			if !robotDispatchContext.claimsProven() {
+				suppressUnprovenTriageClaims(&triage)
+			}
+
+			// Marshal triage to JSON for the export function
+			triageJSON, err := json.Marshal(triage)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error marshaling triage data: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Generate the brief
+			config := export.DefaultPriorityBriefConfig()
+			config.DataHash = dataHash
+			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating priority brief: %v\n", err)
+				os.Exit(1)
+			}
+			if !robotDispatchContext.claimsProven() {
+				brief = "> Readiness is provisional because source data is incomplete or stale. Restore the affected sources before claiming work.\n\n" + brief
+			}
+
+			// Write to file safely via os.Root confinement
+			if err := export.SafeWriteOutput(*priorityBrief, []byte(brief), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing priority brief: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("Done! Priority brief saved to %s\n", *priorityBrief)
+			os.Exit(0)
+		}
+
+		// Handle --agent-brief flag (bv-131)
+		if *agentBrief != "" {
+			fmt.Printf("Generating agent brief bundle to %s/...\n", *agentBrief)
+
+			if st, lErr := os.Lstat(filepath.Clean(*agentBrief)); lErr == nil && st.Mode()&os.ModeSymlink != 0 {
+				fmt.Fprintf(os.Stderr, "Error creating directory: refusing symlink output directory %s\n", *agentBrief)
+				os.Exit(1)
+			}
+			// Create output directory
+			if err := os.MkdirAll(*agentBrief, 0755); err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Generate triage data
+			triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
+				WaitForPhase2:  true,
+				ActionableOnly: !*robotIncludeInactive,
+				Readiness:      readiness,
+				CandidateIDs:   candidateIDs,
+			}, robotNow())
+			if !robotDispatchContext.claimsProven() {
+				suppressUnprovenTriageClaims(&triage)
+			}
+			triagePayload, err := withEnvelope(robotDispatchContext.Envelope(), triage)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding triage authority: %v\n", err)
+				os.Exit(1)
+			}
+			triageJSON, err := json.MarshalIndent(triagePayload, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error marshaling triage: %v\n", err)
+				os.Exit(1)
+			}
+			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "triage.json"), triageJSON, 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing triage.json: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("  → triage.json")
+
+			// Generate insights
+			analyzer := analysis.NewAnalyzer(issues)
+			stats := analyzer.Analyze()
+			insights := stats.GenerateInsights(50)
+			insightsPayload, err := withEnvelope(robotDispatchContext.Envelope(), insights)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding insights authority: %v\n", err)
+				os.Exit(1)
+			}
+			insightsJSON, err := json.MarshalIndent(insightsPayload, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error marshaling insights: %v\n", err)
+				os.Exit(1)
+			}
+			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "insights.json"), insightsJSON, 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing insights.json: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("  → insights.json")
+
+			// Generate priority brief
+			config := export.DefaultPriorityBriefConfig()
+			config.DataHash = dataHash
+			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating brief: %v\n", err)
+				os.Exit(1)
+			}
+			if !robotDispatchContext.claimsProven() {
+				brief = "> Readiness is provisional; inspect source_authority in triage.json before claiming work.\n\n" + brief
+			}
+			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "brief.md"), []byte(brief), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing brief.md: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("  → brief.md")
+
+			// Generate jq helpers
+			helpers := generateJQHelpers()
+			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "helpers.md"), []byte(helpers), 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing helpers.md: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("  → helpers.md")
+
+			// Generate meta.json with hash and config
+			meta := struct {
+				RobotEnvelope
+				IssueCount int      `json:"issue_count"`
+				Files      []string `json:"files"`
+			}{
+				RobotEnvelope: robotDispatchContext.Envelope(),
+				IssueCount:    len(issues),
+				Files:         []string{"triage.json", "insights.json", "brief.md", "helpers.md", "meta.json"},
+			}
+			metaJSON, _ := json.MarshalIndent(meta, "", "  ")
+			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "meta.json"), metaJSON, 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "Error writing meta.json: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println("  → meta.json")
+
+			fmt.Printf("\nDone! Agent brief bundle saved to %s/\n", *agentBrief)
 			os.Exit(0)
 		}
 
@@ -4133,13 +4238,7 @@ func main() {
 				*robotDiff = true
 			}
 
-			cwd, err := os.Getwd()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting current directory: %v\n", err)
-				os.Exit(1)
-			}
-
-			gitLoader := loader.NewGitLoader(cwd)
+			gitLoader := loader.NewGitLoader(projectDir)
 
 			// Load historical issues and apply the same scope as current issues
 			historicalIssues, err := gitLoader.LoadAt(*diffSince)
@@ -4280,7 +4379,7 @@ func main() {
 			fmt.Printf("Exporting %d issues to %s...\n", len(reportIssues), reportPath)
 
 			// Authorization errors always fail closed, regardless of on_error.
-			executor, err := hooks.RunHooks("", hooks.ExportContext{
+			executor, err := hooks.RunHooks(projectDir, hooks.ExportContext{
 				ExportPath:   reportPath,
 				ExportFormat: options.Format,
 				IssueCount:   len(reportIssues),
@@ -4796,7 +4895,7 @@ func reloadWorkspaceForUI(ctx context.Context, configPath, label, repo string) (
 	if err != nil {
 		return ui.SourceReloadResult{}, fmt.Errorf("reload workspace config: %w", err)
 	}
-	aggregate := workspace.NewAggregateLoader(config, filepath.Dir(filepath.Dir(configPath)))
+	aggregate := workspace.NewAggregateLoader(config, workspace.ResolveWorkspaceBaseDir(configPath))
 	aggregate.SetLogger(nil)
 	issues, results, err := aggregate.LoadAll(ctx)
 	if err != nil {
@@ -5705,7 +5804,7 @@ func runPreviewServer(dir string, liveReload bool) error {
 }
 
 // runPagesWizard runs the interactive deployment wizard (bv-10g).
-func runPagesWizard(beadsPath string) error {
+func runPagesWizard(beadsPath string, includeInactive bool) error {
 	wizard := export.NewWizard(beadsPath)
 
 	// Run interactive wizard to collect configuration
@@ -5774,7 +5873,11 @@ func runPagesWizard(beadsPath string) error {
 	fmt.Println("  -> Generating triage data...")
 	exportContext := RobotContext{Issues: exportIssues, Readiness: source.Readiness, SourceAuthority: source.SourceAuthority,
 		SourcePath: source.SourcePath, SourceKind: source.SourceKind, DataHash: analysis.ComputeDataHash(source.Issues)}
-	triage := analysis.ComputeTriageWithOptions(exportIssues, analysis.TriageOptions{Readiness: source.Readiness})
+	triage := analysis.ComputeTriageWithOptionsAndTime(exportIssues, analysis.TriageOptions{
+		WaitForPhase2:  true,
+		ActionableOnly: !includeInactive,
+		Readiness:      source.Readiness,
+	}, robotNow())
 	if !exportContext.claimsProven() {
 		suppressUnprovenTriageClaims(&triage)
 	}
@@ -6611,6 +6714,11 @@ func setDifference(a, b []string) []string {
 
 // calculateBurndownAt is a deterministic variant of calculateBurndown for testing.
 func calculateBurndownAt(sprint *model.Sprint, issues []model.Issue, now time.Time) BurndownOutput {
+	return calculateBurndownAtWithThresholds(sprint, issues, now, analysis.DefaultAtRiskThresholds())
+}
+
+// calculateBurndownAtWithThresholds computes sprint burndown using explicit at-risk thresholds.
+func calculateBurndownAtWithThresholds(sprint *model.Sprint, issues []model.Issue, now time.Time, thresholds analysis.AtRiskThresholds) BurndownOutput {
 
 	// Build issue map for sprint beads
 	issueMap := make(map[string]model.Issue, len(issues))
@@ -6705,7 +6813,7 @@ func calculateBurndownAt(sprint *model.Sprint, issues []model.Issue, now time.Ti
 		DailyPoints:       dailyPoints,
 		IdealLine:         idealLine,
 		ScopeChanges:      nil,
-		AtRisk:            analysis.DetectAtRisk(issues, sprint, now, analysis.DefaultAtRiskThresholds()),
+		AtRisk:            analysis.DetectAtRisk(issues, sprint, now, thresholds),
 	}
 }
 
@@ -6957,18 +7065,18 @@ var timeTravelCommitLimit = 500
 
 // generateHistoryForExport creates time-travel history data from git history
 func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) {
-	cwd, err := os.Getwd()
+	repoDir, err := resolveCLIProjectDir()
 	if err != nil {
 		return nil, err
 	}
 
 	// Check if we're in a git repository
-	if err := correlation.ValidateRepository(cwd); err != nil {
+	if err := correlation.ValidateRepository(repoDir); err != nil {
 		return nil, err
 	}
 
 	// Get beads path (supports both JSONL and SQLite-backed workspaces)
-	beadsDir, beadsPath, err := resolveCorrelationBeadsPath(cwd)
+	beadsDir, beadsPath, err := resolveCorrelationBeadsPath(repoDir)
 	if err != nil {
 		return nil, err
 	}
@@ -7000,7 +7108,7 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 	if err := feedbackStore.Load(); err != nil {
 		return nil, fmt.Errorf("loading correlation feedback: %w", err)
 	}
-	correlator := correlation.NewCorrelator(cwd, beadsPath).WithFeedbackStore(feedbackStore)
+	correlator := correlation.NewCorrelator(repoDir, beadsPath).WithFeedbackStore(feedbackStore)
 	report, err := correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{
 		Limit: timeTravelCommitLimit,
 	})
@@ -7042,12 +7150,21 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		}
 	}
 
-	// Convert map to sorted slice
+	// Convert map to sorted slice (deduplicating per-commit bead IDs across synthesized + explicit lifecycle events)
 	var commits []TimeTravelCommit
 	for _, commit := range commitMap {
-		sort.Strings(commit.BeadsAdded)
-		sort.Strings(commit.BeadsClosed)
-		sort.Strings(commit.BeadsRemoved)
+		if len(commit.BeadsAdded) > 0 {
+			sort.Strings(commit.BeadsAdded)
+			commit.BeadsAdded = slices.Compact(commit.BeadsAdded)
+		}
+		if len(commit.BeadsClosed) > 0 {
+			sort.Strings(commit.BeadsClosed)
+			commit.BeadsClosed = slices.Compact(commit.BeadsClosed)
+		}
+		if len(commit.BeadsRemoved) > 0 {
+			sort.Strings(commit.BeadsRemoved)
+			commit.BeadsRemoved = slices.Compact(commit.BeadsRemoved)
+		}
 		commits = append(commits, *commit)
 	}
 
@@ -7062,7 +7179,7 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 	// edited the old name can be dropped. Every extracted commit is reachable
 	// from HEAD, so each one has a rank. Reverse by rank afterward.
 	orderCmd := exec.Command("git", "log", "--format=%H", "--topo-order", "HEAD")
-	orderCmd.Dir = cwd
+	orderCmd.Dir = repoDir
 	orderOutput, err := orderCmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("ordering timeline commits: %w", err)
@@ -7103,7 +7220,7 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		}
 	}
 	sort.Strings(initialBeads)
-	sprints, err := loader.LoadSprints(cwd)
+	sprints, err := loader.LoadSprints(repoDir)
 	if err != nil {
 		return nil, fmt.Errorf("loading timeline sprints: %w", err)
 	}
@@ -7490,7 +7607,7 @@ func resolveRobotOutputFormat(cli string) string {
 		format = strings.TrimSpace(env.OutputFormat.Get())
 	}
 	if format == "" {
-		format = strings.TrimSpace(os.Getenv("TOON_DEFAULT_FORMAT"))
+		format = strings.TrimSpace(env.ToonDefaultFormat.Get())
 	}
 	if format == "" {
 		format = "json"
@@ -7501,10 +7618,10 @@ func resolveRobotOutputFormat(cli string) string {
 func resolveToonEncodeOptionsFromEnv() toon.EncodeOptions {
 	opts := toon.DefaultEncodeOptions()
 
-	if v := strings.TrimSpace(os.Getenv("TOON_KEY_FOLDING")); v != "" {
+	if v := strings.TrimSpace(env.ToonKeyFolding.Get()); v != "" {
 		opts.KeyFolding = v
 	}
-	if v := strings.TrimSpace(os.Getenv("TOON_INDENT")); v != "" {
+	if v := strings.TrimSpace(env.ToonIndent.Get()); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			// Be conservative; tru supports 0..=16 but clamp to avoid surprising output.
 			if n < 0 {
@@ -7579,7 +7696,7 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		"robot-triage": {
 			Flag: "--robot-triage", Description: "Unified triage: top picks, recommendations, quick wins, blockers, project health, velocity.",
 			KeyFields:   []string{"triage.quick_ref.top_picks", "triage.recommendations", "triage.quick_wins", "triage.blockers_to_clear", "triage.project_health"},
-			Params:      []string{"--graph-root <id>", "--robot-include-inactive"},
+			Params:      []string{"--graph-root <id>", "--robot-include-inactive", "--robot-max-results <n>", "--brief"},
 			NeedsIssues: true,
 		},
 		"robot-next": {
@@ -7590,17 +7707,19 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		},
 		"robot-plan": {
 			Flag: "--robot-plan", Description: "Dependency-respecting execution plan with parallel tracks.",
-			KeyFields:   []string{"tracks", "items", "unblocks", "summary"},
+			KeyFields:   []string{"plan.tracks", "plan.total_actionable", "plan.total_blocked", "plan.summary"},
 			NeedsIssues: true,
 		},
 		"robot-insights": {
 			Flag: "--robot-insights", Description: "Deep graph analysis: PageRank, betweenness, HITS, eigenvector, k-core, cycle detection.",
-			KeyFields:   []string{"pagerank", "betweenness", "hits", "eigenvector", "k_core", "cycles"},
+			KeyFields:   []string{"full_stats", "Bottlenecks", "Keystones", "Influencers", "Hubs", "Authorities", "Cores", "Articulation", "Slack", "Cycles", "Velocity", "top_what_ifs"},
+			Params:      []string{"--robot-include-inactive"},
 			NeedsIssues: true,
 		},
 		"robot-priority": {
 			Flag: "--robot-priority", Description: "Priority misalignment detection: items whose graph importance differs from assigned priority.",
-			KeyFields:   []string{"misalignments", "suggestions"},
+			KeyFields:   []string{"recommendations", "summary", "filters", "field_descriptions"},
+			Params:      []string{"--robot-min-confidence 0.0-1.0", "--robot-max-results <n>", "--robot-by-label <label>", "--robot-include-inactive"},
 			NeedsIssues: true,
 		},
 		"robot-triage-by-track": {
@@ -7651,8 +7770,15 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		},
 		"robot-history": {
 			Flag: "--robot-history", Description: "Bead-to-commit correlations from git history.",
-			KeyFields:   []string{"correlations", "confidence", "commit_sha", "bead_id"},
+			KeyFields:   []string{"git_range", "stats", "histories", "commit_index"},
 			Params:      []string{"--bead-history <id>", "--history-since <date>", "--history-limit <n>", "--min-confidence 0.0-1.0"},
+			NeedsIssues: true,
+			NeedsGit:    true,
+		},
+		"bead-history": {
+			Flag: "--bead-history <id>", Description: "Bead-to-commit correlation history scoped to a single bead.",
+			KeyFields:   []string{"git_range", "stats", "histories", "commit_index"},
+			Params:      []string{"--history-since <date>", "--history-limit <n>", "--min-confidence 0.0-1.0"},
 			NeedsIssues: true,
 			NeedsGit:    true,
 		},
@@ -7808,6 +7934,8 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		"robot-drift": {
 			Flag:          "--robot-drift",
 			Description:   "Drift detection from saved baseline.",
+			KeyFields:     []string{"has_drift", "exit_code", "summary", "alerts", "skipped_checks", "baseline"},
+			Params:        []string{"--check-drift"},
 			NeedsIssues:   true,
 			NeedsBaseline: true,
 		},
@@ -7900,6 +8028,8 @@ func preferredRobotInvocationOverride(commandName string) string {
 		return "bv robot-diff HEAD~1 --json"
 	case "robot-history":
 		return "bv robot-history --history-limit 20 --json"
+	case "bead-history":
+		return "bv --bead-history ISSUE_ID --format json"
 	case "robot-alerts":
 		return "bv robot-alerts --severity critical --json"
 	case "robot-suggest":
@@ -7961,6 +8091,11 @@ func acceptedRobotInvocationOverrides(commandName string) []string {
 		return []string{
 			"bv --check-drift --robot-drift --format json",
 			"bv robot-drift --json",
+		}
+	case "bead-history":
+		return []string{
+			"bv --bead-history ISSUE_ID --format json",
+			"bv bead-history ISSUE_ID --json",
 		}
 	default:
 		return nil
@@ -8222,6 +8357,7 @@ func generateRobotSchemas() RobotSchemas {
 	}
 
 	commands := map[string]map[string]interface{}{
+		"bead-history":       robotHistoryOutputSchema(),
 		"robot-capabilities": robotCapabilitiesSchema(),
 		"robot-docs":         robotDocsOutputSchema(),
 		"robot-help":         robotHelpOutputSchema(),
@@ -8231,11 +8367,37 @@ func generateRobotSchemas() RobotSchemas {
 		"robot-triage": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
 			"title":       "Robot Triage Output",
-			"description": "Unified triage recommendations with quick picks, blockers, and project health",
+			"description": "Unified triage recommendations with quick picks, blockers, and project health (or compact --brief view)",
 			"type":        "object",
 			"properties": map[string]interface{}{
-				"generated_at": map[string]interface{}{"type": "string", "format": "date-time"},
-				"data_hash":    map[string]interface{}{"type": "string"},
+				"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
+				"data_hash":     map[string]interface{}{"type": "string"},
+				"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":       map[string]interface{}{"type": "string"},
+				"brief":         map[string]interface{}{"type": "boolean"},
+				"quick_ref": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"open_count":               map[string]interface{}{"type": "integer"},
+						"actionable_count":         map[string]interface{}{"type": "integer"},
+						"blocked_count":            map[string]interface{}{"type": "integer"},
+						"readiness_blocked_count":  map[string]interface{}{"type": "integer"},
+						"deferred_or_parked_count": map[string]interface{}{"type": "integer"},
+						"in_progress_count":        map[string]interface{}{"type": "integer"},
+						"not_closed_count":         map[string]interface{}{"type": "integer"},
+						"not_actionable_count":     map[string]interface{}{"type": "integer"},
+						"top_picks": map[string]interface{}{
+							"type":  "array",
+							"items": map[string]interface{}{"$ref": "#/$defs/top_pick"},
+						},
+					},
+				},
+				"recommendations": map[string]interface{}{
+					"type":  "array",
+					"items": map[string]interface{}{"$ref": "#/$defs/brief_recommendation"},
+				},
+				"quick_wins":        map[string]interface{}{"type": "array"},
+				"blockers_to_clear": map[string]interface{}{"type": "array"},
 				"triage": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -8256,15 +8418,17 @@ func generateRobotSchemas() RobotSchemas {
 						"quick_ref": map[string]interface{}{
 							"type": "object",
 							"properties": map[string]interface{}{
-								"open_count":           map[string]interface{}{"type": "integer", "description": "Strict count of issues with status == open (equals project_health.counts.by_status.open)"},
-								"actionable_count":     map[string]interface{}{"type": "integer", "description": "Issues ready to work on: status open or in_progress, no open blocking dependencies, no future defer_until (parked statuses such as blocked/deferred/draft are excluded, matching br ready)"},
-								"blocked_count":        map[string]interface{}{"type": "integer", "description": "Strict count of issues with status == blocked (equals project_health.counts.by_status.blocked)"},
-								"in_progress_count":    map[string]interface{}{"type": "integer", "description": "Strict count of issues with status == in_progress"},
-								"not_closed_count":     map[string]interface{}{"type": "integer", "description": "All non-closed issues (open+in_progress+blocked+deferred); equals actionable_count + not_actionable_count"},
-								"not_actionable_count": map[string]interface{}{"type": "integer", "description": "Non-closed issues that are not actionable: blocked by open dependencies, parked in a non-actionable status, or scheduler-deferred"},
+								"open_count":               map[string]interface{}{"type": "integer", "description": "Strict count of issues with status == open (equals project_health.counts.by_status.open)"},
+								"actionable_count":         map[string]interface{}{"type": "integer", "description": "Issues ready to work on: status open or in_progress, no open blocking dependencies, no future defer_until (parked statuses such as blocked/deferred/draft are excluded, matching br ready)"},
+								"blocked_count":            map[string]interface{}{"type": "integer", "description": "Strict count of issues with status == blocked (equals project_health.counts.by_status.blocked)"},
+								"readiness_blocked_count":  map[string]interface{}{"type": "integer", "description": "Open/in_progress issues blocked by open blocking dependencies without future defer_until (equals plan.total_blocked, baseline.stats.blocked_count, and drift.blocked_count)"},
+								"deferred_or_parked_count": map[string]interface{}{"type": "integer", "description": "Non-closed issues parked by status (blocked/deferred/draft/pinned/hooked/review) or scheduler-deferred by a future defer_until (equals plan.total_deferred_or_parked)"},
+								"in_progress_count":        map[string]interface{}{"type": "integer", "description": "Strict count of issues with status == in_progress"},
+								"not_closed_count":         map[string]interface{}{"type": "integer", "description": "All non-closed issues (open+in_progress+blocked+deferred); equals actionable_count + not_actionable_count"},
+								"not_actionable_count":     map[string]interface{}{"type": "integer", "description": "Non-closed issues that are not actionable: equals readiness_blocked_count + deferred_or_parked_count"},
 								"top_picks": map[string]interface{}{
 									"type":  "array",
-									"items": map[string]interface{}{"$ref": "#/$defs/recommendation"},
+									"items": map[string]interface{}{"$ref": "#/$defs/top_pick"},
 								},
 							},
 						},
@@ -8278,22 +8442,58 @@ func generateRobotSchemas() RobotSchemas {
 						"commands":          map[string]interface{}{"type": "object"},
 					},
 				},
+				"feedback":    map[string]interface{}{"type": "object"},
 				"usage_hints": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			},
+			"oneOf": []map[string]interface{}{
+				{"required": []string{"generated_at", "data_hash", "triage"}},
+				{"required": []string{"generated_at", "data_hash", "brief", "quick_ref", "recommendations"}},
+			},
 			"$defs": map[string]interface{}{
-				"recommendation": map[string]interface{}{
+				"top_pick": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
 						"id":       map[string]interface{}{"type": "string"},
 						"title":    map[string]interface{}{"type": "string"},
-						"type":     map[string]interface{}{"type": "string"},
-						"status":   map[string]interface{}{"type": "string"},
-						"priority": map[string]interface{}{"type": "integer"},
-						"labels":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 						"score":    map[string]interface{}{"type": "number"},
 						"reasons":  map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 						"unblocks": map[string]interface{}{"type": "integer"},
 						"actions":  issueActionsSchema(),
+					},
+					"required": []string{"id", "title", "score"},
+				},
+				"recommendation": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"id":           map[string]interface{}{"type": "string"},
+						"title":        map[string]interface{}{"type": "string"},
+						"type":         map[string]interface{}{"type": "string"},
+						"status":       map[string]interface{}{"type": "string"},
+						"assignee":     map[string]interface{}{"type": "string"},
+						"priority":     map[string]interface{}{"type": "integer"},
+						"labels":       map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						"score":        map[string]interface{}{"type": "number"},
+						"breakdown":    map[string]interface{}{"type": "object"},
+						"action":       map[string]interface{}{"type": "string"},
+						"reasons":      map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						"unblocks_ids": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						"blocked_by":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						"claimable":    map[string]interface{}{"type": "boolean"},
+						"actions":      issueActionsSchema(),
+					},
+					"required": []string{"id", "title", "score"},
+				},
+				"brief_recommendation": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"id":         map[string]interface{}{"type": "string"},
+						"title":      map[string]interface{}{"type": "string"},
+						"status":     map[string]interface{}{"type": "string"},
+						"assignee":   map[string]interface{}{"type": "string"},
+						"score":      map[string]interface{}{"type": "number"},
+						"unblocks":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						"blocked_by": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						"actions":    issueActionsSchema(),
 					},
 					"required": []string{"id", "title", "score"},
 				},
@@ -8360,27 +8560,40 @@ func generateRobotSchemas() RobotSchemas {
 			"description": "Dependency-respecting execution plan with parallel tracks",
 			"type":        "object",
 			"properties": map[string]interface{}{
-				"generated_at": map[string]interface{}{"type": "string", "format": "date-time"},
-				"data_hash":    map[string]interface{}{"type": "string"},
+				"generated_at":    map[string]interface{}{"type": "string", "format": "date-time"},
+				"data_hash":       map[string]interface{}{"type": "string"},
+				"output_format":   map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":         map[string]interface{}{"type": "string"},
+				"analysis_config": map[string]interface{}{"type": "object"},
+				"status":          map[string]interface{}{"type": "object"},
+				"label_scope":     map[string]interface{}{"type": "string"},
+				"label_context":   map[string]interface{}{"type": "object"},
 				"plan": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"phases": map[string]interface{}{
+						"tracks": map[string]interface{}{
 							"type": "array",
 							"items": map[string]interface{}{
 								"type": "object",
 								"properties": map[string]interface{}{
-									"phase":  map[string]interface{}{"type": "integer"},
-									"issues": map[string]interface{}{"type": "array"},
+									"track_id": map[string]interface{}{"type": "string"},
+									"items":    map[string]interface{}{"type": "array"},
+									"reason":   map[string]interface{}{"type": "string"},
 								},
+								"required": []string{"track_id", "items", "reason"},
 							},
 						},
-						"summary": map[string]interface{}{"type": "object"},
+						"total_actionable":         map[string]interface{}{"type": "integer"},
+						"total_blocked":            map[string]interface{}{"type": "integer"},
+						"total_deferred_or_parked": map[string]interface{}{"type": "integer"},
+						"total_in_progress":        map[string]interface{}{"type": "integer"},
+						"summary":                  map[string]interface{}{"type": "object"},
 					},
+					"required": []string{"tracks", "total_actionable", "total_blocked", "summary"},
 				},
-				"status":      map[string]interface{}{"type": "object"},
-				"usage_hints": map[string]interface{}{"type": "array"},
+				"usage_hints": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			},
+			"required": []string{"generated_at", "data_hash", "output_format", "version", "analysis_config", "status", "plan", "usage_hints"},
 		},
 		"robot-insights": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
@@ -8390,22 +8603,31 @@ func generateRobotSchemas() RobotSchemas {
 			"properties": map[string]interface{}{
 				"generated_at":      map[string]interface{}{"type": "string", "format": "date-time"},
 				"data_hash":         map[string]interface{}{"type": "string"},
-				"Stats":             map[string]interface{}{"type": "object"},
-				"Cycles":            map[string]interface{}{"type": "array"},
-				"Keystones":         map[string]interface{}{"type": "array"},
-				"Bottlenecks":       map[string]interface{}{"type": "array"},
-				"Influencers":       map[string]interface{}{"type": "array"},
-				"Hubs":              map[string]interface{}{"type": "array"},
-				"Authorities":       map[string]interface{}{"type": "array"},
-				"Orphans":           map[string]interface{}{"type": "array"},
-				"Cores":             map[string]interface{}{"type": "array"},
-				"Articulation":      map[string]interface{}{"type": "array"},
-				"Slack":             map[string]interface{}{"type": "array"},
-				"Velocity":          map[string]interface{}{"type": "object"},
+				"output_format":     map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":           map[string]interface{}{"type": "string"},
+				"analysis_config":   map[string]interface{}{"type": "object"},
 				"status":            map[string]interface{}{"type": "object"},
+				"label_scope":       map[string]interface{}{"type": "string"},
+				"label_context":     map[string]interface{}{"type": "object"},
+				"full_stats":        map[string]interface{}{"type": "object"},
+				"Stats":             map[string]interface{}{"type": []string{"object", "null"}},
+				"ClusterDensity":    map[string]interface{}{"type": "number"},
+				"Cycles":            robotNullableArraySchema(map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}}),
+				"Keystones":         robotNullableArraySchema(map[string]interface{}{"type": "object"}),
+				"Bottlenecks":       robotNullableArraySchema(map[string]interface{}{"type": "object"}),
+				"Influencers":       robotNullableArraySchema(map[string]interface{}{"type": "object"}),
+				"Hubs":              robotNullableArraySchema(map[string]interface{}{"type": "object"}),
+				"Authorities":       robotNullableArraySchema(map[string]interface{}{"type": "object"}),
+				"Orphans":           robotNullableArraySchema(map[string]interface{}{"type": "string"}),
+				"Cores":             robotNullableArraySchema(map[string]interface{}{"type": "object"}),
+				"Articulation":      robotNullableArraySchema(map[string]interface{}{"type": "string"}),
+				"Slack":             robotNullableArraySchema(map[string]interface{}{"type": "object"}),
+				"Velocity":          map[string]interface{}{"type": []string{"object", "null"}},
+				"top_what_ifs":      map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
 				"advanced_insights": map[string]interface{}{"type": "object"},
-				"usage_hints":       map[string]interface{}{"type": "array"},
+				"usage_hints":       map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			},
+			"required": []string{"generated_at", "data_hash", "output_format", "version", "analysis_config", "status", "full_stats", "usage_hints"},
 		},
 		"robot-priority": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
@@ -8415,13 +8637,34 @@ func generateRobotSchemas() RobotSchemas {
 			"properties": map[string]interface{}{
 				"generated_at":    map[string]interface{}{"type": "string", "format": "date-time"},
 				"data_hash":       map[string]interface{}{"type": "string"},
+				"output_format":   map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":         map[string]interface{}{"type": "string"},
 				"as_of":           map[string]interface{}{"type": "string"},
 				"as_of_commit":    map[string]interface{}{"type": "string"},
 				"analysis_config": map[string]interface{}{"type": "object"},
 				"status":          map[string]interface{}{"type": "object"},
 				"label_scope":     map[string]interface{}{"type": "string"},
 				"label_context":   map[string]interface{}{"type": "object"},
-				"recommendations": map[string]interface{}{"type": "array"},
+				"recommendations": map[string]interface{}{
+					"type": "array",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"issue_id":           map[string]interface{}{"type": "string"},
+							"title":              map[string]interface{}{"type": "string"},
+							"labels":             map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"current_priority":   map[string]interface{}{"type": "integer"},
+							"suggested_priority": map[string]interface{}{"type": "integer"},
+							"impact_score":       map[string]interface{}{"type": "number"},
+							"confidence":         map[string]interface{}{"type": "number"},
+							"direction":          map[string]interface{}{"type": "string", "enum": []string{"increase", "decrease"}},
+							"reasoning":          map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"what_if":            map[string]interface{}{"type": "object"},
+							"explanation":        map[string]interface{}{"type": "object"},
+						},
+						"required": []string{"issue_id", "title", "labels", "current_priority", "suggested_priority", "impact_score", "confidence", "direction", "reasoning"},
+					},
+				},
 				"field_descriptions": map[string]interface{}{
 					"type":                 "object",
 					"additionalProperties": map[string]interface{}{"type": "string"},
@@ -8445,7 +8688,7 @@ func generateRobotSchemas() RobotSchemas {
 				},
 				"usage_hints": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			},
-			"required": []string{"generated_at", "data_hash", "analysis_config", "status", "recommendations", "field_descriptions", "filters", "summary", "usage_hints"},
+			"required": []string{"generated_at", "data_hash", "output_format", "version", "analysis_config", "status", "recommendations", "field_descriptions", "filters", "summary", "usage_hints"},
 		},
 		"robot-graph": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
@@ -8528,10 +8771,40 @@ func generateRobotSchemas() RobotSchemas {
 					"type":  "array",
 					"items": alertSchema(),
 				},
-				"summary":     alertSummarySchema(),
-				"usage_hints": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+				"summary":        alertSummarySchema(),
+				"skipped_checks": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
+				"usage_hints":    map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			},
 			"required": []string{"generated_at", "data_hash", "output_format", "version", "alerts", "summary", "usage_hints"},
+		},
+		"robot-drift": {
+			"$schema":     "https://json-schema.org/draft/2020-12/schema",
+			"title":       "Robot Drift Output",
+			"description": "Drift detection from saved baseline with proactive issue-level alerts",
+			"type":        "object",
+			"properties": map[string]interface{}{
+				"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
+				"data_hash":     map[string]interface{}{"type": "string"},
+				"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":       map[string]interface{}{"type": "string"},
+				"has_drift":     map[string]interface{}{"type": "boolean"},
+				"exit_code":     map[string]interface{}{"type": "integer"},
+				"summary":       alertSummarySchema(),
+				"alerts": map[string]interface{}{
+					"type":  "array",
+					"items": alertSchema(),
+				},
+				"skipped_checks": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
+				"baseline": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"created_at": map[string]interface{}{"type": "string", "format": "date-time"},
+						"commit_sha": map[string]interface{}{"type": "string"},
+					},
+					"required": []string{"created_at"},
+				},
+			},
+			"required": []string{"generated_at", "data_hash", "output_format", "version", "has_drift", "exit_code", "summary", "alerts", "baseline"},
 		},
 		"robot-recipes": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
@@ -8549,16 +8822,19 @@ func generateRobotSchemas() RobotSchemas {
 			},
 			"required": []string{"generated_at", "output_format", "version", "recipes"},
 		},
-		"robot-correlation-stats": robotCorrelationStatsOutputSchema(),
-		"robot-file-beads":        robotFileBeadsOutputSchema(),
-		"robot-file-hotspots":     robotFileHotspotsOutputSchema(),
-		"robot-file-relations":    robotFileRelationsOutputSchema(),
-		"robot-impact":            robotImpactOutputSchema(),
-		"robot-related":           robotRelatedOutputSchema(),
-		"robot-blocker-chain":     robotBlockerChainOutputSchema(),
-		"robot-impact-network":    robotImpactNetworkOutputSchema(),
-		"robot-causality":         robotCausalityOutputSchema(),
-		"robot-orphans":           robotOrphansOutputSchema(),
+		"robot-correlation-stats":   robotCorrelationStatsOutputSchema(),
+		"robot-explain-correlation": robotExplainCorrelationOutputSchema(),
+		"robot-confirm-correlation": robotCorrelationFeedbackOutputSchema("Robot Confirm Correlation Output", "Confirmation receipt for a commit-to-bead correlation"),
+		"robot-reject-correlation":  robotCorrelationFeedbackOutputSchema("Robot Reject Correlation Output", "Rejection receipt for a commit-to-bead correlation"),
+		"robot-file-beads":          robotFileBeadsOutputSchema(),
+		"robot-file-hotspots":       robotFileHotspotsOutputSchema(),
+		"robot-file-relations":      robotFileRelationsOutputSchema(),
+		"robot-impact":              robotImpactOutputSchema(),
+		"robot-related":             robotRelatedOutputSchema(),
+		"robot-blocker-chain":       robotBlockerChainOutputSchema(),
+		"robot-impact-network":      robotImpactNetworkOutputSchema(),
+		"robot-causality":           robotCausalityOutputSchema(),
+		"robot-orphans":             robotOrphansOutputSchema(),
 		"robot-metrics": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
 			"title":       "Robot Metrics Output",
@@ -8686,29 +8962,34 @@ func generateRobotSchemas() RobotSchemas {
 			"description": "Capacity simulation and dependency-aware completion projection",
 			"type":        "object",
 			"properties": map[string]interface{}{
-				"generated_at":         map[string]interface{}{"type": "string", "format": "date-time"},
-				"data_hash":            map[string]interface{}{"type": "string"},
-				"output_format":        map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
-				"version":              map[string]interface{}{"type": "string"},
-				"agents":               map[string]interface{}{"type": "integer"},
-				"label":                map[string]interface{}{"type": "string"},
-				"open_issue_count":     map[string]interface{}{"type": "integer"},
-				"total_minutes":        map[string]interface{}{"type": "integer"},
-				"total_days":           map[string]interface{}{"type": "number"},
-				"serial_minutes":       map[string]interface{}{"type": "integer"},
-				"parallel_minutes":     map[string]interface{}{"type": "integer"},
-				"parallelizable_pct":   map[string]interface{}{"type": "number"},
-				"estimated_days":       map[string]interface{}{"type": "number"},
-				"critical_path_length": map[string]interface{}{"type": "integer"},
-				"critical_path":        map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
-				"actionable_count":     map[string]interface{}{"type": "integer"},
-				"actionable":           map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
-				"bottlenecks":          map[string]interface{}{"type": "array", "items": capacityBottleneckSchema()},
+				"generated_at":             map[string]interface{}{"type": "string", "format": "date-time"},
+				"data_hash":                map[string]interface{}{"type": "string"},
+				"output_format":            map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":                  map[string]interface{}{"type": "string"},
+				"agents":                   map[string]interface{}{"type": "integer"},
+				"label":                    map[string]interface{}{"type": "string"},
+				"open_issue_count":         map[string]interface{}{"type": "integer"},
+				"total_minutes":            map[string]interface{}{"type": "integer"},
+				"total_days":               map[string]interface{}{"type": "number"},
+				"serial_minutes":           map[string]interface{}{"type": "integer"},
+				"parallel_minutes":         map[string]interface{}{"type": "integer"},
+				"parallelizable_pct":       map[string]interface{}{"type": "number"},
+				"estimated_days":           map[string]interface{}{"type": "number"},
+				"critical_path_minutes":    map[string]interface{}{"type": "integer"},
+				"velocity_minutes_per_day": map[string]interface{}{"type": "number"},
+				"graham_min_days":          map[string]interface{}{"type": "number"},
+				"graham_max_days":          map[string]interface{}{"type": "number"},
+				"critical_path_length":     map[string]interface{}{"type": "integer"},
+				"critical_path":            map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+				"actionable_count":         map[string]interface{}{"type": "integer"},
+				"actionable":               map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+				"bottlenecks":              map[string]interface{}{"type": "array", "items": capacityBottleneckSchema()},
 			},
 			"required": []string{
 				"generated_at", "data_hash", "output_format", "version", "agents",
 				"open_issue_count", "total_minutes", "total_days", "serial_minutes",
 				"parallel_minutes", "parallelizable_pct", "estimated_days",
+				"critical_path_minutes", "velocity_minutes_per_day", "graham_min_days", "graham_max_days",
 				"critical_path_length", "critical_path", "actionable_count", "actionable",
 			},
 		},
@@ -8980,7 +9261,10 @@ func alertSchema() map[string]interface{} {
 			"delta":                   map[string]interface{}{"type": "number"},
 			"details":                 map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			"issue_id":                map[string]interface{}{"type": "string"},
+			"related_issue_id":        map[string]interface{}{"type": "string"},
 			"label":                   map[string]interface{}{"type": "string"},
+			"labels":                  map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+			"suggested_action":        map[string]interface{}{"type": "string"},
 			"detected_at":             map[string]interface{}{"type": "string", "format": "date-time"},
 			"unblocks_count":          map[string]interface{}{"type": "integer"},
 			"downstream_priority_sum": map[string]interface{}{"type": "integer"},
@@ -9290,6 +9574,31 @@ func robotCorrelationStatsOutputSchema() map[string]interface{} {
 			"rejected", "ignored", "accuracy_rate", "avg_confirm_conf", "avg_reject_conf",
 		},
 	}
+}
+
+func robotExplainCorrelationOutputSchema() map[string]interface{} {
+	return robotFileCommandOutputSchema("Robot Explain Correlation Output", "Detailed explanation for why a commit is linked to a bead", map[string]interface{}{
+		"commit_sha":     map[string]interface{}{"type": "string"},
+		"bead_id":        map[string]interface{}{"type": "string"},
+		"confidence":     map[string]interface{}{"type": "number"},
+		"level":          map[string]interface{}{"type": "string"},
+		"method":         map[string]interface{}{"type": "string"},
+		"summary":        map[string]interface{}{"type": "string"},
+		"signals":        map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
+		"recommendation": map[string]interface{}{"type": "string"},
+		"feedback":       map[string]interface{}{"type": "object"},
+	}, []string{"generated_at", "data_hash", "output_format", "version", "commit_sha", "bead_id", "confidence", "method"})
+}
+
+func robotCorrelationFeedbackOutputSchema(title, description string) map[string]interface{} {
+	return robotFileCommandOutputSchema(title, description, map[string]interface{}{
+		"status":    map[string]interface{}{"type": "string", "enum": []string{"confirmed", "rejected"}},
+		"commit":    map[string]interface{}{"type": "string"},
+		"bead":      map[string]interface{}{"type": "string"},
+		"by":        map[string]interface{}{"type": "string"},
+		"reason":    map[string]interface{}{"type": "string"},
+		"orig_conf": map[string]interface{}{"type": "number"},
+	}, []string{"generated_at", "data_hash", "output_format", "version", "status", "commit", "bead", "by", "orig_conf"})
 }
 
 func robotOrphansOutputSchema() map[string]interface{} {
@@ -9898,6 +10207,20 @@ func discoverWorkspaceConfig() string {
 		return ""
 	}
 	return found
+}
+
+// resolveCLIProjectDir returns the canonical project root directory (parent of
+// the active .beads directory when reachable from CWD or BEADS_DIR/BEADS_DB),
+// falling back to os.Getwd() when no .beads directory is active.
+func resolveCLIProjectDir() (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	if root, _, rootErr := loader.ResolveProjectRoot(wd); rootErr == nil && root != "" {
+		return root, nil
+	}
+	return wd, nil
 }
 
 // mustGetwd returns the working directory or "." when it cannot be read; it

@@ -204,8 +204,10 @@ func (e *Extractor) extractViaGitLogPatch(opts ExtractOptions) ([]BeadEvent, err
 		return nil, fmt.Errorf("git log failed: %w", err)
 	}
 
-	// Sort chronologically (git log returns newest first)
-	reverseEvents(events)
+	// Sort commits chronologically (git log returns newest commit first) while
+	// preserving deterministic within-commit event ordering (e.g. EventCreated
+	// before synthesized EventClaimed / EventClosed).
+	reverseCommitEventGroups(events)
 
 	return events, nil
 }
@@ -475,9 +477,13 @@ func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID str
 		}
 
 		if !hadOld && hasNew {
-			// New bead created
+			// New bead created; synthesize initial Claimed / Closed milestone
+			// when the bead enters history directly as in_progress or closed.
 			event.EventType = EventCreated
 			events = append(events, event)
+			if synth, ok := synthesizedCreationMilestone(event, newSnap.Status); ok {
+				events = append(events, synth)
+			}
 		} else if hadOld && hasNew {
 			// Check for status change
 			if oldSnap.Status != newSnap.Status {
@@ -582,6 +588,40 @@ func normalizeLifecycleStatus(status string) string {
 
 func isClosedLifecycleStatus(status string) bool {
 	return status == "closed" || status == "tombstone"
+}
+
+// synthesizedCreationMilestone emits a synthetic EventClaimed or EventClosed
+// immediately after EventCreated when a bead first appears in JSONL already in
+// an active (in_progress) or terminal (closed/tombstone) lifecycle state.
+func synthesizedCreationMilestone(created BeadEvent, rawStatus string) (BeadEvent, bool) {
+	norm := normalizeLifecycleStatus(rawStatus)
+	synth := created
+	switch {
+	case norm == "in_progress":
+		synth.EventType = EventClaimed
+		return synth, true
+	case isClosedLifecycleStatus(norm):
+		synth.EventType = EventClosed
+		return synth, true
+	default:
+		return BeadEvent{}, false
+	}
+}
+
+// reverseCommitEventGroups reverses commit blocks from newest-first to
+// oldest-first while preserving within-commit event ordering.
+func reverseCommitEventGroups(events []BeadEvent) {
+	reverseEvents(events)
+	for start := 0; start < len(events); {
+		end := start + 1
+		for end < len(events) && events[end].CommitSHA == events[start].CommitSHA {
+			end++
+		}
+		if end-start > 1 {
+			reverseEvents(events[start:end])
+		}
+		start = end
+	}
 }
 
 // reverseEvents reverses a slice of events in place

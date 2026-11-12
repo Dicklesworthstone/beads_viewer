@@ -70,12 +70,13 @@ const (
 	focusHistory
 	focusAttention
 	focusLabelPicker
-	focusSprint      // Sprint dashboard view (bv-161)
-	focusAgentPrompt // AGENTS.md integration prompt (bv-i8dk)
-	focusFlowMatrix  // Cross-label flow matrix view
-	focusTutorial    // Interactive tutorial (bv-8y31)
-	focusCassModal   // Cass session preview modal (bv-5bqh)
-	focusUpdateModal // Self-update modal (bv-182)
+	focusSprint             // Sprint dashboard view (bv-161)
+	focusAgentPrompt        // AGENTS.md integration prompt (bv-i8dk)
+	focusFlowMatrix         // Cross-label flow matrix view
+	focusTutorial           // Interactive tutorial (bv-8y31)
+	focusCassModal          // Cass session preview modal (bv-5bqh)
+	focusUpdateModal        // Self-update modal (bv-182)
+	focusVelocityComparison // Side-by-side label velocity comparison (bv-125)
 )
 
 // embeddedTextInputTarget identifies one of the text inputs owned by Model.
@@ -1353,10 +1354,11 @@ type Model struct {
 	dismissedAlerts map[string]bool
 
 	// Sprint view (bv-161)
-	sprints        []model.Sprint
-	selectedSprint *model.Sprint
-	isSprintView   bool
-	sprintViewText string
+	sprints                []model.Sprint
+	selectedSprint         *model.Sprint
+	isSprintView           bool
+	sprintViewText         string
+	sprintAtRiskThresholds analysis.AtRiskThresholds
 
 	// AGENTS.md integration (bv-i8dk)
 	showAgentPrompt  bool
@@ -2417,7 +2419,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	// Precompute drift/health alerts (bv-168)
 	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlerts(issues, graphStats, analyzer)
 
-	// Load sprints from the same directory as beadsPath (bv-161)
+	// Load sprints and sprint at-risk thresholds from project config (bv-161, bv-apal.28)
 	var sprints []model.Sprint
 	if beadsPath != "" {
 		beadsDir := filepath.Dir(beadsPath)
@@ -2425,11 +2427,20 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 			sprints = loaded
 		}
 	}
+	sprintProjectDir := cass.WorkspaceFromBeadsPath(beadsPath)
+	sprintAtRiskThresholds := analysis.DefaultAtRiskThresholds()
+	if driftCfg, err := drift.LoadConfig(sprintProjectDir); err == nil && driftCfg != nil {
+		sprintAtRiskThresholds = driftCfg.AtRiskThresholds()
+	}
 
 	// Tree view state should persist alongside the beads directory (e.g. BEADS_DIR overrides).
+	// When beadsPath is empty (e.g. historical --as-of mode), mark the tree read-only so it
+	// never writes .beads/tree-state.json into the working directory.
 	treeModel := NewTreeModel(theme)
 	if beadsPath != "" {
 		treeModel.SetBeadsDir(filepath.Dir(beadsPath))
+	} else {
+		treeModel.SetReadOnly(true)
 	}
 
 	m := Model{
@@ -2500,8 +2511,9 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		alertsWarning:   alertsWarning,
 		alertsInfo:      alertsInfo,
 		dismissedAlerts: make(map[string]bool),
-		// Sprint view (bv-161)
-		sprints: sprints,
+		// Sprint view (bv-161, bv-apal.28)
+		sprints:                sprints,
+		sprintAtRiskThresholds: sprintAtRiskThresholds,
 		// AGENTS.md integration (bv-i8dk) - workDir derived from beadsPath
 		workDir: cass.WorkspaceFromBeadsPath(beadsPath),
 		// Tutorial integration (bv-8y31)
@@ -3494,6 +3506,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.newIssueIDs = nil
 			m.closedIssueIDs = nil
 			m.modifiedIssueIDs = nil
+			m.tree.SetReadOnly(m.beadsPath == "")
 		}
 
 		listFilterActive := m.list.FilterState() != list.Unfiltered
@@ -3952,6 +3965,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.newIssueIDs = nil
 			m.closedIssueIDs = nil
 			m.modifiedIssueIDs = nil
+			m.tree.SetReadOnly(m.beadsPath == "")
 		}
 
 		// Reload issues from disk
@@ -4451,6 +4465,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Close label health detail modal if open
 		if m.showLabelHealthDetail {
 			s := msg.String()
+			if s == "ctrl+c" {
+				return m, m.quitCommand()
+			}
 			if s == "esc" || s == "q" || s == "enter" || s == "h" {
 				m.showLabelHealthDetail = false
 				m.labelHealthDetail = nil
@@ -4464,12 +4481,33 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showLabelHealthDetail = false
 				return m, nil
 			}
+			if !IsContextHelpTrigger(msg) {
+				return m, nil
+			}
+		}
+
+		// Handle label graph analysis sub-view (bv-109) before drilldown (which opens it on 'g')
+		if m.showLabelGraphAnalysis {
+			s := msg.String()
+			switch s {
+			case "ctrl+c":
+				return m, m.quitCommand()
+			case "esc", "q", "g":
+				m.showLabelGraphAnalysis = false
+				m.labelGraphAnalysisResult = nil
+				return m, nil
+			}
+			if !IsContextHelpTrigger(msg) {
+				return m, nil
+			}
 		}
 
 		// Handle label drilldown modal if open
 		if m.showLabelDrilldown {
 			s := msg.String()
 			switch s {
+			case "ctrl+c":
+				return m, m.quitCommand()
 			case "enter":
 				// Apply label filter to main list and close drilldown
 				if m.labelDrilldownLabel != "" {
@@ -4502,42 +4540,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.labelDrilldownIssues = nil
 				return m, nil
 			}
-		}
-
-		// Handle label graph analysis sub-view (bv-109)
-		if m.showLabelGraphAnalysis {
-			s := msg.String()
-			switch s {
-			case "esc", "q", "g":
-				m.showLabelGraphAnalysis = false
-				m.labelGraphAnalysisResult = nil
+			if !IsContextHelpTrigger(msg) {
 				return m, nil
 			}
-		}
-
-		// Handle velocity comparison sub-view if open (bv-125)
-		if m.showVelocityComparison {
-			s := msg.String()
-			switch s {
-			case "j", "down":
-				m.velocityComparison.MoveDown()
-				return m, nil
-			case "k", "up":
-				m.velocityComparison.MoveUp()
-				return m, nil
-			case "enter":
-				if selectedLabel := m.velocityComparison.SelectedLabel(); selectedLabel != "" {
-					m.currentFilter = "label:" + selectedLabel
-					m.applyFilter()
-					m.focused = focusList
-				}
-				m.showVelocityComparison = false
-				return m, m.pendingSemanticFilterCmd()
-			case "esc", "q", "v":
-				m.showVelocityComparison = false
-				return m, nil
-			}
-			return m, nil
 		}
 
 		// Attention view (bv-117): cursor navigation, drilldown, quick filters.
@@ -4641,6 +4646,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.showVelocityComparison && m.focused != focusVelocityComparison &&
+			m.focused != focusHelp && m.focused != focusTutorial && m.focused != focusQuitConfirm {
+			m.focused = focusVelocityComparison
+		}
+
 		// Handle help overlay toggle (? or F1)
 		if ((msg.String() == "?" && !m.isTextInputActive()) || msg.String() == "f1") && m.list.FilterState() != list.Filtering {
 			m.showHelp = !m.showHelp
@@ -4677,16 +4687,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Handle context-sensitive tutorial trigger (~) - bv-324s, bv-8y31
 		if IsContextHelpTrigger(msg) && !m.isTextInputActive() {
-			if m.showTutorial && m.tutorialModel.contextMode {
+			if m.showTutorial {
 				m.closeTutorial()
 				return m, nil
 			}
-			if !m.showTutorial {
-				if m.showHelp {
-					m.focusBeforeTutorial = m.focusBeforeHelp
-				} else {
-					m.focusBeforeTutorial = m.focused
-				}
+			if m.showHelp {
+				m.focusBeforeTutorial = m.focusBeforeHelp
+			} else {
+				m.focusBeforeTutorial = m.focused
 			}
 			ctx := string(m.CurrentContext())
 			m.showHelp = false
@@ -5035,6 +5043,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.focused = focusList
 					return m, nil
 				}
+				if m.focused == focusVelocityComparison || m.showVelocityComparison {
+					m.showVelocityComparison = false
+					m.focused = focusLabelDashboard
+					return m, nil
+				}
 				if m.focused == focusLabelDashboard {
 					m.focused = focusList
 					return m, nil
@@ -5099,8 +5112,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.focused = focusList
 					return m, nil
 				}
+				// Close velocity comparison sub-view back to label dashboard
+				if m.focused == focusVelocityComparison || m.showVelocityComparison {
+					m.showVelocityComparison = false
+					m.focused = focusLabelDashboard
+					return m, nil
+				}
 				// Close label dashboard if open
 				if m.focused == focusLabelDashboard {
+					m.focused = focusList
+					return m, nil
+				}
+				// Exit tree view cleanly to list while preserving any active list filters
+				if m.focused == focusTree {
 					m.focused = focusList
 					return m, nil
 				}
@@ -5237,38 +5261,42 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case focusLabelDashboard:
-				if selectedLabel, cmd := m.labelDashboard.Update(msg); selectedLabel != "" {
-					// Filter list by selected label and jump back to list view
-					m.currentFilter = "label:" + selectedLabel
-					m.applyFilter()
-					m.focused = focusList
-					return m, tea.Batch(cmd, m.pendingSemanticFilterCmd())
-				}
-				// Open detail modal on 'h'
-				if keyStr == "h" && len(m.labelDashboard.labels) > 0 {
-					idx := m.labelDashboard.cursor
-					if idx >= 0 && idx < len(m.labelDashboard.labels) {
-						lh := m.labelDashboard.labels[idx]
-						m.showLabelHealthDetail = true
-						m.labelHealthDetail = &lh
-						// Precompute cross-label flows for this label
-						m.labelHealthDetailFlow = m.getCrossFlowsForLabel(lh.Label)
-						return m, nil
+				switch keyStr {
+				case "j", "k", "up", "down", "home", "G", "end", "enter":
+					if selectedLabel, cmd := m.labelDashboard.Update(msg); selectedLabel != "" {
+						// Filter list by selected label and jump back to list view
+						m.currentFilter = "label:" + selectedLabel
+						m.applyFilter()
+						m.focused = focusList
+						return m, tea.Batch(cmd, m.pendingSemanticFilterCmd())
 					}
-				}
-				// Open drilldown overlay on 'd'
-				if keyStr == "d" && len(m.labelDashboard.labels) > 0 {
-					idx := m.labelDashboard.cursor
-					if idx >= 0 && idx < len(m.labelDashboard.labels) {
-						lh := m.labelDashboard.labels[idx]
-						m.labelDrilldownLabel = lh.Label
-						m.labelDrilldownIssues = m.filterIssuesByLabel(lh.Label)
-						m.showLabelDrilldown = true
-						return m, nil
+					viewToggleHandled = true
+				case "h":
+					if len(m.labelDashboard.labels) > 0 {
+						idx := m.labelDashboard.cursor
+						if idx >= 0 && idx < len(m.labelDashboard.labels) {
+							lh := m.labelDashboard.labels[idx]
+							m.showLabelHealthDetail = true
+							m.labelHealthDetail = &lh
+							// Precompute cross-label flows for this label
+							m.labelHealthDetailFlow = m.getCrossFlowsForLabel(lh.Label)
+							return m, nil
+						}
 					}
-				}
-				// Open velocity comparison sub-view on 'v' (bv-125)
-				if keyStr == "v" {
+				case "d":
+					if len(m.labelDashboard.labels) > 0 {
+						idx := m.labelDashboard.cursor
+						if idx >= 0 && idx < len(m.labelDashboard.labels) {
+							lh := m.labelDashboard.labels[idx]
+							m.labelDrilldownLabel = lh.Label
+							m.labelDrilldownIssues = m.filterIssuesByLabel(lh.Label)
+							m.showLabelDrilldown = true
+							return m, nil
+						}
+					}
+					viewToggleHandled = true
+				case "v":
+					// Open velocity comparison sub-view on 'v' (bv-125)
 					m.velocityComparison.SetData(m.issues)
 					bodyHeight := m.height - 1
 					if bodyHeight < 5 {
@@ -5276,9 +5304,33 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.velocityComparison.SetSize(m.mainContentWidth(), bodyHeight)
 					m.showVelocityComparison = true
+					m.focused = focusVelocityComparison
 					return m, nil
 				}
-				return m, nil
+
+			case focusVelocityComparison:
+				switch keyStr {
+				case "j", "down":
+					m.velocityComparison.MoveDown()
+					viewToggleHandled = true
+				case "k", "up":
+					m.velocityComparison.MoveUp()
+					viewToggleHandled = true
+				case "enter":
+					if selectedLabel := m.velocityComparison.SelectedLabel(); selectedLabel != "" {
+						m.currentFilter = "label:" + selectedLabel
+						m.applyFilter()
+						m.focused = focusList
+					} else {
+						m.focused = focusLabelDashboard
+					}
+					m.showVelocityComparison = false
+					return m, m.pendingSemanticFilterCmd()
+				case "v":
+					m.showVelocityComparison = false
+					m.focused = focusLabelDashboard
+					viewToggleHandled = true
+				}
 
 			case focusGraph:
 				// Graph uses h/l for nav — intercept those.
@@ -5300,6 +5352,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case focusTree:
+				if m.timeTravelMode {
+					m.tree.SetReadOnly(true)
+				}
 				// Tree uses h/l for nav — intercept those.
 				// "g" handled via gg-combo (bv-6fm0): gg jumps to top, single g -> graph.
 				// Let other view-toggle keys (b/a/i/f/etc.) fall through.
@@ -5495,6 +5550,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.isGraphView = false
 				m.isActionableView = false
 				m.isHistoryView = false
+				m.isSprintView = false
+				m.showVelocityComparison = false
 				if m.isBoardView {
 					m.focused = focusBoard
 					m.refreshBoardAndGraphForCurrentFilter()
@@ -5509,6 +5566,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.isBoardView = false
 				m.isActionableView = false
 				m.isHistoryView = false
+				m.isSprintView = false
+				m.showVelocityComparison = false
 				if m.isGraphView {
 					m.focused = focusGraph
 					m.refreshBoardAndGraphForCurrentFilter()
@@ -5523,6 +5582,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.isGraphView = false
 				m.isBoardView = false
 				m.isHistoryView = false
+				m.isSprintView = false
+				m.showVelocityComparison = false
 				if m.isActionableView {
 					// Build execution plan
 					analyzer := analysis.NewAnalyzer(m.issues)
@@ -5545,6 +5606,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.isBoardView = false
 					m.isActionableView = false
 					m.isHistoryView = false
+					m.isSprintView = false
+					m.showVelocityComparison = false
+					if m.timeTravelMode {
+						m.tree.SetReadOnly(true)
+					}
 					// Build tree from snapshot when available (bv-t435)
 					if m.snapshot != nil {
 						m.tree.BuildFromSnapshot(m.snapshot)
@@ -5564,6 +5630,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.isBoardView = false
 					m.isActionableView = false
 					m.isHistoryView = false
+					m.isSprintView = false
+					m.showVelocityComparison = false
 					m.focused = focusInsights
 					m.rebuildInsightsPanel()
 				}
@@ -5592,6 +5660,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.isGraphView = false
 				m.isBoardView = false
 				m.isActionableView = false
+				m.isSprintView = false
+				m.showVelocityComparison = false
 				if m.isHistoryView {
 					if m.historyLoadFailed && !m.historyLoading {
 						return m, m.enterHistoryView()
@@ -5603,11 +5673,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.enterHistoryView()
 
 			case "[", "f3":
-				// Open label dashboard (phase 1: table view)
+				// Toggle label dashboard (phase 1: table view)
+				if m.focused == focusLabelDashboard {
+					m.focused = focusList
+					m.statusMsg = ""
+					return m, nil
+				}
 				m.isGraphView = false
 				m.isBoardView = false
 				m.isActionableView = false
 				m.isHistoryView = false
+				m.isSprintView = false
+				m.showVelocityComparison = false
 				m.focused = focusLabelDashboard
 				// Compute label health (fast; phase1 metrics only needed) with caching
 				if !m.labelHealthCached {
@@ -5627,6 +5704,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.isBoardView = false
 				m.isActionableView = false
 				m.isHistoryView = false
+				m.isSprintView = false
+				m.showVelocityComparison = false
 				m.focused = focusAttention
 				m.refreshAttentionView()
 				m.statusMsg = fmt.Sprintf("Attention: %d labels ranked • j/k move • enter drilldown • 1-9 filter • ] close", m.attentionView.Len())
@@ -5641,6 +5720,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.isBoardView = false
 				m.isActionableView = false
 				m.isHistoryView = false
+				m.isSprintView = false
+				m.showVelocityComparison = false
 				m.focused = focusFlowMatrix
 				m.flowDetailID = ""
 				m.flowMatrix = NewFlowMatrixModel(m.theme)
@@ -5774,6 +5855,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			case focusFlowMatrix:
 				m.flowMatrix.MoveUp()
+			case focusVelocityComparison:
+				m.velocityComparison.MoveUp()
 			}
 			return m, nil
 		case tea.MouseButtonWheelDown:
@@ -5811,6 +5894,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			case focusFlowMatrix:
 				m.flowMatrix.MoveDown()
+			case focusVelocityComparison:
+				m.velocityComparison.MoveDown()
 			}
 			return m, nil
 
@@ -6475,6 +6560,7 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.selectListIssueByID(selectedID)
 			// Switch to graph view focused on this bead
 			m.isHistoryView = false
+			m.isGraphView = true
 			m.graphView.SelectByID(selectedID)
 			m.focused = focusGraph
 			m.statusMsg = fmt.Sprintf("📊 Graph view: %s", selectedID)
@@ -7119,9 +7205,6 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 		body = m.renderLabelGraphAnalysis()
 	} else if m.showLabelDrilldown && m.labelDrilldownLabel != "" {
 		body = m.renderLabelDrilldown()
-	} else if m.showVelocityComparison {
-		m.velocityComparison.SetSize(m.width, m.height-1)
-		body = m.velocityComparison.View()
 	} else if m.showAlertsPanel {
 		body = m.renderAlertsPanel()
 	} else if m.showTimeTravelPrompt {
@@ -7142,6 +7225,9 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 	} else {
 		overlay = false
 		switch {
+		case m.showVelocityComparison || m.focused == focusVelocityComparison:
+			m.velocityComparison.SetSize(bodyWidth, bodyHeight)
+			body = m.velocityComparison.View()
 		case m.focused == focusAttention:
 			m.attentionView.SetSize(bodyWidth, bodyHeight)
 			body = m.attentionView.View()
@@ -8180,7 +8266,7 @@ func (m *Model) renderFooter() string {
 	// ─────────────────────────────────────────────────────────────────────────
 	var filterTxt string
 	var filterIcon string
-	if m.showVelocityComparison {
+	if m.showVelocityComparison || m.focused == focusVelocityComparison {
 		filterTxt = "VELOCITY: j/k select • enter filter • v/esc close"
 		filterIcon = "📈"
 	} else if m.focused == focusLabelDashboard {
@@ -9592,6 +9678,7 @@ func (m *Model) applyContentSizing() {
 	// the panel dimensions between renders (paging, cursor visibility) in step
 	// with a resize or sidebar toggle.
 	m.labelDashboard.SetSize(contentWidth, bodyHeight)
+	m.velocityComparison.SetSize(contentWidth, bodyHeight)
 	m.insightsPanel.SetSize(contentWidth, bodyHeight)
 	m.attentionView.SetSize(contentWidth, bodyHeight)
 	m.flowMatrix.SetSize(contentWidth, bodyHeight)
@@ -9728,7 +9815,8 @@ func (m *Model) handleLeftClick(x, y int) *Model {
 	if m.focused == focusInsights || m.focused == focusFlowMatrix ||
 		m.focused == focusTree || m.isGraphView || m.isBoardView ||
 		m.isActionableView || m.isHistoryView || m.isSprintView ||
-		m.focused == focusLabelDashboard {
+		m.focused == focusLabelDashboard || m.focused == focusAttention ||
+		m.focused == focusVelocityComparison || m.showVelocityComparison {
 		return m
 	}
 
@@ -10260,6 +10348,7 @@ func (m *Model) enterTimeTravelMode(revision string) {
 	m.timeTravelMode = true
 	m.timeTravelDiff = diff
 	m.timeTravelSince = revision
+	m.tree.SetReadOnly(true)
 
 	// Success feedback
 	m.statusMsg = fmt.Sprintf("⏱️ Time-travel: comparing with %s (+%d ✅%d ~%d)",
@@ -10278,6 +10367,7 @@ func (m *Model) exitTimeTravelMode() {
 	m.newIssueIDs = nil
 	m.closedIssueIDs = nil
 	m.modifiedIssueIDs = nil
+	m.tree.SetReadOnly(m.beadsPath == "")
 
 	// Feedback
 	m.statusMsg = "⏱️ Time-travel mode disabled"
@@ -10320,6 +10410,8 @@ func (f focus) String() string {
 		return "tree"
 	case focusLabelDashboard:
 		return "label_dashboard"
+	case focusVelocityComparison:
+		return "velocity_comparison"
 	case focusInsights:
 		return "insights"
 	case focusActionable:
@@ -11432,7 +11524,7 @@ func (m *Model) refreshLabelViews(underlyingFocus focus) {
 			}
 		}
 	}
-	if m.showVelocityComparison {
+	if m.showVelocityComparison || underlyingFocus == focusVelocityComparison {
 		m.velocityComparison.SetData(m.issues)
 		bodyHeight := m.height - 1
 		if bodyHeight < 5 {

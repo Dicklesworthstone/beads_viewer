@@ -88,13 +88,18 @@ func TestEnv_NoRawGetenvInProductionCode(t *testing.T) {
 					return true
 				}
 
-				// Check argument: string literal starting with BV_ or BEADS_
+				// Check argument: string literal starting with BV_ or BEADS_, or
+				// any dynamic/constant identifier (which could hide BV_*/BEADS_*
+				// names behind constants or helper parameters).
 				if lit, ok := call.Args[0].(*ast.BasicLit); ok && isStringLit(lit.Kind) {
 					rawVal := strings.Trim(lit.Value, `"`+"`")
 					if strings.HasPrefix(rawVal, "BV_") || strings.HasPrefix(rawVal, "BEADS_") {
 						pos := fset.Position(call.Pos())
 						violations = append(violations, pos.String()+": raw os."+sel.Sel.Name+"("+lit.Value+") must use internal/env")
 					}
+				} else {
+					pos := fset.Position(call.Pos())
+					violations = append(violations, pos.String()+": non-literal os."+sel.Sel.Name+"(...) must route through internal/env")
 				}
 
 				return true

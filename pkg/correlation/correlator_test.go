@@ -766,3 +766,185 @@ func TestCorrelator_CancelledContextReturnsFast(t *testing.T) {
 		t.Fatalf("goroutines leaked after cancellation: before=%d after=%d", before, after)
 	}
 }
+
+func TestCorrelator_CreatedDirectlyInProgressAndClosedMilestonesAndTemporalMixedCommit(t *testing.T) {
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "init")
+
+	baseTime := time.Date(2026, 5, 10, 9, 0, 0, 0, time.UTC)
+	commitAt := func(offset time.Duration, msg string, paths ...string) string {
+		t.Helper()
+		runGit(t, repo, "add", "--", ".")
+		ts := baseTime.Add(offset).Format(time.RFC3339)
+		cmd := exec.Command("git", "commit", "-m", msg)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Dev", "GIT_AUTHOR_EMAIL=dev@example.com",
+			"GIT_COMMITTER_NAME=Dev", "GIT_COMMITTER_EMAIL=dev@example.com",
+			"GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("commit %q (%v): %v\n%s", msg, paths, err, out)
+		}
+		out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	jsonl := filepath.Join(beadsDir, "issues.jsonl")
+
+	// Commit 1 (t+0h): bv-pzpv created directly as in_progress!
+	if err := os.WriteFile(jsonl, []byte(`{"id":"bv-pzpv","title":"Implement service handler","status":"in_progress","assignee":"dev@example.com"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(0, "chore: create bv-pzpv directly in_progress", ".beads/issues.jsonl")
+
+	// Commit 2 (t+1h): Mixed commit touching code AND .beads/issues.jsonl (e.g. adding unrelated open bead bv-empty), with NO bead ID in message!
+	if err := os.WriteFile(filepath.Join(repo, "service.go"), []byte("package main\nfunc Handle() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-pzpv","title":"Implement service handler","status":"in_progress","assignee":"dev@example.com"}`+"\n"+
+			`{"id":"bv-empty","title":"Untouched backlog item","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mixedTemporalSHA := commitAt(1*time.Hour, "wip: implement handler logic", "service.go", ".beads/issues.jsonl")
+
+	// Commit 3 (t+90m): Pure .beads/-only bookkeeping commit inside window (negative control: must NOT correlate as temporal_author).
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-pzpv","title":"Implement service handler","status":"in_progress","assignee":"dev@example.com"}`+"\n"+
+			`{"id":"bv-empty","title":"Untouched backlog item retitled","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pureBeadsSHA := commitAt(90*time.Minute, "chore: update backlog title", ".beads/issues.jsonl")
+
+	// Commit 4 (t+2h): Close bv-pzpv AND introduce single-commit bv-one-shot directly as closed alongside Dockerfile + App.svelte!
+	if err := os.WriteFile(filepath.Join(repo, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "App.svelte"), []byte("<script>export let ok = true;</script>\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-pzpv","title":"Implement service handler","status":"closed","assignee":"dev@example.com"}`+"\n"+
+			`{"id":"bv-empty","title":"Untouched backlog item retitled","status":"open"}`+"\n"+
+			`{"id":"bv-one-shot","title":"Containerize svelte app","status":"closed","assignee":"dev@example.com"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oneShotSHA := commitAt(2*time.Hour, "chore: close work and ship container", "Dockerfile", "App.svelte", ".beads/issues.jsonl")
+
+	// Commit 5 (t+3h): Explicit-ID commit touching ONLY non-code repo files (.gitignore and docs/RELEASING.txt).
+	if err := os.MkdirAll(filepath.Join(repo, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("dist/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "docs", "RELEASING.txt"), []byte("Release notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	explicitDocsSHA := commitAt(3*time.Hour, "docs(bv-pzpv): document release hygiene.", ".gitignore", "docs/RELEASING.txt")
+
+	beads := []BeadInfo{
+		{ID: "bv-pzpv", Title: "Implement service handler", Status: "closed"},
+		{ID: "bv-empty", Title: "Untouched backlog item retitled", Status: "open"},
+		{ID: "bv-one-shot", Title: "Containerize svelte app", Status: "closed"},
+	}
+
+	report, err := NewCorrelator(repo, jsonl).GenerateReport(beads, CorrelatorOptions{Limit: 100})
+	if err != nil {
+		t.Fatalf("GenerateReport: %v", err)
+	}
+
+	// Verify Fix 2 + Fix 3 + Fix 5 on bv-pzpv
+	pzpv := report.Histories["bv-pzpv"]
+	if pzpv.Milestones.Created == nil || pzpv.Milestones.Claimed == nil || pzpv.Milestones.Closed == nil {
+		t.Fatalf("expected Created, Claimed, and Closed milestones on bv-pzpv, got %+v", pzpv.Milestones)
+	}
+	if pzpv.CycleTime == nil || pzpv.CycleTime.ClaimToClose == nil || *pzpv.CycleTime.ClaimToClose != 2*time.Hour {
+		t.Fatalf("expected ClaimToClose == 2h on bv-pzpv, got %+v", pzpv.CycleTime)
+	}
+
+	commitsBySHA := make(map[string]CorrelatedCommit)
+	for _, cc := range pzpv.Commits {
+		commitsBySHA[cc.SHA] = cc
+	}
+	if cc, ok := commitsBySHA[mixedTemporalSHA]; !ok || cc.Method != MethodTemporalAuthor {
+		t.Fatalf("expected mixed code+.beads/ commit %s to correlate via temporal_author, got %+v (exists=%v)", mixedTemporalSHA[:7], cc, ok)
+	}
+	if _, ok := commitsBySHA[pureBeadsSHA]; ok {
+		t.Fatalf("pure .beads/-only commit %s must NOT correlate via temporal_author", pureBeadsSHA[:7])
+	}
+	if cc, ok := commitsBySHA[explicitDocsSHA]; !ok || cc.Method != MethodExplicitID || len(cc.Files) != 2 {
+		t.Fatalf("expected explicit_id non-code commit %s with 2 files (.gitignore, docs/RELEASING.txt), got %+v (exists=%v)", explicitDocsSHA[:7], cc, ok)
+	}
+
+	// Also verify standalone TemporalCorrelator admits mixed code+.beads/ commit and rejects pure .beads/ commit.
+	tc := NewTemporalCorrelator(repo)
+	win := ExtractWindowFromMilestones("bv-pzpv", pzpv.Title, pzpv.Milestones)
+	if win == nil {
+		t.Fatal("ExtractWindowFromMilestones returned nil")
+	}
+	standaloneTemporal, err := tc.FindCommitsInWindow(*win)
+	if err != nil {
+		t.Fatalf("FindCommitsInWindow: %v", err)
+	}
+	foundStandaloneMixed := false
+	for _, cc := range standaloneTemporal {
+		if cc.SHA == pureBeadsSHA {
+			t.Fatalf("standalone TemporalCorrelator correlated pure .beads/ commit %s", pureBeadsSHA[:7])
+		}
+		if cc.SHA == mixedTemporalSHA {
+			foundStandaloneMixed = true
+		}
+	}
+	if !foundStandaloneMixed {
+		t.Fatalf("standalone TemporalCorrelator missed mixed code+.beads/ commit %s", mixedTemporalSHA[:7])
+	}
+
+	// Verify Fix 2 + Fix 5 on single-commit closed bead bv-one-shot
+	oneShot := report.Histories["bv-one-shot"]
+	if oneShot.Milestones.Created == nil || oneShot.Milestones.Closed == nil {
+		t.Fatalf("expected Created and Closed milestones on bv-one-shot, got %+v", oneShot.Milestones)
+	}
+	if len(oneShot.Commits) != 1 || oneShot.Commits[0].SHA != oneShotSHA || oneShot.Commits[0].Method != MethodCoCommitted {
+		t.Fatalf("expected single-commit closed bead bv-one-shot to correlate via co_committed, got %+v", oneShot.Commits)
+	}
+	if len(oneShot.Commits[0].Files) != 2 {
+		t.Fatalf("expected Dockerfile + App.svelte (2 files) on bv-one-shot co-commit, got %+v", oneShot.Commits[0].Files)
+	}
+
+	// Verify Fix 4: Non-null "commits":[] JSON serialization on 0-commit beads (and after filtering)
+	emptyHist := report.Histories["bv-empty"]
+	if emptyHist.Commits == nil {
+		t.Fatal("bv-empty Commits slice is nil, want non-nil []CorrelatedCommit{}")
+	}
+	rawJSON, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("json.Marshal(report): %v", err)
+	}
+	if strings.Contains(string(rawJSON), `"commits":null`) {
+		t.Fatalf("serialized HistoryReport contains \"commits\":null: %s", rawJSON)
+	}
+	if !strings.Contains(string(rawJSON), `"commits":[]`) {
+		t.Fatalf("serialized HistoryReport missing \"commits\":[]: %s", rawJSON)
+	}
+
+	filtered := NewScorer().FilterHistoriesByConfidence(report.Histories, 0.999)
+	filteredJSON, err := json.Marshal(filtered)
+	if err != nil {
+		t.Fatalf("json.Marshal(filtered): %v", err)
+	}
+	if strings.Contains(string(filteredJSON), `"commits":null`) {
+		t.Fatalf("confidence-filtered histories serialized \"commits\":null: %s", filteredJSON)
+	}
+}

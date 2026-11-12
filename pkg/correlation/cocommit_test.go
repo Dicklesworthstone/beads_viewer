@@ -24,6 +24,50 @@ func TestIsCodeFile(t *testing.T) {
 		{"schema.sql", true},
 		{"script.sh", true},
 
+		// Modern web, schema, infra, systems, and script extensions
+		{"web/index.html", true},
+		{"web/legacy.htm", true},
+		{"styles/main.css", true},
+		{"styles/theme.scss", true},
+		{"styles/vars.sass", true},
+		{"styles/compact.less", true},
+		{"src/App.svelte", true},
+		{"src/Widget.vue", true},
+		{"src/pages/index.astro", true},
+		{"api/v1/service.proto", true},
+		{"api/schema.graphql", true},
+		{"api/query.gql", true},
+		{"infra/main.tf", true},
+		{"infra/terragrunt.hcl", true},
+		{"src/kernel.zig", true},
+		{"wasm/module.wat", true},
+		{"wasm/world.wit", true},
+		{"nix/shell.nix", true},
+		{"scripts/deploy.ps1", true},
+		{"scripts/common.psm1", true},
+		{"scripts/build.bat", true},
+		{"scripts/run.cmd", true},
+		{"cmake/FindDep.cmake", true},
+
+		// Exact build/container/manifest basenames (root & nested)
+		{"Makefile", true},
+		{"sub/Makefile", true},
+		{"GNUmakefile", true},
+		{"Dockerfile", true},
+		{"deploy/Dockerfile", true},
+		{"Containerfile", true},
+		{"Justfile", true},
+		{"Vagrantfile", true},
+		{"Tiltfile", true},
+		{"BUILD", true},
+		{"pkg/foo/BUILD.bazel", true},
+		{"WORKSPACE", true},
+		{"flake.nix", true},
+		{"go.mod", true},
+		{"Cargo.toml", true},
+		{"package.json", true},
+		{"pyproject.toml", true},
+
 		// Non-code files
 		{"image.png", false},
 		{"photo.jpg", false},
@@ -33,7 +77,6 @@ func TestIsCodeFile(t *testing.T) {
 		{"data.csv", false},
 
 		// Edge cases
-		{"Makefile", false}, // No extension
 		{".gitignore", false},
 		{"", false},
 	}

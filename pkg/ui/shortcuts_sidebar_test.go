@@ -148,13 +148,18 @@ func TestContextFromFocus(t *testing.T) {
 		{focusHistory, "history"},
 		{focusActionable, "actionable"},
 		{focusLabelDashboard, "label"},
+		{focusTree, "tree"},
+		{focusFlowMatrix, "flow"},
+		{focusSprint, "sprint"},
+		{focusAttention, "attention"},
+		{focusVelocityComparison, "velocity"},
 		{focusHelp, "list"}, // Default fallback
 	}
 
 	for _, tt := range tests {
 		got := ContextFromFocus(tt.focus)
 		if got != tt.expected {
-			t.Errorf("ContextFromFocus(%d) = %q, want %q", tt.focus, got, tt.expected)
+			t.Errorf("ContextFromFocus(%v) = %q, want %q", tt.focus, got, tt.expected)
 		}
 	}
 }

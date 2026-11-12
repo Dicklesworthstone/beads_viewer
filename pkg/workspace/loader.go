@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/datasource"
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -180,26 +181,37 @@ func (l *AggregateLoader) LoadAll(ctx context.Context) ([]model.Issue, []LoadRes
 // entries whose paths suppress auto-discovery of that same repository.
 func (l *AggregateLoader) getRepos() ([]RepoConfig, error) {
 	var enabled []RepoConfig
-	seenPaths := make(map[string]bool)
+	seenEnabledPaths := make(map[string]bool)
+	disabledPaths := make(map[string]bool)
 	seenPrefixes := make(map[string]bool)
 	seenSourceRepos := make(map[string]bool)
 
-	addRepo := func(repo RepoConfig) error {
+	addRepo := func(repo RepoConfig, discovered bool) error {
 		repo = l.applyDefaults(repo)
+
+		if !repo.IsEnabled() {
+			if strings.TrimSpace(repo.Path) != "" {
+				pathKey, err := l.repoPathKey(repo)
+				if err != nil {
+					return err
+				}
+				if disabledPaths[pathKey] {
+					return nil
+				}
+				disabledPaths[pathKey] = true
+			}
+			enabled = append(enabled, repo)
+			return nil
+		}
 
 		pathKey, err := l.repoPathKey(repo)
 		if err != nil {
 			return err
 		}
-		if seenPaths[pathKey] {
+		if seenEnabledPaths[pathKey] || (discovered && disabledPaths[pathKey]) {
 			return nil
 		}
-		seenPaths[pathKey] = true
-
-		if !repo.IsEnabled() {
-			enabled = append(enabled, repo)
-			return nil
-		}
+		seenEnabledPaths[pathKey] = true
 
 		prefixKey := strings.ToLower(repo.GetPrefix())
 		if seenPrefixes[prefixKey] {
@@ -220,7 +232,7 @@ func (l *AggregateLoader) getRepos() ([]RepoConfig, error) {
 	}
 
 	for _, repo := range l.config.Repos {
-		if err := addRepo(repo); err != nil {
+		if err := addRepo(repo, false); err != nil {
 			return nil, err
 		}
 	}
@@ -231,7 +243,7 @@ func (l *AggregateLoader) getRepos() ([]RepoConfig, error) {
 			return nil, err
 		}
 		for _, repo := range discovered {
-			if err := addRepo(repo); err != nil {
+			if err := addRepo(repo, true); err != nil {
 				return nil, err
 			}
 		}
@@ -345,13 +357,11 @@ func (l *AggregateLoader) discoverRepos() ([]RepoConfig, error) {
 				continue
 			}
 			// A Dolt-native tracker is discoverable even before its compatibility
-			// export exists; loadSingleRepo refreshes that export. For JSONL-backed
-			// trackers, require a selectable issue file at the resolved redirect
-			// target rather than incorrectly probing only the local redirect stub.
-			if !loader.IsBDWorkspace(beadsDir) {
-				if _, err := loader.FindJSONLPath(beadsDir); err != nil {
-					continue
-				}
+			// export exists; loadSingleRepo refreshes that export. For br/legacy
+			// trackers, require a selectable SQLite or JSONL authority at the
+			// resolved redirect target rather than probing only the local stub.
+			if !loader.IsBDWorkspace(beadsDir) && !hasWorkspaceSelectableSource(beadsDir) {
+				continue
 			}
 
 			repos = append(repos, RepoConfig{
@@ -431,7 +441,7 @@ func (l *AggregateLoader) loadReposParallel(ctx context.Context, repos []RepoCon
 			default:
 			}
 
-			results[i] = l.loadSingleRepo(repo, knownPrefixes)
+			results[i] = l.loadSingleRepo(ctx, repo, knownPrefixes)
 
 			return nil // Individual repo errors are captured in results, not propagated
 		})
@@ -450,12 +460,19 @@ func (l *AggregateLoader) loadReposParallel(ctx context.Context, repos []RepoCon
 }
 
 // loadSingleRepo loads issues from a single repository and namespaced them
-func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[string]bool) LoadResult {
+func (l *AggregateLoader) loadSingleRepo(ctx context.Context, repo RepoConfig, knownPrefixes map[string]bool) LoadResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Resolve the repo path relative to workspace root
 	repo = l.applyDefaults(repo)
 	repoPath := l.resolveRepoPath(repo.Path)
 	result := LoadResult{RepoName: repo.GetName(), Prefix: repo.GetPrefix(), RepoPath: repo.Path,
 		SourcePath: filepath.Join(repoPath, repo.GetBeadsPath())}
+	if err := ctx.Err(); err != nil {
+		result.Error = err
+		return result
+	}
 
 	// Load raw issues from the repo, respecting custom beads path if provided
 	beadsDir, redirects, err := loader.ResolveBeadsDirWithTrace(filepath.Join(repoPath, repo.GetBeadsPath()))
@@ -467,6 +484,10 @@ func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[stri
 		watchDir = filepath.Dir(redirects[len(redirects)-1])
 	}
 	if watchDir != "" {
+		result.WatchPaths = append(result.WatchPaths,
+			filepath.Join(watchDir, "beads.db"),
+			filepath.Join(watchDir, "beads.db-wal"),
+		)
 		for _, name := range loader.PreferredJSONLNames {
 			result.WatchPaths = append(result.WatchPaths, filepath.Join(watchDir, name))
 		}
@@ -493,16 +514,7 @@ func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[stri
 			fmt.Fprintf(os.Stderr, "Warning: %s\n", message)
 		}
 	}
-	jsonlPath, err := loader.PrepareBeadsDirForRead(beadsDir, true, warnSourceFallback)
-	if err != nil {
-		result.SourcePath = beadsDir
-		result.Error = fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
-		return result
-	}
-	result.SourcePath = jsonlPath
-	result.WatchPaths = append(result.WatchPaths, jsonlPath)
-	parseOptions := loader.ParseOptions{Stats: &result.ParseStats}
-	parseOptions.WarningHandler = func(message string) {
+	emitParseWarning := func(message string) {
 		result.WarningCount++
 		if len(result.ParseWarnings) < 10 {
 			result.ParseWarnings = append(result.ParseWarnings, message)
@@ -515,16 +527,50 @@ func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[stri
 			fmt.Fprintf(os.Stderr, "Warning: %s\n", message)
 		}
 	}
-	issues, err := loader.LoadIssuesFromFileWithOptions(jsonlPath, parseOptions)
-	if err != nil {
-		result.Error = fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
-		return result
+
+	var (
+		issues     []model.Issue
+		sourcePath string
+	)
+	if loader.IsBDWorkspace(beadsDir) {
+		jsonlPath, prepErr := loader.PrepareBeadsDirForReadContext(ctx, beadsDir, true, warnSourceFallback)
+		if prepErr != nil {
+			result.SourcePath = beadsDir
+			result.Error = fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), prepErr)
+			return result
+		}
+		sourcePath = jsonlPath
+		result.SourcePath = sourcePath
+		result.WatchPaths = append(result.WatchPaths, sourcePath)
+		parseOptions := loader.ParseOptions{
+			Stats:          &result.ParseStats,
+			WarningHandler: emitParseWarning,
+		}
+		issues, err = loader.LoadIssuesFromFileWithOptions(sourcePath, parseOptions)
+		if err != nil {
+			result.Error = fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
+			return result
+		}
+		if result.ParseStats.Valid == 0 && result.ParseStats.Errors+result.ParseStats.Skipped > 0 {
+			result.Error = fmt.Errorf("failed to load issues from %s: no issue records (%d non-issue/error lines, 0 valid issues)",
+				repo.GetName(), result.ParseStats.Errors+result.ParseStats.Skipped)
+			return result
+		}
+	} else {
+		issues, sourcePath, err = l.loadStandardRepoIssues(ctx, repo.GetName(), beadsDir, &result, warnSourceFallback, emitParseWarning)
+		if err != nil {
+			if sourcePath != "" {
+				result.SourcePath = sourcePath
+			} else {
+				result.SourcePath = beadsDir
+			}
+			result.Error = fmt.Errorf("failed to load issues from %s: %w", repo.GetName(), err)
+			return result
+		}
+		result.SourcePath = sourcePath
+		result.WatchPaths = append(result.WatchPaths, sourcePath)
 	}
-	if result.ParseStats.Valid == 0 && result.ParseStats.Errors+result.ParseStats.Skipped > 0 {
-		result.Error = fmt.Errorf("failed to load issues from %s: no issue records (%d non-issue/error lines, 0 valid issues)",
-			repo.GetName(), result.ParseStats.Errors+result.ParseStats.Skipped)
-		return result
-	}
+
 	// Resolve local references before filtering tombstones: a deleted local ID
 	// that resembles another repository's prefix is still a local dependency.
 	localIDs := make(map[string]bool, len(issues))
@@ -547,12 +593,199 @@ func (l *AggregateLoader) loadSingleRepo(repo RepoConfig, knownPrefixes map[stri
 	issues = visibleIssues
 
 	// Apply namespacing to all IDs
-	loader.AttachIssueOrigins(issues, jsonlPath, result.ParseStats.Errors == 0 && len(result.AuthorityWarnings) == 0)
+	loader.AttachIssueOrigins(issues, sourcePath, result.ParseStats.Errors == 0 && len(result.AuthorityWarnings) == 0)
 	namespacedIssues := l.namespaceIssues(issues, prefix, localIDs, knownPrefixes)
 
 	result.Issues = namespacedIssues
 	result.TombstoneIDs = tombstoneIDs
 	return result
+}
+
+func hasWorkspaceSelectableSource(beadsDir string) bool {
+	if _, err := loader.FindJSONLPath(beadsDir); err == nil {
+		return true
+	}
+	if info, err := os.Stat(filepath.Join(beadsDir, "beads.db")); err == nil && !info.IsDir() {
+		return true
+	}
+	return false
+}
+
+func sortWorkspaceCandidates(sources []datasource.DataSource) {
+	jsonlRank := func(source datasource.DataSource) int {
+		if source.Type != datasource.SourceTypeJSONLLocal && source.Type != datasource.SourceTypeJSONLWorktree {
+			return 0
+		}
+		name := filepath.Base(source.Path)
+		for i, preferred := range loader.PreferredJSONLNames {
+			if name == preferred {
+				return len(loader.PreferredJSONLNames) - i
+			}
+		}
+		return 0
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		left, right := sources[i], sources[j]
+		if !left.ModTime.Equal(right.ModTime) {
+			return left.ModTime.After(right.ModTime)
+		}
+		if left.Priority != right.Priority {
+			return left.Priority > right.Priority
+		}
+		leftRank, rightRank := jsonlRank(left), jsonlRank(right)
+		if leftRank != rightRank {
+			return leftRank > rightRank
+		}
+		return left.Path < right.Path
+	})
+}
+
+func (l *AggregateLoader) loadStandardRepoIssues(
+	ctx context.Context,
+	_ string,
+	beadsDir string,
+	result *LoadResult,
+	warnSourceFallback func(string),
+	emitParseWarning func(string),
+) ([]model.Issue, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, beadsDir, err
+	}
+	sources, err := datasource.DiscoverSources(datasource.DiscoveryOptions{
+		BeadsDir:               beadsDir,
+		ValidateAfterDiscovery: false,
+		SkipWorktreeSources:    true,
+		WarningHandler:         warnSourceFallback,
+	})
+	if err != nil {
+		return nil, beadsDir, err
+	}
+	if len(sources) == 0 {
+		// Delegate to FindJSONLPath to preserve exact missing-source diagnostics.
+		jsonlPath, findErr := loader.FindJSONLPath(beadsDir)
+		if findErr != nil {
+			return nil, beadsDir, findErr
+		}
+		sources = []datasource.DataSource{{
+			Type:     datasource.SourceTypeJSONLLocal,
+			Path:     jsonlPath,
+			Priority: datasource.PriorityJSONLLocal,
+		}}
+	}
+	sortWorkspaceCandidates(sources)
+
+	maxErrorRate := datasource.DefaultValidationOptions().MaxJSONLErrorRate
+	var lastErr error
+	var lastSourcePath string
+
+	for idx, candidate := range sources {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, candidate.Path, ctxErr
+		}
+		hasMore := idx < len(sources)-1
+		lastSourcePath = candidate.Path
+
+		if candidate.Type == datasource.SourceTypeSQLite {
+			valCopy := candidate
+			if valErr := datasource.ValidateSource(&valCopy); valErr != nil {
+				lastErr = valErr
+				if hasMore {
+					warnSourceFallback(fmt.Sprintf("SQLite source %s failed validation, falling back: %v", candidate.Path, valErr))
+					continue
+				}
+				return nil, candidate.Path, valErr
+			}
+			reader, openErr := datasource.NewSQLiteReaderContext(ctx, candidate)
+			if openErr != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, candidate.Path, ctxErr
+				}
+				lastErr = openErr
+				if hasMore {
+					warnSourceFallback(fmt.Sprintf("SQLite source %s could not be opened, falling back: %v", candidate.Path, openErr))
+					continue
+				}
+				return nil, candidate.Path, openErr
+			}
+			snapshot, report, readErr := reader.LoadIssueSnapshotContext(ctx)
+			_ = reader.Close()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, candidate.Path, ctxErr
+			}
+			if readErr != nil {
+				lastErr = readErr
+				if hasMore {
+					warnSourceFallback(fmt.Sprintf("SQLite source %s failed during read, falling back: %v", candidate.Path, readErr))
+					continue
+				}
+				return nil, candidate.Path, readErr
+			}
+			totalAccounted := report.Valid + report.Errors + report.ReadErrors
+			errCount := report.Errors + report.ReadErrors
+			if errCount > 0 && hasMore && (totalAccounted == 0 || float64(errCount)/float64(totalAccounted) > maxErrorRate || report.ReadErrors > 0) {
+				lastErr = fmt.Errorf("SQLite source %s had %d issue/read errors", candidate.Path, errCount)
+				warnSourceFallback(fmt.Sprintf("SQLite source %s had %d errors, falling back", candidate.Path, errCount))
+				continue
+			}
+			result.ParseStats = loader.ParseStats{
+				Valid:   report.Valid,
+				Errors:  errCount,
+				Skipped: report.Skipped,
+			}
+			for _, w := range report.Warnings {
+				emitParseWarning(w)
+			}
+			return snapshot, candidate.Path, nil
+		}
+
+		// JSONL candidate
+		var stats loader.ParseStats
+		var bufferedWarnings []string
+		parseOpts := loader.ParseOptions{
+			Stats: &stats,
+			WarningHandler: func(msg string) {
+				bufferedWarnings = append(bufferedWarnings, msg)
+			},
+		}
+		issues, loadErr := loader.LoadIssuesFromFileWithOptions(candidate.Path, parseOpts)
+		if loadErr != nil {
+			lastErr = loadErr
+			if hasMore {
+				warnSourceFallback(fmt.Sprintf("JSONL source %s failed to read, falling back: %v", candidate.Path, loadErr))
+				continue
+			}
+			return nil, candidate.Path, loadErr
+		}
+		if stats.Valid == 0 && stats.Errors+stats.Skipped > 0 {
+			emptyErr := fmt.Errorf("no issue records (%d non-issue/error lines, 0 valid issues)", stats.Errors+stats.Skipped)
+			lastErr = emptyErr
+			if hasMore {
+				warnSourceFallback(fmt.Sprintf("JSONL source %s contained no valid issues, falling back: %v", candidate.Path, emptyErr))
+				continue
+			}
+			result.ParseStats = stats
+			for _, w := range bufferedWarnings {
+				emitParseWarning(w)
+			}
+			return nil, candidate.Path, emptyErr
+		}
+		if hasMore && stats.ErrorRate() > maxErrorRate {
+			rateErr := fmt.Errorf("JSONL error rate %.1f%% exceeds max %.1f%%", stats.ErrorRate()*100, maxErrorRate*100)
+			lastErr = rateErr
+			warnSourceFallback(fmt.Sprintf("JSONL source %s exceeded error threshold (%.1f%%), falling back", candidate.Path, stats.ErrorRate()*100))
+			continue
+		}
+		result.ParseStats = stats
+		for _, w := range bufferedWarnings {
+			emitParseWarning(w)
+		}
+		return issues, candidate.Path, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no valid issue source found in %s", beadsDir)
+	}
+	return nil, lastSourcePath, lastErr
 }
 
 func workspaceLoadResultIdentity(result LoadResult) string {
@@ -565,6 +798,9 @@ func workspaceLoadResultIdentity(result LoadResult) string {
 func knownRepoPrefixes(repos []RepoConfig) map[string]bool {
 	prefixes := make(map[string]bool, len(repos))
 	for _, repo := range repos {
+		if !repo.IsEnabled() {
+			continue
+		}
 		prefix := repo.GetPrefix()
 		if prefix != "" {
 			prefixes[prefix] = true
@@ -637,6 +873,29 @@ func (l *AggregateLoader) logRepoError(repoName string, err error) {
 	}
 }
 
+// ResolveWorkspaceBaseDir resolves the base directory against which relative
+// repository paths in a workspace configuration file are evaluated. Standard
+// <root>/.bv/workspace.yaml configs resolve against <root>; standalone config
+// files elsewhere (e.g., /tmp/ws.yaml) resolve against their own parent directory.
+func ResolveWorkspaceBaseDir(configPath string) string {
+	trimmed := strings.TrimSpace(configPath)
+	if trimmed == "" {
+		if wd, err := os.Getwd(); err == nil {
+			return filepath.Clean(wd)
+		}
+		return "."
+	}
+	cleaned := filepath.Clean(trimmed)
+	if abs, err := filepath.Abs(cleaned); err == nil {
+		cleaned = filepath.Clean(abs)
+	}
+	dir := filepath.Dir(cleaned)
+	if filepath.Base(dir) == ".bv" {
+		return filepath.Dir(dir)
+	}
+	return dir
+}
+
 // LoadAllFromConfig is a convenience function that loads a workspace config and all its repos
 func LoadAllFromConfig(ctx context.Context, configPath string) ([]model.Issue, []LoadResult, error) {
 	config, err := LoadConfig(configPath)
@@ -644,7 +903,7 @@ func LoadAllFromConfig(ctx context.Context, configPath string) ([]model.Issue, [
 		return nil, nil, fmt.Errorf("failed to load workspace config: %w", err)
 	}
 
-	workspaceRoot := filepath.Dir(filepath.Dir(configPath)) // .bv/workspace.yaml -> workspace root
+	workspaceRoot := ResolveWorkspaceBaseDir(configPath)
 	loader := NewAggregateLoader(config, workspaceRoot)
 
 	return loader.LoadAll(ctx)

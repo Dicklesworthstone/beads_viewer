@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
 )
 
@@ -78,7 +78,7 @@ func writeRobotSearchOutput(w io.Writer, out robotSearchOutput) error {
 }
 
 func resolveSearchConfig(modeFlag, presetFlag, weightsFlag string) (search.SearchConfig, error) {
-	mode, preset, weights := os.Getenv(search.EnvSearchMode), os.Getenv(search.EnvSearchPreset), os.Getenv(search.EnvSearchWeights)
+	mode, preset, weights := env.SearchMode.Get(), env.SearchPreset.Get(), env.SearchWeights.Get()
 	// Validate only inherited values. A selected preset owns the implied mode,
 	// and explicit text mode makes an inherited hybrid preset irrelevant.
 	if modeFlag != "" || presetFlag != "" {

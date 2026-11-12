@@ -2,7 +2,9 @@ package workspace_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"os"
@@ -11,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/workspace"
@@ -1288,4 +1292,191 @@ func TestAggregateLoaderDefaultsBeadsPath(t *testing.T) {
 		t.Fatalf("expected 1 issue, got %d", len(issues))
 	}
 	requireWorkspaceLoaderString(t, "namespaced ID", issues[0].ID, "svc-CUST-1")
+}
+
+func TestResolveWorkspaceBaseDirAndCustomConfigPath(t *testing.T) {
+	rootDir := t.TempDir()
+	stdConfigPath := filepath.Join(rootDir, ".bv", "workspace.yaml")
+	customDir := filepath.Join(t.TempDir(), "custom-configs")
+	customConfigPath := filepath.Join(customDir, "ws.yaml")
+
+	if got := workspace.ResolveWorkspaceBaseDir(stdConfigPath); got != filepath.Clean(rootDir) {
+		t.Fatalf("ResolveWorkspaceBaseDir(%q) = %q, want %q", stdConfigPath, got, filepath.Clean(rootDir))
+	}
+	if got := workspace.ResolveWorkspaceBaseDir(customConfigPath); got != filepath.Clean(customDir) {
+		t.Fatalf("ResolveWorkspaceBaseDir(%q) = %q, want %q", customConfigPath, got, filepath.Clean(customDir))
+	}
+
+	// End-to-end: custom config outside .bv/ resolves relative member paths
+	// against customDir rather than filepath.Dir(filepath.Dir(...)).
+	if err := os.MkdirAll(customDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	apiRepo := filepath.Join(customDir, "api")
+	createTestBeadsFile(t, apiRepo, []model.Issue{
+		{ID: "CUSTOM-1", Title: "From custom ws.yaml", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+	})
+	yamlBody := "name: custom-ws\nrepos:\n  - name: api\n    path: api\n    prefix: api-\n  - name: retired\n    path: api\n    prefix: api-\n    enabled: false\n"
+	if err := os.WriteFile(customConfigPath, []byte(yamlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	issues, results, err := workspace.LoadAllFromConfig(context.Background(), customConfigPath)
+	if err != nil {
+		t.Fatalf("LoadAllFromConfig(%q) error = %v", customConfigPath, err)
+	}
+	if len(issues) != 1 || issues[0].ID != "api-CUSTOM-1" {
+		t.Fatalf("loaded issues = %+v, want [api-CUSTOM-1]", issues)
+	}
+	summary := workspace.Summarize(results)
+	if summary.SuccessfulRepos != 1 || summary.DisabledRepos != 1 {
+		t.Fatalf("summary = %+v, want 1 successful and 1 disabled repo", summary)
+	}
+}
+
+func TestAggregateLoaderPrefersFresherSQLiteOverStaleJSONL(t *testing.T) {
+	wsRoot := t.TempDir()
+	apiRepo := filepath.Join(wsRoot, "api")
+	beadsDir := filepath.Join(apiRepo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write an older, stale issues.jsonl with only STALE-1.
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	staleJSONL := `{"id":"STALE-1","title":"Stale JSONL only","status":"open","priority":2,"issue_type":"task"}` + "\n"
+	if err := os.WriteFile(jsonlPath, []byte(staleJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	staleTime := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(jsonlPath, staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a newer SQLite beads.db in WAL mode with STALE-1, FRESH-SQLITE-2, and a tombstone GONE-3.
+	dbPath := filepath.Join(beadsDir, "beads.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	for _, stmt := range []string{
+		`PRAGMA journal_mode = WAL`,
+		`CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT DEFAULT '',
+			status TEXT NOT NULL,
+			priority INTEGER DEFAULT 2,
+			issue_type TEXT DEFAULT 'task',
+			created_at TEXT,
+			updated_at TEXT
+		)`,
+		`CREATE TABLE dependencies (
+			issue_id TEXT NOT NULL,
+			depends_on_id TEXT NOT NULL,
+			type TEXT DEFAULT 'blocks'
+		)`,
+		`INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) VALUES
+			('STALE-1', 'Updated in SQLite', 'open', 1, 'task', '2026-11-01T00:00:00Z', '2026-11-02T00:00:00Z'),
+			('FRESH-SQLITE-2', 'Committed only to SQLite WAL', 'in_progress', 1, 'feature', '2026-11-02T00:00:00Z', '2026-11-03T00:00:00Z'),
+			('GONE-3', 'Deleted in SQLite', 'tombstone', 3, 'task', '2026-11-01T00:00:00Z', '2026-11-03T00:00:00Z')`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("sqlite setup (%s): %v", stmt, err)
+		}
+	}
+
+	cfg := &workspace.Config{
+		Repos: []workspace.RepoConfig{
+			{Name: "api", Path: "api", Prefix: "api-"},
+		},
+	}
+	agg := workspace.NewAggregateLoader(cfg, wsRoot)
+	issues, results, err := agg.LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Error != nil {
+		t.Fatalf("results = %+v", results)
+	}
+	if filepath.Base(results[0].SourcePath) != "beads.db" {
+		t.Fatalf("SourcePath = %q, want beads.db", results[0].SourcePath)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("visible issues = %+v, want 2 non-tombstone SQLite issues", issues)
+	}
+	foundFresh := false
+	for _, iss := range issues {
+		if iss.ID == "api-FRESH-SQLITE-2" {
+			foundFresh = true
+		}
+		if iss.ID == "api-GONE-3" {
+			t.Fatalf("tombstone issue %q leaked into visible workspace issues", iss.ID)
+		}
+	}
+	if !foundFresh {
+		t.Fatalf("expected fresh SQLite issue api-FRESH-SQLITE-2 in %+v", issues)
+	}
+	if len(results[0].TombstoneIDs) != 1 || results[0].TombstoneIDs[0] != "api-GONE-3" {
+		t.Fatalf("TombstoneIDs = %v, want [api-GONE-3]", results[0].TombstoneIDs)
+	}
+	if results[0].ParseStats.Valid != 3 || results[0].ParseStats.Errors != 0 {
+		t.Fatalf("ParseStats = %+v, want Valid=3 Errors=0", results[0].ParseStats)
+	}
+}
+
+func TestAggregateLoaderCancelsHungBDRefreshPromptly(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell fake bd script")
+	}
+
+	wsRoot := t.TempDir()
+	bdRepo := filepath.Join(wsRoot, "dolt-svc")
+	beadsDir := filepath.Join(bdRepo, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Present stale issues.jsonl must NOT mask explicit caller context cancellation.
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(`{"id":"STALE-BD","title":"Stale","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	binDir := filepath.Join(wsRoot, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hungBD := "#!/bin/sh\nexec sleep 30\n"
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(hungBD), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg := &workspace.Config{
+		Repos: []workspace.RepoConfig{
+			{Name: "dolt-svc", Path: "dolt-svc", Prefix: "dolt-"},
+		},
+	}
+	agg := workspace.NewAggregateLoader(cfg, wsRoot)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, results, err := agg.LoadAll(ctx)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected LoadAll to fail when hung bd refresh is cancelled by context")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("LoadAll took %v after 120ms context timeout; expected prompt cancellation", elapsed)
+	}
+	if len(results) != 1 || !errors.Is(results[0].Error, context.DeadlineExceeded) {
+		t.Fatalf("results = %+v, want context.DeadlineExceeded", results)
+	}
 }

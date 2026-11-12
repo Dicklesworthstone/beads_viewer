@@ -175,11 +175,11 @@ func (m Model) renderSprintDashboard() string {
 		sb.WriteString("\n\n")
 	}
 
-	// At-risk items: the same four signals --robot-burndown reports
-	// (analysis.DetectAtRisk), so the TUI and robot agree.
+	// At-risk items: the same four signals and .bv/drift.yaml thresholds
+	// --robot-burndown reports (analysis.DetectAtRisk), so the TUI and robot agree.
 	sb.WriteString(labelStyle.Render("At Risk:"))
 	sb.WriteString("\n")
-	atRisk := analysis.DetectAtRisk(m.issues, sprint, now, analysis.DefaultAtRiskThresholds())
+	atRisk := analysis.DetectAtRisk(m.issues, sprint, now, m.sprintAtRiskThresholds)
 	if len(atRisk) == 0 {
 		sb.WriteString(t.Renderer.NewStyle().Foreground(t.Open).Render("  ✓ No at-risk items"))
 		sb.WriteString("\n")

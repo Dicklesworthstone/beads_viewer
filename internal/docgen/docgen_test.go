@@ -2,6 +2,8 @@ package docgen_test
 
 import (
 	"encoding/json"
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -55,6 +57,12 @@ func TestDocgen_RenderKeysTable(t *testing.T) {
 	table := docgen.RenderKeysTable()
 	if !strings.Contains(table, "| Context | Key | Action |") {
 		t.Errorf("keys table missing header")
+	}
+	if !strings.Contains(table, "Open in $EDITOR") {
+		t.Errorf("keys table missing literal 'Open in $EDITOR'")
+	}
+	if !strings.Contains(table, "`` ` ``") {
+		t.Errorf("keys table missing properly escaped backtick tutorial shortcut")
 	}
 }
 
@@ -126,5 +134,42 @@ Footer`
 	_, ok2 := docgen.ReplaceBetweenMarkers(input, "nonexistent", "new content")
 	if ok2 {
 		t.Errorf("expected false for nonexistent marker")
+	}
+}
+
+func TestDocgen_PreservesDollarLiterals(t *testing.T) {
+	input := "# Keys\n\n<!-- bv:generated:keys -->\nstale\n<!-- /bv:generated:keys -->\n"
+	replacementBody := strings.Join([]string{
+		"| `list,detail` | `O` | Open in $EDITOR |",
+		"| `shell` | `$1` | Positional arg $1 and ${PATH} |",
+		"| `cost` | `$$` | Double dollar $$ literal |",
+	}, "\n")
+
+	// Negative control: prove the old regexp.ReplaceAllString approach corrupts
+	// $EDITOR (and $$ / ${PATH} / $1) via regex capture-group template expansion.
+	legacyRe := regexp.MustCompile(`(?s)(<!--\s*bv:generated:keys\s*-->)(.*?)(<!--\s*/bv:generated(?::keys)?\s*-->)`)
+	legacyReplacement := fmt.Sprintf("${1}\n%s\n${3}", strings.TrimSpace(replacementBody))
+	corrupted := legacyRe.ReplaceAllString(input, legacyReplacement)
+	if strings.Contains(corrupted, "Open in $EDITOR") {
+		t.Fatalf("negative control failed: regexp.ReplaceAllString unexpectedly preserved $EDITOR:\n%s", corrupted)
+	}
+	if !strings.Contains(corrupted, "Open in  |") {
+		t.Fatalf("negative control failed: expected regexp.ReplaceAllString to strip $EDITOR into empty capture, got:\n%s", corrupted)
+	}
+
+	// Positive assertion: ReplaceBetweenMarkers preserves every dollar token verbatim.
+	got, ok := docgen.ReplaceBetweenMarkers(input, "keys", replacementBody)
+	if !ok {
+		t.Fatalf("ReplaceBetweenMarkers returned ok=false")
+	}
+
+	want := "# Keys\n\n<!-- bv:generated:keys -->\n" + replacementBody + "\n<!-- /bv:generated:keys -->\n"
+	if got != want {
+		t.Fatalf("ReplaceBetweenMarkers corrupted dollar literals:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	for _, literal := range []string{"Open in $EDITOR", "$1", "${PATH}", "$$"} {
+		if !strings.Contains(got, literal) {
+			t.Errorf("expected output to preserve literal %q, got:\n%s", literal, got)
+		}
 	}
 }

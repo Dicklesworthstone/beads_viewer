@@ -2,7 +2,7 @@
 # release_gate.sh: the single pre-release check. Every stage must pass; the
 # gate writes its log and receipt outside the source checkout. Only a clean,
 # complete receipt permits packaging; diagnostic skips never authorize release.
-# Usage: release_gate.sh [run|verify-toolchain|audit|verify-source|verify-binary PATH|package|seal DIR|verify]
+# Usage: release_gate.sh [run|preflight|verify-toolchain|audit|verify-source|verify-binary PATH|package|seal DIR|verify]
 # Set RELEASE_GATE_RECEIPT to the receipt printed by `run` for later commands.
 #
 # Stages:
@@ -45,7 +45,7 @@ export GOWORK=off CGO_ENABLED=0 GOTOOLCHAIN=local
 # outside it. It never executes a packaged binary or extracts archive paths.
 receipt() {
   python3 - "$root" "${RELEASE_GATE_RECEIPT:-}" "$@" <<'PY'
-import hashlib, json, os, pathlib, re, stat, subprocess, sys, tarfile, tempfile, zipfile
+import hashlib, json, os, pathlib, re, shutil, stat, subprocess, sys, tarfile, tempfile, zipfile
 from datetime import datetime, timezone
 
 root = pathlib.Path(sys.argv[1]).resolve()
@@ -94,13 +94,16 @@ def source():
             h.update(b"missing-or-non-file")
     dirty = run("git", "status", "--porcelain=v1", "--untracked-files=all")
     # Ignored Go/embed inputs still affect builds. Build caches outside these
-    # declared source directories are not inputs to the release binary.
-    ignored = run("git", "ls-files", "--others", "--ignored", "--exclude-standard",
-                  "--", "cmd", "pkg", "internal", "vendor", "go.work", "go.work.sum")
+    # declared source directories and non-embedded test artifacts (rapid .fail
+    # seeds and as-of HTML test exports) are not inputs to the release binary.
+    ignored_raw = run("git", "ls-files", "--others", "--ignored", "--exclude-standard",
+                      "--", "cmd", "pkg", "internal", "vendor", "go.work", "go.work.sum")
+    ignored = [p for p in ignored_raw.splitlines()
+               if not re.search(r"(^|/)(\.beads|testdata/rapid)(/|$)|graph_export__as_of__.*\.html$", p)]
     return {"revision": run("git", "rev-parse", "HEAD"),
             "tree": run("git", "rev-parse", "HEAD^{tree}"),
             "inputs_sha256": h.hexdigest(), "dirty": dirty.splitlines(),
-            "ignored_build_inputs": ignored.splitlines()}
+            "ignored_build_inputs": ignored}
 
 def stable_version(version, prefix):
     match = re.fullmatch(re.escape(prefix) + r"(\d+)\.(\d+)\.(\d+)", version)
@@ -115,7 +118,7 @@ def validate_go_flags(flags):
     if not re.fullmatch(r"(?:-p=[1-9][0-9]*)?", flags.strip()):
         fail("unsupported release GOFLAGS: only empty flags or a single -p=N are allowed")
 
-def module_policy():
+def go_mod_policy():
     validate_go_flags(os.environ.get("GOFLAGS", ""))
     # Empty caller GOFLAGS can fall back to settings persisted in GOENV.
     # Validate those before any module command can consume external inputs.
@@ -137,21 +140,45 @@ def module_policy():
     replacements = {row["Old"]["Path"]: row["New"] for row in module.get("Replace") or []}
     if "golang.org/x/net" in replacements:
         fail("golang.org/x/net must use its verified upstream module, not a replacement")
+    return {"toolchain": intended, "dependencies": dependencies, "replacements": replacements, "net_version": net_version}
+
+def module_policy():
+    policy = go_mod_policy()
+    net_version = policy.pop("net_version")
     # Go validates the complete vendor/modules.txt declaration set before
     # listing a module, so a stale vendored version cannot pass this preflight.
     selected = json.loads(run("go", "list", "-mod=vendor", "-m", "-json", "golang.org/x/net"))
     if selected.get("Version") != net_version or selected.get("Replace"):
         fail("selected golang.org/x/net does not match go.mod")
-    return {"toolchain": intended, "dependencies": dependencies, "replacements": replacements}
+    return policy
+
+def cached_toolchain_hint(intended):
+    candidates = []
+    for base in (os.environ.get("GOMODCACHE", ""), "/data/ssd/cache/go-mod",
+                 str(pathlib.Path.home() / "go/pkg/mod")):
+        if not base:
+            continue
+        dl = pathlib.Path(base) / "golang.org"
+        if not dl.is_dir():
+            continue
+        for entry in sorted(dl.glob(f"toolchain@*-{intended}.*")):
+            go_bin = entry / "bin" / "go"
+            if go_bin.is_file() and os.access(go_bin, os.X_OK):
+                candidates.append(str(entry / "bin"))
+    if candidates:
+        return f'; hint: prepend PATH="{candidates[0]}:$PATH" GOTOOLCHAIN=local'
+    return ""
 
 def toolchain():
     validate_go_flags(os.environ.get("GOFLAGS", ""))
     actual = json.loads(run("go", "env", "-json", "GOVERSION", "GOHOSTOS", "GOHOSTARCH",
                             "GOEXPERIMENT", "GOTOOLCHAIN", "GOFLAGS", "GOWORK", "CGO_ENABLED"))
     validate_go_flags(actual["GOFLAGS"])
-    intended = module_policy()["toolchain"]
+    intended = go_mod_policy()["toolchain"]
     if actual["GOVERSION"] != intended or actual["GOTOOLCHAIN"] != "local":
-        fail(f"release requires {intended} with GOTOOLCHAIN=local; selected {actual['GOVERSION']}")
+        hint = cached_toolchain_hint(intended)
+        fail(f"release requires {intended} with GOTOOLCHAIN=local; selected {actual['GOVERSION']}{hint}")
+    module_policy()
     return actual
 
 def dataset():
@@ -411,6 +438,51 @@ try:
         actual = toolchain()
         policy = module_policy()
         print(f"release toolchain verified: {actual['GOVERSION']}; golang.org/x/net {policy['dependencies']['golang.org/x/net']}")
+    elif mode == "preflight":
+        actual = toolchain()
+        policy = module_policy()
+        src = source()
+        ds = dataset()
+        if ds["sha256"] is None:
+            fail(f"missing frozen benchmark dataset: {ds['path']}")
+        pwsh_cmd = os.environ.get("PWSH", "pwsh")
+        goreleaser_bin = shutil.which("goreleaser")
+        pwsh_bin = shutil.which(pwsh_cmd)
+        shellcheck_bin = shutil.which("shellcheck")
+        govulncheck_bin = shutil.which("govulncheck")
+        govulncheck_status = "install_on_audit_v1.9.0"
+        if govulncheck_bin:
+            try:
+                scanner_info(govulncheck_bin)
+                govulncheck_status = f"pinned_v1.9.0 ({govulncheck_bin})"
+            except SystemExit:
+                govulncheck_status = f"path_unpinned_will_install_v1.9.0 ({govulncheck_bin})"
+        skip_helpers = []
+        if not goreleaser_bin:
+            skip_helpers.append("goreleaser (stage 10 packaging live-run skipped; package subcommand fails closed)")
+        if not pwsh_bin:
+            skip_helpers.append(f"{pwsh_cmd} (stage 10 install_ps1_test skipped)")
+        clean_source = not src["dirty"] and not src["ignored_build_inputs"]
+        report = {
+            "clean_source": clean_source,
+            "dirty": src["dirty"],
+            "ignored_build_inputs": src["ignored_build_inputs"],
+            "revision": src["revision"],
+            "toolchain": actual["GOVERSION"],
+            "gotoolchain": actual["GOTOOLCHAIN"],
+            "x_net": policy["dependencies"]["golang.org/x/net"],
+            "govulncheck": govulncheck_status,
+            "helpers": {
+                "goreleaser": goreleaser_bin or "missing (skip-200 in stage 10; fail-closed in package)",
+                "pwsh": pwsh_bin or "missing (skip-200 in stage 10)",
+                "shellcheck": shellcheck_bin or "missing (optional static lint)",
+            },
+            "release_eligible_if_run_now": bool(clean_source and goreleaser_bin and pwsh_bin),
+            "stage_10_skip_notes": skip_helpers,
+        }
+        print(json.dumps(report, indent=2, sort_keys=True))
+        if not clean_source and os.environ.get("RELEASE_GATE_ALLOW_DIRTY_PREFLIGHT") != "1":
+            fail("preflight found dirty or undeclared build inputs (commit/clean before release gate)")
     elif mode == "audit":
         audit_source()
     elif mode == "init":
@@ -542,7 +614,8 @@ PY
 
 case "${1:-run}" in
   verify-toolchain|verify-source|verify-binary|seal|verify) receipt "$@"; exit $? ;;
-  audit) RELEASE_GATE_RECEIPT= receipt audit; exit $? ;;
+  preflight) RELEASE_GATE_RECEIPT="" receipt preflight; exit $? ;;
+  audit) RELEASE_GATE_RECEIPT="" receipt audit; exit $? ;;
   package)
     receipt verify-source || exit 1
     # GoReleaser creates its dist directory; never clean/delete an existing one.
@@ -558,7 +631,7 @@ case "${1:-run}" in
     exit $?
     ;;
   run) ;;
-  *) echo "usage: $0 [run|verify-toolchain|audit|verify-source|verify-binary PATH|package|seal DIR|verify]" >&2; exit 2 ;;
+  *) echo "usage: $0 [run|preflight|verify-toolchain|audit|verify-source|verify-binary PATH|package|seal DIR|verify]" >&2; exit 2 ;;
 esac
 
 ts="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -686,16 +759,26 @@ benchmarks() {
 script_self_tests() {
   # The gate's own helpers have tests; a comparator that mis-parses a column
   # or an installer that stops failing closed must not pass silently.
+  local helper_skipped=0 rc=0
   tests/scripts/benchmark_compare_test.sh || return 1
   # Fixture scanner responses are synthetic to test orchestration and failure
   # rejection; Go/GoReleaser packaging is real. Stage 11 runs the required real
   # project source vulnerability scans, including access to the real database.
-  bash tests/scripts/release_gate_test.sh gate-mechanics || return 1
+  bash tests/scripts/release_gate_test.sh gate-mechanics
+  rc=$?
+  if [ "$rc" -eq 200 ]; then
+    helper_skipped=1
+  elif [ "$rc" -ne 0 ]; then
+    return "$rc"
+  fi
   local pwsh="${PWSH:-pwsh}"
   if command -v "$pwsh" >/dev/null 2>&1; then
     PWSH="$pwsh" tests/scripts/install_ps1_test.sh || return 1
   else
     echo "install_ps1_test skipped: pwsh not found (set PWSH=/path/to/pwsh to include it)"
+    helper_skipped=1
+  fi
+  if [ "$helper_skipped" -eq 1 ]; then
     return 200
   fi
 }

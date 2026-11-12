@@ -50,5 +50,14 @@ done < <(find "$dir" -maxdepth 1 -type f | sort)
 echo "verify_vendor: $listed manifest entries checked, $problems problem(s)"
 [ "$problems" -eq 0 ]
 if [ "$source_check" -eq 1 ]; then
-  bash scripts/build_graph_wasm.sh
+  verify_tmp="$(mktemp -d "${TMPDIR:-/tmp}/bv-verify-vendor.XXXXXX")"
+  cleanup_verify_tmp() {
+    local rc=$?
+    if [ -n "${verify_tmp:-}" ] && [ -d "$verify_tmp" ]; then
+      rm -rf "$verify_tmp"
+    fi
+    exit "$rc"
+  }
+  trap cleanup_verify_tmp EXIT
+  bash scripts/build_graph_wasm.sh --out-dir "$verify_tmp/graph-wasm"
 fi

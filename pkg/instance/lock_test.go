@@ -2,8 +2,13 @@ package instance
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -441,4 +446,224 @@ func writeLockInfoForTest(t *testing.T, path string, info LockInfo) {
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		t.Fatalf("writing lock info: %v", err)
 	}
+}
+
+func TestClassifySignalZeroErr_EPERMIsAlive(t *testing.T) {
+	if !classifySignalZeroErr(nil) {
+		t.Fatal("nil error must classify as alive")
+	}
+	if !classifySignalZeroErr(syscall.EPERM) {
+		t.Fatal("EPERM must classify as alive (process owned by different UID)")
+	}
+	if !classifySignalZeroErr(fmt.Errorf("wrapped: %w", syscall.EPERM)) {
+		t.Fatal("wrapped EPERM must classify as alive")
+	}
+	if classifySignalZeroErr(syscall.ESRCH) {
+		t.Fatal("ESRCH must classify as dead")
+	}
+	if classifySignalZeroErr(os.ErrProcessDone) {
+		t.Fatal("ErrProcessDone must classify as dead")
+	}
+}
+
+func TestNewLock_EPERMSameHostLockNotStolen(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix signal(0) EPERM semantics apply to non-Windows hosts")
+	}
+
+	const localHost = "local-workstation"
+	const otherUIDPID = 424242
+
+	lockHooksMu.Lock()
+	origHost := hostnameFunc
+	origSignal := signalZeroOverride
+	hostnameFunc = func() (string, error) { return localHost, nil }
+	signalZeroOverride = func(pid int) error {
+		if pid == otherUIDPID {
+			return syscall.EPERM
+		}
+		return syscall.ESRCH
+	}
+	lockHooksMu.Unlock()
+	t.Cleanup(func() {
+		lockHooksMu.Lock()
+		hostnameFunc = origHost
+		signalZeroOverride = origSignal
+		lockHooksMu.Unlock()
+	})
+
+	tmpDir := t.TempDir()
+	lockPath := filepath.Join(tmpDir, LockFileName)
+	initial := LockInfo{
+		PID:       otherUIDPID,
+		StartedAt: time.Now().Add(-2 * time.Hour),
+		Hostname:  localHost,
+		OwnerID:   "other-uid-owner",
+	}
+	writeLockInfoForTest(t, lockPath, initial)
+
+	lock, err := NewLock(tmpDir)
+	if err != nil {
+		t.Fatalf("NewLock failed: %v", err)
+	}
+	defer lock.Release()
+
+	if lock.IsFirstInstance() {
+		t.Fatal("EPERM PID on same host must be treated as running; lock must not be stolen")
+	}
+	if lock.HolderPID() != otherUIDPID {
+		t.Fatalf("HolderPID() = %d, want %d", lock.HolderPID(), otherUIDPID)
+	}
+
+	got, err := readLockFile(lockPath)
+	if err != nil {
+		t.Fatalf("reading lock file: %v", err)
+	}
+	if got.OwnerID != initial.OwnerID {
+		t.Fatalf("lock file owner mutated: got %q, want %q", got.OwnerID, initial.OwnerID)
+	}
+}
+
+func TestNewLock_ForeignHostnameLeaseGuard(t *testing.T) {
+	const (
+		localHost   = "node-alpha"
+		foreignHost = "node-beta"
+		foreignPID  = 99999999
+		testTTL     = 5 * time.Minute
+	)
+
+	var localPIDProbes atomic.Int64
+
+	lockHooksMu.Lock()
+	origHost := hostnameFunc
+	origTTL := foreignHostLeaseTTL
+	origAlive := processAliveFunc
+	hostnameFunc = func() (string, error) { return localHost, nil }
+	foreignHostLeaseTTL = testTTL
+	processAliveFunc = func(pid int) bool {
+		localPIDProbes.Add(1)
+		return isProcessAlive(pid)
+	}
+	lockHooksMu.Unlock()
+	t.Cleanup(func() {
+		lockHooksMu.Lock()
+		hostnameFunc = origHost
+		foreignHostLeaseTTL = origTTL
+		processAliveFunc = origAlive
+		lockHooksMu.Unlock()
+	})
+
+	t.Run("active foreign lease is preserved without probing local PID table", func(t *testing.T) {
+		localPIDProbes.Store(0)
+		tmpDir := t.TempDir()
+		lockPath := filepath.Join(tmpDir, LockFileName)
+		activeForeign := LockInfo{
+			PID:       foreignPID,
+			StartedAt: time.Now().Add(-1 * time.Minute),
+			Hostname:  foreignHost,
+			OwnerID:   "foreign-active-owner",
+		}
+		writeLockInfoForTest(t, lockPath, activeForeign)
+
+		lock, err := NewLock(tmpDir)
+		if err != nil {
+			t.Fatalf("NewLock failed: %v", err)
+		}
+		defer lock.Release()
+
+		if lock.IsFirstInstance() {
+			t.Fatal("active foreign-host lock must not be taken over")
+		}
+		if lock.HolderPID() != foreignPID {
+			t.Fatalf("HolderPID() = %d, want %d", lock.HolderPID(), foreignPID)
+		}
+		if probes := localPIDProbes.Load(); probes != 0 {
+			t.Fatalf("foreign-host lock probed local PID table %d times, want 0", probes)
+		}
+
+		got, err := readLockFile(lockPath)
+		if err != nil {
+			t.Fatalf("reading lock file: %v", err)
+		}
+		if got.OwnerID != activeForeign.OwnerID {
+			t.Fatalf("active foreign lock was overwritten: got owner %q, want %q", got.OwnerID, activeForeign.OwnerID)
+		}
+	})
+
+	t.Run("expired foreign lease is recovered after TTL without probing local PID table", func(t *testing.T) {
+		selfPID := os.Getpid()
+		localPIDProbes.Store(0)
+		tmpDir := t.TempDir()
+		lockPath := filepath.Join(tmpDir, LockFileName)
+		expiredForeign := LockInfo{
+			PID:       foreignPID,
+			StartedAt: time.Now().Add(-2 * testTTL),
+			Hostname:  foreignHost,
+			OwnerID:   "foreign-expired-lease",
+		}
+		writeLockInfoForTest(t, lockPath, expiredForeign)
+
+		lock, err := NewLock(tmpDir)
+		if err != nil {
+			t.Fatalf("NewLock failed: %v", err)
+		}
+		defer lock.Release()
+
+		if !lock.IsFirstInstance() {
+			t.Fatal("expired foreign-host lock should be recovered")
+		}
+		if lock.HolderPID() != selfPID {
+			t.Fatalf("HolderPID() = %d, want %d", lock.HolderPID(), selfPID)
+		}
+		if probes := localPIDProbes.Load(); probes != 0 {
+			t.Fatalf("foreign-host lock probed local PID table %d times, want 0", probes)
+		}
+
+		got, err := readLockFile(lockPath)
+		if err != nil {
+			t.Fatalf("reading lock file after takeover: %v", err)
+		}
+		if got.Hostname != localHost || got.PID != selfPID {
+			t.Fatalf("unexpected takeover lock info: %+v", got)
+		}
+	})
+}
+
+func TestLock_ConcurrentMethodsRace(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	primary, err := NewLock(tmpDir)
+	if err != nil {
+		t.Fatalf("NewLock(primary) failed: %v", err)
+	}
+
+	secondary, err := NewLock(tmpDir)
+	if err != nil {
+		primary.Release()
+		t.Fatalf("NewLock(secondary) failed: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 25; j++ {
+				_ = primary.IsFirstInstance()
+				_ = primary.HolderPID()
+				_ = primary.Path()
+				_ = secondary.IsFirstInstance()
+				_ = secondary.HolderPID()
+				_ = secondary.Path()
+				secondary.checkStale()
+				if id%4 == 0 && j == 12 {
+					primary.Release()
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	primary.Release()
+	secondary.Release()
 }

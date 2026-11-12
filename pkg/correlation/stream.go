@@ -128,8 +128,8 @@ func (s *StreamExtractor) StreamEvents(opts StreamOptions) ([]BeadEvent, error) 
 		}
 	}
 
-	// Reverse to chronological order
-	reverseEvents(events)
+	// Reverse commit blocks to chronological order while preserving within-commit order
+	reverseCommitEventGroups(events)
 
 	return events, nil
 }
@@ -351,6 +351,11 @@ func (s *StreamExtractor) parseBufferedDiff(lines []string, info commitInfo, fil
 		if !hadOld && hasNew {
 			event.EventType = EventCreated
 			events = append(events, event)
+			if synth, ok := synthesizedCreationMilestone(event, newSnap.Status); ok {
+				if closedSince == nil || synth.EventType != EventClosed || !info.Timestamp.Before(*closedSince) {
+					events = append(events, synth)
+				}
+			}
 		} else if hadOld && hasNew {
 			if oldSnap.Status != newSnap.Status {
 				event.EventType = determineStatusEvent(oldSnap.Status, newSnap.Status)

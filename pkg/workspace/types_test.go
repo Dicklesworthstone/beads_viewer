@@ -612,3 +612,83 @@ func TestIDResolverDisabledRepos(t *testing.T) {
 		t.Error("Disabled repo prefix should not be recognized")
 	}
 }
+
+func TestConfigValidateDisabledRepos(t *testing.T) {
+	disabled := false
+	enabled := true
+
+	tests := []struct {
+		name    string
+		config  workspace.Config
+		wantErr bool
+	}{
+		{
+			name: "disabled repo with duplicate prefix passes Validate",
+			config: workspace.Config{
+				Repos: []workspace.RepoConfig{
+					{Name: "api-active", Path: "services/api", Prefix: "api-", Enabled: &enabled},
+					{Name: "api-retired", Path: "legacy/api", Prefix: "api-", Enabled: &disabled},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "disabled repo with duplicate normalized source repo key passes Validate",
+			config: workspace.Config{
+				Repos: []workspace.RepoConfig{
+					{Name: "api", Path: "services/api", Prefix: "api-", Enabled: &enabled},
+					{Name: "api-old", Path: "services/api-old", Prefix: "api_", Enabled: &disabled},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "disabled repo with empty path passes Validate",
+			config: workspace.Config{
+				Repos: []workspace.RepoConfig{
+					{Name: "api", Path: "services/api", Prefix: "api-", Enabled: &enabled},
+					{Name: "retired-no-path", Path: "", Prefix: "old-", Enabled: &disabled},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "all disabled repos without discovery fails Validate",
+			config: workspace.Config{
+				Repos: []workspace.RepoConfig{
+					{Name: "api-retired", Path: "legacy/api", Prefix: "api-", Enabled: &disabled},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "all disabled repos with discovery enabled passes Validate",
+			config: workspace.Config{
+				Discovery: workspace.DiscoveryConfig{Enabled: true},
+				Repos: []workspace.RepoConfig{
+					{Name: "api-retired", Path: "legacy/api", Prefix: "api-", Enabled: &disabled},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "two enabled repos with duplicate prefix fails Validate",
+			config: workspace.Config{
+				Repos: []workspace.RepoConfig{
+					{Name: "api-1", Path: "services/api1", Prefix: "api-", Enabled: &enabled},
+					{Name: "api-2", Path: "services/api2", Prefix: "api-", Enabled: &enabled},
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}

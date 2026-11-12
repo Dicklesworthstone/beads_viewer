@@ -135,6 +135,8 @@ type phaseTwoRobotHandlerConfig struct {
 	RobotPlanFlag       *bool
 	RobotPriorityFlag   *bool
 	RobotAlertsFlag     *bool
+	RobotDriftFlag      *bool
+	CheckDriftFlag      *bool
 	RobotSuggestFlag    *bool
 	RobotBurndownFlag   *string
 	RobotForecastFlag   *string
@@ -143,6 +145,7 @@ type phaseTwoRobotHandlerConfig struct {
 	RobotSearchFlag     *bool
 	RobotDiffFlag       *bool
 	ForceFullAnalysis   *bool
+	IncludeInactive     *bool
 	GraphFormat         *string
 	GraphRoot           *string
 	GraphDepth          *int
@@ -166,6 +169,7 @@ type phaseThreeRobotHandlerConfig struct {
 	RobotTriageFlag         *bool
 	RobotTriageBriefFlag    *bool
 	IncludeInactive         *bool
+	RobotMaxResults         *int
 	RobotTriageByTrackFlag  *bool
 	RobotTriageByLabelFlag  *bool
 	RobotNextFlag           *bool
@@ -340,7 +344,7 @@ func unsupportedScopeFor(command string, ctx RobotContext) []string {
 		return nil
 	}
 	switch normalizeRobotFlagName(command) {
-	case "robot-history", "robot-orphans", "robot-file-beads", "robot-file-hotspots",
+	case "robot-history", "bead-history", "robot-orphans", "robot-file-beads", "robot-file-hotspots",
 		"robot-file-relations", "robot-impact-network", "robot-related",
 		"robot-explain-correlation", "robot-confirm-correlation", "robot-reject-correlation",
 		"robot-correlation-stats", "robot-impact",
@@ -433,6 +437,193 @@ func (r *RobotRegistry) AnyActive() bool {
 		}
 	}
 	return false
+}
+
+// AnyRobotModeActive reports whether any primary robot command registered in r
+// (excluding non-robot metadata commands like --version and modifiers) is active.
+func (r *RobotRegistry) AnyRobotModeActive() bool {
+	if r == nil {
+		return false
+	}
+	for _, cmd := range r.commands {
+		if cmd.IsModifier || cmd.FlagName == "version" {
+			continue
+		}
+		if robotFlagActive(cmd.FlagPtr) {
+			return true
+		}
+	}
+	return false
+}
+
+// AllFlagNames returns the normalized CLI flag names registered in r
+// (excluding modifiers) in deterministic sorted order.
+func (r *RobotRegistry) AllFlagNames() []string {
+	if r == nil {
+		return nil
+	}
+	names := make([]string, 0, len(r.commands))
+	for _, cmd := range r.commands {
+		if cmd.IsModifier {
+			continue
+		}
+		names = append(names, cmd.FlagName)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// PrimaryRobotFlagNames returns the normalized CLI flag names of primary robot
+// commands in r (excluding modifiers and --version) in deterministic sorted order.
+func (r *RobotRegistry) PrimaryRobotFlagNames() []string {
+	if r == nil {
+		return nil
+	}
+	names := make([]string, 0, len(r.commands))
+	for _, cmd := range r.commands {
+		if cmd.IsModifier || cmd.FlagName == "version" {
+			continue
+		}
+		names = append(names, cmd.FlagName)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func anyRobotModeActive(registries ...*RobotRegistry) bool {
+	for _, reg := range registries {
+		if reg != nil && reg.AnyRobotModeActive() {
+			return true
+		}
+	}
+	return false
+}
+
+func allPrimaryRobotFlagNames(registries ...*RobotRegistry) []string {
+	seen := make(map[string]struct{})
+	for _, reg := range registries {
+		for _, name := range reg.PrimaryRobotFlagNames() {
+			seen[name] = struct{}{}
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// configuredPrimaryRobotFlagNames constructs an isolated dry-run copy of the
+// Phase 1/2/3 robot registries so callers (including primaryRobotFlagNames()
+// and contract tests) derive the complete primary command set from a single
+// registration source of truth.
+func configuredPrimaryRobotFlagNames() []string {
+	var dummyBool bool
+	var dummyStr string
+	var dummyInt int
+	var dummyFloat float64
+
+	r1 := newRobotRegistry()
+	registerPhaseOneRobotHandlers(&r1, phaseOneRobotHandlerConfig{
+		RobotHelpFlag:         &dummyBool,
+		RobotCapabilitiesFlag: &dummyBool,
+		RobotSchemaFlag:       &dummyBool,
+		RobotRecipesFlag:      &dummyBool,
+		RobotMetricsFlag:      &dummyBool,
+		RobotDocsFlag:         &dummyStr,
+		VersionFlag:           &dummyBool,
+		SchemaCommand:         &dummyStr,
+	})
+	r2 := newRobotRegistry()
+	registerPhaseTwoRobotHandlers(&r2, phaseTwoRobotHandlerConfig{
+		RobotPlanFlag:       &dummyBool,
+		RobotPriorityFlag:   &dummyBool,
+		RobotAlertsFlag:     &dummyBool,
+		RobotDriftFlag:      &dummyBool,
+		CheckDriftFlag:      &dummyBool,
+		RobotSuggestFlag:    &dummyBool,
+		RobotBurndownFlag:   &dummyStr,
+		RobotForecastFlag:   &dummyStr,
+		RobotSprintListFlag: &dummyBool,
+		RobotGraphFlag:      &dummyBool,
+		RobotSearchFlag:     &dummyBool,
+		RobotDiffFlag:       &dummyBool,
+		ForceFullAnalysis:   &dummyBool,
+		IncludeInactive:     &dummyBool,
+		GraphFormat:         &dummyStr,
+		GraphRoot:           &dummyStr,
+		GraphDepth:          &dummyInt,
+		AlertSeverity:       &dummyStr,
+		AlertType:           &dummyStr,
+		AlertLabel:          &dummyStr,
+		SuggestType:         &dummyStr,
+		SuggestConfidence:   &dummyFloat,
+		SuggestBead:         &dummyStr,
+		RobotMinConf:        &dummyFloat,
+		RobotMaxResults:     &dummyInt,
+		RobotByLabel:        &dummyStr,
+		RobotByAssignee:     &dummyStr,
+		ForecastLabel:       &dummyStr,
+		ForecastSprint:      &dummyStr,
+		ForecastAgents:      &dummyInt,
+	})
+	r3 := newRobotRegistry()
+	registerPhaseThreeRobotHandlers(&r3, phaseThreeRobotHandlerConfig{
+		RobotInsightsFlag:       &dummyBool,
+		RobotTriageFlag:         &dummyBool,
+		RobotTriageBriefFlag:    &dummyBool,
+		IncludeInactive:         &dummyBool,
+		RobotMaxResults:         &dummyInt,
+		RobotTriageByTrackFlag:  &dummyBool,
+		RobotTriageByLabelFlag:  &dummyBool,
+		RobotNextFlag:           &dummyBool,
+		RobotHistoryFlag:        &dummyBool,
+		RobotLabelHealthFlag:    &dummyBool,
+		RobotLabelFlowFlag:      &dummyBool,
+		RobotLabelAttentionFlag: &dummyBool,
+		GraphRoot:               &dummyStr,
+		BeadHistoryFlag:         &dummyStr,
+		RobotExplainCorrFlag:    &dummyStr,
+		RobotConfirmCorrFlag:    &dummyStr,
+		RobotRejectCorrFlag:     &dummyStr,
+		RobotCorrStatsFlag:      &dummyBool,
+		CorrelationFeedbackBy:   &dummyStr,
+		CorrelationReason:       &dummyStr,
+		RobotOrphansFlag:        &dummyBool,
+		OrphansMinScore:         &dummyInt,
+		RobotFileBeadsFlag:      &dummyStr,
+		FileBeadsLimit:          &dummyInt,
+		RobotFileHotspotsFlag:   &dummyBool,
+		HotspotsLimit:           &dummyInt,
+		RobotImpactFlag:         &dummyStr,
+		ForceFullAnalysis:       &dummyBool,
+		HistoryLimit:            &dummyInt,
+		HistoryTimeoutMs:        &dummyInt,
+		HistorySince:            &dummyStr,
+		MinConfidence:           &dummyFloat,
+		AttentionLimit:          &dummyInt,
+		RelationsThreshold:      &dummyFloat,
+		RelationsLimit:          &dummyInt,
+		RelatedMinRelevance:     &dummyInt,
+		RelatedMaxResults:       &dummyInt,
+		RelatedIncludeClosed:    &dummyBool,
+		NetworkDepth:            &dummyInt,
+		ForecastLabel:           &dummyStr,
+		ForecastSprint:          &dummyStr,
+		ForecastAgents:          &dummyInt,
+		RobotFileRelationsFlag:  &dummyStr,
+		RobotRelatedFlag:        &dummyStr,
+		RobotBlockerChainFlag:   &dummyStr,
+		RobotImpactNetworkFlag:  &dummyStr,
+		RobotCausalityFlag:      &dummyStr,
+		RobotSprintShowFlag:     &dummyStr,
+		RobotCapacityFlag:       &dummyBool,
+		CapacityAgents:          &dummyInt,
+		CapacityLabel:           &dummyStr,
+		NotReadyLabels:          &dummyStr,
+	})
+	return allPrimaryRobotFlagNames(&r1, &r2, &r3)
 }
 
 func (r *RobotRegistry) ActiveCommands() []RobotCommand {
@@ -933,7 +1124,8 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			stats := analyzer.AnalyzeAsyncWithConfig(context.Background(), config)
 			stats.WaitForPhase2()
 
-			recommendations := analyzer.GenerateEnhancedRecommendations()
+			includeInactive := cfg.IncludeInactive != nil && *cfg.IncludeInactive
+			recommendations := analyzer.GenerateEnhancedRecommendationsFromStats(stats, analysis.DefaultThresholds(), 0, includeInactive)
 			filtered := make([]analysis.EnhancedPriorityRecommendation, 0, len(recommendations))
 			issueMap := make(map[string]model.Issue, len(ctx.Issues))
 			for _, issue := range ctx.Issues {
@@ -975,6 +1167,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 			if len(recommendations) > maxResults {
 				recommendations = recommendations[:maxResults]
+			}
+			if recommendations == nil {
+				recommendations = []analysis.EnhancedPriorityRecommendation{}
 			}
 
 			highConfidence := 0
@@ -1028,7 +1223,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				output.Filters.ByAssignee = *cfg.RobotByAssignee
 			}
 			output.Filters.MaxResults = maxResults
-			output.Summary.TotalIssues = len(ctx.Issues)
+			output.Summary.TotalIssues = analyzer.CountStatusPartition().Total
 			output.Summary.Recommendations = len(recommendations)
 			output.Summary.HighConfidence = highConfidence
 
@@ -1134,28 +1329,26 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			analyzer := ctx.Analyzer()
 			stats := analyzer.Analyze()
 
-			openCount, closedCount, blockedCount := 0, 0, 0
+			partition := analyzer.CountStatusPartition()
+			openCount := 0
 			for _, issue := range ctx.Issues {
-				switch issue.Status {
-				case model.StatusClosed:
-					closedCount++
-				case model.StatusBlocked:
-					blockedCount++
-				case model.StatusOpen, model.StatusInProgress:
+				if !analyzer.IsCandidate(issue.ID) {
+					continue
+				}
+				if issue.Status == model.StatusOpen || issue.Status == model.StatusInProgress {
 					openCount++
 				}
 			}
-			actionableCount := analyzer.CountActionableIssues()
 			cycles := stats.Cycles()
 			curStats := baseline.GraphStats{
 				NodeCount:       stats.NodeCount,
 				EdgeCount:       stats.EdgeCount,
 				Density:         stats.Density,
 				OpenCount:       openCount,
-				ClosedCount:     closedCount,
-				BlockedCount:    blockedCount,
+				ClosedCount:     partition.Closed,
+				BlockedCount:    partition.Blocked,
 				CycleCount:      len(cycles),
-				ActionableCount: actionableCount,
+				ActionableCount: partition.Actionable,
 			}
 
 			bl := &baseline.Baseline{Stats: curStats}
@@ -1262,6 +1455,132 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 
 			if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 				return fmt.Errorf("encoding alerts: %w", err)
+			}
+			return nil
+		},
+	})
+
+	registry.Register(RobotCommand{
+		Name:            "robot-drift",
+		FlagName:        "robot-drift",
+		FlagPtr:         cfg.RobotDriftFlag,
+		RequiredCoFlags: []string{"check-drift"},
+		Description:     "Output drift check from saved baseline as JSON (with --check-drift)",
+		Handler: func(ctx RobotContext) error {
+			projectDir, err := ctx.ProjectDirOrDefault()
+			if err != nil {
+				return fmt.Errorf("getting project directory: %w", err)
+			}
+			baselinePath, err := ctx.BaselinePathOrDefault()
+			if err != nil {
+				return fmt.Errorf("getting baseline path: %w", err)
+			}
+			if !baseline.Exists(baselinePath) {
+				fmt.Fprintln(ctx.StderrOrDefault(), "Error: No baseline found.")
+				fmt.Fprintln(ctx.StderrOrDefault(), "Create one with: bv --save-baseline \"description\"")
+				return newReportedRobotHandlerExit(1)
+			}
+
+			bl, err := baseline.Load(baselinePath)
+			if err != nil {
+				fmt.Fprintf(ctx.StderrOrDefault(), "Error loading baseline: %v\n", err)
+				return newReportedRobotHandlerExit(1)
+			}
+
+			driftNow := robotNow()
+			analyzer := ctx.Analyzer()
+			analyzer.SetNow(driftNow)
+			if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
+				fullCfg := analysis.FullAnalysisConfig()
+				analyzer.SetConfig(&fullCfg)
+			}
+			stats := analyzer.Analyze()
+
+			partition := analyzer.CountStatusPartition()
+			openCount := 0
+			for _, issue := range ctx.Issues {
+				if !analyzer.IsCandidate(issue.ID) {
+					continue
+				}
+				if issue.Status == model.StatusOpen || issue.Status == model.StatusInProgress {
+					openCount++
+				}
+			}
+			cycles := stats.Cycles()
+			currentStats := baseline.GraphStats{
+				NodeCount:       stats.NodeCount,
+				EdgeCount:       stats.EdgeCount,
+				Density:         stats.Density,
+				OpenCount:       openCount,
+				ClosedCount:     partition.Closed,
+				BlockedCount:    partition.Blocked,
+				CycleCount:      len(cycles),
+				ActionableCount: partition.Actionable,
+			}
+			currentMetrics := baseline.TopMetrics{
+				PageRank:     buildMetricItems(stats.PageRank(), 10),
+				Betweenness:  buildMetricItems(stats.Betweenness(), 10),
+				CriticalPath: buildMetricItems(stats.CriticalPathScore(), 10),
+				Hubs:         buildMetricItems(stats.Hubs(), 10),
+				Authorities:  buildMetricItems(stats.Authorities(), 10),
+			}
+			current := baseline.New(currentStats, currentMetrics, cycles, "current")
+
+			driftConfig, err := drift.LoadConfig(projectDir)
+			if err != nil {
+				if !ctx.EnvRobot {
+					fmt.Fprintf(ctx.StderrOrDefault(), "Warning: Error loading drift config: %v\n", err)
+				}
+				driftConfig = drift.DefaultConfig()
+			}
+
+			calc := drift.NewCalculator(bl, current, driftConfig)
+			calc.SetNow(driftNow)
+			calc.SetIssues(ctx.Issues)
+			if !calc.ReuseAnalyzer(analyzer) {
+				return fmt.Errorf("preparing drift check: issue rows do not match the scoped analyzer")
+			}
+			result := calc.Calculate()
+			alerts := result.Alerts
+			if alerts == nil {
+				alerts = []drift.Alert{}
+			}
+
+			output := struct {
+				RobotEnvelope
+				HasDrift bool `json:"has_drift"`
+				ExitCode int  `json:"exit_code"`
+				Summary  struct {
+					Total    int `json:"total"`
+					Critical int `json:"critical"`
+					Warning  int `json:"warning"`
+					Info     int `json:"info"`
+				} `json:"summary"`
+				Alerts        []drift.Alert        `json:"alerts"`
+				SkippedChecks []drift.SkippedCheck `json:"skipped_checks,omitempty"`
+				Baseline      struct {
+					CreatedAt string `json:"created_at"`
+					CommitSHA string `json:"commit_sha,omitempty"`
+				} `json:"baseline"`
+			}{
+				RobotEnvelope: ctx.Envelope(),
+				HasDrift:      result.HasDrift,
+				ExitCode:      result.ExitCode(),
+				Alerts:        alerts,
+				SkippedChecks: result.SkippedChecks,
+			}
+			output.Summary.Total = len(alerts)
+			output.Summary.Critical = result.CriticalCount
+			output.Summary.Warning = result.WarningCount
+			output.Summary.Info = result.InfoCount
+			output.Baseline.CreatedAt = bl.CreatedAt.Format(time.RFC3339)
+			output.Baseline.CommitSHA = bl.CommitSHA
+
+			if err := ctx.EncoderOrDefault().Encode(output); err != nil {
+				return fmt.Errorf("encoding drift result: %w", err)
+			}
+			if exitCode := result.ExitCode(); exitCode != 0 {
+				return newReportedRobotHandlerExit(exitCode)
 			}
 			return nil
 		},
@@ -1410,7 +1729,12 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			now := robotNow()
-			burndown := calculateBurndownAt(targetSprint, ctx.Issues, now)
+			projectDir, _ := ctx.ProjectDirOrDefault()
+			driftCfg, cfgErr := drift.LoadConfig(projectDir)
+			if cfgErr != nil || driftCfg == nil {
+				driftCfg = drift.DefaultConfig()
+			}
+			burndown := calculateBurndownAtWithThresholds(targetSprint, ctx.Issues, now, driftCfg.AtRiskThresholds())
 			burndown.RobotEnvelope = ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues))
 			issueMap := make(map[string]model.Issue, len(ctx.Issues))
 			for _, issue := range ctx.Issues {
@@ -1865,7 +2189,8 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		analyzer.SetConfig(&fullConfig)
 	}
 	stats := analyzer.Analyze()
-	insights := stats.GenerateInsights(50)
+	includeInactive := cfg.IncludeInactive != nil && *cfg.IncludeInactive
+	insights := analyzer.GenerateScopedInsights(&stats, 50, includeInactive)
 
 	if velocity := analysis.ComputeProjectVelocity(ctx.Issues, robotNow(), 8); velocity != nil {
 		snapshot := &analysis.VelocitySnapshot{
@@ -2197,10 +2522,15 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	if ctx.DataHashMatchesIssues {
 		seedHash = ctx.DataHash
 	}
+	maxResults := 0
+	if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+		maxResults = *cfg.RobotMaxResults
+	}
 	// bv-90: accept/ignore feedback tunes the factor weights once enough
 	// samples exist; the payload's feedback block reports whether it applied.
 	feedbackData, feedbackWeights := loadRobotFeedback()
 	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
+		TopN:           maxResults,
 		ActionableOnly: cfg.IncludeInactive == nil || !*cfg.IncludeInactive,
 		GroupByTrack:   cfg.RobotTriageByTrackFlag != nil && *cfg.RobotTriageByTrackFlag,
 		Readiness:      ctx.Readiness,
@@ -2214,6 +2544,9 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		NotReadyLabels: resolveNotReadyLabels(cfg),
 		Weights:        feedbackWeights,
 	}, now)
+	if maxResults > 0 && len(triage.QuickRef.TopPicks) > maxResults {
+		triage.QuickRef.TopPicks = triage.QuickRef.TopPicks[:maxResults]
+	}
 	stabilizeRobotTriageForPinnedClock(&triage)
 	triage.Meta.HistoryStatus = historyStatus
 	if !ctx.claimsProven() {
@@ -2882,14 +3215,16 @@ func handleRobotCorrelationStats(ctx RobotContext) error {
 
 	output := struct {
 		correlation.FeedbackStats
-		GeneratedAt  string `json:"generated_at"`
-		OutputFormat string `json:"output_format,omitempty"`
-		Version      string `json:"version,omitempty"`
+		GeneratedAt  string      `json:"generated_at"`
+		OutputFormat string      `json:"output_format,omitempty"`
+		Version      string      `json:"version,omitempty"`
+		Scope        *RobotScope `json:"scope,omitempty"`
 	}{
 		FeedbackStats: feedbackStore.GetStats(),
 		GeneratedAt:   robotNow().Format(time.RFC3339),
 		OutputFormat:  robotOutputFormat,
 		Version:       version.Version,
+		Scope:         ctx.Envelope().Scope,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding stats: %w", err)
@@ -2944,7 +3279,11 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 		explanation.Feedback = &fb
 		explanation.Recommendation = describeCorrelationFeedback(fb)
 	}
-	if err := ctx.EncoderOrDefault().Encode(explanation); err != nil {
+	enveloped, err := withEnvelope(ctx.EnvelopeWithHash(report.DataHash), explanation)
+	if err != nil {
+		return fmt.Errorf("explain correlation payload: %w", err)
+	}
+	if err := ctx.EncoderOrDefault().Encode(enveloped); err != nil {
 		return fmt.Errorf("encoding explanation: %w", err)
 	}
 	return nil
@@ -3024,7 +3363,11 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 		"reason":    reason,
 		"orig_conf": originalConf,
 	}
-	if err := ctx.EncoderOrDefault().Encode(result); err != nil {
+	enveloped, err := withEnvelope(ctx.EnvelopeWithHash(report.DataHash), result)
+	if err != nil {
+		return fmt.Errorf("correlation feedback payload: %w", err)
+	}
+	if err := ctx.EncoderOrDefault().Encode(enveloped); err != nil {
 		return fmt.Errorf("encoding result: %w", err)
 	}
 	return nil
@@ -3559,6 +3902,9 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	}
 
 	longestChain := longestCapacityChain(actionable, blocks)
+	if longestChain == nil {
+		longestChain = []string{}
+	}
 
 	serialMinutes := 0
 	for _, id := range longestChain {
@@ -3573,8 +3919,21 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	if totalMinutes > 0 {
 		parallelizablePct = float64(parallelMinutes) / float64(totalMinutes) * 100
 	}
+	graham := analysis.ComputeGrahamBounds(openIssues, ctx.Issues, &graphStats, agents, now)
+	velPerDay := graham.VelocityMinutesPerDay
+	if velPerDay <= 0 {
+		velPerDay = 60.0 * 8.0
+	}
 	effectiveMinutes := serialMinutes + parallelMinutes/agents
-	estimatedDays := float64(effectiveMinutes) / (60.0 * 8.0)
+	estimatedDays := float64(effectiveMinutes) / velPerDay
+	if len(openIssues) > 0 {
+		if estimatedDays < graham.GrahamMinDays {
+			estimatedDays = graham.GrahamMinDays
+		}
+		if estimatedDays > graham.GrahamMaxDays {
+			estimatedDays = graham.GrahamMaxDays
+		}
+	}
 
 	type bottleneck struct {
 		ID          string   `json:"id"`
@@ -3605,35 +3964,43 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 
 	output := struct {
 		RobotEnvelope
-		Agents            int          `json:"agents"`
-		Label             string       `json:"label,omitempty"`
-		OpenIssueCount    int          `json:"open_issue_count"`
-		TotalMinutes      int          `json:"total_minutes"`
-		TotalDays         float64      `json:"total_days"`
-		SerialMinutes     int          `json:"serial_minutes"`
-		ParallelMinutes   int          `json:"parallel_minutes"`
-		ParallelizablePct float64      `json:"parallelizable_pct"`
-		EstimatedDays     float64      `json:"estimated_days"`
-		CriticalPathLen   int          `json:"critical_path_length"`
-		CriticalPath      []string     `json:"critical_path,omitempty"`
-		ActionableCount   int          `json:"actionable_count"`
-		Actionable        []string     `json:"actionable,omitempty"`
-		Bottlenecks       []bottleneck `json:"bottlenecks,omitempty"`
+		Agents              int          `json:"agents"`
+		Label               string       `json:"label,omitempty"`
+		OpenIssueCount      int          `json:"open_issue_count"`
+		TotalMinutes        int          `json:"total_minutes"`
+		TotalDays           float64      `json:"total_days"`
+		SerialMinutes       int          `json:"serial_minutes"`
+		ParallelMinutes     int          `json:"parallel_minutes"`
+		ParallelizablePct   float64      `json:"parallelizable_pct"`
+		EstimatedDays       float64      `json:"estimated_days"`
+		CriticalPathMinutes int          `json:"critical_path_minutes"`
+		VelocityMinutesDay  float64      `json:"velocity_minutes_per_day"`
+		GrahamMinDays       float64      `json:"graham_min_days"`
+		GrahamMaxDays       float64      `json:"graham_max_days"`
+		CriticalPathLen     int          `json:"critical_path_length"`
+		CriticalPath        []string     `json:"critical_path"`
+		ActionableCount     int          `json:"actionable_count"`
+		Actionable          []string     `json:"actionable"`
+		Bottlenecks         []bottleneck `json:"bottlenecks,omitempty"`
 	}{
-		RobotEnvelope:     ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues)),
-		Agents:            agents,
-		OpenIssueCount:    len(openIssues),
-		TotalMinutes:      totalMinutes,
-		TotalDays:         float64(totalMinutes) / (60.0 * 8.0),
-		SerialMinutes:     serialMinutes,
-		ParallelMinutes:   parallelMinutes,
-		ParallelizablePct: parallelizablePct,
-		EstimatedDays:     estimatedDays,
-		CriticalPathLen:   len(longestChain),
-		CriticalPath:      longestChain,
-		ActionableCount:   len(actionable),
-		Actionable:        actionable,
-		Bottlenecks:       bottlenecks,
+		RobotEnvelope:       ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues)),
+		Agents:              agents,
+		OpenIssueCount:      len(openIssues),
+		TotalMinutes:        totalMinutes,
+		TotalDays:           float64(totalMinutes) / (60.0 * 8.0),
+		SerialMinutes:       serialMinutes,
+		ParallelMinutes:     parallelMinutes,
+		ParallelizablePct:   parallelizablePct,
+		EstimatedDays:       estimatedDays,
+		CriticalPathMinutes: graham.CriticalPathMinutes,
+		VelocityMinutesDay:  graham.VelocityMinutesPerDay,
+		GrahamMinDays:       graham.GrahamMinDays,
+		GrahamMaxDays:       graham.GrahamMaxDays,
+		CriticalPathLen:     len(longestChain),
+		CriticalPath:        longestChain,
+		ActionableCount:     len(actionable),
+		Actionable:          actionable,
+		Bottlenecks:         bottlenecks,
 	}
 	if cfg.CapacityLabel != nil && strings.TrimSpace(*cfg.CapacityLabel) != "" {
 		output.Label = *cfg.CapacityLabel

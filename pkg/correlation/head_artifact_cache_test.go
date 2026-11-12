@@ -188,12 +188,12 @@ func TestPersistentCorrelationCachesIsolateNamespaces(t *testing.T) {
 func TestPersistentCorrelationCachesIsolateMatcherPolicies(t *testing.T) {
 	t.Setenv("BV_ROBOT", "1")
 	t.Setenv("BV_NO_CACHE", "")
-	repo, jsonl, _ := rootCorrelationRepo(t, "custom-alpha", "feat(custom-alpha): add feature")
+	repo, jsonl, _ := rootCorrelationRepo(t, "custom-alpha", "feat(ext_custom-alpha): add feature")
 	opts := CorrelatorOptions{Limit: 10}
 	matcher := func(custom bool) *Correlator {
 		c := NewCorrelator(repo, jsonl)
 		if custom {
-			c.explicit.AddPattern(regexp.MustCompile(`\b(custom-[a-z]+)\b`))
+			c.explicit.AddPattern(regexp.MustCompile(`\bext_(custom-[a-z]+)\b`))
 		}
 		return c
 	}
@@ -379,5 +379,77 @@ func TestHeadArtifactCache_RoundTripKeepsStrategyFields(t *testing.T) {
 	}
 	if out.FormatVersion != historyArtifactFormatVersion {
 		t.Fatalf("stored format version %d, want %d", out.FormatVersion, historyArtifactFormatVersion)
+	}
+}
+
+func TestCorrelationDiskCachePermissionsStrict0700And0600(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+
+	parentDir := t.TempDir()
+	cacheDir := filepath.Join(parentDir, "bv-secure-cache")
+	t.Setenv("BV_CACHE_DIR", cacheDir)
+
+	repo, jsonl, _ := multiStrategyRepo(t)
+	beads := []BeadInfo{{ID: "bv-1", Title: "One", Status: "closed"}}
+	c := NewCorrelator(repo, jsonl)
+	if _, err := c.extractor.extractViaSnapshots(ExtractOptions{Limit: 50}); err != nil {
+		t.Fatalf("extractViaSnapshots: %v", err)
+	}
+	if _, err := c.GenerateReportCached(beads, CorrelatorOptions{Limit: 50}); err != nil {
+		t.Fatalf("GenerateReportCached: %v", err)
+	}
+
+	dirInfo, err := os.Stat(cacheDir)
+	if err != nil {
+		t.Fatalf("stat cacheDir: %v", err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("cache directory permissions = %04o, want 0700", perm)
+	}
+
+	expectedFiles := []string{
+		correlationDiskCacheFileName,
+		headArtifactCacheFileName,
+		perCommitEventCacheFileName,
+		perCommitCoCommitCacheFileName,
+	}
+	for _, name := range expectedFiles {
+		filePath := filepath.Join(cacheDir, name)
+		fi, err := os.Stat(filePath)
+		if err != nil {
+			t.Fatalf("expected cache file %s to exist: %v", name, err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o600 {
+			t.Errorf("cache file %s permissions = %04o, want 0600", name, perm)
+		}
+	}
+
+	// Also verify tightening when BV_CACHE_DIR pre-exists with 0755 permissions.
+	preExistingDir := filepath.Join(parentDir, "preexisting-0755")
+	if err := os.MkdirAll(preExistingDir, 0o755); err != nil {
+		t.Fatalf("mkdir preexisting: %v", err)
+	}
+	_ = os.Chmod(preExistingDir, 0o755)
+	t.Setenv("BV_CACHE_DIR", preExistingDir)
+
+	putCorrelationDiskCachedReport("ns", "head", hashBeads(beads), "opts", &HistoryReport{DataHash: hashBeads(beads)})
+	putHeadArtifactCached("ns", "head", "opts", &historyArtifact{WalkedCommits: 1})
+
+	preInfo, err := os.Stat(preExistingDir)
+	if err != nil {
+		t.Fatalf("stat preexisting cache dir: %v", err)
+	}
+	if perm := preInfo.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("preexisting cache dir permissions = %04o, want 0700", perm)
+	}
+	for _, name := range []string{correlationDiskCacheFileName, headArtifactCacheFileName} {
+		fi, err := os.Stat(filepath.Join(preExistingDir, name))
+		if err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o600 {
+			t.Errorf("cache file %s permissions = %04o, want 0600", name, perm)
+		}
 	}
 }

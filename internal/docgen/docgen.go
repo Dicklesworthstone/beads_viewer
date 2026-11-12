@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -439,11 +438,17 @@ func RenderKeysTable() string {
 		}
 
 		keyDisplay := b.Key
-		if !strings.HasPrefix(keyDisplay, "`") {
+		if keyDisplay == "`" {
+			keyDisplay = "`` ` ``"
+		} else if !strings.HasPrefix(keyDisplay, "`") {
 			parts := strings.Split(keyDisplay, ", ")
 			var formattedParts []string
 			for _, p := range parts {
-				formattedParts = append(formattedParts, "`"+p+"`")
+				if p == "`" {
+					formattedParts = append(formattedParts, "`` ` ``")
+				} else {
+					formattedParts = append(formattedParts, "`"+p+"`")
+				}
 			}
 			keyDisplay = strings.Join(formattedParts, ", ")
 		}
@@ -557,18 +562,77 @@ func GenerateConstantsJSON() ([]byte, error) {
 }
 
 // ReplaceBetweenMarkers finds <!-- bv:generated:<name> --> and <!-- /bv:generated -->
-// and replaces everything in between. If end marker is <!-- /bv:generated:<name> -->, it handles that too.
+// (or <!-- /bv:generated:<name> -->) and replaces everything in between using
+// deterministic literal index-based string slicing (without regexp template expansion).
 func ReplaceBetweenMarkers(content, markerName, newContent string) (string, bool) {
-	pattern := fmt.Sprintf(`(?s)(<!--\s*bv:generated:%s\s*-->)(.*?)(<!--\s*/bv:generated(?::%s)?\s*-->)`,
-		regexp.QuoteMeta(markerName), regexp.QuoteMeta(markerName))
-	re := regexp.MustCompile(pattern)
-
-	if !re.MatchString(content) {
+	if markerName == "" {
 		return content, false
 	}
 
-	replacement := fmt.Sprintf("${1}\n%s\n${3}", strings.TrimSpace(newContent))
-	return re.ReplaceAllString(content, replacement), true
+	startBody := "bv:generated:" + markerName
+	endBodyGeneric := "/bv:generated"
+	endBodyNamed := "/bv:generated:" + markerName
+	trimmedNew := strings.TrimSpace(newContent)
+
+	var out strings.Builder
+	cursor := 0
+	replaced := false
+
+	for {
+		_, startEnd, ok := findHTMLCommentMarker(content, cursor, func(body string) bool {
+			return body == startBody
+		})
+		if !ok {
+			break
+		}
+		endOpen, endEnd, ok := findHTMLCommentMarker(content, startEnd, func(body string) bool {
+			return body == endBodyGeneric || body == endBodyNamed
+		})
+		if !ok {
+			break
+		}
+
+		out.WriteString(content[cursor:startEnd])
+		out.WriteByte('\n')
+		out.WriteString(trimmedNew)
+		out.WriteByte('\n')
+		out.WriteString(content[endOpen:endEnd])
+		cursor = endEnd
+		replaced = true
+	}
+
+	if !replaced {
+		return content, false
+	}
+	out.WriteString(content[cursor:])
+	return out.String(), true
+}
+
+// findHTMLCommentMarker scans s starting at byte offset from for the next HTML
+// comment <!-- ... --> whose trimmed interior satisfies matchBody, returning its
+// [start, end) byte bounds in s.
+func findHTMLCommentMarker(s string, from int, matchBody func(string) bool) (int, int, bool) {
+	offset := from
+	for offset < len(s) {
+		relOpen := strings.Index(s[offset:], "<!--")
+		if relOpen < 0 {
+			return 0, 0, false
+		}
+		openIdx := offset + relOpen
+		afterOpen := openIdx + len("<!--")
+		relClose := strings.Index(s[afterOpen:], "-->")
+		if relClose < 0 {
+			return 0, 0, false
+		}
+		closeIdx := afterOpen + relClose
+		endIdx := closeIdx + len("-->")
+		body := strings.TrimSpace(s[afterOpen:closeIdx])
+		if matchBody(body) {
+			return openIdx, endIdx, true
+		}
+		offset = afterOpen
+	}
+	return 0, 0, false
 }
 
 // GenerateOptions configures documentation generation.

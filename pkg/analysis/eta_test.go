@@ -554,3 +554,127 @@ func TestEstimateETAForIssue_GlobalVelocityFallback(t *testing.T) {
 		t.Error("Expected global velocity fallback in factors")
 	}
 }
+
+func TestEstimateETAForIssue_EffectiveWorkVelocityScaleParity(t *testing.T) {
+	now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	longDesc := strings.Repeat("Detailed epic acceptance criteria and subsystem wiring. ", 60)
+
+	// Close 30 identical complex epics over 30 days => steady pace of exactly 1 epic/day.
+	issues := make([]model.Issue, 0, 31)
+	for d := 1; d <= 30; d++ {
+		closedAt := now.Add(-time.Duration(d) * 24 * time.Hour)
+		issues = append(issues, model.Issue{
+			ID:          "closed-epic-" + string(rune('a'+(d-1)%26)) + string(rune('0'+d/10)),
+			Title:       "Historical Epic",
+			Description: longDesc,
+			Status:      model.StatusClosed,
+			IssueType:   model.TypeEpic,
+			Labels:      []string{"core"},
+			ClosedAt:    &closedAt,
+		})
+	}
+	issues = append(issues, model.Issue{
+		ID:          "open-epic",
+		Title:       "Next Identical Epic",
+		Description: longDesc,
+		Status:      model.StatusOpen,
+		IssueType:   model.TypeEpic,
+		Labels:      []string{"core"},
+	})
+
+	eta, err := EstimateETAForIssue(issues, nil, "open-epic", 1, now)
+	if err != nil {
+		t.Fatalf("EstimateETAForIssue failed: %v", err)
+	}
+	// With 30 identical epics closed in 30 days and k=5 shrinkage toward an identical global
+	// velocity, the estimated duration for 1 open identical epic must be ~1.0 day (not 5.4x-10.8x).
+	diff := eta.EstimatedDays - 1.0
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > 0.05 {
+		t.Fatalf("expected ~1.0 day ETA for steady 1-epic/day pace, got %.4f days (factors=%v)", eta.EstimatedDays, eta.Factors)
+	}
+}
+
+func TestEstimateVelocity_BuhlmannStraubCredibilityShrinkage(t *testing.T) {
+	now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-5 * 24 * time.Hour)
+	est300 := 300
+	est1800 := 1800
+
+	// 19 baseline closures of 300m each + 1 outlier label closure of 1800m over 30d:
+	// global total = 19*300 + 1800 = 7500m => v_global = 250 m/day.
+	// outlier label n=1 => v_label = 1800/30 = 60 m/day.
+	// Buhlmann-Straub k=5: v_shrunk = (1*60 + 5*250) / 6 = 1310 / 6 = 218.3333 m/day.
+	issues := make([]model.Issue, 0, 21)
+	for i := 0; i < 19; i++ {
+		issues = append(issues, model.Issue{
+			ID:               "base-" + string(rune('a'+i)),
+			Status:           model.StatusClosed,
+			IssueType:        model.TypeTask,
+			EstimatedMinutes: &est300,
+			Labels:           []string{"steady"},
+			ClosedAt:         &closedAt,
+		})
+	}
+	issues = append(issues,
+		model.Issue{
+			ID:               "outlier-closed",
+			Status:           model.StatusClosed,
+			IssueType:        model.TypeTask,
+			EstimatedMinutes: &est1800,
+			Labels:           []string{"rare"},
+			ClosedAt:         &closedAt,
+		},
+		model.Issue{
+			ID:               "target-open",
+			Status:           model.StatusOpen,
+			IssueType:        model.TypeTask,
+			EstimatedMinutes: &est300,
+			Labels:           []string{"rare"},
+		},
+	)
+
+	vel, _, _ := estimateVelocityMinutesPerDayWithStats(issues, nil, issues[len(issues)-1], now, 300)
+	want := (1.0*60.0 + 5.0*250.0) / 6.0
+	diff := vel - want
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > 0.01 {
+		t.Fatalf("Buhlmann-Straub shrunk velocity = %.4f, want %.4f (unshrunk 60.0, global 250.0)", vel, want)
+	}
+}
+
+func TestComputeGrahamBounds_ParallelSchedulingInvariants(t *testing.T) {
+	now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	m120 := 120
+	// Chain A -> B (240m critical path) + 2 independent tasks C, D (120m each) => W = 480m, L_crit = 240m.
+	openIssues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen, IssueType: model.TypeTask, EstimatedMinutes: &m120},
+		{ID: "B", Status: model.StatusOpen, IssueType: model.TypeTask, EstimatedMinutes: &m120, Dependencies: []*model.Dependency{
+			{DependsOnID: "A", Type: model.DepBlocks},
+		}},
+		{ID: "C", Status: model.StatusOpen, IssueType: model.TypeTask, EstimatedMinutes: &m120},
+		{ID: "D", Status: model.StatusOpen, IssueType: model.TypeTask, EstimatedMinutes: &m120},
+	}
+
+	b3 := ComputeGrahamBounds(openIssues, openIssues, nil, 3, now)
+	if b3.TotalMinutes != 480 || b3.CriticalPathMinutes != 240 {
+		t.Fatalf("unexpected W/L_crit: %+v", b3)
+	}
+	// m=3: T_min = max(240, 480/3=160) = 240; T_max = 240 + (480-240)/3 = 320.
+	if b3.GrahamMinMinutes != 240 || b3.GrahamMaxMinutes != 320 {
+		t.Fatalf("unexpected m=3 Graham minute bounds: min=%.2f max=%.2f (want 240, 320)", b3.GrahamMinMinutes, b3.GrahamMaxMinutes)
+	}
+	if !(b3.GrahamMinDays <= b3.GrahamMaxDays && b3.GrahamMinDays > 0) {
+		t.Fatalf("invalid Graham day bounds: %+v", b3)
+	}
+
+	// m=1: T_min == T_max == W == 480.
+	b1 := ComputeGrahamBounds(openIssues, openIssues, nil, 1, now)
+	if b1.GrahamMinMinutes != 480 || b1.GrahamMaxMinutes != 480 {
+		t.Fatalf("m=1 Graham bounds must collapse to W=480: %+v", b1)
+	}
+}

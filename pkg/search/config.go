@@ -3,9 +3,10 @@ package search
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // EmbeddingConfigFromEnv reads semantic embedding configuration from environment variables.
@@ -15,12 +16,12 @@ import (
 //   - BV_SEMANTIC_MODEL: model identifier (provider-specific, optional)
 //   - BV_SEMANTIC_DIM: embedding dimension (default: DefaultEmbeddingDim)
 func EmbeddingConfigFromEnv() EmbeddingConfig {
-	provider := strings.ToLower(strings.TrimSpace(os.Getenv(EnvSemanticEmbedder)))
+	provider := strings.ToLower(strings.TrimSpace(env.SemanticEmbedder.Get()))
 	cfg := EmbeddingConfig{
 		Provider: Provider(provider),
-		Model:    strings.TrimSpace(os.Getenv(EnvSemanticModel)),
+		Model:    strings.TrimSpace(env.SemanticModel.Get()),
 	}
-	if dimStr := os.Getenv(EnvSemanticDim); dimStr != "" {
+	if dimStr := env.SemanticDim.Get(); dimStr != "" {
 		if dim, err := strconv.Atoi(dimStr); err == nil {
 			cfg.Dim = dim
 		}
@@ -71,7 +72,7 @@ type SearchConfig struct {
 // SearchConfigFromEnv reads hybrid search configuration from environment variables.
 // Defaults: mode=text, preset=default.
 func SearchConfigFromEnv() (SearchConfig, error) {
-	return ParseSearchConfig(os.Getenv(EnvSearchMode), os.Getenv(EnvSearchPreset), os.Getenv(EnvSearchWeights))
+	return ParseSearchConfig(env.SearchMode.Get(), env.SearchPreset.Get(), env.SearchWeights.Get())
 }
 
 // ParseSearchConfig validates effective values after the caller resolves their

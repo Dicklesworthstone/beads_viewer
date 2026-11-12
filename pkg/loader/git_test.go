@@ -1342,3 +1342,152 @@ func TestCacheExpiry(t *testing.T) {
 		t.Errorf("expected 0 valid entries after expiry, got %d", stats.ValidEntries)
 	}
 }
+
+func TestGitLoader_SubdirectoryInvariance(t *testing.T) {
+	repoDir := initGitLoaderTestRepo(t)
+	first := `{"id":"SUB-1","title":"Initial issue","status":"open","priority":1,"issue_type":"task"}` + "\n"
+	commitGitLoaderFixture(t, repoDir, ".beads/issues.jsonl", first, "first beads commit")
+	firstSHA := strings.TrimSpace(runGitOutput(t, repoDir, "rev-parse", "HEAD"))
+
+	second := first + `{"id":"SUB-2","title":"Second issue","status":"open","priority":2,"issue_type":"task"}` + "\n"
+	commitGitLoaderFixture(t, repoDir, ".beads/issues.jsonl", second, "second beads commit")
+	secondSHA := strings.TrimSpace(runGitOutput(t, repoDir, "rev-parse", "HEAD"))
+
+	nestedSubdir := filepath.Join(repoDir, "pkg", "sub", "deep")
+	if err := os.MkdirAll(nestedSubdir, 0o755); err != nil {
+		t.Fatalf("create nested subdir: %v", err)
+	}
+
+	canonicalRoot, err := filepath.EvalSymlinks(repoDir)
+	if err != nil {
+		t.Fatalf("eval repoDir symlinks: %v", err)
+	}
+
+	subPaths := []struct {
+		name string
+		path string
+	}{
+		{name: "pkg", path: filepath.Join(repoDir, "pkg")},
+		{name: "pkg/sub/deep", path: nestedSubdir},
+	}
+
+	for _, tc := range subPaths {
+		t.Run(tc.name, func(t *testing.T) {
+			gl := NewGitLoader(tc.path)
+			cmd := gl.gitCommand("status")
+			gotCmdDir, err := filepath.EvalSymlinks(cmd.Dir)
+			if err != nil {
+				t.Fatalf("eval cmd.Dir symlinks (%q): %v", cmd.Dir, err)
+			}
+			if gotCmdDir != canonicalRoot {
+				t.Fatalf("gitCommand Dir = %q, want canonical repo root %q", gotCmdDir, canonicalRoot)
+			}
+
+			hasBeads, err := gl.HasBeadsAtRevision("HEAD")
+			if err != nil {
+				t.Fatalf("HasBeadsAtRevision(HEAD) from %s: %v", tc.name, err)
+			}
+			if !hasBeads {
+				t.Fatalf("HasBeadsAtRevision(HEAD) from %s = false, want true", tc.name)
+			}
+
+			report, err := gl.LoadAtWithReport("HEAD")
+			if err != nil {
+				t.Fatalf("LoadAtWithReport(HEAD) from %s: %v", tc.name, err)
+			}
+			if len(report.Issues) != 2 || report.Issues[0].ID != "SUB-1" || report.Issues[1].ID != "SUB-2" {
+				t.Fatalf("LoadAtWithReport(HEAD) issues = %+v, want SUB-1 and SUB-2", report.Issues)
+			}
+
+			revs, err := gl.ListRevisions(10)
+			if err != nil {
+				t.Fatalf("ListRevisions from %s: %v", tc.name, err)
+			}
+			if len(revs) != 2 {
+				t.Fatalf("ListRevisions count = %d, want 2", len(revs))
+			}
+
+			between, err := gl.GetCommitsBetween(firstSHA, secondSHA)
+			if err != nil {
+				t.Fatalf("GetCommitsBetween from %s: %v", tc.name, err)
+			}
+			if len(between) != 1 || between[0].SHA != secondSHA {
+				t.Fatalf("GetCommitsBetween = %+v, want [%s]", between, secondSHA)
+			}
+		})
+	}
+
+	// Verify bare struct literal without precomputed repoRoot still passes --full-tree
+	// and canonicalizes repoPath on gitCommand.
+	raw := &GitLoader{
+		repoPath: nestedSubdir,
+		cache:    &revisionCache{entries: make(map[string]cacheEntry), maxAge: time.Minute},
+	}
+	exists, err := raw.historicalPathExists(secondSHA, ".beads/issues.jsonl")
+	if err != nil || !exists {
+		t.Fatalf("historicalPathExists from nested subdir = (%v, %v), want (true, nil)", exists, err)
+	}
+}
+
+func TestGitLoader_SubdirectoryCwdSubprocess(t *testing.T) {
+	if targetSubdir := os.Getenv("BV_GITLOADER_SUBDIR_CHILD"); targetSubdir != "" {
+		gl := NewGitLoader("")
+		has, err := gl.HasBeadsAtRevision("HEAD")
+		if err != nil || !has {
+			t.Fatalf("HasBeadsAtRevision from CWD subdir: has=%v err=%v", has, err)
+		}
+		issues, err := gl.LoadAt("HEAD")
+		if err != nil || len(issues) != 1 || issues[0].ID != "CWD-SUB-1" {
+			t.Fatalf("LoadAt from CWD subdir: issues=%+v err=%v", issues, err)
+		}
+		return
+	}
+
+	repoDir := initGitLoaderTestRepo(t)
+	payload := `{"id":"CWD-SUB-1","title":"Loaded from nested CWD","status":"open","priority":1,"issue_type":"task"}` + "\n"
+	commitGitLoaderFixture(t, repoDir, ".beads/issues.jsonl", payload, "cwd subdir fixture")
+
+	subDir := filepath.Join(repoDir, "cmd", "bv")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir cmd/bv: %v", err)
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(exe, "-test.run=^TestGitLoader_SubdirectoryCwdSubprocess$")
+	cmd.Dir = subDir
+	cmd.Env = append(os.Environ(), "BV_GITLOADER_SUBDIR_CHILD="+subDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("subprocess NewGitLoader(\"\") from %s failed: %v\n%s", subDir, err, string(out))
+	}
+}
+
+func TestGitLoader_HonorsMaxLineSizeEnv(t *testing.T) {
+	repoDir := initGitLoaderTestRepo(t)
+	largeDesc := strings.Repeat("x", 1500*1024) // ~1.5 MiB (> 1 MiB, < 4 MiB)
+	line := fmt.Sprintf(`{"id":"BIG-GIT-1","title":"Large historical issue","description":%q,"status":"open","priority":1,"issue_type":"task"}`+"\n", largeDesc)
+	commitGitLoaderFixture(t, repoDir, ".beads/issues.jsonl", line, "large line commit")
+
+	subDir := filepath.Join(repoDir, "pkg", "loader")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir pkg/loader: %v", err)
+	}
+
+	t.Setenv(MaxLineSizeEnvVar, "1")
+	_, err := NewGitLoader(subDir).LoadAtWithReport("HEAD")
+	if err == nil {
+		t.Fatal("expected BV_MAX_LINE_SIZE_MB=1 to reject 1.5 MiB historical JSONL line")
+	}
+
+	t.Setenv(MaxLineSizeEnvVar, "4")
+	report, err := NewGitLoader(subDir).LoadAtWithReport("HEAD")
+	if err != nil {
+		t.Fatalf("LoadAtWithReport with BV_MAX_LINE_SIZE_MB=4 failed: %v", err)
+	}
+	if len(report.Issues) != 1 || report.Issues[0].ID != "BIG-GIT-1" || report.ParseStats.Errors != 0 {
+		t.Fatalf("unexpected report under BV_MAX_LINE_SIZE_MB=4: stats=%+v len=%d", report.ParseStats, len(report.Issues))
+	}
+}

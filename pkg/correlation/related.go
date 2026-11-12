@@ -135,6 +135,18 @@ func (hr *HistoryReport) FindRelatedWorkAt(targetID string, opts RelatedWorkOpti
 	// 4. Concurrent Detection (same time window)
 	concurrentCandidates := hr.findConcurrent(targetID, target, opts, seen, now)
 	result.Concurrent = concurrentCandidates
+	if result.FileOverlap == nil {
+		result.FileOverlap = []RelatedWorkBead{}
+	}
+	if result.CommitOverlap == nil {
+		result.CommitOverlap = []RelatedWorkBead{}
+	}
+	if result.DependencyCluster == nil {
+		result.DependencyCluster = []RelatedWorkBead{}
+	}
+	if result.Concurrent == nil {
+		result.Concurrent = []RelatedWorkBead{}
+	}
 
 	// Calculate total
 	result.TotalRelated = len(result.FileOverlap) + len(result.CommitOverlap) +

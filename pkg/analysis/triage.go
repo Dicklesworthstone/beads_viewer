@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -103,8 +104,18 @@ type QuickRef struct {
 	// NotActionableCount counts non-closed issues that are NOT actionable
 	// (blocked by open dependencies, parked in a non-actionable status, or
 	// scheduler-deferred). This carries the pre-#165 blocked_count semantics.
-	NotActionableCount int       `json:"not_actionable_count"`
-	TopPicks           []TopPick `json:"top_picks"` // Top 3 recommended items
+	NotActionableCount int `json:"not_actionable_count"`
+	// ReadinessBlockedCount counts candidate issues blocked by unsatisfied open
+	// dependencies or explicit status=="blocked" (excludes deferred/parked
+	// statuses; equals Analyzer.CountStatusPartition().Blocked,
+	// plan.total_blocked, baseline.stats.blocked_count, and drift.blocked_count).
+	ReadinessBlockedCount int `json:"readiness_blocked_count"`
+	// DeferredOrParkedCount counts non-closed candidate issues that are neither
+	// actionable nor dependency/status-blocked (future defer_until, deferred,
+	// draft, pinned, hooked, review; equals
+	// NotActionableCount - ReadinessBlockedCount).
+	DeferredOrParkedCount int       `json:"deferred_or_parked_count"`
+	TopPicks              []TopPick `json:"top_picks"` // Top 3 recommended items
 }
 
 // TopPick is a condensed recommendation for quick reference
@@ -130,7 +141,7 @@ type Recommendation struct {
 	Breakdown   ScoreBreakdown `json:"breakdown"`
 	Action      string         `json:"action"` // Suggested next action (human-readable)
 	Reasons     []string       `json:"reasons"`
-	UnblocksIDs []string       `json:"unblocks_ids,omitempty"`
+	UnblocksIDs []string       `json:"unblocks_ids"`
 	BlockedBy   []string       `json:"blocked_by,omitempty"`
 	// Claimable is the machine-readable form of the top-pick gate (issue
 	// #199): true iff isClaimableRecommendation would surface this item as a
@@ -590,6 +601,7 @@ func extractDescendantSubgraph(issues []model.Issue, rootID string) []model.Issu
 //
 // The outputs match ComputeTriageWithOptionsAndTime given equivalent inputs.
 func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []model.Issue, opts TriageOptions, now time.Time) TriageResult {
+	defer metrics.Timer(metrics.TriageAnalysis)()
 	start := time.Now()
 
 	// Set defaults
@@ -636,20 +648,39 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	// So: build the recommendations against the full triageScores set
 	// first, slice to opts.TopN for the user-visible recommendations
 	// list, and feed the *unsliced* set into buildTopPicks.
-	allRecommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, len(triageScores), now)
-	selectedRecommendations := allRecommendations[:0]
-	for _, rec := range allRecommendations {
-		if analyzer.IsCandidate(rec.ID) && (!opts.ActionableOnly || triageCtx.IsActionable(rec.ID)) {
-			selectedRecommendations = append(selectedRecommendations, rec)
-		}
-	}
-	allRecommendations = selectedRecommendations
-
 	// Parents with open children are excluded from claimable top picks (issue
 	// #17 parity): such a parent is a planning container, not directly claimable
 	// work, even when it passes the epic-type / blocker checks (e.g. a non-epic
-	// parent). The parent re-becomes claimable once its children are all closed.
+	// parent). Container epics with open children are also excluded from default
+	// leaf recommendations (ActionableOnly) and carry an explicit coordination
+	// action hint when inactive items are requested (--robot-include-inactive).
 	parentsWithOpenChildren := analyzer.ParentsWithOpenChildren()
+	isContainerEpicWithOpenChildren := func(id string) bool {
+		if !parentsWithOpenChildren[id] {
+			return false
+		}
+		iss := analyzer.getIssue(id)
+		return iss != nil && iss.IssueType == model.TypeEpic
+	}
+
+	selectionMode := SelectionAllScopedCandidates
+	if opts.ActionableOnly {
+		selectionMode = SelectionReadyLeaf
+	}
+	eligibleIDs := analyzer.CandidateIssueSet(selectionMode)
+
+	allRecommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, len(triageScores), now)
+	selectedRecommendations := allRecommendations[:0]
+	for _, rec := range allRecommendations {
+		if !eligibleIDs[rec.ID] {
+			continue
+		}
+		if isContainerEpicWithOpenChildren(rec.ID) {
+			rec.Action = "Coordinate open child tasks"
+		}
+		selectedRecommendations = append(selectedRecommendations, rec)
+	}
+	allRecommendations = selectedRecommendations
 
 	// Stamp the claimability verdict on every scored item once (issue #199) so
 	// recommendations carry it as a field and quick_wins can gate on the same
@@ -709,6 +740,8 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 		staleness = ComputeStaleness(opts.History, issues, now)
 	}
 
+	partition := analyzer.CountStatusPartition()
+
 	return TriageResult{
 		Meta: TriageMeta{
 			Version:       "1.0.0",
@@ -719,13 +752,15 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 		},
 		Status: stats.Status(),
 		QuickRef: QuickRef{
-			OpenCount:          counts.Open,
-			ActionableCount:    counts.Actionable,
-			BlockedCount:       counts.Blocked,
-			InProgressCount:    counts.ByStatus["in_progress"],
-			NotClosedCount:     counts.NotClosed,
-			NotActionableCount: counts.DependencyBlocked,
-			TopPicks:           topPicks,
+			OpenCount:             counts.Open,
+			ActionableCount:       counts.Actionable,
+			BlockedCount:          counts.Blocked,
+			InProgressCount:       counts.ByStatus["in_progress"],
+			NotClosedCount:        counts.NotClosed,
+			NotActionableCount:    counts.DependencyBlocked,
+			ReadinessBlockedCount: partition.Blocked,
+			DeferredOrParkedCount: partition.DeferredOrParked,
+			TopPicks:              topPicks,
 		},
 		Recommendations:        recommendations,
 		QuickWins:              quickWins,
@@ -934,6 +969,7 @@ func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageConte
 		// Get blocked by (cached via TriageContext)
 		blockedBy := ctx.OpenBlockers(score.IssueID)
 
+		unblocks := append([]string{}, unblocksMap[score.IssueID]...)
 		rec := Recommendation{
 			ID:          score.IssueID,
 			Title:       score.Title,
@@ -947,7 +983,7 @@ func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageConte
 			Breakdown:   score.Breakdown,
 			Action:      reasons.ActionHint,
 			Reasons:     reasons.All,
-			UnblocksIDs: unblocksMap[score.IssueID],
+			UnblocksIDs: unblocks,
 		}
 		if len(blockedBy) > 0 {
 			rec.BlockedBy = blockedBy

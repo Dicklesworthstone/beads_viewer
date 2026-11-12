@@ -1093,7 +1093,7 @@ func TestCachedCorrelator_FeedbackFingerprintChangesCacheKey(t *testing.T) {
 }
 
 func TestInMemoryCorrelatorsRespectMatcherPolicyChanges(t *testing.T) {
-	repo, jsonl, _ := rootCorrelationRepo(t, "custom-alpha", "feat(custom-alpha): add feature")
+	repo, jsonl, _ := rootCorrelationRepo(t, "custom-alpha", "feat(ext_custom-alpha): add feature")
 	beads := []BeadInfo{{ID: "custom-alpha", Title: "One", Status: "open"}}
 	opts := CorrelatorOptions{Limit: 10}
 	for _, kind := range []string{"cached", "incremental"} {
@@ -1111,7 +1111,7 @@ func TestInMemoryCorrelatorsRespectMatcherPolicyChanges(t *testing.T) {
 			for _, want := range []int{0, 1, 0} {
 				c.explicit = NewExplicitMatcher(repo)
 				if want == 1 {
-					c.explicit.AddPattern(regexp.MustCompile(`\b(custom-[a-z]+)\b`))
+					c.explicit.AddPattern(regexp.MustCompile(`\bext_(custom-[a-z]+)\b`))
 				}
 				report, err := generate(beads, opts)
 				if err != nil {

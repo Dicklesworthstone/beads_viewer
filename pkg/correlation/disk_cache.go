@@ -61,11 +61,14 @@ func SetDiskCacheEnabled(on bool) { diskCacheForced.Store(on) }
 // hit/miss.
 
 const (
-	// correlationDiskCacheVersion: 4 adds historical constraint observations;
+	// correlationDiskCacheVersion: 5 = Aho-Corasick known-ID matching,
+	// synthesized creation milestones, mixed .beads/+code temporal candidates,
+	// non-nil commits slices, and expanded code/explicit file retention;
+	// 4 adds historical constraint observations;
 	// 3 = reports carry per-commit methods, the
 	// walked window, strategy timings and feedback_applied (v2 reports lack
 	// them and must not be served as-is).
-	correlationDiskCacheVersion      = 4
+	correlationDiskCacheVersion      = 5
 	correlationDiskCacheFileName     = "correlation_report_cache.json"
 	correlationDiskCacheDirName      = "bv"
 	correlationDiskCacheMaxEntries   = 6
@@ -115,9 +118,10 @@ func correlationDiskCachePath(create bool) (string, error) {
 		base = filepath.Join(dir, correlationDiskCacheDirName)
 	}
 	if create {
-		if err := os.MkdirAll(base, 0o755); err != nil {
+		if err := os.MkdirAll(base, 0o700); err != nil {
 			return "", err
 		}
+		_ = os.Chmod(base, 0o700)
 	}
 	return filepath.Join(base, correlationDiskCacheFileName), nil
 }
@@ -288,7 +292,7 @@ func getCorrelationDiskCachedReport(namespace, headSHA, beadsHash, optsHash stri
 	if err != nil {
 		return nil, false
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, false
 	}
@@ -331,7 +335,7 @@ func putCorrelationDiskCachedReport(namespace, headSHA, beadsHash, optsHash stri
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return
 	}
@@ -340,6 +344,7 @@ func putCorrelationDiskCachedReport(namespace, headSHA, beadsHash, optsHash stri
 		return
 	}
 	defer func() { _ = unlockFile(f) }()
+	_ = f.Chmod(0o600)
 
 	now := time.Now().UTC()
 	cf := readCorrelationDiskCacheLocked(f)
@@ -397,6 +402,9 @@ func (c *Correlator) GenerateReportCached(beads []BeadInfo, opts CorrelatorOptio
 	if err != nil {
 		// Can't key the cache without a stable HEAD; compute uncached.
 		return c.GenerateReport(beads, opts)
+	}
+	if c.explicit != nil {
+		c.explicit.SetKnownBeadIDs(beadIDsFromInfos(beads))
 	}
 	beadsHash := hashBeads(beads)
 	optsHash := c.cacheOptionsHash(opts)

@@ -939,6 +939,7 @@ func TestVisibleRangePerformance(t *testing.T) {
 
 // TestSaveState tests the saveState method
 func TestSaveState(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	// Create temp directory for test
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -971,6 +972,13 @@ func TestSaveState(t *testing.T) {
 
 	// Verify the file was created
 	statePath := filepath.Join(beadsDir, "tree-state.json")
+	info, err := os.Stat(statePath)
+	if err != nil {
+		t.Fatalf("Failed to stat state file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("State file permissions = %04o, want 0600", perm)
+	}
 	data, err := os.ReadFile(statePath)
 	if err != nil {
 		t.Fatalf("Failed to read state file: %v", err)
@@ -995,6 +1003,7 @@ func TestSaveState(t *testing.T) {
 
 // TestSaveStateOnlyNonDefault verifies that only non-default states are saved
 func TestSaveStateOnlyNonDefault(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 
@@ -1126,12 +1135,51 @@ func TestSetBeadsDir(t *testing.T) {
 	}
 }
 
+func TestSaveState_GatedByNoSavedConfigAndReadOnly(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "root-1", Title: "Root 1", Status: model.StatusOpen, IssueType: model.TypeEpic},
+		{ID: "child-1", Title: "Child 1", Status: model.StatusOpen, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "child-1", DependsOnID: "root-1", Type: model.DepParentChild}}},
+	}
+
+	t.Run("BV_NO_SAVED_CONFIG skips saveState", func(t *testing.T) {
+		t.Setenv("BV_NO_SAVED_CONFIG", "1")
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		theme := DefaultTheme(lipgloss.NewRenderer(nil))
+		tree := NewTreeModel(theme)
+		tree.SetBeadsDir(beadsDir)
+		tree.Build(issues)
+		tree.CollapseAll()
+
+		statePath := filepath.Join(beadsDir, "tree-state.json")
+		if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+			t.Fatalf("expected no tree-state.json when BV_NO_SAVED_CONFIG=1, stat err=%v", err)
+		}
+	})
+
+	t.Run("readOnly skips saveState", func(t *testing.T) {
+		beadsDir := filepath.Join(t.TempDir(), ".beads")
+		theme := DefaultTheme(lipgloss.NewRenderer(nil))
+		tree := NewTreeModel(theme)
+		tree.SetBeadsDir(beadsDir)
+		tree.SetReadOnly(true)
+		tree.Build(issues)
+		tree.CollapseAll()
+
+		statePath := filepath.Join(beadsDir, "tree-state.json")
+		if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+			t.Fatalf("expected no tree-state.json when tree.IsReadOnly(), stat err=%v", err)
+		}
+	})
+}
+
 // =============================================================================
 // loadState tests (bv-afcm)
 // =============================================================================
 
 // TestLoadState tests that loadState correctly restores expand/collapse state
 func TestLoadState(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
@@ -1228,6 +1276,7 @@ func TestLoadStateNoFile(t *testing.T) {
 
 // TestLoadStateCorrupted tests that corrupted state file uses defaults
 func TestLoadStateCorrupted(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
@@ -1261,6 +1310,7 @@ func TestLoadStateCorrupted(t *testing.T) {
 }
 
 func TestLoadStateUnsupportedVersion(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
@@ -1298,6 +1348,7 @@ func TestLoadStateUnsupportedVersion(t *testing.T) {
 
 // TestLoadStateStaleIDs tests that stale IDs in state file are ignored
 func TestLoadStateStaleIDs(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {

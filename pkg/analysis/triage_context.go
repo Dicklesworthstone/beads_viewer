@@ -3,6 +3,7 @@ package analysis
 import (
 	"sync"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -114,8 +115,10 @@ func (ctx *TriageContext) IsActionable(id string) bool {
 // MUST be called while holding the lock.
 func (ctx *TriageContext) ensureActionableInternal() {
 	if ctx.actionableComputed {
+		metrics.TriageCache.Hit()
 		return
 	}
+	metrics.TriageCache.Miss()
 
 	ctx.actionable = ctx.analyzer.GetActionableIssues()
 	ctx.actionableSet = make(map[string]bool, len(ctx.actionable))

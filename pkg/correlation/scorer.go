@@ -177,10 +177,13 @@ func (s *Scorer) ExplainConfidence(method CorrelationMethod, confidence float64,
 // FilterByConfidence filters commits by minimum confidence threshold.
 func (s *Scorer) FilterByConfidence(commits []CorrelatedCommit, minConfidence float64) []CorrelatedCommit {
 	if minConfidence <= 0 {
+		if commits == nil {
+			return []CorrelatedCommit{}
+		}
 		return commits
 	}
 
-	var filtered []CorrelatedCommit
+	filtered := make([]CorrelatedCommit, 0, len(commits))
 	for _, c := range commits {
 		if c.Confidence >= minConfidence {
 			filtered = append(filtered, c)

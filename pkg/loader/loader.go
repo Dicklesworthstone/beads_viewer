@@ -306,6 +306,14 @@ func GetBeadsDirWithTrace(repoPath string) (string, []string, error) {
 		return "", nil, fmt.Errorf("inspect beads directory %s: %w", beadsDir, err)
 	}
 
+	// Check ancestor directories (e.g., when invoked from <root>/pkg/sub inside a
+	// non-git or git project tree) while respecting ceiling and temp boundaries.
+	if ancestorBeadsDir, err := findAncestorBeadsDir(repoPath); err != nil {
+		return "", nil, err
+	} else if ancestorBeadsDir != "" {
+		return resolveBeadsRedirect(ancestorBeadsDir)
+	}
+
 	// If not found, check if we're in a git worktree and look in the main repo
 	mainRepoRoot, err := getMainRepoRoot(repoPath)
 	if err == nil && mainRepoRoot != "" && mainRepoRoot != repoPath {
@@ -320,6 +328,99 @@ func GetBeadsDirWithTrace(repoPath string) (string, []string, error) {
 	// Return the original path even if .beads doesn't exist
 	// (caller will handle the error)
 	return beadsDir, []string{filepath.Join(beadsDir, "redirect")}, nil
+}
+
+// ProjectRootFromBeadsDir derives the canonical project root directory from a
+// discovered beads directory path. When beadsDir ends in ".beads" or "_beads",
+// its parent directory is returned; otherwise the cleaned absolute path is returned.
+func ProjectRootFromBeadsDir(beadsDir string) string {
+	trimmed := strings.TrimSpace(beadsDir)
+	if trimmed == "" {
+		return ""
+	}
+	clean := filepath.Clean(trimmed)
+	if abs, err := filepath.Abs(clean); err == nil {
+		clean = filepath.Clean(abs)
+	}
+	if base := filepath.Base(clean); base == ".beads" || base == "_beads" {
+		return filepath.Dir(clean)
+	}
+	return clean
+}
+
+// ResolveProjectRoot resolves the canonical project root directory and active
+// beads directory from repoPath (or the current working directory when repoPath
+// is empty), allowing callers in nested subdirectories to locate project-root
+// configuration files (.bv/hooks.yaml, .bv/drift.yaml, .bv/recipes.yaml,
+// .bv/baseline.json) consistently.
+func ResolveProjectRoot(repoPath string) (projectRoot string, beadsDir string, err error) {
+	beadsDir, trace, err := GetBeadsDirWithTrace(repoPath)
+	if err != nil {
+		return "", "", err
+	}
+	if abs, absErr := filepath.Abs(beadsDir); absErr == nil {
+		beadsDir = filepath.Clean(abs)
+	} else {
+		beadsDir = filepath.Clean(beadsDir)
+	}
+
+	if env.BeadsDB.Get() == "" && env.BeadsDir.Get() == "" {
+		if len(trace) > 0 {
+			initialBeadsDir := filepath.Dir(trace[0])
+			if info, statErr := os.Stat(initialBeadsDir); statErr == nil && info.IsDir() {
+				return ProjectRootFromBeadsDir(initialBeadsDir), beadsDir, nil
+			}
+		}
+		if _, statErr := os.Stat(beadsDir); os.IsNotExist(statErr) {
+			if gitRoot, gitErr := GetGitWorktreeRoot(repoPath); gitErr == nil && gitRoot != "" {
+				return gitRoot, filepath.Join(gitRoot, ".beads"), nil
+			}
+		}
+	}
+
+	return ProjectRootFromBeadsDir(beadsDir), beadsDir, nil
+}
+
+func findAncestorBeadsDir(startPath string) (string, error) {
+	absStart, err := filepath.Abs(startPath)
+	if err != nil {
+		return "", nil
+	}
+	cleanStart := filepath.Clean(absStart)
+
+	stopDirs := make(map[string]bool)
+	addStop := func(p string) {
+		if strings.TrimSpace(p) == "" {
+			return
+		}
+		if abs, absErr := filepath.Abs(p); absErr == nil {
+			stopDirs[filepath.Clean(abs)] = true
+		}
+		if eval, evalErr := filepath.EvalSymlinks(p); evalErr == nil {
+			stopDirs[filepath.Clean(eval)] = true
+		}
+	}
+	addStop(os.TempDir())
+	for _, ceiling := range filepath.SplitList(os.Getenv("GIT_CEILING_DIRECTORIES")) {
+		addStop(ceiling)
+	}
+
+	curr := cleanStart
+	for {
+		parent := filepath.Dir(curr)
+		if parent == curr || stopDirs[curr] || stopDirs[parent] {
+			return "", nil
+		}
+		candidate := filepath.Join(parent, ".beads")
+		if info, statErr := os.Stat(candidate); statErr == nil {
+			if info.IsDir() {
+				return candidate, nil
+			}
+		} else if !os.IsNotExist(statErr) {
+			return "", fmt.Errorf("inspect beads directory %s: %w", candidate, statErr)
+		}
+		curr = parent
+	}
 }
 
 // maxRedirectBytes and maxRedirectDepth bound .beads/redirect resolution,
@@ -567,10 +668,26 @@ func PrepareWorkspaceForRead(repoPath string, refreshBDExport bool, warnFunc fun
 // is used (optionally refreshed). In regular br workspaces FindJSONLPath is
 // used as before.
 func PrepareBeadsDirForRead(beadsDir string, refreshBDExport bool, warnFunc func(string)) (string, error) {
+	return PrepareBeadsDirForReadContext(context.Background(), beadsDir, refreshBDExport, warnFunc)
+}
+
+// PrepareBeadsDirForReadContext resolves the active JSONL file for an explicit
+// .beads directory while honoring caller context cancellation and bounding any
+// bd compatibility export subprocess to bdExportTimeout.
+func PrepareBeadsDirForReadContext(ctx context.Context, beadsDir string, refreshBDExport bool, warnFunc func(string)) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if IsBDWorkspace(beadsDir) {
 		issuesPath := filepath.Join(beadsDir, "issues.jsonl")
 		if refreshBDExport {
-			if err := exportBDIssuesJSONL(beadsDir, issuesPath); err != nil {
+			if err := exportBDIssuesJSONLContext(ctx, beadsDir, issuesPath); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return "", ctxErr
+				}
 				if _, statErr := os.Stat(issuesPath); statErr == nil {
 					if warnFunc != nil {
 						warnFunc(fmt.Sprintf("bd export failed, using existing issues.jsonl: %v", err))
@@ -595,15 +712,15 @@ func PrepareBeadsDirForRead(beadsDir string, refreshBDExport bool, warnFunc func
 // JSONL compatibility file from the bd workspace's Dolt database. Failed,
 // interrupted, or invalid exports never replace the previous compatibility file.
 func exportBDIssuesJSONL(beadsDir, issuesPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), bdExportTimeout)
-	defer cancel()
-	return exportBDIssuesJSONLContext(ctx, beadsDir, issuesPath)
+	return exportBDIssuesJSONLContext(context.Background(), beadsDir, issuesPath)
 }
 
 func exportBDIssuesJSONLContext(ctx context.Context, beadsDir, issuesPath string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	ctx, cancel := context.WithTimeout(ctx, bdExportTimeout)
+	defer cancel()
 	executable, err := exec.LookPath("bd")
 	if err != nil {
 		return fmt.Errorf("bd binary not found in PATH")
@@ -623,7 +740,7 @@ func exportBDIssuesJSONLContext(ctx context.Context, beadsDir, issuesPath string
 	return exportBDIssuesJSONLWithRoute(ctx, absBeadsDir, absIssuesPath, func(stagedPath string) *exec.Cmd {
 		cmd := exec.CommandContext(ctx, executable, "export", "-o", stagedPath)
 		cmd.Dir = filepath.Dir(absBeadsDir)
-		cmd.Env = append(withoutBeadsAuthorityEnv(os.Environ()), BeadsDirEnvVar+"="+absBeadsDir)
+		cmd.Env = append(withoutBeadsAuthorityEnv(gitLoaderEnvironment()), BeadsDirEnvVar+"="+absBeadsDir)
 		return cmd
 	})
 }
@@ -643,7 +760,7 @@ func RefreshBDExport(ctx context.Context, origin model.IssueOrigin) error {
 	return exportBDIssuesJSONLWithRoute(ctx, origin.TrackerDirectory, path, func(stagedPath string) *exec.Cmd {
 		cmd := exec.CommandContext(ctx, origin.Executable, "--db", origin.Database, "export", "-o", stagedPath)
 		cmd.Dir = origin.WorkingDirectory
-		cmd.Env = append(withoutBeadsAuthorityEnv(os.Environ()),
+		cmd.Env = append(withoutBeadsAuthorityEnv(gitLoaderEnvironment()),
 			BeadsDirEnvVar+"="+origin.TrackerDirectory, BeadsDBEnvVar+"="+origin.Database, "BD_DB="+origin.Database)
 		return cmd
 	})
@@ -825,9 +942,12 @@ func withoutBeadsAuthorityEnv(entries []string) []string {
 // For regular repos, this returns the repo root.
 // For worktrees, this returns the main repository root (not the worktree root).
 func getMainRepoRoot(repoPath string) (string, error) {
+	gitEnv := gitLoaderEnvironment()
+
 	// First, check if we're in a git repository at all
-	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd := exec.Command("git", "--no-replace-objects", "rev-parse", "--show-toplevel")
 	cmd.Dir = repoPath
+	cmd.Env = gitEnv
 	topLevelOut, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("not a git repository: %w", err)
@@ -837,8 +957,9 @@ func getMainRepoRoot(repoPath string) (string, error) {
 	// Check if this is a worktree by looking at the git-common-dir
 	// For regular repos: git-common-dir == git-dir
 	// For worktrees: git-common-dir points to main repo's .git
-	cmd = exec.Command("git", "rev-parse", "--path-format=absolute", "--git-common-dir")
+	cmd = exec.Command("git", "--no-replace-objects", "rev-parse", "--path-format=absolute", "--git-common-dir")
 	cmd.Dir = repoPath
+	cmd.Env = gitEnv
 	commonDirOut, err := cmd.Output()
 	if err != nil {
 		// Fallback: not a worktree or old git version
@@ -846,8 +967,9 @@ func getMainRepoRoot(repoPath string) (string, error) {
 	}
 	commonDir := strings.TrimSpace(string(commonDirOut))
 
-	cmd = exec.Command("git", "rev-parse", "--path-format=absolute", "--git-dir")
+	cmd = exec.Command("git", "--no-replace-objects", "rev-parse", "--path-format=absolute", "--git-dir")
 	cmd.Dir = repoPath
+	cmd.Env = gitEnv
 	gitDirOut, err := cmd.Output()
 	if err != nil {
 		return worktreeRoot, nil
@@ -1703,9 +1825,19 @@ func countLines(data []byte) int {
 	return n
 }
 
+// MaxJSONLLineSizeBytes returns the effective default maximum JSONL line size
+// in bytes, honoring BV_MAX_LINE_SIZE_MB when set and falling back to
+// DefaultMaxBufferSize (10 MiB).
+func MaxJSONLLineSizeBytes() int {
+	if fromEnv := MaxLineSizeFromEnv(); fromEnv > 0 {
+		return fromEnv
+	}
+	return DefaultMaxBufferSize
+}
+
 func effectiveMaxCapacity(requested int) int {
 	if requested <= 0 {
-		return DefaultMaxBufferSize
+		return MaxJSONLLineSizeBytes()
 	}
 	// bufio.Reader clamps smaller buffers to its internal minimum. Use the same
 	// effective cap in the parallel path so boundary behavior matches.

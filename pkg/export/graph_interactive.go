@@ -4,7 +4,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -330,6 +329,8 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			projectName = "graph"
 		}
 		outputPath = GenerateInteractiveGraphFilename(projectName)
+	} else if err := validateExistingPathNotSymlinkOrDir(outputPath); err != nil {
+		return "", err
 	}
 
 	// Ensure .html extension
@@ -339,15 +340,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 
 	html := generateUltimateHTML(title, opts.DataHash, string(dataJSON), len(nodes), len(links), opts.ProjectName, forceGraphJS, markedJS)
 
-	// Ensure directory exists
-	dir := filepath.Dir(outputPath)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", fmt.Errorf("create dir: %w", err)
-		}
-	}
-
-	if err := os.WriteFile(outputPath, []byte(html), 0644); err != nil {
+	if err := SafeWriteOutput(outputPath, []byte(html), 0o644); err != nil {
 		return "", err
 	}
 

@@ -495,3 +495,111 @@ func TestOrphanDetector_WindowMatchesIndex(t *testing.T) {
 		t.Fatalf("usage_hints should document beads_only_commits: %v", orphans.UsageHints)
 	}
 }
+
+func TestOrphanDetector_SharesExplicitMatcherParityForBase36AndDotIDs(t *testing.T) {
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "alice@example.com")
+	runGit(t, repo, "config", "user.name", "Alice")
+
+	jsonl := filepath.Join(beadsDir, "issues.jsonl")
+	seed := `{"id":"bv-pzpv","title":"Correlation overhaul","status":"open","priority":1,"issue_type":"task"}` + "\n" +
+		`{"id":"bv-apal.20","title":"Dot child","status":"open","priority":1,"issue_type":"task"}` + "\n"
+	if err := os.WriteFile(jsonl, []byte(seed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "chore: seed beads")
+
+	writeCommit := func(path, content, msg string) string {
+		t.Helper()
+		full := filepath.Join(repo, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, repo, "add", path)
+		cmd := exec.Command("git", "commit", "-m", msg)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Other", "GIT_AUTHOR_EMAIL=other@example.com",
+			"GIT_COMMITTER_NAME=Other", "GIT_COMMITTER_EMAIL=other@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("commit %q: %v\n%s", msg, err, out)
+		}
+		out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	shaBase36 := writeCommit("pkg/a.go", "package pkg\n", "fix(bv-pzpv): wire Aho-Corasick matcher")
+	shaDot := writeCommit("pkg/b.go", "package pkg\n", "Closes [BV-APAL.20].")
+	shaNegPath := writeCommit("pkg/bv-pzpv/c.go", "package bvpzpv\n", "chore: refactor pkg/bv-pzpv/c.go and https://example.com/bv-apal.20")
+
+	beads := []BeadInfo{
+		{ID: "bv-pzpv", Title: "Correlation overhaul", Status: "open"},
+		{ID: "bv-apal.20", Title: "Dot child", Status: "open"},
+	}
+	report, err := NewCorrelator(repo, jsonl).GenerateReport(beads, CorrelatorOptions{Limit: 100})
+	if err != nil {
+		t.Fatalf("GenerateReport: %v", err)
+	}
+
+	if _, ok := report.CommitIndex[shaBase36]; !ok {
+		t.Fatalf("expected base36 explicit commit %s to be correlated", shaBase36[:7])
+	}
+	if _, ok := report.CommitIndex[shaDot]; !ok {
+		t.Fatalf("expected dot-hierarchical explicit commit %s to be correlated", shaDot[:7])
+	}
+	if _, ok := report.CommitIndex[shaNegPath]; ok {
+		t.Fatalf("negative-control path/URL commit %s must not false-correlate", shaNegPath[:7])
+	}
+
+	detector := NewOrphanDetectorAt(report, repo, time.Now())
+	orphans, err := detector.DetectOrphans(ExtractOptions{Limit: 100})
+	if err != nil {
+		t.Fatalf("DetectOrphans: %v", err)
+	}
+	if orphans.Stats.CorrelatedCount != 2 || orphans.Stats.OrphanCount != 1 {
+		t.Fatalf("orphan stats = %+v, want correlated=2 orphan=1", orphans.Stats)
+	}
+	for _, cand := range orphans.Candidates {
+		if cand.SHA == shaBase36 || cand.SHA == shaDot {
+			t.Fatalf("explicitly correlated commit %s was flagged as orphan", cand.SHA[:7])
+		}
+		for _, sig := range cand.Signals {
+			if sig.Signal == SignalOrphanMessage {
+				t.Fatalf("negative-control path/URL commit %s received false SignalOrphanMessage: %+v", cand.SHA[:7], sig)
+			}
+		}
+	}
+
+	// Verify ReverseLookup.FindOrphanCommits also excludes base36 & dot-child commits
+	// even when CommitIndex is unpopulated (exercising shared ExplicitMatcher directly).
+	unindexedReport := &HistoryReport{
+		Histories:   report.Histories,
+		CommitIndex: CommitIndex{},
+	}
+	rl := NewReverseLookupWithRepo(unindexedReport, repo)
+	rawOrphans, rlStats, err := rl.FindOrphanCommits(ExtractOptions{Limit: 100})
+	if err != nil {
+		t.Fatalf("FindOrphanCommits: %v", err)
+	}
+	if rlStats.CorrelatedCmts != 2 || rlStats.OrphanCommits != 1 {
+		t.Fatalf("ReverseLookup stats = %+v, want correlated=2 orphan=1", rlStats)
+	}
+	for _, oc := range rawOrphans {
+		if oc.SHA == shaBase36 || oc.SHA == shaDot {
+			t.Fatalf("FindOrphanCommits returned explicitly referenced commit %s", oc.SHA[:7])
+		}
+	}
+}

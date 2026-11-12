@@ -118,9 +118,10 @@ func perCommitCoCommitCachePath(create bool) (string, error) {
 		base = filepath.Join(dir, correlationDiskCacheDirName)
 	}
 	if create {
-		if err := os.MkdirAll(base, 0o755); err != nil {
+		if err := os.MkdirAll(base, 0o700); err != nil {
 			return "", err
 		}
+		_ = os.Chmod(base, 0o700)
 	}
 	return filepath.Join(base, perCommitCoCommitCacheFileName), nil
 }
@@ -293,7 +294,7 @@ func loadPerCommitCoCommit(namespace string) map[string]perCommitCoCommitEntry {
 	if err != nil {
 		return nil
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return nil
 	}
@@ -334,7 +335,7 @@ func storePerCommitCoCommit(namespace string, fresh map[string]perCommitCoCommit
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return
 	}
@@ -343,6 +344,7 @@ func storePerCommitCoCommit(namespace string, fresh map[string]perCommitCoCommit
 		return
 	}
 	defer func() { _ = unlockFile(f) }()
+	_ = f.Chmod(0o600)
 
 	cf := readPerCommitCoCommitCacheLocked(f)
 	if cf.Entries == nil {

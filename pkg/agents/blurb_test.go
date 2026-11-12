@@ -4,6 +4,10 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 func TestContainsBlurb(t *testing.T) {
@@ -566,7 +570,7 @@ func TestUpdateBlurbFutureVersionFailsClosed(t *testing.T) {
 
 func TestUpdateBlurbFutureVersionRevealedByLegacyRemovalFailsClosed(t *testing.T) {
 	content := "# Header\n\n" + LegacyBlurbContent + "\n" +
-		"<!-- bv-agent-instructions-v9 -->\n" +
+		fmt.Sprintf("<!-- bv-agent-instructions-v%d -->\n", BlurbVersion+1) +
 		"```bash\nfuture command\n```\n" +
 		"newer instructions\n<!-- end-bv-agent-instructions -->\n"
 
@@ -624,7 +628,7 @@ func TestRemoveBlurbMalformedMarkersFailClosed(t *testing.T) {
 }
 
 func TestRemoveBlurbFutureVersionFailsClosed(t *testing.T) {
-	content := "# Header\n\n<!-- bv-agent-instructions-v8 -->\nnewer\n<!-- end-bv-agent-instructions -->\n"
+	content := fmt.Sprintf("# Header\n\n<!-- bv-agent-instructions-v%d -->\nnewer\n<!-- end-bv-agent-instructions -->\n", BlurbVersion+1)
 	if got := RemoveBlurb(content); got != content {
 		t.Fatalf("RemoveBlurb() removed future instructions:\n got: %q\nwant: %q", got, content)
 	}
@@ -635,7 +639,7 @@ func TestRemoveBlurbFutureVersionFailsClosed(t *testing.T) {
 
 func TestRemoveBlurbFutureVersionRevealedByLegacyRemovalFailsClosed(t *testing.T) {
 	content := "# Header\n\n" + LegacyBlurbContent + "\n" +
-		"<!-- bv-agent-instructions-v8 -->\n" +
+		fmt.Sprintf("<!-- bv-agent-instructions-v%d -->\n", BlurbVersion+1) +
 		"```bash\nfuture command\n```\n" +
 		"newer\n<!-- end-bv-agent-instructions -->\n"
 	if got := RemoveBlurb(content); got != content {
@@ -2124,5 +2128,105 @@ func TestNestedEmptyListAfterBlankPreservesOuterScope(t *testing.T) {
 	}
 	if got := RemoveBlurb(content); got != content {
 		t.Fatalf("RemoveBlurb() changed documentation inside outer list:\n got: %q\nwant: %q", got, content)
+	}
+}
+
+func TestAgentBlurb_ClaimsMatchLiveTriageContract(t *testing.T) {
+	if BlurbVersion < 8 {
+		t.Fatalf("BlurbVersion = %d, want >= 8", BlurbVersion)
+	}
+	if !strings.HasPrefix(AgentBlurb, BlurbStartMarker) {
+		t.Fatalf("AgentBlurb must start with BlurbStartMarker %q", BlurbStartMarker)
+	}
+	if strings.Contains(AgentBlurb, "Recommendations can include blocked or assigned work") {
+		t.Fatalf("AgentBlurb still contains obsolete v7 readiness claim contradicting ready-by-default triage")
+	}
+	for _, requiredToken := range []string{
+		"bv --robot-triage",
+		"--robot-include-inactive",
+		"triage.recommendations",
+		"triage.quick_ref.top_picks",
+		"br update <id> --claim --json",
+		"bd update <id> --claim --json",
+	} {
+		if !strings.Contains(AgentBlurb, requiredToken) {
+			t.Fatalf("AgentBlurb missing required contract token %q", requiredToken)
+		}
+	}
+
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	future := now.Add(7 * 24 * time.Hour)
+	issues := []model.Issue{
+		{
+			ID:        "bv-ready",
+			Title:     "Ready leaf",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "bv-blocked",
+			Title:     "Dependency blocked",
+			Status:    model.StatusOpen,
+			Priority:  0,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-blocked", DependsOnID: "bv-ready", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:         "bv-deferred",
+			Title:      "Future deferred",
+			Status:     model.StatusOpen,
+			Priority:   0,
+			IssueType:  model.TypeTask,
+			DeferUntil: &future,
+			UpdatedAt:  now,
+		},
+		{
+			ID:        "bv-epic",
+			Title:     "Container epic",
+			Status:    model.StatusOpen,
+			Priority:  0,
+			IssueType: model.TypeEpic,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "bv-epic.1",
+			Title:     "Epic open child",
+			Status:    model.StatusBlocked,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-epic.1", DependsOnID: "bv-epic", Type: model.DepParentChild},
+			},
+		},
+	}
+
+	defaultTriage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
+		WaitForPhase2:  true,
+		ActionableOnly: true,
+	}, now)
+	if len(defaultTriage.Recommendations) != 1 || defaultTriage.Recommendations[0].ID != "bv-ready" || !defaultTriage.Recommendations[0].Claimable {
+		t.Fatalf("default ActionableOnly=true triage violated AgentBlurb v8 contract: got %+v, want [bv-ready (claimable=true)]", defaultTriage.Recommendations)
+	}
+	if len(defaultTriage.QuickRef.TopPicks) != 1 || defaultTriage.QuickRef.TopPicks[0].ID != "bv-ready" {
+		t.Fatalf("default top_picks violated AgentBlurb v8 contract: got %+v", defaultTriage.QuickRef.TopPicks)
+	}
+
+	inactiveTriage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
+		WaitForPhase2:  true,
+		ActionableOnly: false,
+	}, now)
+	if len(inactiveTriage.Recommendations) < 4 {
+		t.Fatalf("--robot-include-inactive (ActionableOnly=false) failed to include blocked/deferred/container items: got %+v", inactiveTriage.Recommendations)
+	}
+	for _, rec := range inactiveTriage.Recommendations {
+		if rec.ID != "bv-ready" && rec.Claimable {
+			t.Fatalf("inactive item %s falsely marked Claimable=true under --robot-include-inactive", rec.ID)
+		}
 	}
 }

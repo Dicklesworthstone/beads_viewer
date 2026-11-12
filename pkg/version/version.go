@@ -30,25 +30,33 @@ func init() {
 	// this bug — "bv --version" printed just "bv".
 	//
 	// The fix: inject into the *unexported* `version` variable, validate
-	// the injected value, and always fall through to the hardcoded
-	// fallback as a last resort so Version is never empty.
-	switch {
-	case isUsableVersion(version):
-		// 1. Build-time ldflags injection (GoReleaser, Nix, manual).
-		Version = normalizeVersion(version)
-	case versionFromBuildInfo() != "":
-		// 2. Module version from "go install ...@vX.Y.Z".
-		Version = versionFromBuildInfo()
-	default:
-		// 3. Hardcoded fallback (always available, manually bumped per release).
-		Version = fallback
-	}
+	// the injected value, distinguish untagged VCS development builds via
+	// "-dev+<shortrev>[.dirty]" so local builds never impersonate a sealed
+	// release tag, and always fall through to the hardcoded fallback as a
+	// last resort so Version is never empty.
+	info, ok := debug.ReadBuildInfo()
+	Version = resolveVersion(version, info, ok)
+}
 
-	// Defensive guarantee: Version must never be empty regardless of how
-	// the above branches resolve.  This prevents a repeat of #126.
-	if Version == "" {
-		Version = fallback
+func resolveVersion(injected string, info *debug.BuildInfo, hasBuildInfo bool) string {
+	switch {
+	case isUsableVersion(injected):
+		// 1. Build-time ldflags injection (GoReleaser, Nix, manual).
+		return normalizeVersion(injected)
+	case hasBuildInfo && info != nil:
+		// 2. Tagged module version from "go install ...@vX.Y.Z".
+		if rel := releaseModuleVersion(info.Main.Version); rel != "" {
+			return rel
+		}
+		// 3. Untagged local / pseudo-version / dirty VCS build: never claim a sealed release tag.
+		if dev := devVersionFromBuildInfo(info); dev != "" {
+			return dev
+		}
 	}
+	if fallback != "" {
+		return fallback
+	}
+	return "v0.0.0-dev"
 }
 
 // isUsableVersion returns true if v looks like an actual version string
@@ -86,17 +94,6 @@ func normalizeVersion(v string) string {
 	return v
 }
 
-// versionFromBuildInfo extracts the module version stamped by the Go toolchain
-// when the binary is built via "go install ...@vX.Y.Z". Returns empty string
-// for local development builds (which produce "(devel)" or pseudo-versions).
-func versionFromBuildInfo() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
-		return ""
-	}
-	return releaseModuleVersion(info.Main.Version)
-}
-
 // Go stamps three pseudo-version forms: no base tag, a release base, or a
 // prerelease base. Match the complete timestamp/revision form so ordinary
 // prerelease tags such as v1.2.3-0.alpha remain usable.
@@ -116,4 +113,60 @@ func releaseModuleVersion(v string) string {
 		return ""
 	}
 	return v
+}
+
+// devVersionFromBuildInfo formats untagged local/pseudo-version/dirty builds as
+// "<fallback>-dev" or "<fallback>-dev+<shortrev>[.dirty]" so an unsealed dev
+// binary never impersonates a published release tag while remaining valid SemVer
+// recognized as a development prerelease by pkg/updater.
+func devVersionFromBuildInfo(info *debug.BuildInfo) string {
+	if info == nil {
+		return ""
+	}
+	mv := strings.TrimSpace(info.Main.Version)
+	isDevModule := mv == "(devel)"
+	if !isDevModule && mv != "" {
+		norm := mv
+		if norm[0] != 'v' {
+			norm = "v" + norm
+		}
+		isDevModule = pseudoVersionPattern.MatchString(norm) || strings.HasSuffix(norm, "+dirty")
+	}
+	var rev string
+	var dirty bool
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = sanitizeSemverIdent(s.Value, 12)
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if !isDevModule && rev == "" && !dirty {
+		return ""
+	}
+	base := fallback + "-dev"
+	switch {
+	case rev != "" && dirty:
+		return base + "+" + rev + ".dirty"
+	case rev != "":
+		return base + "+" + rev
+	case dirty:
+		return base + "+dirty"
+	default:
+		return base
+	}
+}
+
+func sanitizeSemverIdent(raw string, maxLen int) string {
+	var b strings.Builder
+	for _, r := range raw {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			b.WriteRune(r)
+			if maxLen > 0 && b.Len() >= maxLen {
+				break
+			}
+		}
+	}
+	return b.String()
 }

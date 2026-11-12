@@ -10,19 +10,126 @@
 # It also extracts the production version-check function and runs real local
 # processes to check its deadline and diagnostics. This is portable function
 # coverage, not native Windows executable or source-install first-start proof.
-# Usage: tests/scripts/install_ps1_test.sh   (needs pwsh on PATH or PWSH=/path/to/pwsh, and python3)
+# Usage:
+#   tests/scripts/install_ps1_test.sh                         (needs pwsh on PATH or PWSH=/path/to/pwsh, and python3)
+#   tests/scripts/install_ps1_test.sh --server-lifecycle-only (verifies HTTP server PID tracking + cleanup teardown without pwsh)
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-pwsh="${PWSH:-pwsh}"
-command -v "$pwsh" >/dev/null || { echo "install_ps1_test: pwsh not found (set PWSH=/path/to/pwsh)"; exit 2; }
+mode="full"
+lifecycle_record_file=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --server-lifecycle-only)
+      mode="lifecycle-parent"
+      ;;
+    --_server-lifecycle-child)
+      [ "$#" -ge 2 ] || { echo "install_ps1_test: missing record file argument" >&2; exit 2; }
+      mode="lifecycle-child"
+      lifecycle_record_file="$2"
+      shift
+      ;;
+    *)
+      echo "install_ps1_test: unsupported argument: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
 command -v python3 >/dev/null || { echo "install_ps1_test: python3 is required"; exit 2; }
 
+is_loopback_port_closed() {
+  local check_port="$1"
+  python3 - "$check_port" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(0.1)
+try:
+    rc = s.connect_ex(("127.0.0.1", int(sys.argv[1])))
+finally:
+    s.close()
+sys.exit(0 if rc != 0 else 1)
+PY
+}
+
+if [ "$mode" = "lifecycle-parent" ]; then
+  parent_tmp="$(mktemp -d "${TMPDIR:-/tmp}/bv-install-ps1-lifecycle.XXXXXX")"
+  trap 'rm -rf "$parent_tmp"' EXIT
+  record_file="$parent_tmp/server-record.txt"
+  bash "$0" --_server-lifecycle-child "$record_file"
+  [ -f "$record_file" ] || { echo "FAIL: install_ps1_test: child did not write server record" >&2; exit 1; }
+  read -r recorded_pid recorded_port recorded_comm < "$record_file"
+  [ -n "$recorded_pid" ] && [ -n "$recorded_port" ] || { echo "FAIL: install_ps1_test: incomplete server record" >&2; exit 1; }
+  case "$recorded_comm" in
+    python*) ;;
+    *) echo "FAIL: install_ps1_test: server_pid $recorded_pid command was '$recorded_comm', expected python3" >&2; exit 1 ;;
+  esac
+  if kill -0 "$recorded_pid" 2>/dev/null; then
+    echo "FAIL: install_ps1_test: server_pid $recorded_pid survived child exit" >&2
+    exit 1
+  fi
+  if ! is_loopback_port_closed "$recorded_port"; then
+    echo "FAIL: install_ps1_test: port 127.0.0.1:$recorded_port remained open after child exit" >&2
+    exit 1
+  fi
+  echo "install_ps1_test: PASS (--server-lifecycle-only: pid=$recorded_pid comm=$recorded_comm port=$recorded_port torn down cleanly)"
+  exit 0
+fi
+
+pwsh="${PWSH:-pwsh}"
+if [ "$mode" = "full" ]; then
+  command -v "$pwsh" >/dev/null || { echo "install_ps1_test: pwsh not found (set PWSH=/path/to/pwsh)"; exit 2; }
+fi
+
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/bv-install-ps1-test.XXXXXX")"
+port=""
 server_pid=""
+# shellcheck disable=SC2329 # Invoked via trap cleanup EXIT below.
 cleanup() {
-  [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null
-  printf 'install_ps1_test: retained artifacts at %s\n' "$tmp"
+  local exit_rc=$?
+  local teardown_failed=0
+  if [ -n "$server_pid" ]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      if ! kill -0 "$server_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.05
+    done
+    if kill -0 "$server_pid" 2>/dev/null; then
+      kill -9 "$server_pid" 2>/dev/null || true
+      wait "$server_pid" 2>/dev/null || true
+    fi
+    if kill -0 "$server_pid" 2>/dev/null; then
+      echo "FAIL: install_ps1_test: server process $server_pid still running after cleanup" >&2
+      teardown_failed=1
+    fi
+  fi
+  if [ -n "$port" ]; then
+    local closed=0
+    for _ in $(seq 1 50); do
+      if is_loopback_port_closed "$port"; then
+        closed=1
+        break
+      fi
+      sleep 0.05
+    done
+    if [ "$closed" -ne 1 ]; then
+      echo "FAIL: install_ps1_test: loopback port 127.0.0.1:$port still open after cleanup" >&2
+      teardown_failed=1
+    fi
+  fi
+  if [ "$mode" = "lifecycle-child" ]; then
+    rm -rf "$tmp"
+  else
+    printf 'install_ps1_test: retained artifacts at %s\n' "$tmp"
+  fi
+  if [ "$teardown_failed" -ne 0 ] && [ "$exit_rc" -eq 0 ]; then
+    exit 1
+  fi
+  exit "$exit_rc"
 }
 trap cleanup EXIT
 
@@ -50,14 +157,28 @@ cat > "$site/api-nochecksums/releases/tags/$tag" <<EOF
 {"tag_name": "$tag", "assets": [{"name": "$asset"}]}
 EOF
 
-# Serve the fake release on a free loopback port.
+# Serve the fake release on a free loopback port directly (no subshell so $! is python3).
 port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-( cd "$site" && python3 -m http.server "$port" --bind 127.0.0.1 >"$tmp/server.log" 2>&1 ) &
+python3 -m http.server "$port" --bind 127.0.0.1 --directory "$site" >"$tmp/server.log" 2>&1 &
 server_pid=$!
+server_ready=0
 for _ in $(seq 1 50); do
-  if curl -s -o /dev/null "http://127.0.0.1:$port/api/releases/latest"; then break; fi
+  if curl -fsS -o /dev/null "http://127.0.0.1:$port/api/releases/latest" 2>/dev/null; then
+    server_ready=1
+    break
+  fi
   sleep 0.1
 done
+[ "$server_ready" -eq 1 ] || { echo "FAIL: install_ps1_test: HTTP server failed to bind 127.0.0.1:$port" >&2; exit 1; }
+
+if [ "$mode" = "lifecycle-child" ]; then
+  kill -0 "$server_pid" 2>/dev/null || { echo "FAIL: install_ps1_test: server_pid $server_pid not alive" >&2; exit 1; }
+  server_comm="$(ps -p "$server_pid" -o comm= | tr -d '[:space:]')"
+  payload="$(curl -fsS "http://127.0.0.1:$port/api/releases/latest")"
+  [[ "$payload" == *"\"tag_name\": \"$tag\""* ]] || { echo "FAIL: install_ps1_test: unexpected payload: $payload" >&2; exit 1; }
+  printf '%s %s %s\n' "$server_pid" "$port" "$server_comm" > "$lifecycle_record_file"
+  exit 0
+fi
 
 fail=0
 run_installer() {

@@ -102,6 +102,113 @@ func (s *GraphStats) GenerateInsights(limit int) Insights {
 	}
 }
 
+// GenerateScopedInsights translates graph statistics into actionable insights
+// scoped to the analyzer's candidate set. When includeInactive is false,
+// operational bottleneck lists (Bottlenecks, Articulation, Keystones, Slack,
+// Orphans) exclude closed/tombstoned historical beads so long-resolved root
+// epics do not crowd out live bottlenecks. When includeInactive is true, all
+// candidate issues (including closed historical topology) remain eligible.
+func (a *Analyzer) GenerateScopedInsights(s *GraphStats, limit int, includeInactive bool) Insights {
+	if s == nil {
+		analyzed := a.Analyze()
+		s = &analyzed
+	}
+	if a == nil {
+		return s.GenerateInsights(limit)
+	}
+
+	eligible := func(id string) bool {
+		if !a.IsCandidate(id) {
+			return false
+		}
+		if includeInactive {
+			return true
+		}
+		issue, exists := a.issueMap[id]
+		return exists && !isClosedLikeStatus(issue.Status)
+	}
+	candidateOnly := func(id string) bool {
+		return a.IsCandidate(id)
+	}
+	filterFloatMap := func(in map[string]float64, keep func(string) bool) map[string]float64 {
+		out := make(map[string]float64, len(in))
+		for id, val := range in {
+			if keep(id) {
+				out[id] = val
+			}
+		}
+		return out
+	}
+	filterIntMap := func(in map[string]int, keep func(string) bool) map[string]int {
+		out := make(map[string]int, len(in))
+		for id, val := range in {
+			if keep(id) {
+				out[id] = val
+			}
+		}
+		return out
+	}
+	filterStrings := func(in []string, keep func(string) bool) []string {
+		out := make([]string, 0, len(in))
+		for _, id := range in {
+			if keep(id) {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+
+	var betweenness map[string]float64
+	var coreNum map[string]int
+	var artPts []string
+	if includeInactive {
+		betweenness = filterFloatMap(s.Betweenness(), candidateOnly)
+		coreNum = filterIntMap(s.CoreNumber(), candidateOnly)
+		artPts = filterStrings(s.ArticulationPoints(), candidateOnly)
+	} else {
+		activeBW, activeCore, activeArt := a.activeSubgraphMetrics(s)
+		betweenness = filterFloatMap(activeBW, eligible)
+		coreNum = filterIntMap(activeCore, eligible)
+		artPts = filterStrings(activeArt, eligible)
+	}
+	criticalPath := filterFloatMap(s.CriticalPathScore(), eligible)
+	slack := filterFloatMap(s.Slack(), eligible)
+	orphans := filterStrings(findOrphans(s.OutDegree), eligible)
+
+	eigenvector := filterFloatMap(s.Eigenvector(), eligible)
+	hubs := filterFloatMap(s.Hubs(), eligible)
+	authorities := filterFloatMap(s.Authorities(), eligible)
+	if includeInactive {
+		eigenvector = filterFloatMap(s.Eigenvector(), candidateOnly)
+		hubs = filterFloatMap(s.Hubs(), candidateOnly)
+		authorities = filterFloatMap(s.Authorities(), candidateOnly)
+	}
+
+	cycles := s.Cycles()
+	if cycles == nil {
+		cycles = make([][]string, 0)
+	}
+
+	if limit <= 0 {
+		limit = s.NodeCount
+	}
+
+	return Insights{
+		Bottlenecks:    getTopItems(betweenness, limit),
+		Keystones:      getTopItems(criticalPath, limit),
+		Influencers:    getTopItems(eigenvector, limit),
+		Hubs:           getTopItems(hubs, limit),
+		Authorities:    getTopItems(authorities, limit),
+		Cores:          getTopItemsInt(coreNum, limit),
+		Articulation:   limitStrings(artPts, limit),
+		Slack:          getTopItems(slack, limit),
+		Orphans:        limitStrings(orphans, limit),
+		Cycles:         cycles,
+		ClusterDensity: s.Density,
+		Stats:          s,
+	}
+}
+
 func findOrphans(outDegree map[string]int) []string {
 	ids := make([]string, 0)
 	for id, deg := range outDegree {

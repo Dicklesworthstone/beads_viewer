@@ -1,12 +1,18 @@
 package ui
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -449,7 +455,7 @@ func TestKeyDispatch_ComboCancelledByOtherKey(t *testing.T) {
 }
 
 // TestKeyDispatch_Regression_QInHistoryClosesHistory verifies that 'q' in history view
-// closes history and returns to list.
+// closes history and returns to list without opening quit confirmation.
 func TestKeyDispatch_Regression_QInHistoryClosesHistory(t *testing.T) {
 	m := setupTestModel(t)
 
@@ -461,59 +467,95 @@ func TestKeyDispatch_Regression_QInHistoryClosesHistory(t *testing.T) {
 		t.Fatalf("Expected history view after 'h', got isHistoryView=%v focused=%v", m.isHistoryView, m.focused)
 	}
 
-	// Press 'q' - should close history (falls through to quit confirm or handled by global)
-	updated, _ = m.Update(keyMsg("q"))
+	// Press 'q' - must close history cleanly back to focusList without quit modal
+	updated, cmd := m.Update(keyMsg("q"))
 	m = updated.(*Model)
 
-	// 'q' in history should close history view (or show quit confirm if at top level)
-	// Based on the code, 'q' is not in the history handler's key list, so it falls through
-	// to global handling which closes overlays.
-	t.Logf("focus=history key=q expected=close_history actual=isHistoryView:%v focused:%v", m.isHistoryView, m.focused)
+	if m.isHistoryView {
+		t.Fatalf("expected 'q' in history view to clear isHistoryView, got true")
+	}
+	if m.focused != focusList {
+		t.Fatalf("expected 'q' in history view to return to focusList, got %v", m.focused)
+	}
+	if m.showQuitConfirm {
+		t.Fatalf("expected 'q' in history view not to trigger showQuitConfirm")
+	}
+	if cmd != nil {
+		t.Fatalf("expected 'q' in history view not to emit a quit command")
+	}
 }
 
 // TestKeyDispatch_Regression_EscInTreeReturnsList verifies that ESC in tree view
-// returns to list.
+// returns cleanly to focusList while preserving any active list filter.
 func TestKeyDispatch_Regression_EscInTreeReturnsList(t *testing.T) {
 	m := setupTestModel(t)
 
+	// Activate a status filter in list view before entering tree view
+	updated, _ := m.Update(keyMsg("o"))
+	m = updated.(*Model)
+	if m.currentFilter != "open" {
+		t.Fatalf("expected currentFilter=%q after 'o', got %q", "open", m.currentFilter)
+	}
+
 	// Toggle tree view on (E, not f - f is FlowMatrix)
-	updated, _ := m.Update(keyMsg("E"))
+	updated, _ = m.Update(keyMsg("E"))
 	m = updated.(*Model)
 
 	if m.focused != focusTree {
 		t.Fatalf("Expected focusTree after 'E', got %v", m.focused)
 	}
 
-	// Press ESC - should return to list
+	// Press ESC - must exit focusTree back to focusList and preserve currentFilter
 	updated, _ = m.Update(keyMsg("esc"))
 	m = updated.(*Model)
 
-	// ESC is handled by tree and should close tree or return to list
-	// Based on code: "esc" is in tree handler's list
-	t.Logf("focus=tree key=esc expected=return_to_list actual=focused:%v", m.focused)
+	if m.focused != focusList {
+		t.Fatalf("expected ESC in tree view to return to focusList, got %v", m.focused)
+	}
+	if m.currentFilter != "open" {
+		t.Fatalf("expected ESC in tree view to preserve list filter %q, got %q", "open", m.currentFilter)
+	}
+	if m.showQuitConfirm {
+		t.Fatalf("expected ESC in tree view not to open quit confirm")
+	}
 }
 
 // TestKeyDispatch_Regression_FInHistoryTogglesFileTree verifies that 'f' in history view
-// toggles the file tree within history.
+// toggles the file tree within history rather than switching to Flow Matrix.
 func TestKeyDispatch_Regression_FInHistoryTogglesFileTree(t *testing.T) {
 	m := setupTestModel(t)
 
-	// Toggle history view on
+	// Toggle history view on and mark a history report with files as current
 	updated, _ := m.Update(keyMsg("h"))
 	m = updated.(*Model)
-
-	if m.focused != focusHistory {
-		t.Fatalf("Expected focusHistory after 'h', got %v", m.focused)
+	if m.focused != focusHistory || !m.isHistoryView {
+		t.Fatalf("Expected focusHistory after 'h', got focused=%v isHistoryView=%v", m.focused, m.isHistoryView)
 	}
+	report := createTestHistoryReportWithFiles()
+	m.historyView = NewHistoryModel(report, testTheme())
+	makeHistoryReportCurrent(m, report)
 
-	// Press 'f' - should toggle file tree within history
+	// First 'f' opens the file tree panel inside history view; Tab cycles focus into it
 	updated, _ = m.Update(keyMsg("f"))
 	m = updated.(*Model)
 
-	// 'f' is handled by history handler
-	// Verify we're still in history (file tree is internal state)
-	t.Logf("focus=history key=f expected=toggle_file_tree actual=focused:%v fileTreeFocus:%v",
-		m.focused, m.historyView.FileTreeHasFocus())
+	if m.focused != focusHistory || !m.isHistoryView {
+		t.Fatalf("expected 'f' in history view to stay in focusHistory, got focused=%v isHistoryView=%v", m.focused, m.isHistoryView)
+	}
+	if !m.historyView.IsFileTreeVisible() {
+		t.Fatalf("expected 'f' in history view to make file tree visible")
+	}
+
+	// Second 'f' hides the file tree while staying in history view
+	updated, _ = m.Update(keyMsg("f"))
+	m = updated.(*Model)
+
+	if m.focused != focusHistory || !m.isHistoryView {
+		t.Fatalf("expected second 'f' in history view to stay in focusHistory, got focused=%v isHistoryView=%v", m.focused, m.isHistoryView)
+	}
+	if m.historyView.IsFileTreeVisible() {
+		t.Fatalf("expected second 'f' in history view to hide file tree")
+	}
 }
 
 func TestKeyDispatch_Regression_BoardSearchConsumesInput(t *testing.T) {
@@ -818,35 +860,109 @@ func TestKeyDispatch_Regression_HistoryFileTreeEscStaysInHistory(t *testing.T) {
 	}
 }
 
-// TestKeyDispatch_ModalConsumesAllKeys verifies that modals consume all keys
-// and don't pass them through to underlying views.
+// TestKeyDispatch_ModalConsumesAllKeys verifies that modals consume view-toggle keys
+// and never pass them through to underlying view switches.
 func TestKeyDispatch_ModalConsumesAllKeys(t *testing.T) {
-	m := setupTestModel(t)
+	viewToggleKeys := []string{"b", "g", "h", "f", "i", "a", "E", "[", "]", "P"}
 
-	// Show help modal
-	updated, _ := m.Update(keyMsg("?"))
-	m = updated.(*Model)
+	t.Run("help_overlay_consumes_without_view_passthrough", func(t *testing.T) {
+		for _, key := range viewToggleKeys {
+			m := setupTestModel(t)
+			updated, _ := m.Update(keyMsg("?"))
+			m = updated.(*Model)
+			if !m.showHelp || m.focused != focusHelp {
+				t.Fatalf("expected help modal after '?', got showHelp=%v focused=%v", m.showHelp, m.focused)
+			}
 
-	if !m.showHelp {
-		t.Fatalf("Expected help modal after '?'")
-	}
+			updated, _ = m.Update(keyMsg(key))
+			m = updated.(*Model)
 
-	// Keys that would normally toggle views
-	viewToggleKeys := []string{"b", "g", "h", "f", "i", "a"}
-
-	for _, key := range viewToggleKeys {
-		updated, _ := m.Update(keyMsg(key))
-		result := updated.(*Model)
-
-		// Modal should still be shown - keys are consumed
-		if result.showHelp && result.focused == focusHelp {
-			// Modal correctly consumed the key
-			t.Logf("focus=help key=%s expected=consumed actual=modal_still_shown", key)
-		} else {
-			// Key escaped the modal
-			t.Logf("focus=help key=%s expected=consumed actual=modal_dismissed/toggled (may be intended for dismiss)", key)
+			if key == "g" {
+				// 'g' scrolls help to top and keeps help open.
+				if !m.showHelp || m.focused != focusHelp {
+					t.Fatalf("expected 'g' in help modal to stay in focusHelp, got showHelp=%v focused=%v", m.showHelp, m.focused)
+				}
+			} else {
+				// Non-navigation keys dismiss help back to focusBeforeHelp (focusList)
+				// and MUST NOT pass through to open any underlying view.
+				if m.showHelp {
+					t.Fatalf("expected %q in help modal to dismiss help, got showHelp=true", key)
+				}
+				if m.focused != focusList {
+					t.Fatalf("key %q leaked through help modal: focused=%v, want focusList", key, m.focused)
+				}
+				if m.isBoardView || m.isGraphView || m.isHistoryView || m.isActionableView || m.isSprintView {
+					t.Fatalf("key %q leaked view flags through help modal: board=%v graph=%v history=%v actionable=%v sprint=%v",
+						key, m.isBoardView, m.isGraphView, m.isHistoryView, m.isActionableView, m.isSprintView)
+				}
+			}
 		}
-	}
+	})
+
+	t.Run("tutorial_modal_stays_open_on_view_keys", func(t *testing.T) {
+		m := setupTestModel(t)
+		updated, _ := m.Update(keyMsg("`"))
+		m = updated.(*Model)
+		if !m.showTutorial || m.focused != focusTutorial {
+			t.Fatalf("expected tutorial modal after '`', got showTutorial=%v focused=%v", m.showTutorial, m.focused)
+		}
+
+		for _, key := range []string{"b", "g", "h", "f", "i", "E", "[", "]", "P"} {
+			updated, _ = m.Update(keyMsg(key))
+			m = updated.(*Model)
+			if !m.showTutorial || m.focused != focusTutorial {
+				t.Fatalf("key %q escaped tutorial modal: showTutorial=%v focused=%v", key, m.showTutorial, m.focused)
+			}
+		}
+	})
+
+	t.Run("quit_confirm_consumes_without_view_passthrough", func(t *testing.T) {
+		for _, key := range viewToggleKeys {
+			m := setupTestModel(t)
+			updated, _ := m.Update(keyMsg("esc"))
+			m = updated.(*Model)
+			if !m.showQuitConfirm || m.focused != focusQuitConfirm {
+				t.Fatalf("expected quit confirm after ESC in unfiltered list, got showQuitConfirm=%v focused=%v", m.showQuitConfirm, m.focused)
+			}
+
+			updated, _ = m.Update(keyMsg(key))
+			m = updated.(*Model)
+			if m.showQuitConfirm || m.focused != focusList {
+				t.Fatalf("key %q in quit confirm: expected cancel back to focusList, got showQuitConfirm=%v focused=%v",
+					key, m.showQuitConfirm, m.focused)
+			}
+			if m.isBoardView || m.isGraphView || m.isHistoryView || m.isActionableView || m.isSprintView {
+				t.Fatalf("key %q leaked through quit confirm into view toggle", key)
+			}
+		}
+	})
+
+	t.Run("label_health_detail_modal_blocks_cross_view_leakage", func(t *testing.T) {
+		now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+		issues := []model.Issue{
+			{ID: "LH-1", Title: "Labeled issue", Status: model.StatusOpen, Priority: 1, Labels: []string{"backend"}, CreatedAt: now, UpdatedAt: now},
+		}
+		m := NewModel(issues, nil, "")
+		updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+		m = updated.(*Model)
+
+		updated, _ = m.Update(keyMsg("["))
+		m = updated.(*Model)
+		updated, _ = m.Update(keyMsg("h"))
+		m = updated.(*Model)
+		if !m.showLabelHealthDetail || m.focused != focusLabelDashboard {
+			t.Fatalf("expected label health detail modal after '[' then 'h', got show=%v focused=%v", m.showLabelHealthDetail, m.focused)
+		}
+
+		for _, key := range []string{"b", "g", "f", "i", "a", "E", "[", "]", "P"} {
+			updated, _ = m.Update(keyMsg(key))
+			m = updated.(*Model)
+			if !m.showLabelHealthDetail || m.focused != focusLabelDashboard {
+				t.Fatalf("key %q leaked out of label health detail modal: show=%v focused=%v",
+					key, m.showLabelHealthDetail, m.focused)
+			}
+		}
+	})
 }
 
 // TestKeyDispatch_ViewToggleTable tests critical view toggle combinations.
@@ -922,4 +1038,703 @@ func TestKeyDispatch_ViewToggleTable(t *testing.T) {
 			t.Logf("focus=%v key=%s expected=%s actual=focus:%v", tc.startFocus, tc.key, expected, result.focused)
 		})
 	}
+}
+
+// setupFSMModel constructs a fully populated Model suitable for exercising every
+// primary focus state (including Sprint, Insights heatmap drilldown, History with
+// file tree, Label Dashboard, Velocity Comparison, Flow Matrix, Attention, and Tree).
+func setupFSMModel(t *testing.T, beadsPath string) *Model {
+	t.Helper()
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-24 * time.Hour)
+	issues := []model.Issue{
+		{
+			ID:        "FSM-1",
+			Title:     "Root epic backend",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeEpic,
+			Labels:    []string{"backend"},
+			CreatedAt: now.Add(-7 * 24 * time.Hour),
+			UpdatedAt: now,
+		},
+		{
+			ID:        "FSM-2",
+			Title:     "Child frontend task",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			Labels:    []string{"frontend"},
+			CreatedAt: now.Add(-5 * 24 * time.Hour),
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "FSM-2", DependsOnID: "FSM-1", Type: model.DepParentChild},
+				{IssueID: "FSM-2", DependsOnID: "FSM-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "FSM-3",
+			Title:     "Completed backend bug",
+			Status:    model.StatusClosed,
+			Priority:  1,
+			IssueType: model.TypeBug,
+			Labels:    []string{"backend"},
+			CreatedAt: now.Add(-6 * 24 * time.Hour),
+			UpdatedAt: closedAt,
+			ClosedAt:  &closedAt,
+		},
+	}
+
+	m := NewModel(issues, nil, beadsPath)
+	m.sprints = []model.Sprint{
+		{
+			ID:        "sprint-1",
+			Name:      "Sprint 1",
+			StartDate: now.AddDate(0, 0, -2),
+			EndDate:   now.AddDate(0, 0, 5),
+			BeadIDs:   []string{"FSM-1", "FSM-2"},
+		},
+	}
+
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 48})
+	m = updated.(*Model)
+	return m
+}
+
+// enterInsightsHeatmapDrilldown transitions m into focusInsights with the priority
+// heatmap active and drilled down into a populated cell via real Model.Update keys.
+func enterInsightsHeatmapDrilldown(t *testing.T, m *Model) *Model {
+	t.Helper()
+	updated, _ := m.Update(keyMsg("i"))
+	m = updated.(*Model)
+	if m.focused != focusInsights {
+		t.Fatalf("expected focusInsights after 'i', got %v", m.focused)
+	}
+
+	// Populate Phase-2 insights + top picks AFTER pressing 'i' (which calls rebuildInsightsPanel).
+	stats := analysis.NewAnalyzer(m.issues).AnalyzeAsync(context.Background())
+	stats.WaitForPhase2()
+	m.insightsPanel = NewInsightsModel(stats.GenerateInsights(len(m.issues)), m.issueMap, m.theme)
+	m.insightsPanel.SetTopPicks([]analysis.TopPick{
+		{ID: "FSM-1", Title: "Root epic backend", Score: 0.90},
+		{ID: "FSM-2", Title: "Child frontend task", Score: 0.50},
+	})
+	m.insightsPanel.SetSize(150, 42)
+	m.insightsPanel.focusedPanel = PanelPriority
+
+	updated, _ = m.Update(keyMsg("H"))
+	m = updated.(*Model)
+	if !m.insightsPanel.IsHeatmapActive() {
+		t.Fatalf("expected heatmap active after 'H'")
+	}
+
+	targetRow, targetCol := -1, -1
+	for r := range m.insightsPanel.heatmapIssueMap {
+		for c := range m.insightsPanel.heatmapIssueMap[r] {
+			if slices.Contains(m.insightsPanel.heatmapIssueMap[r][c], "FSM-1") {
+				targetRow, targetCol = r, c
+			}
+		}
+	}
+	if targetRow < 0 || targetCol < 0 {
+		t.Fatalf("FSM-1 not found in heatmapIssueMap")
+	}
+	for m.insightsPanel.heatmapRow < targetRow {
+		updated, _ = m.Update(keyMsg("j"))
+		m = updated.(*Model)
+	}
+	for m.insightsPanel.heatmapCol < targetCol {
+		updated, _ = m.Update(keyMsg("l"))
+		m = updated.(*Model)
+	}
+	updated, _ = m.Update(keyMsg("enter"))
+	m = updated.(*Model)
+	if m.focused != focusInsights || !m.insightsPanel.IsHeatmapDrillDown() {
+		t.Fatalf("expected focusInsights heatmap drilldown, got focused=%v drill=%v",
+			m.focused, m.insightsPanel.IsHeatmapDrillDown())
+	}
+	return m
+}
+
+// TestFocusKeyStateMachine exhaustively exercises Model.Update across all 13 primary
+// focus states against Esc, q, ?, ~, ;, `, cross-view toggles (b, g, i, E, a, h, P,
+// [, ], f), preserved list filters on sub-view exit, isTextInputActive() guards, and
+// TreeModel.saveState persistence gates.
+func TestFocusKeyStateMachine(t *testing.T) {
+	type fsmStateSpec struct {
+		name      string
+		wantFocus focus
+		enter     func(t *testing.T, m *Model) *Model
+	}
+
+	states := []fsmStateSpec{
+		{
+			name:      "list",
+			wantFocus: focusList,
+			enter:     func(_ *testing.T, m *Model) *Model { return m },
+		},
+		{
+			name:      "board",
+			wantFocus: focusBoard,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("b"))
+				return u.(*Model)
+			},
+		},
+		{
+			name:      "graph",
+			wantFocus: focusGraph,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("g"))
+				return u.(*Model)
+			},
+		},
+		{
+			name:      "insights",
+			wantFocus: focusInsights,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("i"))
+				return u.(*Model)
+			},
+		},
+		{
+			name:      "insights_heatmap_drilldown",
+			wantFocus: focusInsights,
+			enter:     enterInsightsHeatmapDrilldown,
+		},
+		{
+			name:      "tree",
+			wantFocus: focusTree,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("E"))
+				return u.(*Model)
+			},
+		},
+		{
+			name:      "actionable",
+			wantFocus: focusActionable,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("a"))
+				return u.(*Model)
+			},
+		},
+		{
+			name:      "history",
+			wantFocus: focusHistory,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("h"))
+				m = u.(*Model)
+				report := createTestHistoryReportWithFiles()
+				m.historyView = NewHistoryModel(report, testTheme())
+				makeHistoryReportCurrent(m, report)
+				return m
+			},
+		},
+		{
+			name:      "sprint",
+			wantFocus: focusSprint,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("P"))
+				return u.(*Model)
+			},
+		},
+		{
+			name:      "flow_matrix",
+			wantFocus: focusFlowMatrix,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("f"))
+				return u.(*Model)
+			},
+		},
+		{
+			name:      "attention",
+			wantFocus: focusAttention,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("]"))
+				return u.(*Model)
+			},
+		},
+		{
+			name:      "label_dashboard",
+			wantFocus: focusLabelDashboard,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("["))
+				return u.(*Model)
+			},
+		},
+		{
+			name:      "velocity_comparison",
+			wantFocus: focusVelocityComparison,
+			enter: func(t *testing.T, m *Model) *Model {
+				u, _ := m.Update(keyMsg("["))
+				m = u.(*Model)
+				u, _ = m.Update(keyMsg("v"))
+				return u.(*Model)
+			},
+		},
+	}
+
+	keys := []string{"esc", "q", "?", "~", ";", "`", "b", "g", "i", "E", "a", "h", "P", "[", "]", "f"}
+
+	t.Run("FocusByKeyMatrix", func(t *testing.T) {
+		for _, st := range states {
+			st := st
+			for _, key := range keys {
+				key := key
+				t.Run(st.name+"_"+key, func(t *testing.T) {
+					m := setupFSMModel(t, "")
+					m = st.enter(t, m)
+					if m.focused != st.wantFocus {
+						t.Fatalf("enter %s: focused=%v, want %v", st.name, m.focused, st.wantFocus)
+					}
+
+					priorFocus := m.focused
+					priorCtx := m.CurrentContext()
+
+					updated, cmd := m.Update(keyMsg(key))
+					m = updated.(*Model)
+
+					switch key {
+					case "esc":
+						switch st.name {
+						case "list":
+							if m.focused != focusQuitConfirm || !m.showQuitConfirm {
+								t.Fatalf("list+esc: focused=%v showQuitConfirm=%v, want focusQuitConfirm/true", m.focused, m.showQuitConfirm)
+							}
+						case "insights_heatmap_drilldown":
+							if m.focused != focusInsights || !m.insightsPanel.IsHeatmapActive() || m.insightsPanel.IsHeatmapDrillDown() {
+								t.Fatalf("insights_heatmap_drilldown+esc: expected exit drilldown staying in focusInsights, got focused=%v heatmap=%v drill=%v",
+									m.focused, m.insightsPanel.IsHeatmapActive(), m.insightsPanel.IsHeatmapDrillDown())
+							}
+							// Second Esc exits focusInsights back to focusList.
+							u2, _ := m.Update(keyMsg("esc"))
+							m2 := u2.(*Model)
+							if m2.focused != focusList {
+								t.Fatalf("second esc after heatmap drilldown: focused=%v, want focusList", m2.focused)
+							}
+						case "velocity_comparison":
+							if m.focused != focusLabelDashboard || m.showVelocityComparison {
+								t.Fatalf("velocity_comparison+esc: focused=%v showVelocity=%v, want focusLabelDashboard/false",
+									m.focused, m.showVelocityComparison)
+							}
+						default:
+							if m.focused != focusList || m.showQuitConfirm {
+								t.Fatalf("%s+esc: focused=%v showQuitConfirm=%v, want focusList/false", st.name, m.focused, m.showQuitConfirm)
+							}
+						}
+
+					case "q":
+						switch st.name {
+						case "list":
+							if m.focused != focusList || cmd == nil {
+								t.Fatalf("list+q: focused=%v cmd=%v, want focusList with non-nil quit cmd", m.focused, cmd)
+							}
+						case "insights_heatmap_drilldown":
+							if m.focused != focusInsights || !m.insightsPanel.IsHeatmapActive() || m.insightsPanel.IsHeatmapDrillDown() {
+								t.Fatalf("insights_heatmap_drilldown+q: expected exit drilldown staying in focusInsights, got focused=%v heatmap=%v drill=%v",
+									m.focused, m.insightsPanel.IsHeatmapActive(), m.insightsPanel.IsHeatmapDrillDown())
+							}
+						case "velocity_comparison":
+							if m.focused != focusLabelDashboard || m.showVelocityComparison {
+								t.Fatalf("velocity_comparison+q: focused=%v showVelocity=%v, want focusLabelDashboard/false",
+									m.focused, m.showVelocityComparison)
+							}
+						default:
+							if m.focused != focusList || cmd != nil {
+								t.Fatalf("%s+q: focused=%v cmd=%v, want focusList with nil cmd", st.name, m.focused, cmd)
+							}
+						}
+
+					case "?":
+						if !m.showHelp || m.focused != focusHelp {
+							t.Fatalf("%s+?: showHelp=%v focused=%v, want true/focusHelp", st.name, m.showHelp, m.focused)
+						}
+						u2, _ := m.Update(keyMsg("esc"))
+						m = u2.(*Model)
+						if m.showHelp || m.focused != priorFocus {
+							t.Fatalf("%s+? then esc: showHelp=%v focused=%v, want false/%v", st.name, m.showHelp, m.focused, priorFocus)
+						}
+
+					case "~":
+						if !m.showTutorial || m.focused != focusTutorial || !m.tutorialModel.IsContextMode() {
+							t.Fatalf("%s+~: showTutorial=%v focused=%v contextMode=%v, want true/focusTutorial/true",
+								st.name, m.showTutorial, m.focused, m.tutorialModel.IsContextMode())
+						}
+						visible := m.tutorialModel.visiblePages()
+						if len(visible) == 0 {
+							t.Fatalf("%s+~: visiblePages() is empty for context %q", st.name, priorCtx)
+						}
+						if !slices.Contains(visible[0].Contexts, string(priorCtx)) {
+							t.Fatalf("%s+~: first visible page %q Contexts=%v does not contain active context %q",
+								st.name, visible[0].ID, visible[0].Contexts, priorCtx)
+						}
+						if m.tutorialModel.currentPage != 0 {
+							t.Fatalf("%s+~: currentPage=%d, want 0 (first filtered context page)",
+								st.name, m.tutorialModel.currentPage)
+						}
+						u2, _ := m.Update(keyMsg("esc"))
+						m = u2.(*Model)
+						if m.showTutorial || m.focused != priorFocus {
+							t.Fatalf("%s+~ then esc: showTutorial=%v focused=%v, want false/%v",
+								st.name, m.showTutorial, m.focused, priorFocus)
+						}
+
+					case ";":
+						if !m.showShortcutsSidebar || m.focused != priorFocus {
+							t.Fatalf("%s+;: showShortcutsSidebar=%v focused=%v, want true/%v",
+								st.name, m.showShortcutsSidebar, m.focused, priorFocus)
+						}
+
+					case "`":
+						if !m.showTutorial || m.focused != focusTutorial || m.tutorialModel.IsContextMode() {
+							t.Fatalf("%s+`: showTutorial=%v focused=%v contextMode=%v, want true/focusTutorial/false",
+								st.name, m.showTutorial, m.focused, m.tutorialModel.IsContextMode())
+						}
+						u2, _ := m.Update(keyMsg("esc"))
+						m = u2.(*Model)
+						if m.showTutorial || m.focused != priorFocus {
+							t.Fatalf("%s+` then esc: showTutorial=%v focused=%v, want false/%v",
+								st.name, m.showTutorial, m.focused, priorFocus)
+						}
+
+					case "b":
+						if st.name == "board" {
+							if m.focused != focusList || m.isBoardView {
+								t.Fatalf("board+b: focused=%v isBoardView=%v, want focusList/false", m.focused, m.isBoardView)
+							}
+						} else if m.focused != focusBoard || !m.isBoardView || m.isSprintView || m.showVelocityComparison {
+							t.Fatalf("%s+b: focused=%v isBoardView=%v sprint=%v vel=%v, want focusBoard/true/false/false",
+								st.name, m.focused, m.isBoardView, m.isSprintView, m.showVelocityComparison)
+						}
+
+					case "g":
+						switch st.name {
+						case "graph":
+							if m.focused != focusList || m.isGraphView {
+								t.Fatalf("graph+g: focused=%v isGraphView=%v, want focusList/false", m.focused, m.isGraphView)
+							}
+						case "board", "tree":
+							if m.focused != priorFocus || m.pendingComboKey != "g" {
+								t.Fatalf("%s+g: focused=%v pendingComboKey=%q, want %v/\"g\"",
+									st.name, m.focused, m.pendingComboKey, priorFocus)
+							}
+							// Expiring the combo timer switches to focusGraph.
+							u2, _ := m.Update(comboTickMsg{key: "g"})
+							m = u2.(*Model)
+							if m.focused != focusGraph || !m.isGraphView {
+								t.Fatalf("%s+g combo expiry: focused=%v isGraphView=%v, want focusGraph/true",
+									st.name, m.focused, m.isGraphView)
+							}
+						case "flow_matrix", "attention":
+							if m.focused != priorFocus || m.pendingComboKey != "" {
+								t.Fatalf("%s+g: focused=%v pendingComboKey=%q, want in-view GoToTop staying in %v",
+									st.name, m.focused, m.pendingComboKey, priorFocus)
+							}
+						default:
+							if m.focused != focusGraph || !m.isGraphView {
+								t.Fatalf("%s+g: focused=%v isGraphView=%v, want focusGraph/true",
+									st.name, m.focused, m.isGraphView)
+							}
+						}
+
+					case "i":
+						if st.name == "insights" || st.name == "insights_heatmap_drilldown" {
+							if m.focused != focusList {
+								t.Fatalf("%s+i: focused=%v, want focusList", st.name, m.focused)
+							}
+						} else if m.focused != focusInsights {
+							t.Fatalf("%s+i: focused=%v, want focusInsights", st.name, m.focused)
+						}
+
+					case "E":
+						if st.name == "tree" {
+							if m.focused != focusList {
+								t.Fatalf("tree+E: focused=%v, want focusList", m.focused)
+							}
+						} else if m.focused != focusTree {
+							t.Fatalf("%s+E: focused=%v, want focusTree", st.name, m.focused)
+						}
+
+					case "a":
+						if st.name == "actionable" {
+							if m.focused != focusList || m.isActionableView {
+								t.Fatalf("actionable+a: focused=%v isActionable=%v, want focusList/false", m.focused, m.isActionableView)
+							}
+						} else if m.focused != focusActionable || !m.isActionableView {
+							t.Fatalf("%s+a: focused=%v isActionable=%v, want focusActionable/true",
+								st.name, m.focused, m.isActionableView)
+						}
+
+					case "h":
+						switch st.name {
+						case "history":
+							if m.focused != focusList || m.isHistoryView {
+								t.Fatalf("history+h: focused=%v isHistoryView=%v, want focusList/false",
+									m.focused, m.isHistoryView)
+							}
+						case "board", "graph", "insights", "insights_heatmap_drilldown", "tree":
+							if m.focused != priorFocus {
+								t.Fatalf("%s+h: focused=%v, want in-view navigation staying in %v", st.name, m.focused, priorFocus)
+							}
+						case "label_dashboard":
+							if m.focused != focusLabelDashboard || !m.showLabelHealthDetail {
+								t.Fatalf("label_dashboard+h: focused=%v showLabelHealthDetail=%v, want focusLabelDashboard/true",
+									m.focused, m.showLabelHealthDetail)
+							}
+						default:
+							if m.focused != focusHistory || !m.isHistoryView {
+								t.Fatalf("%s+h: focused=%v isHistoryView=%v, want focusHistory/true",
+									st.name, m.focused, m.isHistoryView)
+							}
+						}
+
+					case "P":
+						switch st.name {
+						case "list":
+							if m.focused != focusSprint || !m.isSprintView {
+								t.Fatalf("list+P: focused=%v isSprintView=%v, want focusSprint/true", m.focused, m.isSprintView)
+							}
+						case "sprint":
+							if m.focused != focusList || m.isSprintView {
+								t.Fatalf("sprint+P: focused=%v isSprintView=%v, want focusList/false", m.focused, m.isSprintView)
+							}
+						default:
+							if m.focused != priorFocus || m.isSprintView {
+								t.Fatalf("%s+P: focused=%v isSprintView=%v, want unchanged %v/false",
+									st.name, m.focused, m.isSprintView, priorFocus)
+							}
+						}
+
+					case "[":
+						if st.name == "label_dashboard" {
+							if m.focused != focusList {
+								t.Fatalf("label_dashboard+[: focused=%v, want focusList", m.focused)
+							}
+						} else if m.focused != focusLabelDashboard || m.showVelocityComparison {
+							t.Fatalf("%s+[: focused=%v showVelocity=%v, want focusLabelDashboard/false",
+								st.name, m.focused, m.showVelocityComparison)
+						}
+
+					case "]":
+						if st.name == "attention" {
+							if m.focused != focusList {
+								t.Fatalf("attention+]: focused=%v, want focusList", m.focused)
+							}
+						} else if m.focused != focusAttention {
+							t.Fatalf("%s+]: focused=%v, want focusAttention", st.name, m.focused)
+						}
+
+					case "f":
+						switch st.name {
+						case "flow_matrix":
+							if m.focused != focusList {
+								t.Fatalf("flow_matrix+f: focused=%v, want focusList", m.focused)
+							}
+						case "history":
+							if m.focused != focusHistory || !m.historyView.showFileTree {
+								t.Fatalf("history+f: focused=%v showFileTree=%v, want focusHistory/true",
+									m.focused, m.historyView.showFileTree)
+							}
+						default:
+							if m.focused != focusFlowMatrix {
+								t.Fatalf("%s+f: focused=%v, want focusFlowMatrix", st.name, m.focused)
+							}
+						}
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("SubViewExitPreservesActiveListFilter", func(t *testing.T) {
+		subViews := []fsmStateSpec{}
+		for _, st := range states {
+			if st.name != "list" && st.name != "insights_heatmap_drilldown" && st.name != "velocity_comparison" {
+				subViews = append(subViews, st)
+			}
+		}
+		for _, st := range subViews {
+			t.Run(st.name, func(t *testing.T) {
+				m := setupFSMModel(t, "")
+				u, _ := m.Update(keyMsg("o"))
+				m = u.(*Model)
+				if m.currentFilter != "open" {
+					t.Fatalf("expected active 'open' filter before entering %s, got %q", st.name, m.currentFilter)
+				}
+
+				m = st.enter(t, m)
+				if m.focused != st.wantFocus {
+					t.Fatalf("enter %s: focused=%v, want %v", st.name, m.focused, st.wantFocus)
+				}
+
+				u, _ = m.Update(keyMsg("esc"))
+				m = u.(*Model)
+				if m.focused != focusList {
+					t.Fatalf("%s+esc: focused=%v, want focusList", st.name, m.focused)
+				}
+				if m.currentFilter != "open" {
+					t.Fatalf("%s+esc cleared active list filter: currentFilter=%q, want %q", st.name, m.currentFilter, "open")
+				}
+			})
+		}
+	})
+
+	t.Run("IsTextInputActiveGuardsGlobalAndToggleKeys", func(t *testing.T) {
+		guardKeys := []string{"?", "~", ";", "`", "q", "b", "g", "i", "E", "a", "h", "P", "[", "]", "f"}
+
+		inputModes := []struct {
+			name      string
+			wantFocus focus
+			enter     func(t *testing.T, m *Model) *Model
+			value     func(m *Model) string
+		}{
+			{
+				name:      "list_filtering",
+				wantFocus: focusList,
+				enter: func(t *testing.T, m *Model) *Model {
+					u, _ := m.Update(keyMsg("/"))
+					return u.(*Model)
+				},
+				value: func(m *Model) string { return m.list.FilterInput.Value() },
+			},
+			{
+				name:      "board_search",
+				wantFocus: focusBoard,
+				enter: func(t *testing.T, m *Model) *Model {
+					u, _ := m.Update(keyMsg("b"))
+					m = u.(*Model)
+					u, _ = m.Update(keyMsg("/"))
+					return u.(*Model)
+				},
+				value: func(m *Model) string { return m.board.SearchQuery() },
+			},
+			{
+				name:      "history_search",
+				wantFocus: focusHistory,
+				enter: func(t *testing.T, m *Model) *Model {
+					u, _ := m.Update(keyMsg("h"))
+					m = u.(*Model)
+					report := createTestHistoryReportWithFiles()
+					m.historyView = NewHistoryModel(report, testTheme())
+					makeHistoryReportCurrent(m, report)
+					u, _ = m.Update(keyMsg("/"))
+					return u.(*Model)
+				},
+				value: func(m *Model) string { return m.historyView.SearchQuery() },
+			},
+			{
+				name:      "label_picker",
+				wantFocus: focusLabelPicker,
+				enter: func(t *testing.T, m *Model) *Model {
+					u, _ := m.Update(keyMsg("l"))
+					return u.(*Model)
+				},
+				value: func(m *Model) string { return m.labelPicker.InputValue() },
+			},
+			{
+				name:      "time_travel_input",
+				wantFocus: focusTimeTravelInput,
+				enter: func(t *testing.T, m *Model) *Model {
+					u, _ := m.Update(keyMsg("t"))
+					return u.(*Model)
+				},
+				value: func(m *Model) string { return m.timeTravelInput.Value() },
+			},
+		}
+
+		for _, im := range inputModes {
+			t.Run(im.name, func(t *testing.T) {
+				m := setupFSMModel(t, "")
+				m = im.enter(t, m)
+				if !m.isTextInputActive() {
+					t.Fatalf("%s: expected isTextInputActive() == true", im.name)
+				}
+
+				for _, k := range guardKeys {
+					u, cmd := m.Update(keyMsg(k))
+					m = u.(*Model)
+					if m.focused != im.wantFocus {
+						t.Fatalf("%s+%q hijacked focus: got %v, want %v", im.name, k, m.focused, im.wantFocus)
+					}
+					if m.showHelp || m.showTutorial || m.showShortcutsSidebar || m.showQuitConfirm {
+						t.Fatalf("%s+%q opened global overlay: help=%v tut=%v sidebar=%v quit=%v",
+							im.name, k, m.showHelp, m.showTutorial, m.showShortcutsSidebar, m.showQuitConfirm)
+					}
+					if k == "q" && cmd != nil && im.name != "list_filtering" {
+						// Note: list_filtering returns textinput blink/filter cmds, never tea.Quit;
+						// non-list inputs return nil on rune append.
+						_ = cmd
+					}
+				}
+
+				gotVal := im.value(m)
+				wantVal := strings.Join(guardKeys, "")
+				if gotVal != wantVal {
+					t.Fatalf("%s typed value = %q, want %q", im.name, gotVal, wantVal)
+				}
+			})
+		}
+	})
+
+	t.Run("TreeSaveState_ZeroWritesWhenNoSavedConfigOrTimeTravel", func(t *testing.T) {
+		t.Run("BV_NO_SAVED_CONFIG_prevents_tree_state_write", func(t *testing.T) {
+			t.Setenv("BV_NO_SAVED_CONFIG", "1")
+			tmpDir := t.TempDir()
+			beadsDir := filepath.Join(tmpDir, ".beads")
+			if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			beadsFile := filepath.Join(beadsDir, "issues.jsonl")
+			if err := os.WriteFile(beadsFile, []byte(""), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			m := setupFSMModel(t, beadsFile)
+			u, _ := m.Update(keyMsg("E"))
+			m = u.(*Model)
+			if m.focused != focusTree {
+				t.Fatalf("expected focusTree after 'E', got %v", m.focused)
+			}
+
+			// Exercise tree state-mutating keys (expand/collapse all, toggle, cycle sort, cycle mode).
+			for _, k := range []string{"X", "Z", "enter", "s", "m"} {
+				u, _ = m.Update(keyMsg(k))
+				m = u.(*Model)
+			}
+
+			statePath := filepath.Join(beadsDir, "tree-state.json")
+			if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+				t.Fatalf("expected zero %s writes when BV_NO_SAVED_CONFIG=1, got stat err=%v", statePath, err)
+			}
+		})
+
+		t.Run("TimeTravelMode_marks_tree_read_only", func(t *testing.T) {
+			t.Setenv("BV_NO_SAVED_CONFIG", "")
+			tmpDir := t.TempDir()
+			beadsDir := filepath.Join(tmpDir, ".beads")
+			if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			beadsFile := filepath.Join(beadsDir, "issues.jsonl")
+			if err := os.WriteFile(beadsFile, []byte(""), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			m := setupFSMModel(t, beadsFile)
+			m.timeTravelMode = true
+			m.tree.SetReadOnly(true)
+
+			u, _ := m.Update(keyMsg("E"))
+			m = u.(*Model)
+			for _, k := range []string{"X", "Z", "enter"} {
+				u, _ = m.Update(keyMsg(k))
+				m = u.(*Model)
+			}
+
+			statePath := filepath.Join(beadsDir, "tree-state.json")
+			if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+				t.Fatalf("expected zero %s writes in time-travel read-only mode, got stat err=%v", statePath, err)
+			}
+		})
+	})
 }

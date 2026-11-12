@@ -566,7 +566,7 @@ func TestWatcher_FsnotifyCreateRefreshesRemovedState(t *testing.T) {
 		w.mu.Unlock()
 	}()
 
-	if _, active := w.recordStat(runGeneration, info.ModTime(), info.Size()); !active {
+	if _, active := w.recordStat(runGeneration, info); !active {
 		t.Fatal("test run should be active")
 	}
 	if hadFile, active := w.recordMissing(runGeneration); !active || !hadFile {
@@ -834,7 +834,19 @@ func TestWatcher_RestartRejectsQueuedAndLatePriorRunChanges(t *testing.T) {
 
 	// A producer that was delayed across Stop/Start cannot mutate the new
 	// baseline, invoke callbacks, or publish on the shared change channel.
-	if changed, active := w.recordStat(firstRun, baselineMtime.Add(time.Hour), baselineSize+1); changed || active {
+	otherFile := filepath.Join(filepath.Dir(tmpFile), "other.jsonl")
+	if err := os.WriteFile(otherFile, []byte("different size payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	futureTime := baselineMtime.Add(time.Hour)
+	if err := os.Chtimes(otherFile, futureTime, futureTime); err != nil {
+		t.Fatal(err)
+	}
+	otherInfo, err := os.Stat(otherFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, active := w.recordStat(firstRun, otherInfo); changed || active {
 		t.Fatalf("stale recordStat returned changed=%v active=%v", changed, active)
 	}
 	w.notifyChange(firstRun)
@@ -1021,5 +1033,141 @@ func TestWatcher_EnvForcePoll(t *testing.T) {
 
 	if !w.IsPolling() {
 		t.Fatal("expected watcher to be in polling mode when BV_FORCE_POLL is set")
+	}
+}
+
+func TestWatcher_RecordStatDetectsInodeChangeSameSizeMtime(t *testing.T) {
+	dir := t.TempDir()
+	pathA := filepath.Join(dir, "a.jsonl")
+	pathB := filepath.Join(dir, "b.jsonl")
+	fixedTime := time.Now().Truncate(time.Second)
+
+	if err := os.WriteFile(pathA, []byte("{\"id\":1}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pathB, []byte("{\"id\":2}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(pathA, fixedTime, fixedTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(pathB, fixedTime, fixedTime); err != nil {
+		t.Fatal(err)
+	}
+
+	infoA, err := os.Stat(pathA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	infoB, err := os.Stat(pathB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !infoA.ModTime().Equal(infoB.ModTime()) || infoA.Size() != infoB.Size() || os.SameFile(infoA, infoB) {
+		t.Fatalf("fixture requires distinct inodes with identical mtime and size")
+	}
+
+	w, err := NewWatcher(pathA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.mu.Lock()
+	w.started = true
+	w.runGeneration = 1
+	w.mu.Unlock()
+
+	if changed, active := w.recordStat(1, infoA); !active || !changed {
+		t.Fatalf("initial recordStat = (%v, %v), want (true, true)", changed, active)
+	}
+	if changed, active := w.recordStat(1, infoA); !active || changed {
+		t.Fatalf("repeat same-file recordStat = (%v, %v), want (false, true)", changed, active)
+	}
+	if changed, active := w.recordStat(1, infoB); !active || !changed {
+		t.Fatalf("inode-changed recordStat = (%v, %v), want (true, true)", changed, active)
+	}
+}
+
+func TestWatcher_FsnotifyTransientJSONLTruncateSettles(t *testing.T) {
+	t.Setenv("BV_FORCE_POLL", "")
+	t.Setenv("BV_FORCE_POLLING", "")
+
+	path := filepath.Join(t.TempDir(), "issues.jsonl")
+	if err := os.WriteFile(path, []byte("{\"id\":\"bv-1\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		obsMu    sync.Mutex
+		observed []string
+	)
+	w, err := NewWatcher(path,
+		WithDebounceDuration(15*time.Millisecond),
+		WithOnChange(func() {
+			data, rerr := os.ReadFile(path)
+			if rerr == nil {
+				obsMu.Lock()
+				observed = append(observed, string(data))
+				obsMu.Unlock()
+			}
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.jsonlSettleWindow = 80 * time.Millisecond
+
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	// Step 1: non-atomic writer truncates to 0 bytes, pauses longer than debounce,
+	// writes a torn partial line, then completes with newline inside settle window.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	if _, err := f.WriteString("{\"id\":\"bv-2\""); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if _, err := f.WriteString("}\n"); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-w.Changed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for completed JSONL write notification")
+	}
+
+	obsMu.Lock()
+	gotSnapshots := append([]string(nil), observed...)
+	obsMu.Unlock()
+	if len(gotSnapshots) != 1 || gotSnapshots[0] != "{\"id\":\"bv-2\"}\n" {
+		t.Fatalf("unexpected snapshots during non-atomic JSONL write: %q", gotSnapshots)
+	}
+
+	// Step 2: intentional truncation to 0 bytes that persists across the settle window
+	// must still notify so genuine clears are never lost.
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-w.Changed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for persistent 0-byte JSONL clear notification")
+	}
+	obsMu.Lock()
+	finalSnapshots := append([]string(nil), observed...)
+	obsMu.Unlock()
+	if len(finalSnapshots) != 2 || finalSnapshots[1] != "" {
+		t.Fatalf("expected persistent 0-byte clear snapshot after settle window, got %q", finalSnapshots)
 	}
 }

@@ -429,3 +429,66 @@ func TestInsights_EmptyFields(t *testing.T) {
 		t.Error("Expected nil Stats")
 	}
 }
+
+func TestGenerateScopedInsights_ExcludesClosedTopologyByDefault(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "CLOSED-HUB", Status: model.StatusClosed},
+		{ID: "CLOSED-A", Status: model.StatusClosed, Dependencies: []*model.Dependency{
+			{DependsOnID: "CLOSED-HUB", Type: model.DepBlocks},
+		}},
+		{ID: "CLOSED-B", Status: model.StatusClosed, Dependencies: []*model.Dependency{
+			{DependsOnID: "CLOSED-A", Type: model.DepBlocks},
+		}},
+		{ID: "OPEN-ROOT", Status: model.StatusOpen},
+		{ID: "OPEN-MID", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "OPEN-ROOT", Type: model.DepBlocks},
+		}},
+		{ID: "OPEN-LEAF", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{DependsOnID: "OPEN-MID", Type: model.DepBlocks},
+		}},
+		{ID: "CLOSED-ORPHAN", Status: model.StatusClosed},
+		{ID: "OPEN-ORPHAN", Status: model.StatusOpen},
+	}
+
+	an := NewAnalyzer(issues)
+	stats := an.Analyze()
+
+	activeOnly := an.GenerateScopedInsights(&stats, 10, false)
+	for _, item := range activeOnly.Bottlenecks {
+		if item.ID == "CLOSED-HUB" || item.ID == "CLOSED-A" || item.ID == "CLOSED-B" {
+			t.Fatalf("scoped insights (includeInactive=false) leaked closed bottleneck %s", item.ID)
+		}
+	}
+	for _, id := range activeOnly.Articulation {
+		if id == "CLOSED-HUB" || id == "CLOSED-A" || id == "CLOSED-B" {
+			t.Fatalf("scoped insights (includeInactive=false) leaked closed articulation point %s", id)
+		}
+	}
+	for _, id := range activeOnly.Orphans {
+		if id == "CLOSED-ORPHAN" {
+			t.Fatalf("scoped insights (includeInactive=false) leaked closed orphan %s", id)
+		}
+	}
+
+	withInactive := an.GenerateScopedInsights(&stats, 10, true)
+	foundClosedOrphan := false
+	for _, id := range withInactive.Orphans {
+		if id == "CLOSED-ORPHAN" {
+			foundClosedOrphan = true
+			break
+		}
+	}
+	if !foundClosedOrphan {
+		t.Fatalf("expected CLOSED-ORPHAN when includeInactive=true, got %v", withInactive.Orphans)
+	}
+}
+
+func TestConfigForSize_SkipPhase2DisablesAllPhase2Algorithms(t *testing.T) {
+	t.Setenv("BV_SKIP_PHASE2", "1")
+	cfg := ConfigForSize(25, 40)
+	if cfg.ComputePageRank || cfg.ComputeBetweenness || cfg.ComputeEigenvector ||
+		cfg.ComputeHITS || cfg.ComputeCriticalPath || cfg.ComputeCycles ||
+		cfg.ComputeKCore || cfg.ComputeArticulation || cfg.ComputeSlack {
+		t.Fatalf("BV_SKIP_PHASE2=1 left Phase 2 algorithms enabled: %+v", cfg)
+	}
+}

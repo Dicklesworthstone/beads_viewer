@@ -423,6 +423,9 @@ func (c *CachedCorrelator) WithFeedbackStore(store *FeedbackStore) *CachedCorrel
 // buildKey extends BuildCacheKey with the wrapped correlator's matcher policy
 // and feedback fingerprint. Both are inputs to the assembled report.
 func (c *CachedCorrelator) buildKey(beads []BeadInfo, opts CorrelatorOptions) (CacheKey, error) {
+	if c.correlator != nil && c.correlator.explicit != nil {
+		c.correlator.explicit.SetKnownBeadIDs(beadIDsFromInfos(beads))
+	}
 	key, err := BuildCacheKey(c.cache.repoPath, beads, opts)
 	if err != nil {
 		return CacheKey{}, err

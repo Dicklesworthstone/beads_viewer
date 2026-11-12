@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 // GitLoader loads beads from git history
 type GitLoader struct {
 	repoPath string
+	repoRoot string
 	cache    *revisionCache
 	flight   singleflight.Group
 }
@@ -68,9 +70,36 @@ func (g *GitLoader) gitCommand(args ...string) *exec.Cmd {
 	gitArgs = append(gitArgs, "--no-replace-objects")
 	gitArgs = append(gitArgs, args...)
 	cmd := exec.Command("git", gitArgs...)
-	cmd.Dir = g.repoPath
+	dir := g.repoRoot
+	if dir == "" {
+		dir = resolveGitLoaderRoot(g.repoPath)
+	}
+	cmd.Dir = dir
 	cmd.Env = gitLoaderEnvironment()
 	return cmd
+}
+
+func resolveGitLoaderRoot(repoPath string) string {
+	target := repoPath
+	if strings.TrimSpace(target) == "" {
+		if wd, err := os.Getwd(); err == nil {
+			target = wd
+		}
+	}
+	if target == "" {
+		return repoPath
+	}
+	info, err := os.Stat(target)
+	if err != nil || !info.IsDir() {
+		return repoPath
+	}
+	if root, err := GetGitWorktreeRoot(target); err == nil && root != "" {
+		return root
+	}
+	if abs, err := filepath.Abs(target); err == nil {
+		return filepath.Clean(abs)
+	}
+	return repoPath
 }
 
 func gitLoaderEnvironment() []string {
@@ -107,6 +136,7 @@ func gitLoaderEnvironmentOverridesAuthority(name string) bool {
 func NewGitLoader(repoPath string) *GitLoader {
 	return &GitLoader{
 		repoPath: repoPath,
+		repoRoot: resolveGitLoaderRoot(repoPath),
 		cache: &revisionCache{
 			entries: make(map[string]cacheEntry),
 			maxAge:  5 * time.Minute,
@@ -118,6 +148,7 @@ func NewGitLoader(repoPath string) *GitLoader {
 func NewGitLoaderWithCacheTTL(repoPath string, cacheTTL time.Duration) *GitLoader {
 	return &GitLoader{
 		repoPath: repoPath,
+		repoRoot: resolveGitLoaderRoot(repoPath),
 		cache: &revisionCache{
 			entries: make(map[string]cacheEntry),
 			maxAge:  cacheTTL,
@@ -399,7 +430,7 @@ func (g *GitLoader) historicalPathExists(sha, path string) (bool, error) {
 	// Unlike `git show <commit>:<path>`, ls-tree distinguishes absence (empty,
 	// successful output) from repository/object failures (non-zero exit). This
 	// lets precedence fallback happen only when a candidate path truly is absent.
-	cmd := g.gitCommand("ls-tree", "--name-only", "-z", sha, "--", path)
+	cmd := g.gitCommand("ls-tree", "--name-only", "--full-tree", "-z", sha, "--", path)
 	out, err := cmd.Output()
 	if err != nil {
 		return false, err

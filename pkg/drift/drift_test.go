@@ -2441,9 +2441,44 @@ func TestConfigValidate_ProactiveKeys(t *testing.T) {
 	if loaded.VelocityWindowDays != 7 || loaded.DuplicateMaxAlerts != 10 || loaded.ScopeCreepPct != 20 || loaded.HighImpactPriorityMax != 1 {
 		t.Fatalf("example config keys not honoured: %+v", loaded)
 	}
-	for _, key := range []string{"proactive_max_issues", "scope_creep_pct", "velocity_drop_pct", "velocity_window_days", "velocity_min_baseline", "high_impact_unblock_min", "high_impact_priority_max", "abandoned_claim_multiplier", "duplicate_jaccard_threshold", "duplicate_max_alerts", "priority_mismatch_min_confidence"} {
+	for _, key := range []string{"proactive_max_issues", "scope_creep_pct", "velocity_drop_pct", "velocity_window_days", "velocity_min_baseline", "high_impact_unblock_min", "high_impact_priority_max", "abandoned_claim_multiplier", "duplicate_jaccard_threshold", "duplicate_max_alerts", "priority_mismatch_min_confidence", "sprint_blocked_days", "sprint_inactive_days"} {
 		if !strings.Contains(ExampleConfig(), key+":") {
 			t.Errorf("ExampleConfig missing key %s", key)
 		}
+	}
+}
+
+func TestSprintAtRiskThresholdsConfig(t *testing.T) {
+	defaults := DefaultConfig().AtRiskThresholds()
+	if defaults.BlockedDays != 2 || defaults.InactiveDays != 4 {
+		t.Fatalf("unexpected default AtRiskThresholds: %+v", defaults)
+	}
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	customYAML := "sprint_blocked_days: 5\nsprint_inactive_days: 9\n"
+	if err := os.WriteFile(ConfigPath(dir), []byte(customYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(dir)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	th := cfg.AtRiskThresholds()
+	if th.BlockedDays != 5 || th.InactiveDays != 9 {
+		t.Fatalf("custom AtRiskThresholds = %+v, want {BlockedDays:5 InactiveDays:9}", th)
+	}
+
+	negBlocked := DefaultConfig()
+	negBlocked.SprintBlockedDays = -1
+	if err := negBlocked.Validate(); err == nil {
+		t.Fatal("expected validation error for negative sprint_blocked_days")
+	}
+	negInactive := DefaultConfig()
+	negInactive.SprintInactiveDays = -2
+	if err := negInactive.Validate(); err == nil {
+		t.Fatal("expected validation error for negative sprint_inactive_days")
 	}
 }

@@ -180,6 +180,11 @@ func (e *Extractor) extractCausalHistory(target string, opts ExtractOptions) (*C
 				event.EventType = determineStatusEvent(old.Status, current.Status)
 			}
 			obs.Changes = append(obs.Changes, event)
+			if !hadOld && hasNew {
+				if synth, ok := synthesizedCreationMilestone(event, current.Status); ok {
+					obs.Changes = append(obs.Changes, synth)
+				}
+			}
 		}
 		result.Observations = append(result.Observations, obs)
 		previous, previousValid, previousSHA = after, validAfter, c.newSHA
@@ -490,17 +495,13 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 	// preserving the no-rewrite-on-pure-hit discipline when nothing is new).
 	storePerCommitEvents(namespace, fresh)
 
-	// Compose the full event slice in the SAME ORDER a full extraction produces:
-	// concatenate per-commit events in git-log (newest-first) order, exactly as
-	// the original single loop did, then reverse to chronological.
+	// Compose the full event slice in chronological (oldest-first) commit order
+	// while preserving within-commit ordering (EventCreated before EventClaimed /
+	// EventClosed), matching extractViaGitLogPatch byte-for-byte.
 	var events []BeadEvent
-	for i := range commits {
+	for i := len(commits) - 1; i >= 0; i-- {
 		events = append(events, perCommitEvents[i]...)
 	}
-
-	// snapshotCommits returns newest-first (git log order); match the legacy
-	// Extract contract which sorts chronologically before returning.
-	reverseEvents(events)
 	return events, nil
 }
 

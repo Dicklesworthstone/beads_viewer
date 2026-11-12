@@ -1,9 +1,14 @@
 package correlation
 
 import (
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	json "github.com/goccy/go-json"
 )
 
 func TestIncrementalThreshold(t *testing.T) {
@@ -144,9 +149,10 @@ func TestMergeReports_Basic(t *testing.T) {
 
 	merged := mergeReports(existing, beads, newEvents, nil)
 
-	// Check merged report
-	if merged.DataHash != existing.DataHash {
-		t.Errorf("DataHash changed: %s != %s", merged.DataHash, existing.DataHash)
+	// DataHash must be recomputed accurately for the updated bead state.
+	wantHash := hashBeads(beads)
+	if merged.DataHash != wantHash {
+		t.Errorf("DataHash = %s, want recomputed %s (stale was %s)", merged.DataHash, wantHash, existing.DataHash)
 	}
 
 	if merged.GitRange != "abc123..def456 (incremental)" {
@@ -601,5 +607,202 @@ func TestCalculateMergedStats_CycleTime(t *testing.T) {
 
 	if stats.AvgCycleTimeDays == nil {
 		t.Error("AvgCycleTimeDays should be set when cycle times exist")
+	}
+}
+
+func TestIncrementalCorrelator_MultiStrategyFeedbackAndDataHashParity(t *testing.T) {
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "init")
+
+	baseTime := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	commitAt := func(offset time.Duration, msg string) string {
+		t.Helper()
+		runGit(t, repo, "add", "--", ".")
+		ts := baseTime.Add(offset).Format(time.RFC3339)
+		cmd := exec.Command("git", "commit", "-m", msg)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Alice", "GIT_AUTHOR_EMAIL=alice@example.com",
+			"GIT_COMMITTER_NAME=Alice", "GIT_COMMITTER_EMAIL=alice@example.com",
+			"GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("commit %q: %v\n%s", msg, err, out)
+		}
+		out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	jsonl := filepath.Join(beadsDir, "issues.jsonl")
+
+	// Initial commit 1: bv-pzpv created directly in_progress, bv-apal.20 open.
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-pzpv","title":"Overhaul correlation","status":"in_progress","assignee":"alice@example.com"}`+"\n"+
+			`{"id":"bv-apal.20","title":"Dot child task","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "init.go"), []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedSHA := commitAt(0, "feat(bv-pzpv): initial setup")
+
+	// Commit 2: explicit commit that we will reject via FeedbackStore.
+	if err := os.WriteFile(filepath.Join(repo, "reject_me.go"), []byte("package p\nvar r = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rejectedSHA := commitAt(15*time.Minute, "refs bv-pzpv noisy commit")
+
+	store := NewFeedbackStore(beadsDir)
+	if err := store.Confirm(seedSHA, "bv-pzpv", "alice", 0.9, "seed link"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Reject(rejectedSHA, "bv-pzpv", "alice", 0.9, "noise"); err != nil {
+		t.Fatal(err)
+	}
+
+	initialBeads := []BeadInfo{
+		{ID: "bv-pzpv", Title: "Overhaul correlation", Status: "in_progress"},
+		{ID: "bv-apal.20", Title: "Dot child task", Status: "open"},
+	}
+	opts := CorrelatorOptions{Limit: 100}
+
+	ic := NewIncrementalCorrelator(repo, jsonl).WithFeedbackStore(store)
+	firstRes, err := ic.GenerateReportWithDetails(initialBeads, opts)
+	if err != nil {
+		t.Fatalf("initial GenerateReportWithDetails: %v", err)
+	}
+	if firstRes.WasIncremental {
+		t.Fatal("first run should be a full refresh")
+	}
+
+	// Incremental commits after initial cache population:
+	// Commit 3: explicit_id on dot-child bv-apal.20 touching non-Go files (.gitignore + Makefile).
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("*.tmp\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "Makefile"), []byte("all:\n\t@true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dotExplicitSHA := commitAt(30*time.Minute, "Closes [BV-APAL.20].")
+
+	// Commit 4: mixed code + .beads/ commit inside bv-pzpv's active window (temporal_author).
+	if err := os.WriteFile(filepath.Join(repo, "worker.zig"), []byte("pub fn main() void {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-pzpv","title":"Overhaul correlation","status":"in_progress","assignee":"alice@example.com"}`+"\n"+
+			`{"id":"bv-apal.20","title":"Dot child task","status":"open"}`+"\n"+
+			`{"id":"bv-empty","title":"Zero commit bead","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	temporalMixedSHA := commitAt(45*time.Minute, "wip: add zig worker")
+
+	// Commit 5: close bv-pzpv and create single-commit closed bv-fast alongside schema.graphql (co_committed).
+	if err := os.WriteFile(filepath.Join(repo, "schema.graphql"), []byte("type Query { ok: Boolean! }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-pzpv","title":"Overhaul correlation complete","status":"closed","assignee":"alice@example.com"}`+"\n"+
+			`{"id":"bv-apal.20","title":"Dot child task","status":"closed"}`+"\n"+
+			`{"id":"bv-empty","title":"Zero commit bead","status":"open"}`+"\n"+
+			`{"id":"bv-fast","title":"Fast graphql schema","status":"closed","assignee":"alice@example.com"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	coCommitSHA := commitAt(60*time.Minute, "chore: finalize beads and schema")
+
+	updatedBeads := []BeadInfo{
+		{ID: "bv-pzpv", Title: "Overhaul correlation complete", Status: "closed"},
+		{ID: "bv-apal.20", Title: "Dot child task", Status: "closed"},
+		{ID: "bv-empty", Title: "Zero commit bead", Status: "open"},
+		{ID: "bv-fast", Title: "Fast graphql schema", Status: "closed"},
+	}
+
+	incRes, err := ic.GenerateReportWithDetails(updatedBeads, opts)
+	if err != nil {
+		t.Fatalf("incremental GenerateReportWithDetails: %v", err)
+	}
+	if !incRes.WasIncremental {
+		t.Fatalf("expected WasIncremental=true, got false (reason=%q)", incRes.RefreshReason)
+	}
+	if incRes.NewCommitCount != 3 {
+		t.Fatalf("NewCommitCount = %d, want 3", incRes.NewCommitCount)
+	}
+
+	freshReport, err := NewCorrelator(repo, jsonl).WithFeedbackStore(store).GenerateReport(updatedBeads, opts)
+	if err != nil {
+		t.Fatalf("fresh Correlator.GenerateReport: %v", err)
+	}
+
+	incReport := incRes.Report
+	if incReport.DataHash != hashBeads(updatedBeads) || incReport.DataHash != freshReport.DataHash {
+		t.Fatalf("incremental DataHash = %q, want %q", incReport.DataHash, freshReport.DataHash)
+	}
+
+	// Verify feedback overrides survived incremental update: seedSHA confirmed (1.0), rejectedSHA absent.
+	pzpvCommits := make(map[string]CorrelatedCommit)
+	for _, cc := range incReport.Histories["bv-pzpv"].Commits {
+		pzpvCommits[cc.SHA] = cc
+	}
+	if _, ok := pzpvCommits[rejectedSHA]; ok {
+		t.Fatalf("rejected commit %s reappeared after incremental update", rejectedSHA[:7])
+	}
+	if seed, ok := pzpvCommits[seedSHA]; !ok || !seed.Confirmed || seed.Confidence != 1.0 {
+		t.Fatalf("confirmed commit %s lost confirmation override: %+v (exists=%v)", seedSHA[:7], seed, ok)
+	}
+	if _, ok := pzpvCommits[temporalMixedSHA]; !ok {
+		t.Fatalf("incremental update missed temporal_author mixed commit %s", temporalMixedSHA[:7])
+	}
+
+	// Verify explicit_id on dot-child bv-apal.20 and co_committed on bv-fast.
+	apalCommits := make(map[string]CorrelatedCommit)
+	for _, cc := range incReport.Histories["bv-apal.20"].Commits {
+		apalCommits[cc.SHA] = cc
+	}
+	if _, ok := apalCommits[dotExplicitSHA]; !ok {
+		t.Fatalf("incremental update missed explicit_id commit %s on bv-apal.20", dotExplicitSHA[:7])
+	}
+	if fast := incReport.Histories["bv-fast"].Commits; len(fast) != 1 || fast[0].SHA != coCommitSHA {
+		t.Fatalf("incremental update missed co_committed commit %s on bv-fast: %+v", coCommitSHA[:7], fast)
+	}
+
+	// Differential parity check across all beads vs fresh full Correlator.
+	for _, b := range updatedBeads {
+		gotH := incReport.Histories[b.ID]
+		wantH := freshReport.Histories[b.ID]
+		if len(gotH.Events) != len(wantH.Events) {
+			t.Fatalf("bead %s event count = %d, want %d", b.ID, len(gotH.Events), len(wantH.Events))
+		}
+		if len(gotH.Commits) != len(wantH.Commits) {
+			t.Fatalf("bead %s commit count = %d (%+v), want %d (%+v)", b.ID, len(gotH.Commits), gotH.Commits, len(wantH.Commits), wantH.Commits)
+		}
+		for i := range wantH.Commits {
+			if gotH.Commits[i].SHA != wantH.Commits[i].SHA ||
+				gotH.Commits[i].Method != wantH.Commits[i].Method ||
+				gotH.Commits[i].Confirmed != wantH.Commits[i].Confirmed {
+				t.Errorf("bead %s commit[%d] = %+v, want %+v", b.ID, i, gotH.Commits[i], wantH.Commits[i])
+			}
+		}
+	}
+
+	// Verify non-null "commits":[] serialization in incremental report.
+	if incReport.Histories["bv-empty"].Commits == nil {
+		t.Fatal("bv-empty Commits slice in incremental report must not be nil")
+	}
+	raw, err := json.Marshal(incReport)
+	if err != nil {
+		t.Fatalf("json.Marshal(incReport): %v", err)
+	}
+	if strings.Contains(string(raw), `"commits":null`) || !strings.Contains(string(raw), `"commits":[]`) {
+		t.Fatalf("incremental report JSON violated non-null commits invariant: %s", raw)
 	}
 }

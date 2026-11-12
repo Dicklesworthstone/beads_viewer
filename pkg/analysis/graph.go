@@ -1525,6 +1525,110 @@ func (a *Analyzer) cycleEligibilityHash() string {
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
+// activeSubgraphMetrics computes betweenness centrality, k-core numbers, and
+// articulation points over the induced subgraph of non-closed issues. When no
+// closed issues exist in the analyzer, it delegates directly to stats' cached
+// full-graph accessors so pure-open fixtures and synthetic GraphStats tests
+// incur zero extra work. When closed historical issues are present, computing
+// on the active subgraph prevents high-volume closed archives from starving
+// approximate pivot sampling or introducing phantom historical cut vertices.
+func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64, map[string]int, []string) {
+	if a == nil || stats == nil {
+		return nil, nil, nil
+	}
+	activeIDs := make([]string, 0, len(a.issueMap))
+	hasClosed := false
+	for id, issue := range a.issueMap {
+		if isClosedLikeStatus(issue.Status) {
+			hasClosed = true
+			continue
+		}
+		activeIDs = append(activeIDs, id)
+	}
+	if !hasClosed {
+		return stats.Betweenness(), stats.CoreNumber(), stats.ArticulationPoints()
+	}
+	if len(activeIDs) == 0 {
+		return map[string]float64{}, map[string]int{}, []string{}
+	}
+	sort.Strings(activeIDs)
+
+	sub := newCompactDirectedGraph(len(activeIDs))
+	idToSub := make(map[string]int64, len(activeIDs))
+	for i, id := range activeIDs {
+		idToSub[id] = int64(i)
+	}
+	edgeCount := 0
+	if a.g != nil {
+		edges := a.g.Edges()
+		for edges.Next() {
+			edge := edges.Edge()
+			fromID := a.nodeToID[edge.From().ID()]
+			toID := a.nodeToID[edge.To().ID()]
+			u, okU := idToSub[fromID]
+			v, okV := idToSub[toID]
+			if !okU || !okV || u == v {
+				continue
+			}
+			sub.addEdge(u, v)
+			edgeCount++
+		}
+	}
+
+	status := stats.Status()
+	bwOut := make(map[string]float64, len(activeIDs))
+	if status.Betweenness.State != "skipped" {
+		for _, id := range activeIDs {
+			bwOut[id] = 0
+		}
+		if edgeCount > 0 && len(activeIDs) > 1 {
+			subCfg := ConfigForSize(len(activeIDs), edgeCount)
+			if subCfg.BetweennessMode == BetweennessApproximate && subCfg.BetweennessSampleSize > 0 && status.Betweenness.State == "approx" {
+				res := approxBetweennessDeterministic(sub, subCfg.BetweennessSampleSize, 1)
+				for subNode, val := range res.Scores {
+					if subNode >= 0 && int(subNode) < len(activeIDs) {
+						bwOut[activeIDs[subNode]] = val
+					}
+				}
+			} else if subCfg.ComputeBetweenness {
+				rawBW := network.Betweenness(sub)
+				for subNode, val := range rawBW {
+					if subNode >= 0 && int(subNode) < len(activeIDs) {
+						bwOut[activeIDs[subNode]] = val
+					}
+				}
+			}
+		}
+	}
+
+	coreOut := make(map[string]int)
+	artOut := make([]string, 0)
+	if status.KCore.State != "skipped" || status.Articulation.State != "skipped" {
+		adj := newUndirectedAdjacency(sub)
+		if status.KCore.State != "skipped" {
+			rawCore := computeKCore(adj)
+			coreOut = make(map[string]int, len(rawCore))
+			for subNode, val := range rawCore {
+				if subNode >= 0 && int(subNode) < len(activeIDs) {
+					coreOut[activeIDs[subNode]] = val
+				}
+			}
+		}
+		if status.Articulation.State != "skipped" {
+			rawArt := findArticulationPoints(adj)
+			artOut = make([]string, 0, len(rawArt))
+			for subNode := range rawArt {
+				if subNode >= 0 && int(subNode) < len(activeIDs) {
+					artOut = append(artOut, activeIDs[subNode])
+				}
+			}
+			sort.Strings(artOut)
+		}
+	}
+
+	return bwOut, coreOut, artOut
+}
+
 // activeCycleGraph returns the blocking graph induced by open-like issues.
 // Closed and tombstoned issues remain in a.g for historical centrality, but
 // they no longer block execution and therefore must break operational cycles.
@@ -1557,6 +1661,7 @@ func (a *Analyzer) activeCycleGraph() directedGraph {
 }
 
 func NewAnalyzer(issues []model.Issue) *Analyzer {
+	defer metrics.Timer(metrics.GraphLoad)()
 	// Issue IDs are the graph's semantic identity. Assign compact numeric IDs in
 	// sorted issue-ID order so cache-equivalent input permutations cannot change
 	// sampled pivots, traversal order, floating-point reduction, or cycle choice.
@@ -1642,9 +1747,12 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 				continue
 			}
 			seenByBlocker[v] = epoch
-			// Blocker ratio is defined as direct dependents (graph in-degree),
-			// so repeated dependency records from one issue count only once.
-			blockerCounts[v]++
+			// Blocker ratio is defined as unresolved direct dependents,
+			// so repeated dependency records from one issue count only once
+			// and already-closed dependents do not inflate live blocker ratios.
+			if !isClosedLikeStatus(issue.Status) {
+				blockerCounts[v]++
+			}
 
 			// Issue (u) depends on v → edge u -> v
 			g.addEdge(u, v)
@@ -1954,6 +2062,7 @@ func (a *Analyzer) computePhase1WithProfile(stats *GraphStats, profile *StartupP
 		}
 	}
 	profile.TopoSort = time.Since(topoStart)
+	metrics.TopologicalSort.Record(profile.TopoSort)
 
 	// Density
 	n := float64(len(a.issueMap))
@@ -2041,6 +2150,7 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 			}
 		}
 		profile.PageRank = time.Since(prStart)
+		metrics.PageRankCompute.Record(profile.PageRank)
 	}
 
 	// Betweenness
@@ -2103,6 +2213,7 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 			}
 		}
 		profile.Betweenness = time.Since(bwStart)
+		metrics.BetweennessCompute.Record(profile.Betweenness)
 	}
 
 	// Eigenvector
@@ -2155,6 +2266,7 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 			}
 		}
 		profile.HITS = time.Since(hitsStart)
+		metrics.HITSCompute.Record(profile.HITS)
 	}
 
 	// Critical Path
@@ -2250,6 +2362,7 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 			}
 		}
 		profile.Cycles = time.Since(cyclesStart)
+		metrics.CycleDetection.Record(profile.Cycles)
 	}
 
 	// Check cancellation before advanced signals
@@ -2395,12 +2508,14 @@ func (a *Analyzer) computePhase1(stats *GraphStats) {
 	// Topological Sort (execution order)
 	// Note: In our graph model, edge u -> v means u depends on v, so we reverse
 	// topo.Sort's output to get dependencies-first ordering.
+	topoStart := time.Now()
 	sorted, err := topo.Sort(a.g)
 	if err == nil {
 		for i := len(sorted) - 1; i >= 0; i-- {
 			stats.TopologicalOrder = append(stats.TopologicalOrder, a.nodeToID[sorted[i].ID()])
 		}
 	}
+	metrics.TopologicalSort.Record(time.Since(topoStart))
 
 	// Density
 	n := float64(len(a.issueMap))

@@ -2341,3 +2341,76 @@ func TestGenerateTriageReasons_QuickWinKeepsParkedStatusHint(t *testing.T) {
 		t.Errorf("open: action = %q, want quick-win hint", open.ActionHint)
 	}
 }
+
+func TestComputeTriage_ContainerEpicExcludedFromDefaultRecommendations(t *testing.T) {
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "bv-umbrella",
+			Title:     "Container epic with open child",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeEpic,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "bv-umbrella.1",
+			Title:     "Ready leaf child",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-umbrella.1", DependsOnID: "bv-umbrella", Type: model.DepParentChild},
+			},
+		},
+		{
+			ID:        "bv-leaf-epic",
+			Title:     "Childless open epic",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeEpic,
+			UpdatedAt: now,
+		},
+	}
+
+	readyDefault := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		WaitForPhase2:  true,
+		ActionableOnly: true,
+	}, now)
+
+	seenDefault := make(map[string]Recommendation)
+	for _, rec := range readyDefault.Recommendations {
+		seenDefault[rec.ID] = rec
+	}
+	if _, found := seenDefault["bv-umbrella"]; found {
+		t.Fatalf("container epic with open child must be excluded from default ActionableOnly recommendations: %+v", readyDefault.Recommendations)
+	}
+	if _, found := seenDefault["bv-umbrella.1"]; !found {
+		t.Fatalf("ready leaf child missing from default recommendations: %+v", readyDefault.Recommendations)
+	}
+	if _, found := seenDefault["bv-leaf-epic"]; !found {
+		t.Fatalf("childless open epic should still be permitted in default recommendations: %+v", readyDefault.Recommendations)
+	}
+
+	withInactive := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		WaitForPhase2:  true,
+		ActionableOnly: false,
+	}, now)
+	var umbrella *Recommendation
+	for i := range withInactive.Recommendations {
+		if withInactive.Recommendations[i].ID == "bv-umbrella" {
+			umbrella = &withInactive.Recommendations[i]
+			break
+		}
+	}
+	if umbrella == nil {
+		t.Fatalf("expected container epic in --robot-include-inactive recommendations: %+v", withInactive.Recommendations)
+	}
+	if umbrella.Claimable {
+		t.Fatalf("container epic must have Claimable=false")
+	}
+	if umbrella.Action != "Coordinate open child tasks" {
+		t.Fatalf("container epic Action = %q, want %q", umbrella.Action, "Coordinate open child tasks")
+	}
+}

@@ -36,9 +36,19 @@ type IncrementalCorrelator struct {
 	refreshes  int64 // Count of full refreshes
 	mu         sync.Mutex
 
+	rawMu     sync.RWMutex
+	rawStates map[string]*incrementalRawState
+
 	// ctx, when set via WithContext, bounds the git subprocesses spawned by
 	// incremental updates (issue #166). nil means context.Background().
 	ctx context.Context
+}
+
+type incrementalRawState struct {
+	headSHA   string
+	events    []BeadEvent
+	coCommits []CorrelatedCommit
+	walk      []walkedCommit
 }
 
 // WithContext binds ctx to the correlator (and its underlying full
@@ -52,12 +62,23 @@ func (ic *IncrementalCorrelator) WithContext(ctx context.Context) *IncrementalCo
 	return ic
 }
 
+// WithFeedbackStore attaches the confirm/reject feedback store to the
+// underlying correlator so both full refreshes and incremental updates preserve
+// and re-apply user feedback overrides.
+func (ic *IncrementalCorrelator) WithFeedbackStore(store *FeedbackStore) *IncrementalCorrelator {
+	if ic.correlator != nil {
+		ic.correlator.WithFeedbackStore(store)
+	}
+	return ic
+}
+
 // NewIncrementalCorrelator creates a correlator with incremental update support.
 // beadsFilePath is optional and forwarded to the underlying correlator.
 func NewIncrementalCorrelator(repoPath string, beadsFilePath ...string) *IncrementalCorrelator {
 	return &IncrementalCorrelator{
 		correlator: NewCorrelator(repoPath, beadsFilePath...),
 		cache:      NewHistoryCache(repoPath),
+		rawStates:  make(map[string]*incrementalRawState),
 	}
 }
 
@@ -67,6 +88,7 @@ func NewIncrementalCorrelatorWithOptions(repoPath string, maxAge time.Duration, 
 	return &IncrementalCorrelator{
 		correlator: NewCorrelator(repoPath, beadsFilePath...),
 		cache:      NewHistoryCacheWithOptions(repoPath, maxAge, maxSize),
+		rawStates:  make(map[string]*incrementalRawState),
 	}
 }
 
@@ -79,8 +101,16 @@ func (ic *IncrementalCorrelator) GenerateReport(beads []BeadInfo, opts Correlato
 	return result.Report, nil
 }
 
+func canUseIncrementalMode(opts CorrelatorOptions) bool {
+	return opts.Revision == "" && opts.CausalityBeadID == "" && opts.Since == nil && opts.Until == nil
+}
+
 // GenerateReportWithDetails generates a report and returns detailed update information
 func (ic *IncrementalCorrelator) GenerateReportWithDetails(beads []BeadInfo, opts CorrelatorOptions) (*IncrementalUpdateResult, error) {
+	if ic.correlator != nil && ic.correlator.explicit != nil {
+		ic.correlator.explicit.SetKnownBeadIDs(beadIDsFromInfos(beads))
+	}
+
 	// Build cache key
 	key, err := BuildCacheKey(ic.cache.repoPath, beads, opts)
 	if err != nil {
@@ -96,6 +126,7 @@ func (ic *IncrementalCorrelator) GenerateReportWithDetails(beads []BeadInfo, opt
 		}, nil
 	}
 	key.Options = ic.correlator.cacheOptionsHash(opts)
+	key.Feedback = ic.correlator.feedbackFingerprint()
 
 	// Check cache
 	if cached, ok := ic.cache.Get(key); ok {
@@ -107,23 +138,53 @@ func (ic *IncrementalCorrelator) GenerateReportWithDetails(beads []BeadInfo, opt
 		}, nil
 	}
 
-	// Cache miss - try incremental update if we have a cached report with same beads
-	existingReport := ic.findExistingReport(beads, opts)
-	// The incremental merger appends through live HEAD and carries lifecycle
-	// events only. Revision-bound or full causal evidence needs the ordinary
+	// Cache miss - try incremental update through live HEAD when options allow.
+	// Revision-bound, date-bounded, or full causal evidence queries require
 	// complete extraction below; same-key cache hits above remain usable.
-	if existingReport != nil && existingReport.LatestCommitSHA != "" && opts.Revision == "" && opts.CausalityBeadID == "" {
-		result, err := ic.tryIncrementalUpdate(existingReport, beads, opts)
-		if err == nil && result != nil {
-			ic.recordIncrementalUpdate()
-			ic.cache.Put(key, result.Report)
-			return result, nil
+	if canUseIncrementalMode(opts) {
+		if state := ic.getRawState(opts); state != nil && state.headSHA != "" {
+			result, nextState, incErr := ic.tryIncrementalUpdateFromRaw(state, key.HeadSHA, beads, opts)
+			if incErr == nil && result != nil {
+				ic.putRawState(opts, nextState)
+				ic.recordIncrementalUpdate()
+				ic.cache.Put(key, result.Report)
+				return result, nil
+			}
+		} else if existingReport := ic.findExistingReport(beads, opts); existingReport != nil && existingReport.LatestCommitSHA != "" {
+			result, incErr := ic.tryIncrementalUpdate(existingReport, beads, opts)
+			if incErr == nil && result != nil {
+				ic.recordIncrementalUpdate()
+				ic.cache.Put(key, result.Report)
+				return result, nil
+			}
 		}
-		// If incremental failed, fall through to full refresh
 	}
 
 	// Full refresh
 	ic.recordFullRefresh()
+
+	if canUseIncrementalMode(opts) {
+		art, walk, err := ic.correlator.extractHistoryArtifactWithWalk(opts)
+		if err != nil {
+			return nil, err
+		}
+		report := ic.correlator.assembleReport(beads, opts, art)
+		if key.HeadSHA != "" {
+			report.LatestCommitSHA = key.HeadSHA
+		}
+		ic.putRawState(opts, &incrementalRawState{
+			headSHA:   key.HeadSHA,
+			events:    append([]BeadEvent(nil), art.Events...),
+			coCommits: cloneCorrelatedCommits(art.Commits),
+			walk:      cloneWalkedCommits(walk),
+		})
+		ic.cache.Put(key, report)
+		return &IncrementalUpdateResult{
+			Report:         report,
+			WasIncremental: false,
+			RefreshReason:  "no suitable cached report for incremental update",
+		}, nil
+	}
 
 	report, err := ic.correlator.GenerateReport(beads, opts)
 	if err != nil {
@@ -168,25 +229,245 @@ func (ic *IncrementalCorrelator) statsSnapshot() (hits, misses, increments, refr
 	return ic.hits, ic.misses, ic.increments, ic.refreshes
 }
 
+func (ic *IncrementalCorrelator) getRawState(opts CorrelatorOptions) *incrementalRawState {
+	rawKey := hashOptions(opts)
+	ic.rawMu.RLock()
+	defer ic.rawMu.RUnlock()
+	if ic.rawStates == nil {
+		return nil
+	}
+	return ic.rawStates[rawKey]
+}
+
+func (ic *IncrementalCorrelator) putRawState(opts CorrelatorOptions, state *incrementalRawState) {
+	if state == nil {
+		return
+	}
+	rawKey := hashOptions(opts)
+	ic.rawMu.Lock()
+	defer ic.rawMu.Unlock()
+	if ic.rawStates == nil {
+		ic.rawStates = make(map[string]*incrementalRawState)
+	}
+	ic.rawStates[rawKey] = state
+}
+
+func cloneWalkedCommits(walk []walkedCommit) []walkedCommit {
+	cloned := make([]walkedCommit, len(walk))
+	for i := range walk {
+		cloned[i] = walk[i]
+		if walk[i].Files != nil {
+			cloned[i].Files = append([]string(nil), walk[i].Files...)
+		}
+	}
+	return cloned
+}
+
 // findExistingReport looks for a cached report that can be incrementally updated
 func (ic *IncrementalCorrelator) findExistingReport(beads []BeadInfo, opts CorrelatorOptions) *HistoryReport {
-	// Look for any cached report with the same beads hash (different HEAD is OK)
-	beadsHash := hashBeads(beads)
+	optsPrefix := hashOptions(opts) + ":matcher:"
 	optsHash := ic.correlator.cacheOptionsHash(opts)
+	beadsHash := hashBeads(beads)
 
 	ic.cache.mu.RLock()
 	defer ic.cache.mu.RUnlock()
 
+	var fallback *HistoryReport
 	for _, entry := range ic.cache.entries {
-		// Match on beads and options, but allow different HEAD
 		if entry.Key.BeadsHash == beadsHash && entry.Key.Options == optsHash {
 			return entry.Report
 		}
+		if strings.HasPrefix(entry.Key.Options, optsPrefix) {
+			fallback = entry.Report
+		}
 	}
-	return nil
+	return fallback
 }
 
-// tryIncrementalUpdate attempts to update an existing report incrementally
+func (ic *IncrementalCorrelator) tryIncrementalUpdateFromRaw(
+	state *incrementalRawState,
+	currentHeadSHA string,
+	beads []BeadInfo,
+	opts CorrelatorOptions,
+) (*IncrementalUpdateResult, *incrementalRawState, error) {
+	var newCommitSHAs []string
+	if currentHeadSHA != state.headSHA {
+		if !isCommitAncestor(ic.ctx, ic.cache.repoPath, state.headSHA, currentHeadSHA) {
+			return nil, nil, fmt.Errorf("cached HEAD %s is not an ancestor of %s", state.headSHA, currentHeadSHA)
+		}
+		var err error
+		newCommitSHAs, err = getCommitsSince(ic.ctx, ic.cache.repoPath, state.headSHA)
+		if err != nil {
+			return nil, nil, fmt.Errorf("finding new commits: %w", err)
+		}
+		if len(newCommitSHAs) > IncrementalThreshold {
+			return nil, nil, fmt.Errorf("too many new commits (%d > %d)", len(newCommitSHAs), IncrementalThreshold)
+		}
+	}
+
+	var newEvents []BeadEvent
+	var newCoCommits []CorrelatedCommit
+	var newWalk []walkedCommit
+	if len(newCommitSHAs) > 0 {
+		extractor := ic.incrementalExtractor()
+		var err error
+		newEvents, err = extractEventsFromCommits(extractor, newCommitSHAs, opts.BeadID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("extracting new events: %w", err)
+		}
+		newCoCommits, err = ic.correlator.coCommitter.ExtractAllCoCommits(newEvents)
+		if err != nil {
+			return nil, nil, fmt.Errorf("extracting co-commits: %w", err)
+		}
+		newWalk, err = walkCommitsBySHAs(ic.ctx, ic.cache.repoPath, newCommitSHAs)
+		if err != nil {
+			return nil, nil, fmt.Errorf("walking incremental commits: %w", err)
+		}
+	}
+
+	allEvents := make([]BeadEvent, 0, len(state.events)+len(newEvents))
+	allEvents = append(allEvents, state.events...)
+	allEvents = append(allEvents, newEvents...)
+
+	allCoCommits := make([]CorrelatedCommit, 0, len(state.coCommits)+len(newCoCommits))
+	allCoCommits = append(allCoCommits, cloneCorrelatedCommits(state.coCommits)...)
+	allCoCommits = append(allCoCommits, newCoCommits...)
+
+	allWalk := make([]walkedCommit, 0, len(state.walk)+len(newWalk))
+	allWalk = append(allWalk, cloneWalkedCommits(state.walk)...)
+	allWalk = append(allWalk, newWalk...)
+
+	if opts.Limit > 0 {
+		if len(allWalk) > opts.Limit {
+			allWalk = allWalk[len(allWalk)-opts.Limit:]
+		}
+		allEvents, allCoCommits = trimEventsAndCoCommitsToLimit(allEvents, allCoCommits, opts.Limit)
+	}
+
+	startCoCommit := time.Now()
+	coCommitCandidates := len(allCoCommits)
+	coCommitDur := durationMS(time.Since(startCoCommit))
+
+	startExplicit := time.Now()
+	matcher := ic.correlator.explicit.withMergedKnownIDs(beadIDsFromEvents(allEvents))
+	explicitCommits, err := ic.correlator.extractExplicitCommitsWithMatcher(matcher, allWalk, opts.BeadID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("extracting explicit-id commits: %w", err)
+	}
+	explicitDur := durationMS(time.Since(startExplicit))
+
+	startTemporal := time.Now()
+	temporalCandidates, err := ic.correlator.extractTemporalCandidates(allEvents, allWalk, opts.BeadID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("extracting temporal candidates: %w", err)
+	}
+	temporalDur := durationMS(time.Since(startTemporal))
+
+	art := &historyArtifact{
+		FormatVersion: historyArtifactFormatVersion,
+		Events:        allEvents,
+		Commits:       allCoCommits,
+		Explicit:      explicitCommits,
+		Temporal:      temporalCandidates,
+		WalkedCommits: len(allWalk),
+		Strategies: []StrategyRun{
+			{Name: MethodCoCommitted.String(), Ran: true, DurationMS: coCommitDur, Candidates: coCommitCandidates},
+			{Name: MethodExplicitID.String(), Ran: true, DurationMS: explicitDur, Candidates: len(explicitCommits)},
+			{Name: MethodTemporalAuthor.String(), Ran: true, DurationMS: temporalDur, Candidates: len(temporalCandidates)},
+		},
+	}
+
+	merged := ic.correlator.assembleReport(beads, opts, art)
+	nextHead := currentHeadSHA
+	if nextHead == "" && len(newCommitSHAs) > 0 {
+		nextHead = newCommitSHAs[len(newCommitSHAs)-1]
+	}
+	if nextHead == "" {
+		nextHead = state.headSHA
+	}
+	merged.LatestCommitSHA = nextHead
+
+	mergedNewCommits := 0
+	if len(newCommitSHAs) > 0 {
+		newSet := make(map[string]struct{}, len(newCommitSHAs))
+		for _, sha := range newCommitSHAs {
+			newSet[sha] = struct{}{}
+		}
+		seenSHAs := make(map[string]struct{})
+		for _, h := range merged.Histories {
+			for _, cc := range h.Commits {
+				if _, isNew := newSet[cc.SHA]; isNew {
+					seenSHAs[cc.SHA] = struct{}{}
+				}
+			}
+		}
+		mergedNewCommits = len(seenSHAs)
+	}
+
+	nextState := &incrementalRawState{
+		headSHA:   nextHead,
+		events:    allEvents,
+		coCommits: cloneCorrelatedCommits(allCoCommits),
+		walk:      cloneWalkedCommits(allWalk),
+	}
+
+	return &IncrementalUpdateResult{
+		Report:            merged,
+		WasIncremental:    true,
+		NewCommitCount:    len(newCommitSHAs),
+		MergedEventCount:  len(newEvents),
+		MergedCommitCount: mergedNewCommits,
+	}, nextState, nil
+}
+
+func trimEventsAndCoCommitsToLimit(events []BeadEvent, coCommits []CorrelatedCommit, limit int) ([]BeadEvent, []CorrelatedCommit) {
+	if limit <= 0 || len(events) == 0 {
+		return events, coCommits
+	}
+	var distinctSHAs []string
+	seen := make(map[string]struct{})
+	for _, ev := range events {
+		if _, ok := seen[ev.CommitSHA]; !ok {
+			seen[ev.CommitSHA] = struct{}{}
+			distinctSHAs = append(distinctSHAs, ev.CommitSHA)
+		}
+	}
+	if len(distinctSHAs) <= limit {
+		return events, coCommits
+	}
+	keep := make(map[string]struct{}, limit)
+	for _, sha := range distinctSHAs[len(distinctSHAs)-limit:] {
+		keep[sha] = struct{}{}
+	}
+	trimmedEvents := make([]BeadEvent, 0, len(events))
+	for _, ev := range events {
+		if _, ok := keep[ev.CommitSHA]; ok {
+			trimmedEvents = append(trimmedEvents, ev)
+		}
+	}
+	trimmedCommits := make([]CorrelatedCommit, 0, len(coCommits))
+	for _, cc := range coCommits {
+		if _, ok := keep[cc.SHA]; ok {
+			trimmedCommits = append(trimmedCommits, cc)
+		}
+	}
+	return trimmedEvents, trimmedCommits
+}
+
+func isCommitAncestor(ctx context.Context, repoPath, ancestorSHA, descendantSHA string) bool {
+	if ancestorSHA == "" || descendantSHA == "" {
+		return false
+	}
+	if ancestorSHA == descendantSHA {
+		return true
+	}
+	cmd := gitCommand(ctx, "merge-base", "--is-ancestor", ancestorSHA, descendantSHA)
+	cmd.Dir = repoPath
+	return cmd.Run() == nil
+}
+
+// tryIncrementalUpdate attempts to update an existing report incrementally when
+// only a HistoryReport (without raw walk state) is present in the cache.
 func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, beads []BeadInfo, opts CorrelatorOptions) (*IncrementalUpdateResult, error) {
 	// Find new commits since the existing report
 	newCommitSHAs, err := getCommitsSince(ic.ctx, ic.cache.repoPath, existing.LatestCommitSHA)
@@ -199,10 +480,11 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, b
 		return nil, fmt.Errorf("too many new commits (%d > %d)", len(newCommitSHAs), IncrementalThreshold)
 	}
 
-	// If no new commits, the existing report is still valid
+	// If no new commits, re-merge metadata, feedback, and DataHash against current beads
 	if len(newCommitSHAs) == 0 {
+		merged := mergeReportsWithCorrelator(ic.correlator, existing, beads, nil, nil, existing.LatestCommitSHA)
 		return &IncrementalUpdateResult{
-			Report:         existing,
+			Report:         merged,
 			WasIncremental: true,
 			NewCommitCount: 0,
 		}, nil
@@ -215,22 +497,77 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, b
 	}
 
 	// Extract co-commits from new events
-	coCommitter := NewCoCommitExtractor(ic.cache.repoPath)
-	coCommitter.ctx = ic.ctx
-	newCorrelatedCommits, err := coCommitter.ExtractAllCoCommits(newEvents)
+	newCoCommits, err := ic.correlator.coCommitter.ExtractAllCoCommits(newEvents)
 	if err != nil {
 		return nil, fmt.Errorf("extracting co-commits: %w", err)
 	}
 
+	newWalk, err := walkCommitsBySHAs(ic.ctx, ic.cache.repoPath, newCommitSHAs)
+	if err != nil {
+		return nil, fmt.Errorf("walking incremental commits: %w", err)
+	}
+
+	// Collect all known IDs and combined events from existing histories + newEvents + beads
+	knownIDs := beadIDsFromInfos(beads)
+	var allEvents []BeadEvent
+	for id, h := range existing.Histories {
+		if id != "" {
+			knownIDs = append(knownIDs, id)
+		}
+		allEvents = append(allEvents, h.Events...)
+	}
+	allEvents = append(allEvents, newEvents...)
+	knownIDs = append(knownIDs, beadIDsFromEvents(allEvents)...)
+
+	matcher := ic.correlator.explicit.withMergedKnownIDs(knownIDs)
+	newExplicit, err := ic.correlator.extractExplicitCommitsWithMatcher(matcher, newWalk, opts.BeadID)
+	if err != nil {
+		return nil, fmt.Errorf("extracting explicit-id commits: %w", err)
+	}
+
+	newTemporalCands, err := ic.correlator.extractTemporalCandidates(allEvents, newWalk, opts.BeadID)
+	if err != nil {
+		return nil, fmt.Errorf("extracting temporal candidates: %w", err)
+	}
+
+	titles := make(map[string]string, len(beads))
+	for _, h := range existing.Histories {
+		titles[h.BeadID] = h.Title
+	}
+	for _, b := range beads {
+		titles[b.ID] = b.Title
+	}
+	explicitBeadsBySHA := make(map[string]map[string]struct{})
+	for _, cc := range newExplicit {
+		if explicitBeadsBySHA[cc.SHA] == nil {
+			explicitBeadsBySHA[cc.SHA] = make(map[string]struct{})
+		}
+		explicitBeadsBySHA[cc.SHA][cc.BeadID] = struct{}{}
+	}
+	var newTemporal []CorrelatedCommit
+	for _, cand := range newTemporalCands {
+		if expSet, ok := explicitBeadsBySHA[cand.SHA]; ok {
+			if _, same := expSet[cand.BeadID]; !same {
+				continue
+			}
+		}
+		newTemporal = append(newTemporal, finalizeTemporalCandidate(cand, titles[cand.BeadID]))
+	}
+
+	allNewCommits := make([]CorrelatedCommit, 0, len(newCoCommits)+len(newExplicit)+len(newTemporal))
+	allNewCommits = append(allNewCommits, newCoCommits...)
+	allNewCommits = append(allNewCommits, newExplicit...)
+	allNewCommits = append(allNewCommits, newTemporal...)
+
 	// Merge new data with existing report
-	merged := mergeReportsThrough(existing, beads, newEvents, newCorrelatedCommits, newCommitSHAs[len(newCommitSHAs)-1])
+	merged := mergeReportsWithCorrelator(ic.correlator, existing, beads, newEvents, allNewCommits, newCommitSHAs[len(newCommitSHAs)-1])
 
 	return &IncrementalUpdateResult{
 		Report:            merged,
 		WasIncremental:    true,
 		NewCommitCount:    len(newCommitSHAs),
 		MergedEventCount:  len(newEvents),
-		MergedCommitCount: len(newCorrelatedCommits),
+		MergedCommitCount: len(allNewCommits),
 	}, nil
 }
 
@@ -303,12 +640,11 @@ func extractEventsFromCommits(extractor *Extractor, commitSHAs []string, filterB
 		return nil, nil
 	}
 
-	// Use git log with --no-walk to process specific commits exactly as listed.
-	// This avoids range semantics (A..B) which can be tricky with root commits
-	// or non-linear history segments.
+	// Use git log with --no-walk to process specific commits.
 	args := []string{
 		"log",
 		"-p",
+		"--unified=0",
 		"--format=" + gitLogHeaderFormat,
 		"--no-walk",
 	}
@@ -323,15 +659,75 @@ func extractEventsFromCommits(extractor *Extractor, commitSHAs []string, filterB
 		return nil, fmt.Errorf("git log for commits failed: %w", err)
 	}
 
-	events, err := extractor.parseGitLogOutput(bytes.NewReader(out), filterBeadID)
+	parsed, err := extractor.parseGitLogOutput(bytes.NewReader(out), filterBeadID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Reverse to chronological order (git log output depends on input order but usually LIFO)
-	// We want chronological for the history report
-	reverseEvents(events)
+	// Reassemble commit groups in the caller's chronological commitSHAs order
+	// while preserving deterministic within-commit event ordering (EventCreated
+	// before synthesized EventClaimed / EventClosed).
+	bySHA := make(map[string][]BeadEvent, len(commitSHAs))
+	for _, ev := range parsed {
+		bySHA[ev.CommitSHA] = append(bySHA[ev.CommitSHA], ev)
+	}
+	events := make([]BeadEvent, 0, len(parsed))
+	seen := make(map[string]struct{}, len(commitSHAs))
+	for _, sha := range commitSHAs {
+		if _, dup := seen[sha]; dup {
+			continue
+		}
+		seen[sha] = struct{}{}
+		events = append(events, bySHA[sha]...)
+	}
 	return events, nil
+}
+
+func walkCommitsBySHAs(ctx context.Context, repoPath string, commitSHAs []string) ([]walkedCommit, error) {
+	if len(commitSHAs) == 0 {
+		return nil, nil
+	}
+	args := []string{
+		"log",
+		"--no-merges",
+		"--name-only",
+		"--no-walk",
+		"--format=" + commitWalkFormat,
+	}
+	args = append(args, commitSHAs...)
+
+	cmd := gitCommand(ctx, withNoColorGit(args)...)
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx != nil && ctx.Err() != nil {
+			return nil, fmt.Errorf("git log incremental walk: %w", ctx.Err())
+		}
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("git log incremental walk failed: %s", strings.TrimSpace(string(exitErr.Stderr)))
+		}
+		return nil, fmt.Errorf("git log incremental walk failed: %w", err)
+	}
+	parsed, err := parseCommitWalk(out)
+	if err != nil {
+		return nil, err
+	}
+	bySHA := make(map[string]walkedCommit, len(parsed))
+	for _, wc := range parsed {
+		bySHA[wc.SHA] = wc
+	}
+	ordered := make([]walkedCommit, 0, len(parsed))
+	seen := make(map[string]struct{}, len(commitSHAs))
+	for _, sha := range commitSHAs {
+		if _, dup := seen[sha]; dup {
+			continue
+		}
+		seen[sha] = struct{}{}
+		if wc, ok := bySHA[sha]; ok {
+			ordered = append(ordered, wc)
+		}
+	}
+	return ordered, nil
 }
 
 // mergeReports creates a new report by merging existing data with new events/commits
@@ -387,6 +783,15 @@ func cloneCorrelatedCommits(commits []CorrelatedCommit) []CorrelatedCommit {
 }
 
 func mergeReportsThrough(existing *HistoryReport, beads []BeadInfo, newEvents []BeadEvent, newCommits []CorrelatedCommit, latestProcessedSHA string) *HistoryReport {
+	return mergeReportsWithCorrelator(nil, existing, beads, newEvents, newCommits, latestProcessedSHA)
+}
+
+func mergeReportsWithCorrelator(c *Correlator, existing *HistoryReport, beads []BeadInfo, newEvents []BeadEvent, newCommits []CorrelatedCommit, latestProcessedSHA string) *HistoryReport {
+	scorer := NewScorer()
+	if c != nil && c.scorer != nil {
+		scorer = c.scorer
+	}
+
 	// Create a deep copy of existing histories
 	histories := make(map[string]BeadHistory, len(existing.Histories))
 	for id, h := range existing.Histories {
@@ -444,12 +849,11 @@ func mergeReportsThrough(existing *HistoryReport, beads []BeadInfo, newEvents []
 		}
 	}
 
-	// Merge new commits
+	// Merge new commits grouped by bead and correlation method so distinct
+	// strategies combine signals while exact duplicates within the same method
+	// are deduplicated cleanly.
 	commitsByBead := make(map[string][]CorrelatedCommit)
 	for _, commit := range newCommits {
-		// Match full report assembly: the correlation itself owns bead linkage.
-		// Same-SHA lifecycle events can belong to multiple beads and must not
-		// cross-associate their distinct correlation records.
 		if commit.BeadID != "" {
 			commitsByBead[commit.BeadID] = append(commitsByBead[commit.BeadID], commit)
 		}
@@ -457,13 +861,28 @@ func mergeReportsThrough(existing *HistoryReport, beads []BeadInfo, newEvents []
 
 	for beadID, commits := range commitsByBead {
 		if h, exists := histories[beadID]; exists {
-			h.Commits = dedupCommits(append(h.Commits, commits...))
+			h.Commits = mergeIncrementalBeadCommits(scorer, h.Commits, commits)
 			// Update last author
 			if len(h.Commits) > 0 {
 				h.LastAuthor = h.Commits[len(h.Commits)-1].Author
+			} else if len(h.Events) > 0 {
+				h.LastAuthor = h.Events[len(h.Events)-1].Author
 			}
 			histories[beadID] = h
 		}
+	}
+
+	// Ensure every history has a non-nil Commits slice.
+	for beadID, h := range histories {
+		if h.Commits == nil {
+			h.Commits = []CorrelatedCommit{}
+			histories[beadID] = h
+		}
+	}
+
+	var feedbackApplied *FeedbackApplied
+	if c != nil && c.feedback != nil {
+		feedbackApplied = applyFeedbackIdempotent(c.feedback, histories)
 	}
 
 	// Build a stable reverse index; HistoryReport exposes these map-derived
@@ -472,6 +891,7 @@ func mergeReportsThrough(existing *HistoryReport, beads []BeadInfo, newEvents []
 
 	// Calculate new stats
 	stats := calculateMergedStats(histories, newCommits)
+	stats.FeedbackApplied = feedbackApplied
 
 	// Find latest commit SHA when a direct caller did not supply the rev-list
 	// cursor. Incremental callers always use the newest processed SHA so code-only
@@ -495,15 +915,99 @@ func mergeReportsThrough(existing *HistoryReport, beads []BeadInfo, newEvents []
 		latestSHA = existing.LatestCommitSHA
 	}
 
+	dataHash := existing.DataHash
+	if beads != nil || dataHash == "" {
+		dataHash = hashBeads(beads)
+	}
+
 	return &HistoryReport{
 		GeneratedAt:     time.Now().UTC(),
-		DataHash:        existing.DataHash,
+		DataHash:        dataHash,
 		GitRange:        existing.GitRange + " (incremental)",
 		LatestCommitSHA: latestSHA,
 		Stats:           stats,
 		Histories:       histories,
 		CommitIndex:     commitIndex,
 	}
+}
+
+func mergeIncrementalBeadCommits(scorer *Scorer, existing, incoming []CorrelatedCommit) []CorrelatedCommit {
+	byMethod := make(map[CorrelationMethod][]CorrelatedCommit)
+	var methodOrder []CorrelationMethod
+	add := func(cc CorrelatedCommit) {
+		if _, ok := byMethod[cc.Method]; !ok {
+			methodOrder = append(methodOrder, cc.Method)
+		}
+		byMethod[cc.Method] = append(byMethod[cc.Method], cc)
+	}
+	for _, cc := range existing {
+		add(cc)
+	}
+	for _, cc := range incoming {
+		add(cc)
+	}
+	if len(methodOrder) == 0 {
+		return []CorrelatedCommit{}
+	}
+	if len(methodOrder) == 1 && methodOrder[0] == "" {
+		return dedupCommits(byMethod[""])
+	}
+	lists := make([][]CorrelatedCommit, 0, len(methodOrder))
+	for _, m := range methodOrder {
+		lists = append(lists, byMethod[m])
+	}
+	return mergeCorrelatedCommits(scorer, lists...)
+}
+
+func applyFeedbackIdempotent(store *FeedbackStore, histories map[string]BeadHistory) *FeedbackApplied {
+	if store == nil {
+		return nil
+	}
+	applied := &FeedbackApplied{}
+	for beadID, history := range histories {
+		if len(history.Commits) == 0 {
+			continue
+		}
+		kept := make([]CorrelatedCommit, 0, len(history.Commits))
+		changed := false
+		for _, commit := range history.Commits {
+			fb, ok := store.Get(commit.SHA, beadID)
+			if !ok {
+				kept = append(kept, commit)
+				continue
+			}
+			switch fb.Type {
+			case FeedbackReject:
+				applied.Rejected++
+				changed = true
+				continue
+			case FeedbackConfirm:
+				applied.Confirmed++
+				changed = true
+				commit.Confidence = 1.0
+				if !commit.Confirmed {
+					commit.Confirmed = true
+					commit.Reason = commit.Reason + "; confirmed by feedback (" + fb.FeedbackBy + ")"
+				}
+			case FeedbackIgnore:
+				applied.Ignored++
+			}
+			kept = append(kept, commit)
+		}
+		if !changed {
+			continue
+		}
+		history.Commits = kept
+		if len(kept) > 0 {
+			history.LastAuthor = kept[len(kept)-1].Author
+		} else if len(history.Events) > 0 {
+			history.LastAuthor = history.Events[len(history.Events)-1].Author
+		} else {
+			history.LastAuthor = ""
+		}
+		histories[beadID] = history
+	}
+	return applied
 }
 
 // calculateMergedStats computes statistics for the merged report
@@ -564,6 +1068,9 @@ func calculateMergedStats(histories map[string]BeadHistory, newCommits []Correla
 // InvalidateCache clears all cached entries
 func (ic *IncrementalCorrelator) InvalidateCache() {
 	ic.cache.Invalidate()
+	ic.rawMu.Lock()
+	ic.rawStates = make(map[string]*incrementalRawState)
+	ic.rawMu.Unlock()
 }
 
 // CacheStats returns cache and incremental update statistics

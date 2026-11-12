@@ -45,7 +45,7 @@ func EstimateETAForIssue(issues []model.Issue, stats *GraphStats, issueID string
 	medianMinutes := computeMedianEstimatedMinutes(issues)
 	complexityMinutes, complexityFactors := estimateComplexityMinutes(issue, stats, medianMinutes)
 
-	velocityPerDay, velocitySamples, velocityFactors := estimateVelocityMinutesPerDay(issues, issue, now, medianMinutes)
+	velocityPerDay, velocitySamples, velocityFactors := estimateVelocityMinutesPerDayWithStats(issues, stats, issue, now, medianMinutes)
 	if velocityPerDay <= 0 {
 		// Conservative default: one median-sized issue per (work) week.
 		velocityPerDay = float64(medianMinutes) / 5.0
@@ -148,28 +148,46 @@ func estimateComplexityMinutes(issue model.Issue, stats *GraphStats, medianMinut
 	return derived, factors
 }
 
+// buehlmannStraubPriorWeight is the empirical-Bayes credibility prior strength k
+// used to shrink noisy small-sample label velocities toward global project velocity:
+//
+//	v_shrunk = (n / (n + k)) * v_label + (k / (n + k)) * v_global
+const buehlmannStraubPriorWeight = 5.0
+
 func estimateVelocityMinutesPerDay(issues []model.Issue, issue model.Issue, now time.Time, medianMinutes int) (float64, int, []string) {
+	return estimateVelocityMinutesPerDayWithStats(issues, nil, issue, now, medianMinutes)
+}
+
+func estimateVelocityMinutesPerDayWithStats(issues []model.Issue, stats *GraphStats, issue model.Issue, now time.Time, medianMinutes int) (float64, int, []string) {
 	const windowDays = 30
 	since := now.Add(-time.Duration(windowDays) * 24 * time.Hour)
 
+	globalV, globalN := velocityMinutesPerDayForLabelWithStats(issues, stats, "", since, medianMinutes)
 	labels := issue.Labels
 	if len(labels) == 0 {
-		v, n := velocityMinutesPerDayForLabel(issues, "", since, medianMinutes)
-		return v, n, []string{fmt.Sprintf("velocity: global (%d samples/30d)", n)}
+		return globalV, globalN, []string{fmt.Sprintf("velocity: global (%d samples/30d)", globalN)}
 	}
 
-	// Use the slowest non-zero label velocity for conservative ETA (deterministic).
+	// Shrink each observed label velocity toward global velocity via Bühlmann-Straub
+	// credibility weighting, then pick the slowest non-zero shrunk label velocity
+	// for conservative, deterministic ETA estimation.
 	bestLabel := ""
 	bestV := 0.0
 	bestN := 0
 	for _, label := range labels {
-		v, n := velocityMinutesPerDayForLabel(issues, label, since, medianMinutes)
-		if n == 0 || v <= 0 {
+		rawV, n := velocityMinutesPerDayForLabelWithStats(issues, stats, label, since, medianMinutes)
+		if n == 0 || rawV <= 0 {
 			continue
 		}
-		if bestV == 0 || v < bestV || (v == bestV && strings.ToLower(label) < strings.ToLower(bestLabel)) {
+		priorV := rawV
+		if globalN > 0 && globalV > 0 {
+			priorV = globalV
+		}
+		nf := float64(n)
+		shrunkV := (nf*rawV + buehlmannStraubPriorWeight*priorV) / (nf + buehlmannStraubPriorWeight)
+		if bestV == 0 || shrunkV < bestV || (shrunkV == bestV && strings.ToLower(label) < strings.ToLower(bestLabel)) {
 			bestLabel = label
-			bestV = v
+			bestV = shrunkV
 			bestN = n
 		}
 	}
@@ -178,11 +196,14 @@ func estimateVelocityMinutesPerDay(issues []model.Issue, issue model.Issue, now 
 	}
 
 	// Fallback: global velocity.
-	v, n := velocityMinutesPerDayForLabel(issues, "", since, medianMinutes)
-	return v, n, []string{fmt.Sprintf("velocity: global (%d samples/30d)", n)}
+	return globalV, globalN, []string{fmt.Sprintf("velocity: global (%d samples/30d)", globalN)}
 }
 
 func velocityMinutesPerDayForLabel(issues []model.Issue, label string, since time.Time, medianMinutes int) (float64, int) {
+	return velocityMinutesPerDayForLabelWithStats(issues, nil, label, since, medianMinutes)
+}
+
+func velocityMinutesPerDayForLabelWithStats(issues []model.Issue, stats *GraphStats, label string, since time.Time, medianMinutes int) (float64, int) {
 	total := 0
 	samples := 0
 
@@ -204,13 +225,9 @@ func velocityMinutesPerDayForLabel(issues []model.Issue, label string, since tim
 			continue
 		}
 
-		minutes := medianMinutes
-		if iss.EstimatedMinutes != nil && *iss.EstimatedMinutes > 0 {
-			minutes = *iss.EstimatedMinutes
-		}
-		if minutes <= 0 {
-			minutes = DefaultEstimatedMinutes
-		}
+		// Measure closed work with the exact same complexity scale used for open work
+		// so numerator and denominator share identical units (eliminating 5.4x-10.8x bias).
+		minutes, _ := estimateComplexityMinutes(iss, stats, medianMinutes)
 		total += minutes
 		samples++
 	}
@@ -219,6 +236,161 @@ func velocityMinutesPerDayForLabel(issues []model.Issue, label string, since tim
 		return 0, 0
 	}
 	return float64(total) / 30.0, samples
+}
+
+// GrahamBounds captures Graham (1969) parallel list-scheduling makespan bounds:
+//
+//	T_min(m) = max(L_crit, W / m)
+//	T_max(m) = L_crit + max(0, W - L_crit) / m
+//
+// expressed both in raw work-minutes and in velocity-calibrated days.
+type GrahamBounds struct {
+	TotalMinutes          int     `json:"total_minutes"`
+	CriticalPathMinutes   int     `json:"critical_path_minutes"`
+	GrahamMinMinutes      float64 `json:"graham_min_minutes"`
+	GrahamMaxMinutes      float64 `json:"graham_max_minutes"`
+	VelocityMinutesPerDay float64 `json:"velocity_minutes_per_day"`
+	GrahamMinDays         float64 `json:"graham_min_days"`
+	GrahamMaxDays         float64 `json:"graham_max_days"`
+}
+
+// ComputeGrahamBounds computes Graham (1969) lower and upper makespan bounds for
+// executing openIssues across agents parallel workers, calibrated against the
+// project's effective closure velocity over allIssues.
+func ComputeGrahamBounds(openIssues []model.Issue, allIssues []model.Issue, stats *GraphStats, agents int, now time.Time) GrahamBounds {
+	if agents <= 0 {
+		agents = 1
+	}
+	medianMinutes := computeMedianEstimatedMinutes(allIssues)
+	since := now.Add(-30 * 24 * time.Hour)
+	velocityPerDay, _ := velocityMinutesPerDayForLabelWithStats(allIssues, stats, "", since, medianMinutes)
+	if velocityPerDay <= 0 {
+		velocityPerDay = 480.0 // Default 8h workday when project has no 30d closure history
+	}
+
+	if len(openIssues) == 0 {
+		return GrahamBounds{VelocityMinutesPerDay: velocityPerDay}
+	}
+
+	weights := make(map[string]int, len(openIssues))
+	openSet := make(map[string]model.Issue, len(openIssues))
+	totalMinutes := 0
+	for _, iss := range openIssues {
+		w, _ := estimateComplexityMinutes(iss, stats, medianMinutes)
+		weights[iss.ID] = w
+		openSet[iss.ID] = iss
+		totalMinutes += w
+	}
+
+	// Build prerequisite -> dependent adjacency on the unresolved subgraph.
+	dependents := make(map[string][]string, len(openIssues))
+	for _, iss := range openIssues {
+		seen := make(map[string]bool)
+		for _, dep := range iss.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() || seen[dep.DependsOnID] || dep.DependsOnID == iss.ID {
+				continue
+			}
+			if _, ok := openSet[dep.DependsOnID]; ok {
+				seen[dep.DependsOnID] = true
+				dependents[dep.DependsOnID] = append(dependents[dep.DependsOnID], iss.ID)
+			}
+		}
+	}
+	for k := range dependents {
+		sort.Strings(dependents[k])
+	}
+
+	// Longest work-weighted simple path (memoized on acyclic subgraphs, cycle-safe).
+	const (
+		unvisited = 0
+		visiting  = 1
+		visited   = 2
+	)
+	state := make(map[string]int, len(openIssues))
+	memo := make(map[string]int, len(openIssues))
+	hasCycle := false
+
+	var dfsDAG func(id string) int
+	dfsDAG = func(id string) int {
+		if state[id] == visited {
+			return memo[id]
+		}
+		if state[id] == visiting {
+			hasCycle = true
+			return 0
+		}
+		state[id] = visiting
+		bestSuffix := 0
+		for _, next := range dependents[id] {
+			if cand := dfsDAG(next); cand > bestSuffix {
+				bestSuffix = cand
+			}
+		}
+		state[id] = visited
+		memo[id] = weights[id] + bestSuffix
+		return memo[id]
+	}
+
+	ids := make([]string, 0, len(openIssues))
+	for id := range openSet {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	critMinutes := 0
+	for _, id := range ids {
+		if cand := dfsDAG(id); cand > critMinutes {
+			critMinutes = cand
+		}
+	}
+
+	if hasCycle {
+		// Cycle fallback: bounded simple-path search so cyclic components remain exact/finite.
+		critMinutes = 0
+		onPath := make(map[string]bool, len(ids))
+		var dfsSimple func(id string, depth int) int
+		dfsSimple = func(id string, depth int) int {
+			if depth > 64 {
+				return weights[id]
+			}
+			onPath[id] = true
+			bestSuffix := 0
+			for _, next := range dependents[id] {
+				if onPath[next] {
+					continue
+				}
+				if cand := dfsSimple(next, depth+1); cand > bestSuffix {
+					bestSuffix = cand
+				}
+			}
+			onPath[id] = false
+			return weights[id] + bestSuffix
+		}
+		for _, id := range ids {
+			if cand := dfsSimple(id, 0); cand > critMinutes {
+				critMinutes = cand
+			}
+		}
+	}
+	if critMinutes > totalMinutes {
+		critMinutes = totalMinutes
+	}
+
+	m := float64(agents)
+	wFloat := float64(totalMinutes)
+	lCrit := float64(critMinutes)
+	minMinutes := max(lCrit, wFloat/m)
+	maxMinutes := lCrit + max(0.0, wFloat-lCrit)/m
+
+	return GrahamBounds{
+		TotalMinutes:          totalMinutes,
+		CriticalPathMinutes:   critMinutes,
+		GrahamMinMinutes:      minMinutes,
+		GrahamMaxMinutes:      maxMinutes,
+		VelocityMinutesPerDay: velocityPerDay,
+		GrahamMinDays:         minMinutes / velocityPerDay,
+		GrahamMaxDays:         maxMinutes / velocityPerDay,
+	}
 }
 
 func hasLabel(labels []string, target string) bool {

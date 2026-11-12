@@ -158,14 +158,29 @@ func (s *ShortcutsSidebar) allSections() []shortcutSection {
 func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 	return []shortcutSection{
 		{
-			title:    "Navigation",
-			contexts: []string{}, // All contexts
+			title: "Navigation",
+			contexts: []string{
+				"list", "detail", "split", "board", "graph", "insights",
+				"history", "actionable", "tree", "flow", "attention", "label",
+			},
 			items: []shortcutItem{
 				{"j/k", "Move ↓/↑"},
-				{"G/gg", "End/Start"},
+				{"G/Home", "End/Start"},
 				{"^d/^u", "Page ↓/↑"},
 				{"Enter", "Details"},
 				{"Esc", "Back"},
+			},
+		},
+		{
+			title:    "Help & Global",
+			contexts: []string{}, // All contexts
+			items: []shortcutItem{
+				{"?", "Help overlay"},
+				{"~", "Context help"},
+				{"`", "Full tutorial"},
+				{";", "This sidebar"},
+				{"^r/F5", "Refresh"},
+				{"q", "Back / Quit"},
 			},
 		},
 		{
@@ -175,10 +190,13 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 				{"a", "Actionable"},
 				{"b", "Board"},
 				{"g", "Graph"},
+				{"E", "Tree"},
 				{"h", "History"},
 				{"i", "Insights"},
-				{"?", "Help"},
-				{";", "This sidebar"},
+				{"P", "Sprint"},
+				{"[", "Labels"},
+				{"]", "Attention"},
+				{"f", "Flow matrix"},
 				{"p", "Priority hints"},
 			},
 		},
@@ -187,22 +205,53 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 			contexts: []string{"graph"},
 			items: []shortcutItem{
 				{"hjkl", "Navigate"},
+				{"Space", "Expand/collapse"},
 				{"H/L", "Scroll ←/→"},
-				{"PgUp/Dn", "Scroll ↑/↓"},
+				{"J/K", "Scroll ↓/↑"},
+				{"PgUp/Dn", "Jump 10 nodes"},
+				{"y", "Copy ID"},
 				{"Enter", "Jump to issue"},
+			},
+		},
+		{
+			title:    "Tree",
+			contexts: []string{"tree"},
+			items: []shortcutItem{
+				{"j/k", "Move ↓/↑"},
+				{"Enter", "Expand/collapse"},
+				{"h/l", "Parent / Child"},
+				{"o/O", "Expand/Collapse all"},
+				{"gg/G", "Top / Bottom"},
+				{"Tab", "Toggle detail"},
+				{"y", "Copy ID"},
+				{"V", "Cass sessions"},
+				{"E/Esc", "Exit tree"},
 			},
 		},
 		{
 			title:    "Insights",
 			contexts: []string{"insights"},
 			items: []shortcutItem{
-				{"h/l", "Switch panel"},
+				{"h/l/Tab", "Switch panel"},
 				{"j/k", "Select item"},
 				{"^j/^k", "Scroll detail"},
+				{"</>", "Resize detail"},
 				{"e", "Explanations"},
 				{"x", "Calc proof"},
-				{"m", "Heatmap"},
+				{"m/H", "Heatmap"},
 				{"Enter", "Jump to issue"},
+			},
+		},
+		{
+			title:    "Actionable",
+			contexts: []string{"actionable"},
+			items: []shortcutItem{
+				{"j/k", "Move ↓/↑"},
+				{"Home/G", "Start / End"},
+				{"PgUp/Dn", "Page ↑/↓"},
+				{"Enter", "Open details"},
+				{"y", "Copy ID"},
+				{"a/Esc", "Exit actionable"},
 			},
 		},
 		{
@@ -214,10 +263,11 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 				{"j/k", "Navigate ↓/↑"},
 				{"J/K", "Detail ↓/↑"},
 				{"Tab", "Focus toggle"},
+				{"t/f", "Timeline / Files"},
+				{"c", "Confidence"},
 				{"y", "Copy SHA"},
 				{"o", "Open in browser"},
-				{"g", "Graph view"},
-				{"c", "Cycle filter"},
+				{"V", "Cass sessions"},
 			},
 		},
 		{
@@ -225,11 +275,68 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 			contexts: []string{"board"},
 			items: []shortcutItem{
 				{"h/l", "Columns ←/→"},
+				{"H/L/1-4", "Jump column"},
 				{"j/k", "Items ↓/↑"},
+				{"gg/G", "Top / Bottom"},
+				{"/", "Search cards"},
+				{"s", "Swimlanes"},
+				{"o/c/r", "Status filter"},
+				{"d/e", "Expand / Empty"},
 				{"Tab", "Toggle detail"},
-				{"y", "Copy ID"},
-				{"^j/^k", "Scroll detail"},
+				{"y/V", "Copy ID / Cass"},
 				{"Enter", "Full view"},
+			},
+		},
+		{
+			title:    "Flow Matrix",
+			contexts: []string{"flow"},
+			items: []shortcutItem{
+				{"j/k", "Move ↓/↑"},
+				{"g/G", "Top / Bottom"},
+				{"Tab", "Switch panel"},
+				{"Enter", "Drilldown / Issue"},
+				{"y", "Copy ID"},
+				{"f/Esc", "Back / Exit"},
+			},
+		},
+		{
+			title:    "Sprint",
+			contexts: []string{"sprint"},
+			items: []shortcutItem{
+				{"j/k", "Next / Prev sprint"},
+				{"P/Esc", "Exit sprint view"},
+			},
+		},
+		{
+			title:    "Attention",
+			contexts: []string{"attention"},
+			items: []shortcutItem{
+				{"j/k", "Move ↓/↑"},
+				{"g/G", "Top / Bottom"},
+				{"Enter", "Label drilldown"},
+				{"1-9", "Filter by rank"},
+				{"]/Esc", "Exit attention"},
+			},
+		},
+		{
+			title:    "Labels",
+			contexts: []string{"label"},
+			items: []shortcutItem{
+				{"j/k", "Select label"},
+				{"Enter", "Filter by label"},
+				{"h", "Health detail"},
+				{"d", "Label drilldown"},
+				{"v", "Velocity view"},
+				{"[/Esc", "Exit labels"},
+			},
+		},
+		{
+			title:    "Velocity",
+			contexts: []string{"velocity"},
+			items: []shortcutItem{
+				{"j/k", "Select label"},
+				{"Enter", "Filter by label"},
+				{"v/Esc", "Back to labels"},
 			},
 		},
 		{
@@ -241,6 +348,8 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 				{"r", "Ready (no blocks)"},
 				{"l", "Label picker"},
 				{"/", "Search"},
+				{"s/S", "Sort / Triage"},
+				{"w", "Repo picker"},
 			},
 		},
 		{
@@ -250,9 +359,10 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 				{"t/T", "Time-travel"},
 				{"x", "Export .md"},
 				{"y", "Copy ID"},
-				{"C", "Copy"},
+				{"C", "Copy issue"},
 				{"O", "Open in $EDITOR"},
 				{"'", "Recipe picker"},
+				{"!", "Alerts panel"},
 				{"U", "Self-update"},
 				{"V", "Cass sessions"},
 			},
@@ -383,7 +493,7 @@ func (s *ShortcutsSidebar) View() string {
 	return boxStyle.Render(content)
 }
 
-// contextFromFocus returns the context string for the current focus
+// ContextFromFocus returns the context string for the current focus.
 func ContextFromFocus(f focus) string {
 	switch f {
 	case focusList:
@@ -402,6 +512,16 @@ func ContextFromFocus(f focus) string {
 		return "actionable"
 	case focusLabelDashboard:
 		return "label"
+	case focusTree:
+		return "tree"
+	case focusFlowMatrix:
+		return "flow"
+	case focusSprint:
+		return "sprint"
+	case focusAttention:
+		return "attention"
+	case focusVelocityComparison:
+		return "velocity"
 	default:
 		return "list"
 	}

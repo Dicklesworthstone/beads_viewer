@@ -1797,7 +1797,7 @@ func envMaxLineSizeBytes() int {
 }
 
 func envBool(name string) bool {
-	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	v := strings.TrimSpace(strings.ToLower(env.Get(name)))
 	if v == "" {
 		return false
 	}
@@ -1810,7 +1810,7 @@ func envBool(name string) bool {
 }
 
 func envPositiveInt(name string) (int, bool) {
-	v := strings.TrimSpace(os.Getenv(name))
+	v := strings.TrimSpace(env.Get(name))
 	if v == "" {
 		return 0, false
 	}

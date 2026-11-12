@@ -25,6 +25,7 @@ type Debouncer struct {
 	mu       sync.Mutex
 	seq      uint64
 	burst    uint64
+	inFlight int
 }
 
 // NewDebouncer creates a new Debouncer with the specified duration.
@@ -76,7 +77,14 @@ func (d *Debouncer) fire(burst, seq uint64, deadline bool) {
 	}
 	callback := d.callback
 	d.cancelLocked()
+	d.inFlight++
 	d.mu.Unlock()
+
+	defer func() {
+		d.mu.Lock()
+		d.inFlight--
+		d.mu.Unlock()
+	}()
 
 	// No user code under mu: watcher callbacks may Stop, Cancel or Trigger.
 	callback()
@@ -109,4 +117,11 @@ func (d *Debouncer) Cancel() {
 // Duration returns the debounce duration.
 func (d *Debouncer) Duration() time.Duration {
 	return d.duration
+}
+
+// hasPending reports whether a debounce timer is armed or a callback is currently running.
+func (d *Debouncer) hasPending() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.timer != nil || d.deadline != nil || d.inFlight > 0
 }

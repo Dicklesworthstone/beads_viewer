@@ -55,7 +55,7 @@ import (
 // serialized-size ceiling so it cannot grow without bound.
 
 const (
-	perCommitEventCacheVersion     = 2
+	perCommitEventCacheVersion     = 3
 	perCommitEventCacheFileName    = "correlation_per_commit_event_cache.json"
 	perCommitEventCacheMaxAge      = 30 * 24 * time.Hour // commits are immutable; keep a month
 	perCommitEventCacheMaxCommits  = 4000                // bound the accumulating commit map
@@ -106,9 +106,10 @@ func perCommitEventCachePath(create bool) (string, error) {
 		base = filepath.Join(dir, correlationDiskCacheDirName)
 	}
 	if create {
-		if err := os.MkdirAll(base, 0o755); err != nil {
+		if err := os.MkdirAll(base, 0o700); err != nil {
 			return "", err
 		}
+		_ = os.Chmod(base, 0o700)
 	}
 	return filepath.Join(base, perCommitEventCacheFileName), nil
 }
@@ -266,7 +267,7 @@ func loadPerCommitEvents(namespace string) map[string]perCommitEventEntry {
 	if err != nil {
 		return nil
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return nil
 	}
@@ -306,7 +307,7 @@ func storePerCommitEvents(namespace string, fresh map[string]perCommitEventEntry
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return
 	}
@@ -315,6 +316,7 @@ func storePerCommitEvents(namespace string, fresh map[string]perCommitEventEntry
 		return
 	}
 	defer func() { _ = unlockFile(f) }()
+	_ = f.Chmod(0o600)
 
 	cf := readPerCommitEventCacheLocked(f)
 	if cf.Entries == nil {

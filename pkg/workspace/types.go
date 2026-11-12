@@ -97,7 +97,12 @@ func (c *Config) Validate() error {
 
 	seen := make(map[string]bool)
 	seenSourceRepos := make(map[string]bool)
+	enabledCount := 0
 	for i, repo := range c.Repos {
+		if !repo.IsEnabled() {
+			continue
+		}
+		enabledCount++
 		if repo.Path == "" {
 			return fmt.Errorf("repo[%d]: path is required", i)
 		}
@@ -116,6 +121,10 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("repo[%d]: prefix %q duplicates normalized source repository key %q", i, prefix, sourceRepo)
 		}
 		seenSourceRepos[sourceRepo] = true
+	}
+
+	if enabledCount == 0 && !c.Discovery.Enabled {
+		return fmt.Errorf("workspace must have at least one enabled repo or enable discovery")
 	}
 
 	return nil

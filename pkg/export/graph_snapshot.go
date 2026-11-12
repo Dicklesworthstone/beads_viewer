@@ -5,7 +5,6 @@ import (
 	"image/color"
 	"io"
 	"math"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -60,9 +59,8 @@ func SaveGraphSnapshot(opts GraphSnapshotOptions) error {
 	if opts.Path == "" {
 		return fmt.Errorf("output path is required")
 	}
-
-	if err := os.MkdirAll(filepath.Dir(opts.Path), 0o755); err != nil {
-		return fmt.Errorf("create parent dir: %w", err)
+	if err := validateExistingPathNotSymlinkOrDir(opts.Path); err != nil {
+		return err
 	}
 
 	layout := buildLayout(opts)
@@ -367,20 +365,15 @@ func renderPNG(opts GraphSnapshotOptions, layout layoutResult) error {
 		drawNode(dc, n)
 	}
 
-	return dc.SavePNG(opts.Path)
+	return SafeWriteOutputFunc(opts.Path, 0o644, func(w io.Writer) error {
+		return dc.EncodePNG(w)
+	})
 }
 
 func renderSVG(opts GraphSnapshotOptions, layout layoutResult) error {
-	file, err := os.Create(opts.Path)
-	if err != nil {
-		return err
-	}
-
-	err = renderSVGToWriter(file, layout)
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	return err
+	return SafeWriteOutputFunc(opts.Path, 0o644, func(w io.Writer) error {
+		return renderSVGToWriter(w, layout)
+	})
 }
 
 func renderSVGToWriter(w io.Writer, layout layoutResult) error {

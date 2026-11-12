@@ -23,27 +23,20 @@ const (
 	SignalOrphanAuthor OrphanSignal = "author"
 )
 
-// Pre-compiled regex patterns for message analysis (compiled once at init).
-var (
-	// Message patterns for detecting bead-related commits
-	orphanMessagePatterns = []struct {
-		re     *regexp.Regexp
-		weight int
-	}{
-		{regexp.MustCompile(`\b(fix|fixes|fixed)\b`), 10},
-		{regexp.MustCompile(`\b(close|closes|closed)\b`), 10},
-		{regexp.MustCompile(`\b(resolve|resolves|resolved)\b`), 10},
-		{regexp.MustCompile(`\b(implement|implements|implemented)\b`), 8},
-		{regexp.MustCompile(`\b(add|adds|added)\b`), 5},
-		{regexp.MustCompile(`#\d+`), 15},               // Issue number reference
-		{regexp.MustCompile(`\b[a-z]{2,5}-\d+\b`), 20}, // JIRA-style ID (lowercase since message is lowercased)
-		{regexp.MustCompile(`\bbv-[a-z0-9]+\b`), 25},   // bv-xxx pattern
-		{regexp.MustCompile(`\bbeads?[-_]?\d+\b`), 25}, // bead-123 pattern
-	}
-
-	// Pattern for extracting specific bead IDs from messages
-	orphanBeadIDPattern = regexp.MustCompile(`(?i)\bbv-([a-z0-9]{4,8})\b`) // Case-insensitive
-)
+// Pre-compiled regex patterns for generic action-verb / issue-number signals
+// on unlinked commits. Explicit bead ID matching delegates to ExplicitMatcher
+// so Correlator and OrphanDetector share a single canonical matcher.
+var orphanMessagePatterns = []struct {
+	re     *regexp.Regexp
+	weight int
+}{
+	{regexp.MustCompile(`\b(fix|fixes|fixed)\b`), 10},
+	{regexp.MustCompile(`\b(close|closes|closed)\b`), 10},
+	{regexp.MustCompile(`\b(resolve|resolves|resolved)\b`), 10},
+	{regexp.MustCompile(`\b(implement|implements|implemented)\b`), 8},
+	{regexp.MustCompile(`\b(add|adds|added)\b`), 5},
+	{regexp.MustCompile(`#\d+`), 15}, // Issue number reference
+}
 
 // OrphanCandidate represents a commit that might be missing a bead linkage.
 type OrphanCandidate struct {
@@ -118,10 +111,39 @@ type OrphanDetector struct {
 	dataHash    string
 	lookup      *ReverseLookup
 	fileLookup  *FileLookup
+	explicit    *ExplicitMatcher
 	beadWindows map[string]TemporalWindow // BeadID -> active time window
 	authorBeads map[string][]string       // Author email -> BeadIDs they worked on
 	now         time.Time
 	window      *HistoryWindow // The correlation index's commit window, when the report carries one
+}
+
+// WithExplicitMatcher configures OrphanDetector and its underlying ReverseLookup
+// to share an ExplicitMatcher (augmented with all known Bead IDs in the report).
+func (od *OrphanDetector) WithExplicitMatcher(m *ExplicitMatcher) *OrphanDetector {
+	if m == nil {
+		return od
+	}
+	var known []string
+	if od.lookup != nil {
+		for id, history := range od.lookup.beads {
+			known = append(known, id)
+			if history.BeadID != "" && history.BeadID != id {
+				known = append(known, history.BeadID)
+			}
+			for _, ev := range history.Events {
+				if ev.BeadID != "" {
+					known = append(known, ev.BeadID)
+				}
+			}
+		}
+	}
+	shared := m.withMergedKnownIDs(known)
+	od.explicit = shared
+	if od.lookup != nil {
+		od.lookup.explicit = shared
+	}
+	return od
 }
 
 // NewOrphanDetector creates a detector from a history report.
@@ -143,11 +165,13 @@ func NewSmartOrphanDetector(report *HistoryReport, repoPath string) *OrphanDetec
 
 // newOrphanDetector is the internal constructor.
 func newOrphanDetector(report *HistoryReport, repoPath string, now time.Time) *OrphanDetector {
+	lookup := NewReverseLookupWithRepo(report, repoPath)
 	od := &OrphanDetector{
 		repoPath:    repoPath,
 		dataHash:    report.DataHash,
-		lookup:      NewReverseLookupWithRepo(report, repoPath),
+		lookup:      lookup,
 		fileLookup:  NewFileLookup(report),
+		explicit:    lookup.explicit,
 		beadWindows: make(map[string]TemporalWindow),
 		authorBeads: make(map[string][]string),
 		now:         now,
@@ -431,11 +455,12 @@ func (od *OrphanDetector) checkFiles(candidate *OrphanCandidate, beadScores map[
 	}
 }
 
-// checkMessage checks if commit message contains bead-like patterns.
+// checkMessage checks if commit message contains bead-like patterns using the
+// shared ExplicitMatcher plus generic action-verb heuristics.
 func (od *OrphanDetector) checkMessage(candidate *OrphanCandidate, beadScores map[string]*probableBeadBuilder) {
 	msg := strings.ToLower(candidate.Message)
 
-	// Look for bead-like patterns (using pre-compiled regexes)
+	// Look for generic action-verb / issue-number patterns
 	totalWeight := 0
 	var matchDetails []string
 
@@ -447,14 +472,19 @@ func (od *OrphanDetector) checkMessage(candidate *OrphanCandidate, beadScores ma
 		}
 	}
 
-	// Custom ID patterns (--id-pattern, #188) count as strong ID signals,
-	// matched against the original-case message since the pattern is
-	// user-supplied.
-	for _, re := range CustomIDPatterns() {
-		if match := re.FindString(candidate.Message); match != "" {
-			totalWeight += 25
-			matchDetails = append(matchDetails, match)
+	matcher := od.explicit
+	if matcher == nil {
+		matcher = NewExplicitMatcher(od.repoPath)
+	}
+	idMatches := matcher.ExtractIDsFromMessage(candidate.Message)
+	for _, idMatch := range idMatches {
+		totalWeight += 25
+		if idMatch.RawMatch != "" {
+			matchDetails = append(matchDetails, idMatch.RawMatch)
+		} else {
+			matchDetails = append(matchDetails, idMatch.ID)
 		}
+		od.scoreMentionedBead(beadScores, idMatch.ID)
 	}
 
 	if totalWeight > 0 {
@@ -463,31 +493,6 @@ func (od *OrphanDetector) checkMessage(candidate *OrphanCandidate, beadScores ma
 			Details: fmt.Sprintf("Message patterns: %s", strings.Join(matchDetails, ", ")),
 			Weight:  minInt(totalWeight, 35),
 		})
-	}
-
-	// Try to match specific bead IDs mentioned in message (case-insensitive)
-	matches := orphanBeadIDPattern.FindAllStringSubmatch(msg, -1)
-	for _, match := range matches {
-		if len(match) >= 2 {
-			od.scoreMentionedBead(beadScores, "bv-"+strings.ToLower(match[1]))
-		}
-	}
-
-	// Custom ID patterns (--id-pattern, #188): extract candidate IDs from the
-	// original-case message and credit any that name a known bead. The ID is
-	// capture group 1 when the pattern defines one, else the whole match.
-	for _, re := range CustomIDPatterns() {
-		for _, match := range re.FindAllStringSubmatch(candidate.Message, -1) {
-			id := ""
-			if len(match) >= 2 && match[1] != "" {
-				id = match[1]
-			} else if len(match) >= 1 {
-				id = match[0]
-			}
-			if id != "" {
-				od.scoreMentionedBead(beadScores, id)
-			}
-		}
 	}
 }
 

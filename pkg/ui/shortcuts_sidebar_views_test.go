@@ -65,19 +65,20 @@ func sidebarViewTestIssues() []model.Issue {
 func TestShortcutsSidebarFitsEveryView(t *testing.T) {
 	views := []struct {
 		name      string
-		key       string
+		keys      []string
 		wantFocus focus
 	}{
-		{"list", "", focusList},
-		{"board", "b", focusBoard},
-		{"graph", "g", focusGraph},
-		{"insights", "i", focusInsights},
-		{"actionable", "a", focusActionable},
-		{"history", "h", focusHistory},
-		{"tree", "E", focusTree},
-		{"label_dashboard", "[", focusLabelDashboard},
-		{"attention", "]", focusAttention},
-		{"flow_matrix", "f", focusFlowMatrix},
+		{"list", nil, focusList},
+		{"board", []string{"b"}, focusBoard},
+		{"graph", []string{"g"}, focusGraph},
+		{"insights", []string{"i"}, focusInsights},
+		{"actionable", []string{"a"}, focusActionable},
+		{"history", []string{"h"}, focusHistory},
+		{"tree", []string{"E"}, focusTree},
+		{"label_dashboard", []string{"["}, focusLabelDashboard},
+		{"velocity_comparison", []string{"[", "v"}, focusVelocityComparison},
+		{"attention", []string{"]"}, focusAttention},
+		{"flow_matrix", []string{"f"}, focusFlowMatrix},
 	}
 	sizes := []struct{ w, h int }{
 		{160, 45},
@@ -101,11 +102,11 @@ func TestShortcutsSidebarFitsEveryView(t *testing.T) {
 					if sidebarFirst {
 						m = sendRunes(t, m, ";")
 					}
-					if v.key != "" {
-						m = sendRunes(t, m, v.key)
+					for _, k := range v.keys {
+						m = sendRunes(t, m, k)
 					}
 					if m.focused != v.wantFocus {
-						t.Fatalf("key %q: focused=%v, want %v", v.key, m.focused, v.wantFocus)
+						t.Fatalf("keys %v: focused=%v, want %v", v.keys, m.focused, v.wantFocus)
 					}
 					if !sidebarFirst {
 						m = sendRunes(t, m, ";")

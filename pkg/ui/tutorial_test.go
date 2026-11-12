@@ -2,11 +2,14 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func newTestTutorialModel() TutorialModel {
@@ -492,7 +495,7 @@ func TestDefaultTutorialPages(t *testing.T) {
 		}
 	}
 
-	// Check all pages have required fields
+	// Check all pages have required fields and backing structured elements
 	for _, page := range pages {
 		if page.ID == "" {
 			t.Error("Page missing ID")
@@ -500,8 +503,9 @@ func TestDefaultTutorialPages(t *testing.T) {
 		if page.Title == "" {
 			t.Error("Page missing Title")
 		}
-		if page.Content == "" {
-			t.Error("Page missing Content")
+		sp := getStructuredPage(page.ID)
+		if sp == nil || len(sp.Elements) == 0 {
+			t.Errorf("Page %s missing structured content elements", page.ID)
 		}
 	}
 }
@@ -911,35 +915,47 @@ func TestAllPagesRenderWithoutError(t *testing.T) {
 
 func TestAllPagesHaveValidContent(t *testing.T) {
 	pages := defaultTutorialPages()
+	theme := Theme{Renderer: lipgloss.DefaultRenderer()}
 
 	for _, page := range pages {
 		t.Run(page.ID, func(t *testing.T) {
-			// Content should not be empty
-			if page.Content == "" {
-				t.Errorf("Page %s has empty content", page.ID)
+			sp := getStructuredPage(page.ID)
+			if sp == nil {
+				t.Fatalf("Page %s missing from structuredTutorialPages()", page.ID)
+			}
+			rendered := ansi.Strip(RenderStructuredPage(*sp, theme, 80))
+
+			// Rendered content should not be empty
+			if strings.TrimSpace(rendered) == "" {
+				t.Errorf("Page %s rendered empty content", page.ID)
 			}
 
-			// Content should have minimum length
-			if len(page.Content) < 50 {
-				t.Errorf("Page %s content too short (%d chars)", page.ID, len(page.Content))
+			// Rendered content should have minimum length
+			if len(rendered) < 50 {
+				t.Errorf("Page %s content too short (%d chars)", page.ID, len(rendered))
 			}
 
-			// Should have at least one markdown header
-			if !strings.Contains(page.Content, "#") {
-				t.Errorf("Page %s should have at least one markdown header", page.ID)
+			// Should have at least one Section header element
+			hasSection := false
+			for _, el := range sp.Elements {
+				if sec, ok := el.(Section); ok && strings.TrimSpace(sec.Title) != "" {
+					hasSection = true
+					break
+				}
+			}
+			if !hasSection {
+				t.Errorf("Page %s should have at least one non-empty Section header", page.ID)
 			}
 
-			// Should not contain placeholder text (except valid uses like "TODO list")
-			// Only flag obvious placeholders, not valid uses in sentences
 			obviousPlaceholders := []string{
-				"TODO:",       // Obvious TODO marker
-				"FIXME:",      // Obvious FIXME marker
-				"TBD:",        // Obvious TBD marker
-				"coming soon", // Placeholder phrase
+				"TODO:",
+				"FIXME:",
+				"TBD:",
+				"coming soon",
 				"[placeholder",
 				"NOT IMPLEMENTED",
 			}
-			contentLower := strings.ToLower(page.Content)
+			contentLower := strings.ToLower(rendered)
 			for _, ph := range obviousPlaceholders {
 				if strings.Contains(contentLower, strings.ToLower(ph)) {
 					t.Errorf("Page %s contains placeholder text %q", page.ID, ph)
@@ -977,27 +993,20 @@ func TestAllPagesHaveValidStructure(t *testing.T) {
 }
 
 func TestPageContentLineWidth(t *testing.T) {
-	pages := defaultTutorialPages()
-	maxLineWidth := 100 // Reasonable max for terminal rendering
+	pages := structuredTutorialPages()
+	theme := Theme{Renderer: lipgloss.DefaultRenderer()}
+	targetWidth := 80
 
 	for _, page := range pages {
 		t.Run(page.ID, func(t *testing.T) {
-			lines := strings.Split(page.Content, "\n")
-			inCodeBlock := false
-			for _, line := range lines {
-				// Track code block state
-				if strings.HasPrefix(strings.TrimSpace(line), "```") {
-					inCodeBlock = !inCodeBlock
-					continue
-				}
-				// Skip lines inside code blocks (may have longer lines intentionally)
-				if inCodeBlock {
-					continue
-				}
-				// Only check non-code-block, non-indented lines
-				if len(line) > maxLineWidth && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
-					// Content lines exceeding width will wrap in terminal, not an error
-					// Just verify the check runs without issues
+			rendered := RenderStructuredPage(page, theme, targetWidth)
+			if strings.TrimSpace(rendered) == "" {
+				t.Fatalf("Page %s rendered empty output at width %d", page.ID, targetWidth)
+			}
+			for i, line := range strings.Split(rendered, "\n") {
+				if w := lipgloss.Width(line); w > targetWidth+8 {
+					t.Errorf("Page %s line %d width %d overflows target width %d: %q",
+						page.ID, i+1, w, targetWidth, ansi.Strip(line))
 				}
 			}
 		})
@@ -1062,21 +1071,27 @@ func TestMinimalTerminalDimensions(t *testing.T) {
 }
 
 func TestAllPagesContentMarkdownValid(t *testing.T) {
-	pages := defaultTutorialPages()
-
-	for _, page := range pages {
+	for _, page := range structuredTutorialPages() {
 		t.Run(page.ID, func(t *testing.T) {
-			content := page.Content
-
-			// Check for unclosed code blocks
-			codeBlockCount := strings.Count(content, "```")
-			if codeBlockCount%2 != 0 {
-				t.Errorf("Page %s has unclosed code block (found %d markers)", page.ID, codeBlockCount)
+			if len(page.Elements) == 0 {
+				t.Fatalf("Page %s has zero elements", page.ID)
 			}
-
-			// Bold marker check is too strict - ** can appear in code blocks,
-			// glob patterns (e.g., **/*.go), or other contexts.
-			// We just verify content parses without error via Glamour rendering.
+			for idx, el := range page.Elements {
+				switch v := el.(type) {
+				case Paragraph:
+					if strings.TrimSpace(v.Text) == "" {
+						t.Errorf("Page %s element %d has empty Paragraph", page.ID, idx)
+					}
+				case Code:
+					if strings.TrimSpace(v.Text) == "" {
+						t.Errorf("Page %s element %d has empty Code block", page.ID, idx)
+					}
+				case KeyTable:
+					if len(v.Bindings) == 0 {
+						t.Errorf("Page %s element %d has empty KeyTable", page.ID, idx)
+					}
+				}
+			}
 		})
 	}
 }
@@ -1102,11 +1117,15 @@ func TestScrollingWithLongContent(t *testing.T) {
 	m := newTestTutorialModel()
 	m.SetSize(80, 15) // Short terminal to force scrolling
 
-	// Find a page with substantial content
+	// Find a structured page whose rendered output exceeds 20 lines
 	foundLongPage := false
 	for i, page := range m.pages {
-		lines := strings.Count(page.Content, "\n")
-		if lines > 20 { // Page that needs scrolling
+		sp := getStructuredPage(page.ID)
+		if sp == nil {
+			continue
+		}
+		rendered := RenderStructuredPage(*sp, m.theme, 72)
+		if strings.Count(rendered, "\n") > 20 {
 			m.JumpToPage(i)
 			foundLongPage = true
 			break
@@ -1114,7 +1133,7 @@ func TestScrollingWithLongContent(t *testing.T) {
 	}
 
 	if !foundLongPage {
-		t.Skip("No page with >20 lines found for scroll testing")
+		t.Fatal("No structured tutorial page with >20 lines found for scroll testing")
 	}
 
 	// Scroll down multiple times
@@ -1134,8 +1153,6 @@ func TestScrollingWithLongContent(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
 	}
-
-	// Should not crash
 }
 
 func TestPageSections(t *testing.T) {
@@ -1212,11 +1229,173 @@ func TestGlamourRenderingAllPages(t *testing.T) {
 				t.Errorf("Page %s rendered empty view", page.ID)
 			}
 
-			// View should not be identical to raw content
-			// (meaning Glamour did some transformation)
-			if view == page.Content {
-				t.Errorf("Page %s may not have been rendered through Glamour", page.ID)
+			// View should include the page title
+			if !strings.Contains(view, page.Title) {
+				t.Errorf("Page %s view missing title %q", page.ID, page.Title)
 			}
 		})
+	}
+}
+
+func TestTutorialContent_PathsAndKeysMatchRuntime(t *testing.T) {
+	allowedPaths := map[string]bool{
+		".bv/workspace.yaml":  true,
+		".bv/recipes.yaml":    true,
+		".bv/hooks.yaml":      true,
+		".bv/drift.yaml":      true,
+		".bv/baseline.json":   true,
+		".bv/semantic":        true,
+		".beads/issues.jsonl": true,
+		".beads/beads.jsonl":  true,
+		".beads/beads.db":     true,
+		".beads/config.yaml":  true,
+	}
+
+	pathRe := regexp.MustCompile(`(?:\.bv|\.beads)/[A-Za-z0-9_.-]+`)
+	theme := Theme{Renderer: lipgloss.DefaultRenderer()}
+
+	// 1. Scan rendered output of every structured page AND raw tutorial_content.go source
+	// for any .bv/... or .beads/... file paths and reject any unrecognised filename.
+	seenPaths := map[string]bool{}
+	var allRendered strings.Builder
+	for _, page := range structuredTutorialPages() {
+		rendered := ansi.Strip(RenderStructuredPage(page, theme, 120))
+		allRendered.WriteString(rendered)
+		allRendered.WriteByte('\n')
+		for _, rawMatch := range pathRe.FindAllString(rendered, -1) {
+			cleaned := strings.TrimRight(rawMatch, ".,;:)")
+			seenPaths[cleaned] = true
+			if !allowedPaths[cleaned] {
+				t.Errorf("page %s references non-canonical path %q (allowed: %v)", page.ID, cleaned, allowedPaths)
+			}
+		}
+	}
+
+	srcBytes, err := os.ReadFile("tutorial_content.go")
+	if err != nil {
+		t.Fatalf("read tutorial_content.go: %v", err)
+	}
+	srcText := string(srcBytes)
+	for _, rawMatch := range pathRe.FindAllString(srcText, -1) {
+		cleaned := strings.TrimRight(rawMatch, ".,;:)")
+		seenPaths[cleaned] = true
+		if !allowedPaths[cleaned] {
+			t.Errorf("tutorial_content.go references non-canonical path %q", cleaned)
+		}
+	}
+	if !seenPaths[".bv/workspace.yaml"] || !seenPaths[".bv/recipes.yaml"] || !seenPaths[".beads/issues.jsonl"] {
+		t.Errorf("expected tutorial_content.go to document .bv/workspace.yaml, .bv/recipes.yaml, and .beads/issues.jsonl; saw %v", seenPaths)
+	}
+
+	// 2. Guard against factual regressions in tutorial_content.go.
+	forbiddenClaims := []string{
+		".beads/workspace.json",
+		".beads/recipes.json",
+		"Shift+L",
+		"Workspace-wide search",
+		"Sprint Ready",
+		"Blocked Review",
+		"Stale Items",
+		"AI-powered prioritization",
+		"Focus on subgraph",
+		"o/c/r/a",
+		"All (reset filter)",
+	}
+	renderedCorpus := allRendered.String()
+	for _, bad := range forbiddenClaims {
+		if strings.Contains(srcText, bad) || strings.Contains(renderedCorpus, bad) {
+			t.Errorf("tutorial_content.go still contains factual falsehood %q", bad)
+		}
+	}
+
+	// 3. Assert every runtime Model.CurrentContext() state matches at least one
+	// explicitly tagged tutorial page in context mode.
+	for _, ctx := range AllContexts() {
+		tut := newTestTutorialModel()
+		tut.SetContext(string(ctx))
+		tut.SetContextMode(true)
+		visible := tut.visiblePages()
+		if len(visible) == 0 {
+			t.Fatalf("context %q has zero visible pages", ctx)
+		}
+		matched := false
+		for _, c := range visible[0].Contexts {
+			if c == string(ctx) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Errorf("context %q fell back to untagged page %q instead of a context-tagged page", ctx, visible[0].ID)
+		}
+	}
+
+	// 4. Assert shortcuts_sidebar.go produces distinct, non-"list" contexts and
+	// view-specific bindings for Tree, FlowMatrix, Sprint, Attention, and VelocityComparison.
+	targetFocuses := []struct {
+		name         string
+		focus        focus
+		wantContext  string
+		wantCategory string
+		wantKey      string
+	}{
+		{"Tree", focusTree, "tree", "Tree", "E"},
+		{"FlowMatrix", focusFlowMatrix, "flow", "Flow", "f"},
+		{"Sprint", focusSprint, "sprint", "Sprint", "P"},
+		{"Attention", focusAttention, "attention", "Attention", "1-9"},
+		{"VelocityComparison", focusVelocityComparison, "velocity", "Velocity", "v"},
+	}
+
+	seenContexts := map[string]string{}
+	model := setupTestModel(t)
+	listBindings := model.keyRegistry.AllBindingsForFocus(focusList)
+
+	for _, tf := range targetFocuses {
+		ctx := ContextFromFocus(tf.focus)
+		if ctx == "list" || ctx == "" {
+			t.Errorf("%s (%v) mapped to generic context %q; want %q", tf.name, tf.focus, ctx, tf.wantContext)
+		}
+		if ctx != tf.wantContext {
+			t.Errorf("%s ContextFromFocus=%q, want %q", tf.name, ctx, tf.wantContext)
+		}
+		if prev, dup := seenContexts[ctx]; dup {
+			t.Errorf("%s shares context %q with %s; must be distinct", tf.name, ctx, prev)
+		}
+		seenContexts[ctx] = tf.name
+
+		// Check registry-backed sidebar sections
+		sidebar := NewShortcutsSidebar(theme)
+		sidebar.SetSize(34, 60)
+		sidebar.SetKeyRegistry(model.keyRegistry)
+		sidebar.SetFocus(tf.focus)
+		regRendered := ansi.Strip(sidebar.View())
+		if !strings.Contains(regRendered, tf.wantCategory) {
+			t.Errorf("%s registry-backed sidebar missing category %q:\n%s", tf.name, tf.wantCategory, regRendered)
+		}
+		if !model.keyRegistry.HasBinding(tf.focus, tf.wantKey) {
+			t.Errorf("%s missing registered key %q in KeyRegistry", tf.name, tf.wantKey)
+		}
+		focusBindings := model.keyRegistry.AllBindingsForFocus(tf.focus)
+		if len(focusBindings) == len(listBindings) {
+			same := true
+			for i := range focusBindings {
+				if focusBindings[i].Key != listBindings[i].Key || focusBindings[i].Desc != listBindings[i].Desc {
+					same = false
+					break
+				}
+			}
+			if same {
+				t.Errorf("%s has identical bindings to focusList", tf.name)
+			}
+		}
+
+		// Also check fallback hardcoded sidebar sections
+		fallback := NewShortcutsSidebar(theme)
+		fallback.SetSize(34, 60)
+		fallback.SetFocus(tf.focus)
+		fallbackRendered := ansi.Strip(fallback.View())
+		if strings.Contains(fallbackRendered, "Recipe picker") {
+			t.Errorf("%s fallback sidebar leaked list-only 'Recipe picker' action:\n%s", tf.name, fallbackRendered)
+		}
 	}
 }

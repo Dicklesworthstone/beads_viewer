@@ -2077,3 +2077,246 @@ func TestParseIssues_NativeDueAtAndPrecedence(t *testing.T) {
 		t.Fatalf("DUE-3 DueDate = %v, want nil when due_at is explicitly null", issues[2].DueDate)
 	}
 }
+
+func TestGetBeadsDir_IgnoresPoisonedAmbientGitEnvironment(t *testing.T) {
+	// Create real git repo with .beads at root, initial commit, nested subdir, and linked worktree.
+	realRoot := t.TempDir()
+	initCmd := exec.Command("git", "init", "-b", "main", realRoot)
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init realRoot: %v (%s)", err, string(out))
+	}
+	realBeads := filepath.Join(realRoot, ".beads")
+	if err := os.MkdirAll(realBeads, 0o755); err != nil {
+		t.Fatalf("mkdir realBeads: %v", err)
+	}
+	nested := filepath.Join(realRoot, "pkg", "sub")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("mkdir nested: %v", err)
+	}
+	_ = exec.Command("git", "-C", realRoot, "config", "user.email", "test@example.com").Run()
+	_ = exec.Command("git", "-C", realRoot, "config", "user.name", "Test").Run()
+	if err := os.WriteFile(filepath.Join(realRoot, "README.md"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", realRoot, "add", "README.md").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v (%s)", err, string(out))
+	}
+	if out, err := exec.Command("git", "-C", realRoot, "commit", "-m", "init").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v (%s)", err, string(out))
+	}
+
+	worktreeDir := filepath.Join(t.TempDir(), "wt")
+	if out, err := exec.Command("git", "-C", realRoot, "worktree", "add", "-b", "wt-branch", worktreeDir).CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v (%s)", err, string(out))
+	}
+	wtSub := filepath.Join(worktreeDir, "cmd", "bv")
+	if err := os.MkdirAll(wtSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a foreign git repo with its own .beads to act as a hostile hook leak.
+	foreignRoot := t.TempDir()
+	foreignInit := exec.Command("git", "init", "-b", "main", foreignRoot)
+	if out, err := foreignInit.CombinedOutput(); err != nil {
+		t.Fatalf("git init foreignRoot: %v (%s)", err, string(out))
+	}
+	if err := os.MkdirAll(filepath.Join(foreignRoot, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir foreign .beads: %v", err)
+	}
+
+	// Poison GIT_DIR / GIT_COMMON_DIR / GIT_WORK_TREE / GIT_INDEX_FILE to point at foreignRoot.
+	for _, kv := range [][2]string{
+		{"BEADS_DIR", ""},
+		{"BEADS_DB", ""},
+		{"GIT_DIR", filepath.Join(foreignRoot, ".git")},
+		{"GIT_COMMON_DIR", filepath.Join(foreignRoot, ".git")},
+		{"GIT_WORK_TREE", foreignRoot},
+		{"GIT_INDEX_FILE", filepath.Join(foreignRoot, ".git", "index")},
+	} {
+		t.Setenv(kv[0], kv[1])
+	}
+
+	wantEval, err := filepath.EvalSymlinks(realBeads)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(realBeads): %v", err)
+	}
+
+	gotBeadsDir, err := loader.GetBeadsDir(nested)
+	if err != nil {
+		t.Fatalf("GetBeadsDir(nested) under poisoned GIT_* env failed: %v", err)
+	}
+	gotEval, err := filepath.EvalSymlinks(gotBeadsDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(gotBeadsDir): %v", err)
+	}
+	if gotEval != wantEval {
+		t.Fatalf("GetBeadsDir(nested) = %q, want %q (poisoned GIT_* leaked foreign repo %q)", gotEval, wantEval, foreignRoot)
+	}
+
+	// Linked worktree has NO local .beads, so GetBeadsDir(wtSub) MUST execute
+	// getMainRepoRoot(wtSub) (git rev-parse --git-common-dir) and still ignore
+	// poisoned GIT_COMMON_DIR/GIT_DIR/GIT_WORK_TREE!
+	gotFromWT, err := loader.GetBeadsDir(wtSub)
+	if err != nil {
+		t.Fatalf("GetBeadsDir(wtSub) under poisoned GIT_* env failed: %v", err)
+	}
+	gotWTEval, err := filepath.EvalSymlinks(gotFromWT)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(gotFromWT): %v", err)
+	}
+	if gotWTEval != wantEval {
+		t.Fatalf("GetBeadsDir(wtSub) = %q, want %q", gotWTEval, wantEval)
+	}
+}
+
+func TestResolveProjectRootAndProjectRootFromBeadsDir(t *testing.T) {
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+
+	t.Run("non-git nested subdirectory with parent .beads", func(t *testing.T) {
+		root := t.TempDir()
+		beads := filepath.Join(root, ".beads")
+		sub := filepath.Join(root, "pkg", "sub")
+		if err := os.MkdirAll(beads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		gotRoot, gotBeads, err := loader.ResolveProjectRoot(sub)
+		if err != nil {
+			t.Fatalf("ResolveProjectRoot(%q) error = %v", sub, err)
+		}
+		if gotRoot != filepath.Clean(root) {
+			t.Fatalf("projectRoot = %q, want %q", gotRoot, filepath.Clean(root))
+		}
+		if gotBeads != filepath.Clean(beads) {
+			t.Fatalf("beadsDir = %q, want %q", gotBeads, filepath.Clean(beads))
+		}
+		if fromBeads := loader.ProjectRootFromBeadsDir(gotBeads); fromBeads != filepath.Clean(root) {
+			t.Fatalf("ProjectRootFromBeadsDir(%q) = %q, want %q", gotBeads, fromBeads, filepath.Clean(root))
+		}
+	})
+
+	t.Run("git repo nested subdirectory without .beads", func(t *testing.T) {
+		root := t.TempDir()
+		if out, err := exec.Command("git", "init", "-b", "main", root).CombinedOutput(); err != nil {
+			t.Fatalf("git init: %v (%s)", err, string(out))
+		}
+		sub := filepath.Join(root, "pkg", "sub")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		gotRoot, gotBeads, err := loader.ResolveProjectRoot(sub)
+		if err != nil {
+			t.Fatalf("ResolveProjectRoot(%q) error = %v", sub, err)
+		}
+		wantRoot, _ := filepath.EvalSymlinks(root)
+		gotRootEval, _ := filepath.EvalSymlinks(gotRoot)
+		if gotRootEval != wantRoot {
+			t.Fatalf("projectRoot = %q, want %q", gotRootEval, wantRoot)
+		}
+		if filepath.Base(gotBeads) != ".beads" {
+			t.Fatalf("beadsDir = %q, want <root>/.beads", gotBeads)
+		}
+	})
+
+	t.Run("redirected .beads preserves local checkout projectRoot", func(t *testing.T) {
+		checkout := t.TempDir()
+		shared := t.TempDir()
+		localBeads := filepath.Join(checkout, ".beads")
+		sharedBeads := filepath.Join(shared, ".beads")
+		sub := filepath.Join(checkout, "pkg", "sub")
+		if err := os.MkdirAll(localBeads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(sharedBeads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(localBeads, "redirect"), []byte(sharedBeads+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		gotRoot, gotBeads, err := loader.ResolveProjectRoot(sub)
+		if err != nil {
+			t.Fatalf("ResolveProjectRoot(%q) error = %v", sub, err)
+		}
+		if gotRoot != filepath.Clean(checkout) {
+			t.Fatalf("projectRoot = %q, want local checkout %q", gotRoot, filepath.Clean(checkout))
+		}
+		if gotBeads != filepath.Clean(sharedBeads) {
+			t.Fatalf("beadsDir = %q, want redirected %q", gotBeads, filepath.Clean(sharedBeads))
+		}
+	})
+}
+
+func TestMaxJSONLLineSizeBytes_UniversalEffectiveMaxCapacity(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1.5 MiB line: rejected at BV_MAX_LINE_SIZE_MB=1, accepted at default (10 MiB).
+	mediumPath := filepath.Join(dir, "medium.jsonl")
+	mediumDesc := strings.Repeat("m", 1500*1024)
+	mediumLine := fmt.Sprintf(`{"id":"MED-1","title":"Medium","description":%q,"status":"open","priority":1,"issue_type":"task"}`+"\n", mediumDesc)
+	if err := os.WriteFile(mediumPath, []byte(mediumLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(loader.MaxLineSizeEnvVar, "1")
+	if got := loader.MaxJSONLLineSizeBytes(); got != 1*1024*1024 {
+		t.Fatalf("MaxJSONLLineSizeBytes() = %d, want %d", got, 1*1024*1024)
+	}
+	var stats1 loader.ParseStats
+	issues1, err := loader.LoadIssuesFromFileWithOptions(mediumPath, loader.ParseOptions{
+		Stats:          &stats1,
+		WarningHandler: func(string) {},
+	})
+	if err != nil {
+		t.Fatalf("LoadIssuesFromFileWithOptions under 1MB cap returned unexpected error: %v", err)
+	}
+	if len(issues1) != 0 || stats1.Errors != 1 {
+		t.Fatalf("expected 1.5 MiB line to be dropped under BV_MAX_LINE_SIZE_MB=1: len=%d stats=%+v", len(issues1), stats1)
+	}
+
+	// 11 MiB line: exceeds DefaultMaxBufferSize (10 MiB), so BufferSize == 0 MUST
+	// consult BV_MAX_LINE_SIZE_MB=16 to succeed.
+	largePath := filepath.Join(dir, "large11mb.jsonl")
+	largeDesc := strings.Repeat("L", 11*1024*1024)
+	largeLine := fmt.Sprintf(`{"id":"LARGE-11MB","title":"Eleven MB","description":%q,"status":"open","priority":1,"issue_type":"task"}`+"\n", largeDesc)
+	if err := os.WriteFile(largePath, []byte(largeLine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(loader.MaxLineSizeEnvVar, "")
+	var statsDefault loader.ParseStats
+	issuesDefault, err := loader.LoadIssuesFromFileWithOptions(largePath, loader.ParseOptions{
+		Stats:          &statsDefault,
+		WarningHandler: func(string) {},
+	})
+	if err != nil {
+		t.Fatalf("LoadIssuesFromFileWithOptions under default 10MB cap failed: %v", err)
+	}
+	if len(issuesDefault) != 0 || statsDefault.Errors != 1 {
+		t.Fatalf("expected 11 MiB line to exceed default 10 MiB cap: len=%d stats=%+v", len(issuesDefault), statsDefault)
+	}
+
+	t.Setenv(loader.MaxLineSizeEnvVar, "16")
+	if got := loader.MaxJSONLLineSizeBytes(); got != 16*1024*1024 {
+		t.Fatalf("MaxJSONLLineSizeBytes() = %d, want %d", got, 16*1024*1024)
+	}
+	var stats16 loader.ParseStats
+	issues16, err := loader.LoadIssuesFromFileWithOptions(largePath, loader.ParseOptions{
+		Stats:          &stats16,
+		WarningHandler: func(string) {},
+	})
+	if err != nil {
+		t.Fatalf("LoadIssuesFromFileWithOptions under BV_MAX_LINE_SIZE_MB=16 failed: %v", err)
+	}
+	if len(issues16) != 1 || issues16[0].ID != "LARGE-11MB" || stats16.Errors != 0 {
+		t.Fatalf("expected 11 MiB line to load cleanly under BV_MAX_LINE_SIZE_MB=16: len=%d stats=%+v", len(issues16), stats16)
+	}
+}

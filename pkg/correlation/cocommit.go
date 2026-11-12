@@ -49,33 +49,76 @@ func NewCoCommitExtractor(repoPath string) *CoCommitExtractor {
 
 // codeFileExtensions lists file extensions considered "code files"
 var codeFileExtensions = map[string]bool{
-	".go":    true,
-	".py":    true,
-	".js":    true,
-	".ts":    true,
-	".jsx":   true,
-	".tsx":   true,
-	".rs":    true,
-	".java":  true,
-	".kt":    true,
-	".swift": true,
-	".c":     true,
-	".cpp":   true,
-	".h":     true,
-	".hpp":   true,
-	".rb":    true,
-	".php":   true,
-	".cs":    true,
-	".scala": true,
-	".yaml":  true,
-	".yml":   true,
-	".json":  true,
-	".toml":  true,
-	".md":    true,
-	".sql":   true,
-	".sh":    true,
-	".bash":  true,
-	".zsh":   true,
+	".go":      true,
+	".py":      true,
+	".js":      true,
+	".ts":      true,
+	".jsx":     true,
+	".tsx":     true,
+	".rs":      true,
+	".java":    true,
+	".kt":      true,
+	".swift":   true,
+	".c":       true,
+	".cpp":     true,
+	".h":       true,
+	".hpp":     true,
+	".rb":      true,
+	".php":     true,
+	".cs":      true,
+	".scala":   true,
+	".yaml":    true,
+	".yml":     true,
+	".json":    true,
+	".toml":    true,
+	".md":      true,
+	".sql":     true,
+	".sh":      true,
+	".bash":    true,
+	".zsh":     true,
+	".html":    true,
+	".htm":     true,
+	".css":     true,
+	".scss":    true,
+	".sass":    true,
+	".less":    true,
+	".svelte":  true,
+	".vue":     true,
+	".astro":   true,
+	".proto":   true,
+	".graphql": true,
+	".gql":     true,
+	".tf":      true,
+	".hcl":     true,
+	".zig":     true,
+	".wat":     true,
+	".wit":     true,
+	".nix":     true,
+	".ps1":     true,
+	".psm1":    true,
+	".bat":     true,
+	".cmd":     true,
+	".cmake":   true,
+}
+
+// codeFileBasenames lists exact basenames considered code/build/manifest files
+// even when they lack a recognized extension.
+var codeFileBasenames = map[string]bool{
+	"Makefile":       true,
+	"GNUmakefile":    true,
+	"Dockerfile":     true,
+	"Containerfile":  true,
+	"Justfile":       true,
+	"Vagrantfile":    true,
+	"Tiltfile":       true,
+	"BUILD":          true,
+	"BUILD.bazel":    true,
+	"WORKSPACE":      true,
+	"flake.nix":      true,
+	"go.mod":         true,
+	"Cargo.toml":     true,
+	"package.json":   true,
+	"pyproject.toml": true,
 }
 
 // excludedPaths lists path prefixes that should be excluded
@@ -128,6 +171,36 @@ func (c *CoCommitExtractor) ExtractCoCommittedFiles(event BeadEvent) ([]FileChan
 	}
 
 	return codeFiles, nil
+}
+
+// ExtractNonExcludedFiles extracts all non-excluded repository files changed in
+// commitSHA regardless of file extension (e.g. .gitignore, docs, config files).
+// Used by explicit_id correlation so commits explicitly naming a bead ID are
+// never dropped solely because they touched non-code repository files.
+func (c *CoCommitExtractor) ExtractNonExcludedFiles(commitSHA string) ([]FileChange, error) {
+	files, err := c.getFilesChanged(commitSHA)
+	if err != nil {
+		return nil, err
+	}
+
+	stats, err := c.getLineStats(commitSHA)
+	if err != nil {
+		stats = make(map[string]lineStats)
+	}
+
+	var repoFiles []FileChange
+	for _, f := range files {
+		if isExcludedPath(f.Path) {
+			continue
+		}
+		if s, ok := stats[f.Path]; ok {
+			f.Insertions = s.insertions
+			f.Deletions = s.deletions
+		}
+		repoFiles = append(repoFiles, f)
+	}
+
+	return repoFiles, nil
 }
 
 // CreateCorrelatedCommit creates a CorrelatedCommit with confidence scoring
@@ -560,7 +633,7 @@ func (c *CoCommitExtractor) generateReason(event BeadEvent, files []FileChange, 
 	return strings.Join(parts, "; ")
 }
 
-// isCodeFile checks if a file path is a code file based on extension
+// isCodeFile checks if a file path is a code file based on basename or extension
 func isCodeFile(path string) bool {
 	// Handle git quoting (e.g. "path/with spaces.go")
 	if len(path) > 2 && path[0] == '"' && path[len(path)-1] == '"' {
@@ -572,7 +645,13 @@ func isCodeFile(path string) bool {
 		path = path[1 : len(path)-1]
 	}
 
-	ext := strings.ToLower(filepath.Ext(path))
+	normalized := strings.ReplaceAll(path, "\\", "/")
+	base := filepath.Base(normalized)
+	if codeFileBasenames[base] {
+		return true
+	}
+
+	ext := strings.ToLower(filepath.Ext(base))
 	return codeFileExtensions[ext]
 }
 

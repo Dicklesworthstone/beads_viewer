@@ -106,8 +106,10 @@ type CorrelatorOptions struct {
 // written. History: v1 = events + co-commit commits only; v2 = adds
 // per-method explicit-ID commits, temporal candidates, the walked window and
 // per-strategy timings; v3 = owned before/after transitions and optional full
-// historical constraint evidence for one causal-analysis target.
-const historyArtifactFormatVersion = 3
+// historical constraint evidence for one causal-analysis target; v4 = Aho-Corasick
+// known-ID matching, synthesized creation milestones, mixed .beads/+code
+// temporal candidates, and expanded code/explicit file retention.
+const historyArtifactFormatVersion = 4
 
 // historyArtifact holds the purely history-derived (HEAD + options only)
 // intermediate products of report generation: the extracted lifecycle events
@@ -208,13 +210,13 @@ func (a *historyArtifact) UnmarshalJSON(b []byte) error {
 }
 
 // extractHistoryArtifact runs ONLY the HEAD/options-dependent extraction steps
-// (git history walk + the three correlation strategies). It is deterministic
-// given the repository HEAD and the extract options; it never reads the
-// working-tree bead slice. Split out so the result can be memoized
-// independently of bead edits. Every git subprocess is bound to c.ctx, so a
-// cancelled context aborts whichever strategy is running and returns its
-// error (issue #166).
+// (git history walk + the three correlation strategies).
 func (c *Correlator) extractHistoryArtifact(opts CorrelatorOptions) (*historyArtifact, error) {
+	art, _, err := c.extractHistoryArtifactWithWalk(opts)
+	return art, err
+}
+
+func (c *Correlator) extractHistoryArtifactWithWalk(opts CorrelatorOptions) (*historyArtifact, []walkedCommit, error) {
 	extractOpts := ExtractOptions{
 		Revision: opts.Revision,
 		Since:    opts.Since,
@@ -227,7 +229,7 @@ func (c *Correlator) extractHistoryArtifact(opts CorrelatorOptions) (*historyArt
 		var err error
 		art.CausalHistory, err = c.extractor.extractCausalHistory(opts.CausalityBeadID, extractOpts)
 		if err != nil {
-			return nil, fmt.Errorf("extracting causal history: %w", err)
+			return nil, nil, fmt.Errorf("extracting causal history: %w", err)
 		}
 	}
 
@@ -236,11 +238,11 @@ func (c *Correlator) extractHistoryArtifact(opts CorrelatorOptions) (*historyArt
 	start := time.Now()
 	events, err := c.extractor.Extract(extractOpts)
 	if err != nil {
-		return nil, fmt.Errorf("extracting events: %w", err)
+		return nil, nil, fmt.Errorf("extracting events: %w", err)
 	}
 	commits, err := c.coCommitter.ExtractAllCoCommits(events)
 	if err != nil {
-		return nil, fmt.Errorf("extracting co-commits: %w", err)
+		return nil, nil, fmt.Errorf("extracting co-commits: %w", err)
 	}
 	art.Events = events
 	art.Commits = commits
@@ -252,19 +254,21 @@ func (c *Correlator) extractHistoryArtifact(opts CorrelatorOptions) (*historyArt
 	// One bounded metadata walk feeds both remaining strategies (and defines the
 	// window the orphan detector reports).
 	if err := c.checkCtx(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	walk, err := walkCommits(c.ctx, c.repoPath, extractOpts)
 	if err != nil {
-		return nil, fmt.Errorf("walking commits: %w", err)
+		return nil, nil, fmt.Errorf("walking commits: %w", err)
 	}
 	art.WalkedCommits = len(walk)
 
 	// Strategy 2: explicit_id — bead ids referenced in commit messages.
+	// Combine live known IDs on c.explicit with historical JSONL event IDs.
 	start = time.Now()
-	explicit, err := c.extractExplicitCommits(walk, opts.BeadID)
+	matcher := c.explicit.withMergedKnownIDs(beadIDsFromEvents(events))
+	explicit, err := c.extractExplicitCommitsWithMatcher(matcher, walk, opts.BeadID)
 	if err != nil {
-		return nil, fmt.Errorf("extracting explicit-id commits: %w", err)
+		return nil, nil, fmt.Errorf("extracting explicit-id commits: %w", err)
 	}
 	art.Explicit = explicit
 	art.Strategies = append(art.Strategies, StrategyRun{
@@ -275,12 +279,12 @@ func (c *Correlator) extractHistoryArtifact(opts CorrelatorOptions) (*historyArt
 	// Strategy 3: temporal_author — the claimant's code commits inside the
 	// bead's active window. Precedence against explicit-ID links is resolved
 	// at assembly (mergeStrategyCommits), once it is known which referenced
-	// beads actually exist; co-commit links never overlap because those
-	// commits touch .beads/ and are excluded here.
+	// beads actually exist; pure .beads/-only commits are excluded here while
+	// mixed code + .beads/ commits are admitted.
 	start = time.Now()
 	temporal, err := c.extractTemporalCandidates(events, walk, opts.BeadID)
 	if err != nil {
-		return nil, fmt.Errorf("extracting temporal candidates: %w", err)
+		return nil, nil, fmt.Errorf("extracting temporal candidates: %w", err)
 	}
 	art.Temporal = temporal
 	art.Strategies = append(art.Strategies, StrategyRun{
@@ -288,7 +292,7 @@ func (c *Correlator) extractHistoryArtifact(opts CorrelatorOptions) (*historyArt
 		DurationMS: durationMS(time.Since(start)), Candidates: len(temporal),
 	})
 
-	return art, nil
+	return art, walk, nil
 }
 
 func durationMS(d time.Duration) float64 {
@@ -305,24 +309,59 @@ func (c *Correlator) checkCtx() error {
 }
 
 // extractExplicitCommits converts walk matches into CorrelatedCommits with the
-// commit's code files (served from the co-commit extractor's batched cache).
-// Like the co-commit strategy it keeps only commits that touched at least one
-// code file: a bookkeeping-only commit that names a bead is not a code change.
+// commit's repository files (served from the co-commit extractor's batched cache).
+// Pure .beads/-only bookkeeping commits and empty commits are skipped, while any
+// explicit-ID commit touching at least one non-.beads/ repository file (including
+// docs, config, or build files) is retained.
 func (c *Correlator) extractExplicitCommits(walk []walkedCommit, beadFilter string) ([]CorrelatedCommit, error) {
-	matches := c.explicit.MatchWalkedCommits(walk, beadFilter)
+	return c.extractExplicitCommitsWithMatcher(c.explicit, walk, beadFilter)
+}
+
+func (c *Correlator) extractExplicitCommitsWithMatcher(matcher *ExplicitMatcher, walk []walkedCommit, beadFilter string) ([]CorrelatedCommit, error) {
+	if matcher == nil {
+		matcher = c.explicit
+	}
+	matches := matcher.MatchWalkedCommits(walk, beadFilter)
 	if len(matches) == 0 {
 		return nil, nil
 	}
+	walkBySHA := make(map[string]walkedCommit, len(walk))
+	for _, wc := range walk {
+		walkBySHA[wc.SHA] = wc
+	}
+	filteredMatches := make([]ExplicitMatch, 0, len(matches))
 	shas := make([]string, 0, len(matches))
+	queued := make(map[string]struct{}, len(matches))
 	for _, m := range matches {
-		shas = append(shas, m.CommitSHA)
+		wc, ok := walkBySHA[m.CommitSHA]
+		if ok && (len(wc.Files) == 0 || wc.beadsOnly()) {
+			continue
+		}
+		filteredMatches = append(filteredMatches, m)
+		if _, dup := queued[m.CommitSHA]; !dup {
+			queued[m.CommitSHA] = struct{}{}
+			shas = append(shas, m.CommitSHA)
+		}
+	}
+	if len(filteredMatches) == 0 {
+		return nil, nil
 	}
 	if err := c.coCommitter.primeBatch(shas); err != nil {
 		return nil, err
 	}
-	commits := make([]CorrelatedCommit, 0, len(matches))
-	for _, m := range matches {
-		cc := c.explicit.CreateCorrelatedCommit(m, c.coCommitter)
+	commits := make([]CorrelatedCommit, 0, len(filteredMatches))
+	for _, m := range filteredMatches {
+		cc := matcher.CreateCorrelatedCommit(m, c.coCommitter)
+		if len(cc.Files) == 0 {
+			if wc, ok := walkBySHA[m.CommitSHA]; ok {
+				for _, f := range wc.Files {
+					if len(f) >= 7 && f[:7] == ".beads/" {
+						continue
+					}
+					cc.Files = append(cc.Files, FileChange{Path: f, Action: "M"})
+				}
+			}
+		}
 		if len(cc.Files) == 0 {
 			continue
 		}
@@ -332,9 +371,9 @@ func (c *Correlator) extractExplicitCommits(walk []walkedCommit, beadFilter stri
 }
 
 // extractTemporalCandidates finds, for every bead with a claimed→closed
-// window, the walked commits by the claimant inside that window that (a) did
-// not touch .beads/ (those belong to the co-commit strategy) and (b) changed
-// at least one code file.
+// window, the walked commits by the claimant inside that window that (a) are
+// not pure .beads/-only tracker bookkeeping commits and (b) changed at least
+// one code file.
 func (c *Correlator) extractTemporalCandidates(events []BeadEvent, walk []walkedCommit, beadFilter string) ([]temporalCandidate, error) {
 	windows := temporalWindowsFromEvents(events, beadFilter)
 	if len(windows) == 0 {
@@ -350,7 +389,7 @@ func (c *Correlator) extractTemporalCandidates(events []BeadEvent, walk []walked
 	queued := make(map[string]struct{})
 	for _, w := range windows {
 		for _, wc := range walk {
-			if wc.touchesBeadsDir() || !commitInWindow(w, wc) {
+			if len(wc.Files) == 0 || wc.beadsOnly() || !commitInWindow(w, wc) {
 				continue
 			}
 			pairs = append(pairs, pair{window: w, commit: wc})
@@ -401,11 +440,34 @@ func (c *Correlator) extractTemporalCandidates(events []BeadEvent, walk []walked
 
 // GenerateReport generates a complete history report
 func (c *Correlator) GenerateReport(beads []BeadInfo, opts CorrelatorOptions) (*HistoryReport, error) {
+	if c.explicit != nil {
+		c.explicit.SetKnownBeadIDs(beadIDsFromInfos(beads))
+	}
 	art, err := c.extractHistoryArtifact(opts)
 	if err != nil {
 		return nil, err
 	}
 	return c.assembleReport(beads, opts, art), nil
+}
+
+func beadIDsFromInfos(beads []BeadInfo) []string {
+	ids := make([]string, 0, len(beads))
+	for _, b := range beads {
+		if b.ID != "" {
+			ids = append(ids, b.ID)
+		}
+	}
+	return ids
+}
+
+func beadIDsFromEvents(events []BeadEvent) []string {
+	ids := make([]string, 0, len(events))
+	for _, ev := range events {
+		if ev.BeadID != "" {
+			ids = append(ids, ev.BeadID)
+		}
+	}
+	return ids
 }
 
 // assembleReport builds the final HistoryReport from the current bead slice and
@@ -568,7 +630,7 @@ func (c *Correlator) buildHistories(beads []BeadInfo, events []BeadEvent, commit
 // dedupCommits removes duplicate commits by SHA
 func dedupCommits(commits []CorrelatedCommit) []CorrelatedCommit {
 	seen := make(map[string]bool)
-	var result []CorrelatedCommit
+	result := make([]CorrelatedCommit, 0, len(commits))
 	for _, c := range commits {
 		if !seen[c.SHA] {
 			seen[c.SHA] = true
@@ -651,14 +713,16 @@ func mergeCorrelatedCommits(scorer *Scorer, strategies ...[]CorrelatedCommit) []
 		}
 	}
 	if len(order) == 0 {
-		return nil
+		return []CorrelatedCommit{}
 	}
 
 	merged := make([]CorrelatedCommit, 0, len(order))
 	for _, sha := range order {
 		group := bySHA[sha]
 		result := group[0]
-		result.Methods = []string{group[0].Method.String()}
+		if group[0].Method != "" {
+			result.Methods = []string{group[0].Method.String()}
+		}
 		if len(group) > 1 {
 			signals := make([]ConfidenceSignal, 0, len(group))
 			seenFiles := make(map[string]struct{})

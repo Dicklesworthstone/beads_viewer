@@ -124,8 +124,9 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 			continue
 		}
 
-		// Skip commits that touch beads files (those are handled by co-commit extractor)
-		if t.touchesBeadsFile(sha) {
+		// Skip pure tracker-bookkeeping commits (100% .beads/ paths);
+		// mixed code + .beads/ commits are admitted.
+		if t.isBeadsOnlyCommit(sha) {
 			continue
 		}
 
@@ -173,8 +174,10 @@ func gitAuthorRegex(author, authorEmail string) string {
 	return regexp.QuoteMeta(identity)
 }
 
-// touchesBeadsFile checks if a commit modifies any beads file
-func (t *TemporalCorrelator) touchesBeadsFile(sha string) bool {
+// isBeadsOnlyCommit reports whether every modified path in the commit is
+// tracker metadata under .beads/. Mixed commits touching both .beads/ and
+// repository code files return false so temporal correlation evaluates them.
+func (t *TemporalCorrelator) isBeadsOnlyCommit(sha string) bool {
 	cmd := gitCommand(t.ctx, "show", "--name-only", "--format=", sha)
 	cmd.Dir = t.repoPath
 
@@ -183,14 +186,19 @@ func (t *TemporalCorrelator) touchesBeadsFile(sha string) bool {
 		return false
 	}
 
+	total := 0
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
-		path := scanner.Text()
-		if strings.HasPrefix(path, ".beads/") {
-			return true
+		path := strings.TrimSpace(scanner.Text())
+		if path == "" {
+			continue
+		}
+		total++
+		if !strings.HasPrefix(path, ".beads/") {
+			return false
 		}
 	}
-	return false
+	return total > 0
 }
 
 // calculateTemporalConfidence computes dynamic confidence for temporal correlation

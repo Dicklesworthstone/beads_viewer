@@ -33,10 +33,12 @@ type RelatedBead struct {
 
 // ReverseLookup provides reverse lookup from commits to beads.
 type ReverseLookup struct {
-	repoPath string
-	index    CommitIndex                   // SHA -> []BeadID
-	details  map[string][]CorrelatedCommit // SHA -> commits with full details
-	beads    map[string]BeadHistory        // BeadID -> history
+	repoPath         string
+	index            CommitIndex                   // SHA -> []BeadID
+	details          map[string][]CorrelatedCommit // SHA -> commits with full details
+	beads            map[string]BeadHistory        // BeadID -> history
+	explicit         *ExplicitMatcher
+	feedbackRejected bool
 
 	// ctx, when set via WithContext, bounds the git subprocesses spawned by
 	// the lookup (issue #166). nil means context.Background().
@@ -47,7 +49,31 @@ type ReverseLookup struct {
 // when ctx is done (issue #166). Returns the receiver for chaining.
 func (rl *ReverseLookup) WithContext(ctx context.Context) *ReverseLookup {
 	rl.ctx = ctx
+	if rl.explicit != nil {
+		rl.explicit.WithContext(ctx)
+	}
 	return rl
+}
+
+func collectReportKnownBeadIDs(report *HistoryReport) []string {
+	if report == nil || len(report.Histories) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(report.Histories))
+	for beadID, history := range report.Histories {
+		if beadID != "" {
+			ids = append(ids, beadID)
+		}
+		if history.BeadID != "" && history.BeadID != beadID {
+			ids = append(ids, history.BeadID)
+		}
+		for _, ev := range history.Events {
+			if ev.BeadID != "" {
+				ids = append(ids, ev.BeadID)
+			}
+		}
+	}
+	return canonicalizeKnownIDList(ids)
 }
 
 // NewReverseLookup creates a new reverse lookup from a history report.
@@ -58,6 +84,7 @@ func NewReverseLookup(report *HistoryReport) *ReverseLookup {
 		details: make(map[string][]CorrelatedCommit),
 	}
 	if report == nil {
+		rl.explicit = NewExplicitMatcher("")
 		return rl
 	}
 	if report.CommitIndex != nil {
@@ -66,6 +93,10 @@ func NewReverseLookup(report *HistoryReport) *ReverseLookup {
 	if report.Histories != nil {
 		rl.beads = report.Histories
 	}
+	if report.Stats.FeedbackApplied != nil && report.Stats.FeedbackApplied.Rejected > 0 {
+		rl.feedbackRejected = true
+	}
+	rl.explicit = NewExplicitMatcherWithKnownIDs("", collectReportKnownBeadIDs(report))
 
 	// Build details map for quick access
 	for _, history := range rl.beads {
@@ -81,7 +112,28 @@ func NewReverseLookup(report *HistoryReport) *ReverseLookup {
 func NewReverseLookupWithRepo(report *HistoryReport, repoPath string) *ReverseLookup {
 	rl := NewReverseLookup(report)
 	rl.repoPath = repoPath
+	if rl.explicit != nil {
+		rl.explicit.mu.Lock()
+		rl.explicit.repoPath = repoPath
+		rl.explicit.mu.Unlock()
+	}
 	return rl
+}
+
+func (rl *ReverseLookup) matchesUnambiguousKnownBead(beadID string) bool {
+	if beadID == "" || len(rl.beads) == 0 {
+		return false
+	}
+	matches := 0
+	for id := range rl.beads {
+		if strings.EqualFold(id, beadID) {
+			matches++
+			if matches > 1 {
+				return false
+			}
+		}
+	}
+	return matches == 1
 }
 
 // LookupByCommit finds all beads related to a commit.
@@ -281,6 +333,19 @@ func (rl *ReverseLookup) FindOrphanCommits(opts ExtractOptions) ([]OrphanCommit,
 		if _, ok := rl.index[wc.SHA]; ok {
 			correlated++
 			continue
+		}
+		if rl.explicit != nil && !rl.feedbackRejected {
+			linked := false
+			for _, idMatch := range rl.explicit.ExtractIDsFromMessage(wc.message()) {
+				if rl.matchesUnambiguousKnownBead(idMatch.ID) {
+					linked = true
+					break
+				}
+			}
+			if linked {
+				correlated++
+				continue
+			}
 		}
 		var files []string
 		for _, f := range wc.Files {

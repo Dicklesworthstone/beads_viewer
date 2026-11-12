@@ -253,6 +253,16 @@ reject vulnerable-next-minor 'below the security floor' bash "$vulnerable_next_m
 wrong_toolchain="$(clone_fixture wrong-toolchain)"
 (cd "$wrong_toolchain" && go mod edit -toolchain=go1.26.99)
 reject compiler-selection 'release requires go1.26.99' bash "$wrong_toolchain/scripts/release_gate.sh" verify-toolchain
+fake_modcache="$tmp/fake-gomodcache"
+fake_tc_bin="$fake_modcache/golang.org/toolchain@v0.0.1-go1.26.99.$(go env GOHOSTOS)-$(go env GOHOSTARCH)/bin"
+mkdir -p "$fake_tc_bin"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_tc_bin/go"
+chmod +x "$fake_tc_bin/go"
+reject preflight-compiler-hint 'hint: prepend PATH=' env GOMODCACHE="$fake_modcache" bash "$wrong_toolchain/scripts/release_gate.sh" preflight
+if grep -q 'Traceback' "$tmp/preflight-compiler-hint.log"; then
+  cat "$tmp/preflight-compiler-hint.log"
+  fail 'preflight compiler mismatch leaked Python Traceback'
+fi
 old_net="$(clone_fixture old-net)"
 (cd "$old_net" && go mod edit -require=golang.org/x/net@v0.59.0)
 reject old-net 'below the security floor' bash "$old_net/scripts/release_gate.sh" verify-toolchain
@@ -426,13 +436,27 @@ reject changed-audit 'source vulnerability evidence changed' env RELEASE_GATE_RE
 
 # The actual checked-in GoReleaser config must consume the receipt and finish
 # packaging without network publication. Its post hooks inspect all binaries.
+# When goreleaser is absent on a diagnostic host, verify that `package` still
+# fails closed (and still binds packaging_config), continue testing all 5
+# pure-Go cross-builds and tamper controls, and return sentinel 200 at the end
+# so Stage 10 records SKIPPED (ineligible receipt) instead of FAILED.
 goreleaser_dist="$tmp/goreleaser-packages"
-if ! RELEASE_GATE_DIST="$goreleaser_dist" bash "$fixture/scripts/release_gate.sh" package >"$tmp/goreleaser-package.log" 2>&1; then
-  cat "$tmp/goreleaser-package.log"
-  fail "GoReleaser package path failed"
+goreleaser_skipped=0
+if command -v goreleaser >/dev/null 2>&1; then
+  if ! RELEASE_GATE_DIST="$goreleaser_dist" bash "$fixture/scripts/release_gate.sh" package >"$tmp/goreleaser-package.log" 2>&1; then
+    cat "$tmp/goreleaser-package.log"
+    fail "GoReleaser package path failed"
+  fi
+  echo "ok: GoReleaser packaged and verified real binaries ($tmp/goreleaser-package.log)"
+  cp "$receipt" "$tmp/goreleaser-sealed-receipt.json"
+else
+  if RELEASE_GATE_DIST="$goreleaser_dist" bash "$fixture/scripts/release_gate.sh" package >"$tmp/goreleaser-package.log" 2>&1; then
+    fail "package unexpectedly succeeded without goreleaser installed"
+  fi
+  mkdir -p "$goreleaser_dist"
+  goreleaser_skipped=1
+  echo "SKIPPED: goreleaser not installed (verified package fails closed; running pure-Go cross-build, seal, verify, and tamper controls)"
 fi
-echo "ok: GoReleaser packaged and verified real binaries ($tmp/goreleaser-package.log)"
-cp "$receipt" "$tmp/goreleaser-sealed-receipt.json"
 reject reused-dist 'dist exists' env RELEASE_GATE_DIST="$goreleaser_dist" bash "$fixture/scripts/release_gate.sh" package
 reject source-dist 'must be outside source' env RELEASE_GATE_DIST="$fixture/dist" bash "$fixture/scripts/release_gate.sh" package
 
@@ -564,9 +588,16 @@ PY
       bash "$fixture/scripts/release_gate.sh" verify-binary "$tmp/binaries/bv-linux-amd64"
   done
   cp "$receipt" "$tmp/failed-package.json"
-  reject failed-package-posthook 'unsuccessful binary vulnerability evidence' \
-    env RELEASE_GATE_RECEIPT="$tmp/failed-package.json" FIXTURE_BINARY_SCANNER_EXIT=3 \
-    RELEASE_GATE_DIST="$tmp/failed-package-dist" bash "$fixture/scripts/release_gate.sh" package
+  if command -v goreleaser >/dev/null 2>&1; then
+    reject failed-package-posthook 'unsuccessful binary vulnerability evidence' \
+      env RELEASE_GATE_RECEIPT="$tmp/failed-package.json" FIXTURE_BINARY_SCANNER_EXIT=3 \
+      RELEASE_GATE_DIST="$tmp/failed-package-dist" bash "$fixture/scripts/release_gate.sh" package
+  else
+    if RELEASE_GATE_RECEIPT="$tmp/failed-package.json" FIXTURE_BINARY_SCANNER_EXIT=3 \
+      RELEASE_GATE_DIST="$tmp/failed-package-dist" bash "$fixture/scripts/release_gate.sh" package >"$tmp/failed-package-posthook.log" 2>&1; then
+      fail "failed-package-posthook unexpectedly succeeded without goreleaser"
+    fi
+  fi
   python3 - "$tmp/failed-package.json" "$tmp/failed-package-dist" <<'PY'
 import json, pathlib, sys
 r = json.load(open(sys.argv[1]))
@@ -619,7 +650,8 @@ reject no-build-info 'binary revision mismatch' bash "$fixture/scripts/release_g
 # unmodified Go metadata from all five cross-built executables.
 mkdir -p "$tmp/metadata-tools"
 export REAL_GO_FOR_FIXTURE="$fixture_go"
-export BUILDINFO_GO_FOR_FIXTURE="$(command -v go)"
+BUILDINFO_GO_FOR_FIXTURE="$(command -v go)"
+export BUILDINFO_GO_FOR_FIXTURE
 cat >"$tmp/metadata-tools/go" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -682,6 +714,10 @@ PY
 printf 'tamper\n' >>"$dist/bv_fixture_linux_amd64.tar.gz"
 reject changed-archive 'artifact changed' bash "$fixture/scripts/release_gate.sh" verify
 reject changed-checksum 'archive checksum mismatch' bash "$fixture/scripts/release_gate.sh" seal "$dist"
+if [ "$goreleaser_skipped" -eq 1 ]; then
+  echo "release_gate_test: SKIPPED live GoReleaser packaging (goreleaser unavailable; package fail-closed, five pure-Go cross-builds, seal/verify, and all tamper controls PASSED)"
+  exit 200
+fi
 if [ "$scope" = gate-mechanics ]; then
   echo "release_gate_test: PASS (synthetic stages/scanner; real Git, GoReleaser and five Go cross-builds; no vulnerability scan/publication)"
 else

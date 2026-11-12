@@ -874,3 +874,58 @@ func TestDetectDuplicates_LargeIssueSet(t *testing.T) {
 		t.Error("Should find at least one duplicate pair")
 	}
 }
+
+func TestDetectDuplicates_SkipsExplicitlyLinkedIssues(t *testing.T) {
+	depTypes := []model.DependencyType{
+		model.DepBlocks,
+		model.DepRelated,
+		model.DepParentChild,
+		model.DepDiscoveredFrom,
+	}
+	for _, depType := range depTypes {
+		t.Run(string(depType)+"_forward", func(t *testing.T) {
+			issues := []model.Issue{
+				{
+					ID:          "ISSUE-1",
+					Title:       "Implement deterministic robot drift schema validation",
+					Description: "Add schema validation for robot drift JSON output",
+					Status:      model.StatusOpen,
+					Dependencies: []*model.Dependency{
+						{IssueID: "ISSUE-1", DependsOnID: "ISSUE-2", Type: depType},
+					},
+				},
+				{
+					ID:          "ISSUE-2",
+					Title:       "Implement deterministic robot drift schema validation",
+					Description: "Add schema validation for robot drift JSON output",
+					Status:      model.StatusOpen,
+				},
+			}
+			if got := DetectDuplicates(issues, DefaultDuplicateConfig()); len(got) != 0 {
+				t.Fatalf("DetectDuplicates returned %d suggestions for %s-linked pair, want 0: %+v", len(got), depType, got)
+			}
+		})
+		t.Run(string(depType)+"_reverse", func(t *testing.T) {
+			issues := []model.Issue{
+				{
+					ID:          "ISSUE-1",
+					Title:       "Implement deterministic robot drift schema validation",
+					Description: "Add schema validation for robot drift JSON output",
+					Status:      model.StatusOpen,
+				},
+				{
+					ID:          "ISSUE-2",
+					Title:       "Implement deterministic robot drift schema validation",
+					Description: "Add schema validation for robot drift JSON output",
+					Status:      model.StatusOpen,
+					Dependencies: []*model.Dependency{
+						{IssueID: "ISSUE-2", DependsOnID: "ISSUE-1", Type: depType},
+					},
+				},
+			}
+			if got := DetectDuplicates(issues, DefaultDuplicateConfig()); len(got) != 0 {
+				t.Fatalf("DetectDuplicates returned %d suggestions for reverse %s-linked pair, want 0: %+v", len(got), depType, got)
+			}
+		})
+	}
+}

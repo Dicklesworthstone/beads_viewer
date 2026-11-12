@@ -143,10 +143,17 @@ type DiffSummary struct {
 // CompareSnapshots computes the diff between two snapshots
 func CompareSnapshots(from, to *Snapshot) *SnapshotDiff {
 	diff := &SnapshotDiff{
-		FromTimestamp: from.Timestamp,
-		ToTimestamp:   to.Timestamp,
-		FromRevision:  from.Revision,
-		ToRevision:    to.Revision,
+		FromTimestamp:  from.Timestamp,
+		ToTimestamp:    to.Timestamp,
+		FromRevision:   from.Revision,
+		ToRevision:     to.Revision,
+		NewIssues:      []model.Issue{},
+		ClosedIssues:   []model.Issue{},
+		RemovedIssues:  []model.Issue{},
+		ReopenedIssues: []model.Issue{},
+		ModifiedIssues: []ModifiedIssue{},
+		NewCycles:      [][]string{},
+		ResolvedCycles: [][]string{},
 	}
 
 	// Build issue maps for quick lookup (use pointers to avoid copying structs)
@@ -224,6 +231,12 @@ func CompareSnapshots(from, to *Snapshot) *SnapshotDiff {
 
 	// Compare cycles
 	diff.NewCycles, diff.ResolvedCycles = compareCycles(from.Stats, to.Stats)
+	if diff.NewCycles == nil {
+		diff.NewCycles = [][]string{}
+	}
+	if diff.ResolvedCycles == nil {
+		diff.ResolvedCycles = [][]string{}
+	}
 
 	// Calculate metric deltas
 	diff.MetricDeltas = calculateMetricDeltas(from, to)

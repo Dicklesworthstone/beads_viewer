@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -632,3 +634,55 @@ func TestModel_PKeyIgnoredOutsideListAndDetail(t *testing.T) {
 
 // must2 drops the tea.Cmd half of an Update result.
 func must2(tm tea.Model, _ tea.Cmd) tea.Model { return tm }
+
+func TestRenderSprintDashboard_RespectsDriftConfigThresholds(t *testing.T) {
+	now := time.Now().UTC()
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	bvDir := filepath.Join(tmpDir, ".bv")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bvDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(beadsPath, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Issue blocked for 3 days (P2): at-risk under default (2d) but safe under sprint_blocked_days: 10.
+	issues := []model.Issue{{
+		ID:        "SPRINT-BLK-1",
+		Title:     "Blocked three days",
+		Status:    model.StatusBlocked,
+		Priority:  2,
+		IssueType: model.TypeTask,
+		UpdatedAt: now.Add(-3 * 24 * time.Hour),
+	}}
+	sprint := model.Sprint{
+		ID:        "s1",
+		Name:      "Sprint Thresholds",
+		StartDate: now.Add(-5 * 24 * time.Hour),
+		EndDate:   now.Add(9 * 24 * time.Hour),
+		BeadIDs:   []string{"SPRINT-BLK-1"},
+	}
+
+	mDefault := NewModel(issues, nil, beadsPath)
+	t.Cleanup(mDefault.Stop)
+	mDefault.selectedSprint = &sprint
+	outDefault := mDefault.renderSprintDashboard()
+	if !strings.Contains(outDefault, "blocked") {
+		t.Fatalf("expected default sprint dashboard to flag 3-day blocked issue:\n%s", outDefault)
+	}
+
+	if err := os.WriteFile(filepath.Join(bvDir, "drift.yaml"), []byte("sprint_blocked_days: 10\nsprint_inactive_days: 10\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mCustom := NewModel(issues, nil, beadsPath)
+	t.Cleanup(mCustom.Stop)
+	mCustom.selectedSprint = &sprint
+	outCustom := mCustom.renderSprintDashboard()
+	if !strings.Contains(outCustom, "No at-risk items") {
+		t.Fatalf("expected sprint_blocked_days=10 from .bv/drift.yaml to suppress 3-day blocked warning:\n%s", outCustom)
+	}
+}

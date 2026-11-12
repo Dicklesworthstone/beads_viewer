@@ -123,16 +123,28 @@ func (a *Analyzer) GenerateEnhancedRecommendations() []EnhancedPriorityRecommend
 
 // GenerateEnhancedRecommendationsWithThresholds generates enhanced recommendations
 func (a *Analyzer) GenerateEnhancedRecommendationsWithThresholds(thresholds RecommendationThresholds) []EnhancedPriorityRecommendation {
-	// Keep the whole batch on one completed snapshot. Reanalyzing each score
-	// rereads and reconstructs the same robot disk cache for every issue.
-	stats := a.Analyze()
-	scores := a.ComputeImpactScoresFromStats(&stats, a.Now())
+	return a.GenerateEnhancedRecommendationsFromStats(nil, thresholds, 10, true)
+}
+
+// GenerateEnhancedRecommendationsFromStats generates enhanced recommendations reusing
+// caller-supplied GraphStats. When includeInactive is false, parked or deferred
+// statuses (blocked, deferred, future defer_until, draft, pinned, hooked, review)
+// are excluded so default --robot-priority surfaces only live open/in_progress
+// candidate backlog items. Pass maxResults <= 0 for uncapped output before caller
+// post-filtering.
+func (a *Analyzer) GenerateEnhancedRecommendationsFromStats(stats *GraphStats, thresholds RecommendationThresholds, maxResults int, includeInactive bool) []EnhancedPriorityRecommendation {
+	if stats == nil {
+		analyzed := a.Analyze()
+		stats = &analyzed
+	}
+	rawNow := a.Now()
+	scores := a.ComputeImpactScoresFromStats(stats, rawNow)
 	if len(scores) == 0 {
 		return nil
 	}
 
 	// Get basic recommendations
-	basicRecs := a.GenerateRecommendationsFromStats(&stats, thresholds)
+	basicRecs := a.GenerateRecommendationsFromStats(stats, thresholds)
 
 	// Create a map for quick lookup
 	recMap := make(map[string]*PriorityRecommendation)
@@ -141,14 +153,26 @@ func (a *Analyzer) GenerateEnhancedRecommendationsWithThresholds(thresholds Reco
 	}
 
 	var enhanced []EnhancedPriorityRecommendation
-	now := a.Now().UTC()
+	now := rawNow.UTC()
+	dataHash := a.DataHash()
+	phase2Ready := stats.IsPhase2Ready()
+
+	selectionMode := SelectionReadyLeaf
+	if includeInactive {
+		selectionMode = SelectionAllScopedCandidates
+	}
+	eligibleIDs := a.CandidateIssueSet(selectionMode)
 
 	// Enhance each score with what-if deltas
 	for _, score := range scores {
+		if !eligibleIDs[score.IssueID] {
+			continue
+		}
+
 		rec, hasRec := recMap[score.IssueID]
 
 		// Generate what-if for all scores (not just those with recommendations)
-		whatIf := a.computeWhatIfDeltaFromStats(score.IssueID, &stats)
+		whatIf := a.computeWhatIfDeltaFromStats(score.IssueID, stats)
 		topReasons := GenerateTopReasons(score)
 
 		// Determine if caps were applied
@@ -164,8 +188,9 @@ func (a *Analyzer) GenerateEnhancedRecommendationsWithThresholds(thresholds Reco
 			WhatIf:     whatIf,
 			Status: ExplanationStatus{
 				ComputedAt:    now.Format(time.RFC3339),
+				DataHash:      dataHash,
 				Deterministic: true,
-				Phase2Ready:   true, // Assume Phase 2 is ready
+				Phase2Ready:   phase2Ready,
 				Capped:        capped,
 				CappedFields:  cappedFields,
 			},
@@ -183,6 +208,7 @@ func (a *Analyzer) GenerateEnhancedRecommendationsWithThresholds(thresholds Reco
 				PriorityRecommendation: PriorityRecommendation{
 					IssueID:           score.IssueID,
 					Title:             score.Title,
+					Labels:            append([]string{}, score.Labels...),
 					CurrentPriority:   score.Priority,
 					SuggestedPriority: score.Priority, // No change
 					ImpactScore:       score.Score,
@@ -196,14 +222,16 @@ func (a *Analyzer) GenerateEnhancedRecommendationsWithThresholds(thresholds Reco
 		}
 	}
 
-	// Sort by impact score descending
+	// Sort by impact score descending, then IssueID ascending for determinism
 	sort.Slice(enhanced, func(i, j int) bool {
-		return enhanced[i].ImpactScore > enhanced[j].ImpactScore
+		if enhanced[i].ImpactScore != enhanced[j].ImpactScore {
+			return enhanced[i].ImpactScore > enhanced[j].ImpactScore
+		}
+		return enhanced[i].IssueID < enhanced[j].IssueID
 	})
 
-	// Cap at 10 items
-	if len(enhanced) > 10 {
-		enhanced = enhanced[:10]
+	if maxResults > 0 && len(enhanced) > maxResults {
+		enhanced = enhanced[:maxResults]
 	}
 
 	return enhanced

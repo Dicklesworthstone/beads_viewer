@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"gopkg.in/yaml.v3"
 )
 
@@ -83,6 +84,12 @@ type Config struct {
 	// Per-label staleness overrides (bv-167)
 	// Labels can have tighter or looser thresholds than the default
 	LabelOverrides map[string]*LabelConfig `yaml:"label_overrides,omitempty" json:"label_overrides,omitempty"`
+
+	// Sprint at-risk thresholds (bv-apal.28)
+	// SprintBlockedDays flags blocked sprint items stale for >= N days (default: 2)
+	SprintBlockedDays int `yaml:"sprint_blocked_days,omitempty" json:"sprint_blocked_days,omitempty"`
+	// SprintInactiveDays flags in_progress sprint items with no updates for >= N days (default: 4)
+	SprintInactiveDays int `yaml:"sprint_inactive_days,omitempty" json:"sprint_inactive_days,omitempty"`
 }
 
 // LabelConfig allows per-label threshold customization (bv-167)
@@ -123,6 +130,8 @@ func DefaultConfig() *Config {
 		DuplicateMaxAlerts:            10,   // At most 10 duplicate alerts per run
 		PriorityMismatchMinConfidence: 0.6,  // Recommendation confidence that becomes a warning
 		ProactiveMaxIssues:            2000, // Skip the expensive checks above this many issues
+		SprintBlockedDays:             2,    // Blocked sprint items flagged after 2 days
+		SprintInactiveDays:            4,    // In-progress sprint items flagged after 4 days idle
 	}
 }
 
@@ -238,6 +247,15 @@ func (c *Config) Validate() error {
 	}
 	if c.PriorityMismatchMinConfidence == 0 {
 		c.PriorityMismatchMinConfidence = defaults.PriorityMismatchMinConfidence
+	}
+	if c.SprintBlockedDays == 0 {
+		c.SprintBlockedDays = defaults.SprintBlockedDays
+	}
+	if c.SprintInactiveDays == 0 {
+		c.SprintInactiveDays = defaults.SprintInactiveDays
+	}
+	if c.SprintBlockedDays < 0 || c.SprintInactiveDays < 0 {
+		return fmt.Errorf("sprint_blocked_days and sprint_inactive_days must be positive")
 	}
 	if c.ProactiveMaxIssues < 0 {
 		return fmt.Errorf("proactive_max_issues must be non-negative (0 = no cap)")
@@ -393,6 +411,22 @@ func (c *Config) GetStalenessThresholds(labels []string) (warnDays, critDays int
 	return
 }
 
+// AtRiskThresholds returns sprint burndown at-risk thresholds configured via
+// .bv/drift.yaml, falling back to DefaultAtRiskThresholds for unset fields.
+func (c *Config) AtRiskThresholds() analysis.AtRiskThresholds {
+	defaults := analysis.DefaultAtRiskThresholds()
+	if c == nil {
+		return defaults
+	}
+	if c.SprintBlockedDays > 0 {
+		defaults.BlockedDays = c.SprintBlockedDays
+	}
+	if c.SprintInactiveDays > 0 {
+		defaults.InactiveDays = c.SprintInactiveDays
+	}
+	return defaults
+}
+
 // ExampleConfig returns an example configuration with comments
 func ExampleConfig() string {
 	return `# Drift detection thresholds configuration
@@ -448,6 +482,10 @@ priority_mismatch_min_confidence: 0.6  # Warning at this confidence or above
 # Graph-size cap for the expensive proactive checks (priority_mismatch, potential_duplicate);
 # larger graphs skip them and report skipped_checks. 0 disables the cap.
 proactive_max_issues: 2000
+
+# Sprint burndown at-risk thresholds (bv-apal.28)
+sprint_blocked_days: 2           # Blocked sprint items stale for >= N days
+sprint_inactive_days: 4          # In-progress sprint items idle for >= N days
 
 # Disable specific alert types (bv-167)
 # Uncomment to disable:

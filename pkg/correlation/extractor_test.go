@@ -651,3 +651,101 @@ func TestReverseEvents_Single(t *testing.T) {
 		t.Error("reverseEvents of single should keep it")
 	}
 }
+
+func TestSynthesizeCreationMilestones_DiffAndSnapshotPaths(t *testing.T) {
+	// 1. Unit test parseGitLogOutput + reverseCommitEventGroups (diff path)
+	data := []byte(`2222222222222222222222222222222222222222` + "\x00" + `2026-02-01T12:00:00Z` + "\x00" + `Alice` + "\x00" + `alice@example.com` + "\x00" + `Close claimed bead and add pre-closed bead
+
+diff --git a/.beads/issues.jsonl b/.beads/issues.jsonl
+--- a/.beads/issues.jsonl
++++ b/.beads/issues.jsonl
+-{"id":"bv-claim","title":"Created in progress","status":"in_progress"}
++{"id":"bv-claim","title":"Created in progress","status":"closed"}
++{"id":"bv-done","title":"Created directly closed","status":"closed"}
++{"id":"bv-tomb","title":"Created as tombstone","status":"tombstone"}
+1111111111111111111111111111111111111111` + "\x00" + `2026-02-01T10:00:00Z` + "\x00" + `Alice` + "\x00" + `alice@example.com` + "\x00" + `Create bead directly as in_progress
+
+diff --git a/.beads/issues.jsonl b/.beads/issues.jsonl
+--- /dev/null
++++ b/.beads/issues.jsonl
++{"id":"bv-claim","title":"Created in progress","status":"in_progress"}
+`)
+
+	e := NewExtractor("/tmp/test", "")
+	events, err := e.parseGitLogOutput(bytes.NewReader(data), "")
+	if err != nil {
+		t.Fatalf("parseGitLogOutput: %v", err)
+	}
+	reverseCommitEventGroups(events)
+
+	byBead := make(map[string][]EventType)
+	for _, ev := range events {
+		byBead[ev.BeadID] = append(byBead[ev.BeadID], ev.EventType)
+	}
+
+	wantClaim := []EventType{EventCreated, EventClaimed, EventClosed}
+	if len(byBead["bv-claim"]) != len(wantClaim) {
+		t.Fatalf("bv-claim events = %v, want %v", byBead["bv-claim"], wantClaim)
+	}
+	for i := range wantClaim {
+		if byBead["bv-claim"][i] != wantClaim[i] {
+			t.Errorf("bv-claim[%d] = %v, want %v", i, byBead["bv-claim"][i], wantClaim[i])
+		}
+	}
+
+	for _, id := range []string{"bv-done", "bv-tomb"} {
+		want := []EventType{EventCreated, EventClosed}
+		if len(byBead[id]) != len(want) || byBead[id][0] != EventCreated || byBead[id][1] != EventClosed {
+			t.Fatalf("%s events = %v, want %v", id, byBead[id], want)
+		}
+	}
+
+	// 2. Real git repository test exercising snapshot extraction (extractViaSnapshots)
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "alice@example.com")
+	runGit(t, repo, "config", "user.name", "Alice")
+
+	jsonl := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(jsonl, []byte(`{"id":"bv-direct-claim","title":"Direct Claim","status":"in_progress"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "create bead directly in_progress")
+
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-direct-claim","title":"Direct Claim","status":"closed"}`+"\n"+
+			`{"id":"bv-direct-close","title":"Direct Close","status":"closed"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "close claimed and add direct-closed bead")
+
+	snapExtractor := NewExtractor(repo, jsonl)
+	for _, mode := range []string{"patch", "snapshot"} {
+		var extracted []BeadEvent
+		if mode == "patch" {
+			extracted, err = snapExtractor.extractViaGitLogPatch(ExtractOptions{})
+		} else {
+			extracted, err = snapExtractor.extractViaSnapshots(ExtractOptions{})
+		}
+		if err != nil {
+			t.Fatalf("%s Extract: %v", mode, err)
+		}
+		snapByBead := make(map[string][]BeadEvent)
+		for _, ev := range extracted {
+			snapByBead[ev.BeadID] = append(snapByBead[ev.BeadID], ev)
+		}
+		if got := snapByBead["bv-direct-claim"]; len(got) != 3 || got[0].EventType != EventCreated || got[1].EventType != EventClaimed || got[2].EventType != EventClosed {
+			t.Fatalf("%s bv-direct-claim events = %+v, want [created, claimed, closed]", mode, got)
+		}
+		if got := snapByBead["bv-direct-close"]; len(got) != 2 || got[0].EventType != EventCreated || got[1].EventType != EventClosed {
+			t.Fatalf("%s bv-direct-close events = %+v, want [created, closed]", mode, got)
+		}
+	}
+}

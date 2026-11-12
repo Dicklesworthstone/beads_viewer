@@ -82,3 +82,7 @@ benchmarks/reference.txt
 
 # Remote compilation helper cache (AGENTS.md says it is ignored; it was not)
 .rch-go/
+
+# Ephemeral graph-export test snapshots and rapid property-test failure seeds
+*graph_export__as_of__*.html
+**/testdata/rapid/

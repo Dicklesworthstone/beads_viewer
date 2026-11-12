@@ -1,10 +1,11 @@
 package analysis
 
 import (
-	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // AnalysisConfig controls which metrics to compute and their timeouts.
@@ -361,15 +362,15 @@ const (
 // ApplyEnvOverrides applies environment-variable tunables to the analysis config.
 //
 // Supported:
-//   - BV_SKIP_PHASE2=1: skip expensive Phase 2 metrics (PageRank, Betweenness, HITS, Cycles,
-//     Eigenvector, Critical Path). (k-core/articulation/slack remain enabled.)
+//   - BV_SKIP_PHASE2=1: skip all Phase 2 metrics (PageRank, Betweenness, HITS, Cycles,
+//     Eigenvector, Critical Path, k-core, Articulation Points, Slack).
 //   - BV_PHASE2_TIMEOUT_S=N: override per-metric timeouts to N seconds (must be >0).
 //   - SOURCE_DATE_EPOCH=N: in robot mode, run timeout-raced metrics to completion
 //     when N is a valid base-10 int64, making their result state reproducible.
 func ApplyEnvOverrides(cfg AnalysisConfig) AnalysisConfig {
 	// SOURCE_DATE_EPOCH is a robot-output reproducibility contract. Do not let a
 	// process-wide build timestamp silently remove the TUI/library latency bounds.
-	cfg.RunToCompletion = envBool("BV_ROBOT") && validSourceDateEpoch()
+	cfg.RunToCompletion = envBool(env.Robot.Name) && validSourceDateEpoch()
 
 	if envBool(EnvSkipPhase2) {
 		cfg.ComputeBetweenness = false
@@ -387,6 +388,9 @@ func ApplyEnvOverrides(cfg AnalysisConfig) AnalysisConfig {
 
 		cfg.ComputeEigenvector = false
 		cfg.ComputeCriticalPath = false
+		cfg.ComputeKCore = false
+		cfg.ComputeArticulation = false
+		cfg.ComputeSlack = false
 	}
 
 	if timeout, ok := envPositiveSeconds(EnvPhase2TimeoutSeconds); ok {
@@ -408,7 +412,7 @@ func ApplyEnvOverrides(cfg AnalysisConfig) AnalysisConfig {
 }
 
 func validSourceDateEpoch() bool {
-	v := strings.TrimSpace(os.Getenv(EnvSourceDateEpoch))
+	v := strings.TrimSpace(env.Get(EnvSourceDateEpoch))
 	if v == "" {
 		return false
 	}
@@ -425,7 +429,7 @@ func validSourceDateEpoch() bool {
 }
 
 func envPositiveSeconds(name string) (time.Duration, bool) {
-	v := strings.TrimSpace(os.Getenv(name))
+	v := strings.TrimSpace(env.Get(name))
 	if v == "" {
 		return 0, false
 	}
@@ -438,7 +442,7 @@ func envPositiveSeconds(name string) (time.Duration, bool) {
 }
 
 func envBool(name string) bool {
-	v := strings.TrimSpace(os.Getenv(name))
+	v := strings.TrimSpace(env.Get(name))
 	if v == "" {
 		return false
 	}

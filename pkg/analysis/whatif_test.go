@@ -847,9 +847,30 @@ func TestEnhancedPriorityBatchRegression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Captured from the pre-reuse implementation at 52853c6a with this exact
-	// fixture and explicit metric policy; includes every serialized field.
-	const wantSHA = "0910d7fe9597707b58c50d594a33bdca75698ca5da0b29ce59a92243c0bcab46"
+	// Verify exact numerical parity with pre-reuse 52853c6a plus the three
+	// bv-apal.21 contract upgrades: non-null labels ([]), populated
+	// explanation.status.data_hash, and deterministic IssueID tie-breaking.
+	if len(got) != 10 {
+		t.Fatalf("len(got)=%d want 10", len(got))
+	}
+	if got[0].IssueID != "ROOT" || got[0].ImpactScore != 0.41725 || got[0].WhatIf == nil || got[0].WhatIf.DirectUnblocks != 539 || got[0].WhatIf.EstimatedDaysSaved != 67.375 {
+		t.Fatalf("ROOT recommendation drifted: %+v", got[0])
+	}
+	for i := 1; i < len(got); i++ {
+		wantID := fmt.Sprintf("DEPENDENT-%03d", i*5)
+		if got[i].IssueID != wantID || got[i].ImpactScore != 0.16072914549252842 {
+			t.Fatalf("got[%d]=(%s, %v) want (%s, 0.16072914549252842)", i, got[i].IssueID, got[i].ImpactScore, wantID)
+		}
+	}
+	for i, rec := range got {
+		if rec.Labels == nil || len(rec.Labels) != 0 {
+			t.Fatalf("got[%d].Labels=%#v want non-nil empty slice", i, rec.Labels)
+		}
+		if rec.Explanation.Status.DataHash == "" || !rec.Explanation.Status.Phase2Ready {
+			t.Fatalf("got[%d].Explanation.Status=%+v want non-empty data_hash and phase2_ready=true", i, rec.Explanation.Status)
+		}
+	}
+	const wantSHA = "12e5c9f104e215e36b10fefe1ebbc0df86954ad12f2f8decc48462cd269ed490"
 	if gotSHA := fmt.Sprintf("%x", sha256.Sum256(encoded)); gotSHA != wantSHA {
 		t.Fatalf("complete enhanced output SHA256=%s want %s\n%s", gotSHA, wantSHA, encoded)
 	}

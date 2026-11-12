@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"testing"
 )
@@ -185,6 +186,10 @@ func TestReleaseVersionSourcesStayAligned(t *testing.T) {
 		t.Fatalf("flake.nix version %q does not match fallback %q", got, want)
 	}
 
+	if strings.Contains(string(flake), "blob/v${bvVersion}/LICENSE") || strings.Contains(string(flake), "blob/v"+flakeVersion+"/LICENSE") {
+		t.Fatalf("flake.nix license URL must not reference potentially-untagged blob/v%s/LICENSE", flakeVersion)
+	}
+
 	goreleaser, err := os.ReadFile(filepath.Join(repoRoot, ".goreleaser.yaml"))
 	if err != nil {
 		t.Fatalf("read .goreleaser.yaml: %v", err)
@@ -192,5 +197,59 @@ func TestReleaseVersionSourcesStayAligned(t *testing.T) {
 	const injection = "pkg/version.version=v{{.Version}}"
 	if !strings.Contains(string(goreleaser), injection) {
 		t.Fatalf("GoReleaser must inject the validated version variable with %q", injection)
+	}
+}
+
+func TestResolveVersionDistinguishesDevFromSealedTag(t *testing.T) {
+	// 1. Explicit ldflags injection always wins (GoReleaser / Nix).
+	got := resolveVersion("0.26.1", &debug.BuildInfo{
+		Main: debug.Module{Version: "(devel)"},
+		Settings: []debug.BuildSetting{
+			{Key: "vcs.revision", Value: "548e5605f461deadbeef"},
+			{Key: "vcs.modified", Value: "false"},
+		},
+	}, true)
+	if got != "v0.26.1" {
+		t.Fatalf("injected release version got %q, want v0.26.1", got)
+	}
+
+	// 2. Tagged module install ("go install ...@v0.26.0") preserves exact tag.
+	got = resolveVersion("", &debug.BuildInfo{
+		Main: debug.Module{Version: "v0.26.0"},
+	}, true)
+	if got != "v0.26.0" {
+		t.Fatalf("tagged module version got %q, want v0.26.0", got)
+	}
+
+	// 3. Clean untagged VCS build reports <fallback>-dev+<shortrev>.
+	got = resolveVersion("", &debug.BuildInfo{
+		Main: debug.Module{Version: "(devel)"},
+		Settings: []debug.BuildSetting{
+			{Key: "vcs.revision", Value: "548e5605f461deadbeef"},
+			{Key: "vcs.modified", Value: "false"},
+		},
+	}, true)
+	want := fallback + "-dev+548e5605f461"
+	if got != want {
+		t.Fatalf("clean untagged VCS build got %q, want %q", got, want)
+	}
+
+	// 4. Dirty untagged VCS build appends .dirty.
+	got = resolveVersion("", &debug.BuildInfo{
+		Main: debug.Module{Version: "(devel)"},
+		Settings: []debug.BuildSetting{
+			{Key: "vcs.revision", Value: "548e5605f461deadbeef"},
+			{Key: "vcs.modified", Value: "true"},
+		},
+	}, true)
+	wantDirty := fallback + "-dev+548e5605f461.dirty"
+	if got != wantDirty {
+		t.Fatalf("dirty untagged VCS build got %q, want %q", got, wantDirty)
+	}
+
+	// 5. Missing build-info falls back cleanly to fallback.
+	got = resolveVersion("", nil, false)
+	if got != fallback {
+		t.Fatalf("missing build-info got %q, want %q", got, fallback)
 	}
 }

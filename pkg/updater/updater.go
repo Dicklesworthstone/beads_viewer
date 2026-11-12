@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/version"
 	"gopkg.in/yaml.v3"
 )
@@ -38,6 +39,13 @@ const (
 // maxExtractedBinaryBytes is a variable so tests can shrink the limit without
 // constructing large archives. Production keeps it aligned with maxDownloadBytes.
 var maxExtractedBinaryBytes int64 = maxDownloadBytes
+
+var (
+	updaterHTTPClientFactory = func(timeout time.Duration) *http.Client {
+		return &http.Client{Timeout: timeout}
+	}
+	getCurrentBinaryPath = GetCurrentBinaryPath
+)
 
 // Environment variables that control the updater's network behaviour.
 const (
@@ -96,13 +104,13 @@ func parseEnvBoolean(value string) (enabled, valid bool) {
 }
 
 func savedConfigDisabled() bool {
-	return os.Getenv(envNoSavedConfig) != ""
+	return env.NoSavedConfig.Get() != ""
 }
 
 // UserConfigDir returns bv's user configuration directory:
 // $XDG_CONFIG_HOME/bv when XDG_CONFIG_HOME is set, otherwise ~/.config/bv.
 func UserConfigDir() (string, error) {
-	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
+	if xdg := strings.TrimSpace(env.Get("XDG_CONFIG_HOME")); xdg != "" {
 		return filepath.Join(xdg, "bv"), nil
 	}
 	home, err := os.UserHomeDir()
@@ -151,11 +159,11 @@ func LoadPreferences() Preferences {
 	if cfg.Updates.UseToken != nil {
 		prefs.UseAmbientToken = *cfg.Updates.UseToken
 	}
-	if value := strings.TrimSpace(os.Getenv(EnvNoUpdateCheck)); value != "" {
+	if value := strings.TrimSpace(env.NoUpdateCheck.Get()); value != "" {
 		disabled, valid := parseEnvBoolean(value)
 		prefs.CheckOnStartup = valid && !disabled
 	}
-	if value := strings.TrimSpace(os.Getenv(EnvUseToken)); value != "" {
+	if value := strings.TrimSpace(env.UpdateUseToken.Get()); value != "" {
 		enabled, valid := parseEnvBoolean(value)
 		prefs.UseAmbientToken = valid && enabled
 	}
@@ -208,10 +216,10 @@ func RecordStartupDisclosure() error {
 // checking GITHUB_TOKEN first, then GH_TOKEN. Returns empty string if
 // neither is set.
 func ambientGitHubToken() string {
-	if tok := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); tok != "" {
+	if tok := strings.TrimSpace(env.Get("GITHUB_TOKEN")); tok != "" {
 		return tok
 	}
-	return strings.TrimSpace(os.Getenv("GH_TOKEN"))
+	return strings.TrimSpace(env.Get("GH_TOKEN"))
 }
 
 // githubToken returns the token to attach to GitHub requests, or "" when the
@@ -615,7 +623,7 @@ func compareVersions(v1, v2 string) int {
 
 // GetLatestRelease fetches full release info including assets
 func GetLatestRelease() (*Release, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := updaterHTTPClientFactory(30 * time.Second)
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/releases/latest", nil)
 	if err != nil {
 		return nil, err
@@ -939,20 +947,121 @@ func downloadReleaseAssetBytes(ctx context.Context, client *http.Client, asset *
 }
 
 func validateRemoteChecksumManifest(ctx context.Context, client *http.Client, release *Release) error {
+	_, err := verifyReleaseAssetChecksumEntryWithClient(ctx, client, release, "")
+	return err
+}
+
+// VerifyReleaseAssetChecksumEntry fetches the release's checksums.txt manifest
+// using the same origin, TLS, redirect, size, and SHA-256 metadata guards as
+// PerformUpdate, parses it, and verifies that a valid 64-hex SHA-256 entry
+// exists for assetName (or the current platform's selected archive asset when
+// assetName is empty). It fails closed if checksums.txt is unreachable, returns
+// an HTTP error, is malformed, disagrees with release metadata, or lacks the asset.
+func VerifyReleaseAssetChecksumEntry(release *Release, assetName string) (expectedSHA256 string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client := updaterHTTPClientFactory(30 * time.Second)
+	return verifyReleaseAssetChecksumEntryWithClient(ctx, client, release, assetName)
+}
+
+func verifyReleaseAssetChecksumEntryWithClient(ctx context.Context, client *http.Client, release *Release, assetName string) (string, error) {
 	_, checksumAsset, err := releaseAssetsForUpdate(release)
 	if err != nil {
-		return err
+		return "", err
 	}
 	data, err := downloadReleaseAssetBytes(ctx, client, checksumAsset, maxChecksumManifestBytes)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("fetch checksums.txt: %w", err)
 	}
 	checksums, err := parseChecksumData(data)
 	if err != nil {
-		return err
+		return "", fmt.Errorf("parse checksums.txt: %w", err)
 	}
-	_, _, err = checkedPlatformAsset(release, checksums)
-	return err
+	if len(checksums) == 0 {
+		return "", fmt.Errorf("checksums.txt contains no valid SHA-256 entries")
+	}
+
+	assetName = strings.TrimSpace(assetName)
+	if assetName == "" {
+		asset, assetDigest, err := checkedPlatformAsset(release, checksums)
+		if err != nil {
+			return "", err
+		}
+		if err := ensureNoMalformedChecksumLineForAsset(data, asset.Name); err != nil {
+			return "", err
+		}
+		return assetDigest, nil
+	}
+
+	cleanName, err := safeAssetName(assetName)
+	if err != nil {
+		return "", err
+	}
+	if err := ensureNoMalformedChecksumLineForAsset(data, cleanName); err != nil {
+		return "", err
+	}
+
+	var targetAsset *Asset
+	for i := range release.Assets {
+		if release.Assets[i].Name == cleanName {
+			targetAsset = &release.Assets[i]
+			break
+		}
+	}
+	if targetAsset == nil {
+		return "", fmt.Errorf("release %s does not contain asset %q", release.TagName, cleanName)
+	}
+	if err := validateReleaseAsset(release, targetAsset, "platform asset", maxDownloadBytes); err != nil {
+		return "", err
+	}
+
+	expectedHash, ok := checksums[cleanName]
+	if !ok {
+		return "", fmt.Errorf("checksums.txt has no valid SHA-256 entry for %s", cleanName)
+	}
+	if len(expectedHash) != sha256.Size*2 {
+		return "", fmt.Errorf("checksums.txt has invalid SHA-256 length %d for %s", len(expectedHash), cleanName)
+	}
+	if _, err := hex.DecodeString(expectedHash); err != nil {
+		return "", fmt.Errorf("checksums.txt has malformed SHA-256 digest for %s: %w", cleanName, err)
+	}
+	assetDigest, err := assetSHA256Digest(targetAsset)
+	if err != nil {
+		return "", err
+	}
+	if expectedHash != assetDigest {
+		return "", fmt.Errorf("checksums.txt digest for %s disagrees with GitHub release metadata", cleanName)
+	}
+	return expectedHash, nil
+}
+
+func ensureNoMalformedChecksumLineForAsset(data []byte, assetName string) error {
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			if line == assetName {
+				return fmt.Errorf("malformed checksum entry for %s", assetName)
+			}
+			continue
+		}
+		rawHash := parts[0]
+		filename := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line[len(rawHash):]), "*"))
+		if filename != assetName && strings.TrimSpace(line[len(rawHash):]) != assetName {
+			continue
+		}
+		hash := strings.ToLower(rawHash)
+		if len(hash) != sha256.Size*2 {
+			return fmt.Errorf("malformed SHA-256 digest length %d for %s", len(hash), assetName)
+		}
+		if _, err := hex.DecodeString(hash); err != nil {
+			return fmt.Errorf("malformed SHA-256 digest for %s: %w", assetName, err)
+		}
+	}
+	return nil
 }
 
 // downloadFile downloads a file from URL to a local path.
@@ -967,9 +1076,7 @@ func downloadFile(url, destPath string, expectedSize int64) error {
 		return fmt.Errorf("download size %d exceeds maximum %d", expectedSize, maxDownloadBytes)
 	}
 
-	client := &http.Client{
-		Timeout: 5 * time.Minute,
-	}
+	client := updaterHTTPClientFactory(5 * time.Minute)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -1199,6 +1306,29 @@ func extractBinaryFromZip(archivePath, destPath string) error {
 }
 
 func copyExtractedBinary(src io.Reader, destPath string, declaredSize int64) error {
+	if err := validateExtractedSizeBounds(declaredSize); err != nil {
+		return err
+	}
+
+	out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return fmt.Errorf("failed to create binary: %w", err)
+	}
+
+	writeErr := writeBoundedBinaryToFile(src, out)
+	closeErr := out.Close()
+	if writeErr != nil {
+		_ = os.Remove(destPath)
+		return writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(destPath)
+		return fmt.Errorf("failed to flush extracted binary: %w", closeErr)
+	}
+	return nil
+}
+
+func validateExtractedSizeBounds(declaredSize int64) error {
 	if maxExtractedBinaryBytes < 0 {
 		return fmt.Errorf("extracted binary size limit cannot be negative: %d", maxExtractedBinaryBytes)
 	}
@@ -1208,24 +1338,99 @@ func copyExtractedBinary(src io.Reader, destPath string, declaredSize int64) err
 	if declaredSize > maxExtractedBinaryBytes {
 		return fmt.Errorf("extracted binary size %d exceeds maximum %d", declaredSize, maxExtractedBinaryBytes)
 	}
+	return nil
+}
 
-	out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-	if err != nil {
-		return fmt.Errorf("failed to create binary: %w", err)
-	}
-
+func writeBoundedBinaryToFile(src io.Reader, out *os.File) error {
 	n, copyErr := io.Copy(out, io.LimitReader(src, maxExtractedBinaryBytes+1))
-	closeErr := out.Close()
 	if copyErr != nil {
 		return fmt.Errorf("failed to extract binary: %w", copyErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("failed to flush extracted binary: %w", closeErr)
 	}
 	if n > maxExtractedBinaryBytes {
 		return fmt.Errorf("extracted binary exceeds maximum size %d", maxExtractedBinaryBytes)
 	}
 	return nil
+}
+
+func extractBinaryToStagedFile(archivePath string, stagedFile *os.File) error {
+	if strings.EqualFold(filepath.Ext(archivePath), ".zip") {
+		return extractBinaryFromZipToStagedFile(archivePath, stagedFile)
+	}
+	return extractBinaryFromTarGzToStagedFile(archivePath, stagedFile)
+}
+
+func extractBinaryFromTarGzToStagedFile(archivePath string, stagedFile *os.File) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("tar read error: %w", err)
+		}
+		name := filepath.Base(header.Name)
+		if name == "bv" || name == "bv.exe" {
+			if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+				continue
+			}
+			if err := validateExtractedSizeBounds(header.Size); err != nil {
+				return err
+			}
+			return writeBoundedBinaryToFile(tr, stagedFile)
+		}
+	}
+	return fmt.Errorf("binary not found in archive")
+}
+
+func extractBinaryFromZipToStagedFile(archivePath string, stagedFile *os.File) error {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return fmt.Errorf("failed to open zip archive: %w", err)
+	}
+	defer zr.Close()
+
+	for _, file := range zr.File {
+		name := filepath.Base(file.Name)
+		if name != "bv" && name != "bv.exe" {
+			continue
+		}
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		if maxExtractedBinaryBytes < 0 {
+			return fmt.Errorf("extracted binary size limit cannot be negative: %d", maxExtractedBinaryBytes)
+		}
+		if file.UncompressedSize64 > uint64(maxExtractedBinaryBytes) {
+			return fmt.Errorf("extracted binary size %d exceeds maximum %d", file.UncompressedSize64, maxExtractedBinaryBytes)
+		}
+		src, err := file.Open()
+		if err != nil {
+			return fmt.Errorf("failed to open zipped binary: %w", err)
+		}
+		writeErr := writeBoundedBinaryToFile(src, stagedFile)
+		closeErr := src.Close()
+		if writeErr != nil {
+			return writeErr
+		}
+		if closeErr != nil {
+			return fmt.Errorf("failed to close zipped binary: %w", closeErr)
+		}
+		return nil
+	}
+	return fmt.Errorf("binary not found in archive")
 }
 
 // GetCurrentBinaryPath returns the path to the currently running binary
@@ -1291,7 +1496,7 @@ func PerformUpdate(release *Release, progress io.Writer) (*UpdateResult, error) 
 	}
 
 	// Get current binary path
-	binaryPath, err := GetCurrentBinaryPath()
+	binaryPath, err := getCurrentBinaryPath()
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine binary path: %w", err)
 	}
@@ -1350,69 +1555,137 @@ func PerformUpdate(release *Release, progress io.Writer) (*UpdateResult, error) 
 		return nil, fmt.Errorf("checksum verification failed: %w", err)
 	}
 
-	// Extract binary to temp location
-	newBinaryPath := filepath.Join(tmpDir, "bv-new")
+	// Stage extracted binary inside binaryDir on the SAME filesystem as binaryPath
+	// so os.Rename onto binaryPath is guaranteed atomic without EXDEV copy fallback.
+	stagePattern := ".bv-update-*"
 	if runtime.GOOS == "windows" {
-		newBinaryPath += ".exe"
+		stagePattern = ".bv-update-*.exe"
 	}
+	stagedFile, err := os.CreateTemp(binaryDir, stagePattern)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create staged binary in %s: %w", binaryDir, err)
+	}
+	stagedPath := stagedFile.Name()
+	stagedCommitted := false
+	defer func() {
+		if !stagedCommitted {
+			_ = os.Remove(stagedPath)
+		}
+	}()
+
 	fmt.Fprintln(progress, "Extracting...")
-	if err := extractBinary(archivePath, newBinaryPath); err != nil {
+	if err := extractBinaryToStagedFile(archivePath, stagedFile); err != nil {
+		_ = stagedFile.Close()
 		return nil, fmt.Errorf("extraction failed: %w", err)
 	}
+	if err := stagedFile.Chmod(0o755); err != nil {
+		_ = stagedFile.Close()
+		return nil, fmt.Errorf("failed to set executable permissions on staged binary: %w", err)
+	}
+	if err := stagedFile.Sync(); err != nil {
+		_ = stagedFile.Close()
+		return nil, fmt.Errorf("failed to sync staged binary: %w", err)
+	}
+	if err := stagedFile.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close staged binary: %w", err)
+	}
 
-	// Verify new binary works
+	// Verify new binary works before touching current binary or backup
 	fmt.Fprintln(progress, "Verifying new binary...")
-	if err := verifyBinaryVersion(newBinaryPath, release.TagName); err != nil {
+	if err := verifyBinaryVersion(stagedPath, release.TagName); err != nil {
 		return nil, fmt.Errorf("new binary verification failed: %w", err)
 	}
 
-	// Create backup of current binary
+	// Create backup of current binary atomically in the same directory
 	backupPath := GetBackupPath(binaryPath)
 	fmt.Fprintf(progress, "Backing up current binary to %s...\n", backupPath)
-
-	// Move the current binary out of the way. This avoids ETXTBSY on Linux
-	// and "file in use" errors on Windows when writing the new binary.
-	// If a backup already exists and rename cannot replace it, fall back to
-	// copyFile so the previous backup is not removed before a fresh backup
-	// is successfully written.
-	movedForBackup := false
-	if err := os.Rename(binaryPath, backupPath); err == nil {
-		movedForBackup = true
-	} else if err := copyFile(binaryPath, backupPath); err != nil {
+	if err := atomicCopyRegularFileInDir(binaryPath, backupPath, ".bv-backup-*"); err != nil {
 		return nil, fmt.Errorf("backup failed: %w", err)
 	}
 	result.BackupPath = backupPath
 
-	// Replace binary
+	// Atomically replace binaryPath on the same filesystem
 	fmt.Fprintln(progress, "Installing new version...")
-	if err := os.Rename(newBinaryPath, binaryPath); err != nil {
-		// If binaryPath still exists (copy fallback above), try to remove it first
-		if !movedForBackup {
-			_ = os.Remove(binaryPath)
-		}
-		// On some systems, rename across filesystems doesn't work
-		if err := copyFile(newBinaryPath, binaryPath); err != nil {
-			// Restore from backup
-			restoreErr := os.Rename(backupPath, binaryPath)
-			if restoreErr != nil {
-				restoreErr = copyFile(backupPath, binaryPath)
-			}
-			if restoreErr != nil {
-				return nil, fmt.Errorf("installation failed: %w (restore also failed: %v; manual recovery: mv %s %s)", err, restoreErr, backupPath, binaryPath)
-			}
-			return nil, fmt.Errorf("installation failed (restored from backup): %w", err)
-		}
+	if err := atomicRenameOverExecutable(stagedPath, binaryPath); err != nil {
+		return nil, fmt.Errorf("installation failed: %w", err)
 	}
-
-	// Ensure executable permissions
-	if err := os.Chmod(binaryPath, 0755); err != nil {
-		// Not fatal, but log it
-		fmt.Fprintf(progress, "Warning: could not set permissions: %v\n", err)
-	}
+	stagedCommitted = true
 
 	result.Success = true
 	result.Message = fmt.Sprintf("Successfully updated from %s to %s", version.Version, release.TagName)
 	return result, nil
+}
+
+func atomicCopyRegularFileInDir(srcPath, dstPath, tempPattern string) error {
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	info, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("source %s is not a regular file", srcPath)
+	}
+
+	dstDir := filepath.Dir(dstPath)
+	tmpFile, err := os.CreateTemp(dstDir, tempPattern)
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := io.Copy(tmpFile, srcFile); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Chmod(info.Mode().Perm()); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, dstPath); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func atomicRenameOverExecutable(stagedPath, binaryPath string) error {
+	if err := os.Rename(stagedPath, binaryPath); err == nil {
+		return nil
+	} else if runtime.GOOS != "windows" {
+		return err
+	}
+
+	// On Windows, replacing a running executable in-place requires moving the
+	// running binary's directory entry aside first on the same volume.
+	oldPath := binaryPath + ".old"
+	_ = os.Remove(oldPath)
+	if moveErr := os.Rename(binaryPath, oldPath); moveErr != nil {
+		return moveErr
+	}
+	if renameErr := os.Rename(stagedPath, binaryPath); renameErr != nil {
+		_ = os.Rename(oldPath, binaryPath)
+		return renameErr
+	}
+	_ = os.Remove(oldPath)
+	return nil
 }
 
 // copyFile copies a file from src to dst
@@ -1509,45 +1782,126 @@ func verifyBinaryVersion(binaryPath, expectedVersion string) error {
 	return nil
 }
 
-// Rollback restores the previous version from backup
+const rollbackSmokeProbeTimeout = 5 * time.Second
+
+func smokeProbeBinaryVersion(binaryPath string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var stdout limitedOutputBuffer
+	var stderr limitedOutputBuffer
+	cmd := osExec.CommandContext(ctx, binaryPath, "--version")
+	cmd.WaitDelay = time.Second
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("backup --version smoke probe timed out: %w", ctx.Err())
+		}
+		return fmt.Errorf("backup --version smoke probe failed: %w (stderr: %q)", err, strings.TrimSpace(stderr.data.String()))
+	}
+	if stdout.truncated {
+		return fmt.Errorf("backup --version output exceeds %d bytes", maxBinaryVersionOutputBytes)
+	}
+	return nil
+}
+
+// Rollback restores the previous version from backup after validating that the
+// backup is a non-empty regular executable file whose --version smoke probe exits 0.
 func Rollback() error {
-	binaryPath, err := GetCurrentBinaryPath()
+	binaryPath, err := getCurrentBinaryPath()
 	if err != nil {
 		return fmt.Errorf("cannot determine binary path: %w", err)
 	}
 
 	backupPath := GetBackupPath(binaryPath)
-	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
-		return fmt.Errorf("no backup found at %s", backupPath)
+	lstatInfo, err := os.Lstat(backupPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("no backup found at %s", backupPath)
+		}
+		return fmt.Errorf("inspect backup at %s: %w", backupPath, err)
+	}
+	if lstatInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing rollback from %s: backup is a symlink", backupPath)
+	}
+	if !lstatInfo.Mode().IsRegular() {
+		return fmt.Errorf("refusing rollback from %s: backup is not a regular file (%s)", backupPath, lstatInfo.Mode())
+	}
+	if lstatInfo.Size() <= 0 {
+		return fmt.Errorf("refusing rollback from %s: backup file is empty", backupPath)
+	}
+	if runtime.GOOS != "windows" && lstatInfo.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("refusing rollback from %s: backup file is not executable (mode %o)", backupPath, lstatInfo.Mode().Perm())
+	}
+
+	backupFile, err := os.Open(backupPath)
+	if err != nil {
+		return fmt.Errorf("open backup at %s: %w", backupPath, err)
+	}
+	defer backupFile.Close()
+
+	openInfo, err := backupFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat opened backup at %s: %w", backupPath, err)
+	}
+	if !os.SameFile(lstatInfo, openInfo) || !openInfo.Mode().IsRegular() || openInfo.Size() <= 0 {
+		return fmt.Errorf("refusing rollback from %s: backup changed during validation", backupPath)
+	}
+
+	binaryDir := filepath.Dir(binaryPath)
+	stagePattern := ".bv-rollback-*"
+	if runtime.GOOS == "windows" {
+		stagePattern = ".bv-rollback-*.exe"
+	}
+	stagedFile, err := os.CreateTemp(binaryDir, stagePattern)
+	if err != nil {
+		return fmt.Errorf("stage rollback binary in %s: %w", binaryDir, err)
+	}
+	stagedPath := stagedFile.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(stagedPath)
+		}
+	}()
+
+	if n, err := io.Copy(stagedFile, io.LimitReader(backupFile, maxExtractedBinaryBytes+1)); err != nil {
+		_ = stagedFile.Close()
+		return fmt.Errorf("copy backup to staged binary: %w", err)
+	} else if n <= 0 || n > maxExtractedBinaryBytes {
+		_ = stagedFile.Close()
+		return fmt.Errorf("invalid backup size %d bytes", n)
+	}
+
+	mode := openInfo.Mode().Perm()
+	if runtime.GOOS != "windows" && mode&0o111 == 0 {
+		_ = stagedFile.Close()
+		return fmt.Errorf("refusing rollback from %s: backup file is not executable", backupPath)
+	}
+	if err := stagedFile.Chmod(mode); err != nil {
+		_ = stagedFile.Close()
+		return fmt.Errorf("chmod staged rollback binary: %w", err)
+	}
+	if err := stagedFile.Sync(); err != nil {
+		_ = stagedFile.Close()
+		return fmt.Errorf("sync staged rollback binary: %w", err)
+	}
+	if err := stagedFile.Close(); err != nil {
+		return fmt.Errorf("close staged rollback binary: %w", err)
+	}
+
+	// Smoke-probe the exact staged inode before touching binaryPath.
+	if err := smokeProbeBinaryVersion(stagedPath, rollbackSmokeProbeTimeout); err != nil {
+		return fmt.Errorf("refusing rollback from %s: %w", backupPath, err)
 	}
 
 	fmt.Printf("Rolling back from backup at %s...\n", backupPath)
-
-	// Move the currently running binary out of the way to avoid ETXTBSY / file-in-use
-	badPath := binaryPath + ".bad"
-	_ = os.Remove(badPath)
-	movedToBad := false
-	if err := os.Rename(binaryPath, badPath); err == nil {
-		movedToBad = true
+	if err := atomicRenameOverExecutable(stagedPath, binaryPath); err != nil {
+		return fmt.Errorf("rollback failed: %w", err)
 	}
-
-	if err := os.Rename(backupPath, binaryPath); err != nil {
-		if !movedToBad {
-			_ = os.Remove(binaryPath)
-		}
-		if copyErr := copyFile(backupPath, binaryPath); copyErr != nil {
-			// Try to restore the bad binary if rollback completely failed
-			if movedToBad {
-				_ = os.Rename(badPath, binaryPath)
-			}
-			return fmt.Errorf("rollback failed: %w", copyErr)
-		}
-	}
-
-	// Clean up the bad binary if we successfully renamed it out of the way
-	if movedToBad {
-		_ = os.Remove(badPath) // May fail on Windows if it's currently executing, but that's fine
-	}
+	committed = true
+	_ = backupFile.Close()
+	_ = os.Remove(backupPath)
 
 	fmt.Println("Rollback complete")
 	return nil

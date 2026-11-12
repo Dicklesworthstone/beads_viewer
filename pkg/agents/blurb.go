@@ -12,10 +12,10 @@ import (
 
 // BlurbVersion is the current version of the agent instructions blurb.
 // Increment this whenever the instructions change so installed blocks refresh.
-const BlurbVersion = 7
+const BlurbVersion = 8
 
 // BlurbStartMarker marks the beginning of injected agent instructions.
-const BlurbStartMarker = "<!-- bv-agent-instructions-v7 -->"
+const BlurbStartMarker = "<!-- bv-agent-instructions-v8 -->"
 
 // BlurbEndMarker marks the end of injected agent instructions.
 const BlurbEndMarker = "<!-- end-bv-agent-instructions -->"
@@ -23,10 +23,11 @@ const BlurbEndMarker = "<!-- end-bv-agent-instructions -->"
 const blurbStartPrefix = "<!-- bv-agent-instructions-v"
 
 // AgentBlurb contains the instructions to be appended to AGENTS.md files.
-// This is the v7 blurb: v6 plus explicit robot output-format exceptions.
+// This is the v8 blurb: ready-by-default triage recommendations plus
+// --robot-include-inactive guidance.
 // Bump the version whenever the text
 // changes: --agents-add refreshes installed blocks by version, not content.
-const AgentBlurb = `<!-- bv-agent-instructions-v7 -->
+const AgentBlurb = `<!-- bv-agent-instructions-v8 -->
 
 ---
 
@@ -69,7 +70,7 @@ bv --robot-graph --format toon
 bv --robot-triage --format toon --stats
 ` + "```" + `
 
-Recommendations can include blocked or assigned work; ` + "`" + `triage.quick_ref.top_picks` + "`" + ` reflects snapshot readiness. A suggested action records its original local ID, working directory, and tracker route. Use that route rather than a namespaced display ID or an unrelated current directory. Inspect current tracker state before execution: analysis does not reserve work or guarantee that a later claim succeeds.
+By default, ` + "`" + `triage.recommendations` + "`" + ` and ` + "`" + `triage.quick_ref.top_picks` + "`" + ` surface ready, actionable leaf work (pass ` + "`" + `--robot-include-inactive` + "`" + ` to inspect blocked, deferred, parked, or umbrella epic items; assigned ` + "`" + `in_progress` + "`" + ` items remain marked ` + "`" + `claimable=false` + "`" + `). A suggested action records its original local ID, working directory, and tracker route. Use that route rather than a namespaced display ID or an unrelated current directory. Inspect current tracker state before execution: analysis does not reserve work or guarantee that a later claim succeeds.
 
 #### Other bv Commands
 
@@ -79,8 +80,10 @@ Recommendations can include blocked or assigned work; ` + "`" + `triage.quick_re
 | ` + "`" + `--robot-priority` + "`" + ` | Priority misalignment detection with confidence |
 | ` + "`" + `--robot-insights` + "`" + ` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core |
 | ` + "`" + `--robot-alerts` + "`" + ` | Stale issues, blocking cascades, priority mismatches |
+| ` + "`" + `--check-drift --robot-drift` + "`" + ` | Baseline drift evaluation + live issue health alerts |
 | ` + "`" + `--robot-suggest` + "`" + ` | Hygiene: duplicates, missing deps, label suggestions, cycle breaks |
 | ` + "`" + `--robot-diff --diff-since <ref>` + "`" + ` | Changes since ref: new/closed/modified issues |
+| ` + "`" + `--bead-history <id>` + "`" + ` | Single-bead lifecycle events and correlated git commits |
 | ` + "`" + `--robot-graph [--graph-format=json\|dot\|mermaid]` + "`" + ` | Dependency graph export |
 
 Robot analysis commands default to JSON; ` + "`" + `--format toon` + "`" + ` selects TOON, and ` + "`" + `--robot-help` + "`" + ` defaults to text. In JSON mode, ` + "`" + `--graph-format=dot` + "`" + ` or ` + "`" + `mermaid` + "`" + ` puts diagram text in the ` + "`" + `graph` + "`" + ` field (` + "`" + `bv --robot-graph --graph-format=dot | jq -r .graph` + "`" + `).

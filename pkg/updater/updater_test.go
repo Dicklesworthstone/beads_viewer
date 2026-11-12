@@ -1,7 +1,22 @@
 package updater
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 // ============================================================================
@@ -418,4 +433,413 @@ func TestCompareVersions_SemVerNumericIdentifiers(t *testing.T) {
 	if got != expected {
 		t.Errorf("compareVersions(%q, %q) = %d; want %d (numeric prerelease comparison failure)", v1, v2, got, expected)
 	}
+}
+
+func installMockUpdaterDownloads(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	target, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	origFactory := updaterHTTPClientFactory
+	updaterHTTPClientFactory = func(timeout time.Duration) *http.Client {
+		client := srv.Client()
+		client.Timeout = timeout
+		base := client.Transport
+		if base == nil {
+			base = http.DefaultTransport
+		}
+		client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			clone := req.Clone(req.Context())
+			clonedURL := *req.URL
+			clone.URL = &clonedURL
+			if req.URL.Hostname() == "github.com" && strings.HasPrefix(req.URL.Path, "/Dicklesworthstone/beads_viewer/releases/download/") {
+				clone.URL.Scheme = target.Scheme
+				clone.URL.Host = target.Host
+			}
+			return base.RoundTrip(clone)
+		})
+		return client
+	}
+	t.Cleanup(func() {
+		updaterHTTPClientFactory = origFactory
+	})
+}
+
+func buildTestReleaseArchiveBytes(t *testing.T, binaryPayload []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if runtime.GOOS == "windows" {
+		zw := zip.NewWriter(&buf)
+		w, err := zw.Create("bv.exe")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(binaryPayload); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "bv",
+		Mode: 0o755,
+		Size: int64(len(binaryPayload)),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(binaryPayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestVerifyReleaseAssetChecksumEntry(t *testing.T) {
+	const tag = "v99.0.0"
+	assetName := getAssetName(tag)
+	wantDigest := strings.Repeat("a", 64)
+
+	makeReleaseWithChecksum := func(checksumBody string) *Release {
+		checksumSum := sha256.Sum256([]byte(checksumBody))
+		return &Release{
+			TagName: tag,
+			HTMLURL: "https://github.com/Dicklesworthstone/beads_viewer/releases/tag/" + tag,
+			Assets: []Asset{
+				{
+					Name:               assetName,
+					BrowserDownloadURL: "https://github.com/Dicklesworthstone/beads_viewer/releases/download/" + tag + "/" + assetName,
+					Size:               1024,
+					Digest:             "sha256:" + wantDigest,
+					State:              "uploaded",
+				},
+				{
+					Name:               "checksums.txt",
+					BrowserDownloadURL: "https://github.com/Dicklesworthstone/beads_viewer/releases/download/" + tag + "/checksums.txt",
+					Size:               int64(len(checksumBody)),
+					Digest:             "sha256:" + hex.EncodeToString(checksumSum[:]),
+					State:              "uploaded",
+				},
+			},
+		}
+	}
+
+	t.Run("valid_checksums_txt", func(t *testing.T) {
+		body := fmt.Sprintf("%s  %s\n%s  other_asset.tar.gz\n", wantDigest, assetName, strings.Repeat("b", 64))
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/checksums.txt") {
+				_, _ = w.Write([]byte(body))
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer srv.Close()
+		installMockUpdaterDownloads(t, srv)
+
+		rel := makeReleaseWithChecksum(body)
+		got, err := VerifyReleaseAssetChecksumEntry(rel, assetName)
+		if err != nil {
+			t.Fatalf("VerifyReleaseAssetChecksumEntry valid failed: %v", err)
+		}
+		if got != wantDigest {
+			t.Fatalf("expected digest %s, got %s", wantDigest, got)
+		}
+
+		gotAuto, err := VerifyReleaseAssetChecksumEntry(rel, "")
+		if err != nil || gotAuto != wantDigest {
+			t.Fatalf("VerifyReleaseAssetChecksumEntry auto asset = (%q, %v), want (%q, nil)", gotAuto, err, wantDigest)
+		}
+	})
+
+	t.Run("http_404_fails_closed", func(t *testing.T) {
+		body := fmt.Sprintf("%s  %s\n", wantDigest, assetName)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		}))
+		defer srv.Close()
+		installMockUpdaterDownloads(t, srv)
+
+		if _, err := VerifyReleaseAssetChecksumEntry(makeReleaseWithChecksum(body), assetName); err == nil {
+			t.Fatal("expected HTTP 404 on checksums.txt to fail closed")
+		}
+	})
+
+	t.Run("missing_asset_entry_fails_closed", func(t *testing.T) {
+		body := fmt.Sprintf("%s  unrelated_platform.tar.gz\n", strings.Repeat("b", 64))
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		defer srv.Close()
+		installMockUpdaterDownloads(t, srv)
+
+		if _, err := VerifyReleaseAssetChecksumEntry(makeReleaseWithChecksum(body), assetName); err == nil {
+			t.Fatal("expected missing asset entry in checksums.txt to fail closed")
+		}
+	})
+
+	t.Run("malformed_digest_fails_closed", func(t *testing.T) {
+		body := fmt.Sprintf("not-a-64-hex-sha256  %s\n%s  other.tar.gz\n", assetName, strings.Repeat("c", 64))
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(body))
+		}))
+		defer srv.Close()
+		installMockUpdaterDownloads(t, srv)
+
+		if _, err := VerifyReleaseAssetChecksumEntry(makeReleaseWithChecksum(body), assetName); err == nil {
+			t.Fatal("expected malformed digest in checksums.txt to fail closed")
+		}
+	})
+}
+
+func assertNoUpdaterStageRemnants(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".bv-update-") || strings.HasPrefix(name, ".bv-backup-") || strings.HasPrefix(name, ".bv-rollback-") {
+			t.Fatalf("unexpected leftover updater temp file %q in %s", name, dir)
+		}
+	}
+}
+
+func TestPerformUpdate_StagesInBinaryDirAndCleansUp(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script mock binary test runs on Unix")
+	}
+
+	const tag = "v99.0.0"
+	assetName := getAssetName(tag)
+
+	runScenario := func(t *testing.T, candidateScript string, wantErr bool) {
+		t.Helper()
+		binaryDir := t.TempDir()
+		execPath := filepath.Join(binaryDir, "bv")
+		originalScript := []byte("#!/bin/sh\necho 'bv v0.26.1'\n")
+		if err := os.WriteFile(execPath, originalScript, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		origGetBin := getCurrentBinaryPath
+		getCurrentBinaryPath = func() (string, error) { return execPath, nil }
+		t.Cleanup(func() { getCurrentBinaryPath = origGetBin })
+
+		archiveBytes := buildTestReleaseArchiveBytes(t, []byte(candidateScript))
+		archiveSum := sha256.Sum256(archiveBytes)
+		archiveDigest := hex.EncodeToString(archiveSum[:])
+		checksumBody := fmt.Sprintf("%s  %s\n", archiveDigest, assetName)
+		checksumSum := sha256.Sum256([]byte(checksumBody))
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/checksums.txt"):
+				_, _ = w.Write([]byte(checksumBody))
+			case strings.HasSuffix(r.URL.Path, "/"+assetName):
+				_, _ = w.Write(archiveBytes)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+		installMockUpdaterDownloads(t, srv)
+
+		rel := &Release{
+			TagName: tag,
+			HTMLURL: "https://github.com/Dicklesworthstone/beads_viewer/releases/tag/" + tag,
+			Assets: []Asset{
+				{
+					Name:               assetName,
+					BrowserDownloadURL: "https://github.com/Dicklesworthstone/beads_viewer/releases/download/" + tag + "/" + assetName,
+					Size:               int64(len(archiveBytes)),
+					Digest:             "sha256:" + archiveDigest,
+					State:              "uploaded",
+				},
+				{
+					Name:               "checksums.txt",
+					BrowserDownloadURL: "https://github.com/Dicklesworthstone/beads_viewer/releases/download/" + tag + "/checksums.txt",
+					Size:               int64(len(checksumBody)),
+					Digest:             "sha256:" + hex.EncodeToString(checksumSum[:]),
+					State:              "uploaded",
+				},
+			},
+		}
+
+		res, err := PerformUpdate(rel, nil)
+		assertNoUpdaterStageRemnants(t, binaryDir)
+
+		if wantErr {
+			if err == nil {
+				t.Fatal("expected PerformUpdate to fail verification")
+			}
+			gotExec, readErr := os.ReadFile(execPath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !bytes.Equal(gotExec, originalScript) {
+				t.Fatalf("failed PerformUpdate modified existing executable: got %q, want %q", gotExec, originalScript)
+			}
+			return
+		}
+
+		if err != nil {
+			t.Fatalf("PerformUpdate failed: %v", err)
+		}
+		if res == nil || !res.Success {
+			t.Fatalf("unexpected UpdateResult: %#v", res)
+		}
+		gotExec, err := os.ReadFile(execPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotExec) != candidateScript {
+			t.Fatalf("updated binary content = %q, want %q", gotExec, candidateScript)
+		}
+		gotBackup, err := os.ReadFile(GetBackupPath(execPath))
+		if err != nil {
+			t.Fatalf("expected backup file: %v", err)
+		}
+		if !bytes.Equal(gotBackup, originalScript) {
+			t.Fatalf("backup content = %q, want %q", gotBackup, originalScript)
+		}
+	}
+
+	t.Run("success_stages_and_replaces_atomically", func(t *testing.T) {
+		// Verify the candidate script ran from inside binaryDir ($0 starts with binaryDir+"/.bv-update-")
+		candidate := "#!/bin/sh\ncase \"$0\" in\n  */.bv-update-*|*/bv) echo 'bv v99.0.0'; exit 0 ;;\n  *) echo 'staged outside binaryDir' >&2; exit 2 ;;\nesac\n"
+		runScenario(t, candidate, false)
+	})
+
+	t.Run("verification_failure_leaves_zero_remnants_and_preserves_binary", func(t *testing.T) {
+		corruptCandidate := "#!/bin/sh\necho 'broken binary' >&2\nexit 1\n"
+		runScenario(t, corruptCandidate, true)
+	})
+}
+
+func TestRollback_ValidatesBackupBeforeReplacingExecutable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script mock binary test runs on Unix")
+	}
+
+	setupExec := func(t *testing.T) (dir, execPath, backupPath string, workingBytes []byte) {
+		t.Helper()
+		dir = t.TempDir()
+		execPath = filepath.Join(dir, "bv")
+		backupPath = GetBackupPath(execPath)
+		workingBytes = []byte("#!/bin/sh\necho 'bv v0.26.1'\n")
+		if err := os.WriteFile(execPath, workingBytes, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		origGetBin := getCurrentBinaryPath
+		getCurrentBinaryPath = func() (string, error) { return execPath, nil }
+		t.Cleanup(func() { getCurrentBinaryPath = origGetBin })
+		return dir, execPath, backupPath, workingBytes
+	}
+
+	assertExecIntact := func(t *testing.T, dir, execPath string, workingBytes []byte) {
+		t.Helper()
+		got, err := os.ReadFile(execPath)
+		if err != nil {
+			t.Fatalf("read working executable: %v", err)
+		}
+		if !bytes.Equal(got, workingBytes) {
+			t.Fatalf("working executable was corrupted by rejected Rollback: got %q, want %q", got, workingBytes)
+		}
+		assertNoUpdaterStageRemnants(t, dir)
+	}
+
+	t.Run("rejects_symlink_backup", func(t *testing.T) {
+		dir, execPath, backupPath, workingBytes := setupExec(t)
+		target := filepath.Join(dir, "elsewhere.bin")
+		if err := os.WriteFile(target, []byte("#!/bin/sh\necho 'bv v0.25.0'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, backupPath); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Rollback(); err == nil || !strings.Contains(err.Error(), "symlink") {
+			t.Fatalf("expected symlink backup rejection, got %v", err)
+		}
+		assertExecIntact(t, dir, execPath, workingBytes)
+	})
+
+	t.Run("rejects_zero_byte_backup", func(t *testing.T) {
+		dir, execPath, backupPath, workingBytes := setupExec(t)
+		if err := os.WriteFile(backupPath, nil, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Rollback(); err == nil || !strings.Contains(err.Error(), "empty") {
+			t.Fatalf("expected 0-byte backup rejection, got %v", err)
+		}
+		assertExecIntact(t, dir, execPath, workingBytes)
+	})
+
+	t.Run("rejects_non_executable_backup", func(t *testing.T) {
+		dir, execPath, backupPath, workingBytes := setupExec(t)
+		if err := os.WriteFile(backupPath, []byte("#!/bin/sh\necho 'bv v0.25.0'\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Rollback(); err == nil || !strings.Contains(err.Error(), "not executable") {
+			t.Fatalf("expected non-executable backup rejection, got %v", err)
+		}
+		assertExecIntact(t, dir, execPath, workingBytes)
+	})
+
+	t.Run("rejects_corrupt_or_nonzero_exiting_backup", func(t *testing.T) {
+		dir, execPath, backupPath, workingBytes := setupExec(t)
+		if err := os.WriteFile(backupPath, []byte("#!/bin/sh\necho 'segfault' >&2\nexit 42\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Rollback(); err == nil || !strings.Contains(err.Error(), "smoke probe failed") {
+			t.Fatalf("expected non-zero --version backup rejection, got %v", err)
+		}
+		assertExecIntact(t, dir, execPath, workingBytes)
+	})
+
+	t.Run("succeeds_on_valid_executable_backup", func(t *testing.T) {
+		dir, execPath, backupPath, _ := setupExec(t)
+		validBackup := []byte("#!/bin/sh\necho 'bv v0.25.0'\n")
+		if err := os.WriteFile(backupPath, validBackup, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beforeInfo, err := os.Stat(execPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := Rollback(); err != nil {
+			t.Fatalf("expected valid Rollback to succeed, got %v", err)
+		}
+		assertNoUpdaterStageRemnants(t, dir)
+
+		got, err := os.ReadFile(execPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, validBackup) {
+			t.Fatalf("restored binary = %q, want %q", got, validBackup)
+		}
+		afterInfo, err := os.Stat(execPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(beforeInfo, afterInfo) {
+			t.Fatal("expected Rollback to replace executable via atomic rename onto a new inode")
+		}
+	})
 }

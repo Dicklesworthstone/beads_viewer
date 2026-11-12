@@ -262,8 +262,14 @@ var (
 
 	SkipPhase2 = register(Var{
 		Name:        "BV_SKIP_PHASE2",
-		Description: "Skip Phase 2 graph metrics (centrality, cycles, critical path) (`1`/`0`).",
+		Description: "Skip all Phase 2 graph metrics (centrality, cycles, critical path, k-core, articulation points, slack) (`1`/`0`).",
 		Default:     "(disabled)",
+	})
+
+	SourceDateEpoch = register(Var{
+		Name:        "SOURCE_DATE_EPOCH",
+		Description: "Unix epoch timestamp (seconds) pinning robot report timestamps and running timeout-raced metrics to deterministic completion.",
+		Default:     "(unset)",
 	})
 
 	TestMode = register(Var{
@@ -276,6 +282,30 @@ var (
 		Name:        "BV_THEME",
 		Description: "Pin the TUI palette: `light` or `dark` (overridden by `--theme`).",
 		Default:     "(auto-detect)",
+	})
+
+	ToonDefaultFormat = register(Var{
+		Name:        "TOON_DEFAULT_FORMAT",
+		Description: "Fallback robot output format (`json` or `toon`) when `--format` and `BV_OUTPUT_FORMAT` are unset.",
+		Default:     "(unset)",
+	})
+
+	ToonIndent = register(Var{
+		Name:        "TOON_INDENT",
+		Description: "Indentation width (0–16) passed to TOON encoding.",
+		Default:     "(default)",
+	})
+
+	ToonKeyFolding = register(Var{
+		Name:        "TOON_KEY_FOLDING",
+		Description: "Key folding mode passed to TOON encoding.",
+		Default:     "(default)",
+	})
+
+	ToonStats = register(Var{
+		Name:        "TOON_STATS",
+		Description: "Set to `1` to write JSON vs TOON token estimates to stderr (`--stats` sets it).",
+		Default:     "(off)",
 	})
 
 	TUIAutocloseMS = register(Var{

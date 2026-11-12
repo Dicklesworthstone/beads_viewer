@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,21 +20,104 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+type manualPollClock struct {
+	tickCh    chan time.Time
+	passDone  chan uint64
+	extraHook func(runGeneration uint64)
+}
+
+func newManualPollClock() *manualPollClock {
+	return &manualPollClock{
+		tickCh:   make(chan time.Time),
+		passDone: make(chan uint64, 16),
+	}
+}
+
+func (c *manualPollClock) attach(w *Watcher) {
+	w.pollTicker = func(time.Duration) (<-chan time.Time, func()) {
+		return c.tickCh, func() {}
+	}
+	w.onPollPass = func(runGeneration uint64) {
+		if c.extraHook != nil {
+			c.extraHook(runGeneration)
+		}
+		c.passDone <- runGeneration
+	}
+}
+
+func (c *manualPollClock) step(t *testing.T, w *Watcher) {
+	t.Helper()
+	if err := c.stepErr(w); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (c *manualPollClock) stepErr(w *Watcher) error {
+	w.mu.RLock()
+	started := w.started
+	polling := w.useFallback
+	targetGen := w.runGeneration
+	var done <-chan struct{}
+	if w.ctx != nil {
+		done = w.ctx.Done()
+	}
+	w.mu.RUnlock()
+	if !started || !polling {
+		return fmt.Errorf("cannot step poll pass when watcher started=%v polling=%v", started, polling)
+	}
+
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+
+	for {
+		select {
+		case c.tickCh <- time.Now():
+		case <-done:
+			return errors.New("watcher stopped while sending deterministic poll tick")
+		case <-deadline.C:
+			return errors.New("timed out sending deterministic poll tick")
+		}
+
+		for {
+			select {
+			case gen := <-c.passDone:
+				if gen == targetGen {
+					return nil
+				}
+				if gen < targetGen {
+					goto nextTick
+				}
+			case <-done:
+				return errors.New("watcher stopped while awaiting deterministic poll pass")
+			case <-deadline.C:
+				return errors.New("timed out awaiting deterministic poll pass")
+			}
+		}
+	nextTick:
+	}
+}
+
 // Inject at the existing notification-channel boundary. The event loop,
 // debouncer, polling loop and filesystem observations are real. This avoids
 // overflowing the machine-wide kernel queue just to reproduce lost events.
-func notificationWatch(t *testing.T, path string, onError func(error)) (*Watcher, chan fsnotify.Event, chan error, <-chan struct{}) {
+func notificationWatch(t *testing.T, path string, onError func(error)) (*Watcher, *manualPollClock, chan fsnotify.Event, chan error, <-chan struct{}) {
 	t.Helper()
 	w, err := NewWatcher(path, WithForcePoll(true), WithPollInterval(10*time.Millisecond),
 		WithDebounceDuration(time.Millisecond), WithOnError(onError))
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(path)
+	clock := newManualPollClock()
+	clock.attach(w)
+	info, endsWithNewline, err := statWatchedFile(path, w.isJSONL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.lastExists, w.lastMtime, w.lastSize = true, info.ModTime(), info.Size()
+	w.lastExists = true
+	w.lastInfo = info
+	w.lastMtime = info.ModTime()
+	w.lastSize = info.Size()
+	w.lastEndsWithNewline = endsWithNewline
 	if w.walPath != "" {
 		w.lastWALInfo, err = os.Stat(w.walPath)
 		if err != nil && !os.IsNotExist(err) {
@@ -57,108 +141,155 @@ func notificationWatch(t *testing.T, path string, onError func(error)) (*Watcher
 			t.Error("notification loop did not stop")
 		}
 	})
-	return w, events, failures, done
+	return w, clock, events, failures, done
+}
+
+func waitWatchChangeErr(w *Watcher) error {
+	select {
+	case <-w.Changed():
+		return nil
+	case <-time.After(2 * time.Second):
+		return errors.New("watcher failed to deliver a refresh")
+	}
 }
 
 func requireWatchChange(t *testing.T, w *Watcher) {
 	t.Helper()
-	select {
-	case <-w.Changed():
-	case <-time.After(2 * time.Second):
-		t.Fatal("watcher failed to deliver a refresh")
+	if err := waitWatchChangeErr(w); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func requireWatchQuiet(t *testing.T, w *Watcher) {
-	t.Helper()
-	select {
-	case <-w.Changed():
-		t.Fatal("unchanged selected family produced another refresh")
-	case <-time.After(50 * time.Millisecond):
+func flushPendingDebounce(w *Watcher) error {
+	if !w.debouncer.hasPending() {
+		return nil
 	}
-}
-
-// settleAfterWrite replaces requireWatchChange after a write the test makes while
-// the poller runs. The poller stats the selected family without coordinating
-// with writers, so it can see a write made of several syscalls half-done:
-// os.WriteFile truncates before it writes, and an SQLite commit that creates the
-// WAL shows it empty, then with its header, then with a frame header, then with
-// the page. Each distinct state it sees is a real change and may refresh, so
-// "exactly one refresh per write" is not a polling guarantee. "An unchanged
-// family produces no refresh" is, and the requireWatchQuiet that follows checks
-// it from the moment the poller has recorded the finished write.
-//
-// It requires at least one refresh, then waits until the poller's recorded
-// fingerprint matches the family on disk, no debounce timer is pending and no
-// refresh is queued, on three consecutive checks one poll interval apart.
-// Refreshes drained meanwhile belong to the write's intermediate states; more
-// than maxRefreshesPerWrite of them, or no settle within 2s, fails the test.
-func settleAfterWrite(t *testing.T, w *Watcher) {
-	t.Helper()
-	const maxRefreshesPerWrite = 4
-	requireWatchChange(t, w)
-	refreshes, clean := 1, 0
 	deadline := time.Now().Add(2 * time.Second)
+	for w.debouncer.hasPending() {
+		if time.Now().After(deadline) {
+			return errors.New("timed out waiting for pending debouncer callback")
+		}
+		time.Sleep(200 * time.Microsecond)
+	}
+	return nil
+}
+
+func checkWatchQuiet(w *Watcher, clock *manualPollClock) error {
+	if clock != nil && w.IsStarted() && w.IsPolling() {
+		for i := 0; i < 2; i++ {
+			if err := clock.stepErr(w); err != nil {
+				return err
+			}
+		}
+	}
+	if err := flushPendingDebounce(w); err != nil {
+		return err
+	}
+	select {
+	case <-w.Changed():
+		return errors.New("unchanged selected family produced another refresh")
+	default:
+		return nil
+	}
+}
+
+func requireWatchQuiet(t *testing.T, w *Watcher, clock *manualPollClock) {
+	t.Helper()
+	if err := checkWatchQuiet(w, clock); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// settleAfterWrite drives deterministic poll ticks after a completed write.
+// It requires at least one refresh, then verifies the poller's recorded
+// fingerprint matches the family on disk with no debounce pending and no
+// refresh queued across three consecutive poll passes. More than
+// maxRefreshesPerWrite refreshes fails the test (preserving the churn guard).
+func settleAfterWrite(t *testing.T, w *Watcher, clock *manualPollClock) {
+	t.Helper()
+	refreshes, err := checkSettleAfterWrite(w, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walSize := int64(-1)
+	if w.walPath != "" {
+		if info, err := os.Stat(w.walPath); err == nil {
+			walSize = info.Size()
+		}
+	}
+	t.Logf("settled after %d refresh(es); selected WAL now %d bytes", refreshes, walSize)
+}
+
+func checkSettleAfterWrite(w *Watcher, clock *manualPollClock) (int, error) {
+	const maxRefreshesPerWrite = 4
+	if !w.debouncer.hasPending() && len(w.Changed()) == 0 {
+		if err := clock.stepErr(w); err != nil {
+			return 0, err
+		}
+	}
+	if err := waitWatchChangeErr(w); err != nil {
+		return 0, err
+	}
+	refreshes, clean := 1, 0
 	for clean < 3 {
+		if err := clock.stepErr(w); err != nil {
+			return refreshes, err
+		}
+		if err := flushPendingDebounce(w); err != nil {
+			return refreshes, err
+		}
 		select {
 		case <-w.Changed():
 			refreshes++
 			clean = 0
 			if refreshes > maxRefreshesPerWrite {
-				t.Fatalf("one write produced %d refreshes, more than the %d states it can show", refreshes, maxRefreshesPerWrite)
+				return refreshes, fmt.Errorf("one write produced %d refreshes, more than the %d states it can show", refreshes, maxRefreshesPerWrite)
 			}
 			continue
 		default:
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("poller did not settle on the written family within 2s (%d refreshes)", refreshes)
+		ok, err := checkWatchRecordedFamily(w)
+		if err != nil {
+			return refreshes, err
 		}
-		if watchRecordedFamily(t, w) {
+		if ok {
 			clean++
 		} else {
 			clean = 0
 		}
-		time.Sleep(w.pollInterval)
 	}
-	walSize := int64(-1)
-	if info, err := os.Stat(w.walPath); err == nil {
-		walSize = info.Size()
-	}
-	t.Logf("settled after %d refresh(es); selected WAL now %d bytes", refreshes, walSize)
+	return refreshes, nil
 }
 
-// watchRecordedFamily reports whether the poller has recorded the selected
+// checkWatchRecordedFamily reports whether the poller has recorded the selected
 // family as it is on disk now, with no debounce timer pending and no refresh
 // queued. It reads the debouncer while holding w.mu, the same lock order as
 // scheduleChange, so it never sees a Trigger half-done.
-func watchRecordedFamily(t *testing.T, w *Watcher) bool {
-	t.Helper()
+func checkWatchRecordedFamily(w *Watcher) (bool, error) {
 	mainInfo, err := os.Stat(w.path)
 	if err != nil {
-		t.Fatal(err)
+		return false, err
 	}
 	var walInfo os.FileInfo
 	if w.walPath != "" {
 		if walInfo, err = os.Stat(w.walPath); err != nil && !os.IsNotExist(err) {
-			t.Fatal(err)
+			return false, err
 		}
 	}
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	if !w.lastExists || !w.lastMtime.Equal(mainInfo.ModTime()) || w.lastSize != mainInfo.Size() {
-		return false
+	if !w.lastExists || w.lastInfo == nil || !os.SameFile(w.lastInfo, mainInfo) ||
+		!w.lastMtime.Equal(mainInfo.ModTime()) || w.lastSize != mainInfo.Size() || w.unsettledJSONL {
+		return false, nil
 	}
 	if (w.lastWALInfo == nil) != (walInfo == nil) {
-		return false
+		return false, nil
 	}
 	if walInfo != nil && (!os.SameFile(w.lastWALInfo, walInfo) ||
 		!w.lastWALInfo.ModTime().Equal(walInfo.ModTime()) || w.lastWALInfo.Size() != walInfo.Size()) {
-		return false
+		return false, nil
 	}
-	w.debouncer.mu.Lock()
-	pending := w.debouncer.timer != nil || w.debouncer.deadline != nil
-	w.debouncer.mu.Unlock()
-	return !pending && len(w.changeCh) == 0
+	return !w.debouncer.hasPending() && len(w.changeCh) == 0, nil
 }
 
 func TestWatcherNotificationFailuresResumePolling(t *testing.T) {
@@ -169,7 +300,7 @@ func TestWatcherNotificationFailuresResumePolling(t *testing.T) {
 				t.Fatal(err)
 			}
 			reported := make(chan error, 8)
-			w, events, failures, _ := notificationWatch(t, path, func(err error) { reported <- err })
+			w, clock, events, failures, _ := notificationWatch(t, path, func(err error) { reported <- err })
 			changed, runDone := w.Changed(), w.Done()
 			var want error
 			switch failure {
@@ -201,13 +332,13 @@ func TestWatcherNotificationFailuresResumePolling(t *testing.T) {
 			}
 			// No disk metadata changed: uncertainty alone must request a rescan.
 			requireWatchChange(t, w)
-			requireWatchQuiet(t, w)
+			requireWatchQuiet(t, w, clock)
 			for i := 0; i < 3; i++ {
 				if err := os.WriteFile(path+"-wal", bytes.Repeat([]byte{byte(i)}, i+1), 0o600); err != nil {
 					t.Fatal(err)
 				}
-				settleAfterWrite(t, w)
-				requireWatchQuiet(t, w)
+				settleAfterWrite(t, w, clock)
+				requireWatchQuiet(t, w, clock)
 			}
 			// Reader coordination and unrelated siblings must not create loops.
 			for _, suffix := range []string{"-shm", "-wal.other", ".other-wal"} {
@@ -215,7 +346,7 @@ func TestWatcherNotificationFailuresResumePolling(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			requireWatchQuiet(t, w)
+			requireWatchQuiet(t, w, clock)
 		})
 	}
 }
@@ -244,7 +375,7 @@ PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;`); err != nil {
 	}
 	defer reader.Close()
 	reported := make(chan error, 8)
-	w, _, failures, _ := notificationWatch(t, path, func(err error) { reported <- err })
+	w, clock, _, failures, _ := notificationWatch(t, path, func(err error) { reported <- err })
 	failures <- fsnotify.ErrEventOverflow
 	select {
 	case <-reported:
@@ -255,13 +386,13 @@ PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;`); err != nil {
 		t.Fatal("lost WAL notifications did not activate polling")
 	}
 	requireWatchChange(t, w)
-	requireWatchQuiet(t, w)
+	requireWatchQuiet(t, w, clock)
 	for i := 0; i < 12; i++ {
 		title := fmt.Sprintf("committed WAL version %d", i)
 		if _, err := db.Exec("UPDATE issues SET title=?", title); err != nil {
 			t.Fatal(err)
 		}
-		settleAfterWrite(t, w)
+		settleAfterWrite(t, w, clock)
 		var got string
 		if err := reader.QueryRow("SELECT title FROM issues").Scan(&got); err != nil || got != title {
 			t.Fatalf("fresh snapshot after fallback: %q, %v; want %q", got, err, title)
@@ -270,7 +401,7 @@ PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;`); err != nil {
 		if err != nil || !bytes.Equal(before, after) {
 			t.Fatal("fixture must exercise WAL-only commits, not main-file writes")
 		}
-		requireWatchQuiet(t, w)
+		requireWatchQuiet(t, w, clock)
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
@@ -278,6 +409,7 @@ PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;`); err != nil {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	clock.step(t, w)
 	requireWatchChange(t, w) // last close checkpoints and removes the WAL
 	if _, err := os.Stat(path + "-wal"); !os.IsNotExist(err) {
 		t.Fatalf("fixture did not checkpoint/remove WAL on last close: %v", err)
@@ -291,7 +423,7 @@ func TestWatcherFallbackDoesNotWaitForErrorCallback(t *testing.T) {
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
 	defer close(release)
-	w, _, failures, _ := notificationWatch(t, path, func(error) { close(entered); <-release })
+	w, clock, _, failures, _ := notificationWatch(t, path, func(error) { close(entered); <-release })
 	failures <- fsnotify.ErrEventOverflow
 	select {
 	case <-entered:
@@ -302,10 +434,11 @@ func TestWatcherFallbackDoesNotWaitForErrorCallback(t *testing.T) {
 		t.Fatal("blocked callback prevented polling handover")
 	}
 	requireWatchChange(t, w)
-	requireWatchQuiet(t, w)
+	requireWatchQuiet(t, w, clock)
 	if err := os.WriteFile(path+"-wal", []byte("later change"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	clock.step(t, w)
 	requireWatchChange(t, w)
 }
 
@@ -316,8 +449,11 @@ func TestWatcherFallbackCanStopFromErrorCallback(t *testing.T) {
 	}
 	var w *Watcher
 	stopped := make(chan struct{})
-	var failures chan error
-	w, _, failures, _ = notificationWatch(t, path, func(error) {
+	var (
+		clock    *manualPollClock
+		failures chan error
+	)
+	w, clock, _, failures, _ = notificationWatch(t, path, func(error) {
 		w.Stop()
 		close(stopped)
 	})
@@ -335,7 +471,7 @@ func TestWatcherFallbackCanStopFromErrorCallback(t *testing.T) {
 	default:
 		t.Fatal("Stop did not cancel fallback's context")
 	}
-	requireWatchQuiet(t, w)
+	requireWatchQuiet(t, w, clock)
 }
 
 func TestWatcherFallbackIsSingleAndOldRunsCannotRevive(t *testing.T) {
@@ -344,7 +480,7 @@ func TestWatcherFallbackIsSingleAndOldRunsCannotRevive(t *testing.T) {
 		t.Fatal(err)
 	}
 	var reports atomic.Int32
-	w, _, failures, done := notificationWatch(t, path, func(error) { reports.Add(1) })
+	w, clock, _, failures, done := notificationWatch(t, path, func(error) { reports.Add(1) })
 	failures <- fsnotify.ErrEventOverflow
 	select {
 	case <-done:
@@ -366,7 +502,7 @@ func TestWatcherFallbackIsSingleAndOldRunsCannotRevive(t *testing.T) {
 	if reports.Load() != 1 {
 		t.Fatalf("duplicate handovers: %d error callbacks", reports.Load())
 	}
-	requireWatchQuiet(t, w)
+	requireWatchQuiet(t, w, clock)
 	w.Stop()
 	if err := w.Start(); err != nil { // ForcePoll was set by the fixture.
 		t.Fatal(err)
@@ -377,10 +513,11 @@ func TestWatcherFallbackIsSingleAndOldRunsCannotRevive(t *testing.T) {
 	if reports.Load() != 1 || !w.IsStarted() || !w.IsPolling() {
 		t.Fatal("old notification failure crossed the restart generation")
 	}
-	requireWatchQuiet(t, w)
+	requireWatchQuiet(t, w, clock)
 	if err := os.WriteFile(path+"-wal", []byte("new run"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	clock.step(t, w)
 	requireWatchChange(t, w)
 }
 
@@ -399,6 +536,8 @@ func TestWatcherNativeBackendClosureResumesPolling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := newManualPollClock()
+	clock.attach(w)
 	if err := w.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -421,9 +560,246 @@ func TestWatcherNativeBackendClosureResumesPolling(t *testing.T) {
 		t.Fatal("native backend closure did not preserve monitoring")
 	}
 	requireWatchChange(t, w)
-	requireWatchQuiet(t, w)
+	requireWatchQuiet(t, w, clock)
 	if err := os.WriteFile(path+"-wal", []byte("after closure"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	clock.step(t, w)
 	requireWatchChange(t, w)
+}
+
+func TestWatcherRecoveryNegativeControls(t *testing.T) {
+	t.Run("churn_plant_exceeds_refresh_cap", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "selected.db")
+		if err := os.WriteFile(path, []byte("main"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w, err := NewWatcher(path, WithForcePoll(true), WithDebounceDuration(time.Millisecond))
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock := newManualPollClock()
+		clock.extraHook = func(runGeneration uint64) {
+			// Planted bug: every poll schedules a refresh even when unchanged.
+			w.scheduleChange(runGeneration)
+		}
+		clock.attach(w)
+		if err := w.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer w.Stop()
+
+		if err := os.WriteFile(path+"-wal", []byte("commit"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		refreshes, settleErr := checkSettleAfterWrite(w, clock)
+		if settleErr == nil || !strings.Contains(settleErr.Error(), "more than the 4 states it can show") {
+			t.Fatalf("expected churn negative control failure (>4 refreshes), got refreshes=%d err=%v", refreshes, settleErr)
+		}
+	})
+
+	t.Run("shm_sibling_plant_fails_quiet_check", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "selected.db")
+		if err := os.WriteFile(path, []byte("main"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		w, err := NewWatcher(path, WithForcePoll(true), WithDebounceDuration(time.Millisecond))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var lastSHM os.FileInfo
+		clock := newManualPollClock()
+		clock.extraHook = func(runGeneration uint64) {
+			// Planted bug: poller inspects the -shm reader-coordination sibling.
+			info, statErr := os.Stat(path + "-shm")
+			if statErr == nil && (lastSHM == nil || !lastSHM.ModTime().Equal(info.ModTime()) || lastSHM.Size() != info.Size()) {
+				lastSHM = info
+				w.scheduleChange(runGeneration)
+			}
+		}
+		clock.attach(w)
+		if err := w.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer w.Stop()
+
+		if err := os.WriteFile(path+"-shm", []byte("reader index"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		quietErr := checkWatchQuiet(w, clock)
+		if quietErr == nil || !strings.Contains(quietErr.Error(), "unchanged selected family produced another refresh") {
+			t.Fatalf("expected -shm negative control failure, got err=%v", quietErr)
+		}
+	})
+}
+
+func TestWatcherSameSizeAtomicRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "issues.jsonl")
+	fixedTime := time.Now().Truncate(time.Second)
+
+	if err := os.WriteFile(path, []byte("{\"id\":\"1\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, fixedTime, fixedTime); err != nil {
+		t.Fatal(err)
+	}
+	beforeInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := NewWatcher(path, WithForcePoll(true), WithDebounceDuration(time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := newManualPollClock()
+	clock.attach(w)
+	if err := w.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer w.Stop()
+
+	requireWatchQuiet(t, w, clock)
+
+	staged := filepath.Join(dir, "issues.jsonl.tmp")
+	if err := os.WriteFile(staged, []byte("{\"id\":\"2\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(staged, fixedTime, fixedTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(staged, path); err != nil {
+		t.Fatal(err)
+	}
+
+	afterInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !afterInfo.ModTime().Equal(beforeInfo.ModTime()) || afterInfo.Size() != beforeInfo.Size() || os.SameFile(beforeInfo, afterInfo) {
+		t.Fatalf("fixture must preserve mtime (%v vs %v) and size (%d vs %d) while changing inode",
+			beforeInfo.ModTime(), afterInfo.ModTime(), beforeInfo.Size(), afterInfo.Size())
+	}
+
+	settleAfterWrite(t, w, clock)
+	requireWatchQuiet(t, w, clock)
+}
+
+func TestWatcherTransientTruncate(t *testing.T) {
+	t.Run("coalesces_transient_zero_byte_and_torn_jsonl", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "issues.jsonl")
+		if err := os.WriteFile(path, []byte("{\"id\":\"bv-1\"}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		var (
+			mu        sync.Mutex
+			snapshots []string
+		)
+		w, err := NewWatcher(path,
+			WithForcePoll(true),
+			WithDebounceDuration(time.Millisecond),
+			WithOnChange(func() {
+				data, rerr := os.ReadFile(path)
+				if rerr == nil {
+					mu.Lock()
+					snapshots = append(snapshots, string(data))
+					mu.Unlock()
+				}
+			}),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock := newManualPollClock()
+		clock.attach(w)
+		if err := w.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer w.Stop()
+
+		// Non-atomic writer step 1: O_TRUNC empties the previously valid JSONL file.
+		if err := os.Truncate(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		clock.step(t, w)
+		if err := flushPendingDebounce(w); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-w.Changed():
+			t.Fatal("watcher fired prematurely on transient 0-byte JSONL")
+		default:
+		}
+
+		// Non-atomic writer step 2: partial trailing line without newline.
+		if err := os.WriteFile(path, []byte("{\"id\":\"bv-2\""), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		clock.step(t, w)
+		if err := flushPendingDebounce(w); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-w.Changed():
+			t.Fatal("watcher fired prematurely on torn non-newline-terminated JSONL")
+		default:
+		}
+
+		// Non-atomic writer step 3: completed newline-terminated payload.
+		if err := os.WriteFile(path, []byte("{\"id\":\"bv-2\"}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		settleAfterWrite(t, w, clock)
+		requireWatchQuiet(t, w, clock)
+
+		mu.Lock()
+		got := append([]string(nil), snapshots...)
+		mu.Unlock()
+		if len(got) != 1 || got[0] != "{\"id\":\"bv-2\"}\n" {
+			t.Fatalf("expected single clean snapshot for completed write, got %q", got)
+		}
+	})
+
+	t.Run("emits_when_zero_byte_clear_persists", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "issues.jsonl")
+		if err := os.WriteFile(path, []byte("{\"id\":\"bv-1\"}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		w, err := NewWatcher(path, WithForcePoll(true), WithDebounceDuration(time.Millisecond))
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock := newManualPollClock()
+		clock.attach(w)
+		if err := w.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer w.Stop()
+
+		if err := os.Truncate(path, 0); err != nil {
+			t.Fatal(err)
+		}
+
+		// First defaultJSONLSettlePolls-1 observations withhold to guard against transient O_TRUNC.
+		for i := 1; i < defaultJSONLSettlePolls; i++ {
+			clock.step(t, w)
+			if err := flushPendingDebounce(w); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-w.Changed():
+				t.Fatalf("emitted before settle window completed on poll %d", i)
+			default:
+			}
+		}
+
+		// Once 0-byte state persists across the settle window, watcher must emit
+		// so intentional clears are never lost, then remain quiet.
+		clock.step(t, w)
+		requireWatchChange(t, w)
+		requireWatchQuiet(t, w, clock)
+	})
 }

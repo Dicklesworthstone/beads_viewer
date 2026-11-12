@@ -22,12 +22,150 @@ type ExecutionTrack struct {
 	Reason  string     `json:"reason"` // Why these are grouped
 }
 
+// SelectionMode controls candidate selection across triage, priority, what-if,
+// plan, script emission, briefs, and exports (Choke-Point 1).
+type SelectionMode int
+
+const (
+	// SelectionReadyLeaf selects scoped candidate issues that are actionable now
+	// (open or in_progress, not future-deferred, no unsatisfied blocking
+	// dependencies) and are not open container epics with open parent-child
+	// children.
+	SelectionReadyLeaf SelectionMode = iota
+	// SelectionActionable selects all scoped candidate issues that are
+	// actionable now (including container epics when needed by callers).
+	SelectionActionable
+	// SelectionAllScopedCandidates selects all non-closed candidate issues in
+	// scope (including blocked, deferred, parked, and container epics) for
+	// --robot-include-inactive diagnostics.
+	SelectionAllScopedCandidates
+)
+
+// CandidateIssueSet returns the canonical set of issue IDs matching mode under
+// the analyzer's CandidateIDs scope, ReadinessIndex, and reference clock.
+func (a *Analyzer) CandidateIssueSet(mode SelectionMode) map[string]bool {
+	allowed := make(map[string]bool)
+	if a == nil || len(a.issueMap) == 0 {
+		return allowed
+	}
+	readiness := a.Readiness()
+	now := a.Now()
+	var parentsWithOpenChildren map[string]bool
+	if mode == SelectionReadyLeaf {
+		parentsWithOpenChildren = a.ParentsWithOpenChildren()
+	}
+	for id, issue := range a.issueMap {
+		if !a.IsCandidate(id) || isClosedLikeStatus(issue.Status) {
+			continue
+		}
+		switch mode {
+		case SelectionAllScopedCandidates:
+			allowed[id] = true
+		case SelectionActionable:
+			if readiness.Ready(id, now) {
+				allowed[id] = true
+			}
+		case SelectionReadyLeaf:
+			if !readiness.Ready(id, now) {
+				continue
+			}
+			if issue.IssueType == model.TypeEpic && parentsWithOpenChildren[id] {
+				continue
+			}
+			allowed[id] = true
+		}
+	}
+	return allowed
+}
+
+// CandidateIssues returns the deterministic ID-sorted slice of issues matching
+// mode under the analyzer's CandidateIDs scope, ReadinessIndex, and clock.
+func (a *Analyzer) CandidateIssues(mode SelectionMode) []model.Issue {
+	allowed := a.CandidateIssueSet(mode)
+	if len(allowed) == 0 {
+		return []model.Issue{}
+	}
+	ids := make([]string, 0, len(allowed))
+	for id := range allowed {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]model.Issue, 0, len(ids))
+	for _, id := range ids {
+		if issue, ok := a.issueMap[id]; ok {
+			out = append(out, issue)
+		}
+	}
+	return out
+}
+
+// StatusPartition partitions candidate issues into mutually exclusive readiness
+// buckets: Closed + Actionable + Blocked + DeferredOrParked == Total.
+type StatusPartition struct {
+	Total            int `json:"total"`
+	Closed           int `json:"closed"`
+	NotClosed        int `json:"not_closed"`
+	Actionable       int `json:"actionable"`
+	Blocked          int `json:"blocked"`
+	DeferredOrParked int `json:"deferred_or_parked"`
+	InProgress       int `json:"in_progress"`
+	OpenStrict       int `json:"open_strict"`
+	BlockedStrict    int `json:"blocked_strict"`
+}
+
+// CountStatusPartition computes canonical readiness and status counts across all
+// candidate issues owned by the analyzer. Dependency-blocked open/in_progress
+// issues and status="blocked" issues count under Blocked, while deferred,
+// future defer_until, draft, pinned, hooked, review, and custom parked statuses
+// count under DeferredOrParked.
+func (a *Analyzer) CountStatusPartition() StatusPartition {
+	var p StatusPartition
+	if a == nil {
+		return p
+	}
+	readiness := a.Readiness()
+	now := a.Now()
+	for id, issue := range a.issueMap {
+		if !a.IsCandidate(id) {
+			continue
+		}
+		p.Total++
+		if issue.Status == model.StatusOpen {
+			p.OpenStrict++
+		}
+		if issue.Status == model.StatusBlocked {
+			p.BlockedStrict++
+		}
+		if issue.Status == model.StatusInProgress {
+			p.InProgress++
+		}
+		if isClosedLikeStatus(issue.Status) {
+			p.Closed++
+			continue
+		}
+		p.NotClosed++
+		switch {
+		case readiness.Ready(id, now):
+			p.Actionable++
+		case issue.Status == model.StatusBlocked:
+			p.Blocked++
+		case !isActionableStatus(issue.Status) || issue.IsDeferredAt(now):
+			p.DeferredOrParked++
+		default:
+			p.Blocked++
+		}
+	}
+	return p
+}
+
 // ExecutionPlan is the complete work plan with parallel tracks
 type ExecutionPlan struct {
-	Tracks          []ExecutionTrack `json:"tracks"`
-	TotalActionable int              `json:"total_actionable"`
-	TotalBlocked    int              `json:"total_blocked"`
-	Summary         PlanSummary      `json:"summary"`
+	Tracks                []ExecutionTrack `json:"tracks"`
+	TotalActionable       int              `json:"total_actionable"`
+	TotalBlocked          int              `json:"total_blocked"`
+	TotalDeferredOrParked int              `json:"total_deferred_or_parked,omitempty"`
+	TotalInProgress       int              `json:"total_in_progress,omitempty"`
+	Summary               PlanSummary      `json:"summary"`
 }
 
 // PlanSummary provides quick insights about the plan
@@ -60,22 +198,19 @@ func (a *Analyzer) GetExecutionPlan() ExecutionPlan {
 	// Build tracks from components, filtering to actionable issues only
 	tracks := a.buildTracks(components, actionableSet, unblocksMap)
 
-	// Calculate totals
-	totalOpen := 0
-	for _, issue := range a.issueMap {
-		if a.IsCandidate(issue.ID) && !isClosedLikeStatus(issue.Status) {
-			totalOpen++
-		}
-	}
+	// Partition candidate issues into actionable, blocked, and deferred/parked
+	partition := a.CountStatusPartition()
 
 	// Find highest impact issue
 	summary := a.computePlanSummary(actionable, unblocksMap)
 
 	return ExecutionPlan{
-		Tracks:          tracks,
-		TotalActionable: len(actionable),
-		TotalBlocked:    totalOpen - len(actionable),
-		Summary:         summary,
+		Tracks:                tracks,
+		TotalActionable:       len(actionable),
+		TotalBlocked:          partition.Blocked,
+		TotalDeferredOrParked: partition.DeferredOrParked,
+		TotalInProgress:       partition.InProgress,
+		Summary:               summary,
 	}
 }
 
