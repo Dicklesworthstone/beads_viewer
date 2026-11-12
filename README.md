@@ -3,7 +3,6 @@
 ![Release](https://img.shields.io/github/v/release/Dicklesworthstone/beads_viewer?style=for-the-badge&color=bd93f9)
 ![Go Version](https://img.shields.io/github/go-mod/go-version/Dicklesworthstone/beads_viewer?style=for-the-badge&color=6272a4)
 ![License](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue-the-badge)
-[![Coverage](https://codecov.io/gh/Dicklesworthstone/beads_viewer/branch/main/graph/badge.svg)](https://codecov.io/gh/Dicklesworthstone/beads_viewer)
 
 > **The elegant, keyboard-driven terminal interface for the [Beads](https://github.com/steveyegge/beads) issue tracker.**
 
@@ -286,7 +285,7 @@ Each hook retains at most **1 MiB (1,048,576 bytes) of stdout and 1 MiB of stder
 The text below is exactly what `bv --agents-add` (and the TUI's AGENTS.md prompt) installs (`pkg/agents/blurb.go`, `AgentBlurb`); a docs parity test keeps this copy identical to it.
 
 ````markdown
-<!-- bv-agent-instructions-v7 -->
+<!-- bv-agent-instructions-v8 -->
 
 ---
 
@@ -329,7 +328,7 @@ bv --robot-graph --format toon
 bv --robot-triage --format toon --stats
 ```
 
-Recommendations can include blocked or assigned work; `triage.quick_ref.top_picks` reflects snapshot readiness. A suggested action records its original local ID, working directory, and tracker route. Use that route rather than a namespaced display ID or an unrelated current directory. Inspect current tracker state before execution: analysis does not reserve work or guarantee that a later claim succeeds.
+By default, `triage.recommendations` and `triage.quick_ref.top_picks` surface ready, actionable leaf work (pass `--robot-include-inactive` to inspect blocked, deferred, parked, or umbrella epic items; assigned `in_progress` items remain marked `claimable=false`). A suggested action records its original local ID, working directory, and tracker route. Use that route rather than a namespaced display ID or an unrelated current directory. Inspect current tracker state before execution: analysis does not reserve work or guarantee that a later claim succeeds.
 
 #### Other bv Commands
 
@@ -339,8 +338,10 @@ Recommendations can include blocked or assigned work; `triage.quick_ref.top_pick
 | `--robot-priority` | Priority misalignment detection with confidence |
 | `--robot-insights` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core |
 | `--robot-alerts` | Stale issues, blocking cascades, priority mismatches |
+| `--check-drift --robot-drift` | Baseline drift evaluation + live issue health alerts |
 | `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions, cycle breaks |
 | `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues |
+| `--bead-history <id>` | Single-bead lifecycle events and correlated git commits |
 | `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
 
 Robot analysis commands default to JSON; `--format toon` selects TOON, and `--robot-help` defaults to text. In JSON mode, `--graph-format=dot` or `mermaid` puts diagram text in the `graph` field (`bv --robot-graph --graph-format=dot | jq -r .graph`).
@@ -415,7 +416,7 @@ Tracker commands do not grant permission to commit or push application code. Fol
 
 The blurb uses HTML comment markers for version tracking:
 ```
-<!-- bv-agent-instructions-v7 -->
+<!-- bv-agent-instructions-v8 -->
 ... content ...
 <!-- end-bv-agent-instructions -->
 ```
@@ -3265,7 +3266,7 @@ These commands output **structured JSON** designed for programmatic consumption:
 | `--robot-impact <paths>` | Impact of modifying the given comma-separated files | Change risk assessment |
 | `--robot-file-hotspots` | Files touched by the most beads | Finding churn hotspots |
 | `--robot-file-relations <path>` | Files that frequently co-change with the given file | Related-code discovery |
-| `--robot-metrics` | In-process counters from the real caches and timers: `graph_cache` (analysis in-memory + disk cache), `correlation_cache` (history report/artifact caches), `search_cache` (on-disk vector index), `triage_cache`; timings `loader.parse`, `analysis.phase1`, `analysis.phase2`; plus memory stats. Counts cover the current process only, so a bare `--robot-metrics` shows the load it just did; `BV_METRICS=0` disables collection | Diagnosing slow runs |
+| `--robot-metrics` | In-process counters from the real caches and timers: `graph_cache` (analysis in-memory + disk cache), `correlation_cache` (history report/artifact caches), `search_cache` (on-disk vector index), `triage_cache`; timings `loader.parse`, `graph_load`, `analysis.phase1`, `topological_sort`, `analysis.phase2`, `pagerank_compute`, `betweenness_compute`, `hits_compute`, `cycle_detection`, `triage_analysis`; plus memory stats. Counts cover the current process only, so a bare `--robot-metrics` shows the load it just did; `BV_METRICS=0` disables collection | Diagnosing slow runs |
 | `--robot-capabilities` | Machine-readable command capabilities | Agent self-configuration |
 | `--robot-schema` | JSON Schema definitions for all robot commands | Output validation |
 | `--robot-docs <topic>` | Machine-readable JSON docs: `guide`, `commands`, `examples`, `env`, `exit-codes`, `all` | Agent onboarding |
@@ -3406,7 +3407,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--robot-history-timeout-ms` | int | `-1` | Budget in ms for the git-history prologue of robot triage (0 = unbounded; default 10000, env BV_ROBOT_HISTORY_TIMEOUT_MS) | Robot & Planning Flags |
 | `--robot-impact` | string | (empty) | Analyze impact of modifying files (comma-separated paths) | Robot & Planning Flags |
 | `--robot-impact-network` | string | (empty) | Output bead impact network as JSON (empty for full, or bead ID for subnetwork) | Robot & Planning Flags |
-| `--robot-include-inactive` | bool | `false` | Include parked and blocked planning diagnostics in robot triage recommendations; never enables claims | Robot & Planning Flags |
+| `--robot-include-inactive` | bool | `false` | Include parked, blocked, and container-epic diagnostics in triage, priority, insights, script, and export outputs; never enables claims | Robot & Planning Flags |
 | `--robot-insights` | bool | `false` | Output graph analysis and insights as JSON for AI agents | Robot & Planning Flags |
 | `--robot-label-attention` | bool | `false` | Output attention-ranked labels as JSON for AI agents | Robot & Planning Flags |
 | `--robot-label-flow` | bool | `false` | Output cross-label dependency flow as JSON for AI agents | Robot & Planning Flags |
@@ -3521,7 +3522,7 @@ bv --agent-brief ./agent-bundle/
 
 These are heuristics, not a scheduler. For `--robot-forecast`, choose a base from a positive `estimated_minutes`, otherwise the median positive estimate in the loaded issues (default 60 minutes). **Both explicit and inferred bases receive all multipliers:** type (`task`/`bug`: 1, `chore`: 0.8, `feature`: 1.3, `epic`: 2), dependency depth (`1 + min(1, depth/10)`), and description length (`1 + min(1, Unicode runes/2000)`). The product is truncated to integer minutes. Depth uses the available critical-path score; unavailable scores contribute zero depth.
 
-Velocity is estimated minutes closed in the last 30 days divided by 30, using the slowest nonzero matching-label velocity, then global velocity, then median/5 (with 60 min/day as a final fallback). ETA days = work minutes / (velocity × agents). Its confidence band is rule-based and has not been calibrated as a statistical probability. `--robot-capacity` sums serial work on the critical path with remaining parallel work divided by `--agents`; it does not assign issues to agents or account for their availability. Payloads expose the factors behind these estimates. Note that the per-issue `estimated_days` of `--robot-forecast` is the only field that uses the formula above: `--robot-capacity`'s `estimated_days`/`total_days` and `--robot-forecast`'s `summary.total_days` convert minutes at a fixed eight-hour workday (`minutes / 480`) instead, they do not use the velocity estimate, and `summary.total_days` ignores `--forecast-agents`.
+Velocity is complexity-weighted work minutes closed in the last 30 days divided by 30 (using the same `base × type × depth × description` formula as open estimates), shrunk per matching label toward global velocity via Bühlmann-Straub empirical-Bayes credibility weighting (`n / (n + 5)`), picking the slowest nonzero shrunk label velocity, then global velocity, then median/5 (with 60 min/day as a final fallback). ETA days = work minutes / (velocity × agents). Its confidence band is rule-based and has not been calibrated as a statistical probability. `--robot-capacity` reports serial critical-path work, parallelizable work, and Graham (1969) parallel list-scheduling makespan bounds (`[max(L_crit, W/m), L_crit + (W - L_crit)/m]`); it does not assign issues to agents or account for their availability. Payloads expose the factors behind these estimates. Note that the per-issue `estimated_days` of `--robot-forecast` (and `graham_bounds` velocity-calibrated days in `--robot-capacity`) use historical velocity, whereas `--robot-capacity`'s legacy `estimated_days`/`total_days` and `--robot-forecast`'s `summary.total_days` convert minutes at a fixed eight-hour workday (`minutes / 480`), and `summary.total_days` ignores `--forecast-agents`.
 
 Forecast output applies the global issue selection and intersects it with
 `--forecast-label` and `--forecast-sprint`, when supplied. These filters also
@@ -3542,14 +3543,15 @@ an exhaustive simple-path search, which can be expensive on dense cyclic graphs.
 
 For a worked example, take two feature issues with depth 2 and descriptions of
 1,000 Unicode characters. One has an explicit 120-minute estimate; the other
-has none. The only other positive estimate is a 240-minute issue closed within
-the last 30 days, so the median is 180 minutes and velocity is 8 min/day.
+has none. The only other positive estimate is an isolated 240-minute task
+(depth 1, empty description → 264 complexity minutes) closed within the last 30
+days, so the median base is 180 minutes and velocity is 8.8 min/day.
 With two agents, applying all multipliers gives:
 
 | Estimate source | Work minutes | ETA days |
 |-----------------|--------------|----------|
-| explicit | 280 | 17.5 |
-| median | 421 | 26.3125 |
+| explicit | 280 | 15.9091 |
+| median | 421 | 23.9205 |
 
 ```bash
 # Forecast completion ETA for a specific issue
@@ -3596,15 +3598,16 @@ bv --robot-triage --robot-triage-by-label
 
 ### Shell Script Emission
 
-Generate executable shell scripts from recommendations for automated workflows:
+Generate executable shell scripts from ready recommendations for automated workflows (standalone `--emit-script` or combined with `--robot-triage`):
 
 ```bash
-# Emit bash script for top 5 recommendations
+# Emit bash script for top 5 actionable recommendations
+bv --emit-script --script-limit=5 > work.sh
 bv --robot-triage --emit-script --script-limit=5
 
 # Different shell formats
-bv --robot-triage --emit-script --script-format=fish
-bv --robot-triage --emit-script --script-format=zsh
+bv --emit-script --script-format=fish
+bv --emit-script --script-format=zsh
 ```
 
 ### Feedback System (Adaptive Recommendations)
@@ -4240,14 +4243,16 @@ bv has a comprehensive built-in help system:
 | :--- | :---: | :--- |
 | **all** | `j` | Move down |
 |  | `k` | Move up |
-|  | `G` | Go to end |
-| **list** | `home` | Go to start |
+| **list,detail,board,graph,tree,actionable,history,flow,attention,label** | `G` | Go to end |
+| **list,detail,board,actionable,flow,attention,label** | `home` | Go to start |
 | **board,tree** | `gg` | Go to start |
-| **all** | `ctrl+d` | Page down |
+| **list,detail,board,graph,tree,actionable,attention** | `ctrl+d` | Page down |
 |  | `ctrl+u` | Page up |
-|  | `enter` | Open details |
-|  | `esc` | Back/close (list: clear filters) |
-|  | `q` | Quit |
+| **list,detail,board,graph,insights,actionable,history** | `enter` | Open details |
+| **all** | `esc` | Back/close (list: clear filters) |
+|  | `q` | Quit / close view |
+|  | `ctrl+r` | Refresh issues from disk |
+|  | `f5` | Refresh issues from disk |
 | **list,detail** | `a` | Actionable view |
 |  | `b` | Board view |
 |  | `g` | Graph view |
@@ -4261,6 +4266,8 @@ bv has a comprehensive built-in help system:
 | **list** | `!` | Alerts panel |
 |  | `w` | Repo picker (workspace mode) |
 | **all** | `?` | Help overlay |
+|  | `` ` `` | Interactive tutorial |
+|  | `~` | Context-sensitive help |
 |  | `;` | Shortcuts sidebar |
 | **list,detail** | `p` | Priority hints |
 | **list** | `o` | Open issues only |
@@ -4268,6 +4275,9 @@ bv has a comprehensive built-in help system:
 |  | `r` | Ready (unblocked) |
 |  | `l` | Label picker |
 |  | `/` | Search/filter |
+|  | `ctrl+s` | Toggle semantic search |
+|  | `H` | Toggle hybrid search ranking |
+|  | `alt+h` | Cycle hybrid search preset |
 |  | `s` | Cycle sort mode |
 |  | `S` | Sort by triage score (triage recipe) |
 | **list,detail** | `t` | Time travel (custom revision) |
@@ -4275,12 +4285,12 @@ bv has a comprehensive built-in help system:
 | **list** | `n` | Next changed issue (time travel) |
 |  | `N` | Previous changed issue (time travel) |
 | **list,detail** | `x` | Export to markdown |
-| **all** | `y` | Copy issue ID |
-| **detail** | `C` | Copy full issue |
-|  | `O` | Open in  |
+| **list,detail,board,graph,insights,tree,actionable,flow** | `y` | Copy issue ID |
+| **list,detail** | `C` | Copy full issue |
+|  | `O` | Open in $EDITOR |
 | **list** | `'` | Recipe picker |
-| **all** | `U` | Self-update check |
-| **list** | `V` | Cass sessions |
+|  | `U` | Self-update check |
+| **list,detail,board,tree,history** | `V` | Cass sessions |
 | **graph** | `hjkl` | Navigate graph |
 |  | `H` | Scroll left |
 |  | `L` | Scroll right |
@@ -4292,34 +4302,72 @@ bv has a comprehensive built-in help system:
 |  | `l` | Next column |
 |  | `H` | First column |
 |  | `L` | Last column |
+|  | `1-4` | Jump to column 1-4 |
+|  | `/` | Search cards |
+|  | `n` | Next search match |
+|  | `N` | Previous search match |
+|  | `o` | Open cards filter |
+|  | `c` | Closed cards filter |
+|  | `r` | Ready cards filter |
 |  | `s` | Cycle swimlane mode |
+|  | `e` | Toggle empty columns |
+|  | `d` | Expand/collapse card inline |
 |  | `tab` | Toggle detail |
-| **tree** | `E` | Exit tree view |
-| **board** | `ctrl+j` | Scroll detail down |
+|  | `ctrl+j` | Scroll detail down |
 |  | `ctrl+k` | Scroll detail up |
+| **tree** | `enter` | Expand/collapse node |
+|  | `space` | Expand/collapse node |
+|  | `h` | Collapse or jump to parent |
+|  | `l` | Expand or move to child |
+|  | `o` | Expand all nodes |
+|  | `O` | Collapse all nodes |
+|  | `tab` | Toggle detail pane |
+|  | `PgUp` | Page up |
+|  | `PgDn` | Page down |
+|  | `E` | Exit tree view |
+| **actionable** | `PgUp` | Page up |
+|  | `PgDn` | Page down |
+|  | `a` | Close actionable view |
 | **insights** | `h` | Previous panel |
 |  | `l` | Next panel |
 |  | `tab` | Next panel |
 |  | `shift+tab` | Previous panel |
+|  | `ctrl+j` | Scroll detail down |
+|  | `ctrl+k` | Scroll detail up |
 |  | `e` | Toggle explanations |
 |  | `x` | Calculation proof |
 |  | `m` | Heatmap toggle |
+|  | `H` | Heatmap toggle |
 |  | `<` | Widen detail panel |
 |  | `>` | Narrow detail panel |
 | **history** | `v` | Toggle git/bead mode |
+|  | `/` | Search history |
+|  | `c` | Cycle confidence filter |
 |  | `tab` | Toggle focus |
 |  | `t` | Toggle timeline pane |
 |  | `f` | Toggle file tree |
 |  | `J` | Detail scroll down |
 |  | `K` | Detail scroll up |
+|  | `y` | Copy commit SHA |
 |  | `o` | Open in browser |
+|  | `h` | Close history view |
+| **flow** | `g` | Go to top |
+|  | `tab` | Switch matrix/list panel |
+|  | `enter` | Label drilldown / issue detail |
+|  | `f` | Back / close flow matrix |
 | **attention** | `g` | Go to top |
 |  | `enter` | Label drilldown |
 |  | `1-9` | Filter list by rank |
 |  | `]` | Close attention view |
-| **label** | `h` | Label health detail |
+| **label** | `enter` | Filter list by label |
+|  | `h` | Label health detail |
 |  | `d` | Label drilldown |
 |  | `v` | Velocity comparison |
+|  | `[` | Close label dashboard |
+| **velocity** | `j` | Next label row |
+|  | `k` | Previous label row |
+|  | `enter` | Filter list by label |
+|  | `v` | Return to label dashboard |
 | **sprint** | `P` | Close sprint dashboard |
 |  | `j` | Next sprint |
 |  | `k` | Previous sprint |
@@ -4370,7 +4418,7 @@ bv has a comprehensive built-in help system:
 | `BV_SEMANTIC_DIM` | Embedding dimension for the hashed search index. | `384` |
 | `BV_SEMANTIC_EMBEDDER` | Embedding provider for `bv --search` and TUI search. Only `hash` (FNV-1a keyword feature hashing) is implemented; `python-sentence-transformers` and `openai` are reserved names that fail with "not implemented". | `hash` |
 | `BV_SEMANTIC_MODEL` | Model name for a future non-hash provider; ignored by `hash`. | (empty) |
-| `BV_SKIP_PHASE2` | Skip Phase 2 graph metrics (centrality, cycles, critical path) (`1`/`0`). | (disabled) |
+| `BV_SKIP_PHASE2` | Skip all Phase 2 graph metrics (centrality, cycles, critical path, k-core, articulation points, slack) (`1`/`0`). | (disabled) |
 | `BV_TEST_MODE` | Any value: test harness mode; suppresses browser opening, terminal capability queries, and the background worker's idle GC tuning. | (unset) |
 | `BV_THEME` | Pin the TUI palette: `light` or `dark` (overridden by `--theme`). | (auto-detect) |
 | `BV_TUI_AUTOCLOSE_MS` | Quit the TUI automatically after this many milliseconds (for automated tests). | (unset) |
@@ -4379,6 +4427,11 @@ bv has a comprehensive built-in help system:
 | `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker. | (default) |
 | `BV_WORKER_METRICS` | Truthy value: the background worker records its own metrics. | (off) |
 | `BV_WORKER_TRACE` | Path to a trace file the background worker appends to. | (off) |
+| `SOURCE_DATE_EPOCH` | Unix epoch timestamp (seconds) pinning robot report timestamps and running timeout-raced metrics to deterministic completion. | (unset) |
+| `TOON_DEFAULT_FORMAT` | Fallback robot output format (`json` or `toon`) when `--format` and `BV_OUTPUT_FORMAT` are unset. | (unset) |
+| `TOON_INDENT` | Indentation width (0–16) passed to TOON encoding. | (default) |
+| `TOON_KEY_FOLDING` | Key folding mode passed to TOON encoding. | (default) |
+| `TOON_STATS` | Set to `1` to write JSON vs TOON token estimates to stderr (`--stats` sets it). | (off) |
 <!-- /bv:generated -->
 
 **Use cases for `BEADS_DIR`:**

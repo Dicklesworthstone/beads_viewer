@@ -36,7 +36,7 @@
 | `BV_SEMANTIC_DIM` | Embedding dimension for the hashed search index. | `384` |
 | `BV_SEMANTIC_EMBEDDER` | Embedding provider for `bv --search` and TUI search. Only `hash` (FNV-1a keyword feature hashing) is implemented; `python-sentence-transformers` and `openai` are reserved names that fail with "not implemented". | `hash` |
 | `BV_SEMANTIC_MODEL` | Model name for a future non-hash provider; ignored by `hash`. | (empty) |
-| `BV_SKIP_PHASE2` | Skip Phase 2 graph metrics (centrality, cycles, critical path) (`1`/`0`). | (disabled) |
+| `BV_SKIP_PHASE2` | Skip all Phase 2 graph metrics (centrality, cycles, critical path, k-core, articulation points, slack) (`1`/`0`). | (disabled) |
 | `BV_TEST_MODE` | Any value: test harness mode; suppresses browser opening, terminal capability queries, and the background worker's idle GC tuning. | (unset) |
 | `BV_THEME` | Pin the TUI palette: `light` or `dark` (overridden by `--theme`). | (auto-detect) |
 | `BV_TUI_AUTOCLOSE_MS` | Quit the TUI automatically after this many milliseconds (for automated tests). | (unset) |
@@ -45,3 +45,8 @@
 | `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker. | (default) |
 | `BV_WORKER_METRICS` | Truthy value: the background worker records its own metrics. | (off) |
 | `BV_WORKER_TRACE` | Path to a trace file the background worker appends to. | (off) |
+| `SOURCE_DATE_EPOCH` | Unix epoch timestamp (seconds) pinning robot report timestamps and running timeout-raced metrics to deterministic completion. | (unset) |
+| `TOON_DEFAULT_FORMAT` | Fallback robot output format (`json` or `toon`) when `--format` and `BV_OUTPUT_FORMAT` are unset. | (unset) |
+| `TOON_INDENT` | Indentation width (0–16) passed to TOON encoding. | (default) |
+| `TOON_KEY_FOLDING` | Key folding mode passed to TOON encoding. | (default) |
+| `TOON_STATS` | Set to `1` to write JSON vs TOON token estimates to stderr (`--stats` sets it). | (off) |

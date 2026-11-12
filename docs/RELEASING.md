@@ -57,6 +57,7 @@ packaged executable was rebuilt.
 ## The gate
 
 ```bash
+scripts/release_gate.sh preflight           # zero-mutation toolchain, clean-tree & helper check
 scripts/release_gate.sh                     # everything, ~12 minutes on the reference machine (8 of them stage 8)
 RELEASE_GATE_SKIP="8" scripts/release_gate.sh   # ~4 minutes: skip the benchmark comparison for quick loops (see below)
 ```
@@ -434,6 +435,22 @@ six archive/preservation scenarios also pass on a separate native host.
 The Windows optional-source rerun above is a separate failed result, not part
 of that default-suite pass. Raw release and verification evidence is retained
 under `/data/tmp/bv-release-v0.24.1-20260908`.
+
+### v0.26.0 verification and receipt qualification (2026-11-02)
+
+On 2026-11-02, [v0.26.0](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.26.0)
+was published with all five platform archives (`bv_0.26.0_<os>_<arch>.tar.gz`
+and `.zip`) and `checksums.txt`. As disclosed in `CHANGELOG.md`, the v0.26.0
+release notes record one failed E2E stage and an ineligible diagnostic receipt;
+that historical exception does not authorize any future release (including
+`v0.26.1`) to bypass a complete 11-stage clean-source gate. On hosts without
+`goreleaser` or `pwsh`, `scripts/release_gate.sh preflight` reports the missing
+helpers up front, `tests/scripts/release_gate_test.sh gate-mechanics` still
+executes all five pure-Go cross-builds and tamper negative controls before
+returning skip sentinel `200` (marking stage 10 `SKIPPED` and the receipt
+ineligible), and `scripts/release_gate.sh package` fails closed. Native macOS
+(`darwin/amd64`, `darwin/arm64`) and native `linux/arm64` smoke verification
+remain tracked separately under `bv-oonu.9` and `bv-oonu.10`.
 
 ## Vendored dependency patches
 

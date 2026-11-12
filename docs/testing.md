@@ -333,17 +333,17 @@ if _, ok := result["generated_at"]; !ok {
 
 ## CI Integration
 
-The checked-in CI workflow is configured for pushes and pull requests, but
-the CI, Release, Fuzz, and Flake Update workflows were `disabled_manually`
-when checked on 2026-09-05 with `gh workflow list --all`. A workflow file or
-badge does not establish that a run occurred. Check the live workflow state
-and run results before relying on CI or Codecov coverage.
+GitHub Actions is permanently prohibited in this repository; all CI, checks,
+builds, tests, and releases execute through DSR (Doodlestein Self-Releaser) or
+local/RCH gate invocations. Retained `.github/workflows/*.yml` definitions
+remain only as static input for local DSR/`act` execution and pinned-SHA policy
+verification, never for hosted or self-hosted GitHub Actions dispatch.
 
-Run the source tests locally or through RCH. Releases require the complete
-local gate described in [RELEASING.md](RELEASING.md). The checked-in CI gate
-invocation skips benchmarks and allows missing checks; it is diagnostic and
-cannot authorize packaging. Its log-upload path also needs updating before
-the workflow is re-enabled. No workflow was re-enabled by this change.
+Run the source tests locally, through DSR, or through RCH. Releases require the
+complete clean-source gate described in [RELEASING.md](RELEASING.md) (check
+readiness first with `scripts/release_gate.sh preflight`). Diagnostic runs with
+skipped stages or missing helpers exit `2` (`INCOMPLETE; NOT ELIGIBLE FOR
+RELEASE`) and cannot authorize packaging.
 
 For local stress-testing, consider running the race detector:
 

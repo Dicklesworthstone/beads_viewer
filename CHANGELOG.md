@@ -43,25 +43,27 @@ establish a published release or a passing release receipt.
 ### Security build dependencies and release checks
 
 - Address [#215](https://github.com/Dicklesworthstone/beads_viewer/issues/215)
-  by requiring Go **1.26.10** and upgrading `golang.org/x/net` from v0.59.0
-  to **v0.62.0**. Go's module resolver also selects `x/sync` v0.24.0,
-  `x/sys` v0.49.0, `x/term` v0.47.0 and `x/text` v0.43.0. Regenerate the
-  affected Go vendor sources and checksums so offline builds use those versions.
+  (`1774a69d`) by requiring Go **1.26.10** and upgrading `golang.org/x/net`
+  from v0.59.0 to **v0.62.0**. Go's module resolver also selects `x/sync`
+  v0.24.0, `x/sys` v0.49.0, `x/term` v0.47.0 and `x/text` v0.43.0. Regenerate
+  the affected Go vendor sources and checksums so offline builds use those
+  versions.
 - Select the compiler explicitly from `go.mod` in the retained DSR/`act`
   workflow inputs, disable automatic switching in release builds, and reject
   a compiler that differs from the approved pin. The Nix package and shell
   select Go 1.26.10 without changing the supported platform set.
 - Require pinned source-mode `govulncheck` analysis for all five release
-  targets. Bind the scanner and successful scan logs to the existing release
-  receipt. Verify each packaged executable's compiler and linked dependency
-  versions in addition to its revision, clean-source flag and checksums.
-  Scan the executable extracted from each final archive before sealing it;
-  failed scans or reseals invalidate earlier artifact approval.
-  Reject ambient build flags that could supply external source or module
-  inputs outside that receipt.
-- Keep publication separate from packaging. Archive names, target matrix,
-  `CGO_ENABLED=0`, `checksums.txt`, and Homebrew/Scoop compatibility remain
-  unchanged. Source installers verify the compiled toolchain before installation.
+  targets (`518f1798`, `ec20e555`, `2e09b08e`, `ea614392`, `b522cfe4`). Bind
+  the scanner and successful scan logs to the existing release receipt. Verify
+  each packaged executable's compiler and linked dependency versions in
+  addition to its revision, clean-source flag and checksums. Scan the
+  executable extracted from each final archive before sealing it; failed scans
+  or reseals invalidate earlier artifact approval. Reject ambient build flags
+  that could supply external source or module inputs outside that receipt.
+- Keep publication separate from packaging (`daabdc9f`). Archive names, target
+  matrix, `CGO_ENABLED=0`, `checksums.txt`, and Homebrew/Scoop compatibility
+  remain unchanged. Source installers verify the compiled toolchain before
+  installation.
 
 The fixes cover the reported certificate-trust, standard-library and HTML
 parser/renderer advisories at their upstream fixed versions. The original
@@ -70,18 +72,89 @@ every reported vulnerability has an exploitable execution path in bv.
 
 ### Changes already on main after v0.26.0
 
-- Hooks require explicit digest approval and credential grants, support
-  approved direct argument-vector execution, and enforce process/output limits.
-- The updater respects credential denial, confines credentials to secure
-  GitHub origins and redirects, and bounds version-probe output.
-- History matching recognizes lowercase references and scopes cached results
-  to the matcher policy. Tracker refreshes are bounded and preserve validated
-  snapshots.
-- Exports require authorization for recipe template reads, confine output
-  writes, and follow the loaded workspace in watch mode. Preview serving
-  restricts origins and retains the selected directory.
-- Editor saves are bound to a verified tracker and source session, preserving
-  drafts on failure and checking authority again before writes and refreshes.
+- **Hooks security and macOS process-group lifecycle** (`57efd344`, `c818b65e`,
+  `17e24130`, `803db064`, `f2297dc3`): require explicit SHA-256 digest approval
+  and user credential grants beyond the operational environment, support
+  approved direct `argv` execution, enforce process lifetime and bounded output,
+  and allow approved hooks to succeed on macOS once the leader process group
+  exits.
+- **Self-updater confinement and version-probe safety** (`db8e1c3c`, `7ab7f3d2`,
+  `ad764169`): honor explicit credential denial and reject ambiguous consent,
+  bind credentials strictly to HTTPS GitHub origins across redirects, and
+  enforce `--version` probe output caps through `io.Copy`.
+- **Export confinement, preview origin checks, bounded loader refreshes, and
+  authority-bound UI saves** (`cd8b21c4`, `128fdda7`, `5b0701df`, `cc219bb3`,
+  `4fba7a00`, `2f5b1d01`): require explicit user authorization for recipe
+  template reads, bound `bd` refreshes while preserving validated snapshots,
+  confine bundle writes and replace linked outputs safely, enforce local
+  preview origins while holding the served directory, follow loaded workspace
+  routes in watch mode, and bind editor saves to verified tracker authority.
+- **Case-insensitive history reference matching and cache scoping**
+  (`538a486d`): recognize lowercase bead references in commit messages and
+  scope correlation caches to the active matcher policy.
+- **Ready-by-default `--robot-triage` recommendations and non-null `labels`**
+  (`964cb5ce`, `516e96aa`): emit `labels: []` arrays for unlabeled
+  recommendations and filter `--robot-triage` to ready work by default with
+  `--robot-include-inactive` opt-in.
+- **Installer helper isolation and tracker housekeeping** (`78abab68`,
+  `3b3625b7`): drain ready output in `install.ps1` tests, isolate tracker test
+  helpers, and record root-cause follow-up on `bv-8k8m` after `bv-apal.20`.
+
+### Post-516e96aa reality-check gap closure (2026-11-12)
+
+- **Robot CLI contract, `--robot-drift`, and environment confinement**
+  (`bv-apal.28`, `bv-apal.29`): derive primary robot flag sets and TTY query
+  suppression directly from `RobotRegistry`; validate all 42 registered primary
+  robot commands live against `--robot-schema` (fixing `null` slices in
+  `CompareSnapshots` and `FindRelatedWorkAt`); register `--robot-drift` and
+  wire live issue-level drift alerts; execute `--agents-add`/`--agents-update`/
+  `--agents-remove` under `BV_ROBOT=1` with JSON receipts; route
+  `--bead-history` with full `RobotEnvelope`; and enforce `internal/env`
+  confinement via AST inspection.
+- **Unified actionable-leaf readiness and `v8` `AGENTS.md` blurb**
+  (`bv-apal.23`, `bv-apal.24`): filter umbrella container epics with open
+  children and unify ready-leaf recommendation defaults across `--robot-triage`,
+  `--emit-script`, `--agent-brief`, `--priority-brief`, and `--export-pages`
+  (with `--robot-include-inactive` opt-in), backed by `v8` `AGENTS.md` blurb
+  synchronization.
+- **Git correlation engine overhaul** (`bv-pzpv`, `bv-apal.27`): replace
+  per-commit regex scans with a single-pass Aho-Corasick dot-hierarchy matcher
+  (`bv-oonu.21` never false-matches `bv-oonu`), synthesize `EventClaimed` and
+  `EventClosed` lifecycle transitions for accurate `temporal_author` windows,
+  admit mixed `.beads/` + code commits, emit non-null `commits: []` and
+  deduplicated `BeadsClosed` slices, enforce `0700`/`0600` cache permissions,
+  and repair `IncrementalCorrelator`.
+- **Canonical subdirectory resolution, export/updater confinement, and watcher
+  recovery** (`bv-apal.25`, `bv-apal.26`, `bv-02ez`, `bv-eput`, `bv-oonu.22`,
+  `bv-oonu.23`): resolve `.beads/`, `.bv/`, `AGENTS.md`, `--as-of`, and
+  `--workspace` from the canonical project root across nested subdirectories;
+  decode `.bv/hooks.yaml` strictly with `yaml.Decoder.KnownFields(true)`;
+  confine standalone HTML/DOT/SVG/Markdown exports via `SafeWriteOutput`
+  (`os.OpenRoot`); track watcher replacement via `os.SameFile` with bounded
+  0-byte truncate+rewrite settle retries and deterministic poll-clock tests;
+  verify dry-run updater `checksums.txt` digests and stage binaries in
+  `binaryDir`; and treat `EPERM` same-host PIDs as alive in `pkg/instance`.
+- **Actionable centrality, unbiased ETA/Graham bounds, status conservation, and
+  metamorphic proofs** (`bv-apal.21`, `bv-apal.22`, `bv-apal.32`,
+  `bv-apal.33`): share `CandidateIssueSet` readiness across `--robot-priority`,
+  `--robot-plan`, and `--robot-whatif`; compute active non-closed centrality
+  normalization and `--robot-insights` bottlenecks/articulation/k-core; align
+  `effectiveWorkMinutes` across ETA numerator and velocity denominator with
+  Bühlmann–Straub empirical-Bayes label shrinkage and Graham (1969) parallel
+  makespan bounds; conserve `StatusPartition` across triage
+  (`readiness_blocked_count` + `deferred_or_parked_count`, preserving Issue
+  `#165` `blocked_count`), plan, baseline, and drift; honor `.bv/drift.yaml`
+  `sprint_blocked_days` and `sprint_inactive_days`; wire `pkg/metrics` timers;
+  and enforce `rapid` metamorphic invariants (`MR-1`..`MR-5`) with a `6/6`
+  mutation-kill matrix.
+- **TUI state-machine polish, literal `docgen`, and `release_gate.sh preflight`**
+  (`bv-apal.30`, `bv-apal.31`, `bv-jgz0`, `bv-8k8m`, `bv-oonu.24`,
+  `bv-oonu.25`): preserve `$EDITOR` literals in `internal/docgen`; repair TUI
+  focus/tutorial/shortcut transitions and `TreeModel.saveState` guards; honor
+  `TMPDIR` in WASM/vendor scripts and clean up `install_ps1_test.sh` background
+  jobs; add `scripts/release_gate.sh preflight` with cached-toolchain hints;
+  stamp untagged VCS builds as `v0.26.1-dev+<rev>` (`flake.nix` pointing to
+  `blob/main/LICENSE`); and synchronize `MANIFEST.json` and release docs.
 
 ## v0.26.0 — 2026-11-02
 

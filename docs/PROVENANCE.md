@@ -129,8 +129,12 @@ unoptimized build requires its own reviewed pipeline; it is not this artifact.
 
 Install the dated compiler and target, cache the locked dependencies, and
 provide the two release binaries using `WASM_BINDGEN` and `WASM_OPT`. The
-build itself makes no network requests. Downloads must use the User-Agent
-`OpenAI File Downloader, XaiImageApiFetch/1.0`. The reviewed upstream archives
+build itself makes no network requests. Manual artifact fetches must identify
+this project honestly in `User-Agent` (for example
+`beads_viewer-agent (+https://github.com/Dicklesworthstone/beads_viewer)`,
+matching the self-updater's `beads-viewer-update-check` and
+`beads-viewer-updater` client identifiers in `pkg/updater/updater.go`; never
+impersonate another product's or company's client). The reviewed upstream archives
 were fetched from immutable release URLs and checked against GitHub's release
 digests:
 

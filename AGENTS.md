@@ -900,7 +900,7 @@ Also, if I ask you to explicitly use your built-in TODO functionality, don't com
 
 For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "beads_viewer-agent (+https://github.com/Dicklesworthstone/beads_viewer)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.
 
-<!-- bv-agent-instructions-v7 -->
+<!-- bv-agent-instructions-v8 -->
 
 ---
 
@@ -943,7 +943,7 @@ bv --robot-graph --format toon
 bv --robot-triage --format toon --stats
 ```
 
-Recommendations can include blocked or assigned work; `triage.quick_ref.top_picks` reflects snapshot readiness. A suggested action records its original local ID, working directory, and tracker route. Use that route rather than a namespaced display ID or an unrelated current directory. Inspect current tracker state before execution: analysis does not reserve work or guarantee that a later claim succeeds.
+By default, `triage.recommendations` and `triage.quick_ref.top_picks` surface ready, actionable leaf work (pass `--robot-include-inactive` to inspect blocked, deferred, parked, or umbrella epic items; assigned `in_progress` items remain marked `claimable=false`). A suggested action records its original local ID, working directory, and tracker route. Use that route rather than a namespaced display ID or an unrelated current directory. Inspect current tracker state before execution: analysis does not reserve work or guarantee that a later claim succeeds.
 
 #### Other bv Commands
 
@@ -953,8 +953,10 @@ Recommendations can include blocked or assigned work; `triage.quick_ref.top_pick
 | `--robot-priority` | Priority misalignment detection with confidence |
 | `--robot-insights` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core |
 | `--robot-alerts` | Stale issues, blocking cascades, priority mismatches |
+| `--check-drift --robot-drift` | Baseline drift evaluation + live issue health alerts |
 | `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions, cycle breaks |
 | `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues |
+| `--bead-history <id>` | Single-bead lifecycle events and correlated git commits |
 | `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
 
 Robot analysis commands default to JSON; `--format toon` selects TOON, and `--robot-help` defaults to text. In JSON mode, `--graph-format=dot` or `mermaid` puts diagram text in the `graph` field (`bv --robot-graph --graph-format=dot | jq -r .graph`).
