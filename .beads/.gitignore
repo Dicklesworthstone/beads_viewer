@@ -56,3 +56,7 @@ recovery_*/
 # fsqlite migration markers; never committed, removed only on maintainer approval
 *.bad_*
 *.fsqlite-migration-state
+
+# Local br WAL index directories and TUI tree-view fold state
+.br-wal-index*/
+tree-state.json
