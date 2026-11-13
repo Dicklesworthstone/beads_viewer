@@ -685,3 +685,25 @@ func TestEmbeddedViewerRendersComments(t *testing.T) {
 		t.Fatal("index.html must show a comment count header (#187)")
 	}
 }
+
+func TestViewerJS_NoExternalCDNFallbackUnderSelfCSP(t *testing.T) {
+	js, err := ViewerAssetsFS.ReadFile("viewer_assets/viewer.js")
+	if err != nil {
+		t.Fatalf("read embedded viewer.js: %v", err)
+	}
+	viewerJS := string(js)
+	if strings.Contains(viewerJS, "cdn.jsdelivr.net") {
+		t.Fatal("viewer.js must not inject cdn.jsdelivr.net scripts under 'self' CSP")
+	}
+	if !strings.Contains(viewerJS, "./vendor/sql-wasm.js") {
+		t.Fatal("viewer.js must load ./vendor/sql-wasm.js locally")
+	}
+
+	htmlBytes, err := ViewerAssetsFS.ReadFile("viewer_assets/index.html")
+	if err != nil {
+		t.Fatalf("read embedded index.html: %v", err)
+	}
+	if !strings.Contains(string(htmlBytes), "script-src 'self'") {
+		t.Fatal("index.html must retain strict script-src 'self' CSP")
+	}
+}

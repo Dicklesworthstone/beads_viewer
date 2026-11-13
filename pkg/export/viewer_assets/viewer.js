@@ -407,40 +407,18 @@ async function initSqlJs() {
   // Load sql.js from CDN (with WASM)
   const sqlPromise = initSqlJs.cached || (initSqlJs.cached = new Promise(async (resolve, reject) => {
     try {
-      let usedLocal = false;
-      // Try loading from local vendor first
-      let sqlJs;
-      try {
-        const script = document.createElement('script');
-        script.src = './vendor/sql-wasm.js';
-        document.head.appendChild(script);
-        await new Promise((res, rej) => {
-          script.onload = res;
-          script.onerror = rej;
-        });
-        sqlJs = window.initSqlJs;
-        usedLocal = true;
-      } catch {
-        // Fallback to CDN
-        const script = document.createElement('script');
-        script.src = 'https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js';
-        document.head.appendChild(script);
-        await new Promise((res, rej) => {
-          script.onload = res;
-          script.onerror = rej;
-        });
-        sqlJs = window.initSqlJs;
-        usedLocal = false;
-      }
+      // Load sql.js strictly from local vendored assets (enforced by 'self' CSP).
+      const script = document.createElement('script');
+      script.src = './vendor/sql-wasm.js';
+      document.head.appendChild(script);
+      await new Promise((res, rej) => {
+        script.onload = res;
+        script.onerror = () => rej(new Error('Failed to load local ./vendor/sql-wasm.js'));
+      });
+      const sqlJs = window.initSqlJs;
 
       const SQL = await sqlJs({
-        locateFile: file => {
-          // Prefer local vendored wasm when available for offline use
-          if (usedLocal) {
-            return `./vendor/${file}`;
-          }
-          return `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}`;
-        }
+        locateFile: file => `./vendor/${file}`
       });
 
       DIAGNOSTICS.wasm = true;
