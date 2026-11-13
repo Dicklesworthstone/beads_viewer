@@ -8,11 +8,13 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -267,6 +269,10 @@ type DataSnapshot struct {
 	LoadError    error     // Non-nil if last load had recoverable errors
 	ErrorTime    time.Time // When error occurred
 	StaleWarning bool      // True if data is from previous successful load
+
+	beadsPath       string
+	projectDir      string
+	explicitWeights bool
 }
 
 func (s *DataSnapshot) attachPooledIssues(refs []*model.Issue) {
@@ -380,11 +386,14 @@ func (l *GraphLayout) UpdatePhase2Ranks(stats *analysis.GraphStats) {
 // SnapshotBuilder constructs DataSnapshots from raw data.
 // This is used by the BackgroundWorker to build new snapshots.
 type SnapshotBuilder struct {
-	issues   []model.Issue
-	analyzer *analysis.Analyzer
-	analysis *analysis.GraphStats
-	recipe   *recipe.Recipe
-	cfg      snapshotBuildConfig
+	issues          []model.Issue
+	analyzer        *analysis.Analyzer
+	analysis        *analysis.GraphStats
+	recipe          *recipe.Recipe
+	cfg             snapshotBuildConfig
+	beadsPath       string
+	projectDir      string
+	explicitWeights bool
 
 	prevSnapshot *DataSnapshot
 	diff         *analysis.IssueDiff
@@ -433,8 +442,74 @@ func issuesWithoutTombstones(issues []model.Issue) []model.Issue {
 func (b *SnapshotBuilder) WithWeights(w *analysis.Weights) *SnapshotBuilder {
 	if w != nil {
 		b.analyzer.SetWeights(*w)
+		b.explicitWeights = true
 	}
 	return b
+}
+
+// WithBeadsPath associates a .beads/<file>.jsonl path with this snapshot build
+// so baseline drift alerts and .beads/feedback.json weights resolve against the
+// target workspace even when the process CWD is a subdirectory.
+func (b *SnapshotBuilder) WithBeadsPath(beadsPath string) *SnapshotBuilder {
+	b.beadsPath = beadsPath
+	if b.projectDir == "" && beadsPath != "" {
+		b.projectDir = cass.WorkspaceFromBeadsPath(beadsPath)
+	}
+	return b
+}
+
+// WithProjectDir associates a project root directory with this snapshot build.
+func (b *SnapshotBuilder) WithProjectDir(projectDir string) *SnapshotBuilder {
+	b.projectDir = projectDir
+	return b
+}
+
+func (b *SnapshotBuilder) resolvedProjectDir() string {
+	if strings.TrimSpace(b.projectDir) != "" {
+		return b.projectDir
+	}
+	if strings.TrimSpace(b.beadsPath) != "" {
+		return cass.WorkspaceFromBeadsPath(b.beadsPath)
+	}
+	return ""
+}
+
+func (b *SnapshotBuilder) resolvedBeadsDir() string {
+	if strings.TrimSpace(b.beadsPath) != "" {
+		return filepath.Dir(b.beadsPath)
+	}
+	if strings.TrimSpace(b.projectDir) != "" {
+		return filepath.Join(b.projectDir, ".beads")
+	}
+	return ""
+}
+
+func (s *DataSnapshot) resolvedBeadsDir() string {
+	if s == nil {
+		return ""
+	}
+	if strings.TrimSpace(s.beadsPath) != "" {
+		return filepath.Dir(s.beadsPath)
+	}
+	if strings.TrimSpace(s.projectDir) != "" {
+		return filepath.Join(s.projectDir, ".beads")
+	}
+	return ""
+}
+
+// feedbackWeightsForBeadsDir loads feedback.json from beadsDir and returns the
+// adjusted factor weights when enough accept/ignore samples exist to apply them;
+// nil otherwise.
+func feedbackWeightsForBeadsDir(beadsDir string) *analysis.Weights {
+	if strings.TrimSpace(beadsDir) == "" {
+		return nil
+	}
+	fb, err := analysis.LoadFeedback(beadsDir)
+	if err != nil || fb == nil || !fb.Applies() {
+		return nil
+	}
+	w := fb.Weights()
+	return &w
 }
 
 // feedbackWeightsForBeadsPath loads .beads/feedback.json next to the issue
@@ -444,15 +519,10 @@ func (b *SnapshotBuilder) WithWeights(w *analysis.Weights) *SnapshotBuilder {
 // priority hints (p) and the actionable view rank issues the same way
 // --robot-triage does.
 func feedbackWeightsForBeadsPath(beadsPath string) *analysis.Weights {
-	if beadsPath == "" {
+	if strings.TrimSpace(beadsPath) == "" {
 		return nil
 	}
-	fb, err := analysis.LoadFeedback(filepath.Dir(beadsPath))
-	if err != nil || fb == nil || !fb.Applies() {
-		return nil
-	}
-	w := fb.Weights()
-	return &w
+	return feedbackWeightsForBeadsDir(filepath.Dir(beadsPath))
 }
 
 // WithAnalysis sets the pre-computed analysis (for when we have cached results).

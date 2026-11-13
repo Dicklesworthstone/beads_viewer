@@ -1631,6 +1631,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	analyzeStart := time.Now()
 	analyzeErr := w.safeCompute("analyze_phase1", func() error {
 		builder := NewSnapshotBuilder(issues, authority).
+			WithBeadsPath(w.beadsPath).
 			WithRecipe(currentRecipe).
 			WithWeights(feedbackWeightsForBeadsPath(w.beadsPath)).
 			WithBuildConfig(snapshotBuildConfigForTier(tier))
