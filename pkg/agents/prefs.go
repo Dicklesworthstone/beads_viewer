@@ -149,6 +149,31 @@ func ShouldPromptForAgentFile(workDir string) bool {
 	return true
 }
 
+// ShouldPromptForAgentUpgrade determines if we should offer to upgrade an
+// existing outdated AGENTS.md / CLAUDE.md blurb to targetVersion.
+// Unlike ShouldPromptForAgentFile, a prior acceptance of an older blurb version
+// does not suppress upgrade prompts, unless the user selected "don't ask again"
+// or already declined/accepted targetVersion (or newer).
+func ShouldPromptForAgentUpgrade(workDir string, targetVersion int) bool {
+	pref, err := LoadAgentPromptPreference(workDir)
+	if err != nil {
+		return true
+	}
+	if pref == nil {
+		return true
+	}
+	if pref.DontAskAgain {
+		return false
+	}
+	if pref.BlurbVersionAdded >= targetVersion {
+		return false
+	}
+	if !pref.DeclinedAt.IsZero() && pref.BlurbVersionOffered >= targetVersion {
+		return false
+	}
+	return true
+}
+
 // RecordDecline records that the user declined the AGENTS.md prompt.
 func RecordDecline(workDir string, dontAskAgain bool) error {
 	pref := AgentPromptPreference{

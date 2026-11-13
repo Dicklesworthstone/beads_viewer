@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/agents"
@@ -20,13 +21,15 @@ const (
 
 // AgentPromptModal is a modal dialog for the AGENTS.md prompt.
 type AgentPromptModal struct {
-	selection int    // 0=yes, 1=no, 2=never
-	filePath  string // Which file we're offering to modify
-	fileType  string // AGENTS.md or CLAUDE.md
-	result    AgentPromptResult
-	theme     Theme
-	width     int
-	height    int
+	selection       int    // 0=yes, 1=no, 2=never
+	filePath        string // Which file we're offering to modify
+	fileType        string // AGENTS.md or CLAUDE.md
+	isUpgrade       bool   // True when offering to update an outdated blurb
+	existingVersion int    // Existing blurb version (0 for legacy/unversioned)
+	result          AgentPromptResult
+	theme           Theme
+	width           int
+	height          int
 }
 
 // NewAgentPromptModal creates a new AGENTS.md prompt modal.
@@ -40,6 +43,15 @@ func NewAgentPromptModal(filePath, fileType string, theme Theme) AgentPromptModa
 		width:     60,
 		height:    20,
 	}
+}
+
+// NewAgentUpgradePromptModal creates an AGENTS.md prompt modal configured to
+// offer an in-place upgrade of an outdated blurb version.
+func NewAgentUpgradePromptModal(filePath, fileType string, existingVersion int, theme Theme) AgentPromptModal {
+	m := NewAgentPromptModal(filePath, fileType, theme)
+	m.isUpgrade = true
+	m.existingVersion = existingVersion
+	return m
 }
 
 // Update handles input for the modal.
@@ -132,23 +144,42 @@ func (m AgentPromptModal) View() string {
 	// Build content
 	var b strings.Builder
 
-	// Title
-	b.WriteString(titleStyle.Render("📝 Enhance AI Agent Integration?"))
-	b.WriteString("\n\n")
+	// Title & Body
+	if m.isUpgrade {
+		b.WriteString(titleStyle.Render("🔄 Update AI Agent Instructions?"))
+		b.WriteString("\n\n")
 
-	// Body
-	b.WriteString(bodyStyle.Render("We found " + m.fileType + " in this project but it"))
-	b.WriteString("\n")
-	b.WriteString(bodyStyle.Render("doesn't include beads_viewer instructions."))
-	b.WriteString("\n\n")
-	b.WriteString(bodyStyle.Render("Adding these helps AI coding agents understand"))
-	b.WriteString("\n")
-	b.WriteString(bodyStyle.Render("how to use your issue tracking workflow."))
-	b.WriteString("\n\n")
+		existingDesc := "a legacy unversioned format"
+		if m.existingVersion > 0 {
+			existingDesc = fmt.Sprintf("v%d", m.existingVersion)
+		}
+		b.WriteString(bodyStyle.Render(fmt.Sprintf("We found %s with outdated beads_viewer instructions (%s).", m.fileType, existingDesc)))
+		b.WriteString("\n")
+		b.WriteString(bodyStyle.Render(fmt.Sprintf("Would you like to update the instructions blurb to v%d?", agents.BlurbVersion)))
+		b.WriteString("\n\n")
+		b.WriteString(bodyStyle.Render("Updating ensures AI coding agents have the latest"))
+		b.WriteString("\n")
+		b.WriteString(bodyStyle.Render("robot flags and workflow guidance."))
+		b.WriteString("\n\n")
 
-	// Preview
-	b.WriteString(previewHeaderStyle.Render("Preview of content to add:"))
-	b.WriteString("\n")
+		b.WriteString(previewHeaderStyle.Render(fmt.Sprintf("Preview of updated content (v%d):", agents.BlurbVersion)))
+		b.WriteString("\n")
+	} else {
+		b.WriteString(titleStyle.Render("📝 Enhance AI Agent Integration?"))
+		b.WriteString("\n\n")
+
+		b.WriteString(bodyStyle.Render("We found " + m.fileType + " in this project but it"))
+		b.WriteString("\n")
+		b.WriteString(bodyStyle.Render("doesn't include beads_viewer instructions."))
+		b.WriteString("\n\n")
+		b.WriteString(bodyStyle.Render("Adding these helps AI coding agents understand"))
+		b.WriteString("\n")
+		b.WriteString(bodyStyle.Render("how to use your issue tracking workflow."))
+		b.WriteString("\n\n")
+
+		b.WriteString(previewHeaderStyle.Render("Preview of content to add:"))
+		b.WriteString("\n")
+	}
 
 	preview := getBlurbPreview()
 	b.WriteString(previewBoxStyle.Render(preview))
@@ -159,6 +190,9 @@ func (m AgentPromptModal) View() string {
 
 	// Yes button
 	yesLabel := "Yes, add it"
+	if m.isUpgrade {
+		yesLabel = "Yes, update it"
+	}
 	if m.selection == 0 {
 		buttons = append(buttons, selectedButton.Render(yesLabel))
 	} else {
@@ -202,6 +236,16 @@ func (m AgentPromptModal) Result() AgentPromptResult {
 // FilePath returns the path of the file to modify.
 func (m AgentPromptModal) FilePath() string {
 	return m.filePath
+}
+
+// IsUpgrade returns true when the modal offers to update an outdated blurb.
+func (m AgentPromptModal) IsUpgrade() bool {
+	return m.isUpgrade
+}
+
+// ExistingVersion returns the detected outdated blurb version (0 for legacy).
+func (m AgentPromptModal) ExistingVersion() int {
+	return m.existingVersion
 }
 
 // SetSize sets the modal dimensions.
