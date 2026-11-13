@@ -1467,9 +1467,21 @@ func ComputeTriageScoresWithOptions(issues []model.Issue, opts TriageScoringOpti
 
 	// Build analyzer for base scoring and graph analysis
 	analyzer := NewAnalyzer(issues)
-	baseScores := analyzer.ComputeImpactScores()
+	stats := analyzer.Analyze()
 
+	return ComputeTriageScoresFromAnalyzer(analyzer, &stats, opts, analyzer.Now())
+}
+
+// ComputeTriageScoresFromAnalyzer calculates triage scores reusing an existing
+// Analyzer and precomputed GraphStats at the specified evaluation instant.
+func ComputeTriageScoresFromAnalyzer(analyzer *Analyzer, stats *GraphStats, opts TriageScoringOptions, now time.Time) []TriageScore {
+	if analyzer == nil || stats == nil || len(analyzer.issueMap) == 0 {
+		return nil
+	}
+
+	baseScores := analyzer.ComputeImpactScoresFromStats(stats, now)
 	triageCtx := NewTriageContext(analyzer)
+	triageCtx.SetStats(stats)
 
 	return computeTriageScoresFromImpact(baseScores, triageCtx, opts)
 }
