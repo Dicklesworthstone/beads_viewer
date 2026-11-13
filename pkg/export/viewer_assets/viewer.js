@@ -1026,9 +1026,12 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
 
   // Search filter (LIKE-based, FTS5 handled separately)
   if (filters.search) {
-    clauses.push(`(${col('title')} LIKE ? OR ${col('description')} LIKE ? OR ${col('id')} LIKE ?)`);
-    const searchTerm = `%${filters.search}%`;
-    params.push(searchTerm, searchTerm, searchTerm);
+    const tokens = String(filters.search).trim().split(/\s+/).filter(Boolean);
+    for (const token of tokens) {
+      clauses.push(`(${col('title')} LIKE ? OR ${col('description')} LIKE ? OR ${col('id')} LIKE ? OR COALESCE(${col('labels')}, '') LIKE ? OR COALESCE(${col('assignee')}, '') LIKE ?)`);
+      const searchTerm = `%${token}%`;
+      params.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
+    }
   }
 
   return { clauses, params };
@@ -1319,15 +1322,27 @@ function searchIssues(term, options = {}) {
   }
 
   const maxBM25 = Math.max(...rows.map(r => Math.abs(r.bm25_score ?? 0)), 0);
-  const normalized = rows.map(r => ({
-    ...r,
-    textScore: maxBM25 > 0 ? (1 - Math.min(Math.abs(r.bm25_score ?? 0) / maxBM25, 1)) : 0.5,
-    blockerCount: r.blocker_count ?? r.blocked_by_count ?? 0,
-    updatedAt: r.updated_at,
-    pagerank: r.pagerank,
-    status: r.status,
-    priority: r.priority,
-  }));
+  const { hasMetrics, maxPageRank } = getPageRankBounds();
+  const normalized = rows.map(r => {
+    const textScore = maxBM25 > 0
+      ? (1 - Math.min(Math.abs(r.bm25_score ?? 0) / maxBM25, 1))
+      : computeLexicalTextScore(r, term);
+    let normalizedPageRank = 0.5;
+    if (hasMetrics) {
+      normalizedPageRank = maxPageRank > 0
+        ? Math.min(1, Math.max(0, (Number(r.pagerank) || 0) / maxPageRank))
+        : 0;
+    }
+    return {
+      ...r,
+      textScore,
+      blockerCount: r.blocker_count ?? r.blocked_by_count ?? 0,
+      updatedAt: r.updated_at,
+      pagerank: normalizedPageRank,
+      status: r.status,
+      priority: r.priority,
+    };
+  });
 
   const baseWeights = HYBRID_PRESETS[preset] || HYBRID_PRESETS.default;
   const weights = adjustHybridWeightsForQuery(baseWeights, term);
@@ -1349,6 +1364,60 @@ function searchIssues(term, options = {}) {
       ...r,
       text_score: r.textScore,
     }));
+}
+
+/**
+ * Compute deterministic lexical relevance score in (0, 1] when FTS5 BM25 is unavailable.
+ */
+function computeLexicalTextScore(row, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return 0.5;
+  const tokens = q.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return 0.5;
+
+  const id = String(row.id || '').toLowerCase();
+  const title = String(row.title || '').toLowerCase();
+  const labels = String(row.labels || '').toLowerCase();
+  const assignee = String(row.assignee || '').toLowerCase();
+  const description = String(row.description || '').toLowerCase();
+
+  if (id === q || title === q) return 1.0;
+  if (id.startsWith(q) || title.startsWith(q)) return 0.95;
+  if (title.includes(q)) return 0.9;
+
+  const titleMatches = tokens.filter(t => title.includes(t)).length;
+  if (titleMatches > 0) {
+    const titleWords = title.split(/[^a-z0-9_]+/).filter(Boolean);
+    const prefixHits = tokens.filter(t => titleWords.some(w => w.startsWith(t))).length;
+    const score = 0.75 + 0.15 * (titleMatches / tokens.length) + 0.05 * (prefixHits / tokens.length);
+    return Math.min(0.95, Math.max(0.75, score));
+  }
+
+  if (tokens.some(t => id.includes(t) || labels.includes(t) || assignee.includes(t))) {
+    return 0.65;
+  }
+
+  const descMatches = tokens.filter(t => description.includes(t)).length;
+  if (descMatches > 0) {
+    return Math.min(0.55, 0.45 + 0.10 * (descMatches / tokens.length));
+  }
+
+  return 0.35;
+}
+
+/**
+ * Inspect global PageRank normalization bounds across all exported issue metrics.
+ */
+function getPageRankBounds() {
+  try {
+    const rows = execQuery('SELECT COUNT(*) AS count, MAX(pagerank) AS max_pr FROM issue_metrics');
+    const row = rows?.[0];
+    const count = Number(row?.count || 0);
+    const maxPR = Number(row?.max_pr || 0);
+    return { hasMetrics: count > 0, maxPageRank: Number.isFinite(maxPR) ? maxPR : 0 };
+  } catch {
+    return { hasMetrics: false, maxPageRank: 0 };
+  }
 }
 
 function countSearchIssues(term, filters = {}) {
@@ -2426,8 +2495,17 @@ function beadsApp() {
     graphStageTimer: null,
 
     // Heatmap & metrics mode
+    currentPreset: 'force',
     graphHeatmapActive: false,
     graphSizeMetric: 'pagerank', // pagerank | betweenness | critical | indegree
+    timeTravelAvailable: false,
+    timeTravelActive: false,
+
+    // Cycle navigator state (synced between Insights and Graph views)
+    cycleNavigatorActive: false,
+    currentCycleIdx: 0,
+    totalCycles: 0,
+    currentCyclePath: '',
 
     // Critical path highlighting
     showCriticalPath: false,
@@ -2617,6 +2695,86 @@ function beadsApp() {
         }
       });
 
+      // Sync graph cycle navigator, view mode, and time-travel state
+      document.addEventListener('bv-graph:cycleHighlightChange', (e) => {
+        this.cycleNavigatorActive = true;
+        this.currentCycleIdx = e.detail?.currentIndex ?? 0;
+        this.totalCycles = e.detail?.cycleCount ?? (this.cycleInfo?.cycleCount || 0);
+        this.currentCyclePath = e.detail?.cyclePath || '';
+      });
+      document.addEventListener('bv-graph:cycleNavigatorReset', () => {
+        this.cycleNavigatorActive = false;
+        this.currentCycleIdx = 0;
+        this.currentCyclePath = '';
+      });
+      document.addEventListener('bv-graph:timeTravelReady', (e) => {
+        this.timeTravelAvailable = (e.detail?.commits || 0) > 0;
+      });
+      document.addEventListener('bv-graph:timeTravelStart', () => {
+        this.timeTravelActive = true;
+      });
+      document.addEventListener('bv-graph:timeTravelStop', () => {
+        this.timeTravelActive = false;
+      });
+      document.addEventListener('bv-graph:viewModeChange', (e) => {
+        if (e.detail?.preset) {
+          this.currentPreset = e.detail.preset;
+        }
+      });
+
+      // Dashboard chart click-to-filter integration
+      document.addEventListener('bv-chart:priorityClick', (e) => {
+        const priority = e.detail?.priority;
+        if (priority === undefined || priority === null) return;
+        this.selectedIssue = null;
+        this.graphDetailNode = null;
+        this.filters = {
+          status: [],
+          type: [],
+          priority: [Number(priority)],
+          labels: [],
+          assignee: '',
+          hasBlockers: null,
+          isBlocking: null,
+        };
+        this.page = 1;
+        navigateToIssues(this.filters, this.sort, this.searchQuery);
+      });
+      document.addEventListener('bv-chart:typeClick', (e) => {
+        const type = e.detail?.type;
+        if (!type) return;
+        this.selectedIssue = null;
+        this.graphDetailNode = null;
+        this.filters = {
+          status: [],
+          type: [String(type)],
+          priority: [],
+          labels: [],
+          assignee: '',
+          hasBlockers: null,
+          isBlocking: null,
+        };
+        this.page = 1;
+        navigateToIssues(this.filters, this.sort, this.searchQuery);
+      });
+      document.addEventListener('bv-chart:heatmapClick', (e) => {
+        const labels = [...new Set([e.detail?.fromLabel, e.detail?.toLabel].filter(Boolean))];
+        if (labels.length === 0) return;
+        this.selectedIssue = null;
+        this.graphDetailNode = null;
+        this.filters = {
+          status: [],
+          type: [],
+          priority: [],
+          labels,
+          assignee: '',
+          hasBlockers: null,
+          isBlocking: null,
+        };
+        this.page = 1;
+        navigateToIssues(this.filters, this.sort, this.searchQuery);
+      });
+
       try {
         this.loadingMessage = 'Loading sql.js WebAssembly...';
         await loadDatabase((msg) => {
@@ -2679,6 +2837,7 @@ function beadsApp() {
           this.topByBetweenness = getTopByBetweenness(10);
           this.topByCriticalPath = getTopByCriticalPath(10);
           this.cycleInfo = getCycleInfo();
+          this.totalCycles = this.cycleInfo?.cycleCount || 0;
           this.topImpactIssues = topWhatIf(10);
           // Additional TUI-style metrics
           this.topByHITSHub = getTopByHITSHub(10);
@@ -2886,13 +3045,21 @@ function beadsApp() {
 
           // Register event listeners once (inside forceGraphReady check to avoid duplicates)
           // Events are dispatched on document, so listen there
-          document.addEventListener('bv-graph:nodeClick', (e) => {
+          const handleGraphNodeDetail = (e) => {
             const node = e.detail?.node;
             if (node) {
               this.graphDetailNode = node;
               console.log('[Viewer] Node selected for detail:', node.id);
               // Resize graph after detail pane opens (wait for transition)
               setTimeout(() => this.resizeForceGraph(), 350);
+            }
+          };
+          document.addEventListener('bv-graph:nodeClick', handleGraphNodeDetail);
+          document.addEventListener('bv-graph:nodeSelect', handleGraphNodeDetail);
+          document.addEventListener('bv-graph:selectionChange', (e) => {
+            if (e.detail && e.detail.node === null && this.graphDetailNode) {
+              this.graphDetailNode = null;
+              setTimeout(() => this.resizeForceGraph(), 250);
             }
           });
           document.addEventListener('bv-graph:backgroundClick', () => {
@@ -2938,6 +3105,8 @@ function beadsApp() {
 
         // Try to load history data for time-travel feature (bv-z38b)
         // Use cache-busting to avoid stale data from CDN
+        this.timeTravelAvailable = false;
+        this.timeTravelActive = false;
         try {
           // Optional history must not leave graph refresh locked on a stalled
           // response. The deadline also covers consumption of the JSON body.
@@ -2946,8 +3115,9 @@ function beadsApp() {
           });
           if (historyResp.ok) {
             const historyData = await historyResp.json();
-            if (this.forceGraphModule.initTimeTravel) {
-              this.forceGraphModule.initTimeTravel(historyData);
+            if (historyData?.commits?.length > 0 && this.forceGraphModule.initTimeTravel) {
+              const ready = this.forceGraphModule.initTimeTravel(historyData);
+              this.timeTravelAvailable = Boolean(ready ?? true);
               console.log('[Viewer] Time-travel history loaded');
             }
           }
@@ -3468,7 +3638,7 @@ function beadsApp() {
 
     /**
      * Apply a layout preset to the graph (bv-97)
-     * @param {string} presetName - One of: 'force', 'compact', 'spread', 'orthogonal', 'radial', 'cluster'
+     * @param {string} presetName - One of: 'force', 'compact', 'spread', 'orthogonal', 'radial', 'cluster', 'galaxy'
      */
     applyGraphPreset(presetName) {
       if (!this.forceGraphModule) {
@@ -3478,12 +3648,129 @@ function beadsApp() {
       if (this.forceGraphModule.applyPreset) {
         const success = this.forceGraphModule.applyPreset(presetName);
         if (success) {
+          this.currentPreset = presetName;
           const presets = this.forceGraphModule.getLayoutPresets?.() || {};
           const preset = presets[presetName];
           showToast(`Layout: ${preset?.name || presetName}`, 'info');
         }
+      } else if (presetName === 'galaxy' && this.forceGraphModule.setViewMode) {
+        this.forceGraphModule.setViewMode('galaxy');
+        this.currentPreset = 'galaxy';
       } else {
         showToast('Presets not available', 'warning');
+      }
+    },
+
+    /**
+     * Toggle Git history time-travel playback controls in the graph view
+     */
+    toggleTimeTravel() {
+      if (!this.forceGraphModule) {
+        showToast('Graph not initialized', 'warning');
+        return;
+      }
+      if (typeof this.forceGraphModule.toggleTimeTravel === 'function') {
+        this.timeTravelActive = Boolean(this.forceGraphModule.toggleTimeTravel());
+      } else if (this.forceGraphModule.isTimeTravelActive?.()) {
+        this.forceGraphModule.stopTimeTravel?.();
+        this.timeTravelActive = false;
+      } else {
+        this.forceGraphModule.startTimeTravel?.();
+        this.timeTravelActive = true;
+      }
+    },
+
+    /**
+     * Ensure graph view is active and ForceGraph is initialized
+     */
+    async initForceGraph() {
+      if (this.view !== 'graph') {
+        this.view = 'graph';
+        this.selectedIssue = null;
+        if (window.location.hash !== '#/graph') {
+          window.history.replaceState(null, '', '#/graph');
+        }
+        await new Promise(resolve => this.$nextTick(resolve));
+      }
+      if (this.forceGraphLoading) {
+        while (this.forceGraphLoading) {
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+      } else if (!this.forceGraphReady || !this.forceGraphModule) {
+        await this.initForceGraphView();
+      }
+      return Boolean(this.forceGraphReady && this.forceGraphModule);
+    },
+
+    async highlightCyclesInGraph() {
+      const ready = await this.initForceGraph();
+      if (!ready) return;
+      this.forceGraphModule?.toggleCycleNavigator?.();
+    },
+
+    async prevCycleInGraph() {
+      const ready = await this.initForceGraph();
+      if (!ready) return;
+      this.forceGraphModule?.prevCycle?.();
+    },
+
+    async nextCycleInGraph() {
+      const ready = await this.initForceGraph();
+      if (!ready) return;
+      this.forceGraphModule?.nextCycle?.();
+    },
+
+    async focusCycleInGraph() {
+      const ready = await this.initForceGraph();
+      if (!ready) return;
+      this.forceGraphModule?.zoomToCycle?.();
+    },
+
+    /**
+     * Set single-select label filter from dropdown
+     */
+    setLabelFilter(label) {
+      const trimmed = String(label || '').trim();
+      this.filters.labels = trimmed ? [trimmed] : [];
+      this.applyFilter();
+    },
+
+    /**
+     * Toggle a label in filters.labels (clicking label badge on card/detail/graph)
+     */
+    toggleLabelFilter(label) {
+      const trimmed = String(label || '').trim();
+      if (!trimmed) return;
+      if (!Array.isArray(this.filters.labels)) {
+        this.filters.labels = [];
+      }
+      const idx = this.filters.labels.indexOf(trimmed);
+      if (idx === -1) {
+        this.filters.labels.push(trimmed);
+      } else {
+        this.filters.labels.splice(idx, 1);
+      }
+      this.selectedIssue = null;
+      this.graphDetailNode = null;
+      this.page = 1;
+      if (this.view !== 'issues') {
+        navigateToIssues(this.filters, this.sort, this.searchQuery);
+      } else {
+        this.loadIssues();
+      }
+    },
+
+    /**
+     * Invoke an error recovery action ({ action }, { handler }, or { url })
+     */
+    runErrorAction(action) {
+      if (!action) return;
+      if (typeof action.action === 'function') {
+        action.action();
+      } else if (typeof action.handler === 'function') {
+        action.handler();
+      } else if (action.url) {
+        window.open(action.url, '_blank', 'noopener,noreferrer');
       }
     },
 
