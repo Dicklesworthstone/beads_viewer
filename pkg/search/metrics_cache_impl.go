@@ -67,32 +67,7 @@ func (l *AnalyzerMetricsLoader) LoadMetrics() (map[string]IssueMetrics, error) {
 		return map[string]IssueMetrics{}, nil
 	}
 
-	cached := analysis.NewCachedAnalyzer(l.issues, l.cache)
-	if l.config != nil {
-		cached.SetConfig(l.config)
-	}
-
-	stats := cached.AnalyzeAsync(context.Background())
-	stats.WaitForPhase2()
-
-	pageRank := stats.PageRank()
-	metrics := make(map[string]IssueMetrics, len(l.issues))
-
-	for _, issue := range l.issues {
-		pr, ok := pageRank[issue.ID]
-		if !ok {
-			pr = defaultPageRank
-		}
-		metrics[issue.ID] = IssueMetrics{
-			IssueID:      issue.ID,
-			PageRank:     pr,
-			Status:       string(issue.Status),
-			Priority:     issue.Priority,
-			BlockerCount: stats.InDegree[issue.ID],
-			UpdatedAt:    issue.UpdatedAt,
-		}
-	}
-
+	metrics, _ := l.computeMetricsAndHash(false)
 	return metrics, nil
 }
 
@@ -116,6 +91,11 @@ func (l *AnalyzerMetricsLoader) LoadMetricsWithHash() (map[string]IssueMetrics, 
 		return map[string]IssueMetrics{}, l.snapshotHash(), nil
 	}
 
+	metrics, hash := l.computeMetricsAndHash(true)
+	return metrics, hash, nil
+}
+
+func (l *AnalyzerMetricsLoader) computeMetricsAndHash(includeHash bool) (map[string]IssueMetrics, string) {
 	cached := analysis.NewCachedAnalyzer(l.issues, l.cache)
 	if l.config != nil {
 		cached.SetConfig(l.config)
@@ -125,27 +105,57 @@ func (l *AnalyzerMetricsLoader) LoadMetricsWithHash() (map[string]IssueMetrics, 
 	stats.WaitForPhase2()
 
 	pageRank := stats.PageRank()
-	metrics := make(map[string]IssueMetrics, len(l.issues))
+	hasPageRank := len(pageRank) > 0
+	maxActivePR := 0.0
+	maxAnyPR := 0.0
+	if hasPageRank {
+		for _, issue := range l.issues {
+			pr := pageRank[issue.ID]
+			if pr > maxAnyPR {
+				maxAnyPR = pr
+			}
+			if issue.Status != model.StatusClosed && issue.Status != model.StatusTombstone && pr > maxActivePR {
+				maxActivePR = pr
+			}
+		}
+	}
+	normDenom := maxActivePR
+	if normDenom <= 0 {
+		normDenom = maxAnyPR
+	}
 
+	metrics := make(map[string]IssueMetrics, len(l.issues))
 	for _, issue := range l.issues {
-		pr, ok := pageRank[issue.ID]
-		if !ok {
-			pr = defaultPageRank
+		pr := defaultPageRank
+		if hasPageRank {
+			rawPR, ok := pageRank[issue.ID]
+			switch {
+			case !ok:
+				pr = defaultPageRank
+			case normDenom > 0:
+				pr = rawPR / normDenom
+				if pr > 1.0 {
+					pr = 1.0
+				}
+			default:
+				pr = 0
+			}
 		}
 		metrics[issue.ID] = IssueMetrics{
 			IssueID:      issue.ID,
 			PageRank:     pr,
 			Status:       string(issue.Status),
 			Priority:     issue.Priority,
-			BlockerCount: stats.InDegree[issue.ID],
+			BlockerCount: cached.OpenBlockerCount(issue.ID),
 			UpdatedAt:    issue.UpdatedAt,
 		}
 	}
 
-	// Compute hash from the exact same issues used for metrics
-	hash := l.snapshotHash()
-
-	return metrics, hash, nil
+	var hash string
+	if includeHash {
+		hash = l.snapshotHash()
+	}
+	return metrics, hash
 }
 
 // Get returns metrics for an issue, computing/loading if needed.
