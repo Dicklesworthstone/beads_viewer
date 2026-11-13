@@ -790,15 +790,16 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 			} `json:"top_picks"`
 		} `json:"quick_ref"`
 		Recommendations []struct {
-			ID        string   `json:"id"`
-			Title     string   `json:"title"`
-			Type      string   `json:"type"`
-			Status    string   `json:"status"`
-			Priority  int      `json:"priority"`
-			Score     float64  `json:"score"`
-			Action    string   `json:"action"`
-			Reasons   []string `json:"reasons"`
-			Breakdown struct {
+			ID          string   `json:"id"`
+			Title       string   `json:"title"`
+			Type        string   `json:"type"`
+			Status      string   `json:"status"`
+			Priority    int      `json:"priority"`
+			Score       float64  `json:"score"`
+			Action      string   `json:"action"`
+			Reasons     []string `json:"reasons"`
+			UnblocksIDs []string `json:"unblocks_ids"`
+			Breakdown   struct {
 				PageRankNorm     float64 `json:"pagerank_norm"`
 				BetweennessNorm  float64 `json:"betweenness_norm"`
 				TimeToImpactNorm float64 `json:"time_to_impact_norm"`
@@ -811,11 +812,17 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 			Reason string  `json:"reason"`
 		} `json:"quick_wins"`
 		BlockersToClear []struct {
-			ID            string `json:"id"`
-			Title         string `json:"title"`
-			UnblocksCount int    `json:"unblocks_count"`
-			Actionable    bool   `json:"actionable"`
+			ID            string   `json:"id"`
+			Title         string   `json:"title"`
+			UnblocksCount int      `json:"unblocks_count"`
+			UnblocksIDs   []string `json:"unblocks_ids"`
+			Actionable    bool     `json:"actionable"`
 		} `json:"blockers_to_clear"`
+		Alerts []struct {
+			Type     string `json:"type"`
+			Severity string `json:"severity"`
+			Message  string `json:"message"`
+		} `json:"alerts"`
 	}
 
 	if err := json.Unmarshal(triageJSON, &triage); err != nil {
@@ -843,6 +850,21 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 		triage.QuickRef.InProgressCount,
 		triage.QuickRef.BlockedCount,
 		triage.QuickRef.ActionableCount))
+
+	if len(triage.Alerts) > 0 {
+		sb.WriteString("## ⚠️ Alerts\n\n")
+		for _, alert := range triage.Alerts {
+			icon := "ℹ️"
+			switch alert.Severity {
+			case "critical", "error":
+				icon = "🔴"
+			case "warning":
+				icon = "🟡"
+			}
+			sb.WriteString(fmt.Sprintf("- %s **%s**: %s\n", icon, alert.Type, alert.Message))
+		}
+		sb.WriteString("\n")
+	}
 
 	sb.WriteString("---\n\n")
 
@@ -933,6 +955,58 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 			))
 		}
 		sb.WriteString("\n")
+	}
+
+	// What-If Unblock Impact
+	if config.IncludeWhatIf {
+		type whatIfRow struct {
+			id      string
+			title   string
+			targets []string
+		}
+		var rows []whatIfRow
+		seen := make(map[string]bool)
+		for _, rec := range triage.Recommendations {
+			if len(rec.UnblocksIDs) > 0 && !seen[rec.ID] {
+				seen[rec.ID] = true
+				rows = append(rows, whatIfRow{id: rec.ID, title: rec.Title, targets: rec.UnblocksIDs})
+			}
+		}
+		for _, b := range triage.BlockersToClear {
+			if len(b.UnblocksIDs) > 0 && !seen[b.ID] {
+				seen[b.ID] = true
+				rows = append(rows, whatIfRow{id: b.ID, title: b.Title, targets: b.UnblocksIDs})
+			}
+		}
+		if len(rows) > 0 {
+			sb.WriteString("## 🔮 What-If Impact\n\n")
+			sb.WriteString("| Completing | Directly Unblocks | Downstream IDs |\n")
+			sb.WriteString("|------------|:-----------------:|----------------|\n")
+			limit := config.MaxBlockers
+			if limit <= 0 {
+				limit = 3
+			}
+			if limit > len(rows) {
+				limit = len(rows)
+			}
+			for i := 0; i < limit; i++ {
+				r := rows[i]
+				shown := r.targets
+				suffix := ""
+				if len(shown) > 3 {
+					suffix = fmt.Sprintf(" (+%d more)", len(shown)-3)
+					shown = shown[:3]
+				}
+				sb.WriteString(fmt.Sprintf("| **%s** %s | %d | %s%s |\n",
+					r.id,
+					truncateString(r.title, 25),
+					len(r.targets),
+					strings.Join(shown, ", "),
+					suffix,
+				))
+			}
+			sb.WriteString("\n")
+		}
 	}
 
 	// Legend
