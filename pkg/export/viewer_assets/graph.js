@@ -198,6 +198,21 @@ const LAYOUT_PRESETS = {
             cooldownTicks: 250
         },
         viewMode: VIEW_MODES.CLUSTER
+    },
+
+    // Label galaxy layout - groups by primary label with convex hulls (bv-qpt0)
+    galaxy: {
+        name: 'Label Galaxy',
+        description: 'Clusters nodes by primary label with color-coded hulls',
+        icon: '🌌',
+        config: {
+            linkDistance: 80,
+            chargeStrength: -40,
+            centerStrength: 0.05,
+            warmupTicks: 100,
+            cooldownTicks: 300
+        },
+        viewMode: VIEW_MODES.LABEL_GALAXY
     }
 };
 
@@ -1105,6 +1120,9 @@ function prepareGraphData(layout = null) {
             criticalDepth: idx !== undefined && metrics.criticalPath ? metrics.criticalPath[idx] : 0,
             eigenvector: idx !== undefined && metrics.eigenvector ? metrics.eigenvector[idx] : 0,
             kcore: idx !== undefined && metrics.kcore ? metrics.kcore[idx] : 0,
+            slack: idx !== undefined && metrics.slack ? metrics.slack[idx] : undefined,
+            hitsHub: idx !== undefined && metrics.hits?.hub ? metrics.hits.hub[idx] : undefined,
+            hitsAuth: idx !== undefined && metrics.hits?.authority ? metrics.hits.authority[idx] : undefined,
             inCycle: false,
 
             // Dependency counts. Prefer the active-blocker count from the
@@ -1418,9 +1436,9 @@ function getLinkColor(link) {
 
             // Color gradient: red (urgent) -> orange -> yellow -> cyan (relaxed)
             if (normalizedSlack < 0.25) {
-                return THEME.priority.p0 + 'aa'; // Red with alpha (very urgent)
+                return THEME.priority[0] + 'aa'; // Red with alpha (very urgent)
             } else if (normalizedSlack < 0.5) {
-                return THEME.priority.p1 + 'aa'; // Orange (moderately urgent)
+                return THEME.priority[1] + 'aa'; // Orange (moderately urgent)
             } else if (normalizedSlack < 0.75) {
                 return THEME.accent.yellow + 'aa'; // Yellow (some slack)
             } else {
@@ -2111,6 +2129,9 @@ export function getCriticalPathState() {
 // ============================================================================
 
 export function selectNode(node) {
+    if (typeof node === 'string') {
+        node = store.graph?.graphData()?.nodes?.find(n => n.id === node) || null;
+    }
     store.selectedNode = node;
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
@@ -2485,12 +2506,25 @@ export function resetView() {
     store.graph.zoom(1, 500);
 }
 
-export function setViewMode(mode) {
+export function setViewMode(mode, presetOverride = null) {
+    if (mode === 'galaxy') {
+        mode = VIEW_MODES.LABEL_GALAXY;
+    }
     store.viewMode = mode;
+
+    const modeToPreset = {
+        [VIEW_MODES.FORCE]: 'force',
+        [VIEW_MODES.HIERARCHY]: 'compact',
+        [VIEW_MODES.RADIAL]: 'radial',
+        [VIEW_MODES.CLUSTER]: 'cluster',
+        [VIEW_MODES.LABEL_GALAXY]: 'galaxy'
+    };
+    store.currentPreset = presetOverride || modeToPreset[mode] || 'force';
 
     // Deactivate galaxy mode if switching away from it
     if (mode !== VIEW_MODES.LABEL_GALAXY && labelClusterState.active) {
         deactivateLabelGalaxy();
+        store.graph?.d3Force('collision', null);
     }
 
     // Apply layout forces based on mode
@@ -2511,7 +2545,7 @@ export function setViewMode(mode) {
             applyForceLayout();
     }
 
-    dispatchEvent('viewModeChange', { mode });
+    dispatchEvent('viewModeChange', { mode, preset: store.currentPreset });
 }
 
 /**
@@ -2642,25 +2676,24 @@ function applyPreset(presetName) {
     }
     store.graph
         .warmupTicks(timeTravelState.active ? 0 : store.config.warmupTicks)
-        .cooldownTicks(store.config.cooldownTicks);
+        .cooldownTicks(store.config.cooldownTicks)
+        .d3Force('link', d3.forceLink()
+            .id(d => d.id)
+            .distance(getLinkDistance))
+        .d3Force('center', d3.forceCenter())
+        .d3Force('collision', null);
 
-    // Update view mode if specified
-    if (preset.viewMode && preset.viewMode !== store.viewMode) {
-        setViewMode(preset.viewMode);
-    }
+    // Update view mode and sync toolbar state
+    const targetMode = preset.viewMode || VIEW_MODES.FORCE;
+    setViewMode(targetMode, presetName);
 
-    // Apply custom forces if defined
+    // Apply custom forces if defined, or standard force config for force-mode presets
     if (preset.customForces) {
         applyCustomForces(preset.customForces);
-    } else {
-        // Reset to standard force configuration
+    } else if (targetMode === VIEW_MODES.FORCE) {
         store.graph
-            .d3Force('link', d3.forceLink()
-                .id(d => d.id)
-                .distance(getLinkDistance))
             .d3Force('charge', d3.forceManyBody()
                 .strength(store.config.chargeStrength))
-            .d3Force('center', d3.forceCenter())
             .d3Force('x', d3.forceX()
                 .strength(store.config.centerStrength))
             .d3Force('y', d3.forceY()
@@ -2805,11 +2838,7 @@ function setupKeyboardShortcuts() {
             case 't':
                 // Toggle time-travel mode (bv-z38b)
                 if (timeTravelState.history) {
-                    if (timeTravelState.active) {
-                        stopTimeTravel();
-                    } else {
-                        startTimeTravel();
-                    }
+                    toggleTimeTravel();
                 }
                 break;
             case ' ':
@@ -3014,7 +3043,7 @@ function showTooltip(node) {
         extendedMetrics.push(`<span title="Influence centrality">Eigen: ${safeMetric(node.eigenvector * 100, 1, '%')}</span>`);
     }
     if (node.slack !== undefined && isFinite(node.slack)) {
-        const slackColor = node.slack < 3 ? THEME.priority.p0 : node.slack < 7 ? THEME.priority.p1 : THEME.fgMuted;
+        const slackColor = node.slack < 3 ? THEME.priority[0] : node.slack < 7 ? THEME.priority[1] : THEME.fgMuted;
         extendedMetrics.push(`<span style="color: ${slackColor}" title="Schedule flexibility">Slack: ${formatSlack(node.slack)}</span>`);
     }
 
@@ -3762,6 +3791,23 @@ export function stopTimeTravel() {
     }
 
     dispatchEvent('timeTravelStop', {});
+}
+
+/**
+ * Toggle time-travel mode on or off
+ * @returns {boolean} True if time-travel is now active
+ */
+export function toggleTimeTravel() {
+    if (!timeTravelState.history) {
+        console.warn('[TimeTravel] No history loaded');
+        return false;
+    }
+    if (timeTravelState.active) {
+        stopTimeTravel();
+    } else {
+        startTimeTravel();
+    }
+    return timeTravelState.active;
 }
 
 /**

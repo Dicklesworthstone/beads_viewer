@@ -535,12 +535,17 @@ function initHeatmap() {
     const container = document.getElementById('heatmap-container');
     if (!container) return;
 
-    // Create canvas if not exists
+    // Create canvas if not exists, clearing any placeholder text first
     let canvas = container.querySelector('canvas');
     if (!canvas) {
+        container.replaceChildren();
         canvas = document.createElement('canvas');
         canvas.id = 'heatmap-canvas';
         container.appendChild(canvas);
+    } else {
+        Array.from(container.children).forEach(child => {
+            if (child !== canvas) child.remove();
+        });
     }
 
     chartsState.heatmapCanvas = canvas;
