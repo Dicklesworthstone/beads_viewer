@@ -889,6 +889,9 @@ type StartupUpdateCheckMsg struct {
 // CheckUpdateCmd returns a command that runs the startup update check.
 func CheckUpdateCmd() tea.Cmd {
 	return func() tea.Msg {
+		if env.TestMode.Get() != "" {
+			return nil
+		}
 		tag, url, err := updater.CheckForUpdates()
 		return StartupUpdateCheckMsg{TagName: tag, URL: url, Err: err}
 	}
@@ -2618,8 +2621,8 @@ func (m *Model) Init() tea.Cmd {
 	// The automatic release check is opt-out (BV_NO_UPDATE_CHECK=1 or
 	// updates.check: false in ~/.config/bv/config.yaml); explicit
 	// --check-update/--update still work when it is disabled (#197).
-	// Tests suppress automatic network calls via BV_TEST_MODE.
-	if updater.StartupCheckEnabled() && env.TestMode.Get() == "" {
+	// CheckUpdateCmd itself suppresses outbound network calls under BV_TEST_MODE.
+	if updater.StartupCheckEnabled() {
 		cmds = append(cmds, CheckUpdateCmd())
 	}
 	// cass detection at startup (E4); tests opt back in by clearing BV_TEST_MODE.
