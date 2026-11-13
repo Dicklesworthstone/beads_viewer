@@ -503,7 +503,19 @@ func (h *HistoryModel) SetSize(width, height int) {
 // SetAuthorFilter sets the author filter and rebuilds the list
 func (h *HistoryModel) SetAuthorFilter(author string) {
 	h.authorFilter = author
-	h.rebuildFilteredList()
+	h.applySearchFilter()
+	if h.viewMode == historyModeGit && strings.TrimSpace(h.searchInput.Value()) == "" {
+		if h.selectedGitCommit >= len(h.commitList) {
+			h.selectedGitCommit = 0
+			h.selectedRelatedBead = 0
+		}
+		h.gitScrollOffset = 0
+	}
+}
+
+// GetAuthorFilter returns the active author filter ("" when unfiltered).
+func (h *HistoryModel) GetAuthorFilter() string {
+	return h.authorFilter
 }
 
 // SetMinConfidence sets the minimum confidence threshold and rebuilds the list
@@ -924,6 +936,7 @@ func (h *HistoryModel) ToggleExpand() {
 func (h *HistoryModel) StartSearch() tea.Cmd {
 	h.searchActive = true
 	h.searchMode = searchModeAll
+	h.updateSearchPlaceholder()
 	return h.searchInput.Focus()
 }
 
@@ -932,9 +945,34 @@ func (h *HistoryModel) StartSearchWithMode(mode historySearchMode) tea.Cmd {
 	h.searchActive = true
 	h.searchMode = mode
 	cmd := h.searchInput.Focus()
+	h.updateSearchPlaceholder()
+	return cmd
+}
 
-	// Set appropriate placeholder based on mode
-	switch mode {
+// CycleSearchMode cycles the scoped history search mode in order
+// All -> Commit -> Author -> Bead -> SHA -> All while preserving the current
+// search query, updating the input placeholder, and re-applying the filter.
+func (h *HistoryModel) CycleSearchMode() {
+	switch h.searchMode {
+	case searchModeAll:
+		h.searchMode = searchModeCommit
+	case searchModeCommit:
+		h.searchMode = searchModeAuthor
+	case searchModeAuthor:
+		h.searchMode = searchModeBead
+	case searchModeBead:
+		h.searchMode = searchModeSHA
+	case searchModeSHA:
+		h.searchMode = searchModeAll
+	default:
+		h.searchMode = searchModeAll
+	}
+	h.updateSearchPlaceholder()
+	h.applySearchFilter()
+}
+
+func (h *HistoryModel) updateSearchPlaceholder() {
+	switch h.searchMode {
 	case searchModeCommit:
 		h.searchInput.Placeholder = "Search commit messages..."
 	case searchModeSHA:
@@ -946,7 +984,6 @@ func (h *HistoryModel) StartSearchWithMode(mode historySearchMode) tea.Cmd {
 	default:
 		h.searchInput.Placeholder = "Search commits, beads, authors..."
 	}
-	return cmd
 }
 
 // CancelSearch cancels the search and clears the query
@@ -974,6 +1011,11 @@ func (h *HistoryModel) ClearSearch() {
 
 // IsSearchActive returns whether search input is active
 func (h *HistoryModel) IsSearchActive() bool {
+	return h.searchActive
+}
+
+// IsSearching returns whether search input is active.
+func (h *HistoryModel) IsSearching() bool {
 	return h.searchActive
 }
 
@@ -1242,6 +1284,12 @@ func (h *HistoryModel) buildCommitList() {
 	// Collect all commits from all bead histories
 	for beadID, hist := range h.report.Histories {
 		for _, commit := range hist.Commits {
+			if h.authorFilter != "" {
+				if !strings.Contains(strings.ToLower(commit.Author), strings.ToLower(h.authorFilter)) &&
+					!strings.Contains(strings.ToLower(commit.AuthorEmail), strings.ToLower(h.authorFilter)) {
+					continue
+				}
+			}
 			if entryIndex, ok := entryIndexBySHA[commit.SHA]; ok {
 				if _, ok := beadIDsBySHA[commit.SHA][beadID]; !ok {
 					beadIDsBySHA[commit.SHA][beadID] = struct{}{}

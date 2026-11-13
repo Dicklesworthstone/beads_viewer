@@ -657,7 +657,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Section{Title: "Reports, static dashboards & drift alerts"},
 				Spacer{Lines: 1},
 				Section{Title: "Quick Markdown Export (x)"},
-				Paragraph{Text: "Press x in List or Detail view to export a Markdown status report (with optional pre/post hooks in .bv/hooks.yaml)."},
+				Paragraph{Text: "Press x in List or Detail view to write a quick Markdown status report. CLI exports (--export-md, --export-pages, and bv --pages) also run optional pre/post hooks configured in .bv/hooks.yaml."},
 				Spacer{Lines: 1},
 				Section{Title: "Static Site Generation"},
 				Code{Text: "bv --pages               # Interactive deployment wizard\nbv --export-pages ./out  # Export self-contained HTML+SQLite bundle\nbv --preview-pages ./out # Preview locally"},
