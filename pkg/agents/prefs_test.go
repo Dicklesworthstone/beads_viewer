@@ -286,3 +286,90 @@ func TestPrefsCreateDirectory(t *testing.T) {
 		t.Error("Expected prefs directory to be created")
 	}
 }
+
+func TestShouldPromptForAgentUpgrade(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	tests := []struct {
+		name          string
+		targetVersion int
+		setup         func(string) error
+		expected      bool
+	}{
+		{
+			name:          "new project with no saved prefs",
+			targetVersion: BlurbVersion,
+			setup:         func(string) error { return nil },
+			expected:      true,
+		},
+		{
+			name:          "previously accepted older blurb v1 allows upgrade prompt for current version",
+			targetVersion: BlurbVersion,
+			setup: func(dir string) error {
+				return SaveAgentPromptPreference(dir, AgentPromptPreference{
+					BlurbVersionAdded: 1,
+					AddedAt:           time.Now(),
+				})
+			},
+			expected: true,
+		},
+		{
+			name:          "already accepted target version suppresses prompt",
+			targetVersion: BlurbVersion,
+			setup: func(dir string) error {
+				return SaveAgentPromptPreference(dir, AgentPromptPreference{
+					BlurbVersionAdded: BlurbVersion,
+					AddedAt:           time.Now(),
+				})
+			},
+			expected: false,
+		},
+		{
+			name:          "dont ask again suppresses upgrade prompt",
+			targetVersion: BlurbVersion,
+			setup: func(dir string) error {
+				return SaveAgentPromptPreference(dir, AgentPromptPreference{
+					DontAskAgain:        true,
+					DeclinedAt:          time.Now(),
+					BlurbVersionOffered: 1,
+				})
+			},
+			expected: false,
+		},
+		{
+			name:          "declined older version still prompts for newer version",
+			targetVersion: BlurbVersion,
+			setup: func(dir string) error {
+				return SaveAgentPromptPreference(dir, AgentPromptPreference{
+					DeclinedAt:          time.Now(),
+					BlurbVersionOffered: 2,
+				})
+			},
+			expected: true,
+		},
+		{
+			name:          "declined current target version suppresses repeat prompt",
+			targetVersion: BlurbVersion,
+			setup: func(dir string) error {
+				return SaveAgentPromptPreference(dir, AgentPromptPreference{
+					DeclinedAt:          time.Now(),
+					BlurbVersionOffered: BlurbVersion,
+				})
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			projectDir := t.TempDir()
+			if err := tt.setup(projectDir); err != nil {
+				t.Fatal(err)
+			}
+			if got := ShouldPromptForAgentUpgrade(projectDir, tt.targetVersion); got != tt.expected {
+				t.Errorf("ShouldPromptForAgentUpgrade(..., %d) = %v, want %v", tt.targetVersion, got, tt.expected)
+			}
+		})
+	}
+}
