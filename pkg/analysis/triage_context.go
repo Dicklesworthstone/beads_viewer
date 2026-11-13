@@ -321,11 +321,7 @@ func (ctx *TriageContext) LabelHealthMap(now time.Time) map[string]int {
 		return ctx.labelHealth
 	}
 
-	res := ComputeAllLabelHealth(ctx.analyzer.issues, DefaultLabelHealthConfig(), now, ctx.stats)
-	healthMap := make(map[string]int, len(res.Labels))
-	for _, lh := range res.Labels {
-		healthMap[lh.Label] = lh.Health
-	}
+	healthMap := ComputeLabelHealthScores(ctx.analyzer.issues, DefaultLabelHealthConfig(), now, ctx.stats)
 	ctx.labelHealth = healthMap
 	ctx.labelHealthNow = now
 	ctx.labelHealthComputed = true

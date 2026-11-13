@@ -179,8 +179,11 @@ every reported vulnerability has an exploitable execution path in bv.
   cycle detection (`TriageConfig`), `ProjectHealth.Staleness` fallback without git
   history, and synthesized `Alerts` (`cycle`, `stale`, `abandoned_claim`,
   `velocity_drop`) in `--robot-triage` and `--priority-brief` (alongside What-If
-  deltas); normalize active hybrid-search PageRank and open-only blocker counts
-  with shared `analysis.GetGlobalCache()`; add `--pages-subtitle`, `git_hash`
+  deltas, backed by single-pass $O(N + E)$ `ComputeLabelHealthScores` /
+  `ComputeAllLabelHealth` indexing); normalize active hybrid-search PageRank and
+  open-only blocker counts with shared `analysis.GetGlobalCache()` and
+  refresh-epoch singleflight coalescing across hash drift; add `--pages-subtitle`,
+  `git_hash`
   stamping, and `ReplaceTitle`/`ReplaceSubtitle` + `SuggestRepoName` +
   `AttemptGHInstall` in `--pages`/`--export-pages`; wire TUI `ProjectDir` scoping,
   persisted feedback weights, in-memory `--as-of` semantic search, startup

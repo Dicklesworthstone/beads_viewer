@@ -469,12 +469,18 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 	health := NewLabelHealth(label)
 	health.Issues = []string{}
 
-	// Collect issues with this label
+	// Collect issues with this label and build an O(1) ID -> first-seen Labels index
+	// (matching GetLabelsForIssue semantics without O(N*E) linear scans).
 	var labeled []model.Issue
-	for _, iss := range issues {
+	firstLabelsByID := make(map[string][]string, len(issues))
+	for i := range issues {
+		iss := &issues[i]
+		if _, seen := firstLabelsByID[iss.ID]; !seen {
+			firstLabelsByID[iss.ID] = iss.Labels
+		}
 		for _, l := range iss.Labels {
 			if l == label {
-				labeled = append(labeled, iss)
+				labeled = append(labeled, *iss)
 				health.Issues = append(health.Issues, iss.ID)
 				break
 			}
@@ -489,8 +495,8 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 	}
 
 	// Status counts
-	for _, iss := range labeled {
-		switch iss.Status {
+	for i := range labeled {
+		switch labeled[i].Status {
 		case model.StatusClosed, model.StatusTombstone:
 			health.ClosedCount++
 		case model.StatusInProgress:
@@ -510,17 +516,17 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 	seenIn := make(map[string]struct{})
 	seenOut := make(map[string]struct{})
 	labeledSet := make(map[string]bool, len(labeled))
-	for _, iss := range labeled {
-		labeledSet[iss.ID] = true
+	for i := range labeled {
+		labeledSet[labeled[i].ID] = true
 	}
 	// Incoming: other labels' issues block this label's issues
-	for _, iss := range labeled {
+	for i := range labeled {
 		hasExternalBlocker := false
-		for _, dep := range iss.Dependencies {
+		for _, dep := range labeled[i].Dependencies {
 			if dep == nil || !dep.Type.IsBlocking() {
 				continue
 			}
-			blockerLabels := GetLabelsForIssue(issues, dep.DependsOnID)
+			blockerLabels := firstLabelsByID[dep.DependsOnID]
 			for _, bl := range blockerLabels {
 				if bl != label {
 					flow.IncomingDeps++
@@ -534,7 +540,8 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 		}
 	}
 	// Outgoing: this label's issues block other labels' issues
-	for _, other := range issues {
+	for i := range issues {
+		other := &issues[i]
 		if labeledSet[other.ID] {
 			continue
 		}
@@ -543,8 +550,7 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 				continue
 			}
 			if labeledSet[dep.DependsOnID] {
-				otherLabels := other.Labels
-				for _, ol := range otherLabels {
+				for _, ol := range other.Labels {
 					if ol != label {
 						flow.OutgoingDeps++
 						seenOut[ol] = struct{}{}
@@ -571,33 +577,58 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 		s := analyzer.Analyze()
 		stats = &s
 	}
-	pr := stats.PageRank()
-	bw := stats.Betweenness()
-	maxPR := findMax(pr)
-	maxBW := findMax(bw)
+	crit := computeLabelCriticality(labeled, stats, 0, 0, false)
 
-	var prSum, bwSum float64
-	maxBwLabel := 0.0
+	health.Velocity = velocity
+	health.Freshness = freshness
+	health.Flow = flow
+	health.Criticality = crit
+
+	health.Health = ComputeCompositeHealth(velocity.VelocityScore, freshness.FreshnessScore, flow.FlowScore, crit.CriticalityScore, cfg)
+	health.HealthLevel = HealthLevelFromScore(health.Health)
+	return health
+}
+
+type labelOutgoingAcc struct {
+	outgoingDeps     int
+	blockingExternal int
+	seenOut          map[string]struct{}
+}
+
+func computeLabelCriticality(labeled []model.Issue, stats *GraphStats, maxPR, maxBW float64, haveMax bool) CriticalityMetrics {
+	var prSum, bwSum, maxBwLabel float64
 	var critCount, bottleneckCount int
-	for _, iss := range labeled {
-		prSum += pr[iss.ID]
-		bwVal := bw[iss.ID]
+
+	stats.mu.RLock()
+	pr := stats.pageRank
+	bw := stats.betweenness
+	cp := stats.criticalPathScore
+	if !haveMax {
+		maxPR = findMax(pr)
+		maxBW = findMax(bw)
+	}
+	for i := range labeled {
+		id := labeled[i].ID
+		prSum += pr[id]
+		bwVal := bw[id]
 		bwSum += bwVal
 		if bwVal > maxBwLabel {
 			maxBwLabel = bwVal
 		}
-		if stats.GetCriticalPathScore(iss.ID) > 0 {
+		if cp[id] > 0 {
 			critCount++
 		}
 		if bwVal > 0 {
 			bottleneckCount++
 		}
 	}
+	stats.mu.RUnlock()
+
 	avgPR := 0.0
 	avgBW := 0.0
-	if health.IssueCount > 0 {
-		avgPR = prSum / float64(health.IssueCount)
-		avgBW = bwSum / float64(health.IssueCount)
+	if len(labeled) > 0 {
+		avgPR = prSum / float64(len(labeled))
+		avgBW = bwSum / float64(len(labeled))
 	}
 	critScore := 0
 	if maxPR > 0 {
@@ -608,10 +639,7 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 	}
 	critScore = clampScore(critScore)
 
-	health.Velocity = velocity
-	health.Freshness = freshness
-	health.Flow = flow
-	health.Criticality = CriticalityMetrics{
+	return CriticalityMetrics{
 		AvgPageRank:       avgPR,
 		AvgBetweenness:    avgBW,
 		MaxBetweenness:    maxBwLabel,
@@ -619,8 +647,90 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 		BottleneckCount:   bottleneckCount,
 		CriticalityScore:  critScore,
 	}
+}
 
-	health.Health = ComputeCompositeHealth(velocity.VelocityScore, freshness.FreshnessScore, flow.FlowScore, critScore, cfg)
+func computeIndexedLabelHealth(
+	label string,
+	labeled []model.Issue,
+	firstLabelsByID map[string][]string,
+	outAcc *labelOutgoingAcc,
+	cfg LabelHealthConfig,
+	now time.Time,
+	stats *GraphStats,
+	maxPR, maxBW float64,
+) LabelHealth {
+	health := NewLabelHealth(label)
+	health.Issues = make([]string, len(labeled))
+	for i := range labeled {
+		health.Issues[i] = labeled[i].ID
+	}
+
+	health.IssueCount = len(labeled)
+	if health.IssueCount == 0 {
+		health.Health = 0
+		health.HealthLevel = HealthLevelCritical
+		return health
+	}
+
+	for i := range labeled {
+		switch labeled[i].Status {
+		case model.StatusClosed, model.StatusTombstone:
+			health.ClosedCount++
+		case model.StatusInProgress:
+			health.OpenCount++
+		case model.StatusBlocked:
+			health.Blocked++
+		default:
+			health.OpenCount++
+		}
+	}
+
+	velocity := ComputeVelocityMetrics(labeled, now)
+	freshness := ComputeFreshnessMetrics(labeled, now, cfg.StaleThresholdDays)
+
+	flow := FlowMetrics{}
+	seenIn := make(map[string]struct{})
+	for i := range labeled {
+		hasExternalBlocker := false
+		for _, dep := range labeled[i].Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			blockerLabels := firstLabelsByID[dep.DependsOnID]
+			for _, bl := range blockerLabels {
+				if bl != label {
+					flow.IncomingDeps++
+					seenIn[bl] = struct{}{}
+					hasExternalBlocker = true
+				}
+			}
+		}
+		if hasExternalBlocker {
+			flow.BlockedByExternal++
+		}
+	}
+	for l := range seenIn {
+		flow.IncomingLabels = append(flow.IncomingLabels, l)
+	}
+	sort.Strings(flow.IncomingLabels)
+
+	if outAcc != nil {
+		flow.OutgoingDeps = outAcc.outgoingDeps
+		flow.BlockingExternal = outAcc.blockingExternal
+		for l := range outAcc.seenOut {
+			flow.OutgoingLabels = append(flow.OutgoingLabels, l)
+		}
+		sort.Strings(flow.OutgoingLabels)
+	}
+	flow.FlowScore = clampScore(100 - (flow.IncomingDeps * 5))
+
+	crit := computeLabelCriticality(labeled, stats, maxPR, maxBW, true)
+
+	health.Velocity = velocity
+	health.Freshness = freshness
+	health.Flow = flow
+	health.Criticality = crit
+	health.Health = ComputeCompositeHealth(velocity.VelocityScore, freshness.FreshnessScore, flow.FlowScore, crit.CriticalityScore, cfg)
 	health.HealthLevel = HealthLevelFromScore(health.Health)
 	return health
 }
@@ -634,6 +744,9 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 		Labels:          []LabelHealth{},
 		Summaries:       []LabelSummary{},
 		AttentionNeeded: []string{},
+	}
+	if len(labels.Labels) == 0 {
+		return result
 	}
 
 	// Deterministic traversal
@@ -649,8 +762,84 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 		fullStats = &s
 	}
 
+	// Single-pass O(N) label & ID index + single-pass O(N + E) outgoing flow accumulation,
+	// avoiding O(L * N * E) GetLabelsForIssue linear scans and O(L * N) PageRank map clones.
+	firstLabelsByID := make(map[string][]string, len(issues))
+	labelSetByID := make(map[string]map[string]struct{}, len(issues))
+	labeledByLabel := make(map[string][]model.Issue, len(labels.Labels))
+	seenOnEntry := make(map[string]struct{}, 8)
+	for i := range issues {
+		iss := &issues[i]
+		if _, seen := firstLabelsByID[iss.ID]; !seen {
+			firstLabelsByID[iss.ID] = iss.Labels
+		}
+		if len(iss.Labels) == 0 {
+			continue
+		}
+		idSet := labelSetByID[iss.ID]
+		if idSet == nil {
+			idSet = make(map[string]struct{}, len(iss.Labels))
+			labelSetByID[iss.ID] = idSet
+		}
+		clear(seenOnEntry)
+		for _, l := range iss.Labels {
+			if l == "" {
+				continue
+			}
+			idSet[l] = struct{}{}
+			if _, dup := seenOnEntry[l]; dup {
+				continue
+			}
+			seenOnEntry[l] = struct{}{}
+			labeledByLabel[l] = append(labeledByLabel[l], *iss)
+		}
+	}
+
+	outByLabel := make(map[string]*labelOutgoingAcc, len(labels.Labels))
+	blockedSourceLabels := make(map[string]struct{}, 8)
+	for i := range issues {
+		other := &issues[i]
+		if len(other.Dependencies) == 0 {
+			continue
+		}
+		clear(blockedSourceLabels)
+		otherSet := labelSetByID[other.ID]
+		for _, dep := range other.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			for srcLabel := range labelSetByID[dep.DependsOnID] {
+				if _, sameLabel := otherSet[srcLabel]; sameLabel {
+					continue
+				}
+				blockedSourceLabels[srcLabel] = struct{}{}
+			}
+		}
+		for srcLabel := range blockedSourceLabels {
+			acc := outByLabel[srcLabel]
+			if acc == nil {
+				acc = &labelOutgoingAcc{seenOut: make(map[string]struct{})}
+				outByLabel[srcLabel] = acc
+			}
+			acc.blockingExternal++
+			for _, ol := range other.Labels {
+				if ol != srcLabel {
+					acc.outgoingDeps++
+					acc.seenOut[ol] = struct{}{}
+				}
+			}
+		}
+	}
+
+	fullStats.mu.RLock()
+	maxPR := findMax(fullStats.pageRank)
+	maxBW := findMax(fullStats.betweenness)
+	fullStats.mu.RUnlock()
+
+	result.Labels = make([]LabelHealth, 0, len(labels.Labels))
+	result.Summaries = make([]LabelSummary, 0, len(labels.Labels))
 	for _, label := range labels.Labels {
-		health := ComputeLabelHealthForLabel(label, issues, cfg, now, fullStats)
+		health := computeIndexedLabelHealth(label, labeledByLabel[label], firstLabelsByID, outByLabel[label], cfg, now, fullStats, maxPR, maxBW)
 		result.Labels = append(result.Labels, health)
 		summary := LabelSummary{
 			Label:          label,
@@ -684,6 +873,197 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 	})
 
 	return result
+}
+
+type labelScoreAcc struct {
+	issueCount     int
+	closed30       int
+	prevWeek       int
+	currentWeek    int
+	totalStaleness float64
+	freshCount     int
+	incomingDeps   int
+	prSum          float64
+	maxBwLabel     float64
+}
+
+// ComputeLabelHealthScores computes the composite 0-100 health score for every
+// non-empty label in issues in a single O(N + E) pass without per-label slice
+// or map allocations. Every returned score is bit-for-bit identical to
+// ComputeLabelHealthForLabel(label, issues, cfg, now, stats).Health.
+func ComputeLabelHealthScores(issues []model.Issue, cfg LabelHealthConfig, now time.Time, stats *GraphStats) map[string]int {
+	if len(issues) == 0 {
+		return map[string]int{}
+	}
+
+	hasAnyLabel := false
+	for i := range issues {
+		for _, l := range issues[i].Labels {
+			if l != "" {
+				hasAnyLabel = true
+				break
+			}
+		}
+		if hasAnyLabel {
+			break
+		}
+	}
+	if !hasAnyLabel {
+		return map[string]int{}
+	}
+
+	var fullStats *GraphStats
+	if stats != nil {
+		fullStats = stats
+	} else {
+		analyzer := NewAnalyzer(issues)
+		s := analyzer.Analyze()
+		fullStats = &s
+	}
+
+	firstLabelsByID := make(map[string][]string, len(issues))
+	for i := range issues {
+		id := issues[i].ID
+		if _, seen := firstLabelsByID[id]; !seen {
+			firstLabelsByID[id] = issues[i].Labels
+		}
+	}
+
+	staleDays := cfg.StaleThresholdDays
+	if staleDays <= 0 {
+		staleDays = DefaultStaleThresholdDays
+	}
+	threshold := float64(staleDays)
+	const day = 24 * time.Hour
+	weekAgo := now.Add(-7 * day)
+	monthAgo := now.Add(-30 * day)
+	prevWeekStart := now.Add(-14 * day)
+
+	accByLabel := make(map[string]*labelScoreAcc, 32)
+
+	fullStats.mu.RLock()
+	pr := fullStats.pageRank
+	bw := fullStats.betweenness
+	maxPR := findMax(pr)
+	maxBW := findMax(bw)
+
+	for i := range issues {
+		iss := &issues[i]
+		if len(iss.Labels) == 0 {
+			continue
+		}
+		issPR := pr[iss.ID]
+		issBW := bw[iss.ID]
+
+		isClosedWithTime := isClosedLikeStatus(iss.Status) && iss.ClosedAt != nil
+		var closed30Inc, prevWeekInc, curWeekInc int
+		if isClosedWithTime {
+			closedAt := *iss.ClosedAt
+			if closedAt.After(monthAgo) {
+				closed30Inc = 1
+			}
+			if closedAt.After(prevWeekStart) && closedAt.Before(weekAgo) {
+				prevWeekInc = 1
+			} else if closedAt.After(weekAgo) {
+				curWeekInc = 1
+			}
+		}
+
+		hasUpdated := !iss.UpdatedAt.IsZero()
+		var stalenessDays float64
+		if hasUpdated {
+			stalenessDays = now.Sub(iss.UpdatedAt).Hours() / 24.0
+		}
+
+		for j, l := range iss.Labels {
+			if l == "" {
+				continue
+			}
+			dup := false
+			for k := 0; k < j; k++ {
+				if iss.Labels[k] == l {
+					dup = true
+					break
+				}
+			}
+			if dup {
+				continue
+			}
+
+			acc := accByLabel[l]
+			if acc == nil {
+				acc = &labelScoreAcc{}
+				accByLabel[l] = acc
+			}
+			acc.issueCount++
+			acc.closed30 += closed30Inc
+			acc.prevWeek += prevWeekInc
+			acc.currentWeek += curWeekInc
+			if hasUpdated {
+				acc.totalStaleness += stalenessDays
+				acc.freshCount++
+			}
+			for _, dep := range iss.Dependencies {
+				if dep == nil || !dep.Type.IsBlocking() {
+					continue
+				}
+				for _, bl := range firstLabelsByID[dep.DependsOnID] {
+					if bl != l {
+						acc.incomingDeps++
+					}
+				}
+			}
+			acc.prSum += issPR
+			if issBW > acc.maxBwLabel {
+				acc.maxBwLabel = issBW
+			}
+		}
+	}
+	fullStats.mu.RUnlock()
+
+	scores := make(map[string]int, len(accByLabel))
+	for l, acc := range accByLabel {
+		trendDir := "stable"
+		if acc.prevWeek > 0 {
+			trendPercent := (float64(acc.currentWeek-acc.prevWeek) / float64(acc.prevWeek)) * 100
+			switch {
+			case trendPercent > 10:
+				trendDir = "improving"
+			case trendPercent < -10:
+				trendDir = "declining"
+			}
+		} else if acc.currentWeek > 0 {
+			trendDir = "improving"
+		}
+		velocityScore := 0
+		if acc.closed30 > 0 {
+			velocityScore = int(min(100.0, float64(acc.closed30)*10))
+		}
+		if trendDir == "improving" && velocityScore < 100 {
+			velocityScore = clampScore(velocityScore + 10)
+		}
+
+		avgStaleness := 0.0
+		if acc.freshCount > 0 {
+			avgStaleness = acc.totalStaleness / float64(acc.freshCount)
+		}
+		freshnessScore := clampScore(int(max(0.0, 100-(avgStaleness/(threshold*2))*100)))
+
+		flowScore := clampScore(100 - (acc.incomingDeps * 5))
+
+		avgPR := acc.prSum / float64(acc.issueCount)
+		critScore := 0
+		if maxPR > 0 {
+			critScore += int((avgPR / maxPR) * 50)
+		}
+		if maxBW > 0 {
+			critScore += int((acc.maxBwLabel / maxBW) * 50)
+		}
+		critScore = clampScore(critScore)
+
+		scores[l] = ComputeCompositeHealth(velocityScore, freshnessScore, flowScore, critScore, cfg)
+	}
+	return scores
 }
 
 func clampScore(v int) int {

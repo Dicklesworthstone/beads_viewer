@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -2684,6 +2685,79 @@ func TestComputeBlockageCascadeAt_DependencyBlockedAndPermutationInvariant(t *te
 		}
 		if string(gotJSON) != string(canonicalJSON) {
 			t.Fatalf("permutation %d drifted:\ngot:  %s\nwant: %s", iter, gotJSON, canonicalJSON)
+		}
+	}
+}
+
+func TestComputeAllLabelHealth_MatchesPerLabelOracle(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultLabelHealthConfig()
+	labelPool := []string{"", "api", "backend", "ui", "db", "auth", "ops", "perf", "security"}
+	statuses := []model.Status{model.StatusOpen, model.StatusInProgress, model.StatusBlocked, model.StatusClosed, model.StatusDeferred, model.StatusTombstone}
+	depTypes := []model.DependencyType{model.DepBlocks, model.DepRelated, model.DepParentChild}
+
+	rng := rand.New(rand.NewSource(20261113))
+	for trial := 0; trial < 100; trial++ {
+		n := rng.Intn(30)
+		issues := make([]model.Issue, n)
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("iss-%02d", i)
+			status := statuses[rng.Intn(len(statuses))]
+			created := now.Add(-time.Duration(rng.Intn(60)+1) * 24 * time.Hour)
+			updated := created.Add(time.Duration(rng.Intn(30)) * 24 * time.Hour)
+			var closedAt *time.Time
+			if status == model.StatusClosed {
+				c := updated
+				closedAt = &c
+			}
+			k := rng.Intn(4)
+			var labels []string
+			for j := 0; j < k; j++ {
+				labels = append(labels, labelPool[rng.Intn(len(labelPool))])
+			}
+			issues[i] = model.Issue{
+				ID:        id,
+				Title:     fmt.Sprintf("Issue %d", i),
+				Status:    status,
+				Priority:  rng.Intn(5),
+				IssueType: model.TypeTask,
+				Labels:    labels,
+				CreatedAt: created,
+				UpdatedAt: updated,
+				ClosedAt:  closedAt,
+			}
+		}
+		for i := 0; i < n; i++ {
+			edgeCount := rng.Intn(4)
+			for e := 0; e < edgeCount; e++ {
+				target := fmt.Sprintf("iss-%02d", rng.Intn(n+2)) // includes missing targets
+				issues[i].Dependencies = append(issues[i].Dependencies, &model.Dependency{
+					IssueID:     issues[i].ID,
+					DependsOnID: target,
+					Type:        depTypes[rng.Intn(len(depTypes))],
+				})
+			}
+		}
+
+		analyzer := NewAnalyzer(issues)
+		stats := analyzer.Analyze()
+		batch := ComputeAllLabelHealth(issues, cfg, now, &stats)
+		scores := ComputeLabelHealthScores(issues, cfg, now, &stats)
+
+		if len(batch.Labels) != batch.TotalLabels {
+			t.Fatalf("trial %d: len(Labels)=%d != TotalLabels=%d", trial, len(batch.Labels), batch.TotalLabels)
+		}
+		if len(scores) != batch.TotalLabels {
+			t.Fatalf("trial %d: len(scores)=%d != TotalLabels=%d", trial, len(scores), batch.TotalLabels)
+		}
+		for _, got := range batch.Labels {
+			want := ComputeLabelHealthForLabel(got.Label, issues, cfg, now, &stats)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("trial %d label %q mismatch:\ngot:  %#v\nwant: %#v", trial, got.Label, got, want)
+			}
+			if scores[got.Label] != want.Health {
+				t.Fatalf("trial %d label %q score=%d != want.Health=%d", trial, got.Label, scores[got.Label], want.Health)
+			}
 		}
 	}
 }

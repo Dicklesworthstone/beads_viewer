@@ -794,3 +794,68 @@ func TestAnalyzerMetricsLoader_NormalizesActivePageRankAndExcludesClosedDependen
 		t.Fatalf("expected done-blocker BlockerCount = 0 when its only dependent is closed, got %d", doneBlocker.BlockerCount)
 	}
 }
+
+type preemptedHashDriftLoader struct {
+	hashCalls         atomic.Int32
+	loadCalls         atomic.Int32
+	firstHashObserved chan struct{}
+	allowFirstProceed chan struct{}
+	metrics           map[string]IssueMetrics
+	finalHash         string
+}
+
+func (p *preemptedHashDriftLoader) LoadMetrics() (map[string]IssueMetrics, error) {
+	return nil, errors.New("unexpected non-atomic load")
+}
+
+func (p *preemptedHashDriftLoader) ComputeDataHash() (string, error) {
+	switch p.hashCalls.Add(1) {
+	case 1:
+		close(p.firstHashObserved)
+		<-p.allowFirstProceed
+		return "hash-a", nil
+	default:
+		return p.finalHash, nil
+	}
+}
+
+func (p *preemptedHashDriftLoader) LoadMetricsWithHash() (map[string]IssueMetrics, string, error) {
+	p.loadCalls.Add(1)
+	return p.metrics, p.finalHash, nil
+}
+
+func TestMetricsCacheEnsureFresh_PreemptedStaleObserverAfterRefresh(t *testing.T) {
+	loader := &preemptedHashDriftLoader{
+		firstHashObserved: make(chan struct{}),
+		allowFirstProceed: make(chan struct{}),
+		metrics: map[string]IssueMetrics{
+			"A": {IssueID: "A", PageRank: 0.9, BlockerCount: 4},
+		},
+		finalHash: "hash-b",
+	}
+	cache := NewMetricsCache(loader)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if _, ok := cache.Get("A"); !ok {
+			t.Errorf("worker 1 expected metric A")
+		}
+	}()
+
+	<-loader.firstHashObserved
+	// Worker 2 observes hash-b and completes Refresh() before Worker 1 enters singleflight.
+	if _, ok := cache.Get("A"); !ok {
+		t.Fatal("worker 2 expected metric A")
+	}
+	close(loader.allowFirstProceed)
+	wg.Wait()
+
+	if got := loader.loadCalls.Load(); got != 1 {
+		t.Fatalf("expected 1 refresh when preempted observer sees post-refresh hash-b, got %d", got)
+	}
+	if got := cache.DataHash(); got != "hash-b" {
+		t.Fatalf("expected final cache hash %q, got %q", "hash-b", got)
+	}
+}

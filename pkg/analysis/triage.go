@@ -1921,12 +1921,17 @@ func generateTriageReasonsForScoreAt(score TriageScore, triageCtx *TriageContext
 		claimedByAgent = issue.Assignee
 	}
 
+	var labelHealth map[string]int
+	if issue != nil && len(issue.Labels) > 0 {
+		labelHealth = triageCtx.LabelHealthMap(now) // cached
+	}
+
 	ctx := TriageReasonContext{
 		Issue:           issue,
 		TriageScore:     &score,
 		UnblocksIDs:     unblocksMap[score.IssueID],
 		BlockedByIDs:    triageCtx.OpenBlockers(score.IssueID), // cached
-		LabelHealth:     triageCtx.LabelHealthMap(now),         // cached
+		LabelHealth:     labelHealth,
 		ClaimedByAgent:  claimedByAgent,
 		DaysSinceUpdate: daysSinceUpdate,
 		IsQuickWin:      isQuickWin,

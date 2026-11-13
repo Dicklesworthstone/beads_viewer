@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -17,6 +18,7 @@ const metricsCacheRefreshFlightKey = "refresh"
 type metricsCache struct {
 	mu              sync.RWMutex
 	sf              singleflight.Group // Prevents cache stampede on concurrent refresh
+	refreshGen      atomic.Uint64
 	metrics         map[string]IssueMetrics
 	dataHash        string
 	maxBlockerCount int
@@ -259,6 +261,7 @@ func (c *metricsCache) Refresh() error {
 	c.metrics = copied
 	c.dataHash = hash
 	c.maxBlockerCount = maxBlocker
+	c.refreshGen.Add(1)
 	c.mu.Unlock()
 
 	return nil
@@ -283,6 +286,7 @@ func (c *metricsCache) ensureFresh() error {
 		return fmt.Errorf("metrics loader is nil")
 	}
 
+	genBefore := c.refreshGen.Load()
 	hash, err := c.loader.ComputeDataHash()
 	if err != nil {
 		return err
@@ -296,11 +300,21 @@ func (c *metricsCache) ensureFresh() error {
 	// hash-suffixed) so concurrent refreshes coalesce even when callers
 	// observed different source hashes mid-drift — otherwise two workers that
 	// each compute a slightly different hash trigger two parallel Refresh()
-	// calls, defeating the stampede guard. After Refresh() runs once, every
-	// coalesced caller observes the latest snapshot in the cache.
+	// calls, defeating the stampede guard. If another caller completed a
+	// Refresh() while this caller was queued before singleflight, re-check the
+	// loader's latest hash before triggering a redundant refresh.
 	_, err, _ = c.sf.Do(metricsCacheRefreshFlightKey, func() (interface{}, error) {
 		if c.isFreshForHash(hash) {
 			return nil, nil
+		}
+		if c.refreshGen.Load() != genBefore {
+			latestHash, hashErr := c.loader.ComputeDataHash()
+			if hashErr != nil {
+				return nil, hashErr
+			}
+			if c.isFreshForHash(latestHash) {
+				return nil, nil
+			}
 		}
 		return nil, c.Refresh()
 	})
