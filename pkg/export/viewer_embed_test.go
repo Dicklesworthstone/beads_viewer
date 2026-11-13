@@ -721,3 +721,55 @@ func TestViewerJS_MarkdownStripsInlineHandlersBeforeDOMPurify(t *testing.T) {
 		t.Fatal("viewer.js must not call default marked.parse/parseInline with raw inline event-handler attributes")
 	}
 }
+
+func TestReplaceTitle_ActualEmbeddedIndexHTML(t *testing.T) {
+	raw, err := ViewerAssetsFS.ReadFile("viewer_assets/index.html")
+	if err != nil {
+		t.Fatalf("read embedded index.html: %v", err)
+	}
+
+	result := replaceTitle(string(raw), "Sprint 42 <Live>")
+	if !strings.Contains(result, "<title>Sprint 42 &lt;Live&gt;</title>") {
+		t.Fatal("expected <title> in embedded index.html to be updated and HTML-escaped")
+	}
+	if !strings.Contains(result, `<h1 class="text-lg sm:text-xl font-semibold">Sprint 42 &lt;Live&gt;</h1>`) {
+		t.Fatal("expected responsive navbar <h1> in embedded index.html to be updated and HTML-escaped")
+	}
+	if strings.Contains(result, ">Beads Viewer</h1>") {
+		t.Fatal("expected default Beads Viewer navbar heading to be replaced")
+	}
+}
+
+func TestEmbedAssetsWithSubtitle(t *testing.T) {
+	outWithSub := t.TempDir()
+	if err := EmbedAssetsWithSubtitle(outWithSub, "Sprint 42", "  Team <Alpha> & Ops  "); err != nil {
+		t.Fatalf("EmbedAssetsWithSubtitle failed: %v", err)
+	}
+
+	indexBytes, err := os.ReadFile(filepath.Join(outWithSub, "index.html"))
+	if err != nil {
+		t.Fatalf("read exported index.html: %v", err)
+	}
+	indexHTML := string(indexBytes)
+
+	wantBlock := `<h1 class="text-lg sm:text-xl font-semibold">Sprint 42</h1>` + "\n" +
+		`              <p class="text-xs text-gray-500 dark:text-gray-400 truncate">Team &lt;Alpha&gt; &amp; Ops</p>`
+	if !strings.Contains(indexHTML, wantBlock) {
+		t.Fatalf("expected escaped subtitle paragraph directly beneath navbar <h1>, got snippet missing %q", wantBlock)
+	}
+
+	outWithoutSub := t.TempDir()
+	if err := EmbedAssets(outWithoutSub, "Sprint 42"); err != nil {
+		t.Fatalf("EmbedAssets failed: %v", err)
+	}
+	noSubBytes, err := os.ReadFile(filepath.Join(outWithoutSub, "index.html"))
+	if err != nil {
+		t.Fatalf("read exported index.html without subtitle: %v", err)
+	}
+	if strings.Contains(string(noSubBytes), `<p class="text-xs text-gray-500 dark:text-gray-400 truncate">`) {
+		t.Fatal("expected no subtitle paragraph when subtitle is empty")
+	}
+	if got := ReplaceSubtitle(`<h1 class="text-xl">Title</h1>`, "   "); got != `<h1 class="text-xl">Title</h1>` {
+		t.Fatalf("ReplaceSubtitle with whitespace modified content: %q", got)
+	}
+}
