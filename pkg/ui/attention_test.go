@@ -204,6 +204,84 @@ func TestModel_AttentionViewFocusDrilldownAndFilter(t *testing.T) {
 	}
 }
 
+func TestModel_AttentionViewStyledCursorAndPinnedClock(t *testing.T) {
+	pinnedNow := time.Date(2025, 3, 15, 12, 0, 0, 0, time.UTC)
+	closedNearPinned := pinnedNow.Add(-5 * 24 * time.Hour)
+
+	issues := []model.Issue{
+		{
+			ID:        "PINNED-CLOSED",
+			Title:     "Closed near pinned reference clock",
+			Status:    model.StatusClosed,
+			Priority:  1,
+			Labels:    []string{"alpha"},
+			CreatedAt: pinnedNow.Add(-20 * 24 * time.Hour),
+			UpdatedAt: closedNearPinned,
+			ClosedAt:  &closedNearPinned,
+		},
+		{
+			ID:        "PINNED-OPEN-1",
+			Title:     "Open alpha issue",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			Labels:    []string{"alpha"},
+			CreatedAt: pinnedNow.Add(-10 * 24 * time.Hour),
+			UpdatedAt: pinnedNow.Add(-2 * 24 * time.Hour),
+		},
+		{
+			ID:        "PINNED-OPEN-2",
+			Title:     "Open beta issue",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			Labels:    []string{"beta"},
+			CreatedAt: pinnedNow.Add(-3 * 24 * time.Hour),
+			UpdatedAt: pinnedNow.Add(-1 * 24 * time.Hour),
+		},
+	}
+
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.analyzer.SetNow(pinnedNow)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+	// Open attention view via ']'
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	m = updated.(*Model)
+	if m.focused != focusAttention {
+		t.Fatalf("expected focusAttention, got %v", m.focused)
+	}
+
+	// Verify NewModel wired DefaultTheme into m.attentionView so the selected row
+	// renders the thick left selection border ('┃') and respects mainContentWidth.
+	rawView := m.attentionView.View()
+	lines := strings.Split(strings.TrimSuffix(rawView, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected header + 2 rows, got %d lines:\n%s", len(lines), rawView)
+	}
+	if !strings.Contains(lines[1], "┃") || strings.Contains(lines[2], "┃") {
+		t.Fatalf("expected row 1 to carry Selected '┃' border and row 2 not to:\nrow1=%q\nrow2=%q", lines[1], lines[2])
+	}
+	for i, line := range lines {
+		if w := lipgloss.Width(line); w > m.mainContentWidth() {
+			t.Fatalf("line %d width %d exceeds mainContentWidth %d: %q", i, w, m.mainContentWidth(), line)
+		}
+	}
+
+	// Verify pinned reference clock: closedNearPinned is within 30 days of pinnedNow
+	// (2025-03-15), so alpha's reason must report closed30=1 rather than 0 from wall-clock time.Now().
+	if !strings.Contains(rawView, "closed30=1") {
+		t.Fatalf("expected refreshAttentionView to use pinned analysisReferenceTime (closed30=1), got:\n%s", rawView)
+	}
+
+	// Move cursor down with 'j' and verify selection highlight moves to row 2.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	m = updated.(*Model)
+	movedLines := strings.Split(strings.TrimSuffix(m.attentionView.View(), "\n"), "\n")
+	if strings.Contains(movedLines[1], "┃") || !strings.Contains(movedLines[2], "┃") {
+		t.Fatalf("expected '┃' cursor highlight to move to row 2:\nrow1=%q\nrow2=%q", movedLines[1], movedLines[2])
+	}
+}
+
 func pad2(i int) string {
 	return fmt.Sprintf("%02d", i)
 }
