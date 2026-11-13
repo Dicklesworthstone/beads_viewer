@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -369,4 +370,55 @@ func TestWizard_PrintSuccess_Cloudflare(t *testing.T) {
 
 	// Just verify it doesn't panic
 	wizard.PrintSuccess(result)
+}
+
+func TestWizard_CollectGitHubConfig_UsesSuggestRepoName(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	tmpDir := t.TempDir()
+	bundleDir := filepath.Join(tmpDir, "acme-tracker", "bv-pages")
+	if err := os.MkdirAll(bundleDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	wizard := NewWizard(filepath.Join(tmpDir, "acme-tracker", ".beads"))
+	wizard.bundlePath = bundleDir
+	wizard.input = &wizardInputReader{data: []byte("\nn\n\n")}
+
+	if err := wizard.collectGitHubConfig(); err != nil {
+		t.Fatalf("collectGitHubConfig: %v", err)
+	}
+	if wizard.config.RepoName != "acme-tracker-pages" {
+		t.Fatalf("RepoName = %q, want %q", wizard.config.RepoName, "acme-tracker-pages")
+	}
+
+	wizardDefault := NewWizard(filepath.Join(tmpDir, "acme-tracker", ".beads"))
+	wizardDefault.input = &wizardInputReader{data: []byte("\nn\n\n")}
+	if err := wizardDefault.collectGitHubConfig(); err != nil {
+		t.Fatalf("collectGitHubConfig (empty bundlePath): %v", err)
+	}
+	if !strings.HasSuffix(wizardDefault.config.RepoName, "-pages") {
+		t.Fatalf("RepoName with empty bundlePath = %q, want -pages suffix", wizardDefault.config.RepoName)
+	}
+}
+
+func TestWizard_CheckPrerequisites_GHMissing(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	t.Setenv("PATH", t.TempDir())
+
+	// Non-interactive without input buffer returns clean error immediately
+	nonInteractive := NewWizard("/tmp/test")
+	nonInteractive.config.DeployTarget = "github"
+	err := nonInteractive.checkPrerequisites()
+	if err == nil || !strings.Contains(err.Error(), "gh CLI is required") {
+		t.Fatalf("non-interactive checkPrerequisites error = %v, want 'gh CLI is required'", err)
+	}
+
+	// Interactive prompt declined returns clean error without attempting install
+	declined := NewWizard("/tmp/test")
+	declined.config.DeployTarget = "github"
+	declined.input = &wizardInputReader{data: []byte("n\n")}
+	err = declined.checkPrerequisites()
+	if err == nil || !strings.Contains(err.Error(), "gh CLI is required") {
+		t.Fatalf("declined checkPrerequisites error = %v, want 'gh CLI is required'", err)
+	}
 }
