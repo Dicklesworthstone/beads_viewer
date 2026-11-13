@@ -1932,6 +1932,20 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 	}
 }
 
+// OpenBlockerCount returns the number of non-closed/non-tombstone issues that
+// directly depend on issueID via blocking edges. Unlike GraphStats.InDegree,
+// already-closed dependents do not inflate live downstream impact.
+func (a *Analyzer) OpenBlockerCount(issueID string) int {
+	if a == nil {
+		return 0
+	}
+	nodeID, ok := a.idToNode[issueID]
+	if !ok || nodeID < 0 || int(nodeID) >= len(a.blockerCounts) {
+		return 0
+	}
+	return a.blockerCounts[nodeID]
+}
+
 // AnalyzeAsync performs graph analysis in two phases for fast startup.
 // Phase 1 (instant): Degree centrality, topological order, density
 // Phase 2 (background): PageRank, Betweenness, Eigenvector, HITS, Cycles

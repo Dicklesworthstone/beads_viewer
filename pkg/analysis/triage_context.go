@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"sync"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -28,16 +29,20 @@ import (
 type TriageContext struct {
 	// Input
 	analyzer *Analyzer
+	stats    *GraphStats
 
 	// Computed caches
 	actionable         []model.Issue
 	actionableSet      map[string]bool
 	actionableComputed bool
 
-	blockerDepth     map[string]int
-	openBlockers     map[string][]string
-	unblocksMap      map[string][]string
-	unblocksComputed bool
+	blockerDepth        map[string]int
+	openBlockers        map[string][]string
+	unblocksMap         map[string][]string
+	unblocksComputed    bool
+	labelHealth         map[string]int
+	labelHealthComputed bool
+	labelHealthNow      time.Time
 
 	// Thread safety (nil for single-threaded mode)
 	mu *sync.Mutex
@@ -289,6 +294,44 @@ func (ctx *TriageContext) AllBlockerDepths() map[string]int {
 	return result
 }
 
+// SetStats attaches precomputed GraphStats so LabelHealthMap can reuse the
+// caller's Phase 2 metrics without running a second graph analysis pass.
+func (ctx *TriageContext) SetStats(stats *GraphStats) {
+	ctx.lock()
+	defer ctx.unlock()
+
+	ctx.stats = stats
+	ctx.labelHealth = nil
+	ctx.labelHealthComputed = false
+}
+
+// LabelHealthMap returns a memoized map of label -> composite health score (0-100)
+// evaluated at now. Subsequent calls with the same reference instant return in O(1).
+func (ctx *TriageContext) LabelHealthMap(now time.Time) map[string]int {
+	ctx.lock()
+	defer ctx.unlock()
+
+	if ctx.labelHealthComputed && ctx.labelHealthNow.Equal(now) {
+		return ctx.labelHealth
+	}
+	if ctx.analyzer == nil || len(ctx.analyzer.issues) == 0 {
+		ctx.labelHealth = map[string]int{}
+		ctx.labelHealthNow = now
+		ctx.labelHealthComputed = true
+		return ctx.labelHealth
+	}
+
+	res := ComputeAllLabelHealth(ctx.analyzer.issues, DefaultLabelHealthConfig(), now, ctx.stats)
+	healthMap := make(map[string]int, len(res.Labels))
+	for _, lh := range res.Labels {
+		healthMap[lh.Label] = lh.Health
+	}
+	ctx.labelHealth = healthMap
+	ctx.labelHealthNow = now
+	ctx.labelHealthComputed = true
+	return ctx.labelHealth
+}
+
 // Reset clears all caches for reuse with fresh data.
 //
 // Call this if the underlying Analyzer data changes and you want to recompute.
@@ -303,6 +346,9 @@ func (ctx *TriageContext) Reset() {
 	ctx.openBlockers = make(map[string][]string)
 	ctx.unblocksMap = nil
 	ctx.unblocksComputed = false
+	ctx.labelHealth = nil
+	ctx.labelHealthComputed = false
+	ctx.labelHealthNow = time.Time{}
 }
 
 // GetIssue returns an issue by ID from the underlying Analyzer.

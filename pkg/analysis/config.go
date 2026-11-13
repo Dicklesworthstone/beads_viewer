@@ -255,8 +255,9 @@ func FullAnalysisConfig() AnalysisConfig {
 }
 
 // TriageConfig returns a minimal config optimized for triage operations.
-// Only computes PageRank and Betweenness which are needed for triage scoring.
-// Skips Eigenvector, HITS, Cycles, k-core, articulation, and slack for 50-200ms savings.
+// Computes PageRank, approximate Betweenness, and bounded Cycle detection so
+// project_health.graph.has_cycles / cycle_count and triage alerts stay accurate,
+// while skipping Eigenvector, HITS, CriticalPath, k-core, articulation, and slack.
 // (bv-t1js optimization)
 func TriageConfig() AnalysisConfig {
 	cfg := AnalysisConfig{
@@ -268,9 +269,12 @@ func TriageConfig() AnalysisConfig {
 		ComputePageRank: true,
 		PageRankTimeout: 200 * time.Millisecond,
 
+		ComputeCycles:    true,
+		CyclesTimeout:    100 * time.Millisecond,
+		MaxCyclesToStore: 20,
+
 		// Disable metrics not needed for triage
 		ComputeHITS:         false,
-		ComputeCycles:       false,
 		ComputeEigenvector:  false,
 		ComputeCriticalPath: false,
 		ComputeKCore:        false,

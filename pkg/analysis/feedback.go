@@ -174,7 +174,7 @@ func calculateFeedbackStats(events []FeedbackEvent) FeedbackStats {
 	return stats
 }
 
-// Save persists feedback data to the beads directory
+// Save persists feedback data atomically to the beads directory.
 func (f *FeedbackData) Save(beadsDir string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -186,10 +186,43 @@ func (f *FeedbackData) Save(beadsDir string) error {
 		return fmt.Errorf("failed to marshal feedback: %w", err)
 	}
 
+	if err := os.MkdirAll(beadsDir, 0o700); err != nil {
+		return fmt.Errorf("failed to create beads directory: %w", err)
+	}
+
+	tmpFile, err := os.CreateTemp(beadsDir, ".feedback-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp feedback file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := tmpFile.Chmod(0o600); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to chmod temp feedback file: %w", err)
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to write temp feedback file: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to sync temp feedback file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temp feedback file: %w", err)
+	}
+
 	path := filepath.Join(beadsDir, FeedbackFile)
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("failed to write feedback file: %w", err)
 	}
+	cleanupTmp = false
 
 	return nil
 }

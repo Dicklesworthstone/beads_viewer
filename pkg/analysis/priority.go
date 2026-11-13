@@ -958,6 +958,23 @@ func (a *Analyzer) computeWhatIfDelta(issueID string) *WhatIfDelta {
 	return a.computeWhatIfDeltaFromStats(issueID, &stats)
 }
 
+// ComputeWhatIfDeltaFromStats calculates the impact of completing issueID using
+// caller-supplied GraphStats, returning an error if issueID is absent or
+// excluded from the active candidate scope.
+func (a *Analyzer) ComputeWhatIfDeltaFromStats(issueID string, stats *GraphStats) (*WhatIfDelta, error) {
+	if a == nil {
+		return nil, fmt.Errorf("analyzer is nil")
+	}
+	if _, ok := a.issueMap[issueID]; !ok || !a.IsCandidate(issueID) {
+		return nil, fmt.Errorf("issue not found: %s", issueID)
+	}
+	delta := a.computeWhatIfDeltaFromStats(issueID, stats)
+	if delta == nil {
+		return nil, fmt.Errorf("failed to compute what-if delta for %s", issueID)
+	}
+	return delta, nil
+}
+
 // computeWhatIfDeltaFromStats calculates the impact of completing an issue
 // using graph statistics already owned by the caller.
 func (a *Analyzer) computeWhatIfDeltaFromStats(issueID string, stats *GraphStats) *WhatIfDelta {

@@ -408,8 +408,9 @@ type TriageOptions struct {
 	TopN          int                   // Number of recommendations (default 10)
 	QuickWinN     int                   // Number of quick wins (default 5)
 	BlockerN      int                   // Number of blockers to show (default 5)
-	WaitForPhase2 bool                  // Block until Phase 2 metrics ready
-	UseFastConfig bool                  // Use TriageConfig for faster Phase 2 (bv-t1js optimization)
+	WaitForPhase2     bool                  // Block until Phase 2 metrics ready
+	UseFastConfig     bool                  // Use TriageConfig for faster Phase 2 (bv-t1js optimization)
+	ForceFullAnalysis bool                  // Force FullAnalysisConfig regardless of graph size (--force-full-analysis)
 	// Robot work selection excludes parked and dependency-blocked diagnostics.
 	// Planning consumers retain the complete scored list by default.
 	ActionableOnly bool
@@ -517,18 +518,25 @@ func ComputeTriageWithOptionsAndTime(issues []model.Issue, opts TriageOptions, n
 	// Use fast config for triage-only analysis (bv-t1js optimization)
 	// bv-perf: When no open issues, use NoPhase2Config to skip the goroutine entirely.
 	var stats *GraphStats
-	if !hasOpenIssues {
+	if !hasOpenIssues && !opts.ForceFullAnalysis {
 		// All issues closed - skip Phase 2 completely (no scoring needed)
 		stats = analyzer.AnalyzeAsyncWithConfig(context.Background(), NoPhase2Config())
+	} else if opts.ForceFullAnalysis {
+		stats = analyzer.AnalyzeAsyncWithConfig(context.Background(), FullAnalysisConfig())
 	} else if opts.UseFastConfig {
-		stats = analyzer.AnalyzeAsyncWithConfig(context.Background(), TriageConfig())
+		cfg := TriageConfig()
+		if cfg.ComputeCycles && len(issues) > 2000 {
+			cfg.ComputeCycles = false
+			cfg.CyclesSkipReason = "XL graph (>2000 nodes) in fast triage mode; use --force-full-analysis"
+		}
+		stats = analyzer.AnalyzeAsyncWithConfig(context.Background(), cfg)
 	} else {
 		stats = analyzer.AnalyzeAsync(context.Background())
 	}
 
 	// Triage requires advanced metrics (PageRank, etc.) for scoring.
-	// If requested, wait for Phase 2 to complete - but only if there are open issues.
-	if opts.WaitForPhase2 && hasOpenIssues {
+	// If requested, wait for Phase 2 to complete - or always when ForceFullAnalysis is set.
+	if opts.WaitForPhase2 && (hasOpenIssues || opts.ForceFullAnalysis) {
 		stats.WaitForPhase2()
 	}
 
@@ -616,8 +624,9 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	}
 
 	// Create TriageContext for unified caching (bv-oko3)
-	// This caches actionable issues, blocker depths, etc. across all sub-functions
+	// This caches actionable issues, blocker depths, label health, etc. across all sub-functions
 	triageCtx := NewTriageContext(analyzer)
+	triageCtx.SetStats(stats)
 
 	// Get unblocks map from context (bv-wjs0)
 	unblocksMap := triageCtx.UnblocksMap()
@@ -698,6 +707,18 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 		}
 	}
 
+	// bv-87: Build grouped recommendations over the full candidate recommendation
+	// set BEFORE slicing recommendations to opts.TopN so tracks and labels beyond
+	// the global top-N cap still surface their top picks for multi-agent swarms.
+	var recsByTrack []TrackRecommendationGroup
+	var recsByLabel []LabelRecommendationGroup
+	if opts.GroupByTrack {
+		recsByTrack = buildRecommendationsByTrack(allRecommendations, analyzer, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
+	}
+	if opts.GroupByLabel {
+		recsByLabel = buildRecommendationsByLabel(allRecommendations, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
+	}
+
 	recommendations := allRecommendations
 	if len(recommendations) > opts.TopN {
 		recommendations = recommendations[:opts.TopN]
@@ -722,24 +743,15 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	}
 
 	elapsed := time.Since(start)
-	projectVelocity := ComputeProjectVelocity(issues, now.UTC(), 8)
+	projectVelocity := ComputeProjectVelocity(candidateIssues, now.UTC(), 8)
 
-	// bv-87: Build grouped recommendations if requested
-	var recsByTrack []TrackRecommendationGroup
-	var recsByLabel []LabelRecommendationGroup
-	if opts.GroupByTrack {
-		recsByTrack = buildRecommendationsByTrack(recommendations, analyzer, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
-	}
-	if opts.GroupByLabel {
-		recsByLabel = buildRecommendationsByLabel(recommendations, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
-	}
-
-	// Calculate staleness if history is available
+	// Calculate staleness over in-scope candidate issues if history is available
 	var staleness *Staleness
 	if opts.History != nil {
-		staleness = ComputeStaleness(opts.History, issues, now)
+		staleness = ComputeStaleness(opts.History, candidateIssues, now)
 	}
 
+	alerts := buildTriageAlerts(analyzer, candidateIssues, stats, staleness, projectVelocity, now)
 	partition := analyzer.CountStatusPartition()
 
 	return TriageResult{
@@ -773,8 +785,99 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 			Velocity:  projectVelocity,
 			Staleness: staleness,
 		},
+		Alerts:   alerts,
 		Commands: buildCommands(analyzer.issueMap[topID].Actions(topID != "")),
 	}
+}
+
+// buildTriageAlerts synthesizes proactive triage warnings over candidate issues
+// without leaking context-only out-of-scope issue IDs.
+func buildTriageAlerts(analyzer *Analyzer, candidateIssues []model.Issue, stats *GraphStats, staleness *Staleness, velocity *Velocity, now time.Time) []Alert {
+	var alerts []Alert
+
+	if stats != nil {
+		cycles := stats.Cycles()
+		if len(cycles) > 0 {
+			memberSet := make(map[string]bool)
+			scopedCycleCount := 0
+			for _, cyc := range cycles {
+				hasCandidate := false
+				for _, id := range cyc {
+					if analyzer == nil || analyzer.IsCandidate(id) {
+						hasCandidate = true
+						memberSet[id] = true
+					}
+				}
+				if hasCandidate {
+					scopedCycleCount++
+				}
+			}
+			if scopedCycleCount > 0 {
+				memberIDs := make([]string, 0, len(memberSet))
+				for id := range memberSet {
+					memberIDs = append(memberIDs, id)
+				}
+				sort.Strings(memberIDs)
+				msg := fmt.Sprintf("%d dependency cycle(s) detected involving %d in-scope issue(s)", scopedCycleCount, len(memberIDs))
+				alerts = append(alerts, Alert{
+					Type:     "cycle",
+					Severity: "critical",
+					Message:  msg,
+					IssueID:  memberIDs[0],
+					IssueIDs: memberIDs,
+				})
+			}
+		}
+	}
+
+	if staleness != nil && staleness.StaleCount > 0 && staleness.StalestIssueID != "" {
+		if analyzer == nil || analyzer.IsCandidate(staleness.StalestIssueID) {
+			alerts = append(alerts, Alert{
+				Type:     "stale",
+				Severity: "warning",
+				Message:  fmt.Sprintf("%d issue(s) inactive >%d days (stalest: %s at %dd)", staleness.StaleCount, staleness.ThresholdDays, staleness.StalestIssueID, staleness.StalestIssueDays),
+				IssueID:  staleness.StalestIssueID,
+			})
+		}
+	}
+
+	var abandoned []string
+	for _, iss := range candidateIssues {
+		if iss.Status != model.StatusInProgress || iss.UpdatedAt.IsZero() {
+			continue
+		}
+		days := int(now.Sub(iss.UpdatedAt).Hours() / 24)
+		if days > 14 {
+			abandoned = append(abandoned, iss.ID)
+		}
+	}
+	if len(abandoned) > 0 {
+		sort.Strings(abandoned)
+		alerts = append(alerts, Alert{
+			Type:     "abandoned_claim",
+			Severity: "warning",
+			Message:  fmt.Sprintf("%d in-progress issue(s) have no updates for >14 days (first: %s)", len(abandoned), abandoned[0]),
+			IssueID:  abandoned[0],
+			IssueIDs: abandoned,
+		})
+	}
+
+	if velocity != nil && !velocity.Estimated && len(velocity.Weekly) >= 5 {
+		priorSum := 0
+		for i := 1; i <= 4; i++ {
+			priorSum += velocity.Weekly[i].Closed
+		}
+		priorAvg := float64(priorSum) / 4.0
+		if priorAvg >= 2.0 && float64(velocity.ClosedLast7Days) <= priorAvg*0.5 {
+			alerts = append(alerts, Alert{
+				Type:     "velocity_drop",
+				Severity: "warning",
+				Message:  fmt.Sprintf("7-day closure velocity (%d) dropped >=50%% below prior 4-week average (%.1f/wk)", velocity.ClosedLast7Days, priorAvg),
+			})
+		}
+	}
+
+	return alerts
 }
 
 // ComputeStaleness calculates staleness metrics from history
@@ -1806,6 +1909,7 @@ func generateTriageReasonsForScoreAt(score TriageScore, triageCtx *TriageContext
 		TriageScore:     &score,
 		UnblocksIDs:     unblocksMap[score.IssueID],
 		BlockedByIDs:    triageCtx.OpenBlockers(score.IssueID), // cached
+		LabelHealth:     triageCtx.LabelHealthMap(now),        // cached
 		ClaimedByAgent:  claimedByAgent,
 		DaysSinceUpdate: daysSinceUpdate,
 		IsQuickWin:      isQuickWin,

@@ -253,6 +253,42 @@ type WhatIfEntry struct {
 	Delta   WhatIfDelta `json:"delta"`
 }
 
+// WhatIfResult represents the single-issue completion simulation result for --robot-whatif.
+type WhatIfResult struct {
+	IssueID  string      `json:"issue_id"`
+	Title    string      `json:"title"`
+	Status   string      `json:"status"`
+	Priority int         `json:"priority"`
+	Delta    WhatIfDelta `json:"delta"`
+}
+
+// ComputeWhatIf simulates completing issueID and returns its downstream impact
+// summary, or nil when issueID does not exist in the active candidate scope.
+func (a *Analyzer) ComputeWhatIf(issueID string, stats *GraphStats) *WhatIfResult {
+	if a == nil {
+		return nil
+	}
+	issue, ok := a.issueMap[issueID]
+	if !ok || !a.IsCandidate(issueID) {
+		return nil
+	}
+	if stats == nil {
+		analyzed := a.Analyze()
+		stats = &analyzed
+	}
+	delta := a.computeWhatIfDeltaFromStats(issueID, stats)
+	if delta == nil {
+		return nil
+	}
+	return &WhatIfResult{
+		IssueID:  issue.ID,
+		Title:    issue.Title,
+		Status:   string(issue.Status),
+		Priority: issue.Priority,
+		Delta:    *delta,
+	}
+}
+
 // TopWhatIfDeltas returns the top N issues with highest downstream impact (bv-83)
 func (a *Analyzer) TopWhatIfDeltas(n int) []WhatIfEntry {
 	stats := a.Analyze()
