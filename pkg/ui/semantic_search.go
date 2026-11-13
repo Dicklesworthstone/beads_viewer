@@ -3,7 +3,6 @@ package ui
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -730,11 +729,29 @@ func BuildSemanticIndexCmd(issues []model.Issue, dataGen, buildGen uint64, workD
 		if len(workDir) > 0 {
 			projectDir = strings.TrimSpace(workDir[0])
 		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		docs := search.DocumentsFromIssues(issues)
+
+		// Read-only / historical mode (no project directory): build an in-memory
+		// index without reading or overwriting .bv/semantic/ on disk.
 		if projectDir == "" {
-			var err error
-			projectDir, err = os.Getwd()
+			idx := search.NewVectorIndex(embedder.Dim())
+			stats, err := search.SyncVectorIndex(ctx, idx, embedder, docs, 64)
 			if err != nil {
 				return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
+			}
+			return SemanticIndexReadyMsg{
+				DataGeneration:  dataGen,
+				BuildGeneration: buildGen,
+				Embedder:        embedder,
+				Index:           idx,
+				IndexPath:       "",
+				Loaded:          false,
+				NeedsSave:       false,
+				Stats:           stats,
 			}
 		}
 
@@ -744,10 +761,6 @@ func BuildSemanticIndexCmd(issues []model.Issue, dataGen, buildGen uint64, workD
 			return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-
-		docs := search.DocumentsFromIssues(issues)
 		stats, err := search.SyncVectorIndex(ctx, idx, embedder, docs, 64)
 		if err != nil {
 			return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
