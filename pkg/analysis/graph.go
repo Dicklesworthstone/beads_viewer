@@ -1340,11 +1340,11 @@ type Analyzer struct {
 	structHashOnce sync.Once
 	structHash     string
 
-	activeSetOnce     sync.Once
-	activeSetHash     string
-	activeIDs         []string
-	hasClosed         bool
-	activePrecomputed bool
+	activeSetOnce sync.Once
+	activeSetHash string
+	activeIDs     []string
+	hasClosed     bool
+	sortedIDs     []string
 }
 
 // SetReadinessScope separates dependency authority and candidate eligibility
@@ -1567,7 +1567,19 @@ func (a *Analyzer) computeGraphStructureHash() string {
 
 func (a *Analyzer) ensureActiveSet() ([]string, bool, string) {
 	a.activeSetOnce.Do(func() {
-		if !a.activePrecomputed {
+		if len(a.sortedIDs) > 0 {
+			ids := make([]string, 0, len(a.sortedIDs))
+			hasClosed := false
+			for _, id := range a.sortedIDs {
+				if isClosedLikeStatus(a.issueMap[id].Status) {
+					hasClosed = true
+					continue
+				}
+				ids = append(ids, id)
+			}
+			a.activeIDs = ids
+			a.hasClosed = hasClosed
+		} else {
 			ids := make([]string, 0, len(a.issueMap))
 			hasClosed := false
 			for id, issue := range a.issueMap {
@@ -1580,7 +1592,6 @@ func (a *Analyzer) ensureActiveSet() ([]string, bool, string) {
 			sort.Strings(ids)
 			a.activeIDs = ids
 			a.hasClosed = hasClosed
-			a.activePrecomputed = true
 		}
 		h := sha256.New()
 		for _, id := range a.activeIDs {
@@ -1825,18 +1836,11 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 	childrenByParent := make(map[string][]string)
 	blockerCounts := make([]int, len(sortedIssueIDs))
 
-	// 1. Add Nodes and record already-sorted active issue IDs
-	activeIDs := make([]string, 0, len(sortedIssueIDs))
-	hasClosed := false
+	// 1. Add Nodes
 	for idx, id := range sortedIssueIDs {
 		nodeID := int64(idx)
 		idToNode[id] = nodeID
 		nodeToID[nodeID] = id
-		if isClosedLikeStatus(issueMap[id].Status) {
-			hasClosed = true
-		} else {
-			activeIDs = append(activeIDs, id)
-		}
 	}
 
 	// 2. Add blocking edges and index parent-child rollups.
@@ -1915,18 +1919,16 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 	}
 
 	return &Analyzer{
-		g:                 g,
-		idToNode:          idToNode,
-		nodeToID:          nodeToID,
-		issueMap:          issueMap,
-		issues:            ownedIssues,
-		childrenByParent:  childrenByParent,
-		blockerCounts:     blockerCounts,
-		blockerCountsMax:  maxBlockers,
-		now:               time.Now(),
-		activeIDs:         activeIDs,
-		hasClosed:         hasClosed,
-		activePrecomputed: true,
+		g:                g,
+		idToNode:         idToNode,
+		nodeToID:         nodeToID,
+		issueMap:         issueMap,
+		issues:           ownedIssues,
+		childrenByParent: childrenByParent,
+		blockerCounts:    blockerCounts,
+		blockerCountsMax: maxBlockers,
+		now:              time.Now(),
+		sortedIDs:        sortedIssueIDs,
 	}
 }
 
