@@ -213,9 +213,17 @@ func (b *Baseline) Summary() string {
 	return sb.String()
 }
 
-// New creates a new baseline with the given stats and metrics
+// New creates a new baseline with the given stats and metrics for the current working directory.
 func New(stats GraphStats, top TopMetrics, cycles [][]string, description string) *Baseline {
-	sha, msg, branch := GetGitInfo(".")
+	return NewForDir(".", stats, top, cycles, description)
+}
+
+// NewForDir creates a new baseline resolving git commit/branch metadata from projectDir.
+func NewForDir(projectDir string, stats GraphStats, top TopMetrics, cycles [][]string, description string) *Baseline {
+	if projectDir == "" {
+		projectDir = "."
+	}
+	sha, msg, branch := GetGitInfo(projectDir)
 
 	return &Baseline{
 		Version:       CurrentVersion,
