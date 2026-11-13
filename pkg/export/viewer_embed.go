@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -139,19 +140,43 @@ func (b *Bundle) writeFile(name string, perm os.FileMode, write func(io.Writer) 
 	return nil
 }
 
-// CopyEmbeddedAssets copies all embedded viewer assets to the specified output directory.
+// EmbedAssets copies all embedded viewer assets to the specified output directory.
 // If title is provided, it replaces "Beads Viewer" in index.html.
-func CopyEmbeddedAssets(outputDir, title string) error {
+func EmbedAssets(outputDir, title string) error {
+	return EmbedAssetsWithSubtitle(outputDir, title, "")
+}
+
+// EmbedAssetsWithSubtitle copies all embedded viewer assets to the specified output directory,
+// replacing the default title when non-empty and rendering an optional subtitle beneath the navbar h1.
+func EmbedAssetsWithSubtitle(outputDir, title, subtitle string) error {
 	bundle, err := OpenBundle(outputDir)
 	if err != nil {
 		return err
 	}
 	defer bundle.Close()
-	return bundle.CopyEmbeddedAssets(title)
+	return bundle.CopyEmbeddedAssetsWithSubtitle(title, subtitle)
+}
+
+// CopyEmbeddedAssets copies all embedded viewer assets to the specified output directory.
+// If title is provided, it replaces "Beads Viewer" in index.html.
+func CopyEmbeddedAssets(outputDir, title string) error {
+	return EmbedAssetsWithSubtitle(outputDir, title, "")
+}
+
+// CopyEmbeddedAssetsWithSubtitle copies all embedded viewer assets to the specified output directory,
+// replacing the default title and rendering an optional subtitle beneath the navbar h1.
+func CopyEmbeddedAssetsWithSubtitle(outputDir, title, subtitle string) error {
+	return EmbedAssetsWithSubtitle(outputDir, title, subtitle)
 }
 
 // CopyEmbeddedAssets writes viewer assets through the held bundle boundary.
 func (b *Bundle) CopyEmbeddedAssets(title string) error {
+	return b.CopyEmbeddedAssetsWithSubtitle(title, "")
+}
+
+// CopyEmbeddedAssetsWithSubtitle writes viewer assets through the held bundle boundary,
+// applying optional title and subtitle customization to index.html.
+func (b *Bundle) CopyEmbeddedAssetsWithSubtitle(title, subtitle string) error {
 	var offlineFiles []string
 	// Walk the embedded filesystem and copy all files
 	err := fs.WalkDir(ViewerAssetsFS, "viewer_assets", func(path string, d fs.DirEntry, err error) error {
@@ -188,11 +213,14 @@ func (b *Bundle) CopyEmbeddedAssets(title string) error {
 			return err
 		}
 
-		// Special handling for index.html to replace the title and add cache-busting
+		// Special handling for index.html to replace the title/subtitle and add cache-busting
 		if relPath == "index.html" {
 			contentStr := string(content)
 			if title != "" {
 				contentStr = replaceTitle(contentStr, title)
+			}
+			if strings.TrimSpace(subtitle) != "" {
+				contentStr = ReplaceSubtitle(contentStr, subtitle)
 			}
 			// Always add cache-busting to prevent CDN from serving stale JS files
 			contentStr = AddScriptCacheBusting(contentStr)
@@ -289,8 +317,13 @@ func isDevOnlyAsset(relPath string) bool {
 	return strings.HasSuffix(relPath, ".test.js")
 }
 
+var (
+	defaultNavbarH1Pattern = regexp.MustCompile(`(<h1\b[^>]*>)Beads Viewer(</h1>)`)
+	firstNavbarH1Pattern   = regexp.MustCompile(`<h1\b[^>]*>[^<]*</h1>`)
+)
+
 // replaceTitle replaces the default title in HTML content with the provided title.
-// It replaces both the <title> tag and the h1 header.
+// It replaces both the <title> tag and the h1 header regardless of responsive classes.
 // The title is HTML-escaped to prevent XSS and broken HTML.
 func replaceTitle(content, title string) string {
 	if title == "" {
@@ -303,10 +336,30 @@ func replaceTitle(content, title string) string {
 	// Replace title in <title> tag
 	content = strings.Replace(content, "<title>Beads Viewer</title>", "<title>"+safeTitle+"</title>", 1)
 
-	// Replace title in h1 header
-	content = strings.Replace(content, `<h1 class="text-xl font-semibold">Beads Viewer</h1>`, `<h1 class="text-xl font-semibold">`+safeTitle+`</h1>`, 1)
+	// Replace title in navbar h1 header while preserving existing h1 attributes/classes
+	if loc := defaultNavbarH1Pattern.FindStringSubmatchIndex(content); loc != nil {
+		content = content[:loc[0]] + content[loc[2]:loc[3]] + safeTitle + content[loc[4]:loc[5]] + content[loc[1]:]
+	}
 
 	return content
+}
+
+// ReplaceSubtitle inserts an HTML-escaped subtitle paragraph directly beneath the navbar <h1>
+// when subtitle is non-whitespace.
+func ReplaceSubtitle(content, subtitle string) string {
+	trimmed := strings.TrimSpace(subtitle)
+	if trimmed == "" {
+		return content
+	}
+
+	loc := firstNavbarH1Pattern.FindStringIndex(content)
+	if loc == nil {
+		return content
+	}
+
+	safeSubtitle := html.EscapeString(trimmed)
+	subtitleEl := "\n              <p class=\"text-xs text-gray-500 dark:text-gray-400 truncate\">" + safeSubtitle + "</p>"
+	return content[:loc[1]] + subtitleEl + content[loc[1]:]
 }
 
 // AddScriptCacheBusting adds a cache-busting query parameter to script src attributes.
