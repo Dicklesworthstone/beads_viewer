@@ -602,10 +602,30 @@ func (c *Correlator) cacheResult(beadID string, result *CorrelationResult) {
 }
 
 // WorkspaceFromBeadsPath extracts the workspace directory from a beads.jsonl path.
+// An empty path returns "", and relative paths are resolved to absolute paths
+// before stripping the beads directory and filename.
 func WorkspaceFromBeadsPath(beadsPath string) string {
+	trimmed := strings.TrimSpace(beadsPath)
+	if trimmed == "" {
+		return ""
+	}
+	if !filepath.IsAbs(trimmed) && !isWindowsDrivePath(trimmed) {
+		if abs, err := filepath.Abs(trimmed); err == nil {
+			trimmed = abs
+		}
+	}
 	// /path/to/project/.beads/beads.jsonl → /path/to/project
-	dir := filepath.Dir(beadsPath) // → /path/to/project/.beads
-	return filepath.Dir(dir)       // → /path/to/project
+	dir := filepath.Dir(trimmed) // → /path/to/project/.beads
+	return filepath.Dir(dir)     // → /path/to/project
+}
+
+func isWindowsDrivePath(p string) bool {
+	if len(p) < 3 {
+		return false
+	}
+	c := p[0]
+	return ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) &&
+		p[1] == ':' && (p[2] == '/' || p[2] == '\\')
 }
 
 // beadIDRegex matches bead IDs like "bv-abc123"
