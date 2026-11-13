@@ -9294,25 +9294,6 @@ func generateRobotSchemas() RobotSchemas {
 			commands[name] = genericRobotCommandSchema(name, doc)
 		}
 	}
-	if envProps, ok := envelope["properties"].(map[string]interface{}); ok {
-		for _, schema := range commands {
-			props, ok := schema["properties"].(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if _, hasGenAt := props["generated_at"]; !hasGenAt {
-				continue
-			}
-			if _, hasDataHash := props["data_hash"]; !hasDataHash {
-				continue
-			}
-			for k, v := range envProps {
-				if _, exists := props[k]; !exists {
-					props[k] = v
-				}
-			}
-		}
-	}
 
 	return RobotSchemas{
 		SchemaVersion: robotContractVersion,
@@ -10381,14 +10362,12 @@ func robotGroupedTriageOutputSchema(title, description, groupProperty string, gr
 		"description": description,
 		"type":        "object",
 		"properties": map[string]interface{}{
-			"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
-			"data_hash":     map[string]interface{}{"type": "string"},
-			"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
-			"version":       map[string]interface{}{"type": "string"},
-			"as_of":         map[string]interface{}{"type": "string"},
-			"as_of_commit":  map[string]interface{}{"type": "string"},
-			"brief":         map[string]interface{}{"type": "boolean"},
-			"quick_ref":     map[string]interface{}{"type": "object"},
+			"generated_at": map[string]interface{}{"type": "string", "format": "date-time"},
+			"data_hash":    map[string]interface{}{"type": "string"},
+			"as_of":        map[string]interface{}{"type": "string"},
+			"as_of_commit": map[string]interface{}{"type": "string"},
+			"brief":        map[string]interface{}{"type": "boolean"},
+			"quick_ref":    map[string]interface{}{"type": "object"},
 			"recommendations": map[string]interface{}{
 				"type": "array",
 			},

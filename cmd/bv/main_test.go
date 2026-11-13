@@ -3966,6 +3966,7 @@ func TestBriefOutputsRefuseSymlinkTargets(t *testing.T) {
 }
 
 func TestRobotWhatIfAndWave6CLIWiring(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
 	exe := buildTestBinary(t)
 	tmpDir := t.TempDir()
 
@@ -4154,6 +4155,9 @@ func TestRobotWhatIfAndWave6CLIWiring(t *testing.T) {
 		t.Fatalf("--robot-schema failed: %v\nstderr: %s", err, stderr)
 	}
 	var liveSchemas struct {
+		Envelope struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		} `json:"envelope"`
 		Commands map[string]struct {
 			Properties map[string]json.RawMessage `json:"properties"`
 			Required   []string                   `json:"required"`
@@ -4193,8 +4197,10 @@ func TestRobotWhatIfAndWave6CLIWiring(t *testing.T) {
 			t.Fatalf("unmarshal %s payload: %v", cmdName, err)
 		}
 		for k := range obj {
-			if _, declared := cmdSchema.Properties[k]; !declared {
-				t.Fatalf("%s --brief emitted undeclared top-level key %q", cmdName, k)
+			_, inCmd := cmdSchema.Properties[k]
+			_, inEnv := liveSchemas.Envelope.Properties[k]
+			if !inCmd && !inEnv {
+				t.Fatalf("%s --brief emitted undeclared top-level key %q (absent from both command properties and envelope.properties)", cmdName, k)
 			}
 		}
 		if len(cmdSchema.OneOf) == 0 {
