@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -137,11 +139,28 @@ func TestFindBeadIDMentions(t *testing.T) {
 }
 
 func TestWorkspaceFromBeadsPath(t *testing.T) {
+	tmpRoot := t.TempDir()
+	nestedRepo := filepath.Join(tmpRoot, "nested", "repo")
+	if err := os.MkdirAll(filepath.Join(nestedRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(tmpRoot)
+
 	tests := []struct {
 		name     string
 		input    string
 		expected string
 	}{
+		{
+			name:     "empty path returns empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "whitespace path returns empty string",
+			input:    "   ",
+			expected: "",
+		},
 		{
 			name:     "standard path",
 			input:    "/home/user/project/.beads/beads.jsonl",
@@ -151,6 +170,16 @@ func TestWorkspaceFromBeadsPath(t *testing.T) {
 			name:     "windows-like path",
 			input:    "C:/Users/dev/project/.beads/issues.jsonl",
 			expected: "C:/Users/dev/project",
+		},
+		{
+			name:     "relative .beads path resolves to absolute workspace",
+			input:    ".beads/issues.jsonl",
+			expected: tmpRoot,
+		},
+		{
+			name:     "nested relative .beads path resolves to nested workspace",
+			input:    filepath.Join("nested", "repo", ".beads", "issues.jsonl"),
+			expected: nestedRepo,
 		},
 	}
 
