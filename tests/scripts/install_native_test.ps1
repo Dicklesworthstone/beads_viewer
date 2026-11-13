@@ -271,7 +271,7 @@ exit $LASTEXITCODE
     $compilerScript = @'
 @echo off
 if "%~1" == "version" (
-  echo go version go1.26.10 windows/amd64
+  echo go version go1.26.11 windows/amd64
   exit /b 0
 )
 if "%~1" == "install" (

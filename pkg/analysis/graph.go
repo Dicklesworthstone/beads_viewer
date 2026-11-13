@@ -104,6 +104,12 @@ type GraphStats struct {
 
 	// Phase 2 status flags for robot visibility
 	status MetricStatus
+
+	// Memoized active-subgraph metrics keyed by (activeSetHash|metricStates)
+	activeMetricsKey   string
+	activeBetweenness  map[string]float64
+	activeCoreNumber   map[string]int
+	activeArticulation []string
 }
 
 // metricStatus captures per-metric computation outcome for transparency.
@@ -1331,11 +1337,14 @@ type Analyzer struct {
 	dataHashOnce sync.Once
 	dataHash     string
 
-	activeMetricsMu    sync.Mutex
-	activeMetricsStats *GraphStats
-	activeBW           map[string]float64
-	activeCore         map[string]int
-	activeArt          []string
+	structHashOnce sync.Once
+	structHash     string
+
+	activeSetOnce     sync.Once
+	activeSetHash     string
+	activeIDs         []string
+	hasClosed         bool
+	activePrecomputed bool
 }
 
 // SetReadinessScope separates dependency authority and candidate eligibility
@@ -1450,6 +1459,52 @@ func (a *Analyzer) graphStructureHash() string {
 	if a == nil || a.g == nil {
 		return "none"
 	}
+	a.structHashOnce.Do(func() {
+		a.structHash = a.computeGraphStructureHash()
+	})
+	return a.structHash
+}
+
+func (a *Analyzer) computeGraphStructureHash() string {
+	if cg, ok := a.g.(*compactDirectedGraph); ok && len(a.nodeToID) == len(cg.nodes) {
+		// In NewAnalyzer, compact node IDs 0..N-1 are already assigned in sorted
+		// issue-ID order and each row cg.out[u] is already sorted and deduplicated.
+		sorted := true
+		for i := 1; i < len(cg.nodes); i++ {
+			if a.nodeToID[int64(i-1)] > a.nodeToID[int64(i)] {
+				sorted = false
+				break
+			}
+		}
+		if sorted {
+			h := sha256.New()
+			for i := range cg.nodes {
+				h.Write([]byte(a.nodeToID[int64(i)]))
+				h.Write([]byte{0})
+			}
+			h.Write([]byte{1})
+			for i, outs := range cg.out {
+				from := a.nodeToID[int64(i)]
+				if from == "" || len(outs) == 0 {
+					continue
+				}
+				for j, v := range outs {
+					if j > 0 && v == outs[j-1] {
+						continue
+					}
+					to := a.nodeToID[v]
+					if to == "" {
+						continue
+					}
+					h.Write([]byte(from))
+					h.Write([]byte{0})
+					h.Write([]byte(to))
+					h.Write([]byte{0})
+				}
+			}
+			return hex.EncodeToString(h.Sum(nil))[:16]
+		}
+	}
 
 	type nodeKey struct {
 		id   string
@@ -1510,25 +1565,40 @@ func (a *Analyzer) graphStructureHash() string {
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
+func (a *Analyzer) ensureActiveSet() ([]string, bool, string) {
+	a.activeSetOnce.Do(func() {
+		if !a.activePrecomputed {
+			ids := make([]string, 0, len(a.issueMap))
+			hasClosed := false
+			for id, issue := range a.issueMap {
+				if isClosedLikeStatus(issue.Status) {
+					hasClosed = true
+					continue
+				}
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			a.activeIDs = ids
+			a.hasClosed = hasClosed
+			a.activePrecomputed = true
+		}
+		h := sha256.New()
+		for _, id := range a.activeIDs {
+			h.Write([]byte(id))
+			h.Write([]byte{0})
+		}
+		a.activeSetHash = hex.EncodeToString(h.Sum(nil))[:16]
+	})
+	return a.activeIDs, a.hasClosed, a.activeSetHash
+}
+
 // cycleEligibilityHash fingerprints the set of issues that can participate in
 // an execution-blocking cycle. The general graph cache otherwise keys only on
 // nodes and edges, but closing one member changes cycle semantics without
 // changing that topology.
 func (a *Analyzer) cycleEligibilityHash() string {
-	ids := make([]string, 0, len(a.issueMap))
-	for id, issue := range a.issueMap {
-		if !isClosedLikeStatus(issue.Status) {
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-
-	h := sha256.New()
-	for _, id := range ids {
-		h.Write([]byte(id))
-		h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	_, _, hash := a.ensureActiveSet()
+	return hash
 }
 
 // activeSubgraphMetrics computes betweenness centrality, k-core numbers, and
@@ -1546,54 +1616,82 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 		return stats.Betweenness(), stats.CoreNumber(), stats.ArticulationPoints()
 	}
 
-	a.activeMetricsMu.Lock()
-	if a.activeMetricsStats == stats {
-		bwCached, coreCached, artCached := a.activeBW, a.activeCore, a.activeArt
-		a.activeMetricsMu.Unlock()
-		return bwCached, coreCached, artCached
-	}
-	a.activeMetricsMu.Unlock()
-
-	activeIDs := make([]string, 0, len(a.issueMap))
-	hasClosed := false
-	for id, issue := range a.issueMap {
-		if isClosedLikeStatus(issue.Status) {
-			hasClosed = true
-			continue
-		}
-		activeIDs = append(activeIDs, id)
-	}
+	activeIDs, hasClosed, activeHash := a.ensureActiveSet()
 	if !hasClosed {
 		return stats.Betweenness(), stats.CoreNumber(), stats.ArticulationPoints()
 	}
 	if len(activeIDs) == 0 {
 		return map[string]float64{}, map[string]int{}, []string{}
 	}
-	sort.Strings(activeIDs)
-
-	sub := newCompactDirectedGraph(len(activeIDs))
-	idToSub := make(map[string]int64, len(activeIDs))
-	for i, id := range activeIDs {
-		idToSub[id] = int64(i)
-	}
-	edgeCount := 0
-	edges := a.g.Edges()
-	for edges.Next() {
-		edge := edges.Edge()
-		fromID := a.nodeToID[edge.From().ID()]
-		toID := a.nodeToID[edge.To().ID()]
-		u, okU := idToSub[fromID]
-		v, okV := idToSub[toID]
-		if !okU || !okV || u == v {
-			continue
-		}
-		sub.addEdge(u, v)
-		edgeCount++
-	}
 
 	status := stats.Status()
+	wantBW := status.Betweenness.State == "computed" || status.Betweenness.State == "approx" || status.Betweenness.State == ""
+	wantKCore := status.KCore.State == "computed" || status.KCore.State == ""
+	wantArt := status.Articulation.State == "computed" || status.Articulation.State == ""
+	if !wantBW && !wantKCore && !wantArt {
+		return map[string]float64{}, map[string]int{}, []string{}
+	}
+
+	cacheKey := activeHash + "|" + status.Betweenness.State + "|" + status.KCore.State + "|" + status.Articulation.State
+	stats.mu.RLock()
+	if stats.activeMetricsKey == cacheKey {
+		bwCached, coreCached, artCached := stats.activeBetweenness, stats.activeCoreNumber, stats.activeArticulation
+		stats.mu.RUnlock()
+		return bwCached, coreCached, artCached
+	}
+	stats.mu.RUnlock()
+
+	sub := newCompactDirectedGraph(len(activeIDs))
+	edgeCount := 0
+	if cg, ok := a.g.(*compactDirectedGraph); ok && len(a.nodeToID) == len(cg.nodes) {
+		origToSub := make([]int64, len(cg.nodes))
+		for i := range origToSub {
+			origToSub[i] = -1
+		}
+		for subIdx, id := range activeIDs {
+			if origNode, exists := a.idToNode[id]; exists && origNode >= 0 && int(origNode) < len(origToSub) {
+				origToSub[origNode] = int64(subIdx)
+			}
+		}
+		for fromNode, outs := range cg.out {
+			u := origToSub[fromNode]
+			if u < 0 {
+				continue
+			}
+			for _, toNode := range outs {
+				if toNode < 0 || int(toNode) >= len(origToSub) {
+					continue
+				}
+				v := origToSub[toNode]
+				if v < 0 || u == v {
+					continue
+				}
+				sub.addEdge(u, v)
+				edgeCount++
+			}
+		}
+	} else {
+		idToSub := make(map[string]int64, len(activeIDs))
+		for i, id := range activeIDs {
+			idToSub[id] = int64(i)
+		}
+		edges := a.g.Edges()
+		for edges.Next() {
+			edge := edges.Edge()
+			fromID := a.nodeToID[edge.From().ID()]
+			toID := a.nodeToID[edge.To().ID()]
+			u, okU := idToSub[fromID]
+			v, okV := idToSub[toID]
+			if !okU || !okV || u == v {
+				continue
+			}
+			sub.addEdge(u, v)
+			edgeCount++
+		}
+	}
+
 	bwOut := make(map[string]float64, len(activeIDs))
-	if status.Betweenness.State != "skipped" && status.Betweenness.State != "timeout" {
+	if wantBW {
 		for _, id := range activeIDs {
 			bwOut[id] = 0
 		}
@@ -1627,7 +1725,7 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 					}
 				}
 			default:
-				rawBW := network.Betweenness(sub)
+				rawBW := exactBetweennessCompact(sub)
 				for subNode, val := range rawBW {
 					if subNode >= 0 && int(subNode) < len(activeIDs) {
 						bwOut[activeIDs[subNode]] = val
@@ -1639,9 +1737,9 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 
 	coreOut := make(map[string]int)
 	artOut := make([]string, 0)
-	if status.KCore.State != "skipped" || status.Articulation.State != "skipped" {
+	if wantKCore || wantArt {
 		adj := newUndirectedAdjacency(sub)
-		if status.KCore.State != "skipped" {
+		if wantKCore {
 			rawCore := computeKCore(adj)
 			coreOut = make(map[string]int, len(rawCore))
 			for subNode, val := range rawCore {
@@ -1650,7 +1748,7 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 				}
 			}
 		}
-		if status.Articulation.State != "skipped" {
+		if wantArt {
 			rawArt := findArticulationPoints(adj)
 			artOut = make([]string, 0, len(rawArt))
 			for subNode := range rawArt {
@@ -1662,12 +1760,12 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 		}
 	}
 
-	a.activeMetricsMu.Lock()
-	a.activeMetricsStats = stats
-	a.activeBW = bwOut
-	a.activeCore = coreOut
-	a.activeArt = artOut
-	a.activeMetricsMu.Unlock()
+	stats.mu.Lock()
+	stats.activeMetricsKey = cacheKey
+	stats.activeBetweenness = bwOut
+	stats.activeCoreNumber = coreOut
+	stats.activeArticulation = artOut
+	stats.mu.Unlock()
 
 	return bwOut, coreOut, artOut
 }
@@ -1727,11 +1825,18 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 	childrenByParent := make(map[string][]string)
 	blockerCounts := make([]int, len(sortedIssueIDs))
 
-	// 1. Add Nodes
+	// 1. Add Nodes and record already-sorted active issue IDs
+	activeIDs := make([]string, 0, len(sortedIssueIDs))
+	hasClosed := false
 	for idx, id := range sortedIssueIDs {
 		nodeID := int64(idx)
 		idToNode[id] = nodeID
 		nodeToID[nodeID] = id
+		if isClosedLikeStatus(issueMap[id].Status) {
+			hasClosed = true
+		} else {
+			activeIDs = append(activeIDs, id)
+		}
 	}
 
 	// 2. Add blocking edges and index parent-child rollups.
@@ -1810,15 +1915,18 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 	}
 
 	return &Analyzer{
-		g:                g,
-		idToNode:         idToNode,
-		nodeToID:         nodeToID,
-		issueMap:         issueMap,
-		issues:           ownedIssues,
-		childrenByParent: childrenByParent,
-		blockerCounts:    blockerCounts,
-		blockerCountsMax: maxBlockers,
-		now:              time.Now(),
+		g:                 g,
+		idToNode:          idToNode,
+		nodeToID:          nodeToID,
+		issueMap:          issueMap,
+		issues:            ownedIssues,
+		childrenByParent:  childrenByParent,
+		blockerCounts:     blockerCounts,
+		blockerCountsMax:  maxBlockers,
+		now:               time.Now(),
+		activeIDs:         activeIDs,
+		hasClosed:         hasClosed,
+		activePrecomputed: true,
 	}
 }
 
@@ -2208,8 +2316,14 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 				return ApproxBetweenness(a.g, config.BetweennessSampleSize, 1)
 			}
 			// Exact mode or mode not set (default to exact)
+			var exactScores map[int64]float64
+			if cg, ok := a.g.(*compactDirectedGraph); ok {
+				exactScores = exactBetweennessCompact(cg)
+			} else {
+				exactScores = network.Betweenness(a.g)
+			}
 			return BetweennessResult{
-				Scores:     network.Betweenness(a.g),
+				Scores:     exactScores,
 				Mode:       BetweennessExact,
 				TotalNodes: a.g.Nodes().Len(),
 			}

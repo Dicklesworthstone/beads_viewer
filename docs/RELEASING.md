@@ -9,7 +9,7 @@ browser, or WASM proofs listed below.
 
 The release compiler is selected from `go.mod`: use its `toolchain` directive
 when present, otherwise its exact `go` version. The current pin and source-build
-minimum are **Go 1.26.10**. There is no redundant `toolchain go1.26.10` line:
+minimum are **Go 1.26.11**. There is no redundant `toolchain go1.26.11` line:
 `go mod tidy` removes a toolchain directive equal to the `go` directive. The
 retained DSR/`act` workflow inputs use `actions/setup-go`'s `go-version-file`
 support to select the same version explicitly.
@@ -20,7 +20,7 @@ compiler that differs from the pin. It also rejects an affected compiler
 version or `golang.org/x/net` below v0.62.0, and checks the vendored module
 declarations. Update dependencies with Go's module commands, regenerate the
 affected vendored sources, and retain the verified `go.sum` entries. Both the
-Nix package and its development shell use the fixed Go 1.26.10 compiler.
+Nix package and its development shell use the fixed Go 1.26.11 compiler.
 
 The gate accepts only empty `GOFLAGS` or one positive parallelism setting
 such as `-p=2`. This applies to both the caller environment and Go's persistent

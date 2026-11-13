@@ -132,7 +132,7 @@ func flakeBVVersion(flake []byte) (string, error) {
 
 func TestFlakeBVVersionScope(t *testing.T) {
 	const compiler = `go = pkgs.go_1_26.overrideAttrs (_: {
-  version = "1.26.10";
+  version = "1.26.11";
 });
 `
 	const application = `bv = buildGoModule {

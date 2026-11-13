@@ -107,11 +107,11 @@ func releaseToolchainFromMod(mod []byte) (string, error) {
 		}
 		want = strings.TrimPrefix(toolchain, "go")
 	}
-	if !regexp.MustCompile(`^1\.[0-9]+\.[0-9]+$`).MatchString(want) || goversion.Compare("go"+want, "go1.26.10") < 0 {
-		return "", fmt.Errorf("release toolchain must be a full patch release at least Go 1.26.10, got %q", want)
+	if !regexp.MustCompile(`^1\.[0-9]+\.[0-9]+$`).MatchString(want) || goversion.Compare("go"+want, "go1.26.11") < 0 {
+		return "", fmt.Errorf("release toolchain must be a full patch release at least Go 1.26.11, got %q", want)
 	}
-	if strings.HasPrefix(want, "1.27.") && goversion.Compare("go"+want, "go1.27.3") < 0 {
-		return "", fmt.Errorf("Go 1.27 release toolchain must include the security fixes in 1.27.3, got %q", want)
+	if strings.HasPrefix(want, "1.27.") && goversion.Compare("go"+want, "go1.27.4") < 0 {
+		return "", fmt.Errorf("Go 1.27 release toolchain must include the security fixes in 1.27.4, got %q", want)
 	}
 	if goversion.Compare("go"+want, "go"+minimum) < 0 {
 		return "", fmt.Errorf("release toolchain %s is older than the go.mod minimum %s", want, minimum)
@@ -123,20 +123,20 @@ func TestReleaseToolchainDirectiveSelection(t *testing.T) {
 	for _, tc := range []struct {
 		name, mod, want string
 	}{
-		{"go directive", "go 1.26.10\n", "1.26.10"},
-		{"toolchain directive", "go 1.26.0\ntoolchain go1.26.10\n", "1.26.10"},
-		{"newer patch", "go 1.26.11 // security update\n", "1.26.11"},
-		{"patched newer minor", "go 1.27.3\n", "1.27.3"},
+		{"go directive", "go 1.26.11\n", "1.26.11"},
+		{"toolchain directive", "go 1.26.0\ntoolchain go1.26.11\n", "1.26.11"},
+		{"newer patch", "go 1.26.12 // security update\n", "1.26.12"},
+		{"patched newer minor", "go 1.27.4\n", "1.27.4"},
 		{"vulnerable newer minor", "go 1.27.0\n", ""},
-		{"vulnerable newer patch", "go 1.27.2\n", ""},
-		{"old patch", "go 1.26.8\n", ""},
+		{"vulnerable newer patch", "go 1.27.3\n", ""},
+		{"old patch", "go 1.26.10\n", ""},
 		{"floating minor", "go 1.26\n", ""},
-		{"old toolchain", "go 1.26.0\ntoolchain go1.26.8\n", ""},
+		{"old toolchain", "go 1.26.0\ntoolchain go1.26.10\n", ""},
 		{"floating toolchain", "go 1.26.0\ntoolchain go1.26\n", ""},
-		{"default toolchain", "go 1.26.10\ntoolchain default\n", ""},
-		{"toolchain below minimum", "go 1.26.11\ntoolchain go1.26.10\n", ""},
-		{"missing go directive", "toolchain go1.26.10\n", ""},
-		{"duplicate go directive", "go 1.26.10\ngo 1.26.11\n", ""},
+		{"default toolchain", "go 1.26.11\ntoolchain default\n", ""},
+		{"toolchain below minimum", "go 1.26.12\ntoolchain go1.26.11\n", ""},
+		{"missing go directive", "toolchain go1.26.11\n", ""},
+		{"duplicate go directive", "go 1.26.11\ngo 1.26.12\n", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := releaseToolchainFromMod([]byte(tc.mod))
@@ -209,11 +209,11 @@ jobs:
 `
 	for name, data := range map[string]string{
 		"file pin and workflow env": valid,
-		"literal patch pin":         strings.Replace(valid, "go-version-file: go.mod", "go-version: '1.26.10'", 1),
+		"literal patch pin":         strings.Replace(valid, "go-version-file: go.mod", "go-version: '1.26.11'", 1),
 		"job env":                   strings.Replace(valid, "env:\n  GOTOOLCHAIN: local\n  GOWORK: 'off'\njobs:\n  test:", "jobs:\n  test:\n    env:\n      GOTOOLCHAIN: local\n      GOWORK: 'off'", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if count, err := validateGoWorkflow([]byte(data), "1.26.10"); err != nil || count != 1 {
+			if count, err := validateGoWorkflow([]byte(data), "1.26.11"); err != nil || count != 1 {
 				t.Fatalf("valid exact toolchain rejected: setups=%d err=%v", count, err)
 			}
 		})
@@ -221,11 +221,11 @@ jobs:
 	for _, tc := range []struct {
 		name, old, replacement string
 	}{
-		{"old patch", "go-version-file: go.mod", "go-version: '1.26.8'"},
+		{"old patch", "go-version-file: go.mod", "go-version: '1.26.10'"},
 		{"floating minor", "go-version-file: go.mod", "go-version: '1.26'"},
 		{"missing pin", "go-version-file: go.mod", "cache: true"},
 		{"different version file", "go-version-file: go.mod", "go-version-file: go.work"},
-		{"literal overrides file", "go-version-file: go.mod", "go-version-file: go.mod\n          go-version: '1.26.8'"},
+		{"literal overrides file", "go-version-file: go.mod", "go-version-file: go.mod\n          go-version: '1.26.10'"},
 		{"automatic selection", "GOTOOLCHAIN: local", "GOTOOLCHAIN: auto"},
 		{"workspace override", "GOWORK: 'off'", "GOWORK: ../go.work"},
 		{"job override", "  test:\n    steps:", "  test:\n    env:\n      GOTOOLCHAIN: auto\n    steps:"},
@@ -236,7 +236,7 @@ jobs:
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			changed := strings.Replace(valid, tc.old, tc.replacement, 1)
-			if _, err := validateGoWorkflow([]byte(changed), "1.26.10"); err == nil {
+			if _, err := validateGoWorkflow([]byte(changed), "1.26.11"); err == nil {
 				t.Fatalf("accepted workflow regression %q", tc.name)
 			}
 		})

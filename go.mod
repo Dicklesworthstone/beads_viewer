@@ -1,7 +1,7 @@
 module github.com/Dicklesworthstone/beads_viewer
 
 // Keep the source installers and documented minimum aligned with this version.
-go 1.26.10
+go 1.26.11
 
 require (
 	git.sr.ht/~sbinet/gg v0.8.0

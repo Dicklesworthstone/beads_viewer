@@ -245,10 +245,10 @@ printf 'GOFLAGS=-overlay=%s\n' "$external/overlay.json" >"$external/goenv"
 reject persistent-flags 'unsupported release GOFLAGS' env GOFLAGS= GOENV="$external/goenv" bash "$fixture/scripts/release_gate.sh" verify-toolchain
 
 old_toolchain="$(clone_fixture old-toolchain)"
-(cd "$old_toolchain" && go mod edit -toolchain=go1.26.8)
+(cd "$old_toolchain" && go mod edit -toolchain=go1.26.10)
 reject old-toolchain 'below the security floor' bash "$old_toolchain/scripts/release_gate.sh" verify-toolchain
 vulnerable_next_minor="$(clone_fixture vulnerable-next-minor)"
-(cd "$vulnerable_next_minor" && go mod edit -toolchain=go1.27.2)
+(cd "$vulnerable_next_minor" && go mod edit -toolchain=go1.27.3)
 reject vulnerable-next-minor 'below the security floor' bash "$vulnerable_next_minor/scripts/release_gate.sh" verify-toolchain
 wrong_toolchain="$(clone_fixture wrong-toolchain)"
 (cd "$wrong_toolchain" && go mod edit -toolchain=go1.26.99)

@@ -129,9 +129,9 @@ def go_mod_policy():
     # major/minor version or permission to auto-upgrade the release toolchain.
     intended = module.get("Toolchain") or "go" + module.get("Go", "")
     version = stable_version(intended, "go")
-    # GO-2026-6809 was also present in 1.27.0--1.27.2: an unconditional
-    # >=1.26.10 comparison would accidentally permit those vulnerable releases.
-    if version < (1, 26, 10) or (version[:2] == (1, 27) and version < (1, 27, 3)):
+    # GO-2026-6809 and GO-2026-6859 also affect 1.27.0--1.27.3: an unconditional
+    # >=1.26.11 comparison would accidentally permit those vulnerable releases.
+    if version < (1, 26, 11) or (version[:2] == (1, 27) and version < (1, 27, 4)):
         fail(f"go.mod toolchain is below the security floor: {intended}")
     dependencies = {row["Path"]: row["Version"] for row in module.get("Require") or []}
     net_version = dependencies.get("golang.org/x/net", "")

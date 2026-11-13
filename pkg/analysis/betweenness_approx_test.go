@@ -8,6 +8,7 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/testutil"
+	"gonum.org/v1/gonum/graph/network"
 	"gonum.org/v1/gonum/graph/simple"
 )
 
@@ -317,4 +318,28 @@ func generateChainGraph(n int) []model.Issue {
 // generateID creates a unique ID for testing
 func generateID(i int) string {
 	return string(rune('A'+i%26)) + string(rune('0'+i/26))
+}
+
+func TestExactBetweennessCompact_MatchesGonum(t *testing.T) {
+	issues, err := testutil.PerformanceIssues("unicode", 120, 20261112)
+	if err != nil {
+		t.Fatal(err)
+	}
+	an := NewAnalyzer(issues)
+	cg, ok := an.g.(*compactDirectedGraph)
+	if !ok {
+		t.Fatalf("expected *compactDirectedGraph, got %T", an.g)
+	}
+	got := exactBetweennessCompact(cg)
+	want := network.Betweenness(cg)
+	for i := range cg.nodes {
+		id := int64(i)
+		diff := got[id] - want[id]
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > 1e-11 {
+			t.Fatalf("node %d betweenness mismatch: got %.15f, want %.15f (diff %.3e)", id, got[id], want[id], diff)
+		}
+	}
 }

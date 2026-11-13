@@ -43,7 +43,8 @@ establish a published release or a passing release receipt.
 ### Security build dependencies and release checks
 
 - Address [#215](https://github.com/Dicklesworthstone/beads_viewer/issues/215)
-  (`1774a69d`) by requiring Go **1.26.10** and upgrading `golang.org/x/net`
+  (`1774a69d`) and `GO-2026-6859` by requiring Go **1.26.11** (and `1.27.4` on
+  the Go 1.27 branch) and upgrading `golang.org/x/net`
   from v0.59.0 to **v0.62.0**. Go's module resolver also selects `x/sync`
   v0.24.0, `x/sys` v0.49.0, `x/term` v0.47.0 and `x/text` v0.43.0. Regenerate
   the affected Go vendor sources and checksums so offline builds use those
@@ -51,7 +52,7 @@ establish a published release or a passing release receipt.
 - Select the compiler explicitly from `go.mod` in the retained DSR/`act`
   workflow inputs, disable automatic switching in release builds, and reject
   a compiler that differs from the approved pin. The Nix package and shell
-  select Go 1.26.10 without changing the supported platform set.
+  select Go 1.26.11 without changing the supported platform set.
 - Require pinned source-mode `govulncheck` analysis for all five release
   targets (`518f1798`, `ec20e555`, `2e09b08e`, `ea614392`, `b522cfe4`). Bind
   the scanner and successful scan logs to the existing release receipt. Verify

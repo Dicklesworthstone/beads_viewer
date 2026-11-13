@@ -401,15 +401,15 @@ Write-Output "selected=$expected"
 Assert-SourceToolchain @("C:\path with spaces\bv.exe: $BuildVersion") $expected
 ''')
 toolchain_cases = [
-    ('canonical-go', 'go 1.26.10\n', 'go1.26.10', 0, 'selected=go1.26.10'),
-    ('explicit-pin', 'go 1.26.0\ntoolchain go1.26.10\n', 'go1.26.10', 0, 'selected=go1.26.10'),
-    ('older-tag', 'go 1.26.0\ntoolchain go1.26.8\n', 'go1.26.10', 0, 'selected=go1.26.10'),
-    ('older-language', 'go 1.25\n', 'go1.26.10', 0, 'selected=go1.26.10'),
-    ('newer-vulnerable-pin', 'go 1.27.0\ntoolchain go1.27.2\n', 'go1.27.3', 0, 'selected=go1.27.3'),
-    ('old-built-compiler', 'go 1.26.10\n', 'go1.26.8', 1, 'expected go1.26.10'),
-    ('newer-vulnerable-compiler', 'go 1.26.10\n', 'go1.27.2', 1, 'expected go1.26.10'),
-    ('unknown-built-compiler', 'go 1.26.10\n', 'unknown', 1, 'expected go1.26.10'),
-    ('no-declaration', 'module example.test/missing\n', 'go1.26.10', 1, 'stable Go version'),
+    ('canonical-go', 'go 1.26.11\n', 'go1.26.11', 0, 'selected=go1.26.11'),
+    ('explicit-pin', 'go 1.26.0\ntoolchain go1.26.11\n', 'go1.26.11', 0, 'selected=go1.26.11'),
+    ('older-tag', 'go 1.26.0\ntoolchain go1.26.10\n', 'go1.26.11', 0, 'selected=go1.26.11'),
+    ('older-language', 'go 1.25\n', 'go1.26.11', 0, 'selected=go1.26.11'),
+    ('newer-vulnerable-pin', 'go 1.27.0\ntoolchain go1.27.3\n', 'go1.27.4', 0, 'selected=go1.27.4'),
+    ('old-built-compiler', 'go 1.26.11\n', 'go1.26.10', 1, 'expected go1.26.11'),
+    ('newer-vulnerable-compiler', 'go 1.26.11\n', 'go1.27.3', 1, 'expected go1.26.11'),
+    ('unknown-built-compiler', 'go 1.26.11\n', 'unknown', 1, 'expected go1.26.11'),
+    ('no-declaration', 'module example.test/missing\n', 'go1.26.11', 1, 'stable Go version'),
     ('development-compiler', 'go 1.26.0\ntoolchain go1.27rc1\n', 'go1.27rc1', 1, 'stable Go version'),
 ]
 for name, module, built_version, expected, marker in toolchain_cases:
@@ -429,7 +429,7 @@ for name, module, built_version, expected, marker in toolchain_cases:
 # must observe that value instead of substituting its own safe constant. This
 # copy is parsed only; it is never executed as an installer.
 installer_text = Path(installer).read_text()
-floor_assignment = '$MIN_GO_VERSION = "1.26.10"'
+floor_assignment = '$MIN_GO_VERSION = "1.26.11"'
 if installer_text.count(floor_assignment) != 1:
     raise SystemExit('Cannot construct the single-assignment source-floor control')
 old_floor_installer = scratch / 'installer-old-floor.ps1'
@@ -438,7 +438,7 @@ old_tag_module = scratch / 'source-floor-control.mod'
 old_tag_module.write_text('go 1.26.0\ntoolchain go1.26.8\n')
 result = subprocess.run([pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-File', str(toolchain_probe),
                          '-Installer', str(old_floor_installer), '-ModuleFile', str(old_tag_module),
-                         '-BuildVersion', 'go1.26.10'], capture_output=True, text=True, timeout=15)
+                         '-BuildVersion', 'go1.26.11'], capture_output=True, text=True, timeout=15)
 output = result.stdout + result.stderr
 if result.returncode != 1 or 'selected=go1.26.8' not in output or 'expected go1.26.8' not in output:
     failed = True

@@ -309,7 +309,12 @@ func approxBetweenness(g graph.Directed, sampleSize int, seed int64, workers int
 
 	// For small graphs or when sample size >= node count, use exact algorithm
 	if sampleSize >= n {
-		exact := network.Betweenness(g)
+		var exact map[int64]float64
+		if cg, ok := g.(*compactDirectedGraph); ok {
+			exact = exactBetweennessCompact(cg)
+		} else {
+			exact = network.Betweenness(g)
+		}
 		result.Scores = exact
 		result.Mode = BetweennessExact
 		result.SampleSize = n
@@ -480,6 +485,53 @@ func singleSourceBetweennessDense(adj cachedAdjacency, sourceIdx int, buf *brand
 		// Add dependency to betweenness (w != sourceIdx already checked above)
 		buf.bc[w] += delta[w]
 	}
+}
+
+// exactBetweennessCompact computes exact Brandes betweenness centrality on a
+// compactDirectedGraph using dense flat arrays and pooled Brandes buffers,
+// avoiding Gonum's per-source map and iterator interface allocations.
+func exactBetweennessCompact(g *compactDirectedGraph) map[int64]float64 {
+	if g == nil {
+		return map[int64]float64{}
+	}
+	n := len(g.nodes)
+	if n <= 1 || g.edgeCount == 0 {
+		return map[int64]float64{}
+	}
+	outgoing := make([][]int, n)
+	arena := make([]int, 0, g.edgeCount)
+	for u, outs := range g.out {
+		if len(outs) == 0 {
+			continue
+		}
+		start := len(arena)
+		for _, v := range outs {
+			arena = append(arena, int(v))
+		}
+		outgoing[u] = arena[start:len(arena):len(arena)]
+	}
+	adj := cachedAdjacency{outgoing: outgoing}
+	totals := make([]float64, n)
+	buf := brandesPool.Get().(*brandesBuffers)
+	for s := 0; s < n; s++ {
+		if len(outgoing[s]) == 0 {
+			continue
+		}
+		singleSourceBetweennessDense(adj, s, buf)
+		for _, w := range buf.stack {
+			if w != s && buf.bc[w] != 0 {
+				totals[w] += buf.bc[w]
+			}
+		}
+	}
+	brandesPool.Put(buf)
+	scores := make(map[int64]float64)
+	for i, val := range totals {
+		if val != 0 {
+			scores[int64(i)] = val
+		}
+	}
+	return scores
 }
 
 // RecommendSampleSize returns a recommended sample size based on graph characteristics.

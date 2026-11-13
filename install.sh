@@ -4,7 +4,7 @@ set -euo pipefail
 REPO_OWNER="Dicklesworthstone"
 REPO_NAME="beads_viewer"
 BIN_NAME="bv"
-MIN_GO_VERSION="1.26.10"
+MIN_GO_VERSION="1.26.11"
 
 TMP_DIRS=()
 
@@ -422,9 +422,9 @@ source_toolchain() {
     fi
     if ! version_ge "$version" "$MIN_GO_VERSION"; then
         version="$MIN_GO_VERSION"
-    elif [[ "$version" == 1.27.* ]] && ! version_ge "$version" "1.27.3"; then
-        # GO-2026-6809 is also present in Go 1.27.0 through 1.27.2.
-        version="1.27.3"
+    elif [[ "$version" == 1.27.* ]] && ! version_ge "$version" "1.27.4"; then
+        # GO-2026-6809 and GO-2026-6859 also affect Go 1.27.0 through 1.27.3.
+        version="1.27.4"
     fi
     printf 'go%s\n' "$version"
 }
