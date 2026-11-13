@@ -7,6 +7,8 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -3154,5 +3156,118 @@ func TestFileTree_JumpToFile(t *testing.T) {
 
 	if goFileCount < 4 {
 		t.Errorf("Expected at least 4 .go files in test data, got %d", goFileCount)
+	}
+}
+
+func TestHistoryModel_CycleSearchModeAndAuthorToggle(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "bv-1", Title: "Fix authentication bug", Status: model.StatusClosed, Priority: 1},
+		{ID: "bv-2", Title: "Add logging", Status: model.StatusOpen, Priority: 2},
+		{ID: "bv-3", Title: "Refactor database", Status: model.StatusInProgress, Priority: 2},
+	}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 35})
+
+	send := func(msg tea.KeyMsg) {
+		t.Helper()
+		updated, _ := m.Update(msg)
+		m = updated.(*Model)
+	}
+
+	// Switch to History view and install a deterministic test report.
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	if m.focused != focusHistory {
+		t.Fatalf("expected focusHistory, got %v", m.focused)
+	}
+	makeHistoryReportCurrent(m, createTestHistoryReport())
+
+	// 1. Start search ('/'), enter "Dev Two", and press Tab to cycle search modes:
+	// All -> Commit -> Author -> Bead -> SHA -> All while preserving the query and re-filtering.
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	for _, r := range "Dev Two" {
+		send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	if got := m.historyView.SearchQuery(); got != "Dev Two" {
+		t.Fatalf("expected SearchQuery 'Dev Two', got %q", got)
+	}
+	if m.historyView.searchMode != searchModeAll {
+		t.Fatalf("expected initial searchModeAll, got %v", m.historyView.searchMode)
+	}
+
+	// Tab -> Commit mode ("Dev Two" appears in no commit message -> 0 filtered beads)
+	send(tea.KeyMsg{Type: tea.KeyTab})
+	if m.historyView.searchMode != searchModeCommit || m.historyView.SearchQuery() != "Dev Two" {
+		t.Fatalf("after 1st Tab: mode=%v query=%q", m.historyView.searchMode, m.historyView.SearchQuery())
+	}
+	if len(m.historyView.histories) != 0 {
+		t.Fatalf("expected 0 beads matching 'Dev Two' in Commit mode, got %d", len(m.historyView.histories))
+	}
+
+	// Tab -> Author mode ("Dev Two" matches bv-2 and bv-3 -> 2 filtered beads)
+	send(tea.KeyMsg{Type: tea.KeyTab})
+	if m.historyView.searchMode != searchModeAuthor || m.historyView.SearchQuery() != "Dev Two" {
+		t.Fatalf("after 2nd Tab: mode=%v query=%q", m.historyView.searchMode, m.historyView.SearchQuery())
+	}
+	if len(m.historyView.histories) != 2 {
+		t.Fatalf("expected 2 beads matching 'Dev Two' in Author mode, got %d", len(m.historyView.histories))
+	}
+
+	// Tab -> Bead -> SHA -> All
+	send(tea.KeyMsg{Type: tea.KeyTab})
+	if m.historyView.searchMode != searchModeBead {
+		t.Fatalf("after 3rd Tab: want searchModeBead, got %v", m.historyView.searchMode)
+	}
+	send(tea.KeyMsg{Type: tea.KeyTab})
+	if m.historyView.searchMode != searchModeSHA {
+		t.Fatalf("after 4th Tab: want searchModeSHA, got %v", m.historyView.searchMode)
+	}
+	send(tea.KeyMsg{Type: tea.KeyTab})
+	if m.historyView.searchMode != searchModeAll {
+		t.Fatalf("after 5th Tab: want wrap to searchModeAll, got %v", m.historyView.searchMode)
+	}
+
+	// Clear search via CancelSearch.
+	m.historyView.CancelSearch()
+
+	// 2. Press 'A' in Bead mode to toggle @author filter for the currently selected commit.
+	selectedCommit := m.historyView.SelectedCommit()
+	if selectedCommit == nil {
+		t.Fatal("expected selected commit in Bead mode")
+	}
+	expectedAuthor := selectedCommit.Author
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("A")})
+	if got := m.historyView.GetAuthorFilter(); got != expectedAuthor {
+		t.Fatalf("expected 'A' to filter by %q, got %q (status=%q)", expectedAuthor, got, m.statusMsg)
+	}
+	if !strings.Contains(m.statusMsg, expectedAuthor) {
+		t.Fatalf("expected statusMsg to mention author filter %q, got %q", expectedAuthor, m.statusMsg)
+	}
+	if len(m.historyView.histories) == 0 || len(m.historyView.histories) >= 3 {
+		t.Fatalf("expected Bead mode to filter down to matching author beads, got %d beads", len(m.historyView.histories))
+	}
+
+	// Verify Git mode ('v') also respects the active @author filter!
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	if !m.historyView.IsGitMode() {
+		t.Fatal("expected Git mode after 'v'")
+	}
+	filteredGitCommits := m.historyView.GetFilteredCommitList()
+	if len(filteredGitCommits) == 0 {
+		t.Fatal("expected non-empty filtered commit list in Git mode")
+	}
+	for _, entry := range filteredGitCommits {
+		if !strings.Contains(strings.ToLower(entry.Author), strings.ToLower(expectedAuthor)) {
+			t.Fatalf("Git mode commit list leaked non-matching author %q (want %q)", entry.Author, expectedAuthor)
+		}
+	}
+
+	// Pressing 'A' again on a "Dev One" commit clears the @author filter.
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("A")})
+	if got := m.historyView.GetAuthorFilter(); got != "" {
+		t.Fatalf("expected second 'A' to clear author filter, got %q", got)
+	}
+	if !strings.Contains(strings.ToLower(m.statusMsg), "cleared") {
+		t.Fatalf("expected cleared statusMsg, got %q", m.statusMsg)
 	}
 }

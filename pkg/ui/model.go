@@ -1034,6 +1034,27 @@ type sharedIncrementalCorrelator struct {
 	ic *correlation.IncrementalCorrelator
 }
 
+func (s *sharedIncrementalCorrelator) generateReport(
+	ctx context.Context,
+	feedbackStore *correlation.FeedbackStore,
+	beads []correlation.BeadInfo,
+	opts correlation.CorrelatorOptions,
+) (*correlation.HistoryReport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	s.ic.WithContext(ctx).WithFeedbackStore(feedbackStore)
+	return s.ic.GenerateReport(beads, opts)
+}
+
+func (s *sharedIncrementalCorrelator) cacheStats() correlation.IncrementalCorrelatorStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ic.CacheStats()
+}
+
 var (
 	historyCorrelatorRegistryMu    sync.Mutex
 	historyCorrelatorRegistry      = make(map[string]*sharedIncrementalCorrelator)
@@ -1165,18 +1186,7 @@ func loadHistoryForWorkDirCmd(
 		var report *correlation.HistoryReport
 		if repoPath != "" {
 			entry := getSharedIncrementalCorrelator(repoPath, correlationPath)
-			entry.mu.Lock()
-			if ctx.Err() != nil {
-				entry.mu.Unlock()
-				return HistoryLoadedMsg{
-					DataGeneration:    dataGeneration,
-					RequestGeneration: requestGeneration,
-					Error:             ctx.Err(),
-				}
-			}
-			entry.ic.WithContext(ctx).WithFeedbackStore(feedbackStore)
-			report, err = entry.ic.GenerateReport(beads, opts)
-			entry.mu.Unlock()
+			report, err = entry.generateReport(ctx, feedbackStore, beads, opts)
 		} else {
 			correlator := correlation.NewCorrelator(repoPath, correlationPath).
 				WithContext(ctx).
@@ -9570,6 +9580,9 @@ func (m *Model) refreshBoardAndGraphForCurrentFilter() {
 }
 
 func (m *Model) applyFilter() {
+	if m.activeRecipe != nil && m.currentFilter != "recipe:"+m.activeRecipe.Name {
+		m.activeRecipe = nil
+	}
 	var filteredItems []list.Item
 	var filteredIssues []model.Issue
 	filterNow := m.analysisReferenceTime()
@@ -9761,6 +9774,7 @@ func (m *Model) applyRecipe(r *recipe.Recipe) {
 		m.statusMsg = "Recipe: " + err.Error()
 		return
 	}
+	m.activeRecipe = r
 	m.refreshRecipeMetrics()
 	m.updateListDelegate()
 
@@ -10724,45 +10738,22 @@ func (m Model) IsHistoryView() bool {
 // issue slice when any filter, recipe, repo scope, or search filter is active,
 // falling back to m.issues when unfiltered.
 func (m *Model) exportIssuesForCurrentView() []model.Issue {
-	if m.list.FilterState() != list.Unfiltered {
-		visible := m.list.VisibleItems()
-		out := make([]model.Issue, 0, len(visible))
-		for _, item := range visible {
-			if issueItem, ok := item.(IssueItem); ok {
-				out = append(out, issueItem.Issue)
-			}
-		}
-		return out
+	hasViewScope := m.list.FilterState() != list.Unfiltered ||
+		m.activeRecipe != nil ||
+		(m.currentFilter != "" && m.currentFilter != "all") ||
+		(m.workspaceMode && m.activeRepos != nil)
+	if !hasViewScope {
+		return m.issues
 	}
 
-	if m.activeRecipe != nil {
-		candidates := make([]model.Issue, 0, len(m.issues))
-		for _, issue := range m.issues {
-			if m.workspaceMode && m.activeRepos != nil {
-				repoKey := issueRepoKey(issue)
-				if repoKey != "" && !m.activeRepos[repoKey] {
-					continue
-				}
-			}
-			candidates = append(candidates, issue)
-		}
-		if selected, err := applyRecipeToIssues(candidates, m.analyzer, m.analysis, m.triageScores, m.activeRecipe, m.analysisReferenceTime()); err == nil {
-			return selected
+	visible := m.list.VisibleItems()
+	out := make([]model.Issue, 0, len(visible))
+	for _, item := range visible {
+		if issueItem, ok := item.(IssueItem); ok {
+			out = append(out, issueItem.Issue)
 		}
 	}
-
-	if (m.currentFilter != "" && m.currentFilter != "all") || (m.workspaceMode && m.activeRepos != nil) {
-		filterNow := m.analysisReferenceTime()
-		filtered := make([]model.Issue, 0, len(m.issues))
-		for _, issue := range m.issues {
-			if m.matchesCurrentFilter(issue, filterNow) {
-				filtered = append(filtered, issue)
-			}
-		}
-		return filtered
-	}
-
-	return m.issues
+	return out
 }
 
 // exportToMarkdown exports active (or all) issues to a Markdown file with auto-generated filename
@@ -11973,31 +11964,30 @@ func computeAlertsForDir(issues []model.Issue, stats *analysis.GraphStats, analy
 		driftConfig = drift.DefaultConfig()
 	}
 
-	openCount, closedCount, blockedCount := 0, 0, 0
+	partition := analyzer.CountStatusPartition()
+	openCount := 0
 	for _, issue := range issues {
-		switch {
-		case isClosedLikeStatus(issue.Status):
-			closedCount++
-		case issue.Status == model.StatusBlocked:
-			blockedCount++
-		default:
+		if !analyzer.IsCandidate(issue.ID) {
+			continue
+		}
+		if issue.Status == model.StatusOpen || issue.Status == model.StatusInProgress {
 			openCount++
 		}
 	}
-
+	cycles := stats.Cycles()
 	curStats := baseline.GraphStats{
 		NodeCount:       stats.NodeCount,
 		EdgeCount:       stats.EdgeCount,
 		Density:         stats.Density,
 		OpenCount:       openCount,
-		ClosedCount:     closedCount,
-		BlockedCount:    blockedCount,
-		CycleCount:      len(stats.Cycles()),
-		ActionableCount: analyzer.CountActionableIssues(),
+		ClosedCount:     partition.Closed,
+		BlockedCount:    partition.Blocked,
+		CycleCount:      len(cycles),
+		ActionableCount: partition.Actionable,
 	}
 
 	bl := &baseline.Baseline{Stats: curStats}
-	cur := &baseline.Baseline{Stats: curStats, Cycles: stats.Cycles()}
+	cur := &baseline.Baseline{Stats: curStats, Cycles: cycles}
 	if resolvedDir != "" {
 		baselinePath := baseline.DefaultPath(resolvedDir)
 		if baseline.Exists(baselinePath) {

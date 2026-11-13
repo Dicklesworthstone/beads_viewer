@@ -2824,3 +2824,163 @@ func TestWithPhase2_PreservesTreeOccurrences(t *testing.T) {
 		})
 	}
 }
+
+func TestNewModel_RecipeLoaderWorkDirAndWarnings(t *testing.T) {
+	otherCWD := t.TempDir()
+	t.Chdir(otherCWD)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// 1. Valid custom recipe in <projectDir>/.bv/recipes.yaml is loaded even when CWD != projectDir.
+	projectDir := t.TempDir()
+	beadsDir := filepath.Join(projectDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(projectDir, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(beadsPath, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	validRecipesYAML := "recipes:\n  custom-subdir-view:\n    description: Loaded from workDir\n    filters:\n      status: [open]\n"
+	if err := os.WriteFile(filepath.Join(projectDir, ".bv", "recipes.yaml"), []byte(validRecipesYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	issues := []model.Issue{{ID: "R-1", Title: "Recipe test", Status: model.StatusOpen, Priority: 1}}
+	m := NewModel(issues, nil, beadsPath)
+	t.Cleanup(m.Stop)
+	if m.recipeLoader == nil || m.recipeLoader.Get("custom-subdir-view") == nil {
+		t.Fatalf("expected recipeLoader to load custom-subdir-view from %s/.bv/recipes.yaml", projectDir)
+	}
+	if m.statusIsError {
+		t.Fatalf("expected no error status for valid recipes.yaml, got %q", m.statusMsg)
+	}
+
+	// 2. Invalid YAML in <projectDir>/.bv/recipes.yaml surfaces a non-fatal warning in statusMsg.
+	badProjectDir := t.TempDir()
+	badBeadsDir := filepath.Join(badProjectDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(badProjectDir, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(badBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	badBeadsPath := filepath.Join(badBeadsDir, "issues.jsonl")
+	if err := os.WriteFile(badBeadsPath, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(badProjectDir, ".bv", "recipes.yaml"), []byte("recipes:\n  broken: [\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mBad := NewModel(issues, nil, badBeadsPath)
+	t.Cleanup(mBad.Stop)
+	if !mBad.statusIsError || !strings.Contains(strings.ToLower(mBad.statusMsg), "recipe") {
+		t.Fatalf("expected non-fatal recipe warning in statusMsg, got statusIsError=%v statusMsg=%q", mBad.statusIsError, mBad.statusMsg)
+	}
+}
+
+func TestSnapshotBuilder_AppliesFeedbackWeightsFromBeadsPath(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "FRESH-P0",
+			Title:     "Fresh high priority issue",
+			Status:    model.StatusOpen,
+			Priority:  0,
+			CreatedAt: now.Add(-1 * time.Hour),
+			UpdatedAt: now.Add(-1 * time.Hour),
+		},
+		{
+			ID:        "STALE-P3",
+			Title:     "Stale lower priority issue",
+			Status:    model.StatusOpen,
+			Priority:  3,
+			CreatedAt: now.Add(-35 * 24 * time.Hour),
+			UpdatedAt: now.Add(-35 * 24 * time.Hour),
+		},
+	}
+
+	projectDir := t.TempDir()
+	beadsDir := filepath.Join(projectDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(beadsPath, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Use deterministic Phase-1 build config for Build() comparisons so async
+	// Phase-2 goroutines cannot race under heavy -race load; Phase 2 is tested
+	// explicitly via WithPhase2 below.
+
+	// Baseline snapshot before feedback.json exists.
+	baseBuilder := NewSnapshotBuilder(cloneIssuesForAsync(issues)).WithBeadsPath(beadsPath)
+	baseBuilder.cfg.SkipPhase2 = true
+	baseBuilder.analyzer.SetNow(now)
+	baseSnap := baseBuilder.Build()
+
+	// Persist >= MinFeedbackSamples events boosting Staleness (2.0x) and reducing PriorityBoost (0.5x).
+	fb := analysis.DefaultFeedbackData()
+	for i := 0; i < analysis.MinFeedbackSamples; i++ {
+		fb.Events = append(fb.Events, analysis.FeedbackEvent{
+			IssueID:   "STALE-P3",
+			Action:    "accept",
+			Score:     0.6,
+			Timestamp: now,
+		})
+	}
+	fb.Adjustments = []analysis.WeightAdjustment{
+		{Name: "Staleness", Adjustment: 2.0, Samples: analysis.MinFeedbackSamples, LastUpdated: now},
+		{Name: "PriorityBoost", Adjustment: 0.5, Samples: analysis.MinFeedbackSamples, LastUpdated: now},
+	}
+	if err := fb.Save(beadsDir); err != nil {
+		t.Fatalf("save feedback: %v", err)
+	}
+
+	tunedBuilder := NewSnapshotBuilder(cloneIssuesForAsync(issues)).WithBeadsPath(beadsPath)
+	tunedBuilder.cfg.SkipPhase2 = true
+	tunedBuilder.analyzer.SetNow(now)
+	tunedSnap := tunedBuilder.Build()
+
+	fbWeights := fb.Weights()
+	explicitBuilder := NewSnapshotBuilder(cloneIssuesForAsync(issues)).WithWeights(&fbWeights)
+	explicitBuilder.cfg.SkipPhase2 = true
+	explicitBuilder.analyzer.SetNow(now)
+	explicitSnap := explicitBuilder.Build()
+
+	if tunedSnap.TriageScores["STALE-P3"] <= baseSnap.TriageScores["STALE-P3"] {
+		t.Fatalf("expected feedback weights in Build() to boost STALE-P3 score: before=%f after=%f",
+			baseSnap.TriageScores["STALE-P3"], tunedSnap.TriageScores["STALE-P3"])
+	}
+	for _, id := range []string{"FRESH-P0", "STALE-P3"} {
+		if tunedSnap.TriageScores[id] != explicitSnap.TriageScores[id] {
+			t.Fatalf("expected WithBeadsPath(%s) score %f to match explicit fb.Weights() score %f",
+				id, tunedSnap.TriageScores[id], explicitSnap.TriageScores[id])
+		}
+	}
+
+	// Verify WithPhase2 also preserves beadsPath and applies feedback weights.
+	az := analysis.NewAnalyzer(cloneIssuesForAsync(issues))
+	az.SetNow(now)
+	phase2Stats := az.AnalyzeAsync(nil)
+	phase2Stats.WaitForPhase2()
+
+	phase2Insights := phase2Stats.GenerateInsights(len(issues))
+	phase2Tuned := tunedSnap.WithPhase2(phase2Stats, phase2Insights, cloneIssuesForAsync(issues), az)
+
+	azDefault := analysis.NewAnalyzer(cloneIssuesForAsync(issues))
+	azDefault.SetNow(now)
+	noPathBuilder := NewSnapshotBuilder(cloneIssuesForAsync(issues))
+	noPathBuilder.cfg.SkipPhase2 = true
+	noPathBuilder.analyzer.SetNow(now)
+	phase2Default := noPathBuilder.Build().WithPhase2(phase2Stats, phase2Insights, cloneIssuesForAsync(issues), azDefault)
+	if phase2Tuned.TriageScores["STALE-P3"] <= phase2Default.TriageScores["STALE-P3"] {
+		t.Fatalf("expected WithPhase2() to retain beadsPath feedback weights: default=%f tuned=%f",
+			phase2Default.TriageScores["STALE-P3"], phase2Tuned.TriageScores["STALE-P3"])
+	}
+}

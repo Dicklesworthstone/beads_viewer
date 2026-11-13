@@ -2,6 +2,7 @@ package search
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -685,5 +686,111 @@ func TestNewAnalyzerMetricsLoader_ClonesIssues(t *testing.T) {
 	}
 	if got := metrics["A"].Status; got != string(model.StatusOpen) {
 		t.Fatalf("expected cloned loader status %q, got %q", model.StatusOpen, got)
+	}
+}
+
+func TestAnalyzerMetricsLoader_NormalizesActivePageRankAndExcludesClosedDependents(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-24 * time.Hour)
+
+	issues := []model.Issue{
+		{
+			ID:        "closed-hub",
+			Title:     "Historical closed hub",
+			Status:    model.StatusClosed,
+			IssueType: model.TypeTask,
+			Priority:  1,
+			CreatedAt: closedAt,
+			UpdatedAt: closedAt,
+			ClosedAt:  &closedAt,
+		},
+		{
+			ID:        "open-root",
+			Title:     "Active root blocker",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Priority:  1,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "done-blocker",
+			Title:     "Open issue whose only dependent is already closed",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Priority:  2,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "closed-dependent",
+			Title:     "Already finished dependent",
+			Status:    model.StatusClosed,
+			IssueType: model.TypeTask,
+			Priority:  2,
+			CreatedAt: closedAt,
+			UpdatedAt: closedAt,
+			ClosedAt:  &closedAt,
+			Dependencies: []*model.Dependency{
+				{IssueID: "closed-dependent", DependsOnID: "done-blocker", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	// Give closed-hub 12 closed dependents (highest raw PageRank in graph) and
+	// open-root 5 open dependents (highest ACTIVE PageRank in graph), plus 10
+	// leaf nodes so raw PageRank values are all << 1.0.
+	for i := 0; i < 12; i++ {
+		issues = append(issues, model.Issue{
+			ID:        fmt.Sprintf("hist-%d", i),
+			Title:     fmt.Sprintf("Historical child %d", i),
+			Status:    model.StatusClosed,
+			IssueType: model.TypeTask,
+			Priority:  3,
+			CreatedAt: closedAt,
+			UpdatedAt: closedAt,
+			ClosedAt:  &closedAt,
+			Dependencies: []*model.Dependency{
+				{IssueID: fmt.Sprintf("hist-%d", i), DependsOnID: "closed-hub", Type: model.DepBlocks},
+			},
+		})
+	}
+	for i := 0; i < 5; i++ {
+		issues = append(issues, model.Issue{
+			ID:        fmt.Sprintf("active-dep-%d", i),
+			Title:     fmt.Sprintf("Active dependent %d", i),
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Priority:  2,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: fmt.Sprintf("active-dep-%d", i), DependsOnID: "open-root", Type: model.DepBlocks},
+			},
+		})
+	}
+
+	loader := NewAnalyzerMetricsLoader(issues).WithCache(analysis.NewCache(analysis.DefaultCacheTTL))
+	metrics, err := loader.LoadMetrics()
+	if err != nil {
+		t.Fatalf("LoadMetrics failed: %v", err)
+	}
+
+	openRoot := metrics["open-root"]
+	if openRoot.PageRank < 0.999 || openRoot.PageRank > 1.0 {
+		t.Fatalf("expected top active blocker open-root PageRank normalized to 1.0, got %f", openRoot.PageRank)
+	}
+	if openRoot.BlockerCount != 5 {
+		t.Fatalf("expected open-root BlockerCount = 5 open dependents, got %d", openRoot.BlockerCount)
+	}
+
+	closedHub := metrics["closed-hub"]
+	if closedHub.PageRank > 1.0 {
+		t.Fatalf("expected closed-hub PageRank clamped <= 1.0, got %f", closedHub.PageRank)
+	}
+
+	doneBlocker := metrics["done-blocker"]
+	if doneBlocker.BlockerCount != 0 {
+		t.Fatalf("expected done-blocker BlockerCount = 0 when its only dependent is closed, got %d", doneBlocker.BlockerCount)
 	}
 }

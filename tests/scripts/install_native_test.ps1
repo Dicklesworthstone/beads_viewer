@@ -14,8 +14,8 @@ Retains logs, downloaded checksums, fixture archives, and executables for review
 [CmdletBinding()]
 param(
     [string]$InstallerPath = (Join-Path $PSScriptRoot '..\..\install.ps1'),
-    [string]$Version = 'v0.23.0',
-    [string]$PreviousVersion = 'v0.22.0',
+    [string]$Version = '',
+    [string]$PreviousVersion = '',
     [string]$WorkDir = '',
     [switch]$IncludeSource,
     [switch]$SourceOnly,
@@ -77,9 +77,43 @@ function Invoke-Installer {
     if ($FromSource) { $arguments += '-FromSource' }
     return Invoke-Logged $Name 'powershell.exe' $arguments -AllowFailure:$AllowFailure
 }
+function Resolve-DefaultReleasePair {
+    $fallbackCurrent = 'v0.26.0'
+    $fallbackPrevious = 'v0.25.2'
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $headers = @{ 'User-Agent' = 'bv-native-installer-test' }
+        $releases = Invoke-RestMethod -Uri 'https://api.github.com/repos/Dicklesworthstone/beads_viewer/releases?per_page=10' -Headers $headers -TimeoutSec 15
+        $tags = @()
+        foreach ($rel in @($releases)) {
+            if ($rel.draft -or $rel.prerelease -or -not $rel.tag_name) { continue }
+            $expectedAsset = "bv_$($rel.tag_name.TrimStart('v'))_windows_amd64.zip"
+            $hasWinZip = @($rel.assets | Where-Object { $_.name -eq $expectedAsset }).Count -gt 0
+            $hasSums = @($rel.assets | Where-Object { $_.name -eq 'checksums.txt' }).Count -gt 0
+            if ($hasWinZip -and $hasSums) {
+                $tags += [string]$rel.tag_name
+            }
+            if ($tags.Count -ge 2) { break }
+        }
+        if ($tags.Count -ge 2) {
+            return @{ Current = $tags[0]; Previous = $tags[1]; Source = 'github-api' }
+        }
+    } catch {
+        Write-Host "Release pair discovery fell back to pinned defaults ($($_.Exception.Message))"
+    }
+    return @{ Current = $fallbackCurrent; Previous = $fallbackPrevious; Source = 'fallback' }
+}
 function Assert-Version {
-    param([string]$Name, [string]$Binary, [string]$Tag)
+    param([string]$Name, [string]$Binary, [string]$Tag, [switch]$MeasureFirstStart)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
     $result = Invoke-Logged "$Name-version" $Binary @('--version')
+    $watch.Stop()
+    if ($MeasureFirstStart) {
+        Write-Host "first_invocation_ms=$($watch.ElapsedMilliseconds) ($Name)"
+        if ($watch.ElapsedMilliseconds -ge 10000) {
+            throw "First invocation exceeded 10s ceiling: $($watch.ElapsedMilliseconds)ms"
+        }
+    }
     if ($result.Output -cne "bv $Tag") { throw "Expected bv $Tag, got $($result.Output)" }
     $caps = Invoke-Logged "$Name-capabilities" $Binary @('--robot-capabilities')
     $manifest = $caps.Output | ConvertFrom-Json
@@ -88,6 +122,14 @@ function Assert-Version {
 }
 
 try {
+    if ($SourceOnly) {
+        if (-not $Version) { $Version = 'v0.26.0' }
+    } elseif (-not $Version -or -not $PreviousVersion) {
+        $pair = Resolve-DefaultReleasePair
+        if (-not $Version) { $Version = $pair.Current }
+        if (-not $PreviousVersion) { $PreviousVersion = $pair.Previous }
+        Write-Host "Resolved release pair ($($pair.Source)): current=$Version previous=$PreviousVersion"
+    }
     Write-Host "Native evidence retained at $WorkDir"
     Write-Host "OS=$([Environment]::OSVersion.VersionString); OSArchitecture=$([Runtime.InteropServices.RuntimeInformation]::OSArchitecture); ProcessArchitecture=$([Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture); PowerShell=$($PSVersionTable.PSVersion)"
     Write-Host "Installer SHA256=$((Get-FileHash $InstallerPath -Algorithm SHA256).Hash)"
@@ -100,7 +142,7 @@ try {
         $sourceDir = Join-Path $WorkDir 'native source install with spaces'
         $sourceBinary = Join-Path $sourceDir 'bv.exe'
         $null = Invoke-Installer 'source-positive' $Version $sourceDir -FromSource
-        Assert-Version 'source-positive' $sourceBinary $Version
+        Assert-Version 'source-positive' $sourceBinary $Version -MeasureFirstStart
         $info = Invoke-Logged 'source-positive-build-info' $realGo @('version', '-m', $sourceBinary)
         if ($info.Output -notmatch ('(?m)^\s*build\s+vcs.revision=' + $SourceCommit + '\s*$') -or
             $info.Output -notmatch '(?m)^\s*build\s+vcs.modified=false\s*$') {
@@ -215,7 +257,7 @@ exit $LASTEXITCODE
     $oldBinary = Join-Path $WorkDir 'previous.exe'
     Copy-Item -LiteralPath $liveBinary -Destination $oldBinary
     $null = Invoke-Installer 'live-install-current' $Version $liveDir
-    Assert-Version 'current' $liveBinary $Version
+    Assert-Version 'current' $liveBinary $Version -MeasureFirstStart
     $goodHash = (Get-FileHash $liveBinary -Algorithm SHA256).Hash
     Write-Host "Previous binary SHA256=$((Get-FileHash $oldBinary -Algorithm SHA256).Hash); current binary SHA256=$goodHash"
     if (Get-Command go -ErrorAction SilentlyContinue) {

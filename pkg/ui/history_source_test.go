@@ -370,3 +370,109 @@ func TestLoadHistoryCmd_HonoursFeedbackStore(t *testing.T) {
 		t.Fatalf("commit_index still contains rejected commit %s: %v", workSHA[:7], after.CommitIndex[workSHA])
 	}
 }
+
+func TestLoadHistoryCmd_IncrementalReloadReusesCorrelator(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=IncDev", "GIT_AUTHOR_EMAIL=inc@example.com",
+			"GIT_COMMITTER_NAME=IncDev", "GIT_COMMITTER_EMAIL=inc@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	writeJSONL := func(status string) {
+		t.Helper()
+		line := `{"id":"bv-1","title":"Incremental target","status":"` + status + `","priority":1,"issue_type":"task"}` + "\n"
+		if err := os.WriteFile(jsonlPath, []byte(line), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	git("init")
+	writeJSONL("open")
+	git("add", ".beads/issues.jsonl")
+	git("commit", "-m", "seed bv-1")
+
+	writeJSONL("in_progress")
+	if err := os.WriteFile(filepath.Join(repo, "work.txt"), []byte("step 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", ".beads/issues.jsonl", "work.txt")
+	git("commit", "-m", "feat(bv-1): initial implementation")
+
+	beads := []correlation.BeadInfo{{ID: "bv-1", Title: "Incremental target", Status: "in_progress"}}
+	runLoad := func(gen uint64) *correlation.HistoryReport {
+		t.Helper()
+		msg := LoadHistoryCmd(context.Background(), beads, jsonlPath, gen, gen)()
+		loaded, ok := msg.(HistoryLoadedMsg)
+		if !ok {
+			t.Fatalf("LoadHistoryCmd returned %T, want HistoryLoadedMsg", msg)
+		}
+		if loaded.Error != nil {
+			t.Fatalf("LoadHistoryCmd error: %v", loaded.Error)
+		}
+		return loaded.Report
+	}
+
+	absRepo, err := filepath.Abs(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrPath := resolveHistoryCorrelationPath(jsonlPath, absRepo)
+
+	// 1. Initial load performs 1 full refresh.
+	_ = runLoad(1)
+	shared := getSharedIncrementalCorrelator(absRepo, corrPath)
+	stats1 := shared.cacheStats()
+	if stats1.FullRefreshes != 1 || stats1.Hits != 0 || stats1.IncrementalUpdates != 0 {
+		t.Fatalf("after 1st load: stats=%+v, want FullRefreshes=1 Hits=0 IncrementalUpdates=0", stats1)
+	}
+
+	// 2. Reload on unchanged HEAD hits the cache without re-walking git history.
+	_ = runLoad(2)
+	stats2 := shared.cacheStats()
+	if stats2.Hits != 1 || stats2.FullRefreshes != 1 {
+		t.Fatalf("after unchanged reload: stats=%+v, want Hits=1 FullRefreshes=1", stats2)
+	}
+
+	// 3. Commit a new change referencing bv-1 and reload -> IncrementalUpdates increments without a full refresh!
+	if err := os.WriteFile(filepath.Join(repo, "work.txt"), []byte("step 1\nstep 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "work.txt")
+	git("commit", "-m", "fix(bv-1): incremental follow-up")
+	incSHA := git("rev-parse", "HEAD")
+
+	report3 := runLoad(3)
+	stats3 := shared.cacheStats()
+	if stats3.IncrementalUpdates != 1 || stats3.FullRefreshes != 1 {
+		t.Fatalf("after new commit reload: stats=%+v, want IncrementalUpdates=1 FullRefreshes=1", stats3)
+	}
+
+	var foundIncCommit bool
+	for _, c := range report3.Histories["bv-1"].Commits {
+		if c.SHA == incSHA {
+			foundIncCommit = true
+			break
+		}
+	}
+	if !foundIncCommit {
+		t.Fatalf("expected incrementally correlated commit %s in bv-1 history: %+v", incSHA[:7], report3.Histories["bv-1"].Commits)
+	}
+}

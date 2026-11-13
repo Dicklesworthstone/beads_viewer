@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
@@ -967,4 +968,231 @@ func TestListKeys_DocumentedViewToggles(t *testing.T) {
 			t.Fatalf("no markdown file written to %s: %v", dir, entries)
 		}
 	})
+}
+
+func TestComputeAlertsForDir_RealBaselineAndCycleSuppression(t *testing.T) {
+	otherCWD := t.TempDir()
+	t.Chdir(otherCWD)
+
+	projectDir := t.TempDir()
+	beadsDir := filepath.Join(projectDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(beadsPath, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	bl := &baseline.Baseline{
+		Version:   baseline.CurrentVersion,
+		CreatedAt: now.Add(-7 * 24 * time.Hour),
+		Stats: baseline.GraphStats{
+			NodeCount:       2,
+			EdgeCount:       1,
+			Density:         0.05,
+			OpenCount:       2,
+			ClosedCount:     0,
+			BlockedCount:    0,
+			CycleCount:      1,
+			ActionableCount: 10,
+		},
+		TopMetrics: baseline.TopMetrics{
+			PageRank: []baseline.MetricItem{
+				{ID: "LEGACY-PR", Value: 0.9},
+			},
+		},
+		Cycles: [][]string{
+			{"A", "B", "A"},
+		},
+	}
+	if err := bl.Save(baseline.DefaultPath(projectDir)); err != nil {
+		t.Fatalf("save baseline: %v", err)
+	}
+
+	issues := []model.Issue{
+		{
+			ID: "ROOT", Title: "Root unblocker", Status: model.StatusOpen, Priority: 1,
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "A", Title: "Pre-existing cycle A", Status: model.StatusOpen, Priority: 2,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "B", Type: model.DepBlocks}},
+		},
+		{
+			ID: "B", Title: "Pre-existing cycle B", Status: model.StatusOpen, Priority: 2,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}},
+		},
+		{
+			ID: "BLK-1", Title: "Blocked 1", Status: model.StatusOpen, Priority: 2,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "BLK-2", Title: "Blocked 2", Status: model.StatusOpen, Priority: 2,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{DependsOnID: "ROOT", Type: model.DepBlocks},
+				{DependsOnID: "BLK-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "BLK-3", Title: "Blocked 3", Status: model.StatusOpen, Priority: 2,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "BLK-4", Title: "Blocked 4", Status: model.StatusOpen, Priority: 2,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "BLK-5", Title: "Blocked 5", Status: model.StatusOpen, Priority: 2,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "ROOT", Type: model.DepBlocks}},
+		},
+	}
+
+	az := analysis.NewAnalyzer(issues)
+	az.SetNow(now)
+	stats := az.AnalyzeAsync(nil)
+	stats.WaitForPhase2()
+
+	alerts, _, _, _ := computeAlertsForDir(issues, stats, az, projectDir)
+	seen := make(map[drift.AlertType]drift.Alert)
+	for _, a := range alerts {
+		seen[a.Type] = a
+	}
+
+	// Negative control: A <-> B was already in .bv/baseline.json, so it must NOT fire new_cycle.
+	if unexpected, ok := seen[drift.AlertNewCycle]; ok {
+		t.Fatalf("pre-existing baseline cycle A<->B must not trigger new_cycle, got: %+v", unexpected)
+	}
+
+	// All 7 baseline-drift alert types must fire against the loaded .bv/baseline.json.
+	wantDriftTypes := []drift.AlertType{
+		drift.AlertDensityGrowth,
+		drift.AlertScopeCreep,
+		drift.AlertBlockedIncrease,
+		drift.AlertActionableChange,
+		drift.AlertPageRankChange,
+		drift.AlertNodeCountChange,
+		drift.AlertEdgeCountChange,
+	}
+	for _, want := range wantDriftTypes {
+		if _, ok := seen[want]; !ok {
+			t.Errorf("expected baseline drift alert %q from .bv/baseline.json, seen=%v", want, seen)
+		}
+	}
+
+	// Positive control: adding a genuinely new cycle C <-> D fires new_cycle with Delta == 1 (only C<->D).
+	withNewCycle := append(copyIssues(issues),
+		model.Issue{
+			ID: "C", Title: "New cycle C", Status: model.StatusOpen, Priority: 1,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "D", Type: model.DepBlocks}},
+		},
+		model.Issue{
+			ID: "D", Title: "New cycle D", Status: model.StatusOpen, Priority: 1,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{DependsOnID: "C", Type: model.DepBlocks}},
+		},
+	)
+	az2 := analysis.NewAnalyzer(withNewCycle)
+	az2.SetNow(now)
+	stats2 := az2.AnalyzeAsync(nil)
+	stats2.WaitForPhase2()
+
+	alerts2, critical2, _, _ := computeAlertsForDir(withNewCycle, stats2, az2, projectDir)
+	var newCycleAlert *drift.Alert
+	for i := range alerts2 {
+		if alerts2[i].Type == drift.AlertNewCycle {
+			newCycleAlert = &alerts2[i]
+			break
+		}
+	}
+	if newCycleAlert == nil || critical2 == 0 {
+		t.Fatalf("expected critical new_cycle alert for C<->D, got alerts=%v", alerts2)
+	}
+	if newCycleAlert.Delta != 1 {
+		t.Fatalf("expected new_cycle Delta=1 (suppressing baseline A<->B), got Delta=%v details=%v", newCycleAlert.Delta, newCycleAlert.Details)
+	}
+}
+
+func TestExportToMarkdown_FilterRecipeSearchAndWorkDir(t *testing.T) {
+	otherCWD := t.TempDir()
+	t.Chdir(otherCWD)
+
+	projectDir := filepath.Join(t.TempDir(), "custom-workspace")
+	beadsDir := filepath.Join(projectDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(beadsPath, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC()
+	issues := []model.Issue{
+		{ID: "OPEN-API", Title: "Open API endpoint", Status: model.StatusOpen, Priority: 1, Labels: []string{"api"}, CreatedAt: now, UpdatedAt: now},
+		{ID: "OPEN-UI", Title: "Open UI polish", Status: model.StatusOpen, Priority: 2, Labels: []string{"ui"}, CreatedAt: now, UpdatedAt: now},
+		{ID: "CLOSED-DB", Title: "Closed database task", Status: model.StatusClosed, Priority: 2, Labels: []string{"db"}, CreatedAt: now, UpdatedAt: now},
+	}
+
+	m := NewModel(copyIssues(issues), nil, beadsPath)
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
+
+	expectedPath := filepath.Join(projectDir, m.generateExportFilename())
+	if !strings.Contains(filepath.Base(expectedPath), "custom-workspace") {
+		t.Fatalf("expected export filename to derive project name from m.workDir, got %q", filepath.Base(expectedPath))
+	}
+
+	// 1. Unfiltered export writes all issues into m.workDir (NOT otherCWD).
+	m.exportToMarkdown()
+	if m.statusIsError {
+		t.Fatalf("unexpected export error: %s", m.statusMsg)
+	}
+	body, err := os.ReadFile(expectedPath)
+	if err != nil {
+		t.Fatalf("expected export in m.workDir (%s), err: %v", expectedPath, err)
+	}
+	if entries, _ := os.ReadDir(otherCWD); len(entries) != 0 {
+		t.Fatalf("export must not write to CWD when m.workDir is set, found: %v", entries)
+	}
+	content := string(body)
+	if !strings.Contains(content, "OPEN-API") || !strings.Contains(content, "OPEN-UI") || !strings.Contains(content, "CLOSED-DB") {
+		t.Fatalf("unfiltered export must include all 3 issues:\n%s", content)
+	}
+
+	// 2. Active status filter ("open") exports only open issues.
+	m.currentFilter = "open"
+	m.applyFilter()
+	m.exportToMarkdown()
+	body, err = os.ReadFile(expectedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content = string(body)
+	if !strings.Contains(content, "OPEN-API") || !strings.Contains(content, "OPEN-UI") || strings.Contains(content, "CLOSED-DB") {
+		t.Fatalf("open-filtered export must omit CLOSED-DB:\n%s", content)
+	}
+
+	// 3. Active recipe ("api" tag) scopes export to matching recipe issues.
+	m.currentFilter = "all"
+	r := &recipe.Recipe{Name: "api-only", Filters: recipe.FilterConfig{Tags: []string{"api"}}}
+	m.applyRecipe(r)
+	m.exportToMarkdown()
+	body, err = os.ReadFile(expectedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content = string(body)
+	if !strings.Contains(content, "OPEN-API") || strings.Contains(content, "OPEN-UI") || strings.Contains(content, "CLOSED-DB") {
+		t.Fatalf("recipe-scoped export must include only OPEN-API:\n%s", content)
+	}
 }

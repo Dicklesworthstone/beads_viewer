@@ -811,11 +811,15 @@ func (b *BoardModel) IsSearchMatch(colIdx, rowIdx int) bool {
 // ToggleDetail toggles the detail panel visibility
 func (b *BoardModel) ToggleDetail() {
 	b.showDetail = !b.showDetail
+	if b.showDetail {
+		b.syncDetailContent()
+	}
 }
 
 // ShowDetail shows the detail panel
 func (b *BoardModel) ShowDetail() {
 	b.showDetail = true
+	b.syncDetailContent()
 }
 
 // HideDetail hides the detail panel
@@ -830,11 +834,13 @@ func (b *BoardModel) IsDetailShown() bool {
 
 // DetailScrollDown scrolls the detail panel down
 func (b *BoardModel) DetailScrollDown(lines int) {
+	b.syncDetailContent()
 	b.detailVP.LineDown(lines)
 }
 
 // DetailScrollUp scrolls the detail panel up
 func (b *BoardModel) DetailScrollUp(lines int) {
+	b.syncDetailContent()
 	b.detailVP.LineUp(lines)
 }
 
@@ -1628,12 +1634,115 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 	return cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left, parts...))
 }
 
+// syncDetailContent populates detailVP for the currently selected issue when the
+// selection has changed, preserving scroll offset across renders when unchanged.
+func (b *BoardModel) syncDetailContent() {
+	t := b.theme
+	issue := b.SelectedIssue()
+	if issue == nil {
+		if b.lastDetailID != "_none_" {
+			b.lastDetailID = "_none_"
+			helpText := "## No Selection\n\nNavigate to a card with **h/l** and **j/k** to see details here.\n\nPress **Tab** to hide this panel."
+			rendered := helpText
+			if b.mdRenderer != nil {
+				if md, err := b.mdRenderer.Render(helpText); err == nil {
+					rendered = md
+				}
+			}
+			b.detailVP.SetContent(rendered)
+			b.detailVP.GotoTop()
+		}
+		return
+	}
+
+	if b.lastDetailID == issue.ID {
+		return
+	}
+	b.lastDetailID = issue.ID
+
+	var content strings.Builder
+
+	// Header with ID and type
+	icon, _ := t.GetTypeIcon(string(issue.IssueType))
+	content.WriteString(fmt.Sprintf("## %s %s\n\n", icon, issue.ID))
+
+	// Title
+	content.WriteString(fmt.Sprintf("**%s**\n\n", issue.Title))
+
+	// Status and Priority
+	statusIcon := GetStatusIcon(string(issue.Status))
+	prioIcon := GetPriorityIcon(issue.Priority)
+	content.WriteString(fmt.Sprintf("%s %s  %s P%d\n\n",
+		statusIcon, issue.Status, prioIcon, issue.Priority))
+
+	// Metadata section
+	if issue.Assignee != "" {
+		content.WriteString(fmt.Sprintf("**Assignee:** @%s\n\n", issue.Assignee))
+	}
+
+	if len(issue.Labels) > 0 {
+		content.WriteString(fmt.Sprintf("**Labels:** %s\n\n", strings.Join(issue.Labels, ", ")))
+	}
+
+	// Dependencies - show with titles and status (bv-kklp)
+	var blockingDeps []*model.Dependency
+	for _, dep := range issue.Dependencies {
+		if dep != nil && dep.Type.IsBlocking() {
+			blockingDeps = append(blockingDeps, dep)
+		}
+	}
+	if len(blockingDeps) > 0 {
+		content.WriteString("**Blocked by:**\n")
+		for _, dep := range blockingDeps {
+			if blocker, ok := b.issueMap[dep.DependsOnID]; ok && blocker != nil {
+				content.WriteString(fmt.Sprintf("- %s: %s (%s)\n",
+					dep.DependsOnID, blocker.Title, blocker.Status))
+			} else {
+				content.WriteString(fmt.Sprintf("- %s\n", dep.DependsOnID))
+			}
+		}
+		content.WriteString("\n")
+	}
+
+	// Show what this issue blocks (bv-kklp)
+	if blockedIDs, ok := b.blocksIndex[issue.ID]; ok && len(blockedIDs) > 0 {
+		content.WriteString("**Blocks:**\n")
+		for _, blockedID := range blockedIDs {
+			if blocked, ok := b.issueMap[blockedID]; ok && blocked != nil {
+				content.WriteString(fmt.Sprintf("- %s: %s\n", blockedID, blocked.Title))
+			} else {
+				content.WriteString(fmt.Sprintf("- %s\n", blockedID))
+			}
+		}
+		content.WriteString(fmt.Sprintf("\n💡 Completing this would unblock %d issue(s)\n\n", len(blockedIDs)))
+	}
+
+	// Description
+	if issue.Description != "" {
+		content.WriteString("---\n\n")
+		content.WriteString(issue.Description)
+		content.WriteString("\n")
+	}
+
+	// Timestamps
+	content.WriteString("\n---\n\n")
+	content.WriteString(fmt.Sprintf("*Created: %s*\n", FormatTimeRel(issue.CreatedAt)))
+	content.WriteString(fmt.Sprintf("*Updated: %s*\n", FormatTimeRel(issue.UpdatedAt)))
+
+	// Render with markdown
+	rendered := content.String()
+	if b.mdRenderer != nil {
+		if md, err := b.mdRenderer.Render(rendered); err == nil {
+			rendered = md
+		}
+	}
+	b.detailVP.SetContent(rendered)
+	b.detailVP.GotoTop()
+}
+
 // renderDetailPanel renders the detail panel for the selected issue (bv-r6kh)
 func (b *BoardModel) renderDetailPanel(width, height int) string {
 	t := b.theme
-
-	// Get the selected issue
-	issue := b.SelectedIssue()
 
 	// Update viewport dimensions
 	vpWidth := width - 4 // Account for border
@@ -1647,108 +1756,7 @@ func (b *BoardModel) renderDetailPanel(width, height int) string {
 	b.detailVP.Width = vpWidth
 	b.detailVP.Height = vpHeight
 
-	// Build content based on selection state
-	if issue == nil {
-		// No issue selected - show help text (use special marker to detect "no selection" state)
-		if b.lastDetailID != "_none_" {
-			b.lastDetailID = "_none_"
-			helpText := "## No Selection\n\nNavigate to a card with **h/l** and **j/k** to see details here.\n\nPress **Tab** to hide this panel."
-			rendered := helpText
-			if b.mdRenderer != nil {
-				if md, err := b.mdRenderer.Render(helpText); err == nil {
-					rendered = md
-				}
-			}
-			b.detailVP.SetContent(rendered)
-			b.detailVP.GotoTop()
-		}
-	} else {
-		// Issue selected - only update content if the issue changed
-		if b.lastDetailID != issue.ID {
-			b.lastDetailID = issue.ID
-
-			var content strings.Builder
-
-			// Header with ID and type
-			icon, _ := t.GetTypeIcon(string(issue.IssueType))
-			content.WriteString(fmt.Sprintf("## %s %s\n\n", icon, issue.ID))
-
-			// Title
-			content.WriteString(fmt.Sprintf("**%s**\n\n", issue.Title))
-
-			// Status and Priority
-			statusIcon := GetStatusIcon(string(issue.Status))
-			prioIcon := GetPriorityIcon(issue.Priority)
-			content.WriteString(fmt.Sprintf("%s %s  %s P%d\n\n",
-				statusIcon, issue.Status, prioIcon, issue.Priority))
-
-			// Metadata section
-			if issue.Assignee != "" {
-				content.WriteString(fmt.Sprintf("**Assignee:** @%s\n\n", issue.Assignee))
-			}
-
-			if len(issue.Labels) > 0 {
-				content.WriteString(fmt.Sprintf("**Labels:** %s\n\n", strings.Join(issue.Labels, ", ")))
-			}
-
-			// Dependencies - show with titles and status (bv-kklp)
-			// First count blocking deps to avoid empty "Blocked by:" header
-			var blockingDeps []*model.Dependency
-			for _, dep := range issue.Dependencies {
-				if dep != nil && dep.Type.IsBlocking() {
-					blockingDeps = append(blockingDeps, dep)
-				}
-			}
-			if len(blockingDeps) > 0 {
-				content.WriteString("**Blocked by:**\n")
-				for _, dep := range blockingDeps {
-					// Look up blocker info for richer display
-					if blocker, ok := b.issueMap[dep.DependsOnID]; ok && blocker != nil {
-						content.WriteString(fmt.Sprintf("- %s: %s (%s)\n",
-							dep.DependsOnID, blocker.Title, blocker.Status))
-					} else {
-						content.WriteString(fmt.Sprintf("- %s\n", dep.DependsOnID))
-					}
-				}
-				content.WriteString("\n")
-			}
-
-			// Show what this issue blocks (bv-kklp)
-			if blockedIDs, ok := b.blocksIndex[issue.ID]; ok && len(blockedIDs) > 0 {
-				content.WriteString("**Blocks:**\n")
-				for _, blockedID := range blockedIDs {
-					if blocked, ok := b.issueMap[blockedID]; ok && blocked != nil {
-						content.WriteString(fmt.Sprintf("- %s: %s\n", blockedID, blocked.Title))
-					} else {
-						content.WriteString(fmt.Sprintf("- %s\n", blockedID))
-					}
-				}
-				content.WriteString(fmt.Sprintf("\n💡 Completing this would unblock %d issue(s)\n\n", len(blockedIDs)))
-			}
-
-			// Description
-			if issue.Description != "" {
-				content.WriteString("---\n\n")
-				content.WriteString(issue.Description)
-				content.WriteString("\n")
-			}
-
-			// Timestamps
-			content.WriteString("\n---\n\n")
-			content.WriteString(fmt.Sprintf("*Created: %s*\n", FormatTimeRel(issue.CreatedAt)))
-			content.WriteString(fmt.Sprintf("*Updated: %s*\n", FormatTimeRel(issue.UpdatedAt)))
-
-			// Render with markdown
-			rendered := content.String()
-			if b.mdRenderer != nil {
-				if md, err := b.mdRenderer.Render(rendered); err == nil {
-					rendered = md
-				}
-			}
-			b.detailVP.SetContent(rendered)
-			b.detailVP.GotoTop()
-		}
-	}
+	b.syncDetailContent()
 
 	// Build scroll indicator
 	var sb strings.Builder

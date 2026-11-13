@@ -227,19 +227,29 @@ func TestEmitScript_FiveSurfaceReadinessEquivalenceAndReadmeExamples(t *testing.
 	}
 	prioBriefMD := string(prioBriefBytes)
 
+	reTopRec := regexp.MustCompile(`(?m)^\|\s*\d+\s*\|\s*\*\*([A-Z0-9-]+)\*\*`)
 	for surfaceName, md := range map[string]string{
 		"--agent-brief brief.md": agentBriefMD,
 		"--priority-brief":       prioBriefMD,
 	} {
-		for _, wantID := range triageIDs {
-			if !strings.Contains(md, wantID) {
-				t.Fatalf("%s missing actionable item %s:\n%s", surfaceName, wantID, md)
+		var briefRecIDs []string
+		for _, m := range reTopRec.FindAllStringSubmatch(md, -1) {
+			briefRecIDs = append(briefRecIDs, m[1])
+		}
+		if !reflect.DeepEqual(briefRecIDs, triageIDs) {
+			t.Fatalf("%s Top Recommendations IDs = %v, want exact match with --robot-triage %v:\n%s",
+				surfaceName, briefRecIDs, triageIDs, md)
+		}
+		// Inactive/container items may be cited in What-If Downstream IDs when an
+		// actionable blocker (L1) unblocks them, but must NEVER appear as a
+		// primary recommended, quick-win, blocker-to-clear, or completing subject (**ID**).
+		for _, excludedID := range []string{"EPIC-CONT", "CHILD-BLK", "TASK-BLK", "TASK-DEF"} {
+			if strings.Contains(md, "**"+excludedID+"**") {
+				t.Fatalf("%s leaked inactive item %s as a primary brief row:\n%s", surfaceName, excludedID, md)
 			}
 		}
-		for _, excludedID := range []string{"EPIC-CONT", "CHILD-BLK", "TASK-BLK", "TASK-DEF"} {
-			if strings.Contains(md, excludedID) {
-				t.Fatalf("%s leaked inactive item %s:\n%s", surfaceName, excludedID, md)
-			}
+		if !strings.Contains(md, "## 🔮 What-If Impact") || !strings.Contains(md, "CHILD-BLK, TASK-BLK") {
+			t.Fatalf("%s missing What-If Impact downstream unblocks for L1:\n%s", surfaceName, md)
 		}
 	}
 

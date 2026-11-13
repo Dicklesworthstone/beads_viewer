@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -318,4 +319,105 @@ func TestShortcutsSidebarReservesLayoutWidth(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestShortcutsSidebar_CtrlJKGuardBoardDetailAndPrompts(t *testing.T) {
+	var longDesc strings.Builder
+	for i := 0; i < 60; i++ {
+		longDesc.WriteString("Line of markdown detail content for board detail scrolling verification.\n")
+	}
+	issues := []model.Issue{
+		{
+			ID:          "BOARD-1",
+			Title:       "Board issue with scrollable detail",
+			Description: longDesc.String(),
+			Status:      model.StatusOpen,
+			Priority:    1,
+		},
+		{
+			ID:       "BOARD-2",
+			Title:    "Second board issue",
+			Status:   model.StatusInProgress,
+			Priority: 2,
+		},
+	}
+
+	m := sizedModel(t, issues, 180, 24)
+	t.Cleanup(m.Stop)
+
+	send := func(msg tea.KeyMsg) {
+		t.Helper()
+		updated, _ := m.Update(msg)
+		m = updated.(*Model)
+	}
+
+	// Open shortcuts sidebar via ';'
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";")})
+	if !m.showShortcutsSidebar {
+		t.Fatal("expected shortcuts sidebar to be open")
+	}
+
+	// Open Board view ('b') and show Board detail ('tab'), then render once to populate detailVP.
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	send(tea.KeyMsg{Type: tea.KeyTab})
+	if m.focused != focusBoard || !m.board.IsDetailShown() {
+		t.Fatalf("expected focusBoard with detail shown, focused=%v detail=%v", m.focused, m.board.IsDetailShown())
+	}
+	_ = m.View()
+
+	// 1. Negative control: ctrl+j must scroll Board detail and NOT scroll shortcuts sidebar.
+	send(tea.KeyMsg{Type: tea.KeyCtrlJ})
+	if m.shortcutsSidebar.scrollOffset != 0 {
+		t.Fatalf("ctrl+j with Board detail open must not scroll sidebar, got sidebar scrollOffset=%d", m.shortcutsSidebar.scrollOffset)
+	}
+	if m.board.detailVP.YOffset == 0 {
+		t.Fatal("expected ctrl+j to scroll Board detail viewport down when sidebar is open")
+	}
+
+	// 2. Positive control: hide Board detail ('tab'); now ctrl+j / pgdown / pgup / ctrl+k scroll sidebar.
+	send(tea.KeyMsg{Type: tea.KeyTab})
+	if m.board.IsDetailShown() {
+		t.Fatal("expected Board detail to hide after second tab")
+	}
+	send(tea.KeyMsg{Type: tea.KeyCtrlJ})
+	if m.shortcutsSidebar.scrollOffset != 1 {
+		t.Fatalf("expected ctrl+j with Board detail hidden to scroll sidebar to 1, got %d", m.shortcutsSidebar.scrollOffset)
+	}
+	send(tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.shortcutsSidebar.scrollOffset <= 1 {
+		t.Fatalf("expected pgdown to advance sidebar scrollOffset, got %d", m.shortcutsSidebar.scrollOffset)
+	}
+	send(tea.KeyMsg{Type: tea.KeyPgUp})
+	send(tea.KeyMsg{Type: tea.KeyCtrlK})
+	if m.shortcutsSidebar.scrollOffset != 0 {
+		t.Fatalf("expected pgup + ctrl+k to return sidebar scrollOffset to 0, got %d", m.shortcutsSidebar.scrollOffset)
+	}
+
+	// 3. Negative controls: active History search, time-travel prompt, and label picker must block sidebar ctrl+j.
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")}) // Exit Board back to list so 'h' opens History
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	makeHistoryReportCurrent(m, createTestHistoryReport())
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	if !m.historyView.IsSearching() {
+		t.Fatal("expected history search input to be active")
+	}
+	send(tea.KeyMsg{Type: tea.KeyCtrlJ})
+	if m.shortcutsSidebar.scrollOffset != 0 {
+		t.Fatalf("ctrl+j during History search must not scroll sidebar, got %d", m.shortcutsSidebar.scrollOffset)
+	}
+	send(tea.KeyMsg{Type: tea.KeyEsc})
+
+	m.showTimeTravelPrompt = true
+	send(tea.KeyMsg{Type: tea.KeyCtrlJ})
+	if m.shortcutsSidebar.scrollOffset != 0 {
+		t.Fatalf("ctrl+j during time-travel prompt must not scroll sidebar, got %d", m.shortcutsSidebar.scrollOffset)
+	}
+	m.showTimeTravelPrompt = false
+
+	m.showLabelPicker = true
+	send(tea.KeyMsg{Type: tea.KeyCtrlJ})
+	if m.shortcutsSidebar.scrollOffset != 0 {
+		t.Fatalf("ctrl+j during label picker must not scroll sidebar, got %d", m.shortcutsSidebar.scrollOffset)
+	}
+	m.showLabelPicker = false
 }

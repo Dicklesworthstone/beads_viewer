@@ -3,6 +3,7 @@ package analysis
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -2412,5 +2413,238 @@ func TestComputeTriage_ContainerEpicExcludedFromDefaultRecommendations(t *testin
 	}
 	if umbrella.Action != "Coordinate open child tasks" {
 		t.Fatalf("container epic Action = %q, want %q", umbrella.Action, "Coordinate open child tasks")
+	}
+}
+
+func TestComputeTriage_TriageConfigDetectsCyclesAndPopulatesAlerts(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	staleTime := now.Add(-40 * 24 * time.Hour)
+	abandonedTime := now.Add(-20 * 24 * time.Hour)
+
+	issues := []model.Issue{
+		{
+			ID:        "cyc-1",
+			Title:     "Cycle node 1",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "cyc-1", DependsOnID: "cyc-2", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "cyc-2",
+			Title:     "Cycle node 2",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "cyc-2", DependsOnID: "cyc-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "stale-open",
+			Title:     "Stale open task",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			CreatedAt: staleTime,
+			UpdatedAt: staleTime,
+		},
+		{
+			ID:        "abandoned-wip",
+			Title:     "Abandoned claim",
+			Status:    model.StatusInProgress,
+			Assignee:  "agent-alpha",
+			Priority:  1,
+			IssueType: model.TypeTask,
+			CreatedAt: abandonedTime,
+			UpdatedAt: abandonedTime,
+		},
+	}
+
+	// Prior 4 weeks had 8 real closures (2/wk avg) and last 7d has 0 closures -> velocity_drop.
+	for i := 0; i < 8; i++ {
+		closedAt := now.Add(-time.Duration(10+i*2) * 24 * time.Hour)
+		createdAt := closedAt.Add(-2 * 24 * time.Hour)
+		issues = append(issues, model.Issue{
+			ID:        fmt.Sprintf("closed-%d", i),
+			Title:     fmt.Sprintf("Closed historical %d", i),
+			Status:    model.StatusClosed,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			CreatedAt: createdAt,
+			UpdatedAt: closedAt,
+			ClosedAt:  &closedAt,
+		})
+	}
+
+	triage := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		UseFastConfig:  true,
+		WaitForPhase2:  true,
+		ActionableOnly: true,
+	}, now)
+
+	if !triage.ProjectHealth.Graph.HasCycles || triage.ProjectHealth.Graph.CycleCount != 1 {
+		t.Fatalf("expected UseFastConfig triage to detect 1 cycle; got has_cycles=%v cycle_count=%d",
+			triage.ProjectHealth.Graph.HasCycles, triage.ProjectHealth.Graph.CycleCount)
+	}
+
+	seenTypes := make(map[string]string)
+	for _, a := range triage.Alerts {
+		seenTypes[a.Type] = a.Severity
+	}
+	for wantType, wantSeverity := range map[string]string{
+		"cycle":           "critical",
+		"stale":           "warning",
+		"abandoned_claim": "warning",
+		"velocity_drop":   "warning",
+	} {
+		if gotSeverity, ok := seenTypes[wantType]; !ok || gotSeverity != wantSeverity {
+			t.Fatalf("missing or wrong severity for alert %q: got=%q (present=%v), alerts=%+v",
+				wantType, gotSeverity, ok, triage.Alerts)
+		}
+	}
+}
+
+func TestComputeTriage_ForceFullAnalysisLabelHealthAndGroupSlicing(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	veryOld := now.Add(-60 * 24 * time.Hour)
+
+	// Make label "fragile" unhealthy (< 60) via stale + blocked peers, while "ready-1" is actionable.
+	issues := []model.Issue{
+		{
+			ID:        "ready-1",
+			Title:     "Ready fragile task",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Labels:    []string{"fragile"},
+			CreatedAt: veryOld,
+			UpdatedAt: veryOld,
+		},
+		{
+			ID:        "blocked-1",
+			Title:     "Blocked fragile peer 1",
+			Status:    model.StatusBlocked,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Labels:    []string{"fragile"},
+			CreatedAt: veryOld,
+			UpdatedAt: veryOld,
+			Dependencies: []*model.Dependency{
+				{IssueID: "blocked-1", DependsOnID: "ready-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "blocked-2",
+			Title:     "Blocked fragile peer 2",
+			Status:    model.StatusBlocked,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Labels:    []string{"fragile"},
+			CreatedAt: veryOld,
+			UpdatedAt: veryOld,
+			Dependencies: []*model.Dependency{
+				{IssueID: "blocked-2", DependsOnID: "ready-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "ready-2",
+			Title:     "Second independent track",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			Labels:    []string{"healthy-track"},
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+	}
+
+	triage := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		TopN:              1,
+		GroupByTrack:      true,
+		GroupByLabel:      true,
+		WaitForPhase2:     true,
+		ActionableOnly:    true,
+		ForceFullAnalysis: true,
+	}, now)
+
+	if len(triage.Recommendations) != 1 {
+		t.Fatalf("Recommendations len = %d, want 1 (TopN=1)", len(triage.Recommendations))
+	}
+	// Groupings must cover all actionable recommendations before TopN truncation.
+	if len(triage.RecommendationsByTrack) != 1 || len(triage.RecommendationsByTrack[0].Recommendations) != 2 {
+		t.Fatalf("RecommendationsByTrack = %+v, want 1 track containing both actionable recommendations even when TopN=1", triage.RecommendationsByTrack)
+	}
+	if len(triage.RecommendationsByLabel) < 2 {
+		t.Fatalf("RecommendationsByLabel len = %d, want >= 2 label groups even when TopN=1", len(triage.RecommendationsByLabel))
+	}
+
+	foundLabelReason := false
+	for _, reason := range triage.Recommendations[0].Reasons {
+		if strings.Contains(reason, "Label 'fragile' needs attention") {
+			foundLabelReason = true
+			break
+		}
+	}
+	if !foundLabelReason {
+		t.Fatalf("expected LabelHealth attention reason on ready-1, got reasons: %v", triage.Recommendations[0].Reasons)
+	}
+
+	// All-closed graph with ForceFullAnalysis=true must still run Phase 2 instead of skipping.
+	closedAt := now.Add(-time.Hour)
+	allClosed := []model.Issue{
+		{ID: "c-1", Title: "Closed 1", Status: model.StatusClosed, ClosedAt: &closedAt, UpdatedAt: closedAt},
+		{ID: "c-2", Title: "Closed 2", Status: model.StatusClosed, ClosedAt: &closedAt, UpdatedAt: closedAt,
+			Dependencies: []*model.Dependency{{IssueID: "c-2", DependsOnID: "c-1", Type: model.DepBlocks}}},
+	}
+	closedTriage := ComputeTriageWithOptionsAndTime(allClosed, TriageOptions{
+		WaitForPhase2:     true,
+		ForceFullAnalysis: true,
+	}, now)
+	if closedTriage.Status.PageRank.State == "skipped" {
+		t.Fatalf("ForceFullAnalysis=true must not skip PageRank on all-closed graph: %+v", closedTriage.Status.PageRank)
+	}
+}
+
+func TestComputeWhatIf_RespectsCandidateScope(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "api-1", Title: "Root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{ID: "api-2", Title: "Blocked child", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "api-2", DependsOnID: "api-1", Type: model.DepBlocks}}},
+	}
+
+	an := NewAnalyzer(issues)
+	stats := an.Analyze()
+	full := an.ComputeWhatIf("api-1", &stats)
+	if full == nil {
+		t.Fatalf("ComputeWhatIf(api-1) returned nil")
+	}
+	if full.Delta.DirectUnblocks != 1 || len(full.Delta.UnblockedIssueIDs) != 1 || full.Delta.UnblockedIssueIDs[0] != "api-2" {
+		t.Fatalf("unexpected full what-if delta: %+v", full.Delta)
+	}
+	if missing := an.ComputeWhatIf("does-not-exist", &stats); missing != nil {
+		t.Fatalf("expected nil for missing issue, got %+v", missing)
+	}
+
+	scoped := NewAnalyzer(issues)
+	scoped.SetReadinessScope(model.NewReadinessIndex(issues), map[string]bool{"api-1": true})
+	scopedStats := scoped.Analyze()
+	scopedRes := scoped.ComputeWhatIf("api-1", &scopedStats)
+	if scopedRes == nil {
+		t.Fatalf("scoped ComputeWhatIf(api-1) returned nil")
+	}
+	for _, id := range scopedRes.Delta.UnblockedIssueIDs {
+		if id == "api-2" {
+			t.Fatalf("out-of-scope issue api-2 leaked into UnblockedIssueIDs: %+v", scopedRes.Delta)
+		}
+	}
+	if outOfScope := scoped.ComputeWhatIf("api-2", &scopedStats); outOfScope != nil {
+		t.Fatalf("expected nil when querying non-candidate api-2, got %+v", outOfScope)
 	}
 }

@@ -211,6 +211,7 @@ type phaseThreeRobotHandlerConfig struct {
 	RobotFileRelationsFlag  *string
 	RobotRelatedFlag        *string
 	RobotBlockerChainFlag   *string
+	RobotWhatIfFlag         *string
 	RobotImpactNetworkFlag  *string
 	RobotCausalityFlag      *string
 	RobotSprintShowFlag     *string
@@ -616,6 +617,7 @@ func configuredPrimaryRobotFlagNames() []string {
 		RobotFileRelationsFlag:  &dummyStr,
 		RobotRelatedFlag:        &dummyStr,
 		RobotBlockerChainFlag:   &dummyStr,
+		RobotWhatIfFlag:         &dummyStr,
 		RobotImpactNetworkFlag:  &dummyStr,
 		RobotCausalityFlag:      &dummyStr,
 		RobotSprintShowFlag:     &dummyStr,
@@ -1111,7 +1113,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		Handler: func(ctx RobotContext) error {
 			analyzer := ctx.Analyzer()
 			analyzer.SetNow(robotNow())
-			if _, w := loadRobotFeedback(); w != nil {
+			if _, w := loadRobotFeedbackForContext(ctx); w != nil {
 				analyzer.SetWeights(*w)
 			}
 			if ctx.DataHashMatchesIssues {
@@ -1243,6 +1245,10 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		Handler: func(ctx RobotContext) error {
 			analyzer := ctx.Analyzer()
 			analyzer.SetNow(robotNow())
+			if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
+				fullCfg := analysis.FullAnalysisConfig()
+				analyzer.SetConfig(&fullCfg)
+			}
 			stats := analyzer.Analyze()
 
 			format := export.GraphFormatJSON
@@ -1328,6 +1334,11 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			analyzer := ctx.Analyzer()
+			analyzer.SetNow(robotNow())
+			if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
+				fullCfg := analysis.FullAnalysisConfig()
+				analyzer.SetConfig(&fullCfg)
+			}
 			stats := analyzer.Analyze()
 
 			partition := analyzer.CountStatusPartition()
@@ -1525,7 +1536,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				Hubs:         buildMetricItems(stats.Hubs(), 10),
 				Authorities:  buildMetricItems(stats.Authorities(), 10),
 			}
-			current := baseline.New(currentStats, currentMetrics, cycles, "current")
+			current := baseline.NewForDir(projectDir, currentStats, currentMetrics, cycles, "current")
 
 			driftConfig, err := drift.LoadConfig(projectDir)
 			if err != nil {
@@ -1767,6 +1778,10 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 
 			analyzer := ctx.Analyzer()
 			analyzer.SetNow(robotNow())
+			if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
+				fullCfg := analysis.FullAnalysisConfig()
+				analyzer.SetConfig(&fullCfg)
+			}
 			graphStats := analyzer.Analyze()
 
 			targetIssues := make([]model.Issue, 0, len(ctx.Issues))
@@ -2047,6 +2062,9 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 	})
 	register("robot-blocker-chain", cfg.RobotBlockerChainFlag, "Output blocker chain analysis for an issue", func(ctx RobotContext) error {
 		return handleRobotBlockerChain(ctx, cfg)
+	})
+	register("robot-whatif", cfg.RobotWhatIfFlag, "Simulate completing an issue and output downstream unblock impact as JSON", func(ctx RobotContext) error {
+		return handleRobotWhatIf(ctx, cfg)
 	})
 	register("robot-impact-network", cfg.RobotImpactNetworkFlag, "Output bead impact network as JSON", func(ctx RobotContext) error {
 		return handleRobotImpactNetwork(ctx, cfg)
@@ -2486,9 +2504,7 @@ func generateTriageHistoryBounded(workDir, beadsPath, asOfCommit string, beadInf
 	}
 }
 
-func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	var historyReport *correlation.HistoryReport
-	historyStatus := "" // empty = history generation not attempted (#166)
+func loadTriageHistoryForContext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) (*correlation.HistoryReport, string) {
 	hasOpenIssues := false
 	for _, issue := range ctx.Issues {
 		if issue.Status != model.StatusClosed && issue.Status != model.StatusTombstone {
@@ -2496,26 +2512,34 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 			break
 		}
 	}
-
-	if hasOpenIssues && sourceDateEpochActive() {
-		historyStatus = "skipped"
-	} else if hasOpenIssues {
-		workDir, err := ctx.WorkDirOrDefault()
-		if err == nil {
-			if beadsPath, err := resolveCorrelationBeadsPathForContext(ctx, workDir); err == nil {
-				limit := 500
-				if cfg.HistoryLimit != nil {
-					limit = *cfg.HistoryLimit
-				}
-				if limit == 500 {
-					limit = 200
-				}
-				beadInfos := buildCorrelationBeadInfos(ctx.Issues)
-				historyReport, historyStatus = generateTriageHistoryBounded(
-					workDir, beadsPath, ctx.AsOfCommit, beadInfos, limit, resolveRobotHistoryTimeout(cfg))
-			}
-		}
+	if !hasOpenIssues {
+		return nil, ""
 	}
+	if sourceDateEpochActive() {
+		return nil, "skipped"
+	}
+	workDir, err := ctx.WorkDirOrDefault()
+	if err != nil {
+		return nil, ""
+	}
+	beadsPath, err := resolveCorrelationBeadsPathForContext(ctx, workDir)
+	if err != nil {
+		return nil, ""
+	}
+	limit := 500
+	if cfg.HistoryLimit != nil {
+		limit = *cfg.HistoryLimit
+	}
+	if limit == 500 {
+		limit = 200
+	}
+	beadInfos := buildCorrelationBeadInfos(ctx.Issues)
+	return generateTriageHistoryBounded(
+		workDir, beadsPath, ctx.AsOfCommit, beadInfos, limit, resolveRobotHistoryTimeout(cfg))
+}
+
+func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
+	historyReport, historyStatus := loadTriageHistoryForContext(ctx, cfg)
 
 	// bv-140: scope triage to a subgraph if --graph-root is specified
 	var rootIssueID string
@@ -2534,21 +2558,23 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	}
 	// bv-90: accept/ignore feedback tunes the factor weights once enough
 	// samples exist; the payload's feedback block reports whether it applied.
-	feedbackData, feedbackWeights := loadRobotFeedback()
+	feedbackData, feedbackWeights := loadRobotFeedbackForContext(ctx)
+	forceFull := cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis
 	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
-		TopN:           maxResults,
-		ActionableOnly: cfg.IncludeInactive == nil || !*cfg.IncludeInactive,
-		GroupByTrack:   cfg.RobotTriageByTrackFlag != nil && *cfg.RobotTriageByTrackFlag,
-		Readiness:      ctx.Readiness,
-		CandidateIDs:   ctx.CandidateIDs,
-		GroupByLabel:   cfg.RobotTriageByLabelFlag != nil && *cfg.RobotTriageByLabelFlag,
-		WaitForPhase2:  true,
-		UseFastConfig:  true,
-		History:        historyReport,
-		RootIssueID:    rootIssueID,
-		SeedDataHash:   seedHash,
-		NotReadyLabels: resolveNotReadyLabels(cfg),
-		Weights:        feedbackWeights,
+		TopN:              maxResults,
+		ActionableOnly:    cfg.IncludeInactive == nil || !*cfg.IncludeInactive,
+		GroupByTrack:      cfg.RobotTriageByTrackFlag != nil && *cfg.RobotTriageByTrackFlag,
+		Readiness:         ctx.Readiness,
+		CandidateIDs:      ctx.CandidateIDs,
+		GroupByLabel:      cfg.RobotTriageByLabelFlag != nil && *cfg.RobotTriageByLabelFlag,
+		WaitForPhase2:     true,
+		UseFastConfig:     !forceFull,
+		ForceFullAnalysis: forceFull,
+		History:           historyReport,
+		RootIssueID:       rootIssueID,
+		SeedDataHash:      seedHash,
+		NotReadyLabels:    resolveNotReadyLabels(cfg),
+		Weights:           feedbackWeights,
 	}, now)
 	if maxResults > 0 && len(triage.QuickRef.TopPicks) > maxResults {
 		triage.QuickRef.TopPicks = triage.QuickRef.TopPicks[:maxResults]
@@ -2626,11 +2652,13 @@ type briefTriageRecommendation struct {
 // health, commands, feedback, and usage hints are omitted.
 type briefTriageOutput struct {
 	RobotEnvelope
-	Brief           bool                        `json:"brief"`
-	QuickRef        analysis.QuickRef           `json:"quick_ref"`
-	Recommendations []briefTriageRecommendation `json:"recommendations"`
-	QuickWins       []analysis.QuickWin         `json:"quick_wins,omitempty"`
-	BlockersToClear []analysis.BlockerItem      `json:"blockers_to_clear,omitempty"`
+	Brief                  bool                                `json:"brief"`
+	QuickRef               analysis.QuickRef                   `json:"quick_ref"`
+	Recommendations        []briefTriageRecommendation         `json:"recommendations"`
+	RecommendationsByTrack []analysis.TrackRecommendationGroup `json:"recommendations_by_track,omitempty"`
+	RecommendationsByLabel []analysis.LabelRecommendationGroup `json:"recommendations_by_label,omitempty"`
+	QuickWins              []analysis.QuickWin                 `json:"quick_wins,omitempty"`
+	BlockersToClear        []analysis.BlockerItem              `json:"blockers_to_clear,omitempty"`
 }
 
 func encodeBriefTriage(ctx RobotContext, triage analysis.TriageResult, now time.Time) error {
@@ -2648,12 +2676,14 @@ func encodeBriefTriage(ctx RobotContext, triage analysis.TriageResult, now time.
 		})
 	}
 	output := briefTriageOutput{
-		RobotEnvelope:   ctx.Envelope(),
-		Brief:           true,
-		QuickRef:        triage.QuickRef,
-		Recommendations: recs,
-		QuickWins:       triage.QuickWins,
-		BlockersToClear: triage.BlockersToClear,
+		RobotEnvelope:          ctx.Envelope(),
+		Brief:                  true,
+		QuickRef:               triage.QuickRef,
+		Recommendations:        recs,
+		RecommendationsByTrack: triage.RecommendationsByTrack,
+		RecommendationsByLabel: triage.RecommendationsByLabel,
+		QuickWins:              triage.QuickWins,
+		BlockersToClear:        triage.BlockersToClear,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding robot-triage --brief: %w", err)
@@ -2780,7 +2810,22 @@ func robotNextClaimablePick(picks []analysis.TopPick, issues []model.Issue, read
 // Every scoring surface (triage, next, priority, TUI hints) goes through the
 // same rule so an agent's accept/ignore history changes what it is told next.
 func loadRobotFeedback() (*analysis.FeedbackData, *analysis.Weights) {
-	beadsDir, err := loader.GetBeadsDir("")
+	return loadRobotFeedbackForDir("")
+}
+
+func loadRobotFeedbackForContext(ctx RobotContext) (*analysis.FeedbackData, *analysis.Weights) {
+	if ctx.AsOf != "" {
+		return nil, nil
+	}
+	dir := ctx.ProjectDir
+	if dir == "" {
+		dir = ctx.WorkDir
+	}
+	return loadRobotFeedbackForDir(dir)
+}
+
+func loadRobotFeedbackForDir(projectDir string) (*analysis.FeedbackData, *analysis.Weights) {
+	beadsDir, err := loader.GetBeadsDir(projectDir)
 	if err != nil {
 		return nil, nil
 	}
@@ -2802,15 +2847,17 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	}
 
 	now := robotNow()
-	_, feedbackWeights := loadRobotFeedback()
+	_, feedbackWeights := loadRobotFeedbackForContext(ctx)
+	forceFull := cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis
 	triage := analysis.ComputeTriageWithOptionsAndTime(ctx.Issues, analysis.TriageOptions{
-		WaitForPhase2:  true,
-		Readiness:      ctx.Readiness,
-		CandidateIDs:   ctx.CandidateIDs,
-		UseFastConfig:  true,
-		RootIssueID:    rootIssueID,
-		NotReadyLabels: resolveNotReadyLabels(cfg),
-		Weights:        feedbackWeights,
+		WaitForPhase2:     true,
+		Readiness:         ctx.Readiness,
+		CandidateIDs:      ctx.CandidateIDs,
+		UseFastConfig:     !forceFull,
+		ForceFullAnalysis: forceFull,
+		RootIssueID:       rootIssueID,
+		NotReadyLabels:    resolveNotReadyLabels(cfg),
+		Weights:           feedbackWeights,
 	}, now)
 	stabilizeRobotTriageForPinnedClock(&triage)
 
@@ -3673,13 +3720,16 @@ func handleRobotRelated(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 }
 
 func handleRobotBlockerChain(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	// Use the dispatch context's issue set: it already carries --as-of,
-	// --label, --recipe, and --repo scoping. Reloading the working tree here
-	// silently bypassed all four (reality check 2026-09-01, gap 2).
+	// Use the dispatch context's analyzer and issue set: it already carries
+	// --as-of, --label, --recipe, and --repo scoping plus readiness/CandidateIDs.
 	issues := ctx.Issues
 
-	analyzer := analysis.NewAnalyzer(issues)
+	analyzer := ctx.Analyzer()
 	analyzer.SetNow(robotNow())
+	if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
+		fullCfg := analysis.FullAnalysisConfig()
+		analyzer.SetConfig(&fullCfg)
+	}
 	result := analyzer.GetBlockerChain(*cfg.RobotBlockerChainFlag)
 	if result == nil {
 		fmt.Fprintf(ctx.StderrOrDefault(), "Issue not found: %s\n", *cfg.RobotBlockerChainFlag)
@@ -3695,6 +3745,36 @@ func handleRobotBlockerChain(ctx RobotContext, cfg phaseThreeRobotHandlerConfig)
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding blocker chain: %w", err)
+	}
+	return nil
+}
+
+func handleRobotWhatIf(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
+	issues := ctx.Issues
+
+	analyzer := ctx.Analyzer()
+	analyzer.SetNow(robotNow())
+	if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
+		fullCfg := analysis.FullAnalysisConfig()
+		analyzer.SetConfig(&fullCfg)
+	}
+	stats := analyzer.Analyze()
+
+	result := analyzer.ComputeWhatIf(*cfg.RobotWhatIfFlag, &stats)
+	if result == nil {
+		fmt.Fprintf(ctx.StderrOrDefault(), "Issue not found: %s\n", *cfg.RobotWhatIfFlag)
+		return newReportedRobotHandlerExit(1)
+	}
+
+	output := struct {
+		RobotEnvelope
+		Result *analysis.WhatIfResult `json:"result"`
+	}{
+		RobotEnvelope: ctx.EnvelopeWithHash(analysis.ComputeDataHash(issues)),
+		Result:        result,
+	}
+	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
+		return fmt.Errorf("encoding what-if impact: %w", err)
 	}
 	return nil
 }
@@ -3851,6 +3931,10 @@ func handleRobotSprintShow(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) e
 func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	analyzer := ctx.Analyzer()
 	analyzer.SetNow(robotNow())
+	if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
+		fullCfg := analysis.FullAnalysisConfig()
+		analyzer.SetConfig(&fullCfg)
+	}
 	graphStats := analyzer.Analyze()
 
 	targetIssues := make([]model.Issue, 0, len(ctx.Issues))

@@ -366,36 +366,37 @@ func (f *FeedbackData) GetEffectiveWeights() map[string]float64 {
 
 // getEffectiveWeightsLocked is the internal version that assumes lock is already held
 func (f *FeedbackData) getEffectiveWeightsLocked() map[string]float64 {
-	baseWeights := map[string]float64{
-		"PageRank":      WeightPageRank,
-		"Betweenness":   WeightBetweenness,
-		"BlockerRatio":  WeightBlockerRatio,
-		"Staleness":     WeightStaleness,
-		"PriorityBoost": WeightPriorityBoost,
-		"TimeToImpact":  WeightTimeToImpact,
-		"Urgency":       WeightUrgency,
-		"Risk":          WeightRisk,
+	ordered := []struct {
+		name string
+		base float64
+	}{
+		{"PageRank", WeightPageRank},
+		{"Betweenness", WeightBetweenness},
+		{"BlockerRatio", WeightBlockerRatio},
+		{"Staleness", WeightStaleness},
+		{"PriorityBoost", WeightPriorityBoost},
+		{"TimeToImpact", WeightTimeToImpact},
+		{"Urgency", WeightUrgency},
+		{"Risk", WeightRisk},
 	}
 
-	effective := make(map[string]float64)
+	effective := make(map[string]float64, len(ordered))
 	adjustments := f.getAdjustedWeightsLocked() // Use internal version to avoid deadlock
 
-	for name, base := range baseWeights {
-		if adj, ok := adjustments[name]; ok {
-			effective[name] = base * adj
-		} else {
-			effective[name] = base
+	// Sum in fixed canonical order so IEEE-754 normalization is bit-identical across runs.
+	var total float64
+	for _, item := range ordered {
+		val := item.base
+		if adj, ok := adjustments[item.name]; ok {
+			val *= adj
 		}
+		effective[item.name] = val
+		total += val
 	}
 
-	// Normalize so weights still sum to ~1.0
-	var total float64
-	for _, w := range effective {
-		total += w
-	}
 	if total > 0 {
-		for name := range effective {
-			effective[name] /= total
+		for _, item := range ordered {
+			effective[item.name] /= total
 		}
 	}
 

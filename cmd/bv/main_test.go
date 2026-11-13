@@ -1661,6 +1661,25 @@ func TestRobotRelationshipWorkflowSchemasMatchHandlerOutputs(t *testing.T) {
 		}
 	}
 
+	whatIfProps := requireRobotSchemaProperties(t, schemas, "robot-whatif")
+	for _, name := range []string{"generated_at", "data_hash", "output_format", "version", "result"} {
+		if whatIfProps[name] == nil {
+			t.Fatalf("robot-whatif schema missing top-level property %q", name)
+		}
+	}
+	whatIfResultProps := requireNestedSchemaProperties(t, whatIfProps["result"], "robot-whatif result")
+	for _, name := range []string{"issue_id", "title", "status", "priority", "delta"} {
+		if whatIfResultProps[name] == nil {
+			t.Fatalf("robot-whatif result schema missing %q", name)
+		}
+	}
+	whatIfDeltaProps := requireNestedSchemaProperties(t, whatIfResultProps["delta"], "robot-whatif delta")
+	for _, name := range []string{"direct_unblocks", "transitive_unblocks", "blocked_reduction", "depth_reduction", "unblocked_issue_ids", "parallelization_gain", "explanation"} {
+		if whatIfDeltaProps[name] == nil {
+			t.Fatalf("robot-whatif delta schema missing %q", name)
+		}
+	}
+
 	networkProps := requireRobotSchemaProperties(t, schemas, "robot-impact-network")
 	for _, name := range []string{
 		"generated_at", "data_hash", "output_format", "version",
@@ -2081,6 +2100,7 @@ func TestRobotRelationshipWorkflowDocsExposeLiveJSONPaths(t *testing.T) {
 	expectations := map[string][]string{
 		"robot-related":        {"target_bead_id", "total_related", "file_overlap"},
 		"robot-blocker-chain":  {"result.target_id", "result.root_blockers", "result.chain"},
+		"robot-whatif":         {"result.issue_id", "result.delta.direct_unblocks", "result.delta.transitive_unblocks", "result.delta.unblocked_issue_ids"},
 		"robot-impact-network": {"network.nodes", "stats.total_nodes", "top_connected"},
 		"robot-causality":      {"chain.events", "insights.summary", "insights.recommendations"},
 	}
@@ -3416,6 +3436,7 @@ func TestRobotRegistry_TotalContract(t *testing.T) {
 		"robot-file-relations":      {"--robot-file-relations", "src/app.go"},
 		"robot-related":             {"--robot-related", "bv-1"},
 		"robot-blocker-chain":       {"--robot-blocker-chain", "bv-2"},
+		"robot-whatif":              {"--robot-whatif", "bv-1"},
 		"robot-impact-network":      {"--robot-impact-network", "bv-1"},
 		"robot-causality":           {"--robot-causality", "bv-1"},
 		"robot-sprint-show":         {"--robot-sprint-show", "sprint-1"},
@@ -3941,6 +3962,342 @@ func TestBriefOutputsRefuseSymlinkTargets(t *testing.T) {
 	}
 	if out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--agent-brief", symlinkDir); err == nil {
 		t.Fatalf("expected --agent-brief to refuse symlink directory; stdout:\n%s\nstderr:\n%s", out, stderr)
+	}
+}
+
+func TestRobotWhatIfAndWave6CLIWiring(t *testing.T) {
+	exe := buildTestBinary(t)
+	tmpDir := t.TempDir()
+
+	// Initialize a tiny git repo so baseline/pages git_hash stamping is exercised against real git.
+	for _, gitArgs := range [][]string{
+		{"init", "-b", "main"},
+		{"config", "user.name", "Test User"},
+		{"config", "user.email", "test@example.invalid"},
+		{"config", "commit.gpgsign", "false"},
+	} {
+		cmd := exec.Command("git", gitArgs...)
+		cmd.Dir = tmpDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", gitArgs, err, out)
+		}
+	}
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issuesContent := strings.Join([]string{
+		`{"id":"root-1","title":"Unblock backend","status":"open","priority":1,"issue_type":"task","labels":["core"],"created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"}`,
+		`{"id":"back-1","title":"Backend API","status":"open","priority":1,"issue_type":"task","labels":["backend"],"created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z","dependencies":[{"issue_id":"back-1","depends_on_id":"root-1","type":"blocks"}]}`,
+		`{"id":"track-2","title":"Independent frontend","status":"open","priority":2,"issue_type":"task","labels":["frontend"],"created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"}`,
+		`{"id":"done-1","title":"Closed task","status":"closed","priority":2,"issue_type":"task","created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-02T00:00:00Z","closed_at":"2026-10-02T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(issuesContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, gitArgs := range [][]string{
+		{"add", ".beads/issues.jsonl"},
+		{"commit", "-m", "seed issues"},
+	} {
+		cmd := exec.Command("git", gitArgs...)
+		cmd.Dir = tmpDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", gitArgs, err, out)
+		}
+	}
+	revOut, err := exec.Command("git", "-C", tmpDir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v", err)
+	}
+	headSHA := strings.TrimSpace(string(revOut))
+
+	// 1. --robot-whatif and `bv whatif <id> --json` intent alias
+	stdout, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "whatif", "root-1", "--json")
+	if err != nil {
+		t.Fatalf("bv whatif root-1 --json failed: %v\nstderr: %s", err, stderr)
+	}
+	var whatIfResp struct {
+		Result struct {
+			IssueID string `json:"issue_id"`
+			Delta   struct {
+				DirectUnblocks    int      `json:"direct_unblocks"`
+				UnblockedIssueIDs []string `json:"unblocked_issue_ids"`
+			} `json:"delta"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &whatIfResp); err != nil {
+		t.Fatalf("unmarshal robot-whatif: %v\nstdout: %s", err, stdout)
+	}
+	if whatIfResp.Result.IssueID != "root-1" || whatIfResp.Result.Delta.DirectUnblocks != 1 ||
+		len(whatIfResp.Result.Delta.UnblockedIssueIDs) != 1 || whatIfResp.Result.Delta.UnblockedIssueIDs[0] != "back-1" {
+		t.Fatalf("unexpected robot-whatif output: %s", stdout)
+	}
+
+	// Closed issue -> 0 unblocks; missing issue -> exit 1.
+	closedOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-whatif", "done-1")
+	if err != nil {
+		t.Fatalf("--robot-whatif done-1 failed: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(closedOut, `"direct_unblocks": 0`) && !strings.Contains(closedOut, `"direct_unblocks":0`) {
+		t.Fatalf("expected 0 direct_unblocks for closed issue, got: %s", closedOut)
+	}
+	if _, missingStderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-whatif", "missing-999"); err == nil || !strings.Contains(missingStderr, "Issue not found: missing-999") {
+		t.Fatalf("expected exit 1 + Issue not found for missing issue; err=%v stderr=%s", err, missingStderr)
+	}
+
+	// 2. --robot-triage-by-track / --robot-triage-by-label --robot-max-results 1 --brief preserves full group recommendations across all actionable items
+	briefOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-triage-by-track", "--robot-max-results", "1", "--brief")
+	if err != nil {
+		t.Fatalf("--robot-triage-by-track --brief failed: %v\nstderr: %s", err, stderr)
+	}
+	var briefPayload struct {
+		Recommendations        []json.RawMessage `json:"recommendations"`
+		RecommendationsByTrack []struct {
+			TrackID         string            `json:"track_id"`
+			Recommendations []json.RawMessage `json:"recommendations"`
+		} `json:"recommendations_by_track"`
+	}
+	if err := json.Unmarshal([]byte(briefOut), &briefPayload); err != nil {
+		t.Fatalf("unmarshal brief triage: %v\n%s", err, briefOut)
+	}
+	if len(briefPayload.Recommendations) != 1 || len(briefPayload.RecommendationsByTrack) != 1 || len(briefPayload.RecommendationsByTrack[0].Recommendations) != 2 {
+		t.Fatalf("expected 1 top recommendation and 1 track containing both actionable items in brief output, got recs=%d tracks=%d\n%s",
+			len(briefPayload.Recommendations), len(briefPayload.RecommendationsByTrack), briefOut)
+	}
+
+	briefLabelOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-triage-by-label", "--robot-max-results", "1", "--brief")
+	if err != nil {
+		t.Fatalf("--robot-triage-by-label --brief failed: %v\nstderr: %s", err, stderr)
+	}
+	var briefLabelPayload struct {
+		Recommendations        []json.RawMessage `json:"recommendations"`
+		RecommendationsByLabel []json.RawMessage `json:"recommendations_by_label"`
+	}
+	if err := json.Unmarshal([]byte(briefLabelOut), &briefLabelPayload); err != nil {
+		t.Fatalf("unmarshal brief label triage: %v\n%s", err, briefLabelOut)
+	}
+	if len(briefLabelPayload.Recommendations) != 1 || len(briefLabelPayload.RecommendationsByLabel) != 2 {
+		t.Fatalf("expected 1 top recommendation and 2 label groups in brief output, got recs=%d labels=%d\n%s",
+			len(briefLabelPayload.Recommendations), len(briefLabelPayload.RecommendationsByLabel), briefLabelOut)
+	}
+
+	// 3. Feedback mutual exclusion + subdirectory invocation + structured format output
+	subDir := filepath.Join(tmpDir, "nested", "subdir")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, fbStderr, err := runCommandWithTimeout(t, subDir, exe, "--feedback-accept", "root-1", "--feedback-ignore", "track-2"); err == nil || !strings.Contains(fbStderr, "cannot be used together") {
+		t.Fatalf("expected mutual exclusion error for simultaneous --feedback-accept and --feedback-ignore; err=%v stderr=%s", err, fbStderr)
+	}
+	fbOut, stderr, err := runCommandWithTimeout(t, subDir, exe, "--feedback-accept", "root-1", "--format", "json")
+	if err != nil {
+		t.Fatalf("--feedback-accept from subdir failed: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(fbOut, `"action"`) || !strings.Contains(fbOut, `"accept"`) || !strings.Contains(fbOut, `"generated_at"`) {
+		t.Fatalf("expected structured RobotEnvelope JSON from --feedback-accept --format json, got:\n%s", fbOut)
+	}
+
+	// 4. --save-baseline from subdir captures git commit SHA from projectDir
+	if _, stderr, err := runCommandWithTimeout(t, subDir, exe, "--save-baseline", "from-subdir"); err != nil {
+		t.Fatalf("--save-baseline from subdir failed: %v\nstderr: %s", err, stderr)
+	}
+	baselineBytes, err := os.ReadFile(filepath.Join(tmpDir, ".bv", "baseline.json"))
+	if err != nil {
+		t.Fatalf("read baseline.json: %v", err)
+	}
+	if !strings.Contains(string(baselineBytes), headSHA) {
+		t.Fatalf("baseline.json missing git commit %s when saved from subdir:\n%s", headSHA, baselineBytes)
+	}
+
+	// 5. --export-pages --pages-title --pages-subtitle stamps git_hash, renders subtitle, and reports readiness-blocked count in README.md
+	pagesOut := filepath.Join(tmpDir, "pages-out")
+	if _, stderr, err := runCommandWithTimeout(t, subDir, exe, "--export-pages", pagesOut, "--pages-title", "Wave 6 Title", "--pages-subtitle", "Sprint <Alpha> & Co"); err != nil {
+		t.Fatalf("--export-pages failed: %v\nstderr: %s", err, stderr)
+	}
+	indexHTML, err := os.ReadFile(filepath.Join(pagesOut, "index.html"))
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	if !strings.Contains(string(indexHTML), "Wave 6 Title") || !strings.Contains(string(indexHTML), "Sprint &lt;Alpha&gt; &amp; Co") {
+		t.Fatalf("exported index.html missing title or escaped subtitle:\n%s", indexHTML[:min(2000, len(indexHTML))])
+	}
+	metaBytes, err := os.ReadFile(filepath.Join(pagesOut, "data", "meta.json"))
+	if err != nil {
+		t.Fatalf("read data/meta.json: %v", err)
+	}
+	if !strings.Contains(string(metaBytes), headSHA) {
+		t.Fatalf("exported data/meta.json missing git_hash %s:\n%s", headSHA, metaBytes)
+	}
+	readmeBytes, err := os.ReadFile(filepath.Join(pagesOut, "README.md"))
+	if err != nil {
+		t.Fatalf("read exported README.md: %v", err)
+	}
+	if !strings.Contains(string(readmeBytes), "**1** blocked") {
+		t.Fatalf("exported README.md should report 1 readiness-blocked issue (back-1), got:\n%s", readmeBytes)
+	}
+
+	// 6. --export-graph --label backend preserves 1-hop cross-label blocker edge (root-1 -> back-1)
+	graphHTMLPath := filepath.Join(tmpDir, "backend-graph.html")
+	graphStdout, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--export-graph", graphHTMLPath, "--label", "backend")
+	if err != nil {
+		t.Fatalf("--export-graph --label backend failed: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(graphStdout, "1 edges") {
+		t.Fatalf("expected --export-graph --label backend to preserve 1-hop blocker edge, got stdout: %s", graphStdout)
+	}
+
+	// 7. Live --robot-schema & --robot-docs parity for --brief grouped triage and triage.alerts
+	schemaOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-schema")
+	if err != nil {
+		t.Fatalf("--robot-schema failed: %v\nstderr: %s", err, stderr)
+	}
+	var liveSchemas struct {
+		Commands map[string]struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+			Required   []string                   `json:"required"`
+			OneOf      []struct {
+				Required []string `json:"required"`
+			} `json:"oneOf"`
+		} `json:"commands"`
+	}
+	if err := json.Unmarshal([]byte(schemaOut), &liveSchemas); err != nil {
+		t.Fatalf("unmarshal --robot-schema: %v", err)
+	}
+	var triageProp struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(liveSchemas.Commands["robot-triage"].Properties["triage"], &triageProp); err != nil {
+		t.Fatalf("unmarshal robot-triage.properties.triage: %v", err)
+	}
+	if _, ok := triageProp.Properties["alerts"]; !ok {
+		t.Fatalf("robot-triage schema missing triage.properties.alerts")
+	}
+
+	briefPlainOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-triage", "--brief")
+	if err != nil {
+		t.Fatalf("--robot-triage --brief failed: %v\nstderr: %s", err, stderr)
+	}
+	for cmdName, rawPayload := range map[string]string{
+		"robot-triage":          briefPlainOut,
+		"robot-triage-by-track": briefOut,
+		"robot-triage-by-label": briefLabelOut,
+	} {
+		cmdSchema, ok := liveSchemas.Commands[cmdName]
+		if !ok {
+			t.Fatalf("missing schema for %s", cmdName)
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(rawPayload), &obj); err != nil {
+			t.Fatalf("unmarshal %s payload: %v", cmdName, err)
+		}
+		for k := range obj {
+			if _, declared := cmdSchema.Properties[k]; !declared {
+				t.Fatalf("%s --brief emitted undeclared top-level key %q", cmdName, k)
+			}
+		}
+		if len(cmdSchema.OneOf) == 0 {
+			t.Fatalf("%s schema missing oneOf branch for --brief", cmdName)
+		}
+		matchedBranch := false
+		for _, branch := range cmdSchema.OneOf {
+			allPresent := true
+			for _, req := range branch.Required {
+				if _, present := obj[req]; !present {
+					allPresent = false
+					break
+				}
+			}
+			if allPresent {
+				matchedBranch = true
+				break
+			}
+		}
+		if !matchedBranch {
+			t.Fatalf("%s --brief payload failed all oneOf required branches: %+v", cmdName, cmdSchema.OneOf)
+		}
+	}
+
+	docsOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-docs", "commands")
+	if err != nil {
+		t.Fatalf("--robot-docs commands failed: %v\nstderr: %s", err, stderr)
+	}
+	for _, want := range []string{"--brief", "--robot-max-results"} {
+		if strings.Count(docsOut, want) < 3 {
+			t.Fatalf("expected --robot-docs commands to document %s on robot-triage and both grouped variants:\n%s", want, docsOut)
+		}
+	}
+
+	// 8. Git-commit History staleness parity across --robot-triage, --priority-brief, --agent-brief, --export-pages, and --emit-script:
+	// All open issues have JSONL updated_at 2026-10-01 (>14d old), so a fresh git commit referencing them must suppress false stale alerts everywhere.
+	if err := os.WriteFile(filepath.Join(tmpDir, "work.txt"), []byte("active work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, gitArgs := range [][]string{
+		{"add", "work.txt"},
+		{"commit", "-m", "feat: fresh progress on root-1, back-1, and track-2"},
+	} {
+		cmd := exec.Command("git", gitArgs...)
+		cmd.Dir = tmpDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", gitArgs, err, out)
+		}
+	}
+
+	triageWithCommitOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-triage")
+	if err != nil {
+		t.Fatalf("--robot-triage after commit failed: %v\nstderr: %s", err, stderr)
+	}
+	if strings.Contains(triageWithCommitOut, `"type": "stale"`) || strings.Contains(triageWithCommitOut, `"type":"stale"`) {
+		t.Fatalf("expected git commit to suppress stale alert in --robot-triage:\n%s", triageWithCommitOut)
+	}
+
+	prioBriefFile := filepath.Join(tmpDir, "prio-brief.md")
+	if _, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--priority-brief", prioBriefFile); err != nil {
+		t.Fatalf("--priority-brief failed: %v\nstderr: %s", err, stderr)
+	}
+	prioBriefBytes, err := os.ReadFile(prioBriefFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(prioBriefBytes), "**stale**") {
+		t.Fatalf("--priority-brief emitted false stale alert despite fresh git commit:\n%s", prioBriefBytes)
+	}
+
+	agentBriefDir := filepath.Join(tmpDir, "agent-brief-out")
+	if _, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--agent-brief", agentBriefDir); err != nil {
+		t.Fatalf("--agent-brief failed: %v\nstderr: %s", err, stderr)
+	}
+	agentBriefMD, err := os.ReadFile(filepath.Join(agentBriefDir, "brief.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(agentBriefMD), "**stale**") {
+		t.Fatalf("--agent-brief brief.md emitted false stale alert despite fresh git commit:\n%s", agentBriefMD)
+	}
+	agentTriageJSON, err := os.ReadFile(filepath.Join(agentBriefDir, "triage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(agentTriageJSON), `"type": "stale"`) || !strings.Contains(string(agentTriageJSON), `"history_status": "ok"`) {
+		t.Fatalf("--agent-brief triage.json missing git history staleness parity:\n%s", agentTriageJSON)
+	}
+
+	pagesOut2 := filepath.Join(tmpDir, "pages-out-no-tt")
+	if _, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--export-pages", pagesOut2, "--pages-include-history=false"); err != nil {
+		t.Fatalf("--export-pages (no history bundle) failed: %v\nstderr: %s", err, stderr)
+	}
+	pagesTriageJSON, err := os.ReadFile(filepath.Join(pagesOut2, "data", "triage.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(pagesTriageJSON), `"type": "stale"`) || !strings.Contains(string(pagesTriageJSON), `"history_status": "ok"`) {
+		t.Fatalf("--export-pages data/triage.json emitted false stale alert despite fresh git commit:\n%s", pagesTriageJSON)
+	}
+
+	if scriptOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--emit-script"); err != nil || !strings.Contains(scriptOut, "root-1") {
+		t.Fatalf("--emit-script after commit failed: err=%v stderr=%s out=%s", err, stderr, scriptOut)
 	}
 }
 

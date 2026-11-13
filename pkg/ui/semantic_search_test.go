@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -1863,6 +1865,77 @@ func TestSemanticSearchConcurrentAccess(t *testing.T) {
 	<-done
 
 	// If we get here without panic, the test passes
+}
+
+func TestSemanticSearch_ReadOnlyAsOfBuildsInMemoryWithoutDiskWrite(t *testing.T) {
+	cwdDir := t.TempDir()
+	t.Chdir(cwdDir)
+
+	projectDir := t.TempDir()
+	now := time.Date(2026, 4, 10, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:          "ASOF-1",
+			Title:       "Authentication token refresh bug",
+			Description: "Expired OAuth refresh tokens fail silently",
+			Status:      model.StatusOpen,
+			Priority:    1,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+		{
+			ID:          "ASOF-2",
+			Title:       "Kanban board column sizing",
+			Description: "Adjust horizontal card padding",
+			Status:      model.StatusOpen,
+			Priority:    2,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		},
+	}
+
+	// Historical --as-of mode passes beadsPath == "", even if SetWorkDir is set.
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.SetWorkDir(projectDir)
+
+	buildCmd := m.startSemanticIndexBuild()
+	if buildCmd == nil {
+		t.Fatal("expected startSemanticIndexBuild to return a non-nil command")
+	}
+
+	rawMsg := buildCmd()
+	ready, ok := rawMsg.(SemanticIndexReadyMsg)
+	if !ok {
+		t.Fatalf("expected SemanticIndexReadyMsg, got %T", rawMsg)
+	}
+	if ready.Error != nil {
+		t.Fatalf("unexpected semantic build error: %v", ready.Error)
+	}
+	if ready.IndexPath != "" || ready.NeedsSave || ready.Loaded {
+		t.Fatalf("expected in-memory index (IndexPath=\"\", NeedsSave=false, Loaded=false), got IndexPath=%q NeedsSave=%v Loaded=%v",
+			ready.IndexPath, ready.NeedsSave, ready.Loaded)
+	}
+	if ready.Index == nil || ready.Index.Size() != len(issues) {
+		t.Fatalf("expected %d embedded documents in memory, got index=%v", len(issues), ready.Index)
+	}
+
+	updated, saveCmd := m.Update(ready)
+	mp := updated.(*Model)
+	if saveCmd != nil {
+		t.Fatal("expected nil save command in read-only --as-of mode")
+	}
+	if mp.semanticSearch == nil || !mp.semanticSearch.Snapshot().Ready {
+		t.Fatal("expected mp.semanticSearch.Snapshot().Ready to become true after in-memory build")
+	}
+
+	// Negative control: neither CWD nor projectDir may have .bv/semantic created on disk.
+	for _, root := range []string{cwdDir, projectDir} {
+		semDir := filepath.Join(root, ".bv", "semantic")
+		if _, err := os.Stat(semDir); !os.IsNotExist(err) {
+			t.Fatalf("read-only --as-of semantic build must not touch disk at %s (stat err=%v)", semDir, err)
+		}
+	}
 }
 
 // =============================================================================

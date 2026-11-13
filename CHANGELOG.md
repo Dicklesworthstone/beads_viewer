@@ -169,6 +169,26 @@ every reported vulnerability has an exploitable execution path in bv.
   `--capacity-label`; remove the dead CSP-violating CDN fallback in `viewer.js`;
   and reconcile public formula, tutorial-key (`~` vs `` ` ``), and `SKILL.md`
   reference tables.
+- **Wave 6 high-leverage runtime wirings across CLI, analysis, TUI, and static
+  dashboard** (`bv-apal.36`..`bv-apal.41`): implement the documented
+  `--robot-whatif <id>` command (`RobotRegistry`, `--robot-schema`, `--robot-docs`,
+  TTY guard, and `ComputeWhatIf` candidate scoping); honor `--force-full-analysis`,
+  persisted feedback weights (`.beads/feedback.json`), and `baseline.NewForDir`
+  across robot/CLI commands; preserve `recommendations_by_track` and
+  `recommendations_by_label` under `--brief` and `--robot-max-results`; enable
+  cycle detection (`TriageConfig`), `ProjectHealth.Staleness` fallback without git
+  history, and synthesized `Alerts` (`cycle`, `stale`, `abandoned_claim`,
+  `velocity_drop`) in `--robot-triage` and `--priority-brief` (alongside What-If
+  deltas); normalize active hybrid-search PageRank and open-only blocker counts
+  with shared `analysis.GetGlobalCache()`; add `--pages-subtitle`, `git_hash`
+  stamping, and `ReplaceTitle`/`ReplaceSubtitle` + `SuggestRepoName` +
+  `AttemptGHInstall` in `--pages`/`--export-pages`; wire TUI `ProjectDir` scoping,
+  persisted feedback weights, in-memory `--as-of` semantic search, startup
+  `AGENTS.md` blurb auto-upgrade modal, `;` shortcuts-sidebar `ctrl+j`/`ctrl+k`
+  guard, and Cass relative-path resolution;
+  and connect static-viewer Galaxy (`5`) preset, `T` time-travel, arrow-key detail
+  sync, cycle-navigator buttons, error-modal actions, chart click-to-filter, label
+  filtering, and multi-token search scoring.
 
 ## v0.26.0 — 2026-11-02
 

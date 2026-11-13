@@ -176,6 +176,7 @@ var rootHelpSections = []flagHelpSection{
 				"agent-brief",
 				"export-pages",
 				"pages-title",
+				"pages-subtitle",
 				"pages-include-closed",
 				"pages-include-history",
 				"preview-pages",
@@ -639,6 +640,8 @@ func rewriteAgentIntentCommand(args []string) ([]string, bool) {
 		return rewriteRobotValueIntent(rest, "related", "", "--robot-related", ""), true
 	case "blockers", "blocker-chain":
 		return rewriteRobotValueIntent(rest, "blocker-chain", "", "--robot-blocker-chain", ""), true
+	case "whatif", "what-if":
+		return rewriteRobotValueIntent(rest, "whatif", "", "--robot-whatif", ""), true
 	case "impact-network":
 		return rewriteRobotValueIntent(rest, "impact-network", "", "--robot-impact-network", "all"), true
 	case "causality":
@@ -754,6 +757,8 @@ func rewriteCanonicalRobotCommandIntent(command string, rest []string) ([]string
 		return rewriteRobotValueIntent(rest, "related", "", "--robot-related", ""), true
 	case "robot-blocker-chain":
 		return rewriteRobotValueIntent(rest, "blocker-chain", "", "--robot-blocker-chain", ""), true
+	case "robot-whatif":
+		return rewriteRobotValueIntent(rest, "whatif", "", "--robot-whatif", ""), true
 	case "robot-impact-network":
 		return rewriteRobotValueIntent(rest, "impact-network", "", "--robot-impact-network", "all"), true
 	case "robot-causality":
@@ -1085,6 +1090,8 @@ func agentIntentCommandNames() []string {
 		"related",
 		"blockers",
 		"blocker-chain",
+		"whatif",
+		"what-if",
 		"impact-network",
 		"causality",
 		"sprints",
@@ -1570,6 +1577,8 @@ func main() {
 	relatedIncludeClosed := flag.Bool("related-include-closed", false, "Include closed beads in related work results")
 	// Blocker chain analysis flag (bv-nlo0)
 	robotBlockerChain := flag.String("robot-blocker-chain", "", "Output full blocker chain analysis for issue ID as JSON")
+	// What-if impact simulation flag (bv-apal.36)
+	robotWhatIf := flag.String("robot-whatif", "", "Simulate completing issue ID and output downstream unblock impact as JSON")
 	// Impact network graph flag (bv-48kr)
 	robotImpactNetwork := flag.String("robot-impact-network", "", "Output bead impact network as JSON (empty for full, or bead ID for subnetwork)")
 	networkDepth := flag.Int("network-depth", 2, "Depth of subnetwork when querying specific bead (1-3)")
@@ -1605,6 +1614,7 @@ func main() {
 	// Static pages export flags (bv-73f)
 	exportPages := flag.String("export-pages", "", "Export static site to directory (e.g., ./bv-pages)")
 	pagesTitle := flag.String("pages-title", "", "Custom title for static site")
+	pagesSubtitle := flag.String("pages-subtitle", "", "Custom subtitle for static site")
 	pagesIncludeClosed := flag.Bool("pages-include-closed", true, "Include closed issues in export (default: true)")
 	pagesIncludeHistory := flag.Bool("pages-include-history", true, "Include git history for time-travel (default: true)")
 	previewPages := flag.String("preview-pages", "", "Preview existing static site bundle")
@@ -1711,6 +1721,7 @@ func main() {
 		RobotFileRelationsFlag:  robotFileRelations,
 		RobotRelatedFlag:        robotRelatedWork,
 		RobotBlockerChainFlag:   robotBlockerChain,
+		RobotWhatIfFlag:         robotWhatIf,
 		RobotImpactNetworkFlag:  robotImpactNetwork,
 		RobotCausalityFlag:      robotCausality,
 		RobotSprintShowFlag:     robotSprintShow,
@@ -1823,7 +1834,10 @@ func main() {
 				"export-pages", "pages", "export-graph",
 			}},
 			{modifier: "robot-history-timeout-ms", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
-			{modifier: "robot-not-ready-labels", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
+			{modifier: "robot-not-ready-labels", requires: []string{
+				"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
+				"emit-script", "priority-brief", "agent-brief", "export-pages", "pages", "export-graph",
+			}},
 			{modifier: "min-confidence", requires: []string{"robot-history", "bead-history"}},
 			{modifier: "correlation-by", requires: []string{"robot-confirm-correlation", "robot-reject-correlation"}},
 			{modifier: "correlation-reason", requires: []string{"robot-confirm-correlation", "robot-reject-correlation"}},
@@ -1846,6 +1860,7 @@ func main() {
 			{modifier: "script-limit", requires: []string{"emit-script"}},
 			{modifier: "script-format", requires: []string{"emit-script"}},
 			{modifier: "pages-title", requires: []string{"export-pages"}},
+			{modifier: "pages-subtitle", requires: []string{"export-pages"}},
 			{modifier: "pages-include-closed", requires: []string{"export-pages"}},
 			{modifier: "pages-include-history", requires: []string{"export-pages"}},
 			{modifier: "no-live-reload", requires: []string{"preview-pages"}},
@@ -1890,6 +1905,7 @@ func main() {
 			{flags: []string{"robot-file-relations"}},
 			{flags: []string{"robot-related"}},
 			{flags: []string{"robot-blocker-chain"}},
+			{flags: []string{"robot-whatif"}},
 			{flags: []string{"robot-impact-network"}},
 			{flags: []string{"robot-causality"}},
 			{flags: []string{"robot-sprint-list"}},
@@ -2579,9 +2595,36 @@ func main() {
 			}
 		}
 
-		// Handle feedback commands (bv-90)
+		// Resolve canonical project directory (handles nested subdirectory invocations)
+		projectDir, err := resolveCLIProjectDir()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error getting project directory: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Handle feedback commands (bv-90, bv-apal.36)
 		if *feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset || *feedbackShow {
-			beadsDir, err := loader.GetBeadsDir("")
+			if *feedbackAccept != "" && *feedbackIgnore != "" {
+				fmt.Fprintln(os.Stderr, "Error: --feedback-accept and --feedback-ignore cannot be used together")
+				os.Exit(1)
+			}
+
+			feedbackRobotMode := envRobot || flag.CommandLine.Changed("format")
+			emitFeedbackRobot := func(dataHash string, payload interface{}) {
+				wrapped, encErr := withEnvelope(NewRobotEnvelope(dataHash), payload)
+				if encErr != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding feedback envelope: %v\n", encErr)
+					os.Exit(1)
+				}
+				encoder := newRobotEncoder(os.Stdout)
+				if encErr := encoder.Encode(wrapped); encErr != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding feedback output: %v\n", encErr)
+					os.Exit(1)
+				}
+				os.Exit(0)
+			}
+
+			beadsDir, err := loader.GetBeadsDir(projectDir)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
 				os.Exit(1)
@@ -2599,18 +2642,27 @@ func main() {
 					fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
 					os.Exit(1)
 				}
+				if feedbackRobotMode {
+					emitFeedbackRobot("", map[string]interface{}{
+						"action":   "reset",
+						"feedback": feedback.ToJSON(),
+					})
+				}
 				fmt.Println("Feedback data reset to defaults.")
 				os.Exit(0)
 			}
 
 			if *feedbackShow {
+				if feedbackRobotMode {
+					emitFeedbackRobot("", feedback.ToJSON())
+				}
 				feedbackJSON := feedback.ToJSON()
 				data, _ := json.MarshalIndent(feedbackJSON, "", "  ")
 				fmt.Println(string(data))
 				os.Exit(0)
 			}
 
-			// For accept/ignore, we need to get the issue's score breakdown
+			// For accept/ignore, compute the issue's score breakdown at robotNow()
 			if *feedbackAccept != "" || *feedbackIgnore != "" {
 				issueID := *feedbackAccept
 				action := "accept"
@@ -2619,15 +2671,13 @@ func main() {
 					action = "ignore"
 				}
 
-				// Load issues to get score breakdown
-				loaded, err := datasource.LoadIssues("")
+				loaded, err := datasource.LoadIssues(projectDir)
 				issues := loaded.Issues
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error loading issues: %v\n", err)
 					os.Exit(1)
 				}
 
-				// Find the issue
 				var foundIssue *model.Issue
 				for i := range issues {
 					if issues[i].ID == issueID {
@@ -2641,8 +2691,13 @@ func main() {
 					os.Exit(1)
 				}
 
-				// Compute impact score for the issue to get breakdown
 				an := analysis.NewAnalyzer(issues)
+				an.SetNow(robotNow())
+				an.SetReadinessScope(model.NewReadinessIndex(issues), nil)
+				if *forceFullAnalysis {
+					fullCfg := analysis.FullAnalysisConfig()
+					an.SetConfig(&fullCfg)
+				}
 				scores := an.ComputeImpactScores()
 
 				var score float64
@@ -2665,17 +2720,19 @@ func main() {
 					os.Exit(1)
 				}
 
+				if feedbackRobotMode {
+					emitFeedbackRobot(analysis.ComputeDataHash(issues), map[string]interface{}{
+						"action":   action,
+						"issue_id": issueID,
+						"score":    score,
+						"feedback": feedback.ToJSON(),
+					})
+				}
+
 				fmt.Printf("Recorded %s feedback for %s (score: %.3f)\n", action, issueID, score)
 				fmt.Println(feedback.Summary())
 				os.Exit(0)
 			}
-		}
-
-		// Resolve canonical project directory (handles nested subdirectory invocations)
-		projectDir, err := resolveCLIProjectDir()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error getting project directory: %v\n", err)
-			os.Exit(1)
 		}
 
 		// Load recipes (needed for both --robot-recipes and --recipe)
@@ -3085,7 +3142,12 @@ func main() {
 				resolvedPreset = presetName
 				resolvedWeights = &weights
 
-				cache := search.NewMetricsCache(search.NewAnalyzerMetricsLoader(issuesForSearch))
+				metricsLoader := search.NewAnalyzerMetricsLoader(issuesForSearch).WithCache(analysis.GetGlobalCache())
+				if *forceFullAnalysis {
+					fullCfg := analysis.FullAnalysisConfig()
+					metricsLoader = metricsLoader.WithConfig(&fullCfg)
+				}
+				cache := search.NewMetricsCache(metricsLoader)
 				if err := cache.Refresh(); err != nil {
 					fmt.Fprintf(os.Stderr, "Error computing hybrid metrics: %v\n", err)
 					os.Exit(1)
@@ -3184,7 +3246,7 @@ func main() {
 
 		// Handle --pages wizard (bv-10g)
 		if *pagesWizard {
-			if err := runPagesWizard(beadsPath, *robotIncludeInactive); err != nil {
+			if err := runPagesWizard(beadsPath, *robotIncludeInactive, *forceFullAnalysis, *robotNotReadyLabels); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -3255,17 +3317,36 @@ func main() {
 				// Build graph and compute stats
 				fmt.Println("  → Running graph analysis...")
 				analyzer := analysis.NewAnalyzer(exportIssues)
-				stats := analyzer.AnalyzeAsync(context.Background())
+				analyzer.SetNow(robotNow())
+				analyzer.SetReadinessScope(exportContext.Readiness, exportContext.CandidateIDs)
+				var stats *analysis.GraphStats
+				if *forceFullAnalysis {
+					fullCfg := analysis.FullAnalysisConfig()
+					analyzer.SetConfig(&fullCfg)
+					stats = analyzer.AnalyzeAsyncWithConfig(context.Background(), fullCfg)
+				} else {
+					stats = analyzer.AnalyzeAsync(context.Background())
+				}
 				stats.WaitForPhase2()
 
-				// Compute triage
+				// Compute triage (using bounded git history for staleness parity with --robot-triage)
 				fmt.Println("  → Generating triage data...")
+				triageHistory, triageHistoryStatus := loadTriageHistoryForContext(exportContext, phaseThreeRobotHandlerConfig{
+					HistoryLimit:     historyLimit,
+					HistoryTimeoutMs: robotHistoryTimeoutMs,
+				})
+				_, exportFeedbackWeights := loadRobotFeedbackForContext(exportContext)
 				triage := analysis.ComputeTriageWithOptionsAndTime(exportIssues, analysis.TriageOptions{
-					WaitForPhase2:  true,
-					ActionableOnly: !*robotIncludeInactive,
-					Readiness:      exportContext.Readiness,
-					CandidateIDs:   exportContext.CandidateIDs,
+					WaitForPhase2:     true,
+					ActionableOnly:    !*robotIncludeInactive,
+					Readiness:         exportContext.Readiness,
+					CandidateIDs:      exportContext.CandidateIDs,
+					History:           triageHistory,
+					ForceFullAnalysis: *forceFullAnalysis,
+					NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
+					Weights:           exportFeedbackWeights,
 				}, robotNow())
+				triage.Meta.HistoryStatus = triageHistoryStatus
 				if !exportContext.claimsProven() {
 					suppressUnprovenTriageClaims(&triage)
 				}
@@ -3302,6 +3383,11 @@ func main() {
 				if *pagesTitle != "" {
 					exporter.Config.Title = *pagesTitle
 				}
+				if exportContext.AsOfCommit != "" {
+					exporter.SetGitHash(exportContext.AsOfCommit)
+				} else if commit, _, _ := baseline.GetGitInfo(projectDir); commit != "" {
+					exporter.SetGitHash(commit)
+				}
 
 				// Export SQLite database
 				fmt.Println("  → Writing database and JSON files...")
@@ -3333,7 +3419,7 @@ func main() {
 
 				// Bind the offline viewer to the completed data, including history.
 				fmt.Println("  → Copying viewer assets...")
-				if err := copyViewerAssets(bundle, *pagesTitle); err != nil {
+				if err := copyViewerAssetsWithSubtitle(bundle, *pagesTitle, *pagesSubtitle); err != nil {
 					return fmt.Errorf("copying assets: %w", err)
 				}
 				// Windows holds the directory against renames while open. Release
@@ -3643,22 +3729,12 @@ func main() {
 
 		// Handle --export-graph (bv-94) - PNG/SVG/HTML export
 		if *exportGraph != "" {
-			// Apply label filter if specified
+			// scopeLoadedIssues already selected --label with 1-hop dependency
+			// context and CandidateIDs; re-filtering by label here would erase
+			// boundary blocker edges.
 			exportIssues := issues
-			if *labelScope != "" {
-				var filtered []model.Issue
-				for _, iss := range issues {
-					for _, lbl := range iss.Labels {
-						if strings.EqualFold(lbl, *labelScope) {
-							filtered = append(filtered, iss)
-							break
-						}
-					}
-				}
-				exportIssues = filtered
-			}
 
-			if len(exportIssues) == 0 {
+			if len(exportIssues) == 0 || (robotDispatchContext.CandidateIDs != nil && len(robotDispatchContext.CandidateIDs) == 0) {
 				fmt.Fprintf(os.Stderr, "No issues to export (check filters)\n")
 				os.Exit(1)
 			}
@@ -3696,12 +3772,16 @@ func main() {
 				}
 
 				// Compute triage for the graph export
+				_, graphFeedbackWeights := loadRobotFeedbackForContext(robotDispatchContext)
 				triageOpts := analysis.TriageOptions{
-					WaitForPhase2:  true,
-					ActionableOnly: !*robotIncludeInactive,
-					Readiness:      robotDispatchContext.Readiness,
-					CandidateIDs:   robotDispatchContext.CandidateIDs,
-					History:        historyReport,
+					WaitForPhase2:     true,
+					ActionableOnly:    !*robotIncludeInactive,
+					Readiness:         robotDispatchContext.Readiness,
+					CandidateIDs:      robotDispatchContext.CandidateIDs,
+					History:           historyReport,
+					ForceFullAnalysis: *forceFullAnalysis,
+					NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
+					Weights:           graphFeedbackWeights,
 				}
 				triage := analysis.ComputeTriageWithOptionsAndTime(exportIssues, triageOpts, robotNow())
 				if !robotDispatchContext.claimsProven() {
@@ -3817,7 +3897,7 @@ func main() {
 				Authorities:  buildMetricItems(stats.Authorities(), 10),
 			}
 
-			bl := baseline.New(graphStats, topMetrics, cycles, *saveBaseline)
+			bl := baseline.NewForDir(projectDir, graphStats, topMetrics, cycles, *saveBaseline)
 
 			if err := bl.Save(baselinePath); err != nil {
 				fmt.Fprintf(os.Stderr, "Error saving baseline: %v\n", err)
@@ -3889,7 +3969,7 @@ func main() {
 				Hubs:         buildMetricItems(stats.Hubs(), 10),
 				Authorities:  buildMetricItems(stats.Authorities(), 10),
 			}
-			current := baseline.New(currentStats, currentMetrics, cycles, "current")
+			current := baseline.NewForDir(projectDir, currentStats, currentMetrics, cycles, "current")
 
 			// Load drift config and run calculator
 			driftConfig, err := drift.LoadConfig(projectDir)
@@ -3921,12 +4001,22 @@ func main() {
 		// dispatch so both `bv --emit-script` and `bv --robot-triage --emit-script`
 		// emit the executable shell script instead of exiting early with JSON.
 		if *emitScript {
+			_, scriptFeedbackWeights := loadRobotFeedbackForContext(robotDispatchContext)
+			scriptHistory, scriptHistoryStatus := loadTriageHistoryForContext(robotDispatchContext, phaseThreeRobotHandlerConfig{
+				HistoryLimit:     historyLimit,
+				HistoryTimeoutMs: robotHistoryTimeoutMs,
+			})
 			triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
-				WaitForPhase2:  true,
-				ActionableOnly: !*robotIncludeInactive,
-				Readiness:      readiness,
-				CandidateIDs:   candidateIDs,
+				WaitForPhase2:     true,
+				ActionableOnly:    !*robotIncludeInactive,
+				Readiness:         readiness,
+				CandidateIDs:      candidateIDs,
+				History:           scriptHistory,
+				ForceFullAnalysis: *forceFullAnalysis,
+				NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
+				Weights:           scriptFeedbackWeights,
 			}, robotNow())
+			triage.Meta.HistoryStatus = scriptHistoryStatus
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
 			}
@@ -4037,12 +4127,22 @@ func main() {
 		// Handle --priority-brief flag (bv-96)
 		if *priorityBrief != "" {
 			fmt.Printf("Generating priority brief to %s...\n", *priorityBrief)
+			_, briefFeedbackWeights := loadRobotFeedbackForContext(robotDispatchContext)
+			briefHistory, briefHistoryStatus := loadTriageHistoryForContext(robotDispatchContext, phaseThreeRobotHandlerConfig{
+				HistoryLimit:     historyLimit,
+				HistoryTimeoutMs: robotHistoryTimeoutMs,
+			})
 			triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
-				WaitForPhase2:  true,
-				ActionableOnly: !*robotIncludeInactive,
-				Readiness:      readiness,
-				CandidateIDs:   candidateIDs,
+				WaitForPhase2:     true,
+				ActionableOnly:    !*robotIncludeInactive,
+				Readiness:         readiness,
+				CandidateIDs:      candidateIDs,
+				History:           briefHistory,
+				ForceFullAnalysis: *forceFullAnalysis,
+				NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
+				Weights:           briefFeedbackWeights,
 			}, robotNow())
+			triage.Meta.HistoryStatus = briefHistoryStatus
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
 			}
@@ -4091,12 +4191,22 @@ func main() {
 			}
 
 			// Generate triage data
+			_, agentFeedbackWeights := loadRobotFeedbackForContext(robotDispatchContext)
+			agentHistory, agentHistoryStatus := loadTriageHistoryForContext(robotDispatchContext, phaseThreeRobotHandlerConfig{
+				HistoryLimit:     historyLimit,
+				HistoryTimeoutMs: robotHistoryTimeoutMs,
+			})
 			triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
-				WaitForPhase2:  true,
-				ActionableOnly: !*robotIncludeInactive,
-				Readiness:      readiness,
-				CandidateIDs:   candidateIDs,
+				WaitForPhase2:     true,
+				ActionableOnly:    !*robotIncludeInactive,
+				Readiness:         readiness,
+				CandidateIDs:      candidateIDs,
+				History:           agentHistory,
+				ForceFullAnalysis: *forceFullAnalysis,
+				NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
+				Weights:           agentFeedbackWeights,
 			}, robotNow())
+			triage.Meta.HistoryStatus = agentHistoryStatus
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
 			}
@@ -4117,7 +4227,12 @@ func main() {
 			fmt.Println("  → triage.json")
 
 			// Generate insights
-			analyzer := analysis.NewAnalyzer(issues)
+			analyzer := robotDispatchContext.Analyzer()
+			analyzer.SetNow(robotNow())
+			if *forceFullAnalysis {
+				fullCfg := analysis.FullAnalysisConfig()
+				analyzer.SetConfig(&fullCfg)
+			}
 			stats := analyzer.Analyze()
 			insights := stats.GenerateInsights(50)
 			insightsPayload, err := withEnvelope(robotDispatchContext.Envelope(), insights)
@@ -4207,6 +4322,9 @@ func main() {
 
 		// Handle --robot-related flag (bv-jtdl)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-blocker-chain", robotDispatchContext)
+
+		// Handle --robot-whatif flag (bv-apal.36)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-whatif", robotDispatchContext)
 
 		// Handle --robot-blocker-chain flag (bv-nlo0)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-impact-network", robotDispatchContext)
@@ -4311,6 +4429,9 @@ func main() {
 
 			// Launch TUI with historical issues (already loaded, no live reload)
 			m := ui.NewModel(issues, activeRecipe, "", ui.ReadinessScope{Authority: readiness, CandidateIDs: candidateIDs})
+			if projectDir != "" {
+				m.SetWorkDir(projectDir)
+			}
 			defer m.Stop()
 			if *debugRender != "" {
 				output := m.RenderDebugView(*debugRender, *debugWidth, *debugHeight)
@@ -4454,6 +4575,9 @@ func main() {
 
 		// Initial Model with live reload support
 		m := ui.NewModel(issues, activeRecipe, beadsPath, ui.ReadinessScope{Authority: readiness, CandidateIDs: candidateIDs})
+		if projectDir != "" {
+			m.SetWorkDir(projectDir)
+		}
 		defer m.Stop() // Clean up file watcher
 
 		// Enable workspace mode if loading from workspace config
@@ -4853,7 +4977,7 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 		ctx.DataHashMatchesIssues = false
 	}
 	if r != nil {
-		metrics := recipeMetrics(fullSource, r)
+		metrics := recipeMetricsForContext(ctx, fullSource, r)
 		metrics.Readiness = ctx.Readiness
 		recipeIssues := ctx.Issues
 		if ctx.CandidateIDs != nil {
@@ -4961,16 +5085,30 @@ func applyRecipe(issues []model.Issue, r *recipe.Recipe) ([]model.Issue, error) 
 // over every issue handed in, so a blocker hidden by the recipe's filters still
 // feeds the PageRank/betweenness of what remains, exactly as the TUI's stats do.
 func recipeMetrics(issues []model.Issue, r *recipe.Recipe) recipe.Metrics {
+	return recipeMetricsForContext(RobotContext{Readiness: model.NewReadinessIndex(issues)}, issues, r)
+}
+
+func recipeMetricsForContext(ctx RobotContext, issues []model.Issue, r *recipe.Recipe) recipe.Metrics {
 	var metrics recipe.Metrics
+	if r == nil || (!r.NeedsGraphMetrics() && !r.NeedsTriageScores()) {
+		return metrics
+	}
+	now := robotNow()
+	analyzer := analysis.NewAnalyzer(issues)
+	analyzer.SetNow(now)
+	if ctx.Readiness != nil {
+		analyzer.SetReadinessScope(ctx.Readiness, nil)
+	}
+	if _, w := loadRobotFeedbackForContext(ctx); w != nil {
+		analyzer.SetWeights(*w)
+	}
+	stats := analyzer.AnalyzeAsync(context.Background())
+	stats.WaitForPhase2()
 	if r.NeedsGraphMetrics() {
-		analyzer := analysis.NewAnalyzer(issues)
-		analyzer.SetNow(robotNow())
-		stats := analyzer.AnalyzeAsync(context.Background())
-		stats.WaitForPhase2()
 		metrics.Graph = stats
 	}
 	if r.NeedsTriageScores() {
-		scores := analysis.ComputeTriageScores(issues)
+		scores := analysis.ComputeTriageScoresFromAnalyzer(analyzer, stats, analysis.DefaultTriageScoringOptions(), now)
 		metrics.Triage = make(map[string]float64, len(scores))
 		for _, score := range scores {
 			metrics.Triage[score.IssueID] = score.TriageScore
@@ -5316,9 +5454,15 @@ func buildAttentionReason(score analysis.LabelAttentionScore) string {
 // copyViewerAssets copies the viewer HTML/JS/CSS assets to the output directory.
 // If title is provided, it replaces the default title in index.html.
 func copyViewerAssets(bundle *export.Bundle, title string) error {
+	return copyViewerAssetsWithSubtitle(bundle, title, "")
+}
+
+// copyViewerAssetsWithSubtitle copies viewer HTML/JS/CSS assets and applies
+// optional title and subtitle customization to index.html.
+func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string) error {
 	// First try to use embedded assets (production builds)
 	if export.HasEmbeddedAssets() {
-		if err := bundle.CopyEmbeddedAssets(title); err != nil {
+		if err := bundle.CopyEmbeddedAssetsWithSubtitle(title, subtitle); err != nil {
 			return err
 		}
 		// The optional hybrid scorer is built from source straight into the
@@ -5347,9 +5491,9 @@ func copyViewerAssets(bundle *export.Bundle, title string) error {
 	for _, file := range files {
 		src := filepath.Join(assetsDir, file)
 
-		// Special handling for index.html to replace title and add cache-busting
+		// Special handling for index.html to replace title/subtitle and add cache-busting
 		if file == "index.html" {
-			if err := copyFileWithTitleAndCacheBusting(src, bundle, file, title); err != nil {
+			if err := copyFileWithTitleSubtitleAndCacheBusting(src, bundle, file, title, subtitle); err != nil {
 				return fmt.Errorf("copy %s: %w", file, err)
 			}
 			continue
@@ -5478,6 +5622,10 @@ func copyFile(src string, bundle *export.Bundle, name string) error {
 // copyFileWithTitleAndCacheBusting copies a file while replacing the default title
 // and adding cache-busting query parameters to script tags.
 func copyFileWithTitleAndCacheBusting(src string, bundle *export.Bundle, name, title string) error {
+	return copyFileWithTitleSubtitleAndCacheBusting(src, bundle, name, title, "")
+}
+
+func copyFileWithTitleSubtitleAndCacheBusting(src string, bundle *export.Bundle, name, title, subtitle string) error {
 	content, err := os.ReadFile(src)
 	if err != nil {
 		return err
@@ -5489,7 +5637,11 @@ func copyFileWithTitleAndCacheBusting(src string, bundle *export.Bundle, name, t
 	if title != "" {
 		safeTitle := html.EscapeString(title)
 		result = strings.Replace(result, "<title>Beads Viewer</title>", "<title>"+safeTitle+"</title>", 1)
+		result = strings.Replace(result, `<h1 class="text-lg sm:text-xl font-semibold">Beads Viewer</h1>`, `<h1 class="text-lg sm:text-xl font-semibold">`+safeTitle+`</h1>`, 1)
 		result = strings.Replace(result, `<h1 class="text-xl font-semibold">Beads Viewer</h1>`, `<h1 class="text-xl font-semibold">`+safeTitle+`</h1>`, 1)
+	}
+	if strings.TrimSpace(subtitle) != "" {
+		result = export.ReplaceSubtitle(result, subtitle)
 	}
 
 	// Always add cache-busting to script tags to prevent CDN from serving stale JS files
@@ -5558,13 +5710,18 @@ func generateREADME(bundle *export.Bundle, title, pagesURL string, issues []mode
 			completionPct = float64(health.Closed) / float64(health.Total) * 100
 		}
 
+		blockedCount := triage.QuickRef.ReadinessBlockedCount
+		if blockedCount == 0 && health.Blocked > 0 {
+			blockedCount = health.Blocked
+		}
+
 		b.WriteString("## 📊 Executive Summary\n\n")
 		b.WriteString(fmt.Sprintf("**%d** total issues | **%.0f%%** complete | **%d** ready to work | **%d** blocked\n\n",
-			health.Total, completionPct, health.Actionable, health.Blocked))
+			health.Total, completionPct, health.Actionable, blockedCount))
 
 		// Health assessment
-		if health.Blocked > 0 && health.Actionable > 0 {
-			blockRatio := float64(health.Blocked) / float64(health.Actionable)
+		if blockedCount > 0 && health.Actionable > 0 {
+			blockRatio := float64(blockedCount) / float64(health.Actionable)
 			if blockRatio > 1.0 {
 				b.WriteString("⚠️ **Health Warning:** More issues are blocked than actionable. Focus on clearing blockers.\n\n")
 			}
@@ -5804,7 +5961,7 @@ func runPreviewServer(dir string, liveReload bool) error {
 }
 
 // runPagesWizard runs the interactive deployment wizard (bv-10g).
-func runPagesWizard(beadsPath string, includeInactive bool) error {
+func runPagesWizard(beadsPath string, includeInactive, forceFullAnalysis bool, notReadyLabels string) error {
 	wizard := export.NewWizard(beadsPath)
 
 	// Run interactive wizard to collect configuration
@@ -5865,19 +6022,39 @@ func runPagesWizard(beadsPath string, includeInactive bool) error {
 
 	// Build graph and compute stats
 	fmt.Println("  -> Running graph analysis...")
+	wizardProjectDir := ""
+	if source.BeadsDir != "" {
+		wizardProjectDir = filepath.Dir(source.BeadsDir)
+	}
 	analyzer := analysis.NewAnalyzer(exportIssues)
-	stats := analyzer.AnalyzeAsync(context.Background())
+	analyzer.SetNow(robotNow())
+	analyzer.SetReadinessScope(source.Readiness, nil)
+	var stats *analysis.GraphStats
+	if forceFullAnalysis {
+		fullCfg := analysis.FullAnalysisConfig()
+		analyzer.SetConfig(&fullCfg)
+		stats = analyzer.AnalyzeAsyncWithConfig(context.Background(), fullCfg)
+	} else {
+		stats = analyzer.AnalyzeAsync(context.Background())
+	}
 	stats.WaitForPhase2()
 
 	// Compute triage
 	fmt.Println("  -> Generating triage data...")
 	exportContext := RobotContext{Issues: exportIssues, Readiness: source.Readiness, SourceAuthority: source.SourceAuthority,
-		SourcePath: source.SourcePath, SourceKind: source.SourceKind, DataHash: analysis.ComputeDataHash(source.Issues)}
+		SourcePath: source.SourcePath, SourceKind: source.SourceKind, ProjectDir: wizardProjectDir, DataHash: analysis.ComputeDataHash(source.Issues)}
+	_, wizardFeedbackWeights := loadRobotFeedbackForContext(exportContext)
+	wizardTriageHistory, wizardHistoryStatus := loadTriageHistoryForContext(exportContext, phaseThreeRobotHandlerConfig{})
 	triage := analysis.ComputeTriageWithOptionsAndTime(exportIssues, analysis.TriageOptions{
-		WaitForPhase2:  true,
-		ActionableOnly: !includeInactive,
-		Readiness:      source.Readiness,
+		WaitForPhase2:     true,
+		ActionableOnly:    !includeInactive,
+		Readiness:         source.Readiness,
+		History:           wizardTriageHistory,
+		ForceFullAnalysis: forceFullAnalysis,
+		NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: &notReadyLabels}),
+		Weights:           wizardFeedbackWeights,
 	}, robotNow())
+	triage.Meta.HistoryStatus = wizardHistoryStatus
 	if !exportContext.claimsProven() {
 		suppressUnprovenTriageClaims(&triage)
 	}
@@ -5913,6 +6090,11 @@ func runPagesWizard(beadsPath string, includeInactive bool) error {
 	exporter.Config.RobotEnvelope = envelope
 	if config.Title != "" {
 		exporter.Config.Title = config.Title
+	}
+	if wizardProjectDir != "" {
+		if commit, _, _ := baseline.GetGitInfo(wizardProjectDir); commit != "" {
+			exporter.SetGitHash(commit)
+		}
 	}
 
 	// Export SQLite database
@@ -5968,7 +6150,7 @@ func runPagesWizard(beadsPath string, includeInactive bool) error {
 
 	// Bind the offline viewer after all database/history data has been published.
 	fmt.Println("  -> Copying viewer assets...")
-	if err := copyViewerAssets(bundle, config.Title); err != nil {
+	if err := copyViewerAssetsWithSubtitle(bundle, config.Title, config.Subtitle); err != nil {
 		return fmt.Errorf("failed to copy assets: %w", err)
 	}
 	if err := bundle.Close(); err != nil {
@@ -7725,13 +7907,13 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		"robot-triage-by-track": {
 			Flag: "--robot-triage-by-track", Description: "Triage grouped by independent parallel execution tracks.",
 			KeyFields:   []string{"triage.recommendations_by_track[].track_id", "triage.recommendations_by_track[].top_pick", "triage.recommendations_by_track[].claim_command"},
-			Params:      []string{"--graph-root <id>", "--robot-include-inactive"},
+			Params:      []string{"--graph-root <id>", "--robot-max-results <n>", "--brief", "--robot-include-inactive"},
 			NeedsIssues: true,
 		},
 		"robot-triage-by-label": {
 			Flag: "--robot-triage-by-label", Description: "Triage grouped by label for area-focused agents.",
 			KeyFields:   []string{"triage.recommendations_by_label[].label", "triage.recommendations_by_label[].top_pick", "triage.recommendations_by_label[].claim_command"},
-			Params:      []string{"--graph-root <id>", "--robot-include-inactive"},
+			Params:      []string{"--graph-root <id>", "--robot-max-results <n>", "--brief", "--robot-include-inactive"},
 			NeedsIssues: true,
 		},
 		"robot-alerts": {
@@ -7888,6 +8070,12 @@ func robotCommandDocs() map[string]robotCommandDoc {
 			Flag:        "--robot-blocker-chain <id>",
 			Description: "Full blocker chain analysis for an issue.",
 			KeyFields:   []string{"result.target_id", "result.is_blocked", "result.root_blockers", "result.chain", "result.has_cycle"},
+			NeedsIssues: true,
+		},
+		"robot-whatif": {
+			Flag:        "--robot-whatif <id>",
+			Description: "Simulate completing an issue and report direct/transitive downstream unblocks.",
+			KeyFields:   []string{"result.issue_id", "result.delta.direct_unblocks", "result.delta.transitive_unblocks", "result.delta.blocked_reduction", "result.delta.parallelization_gain", "result.delta.unblocked_issue_ids"},
 			NeedsIssues: true,
 		},
 		"robot-impact-network": {
@@ -8055,6 +8243,8 @@ func preferredRobotInvocationOverride(commandName string) string {
 		return "bv robot-related ISSUE_ID --json"
 	case "robot-blocker-chain":
 		return "bv robot-blocker-chain ISSUE_ID --json"
+	case "robot-whatif":
+		return "bv robot-whatif ISSUE_ID --json"
 	case "robot-causality":
 		return "bv robot-causality ISSUE_ID --json"
 	case "robot-forecast":
@@ -8397,6 +8587,14 @@ func generateRobotSchemas() RobotSchemas {
 					"type":  "array",
 					"items": map[string]interface{}{"$ref": "#/$defs/brief_recommendation"},
 				},
+				"recommendations_by_track": map[string]interface{}{
+					"type":  "array",
+					"items": robotTrackRecommendationGroupSchema(),
+				},
+				"recommendations_by_label": map[string]interface{}{
+					"type":  "array",
+					"items": robotLabelRecommendationGroupSchema(),
+				},
 				"quick_wins":        map[string]interface{}{"type": "array"},
 				"blockers_to_clear": map[string]interface{}{"type": "array"},
 				"triage": map[string]interface{}{
@@ -8416,6 +8614,7 @@ func generateRobotSchemas() RobotSchemas {
 								},
 							},
 						},
+						"status": map[string]interface{}{"type": "object"},
 						"quick_ref": map[string]interface{}{
 							"type": "object",
 							"properties": map[string]interface{}{
@@ -8437,9 +8636,18 @@ func generateRobotSchemas() RobotSchemas {
 							"type":  "array",
 							"items": map[string]interface{}{"$ref": "#/$defs/recommendation"},
 						},
+						"recommendations_by_track": map[string]interface{}{
+							"type":  "array",
+							"items": robotTrackRecommendationGroupSchema(),
+						},
+						"recommendations_by_label": map[string]interface{}{
+							"type":  "array",
+							"items": robotLabelRecommendationGroupSchema(),
+						},
 						"quick_wins":        map[string]interface{}{"type": "array"},
 						"blockers_to_clear": map[string]interface{}{"type": "array"},
 						"project_health":    map[string]interface{}{"type": "object"},
+						"alerts":            map[string]interface{}{"type": "array"},
 						"commands":          map[string]interface{}{"type": "object"},
 					},
 				},
@@ -8833,6 +9041,7 @@ func generateRobotSchemas() RobotSchemas {
 		"robot-impact":              robotImpactOutputSchema(),
 		"robot-related":             robotRelatedOutputSchema(),
 		"robot-blocker-chain":       robotBlockerChainOutputSchema(),
+		"robot-whatif":              robotWhatIfOutputSchema(),
 		"robot-impact-network":      robotImpactNetworkOutputSchema(),
 		"robot-causality":           robotCausalityOutputSchema(),
 		"robot-orphans":             robotOrphansOutputSchema(),
@@ -9083,6 +9292,25 @@ func generateRobotSchemas() RobotSchemas {
 	for name, doc := range robotCommandDocs() {
 		if _, ok := commands[name]; !ok {
 			commands[name] = genericRobotCommandSchema(name, doc)
+		}
+	}
+	if envProps, ok := envelope["properties"].(map[string]interface{}); ok {
+		for _, schema := range commands {
+			props, ok := schema["properties"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if _, hasGenAt := props["generated_at"]; !hasGenAt {
+				continue
+			}
+			if _, hasDataHash := props["data_hash"]; !hasDataHash {
+				continue
+			}
+			for k, v := range envProps {
+				if _, exists := props[k]; !exists {
+					props[k] = v
+				}
+			}
 		}
 	}
 
@@ -9823,6 +10051,39 @@ func robotBlockerChainEntrySchema() map[string]interface{} {
 	}
 }
 
+func robotWhatIfOutputSchema() map[string]interface{} {
+	return robotFileCommandOutputSchema("Robot What-If Output", "Simulated downstream unblock impact of completing an issue", map[string]interface{}{
+		"result": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"issue_id": map[string]interface{}{"type": "string"},
+				"title":    map[string]interface{}{"type": "string"},
+				"status":   map[string]interface{}{"type": "string"},
+				"priority": map[string]interface{}{"type": "integer"},
+				"delta":    whatIfDeltaSchema(),
+			},
+			"required": []string{"issue_id", "title", "status", "priority", "delta"},
+		},
+	}, []string{"generated_at", "data_hash", "output_format", "version", "result"})
+}
+
+func whatIfDeltaSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"direct_unblocks":      map[string]interface{}{"type": "integer"},
+			"transitive_unblocks":  map[string]interface{}{"type": "integer"},
+			"blocked_reduction":    map[string]interface{}{"type": "integer"},
+			"depth_reduction":      map[string]interface{}{"type": "number"},
+			"estimated_days_saved": map[string]interface{}{"type": "number"},
+			"unblocked_issue_ids":  robotNullableArraySchema(map[string]interface{}{"type": "string"}),
+			"parallelization_gain": map[string]interface{}{"type": []string{"integer", "null"}},
+			"explanation":          map[string]interface{}{"type": "string"},
+		},
+		"required": []string{"direct_unblocks", "transitive_unblocks", "blocked_reduction", "depth_reduction", "explanation"},
+	}
+}
+
 func robotImpactNetworkOutputSchema() map[string]interface{} {
 	return robotFileCommandOutputSchema("Robot Impact Network Output", "Impact network graph for all beads or one bead subnetwork", map[string]interface{}{
 		"bead_id":       map[string]interface{}{"type": "string"},
@@ -10120,19 +10381,34 @@ func robotGroupedTriageOutputSchema(title, description, groupProperty string, gr
 		"description": description,
 		"type":        "object",
 		"properties": map[string]interface{}{
-			"generated_at": map[string]interface{}{"type": "string", "format": "date-time"},
-			"data_hash":    map[string]interface{}{"type": "string"},
-			"as_of":        map[string]interface{}{"type": "string"},
-			"as_of_commit": map[string]interface{}{"type": "string"},
+			"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
+			"data_hash":     map[string]interface{}{"type": "string"},
+			"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+			"version":       map[string]interface{}{"type": "string"},
+			"as_of":         map[string]interface{}{"type": "string"},
+			"as_of_commit":  map[string]interface{}{"type": "string"},
+			"brief":         map[string]interface{}{"type": "boolean"},
+			"quick_ref":     map[string]interface{}{"type": "object"},
+			"recommendations": map[string]interface{}{
+				"type": "array",
+			},
+			groupProperty: map[string]interface{}{
+				"type":  "array",
+				"items": groupItemSchema,
+			},
+			"quick_wins":        map[string]interface{}{"type": "array"},
+			"blockers_to_clear": map[string]interface{}{"type": "array"},
 			"triage": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
 					"meta":              map[string]interface{}{"type": "object"},
+					"status":            map[string]interface{}{"type": "object"},
 					"quick_ref":         map[string]interface{}{"type": "object"},
 					"recommendations":   map[string]interface{}{"type": "array"},
 					"quick_wins":        map[string]interface{}{"type": "array"},
 					"blockers_to_clear": map[string]interface{}{"type": "array"},
 					"project_health":    map[string]interface{}{"type": "object"},
+					"alerts":            map[string]interface{}{"type": "array"},
 					"commands":          map[string]interface{}{"type": "object"},
 					groupProperty: map[string]interface{}{
 						"type":  "array",
@@ -10144,7 +10420,10 @@ func robotGroupedTriageOutputSchema(title, description, groupProperty string, gr
 			"feedback":    map[string]interface{}{"type": "object"},
 			"usage_hints": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 		},
-		"required": []string{"generated_at", "data_hash", "triage", "usage_hints"},
+		"oneOf": []map[string]interface{}{
+			{"required": []string{"generated_at", "data_hash", "triage", "usage_hints"}},
+			{"required": []string{"generated_at", "data_hash", "brief", "quick_ref", "recommendations"}},
+		},
 	}
 }
 

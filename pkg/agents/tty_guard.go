@@ -55,6 +55,7 @@ var canonicalRobotFlags = []string{
 	"robot-triage",
 	"robot-triage-by-label",
 	"robot-triage-by-track",
+	"robot-whatif",
 }
 
 // canonicalHeadlessFlags are non-robot CLI flags that execute headlessly and
@@ -70,14 +71,20 @@ var canonicalHeadlessFlags = []string{
 	"check-update",
 	"diff-since",
 	"emit-script",
+	"export-graph",
 	"export-md",
 	"export-pages",
+	"feedback-accept",
+	"feedback-ignore",
+	"feedback-reset",
+	"feedback-show",
 	"generate-docs",
 	"help",
 	"hooks-info",
 	"priority-brief",
 	"rollback",
 	"save-baseline",
+	"search",
 	"update",
 	"version",
 }

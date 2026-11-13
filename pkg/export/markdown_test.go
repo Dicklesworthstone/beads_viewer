@@ -1996,3 +1996,56 @@ func TestExportSurfaces_DueDateDeferUntilExternalRef(t *testing.T) {
 		}
 	}
 }
+
+func TestGeneratePriorityBriefFromTriageJSON_RendersAlertsAndWhatIf(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "root-1", Title: "Unblock cascade", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "dep-1", Title: "Waiting 1", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "dep-1", DependsOnID: "root-1", Type: model.DepBlocks}}},
+		{ID: "dep-2", Title: "Waiting 2", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "dep-2", DependsOnID: "dep-1", Type: model.DepBlocks}}},
+		{ID: "cyc-a", Title: "Cycle A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "cyc-a", DependsOnID: "cyc-b", Type: model.DepBlocks}}},
+		{ID: "cyc-b", Title: "Cycle B", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "cyc-b", DependsOnID: "cyc-a", Type: model.DepBlocks}}},
+	}
+
+	triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
+		UseFastConfig:  true,
+		WaitForPhase2:  true,
+		ActionableOnly: true,
+	}, now)
+	triageJSON, err := json.Marshal(triage)
+	if err != nil {
+		t.Fatalf("marshal triage: %v", err)
+	}
+
+	cfg := DefaultPriorityBriefConfig()
+	brief, err := GeneratePriorityBriefFromTriageJSON(triageJSON, cfg)
+	if err != nil {
+		t.Fatalf("GeneratePriorityBriefFromTriageJSON failed: %v", err)
+	}
+	for _, want := range []string{
+		"## ⚠️ Alerts",
+		"**cycle**",
+		"## 🔮 What-If Impact",
+		"**root-1**",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("priority brief missing %q:\n%s", want, brief)
+		}
+	}
+
+	cfg.IncludeWhatIf = false
+	withoutOptional, err := GeneratePriorityBriefFromTriageJSON(triageJSON, cfg)
+	if err != nil {
+		t.Fatalf("GeneratePriorityBriefFromTriageJSON(disabled) failed: %v", err)
+	}
+	if strings.Contains(withoutOptional, "## 🔮 What-If Impact") {
+		t.Fatalf("expected IncludeWhatIf=false to omit What-If section:\n%s", withoutOptional)
+	}
+	if !strings.Contains(withoutOptional, "## ⚠️ Alerts") {
+		t.Fatalf("expected Alerts section to remain rendered when alerts are present:\n%s", withoutOptional)
+	}
+}

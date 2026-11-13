@@ -403,11 +403,11 @@ func ComputeTriage(issues []model.Issue) TriageResult {
 
 // TriageOptions configures triage computation
 type TriageOptions struct {
-	Readiness     *model.ReadinessIndex // Authority before any root/label/repo/recipe scope
-	CandidateIDs  map[string]bool       // nil = all analysis issues; empty = no candidates
-	TopN          int                   // Number of recommendations (default 10)
-	QuickWinN     int                   // Number of quick wins (default 5)
-	BlockerN      int                   // Number of blockers to show (default 5)
+	Readiness         *model.ReadinessIndex // Authority before any root/label/repo/recipe scope
+	CandidateIDs      map[string]bool       // nil = all analysis issues; empty = no candidates
+	TopN              int                   // Number of recommendations (default 10)
+	QuickWinN         int                   // Number of quick wins (default 5)
+	BlockerN          int                   // Number of blockers to show (default 5)
 	WaitForPhase2     bool                  // Block until Phase 2 metrics ready
 	UseFastConfig     bool                  // Use TriageConfig for faster Phase 2 (bv-t1js optimization)
 	ForceFullAnalysis bool                  // Force FullAnalysisConfig regardless of graph size (--force-full-analysis)
@@ -745,11 +745,8 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	elapsed := time.Since(start)
 	projectVelocity := ComputeProjectVelocity(candidateIssues, now.UTC(), 8)
 
-	// Calculate staleness over in-scope candidate issues if history is available
-	var staleness *Staleness
-	if opts.History != nil {
-		staleness = ComputeStaleness(opts.History, candidateIssues, now)
-	}
+	// Calculate staleness over in-scope candidate issues (uses git history when available, falling back to issue timestamps)
+	staleness := ComputeStaleness(opts.History, candidateIssues, now)
 
 	alerts := buildTriageAlerts(analyzer, candidateIssues, stats, staleness, projectVelocity, now)
 	partition := analyzer.CountStatusPartition()
@@ -893,23 +890,31 @@ func ComputeStaleness(history *correlation.HistoryReport, issues []model.Issue, 
 			continue
 		}
 
-		// Use history events to find true last activity
+		// Use history events to find true last activity when git history is available
 		var lastActivity time.Time
-		if h, ok := history.Histories[issue.ID]; ok {
-			if len(h.Events) > 0 {
-				lastActivity = h.Events[len(h.Events)-1].Timestamp
-			}
-			if len(h.Commits) > 0 {
-				lastCommit := h.Commits[len(h.Commits)-1].Timestamp
-				if lastCommit.After(lastActivity) {
-					lastActivity = lastCommit
+		if history != nil && history.Histories != nil {
+			if h, ok := history.Histories[issue.ID]; ok {
+				if len(h.Events) > 0 {
+					lastActivity = h.Events[len(h.Events)-1].Timestamp
+				}
+				if len(h.Commits) > 0 {
+					lastCommit := h.Commits[len(h.Commits)-1].Timestamp
+					if lastCommit.After(lastActivity) {
+						lastActivity = lastCommit
+					}
 				}
 			}
 		}
 
-		// Fallback to issue UpdatedAt if history missing
+		// Fallback to issue UpdatedAt (or CreatedAt) if history is missing
 		if lastActivity.IsZero() {
 			lastActivity = issue.UpdatedAt
+		}
+		if lastActivity.IsZero() {
+			lastActivity = issue.CreatedAt
+		}
+		if lastActivity.IsZero() {
+			continue
 		}
 
 		if lastActivity.Before(threshold) {
@@ -1921,7 +1926,7 @@ func generateTriageReasonsForScoreAt(score TriageScore, triageCtx *TriageContext
 		TriageScore:     &score,
 		UnblocksIDs:     unblocksMap[score.IssueID],
 		BlockedByIDs:    triageCtx.OpenBlockers(score.IssueID), // cached
-		LabelHealth:     triageCtx.LabelHealthMap(now),        // cached
+		LabelHealth:     triageCtx.LabelHealthMap(now),         // cached
 		ClaimedByAgent:  claimedByAgent,
 		DaysSinceUpdate: daysSinceUpdate,
 		IsQuickWin:      isQuickWin,

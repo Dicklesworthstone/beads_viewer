@@ -11,7 +11,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 
-const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle] = process.argv.slice(2);
+const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle, capabilitiesBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
 assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'precomputed-metrics', 'graph-startup', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline', 'timeline-removal', 'timeline-animation', 'timeline-sprints', 'timeline-performance'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
@@ -1179,6 +1179,13 @@ async function journey(page, mobile) {
   // The first controller reloads the document. Wait for the resulting app.
   await delay(500);
   await ready(page);
+  assert.equal(await evaluate(page, 'document.title'), 'Browser journeys', 'custom --pages-title sets document title');
+  assert.equal(await evaluate(page, `document.querySelector('header h1')?.textContent.trim()`), 'Browser journeys', 'custom --pages-title replaces navbar h1');
+  assert.equal(await evaluate(page, `document.querySelector('header h1 + p')?.textContent.trim()`), 'Adversarial <smoke> & offline', 'custom --pages-subtitle renders escaped subtitle beneath navbar h1');
+  assert.equal(await evaluate(page, `document.querySelectorAll('header smoke').length`), 0, 'subtitle HTML is escaped rather than parsed');
+  assert.equal(await evaluate(page, `document.querySelectorAll('#heatmap-container p').length`), 0, 'heatmap placeholder paragraph cleared on init');
+  assert.equal(await evaluate(page, `document.getElementById('heatmap-container')?.textContent.includes('Expand to load heatmap') || false`), false, 'heatmap placeholder text removed');
+  assert.ok(await evaluate(page, `!!document.getElementById('heatmap-canvas')`), 'heatmap canvas mounted');
   assert.deepEqual(await evaluate(page, '[GRAPH_STATE.graph.nodeCount(), GRAPH_STATE.graph.edgeCount()]'), [4, 1]);
   assert.deepEqual(await evaluate(page, '[...GRAPH_STATE.nodeMap.keys()].sort()'), ['browser-closed', 'browser-detail', 'browser-other', 'browser-root'], 'isolated issues populate the actual WASM graph');
   await evaluate(page, `document.getElementById('priority-chart').scrollIntoView({block:'center'})`);
@@ -1223,6 +1230,18 @@ async function journey(page, mobile) {
   await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading && !!document.querySelector('#graph-container canvas')`, 'interactive graph rendered');
   const graphIDs = await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().nodes.map(n=>n.id).sort()`);
   assert.deepEqual(graphIDs, ['browser-closed', 'browser-detail', 'browser-other', 'browser-root']);
+  const acyclicMetrics = await evaluate(page, `(() => {
+    const m = ${app}.forceGraphModule, theme = m.THEME?.priority || {};
+    const nodes = Object.fromEntries(m.getGraph().graphData().nodes.map(n => [n.id, {slack: n.slack, hitsHub: n.hitsHub, hitsAuth: n.hitsAuth}]));
+    return { p0: theme[0], p1: theme[1], legacyP0: theme.p0, nodes };
+  })()`);
+  assert.equal(acyclicMetrics.p0, '#FF0000', 'THEME.priority[0] defined');
+  assert.equal(acyclicMetrics.p1, '#FF5555', 'THEME.priority[1] defined');
+  assert.equal(acyclicMetrics.legacyP0, undefined);
+  assert.equal(acyclicMetrics.nodes['browser-root'].slack, 0, 'critical-path prerequisite has zero slack');
+  assert.equal(acyclicMetrics.nodes['browser-detail'].slack, 0, 'critical-path dependent has zero slack');
+  assert.ok(acyclicMetrics.nodes['browser-other'].slack > 0 && acyclicMetrics.nodes['browser-closed'].slack > 0, 'isolated DAG issues receive positive WASM slack');
+  assert.ok(acyclicMetrics.nodes['browser-detail'].hitsHub > 0 && acyclicMetrics.nodes['browser-root'].hitsAuth > 0, 'directed WASM HITS hub/authority attached to force-graph nodes');
   // Click an actual force-graph node using its rendered graph-to-screen transform.
   await delay(1000);
   const point = await evaluate(page, `(() => { const g=${app}.forceGraphModule.getGraph(); const n=g.graphData().nodes.find(n=>n.id==='browser-root'); const p=g.graph2ScreenCoords(n.x,n.y); const r=document.querySelector('#graph-container canvas').getBoundingClientRect(); return {x:r.x+p.x,y:r.y+p.y}; })()`);
@@ -1248,6 +1267,244 @@ async function journey(page, mobile) {
   await capture(page, 'updated');
   clean(page);
   console.log(`ok: ${page.name} charts/search/filter/keyboard/detail/comments/copy/Mermaid/graph/offline/update`);
+}
+
+async function capabilitiesJourney(page) {
+  const readyCaps = `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total === 6 && ${app}.graphReady`;
+  await waitFor(page, readyCaps, 'six capability issues and actual graph WASM ready');
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'capabilities worker controls page');
+  await delay(500);
+  await waitFor(page, readyCaps, 'capabilities app ready after service worker activation');
+  const allCapIDs = ['cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b', 'cap-closed-prereq', 'cap-hub-leaf'];
+
+  // 1. Title & Subtitle escaping and navbar rendering.
+  assert.equal(await evaluate(page, 'document.title'), 'Capabilities <Title> & Gate');
+  assert.equal(await evaluate(page, `document.querySelector('header h1')?.textContent.trim()`), 'Capabilities <Title> & Gate');
+  assert.equal(await evaluate(page, `document.querySelector('header h1 + p')?.textContent.trim()`), 'Release <RC-C10> & Proof');
+  assert.equal(await evaluate(page, `document.querySelectorAll('header title, header rc-c10').length`), 0, 'escaped title/subtitle markup');
+
+  // 7. Heatmap placeholder cleared + Priority, Type, and Heatmap chart click-to-filter.
+  assert.equal(await evaluate(page, `document.querySelectorAll('#heatmap-container p').length`), 0, 'heatmap placeholder <p> removed');
+  assert.ok(await evaluate(page, `document.getElementById('heatmap-canvas')?.width > 0`), 'heatmap canvas painted');
+  await waitFor(page, `(${visible})(document.getElementById('priority-chart')) && Chart.getChart('priority-chart')?.width > 0`, 'visible priority chart');
+  const p0Point = await evaluate(page, `(() => {
+    const c = document.getElementById('priority-chart');
+    c.scrollIntoView({ block: 'center' });
+    const r = c.getBoundingClientRect();
+    const pos = Chart.getChart('priority-chart').getDatasetMeta(0).data[0].tooltipPosition();
+    return { x: r.left + pos.x, y: r.top + pos.y };
+  })()`);
+  await waitFor(page, `document.elementFromPoint(${p0Point.x}, ${p0Point.y}) === document.getElementById('priority-chart')`, 'uncovered priority chart slice');
+  for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...p0Point, button: 'left', clickCount: 1 }, page.session);
+  await waitFor(page, `${app}.view === 'issues' && JSON.stringify(${app}.filters.priority) === '[0]'`, 'priority chart click filters P0');
+  await resultIDs(page, ['cap-auth-root']);
+
+  await click(page, 'a[href="#/"]');
+  await waitFor(page, `${app}.view === 'dashboard' && (${visible})(document.getElementById('type-chart')) && Chart.getChart('type-chart')?.width > 0`, 'visible type chart on dashboard');
+  const bugBarPoint = await evaluate(page, `(() => {
+    const c = document.getElementById('type-chart');
+    c.scrollIntoView({ block: 'center' });
+    const chart = Chart.getChart('type-chart'), idx = chart.data.labels.indexOf('Bug');
+    const bar = chart.getDatasetMeta(0).data[idx], r = c.getBoundingClientRect();
+    return { x: r.left + (bar.base + bar.x) / 2, y: r.top + bar.y };
+  })()`);
+  await waitFor(page, `document.elementFromPoint(${bugBarPoint.x}, ${bugBarPoint.y}) === document.getElementById('type-chart')`, 'uncovered type chart bar');
+  for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...bugBarPoint, button: 'left', clickCount: 1 }, page.session);
+  await waitFor(page, `${app}.view === 'issues' && JSON.stringify(${app}.filters.type) === '["bug"]'`, 'type chart click filters bug');
+  await resultIDs(page, ['cap-auth-root']);
+
+  await click(page, 'a[href="#/"]');
+  await waitFor(page, `${app}.view === 'dashboard' && (${visible})(document.getElementById('heatmap-canvas')) && document.getElementById('heatmap-canvas')?.width > 0`, 'visible heatmap canvas');
+  const heatmapPoint = await evaluate(page, `(() => {
+    const c = document.getElementById('heatmap-canvas');
+    c.scrollIntoView({ block: 'center' });
+    const r = c.getBoundingClientRect();
+    // Sorted labels: ['backend','frontend','observability','ops','security'] -> cellSize=40, row=1 (frontend), col=0 (backend)
+    return { x: r.left + 100 + 20, y: r.top + 60 + 40 + 20 };
+  })()`);
+  await waitFor(page, `document.elementFromPoint(${heatmapPoint.x}, ${heatmapPoint.y}) === document.getElementById('heatmap-canvas')`, 'uncovered heatmap cell');
+  for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...heatmapPoint, button: 'left', clickCount: 1 }, page.session);
+  await waitFor(page, `${app}.view === 'issues' && JSON.stringify(${app}.filters.labels) === '["frontend","backend"]'`, 'heatmap click filters cross-dependent labels');
+  await resultIDs(page, ['cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-closed-prereq']);
+  await click(page, 'button', 'Clear all');
+  await resultIDs(page, allCapIDs);
+
+  // 6. Label filter <select> + clickable label chips on issue cards.
+  await evaluate(page, `(() => {
+    const sel = [...document.querySelectorAll('select[aria-label="Filter by label"]')].find(${visible});
+    sel.value = 'security';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await waitFor(page, `JSON.stringify(${app}.filters.labels) === '["security"]'`, 'label select filters security');
+  await resultIDs(page, ['cap-auth-root']);
+  await evaluate(page, `(() => {
+    const sel = [...document.querySelectorAll('select[aria-label="Filter by label"]')].find(${visible});
+    sel.value = '';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await waitFor(page, `${app}.filters.labels.length === 0`, 'label select All clears label filter');
+  await resultIDs(page, allCapIDs);
+
+  await click(page, 'span[title="Filter by label: observability"]', 'observability');
+  await waitFor(page, `JSON.stringify(${app}.filters.labels) === '["observability"]'`, 'label chip click applies filter');
+  assert.equal(await evaluate(page, `${app}.selectedIssue`), null, 'label chip @click.stop does not open issue modal');
+  await resultIDs(page, ['cap-hub-leaf']);
+  await click(page, 'span[title="Filter by label: observability"]', 'observability');
+  await waitFor(page, `${app}.filters.labels.length === 0`, 'clicking active label chip toggles off');
+  await resultIDs(page, allCapIDs);
+
+  // 8. Multi-word search tokenization + deterministic lexical scoring + normalized maxPageRank.
+  await search(page, 'gateway security');
+  await resultIDs(page, ['cap-auth-root']);
+  await search(page, 'OAuth alice');
+  await resultIDs(page, ['cap-auth-root']);
+  await evaluate(page, `(() => {
+    const sel = [...document.querySelectorAll('select[x-model="searchMode"]')].find(${visible});
+    sel.value = 'hybrid';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await search(page, 'OAuth login');
+  await waitFor(page, `${app}.issues.length === 3 && ${app}.issues.every(i => Number.isFinite(i.hybrid_score))`, 'multi-word hybrid search scored');
+  await resultIDs(page, ['cap-auth-root', 'cap-auth-ui', 'cap-closed-prereq']);
+  assert.equal(await evaluate(page, `${app}.searchBackend`), 'substring');
+  const hybridAudit = await evaluate(page, `(() => {
+    const rawRows = execQuery('SELECT issue_id, pagerank FROM issue_metrics');
+    const rawPR = Object.fromEntries(rawRows.map(r => [r.issue_id, r.pagerank]));
+    const maxRawPR = Math.max(...rawRows.map(r => r.pagerank));
+    const issues = ${app}.issues.map(i => ({ id: i.id, score: i.hybrid_score, text: i.text_score, components: i.component_scores }));
+    return JSON.parse(JSON.stringify({ maxRawPR, rawPR, issues }));
+  })()`);
+  assert.ok(hybridAudit.maxRawPR > 0 && hybridAudit.maxRawPR < 1.0, 'raw SQLite PageRank is < 1 prior to normalization');
+  const byID = Object.fromEntries(hybridAudit.issues.map(r => [r.id, r]));
+  assert.ok(byID['cap-auth-root'].text > byID['cap-auth-ui'].text && byID['cap-auth-ui'].text > 0 && byID['cap-auth-root'].text <= 1.0,
+    `lexical scorer ranks title token match above description-only match: ${JSON.stringify(byID)}`);
+  assert.ok(Math.abs(byID['cap-auth-root'].components.pagerank - 1.0) < 1e-12, 'top PageRank issue normalizes to 1.0');
+  for (const row of hybridAudit.issues) {
+    assert.ok(row.components.pagerank >= 0 && row.components.pagerank <= 1.0, 'normalized pagerank within [0, 1]');
+    assert.ok(Math.abs(row.components.pagerank - (hybridAudit.rawPR[row.id] / hybridAudit.maxRawPR)) < 1e-12, `pagerank normalized by maxPageRank for ${row.id}`);
+    const expected = .55 * row.text + .15 * row.components.pagerank + .1125 * row.components.status + .075 * row.components.impact + .075 * row.components.priority + .0375 * row.components.recency;
+    assert.ok(Math.abs(row.score - expected) < 1e-12, `hybrid linear combination exact for ${row.id}`);
+  }
+  await search(page, '');
+
+  // 4. Insights "Circular Dependencies" Cycle Navigator controls.
+  await click(page, 'a[href="#/insights"]');
+  await waitFor(page, `${app}.view === 'insights' && ${app}.cycleInfo?.hasCycles`, 'dependency cycles detected in Insights');
+  await click(page, 'button', 'Highlight Cycles');
+  await waitFor(page, `${app}.view === 'graph' && ${app}.forceGraphReady && !${app}.forceGraphLoading && ${app}.cycleNavigatorActive`, 'Highlight Cycles opens graph and activates navigator');
+  assert.equal(await evaluate(page, `${app}.totalCycles`), 2);
+  assert.equal(await evaluate(page, `${app}.currentCycleIdx`), 0);
+  assert.ok((await evaluate(page, `${app}.currentCyclePath`)).includes('→'), 'active cycle path rendered');
+
+  await click(page, 'a[href="#/insights"]');
+  await click(page, 'button[\\@click="nextCycleInGraph()"]');
+  await waitFor(page, `${app}.view === 'graph' && ${app}.currentCycleIdx === 1 && ${app}.forceGraphModule.getCycleNavigatorState().currentIndex === 1`, 'nextCycleInGraph selects cycle 2');
+
+  await click(page, 'a[href="#/insights"]');
+  await click(page, 'button[\\@click="prevCycleInGraph()"]');
+  await waitFor(page, `${app}.view === 'graph' && ${app}.currentCycleIdx === 0 && ${app}.forceGraphModule.getCycleNavigatorState().currentIndex === 0`, 'prevCycleInGraph returns to cycle 1');
+
+  await click(page, 'a[href="#/insights"]');
+  await click(page, 'button', 'Zoom to Cycle');
+  await waitFor(page, `${app}.view === 'graph' && ${app}.cycleNavigatorActive`, 'focusCycleInGraph navigates to graph with cycle focused');
+
+  await click(page, 'a[href="#/insights"]');
+  await click(page, 'button', 'Reset View');
+  await waitFor(page, `${app}.view === 'graph' && !${app}.cycleNavigatorActive && !${app}.forceGraphModule.getCycleNavigatorState().active`, 'Reset View clears cycle navigator');
+
+  // 2. Galaxy ('5') preset + viewModeChange sync, Time-Travel ('T') button + Space/T, and ArrowRight nodeSelect sync.
+  await click(page, 'button[title="Cluster by label (5)"]');
+  await waitFor(page, `${app}.currentPreset === 'galaxy' && ${app}.forceGraphModule.getLabelClusterState().active`, 'Galaxy button enables label galaxy');
+  await evaluate(page, 'document.activeElement?.blur?.()');
+  await key(page, '1', 'Digit1');
+  await waitFor(page, `${app}.currentPreset === 'force' && !${app}.forceGraphModule.getLabelClusterState().active`, 'Digit1 syncs toolbar preset back to force');
+  await key(page, '5', 'Digit5');
+  await waitFor(page, `${app}.currentPreset === 'galaxy' && ${app}.forceGraphModule.getLabelClusterState().active`, 'Digit5 syncs toolbar preset to galaxy');
+  await key(page, '1', 'Digit1');
+  await waitFor(page, `${app}.currentPreset === 'force'`, 'return to force mode');
+
+  await key(page, '?', 'Slash');
+  await waitFor(page, `${app}.showKeyboardHelp`, 'keyboard shortcuts modal opens');
+  const helpText = await evaluate(page, `document.body.innerText`);
+  assert.ok(helpText.includes('Label Galaxy') && helpText.includes('Time-travel history') && helpText.includes('Play / pause timeline'), 'updated 1-5, T, and Space shortcuts documented');
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.showKeyboardHelp`, 'Escape closes keyboard help');
+
+  await waitFor(page, `${app}.timeTravelAvailable`, 'exported git history enables Time Travel button');
+  await click(page, 'button[title="Time-travel history (T)"]');
+  await waitFor(page, `${app}.timeTravelActive && ${app}.forceGraphModule.getTimeTravelState().active && !!document.querySelector('#time-travel-controls')`, 'Time Travel toolbar button activates timeline');
+  assert.equal(await evaluate(page, `${app}.forceGraphModule.getTimeTravelState().totalCommits`), 2);
+  await evaluate(page, 'document.activeElement?.blur?.()');
+  await key(page, ' ', 'Space');
+  await waitFor(page, `(() => { const s = ${app}.forceGraphModule.getTimeTravelState(); return s.playing || s.currentIdx === 1; })()`, 'Space triggers timeline playback');
+  await key(page, 't', 'KeyT');
+  await waitFor(page, `!${app}.timeTravelActive && !${app}.forceGraphModule.getTimeTravelState().active && !document.querySelector('#time-travel-controls')?.classList.contains('active')`, 'T shortcut exits time-travel');
+
+  // 3. Force-graph WASM hitsHub/hitsAuth/slack + THEME.priority[0]/[1] heatmap urgency link painting.
+  await click(page, 'button[title="Toggle heatmap coloring (H)"]');
+  await waitFor(page, `${app}.graphHeatmapActive`, 'heatmap link urgency mode enabled');
+  const graphAudit = await evaluate(page, `(() => {
+    const m = ${app}.forceGraphModule, g = m.getGraph(), draw = g.linkCanvasObject();
+    const nodes = g.graphData().nodes.map(n => ({ id: n.id, slack: n.slack, hitsHub: n.hitsHub, hitsAuth: n.hitsAuth }));
+    const nonCycleLinks = g.graphData().links.filter(link => !(link.source.inCycle && link.target.inCycle));
+    const redLinks = nonCycleLinks.filter(link => {
+      const c = new OffscreenCanvas(256, 256), ctx = c.getContext('2d');
+      const a = link.source, b = link.target;
+      const scale = 180 / Math.max(Math.abs(b.x - a.x), Math.abs(b.y - a.y), 1);
+      ctx.setTransform(scale, 0, 0, scale, 128 - scale * (a.x + b.x) / 2, 128 - scale * (a.y + b.y) / 2);
+      draw(link, ctx, scale);
+      const px = ctx.getImageData(0, 0, 256, 256).data;
+      for (let i = 0; i < px.length; i += 4) {
+        if (px[i + 3] >= 40 && px[i] >= 245 && px[i + 1] <= 10 && px[i + 2] <= 10) return true;
+      }
+      return false;
+    }).length;
+    return { themeP0: m.THEME.priority[0], themeP1: m.THEME.priority[1], nodes, redLinks, nonCycleCount: nonCycleLinks.length };
+  })()`);
+  assert.equal(graphAudit.themeP0, '#FF0000');
+  assert.equal(graphAudit.themeP1, '#FF5555');
+  assert.ok(graphAudit.nodes.every(n => Number.isFinite(n.slack) && Number.isFinite(n.hitsHub) && Number.isFinite(n.hitsAuth)), 'every node carries finite slack, hitsHub, and hitsAuth');
+  assert.ok(graphAudit.nodes.some(n => n.hitsHub > 0) && graphAudit.nodes.some(n => n.hitsAuth > 0), 'positive HITS hub and authority scores attached');
+  assert.equal(graphAudit.nonCycleCount, 2);
+  assert.equal(graphAudit.redLinks, graphAudit.nonCycleCount, 'non-cycle zero-slack links paint THEME.priority[0] urgency red in heatmap mode');
+  await click(page, 'button[title="Toggle heatmap coloring (H)"]');
+
+  await evaluate(page, `${app}.graphDetailNode = null; ${app}.forceGraphModule.clearSelection(); document.activeElement?.blur?.()`);
+  await key(page, 'ArrowRight');
+  await waitFor(page, `${app}.graphDetailNode?.id === 'cap-auth-root'`, 'ArrowRight dispatches nodeSelect and updates graphDetailNode to P0 issue');
+  await key(page, 'ArrowRight');
+  await waitFor(page, `${app}.graphDetailNode && ${app}.graphDetailNode.id !== 'cap-auth-root' && ${app}.graphDetailNode.id === ${app}.forceGraphModule.getSelectedNode()?.id`, 'second ArrowRight advances graphDetailNode');
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.graphDetailNode`, 'Escape clears selected graph detail node');
+
+  // 5. Error Modal runErrorAction(action) recovery handler ({ action }, { handler }, { url }).
+  await evaluate(page, `(() => {
+    window.__errorRecovered = [];
+    window.__origOpen = window.open;
+    window.open = (url, target, features) => { window.__errorRecovered.push([url, target, features].join('|')); return null; };
+    showError({
+      title: 'Synthetic Recovery Check',
+      message: 'Verify runErrorAction supports action, handler, and url',
+      dismissible: true,
+      actions: [
+        { label: 'Action Recovery', primary: true, action: () => window.__errorRecovered.push('action') },
+        { label: 'Handler Recovery', handler: () => window.__errorRecovered.push('handler') },
+        { label: 'URL Recovery', url: './index.html#recovered' },
+      ],
+    });
+    ${app}.globalError = ERROR_STATE.error;
+  })()`);
+  await click(page, 'button', 'Action Recovery');
+  await click(page, 'button', 'Handler Recovery');
+  await click(page, 'button', 'URL Recovery');
+  await click(page, 'button', 'Dismiss');
+  await waitFor(page, `!${app}.globalError`, 'Dismiss closes error modal');
+  const recovered = await evaluate(page, `(() => { window.open = window.__origOpen; return window.__errorRecovered; })()`);
+  assert.deepEqual(recovered, ['action', 'handler', './index.html#recovered|_blank|noopener,noreferrer'], 'runErrorAction executes action, handler, and url recovery');
+
+  await capture(page, 'capabilities');
+  clean(page);
+  console.log(`PASS: ${page.name} title/subtitle, charts/heatmap, labels, multi-word lexical+PageRank hybrid search, cycle navigator, galaxy/time-travel/arrow-keys, HITS/slack/THEME.priority, and error recovery`);
 }
 try {
   const stderr = fs.createWriteStream(path.join(artifacts, 'chrome.stderr'));
@@ -1345,6 +1602,14 @@ try {
     await capture(project, 'boot');
     clean(project);
     console.log('ok: requested project export boot (known fixture journeys follow)');
+    activeBundle = bundle;
+  }
+  if (mode === 'journeys') {
+    assert.ok(capabilitiesBundle, 'capabilities fixture export required for viewer capability journeys');
+    activeBundle = capabilitiesBundle;
+    const caps = await openPage('capabilities');
+    await capabilitiesJourney(caps);
+    await send('Target.closeTarget', { targetId: caps.target });
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');

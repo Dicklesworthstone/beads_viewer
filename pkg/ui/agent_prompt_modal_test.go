@@ -1,9 +1,15 @@
 package ui
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/agents"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -241,5 +247,174 @@ func TestCenterModal(t *testing.T) {
 	// Should still contain the content
 	if !strings.Contains(centered, "Enhance AI Agent") {
 		t.Error("Centered modal should contain title")
+	}
+}
+
+func TestCheckAgentFileCmd_UpgradeAndNegativeControls(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	runCheck := func(t *testing.T, dir string) AgentFileCheckMsg {
+		t.Helper()
+		msg := CheckAgentFileCmd(dir)()
+		check, ok := msg.(AgentFileCheckMsg)
+		if !ok {
+			t.Fatalf("CheckAgentFileCmd returned %T, want AgentFileCheckMsg", msg)
+		}
+		return check
+	}
+
+	t.Run("missing blurb prompts fresh add", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("# Project Rules\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got := runCheck(t, dir)
+		if !got.ShouldPrompt || got.IsUpgrade {
+			t.Fatalf("got %+v, want ShouldPrompt=true IsUpgrade=false", got)
+		}
+	})
+
+	t.Run("outdated v3 blurb prompts upgrade even after prior v3 acceptance", func(t *testing.T) {
+		dir := t.TempDir()
+		oldDoc := "# Project Rules\n\n<!-- bv-agent-instructions-v3 -->\nOld v3 instructions\n<!-- end-bv-agent-instructions -->\n"
+		if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(oldDoc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := agents.SaveAgentPromptPreference(dir, agents.AgentPromptPreference{
+			BlurbVersionAdded: 3,
+			AddedAt:           time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		got := runCheck(t, dir)
+		if !got.ShouldPrompt || !got.IsUpgrade || got.ExistingVersion != 3 {
+			t.Fatalf("got %+v, want ShouldPrompt=true IsUpgrade=true ExistingVersion=3", got)
+		}
+	})
+
+	t.Run("current version blurb does not prompt", func(t *testing.T) {
+		dir := t.TempDir()
+		curDoc := "# Project Rules\n\n" + agents.AgentBlurb + "\n"
+		if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(curDoc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := runCheck(t, dir); got.ShouldPrompt {
+			t.Fatalf("current v%d blurb must not prompt, got %+v", agents.BlurbVersion, got)
+		}
+	})
+
+	t.Run("future blurb v99 negative control does not prompt", func(t *testing.T) {
+		dir := t.TempDir()
+		futureDoc := "# Project Rules\n\n<!-- bv-agent-instructions-v99 -->\nFuture instructions\n<!-- end-bv-agent-instructions -->\n"
+		if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(futureDoc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := runCheck(t, dir); got.ShouldPrompt {
+			t.Fatalf("future v99 blurb must never prompt for downgrade, got %+v", got)
+		}
+	})
+
+	t.Run("malformed blurb negative control does not prompt", func(t *testing.T) {
+		dir := t.TempDir()
+		malformedDoc := "# Project Rules\n\n<!-- bv-agent-instructions-v3 -->\nMissing closing marker\n"
+		if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte(malformedDoc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := runCheck(t, dir); got.ShouldPrompt {
+			t.Fatalf("malformed blurb must not auto-prompt, got %+v", got)
+		}
+	})
+}
+
+func TestModel_AgentUpgradePromptAcceptAndAsOfGuard(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	// 1. Verify upgrade modal rendering and in-place UpdateBlurbInFile on accept.
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(beadsPath, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	agentsPath := filepath.Join(dir, "AGENTS.md")
+	initialContent := "# Custom Header\n\n<!-- bv-agent-instructions-v3 -->\nOutdated v3 blurb\n<!-- end-bv-agent-instructions -->\n\n# Custom Footer\n"
+	if err := os.WriteFile(agentsPath, []byte(initialContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	issues := []model.Issue{{ID: "A-1", Title: "One", Status: model.StatusOpen, Priority: 1}}
+	mp := NewModel(issues, nil, beadsPath)
+	t.Cleanup(mp.Stop)
+	mp.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+
+	checkMsg := CheckAgentFileCmd(dir)()
+	updated, _ := mp.Update(checkMsg)
+	mp = updated.(*Model)
+	if !mp.showAgentPrompt || !mp.agentPromptModal.IsUpgrade() || mp.agentPromptModal.ExistingVersion() != 3 {
+		t.Fatalf("expected upgrade modal for v3, show=%v isUpgrade=%v ver=%d",
+			mp.showAgentPrompt, mp.agentPromptModal.IsUpgrade(), mp.agentPromptModal.ExistingVersion())
+	}
+
+	modalView := mp.agentPromptModal.View()
+	wantUpgradeText := fmt.Sprintf("v%d", agents.BlurbVersion)
+	if !strings.Contains(modalView, "Update AI Agent Instructions") ||
+		!strings.Contains(modalView, "v3") ||
+		!strings.Contains(modalView, wantUpgradeText) ||
+		!strings.Contains(modalView, "Yes, update it") {
+		t.Fatalf("upgrade modal view missing expected upgrade copy:\n%s", modalView)
+	}
+
+	// Accept via 'y' shortcut and verify in-place replacement to current BlurbVersion.
+	updated, _ = mp.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	mp = updated.(*Model)
+	if mp.showAgentPrompt {
+		t.Fatal("expected agent prompt modal to close after accepting")
+	}
+	afterBytes, err := os.ReadFile(agentsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterContent := string(afterBytes)
+	if !strings.Contains(afterContent, agents.BlurbStartMarker) ||
+		strings.Contains(afterContent, "bv-agent-instructions-v3") ||
+		!strings.Contains(afterContent, "# Custom Header") ||
+		!strings.Contains(afterContent, "# Custom Footer") {
+		t.Fatalf("expected in-place blurb upgrade preserving custom sections, got:\n%s", afterContent)
+	}
+
+	// 2. Negative control: historical --as-of mode (beadsPath == "") must NOT dispatch CheckAgentFileCmd from Init().
+	asOfDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(asOfDir, "AGENTS.md"), []byte("# Unmodified AGENTS.md\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	asOfModel := NewModel(issues, nil, "")
+	t.Cleanup(asOfModel.Stop)
+	asOfModel.SetWorkDir(asOfDir)
+
+	var collectMsgs func(tea.Cmd) []tea.Msg
+	collectMsgs = func(cmd tea.Cmd) []tea.Msg {
+		if cmd == nil {
+			return nil
+		}
+		msg := cmd()
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			var out []tea.Msg
+			for _, sub := range batch {
+				out = append(out, collectMsgs(sub)...)
+			}
+			return out
+		}
+		return []tea.Msg{msg}
+	}
+
+	for _, msg := range collectMsgs(asOfModel.Init()) {
+		if _, isAgentCheck := msg.(AgentFileCheckMsg); isAgentCheck {
+			t.Fatalf("read-only historical model (beadsPath == \"\") must not dispatch CheckAgentFileCmd, got %+v", msg)
+		}
 	}
 }

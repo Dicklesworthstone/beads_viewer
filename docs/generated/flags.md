@@ -29,6 +29,7 @@
 | `--pages` | bool | `false` | Launch interactive Pages deployment wizard | Export & Reporting |
 | `--pages-include-closed` | bool | `true` | Include closed issues in export (default: true) | Export & Reporting |
 | `--pages-include-history` | bool | `true` | Include git history for time-travel (default: true) | Export & Reporting |
+| `--pages-subtitle` | string | (empty) | Custom subtitle for static site | Export & Reporting |
 | `--pages-title` | string | (empty) | Custom title for static site | Export & Reporting |
 | `--preview-pages` | string | (empty) | Preview existing static site bundle | Export & Reporting |
 | `--priority-brief` | string | (empty) | Export priority brief to Markdown file (e.g., brief.md) | Export & Reporting |
@@ -133,6 +134,7 @@
 | `--robot-triage` | bool | `false` | Output unified triage as JSON (the mega-command for AI agents) | Robot & Planning Flags |
 | `--robot-triage-by-label` | bool | `false` | Group triage recommendations by label (bv-87) | Robot & Planning Flags |
 | `--robot-triage-by-track` | bool | `false` | Group triage recommendations by execution track (bv-87) | Robot & Planning Flags |
+| `--robot-whatif` | string | (empty) | Simulate completing issue ID and output downstream unblock impact as JSON | Robot & Planning Flags |
 | `--schema-command` | string | (empty) | Output schema for specific command only (e.g., robot-triage) | Robot & Planning Flags |
 | `--suggest-bead` | string | (empty) | Filter suggestions for specific bead ID | Robot & Planning Flags |
 | `--suggest-confidence` | float64 | `0` | Minimum confidence for suggestions (0.0-1.0) | Robot & Planning Flags |
