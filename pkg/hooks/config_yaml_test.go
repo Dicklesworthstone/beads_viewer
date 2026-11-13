@@ -198,6 +198,18 @@ hooks:
 			wantPostCount: 1,
 		},
 		{
+			name: "absorbs self-declared trusted field without granting trust",
+			yamlData: `
+trusted: true
+hooks:
+  pre-export:
+    - name: unreviewed
+      command: echo pre
+`,
+			wantPreCount:  1,
+			wantPostCount: 0,
+		},
+		{
 			name: "rejects unknown top-level key",
 			yamlData: `
 hookz:

@@ -43,6 +43,10 @@ type Hook struct {
 // Config holds all hook configurations
 type Config struct {
 	Hooks HooksByPhase `yaml:"hooks" json:"hooks"`
+	// IgnoredSelfTrust absorbs any self-declared `trusted:` key in project YAML
+	// without ever granting trust, so trust verification still runs and emits
+	// ErrUntrustedHooks guidance while KnownFields(true) rejects schema typos.
+	IgnoredSelfTrust any `yaml:"trusted,omitempty" json:"-"`
 
 	// Provenance belongs to the loader, never to project-controlled YAML.
 	projectDir string
@@ -275,6 +279,7 @@ func ParseConfig(data []byte) (Config, error) {
 		return Config{}, fmt.Errorf("line %d: multiple YAML documents are not supported", extra.Line)
 	}
 
+	config.IgnoredSelfTrust = nil
 	return config, nil
 }
 

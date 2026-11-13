@@ -128,21 +128,17 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			return reflect.DeepEqual(rows, []any{[]any{"MID"}})
 		}},
 		{"README.md", "bv --robot-priority | jq ", ".priority.recommendations[] | select(.confidence > 0.6)", func(rows []any) bool {
-			foundBridge := false
-			for _, entry := range rows {
-				row, ok := entry.(map[string]any)
-				if !ok {
-					return false
-				}
-				confidence, ok := row["confidence"].(float64)
-				if !ok || confidence <= 0.6 {
-					return false
-				}
-				if row["issue_id"] == "MID" {
-					foundBridge = true
-				}
+			// Default --robot-priority aligns with --robot-triage ready-leaf filtering:
+			// only actionable ROOT is recommended by default; blocked MID requires --robot-include-inactive.
+			if len(rows) != 1 {
+				return false
 			}
-			return foundBridge
+			row, ok := rows[0].(map[string]any)
+			if !ok {
+				return false
+			}
+			confidence, ok := row["confidence"].(float64)
+			return ok && confidence > 0.6 && row["issue_id"] == "ROOT"
 		}},
 		{"AGENTS.md", "bv --robot-triage | jq ", ".quick_ref", func(rows []any) bool {
 			row, ok := rows[0].(map[string]any)
@@ -251,6 +247,33 @@ func TestDocsParity_CopiedRobotQueriesReturnMeaningfulResults(t *testing.T) {
 			}
 		})
 	}
+	t.Run("robot_priority_include_inactive_retains_blocked_bridge", func(t *testing.T) {
+		cmd := exec.Command(bv, "--robot-priority", "--robot-include-inactive")
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "SOURCE_DATE_EPOCH=1788220800")
+		payload, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("--robot-priority --robot-include-inactive failed: %v\n%s", err, payload)
+		}
+		var parsed struct {
+			Recommendations []struct {
+				IssueID    string  `json:"issue_id"`
+				Confidence float64 `json:"confidence"`
+			} `json:"recommendations"`
+		}
+		if err := json.Unmarshal(payload, &parsed); err != nil {
+			t.Fatalf("unmarshal priority payload: %v\n%s", err, payload)
+		}
+		foundBridge := false
+		for _, rec := range parsed.Recommendations {
+			if rec.IssueID == "MID" && rec.Confidence > 0.6 {
+				foundBridge = true
+			}
+		}
+		if !foundBridge {
+			t.Fatalf("expected --robot-priority --robot-include-inactive to retain blocked bridge MID, got %+v", parsed.Recommendations)
+		}
+	})
 }
 
 func TestDocsParity_CopiedHistoryQueryPreservesUnits(t *testing.T) {

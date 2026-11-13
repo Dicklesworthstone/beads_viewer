@@ -287,7 +287,7 @@ func permuteIssuesAndDeps(rt *rapid.T, issues []model.Issue) []model.Issue {
 	return cloned
 }
 
-func analyzeUncached(issues []model.Issue, readiness *model.ReadinessIndex, candidateIDs map[string]bool) (*Analyzer, GraphStats) {
+func analyzeUncached(issues []model.Issue, readiness *model.ReadinessIndex, candidateIDs map[string]bool) (*Analyzer, *GraphStats) {
 	a := NewAnalyzer(issues)
 	a.SetNow(metamorphicFixedNow)
 	if readiness != nil || candidateIDs != nil {
@@ -297,7 +297,7 @@ func analyzeUncached(issues []model.Issue, readiness *model.ReadinessIndex, cand
 	cfg.DisableCache = true
 	statsPtr := a.AnalyzeAsyncWithConfig(context.Background(), cfg)
 	statsPtr.WaitForPhase2()
-	return a, *statsPtr
+	return a, statsPtr
 }
 
 func approxFloatMapEqual(a, b map[string]float64, tol float64) bool {
@@ -369,8 +369,8 @@ func checkMR1PermutationEquivalence(rt *rapid.T, mutantUnsortedTieBreak bool) {
 			fmt.Sprintf("planA=%+v planB=%+v", planA, planB), nil)
 	}
 
-	recsA := anA.GenerateRecommendationsFromStats(&statsA, DefaultThresholds())
-	recsB := anB.GenerateRecommendationsFromStats(&statsB, DefaultThresholds())
+	recsA := anA.GenerateRecommendationsFromStats(statsA, DefaultThresholds())
+	recsB := anB.GenerateRecommendationsFromStats(statsB, DefaultThresholds())
 	if !reflect.DeepEqual(recsA, recsB) {
 		failMetamorphic(rt, "MR-1", issues, nil, "GenerateRecommendationsFromStats permutation invariance",
 			fmt.Sprintf("recsA=%+v recsB=%+v", recsA, recsB), nil)
@@ -403,19 +403,19 @@ func checkMR1PermutationEquivalence(rt *rapid.T, mutantUnsortedTieBreak bool) {
 		}
 		return ids
 	}
-	ordA := rankImpactIDs(anA, &statsA, issues)
-	ordB := rankImpactIDs(anB, &statsB, permuted)
+	ordA := rankImpactIDs(anA, statsA, issues)
+	ordB := rankImpactIDs(anB, statsB, permuted)
 	if !reflect.DeepEqual(ordA, ordB) {
 		failMetamorphic(rt, "MR-1", issues, nil, "ImpactScore ranking IDs must be identical under input permutation",
 			fmt.Sprintf("ordA=%v ordB=%v", ordA, ordB), nil)
 	}
 
 	for _, actionableOnly := range []bool{true, false} {
-		trA := ComputeTriageFromAnalyzer(anA, &statsA, issues, TriageOptions{
+		trA := ComputeTriageFromAnalyzer(anA, statsA, issues, TriageOptions{
 			WaitForPhase2:  true,
 			ActionableOnly: actionableOnly,
 		}, metamorphicFixedNow)
-		trB := ComputeTriageFromAnalyzer(anB, &statsB, permuted, TriageOptions{
+		trB := ComputeTriageFromAnalyzer(anB, statsB, permuted, TriageOptions{
 			WaitForPhase2:  true,
 			ActionableOnly: actionableOnly,
 		}, metamorphicFixedNow)
@@ -467,7 +467,7 @@ func checkMR2ScopeContainmentAndNonPromotion(rt *rapid.T, mutantDropScopeAndRead
 	fullReadyLeaf := fullAn.CandidateIssueSet(SelectionReadyLeaf)
 
 	var scopedAn *Analyzer
-	var scopedStats GraphStats
+	var scopedStats *GraphStats
 	if mutantDropScopeAndReadiness {
 		// Mutant M2 (516e96aa defect): constructs the analyzer on the pre-sliced
 		// scoped subset alone without retaining full-graph ReadinessIndex or CandidateIDs,
@@ -499,14 +499,14 @@ func checkMR2ScopeContainmentAndNonPromotion(rt *rapid.T, mutantDropScopeAndRead
 
 	// 2. Priority & WhatIf Containment and Actionable-Default Readiness:
 	// Default includeInactive=false must satisfy IDs(EnhancedPriority(G, S)) ⊆ ReadyLeaf(G) ∩ S.
-	recs := scopedAn.GenerateRecommendationsFromStats(&scopedStats, DefaultThresholds())
+	recs := scopedAn.GenerateRecommendationsFromStats(scopedStats, DefaultThresholds())
 	for _, rec := range recs {
 		if !scope[rec.IssueID] {
 			failMetamorphic(rt, "MR-2", issues, scope, "IDs(GenerateRecommendations(G, S)) ⊆ S",
 				fmt.Sprintf("out-of-scope issue %s leaked into recommendations", rec.IssueID), nil)
 		}
 	}
-	enhanced := scopedAn.GenerateEnhancedRecommendationsFromStats(&scopedStats, DefaultThresholds(), 0, false)
+	enhanced := scopedAn.GenerateEnhancedRecommendationsFromStats(scopedStats, DefaultThresholds(), 0, false)
 	for _, rec := range enhanced {
 		if !scope[rec.IssueID] {
 			failMetamorphic(rt, "MR-2", issues, scope, "IDs(EnhancedPriority(G, S)) ⊆ S",
@@ -544,7 +544,7 @@ func checkMR2ScopeContainmentAndNonPromotion(rt *rapid.T, mutantDropScopeAndRead
 	}
 
 	// 4. Triage Containment & Non-Promotion + Compound (MR-1 ∘ MR-2) Permutation-under-Scope
-	triageScoped := ComputeTriageFromAnalyzer(scopedAn, &scopedStats, issues, TriageOptions{
+	triageScoped := ComputeTriageFromAnalyzer(scopedAn, scopedStats, issues, TriageOptions{
 		WaitForPhase2:  true,
 		ActionableOnly: true,
 		Readiness:      authority,
@@ -581,7 +581,7 @@ func checkMR2ScopeContainmentAndNonPromotion(rt *rapid.T, mutantDropScopeAndRead
 	// Compound check MR-1 ∘ MR-2: permuting G then scoping to S preserves scoped triage IDs.
 	permIssues := permuteIssuesAndDeps(rt, issues)
 	permAn, permStats := analyzeUncached(permIssues, model.NewReadinessIndex(permIssues), scope)
-	triagePerm := ComputeTriageFromAnalyzer(permAn, &permStats, permIssues, TriageOptions{
+	triagePerm := ComputeTriageFromAnalyzer(permAn, permStats, permIssues, TriageOptions{
 		WaitForPhase2:  true,
 		ActionableOnly: true,
 		Readiness:      permAn.Readiness(),
@@ -645,11 +645,11 @@ func checkMR3WorkScaleAndGrahamAndArchiveInvariance(rt *rapid.T, mutantRawVeloci
 		if iss.Status == model.StatusClosed {
 			continue
 		}
-		etaBase, err := EstimateETAForIssue(dag, &baseStats, iss.ID, agents, metamorphicFixedNow)
+		etaBase, err := EstimateETAForIssue(dag, baseStats, iss.ID, agents, metamorphicFixedNow)
 		if err != nil {
 			rt.Fatalf("EstimateETAForIssue base error: %v", err)
 		}
-		etaScaled, err := EstimateETAForIssue(scaled, &scaledStats, iss.ID, agents, metamorphicFixedNow)
+		etaScaled, err := EstimateETAForIssue(scaled, scaledStats, iss.ID, agents, metamorphicFixedNow)
 		if err != nil {
 			rt.Fatalf("EstimateETAForIssue scaled error: %v", err)
 		}
@@ -725,8 +725,8 @@ func checkMR3WorkScaleAndGrahamAndArchiveInvariance(rt *rapid.T, mutantRawVeloci
 		}
 		return est.EstimatedDays
 	}
-	daysSimple := evalETADays(gSimple, &statsSimple, gSimple[0].ID)
-	daysComplex := evalETADays(gComplex, &statsComplex, gComplex[0].ID)
+	daysSimple := evalETADays(gSimple, statsSimple, gSimple[0].ID)
+	daysComplex := evalETADays(gComplex, statsComplex, gComplex[0].ID)
 	if math.Abs(daysComplex-daysSimple)/math.Max(daysSimple, 1e-9) > 0.01 {
 		failMetamorphic(rt, "MR-3/ComplexityEquivariance", gComplex, nil,
 			"ETA_days(G_complex) == ETA_days(G_simple) under uniform open+closed complexity multiplier",
@@ -742,9 +742,9 @@ func checkMR3WorkScaleAndGrahamAndArchiveInvariance(rt *rapid.T, mutantRawVeloci
 	}
 	m1 := rapid.IntRange(1, 15).Draw(rt, "graham_m1")
 	m2 := rapid.IntRange(m1+1, 16).Draw(rt, "graham_m2")
-	gb1 := ComputeGrahamBounds(openDAG, dag, &baseStats, 1, metamorphicFixedNow)
-	gbm1 := ComputeGrahamBounds(openDAG, dag, &baseStats, m1, metamorphicFixedNow)
-	gbm2 := ComputeGrahamBounds(openDAG, dag, &baseStats, m2, metamorphicFixedNow)
+	gb1 := ComputeGrahamBounds(openDAG, dag, baseStats, 1, metamorphicFixedNow)
+	gbm1 := ComputeGrahamBounds(openDAG, dag, baseStats, m1, metamorphicFixedNow)
+	gbm2 := ComputeGrahamBounds(openDAG, dag, baseStats, m2, metamorphicFixedNow)
 
 	if gb1.TotalMinutes >= gb1.CriticalPathMinutes {
 		if math.Abs(gb1.GrahamMinMinutes-float64(gb1.TotalMinutes)) > 1e-9 ||
@@ -820,8 +820,8 @@ func checkMR3WorkScaleAndGrahamAndArchiveInvariance(rt *rapid.T, mutantRawVeloci
 		return scores
 	}
 
-	scoresActive := evalImpactScores(anActive, &statsActive)
-	scoresArchived := evalImpactScores(anArchived, &statsArchived)
+	scoresActive := evalImpactScores(anActive, statsActive)
+	scoresArchived := evalImpactScores(anArchived, statsArchived)
 	if len(scoresActive) != len(scoresArchived) {
 		failMetamorphic(rt, "MR-3/ClosedArchive", withArchive, nil, "Active score count unchanged by closed archive",
 			fmt.Sprintf("lenActive=%d lenArchived=%d", len(scoresActive), len(scoresArchived)), nil)
@@ -841,8 +841,8 @@ func checkMR3WorkScaleAndGrahamAndArchiveInvariance(rt *rapid.T, mutantRawVeloci
 		}
 	}
 
-	recsActive := anActive.GenerateRecommendationsFromStats(&statsActive, DefaultThresholds())
-	recsArchived := anArchived.GenerateRecommendationsFromStats(&statsArchived, DefaultThresholds())
+	recsActive := anActive.GenerateRecommendationsFromStats(statsActive, DefaultThresholds())
+	recsArchived := anArchived.GenerateRecommendationsFromStats(statsArchived, DefaultThresholds())
 	activeSuggested := make(map[string]int, len(recsActive))
 	for _, rec := range recsActive {
 		activeSuggested[rec.IssueID] = rec.SuggestedPriority
@@ -923,7 +923,7 @@ func checkMR4StatusPartitionConservation(rt *rapid.T, mutantDeferredInBlocked bo
 	}
 
 	plan := an.GetExecutionPlan()
-	triage := ComputeTriageFromAnalyzer(an, &stats, loaded, TriageOptions{
+	triage := ComputeTriageFromAnalyzer(an, stats, loaded, TriageOptions{
 		WaitForPhase2:  true,
 		ActionableOnly: true,
 		Readiness:      authority,
@@ -1110,11 +1110,15 @@ func (c *captureRapidTB) Skip(a ...any)             { c.logs = append(c.logs, fm
 func (c *captureRapidTB) SkipNow()                  {}
 func (c *captureRapidTB) Errorf(f string, a ...any) { c.failed = true; c.Logf(f, a...) }
 func (c *captureRapidTB) Error(a ...any)            { c.failed = true; c.Log(a...) }
-func (c *captureRapidTB) Fatalf(f string, a ...any) { c.failed = true; c.Logf(f, a...); panic(stopMutantRun{}) }
-func (c *captureRapidTB) Fatal(a ...any)            { c.failed = true; c.Log(a...); panic(stopMutantRun{}) }
-func (c *captureRapidTB) FailNow()                  { c.failed = true; panic(stopMutantRun{}) }
-func (c *captureRapidTB) Fail()                     { c.failed = true }
-func (c *captureRapidTB) Failed() bool              { return c.failed }
+func (c *captureRapidTB) Fatalf(f string, a ...any) {
+	c.failed = true
+	c.Logf(f, a...)
+	panic(stopMutantRun{})
+}
+func (c *captureRapidTB) Fatal(a ...any) { c.failed = true; c.Log(a...); panic(stopMutantRun{}) }
+func (c *captureRapidTB) FailNow()       { c.failed = true; panic(stopMutantRun{}) }
+func (c *captureRapidTB) Fail()          { c.failed = true }
+func (c *captureRapidTB) Failed() bool   { return c.failed }
 
 func expectMutantKilled(t *testing.T, mutantName string, prop func(*rapid.T)) {
 	t.Helper()

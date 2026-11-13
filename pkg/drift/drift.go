@@ -1016,6 +1016,7 @@ func (c *Calculator) checkPotentialDuplicate(result *Result) {
 		return
 	}
 	cfg := analysis.DefaultDuplicateConfig()
+	cfg.IgnoreLinked = true
 	if c.config.DuplicateJaccardThreshold > 0 {
 		cfg.JaccardThreshold = c.config.DuplicateJaccardThreshold
 	}

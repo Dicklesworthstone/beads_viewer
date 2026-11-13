@@ -121,7 +121,7 @@ type MetricStatus struct {
 
 // statusEntry records computation state for a single metric.
 type statusEntry struct {
-	State   string        `json:"state"`            // computed|approx|timeout|skipped
+	State   string        `json:"state"`            // computed|timeout|skipped (approx recorded via Reason="approximate" + Sample)
 	Reason  string        `json:"reason,omitempty"` // explanation when skipped/timeout/approx
 	Sample  int           `json:"sample,omitempty"` // sample size when approximate
 	Elapsed time.Duration `json:"-"`                // serialized in ms via MarshalJSON
@@ -1330,6 +1330,12 @@ type Analyzer struct {
 
 	dataHashOnce sync.Once
 	dataHash     string
+
+	activeMetricsMu    sync.Mutex
+	activeMetricsStats *GraphStats
+	activeBW           map[string]float64
+	activeCore         map[string]int
+	activeArt          []string
 }
 
 // SetReadinessScope separates dependency authority and candidate eligibility
@@ -1536,6 +1542,18 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 	if a == nil || stats == nil {
 		return nil, nil, nil
 	}
+	if a.g == nil {
+		return stats.Betweenness(), stats.CoreNumber(), stats.ArticulationPoints()
+	}
+
+	a.activeMetricsMu.Lock()
+	if a.activeMetricsStats == stats {
+		bwCached, coreCached, artCached := a.activeBW, a.activeCore, a.activeArt
+		a.activeMetricsMu.Unlock()
+		return bwCached, coreCached, artCached
+	}
+	a.activeMetricsMu.Unlock()
+
 	activeIDs := make([]string, 0, len(a.issueMap))
 	hasClosed := false
 	for id, issue := range a.issueMap {
@@ -1559,38 +1577,56 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 		idToSub[id] = int64(i)
 	}
 	edgeCount := 0
-	if a.g != nil {
-		edges := a.g.Edges()
-		for edges.Next() {
-			edge := edges.Edge()
-			fromID := a.nodeToID[edge.From().ID()]
-			toID := a.nodeToID[edge.To().ID()]
-			u, okU := idToSub[fromID]
-			v, okV := idToSub[toID]
-			if !okU || !okV || u == v {
-				continue
-			}
-			sub.addEdge(u, v)
-			edgeCount++
+	edges := a.g.Edges()
+	for edges.Next() {
+		edge := edges.Edge()
+		fromID := a.nodeToID[edge.From().ID()]
+		toID := a.nodeToID[edge.To().ID()]
+		u, okU := idToSub[fromID]
+		v, okV := idToSub[toID]
+		if !okU || !okV || u == v {
+			continue
 		}
+		sub.addEdge(u, v)
+		edgeCount++
 	}
 
 	status := stats.Status()
 	bwOut := make(map[string]float64, len(activeIDs))
-	if status.Betweenness.State != "skipped" {
+	if status.Betweenness.State != "skipped" && status.Betweenness.State != "timeout" {
 		for _, id := range activeIDs {
 			bwOut[id] = 0
 		}
 		if edgeCount > 0 && len(activeIDs) > 1 {
 			subCfg := ConfigForSize(len(activeIDs), edgeCount)
-			if subCfg.BetweennessMode == BetweennessApproximate && subCfg.BetweennessSampleSize > 0 && status.Betweenness.State == "approx" {
-				res := approxBetweennessDeterministic(sub, subCfg.BetweennessSampleSize, 1)
+			switch {
+			case stats.Config.BetweennessMode == BetweennessSkip || subCfg.BetweennessMode == BetweennessSkip || !subCfg.ComputeBetweenness:
+				// Dense/skipped tier: retain zeroed betweenness without running O(VE) Brandes.
+			case subCfg.BetweennessMode == BetweennessApproximate ||
+				(stats.Config.BetweennessMode == BetweennessApproximate && stats.Config.BetweennessSampleSize > 0 && len(activeIDs) >= 500):
+				sampleSize := subCfg.BetweennessSampleSize
+				if stats.Config.BetweennessMode == BetweennessApproximate && stats.Config.BetweennessSampleSize > 0 &&
+					(sampleSize == 0 || stats.Config.BetweennessSampleSize < sampleSize) {
+					sampleSize = stats.Config.BetweennessSampleSize
+				}
+				if sampleSize <= 0 && status.Betweenness.Sample > 0 {
+					sampleSize = status.Betweenness.Sample
+				}
+				if sampleSize <= 0 {
+					sampleSize = 100
+				}
+				var res BetweennessResult
+				if stats.Config.RunToCompletion {
+					res = approxBetweennessDeterministic(sub, sampleSize, 1)
+				} else {
+					res = ApproxBetweenness(sub, sampleSize, 1)
+				}
 				for subNode, val := range res.Scores {
 					if subNode >= 0 && int(subNode) < len(activeIDs) {
 						bwOut[activeIDs[subNode]] = val
 					}
 				}
-			} else if subCfg.ComputeBetweenness {
+			default:
 				rawBW := network.Betweenness(sub)
 				for subNode, val := range rawBW {
 					if subNode >= 0 && int(subNode) < len(activeIDs) {
@@ -1625,6 +1661,13 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 			sort.Strings(artOut)
 		}
 	}
+
+	a.activeMetricsMu.Lock()
+	a.activeMetricsStats = stats
+	a.activeBW = bwOut
+	a.activeCore = coreOut
+	a.activeArt = artOut
+	a.activeMetricsMu.Unlock()
 
 	return bwOut, coreOut, artOut
 }

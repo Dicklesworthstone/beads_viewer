@@ -51,6 +51,12 @@ type DuplicateConfig struct {
 	// Default: true
 	IgnoreClosedVsOpen bool
 
+	// IgnoreLinked skips pairs already connected by an explicit dependency edge
+	// (used by drift/hygiene alerting so already-triaged related/blocking pairs
+	// do not re-alert; when false, DetectDuplicates retains the analytical
+	// duplicate finding while withholding redundant MutationRelate actions).
+	IgnoreLinked bool
+
 	// MaxSuggestions limits the number of duplicate suggestions
 	// Default: 20
 	MaxSuggestions int
@@ -214,9 +220,10 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 				}
 			}
 
-			// Skip pairs already explicitly linked in the dependency graph
-			// (blocks, parent-child, related, discovered-from, etc.).
-			if issuesHaveDependencyLink(issue1, issue2) {
+			// Skip pairs already explicitly linked when IgnoreLinked is enabled
+			// (e.g. drift/hygiene alerting). Otherwise retain the analytical
+			// potential_duplicate entry and suppress redundant MutationRelate below.
+			if config.IgnoreLinked && issuesHaveDependencyLink(issue1, issue2) {
 				continue
 			}
 
@@ -260,9 +267,17 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 			pair.Similarity,
 		).WithRelatedBead(pair.Issue2).WithMetadata("method", pair.Method)
 
-		// Add action command if both are open
+		// Add action command if both are open and not already linked
 		if !isClosedLikeDuplicateStatus(issue1.Status) && !isClosedLikeDuplicateStatus(issue2.Status) {
-			sug = sug.withMutationAction(*issue1, model.MutationRelate, issue2, "")
+			if issuesHaveDependencyLink(issue1, issue2) {
+				if _, reason := issue1.MutationAction(model.MutationRelate, issue2, ""); reason != "" {
+					sug = sug.WithMetadata("action_unavailable_reason", reason)
+				} else {
+					sug = sug.WithMetadata("action_unavailable_reason", "issues are already linked in the dependency graph")
+				}
+			} else {
+				sug = sug.withMutationAction(*issue1, model.MutationRelate, issue2, "")
+			}
 		}
 
 		suggestions = append(suggestions, sug)

@@ -882,6 +882,25 @@ func TestDetectDuplicates_SkipsExplicitlyLinkedIssues(t *testing.T) {
 		model.DepParentChild,
 		model.DepDiscoveredFrom,
 	}
+	assertLinkedBehavior := func(t *testing.T, depType model.DependencyType, issues []model.Issue) {
+		t.Helper()
+		// 1. Default suggest mode (IgnoreLinked=false) retains the analytical
+		// duplicate finding while withholding redundant MutationRelate actions.
+		got := DetectDuplicates(issues, DefaultDuplicateConfig())
+		if len(got) != 1 {
+			t.Fatalf("DetectDuplicates(default) returned %d suggestions for %s-linked pair, want 1: %+v", len(got), depType, got)
+		}
+		if got[0].Action != nil || got[0].ActionCommand != "" || got[0].Metadata["action_unavailable_reason"] == nil {
+			t.Fatalf("DetectDuplicates(default) emitted executable action for %s-linked pair: %+v", depType, got[0])
+		}
+
+		// 2. Drift/hygiene alert mode (IgnoreLinked=true) skips already-linked pairs completely.
+		alertCfg := DefaultDuplicateConfig()
+		alertCfg.IgnoreLinked = true
+		if gotIgnored := DetectDuplicates(issues, alertCfg); len(gotIgnored) != 0 {
+			t.Fatalf("DetectDuplicates(IgnoreLinked=true) returned %d suggestions for %s-linked pair, want 0: %+v", len(gotIgnored), depType, gotIgnored)
+		}
+	}
 	for _, depType := range depTypes {
 		t.Run(string(depType)+"_forward", func(t *testing.T) {
 			issues := []model.Issue{
@@ -901,9 +920,7 @@ func TestDetectDuplicates_SkipsExplicitlyLinkedIssues(t *testing.T) {
 					Status:      model.StatusOpen,
 				},
 			}
-			if got := DetectDuplicates(issues, DefaultDuplicateConfig()); len(got) != 0 {
-				t.Fatalf("DetectDuplicates returned %d suggestions for %s-linked pair, want 0: %+v", len(got), depType, got)
-			}
+			assertLinkedBehavior(t, depType, issues)
 		})
 		t.Run(string(depType)+"_reverse", func(t *testing.T) {
 			issues := []model.Issue{
@@ -923,9 +940,7 @@ func TestDetectDuplicates_SkipsExplicitlyLinkedIssues(t *testing.T) {
 					},
 				},
 			}
-			if got := DetectDuplicates(issues, DefaultDuplicateConfig()); len(got) != 0 {
-				t.Fatalf("DetectDuplicates returned %d suggestions for reverse %s-linked pair, want 0: %+v", len(got), depType, got)
-			}
+			assertLinkedBehavior(t, depType, issues)
 		})
 	}
 }

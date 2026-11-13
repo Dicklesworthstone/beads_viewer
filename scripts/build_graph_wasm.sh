@@ -113,7 +113,12 @@ if source['inputs']['bv-graph-wasm/Cargo.lock'] != manifest['graph_wasm'].get('c
 PY
 fi
 
-mkdir -p "$out/source/bv-graph-wasm" "$out/cargo" "$out/pkg" "$out/bindgen"
+mkdir -p "$out/source/bv-graph-wasm/.rch" "$out/cargo" "$out/pkg" "$out/bindgen"
+cat >"$out/source/bv-graph-wasm/.rch/config.toml" <<'TOML'
+[general]
+force_local = true
+force_remote = false
+TOML
 cp "$crate/Cargo.toml" "$crate/Cargo.lock" "$crate/rust-toolchain.toml" "$out/source/bv-graph-wasm/"
 cp -R "$crate/src" "$out/source/bv-graph-wasm/src"
 cargo_cache="${CARGO_HOME:-$HOME/.cargo}"
@@ -138,7 +143,6 @@ echo '== cargo build (locked, offline, default features, isolated local compiler
   env -i HOME="$HOME" PATH="$PATH" LC_ALL=C \
     RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="$out/cargo" \
     CARGO_TARGET_DIR="$out/target" CARGO_HTTP_USER_AGENT='beads_viewer-build (+https://github.com/Dicklesworthstone/beads_viewer)' \
-    RCH_CARGO_WRAPPER_BYPASS=1 \
     CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=$out=/bv-build"$'\x1f'"--remap-path-prefix=$cargo_cache=/cargo"$'\x1f'"--remap-path-prefix=$rust_sysroot=/rust-toolchain"$'\x1f'"--remap-path-prefix=$resolved_sysroot=/rust-toolchain" \
     "$rustup" run "$toolchain" cargo build --locked --offline --release --target "$target" -j 2
 ) 2>&1 | tee "$out/cargo.log"

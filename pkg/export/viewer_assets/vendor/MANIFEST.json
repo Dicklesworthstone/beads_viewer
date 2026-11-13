@@ -1,9 +1,9 @@
 {
   "_comment": "Provenance of every vendored viewer asset. scripts/verify_vendor.sh and pkg/export/vendor_manifest_test.go recompute the sha256 of each file and fail on any mismatch or unlisted file. A version of \"unknown\" means the artifact carries no version marker; the hash still pins the exact bytes shipped. Update this file (hash, version, date, reviewed_by) whenever an asset is replaced.",
-  "reviewed_by": "library-updater 2026-09-12; pipeline TMPDIR confinement refresh 2026-11-12 (bv_graph.js and bv_graph_bg.wasm bytes unchanged)",
+  "reviewed_by": "library-updater 2026-09-12; pipeline TMPDIR confinement + rch force_local refresh 2026-11-12 (bv_graph.js and bv_graph_bg.wasm bytes unchanged)",
   "date": "2026-11-12",
   "graph_wasm": {
-    "source_sha256": "cd07dff83e510a7dc33f37eb03723183d0f42a8711b6f54f3e6abd89f78b5ab1",
+    "source_sha256": "c2b5e7cfe3532bbf042dfad9beb227f8d374061877fc4924ec3b94790bcde321",
     "cargo_lock_sha256": "dfe6b9df8c27da85d65a3bebd14931130e57c11653d1b39f0a507e0923df7cf7",
     "pipeline": {
       "bindgen_executable_sha256": "dc9e4f1e03996c26fb8bfedfded73d81120a37251c3f19eb87bb460f1f89a5be",

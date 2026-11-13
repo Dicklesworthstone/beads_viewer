@@ -113,11 +113,12 @@ func TestEmitScript_WithRobotTriageAndContainerEpicFiltering(t *testing.T) {
 
 // TestEmitScript_FiveSurfaceReadinessEquivalenceAndReadmeExamples (bv-apal.24)
 // proves that default invocations of all 5 recommendation surfaces:
-//   1. --robot-triage
-//   2. --emit-script
-//   3. --agent-brief (<dir>/triage.json + <dir>/brief.md)
-//   4. --priority-brief (<file>)
-//   5. --export-pages (<dir>/data/triage.json)
+//  1. --robot-triage
+//  2. --emit-script
+//  3. --agent-brief (<dir>/triage.json + <dir>/brief.md)
+//  4. --priority-brief (<file>)
+//  5. --export-pages (<dir>/data/triage.json)
+//
 // emit the exact same actionable leaf recommendation IDs on a mixed fixture
 // (ready leaves, container epic + blocked child, childless open epic, blocked
 // task, future-deferred task), that --robot-include-inactive surfaces the

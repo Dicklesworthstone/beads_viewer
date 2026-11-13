@@ -103,7 +103,7 @@ every reported vulnerability has an exploitable execution path in bv.
 ### Post-516e96aa reality-check gap closure (2026-11-12)
 
 - **Robot CLI contract, `--robot-drift`, and environment confinement**
-  (`bv-apal.28`, `bv-apal.29`): derive primary robot flag sets and TTY query
+  (`bv-apal.21`, `bv-apal.22`): derive primary robot flag sets and TTY query
   suppression directly from `RobotRegistry`; validate all 42 registered primary
   robot commands live against `--robot-schema` (fixing `null` slices in
   `CompareSnapshots` and `FindRelatedWorkAt`); register `--robot-drift` and
@@ -135,7 +135,7 @@ every reported vulnerability has an exploitable execution path in bv.
   verify dry-run updater `checksums.txt` digests and stage binaries in
   `binaryDir`; and treat `EPERM` same-host PIDs as alive in `pkg/instance`.
 - **Actionable centrality, unbiased ETA/Graham bounds, status conservation, and
-  metamorphic proofs** (`bv-apal.21`, `bv-apal.22`, `bv-apal.32`,
+  metamorphic proofs** (`bv-apal.28`, `bv-apal.29`, `bv-apal.32`,
   `bv-apal.33`): share `CandidateIssueSet` readiness across `--robot-priority`,
   `--robot-plan`, and `--robot-whatif`; compute active non-closed centrality
   normalization and `--robot-insights` bottlenecks/articulation/k-core; align
