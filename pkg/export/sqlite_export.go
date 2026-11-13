@@ -54,6 +54,13 @@ func NewSQLiteExporter(issues []*model.Issue, deps []*model.Dependency, metricsO
 	switch v := metricsOrStats.(type) {
 	case map[string]*model.IssueMetrics:
 		exp.Metrics = v
+	case map[string]model.IssueMetrics:
+		m := make(map[string]*model.IssueMetrics, len(v))
+		for k, val := range v {
+			valCopy := val
+			m[k] = &valCopy
+		}
+		exp.Metrics = m
 	case *analysis.GraphStats:
 		exp.Stats = v
 	case nil:
@@ -398,8 +405,8 @@ func (e *SQLiteExporter) insertComments(db *sql.DB) error {
 
 // insertMetrics inserts computed graph metrics for all issues.
 func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
-	if e.Stats == nil {
-		return nil // No stats available
+	if e.Stats == nil && len(e.Metrics) == 0 {
+		return nil // No stats or precomputed metrics available
 	}
 
 	tx, err := db.Begin()
@@ -471,23 +478,94 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 		}
 	}
 
-	// Get metrics maps from stats
-	pageRankMap := e.Stats.PageRank()
-	betweennessMap := e.Stats.Betweenness()
-	criticalPathMap := e.Stats.CriticalPathScore()
+	if e.Stats != nil {
+		// Get metrics maps from stats
+		pageRankMap := e.Stats.PageRank()
+		betweennessMap := e.Stats.Betweenness()
+		criticalPathMap := e.Stats.CriticalPathScore()
 
-	for _, issue := range e.Issues {
-		id := issue.ID
-		pr := pageRankMap[id]
-		bw := betweennessMap[id]
-		cp := int(criticalPathMap[id])
-		score := triageScores[id]
-		blocks := blocksCount[id]
-		blockedBy := blockedByCount[id]
+		for _, issue := range e.Issues {
+			if issue == nil {
+				continue
+			}
+			id := issue.ID
+			pr := pageRankMap[id]
+			bw := betweennessMap[id]
+			cp := int(criticalPathMap[id])
+			score := triageScores[id]
+			blocks := blocksCount[id]
+			blockedBy := blockedByCount[id]
 
-		_, err := stmt.Exec(id, pr, bw, cp, score, blocks, blockedBy)
-		if err != nil {
-			return fmt.Errorf("insert metrics for %s: %w", id, err)
+			_, err := stmt.Exec(id, pr, bw, cp, score, blocks, blockedBy)
+			if err != nil {
+				return fmt.Errorf("insert metrics for %s: %w", id, err)
+			}
+		}
+	} else {
+		// Insert explicit e.Metrics rows when e.Stats == nil
+		inserted := make(map[string]struct{}, len(e.Issues))
+		for _, issue := range e.Issues {
+			if issue == nil {
+				continue
+			}
+			id := issue.ID
+			inserted[id] = struct{}{}
+			var pr, bw float64
+			var cp int
+			score := triageScores[id]
+			blocks := blocksCount[id]
+			blockedBy := blockedByCount[id]
+			if m := e.Metrics[id]; m != nil {
+				pr = m.PageRank
+				bw = m.Betweenness
+				cp = m.CriticalPathDepth
+				if m.TriageScore != 0 {
+					score = m.TriageScore
+				}
+				if m.BlocksCount != 0 {
+					blocks = m.BlocksCount
+				}
+				if m.BlockedByCount != 0 {
+					blockedBy = m.BlockedByCount
+				}
+			}
+
+			_, err := stmt.Exec(id, pr, bw, cp, score, blocks, blockedBy)
+			if err != nil {
+				return fmt.Errorf("insert metrics for %s: %w", id, err)
+			}
+		}
+
+		if len(e.Issues) == 0 {
+			ids := make([]string, 0, len(e.Metrics))
+			for id := range e.Metrics {
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			for _, id := range ids {
+				if _, seen := inserted[id]; seen {
+					continue
+				}
+				m := e.Metrics[id]
+				if m == nil {
+					continue
+				}
+				score := m.TriageScore
+				if score == 0 {
+					score = triageScores[id]
+				}
+				blocks := m.BlocksCount
+				if blocks == 0 {
+					blocks = blocksCount[id]
+				}
+				blockedBy := m.BlockedByCount
+				if blockedBy == 0 {
+					blockedBy = blockedByCount[id]
+				}
+				if _, err := stmt.Exec(id, m.PageRank, m.Betweenness, m.CriticalPathDepth, score, blocks, blockedBy); err != nil {
+					return fmt.Errorf("insert metrics for %s: %w", id, err)
+				}
+			}
 		}
 	}
 
