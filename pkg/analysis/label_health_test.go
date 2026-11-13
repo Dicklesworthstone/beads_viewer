@@ -1,7 +1,9 @@
 package analysis
 
 import (
+	"encoding/json"
 	"fmt"
+	"math/rand"
 	"strings"
 	"testing"
 	"time"
@@ -2593,5 +2595,95 @@ func TestBlockageCascadeAnalysis_GetMostImpactfulCascade(t *testing.T) {
 	}
 	if cascade.SourceLabel != "high" {
 		t.Errorf("Expected 'high' label, got %s", cascade.SourceLabel)
+	}
+}
+
+func TestComputeBlockageCascadeAt_DependencyBlockedAndPermutationInvariant(t *testing.T) {
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultLabelHealthConfig()
+
+	baseIssues := []model.Issue{
+		{
+			ID:        "bv-root-a",
+			Title:     "Root A",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Labels:    []string{"platform", "infra"},
+		},
+		{
+			ID:        "bv-root-b",
+			Title:     "Root B",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Labels:    []string{"infra", "platform"},
+		},
+		{
+			ID:        "bv-db-1",
+			Title:     "Open but dependency-blocked DB task",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Labels:    []string{"db"},
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-db-1", DependsOnID: "bv-root-b", Type: model.DepBlocks},
+				{IssueID: "bv-db-1", DependsOnID: "bv-root-a", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "bv-api-1",
+			Title:     "API waiting on DB",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Labels:    []string{"api"},
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-api-1", DependsOnID: "bv-db-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "bv-ui-1",
+			Title:     "UI waiting on API",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Labels:    []string{"ui"},
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-ui-1", DependsOnID: "bv-api-1", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	flow := ComputeCrossLabelFlow(baseIssues, cfg)
+	canonical := ComputeBlockageCascadeAt(baseIssues, flow, cfg, now)
+	if canonical.TotalBlocked != 3 {
+		t.Fatalf("expected 3 dependency-blocked open issues (db, api, ui), got %d", canonical.TotalBlocked)
+	}
+	if canonical.CriticalChain == nil || len(canonical.CriticalChain) < 3 {
+		t.Fatalf("expected non-empty CriticalChain >= 3 labels, got %#v", canonical.CriticalChain)
+	}
+	if len(canonical.TopUnblocks) == 0 {
+		t.Fatalf("expected TopUnblocks recommendations for open dependency blockers, got empty")
+	}
+	canonicalJSON, err := json.Marshal(canonical)
+	if err != nil {
+		t.Fatalf("marshal canonical cascade: %v", err)
+	}
+
+	rng := rand.New(rand.NewSource(42))
+	for iter := 0; iter < 25; iter++ {
+		perm := make([]model.Issue, len(baseIssues))
+		copy(perm, baseIssues)
+		rng.Shuffle(len(perm), func(i, j int) { perm[i], perm[j] = perm[j], perm[i] })
+		for idx := range perm {
+			labels := append([]string(nil), perm[idx].Labels...)
+			rng.Shuffle(len(labels), func(i, j int) { labels[i], labels[j] = labels[j], labels[i] })
+			perm[idx].Labels = labels
+		}
+		permFlow := ComputeCrossLabelFlow(perm, cfg)
+		got := ComputeBlockageCascadeAt(perm, permFlow, cfg, now)
+		gotJSON, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("marshal permuted cascade: %v", err)
+		}
+		if string(gotJSON) != string(canonicalJSON) {
+			t.Fatalf("permutation %d drifted:\ngot:  %s\nwant: %s", iter, gotJSON, canonicalJSON)
+		}
 	}
 }

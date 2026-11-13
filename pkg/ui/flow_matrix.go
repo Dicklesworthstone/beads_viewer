@@ -15,6 +15,7 @@ import (
 // showing how labels block each other with visual impact indicators
 type FlowMatrixModel struct {
 	flow         *analysis.CrossLabelFlow
+	cascade      analysis.BlockageCascadeAnalysis
 	issues       []model.Issue
 	labelStats   []labelFlowStats
 	cursor       int
@@ -105,6 +106,7 @@ func (m *FlowMatrixModel) SetSize(width, height int) {
 func (m *FlowMatrixModel) computeStats() {
 	if m.flow == nil || len(m.flow.Labels) == 0 {
 		m.labelStats = nil
+		m.cascade = analysis.BlockageCascadeAnalysis{}
 		return
 	}
 
@@ -183,6 +185,7 @@ func (m *FlowMatrixModel) computeStats() {
 	})
 
 	m.labelStats = stats
+	m.cascade = analysis.ComputeBlockageCascade(m.issues, *m.flow, analysis.DefaultLabelHealthConfig())
 }
 
 // Update handles keyboard input
@@ -689,6 +692,18 @@ func (m FlowMatrixModel) renderDetailPanel(width int) string {
 	}
 
 	b.WriteString("\n")
+
+	if cascade := m.cascade.GetCascadeForLabel(stat.Label); cascade != nil && (cascade.BlockedCount > 0 || cascade.TotalImpact > 0) {
+		b.WriteString(summaryStyle.Render("TRANSITIVE CASCADE"))
+		b.WriteString("\n")
+		b.WriteString(fmt.Sprintf("  Blocked in %s: %d  │  Downstream waiting: %d (%d levels)\n",
+			stat.Label, cascade.BlockedCount, cascade.TotalImpact, len(cascade.CascadeLevels)))
+		if len(cascade.Recommendations) > 0 {
+			top := cascade.Recommendations[0]
+			b.WriteString(fmt.Sprintf("  Top unblock: %s (unblocks %d)\n", top.IssueID, top.UnblocksCount))
+		}
+		b.WriteString("\n")
+	}
 
 	// Hint
 	hintStyle := m.theme.Renderer.NewStyle().Foreground(m.theme.Subtext).Italic(true)

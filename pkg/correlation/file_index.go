@@ -3,7 +3,7 @@ package correlation
 
 import (
 	"fmt"
-	"path/filepath"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -248,6 +248,7 @@ func (fl *FileLookup) LookupByFile(path string) *FileBeadLookupResult {
 
 // LookupByFileGlob finds beads for files matching a glob pattern.
 func (fl *FileLookup) LookupByFileGlob(pattern string) *FileBeadLookupResult {
+	normalizedPattern := normalizePath(pattern)
 	result := &FileBeadLookupResult{
 		FilePath:    pattern,
 		OpenBeads:   []BeadReference{},
@@ -258,7 +259,7 @@ func (fl *FileLookup) LookupByFileGlob(pattern string) *FileBeadLookupResult {
 	closedRefs := make(map[string]BeadReference)
 
 	for filePath, refs := range fl.index.FileToBeads {
-		matched, err := filepath.Match(pattern, filePath)
+		matched, err := path.Match(normalizedPattern, filePath)
 		if err != nil || !matched {
 			continue
 		}

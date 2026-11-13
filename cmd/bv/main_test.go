@@ -2374,7 +2374,7 @@ func TestRobotLabelSchemasMatchHandlerOutputs(t *testing.T) {
 	}
 
 	flowProps := requireRobotSchemaProperties(t, schemas, "robot-label-flow")
-	for _, name := range []string{"flow", "analysis_config", "usage_hints"} {
+	for _, name := range []string{"flow", "blockage_cascade", "analysis_config", "usage_hints"} {
 		if flowProps[name] == nil {
 			t.Fatalf("robot-label-flow schema missing top-level property %q", name)
 		}

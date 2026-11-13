@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -2088,21 +2089,26 @@ func handleRobotLabelHealth(ctx RobotContext) error {
 }
 
 func handleRobotLabelFlow(ctx RobotContext) error {
+	now := robotNow()
 	cfg := analysis.DefaultLabelHealthConfig()
 	flow := analysis.ComputeCrossLabelFlow(ctx.Issues, cfg)
+	cascade := analysis.ComputeBlockageCascadeAt(ctx.Issues, flow, cfg, now)
 	output := struct {
 		RobotEnvelope
-		Flow       analysis.CrossLabelFlow    `json:"flow"`
-		Config     analysis.LabelHealthConfig `json:"analysis_config"`
-		UsageHints []string                   `json:"usage_hints"`
+		Flow            analysis.CrossLabelFlow          `json:"flow"`
+		BlockageCascade analysis.BlockageCascadeAnalysis `json:"blockage_cascade"`
+		Config          analysis.LabelHealthConfig       `json:"analysis_config"`
+		UsageHints      []string                         `json:"usage_hints"`
 	}{
-		RobotEnvelope: ctx.Envelope(),
-		Flow:          flow,
-		Config:        cfg,
+		RobotEnvelope:   ctx.Envelope(),
+		Flow:            flow,
+		BlockageCascade: cascade,
+		Config:          cfg,
 		UsageHints: []string{
 			"jq '.flow.bottleneck_labels' - labels blocking the most others",
 			"jq '.flow.dependencies[] | select(.issue_count > 0) | {from:.from_label,to:.to_label,count:.issue_count}'",
 			"jq '.flow.flow_matrix' - raw matrix (row=from, col=to, align with .flow.labels)",
+			"jq '.blockage_cascade.top_unblocks' - highest-leverage blockers to clear across downstream labels",
 		},
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -3498,6 +3504,15 @@ func handleRobotFileBeads(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 		return fmt.Errorf("robot file beads flag not configured")
 	}
 
+	query := *cfg.RobotFileBeadsFlag
+	isGlob := strings.ContainsAny(query, "*?[")
+	if isGlob {
+		normalizedGlob := strings.TrimPrefix(strings.ReplaceAll(query, "\\", "/"), "./")
+		if _, err := path.Match(normalizedGlob, ""); err != nil {
+			return fmt.Errorf("invalid file glob %q: %w", query, err)
+		}
+	}
+
 	workDir, err := ctx.WorkDirOrDefault()
 	if err != nil {
 		return fmt.Errorf("getting current directory: %w", err)
@@ -3513,7 +3528,12 @@ func handleRobotFileBeads(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 	}
 
 	fileLookup := correlation.NewFileLookup(report)
-	result := fileLookup.LookupByFile(*cfg.RobotFileBeadsFlag)
+	var result *correlation.FileBeadLookupResult
+	if isGlob {
+		result = fileLookup.LookupByFileGlob(query)
+	} else {
+		result = fileLookup.LookupByFile(query)
+	}
 	closedLimit := 20
 	if cfg.FileBeadsLimit != nil {
 		closedLimit = *cfg.FileBeadsLimit
@@ -3871,7 +3891,7 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 
 	totalMinutes := 0
 	for _, issue := range openIssues {
-		eta, err := analysis.EstimateETAForIssue(targetIssues, &graphStats, issue.ID, 1, now)
+		eta, err := analysis.EstimateETAForIssue(ctx.Issues, &graphStats, issue.ID, 1, now)
 		if err == nil {
 			totalMinutes += eta.EstimatedMinutes
 		}
@@ -3908,7 +3928,7 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 
 	serialMinutes := 0
 	for _, id := range longestChain {
-		eta, err := analysis.EstimateETAForIssue(targetIssues, &graphStats, id, 1, now)
+		eta, err := analysis.EstimateETAForIssue(ctx.Issues, &graphStats, id, 1, now)
 		if err == nil {
 			serialMinutes += eta.EstimatedMinutes
 		}

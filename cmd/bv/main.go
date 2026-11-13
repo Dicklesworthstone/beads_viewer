@@ -1545,7 +1545,7 @@ func main() {
 	robotOrphans := flag.Bool("robot-orphans", false, "Output orphan commit candidates (commits that should be linked but aren't) as JSON")
 	orphansMinScore := flag.Int("orphans-min-score", 30, "Minimum suspicion score for orphan candidates (0-100)")
 	// File-bead index flags (bv-hmib)
-	robotFileBeads := flag.String("robot-file-beads", "", "Output beads that touched a file path as JSON")
+	robotFileBeads := flag.String("robot-file-beads", "", "Output beads that touched a file path, directory prefix, or glob pattern as JSON")
 	fileBeadsLimit := flag.Int("file-beads-limit", 20, "Max closed beads to show (use with --robot-file-beads)")
 	fileHotspots := flag.Bool("robot-file-hotspots", false, "Output files touched by most beads as JSON")
 	hotspotsLimit := flag.Int("hotspots-limit", 10, "Max hotspots to show (use with --robot-file-hotspots)")
@@ -7829,7 +7829,8 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		},
 		"robot-label-flow": {
 			Flag:        "--robot-label-flow",
-			Description: "Cross-label dependency flow analysis.",
+			Description: "Cross-label dependency flow and transitive blockage cascade analysis.",
+			KeyFields:   []string{"flow", "blockage_cascade", "analysis_config", "usage_hints"},
 			NeedsIssues: true,
 		},
 		"robot-label-attention": {
@@ -7856,7 +7857,7 @@ func robotCommandDocs() map[string]robotCommandDoc {
 			NeedsGit:    true,
 		},
 		"robot-file-beads": {
-			Flag: "--robot-file-beads <path>", Description: "Beads that touched a specific file path.",
+			Flag: "--robot-file-beads <path>", Description: "Beads that touched a specific file path, directory prefix, or glob pattern.",
 			KeyFields:   []string{"file_path", "total_beads", "open_beads", "closed_beads"},
 			Params:      []string{"--file-beads-limit <n>"},
 			NeedsIssues: true,
@@ -8895,16 +8896,17 @@ func generateRobotSchemas() RobotSchemas {
 		"robot-label-flow": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
 			"title":       "Robot Label Flow Output",
-			"description": "Cross-label dependency flow analysis with analysis config and usage hints",
+			"description": "Cross-label dependency flow and transitive blockage cascade analysis with analysis config and usage hints",
 			"type":        "object",
 			"properties": map[string]interface{}{
-				"generated_at":    map[string]interface{}{"type": "string", "format": "date-time"},
-				"data_hash":       map[string]interface{}{"type": "string"},
-				"flow":            crossLabelFlowSchema(),
-				"analysis_config": labelHealthConfigSchema(),
-				"usage_hints":     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+				"generated_at":     map[string]interface{}{"type": "string", "format": "date-time"},
+				"data_hash":        map[string]interface{}{"type": "string"},
+				"flow":             crossLabelFlowSchema(),
+				"blockage_cascade": blockageCascadeSchema(),
+				"analysis_config":  labelHealthConfigSchema(),
+				"usage_hints":      map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			},
-			"required": []string{"generated_at", "data_hash", "flow", "analysis_config", "usage_hints"},
+			"required": []string{"generated_at", "data_hash", "flow", "blockage_cascade", "analysis_config", "usage_hints"},
 		},
 		"robot-label-attention": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
@@ -9227,6 +9229,46 @@ func crossLabelFlowSchema() map[string]interface{} {
 			"total_cross_label_deps": map[string]interface{}{"type": "integer"},
 		},
 		"required": []string{"labels", "flow_matrix", "dependencies", "critical_paths", "bottleneck_labels", "total_cross_label_deps"},
+	}
+}
+
+func blockageCascadeSchema() map[string]interface{} {
+	unblockRec := map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"issue_id":       map[string]interface{}{"type": "string"},
+			"issue_title":    map[string]interface{}{"type": "string"},
+			"label":          map[string]interface{}{"type": "string"},
+			"unblocks_count": map[string]interface{}{"type": "integer"},
+			"cascade_depth":  map[string]interface{}{"type": "integer"},
+			"reason":         map[string]interface{}{"type": "string"},
+		},
+		"required": []string{"issue_id", "label", "unblocks_count", "cascade_depth", "reason"},
+	}
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
+			"total_blocked": map[string]interface{}{"type": "integer"},
+			"cascades": map[string]interface{}{
+				"type": "array",
+				"items": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"source_label":    map[string]interface{}{"type": "string"},
+						"blocked_count":   map[string]interface{}{"type": "integer"},
+						"cascade_levels":  map[string]interface{}{"type": "array"},
+						"total_impact":    map[string]interface{}{"type": "integer"},
+						"affected_labels": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						"recommendations": map[string]interface{}{"type": "array", "items": unblockRec},
+					},
+					"required": []string{"source_label", "blocked_count", "cascade_levels", "total_impact", "affected_labels", "recommendations"},
+				},
+			},
+			"top_unblocks":   map[string]interface{}{"type": "array", "items": unblockRec},
+			"critical_chain": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+		},
+		"required": []string{"generated_at", "total_blocked", "cascades", "top_unblocks", "critical_chain"},
 	}
 }
 

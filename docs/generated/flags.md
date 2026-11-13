@@ -101,7 +101,7 @@
 | `--robot-docs` | string | (empty) | Machine-readable JSON docs for AI agents. Topics: guide, commands, examples, env, exit-codes, all | Robot & Planning Flags |
 | `--robot-drift` | bool | `false` | Output drift check as JSON (use with --check-drift) | Robot & Planning Flags |
 | `--robot-explain-correlation` | string | (empty) | Explain why a commit is linked to a bead (format: SHA:beadID) | Robot & Planning Flags |
-| `--robot-file-beads` | string | (empty) | Output beads that touched a file path as JSON | Robot & Planning Flags |
+| `--robot-file-beads` | string | (empty) | Output beads that touched a file path, directory prefix, or glob pattern as JSON | Robot & Planning Flags |
 | `--robot-file-hotspots` | bool | `false` | Output files touched by most beads as JSON | Robot & Planning Flags |
 | `--robot-file-relations` | string | (empty) | Output files that frequently co-change with the given file path | Robot & Planning Flags |
 | `--robot-forecast` | string | (empty) | Output ETA forecast for bead ID, or 'all' for all open issues | Robot & Planning Flags |

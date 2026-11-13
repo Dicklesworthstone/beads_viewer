@@ -1049,10 +1049,21 @@ func ComputeBlockedByLabel(issues []model.Issue, analyzer *Analyzer) map[string]
 // For each label with blocked issues, it shows which other labels are waiting (transitively).
 // Example output: database(4 blocked) -> backend: 3 waiting -> testing: 2 waiting
 func ComputeBlockageCascade(issues []model.Issue, flow CrossLabelFlow, cfg LabelHealthConfig) BlockageCascadeAnalysis {
+	return ComputeBlockageCascadeAt(issues, flow, cfg, time.Now())
+}
+
+// ComputeBlockageCascadeAt computes the transitive downstream blockage cascade at a deterministic
+// reference timestamp, counting both explicit status="blocked" issues and open/in-progress issues
+// blocked by unsatisfied dependencies in model.ReadinessIndex.
+func ComputeBlockageCascadeAt(issues []model.Issue, flow CrossLabelFlow, cfg LabelHealthConfig, now time.Time) BlockageCascadeAnalysis {
+	if now.IsZero() {
+		now = time.Now()
+	}
 	result := BlockageCascadeAnalysis{
-		GeneratedAt: time.Now(),
-		Cascades:    []BlockageCascadeResult{},
-		TopUnblocks: []UnblockRecommendation{},
+		GeneratedAt:   now,
+		Cascades:      []BlockageCascadeResult{},
+		TopUnblocks:   []UnblockRecommendation{},
+		CriticalChain: []string{},
 	}
 
 	if len(flow.Labels) == 0 {
@@ -1065,17 +1076,29 @@ func ComputeBlockageCascade(issues []model.Issue, flow CrossLabelFlow, cfg Label
 		labelIndex[label] = i
 	}
 
-	// Build issue map and count blocked per label
+	readiness := model.NewReadinessIndex(issues)
+
+	// Build issue map and count blocked per label using the canonical partition predicate.
 	issueMap := make(map[string]model.Issue, len(issues))
 	blockedByLabel := make(map[string][]model.Issue)
-	blockedIssueIDs := make(map[string]bool) // Track unique blocked issues
+	blockedIssueIDs := make(map[string]bool)
 	for _, iss := range issues {
 		issueMap[iss.ID] = iss
-		if iss.Status == model.StatusBlocked {
-			blockedIssueIDs[iss.ID] = true // Count each blocked issue once
-			for _, label := range iss.Labels {
-				blockedByLabel[label] = append(blockedByLabel[label], iss)
+		if isClosedLikeStatus(iss.Status) || readiness.Ready(iss.ID, now) {
+			continue
+		}
+		isBlocked := iss.Status == model.StatusBlocked || (isActionableStatus(iss.Status) && !iss.IsDeferredAt(now))
+		if !isBlocked || blockedIssueIDs[iss.ID] {
+			continue
+		}
+		blockedIssueIDs[iss.ID] = true
+		seenLabel := make(map[string]bool, len(iss.Labels))
+		for _, label := range iss.Labels {
+			if label == "" || seenLabel[label] {
+				continue
 			}
+			seenLabel[label] = true
+			blockedByLabel[label] = append(blockedByLabel[label], iss)
 		}
 	}
 
@@ -1083,26 +1106,35 @@ func ComputeBlockageCascade(issues []model.Issue, flow CrossLabelFlow, cfg Label
 	result.TotalBlocked = len(blockedIssueIDs)
 
 	// For each label with blocked issues, compute cascade
-	var allCascades []BlockageCascadeResult
+	allCascades := make([]BlockageCascadeResult, 0, len(blockedByLabel))
 	for sourceLabel, blockedIssues := range blockedByLabel {
 		if len(blockedIssues) == 0 {
 			continue
 		}
+		sort.Slice(blockedIssues, func(i, j int) bool {
+			return blockedIssues[i].ID < blockedIssues[j].ID
+		})
 
-		cascade := computeSingleCascade(sourceLabel, blockedIssues, flow, labelIndex, issueMap)
+		cascade := computeSingleCascade(sourceLabel, blockedIssues, flow, labelIndex, issueMap, readiness)
 		if cascade.TotalImpact > 0 || cascade.BlockedCount > 0 {
 			allCascades = append(allCascades, cascade)
 		}
 	}
 
-	// Sort cascades by total impact (highest first)
+	// Sort cascades by total impact (highest first), then blocked count, then label name.
 	sort.Slice(allCascades, func(i, j int) bool {
-		return allCascades[i].TotalImpact > allCascades[j].TotalImpact
+		if allCascades[i].TotalImpact != allCascades[j].TotalImpact {
+			return allCascades[i].TotalImpact > allCascades[j].TotalImpact
+		}
+		if allCascades[i].BlockedCount != allCascades[j].BlockedCount {
+			return allCascades[i].BlockedCount > allCascades[j].BlockedCount
+		}
+		return allCascades[i].SourceLabel < allCascades[j].SourceLabel
 	})
 	result.Cascades = allCascades
 
-	// Collect all recommendations and sort by unblock count
-	var allRecs []UnblockRecommendation
+	// Collect all recommendations and sort deterministically.
+	allRecs := make([]UnblockRecommendation, 0)
 	for _, cascade := range allCascades {
 		allRecs = append(allRecs, cascade.Recommendations...)
 	}
@@ -1110,7 +1142,13 @@ func ComputeBlockageCascade(issues []model.Issue, flow CrossLabelFlow, cfg Label
 		if allRecs[i].UnblocksCount != allRecs[j].UnblocksCount {
 			return allRecs[i].UnblocksCount > allRecs[j].UnblocksCount
 		}
-		return allRecs[i].CascadeDepth > allRecs[j].CascadeDepth
+		if allRecs[i].CascadeDepth != allRecs[j].CascadeDepth {
+			return allRecs[i].CascadeDepth > allRecs[j].CascadeDepth
+		}
+		if allRecs[i].IssueID != allRecs[j].IssueID {
+			return allRecs[i].IssueID < allRecs[j].IssueID
+		}
+		return allRecs[i].Label < allRecs[j].Label
 	})
 
 	// Take top 10 recommendations
@@ -1120,7 +1158,7 @@ func ComputeBlockageCascade(issues []model.Issue, flow CrossLabelFlow, cfg Label
 	result.TopUnblocks = allRecs
 
 	// Find critical chain (longest cascade)
-	var longestChain []string
+	longestChain := []string{}
 	for _, cascade := range allCascades {
 		chain := []string{cascade.SourceLabel}
 		for _, level := range cascade.CascadeLevels {
@@ -1138,7 +1176,7 @@ func ComputeBlockageCascade(issues []model.Issue, flow CrossLabelFlow, cfg Label
 }
 
 // computeSingleCascade computes the cascade for a single source label
-func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow CrossLabelFlow, labelIndex map[string]int, issueMap map[string]model.Issue) BlockageCascadeResult {
+func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow CrossLabelFlow, labelIndex map[string]int, issueMap map[string]model.Issue, readiness *model.ReadinessIndex) BlockageCascadeResult {
 	result := BlockageCascadeResult{
 		SourceLabel:     sourceLabel,
 		BlockedCount:    len(blockedIssues),
@@ -1149,6 +1187,17 @@ func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow 
 
 	if _, ok := labelIndex[sourceLabel]; !ok {
 		return result
+	}
+
+	// Validate matrix dimensions before indexing
+	n := len(flow.Labels)
+	if len(flow.FlowMatrix) < n {
+		return result
+	}
+	for i := 0; i < n; i++ {
+		if len(flow.FlowMatrix[i]) < n {
+			return result
+		}
 	}
 
 	// BFS to find transitive downstream labels
@@ -1204,9 +1253,12 @@ func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow 
 		}
 
 		if len(levelEntries) > 0 {
-			// Sort entries by waiting count (highest first)
+			// Sort entries by waiting count (highest first), then label name.
 			sort.Slice(levelEntries, func(i, j int) bool {
-				return levelEntries[i].WaitingCount > levelEntries[j].WaitingCount
+				if levelEntries[i].WaitingCount != levelEntries[j].WaitingCount {
+					return levelEntries[i].WaitingCount > levelEntries[j].WaitingCount
+				}
+				return levelEntries[i].Label < levelEntries[j].Label
 			})
 
 			result.CascadeLevels = append(result.CascadeLevels, CascadeLevel{
@@ -1217,6 +1269,7 @@ func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow 
 			totalImpact += levelTotal
 		}
 
+		sort.Strings(nextLevel)
 		currentLevel = nextLevel
 	}
 
@@ -1231,11 +1284,9 @@ func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow 
 	// Generate recommendations - find blockers that would unblock the most
 	blockerImpact := make(map[string]int) // issueID -> transitive unblock count
 	for _, blockedIssue := range blockedIssues {
-		for _, dep := range blockedIssue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
-				continue
-			}
-			blocker, exists := issueMap[dep.DependsOnID]
+		blockerIDs := readiness.Blockers(blockedIssue.ID)
+		for _, blockerID := range blockerIDs {
+			blocker, exists := issueMap[blockerID]
 			if !exists || isClosedLikeStatus(blocker.Status) {
 				continue
 			}
@@ -1245,17 +1296,20 @@ func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow 
 		}
 	}
 
-	// Sort blockers by impact
+	// Sort blockers by impact (highest first), then ID.
 	type blockerRec struct {
 		id     string
 		impact int
 	}
-	var blockers []blockerRec
+	blockers := make([]blockerRec, 0, len(blockerImpact))
 	for id, impact := range blockerImpact {
 		blockers = append(blockers, blockerRec{id: id, impact: impact})
 	}
 	sort.Slice(blockers, func(i, j int) bool {
-		return blockers[i].impact > blockers[j].impact
+		if blockers[i].impact != blockers[j].impact {
+			return blockers[i].impact > blockers[j].impact
+		}
+		return blockers[i].id < blockers[j].id
 	})
 
 	// Take top 5 recommendations for this cascade
@@ -1266,7 +1320,14 @@ func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow 
 		iss := issueMap[b.id]
 		label := sourceLabel
 		if len(iss.Labels) > 0 {
-			label = iss.Labels[0]
+			sortedLabels := append([]string(nil), iss.Labels...)
+			sort.Strings(sortedLabels)
+			for _, candidate := range sortedLabels {
+				if candidate != "" {
+					label = candidate
+					break
+				}
+			}
 		}
 		result.Recommendations = append(result.Recommendations, UnblockRecommendation{
 			IssueID:       b.id,
