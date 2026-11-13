@@ -182,18 +182,23 @@ func (m AttentionModel) View() string {
 		width = 40
 	}
 	colWidths := attentionColumnWidths(width)
+	selectedWidth := width - m.theme.Selected.GetHorizontalFrameSize()
+	if selectedWidth < 40 {
+		selectedWidth = 40
+	}
+	selectedColWidths := attentionColumnWidths(selectedWidth)
 
-	renderRow := func(cells []string) string {
+	renderRowWithWidths := func(widths []int, cells []string) string {
 		parts := make([]string, 0, len(cells))
 		for i, c := range cells {
-			c = truncate(c, colWidths[i])
-			parts = append(parts, padRight(c, colWidths[i]))
+			c = truncate(c, widths[i])
+			parts = append(parts, padRight(c, widths[i]))
 		}
 		return strings.Join(parts, " | ")
 	}
 
 	var b strings.Builder
-	b.WriteString(renderRow([]string{"Rank", "Label", "Attention", "Reason"}))
+	b.WriteString(renderRowWithWidths(colWidths, []string{"Rank", "Label", "Attention", "Reason"}))
 	b.WriteString("\n")
 
 	rows := m.height - 1
@@ -210,7 +215,11 @@ func (m AttentionModel) View() string {
 	}
 	for i := start; i < end; i++ {
 		s := m.labels[i]
-		line := renderRow([]string{
+		rowWidths := colWidths
+		if i == m.cursor {
+			rowWidths = selectedColWidths
+		}
+		line := renderRowWithWidths(rowWidths, []string{
 			fmt.Sprintf("%d", i+1),
 			s.Label,
 			fmt.Sprintf("%.2f", s.AttentionScore),
