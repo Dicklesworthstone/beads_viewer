@@ -618,10 +618,23 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		}
 	}
 
+	beadsDir := b.resolvedBeadsDir()
+	var feedbackWeights *analysis.Weights
+	if !b.explicitWeights && beadsDir != "" {
+		if fw := feedbackWeightsForBeadsDir(beadsDir); fw != nil {
+			b.analyzer.SetWeights(*fw)
+			feedbackWeights = fw
+		}
+	}
+
 	var recipeTriage map[string]float64
 	var triageResult analysis.TriageResult
 	if b.cfg.PrecomputeTriage || (b.recipe != nil && b.recipe.NeedsTriageScores()) {
-		triageResult = analysis.ComputeTriageFromAnalyzer(b.analyzer, graphStats, issues, analysis.TriageOptions{}, now)
+		opts := analysis.TriageOptions{}
+		if feedbackWeights != nil {
+			opts.Weights = feedbackWeights
+		}
+		triageResult = analysis.ComputeTriageFromAnalyzer(b.analyzer, graphStats, issues, opts, now)
 		recipeTriage = make(map[string]float64, len(triageResult.Recommendations))
 		for _, rec := range triageResult.Recommendations {
 			recipeTriage[rec.ID] = rec.Score
@@ -731,7 +744,8 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	}
 	semanticIDs, semanticDocs := buildSnapshotSearchDocuments(listItems, b.prevSnapshot, b.diff)
 
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlerts(issues, graphStats, b.analyzer)
+	projectDir := b.resolvedProjectDir()
+	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsForDir(issues, graphStats, b.analyzer, projectDir)
 
 	snapshot := &DataSnapshot{
 		LoadError:      recipeErr,
@@ -776,6 +790,9 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 			Ratio:   b.diffStats.Ratio,
 		},
 		IncrementalListUsed: listItemsIncremental,
+		beadsPath:           b.beadsPath,
+		projectDir:          projectDir,
+		explicitWeights:     b.explicitWeights,
 	}
 	snapshot.phase2Input = snapshot.detachedPhase2Input()
 	return snapshot
@@ -1354,7 +1371,16 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 	var completedTriage *analysis.TriageResult
 
 	if stats != nil && analyzer != nil && len(issues) > 0 {
-		triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, stats, issues, analysis.TriageOptions{}, analyzer.Now())
+		opts := analysis.TriageOptions{}
+		if !s.explicitWeights && analyzer.Weights() == analysis.DefaultWeights() {
+			if beadsDir := s.resolvedBeadsDir(); beadsDir != "" {
+				if fw := feedbackWeightsForBeadsDir(beadsDir); fw != nil {
+					analyzer.SetWeights(*fw)
+					opts.Weights = fw
+				}
+			}
+		}
+		triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, stats, issues, opts, analyzer.Now())
 		completedTriage = &triageResult
 		triageScores = make(map[string]float64, len(triageResult.Recommendations))
 		triageReasons = make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
@@ -1416,7 +1442,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		listModelItems[i] = listItems[i]
 		listIndexByID[listItems[i].Issue.ID] = i
 	}
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlerts(issuesClone, stats, analyzer)
+	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsForDir(issuesClone, stats, analyzer, s.projectDir)
 
 	return &DataSnapshot{
 		// Clone mutable Phase 1 data so the new snapshot stays immutable even if
@@ -1475,5 +1501,8 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		LoadError:            s.LoadError,
 		ErrorTime:            s.ErrorTime,
 		StaleWarning:         s.StaleWarning,
+		beadsPath:            s.beadsPath,
+		projectDir:           s.projectDir,
+		explicitWeights:      s.explicitWeights,
 	}
 }

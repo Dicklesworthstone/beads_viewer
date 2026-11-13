@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/internal/datasource"
@@ -194,6 +195,7 @@ func (m *Model) preparePhase2Cmd() tea.Cmd {
 	authority := sourceAnalyzer.Readiness()
 	scoring := sourceAnalyzer.CaptureScoring()
 	weights, now := sourceAnalyzer.Weights(), sourceAnalyzer.Now()
+	beadsPath, workDir := m.beadsPath, m.workDir
 	var candidates map[string]bool
 	if m.candidateIDs != nil {
 		candidates = make(map[string]bool, len(m.candidateIDs))
@@ -213,10 +215,20 @@ func (m *Model) preparePhase2Cmd() tea.Cmd {
 			return nil
 		}
 		if input == nil {
-			builder := NewSnapshotBuilder(issues, authority).WithAnalysis(stats)
+			builder := NewSnapshotBuilder(issues, authority).
+				WithBeadsPath(beadsPath).
+				WithProjectDir(workDir).
+				WithAnalysis(stats)
 			builder.analyzer.RestoreScoring(scoring)
 			builder.analyzer.SetReadinessScope(authority, candidates)
 			input = builder.Build()
+		} else {
+			if input.beadsPath == "" && beadsPath != "" {
+				input.beadsPath = beadsPath
+			}
+			if input.projectDir == "" && workDir != "" {
+				input.projectDir = workDir
+			}
 		}
 		prepared := input.WithPhase2(stats, insights, issues, analyzer)
 		if ctx.Err() != nil {
@@ -966,9 +978,11 @@ func CheckCassHealthCmd() tea.Cmd {
 
 // AgentFileCheckMsg is sent after checking for AGENTS.md integration (bv-i8dk)
 type AgentFileCheckMsg struct {
-	ShouldPrompt bool
-	FilePath     string
-	FileType     string
+	ShouldPrompt    bool
+	FilePath        string
+	FileType        string
+	IsUpgrade       bool
+	ExistingVersion int
 }
 
 // CheckAgentFileCmd returns a command that checks if we should prompt for AGENTS.md
@@ -978,16 +992,17 @@ func CheckAgentFileCmd(workDir string) tea.Cmd {
 			return AgentFileCheckMsg{ShouldPrompt: false}
 		}
 
-		// Check if we should prompt based on preferences
-		if !agents.ShouldPromptForAgentFile(workDir) {
+		// Detect agent file
+		detection := agents.DetectAgentFile(workDir)
+		if !detection.Found() {
 			return AgentFileCheckMsg{ShouldPrompt: false}
 		}
 
-		// Detect agent file
-		detection := agents.DetectAgentFile(workDir)
-
-		// Only prompt if file exists but doesn't have our blurb
-		if detection.Found() && detection.NeedsBlurb() {
+		// Fresh blurb prompt when file exists without any blurb
+		if detection.NeedsBlurb() {
+			if !agents.ShouldPromptForAgentFile(workDir) {
+				return AgentFileCheckMsg{ShouldPrompt: false}
+			}
 			return AgentFileCheckMsg{
 				ShouldPrompt: true,
 				FilePath:     detection.FilePath,
@@ -995,8 +1010,61 @@ func CheckAgentFileCmd(workDir string) tea.Cmd {
 			}
 		}
 
+		// Upgrade prompt when file has an outdated blurb (v1..v7 or legacy),
+		// never when future-versioned or malformed.
+		if detection.NeedsUpgrade() && !detection.HasFutureBlurb() && !detection.HasMalformedBlurb() {
+			if !agents.ShouldPromptForAgentUpgrade(workDir, agents.BlurbVersion) {
+				return AgentFileCheckMsg{ShouldPrompt: false}
+			}
+			return AgentFileCheckMsg{
+				ShouldPrompt:    true,
+				FilePath:        detection.FilePath,
+				FileType:        detection.FileType,
+				IsUpgrade:       true,
+				ExistingVersion: detection.BlurbVersion,
+			}
+		}
+
 		return AgentFileCheckMsg{ShouldPrompt: false}
 	}
+}
+
+type sharedIncrementalCorrelator struct {
+	mu sync.Mutex
+	ic *correlation.IncrementalCorrelator
+}
+
+var (
+	historyCorrelatorRegistryMu    sync.Mutex
+	historyCorrelatorRegistry      = make(map[string]*sharedIncrementalCorrelator)
+	historyCorrelatorRegistryOrder []string
+)
+
+const maxSharedHistoryCorrelators = 16
+
+func getSharedIncrementalCorrelator(repoPath, correlationPath string) *sharedIncrementalCorrelator {
+	key := repoPath + "\x00" + correlationPath
+	historyCorrelatorRegistryMu.Lock()
+	defer historyCorrelatorRegistryMu.Unlock()
+
+	if entry, ok := historyCorrelatorRegistry[key]; ok {
+		return entry
+	}
+	if len(historyCorrelatorRegistryOrder) >= maxSharedHistoryCorrelators {
+		oldest := historyCorrelatorRegistryOrder[0]
+		historyCorrelatorRegistryOrder = historyCorrelatorRegistryOrder[1:]
+		delete(historyCorrelatorRegistry, oldest)
+	}
+	var ic *correlation.IncrementalCorrelator
+	if correlationPath != "" {
+		ic = correlation.NewIncrementalCorrelator(repoPath, correlationPath)
+	} else {
+		ic = correlation.NewIncrementalCorrelator(repoPath)
+	}
+	entry := &sharedIncrementalCorrelator{ic: ic}
+	historyCorrelatorRegistry[key] = entry
+	historyCorrelatorRegistryOrder = append(historyCorrelatorRegistryOrder, key)
+	return entry
 }
 
 type historyLoadCommandFactory func(
@@ -1014,6 +1082,16 @@ func LoadHistoryCmd(
 	ctx context.Context,
 	beads []correlation.BeadInfo,
 	beadsPath string,
+	dataGeneration, requestGeneration uint64,
+) tea.Cmd {
+	return loadHistoryForWorkDirCmd(ctx, beads, beadsPath, "", dataGeneration, requestGeneration)
+}
+
+func loadHistoryForWorkDirCmd(
+	ctx context.Context,
+	beads []correlation.BeadInfo,
+	beadsPath string,
+	workDir string,
 	dataGeneration, requestGeneration uint64,
 ) tea.Cmd {
 	if ctx == nil {
@@ -1036,9 +1114,15 @@ func LoadHistoryCmd(
 					repoPath = dir
 				}
 			}
+		} else if strings.TrimSpace(workDir) != "" {
+			if absWork, e := filepath.Abs(strings.TrimSpace(workDir)); e == nil {
+				repoPath = absWork
+			} else {
+				repoPath = strings.TrimSpace(workDir)
+			}
 		}
 
-		// Fallback to CWD if beadsPath is empty (workspace mode) or Abs failed
+		// Fallback to CWD if beadsPath and workDir are empty (workspace mode) or Abs failed
 		if repoPath == "" {
 			repoPath, err = os.Getwd()
 			if err != nil {
@@ -1062,23 +1146,43 @@ func LoadHistoryCmd(
 		// git-tracked JSONL ourselves whenever beadsPath is not already one.
 		correlationPath := resolveHistoryCorrelationPath(beadsPath, repoPath)
 
-		correlator := correlation.NewCorrelator(repoPath, correlationPath).WithContext(ctx)
 		// The History view is a read path: stored confirm/reject feedback lives
 		// next to the followed JSONL and shapes the view like --robot-history.
 		// A store that cannot be read must not take the whole view down.
+		var feedbackStore *correlation.FeedbackStore
 		if correlationPath != "" {
-			feedbackStore := correlation.NewFeedbackStore(filepath.Dir(correlationPath))
-			if err := feedbackStore.Load(); err != nil {
+			fs := correlation.NewFeedbackStore(filepath.Dir(correlationPath))
+			if err := fs.Load(); err != nil {
 				debug.Log("history: correlation feedback not loaded: %v", err)
 			} else {
-				correlator.WithFeedbackStore(feedbackStore)
+				feedbackStore = fs
 			}
 		}
 		opts := correlation.CorrelatorOptions{
 			Limit: 500, // Reasonable limit for TUI performance
 		}
 
-		report, err := correlator.GenerateReport(beads, opts)
+		var report *correlation.HistoryReport
+		if repoPath != "" {
+			entry := getSharedIncrementalCorrelator(repoPath, correlationPath)
+			entry.mu.Lock()
+			if ctx.Err() != nil {
+				entry.mu.Unlock()
+				return HistoryLoadedMsg{
+					DataGeneration:    dataGeneration,
+					RequestGeneration: requestGeneration,
+					Error:             ctx.Err(),
+				}
+			}
+			entry.ic.WithContext(ctx).WithFeedbackStore(feedbackStore)
+			report, err = entry.ic.GenerateReport(beads, opts)
+			entry.mu.Unlock()
+		} else {
+			correlator := correlation.NewCorrelator(repoPath, correlationPath).
+				WithContext(ctx).
+				WithFeedbackStore(feedbackStore)
+			report, err = correlator.GenerateReport(beads, opts)
+		}
 		return HistoryLoadedMsg{
 			DataGeneration:    dataGeneration,
 			RequestGeneration: requestGeneration,
@@ -1562,7 +1666,11 @@ func (m *Model) startSemanticIndexBuild() tea.Cmd {
 	m.semanticIndexBuilding = true
 	m.semanticIndexBuildGen++
 	m.semanticIndexBuildData = m.semanticDataGeneration
-	return BuildSemanticIndexCmd(m.issuesForAsync(), m.semanticDataGeneration, m.semanticIndexBuildGen, m.workDir)
+	indexWorkDir := m.workDir
+	if m.beadsPath == "" {
+		indexWorkDir = ""
+	}
+	return BuildSemanticIndexCmd(m.issuesForAsync(), m.semanticDataGeneration, m.semanticIndexBuildGen, indexWorkDir)
 }
 
 func (m *Model) queueSemanticIndexSave(request semanticIndexSaveRequest) tea.Cmd {
@@ -2078,10 +2186,6 @@ func (m *Model) startHistoryLoad() tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.historyLoadCancel = cancel
 	m.historyLoading = true
-	loadCommand := m.historyLoadCommand
-	if loadCommand == nil {
-		loadCommand = LoadHistoryCmd
-	}
 	// Correlation reads only current ID/title/status; lifecycle and assignee
 	// evidence come from Git. Copy these immutable string values into an owned
 	// slice before the command can run alongside later row edits or sorting.
@@ -2093,13 +2197,25 @@ func (m *Model) startHistoryLoad() tea.Cmd {
 			Status: string(m.issues[i].Status),
 		}
 	}
-	cmd := loadCommand(
-		ctx,
-		beads,
-		m.beadsPath,
-		m.historyLoadDataGeneration,
-		m.historyLoadRequestGeneration,
-	)
+	var cmd tea.Cmd
+	if m.historyLoadCommand != nil {
+		cmd = m.historyLoadCommand(
+			ctx,
+			beads,
+			m.beadsPath,
+			m.historyLoadDataGeneration,
+			m.historyLoadRequestGeneration,
+		)
+	} else {
+		cmd = loadHistoryForWorkDirCmd(
+			ctx,
+			beads,
+			m.beadsPath,
+			m.workDir,
+			m.historyLoadDataGeneration,
+			m.historyLoadRequestGeneration,
+		)
+	}
 	if cmd == nil {
 		m.cancelHistoryLoad()
 		m.historyLoading = false
@@ -2316,9 +2432,16 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		}
 	}
 
-	// Initialize recipe loader
-	recipeLoader := recipe.NewLoader()
-	_ = recipeLoader.Load() // Load recipes (errors are non-fatal, will just show empty)
+	workDir := cass.WorkspaceFromBeadsPath(beadsPath)
+
+	// Initialize recipe loader (project-scoped when workDir is known)
+	var recipeLoaderOpts []recipe.LoaderOption
+	if workDir != "" {
+		recipeLoaderOpts = append(recipeLoaderOpts, recipe.WithProjectDir(workDir))
+	}
+	recipeLoader := recipe.NewLoader(recipeLoaderOpts...)
+	_ = recipeLoader.Load() // Load recipes (errors are non-fatal, warnings surfaced below)
+	recipeWarnings := recipeLoader.Warnings()
 	recipePicker := NewRecipePickerModel(recipeLoader.List(), theme)
 
 	// Initialize label picker (bv-126)
@@ -2422,10 +2545,13 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	} else if watcherErr != nil {
 		initialStatus = fmt.Sprintf("Live reload unavailable: %v", watcherErr)
 		initialStatusErr = true
+	} else if len(recipeWarnings) > 0 {
+		initialStatus = fmt.Sprintf("⚠️ Recipe config warning: %s", recipeWarnings[0])
+		initialStatusErr = true
 	}
 
 	// Precompute drift/health alerts (bv-168)
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlerts(issues, graphStats, analyzer)
+	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsForDir(issues, graphStats, analyzer, workDir)
 
 	// Load sprints and sprint at-risk thresholds from project config (bv-161, bv-apal.28)
 	var sprints []model.Sprint
@@ -2435,9 +2561,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 			sprints = loaded
 		}
 	}
-	sprintProjectDir := cass.WorkspaceFromBeadsPath(beadsPath)
 	sprintAtRiskThresholds := analysis.DefaultAtRiskThresholds()
-	if driftCfg, err := drift.LoadConfig(sprintProjectDir); err == nil && driftCfg != nil {
+	if driftCfg, err := drift.LoadConfig(workDir); err == nil && driftCfg != nil {
 		sprintAtRiskThresholds = driftCfg.AtRiskThresholds()
 	}
 
@@ -2469,6 +2594,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		renderer:                renderer,
 		board:                   board,
 		labelDashboard:          labelDashboard,
+		attentionView:           NewAttentionModel(theme),
 		velocityComparison:      velocityComparison,
 		shortcutsSidebar:        shortcutsSidebar,
 		graphView:               graphView,
@@ -2523,7 +2649,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		sprints:                sprints,
 		sprintAtRiskThresholds: sprintAtRiskThresholds,
 		// AGENTS.md integration (bv-i8dk) - workDir derived from beadsPath
-		workDir: cass.WorkspaceFromBeadsPath(beadsPath),
+		workDir: workDir,
 		// Tutorial integration (bv-8y31)
 		tutorialModel: NewTutorialModel(theme),
 	}
@@ -2535,6 +2661,34 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		m.applyRecipe(activeRecipe)
 	}
 	return &m
+}
+
+// SetWorkDir sets or overrides the project root directory (e.g. when running
+// from a subdirectory, with BEADS_DIR outside the repo, or in read-only
+// historical --as-of mode where beadsPath is empty).
+func (m *Model) SetWorkDir(dir string) {
+	if m == nil {
+		return
+	}
+	m.workDir = strings.TrimSpace(dir)
+	var loaderOpts []recipe.LoaderOption
+	if m.workDir != "" {
+		loaderOpts = append(loaderOpts, recipe.WithProjectDir(m.workDir))
+	}
+	recipeLoader := recipe.NewLoader(loaderOpts...)
+	_ = recipeLoader.Load()
+	m.recipeLoader = recipeLoader
+	m.recipePicker = NewRecipePickerModel(recipeLoader.List(), m.theme)
+	if warnings := recipeLoader.Warnings(); len(warnings) > 0 && m.statusMsg == "" {
+		m.statusMsg = fmt.Sprintf("⚠️ Recipe config warning: %s", warnings[0])
+		m.statusIsError = true
+	}
+	if m.workDir != "" {
+		if driftCfg, err := drift.LoadConfig(m.workDir); err == nil && driftCfg != nil {
+			m.sprintAtRiskThresholds = driftCfg.AtRiskThresholds()
+		}
+		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
+	}
 }
 
 // refreshScopedTriageData replaces worker rankings computed without the UI's
@@ -2640,8 +2794,9 @@ func (m *Model) Init() tea.Cmd {
 	if historyCmd := m.startHistoryLoad(); historyCmd != nil {
 		cmds = append(cmds, historyCmd)
 	}
-	// Check for AGENTS.md integration prompt (bv-i8dk)
-	if m.workDir != "" && !m.workspaceMode {
+	// Check for AGENTS.md integration prompt (bv-i8dk).
+	// Skip in read-only historical mode (beadsPath == "") or workspace mode.
+	if m.beadsPath != "" && m.workDir != "" && !m.workspaceMode {
 		cmds = append(cmds, CheckAgentFileCmd(m.workDir))
 	}
 	return tea.Batch(cmds...)
@@ -3075,7 +3230,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Even an index that matched disk when its build ran must be written after
 		// an older active save. Otherwise that older save can physically finish
 		// last and roll the on-disk index back after this newer build was accepted.
-		mustSaveAfterActive := m.semanticIndexSaveActive != nil
+		mustSaveAfterActive := m.semanticIndexSaveActive != nil && msg.IndexPath != ""
 		if msg.NeedsSave || mustSaveAfterActive {
 			if msg.Index == nil || msg.IndexPath == "" {
 				m.semanticSearchEnabled = false
@@ -3330,7 +3485,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.alerts = msg.prepared.alerts
 			m.alertsCritical, m.alertsWarning, m.alertsInfo = msg.prepared.alertsCritical, msg.prepared.alertsWarning, msg.prepared.alertsInfo
 		} else {
-			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlerts(m.issues, m.analysis, m.analyzer)
+			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
 		}
 
 		// Invalidate label health and attention caches since we have new graph metrics (criticality)
@@ -3484,7 +3639,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// AGENTS.md integration check (bv-i8dk)
 		if msg.ShouldPrompt && msg.FilePath != "" {
 			m.showAgentPrompt = true
-			m.agentPromptModal = NewAgentPromptModal(msg.FilePath, msg.FileType, m.theme)
+			if msg.IsUpgrade {
+				m.agentPromptModal = NewAgentUpgradePromptModal(msg.FilePath, msg.FileType, msg.ExistingVersion, m.theme)
+			} else {
+				m.agentPromptModal = NewAgentPromptModal(msg.FilePath, msg.FileType, m.theme)
+			}
 			m.focused = focusAgentPrompt
 		}
 
@@ -4099,6 +4258,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cachedAnalyzer := analysis.NewCachedAnalyzer(newIssues, nil)
 		m.analyzer = cachedAnalyzer.Analyzer
 		m.analyzer.SetReadinessScope(loadedIssues.Authority, m.candidateIDs)
+		if w := feedbackWeightsForBeadsPath(m.beadsPath); w != nil {
+			m.analyzer.SetWeights(*w)
+		}
 		m.analysis = cachedAnalyzer.AnalyzeAsync(context.Background())
 		cacheHit := cachedAnalyzer.WasCacheHit()
 		if profileRefresh {
@@ -4160,7 +4322,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if profileRefresh {
 			alertsStart = time.Now()
 		}
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlerts(m.issues, m.analysis, m.analyzer)
+		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
 		if profileRefresh {
 			recordTiming("alerts", time.Since(alertsStart))
 		}
@@ -4414,15 +4576,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Check if user made a decision
 			switch m.agentPromptModal.Result() {
 			case AgentPromptAccept:
-				// User accepted - add blurb to file
+				// User accepted - add or upgrade blurb in file
 				filePath := m.agentPromptModal.FilePath()
-				if err := agents.AppendBlurbToFile(filePath); err != nil {
-					m.statusMsg = "Failed to update " + filepath.Base(filePath) + ": " + err.Error()
+				shouldUpgrade := m.agentPromptModal.IsUpgrade() || agents.DetectAgentFile(filepath.Dir(filePath)).NeedsUpgrade()
+				var writeErr error
+				if shouldUpgrade {
+					writeErr = agents.UpdateBlurbInFile(filePath)
+				} else {
+					writeErr = agents.AppendBlurbToFile(filePath)
+				}
+				if writeErr != nil {
+					m.statusMsg = "Failed to update " + filepath.Base(filePath) + ": " + writeErr.Error()
 					m.statusIsError = true
 				} else {
-					m.statusMsg = "✓ Added beads instructions to " + filepath.Base(filePath)
+					if shouldUpgrade {
+						m.statusMsg = "✓ Updated beads instructions in " + filepath.Base(filePath)
+					} else {
+						m.statusMsg = "✓ Added beads instructions to " + filepath.Base(filePath)
+					}
 					// Record acceptance
-					_ = agents.RecordAccept(m.workDir)
+					if m.workDir != "" {
+						_ = agents.RecordAccept(m.workDir)
+					} else if dir := filepath.Dir(filePath); dir != "" {
+						_ = agents.RecordAccept(dir)
+					}
 				}
 				m.showAgentPrompt = false
 				m.focused = focusList
@@ -4797,14 +4974,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Handle shortcuts sidebar scrolling (Ctrl+j/k when sidebar visible) - bv-3qi5
-		if m.showShortcutsSidebar && m.list.FilterState() != list.Filtering {
+		// Handle shortcuts sidebar scrolling (Ctrl+j/k and PgUp/PgDown when sidebar visible
+		// and no active detail pane or text/picker prompt owns those keys) - bv-3qi5
+		if m.canScrollShortcutsSidebar(msg.String()) {
 			switch msg.String() {
 			case "ctrl+j":
 				m.shortcutsSidebar.ScrollDown()
 				return m, nil
 			case "ctrl+k":
 				m.shortcutsSidebar.ScrollUp()
+				return m, nil
+			case "pgdown":
+				m.shortcutsSidebar.ScrollPageDown()
+				return m, nil
+			case "pgup":
+				m.shortcutsSidebar.ScrollPageUp()
 				return m, nil
 			}
 		}
@@ -5462,7 +5646,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					case "h", "f", "g", "t",
 						"j", "k", "up", "down",
 						"J", "K", "v", "tab", "enter",
-						"y", "c", "F", "o", "/":
+						"y", "c", "F", "o", "/", "A":
 						m, cmd = m.handleHistoryKeys(msg)
 						cmds = append(cmds, cmd)
 						viewToggleHandled = true
@@ -6350,6 +6534,12 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.historyView.FinishSearch()
 			m.endEmbeddedTextInputSession(embeddedTextInputHistorySearch)
 			return m, nil
+		case "tab":
+			// Cycle scoped search mode (All -> Commit -> Author -> Bead -> SHA -> All)
+			m.historyView.CycleSearchMode()
+			m.statusMsg = fmt.Sprintf("🔍 Search mode: %s", m.historyView.GetSearchModeName())
+			m.statusIsError = false
+			return m, nil
 		default:
 			// Forward to search input
 			inputCmd := m.updateHistorySearchInput(msg)
@@ -6517,6 +6707,31 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 				m.statusMsg = fmt.Sprintf("🔍 Confidence filter: ≥%.0f%%", conf*100)
 			}
 			m.statusIsError = false
+		}
+	case "A":
+		// Toggle author filter for the currently selected commit/item
+		var author string
+		if m.historyView.IsGitMode() {
+			if commit := m.historyView.SelectedGitCommit(); commit != nil {
+				author = strings.TrimSpace(commit.Author)
+			}
+		} else {
+			if commit := m.historyView.SelectedCommit(); commit != nil {
+				author = strings.TrimSpace(commit.Author)
+			}
+		}
+		curAuthor := m.historyView.GetAuthorFilter()
+		if curAuthor != "" && (author == "" || strings.EqualFold(curAuthor, author)) {
+			m.historyView.SetAuthorFilter("")
+			m.statusMsg = "👤 Author filter cleared"
+			m.statusIsError = false
+		} else if author != "" {
+			m.historyView.SetAuthorFilter(author)
+			m.statusMsg = fmt.Sprintf("👤 Filtering by author: @%s", author)
+			m.statusIsError = false
+		} else {
+			m.statusMsg = "❌ No commit selected"
+			m.statusIsError = true
 		}
 	case "f", "F":
 		// Toggle file tree panel (bv-190l)
@@ -10505,29 +10720,86 @@ func (m Model) IsHistoryView() bool {
 	return m.isHistoryView
 }
 
-// exportToMarkdown exports all issues to a Markdown file with auto-generated filename
+// exportIssuesForCurrentView returns the active filtered/recipe/search-scoped
+// issue slice when any filter, recipe, repo scope, or search filter is active,
+// falling back to m.issues when unfiltered.
+func (m *Model) exportIssuesForCurrentView() []model.Issue {
+	if m.list.FilterState() != list.Unfiltered {
+		visible := m.list.VisibleItems()
+		out := make([]model.Issue, 0, len(visible))
+		for _, item := range visible {
+			if issueItem, ok := item.(IssueItem); ok {
+				out = append(out, issueItem.Issue)
+			}
+		}
+		return out
+	}
+
+	if m.activeRecipe != nil {
+		candidates := make([]model.Issue, 0, len(m.issues))
+		for _, issue := range m.issues {
+			if m.workspaceMode && m.activeRepos != nil {
+				repoKey := issueRepoKey(issue)
+				if repoKey != "" && !m.activeRepos[repoKey] {
+					continue
+				}
+			}
+			candidates = append(candidates, issue)
+		}
+		if selected, err := applyRecipeToIssues(candidates, m.analyzer, m.analysis, m.triageScores, m.activeRecipe, m.analysisReferenceTime()); err == nil {
+			return selected
+		}
+	}
+
+	if (m.currentFilter != "" && m.currentFilter != "all") || (m.workspaceMode && m.activeRepos != nil) {
+		filterNow := m.analysisReferenceTime()
+		filtered := make([]model.Issue, 0, len(m.issues))
+		for _, issue := range m.issues {
+			if m.matchesCurrentFilter(issue, filterNow) {
+				filtered = append(filtered, issue)
+			}
+		}
+		return filtered
+	}
+
+	return m.issues
+}
+
+// exportToMarkdown exports active (or all) issues to a Markdown file with auto-generated filename
 func (m *Model) exportToMarkdown() {
 	// Generate smart filename: beads_report_<project>_YYYY-MM-DD.md
 	filename := m.generateExportFilename()
+	outPath := filename
+	if workDir := strings.TrimSpace(m.workDir); workDir != "" {
+		outPath = filepath.Join(workDir, filename)
+	}
+
+	issuesToExport := m.exportIssuesForCurrentView()
 
 	// Export the issues
-	err := export.SaveMarkdownToFile(m.issues, filename)
+	err := export.SaveMarkdownToFile(issuesToExport, outPath)
 	if err != nil {
 		m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
 		m.statusIsError = true
 		return
 	}
 
-	m.statusMsg = fmt.Sprintf("✅ Exported %d issues to %s", len(m.issues), filename)
+	m.statusMsg = fmt.Sprintf("✅ Exported %d issues to %s", len(issuesToExport), outPath)
 	m.statusIsError = false
 }
 
 // generateExportFilename creates a smart filename based on project and date
 func (m *Model) generateExportFilename() string {
-	// Get project name from current directory
+	// Resolve project name from m.workDir when available, falling back to CWD
 	projectName := "beads"
-	if cwd, err := os.Getwd(); err == nil {
-		projectName = filepath.Base(cwd)
+	projectDir := strings.TrimSpace(m.workDir)
+	if projectDir == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			projectDir = cwd
+		}
+	}
+	if projectDir != "" {
+		projectName = filepath.Base(projectDir)
 		// Sanitize: replace spaces and special chars with underscores
 		projectName = strings.Map(func(r rune) rune {
 			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
@@ -11486,7 +11758,7 @@ func (m *Model) clearAttentionOverlay() {
 // issue set and feeds the navigable attention view.
 func (m *Model) refreshAttentionView() {
 	cfg := analysis.DefaultLabelHealthConfig()
-	m.attentionCache = analysis.ComputeLabelAttentionScores(m.issues, cfg, time.Now().UTC())
+	m.attentionCache = analysis.ComputeLabelAttentionScores(m.issues, cfg, m.analysisReferenceTime().UTC())
 	m.attentionCached = true
 	m.attentionView.SetData(m.attentionCache)
 	height := m.height - 1
@@ -11561,6 +11833,46 @@ func (m *Model) refreshLabelViews(underlyingFocus focus) {
 			bodyHeight = 5
 		}
 		m.velocityComparison.SetSize(m.mainContentWidth(), bodyHeight)
+	}
+}
+
+// canScrollShortcutsSidebar reports whether the shortcuts sidebar (;) should
+// intercept the given scroll key without stealing keys from active text inputs,
+// pickers, overlays, or detail panes.
+func (m *Model) canScrollShortcutsSidebar(key string) bool {
+	if !m.showShortcutsSidebar {
+		return false
+	}
+	if m.showHelp || m.showTutorial || m.showTimeTravelPrompt ||
+		m.showLabelPicker || m.showRepoPicker || m.showRecipePicker ||
+		m.showAgentPrompt || m.showCassModal || m.showAlertsPanel || m.showQuitConfirm {
+		return false
+	}
+	if m.list.FilterState() == list.Filtering || m.isTextInputActive() || m.historyView.IsSearching() {
+		return false
+	}
+	switch key {
+	case "ctrl+j", "ctrl+k":
+		if m.focused == focusBoard && m.board.IsDetailShown() {
+			return false
+		}
+		if m.focused == focusInsights && m.insightsPanel.showDetailPanel {
+			return false
+		}
+		return true
+	case "pgup", "pgdown":
+		switch m.focused {
+		case focusDetail, focusGraph, focusTree, focusActionable, focusFlowMatrix:
+			return false
+		case focusBoard:
+			return !m.board.IsDetailShown()
+		case focusList:
+			return m.list.Paginator.TotalPages <= 1
+		default:
+			return true
+		}
+	default:
+		return false
 	}
 }
 
@@ -11639,14 +11951,24 @@ func (m *Model) handleAttentionKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd, bool) {
 // ════════════════════════════════════════════════════════════════════════════
 
 // computeAlerts calculates drift alerts for the current issues using the
-// already-computed graph stats/analyzer to avoid redundant work.
+// already-computed graph stats/analyzer, falling back to CWD for baseline lookup.
 func computeAlerts(issues []model.Issue, stats *analysis.GraphStats, analyzer *analysis.Analyzer) ([]drift.Alert, int, int, int) {
+	return computeAlertsForDir(issues, stats, analyzer, "")
+}
+
+// computeAlertsForDir calculates drift alerts for the current issues against
+// <projectDir>/.bv/baseline.json (when present) and <projectDir>/.bv/drift.yaml,
+// falling back to CWD only when projectDir is empty.
+func computeAlertsForDir(issues []model.Issue, stats *analysis.GraphStats, analyzer *analysis.Analyzer, projectDir string) ([]drift.Alert, int, int, int) {
 	if len(issues) == 0 || stats == nil || analyzer == nil {
 		return nil, 0, 0, 0
 	}
 
-	projectDir, _ := os.Getwd()
-	driftConfig, err := drift.LoadConfig(projectDir)
+	resolvedDir := strings.TrimSpace(projectDir)
+	if resolvedDir == "" {
+		resolvedDir, _ = os.Getwd()
+	}
+	driftConfig, err := drift.LoadConfig(resolvedDir)
 	if err != nil {
 		driftConfig = drift.DefaultConfig()
 	}
@@ -11676,6 +11998,21 @@ func computeAlerts(issues []model.Issue, stats *analysis.GraphStats, analyzer *a
 
 	bl := &baseline.Baseline{Stats: curStats}
 	cur := &baseline.Baseline{Stats: curStats, Cycles: stats.Cycles()}
+	if resolvedDir != "" {
+		baselinePath := baseline.DefaultPath(resolvedDir)
+		if baseline.Exists(baselinePath) {
+			if loaded, loadErr := baseline.Load(baselinePath); loadErr == nil && loaded != nil {
+				bl = loaded
+				cur.TopMetrics = baseline.TopMetrics{
+					PageRank:     buildBaselineMetricItems(stats.PageRank(), 10),
+					Betweenness:  buildBaselineMetricItems(stats.Betweenness(), 10),
+					CriticalPath: buildBaselineMetricItems(stats.CriticalPathScore(), 10),
+					Hubs:         buildBaselineMetricItems(stats.Hubs(), 10),
+					Authorities:  buildBaselineMetricItems(stats.Authorities(), 10),
+				}
+			}
+		}
+	}
 
 	calc := drift.NewCalculator(bl, cur, driftConfig)
 	calc.SetNow(analyzer.Now())
@@ -11696,6 +12033,26 @@ func computeAlerts(issues []model.Issue, stats *analysis.GraphStats, analyzer *a
 	}
 
 	return result.Alerts, critical, warning, info
+}
+
+func buildBaselineMetricItems(scores map[string]float64, limit int) []baseline.MetricItem {
+	if len(scores) == 0 || limit <= 0 {
+		return nil
+	}
+	items := make([]baseline.MetricItem, 0, len(scores))
+	for id, val := range scores {
+		items = append(items, baseline.MetricItem{ID: id, Value: val})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Value != items[j].Value {
+			return items[i].Value > items[j].Value
+		}
+		return items[i].ID < items[j].ID
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	return items
 }
 
 // alertKey generates a unique key for an alert (for dismissal tracking)
