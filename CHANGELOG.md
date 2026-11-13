@@ -156,6 +156,19 @@ every reported vulnerability has an exploitable execution path in bv.
   jobs; add `scripts/release_gate.sh preflight` with cached-toolchain hints;
   stamp untagged VCS builds as `v0.26.1-dev+<rev>` (`flake.nix` pointing to
   `blob/main/LICENSE`); and synchronize `MANIFEST.json` and release docs.
+- **Dense Brandes betweenness, `GO-2026-6859` `go1.26.11` verification, and
+  high-leverage feature wirings** (`7f4f16c7`, `d8d6f2ba`, `bv-apal.34`,
+  `bv-apal.35`): accelerate Phase 2 Brandes betweenness (`-89.4%` `FullAnalysis`
+  latency) and memoize `GraphStats` copies (`0.0%` worst benchmark regression);
+  upgrade local release gate verification to Go `1.26.11` (`0` Stage-11
+  vulnerabilities); wire the one-time TUI `github.com` startup update-check
+  footer disclosure (`StartupDisclosurePending` / `RecordStartupDisclosure`);
+  support glob patterns in `--robot-file-beads` (`LookupByFileGlob`); expose
+  dependency-aware transitive `blockage_cascade` in `--robot-label-flow` and the
+  TUI Flow Matrix (`f`); align `--robot-capacity` global median ETA base under
+  `--capacity-label`; remove the dead CSP-violating CDN fallback in `viewer.js`;
+  and reconcile public formula, tutorial-key (`~` vs `` ` ``), and `SKILL.md`
+  reference tables.
 
 ## v0.26.0 — 2026-11-02
 

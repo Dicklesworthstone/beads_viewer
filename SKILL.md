@@ -72,26 +72,41 @@ bv --robot-priority            # Priority misalignment detection
 ```bash
 bv --robot-insights            # Full metrics: PageRank, betweenness, HITS, cycles, etc.
 bv --robot-label-health        # Per-label health: healthy|warning|critical
-bv --robot-label-flow          # Cross-label dependency flow matrix
+bv --robot-label-flow          # Cross-label dependency flow matrix + blockage_cascade
 bv --robot-label-attention     # Attention-ranked labels
+bv --robot-whatif <id>         # Counterfactual unblock & impact delta if <id> completes
+bv --robot-blocker-chain <id>  # Full upstream blocker chain for one issue
 ```
 
-### History & Changes
+### History, Provenance & Search
 
 ```bash
-bv --robot-history             # Bead-to-commit correlations
-bv --robot-diff --diff-since HEAD~1 # Changes since an existing Git ref
+bv --robot-history                     # Bead-to-commit correlations
+bv --bead-history <id>                 # Single-bead commit correlation history
+bv --robot-file-beads "pkg/ui/*.go"    # Beads touching a file, directory prefix, or glob
+bv --robot-file-hotspots               # Files touched by the most beads
+bv --robot-file-relations <path>       # Co-changing files above correlation threshold
+bv --robot-impact <paths>              # Risk analysis before editing comma-separated paths
+bv --robot-orphans                     # Commits missing explicit bead links
+bv --robot-diff --diff-since HEAD~1    # Changes since an existing Git ref
+bv --search "oauth" --robot-search     # Keyword or --search-mode hybrid semantic search
 ```
 
-### Other Commands
+### Sprints, Capacity, Drift & Discovery
 
 ```bash
-bv --robot-burndown sprint-1  # Use an existing sprint ID for burndown/scope changes
-bv --robot-forecast all       # Duration/velocity heuristic, not a scheduler
-bv --robot-alerts              # Stale issues, blocking cascades
-bv --robot-suggest             # Hygiene: duplicates, missing deps, cycle breaks
-bv --robot-graph               # Dependency graph export (JSON, DOT, Mermaid)
-bv --export-graph graph.html   # Self-contained interactive HTML visualization
+bv --robot-sprint-list                 # Configured sprints
+bv --robot-sprint-show sprint-1        # Single sprint detail
+bv --robot-burndown sprint-1           # Use an existing sprint ID for burndown/scope changes
+bv --robot-forecast all                # Duration/velocity heuristic, not a scheduler
+bv --robot-capacity --agents=3         # Serial/parallel capacity + Graham makespan bounds
+bv --robot-alerts                      # Stale issues, blocking cascades
+bv --check-drift --robot-drift         # Saved-baseline drift check as structured JSON
+bv --robot-suggest                     # Hygiene: duplicates, missing deps, cycle breaks
+bv --robot-graph                       # Dependency graph export (JSON, DOT, Mermaid)
+bv --robot-capabilities                # Machine-readable command/flag/env/schema discovery
+bv --robot-schema                      # JSON Schema definitions for all robot commands
+bv --export-graph graph.html           # Self-contained interactive HTML visualization
 ```
 
 ## Scoping & Filtering
@@ -210,6 +225,10 @@ When running `bv` interactively (not for agents):
 | `f` | Flow matrix (cross-label dependencies) |
 | `[` | Label dashboard (per-label health) |
 | `]` | Attention view (label priority ranking) |
+| `P` | Sprint dashboard (progress, burndown, velocity) |
+| `'` | Recipe picker (pre-filtered views) |
+| `?` / `;` | Quick reference modal / persistent shortcuts sidebar |
+| `~` / `` ` `` | Context-filtered tutorial / full interactive tutorial |
 
 ## Integration with br/bd CLIs
 

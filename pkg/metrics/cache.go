@@ -103,7 +103,7 @@ type CacheStats struct {
 // Every counter here has a producer: GraphCache is fed by the analysis
 // in-memory and disk caches (pkg/analysis), CorrelationCache by the
 // correlation report/artifact caches (pkg/correlation), SearchCache by the
-// on-disk vector index (pkg/search), TriageCache by the TUI snapshot cache.
+// on-disk vector index (pkg/search), TriageCache by pkg/analysis.TriageContext.
 var (
 	GraphCache       = newCacheMetric("graph_cache")
 	TriageCache      = newCacheMetric("triage_cache")

@@ -1545,3 +1545,215 @@ func TestDocsParity_PagesLoadProseMatchesArtifact(t *testing.T) {
 		t.Logf("negative control rejected stale ee81c286 README.md as expected: %v", err)
 	})
 }
+
+func TestDocsParity_RobotCapacityFormulaAndLabelScope(t *testing.T) {
+	readme := repoFile(t, "README.md")
+	for _, want := range []string{
+		"graham_min_days",
+		"graham_max_days",
+		"velocity_minutes_per_day",
+		"clamped to `[graham_min_days, graham_max_days]`",
+		"`--robot-capacity`'s `total_days` and `--robot-forecast`'s `summary.total_days` convert minutes at a fixed eight-hour workday (`minutes / 480`)",
+	} {
+		if !strings.Contains(readme, want) {
+			t.Fatalf("README.md capacity/forecast formula prose missing %q", want)
+		}
+	}
+	if strings.Contains(readme, "legacy `estimated_days`/`total_days`") {
+		t.Fatal("README.md must not claim --robot-capacity estimated_days uses fixed 480 min/day")
+	}
+
+	bv := buildBvBinary(t)
+	ws := t.TempDir()
+	beadsDir := filepath.Join(ws, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-5 * 24 * time.Hour).Format(time.RFC3339)
+	createdAt := now.Add(-10 * 24 * time.Hour).Format(time.RFC3339)
+
+	// Global workspace has 3 explicit 240-minute closed tasks in other labels (so global median = 240),
+	// while the "backend" label has two open tasks with NO explicit estimated_minutes.
+	// Before the fix, --robot-capacity --capacity-label backend passed targetIssues instead of ctx.Issues
+	// to EstimateETAForIssue, collapsing base minutes from 240 -> 60 and disagreeing with ComputeGrahamBounds
+	// and --robot-forecast!
+	lines := []string{
+		fmt.Sprintf(`{"id":"CL-1","title":"Closed 1","status":"closed","priority":1,"issue_type":"task","estimated_minutes":240,"labels":["ops"],"created_at":%q,"updated_at":%q,"closed_at":%q}`, createdAt, closedAt, closedAt),
+		fmt.Sprintf(`{"id":"CL-2","title":"Closed 2","status":"closed","priority":1,"issue_type":"task","estimated_minutes":240,"labels":["ops"],"created_at":%q,"updated_at":%q,"closed_at":%q}`, createdAt, closedAt, closedAt),
+		fmt.Sprintf(`{"id":"CL-3","title":"Closed 3","status":"closed","priority":1,"issue_type":"task","estimated_minutes":240,"labels":["ops"],"created_at":%q,"updated_at":%q,"closed_at":%q}`, createdAt, closedAt, closedAt),
+		fmt.Sprintf(`{"id":"BE-1","title":"Backend 1","status":"open","priority":1,"issue_type":"task","labels":["backend"],"created_at":%q,"updated_at":%q}`, createdAt, createdAt),
+		fmt.Sprintf(`{"id":"BE-2","title":"Backend 2","status":"open","priority":1,"issue_type":"task","labels":["backend"],"created_at":%q,"updated_at":%q}`, createdAt, createdAt),
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	capCmd := exec.Command(bv, "--robot-capacity", "--capacity-label", "backend", "--agents", "2")
+	capCmd.Dir = ws
+	capCmd.Env = append(os.Environ(), "BV_ROBOT_NOW="+now.Format(time.RFC3339))
+	capOut, err := capCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--robot-capacity failed: %v\n%s", err, capOut)
+	}
+	var capPayload struct {
+		TotalMinutes          int     `json:"total_minutes"`
+		TotalDays             float64 `json:"total_days"`
+		EstimatedDays         float64 `json:"estimated_days"`
+		GrahamMinDays         float64 `json:"graham_min_days"`
+		GrahamMaxDays         float64 `json:"graham_max_days"`
+		VelocityMinutesPerDay float64 `json:"velocity_minutes_per_day"`
+	}
+	if err := json.Unmarshal(capOut, &capPayload); err != nil {
+		t.Fatalf("unmarshal --robot-capacity: %v\n%s", err, capOut)
+	}
+
+	fcCmd := exec.Command(bv, "--robot-forecast", "all", "--forecast-label", "backend")
+	fcCmd.Dir = ws
+	fcCmd.Env = append(os.Environ(), "BV_ROBOT_NOW="+now.Format(time.RFC3339))
+	fcOut, err := fcCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--robot-forecast failed: %v\n%s", err, fcOut)
+	}
+	var fcPayload struct {
+		Summary struct {
+			TotalMinutes int     `json:"total_minutes"`
+			TotalDays    float64 `json:"total_days"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(fcOut, &fcPayload); err != nil {
+		t.Fatalf("unmarshal --robot-forecast: %v\n%s", err, fcOut)
+	}
+
+	if capPayload.TotalMinutes != fcPayload.Summary.TotalMinutes || capPayload.TotalMinutes < 480 {
+		t.Fatalf("expected --robot-capacity total_minutes (%d) to match --robot-forecast summary.total_minutes (%d) using global 240m median",
+			capPayload.TotalMinutes, fcPayload.Summary.TotalMinutes)
+	}
+	wantTotalDays := math.Round(float64(capPayload.TotalMinutes)/480.0*100) / 100
+	if math.Abs(capPayload.TotalDays-wantTotalDays) > 0.02 {
+		t.Fatalf("total_days = %v, want minutes/480 = %v", capPayload.TotalDays, wantTotalDays)
+	}
+	if capPayload.EstimatedDays < capPayload.GrahamMinDays-0.02 || capPayload.EstimatedDays > capPayload.GrahamMaxDays+0.02 {
+		t.Fatalf("estimated_days = %v outside Graham bounds [%v, %v]", capPayload.EstimatedDays, capPayload.GrahamMinDays, capPayload.GrahamMaxDays)
+	}
+	// Verify historical velocity (720m / 30d = 24 min/day, far from 480 min/day) drove estimated_days > total_days.
+	if capPayload.EstimatedDays <= capPayload.TotalDays {
+		t.Fatalf("expected velocity-calibrated estimated_days (%v at vel=%v/d) > fixed-480m total_days (%v)",
+			capPayload.EstimatedDays, capPayload.VelocityMinutesPerDay, capPayload.TotalDays)
+	}
+}
+
+func TestDocsParity_TutorialKeysFileBeadsGlobAndLabelFlowCascade(t *testing.T) {
+	readme := repoFile(t, "README.md")
+	if !strings.Contains(readme, "| **Context Tutorial** | `~` |") {
+		t.Fatal("README.md must document `~` as Context Tutorial in the help surfaces table")
+	}
+	if strings.Contains(readme, "press `` ` `` while in Board view") {
+		t.Fatal("README.md must not claim backtick opens the context-filtered tutorial")
+	}
+
+	// Verify live TUI behavior matches README: in Board view, `~` sets contextMode=true, while `` ` `` sets contextMode=false.
+	m := ui.NewModel([]model.Issue{
+		{ID: "T-1", Title: "Board item", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+	}, nil, "")
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = updated.(*ui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(*ui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'~'}})
+	m = updated.(*ui.Model)
+	if !m.IsTutorialContextMode() {
+		t.Fatal("expected pressing '~' in Board view to open context-filtered tutorial")
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(*ui.Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'`'}})
+	m = updated.(*ui.Model)
+	if m.IsTutorialContextMode() {
+		t.Fatal("expected pressing '`' in Board view to open unfiltered full tutorial")
+	}
+
+	// Verify --robot-file-beads glob support + bad-glob rejection + --robot-label-flow blockage_cascade.
+	bv := buildBvBinary(t)
+	ws := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = ws
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init", "-b", "main")
+	if err := os.MkdirAll(filepath.Join(ws, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(ws, "pkg", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issuesJSONL := strings.Join([]string{
+		`{"id":"bv-10","title":"Root schema","status":"open","priority":1,"issue_type":"task","labels":["schema"]}`,
+		`{"id":"bv-11","title":"DB blocked","status":"open","priority":1,"issue_type":"task","labels":["db"],"dependencies":[{"issue_id":"bv-11","depends_on_id":"bv-10","type":"blocks"}]}`,
+		`{"id":"bv-12","title":"UI waiting","status":"open","priority":2,"issue_type":"task","labels":["ui"],"dependencies":[{"issue_id":"bv-12","depends_on_id":"bv-11","type":"blocks"}]}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(ws, ".beads", "issues.jsonl"), []byte(issuesJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "pkg", "sub", "alpha.go"), []byte("package sub\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "feat: implement bv-10 alpha")
+
+	globCmd := exec.Command(bv, "--robot-file-beads", "pkg/sub/*.go")
+	globCmd.Dir = ws
+	globOut, err := globCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--robot-file-beads glob failed: %v\n%s", err, globOut)
+	}
+	var fileBeads struct {
+		TotalBeads int `json:"total_beads"`
+		OpenBeads  []struct {
+			BeadID string `json:"bead_id"`
+		} `json:"open_beads"`
+	}
+	if err := json.Unmarshal(globOut, &fileBeads); err != nil {
+		t.Fatalf("unmarshal --robot-file-beads: %v\n%s", err, globOut)
+	}
+	if fileBeads.TotalBeads != 1 || len(fileBeads.OpenBeads) != 1 || fileBeads.OpenBeads[0].BeadID != "bv-10" {
+		t.Fatalf("expected --robot-file-beads glob to match bv-10, got %+v", fileBeads)
+	}
+
+	badGlobCmd := exec.Command(bv, "--robot-file-beads", "[")
+	badGlobCmd.Dir = ws
+	if out, err := badGlobCmd.CombinedOutput(); err == nil {
+		t.Fatalf("expected invalid glob '[' to fail, got exit 0:\n%s", out)
+	}
+
+	flowCmd := exec.Command(bv, "--robot-label-flow")
+	flowCmd.Dir = ws
+	flowOut, err := flowCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--robot-label-flow failed: %v\n%s", err, flowOut)
+	}
+	var flowPayload struct {
+		BlockageCascade struct {
+			TotalBlocked int `json:"total_blocked"`
+			TopUnblocks  []struct {
+				IssueID string `json:"issue_id"`
+			} `json:"top_unblocks"`
+		} `json:"blockage_cascade"`
+	}
+	if err := json.Unmarshal(flowOut, &flowPayload); err != nil {
+		t.Fatalf("unmarshal --robot-label-flow: %v\n%s", err, flowOut)
+	}
+	if flowPayload.BlockageCascade.TotalBlocked != 2 || len(flowPayload.BlockageCascade.TopUnblocks) == 0 {
+		t.Fatalf("expected --robot-label-flow blockage_cascade with 2 blocked issues and top_unblocks, got %+v", flowPayload.BlockageCascade)
+	}
+}

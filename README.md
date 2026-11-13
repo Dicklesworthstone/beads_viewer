@@ -2146,17 +2146,18 @@ Progress persists across sessions: pages you have seen are recorded in the user 
 
 ### Context-Sensitive Filtering
 
-When you open the tutorial from a specific view (e.g., press `` ` `` while in Board view), the tutorial can filter to show only pages relevant to that context. This provides focused learning without overwhelming new users.
+When you open context help from a specific view with `~` (e.g., press `~` while in Board view), the tutorial filters to show only pages relevant to that view's context. Pressing `` ` `` opens the full unfiltered tutorial across all pages.
 
-### Quick Reference vs. Full Tutorial
+### Quick Reference vs. Tutorials & Sidebar
 
-bv provides two help levels:
+bv provides four complementary help surfaces:
 
 | Feature | Key | Purpose |
 |---------|-----|---------|
 | **Quick Reference** | `?` | Compact keyboard shortcuts for current view |
-| **Full Tutorial** | `` ` `` | Multi-page walkthrough with examples |
-| **Shortcuts Sidebar** | `;` | Persistent reference while working |
+| **Context Tutorial** | `~` | Tutorial pages filtered to the current view |
+| **Full Tutorial** | `` ` `` | Complete multi-page walkthrough with examples |
+| **Shortcuts Sidebar** | `;` | Persistent toggleable reference while working |
 
 From Quick Reference, press `Space` to jump directly into the full tutorial.
 
@@ -3249,21 +3250,31 @@ These commands output **structured JSON** designed for programmatic consumption:
 | `--robot-insights` | Graph metrics + top N lists | Project health assessment |
 | `--robot-plan` | Actionable tracks + dependencies | Work queue generation |
 | `--robot-priority` | Priority recommendations | Automated priority fixing |
+| `--robot-whatif <id>` | Counterfactual impact delta if an issue completes | Unblock & priority simulation |
+| `--robot-search` | Hashed keyword or graph-weighted hybrid search (with `--search <query>`) | Issue discovery |
 | `--robot-history` | Bead-to-commit correlations | Code change tracking |
+| `--bead-history <id>` | Single-bead commit correlation history | Scoped code provenance |
+| `--robot-orphans` | Unlinked commit candidates with probable beads | Hygiene & audit |
 | `--robot-label-health` | Per-label health metrics | Domain health monitoring |
-| `--robot-label-flow` | Cross-label dependency matrix | Inter-domain analysis |
+| `--robot-label-flow` | Cross-label dependency matrix + transitive `blockage_cascade` | Inter-domain bottleneck analysis |
 | `--robot-label-attention` | Attention-ranked labels | Domain prioritization |
 | `--robot-sprint-list` | All sprints as JSON | Sprint planning |
+| `--robot-sprint-show <id>` | Single configured sprint detail as JSON | Sprint inspection |
 | `--robot-burndown` | Sprint burndown data | Progress tracking |
 | `--robot-suggest` | Hygiene suggestions (deps/dupes/labels/cycles) | Project cleanup automation |
 | `--robot-diff` | JSON diff (with `--diff-since`) | Change tracking |
+| `--robot-drift` | Saved-baseline drift + proactive alerts (with `--check-drift`) | Automated CI/DSR drift gates |
 | `--robot-recipes` | Available recipe list | Recipe discovery |
 | `--robot-graph` | Dependency graph as JSON/DOT/Mermaid | Graph visualization & export |
 | `--robot-forecast` | ETA estimate per issue (heuristic duration / velocity) | Rough completion timelines |
-| `--robot-capacity` | Serial + parallel-over-agents capacity estimate | Rough resource planning |
+| `--robot-capacity` | Serial + parallel-over-agents capacity & Graham bounds | Rough resource planning |
 | `--robot-alerts` | Drift + proactive warnings | Health monitoring |
 | `--robot-blocker-chain <id>` | Full blocker chain analysis for one issue | Explaining why work is stuck |
+| `--robot-causality <id>` | Temporal causal chain of commits/events for one issue | Root-cause & timeline analysis |
+| `--robot-related <id>` | Related beads by file, commit, dependency, and concurrency overlap | Context discovery |
+| `--robot-impact-network <id>` | Multi-edge bead impact network (`all` or `<id>`) | Blast-radius mapping |
 | `--robot-impact <paths>` | Impact of modifying the given comma-separated files | Change risk assessment |
+| `--robot-file-beads <path\|glob>` | Beads that touched a file path, directory prefix, or glob pattern | File ownership & history |
 | `--robot-file-hotspots` | Files touched by the most beads | Finding churn hotspots |
 | `--robot-file-relations <path>` | Files that frequently co-change with the given file | Related-code discovery |
 | `--robot-metrics` | In-process counters from the real caches and timers: `graph_cache` (analysis in-memory + disk cache), `correlation_cache` (history report/artifact caches), `search_cache` (on-disk vector index), `triage_cache`; timings `loader.parse`, `graph_load`, `analysis.phase1`, `topological_sort`, `analysis.phase2`, `pagerank_compute`, `betweenness_compute`, `hits_compute`, `cycle_detection`, `triage_analysis`; plus memory stats. Counts cover the current process only, so a bare `--robot-metrics` shows the load it just did; `BV_METRICS=0` disables collection | Diagnosing slow runs |
@@ -3397,7 +3408,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--robot-docs` | string | (empty) | Machine-readable JSON docs for AI agents. Topics: guide, commands, examples, env, exit-codes, all | Robot & Planning Flags |
 | `--robot-drift` | bool | `false` | Output drift check as JSON (use with --check-drift) | Robot & Planning Flags |
 | `--robot-explain-correlation` | string | (empty) | Explain why a commit is linked to a bead (format: SHA:beadID) | Robot & Planning Flags |
-| `--robot-file-beads` | string | (empty) | Output beads that touched a file path as JSON | Robot & Planning Flags |
+| `--robot-file-beads` | string | (empty) | Output beads that touched a file path, directory prefix, or glob pattern as JSON | Robot & Planning Flags |
 | `--robot-file-hotspots` | bool | `false` | Output files touched by most beads as JSON | Robot & Planning Flags |
 | `--robot-file-relations` | string | (empty) | Output files that frequently co-change with the given file path | Robot & Planning Flags |
 | `--robot-forecast` | string | (empty) | Output ETA forecast for bead ID, or 'all' for all open issues | Robot & Planning Flags |
@@ -3522,7 +3533,7 @@ bv --agent-brief ./agent-bundle/
 
 These are heuristics, not a scheduler. For `--robot-forecast`, choose a base from a positive `estimated_minutes`, otherwise the median positive estimate in the loaded issues (default 60 minutes). **Both explicit and inferred bases receive all multipliers:** type (`task`/`bug`: 1, `chore`: 0.8, `feature`: 1.3, `epic`: 2), dependency depth (`1 + min(1, depth/10)`), and description length (`1 + min(1, Unicode runes/2000)`). The product is truncated to integer minutes. Depth uses the available critical-path score; unavailable scores contribute zero depth.
 
-Velocity is complexity-weighted work minutes closed in the last 30 days divided by 30 (using the same `base × type × depth × description` formula as open estimates), shrunk per matching label toward global velocity via Bühlmann-Straub empirical-Bayes credibility weighting (`n / (n + 5)`), picking the slowest nonzero shrunk label velocity, then global velocity, then median/5 (with 60 min/day as a final fallback). ETA days = work minutes / (velocity × agents). Its confidence band is rule-based and has not been calibrated as a statistical probability. `--robot-capacity` reports serial critical-path work, parallelizable work, and Graham (1969) parallel list-scheduling makespan bounds (`[max(L_crit, W/m), L_crit + (W - L_crit)/m]`); it does not assign issues to agents or account for their availability. Payloads expose the factors behind these estimates. Note that the per-issue `estimated_days` of `--robot-forecast` (and `graham_bounds` velocity-calibrated days in `--robot-capacity`) use historical velocity, whereas `--robot-capacity`'s legacy `estimated_days`/`total_days` and `--robot-forecast`'s `summary.total_days` convert minutes at a fixed eight-hour workday (`minutes / 480`), and `summary.total_days` ignores `--forecast-agents`.
+Velocity is complexity-weighted work minutes closed in the last 30 days divided by 30 (using the same `base × type × depth × description` formula as open estimates), shrunk per matching label toward global velocity via Bühlmann-Straub empirical-Bayes credibility weighting (`n / (n + 5)`), picking the slowest nonzero shrunk label velocity, then global velocity, then median/5 (with 60 min/day as a final fallback). ETA days = work minutes / (velocity × agents). Its confidence band is rule-based and has not been calibrated as a statistical probability. `--robot-capacity` reports serial critical-path work, parallelizable work, and top-level Graham (1969) parallel list-scheduling makespan bounds (`graham_min_days`, `graham_max_days`, `critical_path_minutes`, and `velocity_minutes_per_day`, implementing `[max(L_crit, W/m), L_crit + (W - L_crit)/m]`); it does not assign issues to agents or account for their availability. Payloads expose the factors behind these estimates. Both `--robot-forecast`'s per-issue `estimated_days` and `--robot-capacity`'s `estimated_days` divide complexity-weighted minutes by historical velocity (clamped to `[graham_min_days, graham_max_days]` in `--robot-capacity`, falling back to `480` min/day only when velocity is zero), whereas `--robot-capacity`'s `total_days` and `--robot-forecast`'s `summary.total_days` convert minutes at a fixed eight-hour workday (`minutes / 480`), and `summary.total_days` ignores `--forecast-agents`.
 
 Forecast output applies the global issue selection and intersects it with
 `--forecast-label` and `--forecast-sprint`, when supplied. These filters also
