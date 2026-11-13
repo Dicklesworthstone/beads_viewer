@@ -432,13 +432,13 @@ func (w *Wizard) collectGitHubConfig() error {
 	fmt.Println("Step 3: GitHub Configuration")
 	fmt.Println("────────────────────────────")
 
-	// Suggest repo name based on current directory
-	cwd, _ := os.Getwd()
-	base := filepath.Base(cwd)
-	if base == "." || base == "/" {
-		base = "beads-viewer-pages"
+	// Suggest repo name using shared helper
+	suggestedName := SuggestRepoName(w.bundlePath)
+	if isEmptyPathBase(suggestedName) {
+		suggestedName = "beads-viewer-pages"
+	} else if !strings.HasSuffix(suggestedName, "-pages") {
+		suggestedName = suggestedName + "-pages"
 	}
-	suggestedName := base + "-pages"
 	repoName := suggestedName
 	description := "Issue tracker dashboard"
 
@@ -569,7 +569,37 @@ func (w *Wizard) checkPrerequisites() error {
 		if !status.Installed {
 			fmt.Println("✗ gh CLI not installed")
 			ShowInstallInstructions()
-			return fmt.Errorf("gh CLI is required for GitHub Pages deployment")
+			if !isTerminal() && w.input == nil {
+				return fmt.Errorf("gh CLI is required for GitHub Pages deployment")
+			}
+
+			var doInstall bool
+			form := w.newForm(
+				huh.NewGroup(
+					huh.NewConfirm().
+						Title("Would you like to install gh CLI now?").
+						Value(&doInstall).
+						Affirmative("Yes").
+						Negative("No"),
+				),
+			)
+
+			if err := form.Run(); err != nil {
+				return fmt.Errorf("gh CLI is required for GitHub Pages deployment: %w", err)
+			}
+
+			if doInstall {
+				if err := AttemptGHInstall(); err != nil {
+					return fmt.Errorf("gh CLI installation failed: %w", err)
+				}
+				// Re-check
+				status, _ = CheckGHStatus()
+				if status == nil || !status.Installed {
+					return fmt.Errorf("gh CLI installation failed")
+				}
+			} else {
+				return fmt.Errorf("gh CLI is required for GitHub Pages deployment")
+			}
 		}
 		fmt.Println("✓ gh CLI installed")
 
