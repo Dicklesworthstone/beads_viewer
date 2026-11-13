@@ -180,7 +180,10 @@ every reported vulnerability has an exploitable execution path in bv.
   history, and synthesized `Alerts` (`cycle`, `stale`, `abandoned_claim`,
   `velocity_drop`) in `--robot-triage` and `--priority-brief` (alongside What-If
   deltas, backed by single-pass $O(N + E)$ `ComputeLabelHealthScores` /
-  `ComputeAllLabelHealth` indexing); normalize active hybrid-search PageRank and
+  `ComputeAllLabelHealth` indexing, slab-backed `model.CloneIssues`,
+  integer-indexed `ReadinessIndex`, CSR-slab `NewAnalyzer`, and ungrouped
+  `TopN`/`TopPicks` reason materialization); normalize active hybrid-search
+  PageRank and
   open-only blocker counts with shared `analysis.GetGlobalCache()` and
   refresh-epoch singleflight coalescing across hash drift; add `--pages-subtitle`,
   `git_hash`

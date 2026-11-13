@@ -231,25 +231,257 @@ func (i Issue) Clone() Issue {
 
 	if i.Dependencies != nil {
 		clone.Dependencies = make([]*Dependency, len(i.Dependencies))
-		for idx, dep := range i.Dependencies {
+		nonNil := 0
+		for _, dep := range i.Dependencies {
 			if dep != nil {
-				v := *dep
-				clone.Dependencies[idx] = &v
+				nonNil++
+			}
+		}
+		if nonNil > 0 {
+			depSlab := make([]Dependency, nonNil)
+			pos := 0
+			for idx, dep := range i.Dependencies {
+				if dep != nil {
+					depSlab[pos] = *dep
+					clone.Dependencies[idx] = &depSlab[pos]
+					pos++
+				}
 			}
 		}
 	}
 
 	if i.Comments != nil {
 		clone.Comments = make([]*Comment, len(i.Comments))
-		for idx, comment := range i.Comments {
+		nonNil := 0
+		for _, comment := range i.Comments {
 			if comment != nil {
-				v := *comment
-				clone.Comments[idx] = &v
+				nonNil++
+			}
+		}
+		if nonNil > 0 {
+			commentSlab := make([]Comment, nonNil)
+			pos := 0
+			for idx, comment := range i.Comments {
+				if comment != nil {
+					commentSlab[pos] = *comment
+					clone.Comments[idx] = &commentSlab[pos]
+					pos++
+				}
 			}
 		}
 	}
 
 	return clone
+}
+
+// CloneIssues creates a deep copy of a slice of issues using contiguous slab
+// allocations for nested slices and optional pointer fields while preserving
+// exact nil-vs-empty slice distinctions and per-element isolation.
+func CloneIssues(issues []Issue) []Issue {
+	if issues == nil {
+		return nil
+	}
+	if len(issues) == 0 {
+		return []Issue{}
+	}
+
+	var (
+		totalOrigins     int
+		totalInts        int
+		totalTimes       int
+		totalStrPtrs     int
+		totalLabels      int
+		totalDepPtrs     int
+		totalDepVals     int
+		totalCommentPtrs int
+		totalCommentVals int
+	)
+
+	for i := range issues {
+		src := &issues[i]
+		if src.Origin != nil {
+			totalOrigins++
+		}
+		if src.EstimatedMinutes != nil {
+			totalInts++
+		}
+		if src.ClosedAt != nil {
+			totalTimes++
+		}
+		if src.DueDate != nil {
+			totalTimes++
+		}
+		if src.DeferUntil != nil {
+			totalTimes++
+		}
+		if src.CompactedAt != nil {
+			totalTimes++
+		}
+		if src.ExternalRef != nil {
+			totalStrPtrs++
+		}
+		if src.CompactedAtCommit != nil {
+			totalStrPtrs++
+		}
+		totalLabels += len(src.Labels)
+		totalDepPtrs += len(src.Dependencies)
+		for _, dep := range src.Dependencies {
+			if dep != nil {
+				totalDepVals++
+			}
+		}
+		totalCommentPtrs += len(src.Comments)
+		for _, comment := range src.Comments {
+			if comment != nil {
+				totalCommentVals++
+			}
+		}
+	}
+
+	clones := make([]Issue, len(issues))
+	var originSlab []IssueOrigin
+	if totalOrigins > 0 {
+		originSlab = make([]IssueOrigin, totalOrigins)
+	}
+	var intSlab []int
+	if totalInts > 0 {
+		intSlab = make([]int, totalInts)
+	}
+	var timeSlab []time.Time
+	if totalTimes > 0 {
+		timeSlab = make([]time.Time, totalTimes)
+	}
+	var strPtrSlab []string
+	if totalStrPtrs > 0 {
+		strPtrSlab = make([]string, totalStrPtrs)
+	}
+	var labelSlab []string
+	if totalLabels > 0 {
+		labelSlab = make([]string, totalLabels)
+	}
+	var depPtrSlab []*Dependency
+	if totalDepPtrs > 0 {
+		depPtrSlab = make([]*Dependency, totalDepPtrs)
+	}
+	var depValSlab []Dependency
+	if totalDepVals > 0 {
+		depValSlab = make([]Dependency, totalDepVals)
+	}
+	var commentPtrSlab []*Comment
+	if totalCommentPtrs > 0 {
+		commentPtrSlab = make([]*Comment, totalCommentPtrs)
+	}
+	var commentValSlab []Comment
+	if totalCommentVals > 0 {
+		commentValSlab = make([]Comment, totalCommentVals)
+	}
+
+	var (
+		originPos     int
+		intPos        int
+		timePos       int
+		strPtrPos     int
+		labelPos      int
+		depPtrPos     int
+		depValPos     int
+		commentPtrPos int
+		commentValPos int
+	)
+
+	for i := range issues {
+		src := &issues[i]
+		dst := *src
+
+		if src.Origin != nil {
+			originSlab[originPos] = *src.Origin
+			dst.Origin = &originSlab[originPos]
+			originPos++
+		}
+		if src.EstimatedMinutes != nil {
+			intSlab[intPos] = *src.EstimatedMinutes
+			dst.EstimatedMinutes = &intSlab[intPos]
+			intPos++
+		}
+		if src.ClosedAt != nil {
+			timeSlab[timePos] = *src.ClosedAt
+			dst.ClosedAt = &timeSlab[timePos]
+			timePos++
+		}
+		if src.DueDate != nil {
+			timeSlab[timePos] = *src.DueDate
+			dst.DueDate = &timeSlab[timePos]
+			timePos++
+		}
+		if src.DeferUntil != nil {
+			timeSlab[timePos] = *src.DeferUntil
+			dst.DeferUntil = &timeSlab[timePos]
+			timePos++
+		}
+		if src.CompactedAt != nil {
+			timeSlab[timePos] = *src.CompactedAt
+			dst.CompactedAt = &timeSlab[timePos]
+			timePos++
+		}
+		if src.ExternalRef != nil {
+			strPtrSlab[strPtrPos] = *src.ExternalRef
+			dst.ExternalRef = &strPtrSlab[strPtrPos]
+			strPtrPos++
+		}
+		if src.CompactedAtCommit != nil {
+			strPtrSlab[strPtrPos] = *src.CompactedAtCommit
+			dst.CompactedAtCommit = &strPtrSlab[strPtrPos]
+			strPtrPos++
+		}
+
+		if src.Labels != nil {
+			n := len(src.Labels)
+			if n == 0 {
+				dst.Labels = make([]string, 0)
+			} else {
+				dst.Labels = labelSlab[labelPos : labelPos+n : labelPos+n]
+				copy(dst.Labels, src.Labels)
+				labelPos += n
+			}
+		}
+
+		if src.Dependencies != nil {
+			n := len(src.Dependencies)
+			if n == 0 {
+				dst.Dependencies = make([]*Dependency, 0)
+			} else {
+				dst.Dependencies = depPtrSlab[depPtrPos : depPtrPos+n : depPtrPos+n]
+				depPtrPos += n
+				for idx, dep := range src.Dependencies {
+					if dep != nil {
+						depValSlab[depValPos] = *dep
+						dst.Dependencies[idx] = &depValSlab[depValPos]
+						depValPos++
+					}
+				}
+			}
+		}
+
+		if src.Comments != nil {
+			n := len(src.Comments)
+			if n == 0 {
+				dst.Comments = make([]*Comment, 0)
+			} else {
+				dst.Comments = commentPtrSlab[commentPtrPos : commentPtrPos+n : commentPtrPos+n]
+				commentPtrPos += n
+				for idx, comment := range src.Comments {
+					if comment != nil {
+						commentValSlab[commentValPos] = *comment
+						dst.Comments[idx] = &commentValSlab[commentValPos]
+						commentValPos++
+					}
+				}
+			}
+		}
+
+		clones[i] = dst
+	}
+
+	return clones
 }
 
 // IsDeferredAt reports whether the issue's defer_until deferral is still

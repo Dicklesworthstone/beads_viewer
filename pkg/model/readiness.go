@@ -19,24 +19,29 @@ const (
 // ranking scopes. Construction is O(issues + edges); readiness lookups are O(1).
 // It does not compute expensive graph metrics or mutate the caller's issues.
 type ReadinessIndex struct {
-	issues   map[string]readinessIssue
-	states   map[string]DependencyState
-	children map[string][]string
+	idToIdx         map[string]int
+	ids             []string
+	issues          []readinessIssue
+	states          []DependencyState
+	children        [][]int32
+	missingChildren map[string][]int32
 }
 
-// Keep only decision inputs. Copy dependency values into one slice per issue
-// instead of cloning display text, comments and separately allocated edges.
+// Keep only decision inputs. Copy dependency values into a single slab across
+// the index instead of cloning display text, comments and separately allocated edges.
 type readinessIssue struct {
-	Status       Status
-	IssueType    IssueType
-	Assignee     string
-	DeferUntil   *time.Time
-	Dependencies []readinessDependency
+	Status        Status
+	IssueType     IssueType
+	Assignee      string
+	DeferUntil    *time.Time
+	Dependencies  []readinessDependency
+	hasParentEdge bool
 }
 
 type readinessDependency struct {
-	DependsOnID string
-	Type        DependencyType
+	DependsOnID  string
+	DependsOnIdx int32
+	Type         DependencyType
 }
 
 func (issue readinessIssue) isDeferredAt(now time.Time) bool {
@@ -44,33 +49,131 @@ func (issue readinessIssue) isDeferredAt(now time.Time) bool {
 }
 
 func NewReadinessIndex(issues []Issue) *ReadinessIndex {
-	r := &ReadinessIndex{
-		issues:   make(map[string]readinessIssue, len(issues)),
-		states:   make(map[string]DependencyState, len(issues)),
-		children: make(map[string][]string),
+	nInput := len(issues)
+	idToIdx := make(map[string]int, nInput)
+	ids := make([]string, 0, nInput)
+	lastRow := make([]int, 0, nInput)
+	for rowIdx := range issues {
+		id := issues[rowIdx].ID
+		if idx, exists := idToIdx[id]; exists {
+			lastRow[idx] = rowIdx
+		} else {
+			idToIdx[id] = len(ids)
+			ids = append(ids, id)
+			lastRow = append(lastRow, rowIdx)
+		}
 	}
-	for _, issue := range issues {
-		owned := readinessIssue{
-			Status:    issue.Status,
-			IssueType: issue.IssueType,
-			Assignee:  issue.Assignee,
+
+	n := len(ids)
+	totalDeps := 0
+	totalDefers := 0
+	totalParentEdges := 0
+	for idx := 0; idx < n; idx++ {
+		src := &issues[lastRow[idx]]
+		if src.DeferUntil != nil {
+			totalDefers++
 		}
-		if issue.DeferUntil != nil {
-			deferUntil := *issue.DeferUntil
-			owned.DeferUntil = &deferUntil
-		}
-		if len(issue.Dependencies) > 0 {
-			owned.Dependencies = make([]readinessDependency, 0, len(issue.Dependencies))
-			for _, dep := range issue.Dependencies {
-				if dep != nil {
-					owned.Dependencies = append(owned.Dependencies, readinessDependency{
-						DependsOnID: dep.DependsOnID,
-						Type:        dep.Type,
-					})
+		for _, dep := range src.Dependencies {
+			if dep != nil {
+				totalDeps++
+				if dep.Type == DepParentChild {
+					totalParentEdges++
 				}
 			}
 		}
-		r.issues[issue.ID] = owned
+	}
+
+	var depSlab []readinessDependency
+	if totalDeps > 0 {
+		depSlab = make([]readinessDependency, totalDeps)
+	}
+	var deferSlab []time.Time
+	if totalDefers > 0 {
+		deferSlab = make([]time.Time, totalDefers)
+	}
+
+	ownedIssues := make([]readinessIssue, n)
+	var childDeg []int32
+	if totalParentEdges > 0 {
+		childDeg = make([]int32, n)
+	}
+	var missingChildren map[string][]int32
+
+	depPos := 0
+	deferPos := 0
+	for idx := 0; idx < n; idx++ {
+		src := &issues[lastRow[idx]]
+		owned := readinessIssue{
+			Status:    src.Status,
+			IssueType: src.IssueType,
+			Assignee:  src.Assignee,
+		}
+		if src.DeferUntil != nil {
+			deferSlab[deferPos] = *src.DeferUntil
+			owned.DeferUntil = &deferSlab[deferPos]
+			deferPos++
+		}
+		if len(src.Dependencies) > 0 {
+			start := depPos
+			for _, dep := range src.Dependencies {
+				if dep == nil {
+					continue
+				}
+				targetIdx := int32(-1)
+				if resolvedIdx, ok := idToIdx[dep.DependsOnID]; ok {
+					targetIdx = int32(resolvedIdx)
+				}
+				depSlab[depPos] = readinessDependency{
+					DependsOnID:  dep.DependsOnID,
+					DependsOnIdx: targetIdx,
+					Type:         dep.Type,
+				}
+				depPos++
+				if dep.Type == DepParentChild {
+					owned.hasParentEdge = true
+					if targetIdx >= 0 {
+						childDeg[targetIdx]++
+					} else {
+						if missingChildren == nil {
+							missingChildren = make(map[string][]int32)
+						}
+						missingChildren[dep.DependsOnID] = append(missingChildren[dep.DependsOnID], int32(idx))
+					}
+				}
+			}
+			if depPos > start {
+				owned.Dependencies = depSlab[start:depPos:depPos]
+			}
+		}
+		ownedIssues[idx] = owned
+	}
+
+	children := make([][]int32, n)
+	if totalParentEdges > 0 {
+		knownParentEdges := 0
+		for _, deg := range childDeg {
+			knownParentEdges += int(deg)
+		}
+		if knownParentEdges > 0 {
+			childSlab := make([]int32, knownParentEdges)
+			offset := 0
+			for idx, deg := range childDeg {
+				if deg > 0 {
+					end := offset + int(deg)
+					children[idx] = childSlab[offset:offset:end]
+					offset = end
+				}
+			}
+		}
+	}
+
+	r := &ReadinessIndex{
+		idToIdx:         idToIdx,
+		ids:             ids,
+		issues:          ownedIssues,
+		states:          make([]DependencyState, n),
+		children:        children,
+		missingChildren: missingChildren,
 	}
 	r.compute()
 	return r
@@ -87,9 +190,9 @@ func (r *ReadinessIndex) ResolvedIDs() []string {
 	if r == nil {
 		return ids
 	}
-	for id, issue := range r.issues {
-		if closedForReadiness(issue.Status) {
-			ids = append(ids, id)
+	for idx := range r.issues {
+		if closedForReadiness(r.issues[idx].Status) {
+			ids = append(ids, r.ids[idx])
 		}
 	}
 	sort.Strings(ids)
@@ -107,65 +210,74 @@ func combineDependencyState(a, b DependencyState) DependencyState {
 }
 
 func (r *ReadinessIndex) compute() {
-	pending := make(map[string]int, len(r.issues))
-	for id, issue := range r.issues {
-		r.states[id] = DependenciesSatisfied
+	n := len(r.issues)
+	if n == 0 {
+		return
+	}
+	pending := make([]int32, n)
+	for idx := 0; idx < n; idx++ {
+		issue := &r.issues[idx]
+		state := DependenciesSatisfied
 		for _, dep := range issue.Dependencies {
-			if dep.Type == DepParentChild {
-				r.children[dep.DependsOnID] = append(r.children[dep.DependsOnID], id)
+			if dep.Type == DepParentChild && dep.DependsOnIdx >= 0 {
+				r.children[dep.DependsOnIdx] = append(r.children[dep.DependsOnIdx], int32(idx))
 			}
 			if closedForReadiness(issue.Status) {
 				continue
 			}
-			other, exists := r.issues[dep.DependsOnID]
 			if dep.Type.IsBlocking() {
 				switch {
-				case !exists:
-					r.states[id] = DependenciesUnknown
-				case !closedForReadiness(other.Status):
-					r.states[id] = combineDependencyState(r.states[id], DependenciesUnsatisfied)
+				case dep.DependsOnIdx < 0:
+					state = DependenciesUnknown
+				case !closedForReadiness(r.issues[dep.DependsOnIdx].Status):
+					state = combineDependencyState(state, DependenciesUnsatisfied)
 				}
 			} else if dep.Type == DepParentChild {
-				if !exists {
-					r.states[id] = DependenciesUnknown
-				} else if !closedForReadiness(other.Status) {
-					pending[id]++
+				if dep.DependsOnIdx < 0 {
+					state = DependenciesUnknown
+				} else if !closedForReadiness(r.issues[dep.DependsOnIdx].Status) {
+					pending[idx]++
 				}
 			}
 		}
+		r.states[idx] = state
 	}
 	// Process parents before children. There is no arbitrary depth cutoff:
 	// a blocked ancestor still gates a descendant fifty or ten thousand hops
 	// away. A parent cycle (and its descendants) stays unresolved/unknown.
-	queue := make([]string, 0, len(r.issues))
-	for id, issue := range r.issues {
-		if !closedForReadiness(issue.Status) && pending[id] == 0 {
-			queue = append(queue, id)
+	queue := make([]int32, 0, n)
+	for idx := 0; idx < n; idx++ {
+		if !closedForReadiness(r.issues[idx].Status) && pending[idx] == 0 {
+			queue = append(queue, int32(idx))
 		}
 	}
 	for head := 0; head < len(queue); head++ {
-		id := queue[head]
-		for _, child := range r.children[id] {
+		u := queue[head]
+		parentState := r.states[u]
+		for _, child := range r.children[u] {
 			if closedForReadiness(r.issues[child].Status) {
 				continue
 			}
-			r.states[child] = combineDependencyState(r.states[child], r.states[id])
+			r.states[child] = combineDependencyState(r.states[child], parentState)
 			pending[child]--
 			if pending[child] == 0 {
 				queue = append(queue, child)
 			}
 		}
 	}
-	for id, remaining := range pending {
+	for idx, remaining := range pending {
 		if remaining > 0 {
-			r.states[id] = DependenciesUnknown
+			r.states[idx] = DependenciesUnknown
 		}
 	}
 }
 
 func (r *ReadinessIndex) DependencyState(id string) DependencyState {
-	if state, ok := r.states[id]; ok {
-		return state
+	if r == nil {
+		return DependenciesUnknown
+	}
+	if idx, ok := r.idToIdx[id]; ok {
+		return r.states[idx]
 	}
 	return DependenciesUnknown
 }
@@ -173,19 +285,49 @@ func (r *ReadinessIndex) DependencyState(id string) DependencyState {
 // Ready includes ongoing work for planning. Claimable adds the stricter
 // open/unassigned/non-epic/leaf policy used when suggesting a new claim.
 func (r *ReadinessIndex) Ready(id string, now time.Time) bool {
-	issue, exists := r.issues[id]
-	return exists && (issue.Status == StatusOpen || issue.Status == StatusInProgress) &&
-		!issue.isDeferredAt(now) && r.DependencyState(id) == DependenciesSatisfied
+	if r == nil {
+		return false
+	}
+	idx, exists := r.idToIdx[id]
+	if !exists {
+		return false
+	}
+	issue := &r.issues[idx]
+	return (issue.Status == StatusOpen || issue.Status == StatusInProgress) &&
+		!issue.isDeferredAt(now) && r.states[idx] == DependenciesSatisfied
 }
 
 func (r *ReadinessIndex) Claimable(id string, now time.Time) bool {
-	issue, exists := r.issues[id]
-	return exists && r.Ready(id, now) && issue.Status == StatusOpen &&
-		issue.Assignee == "" && issue.IssueType != TypeEpic && !r.HasOpenChildren(id)
+	if r == nil {
+		return false
+	}
+	idx, exists := r.idToIdx[id]
+	if !exists {
+		return false
+	}
+	issue := &r.issues[idx]
+	return issue.Status == StatusOpen && !issue.isDeferredAt(now) &&
+		r.states[idx] == DependenciesSatisfied &&
+		issue.Assignee == "" && issue.IssueType != TypeEpic && !r.hasOpenChildrenAt(idx)
+}
+
+func (r *ReadinessIndex) hasOpenChildrenAt(idx int) bool {
+	for _, child := range r.children[idx] {
+		if !closedForReadiness(r.issues[child].Status) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *ReadinessIndex) HasOpenChildren(id string) bool {
-	for _, child := range r.children[id] {
+	if r == nil {
+		return false
+	}
+	if idx, ok := r.idToIdx[id]; ok {
+		return r.hasOpenChildrenAt(idx)
+	}
+	for _, child := range r.missingChildren[id] {
 		if !closedForReadiness(r.issues[child].Status) {
 			return true
 		}
@@ -197,24 +339,125 @@ func (r *ReadinessIndex) HasOpenChildren(id string) bool {
 // unsatisfied or unknown. These IDs explain why an item was withheld, even
 // when the blocker is outside the visible scope or absent from the source.
 func (r *ReadinessIndex) Blockers(id string) []string {
-	issue, exists := r.issues[id]
-	if !exists || closedForReadiness(issue.Status) {
+	if r == nil {
 		return nil
 	}
-	set := make(map[string]bool)
+	idx, exists := r.idToIdx[id]
+	if !exists {
+		return nil
+	}
+	issue := &r.issues[idx]
+	if closedForReadiness(issue.Status) || r.states[idx] == DependenciesSatisfied || len(issue.Dependencies) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(issue.Dependencies))
 	for _, dep := range issue.Dependencies {
-		other, exists := r.issues[dep.DependsOnID]
-		if dep.Type.IsBlocking() && (!exists || !closedForReadiness(other.Status)) ||
-			dep.Type == DepParentChild && r.DependencyState(dep.DependsOnID) != DependenciesSatisfied {
-			set[dep.DependsOnID] = true
+		if dep.Type.IsBlocking() {
+			if dep.DependsOnIdx < 0 || !closedForReadiness(r.issues[dep.DependsOnIdx].Status) {
+				ids = append(ids, dep.DependsOnID)
+			}
+		} else if dep.Type == DepParentChild {
+			if dep.DependsOnIdx < 0 || r.states[dep.DependsOnIdx] != DependenciesSatisfied {
+				ids = append(ids, dep.DependsOnID)
+			}
 		}
 	}
-	var ids []string
-	for id := range set {
-		ids = append(ids, id)
+	if len(ids) == 0 {
+		return nil
 	}
-	sort.Strings(ids)
+	if len(ids) > 1 {
+		sort.Strings(ids)
+		write := 1
+		for read := 1; read < len(ids); read++ {
+			if ids[read] != ids[write-1] {
+				ids[write] = ids[read]
+				write++
+			}
+		}
+		ids = ids[:write]
+	}
 	return ids
+}
+
+// ReadyAfterSingle evaluates ReadyAfter when simulating completion of a single
+// issue without allocating a map per query.
+func (r *ReadinessIndex) ReadyAfterSingle(id string, now time.Time, completedID string) bool {
+	if completedID == "" {
+		return r.Ready(id, now)
+	}
+	if r == nil || id == completedID {
+		return false
+	}
+	idx, exists := r.idToIdx[id]
+	if !exists {
+		return false
+	}
+	issue := &r.issues[idx]
+	if (issue.Status != StatusOpen && issue.Status != StatusInProgress) || issue.isDeferredAt(now) {
+		return false
+	}
+	completedIdx := int32(-1)
+	if cIdx, ok := r.idToIdx[completedID]; ok {
+		completedIdx = int32(cIdx)
+	}
+	if completedIdx < 0 {
+		return r.states[idx] == DependenciesSatisfied
+	}
+	if r.states[idx] == DependenciesSatisfied {
+		return true
+	}
+	if !issue.hasParentEdge {
+		for _, dep := range issue.Dependencies {
+			if dep.Type.IsBlocking() {
+				if dep.DependsOnIdx < 0 {
+					return false
+				}
+				if dep.DependsOnIdx != completedIdx && !closedForReadiness(r.issues[dep.DependsOnIdx].Status) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	var states map[int32]DependencyState
+	var visiting map[int32]bool
+	var visit func(int32) DependencyState
+	visit = func(cur int32) DependencyState {
+		if cur < 0 {
+			return DependenciesUnknown
+		}
+		if cur == completedIdx || closedForReadiness(r.issues[cur].Status) || r.states[cur] == DependenciesSatisfied {
+			return DependenciesSatisfied
+		}
+		if visiting[cur] {
+			return DependenciesUnknown
+		}
+		if state, ok := states[cur]; ok {
+			return state
+		}
+		if visiting == nil {
+			visiting = make(map[int32]bool)
+			states = make(map[int32]DependencyState)
+		}
+		visiting[cur] = true
+		state := DependenciesSatisfied
+		for _, dep := range r.issues[cur].Dependencies {
+			if dep.Type.IsBlocking() {
+				if dep.DependsOnIdx < 0 {
+					state = DependenciesUnknown
+				} else if dep.DependsOnIdx != completedIdx && !closedForReadiness(r.issues[dep.DependsOnIdx].Status) {
+					state = combineDependencyState(state, DependenciesUnsatisfied)
+				}
+			} else if dep.Type == DepParentChild {
+				state = combineDependencyState(state, visit(dep.DependsOnIdx))
+			}
+		}
+		delete(visiting, cur)
+		states[cur] = state
+		return state
+	}
+	return visit(int32(idx)) == DependenciesSatisfied
 }
 
 // ReadyAfter evaluates a bounded what-if frontier against the same authority.
@@ -224,41 +467,70 @@ func (r *ReadinessIndex) ReadyAfter(id string, now time.Time, completed map[stri
 	if len(completed) == 0 {
 		return r.Ready(id, now)
 	}
-	issue, exists := r.issues[id]
-	if !exists || completed[id] || (issue.Status != StatusOpen && issue.Status != StatusInProgress) || issue.isDeferredAt(now) {
+	if r == nil || completed[id] {
 		return false
 	}
-	states := make(map[string]DependencyState)
-	visiting := make(map[string]bool)
-	var visit func(string) DependencyState
-	visit = func(id string) DependencyState {
-		issue, exists := r.issues[id]
-		if !exists || visiting[id] {
-			return DependenciesUnknown
-		}
-		if completed[id] || closedForReadiness(issue.Status) {
-			return DependenciesSatisfied
-		}
-		if state, ok := states[id]; ok {
-			return state
-		}
-		visiting[id] = true
-		state := DependenciesSatisfied
+	idx, exists := r.idToIdx[id]
+	if !exists {
+		return false
+	}
+	issue := &r.issues[idx]
+	if (issue.Status != StatusOpen && issue.Status != StatusInProgress) || issue.isDeferredAt(now) {
+		return false
+	}
+	if r.states[idx] == DependenciesSatisfied {
+		return true
+	}
+	if !issue.hasParentEdge {
 		for _, dep := range issue.Dependencies {
 			if dep.Type.IsBlocking() {
-				other, exists := r.issues[dep.DependsOnID]
-				if !exists {
+				if dep.DependsOnIdx < 0 {
+					return false
+				}
+				if !completed[dep.DependsOnID] && !closedForReadiness(r.issues[dep.DependsOnIdx].Status) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	var states map[int32]DependencyState
+	var visiting map[int32]bool
+	var visit func(int32) DependencyState
+	visit = func(cur int32) DependencyState {
+		if cur < 0 {
+			return DependenciesUnknown
+		}
+		if completed[r.ids[cur]] || closedForReadiness(r.issues[cur].Status) || r.states[cur] == DependenciesSatisfied {
+			return DependenciesSatisfied
+		}
+		if visiting[cur] {
+			return DependenciesUnknown
+		}
+		if state, ok := states[cur]; ok {
+			return state
+		}
+		if visiting == nil {
+			visiting = make(map[int32]bool)
+			states = make(map[int32]DependencyState)
+		}
+		visiting[cur] = true
+		state := DependenciesSatisfied
+		for _, dep := range r.issues[cur].Dependencies {
+			if dep.Type.IsBlocking() {
+				if dep.DependsOnIdx < 0 {
 					state = DependenciesUnknown
-				} else if !completed[dep.DependsOnID] && !closedForReadiness(other.Status) {
+				} else if !completed[dep.DependsOnID] && !closedForReadiness(r.issues[dep.DependsOnIdx].Status) {
 					state = combineDependencyState(state, DependenciesUnsatisfied)
 				}
 			} else if dep.Type == DepParentChild {
-				state = combineDependencyState(state, visit(dep.DependsOnID))
+				state = combineDependencyState(state, visit(dep.DependsOnIdx))
 			}
 		}
-		delete(visiting, id)
-		states[id] = state
+		delete(visiting, cur)
+		states[cur] = state
 		return state
 	}
-	return visit(id) == DependenciesSatisfied
+	return visit(int32(idx)) == DependenciesSatisfied
 }

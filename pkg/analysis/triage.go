@@ -678,50 +678,123 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	}
 	eligibleIDs := analyzer.CandidateIssueSet(selectionMode)
 
-	allRecommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, len(triageScores), now)
-	selectedRecommendations := allRecommendations[:0]
-	for _, rec := range allRecommendations {
-		if !eligibleIDs[rec.ID] {
-			continue
-		}
-		if isContainerEpicWithOpenChildren(rec.ID) {
-			rec.Action = "Coordinate open child tasks"
-		}
-		selectedRecommendations = append(selectedRecommendations, rec)
-	}
-	allRecommendations = selectedRecommendations
-
-	// Stamp the claimability verdict on every scored item once (issue #199) so
-	// recommendations carry it as a field and quick_wins can gate on the same
-	// predicate top_picks uses. allRecommendations covers the full scored set,
-	// so this map is complete for every impact score.
-	claimableIDs := make(map[string]bool, len(allRecommendations))
-	for i := range allRecommendations {
-		claimable := analyzer.Readiness().Claimable(allRecommendations[i].ID, now) && isClaimableRecommendation(allRecommendations[i], now, opts.NotReadyLabels, parentsWithOpenChildren)
-		allRecommendations[i].Claimable = claimable
-		if issue, ok := analyzer.issueMap[allRecommendations[i].ID]; ok {
-			allRecommendations[i].Actions = issue.Actions(claimable)
-		}
-		if claimable {
-			claimableIDs[allRecommendations[i].ID] = true
-		}
-	}
-
-	// bv-87: Build grouped recommendations over the full candidate recommendation
-	// set BEFORE slicing recommendations to opts.TopN so tracks and labels beyond
-	// the global top-N cap still surface their top picks for multi-agent swarms.
 	var recsByTrack []TrackRecommendationGroup
 	var recsByLabel []LabelRecommendationGroup
-	if opts.GroupByTrack {
-		recsByTrack = buildRecommendationsByTrack(allRecommendations, analyzer, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
-	}
-	if opts.GroupByLabel {
-		recsByLabel = buildRecommendationsByLabel(allRecommendations, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
-	}
+	var recommendations []Recommendation
+	var topPicks []TopPick
+	var claimableIDs map[string]bool
 
-	recommendations := allRecommendations
-	if len(recommendations) > opts.TopN {
-		recommendations = recommendations[:opts.TopN]
+	if opts.GroupByTrack || opts.GroupByLabel {
+		// Grouped modes expose Recommendations and TopPicks per track/label across
+		// the full eligible set, so materialize full recommendations for all of them.
+		allRecommendations := buildRecommendationsFromTriageScores(triageScores, triageCtx, len(triageScores), now)
+		selectedRecommendations := allRecommendations[:0]
+		for _, rec := range allRecommendations {
+			if !eligibleIDs[rec.ID] {
+				continue
+			}
+			if isContainerEpicWithOpenChildren(rec.ID) {
+				rec.Action = "Coordinate open child tasks"
+			}
+			selectedRecommendations = append(selectedRecommendations, rec)
+		}
+		allRecommendations = selectedRecommendations
+
+		claimableIDs = make(map[string]bool, len(allRecommendations))
+		for i := range allRecommendations {
+			claimable := analyzer.Readiness().Claimable(allRecommendations[i].ID, now) && isClaimableRecommendation(allRecommendations[i], now, opts.NotReadyLabels, parentsWithOpenChildren)
+			allRecommendations[i].Claimable = claimable
+			if issue := analyzer.getIssue(allRecommendations[i].ID); issue != nil {
+				allRecommendations[i].Actions = issue.Actions(claimable)
+			}
+			if claimable {
+				claimableIDs[allRecommendations[i].ID] = true
+			}
+		}
+
+		if opts.GroupByTrack {
+			recsByTrack = buildRecommendationsByTrack(allRecommendations, analyzer, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
+		}
+		if opts.GroupByLabel {
+			recsByLabel = buildRecommendationsByLabel(allRecommendations, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
+		}
+
+		recommendations = allRecommendations
+		if len(recommendations) > opts.TopN {
+			recommendations = recommendations[:opts.TopN]
+		}
+		topPicks = buildTopPicks(allRecommendations, 3, now, opts.NotReadyLabels, parentsWithOpenChildren)
+	} else {
+		// Ungrouped mode only exposes Recommendations[:opts.TopN], TopPicks[:3],
+		// and claimableIDs (used by buildQuickWins). Avoid formatting triage reasons
+		// and shell action commands for hundreds of ranked items past TopN & TopPicks.
+		recommendations = make([]Recommendation, 0, min(opts.TopN, len(triageScores)))
+		topPicks = make([]TopPick, 0, 3)
+		claimableIDs = make(map[string]bool)
+		readiness := analyzer.Readiness()
+
+		for _, score := range triageScores {
+			if !eligibleIDs[score.IssueID] {
+				continue
+			}
+			issue := analyzer.getIssue(score.IssueID)
+			if issue == nil {
+				continue
+			}
+			blockedBy := triageCtx.OpenBlockers(score.IssueID)
+			topPickEligible := isClaimableScoreAndIssue(score, issue, blockedBy, now, opts.NotReadyLabels, parentsWithOpenChildren)
+			claimable := readiness.Claimable(score.IssueID, now) && topPickEligible
+			if claimable {
+				claimableIDs[score.IssueID] = true
+			}
+
+			needRec := len(recommendations) < opts.TopN
+			needPick := topPickEligible && len(topPicks) < 3
+			if !needRec && !needPick {
+				continue
+			}
+
+			reasons := generateTriageReasonsForScoreAt(score, triageCtx, now)
+			action := reasons.ActionHint
+			if isContainerEpicWithOpenChildren(score.IssueID) {
+				action = "Coordinate open child tasks"
+			}
+			rawUnblocks := unblocksMap[score.IssueID]
+
+			if needRec {
+				unblocks := append([]string{}, rawUnblocks...)
+				rec := Recommendation{
+					ID:          score.IssueID,
+					Title:       score.Title,
+					Type:        string(issue.IssueType),
+					Status:      score.Status,
+					Assignee:    issue.Assignee,
+					Priority:    score.Priority,
+					Labels:      append([]string{}, issue.Labels...),
+					DeferUntil:  issue.DeferUntil,
+					Score:       score.TriageScore,
+					Breakdown:   score.Breakdown,
+					Action:      action,
+					Reasons:     reasons.All,
+					UnblocksIDs: unblocks,
+					Claimable:   claimable,
+					Actions:     issue.Actions(claimable),
+				}
+				if len(blockedBy) > 0 {
+					rec.BlockedBy = blockedBy
+				}
+				recommendations = append(recommendations, rec)
+			}
+			if needPick {
+				topPicks = append(topPicks, TopPick{
+					ID:       score.IssueID,
+					Title:    score.Title,
+					Score:    score.TriageScore,
+					Reasons:  reasons.All,
+					Unblocks: len(rawUnblocks),
+				})
+			}
+		}
 	}
 
 	// Build quick wins from the claimable subset only: a deferred/draft/blocked
@@ -730,11 +803,6 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 
 	// Build blockers to clear (uses cached actionable issues)
 	blockersToClear := buildBlockersToClearWithContext(triageCtx, unblocksMap, opts.BlockerN)
-
-	// Build top picks for quick ref. Pass the full set so blocked
-	// high-priority items don't crowd genuine actionable work out of
-	// the picks (issue #146).
-	topPicks := buildTopPicks(allRecommendations, 3, now, opts.NotReadyLabels, parentsWithOpenChildren)
 
 	// Determine top issue for commands
 	topID := ""
@@ -942,15 +1010,21 @@ func ComputeStaleness(history *correlation.HistoryReport, issues []model.Issue, 
 // buildUnblocksMap computes what each issue unblocks
 func buildUnblocksMap(ctx *TriageContext) map[string][]string {
 	unblocksMap := make(map[string][]string)
+	readiness := ctx.analyzer.Readiness()
+	now := ctx.analyzer.Now()
 
 	// We only care about blocking dependencies
 	for _, issue := range ctx.analyzer.issueMap {
-		if isClosedLikeStatus(issue.Status) || issue.IsDeferredAt(ctx.analyzer.Now()) {
+		if isClosedLikeStatus(issue.Status) || issue.IsDeferredAt(now) {
 			continue
 		}
 
 		if _, ok := unblocksMap[issue.ID]; !ok {
 			unblocksMap[issue.ID] = nil
+		}
+
+		if readiness.DependencyState(issue.ID) == model.DependenciesSatisfied {
+			continue
 		}
 
 		// Get all open blockers for this issue (including parents)
@@ -962,7 +1036,7 @@ func buildUnblocksMap(ctx *TriageContext) map[string][]string {
 			blockerID := openBlockers[0]
 			// One visible blocker is not proof of readiness: parked statuses,
 			// unresolved parent chains and output eligibility still apply.
-			if ctx.analyzer.isActionableAfterCompletions(issue.ID, map[string]bool{blockerID: true}) {
+			if ctx.analyzer.isActionableAfterSingleCompletion(issue.ID, blockerID) {
 				unblocksMap[blockerID] = append(unblocksMap[blockerID], issue.ID)
 			}
 		}
@@ -970,7 +1044,9 @@ func buildUnblocksMap(ctx *TriageContext) map[string][]string {
 
 	// Sort for determinism
 	for _, unblocks := range unblocksMap {
-		sort.Strings(unblocks)
+		if len(unblocks) > 1 {
+			sort.Strings(unblocks)
+		}
 	}
 
 	return unblocksMap
@@ -1347,6 +1423,21 @@ func isClaimableRecommendation(rec Recommendation, now time.Time, notReadyLabels
 		len(rec.BlockedBy) == 0 &&
 		!rec.isDeferredAt(now) &&
 		!hasAnyLabel(rec.Labels, notReadyLabels)
+}
+
+func isClaimableScoreAndIssue(score TriageScore, issue *model.Issue, blockedBy []string, now time.Time, notReadyLabels []string, parentsWithOpenChildren map[string]bool) bool {
+	if issue == nil || parentsWithOpenChildren[score.IssueID] {
+		return false
+	}
+	if _, ok := quoteBeadsCommandID(score.IssueID); !ok {
+		return false
+	}
+	return score.Status == string(model.StatusOpen) &&
+		issue.IssueType != model.TypeEpic &&
+		issue.Assignee == "" &&
+		len(blockedBy) == 0 &&
+		!issue.IsDeferredAt(now) &&
+		!hasAnyLabel(issue.Labels, notReadyLabels)
 }
 
 // hasAnyLabel reports whether any of issueLabels matches a label in wanted,

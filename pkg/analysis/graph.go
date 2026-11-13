@@ -1312,6 +1312,7 @@ type Analyzer struct {
 	idToNode         map[string]int64
 	nodeToID         map[int64]string
 	issueMap         map[string]model.Issue
+	issuePtrByID     map[string]*model.Issue
 	issues           []model.Issue // Analyzer-owned snapshot retained for data-hash memoization
 	childrenByParent map[string][]string
 	cascadeOnce      sync.Once
@@ -1478,11 +1479,25 @@ func (a *Analyzer) computeGraphStructureHash() string {
 		}
 		if sorted {
 			h := sha256.New()
-			for i := range cg.nodes {
-				h.Write([]byte(a.nodeToID[int64(i)]))
-				h.Write([]byte{0})
+			buf := make([]byte, 0, 4096)
+			flush := func() {
+				if len(buf) > 0 {
+					h.Write(buf)
+					buf = buf[:0]
+				}
 			}
-			h.Write([]byte{1})
+			for i := range cg.nodes {
+				id := a.nodeToID[int64(i)]
+				if len(buf)+len(id)+1 > cap(buf) {
+					flush()
+				}
+				buf = append(buf, id...)
+				buf = append(buf, 0)
+			}
+			if len(buf)+1 > cap(buf) {
+				flush()
+			}
+			buf = append(buf, 1)
 			for i, outs := range cg.out {
 				from := a.nodeToID[int64(i)]
 				if from == "" || len(outs) == 0 {
@@ -1496,12 +1511,17 @@ func (a *Analyzer) computeGraphStructureHash() string {
 					if to == "" {
 						continue
 					}
-					h.Write([]byte(from))
-					h.Write([]byte{0})
-					h.Write([]byte(to))
-					h.Write([]byte{0})
+					need := len(from) + len(to) + 2
+					if len(buf)+need > cap(buf) {
+						flush()
+					}
+					buf = append(buf, from...)
+					buf = append(buf, 0)
+					buf = append(buf, to...)
+					buf = append(buf, 0)
 				}
 			}
+			flush()
 			return hex.EncodeToString(h.Sum(nil))[:16]
 		}
 	}
@@ -1818,11 +1838,13 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 	// sorted issue-ID order so cache-equivalent input permutations cannot change
 	// sampled pivots, traversal order, floating-point reduction, or cycle choice.
 	// Malformed duplicate IDs retain the loader's last-record-wins semantics.
-	ownedIssues := make([]model.Issue, len(issues))
-	issueMap := make(map[string]model.Issue, len(issues))
-	for i, issue := range issues {
-		ownedIssues[i] = issue.Clone()
-		issueMap[ownedIssues[i].ID] = ownedIssues[i]
+	ownedIssues := model.CloneIssues(issues)
+	issueMap := make(map[string]model.Issue, len(ownedIssues))
+	issuePtrByID := make(map[string]*model.Issue, len(ownedIssues))
+	for i := range ownedIssues {
+		id := ownedIssues[i].ID
+		issueMap[id] = ownedIssues[i]
+		issuePtrByID[id] = &ownedIssues[i]
 	}
 	sortedIssueIDs := make([]string, 0, len(issueMap))
 	for id := range issueMap {
@@ -1830,45 +1852,59 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 	}
 	sort.Strings(sortedIssueIDs)
 
-	g := newCompactDirectedGraph(len(sortedIssueIDs))
-	idToNode := make(map[string]int64, len(sortedIssueIDs))
-	nodeToID := make(map[int64]string, len(sortedIssueIDs))
+	nNodes := len(sortedIssueIDs)
+	g := newCompactDirectedGraph(nNodes)
+	idToNode := make(map[string]int64, nNodes)
+	nodeToID := make(map[int64]string, nNodes)
 	childrenByParent := make(map[string][]string)
-	blockerCounts := make([]int, len(sortedIssueIDs))
+	blockerCounts := make([]int, nNodes)
 
 	// 1. Add Nodes
+	totalDeps := 0
 	for idx, id := range sortedIssueIDs {
 		nodeID := int64(idx)
 		idToNode[id] = nodeID
 		nodeToID[nodeID] = id
+		if ptr := issuePtrByID[id]; ptr != nil {
+			totalDeps += len(ptr.Dependencies)
+		}
 	}
 
 	// 2. Add blocking edges and index parent-child rollups.
 	// We only model *blocking* relationships in the analysis graph. Non-blocking
 	// links such as "related" should not influence centrality metrics or cycle
 	// detection because they do not gate execution order.
-	seenByBlocker := make([]int, len(sortedIssueIDs))
+	seenByBlocker := make([]int, nNodes)
+	var (
+		blockingTargets []int64
+		parentTargets   []string
+		edgePairs       [][2]int32
+		outDeg          []int32
+		inDeg           []int32
+	)
+	if totalDeps > 0 {
+		edgePairs = make([][2]int32, 0, totalDeps)
+		outDeg = make([]int32, nNodes)
+		inDeg = make([]int32, nNodes)
+	}
 	epoch := 0
-	for _, issueID := range sortedIssueIDs {
-		issue := issueMap[issueID]
+	for idx, issueID := range sortedIssueIDs {
+		issue := issuePtrByID[issueID]
+		if issue == nil || len(issue.Dependencies) == 0 {
+			continue
+		}
 		epoch++
-		u, ok := idToNode[issueID]
-		if !ok {
-			continue
-		}
-		if len(issue.Dependencies) == 0 {
-			continue
-		}
+		u := int64(idx)
 
-		blockingTargets := make([]int64, 0, len(issue.Dependencies))
-		var parentTargets []string
+		blockingTargets = blockingTargets[:0]
+		parentTargets = parentTargets[:0]
 		for _, dep := range issue.Dependencies {
 			if dep == nil {
 				continue
 			}
 
 			if dep.Type == model.DepParentChild {
-				if _, exists := issueMap[dep.DependsOnID]; exists {
+				if _, exists := issuePtrByID[dep.DependsOnID]; exists {
 					parentTargets = append(parentTargets, dep.DependsOnID)
 				}
 			}
@@ -1884,13 +1920,18 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 			}
 			blockingTargets = append(blockingTargets, v)
 		}
-		sort.Strings(parentTargets)
+		if len(parentTargets) > 1 {
+			sort.Strings(parentTargets)
+		}
 		for i, parentID := range parentTargets {
 			if i == 0 || parentID != parentTargets[i-1] {
 				childrenByParent[parentID] = append(childrenByParent[parentID], issueID)
 			}
 		}
-		slices.Sort(blockingTargets)
+		if len(blockingTargets) > 1 {
+			slices.Sort(blockingTargets)
+		}
+		isClosed := isClosedLikeStatus(issue.Status)
 		for _, v := range blockingTargets {
 			if v < 0 || int(v) >= len(blockerCounts) {
 				continue
@@ -1902,13 +1943,41 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 			// Blocker ratio is defined as unresolved direct dependents,
 			// so repeated dependency records from one issue count only once
 			// and already-closed dependents do not inflate live blocker ratios.
-			if !isClosedLikeStatus(issue.Status) {
+			if !isClosed {
 				blockerCounts[v]++
 			}
 
 			// Issue (u) depends on v → edge u -> v
-			g.addEdge(u, v)
+			edgePairs = append(edgePairs, [2]int32{int32(u), int32(v)})
+			outDeg[u]++
+			inDeg[v]++
 		}
+	}
+
+	if len(edgePairs) > 0 {
+		outSlab := make([]int64, len(edgePairs))
+		inSlab := make([]int64, len(edgePairs))
+		outOff := 0
+		inOff := 0
+		for i := 0; i < nNodes; i++ {
+			if d := int(outDeg[i]); d > 0 {
+				end := outOff + d
+				g.out[i] = outSlab[outOff:outOff:end]
+				outOff = end
+			}
+			if d := int(inDeg[i]); d > 0 {
+				end := inOff + d
+				g.in[i] = inSlab[inOff:inOff:end]
+				inOff = end
+			}
+		}
+		for _, pair := range edgePairs {
+			u := pair[0]
+			v := pair[1]
+			g.out[u] = append(g.out[u], int64(v))
+			g.in[v] = append(g.in[v], int64(u))
+		}
+		g.edgeCount = len(edgePairs)
 	}
 
 	maxBlockers := 0
@@ -1923,6 +1992,7 @@ func NewAnalyzer(issues []model.Issue) *Analyzer {
 		idToNode:         idToNode,
 		nodeToID:         nodeToID,
 		issueMap:         issueMap,
+		issuePtrByID:     issuePtrByID,
 		issues:           ownedIssues,
 		childrenByParent: childrenByParent,
 		blockerCounts:    blockerCounts,
@@ -3102,10 +3172,10 @@ func findArticulationPoints(adj undirectedAdjacency) map[int64]bool {
 // Returns list sorted by ID for determinism.
 func (a *Analyzer) GetActionableIssues() []model.Issue {
 	issues := a.getActionableIssuesAfterCompletions(nil)
-	for i := range issues {
-		issues[i] = issues[i].Clone()
+	if len(issues) == 0 {
+		return nil
 	}
-	return issues
+	return model.CloneIssues(issues)
 }
 
 // CountActionableIssues uses the same readiness and candidate contract without
@@ -3125,11 +3195,14 @@ func (a *Analyzer) CountActionableIssues() int {
 // to simulate a sequence of completions without mutating the analyzer's source
 // issues or maintaining a second, subtly different definition of actionable.
 func (a *Analyzer) getActionableIssuesAfterCompletions(completed map[string]bool) []model.Issue {
-	var ids []string
-	for id := range a.issueMap {
-		ids = append(ids, id)
+	ids := a.sortedIDs
+	if len(ids) != len(a.issueMap) {
+		ids = make([]string, 0, len(a.issueMap))
+		for id := range a.issueMap {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
 	}
-	sort.Strings(ids)
 
 	var actionable []model.Issue
 	readiness := a.Readiness()
@@ -3163,6 +3236,11 @@ func (a *Analyzer) ParentsWithOpenChildren() map[string]bool {
 // getIssue returns a read-only view of an issue for internal analysis code.
 // Callers must not mutate the returned issue or any of its nested data.
 func (a *Analyzer) getIssue(id string) *model.Issue {
+	if a.issuePtrByID != nil {
+		if ptr, ok := a.issuePtrByID[id]; ok {
+			return ptr
+		}
+	}
 	if issue, ok := a.issueMap[id]; ok {
 		return &issue
 	}

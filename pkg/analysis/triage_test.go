@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -2646,5 +2648,109 @@ func TestComputeWhatIf_RespectsCandidateScope(t *testing.T) {
 	}
 	if outOfScope := scoped.ComputeWhatIf("api-2", &scopedStats); outOfScope != nil {
 		t.Fatalf("expected nil when querying non-candidate api-2, got %+v", outOfScope)
+	}
+}
+
+func TestComputeTriageFromAnalyzer_UngroupedMatchesFullMaterializationOracle(t *testing.T) {
+	now := time.Date(2026, 9, 4, 15, 0, 0, 0, time.UTC)
+	future := now.Add(4 * time.Hour)
+	past := now.Add(-48 * time.Hour)
+	statuses := []model.Status{
+		model.StatusOpen,
+		model.StatusInProgress,
+		model.StatusBlocked,
+		model.StatusDeferred,
+		model.StatusClosed,
+	}
+	types := []model.IssueType{
+		model.TypeTask,
+		model.TypeBug,
+		model.TypeFeature,
+		model.TypeEpic,
+	}
+	depTypes := []model.DependencyType{
+		model.DepBlocks,
+		model.DepParentChild,
+		model.DepRelated,
+	}
+	labelPool := []string{"backend", "frontend", "wip", "security", "perf"}
+
+	rng := rand.New(rand.NewSource(20261113))
+	for trial := 0; trial < 40; trial++ {
+		n := 18 + rng.Intn(15)
+		issues := make([]model.Issue, n)
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("bd-%02d", i)
+			st := statuses[rng.Intn(len(statuses))]
+			iss := model.Issue{
+				ID:        id,
+				Title:     fmt.Sprintf("Issue %d", i),
+				Status:    st,
+				Priority:  rng.Intn(5),
+				IssueType: types[rng.Intn(len(types))],
+				CreatedAt: past.Add(-time.Duration(i) * time.Hour),
+				UpdatedAt: past.Add(time.Duration(rng.Intn(24)) * time.Hour),
+			}
+			if st == model.StatusClosed {
+				closedAt := past
+				iss.ClosedAt = &closedAt
+			}
+			if rng.Intn(5) == 0 {
+				iss.Assignee = "agent-1"
+			}
+			if rng.Intn(6) == 0 {
+				iss.DeferUntil = &future
+			}
+			for l := 0; l < rng.Intn(3); l++ {
+				iss.Labels = append(iss.Labels, labelPool[rng.Intn(len(labelPool))])
+			}
+			for d := 0; d < rng.Intn(4); d++ {
+				target := rng.Intn(n)
+				if target == i {
+					continue
+				}
+				iss.Dependencies = append(iss.Dependencies, &model.Dependency{
+					IssueID:     id,
+					DependsOnID: fmt.Sprintf("bd-%02d", target),
+					Type:        depTypes[rng.Intn(len(depTypes))],
+				})
+			}
+			issues[i] = iss
+		}
+
+		readiness := model.NewReadinessIndex(issues)
+		an := NewAnalyzer(issues)
+		an.SetReadinessScope(readiness, nil)
+		an.SetNow(now)
+		stats := an.AnalyzeAsync(context.Background())
+		stats.WaitForPhase2()
+
+		for _, actionableOnly := range []bool{false, true} {
+			for _, topN := range []int{1, 3, 10, 50} {
+				fastOpts := TriageOptions{
+					Readiness:      readiness,
+					TopN:           topN,
+					QuickWinN:      5,
+					BlockerN:       5,
+					WaitForPhase2:  true,
+					ActionableOnly: actionableOnly,
+					NotReadyLabels: []string{"wip"},
+				}
+				fullOpts := fastOpts
+				fullOpts.GroupByLabel = true
+
+				got := ComputeTriageFromAnalyzer(an, stats, issues, fastOpts, now)
+				want := ComputeTriageFromAnalyzer(an, stats, issues, fullOpts, now)
+				// Clear the grouped field and elapsed wall-clock timer before structural comparison.
+				want.RecommendationsByLabel = nil
+				got.Meta.ComputeTimeMs = 0
+				want.Meta.ComputeTimeMs = 0
+
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("trial=%d actionableOnly=%v topN=%d ungrouped triage diverged from full-materialization oracle:\ngot:  %+v\nwant: %+v",
+						trial, actionableOnly, topN, got, want)
+				}
+			}
+		}
 	}
 }

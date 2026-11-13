@@ -1255,3 +1255,164 @@ func TestIssue_Clone_NilFields(t *testing.T) {
 		t.Errorf("Comments should be nil")
 	}
 }
+
+func TestCloneIssues_DeepCopyParityAndSliceIsolation(t *testing.T) {
+	if CloneIssues(nil) != nil {
+		t.Fatal("CloneIssues(nil) must return nil")
+	}
+	empty := CloneIssues([]Issue{})
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("CloneIssues([]Issue{}) must return non-nil empty slice, got %#v", empty)
+	}
+
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	est1, est2 := 45, 90
+	ext1, commit1 := "ext-1", "deadbeef"
+	due := now.Add(24 * time.Hour)
+	deferAt := now.Add(2 * time.Hour)
+	closedAt := now.Add(-time.Hour)
+	compactedAt := now.Add(-30 * time.Minute)
+
+	issues := []Issue{
+		{
+			ID:                "i-1",
+			Title:             "Full issue",
+			Status:            StatusOpen,
+			IssueType:         TypeTask,
+			EstimatedMinutes:  &est1,
+			ClosedAt:          &closedAt,
+			DueDate:           &due,
+			DeferUntil:        &deferAt,
+			ExternalRef:       &ext1,
+			CompactedAt:       &compactedAt,
+			CompactedAtCommit: &commit1,
+			Labels:            []string{"alpha", "beta"},
+			Dependencies: []*Dependency{
+				nil,
+				{IssueID: "i-1", DependsOnID: "i-2", Type: DepBlocks, CreatedAt: now},
+			},
+			Comments: []*Comment{
+				nil,
+				{ID: "c-1", IssueID: "i-1", Author: "bot", Text: "hello", CreatedAt: now},
+			},
+			Origin: &IssueOrigin{
+				LocalID:          "i-1",
+				WorkingDirectory: "/repo",
+				TrackerDirectory: "/repo/.beads",
+				Database:         "/repo/.beads/beads.db",
+				Tracker:          "br",
+				Executable:       "/usr/bin/br",
+				SupportsClaim:    true,
+			},
+		},
+		{
+			ID:               "i-2",
+			Title:            "Empty non-nil slices",
+			Status:           StatusOpen,
+			IssueType:        TypeBug,
+			EstimatedMinutes: &est2,
+			Labels:           []string{},
+			Dependencies:     []*Dependency{},
+			Comments:         []*Comment{},
+		},
+		{
+			ID:        "i-3",
+			Title:     "Nil slices",
+			Status:    StatusClosed,
+			IssueType: TypeChore,
+		},
+	}
+
+	clones := CloneIssues(issues)
+	if len(clones) != len(issues) {
+		t.Fatalf("len(clones) = %d, want %d", len(clones), len(issues))
+	}
+	for i := range issues {
+		want := issues[i].Clone()
+		if !reflect.DeepEqual(clones[i], want) {
+			t.Fatalf("clones[%d] != issues[%d].Clone()\ngot:  %#v\nwant: %#v", i, i, clones[i], want)
+		}
+	}
+	if clones[1].Labels == nil || clones[1].Dependencies == nil || clones[1].Comments == nil {
+		t.Fatal("CloneIssues lost empty non-nil slice distinction")
+	}
+	if clones[2].Labels != nil || clones[2].Dependencies != nil || clones[2].Comments != nil {
+		t.Fatal("CloneIssues turned nil slices into non-nil slices")
+	}
+
+	// Appending to or mutating clones[0] must not bleed into issues[0] or clones[1].
+	clones[0].Labels = append(clones[0].Labels, "gamma")
+	clones[0].Dependencies[1].DependsOnID = "mutated"
+	clones[0].Dependencies = append(clones[0].Dependencies, &Dependency{DependsOnID: "extra"})
+	clones[0].Comments[1].Text = "mutated"
+	clones[0].Origin.LocalID = "mutated"
+	*clones[0].EstimatedMinutes = 999
+
+	if issues[0].Dependencies[1].DependsOnID != "i-2" || *issues[0].EstimatedMinutes != 45 || issues[0].Origin.LocalID != "i-1" {
+		t.Fatal("mutating CloneIssues result mutated source slice")
+	}
+	if len(clones[1].Labels) != 0 || len(clones[1].Dependencies) != 0 || *clones[1].EstimatedMinutes != 90 {
+		t.Fatal("appending/mutating clones[0] bled into adjacent clones[1] slab")
+	}
+}
+
+func TestReadinessAfterSingle_MatchesReadyAfterOracle(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour)
+	statuses := []Status{StatusOpen, StatusInProgress, StatusClosed, StatusTombstone, StatusDeferred, StatusBlocked}
+	edgeTypes := []DependencyType{DepBlocks, DepConditionalBlocks, DepWaitsFor, DepParentChild, DepRelated, ""}
+	rng := rand.New(rand.NewSource(99173))
+
+	for trial := 0; trial < 128; trial++ {
+		issues := make([]Issue, 10)
+		for i := range issues {
+			id := fmt.Sprintf("r-%d", i)
+			if i == 9 && trial%3 == 0 {
+				// Exercise duplicate-ID last-record-wins parity.
+				id = "r-0"
+			}
+			iss := Issue{
+				ID:        id,
+				Status:    statuses[rng.Intn(len(statuses))],
+				IssueType: TypeTask,
+			}
+			if rng.Intn(4) == 0 {
+				iss.DeferUntil = &future
+			}
+			for e := 0; e < rng.Intn(5); e++ {
+				iss.Dependencies = append(iss.Dependencies, &Dependency{
+					IssueID:     id,
+					DependsOnID: fmt.Sprintf("r-%d", rng.Intn(12)), // includes missing r-10, r-11
+					Type:        edgeTypes[rng.Intn(len(edgeTypes))],
+				})
+			}
+			issues[i] = iss
+		}
+
+		idx := NewReadinessIndex(issues)
+		candidates := []string{"", "r-0", "r-1", "r-2", "r-5", "r-10", "missing"}
+		for q := 0; q < 12; q++ {
+			qid := fmt.Sprintf("r-%d", q)
+			blockers := idx.Blockers(qid)
+			if idx.DependencyState(qid) == DependenciesSatisfied && len(blockers) != 0 {
+				t.Fatalf("trial=%d qid=%s satisfied state returned blockers=%v", trial, qid, blockers)
+			}
+			for k := 1; k < len(blockers); k++ {
+				if blockers[k-1] >= blockers[k] {
+					t.Fatalf("trial=%d qid=%s blockers not strictly sorted/unique: %v", trial, qid, blockers)
+				}
+			}
+			for _, cand := range candidates {
+				var m map[string]bool
+				if cand != "" {
+					m = map[string]bool{cand: true}
+				}
+				got := idx.ReadyAfterSingle(qid, now, cand)
+				want := idx.ReadyAfter(qid, now, m)
+				if got != want {
+					t.Fatalf("trial=%d qid=%s cand=%q ReadyAfterSingle=%v != ReadyAfter=%v", trial, qid, cand, got, want)
+				}
+			}
+		}
+	}
+}

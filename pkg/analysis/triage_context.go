@@ -32,9 +32,10 @@ type TriageContext struct {
 	stats    *GraphStats
 
 	// Computed caches
-	actionable         []model.Issue
-	actionableSet      map[string]bool
-	actionableComputed bool
+	actionable            []model.Issue
+	actionableSet         map[string]bool
+	actionableSetComputed bool
+	actionableComputed    bool
 
 	blockerDepth        map[string]int
 	openBlockers        map[string][]string
@@ -107,35 +108,67 @@ func (ctx *TriageContext) ActionableIssues() []model.Issue {
 // scheduler deferral, and has neither an open blocking dependency nor a blocked
 // parent chain.
 //
-// This ensures ActionableIssues is computed first, then does O(1) lookup.
+// This computes the actionable ID set on first access without deep-cloning full
+// Issue bodies when only membership queries are needed, then does O(1) lookup.
 func (ctx *TriageContext) IsActionable(id string) bool {
 	ctx.lock()
 	defer ctx.unlock()
 
-	ctx.ensureActionableInternal()
+	ctx.ensureActionableSetInternal()
 	return ctx.actionableSet[id]
 }
 
-// ensureActionableInternal populates actionable caches without locking.
+// ensureActionableSetInternal populates actionableSet without cloning Issue structs.
+// MUST be called while holding the lock.
+func (ctx *TriageContext) ensureActionableSetInternal() {
+	if ctx.actionableSetComputed {
+		metrics.TriageCache.Hit()
+		return
+	}
+	metrics.TriageCache.Miss()
+
+	readiness := ctx.analyzer.Readiness()
+	now := ctx.analyzer.Now()
+	ctx.actionableSet = make(map[string]bool)
+	for id := range ctx.analyzer.issueMap {
+		if ctx.analyzer.IsCandidate(id) && readiness.Ready(id, now) {
+			ctx.actionableSet[id] = true
+		}
+	}
+	ctx.actionableSetComputed = true
+}
+
+// ensureActionableInternal populates actionable slice and set caches without locking.
 // MUST be called while holding the lock.
 func (ctx *TriageContext) ensureActionableInternal() {
 	if ctx.actionableComputed {
 		metrics.TriageCache.Hit()
 		return
 	}
-	metrics.TriageCache.Miss()
+	if !ctx.actionableSetComputed {
+		metrics.TriageCache.Miss()
+	} else {
+		metrics.TriageCache.Hit()
+	}
 
 	ctx.actionable = ctx.analyzer.GetActionableIssues()
-	ctx.actionableSet = make(map[string]bool, len(ctx.actionable))
-	for _, issue := range ctx.actionable {
-		ctx.actionableSet[issue.ID] = true
+	if !ctx.actionableSetComputed {
+		ctx.actionableSet = make(map[string]bool, len(ctx.actionable))
+		for _, issue := range ctx.actionable {
+			ctx.actionableSet[issue.ID] = true
+		}
+		ctx.actionableSetComputed = true
 	}
 	ctx.actionableComputed = true
 }
 
 // ActionableCount returns the number of actionable issues.
 func (ctx *TriageContext) ActionableCount() int {
-	return len(ctx.ActionableIssues())
+	ctx.lock()
+	defer ctx.unlock()
+
+	ctx.ensureActionableSetInternal()
+	return len(ctx.actionableSet)
 }
 
 // BlockerDepth returns the depth of the blocker chain for an issue.
@@ -337,6 +370,7 @@ func (ctx *TriageContext) Reset() {
 
 	ctx.actionable = nil
 	ctx.actionableSet = nil
+	ctx.actionableSetComputed = false
 	ctx.actionableComputed = false
 	ctx.blockerDepth = make(map[string]int)
 	ctx.openBlockers = make(map[string][]string)
