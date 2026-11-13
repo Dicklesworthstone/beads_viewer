@@ -707,3 +707,17 @@ func TestViewerJS_NoExternalCDNFallbackUnderSelfCSP(t *testing.T) {
 		t.Fatal("index.html must retain strict script-src 'self' CSP")
 	}
 }
+
+func TestViewerJS_MarkdownStripsInlineHandlersBeforeDOMPurify(t *testing.T) {
+	js, err := ViewerAssetsFS.ReadFile("viewer_assets/viewer.js")
+	if err != nil {
+		t.Fatalf("read embedded viewer.js: %v", err)
+	}
+	viewerJS := string(js)
+	if !strings.Contains(viewerJS, "new marked.Marked(") || !strings.Contains(viewerJS, "stripInlineEventAttributes") {
+		t.Fatal("viewer.js must strip inline event-handler attributes via a custom marked.Marked renderer before DOMPurify sanitization")
+	}
+	if strings.Contains(viewerJS, "marked.parse(text)") || strings.Contains(viewerJS, "marked.parseInline(text)") {
+		t.Fatal("viewer.js must not call default marked.parse/parseInline with raw inline event-handler attributes")
+	}
+}

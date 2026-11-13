@@ -2196,22 +2196,69 @@ function getScoreBreakdownBars(breakdown) {
     .sort((a, b) => b.value - a.value);
 }
 
+function escapeRawHtmlForDisplay(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[ch]));
+}
+
+function stripInlineEventAttributes(rawHtml) {
+  const input = String(rawHtml ?? '');
+  if (input.indexOf('<') === -1) return input;
+  // Strip inline on*= event-handler attributes on raw HTML start tags before
+  // DOMPurify invokes DOMParser so Chromium does not emit parser-time CSP
+  // inline-handler errors prior to DOMPurify's authoritative sanitization.
+  return input.replace(/<[a-zA-Z](?:"[^"]*"|'[^']*'|[^>"'])*>/g, tag => {
+    let cur = tag;
+    let prev;
+    do {
+      prev = cur;
+      cur = cur.replace(/(?:[\s/]+)on[a-zA-Z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>"']*)/gi, ' ');
+    } while (cur !== prev);
+    return cur;
+  });
+}
+
+let SAFE_MARKED_INSTANCE = null;
+
+function getSafeMarkedInstance() {
+  if (SAFE_MARKED_INSTANCE) return SAFE_MARKED_INSTANCE;
+  if (typeof marked !== 'undefined' && typeof marked.Marked === 'function') {
+    SAFE_MARKED_INSTANCE = new marked.Marked({
+      renderer: {
+        html(token) {
+          const raw = typeof token === 'string' ? token : (token?.raw ?? token?.text ?? '');
+          return stripInlineEventAttributes(raw);
+        }
+      }
+    });
+  }
+  return SAFE_MARKED_INSTANCE;
+}
+
 /**
  * Format JSON with syntax highlighting for display
  */
 function formatJsonWithHighlight(obj) {
   if (!obj) return '';
   try {
-    const json = JSON.stringify(obj, null, 2);
+    const json = JSON.stringify(obj, null, 2)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
     // Add syntax highlighting classes
     return json
-      .replace(/"([^"]+)":/g, '<span class="text-purple-600 dark:text-purple-400">"$1"</span>:')
-      .replace(/: "([^"]*)"/g, ': <span class="text-green-600 dark:text-green-400">"$1"</span>')
-      .replace(/: (\d+\.?\d*)/g, ': <span class="text-blue-600 dark:text-blue-400">$1</span>')
+      .replace(/"([^"\\]*(?:\\.[^"\\]*)*)":/g, '<span class="text-purple-600 dark:text-purple-400">"$1"</span>:')
+      .replace(/: "([^"\\]*(?:\\.[^"\\]*)*)"/g, ': <span class="text-green-600 dark:text-green-400">"$1"</span>')
+      .replace(/: (-?\d+\.?\d*)/g, ': <span class="text-blue-600 dark:text-blue-400">$1</span>')
       .replace(/: (true|false)/g, ': <span class="text-amber-600 dark:text-amber-400">$1</span>')
       .replace(/: (null)/g, ': <span class="text-gray-500 dark:text-gray-400">$1</span>');
   } catch {
-    return String(obj);
+    return escapeRawHtmlForDisplay(obj);
   }
 }
 
@@ -2221,10 +2268,11 @@ function formatJsonWithHighlight(obj) {
 function renderMarkdown(text) {
   if (!text) return '';
   try {
-    const html = marked.parse(text);
+    const parser = getSafeMarkedInstance();
+    const html = parser ? parser.parse(String(text)) : stripInlineEventAttributes(text);
     return DOMPurify.sanitize(html);
   } catch {
-    return DOMPurify.sanitize(text);
+    return DOMPurify.sanitize(stripInlineEventAttributes(text));
   }
 }
 
@@ -2235,11 +2283,12 @@ function renderMarkdown(text) {
 function renderMarkdownInline(text) {
   if (!text) return '';
   try {
+    const parser = getSafeMarkedInstance();
     // Use marked's parseInline to avoid block elements like <p>
-    const html = marked.parseInline(text);
+    const html = parser ? parser.parseInline(String(text)) : stripInlineEventAttributes(text);
     return DOMPurify.sanitize(html);
   } catch {
-    return DOMPurify.sanitize(text);
+    return DOMPurify.sanitize(stripInlineEventAttributes(text));
   }
 }
 
