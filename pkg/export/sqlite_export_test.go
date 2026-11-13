@@ -1172,3 +1172,65 @@ func TestStringSliceContains(t *testing.T) {
 		}
 	}
 }
+
+func TestExport_ExplicitMetricsWithoutStats(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	issues := []*model.Issue{
+		makeTestIssue("met-1", "Root Blocker", model.StatusOpen, 0, model.TypeTask),
+		makeTestIssue("met-2", "Dependent Task", model.StatusOpen, 1, model.TypeFeature),
+	}
+	deps := []*model.Dependency{
+		{IssueID: "met-2", DependsOnID: "met-1", Type: model.DepBlocks},
+	}
+	metrics := map[string]*model.IssueMetrics{
+		"met-1": {
+			PageRank:          0.75,
+			Betweenness:       0.40,
+			CriticalPathDepth: 3,
+			TriageScore:       0.92,
+		},
+		"met-2": {
+			PageRank:          0.25,
+			Betweenness:       0.10,
+			CriticalPathDepth: 1,
+			TriageScore:       0.55,
+		},
+	}
+
+	exp := NewSQLiteExporter(issues, deps, metrics, nil)
+	if exp.Stats != nil {
+		t.Fatal("expected Stats to be nil when explicit Metrics map is provided")
+	}
+	if err := exp.Export(tmpDir); err != nil {
+		t.Fatalf("Export with explicit Metrics failed: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(tmpDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("open exported sqlite db: %v", err)
+	}
+	defer db.Close()
+
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM issue_metrics`).Scan(&count); err != nil {
+		t.Fatalf("count issue_metrics: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("issue_metrics count = %d, want 2", count)
+	}
+
+	var pr, bw, score float64
+	var cp, blocks, blockedBy int
+	if err := db.QueryRow(`
+		SELECT pagerank, betweenness, critical_path_depth, triage_score, blocks_count, blocked_by_count
+		FROM issue_overview_mv
+		WHERE id = ?
+	`, "met-1").Scan(&pr, &bw, &cp, &score, &blocks, &blockedBy); err != nil {
+		t.Fatalf("query issue_overview_mv for met-1: %v", err)
+	}
+	if pr != 0.75 || bw != 0.40 || cp != 3 || score != 0.92 || blocks != 1 || blockedBy != 0 {
+		t.Fatalf("met-1 overview metrics = (pr=%v, bw=%v, cp=%d, score=%v, blocks=%d, blockedBy=%d), want (0.75, 0.4, 3, 0.92, 1, 0)",
+			pr, bw, cp, score, blocks, blockedBy)
+	}
+}
