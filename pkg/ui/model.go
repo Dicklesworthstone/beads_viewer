@@ -878,14 +878,19 @@ func WaitForBackgroundWorkerMsgCmd(w *BackgroundWorker) tea.Cmd {
 	}
 }
 
-// CheckUpdateCmd returns a command that checks for updates
+// StartupUpdateCheckMsg reports completion of the automatic startup release check
+// so the TUI can record the one-time github.com disclosure even when already up to date.
+type StartupUpdateCheckMsg struct {
+	TagName string
+	URL     string
+	Err     error
+}
+
+// CheckUpdateCmd returns a command that runs the startup update check.
 func CheckUpdateCmd() tea.Cmd {
 	return func() tea.Msg {
 		tag, url, err := updater.CheckForUpdates()
-		if err == nil && tag != "" {
-			return UpdateMsg{TagName: tag, URL: url}
-		}
-		return nil
+		return StartupUpdateCheckMsg{TagName: tag, URL: url, Err: err}
 	}
 }
 
@@ -2613,7 +2618,8 @@ func (m *Model) Init() tea.Cmd {
 	// The automatic release check is opt-out (BV_NO_UPDATE_CHECK=1 or
 	// updates.check: false in ~/.config/bv/config.yaml); explicit
 	// --check-update/--update still work when it is disabled (#197).
-	if updater.StartupCheckEnabled() {
+	// Tests suppress automatic network calls via BV_TEST_MODE.
+	if updater.StartupCheckEnabled() && env.TestMode.Get() == "" {
 		cmds = append(cmds, CheckUpdateCmd())
 	}
 	// cass detection at startup (E4); tests opt back in by clearing BV_TEST_MODE.
@@ -2867,6 +2873,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("Background reload error: %v", msg.err)
 			m.statusIsError = true
 		}
+		return m, nil
+
+	case StartupUpdateCheckMsg:
+		if updater.StartupDisclosurePending() {
+			if m.statusMsg == "" || !m.statusIsError {
+				m.statusMsg = "Checked github.com for updates (set BV_NO_UPDATE_CHECK=1 to disable)"
+				m.statusIsError = false
+			}
+			_ = updater.RecordStartupDisclosure()
+		}
+		if msg.Err != nil || !updater.IsNewerThanCurrent(msg.TagName) {
+			m.updateAvailable = false
+			m.updateTag = ""
+			m.updateURL = ""
+			m.refreshVisibleUpdateNotice()
+			return m, nil
+		}
+		m.updateAvailable = true
+		m.updateTag = msg.TagName
+		m.updateURL = msg.URL
+		m.refreshVisibleUpdateNotice()
 		return m, nil
 
 	case UpdateMsg:
@@ -11861,4 +11888,9 @@ func (m *Model) focusedIssueForSessions() *model.Issue {
 	}
 	iss := issueItem.Issue
 	return &iss
+}
+
+// IsTutorialContextMode reports whether the tutorial overlay is currently open in context-filtered mode.
+func (m *Model) IsTutorialContextMode() bool {
+	return m.showTutorial && m.tutorialModel.IsContextMode()
 }

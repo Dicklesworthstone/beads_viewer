@@ -17,6 +17,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/updater"
 )
 
 func TestMain(m *testing.M) {
@@ -706,5 +707,97 @@ func TestFileChangedAndPhase2PreserveFilterSortRecipeAndSprintDashboard(t *testi
 	snap2 := snap1.WithPhase2(&stats, stats.GenerateInsights(len(graphIssues)), graphIssues, analyzer)
 	if len(snap2.ListItems) == 0 || snap2.ListItems[0].Issue.ID != "Z-root" {
 		t.Fatalf("expected DataSnapshot.WithPhase2 to re-sort recipe by Phase 2 PageRank with Z-root first, got %+v", snap2.ListItems)
+	}
+}
+
+func TestModel_StartupUpdateDisclosureShownOnce(t *testing.T) {
+	cfgRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfgRoot)
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+
+	if !updater.StartupDisclosurePending() {
+		t.Fatal("expected StartupDisclosurePending to be true on fresh config dir")
+	}
+
+	issues := []model.Issue{
+		{ID: "DISC-1", Title: "Disclosure test", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+	}
+	m := NewModel(issues, nil, "")
+	updated, _ := m.Update(StartupUpdateCheckMsg{TagName: "", URL: "", Err: nil})
+	m = updated.(*Model)
+
+	if !strings.Contains(m.statusMsg, "Checked github.com for updates") {
+		t.Fatalf("expected one-time github.com disclosure in statusMsg, got %q", m.statusMsg)
+	}
+	if m.statusIsError {
+		t.Fatal("startup disclosure must not be marked as an error")
+	}
+	if updater.StartupDisclosurePending() {
+		t.Fatal("expected StartupDisclosurePending to become false after first startup check")
+	}
+
+	// Second run must not repeat the disclosure.
+	m.statusMsg = ""
+	updated, _ = m.Update(StartupUpdateCheckMsg{TagName: "", URL: "", Err: nil})
+	m = updated.(*Model)
+	if m.statusMsg != "" {
+		t.Fatalf("expected second StartupUpdateCheckMsg to stay quiet, got %q", m.statusMsg)
+	}
+
+	// Under BV_NO_SAVED_CONFIG=1, nothing is shown and no config directory is created.
+	noSaveRoot := filepath.Join(t.TempDir(), "unsaved-xdg")
+	t.Setenv("XDG_CONFIG_HOME", noSaveRoot)
+	t.Setenv("BV_NO_SAVED_CONFIG", "1")
+	m2 := NewModel(issues, nil, "")
+	updated2, _ := m2.Update(StartupUpdateCheckMsg{TagName: "", URL: "", Err: nil})
+	m2 = updated2.(*Model)
+	if m2.statusMsg != "" {
+		t.Fatalf("expected BV_NO_SAVED_CONFIG=1 to suppress disclosure, got %q", m2.statusMsg)
+	}
+	if _, err := os.Stat(noSaveRoot); !os.IsNotExist(err) {
+		t.Fatalf("expected BV_NO_SAVED_CONFIG=1 not to create config dir, stat err=%v", err)
+	}
+}
+
+func TestFlowMatrix_RendersTransitiveCascade(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "bv-root", Title: "Schema migration", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"schema"}},
+		{
+			ID: "bv-db", Title: "DB layer", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"db"},
+			Dependencies: []*model.Dependency{{IssueID: "bv-db", DependsOnID: "bv-root", Type: model.DepBlocks}},
+		},
+		{
+			ID: "bv-api", Title: "API handler", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"api"},
+			Dependencies: []*model.Dependency{{IssueID: "bv-api", DependsOnID: "bv-db", Type: model.DepBlocks}},
+		},
+		{
+			ID: "bv-ui", Title: "Frontend view", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"ui"},
+			Dependencies: []*model.Dependency{{IssueID: "bv-ui", DependsOnID: "bv-api", Type: model.DepBlocks}},
+		},
+	}
+	flow := analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m := NewModel(issues, nil, "")
+	fm := NewFlowMatrixModel(m.theme)
+	fm.SetData(&flow, issues)
+	fm.SetSize(120, 35)
+
+	// Select "db" label (which has dependency-blocked bv-db and downstream api -> ui).
+	foundDB := false
+	for i := 0; i < 10; i++ {
+		if fm.SelectedLabel() == "db" {
+			foundDB = true
+			break
+		}
+		fm.MoveDown()
+	}
+	if !foundDB {
+		t.Fatalf("expected to select 'db' in FlowMatrixModel, selected=%q", fm.SelectedLabel())
+	}
+
+	view := fm.View()
+	for _, want := range []string{"TRANSITIVE CASCADE", "Downstream waiting: 2 (2 levels)", "Top unblock: bv-root"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("FlowMatrixModel.View() missing %q:\n%s", want, view)
+		}
 	}
 }
