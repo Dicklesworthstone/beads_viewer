@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=5">
   <title>Beads Viewer</title>
+  <link rel="icon" href="data:,">
 
   <!-- Mobile Web App Optimizations -->
   <meta name="mobile-web-app-capable" content="yes">
@@ -737,6 +738,7 @@
                     <div class="flex-1 min-w-0">
                       <span class="text-[10px] sm:text-xs font-mono text-emerald-600 dark:text-emerald-400" x-text="issue.id"></span>
                       <h3 class="text-sm font-medium truncate text-gray-900 dark:text-gray-100 mt-0.5" x-text="issue.title" :title="issue.title"></h3>
+                      <p x-show="issue.reason" class="text-xs text-gray-500 dark:text-gray-400 mt-1 line-clamp-1" x-text="issue.reason"></p>
                     </div>
                     <span x-show="issue.blocks_count" class="shrink-0 px-2 py-0.5 text-[10px] sm:text-xs font-semibold bg-emerald-100 dark:bg-emerald-800/50 text-emerald-700 dark:text-emerald-300 rounded-full">
                       <span x-text="issue.blocks_count"></span> blocked
@@ -1150,6 +1152,10 @@
                             class="px-2 py-0.5 text-xs font-medium rounded bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300 animate-pulse">
                         🔥 Critical #<span x-text="getCriticalPathPosition(issue.id)"></span>
                       </span>
+                      <span x-show="issue.in_cycle"
+                            class="px-2 py-0.5 text-xs font-medium rounded bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300">
+                        ↻ Cycle
+                      </span>
                       <!-- Status badge shown inline on mobile only -->
                       <span class="sm:hidden px-2 py-0.5 text-xs font-medium rounded-full"
                             :class="'status-' + issue.status"
@@ -1174,6 +1180,15 @@
                   <span x-show="issue.assignee" class="truncate max-w-[120px] sm:max-w-none"><span class="font-medium">Assignee:</span> <span x-text="issue.assignee"></span></span>
                   <span x-show="issue.blocks_count"><span class="font-medium">Blocks:</span> <span x-text="issue.blocks_count"></span></span>
                   <span x-show="issue.blocked_by_count"><span class="font-medium">Blocked by:</span> <span x-text="issue.blocked_by_count"></span></span>
+                  <span x-show="issue.comment_count > 0" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700/70 text-gray-600 dark:text-gray-300">
+                    💬 <span x-text="issue.comment_count"></span>
+                  </span>
+                  <span x-show="issue.due_date"
+                        :class="isIssueOverdue(issue) ? 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 font-semibold' : 'bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300'"
+                        class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded">
+                    <span x-text="isIssueOverdue(issue) ? 'Overdue:' : 'Due:'"></span>
+                    <span x-text="formatDate(issue.due_date)"></span>
+                  </span>
                   <template x-if="issue.labels">
                     <template x-for="label in parseLabels(issue.labels)" :key="label">
                       <span @click.stop="toggleLabelFilter(label)"
@@ -1600,7 +1615,7 @@
             <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-4">
               <div class="flex items-center justify-center sm:justify-start gap-3">
                 <button @click="prevCycleInGraph()"
-                        :disabled="!cycleNavigatorActive || (totalCycles || cycleInfo?.cycleCount || 0) <= 1"
+                        :disabled="(totalCycles || cycleInfo?.cycleCount || 0) <= 1"
                         class="w-10 h-10 rounded-xl border border-red-300 dark:border-red-700 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 disabled:opacity-40 disabled:cursor-not-allowed transition-all touch-btn haptic-light flex items-center justify-center">
                   <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
                 </button>
@@ -1610,7 +1625,7 @@
                   <span class="text-lg font-semibold text-gray-600 dark:text-gray-300" x-text="totalCycles || cycleInfo?.cycleCount || '–'"></span>
                 </div>
                 <button @click="nextCycleInGraph()"
-                        :disabled="!cycleNavigatorActive || (totalCycles || cycleInfo?.cycleCount || 0) <= 1"
+                        :disabled="(totalCycles || cycleInfo?.cycleCount || 0) <= 1"
                         class="w-10 h-10 rounded-xl border border-red-300 dark:border-red-700 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 disabled:opacity-40 disabled:cursor-not-allowed transition-all touch-btn haptic-light flex items-center justify-center">
                   <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
                 </button>
@@ -1930,7 +1945,7 @@
                         <svg class="w-3 h-3 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                       </button>
                     </div>
-                    <p class="metric-panel-subtitle text-blue-600 dark:text-blue-400">PageRank / Eigenvector</p>
+                    <p class="metric-panel-subtitle text-blue-600 dark:text-blue-400">Eigenvector Centrality</p>
                   </div>
                 </div>
                 <div class="metric-panel-expand">
@@ -1986,16 +2001,16 @@
                 </div>
               </div>
               <div class="metric-panel-items">
-                <template x-for="(issue, idx) in topByPageRank.slice(0, expandedPanel === 'influencers' ? 10 : 5)" :key="issue.id">
+                <template x-for="(issue, idx) in topByEigenvector.slice(0, expandedPanel === 'influencers' ? 10 : 5)" :key="issue.id">
                   <div class="metric-item group" @click.stop="showIssue(issue.id)">
                     <span class="metric-item-rank text-white"
                           :class="idx === 0 ? 'bg-gradient-to-br from-blue-400 to-sky-500' : idx === 1 ? 'bg-gradient-to-br from-gray-300 to-gray-400' : idx === 2 ? 'bg-gradient-to-br from-blue-600 to-sky-700' : 'bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400'"
                           x-text="idx + 1"></span>
                     <span class="metric-item-title group-hover:text-blue-600 dark:group-hover:text-blue-400" x-text="issue.title"></span>
-                    <span class="metric-item-score bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400" x-text="issue.pagerank?.toFixed(4) || '?'"></span>
+                    <span class="metric-item-score bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400" x-text="issue.eigenvector?.toFixed(4) || '0.0000'"></span>
                   </div>
                 </template>
-                <p x-show="topByPageRank.length === 0" class="text-xs text-gray-400 text-center py-6 italic">No PageRank data available</p>
+                <p x-show="topByEigenvector.length === 0" class="text-xs text-gray-400 text-center py-6 italic">No eigenvector data available</p>
               </div>
             </div>
 
@@ -3134,12 +3149,21 @@
                       class="px-2 py-1.5 text-xs rounded-md transition-all duration-150 flex items-center gap-1 w-full justify-center active:scale-95 hover:scale-[1.02]" title="Toggle heatmap coloring (H)">
                 <span>🔥</span> <span x-text="graphHeatmapActive ? 'ON' : 'OFF'"></span>
               </button>
-              <select x-model="graphSizeMetric" @change="setGraphSizeMetric($event.target.value)"
+              <select id="graphSizeMetric"
+                      aria-label="Node size and heatmap metric"
+                      x-model="graphSizeMetric"
+                      @change="setGraphSizeMetric($event.target.value)"
                       class="text-xs px-2 py-1.5 rounded-md border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200">
                 <option value="pagerank">PageRank</option>
                 <option value="betweenness">Betweenness</option>
-                <option value="critical">Critical Path</option>
-                <option value="indegree">In-Degree</option>
+                <option value="eigenvector">Eigenvector</option>
+                <option value="inDegree">In-Degree</option>
+                <option value="outDegree">Out-Degree</option>
+                <option value="criticalPath">Critical Path</option>
+                <option value="kcore">K-Core</option>
+                <option value="hitsHub">HITS Hub</option>
+                <option value="hitsAuth">HITS Authority</option>
+                <option value="slack">Slack</option>
               </select>
             </div>
             <div class="mt-2 pt-2 border-t border-gray-200 dark:border-gray-600">
@@ -3169,7 +3193,7 @@
       <div class="absolute bottom-4 left-4 pointer-events-auto transition-opacity duration-200"
            :class="graphDetailNode ? 'hidden md:block' : ''">
         <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-2 md:p-3">
-          <div class="text-xs text-gray-500 dark:text-gray-400 mb-1.5 md:mb-2" x-text="graphHeatmapActive ? 'Heatmap: ' + {pagerank:'PageRank',betweenness:'Betweenness',critical:'Critical Path',indegree:'In-Degree'}[graphSizeMetric] : 'Legend'"></div>
+          <div class="text-xs text-gray-500 dark:text-gray-400 mb-1.5 md:mb-2" x-text="graphHeatmapActive ? 'Heatmap: ' + ({pagerank:'PageRank',betweenness:'Betweenness',eigenvector:'Eigenvector',inDegree:'In-Degree',indegree:'In-Degree',outDegree:'Out-Degree',criticalPath:'Critical Path',critical:'Critical Path',kcore:'K-Core',hitsHub:'HITS Hub',hitsAuth:'HITS Authority',slack:'Slack'}[graphSizeMetric] || graphSizeMetric) : 'Legend'"></div>
           <!-- Status color legend (default) -->
           <div x-show="!graphHeatmapActive" class="flex flex-wrap gap-x-3 md:gap-x-4 gap-y-1 text-[10px] md:text-xs">
             <div class="flex items-center gap-1"><div class="w-2.5 h-2.5 md:w-3 md:h-3 rounded-full bg-green-500"></div> Open</div>
@@ -3319,6 +3343,14 @@
                               'bg-gray-400 dark:bg-gray-600 text-white': selectedIssue.priority >= 3
                             }"
                             x-text="'P' + selectedIssue.priority"></span>
+                      <span x-show="selectedIssue.in_cycle"
+                            class="px-2 py-0.5 text-xs font-semibold rounded-full bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800">
+                        ↻ In Cycle
+                      </span>
+                      <span x-show="(selectedIssue.comment_count || (selectedIssue.comments && selectedIssue.comments.length) || 0) > 0"
+                            class="px-2 py-0.5 text-xs font-medium rounded-full bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300">
+                        💬 <span x-text="selectedIssue.comment_count || (selectedIssue.comments ? selectedIssue.comments.length : 0)"></span>
+                      </span>
                     </div>
                     <h2 class="text-lg font-semibold text-gray-900 dark:text-white leading-snug" x-text="selectedIssue.title"></h2>
                     <button @click="copyIssueLink()" class="mt-2 px-3 py-2 text-sm rounded-lg bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-200">Copy link</button>
@@ -3426,14 +3458,69 @@
                 </div>
               </div>
 
+              <!-- Triage Recommendation & Score Breakdown Section -->
+              <div x-show="selectedIssue.triage_action || (selectedIssue.triage_reasons && selectedIssue.triage_reasons.length > 0) || (selectedIssue.score_breakdown_bars && selectedIssue.score_breakdown_bars.length > 0)"
+                   class="mb-6 bg-violet-50/50 dark:bg-violet-950/20 rounded-xl p-4 border border-violet-200/60 dark:border-violet-800/40">
+                <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+                  <h3 class="text-xs font-semibold text-violet-700 dark:text-violet-300 uppercase tracking-wider">Triage Recommendation</h3>
+                  <span x-show="selectedIssue.triage_action"
+                        class="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-violet-100 dark:bg-violet-900/50 text-violet-700 dark:text-violet-200"
+                        x-text="selectedIssue.triage_action"></span>
+                </div>
+                <ul x-show="selectedIssue.triage_reasons && selectedIssue.triage_reasons.length > 0"
+                    class="space-y-1 mb-3 text-xs text-gray-700 dark:text-gray-300 list-disc list-inside">
+                  <template x-for="(reason, rIdx) in (selectedIssue.triage_reasons || [])" :key="rIdx">
+                    <li x-text="reason"></li>
+                  </template>
+                </ul>
+                <div x-show="selectedIssue.triage_unblocks_ids && selectedIssue.triage_unblocks_ids.length > 0" class="mb-3">
+                  <div class="text-[11px] font-medium text-gray-500 dark:text-gray-400 mb-1">Directly Unblocks</div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <template x-for="uid in (selectedIssue.triage_unblocks_ids || [])" :key="uid">
+                      <button @click="showIssue(uid)"
+                              class="px-2 py-0.5 text-xs font-mono bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 rounded hover:bg-emerald-200 dark:hover:bg-emerald-800/60 transition-colors"
+                              x-text="uid"></button>
+                    </template>
+                  </div>
+                </div>
+                <div x-show="selectedIssue.score_breakdown_bars && selectedIssue.score_breakdown_bars.length > 0" class="space-y-2 pt-2 border-t border-violet-200/50 dark:border-violet-800/40">
+                  <div class="text-[11px] font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">Score Breakdown</div>
+                  <template x-for="bar in (selectedIssue.score_breakdown_bars || [])" :key="bar.key">
+                    <div class="flex items-center gap-2 text-xs">
+                      <span class="w-24 shrink-0 text-gray-600 dark:text-gray-300 font-medium truncate" x-text="bar.name"></span>
+                      <div class="flex-1 score-breakdown-track bg-gray-200 dark:bg-gray-700">
+                        <div class="score-breakdown-fill" :class="[bar.colorClass, bar.widthClass]"></div>
+                      </div>
+                      <span class="w-14 shrink-0 text-right font-mono text-[11px] text-gray-500 dark:text-gray-400" x-text="bar.value.toFixed(3)"></span>
+                    </div>
+                  </template>
+                </div>
+              </div>
+
               <!-- Metadata Grid -->
               <div class="mb-6">
                 <h3 class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-3">Details</h3>
-                <div class="grid grid-cols-2 gap-x-6 gap-y-2 text-sm bg-gray-50/50 dark:bg-gray-900/30 rounded-lg p-4 border border-gray-100 dark:border-gray-700/50">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm bg-gray-50/50 dark:bg-gray-900/30 rounded-lg p-4 border border-gray-100 dark:border-gray-700/50">
                   <div x-show="selectedIssue.assignee" class="flex items-center gap-2">
                     <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
                     <span class="text-gray-500 dark:text-gray-400">Assignee:</span>
                     <span class="font-medium text-gray-900 dark:text-white" x-text="selectedIssue.assignee"></span>
+                  </div>
+                  <div x-show="selectedIssue.external_ref" class="flex items-center gap-2">
+                    <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>
+                    <span class="text-gray-500 dark:text-gray-400">External Ref:</span>
+                    <span class="font-mono text-xs px-1.5 py-0.5 rounded bg-gray-200/70 dark:bg-gray-700 text-gray-800 dark:text-gray-200" x-text="selectedIssue.external_ref"></span>
+                  </div>
+                  <div x-show="selectedIssue.due_date" class="flex items-center gap-2">
+                    <svg class="w-4 h-4" :class="selectedIssue.is_overdue ? 'text-red-500' : 'text-amber-500'" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                    <span class="text-gray-500 dark:text-gray-400">Due Date:</span>
+                    <span :class="selectedIssue.is_overdue ? 'text-red-600 dark:text-red-400 font-semibold' : 'text-gray-700 dark:text-gray-300'" x-text="formatDateFull(selectedIssue.due_date)"></span>
+                    <span x-show="selectedIssue.is_overdue" class="px-1.5 py-0.5 text-[10px] font-bold uppercase rounded bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300">Overdue</span>
+                  </div>
+                  <div x-show="selectedIssue.defer_until" class="flex items-center gap-2">
+                    <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+                    <span class="text-gray-500 dark:text-gray-400">Defer Until:</span>
+                    <span class="text-gray-700 dark:text-gray-300" x-text="formatDateFull(selectedIssue.defer_until)"></span>
                   </div>
                   <div class="flex items-center gap-2">
                     <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
@@ -3454,7 +3541,7 @@
               </div>
 
               <!-- Dependencies Section -->
-              <div x-show="selectedIssue.blocks_ids || selectedIssue.blocked_by_ids" class="pt-6 border-t border-gray-200 dark:border-gray-700">
+              <div x-show="selectedIssue.has_any_dependencies || selectedIssue.blocks_ids || selectedIssue.blocked_by_ids" class="pt-6 border-t border-gray-200 dark:border-gray-700">
                 <div class="flex items-center justify-between mb-4">
                   <h3 class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Dependencies</h3>
                   <button @click="showDepGraph = !showDepGraph"
@@ -3467,46 +3554,104 @@
                   </button>
                 </div>
 
-                <!-- Dependency Lists -->
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-                  <div x-show="selectedIssue.blocked_by_ids">
-                    <h4 class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2 flex items-center">
-                      <svg class="w-3 h-3 mr-1 text-yellow-500" fill="currentColor" viewBox="0 0 20 20">
-                        <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
-                      </svg>
-                      Blocked By (<span x-text="(selectedIssue.blocked_by_ids || '').split(',').filter(Boolean).length"></span>)
-                    </h4>
-                    <div class="flex flex-wrap gap-1.5">
-                      <template x-for="id in (selectedIssue.blocked_by_ids || '').split(',').filter(Boolean)" :key="id">
-                        <button @click="showIssue(id.trim())"
-                                class="px-2 py-1 text-xs font-mono bg-yellow-50 dark:bg-yellow-900/20 text-yellow-700 dark:text-yellow-300 rounded hover:bg-yellow-100 dark:hover:bg-yellow-900/40 transition-colors"
-                                x-text="id.trim()"></button>
-                      </template>
+                <!-- Category 1: Blocking / Blocked By -->
+                <div x-show="(selectedIssue.dependencyGroups?.blockedBy?.length > 0) || (selectedIssue.dependencyGroups?.blocks?.length > 0) || selectedIssue.blocked_by_ids || selectedIssue.blocks_ids"
+                     class="mb-4">
+                  <div class="text-[11px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2">Blocking / Blocked By</div>
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div x-show="(selectedIssue.dependencyGroups?.blockedBy?.length > 0) || selectedIssue.blocked_by_ids">
+                      <h4 class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2 flex items-center">
+                        <svg class="w-3 h-3 mr-1 text-yellow-500" fill="currentColor" viewBox="0 0 20 20">
+                          <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/>
+                        </svg>
+                        Blocked By (<span x-text="selectedIssue.dependencyGroups?.blockedBy?.length || (selectedIssue.blocked_by_ids || '').split(',').filter(Boolean).length"></span>)
+                      </h4>
+                      <div class="flex flex-wrap gap-1.5">
+                        <template x-for="dep in (selectedIssue.dependencyGroups?.blockedBy?.length ? selectedIssue.dependencyGroups.blockedBy : (selectedIssue.blocked_by_ids || '').split(',').filter(Boolean).map(s => ({ id: s.trim(), title: s.trim(), status: 'open', dep_type: 'blocks' })))" :key="'bb-' + dep.id">
+                          <button @click="showIssue(dep.id)"
+                                  :title="dep.title"
+                                  :class="(dep.status === 'closed' || dep.status === 'tombstone') ? 'opacity-60 line-through' : (dep.status === 'missing' ? 'border border-dashed border-red-400 text-red-700 dark:text-red-300' : '')"
+                                  class="px-2 py-1 text-xs font-mono bg-yellow-50 dark:bg-yellow-900/20 text-yellow-700 dark:text-yellow-300 rounded hover:bg-yellow-100 dark:hover:bg-yellow-900/40 transition-colors"
+                                  x-text="dep.status === 'missing' ? dep.id + ' (missing)' : dep.id"></button>
+                        </template>
+                      </div>
+                    </div>
+                    <div x-show="(selectedIssue.dependencyGroups?.blocks?.length > 0) || selectedIssue.blocks_ids">
+                      <h4 class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2 flex items-center">
+                        <svg class="w-3 h-3 mr-1 text-red-500" fill="currentColor" viewBox="0 0 20 20">
+                          <path fill-rule="evenodd" d="M13.477 14.89A6 6 0 015.11 6.524l8.367 8.368zm1.414-1.414L6.524 5.11a6 6 0 018.367 8.367zM18 10a8 8 0 11-16 0 8 8 0 0116 0z" clip-rule="evenodd"/>
+                        </svg>
+                        Blocks (<span x-text="selectedIssue.dependencyGroups?.blocks?.length || (selectedIssue.blocks_ids || '').split(',').filter(Boolean).length"></span>)
+                      </h4>
+                      <div class="flex flex-wrap gap-1.5">
+                        <template x-for="dep in (selectedIssue.dependencyGroups?.blocks?.length ? selectedIssue.dependencyGroups.blocks : (selectedIssue.blocks_ids || '').split(',').filter(Boolean).map(s => ({ id: s.trim(), title: s.trim(), status: 'open', dep_type: 'blocks' })))" :key="'bl-' + dep.id">
+                          <button @click="showIssue(dep.id)"
+                                  :title="dep.title"
+                                  :class="(dep.status === 'closed' || dep.status === 'tombstone') ? 'opacity-60 line-through' : (dep.status === 'missing' ? 'border border-dashed border-red-400' : '')"
+                                  class="px-2 py-1 text-xs font-mono bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
+                                  x-text="dep.status === 'missing' ? dep.id + ' (missing)' : dep.id"></button>
+                        </template>
+                      </div>
                     </div>
                   </div>
-                  <div x-show="selectedIssue.blocks_ids">
-                    <h4 class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2 flex items-center">
-                      <svg class="w-3 h-3 mr-1 text-red-500" fill="currentColor" viewBox="0 0 20 20">
-                        <path fill-rule="evenodd" d="M13.477 14.89A6 6 0 015.11 6.524l8.367 8.368zm1.414-1.414L6.524 5.11a6 6 0 018.367 8.367zM18 10a8 8 0 11-16 0 8 8 0 0116 0z" clip-rule="evenodd"/>
-                      </svg>
-                      Blocks (<span x-text="(selectedIssue.blocks_ids || '').split(',').filter(Boolean).length"></span>)
-                    </h4>
-                    <div class="flex flex-wrap gap-1.5">
-                      <template x-for="id in (selectedIssue.blocks_ids || '').split(',').filter(Boolean)" :key="id">
-                        <button @click="showIssue(id.trim())"
-                                class="px-2 py-1 text-xs font-mono bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 rounded hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
-                                x-text="id.trim()"></button>
-                      </template>
+                </div>
+
+                <!-- Category 2: Parent / Children -->
+                <div x-show="(selectedIssue.dependencyGroups?.parents?.length > 0) || (selectedIssue.dependencyGroups?.children?.length > 0)"
+                     class="mb-4 pt-3 border-t border-gray-100 dark:border-gray-700/50">
+                  <div class="text-[11px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2">Parent / Children</div>
+                  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div x-show="selectedIssue.dependencyGroups?.parents?.length > 0">
+                      <h4 class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">
+                        Parent (<span x-text="selectedIssue.dependencyGroups?.parents?.length || 0"></span>)
+                      </h4>
+                      <div class="flex flex-wrap gap-1.5">
+                        <template x-for="dep in (selectedIssue.dependencyGroups?.parents || [])" :key="'p-' + dep.id">
+                          <button @click="showIssue(dep.id)"
+                                  :title="dep.title"
+                                  class="px-2 py-1 text-xs font-mono bg-indigo-50 dark:bg-indigo-900/20 text-indigo-700 dark:text-indigo-300 rounded hover:bg-indigo-100 dark:hover:bg-indigo-900/40 transition-colors"
+                                  x-text="dep.id"></button>
+                        </template>
+                      </div>
                     </div>
+                    <div x-show="selectedIssue.dependencyGroups?.children?.length > 0">
+                      <h4 class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">
+                        Children (<span x-text="selectedIssue.dependencyGroups?.children?.length || 0"></span>)
+                      </h4>
+                      <div class="flex flex-wrap gap-1.5">
+                        <template x-for="dep in (selectedIssue.dependencyGroups?.children || [])" :key="'c-' + dep.id">
+                          <button @click="showIssue(dep.id)"
+                                  :title="dep.title"
+                                  class="px-2 py-1 text-xs font-mono bg-indigo-50 dark:bg-indigo-900/20 text-indigo-700 dark:text-indigo-300 rounded hover:bg-indigo-100 dark:hover:bg-indigo-900/40 transition-colors"
+                                  x-text="dep.id"></button>
+                        </template>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Category 3: Related / Discovered From -->
+                <div x-show="selectedIssue.dependencyGroups?.related?.length > 0"
+                     class="mb-4 pt-3 border-t border-gray-100 dark:border-gray-700/50">
+                  <div class="text-[11px] font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-2">Related / Discovered From</div>
+                  <div class="flex flex-wrap gap-1.5">
+                    <template x-for="dep in (selectedIssue.dependencyGroups?.related || [])" :key="'r-' + dep.id + '-' + dep.dep_type">
+                      <button @click="showIssue(dep.id)"
+                              :title="dep.title + ' (' + dep.dep_type + ')'"
+                              class="inline-flex items-center gap-1.5 px-2 py-1 text-xs font-mono bg-sky-50 dark:bg-sky-900/20 text-sky-700 dark:text-sky-300 rounded hover:bg-sky-100 dark:hover:bg-sky-900/40 transition-colors">
+                        <span x-text="dep.id"></span>
+                        <span class="text-[10px] font-sans px-1 py-0.2 rounded bg-sky-100 dark:bg-sky-800/50 text-sky-600 dark:text-sky-300" x-text="dep.dep_type"></span>
+                      </button>
+                    </template>
                   </div>
                 </div>
 
                 <!-- Mermaid Dependency Graph (lazy-loaded) -->
                 <div x-show="showDepGraph" x-collapse class="mt-4">
                   <div class="bg-white dark:bg-gray-900 rounded-lg p-4 border border-gray-200 dark:border-gray-700">
-                    <div x-ref="depGraph" class="mermaid-container overflow-x-auto">
-                      <div x-init="$watch('showDepGraph', value => { if(value) renderDepGraph() })"></div>
-                    </div>
+                    <div x-ref="depGraph"
+                         x-init="$watch('showDepGraph', value => { if (value) renderDepGraph() }); $watch('selectedIssue', value => { if (value && showDepGraph) renderDepGraph() })"
+                         class="mermaid-container overflow-x-auto"></div>
                   </div>
                   <p class="text-xs text-gray-500 dark:text-gray-400 mt-2 text-center">
                     Click nodes to navigate. Current issue highlighted in blue.

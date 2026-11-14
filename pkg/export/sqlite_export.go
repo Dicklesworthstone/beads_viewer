@@ -27,15 +27,16 @@ import (
 
 // SQLiteExporter exports bv data to a SQLite database for static deployment.
 type SQLiteExporter struct {
-	Issues      []*model.Issue
-	Deps        []*model.Dependency
-	Metrics     map[string]*model.IssueMetrics
-	Stats       *analysis.GraphStats
-	Triage      *analysis.TriageResult
-	Config      SQLiteExportConfig
-	gitHash     string
-	readiness   *model.ReadinessIndex
-	readinessAt time.Time
+	Issues        []*model.Issue
+	Deps          []*model.Dependency
+	Metrics       map[string]*model.IssueMetrics
+	Stats         *analysis.GraphStats
+	Triage        *analysis.TriageResult
+	Config        SQLiteExportConfig
+	gitHash       string
+	readiness     *model.ReadinessIndex
+	readinessAt   time.Time
+	hasHybridWasm bool
 }
 
 // NewSQLiteExporter creates a new exporter with the given data.
@@ -124,6 +125,7 @@ func (e *SQLiteExporter) ExportBundle(bundle *Bundle) error {
 	if err := bundle.root.MkdirAll(dataDir, 0755); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
+	e.hasHybridWasm = bundleHasHybridWasm(bundle)
 
 	dbPath := "beads.sqlite3"
 
@@ -416,8 +418,8 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO issue_metrics (issue_id, pagerank, betweenness, critical_path_depth, triage_score, blocks_count, blocked_by_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO issue_metrics (issue_id, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -482,6 +484,7 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 		// Get metrics maps from stats
 		pageRankMap := e.Stats.PageRank()
 		betweennessMap := e.Stats.Betweenness()
+		eigenvectorMap := e.Stats.Eigenvector()
 		criticalPathMap := e.Stats.CriticalPathScore()
 
 		for _, issue := range e.Issues {
@@ -491,12 +494,13 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 			id := issue.ID
 			pr := pageRankMap[id]
 			bw := betweennessMap[id]
+			ev := eigenvectorMap[id]
 			cp := int(criticalPathMap[id])
 			score := triageScores[id]
 			blocks := blocksCount[id]
 			blockedBy := blockedByCount[id]
 
-			_, err := stmt.Exec(id, pr, bw, cp, score, blocks, blockedBy)
+			_, err := stmt.Exec(id, pr, bw, ev, cp, score, blocks, blockedBy)
 			if err != nil {
 				return fmt.Errorf("insert metrics for %s: %w", id, err)
 			}
@@ -530,7 +534,7 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 				}
 			}
 
-			_, err := stmt.Exec(id, pr, bw, cp, score, blocks, blockedBy)
+			_, err := stmt.Exec(id, pr, bw, 0.0, cp, score, blocks, blockedBy)
 			if err != nil {
 				return fmt.Errorf("insert metrics for %s: %w", id, err)
 			}
@@ -562,7 +566,7 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 				if blockedBy == 0 {
 					blockedBy = blockedByCount[id]
 				}
-				if _, err := stmt.Exec(id, m.PageRank, m.Betweenness, m.CriticalPathDepth, score, blocks, blockedBy); err != nil {
+				if _, err := stmt.Exec(id, m.PageRank, m.Betweenness, 0.0, m.CriticalPathDepth, score, blocks, blockedBy); err != nil {
 					return fmt.Errorf("insert metrics for %s: %w", id, err)
 				}
 			}
@@ -585,8 +589,8 @@ func (e *SQLiteExporter) insertTriageRecommendations(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO triage_recommendations (issue_id, score, action, reasons, unblocks_ids, blocked_by_ids)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO triage_recommendations (issue_id, score, action, reasons, unblocks_ids, blocked_by_ids, breakdown)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -597,6 +601,7 @@ func (e *SQLiteExporter) insertTriageRecommendations(db *sql.DB) error {
 		reasonsJSON, _ := json.Marshal(rec.Reasons)
 		unblocksJSON, _ := json.Marshal(rec.UnblocksIDs)
 		blockedByJSON, _ := json.Marshal(rec.BlockedBy)
+		breakdownJSON, _ := json.Marshal(rec.Breakdown)
 
 		_, err := stmt.Exec(
 			rec.ID,
@@ -605,6 +610,7 @@ func (e *SQLiteExporter) insertTriageRecommendations(db *sql.DB) error {
 			string(reasonsJSON),
 			string(unblocksJSON),
 			string(blockedByJSON),
+			string(breakdownJSON),
 		)
 		if err != nil {
 			return fmt.Errorf("insert triage for %s: %w", rec.ID, err)
@@ -681,6 +687,20 @@ func (e *SQLiteExporter) populateOverviewMetrics(db *sql.DB) error {
 	return tx.Commit()
 }
 
+// bundleHasHybridWasm reports whether the optional bv_hybrid_scorer WASM bundle
+// is present in either the output bundle directory or embedded viewer assets.
+func bundleHasHybridWasm(bundle *Bundle) bool {
+	if bundle != nil && bundle.root != nil {
+		if info, err := bundle.root.Stat("wasm/bv_hybrid_scorer.js"); err == nil && !info.IsDir() {
+			return true
+		}
+	}
+	if info, err := fs.Stat(ViewerAssetsFS, "viewer_assets/wasm/bv_hybrid_scorer.js"); err == nil && !info.IsDir() {
+		return true
+	}
+	return false
+}
+
 // insertMeta inserts export metadata.
 func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 	meta := map[string]string{
@@ -690,6 +710,7 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 		"dependency_count": fmt.Sprintf("%d", len(e.Deps)),
 		"schema_version":   fmt.Sprintf("%d", SchemaVersion),
 		"readiness_at":     e.readinessAt.UTC().Format(time.RFC3339Nano),
+		"has_hybrid_wasm":  strconv.FormatBool(e.hasHybridWasm),
 	}
 
 	if e.gitHash != "" {
@@ -742,12 +763,13 @@ func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error
 
 	// Write export metadata
 	meta := ExportMeta{
-		Version:     "1.0.0",
-		GeneratedAt: time.Now().UTC(),
-		GitCommit:   e.gitHash,
-		IssueCount:  len(e.Issues),
-		DepCount:    len(e.Deps),
-		Title:       e.Config.Title,
+		Version:       "1.0.0",
+		GeneratedAt:   time.Now().UTC(),
+		GitCommit:     e.gitHash,
+		IssueCount:    len(e.Issues),
+		DepCount:      len(e.Deps),
+		Title:         e.Config.Title,
+		HasHybridWasm: e.hasHybridWasm || bundleHasHybridWasm(bundle),
 	}
 	if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)
@@ -964,17 +986,42 @@ func writeJSON(bundle *Bundle, path string, data interface{}) error {
 
 // GetExportedIssues converts issues to ExportIssue format.
 func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
-	// Build dependency lookup maps
+	statusByID := make(map[string]model.Status, len(e.Issues))
+	for _, issue := range e.Issues {
+		if issue == nil {
+			continue
+		}
+		statusByID[issue.ID] = issue.Status
+	}
+	isActiveCounterpart := func(id string) bool {
+		s, ok := statusByID[id]
+		if !ok {
+			return false
+		}
+		return !s.IsClosed() && !s.IsTombstone()
+	}
+
+	// Build active blocking dependency lookup maps (matching issue_overview_mv)
 	blocksIDs := make(map[string][]string)
 	blockedByIDs := make(map[string][]string)
 	for _, dep := range e.Deps {
-		if dep != nil && dep.Type.IsBlocking() {
-			// dep.IssueID depends on dep.DependsOnID, so:
-			// - DependsOnID blocks IssueID
-			// - IssueID is blocked by DependsOnID
-			blocksIDs[dep.DependsOnID] = append(blocksIDs[dep.DependsOnID], dep.IssueID)
-			blockedByIDs[dep.IssueID] = append(blockedByIDs[dep.IssueID], dep.DependsOnID)
+		if dep == nil || !dep.Type.IsBlocking() {
+			continue
 		}
+		if !isActiveCounterpart(dep.DependsOnID) || !isActiveCounterpart(dep.IssueID) {
+			continue
+		}
+		// dep.IssueID depends on dep.DependsOnID, so:
+		// - DependsOnID blocks IssueID
+		// - IssueID is blocked by DependsOnID
+		blocksIDs[dep.DependsOnID] = append(blocksIDs[dep.DependsOnID], dep.IssueID)
+		blockedByIDs[dep.IssueID] = append(blockedByIDs[dep.IssueID], dep.DependsOnID)
+	}
+	for id := range blocksIDs {
+		sort.Strings(blocksIDs[id])
+	}
+	for id := range blockedByIDs {
+		sort.Strings(blockedByIDs[id])
 	}
 
 	// Get triage scores
@@ -983,6 +1030,11 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 		for _, rec := range e.Triage.Recommendations {
 			triageScores[rec.ID] = rec.Score
 		}
+	}
+
+	var eigenvectorMap map[string]float64
+	if e.Stats != nil {
+		eigenvectorMap = e.Stats.Eigenvector()
 	}
 
 	result := make([]ExportIssue, len(e.Issues))
@@ -1023,7 +1075,11 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 		} else if e.Stats != nil {
 			exp.PageRank = e.Stats.GetPageRankScore(issue.ID)
 			exp.Betweenness, _ = e.Stats.BetweennessValue(issue.ID) // O(1) lookup via bv-77ec
+			exp.Eigenvector = eigenvectorMap[issue.ID]
 			exp.CriticalPath = int(e.Stats.GetCriticalPathScore(issue.ID))
+		}
+		if exp.Eigenvector == 0 && eigenvectorMap != nil {
+			exp.Eigenvector = eigenvectorMap[issue.ID]
 		}
 
 		// Fallback triage score from recommendations map

@@ -256,6 +256,9 @@ func TestNormalizeCycle(t *testing.T) {
 	cycle1 := []string{"A", "B", "C"}
 	cycle2 := []string{"B", "C", "A"}
 	cycle3 := []string{"C", "A", "B"}
+	closed1 := []string{"A", "B", "C", "A"}
+	closed2 := []string{"B", "C", "A", "B"}
+	closed3 := []string{"C", "A", "B", "C"}
 
 	norm1 := normalizeCycle(cycle1)
 	norm2 := normalizeCycle(cycle2)
@@ -263,6 +266,42 @@ func TestNormalizeCycle(t *testing.T) {
 
 	if norm1 != norm2 || norm2 != norm3 {
 		t.Errorf("cycle normalization failed: %s, %s, %s", norm1, norm2, norm3)
+	}
+	if normalizeCycle(closed1) != norm1 || normalizeCycle(closed2) != norm1 || normalizeCycle(closed3) != norm1 {
+		t.Errorf("closed cycle normalization failed: %q vs %q vs %q (want %q)",
+			normalizeCycle(closed1), normalizeCycle(closed2), normalizeCycle(closed3), norm1)
+	}
+}
+
+func TestMetricDeltas_BlockedEdgesAndComponents(t *testing.T) {
+	// From: 3 isolated open issues (0 edges, 3 components, 0 blocked)
+	fromIssues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen},
+		{ID: "C", Status: model.StatusOpen},
+	}
+	// To: B depends on A (open), C is explicitly StatusBlocked and depends on A (2 edges, 1 component, 2 blocked without double-counting C)
+	toIssues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "C", Status: model.StatusBlocked, Dependencies: []*model.Dependency{{IssueID: "C", DependsOnID: "A", Type: model.DepBlocks}}},
+	}
+
+	from := NewSnapshot(fromIssues)
+	to := NewSnapshot(toIssues)
+	diff := CompareSnapshots(from, to)
+
+	if to.BlockedCount != 2 {
+		t.Fatalf("expected to.BlockedCount == 2 (B dependency-blocked + C status-blocked without double counting), got %d", to.BlockedCount)
+	}
+	if diff.MetricDeltas.BlockedIssues != 2 {
+		t.Fatalf("expected BlockedIssues delta 2, got %d", diff.MetricDeltas.BlockedIssues)
+	}
+	if diff.MetricDeltas.TotalEdges != 2 {
+		t.Fatalf("expected TotalEdges delta 2, got %d", diff.MetricDeltas.TotalEdges)
+	}
+	if diff.MetricDeltas.ComponentCount != -2 {
+		t.Fatalf("expected ComponentCount delta -2 (3 -> 1), got %d", diff.MetricDeltas.ComponentCount)
 	}
 }
 
@@ -433,5 +472,185 @@ func TestCompareSnapshots_DependencyTypeChange(t *testing.T) {
 
 	if !foundDepChange {
 		t.Error("expected dependency change to be detected when Type changes from related to blocks")
+	}
+}
+
+func TestCompareSnapshots_FiveNewIssueFields(t *testing.T) {
+	fromIssues := []model.Issue{
+		{
+			ID:          "ISS-5",
+			Title:       "Template Seed",
+			Status:      model.StatusOpen,
+			IssueType:   model.TypeTask,
+			CreatedBy:   "alice",
+			CloseReason: "",
+			Ephemeral:   false,
+			Pinned:      false,
+			IsTemplate:  false,
+		},
+	}
+	toIssues := []model.Issue{
+		{
+			ID:          "ISS-5",
+			Title:       "Template Seed",
+			Status:      model.StatusOpen,
+			IssueType:   model.TypeTask,
+			CreatedBy:   "bob",
+			CloseReason: "wontfix",
+			Ephemeral:   true,
+			Pinned:      true,
+			IsTemplate:  true,
+		},
+	}
+
+	diff := CompareSnapshots(NewSnapshot(fromIssues), NewSnapshot(toIssues))
+	if len(diff.ModifiedIssues) != 1 {
+		t.Fatalf("expected 1 modified issue, got %d", len(diff.ModifiedIssues))
+	}
+
+	gotFields := make(map[string]FieldChange, len(diff.ModifiedIssues[0].Changes))
+	for _, ch := range diff.ModifiedIssues[0].Changes {
+		gotFields[ch.Field] = ch
+	}
+
+	for _, wantField := range []string{"created_by", "close_reason", "ephemeral", "pinned", "is_template"} {
+		if _, ok := gotFields[wantField]; !ok {
+			t.Errorf("missing %q in ModifiedIssues[0].Changes: %+v", wantField, diff.ModifiedIssues[0].Changes)
+		}
+	}
+}
+
+func TestNewSnapshot_ActionableAndBlockedCountsWithWithheldBeads(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	future := now.Add(7 * 24 * time.Hour)
+
+	issues := []model.Issue{
+		{ID: "READY-OPEN", Status: model.StatusOpen},
+		{ID: "READY-IP", Status: model.StatusInProgress},
+		{
+			ID:     "DEP-BLOCKED",
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "DEP-BLOCKED", DependsOnID: "READY-OPEN", Type: model.DepBlocks},
+			},
+		},
+		{ID: "STATUS-BLOCKED", Status: model.StatusBlocked},
+		{ID: "PIN-OPEN", Status: model.StatusOpen, Pinned: true},
+		{
+			ID:     "PIN-WITH-DEP",
+			Status: model.StatusOpen,
+			Pinned: true,
+			Dependencies: []*model.Dependency{
+				{IssueID: "PIN-WITH-DEP", DependsOnID: "READY-OPEN", Type: model.DepBlocks},
+			},
+		},
+		{ID: "TMPL-OPEN", Status: model.StatusOpen, IsTemplate: true},
+		{ID: "EPH-OPEN", Status: model.StatusOpen, Ephemeral: true},
+		{ID: "FUTURE-DEF", Status: model.StatusOpen, DeferUntil: &future},
+		{ID: "CLOSED-1", Status: model.StatusClosed},
+		{ID: "TOMB-1", Status: model.StatusTombstone},
+	}
+
+	snap := NewSnapshotAt(issues, now, "HEAD")
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	partition := an.CountStatusPartition()
+
+	if snap.ActionableCount != partition.Actionable || snap.ActionableCount != 2 {
+		t.Fatalf("Snapshot.ActionableCount = %d, want %d (CountStatusPartition.Actionable=%d)",
+			snap.ActionableCount, 2, partition.Actionable)
+	}
+	if snap.BlockedCount != partition.Blocked || snap.BlockedCount != 2 {
+		t.Fatalf("Snapshot.BlockedCount = %d, want %d (CountStatusPartition.Blocked=%d)",
+			snap.BlockedCount, 2, partition.Blocked)
+	}
+	if snap.OpenCount != partition.NotClosed {
+		t.Fatalf("Snapshot.OpenCount = %d, want %d", snap.OpenCount, partition.NotClosed)
+	}
+	if snap.ClosedCount != partition.Closed {
+		t.Fatalf("Snapshot.ClosedCount = %d, want %d", snap.ClosedCount, partition.Closed)
+	}
+}
+
+func TestSnapshot_ComputeScopedCounts(t *testing.T) {
+	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	future := now.Add(48 * time.Hour)
+
+	issues := []model.Issue{
+		{ID: "SCOPED-OPEN", Status: model.StatusOpen},
+		{ID: "SCOPED-IP", Status: model.StatusInProgress},
+		{
+			ID:     "SCOPED-DEP-BLOCKED",
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "SCOPED-DEP-BLOCKED", DependsOnID: "OUTSIDE-BLOCKER", Type: model.DepBlocks},
+			},
+		},
+		{ID: "SCOPED-STATUS-BLOCKED", Status: model.StatusBlocked},
+		{ID: "SCOPED-PARKED-DEFERRED", Status: model.StatusDeferred},
+		{ID: "SCOPED-PARKED-DRAFT", Status: model.StatusDraft},
+		{ID: "SCOPED-PARKED-PINNED", Status: model.StatusPinned},
+		{ID: "SCOPED-PARKED-HOOKED", Status: model.StatusHooked},
+		{ID: "SCOPED-PARKED-REVIEW", Status: model.StatusReview},
+		{
+			ID:     "SCOPED-WITHHELD-PIN",
+			Status: model.StatusOpen,
+			Pinned: true,
+			Dependencies: []*model.Dependency{
+				{IssueID: "SCOPED-WITHHELD-PIN", DependsOnID: "OUTSIDE-BLOCKER", Type: model.DepBlocks},
+			},
+		},
+		{ID: "SCOPED-WITHHELD-TMPL", Status: model.StatusOpen, IsTemplate: true},
+		{ID: "SCOPED-WITHHELD-EPH", Status: model.StatusOpen, Ephemeral: true},
+		{
+			ID:         "SCOPED-FUTURE-DEF",
+			Status:     model.StatusOpen,
+			DeferUntil: &future,
+			Dependencies: []*model.Dependency{
+				{IssueID: "SCOPED-FUTURE-DEF", DependsOnID: "OUTSIDE-BLOCKER", Type: model.DepBlocks},
+			},
+		},
+		{ID: "SCOPED-CLOSED", Status: model.StatusClosed},
+		{ID: "SCOPED-TOMBSTONE", Status: model.StatusTombstone},
+		{ID: "OUTSIDE-BLOCKER", Status: model.StatusOpen},
+		{ID: "OUTSIDE-CLOSED", Status: model.StatusClosed},
+	}
+
+	fullSnap := NewSnapshotAt(issues, now, "HEAD")
+	readiness := model.NewReadinessIndex(issues)
+
+	// 1. Nil predicate matches NewSnapshotAt identically across all 5 counts.
+	allScoped := &Snapshot{Issues: issues, Timestamp: now}
+	allScoped.ComputeScopedCounts(readiness, now, nil)
+	if allScoped.TotalCount != fullSnap.TotalCount ||
+		allScoped.OpenCount != fullSnap.OpenCount ||
+		allScoped.ClosedCount != fullSnap.ClosedCount ||
+		allScoped.BlockedCount != fullSnap.BlockedCount ||
+		allScoped.ActionableCount != fullSnap.ActionableCount {
+		t.Fatalf("ComputeScopedCounts(..., nil) = (%d,%d,%d,%d,%d), want NewSnapshotAt (%d,%d,%d,%d,%d)",
+			allScoped.TotalCount, allScoped.OpenCount, allScoped.ClosedCount, allScoped.BlockedCount, allScoped.ActionableCount,
+			fullSnap.TotalCount, fullSnap.OpenCount, fullSnap.ClosedCount, fullSnap.BlockedCount, fullSnap.ActionableCount)
+	}
+
+	// 2. Scoped predicate counts only SCOPED-* issues while honoring cross-scope blockers
+	// and excluding parked, future-deferred, and withheld beads from BlockedCount & ActionableCount.
+	subSnap := &Snapshot{Issues: issues, Timestamp: now}
+	subSnap.ComputeScopedCounts(readiness, now, func(id string) bool {
+		return len(id) >= 7 && id[:7] == "SCOPED-"
+	})
+	if subSnap.TotalCount != 15 {
+		t.Fatalf("scoped TotalCount = %d, want 15", subSnap.TotalCount)
+	}
+	if subSnap.ClosedCount != 2 {
+		t.Fatalf("scoped ClosedCount = %d, want 2 (closed + tombstone)", subSnap.ClosedCount)
+	}
+	if subSnap.OpenCount != 13 {
+		t.Fatalf("scoped OpenCount = %d, want 13", subSnap.OpenCount)
+	}
+	if subSnap.ActionableCount != 2 {
+		t.Fatalf("scoped ActionableCount = %d, want 2 (SCOPED-OPEN + SCOPED-IP)", subSnap.ActionableCount)
+	}
+	if subSnap.BlockedCount != 2 {
+		t.Fatalf("scoped BlockedCount = %d, want 2 (SCOPED-DEP-BLOCKED + SCOPED-STATUS-BLOCKED; parked/deferred/withheld excluded)", subSnap.BlockedCount)
 	}
 }

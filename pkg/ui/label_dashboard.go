@@ -88,7 +88,7 @@ func (m *LabelDashboardModel) Update(msg tea.KeyMsg) (string, tea.Cmd) {
 				m.scrollOffset = m.cursor
 			}
 		}
-	case "home":
+	case "g", "home":
 		m.cursor = 0
 		m.scrollOffset = 0
 	case "G", "end":

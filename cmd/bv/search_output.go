@@ -136,6 +136,11 @@ func applySearchConfigOverrides(cfg search.SearchConfig, modeFlag, presetFlag, w
 		}
 		cfg.Weights = weights
 		cfg.HasWeights = true
+		if modeFlag == "" {
+			cfg.Mode = search.SearchModeHybrid
+		} else if cfg.Mode == search.SearchModeText {
+			return search.SearchConfig{}, fmt.Errorf("--search-weights needs hybrid mode; drop --search-mode text")
+		}
 	}
 
 	return cfg, nil

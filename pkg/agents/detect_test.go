@@ -505,6 +505,73 @@ func TestDetectAgentFileInParents(t *testing.T) {
 			t.Error("Expected not to find file with limited maxLevels")
 		}
 	})
+
+	t.Run("resolves relative dot workDir upward within repo", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		nested := filepath.Join(repoRoot, "pkg", "sub")
+		if err := os.MkdirAll(nested, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		agentsPath := filepath.Join(repoRoot, "AGENTS.md")
+		if err := os.WriteFile(agentsPath, []byte("# Repo Root AGENTS"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Chdir(nested)
+		detection := DetectAgentFileInParents(".", 3)
+		if !detection.Found() {
+			t.Fatal("Expected DetectAgentFileInParents(\".\", 3) to walk upward and find repo AGENTS.md")
+		}
+		if detection.FilePath != agentsPath {
+			t.Errorf("Expected FilePath %q, got %q", agentsPath, detection.FilePath)
+		}
+	})
+
+	t.Run("stops at git directory boundary without leaking outer AGENTS.md", func(t *testing.T) {
+		outerDir := t.TempDir()
+		outerAgents := filepath.Join(outerDir, "AGENTS.md")
+		if err := os.WriteFile(outerAgents, []byte("# Outer Suite AGENTS"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		repoRoot := filepath.Join(outerDir, "repo")
+		nested := filepath.Join(repoRoot, "cmd", "app")
+		if err := os.MkdirAll(nested, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		detection := DetectAgentFileInParents(nested, 5)
+		if detection.Found() {
+			t.Fatalf("Expected search to stop at .git directory boundary, but found %q", detection.FilePath)
+		}
+	})
+
+	t.Run("stops at git worktree file boundary without leaking outer AGENTS.md", func(t *testing.T) {
+		outerDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(outerDir, "AGENTS.md"), []byte("# Outer Suite AGENTS"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		worktreeRoot := filepath.Join(outerDir, "worktree")
+		nested := filepath.Join(worktreeRoot, "internal")
+		if err := os.MkdirAll(nested, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(worktreeRoot, ".git"), []byte("gitdir: /tmp/fake-gitdir\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		detection := DetectAgentFileInParents(nested, 5)
+		if detection.Found() {
+			t.Fatalf("Expected search to stop at .git file boundary, but found %q", detection.FilePath)
+		}
+	})
 }
 
 func TestAgentFileExists(t *testing.T) {

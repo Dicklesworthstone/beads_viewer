@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -804,5 +805,377 @@ func TestIncrementalCorrelator_MultiStrategyFeedbackAndDataHashParity(t *testing
 	}
 	if strings.Contains(string(raw), `"commits":null`) || !strings.Contains(string(raw), `"commits":[]`) {
 		t.Fatalf("incremental report JSON violated non-null commits invariant: %s", raw)
+	}
+}
+
+func TestIncrementalCorrelator_DeletedAndTombstonedTargetsAndConcurrentGenerateReport(t *testing.T) {
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "init")
+
+	baseTime := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	commitAt := func(offset time.Duration, msg string) string {
+		t.Helper()
+		runGit(t, repo, "add", "--", ".")
+		ts := baseTime.Add(offset).Format(time.RFC3339)
+		cmd := exec.Command("git", "commit", "-m", msg)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Alice", "GIT_AUTHOR_EMAIL=alice@example.com",
+			"GIT_COMMITTER_NAME=Alice", "GIT_COMMITTER_EMAIL=alice@example.com",
+			"GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("commit %q: %v\n%s", msg, err, out)
+		}
+		out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	jsonl := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-del","title":"Will be deleted","status":"open"}`+"\n"+
+			`{"id":"bv-tomb","title":"Will be tombstoned","status":"open"}`+"\n"+
+			`{"id":"bv-live","title":"Remains live","status":"open"}`+"\n"+
+			`{"id":"101","title":"Deleted numeric A","status":"open"}`+"\n"+
+			`{"id":"102","title":"Deleted numeric B","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "app.go"), []byte("package app\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(0, "chore: seed beads")
+
+	if err := os.WriteFile(filepath.Join(repo, "a.go"), []byte("package app\nvar a = 101\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sha101 := commitAt(5*time.Minute, "fix [101]: numeric target A")
+
+	if err := os.WriteFile(filepath.Join(repo, "b.go"), []byte("package app\nvar b = 102\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sha102 := commitAt(10*time.Minute, "fix [102]: numeric target B")
+
+	seedBeads := []BeadInfo{
+		{ID: "bv-del", Title: "Will be deleted", Status: "open"},
+		{ID: "bv-tomb", Title: "Will be tombstoned", Status: "open"},
+		{ID: "bv-live", Title: "Remains live", Status: "open"},
+	}
+
+	// Prime two IncrementalCorrelators before incremental deletion/tombstone commits:
+	// - icRaw exercises tryIncrementalUpdateFromRaw
+	// - icReportOnly exercises tryIncrementalUpdate / mergeReportsWithOptions (rawStates cleared)
+	icRaw := NewIncrementalCorrelator(repo, jsonl)
+	if _, err := icRaw.GenerateReport(seedBeads, CorrelatorOptions{}); err != nil {
+		t.Fatalf("seed icRaw: %v", err)
+	}
+	if _, err := icRaw.GenerateReport(seedBeads, CorrelatorOptions{BeadID: "bv-del"}); err != nil {
+		t.Fatalf("seed icRaw bv-del: %v", err)
+	}
+	if _, err := icRaw.GenerateReport(seedBeads, CorrelatorOptions{BeadID: "bv-tomb"}); err != nil {
+		t.Fatalf("seed icRaw bv-tomb: %v", err)
+	}
+
+	icReportOnly := NewIncrementalCorrelator(repo, jsonl)
+	if _, err := icReportOnly.GenerateReport(seedBeads, CorrelatorOptions{}); err != nil {
+		t.Fatalf("seed icReportOnly: %v", err)
+	}
+	if _, err := icReportOnly.GenerateReport(seedBeads, CorrelatorOptions{BeadID: "bv-del"}); err != nil {
+		t.Fatalf("seed icReportOnly bv-del: %v", err)
+	}
+	if _, err := icReportOnly.GenerateReport(seedBeads, CorrelatorOptions{BeadID: "bv-tomb"}); err != nil {
+		t.Fatalf("seed icReportOnly bv-tomb: %v", err)
+	}
+	if _, err := icReportOnly.GenerateReport(seedBeads, CorrelatorOptions{BeadID: "999"}); err != nil {
+		t.Fatalf("seed icReportOnly 999: %v", err)
+	}
+
+	// Incremental Commit 1: create numeric bead "999", then touch code mentioning [999].
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-del","title":"Will be deleted","status":"open"}`+"\n"+
+			`{"id":"bv-tomb","title":"Will be tombstoned","status":"open"}`+"\n"+
+			`{"id":"bv-live","title":"Remains live","status":"open"}`+"\n"+
+			`{"id":"999","title":"Ephemeral incremental target","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(20*time.Minute, "chore: create 999")
+
+	if err := os.WriteFile(filepath.Join(repo, "ephemeral.go"), []byte("package app\nvar e = 999\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sha999 := commitAt(25*time.Minute, "feat [999]: implement incremental target")
+
+	// Incremental Commit 2: delete bv-del and 999, tombstone bv-tomb.
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-tomb","title":"Will be tombstoned","status":"tombstone"}`+"\n"+
+			`{"id":"bv-live","title":"Remains live","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(30*time.Minute, "chore: delete bv-del & 999 and tombstone bv-tomb")
+
+	// Clear rawStates on icReportOnly so it must use tryIncrementalUpdate + mergeReportsWithOptions.
+	icReportOnly.rawMu.Lock()
+	icReportOnly.rawStates = make(map[string]*incrementalRawState)
+	icReportOnly.rawMu.Unlock()
+
+	liveBeads := []BeadInfo{
+		{ID: "bv-live", Title: "Remains live", Status: "open"},
+	}
+
+	for name, ic := range map[string]*IncrementalCorrelator{
+		"raw_incremental":         icRaw,
+		"report_only_incremental": icReportOnly,
+	} {
+		t.Run(name, func(t *testing.T) {
+			delRes, err := ic.GenerateReportWithDetails(liveBeads, CorrelatorOptions{BeadID: "bv-del"})
+			if err != nil {
+				t.Fatalf("bv-del incremental: %v", err)
+			}
+			if !delRes.WasIncremental {
+				t.Fatalf("expected WasIncremental=true for bv-del, got false (%s)", delRes.RefreshReason)
+			}
+			if got := delRes.Report.Histories["bv-del"].Status; got != "deleted" {
+				t.Fatalf("bv-del Status = %q, want %q", got, "deleted")
+			}
+
+			tombRes, err := ic.GenerateReportWithDetails(liveBeads, CorrelatorOptions{BeadID: "bv-tomb"})
+			if err != nil {
+				t.Fatalf("bv-tomb incremental: %v", err)
+			}
+			if !tombRes.WasIncremental {
+				t.Fatalf("expected WasIncremental=true for bv-tomb, got false (%s)", tombRes.RefreshReason)
+			}
+			if got := tombRes.Report.Histories["bv-tomb"].Status; got != "tombstone" {
+				t.Fatalf("bv-tomb Status = %q, want %q", got, "tombstone")
+			}
+
+			synthRes, err := ic.GenerateReportWithDetails(liveBeads, CorrelatorOptions{BeadID: "999"})
+			if err != nil {
+				t.Fatalf("999 incremental: %v", err)
+			}
+			h999, ok := synthRes.Report.Histories["999"]
+			if !ok {
+				t.Fatalf("expected synthesized history for created+deleted bead 999, got %+v", synthRes.Report.Histories)
+			}
+			if h999.Status != "deleted" || h999.Title != "Ephemeral incremental target" {
+				t.Fatalf("999 synthesized Status=%q Title=%q, want deleted / Ephemeral incremental target", h999.Status, h999.Title)
+			}
+			if len(h999.Commits) != 1 || h999.Commits[0].SHA != sha999 {
+				t.Fatalf("999 commits = %+v, want [%s]", h999.Commits, sha999)
+			}
+		})
+	}
+
+	// Concurrent GenerateReport calls with distinct deleted numeric opts.BeadID values
+	// on shared Correlator, CachedCorrelator, and IncrementalCorrelator must not race or clobber.
+	sharedCorr := NewCorrelator(repo, jsonl)
+	sharedCached := NewCachedCorrelator(repo, jsonl)
+	sharedInc := NewIncrementalCorrelator(repo, jsonl)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 48)
+	targets := []struct {
+		id      string
+		wantSHA string
+	}{
+		{id: "101", wantSHA: sha101},
+		{id: "102", wantSHA: sha102},
+		{id: "999", wantSHA: sha999},
+	}
+
+	for round := 0; round < 16; round++ {
+		tc := targets[round%len(targets)]
+		wg.Add(3)
+		go func(id, wantSHA string) {
+			defer wg.Done()
+			rep, err := sharedCorr.GenerateReport(liveBeads, CorrelatorOptions{BeadID: id})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			h := rep.Histories[id]
+			if len(h.Commits) != 1 || h.Commits[0].SHA != wantSHA {
+				t.Errorf("sharedCorr[%s] commits = %+v, want [%s]", id, h.Commits, wantSHA)
+			}
+		}(tc.id, tc.wantSHA)
+		go func(id, wantSHA string) {
+			defer wg.Done()
+			rep, err := sharedCached.GenerateReport(liveBeads, CorrelatorOptions{BeadID: id})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			h := rep.Histories[id]
+			if len(h.Commits) != 1 || h.Commits[0].SHA != wantSHA {
+				t.Errorf("sharedCached[%s] commits = %+v, want [%s]", id, h.Commits, wantSHA)
+			}
+		}(tc.id, tc.wantSHA)
+		go func(id, wantSHA string) {
+			defer wg.Done()
+			rep, err := sharedInc.GenerateReport(liveBeads, CorrelatorOptions{BeadID: id})
+			if err != nil {
+				errCh <- err
+				return
+			}
+			h := rep.Histories[id]
+			if len(h.Commits) != 1 || h.Commits[0].SHA != wantSHA {
+				t.Errorf("sharedInc[%s] commits = %+v, want [%s]", id, h.Commits, wantSHA)
+			}
+		}(tc.id, tc.wantSHA)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("concurrent GenerateReport error: %v", err)
+	}
+}
+
+func TestIncrementalCorrelator_ReportOnlyFallbackPrunesDeletedAndRefreshesWiderSlice(t *testing.T) {
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "init")
+
+	baseTime := time.Date(2026, 8, 10, 10, 0, 0, 0, time.UTC)
+	commitAt := func(offset time.Duration, msg string) string {
+		t.Helper()
+		runGit(t, repo, "add", "--", ".")
+		ts := baseTime.Add(offset).Format(time.RFC3339)
+		cmd := exec.Command("git", "commit", "-m", msg)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Alice", "GIT_AUTHOR_EMAIL=alice@example.com",
+			"GIT_COMMITTER_NAME=Alice", "GIT_COMMITTER_EMAIL=alice@example.com",
+			"GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("commit %q: %v\n%s", msg, err, out)
+		}
+		out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	jsonl := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-1","title":"Live bead one","status":"open"}`+"\n"+
+			`{"id":"bv-b9c8","title":"Live hash bead","status":"open"}`+"\n"+
+			`{"id":"bv-del","title":"Deleted later","status":"open"}`+"\n"+
+			`{"id":"bv-tomb","title":"Tombstoned later","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(0, "chore: seed four beads")
+
+	if err := os.WriteFile(filepath.Join(repo, "one.go"), []byte("package p\nvar one = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sha1 := commitAt(5*time.Minute, "feat(bv-1): implement one")
+
+	if err := os.WriteFile(filepath.Join(repo, "two.go"), []byte("package p\nvar two = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shaHash := commitAt(10*time.Minute, "fix(bv-b9c8): implement hash bead")
+
+	// Part A: Narrow [bv-1] -> wider [bv-1, bv-b9c8] on report-only fallback must NOT
+	// reuse the narrower report and drop bv-b9c8's historical commits.
+	icNarrowToWide := NewIncrementalCorrelator(repo, jsonl)
+	if _, err := icNarrowToWide.GenerateReport([]BeadInfo{{ID: "bv-1", Title: "Live bead one", Status: "open"}}, CorrelatorOptions{}); err != nil {
+		t.Fatalf("seed narrow report: %v", err)
+	}
+	icNarrowToWide.rawMu.Lock()
+	icNarrowToWide.rawStates = make(map[string]*incrementalRawState)
+	icNarrowToWide.rawMu.Unlock()
+
+	widerBeads := []BeadInfo{
+		{ID: "bv-1", Title: "Live bead one", Status: "open"},
+		{ID: "bv-b9c8", Title: "Live hash bead", Status: "open"},
+	}
+	wideRes, err := icNarrowToWide.GenerateReportWithDetails(widerBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("wider GenerateReportWithDetails: %v", err)
+	}
+	if wideRes.WasIncremental {
+		t.Fatal("widening bead slice on report-only fallback must trigger full refresh rather than reusing incomplete narrow report")
+	}
+	if len(wideRes.Report.Histories["bv-1"].Commits) != 1 || wideRes.Report.Histories["bv-1"].Commits[0].SHA != sha1 {
+		t.Fatalf("bv-1 commits = %+v, want [%s]", wideRes.Report.Histories["bv-1"].Commits, sha1)
+	}
+	if len(wideRes.Report.Histories["bv-b9c8"].Commits) != 1 || wideRes.Report.Histories["bv-b9c8"].Commits[0].SHA != shaHash {
+		t.Fatalf("bv-b9c8 commits = %+v, want [%s]", wideRes.Report.Histories["bv-b9c8"].Commits, shaHash)
+	}
+
+	// Same ID set with Title/Status edit and cleared rawStates MUST hit report-only fallback incrementally.
+	icNarrowToWide.rawMu.Lock()
+	icNarrowToWide.rawStates = make(map[string]*incrementalRawState)
+	icNarrowToWide.rawMu.Unlock()
+	retitledBeads := []BeadInfo{
+		{ID: "bv-1", Title: "Retitled one", Status: "in_progress"},
+		{ID: "bv-b9c8", Title: "Live hash bead", Status: "closed"},
+	}
+	metaRes, err := icNarrowToWide.GenerateReportWithDetails(retitledBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("retitled GenerateReportWithDetails: %v", err)
+	}
+	if !metaRes.WasIncremental {
+		t.Fatalf("expected report-only fallback hit on metadata edit with identical ID set, got full refresh (%s)", metaRes.RefreshReason)
+	}
+	if metaRes.Report.Histories["bv-1"].Title != "Retitled one" || len(metaRes.Report.Histories["bv-b9c8"].Commits) != 1 {
+		t.Fatalf("unexpected retitled incremental result: %+v", metaRes.Report.Histories)
+	}
+
+	// Part B: Unscoped icReportOnly must prune deleted & tombstoned beads from Histories/TotalBeads.
+	icPrune := NewIncrementalCorrelator(repo, jsonl)
+	seedAll := []BeadInfo{
+		{ID: "bv-1", Title: "Live bead one", Status: "open"},
+		{ID: "bv-b9c8", Title: "Live hash bead", Status: "open"},
+		{ID: "bv-del", Title: "Deleted later", Status: "open"},
+		{ID: "bv-tomb", Title: "Tombstoned later", Status: "open"},
+	}
+	if _, err := icPrune.GenerateReport(seedAll, CorrelatorOptions{}); err != nil {
+		t.Fatalf("seed icPrune: %v", err)
+	}
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-1","title":"Live bead one","status":"open"}`+"\n"+
+			`{"id":"bv-tomb","title":"Tombstoned later","status":"tombstone"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(20*time.Minute, "chore: delete bv-del & bv-b9c8 and tombstone bv-tomb")
+
+	icPrune.rawMu.Lock()
+	icPrune.rawStates = make(map[string]*incrementalRawState)
+	icPrune.rawMu.Unlock()
+
+	liveOnly := []BeadInfo{{ID: "bv-1", Title: "Live bead one", Status: "open"}}
+	prunedRes, err := icPrune.GenerateReportWithDetails(liveOnly, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("unscoped icPrune GenerateReportWithDetails: %v", err)
+	}
+	if !prunedRes.WasIncremental {
+		t.Fatalf("expected WasIncremental=true when shrinking beads slice on deletion, got false (%s)", prunedRes.RefreshReason)
+	}
+	if prunedRes.Report.Stats.TotalBeads != 1 || len(prunedRes.Report.Histories) != 1 {
+		t.Fatalf("expected TotalBeads=1 and Histories=[bv-1], got TotalBeads=%d keys=%+v",
+			prunedRes.Report.Stats.TotalBeads, prunedRes.Report.Histories)
+	}
+	if _, leakedDel := prunedRes.Report.Histories["bv-del"]; leakedDel {
+		t.Fatal("deleted bead bv-del leaked into unscoped report-only incremental Histories")
+	}
+	if _, leakedTomb := prunedRes.Report.Histories["bv-tomb"]; leakedTomb {
+		t.Fatal("tombstoned bead bv-tomb leaked into unscoped report-only incremental Histories")
 	}
 }

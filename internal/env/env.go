@@ -200,6 +200,12 @@ var (
 		Default:     "(size-based)",
 	})
 
+	PollInterval = register(Var{
+		Name:        "BV_POLL_INTERVAL",
+		Description: "Polling interval for fallback/forced-polling file watching (Go duration like `500ms`/`2s` or integer milliseconds).",
+		Default:     "`2s`",
+	})
+
 	PrettyJSON = register(Var{
 		Name:        "BV_PRETTY_JSON",
 		Description: "Set to `1` for indented JSON output.",

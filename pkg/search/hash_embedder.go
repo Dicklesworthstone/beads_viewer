@@ -3,33 +3,73 @@ package search
 import (
 	"context"
 	"math"
+	"strings"
 	"unicode"
+)
+
+const (
+	fnvOffset64 uint64 = 14695981039346656037
+	fnvPrime64  uint64 = 1099511628211
 )
 
 // HashEmbedder is a dependency-free embedding fallback.
 // It uses feature hashing over tokens into a fixed-size dense vector.
 type HashEmbedder struct {
-	dim int
+	dim   int
+	model string
+	seed  uint64
 }
 
 func NewHashEmbedder(dim int) *HashEmbedder {
+	return NewHashEmbedderWithModel(dim, "")
+}
+
+// NewHashEmbedderWithModel constructs a HashEmbedder whose feature-hash token
+// seeding incorporates model when non-empty. When model is empty, token hashing
+// uses the standard FNV-1a offset basis for bit-identical default embeddings.
+func NewHashEmbedderWithModel(dim int, model string) *HashEmbedder {
 	if dim <= 0 {
 		dim = DefaultEmbeddingDim
 	}
-	return &HashEmbedder{dim: dim}
+	model = strings.TrimSpace(model)
+	seed := hashModelSeed(model)
+	return &HashEmbedder{
+		dim:   dim,
+		model: model,
+		seed:  seed,
+	}
+}
+
+func hashModelSeed(model string) uint64 {
+	if model == "" {
+		return fnvOffset64
+	}
+	h := fnvOffset64
+	for i := 0; i < len(model); i++ {
+		h ^= uint64(model[i])
+		h *= fnvPrime64
+	}
+	h ^= 0
+	h *= fnvPrime64
+	return h
 }
 
 func (*HashEmbedder) Provider() Provider { return ProviderHash }
 func (h *HashEmbedder) Dim() int         { return h.dim }
+func (h *HashEmbedder) Model() string    { return h.model }
 
 func (h *HashEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	seed := h.seed
+	if seed == 0 && h.model == "" {
+		seed = fnvOffset64
+	}
 	out := make([][]float32, len(texts))
 	for i, text := range texts {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		vec := make([]float32, h.dim)
-		hashEmbedInto(vec, text)
+		hashEmbedIntoWithSeed(vec, seed, text)
 		normalizeL2(vec)
 		out[i] = vec
 	}
@@ -37,6 +77,10 @@ func (h *HashEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 }
 
 func hashEmbedInto(vec []float32, text string) {
+	hashEmbedIntoWithSeed(vec, fnvOffset64, text)
+}
+
+func hashEmbedIntoWithSeed(vec []float32, seed uint64, text string) {
 	if len(vec) == 0 {
 		return
 	}
@@ -52,22 +96,22 @@ func hashEmbedInto(vec []float32, text string) {
 			continue
 		}
 		if tokenStart != -1 {
-			addHashedToken(vec, dim, text[tokenStart:idx])
+			addHashedTokenWithSeed(vec, dim, seed, text[tokenStart:idx])
 			tokenStart = -1
 		}
 	}
 	if tokenStart != -1 {
-		addHashedToken(vec, dim, text[tokenStart:])
+		addHashedTokenWithSeed(vec, dim, seed, text[tokenStart:])
 	}
 }
 
 func addHashedToken(vec []float32, dim uint64, token string) {
-	// FNV-1a 64-bit over UTF-8 bytes.
-	const (
-		offset64 = 14695981039346656037
-		prime64  = 1099511628211
-	)
-	var h uint64 = offset64
+	addHashedTokenWithSeed(vec, dim, fnvOffset64, token)
+}
+
+func addHashedTokenWithSeed(vec []float32, dim uint64, seed uint64, token string) {
+	// FNV-1a 64-bit over UTF-8 bytes, seeded by model when configured.
+	h := seed
 	for i := 0; i < len(token); i++ {
 		b := token[i]
 		// Lowercase ASCII fast-path; unicode case folding isn't worth it for a fallback embedder.
@@ -75,7 +119,7 @@ func addHashedToken(vec []float32, dim uint64, token string) {
 			b += 'a' - 'A'
 		}
 		h ^= uint64(b)
-		h *= prime64
+		h *= fnvPrime64
 	}
 
 	idx := int(h % dim)

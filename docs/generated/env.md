@@ -26,6 +26,7 @@
 | `BV_NO_UPDATE_CHECK` | Skip the TUI's startup release check with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` enables it. Nonempty values override `updates.check` in user config (case-insensitive, trimmed); invalid values skip the check, and empty values preserve config. Explicit `--check-update` / `--update` still work. | (check on) |
 | `BV_OUTPUT_FORMAT` | Default robot output format: `json` or `toon` (overridden by `--format`). | `json` |
 | `BV_PHASE2_TIMEOUT_S` | Override per-metric Phase 2 timeouts (seconds). | (size-based) |
+| `BV_POLL_INTERVAL` | Polling interval for fallback/forced-polling file watching (Go duration like `500ms`/`2s` or integer milliseconds). | `2s` |
 | `BV_PRETTY_JSON` | Set to `1` for indented JSON output. | (compact) |
 | `BV_ROBOT` | Set to `1` to force robot mode (clean stdout, JSON logs, disk cache on). Every `--robot-*` flag sets it. | (unset) |
 | `BV_ROBOT_HISTORY_TIMEOUT_MS` | Bound on the git-history prologue of `--robot-triage` in milliseconds; `0` = unbounded. | `10000` |

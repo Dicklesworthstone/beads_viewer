@@ -126,6 +126,7 @@ func (l *AnalyzerMetricsLoader) computeMetricsAndHash(includeHash bool) (map[str
 		normDenom = maxAnyPR
 	}
 
+	readiness := model.NewReadinessIndex(l.issues)
 	metrics := make(map[string]IssueMetrics, len(l.issues))
 	for _, issue := range l.issues {
 		pr := defaultPageRank
@@ -143,10 +144,15 @@ func (l *AnalyzerMetricsLoader) computeMetricsAndHash(includeHash bool) (map[str
 				pr = 0
 			}
 		}
+		effectiveStatus := issue.Status
+		if (effectiveStatus == model.StatusOpen || effectiveStatus == model.StatusInProgress) &&
+			readiness.DependencyState(issue.ID) != model.DependenciesSatisfied {
+			effectiveStatus = model.StatusBlocked
+		}
 		metrics[issue.ID] = IssueMetrics{
 			IssueID:      issue.ID,
 			PageRank:     pr,
-			Status:       string(issue.Status),
+			Status:       string(effectiveStatus),
 			Priority:     issue.Priority,
 			BlockerCount: cached.OpenBlockerCount(issue.ID),
 			UpdatedAt:    issue.UpdatedAt,

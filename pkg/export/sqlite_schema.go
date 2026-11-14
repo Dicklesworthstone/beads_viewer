@@ -113,6 +113,7 @@ func createMetricsTables(tx *sql.Tx) error {
 			issue_id TEXT PRIMARY KEY,
 			pagerank REAL DEFAULT 0,
 			betweenness REAL DEFAULT 0,
+			eigenvector REAL NOT NULL DEFAULT 0,
 			critical_path_depth INTEGER DEFAULT 0,
 			triage_score REAL DEFAULT 0,
 			blocks_count INTEGER DEFAULT 0,
@@ -133,6 +134,7 @@ func createMetricsTables(tx *sql.Tx) error {
 			reasons TEXT,
 			unblocks_ids TEXT,
 			blocked_by_ids TEXT,
+			breakdown TEXT,
 			FOREIGN KEY (issue_id) REFERENCES issues(id)
 		)
 	`
@@ -207,6 +209,10 @@ func CreateFTSIndex(db *sql.DB) error {
 			description,
 			labels,
 			assignee,
+			notes,
+			design,
+			acceptance_criteria,
+			external_ref,
 			content='issues',
 			content_rowid='rowid',
 			tokenize='porter unicode61'
@@ -266,12 +272,45 @@ func CreateMaterializedViews(db *sql.DB) error {
 			0 as is_actionable,
 			COALESCE(m.pagerank, 0) as pagerank,
 			COALESCE(m.betweenness, 0) as betweenness,
+			COALESCE(m.eigenvector, 0) as eigenvector,
 			COALESCE(m.critical_path_depth, 0) as critical_path_depth,
 			COALESCE(m.triage_score, 0) as triage_score,
-			COALESCE(m.blocks_count, 0) as blocks_count,
-			COALESCE(m.blocked_by_count, 0) as blocked_by_count,
-			COALESCE(m.blocked_by_count, 0) as blocker_count,
-			COALESCE(m.blocks_count, 0) as dependent_count,
+			COALESCE(m.blocks_count, (
+				SELECT COUNT(*)
+				FROM dependencies d
+				JOIN issues i2 ON d.issue_id = i2.id
+				WHERE d.depends_on_id = i.id
+				  AND COALESCE(d.type, 'blocks') IN ('', 'blocks', 'conditional-blocks', 'waits-for')
+				  AND i.status NOT IN ('closed', 'tombstone')
+				  AND i2.status NOT IN ('closed', 'tombstone')
+			)) as blocks_count,
+			COALESCE(m.blocked_by_count, (
+				SELECT COUNT(*)
+				FROM dependencies d
+				JOIN issues i2 ON d.depends_on_id = i2.id
+				WHERE d.issue_id = i.id
+				  AND COALESCE(d.type, 'blocks') IN ('', 'blocks', 'conditional-blocks', 'waits-for')
+				  AND i.status NOT IN ('closed', 'tombstone')
+				  AND i2.status NOT IN ('closed', 'tombstone')
+			)) as blocked_by_count,
+			(
+				SELECT COUNT(*)
+				FROM dependencies d
+				JOIN issues i2 ON d.depends_on_id = i2.id
+				WHERE d.issue_id = i.id
+				  AND COALESCE(d.type, 'blocks') IN ('', 'blocks', 'conditional-blocks', 'waits-for')
+				  AND i.status NOT IN ('closed', 'tombstone')
+				  AND i2.status NOT IN ('closed', 'tombstone')
+			) as blocker_count,
+			(
+				SELECT COUNT(*)
+				FROM dependencies d
+				JOIN issues i2 ON d.issue_id = i2.id
+				WHERE d.depends_on_id = i.id
+				  AND COALESCE(d.type, 'blocks') IN ('', 'blocks', 'conditional-blocks', 'waits-for')
+				  AND i.status NOT IN ('closed', 'tombstone')
+				  AND i2.status NOT IN ('closed', 'tombstone')
+			) as dependent_count,
 			COALESCE(m.critical_path_depth, 0) as critical_depth,
 			0 as in_cycle,
 			-- Comment count for display badges (bv-52)
@@ -287,7 +326,7 @@ func CreateMaterializedViews(db *sql.DB) error {
 					FROM dependencies d
 					JOIN issues i2 ON d.issue_id = i2.id
 					WHERE d.depends_on_id = i.id
-					  AND d.type IN ('', 'blocks', 'conditional-blocks', 'waits-for')
+					  AND COALESCE(d.type, 'blocks') IN ('', 'blocks', 'conditional-blocks', 'waits-for')
 					  AND i.status NOT IN ('closed', 'tombstone')
 					  AND i2.status NOT IN ('closed', 'tombstone')
 					ORDER BY d.issue_id
@@ -297,13 +336,14 @@ func CreateMaterializedViews(db *sql.DB) error {
 					FROM dependencies d
 					JOIN issues i2 ON d.depends_on_id = i2.id
 					WHERE d.issue_id = i.id
-					  AND d.type IN ('', 'blocks', 'conditional-blocks', 'waits-for')
+					  AND COALESCE(d.type, 'blocks') IN ('', 'blocks', 'conditional-blocks', 'waits-for')
 					  AND i.status NOT IN ('closed', 'tombstone')
 					  AND i2.status NOT IN ('closed', 'tombstone')
 					ORDER BY d.depends_on_id
 				)) as blocked_by_ids
 			FROM issues i
 			LEFT JOIN issue_metrics m ON i.id = m.issue_id
+			WHERE COALESCE(i.status, '') <> 'tombstone'
 		`
 	if _, err := tx.Exec(overviewSQL); err != nil {
 		return fmt.Errorf("create issue_overview_mv: %w", err)

@@ -4,6 +4,8 @@ package correlation
 import (
 	"context"
 	"fmt"
+	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -34,6 +36,11 @@ type RelatedBead struct {
 // ReverseLookup provides reverse lookup from commits to beads.
 type ReverseLookup struct {
 	repoPath         string
+	storeDirRel      string
+	storeDirRels     []string
+	subtreeScoped    bool
+	includeSubtrees  []string
+	excludeSubtrees  []string
 	index            CommitIndex                   // SHA -> []BeadID
 	details          map[string][]CorrelatedCommit // SHA -> commits with full details
 	beads            map[string]BeadHistory        // BeadID -> history
@@ -53,6 +60,138 @@ func (rl *ReverseLookup) WithContext(ctx context.Context) *ReverseLookup {
 		rl.explicit.WithContext(ctx)
 	}
 	return rl
+}
+
+// WithStoreDir configures a custom git-root-relative tracker directory prefix
+// (e.g. "custom-beads") so orphan commit detection treats tracker-only commits
+// and tracker paths identically to .beads/.
+func (rl *ReverseLookup) WithStoreDir(storeDirRel string) *ReverseLookup {
+	rl.storeDirRel = normalizeStoreDirRel(storeDirRel)
+	return rl
+}
+
+// WithStoreDirs configures one or more custom git-root-relative tracker directory
+// prefixes for single-repo or shared-.git workspace orphan detection.
+func (rl *ReverseLookup) WithStoreDirs(storeDirs ...string) *ReverseLookup {
+	seen := make(map[string]bool, len(storeDirs))
+	var normalized []string
+	for _, raw := range storeDirs {
+		norm := normalizeStoreDirRel(raw)
+		if norm != "" && !seen[norm] {
+			seen[norm] = true
+			normalized = append(normalized, norm)
+		}
+	}
+	rl.storeDirRels = normalized
+	if len(normalized) > 0 && rl.storeDirRel == "" {
+		rl.storeDirRel = normalized[0]
+	}
+	return rl
+}
+
+// WithSubtreeScope restricts FindOrphanCommits to commits touching at least one
+// path in includePrefixes (or, when includePrefixes is empty and excludePrefixes
+// is non-empty, at least one path outside excludePrefixes). Used for --repo
+// scoping in multi-store workspaces sharing a single .git repository.
+func (rl *ReverseLookup) WithSubtreeScope(includePrefixes, excludePrefixes []string) *ReverseLookup {
+	normalizeList := func(raw []string) []string {
+		var out []string
+		seen := make(map[string]bool, len(raw))
+		for _, p := range raw {
+			rawSlash := strings.TrimSpace(strings.ReplaceAll(filepath.ToSlash(p), "\\", "/"))
+			if rawSlash == "" {
+				continue
+			}
+			norm := path.Clean(rawSlash)
+			norm = strings.TrimPrefix(norm, "./")
+			if norm == "" || norm == "." || norm == ".." || strings.HasPrefix(norm, "../") || strings.HasPrefix(norm, "/") {
+				continue
+			}
+			norm += "/"
+			if !seen[norm] {
+				seen[norm] = true
+				out = append(out, norm)
+			}
+		}
+		return out
+	}
+	inc := normalizeList(includePrefixes)
+	exc := normalizeList(excludePrefixes)
+	if len(inc) > 0 || len(exc) > 0 {
+		rl.subtreeScoped = true
+		rl.includeSubtrees = inc
+		rl.excludeSubtrees = exc
+	}
+	return rl
+}
+
+func (rl *ReverseLookup) commitTouchesSubtreeScope(wc walkedCommit) bool {
+	if !rl.subtreeScoped || len(wc.Files) == 0 {
+		return true
+	}
+	evalFiles := make([]string, 0, len(wc.Files))
+	for _, f := range wc.Files {
+		if !rl.isConfiguredTrackerPath(f) {
+			evalFiles = append(evalFiles, f)
+		}
+	}
+	if len(evalFiles) == 0 {
+		// Pure tracker-only commit: fall back to wc.Files so BeadsOnlyCommits
+		// remains attributed to its owning subtree.
+		evalFiles = wc.Files
+	}
+	if len(rl.includeSubtrees) > 0 {
+		for _, f := range evalFiles {
+			nf := normalizeRepoSlashPath(f)
+			for _, inc := range rl.includeSubtrees {
+				if strings.HasPrefix(nf, inc) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if len(rl.excludeSubtrees) > 0 {
+		for _, f := range evalFiles {
+			nf := normalizeRepoSlashPath(f)
+			excluded := false
+			for _, exc := range rl.excludeSubtrees {
+				if strings.HasPrefix(nf, exc) {
+					excluded = true
+					break
+				}
+			}
+			if !excluded {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func (rl *ReverseLookup) isConfiguredTrackerPath(path string) bool {
+	if isTrackerPath(path, rl.storeDirRel) {
+		return true
+	}
+	for _, dir := range rl.storeDirRels {
+		if isTrackerPath(path, dir) {
+			return true
+		}
+	}
+	return false
+}
+
+func (rl *ReverseLookup) isTrackerOnlyCommit(wc walkedCommit) bool {
+	if len(wc.Files) == 0 {
+		return false
+	}
+	for _, f := range wc.Files {
+		if !rl.isConfiguredTrackerPath(f) {
+			return false
+		}
+	}
+	return true
 }
 
 func collectReportKnownBeadIDs(report *HistoryReport) []string {
@@ -325,7 +464,10 @@ func (rl *ReverseLookup) FindOrphanCommits(opts ExtractOptions) ([]OrphanCommit,
 	correlated := 0
 	beadsOnly := 0
 	for _, wc := range walk {
-		if wc.beadsOnly() {
+		if rl.subtreeScoped && !rl.commitTouchesSubtreeScope(wc) {
+			continue
+		}
+		if rl.isTrackerOnlyCommit(wc) {
 			beadsOnly++
 			continue
 		}
@@ -349,7 +491,7 @@ func (rl *ReverseLookup) FindOrphanCommits(opts ExtractOptions) ([]OrphanCommit,
 		}
 		var files []string
 		for _, f := range wc.Files {
-			if !isExcludedPath(f) {
+			if !isExcludedPath(f) && !rl.isConfiguredTrackerPath(f) {
 				files = append(files, f)
 			}
 		}

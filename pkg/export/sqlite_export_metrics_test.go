@@ -6,11 +6,14 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"golang.org/x/text/unicode/norm"
 )
 
 func TestSQLiteExporter_InsertsMetricsAndTriageRecommendations(t *testing.T) {
@@ -208,13 +211,29 @@ func TestSQLiteExporter_BlockingVocabularyMatchesOverview(t *testing.T) {
 				if edge.blocking && state.active {
 					want = 1
 				}
-				for _, endpoint := range []struct{ id, query, counterpart string }{
-					{"blocker", `SELECT dependent_count, blocks_ids FROM issue_overview_mv WHERE id = ?`, "dependent"},
-					{"dependent", `SELECT blocker_count, blocked_by_ids FROM issue_overview_mv WHERE id = ?`, "blocker"},
+				for _, endpoint := range []struct {
+					id          string
+					status      model.Status
+					query       string
+					counterpart string
+				}{
+					{"blocker", state.blocker, `SELECT dependent_count, blocks_ids FROM issue_overview_mv WHERE id = ?`, "dependent"},
+					{"dependent", state.dependent, `SELECT blocker_count, blocked_by_ids FROM issue_overview_mv WHERE id = ?`, "blocker"},
 				} {
 					var count int
 					var ids sql.NullString
-					if err := db.QueryRow(endpoint.query, endpoint.id).Scan(&count, &ids); err != nil {
+					err := db.QueryRow(endpoint.query, endpoint.id).Scan(&count, &ids)
+					if endpoint.status == model.StatusTombstone {
+						if err != sql.ErrNoRows {
+							t.Fatalf("tombstone endpoint %s leaked into issue_overview_mv: err=%v count=%d ids=%q", endpoint.id, err, count, ids.String)
+						}
+						var rawStatus string
+						if err := db.QueryRow(`SELECT status FROM issues WHERE id = ?`, endpoint.id).Scan(&rawStatus); err != nil || rawStatus != string(model.StatusTombstone) {
+							t.Fatalf("tombstone endpoint %s missing from issues table: status=%q err=%v", endpoint.id, rawStatus, err)
+						}
+						continue
+					}
+					if err != nil {
 						t.Fatal(err)
 					}
 					wantIDs := ""
@@ -441,5 +460,294 @@ func TestSQLiteExporter_writeRobotOutputs_WritesExpectedFiles(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dataDir, name)); err != nil {
 			t.Fatalf("Expected %s to exist: %v", name, err)
 		}
+	}
+}
+
+func hasLetterOrNumberRune(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func escapeSQLiteLikeForTest(raw string) string {
+	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return replacer.Replace(raw)
+}
+
+func buildFTSMatchQueryForTest(raw string) string {
+	normalized := norm.NFC.String(strings.TrimSpace(raw))
+	if normalized == "" {
+		return ""
+	}
+	var parts []string
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() == 0 {
+			return
+		}
+		candidate := cur.String()
+		cur.Reset()
+		if hasLetterOrNumberRune(candidate) {
+			parts = append(parts, candidate)
+		}
+	}
+	for _, r := range normalized {
+		if unicode.IsLetter(r) || unicode.IsMark(r) || unicode.IsNumber(r) || r == '_' {
+			cur.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	if len(parts) == 0 {
+		return ""
+	}
+	quoted := make([]string, len(parts))
+	for i, part := range parts {
+		quoted[i] = `"` + strings.ReplaceAll(part, `"`, `""`) + `"*`
+	}
+	return strings.Join(quoted, " ")
+}
+
+func TestSQLiteExporter_EigenvectorBreakdownFTSAndHybridWasmMeta(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	extRef := "GH-4242"
+	issues := []*model.Issue{
+		{
+			ID:                 "root",
+			Title:              "Gateway root",
+			Description:        "Primary auth gateway",
+			Notes:              "obsidian-note-probe naïve-über हिंदी unicode_word",
+			Design:             "design-arch-v2",
+			AcceptanceCriteria: "ac-criterion-7",
+			ExternalRef:        &extRef,
+			Status:             model.StatusOpen,
+			Priority:           0,
+			IssueType:          model.TypeBug,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+		},
+		{
+			ID:          "leaf",
+			Title:       "Downstream consumer",
+			Description: "Depends on root and has non-blocking metadata edges",
+			Status:      model.StatusOpen,
+			Priority:    1,
+			IssueType:   model.TypeFeature,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "leaf", DependsOnID: "root", Type: model.DepBlocks, CreatedAt: now},
+				{IssueID: "leaf", DependsOnID: "epic", Type: model.DepParentChild, CreatedAt: now},
+				{IssueID: "leaf", DependsOnID: "rel", Type: model.DepRelated, CreatedAt: now},
+				{IssueID: "leaf", DependsOnID: "disc", Type: model.DepDiscoveredFrom, CreatedAt: now},
+				{IssueID: "leaf", DependsOnID: "closed-blk", Type: model.DepBlocks, CreatedAt: now},
+				{IssueID: "leaf", DependsOnID: "tomb-blk", Type: model.DepBlocks, CreatedAt: now},
+			},
+		},
+		{ID: "epic", Title: "Parent epic", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeEpic, CreatedAt: now, UpdatedAt: now},
+		{ID: "rel", Title: "Related task", Notes: "foo___bar literal underscore marker", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "disc", Title: "Discovered origin", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "closed-blk", Title: "Resolved blocker", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "tomb-blk", Title: "Tombstoned blocker", Status: model.StatusTombstone, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	}
+
+	var valueIssues []model.Issue
+	var allDeps []*model.Dependency
+	for _, iss := range issues {
+		valueIssues = append(valueIssues, *iss)
+		allDeps = append(allDeps, iss.Dependencies...)
+	}
+
+	stats := analysis.NewAnalyzer(valueIssues).Analyze()
+	stats.WaitForPhase2()
+	triage := analysis.ComputeTriageWithOptionsAndTime(valueIssues, analysis.TriageOptions{
+		UseFastConfig: true,
+		WaitForPhase2: true,
+	}, now)
+
+	outDir := t.TempDir()
+	exporter := NewSQLiteExporter(issues, allDeps, &stats, &triage)
+	if err := exporter.Export(outDir); err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(outDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("Open sqlite db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// 1. Eigenvector populated in issue_metrics and exposed in issue_overview_mv.
+	var metricEV, mvEV float64
+	if err := db.QueryRow(`SELECT eigenvector FROM issue_metrics WHERE issue_id = ?`, "root").Scan(&metricEV); err != nil {
+		t.Fatalf("Scan issue_metrics.eigenvector: %v", err)
+	}
+	if err := db.QueryRow(`SELECT eigenvector FROM issue_overview_mv WHERE id = ?`, "root").Scan(&mvEV); err != nil {
+		t.Fatalf("Scan issue_overview_mv.eigenvector: %v", err)
+	}
+	if metricEV <= 0 || math.Abs(metricEV-mvEV) > 1e-9 {
+		t.Fatalf("expected positive matching eigenvector for root, got metric=%v mv=%v", metricEV, mvEV)
+	}
+
+	// 2. Triage breakdown JSON persisted in triage_recommendations.breakdown.
+	var breakdownRaw string
+	if err := db.QueryRow(`SELECT breakdown FROM triage_recommendations WHERE issue_id = ?`, "root").Scan(&breakdownRaw); err != nil {
+		t.Fatalf("Scan triage_recommendations.breakdown: %v", err)
+	}
+	var breakdown map[string]any
+	if err := json.Unmarshal([]byte(breakdownRaw), &breakdown); err != nil {
+		t.Fatalf("Unmarshal triage breakdown %q: %v", breakdownRaw, err)
+	}
+	if prVal, ok := breakdown["pagerank"].(float64); !ok || prVal <= 0 {
+		t.Fatalf("expected positive pagerank float in triage breakdown JSON, got %v", breakdown)
+	}
+
+	// 3. FTS5 indexes notes, design, acceptance_criteria, and external_ref with safe hyphenated + Unicode NFC/combining-mark MATCH queries & snippet(..., -1, ...).
+	if got := buildFTSMatchQueryForTest("naïve-über"); got != `"naïve"* "über"*` {
+		t.Fatalf("buildFTSMatchQueryForTest(naïve-über) = %q, want %q", got, `"naïve"* "über"*`)
+	}
+	if got := buildFTSMatchQueryForTest("nai\u0308ve"); got != `"naïve"*` {
+		t.Fatalf("buildFTSMatchQueryForTest(NFD nai\\u0308ve) = %q, want %q", got, `"naïve"*`)
+	}
+	if got := buildFTSMatchQueryForTest("हिंदी"); got != `"हिंदी"*` {
+		t.Fatalf("buildFTSMatchQueryForTest(हिंदी) = %q, want %q", got, `"हिंदी"*`)
+	}
+	if got := buildFTSMatchQueryForTest("___"); got != "" {
+		t.Fatalf("buildFTSMatchQueryForTest(___) = %q, want empty string for LIKE fallback", got)
+	}
+	if got := buildFTSMatchQueryForTest("\u0308"); got != "" {
+		t.Fatalf("buildFTSMatchQueryForTest(isolated combining mark) = %q, want empty string", got)
+	}
+	for _, rawQuery := range []string{"obsidian-note-probe", "GH-4242", "design-arch-v2", "ac-criterion-7", "naïve", "nai\u0308ve", "über", "naïve-über", "हिंदी"} {
+		ftsQuery := buildFTSMatchQueryForTest(rawQuery)
+		var matchedID, snippetText string
+		if err := db.QueryRow(`SELECT id, snippet(issues_fts, -1, '<mark>', '</mark>', '...', 32) FROM issues_fts WHERE issues_fts MATCH ?`, ftsQuery).Scan(&matchedID, &snippetText); err != nil {
+			t.Fatalf("FTS5 query %q (MATCH %q) failed: %v", rawQuery, ftsQuery, err)
+		}
+		if matchedID != "root" {
+			t.Fatalf("FTS5 query %q matched %q, want root", rawQuery, matchedID)
+		}
+		if !strings.Contains(snippetText, "<mark>") {
+			t.Fatalf("FTS5 snippet(..., -1, ...) for %q did not highlight matched column: %q", rawQuery, snippetText)
+		}
+	}
+	// Underscore-only query returns "" from buildFTSMatchQueryForTest and triggers escaped LIKE fallback matching only "foo___bar".
+	var likeMatchedIDs string
+	if err := db.QueryRow(`SELECT COALESCE(GROUP_CONCAT(id), '') FROM issue_overview_mv WHERE COALESCE(notes, '') LIKE ? ESCAPE '\'`, "%"+escapeSQLiteLikeForTest("___")+"%").Scan(&likeMatchedIDs); err != nil {
+		t.Fatalf("Underscore LIKE fallback query failed: %v", err)
+	}
+	if likeMatchedIDs != "rel" {
+		t.Fatalf("Underscore LIKE fallback matched %q, want %q", likeMatchedIDs, "rel")
+	}
+	// Adversarial FTS5 operator/colon/hyphen query must never error.
+	var advCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM issues_fts WHERE issues_fts MATCH ?`, buildFTSMatchQueryForTest("bv-123 AND NOT foo:bar")).Scan(&advCount); err != nil {
+		t.Fatalf("Adversarial FTS5 query failed: %v", err)
+	}
+
+	// 3b. issue_overview_mv excludes tombstones while issues table preserves them; GetExportedIssues matches active blocking counts & eigenvector.
+	var mvTombCount, rawTombCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM issue_overview_mv WHERE id = 'tomb-blk' OR status = 'tombstone'`).Scan(&mvTombCount); err != nil {
+		t.Fatalf("Query issue_overview_mv tombstone count: %v", err)
+	}
+	if mvTombCount != 0 {
+		t.Fatalf("issue_overview_mv tombstone count = %d, want 0", mvTombCount)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM issues WHERE id = 'tomb-blk' AND status = 'tombstone'`).Scan(&rawTombCount); err != nil {
+		t.Fatalf("Query issues tombstone count: %v", err)
+	}
+	if rawTombCount != 1 {
+		t.Fatalf("issues tombstone count = %d, want 1", rawTombCount)
+	}
+
+	exportedIssues := exporter.GetExportedIssues()
+	expByID := make(map[string]ExportIssue, len(exportedIssues))
+	for _, ei := range exportedIssues {
+		expByID[ei.ID] = ei
+	}
+	if math.Abs(expByID["root"].Eigenvector-metricEV) > 1e-9 || expByID["root"].Eigenvector <= 0 {
+		t.Fatalf("GetExportedIssues root.Eigenvector = %v, want %v", expByID["root"].Eigenvector, metricEV)
+	}
+	if expByID["leaf"].BlockedByCount != 1 {
+		t.Fatalf("GetExportedIssues leaf.BlockedByCount = %d, want 1 (active blocking only)", expByID["leaf"].BlockedByCount)
+	}
+	for _, nonBlockingID := range []string{"epic", "rel", "disc", "closed-blk", "tomb-blk"} {
+		if expByID[nonBlockingID].BlocksCount != 0 {
+			t.Fatalf("GetExportedIssues %s.BlocksCount = %d, want 0", nonBlockingID, expByID[nonBlockingID].BlocksCount)
+		}
+	}
+
+	// 4. Non-blocking and resolved edges do NOT inflate blocker_count / dependent_count (even without issue_metrics).
+	noMetricsOut := t.TempDir()
+	noMetricsExp := NewSQLiteExporter(issues, allDeps, nil, nil)
+	if err := noMetricsExp.Export(noMetricsOut); err != nil {
+		t.Fatalf("Export without metrics failed: %v", err)
+	}
+	noMetricsDB, err := sql.Open("sqlite", filepath.Join(noMetricsOut, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("Open noMetricsDB: %v", err)
+	}
+	t.Cleanup(func() { _ = noMetricsDB.Close() })
+
+	var leafBlockers, epicDependents, relDependents, discDependents int
+	if err := noMetricsDB.QueryRow(`SELECT blocker_count FROM issue_overview_mv WHERE id = 'leaf'`).Scan(&leafBlockers); err != nil {
+		t.Fatalf("Scan leaf blocker_count: %v", err)
+	}
+	if leafBlockers != 1 {
+		t.Fatalf("leaf blocker_count = %d, want 1 (only active 'root' blocks edge)", leafBlockers)
+	}
+	for id, gotPtr := range map[string]*int{"epic": &epicDependents, "rel": &relDependents, "disc": &discDependents} {
+		if err := noMetricsDB.QueryRow(`SELECT dependent_count FROM issue_overview_mv WHERE id = ?`, id).Scan(gotPtr); err != nil {
+			t.Fatalf("Scan %s dependent_count: %v", id, err)
+		}
+		if *gotPtr != 0 {
+			t.Fatalf("%s dependent_count = %d, want 0 for non-blocking relationship", id, *gotPtr)
+		}
+	}
+
+	// 5. has_hybrid_wasm written to export_meta and data/meta.json (false by default, true when bundled).
+	var metaDBVal string
+	if err := db.QueryRow(`SELECT value FROM export_meta WHERE key = 'has_hybrid_wasm'`).Scan(&metaDBVal); err != nil {
+		t.Fatalf("Scan export_meta has_hybrid_wasm: %v", err)
+	}
+	if metaDBVal != "false" {
+		t.Fatalf("export_meta has_hybrid_wasm = %q, want \"false\"", metaDBVal)
+	}
+	metaBytes, err := os.ReadFile(filepath.Join(outDir, "data", "meta.json"))
+	if err != nil {
+		t.Fatalf("Read data/meta.json: %v", err)
+	}
+	var metaPayload ExportMeta
+	if err := json.Unmarshal(metaBytes, &metaPayload); err != nil {
+		t.Fatalf("Unmarshal data/meta.json: %v", err)
+	}
+	if metaPayload.HasHybridWasm {
+		t.Fatalf("meta.json has_hybrid_wasm = true, want false when wasm/bv_hybrid_scorer.js is absent")
+	}
+
+	withHybridOut := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(withHybridOut, "wasm"), 0o755); err != nil {
+		t.Fatalf("MkdirAll wasm: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(withHybridOut, "wasm", "bv_hybrid_scorer.js"), []byte("// stub\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile bv_hybrid_scorer.js: %v", err)
+	}
+	if err := NewSQLiteExporter(issues[:1], nil, nil, nil).Export(withHybridOut); err != nil {
+		t.Fatalf("Export with hybrid wasm stub failed: %v", err)
+	}
+	withHybridMetaBytes, err := os.ReadFile(filepath.Join(withHybridOut, "data", "meta.json"))
+	if err != nil {
+		t.Fatalf("Read withHybrid data/meta.json: %v", err)
+	}
+	var withHybridMeta ExportMeta
+	if err := json.Unmarshal(withHybridMetaBytes, &withHybridMeta); err != nil {
+		t.Fatalf("Unmarshal withHybrid data/meta.json: %v", err)
+	}
+	if !withHybridMeta.HasHybridWasm {
+		t.Fatalf("meta.json has_hybrid_wasm = false, want true when wasm/bv_hybrid_scorer.js is present")
 	}
 }

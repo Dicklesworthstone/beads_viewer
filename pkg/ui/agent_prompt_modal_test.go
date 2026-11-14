@@ -418,3 +418,73 @@ func TestModel_AgentUpgradePromptAcceptAndAsOfGuard(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckAgentFileCmd_ParentDirectoryDetection(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	runCheck := func(t *testing.T, dir string) AgentFileCheckMsg {
+		t.Helper()
+		msg := CheckAgentFileCmd(dir)()
+		check, ok := msg.(AgentFileCheckMsg)
+		if !ok {
+			t.Fatalf("CheckAgentFileCmd returned %T, want AgentFileCheckMsg", msg)
+		}
+		return check
+	}
+
+	t.Run("parent with current blurb suppresses prompt in child subdir", func(t *testing.T) {
+		root := t.TempDir()
+		subDir := filepath.Join(root, "packages", "web")
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("# Root\n\n"+agents.AgentBlurb+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := runCheck(t, subDir); got.ShouldPrompt {
+			t.Fatalf("expected no prompt when parent AGENTS.md already has current blurb, got %+v", got)
+		}
+	})
+
+	t.Run("parent without blurb targets parent AGENTS.md instead of child subdir", func(t *testing.T) {
+		root := t.TempDir()
+		subDir := filepath.Join(root, "packages", "api")
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		parentFile := filepath.Join(root, "AGENTS.md")
+		if err := os.WriteFile(parentFile, []byte("# Monorepo Rules\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got := runCheck(t, subDir)
+		if !got.ShouldPrompt || got.IsUpgrade || got.FilePath != parentFile {
+			t.Fatalf("got %+v, want ShouldPrompt=true IsUpgrade=false FilePath=%q", got, parentFile)
+		}
+
+		// Respect DontAskAgain recorded on parent root
+		if err := agents.RecordDecline(root, true); err != nil {
+			t.Fatal(err)
+		}
+		if after := runCheck(t, subDir); after.ShouldPrompt {
+			t.Fatalf("expected parent DontAskAgain preference to suppress subdir prompt, got %+v", after)
+		}
+	})
+
+	t.Run("parent with outdated v3 blurb offers upgrade of parent AGENTS.md", func(t *testing.T) {
+		root := t.TempDir()
+		subDir := filepath.Join(root, "cmd", "bv")
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		parentFile := filepath.Join(root, "AGENTS.md")
+		oldDoc := "# Root\n\n<!-- bv-agent-instructions-v3 -->\nOld v3\n<!-- end-bv-agent-instructions -->\n"
+		if err := os.WriteFile(parentFile, []byte(oldDoc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got := runCheck(t, subDir)
+		if !got.ShouldPrompt || !got.IsUpgrade || got.ExistingVersion != 3 || got.FilePath != parentFile {
+			t.Fatalf("got %+v, want ShouldPrompt=true IsUpgrade=true ExistingVersion=3 FilePath=%q", got, parentFile)
+		}
+	})
+}

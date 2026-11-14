@@ -405,21 +405,20 @@ func TestExtractLabels_TombstoneCounts(t *testing.T) {
 }
 
 func TestExtractLabelsDuplicateLabelsOnIssue(t *testing.T) {
-	// Edge case: same label appears twice on an issue (shouldn't happen, but handle gracefully)
+	// Edge case: same label appears twice on an issue (deduplicated per issue)
 	issues := []model.Issue{
-		{ID: "bv-1", Labels: []string{"api", "api"}, Status: model.StatusOpen}, // Duplicate
+		{ID: "bv-1", Labels: []string{"api", "api"}, Status: model.StatusOpen},
 	}
 
 	result := ExtractLabels(issues)
 
-	// Both occurrences should be counted (total reflects raw label count per issue)
 	if result.LabelCount != 1 {
 		t.Errorf("Expected 1 unique label, got %d", result.LabelCount)
 	}
 
 	apiStats := result.Stats["api"]
-	if apiStats.TotalCount != 2 {
-		t.Errorf("Expected 2 counts for duplicate label, got %d", apiStats.TotalCount)
+	if apiStats.TotalCount != 1 || apiStats.OpenCount != 1 || len(apiStats.IssueIDs) != 1 {
+		t.Errorf("Expected deduplicated per-issue counts (1 total, 1 open, 1 ID), got %+v", apiStats)
 	}
 }
 
@@ -2759,5 +2758,394 @@ func TestComputeAllLabelHealth_MatchesPerLabelOracle(t *testing.T) {
 				t.Fatalf("trial %d label %q score=%d != want.Health=%d", trial, got.Label, scores[got.Label], want.Health)
 			}
 		}
+	}
+}
+
+func TestFreshnessAndAttention_IgnoreClosedStaleness(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	veryOld := now.Add(-120 * 24 * time.Hour)
+	fresh := now.Add(-1 * 24 * time.Hour)
+
+	issues := make([]model.Issue, 0, 52)
+	for i := 0; i < 50; i++ {
+		closedAt := veryOld
+		status := model.StatusClosed
+		if i == 49 {
+			status = model.StatusTombstone
+		}
+		issues = append(issues, model.Issue{
+			ID:        fmt.Sprintf("closed-%02d", i),
+			Labels:    []string{"legacy-done"},
+			Status:    status,
+			CreatedAt: veryOld,
+			UpdatedAt: veryOld,
+			ClosedAt:  &closedAt,
+		})
+	}
+	issues = append(issues, model.Issue{
+		ID:        "open-fresh",
+		Labels:    []string{"legacy-done"},
+		Status:    model.StatusOpen,
+		CreatedAt: fresh,
+		UpdatedAt: fresh,
+	})
+
+	fm := ComputeFreshnessMetrics(issues, now, 14)
+	if fm.StaleCount != 0 {
+		t.Fatalf("expected StaleCount=0 when only open issue is fresh, got %d", fm.StaleCount)
+	}
+	if fm.AvgDaysSinceUpdate < 0.9 || fm.AvgDaysSinceUpdate > 1.1 {
+		t.Fatalf("expected AvgDaysSinceUpdate ~1.0, got %f", fm.AvgDaysSinceUpdate)
+	}
+
+	cfg := DefaultLabelHealthConfig()
+	attn := ComputeLabelAttentionScores(issues, cfg, now)
+	score := attn.GetLabelAttention("legacy-done")
+	if score == nil {
+		t.Fatal("missing attention score for legacy-done")
+	}
+	if score.StaleCount != 0 || score.StalenessFactor != 1.0 {
+		t.Fatalf("expected StaleCount=0 and StalenessFactor=1.0 (not 51x), got StaleCount=%d StalenessFactor=%f", score.StaleCount, score.StalenessFactor)
+	}
+
+	// All closed issues -> openCount == 0 -> AvgDaysSinceUpdate == 0.0 (no NaN/Inf)
+	allClosed := ComputeFreshnessMetrics(issues[:50], now, 14)
+	if allClosed.StaleCount != 0 || allClosed.AvgDaysSinceUpdate != 0.0 || allClosed.FreshnessScore != 100 {
+		t.Fatalf("expected all-closed freshness StaleCount=0 Avg=0 Score=100, got %+v", allClosed)
+	}
+}
+
+func TestLabelHealth_FlowIgnoresClosedUnlessConfigured(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-2 * 24 * time.Hour)
+
+	issues := []model.Issue{
+		{ID: "closed-blocker", Labels: []string{"db"}, Status: model.StatusClosed, UpdatedAt: now, ClosedAt: &closedAt},
+		{
+			ID:        "open-api",
+			Labels:    []string{"api"},
+			Status:    model.StatusOpen,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-api", DependsOnID: "closed-blocker", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "closed-ui",
+			Labels:    []string{"ui"},
+			Status:    model.StatusClosed,
+			UpdatedAt: now,
+			ClosedAt:  &closedAt,
+			Dependencies: []*model.Dependency{
+				{IssueID: "closed-ui", DependsOnID: "open-api", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	cfg := DefaultLabelHealthConfig()
+	apiHealth := ComputeLabelHealthForLabel("api", issues, cfg, now, nil)
+	if apiHealth.Flow.IncomingDeps != 0 || apiHealth.Flow.OutgoingDeps != 0 || apiHealth.Flow.FlowScore != 100 {
+		t.Fatalf("expected closed cross-label deps excluded by default, got %+v", apiHealth.Flow)
+	}
+	batch := ComputeAllLabelHealth(issues, cfg, now, nil)
+	scores := ComputeLabelHealthScores(issues, cfg, now, nil)
+	for _, h := range batch.Labels {
+		if h.Label == "api" && !reflect.DeepEqual(h, apiHealth) {
+			t.Fatalf("batch api health mismatch: got %+v want %+v", h, apiHealth)
+		}
+		if scores[h.Label] != h.Health {
+			t.Fatalf("score mismatch for %s: got %d want %d", h.Label, scores[h.Label], h.Health)
+		}
+	}
+
+	cfgWithClosed := cfg
+	cfgWithClosed.IncludeClosedInFlow = true
+	apiWithClosed := ComputeLabelHealthForLabel("api", issues, cfgWithClosed, now, nil)
+	if apiWithClosed.Flow.IncomingDeps != 1 || apiWithClosed.Flow.OutgoingDeps != 1 {
+		t.Fatalf("expected closed cross-label deps included when IncludeClosedInFlow=true, got %+v", apiWithClosed.Flow)
+	}
+	scoresWithClosed := ComputeLabelHealthScores(issues, cfgWithClosed, now, nil)
+	if scoresWithClosed["api"] != apiWithClosed.Health {
+		t.Fatalf("score with closed flow mismatch: got %d want %d", scoresWithClosed["api"], apiWithClosed.Health)
+	}
+}
+
+func TestLabelHealthAndStats_BlockedCountsDependencyBlockedWithoutDoubleCounting(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-24 * time.Hour)
+	issues := []model.Issue{
+		{ID: "blocker-open", Labels: []string{"core"}, Status: model.StatusOpen, UpdatedAt: now},
+		{ID: "blocker-closed", Labels: []string{"core"}, Status: model.StatusClosed, UpdatedAt: now, ClosedAt: &closedAt},
+		{
+			ID:        "open-blocked-by-dep",
+			Labels:    []string{"api"},
+			Status:    model.StatusOpen,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-blocked-by-dep", DependsOnID: "blocker-open", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "status-blocked-and-dep",
+			Labels:    []string{"api"},
+			Status:    model.StatusBlocked,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "status-blocked-and-dep", DependsOnID: "blocker-open", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "open-unblocked-closed-dep",
+			Labels:    []string{"api"},
+			Status:    model.StatusOpen,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-unblocked-closed-dep", DependsOnID: "blocker-closed", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	extracted := ExtractLabels(issues)
+	apiStats := extracted.Stats["api"]
+	if apiStats == nil {
+		t.Fatal("missing api stats")
+	}
+	if apiStats.Blocked != 2 {
+		t.Fatalf("expected LabelStats.Blocked=2 (1 dep-blocked open + 1 status=blocked without double counting), got %d", apiStats.Blocked)
+	}
+
+	cfg := DefaultLabelHealthConfig()
+	apiHealth := ComputeLabelHealthForLabel("api", issues, cfg, now, nil)
+	if apiHealth.Blocked != 2 {
+		t.Fatalf("expected LabelHealth.Blocked=2, got %d", apiHealth.Blocked)
+	}
+	batch := ComputeAllLabelHealth(issues, cfg, now, nil)
+	for _, h := range batch.Labels {
+		if h.Label == "api" && h.Blocked != 2 {
+			t.Fatalf("expected batch LabelHealth.Blocked=2, got %d", h.Blocked)
+		}
+	}
+}
+
+func TestComputeAllLabelHealth_MinIssuesForHealth(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "a1", Labels: []string{"major"}, Status: model.StatusOpen, UpdatedAt: now},
+		{ID: "a2", Labels: []string{"major"}, Status: model.StatusOpen, UpdatedAt: now},
+		{ID: "a3", Labels: []string{"major"}, Status: model.StatusOpen, UpdatedAt: now},
+		{ID: "b1", Labels: []string{"singleton"}, Status: model.StatusOpen, UpdatedAt: now},
+	}
+
+	cfg := DefaultLabelHealthConfig()
+	cfg.MinIssuesForHealth = 2
+
+	batch := ComputeAllLabelHealth(issues, cfg, now, nil)
+	scores := ComputeLabelHealthScores(issues, cfg, now, nil)
+
+	if batch.TotalLabels != 1 || len(batch.Labels) != 1 || batch.Labels[0].Label != "major" {
+		t.Fatalf("expected only 'major' label with MinIssuesForHealth=2, got TotalLabels=%d Labels=%+v", batch.TotalLabels, batch.Labels)
+	}
+	if len(scores) != 1 || scores["major"] != batch.Labels[0].Health {
+		t.Fatalf("expected scores to contain only 'major' matching batch health, got %+v", scores)
+	}
+}
+
+func TestComputeCrossLabelFlow_CriticalPaths(t *testing.T) {
+	cfg := DefaultLabelHealthConfig()
+
+	emptyFlow := ComputeCrossLabelFlow([]model.Issue{
+		{ID: "solo", Labels: []string{"api"}, Status: model.StatusOpen},
+	}, cfg)
+	if emptyFlow.CriticalPaths == nil || len(emptyFlow.CriticalPaths) != 0 {
+		t.Fatalf("expected non-nil empty CriticalPaths when no cross-label deps, got %#v", emptyFlow.CriticalPaths)
+	}
+
+	// Chain: db -> api -> ui (length 2) and ops -> ui (length 1)
+	chainIssues := []model.Issue{
+		{ID: "db-1", Labels: []string{"db"}, Status: model.StatusOpen},
+		{
+			ID:     "api-1",
+			Labels: []string{"api"},
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "api-1", DependsOnID: "db-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:     "ui-1",
+			Labels: []string{"ui"},
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "ui-1", DependsOnID: "api-1", Type: model.DepBlocks},
+				{IssueID: "ui-1", DependsOnID: "ops-1", Type: model.DepBlocks},
+			},
+		},
+		{ID: "ops-1", Labels: []string{"ops"}, Status: model.StatusOpen},
+	}
+	flow := ComputeCrossLabelFlow(chainIssues, cfg)
+	if len(flow.CriticalPaths) == 0 {
+		t.Fatal("expected CriticalPaths to be populated")
+	}
+	top := flow.CriticalPaths[0]
+	wantLabels := []string{"db", "api", "ui"}
+	if !reflect.DeepEqual(top.Labels, wantLabels) || top.Length != 2 || top.TotalWeight != 2.0 || top.IssueCount != 3 {
+		t.Fatalf("unexpected top critical path: %+v", top)
+	}
+}
+
+func TestLabelHealth_MissingAndParentChainBlockedAndClosedAttentionExclusion(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-40 * 24 * time.Hour)
+
+	issues := []model.Issue{
+		// Root blocker -> open parent blocked by DepBlocks -> child open via DepParentChild must be counted as Blocked
+		{ID: "root-blk", Labels: []string{"core"}, Status: model.StatusOpen, UpdatedAt: now},
+		{
+			ID: "parent-blk", Labels: []string{"core"}, Status: model.StatusOpen, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "parent-blk", DependsOnID: "root-blk", Type: model.DepBlocks}},
+		},
+		{
+			ID: "child-open", Labels: []string{"api"}, Status: model.StatusOpen, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "child-open", DependsOnID: "parent-blk", Type: model.DepParentChild}},
+		},
+		// Missing external blocker -> DependenciesUnknown -> Blocked
+		{
+			ID: "missing-dep", Labels: []string{"api"}, Status: model.StatusOpen, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "missing-dep", DependsOnID: "EXT-MISSING", Type: model.DepBlocks}},
+		},
+		// Pinned open issue must NOT inflate ComputeBlockageCascadeAt TotalBlocked
+		{ID: "pinned-open", Labels: []string{"api"}, Status: model.StatusOpen, Pinned: true, UpdatedAt: now},
+		// 100%-closed archive label with historical issues must score 0 attention and not crush active labels
+		{ID: "arch-1", Labels: []string{"archive"}, Status: model.StatusClosed, UpdatedAt: closedAt, ClosedAt: &closedAt},
+		{
+			ID: "arch-2", Labels: []string{"archive"}, Status: model.StatusClosed, UpdatedAt: closedAt, ClosedAt: &closedAt,
+			Dependencies: []*model.Dependency{{IssueID: "arch-2", DependsOnID: "arch-1", Type: model.DepBlocks}},
+		},
+	}
+
+	cfg := DefaultLabelHealthConfig()
+	apiSingle := ComputeLabelHealthForLabel("api", issues, cfg, now, nil)
+	if apiSingle.Blocked != 2 {
+		t.Fatalf("ComputeLabelHealthForLabel('api').Blocked = %d, want 2 (parent-blocked + missing blocker)", apiSingle.Blocked)
+	}
+	allHealth := ComputeAllLabelHealth(issues, cfg, now, nil)
+	for _, h := range allHealth.Labels {
+		if h.Label == "api" && h.Blocked != 2 {
+			t.Fatalf("ComputeAllLabelHealth('api').Blocked = %d, want 2", h.Blocked)
+		}
+	}
+	extracted := ExtractLabels(issues)
+	if extracted.Stats["api"].Blocked != 2 {
+		t.Fatalf("ExtractLabels Stats['api'].Blocked = %d, want 2", extracted.Stats["api"].Blocked)
+	}
+
+	flow := ComputeCrossLabelFlow(issues, cfg)
+	cascade := ComputeBlockageCascadeAt(issues, flow, cfg, now)
+	// Blocked issues: parent-blk, child-open, missing-dep = 3 (pinned-open excluded)
+	if cascade.TotalBlocked != 3 {
+		t.Fatalf("ComputeBlockageCascadeAt TotalBlocked = %d, want 3 (pinned open excluded)", cascade.TotalBlocked)
+	}
+
+	attn := ComputeLabelAttentionScores(issues, cfg, now)
+	archAttn := attn.GetLabelAttention("archive")
+	apiAttn := attn.GetLabelAttention("api")
+	if archAttn == nil || apiAttn == nil {
+		t.Fatal("expected attention scores for archive and api")
+	}
+	if archAttn.AttentionScore != 0 || archAttn.PageRankSum != 0 || archAttn.BlockImpact != 0 || archAttn.NormalizedScore != 0 {
+		t.Fatalf("expected 100%%-closed label 'archive' to have zero attention/PageRankSum/BlockImpact, got %+v", *archAttn)
+	}
+	if apiAttn.AttentionScore <= 0 {
+		t.Fatalf("expected active label 'api' to have positive AttentionScore, got %+v", *apiAttn)
+	}
+
+	fastAttn := ComputeLabelAttentionScoresFast(issues, cfg, now, nil)
+	if fastAttn["archive"] != 0 {
+		t.Fatalf("expected ComputeLabelAttentionScoresFast['archive'] = 0, got %f", fastAttn["archive"])
+	}
+	if fastAttn["api"] <= 0 {
+		t.Fatalf("expected ComputeLabelAttentionScoresFast['api'] > 0, got %f", fastAttn["api"])
+	}
+}
+
+func TestComputeAllLabelHealthDeduplicatesDuplicateLabelsOnSameIssue(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultLabelHealthConfig()
+
+	dupIssues := []model.Issue{
+		{
+			ID:        "B-1",
+			Title:     "Database migration",
+			Labels:    []string{"db", "db"},
+			Status:    model.StatusOpen,
+			Priority:  1,
+			UpdatedAt: now.Add(-2 * 24 * time.Hour),
+		},
+		{
+			ID:        "A-1",
+			Title:     "API endpoint",
+			Labels:    []string{"api", "api"},
+			Status:    model.StatusOpen,
+			Priority:  1,
+			UpdatedAt: now.Add(-2 * 24 * time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "A-1", DependsOnID: "B-1", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	cleanIssues := []model.Issue{
+		{
+			ID:        "B-1",
+			Title:     "Database migration",
+			Labels:    []string{"db"},
+			Status:    model.StatusOpen,
+			Priority:  1,
+			UpdatedAt: now.Add(-2 * 24 * time.Hour),
+		},
+		{
+			ID:        "A-1",
+			Title:     "API endpoint",
+			Labels:    []string{"api"},
+			Status:    model.StatusOpen,
+			Priority:  1,
+			UpdatedAt: now.Add(-2 * 24 * time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "A-1", DependsOnID: "B-1", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	apiSingle := ComputeLabelHealthForLabel("api", dupIssues, cfg, now, nil)
+	dbSingle := ComputeLabelHealthForLabel("db", dupIssues, cfg, now, nil)
+	apiClean := ComputeLabelHealthForLabel("api", cleanIssues, cfg, now, nil)
+	dbClean := ComputeLabelHealthForLabel("db", cleanIssues, cfg, now, nil)
+
+	if apiSingle.Flow.IncomingDeps != 1 || apiSingle.Flow.FlowScore != apiClean.Flow.FlowScore || apiSingle.Health != apiClean.Health {
+		t.Fatalf("ComputeLabelHealthForLabel('api') inflated by duplicate neighbor labels: got %+v, want %+v", apiSingle, apiClean)
+	}
+	if dbSingle.Flow.OutgoingDeps != 1 || dbSingle.Flow.BlockingExternal != 1 || dbSingle.Health != dbClean.Health {
+		t.Fatalf("ComputeLabelHealthForLabel('db') inflated by duplicate dependent labels: got %+v, want %+v", dbSingle, dbClean)
+	}
+
+	allDup := ComputeAllLabelHealth(dupIssues, cfg, now, nil)
+	allClean := ComputeAllLabelHealth(cleanIssues, cfg, now, nil)
+	if len(allDup.Labels) != 2 || len(allClean.Labels) != 2 {
+		t.Fatalf("expected 2 labels, got %d vs %d", len(allDup.Labels), len(allClean.Labels))
+	}
+	for i := range allDup.Labels {
+		if allDup.Labels[i].Flow.IncomingDeps != allClean.Labels[i].Flow.IncomingDeps ||
+			allDup.Labels[i].Flow.OutgoingDeps != allClean.Labels[i].Flow.OutgoingDeps ||
+			allDup.Labels[i].Flow.FlowScore != allClean.Labels[i].Flow.FlowScore ||
+			allDup.Labels[i].Health != allClean.Labels[i].Health {
+			t.Fatalf("ComputeAllLabelHealth[%s] mismatch with duplicate labels: got %+v, want %+v",
+				allDup.Labels[i].Label, allDup.Labels[i], allClean.Labels[i])
+		}
+	}
+
+	scoresDup := ComputeLabelHealthScores(dupIssues, cfg, now, nil)
+	scoresClean := ComputeLabelHealthScores(cleanIssues, cfg, now, nil)
+	if scoresDup["api"] != scoresClean["api"] || scoresDup["db"] != scoresClean["db"] {
+		t.Fatalf("ComputeLabelHealthScores mismatch with duplicate labels: got %+v, want %+v", scoresDup, scoresClean)
 	}
 }

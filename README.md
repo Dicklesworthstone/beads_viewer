@@ -3314,6 +3314,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--agents-dry-run` | bool | `false` | Show what would happen without executing (use with --agents-*) | Agent File Management |
 | `--agents-force` | bool | `false` | Skip confirmation prompts (use with --agents-*) | Agent File Management |
 | `--agents-remove` | bool | `false` | Remove beads workflow instructions from AGENTS.md | Agent File Management |
+| `--agents-reset` | bool | `false` | Clear saved AGENTS.md prompt preference | Agent File Management |
 | `--agents-update` | bool | `false` | Update beads workflow instructions to latest version | Agent File Management |
 | `--agent-brief` | string | (empty) | Export agent brief bundle to directory (includes triage.json, insights.json, brief.md, helpers.md) | Export & Reporting |
 | `--debug-height` | int | `50` | Height for debug render | Export & Reporting |
@@ -4300,7 +4301,7 @@ bv has a comprehensive built-in help system:
 | **list,detail** | `x` | Export to markdown |
 | **list,detail,board,graph,insights,tree,actionable,flow** | `y` | Copy issue ID |
 | **list,detail** | `C` | Copy full issue |
-|  | `O` | Open in $EDITOR |
+| **list,detail,board,graph,tree,actionable,insights,flow,history** | `O` | Open in $EDITOR |
 | **list** | `'` | Recipe picker |
 |  | `U` | Self-update check |
 | **list,detail,board,tree,history** | `V` | Cass sessions |
@@ -4333,7 +4334,7 @@ bv has a comprehensive built-in help system:
 |  | `h` | Collapse or jump to parent |
 |  | `l` | Expand or move to child |
 |  | `o` | Expand all nodes |
-|  | `O` | Collapse all nodes |
+|  | `Z` | Collapse all nodes |
 |  | `tab` | Toggle detail pane |
 |  | `PgUp` | Page up |
 |  | `PgDn` | Page down |
@@ -4372,7 +4373,8 @@ bv has a comprehensive built-in help system:
 |  | `enter` | Label drilldown |
 |  | `1-9` | Filter list by rank |
 |  | `]` | Close attention view |
-| **label** | `enter` | Filter list by label |
+| **label** | `g` | Go to top |
+|  | `enter` | Filter list by label |
 |  | `h` | Label health detail |
 |  | `d` | Label drilldown |
 |  | `v` | Velocity comparison |
@@ -4421,6 +4423,7 @@ bv has a comprehensive built-in help system:
 | `BV_NO_UPDATE_CHECK` | Skip the TUI's startup release check with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` enables it. Nonempty values override `updates.check` in user config (case-insensitive, trimmed); invalid values skip the check, and empty values preserve config. Explicit `--check-update` / `--update` still work. | (check on) |
 | `BV_OUTPUT_FORMAT` | Default robot output format: `json` or `toon` (overridden by `--format`). | `json` |
 | `BV_PHASE2_TIMEOUT_S` | Override per-metric Phase 2 timeouts (seconds). | (size-based) |
+| `BV_POLL_INTERVAL` | Polling interval for fallback/forced-polling file watching (Go duration like `500ms`/`2s` or integer milliseconds). | `2s` |
 | `BV_PRETTY_JSON` | Set to `1` for indented JSON output. | (compact) |
 | `BV_ROBOT` | Set to `1` to force robot mode (clean stdout, JSON logs, disk cache on). Every `--robot-*` flag sets it. | (unset) |
 | `BV_ROBOT_HISTORY_TIMEOUT_MS` | Bound on the git-history prologue of `--robot-triage` in milliseconds; `0` = unbounded. | `10000` |

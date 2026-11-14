@@ -24,6 +24,18 @@ type ETAEstimate struct {
 	Factors               []string  `json:"factors,omitempty"`
 }
 
+const (
+	etaVelocityWindowDays = 30
+	etaDefaultWeekDays    = 7.0
+)
+
+func defaultVelocityMinutesPerDay(medianMinutes int) float64 {
+	if medianMinutes > 0 {
+		return float64(medianMinutes) / etaDefaultWeekDays
+	}
+	return float64(DefaultEstimatedMinutes) / etaDefaultWeekDays
+}
+
 // EstimateETAForIssue estimates an ETA for a single issue using:
 // - Complexity minutes: explicit estimate or median base, then type × depth × description-length multipliers for either base.
 // - Velocity minutes/day: derived from recent closures of issues sharing labels (fallback to global, then default).
@@ -47,11 +59,9 @@ func EstimateETAForIssue(issues []model.Issue, stats *GraphStats, issueID string
 
 	velocityPerDay, velocitySamples, velocityFactors := estimateVelocityMinutesPerDayWithStats(issues, stats, issue, now, medianMinutes)
 	if velocityPerDay <= 0 {
-		// Conservative default: one median-sized issue per (work) week.
-		velocityPerDay = float64(medianMinutes) / 5.0
-		if velocityPerDay <= 0 {
-			velocityPerDay = 60 // final fallback: 1h/day
-		}
+		// Conservative calendar-day default: one median-sized issue per 7-day calendar week,
+		// matching the 30-calendar-day closure window and 24h durationDays conversion.
+		velocityPerDay = defaultVelocityMinutesPerDay(medianMinutes)
 		velocityFactors = append(velocityFactors, "velocity: no recent closures; using default")
 	}
 
@@ -235,7 +245,7 @@ func velocityMinutesPerDayForLabelWithStats(issues []model.Issue, stats *GraphSt
 	if samples == 0 {
 		return 0, 0
 	}
-	return float64(total) / 30.0, samples
+	return float64(total) / float64(etaVelocityWindowDays), samples
 }
 
 // GrahamBounds captures Graham (1969) parallel list-scheduling makespan bounds:
@@ -262,10 +272,10 @@ func ComputeGrahamBounds(openIssues []model.Issue, allIssues []model.Issue, stat
 		agents = 1
 	}
 	medianMinutes := computeMedianEstimatedMinutes(allIssues)
-	since := now.Add(-30 * 24 * time.Hour)
+	since := now.Add(-time.Duration(etaVelocityWindowDays) * 24 * time.Hour)
 	velocityPerDay, _ := velocityMinutesPerDayForLabelWithStats(allIssues, stats, "", since, medianMinutes)
 	if velocityPerDay <= 0 {
-		velocityPerDay = 480.0 // Default 8h workday when project has no 30d closure history
+		velocityPerDay = defaultVelocityMinutesPerDay(medianMinutes)
 	}
 
 	if len(openIssues) == 0 {

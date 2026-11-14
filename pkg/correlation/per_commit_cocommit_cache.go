@@ -104,7 +104,11 @@ type perCommitCoCommitEntry struct {
 // the schema version. A future change to excludedPaths produces a different
 // namespace, isolating it from stale entries.
 func perCommitCoCommitCacheNamespace() string {
-	h := sha256.Sum256([]byte(strings.Join(excludePathspecArgs(), "\x00")))
+	return perCommitCoCommitCacheNamespaceForStore("")
+}
+
+func perCommitCoCommitCacheNamespaceForStore(storeDirRel string) string {
+	h := sha256.Sum256([]byte(strings.Join(excludePathspecArgsForStore(storeDirRel), "\x00")))
 	return hex.EncodeToString(h[:])
 }
 

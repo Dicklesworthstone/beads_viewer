@@ -2170,6 +2170,9 @@ func TestSnapshotBuilder_SearchDocumentsMatchFullRebuild(t *testing.T) {
 			m := NewModel(copyIssues(changed), nil, "")
 			t.Cleanup(m.Stop)
 			m.currentFilter = "all"
+			if currentRecipe != nil {
+				m.setActiveRecipe(currentRecipe)
+			}
 			m.Update(SnapshotReadyMsg{Snapshot: next})
 			if got := m.semanticSearch.Snapshot().Docs; !reflect.DeepEqual(got, full.semanticDocs) {
 				t.Fatalf("installed search documents differ from full rebuild: got=%q want=%q", got, full.semanticDocs)

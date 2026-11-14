@@ -35,6 +35,13 @@ func isActionableStatus(status model.Status) bool {
 	return status == model.StatusOpen || status == model.StatusInProgress
 }
 
+// isWithheldIssue reports whether an issue is parked via Pinned, Ephemeral, or
+// IsTemplate metadata flags and must therefore be withheld from claiming,
+// top_picks, and readiness-blocked counts.
+func isWithheldIssue(issue *model.Issue) bool {
+	return issue != nil && (issue.Ephemeral || issue.Pinned || issue.IsTemplate)
+}
+
 // TriageResult is the unified output for --robot-triage
 // Designed as a single entry point for AI agents to get everything they need
 type TriageResult struct {
@@ -151,6 +158,11 @@ type Recommendation struct {
 	// parsing the reasons text.
 	Claimable bool               `json:"claimable"`
 	Actions   model.IssueActions `json:"actions"`
+
+	// withheld tracks non-claimable metadata parking (Pinned/Ephemeral/IsTemplate
+	// or ReadinessIndex non-claimability) so downstream Recommendation helpers
+	// (buildTopPicks, track/label TopPick) never select withheld open beads.
+	withheld bool
 }
 
 // isDeferredAt reports whether the recommendation's defer_until is still
@@ -450,6 +462,13 @@ type TriageOptions struct {
 	// workflows that keep a bead open to stay visible but signal not-ready with
 	// a label.
 	NotReadyLabels []string
+
+	// ScoringOptions overrides ProductionTriageScoringOptions when non-nil.
+	ScoringOptions *TriageScoringOptions
+
+	// ClaimedByAgent identifies the calling agent so its own claimed issues are
+	// not penalized by EnableClaimPenalty.
+	ClaimedByAgent string
 }
 
 // TrackRecommendationGroup groups recommendations by execution track (bv-87)
@@ -643,8 +662,15 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	}
 	counts := computeCountsWithContext(candidateIssues, triageCtx)
 
-	// Compute enhanced triage scores (bv-147)
-	triageScores := computeTriageScoresFromImpact(impactScores, triageCtx, DefaultTriageScoringOptions())
+	// Compute enhanced triage scores (bv-147) with Phase 2-4 factors wired
+	scoringOpts := ProductionTriageScoringOptions()
+	if opts.ScoringOptions != nil {
+		scoringOpts = *opts.ScoringOptions
+	}
+	if opts.ClaimedByAgent != "" && scoringOpts.ClaimedByAgent == "" {
+		scoringOpts.ClaimedByAgent = opts.ClaimedByAgent
+	}
+	triageScores := computeTriageScoresFromImpactAt(impactScores, triageCtx, scoringOpts, now)
 
 	// Build recommendations using enhanced scores (bv-148).
 	// Top picks need to search the *full* scored set, not the
@@ -702,9 +728,16 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 
 		claimableIDs = make(map[string]bool, len(allRecommendations))
 		for i := range allRecommendations {
+			issue := analyzer.getIssue(allRecommendations[i].ID)
+			if isWithheldIssue(issue) {
+				allRecommendations[i].withheld = true
+			}
 			claimable := analyzer.Readiness().Claimable(allRecommendations[i].ID, now) && isClaimableRecommendation(allRecommendations[i], now, opts.NotReadyLabels, parentsWithOpenChildren)
 			allRecommendations[i].Claimable = claimable
-			if issue := analyzer.getIssue(allRecommendations[i].ID); issue != nil {
+			if !claimable {
+				allRecommendations[i].withheld = true
+			}
+			if issue != nil {
 				allRecommendations[i].Actions = issue.Actions(claimable)
 			}
 			if claimable {
@@ -749,7 +782,7 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 			}
 
 			needRec := len(recommendations) < opts.TopN
-			needPick := topPickEligible && len(topPicks) < 3
+			needPick := claimable && len(topPicks) < 3
 			if !needRec && !needPick {
 				continue
 			}
@@ -779,6 +812,7 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 					UnblocksIDs: unblocks,
 					Claimable:   claimable,
 					Actions:     issue.Actions(claimable),
+					withheld:    !claimable || isWithheldIssue(issue),
 				}
 				if len(blockedBy) > 0 {
 					rec.BlockedBy = blockedBy
@@ -1168,6 +1202,7 @@ func buildRecommendationsFromTriageScores(scores []TriageScore, ctx *TriageConte
 			Action:      reasons.ActionHint,
 			Reasons:     reasons.All,
 			UnblocksIDs: unblocks,
+			withheld:    isWithheldIssue(issue),
 		}
 		if len(blockedBy) > 0 {
 			rec.BlockedBy = blockedBy
@@ -1411,7 +1446,7 @@ func buildTopPicks(recommendations []Recommendation, limit int, now time.Time, n
 // no-op. parentsWithOpenChildren may be nil, in which case the parent gate is
 // skipped (used by unit tests that exercise the predicate in isolation).
 func isClaimableRecommendation(rec Recommendation, now time.Time, notReadyLabels []string, parentsWithOpenChildren map[string]bool) bool {
-	if parentsWithOpenChildren[rec.ID] {
+	if rec.withheld || parentsWithOpenChildren[rec.ID] {
 		return false
 	}
 	if _, ok := quoteBeadsCommandID(rec.ID); !ok {
@@ -1419,14 +1454,14 @@ func isClaimableRecommendation(rec Recommendation, now time.Time, notReadyLabels
 	}
 	return rec.Status == string(model.StatusOpen) &&
 		rec.Type != string(model.TypeEpic) &&
-		rec.Assignee == "" &&
+		strings.TrimSpace(rec.Assignee) == "" &&
 		len(rec.BlockedBy) == 0 &&
 		!rec.isDeferredAt(now) &&
 		!hasAnyLabel(rec.Labels, notReadyLabels)
 }
 
 func isClaimableScoreAndIssue(score TriageScore, issue *model.Issue, blockedBy []string, now time.Time, notReadyLabels []string, parentsWithOpenChildren map[string]bool) bool {
-	if issue == nil || parentsWithOpenChildren[score.IssueID] {
+	if issue == nil || isWithheldIssue(issue) || parentsWithOpenChildren[score.IssueID] {
 		return false
 	}
 	if _, ok := quoteBeadsCommandID(score.IssueID); !ok {
@@ -1434,7 +1469,7 @@ func isClaimableScoreAndIssue(score TriageScore, issue *model.Issue, blockedBy [
 	}
 	return score.Status == string(model.StatusOpen) &&
 		issue.IssueType != model.TypeEpic &&
-		issue.Assignee == "" &&
+		strings.TrimSpace(issue.Assignee) == "" &&
 		len(blockedBy) == 0 &&
 		!issue.IsDeferredAt(now) &&
 		!hasAnyLabel(issue.Labels, notReadyLabels)
@@ -1523,6 +1558,9 @@ type TriageScoringOptions struct {
 	BaseScoreWeight    float64 // Default 0.70
 	UnblockBoostWeight float64 // Default 0.15
 	QuickWinWeight     float64 // Default 0.15
+	LabelHealthWeight  float64 // Default 0.05 (Phase 2 boost for unhealthy labels)
+	AttentionWeight    float64 // Default 0.05 (Phase 4 boost for high-attention labels)
+	ClaimPenaltyFactor float64 // Default 0.10 multiplier when claimed by another agent
 
 	// Thresholds
 	UnblockThreshold int // Min unblocks to get full boost (default 5)
@@ -1535,12 +1573,15 @@ type TriageScoringOptions struct {
 	ClaimedByAgent       string // Current agent for claim penalty calculation
 }
 
-// DefaultTriageScoringOptions returns sensible defaults
+// DefaultTriageScoringOptions returns sensible defaults (MVP base+unblock+quick_win mode)
 func DefaultTriageScoringOptions() TriageScoringOptions {
 	return TriageScoringOptions{
 		BaseScoreWeight:    0.70,
 		UnblockBoostWeight: 0.15,
 		QuickWinWeight:     0.15,
+		LabelHealthWeight:  0.05,
+		AttentionWeight:    0.05,
+		ClaimPenaltyFactor: 0.10,
 		UnblockThreshold:   5,
 		QuickWinMaxDepth:   2,
 		// All optional features off by default (MVP mode)
@@ -1548,6 +1589,16 @@ func DefaultTriageScoringOptions() TriageScoringOptions {
 		EnableClaimPenalty:   false,
 		EnableAttentionScore: false,
 	}
+}
+
+// ProductionTriageScoringOptions returns DefaultTriageScoringOptions with
+// Phase 2-4 factors (label health, claim penalty, attention score) enabled.
+func ProductionTriageScoringOptions() TriageScoringOptions {
+	opts := DefaultTriageScoringOptions()
+	opts.EnableLabelHealth = true
+	opts.EnableClaimPenalty = true
+	opts.EnableAttentionScore = true
+	return opts
 }
 
 // ComputeTriageScores calculates triage-optimized scores for all open issues
@@ -1579,11 +1630,19 @@ func ComputeTriageScoresFromAnalyzer(analyzer *Analyzer, stats *GraphStats, opts
 	triageCtx := NewTriageContext(analyzer)
 	triageCtx.SetStats(stats)
 
-	return computeTriageScoresFromImpact(baseScores, triageCtx, opts)
+	return computeTriageScoresFromImpactAt(baseScores, triageCtx, opts, now)
 }
 
 // computeTriageScoresFromImpact calculates triage scores from base impact scores
 func computeTriageScoresFromImpact(baseScores []ImpactScore, triageCtx *TriageContext, opts TriageScoringOptions) []TriageScore {
+	now := time.Now()
+	if triageCtx != nil && triageCtx.Analyzer() != nil {
+		now = triageCtx.Analyzer().Now()
+	}
+	return computeTriageScoresFromImpactAt(baseScores, triageCtx, opts, now)
+}
+
+func computeTriageScoresFromImpactAt(baseScores []ImpactScore, triageCtx *TriageContext, opts TriageScoringOptions, now time.Time) []TriageScore {
 	unblocksMap := triageCtx.UnblocksMap()
 
 	// Calculate max unblocks for normalization
@@ -1594,10 +1653,19 @@ func computeTriageScoresFromImpact(baseScores []ImpactScore, triageCtx *TriageCo
 		}
 	}
 
+	var labelHealthMap map[string]int
+	if opts.EnableLabelHealth {
+		labelHealthMap = triageCtx.LabelHealthMap(now)
+	}
+	var labelAttentionMap map[string]float64
+	if opts.EnableAttentionScore {
+		labelAttentionMap = triageCtx.LabelAttentionMap(now)
+	}
+
 	// Build triage scores
 	triageScores := make([]TriageScore, 0, len(baseScores))
 	for _, base := range baseScores {
-		ts := computeSingleTriageScore(base, unblocksMap, maxUnblocks, triageCtx.Analyzer(), opts, triageCtx.BlockerDepth(base.IssueID))
+		ts := computeSingleTriageScoreWithContext(base, unblocksMap, maxUnblocks, triageCtx.Analyzer(), opts, triageCtx.BlockerDepth(base.IssueID), labelHealthMap, labelAttentionMap, now)
 		triageScores = append(triageScores, ts)
 	}
 
@@ -1614,9 +1682,46 @@ func computeTriageScoresFromImpact(baseScores []ImpactScore, triageCtx *TriageCo
 
 // computeSingleTriageScore calculates the triage score for a single issue
 func computeSingleTriageScore(base ImpactScore, unblocksMap map[string][]string, maxUnblocks int, analyzer *Analyzer, opts TriageScoringOptions, blockerDepth int) TriageScore {
+	var labelHealthMap map[string]int
+	var labelAttentionMap map[string]float64
+	var now time.Time
+	if analyzer != nil {
+		now = analyzer.Now()
+		if opts.EnableLabelHealth || opts.EnableAttentionScore {
+			ctx := NewTriageContext(analyzer)
+			if opts.EnableLabelHealth {
+				labelHealthMap = ctx.LabelHealthMap(now)
+			}
+			if opts.EnableAttentionScore {
+				labelAttentionMap = ctx.LabelAttentionMap(now)
+			}
+		}
+	}
+	return computeSingleTriageScoreWithContext(base, unblocksMap, maxUnblocks, analyzer, opts, blockerDepth, labelHealthMap, labelAttentionMap, now)
+}
+
+func computeSingleTriageScoreWithContext(
+	base ImpactScore,
+	unblocksMap map[string][]string,
+	maxUnblocks int,
+	analyzer *Analyzer,
+	opts TriageScoringOptions,
+	blockerDepth int,
+	labelHealthMap map[string]int,
+	labelAttentionMap map[string]float64,
+	now time.Time,
+) TriageScore {
 	factors := TriageFactors{}
 	applied := []string{"base"}
 	pending := []string{}
+
+	var issue *model.Issue
+	if analyzer != nil {
+		issue = analyzer.getIssue(base.IssueID)
+		if now.IsZero() {
+			now = analyzer.Now()
+		}
+	}
 
 	// Calculate unblock boost
 	unblocks := unblocksMap[base.IssueID]
@@ -1632,7 +1737,10 @@ func computeSingleTriageScore(base ImpactScore, unblocksMap map[string][]string,
 
 	// Calculate quick-win boost
 	// Quick wins are items with low blocker depth but high impact
-	if issue := analyzer.getIssue(base.IssueID); issue == nil || issue.Status != model.StatusInProgress {
+	isWithheld := isWithheldIssue(issue) || (issue != nil && isClosedLikeStatus(issue.Status))
+	isFutureDeferred := issue != nil && issue.IsDeferredAt(now)
+	hasNonOpenStatus := issue != nil && issue.Status != "" && issue.Status != model.StatusOpen
+	if !hasNonOpenStatus && !isWithheld && !isFutureDeferred {
 		if blockerDepth <= opts.QuickWinMaxDepth && blockerDepth >= 0 {
 			// Lower depth = higher quick win potential
 			depthFactor := 1.0 - float64(blockerDepth)/float64(opts.QuickWinMaxDepth+1)
@@ -1645,24 +1753,116 @@ func computeSingleTriageScore(base ImpactScore, unblocksMap map[string][]string,
 		}
 	}
 
-	// Track pending features
-	if !opts.EnableLabelHealth {
-		pending = append(pending, "label_health")
-	}
-	if !opts.EnableClaimPenalty {
-		pending = append(pending, "claim_penalty")
-	}
-	if !opts.EnableAttentionScore {
-		pending = append(pending, "attention_score")
-	}
-
-	// Calculate final triage score
+	// Calculate base + Phase 1 triage score
 	triageScore := base.Score*opts.BaseScoreWeight + factors.UnblockBoost + factors.QuickWinBoost
 
-	// Future phases (when enabled):
-	// Phase 2: triageScore += factors.LabelHealth * labelHealthWeight
-	// Phase 3: if claimedByOther { triageScore *= 0.1 }
-	// Phase 4: Replace label health with attention-weighted health
+	lhWeight := opts.LabelHealthWeight
+	if lhWeight <= 0 {
+		lhWeight = 0.05
+	}
+	attnWeight := opts.AttentionWeight
+	if attnWeight <= 0 {
+		attnWeight = 0.05
+	}
+
+	hasLabelHealth := false
+	// Phase 2: Label health urgency boost (cached via TriageContext.LabelHealthMap)
+	if !opts.EnableLabelHealth {
+		pending = append(pending, "label_health")
+	} else if issue != nil && len(labelHealthMap) > 0 {
+		hasScoredLabel := false
+		minHealth := 100
+		for _, l := range issue.Labels {
+			if l == "" {
+				continue
+			}
+			if h, ok := labelHealthMap[l]; ok {
+				if !hasScoredLabel || h < minHealth {
+					minHealth = h
+					hasScoredLabel = true
+				}
+			}
+		}
+		if hasScoredLabel {
+			urgency := float64(100-clampScore(minHealth)) / 100.0
+			factors.LabelHealth = urgency * lhWeight
+			hasLabelHealth = true
+			applied = append(applied, "label_health")
+		}
+	}
+
+	hasAttnScore := false
+	// Phase 4: Attention-weighted label score (cached via TriageContext.LabelAttentionMap)
+	if !opts.EnableAttentionScore {
+		pending = append(pending, "attention_score")
+	} else if issue != nil && len(labelAttentionMap) > 0 {
+		hasAttnLabel := false
+		maxAttn := 0.0
+		for _, l := range issue.Labels {
+			if l == "" {
+				continue
+			}
+			if a, ok := labelAttentionMap[l]; ok {
+				if !hasAttnLabel || a > maxAttn {
+					maxAttn = a
+					hasAttnLabel = true
+				}
+			}
+		}
+		if hasAttnLabel {
+			factors.AttentionScore = maxAttn * attnWeight
+			hasAttnScore = true
+			applied = append(applied, "attention_score")
+		}
+	}
+
+	// Combine label-level boosts without double-counting label staleness when both
+	// Phase 2 and Phase 4 are active, and re-normalize the total positive weight
+	// budget so TriageScore stays strictly monotonic within [0.0, 1.0].
+	extraBudget := 0.0
+	labelBoost := 0.0
+	switch {
+	case opts.EnableLabelHealth && opts.EnableAttentionScore:
+		extraBudget = math.Max(lhWeight, attnWeight)
+		switch {
+		case hasLabelHealth && hasAttnScore && (lhWeight+attnWeight) > 0:
+			labelBoost = (factors.LabelHealth + factors.AttentionScore) * (extraBudget / (lhWeight + attnWeight))
+		case hasLabelHealth:
+			labelBoost = factors.LabelHealth
+		case hasAttnScore:
+			labelBoost = factors.AttentionScore
+		}
+	case opts.EnableLabelHealth:
+		extraBudget = lhWeight
+		labelBoost = factors.LabelHealth
+	case opts.EnableAttentionScore:
+		extraBudget = attnWeight
+		labelBoost = factors.AttentionScore
+	}
+	triageScore += labelBoost
+	totalPositiveBudget := opts.BaseScoreWeight + opts.UnblockBoostWeight + opts.QuickWinWeight + extraBudget
+	if extraBudget > 0 && totalPositiveBudget > 1.0 {
+		triageScore /= totalPositiveBudget
+	}
+
+	// Phase 3: Claim penalty for issues already claimed by another agent
+	if !opts.EnableClaimPenalty {
+		pending = append(pending, "claim_penalty")
+	} else if issue != nil {
+		assignee := strings.TrimSpace(issue.Assignee)
+		claimedBy := strings.TrimSpace(opts.ClaimedByAgent)
+		if assignee != "" && assignee != claimedBy {
+			mult := opts.ClaimPenaltyFactor
+			if mult <= 0 || mult >= 1.0 {
+				mult = 0.10
+			}
+			factors.ClaimPenalty = triageScore * (1.0 - mult)
+			triageScore *= mult
+			applied = append(applied, "claim_penalty")
+		}
+	}
+
+	triageScore = math.Max(0.0, math.Min(1.0, triageScore))
 
 	return TriageScore{
 		IssueID:        base.IssueID,
@@ -1778,16 +1978,26 @@ func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 	if !ctx.HasNow && now.IsZero() {
 		now = time.Now()
 	}
-	// A future defer_until withholds the bead from claiming (issue #191). It is
-	// checked before the status-based hints so the action never reads as
-	// "start work" on something the scheduler has parked.
+	// A future defer_until or metadata parking flag (Pinned/IsTemplate/Ephemeral)
+	// withholds the bead from claiming (issue #191). It is checked before the
+	// status-based hints so the action never reads as "start work" on something parked.
 	isFutureDeferred := ctx.Issue != nil && ctx.Issue.IsDeferredAt(now)
+	isWithheld := isWithheldIssue(ctx.Issue)
 
 	var reasons []string
 	primary := ""
 	actionHint := "Start work on this issue"
 	if isFutureDeferred {
 		actionHint = fmt.Sprintf("Deferred until %s - do not claim before then", ctx.Issue.DeferUntil.UTC().Format(time.RFC3339))
+	} else if isWithheld {
+		switch {
+		case ctx.Issue.Pinned:
+			actionHint = "Pinned issue - do not claim"
+		case ctx.Issue.IsTemplate:
+			actionHint = "Template issue - do not claim"
+		default:
+			actionHint = "Ephemeral issue - do not claim"
+		}
 	} else if ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress {
 		actionHint = "Continue work on this issue"
 	} else if ctx.Issue != nil && ctx.Issue.Status == model.StatusBlocked {
@@ -1841,35 +2051,30 @@ func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 	if ctx.DaysSinceUpdate > 14 {
 		reason := fmt.Sprintf("🕐 No activity in %d days - may need review", ctx.DaysSinceUpdate)
 		reasons = append(reasons, reason)
-		if ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress {
+		if !isWithheld && !isFutureDeferred && ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress {
 			actionHint = "Check if this is stuck and needs help"
 		}
 	} else if ctx.DaysSinceUpdate > 7 {
 		reason := fmt.Sprintf("📅 Last updated %d days ago", ctx.DaysSinceUpdate)
 		reasons = append(reasons, reason)
-		if ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress {
+		if !isWithheld && !isFutureDeferred && ctx.Issue != nil && ctx.Issue.Status == model.StatusInProgress {
 			actionHint = "Continue work on this issue"
 		}
 	}
 
 	// 5. Quick-win identification
-	if ctx.IsQuickWin {
+	// Only genuinely startable open (or unknown-status) non-withheld, non-deferred
+	// beads qualify as quick-win starting points; parked statuses such as blocked,
+	// deferred, draft, pinned, hooked, review, in_progress, and closed/tombstone
+	// never receive quick-win reasons or start-here hints.
+	hasNonOpenStatus := ctx.Issue != nil && ctx.Issue.Status != "" && ctx.Issue.Status != model.StatusOpen
+	if ctx.IsQuickWin && !hasNonOpenStatus && !isWithheld && !isFutureDeferred {
 		reason := "⚡ Low effort, high impact - good starting point"
 		reasons = append(reasons, reason)
 		if primary == "" && len(ctx.UnblocksIDs) > 0 {
 			primary = reason
 		}
-
-		// Update action hint only when the bead is genuinely startable: not
-		// in-progress (keep work/review guidance), not scheduler-deferred (keep
-		// the wait guidance), and not parked in a non-open status such as
-		// blocked/deferred/draft (keep the "resolve"/"wait for status" guidance
-		// computed above; issue #199). An unknown record/status keeps the
-		// pre-existing behaviour of taking the quick-win hint.
-		hasNonOpenStatus := ctx.Issue != nil && ctx.Issue.Status != "" && ctx.Issue.Status != model.StatusOpen
-		if !hasNonOpenStatus && !isFutureDeferred {
-			actionHint = "Quick win - start here for fast progress"
-		}
+		actionHint = "Quick win - start here for fast progress"
 	}
 
 	// 6. Agent claim status
@@ -1903,6 +2108,18 @@ func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 		// The deferral outranks every claim-status hint: the bead must not be
 		// described as "available for work" while the scheduler has it parked.
 		reasons = append(reasons, fmt.Sprintf("⏸️ Deferred until %s - not ready to claim", ctx.Issue.DeferUntil.UTC().Format(time.RFC3339)))
+		if ctx.ClaimedByAgent != "" {
+			reasons = append(reasons, fmt.Sprintf("👤 Claimed by %s", ctx.ClaimedByAgent))
+		}
+	} else if isWithheld {
+		switch {
+		case ctx.Issue.Pinned:
+			reasons = append(reasons, "📌 Pinned issue - not claimable work")
+		case ctx.Issue.IsTemplate:
+			reasons = append(reasons, "📋 Template issue - not claimable work")
+		default:
+			reasons = append(reasons, "⏸️ Ephemeral issue - not claimable work")
+		}
 		if ctx.ClaimedByAgent != "" {
 			reasons = append(reasons, fmt.Sprintf("👤 Claimed by %s", ctx.ClaimedByAgent))
 		}
@@ -1951,7 +2168,9 @@ func GenerateTriageReasons(ctx TriageReasonContext) TriageReasons {
 			reason := fmt.Sprintf("⏳ Blocked by %d items - need to clear dependencies", len(ctx.BlockedByIDs))
 			reasons = append(reasons, reason)
 		}
-		actionHint = fmt.Sprintf("Work on %s first to unblock this", ctx.BlockedByIDs[0])
+		if !isWithheld && !isFutureDeferred {
+			actionHint = fmt.Sprintf("Work on %s first to unblock this", ctx.BlockedByIDs[0])
+		}
 	}
 
 	// 8. Priority context

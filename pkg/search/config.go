@@ -37,7 +37,7 @@ func NewEmbedderFromConfig(cfg EmbeddingConfig) (Embedder, error) {
 	cfg = cfg.Normalized()
 	switch cfg.Provider {
 	case "", ProviderHash:
-		return NewHashEmbedder(cfg.Dim), nil
+		return NewHashEmbedderWithModel(cfg.Dim, cfg.Model), nil
 	case ProviderPythonSentenceTransformers:
 		return nil, fmt.Errorf("semantic embedder %q not implemented (mvp placeholder); set %s=%q for deterministic fallback", cfg.Provider, EnvSemanticEmbedder, ProviderHash)
 	case ProviderOpenAI:
@@ -121,6 +121,14 @@ func ParseSearchConfig(modeValue, presetValue, weightsValue string) (SearchConfi
 		}
 		cfg.Weights = weights
 		cfg.HasWeights = true
+		// Custom weights only affect hybrid ranking: setting them implies hybrid
+		// mode unless text mode was pinned explicitly.
+		switch {
+		case !modeSet:
+			cfg.Mode = SearchModeHybrid
+		case cfg.Mode == SearchModeText:
+			return SearchConfig{}, fmt.Errorf("search weights need hybrid mode; use hybrid mode or unset %s", EnvSearchMode)
+		}
 	}
 
 	return cfg, nil

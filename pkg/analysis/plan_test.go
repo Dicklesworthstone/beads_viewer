@@ -648,3 +648,32 @@ func TestExecutionPlan_HighestImpactTieBreaksByPriority(t *testing.T) {
 		t.Fatalf("ID tie-break: highest_impact = %q, want aa", plan.Summary.HighestImpact)
 	}
 }
+
+func TestCountStatusPartition_WithheldOpenRoutedToDeferredOrParked(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "READY-1", Title: "Ready", Status: model.StatusOpen},
+		{ID: "PIN-1", Title: "Pinned", Status: model.StatusOpen, Pinned: true},
+		{ID: "EPH-1", Title: "Ephemeral", Status: model.StatusOpen, Ephemeral: true},
+		{ID: "TPL-1", Title: "Template", Status: model.StatusOpen, IsTemplate: true},
+		{ID: "BLK-1", Title: "Blocked by Ready", Status: model.StatusOpen, Dependencies: []*model.Dependency{
+			{IssueID: "BLK-1", DependsOnID: "READY-1", Type: model.DepBlocks},
+		}},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+	p := an.CountStatusPartition()
+	if p.Actionable != 1 {
+		t.Fatalf("Actionable = %d, want 1", p.Actionable)
+	}
+	if p.DeferredOrParked != 3 {
+		t.Fatalf("DeferredOrParked = %d, want 3 (pinned + ephemeral + template)", p.DeferredOrParked)
+	}
+	if p.Blocked != 1 {
+		t.Fatalf("Blocked = %d, want 1 (withheld beads must not inflate Blocked)", p.Blocked)
+	}
+
+	plan := an.GetExecutionPlan()
+	if plan.TotalBlocked != 1 || plan.TotalDeferredOrParked != 3 {
+		t.Fatalf("ExecutionPlan partition mismatch: TotalBlocked=%d TotalDeferredOrParked=%d", plan.TotalBlocked, plan.TotalDeferredOrParked)
+	}
+}

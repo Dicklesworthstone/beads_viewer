@@ -1,6 +1,9 @@
 package search
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 // Provider identifies an embedding backend.
 type Provider string
@@ -35,6 +38,7 @@ type EmbeddingConfig struct {
 }
 
 func (c EmbeddingConfig) Normalized() EmbeddingConfig {
+	c.Model = strings.TrimSpace(c.Model)
 	if c.Dim <= 0 {
 		c.Dim = DefaultEmbeddingDim
 	}

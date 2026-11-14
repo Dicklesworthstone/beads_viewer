@@ -223,7 +223,7 @@ func TestPersistentCorrelationCachesIsolateMatcherPolicies(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					namespace, options := first.persistentCacheNamespace(), first.cacheOptionsHash(opts)
+					namespace, options := first.persistentCacheNamespace(), first.artifactOptionsHash(beads, opts)
 					if _, ok := getCorrelationDiskCachedReport(namespace, head, hashBeads(beads), options); !ok {
 						t.Fatal("fixture did not populate the report cache")
 					}
@@ -451,5 +451,119 @@ func TestCorrelationDiskCachePermissionsStrict0700And0600(t *testing.T) {
 		if perm := fi.Mode().Perm(); perm != 0o600 {
 			t.Errorf("cache file %s permissions = %04o, want 0600", name, perm)
 		}
+	}
+}
+
+func TestHeadArtifactCache_IsolatesDifferingBeadIDSlicesWhileReusingOnMetadataEdit(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+
+	repo := initTempGitRepo(t)
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jsonl := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"fe-1","title":"Frontend button","status":"open"}`+"\n"+
+			`{"id":"bv-b9c8","title":"Hash style issue","status":"open"}`+"\n"+
+			`{"id":"42","title":"Numeric issue","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "chore: seed beads")
+
+	if err := os.WriteFile(filepath.Join(repo, "fe.tsx"), []byte("export const b = 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "fe.tsx")
+	runGit(t, repo, "commit", "-m", "feat(fe-1): add frontend button")
+
+	if err := os.WriteFile(filepath.Join(repo, "hash.go"), []byte("package p\nvar h = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "hash.go")
+	runGit(t, repo, "commit", "-m", "fix(bv-b9c8): resolve hash-style issue")
+
+	if err := os.WriteFile(filepath.Join(repo, "num.go"), []byte("package p\nvar n = 42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "num.go")
+	runGit(t, repo, "commit", "-m", "feat [42]: implement numeric issue")
+
+	head, err := getGitHead(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewCorrelator(repo, jsonl)
+	opts := CorrelatorOptions{Limit: 10}
+
+	// 1. Narrow call first (simulating e.g. `bv --label frontend --robot-history`).
+	narrowBeads := []BeadInfo{{ID: "fe-1", Title: "Frontend button", Status: "open"}}
+	narrowRep, err := c.GenerateReportCached(narrowBeads, opts)
+	if err != nil {
+		t.Fatalf("narrow GenerateReportCached: %v", err)
+	}
+	if len(narrowRep.Histories["fe-1"].Commits) != 1 {
+		t.Fatalf("narrow fe-1 commits = %+v, want 1", narrowRep.Histories["fe-1"].Commits)
+	}
+
+	// 2. Broad call next on the exact same BV_CACHE_DIR + HEAD + CorrelatorOptions.
+	// Layer-2 head_artifact_cache must NOT poison bv-b9c8 or "42" with 0 commits.
+	broadBeads := []BeadInfo{
+		{ID: "fe-1", Title: "Frontend button", Status: "open"},
+		{ID: "bv-b9c8", Title: "Hash style issue", Status: "open"},
+		{ID: "42", Title: "Numeric issue", Status: "open"},
+	}
+	if c.artifactOptionsHash(narrowBeads, opts) == c.artifactOptionsHash(broadBeads, opts) {
+		t.Fatal("artifactOptionsHash must differ across narrow vs broad bead ID slices")
+	}
+	if gotFP, wantFP := c.explicit.policyFingerprintWithReportOptions(opts, knownBeadIDsForReport(broadBeads, opts)),
+		c.explicit.withReportOptions(opts, knownBeadIDsForReport(broadBeads, opts)).policyFingerprint(); gotFP != wantFP {
+		t.Fatalf("policyFingerprintWithReportOptions = %q, want %q", gotFP, wantFP)
+	}
+
+	broadRep, err := c.GenerateReportCached(broadBeads, opts)
+	if err != nil {
+		t.Fatalf("broad GenerateReportCached: %v", err)
+	}
+	if len(broadRep.Histories["bv-b9c8"].Commits) != 1 {
+		t.Fatalf("bv-b9c8 commits = %+v, want 1 (Layer-2 cache poisoned by narrow call)", broadRep.Histories["bv-b9c8"].Commits)
+	}
+	if len(broadRep.Histories["42"].Commits) != 1 {
+		t.Fatalf("numeric '42' commits = %+v, want 1 (Layer-2 cache poisoned by narrow call)", broadRep.Histories["42"].Commits)
+	}
+
+	// 3. Metadata edit (Title & Status change, identical ID set) MUST keep the exact
+	// same Layer-2 artifactOptionsHash and hit getHeadArtifactCached cleanly.
+	beforeOptsHash := c.artifactOptionsHash(broadBeads, opts)
+	editedBeads := []BeadInfo{
+		{ID: "fe-1", Title: "Frontend button", Status: "open"},
+		{ID: "bv-b9c8", Title: "Retitled hash issue", Status: "closed"},
+		{ID: "42", Title: "Numeric issue", Status: "in_progress"},
+	}
+	afterOptsHash := c.artifactOptionsHash(editedBeads, opts)
+	if afterOptsHash != beforeOptsHash {
+		t.Fatalf("artifactOptionsHash changed when only Title/Status changed: before=%q after=%q", beforeOptsHash, afterOptsHash)
+	}
+	ns := c.persistentCacheNamespace()
+	if _, ok := getHeadArtifactCached(ns, head, afterOptsHash); !ok {
+		t.Fatal("expected Layer-2 head_artifact_cache hit after Title/Status metadata edit")
+	}
+	if _, ok := getCorrelationDiskCachedReport(ns, head, hashBeads(editedBeads), c.reportOptsHash(afterOptsHash)); ok {
+		t.Fatal("expected Layer-1 report cache miss before running GenerateReportCached with edited metadata")
+	}
+	editedRep, err := c.GenerateReportCached(editedBeads, opts)
+	if err != nil {
+		t.Fatalf("edited GenerateReportCached: %v", err)
+	}
+	if editedRep.Histories["bv-b9c8"].Title != "Retitled hash issue" || editedRep.Histories["bv-b9c8"].Status != "closed" {
+		t.Fatalf("edited metadata not reflected: %+v", editedRep.Histories["bv-b9c8"])
+	}
+	if len(editedRep.Histories["bv-b9c8"].Commits) != 1 || len(editedRep.Histories["42"].Commits) != 1 {
+		t.Fatalf("Layer-2 hit lost commits on edited report: %+v", editedRep.Histories)
 	}
 }

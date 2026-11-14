@@ -330,7 +330,27 @@ func (a *Analyzer) generateCycleBreakSuggestionsFromStats(stats *GraphStats, lim
 			Advisory: "Cycle analysis is unavailable; do not infer that the dependency graph is acyclic.",
 		}
 	}
-	cycles := stats.Cycles()
+	rawCycles := stats.Cycles()
+	cycles := make([][]string, 0, len(rawCycles))
+	for _, cycle := range rawCycles {
+		if len(cycle) == 0 {
+			continue
+		}
+		if cycle[0] == "CYCLE_DETECTION_TIMEOUT" || cycle[0] == "..." {
+			cycles = append(cycles, cycle)
+			continue
+		}
+		hasCandidate := false
+		for _, id := range cycle {
+			if a.IsCandidate(id) {
+				hasCandidate = true
+				break
+			}
+		}
+		if hasCandidate {
+			cycles = append(cycles, cycle)
+		}
+	}
 
 	if len(cycles) == 0 {
 		return &CycleBreakResult{
@@ -463,7 +483,7 @@ func (a *Analyzer) generateTopKSet(k int) *TopKSetResult {
 	// before it have been simulated as complete. Graph context is not a candidate.
 	potentialCandidates := 0
 	for _, issue := range a.issueMap {
-		if a.IsCandidate(issue.ID) && !isClosedLikeStatus(issue.Status) && !issue.IsDeferredAt(a.now) {
+		if a.IsCandidate(issue.ID) && !isClosedLikeStatus(issue.Status) && !issue.IsDeferredAt(a.now) && !isWithheldIssue(&issue) {
 			potentialCandidates++
 		}
 	}
@@ -600,11 +620,14 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 	seenEdges := make(map[edge]struct{})
 	totalDegree := make(map[string]int)
 	for id, issue := range a.issueMap {
-		if isClosedLikeStatus(issue.Status) {
+		if !a.IsCandidate(id) || isClosedLikeStatus(issue.Status) {
 			continue
 		}
 		for _, dep := range issue.Dependencies {
 			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			if !a.IsCandidate(dep.DependsOnID) {
 				continue
 			}
 			if target, ok := a.issueMap[dep.DependsOnID]; ok && !isClosedLikeStatus(target.Status) {
@@ -726,12 +749,39 @@ func (a *Analyzer) generateKPaths(k int, pathLengthCap int) *KPathsResult {
 	var nodes []nodeInfo
 	idToIndex := make(map[string]int)
 
-	// Collect non-closed issues
+	// Collect non-closed candidate issues plus their transitive non-closed
+	// upstream prerequisites so scoped critical paths preserve full blocker
+	// chains while excluding disconnected or downstream out-of-scope subgraphs.
+	relevant := make(map[string]bool, len(a.issueMap))
+	var queue []string
 	for id, issue := range a.issueMap {
-		if !isClosedLikeStatus(issue.Status) {
-			idToIndex[id] = len(nodes)
-			nodes = append(nodes, nodeInfo{id: id, index: len(nodes)})
+		if a.IsCandidate(id) && !isClosedLikeStatus(issue.Status) {
+			relevant[id] = true
+			queue = append(queue, id)
 		}
+	}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		issue, ok := a.issueMap[curr]
+		if !ok {
+			continue
+		}
+		for _, dep := range issue.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() || relevant[dep.DependsOnID] {
+				continue
+			}
+			blocker, exists := a.issueMap[dep.DependsOnID]
+			if !exists || isClosedLikeStatus(blocker.Status) {
+				continue
+			}
+			relevant[dep.DependsOnID] = true
+			queue = append(queue, dep.DependsOnID)
+		}
+	}
+	for id := range relevant {
+		idToIndex[id] = len(nodes)
+		nodes = append(nodes, nodeInfo{id: id, index: len(nodes)})
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].id < nodes[j].id })
 	// Re-index after sorting for determinism
@@ -856,6 +906,9 @@ func (a *Analyzer) generateKPaths(k int, pathLengthCap int) *KPathsResult {
 	}
 	var pathEnds []pathEnd
 	for i := 0; i < n; i++ {
+		if !a.IsCandidate(nodes[i].id) {
+			continue
+		}
 		pathEnds = append(pathEnds, pathEnd{idx: i, length: dist[i], id: nodes[i].id})
 	}
 

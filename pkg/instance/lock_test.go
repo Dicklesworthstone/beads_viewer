@@ -667,3 +667,77 @@ func TestLock_ConcurrentMethodsRace(t *testing.T) {
 	primary.Release()
 	secondary.Release()
 }
+
+func TestLock_HolderHostnameAndSameHost(t *testing.T) {
+	const (
+		localHost   = "host-local"
+		foreignHost = "host-remote"
+	)
+
+	lockHooksMu.Lock()
+	origHost := hostnameFunc
+	origTTL := foreignHostLeaseTTL
+	hostnameFunc = func() (string, error) { return localHost, nil }
+	foreignHostLeaseTTL = 10 * time.Minute
+	lockHooksMu.Unlock()
+	t.Cleanup(func() {
+		lockHooksMu.Lock()
+		hostnameFunc = origHost
+		foreignHostLeaseTTL = origTTL
+		lockHooksMu.Unlock()
+	})
+
+	var nilLock *Lock
+	if nilLock.HolderHostname() != "" {
+		t.Fatalf("nil Lock.HolderHostname() = %q, want empty", nilLock.HolderHostname())
+	}
+	if !nilLock.SameHost() {
+		t.Fatal("nil Lock.SameHost() = false, want true")
+	}
+
+	// 1. Primary + same-host secondary lock
+	sameHostDir := t.TempDir()
+	primary, err := NewLock(sameHostDir)
+	if err != nil {
+		t.Fatalf("NewLock(primary) failed: %v", err)
+	}
+	defer primary.Release()
+	if !primary.SameHost() || primary.HolderHostname() != localHost {
+		t.Fatalf("primary SameHost=%v HolderHostname=%q, want true/%q", primary.SameHost(), primary.HolderHostname(), localHost)
+	}
+
+	secondary, err := NewLock(sameHostDir)
+	if err != nil {
+		t.Fatalf("NewLock(secondary) failed: %v", err)
+	}
+	defer secondary.Release()
+	if secondary.IsFirstInstance() {
+		t.Fatal("expected secondary instance")
+	}
+	if !secondary.SameHost() || secondary.HolderHostname() != localHost {
+		t.Fatalf("same-host secondary SameHost=%v HolderHostname=%q, want true/%q", secondary.SameHost(), secondary.HolderHostname(), localHost)
+	}
+
+	// 2. Active foreign-host lock
+	foreignDir := t.TempDir()
+	writeLockInfoForTest(t, filepath.Join(foreignDir, LockFileName), LockInfo{
+		PID:       424242,
+		StartedAt: time.Now().Add(-30 * time.Second),
+		Hostname:  foreignHost,
+		OwnerID:   "foreign-owner",
+	})
+	foreignSecondary, err := NewLock(foreignDir)
+	if err != nil {
+		t.Fatalf("NewLock(foreignSecondary) failed: %v", err)
+	}
+	defer foreignSecondary.Release()
+	if foreignSecondary.IsFirstInstance() {
+		t.Fatal("expected foreign active lock to remain held")
+	}
+	if foreignSecondary.SameHost() {
+		t.Fatal("foreign-host lock SameHost() = true, want false")
+	}
+	if foreignSecondary.HolderHostname() != foreignHost {
+		t.Fatalf("foreign-host HolderHostname() = %q, want %q", foreignSecondary.HolderHostname(), foreignHost)
+	}
+}

@@ -93,18 +93,22 @@ issues = [
     dict(base, id='cap-auth-ui', title='Session callback screen', status='open', priority=1,
          issue_type='feature', labels=['frontend'], assignee='bob',
          description='Frontend OAuth login redirect view',
+         design='zircon-design-arch-v2',
          dependencies=[dict(issue_id='cap-auth-ui', depends_on_id='cap-auth-root', type='blocks')]),
     dict(base, id='cap-billing-a', title='Invoice webhook retry', status='open', priority=1,
          issue_type='task', labels=['backend'], assignee='alice',
          description='Stripe webhook delivery worker',
+         notes='obsidian-note-probe',
          dependencies=[dict(issue_id='cap-billing-a', depends_on_id='cap-billing-b', type='blocks')]),
     dict(base, id='cap-billing-b', title='Ledger reconciliation job', status='open', priority=2,
          issue_type='task', labels=['ops'], assignee='carol',
          description='Idempotent billing ledger sync',
+         acceptance_criteria='emerald-criteria-probe',
          dependencies=[dict(issue_id='cap-billing-b', depends_on_id='cap-billing-a', type='blocks')]),
     dict(base, id='cap-hub-leaf', title='Dashboard telemetry exporter', status='open', priority=2,
          issue_type='chore', labels=['observability'], assignee='bob',
          description='Exports metrics and depends on gateway',
+         external_ref='GH-4242',
          dependencies=[
              dict(issue_id='cap-hub-leaf', depends_on_id='cap-auth-root', type='blocks'),
              dict(issue_id='cap-hub-leaf', depends_on_id='cap-closed-prereq', type='blocks'),
@@ -118,6 +122,7 @@ PY
   git add .beads/issues.jsonl
   GIT_AUTHOR_DATE="2026-09-04T12:00:00Z" GIT_COMMITTER_DATE="2026-09-04T12:00:00Z" git commit -q -m "add cycles, telemetry hub, and close bootstrap"
   "$bv" --export-pages "$tmp/capabilities-bundle" --pages-title "Capabilities <Title> & Gate" --pages-subtitle "Release <RC-C10> & Proof" >"$tmp/capabilities-export.log" 2>&1
+  "$bv" --export-graph "$tmp/capabilities-bundle/standalone-graph.html" >>"$tmp/capabilities-export.log" 2>&1
 ) || { cat "$tmp/capabilities-export.log" 2>/dev/null || true; exit 1; }
 
 if [ -n "$target" ]; then

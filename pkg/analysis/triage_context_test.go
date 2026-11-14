@@ -1,8 +1,10 @@
 package analysis
 
 import (
+	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
@@ -659,4 +661,31 @@ func BenchmarkTriageContext_BlockerDepth(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestTriageContext_LabelAttentionMapCaching(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "a", Labels: []string{"api"}, Status: model.StatusOpen, UpdatedAt: now.Add(-30 * 24 * time.Hour)},
+		{ID: "b", Labels: []string{"ui"}, Status: model.StatusOpen, UpdatedAt: now},
+	}
+	an := NewAnalyzer(issues)
+	stats := an.Analyze()
+
+	ctx := NewTriageContextThreadSafe(an)
+	ctx.SetStats(&stats)
+
+	m1 := ctx.LabelAttentionMap(now)
+	m2 := ctx.LabelAttentionMap(now)
+	if len(m1) != 2 || m1["api"] <= m1["ui"] {
+		t.Fatalf("expected api attention > ui attention, got %+v", m1)
+	}
+	if !reflect.DeepEqual(m1, m2) {
+		t.Fatalf("expected cached LabelAttentionMap equality, got %+v vs %+v", m1, m2)
+	}
+
+	ctx.Reset()
+	if ctx.labelAttentionComputed {
+		t.Fatal("expected Reset to clear labelAttentionComputed")
+	}
 }

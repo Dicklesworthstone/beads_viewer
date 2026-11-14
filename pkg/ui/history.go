@@ -162,6 +162,7 @@ type HistoryModel struct {
 
 	// Cass session integration state (bv-pr1l)
 	sessionCache map[string][]cass.ScoredResult // Cached sessions per bead ID
+	cassLookup   func(string) []cass.ScoredResult
 
 	// View mode transition state (bv-kvlx)
 	modeChangedAt time.Time // Timestamp of last mode toggle for transition animation
@@ -347,21 +348,52 @@ func (h *HistoryModel) SetSessionsForBead(beadID string, sessions []cass.ScoredR
 	h.sessionCache[beadID] = sessions
 }
 
-// HasSessionsForBead returns true if sessions are cached for the given bead (bv-pr1l)
+// HasSessionsForBead returns true if sessions are cached or available via lookup for the given bead (bv-pr1l)
 func (h *HistoryModel) HasSessionsForBead(beadID string) bool {
-	if h.sessionCache == nil {
-		return false
+	if h.sessionCache != nil {
+		if _, ok := h.sessionCache[beadID]; ok {
+			return true
+		}
 	}
-	_, ok := h.sessionCache[beadID]
-	return ok
+	if h.cassLookup != nil {
+		return len(h.cassLookup(beadID)) > 0
+	}
+	return false
 }
 
-// GetSessionsForBead returns cached sessions for a bead (bv-pr1l)
+// GetSessionsForBead returns cached or looked-up sessions for a bead (bv-pr1l)
 func (h *HistoryModel) GetSessionsForBead(beadID string) []cass.ScoredResult {
-	if h.sessionCache == nil {
-		return nil
+	if h.sessionCache != nil {
+		if sessions, ok := h.sessionCache[beadID]; ok {
+			return sessions
+		}
 	}
-	return h.sessionCache[beadID]
+	if h.cassLookup != nil {
+		return h.cassLookup(beadID)
+	}
+	return nil
+}
+
+// SetCassLookup attaches an optional lookup callback for correlated cass sessions.
+func (h *HistoryModel) SetCassLookup(fn func(string) []cass.ScoredResult) {
+	h.cassLookup = fn
+}
+
+func (h *HistoryModel) sessionCountForBead(beadID string) int {
+	return len(h.GetSessionsForBead(beadID))
+}
+
+func (h *HistoryModel) sessionCountForCommit(commit CommitListEntry) int {
+	total := 0
+	seen := make(map[string]bool, len(commit.BeadIDs))
+	for _, beadID := range commit.BeadIDs {
+		if seen[beadID] {
+			continue
+		}
+		seen[beadID] = true
+		total += h.sessionCountForBead(beadID)
+	}
+	return total
 }
 
 // ClearSessionCache clears all cached sessions (bv-pr1l)
@@ -485,12 +517,26 @@ func (h *HistoryModel) rebuildFilteredList() {
 	}
 }
 
+const (
+	fileTreeMinWidth           = 60
+	fileTreeFullLayoutMinWidth = 90
+)
+
 // SetSize updates the view dimensions
 func (h *HistoryModel) SetSize(width, height int) {
 	h.width = width
 	h.height = height
 
+	// Release file tree focus if terminal shrinks below minimum file-tree width
+	if width > 0 && width < fileTreeMinWidth && h.fileTreeFocus {
+		h.fileTreeFocus = false
+	}
+
 	// Adjust focus if pane is lost due to resize
+	h.clampMainFocusToPaneCount()
+}
+
+func (h *HistoryModel) clampMainFocusToPaneCount() {
 	panes := h.paneCount()
 	if panes < 4 && h.focused == historyFocusTimeline {
 		h.focused = historyFocusList
@@ -518,10 +564,26 @@ func (h *HistoryModel) GetAuthorFilter() string {
 	return h.authorFilter
 }
 
+func (h *HistoryModel) refreshAfterFilterChange() {
+	h.applySearchFilter()
+	commits := h.GetFilteredCommitList()
+	if len(commits) == 0 {
+		h.selectedGitCommit = 0
+		h.selectedRelatedBead = 0
+		h.gitScrollOffset = 0
+	} else if h.selectedGitCommit >= len(commits) {
+		h.selectedGitCommit = len(commits) - 1
+		h.selectedRelatedBead = 0
+		if h.gitScrollOffset > h.selectedGitCommit {
+			h.gitScrollOffset = 0
+		}
+	}
+}
+
 // SetMinConfidence sets the minimum confidence threshold and rebuilds the list
 func (h *HistoryModel) SetMinConfidence(conf float64) {
 	h.minConfidence = conf
-	h.rebuildFilteredList()
+	h.refreshAfterFilterChange()
 }
 
 // File tree methods (bv-190l)
@@ -675,9 +737,12 @@ func (h *HistoryModel) addToFlatList(node *FileTreeNode) {
 // ToggleFileTree toggles the file tree panel visibility
 func (h *HistoryModel) ToggleFileTree() {
 	h.showFileTree = !h.showFileTree
-	if h.showFileTree && h.fileTree == nil {
+	if !h.showFileTree {
+		h.fileTreeFocus = false
+	} else if h.fileTree == nil {
 		h.buildFileTree()
 	}
+	h.clampMainFocusToPaneCount()
 }
 
 // IsFileTreeVisible returns whether the file tree panel is visible
@@ -685,13 +750,29 @@ func (h *HistoryModel) IsFileTreeVisible() bool {
 	return h.showFileTree
 }
 
+// FileTreeRendered returns whether the file tree panel is currently rendered
+// (toggled on and terminal width is wide enough, or width is not yet initialized).
+func (h *HistoryModel) FileTreeRendered() bool {
+	return h.showFileTree && (h.width == 0 || h.width >= fileTreeMinWidth)
+}
+
+// FileTreeSuppressedForWidth returns true when the file tree is toggled on
+// but hidden because the terminal width is below fileTreeMinWidth.
+func (h *HistoryModel) FileTreeSuppressedForWidth() bool {
+	return h.showFileTree && h.width > 0 && h.width < fileTreeMinWidth
+}
+
 // FileTreeHasFocus returns whether the file tree has focus
 func (h *HistoryModel) FileTreeHasFocus() bool {
-	return h.fileTreeFocus
+	return h.fileTreeFocus && h.FileTreeRendered()
 }
 
 // SetFileTreeFocus sets the file tree focus state
 func (h *HistoryModel) SetFileTreeFocus(focus bool) {
+	if focus && h.FileTreeSuppressedForWidth() {
+		h.fileTreeFocus = false
+		return
+	}
 	h.fileTreeFocus = focus
 }
 
@@ -721,7 +802,7 @@ func (h *HistoryModel) ToggleExpandFile() {
 	}
 }
 
-// SelectFile sets the file filter to the selected file
+// SelectFile sets the file filter to the selected file or directory
 func (h *HistoryModel) SelectFile() {
 	if h.selectedFileIdx >= len(h.flatFileList) {
 		return
@@ -732,13 +813,13 @@ func (h *HistoryModel) SelectFile() {
 	} else {
 		h.fileFilter = node.Path
 	}
-	h.rebuildFilteredList()
+	h.refreshAfterFilterChange()
 }
 
 // ClearFileFilter clears the file filter
 func (h *HistoryModel) ClearFileFilter() {
 	h.fileFilter = ""
-	h.rebuildFilteredList()
+	h.refreshAfterFilterChange()
 }
 
 // GetFileFilter returns the current file filter
@@ -878,9 +959,25 @@ func (h *HistoryModel) ToggleFocus() {
 	}
 }
 
+// mainPaneFocused reports whether main pane p currently owns visual/input focus.
+// When the file tree panel is open and focused, no main pane shows an active border.
+func (h *HistoryModel) mainPaneFocused(p historyFocus) bool {
+	return !h.FileTreeHasFocus() && h.focused == p
+}
+
+// ResetMainFocus resets main pane focus back to the primary list pane.
+func (h *HistoryModel) ResetMainFocus() {
+	h.focused = historyFocusList
+}
+
+// IsListFocused returns true if the primary list pane has focus.
+func (h *HistoryModel) IsListFocused() bool {
+	return h.mainPaneFocused(historyFocusList)
+}
+
 // IsDetailFocused returns true if the detail pane has focus (bv-190l)
 func (h *HistoryModel) IsDetailFocused() bool {
-	return h.focused == historyFocusDetail
+	return h.mainPaneFocused(historyFocusDetail)
 }
 
 // NextCommit moves to the next commit within the selected bead (J key)
@@ -1263,6 +1360,10 @@ func (h *HistoryModel) ToggleViewMode() {
 	if strings.TrimSpace(h.searchInput.Value()) != "" {
 		h.applySearchFilter()
 	}
+	// Clamp main focus when switching between Bead mode (up to 4 panes with
+	// timeline) and Git mode (2 or 3 panes, no timeline) so focus never stays
+	// stranded on an invisible pane.
+	h.clampMainFocusToPaneCount()
 }
 
 // IsGitMode returns true if in git-centric view mode
@@ -1287,6 +1388,21 @@ func (h *HistoryModel) buildCommitList() {
 			if h.authorFilter != "" {
 				if !strings.Contains(strings.ToLower(commit.Author), strings.ToLower(h.authorFilter)) &&
 					!strings.Contains(strings.ToLower(commit.AuthorEmail), strings.ToLower(h.authorFilter)) {
+					continue
+				}
+			}
+			if h.minConfidence > 0 && commit.Confidence < h.minConfidence {
+				continue
+			}
+			if h.fileFilter != "" {
+				fileMatched := false
+				for _, file := range commit.Files {
+					if file.Path == h.fileFilter || strings.HasPrefix(file.Path, h.fileFilter+"/") {
+						fileMatched = true
+						break
+					}
+				}
+				if !fileMatched {
 					continue
 				}
 			}
@@ -1527,8 +1643,29 @@ func (h *HistoryModel) determineLayout() historyLayout {
 	return layoutWide
 }
 
-// paneCount returns the number of visible panes for the current layout (bv-xrfh)
+// paneCount returns the number of visible main panes for the current layout (bv-xrfh).
+// When the file tree panel is rendered alongside the main panes, this matches
+// the exact main pane count produced by renderWithFileTree / renderMainPanesForWidth.
 func (h *HistoryModel) paneCount() int {
+	if h.FileTreeRendered() {
+		totalW := h.width
+		if totalW <= 0 {
+			totalW = 120
+		}
+		if totalW < fileTreeFullLayoutMinWidth {
+			return 2
+		}
+		treeWidth := max(24, int(float64(totalW)*0.22))
+		availWidth := totalW - treeWidth
+		if availWidth < layoutBreakpointStandard {
+			return 2
+		}
+		if h.TimelineVisible() && availWidth >= 120 {
+			return 4
+		}
+		return 3
+	}
+
 	layout := h.determineLayout()
 	if h.TimelineVisible() {
 		return 4
@@ -1543,21 +1680,47 @@ func (h *HistoryModel) paneCount() int {
 	}
 }
 
+func (h *HistoryModel) reportHasAnyCommits() bool {
+	if h.report == nil {
+		return false
+	}
+	for _, hist := range h.report.Histories {
+		if len(hist.Commits) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *HistoryModel) hasActiveFilters() bool {
+	return h.fileFilter != "" ||
+		h.minConfidence > 0 ||
+		h.authorFilter != "" ||
+		strings.TrimSpace(h.searchInput.Value()) != ""
+}
+
 // View renders the history view
 func (h *HistoryModel) View() string {
 	if h.report == nil {
 		return h.renderEmpty("No history data loaded")
 	}
 
-	// In git mode, check commit list; in bead mode, check histories
-	if h.viewMode == historyModeGit {
-		if len(h.commitList) == 0 {
-			return h.renderEmpty("No commits with bead correlations found")
+	// Only fall back to full-screen empty state when no filter/file-tree is active
+	// (or when the underlying report itself has zero correlated commits).
+	if !h.reportHasAnyCommits() || (!h.showFileTree && !h.hasActiveFilters()) {
+		if h.viewMode == historyModeGit {
+			if len(h.commitList) == 0 {
+				return h.renderEmpty("No commits with bead correlations found")
+			}
+		} else {
+			if len(h.histories) == 0 {
+				return h.renderEmpty("No beads with commit correlations found")
+			}
 		}
-	} else {
-		if len(h.histories) == 0 {
-			return h.renderEmpty("No beads with commit correlations found")
-		}
+	}
+
+	if h.FileTreeRendered() {
+		return h.renderWithFileTree()
 	}
 
 	// Dispatch to layout-specific renderer (bv-xrfh)
@@ -1568,6 +1731,109 @@ func (h *HistoryModel) View() string {
 	default:
 		return h.renderTwoPaneView()
 	}
+}
+
+// renderWithFileTree renders the left-hand file tree panel alongside the main history panes (bv-190l).
+func (h *HistoryModel) renderWithFileTree() string {
+	totalW := h.width
+	if totalW <= 0 {
+		totalW = 120
+	}
+	panelHeight := h.height - 2
+	if panelHeight < 5 {
+		panelHeight = 5
+	}
+
+	header := h.renderHeader()
+
+	// Compact 2-pane layout (file tree + focused main pane) for 60..89 cols
+	if totalW < fileTreeFullLayoutMinWidth {
+		treeWidth := max(22, int(float64(totalW)*0.40))
+		mainWidth := max(20, totalW-treeWidth)
+		if treeWidth+mainWidth > totalW {
+			treeWidth = totalW / 2
+			mainWidth = totalW - treeWidth
+		}
+		filePanel := h.renderFileTreePanel(treeWidth, panelHeight)
+		var mainPanel string
+		if h.viewMode == historyModeGit {
+			if h.focused == historyFocusDetail {
+				mainPanel = h.renderGitDetailPanel(mainWidth, panelHeight)
+			} else {
+				mainPanel = h.renderGitCommitListPanel(mainWidth, panelHeight)
+			}
+		} else {
+			if h.focused == historyFocusDetail {
+				mainPanel = h.renderDetailPanel(mainWidth, panelHeight)
+			} else {
+				mainPanel = h.renderListPanel(mainWidth, panelHeight)
+			}
+		}
+		panels := lipgloss.JoinHorizontal(lipgloss.Top, filePanel, mainPanel)
+		return lipgloss.JoinVertical(lipgloss.Left, header, panels)
+	}
+
+	// Full layout (>= 90 cols): left file tree + 2/3/4 main panes in remaining width
+	treeWidth := max(24, int(float64(totalW)*0.22))
+	remWidth := totalW - treeWidth
+	filePanel := h.renderFileTreePanel(treeWidth, panelHeight)
+	mainPanes := h.renderMainPanesForWidth(remWidth, panelHeight)
+	panels := lipgloss.JoinHorizontal(lipgloss.Top, filePanel, mainPanes)
+	return lipgloss.JoinVertical(lipgloss.Left, header, panels)
+}
+
+func (h *HistoryModel) renderMainPanesForWidth(availWidth, panelHeight int) string {
+	if availWidth < layoutBreakpointStandard {
+		listWidth := int(float64(availWidth) * 0.45)
+		detailWidth := availWidth - listWidth
+		if h.viewMode == historyModeGit {
+			return lipgloss.JoinHorizontal(lipgloss.Top,
+				h.renderGitCommitListPanel(listWidth, panelHeight),
+				h.renderGitDetailPanel(detailWidth, panelHeight),
+			)
+		}
+		return lipgloss.JoinHorizontal(lipgloss.Top,
+			h.renderListPanel(listWidth, panelHeight),
+			h.renderDetailPanel(detailWidth, panelHeight),
+		)
+	}
+
+	if h.TimelineVisible() && availWidth >= 120 {
+		listWidth := int(float64(availWidth) * 0.20)
+		timelineWidth := int(float64(availWidth) * 0.22)
+		middleWidth := int(float64(availWidth) * 0.25)
+		detailWidth := availWidth - listWidth - timelineWidth - middleWidth
+		return lipgloss.JoinHorizontal(lipgloss.Top,
+			h.renderListPanel(listWidth, panelHeight),
+			h.renderTimelinePanel(timelineWidth, panelHeight),
+			h.renderCommitMiddlePanel(middleWidth, panelHeight),
+			h.renderDetailPanel(detailWidth, panelHeight),
+		)
+	}
+
+	var listWidth, middleWidth, detailWidth int
+	if availWidth >= layoutBreakpointWide {
+		listWidth = int(float64(availWidth) * 0.25)
+		middleWidth = int(float64(availWidth) * 0.30)
+		detailWidth = availWidth - listWidth - middleWidth
+	} else {
+		listWidth = int(float64(availWidth) * 0.30)
+		middleWidth = int(float64(availWidth) * 0.35)
+		detailWidth = availWidth - listWidth - middleWidth
+	}
+
+	if h.viewMode == historyModeGit {
+		return lipgloss.JoinHorizontal(lipgloss.Top,
+			h.renderGitCommitListPanel(listWidth, panelHeight),
+			h.renderGitBeadListPanel(middleWidth, panelHeight),
+			h.renderGitDetailPanel(detailWidth, panelHeight),
+		)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top,
+		h.renderListPanel(listWidth, panelHeight),
+		h.renderCommitMiddlePanel(middleWidth, panelHeight),
+		h.renderDetailPanel(detailWidth, panelHeight),
+	)
 }
 
 // renderTwoPaneView renders the narrow two-pane layout (bv-xrfh)
@@ -1772,7 +2038,7 @@ func (h *HistoryModel) renderTimelinePanel(width, height int) string {
 
 	// Panel border style
 	borderColor := t.Border
-	if h.focused == historyFocusTimeline {
+	if h.mainPaneFocused(historyFocusTimeline) {
 		borderColor = t.Primary
 	}
 	panelStyle := r.NewStyle().
@@ -2081,7 +2347,7 @@ func (h *HistoryModel) renderEmpty(msg string) string {
 		Align(lipgloss.Center, lipgloss.Center).
 		Foreground(t.Secondary)
 
-	return style.Render(msg + "\n\nPress H to close")
+	return style.Render(msg + "\n\nPress h to close")
 }
 
 // renderHeader renders the filter bar, statistics, and title (bv-y5sx)
@@ -2155,7 +2421,7 @@ func (h *HistoryModel) renderHeader() string {
 		rightContent = t.Renderer.NewStyle().
 			Foreground(t.Muted).
 			Padding(0, 1).
-			Render("[/] search  [H] close")
+			Render("[/] search  [h] close")
 	}
 
 	// Combine title line with spacing
@@ -2264,6 +2530,14 @@ func (h *HistoryModel) renderFilterLine() string {
 		activeFilters = append(activeFilters, fmt.Sprintf("\"%s\"", query))
 	}
 
+	// Show file filter chip when active (bv-190l)
+	if h.fileFilter != "" {
+		parts = append(parts, activeFilterStyle.Render("File: "+h.fileFilter))
+	}
+	if h.FileTreeSuppressedForWidth() {
+		parts = append(parts, filterStyle.Render("[File tree hidden: widen ≥60 cols]"))
+	}
+
 	// Show filter status
 	if len(activeFilters) > 0 {
 		parts = append(parts, activeFilterStyle.Render("Filter: "+strings.Join(activeFilters, ", ")))
@@ -2315,7 +2589,7 @@ func (h *HistoryModel) renderListPanel(width, height int) string {
 
 	// Panel border style based on focus
 	borderColor := t.Muted
-	if h.focused == historyFocusList {
+	if h.mainPaneFocused(historyFocusList) {
 		borderColor = t.Primary
 	}
 
@@ -2391,14 +2665,23 @@ func (h *HistoryModel) renderBeadLine(idx int, hist correlation.BeadHistory, wid
 		eventBadge = renderCompactEventBadge(len(hist.Events), t)
 	}
 
-	// Calculate space for event badge
-	eventBadgeWidth := lipgloss.Width(eventBadge)
-	if eventBadgeWidth > 0 {
-		eventBadgeWidth += 1 // Space before badge
+	// Cass session indicator badge (bv-pr1l)
+	sessionBadge := ""
+	if sessionCount := h.sessionCountForBead(hist.BeadID); sessionCount > 0 {
+		sessionBadge = t.Renderer.NewStyle().Foreground(t.InProgress).Render(fmt.Sprintf("🤖%d", sessionCount))
+	}
+
+	// Calculate space for badges
+	badgeWidth := 0
+	if eventBadge != "" {
+		badgeWidth += lipgloss.Width(eventBadge) + 1
+	}
+	if sessionBadge != "" {
+		badgeWidth += lipgloss.Width(sessionBadge) + 1
 	}
 
 	// Truncate title
-	maxTitleLen := width - len(indicator) - len(statusIcon) - len(commitCount) - eventBadgeWidth - 6
+	maxTitleLen := width - len(indicator) - len(statusIcon) - len(commitCount) - badgeWidth - 6
 	if maxTitleLen < 10 {
 		maxTitleLen = 10
 	}
@@ -2409,15 +2692,18 @@ func (h *HistoryModel) renderBeadLine(idx int, hist correlation.BeadHistory, wid
 	titleStyle := t.Renderer.NewStyle().Width(maxTitleLen)
 	countStyle := t.Renderer.NewStyle().Foreground(t.Muted).Align(lipgloss.Right)
 
-	if selected && h.focused == historyFocusList {
+	if selected && h.mainPaneFocused(historyFocusList) {
 		idStyle = idStyle.Bold(true).Foreground(t.Primary)
 		titleStyle = titleStyle.Bold(true)
 	}
 
-	// Include event badge if present
+	// Include event and session badges if present
 	countPart := countStyle.Render(commitCount)
 	if eventBadge != "" {
 		countPart = countPart + " " + eventBadge
+	}
+	if sessionBadge != "" {
+		countPart = countPart + " " + sessionBadge
 	}
 
 	line := fmt.Sprintf("%s%s %s %s %s",
@@ -2437,7 +2723,7 @@ func (h *HistoryModel) renderFileTreePanel(width, height int) string {
 
 	// Panel border style based on focus
 	borderColor := t.Muted
-	if h.fileTreeFocus {
+	if h.FileTreeHasFocus() {
 		borderColor = t.Primary
 	}
 
@@ -2572,7 +2858,7 @@ func (h *HistoryModel) renderDetailPanel(width, height int) string {
 
 	// Panel border style based on focus
 	borderColor := t.Muted
-	if h.focused == historyFocusDetail {
+	if h.mainPaneFocused(historyFocusDetail) {
 		borderColor = t.Primary
 	}
 
@@ -2612,6 +2898,13 @@ func (h *HistoryModel) renderDetailPanel(width, height int) string {
 	var lines []string
 	lines = append(lines, header)
 	lines = append(lines, beadInfoStyle.Render(beadInfo))
+	if sessionCount := h.sessionCountForBead(hist.BeadID); sessionCount > 0 {
+		sessionInfo := fmt.Sprintf("🤖 %d cass session(s) — press V to preview", sessionCount)
+		if width > 10 {
+			sessionInfo = truncateRunesHelper(sessionInfo, width-6, "…")
+		}
+		lines = append(lines, t.Renderer.NewStyle().Foreground(t.InProgress).Render(sessionInfo))
+	}
 	detailSepWidth := width - 4
 	if detailSepWidth < 1 {
 		detailSepWidth = 1
@@ -2652,7 +2945,7 @@ func (h *HistoryModel) renderDetailPanel(width, height int) string {
 
 	// Render commits
 	for i, commit := range hist.Commits {
-		isSelected := i == h.selectedCommit && h.focused == historyFocusDetail
+		isSelected := i == h.selectedCommit && h.mainPaneFocused(historyFocusDetail)
 		commitLines := h.renderCommitDetail(commit, width-4, isSelected)
 		lines = append(lines, commitLines...)
 		if i < len(hist.Commits)-1 {
@@ -3302,7 +3595,7 @@ func (h *HistoryModel) renderGitCommitListPanel(width, height int) string {
 
 	// Panel border style based on focus
 	borderColor := t.Muted
-	if h.focused == historyFocusList {
+	if h.mainPaneFocused(historyFocusList) {
 		borderColor = t.Primary
 	}
 
@@ -3364,9 +3657,15 @@ func (h *HistoryModel) renderGitCommitLine(idx int, commit CommitListEntry, widt
 
 	// Bead count badge
 	beadCount := fmt.Sprintf("[%d]", len(commit.BeadIDs))
+	sessionBadge := ""
+	sessionBadgeWidth := 0
+	if sessionCount := h.sessionCountForCommit(commit); sessionCount > 0 {
+		sessionBadge = t.Renderer.NewStyle().Foreground(t.InProgress).Render(fmt.Sprintf("🤖%d", sessionCount))
+		sessionBadgeWidth = lipgloss.Width(sessionBadge) + 1
+	}
 
 	// Truncate message
-	maxMsgLen := width - len(indicator) - len(commit.ShortSHA) - len(beadCount) - 6
+	maxMsgLen := width - len(indicator) - len(commit.ShortSHA) - len(beadCount) - sessionBadgeWidth - 6
 	if maxMsgLen < 10 {
 		maxMsgLen = 10
 	}
@@ -3377,7 +3676,7 @@ func (h *HistoryModel) renderGitCommitLine(idx int, commit CommitListEntry, widt
 	msgStyle := t.Renderer.NewStyle()
 	countStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
 
-	if selected && h.focused == historyFocusList {
+	if selected && h.mainPaneFocused(historyFocusList) {
 		shaStyle = shaStyle.Bold(true)
 		msgStyle = msgStyle.Bold(true)
 	}
@@ -3388,6 +3687,9 @@ func (h *HistoryModel) renderGitCommitLine(idx int, commit CommitListEntry, widt
 		msgStyle.Render(msg),
 		countStyle.Render(beadCount),
 	)
+	if sessionBadge != "" {
+		line += " " + sessionBadge
+	}
 
 	return line
 }
@@ -3398,7 +3700,7 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 
 	// Panel border style based on focus
 	borderColor := t.Muted
-	if h.focused == historyFocusDetail {
+	if h.mainPaneFocused(historyFocusDetail) {
 		borderColor = t.Primary
 	}
 
@@ -3429,7 +3731,7 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 
 	// List related beads
 	for i, beadID := range commit.BeadIDs {
-		isSelected := i == h.selectedRelatedBead && h.focused == historyFocusDetail
+		isSelected := i == h.selectedRelatedBead && h.mainPaneFocused(historyFocusDetail)
 
 		indicator := "  "
 		if isSelected {
@@ -3457,14 +3759,24 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 			beadStyle = beadStyle.Bold(true).Foreground(t.Primary)
 		}
 
+		sessionBadge := ""
+		sessionBadgeWidth := 0
+		if sc := h.sessionCountForBead(beadID); sc > 0 {
+			sessionBadge = t.Renderer.NewStyle().Foreground(t.InProgress).Render(fmt.Sprintf("🤖%d", sc))
+			sessionBadgeWidth = lipgloss.Width(sessionBadge) + 1
+		}
+
 		// Truncate title
-		maxLen := width - 8
+		maxLen := width - 8 - len(beadID) - sessionBadgeWidth
 		if maxLen < 10 {
 			maxLen = 10
 		}
 		title = truncateRunesHelper(title, maxLen, "…")
 
 		beadLine := fmt.Sprintf("%s%s %s %s", indicator, statusIcon, beadID, beadStyle.Render(title))
+		if sessionBadge != "" {
+			beadLine += " " + sessionBadge
+		}
 		lines = append(lines, beadLine)
 	}
 
@@ -3530,7 +3842,7 @@ func (h *HistoryModel) renderCommitMiddlePanel(width, height int) string {
 	t := h.theme
 
 	borderColor := t.Muted
-	if h.focused == historyFocusMiddle {
+	if h.mainPaneFocused(historyFocusMiddle) {
 		borderColor = t.Primary
 	}
 
@@ -3573,7 +3885,7 @@ func (h *HistoryModel) renderCommitMiddlePanel(width, height int) string {
 
 	for i := startIdx; i < endIdx; i++ {
 		commit := hist.Commits[i]
-		isSelected := i == h.selectedCommit && h.focused == historyFocusMiddle
+		isSelected := i == h.selectedCommit && h.mainPaneFocused(historyFocusMiddle)
 
 		indicator := "  "
 		if isSelected {
@@ -3619,7 +3931,7 @@ func (h *HistoryModel) renderGitBeadListPanel(width, height int) string {
 	t := h.theme
 
 	borderColor := t.Muted
-	if h.focused == historyFocusMiddle {
+	if h.mainPaneFocused(historyFocusMiddle) {
 		borderColor = t.Primary
 	}
 
@@ -3662,7 +3974,7 @@ func (h *HistoryModel) renderGitBeadListPanel(width, height int) string {
 
 	for i := startIdx; i < endIdx; i++ {
 		beadID := commit.BeadIDs[i]
-		isSelected := i == h.selectedRelatedBead && h.focused == historyFocusMiddle
+		isSelected := i == h.selectedRelatedBead && h.mainPaneFocused(historyFocusMiddle)
 
 		indicator := "  "
 		if isSelected {
@@ -3689,13 +4001,23 @@ func (h *HistoryModel) renderGitBeadListPanel(width, height int) string {
 			beadStyle = beadStyle.Bold(true).Foreground(t.Primary)
 		}
 
-		maxLen := width - 12
+		sessionBadge := ""
+		sessionBadgeWidth := 0
+		if sc := h.sessionCountForBead(beadID); sc > 0 {
+			sessionBadge = t.Renderer.NewStyle().Foreground(t.InProgress).Render(fmt.Sprintf("🤖%d", sc))
+			sessionBadgeWidth = lipgloss.Width(sessionBadge) + 1
+		}
+
+		maxLen := width - 12 - sessionBadgeWidth
 		if maxLen < 10 {
 			maxLen = 10
 		}
 		title = truncateRunesHelper(title, maxLen, "…")
 
 		beadLine := fmt.Sprintf("%s%s %s", indicator, statusIcon, beadStyle.Render(title))
+		if sessionBadge != "" {
+			beadLine += " " + sessionBadge
+		}
 		lines = append(lines, beadLine)
 	}
 

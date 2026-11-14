@@ -5,10 +5,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/updater"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // ============================================================================
@@ -697,11 +699,206 @@ func (s UpdateState) String() string {
 		return "Verifying"
 	case UpdateStateInstalling:
 		return "Installing"
+	case UpdateStateRollingBack:
+		return "RollingBack"
 	case UpdateStateSuccess:
 		return "Success"
 	case UpdateStateError:
 		return "Error"
 	default:
 		return "Unknown"
+	}
+}
+
+func TestUpdateModal_RollbackFlowAndPhaseSteps(t *testing.T) {
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+
+	origCanRollback := canRollbackCheck
+	origRunner := rollbackRunner
+	canRollbackCheck = func() bool { return false }
+	rollbackCalled := 0
+	rollbackRunner = func() error {
+		rollbackCalled++
+		return nil
+	}
+	t.Cleanup(func() {
+		canRollbackCheck = origCanRollback
+		rollbackRunner = origRunner
+	})
+
+	// 1. Update modal with backup available: 3-button Tab cycle + 'r' shortcut + RollbackCompleteMsg
+	m := NewUpdateModal("v1.2.0", "https://github.com/example/release", theme)
+	m.SetCanRollback(true)
+	if !m.CanRollback() {
+		t.Fatal("expected CanRollback() == true")
+	}
+	view := m.View()
+	if !strings.Contains(view, "Rollback") || !strings.Contains(view, "[R] Rollback") {
+		t.Fatalf("expected Rollback button & hint in confirm view:\n%s", view)
+	}
+
+	// Tab cycles 0 (Update) -> 1 (Cancel) -> 2 (Rollback) -> 0 (Update)
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.confirmFocus != 1 {
+		t.Fatalf("after 1st Tab: confirmFocus=%d, want 1", m.confirmFocus)
+	}
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.confirmFocus != 2 {
+		t.Fatalf("after 2nd Tab: confirmFocus=%d, want 2", m.confirmFocus)
+	}
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if m.confirmFocus != 0 {
+		t.Fatalf("after 3rd Tab: confirmFocus=%d, want 0", m.confirmFocus)
+	}
+
+	// Press 'r' to start rollback
+	m, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if m.state != UpdateStateRollingBack || !m.IsInProgress() || cmd == nil {
+		t.Fatalf("expected UpdateStateRollingBack in-progress with cmd, got state=%s inProgress=%v cmd=%v", m.state, m.IsInProgress(), cmd != nil)
+	}
+	rollingView := m.View()
+	if !strings.Contains(rollingView, "Rolling Back...") || !strings.Contains(rollingView, "Validating & restoring backup") {
+		t.Fatalf("expected rollback progress view:\n%s", rollingView)
+	}
+
+	// Execute PerformRollbackCmd directly to verify runner invocation
+	rbMsg := PerformRollbackCmd()()
+	rbDone, ok := rbMsg.(RollbackCompleteMsg)
+	if !ok || !rbDone.Success || rollbackCalled != 1 {
+		t.Fatalf("unexpected PerformRollbackCmd result: msg=%#v calls=%d", rbMsg, rollbackCalled)
+	}
+	m, _ = m.Update(rbDone)
+	if m.state != UpdateStateSuccess || !m.IsComplete() || m.CanRollback() {
+		t.Fatalf("after RollbackCompleteMsg: state=%s complete=%v canRollback=%v", m.state, m.IsComplete(), m.CanRollback())
+	}
+	if !strings.Contains(m.View(), "Rollback Complete!") {
+		t.Fatalf("expected Rollback Complete! header:\n%s", m.View())
+	}
+
+	// 2. Rollback-only modal (no pending update)
+	rbOnly := NewUpdateModal("", "", theme)
+	rbOnly.SetCanRollback(true)
+	if rbOnly.confirmFocus != 2 {
+		t.Fatalf("rollback-only modal initial confirmFocus=%d, want 2 (Rollback)", rbOnly.confirmFocus)
+	}
+	rbOnlyView := rbOnly.View()
+	if !strings.Contains(rbOnlyView, "Rollback Binary") || strings.Contains(rbOnlyView, "[Y] Update") {
+		t.Fatalf("unexpected rollback-only view:\n%s", rbOnlyView)
+	}
+	// 'y' must NOT start an update when newVersion is empty
+	rbOnly, yCmd := rbOnly.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	if rbOnly.state != UpdateStateConfirm || yCmd != nil {
+		t.Fatalf("rollback-only modal must ignore 'y', got state=%s cmd=%v", rbOnly.state, yCmd != nil)
+	}
+	// Enter on focused button 2 starts rollback
+	rbOnly, enterCmd := rbOnly.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if rbOnly.state != UpdateStateRollingBack || enterCmd == nil {
+		t.Fatalf("Enter on button 2 should start rollback, got state=%s", rbOnly.state)
+	}
+
+	// 3. 3-phase stepper rendering & phase tracker progression
+	pm := NewUpdateModal("v1.3.0", "", theme)
+	tracker := &updatePhaseTracker{stage: "downloading"}
+	pm.phaseTracker = tracker
+	pm.state = UpdateStateDownloading
+	pm.startTime = time.Now()
+	dlView := pm.View()
+	if !strings.Contains(dlView, "1/3 Download") || !strings.Contains(dlView, "2/3 Verify") || !strings.Contains(dlView, "3/3 Install") {
+		t.Fatalf("expected 3-phase stepper in Downloading view:\n%s", dlView)
+	}
+	_, _ = tracker.Write([]byte("Verifying SHA256 checksum...\n"))
+	pm, _ = pm.Update(updateTickMsg{startedAt: pm.startTime})
+	if pm.state != UpdateStateVerifying || !strings.Contains(pm.View(), "✓ 1/3 Download") {
+		t.Fatalf("expected transition to Verifying with completed step 1, state=%s view:\n%s", pm.state, pm.View())
+	}
+	_, _ = tracker.Write([]byte("Installing binary...\n"))
+	pm, _ = pm.Update(updateTickMsg{startedAt: pm.startTime})
+	if pm.state != UpdateStateInstalling || !strings.Contains(pm.View(), "✓ 2/3 Verify") {
+		t.Fatalf("expected transition to Installing with completed step 2, state=%s view:\n%s", pm.state, pm.View())
+	}
+}
+
+func TestUpdateModalCtrlCContextHelpAndRollbackState(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "UM-1", Title: "Update modal regression test", Status: model.StatusOpen, Priority: 1},
+	}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 32})
+
+	m.updateAvailable = true
+	m.updateTag = "v9.9.9"
+	m.updateURL = "https://example.com/releases/v9.9.9"
+	m.showSelfUpdateModal()
+
+	if !m.showUpdateModal || m.focused != focusUpdateModal {
+		t.Fatalf("expected UpdateModal open and focused, got showUpdateModal=%v focused=%v", m.showUpdateModal, m.focused)
+	}
+
+	// 1. Pressing '~' while UpdateModal is in Confirm state opens contextual tutorial ON TOP of the modal.
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("~")})
+	if !m.showTutorial || m.focused != focusTutorial || !m.IsTutorialContextMode() {
+		t.Fatalf("expected '~' in UpdateModal confirm state to open context tutorial, got showTutorial=%v focused=%v ctxMode=%v",
+			m.showTutorial, m.focused, m.IsTutorialContextMode())
+	}
+	tutPlain := ansi.Strip(m.View())
+	if !strings.Contains(tutPlain, "Tutorial") && !strings.Contains(tutPlain, "Self-Update") && !strings.Contains(tutPlain, "Update") {
+		t.Fatalf("expected rendered View() to display tutorial overlay above UpdateModal:\n%s", tutPlain)
+	}
+	// Closing tutorial via Esc restores focusUpdateModal and keeps showUpdateModal open.
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.showTutorial {
+		t.Fatal("expected Esc to close tutorial overlay")
+	}
+	if !m.showUpdateModal || m.focused != focusUpdateModal {
+		t.Fatalf("expected UpdateModal to remain open and focused after closing tutorial, got show=%v focused=%v",
+			m.showUpdateModal, m.focused)
+	}
+
+	// While an update is actively downloading/installing, '~' must NOT interrupt or open tutorial.
+	m.updateModal.state = UpdateStateDownloading
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("~")})
+	if m.showTutorial {
+		t.Fatal("expected '~' to be ignored while UpdateModal IsInProgress() is true")
+	}
+	m.updateModal.state = UpdateStateConfirm
+
+	// 2. Successful UpdateCompleteMsg clears updateAvailable and shows "updated binary" message.
+	m.Update(UpdateCompleteMsg{
+		Success:    true,
+		NewVersion: "v9.9.9",
+		Message:    "Updated successfully to v9.9.9",
+		BackupPath: "/tmp/bv.bak",
+	})
+	if m.updateAvailable {
+		t.Fatal("expected updateAvailable=false immediately after successful update")
+	}
+	afterUpdateView := ansi.Strip(m.updateModal.View())
+	if !strings.Contains(afterUpdateView, "Restart bv to use the updated binary.") {
+		t.Fatalf("expected 'updated binary' restart prompt after update:\n%s", afterUpdateView)
+	}
+
+	// 3. Subsequent RollbackCompleteMsg renders "rolled-back binary" (never "updated binary")
+	// and restores m.updateAvailable + tag/URL so the user can re-apply the update if desired.
+	m.Update(RollbackCompleteMsg{
+		Success: true,
+		Message: "Restored backup binary",
+	})
+	afterRollbackView := ansi.Strip(m.updateModal.View())
+	if !strings.Contains(afterRollbackView, "Restart bv to use the rolled-back binary.") {
+		t.Fatalf("expected 'rolled-back binary' restart prompt after rollback:\n%s", afterRollbackView)
+	}
+	if strings.Contains(afterRollbackView, "Restart bv to use the updated binary.") {
+		t.Fatalf("rollback success view must not say 'updated binary':\n%s", afterRollbackView)
+	}
+	if !m.updateAvailable || m.updateTag != "v9.9.9" || m.updateURL != "https://example.com/releases/v9.9.9" {
+		t.Fatalf("expected RollbackCompleteMsg to restore updateAvailable=true tag=v9.9.9, got avail=%v tag=%q url=%q",
+			m.updateAvailable, m.updateTag, m.updateURL)
+	}
+
+	// 4. Ctrl+C while UpdateModal is open must trigger quitCmd instead of being swallowed.
+	_, quitCmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if quitCmd == nil {
+		t.Fatal("expected non-nil quitCmd on Ctrl+C while UpdateModal is open")
 	}
 }

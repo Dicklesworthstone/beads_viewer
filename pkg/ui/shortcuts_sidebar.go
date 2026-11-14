@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -98,6 +99,39 @@ func (s *ShortcutsSidebar) Width() int {
 	return s.width
 }
 
+var sidebarCategoryPriority = map[string]int{
+	"Global":             10,
+	"Help & Global":      12,
+	"Views":              20,
+	"Navigation":         30,
+	"Filtering & Search": 40,
+	"Filters":            45,
+	"Export & Actions":   50,
+	"Actions":            55,
+	"Board":              60,
+	"Graph":              61,
+	"Tree":               62,
+	"Actionable":         63,
+	"Insights":           64,
+	"History":            65,
+	"Flow":               66,
+	"Flow Matrix":        66,
+	"Label":              67,
+	"Labels":             67,
+	"Velocity":           68,
+	"Attention":          69,
+	"Sprint":             70,
+	"Detail":             71,
+	"Other":              999,
+}
+
+func sidebarCategoryRank(cat string) int {
+	if rank, ok := sidebarCategoryPriority[cat]; ok {
+		return rank
+	}
+	return 500
+}
+
 // sectionsFromRegistry builds shortcut sections from the key registry (bv-xl6g).
 // Returns nil if registry is nil or has no bindings for current focus.
 func (s *ShortcutsSidebar) sectionsFromRegistry() []shortcutSection {
@@ -112,7 +146,7 @@ func (s *ShortcutsSidebar) sectionsFromRegistry() []shortcutSection {
 
 	// Group by Category
 	categoryItems := make(map[string][]shortcutItem)
-	categoryOrder := []string{} // Preserve order of first appearance
+	categoryOrder := []string{}
 
 	for _, b := range bindings {
 		cat := b.Category
@@ -128,7 +162,16 @@ func (s *ShortcutsSidebar) sectionsFromRegistry() []shortcutSection {
 		})
 	}
 
-	// Build sections in category order
+	// Order categories deterministically by canonical priority, then alphabetically
+	sort.SliceStable(categoryOrder, func(i, j int) bool {
+		ri, rj := sidebarCategoryRank(categoryOrder[i]), sidebarCategoryRank(categoryOrder[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return categoryOrder[i] < categoryOrder[j]
+	})
+
+	// Build sections in deterministic category order
 	sections := make([]shortcutSection, 0, len(categoryOrder))
 	for _, cat := range categoryOrder {
 		sections = append(sections, shortcutSection{
@@ -149,8 +192,16 @@ func (s *ShortcutsSidebar) allSections() []shortcutSection {
 		return sections
 	}
 
-	// Fallback to hardcoded sections
-	return s.hardcodedSections()
+	// Fallback to hardcoded sections in deterministic priority order
+	sections := s.hardcodedSections()
+	sort.SliceStable(sections, func(i, j int) bool {
+		ri, rj := sidebarCategoryRank(sections[i].title), sidebarCategoryRank(sections[j].title)
+		if ri != rj {
+			return ri < rj
+		}
+		return sections[i].title < sections[j].title
+	})
+	return sections
 }
 
 // hardcodedSections returns the manually maintained shortcut sections.
@@ -220,7 +271,7 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 				{"j/k", "Move ↓/↑"},
 				{"Enter", "Expand/collapse"},
 				{"h/l", "Parent / Child"},
-				{"o/O", "Expand/Collapse all"},
+				{"o/Z", "Expand/Collapse all"},
 				{"gg/G", "Top / Bottom"},
 				{"Tab", "Toggle detail"},
 				{"y", "Copy ID"},
@@ -386,13 +437,17 @@ func (s *ShortcutsSidebar) View() string {
 		Bold(true).
 		MarginTop(1)
 
+	const keyColWidth = 11
 	keyStyle := t.Renderer.NewStyle().
 		Foreground(lipgloss.AdaptiveColor{Light: "#7D56F4", Dark: "#BD93F9"}).
 		Bold(true).
-		Width(8)
+		Width(keyColWidth)
 
+	innerWidth := max(s.width-2, 1)
+	descColWidth := max(innerWidth-keyColWidth, 1)
 	descStyle := t.Renderer.NewStyle().
-		Foreground(t.Base.GetForeground())
+		Foreground(t.Base.GetForeground()).
+		Width(descColWidth)
 
 	dimStyle := t.Renderer.NewStyle().
 		Foreground(ColorFooterHint).
@@ -425,7 +480,7 @@ func (s *ShortcutsSidebar) View() string {
 		sb.WriteString("\n")
 
 		for _, item := range section.items {
-			line := keyStyle.Render(item.key) + descStyle.Render(item.desc)
+			line := lipgloss.JoinHorizontal(lipgloss.Top, keyStyle.Render(item.key), descStyle.Render(item.desc))
 			sb.WriteString(line + "\n")
 		}
 	}
@@ -434,7 +489,6 @@ func (s *ShortcutsSidebar) View() string {
 	// (width minus 1 cell of padding on each side) so a long description that
 	// wraps is counted as the lines it really occupies; otherwise the box grows
 	// past its height and the final MaxHeight clips its bottom border.
-	innerWidth := max(s.width-2, 1)
 	fullContent := t.Renderer.NewStyle().Width(innerWidth).Render(strings.TrimSuffix(sb.String(), "\n"))
 	lines := strings.Split(fullContent, "\n")
 	totalLines := len(lines)
@@ -471,7 +525,8 @@ func (s *ShortcutsSidebar) View() string {
 		if maxScroll > 0 {
 			scrollPercent = s.scrollOffset * 100 / maxScroll
 		}
-		footer = dimStyle.Render(fmt.Sprintf("j/k scroll %d%%", scrollPercent))
+		hint := truncateRunesHelper(fmt.Sprintf("ctrl+j/ctrl+k scroll %d%%", scrollPercent), innerWidth, "…")
+		footer = dimStyle.Render(hint)
 	} else {
 		footer = dimStyle.Render("; hide")
 	}

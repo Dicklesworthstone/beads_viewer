@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"math"
 	"sort"
 	"time"
 
@@ -44,6 +45,11 @@ type SuggestAllConfig struct {
 
 	// FilterBead only includes suggestions for this bead ID
 	FilterBead string
+
+	// CandidateIDs restricts suggestions to in-scope candidate beads when non-empty,
+	// excluding suggestions whose primary target is outside CandidateIDs or that
+	// involve only out-of-scope boundary blockers.
+	CandidateIDs map[string]bool
 }
 
 // DefaultSuggestAllConfig returns sensible defaults with all features enabled
@@ -73,24 +79,78 @@ func GenerateAllSuggestions(issues []model.Issue, config SuggestAllConfig, dataH
 func GenerateAllSuggestionsAt(issues []model.Issue, config SuggestAllConfig, dataHash string, now time.Time) SuggestionSet {
 	var allSuggestions []Suggestion
 
+	dupsCfg := config.Duplicates
+	depsCfg := config.Dependencies
+	labelsCfg := config.Labels
+	cyclesCfg := config.Cycles
+
+	candidateInput := issues
+	if config.CandidateIDs != nil {
+		candidateInput = make([]model.Issue, 0, len(issues))
+		for _, iss := range issues {
+			if config.CandidateIDs[iss.ID] {
+				candidateInput = append(candidateInput, iss)
+			}
+		}
+		// Prevent out-of-scope boundary nodes from exhausting per-detector caps
+		// before FilterSuggestionsByCandidates runs (non-positive caps still disable
+		// the sub-detector per sub-detector contract).
+		if dupsCfg.MaxSuggestions > 0 {
+			dupsCfg.MaxSuggestions = math.MaxInt
+		}
+		if depsCfg.MaxSuggestions > 0 {
+			depsCfg.MaxSuggestions = math.MaxInt
+		}
+		if labelsCfg.MaxTotalSuggestions > 0 {
+			labelsCfg.MaxTotalSuggestions = math.MaxInt
+		}
+		if cyclesCfg.MaxCycles > 0 && cyclesCfg.MaxCycles < len(issues) {
+			cyclesCfg.MaxCycles = len(issues)
+		}
+	}
+
 	// Run enabled detectors
 	if config.EnableDuplicates && (config.FilterType == "" || config.FilterType == SuggestionPotentialDuplicate) {
-		duplicates := DetectDuplicates(issues, config.Duplicates)
+		duplicates := DetectDuplicates(candidateInput, dupsCfg)
+		if config.CandidateIDs != nil {
+			duplicates = FilterSuggestionsByCandidates(duplicates, config.CandidateIDs)
+			if config.Duplicates.MaxSuggestions > 0 && len(duplicates) > config.Duplicates.MaxSuggestions {
+				duplicates = duplicates[:config.Duplicates.MaxSuggestions]
+			}
+		}
 		allSuggestions = append(allSuggestions, duplicates...)
 	}
 
 	if config.EnableDependencies && (config.FilterType == "" || config.FilterType == SuggestionMissingDependency) {
-		dependencies := DetectMissingDependencies(issues, config.Dependencies)
+		dependencies := DetectMissingDependencies(issues, depsCfg)
+		if config.CandidateIDs != nil {
+			dependencies = FilterSuggestionsByCandidates(dependencies, config.CandidateIDs)
+			if config.Dependencies.MaxSuggestions > 0 && len(dependencies) > config.Dependencies.MaxSuggestions {
+				dependencies = dependencies[:config.Dependencies.MaxSuggestions]
+			}
+		}
 		allSuggestions = append(allSuggestions, dependencies...)
 	}
 
 	if config.EnableLabels && (config.FilterType == "" || config.FilterType == SuggestionLabelSuggestion) {
-		labels := SuggestLabels(issues, config.Labels)
+		labels := SuggestLabels(issues, labelsCfg)
+		if config.CandidateIDs != nil {
+			labels = FilterSuggestionsByCandidates(labels, config.CandidateIDs)
+			if config.Labels.MaxTotalSuggestions > 0 && len(labels) > config.Labels.MaxTotalSuggestions {
+				labels = labels[:config.Labels.MaxTotalSuggestions]
+			}
+		}
 		allSuggestions = append(allSuggestions, labels...)
 	}
 
 	if config.EnableCycles && (config.FilterType == "" || config.FilterType == SuggestionCycleWarning) {
-		cycles := DetectCycleWarnings(issues, config.Cycles)
+		cycles := DetectCycleWarnings(issues, cyclesCfg)
+		if config.CandidateIDs != nil {
+			cycles = FilterSuggestionsByCandidates(cycles, config.CandidateIDs)
+			if config.Cycles.MaxCycles > 0 && len(cycles) > config.Cycles.MaxCycles {
+				cycles = cycles[:config.Cycles.MaxCycles]
+			}
+		}
 		allSuggestions = append(allSuggestions, cycles...)
 	}
 
@@ -150,6 +210,49 @@ func GenerateAllSuggestionsAt(issues []model.Issue, config SuggestAllConfig, dat
 		filtered[i].GeneratedAt = now
 	}
 	return NewSuggestionSetAt(filtered, dataHash, now)
+}
+
+// FilterSuggestionsByCandidates excludes suggestions outside candidateIDs when
+// candidateIDs is non-nil (nil allows all issues; an empty map allows none):
+//   - cycle warnings require at least one cycle participant to be a candidate
+//     (excluding cycles formed solely by out-of-scope boundary blockers);
+//   - all other suggestion types require their primary TargetBead (and any
+//     non-empty RelatedBead) to be candidates.
+func FilterSuggestionsByCandidates(suggestions []Suggestion, candidateIDs map[string]bool) []Suggestion {
+	if candidateIDs == nil {
+		return suggestions
+	}
+	out := make([]Suggestion, 0, len(suggestions))
+	for _, sug := range suggestions {
+		if suggestionMatchesCandidates(sug, candidateIDs) {
+			out = append(out, sug)
+		}
+	}
+	return out
+}
+
+func suggestionMatchesCandidates(sug Suggestion, candidateIDs map[string]bool) bool {
+	if candidateIDs == nil {
+		return true
+	}
+	switch sug.Type {
+	case SuggestionCycleWarning:
+		if candidateIDs[sug.TargetBead] || (sug.RelatedBead != "" && candidateIDs[sug.RelatedBead]) {
+			return true
+		}
+		if rawPath, ok := sug.Metadata["cycle_path"]; ok {
+			if path, ok := rawPath.([]string); ok {
+				for _, id := range path {
+					if candidateIDs[id] {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	default:
+		return candidateIDs[sug.TargetBead] && (sug.RelatedBead == "" || candidateIDs[sug.RelatedBead])
+	}
 }
 
 // RobotSuggestOutput is the JSON output structure for --robot-suggest

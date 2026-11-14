@@ -572,11 +572,58 @@ func rewriteAgentIntentArgs(args []string) []string {
 		return rewritten
 	}
 
-	rewritten := rewriteAgentIntentFlagAliases(args, "")
+	rewritten := rewriteAgentIntentFlagAliases(args, inferAgentFlagContext(args))
 	if containsAgentStructuredOutputAlias(args) && !hasPrimaryRobotArg(rewritten) && !hasNonRobotPrimaryArg(rewritten) {
 		return append([]string{"--robot-triage"}, rewritten...)
 	}
 	return rewritten
+}
+
+func inferAgentFlagContext(args []string) string {
+	hasEmitScript := false
+	hasTriage := false
+	detected := ""
+	for _, raw := range args {
+		if !strings.HasPrefix(raw, "-") {
+			continue
+		}
+		name := strings.TrimLeft(raw, "-")
+		if eq := strings.IndexByte(name, '='); eq >= 0 {
+			name = name[:eq]
+		}
+		switch strings.ToLower(name) {
+		case "emit-script":
+			hasEmitScript = true
+		case "robot-triage", "robot-triage-by-track", "robot-triage-by-label":
+			hasTriage = true
+		case "robot-next":
+			detected = "next"
+		case "search", "robot-search":
+			detected = "search"
+		case "robot-history", "bead-history":
+			detected = "history"
+		case "robot-causality":
+			detected = "causality"
+		case "robot-impact":
+			detected = "impact"
+		case "robot-impact-network":
+			detected = "impact-network"
+		case "robot-label-attention":
+			detected = "label-attention"
+		case "robot-file-beads":
+			detected = "file-beads"
+		case "robot-file-hotspots":
+			detected = "file-hotspots"
+		case "robot-related":
+			detected = "related"
+		case "robot-file-relations":
+			detected = "file-relations"
+		}
+	}
+	if hasEmitScript && !hasTriage {
+		return "emit-script"
+	}
+	return detected
 }
 
 func rewriteAgentIntentCommand(args []string) ([]string, bool) {
@@ -975,12 +1022,14 @@ func limitFlagForAgentContext(context string) string {
 		return "--file-beads-limit"
 	case "file-hotspots":
 		return "--hotspots-limit"
-	case "history":
+	case "history", "causality", "impact", "impact-network":
 		return "--history-limit"
 	case "related":
 		return "--related-max-results"
 	case "file-relations":
 		return "--relations-limit"
+	case "emit-script":
+		return "--script-limit"
 	default:
 		return "--robot-max-results"
 	}
@@ -1636,6 +1685,7 @@ func main() {
 	agentsRemove := flag.Bool("agents-remove", false, "Remove beads workflow instructions from AGENTS.md")
 	agentsUpdate := flag.Bool("agents-update", false, "Update beads workflow instructions to latest version")
 	agentsCheck := flag.Bool("agents-check", false, "Check AGENTS.md blurb status (default if no --agents-* action)")
+	agentsReset := flag.Bool("agents-reset", false, "Clear saved AGENTS.md prompt preference")
 	agentsDryRun := flag.Bool("agents-dry-run", false, "Show what would happen without executing (use with --agents-*)")
 	agentsForce := flag.Bool("agents-force", false, "Skip confirmation prompts (use with --agents-*)")
 	var recipeLoader *recipe.Loader
@@ -1731,6 +1781,7 @@ func main() {
 		HistoryTimeoutMs:        robotHistoryTimeoutMs,
 		HistorySince:            historySince,
 		MinConfidence:           minConfidence,
+		RobotMinConf:            robotMinConf,
 		AttentionLimit:          attentionLimit,
 		RelationsThreshold:      relationsThreshold,
 		RelationsLimit:          relationsLimit,
@@ -1747,8 +1798,8 @@ func main() {
 		{Name: "format", FlagName: "format", FlagPtr: outputFormat, IsModifier: true, Description: "Structured output format for robot commands (json|toon)"},
 		{Name: "brief", FlagName: "brief", FlagPtr: robotTriageBrief, IsModifier: true, Description: "Emit compact decision-only triage payload (with --robot-triage)"},
 		{Name: "robot-include-inactive", FlagName: "robot-include-inactive", FlagPtr: robotIncludeInactive, IsModifier: true, Description: "Include non-actionable or historical issues in diagnostics"},
-		{Name: "robot-max-results", FlagName: "robot-max-results", FlagPtr: robotMaxResults, IsModifier: true, Description: "Cap recommendations returned by --robot-triage or --robot-priority"},
-		{Name: "robot-min-confidence", FlagName: "robot-min-confidence", FlagPtr: robotMinConf, IsModifier: true, Description: "Filter --robot-priority recommendations by minimum confidence (0.0-1.0)"},
+		{Name: "robot-max-results", FlagName: "robot-max-results", FlagPtr: robotMaxResults, IsModifier: true, Description: "Cap items returned by list-producing robot commands"},
+		{Name: "robot-min-confidence", FlagName: "robot-min-confidence", FlagPtr: robotMinConf, IsModifier: true, Description: "Filter robot recommendations or correlations by minimum confidence (0.0-1.0)"},
 		{Name: "robot-by-label", FlagName: "robot-by-label", FlagPtr: robotByLabel, IsModifier: true, Description: "Filter --robot-priority recommendations by label"},
 		{Name: "robot-by-assignee", FlagName: "robot-by-assignee", FlagPtr: robotByAssignee, IsModifier: true, Description: "Filter --robot-priority recommendations by assignee"},
 		{Name: "schema-command", FlagName: "schema-command", FlagPtr: schemaCommand, IsModifier: true, Description: "Output JSON Schema for a single robot command (with --robot-schema)"},
@@ -1797,8 +1848,8 @@ func main() {
 		}
 
 		modifierRules := []modifierFlagRule{
-			{modifier: "trust-hooks", requires: []string{"export", "export-md", "export-pages"}},
-			{modifier: "hook-env", requires: []string{"export", "export-md", "export-pages"}},
+			{modifier: "trust-hooks", requires: []string{"export", "export-md", "export-pages", "export-graph", "priority-brief", "agent-brief", "pages"}},
+			{modifier: "hook-env", requires: []string{"export", "export-md", "export-pages", "export-graph", "priority-brief", "agent-brief", "pages"}},
 			{modifier: "export-format", requires: []string{"export", "export-md"}},
 			{modifier: "export-include-graph", requires: []string{"export", "export-md"}},
 			{modifier: "export-template", requires: []string{"export", "export-md"}},
@@ -1825,7 +1876,13 @@ func main() {
 			{modifier: "profile-json", requires: []string{"profile-startup"}},
 			{modifier: "robot-drift", requires: []string{"check-drift"}},
 			{modifier: "history-since", requires: []string{"robot-history", "bead-history", "robot-causality"}},
-			{modifier: "history-limit", requires: []string{"robot-history", "bead-history", "robot-causality"}},
+			{modifier: "history-limit", requires: []string{
+				"robot-history", "bead-history", "robot-causality",
+				"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
+				"robot-orphans", "robot-file-beads", "robot-file-hotspots", "robot-impact",
+				"robot-file-relations", "robot-related", "robot-impact-network",
+				"export-pages", "pages", "export-graph", "emit-script", "priority-brief", "agent-brief",
+			}},
 			{modifier: "brief", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label"}},
 			{modifier: "robot-include-inactive", requires: []string{
 				"robot-triage", "robot-triage-by-track", "robot-triage-by-label",
@@ -1833,7 +1890,19 @@ func main() {
 				"emit-script", "agent-brief", "priority-brief",
 				"export-pages", "pages", "export-graph",
 			}},
-			{modifier: "robot-history-timeout-ms", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
+			{modifier: "robot-max-results", requires: []string{
+				"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
+				"robot-priority", "robot-insights", "robot-plan",
+				"robot-alerts", "robot-suggest", "robot-orphans",
+				"emit-script", "agent-brief",
+			}},
+			{modifier: "robot-min-confidence", requires: []string{
+				"robot-priority", "robot-suggest", "robot-history", "bead-history",
+			}},
+			{modifier: "robot-history-timeout-ms", requires: []string{
+				"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
+				"export-pages", "emit-script", "priority-brief", "agent-brief",
+			}},
 			{modifier: "robot-not-ready-labels", requires: []string{
 				"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
 				"emit-script", "priority-brief", "agent-brief", "export-pages", "pages", "export-graph",
@@ -1948,9 +2017,17 @@ func main() {
 		// Inspection is deliberately independent of issue loading and never
 		// expands YAML values against the invoking user's environment.
 		if *hooksInfo {
-			hookDir, dirErr := resolveCLIProjectDir()
-			if dirErr != nil {
-				return fmt.Errorf("getting project directory: %w", dirErr)
+			var hookDir string
+			if *workspaceConfig != "" {
+				hookDir = workspace.ResolveWorkspaceBaseDir(*workspaceConfig)
+			} else if foundWS := discoverWorkspaceConfig(); foundWS != "" {
+				hookDir = workspace.ResolveWorkspaceBaseDir(foundWS)
+			} else {
+				var dirErr error
+				hookDir, dirErr = resolveCLIProjectDir()
+				if dirErr != nil {
+					return fmt.Errorf("getting project directory: %w", dirErr)
+				}
 			}
 			hookLoader := hooks.NewLoader(hooks.WithProjectDir(hookDir))
 			if err := hookLoader.Load(); err != nil {
@@ -2195,7 +2272,7 @@ func main() {
 		}
 
 		// Handle --agents-* commands (bv-105)
-		agentsAnyAction := *agentsAdd || *agentsRemove || *agentsUpdate || *agentsCheck
+		agentsAnyAction := *agentsAdd || *agentsRemove || *agentsUpdate || *agentsCheck || *agentsReset
 		agentsAnyFlag := agentsAnyAction || *agentsDryRun || *agentsForce
 		if agentsAnyFlag {
 			workDir, err := os.Getwd()
@@ -2205,7 +2282,7 @@ func main() {
 			}
 
 			// Default to check mode when no explicit action
-			isCheck := !*agentsAdd && !*agentsRemove && !*agentsUpdate
+			isCheck := !*agentsAdd && !*agentsRemove && !*agentsUpdate && !*agentsReset
 
 			detection := agents.DetectAgentFileInParents(workDir, 3)
 
@@ -2216,6 +2293,47 @@ func main() {
 					os.Exit(1)
 				}
 				os.Exit(exitCode)
+			}
+
+			if *agentsReset {
+				prefDir := workDir
+				if detection.Found() {
+					prefDir = filepath.Dir(detection.FilePath)
+				}
+				if *agentsDryRun {
+					if robotMode {
+						emitAgentsRobot(map[string]interface{}{
+							"action":   "reset",
+							"dry_run":  true,
+							"work_dir": prefDir,
+						}, 0)
+					}
+					fmt.Printf("[dry-run] Would clear AGENTS.md prompt preference for %s\n", prefDir)
+					os.Exit(0)
+				}
+				if err := agents.ClearPreference(prefDir); err != nil {
+					if robotMode {
+						emitAgentsRobot(map[string]interface{}{
+							"action":   "reset",
+							"error":    err.Error(),
+							"work_dir": prefDir,
+						}, 1)
+					}
+					fmt.Fprintf(os.Stderr, "Error clearing AGENTS.md prompt preference: %v\n", err)
+					os.Exit(1)
+				}
+				if prefDir != workDir {
+					_ = agents.ClearPreference(workDir)
+				}
+				if robotMode {
+					emitAgentsRobot(map[string]interface{}{
+						"action":   "reset",
+						"cleared":  true,
+						"work_dir": prefDir,
+					}, 0)
+				}
+				fmt.Printf("✓ Cleared AGENTS.md prompt preference for %s\n", prefDir)
+				os.Exit(0)
 			}
 
 			if isCheck || *agentsCheck {
@@ -2757,6 +2875,7 @@ func main() {
 		robotDispatchContext.WorkDir = projectDir
 		robotDispatchContext.ProjectDir = projectDir
 		robotDispatchContext.BaselinePath = baselinePath
+		robotDispatchContext.HistoryLimit = *historyLimit
 		robotDispatchContext.EnvRobot = envRobot
 
 		// Handle --baseline-info
@@ -2985,7 +3104,7 @@ func main() {
 		// The TUI retains source rows for its recipe picker. Robot and export
 		// consumers apply the recipe before producing their output.
 		recipeForScope := activeRecipe
-		if !(envRobot || *exportFile != "" || *exportReport != "" || *exportPages != "" || *exportGraph != "" ||
+		if !(envRobot || *exportFile != "" || *exportReport != "" || *exportPages != "" || *pagesWizard || *exportGraph != "" ||
 			*priorityBrief != "" || *agentBrief != "" || *emitScript || *semanticQuery != "" ||
 			*checkDrift || *saveBaseline != "" || *diffSince != "") {
 			recipeForScope = nil
@@ -3121,6 +3240,9 @@ func main() {
 				}
 			}
 			results = promoteExactSearchResult(exactID, results)
+			if searchCfg.Mode != search.SearchModeHybrid && len(results) > limit {
+				results = results[:limit]
+			}
 
 			titleByID := make(map[string]string, len(issuesForSearch))
 			for _, iss := range issuesForSearch {
@@ -3246,7 +3368,7 @@ func main() {
 
 		// Handle --pages wizard (bv-10g)
 		if *pagesWizard {
-			if err := runPagesWizard(beadsPath, *robotIncludeInactive, *forceFullAnalysis, *robotNotReadyLabels); err != nil {
+			if err := runPagesWizard(beadsPath, robotDispatchContext, activeRecipe, *robotIncludeInactive, *forceFullAnalysis, *robotNotReadyLabels, *noHooks, hookOptions); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
@@ -3276,12 +3398,12 @@ func main() {
 				}
 				fmt.Printf("  → Loading %d issues\n", len(allIssues))
 
-				// Filter closed issues if not requested
+				// Filter closed and tombstone issues if not requested
 				exportIssues := allIssues
 				if !*pagesIncludeClosed {
 					var openIssues []model.Issue
 					for _, issue := range allIssues {
-						if issue.Status != model.StatusClosed {
+						if !issue.Status.IsClosed() && !issue.Status.IsTombstone() {
 							openIssues = append(openIssues, issue)
 						}
 					}
@@ -3351,18 +3473,20 @@ func main() {
 					suppressUnprovenTriageClaims(&triage)
 				}
 
-				// Extract dependencies
+				// Extract all dependencies (blocking + non-blocking such as parent-child, related, discovered-from)
 				var deps []*model.Dependency
 				for i := range exportIssues {
 					issue := &exportIssues[i]
 					for _, dep := range issue.Dependencies {
-						if dep == nil || !dep.Type.IsBlocking() {
+						if dep == nil {
 							continue
 						}
 						deps = append(deps, &model.Dependency{
 							IssueID:     issue.ID,
 							DependsOnID: dep.DependsOnID,
 							Type:        dep.Type,
+							CreatedAt:   dep.CreatedAt,
+							CreatedBy:   dep.CreatedBy,
 						})
 					}
 				}
@@ -3404,7 +3528,7 @@ func main() {
 				// Export history data for time-travel feature (bv-z38b)
 				if *pagesIncludeHistory {
 					fmt.Println("  → Generating time-travel history data...")
-					if historyReport, err := generateHistoryForExport(allIssues); err == nil && historyReport != nil {
+					if historyReport, err := generateHistoryForExportContext(exportContext); err == nil && historyReport != nil {
 						if historyJSON, err := json.MarshalIndent(historyReport, "", "  "); err == nil {
 							if err := bundle.WriteFile("data/history.json", historyJSON, 0644); err != nil {
 								fmt.Printf("  → Warning: failed to write history.json: %v\n", err)
@@ -3739,6 +3863,51 @@ func main() {
 				os.Exit(1)
 			}
 
+			// Get project name from canonical project directory
+			projectName := "project"
+			if projectDir != "" {
+				projectName = filepath.Base(projectDir)
+			}
+
+			graphFormatName := strings.TrimPrefix(strings.ToLower(filepath.Ext(*exportGraph)), ".")
+			if graphFormatName == "" || *exportGraph == "html" || *exportGraph == "interactive" {
+				graphFormatName = "html"
+			}
+			resolvedGraphExportPath := *exportGraph
+			if *exportGraph == "html" || *exportGraph == "interactive" {
+				resolvedGraphExportPath = export.GenerateInteractiveGraphFilename(projectName)
+			}
+			graphHookExecutor, hookErr := hooks.RunHooks(projectDir, hooks.ExportContext{
+				ExportPath:   resolvedGraphExportPath,
+				ExportFormat: graphFormatName,
+				IssueCount:   len(exportIssues),
+				Timestamp:    robotNow(),
+			}, *noHooks, hookOptions)
+			if hookErr != nil {
+				return hookErr
+			}
+			if graphHookExecutor != nil {
+				graphHookExecutor.SetLogger(func(msg string) {
+					fmt.Printf("  → %s\n", msg)
+				})
+				if err := graphHookExecutor.RunPreExport(); err != nil {
+					return fmt.Errorf("pre-export hook failed: %w", err)
+				}
+			}
+			runGraphPostHooks := func(writtenPath string) {
+				if graphHookExecutor == nil {
+					return
+				}
+				postErr := graphHookExecutor.RunPostExport()
+				if len(graphHookExecutor.Results()) > 0 {
+					fmt.Println(graphHookExecutor.Summary())
+				}
+				if postErr != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v (export written to %s)\n", postErr, writtenPath)
+					os.Exit(1)
+				}
+			}
+
 			analyzer := analysis.NewAnalyzer(exportIssues)
 			analyzer.SetNow(robotNow())
 			analyzer.SetReadinessScope(robotDispatchContext.Readiness, robotDispatchContext.CandidateIDs)
@@ -3748,12 +3917,6 @@ func main() {
 			}
 			stats := analyzer.Analyze()
 
-			// Get project name from canonical project directory
-			projectName := "project"
-			if projectDir != "" {
-				projectName = filepath.Base(projectDir)
-			}
-
 			// Check if HTML export requested (interactive graph)
 			if strings.HasSuffix(strings.ToLower(*exportGraph), ".html") || *exportGraph == "html" || *exportGraph == "interactive" {
 				title := *graphTitle
@@ -3762,11 +3925,19 @@ func main() {
 				}
 
 				var historyReport *correlation.HistoryReport
-				if projectDir != "" && correlation.ValidateRepository(projectDir) == nil {
+				graphBeadsDir := ""
+				if projectDir != "" {
+					graphBeadsDir, _ = loader.GetBeadsDir(projectDir)
+				}
+				if (projectDir != "" && correlation.ValidateRepositoryWithBeadsDir(projectDir, graphBeadsDir) == nil) || robotDispatchContext.SourceKind == "workspace" {
 					correlation.SetDiskCacheEnabled(true)
 					historyCtx := robotDispatchContext
 					historyCtx.Issues = exportIssues
-					if report, err := generateCorrelationReportForContext(historyCtx, projectDir, correlation.CorrelatorOptions{Limit: timeTravelCommitLimit}); err == nil {
+					graphHistLimit := timeTravelCommitLimit
+					if *historyLimit > 0 {
+						graphHistLimit = *historyLimit
+					}
+					if report, err := generateCorrelationReportForContext(historyCtx, projectDir, correlation.CorrelatorOptions{Limit: graphHistLimit, Revision: robotDispatchContext.AsOfCommit}); err == nil {
 						historyReport = report
 					}
 				}
@@ -3800,19 +3971,16 @@ func main() {
 					History:       historyReport,
 					Title:         title,
 					DataHash:      dataHash,
-					Path:          *exportGraph,
+					Path:          resolvedGraphExportPath,
 					ProjectName:   projectName,
 					RobotEnvelope: envelope,
-				}
-				// Auto-generate filename if just "html" or "interactive"
-				if *exportGraph == "html" || *exportGraph == "interactive" {
-					opts.Path = ""
 				}
 				outputPath, err := export.GenerateInteractiveGraphHTML(opts)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error exporting interactive graph: %v\n", err)
 					os.Exit(1)
 				}
+				runGraphPostHooks(outputPath)
 				fmt.Printf("✓ Interactive graph exported to %s (%d nodes, %d edges)\n", outputPath, len(exportIssues), stats.EdgeCount)
 				os.Exit(0)
 			}
@@ -3832,6 +4000,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error exporting graph snapshot: %v\n", err)
 				os.Exit(1)
 			}
+			runGraphPostHooks(*exportGraph)
 
 			fmt.Printf("✓ Graph exported to %s (%d nodes) - tip: use .html for interactive graphs\n", *exportGraph, len(exportIssues))
 			os.Exit(0)
@@ -3873,7 +4042,7 @@ func main() {
 			}
 
 			// Get cycles (method returns a copy)
-			cycles := stats.Cycles()
+			cycles := filterCyclesForCandidates(stats.Cycles(), robotDispatchContext.CandidateIDs)
 
 			// Build GraphStats from analysis
 			graphStats := baseline.GraphStats{
@@ -3890,11 +4059,11 @@ func main() {
 			// Build TopMetrics from analysis (top 10 for each)
 			// Methods return copies of the maps
 			topMetrics := baseline.TopMetrics{
-				PageRank:     buildMetricItems(stats.PageRank(), 10),
-				Betweenness:  buildMetricItems(stats.Betweenness(), 10),
-				CriticalPath: buildMetricItems(stats.CriticalPathScore(), 10),
-				Hubs:         buildMetricItems(stats.Hubs(), 10),
-				Authorities:  buildMetricItems(stats.Authorities(), 10),
+				PageRank:     buildScopedMetricItems(stats.PageRank(), 10, robotDispatchContext.CandidateIDs),
+				Betweenness:  buildScopedMetricItems(stats.Betweenness(), 10, robotDispatchContext.CandidateIDs),
+				CriticalPath: buildScopedMetricItems(stats.CriticalPathScore(), 10, robotDispatchContext.CandidateIDs),
+				Hubs:         buildScopedMetricItems(stats.Hubs(), 10, robotDispatchContext.CandidateIDs),
+				Authorities:  buildScopedMetricItems(stats.Authorities(), 10, robotDispatchContext.CandidateIDs),
 			}
 
 			bl := baseline.NewForDir(projectDir, graphStats, topMetrics, cycles, *saveBaseline)
@@ -3949,7 +4118,7 @@ func main() {
 					openCount++
 				}
 			}
-			cycles := stats.Cycles()
+			cycles := filterCyclesForCandidates(stats.Cycles(), robotDispatchContext.CandidateIDs)
 
 			// Build current snapshot as baseline for comparison
 			currentStats := baseline.GraphStats{
@@ -3963,11 +4132,11 @@ func main() {
 				ActionableCount: partition.Actionable,
 			}
 			currentMetrics := baseline.TopMetrics{
-				PageRank:     buildMetricItems(stats.PageRank(), 10),
-				Betweenness:  buildMetricItems(stats.Betweenness(), 10),
-				CriticalPath: buildMetricItems(stats.CriticalPathScore(), 10),
-				Hubs:         buildMetricItems(stats.Hubs(), 10),
-				Authorities:  buildMetricItems(stats.Authorities(), 10),
+				PageRank:     buildScopedMetricItems(stats.PageRank(), 10, robotDispatchContext.CandidateIDs),
+				Betweenness:  buildScopedMetricItems(stats.Betweenness(), 10, robotDispatchContext.CandidateIDs),
+				CriticalPath: buildScopedMetricItems(stats.CriticalPathScore(), 10, robotDispatchContext.CandidateIDs),
+				Hubs:         buildScopedMetricItems(stats.Hubs(), 10, robotDispatchContext.CandidateIDs),
+				Authorities:  buildScopedMetricItems(stats.Authorities(), 10, robotDispatchContext.CandidateIDs),
 			}
 			current := baseline.NewForDir(projectDir, currentStats, currentMetrics, cycles, "current")
 
@@ -4023,6 +4192,9 @@ func main() {
 
 			// Determine script limit
 			limit := *scriptLimit
+			if !flag.CommandLine.Changed("script-limit") && *robotMaxResults > 0 {
+				limit = *robotMaxResults
+			}
 			if limit <= 0 {
 				limit = 5
 			}
@@ -4126,6 +4298,23 @@ func main() {
 
 		// Handle --priority-brief flag (bv-96)
 		if *priorityBrief != "" {
+			briefHookExecutor, hookErr := hooks.RunHooks(projectDir, hooks.ExportContext{
+				ExportPath:   *priorityBrief,
+				ExportFormat: "markdown",
+				IssueCount:   len(issues),
+				Timestamp:    robotNow(),
+			}, *noHooks, hookOptions)
+			if hookErr != nil {
+				return hookErr
+			}
+			if briefHookExecutor != nil {
+				briefHookExecutor.SetLogger(func(msg string) {
+					fmt.Printf("  → %s\n", msg)
+				})
+				if err := briefHookExecutor.RunPreExport(); err != nil {
+					return fmt.Errorf("pre-export hook failed: %w", err)
+				}
+			}
 			fmt.Printf("Generating priority brief to %s...\n", *priorityBrief)
 			_, briefFeedbackWeights := loadRobotFeedbackForContext(robotDispatchContext)
 			briefHistory, briefHistoryStatus := loadTriageHistoryForContext(robotDispatchContext, phaseThreeRobotHandlerConfig{
@@ -4171,6 +4360,16 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error writing priority brief: %v\n", err)
 				os.Exit(1)
 			}
+			if briefHookExecutor != nil {
+				postErr := briefHookExecutor.RunPostExport()
+				if len(briefHookExecutor.Results()) > 0 {
+					fmt.Println(briefHookExecutor.Summary())
+				}
+				if postErr != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v (export written to %s)\n", postErr, *priorityBrief)
+					os.Exit(1)
+				}
+			}
 
 			fmt.Printf("Done! Priority brief saved to %s\n", *priorityBrief)
 			os.Exit(0)
@@ -4178,12 +4377,29 @@ func main() {
 
 		// Handle --agent-brief flag (bv-131)
 		if *agentBrief != "" {
-			fmt.Printf("Generating agent brief bundle to %s/...\n", *agentBrief)
-
 			if st, lErr := os.Lstat(filepath.Clean(*agentBrief)); lErr == nil && st.Mode()&os.ModeSymlink != 0 {
 				fmt.Fprintf(os.Stderr, "Error creating directory: refusing symlink output directory %s\n", *agentBrief)
 				os.Exit(1)
 			}
+			agentHookExecutor, hookErr := hooks.RunHooks(projectDir, hooks.ExportContext{
+				ExportPath:   *agentBrief,
+				ExportFormat: "bundle",
+				IssueCount:   len(issues),
+				Timestamp:    robotNow(),
+			}, *noHooks, hookOptions)
+			if hookErr != nil {
+				return hookErr
+			}
+			if agentHookExecutor != nil {
+				agentHookExecutor.SetLogger(func(msg string) {
+					fmt.Printf("  → %s\n", msg)
+				})
+				if err := agentHookExecutor.RunPreExport(); err != nil {
+					return fmt.Errorf("pre-export hook failed: %w", err)
+				}
+			}
+			fmt.Printf("Generating agent brief bundle to %s/...\n", *agentBrief)
+
 			// Create output directory
 			if err := os.MkdirAll(*agentBrief, 0755); err != nil {
 				fmt.Fprintf(os.Stderr, "Error creating directory: %v\n", err)
@@ -4226,18 +4442,10 @@ func main() {
 			}
 			fmt.Println("  → triage.json")
 
-			// Generate insights
-			analyzer := robotDispatchContext.Analyzer()
-			analyzer.SetNow(robotNow())
-			if *forceFullAnalysis {
-				fullCfg := analysis.FullAnalysisConfig()
-				analyzer.SetConfig(&fullCfg)
-			}
-			stats := analyzer.Analyze()
-			insights := stats.GenerateInsights(50)
-			insightsPayload, err := withEnvelope(robotDispatchContext.Envelope(), insights)
+			// Generate insights (matching --robot-insights scoping, velocity, and full_stats)
+			insightsPayload, err := buildRobotInsightsPayload(robotDispatchContext, *robotIncludeInactive, *forceFullAnalysis, *robotMaxResults)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error encoding insights authority: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error generating insights: %v\n", err)
 				os.Exit(1)
 			}
 			insightsJSON, err := json.MarshalIndent(insightsPayload, "", "  ")
@@ -4277,13 +4485,17 @@ func main() {
 			fmt.Println("  → helpers.md")
 
 			// Generate meta.json with hash and config
+			scopedIssueCount := len(issues)
+			if candidateIDs != nil {
+				scopedIssueCount = len(candidateIDs)
+			}
 			meta := struct {
 				RobotEnvelope
 				IssueCount int      `json:"issue_count"`
 				Files      []string `json:"files"`
 			}{
 				RobotEnvelope: robotDispatchContext.Envelope(),
-				IssueCount:    len(issues),
+				IssueCount:    scopedIssueCount,
 				Files:         []string{"triage.json", "insights.json", "brief.md", "helpers.md", "meta.json"},
 			}
 			metaJSON, _ := json.MarshalIndent(meta, "", "  ")
@@ -4292,6 +4504,17 @@ func main() {
 				os.Exit(1)
 			}
 			fmt.Println("  → meta.json")
+
+			if agentHookExecutor != nil {
+				postErr := agentHookExecutor.RunPostExport()
+				if len(agentHookExecutor.Results()) > 0 {
+					fmt.Println(agentHookExecutor.Summary())
+				}
+				if postErr != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v (export written to %s)\n", postErr, *agentBrief)
+					os.Exit(1)
+				}
+			}
 
 			fmt.Printf("\nDone! Agent brief bundle saved to %s/\n", *agentBrief)
 			os.Exit(0)
@@ -4400,9 +4623,9 @@ func main() {
 				revision = *diffSince
 			}
 
-			// Create snapshots
-			fromSnapshot := analysis.NewSnapshotAt(fromIssues, time.Time{}, revision)
-			toSnapshot := analysis.NewSnapshot(toIssues)
+			// Create snapshots (honoring SOURCE_DATE_EPOCH via robotNow() and --force-full-analysis)
+			fromSnapshot := newScopedSnapshotForCLI(fromIssues, historicalCtx.Readiness, nil, time.Time{}, revision, *forceFullAnalysis)
+			toSnapshot := newScopedSnapshotForCLI(toIssues, readiness, nil, robotNow(), "HEAD", *forceFullAnalysis)
 
 			// Compute diff
 			diff := analysis.CompareSnapshots(fromSnapshot, toSnapshot)
@@ -4573,6 +4796,12 @@ func main() {
 			}
 		}
 
+		// Scoped single-repo sessions (--label / --repo) use sourceReload to
+		// recompute CLI CandidateIDs and full-source Readiness on every file change.
+		if workspaceInfo == nil && (*labelScope != "" || *repoFilter != "") {
+			_ = os.Setenv("BV_BACKGROUND_MODE", "0")
+		}
+
 		// Initial Model with live reload support
 		m := ui.NewModel(issues, activeRecipe, beadsPath, ui.ReadinessScope{Authority: readiness, CandidateIDs: candidateIDs})
 		if projectDir != "" {
@@ -4596,6 +4825,12 @@ func main() {
 					return ui.SourceReloadResult{}, fmt.Errorf("resolve workspace reload path: %w", pathErr)
 				}
 				return reloadWorkspaceForUI(ctx, reloadPath, reloadLabel, reloadRepo)
+			})
+		} else if beadsPath != "" && (*labelScope != "" || *repoFilter != "") {
+			boundSource := singleSourceLoad.Source
+			reloadLabel, reloadRepo := *labelScope, *repoFilter
+			m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
+				return reloadSingleRepoForUI(ctx, boundSource, reloadLabel, reloadRepo)
 			})
 		}
 
@@ -4945,6 +5180,7 @@ func formatCycle(cycle []string) string {
 // may seed its unfiltered hash only when it describes exactly ctx.Issues.
 func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error) {
 	fullSource := ctx.Issues
+	ctx.FullIssues = fullSource
 	ctx.CandidateIDs = nil
 	ctx.LabelContext = nil
 	if ctx.Repo != "" {
@@ -4991,6 +5227,15 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 		applied, err := recipe.Apply(recipeIssues, metrics, r, robotNow())
 		if err != nil {
 			return RobotContext{}, fmt.Errorf("recipe %s: %w", r.Name, err)
+		}
+		if ctx.CandidateIDs != nil {
+			nextCandidates := make(map[string]bool, len(applied))
+			for _, iss := range applied {
+				if ctx.CandidateIDs[iss.ID] {
+					nextCandidates[iss.ID] = true
+				}
+			}
+			ctx.CandidateIDs = nextCandidates
 		}
 		ctx.Issues = applied
 		ctx.DataHashMatchesIssues = false
@@ -5070,6 +5315,84 @@ func reloadWorkspaceForUI(ctx context.Context, configPath, label, repo string) (
 	}, nil
 }
 
+func newSnapshotForCLI(issues []model.Issue, timestamp time.Time, revision string, forceFullAnalysis bool) *analysis.Snapshot {
+	return newScopedSnapshotForCLI(issues, nil, nil, timestamp, revision, forceFullAnalysis)
+}
+
+func newScopedSnapshotForCLI(issues []model.Issue, readiness *model.ReadinessIndex, candidateIDs map[string]bool, timestamp time.Time, revision string, forceFullAnalysis bool) *analysis.Snapshot {
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
+	analyzer := analysis.NewAnalyzer(issues)
+	analyzer.SetReadinessScope(readiness, candidateIDs)
+	refTime := timestamp
+	if refTime.IsZero() {
+		refTime = robotNow()
+	}
+	analyzer.SetNow(refTime)
+	if forceFullAnalysis {
+		fullCfg := analysis.FullAnalysisConfig()
+		analyzer.SetConfig(&fullCfg)
+	}
+	stats := analyzer.Analyze()
+	snap := &analysis.Snapshot{
+		Timestamp: timestamp,
+		Revision:  revision,
+		Issues:    issues,
+		Stats:     &stats,
+	}
+	snap.ComputeScopedCounts(readiness, refTime, analyzer.IsCandidate)
+	return snap
+}
+
+func reloadSingleRepoForUI(ctx context.Context, source datasource.DataSource, label, repo string) (ui.SourceReloadResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ui.SourceReloadResult{}, err
+	}
+	if source.Type == datasource.SourceTypeSQLite {
+		if err := datasource.ValidateSource(&source); err != nil {
+			return ui.SourceReloadResult{}, fmt.Errorf("reload beads source: %w", err)
+		}
+	}
+	loaded, err := datasource.LoadFromSource(source)
+	if err != nil {
+		return ui.SourceReloadResult{}, fmt.Errorf("reload beads source: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return ui.SourceReloadResult{}, err
+	}
+	authority := newRobotSourceAuthority([]RobotSourceReport{robotSourceFromLoad(loaded, nil)})
+	var warnings []string
+	for _, src := range authority.Sources {
+		if src.Error != "" {
+			warnings = append(warnings, boundedSourceMessage(src.Error))
+		}
+		for _, w := range src.Warnings {
+			warnings = append(warnings, boundedSourceMessage(w))
+		}
+	}
+	if !authority.ClaimSafe {
+		for i := range loaded.Issues {
+			if loaded.Issues[i].Origin != nil {
+				loaded.Issues[i].Origin.ReadOnlyReason = "source authority is incomplete or stale"
+			}
+		}
+	}
+	readiness := model.NewReadinessIndex(issuesWithTombstones(loaded.Issues, loaded.Report.TombstoneIDs))
+	scoped, err := scopeLoadedIssues(RobotContext{
+		Issues: loaded.Issues, Readiness: readiness, LabelScope: label, Repo: repo,
+	}, nil)
+	if err != nil {
+		return ui.SourceReloadResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return ui.SourceReloadResult{}, err
+	}
+	return ui.SourceReloadResult{
+		Issues: scoped.Issues, Authority: readiness, CandidateIDs: scoped.CandidateIDs, Warnings: warnings,
+	}, nil
+}
+
 // applyRecipe is the CLI's entry point into the shared recipe engine
 // (recipe.Apply): it narrows and orders issues with r, computing graph metrics
 // and triage scores only when r's sort chain reads them. The result is a new
@@ -5108,7 +5431,7 @@ func recipeMetricsForContext(ctx RobotContext, issues []model.Issue, r *recipe.R
 		metrics.Graph = stats
 	}
 	if r.NeedsTriageScores() {
-		scores := analysis.ComputeTriageScoresFromAnalyzer(analyzer, stats, analysis.DefaultTriageScoringOptions(), now)
+		scores := analysis.ComputeTriageScoresFromAnalyzer(analyzer, stats, analysis.ProductionTriageScoringOptions(), now)
 		metrics.Triage = make(map[string]float64, len(scores))
 		for _, score := range scores {
 			metrics.Triage[score.IssueID] = score.TriageScore
@@ -5392,22 +5715,34 @@ func filterByRepo(issues []model.Issue, repoFilter string) []model.Issue {
 
 // buildMetricItems converts a metrics map to a sorted slice of MetricItems
 func buildMetricItems(metrics map[string]float64, limit int) []baseline.MetricItem {
+	return buildScopedMetricItems(metrics, limit, nil)
+}
+
+// buildScopedMetricItems converts a metrics map to a deterministically sorted
+// slice of MetricItems, optionally restricting entries to candidateIDs.
+func buildScopedMetricItems(metrics map[string]float64, limit int, candidateIDs map[string]bool) []baseline.MetricItem {
 	if len(metrics) == 0 {
 		return nil
 	}
 
-	// Convert to slice for sorting
 	items := make([]baseline.MetricItem, 0, len(metrics))
 	for id, value := range metrics {
+		if candidateIDs != nil && !candidateIDs[id] {
+			continue
+		}
 		items = append(items, baseline.MetricItem{ID: id, Value: value})
 	}
+	if len(items) == 0 {
+		return nil
+	}
 
-	// Sort by value descending
 	sort.Slice(items, func(i, j int) bool {
-		return items[i].Value > items[j].Value
+		if items[i].Value != items[j].Value {
+			return items[i].Value > items[j].Value
+		}
+		return items[i].ID < items[j].ID
 	})
 
-	// Limit to top N
 	if len(items) > limit {
 		items = items[:limit]
 	}
@@ -5961,7 +6296,7 @@ func runPreviewServer(dir string, liveReload bool) error {
 }
 
 // runPagesWizard runs the interactive deployment wizard (bv-10g).
-func runPagesWizard(beadsPath string, includeInactive, forceFullAnalysis bool, notReadyLabels string) error {
+func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *recipe.Recipe, includeInactive, forceFullAnalysis bool, notReadyLabels string, noHooks bool, hookOptions hooks.ExecutionOptions) error {
 	wizard := export.NewWizard(beadsPath)
 
 	// Run interactive wizard to collect configuration
@@ -5972,25 +6307,66 @@ func runPagesWizard(beadsPath string, includeInactive, forceFullAnalysis bool, n
 
 	config := wizard.GetConfig()
 
-	// Resolve the actual source of issues for this deployment.
-	// This ensures updates always use the originally-deployed dataset,
-	// even if the user runs bv from a different directory.
-	source, err := resolvePagesSource(config, beadsPath)
+	var source pagesSource
+	if dispatchCtx.SourceKind == "workspace" && config.SourcePath == "" && config.SourceBeadsDir == "" {
+		baseIssues := dispatchCtx.FullIssues
+		if len(baseIssues) == 0 {
+			baseIssues = dispatchCtx.Issues
+		}
+		source = pagesSource{
+			Issues:          baseIssues,
+			RepoRoot:        dispatchCtx.ProjectDir,
+			SourcePath:      dispatchCtx.SourcePath,
+			Reason:          "workspace configuration",
+			SourceKind:      "workspace",
+			SourceAuthority: dispatchCtx.SourceAuthority,
+			Readiness:       dispatchCtx.Readiness,
+		}
+	} else {
+		// Resolve the actual source of issues for this deployment.
+		// This ensures updates always use the originally-deployed dataset,
+		// even if the user runs bv from a different directory.
+		source, err = resolvePagesSource(config, beadsPath)
+		if err != nil {
+			return err
+		}
+	}
+
+	scopedSourceCtx := RobotContext{
+		Issues:          source.Issues,
+		Readiness:       source.Readiness,
+		SourceAuthority: source.SourceAuthority,
+		SourcePath:      source.SourcePath,
+		SourceKind:      source.SourceKind,
+		LabelScope:      dispatchCtx.LabelScope,
+		Recipe:          dispatchCtx.Recipe,
+		Repo:            dispatchCtx.Repo,
+		HistoryLimit:    dispatchCtx.HistoryLimit,
+	}
+	scopedSourceCtx, err = scopeLoadedIssues(scopedSourceCtx, activeRecipe)
 	if err != nil {
 		return err
 	}
-	issues := source.Issues
+	issues := scopedSourceCtx.Issues
 
 	// Filter issues based on config
 	exportIssues := issues
 	if !config.IncludeClosed {
 		var openIssues []model.Issue
 		for _, issue := range issues {
-			if issue.Status != model.StatusClosed {
+			if !issue.Status.IsClosed() && !issue.Status.IsTombstone() {
 				openIssues = append(openIssues, issue)
 			}
 		}
 		exportIssues = openIssues
+	}
+
+	wizardProjectDir := source.RepoRoot
+	if wizardProjectDir == "" && source.BeadsDir != "" {
+		wizardProjectDir = filepath.Dir(source.BeadsDir)
+	}
+	if wizardProjectDir == "" {
+		wizardProjectDir = dispatchCtx.ProjectDir
 	}
 
 	// Create temp directory for bundle
@@ -6001,6 +6377,24 @@ func runPagesWizard(beadsPath string, includeInactive, forceFullAnalysis bool, n
 			return fmt.Errorf("failed to create temp directory: %w", err)
 		}
 		bundlePath = tmpDir
+	}
+
+	pagesExecutor, err := hooks.RunHooks(wizardProjectDir, hooks.ExportContext{
+		ExportPath:   bundlePath,
+		ExportFormat: "html",
+		IssueCount:   len(exportIssues),
+		Timestamp:    robotNow(),
+	}, noHooks, hookOptions)
+	if err != nil {
+		return err
+	}
+	if pagesExecutor != nil {
+		pagesExecutor.SetLogger(func(msg string) {
+			fmt.Printf("  -> %s\n", msg)
+		})
+		if err := pagesExecutor.RunPreExport(); err != nil {
+			return fmt.Errorf("pre-export hook failed: %w", err)
+		}
 	}
 
 	// Hold the selected directory across every bundle write.
@@ -6015,6 +6409,8 @@ func runPagesWizard(beadsPath string, includeInactive, forceFullAnalysis bool, n
 
 	if source.BeadsDir != "" {
 		fmt.Printf("  -> Using beads source: %s (%s)\n", source.BeadsDir, source.Reason)
+	} else if source.SourcePath != "" {
+		fmt.Printf("  -> Using source: %s (%s)\n", source.SourcePath, source.Reason)
 	}
 
 	fmt.Println("Exporting static site...")
@@ -6022,13 +6418,9 @@ func runPagesWizard(beadsPath string, includeInactive, forceFullAnalysis bool, n
 
 	// Build graph and compute stats
 	fmt.Println("  -> Running graph analysis...")
-	wizardProjectDir := ""
-	if source.BeadsDir != "" {
-		wizardProjectDir = filepath.Dir(source.BeadsDir)
-	}
 	analyzer := analysis.NewAnalyzer(exportIssues)
 	analyzer.SetNow(robotNow())
-	analyzer.SetReadinessScope(source.Readiness, nil)
+	analyzer.SetReadinessScope(source.Readiness, scopedSourceCtx.CandidateIDs)
 	var stats *analysis.GraphStats
 	if forceFullAnalysis {
 		fullCfg := analysis.FullAnalysisConfig()
@@ -6041,14 +6433,27 @@ func runPagesWizard(beadsPath string, includeInactive, forceFullAnalysis bool, n
 
 	// Compute triage
 	fmt.Println("  -> Generating triage data...")
-	exportContext := RobotContext{Issues: exportIssues, Readiness: source.Readiness, SourceAuthority: source.SourceAuthority,
-		SourcePath: source.SourcePath, SourceKind: source.SourceKind, ProjectDir: wizardProjectDir, DataHash: analysis.ComputeDataHash(source.Issues)}
+	exportContext := scopedSourceCtx
+	exportContext.Issues = exportIssues
+	exportContext.ProjectDir = wizardProjectDir
+	exportContext.WorkDir = wizardProjectDir
+	if exportContext.DataHash == "" {
+		exportContext.DataHash = analysis.ComputeDataHash(source.Issues)
+	}
 	_, wizardFeedbackWeights := loadRobotFeedbackForContext(exportContext)
-	wizardTriageHistory, wizardHistoryStatus := loadTriageHistoryForContext(exportContext, phaseThreeRobotHandlerConfig{})
+	var wizardHistLimit *int
+	if exportContext.HistoryLimit > 0 {
+		hl := exportContext.HistoryLimit
+		wizardHistLimit = &hl
+	}
+	wizardTriageHistory, wizardHistoryStatus := loadTriageHistoryForContext(exportContext, phaseThreeRobotHandlerConfig{
+		HistoryLimit: wizardHistLimit,
+	})
 	triage := analysis.ComputeTriageWithOptionsAndTime(exportIssues, analysis.TriageOptions{
 		WaitForPhase2:     true,
 		ActionableOnly:    !includeInactive,
 		Readiness:         source.Readiness,
+		CandidateIDs:      scopedSourceCtx.CandidateIDs,
 		History:           wizardTriageHistory,
 		ForceFullAnalysis: forceFullAnalysis,
 		NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: &notReadyLabels}),
@@ -6059,18 +6464,20 @@ func runPagesWizard(beadsPath string, includeInactive, forceFullAnalysis bool, n
 		suppressUnprovenTriageClaims(&triage)
 	}
 
-	// Extract dependencies
+	// Extract all dependencies (blocking + non-blocking such as parent-child, related, discovered-from)
 	var deps []*model.Dependency
 	for i := range exportIssues {
 		issue := &exportIssues[i]
 		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
+			if dep == nil {
 				continue
 			}
 			deps = append(deps, &model.Dependency{
 				IssueID:     issue.ID,
 				DependsOnID: dep.DependsOnID,
 				Type:        dep.Type,
+				CreatedAt:   dep.CreatedAt,
+				CreatedBy:   dep.CreatedBy,
 			})
 		}
 	}
@@ -6135,7 +6542,7 @@ func runPagesWizard(beadsPath string, includeInactive, forceFullAnalysis bool, n
 	// Export history data for time-travel feature if requested
 	if config.IncludeHistory {
 		fmt.Println("  -> Generating time-travel history data...")
-		if historyReport, err := generateHistoryForExport(exportIssues); err == nil && historyReport != nil {
+		if historyReport, err := generateHistoryForExportContext(exportContext); err == nil && historyReport != nil {
 			if historyJSON, err := json.MarshalIndent(historyReport, "", "  "); err == nil {
 				if err := bundle.WriteFile("data/history.json", historyJSON, 0644); err != nil {
 					fmt.Printf("  -> Warning: failed to write history.json: %v\n", err)
@@ -6155,6 +6562,16 @@ func runPagesWizard(beadsPath string, includeInactive, forceFullAnalysis bool, n
 	}
 	if err := bundle.Close(); err != nil {
 		return fmt.Errorf("close export directory: %w", err)
+	}
+	if pagesExecutor != nil {
+		postErr := pagesExecutor.RunPostExport()
+		if len(pagesExecutor.Results()) > 0 {
+			fmt.Println("")
+			fmt.Println(pagesExecutor.Summary())
+		}
+		if postErr != nil {
+			return fmt.Errorf("post-export hook failed (bundle already written): %w", postErr)
+		}
 	}
 
 	fmt.Printf("  -> Bundle created: %s\n", bundlePath)
@@ -6253,11 +6670,20 @@ func resolvePagesSource(config *export.WizardConfig, beadsPath string) (pagesSou
 		return src, nil
 	}
 	if config.SourcePath != "" {
-		src, ok, err := loadPagesSourceFromFile(config.SourcePath, "saved source file")
-		if err != nil {
+		lowerPath := strings.ToLower(strings.TrimSpace(config.SourcePath))
+		if strings.HasSuffix(lowerPath, ".yaml") || strings.HasSuffix(lowerPath, ".yml") {
+			src, err := loadPagesSourceFromWorkspace(config.SourcePath, "saved workspace config")
+			if err == nil {
+				return src, nil
+			}
 			lastErr = err
-		} else if ok {
-			return src, nil
+		} else {
+			src, ok, err := loadPagesSourceFromFile(config.SourcePath, "saved source file")
+			if err != nil {
+				lastErr = err
+			} else if ok {
+				return src, nil
+			}
 		}
 	}
 
@@ -6316,10 +6742,45 @@ func resolvePagesSource(config *export.WizardConfig, beadsPath string) (pagesSou
 		return src, nil
 	}
 
+	if wsPath := discoverWorkspaceConfig(); wsPath != "" {
+		if src, err := loadPagesSourceFromWorkspace(wsPath, "discovered workspace"); err == nil {
+			return src, nil
+		} else if lastErr == nil {
+			lastErr = err
+		}
+	}
+
 	if lastErr != nil {
 		return pagesSource{}, lastErr
 	}
 	return pagesSource{}, fmt.Errorf("no valid beads source found for pages export")
+}
+
+func loadPagesSourceFromWorkspace(configPath, reason string) (pagesSource, error) {
+	loadedIssues, results, err := workspace.LoadAllFromConfig(context.Background(), configPath)
+	authority := robotWorkspaceAuthority(results)
+	if err != nil {
+		return pagesSource{}, err
+	}
+	var tombstones []string
+	for _, res := range results {
+		if res.Error == nil {
+			tombstones = append(tombstones, res.TombstoneIDs...)
+		}
+	}
+	absPath := configPath
+	if abs, absErr := filepath.Abs(configPath); absErr == nil {
+		absPath = abs
+	}
+	return pagesSource{
+		Issues:          loadedIssues,
+		RepoRoot:        workspace.ResolveWorkspaceBaseDir(absPath),
+		SourcePath:      absPath,
+		Reason:          reason,
+		SourceKind:      "workspace",
+		SourceAuthority: authority,
+		Readiness:       model.NewReadinessIndex(issuesWithTombstones(loadedIssues, tombstones)),
+	}, nil
 }
 
 func loadPagesSourceFromFile(path, reason string) (pagesSource, bool, error) {
@@ -6692,10 +7153,33 @@ func computeSprintScopeChanges(repoPath string, sprint *model.Sprint, issueMap m
 	if sprint == nil || sprint.ID == "" {
 		return nil, nil
 	}
+	return computeSprintScopeChangesAtPath(
+		repoPath,
+		filepath.Join(".beads", loader.SprintsFileName),
+		sprint.ID,
+		sprint,
+		issueMap,
+		now,
+		nil,
+	)
+}
+
+func computeSprintScopeChangesAtPath(
+	gitRoot string,
+	sprintsRelPath string,
+	rawSprintID string,
+	sprint *model.Sprint,
+	issueMap map[string]model.Issue,
+	now time.Time,
+	qualifyID func(string) string,
+) ([]ScopeChangeEvent, error) {
+	if sprint == nil || rawSprintID == "" || strings.TrimSpace(sprintsRelPath) == "" {
+		return nil, nil
+	}
 	if sprint.StartDate.IsZero() || sprint.EndDate.IsZero() {
 		return nil, nil
 	}
-	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err != nil {
+	if _, err := os.Stat(filepath.Join(gitRoot, ".git")); err != nil {
 		// Not a git repository (common for ad-hoc exports/tests); scope changes are optional.
 		return nil, nil
 	}
@@ -6707,6 +7191,7 @@ func computeSprintScopeChanges(repoPath string, sprint *model.Sprint, issueMap m
 		until = now
 	}
 
+	relSlash := filepath.ToSlash(sprintsRelPath)
 	args := []string{
 		"-c", "color.ui=false",
 		"log",
@@ -6716,14 +7201,14 @@ func computeSprintScopeChanges(repoPath string, sprint *model.Sprint, issueMap m
 		fmt.Sprintf("--since=%s", since.Format(time.RFC3339)),
 		fmt.Sprintf("--until=%s", until.Format(time.RFC3339)),
 		"--",
-		filepath.ToSlash(filepath.Join(".beads", loader.SprintsFileName)),
+		relSlash,
 	}
 
 	cmd := exec.Command("git", args...)
-	cmd.Dir = repoPath
+	cmd.Dir = gitRoot
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("git log %s: %w: %s", filepath.ToSlash(filepath.Join(".beads", loader.SprintsFileName)), err, bytes.TrimSpace(out))
+		return nil, fmt.Errorf("git log %s: %w: %s", relSlash, err, bytes.TrimSpace(out))
 	}
 
 	var commits []scopeCommit
@@ -6738,11 +7223,19 @@ func computeSprintScopeChanges(repoPath string, sprint *model.Sprint, issueMap m
 			return
 		}
 
-		if haveOld && haveNew && oldSnap.ID == sprint.ID && newSnap.ID == sprint.ID {
+		if haveOld && haveNew && oldSnap.ID == rawSprintID && newSnap.ID == rawSprintID {
 			added := setDifference(newSnap.BeadIDs, oldSnap.BeadIDs)
 			removed := setDifference(oldSnap.BeadIDs, newSnap.BeadIDs)
 			if len(added) == 0 && len(removed) == 0 {
 				return
+			}
+			if qualifyID != nil {
+				for i, id := range added {
+					added[i] = qualifyID(id)
+				}
+				for i, id := range removed {
+					removed[i] = qualifyID(id)
+				}
 			}
 
 			sort.Strings(added)
@@ -6807,14 +7300,14 @@ func computeSprintScopeChanges(repoPath string, sprint *model.Sprint, issueMap m
 		}
 
 		if strings.HasPrefix(line, "-{") {
-			if snap, ok := parseSprintJSONLine(strings.TrimPrefix(line, "-")); ok && snap.ID == sprint.ID {
+			if snap, ok := parseSprintJSONLine(strings.TrimPrefix(line, "-")); ok && snap.ID == rawSprintID {
 				oldSnap = snap
 				haveOld = true
 			}
 			continue
 		}
 		if strings.HasPrefix(line, "+{") {
-			if snap, ok := parseSprintJSONLine(strings.TrimPrefix(line, "+")); ok && snap.ID == sprint.ID {
+			if snap, ok := parseSprintJSONLine(strings.TrimPrefix(line, "+")); ok && snap.ID == rawSprintID {
 				newSnap = snap
 				haveNew = true
 			}
@@ -7193,28 +7686,28 @@ jq '.blockers_to_clear | sort_by(-.unblocks_count)' triage.json
 ### Graph Metrics
 ` + "```bash" + `
 # Top PageRank issues
-jq '.top_pagerank | to_entries | sort_by(-.value)[:5]' insights.json
+jq '.full_stats.pagerank | to_entries | sort_by(-.value)[:5]' insights.json
 
-# Top betweenness centrality
-jq '.top_betweenness | to_entries | sort_by(-.value)[:5]' insights.json
+# Top betweenness bottlenecks
+jq '.Bottlenecks[:5]' insights.json
 
-# Find hub issues (high in-degree)
-jq '.top_in_degree | to_entries | sort_by(-.value)[:3]' insights.json
+# Find hub issues (strong dependency aggregators)
+jq '.Hubs[:3]' insights.json
 ` + "```" + `
 
 ### Project Health
 ` + "```bash" + `
 # Get velocity metrics
-jq '.velocity' insights.json
+jq '.Velocity' insights.json
 
-# List critical issues
-jq '.critical_issues' insights.json
+# List critical-path keystones
+jq '.Keystones[:5]' insights.json
 ` + "```" + `
 
 ## Combining Files
 ` + "```bash" + `
 # Cross-reference top picks with insights
-jq -s '.[0].quick_ref.top_picks[0].id as $id | .[1].top_pagerank[$id] // 0' triage.json insights.json
+jq -s '.[0].quick_ref.top_picks[0].id as $id | .[1].full_stats.pagerank[$id] // 0' triage.json insights.json
 
 # Export summary to CSV
 jq -r '.recommendations[] | [.id, .score, .action] | @csv' triage.json
@@ -7247,55 +7740,83 @@ var timeTravelCommitLimit = 500
 
 // generateHistoryForExport creates time-travel history data from git history
 func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) {
-	repoDir, err := resolveCLIProjectDir()
-	if err != nil {
-		return nil, err
-	}
+	return generateHistoryForExportContext(RobotContext{Issues: issues})
+}
 
-	// Check if we're in a git repository
-	if err := correlation.ValidateRepository(repoDir); err != nil {
-		return nil, err
-	}
-
-	// Get beads path (supports both JSONL and SQLite-backed workspaces)
-	beadsDir, beadsPath, err := resolveCorrelationBeadsPath(repoDir)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build bead info from issues
-	beadInfos := make([]correlation.BeadInfo, len(issues))
-	for i, issue := range issues {
-		beadInfos[i] = correlation.BeadInfo{
-			ID:     issue.ID,
-			Title:  issue.Title,
-			Status: string(issue.Status),
-		}
-	}
-
-	// Generate correlation report.
-	//
-	// Enable the persistent correlation caches for this process even though the
-	// export path does not run in robot mode (#182). GenerateReportCached is
-	// keyed on HEAD + beads + options, so a long-lived --watch-export watcher
-	// pays the full git-blob extraction once and then serves history.json
-	// incrementally: an unchanged committed history is a pure cache hit (no
-	// blob I/O), and a HEAD advance only re-reads the new commits' blobs via
-	// the per-commit event cache. Without this the watcher re-materialized the
-	// entire blob history on every re-export. BV_NO_CACHE=1 still opts out.
+func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, error) {
+	issues := ctx.Issues
 	correlation.SetDiskCacheEnabled(true)
-	// Load the same report as robot history. Feedback affects inferred code
-	// correlations, but the timeline below uses the recorded issue events.
-	feedbackStore := correlation.NewFeedbackStore(beadsDir)
-	if err := feedbackStore.Load(); err != nil {
-		return nil, fmt.Errorf("loading correlation feedback: %w", err)
+
+	commitLimit := timeTravelCommitLimit
+	if ctx.HistoryLimit > 0 {
+		commitLimit = ctx.HistoryLimit
 	}
-	correlator := correlation.NewCorrelator(repoDir, beadsPath).WithFeedbackStore(feedbackStore)
-	report, err := correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{
-		Limit: timeTravelCommitLimit,
-	})
-	if err != nil {
-		return nil, err
+
+	var (
+		report    *correlation.HistoryReport
+		repoRoots []string
+		err       error
+	)
+	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
+		report, err = generateWorkspaceCorrelationReport(ctx, correlation.CorrelatorOptions{
+			Limit:    commitLimit,
+			Revision: ctx.AsOfCommit,
+		}, false)
+		if err != nil {
+			return nil, err
+		}
+		sources, _ := resolveWorkspaceCorrelationSources(ctx)
+		seenRoots := make(map[string]bool)
+		for _, ws := range sources {
+			if ctx.Repo != "" && !sourceMatchesRepoFilter(ws.source, ctx.Repo) {
+				continue
+			}
+			cleanRoot := filepath.Clean(ws.repoRoot)
+			if cleanRoot != "" && !seenRoots[cleanRoot] {
+				seenRoots[cleanRoot] = true
+				repoRoots = append(repoRoots, cleanRoot)
+			}
+		}
+		if len(repoRoots) == 0 {
+			return nil, fmt.Errorf("no git repositories available in workspace")
+		}
+	} else {
+		repoDir := ctx.ProjectDir
+		if repoDir == "" {
+			repoDir, err = resolveCLIProjectDir()
+			if err != nil {
+				return nil, err
+			}
+		}
+		exportBeadsDir, _ := loader.GetBeadsDir(repoDir)
+		if err := correlation.ValidateRepositoryWithBeadsDir(repoDir, exportBeadsDir); err != nil {
+			return nil, err
+		}
+		beadsDir, beadsPath, err := resolveCorrelationBeadsPath(repoDir)
+		if err != nil {
+			return nil, err
+		}
+		beadInfos := make([]correlation.BeadInfo, len(issues))
+		for i, issue := range issues {
+			beadInfos[i] = correlation.BeadInfo{
+				ID:     issue.ID,
+				Title:  issue.Title,
+				Status: string(issue.Status),
+			}
+		}
+		feedbackStore := correlation.NewFeedbackStore(beadsDir)
+		if err := feedbackStore.Load(); err != nil {
+			return nil, fmt.Errorf("loading correlation feedback: %w", err)
+		}
+		correlator := correlation.NewCorrelator(repoDir, beadsPath).WithFeedbackStore(feedbackStore)
+		report, err = correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{
+			Limit:    commitLimit,
+			Revision: ctx.AsOfCommit,
+		})
+		if err != nil {
+			return nil, err
+		}
+		repoRoots = []string{repoDir}
 	}
 
 	// Timeline visibility follows observed issue records, not inferred code
@@ -7332,7 +7853,6 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		}
 	}
 
-	// Convert map to sorted slice (deduplicating per-commit bead IDs across synthesized + explicit lifecycle events)
 	var commits []TimeTravelCommit
 	for _, commit := range commitMap {
 		if len(commit.BeadsAdded) > 0 {
@@ -7350,25 +7870,30 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		commits = append(commits, *commit)
 	}
 
-	// Keep Git ancestry order, including equal or backdated author timestamps.
-	// Sorting timestamps or hashes can replay a close before its creation.
-	// Rank every commit reachable from HEAD rather than re-walking the tracker
-	// path. A second path walk does not select the same commits as the
-	// extractor: a bounded walk in topological order is a different set from
-	// the extractor's date-ordered window once a side branch that touched the
-	// tracker is merged, and --follow switches to a renamed tracker's old name
-	// at a point that depends on walk order, so an older side branch that
-	// edited the old name can be dropped. Every extracted commit is reachable
-	// from HEAD, so each one has a rank. Reverse by rank afterward.
-	orderCmd := exec.Command("git", "log", "--format=%H", "--topo-order", "HEAD")
-	orderCmd.Dir = repoDir
-	orderOutput, err := orderCmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("ordering timeline commits: %w", err)
+	type commitRank struct {
+		repoIndex int
+		rank      int
 	}
-	order := make(map[string]int)
-	for i, sha := range strings.Fields(string(orderOutput)) {
-		order[sha] = -i
+	order := make(map[string]commitRank)
+	revTarget := "HEAD"
+	if ctx.AsOfCommit != "" {
+		revTarget = ctx.AsOfCommit
+	}
+	for repoIdx, root := range repoRoots {
+		orderCmd := exec.Command("git", "log", "--format=%H", "--topo-order", revTarget)
+		orderCmd.Dir = root
+		orderOutput, err := orderCmd.Output()
+		if err != nil {
+			if len(repoRoots) == 1 {
+				return nil, fmt.Errorf("ordering timeline commits: %w", err)
+			}
+			continue
+		}
+		for i, sha := range strings.Fields(string(orderOutput)) {
+			if _, exists := order[sha]; !exists {
+				order[sha] = commitRank{repoIndex: repoIdx, rank: -i}
+			}
+		}
 	}
 	for _, commit := range commits {
 		if _, ok := order[commit.SHA]; !ok {
@@ -7376,7 +7901,14 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		}
 	}
 	sort.Slice(commits, func(i, j int) bool {
-		return order[commits[i].SHA] < order[commits[j].SHA]
+		ri, rj := order[commits[i].SHA], order[commits[j].SHA]
+		if ri.repoIndex == rj.repoIndex {
+			return ri.rank < rj.rank
+		}
+		if commits[i].Date != commits[j].Date {
+			return commits[i].Date < commits[j].Date
+		}
+		return commits[i].SHA < commits[j].SHA
 	})
 
 	var initialBeads []string
@@ -7387,12 +7919,10 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 			if _, ok := commitMap[event.CommitSHA]; !ok {
 				continue
 			}
-			if first == nil || order[event.CommitSHA] < order[first.CommitSHA] {
+			if first == nil || order[event.CommitSHA].rank < order[first.CommitSHA].rank {
 				first = event
 			}
 		}
-		// A later observation or the current issue status cannot fill an unknown
-		// boundary. Only the first retained, successfully parsed transition can.
 		if first == nil || !first.TransitionObserved || first.Before == nil {
 			continue
 		}
@@ -7402,9 +7932,14 @@ func generateHistoryForExport(issues []model.Issue) (*TimeTravelHistory, error) 
 		}
 	}
 	sort.Strings(initialBeads)
-	sprints, err := loader.LoadSprints(repoDir)
-	if err != nil {
-		return nil, fmt.Errorf("loading timeline sprints: %w", err)
+
+	sprintWorkDir := ctx.ProjectDir
+	if sprintWorkDir == "" && len(repoRoots) > 0 {
+		sprintWorkDir = repoRoots[0]
+	}
+	sprints, sErr := loadSprintsForContext(ctx, sprintWorkDir)
+	if sErr != nil && len(repoRoots) <= 1 {
+		return nil, fmt.Errorf("loading timeline sprints: %w", sErr)
 	}
 	sort.Slice(sprints, func(i, j int) bool {
 		if !sprints[i].StartDate.Equal(sprints[j].StartDate) {
@@ -7466,6 +8001,9 @@ type RobotSourceReport struct {
 	Warnings     []string `json:"warnings,omitempty"`
 	Error        string   `json:"error,omitempty"`
 	WatchPaths   []string `json:"-"`
+	RepoRoot     string   `json:"-"`
+	RepoPrefix   string   `json:"-"`
+	SourceRepo   string   `json:"-"`
 }
 
 // RobotSourceAuthority keeps exploratory output useful while distinguishing
@@ -7592,10 +8130,17 @@ func robotSourceFromLoad(loaded datasource.LoadResult, loadErr error) RobotSourc
 func robotWorkspaceAuthority(results []workspace.LoadResult) *RobotSourceAuthority {
 	sources := make([]RobotSourceReport, 0, len(results))
 	for _, result := range results {
-		source := RobotSourceReport{Name: result.RepoName, RepoPath: result.RepoPath, SourcePath: result.SourcePath, SourceKind: "jsonl", Status: "loaded",
+		sourceKind := result.SourceKind
+		if sourceKind == "" {
+			sourceKind = "jsonl"
+		}
+		sourceRepo := strings.ToLower(strings.TrimRight(strings.TrimSpace(result.Prefix), "-:_"))
+		source := RobotSourceReport{Name: result.RepoName, RepoPath: result.RepoPath, RepoRoot: result.RepoRoot,
+			RepoPrefix: result.Prefix, SourceRepo: sourceRepo,
+			SourcePath: result.SourcePath, SourceKind: sourceKind, Status: "loaded",
 			WatchPaths: append([]string(nil), result.WatchPaths...),
 			DataHash:   sourceIssuesHash(result.Issues, result.TombstoneIDs), Valid: result.ParseStats.Valid, Errors: result.ParseStats.Errors,
-			Skipped: result.ParseStats.Skipped, Visible: len(result.Issues), Tombstones: len(result.TombstoneIDs),
+			Skipped: result.ParseStats.Skipped, ReadErrors: result.ReadErrors, Visible: len(result.Issues), Tombstones: len(result.TombstoneIDs),
 			Stale: len(result.AuthorityWarnings) > 0, WarningCount: result.WarningCount,
 			Warnings: append(append([]string(nil), result.AuthorityWarnings...), result.ParseWarnings...)}
 		if result.Disabled {

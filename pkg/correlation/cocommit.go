@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -27,7 +28,8 @@ var coCommitFetchedSHAsCounter int64
 
 // CoCommitExtractor extracts files that were changed in the same commit as bead changes
 type CoCommitExtractor struct {
-	repoPath string
+	repoPath    string
+	storeDirRel string
 
 	// ctx, when set (via Correlator.WithContext or directly), bounds the git
 	// subprocesses spawned during co-commit extraction (issue #166). nil means
@@ -37,6 +39,7 @@ type CoCommitExtractor struct {
 	// Memoized per-commit diff data, populated lazily by primeBatch. Once a SHA
 	// is present in batchedSHAs, getFilesChanged/getLineStats serve it from these
 	// maps instead of forking a per-commit `git show`. See #161 batch fan-out fix.
+	cacheMu     sync.RWMutex
 	fileCache   map[string][]FileChange
 	statCache   map[string]map[string]lineStats
 	batchedSHAs map[string]struct{}
@@ -45,6 +48,22 @@ type CoCommitExtractor struct {
 // NewCoCommitExtractor creates a new co-commit extractor
 func NewCoCommitExtractor(repoPath string) *CoCommitExtractor {
 	return &CoCommitExtractor{repoPath: repoPath}
+}
+
+// WithStoreDir configures the git-root-relative tracker directory prefix (e.g.
+// "custom-beads" or "services/api/.beads") so custom non-.beads tracker files
+// are excluded from co-commit and explicit-ID file sets.
+func (c *CoCommitExtractor) WithStoreDir(storeDirRel string) *CoCommitExtractor {
+	norm := normalizeStoreDirRel(storeDirRel)
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	if c.storeDirRel != norm {
+		c.storeDirRel = norm
+		c.fileCache = nil
+		c.statCache = nil
+		c.batchedSHAs = nil
+	}
+	return c
 }
 
 // codeFileExtensions lists file extensions considered "code files"
@@ -157,7 +176,7 @@ func (c *CoCommitExtractor) ExtractCoCommittedFiles(event BeadEvent) ([]FileChan
 		if !isCodeFile(f.Path) {
 			continue
 		}
-		if isExcludedPath(f.Path) {
+		if c.isExcludedPath(f.Path) {
 			continue
 		}
 
@@ -190,7 +209,7 @@ func (c *CoCommitExtractor) ExtractNonExcludedFiles(commitSHA string) ([]FileCha
 
 	var repoFiles []FileChange
 	for _, f := range files {
-		if isExcludedPath(f.Path) {
+		if c.isExcludedPath(f.Path) {
 			continue
 		}
 		if s, ok := stats[f.Path]; ok {
@@ -234,14 +253,39 @@ type lineStats struct {
 // the (often large) excluded blobs (e.g. .beads/issues.jsonl) entirely instead of
 // computing line stats for content the caller discards via isExcludedPath. See #160.
 func excludePathspecArgs() []string {
-	args := make([]string, 0, len(excludedPaths)+2)
+	return excludePathspecArgsForStore("")
+}
+
+func excludePathspecArgsForStore(storeDirRel string) []string {
+	args := make([]string, 0, len(excludedPaths)+4)
 	args = append(args, "--", ".")
 	for _, prefix := range excludedPaths {
 		// Trim trailing slash; ':(exclude,glob)dir/**' matches everything under dir.
 		dir := strings.TrimSuffix(prefix, "/")
 		args = append(args, fmt.Sprintf(":(exclude,glob)%s/**", dir))
 	}
+	args = append(args, ":(exclude,glob)**/.beads/**")
+	if cleanStore := normalizeStoreDirRel(storeDirRel); cleanStore != "" && cleanStore != ".beads" {
+		args = append(args, fmt.Sprintf(":(exclude,glob)%s/**", cleanStore))
+	}
 	return args
+}
+
+func (c *CoCommitExtractor) getStoreDirRel() string {
+	if c == nil {
+		return ""
+	}
+	c.cacheMu.RLock()
+	dir := c.storeDirRel
+	c.cacheMu.RUnlock()
+	return dir
+}
+
+func (c *CoCommitExtractor) excludePathspecArgs() []string {
+	if c == nil {
+		return excludePathspecArgs()
+	}
+	return excludePathspecArgsForStore(c.getStoreDirRel())
 }
 
 // primeBatch fetches name-status and numstat for every requested SHA in two
@@ -261,6 +305,9 @@ func excludePathspecArgs() []string {
 // and yielding an empty file list for that SHA. Either git-pass failure is
 // returned before any missing SHA is marked complete or cached.
 func (c *CoCommitExtractor) primeBatch(shas []string) error {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
 	if c.fileCache == nil {
 		c.fileCache = make(map[string][]FileChange)
 		c.statCache = make(map[string]map[string]lineStats)
@@ -294,7 +341,7 @@ func (c *CoCommitExtractor) primeBatch(shas []string) error {
 	// (name-status) order, LineStats reconstructed exactly via fromLineStatsMap,
 	// and an empty diff memoized as nil files + empty stat map. So the in-memory
 	// maps are byte-identical regardless of how many SHAs came from disk.
-	namespace := perCommitCoCommitCacheNamespace()
+	namespace := perCommitCoCommitCacheNamespaceForStore(c.storeDirRel)
 	disk := loadPerCommitCoCommit(namespace)
 
 	missing := want
@@ -359,10 +406,14 @@ func (c *CoCommitExtractor) primeBatch(shas []string) error {
 // <SHAs> -- <exclude pathspecs>`, reusing the streaming-log header and exclude
 // helpers shared with the snapshot extractor.
 func batchLogArgs(diffFlag string, shas []string) []string {
-	args := make([]string, 0, len(shas)+8)
+	return batchLogArgsForStore(diffFlag, shas, "")
+}
+
+func batchLogArgsForStore(diffFlag string, shas []string, storeDirRel string) []string {
+	args := make([]string, 0, len(shas)+10)
 	args = append(args, "log", "--no-walk=unsorted", diffFlag, "--format="+gitLogHeaderFormat)
 	args = append(args, shas...)
-	args = append(args, excludePathspecArgs()...)
+	args = append(args, excludePathspecArgsForStore(storeDirRel)...)
 	return args
 }
 
@@ -375,7 +426,7 @@ func batchLogArgs(diffFlag string, shas []string) []string {
 func (c *CoCommitExtractor) batchFilesChanged(shas []string) (map[string][]FileChange, error) {
 	files := make(map[string][]FileChange, len(shas))
 
-	cmd := gitCommand(c.ctx, withNoColorGit(batchLogArgs("--name-status", shas))...)
+	cmd := gitCommand(c.ctx, withNoColorGit(batchLogArgsForStore("--name-status", shas, c.storeDirRel))...)
 	cmd.Dir = c.repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -394,7 +445,7 @@ func (c *CoCommitExtractor) batchFilesChanged(shas []string) (map[string][]FileC
 func (c *CoCommitExtractor) batchLineStats(shas []string) (map[string]map[string]lineStats, error) {
 	stats := make(map[string]map[string]lineStats, len(shas))
 
-	cmd := gitCommand(c.ctx, withNoColorGit(batchLogArgs("--numstat", shas))...)
+	cmd := gitCommand(c.ctx, withNoColorGit(batchLogArgsForStore("--numstat", shas, c.storeDirRel))...)
 	cmd.Dir = c.repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -523,13 +574,17 @@ func parseNumstat(payload []byte) map[string]lineStats {
 // was primed via primeBatch it is served from the in-memory cache; otherwise it
 // falls back to a per-commit `git show --name-status`.
 func (c *CoCommitExtractor) getFilesChanged(sha string) ([]FileChange, error) {
+	c.cacheMu.RLock()
 	if c.fileCache != nil {
 		if _, ok := c.batchedSHAs[sha]; ok {
-			return c.fileCache[sha], nil
+			cached := c.fileCache[sha]
+			c.cacheMu.RUnlock()
+			return cached, nil
 		}
 	}
+	c.cacheMu.RUnlock()
 
-	gitArgs := append([]string{"show", "--name-status", "--format=", sha}, excludePathspecArgs()...)
+	gitArgs := append([]string{"show", "--name-status", "--format=", sha}, c.excludePathspecArgs()...)
 	cmd := gitCommand(c.ctx, gitArgs...)
 	cmd.Dir = c.repoPath
 
@@ -545,13 +600,17 @@ func (c *CoCommitExtractor) getFilesChanged(sha string) ([]FileChange, error) {
 // SHA was primed via primeBatch it is served from the in-memory cache; otherwise
 // it falls back to a per-commit `git show --numstat`.
 func (c *CoCommitExtractor) getLineStats(sha string) (map[string]lineStats, error) {
+	c.cacheMu.RLock()
 	if c.statCache != nil {
 		if _, ok := c.batchedSHAs[sha]; ok {
-			return c.statCache[sha], nil
+			cached := c.statCache[sha]
+			c.cacheMu.RUnlock()
+			return cached, nil
 		}
 	}
+	c.cacheMu.RUnlock()
 
-	gitArgs := append([]string{"show", "--numstat", "--format=", sha}, excludePathspecArgs()...)
+	gitArgs := append([]string{"show", "--numstat", "--format=", sha}, c.excludePathspecArgs()...)
 	cmd := gitCommand(c.ctx, gitArgs...)
 	cmd.Dir = c.repoPath
 
@@ -655,11 +714,29 @@ func isCodeFile(path string) bool {
 	return codeFileExtensions[ext]
 }
 
+func (c *CoCommitExtractor) isExcludedPath(path string) bool {
+	if isExcludedPath(path) {
+		return true
+	}
+	if c != nil && isTrackerPath(path, c.getStoreDirRel()) {
+		return true
+	}
+	return false
+}
+
 // isExcludedPath checks if a path should be excluded
 func isExcludedPath(path string) bool {
+	if isBeadsDirPath(path) {
+		return true
+	}
+	norm := strings.ReplaceAll(path, "\\", "/")
+	for strings.HasPrefix(norm, "./") {
+		norm = strings.TrimPrefix(norm, "./")
+	}
+
 	// Check for direct prefix (fast path for root dirs)
 	for _, prefix := range excludedPaths {
-		if strings.HasPrefix(path, prefix) {
+		if strings.HasPrefix(norm, prefix) {
 			return true
 		}
 	}
@@ -671,7 +748,7 @@ func isExcludedPath(path string) bool {
 		if strings.HasSuffix(prefix, "/") {
 			// Check for "/prefix" anywhere in path
 			// We prepend / to ensure we match a directory boundary
-			if strings.Contains(path, "/"+prefix) {
+			if strings.Contains(norm, "/"+prefix) {
 				return true
 			}
 		}

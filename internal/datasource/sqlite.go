@@ -26,10 +26,18 @@ type SQLiteReader struct {
 	report   LoadReport
 }
 
+type sqliteDependencySchema struct {
+	present   bool
+	typeExpr  string
+	typeOrder string
+	createdAt string
+	createdBy string
+}
+
 type sqliteReadSchema struct {
-	dependencyType string
-	labelsTable    bool
-	commentsTable  bool
+	dependencies  sqliteDependencySchema
+	labelsTable   bool
+	commentsTable bool
 }
 
 // Every query that contributes to one issue graph must use the same WAL
@@ -168,6 +176,8 @@ func (r *sqliteReadSession) issuesColumns(ctx context.Context) (map[string]bool,
 func (r *sqliteReadSession) tableColumns(ctx context.Context, table string) (map[string]bool, error) {
 	var query string
 	switch table {
+	case "comments":
+		query = "PRAGMA table_info(comments)"
 	case "dependencies":
 		query = "PRAGMA table_info(dependencies)"
 	case "issues":
@@ -330,12 +340,12 @@ func (r *sqliteReadSession) loadIssueAuthority(ctx context.Context, report *Load
 	if err != nil {
 		return nil, err
 	}
-	dependencyTypeExpr, dependencyErr := r.dependencyTypeExpr(ctx)
+	depSchema, dependencyErr := r.dependencySchema(ctx)
 	if dependencyErr != nil {
 		report.ReadErrors++
 		report.addWarning(dependencyErr.Error())
 	}
-	schema := sqliteReadSchema{dependencyType: dependencyTypeExpr}
+	schema := sqliteReadSchema{dependencies: depSchema}
 	for _, table := range []struct {
 		name        string
 		destination *bool
@@ -372,13 +382,14 @@ func (r *sqliteReadSession) loadIssueAuthority(ctx context.Context, report *Load
 		"i.id", "i.title", expr("description", "NULL"), "i.status",
 		coalesceExpr("priority", "3"), coalesceExpr("issue_type", "'task'"),
 		expr("assignee", "NULL"), expr("estimated_minutes", "NULL"),
-		expr("created_at", "NULL"), expr("updated_at", "NULL"),
-		expr(dueField, "NULL"), expr("defer_until", "NULL"), expr("closed_at", "NULL"),
+		expr("created_at", "NULL"), expr("created_by", "NULL"), expr("updated_at", "NULL"),
+		expr(dueField, "NULL"), expr("defer_until", "NULL"), expr("closed_at", "NULL"), expr("close_reason", "NULL"),
 		expr("external_ref", "NULL"), expr("compaction_level", "NULL"),
 		expr("compacted_at", "NULL"), expr("compacted_at_commit", "NULL"),
 		expr("original_size", "NULL"), expr("labels", "NULL"), expr("design", "NULL"),
 		expr("acceptance_criteria", "NULL"), expr("notes", "NULL"),
 		expr("source_repo", "NULL"), expr("tombstone", "NULL"),
+		expr("ephemeral", "NULL"), expr("pinned", "NULL"), expr("is_template", "NULL"),
 	}
 	orderBy := "i.id"
 	if columns["updated_at"] {
@@ -400,17 +411,19 @@ func (r *sqliteReadSession) loadIssueAuthority(ctx context.Context, report *Load
 		// modernc returns time.Time for DATETIME and strings for TEXT or
 		// expressions. NullString accepts both, unlike NullTime on TEXT.
 		var createdAt, updatedAt, dueDate, deferUntil, closedAt, compactedAt sql.NullString
-		var description, assignee, externalRef, design, acceptanceCriteria, notes, sourceRepo, compactedAtCommit sql.NullString
+		var description, assignee, createdBy, closeReason, externalRef, design, acceptanceCriteria, notes, sourceRepo, compactedAtCommit sql.NullString
 		var labelsJSON sql.NullString
 		var issueType string
 		var tombstone sql.NullInt64
+		var ephemeral, pinned, isTemplate sql.NullBool
 
 		err := rows.Scan(
 			&issue.ID, &issue.Title, &description, &issue.Status, &issue.Priority, &issueType,
-			&assignee, &estimatedMinutes, &createdAt, &updatedAt,
-			&dueDate, &deferUntil, &closedAt, &externalRef, &compactionLevel,
+			&assignee, &estimatedMinutes, &createdAt, &createdBy, &updatedAt,
+			&dueDate, &deferUntil, &closedAt, &closeReason, &externalRef, &compactionLevel,
 			&compactedAt, &compactedAtCommit, &originalSize,
 			&labelsJSON, &design, &acceptanceCriteria, &notes, &sourceRepo, &tombstone,
+			&ephemeral, &pinned, &isTemplate,
 		)
 		if err != nil {
 			report.Errors++
@@ -420,6 +433,15 @@ func (r *sqliteReadSession) loadIssueAuthority(ctx context.Context, report *Load
 		if tombstone.Valid && tombstone.Int64 != 0 {
 			issue.Status = model.StatusTombstone
 		}
+		if ephemeral.Valid && ephemeral.Bool {
+			issue.Ephemeral = true
+		}
+		if pinned.Valid && pinned.Bool {
+			issue.Pinned = true
+		}
+		if isTemplate.Valid && isTemplate.Bool {
+			issue.IsTemplate = true
+		}
 
 		// Map nullable fields
 		if description.Valid {
@@ -428,6 +450,12 @@ func (r *sqliteReadSession) loadIssueAuthority(ctx context.Context, report *Load
 		issue.IssueType = model.IssueType(issueType)
 		if assignee.Valid {
 			issue.Assignee = assignee.String
+		}
+		if createdBy.Valid {
+			issue.CreatedBy = createdBy.String
+		}
+		if closeReason.Valid {
+			issue.CloseReason = closeReason.String
 		}
 		if estimatedMinutes.Valid {
 			v := int(estimatedMinutes.Int64)
@@ -501,8 +529,8 @@ func (r *sqliteReadSession) loadIssueAuthority(ctx context.Context, report *Load
 		if schema.labelsTable && len(labelsByID) != 0 {
 			r.loadLabelsFromTable(ctx, issues, labelsByID, report)
 		}
-		if schema.dependencyType != "" {
-			r.loadDependencies(ctx, issues, byID, schema.dependencyType, report)
+		if schema.dependencies.present {
+			r.loadDependencies(ctx, issues, byID, schema.dependencies, report)
 		}
 		if schema.commentsTable {
 			r.loadComments(ctx, issues, byID, report)
@@ -527,7 +555,7 @@ func sqliteIssueTime(raw sql.NullString, issueID, field string, report *LoadRepo
 // loadLabelsFromTable streams table labels into issues without inline labels.
 // byID is fixed before loading, so a first label never suppresses later labels.
 func (r *sqliteReadSession) loadLabelsFromTable(ctx context.Context, issues []model.Issue, byID map[string][]int, report *LoadReport) {
-	rows, err := r.db.QueryContext(ctx, "SELECT issue_id, label FROM labels")
+	rows, err := r.db.QueryContext(ctx, "SELECT issue_id, label FROM labels ORDER BY issue_id, label")
 	if err != nil {
 		report.ReadErrors++
 		report.addWarning(fmt.Sprintf("reading labels: %v", err))
@@ -554,8 +582,13 @@ func (r *sqliteReadSession) loadLabelsFromTable(ctx context.Context, issues []mo
 
 // loadDependencies keeps missing targets as edges; they must still block work.
 // Orphan source IDs do not create synthetic issues or unbounded side maps.
-func (r *sqliteReadSession) loadDependencies(ctx context.Context, issues []model.Issue, byID map[string][]int, dependencyTypeExpr string, report *LoadReport) {
-	query := fmt.Sprintf(`SELECT issue_id, depends_on_id, %s FROM dependencies`, dependencyTypeExpr)
+func (r *sqliteReadSession) loadDependencies(ctx context.Context, issues []model.Issue, byID map[string][]int, depSchema sqliteDependencySchema, report *LoadReport) {
+	orderBy := "issue_id, depends_on_id"
+	if depSchema.typeOrder != "" {
+		orderBy += ", " + depSchema.typeOrder
+	}
+	query := fmt.Sprintf(`SELECT issue_id, depends_on_id, %s, %s, %s FROM dependencies ORDER BY %s`,
+		depSchema.typeExpr, depSchema.createdAt, depSchema.createdBy, orderBy)
 	rows, err := r.db.QueryContext(ctx, query)
 	if err != nil {
 		report.ReadErrors++
@@ -565,21 +598,39 @@ func (r *sqliteReadSession) loadDependencies(ctx context.Context, issues []model
 	defer rows.Close()
 
 	for rows.Next() {
-		var dep model.Dependency
-		var depType string
-		if err := rows.Scan(&dep.IssueID, &dep.DependsOnID, &depType); err != nil {
+		var issueID, dependsOnID, depType, createdAt, createdBy sql.NullString
+		if err := rows.Scan(&issueID, &dependsOnID, &depType, &createdAt, &createdBy); err != nil {
 			report.ReadErrors++
-			report.addWarning(fmt.Sprintf("reading dependency for %q: %v", dep.IssueID, err))
+			report.addWarning(fmt.Sprintf("reading dependency for %q: %v", issueID.String, err))
 			continue
 		}
-		dep.Type = model.DependencyType(depType)
-		if strings.TrimSpace(dep.DependsOnID) == "" || (dep.Type != "" && !dep.Type.IsValid()) {
+		dep := model.Dependency{
+			IssueID:     issueID.String,
+			DependsOnID: dependsOnID.String,
+		}
+		if depType.Valid {
+			dep.Type = model.DependencyType(depType.String)
+		}
+		if !issueID.Valid || strings.TrimSpace(dep.IssueID) == "" || !dependsOnID.Valid || strings.TrimSpace(dep.DependsOnID) == "" || (dep.Type != "" && !dep.Type.IsValid()) {
 			report.ReadErrors++
-			report.addWarning(fmt.Sprintf("invalid dependency for %q: target %q, type %q", dep.IssueID, dep.DependsOnID, depType))
+			report.addWarning(fmt.Sprintf("invalid dependency for %q: target %q, type %q", dep.IssueID, dep.DependsOnID, depType.String))
 			continue
+		}
+		if createdAt.Valid && strings.TrimSpace(createdAt.String) != "" {
+			t, ok := parseSQLiteTime(createdAt.String)
+			if !ok {
+				report.ReadErrors++
+				report.addWarning(fmt.Sprintf("invalid dependency created_at for %q->%q: %q", dep.IssueID, dep.DependsOnID, createdAt.String))
+				continue
+			}
+			dep.CreatedAt = t
+		}
+		if createdBy.Valid {
+			dep.CreatedBy = createdBy.String
 		}
 		for _, i := range byID[dep.IssueID] {
-			issues[i].Dependencies = append(issues[i].Dependencies, &dep)
+			d := dep
+			issues[i].Dependencies = append(issues[i].Dependencies, &d)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -594,61 +645,124 @@ func (r *sqliteReadSession) tableExists(ctx context.Context, name string) (bool,
 	return exists > 0, err
 }
 
-func (r *sqliteReadSession) dependencyTypeExpr(ctx context.Context) (string, error) {
+func (r *sqliteReadSession) dependencySchema(ctx context.Context) (sqliteDependencySchema, error) {
 	// Minimal snapshots may omit this optional table. Inspect it once per load,
 	// so missing schema and unreadable schema do not become the same authority.
 	exists, err := r.tableExists(ctx, "dependencies")
 	if err != nil {
-		return "", fmt.Errorf("inspecting dependency table: %w", err)
+		return sqliteDependencySchema{}, fmt.Errorf("inspecting dependency table: %w", err)
 	}
 	if !exists {
-		return "", nil
+		return sqliteDependencySchema{}, nil
 	}
 	columns, err := r.tableColumns(ctx, "dependencies")
 	if err != nil {
-		return "", err
+		return sqliteDependencySchema{}, err
 	}
 	if !columns["issue_id"] || !columns["depends_on_id"] {
-		return "", fmt.Errorf("dependency table is missing issue_id or depends_on_id")
+		return sqliteDependencySchema{}, fmt.Errorf("dependency table is missing issue_id or depends_on_id")
+	}
+	schema := sqliteDependencySchema{
+		present:   true,
+		createdAt: "NULL",
+		createdBy: "NULL",
+	}
+	if columns["created_at"] {
+		schema.createdAt = "created_at"
+	}
+	if columns["created_by"] {
+		schema.createdBy = "created_by"
 	}
 	switch {
 	case columns["dependency_type"]:
-		return "dependency_type", nil
+		schema.typeExpr = "dependency_type"
+		schema.typeOrder = "dependency_type"
 	case columns["type"]:
-		return "type", nil
+		schema.typeExpr = "type"
+		schema.typeOrder = "type"
 	default:
 		// Older snapshots omit the type column. An empty type retains the
 		// model's legacy blocking semantics instead of discarding the edge.
-		return "''", nil
+		schema.typeExpr = "''"
 	}
+	return schema, nil
 }
 
 // loadComments preserves per-issue chronological order in one table read.
+// Standard schemas execute a single SELECT without extra PRAGMA metadata queries;
+// minimal schemas omitting id/author/created_at fall back to column inspection
+// only when the primary SELECT fails, while malformed tables missing issue_id
+// or text still increment ReadErrors.
 func (r *sqliteReadSession) loadComments(ctx context.Context, issues []model.Issue, byID map[string][]int, report *LoadReport) {
-	query := `SELECT issue_id, id, author, text, created_at FROM comments ORDER BY issue_id, created_at, id`
-	rows, err := r.db.QueryContext(ctx, query)
+	hasIDCol := true
+	hasAuthorCol := true
+	rows, err := r.db.QueryContext(ctx, `SELECT issue_id, CAST(id AS TEXT), author, text, created_at FROM comments ORDER BY issue_id, created_at, id`)
 	if err != nil {
-		report.ReadErrors++
-		report.addWarning(fmt.Sprintf("reading comments: %v", err))
-		return
+		columns, colErr := r.tableColumns(ctx, "comments")
+		if colErr != nil || !columns["issue_id"] || !columns["text"] {
+			report.ReadErrors++
+			report.addWarning(fmt.Sprintf("reading comments: %v", err))
+			return
+		}
+		hasIDCol = columns["id"]
+		hasAuthorCol = columns["author"]
+		idExpr := "''"
+		idOrder := "rowid"
+		if hasIDCol {
+			idExpr = "CAST(id AS TEXT)"
+			idOrder = "id"
+		}
+		authorExpr := "''"
+		if hasAuthorCol {
+			authorExpr = "author"
+		}
+		createdExpr := "NULL"
+		orderBy := "issue_id, " + idOrder
+		if columns["created_at"] {
+			createdExpr = "created_at"
+			orderBy = "issue_id, created_at, " + idOrder
+		}
+		fallbackQuery := fmt.Sprintf(`SELECT issue_id, %s, %s, text, %s FROM comments ORDER BY %s`,
+			idExpr, authorExpr, createdExpr, orderBy)
+		rows, err = r.db.QueryContext(ctx, fallbackQuery)
+		if err != nil {
+			report.ReadErrors++
+			report.addWarning(fmt.Sprintf("reading comments: %v", err))
+			return
+		}
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var comment model.Comment
-		var createdAt sql.NullString
-		if err := rows.Scan(&comment.IssueID, &comment.ID, &comment.Author, &comment.Text, &createdAt); err != nil {
+		var issueID, id, author, text, createdAt sql.NullString
+		if err := rows.Scan(&issueID, &id, &author, &text, &createdAt); err != nil {
 			report.ReadErrors++
-			report.addWarning(fmt.Sprintf("reading comment for %q: %v", comment.IssueID, err))
+			report.addWarning(fmt.Sprintf("reading comment for %q: %v", issueID.String, err))
 			continue
 		}
-		if createdAt.Valid {
-			if t, ok := parseSQLiteTime(createdAt.String); ok {
-				comment.CreatedAt = t
+		if !issueID.Valid || strings.TrimSpace(issueID.String) == "" || !text.Valid || (hasAuthorCol && !author.Valid) || (hasIDCol && !id.Valid) {
+			report.ReadErrors++
+			report.addWarning(fmt.Sprintf("invalid NULL comment field for %q", issueID.String))
+			continue
+		}
+		comment := model.Comment{
+			ID:      id.String,
+			IssueID: issueID.String,
+			Author:  author.String,
+			Text:    text.String,
+		}
+		if createdAt.Valid && strings.TrimSpace(createdAt.String) != "" {
+			t, ok := parseSQLiteTime(createdAt.String)
+			if !ok {
+				report.ReadErrors++
+				report.addWarning(fmt.Sprintf("invalid comment created_at for %q: %q", comment.IssueID, createdAt.String))
+				continue
 			}
+			comment.CreatedAt = t
 		}
 		for _, i := range byID[comment.IssueID] {
-			issues[i].Comments = append(issues[i].Comments, &comment)
+			c := comment
+			issues[i].Comments = append(issues[i].Comments, &c)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -790,8 +904,13 @@ func parseSQLiteTime(raw string) (time.Time, bool) {
 	for _, layout := range []string{
 		time.RFC3339Nano,
 		time.RFC3339,
-		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05.999999999",
 		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05Z07:00",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
 	} {
 		if t, err := time.Parse(layout, raw); err == nil {
 			return t, true

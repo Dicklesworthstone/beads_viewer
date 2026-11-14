@@ -106,13 +106,17 @@ func DetectMissingDependencies(issues []model.Issue, config DependencySuggestion
 		idToIndex[issue.ID] = i
 	}
 
-	// Fill existingDeps
+	// Fill existingDeps and blockingAdj for O(V+E) boundary-aware cycle checks
+	blockingAdj := make([][]int, len(issues))
 	for i, issue := range issues {
 		deps := make(map[int]bool)
 		for _, dep := range issue.Dependencies {
 			if dep != nil {
 				if idx, ok := idToIndex[dep.DependsOnID]; ok {
 					deps[idx] = true
+					if dep.Type.IsBlocking() {
+						blockingAdj[i] = append(blockingAdj[i], idx)
+					}
 				}
 			}
 		}
@@ -229,15 +233,29 @@ func DetectMissingDependencies(issues []model.Issue, config DependencySuggestion
 		}
 	}
 
-	// Sort by confidence and limit
+	// Sort by confidence and convert up to MaxSuggestions non-cycle-forming matches
 	sortMatchesByConfidence(matches)
-	if len(matches) > config.MaxSuggestions {
-		matches = matches[:config.MaxSuggestions]
-	}
 
-	// Convert to suggestions
-	suggestions := make([]Suggestion, 0, len(matches))
+	capHint := len(matches)
+	if capHint > config.MaxSuggestions {
+		capHint = config.MaxSuggestions
+	}
+	suggestions := make([]Suggestion, 0, capHint)
+	visitedGen := make([]int, len(issues))
+	gen := 0
 	for _, match := range matches {
+		if len(suggestions) >= config.MaxSuggestions {
+			break
+		}
+		fromIdx, okFrom := idToIndex[match.From]
+		toIdx, okTo := idToIndex[match.To]
+		if !okFrom || !okTo {
+			continue
+		}
+		gen++
+		if canReachBlockingIndex(blockingAdj, toIdx, fromIdx, visitedGen, gen) {
+			continue
+		}
 		sug := NewSuggestion(
 			SuggestionMissingDependency,
 			match.From,
@@ -245,13 +263,8 @@ func DetectMissingDependencies(issues []model.Issue, config DependencySuggestion
 			match.Reason,
 			match.Confidence,
 		).WithRelatedBead(match.To).
-			WithMetadata("shared_keywords", match.SharedKeywords)
-		if canAdd, cyclePath, warning := CheckDependencyAddition(issues, match.From, match.To); canAdd {
-			sug = sug.withMutationAction(issues[idToIndex[match.From]], model.MutationAddDependency, &issues[idToIndex[match.To]], "")
-		} else {
-			sug = sug.WithMetadata("action_unavailable_reason", warning).
-				WithMetadata("cycle_path", cyclePath)
-		}
+			WithMetadata("shared_keywords", match.SharedKeywords).
+			withMutationAction(issues[fromIdx], model.MutationAddDependency, &issues[toIdx], "")
 
 		if len(match.SharedLabels) > 0 {
 			sug = sug.WithMetadata("shared_labels", match.SharedLabels)
@@ -261,6 +274,28 @@ func DetectMissingDependencies(issues []model.Issue, config DependencySuggestion
 	}
 
 	return suggestions
+}
+
+func canReachBlockingIndex(adj [][]int, startIdx, targetIdx int, visited []int, gen int) bool {
+	if startIdx == targetIdx {
+		return true
+	}
+	stack := []int{startIdx}
+	visited[startIdx] = gen
+	for len(stack) > 0 {
+		curr := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		for _, next := range adj[curr] {
+			if next == targetIdx {
+				return true
+			}
+			if visited[next] != gen {
+				visited[next] = gen
+				stack = append(stack, next)
+			}
+		}
+	}
+	return false
 }
 
 func titleContainsKeyword(titleLower string, keywords []string) bool {

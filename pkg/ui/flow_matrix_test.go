@@ -1,6 +1,7 @@
 package ui_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // =============================================================================
@@ -641,5 +643,236 @@ func TestFlowMatrixModelEmptyOperations(t *testing.T) {
 
 	if m.SelectedLabel() != "" {
 		t.Errorf("SelectedLabel() = %q, want empty for empty model", m.SelectedLabel())
+	}
+}
+
+func TestFlowMatrixRightPaneFocusAndScroll(t *testing.T) {
+	theme := testFlowTheme()
+	m := ui.NewFlowMatrixModel(theme)
+
+	issues := []model.Issue{
+		{ID: "B-1", Title: "Auth middleware", Status: model.StatusOpen, Priority: 1, Labels: []string{"backend"}},
+		{ID: "B-2", Title: "DB schema", Status: model.StatusOpen, Priority: 2, Labels: []string{"backend"}},
+		{ID: "B-3", Title: "Cache layer", Status: model.StatusInProgress, Priority: 2, Labels: []string{"backend"}},
+		{
+			ID: "F-1", Title: "Login screen", Status: model.StatusOpen, Priority: 1, Labels: []string{"frontend"},
+			Dependencies: []*model.Dependency{
+				{IssueID: "F-1", DependsOnID: "B-1", Type: model.DepBlocks},
+				{IssueID: "F-1", DependsOnID: "B-2", Type: model.DepBlocks},
+				{IssueID: "F-1", DependsOnID: "B-3", Type: model.DepBlocks},
+			},
+		},
+	}
+	flow := analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m.SetData(&flow, issues)
+	m.SetSize(120, 28)
+
+	// Left pane focused initially: SelectedDrilldownIssue is nil before TogglePanel / OpenDrilldown.
+	if m.SelectedDrilldownIssue() != nil {
+		t.Fatalf("expected nil SelectedDrilldownIssue while left pane is focused, got %+v", m.SelectedDrilldownIssue())
+	}
+	leftFocusedView := m.View()
+
+	// Tab switches focus to right pane (focusPanel == 1), highlights border, and exposes inline RELATED ISSUES.
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	rightFocusedView := m.View()
+	if rightFocusedView == leftFocusedView {
+		t.Fatal("expected Tab to visually update focused pane border and indicator")
+	}
+	if !strings.Contains(rightFocusedView, "RELATED ISSUES") {
+		t.Fatalf("expected inline RELATED ISSUES in right pane:\n%s", rightFocusedView)
+	}
+	first := m.SelectedDrilldownIssue()
+	if first == nil {
+		t.Fatal("expected non-nil SelectedDrilldownIssue when right pane has focus")
+	}
+	firstID := first.ID
+
+	// j / down in right pane scrolls drilldownCursor without moving left-pane SelectedLabel.
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	second := m.SelectedDrilldownIssue()
+	if second == nil || second.ID == firstID {
+		t.Fatalf("expected 'j' in right pane to advance SelectedDrilldownIssue from %q, got %+v", firstID, second)
+	}
+	if m.SelectedLabel() != "backend" {
+		t.Fatalf("right-pane scroll must not change SelectedLabel(), got %q", m.SelectedLabel())
+	}
+
+	// G jumps to last related issue; g jumps back to first.
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	last := m.SelectedDrilldownIssue()
+	if last == nil || last.ID == firstID {
+		t.Fatalf("expected 'G' in right pane to jump to last issue, got %+v", last)
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	backToFirst := m.SelectedDrilldownIssue()
+	if backToFirst == nil || backToFirst.ID != firstID {
+		t.Fatalf("expected 'g' in right pane to return to %q, got %+v", firstID, backToFirst)
+	}
+}
+
+func TestFlowMatrixViewportPairAlignmentAndPageKeys(t *testing.T) {
+	theme := ui.DefaultTheme(lipgloss.NewRenderer(nil))
+	m := ui.NewFlowMatrixModel(theme)
+
+	var issues []model.Issue
+	// Build 7 blocking pairs from "backend" -> "frontend" plus extra labels so both panes scroll.
+	for i := 1; i <= 7; i++ {
+		blockerID := fmt.Sprintf("B-%02d", i)
+		blockedID := fmt.Sprintf("F-%02d", i)
+		issues = append(issues,
+			model.Issue{
+				ID:     blockerID,
+				Title:  fmt.Sprintf("Backend blocker %d", i),
+				Status: model.StatusOpen,
+				Labels: []string{"backend"},
+			},
+			model.Issue{
+				ID:     blockedID,
+				Title:  fmt.Sprintf("Frontend dependent %d", i),
+				Status: model.StatusBlocked,
+				Labels: []string{"frontend"},
+				Dependencies: []*model.Dependency{
+					{IssueID: blockedID, DependsOnID: blockerID, Type: model.DepBlocks},
+				},
+			},
+		)
+	}
+	for i := 1; i <= 8; i++ {
+		lbl := fmt.Sprintf("team-%02d", i)
+		src := fmt.Sprintf("T-%02d", i)
+		dst := fmt.Sprintf("U-%02d", i)
+		issues = append(issues,
+			model.Issue{ID: src, Title: "Src " + src, Status: model.StatusOpen, Labels: []string{lbl}},
+			model.Issue{
+				ID:     dst,
+				Title:  "Dst " + dst,
+				Status: model.StatusBlocked,
+				Labels: []string{"sink"},
+				Dependencies: []*model.Dependency{
+					{IssueID: dst, DependsOnID: src, Type: model.DepBlocks},
+				},
+			},
+		)
+	}
+
+	flow := analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
+	m.SetData(&flow, issues)
+	m.SetSize(120, 18)
+
+	// 1. Left pane (focusPanel == 0): pgdown/pgup and ctrl+d/ctrl+u move SelectedLabel.
+	startLabel := m.SelectedLabel()
+	if startLabel != "backend" {
+		t.Fatalf("expected top label 'backend', got %q", startLabel)
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	afterPgDn := m.SelectedLabel()
+	if afterPgDn == startLabel {
+		t.Fatalf("expected pgdown in left pane to advance label from %q", startLabel)
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	if m.SelectedLabel() != startLabel {
+		t.Fatalf("expected pgup in left pane to return to %q, got %q", startLabel, m.SelectedLabel())
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	if m.SelectedLabel() == startLabel {
+		t.Fatalf("expected ctrl+d in left pane to advance label from %q", startLabel)
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	if m.SelectedLabel() != startLabel {
+		t.Fatalf("expected ctrl+u in left pane to return to %q, got %q", startLabel, m.SelectedLabel())
+	}
+
+	// 2. Switch to inline right pane (focusPanel == 1) and test pgdown/pgup/ctrl+d/ctrl+u.
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	firstIssue := m.SelectedDrilldownIssue()
+	if firstIssue == nil {
+		t.Fatal("expected non-nil SelectedDrilldownIssue after Tab")
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID == firstIssue.ID {
+		t.Fatalf("expected pgdown in right pane to advance from %q, got %+v", firstIssue.ID, got)
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID != firstIssue.ID {
+		t.Fatalf("expected pgup in right pane to return to %q, got %+v", firstIssue.ID, got)
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID == firstIssue.ID {
+		t.Fatalf("expected ctrl+d in right pane to advance from %q, got %+v", firstIssue.ID, got)
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID != firstIssue.ID {
+		t.Fatalf("expected ctrl+u in right pane to return to %q, got %+v", firstIssue.ID, got)
+	}
+
+	// 3. Across odd and even heights, stepping j from 0..end and k back to 0 must keep the
+	// selected issue visible inside View() AND never orphan "↳ blocks" at the first row after RELATED ISSUES.
+	assertInlineViewportAligned := func(height, step int, dir string) {
+		t.Helper()
+		sel := m.SelectedDrilldownIssue()
+		if sel == nil {
+			t.Fatalf("height=%d %s step=%d: nil SelectedDrilldownIssue", height, dir, step)
+		}
+		plain := ansi.Strip(m.View())
+		if !strings.Contains(plain, sel.ID) {
+			t.Fatalf("height=%d %s step=%d: selected issue %q clipped out of View():\n%s", height, dir, step, sel.ID, plain)
+		}
+		lines := strings.Split(plain, "\n")
+		foundHeader := false
+		for idx, ln := range lines {
+			if strings.Contains(ln, "RELATED ISSUES (") {
+				foundHeader = true
+				if idx+1 < len(lines) && strings.Contains(lines[idx+1], "↳ blocks") {
+					t.Fatalf("height=%d %s step=%d: orphaned '↳ blocks' at first related-issue row: %q\n%s",
+						height, dir, step, lines[idx+1], plain)
+				}
+				break
+			}
+		}
+		if !foundHeader {
+			t.Fatalf("height=%d %s step=%d: RELATED ISSUES header missing from View():\n%s", height, dir, step, plain)
+		}
+	}
+
+	for _, h := range []int{18, 19, 20, 21, 23, 25} {
+		m.SetSize(120, h)
+		_ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+		assertInlineViewportAligned(h, 0, "init")
+		for step := 1; step < 14; step++ {
+			_ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+			assertInlineViewportAligned(h, step, "down")
+		}
+		for step := 12; step >= 0; step-- {
+			_ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+			assertInlineViewportAligned(h, step, "up")
+		}
+	}
+
+	// 4. Full-screen drilldown: Enter opens drilldown, pgdown/pgup/ctrl+d/ctrl+u move cursor cleanly.
+	m.SetSize(120, 19)
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !strings.Contains(ansi.Strip(m.View()), "Dependencies involving:") {
+		t.Fatalf("expected Enter to open full-screen drilldown:\n%s", ansi.Strip(m.View()))
+	}
+	ddFirst := m.SelectedDrilldownIssue()
+	if ddFirst == nil {
+		t.Fatal("expected non-nil SelectedDrilldownIssue in full-screen drilldown")
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID == ddFirst.ID {
+		t.Fatalf("expected pgdown in full-screen drilldown to advance from %q, got %+v", ddFirst.ID, got)
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID != ddFirst.ID {
+		t.Fatalf("expected pgup in full-screen drilldown to return to %q, got %+v", ddFirst.ID, got)
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID == ddFirst.ID {
+		t.Fatalf("expected ctrl+d in full-screen drilldown to advance from %q, got %+v", ddFirst.ID, got)
+	}
+	_ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	if got := m.SelectedDrilldownIssue(); got == nil || got.ID != ddFirst.ID {
+		t.Fatalf("expected ctrl+u in full-screen drilldown to return to %q, got %+v", ddFirst.ID, got)
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"log"
 	"math"
-	"strings"
 	"testing"
 )
 
@@ -96,8 +95,8 @@ func TestWeightsValidate_LowTextWarns(t *testing.T) {
 	if err := weights.Validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(buf.String(), "WARNING: text weight") {
-		t.Fatalf("expected warning log for low text weight, got %q", buf.String())
+	if buf.Len() != 0 {
+		t.Fatalf("expected silent validation without raw log output, got %q", buf.String())
 	}
 }
 

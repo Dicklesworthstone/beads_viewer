@@ -37,13 +37,16 @@ type TriageContext struct {
 	actionableSetComputed bool
 	actionableComputed    bool
 
-	blockerDepth        map[string]int
-	openBlockers        map[string][]string
-	unblocksMap         map[string][]string
-	unblocksComputed    bool
-	labelHealth         map[string]int
-	labelHealthComputed bool
-	labelHealthNow      time.Time
+	blockerDepth           map[string]int
+	openBlockers           map[string][]string
+	unblocksMap            map[string][]string
+	unblocksComputed       bool
+	labelHealth            map[string]int
+	labelHealthComputed    bool
+	labelHealthNow         time.Time
+	labelAttention         map[string]float64
+	labelAttentionComputed bool
+	labelAttentionNow      time.Time
 
 	// Thread safety (nil for single-threaded mode)
 	mu *sync.Mutex
@@ -327,8 +330,8 @@ func (ctx *TriageContext) AllBlockerDepths() map[string]int {
 	return result
 }
 
-// SetStats attaches precomputed GraphStats so LabelHealthMap can reuse the
-// caller's Phase 2 metrics without running a second graph analysis pass.
+// SetStats attaches precomputed GraphStats so LabelHealthMap and LabelAttentionMap
+// can reuse the caller's Phase 2 metrics without running a second graph analysis pass.
 func (ctx *TriageContext) SetStats(stats *GraphStats) {
 	ctx.lock()
 	defer ctx.unlock()
@@ -336,6 +339,8 @@ func (ctx *TriageContext) SetStats(stats *GraphStats) {
 	ctx.stats = stats
 	ctx.labelHealth = nil
 	ctx.labelHealthComputed = false
+	ctx.labelAttention = nil
+	ctx.labelAttentionComputed = false
 }
 
 // LabelHealthMap returns a memoized map of label -> composite health score (0-100)
@@ -361,6 +366,29 @@ func (ctx *TriageContext) LabelHealthMap(now time.Time) map[string]int {
 	return ctx.labelHealth
 }
 
+// LabelAttentionMap returns a memoized map of label -> normalized [0, 1] attention
+// score evaluated at now. Subsequent calls with the same reference instant return in O(1).
+func (ctx *TriageContext) LabelAttentionMap(now time.Time) map[string]float64 {
+	ctx.lock()
+	defer ctx.unlock()
+
+	if ctx.labelAttentionComputed && ctx.labelAttentionNow.Equal(now) {
+		return ctx.labelAttention
+	}
+	if ctx.analyzer == nil || len(ctx.analyzer.issues) == 0 {
+		ctx.labelAttention = map[string]float64{}
+		ctx.labelAttentionNow = now
+		ctx.labelAttentionComputed = true
+		return ctx.labelAttention
+	}
+
+	attnMap := ComputeLabelAttentionScoresFast(ctx.analyzer.issues, DefaultLabelHealthConfig(), now, ctx.stats)
+	ctx.labelAttention = attnMap
+	ctx.labelAttentionNow = now
+	ctx.labelAttentionComputed = true
+	return ctx.labelAttention
+}
+
 // Reset clears all caches for reuse with fresh data.
 //
 // Call this if the underlying Analyzer data changes and you want to recompute.
@@ -379,6 +407,9 @@ func (ctx *TriageContext) Reset() {
 	ctx.labelHealth = nil
 	ctx.labelHealthComputed = false
 	ctx.labelHealthNow = time.Time{}
+	ctx.labelAttention = nil
+	ctx.labelAttentionComputed = false
+	ctx.labelAttentionNow = time.Time{}
 }
 
 // GetIssue returns an issue by ID from the underlying Analyzer.

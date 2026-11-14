@@ -233,8 +233,7 @@ func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLab
 	}
 
 	// Dependency aggregation
-	type pairKey struct{ from, to string }
-	depMap := make(map[pairKey]*LabelDependency)
+	depMap := make(map[crossLabelPairKey]*LabelDependency)
 	totalDeps := 0
 
 	for _, blocked := range issues {
@@ -252,9 +251,9 @@ func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLab
 			if !cfg.IncludeClosedInFlow && isClosedLikeStatus(blocker.Status) {
 				continue
 			}
-			// Cross-product of labels
-			for _, from := range blocker.Labels {
-				for _, to := range blocked.Labels {
+			// Cross-product of deduplicated labels
+			for _, from := range dedupePreserveOrder(blocker.Labels) {
+				for _, to := range dedupePreserveOrder(blocked.Labels) {
 					if from == "" || to == "" || from == to {
 						continue // skip empty/self
 					}
@@ -265,7 +264,7 @@ func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLab
 					}
 					matrix[iFrom][iTo]++
 					totalDeps++
-					key := pairKey{from: from, to: to}
+					key := crossLabelPairKey{from: from, to: to}
 					entry, exists := depMap[key]
 					if !exists {
 						entry = &LabelDependency{
@@ -324,14 +323,236 @@ func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLab
 	}
 	sort.Strings(bottlenecks)
 
+	criticalPaths := computeCrossLabelCriticalPaths(labelList, matrix, depMap, totalDeps)
+
 	return CrossLabelFlow{
 		Labels:              labelList,
 		FlowMatrix:          matrix,
 		Dependencies:        deps,
-		CriticalPaths:       []LabelPath{},
+		CriticalPaths:       criticalPaths,
 		BottleneckLabels:    bottlenecks,
 		TotalCrossLabelDeps: totalDeps,
 	}
+}
+
+type crossLabelPairKey struct {
+	from, to string
+}
+
+func computeCrossLabelCriticalPaths(labelList []string, matrix [][]int, depMap map[crossLabelPairKey]*LabelDependency, totalDeps int) []LabelPath {
+	n := len(labelList)
+	if n < 2 || totalDeps == 0 {
+		return []LabelPath{}
+	}
+
+	adj := make([][]int, n)
+	inDeg := make([]int, n)
+	for u := 0; u < n; u++ {
+		for v := 0; v < n; v++ {
+			if u != v && matrix[u][v] > 0 {
+				adj[u] = append(adj[u], v)
+				inDeg[v]++
+			}
+		}
+	}
+
+	// Build start nodes: all source labels (inDeg == 0 && outDeg > 0),
+	// plus canonical representatives for any cyclic components unreachable from sources.
+	var starts []int
+	reachable := make([]bool, n)
+	var markReachable func(int)
+	markReachable = func(u int) {
+		if reachable[u] {
+			return
+		}
+		reachable[u] = true
+		for _, v := range adj[u] {
+			markReachable(v)
+		}
+	}
+	for u := 0; u < n; u++ {
+		if inDeg[u] == 0 && len(adj[u]) > 0 {
+			starts = append(starts, u)
+			markReachable(u)
+		}
+	}
+	for u := 0; u < n; u++ {
+		if !reachable[u] && len(adj[u]) > 0 {
+			starts = append(starts, u)
+			markReachable(u)
+		}
+	}
+	if len(starts) == 0 {
+		return []LabelPath{}
+	}
+
+	// Check if label graph is a DAG via Kahn's algorithm for fast exact DP;
+	// fall back to bounded simple-path DFS when cycles exist.
+	remIn := make([]int, n)
+	copy(remIn, inDeg)
+	topoOrder := make([]int, 0, n)
+	queue := make([]int, 0, n)
+	for u := 0; u < n; u++ {
+		if remIn[u] == 0 {
+			queue = append(queue, u)
+		}
+	}
+	for head := 0; head < len(queue); head++ {
+		u := queue[head]
+		topoOrder = append(topoOrder, u)
+		for _, v := range adj[u] {
+			remIn[v]--
+			if remIn[v] == 0 {
+				queue = append(queue, v)
+			}
+		}
+	}
+	isDAG := len(topoOrder) == n
+
+	buildLabelPath := func(nodeIdxs []int) LabelPath {
+		pathLabels := make([]string, len(nodeIdxs))
+		for i, idx := range nodeIdxs {
+			pathLabels[i] = labelList[idx]
+		}
+		var totalWeight float64
+		issueSet := make(map[string]struct{})
+		for i := 0; i+1 < len(nodeIdxs); i++ {
+			u, v := nodeIdxs[i], nodeIdxs[i+1]
+			totalWeight += float64(matrix[u][v])
+			if entry := depMap[crossLabelPairKey{from: labelList[u], to: labelList[v]}]; entry != nil {
+				for _, bp := range entry.BlockingPairs {
+					issueSet[bp.BlockerID] = struct{}{}
+					issueSet[bp.BlockedID] = struct{}{}
+				}
+			}
+		}
+		return LabelPath{
+			Labels:      pathLabels,
+			Length:      len(pathLabels) - 1,
+			IssueCount:  len(issueSet),
+			TotalWeight: totalWeight,
+		}
+	}
+
+	var candidates []LabelPath
+	if isDAG {
+		bestLen := make([]int, n)
+		bestWeight := make([]float64, n)
+		bestNext := make([]int, n)
+		for i := range bestNext {
+			bestNext[i] = -1
+		}
+		for i := len(topoOrder) - 1; i >= 0; i-- {
+			u := topoOrder[i]
+			for _, v := range adj[u] {
+				candLen := 1 + bestLen[v]
+				candW := float64(matrix[u][v]) + bestWeight[v]
+				if candLen > bestLen[u] ||
+					(candLen == bestLen[u] && candW > bestWeight[u]) ||
+					(candLen == bestLen[u] && candW == bestWeight[u] && (bestNext[u] == -1 || v < bestNext[u])) {
+					bestLen[u] = candLen
+					bestWeight[u] = candW
+					bestNext[u] = v
+				}
+			}
+		}
+		for _, s := range starts {
+			if bestNext[s] == -1 {
+				continue
+			}
+			var seq []int
+			for cur := s; cur != -1; cur = bestNext[cur] {
+				seq = append(seq, cur)
+			}
+			if len(seq) >= 2 {
+				candidates = append(candidates, buildLabelPath(seq))
+			}
+		}
+	} else {
+		maxDepth := min(n, 12)
+		const maxVisitsPerStart = 2048
+		for _, s := range starts {
+			visited := make([]bool, n)
+			curSeq := []int{s}
+			var bestSeq []int
+			var bestW float64
+			visits := 0
+
+			var dfs func(u int, curW float64)
+			dfs = func(u int, curW float64) {
+				if visits >= maxVisitsPerStart {
+					return
+				}
+				visits++
+				extended := false
+				if len(curSeq) < maxDepth {
+					for _, v := range adj[u] {
+						if visited[v] {
+							continue
+						}
+						extended = true
+						visited[v] = true
+						curSeq = append(curSeq, v)
+						dfs(v, curW+float64(matrix[u][v]))
+						curSeq = curSeq[:len(curSeq)-1]
+						visited[v] = false
+						if visits >= maxVisitsPerStart {
+							break
+						}
+					}
+				}
+				if !extended && len(curSeq) >= 2 {
+					better := len(curSeq) > len(bestSeq) ||
+						(len(curSeq) == len(bestSeq) && curW > bestW)
+					if !better && len(curSeq) == len(bestSeq) && curW == bestW {
+						for k := range curSeq {
+							if curSeq[k] != bestSeq[k] {
+								better = curSeq[k] < bestSeq[k]
+								break
+							}
+						}
+					}
+					if better {
+						bestSeq = append(bestSeq[:0], curSeq...)
+						bestW = curW
+					}
+				}
+			}
+			visited[s] = true
+			dfs(s, 0)
+			if len(bestSeq) >= 2 {
+				candidates = append(candidates, buildLabelPath(bestSeq))
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		return []LabelPath{}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Length != candidates[j].Length {
+			return candidates[i].Length > candidates[j].Length
+		}
+		if candidates[i].TotalWeight != candidates[j].TotalWeight {
+			return candidates[i].TotalWeight > candidates[j].TotalWeight
+		}
+		if candidates[i].IssueCount != candidates[j].IssueCount {
+			return candidates[i].IssueCount > candidates[j].IssueCount
+		}
+		for k := 0; k < len(candidates[i].Labels) && k < len(candidates[j].Labels); k++ {
+			if candidates[i].Labels[k] != candidates[j].Labels[k] {
+				return candidates[i].Labels[k] < candidates[j].Labels[k]
+			}
+		}
+		return len(candidates[i].Labels) < len(candidates[j].Labels)
+	})
+
+	const maxCriticalPaths = 10
+	if len(candidates) > maxCriticalPaths {
+		candidates = candidates[:maxCriticalPaths]
+	}
+	return candidates
 }
 
 // ComputeVelocityMetrics calculates simple velocity stats for a label.
@@ -414,6 +635,20 @@ func ComputeVelocityMetrics(issues []model.Issue, now time.Time) VelocityMetrics
 	}
 }
 
+func sortedIssueOrder(issues []model.Issue) []int {
+	order := make([]int, len(issues))
+	for i := range issues {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool {
+		if issues[order[i]].ID != issues[order[j]].ID {
+			return issues[order[i]].ID < issues[order[j]].ID
+		}
+		return order[i] < order[j]
+	})
+	return order
+}
+
 // ComputeFreshnessMetrics calculates freshness and staleness for a label.
 func ComputeFreshnessMetrics(issues []model.Issue, now time.Time, staleDays int) FreshnessMetrics {
 	if staleDays <= 0 {
@@ -426,7 +661,9 @@ func ComputeFreshnessMetrics(issues []model.Issue, now time.Time, staleDays int)
 	staleCount := 0
 	threshold := float64(staleDays)
 
-	for _, iss := range issues {
+	order := sortedIssueOrder(issues)
+	for _, idx := range order {
+		iss := &issues[idx]
 		if iss.UpdatedAt.After(mostRecent) {
 			mostRecent = iss.UpdatedAt
 		}
@@ -435,13 +672,13 @@ func ComputeFreshnessMetrics(issues []model.Issue, now time.Time, staleDays int)
 			if !iss.CreatedAt.IsZero() && (oldestOpen.IsZero() || iss.CreatedAt.Before(oldestOpen)) {
 				oldestOpen = iss.CreatedAt
 			}
-		}
-		if !iss.UpdatedAt.IsZero() {
-			days := now.Sub(iss.UpdatedAt).Hours() / 24.0
-			totalStaleness += days
-			count++
-			if days >= threshold {
-				staleCount++
+			if !iss.UpdatedAt.IsZero() {
+				days := now.Sub(iss.UpdatedAt).Hours() / 24.0
+				totalStaleness += days
+				count++
+				if days >= threshold {
+					staleCount++
+				}
 			}
 		}
 	}
@@ -465,18 +702,68 @@ func ComputeFreshnessMetrics(issues []model.Issue, now time.Time, staleDays int)
 
 // ComputeLabelHealthForLabel computes health for a single label.
 // If stats is nil, it will compute graph stats once for the provided issues.
+func dedupePreserveOrder(labels []string) []string {
+	if len(labels) == 0 {
+		return nil
+	}
+	if len(labels) == 1 {
+		if labels[0] == "" {
+			return nil
+		}
+		return labels
+	}
+	hasDupOrEmpty := false
+	for i, l := range labels {
+		if l == "" {
+			hasDupOrEmpty = true
+			break
+		}
+		for j := 0; j < i; j++ {
+			if labels[j] == l {
+				hasDupOrEmpty = true
+				break
+			}
+		}
+		if hasDupOrEmpty {
+			break
+		}
+	}
+	if !hasDupOrEmpty {
+		return labels
+	}
+	out := make([]string, 0, len(labels))
+	for _, l := range labels {
+		if l == "" {
+			continue
+		}
+		seen := false
+		for _, prev := range out {
+			if prev == l {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
 func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHealthConfig, now time.Time, stats *GraphStats) LabelHealth {
 	health := NewLabelHealth(label)
 	health.Issues = []string{}
 
-	// Collect issues with this label and build an O(1) ID -> first-seen Labels index
+	// Collect issues with this label and build O(1) ID -> first-seen Labels & Status indices
 	// (matching GetLabelsForIssue semantics without O(N*E) linear scans).
 	var labeled []model.Issue
 	firstLabelsByID := make(map[string][]string, len(issues))
+	firstStatusByID := make(map[string]model.Status, len(issues))
 	for i := range issues {
 		iss := &issues[i]
 		if _, seen := firstLabelsByID[iss.ID]; !seen {
-			firstLabelsByID[iss.ID] = iss.Labels
+			firstLabelsByID[iss.ID] = dedupePreserveOrder(iss.Labels)
+			firstStatusByID[iss.ID] = iss.Status
 		}
 		for _, l := range iss.Labels {
 			if l == label {
@@ -494,17 +781,20 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 		return health
 	}
 
-	// Status counts
+	readiness := model.NewReadinessIndex(issues)
+
+	// Status counts (counting open issues with unsatisfied blocking dependencies in Blocked without double-counting)
 	for i := range labeled {
 		switch labeled[i].Status {
 		case model.StatusClosed, model.StatusTombstone:
 			health.ClosedCount++
-		case model.StatusInProgress:
-			health.OpenCount++
 		case model.StatusBlocked:
 			health.Blocked++
 		default:
 			health.OpenCount++
+			if readiness.DependencyState(labeled[i].ID) != model.DependenciesSatisfied {
+				health.Blocked++
+			}
 		}
 	}
 
@@ -521,14 +811,21 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 	}
 	// Incoming: other labels' issues block this label's issues
 	for i := range labeled {
+		if !cfg.IncludeClosedInFlow && isClosedLikeStatus(labeled[i].Status) {
+			continue
+		}
 		hasExternalBlocker := false
 		for _, dep := range labeled[i].Dependencies {
 			if dep == nil || !dep.Type.IsBlocking() {
 				continue
 			}
+			blockerStatus, exists := firstStatusByID[dep.DependsOnID]
+			if !exists || (!cfg.IncludeClosedInFlow && isClosedLikeStatus(blockerStatus)) {
+				continue
+			}
 			blockerLabels := firstLabelsByID[dep.DependsOnID]
 			for _, bl := range blockerLabels {
-				if bl != label {
+				if bl != "" && bl != label {
 					flow.IncomingDeps++
 					seenIn[bl] = struct{}{}
 					hasExternalBlocker = true
@@ -545,13 +842,20 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 		if labeledSet[other.ID] {
 			continue
 		}
+		if !cfg.IncludeClosedInFlow && isClosedLikeStatus(other.Status) {
+			continue
+		}
 		for _, dep := range other.Dependencies {
 			if dep == nil || !dep.Type.IsBlocking() {
 				continue
 			}
+			blockerStatus, exists := firstStatusByID[dep.DependsOnID]
+			if !exists || (!cfg.IncludeClosedInFlow && isClosedLikeStatus(blockerStatus)) {
+				continue
+			}
 			if labeledSet[dep.DependsOnID] {
-				for _, ol := range other.Labels {
-					if ol != label {
+				for _, ol := range dedupePreserveOrder(other.Labels) {
+					if ol != "" && ol != label {
 						flow.OutgoingDeps++
 						seenOut[ol] = struct{}{}
 					}
@@ -599,6 +903,8 @@ func computeLabelCriticality(labeled []model.Issue, stats *GraphStats, maxPR, ma
 	var prSum, bwSum, maxBwLabel float64
 	var critCount, bottleneckCount int
 
+	order := sortedIssueOrder(labeled)
+
 	stats.mu.RLock()
 	pr := stats.pageRank
 	bw := stats.betweenness
@@ -607,8 +913,8 @@ func computeLabelCriticality(labeled []model.Issue, stats *GraphStats, maxPR, ma
 		maxPR = findMax(pr)
 		maxBW = findMax(bw)
 	}
-	for i := range labeled {
-		id := labeled[i].ID
+	for _, idx := range order {
+		id := labeled[idx].ID
 		prSum += pr[id]
 		bwVal := bw[id]
 		bwSum += bwVal
@@ -653,6 +959,8 @@ func computeIndexedLabelHealth(
 	label string,
 	labeled []model.Issue,
 	firstLabelsByID map[string][]string,
+	firstStatusByID map[string]model.Status,
+	readiness *model.ReadinessIndex,
 	outAcc *labelOutgoingAcc,
 	cfg LabelHealthConfig,
 	now time.Time,
@@ -676,12 +984,13 @@ func computeIndexedLabelHealth(
 		switch labeled[i].Status {
 		case model.StatusClosed, model.StatusTombstone:
 			health.ClosedCount++
-		case model.StatusInProgress:
-			health.OpenCount++
 		case model.StatusBlocked:
 			health.Blocked++
 		default:
 			health.OpenCount++
+			if readiness != nil && readiness.DependencyState(labeled[i].ID) != model.DependenciesSatisfied {
+				health.Blocked++
+			}
 		}
 	}
 
@@ -691,14 +1000,21 @@ func computeIndexedLabelHealth(
 	flow := FlowMetrics{}
 	seenIn := make(map[string]struct{})
 	for i := range labeled {
+		if !cfg.IncludeClosedInFlow && isClosedLikeStatus(labeled[i].Status) {
+			continue
+		}
 		hasExternalBlocker := false
 		for _, dep := range labeled[i].Dependencies {
 			if dep == nil || !dep.Type.IsBlocking() {
 				continue
 			}
+			blockerStatus, exists := firstStatusByID[dep.DependsOnID]
+			if !exists || (!cfg.IncludeClosedInFlow && isClosedLikeStatus(blockerStatus)) {
+				continue
+			}
 			blockerLabels := firstLabelsByID[dep.DependsOnID]
 			for _, bl := range blockerLabels {
-				if bl != label {
+				if bl != "" && bl != label {
 					flow.IncomingDeps++
 					seenIn[bl] = struct{}{}
 					hasExternalBlocker = true
@@ -740,7 +1056,7 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 	labels := ExtractLabels(issues)
 	result := LabelAnalysisResult{
 		GeneratedAt:     now,
-		TotalLabels:     labels.LabelCount,
+		TotalLabels:     0,
 		Labels:          []LabelHealth{},
 		Summaries:       []LabelSummary{},
 		AttentionNeeded: []string{},
@@ -765,13 +1081,15 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 	// Single-pass O(N) label & ID index + single-pass O(N + E) outgoing flow accumulation,
 	// avoiding O(L * N * E) GetLabelsForIssue linear scans and O(L * N) PageRank map clones.
 	firstLabelsByID := make(map[string][]string, len(issues))
+	firstStatusByID := make(map[string]model.Status, len(issues))
 	labelSetByID := make(map[string]map[string]struct{}, len(issues))
 	labeledByLabel := make(map[string][]model.Issue, len(labels.Labels))
 	seenOnEntry := make(map[string]struct{}, 8)
 	for i := range issues {
 		iss := &issues[i]
 		if _, seen := firstLabelsByID[iss.ID]; !seen {
-			firstLabelsByID[iss.ID] = iss.Labels
+			firstLabelsByID[iss.ID] = dedupePreserveOrder(iss.Labels)
+			firstStatusByID[iss.ID] = iss.Status
 		}
 		if len(iss.Labels) == 0 {
 			continue
@@ -802,10 +1120,17 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 		if len(other.Dependencies) == 0 {
 			continue
 		}
+		if !cfg.IncludeClosedInFlow && isClosedLikeStatus(other.Status) {
+			continue
+		}
 		clear(blockedSourceLabels)
 		otherSet := labelSetByID[other.ID]
 		for _, dep := range other.Dependencies {
 			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			blockerStatus, exists := firstStatusByID[dep.DependsOnID]
+			if !exists || (!cfg.IncludeClosedInFlow && isClosedLikeStatus(blockerStatus)) {
 				continue
 			}
 			for srcLabel := range labelSetByID[dep.DependsOnID] {
@@ -822,8 +1147,8 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 				outByLabel[srcLabel] = acc
 			}
 			acc.blockingExternal++
-			for _, ol := range other.Labels {
-				if ol != srcLabel {
+			for _, ol := range dedupePreserveOrder(other.Labels) {
+				if ol != "" && ol != srcLabel {
 					acc.outgoingDeps++
 					acc.seenOut[ol] = struct{}{}
 				}
@@ -836,10 +1161,20 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 	maxBW := findMax(fullStats.betweenness)
 	fullStats.mu.RUnlock()
 
+	minIssues := cfg.MinIssuesForHealth
+	if minIssues < 1 {
+		minIssues = 1
+	}
+
+	readiness := model.NewReadinessIndex(issues)
+
 	result.Labels = make([]LabelHealth, 0, len(labels.Labels))
 	result.Summaries = make([]LabelSummary, 0, len(labels.Labels))
 	for _, label := range labels.Labels {
-		health := computeIndexedLabelHealth(label, labeledByLabel[label], firstLabelsByID, outByLabel[label], cfg, now, fullStats, maxPR, maxBW)
+		if len(labeledByLabel[label]) < minIssues {
+			continue
+		}
+		health := computeIndexedLabelHealth(label, labeledByLabel[label], firstLabelsByID, firstStatusByID, readiness, outByLabel[label], cfg, now, fullStats, maxPR, maxBW)
 		result.Labels = append(result.Labels, health)
 		summary := LabelSummary{
 			Label:          label,
@@ -864,6 +1199,7 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 			result.AttentionNeeded = append(result.AttentionNeeded, label)
 		}
 	}
+	result.TotalLabels = len(result.Labels)
 
 	sort.Slice(result.Summaries, func(i, j int) bool {
 		if result.Summaries[i].Health != result.Summaries[j].Health {
@@ -922,10 +1258,12 @@ func ComputeLabelHealthScores(issues []model.Issue, cfg LabelHealthConfig, now t
 	}
 
 	firstLabelsByID := make(map[string][]string, len(issues))
+	firstStatusByID := make(map[string]model.Status, len(issues))
 	for i := range issues {
 		id := issues[i].ID
 		if _, seen := firstLabelsByID[id]; !seen {
-			firstLabelsByID[id] = issues[i].Labels
+			firstLabelsByID[id] = dedupePreserveOrder(issues[i].Labels)
+			firstStatusByID[id] = issues[i].Status
 		}
 	}
 
@@ -939,6 +1277,7 @@ func ComputeLabelHealthScores(issues []model.Issue, cfg LabelHealthConfig, now t
 	monthAgo := now.Add(-30 * day)
 	prevWeekStart := now.Add(-14 * day)
 
+	order := sortedIssueOrder(issues)
 	accByLabel := make(map[string]*labelScoreAcc, 32)
 
 	fullStats.mu.RLock()
@@ -947,15 +1286,16 @@ func ComputeLabelHealthScores(issues []model.Issue, cfg LabelHealthConfig, now t
 	maxPR := findMax(pr)
 	maxBW := findMax(bw)
 
-	for i := range issues {
-		iss := &issues[i]
+	for _, idx := range order {
+		iss := &issues[idx]
 		if len(iss.Labels) == 0 {
 			continue
 		}
 		issPR := pr[iss.ID]
 		issBW := bw[iss.ID]
 
-		isClosedWithTime := isClosedLikeStatus(iss.Status) && iss.ClosedAt != nil
+		isClosed := isClosedLikeStatus(iss.Status)
+		isClosedWithTime := isClosed && iss.ClosedAt != nil
 		var closed30Inc, prevWeekInc, curWeekInc int
 		if isClosedWithTime {
 			closedAt := *iss.ClosedAt
@@ -969,11 +1309,13 @@ func ComputeLabelHealthScores(issues []model.Issue, cfg LabelHealthConfig, now t
 			}
 		}
 
-		hasUpdated := !iss.UpdatedAt.IsZero()
+		hasUpdated := !isClosed && !iss.UpdatedAt.IsZero()
 		var stalenessDays float64
 		if hasUpdated {
 			stalenessDays = now.Sub(iss.UpdatedAt).Hours() / 24.0
 		}
+
+		includeFlow := cfg.IncludeClosedInFlow || !isClosed
 
 		for j, l := range iss.Labels {
 			if l == "" {
@@ -1003,13 +1345,19 @@ func ComputeLabelHealthScores(issues []model.Issue, cfg LabelHealthConfig, now t
 				acc.totalStaleness += stalenessDays
 				acc.freshCount++
 			}
-			for _, dep := range iss.Dependencies {
-				if dep == nil || !dep.Type.IsBlocking() {
-					continue
-				}
-				for _, bl := range firstLabelsByID[dep.DependsOnID] {
-					if bl != l {
-						acc.incomingDeps++
+			if includeFlow {
+				for _, dep := range iss.Dependencies {
+					if dep == nil || !dep.Type.IsBlocking() {
+						continue
+					}
+					blockerStatus, exists := firstStatusByID[dep.DependsOnID]
+					if !exists || (!cfg.IncludeClosedInFlow && isClosedLikeStatus(blockerStatus)) {
+						continue
+					}
+					for _, bl := range firstLabelsByID[dep.DependsOnID] {
+						if bl != "" && bl != l {
+							acc.incomingDeps++
+						}
 					}
 				}
 			}
@@ -1021,8 +1369,16 @@ func ComputeLabelHealthScores(issues []model.Issue, cfg LabelHealthConfig, now t
 	}
 	fullStats.mu.RUnlock()
 
+	minIssues := cfg.MinIssuesForHealth
+	if minIssues < 1 {
+		minIssues = 1
+	}
+
 	scores := make(map[string]int, len(accByLabel))
 	for l, acc := range accByLabel {
+		if acc.issueCount < minIssues {
+			continue
+		}
 		trendDir := "stable"
 		if acc.prevWeek > 0 {
 			trendPercent := (float64(acc.currentWeek-acc.prevWeek) / float64(acc.prevWeek)) * 100
@@ -1223,19 +1579,31 @@ func ExtractLabels(issues []model.Issue) LabelExtractionResult {
 
 	result.IssueCount = len(issues)
 	labelSet := make(map[string]bool)
+	readiness := model.NewReadinessIndex(issues)
+	seenOnIssue := make(map[string]struct{}, 8)
 
-	for _, issue := range issues {
+	for i := range issues {
+		issue := &issues[i]
 		// Track issues without labels
 		if len(issue.Labels) == 0 {
 			result.UnlabeledCount++
 		}
 
-		// Process each label on the issue
+		isDepBlocked := !isClosedLikeStatus(issue.Status) &&
+			issue.Status != model.StatusBlocked &&
+			readiness.DependencyState(issue.ID) != model.DependenciesSatisfied
+
+		clear(seenOnIssue)
+		// Process each unique non-empty label on the issue
 		for _, label := range issue.Labels {
-			// Skip empty labels
+			// Skip empty or duplicate labels on the same issue
 			if label == "" {
 				continue
 			}
+			if _, dup := seenOnIssue[label]; dup {
+				continue
+			}
+			seenOnIssue[label] = struct{}{}
 
 			// Track unique labels
 			labelSet[label] = true
@@ -1256,17 +1624,23 @@ func ExtractLabels(issues []model.Issue) LabelExtractionResult {
 			stats.TotalCount++
 			stats.IssueIDs = append(stats.IssueIDs, issue.ID)
 
-			// Count by status
+			// Count by status (plus unsatisfied blocking dependencies without double-counting)
 			switch issue.Status {
 			case model.StatusClosed, model.StatusTombstone:
 				stats.ClosedCount++
 			case model.StatusInProgress:
 				stats.InProgress++
+				if isDepBlocked {
+					stats.Blocked++
+				}
 			case model.StatusBlocked:
 				stats.Blocked++
 			default:
 				// Open plus other non-closed statuses (deferred, draft, pinned, hooked, review)
 				stats.OpenCount++
+				if isDepBlocked {
+					stats.Blocked++
+				}
 			}
 
 			// Count by priority
@@ -1467,7 +1841,7 @@ func ComputeBlockageCascadeAt(issues []model.Issue, flow CrossLabelFlow, cfg Lab
 		if isClosedLikeStatus(iss.Status) || readiness.Ready(iss.ID, now) {
 			continue
 		}
-		isBlocked := iss.Status == model.StatusBlocked || (isActionableStatus(iss.Status) && !iss.IsDeferredAt(now))
+		isBlocked := iss.Status == model.StatusBlocked || (isActionableStatus(iss.Status) && !iss.IsDeferredAt(now) && !isWithheldIssue(&iss))
 		if !isBlocked || blockedIssueIDs[iss.ID] {
 			continue
 		}
@@ -2407,8 +2781,10 @@ func ComputeLabelAttentionScores(issues []model.Issue, cfg LabelHealthConfig, no
 	for i := range scores {
 		if scoreRange > 0 {
 			scores[i].NormalizedScore = (scores[i].AttentionScore - minScore) / scoreRange
-		} else {
+		} else if maxScore > 0 {
 			scores[i].NormalizedScore = 0.5
+		} else {
+			scores[i].NormalizedScore = 0.0
 		}
 	}
 
@@ -2472,12 +2848,14 @@ func computeLabelAttention(label string, issues []model.Issue, issueMap map[stri
 		}
 	}
 
-	// Compute PageRank sum for this label
+	// Compute PageRank sum for open issues in this label in deterministic order
 	sg := ComputeLabelSubgraph(issues, label)
 	if !sg.IsEmpty() {
 		pr := ComputeLabelPageRank(sg)
-		for _, s := range pr.CoreOnly {
-			score.PageRankSum += s
+		for _, id := range sg.CoreIssues {
+			if iss, exists := issueMap[id]; exists && !isClosedLikeStatus(iss.Status) {
+				score.PageRankSum += pr.CoreOnly[id]
+			}
 		}
 	}
 
@@ -2487,15 +2865,18 @@ func computeLabelAttention(label string, issues []model.Issue, issueMap map[stri
 	if score.OpenCount > 0 {
 		score.StalenessFactor = 1.0 + float64(score.StaleCount)/float64(score.OpenCount)
 	} else {
-		score.StalenessFactor = 1.0
+		score.StalenessFactor = 0.0
 	}
 
-	// Compute block impact (how many issues are blocked by this label)
+	// Compute block impact (how many active issues are blocked by open issues in this label)
 	blockImpact := 0
 	for _, iss := range labeledIssues {
-		// Count how many other issues depend on this one
+		if isClosedLikeStatus(iss.Status) {
+			continue
+		}
+		// Count how many active issues depend on this one
 		for _, other := range issues {
-			if other.ID == iss.ID {
+			if other.ID == iss.ID || isClosedLikeStatus(other.Status) {
 				continue
 			}
 			for _, dep := range other.Dependencies {
@@ -2515,11 +2896,204 @@ func computeLabelAttention(label string, issues []model.Issue, issueMap map[stri
 
 	// Compute attention score
 	// attention = (pagerank_sum * staleness_factor * (1 + block_impact)) / velocity
-	// Higher = needs more attention
-	numerator := score.PageRankSum * score.StalenessFactor * (1.0 + score.BlockImpact)
-	score.AttentionScore = numerator / score.VelocityFactor
+	// Higher = needs more attention; 100%-closed labels (openCount == 0) need zero attention.
+	if score.OpenCount > 0 {
+		numerator := score.PageRankSum * score.StalenessFactor * (1.0 + score.BlockImpact)
+		score.AttentionScore = numerator / score.VelocityFactor
+	}
 
 	return score
+}
+
+type labelAttentionAcc struct {
+	issueCount  int
+	openCount   int
+	staleCount  int
+	closed30    int
+	blockImpact int
+	prSum       float64
+}
+
+// ComputeLabelAttentionScoresFast computes normalized [0, 1] attention scores for
+// all non-empty labels in a single O(N + E) pass reusing precomputed GraphStats
+// PageRank values without per-label subgraph PageRank recomputation.
+func ComputeLabelAttentionScoresFast(issues []model.Issue, cfg LabelHealthConfig, now time.Time, stats *GraphStats) map[string]float64 {
+	if len(issues) == 0 {
+		return map[string]float64{}
+	}
+
+	hasAnyLabel := false
+	for i := range issues {
+		for _, l := range issues[i].Labels {
+			if l != "" {
+				hasAnyLabel = true
+				break
+			}
+		}
+		if hasAnyLabel {
+			break
+		}
+	}
+	if !hasAnyLabel {
+		return map[string]float64{}
+	}
+
+	var fullStats *GraphStats
+	if stats != nil {
+		fullStats = stats
+	} else {
+		analyzer := NewAnalyzer(issues)
+		s := analyzer.Analyze()
+		fullStats = &s
+	}
+
+	firstStatusByID := make(map[string]model.Status, len(issues))
+	for i := range issues {
+		if _, seen := firstStatusByID[issues[i].ID]; !seen {
+			firstStatusByID[issues[i].ID] = issues[i].Status
+		}
+	}
+
+	blockingDepCountToID := make(map[string]int, len(issues))
+	for i := range issues {
+		other := &issues[i]
+		if isClosedLikeStatus(other.Status) {
+			continue
+		}
+		for _, dep := range other.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == other.ID {
+				continue
+			}
+			blockerStatus, exists := firstStatusByID[dep.DependsOnID]
+			if exists && !isClosedLikeStatus(blockerStatus) {
+				blockingDepCountToID[dep.DependsOnID]++
+			}
+		}
+	}
+
+	staleDays := cfg.StaleThresholdDays
+	if staleDays <= 0 {
+		staleDays = DefaultStaleThresholdDays
+	}
+	threshold := float64(staleDays)
+	monthAgo := now.Add(-30 * 24 * time.Hour)
+
+	order := sortedIssueOrder(issues)
+	accByLabel := make(map[string]*labelAttentionAcc, 32)
+	fallbackPR := 1.0 / float64(len(issues))
+
+	fullStats.mu.RLock()
+	pr := fullStats.pageRank
+	hasPR := len(pr) > 0
+
+	for _, idx := range order {
+		iss := &issues[idx]
+		if len(iss.Labels) == 0 {
+			continue
+		}
+		issPR := fallbackPR
+		if hasPR {
+			issPR = pr[iss.ID]
+		}
+		isClosed := isClosedLikeStatus(iss.Status)
+		isStaleOpen := false
+		if !isClosed && !iss.UpdatedAt.IsZero() {
+			days := now.Sub(iss.UpdatedAt).Hours() / 24.0
+			if days >= threshold {
+				isStaleOpen = true
+			}
+		}
+		closed30Inc := 0
+		if isClosed && iss.ClosedAt != nil && iss.ClosedAt.After(monthAgo) {
+			closed30Inc = 1
+		}
+		issBlockImpact := blockingDepCountToID[iss.ID]
+
+		for j, l := range iss.Labels {
+			if l == "" {
+				continue
+			}
+			dup := false
+			for k := 0; k < j; k++ {
+				if iss.Labels[k] == l {
+					dup = true
+					break
+				}
+			}
+			if dup {
+				continue
+			}
+			acc := accByLabel[l]
+			if acc == nil {
+				acc = &labelAttentionAcc{}
+				accByLabel[l] = acc
+			}
+			acc.issueCount++
+			if !isClosed {
+				acc.openCount++
+				if isStaleOpen {
+					acc.staleCount++
+				}
+				acc.blockImpact += issBlockImpact
+				acc.prSum += issPR
+			}
+			acc.closed30 += closed30Inc
+		}
+	}
+	fullStats.mu.RUnlock()
+
+	minIssues := cfg.MinIssuesForHealth
+	if minIssues < 1 {
+		minIssues = 1
+	}
+
+	labelNames := make([]string, 0, len(accByLabel))
+	for l, acc := range accByLabel {
+		if acc.issueCount >= minIssues {
+			labelNames = append(labelNames, l)
+		}
+	}
+	if len(labelNames) == 0 {
+		return map[string]float64{}
+	}
+	sort.Strings(labelNames)
+
+	rawScores := make([]float64, len(labelNames))
+	var minScore, maxScore float64
+	for i, l := range labelNames {
+		acc := accByLabel[l]
+		var raw float64
+		if acc.openCount > 0 {
+			stalenessFactor := 1.0 + float64(acc.staleCount)/float64(acc.openCount)
+			velocityFactor := float64(acc.closed30) + 1.0
+			raw = (acc.prSum * stalenessFactor * (1.0 + float64(acc.blockImpact))) / velocityFactor
+		}
+		rawScores[i] = raw
+		if i == 0 {
+			minScore = raw
+			maxScore = raw
+		} else {
+			if raw < minScore {
+				minScore = raw
+			}
+			if raw > maxScore {
+				maxScore = raw
+			}
+		}
+	}
+
+	normalized := make(map[string]float64, len(labelNames))
+	scoreRange := maxScore - minScore
+	for i, l := range labelNames {
+		if scoreRange > 1e-12 {
+			normalized[l] = (rawScores[i] - minScore) / scoreRange
+		} else if maxScore > 0 {
+			normalized[l] = 0.5
+		} else {
+			normalized[l] = 0.0
+		}
+	}
+	return normalized
 }
 
 // GetTopAttentionLabels returns the top N labels needing attention

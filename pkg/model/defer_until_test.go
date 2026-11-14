@@ -81,3 +81,61 @@ func containsKey(doc []byte, key string) bool {
 	_, ok := m[key]
 	return ok
 }
+
+func TestReadinessIndex_WithholdsEphemeralPinnedAndTemplateIssues(t *testing.T) {
+	now := time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC)
+	rawJSON := `{"id":"TPL-1","title":"Template","status":"open","issue_type":"task","created_by":"alice","close_reason":"done","ephemeral":true,"pinned":true,"is_template":true}`
+	var decoded Issue
+	if err := json.Unmarshal([]byte(rawJSON), &decoded); err != nil {
+		t.Fatalf("unmarshal special flags: %v", err)
+	}
+	if decoded.CreatedBy != "alice" || decoded.CloseReason != "done" || !decoded.Ephemeral || !decoded.Pinned || !decoded.IsTemplate {
+		t.Fatalf("decoded fields mismatch: %+v", decoded)
+	}
+	cloned := decoded.Clone()
+	if cloned.CreatedBy != "alice" || cloned.CloseReason != "done" || !cloned.Ephemeral || !cloned.Pinned || !cloned.IsTemplate {
+		t.Fatalf("Clone() dropped special fields: %+v", cloned)
+	}
+
+	issues := []Issue{
+		{ID: "BLOCKER", Title: "Blocker", Status: StatusOpen, IssueType: TypeTask},
+		{ID: "READY-NORMAL", Title: "Normal ready", Status: StatusOpen, IssueType: TypeTask},
+		{ID: "EPHEMERAL-OPEN", Title: "Ephemeral", Status: StatusOpen, IssueType: TypeTask, Ephemeral: true},
+		{ID: "PINNED-OPEN", Title: "Pinned", Status: StatusOpen, IssueType: TypeTask, Pinned: true},
+		{ID: "TEMPLATE-OPEN", Title: "Template", Status: StatusOpen, IssueType: TypeTask, IsTemplate: true},
+		{
+			ID: "PINNED-GATED", Title: "Pinned behind blocker", Status: StatusOpen, IssueType: TypeTask, Pinned: true,
+			Dependencies: []*Dependency{{IssueID: "PINNED-GATED", DependsOnID: "BLOCKER", Type: DepBlocks}},
+		},
+		{
+			ID: "NORMAL-GATED", Title: "Normal behind blocker", Status: StatusOpen, IssueType: TypeTask,
+			Dependencies: []*Dependency{{IssueID: "NORMAL-GATED", DependsOnID: "BLOCKER", Type: DepBlocks}},
+		},
+	}
+
+	idx := NewReadinessIndex(issues)
+	if !idx.Ready("READY-NORMAL", now) || !idx.Claimable("READY-NORMAL", now) {
+		t.Fatal("normal unblocked open issue must be ready and claimable")
+	}
+	for _, withheldID := range []string{"EPHEMERAL-OPEN", "PINNED-OPEN", "TEMPLATE-OPEN"} {
+		if idx.Ready(withheldID, now) {
+			t.Fatalf("%s must not be Ready()", withheldID)
+		}
+		if idx.Claimable(withheldID, now) {
+			t.Fatalf("%s must not be Claimable()", withheldID)
+		}
+	}
+	if !idx.ReadyAfterSingle("NORMAL-GATED", now, "BLOCKER") {
+		t.Fatal("NORMAL-GATED must become ready after BLOCKER closes")
+	}
+	if idx.ReadyAfterSingle("PINNED-GATED", now, "BLOCKER") {
+		t.Fatal("PINNED-GATED must remain withheld in ReadyAfterSingle even after BLOCKER closes")
+	}
+	completed := map[string]bool{"BLOCKER": true}
+	if !idx.ReadyAfter("NORMAL-GATED", now, completed) {
+		t.Fatal("NORMAL-GATED must become ready in ReadyAfter")
+	}
+	if idx.ReadyAfter("PINNED-GATED", now, completed) {
+		t.Fatal("PINNED-GATED must remain withheld in ReadyAfter")
+	}
+}

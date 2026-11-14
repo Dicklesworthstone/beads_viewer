@@ -637,7 +637,11 @@ func getDepthBucket(depth float64) int {
 
 // currentPanelItemCount returns the number of items in the focused panel (including cycles)
 func (m *InsightsModel) currentPanelItemCount() int {
-	switch m.focusedPanel {
+	return m.panelItemCount(m.focusedPanel)
+}
+
+func (m *InsightsModel) panelItemCount(panel MetricPanel) int {
+	switch panel {
 	case PanelBottlenecks:
 		return len(m.insights.Bottlenecks)
 	case PanelKeystones:
@@ -660,6 +664,57 @@ func (m *InsightsModel) currentPanelItemCount() int {
 		return len(m.topPicks)
 	default:
 		return 0
+	}
+}
+
+// ClampSelections keeps focusedPanel, per-panel selectedIndex/scrollOffset, and
+// heatmap drilldown state within bounds after rebuilding insights/recommendations.
+func (m *InsightsModel) ClampSelections() {
+	if m.focusedPanel < 0 || m.focusedPanel >= PanelCount {
+		m.focusedPanel = 0
+	}
+	for p := MetricPanel(0); p < PanelCount; p++ {
+		count := m.panelItemCount(p)
+		if count <= 0 {
+			m.selectedIndex[p] = 0
+			m.scrollOffset[p] = 0
+			continue
+		}
+		if m.selectedIndex[p] >= count {
+			m.selectedIndex[p] = count - 1
+		}
+		if m.selectedIndex[p] < 0 {
+			m.selectedIndex[p] = 0
+		}
+		if m.scrollOffset[p] > m.selectedIndex[p] {
+			m.scrollOffset[p] = m.selectedIndex[p]
+		}
+		if m.scrollOffset[p] < 0 {
+			m.scrollOffset[p] = 0
+		}
+	}
+	if m.showHeatmap {
+		m.rebuildHeatmapGrid()
+		m.heatmapRow = max(0, min(m.heatmapRow, heatmapDepthBuckets-1))
+		m.heatmapCol = max(0, min(m.heatmapCol, heatmapScoreBuckets-1))
+		if m.heatmapDrill {
+			if m.heatmapIssueMap != nil &&
+				m.heatmapRow < len(m.heatmapIssueMap) &&
+				m.heatmapCol < len(m.heatmapIssueMap[m.heatmapRow]) &&
+				len(m.heatmapIssueMap[m.heatmapRow][m.heatmapCol]) > 0 {
+				m.heatmapIssues = m.heatmapIssueMap[m.heatmapRow][m.heatmapCol]
+				if m.heatmapDrillIdx >= len(m.heatmapIssues) {
+					m.heatmapDrillIdx = len(m.heatmapIssues) - 1
+				}
+				if m.heatmapDrillIdx < 0 {
+					m.heatmapDrillIdx = 0
+				}
+			} else {
+				m.heatmapDrill = false
+				m.heatmapIssues = nil
+				m.heatmapDrillIdx = 0
+			}
+		}
 	}
 }
 
@@ -1804,8 +1859,8 @@ func (m *InsightsModel) renderDrillDownIssue(issueID string, isSelected bool, wi
 	statusStyle := t.Renderer.NewStyle().Foreground(statusColor)
 	sb.WriteString(statusStyle.Render(fmt.Sprintf("[%s] ", issue.Status)))
 
-	// Priority if available (1-5 scale, 0 = unset)
-	if issue.Priority > 0 {
+	// Priority if available (0 = P0 critical, 1-4 = P1-P4)
+	if issue.Priority >= 0 {
 		priStyle := t.Renderer.NewStyle().Foreground(t.Subtext)
 		sb.WriteString(priStyle.Render(fmt.Sprintf("P%d ", issue.Priority)))
 	}

@@ -2754,3 +2754,445 @@ func TestComputeTriageFromAnalyzer_UngroupedMatchesFullMaterializationOracle(t *
 		}
 	}
 }
+
+func TestComputeTriageScoresWithOptions_Phase2To4Factors(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+	staleTime := now.Add(-45 * 24 * time.Hour)
+	freshTime := now.Add(-1 * time.Hour)
+	closedRecent := now.Add(-2 * 24 * time.Hour)
+
+	issues := []model.Issue{
+		{
+			ID:        "unhealthy-unclaimed",
+			Title:     "Unhealthy label work",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			Labels:    []string{"bottleneck"},
+			CreatedAt: staleTime,
+			UpdatedAt: staleTime,
+		},
+		{
+			ID:        "healthy-unclaimed",
+			Title:     "Healthy label work",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			Labels:    []string{"smooth"},
+			CreatedAt: freshTime,
+			UpdatedAt: freshTime,
+		},
+		{
+			ID:        "healthy-closed-1",
+			Title:     "Recent close",
+			Status:    model.StatusClosed,
+			Priority:  1,
+			Labels:    []string{"smooth"},
+			CreatedAt: freshTime.Add(-24 * time.Hour),
+			UpdatedAt: closedRecent,
+			ClosedAt:  &closedRecent,
+		},
+		{
+			ID:        "claimed-other",
+			Title:     "Claimed by Bob",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			Assignee:  "bob",
+			Labels:    []string{"bottleneck"},
+			CreatedAt: staleTime,
+			UpdatedAt: staleTime,
+		},
+		{
+			ID:        "claimed-self",
+			Title:     "Claimed by Alice",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			Assignee:  "alice",
+			Labels:    []string{"bottleneck"},
+			CreatedAt: staleTime,
+			UpdatedAt: staleTime,
+		},
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.Analyze()
+
+	opts := ProductionTriageScoringOptions()
+	opts.ClaimedByAgent = "alice"
+	scores := ComputeTriageScoresFromAnalyzer(an, &stats, opts, now)
+
+	byID := make(map[string]TriageScore, len(scores))
+	for _, s := range scores {
+		byID[s.IssueID] = s
+	}
+
+	unhealthy := byID["unhealthy-unclaimed"]
+	healthy := byID["healthy-unclaimed"]
+	claimedOther := byID["claimed-other"]
+	claimedSelf := byID["claimed-self"]
+
+	if len(unhealthy.FactorsPending) != 0 {
+		t.Fatalf("expected zero FactorsPending when Phase 2-4 enabled, got %v", unhealthy.FactorsPending)
+	}
+	if unhealthy.TriageFactors.LabelHealth <= healthy.TriageFactors.LabelHealth {
+		t.Fatalf("expected unhealthy label boost (%f) > healthy label boost (%f)",
+			unhealthy.TriageFactors.LabelHealth, healthy.TriageFactors.LabelHealth)
+	}
+	if unhealthy.TriageFactors.AttentionScore <= healthy.TriageFactors.AttentionScore {
+		t.Fatalf("expected bottleneck attention boost (%f) > smooth attention boost (%f)",
+			unhealthy.TriageFactors.AttentionScore, healthy.TriageFactors.AttentionScore)
+	}
+	if claimedOther.TriageFactors.ClaimPenalty <= 0 {
+		t.Fatalf("expected positive ClaimPenalty on issue claimed by bob, got %f", claimedOther.TriageFactors.ClaimPenalty)
+	}
+	if claimedOther.TriageScore >= claimedSelf.TriageScore*0.2 {
+		t.Fatalf("expected claimedOther score (%f) to be penalized relative to claimedSelf (%f)",
+			claimedOther.TriageScore, claimedSelf.TriageScore)
+	}
+	if claimedSelf.TriageFactors.ClaimPenalty != 0 {
+		t.Fatalf("expected zero ClaimPenalty for calling agent alice, got %f", claimedSelf.TriageFactors.ClaimPenalty)
+	}
+
+	// Verify production ComputeTriageWithOptionsAndTime wires ClaimedByAgent & Phase 2-4 factors
+	prodRes := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		WaitForPhase2:  true,
+		ClaimedByAgent: "alice",
+	}, now)
+	recScore := make(map[string]float64)
+	for _, r := range prodRes.Recommendations {
+		recScore[r.ID] = r.Score
+	}
+	if recScore["claimed-other"] >= recScore["claimed-self"]*0.2 {
+		t.Fatalf("expected production triage to penalize claimed-other (%f) vs claimed-self (%f)",
+			recScore["claimed-other"], recScore["claimed-self"])
+	}
+}
+
+func TestTriage_WithholdsPinnedEphemeralTemplateAndBoundsScore(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	stale := now.Add(-45 * 24 * time.Hour)
+
+	issues := []model.Issue{
+		{ID: "PINNED-1", Title: "Pinned reference doc", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, Pinned: true, Labels: []string{"ops"}, CreatedAt: stale, UpdatedAt: stale},
+		{ID: "EPHEM-1", Title: "Ephemeral wisp", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, Ephemeral: true, Labels: []string{"ops"}, CreatedAt: stale, UpdatedAt: stale},
+		{ID: "TMPL-1", Title: "Issue template", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, IsTemplate: true, Labels: []string{"ops"}, CreatedAt: stale, UpdatedAt: stale},
+		{ID: "READY-HUB", Title: "Actionable hub", Status: model.StatusOpen, IssueType: model.TypeBug, Priority: 0, Labels: []string{"ops"}, CreatedAt: stale, UpdatedAt: stale},
+		{ID: "CLAIM-WS", Title: "Whitespace claimed", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, Assignee: "  alice  ", Labels: []string{"ops"}, CreatedAt: stale, UpdatedAt: stale},
+	}
+	for i := 0; i < 6; i++ {
+		depID := fmt.Sprintf("DOWN-%d", i)
+		issues = append(issues, model.Issue{
+			ID:        depID,
+			Title:     "Downstream item",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Priority:  1,
+			Labels:    []string{"ops"},
+			CreatedAt: stale,
+			UpdatedAt: stale,
+			Dependencies: []*model.Dependency{
+				{IssueID: depID, DependsOnID: "READY-HUB", Type: model.DepBlocks},
+			},
+		})
+	}
+
+	res := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		TopN:           20,
+		WaitForPhase2:  true,
+		ClaimedByAgent: " alice ",
+	}, now)
+
+	withheldIDs := map[string]bool{"PINNED-1": true, "EPHEM-1": true, "TMPL-1": true}
+	for _, pick := range res.QuickRef.TopPicks {
+		if withheldIDs[pick.ID] {
+			t.Fatalf("withheld issue %s leaked into TopPicks: %+v", pick.ID, res.QuickRef.TopPicks)
+		}
+		if pick.Score < 0.0 || pick.Score > 1.0 {
+			t.Fatalf("TopPick %s score %f out of [0, 1]", pick.ID, pick.Score)
+		}
+	}
+	for _, qw := range res.QuickWins {
+		if withheldIDs[qw.ID] {
+			t.Fatalf("withheld issue %s leaked into QuickWins: %+v", qw.ID, res.QuickWins)
+		}
+	}
+
+	recByID := make(map[string]Recommendation, len(res.Recommendations))
+	for _, r := range res.Recommendations {
+		recByID[r.ID] = r
+		if r.Score < 0.0 || r.Score > 1.0 {
+			t.Fatalf("Recommendation %s score %f exceeded [0.0, 1.0]", r.ID, r.Score)
+		}
+	}
+	for id := range withheldIDs {
+		r, ok := recByID[id]
+		if !ok {
+			t.Fatalf("expected %s in unscoped Recommendations", id)
+		}
+		if r.Claimable {
+			t.Fatalf("expected %s Claimable=false, got true", id)
+		}
+		if r.Action == "Start work on this issue" || strings.Contains(r.Action, "start here") {
+			t.Fatalf("expected non-claimable Action for %s, got %q", id, r.Action)
+		}
+		for _, reason := range r.Reasons {
+			if strings.Contains(reason, "available for work") {
+				t.Fatalf("withheld issue %s emitted claimable reason %q", id, reason)
+			}
+		}
+	}
+
+	// Whitespace-padded ClaimedByAgent == Assignee should NOT suffer foreign-agent penalty
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.Analyze()
+	scoreOpts := ProductionTriageScoringOptions()
+	scoreOpts.ClaimedByAgent = "alice"
+	scores := ComputeTriageScoresFromAnalyzer(an, &stats, scoreOpts, now)
+	for _, s := range scores {
+		if s.TriageScore < 0.0 || s.TriageScore > 1.0 {
+			t.Fatalf("TriageScore for %s out of [0, 1]: %f", s.IssueID, s.TriageScore)
+		}
+		if s.IssueID == "CLAIM-WS" && s.TriageFactors.ClaimPenalty != 0 {
+			t.Fatalf("expected zero ClaimPenalty when trimmed Assignee matches trimmed ClaimedByAgent, got %f", s.TriageFactors.ClaimPenalty)
+		}
+	}
+
+	// Grouped + ActionableOnly must completely exclude withheld issues and never pick them as track/label TopPick
+	grouped := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		TopN:           20,
+		GroupByTrack:   true,
+		GroupByLabel:   true,
+		ActionableOnly: true,
+		WaitForPhase2:  true,
+	}, now)
+	for _, r := range grouped.Recommendations {
+		if withheldIDs[r.ID] {
+			t.Fatalf("withheld issue %s leaked into ActionableOnly Recommendations", r.ID)
+		}
+	}
+	for _, g := range grouped.RecommendationsByTrack {
+		if g.TopPick != nil && withheldIDs[g.TopPick.ID] {
+			t.Fatalf("withheld issue %s became track TopPick", g.TopPick.ID)
+		}
+	}
+	for _, g := range grouped.RecommendationsByLabel {
+		if g.TopPick != nil && withheldIDs[g.TopPick.ID] {
+			t.Fatalf("withheld issue %s became label TopPick", g.TopPick.ID)
+		}
+	}
+}
+
+func TestGenerateTriageReasons_WithheldAndDeferredNeverEmitContradictoryHints(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	future := now.Add(7 * 24 * time.Hour)
+
+	cases := []struct {
+		name           string
+		issue          model.Issue
+		daysSinceUpd   int
+		wantActionHint string
+	}{
+		{
+			name:           "pinned open quick-win candidate",
+			issue:          model.Issue{ID: "PIN-OPEN", Status: model.StatusOpen, Pinned: true, Priority: 0},
+			daysSinceUpd:   2,
+			wantActionHint: "Pinned issue - do not claim",
+		},
+		{
+			name:           "pinned stale in_progress (>14d)",
+			issue:          model.Issue{ID: "PIN-STALE", Status: model.StatusInProgress, Pinned: true, Priority: 1},
+			daysSinceUpd:   21,
+			wantActionHint: "Pinned issue - do not claim",
+		},
+		{
+			name:           "pinned active in_progress (>7d)",
+			issue:          model.Issue{ID: "PIN-ACTIVE", Status: model.StatusInProgress, Pinned: true, Priority: 1},
+			daysSinceUpd:   10,
+			wantActionHint: "Pinned issue - do not claim",
+		},
+		{
+			name:           "template open quick-win candidate",
+			issue:          model.Issue{ID: "TMPL-OPEN", Status: model.StatusOpen, IsTemplate: true, Priority: 1},
+			daysSinceUpd:   1,
+			wantActionHint: "Template issue - do not claim",
+		},
+		{
+			name:           "ephemeral open quick-win candidate",
+			issue:          model.Issue{ID: "EPH-OPEN", Status: model.StatusOpen, Ephemeral: true, Priority: 1},
+			daysSinceUpd:   1,
+			wantActionHint: "Ephemeral issue - do not claim",
+		},
+		{
+			name:           "tombstone quick-win candidate",
+			issue:          model.Issue{ID: "TOMB-1", Status: model.StatusTombstone, Priority: 1},
+			daysSinceUpd:   1,
+			wantActionHint: "Wait for status tombstone to become open before claiming",
+		},
+		{
+			name:           "future-deferred open quick-win candidate",
+			issue:          model.Issue{ID: "DEF-OPEN", Status: model.StatusOpen, DeferUntil: &future, Priority: 0},
+			daysSinceUpd:   2,
+			wantActionHint: "Deferred until " + future.UTC().Format(time.RFC3339) + " - do not claim before then",
+		},
+		{
+			name:           "future-deferred stale in_progress (>14d)",
+			issue:          model.Issue{ID: "DEF-STALE", Status: model.StatusInProgress, DeferUntil: &future, Priority: 0},
+			daysSinceUpd:   30,
+			wantActionHint: "Deferred until " + future.UTC().Format(time.RFC3339) + " - do not claim before then",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			iss := tc.issue
+			reasons := GenerateTriageReasons(TriageReasonContext{
+				Issue:           &iss,
+				IsQuickWin:      true,
+				UnblocksIDs:     []string{"DOWN-1", "DOWN-2"},
+				DaysSinceUpdate: tc.daysSinceUpd,
+				Now:             now,
+				HasNow:          true,
+			})
+			if reasons.ActionHint != tc.wantActionHint {
+				t.Fatalf("ActionHint = %q, want %q", reasons.ActionHint, tc.wantActionHint)
+			}
+			for _, r := range append([]string{reasons.Primary}, reasons.All...) {
+				if strings.Contains(r, "good starting point") || strings.Contains(r, "Quick win") {
+					t.Fatalf("withheld/deferred bead emitted quick-win reason %q in %+v", r, reasons)
+				}
+			}
+		})
+	}
+
+	// Also verify QuickWinBoost is zero in ComputeTriageScoresFromAnalyzer for withheld/deferred beads
+	scoreIssues := []model.Issue{
+		{ID: "PIN-1", Title: "Pinned", Status: model.StatusOpen, Pinned: true, Priority: 0, UpdatedAt: now},
+		{ID: "DEF-1", Title: "Deferred", Status: model.StatusOpen, DeferUntil: &future, Priority: 0, UpdatedAt: now},
+		{ID: "READY-1", Title: "Ready", Status: model.StatusOpen, Priority: 0, UpdatedAt: now},
+	}
+	an := NewAnalyzer(scoreIssues)
+	an.SetNow(now)
+	st := an.Analyze()
+	scores := ComputeTriageScoresFromAnalyzer(an, &st, ProductionTriageScoringOptions(), now)
+	for _, sc := range scores {
+		if (sc.IssueID == "PIN-1" || sc.IssueID == "DEF-1") && sc.TriageFactors.QuickWinBoost != 0 {
+			t.Fatalf("expected QuickWinBoost=0 for %s, got %f", sc.IssueID, sc.TriageFactors.QuickWinBoost)
+		}
+		if sc.IssueID == "READY-1" && sc.TriageFactors.QuickWinBoost <= 0 {
+			t.Fatalf("expected positive QuickWinBoost for READY-1, got %f", sc.TriageFactors.QuickWinBoost)
+		}
+	}
+}
+
+func TestParkedStatuses_ZeroQuickWinBoostAndNoGoodStartingPointReason(t *testing.T) {
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	parkedStatuses := []model.Status{
+		model.StatusBlocked,
+		model.StatusDeferred,
+		model.StatusDraft,
+		model.StatusPinned,
+		model.StatusHooked,
+		model.StatusReview,
+		model.StatusInProgress,
+		model.Status("custom-parked"),
+	}
+
+	issues := []model.Issue{
+		{
+			ID:        "OPEN-QW",
+			Title:     "Open quick-win control",
+			Status:    model.StatusOpen,
+			Priority:  0,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "DOWN-OPEN",
+			Title:     "Downstream of OPEN-QW",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "DOWN-OPEN", DependsOnID: "OPEN-QW", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	parkedIDs := make(map[string]model.Status, len(parkedStatuses))
+	for i, st := range parkedStatuses {
+		id := fmt.Sprintf("PARKED-%d", i)
+		downID := fmt.Sprintf("DOWN-PARKED-%d", i)
+		parkedIDs[id] = st
+		issues = append(issues,
+			model.Issue{
+				ID:        id,
+				Title:     "Parked candidate " + string(st),
+				Status:    st,
+				Priority:  0,
+				IssueType: model.TypeTask,
+				UpdatedAt: now,
+			},
+			model.Issue{
+				ID:        downID,
+				Title:     "Downstream of " + id,
+				Status:    model.StatusOpen,
+				Priority:  2,
+				IssueType: model.TypeTask,
+				UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: downID, DependsOnID: id, Type: model.DepBlocks},
+				},
+			},
+		)
+
+		// Direct GenerateTriageReasons check with IsQuickWin=true
+		iss := issues[len(issues)-2]
+		reasons := GenerateTriageReasons(TriageReasonContext{
+			Issue:       &iss,
+			IsQuickWin:  true,
+			UnblocksIDs: []string{downID},
+			Now:         now,
+			HasNow:      true,
+		})
+		for _, text := range append([]string{reasons.Primary, reasons.ActionHint}, reasons.All...) {
+			if strings.Contains(text, "good starting point") || strings.Contains(text, "Quick win") {
+				t.Fatalf("status %q emitted quick-win reason/hint %q in %+v", st, text, reasons)
+			}
+		}
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	st := an.Analyze()
+	scores := ComputeTriageScoresFromAnalyzer(an, &st, ProductionTriageScoringOptions(), now)
+	seenOpenBoost := false
+	for _, sc := range scores {
+		if status, isParked := parkedIDs[sc.IssueID]; isParked {
+			if sc.TriageFactors.QuickWinBoost != 0 {
+				t.Fatalf("parked status %q (%s) got non-zero QuickWinBoost = %f", status, sc.IssueID, sc.TriageFactors.QuickWinBoost)
+			}
+		}
+		if sc.IssueID == "OPEN-QW" {
+			seenOpenBoost = sc.TriageFactors.QuickWinBoost > 0
+		}
+	}
+	if !seenOpenBoost {
+		t.Fatal("expected control OPEN-QW to receive positive QuickWinBoost")
+	}
+
+	triage := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		WaitForPhase2:  true,
+		ActionableOnly: false,
+		TopN:           len(issues),
+	}, now)
+	for _, rec := range triage.Recommendations {
+		if status, isParked := parkedIDs[rec.ID]; isParked {
+			for _, r := range append([]string{rec.Action}, rec.Reasons...) {
+				if strings.Contains(r, "good starting point") || strings.Contains(r, "Quick win") {
+					t.Fatalf("parked recommendation %s (%q) leaked quick-win text %q", rec.ID, status, r)
+				}
+			}
+		}
+	}
+}

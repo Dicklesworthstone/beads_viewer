@@ -172,6 +172,12 @@ function safeQuery(sql, params = [], fallback = []) {
   }
 }
 
+let _toastSequence = 0;
+function nextToastId() {
+  _toastSequence += 1;
+  return `${Date.now()}-${_toastSequence}`;
+}
+
 /**
  * Show a toast notification (non-blocking)
  * @param {string} message - Toast message
@@ -180,7 +186,7 @@ function safeQuery(sql, params = [], fallback = []) {
 function showToast(message, type = 'info') {
   // This will be picked up by the Alpine toast component
   window.dispatchEvent(new CustomEvent('show-toast', {
-    detail: { message, type, id: Date.now() }
+    detail: { message, type, id: nextToastId() }
   }));
 }
 
@@ -757,7 +763,7 @@ async function initGraphEngine() {
     const deps = execQuery(`
       SELECT issue_id, depends_on_id
       FROM dependencies
-      WHERE type IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
+      WHERE COALESCE(type, 'blocks') IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
       ORDER BY issue_id, depends_on_id
     `);
 
@@ -801,7 +807,7 @@ async function initGraphEngine() {
  * Preserve resolved prerequisite identities even when their rows are omitted.
  */
 function getResolvedIssueIDs() {
-  const ids = new Set(execQuery("SELECT id FROM issues WHERE status IN ('closed', 'tombstone')").map(row => row.id));
+  const ids = new Set(execQuery("SELECT id FROM issues WHERE LOWER(status) IN ('closed', 'tombstone')").map(row => row.id));
   const metadata = getMeta().resolved_issue_ids;
   if (metadata) {
     for (const id of JSON.parse(metadata)) ids.add(id);
@@ -952,6 +958,22 @@ function getTopKSet(k = 5) {
 // Query Layer - Using materialized views for performance
 // ============================================================================
 
+function normalizeSearchText(raw) {
+  return String(raw ?? '').normalize('NFC');
+}
+
+function escapeLikePattern(raw) {
+  return String(raw ?? '').replace(/[\\%_]/g, '\\$&');
+}
+
+function extractSearchWordParts(raw) {
+  const text = normalizeSearchText(raw).trim();
+  if (!text) return [];
+  const matches = text.match(/[\p{L}\p{M}\p{N}_]+/gu);
+  if (!matches) return [];
+  return matches.filter(part => /[\p{L}\p{N}]/u.test(part));
+}
+
 /**
  * Build WHERE clauses from filters (shared between query and count)
  */
@@ -1026,11 +1048,33 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
 
   // Search filter (LIKE-based, FTS5 handled separately)
   if (filters.search) {
-    const tokens = String(filters.search).trim().split(/\s+/).filter(Boolean);
-    for (const token of tokens) {
-      clauses.push(`(${col('title')} LIKE ? OR ${col('description')} LIKE ? OR ${col('id')} LIKE ? OR COALESCE(${col('labels')}, '') LIKE ? OR COALESCE(${col('assignee')}, '') LIKE ?)`);
-      const searchTerm = `%${token}%`;
-      params.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
+    const searchParts = normalizeSearchText(filters.search).trim().split(/\s+/).filter(Boolean);
+    const searchCols = [
+      col('title'),
+      col('description'),
+      col('id'),
+      `COALESCE(${col('labels')}, '')`,
+      `COALESCE(${col('assignee')}, '')`,
+      `COALESCE(${col('notes')}, '')`,
+      `COALESCE(${col('design')}, '')`,
+      `COALESCE(${col('acceptance_criteria')}, '')`,
+      `COALESCE(${col('external_ref')}, '')`,
+    ];
+    for (const part of searchParts) {
+      const nfcPattern = `%${escapeLikePattern(part)}%`;
+      const nfdPart = part.normalize('NFD');
+      if (nfdPart !== part) {
+        const nfdPattern = `%${escapeLikePattern(nfdPart)}%`;
+        clauses.push(`(${searchCols.map(c => `${c} LIKE ? ESCAPE '\\' OR ${c} LIKE ? ESCAPE '\\'`).join(' OR ')})`);
+        for (let i = 0; i < searchCols.length; i++) {
+          params.push(nfcPattern, nfdPattern);
+        }
+      } else {
+        clauses.push(`(${searchCols.map(c => `${c} LIKE ? ESCAPE '\\'`).join(' OR ')})`);
+        for (let i = 0; i < searchCols.length; i++) {
+          params.push(nfcPattern);
+        }
+      }
     }
   }
 
@@ -1109,6 +1153,64 @@ function countIssues(filters = {}) {
   return Array.from(labelSet).sort();
 }
 
+function parseJsonArraySafe(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseJsonObjectSafe(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function isIssueOverdue(issue) {
+  if (!issue || !issue.due_date) return false;
+  if (issue.status === 'closed' || issue.status === 'tombstone') return false;
+  const due = new Date(issue.due_date);
+  return !Number.isNaN(due.getTime()) && due.getTime() < Date.now();
+}
+
+function isIssueInCycle(id) {
+  if (!id || !GRAPH_STATE.ready || !GRAPH_STATE.graph) return false;
+  try {
+    if (!GRAPH_STATE.graph.hasCycles()) return false;
+    const idx = GRAPH_STATE.nodeMap.get(id);
+    if (idx === undefined) return false;
+    const enumRes = GRAPH_STATE.graph.enumerateCycles?.(100);
+    if (!Array.isArray(enumRes?.cycles)) return false;
+    return enumRes.cycles.some(cycle => Array.from(cycle).includes(idx));
+  } catch {
+    return false;
+  }
+}
+
+function getTriageRecommendation(id) {
+  try {
+    const rows = execQuery(`
+      SELECT score,
+             action,
+             reasons AS reasons_json,
+             unblocks_ids AS unblocks_ids_json,
+             breakdown AS breakdown_json
+      FROM triage_recommendations
+      WHERE issue_id = ?
+    `, [id]);
+    return rows[0] || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Get a single issue by ID
  */
@@ -1117,6 +1219,38 @@ function getIssue(id) {
   const issue = results[0] || null;
   if (issue) {
     issue.comments = getIssueComments(id);
+    const rec = getTriageRecommendation(id);
+    if (rec) {
+      const reasons = parseJsonArraySafe(rec.reasons_json);
+      const unblocksIds = parseJsonArraySafe(rec.unblocks_ids_json);
+      const breakdown = parseJsonObjectSafe(rec.breakdown_json);
+      issue.triage_rec_score = rec.score;
+      issue.triage_action = rec.action || '';
+      issue.triage_reasons = reasons;
+      issue.triage_unblocks_ids = unblocksIds;
+      issue.triage_breakdown = breakdown;
+      issue.reason = reasons[0] || rec.action || '';
+      issue.score_breakdown_bars = getScoreBreakdownBars(breakdown);
+    } else {
+      issue.triage_action = '';
+      issue.triage_reasons = [];
+      issue.triage_unblocks_ids = [];
+      issue.triage_breakdown = null;
+      issue.score_breakdown_bars = [];
+    }
+    const depGroups = getIssueDependencyGroups(id);
+    issue.dependencyGroups = depGroups;
+    issue.has_any_dependencies = Boolean(
+      issue.blocks_ids ||
+      issue.blocked_by_ids ||
+      depGroups.blocks.length ||
+      depGroups.blockedBy.length ||
+      depGroups.parents.length ||
+      depGroups.children.length ||
+      depGroups.related.length
+    );
+    issue.in_cycle = Boolean(issue.in_cycle || isIssueInCycle(id));
+    issue.is_overdue = isIssueOverdue(issue);
   }
   return issue;
 }
@@ -1158,7 +1292,7 @@ function getGraphViewData() {
   // effective "blocked" colouring (bv-issue#143/#144).
   const issues = execQuery(`
     SELECT id, title, description, status, priority, issue_type, assignee, labels,
-           created_at, updated_at, blocker_count, dependent_count
+           created_at, updated_at, closed_at, blocker_count, dependent_count
     FROM issue_overview_mv
   `).map(row => ({
     id: row.id,
@@ -1171,6 +1305,7 @@ function getGraphViewData() {
     labels: parseLabelsJSON(row.labels),
     created_at: row.created_at,
     updated_at: row.updated_at,
+    closed_at: row.closed_at,
     // Pre-computed active-blocker / active-dependent counts from the
     // materialized view (which excludes closed/tombstoned endpoints).
     blocker_count: row.blocker_count ?? 0,
@@ -1180,7 +1315,6 @@ function getGraphViewData() {
   const dependencies = execQuery(`
     SELECT issue_id, depends_on_id, type
     FROM dependencies
-    WHERE type IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
   `);
 
   return { issues, dependencies };
@@ -1189,7 +1323,7 @@ function getGraphViewData() {
 /**
  * Full-text search using FTS5 (if available)
  */
-const BM25_WEIGHTS = '3.0, 2.0, 1.0, 1.5, 0.5'; // id, title, description, labels, assignee
+const BM25_WEIGHTS = '3.0, 2.0, 1.0, 1.5, 0.5, 0.8, 0.8, 0.8, 1.0'; // id, title, description, labels, assignee, notes, design, acceptance_criteria, external_ref
 const BM25_EXPR = `bm25(issues_fts, ${BM25_WEIGHTS})`;
 
 function isLikelyIssueID(term) {
@@ -1214,9 +1348,7 @@ const HYBRID_CANDIDATE_MIN = 200;
 const HYBRID_CANDIDATE_MIN_SHORT = 300;
 
 function countTokens(term) {
-  if (!term) return 0;
-  const matches = term.match(/[A-Za-z0-9]+/g);
-  return matches ? matches.length : 0;
+  return extractSearchWordParts(term).length;
 }
 
 function isShortQuery(term) {
@@ -1264,6 +1396,22 @@ function supportsFTS5() {
   return DB_STATE.fts5;
 }
 
+/**
+ * Build a safe FTS5 MATCH expression from arbitrary user input.
+ * Normalizes input to NFC, extracts Unicode letter/mark/number/underscore
+ * words containing at least one letter or number, and wraps each as a quoted
+ * prefix phrase ("word"*) so hyphens (bv-123, GH-42, obsidian-note-probe),
+ * combining marks (NFD "nai\u0308ve", NFC "हिंदी"), colons, punctuation, and
+ * FTS5 boolean operators (AND/OR/NOT/NEAR) never trigger SQLite FTS5 errors,
+ * while underscore-only ("___") or punctuation-only queries return "" to fall
+ * back cleanly to substring LIKE matching.
+ */
+function buildFtsMatchQuery(raw) {
+  const parts = extractSearchWordParts(raw);
+  if (parts.length === 0) return '';
+  return parts.map(part => `"${part.replace(/"/g, '""')}"*`).join(' ');
+}
+
 function searchIssues(term, options = {}) {
   const {
     mode = 'text',
@@ -1276,17 +1424,18 @@ function searchIssues(term, options = {}) {
   const searchFilters = { ...filters };
   delete searchFilters.search;
 
+  const ftsQuery = buildFtsMatchQuery(term);
   const { clauses, params } = buildFilterClauses(searchFilters, 'i');
   const baseSQL = `
       SELECT i.*,
-             snippet(issues_fts, 2, '<mark>', '</mark>', '...', 32) as snippet,
+             snippet(issues_fts, -1, '<mark>', '</mark>', '...', 32) as snippet,
              ${BM25_EXPR} as bm25_score
       FROM issues_fts
       JOIN issue_overview_mv i ON issues_fts.id = i.id
       WHERE issues_fts MATCH ?
     `;
   let sql = baseSQL;
-  const queryParams = [term + '*'];
+  const queryParams = [ftsQuery];
   if (clauses.length > 0) {
     sql += ` AND ${clauses.join(' AND ')}`;
     queryParams.push(...params);
@@ -1302,7 +1451,7 @@ function searchIssues(term, options = {}) {
   queryParams.push(fetchLimit, fetchOffset);
 
   let rows = [];
-  if (supportsFTS5()) {
+  if (supportsFTS5() && ftsQuery) {
     try {
       rows = execQuery(sql, queryParams);
     } catch {
@@ -1370,36 +1519,49 @@ function searchIssues(term, options = {}) {
  * Compute deterministic lexical relevance score in (0, 1] when FTS5 BM25 is unavailable.
  */
 function computeLexicalTextScore(row, query) {
-  const q = String(query || '').trim().toLowerCase();
+  const q = normalizeSearchText(query).trim().toLowerCase();
   if (!q) return 0.5;
-  const tokens = q.split(/\s+/).filter(Boolean);
-  if (tokens.length === 0) return 0.5;
+  const wordParts = extractSearchWordParts(q);
+  const terms = wordParts.length > 0 ? wordParts : q.split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return 0.5;
 
-  const id = String(row.id || '').toLowerCase();
-  const title = String(row.title || '').toLowerCase();
-  const labels = String(row.labels || '').toLowerCase();
-  const assignee = String(row.assignee || '').toLowerCase();
-  const description = String(row.description || '').toLowerCase();
+  const id = normalizeSearchText(row.id).toLowerCase();
+  const title = normalizeSearchText(row.title).toLowerCase();
+  const labels = normalizeSearchText(row.labels).toLowerCase();
+  const assignee = normalizeSearchText(row.assignee).toLowerCase();
+  const description = normalizeSearchText(row.description).toLowerCase();
 
   if (id === q || title === q) return 1.0;
   if (id.startsWith(q) || title.startsWith(q)) return 0.95;
   if (title.includes(q)) return 0.9;
 
-  const titleMatches = tokens.filter(t => title.includes(t)).length;
+  const titleMatches = terms.filter(t => title.includes(t)).length;
   if (titleMatches > 0) {
-    const titleWords = title.split(/[^a-z0-9_]+/).filter(Boolean);
-    const prefixHits = tokens.filter(t => titleWords.some(w => w.startsWith(t))).length;
-    const score = 0.75 + 0.15 * (titleMatches / tokens.length) + 0.05 * (prefixHits / tokens.length);
+    const titleWords = extractSearchWordParts(title);
+    const prefixHits = terms.filter(t => titleWords.some(w => w.startsWith(t))).length;
+    const score = 0.75 + 0.15 * (titleMatches / terms.length) + 0.05 * (prefixHits / terms.length);
     return Math.min(0.95, Math.max(0.75, score));
   }
 
-  if (tokens.some(t => id.includes(t) || labels.includes(t) || assignee.includes(t))) {
+  if (terms.some(t => id.includes(t) || labels.includes(t) || assignee.includes(t))) {
     return 0.65;
   }
 
-  const descMatches = tokens.filter(t => description.includes(t)).length;
+  const descMatches = terms.filter(t => description.includes(t)).length;
   if (descMatches > 0) {
-    return Math.min(0.55, 0.45 + 0.10 * (descMatches / tokens.length));
+    return Math.min(0.55, 0.45 + 0.10 * (descMatches / terms.length));
+  }
+
+  const extraText = normalizeSearchText(
+    [row.notes, row.design, row.acceptance_criteria, row.external_ref]
+      .filter(Boolean)
+      .join(' ')
+  ).toLowerCase();
+  if (extraText) {
+    const extraMatches = terms.filter(t => extraText.includes(t)).length;
+    if (extraMatches > 0) {
+      return Math.min(0.45, 0.40 + 0.05 * (extraMatches / terms.length));
+    }
   }
 
   return 0.35;
@@ -1423,7 +1585,8 @@ function getPageRankBounds() {
 function countSearchIssues(term, filters = {}) {
   const searchFilters = { ...filters };
   delete searchFilters.search;
-  if (!supportsFTS5()) return countIssues({ ...searchFilters, search: term });
+  const ftsQuery = buildFtsMatchQuery(term);
+  if (!supportsFTS5() || !ftsQuery) return countIssues({ ...searchFilters, search: term });
   const { clauses, params } = buildFilterClauses(searchFilters, 'i');
 
   let sql = `
@@ -1432,7 +1595,7 @@ function countSearchIssues(term, filters = {}) {
       JOIN issue_overview_mv i ON issues_fts.id = i.id
       WHERE issues_fts MATCH ?
     `;
-  const queryParams = [term + '*'];
+  const queryParams = [ftsQuery];
   if (clauses.length > 0) {
     sql += ` AND ${clauses.join(' AND ')}`;
     queryParams.push(...params);
@@ -1450,9 +1613,10 @@ function countSearchIssues(term, filters = {}) {
  */
 function getStats() {
   const stats = { open: 0, in_progress: 0, closed: 0, tombstone: 0 };
+  let mvTombstones = 0;
 
   try {
-    // Count by status
+    // Count visible lifecycle statuses from issue_overview_mv (which excludes tombstones)
     const statusCounts = execQuery(`
       SELECT status, COUNT(*) as count
       FROM issue_overview_mv
@@ -1460,8 +1624,17 @@ function getStats() {
     `);
     console.log('[Stats] Status counts:', statusCounts);
     statusCounts.forEach(row => {
-      stats[row.status] = row.count;
+      if (row.status === 'tombstone') {
+        mvTombstones = row.count;
+      } else {
+        stats[row.status] = row.count;
+      }
     });
+    try {
+      stats.tombstone = execScalar(`SELECT COUNT(*) FROM issues WHERE status = 'tombstone'`) ?? mvTombstones;
+    } catch {
+      stats.tombstone = mvTombstones;
+    }
     console.log('[Stats] Parsed stats:', stats);
   } catch (err) {
     console.error('[Stats] Error loading status counts:', err);
@@ -1480,9 +1653,9 @@ function getStats() {
     WHERE is_actionable = 1
   `) || 0;
 
-  // Total
+  // Total (visible non-tombstone issues in issue_overview_mv)
   stats.total = execScalar(`SELECT COUNT(*) FROM issue_overview_mv`) || 0;
-  stats.active = stats.total - stats.closed - stats.tombstone;
+  stats.active = Math.max(0, stats.total - stats.closed - mvTombstones);
 
   return stats;
 }
@@ -1491,12 +1664,39 @@ function getStats() {
  * Get quick wins - actionable issues that unblock the most items
  */
 function getQuickWins(limit = 5) {
-  return execQuery(`
-    SELECT * FROM issue_overview_mv
-    WHERE is_actionable = 1
-    ORDER BY blocks_count DESC, triage_score DESC
-    LIMIT ?
-  `, [limit]);
+  let rows;
+  try {
+    rows = execQuery(`
+      SELECT i.*,
+             tr.score AS rec_score,
+             tr.action AS rec_action,
+             tr.reasons AS reasons_json
+      FROM issue_overview_mv i
+      LEFT JOIN triage_recommendations tr ON i.id = tr.issue_id
+      WHERE i.is_actionable = 1
+      ORDER BY i.blocks_count DESC, i.triage_score DESC
+      LIMIT ?
+    `, [limit]);
+  } catch {
+    rows = execQuery(`
+      SELECT * FROM issue_overview_mv
+      WHERE is_actionable = 1
+      ORDER BY blocks_count DESC, triage_score DESC
+      LIMIT ?
+    `, [limit]);
+  }
+  return rows.map(row => {
+    const reasons = parseJsonArraySafe(row.reasons_json);
+    const fallbackReason = row.blocks_count > 0
+      ? `Unblocks ${row.blocks_count} downstream issue${row.blocks_count === 1 ? '' : 's'}`
+      : (row.rec_action || 'Ready to work with zero active blockers');
+    return {
+      ...row,
+      triage_action: row.rec_action || '',
+      triage_reasons: reasons,
+      reason: reasons[0] || fallbackReason,
+    };
+  });
 }
 
 /**
@@ -1519,7 +1719,7 @@ function getDistributionByType() {
 	  return execQuery(`
 	    SELECT issue_type as type, COUNT(*) as count
 	    FROM issue_overview_mv
-	    WHERE status <> 'closed'
+	    WHERE status NOT IN ('closed', 'tombstone')
 	    GROUP BY issue_type
 	    ORDER BY count DESC
 	  `);
@@ -1532,7 +1732,7 @@ function getDistributionByPriority() {
 	  return execQuery(`
 	    SELECT priority, COUNT(*) as count
 	    FROM issue_overview_mv
-	    WHERE status <> 'closed'
+	    WHERE status NOT IN ('closed', 'tombstone')
 	    GROUP BY priority
 	    ORDER BY priority ASC
 	  `);
@@ -1542,12 +1742,35 @@ function getDistributionByPriority() {
  * Get top issues by triage score
  */
 function getTopPicks(limit = 5) {
-  return execQuery(`
-    SELECT * FROM issue_overview_mv
-    WHERE status IN ('open', 'in_progress')
-    ORDER BY triage_score DESC
-    LIMIT ?
-  `, [limit]);
+  let rows;
+  try {
+    rows = execQuery(`
+      SELECT i.*,
+             tr.action AS rec_action,
+             tr.reasons AS reasons_json
+      FROM issue_overview_mv i
+      LEFT JOIN triage_recommendations tr ON i.id = tr.issue_id
+      WHERE i.status IN ('open', 'in_progress')
+      ORDER BY i.triage_score DESC
+      LIMIT ?
+    `, [limit]);
+  } catch {
+    rows = execQuery(`
+      SELECT * FROM issue_overview_mv
+      WHERE status IN ('open', 'in_progress')
+      ORDER BY triage_score DESC
+      LIMIT ?
+    `, [limit]);
+  }
+  return rows.map(row => {
+    const reasons = parseJsonArraySafe(row.reasons_json);
+    return {
+      ...row,
+      triage_action: row.rec_action || '',
+      triage_reasons: reasons,
+      reason: reasons[0] || row.rec_action || '',
+    };
+  });
 }
 
 /**
@@ -1561,16 +1784,68 @@ function getRecentIssues(limit = 10) {
   `, [limit]);
 }
 
+function hasActiveOverviewIssues() {
+  return (execScalar(`SELECT COUNT(*) FROM issue_overview_mv WHERE status NOT IN ('closed', 'tombstone')`) || 0) > 0;
+}
+
 /**
- * Get top issues by PageRank
+ * Get top issues by PageRank (active issues first; falls back to closed only if all issues are closed)
  */
 function getTopByPageRank(limit = 10) {
+  if (hasActiveOverviewIssues()) {
+    return execQuery(`
+      SELECT * FROM issue_overview_mv
+      WHERE pagerank > 0 AND status NOT IN ('closed', 'tombstone')
+      ORDER BY pagerank DESC
+      LIMIT ?
+    `, [limit]);
+  }
   return execQuery(`
     SELECT * FROM issue_overview_mv
-    WHERE pagerank > 0
+    WHERE pagerank > 0 AND status <> 'tombstone'
     ORDER BY pagerank DESC
     LIMIT ?
   `, [limit]);
+}
+
+/**
+ * Get top issues by eigenvector centrality (influencers; active issues unless all issues are closed)
+ */
+function getTopByEigenvector(limit = 10) {
+  const activeOnly = hasActiveOverviewIssues();
+  try {
+    const results = execQuery(activeOnly ? `
+      SELECT * FROM issue_overview_mv
+      WHERE eigenvector > 0 AND status NOT IN ('closed', 'tombstone')
+      ORDER BY eigenvector DESC
+      LIMIT ?
+    ` : `
+      SELECT * FROM issue_overview_mv
+      WHERE eigenvector > 0 AND status <> 'tombstone'
+      ORDER BY eigenvector DESC
+      LIMIT ?
+    `, [limit]);
+    if (results.length > 0) return results;
+  } catch {
+    // Column may not exist in older databases
+  }
+
+  if (GRAPH_STATE.ready && typeof GRAPH_STATE.graph?.eigenvectorDefault === 'function') {
+    try {
+      const ev = GRAPH_STATE.graph.eigenvectorDefault();
+      if (ev && ev.length > 0) {
+        const ranked = getRankedGraphIssues(ev, 'eigenvector', activeOnly ? Math.max(limit * 4, 50) : limit, value => value > 0);
+        if (activeOnly) {
+          return ranked.filter(issue => issue && !['closed', 'tombstone'].includes(issue.status)).slice(0, limit);
+        }
+        return ranked.filter(issue => issue && issue.status !== 'tombstone').slice(0, limit);
+      }
+    } catch (e) {
+      console.warn('[viewer] getTopByEigenvector fallback failed:', e);
+    }
+  }
+
+  return [];
 }
 
 /**
@@ -1784,10 +2059,16 @@ function getCycleInfo() {
 
   const hasCycles = GRAPH_STATE.graph.hasCycles();
   const suggestions = hasCycles ? getCycleBreakSuggestions(5) : null;
+  if (suggestions && !suggestions.suggestions && Array.isArray(suggestions.top_suggestions)) {
+    suggestions.suggestions = suggestions.top_suggestions;
+  }
+  const cycleCount = suggestions?.total_cycles
+    ?? suggestions?.cycles?.length
+    ?? (hasCycles ? (GRAPH_STATE.graph.enumerateCycles?.(100)?.count ?? 0) : 0);
 
   return {
     hasCycles,
-    cycleCount: suggestions?.cycles?.length || 0,
+    cycleCount,
     suggestions,
   };
 }
@@ -1867,18 +2148,132 @@ function getIssueDependencies(id) {
   const blockedBy = execQuery(`
     SELECT i.* FROM issue_overview_mv i
     JOIN dependencies d ON i.id = d.depends_on_id
-    WHERE d.issue_id = ? AND d.type IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
+    WHERE d.issue_id = ? AND COALESCE(d.type, 'blocks') IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
     ORDER BY i.id
   `, [id]);
 
   const blocks = execQuery(`
     SELECT i.* FROM issue_overview_mv i
     JOIN dependencies d ON i.id = d.issue_id
-    WHERE d.depends_on_id = ? AND d.type IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
+    WHERE d.depends_on_id = ? AND COALESCE(d.type, 'blocks') IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
     ORDER BY i.id
   `, [id]);
 
   return { blocks, blockedBy };
+}
+
+/**
+ * Get categorized dependencies (Blocking / Blocked By, Parent / Children, Related / Discovered From)
+ * for the Issue Detail Modal, preserving non-blocking relationship edges without affecting blocking APIs.
+ */
+function getIssueDependencyGroups(id) {
+  const groups = {
+    blocks: [],
+    blockedBy: [],
+    parents: [],
+    children: [],
+    related: [],
+  };
+  if (!id) return groups;
+
+  try {
+    const outgoing = execQuery(`
+      SELECT d.depends_on_id AS dep_id,
+             COALESCE(d.type, 'blocks') AS dep_type,
+             i.id AS mv_id,
+             i.title,
+             i.status,
+             i.priority,
+             i.issue_type,
+             raw_i.title AS raw_title,
+             raw_i.status AS raw_status
+      FROM dependencies d
+      LEFT JOIN issue_overview_mv i ON i.id = d.depends_on_id
+      LEFT JOIN issues raw_i ON raw_i.id = d.depends_on_id
+      WHERE d.issue_id = ?
+      ORDER BY d.depends_on_id
+    `, [id]);
+
+    const incoming = execQuery(`
+      SELECT d.issue_id AS dep_id,
+             COALESCE(d.type, 'blocks') AS dep_type,
+             i.id AS mv_id,
+             i.title,
+             i.status,
+             i.priority,
+             i.issue_type,
+             raw_i.title AS raw_title,
+             raw_i.status AS raw_status
+      FROM dependencies d
+      LEFT JOIN issue_overview_mv i ON i.id = d.issue_id
+      LEFT JOIN issues raw_i ON raw_i.id = d.issue_id
+      WHERE d.depends_on_id = ?
+      ORDER BY d.issue_id
+    `, [id]);
+
+    const blockingTypes = new Set(['', 'blocks', 'conditional-blocks', 'waits-for']);
+    const seenRelated = new Set();
+
+    const toEntry = (row, direction) => {
+      const hasMvRow = Boolean(row.mv_id) || Boolean(row.title || row.status);
+      const hasRawRow = Boolean(row.raw_status);
+      let status = 'missing';
+      let title = `${row.dep_id} (missing)`;
+      if (hasMvRow) {
+        status = row.status || 'open';
+        title = row.title || row.dep_id;
+      } else if (hasRawRow) {
+        status = row.raw_status;
+        title = row.raw_title ? `${row.raw_title} (${row.raw_status})` : `${row.dep_id} (${row.raw_status})`;
+      }
+      return {
+        id: row.dep_id,
+        title,
+        status,
+        priority: row.priority ?? 2,
+        issue_type: row.issue_type || 'task',
+        dep_type: row.dep_type || 'blocks',
+        direction,
+        available: Boolean(row.mv_id),
+      };
+    };
+
+    for (const row of outgoing) {
+      const depType = row.dep_type ?? '';
+      if (blockingTypes.has(depType)) {
+        groups.blockedBy.push(toEntry(row, 'upstream'));
+      } else if (depType === 'parent-child') {
+        groups.parents.push(toEntry(row, 'parent'));
+      } else {
+        const normalizedType = depType || 'related';
+        const key = `${row.dep_id}:${normalizedType}`;
+        if (!seenRelated.has(key)) {
+          seenRelated.add(key);
+          groups.related.push({ ...toEntry(row, 'outgoing'), dep_type: normalizedType });
+        }
+      }
+    }
+
+    for (const row of incoming) {
+      const depType = row.dep_type ?? '';
+      if (blockingTypes.has(depType)) {
+        groups.blocks.push(toEntry(row, 'downstream'));
+      } else if (depType === 'parent-child') {
+        groups.children.push(toEntry(row, 'child'));
+      } else {
+        const normalizedType = depType || 'related';
+        const key = `${row.dep_id}:${normalizedType}`;
+        if (!seenRelated.has(key)) {
+          seenRelated.add(key);
+          groups.related.push({ ...toEntry(row, 'incoming'), dep_type: normalizedType });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[viewer] getIssueDependencyGroups failed:', err);
+  }
+
+  return groups;
 }
 
 // ============================================================================
@@ -2239,28 +2634,40 @@ function getScoreBreakdownBars(breakdown) {
   if (!breakdown) return [];
 
   const components = [
-    { name: 'PageRank', key: 'pagerank', color: '#3b82f6', weight: 0.22 },
-    { name: 'Betweenness', key: 'betweenness', color: '#f97316', weight: 0.20 },
-    { name: 'Blocker Ratio', key: 'blocker_ratio', color: '#ef4444', weight: 0.13 },
-    { name: 'Priority', key: 'priority_boost', color: '#8b5cf6', weight: 0.10 },
-    { name: 'Time Impact', key: 'time_to_impact', color: '#06b6d4', weight: 0.10 },
-    { name: 'Urgency', key: 'urgency', color: '#ec4899', weight: 0.10 },
-    { name: 'Risk', key: 'risk', color: '#f59e0b', weight: 0.10 },
-    { name: 'Staleness', key: 'staleness', color: '#6b7280', weight: 0.05 },
+    { name: 'PageRank', key: 'pagerank', color: '#3b82f6', colorClass: 'sb-c-pagerank', weight: 0.22 },
+    { name: 'Betweenness', key: 'betweenness', color: '#f97316', colorClass: 'sb-c-betweenness', weight: 0.20 },
+    { name: 'Blocker Ratio', key: 'blocker_ratio', color: '#ef4444', colorClass: 'sb-c-blocker_ratio', weight: 0.13 },
+    { name: 'Priority', key: 'priority_boost', color: '#8b5cf6', colorClass: 'sb-c-priority_boost', weight: 0.10 },
+    { name: 'Time Impact', key: 'time_to_impact', color: '#06b6d4', colorClass: 'sb-c-time_to_impact', weight: 0.10 },
+    { name: 'Urgency', key: 'urgency', color: '#ec4899', colorClass: 'sb-c-urgency', weight: 0.10 },
+    { name: 'Risk', key: 'risk', color: '#f59e0b', colorClass: 'sb-c-risk', weight: 0.10 },
+    { name: 'Staleness', key: 'staleness', color: '#6b7280', colorClass: 'sb-c-staleness', weight: 0.05 },
   ];
 
   const total = components.reduce((sum, c) => sum + (breakdown[c.key] || 0), 0);
 
   return components
-    .map(c => ({
-      name: c.name,
-      value: breakdown[c.key] || 0,
-      percent: total > 0 ? ((breakdown[c.key] || 0) / total * 100) : 0,
-      color: c.color,
-      weight: c.weight,
-      // Normalized value for bar width (0-100)
-      normalized: (breakdown[c.key + '_norm'] || 0) * 100
-    }))
+    .map(c => {
+      const value = breakdown[c.key] || 0;
+      const percent = total > 0 ? (value / total * 100) : 0;
+      const normPct = breakdown[c.key + '_norm'] !== undefined
+        ? (breakdown[c.key + '_norm'] || 0) * 100
+        : percent;
+      const clamped = Math.max(0, Math.min(100, normPct));
+      const bucket = value > 0 ? Math.max(5, Math.round(clamped / 5) * 5) : 0;
+      return {
+        name: c.name,
+        key: c.key,
+        value,
+        percent,
+        color: c.color,
+        colorClass: c.colorClass,
+        weight: c.weight,
+        // Normalized value for bar width (0-100)
+        normalized: clamped,
+        widthClass: `sb-w-${bucket}`,
+      };
+    })
     .filter(c => c.value > 0)
     .sort((a, b) => b.value - a.value);
 }
@@ -2513,6 +2920,7 @@ function beadsApp() {
     criticalPathAnimationStep: -1,
 
     // Insights view data
+    topByEigenvector: [],
     topByBetweenness: [],
     topByCriticalPath: [],
     topByHITSHub: [],
@@ -2586,9 +2994,11 @@ function beadsApp() {
           console.warn('[Toast] Invalid toast data:', toast);
           return;
         }
-        // Ensure required properties
+        // Ensure required properties and unique key even under sub-ms bursts
+        const candidateId = toast.id ? String(toast.id) : nextToastId();
+        const uniqueId = this.toasts.some(t => t.id === candidateId) ? nextToastId() : candidateId;
         const validToast = {
-          id: toast.id || Date.now(),
+          id: uniqueId,
           message: toast.message,
           type: toast.type || 'info'
         };
@@ -2794,10 +3204,11 @@ function beadsApp() {
 
         // Load initial data
         this.meta = getMeta();
+        window.BV_META = this.meta;
         this.stats = getStats();
         DIAGNOSTICS.issueCount = this.stats.total || 0;
         if (typeof window.initHybridWasmScorer === 'function') {
-          window.initHybridWasmScorer(DIAGNOSTICS.issueCount)
+          window.initHybridWasmScorer(DIAGNOSTICS.issueCount, this.meta)
             .then((enabled) => {
               DIAGNOSTICS.hybridWasm = !!enabled;
               if (!enabled && typeof window.getHybridWasmStatus === 'function') {
@@ -2813,6 +3224,7 @@ function beadsApp() {
         this.topPicks = getTopPicks(5);
         this.recentIssues = getRecentIssues(10);
         this.topByPageRank = getTopByPageRank(10);
+        this.topByEigenvector = getTopByEigenvector(10);
         this.topByTriageScore = getTopByTriageScore(10);
         this.topBlockers = getTopBlockers(10);
 
@@ -2836,6 +3248,9 @@ function beadsApp() {
           this.topKSet = getTopKSet(5);
           this.topByBetweenness = getTopByBetweenness(10);
           this.topByCriticalPath = getTopByCriticalPath(10);
+          if (!this.topByEigenvector.length) {
+            this.topByEigenvector = getTopByEigenvector(10);
+          }
           this.cycleInfo = getCycleInfo();
           this.totalCycles = this.cycleInfo?.cycleCount || 0;
           this.topImpactIssues = topWhatIf(10);
@@ -2862,7 +3277,7 @@ function beadsApp() {
         if (typeof window.bvCharts !== 'undefined') {
           try {
             const graphData = getGraphViewData();
-            window.bvCharts.init(graphData.issues, graphData.dependencies);
+            window.bvCharts.init(graphData.issues, graphData.dependencies, getResolvedIssueIDs());
           } catch (e) {
             console.warn('[Charts] Init failed:', e);
           }
@@ -2922,8 +3337,14 @@ function beadsApp() {
           // Issue detail view
           this.view = 'issues'; // Keep issues as backdrop
           if (route.params.id) {
-            // Reset state when switching issues
-            this.showDepGraph = false;
+            // Preserve open dependency graph when navigating between issues inside the modal
+            const keepDepGraph = Boolean(this.selectedIssue && this.showDepGraph);
+            if (!keepDepGraph) {
+              this.showDepGraph = false;
+              if (this.$refs && this.$refs.depGraph) {
+                this.$refs.depGraph.innerHTML = '';
+              }
+            }
             this.whatIfResult = null;
             this.selectedIssue = getIssue(route.params.id);
             // Update nav list from current issues
@@ -2935,6 +3356,9 @@ function beadsApp() {
 
         case 'issues':
           this.view = 'issues';
+          if (this.$refs && this.$refs.depGraph) {
+            this.$refs.depGraph.innerHTML = '';
+          }
           this.selectedIssue = null;
           this.showDepGraph = false;
           this.whatIfResult = null;
@@ -3375,13 +3799,27 @@ function beadsApp() {
         return;
       }
 
-      this.showDepGraph = false;
+      const keepDepGraph = Boolean(this.selectedIssue && this.showDepGraph);
+      if (!keepDepGraph) {
+        this._depGraphRenderSeq = (this._depGraphRenderSeq || 0) + 1;
+        this.showDepGraph = false;
+        if (this.$refs && this.$refs.depGraph) {
+          this.$refs.depGraph.innerHTML = '';
+        }
+      }
       this.whatIfResult = null;
       this.selectedIssue = issue;
 
       if (this.issues.length) {
         this.issueNavList = this.issues.map(i => i.id);
       }
+    },
+
+    /**
+     * Alias for opening an issue modal directly
+     */
+    openIssue(id) {
+      this.selectIssue(id);
     },
 
     /**
@@ -3396,6 +3834,10 @@ function beadsApp() {
      */
     closeIssue() {
       // Reset issue detail state
+      this._depGraphRenderSeq = (this._depGraphRenderSeq || 0) + 1;
+      if (this.$refs && this.$refs.depGraph) {
+        this.$refs.depGraph.innerHTML = '';
+      }
       this.selectedIssue = null;
       this.showDepGraph = false;
       this.whatIfResult = null;
@@ -3435,7 +3877,9 @@ function beadsApp() {
       const newId = this.issueNavList[newIndex];
 
       // Reset state and navigate/select
-      this.showDepGraph = false;
+      if (!this.showDepGraph && this.$refs && this.$refs.depGraph) {
+        this.$refs.depGraph.innerHTML = '';
+      }
       this.whatIfResult = null;
       const route = parseRoute(window.location.hash);
       if (route.view === 'issue') {
@@ -3465,10 +3909,27 @@ function beadsApp() {
       if (!this.selectedIssue || !this.$refs.depGraph) return;
 
       const issue = this.selectedIssue;
-      const blockedBy = (issue.blocked_by_ids || '').split(',').filter(Boolean).map(s => s.trim());
-      const blocks = (issue.blocks_ids || '').split(',').filter(Boolean).map(s => s.trim());
+      const targetIssueId = issue.id;
+      const renderSeq = (this._depGraphRenderSeq = (this._depGraphRenderSeq || 0) + 1);
+      this.$refs.depGraph.innerHTML = '';
+      const groups = issue.dependencyGroups || {};
+      const blockedByEntries = groups.blockedBy?.length
+        ? groups.blockedBy
+        : (issue.blocked_by_ids || '').split(',').filter(Boolean).map(s => ({ id: s.trim(), status: 'open', dep_type: 'blocks', available: true }));
+      const blocksEntries = groups.blocks?.length
+        ? groups.blocks
+        : (issue.blocks_ids || '').split(',').filter(Boolean).map(s => ({ id: s.trim(), status: 'open', dep_type: 'blocks', available: true }));
+      const parentEntries = groups.parents || [];
+      const childEntries = groups.children || [];
+      const relatedEntries = groups.related || [];
 
-      if (blockedBy.length === 0 && blocks.length === 0) {
+      if (
+        blockedByEntries.length === 0 &&
+        blocksEntries.length === 0 &&
+        parentEntries.length === 0 &&
+        childEntries.length === 0 &&
+        relatedEntries.length === 0
+      ) {
         this.$refs.depGraph.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-center">No dependencies</p>';
         return;
       }
@@ -3476,44 +3937,88 @@ function beadsApp() {
       // Build Mermaid flowchart
       let diagram = 'flowchart TB\n';
 
-      // Sanitize ID for mermaid (replace special chars)
-      const sanitizeId = (id) => id.replace(/[^a-zA-Z0-9]/g, '_');
+      // Sanitize ID/labels for Mermaid
+      const sanitizeId = (id) => 'n_' + String(id).replace(/[^a-zA-Z0-9]/g, '_');
+      const sanitizeLabel = (text) => String(text ?? '').replace(/["\[\]\n\r]/g, ' ').trim();
+      const sanitizeEdgeLabel = (text) => String(text ?? '').replace(/[^a-zA-Z0-9_-]/g, '_');
       const currentId = sanitizeId(issue.id);
 
       // Style for current node
-      diagram += `  ${currentId}["${issue.id}"]\n`;
+      diagram += `  ${currentId}["${sanitizeLabel(issue.id)}"]\n`;
       diagram += `  style ${currentId} fill:#0ea5e9,stroke:#0284c7,color:#fff\n`;
 
-      // Add blocked-by nodes (upstream)
-      for (const depId of blockedBy) {
-        const nodeId = sanitizeId(depId);
-        diagram += `  ${nodeId}["${depId}"]\n`;
+      const navigableIds = new Set([issue.id]);
+      const styledNodes = new Set([currentId]);
+      const defineNode = (entry, activeStyle) => {
+        const nodeId = sanitizeId(entry.id);
+        if (!styledNodes.has(nodeId)) {
+          styledNodes.add(nodeId);
+          const suffix = entry.status === 'missing' ? ' (missing)' : '';
+          diagram += `  ${nodeId}["${sanitizeLabel(entry.id + suffix)}"]\n`;
+          const isResolved = entry.status === 'closed' || entry.status === 'tombstone';
+          const styleSpec = isResolved
+            ? 'fill:#f3f4f6,stroke:#9ca3af,color:#6b7280'
+            : entry.status === 'missing'
+              ? 'fill:#fef2f2,stroke:#ef4444,stroke-dasharray: 4 2'
+              : activeStyle;
+          diagram += `  style ${nodeId} ${styleSpec}\n`;
+        }
+        if (entry.available !== false) {
+          navigableIds.add(entry.id);
+        }
+        return nodeId;
+      };
+
+      // Upstream blockers (including closed/missing)
+      for (const dep of blockedByEntries) {
+        const nodeId = defineNode(dep, 'fill:#fef3c7,stroke:#f59e0b');
         diagram += `  ${nodeId} --> ${currentId}\n`;
-        diagram += `  style ${nodeId} fill:#fef3c7,stroke:#f59e0b\n`;
       }
 
-      // Add blocks nodes (downstream)
-      for (const depId of blocks) {
-        const nodeId = sanitizeId(depId);
-        diagram += `  ${nodeId}["${depId}"]\n`;
+      // Downstream dependents (including closed)
+      for (const dep of blocksEntries) {
+        const nodeId = defineNode(dep, 'fill:#fee2e2,stroke:#ef4444');
         diagram += `  ${currentId} --> ${nodeId}\n`;
-        diagram += `  style ${nodeId} fill:#fee2e2,stroke:#ef4444\n`;
       }
 
-      // Add click handlers
-      const allIds = [issue.id, ...blockedBy, ...blocks];
-      for (const id of allIds) {
+      // Parents & children (hierarchical non-blocking)
+      for (const dep of parentEntries) {
+        const nodeId = defineNode(dep, 'fill:#e0e7ff,stroke:#6366f1');
+        diagram += `  ${nodeId} -. parent .-> ${currentId}\n`;
+      }
+      for (const dep of childEntries) {
+        const nodeId = defineNode(dep, 'fill:#e0e7ff,stroke:#6366f1');
+        diagram += `  ${currentId} -. child .-> ${nodeId}\n`;
+      }
+
+      // Related / discovered-from / custom non-blocking
+      for (const dep of relatedEntries) {
+        const nodeId = defineNode(dep, 'fill:#e0f2fe,stroke:#0284c7');
+        const edgeLabel = sanitizeEdgeLabel(dep.dep_type || 'related');
+        if (dep.direction === 'incoming') {
+          diagram += `  ${nodeId} -. ${edgeLabel} .-> ${currentId}\n`;
+        } else {
+          diagram += `  ${currentId} -. ${edgeLabel} .-> ${nodeId}\n`;
+        }
+      }
+
+      // Add click handlers for available issues
+      for (const id of navigableIds) {
         const nodeId = sanitizeId(id);
-        diagram += `  click ${nodeId} call window.beadsViewer.navigateToIssue("${id}")\n`;
+        const safeId = String(id).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        diagram += `  click ${nodeId} call window.beadsViewer.navigateToIssue("${safeId}")\n`;
       }
 
       try {
         // Render the diagram
-        const { svg } = await mermaid.render('dep-graph-' + Date.now(), diagram);
+        const { svg } = await mermaid.render('dep-graph-' + nextToastId().replace(/[^a-zA-Z0-9]/g, '_'), diagram);
+        if (this._depGraphRenderSeq !== renderSeq || !this.showDepGraph || !this.selectedIssue || this.selectedIssue.id !== targetIssueId || !this.$refs.depGraph) return;
         this.$refs.depGraph.innerHTML = svg;
       } catch (err) {
         console.warn('Mermaid render failed:', err);
-        this.$refs.depGraph.innerHTML = '<p class="text-red-500 text-center text-sm">Failed to render graph</p>';
+        if (this._depGraphRenderSeq === renderSeq && this.showDepGraph && this.selectedIssue && this.selectedIssue.id === targetIssueId && this.$refs.depGraph) {
+          this.$refs.depGraph.innerHTML = '<p class="text-red-500 text-center text-sm">Failed to render graph</p>';
+        }
       }
     },
 
@@ -3711,12 +4216,18 @@ function beadsApp() {
     async prevCycleInGraph() {
       const ready = await this.initForceGraph();
       if (!ready) return;
+      if (!this.cycleNavigatorActive) {
+        this.forceGraphModule?.toggleCycleNavigator?.();
+      }
       this.forceGraphModule?.prevCycle?.();
     },
 
     async nextCycleInGraph() {
       const ready = await this.initForceGraph();
       if (!ready) return;
+      if (!this.cycleNavigatorActive) {
+        this.forceGraphModule?.toggleCycleNavigator?.();
+      }
       this.forceGraphModule?.nextCycle?.();
     },
 
@@ -3807,8 +4318,16 @@ function beadsApp() {
       const metricLabels = {
         pagerank: 'PageRank',
         betweenness: 'Betweenness Centrality',
+        eigenvector: 'Eigenvector Centrality',
+        inDegree: 'In-Degree (Dependents)',
+        indegree: 'In-Degree (Dependents)',
+        outDegree: 'Out-Degree (Blockers)',
+        criticalPath: 'Critical Path Depth',
         critical: 'Critical Path Depth',
-        indegree: 'In-Degree (Blockers)'
+        kcore: 'K-Core Number',
+        hitsHub: 'HITS Hub Score',
+        hitsAuth: 'HITS Authority Score',
+        slack: 'Schedule Slack',
       };
       showToast(`Metric: ${metricLabels[metric] || metric}`, 'info');
     },
@@ -3873,6 +4392,8 @@ function beadsApp() {
      * Get issue by ID (wrapper for templates)
      */
     getIssue,
+    isIssueOverdue,
+    getScoreBreakdownBars,
 
     /**
      * Dismiss the current error modal
@@ -3903,6 +4424,9 @@ window.beadsViewer = {
   countIssues,
   getIssue,
   getIssueDependencies,
+  getIssueDependencyGroups,
+  isIssueOverdue,
+  getScoreBreakdownBars,
   getStats,
   getMeta,
   getFilterOptions,
@@ -3947,8 +4471,10 @@ window.beadsViewer = {
   getWasmMemoryStats,
 
   // Insights helpers
+  buildFtsMatchQuery,
   getTopByBetweenness,
   getTopByCriticalPath,
+  getTopByEigenvector,
   getCycleInfo,
 
   // Error handling

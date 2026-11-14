@@ -195,6 +195,27 @@ every reported vulnerability has an exploitable execution path in bv.
   and connect static-viewer Galaxy (`5`) preset, `T` time-travel, arrow-key detail
   sync, cycle-navigator buttons, error-modal actions, chart click-to-filter, label
   filtering, and multi-token search scoring.
+- **Datasource fidelity, multi-repo/monorepo workspace parity, analysis/correlation
+  hardening, TUI modal focus algebra, and static viewer Unicode/WASM parity
+  (`bv-apal.42`..`bv-apal.49`):** unify SQLite (`beads.db`) and JSONL issue
+  ingestion (`pinned`, `ephemeral`, `is_template`, `content_hash`, comment author
+  normalization), single-repo custom `BEADS_DIR` correlation/orphan/export routing,
+  multi-repo and Config-A/B shared-`.git` monorepo correlation (`--workspace`,
+  `--repo` subtree scoping, `ExplicitIDAliases`, `AmbiguousUnprefixedIDs` subtree
+  disambiguation, `TargetBeadAliases` for deleted/tombstoned beads, per-store
+  `correlation_feedback.jsonl`, and aggregated sprint/burndown scoping), and universal
+  `--limit` + pre/post export hook parity across `--export-graph` and
+  `--priority-brief`; isolate persistent Layer-2 `head_artifact_cache` and
+  `IncrementalCorrelator` keys by canonical bead-ID dictionary (`artifactOptionsHash`)
+  while preserving metadata-edit reuse, exclude custom tracker paths (`storeDirRel` /
+  `WithStoreDirs` / `WithSubtreeScope`), wire Phase 2–4 triage factors, parked/withheld
+  quick-win guards, and `Snapshot.ComputeScopedCounts`; enforce 14-overlay 1:1 TUI
+  modal Z-order, live `validateViewFocus` split-view resize/stacked-jump unwedging,
+  Recipe Picker `ShowGraph`/secondary-view transitions, Time-Travel `Esc` cancel
+  preservation, and History `Tab`/`o` file-tree + repo scoping; and add NFC + Unicode
+  combining-mark FTS5/LIKE search with literal `_`/`%` wildcard escaping, monotonic
+  Mermaid render sequencing, WASM cycle/metric fallbacks, non-blocking dependency
+  views, and standalone HTML graph filters/Path Finder reset.
 
 ## v0.26.0 — 2026-11-02
 

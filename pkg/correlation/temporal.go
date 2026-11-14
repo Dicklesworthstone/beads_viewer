@@ -428,7 +428,7 @@ type temporalCandidate struct {
 // open for the rest of history, which is the same answer for every past
 // window and keeps the artifact deterministic. Windows are returned in bead
 // id order.
-func temporalWindowsFromEvents(events []BeadEvent, beadFilter string) []TemporalWindow {
+func temporalWindowsFromEvents(events []BeadEvent, beadFilter string, beadAliases ...string) []TemporalWindow {
 	eventsByBead := make(map[string][]BeadEvent)
 	for _, ev := range events {
 		eventsByBead[ev.BeadID] = append(eventsByBead[ev.BeadID], ev)
@@ -458,7 +458,7 @@ func temporalWindowsFromEvents(events []BeadEvent, beadFilter string) []Temporal
 			span.closed = true
 		}
 		spans[id] = span
-		if beadFilter != "" && id != beadFilter {
+		if !matchesBeadFilter(id, beadFilter, beadAliases) {
 			continue
 		}
 		if w := ExtractWindowFromMilestones(id, "", m); w != nil {

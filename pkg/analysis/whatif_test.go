@@ -848,8 +848,11 @@ func TestEnhancedPriorityBatchRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Verify exact numerical parity with pre-reuse 52853c6a plus the three
-	// bv-apal.21 contract upgrades: non-null labels ([]), populated
-	// explanation.status.data_hash, and deterministic IssueID tie-breaking.
+	// bv-apal.21 contract upgrades (non-null labels [], populated
+	// explanation.status.data_hash, deterministic IssueID tie-breaking) and the
+	// bv-apal.44 dependency-blocked StatusRisk fix (+0.012 = (0.7-0.1)*0.20*0.10
+	// on DEPENDENT-* which depend on open ROOT via DepBlocks, while unblocked
+	// ROOT stays at 0.41725).
 	if len(got) != 10 {
 		t.Fatalf("len(got)=%d want 10", len(got))
 	}
@@ -858,8 +861,8 @@ func TestEnhancedPriorityBatchRegression(t *testing.T) {
 	}
 	for i := 1; i < len(got); i++ {
 		wantID := fmt.Sprintf("DEPENDENT-%03d", i*5)
-		if got[i].IssueID != wantID || got[i].ImpactScore != 0.16072914549252842 {
-			t.Fatalf("got[%d]=(%s, %v) want (%s, 0.16072914549252842)", i, got[i].IssueID, got[i].ImpactScore, wantID)
+		if got[i].IssueID != wantID || got[i].ImpactScore != 0.17272914549252844 {
+			t.Fatalf("got[%d]=(%s, %v) want (%s, 0.17272914549252844)", i, got[i].IssueID, got[i].ImpactScore, wantID)
 		}
 	}
 	for i, rec := range got {
@@ -870,7 +873,7 @@ func TestEnhancedPriorityBatchRegression(t *testing.T) {
 			t.Fatalf("got[%d].Explanation.Status=%+v want non-empty data_hash and phase2_ready=true", i, rec.Explanation.Status)
 		}
 	}
-	const wantSHA = "12e5c9f104e215e36b10fefe1ebbc0df86954ad12f2f8decc48462cd269ed490"
+	const wantSHA = "1b367ec1460f1f2a784432cdca6667370be36b3a63164d4656bbb018ed9f8b48"
 	if gotSHA := fmt.Sprintf("%x", sha256.Sum256(encoded)); gotSHA != wantSHA {
 		t.Fatalf("complete enhanced output SHA256=%s want %s\n%s", gotSHA, wantSHA, encoded)
 	}

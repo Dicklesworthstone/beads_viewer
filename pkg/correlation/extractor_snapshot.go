@@ -131,6 +131,13 @@ func (e *Extractor) extractCausalHistory(target string, opts ExtractOptions) (*C
 		}
 		return records, valid, nil
 	}
+	candidates := causalTargetCandidates(target, opts.BeadIDAliases)
+	obsByCand := make([][]CausalObservation, len(candidates))
+	for ci := range obsByCand {
+		obsByCand[ci] = []CausalObservation{}
+	}
+	appeared := make([]bool, len(candidates))
+
 	var previous map[string]beadSnapshot
 	var previousSHA string
 	var previousValid bool
@@ -147,49 +154,101 @@ func (e *Extractor) extractCausalHistory(target string, opts ExtractOptions) (*C
 		if err != nil {
 			return nil, fmt.Errorf("reading causal commit %s: %w", c.info.SHA, err)
 		}
-		oldState, oldRelevant := causalSnapshotState(before, validBefore, target)
-		newState, newRelevant := causalSnapshotState(after, validAfter, target)
-		for id := range newRelevant {
-			oldRelevant[id] = true
+		for ci, cand := range candidates {
+			if _, ok := before[cand]; ok {
+				appeared[ci] = true
+			}
+			if _, ok := after[cand]; ok {
+				appeared[ci] = true
+			}
+			obsByCand[ci] = append(obsByCand[ci], buildCausalObservation(before, validBefore, after, validAfter, cand, c.info, committed[i]))
 		}
-		ids := make([]string, 0, len(oldRelevant))
-		for id := range oldRelevant {
-			ids = append(ids, id)
-		}
-		sort.Strings(ids)
-		obs := CausalObservation{CommitSHA: c.info.SHA, Timestamp: c.info.Timestamp, CommittedAt: committed[i], Before: oldState, After: newState, Changes: []BeadEvent{}}
-		for _, id := range ids {
-			old, hadOld := before[id]
-			current, hasNew := after[id]
-			if hadOld == hasNew && equalHistoricalRecord(old, current) {
-				continue
-			}
-			event := BeadEvent{BeadID: id, CommitSHA: c.info.SHA, Timestamp: c.info.Timestamp, CommitMsg: c.info.Message, Author: c.info.Author, AuthorEmail: c.info.AuthorEmail, EventType: EventModified, TransitionObserved: validBefore && validAfter}
-			if hadOld {
-				event.Before = old.historicalState()
-			}
-			if hasNew {
-				event.After = current.historicalState()
-			}
-			switch {
-			case !hadOld:
-				event.EventType = EventCreated
-			case !hasNew:
-				event.EventType = EventDeleted
-			case old.Status != current.Status:
-				event.EventType = determineStatusEvent(old.Status, current.Status)
-			}
-			obs.Changes = append(obs.Changes, event)
-			if !hadOld && hasNew {
-				if synth, ok := synthesizedCreationMilestone(event, current.Status); ok {
-					obs.Changes = append(obs.Changes, synth)
-				}
-			}
-		}
-		result.Observations = append(result.Observations, obs)
 		previous, previousValid, previousSHA = after, validAfter, c.newSHA
 	}
+	chosen := 0
+	for ci, ok := range appeared {
+		if ok {
+			chosen = ci
+			break
+		}
+	}
+	result.BeadID = candidates[chosen]
+	result.Observations = obsByCand[chosen]
 	return result, nil
+}
+
+func causalTargetCandidates(primary string, aliases []string) []string {
+	out := make([]string, 0, 1+len(aliases))
+	seen := make(map[string]struct{}, 1+len(aliases))
+	if primary != "" {
+		out = append(out, primary)
+		seen[primary] = struct{}{}
+	}
+	for _, a := range aliases {
+		if a == "" {
+			continue
+		}
+		if _, ok := seen[a]; ok {
+			continue
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
+	}
+	if len(out) == 0 {
+		return []string{primary}
+	}
+	return out
+}
+
+func buildCausalObservation(
+	before map[string]beadSnapshot,
+	validBefore bool,
+	after map[string]beadSnapshot,
+	validAfter bool,
+	target string,
+	info commitInfo,
+	committedAt time.Time,
+) CausalObservation {
+	oldState, oldRelevant := causalSnapshotState(before, validBefore, target)
+	newState, newRelevant := causalSnapshotState(after, validAfter, target)
+	for id := range newRelevant {
+		oldRelevant[id] = true
+	}
+	ids := make([]string, 0, len(oldRelevant))
+	for id := range oldRelevant {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	obs := CausalObservation{CommitSHA: info.SHA, Timestamp: info.Timestamp, CommittedAt: committedAt, Before: oldState, After: newState, Changes: []BeadEvent{}}
+	for _, id := range ids {
+		old, hadOld := before[id]
+		current, hasNew := after[id]
+		if hadOld == hasNew && equalHistoricalRecord(old, current) {
+			continue
+		}
+		event := BeadEvent{BeadID: id, CommitSHA: info.SHA, Timestamp: info.Timestamp, CommitMsg: info.Message, Author: info.Author, AuthorEmail: info.AuthorEmail, EventType: EventModified, TransitionObserved: validBefore && validAfter}
+		if hadOld {
+			event.Before = old.historicalState()
+		}
+		if hasNew {
+			event.After = current.historicalState()
+		}
+		switch {
+		case !hadOld:
+			event.EventType = EventCreated
+		case !hasNew:
+			event.EventType = EventDeleted
+		case old.Status != current.Status:
+			event.EventType = determineStatusEvent(old.Status, current.Status)
+		}
+		obs.Changes = append(obs.Changes, event)
+		if !hadOld && hasNew {
+			if synth, ok := synthesizedCreationMilestone(event, current.Status); ok {
+				obs.Changes = append(obs.Changes, synth)
+			}
+		}
+	}
+	return obs
 }
 
 func equalHistoricalRecord(a, b beadSnapshot) bool {
@@ -342,7 +401,7 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 	// (see per_commit_event_cache.go). Load the cached contributions for this
 	// (file,BeadID) namespace; reuse them for already-seen commits so a HEAD
 	// advance only reads + diffs the NEW commits' blobs instead of all ~200.
-	namespace := perCommitEventCacheNamespace(e.primaryBeadsFile(), opts.BeadID)
+	namespace := perCommitEventCacheNamespace(e.primaryBeadsFile(), opts.filterCacheKey())
 	cached := loadPerCommitEvents(namespace)
 	var unfilteredCache map[string]perCommitEventEntry
 	unfilteredLoaded := false
@@ -393,7 +452,7 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 			if ce, ok := unfilteredCache[c.info.SHA]; ok && ce.OldSHA == c.oldSHA && ce.NewSHA == c.newSHA {
 				selected := make([]BeadEvent, 0)
 				for _, event := range ce.Events {
-					if event.BeadID == opts.BeadID {
+					if opts.matchesBead(event.BeadID) {
 						selected = append(selected, event)
 					}
 				}
@@ -465,7 +524,7 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 		var evs []BeadEvent
 		diffText := synthesizeRecordDiff(oldSnapshot.lines, newSnapshot.lines)
 		if len(diffText) > 0 {
-			evs = e.parseDiff(diffText, c.info, opts.BeadID)
+			evs = e.parseDiffFiltered(diffText, c.info, opts.BeadID, opts.BeadIDAliases)
 		}
 		// Store an empty-but-non-nil slice so the compose loop and the cache both
 		// treat "computed, no events" as a definitive result (never re-read).

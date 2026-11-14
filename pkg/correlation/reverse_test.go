@@ -1,6 +1,8 @@
 package correlation
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -443,5 +445,107 @@ func TestCommitBeadResult_EmptyRelatedBeads(t *testing.T) {
 
 	if !result.IsOrphan {
 		t.Error("Should be marked as orphan")
+	}
+}
+
+func TestReverseLookup_WithSubtreeScopeIgnoresTrackerPathsOnCodeCommitsAndNormalizesPaths(t *testing.T) {
+	mono := t.TempDir()
+	runGit(t, mono, "init")
+	runGit(t, mono, "config", "user.email", "test@example.com")
+	runGit(t, mono, "config", "user.name", "Test User")
+	for _, d := range []string{
+		filepath.Join(mono, ".beads"),
+		filepath.Join(mono, "services", "api", ".beads"),
+		filepath.Join(mono, "services", "web", ".beads"),
+	} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(mono, ".beads", "sprints.jsonl"), []byte(`{"id":"s1","name":"Root sprint"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mono, "services", "api", ".beads", "issues.jsonl"), []byte(`{"id":"1","title":"API task","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mono, "services", "web", ".beads", "issues.jsonl"), []byte(`{"id":"1","title":"Web task","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mono, "add", ".")
+	runGit(t, mono, "commit", "-m", "chore: seed trackers only")
+
+	// Commit 2: root tracker + web code file -> must belong ONLY to web, NEVER to root (excludeSubtrees).
+	if err := os.WriteFile(filepath.Join(mono, ".beads", "sprints.jsonl"), []byte(`{"id":"s1","name":"Root sprint v2"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mono, "services", "web", "app.ts"), []byte("export const a = 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mono, "add", ".beads/sprints.jsonl", "services/web/app.ts")
+	runGit(t, mono, "commit", "-m", "fix: web code with root sprint update")
+
+	// Commit 3: api tracker + web code file -> must belong ONLY to web, NEVER to api (includeSubtrees).
+	if err := os.WriteFile(filepath.Join(mono, "services", "api", ".beads", "issues.jsonl"), []byte(`{"id":"1","title":"API task updated","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mono, "services", "web", "app.ts"), []byte("export const a = 2;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mono, "add", "services/api/.beads/issues.jsonl", "services/web/app.ts")
+	runGit(t, mono, "commit", "-m", "fix: web code with api tracker update")
+
+	// Commit 4: pure api tracker commit -> attributed to api's BeadsOnlyCommits (and NOT root).
+	if err := os.WriteFile(filepath.Join(mono, "services", "api", ".beads", "issues.jsonl"), []byte(`{"id":"1","title":"API task v3","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, mono, "add", "services/api/.beads/issues.jsonl")
+	runGit(t, mono, "commit", "-m", "chore: pure api tracker update")
+
+	emptyReport := &HistoryReport{
+		CommitIndex: make(CommitIndex),
+		Histories:   make(map[string]BeadHistory),
+	}
+
+	// 1. Root umbrella scope (excludeSubtrees) with uncleaned paths ("./services//api/", "services/web/sub/..").
+	rlRoot := NewReverseLookupWithRepo(emptyReport, mono).
+		WithStoreDirs(".beads", "services/api/.beads", "services/web/.beads").
+		WithSubtreeScope(nil, []string{"./services//api/", "services/web/sub/..", "..", "../outside", "/outside", "."})
+	rootOrphans, rootStats, err := rlRoot.FindOrphanCommits(ExtractOptions{Limit: 20})
+	if err != nil {
+		t.Fatalf("root FindOrphanCommits: %v", err)
+	}
+	if len(rootOrphans) != 0 || rootStats.TotalCommits != 0 || rootStats.OrphanCommits != 0 {
+		t.Fatalf("root excludeSubtrees contaminated by web code commit touching .beads/sprints.jsonl: orphans=%+v stats=%+v", rootOrphans, rootStats)
+	}
+	if rootStats.BeadsOnlyCommits != 1 {
+		t.Fatalf("root BeadsOnlyCommits = %d, want 1 (seed commit touching .beads/)", rootStats.BeadsOnlyCommits)
+	}
+
+	// 2. API scope (includeSubtrees) with uncleaned path "./services//api" + traversal rejection.
+	rlAPI := NewReverseLookupWithRepo(emptyReport, mono).
+		WithStoreDirs(".beads", "services/api/.beads", "services/web/.beads").
+		WithSubtreeScope([]string{"./services//api", "../outside"}, nil)
+	apiOrphans, apiStats, err := rlAPI.FindOrphanCommits(ExtractOptions{Limit: 20})
+	if err != nil {
+		t.Fatalf("api FindOrphanCommits: %v", err)
+	}
+	if len(apiOrphans) != 0 || apiStats.TotalCommits != 0 || apiStats.OrphanCommits != 0 {
+		t.Fatalf("api includeSubtrees leaked web code commit touching services/api/.beads: orphans=%+v stats=%+v", apiOrphans, apiStats)
+	}
+	if apiStats.BeadsOnlyCommits != 2 {
+		t.Fatalf("api BeadsOnlyCommits = %d, want 2 (seed commit + pure api tracker commit)", apiStats.BeadsOnlyCommits)
+	}
+
+	// 3. Web scope (includeSubtrees) sees both web orphan commits cleanly.
+	rlWeb := NewReverseLookupWithRepo(emptyReport, mono).
+		WithStoreDirs(".beads", "services/api/.beads", "services/web/.beads").
+		WithSubtreeScope([]string{"./services/web/"}, nil)
+	webOrphans, webStats, err := rlWeb.FindOrphanCommits(ExtractOptions{Limit: 20})
+	if err != nil {
+		t.Fatalf("web FindOrphanCommits: %v", err)
+	}
+	if len(webOrphans) != 2 || webStats.TotalCommits != 2 || webStats.OrphanCommits != 2 {
+		t.Fatalf("web includeSubtrees expected 2 orphan commits, got orphans=%+v stats=%+v", webOrphans, webStats)
 	}
 }

@@ -239,12 +239,36 @@ func (c *Calculator) validateBorrowedAnalyzer() {
 	}
 }
 
+// SetCandidates restricts issue-level drift checks to the given candidate ID
+// set when non-nil (matching Analyzer.SetReadinessScope semantics: nil allows
+// all attached issues; an empty non-nil map allows none).
+func (c *Calculator) SetCandidates(candidateIDs map[string]bool) {
+	if candidateIDs == nil {
+		c.analyzerCandidates = nil
+		if c.analyzerSource == nil {
+			c.analyzerCache = nil
+		}
+		return
+	}
+	copied := make(map[string]bool, len(candidateIDs))
+	for id, selected := range candidateIDs {
+		copied[id] = selected
+	}
+	c.analyzerCandidates = copied
+	c.analyzerSource = nil
+	c.analyzerCache = nil
+}
+
+func (c *Calculator) isCandidate(id string) bool {
+	return c.analyzerCandidates == nil || c.analyzerCandidates[id]
+}
+
 // analyzer returns the shared graph analyzer over the attached issues (nil
 // when no issues are attached).
 func (c *Calculator) analyzer() *analysis.Analyzer {
 	if c.analyzerCache == nil && len(c.issues) > 0 {
 		a := analysis.NewAnalyzer(c.issues)
-		if c.analyzerReadiness != nil {
+		if c.analyzerReadiness != nil || c.analyzerCandidates != nil {
 			a.SetReadinessScope(c.analyzerReadiness, c.analyzerCandidates)
 			a.RestoreScoring(c.analyzerScoring)
 		}
@@ -316,6 +340,18 @@ func (c *Calculator) Calculate() *Result {
 	return result
 }
 
+func (c *Calculator) cycleHasCandidate(cycle []string) bool {
+	if c.analyzerCandidates == nil {
+		return true
+	}
+	for _, id := range cycle {
+		if c.analyzerCandidates[id] {
+			return true
+		}
+	}
+	return false
+}
+
 // checkCycles detects new cycles that weren't in the baseline
 func (c *Calculator) checkCycles(result *Result) {
 	// Check if alert type is disabled (bv-167)
@@ -324,13 +360,23 @@ func (c *Calculator) checkCycles(result *Result) {
 	}
 
 	baselineCycles := make(map[string]bool)
+	blCount := 0
 	for _, cycle := range c.baseline.Cycles {
+		if !c.cycleHasCandidate(cycle) {
+			continue
+		}
+		blCount++
 		key := cycleKey(cycle)
 		baselineCycles[key] = true
 	}
 
 	var newCycles [][]string
+	curCount := 0
 	for _, cycle := range c.current.Cycles {
+		if !c.cycleHasCandidate(cycle) {
+			continue
+		}
+		curCount++
 		key := cycleKey(cycle)
 		if !baselineCycles[key] {
 			newCycles = append(newCycles, cycle)
@@ -348,8 +394,8 @@ func (c *Calculator) checkCycles(result *Result) {
 			Severity:        SeverityCritical,
 			SuggestedAction: "Break the cycle by removing or reversing one dependency edge (bv --robot-suggest lists cycle-break candidates)",
 			Message:         fmt.Sprintf("%d new cycle(s) detected", len(newCycles)),
-			BaselineVal:     float64(len(c.baseline.Cycles)),
-			CurrentVal:      float64(len(c.current.Cycles)),
+			BaselineVal:     float64(blCount),
+			CurrentVal:      float64(curCount),
 			Delta:           float64(len(newCycles)),
 			Details:         details,
 			DetectedAt:      c.nowUTC(),
@@ -511,58 +557,119 @@ func (c *Calculator) checkActionable(result *Result) {
 	}
 }
 
-// checkPageRankChanges detects significant changes in top PageRank items
+// collectTopMetricChanges compares baseline and current top-N items for a single structural metric.
+func collectTopMetricChanges(blItems, curItems []baseline.MetricItem, warningPct float64, prefix string) []string {
+	if len(blItems) == 0 && len(curItems) == 0 {
+		return nil
+	}
+
+	blMap := make(map[string]float64, len(blItems))
+	for _, item := range blItems {
+		blMap[item.ID] = item.Value
+	}
+
+	curMap := make(map[string]float64, len(curItems))
+	for _, item := range curItems {
+		curMap[item.ID] = item.Value
+	}
+
+	formatEntry := func(detail string) string {
+		if prefix == "" {
+			return detail
+		}
+		return prefix + ": " + detail
+	}
+
+	var changes []string
+	for id, blVal := range blMap {
+		curVal, exists := curMap[id]
+		if !exists {
+			changes = append(changes, formatEntry(fmt.Sprintf("%s dropped from top", id)))
+			continue
+		}
+		if blVal > 0 {
+			pctChange := ((curVal - blVal) / blVal) * 100
+			if pctChange >= warningPct || pctChange <= -warningPct {
+				changes = append(changes, formatEntry(fmt.Sprintf("%s: %.1f%% change", id, pctChange)))
+			}
+		}
+	}
+
+	for id := range curMap {
+		if _, exists := blMap[id]; !exists {
+			changes = append(changes, formatEntry(fmt.Sprintf("%s entered top", id)))
+		}
+	}
+
+	sort.Strings(changes)
+	return changes
+}
+
+// checkPageRankChanges detects significant changes in top PageRank and centrality items
 func (c *Calculator) checkPageRankChanges(result *Result) {
 	// Check if alert type is disabled (bv-167)
 	if c.config.IsAlertDisabled(string(AlertPageRankChange)) {
 		return
 	}
 
-	blPR := make(map[string]float64)
-	for _, item := range c.baseline.TopMetrics.PageRank {
-		blPR[item.ID] = item.Value
+	warnPct := c.config.PageRankChangeWarningPct
+	var prRaw []string
+	if len(c.current.TopMetrics.PageRank) > 0 || c.current.Stats.NodeCount == 0 {
+		prRaw = collectTopMetricChanges(c.baseline.TopMetrics.PageRank, c.current.TopMetrics.PageRank, warnPct, "")
 	}
 
-	curPR := make(map[string]float64)
-	for _, item := range c.current.TopMetrics.PageRank {
-		curPR[item.ID] = item.Value
-	}
-
-	var changes []string
-
-	// Check for significant changes in existing items
-	for id, blVal := range blPR {
-		curVal, exists := curPR[id]
-		if !exists {
-			changes = append(changes, fmt.Sprintf("%s dropped from top", id))
+	var otherChanges []string
+	for _, metric := range []struct {
+		name string
+		bl   []baseline.MetricItem
+		cur  []baseline.MetricItem
+	}{
+		{"Betweenness", c.baseline.TopMetrics.Betweenness, c.current.TopMetrics.Betweenness},
+		{"CriticalPath", c.baseline.TopMetrics.CriticalPath, c.current.TopMetrics.CriticalPath},
+		{"Hubs", c.baseline.TopMetrics.Hubs, c.current.TopMetrics.Hubs},
+		{"Authorities", c.baseline.TopMetrics.Authorities, c.current.TopMetrics.Authorities},
+	} {
+		// Skip non-PageRank sub-metrics when comparing against a legacy baseline
+		// that only recorded PageRank, or when Phase 2 skipped computing the metric.
+		if (len(metric.bl) == 0 && len(c.baseline.TopMetrics.PageRank) > 0) || len(metric.cur) == 0 {
 			continue
 		}
-		if blVal > 0 {
-			pctChange := ((curVal - blVal) / blVal) * 100
-			if pctChange >= c.config.PageRankChangeWarningPct || pctChange <= -c.config.PageRankChangeWarningPct {
-				changes = append(changes, fmt.Sprintf("%s: %.1f%% change", id, pctChange))
-			}
+		otherChanges = append(otherChanges, collectTopMetricChanges(metric.bl, metric.cur, warnPct, metric.name)...)
+	}
+
+	if len(prRaw) == 0 && len(otherChanges) == 0 {
+		return
+	}
+
+	var details []string
+	var message string
+	if len(otherChanges) == 0 {
+		details = prRaw
+		message = fmt.Sprintf("%d PageRank changes detected", len(details))
+	} else {
+		var prPrefixed []string
+		if len(c.current.TopMetrics.PageRank) > 0 || c.current.Stats.NodeCount == 0 {
+			prPrefixed = collectTopMetricChanges(c.baseline.TopMetrics.PageRank, c.current.TopMetrics.PageRank, warnPct, "PageRank")
+		}
+		details = make([]string, 0, len(prPrefixed)+len(otherChanges))
+		details = append(details, prPrefixed...)
+		details = append(details, otherChanges...)
+		sort.Strings(details)
+		if len(prPrefixed) > 0 {
+			message = fmt.Sprintf("%d PageRank and centrality changes detected", len(details))
+		} else {
+			message = fmt.Sprintf("%d centrality/top-metric changes detected", len(details))
 		}
 	}
 
-	// Check for new entries in top
-	for id := range curPR {
-		if _, exists := blPR[id]; !exists {
-			changes = append(changes, fmt.Sprintf("%s entered top", id))
-		}
-	}
-	sort.Strings(changes)
-
-	if len(changes) > 0 {
-		result.Alerts = append(result.Alerts, Alert{
-			Type:            AlertPageRankChange,
-			Severity:        SeverityWarning,
-			SuggestedAction: "Re-check the priority of the issues whose structural importance moved",
-			Message:         fmt.Sprintf("%d PageRank changes detected", len(changes)),
-			Details:         changes,
-			DetectedAt:      c.nowUTC(),
-		})
-	}
+	result.Alerts = append(result.Alerts, Alert{
+		Type:            AlertPageRankChange,
+		Severity:        SeverityWarning,
+		SuggestedAction: "Re-check the priority of the issues whose structural importance moved",
+		Message:         message,
+		Details:         details,
+		DetectedAt:      c.nowUTC(),
+	})
 }
 
 // checkStaleness emits alerts for issues that have been inactive beyond thresholds.
@@ -580,6 +687,9 @@ func (c *Calculator) checkStaleness(result *Result) {
 	now := c.nowUTC()
 	staleCount := 0
 	for i := range c.issues {
+		if !c.isCandidate(c.issues[i].ID) {
+			continue
+		}
 		if severity, _, _ := c.stalenessSeverity(&c.issues[i], now); severity != "" {
 			staleCount++
 		}
@@ -596,6 +706,9 @@ func (c *Calculator) checkStaleness(result *Result) {
 	}
 	for i := range c.issues {
 		issue := &c.issues[i]
+		if !c.isCandidate(issue.ID) {
+			continue
+		}
 		severity, lastActive, days := c.stalenessSeverity(issue, now)
 		if severity == "" {
 			continue
@@ -873,7 +986,7 @@ func (c *Calculator) checkVelocityDrop(result *Result) {
 	priorStart := now.AddDate(0, 0, -2*window)
 	recent, prior := 0, 0
 	for _, iss := range c.issues {
-		if iss.ClosedAt == nil {
+		if !c.isCandidate(iss.ID) || iss.ClosedAt == nil {
 			continue
 		}
 		closed := iss.ClosedAt.UTC()
@@ -966,6 +1079,9 @@ func (c *Calculator) checkAbandonedClaim(result *Result) {
 	}
 	now := c.nowUTC()
 	for _, iss := range sortedByID(c.issues) {
+		if !c.isCandidate(iss.ID) {
+			continue
+		}
 		if iss.Status != model.StatusInProgress || strings.TrimSpace(iss.Assignee) == "" {
 			continue
 		}
@@ -1028,6 +1144,9 @@ func (c *Calculator) checkPotentialDuplicate(result *Result) {
 	// them only buries the live duplicates under history.
 	live := make([]model.Issue, 0, len(c.issues))
 	for _, iss := range c.issues {
+		if !c.isCandidate(iss.ID) {
+			continue
+		}
 		if iss.Status == model.StatusClosed || iss.Status == model.StatusTombstone {
 			continue
 		}

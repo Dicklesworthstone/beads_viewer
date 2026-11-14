@@ -79,6 +79,7 @@ type Lock struct {
 	path     string
 	lockFile *os.File
 	pid      int
+	hostname string
 	isFirst  bool
 	ownerID  string
 }
@@ -106,6 +107,7 @@ func NewLock(beadsDir string) (*Lock, error) {
 			}
 			if readErr == nil {
 				lock.pid = existing.PID
+				lock.hostname = existing.Hostname
 			}
 
 			// Check if the existing lock is stale
@@ -155,6 +157,7 @@ func (l *Lock) writeLockInfo() error {
 	}
 
 	hostname, _ := currentHostname()
+	l.hostname = hostname
 	info := LockInfo{
 		PID:       os.Getpid(),
 		StartedAt: time.Now(),
@@ -209,6 +212,38 @@ func (l *Lock) HolderPID() int {
 	return l.pid
 }
 
+// HolderHostname returns the hostname recorded by the process holding the lock.
+// Returns empty string if unknown.
+func (l *Lock) HolderHostname() string {
+	if l == nil {
+		return ""
+	}
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.hostname
+}
+
+// SameHost returns true if the lock is held on the same host as the current process
+// (or if no foreign hostname is recorded).
+func (l *Lock) SameHost() bool {
+	if l == nil {
+		return true
+	}
+	l.mu.RLock()
+	isFirst := l.isFirst
+	holderHost := l.hostname
+	l.mu.RUnlock()
+
+	if isFirst || holderHost == "" {
+		return true
+	}
+	localHost, err := currentHostname()
+	if err != nil || localHost == "" {
+		return false
+	}
+	return holderHost == localHost
+}
+
 // checkStale checks if the existing lock is stale (held by a dead process or
 // an expired foreign-host lease) and takes it over if so. Uses atomic rename
 // to avoid TOCTOU race conditions.
@@ -254,6 +289,7 @@ func (l *Lock) checkStale() {
 		l.mu.Lock()
 		if !l.isFirst {
 			l.pid = existing.PID
+			l.hostname = existing.Hostname
 		}
 		l.mu.Unlock()
 		return
@@ -366,6 +402,7 @@ verify:
 	l.mu.Lock()
 	l.isFirst = true
 	l.pid = ownerPID
+	l.hostname = hostname
 	l.ownerID = ownerID
 	l.mu.Unlock()
 }

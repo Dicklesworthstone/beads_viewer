@@ -1805,9 +1805,39 @@ func smokeProbeBinaryVersion(binaryPath string, timeout time.Duration) error {
 	return nil
 }
 
+// CanRollback reports whether a valid regular non-empty executable backup file
+// exists for the current binary so rollback can be offered.
+func CanRollback() bool {
+	binaryPath, err := getCurrentBinaryPath()
+	if err != nil {
+		return false
+	}
+	backupPath := GetBackupPath(binaryPath)
+	lstatInfo, err := os.Lstat(backupPath)
+	if err != nil {
+		return false
+	}
+	if lstatInfo.Mode()&os.ModeSymlink != 0 || !lstatInfo.Mode().IsRegular() || lstatInfo.Size() <= 0 {
+		return false
+	}
+	if runtime.GOOS != "windows" && lstatInfo.Mode().Perm()&0o111 == 0 {
+		return false
+	}
+	return true
+}
+
 // Rollback restores the previous version from backup after validating that the
 // backup is a non-empty regular executable file whose --version smoke probe exits 0.
 func Rollback() error {
+	return PerformRollback(os.Stdout)
+}
+
+// PerformRollback restores the previous version from backup, writing human-readable
+// status messages to progress (pass io.Discard in TUI contexts).
+func PerformRollback(progress io.Writer) error {
+	if progress == nil {
+		progress = io.Discard
+	}
 	binaryPath, err := getCurrentBinaryPath()
 	if err != nil {
 		return fmt.Errorf("cannot determine binary path: %w", err)
@@ -1895,7 +1925,7 @@ func Rollback() error {
 		return fmt.Errorf("refusing rollback from %s: %w", backupPath, err)
 	}
 
-	fmt.Printf("Rolling back from backup at %s...\n", backupPath)
+	fmt.Fprintf(progress, "Rolling back from backup at %s...\n", backupPath)
 	if err := atomicRenameOverExecutable(stagedPath, binaryPath); err != nil {
 		return fmt.Errorf("rollback failed: %w", err)
 	}
@@ -1903,7 +1933,7 @@ func Rollback() error {
 	_ = backupFile.Close()
 	_ = os.Remove(backupPath)
 
-	fmt.Println("Rollback complete")
+	fmt.Fprintln(progress, "Rollback complete")
 	return nil
 }
 

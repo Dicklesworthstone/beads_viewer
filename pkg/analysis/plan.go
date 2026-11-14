@@ -149,7 +149,7 @@ func (a *Analyzer) CountStatusPartition() StatusPartition {
 			p.Actionable++
 		case issue.Status == model.StatusBlocked:
 			p.Blocked++
-		case !isActionableStatus(issue.Status) || issue.IsDeferredAt(now):
+		case !isActionableStatus(issue.Status) || issue.IsDeferredAt(now) || isWithheldIssue(&issue):
 			p.DeferredOrParked++
 		default:
 			p.Blocked++

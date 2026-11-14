@@ -21,6 +21,7 @@ const (
 	ContextRepoPicker         Context = "repo-picker"
 	ContextAgentPrompt        Context = "agent-prompt"
 	ContextCassSession        Context = "cass-session"
+	ContextUpdateModal        Context = "update-modal"
 
 	// Views
 	ContextInsights           Context = "insights"
@@ -51,16 +52,11 @@ const (
 // This is used for context-sensitive help (e.g., double-tap CapsLock).
 // Priority order: overlays → views → detail states → filter → default
 func (m Model) CurrentContext() Context {
-	// === Overlays (most specific - check first) ===
+	// === Overlays (exact renderMainView Z-order) ===
 
-	// Cass session modal (bv-qi94)
-	if m.showCassModal {
-		return ContextCassSession
-	}
-
-	// Agent prompt modal
-	if m.showAgentPrompt {
-		return ContextAgentPrompt
+	// Quit confirmation
+	if m.showQuitConfirm {
+		return ContextQuitConfirm
 	}
 
 	// Help overlay
@@ -68,19 +64,19 @@ func (m Model) CurrentContext() Context {
 		return ContextHelp
 	}
 
-	// Quit confirmation
-	if m.showQuitConfirm {
-		return ContextQuitConfirm
+	// Agent prompt modal
+	if m.showAgentPrompt {
+		return ContextAgentPrompt
 	}
 
-	// Label picker overlay
-	if m.showLabelPicker {
-		return ContextLabelPicker
+	// Cass session modal (bv-qi94)
+	if m.showCassModal {
+		return ContextCassSession
 	}
 
-	// Recipe picker overlay
-	if m.showRecipePicker {
-		return ContextRecipePicker
+	// Self-update modal
+	if m.showUpdateModal {
+		return ContextUpdateModal
 	}
 
 	// Label health detail modal
@@ -88,19 +84,14 @@ func (m Model) CurrentContext() Context {
 		return ContextLabelHealthDetail
 	}
 
-	// Label drilldown overlay
-	if m.showLabelDrilldown {
-		return ContextLabelDrilldown
-	}
-
 	// Label graph analysis sub-view
 	if m.showLabelGraphAnalysis {
 		return ContextLabelGraphAnalysis
 	}
 
-	// Time-travel input prompt
-	if m.showTimeTravelPrompt {
-		return ContextTimeTravelInput
+	// Label drilldown overlay
+	if m.showLabelDrilldown {
+		return ContextLabelDrilldown
 	}
 
 	// Alerts panel
@@ -108,9 +99,24 @@ func (m Model) CurrentContext() Context {
 		return ContextAlerts
 	}
 
+	// Time-travel input prompt
+	if m.showTimeTravelPrompt {
+		return ContextTimeTravelInput
+	}
+
+	// Recipe picker overlay
+	if m.showRecipePicker {
+		return ContextRecipePicker
+	}
+
 	// Repo picker overlay (workspace mode)
 	if m.showRepoPicker {
 		return ContextRepoPicker
+	}
+
+	// Label picker overlay
+	if m.showLabelPicker {
+		return ContextLabelPicker
 	}
 
 	// === Views (based on focus or view flags) ===
@@ -214,6 +220,7 @@ func (c Context) Description() string {
 		ContextRepoPicker:         "Repo picker",
 		ContextAgentPrompt:        "Agent prompt",
 		ContextCassSession:        "Cass session preview",
+		ContextUpdateModal:        "Self-update modal",
 		ContextInsights:           "Insights panel",
 		ContextFlowMatrix:         "Flow matrix",
 		ContextGraph:              "Dependency graph",
@@ -243,7 +250,7 @@ func (c Context) IsOverlay() bool {
 	case ContextLabelPicker, ContextRecipePicker, ContextHelp, ContextQuitConfirm,
 		ContextLabelHealthDetail, ContextLabelDrilldown, ContextLabelGraphAnalysis,
 		ContextTimeTravelInput, ContextAlerts, ContextRepoPicker, ContextAgentPrompt,
-		ContextCassSession:
+		ContextCassSession, ContextUpdateModal:
 		return true
 	}
 	return false
@@ -276,6 +283,7 @@ func AllContexts() []Context {
 		ContextRepoPicker,
 		ContextAgentPrompt,
 		ContextCassSession,
+		ContextUpdateModal,
 		ContextInsights,
 		ContextFlowMatrix,
 		ContextGraph,

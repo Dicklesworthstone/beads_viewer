@@ -894,6 +894,23 @@ func TestGetBlockerChain(t *testing.T) {
 		}
 	})
 
+	t.Run("status blocked root without open dependency blockers", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "A", Status: model.StatusBlocked, Title: "Explicitly blocked"},
+		}
+		an := analysis.NewAnalyzer(issues)
+		result := an.GetBlockerChain("A")
+		if result == nil {
+			t.Fatal("Expected non-nil result")
+		}
+		if !result.IsBlocked {
+			t.Fatal("Expected IsBlocked=true when root issue has StatusBlocked")
+		}
+		if result.Chain[0].Actionable {
+			t.Fatal("Expected StatusBlocked root not to be actionable")
+		}
+	})
+
 	t.Run("future deferred root is not actionable", func(t *testing.T) {
 		now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
 		future := now.Add(time.Hour)
@@ -1065,6 +1082,30 @@ func TestGetBlockerChain(t *testing.T) {
 		}
 		if cEntry.BlocksCount != 2 {
 			t.Errorf("Expected C to block 2 issues, got %d", cEntry.BlocksCount)
+		}
+	})
+
+	t.Run("missing external blocker reported as synthetic root", func(t *testing.T) {
+		issues := []model.Issue{
+			{
+				ID:     "A",
+				Status: model.StatusOpen,
+				Title:  "Issue A",
+				Dependencies: []*model.Dependency{
+					{IssueID: "A", DependsOnID: "EXT-MISSING", Type: model.DepBlocks},
+				},
+			},
+		}
+		an := analysis.NewAnalyzer(issues)
+		result := an.GetBlockerChain("A")
+		if result == nil {
+			t.Fatal("Expected non-nil result")
+		}
+		if !result.IsBlocked || result.ChainLength != 1 {
+			t.Fatalf("Expected IsBlocked=true and ChainLength=1, got IsBlocked=%v ChainLength=%d Chain=%+v", result.IsBlocked, result.ChainLength, result.Chain)
+		}
+		if len(result.RootBlockers) != 1 || result.RootBlockers[0].ID != "EXT-MISSING" || result.RootBlockers[0].Status != "missing" || !result.RootBlockers[0].IsRoot {
+			t.Fatalf("Expected synthetic missing RootBlocker for EXT-MISSING, got %+v", result.RootBlockers)
 		}
 	})
 }

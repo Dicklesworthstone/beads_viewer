@@ -519,14 +519,15 @@ func TestRecomputeNodeDegrees(t *testing.T) {
 	nb := &NetworkBuilder{}
 	network := &ImpactNetwork{
 		Nodes: map[string]*NetworkNode{
-			"bv-001": {BeadID: "bv-001", Degree: 99}, // stale value must be reset
+			"bv-001": {BeadID: "bv-001", Degree: 99, Connectivity: 0.99}, // stale values must be reset
 			"bv-002": {BeadID: "bv-002"},
 			"bv-003": {BeadID: "bv-003"},
 			"bv-004": {BeadID: "bv-004"},
 		},
 		Edges: []NetworkEdge{
 			{FromBead: "bv-001", ToBead: "bv-002", EdgeType: EdgeSharedCommit},
-			{FromBead: "bv-001", ToBead: "bv-002", EdgeType: EdgeSharedFile}, // parallel edge counts again
+			{FromBead: "bv-001", ToBead: "bv-002", EdgeType: EdgeSharedFile}, // parallel edge deduplicated via makeNetworkPair
+			{FromBead: "bv-002", ToBead: "bv-001", EdgeType: EdgeDependency}, // reversed parallel edge deduplicated
 			{FromBead: "bv-002", ToBead: "bv-003", EdgeType: EdgeDependency},
 			{FromBead: "bv-001", ToBead: "bv-ghost", EdgeType: EdgeSharedFile}, // missing endpoint ignored
 		},
@@ -534,10 +535,15 @@ func TestRecomputeNodeDegrees(t *testing.T) {
 
 	nb.recomputeNodeDegrees(network)
 
-	want := map[string]int{"bv-001": 3, "bv-002": 3, "bv-003": 1, "bv-004": 0}
+	want := map[string]int{"bv-001": 1, "bv-002": 2, "bv-003": 1, "bv-004": 0}
 	for id, degree := range want {
 		if got := network.Nodes[id].Degree; got != degree {
 			t.Errorf("node %s: degree %d, want %d", id, got, degree)
+		}
+		wantConn := float64(degree) / 3.0
+		diff := network.Nodes[id].Connectivity - wantConn
+		if diff < -1e-9 || diff > 1e-9 {
+			t.Errorf("node %s: connectivity %f, want %f", id, network.Nodes[id].Connectivity, wantConn)
 		}
 	}
 
@@ -726,26 +732,95 @@ func TestClusterInternalConnectivity(t *testing.T) {
 }
 
 // TestNetworkDensityCalculation tests that network density is properly calculated
+// using unique undirected node pairs rather than parallel typed edges.
 func TestNetworkDensityCalculation(t *testing.T) {
 	report := createTestHistoryReport()
 	builder := NewNetworkBuilder(report)
 	network := builder.Build()
 
-	// Density = edges / max_possible_edges
-	// max_possible_edges = n * (n-1) / 2
 	n := network.Stats.TotalNodes
 	maxEdges := n * (n - 1) / 2
 
 	if maxEdges > 0 {
-		expectedDensity := float64(network.Stats.TotalEdges) / float64(maxEdges)
+		uniquePairs := make(map[networkPair]struct{})
+		for _, edge := range network.Edges {
+			if edge.FromBead != edge.ToBead {
+				uniquePairs[makeNetworkPair(edge.FromBead, edge.ToBead)] = struct{}{}
+			}
+		}
+		expectedDensity := float64(len(uniquePairs)) / float64(maxEdges)
 		if network.Stats.Density < 0 || network.Stats.Density > 1 {
 			t.Errorf("Density should be between 0 and 1, got %f", network.Stats.Density)
 		}
-		// Allow small floating point differences
 		diff := network.Stats.Density - expectedDensity
-		if diff > 0.01 || diff < -0.01 {
-			t.Errorf("Expected density ~%f, got %f", expectedDensity, network.Stats.Density)
+		if diff > 1e-6 || diff < -1e-6 {
+			t.Errorf("Expected density %f, got %f", expectedDensity, network.Stats.Density)
 		}
+	}
+}
+
+func TestMultigraphSimpleGraphMetricsBounded(t *testing.T) {
+	now := time.Now()
+	// 3-node clique where every pair has shared_commit (weight 2) + shared_file + dependency = 9 typed edges
+	report := &HistoryReport{
+		GeneratedAt: now,
+		DataHash:    "multigraph-clique",
+		Histories: map[string]BeadHistory{
+			"bv-1": {BeadID: "bv-1", Title: "One", Status: "open", Commits: []CorrelatedCommit{
+				{SHA: "c12a", Files: []FileChange{{Path: "pkg/core.go"}}},
+				{SHA: "c12b", Files: []FileChange{{Path: "pkg/core.go"}}},
+				{SHA: "c13a", Files: []FileChange{{Path: "pkg/core.go"}}},
+				{SHA: "c13b", Files: []FileChange{{Path: "pkg/core.go"}}},
+			}},
+			"bv-2": {BeadID: "bv-2", Title: "Two", Status: "open", Commits: []CorrelatedCommit{
+				{SHA: "c12a", Files: []FileChange{{Path: "pkg/core.go"}}},
+				{SHA: "c12b", Files: []FileChange{{Path: "pkg/core.go"}}},
+				{SHA: "c23a", Files: []FileChange{{Path: "pkg/core.go"}}},
+				{SHA: "c23b", Files: []FileChange{{Path: "pkg/core.go"}}},
+			}},
+			"bv-3": {BeadID: "bv-3", Title: "Three", Status: "open", Commits: []CorrelatedCommit{
+				{SHA: "c13a", Files: []FileChange{{Path: "pkg/core.go"}}},
+				{SHA: "c13b", Files: []FileChange{{Path: "pkg/core.go"}}},
+				{SHA: "c23a", Files: []FileChange{{Path: "pkg/core.go"}}},
+				{SHA: "c23b", Files: []FileChange{{Path: "pkg/core.go"}}},
+			}},
+		},
+		CommitIndex: CommitIndex{
+			"c12a": {"bv-1", "bv-2"},
+			"c12b": {"bv-1", "bv-2"},
+			"c13a": {"bv-1", "bv-3"},
+			"c13b": {"bv-1", "bv-3"},
+			"c23a": {"bv-2", "bv-3"},
+			"c23b": {"bv-2", "bv-3"},
+		},
+	}
+	issues := []model.Issue{
+		{ID: "bv-1", Dependencies: []*model.Dependency{{IssueID: "bv-1", DependsOnID: "bv-2", Type: model.DepBlocks}}},
+		{ID: "bv-2", Dependencies: []*model.Dependency{{IssueID: "bv-2", DependsOnID: "bv-3", Type: model.DepBlocks}}},
+		{ID: "bv-3", Dependencies: []*model.Dependency{{IssueID: "bv-3", DependsOnID: "bv-1", Type: model.DepBlocks}}},
+	}
+
+	network := NewNetworkBuilderWithIssues(report, issues).Build()
+
+	if network.Stats.TotalEdges != 9 {
+		t.Fatalf("expected all 9 typed edges preserved, got %d", network.Stats.TotalEdges)
+	}
+	if network.Stats.Density != 1.0 {
+		t.Fatalf("expected clique Density == 1.0 (not >1), got %f", network.Stats.Density)
+	}
+	for id, node := range network.Nodes {
+		if node.Degree != 2 {
+			t.Fatalf("expected node %s Degree == 2 (<= N-1), got %d", id, node.Degree)
+		}
+		if node.Connectivity != 1.0 {
+			t.Fatalf("expected node %s Connectivity == 1.0, got %f", id, node.Connectivity)
+		}
+	}
+	if len(network.Clusters) != 1 {
+		t.Fatalf("expected 1 cluster, got %d", len(network.Clusters))
+	}
+	if network.Clusters[0].InternalConnectivity != 1.0 {
+		t.Fatalf("expected cluster InternalConnectivity == 1.0 (not >1), got %f", network.Clusters[0].InternalConnectivity)
 	}
 }
 

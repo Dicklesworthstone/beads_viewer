@@ -3360,6 +3360,9 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 	if len(openBlockers) == 0 {
 		targetEntry.IsRoot = true
 		result.Chain[0] = targetEntry
+		if issue.Status == model.StatusBlocked {
+			result.IsBlocked = true
+		}
 		return result
 	}
 
@@ -3383,6 +3386,19 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 
 		blocker, exists := a.issueMap[id]
 		if !exists {
+			if id != issueID {
+				entry := BlockerChainEntry{
+					ID:          id,
+					Title:       "(missing issue)",
+					Status:      "missing",
+					Depth:       depth,
+					IsRoot:      true,
+					Actionable:  false,
+					BlocksCount: a.countBlockedBy(id),
+				}
+				result.Chain = append(result.Chain, entry)
+				result.RootBlockers = append(result.RootBlockers, entry)
+			}
 			visiting[id] = false
 			visited[id] = true
 			return

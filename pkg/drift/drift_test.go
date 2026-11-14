@@ -2482,3 +2482,152 @@ func TestSprintAtRiskThresholdsConfig(t *testing.T) {
 		t.Fatal("expected validation error for negative sprint_inactive_days")
 	}
 }
+
+func TestCalculatorCandidateScopingExcludesBoundaryBlockers(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-40 * 24 * time.Hour)
+	closedPrior := now.AddDate(0, 0, -10)
+	closedRecent := now.AddDate(0, 0, -2)
+
+	issues := []model.Issue{
+		// In-scope candidate: fresh, open, unique title
+		{ID: "CAND-1", Title: "Implement vector index compaction", Status: model.StatusOpen, UpdatedAt: now.Add(-time.Hour)},
+		// Out-of-scope boundary issues that would otherwise trigger stale_issue, abandoned_claim, potential_duplicate, and velocity_drop
+		{ID: "EXT-STALE", Title: "Migrate legacy auth middleware", Status: model.StatusOpen, UpdatedAt: old},
+		{ID: "EXT-CLAIMED", Title: "Migrate legacy auth middleware", Status: model.StatusInProgress, Assignee: "agent-ext", UpdatedAt: old},
+	}
+	for i := 0; i < 6; i++ {
+		issues = append(issues, model.Issue{
+			ID:        fmt.Sprintf("EXT-CLOSED-%d", i),
+			Title:     fmt.Sprintf("External closed %d", i),
+			Status:    model.StatusClosed,
+			UpdatedAt: now,
+			ClosedAt:  &closedPrior,
+		})
+	}
+	issues = append(issues, model.Issue{
+		ID:        "EXT-RECENT",
+		Title:     "External recent close",
+		Status:    model.StatusClosed,
+		UpdatedAt: now,
+		ClosedAt:  &closedRecent,
+	})
+
+	a := analysis.NewAnalyzer(issues)
+	a.SetNow(now)
+	a.SetReadinessScope(model.NewReadinessIndex(issues), map[string]bool{"CAND-1": true})
+
+	quiet := &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: len(issues), OpenCount: 3}}
+	calc := NewCalculator(quiet, quiet, nil)
+	calc.SetNow(now)
+	calc.SetIssues(issues)
+	if !calc.ReuseAnalyzer(a) {
+		t.Fatal("expected ReuseAnalyzer to accept matching scoped analyzer")
+	}
+
+	result := calc.Calculate()
+	for _, alert := range result.Alerts {
+		switch alert.Type {
+		case AlertStaleIssue, AlertAbandonedClaim, AlertPotentialDuplicate, AlertVelocityDrop:
+			t.Fatalf("out-of-scope boundary issues leaked into %s alert: %+v", alert.Type, alert)
+		}
+	}
+}
+
+func TestCalculatorTopMetricsCentralityDrift(t *testing.T) {
+	bl := &baseline.Baseline{
+		Stats: baseline.GraphStats{NodeCount: 10},
+		TopMetrics: baseline.TopMetrics{
+			PageRank:     []baseline.MetricItem{{ID: "A", Value: 0.40}},
+			Betweenness:  []baseline.MetricItem{{ID: "B", Value: 0.20}},
+			CriticalPath: []baseline.MetricItem{{ID: "C", Value: 5.0}},
+			Hubs:         []baseline.MetricItem{{ID: "D", Value: 0.50}},
+			Authorities:  []baseline.MetricItem{{ID: "E", Value: 0.50}},
+		},
+	}
+	cur := &baseline.Baseline{
+		Stats: baseline.GraphStats{NodeCount: 10},
+		TopMetrics: baseline.TopMetrics{
+			PageRank:     []baseline.MetricItem{{ID: "A", Value: 0.40}}, // unchanged
+			Betweenness:  []baseline.MetricItem{{ID: "B", Value: 0.50}}, // +150%
+			CriticalPath: []baseline.MetricItem{{ID: "C2", Value: 8.0}}, // C dropped, C2 entered
+			Hubs:         []baseline.MetricItem{{ID: "D", Value: 0.50}},
+			Authorities:  []baseline.MetricItem{{ID: "E", Value: 0.10}}, // -80%
+		},
+	}
+
+	calc := NewCalculator(bl, cur, nil)
+	result := calc.Calculate()
+	got := alertsOfType(result, AlertPageRankChange)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 AlertPageRankChange from non-PageRank TopMetrics drift, got %d: %+v", len(got), result.Alerts)
+	}
+	joined := strings.Join(got[0].Details, " | ")
+	for _, want := range []string{"Betweenness: B: 150.0% change", "CriticalPath: C dropped from top", "CriticalPath: C2 entered top", "Authorities: E: -80.0% change"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("expected detail %q in %q", want, joined)
+		}
+	}
+}
+
+func TestCalculatorLegacyBaselineAndCandidateCycles(t *testing.T) {
+	// 1. Pre-existing legacy .bv/baseline.json only populated TopMetrics.PageRank.
+	// Comparing against a current snapshot that populates Betweenness/CriticalPath/Hubs/Authorities
+	// must NOT emit false "entered top" centrality warnings!
+	legacyBL := &baseline.Baseline{
+		Stats: baseline.GraphStats{NodeCount: 10},
+		TopMetrics: baseline.TopMetrics{
+			PageRank: []baseline.MetricItem{{ID: "A", Value: 0.40}},
+		},
+	}
+	curFull := &baseline.Baseline{
+		Stats: baseline.GraphStats{NodeCount: 10},
+		TopMetrics: baseline.TopMetrics{
+			PageRank:     []baseline.MetricItem{{ID: "A", Value: 0.40}},
+			Betweenness:  []baseline.MetricItem{{ID: "B", Value: 0.50}},
+			CriticalPath: []baseline.MetricItem{{ID: "C", Value: 5.0}},
+			Hubs:         []baseline.MetricItem{{ID: "D", Value: 0.50}},
+			Authorities:  []baseline.MetricItem{{ID: "E", Value: 0.50}},
+		},
+	}
+	resLegacy := NewCalculator(legacyBL, curFull, nil).Calculate()
+	if got := alertsOfType(resLegacy, AlertPageRankChange); len(got) != 0 {
+		t.Fatalf("legacy baseline triggered false AlertPageRankChange warnings: %+v", got)
+	}
+
+	// 2. Phase 2 skipped in current snapshot (empty current TopMetrics on non-empty graph)
+	// must NOT emit false "dropped from top" warnings!
+	curSkippedPhase2 := &baseline.Baseline{
+		Stats:      baseline.GraphStats{NodeCount: 10},
+		TopMetrics: baseline.TopMetrics{},
+	}
+	resSkipped := NewCalculator(curFull, curSkippedPhase2, nil).Calculate()
+	if got := alertsOfType(resSkipped, AlertPageRankChange); len(got) != 0 {
+		t.Fatalf("Phase-2-skipped current snapshot triggered false AlertPageRankChange warnings: %+v", got)
+	}
+
+	// 3. Candidate-scoped checkCycles must ignore purely out-of-scope cycles while catching in-scope cycles.
+	blCyc := &baseline.Baseline{
+		Stats: baseline.GraphStats{NodeCount: 4},
+	}
+	curOutOnly := &baseline.Baseline{
+		Stats:  baseline.GraphStats{NodeCount: 4},
+		Cycles: [][]string{{"EXT-1", "EXT-2"}},
+	}
+	calcOut := NewCalculator(blCyc, curOutOnly, nil)
+	calcOut.SetCandidates(map[string]bool{"CAND-1": true, "CAND-2": true})
+	if got := alertsOfType(calcOut.Calculate(), AlertNewCycle); len(got) != 0 {
+		t.Fatalf("out-of-scope cycle leaked into candidate-scoped drift alerts: %+v", got)
+	}
+
+	curInAndOut := &baseline.Baseline{
+		Stats:  baseline.GraphStats{NodeCount: 4},
+		Cycles: [][]string{{"EXT-1", "EXT-2"}, {"CAND-1", "EXT-1"}},
+	}
+	calcIn := NewCalculator(blCyc, curInAndOut, nil)
+	calcIn.SetCandidates(map[string]bool{"CAND-1": true, "CAND-2": true})
+	gotCyc := alertsOfType(calcIn.Calculate(), AlertNewCycle)
+	if len(gotCyc) != 1 || gotCyc[0].Delta != 1 || gotCyc[0].CurrentVal != 1 {
+		t.Fatalf("expected exactly 1 in-scope cycle alert (Delta=1 CurrentVal=1), got %+v", gotCyc)
+	}
+}

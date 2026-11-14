@@ -1523,3 +1523,100 @@ func TestAggregateLoaderCancelsHungBDRefreshPromptly(t *testing.T) {
 		t.Fatalf("results = %+v, want context.DeadlineExceeded", results)
 	}
 }
+
+func TestAggregateLoaderPopulatesSourceKindAndRepoRoot(t *testing.T) {
+	wsRoot := t.TempDir()
+	jsonlRepo := filepath.Join(wsRoot, "web")
+	createTestBeadsFile(t, jsonlRepo, []model.Issue{
+		{ID: "W-1", Title: "Web JSONL issue", Status: model.StatusOpen, IssueType: model.TypeTask},
+	})
+
+	sqliteRepo := filepath.Join(wsRoot, "api")
+	if err := os.MkdirAll(filepath.Join(sqliteRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(sqliteRepo, ".beads", "beads.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	for _, stmt := range []string{
+		`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER DEFAULT 2, issue_type TEXT DEFAULT 'task')`,
+		`INSERT INTO issues (id, title, status) VALUES ('A-1', 'API SQLite issue', 'open')`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("sqlite setup: %v", err)
+		}
+	}
+
+	cfg := &workspace.Config{
+		Repos: []workspace.RepoConfig{
+			{Name: "web", Path: "web", Prefix: "web-"},
+			{Name: "api", Path: "api", Prefix: "api-"},
+		},
+	}
+	agg := workspace.NewAggregateLoader(cfg, wsRoot)
+	_, results, err := agg.LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2", len(results))
+	}
+	byName := map[string]workspace.LoadResult{}
+	for _, r := range results {
+		byName[r.RepoName] = r
+	}
+	if byName["web"].SourceKind != "jsonl_local" || byName["web"].RepoRoot != filepath.Clean(jsonlRepo) {
+		t.Fatalf("web result = %+v, want SourceKind=jsonl_local RepoRoot=%s", byName["web"], jsonlRepo)
+	}
+	if byName["api"].SourceKind != "sqlite" || byName["api"].RepoRoot != filepath.Clean(sqliteRepo) {
+		t.Fatalf("api result = %+v, want SourceKind=sqlite RepoRoot=%s", byName["api"], sqliteRepo)
+	}
+}
+
+func TestAggregateLoader_SharedPathDistinctBeadsPathMonorepo(t *testing.T) {
+	wsRoot := t.TempDir()
+	for _, svc := range []struct {
+		dir   string
+		issue string
+	}{
+		{"services/api/.beads", `{"id":"1","title":"API auth","status":"open","priority":1,"issue_type":"task"}` + "\n"},
+		{"services/web/.beads", `{"id":"1","title":"Web UI","status":"open","priority":2,"issue_type":"task"}` + "\n"},
+	} {
+		fullDir := filepath.Join(wsRoot, filepath.FromSlash(svc.dir))
+		if err := os.MkdirAll(fullDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(fullDir, "issues.jsonl"), []byte(svc.issue), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := &workspace.Config{
+		Repos: []workspace.RepoConfig{
+			{Name: "api", Path: ".", BeadsPath: "services/api/.beads", Prefix: "api-"},
+			{Name: "web", Path: ".", BeadsPath: "services/web/.beads", Prefix: "web-"},
+		},
+	}
+	agg := workspace.NewAggregateLoader(cfg, wsRoot)
+	issues, results, err := agg.LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("len(results) = %d, want 2 (distinct beads_path sharing path '.')", len(results))
+	}
+	for _, r := range results {
+		if r.Error != nil {
+			t.Fatalf("unexpected load error for %s: %v", r.RepoName, r.Error)
+		}
+	}
+	seenIDs := map[string]bool{}
+	for _, iss := range issues {
+		seenIDs[iss.ID] = true
+	}
+	if !seenIDs["api-1"] || !seenIDs["web-1"] {
+		t.Fatalf("expected both api-1 and web-1 loaded, got %v", seenIDs)
+	}
+}

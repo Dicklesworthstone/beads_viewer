@@ -1425,7 +1425,7 @@ func TestFocusKeyStateMachine(t *testing.T) {
 								t.Fatalf("%s+g combo expiry: focused=%v isGraphView=%v, want focusGraph/true",
 									st.name, m.focused, m.isGraphView)
 							}
-						case "flow_matrix", "attention":
+						case "flow_matrix", "attention", "label_dashboard":
 							if m.focused != priorFocus || m.pendingComboKey != "" {
 								t.Fatalf("%s+g: focused=%v pendingComboKey=%q, want in-view GoToTop staying in %v",
 									st.name, m.focused, m.pendingComboKey, priorFocus)

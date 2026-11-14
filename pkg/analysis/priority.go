@@ -278,6 +278,8 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 
 	// Factor weights: defaults unless SetWeights applied feedback-adjusted ones.
 	w := a.Weights()
+	readiness := a.Readiness()
+	riskWeights := DefaultRiskWeights()
 
 	scores := make([]ImpactScore, 0, scoreCount)
 
@@ -310,7 +312,7 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 		urgencyNorm, urgencyExplanation := computeUrgency(&issue, now)
 
 		// Compute risk signals (bv-82)
-		riskSignals := ComputeRiskSignals(&issue, stats, a.issueMap, now)
+		riskSignals := ComputeRiskSignalsWithReadiness(&issue, stats, a.issueMap, readiness, now, riskWeights)
 
 		// Compute weighted score with the analyzer's (possibly feedback-adjusted) weights
 		breakdown := ScoreBreakdown{

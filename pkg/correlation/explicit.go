@@ -33,8 +33,9 @@ type ExplicitMatcher struct {
 	usesDefaultPatterns bool
 	extraPatterns       []*regexp.Regexp
 
-	knownIDs  []string
-	automaton *ahoCorasick
+	knownIDs             []string
+	explicitAliasesLower map[string]string
+	automaton            *ahoCorasick
 
 	// ctx, when set via WithContext, bounds the git subprocesses spawned by
 	// the matcher (issue #166). nil means context.Background().
@@ -188,10 +189,25 @@ func (m *ExplicitMatcher) SetKnownBeadIDs(ids []string) *ExplicitMatcher {
 // withMergedKnownIDs returns an ExplicitMatcher that recognizes the union of
 // m's known IDs and groups without mutating m's own policy state.
 func (m *ExplicitMatcher) withMergedKnownIDs(groups ...[]string) *ExplicitMatcher {
+	return m.withKnownIDsAndAliases(nil, groups...)
+}
+
+// withReportOptions returns an ExplicitMatcher configured with m's patterns,
+// m's known IDs unioned with groups, and opts.ExplicitIDAliases, without
+// mutating m's shared state.
+func (m *ExplicitMatcher) withReportOptions(opts CorrelatorOptions, groups ...[]string) *ExplicitMatcher {
+	return m.withKnownIDsAndAliases(opts.ExplicitIDAliases, groups...)
+}
+
+func (m *ExplicitMatcher) withKnownIDsAndAliases(explicitAliases map[string]string, groups ...[]string) *ExplicitMatcher {
+	if m == nil {
+		m = NewExplicitMatcher("")
+	}
 	m.mu.RLock()
 	basePatterns := append([]*regexp.Regexp(nil), m.patterns...)
 	extraPatterns := append([]*regexp.Regexp(nil), m.extraPatterns...)
 	baseKnown := m.knownIDs
+	baseAliases := m.explicitAliasesLower
 	baseAuto := m.automaton
 	repoPath := m.repoPath
 	builtinCount := m.builtinCount
@@ -199,7 +215,7 @@ func (m *ExplicitMatcher) withMergedKnownIDs(groups ...[]string) *ExplicitMatche
 	ctx := m.ctx
 	m.mu.RUnlock()
 
-	total := len(baseKnown)
+	total := len(baseKnown) + len(explicitAliases)
 	for _, g := range groups {
 		total += len(g)
 	}
@@ -208,27 +224,90 @@ func (m *ExplicitMatcher) withMergedKnownIDs(groups ...[]string) *ExplicitMatche
 	for _, g := range groups {
 		mergedInput = append(mergedInput, g...)
 	}
+	for _, targetCanon := range explicitAliases {
+		if targetCanon != "" {
+			mergedInput = append(mergedInput, targetCanon)
+		}
+	}
 	canonical := canonicalizeKnownIDList(mergedInput)
+	normAliases := canonicalizeExplicitAliases(baseAliases, explicitAliases)
 
 	ac := baseAuto
-	if !stringSlicesEqual(baseKnown, canonical) {
-		if len(canonical) > 0 {
-			ac = buildAhoCorasick(canonical)
+	if !stringSlicesEqual(baseKnown, canonical) || !stringMapsEqual(baseAliases, normAliases) {
+		if len(canonical) > 0 || len(normAliases) > 0 {
+			ac = buildAhoCorasickWithAliases(canonical, normAliases)
 		} else {
 			ac = nil
 		}
 	}
 
 	return &ExplicitMatcher{
-		repoPath:            repoPath,
-		patterns:            basePatterns,
-		builtinCount:        builtinCount,
-		usesDefaultPatterns: usesDefault,
-		extraPatterns:       extraPatterns,
-		knownIDs:            canonical,
-		automaton:           ac,
-		ctx:                 ctx,
+		repoPath:             repoPath,
+		patterns:             basePatterns,
+		builtinCount:         builtinCount,
+		usesDefaultPatterns:  usesDefault,
+		extraPatterns:        extraPatterns,
+		knownIDs:             canonical,
+		explicitAliasesLower: normAliases,
+		automaton:            ac,
+		ctx:                  ctx,
 	}
+}
+
+func canonicalizeExplicitAliases(baseLower, incoming map[string]string) map[string]string {
+	if len(baseLower) == 0 && len(incoming) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(baseLower)+len(incoming))
+	for k, v := range baseLower {
+		if k != "" && v != "" {
+			out[k] = v
+		}
+	}
+	if len(incoming) > 0 {
+		keys := make([]string, 0, len(incoming))
+		for k := range incoming {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		ambiguous := make(map[string]bool)
+		seenIncoming := make(map[string]string, len(incoming))
+		for _, k := range keys {
+			v := incoming[k]
+			if k == "" || v == "" {
+				continue
+			}
+			low := strings.ToLower(k)
+			if prev, exists := seenIncoming[low]; exists && prev != v {
+				ambiguous[low] = true
+			} else {
+				seenIncoming[low] = v
+			}
+		}
+		for low, v := range seenIncoming {
+			if ambiguous[low] {
+				delete(out, low)
+				continue
+			}
+			out[low] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func stringMapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
 }
 
 func canonicalizeKnownIDList(ids []string) []string {
@@ -285,13 +364,55 @@ func (m *ExplicitMatcher) policyFingerprint() string {
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
+// policyFingerprintWithReportOptions computes the exact policyFingerprint that
+// m.withReportOptions(opts, groups...) produces, without constructing an
+// Aho-Corasick automaton on cache-key lookups.
+func (m *ExplicitMatcher) policyFingerprintWithReportOptions(opts CorrelatorOptions, groups ...[]string) string {
+	if m == nil {
+		m = NewExplicitMatcher("")
+	}
+	m.mu.RLock()
+	patterns := append([]*regexp.Regexp(nil), m.patterns...)
+	baseKnown := m.knownIDs
+	m.mu.RUnlock()
+
+	total := len(baseKnown) + len(opts.ExplicitIDAliases)
+	for _, g := range groups {
+		total += len(g)
+	}
+	mergedInput := make([]string, 0, total)
+	mergedInput = append(mergedInput, baseKnown...)
+	for _, g := range groups {
+		mergedInput = append(mergedInput, g...)
+	}
+	for _, targetCanon := range opts.ExplicitIDAliases {
+		if targetCanon != "" {
+			mergedInput = append(mergedInput, targetCanon)
+		}
+	}
+	canonical := canonicalizeKnownIDList(mergedInput)
+
+	h := sha256.New()
+	h.Write([]byte("bv-explicit-matcher-v2\x00"))
+	for _, pattern := range patterns {
+		expression := pattern.String()
+		fmt.Fprintf(h, "%d:%s", len(expression), expression)
+	}
+	h.Write([]byte("\x00known\x00"))
+	for _, id := range canonical {
+		fmt.Fprintf(h, "%d:%s", len(id), id)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
 // acUnusedClass marks bytes that do not appear in any dictionary pattern.
 const acUnusedClass = uint8(0xFF)
 
 type acPattern struct {
-	canonicalID string
-	patLen      int
-	ambiguous   bool
+	canonicalID    string
+	patLen         int
+	ambiguous      bool
+	qualifiedAlias bool
 }
 
 // ahoCorasick implements Aho & Corasick (1975) multi-pattern string matching
@@ -309,9 +430,10 @@ type ahoCorasick struct {
 }
 
 type acSpanMatch struct {
-	l           int
-	r           int
-	canonicalID string
+	l              int
+	r              int
+	canonicalID    string
+	qualifiedAlias bool
 }
 
 func isAllASCIIDigits(s string) bool {
@@ -366,8 +488,13 @@ func hasValidBeadIDBoundaries(message string, l, r int) bool {
 // buildAhoCorasick constructs the Aho-Corasick trie, failure links, dictionary
 // output links, and completed transition table in O(sum_{w in V} |w|) time.
 func buildAhoCorasick(sortedKnownIDs []string) *ahoCorasick {
-	lowerToCanonical := make(map[string]string, len(sortedKnownIDs))
+	return buildAhoCorasickWithAliases(sortedKnownIDs, nil)
+}
+
+func buildAhoCorasickWithAliases(sortedKnownIDs []string, lowerAliases map[string]string) *ahoCorasick {
+	lowerToCanonical := make(map[string]string, len(sortedKnownIDs)+len(lowerAliases))
 	ambiguous := make(map[string]bool)
+	qualifiedAlias := make(map[string]bool, len(lowerAliases))
 
 	for _, id := range sortedKnownIDs {
 		if id == "" {
@@ -380,6 +507,25 @@ func buildAhoCorasick(sortedKnownIDs []string) *ahoCorasick {
 			}
 		} else {
 			lowerToCanonical[low] = id
+		}
+	}
+
+	if len(lowerAliases) > 0 {
+		aliasKeys := make([]string, 0, len(lowerAliases))
+		for lowAlias := range lowerAliases {
+			aliasKeys = append(aliasKeys, lowAlias)
+		}
+		sort.Strings(aliasKeys)
+		for _, lowAlias := range aliasKeys {
+			canon := lowerAliases[lowAlias]
+			if lowAlias == "" || canon == "" {
+				continue
+			}
+			lowerToCanonical[lowAlias] = canon
+			delete(ambiguous, lowAlias)
+			if !strings.EqualFold(lowAlias, canon) {
+				qualifiedAlias[lowAlias] = true
+			}
 		}
 	}
 
@@ -469,9 +615,10 @@ func buildAhoCorasick(sortedKnownIDs []string) *ahoCorasick {
 	patterns := make([]acPattern, len(allKeys))
 	for i, key := range allKeys {
 		patterns[i] = acPattern{
-			canonicalID: lowerToCanonical[key],
-			patLen:      len(key),
-			ambiguous:   ambiguous[key],
+			canonicalID:    lowerToCanonical[key],
+			patLen:         len(key),
+			ambiguous:      ambiguous[key],
+			qualifiedAlias: qualifiedAlias[key],
 		}
 		cur := int32(0)
 		for j := 0; j < len(key); j++ {
@@ -583,9 +730,10 @@ func (ac *ahoCorasick) search(message string) []acSpanMatch {
 				continue
 			}
 			candidates = append(candidates, acSpanMatch{
-				l:           l,
-				r:           r,
-				canonicalID: pat.canonicalID,
+				l:              l,
+				r:              r,
+				canonicalID:    pat.canonicalID,
+				qualifiedAlias: pat.qualifiedAlias,
 			})
 		}
 	}
@@ -595,7 +743,8 @@ func (ac *ahoCorasick) search(message string) []acSpanMatch {
 	}
 
 	// Maximal-munch interval disambiguation: prefer strictly longer spans,
-	// breaking ties by leftmost start index, and discard overlapped subspans.
+	// breaking ties by leftmost start index, qualified alias, and canonical ID,
+	// and discard overlapped subspans.
 	sort.Slice(candidates, func(i, j int) bool {
 		lenI := candidates[i].r - candidates[i].l
 		lenJ := candidates[j].r - candidates[j].l
@@ -604,6 +753,9 @@ func (ac *ahoCorasick) search(message string) []acSpanMatch {
 		}
 		if candidates[i].l != candidates[j].l {
 			return candidates[i].l < candidates[j].l
+		}
+		if candidates[i].qualifiedAlias != candidates[j].qualifiedAlias {
+			return candidates[i].qualifiedAlias
 		}
 		return candidates[i].canonicalID < candidates[j].canonicalID
 	})
@@ -630,14 +782,15 @@ func (ac *ahoCorasick) search(message string) []acSpanMatch {
 
 // ExplicitMatch represents a bead ID found in a commit message.
 type ExplicitMatch struct {
-	BeadID      string
-	CommitSHA   string
-	Message     string
-	Author      string
-	AuthorEmail string
-	Timestamp   time.Time
-	MatchType   string // "closes", "fixes", "resolves", "scope", "bead", "bracket", "refs", "generic"
-	Confidence  float64
+	BeadID         string
+	CommitSHA      string
+	Message        string
+	Author         string
+	AuthorEmail    string
+	Timestamp      time.Time
+	MatchType      string // "closes", "fixes", "resolves", "scope", "bead", "bracket", "refs", "generic"
+	Confidence     float64
+	qualifiedAlias bool
 }
 
 // ExtractIDsFromMessage extracts all bead IDs from a commit message.
@@ -653,6 +806,7 @@ func (m *ExplicitMatcher) ExtractIDsFromMessage(message string) []IDMatch {
 	usesDefault := m.usesDefaultPatterns
 	extraPatterns := m.extraPatterns
 	knownIDs := m.knownIDs
+	explicitAliases := m.explicitAliasesLower
 	m.mu.RUnlock()
 
 	if ac != nil {
@@ -664,6 +818,7 @@ func (m *ExplicitMatcher) ExtractIDsFromMessage(message string) []IDMatch {
 			matchType, rawMatch := classifyContextualSpan(message, sp.l, sp.r, sp.canonicalID)
 			key := strings.ToLower(sp.canonicalID)
 			if existingIdx, ok := idxByLower[key]; ok {
+				matches[existingIdx].qualifiedAlias = matches[existingIdx].qualifiedAlias || sp.qualifiedAlias
 				if CalculateConfidence(matchType, 1) > CalculateConfidence(matches[existingIdx].MatchType, 1) {
 					matches[existingIdx].MatchType = matchType
 					matches[existingIdx].RawMatch = rawMatch
@@ -672,9 +827,10 @@ func (m *ExplicitMatcher) ExtractIDsFromMessage(message string) []IDMatch {
 			}
 			idxByLower[key] = len(matches)
 			matches = append(matches, IDMatch{
-				ID:        sp.canonicalID,
-				MatchType: matchType,
-				RawMatch:  rawMatch,
+				ID:             sp.canonicalID,
+				MatchType:      matchType,
+				RawMatch:       rawMatch,
+				qualifiedAlias: sp.qualifiedAlias,
 			})
 		}
 
@@ -700,10 +856,16 @@ func (m *ExplicitMatcher) ExtractIDsFromMessage(message string) []IDMatch {
 					if raw == "" {
 						continue
 					}
+					rawLower := strings.ToLower(raw)
 					norm := normalizeBeadID(raw)
 					key := strings.ToLower(norm)
 					id := norm
-					if canon, ok := canonByLower[key]; ok {
+					qual := false
+					if aliasCanon, ok := explicitAliases[rawLower]; ok && aliasCanon != "" {
+						id = aliasCanon
+						key = strings.ToLower(aliasCanon)
+						qual = !strings.EqualFold(raw, aliasCanon)
+					} else if canon, ok := canonByLower[key]; ok {
 						if canon == "" {
 							continue
 						}
@@ -711,6 +873,7 @@ func (m *ExplicitMatcher) ExtractIDsFromMessage(message string) []IDMatch {
 					}
 					matchType := classifyMatch(match[0])
 					if existingIdx, ok := idxByLower[key]; ok {
+						matches[existingIdx].qualifiedAlias = matches[existingIdx].qualifiedAlias || qual
 						if CalculateConfidence(matchType, 1) > CalculateConfidence(matches[existingIdx].MatchType, 1) {
 							matches[existingIdx].MatchType = matchType
 							matches[existingIdx].RawMatch = match[0]
@@ -719,9 +882,10 @@ func (m *ExplicitMatcher) ExtractIDsFromMessage(message string) []IDMatch {
 					}
 					idxByLower[key] = len(matches)
 					matches = append(matches, IDMatch{
-						ID:        id,
-						MatchType: matchType,
-						RawMatch:  match[0],
+						ID:             id,
+						MatchType:      matchType,
+						RawMatch:       match[0],
+						qualifiedAlias: qual,
 					})
 				}
 			}
@@ -885,9 +1049,10 @@ func classifyContextualSpan(message string, l, r int, canonicalID string) (strin
 
 // IDMatch represents a single ID match from a message.
 type IDMatch struct {
-	ID        string
-	MatchType string
-	RawMatch  string
+	ID             string
+	MatchType      string
+	RawMatch       string
+	qualifiedAlias bool
 }
 
 // normalizeBeadID normalizes a bead ID to a consistent format.
@@ -1166,6 +1331,25 @@ func (m *ExplicitMatcher) CreateCorrelatedCommit(match ExplicitMatch, coCommitte
 // assembleReport drops pairs whose bead does not exist in the current bead
 // set.
 func (m *ExplicitMatcher) MatchWalkedCommits(commits []walkedCommit, beadFilter string) []ExplicitMatch {
+	return m.MatchWalkedCommitsFiltered(commits, beadFilter, nil)
+}
+
+func (m *ExplicitMatcher) MatchWalkedCommitsFiltered(commits []walkedCommit, beadFilter string, filterAliases []string) []ExplicitMatch {
+	var extraFilterTargets []string
+	if beadFilter != "" {
+		m.mu.RLock()
+		if aliasCanon, ok := m.explicitAliasesLower[strings.ToLower(beadFilter)]; ok && aliasCanon != "" {
+			extraFilterTargets = append(extraFilterTargets, aliasCanon)
+		}
+		m.mu.RUnlock()
+	}
+	if len(extraFilterTargets) > 0 {
+		combined := make([]string, 0, len(filterAliases)+len(extraFilterTargets))
+		combined = append(combined, filterAliases...)
+		combined = append(combined, extraFilterTargets...)
+		filterAliases = combined
+	}
+
 	var matches []ExplicitMatch
 	for _, wc := range commits {
 		ids := m.ExtractIDsFromMessage(wc.message())
@@ -1173,18 +1357,19 @@ func (m *ExplicitMatcher) MatchWalkedCommits(commits []walkedCommit, beadFilter 
 			continue
 		}
 		for _, id := range ids {
-			if beadFilter != "" && !strings.EqualFold(id.ID, beadFilter) {
+			if !matchesBeadFilterFold(id.ID, beadFilter, filterAliases) {
 				continue
 			}
 			matches = append(matches, ExplicitMatch{
-				BeadID:      id.ID,
-				CommitSHA:   wc.SHA,
-				Message:     wc.Subject,
-				Author:      wc.Author,
-				AuthorEmail: wc.AuthorEmail,
-				Timestamp:   wc.Timestamp,
-				MatchType:   id.MatchType,
-				Confidence:  CalculateConfidence(id.MatchType, len(ids)),
+				BeadID:         id.ID,
+				CommitSHA:      wc.SHA,
+				Message:        wc.Subject,
+				Author:         wc.Author,
+				AuthorEmail:    wc.AuthorEmail,
+				Timestamp:      wc.Timestamp,
+				MatchType:      id.MatchType,
+				Confidence:     CalculateConfidence(id.MatchType, len(ids)),
+				qualifiedAlias: id.qualifiedAlias,
 			})
 		}
 	}

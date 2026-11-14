@@ -36,6 +36,7 @@ type ExportIssue struct {
 	// Computed graph metrics
 	PageRank       float64  `json:"pagerank"`
 	Betweenness    float64  `json:"betweenness,omitempty"`
+	Eigenvector    float64  `json:"eigenvector,omitempty"`
 	CriticalPath   int      `json:"critical_path_depth"`
 	TriageScore    float64  `json:"triage_score,omitempty"`
 	BlocksCount    int      `json:"blocks_count"`
@@ -56,6 +57,7 @@ type ExportMetrics struct {
 	IssueID        string  `json:"issue_id"`
 	PageRank       float64 `json:"pagerank"`
 	Betweenness    float64 `json:"betweenness"`
+	Eigenvector    float64 `json:"eigenvector"`
 	CriticalPath   int     `json:"critical_path_depth"`
 	TriageScore    float64 `json:"triage_score"`
 	BlocksCount    int     `json:"blocks_count"`
@@ -64,13 +66,14 @@ type ExportMetrics struct {
 
 // ExportMeta contains metadata about the export.
 type ExportMeta struct {
-	Version     string    `json:"version"`
-	GeneratedAt time.Time `json:"generated_at"`
-	GitCommit   string    `json:"git_commit,omitempty"`
-	IssueCount  int       `json:"issue_count"`
-	DepCount    int       `json:"dependency_count"`
-	DataHash    string    `json:"data_hash,omitempty"`
-	Title       string    `json:"title,omitempty"`
+	Version       string    `json:"version"`
+	GeneratedAt   time.Time `json:"generated_at"`
+	GitCommit     string    `json:"git_commit,omitempty"`
+	IssueCount    int       `json:"issue_count"`
+	DepCount      int       `json:"dependency_count"`
+	DataHash      string    `json:"data_hash,omitempty"`
+	Title         string    `json:"title,omitempty"`
+	HasHybridWasm bool      `json:"has_hybrid_wasm"`
 }
 
 // SQLiteExportConfig configures the SQLite export process.

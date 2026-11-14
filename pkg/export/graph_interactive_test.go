@@ -1,10 +1,12 @@
 package export
 
 import (
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -182,6 +184,145 @@ func TestGenerateInteractiveGraphHTML_EscapesDynamicHTML(t *testing.T) {
 	for _, bad := range forbidden {
 		if strings.Contains(html, bad) {
 			t.Fatalf("generated graph contains unsafe pattern %q", bad)
+		}
+	}
+}
+
+func TestGenerateInteractiveGraphHTML_UnifiedFiltersPathFinderRecentAndActiveBlockers(t *testing.T) {
+	tmpDir := t.TempDir()
+	issues := []model.Issue{
+		{
+			ID:        "bv-open",
+			Title:     "Actionable despite non-blocking and resolved deps",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-open", DependsOnID: "bv-epic", Type: model.DepParentChild},
+				{IssueID: "bv-open", DependsOnID: "bv-rel", Type: model.DepRelated},
+				{IssueID: "bv-open", DependsOnID: "bv-disc", Type: model.DepDiscoveredFrom},
+				{IssueID: "bv-open", DependsOnID: "bv-closed", Type: model.DepBlocks},
+				{IssueID: "bv-open", DependsOnID: "bv-tomb", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "bv-blocked",
+			Title:     "Actively blocked by bv-open",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeFeature,
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-blocked", DependsOnID: "bv-open", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "bv-missing-dep",
+			Title:     "Blocked by missing prerequisite",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-missing-dep", DependsOnID: "ghost-prereq", Type: model.DepBlocks},
+			},
+		},
+		{ID: "bv-epic", Title: "Parent Epic", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeEpic},
+		{ID: "bv-rel", Title: "Related Issue", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask},
+		{ID: "bv-disc", Title: "Discovered Origin", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeBug},
+		{ID: "bv-closed", Title: "Closed Prereq", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask},
+		{ID: "bv-tomb", Title: "Tombstoned Prereq", Status: model.StatusTombstone, Priority: 3, IssueType: model.TypeTask},
+	}
+
+	stats := analysis.NewAnalyzer(issues).Analyze()
+	stats.WaitForPhase2()
+
+	path, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues:      issues,
+		Stats:       &stats,
+		Title:       "Standalone Graph Wiring",
+		Path:        tmpDir + "/standalone.html",
+		ProjectName: "standalone",
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML failed: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", path, err)
+	}
+	html := string(raw)
+
+	if count := strings.Count(html, "function applyFilters()"); count != 1 {
+		t.Fatalf("expected exactly 1 unified applyFilters() definition, got %d", count)
+	}
+
+	for _, want := range []string{
+		"addToRecent(node);",
+		"if (pathFinderMode)",
+		"const path = bfsPath(startId, d.id);",
+		"priorityFilter = 'all';",
+		"labelFilter = 'all';",
+		"document.getElementById('filter-priority').value = 'all';",
+		"document.getElementById('filter-label').value = 'all';",
+		"document.getElementById('recent-panel').classList.remove('visible');",
+		"document.getElementById('btn-recent').classList.remove('active');",
+		"function computeNodeColor(n)",
+		"isActiveNodeStatus(node.status) && node.slack === 0",
+		"Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth());",
+		"isBlockingLinkType(l.type) && (!targetNode || isActiveNodeStatus(targetNode.status))",
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("standalone interactive HTML missing expected wiring %q", want)
+		}
+	}
+
+	const prefix = "\nconst DATA = "
+	start := strings.Index(html, prefix)
+	if start < 0 {
+		t.Fatalf("could not locate embedded DATA payload")
+	}
+	jsonPart := html[start+len(prefix):]
+	end := strings.Index(jsonPart, ";\nconst STATUS_COLORS")
+	if end < 0 {
+		t.Fatalf("could not locate end of embedded DATA payload")
+	}
+
+	var payload struct {
+		Nodes []graphNode `json:"nodes"`
+		Links []graphLink `json:"links"`
+	}
+	if err := json.Unmarshal([]byte(jsonPart[:end]), &payload); err != nil {
+		t.Fatalf("Unmarshal embedded DATA JSON: %v", err)
+	}
+
+	nodeMap := make(map[string]graphNode, len(payload.Nodes))
+	for _, n := range payload.Nodes {
+		nodeMap[n.ID] = n
+	}
+
+	if got := nodeMap["bv-open"].BlockedBy; len(got) != 0 {
+		t.Fatalf("bv-open BlockedBy = %v, want empty (non-blocking, closed, and tombstone deps excluded)", got)
+	}
+	if got := nodeMap["bv-open"].Blocks; len(got) != 1 || got[0] != "bv-blocked" {
+		t.Fatalf("bv-open Blocks = %v, want [bv-blocked]", got)
+	}
+	if got := nodeMap["bv-blocked"].BlockedBy; len(got) != 1 || got[0] != "bv-open" {
+		t.Fatalf("bv-blocked BlockedBy = %v, want [bv-open]", got)
+	}
+	if got := nodeMap["bv-missing-dep"].BlockedBy; len(got) != 1 || got[0] != "ghost-prereq" {
+		t.Fatalf("bv-missing-dep BlockedBy = %v, want [ghost-prereq] (missing blocker target counts as unsatisfied)", got)
+	}
+	for _, id := range []string{"bv-closed", "bv-tomb", "bv-epic", "bv-rel", "bv-disc"} {
+		if got := nodeMap[id].Blocks; len(got) != 0 {
+			t.Fatalf("%s Blocks = %v, want empty", id, got)
+		}
+	}
+	for _, l := range payload.Links {
+		if l.Type != string(model.DepBlocks) && l.Critical {
+			t.Fatalf("non-blocking link %+v should never be marked critical", l)
+		}
+		if (l.Target == "bv-closed" || l.Target == "bv-tomb") && l.Critical {
+			t.Fatalf("resolved link %+v should never be marked critical", l)
 		}
 	}
 }

@@ -276,7 +276,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"x", "Export to markdown", "Actions", "list,detail"},
 		{"y", "Copy issue ID", "Actions", "list,detail,board,graph,insights,tree,actionable,flow"},
 		{"C", "Copy full issue", "Actions", "list,detail"},
-		{"O", "Open in $EDITOR", "Actions", "list,detail"},
+		{"O", "Open in $EDITOR", "Actions", "list,detail,board,graph,tree,actionable,insights,flow,history"},
 		{"'", "Recipe picker", "Actions", "list"},
 		{"U", "Self-update check", "Actions", "list"},
 		{"V", "Cass sessions", "Actions", "list,detail,board,tree,history"},
@@ -315,7 +315,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"h", "Collapse or jump to parent", "Tree", "tree"},
 		{"l", "Expand or move to child", "Tree", "tree"},
 		{"o", "Expand all nodes", "Tree", "tree"},
-		{"O", "Collapse all nodes", "Tree", "tree"},
+		{"Z", "Collapse all nodes", "Tree", "tree"},
 		{"tab", "Toggle detail pane", "Tree", "tree"},
 		{"PgUp", "Page up", "Tree", "tree"},
 		{"PgDn", "Page down", "Tree", "tree"},
@@ -366,6 +366,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"]", "Close attention view", "Attention", "attention"},
 
 		// Label Dashboard ([)
+		{"g", "Go to top", "Label", "label"},
 		{"enter", "Filter list by label", "Label", "label"},
 		{"h", "Label health detail", "Label", "label"},
 		{"d", "Label drilldown", "Label", "label"},

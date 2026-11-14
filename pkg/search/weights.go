@@ -2,7 +2,6 @@ package search
 
 import (
 	"fmt"
-	"log"
 	"math"
 )
 
@@ -26,14 +25,9 @@ type Weights struct {
 }
 
 // Validate checks that weights are valid (non-negative, sum to ~1.0).
-// It logs a warning when text relevance is very low.
 func (w Weights) Validate() error {
 	if err := w.validateComponents(); err != nil {
 		return err
-	}
-
-	if w.TextRelevance < 0.1 {
-		log.Printf("WARNING: text weight %.2f is very low; results may not match query", w.TextRelevance)
 	}
 
 	sum := w.sum()

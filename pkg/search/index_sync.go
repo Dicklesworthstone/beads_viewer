@@ -12,15 +12,63 @@ import (
 )
 
 // DefaultIndexPath returns the default semantic index path under the given project directory.
-// The filename is keyed by provider+dim to avoid mixing incompatible embeddings.
+// The filename is keyed by provider(+model)+dim to avoid mixing incompatible embeddings.
 func DefaultIndexPath(projectDir string, cfg EmbeddingConfig) string {
 	cfg = cfg.Normalized()
 	provider := cfg.Provider
 	if provider == "" {
 		provider = ProviderHash
 	}
-	safeProvider := strings.NewReplacer("/", "_", "\\", "_", " ", "_").Replace(string(provider))
-	return filepath.Join(projectDir, ".bv", "semantic", fmt.Sprintf("index-%s-%d.bvvi", safeProvider, cfg.Dim))
+	safeProvider := sanitizeFilenameSlug(string(provider), "hash")
+	if cfg.Model == "" {
+		return filepath.Join(projectDir, ".bv", "semantic", fmt.Sprintf("index-%s-%d.bvvi", safeProvider, cfg.Dim))
+	}
+	safeModel := sanitizeModelFilenameSlug(cfg.Model)
+	return filepath.Join(projectDir, ".bv", "semantic", fmt.Sprintf("index-%s-%s-%d.bvvi", safeProvider, safeModel, cfg.Dim))
+}
+
+func sanitizeFilenameSlug(raw string, fallback string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	lastUnderscore := false
+	for _, r := range raw {
+		isSafe := (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '-' || r == '_'
+		if isSafe {
+			b.WriteRune(r)
+			lastUnderscore = (r == '_')
+			continue
+		}
+		if !lastUnderscore {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	slug := strings.Trim(b.String(), "_.")
+	if slug == "" {
+		return fallback
+	}
+	return slug
+}
+
+func sanitizeModelFilenameSlug(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ""
+	}
+	slug := sanitizeFilenameSlug(model, "model")
+	if len(slug) > 48 {
+		slug = strings.TrimRight(slug[:48], "_-")
+		if slug == "" {
+			slug = "model"
+		}
+	}
+	// Always append a deterministic FNV-1a hash suffix of the trimmed model name
+	// so sanitized slugs (e.g. "org/v1" -> "org_v1-<h1 >") can never collide with
+	// literal model identifiers matching that sanitized prefix ("org_v1-<h1 >" -> "org_v1-<h1 >-<h2 >").
+	return fmt.Sprintf("%s-%08x", slug, uint32(hashModelSeed(model)))
 }
 
 type IndexSyncStats struct {

@@ -678,3 +678,30 @@ func TestComputeGrahamBounds_ParallelSchedulingInvariants(t *testing.T) {
 		t.Fatalf("m=1 Graham bounds must collapse to W=480: %+v", b1)
 	}
 }
+
+func TestEstimateETAAndGrahamBounds_DefaultCalendarVelocityParity(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	est140 := 140
+	openSingle := []model.Issue{
+		{ID: "TASK-1", Title: "Calendar velocity parity", Status: model.StatusOpen, IssueType: model.TypeTask, EstimatedMinutes: &est140},
+	}
+
+	// With zero historical closures, both EstimateETAForIssue and ComputeGrahamBounds (m=1)
+	// must use the exact same calendar-day fallback velocity (medianMinutes / 7.0 = 20 min/day -> 7.0 days).
+	eta, err := EstimateETAForIssue(openSingle, nil, "TASK-1", 1, now)
+	if err != nil {
+		t.Fatalf("EstimateETAForIssue failed: %v", err)
+	}
+	bounds := ComputeGrahamBounds(openSingle, openSingle, nil, 1, now)
+
+	diff := eta.EstimatedDays - bounds.GrahamMinDays
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff > 1e-6 {
+		t.Fatalf("default fallback velocity mismatch: EstimateETAForIssue=%.6fd vs ComputeGrahamBounds=%.6fd", eta.EstimatedDays, bounds.GrahamMinDays)
+	}
+	if eta.EstimatedDays < 6.99 || eta.EstimatedDays > 7.01 {
+		t.Fatalf("expected 1 issue at medianMinutes with 1 issue/7-calendar-day fallback to take 7.0 days, got %.6f", eta.EstimatedDays)
+	}
+}

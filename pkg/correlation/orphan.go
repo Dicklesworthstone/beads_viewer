@@ -146,6 +146,24 @@ func (od *OrphanDetector) WithExplicitMatcher(m *ExplicitMatcher) *OrphanDetecto
 	return od
 }
 
+// WithStoreDirs configures custom git-root-relative tracker directory prefixes
+// on the underlying ReverseLookup so tracker-only commits are excluded from orphans.
+func (od *OrphanDetector) WithStoreDirs(storeDirs ...string) *OrphanDetector {
+	if od != nil && od.lookup != nil {
+		od.lookup.WithStoreDirs(storeDirs...)
+	}
+	return od
+}
+
+// WithSubtreeScope restricts orphan detection to commits touching the target
+// subtree(s) in a shared-.git workspace when --repo scoping is active.
+func (od *OrphanDetector) WithSubtreeScope(includePrefixes, excludePrefixes []string) *OrphanDetector {
+	if od != nil && od.lookup != nil {
+		od.lookup.WithSubtreeScope(includePrefixes, excludePrefixes)
+	}
+	return od
+}
+
 // NewOrphanDetector creates a detector from a history report.
 func NewOrphanDetector(report *HistoryReport, repoPath string) *OrphanDetector {
 	return NewOrphanDetectorAt(report, repoPath, time.Now())

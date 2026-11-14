@@ -1165,3 +1165,53 @@ func BenchmarkRobotDiskCache_ReadHit(b *testing.B) {
 		}
 	}
 }
+
+func TestComputeDataHashAndFingerprint_FiveNewIssueFields(t *testing.T) {
+	base := model.Issue{
+		ID:        "ISS-1",
+		Title:     "Canonical issue",
+		Status:    model.StatusOpen,
+		IssueType: model.TypeTask,
+		Priority:  2,
+	}
+
+	variants := []struct {
+		name   string
+		mutate func(*model.Issue)
+	}{
+		{"created_by", func(i *model.Issue) { i.CreatedBy = "alice" }},
+		{"close_reason", func(i *model.Issue) { i.CloseReason = "shipped in v1" }},
+		{"ephemeral", func(i *model.Issue) { i.Ephemeral = true }},
+		{"pinned", func(i *model.Issue) { i.Pinned = true }},
+		{"is_template", func(i *model.Issue) { i.IsTemplate = true }},
+	}
+
+	seenFP := map[analysis.IssueFingerprint]string{
+		analysis.ComputeIssueFingerprint(base): "base",
+	}
+	seenDataHash := map[string]string{
+		analysis.ComputeDataHash([]model.Issue{base}): "base",
+	}
+
+	for _, v := range variants {
+		iss := base
+		v.mutate(&iss)
+
+		fp := analysis.ComputeIssueFingerprint(iss)
+		if prev, dup := seenFP[fp]; dup {
+			t.Fatalf("%s fingerprint collided with %s: %+v", v.name, prev, fp)
+		}
+		seenFP[fp] = v.name
+
+		dh := analysis.ComputeDataHash([]model.Issue{iss})
+		if prev, dup := seenDataHash[dh]; dup {
+			t.Fatalf("%s DataHash collided with %s: %s", v.name, prev, dh)
+		}
+		seenDataHash[dh] = v.name
+
+		diff := analysis.ComputeIssueDiff([]model.Issue{base}, []model.Issue{iss})
+		if len(diff.ContentChanged) != 1 || diff.ContentChanged[0] != "ISS-1" {
+			t.Fatalf("%s not detected in ComputeIssueDiff.ContentChanged: %+v", v.name, diff)
+		}
+	}
+}

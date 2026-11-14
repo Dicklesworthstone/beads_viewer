@@ -267,9 +267,10 @@ func (m *tutorialProgressManager) GetProgress() TutorialProgress {
 func (m *TutorialModel) SaveProgress() error {
 	pm := GetTutorialProgressManager()
 
-	// Mark current page as viewed
-	if m.currentPage >= 0 && m.currentPage < len(m.pages) {
-		pm.MarkPageViewed(m.pages[m.currentPage].ID)
+	// Mark current visible page as viewed
+	visible := m.visiblePages()
+	if m.currentPage >= 0 && m.currentPage < len(visible) {
+		pm.MarkPageViewed(visible[m.currentPage].ID)
 	}
 
 	// Check if all pages have been viewed

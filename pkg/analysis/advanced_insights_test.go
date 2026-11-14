@@ -1629,3 +1629,93 @@ func TestParallelGainEvaluatesCandidatesIndependently(t *testing.T) {
 		})
 	}
 }
+
+func TestGenerateCoverageSet_RespectsCandidateScope(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "EXT-HUB", Title: "Out-of-scope hub", Status: model.StatusOpen},
+		{ID: "EXT-LEAF-1", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "EXT-HUB", Type: model.DepBlocks}}},
+		{ID: "EXT-LEAF-2", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "EXT-HUB", Type: model.DepBlocks}}},
+		{ID: "EXT-LEAF-3", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "EXT-HUB", Type: model.DepBlocks}}},
+		{ID: "CAND-ROOT", Title: "In-scope root", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "EXT-HUB", Type: model.DepBlocks}}},
+		{ID: "CAND-DEP", Title: "In-scope dependent", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "CAND-ROOT", Type: model.DepBlocks}}},
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetReadinessScope(model.NewReadinessIndex(issues), map[string]bool{
+		"CAND-ROOT": true,
+		"CAND-DEP":  true,
+	})
+
+	cov := an.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig()).CoverageSet
+	if cov == nil {
+		t.Fatal("expected non-nil CoverageSet")
+	}
+	if cov.TotalEdges != 1 || cov.EdgesCovered != 1 {
+		t.Fatalf("expected 1 in-scope blocking edge covered, got total=%d covered=%d items=%+v", cov.TotalEdges, cov.EdgesCovered, cov.Items)
+	}
+	for _, item := range cov.Items {
+		if strings.HasPrefix(item.ID, "EXT-") {
+			t.Fatalf("out-of-scope issue %s leaked into CoverageSet: %+v", item.ID, cov.Items)
+		}
+	}
+}
+
+func TestKPathsCycleBreakAndTopKSet_RespectCandidateScopeAndWithholding(t *testing.T) {
+	// 1. Acyclic candidate chain with upstream prerequisite (EXT-UP, preserved for blocker context),
+	// disconnected out-of-scope chain (EXT-DISC-1..3, excluded), and downstream out-of-scope dependent (EXT-DOWN, excluded).
+	dagIssues := []model.Issue{
+		{ID: "EXT-UP", Status: model.StatusOpen},
+		{ID: "CAND-1", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "EXT-UP", Type: model.DepBlocks}}},
+		{ID: "CAND-2", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "CAND-1", Type: model.DepBlocks}}},
+		{ID: "EXT-DOWN", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "CAND-2", Type: model.DepBlocks}}},
+		{ID: "EXT-DISC-1", Status: model.StatusOpen},
+		{ID: "EXT-DISC-2", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "EXT-DISC-1", Type: model.DepBlocks}}},
+		{ID: "EXT-DISC-3", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "EXT-DISC-2", Type: model.DepBlocks}}},
+		{ID: "CAND-PIN", Status: model.StatusOpen, Pinned: true},
+	}
+	anDAG := NewAnalyzer(dagIssues)
+	anDAG.SetReadinessScope(model.NewReadinessIndex(dagIssues), map[string]bool{
+		"CAND-1":   true,
+		"CAND-2":   true,
+		"CAND-PIN": true,
+	})
+	insDAG := anDAG.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig())
+	if insDAG.KPaths == nil || insDAG.KPaths.Status.State != "available" || len(insDAG.KPaths.Paths) != 1 {
+		t.Fatalf("expected 1 available KPath preserving upstream prerequisite, got %+v", insDAG.KPaths)
+	}
+	gotPath := insDAG.KPaths.Paths[0].IssueIDs
+	if len(gotPath) != 3 || gotPath[0] != "EXT-UP" || gotPath[1] != "CAND-1" || gotPath[2] != "CAND-2" {
+		t.Fatalf("expected KPath [EXT-UP CAND-1 CAND-2], got %v", gotPath)
+	}
+	for _, p := range insDAG.KPaths.Paths {
+		for _, id := range p.IssueIDs {
+			if strings.HasPrefix(id, "EXT-DISC") || id == "EXT-DOWN" {
+				t.Fatalf("disconnected/downstream out-of-scope node %s leaked into KPaths: %+v", id, p)
+			}
+		}
+	}
+	// TopKSet Limited count must exclude withheld CAND-PIN (leaving only CAND-1, CAND-2 = 2)
+	if insDAG.TopKSet == nil || insDAG.TopKSet.Status.Limited != 2 {
+		t.Fatalf("expected TopKSet Limited=2 (CAND-PIN excluded), got %+v", insDAG.TopKSet)
+	}
+
+	// 2. Purely out-of-scope cycle must NOT leak into CycleBreak suggestions or block in-scope KPaths!
+	cycIssues := []model.Issue{
+		{ID: "EXT-CYC-1", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "EXT-CYC-2", Type: model.DepBlocks}}},
+		{ID: "EXT-CYC-2", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "EXT-CYC-1", Type: model.DepBlocks}}},
+		{ID: "CAND-X", Status: model.StatusOpen},
+		{ID: "CAND-Y", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "CAND-X", Type: model.DepBlocks}}},
+	}
+	anCyc := NewAnalyzer(cycIssues)
+	anCyc.SetReadinessScope(model.NewReadinessIndex(cycIssues), map[string]bool{
+		"CAND-X": true,
+		"CAND-Y": true,
+	})
+	insCyc := anCyc.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig())
+	if insCyc.CycleBreak == nil || insCyc.CycleBreak.CycleCount != 0 || len(insCyc.CycleBreak.Suggestions) != 0 {
+		t.Fatalf("purely out-of-scope cycle leaked into CycleBreak: %+v", insCyc.CycleBreak)
+	}
+	if insCyc.KPaths == nil || insCyc.KPaths.Status.State != "available" || len(insCyc.KPaths.Paths) != 1 {
+		t.Fatalf("expected in-scope KPaths to remain available despite out-of-scope cycle, got %+v", insCyc.KPaths)
+	}
+}

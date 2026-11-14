@@ -67,6 +67,22 @@ func ComputeRiskSignalsWithWeights(
 	now time.Time,
 	weights RiskWeights,
 ) RiskSignals {
+	return ComputeRiskSignalsWithReadiness(issue, stats, issues, nil, now, weights)
+}
+
+// ComputeRiskSignalsWithReadiness calculates risk reusing a prebuilt ReadinessIndex
+// (such as Analyzer.Readiness()) so batch/scoped evaluation is O(1) per issue.
+func ComputeRiskSignalsWithReadiness(
+	issue *model.Issue,
+	stats *GraphStats,
+	issues map[string]model.Issue,
+	readiness *model.ReadinessIndex,
+	now time.Time,
+	weights RiskWeights,
+) RiskSignals {
+	if issue == nil {
+		return RiskSignals{}
+	}
 	signals := RiskSignals{}
 
 	// 1. Fan variance - measure spread in dependency degrees
@@ -79,7 +95,7 @@ func ComputeRiskSignalsWithWeights(
 	signals.CrossRepoRisk = computeCrossRepoRisk(issue, issues)
 
 	// 4. Status risk - blocked/in_progress without recent activity
-	signals.StatusRisk = computeStatusRisk(issue, now)
+	signals.StatusRisk = computeStatusRiskWithReadiness(issue, issues, readiness, now)
 
 	// Compute weighted composite
 	signals.CompositeRisk = signals.FanVariance*weights.FanVariance +
@@ -213,10 +229,25 @@ func computeCrossRepoRisk(issue *model.Issue, issues map[string]model.Issue) flo
 }
 
 // computeStatusRisk measures risk based on current status and activity
-func computeStatusRisk(issue *model.Issue, now time.Time) float64 {
+func computeStatusRisk(issue *model.Issue, issues map[string]model.Issue, now time.Time) float64 {
+	return computeStatusRiskWithReadiness(issue, issues, nil, now)
+}
+
+func computeStatusRiskWithReadiness(
+	issue *model.Issue,
+	issues map[string]model.Issue,
+	readiness *model.ReadinessIndex,
+	now time.Time,
+) float64 {
 	var risk float64
 
-	switch issue.Status {
+	effectiveStatus := issue.Status
+	if (effectiveStatus == model.StatusOpen || effectiveStatus == model.StatusInProgress) &&
+		isIssueDependencyBlockedWithReadiness(issue, issues, readiness) {
+		effectiveStatus = model.StatusBlocked
+	}
+
+	switch effectiveStatus {
 	case model.StatusClosed, model.StatusTombstone:
 		risk = 0
 	case model.StatusBlocked:
@@ -262,6 +293,43 @@ func computeStatusRisk(issue *model.Issue, now time.Time) float64 {
 	}
 
 	return risk
+}
+
+func isIssueDependencyBlockedWithReadiness(
+	issue *model.Issue,
+	issues map[string]model.Issue,
+	readiness *model.ReadinessIndex,
+) bool {
+	if issue == nil {
+		return false
+	}
+	if readiness != nil {
+		return readiness.DependencyState(issue.ID) != model.DependenciesSatisfied
+	}
+	if len(issue.Dependencies) == 0 {
+		return false
+	}
+	r := buildReadinessIndexForMap(issues, issue)
+	return r.DependencyState(issue.ID) != model.DependenciesSatisfied
+}
+
+func buildReadinessIndexForMap(issues map[string]model.Issue, extra *model.Issue) *model.ReadinessIndex {
+	capHint := len(issues)
+	if extra != nil {
+		if _, ok := issues[extra.ID]; !ok {
+			capHint++
+		}
+	}
+	slice := make([]model.Issue, 0, capHint)
+	for _, iss := range issues {
+		slice = append(slice, iss)
+	}
+	if extra != nil {
+		if _, ok := issues[extra.ID]; !ok {
+			slice = append(slice, *extra)
+		}
+	}
+	return model.NewReadinessIndex(slice)
 }
 
 // generateRiskExplanation creates a human-readable risk assessment
@@ -337,20 +405,35 @@ func computeStdDev(values []float64, mean float64) float64 {
 	return math.Sqrt(variance)
 }
 
-// ComputeAllRiskSignals calculates risk for all issues in the map
+// ComputeAllRiskSignals calculates risk for all issues in the map in O(N + E)
+// by building a single ReadinessIndex across the batch.
 func ComputeAllRiskSignals(
 	issues map[string]model.Issue,
 	stats *GraphStats,
 	now time.Time,
 ) map[string]RiskSignals {
+	return ComputeAllRiskSignalsWithReadiness(issues, stats, buildReadinessIndexForMap(issues, nil), now)
+}
+
+// ComputeAllRiskSignalsWithReadiness calculates risk for all non-closed issues
+// in issues reusing a caller-supplied ReadinessIndex.
+func ComputeAllRiskSignalsWithReadiness(
+	issues map[string]model.Issue,
+	stats *GraphStats,
+	readiness *model.ReadinessIndex,
+	now time.Time,
+) map[string]RiskSignals {
 	result := make(map[string]RiskSignals, len(issues))
 	weights := DefaultRiskWeights()
+	if readiness == nil {
+		readiness = buildReadinessIndexForMap(issues, nil)
+	}
 
 	for id, issue := range issues {
 		if isClosedLikeStatus(issue.Status) {
 			continue // Skip closed issues
 		}
-		result[id] = ComputeRiskSignalsWithWeights(&issue, stats, issues, now, weights)
+		result[id] = ComputeRiskSignalsWithReadiness(&issue, stats, issues, readiness, now, weights)
 	}
 
 	return result

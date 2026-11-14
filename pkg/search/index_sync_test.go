@@ -275,3 +275,49 @@ func TestLoadOrNewVectorIndexPreservesRapidCorruptBackups(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultIndexPath_ModelSlug(t *testing.T) {
+	projectDir := filepath.Join(t.TempDir(), "proj")
+	expectedSemanticDir := filepath.Join(projectDir, ".bv", "semantic")
+
+	defaultPath := DefaultIndexPath(projectDir, EmbeddingConfig{Provider: ProviderHash, Dim: 384})
+	wantDefault := filepath.Join(expectedSemanticDir, "index-hash-384.bvvi")
+	if defaultPath != wantDefault {
+		t.Fatalf("default path = %q, want %q", defaultPath, wantDefault)
+	}
+
+	whitespaceModelPath := DefaultIndexPath(projectDir, EmbeddingConfig{Provider: ProviderHash, Model: "   ", Dim: 384})
+	if whitespaceModelPath != wantDefault {
+		t.Fatalf("whitespace model path = %q, want %q", whitespaceModelPath, wantDefault)
+	}
+
+	modelAPath := DefaultIndexPath(projectDir, EmbeddingConfig{Provider: ProviderHash, Model: "custom-v1", Dim: 384})
+	modelBPath := DefaultIndexPath(projectDir, EmbeddingConfig{Provider: ProviderHash, Model: "org/custom:v1", Dim: 384})
+	modelCPath := DefaultIndexPath(projectDir, EmbeddingConfig{Provider: ProviderHash, Model: "org_custom_v1", Dim: 384})
+	traversalPath := DefaultIndexPath(projectDir, EmbeddingConfig{Provider: ProviderHash, Model: "../../../etc/passwd", Dim: 384})
+
+	for name, p := range map[string]string{
+		"modelA":    modelAPath,
+		"modelB":    modelBPath,
+		"modelC":    modelCPath,
+		"traversal": traversalPath,
+	} {
+		if filepath.Dir(p) != expectedSemanticDir {
+			t.Fatalf("%s escaped semantic dir: got dir %q, want %q (full=%q)", name, filepath.Dir(p), expectedSemanticDir, p)
+		}
+		if p == wantDefault {
+			t.Fatalf("%s collided with default path %q", name, p)
+		}
+	}
+	if modelAPath == modelBPath || modelBPath == modelCPath || modelAPath == modelCPath {
+		t.Fatalf("expected distinct cache paths for distinct models, got A=%q B=%q C=%q", modelAPath, modelBPath, modelCPath)
+	}
+
+	// Regression: "org/v1" -> "org_v1-<h1 >" must NEVER collide with literal model "org_v1-<h1 >"
+	slashModelPath := DefaultIndexPath(projectDir, EmbeddingConfig{Provider: ProviderHash, Model: "org/v1", Dim: 384})
+	literalSlug := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(slashModelPath), "index-hash-"), "-384.bvvi")
+	literalModelPath := DefaultIndexPath(projectDir, EmbeddingConfig{Provider: ProviderHash, Model: literalSlug, Dim: 384})
+	if slashModelPath == literalModelPath {
+		t.Fatalf("model 'org/v1' collided with literal slug model %q at %q", literalSlug, slashModelPath)
+	}
+}

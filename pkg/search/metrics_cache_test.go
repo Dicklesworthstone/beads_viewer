@@ -219,18 +219,28 @@ func TestAnalyzerMetricsLoader_LoadMetrics(t *testing.T) {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	issueC := model.Issue{
+		ID:        "C",
+		Title:     "Unblocked Open Issue C",
+		Status:    model.StatusOpen,
+		IssueType: model.TypeTask,
+		Priority:  2,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
 
-	loader := NewAnalyzerMetricsLoader([]model.Issue{issueA, issueB})
+	loader := NewAnalyzerMetricsLoader([]model.Issue{issueA, issueB, issueC})
 	metrics, err := loader.LoadMetrics()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(metrics) != 2 {
-		t.Fatalf("expected 2 metrics entries, got %d", len(metrics))
+	if len(metrics) != 3 {
+		t.Fatalf("expected 3 metrics entries, got %d", len(metrics))
 	}
 
 	metricA := metrics["A"]
 	metricB := metrics["B"]
+	metricC := metrics["C"]
 
 	if metricA.BlockerCount != 0 {
 		t.Fatalf("expected A blocker count 0, got %d", metricA.BlockerCount)
@@ -238,8 +248,13 @@ func TestAnalyzerMetricsLoader_LoadMetrics(t *testing.T) {
 	if metricB.BlockerCount != 1 {
 		t.Fatalf("expected B blocker count 1, got %d", metricB.BlockerCount)
 	}
-	if metricA.Status != string(model.StatusOpen) {
-		t.Fatalf("expected A status open, got %q", metricA.Status)
+	// Issue A has StatusOpen in metadata, but depends on non-closed Issue B via DepBlocks,
+	// so its effective readiness status for hybrid search must be "blocked" (0.5, not 1.0).
+	if metricA.Status != string(model.StatusBlocked) {
+		t.Fatalf("expected dependency-blocked A status %q, got %q", model.StatusBlocked, metricA.Status)
+	}
+	if metricC.Status != string(model.StatusOpen) {
+		t.Fatalf("expected unblocked open C status %q, got %q", model.StatusOpen, metricC.Status)
 	}
 	if metricA.Priority != 2 {
 		t.Fatalf("expected A priority 2, got %d", metricA.Priority)
@@ -252,7 +267,7 @@ func TestAnalyzerMetricsLoader_LoadMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected hash error: %v", err)
 	}
-	expectedHash := analysis.ComputeDataHash([]model.Issue{issueA, issueB})
+	expectedHash := analysis.ComputeDataHash([]model.Issue{issueA, issueB, issueC})
 	if hash != expectedHash {
 		t.Fatalf("expected hash %q, got %q", expectedHash, hash)
 	}
@@ -857,5 +872,35 @@ func TestMetricsCacheEnsureFresh_PreemptedStaleObserverAfterRefresh(t *testing.T
 	}
 	if got := cache.DataHash(); got != "hash-b" {
 		t.Fatalf("expected final cache hash %q, got %q", "hash-b", got)
+	}
+}
+
+func TestAnalyzerMetricsLoader_DependencyBlockedOpenAndInProgressPromotedToBlocked(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "BLK", Title: "Open blocker", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "OPEN-DEP", Title: "Open blocked by dep", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "OPEN-DEP", DependsOnID: "BLK", Type: model.DepBlocks}},
+		},
+		{
+			ID: "INPROG-DEP", Title: "In-progress blocked by dep", Status: model.StatusInProgress, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "INPROG-DEP", DependsOnID: "BLK", Type: model.DepBlocks}},
+		},
+	}
+
+	loader := NewAnalyzerMetricsLoader(issues)
+	metrics, _, err := loader.LoadMetricsWithHash()
+	if err != nil {
+		t.Fatalf("LoadMetricsWithHash: %v", err)
+	}
+	if metrics["BLK"].Status != string(model.StatusOpen) {
+		t.Fatalf("expected unblocked BLK status=open, got %q", metrics["BLK"].Status)
+	}
+	if metrics["OPEN-DEP"].Status != string(model.StatusBlocked) {
+		t.Fatalf("expected dependency-blocked OPEN-DEP status=blocked, got %q", metrics["OPEN-DEP"].Status)
+	}
+	if metrics["INPROG-DEP"].Status != string(model.StatusBlocked) {
+		t.Fatalf("expected dependency-blocked INPROG-DEP status=blocked, got %q", metrics["INPROG-DEP"].Status)
 	}
 }

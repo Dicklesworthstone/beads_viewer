@@ -48,7 +48,7 @@
 | **list,detail** | `x` | Export to markdown |
 | **list,detail,board,graph,insights,tree,actionable,flow** | `y` | Copy issue ID |
 | **list,detail** | `C` | Copy full issue |
-|  | `O` | Open in $EDITOR |
+| **list,detail,board,graph,tree,actionable,insights,flow,history** | `O` | Open in $EDITOR |
 | **list** | `'` | Recipe picker |
 |  | `U` | Self-update check |
 | **list,detail,board,tree,history** | `V` | Cass sessions |
@@ -81,7 +81,7 @@
 |  | `h` | Collapse or jump to parent |
 |  | `l` | Expand or move to child |
 |  | `o` | Expand all nodes |
-|  | `O` | Collapse all nodes |
+|  | `Z` | Collapse all nodes |
 |  | `tab` | Toggle detail pane |
 |  | `PgUp` | Page up |
 |  | `PgDn` | Page down |
@@ -120,7 +120,8 @@
 |  | `enter` | Label drilldown |
 |  | `1-9` | Filter list by rank |
 |  | `]` | Close attention view |
-| **label** | `enter` | Filter list by label |
+| **label** | `g` | Go to top |
+|  | `enter` | Filter list by label |
 |  | `h` | Label health detail |
 |  | `d` | Label drilldown |
 |  | `v` | Velocity comparison |

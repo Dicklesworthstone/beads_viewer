@@ -327,3 +327,209 @@ func TestRecipePresentationCollapsedCrossViewNavigation(t *testing.T) {
 		}
 	}
 }
+
+func TestRecipeCycleSortPreservesRecipeAndFilterSwitchClearsRecipe(t *testing.T) {
+	base := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "api-1", Title: "API older lower prio", Status: model.StatusOpen, Priority: 2, Labels: []string{"api"}, CreatedAt: base, UpdatedAt: base.Add(3 * time.Hour)},
+		{ID: "api-2", Title: "API newer higher prio", Status: model.StatusOpen, Priority: 1, Labels: []string{"api"}, CreatedAt: base.Add(time.Hour), UpdatedAt: base.Add(time.Hour)},
+		{ID: "ui-3", Title: "Excluded UI open issue", Status: model.StatusOpen, Priority: 0, Labels: []string{"ui"}, CreatedAt: base.Add(2 * time.Hour), UpdatedAt: base.Add(2 * time.Hour)},
+		{ID: "api-4", Title: "Excluded closed API issue", Status: model.StatusClosed, Priority: 1, Labels: []string{"api"}, CreatedAt: base.Add(3 * time.Hour), UpdatedAt: base.Add(4 * time.Hour)},
+	}
+	r := &recipe.Recipe{
+		Name: "api-open",
+		Filters: recipe.FilterConfig{
+			Status: []string{"open"},
+			Tags:   []string{"api"},
+		},
+		Sort: recipe.SortConfig{
+			Field:     "id",
+			Direction: "desc",
+		},
+		View: recipe.ViewConfig{
+			Columns: []string{"id"},
+		},
+	}
+
+	m := NewModel(issues, r, "")
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+	m.Update(WaitForPhase2Cmd(m.analysis)())
+
+	send := func(key string) {
+		t.Helper()
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		m = updated.(*Model)
+	}
+
+	assertRecipeScopeIntact := func(step string) []string {
+		t.Helper()
+		got := m.FilteredIssues()
+		if len(got) != 2 {
+			t.Fatalf("%s: expected 2 recipe issues in list, got %d (%+v)", step, len(got), got)
+		}
+		ids := []string{got[0].ID, got[1].ID}
+		for _, id := range ids {
+			if id != "api-1" && id != "api-2" {
+				t.Fatalf("%s: leaked non-recipe issue %q in %v", step, id, ids)
+			}
+		}
+		if m.board.TotalCount() != 2 {
+			t.Fatalf("%s: expected 2 issues in board, got %d", step, m.board.TotalCount())
+		}
+		if m.graphView.TotalCount() != 2 {
+			t.Fatalf("%s: expected 2 issues in graph, got %d", step, m.graphView.TotalCount())
+		}
+		return ids
+	}
+
+	// Initial recipe order: id desc -> ["api-2", "api-1"]
+	if ids := assertRecipeScopeIntact("initial"); !reflect.DeepEqual(ids, []string{"api-2", "api-1"}) {
+		t.Fatalf("expected initial recipe order [api-2 api-1], got %v", ids)
+	}
+
+	// Cycle 's' through every sort mode and back to SortDefault: NEVER wipes to 0 issues!
+	// 1. SortCreatedAsc -> ["api-1", "api-2"]
+	send("s")
+	if ids := assertRecipeScopeIntact("SortCreatedAsc"); !reflect.DeepEqual(ids, []string{"api-1", "api-2"}) {
+		t.Fatalf("SortCreatedAsc order=%v, want [api-1 api-2]", ids)
+	}
+	// 2. SortCreatedDesc -> ["api-2", "api-1"]
+	send("s")
+	if ids := assertRecipeScopeIntact("SortCreatedDesc"); !reflect.DeepEqual(ids, []string{"api-2", "api-1"}) {
+		t.Fatalf("SortCreatedDesc order=%v, want [api-2 api-1]", ids)
+	}
+	// 3. SortPriority -> ["api-2" (P1), "api-1" (P2)]
+	send("s")
+	if ids := assertRecipeScopeIntact("SortPriority"); !reflect.DeepEqual(ids, []string{"api-2", "api-1"}) {
+		t.Fatalf("SortPriority order=%v, want [api-2 api-1]", ids)
+	}
+	// 4. SortUpdated -> ["api-1" (+3h), "api-2" (+1h)]
+	send("s")
+	if ids := assertRecipeScopeIntact("SortUpdated"); !reflect.DeepEqual(ids, []string{"api-1", "api-2"}) {
+		t.Fatalf("SortUpdated order=%v, want [api-1 api-2]", ids)
+	}
+	// 5. Back to SortDefault -> restores recipe's native id desc ["api-2", "api-1"]
+	send("s")
+	if m.sortMode != SortDefault {
+		t.Fatalf("expected wrap back to SortDefault, got %v", m.sortMode)
+	}
+	if ids := assertRecipeScopeIntact("SortDefault restored"); !reflect.DeepEqual(ids, []string{"api-2", "api-1"}) {
+		t.Fatalf("SortDefault restored order=%v, want [api-2 api-1]", ids)
+	}
+
+	// Switching filter via 'o', 'c', 'r' must call setActiveRecipe(nil), clearing activeRecipe,
+	// activeRecipeIssueIDs, and custom recipe columns so standard columns & excluded issues return.
+	for _, tc := range []struct {
+		key       string
+		wantCount int
+	}{
+		{key: "o", wantCount: 3}, // api-1, api-2, ui-3
+		{key: "c", wantCount: 1}, // api-4
+		{key: "r", wantCount: 3}, // api-1, api-2, ui-3 (all unblocked open)
+	} {
+		m.setActiveRecipe(r)
+		m.applyRecipe(r)
+		if strings.Contains(ansi.Strip(m.list.View()), "API newer") {
+			t.Fatalf("precondition before %q: expected custom id-only recipe columns to omit title", tc.key)
+		}
+		send(tc.key)
+		if m.activeRecipe != nil || m.activeRecipeIssueIDs != nil {
+			t.Fatalf("after %q: expected activeRecipe and activeRecipeIssueIDs cleared, got recipe=%v ids=%v",
+				tc.key, m.activeRecipe, m.activeRecipeIssueIDs)
+		}
+		if got := len(m.FilteredIssues()); got != tc.wantCount {
+			t.Fatalf("after %q: FilteredIssues()=%d, want %d", tc.key, got, tc.wantCount)
+		}
+		// Verify custom recipe column delegate (which omitted titles) was reset so titles render again
+		if !strings.Contains(ansi.Strip(m.list.View()), m.FilteredIssues()[0].Title[:8]) {
+			t.Fatalf("after %q: custom recipe delegate remained stuck; list view:\n%s", tc.key, ansi.Strip(m.list.View()))
+		}
+	}
+}
+
+func TestRecipeSelectionResetsManualSortAndSnapshotRepoScopedMaxItems(t *testing.T) {
+	base := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "web-1", Title: "Zeta web first", Status: model.StatusOpen, Priority: 0, CreatedAt: base, UpdatedAt: base},
+		{ID: "web-2", Title: "Beta web second", Status: model.StatusOpen, Priority: 0, CreatedAt: base.Add(time.Hour), UpdatedAt: base.Add(time.Hour)},
+		{ID: "api-1", Title: "Omega api lower prio", Status: model.StatusOpen, Priority: 2, CreatedAt: base.Add(2 * time.Hour), UpdatedAt: base.Add(2 * time.Hour)},
+		{ID: "api-2", Title: "Alpha api mid prio", Status: model.StatusOpen, Priority: 1, CreatedAt: base.Add(3 * time.Hour), UpdatedAt: base.Add(3 * time.Hour)},
+	}
+
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	u, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = u.(*Model)
+
+	// 1. Cycle manual sort 's' (SortCreatedAsc), then apply a custom recipe sorted by id desc:
+	// setActiveRecipe MUST reset m.sortMode to SortDefault so the recipe's own sort order wins!
+	u, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	m = u.(*Model)
+	if m.sortMode == SortDefault {
+		t.Fatal("precondition: expected 's' to leave SortDefault")
+	}
+
+	descRecipe := &recipe.Recipe{
+		Name: "id-desc-cap",
+		Filters: recipe.FilterConfig{
+			Status: []string{"open"},
+		},
+		Sort: recipe.SortConfig{
+			Field:     "id",
+			Direction: "desc",
+		},
+		View: recipe.ViewConfig{
+			MaxItems: 2,
+		},
+	}
+	m.setActiveRecipe(descRecipe)
+	m.applyRecipe(descRecipe)
+	if m.sortMode != SortDefault {
+		t.Fatalf("setActiveRecipe should reset sortMode to SortDefault, got %v", m.sortMode)
+	}
+	got := m.FilteredIssues()
+	if len(got) != 2 || got[0].ID != "web-2" || got[1].ID != "web-1" {
+		t.Fatalf("expected recipe native id-desc top 2 [web-2 web-1], got %+v", got)
+	}
+
+	// Cycle 's' again, then press 'S' (built-in triage recipe): must also reset sortMode to SortDefault.
+	u, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("s")})
+	m = u.(*Model)
+	if m.sortMode == SortDefault {
+		t.Fatal("precondition: expected 's' to change sortMode")
+	}
+	u, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("S")})
+	m = u.(*Model)
+	if m.sortMode != SortDefault {
+		t.Fatalf("pressing 'S' should reset sortMode to SortDefault, got %v", m.sortMode)
+	}
+
+	// 2. SnapshotReadyMsg with workspace activeRepos={"api": true} and recipe MaxItems=2:
+	// Pre-built snapshot ListItems contain only [web-2, web-1] (capped before repo filtering),
+	// so SnapshotReadyMsg MUST re-apply the recipe over repoScopedIssues() instead of starving "api" to 0 items!
+	m.workspaceMode = true
+	m.availableRepos = []string{"api", "web"}
+	m.activeRepos = map[string]bool{"api": true}
+	m.setActiveRecipe(descRecipe)
+	m.applyRecipe(descRecipe)
+
+	builder := NewSnapshotBuilder(issues)
+	builder.WithRecipe(descRecipe)
+	snap := builder.Build()
+	if snap.RecipeName != descRecipe.Name || len(snap.ListItems) != 2 {
+		t.Fatalf("unexpected pre-built snapshot recipe items: name=%q count=%d", snap.RecipeName, len(snap.ListItems))
+	}
+	// Pre-built snapshot items are web-2 and web-1 (repoPrefix="web"), which would starve "api" if filtered post-cap.
+	for i := range snap.ListItems {
+		snap.ListItems[i].RepoPrefix = issueRepoKey(snap.ListItems[i].Issue)
+	}
+
+	u, _ = m.Update(SnapshotReadyMsg{Snapshot: snap})
+	m = u.(*Model)
+
+	scopedGot := m.FilteredIssues()
+	if len(scopedGot) != 2 || scopedGot[0].ID != "api-2" || scopedGot[1].ID != "api-1" {
+		t.Fatalf("SnapshotReadyMsg starved active repo 'api' under MaxItems=2: got %+v, want [api-2 api-1]", scopedGot)
+	}
+}

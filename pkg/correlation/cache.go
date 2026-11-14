@@ -340,23 +340,100 @@ func hashBeads(beads []BeadInfo) string {
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
+func sortedUniqueNonEmptyStrings(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedExplicitAliasPairs(aliases map[string]string) [][2]string {
+	if len(aliases) == 0 {
+		return nil
+	}
+	norm := canonicalizeExplicitAliases(nil, aliases)
+	if len(norm) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(norm))
+	for k := range norm {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := make([][2]string, 0, len(keys))
+	for _, k := range keys {
+		pairs = append(pairs, [2]string{k, norm[k]})
+	}
+	return pairs
+}
+
+func sortedTrueMapKeys(m map[string]bool) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(m))
+	out := make([]string, 0, len(m))
+	for k, v := range m {
+		if !v || k == "" {
+			continue
+		}
+		low := strings.ToLower(k)
+		if _, ok := seen[low]; ok {
+			continue
+		}
+		seen[low] = struct{}{}
+		out = append(out, low)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
+}
+
 // hashOptions creates a hash of correlator options
 func hashOptions(opts CorrelatorOptions) string {
 	// Serialize options to JSON for consistent hashing
 	data, err := json.Marshal(struct {
-		Revision        string
-		BeadID          string
-		Since           *time.Time
-		Until           *time.Time
-		Limit           int
-		CausalityBeadID string
+		Revision               string
+		BeadID                 string
+		Since                  *time.Time
+		Until                  *time.Time
+		Limit                  int
+		CausalityBeadID        string
+		TargetBeadAliases      []string    `json:",omitempty"`
+		ExplicitIDAliases      [][2]string `json:",omitempty"`
+		AmbiguousUnprefixedIDs []string    `json:",omitempty"`
+		StoreSubtreePrefix     string      `json:",omitempty"`
+		SiblingSubtreePrefixes []string    `json:",omitempty"`
 	}{
-		Revision:        opts.Revision,
-		BeadID:          opts.BeadID,
-		Since:           opts.Since,
-		Until:           opts.Until,
-		Limit:           opts.Limit,
-		CausalityBeadID: opts.CausalityBeadID,
+		Revision:               opts.Revision,
+		BeadID:                 opts.BeadID,
+		Since:                  opts.Since,
+		Until:                  opts.Until,
+		Limit:                  opts.Limit,
+		CausalityBeadID:        opts.CausalityBeadID,
+		TargetBeadAliases:      sortedUniqueNonEmptyStrings(opts.TargetBeadAliases),
+		ExplicitIDAliases:      sortedExplicitAliasPairs(opts.ExplicitIDAliases),
+		AmbiguousUnprefixedIDs: sortedTrueMapKeys(opts.AmbiguousUnprefixedIDs),
+		StoreSubtreePrefix:     normalizeSubtreePrefix(opts.StoreSubtreePrefix),
+		SiblingSubtreePrefixes: normalizeSubtreePrefixes(opts.SiblingSubtreePrefixes),
 	})
 	if err != nil {
 		return "default"
@@ -367,13 +444,29 @@ func hashOptions(opts CorrelatorOptions) string {
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
-// cacheOptionsHash adds the actual matcher policy to extraction options. Both
-// persistent cache layers and in-memory wrappers need this identity: changing
-// --id-pattern changes the committed references without changing HEAD or beads.
-// Using the matcher's snapshot also keeps later global pattern registration
-// from changing the identity of an already-constructed correlator.
+// cacheOptionsHash adds the tracker store directory and actual matcher policy
+// to extraction options. Both persistent cache layers and in-memory wrappers
+// need this identity: changing --id-pattern, workspace aliases, subtree
+// disambiguation, or custom beads_path changes extracted references without
+// changing HEAD or beads.
 func (c *Correlator) cacheOptionsHash(opts CorrelatorOptions) string {
-	return hashOptions(opts) + ":matcher:" + c.explicit.policyFingerprint()
+	fp := ""
+	if c != nil && c.explicit != nil {
+		fp = c.explicit.policyFingerprint()
+	}
+	return hashOptions(opts) + ":store:" + c.storeDirRel() + ":matcher:" + fp
+}
+
+// artifactOptionsHash extends cacheOptionsHash with a canonical sorted digest of
+// the report's known bead ID strings (never bead Title or Status), isolating
+// persistent Layer-2 HEAD artifacts and in-memory caches across differing bead
+// ID slices while preserving Layer-2 reuse across bead metadata edits.
+func (c *Correlator) artifactOptionsHash(beads []BeadInfo, opts CorrelatorOptions) string {
+	reportFP := ""
+	if c != nil && c.explicit != nil {
+		reportFP = c.explicit.policyFingerprintWithReportOptions(opts, knownBeadIDsForReport(beads, opts))
+	}
+	return c.cacheOptionsHash(opts) + ":known:" + reportFP
 }
 
 // CachedCorrelator wraps a Correlator with caching support
@@ -394,7 +487,7 @@ func NewCachedCorrelator(repoPath string, beadsFilePath ...string) *CachedCorrel
 	correlator := NewCorrelator(repoPath, beadsFilePath...)
 	return &CachedCorrelator{
 		correlator:       correlator,
-		cache:            NewHistoryCache(repoPath),
+		cache:            NewHistoryCache(correlator.repoPath),
 		generateReportFn: correlator.GenerateReport,
 		shouldRefreshFn:  xfetch.ShouldRefresh,
 	}
@@ -406,7 +499,7 @@ func NewCachedCorrelatorWithOptions(repoPath string, maxAge time.Duration, maxSi
 	correlator := NewCorrelator(repoPath, beadsFilePath...)
 	return &CachedCorrelator{
 		correlator:       correlator,
-		cache:            NewHistoryCacheWithOptions(repoPath, maxAge, maxSize),
+		cache:            NewHistoryCacheWithOptions(correlator.repoPath, maxAge, maxSize),
 		generateReportFn: correlator.GenerateReport,
 		shouldRefreshFn:  xfetch.ShouldRefresh,
 	}
@@ -420,17 +513,14 @@ func (c *CachedCorrelator) WithFeedbackStore(store *FeedbackStore) *CachedCorrel
 	return c
 }
 
-// buildKey extends BuildCacheKey with the wrapped correlator's matcher policy
-// and feedback fingerprint. Both are inputs to the assembled report.
+// buildKey extends BuildCacheKey with the wrapped correlator's store/matcher
+// policy and feedback fingerprint. Both are inputs to the assembled report.
 func (c *CachedCorrelator) buildKey(beads []BeadInfo, opts CorrelatorOptions) (CacheKey, error) {
-	if c.correlator != nil && c.correlator.explicit != nil {
-		c.correlator.explicit.SetKnownBeadIDs(beadIDsFromInfos(beads))
-	}
 	key, err := BuildCacheKey(c.cache.repoPath, beads, opts)
 	if err != nil {
 		return CacheKey{}, err
 	}
-	key.Options = c.correlator.cacheOptionsHash(opts)
+	key.Options = c.correlator.artifactOptionsHash(beads, opts)
 	key.Feedback = c.correlator.feedbackFingerprint()
 	return key, nil
 }

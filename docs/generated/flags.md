@@ -7,6 +7,7 @@
 | `--agents-dry-run` | bool | `false` | Show what would happen without executing (use with --agents-*) | Agent File Management |
 | `--agents-force` | bool | `false` | Skip confirmation prompts (use with --agents-*) | Agent File Management |
 | `--agents-remove` | bool | `false` | Remove beads workflow instructions from AGENTS.md | Agent File Management |
+| `--agents-reset` | bool | `false` | Clear saved AGENTS.md prompt preference | Agent File Management |
 | `--agents-update` | bool | `false` | Update beads workflow instructions to latest version | Agent File Management |
 | `--agent-brief` | string | (empty) | Export agent brief bundle to directory (includes triage.json, insights.json, brief.md, helpers.md) | Export & Reporting |
 | `--debug-height` | int | `50` | Height for debug render | Export & Reporting |

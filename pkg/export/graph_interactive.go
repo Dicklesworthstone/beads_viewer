@@ -125,10 +125,19 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 	nodes := make([]graphNode, 0, len(opts.Issues))
 	links := make([]graphLink, 0)
 
-	// Create issue map for dependency lookup
-	issueMap := make(map[string]bool)
+	// Create issue map for dependency and lifecycle lookup
+	issueMap := make(map[string]bool, len(opts.Issues))
+	issueByID := make(map[string]model.Issue, len(opts.Issues))
 	for _, iss := range opts.Issues {
 		issueMap[iss.ID] = true
+		issueByID[iss.ID] = iss
+	}
+	isActiveIssue := func(id string) bool {
+		iss, ok := issueByID[id]
+		if !ok {
+			return false
+		}
+		return iss.Status != model.StatusClosed && iss.Status != model.StatusTombstone
 	}
 
 	// Get all metrics if available
@@ -160,11 +169,14 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		articulationSet[id] = true
 	}
 
-	// Build reverse dependency map (who blocks who)
+	// Build reverse dependency map (who actively blocks who)
 	blocksMap := make(map[string][]string)
 	for _, iss := range opts.Issues {
+		if !isActiveIssue(iss.ID) {
+			continue
+		}
 		for _, dep := range iss.Dependencies {
-			if dep != nil && issueMap[dep.DependsOnID] && dep.Type.IsBlocking() {
+			if dep != nil && dep.Type.IsBlocking() && isActiveIssue(dep.DependsOnID) {
 				blocksMap[dep.DependsOnID] = append(blocksMap[dep.DependsOnID], iss.ID)
 			}
 		}
@@ -172,11 +184,14 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 
 	// Build nodes with full bead data
 	for _, iss := range opts.Issues {
-		// Compute blocked_by list
+		// Compute active blocked_by list: blocking dependencies pointing to missing (!issueMap)
+		// or active (non-closed, non-tombstone) target issues, matching ReadinessIndex.
 		var blockedBy []string
-		for _, dep := range iss.Dependencies {
-			if dep != nil && issueMap[dep.DependsOnID] && dep.Type.IsBlocking() {
-				blockedBy = append(blockedBy, dep.DependsOnID)
+		if isActiveIssue(iss.ID) {
+			for _, dep := range iss.Dependencies {
+				if dep != nil && dep.Type.IsBlocking() && (!issueMap[dep.DependsOnID] || isActiveIssue(dep.DependsOnID)) {
+					blockedBy = append(blockedBy, dep.DependsOnID)
+				}
 			}
 		}
 
@@ -275,8 +290,8 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			if dep == nil || !issueMap[dep.DependsOnID] {
 				continue
 			}
-			// Only mark as critical if we have stats AND both ends have zero slack
-			isCritical := opts.Stats != nil && slack[iss.ID] == 0 && slack[dep.DependsOnID] == 0
+			// Only mark as critical if blocking between active issues, we have stats, AND both ends have zero slack
+			isCritical := dep.Type.IsBlocking() && isActiveIssue(iss.ID) && isActiveIssue(dep.DependsOnID) && opts.Stats != nil && slack[iss.ID] == 0 && slack[dep.DependsOnID] == 0
 			link := graphLink{
 				Source:   iss.ID,
 				Target:   dep.DependsOnID,

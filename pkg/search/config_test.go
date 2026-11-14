@@ -1,7 +1,9 @@
 package search
 
 import (
+	"context"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -325,6 +327,82 @@ func TestSearchConfigFromEnv_PresetImpliesHybrid(t *testing.T) {
 	os.Setenv(EnvSearchMode, string(SearchModeText))
 	if _, err := SearchConfigFromEnv(); err == nil {
 		t.Fatal("BV_SEARCH_MODE=text with a hybrid preset must be rejected")
+	}
+}
+
+func TestSearchConfigFromEnv_WeightsImpliesHybridAndRejectsExplicitText(t *testing.T) {
+	restore := saveSearchEnv()
+	t.Cleanup(restore)
+
+	validWeights := `{"text":0.4,"pagerank":0.2,"status":0.15,"impact":0.1,"priority":0.1,"recency":0.05}`
+
+	os.Unsetenv(EnvSearchMode)
+	os.Unsetenv(EnvSearchPreset)
+	os.Setenv(EnvSearchWeights, validWeights)
+
+	cfg, err := SearchConfigFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error for weights without explicit mode: %v", err)
+	}
+	if cfg.Mode != SearchModeHybrid {
+		t.Fatalf("expected weights alone to auto-upgrade mode to hybrid, got %q", cfg.Mode)
+	}
+	if !cfg.HasWeights {
+		t.Fatal("expected HasWeights=true")
+	}
+
+	// Explicit BV_SEARCH_MODE=text alongside BV_SEARCH_WEIGHTS is a contradiction.
+	os.Setenv(EnvSearchMode, string(SearchModeText))
+	if _, err := SearchConfigFromEnv(); err == nil {
+		t.Fatal("expected error when BV_SEARCH_MODE=text is combined with BV_SEARCH_WEIGHTS")
+	}
+}
+
+func TestNewEmbedderFromConfig_ModelDistinctEmbeddings(t *testing.T) {
+	ctx := context.Background()
+	texts := []string{"authentication token refresh bug"}
+
+	embDefault, err := NewEmbedderFromConfig(EmbeddingConfig{Provider: ProviderHash, Dim: 64})
+	if err != nil {
+		t.Fatalf("default embedder: %v", err)
+	}
+	embDirect := NewHashEmbedder(64)
+
+	embModelA, err := NewEmbedderFromConfig(EmbeddingConfig{Provider: ProviderHash, Model: "model-alpha", Dim: 64})
+	if err != nil {
+		t.Fatalf("model-alpha embedder: %v", err)
+	}
+	embModelB, err := NewEmbedderFromConfig(EmbeddingConfig{Provider: ProviderHash, Model: "model-beta", Dim: 64})
+	if err != nil {
+		t.Fatalf("model-beta embedder: %v", err)
+	}
+
+	vDefault, err := embDefault.Embed(ctx, texts)
+	if err != nil {
+		t.Fatalf("embed default: %v", err)
+	}
+	vDirect, err := embDirect.Embed(ctx, texts)
+	if err != nil {
+		t.Fatalf("embed direct: %v", err)
+	}
+	if !reflect.DeepEqual(vDefault, vDirect) {
+		t.Fatal("empty-model embedder must match NewHashEmbedder bit-for-bit")
+	}
+
+	vA, err := embModelA.Embed(ctx, texts)
+	if err != nil {
+		t.Fatalf("embed model-alpha: %v", err)
+	}
+	vB, err := embModelB.Embed(ctx, texts)
+	if err != nil {
+		t.Fatalf("embed model-beta: %v", err)
+	}
+
+	if reflect.DeepEqual(vDefault, vA) {
+		t.Fatal("expected non-empty BV_SEMANTIC_MODEL to produce distinct embeddings from default")
+	}
+	if reflect.DeepEqual(vA, vB) {
+		t.Fatal("expected distinct BV_SEMANTIC_MODEL values to produce distinct embeddings")
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	json "github.com/goccy/go-json"
@@ -42,13 +43,55 @@ type Correlator struct {
 // the correct beads file; variadic form preserves compatibility with older
 // single-argument callers.
 func NewCorrelator(repoPath string, beadsFilePath ...string) *Correlator {
+	var explicitPath string
+	if len(beadsFilePath) > 0 {
+		explicitPath = beadsFilePath[0]
+	}
+	gitRoot := repoPath
+	if found, err := FindGitRoot(repoPath); err == nil {
+		gitRoot = found
+	}
+	absRepo := repoPath
+	if abs, err := filepath.Abs(repoPath); err == nil {
+		absRepo = filepath.Clean(abs)
+	}
+	if gitRoot != repoPath && filepath.Clean(gitRoot) != absRepo {
+		if explicitPath != "" && !filepath.IsAbs(explicitPath) {
+			subCandidate := filepath.Join(repoPath, explicitPath)
+			rootCandidate := filepath.Join(gitRoot, explicitPath)
+			if pathExists(subCandidate) || !pathExists(rootCandidate) {
+				explicitPath = subCandidate
+			}
+		} else if explicitPath == "" {
+			if info, err := os.Stat(filepath.Join(repoPath, ".beads")); err == nil && info.IsDir() {
+				picked := pickBeadsFiles(repoPath, defaultBeadsFiles)
+				if len(picked) > 0 {
+					explicitPath = filepath.Join(repoPath, filepath.FromSlash(picked[0]))
+				}
+			}
+		}
+	}
+	var extractor *Extractor
+	if explicitPath != "" {
+		extractor = NewExtractor(gitRoot, explicitPath)
+	} else {
+		extractor = NewExtractor(gitRoot)
+	}
+	storeDirRel := extractor.effectiveStoreDirRel()
 	return &Correlator{
-		repoPath:    repoPath,
-		extractor:   NewExtractor(repoPath, beadsFilePath...),
-		coCommitter: NewCoCommitExtractor(repoPath),
-		explicit:    NewExplicitMatcher(repoPath),
+		repoPath:    gitRoot,
+		extractor:   extractor,
+		coCommitter: NewCoCommitExtractor(gitRoot).WithStoreDir(storeDirRel),
+		explicit:    NewExplicitMatcher(gitRoot),
 		scorer:      NewScorer(),
 	}
+}
+
+func (c *Correlator) storeDirRel() string {
+	if c == nil || c.extractor == nil {
+		return ""
+	}
+	return c.extractor.effectiveStoreDirRel()
 }
 
 // WithContext binds ctx to the correlator and its underlying extractors so
@@ -91,12 +134,17 @@ func (c *Correlator) feedbackFingerprint() string {
 
 // CorrelatorOptions controls how the history report is generated
 type CorrelatorOptions struct {
-	Revision        string     // Resolved commit to walk from (empty = HEAD)
-	BeadID          string     // Filter to single bead ID (empty = all)
-	Since           *time.Time // Only events after this time
-	Until           *time.Time // Only events before this time
-	Limit           int        // Max commits to process (0 = no limit)
-	CausalityBeadID string     // Capture full committed dependency authority for this target only
+	Revision               string            // Resolved commit to walk from (empty = HEAD)
+	BeadID                 string            // Filter to single bead ID (empty = all)
+	Since                  *time.Time        // Only events after this time
+	Until                  *time.Time        // Only events before this time
+	Limit                  int               // Max commits to process (0 = no limit)
+	CausalityBeadID        string            // Capture full committed dependency authority for this target only
+	TargetBeadAliases      []string          // Optional alternate local IDs for BeadID/CausalityBeadID (e.g. both "99" and "api-99" for deleted workspace targets)
+	ExplicitIDAliases      map[string]string // Optional commit-message token -> canonical local BeadID (e.g. "api-1" -> "1", "api-bd-1" -> "bd-1")
+	AmbiguousUnprefixedIDs map[string]bool   // Optional unprefixed local IDs that collide across sibling stores sharing .git
+	StoreSubtreePrefix     string            // Optional slash-normalized subtree prefix for this store (e.g. "services/api/")
+	SiblingSubtreePrefixes []string          // Optional slash-normalized subtree prefixes of sibling stores when StoreSubtreePrefix == ""
 }
 
 // historyArtifactFormatVersion is the schema version of historyArtifact. The
@@ -212,17 +260,26 @@ func (a *historyArtifact) UnmarshalJSON(b []byte) error {
 // extractHistoryArtifact runs ONLY the HEAD/options-dependent extraction steps
 // (git history walk + the three correlation strategies).
 func (c *Correlator) extractHistoryArtifact(opts CorrelatorOptions) (*historyArtifact, error) {
-	art, _, err := c.extractHistoryArtifactWithWalk(opts)
+	return c.extractHistoryArtifactForBeads(nil, opts)
+}
+
+func (c *Correlator) extractHistoryArtifactForBeads(beads []BeadInfo, opts CorrelatorOptions) (*historyArtifact, error) {
+	art, _, err := c.extractHistoryArtifactWithWalkForBeads(beads, opts)
 	return art, err
 }
 
 func (c *Correlator) extractHistoryArtifactWithWalk(opts CorrelatorOptions) (*historyArtifact, []walkedCommit, error) {
+	return c.extractHistoryArtifactWithWalkForBeads(nil, opts)
+}
+
+func (c *Correlator) extractHistoryArtifactWithWalkForBeads(beads []BeadInfo, opts CorrelatorOptions) (*historyArtifact, []walkedCommit, error) {
 	extractOpts := ExtractOptions{
-		Revision: opts.Revision,
-		Since:    opts.Since,
-		Until:    opts.Until,
-		Limit:    opts.Limit,
-		BeadID:   opts.BeadID,
+		Revision:      opts.Revision,
+		Since:         opts.Since,
+		Until:         opts.Until,
+		Limit:         opts.Limit,
+		BeadID:        opts.BeadID,
+		BeadIDAliases: opts.TargetBeadAliases,
 	}
 	art := &historyArtifact{FormatVersion: historyArtifactFormatVersion}
 	if opts.CausalityBeadID != "" {
@@ -263,10 +320,11 @@ func (c *Correlator) extractHistoryArtifactWithWalk(opts CorrelatorOptions) (*hi
 	art.WalkedCommits = len(walk)
 
 	// Strategy 2: explicit_id — bead ids referenced in commit messages.
-	// Combine live known IDs on c.explicit with historical JSONL event IDs.
+	// Combine caller-configured IDs on c.explicit, report beads/targets,
+	// ExplicitIDAliases, and historical JSONL event IDs without mutating c.explicit.
 	start = time.Now()
-	matcher := c.explicit.withMergedKnownIDs(beadIDsFromEvents(events))
-	explicit, err := c.extractExplicitCommitsWithMatcher(matcher, walk, opts.BeadID)
+	matcher := c.explicit.withReportOptions(opts, knownBeadIDsForReport(beads, opts), beadIDsFromEvents(events))
+	explicit, err := c.extractExplicitCommitsWithOptions(matcher, walk, opts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("extracting explicit-id commits: %w", err)
 	}
@@ -279,10 +337,10 @@ func (c *Correlator) extractHistoryArtifactWithWalk(opts CorrelatorOptions) (*hi
 	// Strategy 3: temporal_author — the claimant's code commits inside the
 	// bead's active window. Precedence against explicit-ID links is resolved
 	// at assembly (mergeStrategyCommits), once it is known which referenced
-	// beads actually exist; pure .beads/-only commits are excluded here while
-	// mixed code + .beads/ commits are admitted.
+	// beads actually exist; pure tracker-only commits are excluded here while
+	// mixed code + tracker commits are admitted.
 	start = time.Now()
-	temporal, err := c.extractTemporalCandidates(events, walk, opts.BeadID)
+	temporal, err := c.extractTemporalCandidatesWithOptions(events, walk, opts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("extracting temporal candidates: %w", err)
 	}
@@ -318,13 +376,21 @@ func (c *Correlator) extractExplicitCommits(walk []walkedCommit, beadFilter stri
 }
 
 func (c *Correlator) extractExplicitCommitsWithMatcher(matcher *ExplicitMatcher, walk []walkedCommit, beadFilter string) ([]CorrelatedCommit, error) {
+	return c.extractExplicitCommitsWithOptions(matcher, walk, CorrelatorOptions{BeadID: beadFilter})
+}
+
+func (c *Correlator) extractExplicitCommitsWithOptions(matcher *ExplicitMatcher, walk []walkedCommit, opts CorrelatorOptions) ([]CorrelatedCommit, error) {
 	if matcher == nil {
 		matcher = c.explicit
 	}
-	matches := matcher.MatchWalkedCommits(walk, beadFilter)
+	matches := matcher.MatchWalkedCommitsFiltered(walk, opts.BeadID, opts.TargetBeadAliases)
 	if len(matches) == 0 {
 		return nil, nil
 	}
+	storeDirRel := c.storeDirRel()
+	normStorePrefix := normalizeSubtreePrefix(opts.StoreSubtreePrefix)
+	normSiblingPrefixes := normalizeSubtreePrefixes(opts.SiblingSubtreePrefixes)
+
 	walkBySHA := make(map[string]walkedCommit, len(walk))
 	for _, wc := range walk {
 		walkBySHA[wc.SHA] = wc
@@ -334,8 +400,13 @@ func (c *Correlator) extractExplicitCommitsWithMatcher(matcher *ExplicitMatcher,
 	queued := make(map[string]struct{}, len(matches))
 	for _, m := range matches {
 		wc, ok := walkBySHA[m.CommitSHA]
-		if ok && (len(wc.Files) == 0 || wc.beadsOnly()) {
+		if ok && (len(wc.Files) == 0 || wc.trackerOnly(storeDirRel)) {
 			continue
+		}
+		if ok && !m.qualifiedAlias && isAmbiguousUnprefixedID(opts.AmbiguousUnprefixedIDs, m.BeadID) {
+			if !commitMatchesStoreSubtree(wc.Files, storeDirRel, normStorePrefix, normSiblingPrefixes) {
+				continue
+			}
 		}
 		filteredMatches = append(filteredMatches, m)
 		if _, dup := queued[m.CommitSHA]; !dup {
@@ -355,7 +426,7 @@ func (c *Correlator) extractExplicitCommitsWithMatcher(matcher *ExplicitMatcher,
 		if len(cc.Files) == 0 {
 			if wc, ok := walkBySHA[m.CommitSHA]; ok {
 				for _, f := range wc.Files {
-					if len(f) >= 7 && f[:7] == ".beads/" {
+					if isTrackerPath(f, storeDirRel) || isExcludedPath(f) {
 						continue
 					}
 					cc.Files = append(cc.Files, FileChange{Path: f, Action: "M"})
@@ -370,15 +441,102 @@ func (c *Correlator) extractExplicitCommitsWithMatcher(matcher *ExplicitMatcher,
 	return commits, nil
 }
 
+func isAmbiguousUnprefixedID(ambiguous map[string]bool, id string) bool {
+	if len(ambiguous) == 0 || id == "" {
+		return false
+	}
+	if ambiguous[id] {
+		return true
+	}
+	return ambiguous[strings.ToLower(id)]
+}
+
+func normalizeSubtreePrefix(prefix string) string {
+	clean := normalizeRepoSlashPath(prefix)
+	if clean == "" || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+		return ""
+	}
+	return clean + "/"
+}
+
+func normalizeSubtreePrefixes(prefixes []string) []string {
+	if len(prefixes) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(prefixes))
+	out := make([]string, 0, len(prefixes))
+	for _, p := range prefixes {
+		norm := normalizeSubtreePrefix(p)
+		if norm == "" {
+			continue
+		}
+		if _, ok := seen[norm]; ok {
+			continue
+		}
+		seen[norm] = struct{}{}
+		out = append(out, norm)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
+}
+
+func commitMatchesStoreSubtree(files []string, storeDirRel, normStorePrefix string, normSiblingPrefixes []string) bool {
+	if normStorePrefix == "" && len(normSiblingPrefixes) == 0 {
+		return true
+	}
+	var nonTracker []string
+	for _, f := range files {
+		if isTrackerPath(f, storeDirRel) {
+			continue
+		}
+		clean := normalizeRepoSlashPath(f)
+		if clean == "" || clean == "." {
+			continue
+		}
+		nonTracker = append(nonTracker, clean)
+	}
+	if len(nonTracker) == 0 {
+		return false
+	}
+	if normStorePrefix != "" {
+		for _, nf := range nonTracker {
+			if strings.HasPrefix(nf, normStorePrefix) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, nf := range nonTracker {
+		inSibling := false
+		for _, sib := range normSiblingPrefixes {
+			if strings.HasPrefix(nf, sib) {
+				inSibling = true
+				break
+			}
+		}
+		if !inSibling {
+			return true
+		}
+	}
+	return false
+}
+
 // extractTemporalCandidates finds, for every bead with a claimed→closed
 // window, the walked commits by the claimant inside that window that (a) are
-// not pure .beads/-only tracker bookkeeping commits and (b) changed at least
-// one code file.
+// not pure tracker-only bookkeeping commits and (b) changed at least one code file.
 func (c *Correlator) extractTemporalCandidates(events []BeadEvent, walk []walkedCommit, beadFilter string) ([]temporalCandidate, error) {
-	windows := temporalWindowsFromEvents(events, beadFilter)
+	return c.extractTemporalCandidatesWithOptions(events, walk, CorrelatorOptions{BeadID: beadFilter})
+}
+
+func (c *Correlator) extractTemporalCandidatesWithOptions(events []BeadEvent, walk []walkedCommit, opts CorrelatorOptions) ([]temporalCandidate, error) {
+	windows := temporalWindowsFromEvents(events, opts.BeadID, opts.TargetBeadAliases...)
 	if len(windows) == 0 {
 		return nil, nil
 	}
+	storeDirRel := c.storeDirRel()
 
 	type pair struct {
 		window TemporalWindow
@@ -389,7 +547,7 @@ func (c *Correlator) extractTemporalCandidates(events []BeadEvent, walk []walked
 	queued := make(map[string]struct{})
 	for _, w := range windows {
 		for _, wc := range walk {
-			if len(wc.Files) == 0 || wc.beadsOnly() || !commitInWindow(w, wc) {
+			if len(wc.Files) == 0 || wc.trackerOnly(storeDirRel) || !commitInWindow(w, wc) {
 				continue
 			}
 			pairs = append(pairs, pair{window: w, commit: wc})
@@ -440,14 +598,27 @@ func (c *Correlator) extractTemporalCandidates(events []BeadEvent, walk []walked
 
 // GenerateReport generates a complete history report
 func (c *Correlator) GenerateReport(beads []BeadInfo, opts CorrelatorOptions) (*HistoryReport, error) {
-	if c.explicit != nil {
-		c.explicit.SetKnownBeadIDs(beadIDsFromInfos(beads))
-	}
-	art, err := c.extractHistoryArtifact(opts)
+	art, err := c.extractHistoryArtifactForBeads(beads, opts)
 	if err != nil {
 		return nil, err
 	}
 	return c.assembleReport(beads, opts, art), nil
+}
+
+func knownBeadIDsForReport(beads []BeadInfo, opts CorrelatorOptions) []string {
+	ids := beadIDsFromInfos(beads)
+	if opts.BeadID != "" {
+		ids = append(ids, opts.BeadID)
+	}
+	if opts.CausalityBeadID != "" && opts.CausalityBeadID != opts.BeadID {
+		ids = append(ids, opts.CausalityBeadID)
+	}
+	for _, alias := range opts.TargetBeadAliases {
+		if alias != "" {
+			ids = append(ids, alias)
+		}
+	}
+	return ids
 }
 
 func beadIDsFromInfos(beads []BeadInfo) []string {
@@ -482,20 +653,24 @@ func (c *Correlator) assembleReport(beads []BeadInfo, opts CorrelatorOptions, ar
 	events := art.Events
 	commits := art.Commits
 
-	// Build bead histories from the co-commit strategy, then merge the
+	// Build bead histories from the co-commit strategy, synthesize targeted
+	// deleted/tombstoned beads that have real git evidence, then merge the
 	// explicit-ID and temporal strategies per (commit, bead).
 	histories := c.buildHistories(beads, events, commits)
-	c.mergeStrategyCommits(histories, beads, art)
+	c.synthesizeTargetHistories(histories, opts, art)
+	c.mergeStrategyCommitsWithOptions(histories, beads, opts, art)
 
 	// Honor stored confirm/reject feedback before anything derives from the
 	// commit lists (index, stats).
 	feedbackApplied := c.applyFeedback(histories)
 
-	// Apply bead filter if specified
+	// Apply bead filter if specified (retaining opts.BeadID and any matching TargetBeadAliases)
 	if opts.BeadID != "" {
 		filtered := make(map[string]BeadHistory)
-		if h, ok := histories[opts.BeadID]; ok {
-			filtered[opts.BeadID] = h
+		for _, id := range reportFilterTargetIDs(opts.BeadID, opts.TargetBeadAliases) {
+			if h, ok := histories[id]; ok {
+				filtered[id] = h
+			}
 		}
 		histories = filtered
 	}
@@ -649,22 +824,222 @@ func dedupCommits(commits []CorrelatedCommit) []CorrelatedCommit {
 // subject mentioning bv-9999). Commits end up in chronological order (ties
 // keep strategy precedence: co_committed, explicit_id, temporal_author) and
 // LastAuthor is recomputed from that order.
+func reportSynthesisTargets(opts CorrelatorOptions) []string {
+	if opts.BeadID == "" && opts.CausalityBeadID == "" {
+		return nil
+	}
+	seen := make(map[string]struct{}, 2+len(opts.TargetBeadAliases))
+	var targets []string
+	add := func(id string) {
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		targets = append(targets, id)
+	}
+	add(opts.BeadID)
+	add(opts.CausalityBeadID)
+	for _, alias := range opts.TargetBeadAliases {
+		add(alias)
+	}
+	return targets
+}
+
+func reportFilterTargetIDs(primary string, aliases []string) []string {
+	if primary == "" {
+		return nil
+	}
+	seen := make(map[string]struct{}, 1+len(aliases))
+	out := make([]string, 0, 1+len(aliases))
+	out = append(out, primary)
+	seen[primary] = struct{}{}
+	for _, alias := range aliases {
+		if alias == "" {
+			continue
+		}
+		if _, ok := seen[alias]; ok {
+			continue
+		}
+		seen[alias] = struct{}{}
+		out = append(out, alias)
+	}
+	return out
+}
+
+func resolveUniqueTargetGroupID(histories map[string]BeadHistory, opts CorrelatorOptions) (map[string]struct{}, string) {
+	targets := reportSynthesisTargets(opts)
+	if len(targets) <= 1 {
+		return nil, ""
+	}
+	group := make(map[string]struct{}, len(targets))
+	existing := ""
+	existingCount := 0
+	for _, id := range targets {
+		group[id] = struct{}{}
+		if _, ok := histories[id]; ok {
+			existing = id
+			existingCount++
+		}
+	}
+	if existingCount != 1 {
+		return group, ""
+	}
+	return group, existing
+}
+
+// synthesizeTargetHistories synthesizes BeadHistory entries for explicitly
+// requested targets (opts.BeadID, opts.CausalityBeadID, and opts.TargetBeadAliases)
+// that are absent from live beads (e.g. tombstoned or deleted in git) when
+// tracker-derived git evidence exists. Unfiltered reports and nonexistent target
+// IDs with zero tracker evidence are never synthesized.
+func (c *Correlator) synthesizeTargetHistories(histories map[string]BeadHistory, opts CorrelatorOptions, art *historyArtifact) {
+	if art == nil {
+		return
+	}
+	targets := reportSynthesisTargets(opts)
+	if len(targets) == 0 {
+		return
+	}
+
+	for _, targetID := range targets {
+		if _, exists := histories[targetID]; exists {
+			continue
+		}
+
+		eventsForTarget := []BeadEvent{}
+		for _, ev := range art.Events {
+			if ev.BeadID == targetID {
+				eventsForTarget = append(eventsForTarget, ev)
+			}
+		}
+
+		coCommitsForTarget := []CorrelatedCommit{}
+		for _, cc := range art.Commits {
+			if cc.BeadID == targetID {
+				coCommitsForTarget = append(coCommitsForTarget, cc)
+			}
+		}
+
+		hasCausalObs := false
+		if art.CausalHistory != nil && art.CausalHistory.BeadID == targetID {
+			for _, obs := range art.CausalHistory.Observations {
+				if (obs.Before.Known && obs.Before.Issue != nil) || (obs.After.Known && obs.After.Issue != nil) {
+					hasCausalObs = true
+					break
+				}
+			}
+		}
+
+		// Require tracker-derived git evidence (.beads/ events, co-commits, or causal snapshots)
+		// so a nonexistent target ID that merely matches a word in a commit message never
+		// fabricates a synthetic BeadHistory; explicit commits still attach in mergeStrategyCommits.
+		if len(eventsForTarget) == 0 && len(coCommitsForTarget) == 0 && !hasCausalObs {
+			continue
+		}
+
+		title := ""
+		lastAfterStatus := ""
+		for _, ev := range eventsForTarget {
+			if ev.Before != nil && ev.Before.Title != "" {
+				title = ev.Before.Title
+			}
+			if ev.After != nil {
+				if ev.After.Title != "" {
+					title = ev.After.Title
+				}
+				if ev.After.Status != "" {
+					lastAfterStatus = ev.After.Status
+				}
+			}
+		}
+		if title == "" && art.CausalHistory != nil && art.CausalHistory.BeadID == targetID {
+			for _, obs := range art.CausalHistory.Observations {
+				if obs.Before.Issue != nil && obs.Before.Issue.Title != "" {
+					title = obs.Before.Issue.Title
+				}
+				if obs.After.Issue != nil && obs.After.Issue.Title != "" {
+					title = obs.After.Issue.Title
+				}
+			}
+		}
+		if title == "" {
+			title = targetID
+		}
+
+		status := "deleted"
+		if len(eventsForTarget) > 0 {
+			lastEv := eventsForTarget[len(eventsForTarget)-1]
+			switch {
+			case lastEv.EventType == EventDeleted:
+				status = "deleted"
+			case lastEv.After != nil && lastEv.After.Status == "tombstone":
+				status = "tombstone"
+			case lastAfterStatus != "":
+				status = lastAfterStatus
+			}
+		} else if art.CausalHistory != nil && art.CausalHistory.BeadID == targetID && len(art.CausalHistory.Observations) > 0 {
+			lastObs := art.CausalHistory.Observations[len(art.CausalHistory.Observations)-1]
+			if lastObs.After.Known && lastObs.After.Issue != nil && lastObs.After.Issue.Status != "" {
+				status = lastObs.After.Issue.Status
+			}
+		}
+
+		deduped := dedupCommits(coCommitsForTarget)
+		milestones := GetBeadMilestones(eventsForTarget)
+		history := BeadHistory{
+			BeadID:     targetID,
+			Title:      title,
+			Status:     status,
+			Events:     eventsForTarget,
+			Commits:    deduped,
+			Milestones: milestones,
+			CycleTime:  CalculateCycleTime(milestones),
+		}
+		if len(history.Commits) > 0 {
+			history.LastAuthor = history.Commits[len(history.Commits)-1].Author
+		} else if len(history.Events) > 0 {
+			history.LastAuthor = history.Events[len(history.Events)-1].Author
+		}
+		histories[targetID] = history
+	}
+}
+
 func (c *Correlator) mergeStrategyCommits(histories map[string]BeadHistory, beads []BeadInfo, art *historyArtifact) {
-	titles := make(map[string]string, len(beads))
+	c.mergeStrategyCommitsWithOptions(histories, beads, CorrelatorOptions{}, art)
+}
+
+func (c *Correlator) mergeStrategyCommitsWithOptions(histories map[string]BeadHistory, beads []BeadInfo, opts CorrelatorOptions, art *historyArtifact) {
+	titles := make(map[string]string, len(histories)+len(beads))
+	for id, h := range histories {
+		titles[id] = h.Title
+	}
 	for _, b := range beads {
 		titles[b.ID] = b.Title
 	}
+	targetGroup, uniqueTarget := resolveUniqueTargetGroupID(histories, opts)
 	explicitByBead := make(map[string][]CorrelatedCommit)
 	explicitBeadsBySHA := make(map[string]map[string]struct{})
 	for _, cc := range art.Explicit {
-		if _, known := histories[cc.BeadID]; !known {
-			continue
+		beadID := cc.BeadID
+		if _, known := histories[beadID]; !known {
+			if uniqueTarget != "" {
+				if _, inGroup := targetGroup[beadID]; inGroup {
+					beadID = uniqueTarget
+					cc.BeadID = uniqueTarget
+				}
+			}
+			if _, knownAfter := histories[beadID]; !knownAfter {
+				continue
+			}
 		}
-		explicitByBead[cc.BeadID] = append(explicitByBead[cc.BeadID], cc)
+		explicitByBead[beadID] = append(explicitByBead[beadID], cc)
 		if explicitBeadsBySHA[cc.SHA] == nil {
 			explicitBeadsBySHA[cc.SHA] = make(map[string]struct{})
 		}
-		explicitBeadsBySHA[cc.SHA][cc.BeadID] = struct{}{}
+		explicitBeadsBySHA[cc.SHA][beadID] = struct{}{}
 	}
 	temporalByBead := make(map[string][]CorrelatedCommit)
 	for _, cand := range art.Temporal {
@@ -938,34 +1313,68 @@ func (c *Correlator) calculateDataHash(beads []BeadInfo) string {
 	return hashBeads(beads)
 }
 
-// ValidateRepository checks if the repository is valid for correlation
-func ValidateRepository(repoPath string) error {
-	// Check if git directory exists
-	gitDir := filepath.Join(repoPath, ".git")
-	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+// FindGitRoot walks upward from startPath (starting at filepath.Dir if startPath
+// is an existing regular file) until it finds a directory containing ".git" (a
+// normal .git directory or a worktree/submodule .git file).
+func FindGitRoot(startPath string) (string, error) {
+	if strings.TrimSpace(startPath) == "" {
+		return "", fmt.Errorf("not a git repository: empty path")
+	}
+	abs, err := filepath.Abs(startPath)
+	if err != nil {
+		return "", fmt.Errorf("resolving path %s: %w", startPath, err)
+	}
+	dir := filepath.Clean(abs)
+	if info, statErr := os.Stat(dir); statErr == nil && !info.IsDir() {
+		dir = filepath.Dir(dir)
+	} else if statErr != nil && os.IsNotExist(statErr) {
+		return "", fmt.Errorf("not a git repository: %s", startPath)
+	}
+
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return filepath.Clean(dir), nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("not a git repository: %s", startPath)
+		}
+		dir = parent
+	}
+}
+
+// ValidateRepositoryWithBeadsDir checks that repoPath lies inside a git
+// repository (walking upward via FindGitRoot) and that beadsDir (or
+// filepath.Join(repoPath, ".beads") when beadsDir == "") contains at least one
+// recognized Beads store file.
+func ValidateRepositoryWithBeadsDir(repoPath, beadsDir string) error {
+	if _, err := FindGitRoot(repoPath); err != nil {
 		return fmt.Errorf("not a git repository: %s", repoPath)
 	}
 
-	// Check if any beads file exists (multiple possible names, including SQLite-backed workspaces)
-	beadsFiles := []string{
-		filepath.Join(repoPath, ".beads", "issues.jsonl"),
-		filepath.Join(repoPath, ".beads", "beads.jsonl"),
-		filepath.Join(repoPath, ".beads", "beads.base.jsonl"),
-		filepath.Join(repoPath, ".beads", "beads.db"),
-		filepath.Join(repoPath, ".beads", "metadata.json"),
+	targetBeadsDir := beadsDir
+	if targetBeadsDir == "" {
+		targetBeadsDir = filepath.Join(repoPath, ".beads")
 	}
 
-	found := false
+	beadsFiles := []string{
+		filepath.Join(targetBeadsDir, "issues.jsonl"),
+		filepath.Join(targetBeadsDir, "beads.jsonl"),
+		filepath.Join(targetBeadsDir, "beads.base.jsonl"),
+		filepath.Join(targetBeadsDir, "beads.db"),
+		filepath.Join(targetBeadsDir, "metadata.json"),
+	}
+
 	for _, f := range beadsFiles {
 		if _, err := os.Stat(f); err == nil {
-			found = true
-			break
+			return nil
 		}
 	}
 
-	if !found {
-		return fmt.Errorf("no beads file found in %s/.beads/", repoPath)
-	}
+	return fmt.Errorf("no beads file found in %s", targetBeadsDir)
+}
 
-	return nil
+// ValidateRepository checks if the repository is valid for correlation
+func ValidateRepository(repoPath string) error {
+	return ValidateRepositoryWithBeadsDir(repoPath, "")
 }

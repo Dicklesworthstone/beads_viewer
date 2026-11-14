@@ -44,7 +44,41 @@ function daysSince(updatedAt) {
   return (Date.now() - ts) / (1000 * 60 * 60 * 24);
 }
 
-async function initHybridWasmScorer(issueCount) {
+async function resolveHasHybridWasm(metaOverride) {
+  const pickFlag = (m) => {
+    if (!m || typeof m !== 'object') return undefined;
+    if (typeof m.has_hybrid_wasm === 'boolean') return m.has_hybrid_wasm;
+    if (m.has_hybrid_wasm === 'true') return true;
+    if (m.has_hybrid_wasm === 'false') return false;
+    return undefined;
+  };
+
+  const direct = pickFlag(metaOverride)
+    ?? pickFlag(typeof window !== 'undefined' ? window.BV_META : null)
+    ?? pickFlag(typeof window !== 'undefined' ? window.beadsViewer?.getMeta?.() : null);
+  if (direct !== undefined) {
+    return direct;
+  }
+
+  if (typeof fetch === 'function') {
+    try {
+      const resp = await fetch('./data/meta.json');
+      if (resp.ok) {
+        const json = await resp.json();
+        if (typeof window !== 'undefined') {
+          window.BV_META = json;
+        }
+        return json?.has_hybrid_wasm === true || json?.has_hybrid_wasm === 'true';
+      }
+    } catch (_err) {
+      // Ignore metadata fetch errors; treat optional hybrid WASM as absent
+    }
+  }
+
+  return false;
+}
+
+async function initHybridWasmScorer(issueCount, meta = null) {
   if (HybridWasmCtor) {
     HYBRID_WASM_STATE.ready = true;
     return true;
@@ -62,6 +96,12 @@ async function initHybridWasmScorer(issueCount) {
 
   if (typeof WebAssembly !== 'object') {
     HYBRID_WASM_STATE.reason = 'WebAssembly not available';
+    return false;
+  }
+
+  const hasHybridWasm = await resolveHasHybridWasm(meta);
+  if (hasHybridWasm !== true) {
+    HYBRID_WASM_STATE.reason = 'Optional hybrid WASM module not bundled';
     return false;
   }
 

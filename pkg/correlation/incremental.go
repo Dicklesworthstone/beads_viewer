@@ -75,9 +75,10 @@ func (ic *IncrementalCorrelator) WithFeedbackStore(store *FeedbackStore) *Increm
 // NewIncrementalCorrelator creates a correlator with incremental update support.
 // beadsFilePath is optional and forwarded to the underlying correlator.
 func NewIncrementalCorrelator(repoPath string, beadsFilePath ...string) *IncrementalCorrelator {
+	correlator := NewCorrelator(repoPath, beadsFilePath...)
 	return &IncrementalCorrelator{
-		correlator: NewCorrelator(repoPath, beadsFilePath...),
-		cache:      NewHistoryCache(repoPath),
+		correlator: correlator,
+		cache:      NewHistoryCache(correlator.repoPath),
 		rawStates:  make(map[string]*incrementalRawState),
 	}
 }
@@ -85,9 +86,10 @@ func NewIncrementalCorrelator(repoPath string, beadsFilePath ...string) *Increme
 // NewIncrementalCorrelatorWithOptions creates a correlator with custom cache settings.
 // beadsFilePath is optional and forwarded to the underlying correlator.
 func NewIncrementalCorrelatorWithOptions(repoPath string, maxAge time.Duration, maxSize int, beadsFilePath ...string) *IncrementalCorrelator {
+	correlator := NewCorrelator(repoPath, beadsFilePath...)
 	return &IncrementalCorrelator{
-		correlator: NewCorrelator(repoPath, beadsFilePath...),
-		cache:      NewHistoryCacheWithOptions(repoPath, maxAge, maxSize),
+		correlator: correlator,
+		cache:      NewHistoryCacheWithOptions(correlator.repoPath, maxAge, maxSize),
 		rawStates:  make(map[string]*incrementalRawState),
 	}
 }
@@ -107,10 +109,6 @@ func canUseIncrementalMode(opts CorrelatorOptions) bool {
 
 // GenerateReportWithDetails generates a report and returns detailed update information
 func (ic *IncrementalCorrelator) GenerateReportWithDetails(beads []BeadInfo, opts CorrelatorOptions) (*IncrementalUpdateResult, error) {
-	if ic.correlator != nil && ic.correlator.explicit != nil {
-		ic.correlator.explicit.SetKnownBeadIDs(beadIDsFromInfos(beads))
-	}
-
 	// Build cache key
 	key, err := BuildCacheKey(ic.cache.repoPath, beads, opts)
 	if err != nil {
@@ -125,7 +123,7 @@ func (ic *IncrementalCorrelator) GenerateReportWithDetails(beads []BeadInfo, opt
 			RefreshReason:  "failed to build cache key",
 		}, nil
 	}
-	key.Options = ic.correlator.cacheOptionsHash(opts)
+	key.Options = ic.correlator.artifactOptionsHash(beads, opts)
 	key.Feedback = ic.correlator.feedbackFingerprint()
 
 	// Check cache
@@ -164,7 +162,7 @@ func (ic *IncrementalCorrelator) GenerateReportWithDetails(beads []BeadInfo, opt
 	ic.recordFullRefresh()
 
 	if canUseIncrementalMode(opts) {
-		art, walk, err := ic.correlator.extractHistoryArtifactWithWalk(opts)
+		art, walk, err := ic.correlator.extractHistoryArtifactWithWalkForBeads(beads, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -229,8 +227,15 @@ func (ic *IncrementalCorrelator) statsSnapshot() (hits, misses, increments, refr
 	return ic.hits, ic.misses, ic.increments, ic.refreshes
 }
 
+func (ic *IncrementalCorrelator) rawStateKey(opts CorrelatorOptions) string {
+	if ic != nil && ic.correlator != nil {
+		return hashOptions(opts) + ":store:" + ic.correlator.storeDirRel()
+	}
+	return hashOptions(opts)
+}
+
 func (ic *IncrementalCorrelator) getRawState(opts CorrelatorOptions) *incrementalRawState {
-	rawKey := hashOptions(opts)
+	rawKey := ic.rawStateKey(opts)
 	ic.rawMu.RLock()
 	defer ic.rawMu.RUnlock()
 	if ic.rawStates == nil {
@@ -243,7 +248,7 @@ func (ic *IncrementalCorrelator) putRawState(opts CorrelatorOptions, state *incr
 	if state == nil {
 		return
 	}
-	rawKey := hashOptions(opts)
+	rawKey := ic.rawStateKey(opts)
 	ic.rawMu.Lock()
 	defer ic.rawMu.Unlock()
 	if ic.rawStates == nil {
@@ -263,10 +268,43 @@ func cloneWalkedCommits(walk []walkedCommit) []walkedCommit {
 	return cloned
 }
 
+func reportCoversAllBeadIDs(report *HistoryReport, beads []BeadInfo) bool {
+	if report == nil {
+		return false
+	}
+	for _, b := range beads {
+		if b.ID == "" {
+			continue
+		}
+		if _, ok := report.Histories[b.ID]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func reportCoversScopedBeadIDs(report *HistoryReport, beads []BeadInfo, opts CorrelatorOptions) bool {
+	if report == nil {
+		return false
+	}
+	if opts.BeadID == "" {
+		return reportCoversAllBeadIDs(report, beads)
+	}
+	for _, b := range beads {
+		if b.ID == "" || !matchesBeadFilter(b.ID, opts.BeadID, opts.TargetBeadAliases) {
+			continue
+		}
+		if _, ok := report.Histories[b.ID]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // findExistingReport looks for a cached report that can be incrementally updated
 func (ic *IncrementalCorrelator) findExistingReport(beads []BeadInfo, opts CorrelatorOptions) *HistoryReport {
-	optsPrefix := hashOptions(opts) + ":matcher:"
-	optsHash := ic.correlator.cacheOptionsHash(opts)
+	exactOpts := ic.correlator.artifactOptionsHash(beads, opts)
+	basePrefix := ic.correlator.cacheOptionsHash(opts) + ":known:"
 	beadsHash := hashBeads(beads)
 
 	ic.cache.mu.RLock()
@@ -274,10 +312,13 @@ func (ic *IncrementalCorrelator) findExistingReport(beads []BeadInfo, opts Corre
 
 	var fallback *HistoryReport
 	for _, entry := range ic.cache.entries {
-		if entry.Key.BeadsHash == beadsHash && entry.Key.Options == optsHash {
+		if entry.Key.Options != exactOpts && !strings.HasPrefix(entry.Key.Options, basePrefix) {
+			continue
+		}
+		if entry.Key.BeadsHash == beadsHash && entry.Key.Options == exactOpts {
 			return entry.Report
 		}
-		if strings.HasPrefix(entry.Key.Options, optsPrefix) {
+		if reportCoversScopedBeadIDs(entry.Report, beads, opts) {
 			fallback = entry.Report
 		}
 	}
@@ -311,7 +352,7 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdateFromRaw(
 	if len(newCommitSHAs) > 0 {
 		extractor := ic.incrementalExtractor()
 		var err error
-		newEvents, err = extractEventsFromCommits(extractor, newCommitSHAs, opts.BeadID)
+		newEvents, err = extractEventsFromCommits(extractor, newCommitSHAs, opts.BeadID, opts.TargetBeadAliases...)
 		if err != nil {
 			return nil, nil, fmt.Errorf("extracting new events: %w", err)
 		}
@@ -349,15 +390,15 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdateFromRaw(
 	coCommitDur := durationMS(time.Since(startCoCommit))
 
 	startExplicit := time.Now()
-	matcher := ic.correlator.explicit.withMergedKnownIDs(beadIDsFromEvents(allEvents))
-	explicitCommits, err := ic.correlator.extractExplicitCommitsWithMatcher(matcher, allWalk, opts.BeadID)
+	matcher := ic.correlator.explicit.withReportOptions(opts, knownBeadIDsForReport(beads, opts), beadIDsFromEvents(allEvents))
+	explicitCommits, err := ic.correlator.extractExplicitCommitsWithOptions(matcher, allWalk, opts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("extracting explicit-id commits: %w", err)
 	}
 	explicitDur := durationMS(time.Since(startExplicit))
 
 	startTemporal := time.Now()
-	temporalCandidates, err := ic.correlator.extractTemporalCandidates(allEvents, allWalk, opts.BeadID)
+	temporalCandidates, err := ic.correlator.extractTemporalCandidatesWithOptions(allEvents, allWalk, opts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("extracting temporal candidates: %w", err)
 	}
@@ -482,7 +523,7 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, b
 
 	// If no new commits, re-merge metadata, feedback, and DataHash against current beads
 	if len(newCommitSHAs) == 0 {
-		merged := mergeReportsWithCorrelator(ic.correlator, existing, beads, nil, nil, existing.LatestCommitSHA)
+		merged := mergeReportsWithOptions(ic.correlator, existing, beads, nil, nil, existing.LatestCommitSHA, opts)
 		return &IncrementalUpdateResult{
 			Report:         merged,
 			WasIncremental: true,
@@ -491,7 +532,7 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, b
 	}
 
 	extractor := ic.incrementalExtractor()
-	newEvents, err := extractEventsFromCommits(extractor, newCommitSHAs, opts.BeadID)
+	newEvents, err := extractEventsFromCommits(extractor, newCommitSHAs, opts.BeadID, opts.TargetBeadAliases...)
 	if err != nil {
 		return nil, fmt.Errorf("extracting new events: %w", err)
 	}
@@ -507,8 +548,8 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, b
 		return nil, fmt.Errorf("walking incremental commits: %w", err)
 	}
 
-	// Collect all known IDs and combined events from existing histories + newEvents + beads
-	knownIDs := beadIDsFromInfos(beads)
+	// Collect all known IDs and combined events from existing histories + newEvents + beads + opts
+	knownIDs := knownBeadIDsForReport(beads, opts)
 	var allEvents []BeadEvent
 	for id, h := range existing.Histories {
 		if id != "" {
@@ -519,13 +560,13 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, b
 	allEvents = append(allEvents, newEvents...)
 	knownIDs = append(knownIDs, beadIDsFromEvents(allEvents)...)
 
-	matcher := ic.correlator.explicit.withMergedKnownIDs(knownIDs)
-	newExplicit, err := ic.correlator.extractExplicitCommitsWithMatcher(matcher, newWalk, opts.BeadID)
+	matcher := ic.correlator.explicit.withReportOptions(opts, knownIDs)
+	newExplicit, err := ic.correlator.extractExplicitCommitsWithOptions(matcher, newWalk, opts)
 	if err != nil {
 		return nil, fmt.Errorf("extracting explicit-id commits: %w", err)
 	}
 
-	newTemporalCands, err := ic.correlator.extractTemporalCandidates(allEvents, newWalk, opts.BeadID)
+	newTemporalCands, err := ic.correlator.extractTemporalCandidatesWithOptions(allEvents, newWalk, opts)
 	if err != nil {
 		return nil, fmt.Errorf("extracting temporal candidates: %w", err)
 	}
@@ -560,7 +601,7 @@ func (ic *IncrementalCorrelator) tryIncrementalUpdate(existing *HistoryReport, b
 	allNewCommits = append(allNewCommits, newTemporal...)
 
 	// Merge new data with existing report
-	merged := mergeReportsWithCorrelator(ic.correlator, existing, beads, newEvents, allNewCommits, newCommitSHAs[len(newCommitSHAs)-1])
+	merged := mergeReportsWithOptions(ic.correlator, existing, beads, newEvents, allNewCommits, newCommitSHAs[len(newCommitSHAs)-1], opts)
 
 	return &IncrementalUpdateResult{
 		Report:            merged,
@@ -635,7 +676,7 @@ func countCommitsSince(ctx context.Context, repoPath, sinceSHA string) (int, err
 }
 
 // extractEventsFromCommits extracts bead events from specific commits
-func extractEventsFromCommits(extractor *Extractor, commitSHAs []string, filterBeadID string) ([]BeadEvent, error) {
+func extractEventsFromCommits(extractor *Extractor, commitSHAs []string, filterBeadID string, filterAliases ...string) ([]BeadEvent, error) {
 	if len(commitSHAs) == 0 {
 		return nil, nil
 	}
@@ -659,7 +700,7 @@ func extractEventsFromCommits(extractor *Extractor, commitSHAs []string, filterB
 		return nil, fmt.Errorf("git log for commits failed: %w", err)
 	}
 
-	parsed, err := extractor.parseGitLogOutput(bytes.NewReader(out), filterBeadID)
+	parsed, err := extractor.parseGitLogOutputFiltered(bytes.NewReader(out), filterBeadID, filterAliases)
 	if err != nil {
 		return nil, err
 	}
@@ -787,6 +828,42 @@ func mergeReportsThrough(existing *HistoryReport, beads []BeadInfo, newEvents []
 }
 
 func mergeReportsWithCorrelator(c *Correlator, existing *HistoryReport, beads []BeadInfo, newEvents []BeadEvent, newCommits []CorrelatedCommit, latestProcessedSHA string) *HistoryReport {
+	return mergeReportsWithOptions(c, existing, beads, newEvents, newCommits, latestProcessedSHA, CorrelatorOptions{})
+}
+
+func terminalStatusAndTitleFromEvents(events []BeadEvent) (status string, title string) {
+	for _, ev := range events {
+		if ev.Before != nil && ev.Before.Title != "" {
+			title = ev.Before.Title
+		}
+		if ev.After != nil && ev.After.Title != "" {
+			title = ev.After.Title
+		}
+		switch {
+		case ev.EventType == EventDeleted:
+			status = "deleted"
+		case ev.After != nil && ev.After.Status == "tombstone":
+			status = "tombstone"
+		case ev.EventType == EventClosed:
+			if ev.After != nil && ev.After.Status != "" {
+				status = ev.After.Status
+			} else {
+				status = "closed"
+			}
+		case ev.EventType == EventReopened:
+			if ev.After != nil && ev.After.Status != "" {
+				status = ev.After.Status
+			} else {
+				status = "open"
+			}
+		case ev.After != nil && ev.After.Status != "":
+			status = ev.After.Status
+		}
+	}
+	return status, title
+}
+
+func mergeReportsWithOptions(c *Correlator, existing *HistoryReport, beads []BeadInfo, newEvents []BeadEvent, newCommits []CorrelatedCommit, latestProcessedSHA string, opts CorrelatorOptions) *HistoryReport {
 	scorer := NewScorer()
 	if c != nil && c.scorer != nil {
 		scorer = c.scorer
@@ -811,8 +888,10 @@ func mergeReportsWithCorrelator(c *Correlator, existing *HistoryReport, beads []
 		}
 	}
 
+	liveBeadMap := make(map[string]BeadInfo, len(beads))
 	// Add any new beads that weren't in the existing report
 	for _, bead := range beads {
+		liveBeadMap[bead.ID] = bead
 		if _, exists := histories[bead.ID]; !exists {
 			histories[bead.ID] = BeadHistory{
 				BeadID:  bead.ID,
@@ -833,18 +912,59 @@ func mergeReportsWithCorrelator(c *Correlator, existing *HistoryReport, beads []
 		}
 	}
 
-	// Merge new events
+	// Group new events and tracker-derived co-commits by bead
 	eventsByBead := make(map[string][]BeadEvent)
 	for _, event := range newEvents {
 		eventsByBead[event.BeadID] = append(eventsByBead[event.BeadID], event)
+	}
+	coCommitsByBead := make(map[string][]CorrelatedCommit)
+	for _, cc := range newCommits {
+		if cc.BeadID != "" && cc.Method == MethodCoCommitted {
+			coCommitsByBead[cc.BeadID] = append(coCommitsByBead[cc.BeadID], cc)
+		}
+	}
+
+	// Synthesize target histories for opts.BeadID / opts.CausalityBeadID /
+	// opts.TargetBeadAliases when absent from histories and tracker-derived git
+	// evidence exists in newEvents or co-commits.
+	for _, targetID := range reportSynthesisTargets(opts) {
+		if _, exists := histories[targetID]; exists {
+			continue
+		}
+		if len(eventsByBead[targetID]) == 0 && len(coCommitsByBead[targetID]) == 0 {
+			continue
+		}
+		histories[targetID] = BeadHistory{
+			BeadID:  targetID,
+			Title:   targetID,
+			Status:  "deleted",
+			Events:  []BeadEvent{},
+			Commits: []CorrelatedCommit{},
+		}
 	}
 
 	for beadID, events := range eventsByBead {
 		if h, exists := histories[beadID]; exists {
 			h.Events = append(h.Events, events...)
+			// When bead is absent from live beads (e.g. deleted or tombstoned in
+			// newEvents), update Status and Title from terminal newEvents.
+			if _, isLive := liveBeadMap[beadID]; !isLive {
+				termStatus, termTitle := terminalStatusAndTitleFromEvents(events)
+				if termStatus != "" {
+					h.Status = termStatus
+				} else if h.Status == "" {
+					h.Status = "deleted"
+				}
+				if termTitle != "" && (h.Title == "" || h.Title == beadID) {
+					h.Title = termTitle
+				}
+			}
 			// Recalculate milestones
 			h.Milestones = GetBeadMilestones(h.Events)
 			h.CycleTime = CalculateCycleTime(h.Milestones)
+			if len(h.Commits) == 0 && len(h.Events) > 0 {
+				h.LastAuthor = h.Events[len(h.Events)-1].Author
+			}
 			histories[beadID] = h
 		}
 	}
@@ -852,11 +972,20 @@ func mergeReportsWithCorrelator(c *Correlator, existing *HistoryReport, beads []
 	// Merge new commits grouped by bead and correlation method so distinct
 	// strategies combine signals while exact duplicates within the same method
 	// are deduplicated cleanly.
+	targetGroup, uniqueTarget := resolveUniqueTargetGroupID(histories, opts)
 	commitsByBead := make(map[string][]CorrelatedCommit)
 	for _, commit := range newCommits {
-		if commit.BeadID != "" {
-			commitsByBead[commit.BeadID] = append(commitsByBead[commit.BeadID], commit)
+		if commit.BeadID == "" {
+			continue
 		}
+		beadID := commit.BeadID
+		if _, exists := histories[beadID]; !exists && commit.Method == MethodExplicitID && uniqueTarget != "" {
+			if _, inGroup := targetGroup[beadID]; inGroup {
+				beadID = uniqueTarget
+				commit.BeadID = uniqueTarget
+			}
+		}
+		commitsByBead[beadID] = append(commitsByBead[beadID], commit)
 	}
 
 	for beadID, commits := range commitsByBead {
@@ -883,6 +1012,28 @@ func mergeReportsWithCorrelator(c *Correlator, existing *HistoryReport, beads []
 	var feedbackApplied *FeedbackApplied
 	if c != nil && c.feedback != nil {
 		feedbackApplied = applyFeedbackIdempotent(c.feedback, histories)
+	}
+
+	if opts.BeadID != "" {
+		filtered := make(map[string]BeadHistory)
+		for _, id := range reportFilterTargetIDs(opts.BeadID, opts.TargetBeadAliases) {
+			if h, ok := histories[id]; ok {
+				filtered[id] = h
+			}
+		}
+		histories = filtered
+	} else if beads != nil {
+		synthKeep := make(map[string]struct{})
+		for _, id := range reportSynthesisTargets(opts) {
+			synthKeep[id] = struct{}{}
+		}
+		for id := range histories {
+			if _, isLive := liveBeadMap[id]; !isLive {
+				if _, isSynth := synthKeep[id]; !isSynth {
+					delete(histories, id)
+				}
+			}
+		}
 	}
 
 	// Build a stable reverse index; HistoryReport exposes these map-derived

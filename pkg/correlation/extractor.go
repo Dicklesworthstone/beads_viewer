@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -21,17 +23,87 @@ import (
 
 // ExtractOptions controls which commits and beads to extract events from
 type ExtractOptions struct {
-	Revision string     // Resolved commit to walk from (empty = HEAD); excludes descendants by ancestry
-	Since    *time.Time // Only commits after this time (nil = no limit)
-	Until    *time.Time // Only commits before this time (nil = no limit)
-	Limit    int        // Max commits to process (0 = no limit)
-	BeadID   string     // Filter to single bead ID (empty = all beads)
+	Revision      string     // Resolved commit to walk from (empty = HEAD); excludes descendants by ancestry
+	Since         *time.Time // Only commits after this time (nil = no limit)
+	Until         *time.Time // Only commits before this time (nil = no limit)
+	Limit         int        // Max commits to process (0 = no limit)
+	BeadID        string     // Filter to single bead ID (empty = all beads)
+	BeadIDAliases []string   // Optional alternate local IDs for BeadID / CausalityBeadID
+}
+
+func matchesBeadFilter(id, primary string, aliases []string) bool {
+	if primary == "" {
+		return true
+	}
+	if id == primary {
+		return true
+	}
+	for _, a := range aliases {
+		if a != "" && id == a {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesBeadFilterFold(id, primary string, aliases []string) bool {
+	if primary == "" {
+		return true
+	}
+	if strings.EqualFold(id, primary) {
+		return true
+	}
+	for _, a := range aliases {
+		if a != "" && strings.EqualFold(id, a) {
+			return true
+		}
+	}
+	return false
+}
+
+func (opts ExtractOptions) targetBeadIDs() []string {
+	if opts.BeadID == "" {
+		return nil
+	}
+	out := make([]string, 0, 1+len(opts.BeadIDAliases))
+	seen := make(map[string]struct{}, 1+len(opts.BeadIDAliases))
+	out = append(out, opts.BeadID)
+	seen[opts.BeadID] = struct{}{}
+	for _, a := range opts.BeadIDAliases {
+		if a == "" {
+			continue
+		}
+		if _, ok := seen[a]; ok {
+			continue
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
+	}
+	return out
+}
+
+func (opts ExtractOptions) matchesBead(id string) bool {
+	return matchesBeadFilter(id, opts.BeadID, opts.BeadIDAliases)
+}
+
+func (opts ExtractOptions) filterCacheKey() string {
+	targets := opts.targetBeadIDs()
+	if len(targets) == 0 {
+		return ""
+	}
+	if len(targets) == 1 {
+		return targets[0]
+	}
+	sorted := append([]string(nil), targets...)
+	sort.Strings(sorted)
+	return strings.Join(sorted, "\x00")
 }
 
 // Extractor extracts bead lifecycle events from git history
 type Extractor struct {
-	repoPath   string
-	beadsFiles []string // Files to track (e.g., .beads/beads.jsonl, .beads/issues.jsonl)
+	repoPath    string
+	storeDirRel string
+	beadsFiles  []string // Files to track (e.g., .beads/beads.jsonl, .beads/issues.jsonl)
 
 	// ctx, when set (via Correlator.WithContext or directly), bounds the git
 	// subprocesses spawned during extraction (issue #166). nil means
@@ -45,27 +117,89 @@ type Extractor struct {
 // backward compatibility with existing call sites that pass only repoPath.
 func NewExtractor(repoPath string, beadsFilePath ...string) *Extractor {
 	e := &Extractor{
-		repoPath:   repoPath,
-		beadsFiles: pickBeadsFiles(repoPath, defaultBeadsFiles),
+		repoPath: repoPath,
 	}
 
-	// If a specific file is provided, prioritize it
 	var beadPath string
 	if len(beadsFilePath) > 0 {
 		beadPath = beadsFilePath[0]
 	}
-	if beadPath != "" {
-		// Ensure relative path if possible, though absolute usually works with git if inside repo
-		// For simplicity, we prepend it to the list so it's picked up by buildGitLogArgs as primary
-		rel, err := filepath.Rel(repoPath, beadPath)
-		if err == nil {
-			e.beadsFiles = prependBeadsFile(rel, e.beadsFiles)
-		} else {
-			e.beadsFiles = prependBeadsFile(beadPath, e.beadsFiles)
+	if beadPath == "" {
+		e.beadsFiles = pickBeadsFiles(repoPath, defaultBeadsFiles)
+		e.storeDirRel = deriveStoreDirRel(e.beadsFiles)
+		return e
+	}
+
+	statPath := beadPath
+	if !filepath.IsAbs(statPath) && repoPath != "" {
+		statPath = filepath.Join(repoPath, statPath)
+	}
+	if info, err := os.Stat(statPath); err == nil && info.IsDir() {
+		relDir := resolveExtractorBeadsPath(repoPath, beadPath)
+		dirSlash := normalizeStoreDirRel(relDir)
+		if dirSlash != "" && !filepath.IsAbs(relDir) {
+			e.storeDirRel = dirSlash
+			siblingDefaults := []string{
+				dirSlash + "/beads.jsonl",
+				dirSlash + "/issues.jsonl",
+				dirSlash + "/beads.base.jsonl",
+			}
+			e.beadsFiles = pickBeadsFiles(repoPath, siblingDefaults)
+			return e
 		}
 	}
 
+	relPath := resolveExtractorBeadsPath(repoPath, beadPath)
+	relSlash := strings.TrimPrefix(filepath.ToSlash(relPath), "./")
+	storeDir := normalizeStoreDirRel(path.Dir(relSlash))
+	if storeDir != "" && !filepath.IsAbs(relPath) {
+		e.storeDirRel = storeDir
+		siblingDefaults := []string{
+			storeDir + "/beads.jsonl",
+			storeDir + "/issues.jsonl",
+			storeDir + "/beads.base.jsonl",
+		}
+		e.beadsFiles = prependBeadsFile(relSlash, pickBeadsFiles(repoPath, siblingDefaults))
+	} else {
+		e.beadsFiles = prependBeadsFile(relSlash, nil)
+	}
+
 	return e
+}
+
+// StoreDirRel returns the normalized git-root-relative tracker directory prefix
+// (e.g. ".beads", "custom-beads", or "services/api/.beads"), or "" when the
+// tracked file does not live inside a repository subdirectory.
+func (e *Extractor) StoreDirRel() string {
+	return e.effectiveStoreDirRel()
+}
+
+func (e *Extractor) effectiveStoreDirRel() string {
+	if e == nil {
+		return ""
+	}
+	if e.storeDirRel != "" {
+		return e.storeDirRel
+	}
+	return deriveStoreDirRel(e.beadsFiles)
+}
+
+func resolveExtractorBeadsPath(repoPath, beadPath string) string {
+	cleaned := filepath.Clean(beadPath)
+	if repoPath == "" {
+		return cleaned
+	}
+	if filepath.IsAbs(cleaned) {
+		if absRepo, err := filepath.Abs(repoPath); err == nil {
+			if rel, err := filepath.Rel(absRepo, cleaned); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return rel
+			}
+		}
+	}
+	if rel, err := filepath.Rel(repoPath, cleaned); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return rel
+	}
+	return cleaned
 }
 
 func (e *Extractor) primaryBeadsFile() string {
@@ -184,7 +318,7 @@ func (e *Extractor) extractViaGitLogPatch(opts ExtractOptions) ([]BeadEvent, err
 	}
 
 	// Parse output stream
-	events, parseErr := e.parseGitLogOutput(stdout, opts.BeadID)
+	events, parseErr := e.parseGitLogOutputFiltered(stdout, opts.BeadID, opts.BeadIDAliases)
 
 	// If parsing failed, ensure we drain the pipe or kill the process to avoid deadlock
 	// where git log is blocked writing to full pipe while we wait for it to exit.
@@ -238,13 +372,21 @@ func (e *Extractor) buildGitLogArgs(opts ExtractOptions) []string {
 	}
 
 	// Optimization: If filtering by BeadID, tell git to only show commits
-	// where this ID appears in the diff (added or removed).
+	// where this ID (or one of its target aliases) appears in the diff.
 	// We use -G with a regex to match the JSON field to avoid false positives on common IDs like "1".
 	// Regex matches: "id": [whitespace] "BEAD_ID"
-	if opts.BeadID != "" {
+	if targets := opts.targetBeadIDs(); len(targets) == 1 {
 		// Escape regex meta-characters in BeadID just in case
-		safeID := regexp.QuoteMeta(opts.BeadID)
+		safeID := regexp.QuoteMeta(targets[0])
 		regex := fmt.Sprintf(`"id":\s*"%s"`, safeID)
+		args = insertBefore(args, "--", fmt.Sprintf("-G%s", regex))
+	} else if len(targets) > 1 {
+		quoted := make([]string, 0, len(targets))
+		for _, t := range targets {
+			quoted = append(quoted, regexp.QuoteMeta(t))
+		}
+		regex := fmt.Sprintf(`"id":\s*"(%s)"`, strings.Join(quoted, "|"))
+		args = insertBefore(args, "--", "--extended-regexp")
 		args = insertBefore(args, "--", fmt.Sprintf("-G%s", regex))
 	}
 
@@ -274,6 +416,10 @@ func insertBefore(slice []string, marker, value string) []string {
 
 // parseGitLogOutput parses the combined commit info and diff output from a stream
 func (e *Extractor) parseGitLogOutput(r io.Reader, filterBeadID string) ([]BeadEvent, error) {
+	return e.parseGitLogOutputFiltered(r, filterBeadID, nil)
+}
+
+func (e *Extractor) parseGitLogOutputFiltered(r io.Reader, filterBeadID string, filterAliases []string) ([]BeadEvent, error) {
 	var events []BeadEvent
 
 	// Use bufio.Reader instead of Scanner to handle long lines
@@ -290,7 +436,7 @@ func (e *Extractor) parseGitLogOutput(r io.Reader, filterBeadID string) ([]BeadE
 		}
 		diffBytes := diffBuffer.Bytes()
 		if len(diffBytes) > 0 {
-			diffEvents := e.parseDiff(diffBytes, *currentCommit, filterBeadID)
+			diffEvents := e.parseDiffFiltered(diffBytes, *currentCommit, filterBeadID, filterAliases)
 			events = append(events, diffEvents...)
 		}
 		diffBuffer.Reset()
@@ -383,6 +529,10 @@ func parseCommitInfo(line string) (commitInfo, error) {
 
 // parseDiff extracts bead events from a diff section
 func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID string) []BeadEvent {
+	return e.parseDiffFiltered(diffData, info, filterBeadID, nil)
+}
+
+func (e *Extractor) parseDiffFiltered(diffData []byte, info commitInfo, filterBeadID string, filterAliases []string) []BeadEvent {
 	var events []BeadEvent
 
 	// Track old and new bead states for status change detection
@@ -415,7 +565,7 @@ func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID str
 		if strings.HasPrefix(line, "-{") {
 			jsonStr := strings.TrimPrefix(line, "-")
 			if snap, ok := parseBeadJSON(jsonStr); ok {
-				if filterBeadID == "" || snap.ID == filterBeadID {
+				if matchesBeadFilter(snap.ID, filterBeadID, filterAliases) {
 					oldBeads[snap.ID] = snap
 					seenBeads[snap.ID] = true
 				}
@@ -429,7 +579,7 @@ func (e *Extractor) parseDiff(diffData []byte, info commitInfo, filterBeadID str
 		if strings.HasPrefix(line, "+{") {
 			jsonStr := strings.TrimPrefix(line, "+")
 			if snap, ok := parseBeadJSON(jsonStr); ok {
-				if filterBeadID == "" || snap.ID == filterBeadID {
+				if matchesBeadFilter(snap.ID, filterBeadID, filterAliases) {
 					newBeads[snap.ID] = snap
 					seenBeads[snap.ID] = true
 				}

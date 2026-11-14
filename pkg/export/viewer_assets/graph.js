@@ -262,8 +262,21 @@ class GraphStore {
 
         // Heatmap & metrics mode
         this.heatmapMode = false;
-        this.sizeMetric = 'pagerank'; // pagerank | betweenness | critical | indegree
-        this.maxMetrics = { pagerank: 1, betweenness: 1, critical: 1, indegree: 1 };
+        this.sizeMetric = 'pagerank'; // pagerank | betweenness | eigenvector | inDegree | outDegree | criticalPath | kcore | hitsHub | hitsAuth | slack
+        this.maxMetrics = {
+            pagerank: 1,
+            betweenness: 1,
+            eigenvector: 1,
+            inDegree: 1,
+            indegree: 1,
+            outDegree: 1,
+            criticalPath: 1,
+            critical: 1,
+            kcore: 1,
+            hitsHub: 1,
+            hitsAuth: 1,
+            slack: 1
+        };
 
         // Filters
         this.filters = {
@@ -337,20 +350,112 @@ function refreshGraph() {
 // HEATMAP & GOLD GLOW HELPERS
 // ============================================================================
 
+const SUPPORTED_SIZE_METRICS = [
+    'pagerank',
+    'betweenness',
+    'eigenvector',
+    'inDegree',
+    'indegree',
+    'outDegree',
+    'criticalPath',
+    'critical',
+    'kcore',
+    'hitsHub',
+    'hitsAuth',
+    'slack'
+];
+
+function normalizeMetricKey(metric) {
+    if (metric === 'critical') return 'criticalPath';
+    if (metric === 'indegree') return 'inDegree';
+    return metric || 'pagerank';
+}
+
+function finiteMetricValue(val) {
+    return typeof val === 'number' && Number.isFinite(val) ? val : 0;
+}
+
 /**
  * Compute max metric values for normalization
  * Note: Must be called AFTER prepareGraphData since metrics are on prepared nodes
  */
-function computeMaxMetrics() {
+function computeMaxMetrics(nodesArg = null) {
     // Get prepared nodes from graph data if available, otherwise use raw issues
     const graphData = store.graph?.graphData();
-    const nodes = graphData?.nodes || store.issues;
+    const nodes = nodesArg || graphData?.nodes || store.issues;
     if (!nodes.length) return;
 
-    store.maxMetrics.pagerank = Math.max(...nodes.map(n => n.pagerank || 0), 0.001);
-    store.maxMetrics.betweenness = Math.max(...nodes.map(n => n.betweenness || 0), 0.001);
-    store.maxMetrics.critical = Math.max(...nodes.map(n => n.criticalDepth || 0), 1);
-    store.maxMetrics.indegree = Math.max(...nodes.map(n => n.blockerCount || 0), 1);
+    store.maxMetrics.pagerank = Math.max(...nodes.map(n => finiteMetricValue(n.pagerank)), 0.001);
+    store.maxMetrics.betweenness = Math.max(...nodes.map(n => finiteMetricValue(n.betweenness)), 0.001);
+    store.maxMetrics.eigenvector = Math.max(...nodes.map(n => finiteMetricValue(n.eigenvector)), 0.001);
+    store.maxMetrics.inDegree = Math.max(...nodes.map(n => finiteMetricValue(n.inDegree ?? n.dependentCount)), 1);
+    store.maxMetrics.indegree = store.maxMetrics.inDegree;
+    store.maxMetrics.outDegree = Math.max(...nodes.map(n => finiteMetricValue(n.outDegree ?? n.blockerCount)), 1);
+    store.maxMetrics.criticalPath = Math.max(...nodes.map(n => finiteMetricValue(n.criticalDepth)), 1);
+    store.maxMetrics.critical = store.maxMetrics.criticalPath;
+    store.maxMetrics.kcore = Math.max(...nodes.map(n => finiteMetricValue(n.kcore)), 1);
+    store.maxMetrics.hitsHub = Math.max(...nodes.map(n => finiteMetricValue(n.hitsHub)), 0.001);
+    store.maxMetrics.hitsAuth = Math.max(...nodes.map(n => finiteMetricValue(n.hitsAuth)), 0.001);
+    store.maxMetrics.slack = Math.max(...nodes.map(n => finiteMetricValue(n.slack)), 1);
+}
+
+function getMetricRatio(node, metric = store.sizeMetric, forHeatmap = false) {
+    const key = normalizeMetricKey(metric);
+    let val = 0;
+    let max = 1;
+    switch (key) {
+        case 'pagerank':
+            val = finiteMetricValue(node.pagerank);
+            max = store.maxMetrics.pagerank || 0.001;
+            break;
+        case 'betweenness':
+            val = finiteMetricValue(node.betweenness);
+            max = store.maxMetrics.betweenness || 0.001;
+            break;
+        case 'eigenvector':
+            val = finiteMetricValue(node.eigenvector);
+            max = store.maxMetrics.eigenvector || 0.001;
+            break;
+        case 'inDegree':
+            val = finiteMetricValue(node.inDegree ?? node.dependentCount);
+            max = store.maxMetrics.inDegree || 1;
+            break;
+        case 'outDegree':
+            val = finiteMetricValue(node.outDegree ?? node.blockerCount);
+            max = store.maxMetrics.outDegree || 1;
+            break;
+        case 'criticalPath':
+            val = finiteMetricValue(node.criticalDepth);
+            max = store.maxMetrics.criticalPath || 1;
+            break;
+        case 'kcore':
+            val = finiteMetricValue(node.kcore);
+            max = store.maxMetrics.kcore || 1;
+            break;
+        case 'hitsHub':
+            val = finiteMetricValue(node.hitsHub);
+            max = store.maxMetrics.hitsHub || 0.001;
+            break;
+        case 'hitsAuth':
+            val = finiteMetricValue(node.hitsAuth);
+            max = store.maxMetrics.hitsAuth || 0.001;
+            break;
+        case 'slack': {
+            if (node.slack === undefined || node.slack === null || !Number.isFinite(node.slack)) {
+                return 0;
+            }
+            max = store.maxMetrics.slack || 1;
+            const slackRatio = Math.max(0, Math.min(node.slack / max, 1));
+            // In heatmap mode, 0 slack (critical path) is hottest (1.0 -> red)
+            return forHeatmap ? (1 - slackRatio) : slackRatio;
+        }
+        default:
+            val = finiteMetricValue(node.pagerank);
+            max = store.maxMetrics.pagerank || 0.001;
+            break;
+    }
+    if (max <= 0) return 0;
+    return Math.max(0, Math.min(val / max, 1));
 }
 
 /**
@@ -358,26 +463,7 @@ function computeMaxMetrics() {
  * Uses HSL: 120 (green) to 0 (red) based on metric intensity
  */
 function getHeatmapColor(node) {
-    let val = 0, max = 1;
-    switch (store.sizeMetric) {
-        case 'pagerank':
-            val = node.pagerank || 0;
-            max = store.maxMetrics.pagerank;
-            break;
-        case 'betweenness':
-            val = node.betweenness || 0;
-            max = store.maxMetrics.betweenness;
-            break;
-        case 'critical':
-            val = node.criticalDepth || 0;
-            max = store.maxMetrics.critical;
-            break;
-        case 'indegree':
-            val = node.blockerCount || 0;
-            max = store.maxMetrics.indegree;
-            break;
-    }
-    const ratio = Math.min(val / max, 1);
+    const ratio = getMetricRatio(node, store.sizeMetric, true);
     const hue = 120 - ratio * 120; // Green (120) to Red (0)
     return `hsl(${hue}, 80%, 50%)`;
 }
@@ -439,8 +525,9 @@ export function toggleHeatmap() {
  * Set the size/heatmap metric
  */
 export function setSizeMetric(metric) {
-    if (['pagerank', 'betweenness', 'critical', 'indegree'].includes(metric)) {
+    if (SUPPORTED_SIZE_METRICS.includes(metric)) {
         store.sizeMetric = metric;
+        computeMaxMetrics();
         refreshGraph();
         dispatchEvent('metricChange', { metric: store.sizeMetric });
     }
@@ -656,6 +743,12 @@ function isBlockingDependency(dependency) {
     return !dependency.type || ['blocks', 'conditional-blocks', 'waits-for'].includes(dependency.type);
 }
 
+// Allow all custom and built-in non-blocking Beads edges to render visually (dashed)
+// while keeping WASM DAG metrics strictly blocking-only via isBlockingDependency.
+function isRenderableDependency(dependency) {
+    return Boolean(dependency && dependency.issue_id && dependency.depends_on_id);
+}
+
 function isResolvedIssue(issue) {
     return issue.status === 'closed' || issue.status === 'tombstone';
 }
@@ -746,14 +839,11 @@ function computeMetrics() {
         try {
             const artPoints = store.wasmGraph.articulationPoints();
             if (artPoints && artPoints.length > 0) {
-                // Convert indices to node IDs
+                // Convert WASM node indices to issue IDs via wasmGraph.nodeId(idx)
                 store.metrics.articulationPoints = new Set(
-                    Array.from(artPoints).map(idx => {
-                        for (const [id, i] of store.nodeIndexMap.entries()) {
-                            if (i === idx) return id;
-                        }
-                        return null;
-                    }).filter(Boolean)
+                    Array.from(artPoints)
+                        .map(idx => store.wasmGraph.nodeId(idx))
+                        .filter(Boolean)
                 );
             } else {
                 store.metrics.articulationPoints = new Set();
@@ -807,7 +897,7 @@ export async function initGraph(containerId, options = {}) {
         // Link rendering
         .linkCanvasObject(drawLink)
         .linkCanvasObjectMode(() => 'replace')
-        .linkDirectionalParticles(node => store.config.enableParticles ? 2 : 0)
+        .linkDirectionalParticles(link => (store.config.enableParticles && link.blocking !== false) ? 2 : 0)
         .linkDirectionalParticleSpeed(store.config.particleSpeed)
         .linkDirectionalParticleColor(() => THEME.accent.cyan)
 
@@ -1025,6 +1115,9 @@ export function loadData(issues, dependencies, layout = null) {
     // Prepare graph data with optional pre-computed positions
     const graphData = prepareGraphData(layout);
 
+    // Pre-populate maxMetrics from prepared nodes before warmupTicks runs
+    computeMaxMetrics(graphData.nodes);
+
     // Update graph
     // Valid starting coordinates make synchronous warmup redundant. Paint the
     // seeded graph immediately and let subsequent frames refine the layout.
@@ -1087,20 +1180,25 @@ function prepareGraphData(layout = null) {
     // Build node set for link filtering
     const nodeIds = new Set(nodes.map(n => n.id));
 
-    // Filter links
+    // Filter links (include renderable non-blocking edges visually; mark blocking flag)
     let links = dependencies
-        .filter(isBlockingDependency)
+        .filter(isRenderableDependency)
         .filter(d => nodeIds.has(d.issue_id) && nodeIds.has(d.depends_on_id))
         .map(d => ({
             source: d.issue_id,
             target: d.depends_on_id,
-            type: d.type || 'blocks'
+            type: d.type || 'blocks',
+            blocking: isBlockingDependency(d)
         }));
 
     // Enrich nodes with computed data
     nodes = nodes.map(issue => {
         const idx = store.wasmReady ? store.wasmGraph?.nodeIdx(issue.id) : undefined;
         const pos = layout?.positions?.[issue.id]; // Pre-computed position
+        const blockerCount = issue.blocker_count
+            ?? dependencies.filter(d => isBlockingDependency(d) && d.issue_id === issue.id).length;
+        const dependentCount = issue.dependent_count
+            ?? dependencies.filter(d => isBlockingDependency(d) && d.depends_on_id === issue.id).length;
 
         return {
             id: issue.id,
@@ -1123,16 +1221,17 @@ function prepareGraphData(layout = null) {
             slack: idx !== undefined && metrics.slack ? metrics.slack[idx] : undefined,
             hitsHub: idx !== undefined && metrics.hits?.hub ? metrics.hits.hub[idx] : undefined,
             hitsAuth: idx !== undefined && metrics.hits?.authority ? metrics.hits.authority[idx] : undefined,
+            inDegree: idx !== undefined && store.wasmGraph ? store.wasmGraph.inDegree(idx) : dependentCount,
+            outDegree: idx !== undefined && store.wasmGraph ? store.wasmGraph.outDegree(idx) : blockerCount,
+            isArticulationPoint: Boolean(metrics.articulationPoints?.has(issue.id)),
             inCycle: false,
 
             // Dependency counts. Prefer the active-blocker count from the
             // materialized view (issue.blocker_count / dependent_count) so
             // closed blockers don't keep their dependents looking blocked
             // (bv-issue#143/#144). Fall back to blocking dependency-row counts.
-            blockerCount: issue.blocker_count
-                ?? dependencies.filter(d => isBlockingDependency(d) && d.issue_id === issue.id).length,
-            dependentCount: issue.dependent_count
-                ?? dependencies.filter(d => isBlockingDependency(d) && d.depends_on_id === issue.id).length,
+            blockerCount,
+            dependentCount,
 
             // Seed the simulation without pinning nodes or preventing dragging.
             x: pos ? pos[0] : undefined,
@@ -1158,15 +1257,14 @@ function prepareGraphData(layout = null) {
 // NODE RENDERING
 // ============================================================================
 
-function getNodeSize(node) {
+export function getNodeSize(node) {
     const { nodeMinSize, nodeMaxSize } = store.config;
+    const key = normalizeMetricKey(store.sizeMetric);
+    let score = getMetricRatio(node, key, false);
 
-    // Use PageRank for sizing (normalized 0-1)
-    let score = node.pagerank || 0;
-
-    // Boost for high betweenness (bottleneck nodes)
-    if (node.betweenness > 0.1) {
-        score = Math.min(1, score + 0.2);
+    // Boost for high betweenness (bottleneck nodes) in default PageRank mode
+    if (key === 'pagerank' && (node.betweenness || 0) > 0.1) {
+        score = Math.min(1, score + 0.1);
     }
 
     return nodeMinSize + score * (nodeMaxSize - nodeMinSize);
@@ -1384,6 +1482,15 @@ function getLinkColor(link) {
     const srcId = sourceNode?.id || link.source;
     const tgtId = targetNode?.id || link.target;
 
+    // Non-blocking edges (parent-child, related, discovered-from) are rendered
+    // subtly as dashed lines and never participate in blocking cascade/cycle colors.
+    if (link.blocking === false) {
+        if (store.connectedNodes.size > 0 && store.connectedNodes.has(srcId) && store.connectedNodes.has(tgtId)) {
+            return THEME.link.gold + '99';
+        }
+        return (THEME.fgMuted || '#6272a4') + '88';
+    }
+
     // What-if cascade links (bright green for unblocking edges)
     if (whatIfState.active && store.highlightedLinks.has(linkId)) {
         if (targetNode?._whatIfState === 'closing' || sourceNode?._whatIfState === 'unblocked') {
@@ -1541,6 +1648,9 @@ function drawLink(link, ctx, globalScale) {
     ctx.globalAlpha = opacity;
     ctx.strokeStyle = color;
     ctx.lineWidth = width;
+    if (link.blocking === false) {
+        ctx.setLineDash([4 / globalScale, 4 / globalScale]);
+    }
 
     // Curved link
     const dx = end.x - start.x;
@@ -1554,6 +1664,7 @@ function drawLink(link, ctx, globalScale) {
     ctx.moveTo(start.x, start.y);
     ctx.quadraticCurveTo(cx, cy, end.x, end.y);
     ctx.stroke();
+    ctx.setLineDash([]);
 
     // Arrowhead
     const endSize = getNodeSize(end);
@@ -3046,6 +3157,9 @@ function showTooltip(node) {
         const slackColor = node.slack < 3 ? THEME.priority[0] : node.slack < 7 ? THEME.priority[1] : THEME.fgMuted;
         extendedMetrics.push(`<span style="color: ${slackColor}" title="Schedule flexibility">Slack: ${formatSlack(node.slack)}</span>`);
     }
+    if (node.isArticulationPoint) {
+        extendedMetrics.push(`<span style="color: ${THEME.accent.orange || THEME.priority[1]}" title="Removing this node disconnects the dependency graph">Cut vertex: Yes</span>`);
+    }
 
     tooltipEl.innerHTML = `
         <div style="font-weight: 600; margin-bottom: 8px; color: ${THEME.accent.cyan}">
@@ -3061,6 +3175,7 @@ function showTooltip(node) {
             <span style="color: ${priorityColor}; font-weight: 600;">
                 P${escapeHtml(String(node.priority))}
             </span>
+            ${node.isArticulationPoint ? `<span style="background: ${(THEME.accent.orange || '#ffb86c')}33; color: ${THEME.accent.orange || '#ffb86c'}; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;">ARTICULATION</span>` : ''}
         </div>
         <div style="font-size: 10px; color: ${THEME.fgMuted}; display: grid; grid-template-columns: 1fr 1fr; gap: 4px;">
             <span>Blockers: ${node.blockerCount ?? 0}</span>
@@ -3274,13 +3389,16 @@ function dispatchEvent(name, detail = {}) {
     document.dispatchEvent(new CustomEvent(`bv-graph:${name}`, { detail }));
 }
 
+let _graphToastSequence = 0;
+
 /**
  * Show a toast notification (delegates to parent viewer)
  */
 function showToast(message, type = 'info') {
+    _graphToastSequence += 1;
     // Dispatch event for parent viewer to handle
     window.dispatchEvent(new CustomEvent('show-toast', {
-        detail: { message, type, id: Date.now() }
+        detail: { message, type, id: `${Date.now()}-g${_graphToastSequence}` }
     }));
     // Also log for debugging
     console.log(`[bv-graph] Toast (${type}): ${message}`);

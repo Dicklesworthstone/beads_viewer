@@ -25,15 +25,20 @@ type Issue struct {
 	Assignee           string        `json:"assignee,omitempty"`
 	EstimatedMinutes   *int          `json:"estimated_minutes,omitempty"`
 	CreatedAt          time.Time     `json:"created_at"`
+	CreatedBy          string        `json:"created_by,omitempty"`
 	UpdatedAt          time.Time     `json:"updated_at"`
 	DueDate            *time.Time    `json:"due_date,omitempty"`
 	DeferUntil         *time.Time    `json:"defer_until,omitempty"` // Scheduler deferral: hidden from ready/actionable until this instant passes
 	ClosedAt           *time.Time    `json:"closed_at,omitempty"`
+	CloseReason        string        `json:"close_reason,omitempty"`
 	ExternalRef        *string       `json:"external_ref,omitempty"`
 	CompactionLevel    int           `json:"compaction_level,omitempty"`
 	CompactedAt        *time.Time    `json:"compacted_at,omitempty"`
 	CompactedAtCommit  *string       `json:"compacted_at_commit,omitempty"`
 	OriginalSize       int           `json:"original_size,omitempty"`
+	Ephemeral          bool          `json:"ephemeral,omitempty"`
+	Pinned             bool          `json:"pinned,omitempty"`
+	IsTemplate         bool          `json:"is_template,omitempty"`
 	Labels             []string      `json:"labels,omitempty"`
 	Dependencies       []*Dependency `json:"dependencies,omitempty"`
 	Comments           []*Comment    `json:"comments,omitempty"`

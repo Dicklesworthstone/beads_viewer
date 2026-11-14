@@ -843,3 +843,94 @@ func TestRollback_ValidatesBackupBeforeReplacingExecutable(t *testing.T) {
 		}
 	})
 }
+
+func TestCanRollbackAndPerformRollback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script mock binary test runs on Unix")
+	}
+
+	setupCase := func(t *testing.T) (execPath, backupPath string) {
+		t.Helper()
+		dir := t.TempDir()
+		execPath = filepath.Join(dir, "bv")
+		backupPath = GetBackupPath(execPath)
+		if err := os.WriteFile(execPath, []byte("#!/bin/sh\necho 'bv v0.26.1'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		origGetBin := getCurrentBinaryPath
+		getCurrentBinaryPath = func() (string, error) { return execPath, nil }
+		t.Cleanup(func() { getCurrentBinaryPath = origGetBin })
+		return execPath, backupPath
+	}
+
+	t.Run("missing_backup", func(t *testing.T) {
+		setupCase(t)
+		if CanRollback() {
+			t.Fatal("CanRollback() = true without backup file")
+		}
+	})
+
+	t.Run("empty_backup", func(t *testing.T) {
+		_, backupPath := setupCase(t)
+		if err := os.WriteFile(backupPath, nil, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if CanRollback() {
+			t.Fatal("CanRollback() = true for 0-byte backup")
+		}
+	})
+
+	t.Run("symlink_backup", func(t *testing.T) {
+		execPath, backupPath := setupCase(t)
+		target := filepath.Join(filepath.Dir(execPath), "other.bin")
+		if err := os.WriteFile(target, []byte("#!/bin/sh\necho 'bv v0.25.0'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, backupPath); err != nil {
+			t.Fatal(err)
+		}
+		if CanRollback() {
+			t.Fatal("CanRollback() = true for symlink backup")
+		}
+	})
+
+	t.Run("non_executable_backup", func(t *testing.T) {
+		_, backupPath := setupCase(t)
+		if err := os.WriteFile(backupPath, []byte("#!/bin/sh\necho 'bv v0.25.0'\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if CanRollback() {
+			t.Fatal("CanRollback() = true for non-executable backup")
+		}
+	})
+
+	t.Run("valid_backup_and_perform_rollback", func(t *testing.T) {
+		execPath, backupPath := setupCase(t)
+		validBackup := []byte("#!/bin/sh\necho 'bv v0.25.0'\n")
+		if err := os.WriteFile(backupPath, validBackup, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if !CanRollback() {
+			t.Fatal("CanRollback() = false for valid executable backup")
+		}
+
+		var progress bytes.Buffer
+		if err := PerformRollback(&progress); err != nil {
+			t.Fatalf("PerformRollback failed: %v", err)
+		}
+		progressLog := progress.String()
+		if !strings.Contains(progressLog, "Rolling back from backup") || !strings.Contains(progressLog, "Rollback complete") {
+			t.Fatalf("PerformRollback progress output missing expected messages: %q", progressLog)
+		}
+		restored, err := os.ReadFile(execPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(restored, validBackup) {
+			t.Fatalf("restored binary = %q, want %q", restored, validBackup)
+		}
+		if CanRollback() {
+			t.Fatal("CanRollback() should be false after backup has been consumed by rollback")
+		}
+	})
+}

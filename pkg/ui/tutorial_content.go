@@ -98,7 +98,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 			ID:       "intro-quickstart",
 			Title:    "Quick Start",
 			Section:  "Introduction",
-			Contexts: []string{"help", "quit-confirm"},
+			Contexts: []string{"help", "quit-confirm", "update-modal"},
 			Elements: []TutorialElement{
 				Section{Title: "You're already running bv!"},
 				Spacer{Lines: 1},
@@ -908,7 +908,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 			ID:       "ref-keyboard",
 			Title:    "Keyboard Reference",
 			Section:  "Reference",
-			Contexts: []string{"help", "quit-confirm"},
+			Contexts: []string{"help", "quit-confirm", "update-modal"},
 			Elements: []TutorialElement{
 				Section{Title: "Global & Help"},
 				KeyTable{Bindings: []KeyHint{

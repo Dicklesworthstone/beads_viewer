@@ -1574,6 +1574,8 @@ func installTestGUIEditor(t *testing.T) string {
 	t.Setenv("PATH", binDir)
 	t.Setenv("VISUAL", "")
 	t.Setenv("BV_TEST_EDITOR_CAPTURE", capture)
+	allowGUIEditorLaunchInTest.Store(true)
+	t.Cleanup(func() { allowGUIEditorLaunchInTest.Store(false) })
 	return capture
 }
 

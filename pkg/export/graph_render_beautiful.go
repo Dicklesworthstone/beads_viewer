@@ -18,6 +18,7 @@ func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edge
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>%s | bv Graph</title>
+    <link rel="icon" href="data:,">
     <!-- Self-contained by design: no external stylesheets, scripts, or fonts.
          Inter / JetBrains Mono are used when installed locally; the stacks
          below fall back to the system UI and monospace faces. -->
@@ -618,15 +619,16 @@ func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edge
                 </select>
             </div>
             <div class="toolbar-group">
-                <select id="filter-status" title="Filter nodes by status. Shows only beads matching the selected status.">
-                    <option value="">All Status</option>
+                <select id="filter-status" title="Filter nodes by status or readiness. Shows only beads matching the selected filter.">
+                    <option value="all">All Status</option>
+                    <option value="actionable">Actionable</option>
                     <option value="open">Open</option>
                     <option value="in_progress">In Progress</option>
                     <option value="blocked">Blocked</option>
                     <option value="closed">Closed</option>
                 </select>
                 <select id="filter-type" title="Filter nodes by type. Shows only beads matching the selected type.">
-                    <option value="">All Types</option>
+                    <option value="all">All Types</option>
                     <option value="feature">Feature</option>
                     <option value="bug">Bug</option>
                     <option value="task">Task</option>
@@ -643,7 +645,7 @@ func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edge
             </div>
             <div class="toolbar-group">
                 <select id="filter-priority" title="Filter nodes by priority level (P0=critical, P4=backlog)">
-                    <option value="">All Priorities</option>
+                    <option value="all">All Priorities</option>
                     <option value="0">P0 Critical</option>
                     <option value="1">P1 High</option>
                     <option value="2">P2 Medium</option>
@@ -651,7 +653,7 @@ func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edge
                     <option value="4">P4 Backlog</option>
                 </select>
                 <select id="filter-label" title="Filter nodes by label">
-                    <option value="">All Labels</option>
+                    <option value="all">All Labels</option>
                 </select>
             </div>
             <div class="toolbar-group">
@@ -996,15 +998,41 @@ function highlightMatches(text, query) {
     return out + escapeHTML(source.slice(last));
 }
 
-// Stats calculation
+// Stats calculation (count only active blocking dependencies on non-closed, non-tombstone issues)
+const nodeById = {};
+DATA.nodes.forEach(n => { nodeById[n.id] = n; });
+function isBlockingLinkType(type) {
+    return !type || type === 'blocks' || type === 'conditional-blocks' || type === 'waits-for';
+}
+function isActiveNodeStatus(status) {
+    return status !== 'closed' && status !== 'tombstone';
+}
 let actionable = 0, blocked = 0, onCriticalPath = 0, articulationCount = 0;
-const blockerCount = {};
-DATA.links.forEach(l => blockerCount[l.source] = (blockerCount[l.source] || 0) + 1);
+const blockerSetByNode = {};
 DATA.nodes.forEach(n => {
-    n.blockerCount = blockerCount[n.id] || 0;
+    const set = new Set();
+    (n.blocked_by || []).forEach(depId => {
+        const targetNode = nodeById[depId];
+        if (!targetNode || isActiveNodeStatus(targetNode.status)) {
+            set.add(depId);
+        }
+    });
+    blockerSetByNode[n.id] = set;
+});
+DATA.links.forEach(l => {
+    const src = typeof l.source === 'object' ? l.source.id : l.source;
+    const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+    const targetNode = nodeById[tgt];
+    if (isBlockingLinkType(l.type) && (!targetNode || isActiveNodeStatus(targetNode.status))) {
+        if (!blockerSetByNode[src]) blockerSetByNode[src] = new Set();
+        blockerSetByNode[src].add(tgt);
+    }
+});
+DATA.nodes.forEach(n => {
+    n.blockerCount = isActiveNodeStatus(n.status) && blockerSetByNode[n.id] ? blockerSetByNode[n.id].size : 0;
     if ((n.status === 'open' || n.status === 'in_progress') && n.blockerCount === 0) actionable++;
-    if (n.status === 'blocked') blocked++;
-    if (n.slack === 0) onCriticalPath++;
+    if (n.status === 'blocked' || (isActiveNodeStatus(n.status) && n.blockerCount > 0)) blocked++;
+    if (isActiveNodeStatus(n.status) && n.slack === 0) onCriticalPath++;
     if (n.is_articulation) articulationCount++;
 });
 document.getElementById('stat-actionable').textContent = actionable;
@@ -1018,7 +1046,9 @@ const maxBW = Math.max(...DATA.nodes.map(n => n.betweenness || 0), 0.001);
 const maxCP = Math.max(...DATA.nodes.map(n => n.critical_path || 0), 1);
 const maxInDeg = Math.max(...DATA.nodes.map(n => n.in_degree || 0), 1);
 
-let sizeMetric = 'pagerank', heatmapMode = false, hoveredNode = null, highlightedNodes = new Set();
+let sizeMetric = 'pagerank', heatmapMode = false, hoveredNode = null, highlightedNodes = new Set(), activePathNodes = null;
+const recentlyViewed = [];
+const MAX_RECENT = 8;
 
 function getNodeSize(n) {
     const base = 5, scale = 16;
@@ -1031,7 +1061,7 @@ function getNodeSize(n) {
     }
 }
 
-function getHeatmapColor(n) {
+function getHeatmapColor(n, alpha) {
     let val = 0, max = 1;
     switch(sizeMetric) {
         case 'pagerank': val = n.pagerank || 0; max = maxPR; break;
@@ -1041,7 +1071,30 @@ function getHeatmapColor(n) {
     }
     const ratio = val / max;
     const hue = 120 - ratio * 120; // Green to red
+    if (alpha !== undefined) {
+        return 'hsla(' + hue + ', 80%%, 50%%, ' + alpha + ')';
+    }
     return 'hsl(' + hue + ', 80%%, 50%%)';
+}
+
+function getNodeStatusColor(n) {
+    if ((n.status === 'open' || n.status === 'in_progress') && (n.blockerCount || 0) > 0) {
+        return STATUS_COLORS.blocked;
+    }
+    return STATUS_COLORS[n.status] || '#555577';
+}
+
+function computeNodeBaseColor(n) {
+    return heatmapMode ? getHeatmapColor(n) : getNodeStatusColor(n);
+}
+
+function computeNodeColor(n) {
+    const dimmed = highlightedNodes.size > 0 && !highlightedNodes.has(n.id);
+    if (heatmapMode) {
+        return dimmed ? getHeatmapColor(n, 0.15) : getHeatmapColor(n);
+    }
+    const col = getNodeStatusColor(n);
+    return dimmed ? col + '20' : col;
 }
 
 // Get connected subgraph (for golden glow highlight)
@@ -1067,11 +1120,7 @@ const Graph = ForceGraph()(container)
     .backgroundColor('transparent')
     .nodeId('id')
     .nodeLabel(null)
-    .nodeColor(n => {
-        if (highlightedNodes.size > 0 && !highlightedNodes.has(n.id)) return (STATUS_COLORS[n.status] || '#555577') + '20';
-        if (heatmapMode) return getHeatmapColor(n);
-        return STATUS_COLORS[n.status] || '#555577';
-    })
+    .nodeColor(computeNodeColor)
     .nodeVal(n => getNodeSize(n))
     .linkColor(l => {
         const src = typeof l.source === 'object' ? l.source.id : l.source;
@@ -1107,7 +1156,7 @@ const Graph = ForceGraph()(container)
         const x = node.x, y = node.y;
         if (x === undefined || y === undefined || !isFinite(x) || !isFinite(y)) return;
         const size = getNodeSize(node);
-        const baseColor = heatmapMode ? getHeatmapColor(node) : STATUS_COLORS[node.status] || '#555577';
+        const baseColor = computeNodeBaseColor(node);
         const isHighlighted = highlightedNodes.size === 0 || highlightedNodes.has(node.id);
         const isHovered = hoveredNode && hoveredNode.id === node.id;
         const alpha = isHighlighted ? 1 : 0.15;
@@ -1128,10 +1177,13 @@ const Graph = ForceGraph()(container)
             ctx.fillStyle = g; ctx.fill();
         }
 
-        // Critical path indicator
-        if (node.slack === 0 && isHighlighted) {
+        // Critical path indicator (active issues only)
+        if (isActiveNodeStatus(node.status) && node.slack === 0 && isHighlighted) {
+            ctx.save();
+            ctx.globalAlpha = 0.2;
             ctx.beginPath(); ctx.arc(x, y, size + 3, 0, 2 * Math.PI);
-            ctx.fillStyle = baseColor + '30'; ctx.fill();
+            ctx.fillStyle = baseColor; ctx.fill();
+            ctx.restore();
         }
 
         // Priority ring
@@ -1201,10 +1253,10 @@ function handleNodeHover(node) {
     hoveredNode = node;
     container.style.cursor = node ? 'pointer' : 'grab';
     if (node) {
-        highlightedNodes = getConnectedNodes(node.id, 2);
+        highlightedNodes = activePathNodes ? new Set(activePathNodes) : getConnectedNodes(node.id, 2);
         showHoverPanel(node);
     } else {
-        highlightedNodes = new Set();
+        highlightedNodes = activePathNodes ? new Set(activePathNodes) : new Set();
         hideHoverPanel();
     }
     Graph.nodeColor(Graph.nodeColor()); // Trigger re-render
@@ -1232,7 +1284,7 @@ function populatePanelContent(prefix, node) {
     addBadge('badge-' + safeClassToken(node.status), node.status.replace('_', ' '));
     addBadge('', 'P' + node.priority);
     if (node.is_articulation) addBadge('badge-articulation', 'Cut Vertex');
-    if (node.slack === 0) addBadge('badge-critical', 'Critical Path');
+    if (isActiveNodeStatus(node.status) && node.slack === 0) addBadge('badge-critical', 'Critical Path');
     (node.labels || []).forEach(l => addBadge('badge-type', l));
 
     // Description
@@ -1397,7 +1449,9 @@ document.getElementById('hover-close').onclick = () => document.getElementById('
 
 let selectedNode = null;
 function selectNode(node) {
+    if (!node) return;
     selectedNode = node;
+    addToRecent(node);
     showHoverPanel(node);
     document.getElementById('detail-id').textContent = node.id;
     document.getElementById('detail-name').textContent = node.title;
@@ -1426,6 +1480,7 @@ function selectNode(node) {
 
 function clearSelection() {
     selectedNode = null;
+    activePathNodes = null;
     highlightedNodes = new Set();
     document.getElementById('node-detail').classList.remove('visible');
     document.getElementById('no-selection').style.display = 'block';
@@ -1434,19 +1489,23 @@ function clearSelection() {
 }
 
 // Full-text search
+let searchQuery = '';
 let searchDebounce = null;
 document.getElementById('search-input').oninput = e => {
+    searchQuery = e.target.value || '';
     clearTimeout(searchDebounce);
     searchDebounce = setTimeout(() => performSearch(e.target.value), 150);
 };
 
 function performSearch(query) {
+    searchQuery = query || '';
     const resultsEl = document.getElementById('search-results');
     if (!query || query.length < 2) {
         resultsEl.classList.remove('visible');
         applyFilters();
         return;
     }
+    applyFilters();
     const q = query.toLowerCase();
     const matches = DATA.nodes.filter(n => {
         return n.id.toLowerCase().includes(q) ||
@@ -1494,7 +1553,9 @@ function performSearch(query) {
                 Graph.zoom(2.5, 500);
             }
             resultsEl.classList.remove('visible');
+            searchQuery = '';
             document.getElementById('search-input').value = '';
+            applyFilters();
         };
     });
 }
@@ -1577,43 +1638,61 @@ document.getElementById('ctx-copy-description').onclick = () => {
     hideContextMenu();
     void copyContextField(value, 'Description');
 };
-document.getElementById('ctx-path').onclick = () => { showToast('Click another node to find path'); pathStartNode = contextNode; hideContextMenu(); };
-
-let pathStartNode = null;
-function findPath(startId, endId) {
-    const queue = [[startId]];
-    const visited = new Set([startId]);
-    while (queue.length > 0) {
-        const path = queue.shift();
-        const current = path[path.length - 1];
-        if (current === endId) return path;
-        DATA.links.forEach(l => {
-            const src = typeof l.source === 'object' ? l.source.id : l.source;
-            const tgt = typeof l.target === 'object' ? l.target.id : l.target;
-            if (src === current && !visited.has(tgt)) { visited.add(tgt); queue.push([...path, tgt]); }
-            if (tgt === current && !visited.has(src)) { visited.add(src); queue.push([...path, src]); }
-        });
+document.getElementById('ctx-path').onclick = () => {
+    if (contextNode) {
+        pathFinderMode = true;
+        pathStart = contextNode.id;
+        document.getElementById('btn-path').classList.add('active');
+        updatePathfinderBanner('🔗 Path Finder: Start ' + contextNode.id + ' — click destination node (Esc to cancel)');
+        showToast('Start node: ' + contextNode.id + ' — click destination node');
     }
-    return null;
-}
+    hideContextMenu();
+};
 
 function highlightPath(path) {
+    activePathNodes = new Set(path);
     highlightedNodes = new Set(path);
     Graph.nodeColor(Graph.nodeColor());
     Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
     updateVisibleCount();
-    showToast('Path: ' + path.length + ' nodes');
+    showToast('Path (' + path.length + ' nodes): ' + path.join(' → '));
 }
 
-function handleNodeClick(node) {
-    if (pathStartNode) {
-        const path = findPath(pathStartNode.id, node.id);
-        if (path) highlightPath(path);
-        else showToast('No path found');
-        pathStartNode = null;
-    } else {
-        selectNode(node);
+function handleNodeClick(d) {
+    if (!d) return;
+    if (pathFinderMode) {
+        if (!pathStart) {
+            pathStart = d.id;
+            activePathNodes = new Set([d.id]);
+            highlightedNodes = new Set([d.id]);
+            Graph.nodeColor(Graph.nodeColor());
+            Graph.linkColor(Graph.linkColor());
+            updatePathfinderBanner('🔗 Path Finder: Start ' + d.id + ' — click destination node (Esc to cancel)');
+            showToast('Start node: ' + d.id + ' — click destination node');
+            return;
+        }
+        if (pathStart === d.id) {
+            showToast('Select a different destination node');
+            return;
+        }
+        const startId = pathStart;
+        const path = bfsPath(startId, d.id);
+        if (path && path.length > 0) {
+            highlightPath(path);
+            updatePathfinderBanner('🔗 Path (' + path.length + ' nodes): ' + path.join(' → ') + ' (click new start or Esc to exit)');
+        } else {
+            activePathNodes = null;
+            highlightedNodes = new Set();
+            Graph.nodeColor(Graph.nodeColor());
+            Graph.linkColor(Graph.linkColor());
+            updatePathfinderBanner('🔗 No path between ' + startId + ' and ' + d.id + ' — click start node (Esc to cancel)');
+            showToast('No path found between ' + startId + ' and ' + d.id);
+        }
+        pathStart = null;
+        return;
     }
+    selectNode(d);
 }
 
 function highlightDependencies(node, type) {
@@ -1624,6 +1703,7 @@ function highlightDependencies(node, type) {
         if (type === 'deps' && src === node.id) connected.add(tgt);
         if (type === 'dependents' && tgt === node.id) connected.add(src);
     });
+    activePathNodes = connected;
     highlightedNodes = connected;
     Graph.nodeColor(Graph.nodeColor());
     Graph.linkColor(Graph.linkColor());
@@ -1631,19 +1711,52 @@ function highlightDependencies(node, type) {
     showToast(connected.size + ' nodes shown');
 }
 
-// Filters
-let statusFilter = '', typeFilter = '';
+// Unified filter state and handler
+let statusFilter = 'all', typeFilter = 'all', priorityFilter = 'all', labelFilter = 'all';
 let currentVisibilityFilter = () => true;
-document.getElementById('filter-status').onchange = e => { statusFilter = e.target.value; applyFilters(); };
-document.getElementById('filter-type').onchange = e => { typeFilter = e.target.value; applyFilters(); };
+
+const allLabels = new Set();
+DATA.nodes.forEach(n => (n.labels || []).forEach(l => allLabels.add(l)));
+const labelSelect = document.getElementById('filter-label');
+[...allLabels].sort().forEach(l => {
+    const opt = document.createElement('option');
+    opt.value = l; opt.textContent = l;
+    labelSelect.appendChild(opt);
+});
+
+document.getElementById('filter-status').onchange = e => { statusFilter = e.target.value || 'all'; applyFilters(); };
+document.getElementById('filter-type').onchange = e => { typeFilter = e.target.value || 'all'; applyFilters(); };
+document.getElementById('filter-priority').onchange = e => { priorityFilter = e.target.value || 'all'; applyFilters(); };
+labelSelect.onchange = e => { labelFilter = e.target.value || 'all'; applyFilters(); };
 
 function applyFilters() {
-    const searchVal = document.getElementById('search-input').value.toLowerCase();
+    const q = (searchQuery || document.getElementById('search-input').value || '').trim().toLowerCase();
     currentVisibilityFilter = n => {
-        const matchSearch = !searchVal || n.id.toLowerCase().includes(searchVal) || n.title.toLowerCase().includes(searchVal);
-        const matchStatus = !statusFilter || n.status === statusFilter;
-        const matchType = !typeFilter || n.type === typeFilter;
-        return matchSearch && matchStatus && matchType;
+        const matchSearch = !q ||
+            n.id.toLowerCase().includes(q) ||
+            n.title.toLowerCase().includes(q) ||
+            (n.description || '').toLowerCase().includes(q) ||
+            (n.design || '').toLowerCase().includes(q) ||
+            (n.notes || '').toLowerCase().includes(q) ||
+            (n.acceptance_criteria || '').toLowerCase().includes(q) ||
+            (n.labels || []).some(l => l.toLowerCase().includes(q)) ||
+            (n.assignee || '').toLowerCase().includes(q);
+        if (!matchSearch) return false;
+
+        if (statusFilter && statusFilter !== 'all') {
+            if (statusFilter === 'actionable') {
+                if (!((n.status === 'open' || n.status === 'in_progress') && (n.blockerCount || 0) === 0)) return false;
+            } else if (statusFilter === 'blocked') {
+                if (!(n.status === 'blocked' || (isActiveNodeStatus(n.status) && (n.blockerCount || 0) > 0))) return false;
+            } else if (n.status !== statusFilter) {
+                return false;
+            }
+        }
+
+        if (typeFilter && typeFilter !== 'all' && n.type !== typeFilter) return false;
+        if (priorityFilter && priorityFilter !== 'all' && n.priority !== parseInt(priorityFilter, 10)) return false;
+        if (labelFilter && labelFilter !== 'all' && !(n.labels || []).includes(labelFilter)) return false;
+        return true;
     };
     Graph.nodeVisibility(currentVisibilityFilter);
     updateVisibleCount();
@@ -1666,29 +1779,58 @@ document.getElementById('size-by').onchange = e => {
     sizeMetric = e.target.value;
     document.getElementById('heatmap-metric').textContent = { pagerank: 'PageRank', betweenness: 'Betweenness', critical: 'Critical Path', indegree: 'In-Degree' }[sizeMetric];
     Graph.nodeVal(n => getNodeSize(n));
-    if (heatmapMode) Graph.nodeColor(n => getHeatmapColor(n));
+    if (heatmapMode) Graph.nodeColor(computeNodeColor);
 };
 
 // Controls
 document.getElementById('btn-fit').onclick = () => Graph.zoomToFit(400, 50);
 document.getElementById('btn-reset').onclick = () => {
-    document.getElementById('filter-status').value = '';
-    document.getElementById('filter-type').value = '';
+    document.getElementById('filter-status').value = 'all';
+    document.getElementById('filter-type').value = 'all';
+    document.getElementById('filter-priority').value = 'all';
+    document.getElementById('filter-label').value = 'all';
     document.getElementById('search-input').value = '';
+    document.getElementById('search-results').classList.remove('visible');
     document.getElementById('view-mode').value = 'force';
     document.getElementById('size-by').value = 'pagerank';
-    statusFilter = ''; typeFilter = ''; sizeMetric = 'pagerank'; heatmapMode = false;
+    searchQuery = '';
+    statusFilter = 'all';
+    typeFilter = 'all';
+    priorityFilter = 'all';
+    labelFilter = 'all';
+    sizeMetric = 'pagerank';
+    heatmapMode = false;
+    pathFinderMode = false;
+    pathStart = null;
+    activePathNodes = null;
     highlightedNodes = new Set();
-    Graph.dagMode(null); Graph.nodeVisibility(() => true); Graph.nodeVal(n => getNodeSize(n));
-    Graph.nodeColor(n => STATUS_COLORS[n.status] || '#555577');
-    Graph.linkColor(l => l.critical ? '#ec489980' : '#44475a40');
-    clearSelection(); hideHoverPanel(); Graph.zoomToFit(400, 50); updateVisibleCount();
+    Graph.dagMode(null);
+    Graph.nodeVal(n => getNodeSize(n));
+    Graph.nodeColor(computeNodeColor);
+    Graph.linkColor(l => {
+        const src = typeof l.source === 'object' ? l.source.id : l.source;
+        const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+        if (highlightedNodes.size > 0) {
+            if (highlightedNodes.has(src) && highlightedNodes.has(tgt)) return '#fbbf24aa';
+            return '#44475a15';
+        }
+        return l.critical ? '#ec489980' : '#44475a40';
+    });
+    Graph.linkWidth(Graph.linkWidth());
+    applyFilters();
+    clearSelection();
+    hideHoverPanel();
+    Graph.zoomToFit(400, 50);
     document.getElementById('heatmap-legend').classList.remove('heatmap-active');
     document.getElementById('top-nodes-panel').classList.remove('visible');
+    document.getElementById('recent-panel').classList.remove('visible');
     document.getElementById('triage-panel').style.display = 'none';
+    document.getElementById('pathfinder-banner').classList.remove('visible');
     document.getElementById('btn-heatmap').classList.remove('active');
     document.getElementById('btn-triage').classList.remove('active');
     document.getElementById('btn-top').classList.remove('active');
+    document.getElementById('btn-recent').classList.remove('active');
+    document.getElementById('btn-path').classList.remove('active');
 };
 
 // Heatmap toggle - legend always visible, toggle controls coloring mode
@@ -1696,7 +1838,7 @@ document.getElementById('btn-heatmap').onclick = () => {
     heatmapMode = !heatmapMode;
     document.getElementById('btn-heatmap').classList.toggle('active', heatmapMode);
     document.getElementById('heatmap-legend').classList.toggle('heatmap-active', heatmapMode);
-    Graph.nodeColor(n => heatmapMode ? getHeatmapColor(n) : STATUS_COLORS[n.status] || '#555577');
+    Graph.nodeColor(computeNodeColor);
 };
 
 // Triage panel
@@ -1769,9 +1911,8 @@ function toggleLightMode() {
 }
 
 // Recently viewed nodes
-const recentlyViewed = [];
-const MAX_RECENT = 8;
 function addToRecent(node) {
+    if (!node || !node.id) return;
     const idx = recentlyViewed.findIndex(n => n.id === node.id);
     if (idx > -1) recentlyViewed.splice(idx, 1);
     recentlyViewed.unshift({ id: node.id, title: node.title });
@@ -1799,13 +1940,31 @@ document.getElementById('btn-recent').onclick = () => {
 
 // Path finder mode
 let pathFinderMode = false;
-let pathFinderStart = null;
+let pathStart = null;
+function updatePathfinderBanner(text) {
+    const banner = document.getElementById('pathfinder-banner');
+    if (!banner) return;
+    if (text) banner.textContent = text;
+    banner.classList.toggle('visible', pathFinderMode);
+}
 function togglePathFinder() {
     pathFinderMode = !pathFinderMode;
     document.getElementById('btn-path').classList.toggle('active', pathFinderMode);
-    document.getElementById('pathfinder-banner').classList.toggle('visible', pathFinderMode);
-    if (!pathFinderMode) { pathFinderStart = null; }
-    else if (selectedNode) { pathFinderStart = selectedNode; showToast('Now click destination node'); }
+    if (!pathFinderMode) {
+        pathStart = null;
+        activePathNodes = null;
+        highlightedNodes = new Set();
+        updatePathfinderBanner('🔗 Path Finder: Click start node (Esc to cancel)');
+        Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth());
+    } else if (selectedNode) {
+        pathStart = selectedNode.id;
+        updatePathfinderBanner('🔗 Path Finder: Start ' + selectedNode.id + ' — click destination node (Esc to cancel)');
+        showToast('Start node: ' + selectedNode.id + ' — click destination node');
+    } else {
+        pathStart = null;
+        updatePathfinderBanner('🔗 Path Finder: Click start node (Esc to cancel)');
+        showToast('Path Finder: click start node');
+    }
 }
 document.getElementById('btn-path').onclick = togglePathFinder;
 
@@ -1845,44 +2004,6 @@ document.getElementById('btn-help').onclick = toggleHelp;
 document.getElementById('help-close').onclick = toggleHelp;
 document.getElementById('help-overlay').onclick = e => { if (e.target.id === 'help-overlay') toggleHelp(); };
 
-// Priority filter
-let priorityFilter = '';
-document.getElementById('filter-priority').onchange = e => {
-    priorityFilter = e.target.value;
-    applyFilters();
-};
-
-// Label filter - populate from data
-const allLabels = new Set();
-DATA.nodes.forEach(n => (n.labels || []).forEach(l => allLabels.add(l)));
-const labelSelect = document.getElementById('filter-label');
-[...allLabels].sort().forEach(l => {
-    const opt = document.createElement('option');
-    opt.value = l; opt.textContent = l;
-    labelSelect.appendChild(opt);
-});
-let labelFilter = '';
-labelSelect.onchange = e => {
-    labelFilter = e.target.value;
-    applyFilters();
-};
-
-// Combined filter function
-function applyFilters() {
-    Graph.nodeVisibility(n => {
-        if (statusFilter && n.status !== statusFilter) return false;
-        if (typeFilter && n.type !== typeFilter) return false;
-        if (priorityFilter && n.priority !== parseInt(priorityFilter)) return false;
-        if (labelFilter && !(n.labels || []).includes(labelFilter)) return false;
-        return true;
-    });
-    updateVisibleCount();
-}
-
-// Override existing filter handlers to use combined function
-document.getElementById('filter-status').onchange = e => { statusFilter = e.target.value; applyFilters(); };
-document.getElementById('filter-type').onchange = e => { typeFilter = e.target.value; applyFilters(); };
-
 // Mini-map
 const minimapCanvas = document.getElementById('minimap-canvas');
 const minimapCtx = minimapCanvas.getContext('2d');
@@ -1910,7 +2031,7 @@ function updateMinimap() {
         if (n.x == null || n.y == null) return;
         const x = padding + (n.x - bounds.minX) * scale;
         const y = padding + (n.y - bounds.minY) * scale;
-        minimapCtx.fillStyle = STATUS_COLORS[n.status] || '#555577';
+        minimapCtx.fillStyle = computeNodeColor(n);
         minimapCtx.beginPath();
         minimapCtx.arc(x, y, 2, 0, Math.PI * 2);
         minimapCtx.fill();
@@ -1940,8 +2061,8 @@ document.onkeydown = e => {
         case 'f': Graph.zoomToFit(400, 50); break;
         case 'r': document.getElementById('btn-reset').click(); break;
         case 'escape':
-            if (pathFinderMode) { pathFinderMode = false; pathFinderStart = null; document.getElementById('pathfinder-banner').classList.remove('visible'); document.getElementById('btn-path').classList.remove('active'); }
-            else { clearSelection(); hideHoverPanel(); highlightedNodes = new Set(); Graph.nodeColor(Graph.nodeColor()); }
+            if (pathFinderMode) { pathFinderMode = false; pathStart = null; activePathNodes = null; highlightedNodes = new Set(); document.getElementById('pathfinder-banner').classList.remove('visible'); document.getElementById('btn-path').classList.remove('active'); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
+            else { clearSelection(); hideHoverPanel(); activePathNodes = null; highlightedNodes = new Set(); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
             break;
         case ' ': e.preventDefault(); document.getElementById('btn-fullscreen').click(); break;
         case 'h': document.getElementById('btn-heatmap').click(); break;

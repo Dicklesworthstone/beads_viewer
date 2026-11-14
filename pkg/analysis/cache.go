@@ -372,6 +372,19 @@ func computeIssueContentHash(h *fingerprintWriter, issue model.Issue) string {
 		writeTimeHash(h, comment.CreatedAt)
 	}
 
+	// Preserve the frozen base prefix when all 5 metadata/withholding fields are
+	// at their zero values; because every preceding field in computeIssueContentHash
+	// is strictly prefix-free, appending a tagged extension frame when any of the
+	// 5 fields is non-zero is collision-free across all issue pairs.
+	if issue.CreatedBy != "" || issue.CloseReason != "" || issue.Ephemeral || issue.Pinned || issue.IsTemplate {
+		h.writeByte(1)
+		writeStringHash(h, issue.CreatedBy)
+		writeStringHash(h, issue.CloseReason)
+		writeBoolHash(h, issue.Ephemeral)
+		writeBoolHash(h, issue.Pinned)
+		writeBoolHash(h, issue.IsTemplate)
+	}
+
 	return h.sumHex()
 }
 
@@ -532,6 +545,14 @@ func writeTimePtrHash(w *fingerprintWriter, t *time.Time) {
 	}
 	w.writeByte(1)
 	writeTimeHash(w, *t)
+}
+
+func writeBoolHash(w *fingerprintWriter, v bool) {
+	if v {
+		w.writeByte(1)
+		return
+	}
+	w.writeByte(0)
 }
 
 // ComputeConfigHash generates a deterministic hash of the analysis configuration.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,20 @@ var stoppedWatcherDone = func() <-chan struct{} {
 	close(ch)
 	return ch
 }()
+
+func defaultPollIntervalFromEnv() time.Duration {
+	raw := strings.TrimSpace(env.PollInterval.Get())
+	if raw == "" {
+		return DefaultPollInterval
+	}
+	if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+		return d
+	}
+	if ms, err := strconv.Atoi(raw); err == nil && ms > 0 {
+		return time.Duration(ms) * time.Millisecond
+	}
+	return DefaultPollInterval
+}
 
 // WatcherOption configures a Watcher.
 type WatcherOption func(*Watcher)
@@ -131,7 +146,7 @@ func NewWatcher(path string, opts ...WatcherOption) (*Watcher, error) {
 	w := &Watcher{
 		path:             absPath,
 		debounceDuration: DefaultDebounceDuration,
-		pollInterval:     DefaultPollInterval,
+		pollInterval:     defaultPollIntervalFromEnv(),
 		onChange:         func() {},
 		onError:          func(error) {},
 		changeCh:         make(chan struct{}, 1),

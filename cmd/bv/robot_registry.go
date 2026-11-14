@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	pflag "github.com/spf13/pflag"
+
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
@@ -28,6 +30,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/version"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/workspace"
 )
 
 type RobotCommand struct {
@@ -41,8 +44,9 @@ type RobotCommand struct {
 }
 
 type RobotContext struct {
-	Issues   []model.Issue
-	DataHash string
+	Issues     []model.Issue
+	FullIssues []model.Issue
+	DataHash   string
 	// DataHashMatchesIssues is true when DataHash is the ComputeDataHash of the
 	// exact Issues slice carried here (i.e. no label-scope or recipe filtering
 	// changed Issues after DataHash was computed). When true, handlers may seed
@@ -76,6 +80,7 @@ type RobotContext struct {
 	WorkDir              string
 	ProjectDir           string
 	BaselinePath         string
+	HistoryLimit         int
 	EnvRobot             bool
 	SearchOutput         *robotSearchOutput
 	Diff                 *analysis.SnapshotDiff
@@ -198,6 +203,7 @@ type phaseThreeRobotHandlerConfig struct {
 	HistoryTimeoutMs        *int // #166: budget for the triage history prologue (-1 = unset, 0 = unbounded)
 	HistorySince            *string
 	MinConfidence           *float64
+	RobotMinConf            *float64
 	AttentionLimit          *int
 	RelationsThreshold      *float64
 	RelationsLimit          *int
@@ -604,6 +610,7 @@ func configuredPrimaryRobotFlagNames() []string {
 		HistoryTimeoutMs:        &dummyInt,
 		HistorySince:            &dummyStr,
 		MinConfidence:           &dummyFloat,
+		RobotMinConf:            &dummyFloat,
 		AttentionLimit:          &dummyInt,
 		RelationsThreshold:      &dummyFloat,
 		RelationsLimit:          &dummyInt,
@@ -1071,6 +1078,23 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			plan := analyzer.GetExecutionPlan()
+			if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+				remaining := *cfg.RobotMaxResults
+				cappedTracks := make([]analysis.ExecutionTrack, 0, len(plan.Tracks))
+				for _, track := range plan.Tracks {
+					if remaining <= 0 {
+						break
+					}
+					if len(track.Items) > remaining {
+						track.Items = track.Items[:remaining]
+					}
+					if len(track.Items) > 0 {
+						cappedTracks = append(cappedTracks, track)
+						remaining -= len(track.Items)
+					}
+				}
+				plan.Tracks = cappedTracks
+			}
 			stats := analyzer.AnalyzeAsyncWithConfig(context.Background(), config)
 			stats.WaitForPhase2()
 
@@ -1351,7 +1375,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					openCount++
 				}
 			}
-			cycles := stats.Cycles()
+			cycles := filterCyclesForCandidates(stats.Cycles(), ctx.CandidateIDs)
 			curStats := baseline.GraphStats{
 				NodeCount:       stats.NodeCount,
 				EdgeCount:       stats.EdgeCount,
@@ -1374,11 +1398,11 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				} else {
 					bl = loaded
 					topMetrics := baseline.TopMetrics{
-						PageRank:     buildMetricItems(stats.PageRank(), 10),
-						Betweenness:  buildMetricItems(stats.Betweenness(), 10),
-						CriticalPath: buildMetricItems(stats.CriticalPathScore(), 10),
-						Hubs:         buildMetricItems(stats.Hubs(), 10),
-						Authorities:  buildMetricItems(stats.Authorities(), 10),
+						PageRank:     buildScopedMetricItems(stats.PageRank(), 10, ctx.CandidateIDs),
+						Betweenness:  buildScopedMetricItems(stats.Betweenness(), 10, ctx.CandidateIDs),
+						CriticalPath: buildScopedMetricItems(stats.CriticalPathScore(), 10, ctx.CandidateIDs),
+						Hubs:         buildScopedMetricItems(stats.Hubs(), 10, ctx.CandidateIDs),
+						Authorities:  buildScopedMetricItems(stats.Authorities(), 10, ctx.CandidateIDs),
 					}
 					cur = &baseline.Baseline{Stats: curStats, TopMetrics: topMetrics, Cycles: cycles}
 				}
@@ -1427,6 +1451,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				filtered = append(filtered, alert)
 			}
 			driftResult.Alerts = filtered
+			if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(driftResult.Alerts) > *cfg.RobotMaxResults {
+				driftResult.Alerts = driftResult.Alerts[:*cfg.RobotMaxResults]
+			}
 
 			output := struct {
 				RobotEnvelope
@@ -1518,7 +1545,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					openCount++
 				}
 			}
-			cycles := stats.Cycles()
+			cycles := filterCyclesForCandidates(stats.Cycles(), ctx.CandidateIDs)
 			currentStats := baseline.GraphStats{
 				NodeCount:       stats.NodeCount,
 				EdgeCount:       stats.EdgeCount,
@@ -1530,11 +1557,11 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				ActionableCount: partition.Actionable,
 			}
 			currentMetrics := baseline.TopMetrics{
-				PageRank:     buildMetricItems(stats.PageRank(), 10),
-				Betweenness:  buildMetricItems(stats.Betweenness(), 10),
-				CriticalPath: buildMetricItems(stats.CriticalPathScore(), 10),
-				Hubs:         buildMetricItems(stats.Hubs(), 10),
-				Authorities:  buildMetricItems(stats.Authorities(), 10),
+				PageRank:     buildScopedMetricItems(stats.PageRank(), 10, ctx.CandidateIDs),
+				Betweenness:  buildScopedMetricItems(stats.Betweenness(), 10, ctx.CandidateIDs),
+				CriticalPath: buildScopedMetricItems(stats.CriticalPathScore(), 10, ctx.CandidateIDs),
+				Hubs:         buildScopedMetricItems(stats.Hubs(), 10, ctx.CandidateIDs),
+				Authorities:  buildScopedMetricItems(stats.Authorities(), 10, ctx.CandidateIDs),
 			}
 			current := baseline.NewForDir(projectDir, currentStats, currentMetrics, cycles, "current")
 
@@ -1608,30 +1635,49 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			if cfg.SuggestConfidence != nil {
 				config.MinConfidence = *cfg.SuggestConfidence
 			}
+			if cfg.RobotMinConf != nil && *cfg.RobotMinConf > config.MinConfidence {
+				config.MinConfidence = *cfg.RobotMinConf
+			}
 			if cfg.SuggestBead != nil {
 				config.FilterBead = *cfg.SuggestBead
+			}
+			maxSuggestions := config.MaxSuggestions
+			if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+				maxSuggestions = *cfg.RobotMaxResults
+				config.MaxSuggestions = maxSuggestions
+			}
+			if ctx.CandidateIDs != nil {
+				config.CandidateIDs = ctx.CandidateIDs
+				// Defer the cap until after scoping to CandidateIDs so out-of-scope
+				// context issues cannot crowd out in-scope suggestions.
+				config.MaxSuggestions = 0
 			}
 
 			suggestType := ""
 			if cfg.SuggestType != nil {
 				suggestType = strings.TrimSpace(*cfg.SuggestType)
 			}
-			switch suggestType {
-			case "duplicate", "duplicates":
+			switch strings.ToLower(suggestType) {
+			case "duplicate", "duplicates", string(analysis.SuggestionPotentialDuplicate):
 				config.FilterType = analysis.SuggestionPotentialDuplicate
-			case "dependency", "dependencies":
+			case "dependency", "dependencies", string(analysis.SuggestionMissingDependency):
 				config.FilterType = analysis.SuggestionMissingDependency
-			case "label", "labels":
+			case "label", "labels", string(analysis.SuggestionLabelSuggestion):
 				config.FilterType = analysis.SuggestionLabelSuggestion
-			case "cycle", "cycles":
+			case "cycle", "cycles", string(analysis.SuggestionCycleWarning):
 				config.FilterType = analysis.SuggestionCycleWarning
 			case "":
 			default:
-				fmt.Fprintf(ctx.StderrOrDefault(), "Invalid suggest-type: %s (use: duplicate, dependency, label, cycle)\n", suggestType)
+				fmt.Fprintf(ctx.StderrOrDefault(), "Invalid suggest-type: %s (use: duplicate, dependency, label, cycle; for stale issues use: bv --robot-alerts --alert-type=stale_issue)\n", suggestType)
 				return newReportedRobotHandlerExit(1)
 			}
 
 			suggest := analysis.GenerateRobotSuggestOutputAt(ctx.Issues, config, ctx.DataHash, robotNow())
+			rebuildSet := false
+			if maxSuggestions > 0 && len(suggest.Set.Suggestions) > maxSuggestions {
+				suggest.Set.Suggestions = suggest.Set.Suggestions[:maxSuggestions]
+				rebuildSet = true
+			}
 			if !ctx.claimsProven() || ctx.AsOf != "" {
 				reason := "source authority is incomplete or unknown"
 				if ctx.AsOf != "" {
@@ -1640,6 +1686,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				for i, suggestion := range suggest.Set.Suggestions {
 					suggest.Set.Suggestions[i] = suggestion.WithAction(nil).WithMetadata("action_unavailable_reason", reason)
 				}
+				rebuildSet = true
+			}
+			if rebuildSet {
 				suggest.Set = analysis.NewSuggestionSetAt(suggest.Set.Suggestions, suggest.Set.DataHash, suggest.Set.GeneratedAt)
 			}
 			// Re-host the payload under the shared envelope (same top-level
@@ -1674,7 +1723,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			if err != nil {
 				return fmt.Errorf("getting current directory: %w", err)
 			}
-			sprints, err := loader.LoadSprints(workDir)
+			sprints, err := loadSprintsForContext(ctx, workDir)
 			if err != nil {
 				return fmt.Errorf("loading sprints: %w", err)
 			}
@@ -1705,7 +1754,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			if err != nil {
 				return fmt.Errorf("getting current directory: %w", err)
 			}
-			sprints, err := loader.LoadSprints(workDir)
+			sprints, err := loadSprintsForContext(ctx, workDir)
 			if err != nil {
 				return fmt.Errorf("loading sprints: %w", err)
 			}
@@ -1728,12 +1777,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					return newReportedRobotHandlerExit(1)
 				}
 			} else {
-				for i := range sprints {
-					if sprints[i].ID == target {
-						targetSprint = &sprints[i]
-						break
-					}
-				}
+				targetSprint = matchSprintByID(sprints, target)
 				if targetSprint == nil {
 					fmt.Fprintf(ctx.StderrOrDefault(), "Sprint not found: %s\n", target)
 					return newReportedRobotHandlerExit(1)
@@ -1752,7 +1796,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			for _, issue := range ctx.Issues {
 				issueMap[issue.ID] = issue
 			}
-			if scopeChanges, err := computeSprintScopeChanges(workDir, targetSprint, issueMap, now); err == nil && len(scopeChanges) > 0 {
+			if scopeChanges, err := computeSprintScopeChangesForContext(ctx, workDir, targetSprint, issueMap, now); err == nil && len(scopeChanges) > 0 {
 				burndown.ScopeChanges = scopeChanges
 				// Re-linearize the ideal trajectory at each scope change.
 				burndown.IdealLine = generateIdealLineScoped(targetSprint, burndown.TotalIssues, scopeChanges)
@@ -1787,15 +1831,12 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			targetIssues := make([]model.Issue, 0, len(ctx.Issues))
 			var sprintBeadIDs map[string]bool
 			if cfg.ForecastSprint != nil && strings.TrimSpace(*cfg.ForecastSprint) != "" {
-				sprints, err := loader.LoadSprints(workDir)
+				sprints, err := loadSprintsForContext(ctx, workDir)
 				if err == nil {
-					for _, sprint := range sprints {
-						if sprint.ID == *cfg.ForecastSprint {
-							sprintBeadIDs = make(map[string]bool)
-							for _, beadID := range sprint.BeadIDs {
-								sprintBeadIDs[beadID] = true
-							}
-							break
+					if sprint := matchSprintByID(sprints, *cfg.ForecastSprint); sprint != nil {
+						sprintBeadIDs = make(map[string]bool, len(sprint.BeadIDs))
+						for _, beadID := range sprint.BeadIDs {
+							sprintBeadIDs[beadID] = true
 						}
 					}
 				}
@@ -2202,19 +2243,22 @@ func handleRobotLabelAttention(ctx RobotContext, cfg phaseThreeRobotHandlerConfi
 	return nil
 }
 
-func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
+func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool, maxResults int) (any, error) {
 	analyzer := ctx.Analyzer()
 	analyzer.SetNow(robotNow())
 	if ctx.DataHashMatchesIssues {
 		analyzer.SeedDataHash(ctx.DataHash)
 	}
-	if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
+	if forceFull {
 		fullConfig := analysis.FullAnalysisConfig()
 		analyzer.SetConfig(&fullConfig)
 	}
 	stats := analyzer.Analyze()
-	includeInactive := cfg.IncludeInactive != nil && *cfg.IncludeInactive
-	insights := analyzer.GenerateScopedInsights(&stats, 50, includeInactive)
+	insightLimit := 50
+	if maxResults > 0 {
+		insightLimit = maxResults
+	}
+	insights := analyzer.GenerateScopedInsights(&stats, insightLimit, includeInactive)
 
 	if velocity := analysis.ComputeProjectVelocity(ctx.Issues, robotNow(), 8); velocity != nil {
 		snapshot := &analysis.VelocitySnapshot{
@@ -2318,6 +2362,11 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		Articulation:      limitSlice(stats.ArticulationPoints(), mapLimit),
 	}
 
+	whatIfLimit := 10
+	if maxResults > 0 && maxResults < whatIfLimit {
+		whatIfLimit = maxResults
+	}
+
 	output := struct {
 		RobotEnvelope
 		AnalysisConfig analysis.AnalysisConfig `json:"analysis_config"`
@@ -2337,7 +2386,7 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		LabelContext:     ctx.LabelContext,
 		Insights:         insights,
 		FullStats:        fullStats,
-		TopWhatIfs:       analyzer.TopWhatIfDeltasFromStats(&stats, 10),
+		TopWhatIfs:       analyzer.TopWhatIfDeltasFromStats(&stats, whatIfLimit),
 		AdvancedInsights: analyzer.GenerateAdvancedInsightsFromStats(&stats, analysis.DefaultAdvancedInsightsConfig()),
 		UsageHints: []string{
 			"jq '.Bottlenecks[:5] | map(.ID)' - Top 5 bottleneck IDs",
@@ -2353,12 +2402,26 @@ func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		},
 	}
 
-	if sourceDateEpochActive() && output.AdvancedInsights.ParallelGain != nil {
+	if sourceDateEpochActive() && output.AdvancedInsights != nil && output.AdvancedInsights.ParallelGain != nil {
 		// Match the core metric status: measured wall time is not reproducible,
 		// even when the analysis itself runs deterministically to completion.
 		output.AdvancedInsights.ParallelGain.Status.DurationMs = 0
 	}
 
+	return output, nil
+}
+
+func handleRobotInsights(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
+	includeInactive := cfg.IncludeInactive != nil && *cfg.IncludeInactive
+	forceFull := cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis
+	maxResults := 0
+	if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+		maxResults = *cfg.RobotMaxResults
+	}
+	output, err := buildRobotInsightsPayload(ctx, includeInactive, forceFull, maxResults)
+	if err != nil {
+		return err
+	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding insights: %w", err)
 	}
@@ -2504,6 +2567,52 @@ func generateTriageHistoryBounded(workDir, beadsPath, asOfCommit string, beadInf
 	}
 }
 
+func isCLIFlagExplicitlySet(name string) bool {
+	if pflag.CommandLine == nil {
+		return false
+	}
+	return pflag.CommandLine.Changed(name)
+}
+
+func generateWorkspaceTriageHistoryBounded(ctx RobotContext, limit int, timeout time.Duration) (*correlation.HistoryReport, string) {
+	histCtx := context.Background()
+	cancel := context.CancelFunc(func() {})
+	if timeout > 0 {
+		histCtx, cancel = context.WithTimeout(context.Background(), timeout)
+	}
+	defer cancel()
+
+	type historyResult struct {
+		report *correlation.HistoryReport
+		err    error
+	}
+	resCh := make(chan historyResult, 1)
+	go func() {
+		report, err := generateWorkspaceCorrelationReportWithContext(histCtx, ctx, correlation.CorrelatorOptions{
+			Limit:    limit,
+			Revision: ctx.AsOfCommit,
+		}, false)
+		resCh <- historyResult{report: report, err: err}
+	}()
+
+	select {
+	case res := <-resCh:
+		if res.err != nil {
+			return nil, "error"
+		}
+		return res.report, "ok"
+	case <-histCtx.Done():
+		cancel()
+		shutdownTimer := time.NewTimer(robotHistoryShutdownGrace)
+		defer shutdownTimer.Stop()
+		select {
+		case <-resCh:
+		case <-shutdownTimer.C:
+		}
+		return nil, "timeout"
+	}
+}
+
 func loadTriageHistoryForContext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) (*correlation.HistoryReport, string) {
 	hasOpenIssues := false
 	for _, issue := range ctx.Issues {
@@ -2518,6 +2627,13 @@ func loadTriageHistoryForContext(ctx RobotContext, cfg phaseThreeRobotHandlerCon
 	if sourceDateEpochActive() {
 		return nil, "skipped"
 	}
+	limit := 200
+	if cfg.HistoryLimit != nil && (*cfg.HistoryLimit != 500 || isCLIFlagExplicitlySet("history-limit")) {
+		limit = *cfg.HistoryLimit
+	}
+	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
+		return generateWorkspaceTriageHistoryBounded(ctx, limit, resolveRobotHistoryTimeout(cfg))
+	}
 	workDir, err := ctx.WorkDirOrDefault()
 	if err != nil {
 		return nil, ""
@@ -2525,13 +2641,6 @@ func loadTriageHistoryForContext(ctx RobotContext, cfg phaseThreeRobotHandlerCon
 	beadsPath, err := resolveCorrelationBeadsPathForContext(ctx, workDir)
 	if err != nil {
 		return nil, ""
-	}
-	limit := 500
-	if cfg.HistoryLimit != nil {
-		limit = *cfg.HistoryLimit
-	}
-	if limit == 500 {
-		limit = 200
 	}
 	beadInfos := buildCorrelationBeadInfos(ctx.Issues)
 	return generateTriageHistoryBounded(
@@ -2749,6 +2858,15 @@ func robotNextClaimabilityReasons(pick analysis.TopPick, issueByID map[string]mo
 	if assignee := strings.TrimSpace(issue.Assignee); assignee != "" {
 		reasons = append(reasons, fmt.Sprintf("%s is already assigned to %s", pick.ID, assignee))
 	}
+	if issue.Ephemeral {
+		reasons = append(reasons, fmt.Sprintf("%s is ephemeral", pick.ID))
+	}
+	if issue.Pinned {
+		reasons = append(reasons, fmt.Sprintf("%s is pinned", pick.ID))
+	}
+	if issue.IsTemplate {
+		reasons = append(reasons, fmt.Sprintf("%s is a template", pick.ID))
+	}
 	// Scheduler deferral (issue #191): a future defer_until withholds the bead
 	// from claiming, exactly as `br ready` hides it.
 	if issue.IsDeferredAt(now) {
@@ -2965,10 +3083,6 @@ func handleRobotHistory(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 	if err != nil {
 		return fmt.Errorf("getting current directory: %w", err)
 	}
-	beadsPath, err := resolveCorrelationBeadsPathForContext(ctx, workDir)
-	if err != nil {
-		return err
-	}
 
 	opts := correlation.CorrelatorOptions{Limit: 500, Revision: ctx.AsOfCommit}
 	if cfg.BeadHistoryFlag != nil {
@@ -2987,28 +3101,24 @@ func handleRobotHistory(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		}
 	}
 
-	beadInfos := buildCorrelationBeadInfos(ctx.Issues)
-
-	correlator, err := newCorrelatorWithFeedback(workDir, beadsPath)
+	report, err := generateCorrelationReportForContext(ctx, workDir, opts)
 	if err != nil {
 		return err
 	}
-	report, err := correlator.GenerateReportCached(beadInfos, opts)
-	if err != nil {
-		return fmt.Errorf("generating history report: %w", err)
-	}
 	report.GeneratedAt = robotNow()
 
-	if cfg.MinConfidence != nil && *cfg.MinConfidence > 0 {
+	effectiveMinConf := 0.0
+	if cfg.MinConfidence != nil && *cfg.MinConfidence > effectiveMinConf {
+		effectiveMinConf = *cfg.MinConfidence
+	}
+	if cfg.RobotMinConf != nil && *cfg.RobotMinConf > effectiveMinConf {
+		effectiveMinConf = *cfg.RobotMinConf
+	}
+	if effectiveMinConf > 0 {
 		scorer := correlation.NewScorer()
-		report.Histories = scorer.FilterHistoriesByConfidence(report.Histories, *cfg.MinConfidence)
+		report.Histories = scorer.FilterHistoriesByConfidence(report.Histories, effectiveMinConf)
 		report.CommitIndex = correlation.BuildCommitIndex(report.Histories)
-		report.Stats.BeadsWithCommits = 0
-		for _, history := range report.Histories {
-			if len(history.Commits) > 0 {
-				report.Stats.BeadsWithCommits++
-			}
-		}
+		report.Stats = recomputeHistoryStatsFiltered(report.Histories, report.Stats.Strategies, report.Stats.FeedbackApplied, true)
 	}
 
 	// Same top-level keys as the report plus the shared envelope (source,
@@ -3100,7 +3210,8 @@ func resolveCorrelationBeadsPathForContext(ctx RobotContext, workDir string) (st
 			return beadsPath, nil
 		}
 	}
-	if err := correlation.ValidateRepository(workDir); err != nil {
+	beadsDir, _ := loader.GetBeadsDir(workDir)
+	if err := correlation.ValidateRepositoryWithBeadsDir(workDir, beadsDir); err != nil {
 		return "", err
 	}
 	_, beadsPath, err := resolveCorrelationBeadsPath(workDir)
@@ -3141,9 +3252,1028 @@ func generateCorrelationReport(workDir string, issues []model.Issue, opts correl
 	return report, nil
 }
 
+func recomputeHistoryStats(histories map[string]correlation.BeadHistory, strategies []correlation.StrategyRun, fb *correlation.FeedbackApplied) correlation.HistoryStats {
+	return recomputeHistoryStatsFiltered(histories, strategies, fb, false)
+}
+
+func recomputeHistoryStatsFiltered(histories map[string]correlation.BeadHistory, strategies []correlation.StrategyRun, fb *correlation.FeedbackApplied, onlyWithCommits bool) correlation.HistoryStats {
+	stats := correlation.HistoryStats{
+		TotalBeads:         len(histories),
+		MethodDistribution: make(map[string]int),
+		Strategies:         strategies,
+		FeedbackApplied:    fb,
+	}
+	authors := make(map[string]bool)
+	uniqueCommits := make(map[string]bool)
+	var cycleTimes []time.Duration
+
+	for _, history := range histories {
+		if len(history.Commits) > 0 {
+			stats.BeadsWithCommits++
+		} else if onlyWithCommits {
+			continue
+		}
+		for _, commit := range history.Commits {
+			uniqueCommits[commit.SHA] = true
+			if commit.Author != "" {
+				authors[commit.Author] = true
+			}
+			for _, method := range commit.AllMethods() {
+				stats.MethodDistribution[method]++
+			}
+			if commit.Confirmed {
+				stats.MethodDistribution[correlation.MethodDistributionConfirmedByFeedback]++
+			}
+		}
+		for _, event := range history.Events {
+			if event.Author != "" {
+				authors[event.Author] = true
+			}
+		}
+		if history.CycleTime != nil && history.CycleTime.ClaimToClose != nil {
+			cycleTimes = append(cycleTimes, *history.CycleTime.ClaimToClose)
+		}
+	}
+
+	stats.TotalCommits = len(uniqueCommits)
+	stats.UniqueAuthors = len(authors)
+	if stats.BeadsWithCommits > 0 {
+		stats.AvgCommitsPerBead = float64(stats.TotalCommits) / float64(stats.BeadsWithCommits)
+	}
+	if len(cycleTimes) > 0 {
+		var total time.Duration
+		for _, ct := range cycleTimes {
+			total += ct
+		}
+		avgDays := total.Hours() / 24 / float64(len(cycleTimes))
+		stats.AvgCycleTimeDays = &avgDays
+	}
+	return stats
+}
+
+type workspaceCorrelationSource struct {
+	source    RobotSourceReport
+	repoRoot  string
+	beadsPath string
+	repoLabel string
+}
+
+func findEnclosingGitRoot(startPath string) (string, error) {
+	if strings.TrimSpace(startPath) == "" {
+		return "", fmt.Errorf("empty start path")
+	}
+	abs, err := filepath.Abs(startPath)
+	if err != nil {
+		return "", err
+	}
+	if info, statErr := os.Stat(abs); statErr == nil && !info.IsDir() {
+		abs = filepath.Dir(abs)
+	}
+	dir := filepath.Clean(abs)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("not a git repository: %s", startPath)
+		}
+		dir = parent
+	}
+}
+
+func validateWorkspaceCorrelationStore(gitRoot, beadsDir string) error {
+	if strings.TrimSpace(gitRoot) == "" {
+		return fmt.Errorf("empty git root")
+	}
+	if _, err := os.Stat(filepath.Join(gitRoot, ".git")); err != nil {
+		return fmt.Errorf("missing .git at %s: %w", gitRoot, err)
+	}
+	if strings.TrimSpace(beadsDir) == "" {
+		return fmt.Errorf("empty beads directory")
+	}
+	for _, marker := range []string{"issues.jsonl", "beads.jsonl", "beads.base.jsonl", "beads.db", "metadata.json"} {
+		if _, err := os.Stat(filepath.Join(beadsDir, marker)); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("no tracker files found in %s", beadsDir)
+}
+
+func resolveSourceBeadsDir(src RobotSourceReport) string {
+	sp := strings.TrimSpace(src.SourcePath)
+	if sp != "" {
+		if info, err := os.Stat(sp); err == nil {
+			if info.IsDir() {
+				return filepath.Clean(sp)
+			}
+			return filepath.Clean(filepath.Dir(sp))
+		}
+		lower := strings.ToLower(filepath.Base(sp))
+		if strings.HasSuffix(lower, ".jsonl") || strings.HasSuffix(lower, ".db") {
+			return filepath.Clean(filepath.Dir(sp))
+		}
+		return filepath.Clean(sp)
+	}
+	if strings.TrimSpace(src.RepoRoot) != "" {
+		return filepath.Clean(filepath.Join(src.RepoRoot, ".beads"))
+	}
+	return ""
+}
+
+func resolveWorkspaceCorrelationSources(ctx RobotContext) ([]workspaceCorrelationSource, bool) {
+	if ctx.SourceKind != "workspace" || ctx.SourceAuthority == nil {
+		return nil, false
+	}
+	var resolved []workspaceCorrelationSource
+	distinctRoots := make(map[string]bool)
+	for _, src := range ctx.SourceAuthority.Sources {
+		if src.Status != "loaded" {
+			continue
+		}
+		beadsDir := resolveSourceBeadsDir(src)
+		startPath := strings.TrimSpace(src.RepoRoot)
+		if startPath == "" {
+			startPath = beadsDir
+		}
+		gitRoot, err := findEnclosingGitRoot(startPath)
+		if err != nil {
+			continue
+		}
+		var beadsPath string
+		if strings.HasSuffix(strings.ToLower(src.SourcePath), ".jsonl") {
+			beadsPath = src.SourcePath
+		} else if beadsDir != "" {
+			beadsPath = resolveSQLiteStoreJSONLPath(beadsDir)
+		} else if _, bp, err := resolveCorrelationBeadsPath(gitRoot); err == nil {
+			beadsPath = bp
+			beadsDir = filepath.Dir(bp)
+		}
+		if beadsPath == "" || validateWorkspaceCorrelationStore(gitRoot, beadsDir) != nil {
+			continue
+		}
+		label := strings.TrimSpace(src.Name)
+		if label == "" {
+			label = src.SourceRepo
+		}
+		distinctRoots[filepath.Clean(gitRoot)] = true
+		resolved = append(resolved, workspaceCorrelationSource{
+			source:    src,
+			repoRoot:  gitRoot,
+			beadsPath: beadsPath,
+			repoLabel: label,
+		})
+	}
+	return resolved, len(distinctRoots) > 1
+}
+
+func localBeadIDForWorkspaceIssue(issue model.Issue, src RobotSourceReport) string {
+	if issue.Origin != nil && strings.TrimSpace(issue.Origin.LocalID) != "" {
+		return issue.Origin.LocalID
+	}
+	if src.RepoPrefix != "" && len(issue.ID) > len(src.RepoPrefix) && strings.EqualFold(issue.ID[:len(src.RepoPrefix)], src.RepoPrefix) {
+		return issue.ID[len(src.RepoPrefix):]
+	}
+	return issue.ID
+}
+
+func qualifyWorkspaceHistoricalID(localID string, src RobotSourceReport, localToQualified map[string]string, knownQualified map[string]bool) string {
+	if localID == "" {
+		return ""
+	}
+	if q, ok := localToQualified[localID]; ok {
+		return q
+	}
+	if knownQualified[localID] {
+		return localID
+	}
+	return workspace.QualifyID(localID, src.RepoPrefix)
+}
+
+func remapHistoricalIssueState(state *correlation.HistoricalIssueState, src RobotSourceReport, localToQualified map[string]string, knownQualified map[string]bool) *correlation.HistoricalIssueState {
+	if state == nil {
+		return nil
+	}
+	cp := *state
+	cp.ID = qualifyWorkspaceHistoricalID(cp.ID, src, localToQualified, knownQualified)
+	if len(state.Dependencies) > 0 {
+		cp.Dependencies = make([]correlation.HistoricalDependency, len(state.Dependencies))
+		for i, dep := range state.Dependencies {
+			cp.Dependencies[i] = correlation.HistoricalDependency{
+				DependsOnID: qualifyWorkspaceHistoricalID(dep.DependsOnID, src, localToQualified, knownQualified),
+				Type:        dep.Type,
+			}
+		}
+	}
+	return &cp
+}
+
+func remapWorkspaceBeadEvent(ev correlation.BeadEvent, src RobotSourceReport, localToQualified map[string]string, knownQualified map[string]bool) correlation.BeadEvent {
+	ev.BeadID = qualifyWorkspaceHistoricalID(ev.BeadID, src, localToQualified, knownQualified)
+	ev.Before = remapHistoricalIssueState(ev.Before, src, localToQualified, knownQualified)
+	ev.After = remapHistoricalIssueState(ev.After, src, localToQualified, knownQualified)
+	return ev
+}
+
+func generateWorkspaceCorrelationReport(ctx RobotContext, opts correlation.CorrelatorOptions, raw bool) (*correlation.HistoryReport, error) {
+	return generateWorkspaceCorrelationReportWithContext(context.Background(), ctx, opts, raw)
+}
+
+type workspaceSharedGitMeta struct {
+	ambiguousByRoot map[string]map[string]bool
+	subtreeByKey    map[string]string
+	siblingsByKey   map[string][]string
+	storeDirsByRoot map[string][]string
+}
+
+func workspaceSourceIdentityKey(ws workspaceCorrelationSource) string {
+	return filepath.Clean(ws.repoRoot) + "|" + filepath.Clean(ws.beadsPath) + "|" + strings.ToLower(strings.TrimSpace(ws.source.SourceRepo))
+}
+
+func storeDirRelForWorkspaceSource(ws workspaceCorrelationSource) string {
+	cleanRoot := filepath.Clean(ws.repoRoot)
+	storeDir := filepath.Clean(filepath.Dir(ws.beadsPath))
+	rel, err := filepath.Rel(cleanRoot, storeDir)
+	if err != nil || rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return strings.Trim(filepath.ToSlash(rel), "/")
+}
+
+func storeSubtreePrefixForWorkspaceSource(ws workspaceCorrelationSource) string {
+	cleanRoot := filepath.Clean(ws.repoRoot)
+	storeDir := filepath.Clean(filepath.Dir(ws.beadsPath))
+	containerDir := filepath.Dir(storeDir)
+	if filepath.Base(containerDir) == ".beads" {
+		containerDir = filepath.Dir(containerDir)
+	}
+	rel, err := filepath.Rel(cleanRoot, containerDir)
+	if err != nil || rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return strings.Trim(filepath.ToSlash(rel), "/") + "/"
+}
+
+func buildWorkspaceSharedGitMeta(sources []workspaceCorrelationSource, allIssues []model.Issue) workspaceSharedGitMeta {
+	meta := workspaceSharedGitMeta{
+		ambiguousByRoot: make(map[string]map[string]bool),
+		subtreeByKey:    make(map[string]string, len(sources)),
+		siblingsByKey:   make(map[string][]string, len(sources)),
+		storeDirsByRoot: make(map[string][]string),
+	}
+	issuesByRepo := make(map[string][]model.Issue)
+	for _, issue := range allIssues {
+		rk := strings.ToLower(strings.TrimSpace(issue.SourceRepo))
+		issuesByRepo[rk] = append(issuesByRepo[rk], issue)
+	}
+	byRoot := make(map[string][]workspaceCorrelationSource)
+	for _, ws := range sources {
+		cleanRoot := filepath.Clean(ws.repoRoot)
+		byRoot[cleanRoot] = append(byRoot[cleanRoot], ws)
+		idKey := workspaceSourceIdentityKey(ws)
+		meta.subtreeByKey[idKey] = storeSubtreePrefixForWorkspaceSource(ws)
+		if dirRel := storeDirRelForWorkspaceSource(ws); dirRel != "" {
+			meta.storeDirsByRoot[cleanRoot] = append(meta.storeDirsByRoot[cleanRoot], dirRel)
+		}
+	}
+	for cleanRoot, group := range byRoot {
+		if len(group) <= 1 {
+			continue
+		}
+		localIDStoreCounts := make(map[string]int)
+		var nonEmptySubtrees []string
+		seenSubtree := make(map[string]bool)
+		for _, ws := range group {
+			idKey := workspaceSourceIdentityKey(ws)
+			if sub := meta.subtreeByKey[idKey]; sub != "" && !seenSubtree[sub] {
+				seenSubtree[sub] = true
+				nonEmptySubtrees = append(nonEmptySubtrees, sub)
+			}
+			rk := strings.ToLower(strings.TrimSpace(ws.source.SourceRepo))
+			seenInStore := make(map[string]bool)
+			for _, issue := range issuesByRepo[rk] {
+				localID := strings.ToLower(strings.TrimSpace(localBeadIDForWorkspaceIssue(issue, ws.source)))
+				if localID != "" && !seenInStore[localID] {
+					seenInStore[localID] = true
+					localIDStoreCounts[localID]++
+				}
+			}
+		}
+		sort.Strings(nonEmptySubtrees)
+		amb := make(map[string]bool)
+		for lid, count := range localIDStoreCounts {
+			if count > 1 {
+				amb[lid] = true
+			}
+		}
+		if len(amb) > 0 {
+			meta.ambiguousByRoot[cleanRoot] = amb
+		}
+		for _, ws := range group {
+			idKey := workspaceSourceIdentityKey(ws)
+			if meta.subtreeByKey[idKey] == "" && len(nonEmptySubtrees) > 0 {
+				meta.siblingsByKey[idKey] = nonEmptySubtrees
+			}
+		}
+	}
+	return meta
+}
+
+func buildExplicitAliasesForWorkspaceBeads(issues []model.Issue, src RobotSourceReport) map[string]string {
+	var aliases map[string]string
+	for _, issue := range issues {
+		localID := localBeadIDForWorkspaceIssue(issue, src)
+		if issue.ID != "" && localID != "" && !strings.EqualFold(issue.ID, localID) {
+			if aliases == nil {
+				aliases = make(map[string]string, len(issues))
+			}
+			aliases[issue.ID] = localID
+		}
+	}
+	return aliases
+}
+
+func generateWorkspaceCorrelationReportWithContext(runCtx context.Context, ctx RobotContext, opts correlation.CorrelatorOptions, raw bool) (*correlation.HistoryReport, error) {
+	sources, prefixFiles := resolveWorkspaceCorrelationSources(ctx)
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("no git repositories available in workspace")
+	}
+
+	allWorkspaceIssues := ctx.Issues
+	if len(ctx.FullIssues) > 0 {
+		allWorkspaceIssues = ctx.FullIssues
+	}
+	sharedMeta := buildWorkspaceSharedGitMeta(sources, allWorkspaceIssues)
+
+	knownQualified := make(map[string]bool, len(allWorkspaceIssues))
+	fullIssueByID := make(map[string]model.Issue, len(allWorkspaceIssues))
+	for _, issue := range allWorkspaceIssues {
+		knownQualified[issue.ID] = true
+		fullIssueByID[issue.ID] = issue
+	}
+
+	issuesBySourceRepo := make(map[string][]model.Issue)
+	for _, issue := range ctx.Issues {
+		repoKey := strings.ToLower(strings.TrimSpace(issue.SourceRepo))
+		issuesBySourceRepo[repoKey] = append(issuesBySourceRepo[repoKey], issue)
+	}
+
+	targetFilterID := strings.TrimSpace(opts.BeadID)
+	targetCausalID := strings.TrimSpace(opts.CausalityBeadID)
+
+	mergedHistories := make(map[string]correlation.BeadHistory)
+	var allStrategies []correlation.StrategyRun
+	var mergedFeedback *correlation.FeedbackApplied
+	var mergedCausal *correlation.CausalHistory
+	var gitRange string
+	var latestSHA string
+	var latestTime time.Time
+	totalWalkedCommits := 0
+	countedWindowRoots := make(map[string]bool)
+
+	for _, ws := range sources {
+		if ctx.Repo != "" && !sourceMatchesRepoFilter(ws.source, ctx.Repo) {
+			continue
+		}
+		repoKey := strings.ToLower(strings.TrimSpace(ws.source.SourceRepo))
+		repoIssues := issuesBySourceRepo[repoKey]
+
+		localToQualified := make(map[string]string, len(repoIssues)+4)
+		localBeads := make([]correlation.BeadInfo, 0, len(repoIssues))
+		for _, issue := range repoIssues {
+			localID := localBeadIDForWorkspaceIssue(issue, ws.source)
+			localToQualified[localID] = issue.ID
+			localBeads = append(localBeads, correlation.BeadInfo{
+				ID:     localID,
+				Title:  issue.Title,
+				Status: string(issue.Status),
+			})
+		}
+
+		resolveLocalTarget := func(targetID string) (string, []string, bool) {
+			if targetIssue, exists := fullIssueByID[targetID]; exists {
+				if !strings.EqualFold(strings.TrimSpace(targetIssue.SourceRepo), repoKey) {
+					return "", nil, false
+				}
+				return localBeadIDForWorkspaceIssue(targetIssue, ws.source), nil, true
+			}
+			prefix := ws.source.RepoPrefix
+			if prefix != "" {
+				if len(targetID) > len(prefix) && strings.EqualFold(targetID[:len(prefix)], prefix) {
+					stripped := targetID[len(prefix):]
+					if !strings.EqualFold(stripped, targetID) {
+						return stripped, []string{targetID}, true
+					}
+					return stripped, nil, true
+				}
+				return "", nil, false
+			}
+			return targetID, nil, true
+		}
+
+		cleanRoot := filepath.Clean(ws.repoRoot)
+		idKey := workspaceSourceIdentityKey(ws)
+		repoOpts := opts
+		repoOpts.ExplicitIDAliases = buildExplicitAliasesForWorkspaceBeads(repoIssues, ws.source)
+		repoOpts.AmbiguousUnprefixedIDs = sharedMeta.ambiguousByRoot[cleanRoot]
+		repoOpts.StoreSubtreePrefix = sharedMeta.subtreeByKey[idKey]
+		repoOpts.SiblingSubtreePrefixes = sharedMeta.siblingsByKey[idKey]
+
+		if targetFilterID != "" {
+			localTarget, aliases, ok := resolveLocalTarget(targetFilterID)
+			if !ok {
+				continue
+			}
+			repoOpts.BeadID = localTarget
+			repoOpts.TargetBeadAliases = append(append([]string(nil), repoOpts.TargetBeadAliases...), aliases...)
+			if localTarget != "" {
+				if _, exists := localToQualified[localTarget]; !exists {
+					localToQualified[localTarget] = workspace.QualifyID(localTarget, ws.source.RepoPrefix)
+				}
+			}
+			for _, al := range aliases {
+				if _, exists := localToQualified[al]; !exists {
+					localToQualified[al] = workspace.QualifyID(al, ws.source.RepoPrefix)
+				}
+			}
+		}
+		if targetCausalID != "" {
+			localTarget, aliases, ok := resolveLocalTarget(targetCausalID)
+			if !ok {
+				continue
+			}
+			repoOpts.CausalityBeadID = localTarget
+			for _, al := range aliases {
+				repoOpts.TargetBeadAliases = append(repoOpts.TargetBeadAliases, al)
+				if _, exists := localToQualified[al]; !exists {
+					localToQualified[al] = workspace.QualifyID(al, ws.source.RepoPrefix)
+				}
+			}
+			if localTarget != "" {
+				if _, exists := localToQualified[localTarget]; !exists {
+					localToQualified[localTarget] = workspace.QualifyID(localTarget, ws.source.RepoPrefix)
+				}
+			}
+		}
+
+		var (
+			correlator *correlation.Correlator
+			err        error
+		)
+		if raw {
+			correlator = correlation.NewCorrelator(ws.repoRoot, ws.beadsPath)
+		} else {
+			correlator, err = newCorrelatorWithFeedback(ws.repoRoot, ws.beadsPath)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if runCtx != nil {
+			correlator = correlator.WithContext(runCtx)
+		}
+
+		part, err := correlator.GenerateReportCached(localBeads, repoOpts)
+		if err != nil {
+			return nil, fmt.Errorf("correlating workspace repository %q: %w", ws.repoLabel, err)
+		}
+		if gitRange == "" {
+			gitRange = part.GitRange
+		}
+		if part.Window != nil && !countedWindowRoots[cleanRoot] {
+			countedWindowRoots[cleanRoot] = true
+			totalWalkedCommits += part.Window.Commits
+		}
+		allStrategies = append(allStrategies, part.Stats.Strategies...)
+		if part.Stats.FeedbackApplied != nil {
+			if mergedFeedback == nil {
+				mergedFeedback = &correlation.FeedbackApplied{}
+			}
+			mergedFeedback.Confirmed += part.Stats.FeedbackApplied.Confirmed
+			mergedFeedback.Rejected += part.Stats.FeedbackApplied.Rejected
+			mergedFeedback.Ignored += part.Stats.FeedbackApplied.Ignored
+		}
+
+		for localID, hist := range part.Histories {
+			qualID := qualifyWorkspaceHistoricalID(localID, ws.source, localToQualified, knownQualified)
+			hist.BeadID = qualID
+			events := make([]correlation.BeadEvent, len(hist.Events))
+			for i, ev := range hist.Events {
+				events[i] = remapWorkspaceBeadEvent(ev, ws.source, localToQualified, knownQualified)
+				if events[i].Timestamp.After(latestTime) {
+					latestTime = events[i].Timestamp
+					latestSHA = events[i].CommitSHA
+				}
+			}
+			hist.Events = events
+			hist.Milestones = correlation.GetBeadMilestones(hist.Events)
+
+			commits := make([]correlation.CorrelatedCommit, len(hist.Commits))
+			for i, cc := range hist.Commits {
+				cc.BeadID = qualID
+				if prefixFiles && ws.repoLabel != "" && len(cc.Files) > 0 {
+					files := make([]correlation.FileChange, len(cc.Files))
+					for j, f := range cc.Files {
+						f.Path = path.Join(ws.repoLabel, strings.TrimPrefix(filepath.ToSlash(f.Path), "./"))
+						files[j] = f
+					}
+					cc.Files = files
+				}
+				if cc.Timestamp.After(latestTime) {
+					latestTime = cc.Timestamp
+					latestSHA = cc.SHA
+				}
+				commits[i] = cc
+			}
+			hist.Commits = commits
+			mergedHistories[qualID] = hist
+		}
+
+		if part.CausalHistory != nil {
+			ch := *part.CausalHistory
+			ch.BeadID = qualifyWorkspaceHistoricalID(ch.BeadID, ws.source, localToQualified, knownQualified)
+			obs := make([]correlation.CausalObservation, len(ch.Observations))
+			for i, o := range ch.Observations {
+				o.Before.Issue = remapHistoricalIssueState(o.Before.Issue, ws.source, localToQualified, knownQualified)
+				if len(o.Before.Blockers) > 0 {
+					b := make([]string, len(o.Before.Blockers))
+					for j, id := range o.Before.Blockers {
+						b[j] = qualifyWorkspaceHistoricalID(id, ws.source, localToQualified, knownQualified)
+					}
+					o.Before.Blockers = b
+				}
+				o.After.Issue = remapHistoricalIssueState(o.After.Issue, ws.source, localToQualified, knownQualified)
+				if len(o.After.Blockers) > 0 {
+					b := make([]string, len(o.After.Blockers))
+					for j, id := range o.After.Blockers {
+						b[j] = qualifyWorkspaceHistoricalID(id, ws.source, localToQualified, knownQualified)
+					}
+					o.After.Blockers = b
+				}
+				if len(o.Changes) > 0 {
+					changes := make([]correlation.BeadEvent, len(o.Changes))
+					for j, ev := range o.Changes {
+						changes[j] = remapWorkspaceBeadEvent(ev, ws.source, localToQualified, knownQualified)
+					}
+					o.Changes = changes
+				}
+				obs[i] = o
+			}
+			ch.Observations = obs
+			mergedCausal = &ch
+		}
+
+		if latestSHA == "" && part.LatestCommitSHA != "" {
+			latestSHA = part.LatestCommitSHA
+		}
+	}
+
+	if opts.Revision != "" {
+		latestSHA = opts.Revision
+	}
+	dataHash := ctx.DataHash
+	if dataHash == "" {
+		dataHash = analysis.ComputeDataHash(ctx.Issues)
+	}
+	commitIndex := correlation.BuildCommitIndex(mergedHistories)
+	stats := recomputeHistoryStats(mergedHistories, allStrategies, mergedFeedback)
+
+	return &correlation.HistoryReport{
+		GeneratedAt:     robotNow(),
+		DataHash:        dataHash,
+		GitRange:        gitRange,
+		LatestCommitSHA: latestSHA,
+		Window: &correlation.HistoryWindow{
+			Revision: opts.Revision,
+			Limit:    opts.Limit,
+			Since:    opts.Since,
+			Until:    opts.Until,
+			Commits:  totalWalkedCommits,
+		},
+		Stats:         stats,
+		Histories:     mergedHistories,
+		CommitIndex:   commitIndex,
+		CausalHistory: mergedCausal,
+	}, nil
+}
+
+func resolveWorkspaceFeedbackStoreForBead(ctx RobotContext, workDir, beadID string) (*correlation.FeedbackStore, string, error) {
+	if ctx.SourceKind != "workspace" || ctx.SourceAuthority == nil {
+		store, err := loadCorrelationFeedbackStore(workDir)
+		return store, beadID, err
+	}
+	sources, _ := resolveWorkspaceCorrelationSources(ctx)
+	allIssues := ctx.Issues
+	if len(ctx.FullIssues) > 0 {
+		allIssues = ctx.FullIssues
+	}
+	for _, issue := range allIssues {
+		if issue.ID != beadID {
+			continue
+		}
+		for _, ws := range sources {
+			if strings.EqualFold(strings.TrimSpace(issue.SourceRepo), strings.TrimSpace(ws.source.SourceRepo)) {
+				store, err := loadCorrelationFeedbackStoreForBeadsPath(ws.repoRoot, ws.beadsPath)
+				if err != nil {
+					return nil, "", err
+				}
+				return store, localBeadIDForWorkspaceIssue(issue, ws.source), nil
+			}
+		}
+	}
+	// Fallback: match by workspace source prefix for deleted/tombstoned beads absent from allIssues.
+	for _, ws := range sources {
+		prefix := ws.source.RepoPrefix
+		if prefix != "" && len(beadID) > len(prefix) && strings.EqualFold(beadID[:len(prefix)], prefix) {
+			store, err := loadCorrelationFeedbackStoreForBeadsPath(ws.repoRoot, ws.beadsPath)
+			if err != nil {
+				return nil, "", err
+			}
+			stripped := beadID[len(prefix):]
+			if !strings.EqualFold(stripped, beadID) {
+				if part, corrErr := correlation.NewCorrelator(ws.repoRoot, ws.beadsPath).GenerateReportCached(nil, correlation.CorrelatorOptions{
+					BeadID:            stripped,
+					TargetBeadAliases: []string{beadID},
+					Revision:          ctx.AsOfCommit,
+				}); corrErr == nil {
+					if _, ok := part.Histories[beadID]; ok {
+						return store, beadID, nil
+					}
+				}
+			}
+			return store, stripped, nil
+		}
+	}
+	return nil, "", fmt.Errorf("workspace repository not found for bead %q", beadID)
+}
+
+func loadWorkspaceCorrelationFeedbackStats(ctx RobotContext, workDir string) (correlation.FeedbackStats, error) {
+	if ctx.SourceKind != "workspace" || ctx.SourceAuthority == nil {
+		store, err := loadCorrelationFeedbackStore(workDir)
+		if err != nil {
+			return correlation.FeedbackStats{}, err
+		}
+		return store.GetStats(), nil
+	}
+	sources, _ := resolveWorkspaceCorrelationSources(ctx)
+	if len(sources) == 0 {
+		return correlation.FeedbackStats{}, fmt.Errorf("no git repositories available in workspace")
+	}
+	var agg correlation.FeedbackStats
+	var confirmConfSum, rejectConfSum float64
+	seenDirs := make(map[string]bool)
+	for _, ws := range sources {
+		if ctx.Repo != "" && !sourceMatchesRepoFilter(ws.source, ctx.Repo) {
+			continue
+		}
+		var beadsDir string
+		if strings.TrimSpace(ws.beadsPath) != "" {
+			beadsDir = filepath.Dir(ws.beadsPath)
+		} else {
+			var err error
+			beadsDir, err = loader.GetBeadsDir(ws.repoRoot)
+			if err != nil {
+				continue
+			}
+		}
+		cleanDir := filepath.Clean(beadsDir)
+		if seenDirs[cleanDir] {
+			continue
+		}
+		seenDirs[cleanDir] = true
+		store := correlation.NewFeedbackStore(cleanDir)
+		if err := store.Load(); err != nil {
+			return correlation.FeedbackStats{}, fmt.Errorf("loading feedback for %s: %w", ws.repoLabel, err)
+		}
+		st := store.GetStats()
+		agg.TotalFeedback += st.TotalFeedback
+		agg.Confirmed += st.Confirmed
+		agg.Rejected += st.Rejected
+		agg.Ignored += st.Ignored
+		confirmConfSum += st.AvgConfirmConf * float64(st.Confirmed)
+		rejectConfSum += st.AvgRejectConf * float64(st.Rejected)
+	}
+	if denom := agg.Confirmed + agg.Rejected; denom > 0 {
+		agg.AccuracyRate = float64(agg.Confirmed) / float64(denom)
+	}
+	if agg.Confirmed > 0 {
+		agg.AvgConfirmConf = confirmConfSum / float64(agg.Confirmed)
+	}
+	if agg.Rejected > 0 {
+		agg.AvgRejectConf = rejectConfSum / float64(agg.Rejected)
+	}
+	return agg, nil
+}
+
+func detectWorkspaceOrphans(ctx RobotContext, limit int) (*correlation.OrphanReport, error) {
+	sources, prefixFiles := resolveWorkspaceCorrelationSources(ctx)
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("no git repositories available in workspace")
+	}
+	allWorkspaceIssues := ctx.Issues
+	if len(ctx.FullIssues) > 0 {
+		allWorkspaceIssues = ctx.FullIssues
+	}
+	sharedMeta := buildWorkspaceSharedGitMeta(sources, allWorkspaceIssues)
+
+	knownQualified := make(map[string]bool, len(allWorkspaceIssues))
+	fullIssuesBySourceRepo := make(map[string][]model.Issue)
+	for _, issue := range allWorkspaceIssues {
+		knownQualified[issue.ID] = true
+		key := strings.ToLower(strings.TrimSpace(issue.SourceRepo))
+		fullIssuesBySourceRepo[key] = append(fullIssuesBySourceRepo[key], issue)
+	}
+
+	scopedIssueIDs := make(map[string]bool, len(ctx.Issues))
+	for _, issue := range ctx.Issues {
+		scopedIssueIDs[issue.ID] = true
+	}
+
+	var (
+		allCandidates []correlation.OrphanCandidate
+		byBead        = make(map[string][]string)
+		aggStats      correlation.OrphanReportStats
+		aggWindow     correlation.OrphanWindow
+		gitRange      string
+		usageHints    []string
+	)
+	var rootOrder []string
+	sourcesByRoot := make(map[string][]workspaceCorrelationSource)
+	for _, ws := range sources {
+		cleanRoot := filepath.Clean(ws.repoRoot)
+		if _, exists := sourcesByRoot[cleanRoot]; !exists {
+			rootOrder = append(rootOrder, cleanRoot)
+		}
+		sourcesByRoot[cleanRoot] = append(sourcesByRoot[cleanRoot], ws)
+	}
+	for _, cleanRoot := range rootOrder {
+		group := sourcesByRoot[cleanRoot]
+		if ctx.Repo != "" {
+			anyMatch := false
+			for _, ws := range group {
+				if sourceMatchesRepoFilter(ws.source, ctx.Repo) {
+					anyMatch = true
+					break
+				}
+			}
+			if !anyMatch {
+				continue
+			}
+		}
+
+		primary := group[0]
+		for _, ws := range group {
+			if ctx.Repo == "" || sourceMatchesRepoFilter(ws.source, ctx.Repo) {
+				primary = ws
+				break
+			}
+		}
+		rootHistories := make(map[string]correlation.BeadHistory)
+		var rootWindow *correlation.HistoryWindow
+		var rootGitRange string
+		var rootFeedback *correlation.FeedbackApplied
+		var matchedSubtrees []string
+		var unmatchedSubtrees []string
+		matchedRootStore := false
+
+		for _, ws := range group {
+			idKey := workspaceSourceIdentityKey(ws)
+			sub := sharedMeta.subtreeByKey[idKey]
+			if ctx.Repo != "" {
+				if sourceMatchesRepoFilter(ws.source, ctx.Repo) {
+					if sub == "" {
+						matchedRootStore = true
+					} else {
+						matchedSubtrees = append(matchedSubtrees, sub)
+					}
+				} else if sub != "" {
+					unmatchedSubtrees = append(unmatchedSubtrees, sub)
+				}
+			}
+
+			repoKey := strings.ToLower(strings.TrimSpace(ws.source.SourceRepo))
+			repoIssues := fullIssuesBySourceRepo[repoKey]
+			localToQualified := make(map[string]string, len(repoIssues))
+			localBeads := make([]correlation.BeadInfo, 0, len(repoIssues))
+			for _, issue := range repoIssues {
+				localID := localBeadIDForWorkspaceIssue(issue, ws.source)
+				localToQualified[localID] = issue.ID
+				localBeads = append(localBeads, correlation.BeadInfo{
+					ID:     localID,
+					Title:  issue.Title,
+					Status: string(issue.Status),
+				})
+			}
+
+			correlator, err := newCorrelatorWithFeedback(cleanRoot, ws.beadsPath)
+			if err != nil {
+				return nil, err
+			}
+			part, err := correlator.GenerateReportCached(localBeads, correlation.CorrelatorOptions{
+				Limit:                  limit,
+				Revision:               ctx.AsOfCommit,
+				ExplicitIDAliases:      buildExplicitAliasesForWorkspaceBeads(repoIssues, ws.source),
+				AmbiguousUnprefixedIDs: sharedMeta.ambiguousByRoot[cleanRoot],
+				StoreSubtreePrefix:     sub,
+				SiblingSubtreePrefixes: sharedMeta.siblingsByKey[idKey],
+			})
+			if err != nil {
+				return nil, fmt.Errorf("correlating workspace repository %q: %w", ws.repoLabel, err)
+			}
+			if rootGitRange == "" {
+				rootGitRange = part.GitRange
+			}
+			if rootWindow == nil && part.Window != nil {
+				cp := *part.Window
+				rootWindow = &cp
+			}
+			if part.Stats.FeedbackApplied != nil {
+				if rootFeedback == nil {
+					rootFeedback = &correlation.FeedbackApplied{}
+				}
+				rootFeedback.Confirmed += part.Stats.FeedbackApplied.Confirmed
+				rootFeedback.Rejected += part.Stats.FeedbackApplied.Rejected
+				rootFeedback.Ignored += part.Stats.FeedbackApplied.Ignored
+			}
+			for localID, hist := range part.Histories {
+				qualID := qualifyWorkspaceHistoricalID(localID, ws.source, localToQualified, knownQualified)
+				hist.BeadID = qualID
+				events := make([]correlation.BeadEvent, len(hist.Events))
+				for i, ev := range hist.Events {
+					events[i] = remapWorkspaceBeadEvent(ev, ws.source, localToQualified, knownQualified)
+				}
+				hist.Events = events
+				hist.Milestones = correlation.GetBeadMilestones(hist.Events)
+
+				commits := make([]correlation.CorrelatedCommit, len(hist.Commits))
+				for i, cc := range hist.Commits {
+					cc.BeadID = qualID
+					commits[i] = cc
+				}
+				hist.Commits = commits
+				rootHistories[qualID] = hist
+			}
+		}
+
+		scopedHistories := rootHistories
+		if len(scopedIssueIDs) < len(allWorkspaceIssues) {
+			scopedHistories = make(map[string]correlation.BeadHistory, len(scopedIssueIDs))
+			for qualID, hist := range rootHistories {
+				if scopedIssueIDs[qualID] {
+					scopedHistories[qualID] = hist
+				}
+			}
+		}
+
+		rootReport := &correlation.HistoryReport{
+			GeneratedAt: robotNow(),
+			DataHash:    ctx.DataHash,
+			GitRange:    rootGitRange,
+			Window:      rootWindow,
+			Stats:       correlation.HistoryStats{FeedbackApplied: rootFeedback},
+			Histories:   scopedHistories,
+			CommitIndex: correlation.BuildCommitIndex(rootHistories),
+		}
+		detector := correlation.NewOrphanDetectorAt(rootReport, cleanRoot, robotNow()).
+			WithStoreDirs(sharedMeta.storeDirsByRoot[cleanRoot]...)
+		if ctx.Repo != "" && len(group) > 1 {
+			if matchedRootStore && len(unmatchedSubtrees) > 0 {
+				detector.WithSubtreeScope(nil, unmatchedSubtrees)
+			} else if !matchedRootStore && len(matchedSubtrees) > 0 {
+				detector.WithSubtreeScope(matchedSubtrees, nil)
+			}
+		}
+		partOrphans, err := detector.DetectOrphans(correlation.ExtractOptions{Limit: limit, Revision: ctx.AsOfCommit})
+		if err != nil {
+			return nil, fmt.Errorf("detecting orphans in %q: %w", primary.repoLabel, err)
+		}
+		if gitRange == "" {
+			gitRange = partOrphans.GitRange
+		}
+		if len(usageHints) == 0 {
+			usageHints = partOrphans.UsageHints
+		}
+		if aggWindow.Source == "" {
+			aggWindow = partOrphans.Window
+		} else {
+			aggWindow.Commits += partOrphans.Window.Commits
+		}
+
+		droppedScopedOrphans := 0
+		for _, cand := range partOrphans.Candidates {
+			if ctx.Repo != "" {
+				filteredProbable := make([]correlation.ProbableBead, 0, len(cand.ProbableBeads))
+				for _, pb := range cand.ProbableBeads {
+					if scopedIssueIDs[pb.BeadID] {
+						filteredProbable = append(filteredProbable, pb)
+					}
+				}
+				cand.ProbableBeads = filteredProbable
+
+				if len(group) > 1 && len(cand.Files) > 0 {
+					touchesInScope := false
+					if matchedRootStore {
+						for _, f := range cand.Files {
+							normF := strings.TrimPrefix(filepath.ToSlash(f), "./")
+							inSibling := false
+							for _, sib := range unmatchedSubtrees {
+								if strings.HasPrefix(normF, sib) {
+									inSibling = true
+									break
+								}
+							}
+							if !inSibling {
+								touchesInScope = true
+								break
+							}
+						}
+					} else if len(matchedSubtrees) > 0 {
+						for _, f := range cand.Files {
+							normF := strings.TrimPrefix(filepath.ToSlash(f), "./")
+							for _, sub := range matchedSubtrees {
+								if strings.HasPrefix(normF, sub) {
+									touchesInScope = true
+									break
+								}
+							}
+							if touchesInScope {
+								break
+							}
+						}
+					} else {
+						touchesInScope = true
+					}
+					if !touchesInScope {
+						droppedScopedOrphans++
+						continue
+					}
+				}
+			}
+
+			if prefixFiles && len(group) == 1 && primary.repoLabel != "" && len(cand.Files) > 0 {
+				files := make([]string, len(cand.Files))
+				for i, f := range cand.Files {
+					files[i] = path.Join(primary.repoLabel, strings.TrimPrefix(filepath.ToSlash(f), "./"))
+				}
+				cand.Files = files
+			}
+			for i := range cand.ProbableBeads {
+				qualID := cand.ProbableBeads[i].BeadID
+				byBead[qualID] = append(byBead[qualID], cand.ShortSHA)
+			}
+			allCandidates = append(allCandidates, cand)
+		}
+
+		aggStats.TotalCommits += partOrphans.Stats.TotalCommits - droppedScopedOrphans
+		aggStats.CorrelatedCount += partOrphans.Stats.CorrelatedCount
+		aggStats.OrphanCount += partOrphans.Stats.OrphanCount - droppedScopedOrphans
+		aggStats.BeadsOnlyCommits += partOrphans.Stats.BeadsOnlyCommits
+	}
+
+	sort.Slice(allCandidates, func(i, j int) bool {
+		if allCandidates[i].SuspicionScore != allCandidates[j].SuspicionScore {
+			return allCandidates[i].SuspicionScore > allCandidates[j].SuspicionScore
+		}
+		if !allCandidates[i].Timestamp.Equal(allCandidates[j].Timestamp) {
+			return allCandidates[i].Timestamp.After(allCandidates[j].Timestamp)
+		}
+		return allCandidates[i].SHA < allCandidates[j].SHA
+	})
+	aggStats.CandidateCount = len(allCandidates)
+	if aggStats.TotalCommits > 0 {
+		aggStats.OrphanRatio = float64(aggStats.OrphanCount) / float64(aggStats.TotalCommits)
+	}
+	if len(allCandidates) > 0 {
+		totalSusp := 0
+		for _, c := range allCandidates {
+			totalSusp += c.SuspicionScore
+		}
+		aggStats.AvgSuspicion = float64(totalSusp) / float64(len(allCandidates))
+	}
+	dataHash := ctx.DataHash
+	if dataHash == "" {
+		dataHash = analysis.ComputeDataHash(ctx.Issues)
+	}
+	if allCandidates == nil {
+		allCandidates = []correlation.OrphanCandidate{}
+	}
+	return &correlation.OrphanReport{
+		GeneratedAt: robotNow(),
+		GitRange:    gitRange,
+		DataHash:    dataHash,
+		Window:      aggWindow,
+		Stats:       aggStats,
+		Candidates:  allCandidates,
+		ByBead:      byBead,
+		UsageHints:  usageHints,
+	}, nil
+}
+
 func generateCorrelationReportForContext(ctx RobotContext, workDir string, opts correlation.CorrelatorOptions) (*correlation.HistoryReport, error) {
 	if opts.Revision == "" {
 		opts.Revision = ctx.AsOfCommit
+	}
+	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
+		return generateWorkspaceCorrelationReport(ctx, opts, false)
 	}
 	beadsPath, err := resolveCorrelationBeadsPathForContext(ctx, workDir)
 	if err != nil {
@@ -3166,12 +4296,17 @@ func generateCorrelationReportForContext(ctx RobotContext, workDir string, opts 
 // after an earlier rejection (letting a rejection be flipped) and orig_conf
 // must record the strategy confidence, not a previously pinned 1.0.
 func generateRawCorrelationReport(ctx RobotContext, workDir string, issues []model.Issue, opts correlation.CorrelatorOptions) (*correlation.HistoryReport, error) {
+	if opts.Revision == "" {
+		opts.Revision = ctx.AsOfCommit
+	}
+	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
+		wsCtx := ctx
+		wsCtx.Issues = issues
+		return generateWorkspaceCorrelationReport(wsCtx, opts, true)
+	}
 	beadsPath, err := resolveCorrelationBeadsPathForContext(ctx, workDir)
 	if err != nil {
 		return nil, err
-	}
-	if opts.Revision == "" {
-		opts.Revision = ctx.AsOfCommit
 	}
 	report, err := correlation.NewCorrelator(workDir, beadsPath).GenerateReportCached(buildCorrelationBeadInfos(issues), opts)
 	if err != nil {
@@ -3184,7 +4319,7 @@ func generateRawCorrelationReport(ctx RobotContext, workDir string, issues []mod
 // the correlation feedback store attached so confirm/reject decisions shape
 // histories, the commit index and stats (feedback loop, C4).
 func newCorrelatorWithFeedback(workDir, beadsPath string) (*correlation.Correlator, error) {
-	feedbackStore, err := loadCorrelationFeedbackStore(workDir)
+	feedbackStore, err := loadCorrelationFeedbackStoreForBeadsPath(workDir, beadsPath)
 	if err != nil {
 		return nil, err
 	}
@@ -3192,9 +4327,23 @@ func newCorrelatorWithFeedback(workDir, beadsPath string) (*correlation.Correlat
 }
 
 func loadCorrelationFeedbackStore(workDir string) (*correlation.FeedbackStore, error) {
-	beadsDir, err := loader.GetBeadsDir(workDir)
-	if err != nil {
-		return nil, fmt.Errorf("getting beads directory: %w", err)
+	return loadCorrelationFeedbackStoreForBeadsPath(workDir, "")
+}
+
+func loadCorrelationFeedbackStoreForBeadsPath(workDir, beadsPath string) (*correlation.FeedbackStore, error) {
+	var beadsDir string
+	if strings.TrimSpace(beadsPath) != "" {
+		candidate := filepath.Dir(beadsPath)
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			beadsDir = candidate
+		}
+	}
+	if beadsDir == "" {
+		var err error
+		beadsDir, err = loader.GetBeadsDir(workDir)
+		if err != nil {
+			return nil, fmt.Errorf("getting beads directory: %w", err)
+		}
 	}
 	feedbackStore := correlation.NewFeedbackStore(beadsDir)
 	if err := feedbackStore.Load(); err != nil {
@@ -3261,7 +4410,7 @@ func handleRobotCorrelationStats(ctx RobotContext) error {
 		return fmt.Errorf("getting current directory: %w", err)
 	}
 
-	feedbackStore, err := loadCorrelationFeedbackStore(workDir)
+	stats, err := loadWorkspaceCorrelationFeedbackStats(ctx, workDir)
 	if err != nil {
 		return err
 	}
@@ -3273,7 +4422,7 @@ func handleRobotCorrelationStats(ctx RobotContext) error {
 		Version      string      `json:"version,omitempty"`
 		Scope        *RobotScope `json:"scope,omitempty"`
 	}{
-		FeedbackStats: feedbackStore.GetStats(),
+		FeedbackStats: stats,
 		GeneratedAt:   robotNow().Format(time.RFC3339),
 		OutputFormat:  robotOutputFormat,
 		Version:       version.Version,
@@ -3299,7 +4448,7 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 		return fmt.Errorf("getting current directory: %w", err)
 	}
 
-	feedbackStore, err := loadCorrelationFeedbackStore(workDir)
+	feedbackStore, fbBeadID, err := resolveWorkspaceFeedbackStoreForBead(ctx, workDir, beadID)
 	if err != nil {
 		return err
 	}
@@ -3328,9 +4477,11 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 	}
 
 	explanation := correlation.NewScorer().BuildExplanation(*targetCommit, beadID)
-	if fb, ok := feedbackStore.Get(targetCommit.SHA, beadID); ok {
-		explanation.Feedback = &fb
-		explanation.Recommendation = describeCorrelationFeedback(fb)
+	if fb, ok := feedbackStore.Get(targetCommit.SHA, fbBeadID); ok {
+		fbCopy := fb
+		fbCopy.BeadID = beadID
+		explanation.Feedback = &fbCopy
+		explanation.Recommendation = describeCorrelationFeedback(fbCopy)
 	}
 	enveloped, err := withEnvelope(ctx.EnvelopeWithHash(report.DataHash), explanation)
 	if err != nil {
@@ -3363,7 +4514,7 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 		return fmt.Errorf("getting current directory: %w", err)
 	}
 
-	feedbackStore, err := loadCorrelationFeedbackStore(workDir)
+	feedbackStore, fbBeadID, err := resolveWorkspaceFeedbackStoreForBead(ctx, workDir, beadID)
 	if err != nil {
 		return err
 	}
@@ -3399,11 +4550,11 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 	}
 
 	if reject {
-		if err := feedbackStore.Reject(commitSHA, beadID, feedbackBy, originalConf, reason); err != nil {
+		if err := feedbackStore.Reject(commitSHA, fbBeadID, feedbackBy, originalConf, reason); err != nil {
 			return fmt.Errorf("saving feedback: %w", err)
 		}
 	} else {
-		if err := feedbackStore.Confirm(commitSHA, beadID, feedbackBy, originalConf, reason); err != nil {
+		if err := feedbackStore.Confirm(commitSHA, fbBeadID, feedbackBy, originalConf, reason); err != nil {
 			return fmt.Errorf("saving feedback: %w", err)
 		}
 	}
@@ -3449,7 +4600,13 @@ func handleRobotFileRelations(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 	if cfg.RelationsLimit != nil {
 		maxResults = *cfg.RelationsLimit
 	}
-	result := correlation.NewFileLookup(report).GetRelatedFiles(*cfg.RobotFileRelationsFlag, threshold, maxResults)
+	fileLookup := correlation.NewFileLookup(report)
+	result := fileLookup.GetRelatedFiles(*cfg.RobotFileRelationsFlag, threshold, maxResults)
+	if result.TotalCommits == 0 && ctx.SourceKind == "workspace" {
+		if matches := resolveWorkspaceReportFilePaths(report, *cfg.RobotFileRelationsFlag); len(matches) == 1 {
+			result = fileLookup.GetRelatedFiles(matches[0], threshold, maxResults)
+		}
+	}
 
 	output := struct {
 		RobotEnvelope
@@ -3480,21 +4637,48 @@ func handleRobotOrphans(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 	if cfg.HistoryLimit != nil {
 		limit = *cfg.HistoryLimit
 	}
-	report, err := generateCorrelationReportForContext(ctx, workDir, correlation.CorrelatorOptions{Limit: limit, Revision: ctx.AsOfCommit})
-	if err != nil {
-		return err
-	}
-
-	orphanReport, err := correlation.NewOrphanDetectorAt(report, workDir, robotNow()).DetectOrphans(correlation.ExtractOptions{Limit: limit, Revision: ctx.AsOfCommit})
-	if err != nil {
-		return fmt.Errorf("detecting orphans: %w", err)
+	var orphanReport *correlation.OrphanReport
+	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
+		orphanReport, err = detectWorkspaceOrphans(ctx, limit)
+		if err != nil {
+			return err
+		}
+	} else {
+		report, err := generateCorrelationReportForContext(ctx, workDir, correlation.CorrelatorOptions{Limit: limit, Revision: ctx.AsOfCommit})
+		if err != nil {
+			return err
+		}
+		orphanGitRoot := workDir
+		if found, rootErr := correlation.FindGitRoot(workDir); rootErr == nil {
+			orphanGitRoot = found
+		}
+		var orphanStoreDirs []string
+		if resolvedBeadsPath, bpErr := resolveCorrelationBeadsPathForContext(ctx, workDir); bpErr == nil && resolvedBeadsPath != "" {
+			storeDir := filepath.Clean(filepath.Dir(resolvedBeadsPath))
+			if !filepath.IsAbs(storeDir) {
+				storeDir = filepath.Clean(filepath.Join(workDir, storeDir))
+			}
+			if rel, relErr := filepath.Rel(filepath.Clean(orphanGitRoot), storeDir); relErr == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") {
+				orphanStoreDirs = append(orphanStoreDirs, filepath.ToSlash(rel))
+			}
+		}
+		orphanReport, err = correlation.NewOrphanDetectorAt(report, orphanGitRoot, robotNow()).
+			WithStoreDirs(orphanStoreDirs...).
+			DetectOrphans(correlation.ExtractOptions{Limit: limit, Revision: ctx.AsOfCommit})
+		if err != nil {
+			return fmt.Errorf("detecting orphans: %w", err)
+		}
 	}
 
 	minScore := 30
 	if cfg.OrphansMinScore != nil {
 		minScore = *cfg.OrphansMinScore
 	}
-	filterOrphanReportByMinScore(orphanReport, minScore)
+	maxResults := 0
+	if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+		maxResults = *cfg.RobotMaxResults
+	}
+	filterOrphanReport(orphanReport, minScore, maxResults)
 
 	// Copy fields rather than embedding: OrphanReport defines generated_at and
 	// data_hash too, and encoding/json drops colliding embedded keys silently.
@@ -3522,6 +4706,10 @@ func handleRobotOrphans(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 }
 
 func filterOrphanReportByMinScore(orphanReport *correlation.OrphanReport, minScore int) {
+	filterOrphanReport(orphanReport, minScore, 0)
+}
+
+func filterOrphanReport(orphanReport *correlation.OrphanReport, minScore, maxResults int) {
 	filtered := make([]correlation.OrphanCandidate, 0, len(orphanReport.Candidates))
 	byBead := make(map[string][]string)
 	totalSuspicion := 0
@@ -3529,6 +4717,9 @@ func filterOrphanReportByMinScore(orphanReport *correlation.OrphanReport, minSco
 	for _, candidate := range orphanReport.Candidates {
 		if candidate.SuspicionScore < minScore {
 			continue
+		}
+		if maxResults > 0 && len(filtered) >= maxResults {
+			break
 		}
 		filtered = append(filtered, candidate)
 		totalSuspicion += candidate.SuspicionScore
@@ -3578,8 +4769,22 @@ func handleRobotFileBeads(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 	var result *correlation.FileBeadLookupResult
 	if isGlob {
 		result = fileLookup.LookupByFileGlob(query)
+		if result.TotalBeads == 0 && ctx.SourceKind == "workspace" {
+			cleanGlob := strings.TrimPrefix(strings.ReplaceAll(query, "\\", "/"), "./")
+			if !strings.HasPrefix(cleanGlob, "*/") {
+				if fallback := fileLookup.LookupByFileGlob("*/" + cleanGlob); fallback.TotalBeads > 0 {
+					result = fallback
+				}
+			}
+		}
 	} else {
 		result = fileLookup.LookupByFile(query)
+		if result.TotalBeads == 0 && ctx.SourceKind == "workspace" {
+			clean := strings.TrimPrefix(strings.ReplaceAll(query, "\\", "/"), "./")
+			if fallback := fileLookup.LookupByFileGlob("*/" + clean); fallback.TotalBeads > 0 {
+				result = fallback
+			}
+		}
 	}
 	closedLimit := 20
 	if cfg.FileBeadsLimit != nil {
@@ -3631,9 +4836,20 @@ func handleRobotImpact(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	}
 
 	fileLookup := correlation.NewFileLookup(report)
-	files := strings.Split(*cfg.RobotImpactFlag, ",")
-	for i := range files {
-		files[i] = strings.TrimSpace(files[i])
+	rawFiles := strings.Split(*cfg.RobotImpactFlag, ",")
+	files := make([]string, 0, len(rawFiles))
+	for _, rf := range rawFiles {
+		trimmed := strings.TrimSpace(rf)
+		if trimmed == "" {
+			continue
+		}
+		if ctx.SourceKind == "workspace" {
+			if matches := resolveWorkspaceReportFilePaths(report, trimmed); len(matches) > 0 {
+				files = append(files, matches...)
+				continue
+			}
+		}
+		files = append(files, trimmed)
 	}
 	impactResult := fileLookup.ImpactAnalysisAt(files, robotNow())
 
@@ -3720,19 +4936,39 @@ func handleRobotRelated(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 }
 
 func handleRobotBlockerChain(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	// Use the dispatch context's analyzer and issue set: it already carries
-	// --as-of, --label, --recipe, and --repo scoping plus readiness/CandidateIDs.
+	// Verify the requested target belongs to the visible scoped issue set, then
+	// traverse upstream blockers across FullIssues (when retained) so multi-hop
+	// cross-label/repo/recipe chains reach their true root blockers instead of
+	// stopping at the 1-hop context boundary.
 	issues := ctx.Issues
+	targetID := *cfg.RobotBlockerChainFlag
+	inScope := false
+	for _, issue := range issues {
+		if issue.ID == targetID {
+			inScope = true
+			break
+		}
+	}
+	if !inScope {
+		fmt.Fprintf(ctx.StderrOrDefault(), "Issue not found: %s\n", targetID)
+		return newReportedRobotHandlerExit(1)
+	}
 
-	analyzer := ctx.Analyzer()
+	graphIssues := issues
+	if len(ctx.FullIssues) > 0 {
+		graphIssues = ctx.FullIssues
+	}
+	analyzer := analysis.NewAnalyzer(graphIssues)
+	analyzer.SetReadinessScope(ctx.Readiness, ctx.CandidateIDs)
 	analyzer.SetNow(robotNow())
 	if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
 		fullCfg := analysis.FullAnalysisConfig()
 		analyzer.SetConfig(&fullCfg)
+		_ = analyzer.Analyze()
 	}
-	result := analyzer.GetBlockerChain(*cfg.RobotBlockerChainFlag)
+	result := analyzer.GetBlockerChain(targetID)
 	if result == nil {
-		fmt.Fprintf(ctx.StderrOrDefault(), "Issue not found: %s\n", *cfg.RobotBlockerChainFlag)
+		fmt.Fprintf(ctx.StderrOrDefault(), "Issue not found: %s\n", targetID)
 		return newReportedRobotHandlerExit(1)
 	}
 
@@ -3840,20 +5076,9 @@ func handleRobotCausality(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 	// --label, --recipe, and --repo scoping. Reloading the working tree here
 	// silently bypassed all four (reality check 2026-09-01, gap 2).
 	issues := ctx.Issues
-	beadsPath, err := resolveCorrelationBeadsPathForContext(ctx, workDir)
-	if err != nil {
-		return err
-	}
-
-	beadInfos := buildCorrelationBeadInfos(issues)
-
 	limit := 500
 	if cfg.HistoryLimit != nil {
 		limit = *cfg.HistoryLimit
-	}
-	correlator, err := newCorrelatorWithFeedback(workDir, beadsPath)
-	if err != nil {
-		return err
 	}
 	opts := correlation.CorrelatorOptions{Limit: limit, CausalityBeadID: *cfg.RobotCausalityFlag, Revision: ctx.AsOfCommit}
 	if cfg.HistorySince != nil && strings.TrimSpace(*cfg.HistorySince) != "" {
@@ -3865,7 +5090,7 @@ func handleRobotCausality(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 			opts.Since = &since
 		}
 	}
-	report, err := correlator.GenerateReportCached(beadInfos, opts)
+	report, err := generateCorrelationReportForContext(ctx, workDir, opts)
 	if err != nil {
 		return fmt.Errorf("generating history report: %w", err)
 	}
@@ -3898,18 +5123,12 @@ func handleRobotSprintShow(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) e
 	if err != nil {
 		return fmt.Errorf("getting current directory: %w", err)
 	}
-	sprints, err := loader.LoadSprints(workDir)
+	sprints, err := loadSprintsForContext(ctx, workDir)
 	if err != nil {
 		return fmt.Errorf("loading sprints: %w", err)
 	}
 
-	var found *model.Sprint
-	for i := range sprints {
-		if sprints[i].ID == *cfg.RobotSprintShowFlag {
-			found = &sprints[i]
-			break
-		}
-	}
+	found := matchSprintByID(sprints, *cfg.RobotSprintShowFlag)
 	if found == nil {
 		fmt.Fprintf(ctx.StderrOrDefault(), "Sprint not found: %s\n", *cfg.RobotSprintShowFlag)
 		return newReportedRobotHandlerExit(1)
@@ -3943,9 +5162,10 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 			continue
 		}
 		if cfg.CapacityLabel != nil && strings.TrimSpace(*cfg.CapacityLabel) != "" {
+			wantLabel := strings.TrimSpace(*cfg.CapacityLabel)
 			matches := false
 			for _, label := range issue.Labels {
-				if label == *cfg.CapacityLabel {
+				if strings.EqualFold(strings.TrimSpace(label), wantLabel) {
 					matches = true
 					break
 				}
@@ -4005,7 +5225,30 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		}
 	}
 
-	longestChain := longestCapacityChain(actionable, blocks)
+	var chainStarts []string
+	if len(openIssues) > 0 {
+		// Seed from every in-set root (open issues with no open blocker inside
+		// openIssues). This includes all actionable roots plus externally-gated
+		// sub-DAG roots even when unrelated actionable leaf tasks exist.
+		hasInSetBlocker := make(map[string]bool, len(openIssues))
+		for _, downstreamIDs := range blocks {
+			for _, downstreamID := range downstreamIDs {
+				hasInSetBlocker[downstreamID] = true
+			}
+		}
+		for _, issue := range openIssues {
+			if !hasInSetBlocker[issue.ID] {
+				chainStarts = append(chainStarts, issue.ID)
+			}
+		}
+		if len(chainStarts) == 0 {
+			for _, issue := range openIssues {
+				chainStarts = append(chainStarts, issue.ID)
+			}
+		}
+	}
+
+	longestChain := longestCapacityChain(chainStarts, blocks)
 	if longestChain == nil {
 		longestChain = []string{}
 	}
@@ -4107,7 +5350,7 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		Bottlenecks:         bottlenecks,
 	}
 	if cfg.CapacityLabel != nil && strings.TrimSpace(*cfg.CapacityLabel) != "" {
-		output.Label = *cfg.CapacityLabel
+		output.Label = strings.TrimSpace(*cfg.CapacityLabel)
 	}
 
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -4384,4 +5627,307 @@ func handleRobotFileHotspots(ctx RobotContext, cfg phaseThreeRobotHandlerConfig)
 		return fmt.Errorf("encoding hotspots: %w", err)
 	}
 	return nil
+}
+
+func filterCyclesForCandidates(cycles [][]string, candidateIDs map[string]bool) [][]string {
+	if candidateIDs == nil || len(cycles) == 0 {
+		return cycles
+	}
+	filtered := make([][]string, 0, len(cycles))
+	for _, cycle := range cycles {
+		for _, id := range cycle {
+			if candidateIDs[id] {
+				filtered = append(filtered, cycle)
+				break
+			}
+		}
+	}
+	return filtered
+}
+
+func resolveWorkspaceReportFilePaths(report *correlation.HistoryReport, rawQuery string) []string {
+	if report == nil {
+		return nil
+	}
+	clean := strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(rawQuery), "\\", "/"), "./")
+	if clean == "" {
+		return nil
+	}
+	suffix := "/" + clean
+	seen := make(map[string]bool)
+	var matches []string
+	for _, hist := range report.Histories {
+		for _, cc := range hist.Commits {
+			for _, fc := range cc.Files {
+				norm := strings.TrimPrefix(strings.ReplaceAll(fc.Path, "\\", "/"), "./")
+				if norm == clean {
+					// Exact path exists in the report; caller should query directly.
+					return nil
+				}
+				if strings.HasSuffix(norm, suffix) && strings.Count(strings.TrimSuffix(norm, suffix), "/") == 0 {
+					if !seen[fc.Path] {
+						seen[fc.Path] = true
+						matches = append(matches, fc.Path)
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(matches)
+	return matches
+}
+
+type loadedSprintOrigin struct {
+	sprint          model.Sprint
+	rawID           string
+	repoName        string
+	sprintsFilePath string
+	qualifyID       func(string) string
+}
+
+func sourceMatchesRepoFilter(src RobotSourceReport, repoFilter string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(repoFilter))
+	if trimmed == "" {
+		return true
+	}
+	trimmedBase := strings.TrimRight(trimmed, "-:_")
+	for _, rawCandidate := range []string{src.Name, src.SourceRepo, src.RepoPrefix} {
+		cand := strings.ToLower(strings.TrimSpace(rawCandidate))
+		if cand == "" {
+			continue
+		}
+		candBase := strings.TrimRight(cand, "-:_")
+		if cand == trimmed || candBase == trimmedBase {
+			return true
+		}
+		if strings.HasPrefix(cand, trimmed) || (trimmedBase != "" && strings.HasPrefix(candBase, trimmedBase)) {
+			return true
+		}
+	}
+	return false
+}
+
+func loadSprintsForContext(ctx RobotContext, workDir string) ([]model.Sprint, error) {
+	origins, err := loadSprintsWithOriginsForContext(ctx, workDir)
+	if err != nil {
+		return nil, err
+	}
+	sprints := make([]model.Sprint, len(origins))
+	for i, o := range origins {
+		sprints[i] = o.sprint
+	}
+	return sprints, nil
+}
+
+func loadSprintsWithOriginsForContext(ctx RobotContext, workDir string) ([]loadedSprintOrigin, error) {
+	if ctx.SourceKind != "workspace" || ctx.SourceAuthority == nil {
+		loaded, err := loader.LoadSprints(workDir)
+		if err != nil {
+			return nil, err
+		}
+		sprintsFilePath := ""
+		if beadsDir, dirErr := loader.GetBeadsDir(workDir); dirErr == nil {
+			sprintsFilePath = filepath.Join(beadsDir, loader.SprintsFileName)
+		}
+		origins := make([]loadedSprintOrigin, len(loaded))
+		for i, sp := range loaded {
+			origins[i] = loadedSprintOrigin{
+				sprint:          sp,
+				rawID:           sp.ID,
+				sprintsFilePath: sprintsFilePath,
+			}
+		}
+		return origins, nil
+	}
+
+	allIssues := ctx.Issues
+	if len(ctx.FullIssues) > 0 {
+		allIssues = ctx.FullIssues
+	}
+	knownQualified := make(map[string]bool, len(allIssues))
+	issuesBySourceRepo := make(map[string][]model.Issue)
+	for _, iss := range allIssues {
+		knownQualified[iss.ID] = true
+		key := strings.ToLower(strings.TrimSpace(iss.SourceRepo))
+		issuesBySourceRepo[key] = append(issuesBySourceRepo[key], iss)
+	}
+
+	var entries []loadedSprintOrigin
+	seenBeadsDirs := make(map[string]bool)
+
+	addBeadsDir := func(beadsDir string, src *RobotSourceReport) error {
+		if strings.TrimSpace(beadsDir) == "" {
+			return nil
+		}
+		cleanBeadsDir := filepath.Clean(beadsDir)
+		if absDir, absErr := filepath.Abs(cleanBeadsDir); absErr == nil {
+			cleanBeadsDir = filepath.Clean(absDir)
+		}
+		if seenBeadsDirs[cleanBeadsDir] {
+			return nil
+		}
+		seenBeadsDirs[cleanBeadsDir] = true
+		sprintsFilePath := filepath.Join(cleanBeadsDir, loader.SprintsFileName)
+		loaded, err := loader.LoadSprintsFromFile(sprintsFilePath)
+		if err != nil {
+			return err
+		}
+		var qualifyFn func(string) string
+		repoLabel := ""
+		if src != nil {
+			srcCopy := *src
+			repoLabel = strings.TrimSpace(srcCopy.Name)
+			if repoLabel == "" {
+				repoLabel = strings.TrimSpace(srcCopy.SourceRepo)
+			}
+			if repoLabel == "" && srcCopy.RepoPrefix != "" {
+				repoLabel = strings.TrimRight(srcCopy.RepoPrefix, "-:_")
+			}
+			repoIssues := issuesBySourceRepo[strings.ToLower(strings.TrimSpace(srcCopy.SourceRepo))]
+			localToQualified := make(map[string]string, len(repoIssues))
+			for _, iss := range repoIssues {
+				localID := localBeadIDForWorkspaceIssue(iss, srcCopy)
+				localToQualified[localID] = iss.ID
+			}
+			qualifyFn = func(rawID string) string {
+				return qualifyWorkspaceHistoricalID(rawID, srcCopy, localToQualified, knownQualified)
+			}
+		}
+		for _, sp := range loaded {
+			rawID := sp.ID
+			if qualifyFn != nil && len(sp.BeadIDs) > 0 {
+				qualifiedBeads := make([]string, len(sp.BeadIDs))
+				for i, bid := range sp.BeadIDs {
+					qualifiedBeads[i] = qualifyFn(bid)
+				}
+				sp.BeadIDs = qualifiedBeads
+			}
+			entries = append(entries, loadedSprintOrigin{
+				sprint:          sp,
+				rawID:           rawID,
+				repoName:        repoLabel,
+				sprintsFilePath: sprintsFilePath,
+				qualifyID:       qualifyFn,
+			})
+		}
+		return nil
+	}
+
+	// Iterate configured/discovered workspace sources FIRST so root-repo (`path: "."`)
+	// sprints get proper ID qualification, `<repo>:<id>` disambiguation, and `--repo` scoping.
+	for i := range ctx.SourceAuthority.Sources {
+		src := &ctx.SourceAuthority.Sources[i]
+		if src.Status != "loaded" {
+			continue
+		}
+		beadsDir := resolveSourceBeadsDir(*src)
+		if beadsDir == "" {
+			continue
+		}
+		// Always mark every configured source's beads directory as owned by a repo
+		// source so the umbrella fallback below never re-loads an excluded repo when `--repo` is set.
+		if ctx.Repo != "" && !sourceMatchesRepoFilter(*src, ctx.Repo) {
+			cleanSkipped := filepath.Clean(beadsDir)
+			if absDir, absErr := filepath.Abs(cleanSkipped); absErr == nil {
+				cleanSkipped = filepath.Clean(absDir)
+			}
+			seenBeadsDirs[cleanSkipped] = true
+			continue
+		}
+		if err := addBeadsDir(beadsDir, src); err != nil {
+			return nil, err
+		}
+	}
+
+	// Only load workspace-umbrella sprints from `workDir` when `workDir` has its own
+	// `.beads` directory that was NOT already loaded as a workspace repo source and `--repo` is unset.
+	if workDir != "" && strings.TrimSpace(ctx.Repo) == "" {
+		if rootBeadsDir, dirErr := loader.GetBeadsDir(workDir); dirErr == nil {
+			if err := addBeadsDir(rootBeadsDir, nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	idCounts := make(map[string]int, len(entries))
+	for _, e := range entries {
+		idCounts[e.sprint.ID]++
+	}
+	for i := range entries {
+		if idCounts[entries[i].sprint.ID] > 1 && entries[i].repoName != "" {
+			entries[i].sprint.ID = entries[i].repoName + ":" + entries[i].sprint.ID
+			if entries[i].sprint.Name != "" && !strings.HasPrefix(entries[i].sprint.Name, "["+entries[i].repoName+"]") {
+				entries[i].sprint.Name = "[" + entries[i].repoName + "] " + entries[i].sprint.Name
+			}
+		}
+	}
+	return entries, nil
+}
+
+func computeSprintScopeChangesForContext(
+	ctx RobotContext,
+	workDir string,
+	targetSprint *model.Sprint,
+	issueMap map[string]model.Issue,
+	now time.Time,
+) ([]ScopeChangeEvent, error) {
+	if targetSprint == nil || targetSprint.ID == "" {
+		return nil, nil
+	}
+	if ctx.SourceKind != "workspace" || ctx.SourceAuthority == nil {
+		return computeSprintScopeChanges(workDir, targetSprint, issueMap, now)
+	}
+	origins, err := loadSprintsWithOriginsForContext(ctx, workDir)
+	if err != nil {
+		return nil, err
+	}
+	for _, origin := range origins {
+		if origin.sprint.ID != targetSprint.ID {
+			continue
+		}
+		if origin.sprintsFilePath == "" {
+			return nil, nil
+		}
+		gitRoot, err := findEnclosingGitRoot(filepath.Dir(origin.sprintsFilePath))
+		if err != nil {
+			return nil, nil
+		}
+		relPath, err := filepath.Rel(gitRoot, origin.sprintsFilePath)
+		if err != nil {
+			return nil, nil
+		}
+		return computeSprintScopeChangesAtPath(
+			gitRoot,
+			relPath,
+			origin.rawID,
+			targetSprint,
+			issueMap,
+			now,
+			origin.qualifyID,
+		)
+	}
+	return computeSprintScopeChanges(workDir, targetSprint, issueMap, now)
+}
+
+func matchSprintByID(sprints []model.Sprint, target string) *model.Sprint {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil
+	}
+	for i := range sprints {
+		if sprints[i].ID == target {
+			return &sprints[i]
+		}
+	}
+	var suffixMatch *model.Sprint
+	for i := range sprints {
+		if idx := strings.IndexByte(sprints[i].ID, ':'); idx >= 0 && sprints[i].ID[idx+1:] == target {
+			if suffixMatch != nil {
+				// Ambiguous across multiple workspace repositories; require repo:id.
+				return nil
+			}
+			suffixMatch = &sprints[i]
+		}
+	}
+	return suffixMatch
 }

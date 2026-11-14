@@ -43,10 +43,56 @@ func (w walkedCommit) message() string {
 	return w.Subject + "\n" + w.Body
 }
 
+func normalizeRepoSlashPath(p string) string {
+	if len(p) > 2 && p[0] == '"' && p[len(p)-1] == '"' {
+		p = p[1 : len(p)-1]
+	}
+	norm := strings.ReplaceAll(p, "\\", "/")
+	for strings.HasPrefix(norm, "./") {
+		norm = strings.TrimPrefix(norm, "./")
+	}
+	norm = strings.TrimSuffix(norm, "/")
+	return norm
+}
+
+func normalizeStoreDirRel(storeDirRel string) string {
+	clean := normalizeRepoSlashPath(storeDirRel)
+	if clean == "" || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+		return ""
+	}
+	return clean
+}
+
+func isBeadsDirPath(path string) bool {
+	clean := normalizeRepoSlashPath(path)
+	return clean == ".beads" || strings.HasPrefix(clean, ".beads/") || strings.Contains(clean, "/.beads/")
+}
+
+// isTrackerPath reports whether path belongs to a Beads tracker directory —
+// either any `.beads/` directory or the configured custom storeDirRel (e.g.
+// "custom-beads" or "services/api/.beads").
+func isTrackerPath(path, storeDirRel string) bool {
+	if isBeadsDirPath(path) {
+		return true
+	}
+	cleanStore := normalizeStoreDirRel(storeDirRel)
+	if cleanStore == "" {
+		return false
+	}
+	cleanPath := normalizeRepoSlashPath(path)
+	return cleanPath == cleanStore || strings.HasPrefix(cleanPath, cleanStore+"/")
+}
+
 // touchesBeadsDir reports whether the commit changed anything under .beads/.
 func (w walkedCommit) touchesBeadsDir() bool {
+	return w.touchesTrackerDir("")
+}
+
+// touchesTrackerDir reports whether the commit changed anything under .beads/
+// or storeDirRel.
+func (w walkedCommit) touchesTrackerDir(storeDirRel string) bool {
 	for _, f := range w.Files {
-		if strings.HasPrefix(f, ".beads/") {
+		if isTrackerPath(f, storeDirRel) {
 			return true
 		}
 	}
@@ -57,11 +103,17 @@ func (w walkedCommit) touchesBeadsDir() bool {
 // tracker bookkeeping commit). A commit with no paths at all (empty commit)
 // is not beads-only; it is simply not a code commit either.
 func (w walkedCommit) beadsOnly() bool {
+	return w.trackerOnly("")
+}
+
+// trackerOnly reports whether every changed path lives under .beads/ or
+// storeDirRel (a pure tracker bookkeeping commit).
+func (w walkedCommit) trackerOnly(storeDirRel string) bool {
 	if len(w.Files) == 0 {
 		return false
 	}
 	for _, f := range w.Files {
-		if !strings.HasPrefix(f, ".beads/") {
+		if !isTrackerPath(f, storeDirRel) {
 			return false
 		}
 	}

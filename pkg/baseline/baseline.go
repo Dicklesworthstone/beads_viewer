@@ -200,9 +200,21 @@ func (b *Baseline) Summary() string {
 	sb.WriteString(fmt.Sprintf("Actionable: %d | Cycles: %d\n",
 		b.Stats.ActionableCount, b.Stats.CycleCount))
 
-	if len(b.TopMetrics.PageRank) > 0 {
-		sb.WriteString("\nTop PageRank:\n")
-		for i, item := range b.TopMetrics.PageRank {
+	for _, section := range []struct {
+		header string
+		items  []MetricItem
+	}{
+		{"Top PageRank:", b.TopMetrics.PageRank},
+		{"Top Betweenness:", b.TopMetrics.Betweenness},
+		{"Top Critical Path:", b.TopMetrics.CriticalPath},
+		{"Top Hubs:", b.TopMetrics.Hubs},
+		{"Top Authorities:", b.TopMetrics.Authorities},
+	} {
+		if len(section.items) == 0 {
+			continue
+		}
+		sb.WriteString("\n" + section.header + "\n")
+		for i, item := range section.items {
 			if i >= 5 {
 				break
 			}

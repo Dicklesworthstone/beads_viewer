@@ -74,8 +74,16 @@ const chartsState = {
     heatmapCanvas: null,
     issues: [],
     dependencies: [],
+    resolvedIds: new Set(),
     initialized: false
 };
+
+function normalizeResolvedIds(resolvedIds) {
+    if (resolvedIds instanceof Set) return new Set(resolvedIds);
+    if (Array.isArray(resolvedIds)) return new Set(resolvedIds);
+    if (resolvedIds && typeof resolvedIds[Symbol.iterator] === 'function') return new Set(resolvedIds);
+    return new Set();
+}
 
 // ============================================================================
 // INITIALIZATION
@@ -85,8 +93,9 @@ const chartsState = {
  * Initialize the charts dashboard with issue data
  * @param {Array} issues - Array of issue objects
  * @param {Array} dependencies - Array of dependency objects
+ * @param {Set<string>|Array<string>} [resolvedIds] - Resolved (closed/tombstone) issue IDs
  */
-function initCharts(issues, dependencies) {
+function initCharts(issues, dependencies, resolvedIds) {
     // Destroy existing charts to prevent "Canvas already in use" errors
     if (chartsState.initialized) {
         destroyCharts();
@@ -94,6 +103,7 @@ function initCharts(issues, dependencies) {
 
     chartsState.issues = issues || [];
     chartsState.dependencies = dependencies || [];
+    chartsState.resolvedIds = normalizeResolvedIds(resolvedIds);
     chartsState.initialized = true;
 
     // Initialize all charts
@@ -109,10 +119,14 @@ function initCharts(issues, dependencies) {
  * Update all charts with new data
  * @param {Array} issues - Updated issue array
  * @param {Array} dependencies - Updated dependency array
+ * @param {Set<string>|Array<string>} [resolvedIds] - Updated resolved issue IDs
  */
-function updateCharts(issues, dependencies) {
+function updateCharts(issues, dependencies, resolvedIds) {
     chartsState.issues = issues || chartsState.issues;
     chartsState.dependencies = dependencies || chartsState.dependencies;
+    if (resolvedIds !== undefined) {
+        chartsState.resolvedIds = normalizeResolvedIds(resolvedIds);
+    }
 
     updateBurndownChart();
     updatePriorityChart();
@@ -239,20 +253,64 @@ function initBurndownChart() {
     });
 }
 
+function isChartBlockingDep(dep) {
+    return !dep.type || ['blocks', 'conditional-blocks', 'waits-for'].includes(dep.type);
+}
+
+function resolveClosedDate(issue) {
+    const rawClosed = issue.closed_at || issue.closedAt;
+    if (rawClosed) {
+        const parsed = new Date(rawClosed);
+        if (!isNaN(parsed)) return parsed;
+    }
+    if (issue.status === 'closed') {
+        const rawUpdated = issue.updated_at || issue.updatedAt;
+        if (rawUpdated) {
+            const parsed = new Date(rawUpdated);
+            if (!isNaN(parsed)) return parsed;
+        }
+    }
+    return null;
+}
+
 /**
  * Compute burndown data from issues
- * Groups by day and computes cumulative counts
+ * Groups by day and computes cumulative counts (excluding tombstones)
  */
 function computeBurndownData() {
-    const issues = chartsState.issues;
+    const issues = chartsState.issues.filter(i => i.status !== 'tombstone');
     if (!issues.length) {
         return { labels: [], open: [], closed: [], blocked: [] };
     }
 
+    // Precompute lifecycle timestamps for all issues (including tombstones so upstream refs resolve)
+    const lifecycleById = new Map();
+    chartsState.issues.forEach(issue => {
+        const created = new Date(issue.created_at || issue.createdAt);
+        const rawUpdated = issue.updated_at || issue.updatedAt;
+        const updated = rawUpdated ? new Date(rawUpdated) : null;
+        lifecycleById.set(issue.id, {
+            created: Number.isNaN(created.getTime()) ? null : created,
+            updatedAt: updated && !Number.isNaN(updated.getTime()) ? updated : null,
+            closedAt: resolveClosedDate(issue),
+            status: issue.status || 'open'
+        });
+    });
+
+    // Map blocking upstream dependencies per issue
+    const blockingUpstream = new Map();
+    (chartsState.dependencies || []).forEach(dep => {
+        if (!isChartBlockingDep(dep)) return;
+        if (!blockingUpstream.has(dep.issue_id)) {
+            blockingUpstream.set(dep.issue_id, []);
+        }
+        blockingUpstream.get(dep.issue_id).push(dep.depends_on_id);
+    });
+
     // Get date range
     const dates = issues
-        .map(i => new Date(i.created_at || i.createdAt))
-        .filter(d => !isNaN(d));
+        .map(i => lifecycleById.get(i.id)?.created)
+        .filter(Boolean);
 
     if (!dates.length) {
         return { labels: [], open: [], closed: [], blocked: [] };
@@ -263,37 +321,57 @@ function computeBurndownData() {
 
     // Generate daily buckets
     const buckets = new Map();
-    const current = new Date(minDate);
-    while (current <= maxDate) {
+    const current = new Date(Date.UTC(minDate.getUTCFullYear(), minDate.getUTCMonth(), minDate.getUTCDate()));
+    const endDay = new Date(Date.UTC(maxDate.getUTCFullYear(), maxDate.getUTCMonth(), maxDate.getUTCDate()));
+    while (current <= endDay) {
         const key = formatDateKey(current);
         buckets.set(key, { open: 0, closed: 0, blocked: 0 });
-        current.setDate(current.getDate() + 1);
+        current.setUTCDate(current.getUTCDate() + 1);
     }
 
-    // Count issues at each point
-    issues.forEach(issue => {
-        const created = new Date(issue.created_at || issue.createdAt);
-        const status = issue.status || 'open';
+    const finalDateKey = formatDateKey(endDay);
 
-        // Issue contributes to count from creation date onward
-        buckets.forEach((counts, dateKey) => {
-            const bucketDate = new Date(dateKey);
-            if (bucketDate >= created) {
-                // Check if closed before this date
-                let closedAt = null;
-                if (issue.closed_at) {
-                    closedAt = new Date(issue.closed_at);
-                } else if (status === 'closed' && issue.updated_at) {
-                    closedAt = new Date(issue.updated_at);
-                }
+    // Count issues at each historical day end (dateEnd)
+    buckets.forEach((counts, dateKey) => {
+        const dateEnd = new Date(`${dateKey}T23:59:59.999Z`);
+        const isCurrentBucket = dateKey === finalDateKey;
+        issues.forEach(issue => {
+            const lc = lifecycleById.get(issue.id);
+            if (!lc?.created || lc.created > dateEnd) {
+                return; // Not yet created on dateEnd
+            }
 
-                if (closedAt && bucketDate >= closedAt) {
-                    counts.closed++;
-                } else if (status === 'blocked') {
-                    counts.blocked++;
-                } else {
-                    counts.open++;
+            if (lc.closedAt && lc.closedAt <= dateEnd) {
+                counts.closed++;
+                return; // Already closed on dateEnd; never count as open or blocked
+            }
+
+            // Issue was open on dateEnd: check whether it was blocked on dateEnd
+            const upstreams = blockingUpstream.get(issue.id) || [];
+            const hasOpenBlockerOnDate = upstreams.some(depId => {
+                const depLc = lifecycleById.get(depId);
+                if (!depLc) {
+                    if (chartsState.resolvedIds && chartsState.resolvedIds.has(depId)) {
+                        return false; // Omitted closed/tombstone prerequisite is resolved
+                    }
+                    return true; // Unknown/missing prerequisite remains unresolved
                 }
+                if (String(depLc.status).toLowerCase() === 'tombstone') return false;
+                if (depLc.created && depLc.created > dateEnd) return false;
+                if (depLc.closedAt && depLc.closedAt <= dateEnd) return false;
+                return String(depLc.status).toLowerCase() !== 'closed' || Boolean(depLc.closedAt && depLc.closedAt > dateEnd);
+            });
+
+            // Only count explicit status === 'blocked' on buckets >= updatedAt (or the final/current bucket),
+            // never projecting current manual blocked status backward before updatedAt.
+            const explicitlyBlockedOnDate = lc.status === 'blocked' && (
+                lc.updatedAt ? (dateEnd >= lc.updatedAt || isCurrentBucket) : isCurrentBucket
+            );
+            const isBlockedOnDate = hasOpenBlockerOnDate || explicitlyBlockedOnDate;
+            if (isBlockedOnDate) {
+                counts.blocked++;
+            } else {
+                counts.open++;
             }
         });
     });
@@ -406,7 +484,7 @@ function initPriorityChart() {
 }
 
 function computePriorityData() {
-    const issues = chartsState.issues.filter(i => i.status !== 'closed');
+    const issues = chartsState.issues.filter(i => i.status !== 'closed' && i.status !== 'tombstone');
     const counts = [0, 0, 0, 0, 0]; // P0-P4
 
     issues.forEach(issue => {
@@ -499,7 +577,10 @@ function initTypeChart() {
 }
 
 function computeTypeData() {
-    const issues = chartsState.issues;
+    const activeIssues = chartsState.issues.filter(i => i.status !== 'closed' && i.status !== 'tombstone');
+    const issues = activeIssues.length > 0
+        ? activeIssues
+        : chartsState.issues.filter(i => i.status !== 'tombstone');
     const typeCounts = new Map();
 
     issues.forEach(issue => {
@@ -656,8 +737,8 @@ function renderHeatmap() {
 }
 
 function computeLabelMatrix() {
-    const issues = chartsState.issues;
-    const deps = chartsState.dependencies;
+    const issues = chartsState.issues.filter(i => i.status !== 'tombstone');
+    const deps = (chartsState.dependencies || []).filter(isChartBlockingDep);
 
     // Build issue -> labels map
     const issueLabels = new Map();
@@ -761,6 +842,7 @@ if (typeof window !== 'undefined') {
         init: initCharts,
         update: updateCharts,
         destroy: destroyCharts,
+        computeBurndownData: computeBurndownData,
         CHART_THEME: CHART_THEME
     };
 }

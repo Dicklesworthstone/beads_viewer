@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // AgentFileDetection contains the result of detecting an agent config file.
@@ -232,10 +233,23 @@ func highestBlurbBlockVersion(blocks []blurbBlock) int {
 // AGENTS.md when running from a subdirectory.
 // maxLevels limits how many parent directories to check (0 = current only).
 func DetectAgentFileInParents(workDir string, maxLevels int) AgentFileDetection {
-	currentDir := workDir
+	if strings.TrimSpace(workDir) == "" {
+		workDir = "."
+	}
+	currentDir := filepath.Clean(workDir)
+	if absDir, err := filepath.Abs(workDir); err == nil {
+		currentDir = absDir
+	}
+
 	for i := 0; i <= maxLevels; i++ {
 		if detection := DetectAgentFile(currentDir); detection.Found() {
 			return detection
+		}
+
+		// Never climb past a git repository boundary (either standard .git dir or
+		// worktree/submodule .git file) into a parent directory's AGENTS.md.
+		if _, err := os.Lstat(filepath.Join(currentDir, ".git")); err == nil {
+			break
 		}
 
 		// Move to parent directory

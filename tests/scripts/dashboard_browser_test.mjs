@@ -99,7 +99,10 @@ async function waitFor(page, expression, label, ms = 25000) {
   const until = Date.now() + ms;
   let last;
   while (Date.now() < until) {
-    try { if (await evaluate(page, expression)) return; } catch (err) { last = err.message; }
+    try {
+      const val = await evaluate(page, expression);
+      if (val) return val;
+    } catch (err) { last = err.message; }
     await delay(100);
   }
   throw new Error(`Timed out: ${label}${last ? ': ' + last : ''}`);
@@ -116,7 +119,7 @@ async function capture(page, label) {
     fs.writeFileSync(path.join(artifacts, `${page.name}-${label}.png`), Buffer.from(shot.data, 'base64'));
   } catch (err) { records.push({ captureError: err.message, page: page.name }); }
 }
-async function openPage(name, width = 1280, offline = false) {
+async function openPage(name, width = 1280, offline = false, initialPath = '/') {
   const { browserContextId } = await send('Target.createBrowserContext');
   await send('Browser.grantPermissions', { browserContextId, origin, permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'] });
   const { targetId } = await send('Target.createTarget', { url: 'about:blank', browserContextId });
@@ -129,7 +132,7 @@ async function openPage(name, width = 1280, offline = false) {
   await send('Fetch.enable', { patterns: [{ urlPattern: '*' }] }, sessionId);
   await send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId);
   if (offline) await setOffline(page, true);
-  await send('Page.navigate', { url: origin + '/' }, sessionId);
+  await send('Page.navigate', { url: origin + initialPath }, sessionId);
   return page;
 }
 async function setOffline(page, offline) {
@@ -179,12 +182,54 @@ async function reload(page) {
   records.push({ reloadedOnline: await evaluate(page, 'navigator.onLine'), page: page.name, originListening: server.listening });
   if (page.offline) assert.equal(server.listening, false, 'offline reload succeeded while the origin was stopped');
 }
+let clickProbeSeq = 0;
 async function click(page, selector, text) {
   const predicate = text === undefined ? visible : `e => (${visible})(e) && e.textContent.trim() === ${JSON.stringify(text)}`;
   await waitFor(page, `[...document.querySelectorAll(${JSON.stringify(selector)})].some(${predicate})`, `visible ${selector} ${text || ''}`);
-  const point = await evaluate(page, `(() => { const e = [...document.querySelectorAll(${JSON.stringify(selector)})].find(${predicate}); e.scrollIntoView({block:'center'}); const r=e.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2}; })()`);
+  const probeKey = `__bvClickRect_${++clickProbeSeq}`;
+  await evaluate(page, `(() => {
+    window[${JSON.stringify(probeKey)}] = null;
+    const el = [...document.querySelectorAll(${JSON.stringify(selector)})].find(${predicate});
+    el?.scrollIntoView({ block: 'center', inline: 'nearest' });
+  })()`);
+  const point = await waitFor(page, `(() => {
+    const el = [...document.querySelectorAll(${JSON.stringify(selector)})].find(${predicate});
+    if (!el) {
+      window[${JSON.stringify(probeKey)}] = null;
+      return null;
+    }
+    let rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      window[${JSON.stringify(probeKey)}] = null;
+      return null;
+    }
+    if (rect.top < 0 || rect.bottom > innerHeight || rect.left < 0 || rect.right > innerWidth) {
+      el.scrollIntoView({ block: 'center', inline: 'nearest' });
+      rect = el.getBoundingClientRect();
+      window[${JSON.stringify(probeKey)}] = null;
+      return null;
+    }
+    const x = rect.x + rect.width / 2;
+    const y = rect.y + rect.height / 2;
+    if (!(x > 0 && x < innerWidth && y > 0 && y < innerHeight)) {
+      window[${JSON.stringify(probeKey)}] = null;
+      return null;
+    }
+    const hit = document.elementFromPoint(x, y);
+    if (!hit || (hit !== el && !el.contains(hit))) {
+      window[${JSON.stringify(probeKey)}] = null;
+      return null;
+    }
+    const rectBounds = [rect.x, rect.y, rect.width, rect.height].map(v => v.toFixed(2)).join(',');
+    const prevBounds = window[${JSON.stringify(probeKey)}];
+    window[${JSON.stringify(probeKey)}] = rectBounds;
+    if (prevBounds !== rectBounds) {
+      return null;
+    }
+    delete window[${JSON.stringify(probeKey)}];
+    return { x, y };
+  })()`, `stable uncovered ${selector} ${text || ''}`);
   assert.ok(point.x > 0 && point.x < await evaluate(page, 'innerWidth'), `${selector} is horizontally reachable`);
-  await waitFor(page, `(() => { const e=[...document.querySelectorAll(${JSON.stringify(selector)})].find(${predicate}); return e?.contains(document.elementFromPoint(${point.x},${point.y})); })()`, `uncovered ${selector}`);
   for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...point, button: 'left', clickCount: 1 }, page.session);
 }
 async function key(page, key, code = key) {
@@ -909,9 +954,10 @@ async function blockingTypesJourney(page) {
   assert.deepEqual(await evaluate(page, `getIssueDependencies('workflow-related')`), { blocks: [], blockedBy: [] }, 'custom informational relation remains nonblocking');
   const expected = [
     ['workflow-blocks', 'blocks'], ['workflow-closed', 'waits-for'],
-    ['workflow-conditional', 'conditional-blocks'], ['workflow-legacy', ''], ['workflow-waits', 'waits-for'],
+    ['workflow-conditional', 'conditional-blocks'], ['workflow-legacy', ''],
+    ['workflow-related', 'team-reference'], ['workflow-waits', 'waits-for'],
   ];
-  assert.deepEqual(await evaluate(page, `getGraphViewData().dependencies.map(d=>[d.issue_id,d.type]).sort((a,b)=>a[0].localeCompare(b[0]))`), expected, 'graph query retains all blocking variants and original types');
+  assert.deepEqual(await evaluate(page, `getGraphViewData().dependencies.map(d=>[d.issue_id,d.type]).sort((a,b)=>a[0].localeCompare(b[0]))`), expected, 'graph query retains blocking and custom non-blocking variants');
   assert.deepEqual(await evaluate(page, '[GRAPH_STATE.graph.nodeCount(), GRAPH_STATE.graph.edgeCount()]'), [7, 5]);
   await send('Page.navigate', { url: origin + '/#/issue/workflow-conditional' }, page.session);
   await waitFor(page, `typeof Alpine !== 'undefined' && ${app}.selectedIssue?.id === 'workflow-conditional'`, 'conditional dependent details');
@@ -922,9 +968,9 @@ async function blockingTypesJourney(page) {
   await capture(page, 'dependency-navigation');
   await key(page, 'Escape');
   await click(page, 'a[href="#/graph"]');
-  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading && !!document.querySelector('#graph-container canvas')`, 'force graph draws blocking variants');
-  assert.equal(await evaluate(page, `${app}.forceGraphModule.getWasmGraph().edgeCount()`), 5, 'force graph WASM uses same edges');
-  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().links.map(e=>[e.source.id,e.target.id,e.type]).sort((a,b)=>a[0].localeCompare(b[0]))`), expected.map(([id, type])=>[id, 'workflow-root', type || 'blocks']), 'rendered links preserve endpoint direction');
+  await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading && !!document.querySelector('#graph-container canvas')`, 'force graph draws blocking and non-blocking variants');
+  assert.equal(await evaluate(page, `${app}.forceGraphModule.getWasmGraph().edgeCount()`), 5, 'force graph WASM uses blocking edges only');
+  assert.deepEqual(await evaluate(page, `${app}.forceGraphModule.getGraph().graphData().links.map(e=>[e.source.id,e.target.id,e.type,e.blocking]).sort((a,b)=>a[0].localeCompare(b[0]))`), expected.map(([id, type])=>[id, 'workflow-root', type || 'blocks', type !== 'team-reference']), 'rendered links preserve endpoint direction and non-blocking flag');
   await capture(page, 'blocking-graph');
   clean(page);
   console.log('PASS: real exported SQLite, blocking ID lists, issue h/l navigation, graph WASM and force-graph links');
@@ -1123,6 +1169,20 @@ async function whatIfJourney(page, includeClosed = true) {
   assert.equal(await evaluate(page, `whatIfClose('sim-deleted').transitive_unblocks`), 0, 'tombstone is already resolved');
   assert.equal(await evaluate(page, `whatIfClose('sim-closed').transitive_unblocks`), 0, 'closed prerequisite remains resolved even when omitted');
   assert.deepEqual(await evaluate(page, `[...getResolvedIssueIDs()].sort()`), ['sim-closed', 'sim-deleted']);
+  const tombBurndown = await evaluate(page, `(() => {
+    const gd = getGraphViewData();
+    const resolved = getResolvedIssueIDs();
+    window.bvCharts.init(
+      [{ id: 'sim-tomb-only', status: 'open', created_at: '2026-09-01T12:00:00Z', updated_at: '2026-09-01T12:00:00Z' }],
+      [{ issue_id: 'sim-tomb-only', depends_on_id: 'sim-deleted', type: 'blocks' }],
+      resolved
+    );
+    const bd = window.bvCharts.computeBurndownData();
+    window.bvCharts.init(gd.issues, gd.dependencies, resolved);
+    return { open: bd.open, blocked: bd.blocked };
+  })()`);
+  assert.ok(tombBurndown.open.length > 0 && tombBurndown.open.every(v => v === 1) && tombBurndown.blocked.every(v => v === 0),
+    `open issue blocked solely by tombstoned bead is counted as open in burndown: ${JSON.stringify(tombBurndown)}`);
   assert.deepEqual(await evaluate(page, `getActionableIssues().sort()`), ['sim-other', 'sim-root']);
   assert.deepEqual(await evaluate(page, `getTopKSet(5).items.map(i=>[i.issueId,i.marginal_gain])`), [['sim-root', 2], ['sim-other', 1]]);
   await capture(page, 'what-if-detail');
@@ -1283,7 +1343,51 @@ async function capabilitiesJourney(page) {
   assert.equal(await evaluate(page, `document.querySelector('header h1 + p')?.textContent.trim()`), 'Release <RC-C10> & Proof');
   assert.equal(await evaluate(page, `document.querySelectorAll('header title, header rc-c10').length`), 0, 'escaped title/subtitle markup');
 
-  // 7. Heatmap placeholder cleared + Priority, Type, and Heatmap chart click-to-filter.
+  // 7. Heatmap placeholder cleared + Tombstone burndown check + Priority, Type, and Heatmap chart click-to-filter.
+  const capTombstoneBurndown = await evaluate(page, `(() => {
+    const orig = getGraphViewData();
+    const origResolved = getResolvedIssueIDs();
+    DB_STATE.db.run("INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) VALUES ('cap-tomb-prereq', 'Tombstoned prereq', 'tombstone', 2, 'task', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
+    try {
+      const resolvedWithTomb = getResolvedIssueIDs();
+      const hasTombInResolved = resolvedWithTomb.has('cap-tomb-prereq');
+      window.bvCharts.init(
+        [{ id: 'cap-open-after-tomb', status: 'open', created_at: '2026-09-01T12:00:00Z', updated_at: '2026-09-01T12:00:00Z' }],
+        [{ issue_id: 'cap-open-after-tomb', depends_on_id: 'cap-tomb-prereq', type: 'blocks' }],
+        resolvedWithTomb
+      );
+      const tombData = window.bvCharts.computeBurndownData();
+      window.bvCharts.init(
+        [{ id: 'cap-open-missing-prereq', status: 'open', created_at: '2026-09-01T12:00:00Z', updated_at: '2026-09-01T12:00:00Z' }],
+        [{ issue_id: 'cap-open-missing-prereq', depends_on_id: 'cap-genuinely-missing', type: 'blocks' }],
+        resolvedWithTomb
+      );
+      const missingData = window.bvCharts.computeBurndownData();
+      return {
+        hasTombInResolved,
+        tombOpen: tombData.open,
+        tombBlocked: tombData.blocked,
+        missingOpen: missingData.open,
+        missingBlocked: missingData.blocked,
+      };
+    } finally {
+      DB_STATE.db.run("DELETE FROM issues WHERE id = 'cap-tomb-prereq'");
+      window.bvCharts.init(orig.issues, orig.dependencies, origResolved);
+    }
+  })()`);
+  assert.equal(capTombstoneBurndown.hasTombInResolved, true, 'getResolvedIssueIDs includes tombstoned issues from issues table');
+  assert.ok(
+    capTombstoneBurndown.tombOpen.length > 0 &&
+    capTombstoneBurndown.tombOpen.every(v => v === 1) &&
+    capTombstoneBurndown.tombBlocked.every(v => v === 0),
+    `open issue whose sole prerequisite is tombstoned is counted as open (not blocked) in burndown: ${JSON.stringify(capTombstoneBurndown)}`
+  );
+  assert.ok(
+    capTombstoneBurndown.missingOpen.length > 0 &&
+    capTombstoneBurndown.missingOpen.every(v => v === 0) &&
+    capTombstoneBurndown.missingBlocked.every(v => v === 1),
+    `open issue with genuinely missing prerequisite stays blocked in burndown: ${JSON.stringify(capTombstoneBurndown)}`
+  );
   assert.equal(await evaluate(page, `document.querySelectorAll('#heatmap-container p').length`), 0, 'heatmap placeholder <p> removed');
   assert.ok(await evaluate(page, `document.getElementById('heatmap-canvas')?.width > 0`), 'heatmap canvas painted');
   await waitFor(page, `(${visible})(document.getElementById('priority-chart')) && Chart.getChart('priority-chart')?.width > 0`, 'visible priority chart');
@@ -1363,6 +1467,10 @@ async function capabilitiesJourney(page) {
     sel.value = 'hybrid';
     sel.dispatchEvent(new Event('change', { bubbles: true }));
   })()`);
+  await waitFor(page, `(() => {
+    const el = [...document.querySelectorAll('select[x-model="searchPreset"]')].find(${visible});
+    return Boolean(el && el.offsetParent !== null && el.getBoundingClientRect().width > 0);
+  })()`, 'hybrid preset visible');
   await search(page, 'OAuth login');
   await waitFor(page, `${app}.issues.length === 3 && ${app}.issues.every(i => Number.isFinite(i.hybrid_score))`, 'multi-word hybrid search scored');
   await resultIDs(page, ['cap-auth-root', 'cap-auth-ui', 'cap-closed-prereq']);
@@ -1385,11 +1493,116 @@ async function capabilitiesJourney(page) {
     const expected = .55 * row.text + .15 * row.components.pagerank + .1125 * row.components.status + .075 * row.components.impact + .075 * row.components.priority + .0375 * row.components.recency;
     assert.ok(Math.abs(row.score - expected) < 1e-12, `hybrid linear combination exact for ${row.id}`);
   }
-  await search(page, '');
 
-  // 4. Insights "Circular Dependencies" Cycle Navigator controls.
+  // 8b. Expanded FTS5 schema + genuinely exported notes / design / acceptance_criteria / external_ref hyphenated search matching.
+  const ftsSQL = await evaluate(page, `execScalar("SELECT sql FROM sqlite_master WHERE name = 'issues_fts'") || ''`);
+  for (const col of ['notes', 'design', 'acceptance_criteria', 'external_ref']) {
+    assert.ok(ftsSQL.includes(col), `issues_fts schema includes ${col}: ${ftsSQL}`);
+  }
+  assert.equal(await evaluate(page, `window.beadsViewer.buildFtsMatchQuery('obsidian-note-probe')`), '"obsidian"* "note"* "probe"*');
+  assert.equal(await evaluate(page, `window.beadsViewer.buildFtsMatchQuery('naïve-über 東京')`), '"naïve"* "über"* "東京"*');
+  assert.equal(await evaluate(page, `window.beadsViewer.buildFtsMatchQuery('nai\\u0308ve')`), '"naïve"*');
+  assert.equal(await evaluate(page, `window.beadsViewer.buildFtsMatchQuery('हिंदी')`), '"हिंदी"*');
+  assert.equal(await evaluate(page, `window.beadsViewer.buildFtsMatchQuery('___')`), '');
+  assert.equal(await evaluate(page, `window.beadsViewer.buildFtsMatchQuery('::: !!!')`), '');
+  await search(page, 'obsidian-note-probe');
+  await resultIDs(page, ['cap-billing-a']);
+  await search(page, 'emerald-criteria-probe');
+  await resultIDs(page, ['cap-billing-b']);
+  await search(page, 'zircon-design-arch-v2');
+  await resultIDs(page, ['cap-auth-ui']);
+  await search(page, 'GH-4242');
+  await resultIDs(page, ['cap-hub-leaf']);
+  // Decomposed NFD ('nai\u0308ve'), Indic combining-mark ('हिंदी'), and underscore-only ('___') / punctuation fallback checks.
+  await evaluate(page, `(() => {
+    DB_STATE.db.run("INSERT INTO issues (id, title, description, notes, status, priority, issue_type, labels, created_at, updated_at) VALUES ('cap-unicode-nfc', 'Naïve café gateway', 'Unicode NFC हिंदी search target', 'naïve-über हिंदी', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
+    DB_STATE.db.run("INSERT INTO issues (id, title, description, notes, status, priority, issue_type, labels, created_at, updated_at) VALUES ('cap-underscore-lit', 'Literal underscore case', 'Contains foo___bar marker', 'foo___bar', 'open', 2, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
+    DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, description, notes, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES ('cap-unicode-nfc', 'Naïve café gateway', 'Unicode NFC हिंदी search target', 'naïve-über हिंदी', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'satisfied', 1, 0, 0, 0, 0, 0.25, 0, 0, 0, 0, 0, 0, 0)");
+    DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, description, notes, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES ('cap-underscore-lit', 'Literal underscore case', 'Contains foo___bar marker', 'foo___bar', 'open', 2, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'satisfied', 1, 0, 0, 0, 0, 0.15, 0, 0, 0, 0, 0, 0, 0)");
+  })()`);
+  try {
+    await search(page, 'nai\u0308ve');
+    await resultIDs(page, ['cap-unicode-nfc']);
+    assert.ok((await evaluate(page, `${app}.issues[0]?.text_score || 0`)) >= 0.9, 'NFD query scores NFC title prefix match >= 0.9');
+    await search(page, 'हिंदी');
+    await resultIDs(page, ['cap-unicode-nfc']);
+    await search(page, '___');
+    await resultIDs(page, ['cap-underscore-lit']);
+    assert.equal(await evaluate(page, `${app}.totalIssues`), 1, 'underscore-only LIKE fallback escapes _ wildcard and counts only foo___bar');
+    await search(page, ':::');
+    await resultIDs(page, []);
+    assert.equal(await evaluate(page, `${app}.error || ${app}.globalError || null`), null, 'punctuation fallback query does not error');
+  } finally {
+    await evaluate(page, `(() => {
+      DB_STATE.db.run("DELETE FROM issue_overview_mv WHERE id IN ('cap-unicode-nfc', 'cap-underscore-lit')");
+      DB_STATE.db.run("DELETE FROM issues WHERE id IN ('cap-unicode-nfc', 'cap-underscore-lit')");
+    })()`);
+  }
+  // Adversarial operator/colon/hyphen query never crashes FTS5 or UI.
+  await search(page, 'bv-123 AND NOT foo:bar');
+  assert.equal(await evaluate(page, `${app}.error || ${app}.globalError || null`), null, 'adversarial FTS query does not error');
+  await search(page, '');
+  await resultIDs(page, allCapIDs);
+
+  // 8c. Issue Detail Modal external_ref + resolved blocker line-through + "Show Graph" Mermaid diagram across multiple issues.
+  await click(page, '[aria-label^="View issue cap-hub-leaf:"]');
+  await waitFor(page, `${app}.selectedIssue?.id === 'cap-hub-leaf'`, 'cap-hub-leaf modal opened');
+  await click(page, 'button', 'Show Graph');
+  await waitFor(page, `!!document.querySelector('[x-ref="depGraph"] svg')`, 'Show Graph renders Mermaid SVG including resolved prerequisite');
+  const modalDepAudit = await evaluate(page, `(() => {
+    const blockedBy = ${app}.selectedIssue?.dependencyGroups?.blockedBy || [];
+    const closedDep = blockedBy.find(d => d.id === 'cap-closed-prereq');
+    const openDep = blockedBy.find(d => d.id === 'cap-auth-root');
+    const svgText = document.querySelector('[x-ref="depGraph"] svg')?.textContent || '';
+    return {
+      extRef: ${app}.selectedIssue?.external_ref || '',
+      closedStatus: closedDep?.status,
+      openStatus: openDep?.status,
+      svgHasClosed: svgText.includes('cap-closed-prereq'),
+      svgHasOpen: svgText.includes('cap-auth-root'),
+    };
+  })()`);
+  assert.equal(modalDepAudit.extRef, 'GH-4242');
+  assert.equal(modalDepAudit.closedStatus, 'closed');
+  assert.equal(modalDepAudit.openStatus, 'open');
+  assert.ok(modalDepAudit.svgHasClosed && modalDepAudit.svgHasOpen, `Show Graph renders both active and closed dependencies: ${JSON.stringify(modalDepAudit)}`);
+  // Navigate via dependency chip inside modal while showDepGraph === true -> $watch('selectedIssue') re-renders SVG.
+  await click(page, 'div.fixed.inset-0.z-50 button', 'cap-auth-root');
+  await waitFor(page, `${app}.selectedIssue?.id === 'cap-auth-root' && (document.querySelector('[x-ref="depGraph"] svg')?.textContent || '').includes('cap-auth-ui') && !(document.querySelector('[x-ref="depGraph"] svg')?.textContent || '').includes('cap-closed-prereq')`, 'in-modal dependency chip navigation re-renders Show Graph SVG');
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.selectedIssue`, 'Escape closes issue modal');
+  // Open 2nd completely unlinked issue (cap-billing-a) and click "Show Graph" -> must render cap-billing-a/b, NOT 1st issue's stale SVG.
+  await click(page, '[aria-label^="View issue cap-billing-a:"]');
+  await waitFor(page, `${app}.selectedIssue?.id === 'cap-billing-a'`, 'cap-billing-a modal opened');
+  await click(page, 'button', 'Show Graph');
+  await waitFor(page, `!!document.querySelector('[x-ref="depGraph"] svg')`, 'Show Graph renders Mermaid SVG on 2nd issue');
+  const secondSvgText = await evaluate(page, `document.querySelector('[x-ref="depGraph"] svg')?.textContent || ''`);
+  assert.ok(secondSvgText.includes('cap-billing-a') && secondSvgText.includes('cap-billing-b'), `2nd issue Show Graph contains cap-billing-a/b: ${secondSvgText}`);
+  assert.ok(!secondSvgText.includes('cap-hub-leaf') && !secondSvgText.includes('cap-closed-prereq') && !secondSvgText.includes('cap-auth-root'), `2nd issue Show Graph has no stale 1st issue nodes: ${secondSvgText}`);
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.selectedIssue`, 'Escape closes cap-billing-a modal');
+
+  // 4. Insights "Circular Dependencies" Cycle Navigator controls & Influencers Eigenvector rendering.
   await click(page, 'a[href="#/insights"]');
   await waitFor(page, `${app}.view === 'insights' && ${app}.cycleInfo?.hasCycles`, 'dependency cycles detected in Insights');
+  assert.equal(await evaluate(page, `${app}.cycleInfo.cycleCount`), 2, 'WASM total_cycles populates cycleCount=2');
+  await waitFor(page, `[...document.querySelectorAll('.metric-panel-premium')].some(el => (${visible})(el) && el.textContent.includes('Influencers'))`, 'visible Influencers panel');
+  const eigenAudit = await evaluate(page, `(() => {
+    const list = ${app}.topByEigenvector || [];
+    const panel = [...document.querySelectorAll('.metric-panel-premium')].find(el => (${visible})(el) && el.querySelector('.metric-panel-title')?.textContent.trim() === 'Influencers');
+    const subtitle = panel?.querySelector('.metric-panel-subtitle')?.textContent.trim() || '';
+    const scores = panel ? [...panel.querySelectorAll('.metric-item-score')].map(el => el.textContent.trim()) : [];
+    return {
+      count: list.length,
+      allActive: list.every(i => i.status !== 'closed' && i.status !== 'tombstone'),
+      allPositive: list.length > 0 && list.every(i => Number.isFinite(i.eigenvector) && i.eigenvector > 0),
+      firstFormatted: list[0] ? list[0].eigenvector.toFixed(4) : '',
+      hasSubtitle: subtitle === 'Eigenvector Centrality',
+      rendersFirstScore: list[0] ? scores.includes(list[0].eigenvector.toFixed(4)) : false,
+    };
+  })()`);
+  assert.ok(eigenAudit.count > 0 && eigenAudit.allActive && eigenAudit.allPositive, `topByEigenvector populated with active positive scores: ${JSON.stringify(eigenAudit)}`);
+  assert.ok(eigenAudit.hasSubtitle && eigenAudit.rendersFirstScore, `Influencers panel renders Eigenvector Centrality score in DOM: ${JSON.stringify(eigenAudit)}`);
   await click(page, 'button', 'Highlight Cycles');
   await waitFor(page, `${app}.view === 'graph' && ${app}.forceGraphReady && !${app}.forceGraphLoading && ${app}.cycleNavigatorActive`, 'Highlight Cycles opens graph and activates navigator');
   assert.equal(await evaluate(page, `${app}.totalCycles`), 2);
@@ -1469,6 +1682,36 @@ async function capabilitiesJourney(page) {
   assert.equal(graphAudit.redLinks, graphAudit.nonCycleCount, 'non-cycle zero-slack links paint THEME.priority[0] urgency red in heatmap mode');
   await click(page, 'button[title="Toggle heatmap coloring (H)"]');
 
+  // 3b. #graphSizeMetric new options and live node sizing updates.
+  const sizeMetricAudit = await evaluate(page, `(() => {
+    const sel = document.getElementById('graphSizeMetric');
+    const options = sel ? [...sel.options].map(o => o.value) : [];
+    const m = ${app}.forceGraphModule;
+    const nodes = m.getGraph().graphData().nodes;
+    sel.value = 'inDegree';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    const inDegSizes = nodes.map(n => m.getNodeSize(n));
+    const metricAfterInDeg = m.getHeatmapState().metric;
+    sel.value = 'eigenvector';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    const eigenSizes = nodes.map(n => m.getNodeSize(n));
+    const metricAfterEigen = m.getHeatmapState().metric;
+    sel.value = 'pagerank';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    return {
+      options,
+      metricAfterInDeg,
+      metricAfterEigen,
+      inDegValid: inDegSizes.every(v => Number.isFinite(v) && v >= 4),
+      eigenValid: eigenSizes.every(v => Number.isFinite(v) && v >= 4),
+      inDegSpread: Math.max(...inDegSizes) > Math.min(...inDegSizes),
+    };
+  })()`);
+  assert.deepEqual(sizeMetricAudit.options, ['pagerank', 'betweenness', 'eigenvector', 'inDegree', 'outDegree', 'criticalPath', 'kcore', 'hitsHub', 'hitsAuth', 'slack'], '#graphSizeMetric exposes all 10 graph metrics');
+  assert.equal(sizeMetricAudit.metricAfterInDeg, 'inDegree');
+  assert.equal(sizeMetricAudit.metricAfterEigen, 'eigenvector');
+  assert.ok(sizeMetricAudit.inDegValid && sizeMetricAudit.eigenValid && sizeMetricAudit.inDegSpread, `getNodeSize scales cleanly across sizeMetric options: ${JSON.stringify(sizeMetricAudit)}`);
+
   await evaluate(page, `${app}.graphDetailNode = null; ${app}.forceGraphModule.clearSelection(); document.activeElement?.blur?.()`);
   await key(page, 'ArrowRight');
   await waitFor(page, `${app}.graphDetailNode?.id === 'cap-auth-root'`, 'ArrowRight dispatches nodeSelect and updates graphDetailNode to P0 issue');
@@ -1504,7 +1747,119 @@ async function capabilitiesJourney(page) {
 
   await capture(page, 'capabilities');
   clean(page);
-  console.log(`PASS: ${page.name} title/subtitle, charts/heatmap, labels, multi-word lexical+PageRank hybrid search, cycle navigator, galaxy/time-travel/arrow-keys, HITS/slack/THEME.priority, and error recovery`);
+  assert.deepEqual(
+    records.filter(r => r.page?.startsWith(page.name) && (
+      (r.method === 'Network.responseReceived' && r.params.response.status >= 400) ||
+      (r.method === 'Runtime.consoleAPICalled' && r.params.type === 'error' &&
+        !String(r.params.args?.[0]?.value || '').includes('Synthetic Recovery Check'))
+    )),
+    [],
+    `${page.name}: zero HTTP 4xx/5xx or unexpected console.error events`
+  );
+  console.log(`PASS: ${page.name} title/subtitle, charts/heatmap, labels, multi-word lexical+PageRank+FTS fields search, cycle navigator, eigenvector influencers, sizeMetric, galaxy/time-travel/arrow-keys, HITS/slack/THEME.priority, and error recovery`);
+}
+
+async function standaloneGraphJourney(page) {
+  await waitFor(page, `typeof Graph !== 'undefined' && typeof applyFilters === 'function' && typeof computeNodeColor === 'function' && DATA.nodes.length === 6`, 'standalone interactive HTML graph booted');
+  const initialAudit = await evaluate(page, `(() => {
+    const blockedNode = DATA.nodes.find(n => n.id === 'cap-hub-leaf');
+    const closedNode = DATA.nodes.find(n => n.id === 'cap-closed-prereq');
+    populatePanelContent('docked-', closedNode);
+    const closedBadges = [...document.querySelectorAll('#docked-badges .badge')].map(el => el.textContent.trim());
+    return {
+      blockedNodeBlockerCount: blockedNode?.blockerCount || 0,
+      blockedNodeColor: computeNodeColor(blockedNode),
+      expectedBlockedColor: STATUS_COLORS.blocked,
+      closedBadges,
+    };
+  })()`);
+  assert.equal(initialAudit.blockedNodeBlockerCount, 1, 'cap-hub-leaf counts only active blocker cap-auth-root, not cap-closed-prereq');
+  assert.equal(initialAudit.blockedNodeColor, initialAudit.expectedBlockedColor, 'active node with blockers colors with STATUS_COLORS.blocked');
+  assert.equal(initialAudit.closedBadges.includes('Critical Path'), false, 'closed node never receives Critical Path badge');
+
+  // Verify unified applyFilters across status, label, priority, and search.
+  const filterAudit = await evaluate(page, `(() => {
+    document.getElementById('filter-status').value = 'closed';
+    document.getElementById('filter-status').dispatchEvent(new Event('change'));
+    const closedVisible = DATA.nodes.filter(n => currentVisibilityFilter(n)).map(n => n.id);
+
+    document.getElementById('filter-status').value = 'all';
+    document.getElementById('filter-status').dispatchEvent(new Event('change'));
+    document.getElementById('filter-label').value = 'observability';
+    document.getElementById('filter-label').dispatchEvent(new Event('change'));
+    const labelVisible = DATA.nodes.filter(n => currentVisibilityFilter(n)).map(n => n.id);
+    const visibleStatText = document.getElementById('stat-visible').textContent.trim();
+    return { closedVisible, labelVisible, visibleStatText };
+  })()`);
+  assert.deepEqual(filterAudit.closedVisible, ['cap-closed-prereq']);
+  assert.deepEqual(filterAudit.labelVisible, ['cap-hub-leaf']);
+  assert.equal(filterAudit.visibleStatText, '1 visible');
+
+  // Verify selectNode -> addToRecent + #btn-recent + #btn-reset closing #recent-panel.
+  const recentAndPathAudit = await evaluate(page, `(() => {
+    const graphNodes = Graph.graphData().nodes;
+    const hub = graphNodes.find(n => n.id === 'cap-hub-leaf');
+    const ui = graphNodes.find(n => n.id === 'cap-auth-ui');
+    selectNode(hub);
+    document.getElementById('btn-recent').click();
+    const recentOpenAfterClick = document.getElementById('recent-panel').classList.contains('visible') &&
+      document.getElementById('btn-recent').classList.contains('active');
+    const recentIds = [...document.querySelectorAll('#recent-list .recent-item')].map(el => el.dataset.id);
+
+    // Path Finder ON -> select two connected nodes -> heatmap preserves dimming -> Path Finder OFF resets dimming
+    togglePathFinder();
+    handleNodeClick(hub);
+    const startAfterFirst = pathStart;
+    handleNodeClick(ui);
+    const pathLen = activePathNodes ? activePathNodes.size : 0;
+    const highlightedLenOn = highlightedNodes.size;
+    // Toggle heatmap ON while path is highlighted: unrelated node cap-billing-a must be dimmed hsla(..., 0.15)
+    document.getElementById('btn-heatmap').click();
+    const billingNode = DATA.nodes.find(n => n.id === 'cap-billing-a');
+    const dimmedHeatmapColor = computeNodeColor(billingNode);
+    document.getElementById('btn-heatmap').click();
+
+    // Toggle Path Finder OFF -> must clear activePathNodes & highlightedNodes
+    togglePathFinder();
+    const highlightedLenAfterOff = highlightedNodes.size;
+    const activePathAfterOff = activePathNodes;
+    const billingColorAfterOff = computeNodeColor(billingNode);
+
+    // Reset button closes #recent-panel and resets filters
+    document.getElementById('btn-reset').click();
+    const recentClosedAfterReset = !document.getElementById('recent-panel').classList.contains('visible') &&
+      !document.getElementById('btn-recent').classList.contains('active');
+    const allVisibleAfterReset = DATA.nodes.filter(n => currentVisibilityFilter(n)).length;
+
+    return {
+      recentOpenAfterClick,
+      recentIds,
+      startAfterFirst,
+      pathLen,
+      highlightedLenOn,
+      dimmedHeatmapColor,
+      highlightedLenAfterOff,
+      activePathAfterOff,
+      billingColorAfterOff,
+      recentClosedAfterReset,
+      allVisibleAfterReset,
+    };
+  })()`);
+  assert.equal(recentAndPathAudit.recentOpenAfterClick, true);
+  assert.deepEqual(recentAndPathAudit.recentIds, ['cap-hub-leaf']);
+  assert.equal(recentAndPathAudit.startAfterFirst, 'cap-hub-leaf');
+  assert.equal(recentAndPathAudit.pathLen, 3, 'bfsPath highlights 3-node path cap-hub-leaf -> cap-auth-root -> cap-auth-ui');
+  assert.equal(recentAndPathAudit.highlightedLenOn, 3);
+  assert.match(recentAndPathAudit.dimmedHeatmapColor, /^hsla\(.*0\.15\)$/, 'heatmap mode preserves path dimming');
+  assert.equal(recentAndPathAudit.highlightedLenAfterOff, 0, 'toggling Path Finder OFF clears highlightedNodes dimming');
+  assert.equal(recentAndPathAudit.activePathAfterOff, null, 'toggling Path Finder OFF clears activePathNodes');
+  assert.equal(recentAndPathAudit.billingColorAfterOff, '#ef4444', 'un-dimmed blocked cycle node restores full STATUS_COLORS.blocked');
+  assert.equal(recentAndPathAudit.recentClosedAfterReset, true, '#btn-reset closes #recent-panel and clears .active on #btn-recent');
+  assert.equal(recentAndPathAudit.allVisibleAfterReset, 6, '#btn-reset restores all 6 nodes');
+
+  await capture(page, 'standalone-graph');
+  clean(page);
+  console.log(`PASS: ${page.name} standalone HTML graph filters, blocked colors, active-only critical badge, addToRecent, heatmap dimming, and Path Finder ON/OFF reset`);
 }
 try {
   const stderr = fs.createWriteStream(path.join(artifacts, 'chrome.stderr'));
@@ -1610,6 +1965,9 @@ try {
     const caps = await openPage('capabilities');
     await capabilitiesJourney(caps);
     await send('Target.closeTarget', { targetId: caps.target });
+    const standalone = await openPage('standalone-graph', 1280, false, '/standalone-graph.html');
+    await standaloneGraphJourney(standalone);
+    await send('Target.closeTarget', { targetId: standalone.target });
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
@@ -1705,10 +2063,28 @@ try {
     // the loader or scorer. Small fixtures normally take the size threshold.
     await evaluate(desktop, `HYBRID_WASM_STATE.attempted = false; initHybridWasmScorer(5000)`);
     assert.equal(await evaluate(desktop, 'getHybridWasmStatus().ready'), false);
-    assert.match(await evaluate(desktop, 'getHybridWasmStatus().reason'), /fetch|import|module/i);
+    assert.equal(await evaluate(desktop, 'getHybridWasmStatus().reason'), 'Optional hybrid WASM module not bundled');
+    assert.deepEqual(
+      records.filter(r => (r.serverRequest && r.serverRequest.includes('bv_hybrid_scorer')) || (r.method === 'Network.responseReceived' && r.params?.response?.url?.includes('bv_hybrid_scorer'))),
+      [],
+      'optional bv_hybrid_scorer.js is gated by meta.has_hybrid_wasm with zero 404 requests'
+    );
+    assert.deepEqual(
+      records.filter(r => {
+        if (!['project', 'capabilities', 'standalone-graph', 'desktop', 'mobile-360'].some(prefix => r.page === prefix || r.page?.startsWith(prefix + ':'))) return false;
+        if (r.method !== 'Network.responseReceived' || r.params.response.status < 400) return false;
+        const pathname = new URL(r.params.response.url).pathname;
+        // desktop/mobile-360 fixture intentionally contains sanitized <img src="x"> XSS probe and has no git repo for optional history.json
+        if ((r.page?.startsWith('desktop') || r.page?.startsWith('mobile-360')) && (pathname === '/x' || pathname === '/data/history.json')) return false;
+        return true;
+      }),
+      [],
+      'zero unexpected HTTP 404/500 responses across project, capabilities, standalone-graph, desktop, and mobile journeys'
+    );
     await key(desktop, 'Escape');
     await search(desktop, 'Orchid');
     await evaluate(desktop, `(() => {const e=[...document.querySelectorAll('select[x-model="searchMode"]')].find(${visible}); e.value='hybrid'; e.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+    await waitFor(desktop, `(() => { const el = [...document.querySelectorAll('select[x-model="searchPreset"]')].find(${visible}); return Boolean(el && el.offsetParent !== null && el.getBoundingClientRect().width > 0); })()`, 'hybrid preset visible');
     await waitFor(desktop, `${app}.issues.length > 0 && ${app}.issues.every(i=>Number.isFinite(i.hybrid_score))`, 'JS hybrid results after optional module failure');
     await resultIDs(desktop, ['browser-root', 'browser-detail', 'browser-closed']);
     assert.equal(await evaluate(desktop, `${app}.searchBackend`), 'substring', 'actual vendored SQLite capability disclosed');
@@ -1722,6 +2098,29 @@ try {
     }
     await capture(desktop, 'optional-hybrid-fallback');
     clean(desktop);
+    // Verify Quick Wins reason + Issue Modal triage recommendation & CSP-safe breakdown bars.
+    const quickWinsReasonsOk = await evaluate(desktop, `${app}.quickWins.length > 0 && ${app}.quickWins.every(w => typeof w.reason === 'string' && w.reason.length > 0)`);
+    assert.equal(quickWinsReasonsOk, true, 'Quick Wins populate real triage recommendation reasons');
+    await click(desktop, '[aria-label^="View issue browser-root:"]');
+    await waitFor(desktop, `${app}.selectedIssue?.id === 'browser-root'`, 'browser-root detail modal opened');
+    const triageModalAudit = await evaluate(desktop, `(() => {
+      const iss = ${app}.selectedIssue;
+      const fills = [...document.querySelectorAll('.score-breakdown-fill')];
+      return {
+        reason: iss?.reason || '',
+        reasonsCount: iss?.triage_reasons?.length || 0,
+        barsCount: iss?.score_breakdown_bars?.length || 0,
+        domFillsCount: fills.length,
+        zeroInlineStyles: fills.every(el => !el.hasAttribute('style')),
+      };
+    })()`);
+    assert.ok(triageModalAudit.reason.length > 0 && triageModalAudit.reasonsCount > 0, `Issue modal loads triage reasons: ${JSON.stringify(triageModalAudit)}`);
+    assert.ok(triageModalAudit.barsCount >= 6, `getScoreBreakdownBars computes positive triage components: ${JSON.stringify(triageModalAudit)}`);
+    assert.equal(triageModalAudit.domFillsCount, triageModalAudit.barsCount, 'Issue modal renders all positive score breakdown bars');
+    assert.equal(triageModalAudit.zeroInlineStyles, true, 'Score breakdown bars use CSS classes with zero inline style attributes');
+    clean(desktop);
+    await key(desktop, 'Escape');
+    await waitFor(desktop, `!${app}.selectedIssue`, 'Escape closes browser-root modal');
     await click(desktop, '[aria-label^="View issue browser-detail:"]');
     await waitFor(desktop, `${app}.selectedIssue?.id === 'browser-detail'`, 'detail for denied clipboard');
     await send('Browser.setPermission', { permission: { name: 'clipboard-write' }, setting: 'denied', origin, browserContextId: desktop.context });

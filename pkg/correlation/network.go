@@ -244,24 +244,47 @@ func (nb *NetworkBuilder) BuildAt(now time.Time) *ImpactNetwork {
 	return network
 }
 
-// recomputeNodeDegrees resets and recounts every node's Degree from the final
-// edge list. Each edge contributes one degree to both of its endpoints, so a
-// pair of beads linked by multiple edge types (shared commit, shared file,
-// dependency) counts once per edge — matching the historical inline
-// degree-update loop this method replaced.
+// recomputeNodeDegrees resets and recounts every node's simple-graph Degree
+// and Connectivity from the final edge list, deduplicating parallel typed edges
+// between the same pair of beads via makeNetworkPair.
 func (nb *NetworkBuilder) recomputeNodeDegrees(network *ImpactNetwork) {
 	if network == nil {
 		return
 	}
 	for _, node := range network.Nodes {
 		node.Degree = 0
+		node.Connectivity = 0
 	}
+	seenPairs := make(map[networkPair]struct{}, len(network.Edges))
 	for _, edge := range network.Edges {
-		if node, ok := network.Nodes[edge.FromBead]; ok {
-			node.Degree++
+		if edge.FromBead == edge.ToBead {
+			continue
 		}
-		if node, ok := network.Nodes[edge.ToBead]; ok {
-			node.Degree++
+		nodeA, okA := network.Nodes[edge.FromBead]
+		nodeB, okB := network.Nodes[edge.ToBead]
+		if !okA || !okB {
+			continue
+		}
+		pair := makeNetworkPair(edge.FromBead, edge.ToBead)
+		if _, exists := seenPairs[pair]; exists {
+			continue
+		}
+		seenPairs[pair] = struct{}{}
+		nodeA.Degree++
+		nodeB.Degree++
+	}
+
+	totalNodes := len(network.Nodes)
+	if totalNodes > 1 {
+		denom := float64(totalNodes - 1)
+		for _, node := range network.Nodes {
+			conn := float64(node.Degree) / denom
+			if conn < 0 {
+				conn = 0
+			} else if conn > 1 {
+				conn = 1
+			}
+			node.Connectivity = conn
 		}
 	}
 }
@@ -573,39 +596,47 @@ func (nb *NetworkBuilder) buildCluster(id int, beadIDs []string, network *Impact
 		clusterSet[bid] = true
 	}
 
-	// Count internal and external edges
-	// Note: network.Edges contains unique edges (not duplicated for each direction)
+	// Count internal and external edges, tracking unique undirected internal pairs
+	internalPairs := make(map[networkPair]struct{})
+	internalNeighborSets := make(map[string]map[string]struct{}, len(beadIDs))
 	for _, edge := range network.Edges {
 		fromIn := clusterSet[edge.FromBead]
 		toIn := clusterSet[edge.ToBead]
 
 		if fromIn && toIn {
 			cluster.InternalEdges++
+			if edge.FromBead != edge.ToBead {
+				internalPairs[makeNetworkPair(edge.FromBead, edge.ToBead)] = struct{}{}
+				if internalNeighborSets[edge.FromBead] == nil {
+					internalNeighborSets[edge.FromBead] = make(map[string]struct{})
+				}
+				if internalNeighborSets[edge.ToBead] == nil {
+					internalNeighborSets[edge.ToBead] = make(map[string]struct{})
+				}
+				internalNeighborSets[edge.FromBead][edge.ToBead] = struct{}{}
+				internalNeighborSets[edge.ToBead][edge.FromBead] = struct{}{}
+			}
 		} else if fromIn || toIn {
 			cluster.ExternalEdges++
 		}
 	}
 
-	// Calculate internal connectivity
+	// Calculate internal connectivity using unique undirected pairs (<= 1.0)
 	n := len(beadIDs)
-	maxEdges := n * (n - 1) / 2
-	if maxEdges > 0 {
-		cluster.InternalConnectivity = float64(cluster.InternalEdges) / float64(maxEdges)
+	potentialEdges := n * (n - 1) / 2
+	if potentialEdges > 0 {
+		cluster.InternalConnectivity = float64(len(internalPairs)) / float64(potentialEdges)
+		if cluster.InternalConnectivity > 1.0 {
+			cluster.InternalConnectivity = 1.0
+		}
 	}
 
-	// Find central bead (highest degree within cluster)
-	maxDegree := 0
+	// Find central bead (highest unique neighbor degree within cluster)
+	maxDegree := -1
 	for _, bid := range beadIDs {
 		if node, ok := network.Nodes[bid]; ok {
-			// Count only edges within cluster
-			internalDegree := 0
-			for _, edge := range network.Edges {
-				if (edge.FromBead == bid && clusterSet[edge.ToBead]) ||
-					(edge.ToBead == bid && clusterSet[edge.FromBead]) {
-					internalDegree++
-				}
-			}
-			if internalDegree > maxDegree {
+			internalDegree := len(internalNeighborSets[bid])
+			if internalDegree > maxDegree || (internalDegree == maxDegree && (cluster.CentralBead == "" || bid < cluster.CentralBead)) {
 				maxDegree = internalDegree
 				cluster.CentralBead = bid
 			}
@@ -747,10 +778,24 @@ func (nb *NetworkBuilder) calculateStats(network *ImpactNetwork) {
 		stats.AvgDegree = float64(totalDegree) / float64(stats.TotalNodes)
 	}
 
-	// Calculate density (edges / max_possible_edges)
+	// Calculate density (unique undirected pairs / max_possible_edges, <= 1.0)
 	if stats.TotalNodes > 1 {
+		uniquePairs := make(map[networkPair]struct{}, len(network.Edges))
+		for _, edge := range network.Edges {
+			if edge.FromBead == edge.ToBead {
+				continue
+			}
+			_, okA := network.Nodes[edge.FromBead]
+			_, okB := network.Nodes[edge.ToBead]
+			if okA && okB {
+				uniquePairs[makeNetworkPair(edge.FromBead, edge.ToBead)] = struct{}{}
+			}
+		}
 		maxEdges := stats.TotalNodes * (stats.TotalNodes - 1) / 2
-		stats.Density = float64(stats.TotalEdges) / float64(maxEdges)
+		stats.Density = float64(len(uniquePairs)) / float64(maxEdges)
+		if stats.Density > 1.0 {
+			stats.Density = 1.0
+		}
 	}
 
 	// Find largest cluster
@@ -834,8 +879,9 @@ func (network *ImpactNetwork) GetSubNetwork(beadID string, depth int) *ImpactNet
 		}
 	}
 
-	// Recalculate stats for subnetwork
+	// Recalculate simple-graph degrees, connectivity, and stats for subnetwork
 	nb := &NetworkBuilder{report: nil}
+	nb.recomputeNodeDegrees(subNetwork)
 	nb.calculateStats(subNetwork)
 
 	return subNetwork

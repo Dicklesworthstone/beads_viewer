@@ -1171,3 +1171,37 @@ func TestWatcher_FsnotifyTransientJSONLTruncateSettles(t *testing.T) {
 		t.Fatalf("expected persistent 0-byte clear snapshot after settle window, got %q", finalSnapshots)
 	}
 }
+
+func TestWatcher_EnvPollIntervalDurationAndMillis(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "test.jsonl")
+	if err := os.WriteFile(tmpFile, []byte("initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BV_POLL_INTERVAL", "175ms")
+	wDur, err := NewWatcher(tmpFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := wDur.PollInterval(); got != 175*time.Millisecond {
+		t.Fatalf("BV_POLL_INTERVAL=175ms -> PollInterval() = %v, want 175ms", got)
+	}
+
+	t.Setenv("BV_POLL_INTERVAL", "325")
+	wMs, err := NewWatcher(tmpFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := wMs.PollInterval(); got != 325*time.Millisecond {
+		t.Fatalf("BV_POLL_INTERVAL=325 -> PollInterval() = %v, want 325ms", got)
+	}
+
+	// Explicit WithPollInterval option overrides BV_POLL_INTERVAL.
+	wExplicit, err := NewWatcher(tmpFile, WithPollInterval(600*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := wExplicit.PollInterval(); got != 600*time.Millisecond {
+		t.Fatalf("WithPollInterval(600ms) -> PollInterval() = %v, want 600ms", got)
+	}
+}

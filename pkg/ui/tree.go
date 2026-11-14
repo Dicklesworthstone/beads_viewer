@@ -400,6 +400,7 @@ func (t *TreeModel) Build(issues []model.Issue) {
 	t.flatList = nil
 	t.issueMap = make(map[string]*IssueTreeNode)
 	t.cursor = 0
+	t.lastHash = ""
 
 	if len(issues) == 0 {
 		t.built = true
@@ -424,6 +425,25 @@ func (t *TreeModel) Build(issues []model.Issue) {
 	t.rebuildFlatList()
 
 	t.built = true
+}
+
+// BuildFromIssues rebuilds the tree from an explicit issue slice (e.g. repo-scoped
+// issues in workspace mode) while preserving the currently selected issue when present.
+func (t *TreeModel) BuildFromIssues(issues []model.Issue) {
+	prevSelectedID := ""
+	if issue := t.SelectedIssue(); issue != nil {
+		prevSelectedID = issue.ID
+	}
+	t.Build(issues)
+	if prevSelectedID != "" {
+		for i, node := range t.flatList {
+			if node != nil && node.Issue != nil && node.Issue.ID == prevSelectedID {
+				t.cursor = i
+				t.ensureCursorVisible()
+				break
+			}
+		}
+	}
 }
 
 // BuildFromSnapshot wires the tree view to precomputed tree data from a DataSnapshot.

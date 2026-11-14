@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -795,3 +796,209 @@ func BenchmarkGenerateAllSuggestions_OnlyLabels(b *testing.B) {
 
 // Ensure sort is used
 var _ = sort.Slice
+
+func TestGenerateAllSuggestions_CandidateIDsScoping(t *testing.T) {
+	issues := []model.Issue{
+		// In-scope duplicate pair + cycle
+		{ID: "CAND-1", Title: "Implement OAuth token refresh retry", Status: model.StatusOpen},
+		{ID: "CAND-2", Title: "Implement OAuth token refresh retry", Status: model.StatusOpen},
+		// Out-of-scope boundary duplicate pair + cycle
+		{
+			ID: "EXT-1", Title: "Migrate legacy billing webhook queue", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "EXT-1", DependsOnID: "EXT-2", Type: model.DepBlocks}},
+		},
+		{
+			ID: "EXT-2", Title: "Migrate legacy billing webhook queue", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "EXT-2", DependsOnID: "EXT-1", Type: model.DepBlocks}},
+		},
+		// Seed labels so SuggestLabels also runs
+		{ID: "SEED-1", Title: "OAuth billing webhook", Status: model.StatusOpen, Labels: []string{"auth", "billing"}},
+		{ID: "SEED-2", Title: "OAuth billing webhook", Status: model.StatusOpen, Labels: []string{"auth", "billing"}},
+		{ID: "SEED-3", Title: "OAuth billing webhook", Status: model.StatusOpen, Labels: []string{"auth", "billing"}},
+	}
+
+	cfg := DefaultSuggestAllConfig()
+	cfg.Duplicates.JaccardThreshold = 0.4
+	cfg.CandidateIDs = map[string]bool{
+		"CAND-1": true,
+		"CAND-2": true,
+	}
+
+	set := GenerateAllSuggestions(issues, cfg, "scoped-suggest")
+	if len(set.Suggestions) == 0 {
+		t.Fatal("expected in-scope suggestions for CAND-1/CAND-2")
+	}
+	for _, sug := range set.Suggestions {
+		if strings.HasPrefix(sug.TargetBead, "EXT-") || strings.HasPrefix(sug.TargetBead, "SEED-") {
+			t.Fatalf("out-of-scope primary target leaked into suggestions: %+v", sug)
+		}
+		if sug.Type == SuggestionPotentialDuplicate && !cfg.CandidateIDs[sug.RelatedBead] {
+			t.Fatalf("duplicate suggestion paired out-of-scope bead: %+v", sug)
+		}
+		if sug.Type == SuggestionCycleWarning && !cfg.CandidateIDs[sug.TargetBead] && !cfg.CandidateIDs[sug.RelatedBead] {
+			t.Fatalf("purely out-of-scope cycle leaked into suggestions: %+v", sug)
+		}
+	}
+}
+
+func TestGenerateAllSuggestions_CandidateIDsNoCapStarvationAndMissingDepScope(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		// Closed seed issue establishing the project's known label vocabulary for SuggestLabels
+		{
+			ID:        "SEED-LABELS",
+			Title:     "Seed label vocabulary",
+			Status:    model.StatusClosed,
+			Labels:    []string{"bug", "security", "auth", "database"},
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+	}
+
+	// Add 40 out-of-scope high-confidence label/duplicate/dependency candidates forming
+	// 20 disjoint 2-node cycles (exceeding default sub-detector caps of 30 / 20 / 10)
+	// BEFORE our in-scope candidates!
+	for i := 0; i < 40; i++ {
+		extID := fmt.Sprintf("EXT-%02d", i)
+		peerIdx := i ^ 1 // pairs (0,1), (2,3), ..., (38,39) -> 20 distinct SCC cycles
+		peerID := fmt.Sprintf("EXT-%02d", peerIdx)
+		issues = append(issues, model.Issue{
+			ID:          extID,
+			Title:       "Critical authentication security crash panic bug error",
+			Description: "Database migration schema query authentication crash panic bug",
+			Status:      model.StatusOpen,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+			Dependencies: []*model.Dependency{
+				{IssueID: extID, DependsOnID: peerID, Type: model.DepBlocks},
+			},
+		})
+	}
+
+	// Add 2 in-scope candidates that need label/duplicate/dependency/cycle suggestions
+	issues = append(issues,
+		model.Issue{
+			ID:          "CAND-A",
+			Title:       "Fix authentication login token validation bug",
+			Description: "Authentication token validation fails on refresh",
+			Status:      model.StatusOpen,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CAND-A", DependsOnID: "CAND-B", Type: model.DepBlocks},
+			},
+		},
+		model.Issue{
+			ID:          "CAND-B",
+			Title:       "Fix authentication login token validation bug",
+			Description: "Authentication token validation fails on refresh",
+			Status:      model.StatusOpen,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CAND-B", DependsOnID: "CAND-A", Type: model.DepBlocks},
+			},
+		},
+	)
+
+	cfg := DefaultSuggestAllConfig()
+	cfg.Labels.MaxTotalSuggestions = 5
+	cfg.Cycles.MaxCycles = 2
+	cfg.Duplicates.MaxSuggestions = 5
+	cfg.Dependencies.MaxSuggestions = 5
+	cfg.CandidateIDs = map[string]bool{
+		"CAND-A": true,
+		"CAND-B": true,
+	}
+
+	set := GenerateAllSuggestionsAt(issues, cfg, "no-starve-hash", now)
+	if len(set.Suggestions) == 0 {
+		t.Fatal("in-scope suggestions were starved by out-of-scope boundary issues")
+	}
+
+	foundLabel := false
+	foundCycle := false
+	for _, sug := range set.Suggestions {
+		if sug.Type == SuggestionLabelSuggestion {
+			foundLabel = true
+		}
+		if sug.Type == SuggestionCycleWarning {
+			foundCycle = true
+		}
+		if sug.Type != SuggestionCycleWarning {
+			if !cfg.CandidateIDs[sug.TargetBead] || (sug.RelatedBead != "" && !cfg.CandidateIDs[sug.RelatedBead]) {
+				t.Fatalf("non-cycle suggestion leaked out-of-scope bead: %+v", sug)
+			}
+		}
+	}
+	if !foundLabel {
+		t.Fatal("expected SuggestLabels to survive out-of-scope cap pressure for CAND-A/CAND-B")
+	}
+	if !foundCycle {
+		t.Fatal("expected DetectCycleWarnings to survive out-of-scope cap pressure for CAND-A<->CAND-B")
+	}
+
+	// Verify FilterSuggestionsByCandidates directly rejects SuggestionMissingDependency
+	// when RelatedBead is outside candidateIDs.
+	mixed := []Suggestion{
+		{Type: SuggestionMissingDependency, TargetBead: "CAND-A", RelatedBead: "EXT-00", Confidence: 0.9},
+		{Type: SuggestionMissingDependency, TargetBead: "CAND-A", RelatedBead: "CAND-B", Confidence: 0.8},
+	}
+	filtered := FilterSuggestionsByCandidates(mixed, cfg.CandidateIDs)
+	if len(filtered) != 1 || filtered[0].RelatedBead != "CAND-B" {
+		t.Fatalf("expected FilterSuggestionsByCandidates to require RelatedBead in CandidateIDs for missing_dependency, got %+v", filtered)
+	}
+}
+
+func TestGenerateAllSuggestionsAt_BoundaryCycleExcludedFromMissingDependencies(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+
+	// CAND-A -> EXT-1 -> CAND-B via out-of-scope EXT-1.
+	// CAND-A is older than CAND-B, so DetectMissingDependencies would orient a
+	// keyword/label match as CAND-B -> CAND-A, creating a 3-node cycle through EXT-1!
+	issues := []model.Issue{
+		{
+			ID:          "CAND-A",
+			Title:       "Implement authentication token validation",
+			Description: "Build JWT authentication token validation middleware",
+			Labels:      []string{"auth", "security"},
+			Status:      model.StatusOpen,
+			CreatedAt:   now.Add(-2 * time.Hour),
+			Origin:      suggestionTestOrigin("CAND-A"),
+			Dependencies: []*model.Dependency{
+				{IssueID: "CAND-A", DependsOnID: "EXT-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "EXT-1",
+			Title:     "Unrelated intermediate infrastructure bridge",
+			Status:    model.StatusOpen,
+			CreatedAt: now.Add(-1 * time.Hour),
+			Origin:    suggestionTestOrigin("EXT-1"),
+			Dependencies: []*model.Dependency{
+				{IssueID: "EXT-1", DependsOnID: "CAND-B", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:          "CAND-B",
+			Title:       "Add authentication token validation tests",
+			Description: "Verify JWT authentication token validation middleware",
+			Labels:      []string{"auth", "security"},
+			Status:      model.StatusOpen,
+			CreatedAt:   now,
+			Origin:      suggestionTestOrigin("CAND-B"),
+		},
+	}
+
+	cfg := DefaultSuggestAllConfig()
+	cfg.CandidateIDs = map[string]bool{"CAND-A": true, "CAND-B": true}
+	cfg.Dependencies.MinKeywordOverlap = 2
+	cfg.Dependencies.MinConfidence = 0.1
+
+	set := GenerateAllSuggestionsAt(issues, cfg, "boundary-cycle-hash", now)
+	for _, sug := range set.Suggestions {
+		if sug.Type == SuggestionMissingDependency && sug.TargetBead == "CAND-B" && sug.RelatedBead == "CAND-A" {
+			t.Fatalf("emitted cycle-forming SuggestionMissingDependency CAND-B -> CAND-A across out-of-scope EXT-1: %+v", sug)
+		}
+	}
+}

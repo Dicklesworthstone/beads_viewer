@@ -35,7 +35,14 @@ type readinessIssue struct {
 	Assignee      string
 	DeferUntil    *time.Time
 	Dependencies  []readinessDependency
+	Ephemeral     bool
+	Pinned        bool
+	IsTemplate    bool
 	hasParentEdge bool
+}
+
+func (issue readinessIssue) isWithheldFromReady() bool {
+	return issue.Ephemeral || issue.Pinned || issue.IsTemplate
 }
 
 type readinessDependency struct {
@@ -104,9 +111,12 @@ func NewReadinessIndex(issues []Issue) *ReadinessIndex {
 	for idx := 0; idx < n; idx++ {
 		src := &issues[lastRow[idx]]
 		owned := readinessIssue{
-			Status:    src.Status,
-			IssueType: src.IssueType,
-			Assignee:  src.Assignee,
+			Status:     src.Status,
+			IssueType:  src.IssueType,
+			Assignee:   src.Assignee,
+			Ephemeral:  src.Ephemeral,
+			Pinned:     src.Pinned,
+			IsTemplate: src.IsTemplate,
 		}
 		if src.DeferUntil != nil {
 			deferSlab[deferPos] = *src.DeferUntil
@@ -294,7 +304,7 @@ func (r *ReadinessIndex) Ready(id string, now time.Time) bool {
 	}
 	issue := &r.issues[idx]
 	return (issue.Status == StatusOpen || issue.Status == StatusInProgress) &&
-		!issue.isDeferredAt(now) && r.states[idx] == DependenciesSatisfied
+		!issue.isWithheldFromReady() && !issue.isDeferredAt(now) && r.states[idx] == DependenciesSatisfied
 }
 
 func (r *ReadinessIndex) Claimable(id string, now time.Time) bool {
@@ -306,7 +316,7 @@ func (r *ReadinessIndex) Claimable(id string, now time.Time) bool {
 		return false
 	}
 	issue := &r.issues[idx]
-	return issue.Status == StatusOpen && !issue.isDeferredAt(now) &&
+	return issue.Status == StatusOpen && !issue.isWithheldFromReady() && !issue.isDeferredAt(now) &&
 		r.states[idx] == DependenciesSatisfied &&
 		issue.Assignee == "" && issue.IssueType != TypeEpic && !r.hasOpenChildrenAt(idx)
 }
@@ -393,7 +403,7 @@ func (r *ReadinessIndex) ReadyAfterSingle(id string, now time.Time, completedID 
 		return false
 	}
 	issue := &r.issues[idx]
-	if (issue.Status != StatusOpen && issue.Status != StatusInProgress) || issue.isDeferredAt(now) {
+	if (issue.Status != StatusOpen && issue.Status != StatusInProgress) || issue.isWithheldFromReady() || issue.isDeferredAt(now) {
 		return false
 	}
 	completedIdx := int32(-1)
@@ -475,7 +485,7 @@ func (r *ReadinessIndex) ReadyAfter(id string, now time.Time, completed map[stri
 		return false
 	}
 	issue := &r.issues[idx]
-	if (issue.Status != StatusOpen && issue.Status != StatusInProgress) || issue.isDeferredAt(now) {
+	if (issue.Status != StatusOpen && issue.Status != StatusInProgress) || issue.isWithheldFromReady() || issue.isDeferredAt(now) {
 		return false
 	}
 	if r.states[idx] == DependenciesSatisfied {

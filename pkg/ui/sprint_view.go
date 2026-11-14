@@ -80,13 +80,14 @@ func (m Model) renderSprintDashboard() string {
 	sb.WriteString("\n\n")
 
 	// Compute bead stats
+	scopedIssues := m.repoScopedIssues()
 	var totalBeads, closedBeads, openBeads, blockedBeads, inProgressBeads int
 	var sprintIssues []model.Issue
 	beadIDSet := make(map[string]bool)
 	for _, id := range sprint.BeadIDs {
 		beadIDSet[id] = true
 	}
-	for _, iss := range m.issues {
+	for _, iss := range scopedIssues {
 		if beadIDSet[iss.ID] {
 			totalBeads++
 			sprintIssues = append(sprintIssues, iss)
@@ -179,7 +180,7 @@ func (m Model) renderSprintDashboard() string {
 	// --robot-burndown reports (analysis.DetectAtRisk), so the TUI and robot agree.
 	sb.WriteString(labelStyle.Render("At Risk:"))
 	sb.WriteString("\n")
-	atRisk := analysis.DetectAtRisk(m.issues, sprint, now, m.sprintAtRiskThresholds)
+	atRisk := analysis.DetectAtRisk(scopedIssues, sprint, now, m.sprintAtRiskThresholds)
 	if len(atRisk) == 0 {
 		sb.WriteString(t.Renderer.NewStyle().Foreground(t.Open).Render("  ✓ No at-risk items"))
 		sb.WriteString("\n")

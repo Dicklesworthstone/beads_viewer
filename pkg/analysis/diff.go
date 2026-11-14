@@ -16,10 +16,11 @@ type Snapshot struct {
 	Stats     *GraphStats   `json:"stats,omitempty"`
 
 	// Computed counts
-	TotalCount   int `json:"total_count"`
-	OpenCount    int `json:"open_count"`
-	ClosedCount  int `json:"closed_count"`
-	BlockedCount int `json:"blocked_count"`
+	TotalCount      int `json:"total_count"`
+	OpenCount       int `json:"open_count"`
+	ClosedCount     int `json:"closed_count"`
+	BlockedCount    int `json:"blocked_count"`
+	ActionableCount int `json:"actionable_count"`
 }
 
 // NewSnapshot creates a snapshot from issues
@@ -51,22 +52,51 @@ func NewSnapshotAt(issues []model.Issue, timestamp time.Time, revision string) *
 	return snap
 }
 
-// computeCounts calculates issue counts by status
+// computeCounts calculates issue counts by status and dependency readiness
 func (s *Snapshot) computeCounts() {
-	s.TotalCount = len(s.Issues)
+	s.ComputeScopedCounts(model.NewReadinessIndex(s.Issues), s.Timestamp, nil)
+}
+
+// ComputeScopedCounts populates TotalCount, OpenCount, ClosedCount, BlockedCount,
+// and ActionableCount for issues matching isCandidate (or all issues if nil),
+// using the exact Snapshot readiness/withheld/deferred partition at now.
+func (s *Snapshot) ComputeScopedCounts(readiness *model.ReadinessIndex, now time.Time, isCandidate func(string) bool) {
+	if s == nil {
+		return
+	}
+	s.TotalCount = 0
+	s.OpenCount = 0
+	s.ClosedCount = 0
+	s.BlockedCount = 0
+	s.ActionableCount = 0
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(s.Issues)
+	}
+	if now.IsZero() {
+		now = s.Timestamp
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
 	for _, issue := range s.Issues {
-		switch issue.Status {
-		case model.StatusClosed, model.StatusTombstone:
+		if isCandidate != nil && !isCandidate(issue.ID) {
+			continue
+		}
+		s.TotalCount++
+		if isClosedLikeStatus(issue.Status) {
 			s.ClosedCount++
-		case model.StatusBlocked:
+			continue
+		}
+		s.OpenCount++
+		switch {
+		case readiness.Ready(issue.ID, now) && !isWithheldIssue(&issue):
+			s.ActionableCount++
+		case issue.Status == model.StatusBlocked:
 			s.BlockedCount++
-			s.OpenCount++ // Blocked is a type of open
-		case model.StatusOpen, model.StatusInProgress:
-			s.OpenCount++
+		case !isActionableStatus(issue.Status) || issue.IsDeferredAt(now) || isWithheldIssue(&issue):
+			// Parked, future-deferred, or withheld (Pinned/Ephemeral/IsTemplate)
 		default:
-			// Other non-closed statuses (deferred, draft, pinned, hooked, review)
-			// are still open work items
-			s.OpenCount++
+			s.BlockedCount++
 		}
 	}
 }
@@ -350,6 +380,46 @@ func detectChanges(from, to model.Issue) []FieldChange {
 		})
 	}
 
+	if from.CreatedBy != to.CreatedBy {
+		changes = append(changes, FieldChange{
+			Field:    "created_by",
+			OldValue: from.CreatedBy,
+			NewValue: to.CreatedBy,
+		})
+	}
+
+	if from.CloseReason != to.CloseReason {
+		changes = append(changes, FieldChange{
+			Field:    "close_reason",
+			OldValue: from.CloseReason,
+			NewValue: to.CloseReason,
+		})
+	}
+
+	if from.Ephemeral != to.Ephemeral {
+		changes = append(changes, FieldChange{
+			Field:    "ephemeral",
+			OldValue: fmt.Sprintf("%t", from.Ephemeral),
+			NewValue: fmt.Sprintf("%t", to.Ephemeral),
+		})
+	}
+
+	if from.Pinned != to.Pinned {
+		changes = append(changes, FieldChange{
+			Field:    "pinned",
+			OldValue: fmt.Sprintf("%t", from.Pinned),
+			NewValue: fmt.Sprintf("%t", to.Pinned),
+		})
+	}
+
+	if from.IsTemplate != to.IsTemplate {
+		changes = append(changes, FieldChange{
+			Field:    "is_template",
+			OldValue: fmt.Sprintf("%t", from.IsTemplate),
+			NewValue: fmt.Sprintf("%t", to.IsTemplate),
+		})
+	}
+
 	return changes
 }
 
@@ -404,6 +474,12 @@ func normalizeCycle(cycle []string) string {
 	if len(cycle) == 0 {
 		return ""
 	}
+	if len(cycle) > 1 && cycle[0] == cycle[len(cycle)-1] {
+		cycle = cycle[:len(cycle)-1]
+	}
+	if len(cycle) == 0 {
+		return ""
+	}
 
 	// Find the smallest element to start
 	minIdx := 0
@@ -442,15 +518,73 @@ func calculateMetricDeltas(from, to *Snapshot) MetricDeltas {
 	deltas.OpenIssues = to.OpenCount - from.OpenCount
 	deltas.ClosedIssues = to.ClosedCount - from.ClosedCount
 	deltas.BlockedIssues = to.BlockedCount - from.BlockedCount
+	deltas.ComponentCount = countIssueComponents(to.Issues) - countIssueComponents(from.Issues)
 
 	// Graph-level metrics from Stats
 	if from.Stats != nil && to.Stats != nil {
+		deltas.TotalEdges = to.Stats.EdgeCount - from.Stats.EdgeCount
 		deltas.CycleCount = len(to.Stats.Cycles()) - len(from.Stats.Cycles())
 		deltas.AvgPageRank = avgMapValue(to.Stats.PageRank()) - avgMapValue(from.Stats.PageRank())
 		deltas.AvgBetweenness = avgMapValue(to.Stats.Betweenness()) - avgMapValue(from.Stats.Betweenness())
 	}
 
 	return deltas
+}
+
+// countIssueComponents computes weak connected components over blocking and parent-child dependencies.
+func countIssueComponents(issues []model.Issue) int {
+	if len(issues) == 0 {
+		return 0
+	}
+	parent := make(map[string]string, len(issues))
+	for i := range issues {
+		if issues[i].ID != "" {
+			parent[issues[i].ID] = issues[i].ID
+		}
+	}
+	if len(parent) == 0 {
+		return 0
+	}
+	find := func(x string) string {
+		root := x
+		for parent[root] != root {
+			root = parent[root]
+		}
+		for parent[x] != root {
+			next := parent[x]
+			parent[x] = root
+			x = next
+		}
+		return root
+	}
+	for i := range issues {
+		fromID := issues[i].ID
+		if _, ok := parent[fromID]; !ok {
+			continue
+		}
+		for _, dep := range issues[i].Dependencies {
+			if dep == nil || !(dep.Type.IsBlocking() || dep.Type == model.DepParentChild) {
+				continue
+			}
+			if _, ok := parent[dep.DependsOnID]; !ok {
+				continue
+			}
+			rf, rt := find(fromID), find(dep.DependsOnID)
+			if rf == rt {
+				continue
+			}
+			if rf < rt {
+				parent[rt] = rf
+			} else {
+				parent[rf] = rt
+			}
+		}
+	}
+	roots := make(map[string]struct{}, len(parent))
+	for id := range parent {
+		roots[find(id)] = struct{}{}
+	}
+	return len(roots)
 }
 
 // avgMapValue computes the average value in a map

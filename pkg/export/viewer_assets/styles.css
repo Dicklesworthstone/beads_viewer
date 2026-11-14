@@ -2372,3 +2372,49 @@ body.modal-open .overflow-y-auto {
         transition-duration: 0.01ms !important;
     }
 }
+
+/* =============================================================================
+   Triage Score Breakdown Bars (CSP-safe width & component color classes)
+   ============================================================================= */
+.score-breakdown-track {
+    height: 0.5rem;
+    border-radius: 9999px;
+    overflow: hidden;
+}
+
+.score-breakdown-fill {
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 0.2s ease-out;
+}
+
+.sb-c-pagerank { background-color: #3b82f6; }
+.sb-c-betweenness { background-color: #f97316; }
+.sb-c-blocker_ratio { background-color: #ef4444; }
+.sb-c-priority_boost { background-color: #8b5cf6; }
+.sb-c-time_to_impact { background-color: #06b6d4; }
+.sb-c-urgency { background-color: #ec4899; }
+.sb-c-risk { background-color: #f59e0b; }
+.sb-c-staleness { background-color: #6b7280; }
+
+.sb-w-0 { width: 0%; }
+.sb-w-5 { width: 5%; }
+.sb-w-10 { width: 10%; }
+.sb-w-15 { width: 15%; }
+.sb-w-20 { width: 20%; }
+.sb-w-25 { width: 25%; }
+.sb-w-30 { width: 30%; }
+.sb-w-35 { width: 35%; }
+.sb-w-40 { width: 40%; }
+.sb-w-45 { width: 45%; }
+.sb-w-50 { width: 50%; }
+.sb-w-55 { width: 55%; }
+.sb-w-60 { width: 60%; }
+.sb-w-65 { width: 65%; }
+.sb-w-70 { width: 70%; }
+.sb-w-75 { width: 75%; }
+.sb-w-80 { width: 80%; }
+.sb-w-85 { width: 85%; }
+.sb-w-90 { width: 90%; }
+.sb-w-95 { width: 95%; }
+.sb-w-100 { width: 100%; }

@@ -152,6 +152,34 @@ func TestBaselineSummary(t *testing.T) {
 	}
 }
 
+func TestBaselineSummaryIncludesAllTopMetrics(t *testing.T) {
+	b := &Baseline{
+		Version:   CurrentVersion,
+		CreatedAt: time.Date(2025, 11, 30, 10, 0, 0, 0, time.UTC),
+		Stats:     GraphStats{NodeCount: 10, EdgeCount: 12},
+		TopMetrics: TopMetrics{
+			PageRank:     []MetricItem{{ID: "PR-1", Value: 0.25}},
+			Betweenness:  []MetricItem{{ID: "BW-1", Value: 0.40}},
+			CriticalPath: []MetricItem{{ID: "CP-1", Value: 4.0}},
+			Hubs:         []MetricItem{{ID: "HB-1", Value: 0.60}},
+			Authorities:  []MetricItem{{ID: "AU-1", Value: 0.70}},
+		},
+	}
+
+	summary := b.Summary()
+	for _, token := range []string{
+		"Top PageRank:", "PR-1",
+		"Top Betweenness:", "BW-1",
+		"Top Critical Path:", "CP-1",
+		"Top Hubs:", "HB-1",
+		"Top Authorities:", "AU-1",
+	} {
+		if !strings.Contains(summary, token) {
+			t.Errorf("expected baseline summary to contain %q, got:\n%s", token, summary)
+		}
+	}
+}
+
 func TestNew(t *testing.T) {
 	stats := GraphStats{
 		NodeCount: 50,

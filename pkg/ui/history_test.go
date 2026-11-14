@@ -3271,3 +3271,542 @@ func TestHistoryModel_CycleSearchModeAndAuthorToggle(t *testing.T) {
 		t.Fatalf("expected cleared statusMsg, got %q", m.statusMsg)
 	}
 }
+
+func TestHistoryModel_FileTreeViewLayoutFilterChipGitModeAndCass(t *testing.T) {
+	now := time.Now()
+	report := &correlation.HistoryReport{
+		GeneratedAt: now,
+		Stats: correlation.HistoryStats{
+			TotalBeads:       3,
+			BeadsWithCommits: 3,
+			TotalCommits:     3,
+			UniqueAuthors:    2,
+		},
+		Histories: map[string]correlation.BeadHistory{
+			"bv-1": {
+				BeadID: "bv-1",
+				Title:  "Auth token validation",
+				Status: "open",
+				Commits: []correlation.CorrelatedCommit{
+					{
+						SHA:        "1111111aaaaaaa",
+						ShortSHA:   "1111111",
+						Message:    "feat(auth): validate JWT token",
+						Author:     "Alice",
+						Timestamp:  now,
+						Method:     correlation.MethodExplicitID,
+						Confidence: 0.95,
+						Files: []correlation.FileChange{
+							{Path: "pkg/auth/token.go", Action: "M", Insertions: 20, Deletions: 4},
+						},
+					},
+				},
+			},
+			"bv-2": {
+				BeadID: "bv-2",
+				Title:  "DB pool tuning",
+				Status: "in_progress",
+				Commits: []correlation.CorrelatedCommit{
+					{
+						SHA:        "2222222bbbbbbb",
+						ShortSHA:   "2222222",
+						Message:    "perf(db): tune pool connections",
+						Author:     "Bob",
+						Timestamp:  now.Add(-time.Hour),
+						Method:     correlation.MethodTemporalAuthor,
+						Confidence: 0.60,
+						Files: []correlation.FileChange{
+							{Path: "pkg/db/pool.go", Action: "M", Insertions: 12, Deletions: 3},
+						},
+					},
+				},
+			},
+			"bv-3": {
+				BeadID: "bv-3",
+				Title:  "DB migration runner",
+				Status: "closed",
+				Commits: []correlation.CorrelatedCommit{
+					{
+						SHA:        "3333333ccccccc",
+						ShortSHA:   "3333333",
+						Message:    "feat(db): add migration runner",
+						Author:     "Alice",
+						Timestamp:  now.Add(-2 * time.Hour),
+						Method:     correlation.MethodExplicitID,
+						Confidence: 0.90,
+						Files: []correlation.FileChange{
+							{Path: "pkg/db/migrate.go", Action: "A", Insertions: 80, Deletions: 0},
+						},
+					},
+				},
+			},
+		},
+		CommitIndex: correlation.CommitIndex{
+			"1111111aaaaaaa": []string{"bv-1"},
+			"2222222bbbbbbb": []string{"bv-2"},
+			"3333333ccccccc": []string{"bv-3"},
+		},
+	}
+
+	issues := []model.Issue{
+		{ID: "bv-1", Title: "Auth token validation", Status: model.StatusOpen, Priority: 1},
+		{ID: "bv-2", Title: "DB pool tuning", Status: model.StatusInProgress, Priority: 2},
+		{ID: "bv-3", Title: "DB migration runner", Status: model.StatusClosed, Priority: 2},
+	}
+
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 32})
+
+	send := func(msg tea.KeyMsg) {
+		t.Helper()
+		updated, _ := m.Update(msg)
+		m = updated.(*Model)
+	}
+
+	// Attach cassLookup returning 2 sessions for bv-1
+	m.historyView.SetCassLookup(func(beadID string) []cass.ScoredResult {
+		if beadID == "bv-1" {
+			return []cass.ScoredResult{
+				{SearchResult: cass.SearchResult{Title: "Session 1"}, FinalScore: 0.9},
+				{SearchResult: cass.SearchResult{Title: "Session 2"}, FinalScore: 0.8},
+			}
+		}
+		return nil
+	})
+
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	makeHistoryReportCurrent(m, report)
+	// Re-install our deterministic test cassLookup after enterHistoryView's attachHistoryCassLookup
+	m.historyView.SetCassLookup(func(beadID string) []cass.ScoredResult {
+		if beadID == "bv-1" {
+			return []cass.ScoredResult{
+				{SearchResult: cass.SearchResult{Title: "Session 1"}, FinalScore: 0.9},
+				{SearchResult: cass.SearchResult{Title: "Session 2"}, FinalScore: 0.8},
+			}
+		}
+		return nil
+	})
+
+	// 1. Verify Cass session badge 🤖 renders in View() when cassLookup returns sessions for bv-1
+	if !m.historyView.HasSessionsForBead("bv-1") || m.historyView.HasSessionsForBead("bv-2") {
+		t.Fatal("HasSessionsForBead did not consult cassLookup properly")
+	}
+	baseView := m.historyView.View()
+	if !strings.Contains(baseView, "🤖") {
+		t.Fatalf("expected Cass session badge 🤖 in HistoryModel.View():\n%s", baseView)
+	}
+
+	// 2. Toggle file tree ('f') and verify View() wires renderFileTreePanel across widths
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+	if !m.historyView.showFileTree || !m.historyView.FileTreeRendered() {
+		t.Fatalf("expected file tree visible and rendered at width 120")
+	}
+	wideTreeView := m.historyView.View()
+	if !strings.Contains(wideTreeView, "FILES") || !strings.Contains(wideTreeView, "pkg") {
+		t.Fatalf("expected FILES tree panel in wide HistoryModel.View():\n%s", wideTreeView)
+	}
+
+	// Compact 2-pane width (72 cols): still rendered, never panics
+	m.historyView.SetSize(72, 26)
+	if !m.historyView.FileTreeRendered() {
+		t.Fatal("expected FileTreeRendered() == true at compact width 72")
+	}
+	compactView := m.historyView.View()
+	if !strings.Contains(compactView, "FILES") {
+		t.Fatalf("expected FILES panel in compact 72-col layout:\n%s", compactView)
+	}
+
+	// Narrow width (<60 cols): suppressed with clear notice and focus released (never trapped invisibly!)
+	m.historyView.SetSize(50, 24)
+	if m.historyView.FileTreeRendered() || !m.historyView.FileTreeSuppressedForWidth() {
+		t.Fatalf("expected file tree suppressed at width 50: rendered=%v suppressed=%v",
+			m.historyView.FileTreeRendered(), m.historyView.FileTreeSuppressedForWidth())
+	}
+	if m.historyView.FileTreeHasFocus() {
+		t.Fatal("fileTreeFocus must be cleared when file tree is hidden on narrow terminal")
+	}
+	narrowView := m.historyView.View()
+	if !strings.Contains(narrowView, "File tree hidden") {
+		t.Fatalf("expected narrow-width file tree notice in filter line:\n%s", narrowView)
+	}
+
+	// Restore wide width, focus file tree, navigate to "pkg/db" directory, and press Enter
+	m.historyView.SetSize(120, 32)
+	m.historyView.SetFileTreeFocus(true)
+	// Expand root/pkg if needed and select pkg/db
+	for guard := 0; guard < 10; guard++ {
+		node := m.historyView.SelectedFileNode()
+		if node == nil {
+			break
+		}
+		if node.Path == "pkg/db" {
+			break
+		}
+		if node.IsDir && !node.Expanded {
+			m.historyView.ToggleExpandFile()
+		}
+		m.historyView.MoveDownFileTree()
+	}
+	send(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.historyView.GetFileFilter() != "pkg/db" {
+		t.Fatalf("expected Enter on directory node to set fileFilter='pkg/db', got %q", m.historyView.GetFileFilter())
+	}
+	chipView := m.historyView.View()
+	if !strings.Contains(chipView, "File: pkg/db") {
+		t.Fatalf("expected 'File: pkg/db' chip in filter line:\n%s", chipView)
+	}
+
+	// Switch to Git Mode ('v')
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	if !m.historyView.IsGitMode() {
+		t.Fatal("expected Git Mode after 'v'")
+	}
+	// Directory filter "pkg/db" in Git Mode should keep only the 2 pkg/db commits (2222222, 3333333)
+	if got := len(m.historyView.GetFilteredCommitList()); got != 2 {
+		t.Fatalf("expected 2 commits in Git Mode for directory filter pkg/db, got %d", got)
+	}
+
+	// Press 'c' in Git Mode to cycle minConfidence to 0.50 -> 0.80 (press twice: 0 -> 0.5 -> 0.75/0.8)
+	m.historyView.SetMinConfidence(0.80)
+	if got := len(m.historyView.GetFilteredCommitList()); got != 1 || m.historyView.GetFilteredCommitList()[0].ShortSHA != "3333333" {
+		t.Fatalf("expected Git Mode confidence >=0.80 + pkg/db to leave only commit 3333333, got %+v", m.historyView.GetFilteredCommitList())
+	}
+
+	// 1) In Git Mode when beadIDs has a different stale Bead-Mode selection,
+	// focusedIssueForSessions() must resolve the Git-Mode commit's SelectedRelatedBeadID().
+	m.historyView.beadIDs = []string{"bv-1"}
+	m.historyView.selectedBead = 0
+	if got := m.focusedIssueForSessions(); got == nil || got.ID != "bv-3" {
+		t.Fatalf("expected Git Mode focusedIssueForSessions() to resolve SelectedRelatedBeadID bv-3 over stale beadIDs[0], got %+v", got)
+	}
+
+	// 2) In Git Mode when SelectedBeadID() is empty, focusedIssueForSessions() MUST still resolve SelectedRelatedBeadID() ("bv-3")!
+	m.historyView.beadIDs = nil
+	if m.historyView.SelectedBeadID() != "" {
+		t.Fatalf("expected empty SelectedBeadID() when beadIDs is nil, got %q", m.historyView.SelectedBeadID())
+	}
+	sessIssue := m.focusedIssueForSessions()
+	if sessIssue == nil || sessIssue.ID != "bv-3" {
+		t.Fatalf("expected focusedIssueForSessions() in Git Mode to resolve related bead bv-3 when SelectedBeadID() is empty, got %+v", sessIssue)
+	}
+}
+
+func TestHistoryModel_TabFocusCycleNoTrapAndFileTreeToggleUX(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "bv-1", Title: "Auth bug", Status: model.StatusOpen, Priority: 0},
+		{ID: "bv-2", Title: "DB migration", Status: model.StatusInProgress, Priority: 1},
+		{ID: "bv-3", Title: "Query optimizer", Status: model.StatusClosed, Priority: 2},
+	}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(*Model)
+
+	send := func(msg tea.KeyMsg) {
+		u, _ := m.Update(msg)
+		m = u.(*Model)
+	}
+
+	report := createTestHistoryReportWithFiles()
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("h")})
+	m.historyView = NewHistoryModel(report, m.theme)
+	m.historyView.SetSize(120, 30)
+	makeHistoryReportCurrent(m, report)
+
+	// Pressing 'f' opens AND focuses the file tree so j/k/l/h/Enter/Esc behave as advertised.
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+	if !m.historyView.IsFileTreeVisible() || !m.historyView.FileTreeHasFocus() {
+		t.Fatalf("expected 'f' to open and focus file tree: visible=%v hasFocus=%v",
+			m.historyView.IsFileTreeVisible(), m.historyView.FileTreeHasFocus())
+	}
+	if m.historyView.IsListFocused() || m.historyView.IsDetailFocused() {
+		t.Fatalf("main panes must not simultaneously report focus while fileTreeHasFocus: list=%v detail=%v",
+			m.historyView.IsListFocused(), m.historyView.IsDetailFocused())
+	}
+
+	// Verify 12-step Tab cycle across compact (75), 2-main-pane boundary (95 in 80..102),
+	// 3-main-pane standard (130), and 4-main-pane timeline wide (175).
+	for _, tc := range []struct {
+		name      string
+		width     int
+		wantPanes int
+		wantCycle []string
+	}{
+		{
+			name:      "compact_75",
+			width:     75,
+			wantPanes: 2,
+			wantCycle: []string{"list", "detail", "filetree"},
+		},
+		{
+			name:      "boundary_95",
+			width:     95,
+			wantPanes: 2,
+			wantCycle: []string{"list", "detail", "filetree"},
+		},
+		{
+			name:      "standard_130",
+			width:     130,
+			wantPanes: 3,
+			wantCycle: []string{"list", "middle", "detail", "filetree"},
+		},
+		{
+			name:      "wide_timeline_175",
+			width:     175,
+			wantPanes: 4,
+			wantCycle: []string{"list", "timeline", "middle", "detail", "filetree"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m.historyView.SetSize(tc.width, 30)
+			if !m.historyView.IsFileTreeVisible() {
+				m.historyView.ToggleFileTree()
+			}
+			m.historyView.SetFileTreeFocus(true)
+
+			if gotPanes := m.historyView.paneCount(); gotPanes != tc.wantPanes {
+				t.Fatalf("width=%d: paneCount()=%d, want %d", tc.width, gotPanes, tc.wantPanes)
+			}
+
+			focusState := func() string {
+				if m.historyView.FileTreeHasFocus() {
+					if m.historyView.IsDetailFocused() || m.historyView.IsListFocused() {
+						t.Fatalf("width=%d: dual focus detected alongside fileTree", tc.width)
+					}
+					return "filetree"
+				}
+				switch m.historyView.focused {
+				case historyFocusList:
+					return "list"
+				case historyFocusTimeline:
+					return "timeline"
+				case historyFocusMiddle:
+					return "middle"
+				case historyFocusDetail:
+					return "detail"
+				default:
+					return "unknown"
+				}
+			}
+
+			for step := 0; step < 12; step++ {
+				send(tea.KeyMsg{Type: tea.KeyTab})
+				got := focusState()
+				want := tc.wantCycle[step%len(tc.wantCycle)]
+				if got != want {
+					t.Fatalf("width=%d step=%d: focus=%q, want %q", tc.width, step+1, got, want)
+				}
+				_ = m.historyView.View()
+			}
+		})
+	}
+
+	// Esc while focused on file tree with no filter closes file tree and stays in History view.
+	m.historyView.SetSize(120, 30)
+	if !m.historyView.IsFileTreeVisible() {
+		m.historyView.ToggleFileTree()
+	}
+	m.historyView.ClearFileFilter()
+	m.historyView.SetFileTreeFocus(true)
+	send(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.focused != focusHistory || m.historyView.IsFileTreeVisible() || m.historyView.FileTreeHasFocus() {
+		t.Fatalf("expected Esc on unfiltered file tree to close tree and stay in History: focused=%v visible=%v hasFocus=%v",
+			m.focused, m.historyView.IsFileTreeVisible(), m.historyView.FileTreeHasFocus())
+	}
+}
+
+func TestHistoryModel_GitModeZeroBeadNoFallbackAndCassBadges(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "bv-1", Title: "Bead Mode Stale Selection", Status: model.StatusOpen, Priority: 1},
+		{ID: "bv-2", Title: "Git Related With Cass", Status: model.StatusInProgress, Priority: 1},
+	}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(*Model)
+
+	report := createTestHistoryReportWithFiles()
+	m.isHistoryView = true
+	m.focused = focusHistory
+	m.historyView = NewHistoryModel(report, m.theme)
+	m.historyView.SetSize(140, 30)
+	makeHistoryReportCurrent(m, report)
+	m.historyView.SetCassLookup(func(beadID string) []cass.ScoredResult {
+		if beadID == "bv-2" {
+			return []cass.ScoredResult{{SearchResult: cass.SearchResult{Title: "Git Session"}, FinalScore: 0.95}}
+		}
+		return nil
+	})
+
+	// Switch to Git Mode; verify 🤖 session badge renders in Git Mode commit row & detail/related beads!
+	m.historyView.ToggleViewMode()
+	if !m.historyView.IsGitMode() {
+		t.Fatal("expected Git Mode")
+	}
+	gitView := m.historyView.View()
+	if !strings.Contains(gitView, "🤖1") {
+		t.Fatalf("expected 🤖1 session indicator in Git Mode view:\n%s", gitView)
+	}
+
+	// Case A: Selected Git commit has 0 related beads while hidden Bead-Mode SelectedBeadID() == "bv-1".
+	m.historyView.beadIDs = []string{"bv-1"}
+	m.historyView.selectedBead = 0
+	m.historyView.commitList = []CommitListEntry{
+		{SHA: "deadbeef0000", ShortSHA: "deadbee", Message: "Orphan commit", Author: "Dev", BeadIDs: nil},
+	}
+	m.historyView.selectedGitCommit = 0
+	if got := m.focusedIssueForSessions(); got != nil {
+		t.Fatalf("Git Mode commit with 0 related beads must NOT fall back to Bead-Mode selection, got %+v", got)
+	}
+	if iss, reason := m.selectedIssueForActionWithReason(); iss != nil || reason == "" {
+		t.Fatalf("Git Mode commit with 0 related beads must return nil issue + reason for O, got iss=%+v reason=%q", iss, reason)
+	}
+
+	// Case B: Filter leaves 0 matching commits in Git Mode while Bead-Mode SelectedBeadID() == "bv-1".
+	m.historyView.commitList = nil
+	if got := m.focusedIssueForSessions(); got != nil {
+		t.Fatalf("Git Mode with 0 matching commits must NOT fall back to Bead-Mode selection, got %+v", got)
+	}
+	if iss, reason := m.selectedIssueForActionWithReason(); iss != nil || reason == "" {
+		t.Fatalf("Git Mode with 0 matching commits must return nil issue + reason for O, got iss=%+v reason=%q", iss, reason)
+	}
+}
+
+func TestRound2HistoryViewModeFocusClampAndFileTreeGlobalKeys(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	GetTutorialProgressManager().Reset()
+	t.Cleanup(func() { GetTutorialProgressManager().Reset() })
+
+	// (a) ToggleViewMode from historyFocusTimeline at width >= 150 clamps focus to a visible Git-Mode pane.
+	report := createTestHistoryReportWithFiles()
+	theme := testTheme()
+	h := NewHistoryModel(report, theme)
+	h.SetSize(160, 40)
+	if h.paneCount() != 4 {
+		t.Fatalf("expected 4 panes in wide Bead Mode, got %d", h.paneCount())
+	}
+	h.ToggleFocus()
+	if h.focused != historyFocusTimeline {
+		t.Fatalf("expected historyFocusTimeline after first Tab in 4-pane Bead Mode, got %v", h.focused)
+	}
+	h.ToggleViewMode()
+	if !h.IsGitMode() {
+		t.Fatal("expected Git Mode after ToggleViewMode")
+	}
+	if h.focused == historyFocusTimeline || !h.IsListFocused() {
+		t.Fatalf("expected ToggleViewMode from historyFocusTimeline at width=160 to clamp focus cleanly (got focused=%v IsListFocused=%v)",
+			h.focused, h.IsListFocused())
+	}
+
+	// Also verify narrow 2-pane mode: ToggleViewMode from historyFocusTimeline/Middle clamps to visible pane.
+	h2 := NewHistoryModel(report, theme)
+	h2.SetSize(80, 40)
+	h2.focused = historyFocusTimeline
+	h2.ToggleViewMode()
+	if h2.focused != historyFocusList || !h2.IsListFocused() {
+		t.Fatalf("expected narrow Git-Mode ToggleViewMode to clamp focus to historyFocusList, got %v", h2.focused)
+	}
+
+	// (b) Pressing ?, ;, ~, v, V, q while history file tree is open and focused triggers global/history actions!
+	issues := []model.Issue{
+		{ID: "bv-1", Title: "Token Auth", Status: model.StatusOpen, Priority: 1},
+		{ID: "bv-2", Title: "Session Store", Status: model.StatusInProgress, Priority: 2},
+	}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 150, Height: 35})
+	m = updated.(*Model)
+
+	m.isHistoryView = true
+	m.focused = focusHistory
+	m.historyView = NewHistoryModel(report, m.theme)
+	m.historyView.SetSize(150, 35)
+	makeHistoryReportCurrent(m, report)
+	m.historyView.ToggleFileTree()
+	m.historyView.SetFileTreeFocus(true)
+	if !m.historyView.FileTreeHasFocus() {
+		t.Fatal("precondition: expected history file tree open and focused")
+	}
+
+	send := func(msg tea.KeyMsg) tea.Cmd {
+		t.Helper()
+		var cmd tea.Cmd
+		updated, cmd = m.Update(msg)
+		m = updated.(*Model)
+		return cmd
+	}
+
+	// '?' opens Help overlay
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+	if !m.showHelp || m.focused != focusHelp {
+		t.Fatalf("expected '?' in focused file tree to open Help, got showHelp=%v focused=%v", m.showHelp, m.focused)
+	}
+	send(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.showHelp || m.focused != focusHistory || !m.historyView.FileTreeHasFocus() {
+		t.Fatalf("expected Esc from Help to return to focused file tree, got showHelp=%v focused=%v treeFocus=%v",
+			m.showHelp, m.focused, m.historyView.FileTreeHasFocus())
+	}
+
+	// ';' toggles Shortcuts sidebar
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";")})
+	if !m.showShortcutsSidebar {
+		t.Fatal("expected ';' in focused file tree to enable Shortcuts sidebar")
+	}
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(";")})
+	if m.showShortcutsSidebar {
+		t.Fatal("expected second ';' to hide Shortcuts sidebar")
+	}
+
+	// '~' opens context Tutorial
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("~")})
+	if !m.showTutorial || m.focused != focusTutorial {
+		t.Fatalf("expected '~' in focused file tree to open Tutorial, got showTutorial=%v focused=%v", m.showTutorial, m.focused)
+	}
+	send(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.showTutorial || m.focused != focusHistory || !m.historyView.FileTreeHasFocus() {
+		t.Fatalf("expected Esc from Tutorial to return to focused file tree, got showTutorial=%v focused=%v treeFocus=%v",
+			m.showTutorial, m.focused, m.historyView.FileTreeHasFocus())
+	}
+
+	// 'v' toggles Git/Bead mode even while file tree has focus
+	if m.historyView.IsGitMode() {
+		t.Fatal("precondition: expected Bead Mode before pressing 'v'")
+	}
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	if !m.historyView.IsGitMode() {
+		t.Fatal("expected 'v' while file tree focused to switch History into Git Mode")
+	}
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	if m.historyView.IsGitMode() {
+		t.Fatal("expected second 'v' while file tree focused to switch back to Bead Mode")
+	}
+
+	// 'V' initiates Cass session preview for the focused history row
+	vCmd := send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	if vCmd == nil && m.cassRequest == nil && !m.showCassModal && m.statusMsg == "" {
+		t.Fatal("expected 'V' while file tree focused to trigger Cass session action, not be swallowed")
+	}
+	if m.cassRequest != nil {
+		m.cancelCassLookup()
+	}
+
+	// File-tree nav keys ('j', 'enter') still operate on the file tree
+	prevIdx := m.historyView.selectedFileIdx
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if len(m.historyView.flatFileList) > 1 && m.historyView.selectedFileIdx == prevIdx {
+		t.Fatal("expected 'j' in focused file tree to move file tree selection")
+	}
+
+	// 'q' exits History view instead of being swallowed by file tree; second 'q' quits
+	send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if m.isHistoryView || m.focused != focusList {
+		t.Fatalf("expected 'q' while file tree focused to exit History view to focusList, got isHistoryView=%v focused=%v",
+			m.isHistoryView, m.focused)
+	}
+	quitCmd := send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	if quitCmd == nil {
+		t.Fatal("expected 'q' at top-level list after exiting History view to return quit cmd")
+	}
+}

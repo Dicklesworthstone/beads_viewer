@@ -157,7 +157,9 @@ func correlationCacheNamespace(repoPath, primaryBeadsFile string) string {
 		}
 	}
 
-	identity := filepath.ToSlash(repoCanonical) + "\x00" + filepath.ToSlash(primaryPathspec)
+	primarySlash := filepath.ToSlash(primaryPathspec)
+	storeDirRel := deriveStoreDirRel([]string{primarySlash})
+	identity := filepath.ToSlash(repoCanonical) + "\x00" + primarySlash + "\x00" + storeDirRel
 	sum := sha256.Sum256([]byte(identity))
 	return hex.EncodeToString(sum[:])
 }
@@ -403,11 +405,8 @@ func (c *Correlator) GenerateReportCached(beads []BeadInfo, opts CorrelatorOptio
 		// Can't key the cache without a stable HEAD; compute uncached.
 		return c.GenerateReport(beads, opts)
 	}
-	if c.explicit != nil {
-		c.explicit.SetKnownBeadIDs(beadIDsFromInfos(beads))
-	}
 	beadsHash := hashBeads(beads)
-	optsHash := c.cacheOptionsHash(opts)
+	optsHash := c.artifactOptionsHash(beads, opts)
 	namespace := c.persistentCacheNamespace()
 	// The assembled REPORT depends on the feedback store (rejections remove
 	// commits, confirmations pin confidence), the HEAD-only ARTIFACT does not.
@@ -434,7 +433,7 @@ func (c *Correlator) GenerateReportCached(beads []BeadInfo, opts CorrelatorOptio
 	// still matches the pre-extraction key; extraction spans multiple git calls,
 	// so a concurrent commit could otherwise poison the old HEAD's cache entry.
 	metrics.CorrelationCache.Miss()
-	art, err := c.extractHistoryArtifact(opts)
+	art, err := c.extractHistoryArtifactForBeads(beads, opts)
 	if err != nil {
 		return nil, err
 	}

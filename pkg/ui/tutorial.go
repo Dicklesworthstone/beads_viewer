@@ -91,7 +91,7 @@ func (m TutorialModel) Update(msg tea.Msg) (TutorialModel, tea.Cmd) {
 	case tea.KeyMsg:
 		// Global keys (work in any focus mode)
 		switch msg.String() {
-		case "esc", "q", "~":
+		case "esc", "q", "~", "`":
 			// Mark current page as viewed before closing
 			pages := m.visiblePages()
 			if m.currentPage >= 0 && m.currentPage < len(pages) {

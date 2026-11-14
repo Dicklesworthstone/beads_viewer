@@ -29,7 +29,9 @@ type LoadResult struct {
 	// RepoPath is the configured repository path, retained so diagnostics stay
 	// unambiguous even when display names are duplicated or contain delimiters.
 	RepoPath   string
+	RepoRoot   string `json:"-"`
 	SourcePath string
+	SourceKind string
 	Disabled   bool
 
 	// WatchPaths binds live export monitoring to this load's configured route,
@@ -48,6 +50,7 @@ type LoadResult struct {
 	// A successful load with Errors > 0 is usable for exploratory workspace
 	// views, but it is not a complete authority for claim-emitting robot output.
 	ParseStats    loader.ParseStats
+	ReadErrors    int
 	ParseWarnings []string
 	WarningCount  int
 
@@ -268,7 +271,11 @@ func (l *AggregateLoader) defaultBeadsPath() string {
 
 func (l *AggregateLoader) repoPathKey(repo RepoConfig) (string, error) {
 	path := l.resolveRepoPath(repo.Path)
-	abs, err := filepath.Abs(path)
+	beadsPath := repo.GetBeadsPath()
+	if !filepath.IsAbs(beadsPath) {
+		beadsPath = filepath.Join(path, beadsPath)
+	}
+	abs, err := filepath.Abs(beadsPath)
 	if err != nil {
 		return "", fmt.Errorf("resolve repo path %q: %w", repo.Path, err)
 	}
@@ -467,15 +474,19 @@ func (l *AggregateLoader) loadSingleRepo(ctx context.Context, repo RepoConfig, k
 	// Resolve the repo path relative to workspace root
 	repo = l.applyDefaults(repo)
 	repoPath := l.resolveRepoPath(repo.Path)
-	result := LoadResult{RepoName: repo.GetName(), Prefix: repo.GetPrefix(), RepoPath: repo.Path,
-		SourcePath: filepath.Join(repoPath, repo.GetBeadsPath())}
+	beadsTarget := repo.GetBeadsPath()
+	if !filepath.IsAbs(beadsTarget) {
+		beadsTarget = filepath.Join(repoPath, beadsTarget)
+	}
+	result := LoadResult{RepoName: repo.GetName(), Prefix: repo.GetPrefix(), RepoPath: repo.Path, RepoRoot: repoPath,
+		SourcePath: beadsTarget}
 	if err := ctx.Err(); err != nil {
 		result.Error = err
 		return result
 	}
 
 	// Load raw issues from the repo, respecting custom beads path if provided
-	beadsDir, redirects, err := loader.ResolveBeadsDirWithTrace(filepath.Join(repoPath, repo.GetBeadsPath()))
+	beadsDir, redirects, err := loader.ResolveBeadsDirWithTrace(beadsTarget)
 	result.WatchPaths = append(result.WatchPaths, redirects...)
 	watchDir := beadsDir
 	if watchDir == "" && len(redirects) > 0 {
@@ -541,6 +552,7 @@ func (l *AggregateLoader) loadSingleRepo(ctx context.Context, repo RepoConfig, k
 		}
 		sourcePath = jsonlPath
 		result.SourcePath = sourcePath
+		result.SourceKind = string(datasource.SourceTypeJSONLLocal)
 		result.WatchPaths = append(result.WatchPaths, sourcePath)
 		parseOptions := loader.ParseOptions{
 			Stats:          &result.ParseStats,
@@ -593,7 +605,7 @@ func (l *AggregateLoader) loadSingleRepo(ctx context.Context, repo RepoConfig, k
 	issues = visibleIssues
 
 	// Apply namespacing to all IDs
-	loader.AttachIssueOrigins(issues, sourcePath, result.ParseStats.Errors == 0 && len(result.AuthorityWarnings) == 0)
+	loader.AttachIssueOrigins(issues, sourcePath, result.ParseStats.Errors == 0 && result.ReadErrors == 0 && len(result.AuthorityWarnings) == 0)
 	namespacedIssues := l.namespaceIssues(issues, prefix, localIDs, knownPrefixes)
 
 	result.Issues = namespacedIssues
@@ -727,9 +739,11 @@ func (l *AggregateLoader) loadStandardRepoIssues(
 				warnSourceFallback(fmt.Sprintf("SQLite source %s had %d errors, falling back", candidate.Path, errCount))
 				continue
 			}
+			result.SourceKind = string(candidate.Type)
+			result.ReadErrors = report.ReadErrors
 			result.ParseStats = loader.ParseStats{
 				Valid:   report.Valid,
-				Errors:  errCount,
+				Errors:  report.Errors,
 				Skipped: report.Skipped,
 			}
 			for _, w := range report.Warnings {
@@ -775,6 +789,7 @@ func (l *AggregateLoader) loadStandardRepoIssues(
 			warnSourceFallback(fmt.Sprintf("JSONL source %s exceeded error threshold (%.1f%%), falling back", candidate.Path, stats.ErrorRate()*100))
 			continue
 		}
+		result.SourceKind = string(candidate.Type)
 		result.ParseStats = stats
 		for _, w := range bufferedWarnings {
 			emitParseWarning(w)

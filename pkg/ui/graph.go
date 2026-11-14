@@ -448,11 +448,33 @@ func (g *GraphModel) View(width, height int) string {
 // clipGraph cuts terminal cells, not bytes/runes, preserving graphemes and ANSI
 // style sequences even when a wide character straddles the viewport boundary.
 func (g *GraphModel) clipGraph(content string, width, height, x, y int) string {
+	w := max(0, width)
+	h := max(0, height)
 	lines := strings.Split(content, "\n")
 	y = min(max(0, y), len(lines))
-	lines = lines[y:min(len(lines), y+max(0, height))]
-	for i := range lines {
-		lines[i] = ansi.Cut(lines[i], x, x+max(0, width))
+	lines = lines[y:min(len(lines), y+h)]
+	for i, line := range lines {
+		if w == 0 {
+			lines[i] = ""
+			continue
+		}
+		if x > 0 && ansi.StringWidth(line) > x && ansi.StringWidth(ansi.Cut(line, 0, x)) < x {
+			nextX := x + 1
+			for nextX < x+w && ansi.StringWidth(ansi.Cut(line, 0, nextX)) < nextX {
+				nextX++
+			}
+			pad := strings.Repeat(" ", min(w, nextX-x))
+			if nextX >= x+w {
+				lines[i] = pad
+			} else {
+				lines[i] = pad + ansi.Cut(line, nextX, x+w)
+			}
+		} else {
+			lines[i] = ansi.Cut(line, x, x+w)
+		}
+		if ansi.StringWidth(lines[i]) > w {
+			lines[i] = ansi.Truncate(lines[i], w, "")
+		}
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1132,6 +1154,8 @@ func getStatusColor(status model.Status, t Theme) lipgloss.AdaptiveColor {
 
 func getPriorityIcon(priority int) string {
 	switch priority {
+	case 0:
+		return "🚨"
 	case 1:
 		return "🔥"
 	case 2:

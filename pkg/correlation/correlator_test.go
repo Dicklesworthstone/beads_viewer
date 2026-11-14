@@ -948,3 +948,732 @@ func TestCorrelator_CreatedDirectlyInProgressAndClosedMilestonesAndTemporalMixed
 		t.Fatalf("confidence-filtered histories serialized \"commits\":null: %s", filteredJSON)
 	}
 }
+
+func TestCorrelator_DeletedAndTombstonedTargetBeads(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "init")
+
+	baseTime := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	commitAt := func(offset time.Duration, msg string) string {
+		t.Helper()
+		runGit(t, repo, "add", "-A")
+		ts := baseTime.Add(offset).Format(time.RFC3339)
+		cmd := exec.Command("git", "commit", "-m", msg)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Dev", "GIT_AUTHOR_EMAIL=dev@example.com",
+			"GIT_COMMITTER_NAME=Dev", "GIT_COMMITTER_EMAIL=dev@example.com",
+			"GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("commit %q: %v\n%s", msg, err, out)
+		}
+		out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	jsonl := filepath.Join(beadsDir, "issues.jsonl")
+
+	// Commit 1: create bv-live, bv-del, and bv-tomb
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-live","title":"Live Active Bead","status":"open"}`+"\n"+
+			`{"id":"bv-del","title":"Deleted Historical Bead","status":"open"}`+"\n"+
+			`{"id":"bv-tomb","title":"Tombstoned Historical Bead","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(0, "chore: seed beads")
+
+	// Commit 2: explicit-ID code commit for bv-del (without touching .beads/)
+	if err := os.WriteFile(filepath.Join(repo, "del_feature.go"), []byte("package main\nfunc DelFeature() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	delExplicitSHA := commitAt(1*time.Hour, "[bv-del] implement feature")
+
+	// Commit 3: close bv-del in .beads/issues.jsonl + explicit-ID code commit for bv-tomb
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-live","title":"Live Active Bead","status":"open"}`+"\n"+
+			`{"id":"bv-del","title":"Deleted Historical Bead","status":"closed"}`+"\n"+
+			`{"id":"bv-tomb","title":"Tombstoned Historical Bead","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(2*time.Hour, "chore: close bv-del")
+
+	if err := os.WriteFile(filepath.Join(repo, "tomb_fix.go"), []byte("package main\nfunc TombFix() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tombExplicitSHA := commitAt(3*time.Hour, "Fix bv-tomb edge case")
+
+	// Commit 4: delete bv-del from JSONL and set bv-tomb to status=tombstone
+	if err := os.WriteFile(jsonl, []byte(
+		`{"id":"bv-live","title":"Live Active Bead","status":"open"}`+"\n"+
+			`{"id":"bv-tomb","title":"Tombstoned Historical Bead","status":"tombstone"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitAt(4*time.Hour, "chore: prune bv-del and tombstone bv-tomb")
+
+	liveBeads := []BeadInfo{{ID: "bv-live", Title: "Live Active Bead", Status: "open"}}
+	c := NewCorrelator(repo, jsonl)
+
+	// 1. Unfiltered report must NOT synthesize deleted or tombstoned beads.
+	unfiltered, err := c.GenerateReportCached(liveBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("unfiltered GenerateReportCached: %v", err)
+	}
+	if _, ok := unfiltered.Histories["bv-del"]; ok {
+		t.Fatal("unfiltered report unexpectedly synthesized deleted bead bv-del")
+	}
+	if _, ok := unfiltered.Histories["bv-tomb"]; ok {
+		t.Fatal("unfiltered report unexpectedly synthesized tombstoned bead bv-tomb")
+	}
+
+	// 2. Targeted deleted bead (both uncached and cached twice to hit disk cache)
+	delOpts := CorrelatorOptions{BeadID: "bv-del", CausalityBeadID: "bv-del"}
+	for pass, fn := range []func([]BeadInfo, CorrelatorOptions) (*HistoryReport, error){
+		c.GenerateReport,
+		c.GenerateReportCached,
+		c.GenerateReportCached,
+	} {
+		rep, err := fn(liveBeads, delOpts)
+		if err != nil {
+			t.Fatalf("pass %d deleted GenerateReport: %v", pass, err)
+		}
+		h, ok := rep.Histories["bv-del"]
+		if !ok {
+			t.Fatalf("pass %d missing synthesized history for deleted bead bv-del", pass)
+		}
+		if h.Title != "Deleted Historical Bead" {
+			t.Fatalf("pass %d Title = %q, want %q", pass, h.Title, "Deleted Historical Bead")
+		}
+		if h.Status != "deleted" {
+			t.Fatalf("pass %d Status = %q, want deleted", pass, h.Status)
+		}
+		if len(h.Events) != 3 {
+			t.Fatalf("pass %d Events len = %d, want 3 (created, closed, deleted): %+v", pass, len(h.Events), h.Events)
+		}
+		foundDelCommit := false
+		for _, cc := range h.Commits {
+			if cc.SHA == delExplicitSHA {
+				foundDelCommit = true
+			}
+		}
+		if !foundDelCommit {
+			t.Fatalf("pass %d explicit commit %s missing for deleted bead: %+v", pass, delExplicitSHA, h.Commits)
+		}
+		if rep.CausalHistory == nil || rep.CausalHistory.BeadID != "bv-del" {
+			t.Fatalf("pass %d expected non-nil CausalHistory for bv-del, got %+v", pass, rep.CausalHistory)
+		}
+		if chain := rep.BuildCausalityChainAt("bv-del", DefaultCausalityOptions(), baseTime.Add(5*time.Hour)); chain == nil {
+			t.Fatalf("pass %d BuildCausalityChainAt returned nil for deleted bead bv-del", pass)
+		}
+	}
+
+	// 3. Targeted tombstoned bead (both uncached and cached twice)
+	tombOpts := CorrelatorOptions{BeadID: "bv-tomb", CausalityBeadID: "bv-tomb"}
+	for pass, fn := range []func([]BeadInfo, CorrelatorOptions) (*HistoryReport, error){
+		c.GenerateReport,
+		c.GenerateReportCached,
+		c.GenerateReportCached,
+	} {
+		rep, err := fn(liveBeads, tombOpts)
+		if err != nil {
+			t.Fatalf("pass %d tombstoned GenerateReport: %v", pass, err)
+		}
+		h, ok := rep.Histories["bv-tomb"]
+		if !ok {
+			t.Fatalf("pass %d missing synthesized history for tombstoned bead bv-tomb", pass)
+		}
+		if h.Title != "Tombstoned Historical Bead" {
+			t.Fatalf("pass %d Title = %q, want %q", pass, h.Title, "Tombstoned Historical Bead")
+		}
+		if h.Status != "tombstone" {
+			t.Fatalf("pass %d Status = %q, want tombstone", pass, h.Status)
+		}
+		foundTombCommit := false
+		for _, cc := range h.Commits {
+			if cc.SHA == tombExplicitSHA {
+				foundTombCommit = true
+			}
+		}
+		if !foundTombCommit {
+			t.Fatalf("pass %d explicit commit %s missing for tombstoned bead: %+v", pass, tombExplicitSHA, h.Commits)
+		}
+		if rep.CausalHistory == nil || rep.CausalHistory.BeadID != "bv-tomb" {
+			t.Fatalf("pass %d expected non-nil CausalHistory for bv-tomb, got %+v", pass, rep.CausalHistory)
+		}
+		if chain := rep.BuildCausalityChainAt("bv-tomb", DefaultCausalityOptions(), baseTime.Add(5*time.Hour)); chain == nil {
+			t.Fatalf("pass %d BuildCausalityChainAt returned nil for tombstoned bead bv-tomb", pass)
+		}
+	}
+
+	// 4. Nonexistent bead with zero git evidence must NOT synthesize a phantom history.
+	missingRep, err := c.GenerateReportCached(liveBeads, CorrelatorOptions{BeadID: "bv-does-not-exist", CausalityBeadID: "bv-does-not-exist"})
+	if err != nil {
+		t.Fatalf("nonexistent GenerateReportCached: %v", err)
+	}
+	if _, ok := missingRep.Histories["bv-does-not-exist"]; ok {
+		t.Fatal("nonexistent bead synthesized phantom BeadHistory")
+	}
+	if chain := missingRep.BuildCausalityChainAt("bv-does-not-exist", DefaultCausalityOptions(), baseTime.Add(5*time.Hour)); chain != nil {
+		t.Fatalf("expected nil causal chain for nonexistent bead, got %+v", chain)
+	}
+}
+
+func TestFindGitRoot_ValidateRepositoryWithBeadsDir_AndMonorepoCorrelator(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	nonGitDir := t.TempDir()
+	if _, err := FindGitRoot(nonGitDir); err == nil {
+		t.Fatalf("expected FindGitRoot(%s) to fail outside git repo", nonGitDir)
+	}
+
+	// Git worktree/submodule .git file support
+	wtRoot := t.TempDir()
+	wtSub := filepath.Join(wtRoot, "packages", "core")
+	if err := os.MkdirAll(wtSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtRoot, ".git"), []byte("gitdir: /tmp/fake-worktree-gitdir\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gotWT, err := FindGitRoot(wtSub)
+	if err != nil || gotWT != filepath.Clean(wtRoot) {
+		t.Fatalf("FindGitRoot(worktree subdir) = (%q, %v), want (%q, nil)", gotWT, err, filepath.Clean(wtRoot))
+	}
+
+	// Monorepo with root .git and two independent .beads stores (no root .beads/)
+	mono := t.TempDir()
+	runGit(t, mono, "init")
+
+	apiDir := filepath.Join(mono, "services", "api")
+	webDir := filepath.Join(mono, "services", "web")
+	apiBeadsDir := filepath.Join(apiDir, ".beads")
+	webBeadsDir := filepath.Join(webDir, ".beads")
+	if err := os.MkdirAll(apiBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(webBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	apiJSONL := filepath.Join(apiBeadsDir, "issues.jsonl")
+	webJSONL := filepath.Join(webBeadsDir, "issues.jsonl")
+	apiCode := filepath.Join(apiDir, "handler.go")
+	webCode := filepath.Join(webDir, "app.ts")
+
+	if err := os.WriteFile(apiJSONL, []byte(`{"id":"api-1","title":"API auth endpoint","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(apiCode, []byte("package api\nfunc Auth() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(webJSONL, []byte(`{"id":"web-1","title":"Web login view","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(webCode, []byte("export const Login = () => null;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	baseTime := time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC)
+	commitMono := func(offset time.Duration, msg string, paths ...string) {
+		t.Helper()
+		args := append([]string{"add", "--"}, paths...)
+		runGit(t, mono, args...)
+		ts := baseTime.Add(offset).Format(time.RFC3339)
+		cmd := exec.Command("git", "commit", "-m", msg)
+		cmd.Dir = mono
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Dev", "GIT_AUTHOR_EMAIL=dev@example.com",
+			"GIT_COMMITTER_NAME=Dev", "GIT_COMMITTER_EMAIL=dev@example.com",
+			"GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("commit %q: %v\n%s", msg, err, out)
+		}
+	}
+
+	commitMono(0, "feat(api): seed api-1", "services/api/.beads/issues.jsonl", "services/api/handler.go")
+	commitMono(time.Hour, "feat(web): seed web-1", "services/web/.beads/issues.jsonl", "services/web/app.ts")
+
+	// FindGitRoot from subdirectory and file path
+	if root, err := FindGitRoot(apiDir); err != nil || root != filepath.Clean(mono) {
+		t.Fatalf("FindGitRoot(apiDir) = (%q, %v), want (%q, nil)", root, err, filepath.Clean(mono))
+	}
+	if root, err := FindGitRoot(apiJSONL); err != nil || root != filepath.Clean(mono) {
+		t.Fatalf("FindGitRoot(apiJSONL) = (%q, %v), want (%q, nil)", root, err, filepath.Clean(mono))
+	}
+
+	// ValidateRepositoryWithBeadsDir & ValidateRepository
+	if err := ValidateRepositoryWithBeadsDir(apiDir, apiBeadsDir); err != nil {
+		t.Fatalf("ValidateRepositoryWithBeadsDir(apiDir, apiBeadsDir) failed: %v", err)
+	}
+	if err := ValidateRepositoryWithBeadsDir(mono, apiBeadsDir); err != nil {
+		t.Fatalf("ValidateRepositoryWithBeadsDir(mono, apiBeadsDir) failed: %v", err)
+	}
+	if err := ValidateRepository(apiDir); err != nil {
+		t.Fatalf("ValidateRepository(apiDir) failed: %v", err)
+	}
+	if err := ValidateRepository(mono); err == nil {
+		t.Fatal("expected ValidateRepository(mono) to fail when root .beads/ does not exist")
+	}
+
+	// Correlator constructed from subdirectory (with and without explicit beadsFilePath) isolates store
+	for _, apiCorr := range []*Correlator{
+		NewCorrelator(apiDir),
+		NewCorrelator(apiDir, apiJSONL),
+		NewCorrelator(mono, apiJSONL),
+	} {
+		for _, tracked := range apiCorr.extractor.beadsFiles {
+			if !strings.HasPrefix(tracked, "services/api/.beads/") {
+				t.Fatalf("api extractor leaked cross-store path %q in %v", tracked, apiCorr.extractor.beadsFiles)
+			}
+		}
+		rep, err := apiCorr.GenerateReportCached([]BeadInfo{
+			{ID: "api-1", Title: "API auth endpoint", Status: "open"},
+			{ID: "web-1", Title: "Web login view", Status: "open"},
+		}, CorrelatorOptions{})
+		if err != nil {
+			t.Fatalf("api GenerateReportCached: %v", err)
+		}
+		if len(rep.Histories["api-1"].Events) != 1 || len(rep.Histories["api-1"].Commits) != 1 {
+			t.Fatalf("expected 1 event and 1 co-commit on api-1, got %+v", rep.Histories["api-1"])
+		}
+		if len(rep.Histories["web-1"].Events) != 0 {
+			t.Fatalf("api correlator leaked web-1 events from sibling store: %+v", rep.Histories["web-1"].Events)
+		}
+	}
+
+	webCorr := NewCorrelator(webDir, webJSONL)
+	webRep, err := webCorr.GenerateReportCached([]BeadInfo{
+		{ID: "api-1", Title: "API auth endpoint", Status: "open"},
+		{ID: "web-1", Title: "Web login view", Status: "open"},
+	}, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("web GenerateReportCached: %v", err)
+	}
+	if len(webRep.Histories["web-1"].Events) != 1 || len(webRep.Histories["web-1"].Commits) != 1 {
+		t.Fatalf("expected 1 event and 1 co-commit on web-1, got %+v", webRep.Histories["web-1"])
+	}
+	if len(webRep.Histories["api-1"].Events) != 0 {
+		t.Fatalf("web correlator leaked api-1 events from sibling store: %+v", webRep.Histories["api-1"].Events)
+	}
+}
+
+func TestCorrelator_CustomNonDotBeadsDirExcludesTrackerFilesAndPromotesBD(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init")
+
+	customDir := filepath.Join(repo, "custom-beads")
+	if err := os.MkdirAll(filepath.Join(customDir, "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	subBDDir := filepath.Join(repo, "services", "api", ".beads")
+	if err := os.MkdirAll(filepath.Join(subBDDir, "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repo, "pkg", "auth"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write bd workspace metadata + both legacy beads.jsonl and issues.jsonl to verify promotion.
+	if err := os.WriteFile(filepath.Join(customDir, "metadata.json"), []byte(`{"backend":"dolt","database":"dolt"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customDir, "config.yaml"), []byte("issue_prefix: bd\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customDir, "beads.jsonl"), []byte(`{"id":"stale-legacy","title":"Legacy stale","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	customIssues := filepath.Join(customDir, "issues.jsonl")
+	if err := os.WriteFile(customIssues, []byte(`{"id":"bd-1","title":"Custom store auth bead","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subBDDir, "metadata.json"), []byte(`{"backend":"dolt","database":"dolt"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify orderBeadsFilesForWorkspace promotes <storeDir>/issues.jsonl for both custom-beads and subdirectory .beads.
+	gotCustomOrder := orderBeadsFilesForWorkspace(repo, []string{
+		"custom-beads/beads.jsonl",
+		"custom-beads/issues.jsonl",
+		"custom-beads/beads.base.jsonl",
+	})
+	if len(gotCustomOrder) == 0 || gotCustomOrder[0] != "custom-beads/issues.jsonl" {
+		t.Fatalf("orderBeadsFilesForWorkspace(custom-beads) = %v, want custom-beads/issues.jsonl first", gotCustomOrder)
+	}
+	gotSubOrder := orderBeadsFilesForWorkspace(repo, []string{
+		"services/api/.beads/beads.jsonl",
+		"services/api/.beads/issues.jsonl",
+	})
+	if len(gotSubOrder) == 0 || gotSubOrder[0] != "services/api/.beads/issues.jsonl" {
+		t.Fatalf("orderBeadsFilesForWorkspace(services/api/.beads) = %v, want services/api/.beads/issues.jsonl first", gotSubOrder)
+	}
+
+	authFile := filepath.Join(repo, "pkg", "auth", "token.go")
+	if err := os.WriteFile(authFile, []byte("package auth\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	baseTime := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	commitFiles := func(offset time.Duration, msg string, paths ...string) string {
+		t.Helper()
+		args := append([]string{"add", "--"}, paths...)
+		runGit(t, repo, args...)
+		ts := baseTime.Add(offset).Format(time.RFC3339)
+		cmd := exec.Command("git", "commit", "-m", msg)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Dev", "GIT_AUTHOR_EMAIL=dev@example.com",
+			"GIT_COMMITTER_NAME=Dev", "GIT_COMMITTER_EMAIL=dev@example.com",
+			"GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("commit %q: %v\n%s", msg, err, out)
+		}
+		out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	// Commit 1: initial seed commit creating bd-1 in custom-beads.
+	commitFiles(0, "chore: seed custom-beads",
+		"custom-beads/issues.jsonl",
+		"custom-beads/beads.jsonl",
+		"custom-beads/metadata.json",
+		"custom-beads/config.yaml",
+	)
+
+	// Commit 2: pure custom-beads tracker commit claiming bd-1 AND mentioning [bd-1]
+	// (must NEVER correlate as explicit_id or co_committed code commit!).
+	if err := os.WriteFile(customIssues, []byte(`{"id":"bd-1","title":"Custom store auth bead","status":"in_progress","assignee":"dev@example.com"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customDir, "config.yaml"), []byte("issue_prefix: bd\nsync_branch: main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	trackerOnlySHA := commitFiles(10*time.Minute, "chore [bd-1]: claim bead in custom tracker",
+		"custom-beads/issues.jsonl",
+		"custom-beads/config.yaml",
+	)
+
+	// Commit 3: mixed co_committed status-close commit touching custom-beads/* AND pkg/auth/token.go
+	// (no bead ID in commit message -> correlates purely via co_committed, excluding custom-beads/*).
+	if err := os.WriteFile(customIssues, []byte(`{"id":"bd-1","title":"Custom store auth bead","status":"closed","assignee":"dev@example.com"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customDir, "metadata.json"), []byte(`{"backend":"dolt","database":"dolt","version":2}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mixedCoCommitSHA := commitFiles(20*time.Minute, "chore: ship auth package and close tracker item",
+		"custom-beads/issues.jsonl",
+		"custom-beads/metadata.json",
+		"pkg/auth/token.go",
+	)
+
+	// Commit 4: mixed explicit_id commit touching custom-beads/config.yaml AND pkg/auth/token.go.
+	if err := os.WriteFile(filepath.Join(customDir, "config.yaml"), []byte("issue_prefix: bd\nsync_branch: main\nupdated: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(authFile, []byte("package auth\nfunc Verify() bool { return true }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	codeExplicitSHA := commitFiles(30*time.Minute, "feat(bd-1): verify token signature",
+		"custom-beads/config.yaml",
+		"pkg/auth/token.go",
+	)
+
+	corr := NewCorrelator(repo, customIssues)
+	if got := corr.storeDirRel(); got != "custom-beads" {
+		t.Fatalf("corr.storeDirRel() = %q, want %q", got, "custom-beads")
+	}
+
+	rep, err := corr.GenerateReportCached([]BeadInfo{
+		{ID: "bd-1", Title: "Custom store auth bead", Status: "closed"},
+	}, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("GenerateReportCached: %v", err)
+	}
+
+	h := rep.Histories["bd-1"]
+	if len(h.Events) != 3 {
+		t.Fatalf("bd-1 events = %d, want 3: %+v", len(h.Events), h.Events)
+	}
+	seenSHAs := make(map[string]CorrelatedCommit, len(h.Commits))
+	for _, cc := range h.Commits {
+		seenSHAs[cc.SHA] = cc
+		for _, f := range cc.Files {
+			if strings.HasPrefix(f.Path, "custom-beads/") || f.Path == "custom-beads" {
+				t.Fatalf("tracker file %q leaked into correlated commit %s (%s): %+v", f.Path, cc.ShortSHA, cc.Method, cc.Files)
+			}
+		}
+	}
+	if _, leaked := seenSHAs[trackerOnlySHA]; leaked {
+		t.Fatalf("pure custom-beads tracker commit %s leaked as correlated code commit: %+v", trackerOnlySHA, seenSHAs[trackerOnlySHA])
+	}
+	if mixed, ok := seenSHAs[mixedCoCommitSHA]; !ok || len(mixed.Files) != 1 || mixed.Files[0].Path != "pkg/auth/token.go" {
+		t.Fatalf("mixed co-commit %s (ok=%v) files = %+v, want [pkg/auth/token.go]", mixedCoCommitSHA, ok, mixed.Files)
+	}
+	if explicitMixed, ok := seenSHAs[codeExplicitSHA]; !ok || len(explicitMixed.Files) != 1 || explicitMixed.Files[0].Path != "pkg/auth/token.go" {
+		t.Fatalf("mixed explicit commit %s (ok=%v) files = %+v, want [pkg/auth/token.go]", codeExplicitSHA, ok, explicitMixed.Files)
+	}
+
+	// ReverseLookup.FindOrphanCommits with WithStoreDir("custom-beads") ignores both pure custom-beads commits (Commit 1 & Commit 2).
+	rl := NewReverseLookupWithRepo(rep, repo).WithStoreDir(corr.storeDirRel())
+	orphans, orphanStats, err := rl.FindOrphanCommits(ExtractOptions{Limit: 20})
+	if err != nil {
+		t.Fatalf("FindOrphanCommits: %v", err)
+	}
+	if orphanStats.BeadsOnlyCommits != 2 {
+		t.Fatalf("OrphanStats.BeadsOnlyCommits = %d, want 2", orphanStats.BeadsOnlyCommits)
+	}
+	for _, orphan := range orphans {
+		if orphan.SHA == trackerOnlySHA {
+			t.Fatalf("pure custom-beads commit %s leaked into orphan commits: %+v", trackerOnlySHA, orphan)
+		}
+	}
+}
+
+func TestCorrelator_WorkspaceAliasesAndSharedGitSubtreeDisambiguation(t *testing.T) {
+	t.Setenv("BV_CORRELATION_CACHE_DIR", t.TempDir())
+
+	mono := t.TempDir()
+	runGit(t, mono, "init")
+
+	rootBeadsDir := filepath.Join(mono, ".beads")
+	apiDir := filepath.Join(mono, "services", "api")
+	apiBeadsDir := filepath.Join(apiDir, ".beads")
+	webDir := filepath.Join(mono, "services", "web")
+	webBeadsDir := filepath.Join(webDir, ".beads")
+	for _, d := range []string{rootBeadsDir, apiBeadsDir, webBeadsDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rootJSONL := filepath.Join(rootBeadsDir, "issues.jsonl")
+	apiJSONL := filepath.Join(apiBeadsDir, "issues.jsonl")
+	webJSONL := filepath.Join(webBeadsDir, "issues.jsonl")
+
+	baseTime := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
+	commitMono := func(offset time.Duration, msg string, paths ...string) string {
+		t.Helper()
+		args := append([]string{"add", "--"}, paths...)
+		runGit(t, mono, args...)
+		ts := baseTime.Add(offset).Format(time.RFC3339)
+		cmd := exec.Command("git", "commit", "-m", msg)
+		cmd.Dir = mono
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Dev", "GIT_AUTHOR_EMAIL=dev@example.com",
+			"GIT_COMMITTER_NAME=Dev", "GIT_COMMITTER_EMAIL=dev@example.com",
+			"GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("commit %q: %v\n%s", msg, err, out)
+		}
+		out, err := exec.Command("git", "-C", mono, "rev-parse", "HEAD").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	// Commit 1: seed root, api (with numeric "1", colliding "bd-1", and soon-to-be-deleted "99" depending on "1"), and web ("bd-1").
+	if err := os.WriteFile(rootJSONL, []byte(`{"id":"bd-1","title":"Root umbrella task","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(apiJSONL, []byte(
+		`{"id":"1","title":"API numeric bead","status":"closed"}`+"\n"+
+			`{"id":"bd-1","title":"API colliding bead","status":"open"}`+"\n"+
+			`{"id":"99","title":"Deleted API bead","status":"open","dependencies":[{"issue_id":"99","depends_on_id":"1","type":"blocks"}]}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(webJSONL, []byte(`{"id":"bd-1","title":"Web colliding bead","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mono, "README.md"), []byte("# Monorepo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(apiDir, "handler.go"), []byte("package api\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "app.ts"), []byte("export const v = 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitMono(0, "chore: seed monorepo stores",
+		".beads/issues.jsonl",
+		"services/api/.beads/issues.jsonl",
+		"services/web/.beads/issues.jsonl",
+		"README.md",
+		"services/api/handler.go",
+		"services/web/app.ts",
+	)
+
+	// Commit 2: workspace-qualified ExplicitIDAlias "api-1" touching root README.md (outside services/api/).
+	// Must match BeadID "1" unambiguously despite StoreSubtreePrefix="services/api/".
+	if err := os.WriteFile(filepath.Join(mono, "README.md"), []byte("# Monorepo\nDocument api-1.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	aliasCrossSubtreeSHA := commitMono(10*time.Minute, "docs(api-1): document API contract at root", "README.md")
+
+	// Commit 3: unprefixed colliding "bd-1" touching ONLY services/web/app.ts.
+	if err := os.WriteFile(filepath.Join(webDir, "app.ts"), []byte("export const v = 2;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	webUnprefixedSHA := commitMono(20*time.Minute, "fix(bd-1): fix web login", "services/web/app.ts")
+
+	// Commit 4: unprefixed colliding "bd-1" touching ONLY services/api/handler.go.
+	if err := os.WriteFile(filepath.Join(apiDir, "handler.go"), []byte("package api\nvar ok = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	apiUnprefixedSHA := commitMono(30*time.Minute, "fix(bd-1): fix api handler", "services/api/handler.go")
+
+	// Commit 5: unprefixed colliding "bd-1" touching ONLY root README.md.
+	if err := os.WriteFile(filepath.Join(mono, "README.md"), []byte("# Monorepo\nDocument api-1.\nRoot fix.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootUnprefixedSHA := commitMono(40*time.Minute, "fix(bd-1): update root umbrella docs", "README.md")
+
+	// Commit 6: code commit referencing workspace-qualified "api-99", followed by Commit 7 deleting "99" from services/api/.beads/issues.jsonl.
+	if err := os.WriteFile(filepath.Join(apiDir, "handler.go"), []byte("package api\nvar ok = true\nvar v99 = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	api99SHA := commitMono(50*time.Minute, "feat(api-99): implement endpoint 99", "services/api/handler.go")
+
+	if err := os.WriteFile(apiJSONL, []byte(
+		`{"id":"1","title":"API numeric bead","status":"closed"}`+"\n"+
+			`{"id":"bd-1","title":"API colliding bead","status":"open"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commitMono(60*time.Minute, "chore: prune deleted bead 99", "services/api/.beads/issues.jsonl")
+
+	apiCorr := NewCorrelator(apiDir, apiJSONL)
+	apiLiveBeads := []BeadInfo{
+		{ID: "1", Title: "API numeric bead", Status: "closed"},
+		{ID: "bd-1", Title: "API colliding bead", Status: "open"},
+	}
+	apiRep, err := apiCorr.GenerateReportCached(apiLiveBeads, CorrelatorOptions{
+		ExplicitIDAliases: map[string]string{
+			"api-1":    "1",
+			"api-bd-1": "bd-1",
+		},
+		AmbiguousUnprefixedIDs: map[string]bool{"bd-1": true},
+		StoreSubtreePrefix:     "services/api/",
+	})
+	if err != nil {
+		t.Fatalf("api GenerateReportCached: %v", err)
+	}
+
+	// Verify ExplicitIDAliases matched aliasCrossSubtreeSHA onto canonical "1" even outside services/api/.
+	foundAliasOn1 := false
+	for _, cc := range apiRep.Histories["1"].Commits {
+		if cc.SHA == aliasCrossSubtreeSHA && cc.Method == MethodExplicitID {
+			foundAliasOn1 = true
+		}
+	}
+	if !foundAliasOn1 {
+		t.Fatalf("expected ExplicitIDAlias commit %s on bead '1', got %+v", aliasCrossSubtreeSHA, apiRep.Histories["1"].Commits)
+	}
+
+	// Verify API store accepted apiUnprefixedSHA and rejected webUnprefixedSHA & rootUnprefixedSHA on colliding "bd-1".
+	apiBD1Explicit := make(map[string]bool)
+	for _, cc := range apiRep.Histories["bd-1"].Commits {
+		if cc.Method == MethodExplicitID {
+			apiBD1Explicit[cc.SHA] = true
+		}
+	}
+	if !apiBD1Explicit[apiUnprefixedSHA] || apiBD1Explicit[webUnprefixedSHA] || apiBD1Explicit[rootUnprefixedSHA] {
+		t.Fatalf("api colliding bd-1 explicit SHAs = %v, want ONLY %s", apiBD1Explicit, apiUnprefixedSHA)
+	}
+
+	// Verify Web store accepted webUnprefixedSHA and rejected apiUnprefixedSHA & rootUnprefixedSHA.
+	webCorr := NewCorrelator(webDir, webJSONL)
+	webRep, err := webCorr.GenerateReportCached([]BeadInfo{
+		{ID: "bd-1", Title: "Web colliding bead", Status: "open"},
+	}, CorrelatorOptions{
+		AmbiguousUnprefixedIDs: map[string]bool{"bd-1": true},
+		StoreSubtreePrefix:     "services/web/",
+	})
+	if err != nil {
+		t.Fatalf("web GenerateReportCached: %v", err)
+	}
+	webBD1Explicit := make(map[string]bool)
+	for _, cc := range webRep.Histories["bd-1"].Commits {
+		if cc.Method == MethodExplicitID {
+			webBD1Explicit[cc.SHA] = true
+		}
+	}
+	if !webBD1Explicit[webUnprefixedSHA] || webBD1Explicit[apiUnprefixedSHA] || webBD1Explicit[rootUnprefixedSHA] {
+		t.Fatalf("web colliding bd-1 explicit SHAs = %v, want ONLY %s", webBD1Explicit, webUnprefixedSHA)
+	}
+
+	// Verify Root umbrella store with SiblingSubtreePrefixes accepted rootUnprefixedSHA and rejected api & web subtree commits!
+	rootCorr := NewCorrelator(mono, rootJSONL)
+	rootRep, err := rootCorr.GenerateReportCached([]BeadInfo{
+		{ID: "bd-1", Title: "Root umbrella task", Status: "open"},
+	}, CorrelatorOptions{
+		AmbiguousUnprefixedIDs: map[string]bool{"bd-1": true},
+		SiblingSubtreePrefixes: []string{"services/api/", "services/web/"},
+	})
+	if err != nil {
+		t.Fatalf("root GenerateReportCached: %v", err)
+	}
+	rootBD1Explicit := make(map[string]bool)
+	for _, cc := range rootRep.Histories["bd-1"].Commits {
+		if cc.Method == MethodExplicitID {
+			rootBD1Explicit[cc.SHA] = true
+		}
+	}
+	if !rootBD1Explicit[rootUnprefixedSHA] || rootBD1Explicit[apiUnprefixedSHA] || rootBD1Explicit[webUnprefixedSHA] {
+		t.Fatalf("root umbrella colliding bd-1 explicit SHAs = %v, want ONLY %s", rootBD1Explicit, rootUnprefixedSHA)
+	}
+
+	// Verify TargetBeadAliases ("99" + "api-99") in GenerateReportCached + CausalityBeadID
+	// resolves historical snapshot ID "99", synthesizes its deleted history, and attaches feat(api-99).
+	targetRep, err := apiCorr.GenerateReportCached(apiLiveBeads, CorrelatorOptions{
+		BeadID:            "api-99",
+		CausalityBeadID:   "api-99",
+		TargetBeadAliases: []string{"99", "api-99"},
+		ExplicitIDAliases: map[string]string{"api-99": "99"},
+	})
+	if err != nil {
+		t.Fatalf("target alias GenerateReportCached: %v", err)
+	}
+	h99, ok := targetRep.Histories["99"]
+	if !ok {
+		t.Fatalf("expected synthesized history under historical local ID '99', got keys %+v", targetRep.Histories)
+	}
+	if h99.Status != "deleted" || h99.Title != "Deleted API bead" {
+		t.Fatalf("h99 Status=%q Title=%q, want deleted / Deleted API bead", h99.Status, h99.Title)
+	}
+	found99Commit := false
+	for _, cc := range h99.Commits {
+		if cc.SHA == api99SHA {
+			found99Commit = true
+		}
+	}
+	if !found99Commit {
+		t.Fatalf("expected feat(api-99) commit %s on synthesized '99', got %+v", api99SHA, h99.Commits)
+	}
+	if targetRep.CausalHistory == nil || targetRep.CausalHistory.BeadID != "99" {
+		t.Fatalf("CausalHistory = %+v, want BeadID='99'", targetRep.CausalHistory)
+	}
+	if len(targetRep.CausalHistory.Observations) == 0 {
+		t.Fatalf("expected historical causal observations for '99', got empty Observations: %+v", targetRep.CausalHistory)
+	}
+}

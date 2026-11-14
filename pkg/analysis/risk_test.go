@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -420,5 +421,176 @@ func TestImpactScore_IncludesRisk(t *testing.T) {
 	diff := score.Score - expectedComponents
 	if diff > 0.0001 || diff < -0.0001 {
 		t.Errorf("score %f doesn't match sum of components %f", score.Score, expectedComponents)
+	}
+}
+
+func TestComputeRiskSignals_DependencyBlockedOpenStatusRisk(t *testing.T) {
+	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
+
+	blockerOpen := model.Issue{
+		ID:        "BLOCKER-OPEN",
+		Title:     "Open blocker",
+		Status:    model.StatusOpen,
+		CreatedAt: now.Add(-2 * 24 * time.Hour),
+		UpdatedAt: now,
+	}
+	blockerClosed := model.Issue{
+		ID:        "BLOCKER-CLOSED",
+		Title:     "Closed blocker",
+		Status:    model.StatusClosed,
+		CreatedAt: now.Add(-5 * 24 * time.Hour),
+		UpdatedAt: now,
+	}
+	depBlockedRecent := model.Issue{
+		ID:        "DEP-BLOCKED-RECENT",
+		Title:     "Open issue blocked by unsatisfied dep",
+		Status:    model.StatusOpen,
+		CreatedAt: now.Add(-2 * 24 * time.Hour),
+		UpdatedAt: now,
+		Dependencies: []*model.Dependency{
+			{IssueID: "DEP-BLOCKED-RECENT", DependsOnID: "BLOCKER-OPEN", Type: model.DepBlocks},
+		},
+	}
+	depBlockedStale := model.Issue{
+		ID:        "DEP-BLOCKED-STALE",
+		Title:     "Stale open issue blocked by unsatisfied dep",
+		Status:    model.StatusOpen,
+		CreatedAt: now.Add(-20 * 24 * time.Hour),
+		UpdatedAt: now.Add(-10 * 24 * time.Hour),
+		Dependencies: []*model.Dependency{
+			{IssueID: "DEP-BLOCKED-STALE", DependsOnID: "BLOCKER-OPEN", Type: model.DepBlocks},
+		},
+	}
+	depSatisfied := model.Issue{
+		ID:        "DEP-SATISFIED",
+		Title:     "Open issue whose blocker is closed",
+		Status:    model.StatusOpen,
+		CreatedAt: now.Add(-2 * 24 * time.Hour),
+		UpdatedAt: now,
+		Dependencies: []*model.Dependency{
+			{IssueID: "DEP-SATISFIED", DependsOnID: "BLOCKER-CLOSED", Type: model.DepBlocks},
+		},
+	}
+
+	issues := map[string]model.Issue{
+		"BLOCKER-OPEN":       blockerOpen,
+		"BLOCKER-CLOSED":     blockerClosed,
+		"DEP-BLOCKED-RECENT": depBlockedRecent,
+		"DEP-BLOCKED-STALE":  depBlockedStale,
+		"DEP-SATISFIED":      depSatisfied,
+	}
+	stats := GraphStats{
+		InDegree:  make(map[string]int),
+		OutDegree: make(map[string]int),
+	}
+
+	recentSig := ComputeRiskSignals(&depBlockedRecent, &stats, issues, now)
+	if recentSig.StatusRisk != 0.7 {
+		t.Fatalf("expected StatusRisk=0.7 for dependency-blocked recent open issue, got %f", recentSig.StatusRisk)
+	}
+
+	staleSig := ComputeRiskSignals(&depBlockedStale, &stats, issues, now)
+	if staleSig.StatusRisk != 0.9 {
+		t.Fatalf("expected StatusRisk=0.9 for dependency-blocked stale open issue, got %f", staleSig.StatusRisk)
+	}
+
+	satisfiedSig := ComputeRiskSignals(&depSatisfied, &stats, issues, now)
+	if satisfiedSig.StatusRisk != 0.1 {
+		t.Fatalf("expected StatusRisk=0.1 for unblocked open issue with closed blocker, got %f", satisfiedSig.StatusRisk)
+	}
+}
+
+func TestComputeRiskSignals_ReadinessParentChainPerformanceAndScoped(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+
+	// 1. 5,000-node DepParentChild chain must evaluate in < 50ms via O(N+E) ReadinessIndex
+	const chainLen = 5000
+	chainMap := make(map[string]model.Issue, chainLen+1)
+	chainMap["ROOT-BLOCKER"] = model.Issue{
+		ID:        "ROOT-BLOCKER",
+		Status:    model.StatusOpen,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	for i := 0; i < chainLen; i++ {
+		id := fmt.Sprintf("NODE-%04d", i)
+		iss := model.Issue{
+			ID:        id,
+			Status:    model.StatusOpen,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if i == 0 {
+			iss.Dependencies = []*model.Dependency{
+				{IssueID: id, DependsOnID: "ROOT-BLOCKER", Type: model.DepBlocks},
+			}
+		} else {
+			parentID := fmt.Sprintf("NODE-%04d", i-1)
+			iss.Dependencies = []*model.Dependency{
+				{IssueID: id, DependsOnID: parentID, Type: model.DepParentChild},
+			}
+		}
+		chainMap[id] = iss
+	}
+	emptyStats := GraphStats{
+		InDegree:  make(map[string]int),
+		OutDegree: make(map[string]int),
+	}
+
+	start := time.Now()
+	allSigs := ComputeAllRiskSignals(chainMap, &emptyStats, now)
+	elapsed := time.Since(start)
+	if elapsed > 50*time.Millisecond {
+		t.Fatalf("ComputeAllRiskSignals on %d-node DepParentChild chain took %v (> 50ms)", chainLen, elapsed)
+	}
+	if got := allSigs["NODE-4999"].StatusRisk; got != 0.7 {
+		t.Fatalf("expected leaf of blocked parent chain to have StatusRisk=0.7, got %f", got)
+	}
+
+	// 2. DepParentChild cycle -> DependenciesUnknown -> blocked StatusRisk (0.7)
+	cycIssues := map[string]model.Issue{
+		"CYC-A": {
+			ID: "CYC-A", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CYC-A", DependsOnID: "CYC-B", Type: model.DepParentChild}},
+		},
+		"CYC-B": {
+			ID: "CYC-B", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CYC-B", DependsOnID: "CYC-A", Type: model.DepParentChild}},
+		},
+	}
+	cycSigs := ComputeAllRiskSignals(cycIssues, &emptyStats, now)
+	if cycSigs["CYC-A"].StatusRisk != 0.7 {
+		t.Fatalf("expected DepParentChild cycle to be treated as blocked (0.7), got %f", cycSigs["CYC-A"].StatusRisk)
+	}
+
+	// 3. StatusInProgress with unsatisfied blocker -> blocked StatusRisk (0.9 when >7d stale),
+	//    and scoped ReadinessIndex with closed external blocker -> satisfied StatusRisk (0.1)
+	fullUniverse := []model.Issue{
+		{ID: "EXT-CLOSED", Status: model.StatusClosed, CreatedAt: now, UpdatedAt: now},
+		{ID: "EXT-OPEN", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "CAND-SAT", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CAND-SAT", DependsOnID: "EXT-CLOSED", Type: model.DepBlocks}},
+		},
+		{
+			ID: "CAND-INPROG-BLK", Status: model.StatusInProgress, CreatedAt: now.Add(-10 * 24 * time.Hour), UpdatedAt: now.Add(-9 * 24 * time.Hour),
+			Dependencies: []*model.Dependency{{IssueID: "CAND-INPROG-BLK", DependsOnID: "EXT-OPEN", Type: model.DepBlocks}},
+		},
+	}
+	scopedReadiness := model.NewReadinessIndex(fullUniverse)
+	scopedSlice := fullUniverse[2:] // exclude EXT-CLOSED / EXT-OPEN from candidate slice
+	an := NewAnalyzer(scopedSlice)
+	an.SetNow(now)
+	an.SetReadinessScope(scopedReadiness, map[string]bool{"CAND-SAT": true, "CAND-INPROG-BLK": true})
+	impacts := an.ComputeImpactScores()
+	impactByID := make(map[string]ImpactScore, len(impacts))
+	for _, im := range impacts {
+		impactByID[im.IssueID] = im
+	}
+	if impactByID["CAND-SAT"].Breakdown.RiskSignals == nil || impactByID["CAND-SAT"].Breakdown.RiskSignals.StatusRisk != 0.1 {
+		t.Fatalf("expected scoped closed external blocker to be satisfied (StatusRisk=0.1), got %+v", impactByID["CAND-SAT"].Breakdown.RiskSignals)
+	}
+	if impactByID["CAND-INPROG-BLK"].Breakdown.RiskSignals == nil || impactByID["CAND-INPROG-BLK"].Breakdown.RiskSignals.StatusRisk != 0.9 {
+		t.Fatalf("expected stale dependency-blocked in_progress issue to have StatusRisk=0.9, got %+v", impactByID["CAND-INPROG-BLK"].Breakdown.RiskSignals)
 	}
 }
