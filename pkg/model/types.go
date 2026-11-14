@@ -298,6 +298,20 @@ const (
 	StatusTombstone  Status = "tombstone" // Soft-deleted issue
 )
 
+// Normalize trims surrounding whitespace and canonicalizes built-in statuses.
+// Custom workflow names retain their case and internal whitespace.
+func (s Status) Normalize() Status {
+	trimmed := strings.TrimSpace(string(s))
+	normalized := Status(strings.ToLower(trimmed))
+	switch normalized {
+	case StatusOpen, StatusInProgress, StatusBlocked, StatusDeferred, StatusDraft,
+		StatusPinned, StatusHooked, StatusReview, StatusClosed, StatusTombstone:
+		return normalized
+	default:
+		return Status(trimmed)
+	}
+}
+
 // IsValid accepts nonblank statuses, including br's custom workflow states.
 // Loading a custom state does not make it open, closed, or claimable.
 func (s Status) IsValid() bool {

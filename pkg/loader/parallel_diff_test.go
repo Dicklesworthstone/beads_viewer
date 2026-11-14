@@ -102,6 +102,64 @@ func parseParallel(t *testing.T, data []byte, usePool bool, filter func(*model.I
 	return issues, refs, stats, warns
 }
 
+func TestParseIssues_PreservesCustomStatusesAcrossPaths(t *testing.T) {
+	data := []byte(strings.Join([]string{
+		`{"id":"custom","title":"Review","status":" QA-Review ","issue_type":"task"}`,
+		`{"id":"custom-spaces","title":"QA","status":"Awaiting QA","issue_type":"task"}`,
+		`{"id":"custom-unicode","title":"Review","status":"Révision","issue_type":"task"}`,
+		`{"id":"open","title":"Open","status":"\tOPEN\u00a0","issue_type":"task"}`,
+		`{"id":"closed","title":"Closed","status":" Closed ","issue_type":"task"}`,
+		`{"id":"deleted","title":"Deleted","status":"TombStone","issue_type":"task"}`,
+		`{"id":"blank","title":"Blank status","status":" \t ","issue_type":"task"}`,
+		`{"id":"missing","title":"Missing status","issue_type":"task"}`,
+		`{"id":"null","title":"Null status","status":null,"issue_type":"task"}`,
+		`{"title":"Missing ID","status":"QA-Review","issue_type":"task"}`,
+		`{"_type":"memory","content":"not an issue"}`,
+	}, "\n") + "\n")
+	wantStatuses := []model.Status{"QA-Review", "Awaiting QA", "Révision", model.StatusOpen, model.StatusClosed, model.StatusTombstone}
+	for _, parser := range []struct {
+		name  string
+		parse func(*testing.T, []byte, bool, func(*model.Issue) bool) ([]model.Issue, []*model.Issue, ParseStats, []string)
+	}{
+		{"serial", parseSerial},
+		{"parallel", parseParallel},
+	} {
+		for _, usePool := range []bool{false, true} {
+			for _, filtered := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/pooled=%v/filtered=%v", parser.name, usePool, filtered), func(t *testing.T) {
+					var observed []model.Status
+					issues, refs, stats, warns := parser.parse(t, data, usePool, func(issue *model.Issue) bool {
+						observed = append(observed, issue.Status)
+						return !filtered || issue.Status == "QA-Review"
+					})
+					defer ReturnIssuePtrsToPool(refs)
+					if !reflect.DeepEqual(observed, wantStatuses) {
+						t.Errorf("filter observed statuses %q, want %q", observed, wantStatuses)
+					}
+					if stats != (ParseStats{Valid: 6, Errors: 4, Skipped: 1}) || len(warns) != 4 {
+						t.Fatalf("source accounting changed: stats=%+v warnings=%v", stats, warns)
+					}
+					want := wantStatuses
+					if filtered {
+						want = wantStatuses[:1]
+					}
+					if len(issues) != len(want) {
+						t.Fatalf("loaded %d issues, want %d", len(issues), len(want))
+					}
+					for i, issue := range issues {
+						if issue.Status != want[i] {
+							t.Errorf("issue %q status = %q, want %q", issue.ID, issue.Status, want[i])
+						}
+						if usePool && (len(refs) != len(issues) || refs[i] == nil || refs[i].Status != want[i]) {
+							t.Fatalf("pooled issue %q lost its status: refs=%+v", issue.ID, refs)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 // assertDiffEqual checks that the serial and parallel outputs are identical in
 // every observable dimension: the issue slice (value + order), the count, the
 // stats, and the ordered warnings.

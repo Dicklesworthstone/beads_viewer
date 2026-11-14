@@ -347,6 +347,37 @@ func TestReadinessOwnsMutableDecisionInputs(t *testing.T) {
 	verify()
 }
 
+func TestStatus_Normalize(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status Status
+		want   Status
+	}{
+		{"open", "\tOPEN\u00a0", StatusOpen},
+		{"in progress", " In_Progress ", StatusInProgress},
+		{"blocked", " BLOCKED ", StatusBlocked},
+		{"deferred", " Deferred ", StatusDeferred},
+		{"draft", " DRAFT ", StatusDraft},
+		{"pinned", " Pinned ", StatusPinned},
+		{"hooked", " HOOKED ", StatusHooked},
+		{"review", " Review ", StatusReview},
+		{"closed", " CLOSED ", StatusClosed},
+		{"tombstone", "\u202fTombStone\u3000", StatusTombstone},
+		{"custom", " QA-Review ", "QA-Review"},
+		{"custom internal spaces", " Awaiting  QA ", "Awaiting  QA"},
+		{"custom unicode", "\u00a0Révision\u3000", "Révision"},
+		{"custom built-in prefix", "TombStone Review", "TombStone Review"},
+		{"empty", "", ""},
+		{"blank", "\u00a0\t\n", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.status.Normalize(); got != tc.want {
+				t.Errorf("Normalize(%q) = %q, want %q", tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestStatus_IsValid(t *testing.T) {
 	tests := []struct {
 		name   string

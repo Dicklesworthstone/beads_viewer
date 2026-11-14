@@ -33,6 +33,7 @@ func TestSQLiteLoadReportAccountsForReadLoss(t *testing.T) {
 		{"minimal_valid_without_optional_tables", "", 0, 0},
 		{"malformed_issue_row", `INSERT INTO issues VALUES ('bad', 'Unreadable priority', 'open', 'bad', NULL);`, 1, 0},
 		{"invalid_issue_row", `INSERT INTO issues VALUES ('bad', 'Empty status', '', 2, NULL);`, 1, 0},
+		{"blank_issue_status", "INSERT INTO issues VALUES ('bad', 'Blank status', '\t\n\u00a0', 2, NULL);", 1, 0},
 		{"malformed_dependency_row", `CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT); INSERT INTO dependencies VALUES ('safe', NULL, 'blocks');`, 0, 1},
 		{"malformed_dependency_table", `CREATE TABLE dependencies (issue_id TEXT, type TEXT);`, 0, 1},
 		{"legacy_dependency_without_type", `CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT); INSERT INTO dependencies VALUES ('safe', 'missing');`, 0, 0},
@@ -95,8 +96,8 @@ func TestReaderPreservesBrWorkflowVocabulary(t *testing.T) {
 			dir := t.TempDir()
 			source := DataSource{Type: SourceTypeJSONLLocal, Path: filepath.Join(dir, "issues.jsonl")}
 			if backend == "jsonl" {
-				contents := `{"id":"custom","title":"Custom workflow","status":"qa-review","issue_type":"task"}
-{"id":"ready","title":"Ready work","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"custom","type":"relates-to"},{"depends_on_id":"absent","type":"team-reference"}]}
+				contents := `{"id":"custom","title":"Custom workflow","status":" QA-Review ","issue_type":"task"}
+{"id":"ready","title":"Ready work","status":" OPEN ","issue_type":"task","dependencies":[{"depends_on_id":"custom","type":"relates-to"},{"depends_on_id":"absent","type":"team-reference"}]}
 {"id":"blocked","title":"Blocked work","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"custom","type":"conditional-blocks"}]}
 {"id":"waiting","title":"Waiting work","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"custom","type":"waits-for"}]}
 `
@@ -112,7 +113,7 @@ func TestReaderPreservesBrWorkflowVocabulary(t *testing.T) {
 				t.Cleanup(func() { db.Close() })
 				if _, err := db.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, status TEXT, issue_type TEXT);
 CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT);
-INSERT INTO issues VALUES ('custom', 'Custom workflow', 'qa-review', 'task'), ('ready', 'Ready work', 'open', 'task'), ('blocked', 'Blocked work', 'open', 'task'), ('waiting', 'Waiting work', 'open', 'task');
+INSERT INTO issues VALUES ('custom', 'Custom workflow', ' QA-Review ', 'task'), ('ready', 'Ready work', ' OPEN ', 'task'), ('blocked', 'Blocked work', 'open', 'task'), ('waiting', 'Waiting work', 'open', 'task');
 INSERT INTO dependencies VALUES ('ready', 'custom', 'relates-to'), ('ready', 'absent', 'team-reference'), ('blocked', 'custom', 'conditional-blocks'), ('waiting', 'custom', 'waits-for');`); err != nil {
 					t.Fatal(err)
 				}
@@ -128,8 +129,22 @@ INSERT INTO dependencies VALUES ('ready', 'custom', 'relates-to'), ('ready', 'ab
 			for _, issue := range loaded.Issues {
 				byID[issue.ID] = issue
 			}
-			if byID["custom"].Status != "qa-review" {
+			if byID["custom"].Status != "QA-Review" {
 				t.Fatalf("custom status changed: %+v", byID["custom"])
+			}
+			if byID["ready"].Status != model.StatusOpen {
+				t.Fatalf("built-in status was not normalized: %+v", byID["ready"])
+			}
+			reader, err := NewReader(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			filtered, err := reader.LoadIssuesFiltered(func(issue *model.Issue) bool {
+				return issue.Status == "QA-Review"
+			})
+			if err != nil || len(filtered) != 1 || filtered[0].ID != "custom" {
+				t.Fatalf("custom-status filter lost issue: issues=%+v err=%v", filtered, err)
 			}
 			wantEdges := map[string]map[string]model.DependencyType{
 				"ready":   {"custom": "relates-to", "absent": "team-reference"},

@@ -167,6 +167,49 @@ func TestAggregateLoaderLoadAll(t *testing.T) {
 	}
 }
 
+func TestAggregateLoaderPreservesCustomStatuses(t *testing.T) {
+	root := t.TempDir()
+	createTestBeadsFile(t, filepath.Join(root, "api"), []model.Issue{
+		{ID: "CUSTOM-1", Title: "Review", Status: " QA-Review "},
+	})
+	createTestBeadsFile(t, filepath.Join(root, "web"), []model.Issue{
+		{ID: "WAIT-1", Title: "Waiting for API review", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{DependsOnID: "api-CUSTOM-1", Type: model.DepBlocks}}},
+	})
+	config := &workspace.Config{Repos: []workspace.RepoConfig{
+		{Name: "api", Path: "api", Prefix: "api-"},
+		{Name: "web", Path: "web", Prefix: "web-"},
+	}}
+	issues, results, err := workspace.NewAggregateLoader(config, root).LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	if len(issues) != 2 || len(results) != 2 {
+		t.Fatalf("custom workflow lost workspace records: issues=%+v results=%+v", issues, results)
+	}
+	for _, result := range results {
+		if result.Error != nil || result.ParseStats.Valid != 1 || result.ParseStats.Errors != 0 || result.ParseStats.Skipped != 0 || result.WarningCount != 0 {
+			t.Fatalf("custom workflow lost source authority: %+v", result)
+		}
+	}
+	byID := make(map[string]model.Issue, len(issues))
+	for _, issue := range issues {
+		byID[issue.ID] = issue
+	}
+	if got := byID["api-CUSTOM-1"].Status; got != "QA-Review" {
+		t.Fatalf("namespaced custom status = %q, want QA-Review", got)
+	}
+	readiness := model.NewReadinessIndex(issues)
+	for _, id := range []string{"api-CUSTOM-1", "web-WAIT-1"} {
+		if readiness.Ready(id, time.Now()) || readiness.Claimable(id, time.Now()) {
+			t.Fatalf("%s became actionable before custom workflow completion", id)
+		}
+	}
+	if state := readiness.DependencyState("web-WAIT-1"); state != model.DependenciesUnsatisfied {
+		t.Fatalf("custom cross-repository predecessor state = %q, want unsatisfied", state)
+	}
+}
+
 func TestAggregateLoaderReportsDroppedRecordsFromSuccessfulRepository(t *testing.T) {
 	tmpDir := t.TempDir()
 	repoPath := filepath.Join(tmpDir, "api")
