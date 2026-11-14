@@ -12,7 +12,7 @@ import (
 )
 
 // renderSprintDashboard renders the sprint view with progress, burndown, and at-risk items (bv-161)
-func (m Model) renderSprintDashboard() string {
+func (m *Model) renderSprintDashboard() string {
 	t := m.theme
 	if m.selectedSprint == nil {
 		return "No sprint selected"

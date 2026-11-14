@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"os/exec"
@@ -187,6 +190,42 @@ func TestSnapshotSwapDoesNotCopyModel(t *testing.T) {
 	})
 	if got := result.AllocedBytesPerOp(); got > 64<<10 {
 		t.Fatalf("snapshot swap allocated %d bytes per op for 100 issues; want at most %d", got, 64<<10)
+	}
+}
+
+// Non-escaping value-receiver Model methods copy the >200 KB Model struct on the
+// stack without incrementing AllocedBytesPerOp(). Require all unexported Model
+// helpers in pkg/ui production files to take *Model pointer receivers.
+func TestModelUnexportedMethodsUsePointerReceivers(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read pkg/ui dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	var violations []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || len(fn.Recv.List) == 0 || fn.Name.IsExported() {
+				continue
+			}
+			ident, isValueModel := fn.Recv.List[0].Type.(*ast.Ident)
+			if isValueModel && ident.Name == "Model" {
+				pos := fset.Position(fn.Pos())
+				violations = append(violations, fmt.Sprintf("%s:%d: func (%s) %s", pos.Filename, pos.Line, ident.Name, fn.Name.Name))
+			}
+		}
+	}
+	if len(violations) > 0 {
+		t.Fatalf("unexported value-receiver Model methods copy >200 KB per call (use *Model instead):\n%s", strings.Join(violations, "\n"))
 	}
 }
 

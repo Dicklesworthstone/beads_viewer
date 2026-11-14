@@ -1538,7 +1538,7 @@ type labelFlowSummary struct {
 
 // repoScopedIssues returns m.issues filtered by m.activeRepos when workspace
 // repo filtering is active (nil activeRepos = all repos).
-func (m Model) repoScopedIssues() []model.Issue {
+func (m *Model) repoScopedIssues() []model.Issue {
 	if !m.workspaceMode || m.activeRepos == nil {
 		return m.issues
 	}
@@ -1554,7 +1554,7 @@ func (m Model) repoScopedIssues() []model.Issue {
 }
 
 // getCrossFlowsForLabel returns outgoing cross-label dependency counts for a label
-func (m Model) getCrossFlowsForLabel(label string) labelFlowSummary {
+func (m *Model) getCrossFlowsForLabel(label string) labelFlowSummary {
 	cfg := analysis.DefaultLabelHealthConfig()
 	flow := analysis.ComputeCrossLabelFlow(m.repoScopedIssues(), cfg)
 	out := labelFlowSummary{}
@@ -1594,7 +1594,7 @@ func (m Model) getCrossFlowsForLabel(label string) labelFlowSummary {
 }
 
 // filterIssuesByLabel returns issues that contain the given label (case-sensitive match)
-func (m Model) filterIssuesByLabel(label string) []model.Issue {
+func (m *Model) filterIssuesByLabel(label string) []model.Issue {
 	if m.labelDrilldownCache != nil {
 		if cached, ok := m.labelDrilldownCache[label]; ok {
 			return cached
@@ -1992,7 +1992,7 @@ func (m *Model) clearListFuzzyFilter() {
 // listViewInBounds renders the list from a copy whose selection is clamped to
 // the visible rows. list.View slices VisibleItems() by the paginator's page
 // without checking it, so a stale page must never reach it (GH #210).
-func (m Model) listViewInBounds() string {
+func (m *Model) listViewInBounds() string {
 	l := m.list
 	if n := len(l.VisibleItems()); n > 0 && l.Index() >= n {
 		l.Select(n - 1)
@@ -2002,7 +2002,7 @@ func (m Model) listViewInBounds() string {
 
 // listIndexInBounds is the selected row as listViewInBounds draws it, so the
 // page-info line never reports a page past the visible rows.
-func (m Model) listIndexInBounds() int {
+func (m *Model) listIndexInBounds() int {
 	idx := m.list.Index()
 	if n := len(m.list.VisibleItems()); idx >= n {
 		idx = n - 1
@@ -7173,7 +7173,7 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 }
 
 // getCommitURL returns the GitHub/GitLab commit URL for a SHA (bv-xf4p)
-func (m Model) getCommitURL(sha string) string {
+func (m *Model) getCommitURL(sha string) string {
 	sha = strings.TrimSpace(sha)
 	if sha == "" {
 		return ""
@@ -7361,7 +7361,7 @@ func (m *Model) handleRecipePickerKeys(msg tea.KeyMsg) *Model {
 	return m
 }
 
-func (m Model) restoreFocusFromRepoPicker() focus {
+func (m *Model) restoreFocusFromRepoPicker() focus {
 	if !m.showRepoPicker && m.hasOpenModalOverlay() {
 		return m.restoreTopModalOrListFocus()
 	}
@@ -7772,7 +7772,7 @@ func (m *Model) resetUnderlyingViewToMainList() {
 	}
 }
 
-func (m Model) hasOpenModalOverlay() bool {
+func (m *Model) hasOpenModalOverlay() bool {
 	return m.showQuitConfirm || m.showHelp || m.showTutorial ||
 		m.showAgentPrompt || m.showCassModal || m.showUpdateModal ||
 		m.showTimeTravelPrompt || m.showRecipePicker || m.showRepoPicker ||
@@ -7808,7 +7808,7 @@ func (m *Model) openContextTutorialFromFocus(prior focus) {
 	m.focused = focusTutorial
 }
 
-func (m Model) validateViewFocus(candidate focus) focus {
+func (m *Model) validateViewFocus(candidate focus) focus {
 	if m.showVelocityComparison {
 		return focusVelocityComparison
 	}
@@ -7848,7 +7848,7 @@ func (m Model) validateViewFocus(candidate focus) focus {
 	return focusList
 }
 
-func (m Model) restoreUnderlyingViewFocus() focus {
+func (m *Model) restoreUnderlyingViewFocus() focus {
 	candidate := m.focused
 	if isModalFocus(candidate) {
 		candidate = m.savedViewFocus
@@ -7856,7 +7856,7 @@ func (m Model) restoreUnderlyingViewFocus() focus {
 	return m.validateViewFocus(candidate)
 }
 
-func (m Model) restoreTopModalOrListFocus() focus {
+func (m *Model) restoreTopModalOrListFocus() focus {
 	if m.showQuitConfirm {
 		return focusQuitConfirm
 	}
@@ -7892,7 +7892,7 @@ func (m Model) restoreTopModalOrListFocus() focus {
 
 // restoreFocusFromHelp returns the exact focus that opened the help overlay,
 // respecting any active modal overlay and validating live view flags.
-func (m Model) restoreFocusFromHelp() focus {
+func (m *Model) restoreFocusFromHelp() focus {
 	if m.showQuitConfirm {
 		return focusQuitConfirm
 	}
@@ -7928,7 +7928,7 @@ func (m Model) restoreFocusFromHelp() focus {
 
 // restoreFocusFromTutorial returns the focus that was active before the tutorial opened,
 // respecting any active modal overlay and validating live view flags.
-func (m Model) restoreFocusFromTutorial() focus {
+func (m *Model) restoreFocusFromTutorial() focus {
 	if m.showQuitConfirm {
 		return focusQuitConfirm
 	}
@@ -7964,7 +7964,7 @@ func (m Model) restoreFocusFromTutorial() focus {
 
 // effectiveUnderlyingFocus unwraps transient modal focuses so background/live reloads
 // refresh the active underlying view cleanly.
-func (m Model) effectiveUnderlyingFocus() focus {
+func (m *Model) effectiveUnderlyingFocus() focus {
 	if !isModalFocus(m.focused) {
 		return m.validateViewFocus(m.focused)
 	}
@@ -8044,7 +8044,7 @@ func (m *Model) handleHelpKeys(msg tea.KeyMsg) *Model {
 	return m
 }
 
-func (m Model) renderLoadingScreen() string {
+func (m *Model) renderLoadingScreen() string {
 	frame := workerSpinnerFrames[0]
 	if m.backgroundWorker != nil && m.backgroundWorker.State() == WorkerProcessing {
 		frame = workerSpinnerFrames[m.workerSpinnerIdx%len(workerSpinnerFrames)]
@@ -8260,7 +8260,7 @@ func fitBlock(s string, width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) renderQuitConfirm() string {
+func (m *Model) renderQuitConfirm() string {
 	t := m.theme
 
 	boxStyle := t.Renderer.NewStyle().
@@ -8295,7 +8295,7 @@ func (m Model) renderQuitConfirm() string {
 	)
 }
 
-func (m Model) renderListWithHeader() string {
+func (m *Model) renderListWithHeader() string {
 	t := m.theme
 
 	// Calculate dimensions based on actual list height set in sizing
@@ -8394,7 +8394,7 @@ func (m Model) renderListWithHeader() string {
 		Render(content)
 }
 
-func (m Model) renderSplitView() string {
+func (m *Model) renderSplitView() string {
 	t := m.theme
 
 	var listStyle, detailStyle lipgloss.Style
@@ -8782,7 +8782,7 @@ func (m *Model) renderHelpOverlay() string {
 	)
 }
 
-func (m Model) renderLabelHealthDetail(lh analysis.LabelHealth) string {
+func (m *Model) renderLabelHealthDetail(lh analysis.LabelHealth) string {
 	t := m.theme
 	innerWidth := m.width - 10
 	if innerWidth < 20 {
@@ -8917,7 +8917,7 @@ func (m Model) renderLabelHealthDetail(lh analysis.LabelHealth) string {
 }
 
 // renderLabelDrilldown shows a compact drilldown for the selected label
-func (m Model) renderLabelDrilldown() string {
+func (m *Model) renderLabelDrilldown() string {
 	t := m.theme
 
 	boxStyle := t.Renderer.NewStyle().
@@ -9084,7 +9084,7 @@ func (m Model) renderLabelDrilldown() string {
 }
 
 // renderLabelGraphAnalysis shows label-specific graph metrics (bv-109)
-func (m Model) renderLabelGraphAnalysis() string {
+func (m *Model) renderLabelGraphAnalysis() string {
 	t := m.theme
 	r := m.labelGraphAnalysisResult
 
@@ -9974,7 +9974,7 @@ func nextHybridPreset(current search.PresetName) search.PresetName {
 }
 
 // getDiffStatus returns the diff status for an issue if time-travel mode is active
-func (m Model) getDiffStatus(id string) DiffStatus {
+func (m *Model) getDiffStatus(id string) DiffStatus {
 	if !m.timeTravelMode {
 		return DiffStatusNone
 	}
@@ -10839,7 +10839,7 @@ func (m *Model) recalculateSplitPaneSizes() {
 // Mirroring bubbles' exact guard (list.go View): the filter-bar term is only
 // added when that condition holds, so disabling filtering later would
 // automatically drop it without touching this math.
-func (m Model) listChromeLines() int {
+func (m *Model) listChromeLines() int {
 	lines := 1 // column header (clamped to 1 line; never wraps)
 	if m.isSplitView {
 		lines++ // top border of the rounded-border list panel
@@ -11949,7 +11949,7 @@ func (m *Model) generateExportFilename() string {
 }
 
 // renderTimeTravelPrompt renders the time-travel revision input overlay
-func (m Model) renderTimeTravelPrompt() string {
+func (m *Model) renderTimeTravelPrompt() string {
 	t := m.theme
 
 	boxStyle := t.Renderer.NewStyle().
@@ -13109,8 +13109,13 @@ func (m *Model) refreshActionableView() {
 // refreshLabelViews refreshes active label dashboard, health detail, drilldown,
 // and velocity comparison sub-views when underlying data or Phase 2 metrics update.
 func (m *Model) refreshLabelViews(underlyingFocus focus) {
+	needLabelHealth := underlyingFocus == focusLabelDashboard || m.showLabelHealthDetail || m.showLabelDrilldown
+	needVelocity := m.showVelocityComparison || underlyingFocus == focusVelocityComparison
+	if !needLabelHealth && !needVelocity {
+		return
+	}
 	scopedIssues := m.repoScopedIssues()
-	if underlyingFocus == focusLabelDashboard || m.showLabelHealthDetail || m.showLabelDrilldown {
+	if needLabelHealth {
 		cfg := analysis.DefaultLabelHealthConfig()
 		m.labelHealthCache = analysis.ComputeAllLabelHealth(scopedIssues, cfg, time.Now().UTC(), m.analysis)
 		m.labelHealthCached = true
@@ -13201,7 +13206,7 @@ func (m *Model) canScrollShortcutsSidebar(key string) bool {
 
 // isTextInputActive reports whether an embedded text input (list filter, time-travel
 // prompt, label picker, board search, or history search) is currently capturing printable runes.
-func (m Model) isTextInputActive() bool {
+func (m *Model) isTextInputActive() bool {
 	if m.list.FilterState() == list.Filtering {
 		return true
 	}
@@ -13384,7 +13389,7 @@ func alertKey(a drift.Alert) string {
 }
 
 // renderAlertsPanel renders the alerts overlay panel
-func (m Model) renderAlertsPanel() string {
+func (m *Model) renderAlertsPanel() string {
 	t := m.theme
 
 	boxStyle := t.Renderer.NewStyle().
