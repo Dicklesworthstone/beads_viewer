@@ -938,6 +938,38 @@ func TestGitLoader_Cache(t *testing.T) {
 	}
 }
 
+func TestGitLoaderPreservesCustomStatusAcrossCacheHits(t *testing.T) {
+	repoDir := initGitLoaderTestRepo(t)
+	content := strings.Join([]string{
+		`{"id":"CUSTOM-1","title":"Review","status":" QA-Review ","issue_type":"task"}`,
+		`{"id":"WAIT-1","title":"Waiting","status":"open","issue_type":"task","dependencies":[{"depends_on_id":"CUSTOM-1","type":"blocks"}]}`,
+	}, "\n") + "\n"
+	commitGitLoaderFixture(t, repoDir, ".beads/issues.jsonl", content, "custom workflow status")
+
+	gitLoader := NewGitLoader(repoDir)
+	for attempt := 1; attempt <= 2; attempt++ {
+		report, err := gitLoader.LoadAtWithReport("HEAD")
+		if err != nil {
+			t.Fatalf("attempt %d historical load: %v", attempt, err)
+		}
+		if len(report.Issues) != 2 || report.Issues[0].ID != "CUSTOM-1" || report.Issues[0].Status != "QA-Review" {
+			t.Fatalf("attempt %d changed custom workflow status: %+v", attempt, report.Issues)
+		}
+		if report.ParseStats != (ParseStats{Valid: 2}) || len(report.Warnings) != 0 || len(report.TombstoneIDs) != 0 {
+			t.Fatalf("attempt %d custom status lost source authority: %+v", attempt, report)
+		}
+		readiness := model.NewReadinessIndex(report.Issues)
+		if readiness.Ready("CUSTOM-1", time.Now()) || readiness.Claimable("CUSTOM-1", time.Now()) {
+			t.Fatalf("attempt %d custom status became actionable", attempt)
+		}
+		if state := readiness.DependencyState("WAIT-1"); state != model.DependenciesUnsatisfied {
+			t.Fatalf("attempt %d custom predecessor state = %q, want unsatisfied", attempt, state)
+		}
+		// The next cached read must retain the source status despite caller edits.
+		report.Issues[0].Status = model.StatusClosed
+	}
+}
+
 func TestGitLoader_ConcurrentMissesReturnCallerOwnedReports(t *testing.T) {
 	repoDir := initGitLoaderTestRepo(t)
 	content := "{\"id\":\"CONCURRENT-1\",\"title\":\"Original\",\"status\":\"open\",\"issue_type\":\"task\"}\n"

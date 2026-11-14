@@ -2185,16 +2185,8 @@ func recordTypeOf(line []byte) recordType {
 	}
 }
 
-func normalizeIssueStatus(status model.Status) model.Status {
-	trimmed := strings.TrimSpace(string(status))
-	if trimmed == "" {
-		return ""
-	}
-	return model.Status(strings.ToLower(trimmed))
-}
-
 func normalizeLoadedIssue(issue *model.Issue) {
-	issue.Status = normalizeIssueStatus(issue.Status)
+	issue.Status = issue.Status.Normalize()
 	for _, dep := range issue.Dependencies {
 		if dep == nil {
 			continue

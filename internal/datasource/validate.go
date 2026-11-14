@@ -414,14 +414,11 @@ func validateSQLite(source *DataSource, opts ValidationOptions) error {
 	}
 
 	// Count issues if requested, excluding soft-deleted tombstones identically to
-	// SQLiteReader and model.Status.IsTombstone.
+	// SQLiteReader, including normalized status names and legacy tombstone flags.
 	if opts.CountIssues {
-		countQuery := "SELECT COUNT(*) FROM issues WHERE LOWER(COALESCE(status, '')) != 'tombstone'"
-		if columns["tombstone"] {
-			countQuery += " AND (tombstone IS NULL OR tombstone = 0)"
-		}
-		var count int
-		if err := tx.QueryRowContext(ctx, countQuery).Scan(&count); err != nil {
+		session := sqliteReadSession{db: tx}
+		count, err := session.countIssues(ctx, columns)
+		if err != nil {
 			return fmt.Errorf("cannot count issues: %w", err)
 		}
 		source.IssueCount = count

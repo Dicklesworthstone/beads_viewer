@@ -190,14 +190,12 @@ func TestValidateSQLite_ExcludesTombstonesInReadOnlySnapshot(t *testing.T) {
 	tests := []struct {
 		name               string
 		hasTombstoneColumn bool
-		checkReaderParity  bool
 		inserts            []string
 		wantCount          int
 	}{
 		{
 			name:               "schema with tombstone column matches SQLiteReader LoadIssues",
 			hasTombstoneColumn: true,
-			checkReaderParity:  true,
 			inserts: []string{
 				`INSERT INTO issues (id, title, status, tombstone) VALUES ('ACT-1', 'Open issue', 'open', 0)`,
 				`INSERT INTO issues (id, title, status, tombstone) VALUES ('ACT-2', 'Closed issue', 'closed', NULL)`,
@@ -209,7 +207,6 @@ func TestValidateSQLite_ExcludesTombstonesInReadOnlySnapshot(t *testing.T) {
 		{
 			name:               "modern br schema without tombstone column matches SQLiteReader LoadIssues",
 			hasTombstoneColumn: false,
-			checkReaderParity:  true,
 			inserts: []string{
 				`INSERT INTO issues (id, title, status) VALUES ('ACT-1', 'Open issue', 'open')`,
 				`INSERT INTO issues (id, title, status) VALUES ('ACT-2', 'In progress', 'in_progress')`,
@@ -222,13 +219,24 @@ func TestValidateSQLite_ExcludesTombstonesInReadOnlySnapshot(t *testing.T) {
 		{
 			name:               "case-insensitive status TOMBSTONE and TombStone excluded",
 			hasTombstoneColumn: false,
-			checkReaderParity:  false,
 			inserts: []string{
 				`INSERT INTO issues (id, title, status) VALUES ('ACT-1', 'Open issue', 'open')`,
 				`INSERT INTO issues (id, title, status) VALUES ('DEL-1', 'Uppercase tombstone', 'TOMBSTONE')`,
 				`INSERT INTO issues (id, title, status) VALUES ('DEL-2', 'Mixed case tombstone', 'TombStone')`,
 			},
 			wantCount: 1,
+		},
+		{
+			name:               "custom statuses retained and Unicode padded tombstones excluded",
+			hasTombstoneColumn: true,
+			inserts: []string{
+				`INSERT INTO issues (id, title, status) VALUES ('ACT-1', 'Custom workflow', ' QA-Review ')`,
+				`INSERT INTO issues (id, title, status) VALUES ('ACT-2', 'Custom state mentioning tombstone', 'TombStone Review')`,
+				`INSERT INTO issues (id, title, status) VALUES ('DEL-1', 'Whitespace padded tombstone', char(9) || ' TombStone ' || char(10))`,
+				`INSERT INTO issues (id, title, status) VALUES ('DEL-2', 'Unicode padded tombstone', char(160) || char(8239) || 'TOMBSTONE' || char(12288))`,
+				`INSERT INTO issues (id, title, status, tombstone) VALUES ('DEL-3', 'Flagged custom workflow', 'QA-Review', 1)`,
+			},
+			wantCount: 2,
 		},
 	}
 
@@ -277,19 +285,29 @@ func TestValidateSQLite_ExcludesTombstonesInReadOnlySnapshot(t *testing.T) {
 				t.Fatalf("validateSQLite IssueCount = %d, want %d", source.IssueCount, tt.wantCount)
 			}
 
-			if tt.checkReaderParity {
-				reader, err := NewSQLiteReader(source)
-				if err != nil {
-					t.Fatalf("NewSQLiteReader: %v", err)
-				}
-				defer reader.Close()
-				loaded, err := reader.LoadIssues()
-				if err != nil {
-					t.Fatalf("LoadIssues: %v", err)
-				}
-				if len(loaded) != source.IssueCount {
-					t.Fatalf("LoadIssues count = %d, validateSQLite IssueCount = %d", len(loaded), source.IssueCount)
-				}
+			reader, err := NewSQLiteReader(source)
+			if err != nil {
+				t.Fatalf("NewSQLiteReader: %v", err)
+			}
+			defer reader.Close()
+			loaded, err := reader.LoadIssues()
+			if err != nil {
+				t.Fatalf("LoadIssues: %v", err)
+			}
+			if len(loaded) != source.IssueCount {
+				t.Fatalf("LoadIssues count = %d, validateSQLite IssueCount = %d", len(loaded), source.IssueCount)
+			}
+			count, err := reader.CountIssues()
+			if err != nil || count != source.IssueCount {
+				t.Fatalf("CountIssues = %d, %v; validateSQLite IssueCount = %d", count, err, source.IssueCount)
+			}
+			authority, err := reader.LoadIssueAuthority()
+			if err != nil || len(authority) != len(tt.inserts) {
+				t.Fatalf("tombstones lost from authority: issues=%+v err=%v", authority, err)
+			}
+			report := reader.LoadReport()
+			if len(report.TombstoneIDs) != len(tt.inserts)-tt.wantCount || report.WarningCount != 0 {
+				t.Fatalf("incorrect tombstone accounting: %+v", report)
 			}
 		})
 	}

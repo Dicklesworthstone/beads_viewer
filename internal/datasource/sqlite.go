@@ -266,6 +266,7 @@ func (r *SQLiteReader) LoadIssueSnapshotContext(ctx context.Context) ([]model.Is
 			err = ctxErr
 			break
 		}
+		issue.Status = issue.Status.Normalize()
 		if err := issue.Validate(); err != nil {
 			report.Errors++
 			report.addWarning(fmt.Sprintf("invalid issue %q: %v", issue.ID, err))
@@ -683,16 +684,48 @@ func (r *SQLiteReader) CountIssuesContext(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	var count int
-	query := "SELECT COUNT(*) FROM issues WHERE status != 'tombstone'"
-	if columns["tombstone"] {
-		query += " AND (tombstone IS NULL OR tombstone = 0)"
-	}
-	if err := tx.QueryRowContext(ctx, query).Scan(&count); err != nil {
+	count, err := session.countIssues(ctx, columns)
+	if err != nil {
 		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
+	}
+	return count, nil
+}
+
+// countIssues counts source rows, not validated issues. NULL statuses cannot
+// load and are excluded; non-NULL blanks still count here and are rejected by
+// issue validation. Grouping raw statuses keeps normalization in Go (including
+// Unicode whitespace) without scanning every issue into database/sql values.
+func (r *sqliteReadSession) countIssues(ctx context.Context, columns map[string]bool) (int, error) {
+	query := "SELECT status, COUNT(*) FROM issues WHERE status IS NOT NULL"
+	if columns["tombstone"] {
+		query += " AND (tombstone IS NULL OR tombstone = 0)"
+	}
+	query += " GROUP BY status"
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return 0, fmt.Errorf("querying issue status counts: %w", err)
+	}
+	defer rows.Close()
+
+	var count int
+	for rows.Next() {
+		var status model.Status
+		var statusCount int
+		if err := rows.Scan(&status, &statusCount); err != nil {
+			return 0, fmt.Errorf("reading issue status count: %w", err)
+		}
+		if !status.Normalize().IsTombstone() {
+			count += statusCount
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterating issue status counts: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("closing issue status counts: %w", err)
 	}
 	return count, nil
 }
