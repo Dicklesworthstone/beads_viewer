@@ -4311,6 +4311,7 @@ func TestRobotWhatIfAndWave6CLIWiring(t *testing.T) {
 }
 
 func TestWave8CLIRobotHooksWorkspaceAndScopingParity(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
 	exe := buildTestBinary(t)
 
 	// 1. Single-repo fixture: search-weights auto-hybrid, transitive cross-label blocker chain,
