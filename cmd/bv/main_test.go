@@ -4510,6 +4510,7 @@ func TestWave8CLIRobotHooksWorkspaceAndScopingParity(t *testing.T) {
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(fakeHome, ".config"))
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	if err := agents.RecordDecline(repoDir, true); err != nil {
 		t.Fatalf("RecordDecline: %v", err)
 	}

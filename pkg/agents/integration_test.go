@@ -8,6 +8,7 @@ import (
 
 // TestFullFlow_Accept tests the complete flow when user accepts.
 func TestFullFlow_Accept(t *testing.T) {
+	isolateAgentPrefsConfig(t)
 	tmpDir := t.TempDir()
 
 	// Create AGENTS.md without blurb
@@ -63,6 +64,7 @@ func TestFullFlow_Accept(t *testing.T) {
 
 // TestFullFlow_Decline tests the flow when user declines without "don't ask again".
 func TestFullFlow_Decline(t *testing.T) {
+	isolateAgentPrefsConfig(t)
 	tmpDir := t.TempDir()
 
 	// Create AGENTS.md without blurb
@@ -95,6 +97,7 @@ func TestFullFlow_Decline(t *testing.T) {
 
 // TestFullFlow_NeverAsk tests the flow when user chooses "don't ask again".
 func TestFullFlow_NeverAsk(t *testing.T) {
+	isolateAgentPrefsConfig(t)
 	tmpDir := t.TempDir()
 
 	// Create AGENTS.md without blurb
@@ -154,6 +157,7 @@ func TestFullFlow_AlreadyHasBlurb(t *testing.T) {
 
 // TestFullFlow_NoAgentFile tests behavior with no agent file.
 func TestFullFlow_NoAgentFile(t *testing.T) {
+	isolateAgentPrefsConfig(t)
 	tmpDir := t.TempDir()
 
 	// Empty directory - should prompt but detection returns empty

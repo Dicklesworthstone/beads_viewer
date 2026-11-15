@@ -37,7 +37,19 @@ func TestProjectHash(t *testing.T) {
 	}
 }
 
+func isolateAgentPrefsConfig(t *testing.T) string {
+	t.Helper()
+	homeDir := t.TempDir()
+	xdgDir := filepath.Join(homeDir, ".config")
+	t.Setenv("HOME", homeDir)
+	t.Setenv("XDG_CONFIG_HOME", xdgDir)
+	t.Setenv("APPDATA", xdgDir)
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	return homeDir
+}
+
 func TestSaveAndLoadPreference(t *testing.T) {
+	isolateAgentPrefsConfig(t)
 	// Use temp dir as fake project
 	tmpDir := t.TempDir()
 
@@ -127,6 +139,7 @@ func TestShouldPromptForAgentFile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			isolateAgentPrefsConfig(t)
 			tmpDir := t.TempDir()
 			if err := tt.setup(tmpDir); err != nil {
 				t.Fatal(err)
@@ -141,6 +154,7 @@ func TestShouldPromptForAgentFile(t *testing.T) {
 }
 
 func TestRecordDecline(t *testing.T) {
+	isolateAgentPrefsConfig(t)
 	tmpDir := t.TempDir()
 
 	// Record decline with "don't ask again"
@@ -168,6 +182,7 @@ func TestRecordDecline(t *testing.T) {
 }
 
 func TestRecordAccept(t *testing.T) {
+	isolateAgentPrefsConfig(t)
 	tmpDir := t.TempDir()
 
 	err := RecordAccept(tmpDir)
@@ -191,6 +206,7 @@ func TestRecordAccept(t *testing.T) {
 }
 
 func TestClearPreference(t *testing.T) {
+	isolateAgentPrefsConfig(t)
 	tmpDir := t.TempDir()
 
 	// Save then clear
@@ -264,12 +280,7 @@ func TestPrefsPathConsistency(t *testing.T) {
 }
 
 func TestPrefsCreateDirectory(t *testing.T) {
-	// Temporarily set HOME to a temp dir to avoid polluting real config
-	tmpHome := t.TempDir()
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpHome)
-	defer os.Setenv("HOME", origHome)
-
+	isolateAgentPrefsConfig(t)
 	tmpDir := t.TempDir()
 
 	// This should create the prefs directory
@@ -289,8 +300,7 @@ func TestPrefsCreateDirectory(t *testing.T) {
 }
 
 func TestShouldPromptForAgentUpgrade(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	isolateAgentPrefsConfig(t)
 
 	tests := []struct {
 		name          string

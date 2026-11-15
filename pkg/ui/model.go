@@ -2809,6 +2809,10 @@ func (m *Model) syncBoardReadinessAndFullIssues() {
 	if m.analyzer != nil {
 		m.board.SetReadiness(m.analyzer.Readiness())
 	}
+	if m.snapshot != nil && len(m.snapshot.Issues) == len(m.issues) && m.snapshot.IssueMap != nil {
+		m.board.SetFullIssuesFromSnapshot(m.snapshot)
+		return
+	}
 	m.board.SetFullIssues(m.issues)
 }
 

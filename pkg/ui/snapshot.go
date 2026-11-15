@@ -348,9 +348,10 @@ type GraphLayout struct {
 // BoardState contains precomputed Kanban columns for each swimlane mode.
 // This lets the UI swap board data in O(1) when the full dataset is shown.
 type BoardState struct {
-	ByStatus   [4][]model.Issue
-	ByPriority [4][]model.Issue
-	ByType     [4][]model.Issue
+	ByStatus    [4][]model.Issue
+	ByPriority  [4][]model.Issue
+	ByType      [4][]model.Issue
+	BlocksIndex map[string][]string
 }
 
 func (s *BoardState) ColumnsForMode(mode SwimLaneMode) [4][]model.Issue {
@@ -916,15 +917,18 @@ func buildListItemsIncremental(issues []model.Issue, stats *analysis.GraphStats,
 	}
 
 	listItems := make([]IssueItem, len(issues))
-	for i := range listItems {
+	prevItems := prev.ListItems[:len(issues)]
+	for i := range issues {
 		// Fingerprints canonicalize collection order. Keep derived metrics, but
 		// publish the current source order for labels, comments and dependencies.
 		// New rows already have zero transient presentation state, so copying
 		// the previous issue and transient fields would only overwrite them again.
-		listItems[i].Issue = issues[i]
-		listItems[i].GraphScore = prev.ListItems[i].GraphScore
-		listItems[i].Impact = prev.ListItems[i].Impact
-		listItems[i].RepoPrefix = prev.ListItems[i].RepoPrefix
+		dst := &listItems[i]
+		prevItem := &prevItems[i]
+		dst.Issue = issues[i]
+		dst.GraphScore = prevItem.GraphScore
+		dst.Impact = prevItem.Impact
+		dst.RepoPrefix = prevItem.RepoPrefix
 	}
 	for _, id := range diff.Modified {
 		index, ok := prev.listIndexByID[id]
@@ -1049,9 +1053,10 @@ func buildBoardState(issues []model.Issue) *BoardState {
 		return nil
 	}
 	return &BoardState{
-		ByStatus:   groupIssuesByMode(issues, SwimByStatus),
-		ByPriority: groupIssuesByMode(issues, SwimByPriority),
-		ByType:     groupIssuesByMode(issues, SwimByType),
+		ByStatus:    groupIssuesByMode(issues, SwimByStatus),
+		ByPriority:  groupIssuesByMode(issues, SwimByPriority),
+		ByType:      groupIssuesByMode(issues, SwimByType),
+		BlocksIndex: buildBlocksIndex(issues),
 	}
 }
 
@@ -1270,6 +1275,18 @@ func deepCopyBoardState(bs *BoardState) *BoardState {
 			cloned.ByType[i] = make([]model.Issue, len(bs.ByType[i]))
 			for j := range bs.ByType[i] {
 				cloned.ByType[i][j] = bs.ByType[i][j].Clone()
+			}
+		}
+	}
+	if bs.BlocksIndex != nil {
+		cloned.BlocksIndex = make(map[string][]string, len(bs.BlocksIndex))
+		for k, v := range bs.BlocksIndex {
+			if len(v) > 0 {
+				cp := make([]string, len(v))
+				copy(cp, v)
+				cloned.BlocksIndex[k] = cp
+			} else {
+				cloned.BlocksIndex[k] = nil
 			}
 		}
 	}

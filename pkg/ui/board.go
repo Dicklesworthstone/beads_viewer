@@ -37,8 +37,9 @@ type BoardModel struct {
 
 	// Optional full unscoped issue slice & map so downstream-unblock badges (⚡→N)
 	// and blocker status lookups stay accurate even under Ready/Closed filters.
-	fullIssues   []model.Issue
-	fullIssueMap map[string]*model.Issue
+	fullIssues      []model.Issue
+	fullIssueMap    map[string]*model.Issue
+	fullBlocksReady bool
 
 	// Optional full-graph readiness authority so hidden/cross-filter blockers
 	// and closed/tombstone blockers resolve accurately.
@@ -120,19 +121,49 @@ func (b *BoardModel) SetFullIssues(all []model.Issue) {
 	b.fullIssues = all
 	if len(all) == 0 {
 		b.fullIssueMap = nil
+		b.fullBlocksReady = false
 	} else {
 		b.fullIssueMap = make(map[string]*model.Issue, len(all))
 		for i := range all {
 			b.fullIssueMap[all[i].ID] = &all[i]
 		}
+		b.blocksIndex = buildBlocksIndex(all)
+		b.fullBlocksReady = true
 	}
-	b.rebuildBlocksIndex()
+	if !b.fullBlocksReady {
+		b.rebuildBlocksIndex()
+	}
+	b.lastDetailID = ""
+}
+
+// SetFullIssuesFromSnapshot attaches the snapshot's precomputed issue map and
+// open-only blocking dependents index in O(1) without UI-thread allocations.
+func (b *BoardModel) SetFullIssuesFromSnapshot(s *DataSnapshot) {
+	if s == nil {
+		b.SetFullIssues(nil)
+		return
+	}
+	b.fullIssues = s.Issues
+	b.fullIssueMap = s.IssueMap
+	if s.BoardState != nil && s.BoardState.BlocksIndex != nil {
+		b.blocksIndex = s.BoardState.BlocksIndex
+		b.fullBlocksReady = len(s.Issues) > 0
+	} else if len(s.Issues) > 0 {
+		b.blocksIndex = buildBlocksIndex(s.Issues)
+		b.fullBlocksReady = true
+	} else {
+		b.blocksIndex = nil
+		b.fullBlocksReady = false
+	}
 	b.lastDetailID = ""
 }
 
 func (b *BoardModel) rebuildBlocksIndex() {
 	if len(b.fullIssues) > 0 {
-		b.blocksIndex = buildBlocksIndex(b.fullIssues)
+		if !b.fullBlocksReady {
+			b.blocksIndex = buildBlocksIndex(b.fullIssues)
+			b.fullBlocksReady = true
+		}
 		return
 	}
 	b.blocksIndex = buildBlocksIndex(b.allIssues)
@@ -699,9 +730,17 @@ func (b *BoardModel) SetSnapshot(s *DataSnapshot) {
 		b.columns = groupIssuesByMode(s.Issues, b.swimLaneMode)
 	}
 
-	// Build open-only blocking dependents index so closed/tombstone dependents
-	// and non-blocking hierarchy edges do not inflate ⚡→N.
-	b.rebuildBlocksIndex()
+	// Prefer snapshot-precomputed open-only blocking dependents index in O(1)
+	// so closed/tombstone dependents and non-blocking hierarchy edges do not inflate ⚡→N.
+	b.fullIssues = s.Issues
+	b.fullIssueMap = s.IssueMap
+	if s.BoardState != nil && s.BoardState.BlocksIndex != nil {
+		b.blocksIndex = s.BoardState.BlocksIndex
+		b.fullBlocksReady = len(s.Issues) > 0
+	} else {
+		b.fullBlocksReady = false
+		b.rebuildBlocksIndex()
+	}
 
 	// Use snapshot issue map for blocker titles.
 	b.issueMap = s.IssueMap
@@ -722,7 +761,9 @@ func (b *BoardModel) SetSnapshot(s *DataSnapshot) {
 
 	b.updateActiveColumns()
 	if prevSelectedID != "" {
-		b.SelectIssueByID(prevSelectedID)
+		if cur := b.SelectedIssue(); cur == nil || cur.ID != prevSelectedID {
+			b.SelectIssueByID(prevSelectedID)
+		}
 	}
 	b.expandedCardID = ""
 	if prevExpandedID != "" && b.containsIssueInColumns(prevExpandedID) {
