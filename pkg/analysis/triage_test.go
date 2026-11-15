@@ -3245,3 +3245,310 @@ func TestComputeStalenessAndAbandonedClaim_SkipParkedBeads(t *testing.T) {
 		t.Fatalf("expected abandoned_claim alert solely for UNPARKED-CLAIM, got %+v", activeAlerts)
 	}
 }
+
+func TestScopedInsightsAndTriageHealth_FilterNonCandidateCycles(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+
+	// Case 1: 1-hop non-candidate neighbor cycle (back-1 <-> back-2) blocks candidate front-1.
+	// Scoped to frontend candidates: pure non-candidate cycle must NOT leak into scoped insights or ProjectHealth.Graph.
+	neighborCycleOnly := []model.Issue{
+		{
+			ID:        "front-1",
+			Title:     "Frontend task",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			Labels:    []string{"frontend"},
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "front-1", DependsOnID: "back-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "back-1",
+			Title:     "Backend cycle A",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			Labels:    []string{"backend"},
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "back-1", DependsOnID: "back-2", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "back-2",
+			Title:     "Backend cycle B",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			Labels:    []string{"backend"},
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "back-2", DependsOnID: "back-1", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	candidates := map[string]bool{"front-1": true}
+	readiness := model.NewReadinessIndex(neighborCycleOnly)
+
+	anScoped := NewAnalyzer(neighborCycleOnly)
+	anScoped.SetReadinessScope(readiness, candidates)
+	stats := anScoped.AnalyzeAsync(context.Background())
+	stats.WaitForPhase2()
+
+	unscopedInsights := stats.GenerateInsights(10)
+	if len(unscopedInsights.Cycles) != 1 {
+		t.Fatalf("expected unscoped GenerateInsights to retain 1 cycle, got %v", unscopedInsights.Cycles)
+	}
+	scopedInsights := anScoped.GenerateScopedInsights(stats, 10, false)
+	if len(scopedInsights.Cycles) != 0 {
+		t.Fatalf("expected GenerateScopedInsights to exclude non-candidate cycle, got %v", scopedInsights.Cycles)
+	}
+
+	unscopedTriage := ComputeTriageWithOptionsAndTime(neighborCycleOnly, TriageOptions{WaitForPhase2: true}, now)
+	if !unscopedTriage.ProjectHealth.Graph.HasCycles || unscopedTriage.ProjectHealth.Graph.CycleCount != 1 {
+		t.Fatalf("expected unscoped triage GraphHealth to report 1 cycle, got %+v", unscopedTriage.ProjectHealth.Graph)
+	}
+
+	scopedTriage := ComputeTriageFromAnalyzer(anScoped, stats, neighborCycleOnly, TriageOptions{
+		WaitForPhase2: true,
+		CandidateIDs:  candidates,
+		Readiness:     readiness,
+	}, now)
+	if scopedTriage.ProjectHealth.Graph.HasCycles {
+		t.Fatalf("expected scoped triage GraphHealth.HasCycles=false for pure non-candidate cycle, got %+v", scopedTriage.ProjectHealth.Graph)
+	}
+	if scopedTriage.ProjectHealth.Graph.CycleCount != 0 {
+		t.Fatalf("expected scoped triage GraphHealth.CycleCount=0, got %+v", scopedTriage.ProjectHealth.Graph)
+	}
+
+	// Case 2 (positive control): add a candidate-touching cycle (front-2 <-> back-3).
+	withCandidateCycle := append(model.CloneIssues(neighborCycleOnly),
+		model.Issue{
+			ID:        "front-2",
+			Title:     "Frontend in cross-label cycle",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			Labels:    []string{"frontend"},
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "front-2", DependsOnID: "back-3", Type: model.DepBlocks},
+			},
+		},
+		model.Issue{
+			ID:        "back-3",
+			Title:     "Backend in cross-label cycle",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			Labels:    []string{"backend"},
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "back-3", DependsOnID: "front-2", Type: model.DepBlocks},
+			},
+		},
+	)
+	candidatesBoth := map[string]bool{"front-1": true, "front-2": true}
+	readinessBoth := model.NewReadinessIndex(withCandidateCycle)
+	anBoth := NewAnalyzer(withCandidateCycle)
+	anBoth.SetReadinessScope(readinessBoth, candidatesBoth)
+	statsBoth := anBoth.AnalyzeAsync(context.Background())
+	statsBoth.WaitForPhase2()
+
+	scopedBothInsights := anBoth.GenerateScopedInsights(statsBoth, 10, false)
+	if len(scopedBothInsights.Cycles) != 1 {
+		t.Fatalf("expected 1 candidate-touching cycle in scoped insights, got %v", scopedBothInsights.Cycles)
+	}
+	scopedBothTriage := ComputeTriageFromAnalyzer(anBoth, statsBoth, withCandidateCycle, TriageOptions{
+		WaitForPhase2: true,
+		CandidateIDs:  candidatesBoth,
+		Readiness:     readinessBoth,
+	}, now)
+	if !scopedBothTriage.ProjectHealth.Graph.HasCycles || scopedBothTriage.ProjectHealth.Graph.CycleCount != 1 {
+		t.Fatalf("expected scoped triage GraphHealth to report exactly 1 candidate-touching cycle, got %+v", scopedBothTriage.ProjectHealth.Graph)
+	}
+}
+
+func TestComputeTriageWithOptions_UnblockScopePreservesDownstreamUnblocks(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "BUG-1",
+			Title:     "Actionable blocker bug",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeBug,
+			Priority:  1,
+			CreatedAt: now.Add(-48 * time.Hour),
+			UpdatedAt: now.Add(-2 * time.Hour),
+		},
+		{
+			ID:        "BUG-SOLO",
+			Title:     "Standalone actionable bug",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeBug,
+			Priority:  1,
+			CreatedAt: now.Add(-48 * time.Hour),
+			UpdatedAt: now.Add(-2 * time.Hour),
+		},
+		{
+			ID:        "DOWN-1",
+			Title:     "Blocked downstream bug 1",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeBug,
+			Priority:  1,
+			CreatedAt: now.Add(-24 * time.Hour),
+			UpdatedAt: now.Add(-1 * time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "DOWN-1", DependsOnID: "BUG-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "DOWN-2",
+			Title:     "Blocked downstream bug 2",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeBug,
+			Priority:  1,
+			CreatedAt: now.Add(-24 * time.Hour),
+			UpdatedAt: now.Add(-1 * time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "DOWN-2", DependsOnID: "BUG-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "OUT-OF-RECIPE",
+			Title:     "Downstream chore outside recipe filter",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeChore,
+			Priority:  2,
+			CreatedAt: now.Add(-24 * time.Hour),
+			UpdatedAt: now.Add(-1 * time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "OUT-OF-RECIPE", DependsOnID: "BUG-1", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	candidates := map[string]bool{
+		"BUG-1":    true,
+		"BUG-SOLO": true,
+	}
+	unblockScope := map[string]bool{
+		"BUG-1":    true,
+		"BUG-SOLO": true,
+		"DOWN-1":   true,
+		"DOWN-2":   true,
+	}
+
+	triage := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		WaitForPhase2: true,
+		CandidateIDs:  candidates,
+		UnblockIDs:    unblockScope,
+		Readiness:     model.NewReadinessIndex(issues),
+	}, now)
+
+	if len(triage.Recommendations) != 2 {
+		t.Fatalf("expected exactly 2 recommendations (BUG-1 and BUG-SOLO), got %d: %+v", len(triage.Recommendations), triage.Recommendations)
+	}
+	for _, rec := range triage.Recommendations {
+		if rec.ID != "BUG-1" && rec.ID != "BUG-SOLO" {
+			t.Fatalf("non-candidate %s leaked into Recommendations: %+v", rec.ID, triage.Recommendations)
+		}
+	}
+	if triage.Recommendations[0].ID != "BUG-1" || triage.Recommendations[1].ID != "BUG-SOLO" {
+		t.Fatalf("expected BUG-1 ranked above BUG-SOLO, got [%s, %s]", triage.Recommendations[0].ID, triage.Recommendations[1].ID)
+	}
+	wantUnblocks := []string{"DOWN-1", "DOWN-2"}
+	if !reflect.DeepEqual(triage.Recommendations[0].UnblocksIDs, wantUnblocks) {
+		t.Fatalf("BUG-1.UnblocksIDs = %v, want %v", triage.Recommendations[0].UnblocksIDs, wantUnblocks)
+	}
+
+	// Verify Analyzer WhatIf simulation also honors UnblockScope while keeping top-level candidate eligibility on CandidateIDs.
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	an.SetReadinessScope(model.NewReadinessIndex(issues), candidates)
+	an.SetUnblockScope(unblockScope)
+	stats := an.Analyze()
+	if nonCand := an.ComputeWhatIf("DOWN-1", &stats); nonCand != nil {
+		t.Fatalf("expected ComputeWhatIf(DOWN-1) == nil when excluded from CandidateIDs, got %+v", nonCand)
+	}
+	bug1WhatIf := an.ComputeWhatIf("BUG-1", &stats)
+	if bug1WhatIf == nil {
+		t.Fatal("expected non-nil ComputeWhatIf(BUG-1)")
+	}
+	if bug1WhatIf.Delta.DirectUnblocks != 2 || !reflect.DeepEqual(bug1WhatIf.Delta.UnblockedIssueIDs, wantUnblocks) {
+		t.Fatalf("BUG-1 WhatIf delta = %+v, want DirectUnblocks=2 UnblockedIssueIDs=%v", bug1WhatIf.Delta, wantUnblocks)
+	}
+}
+
+func TestComputeTriageFromAnalyzer_VelocityIssuesConsistentWithAlerts(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	openIssue := model.Issue{
+		ID:        "OPEN-1",
+		Title:     "Active actionable work",
+		Status:    model.StatusOpen,
+		IssueType: model.TypeTask,
+		Priority:  1,
+		CreatedAt: now.Add(-48 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+	}
+
+	allIssues := []model.Issue{openIssue}
+	// Add 12 issues closed in prior 4 weeks (10..24 days ago -> avg 3.0/wk) and 0 closed in last 7 days.
+	for i := 0; i < 12; i++ {
+		closedAt := now.AddDate(0, 0, -(10 + i))
+		createdAt := closedAt.Add(-24 * time.Hour)
+		allIssues = append(allIssues, model.Issue{
+			ID:        fmt.Sprintf("CLOSED-%02d", i+1),
+			Title:     fmt.Sprintf("Historical closed %d", i+1),
+			Status:    model.StatusClosed,
+			IssueType: model.TypeTask,
+			Priority:  2,
+			CreatedAt: createdAt,
+			UpdatedAt: closedAt,
+			ClosedAt:  &closedAt,
+		})
+	}
+
+	candidates := map[string]bool{"OPEN-1": true}
+	readiness := model.NewReadinessIndex(allIssues)
+	an := NewAnalyzer(allIssues)
+	an.SetNow(now)
+	an.SetReadinessScope(readiness, candidates)
+	stats := an.AnalyzeAsync(context.Background())
+	stats.WaitForPhase2()
+
+	// Without VelocityIssues, candidateIssues contains only OPEN-1 -> 0 historical closures, no velocity_drop alert.
+	withoutVel := ComputeTriageFromAnalyzer(an, stats, allIssues, TriageOptions{
+		WaitForPhase2: true,
+		CandidateIDs:  candidates,
+		Readiness:     readiness,
+	}, now)
+	if withoutVel.ProjectHealth.Velocity != nil && withoutVel.ProjectHealth.Velocity.ClosedLast30Days != 0 {
+		t.Fatalf("expected 0 candidate closures without VelocityIssues, got %+v", withoutVel.ProjectHealth.Velocity)
+	}
+
+	// With VelocityIssues, ProjectHealth.Velocity and Alerts see the identical dataset in one pass.
+	withVel := ComputeTriageFromAnalyzer(an, stats, allIssues, TriageOptions{
+		WaitForPhase2:  true,
+		CandidateIDs:   candidates,
+		VelocityIssues: allIssues,
+		Readiness:      readiness,
+	}, now)
+	if withVel.ProjectHealth.Velocity == nil {
+		t.Fatal("expected non-nil ProjectHealth.Velocity")
+	}
+	if withVel.ProjectHealth.Velocity.ClosedLast30Days != 12 || withVel.ProjectHealth.Velocity.ClosedLast7Days != 0 {
+		t.Fatalf("unexpected ProjectHealth.Velocity: %+v", withVel.ProjectHealth.Velocity)
+	}
+
+	foundVelocityAlert := false
+	for _, alert := range withVel.Alerts {
+		if alert.Type == "velocity_drop" {
+			foundVelocityAlert = true
+			if !strings.Contains(alert.Message, "(0)") || !strings.Contains(alert.Message, "(3.0/wk)") {
+				t.Fatalf("unexpected velocity_drop message: %q", alert.Message)
+			}
+		}
+	}
+	if !foundVelocityAlert {
+		t.Fatalf("expected velocity_drop alert when VelocityIssues shows 3.0/wk -> 0/wk drop, got alerts=%+v", withVel.Alerts)
+	}
+}

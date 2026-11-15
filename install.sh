@@ -82,6 +82,75 @@ check_path_and_warn() {
 }
 
 INSTALL_DIR="$(default_install_dir)"
+TARGET_VERSION="${BV_VERSION:-}"
+FROM_SOURCE="${BV_FROM_SOURCE:-0}"
+
+normalize_release_tag() {
+    local raw="$1"
+    if [ -z "$raw" ]; then
+        return 1
+    fi
+    if [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+        raw="v${raw}"
+    fi
+    if [[ ! "$raw" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+        print_error "Invalid release version '$1' (expected tag like v0.26.1)" >&2
+        return 1
+    fi
+    printf '%s\n' "$raw"
+}
+
+usage() {
+    cat <<EOF
+Usage: install.sh [options]
+
+Options:
+  --version <tag>   Install a specific release tag (e.g. v0.26.0)
+  --from-source     Skip pre-built release binaries and build from source
+  -h, --help        Show this help message
+
+Environment:
+  INSTALL_DIR       Target directory for installed binary (default: auto-detected)
+  BV_VERSION        Same as --version <tag>
+  BV_FROM_SOURCE    Set to 1 to force building from source
+EOF
+}
+
+parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --version)
+                if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+                    print_error "--version requires a release tag argument (e.g. --version v0.26.0)" >&2
+                    return 2
+                fi
+                TARGET_VERSION=$(normalize_release_tag "$2") || return 2
+                shift 2
+                ;;
+            --version=*)
+                TARGET_VERSION=$(normalize_release_tag "${1#--version=}") || return 2
+                shift
+                ;;
+            --from-source)
+                FROM_SOURCE=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                print_error "Unknown option: $1" >&2
+                usage >&2
+                return 2
+                ;;
+        esac
+    done
+    if [ -n "$TARGET_VERSION" ]; then
+        TARGET_VERSION=$(normalize_release_tag "$TARGET_VERSION") || return 2
+    fi
+    return 0
+}
 
 print_info() { printf "\033[1;34m==>\033[0m %s\n" "$1"; }
 print_success() { printf "\033[1;32m==>\033[0m %s\n" "$1"; }
@@ -112,6 +181,19 @@ detect_platform() {
 
 get_latest_release() {
     local url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" 2>/dev/null || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$url" 2>/dev/null || return 1
+    else
+        return 1
+    fi
+}
+
+get_release_by_tag() {
+    local tag="$1"
+    local url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${tag}"
 
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL "$url" 2>/dev/null || return 1
@@ -403,6 +485,10 @@ is_tty() {
     [ -t 0 ] && [ -t 1 ]
 }
 
+has_controlling_tty() {
+    [ -t 2 ] && ( : </dev/tty >/dev/tty ) 2>/dev/null
+}
+
 # Select the checkout's exact compiler, with a security floor for older tags.
 # GOTOOLCHAIN is scoped to the build, so neither a user's `local` setting nor
 # a newer but vulnerable launcher can silently substitute a different version.
@@ -452,57 +538,63 @@ ensure_go() {
             printf '%s' "$go_version"
             return 0
         fi
-        print_warn "Go $min_version or later is required. Found: go$go_version"
+        print_warn "Go $min_version or later is required. Found: go$go_version" >&2
     else
-        print_warn "Go is not installed."
+        print_warn "Go is not installed." >&2
     fi
 
-    # Try to install/upgrade via Homebrew on macOS
+    # Try to install/upgrade via Homebrew on macOS. Note: ensure_go is invoked via
+    # command substitution go_version=$(ensure_go), so all diagnostics, prompts,
+    # and package-manager output must go to stderr (>&2) to keep stdout pure.
     if command -v brew >/dev/null 2>&1; then
-        if is_tty; then
-            printf "Install/upgrade Go via Homebrew now? [Y/n] "
-            read -r reply
+        if has_controlling_tty; then
+            printf "Install/upgrade Go via Homebrew now? [Y/n] " >&2
+            if ! read -r reply < /dev/tty; then
+                return 1
+            fi
             if [[ "$reply" =~ ^[Nn] ]]; then
                 return 1
             fi
         else
-            print_info "Attempting non-interactive install of Go via Homebrew..."
+            print_info "Attempting non-interactive install of Go via Homebrew..." >&2
         fi
 
-        if brew install go || brew upgrade go; then
+        if brew install go </dev/null >&2 || brew upgrade go </dev/null >&2; then
             go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
             if version_ge "$go_version" "$min_version"; then
-                print_success "Installed Go $go_version via Homebrew"
+                print_success "Installed Go $go_version via Homebrew" >&2
                 printf '%s' "$go_version"
                 return 0
             fi
         else
-            print_error "Homebrew installation of Go failed."
+            print_error "Homebrew installation of Go failed." >&2
         fi
     else
-        print_warn "Homebrew not found."
+        print_warn "Homebrew not found." >&2
     fi
 
     # Fallback: download official macOS pkg directly
     if [ "$(uname -s)" = "Darwin" ]; then
-        if is_tty; then
-            printf "Download and install the latest Go from go.dev now? [Y/n] "
-            read -r reply
+        if has_controlling_tty; then
+            printf "Download and install the latest Go from go.dev now? [Y/n] " >&2
+            if ! read -r reply < /dev/tty; then
+                return 1
+            fi
             if [[ "$reply" =~ ^[Nn] ]]; then
                 return 1
             fi
         else
-            print_info "Attempting non-interactive Go install via official pkg..."
+            print_info "Attempting non-interactive Go install via official pkg..." >&2
         fi
 
-        if install_go_from_pkg; then
+        if install_go_from_pkg </dev/null >&2; then
             # Try common locations before giving up (pkg installs to /usr/local/go/bin)
             local candidates=( "go" "/usr/local/go/bin/go" "/usr/local/bin/go" )
             for candidate in "${candidates[@]}"; do
                 if command -v "$candidate" >/dev/null 2>&1; then
                     go_version=$("$candidate" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
                     if [ -n "$go_version" ] && version_ge "$go_version" "$min_version"; then
-                        print_success "Detected Go $go_version after pkg install"
+                        print_success "Detected Go $go_version after pkg install" >&2
                         printf '%s' "$go_version"
                         return 0
                     fi
@@ -527,9 +619,13 @@ try_binary_install() {
         return 1
     fi
 
-    # Get latest release info
+    # Get release info (pinned tag when --version/BV_VERSION is set, else latest)
     local release_json
-    release_json=$(get_latest_release) || return 1
+    if [ -n "$TARGET_VERSION" ]; then
+        release_json=$(get_release_by_tag "$TARGET_VERSION") || return 1
+    else
+        release_json=$(get_latest_release) || return 1
+    fi
 
     local parsed version download_url asset_name
     parsed=$(printf '%s' "$release_json" | select_release_asset "$platform") || true
@@ -537,6 +633,11 @@ try_binary_install() {
     version=$(printf '%s' "$parsed" | sed -n '1p')
     download_url=$(printf '%s' "$parsed" | sed -n '2p')
     asset_name=$(printf '%s' "$parsed" | sed -n '3p')
+
+    if [ -n "$TARGET_VERSION" ] && [ -n "$version" ] && [ "${version#v}" != "${TARGET_VERSION#v}" ]; then
+        print_error "Release metadata reported tag $version, expected $TARGET_VERSION; refusing install"
+        exit 1
+    fi
 
     if [ -z "$download_url" ]; then
         print_warn "No pre-built binary found for $platform"
@@ -686,33 +787,59 @@ try_go_install() {
 
     print_info "Using Go $go_version to launch the source build"
 
-    local tmp_dir src_dir repo_url tarball_url tarball_path build_output fetched=0
+    local tmp_dir src_dir repo_url tarball_url tarball_path build_output fetched=0 used_main_tarball=0
     tmp_dir=$(make_tmp_dir)
     src_dir="$tmp_dir/src"
     repo_url="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
 
-    print_info "Fetching source..."
-
-    if command -v git >/dev/null 2>&1; then
-        if git clone --depth 1 "$repo_url" "$src_dir" >/dev/null 2>&1; then
-            fetched=1
-        else
-            print_warn "git clone failed, attempting tarball download..."
+    if [ -n "$TARGET_VERSION" ]; then
+        print_info "Fetching source for $TARGET_VERSION..."
+        if command -v git >/dev/null 2>&1; then
+            if git clone --depth 1 --branch "$TARGET_VERSION" "$repo_url" "$src_dir" >/dev/null 2>&1; then
+                fetched=1
+            else
+                print_warn "git clone for tag $TARGET_VERSION failed, attempting tag tarball download..."
+            fi
         fi
-    fi
-
-    if [ "$fetched" -ne 1 ]; then
-        tarball_url="https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/main"
-        tarball_path="$tmp_dir/source.tar.gz"
-        if ! download_file "$tarball_url" "$tarball_path"; then
-            print_error "Failed to download source tarball from GitHub."
-            exit 1
+        if [ "$fetched" -ne 1 ]; then
+            tarball_url="https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/tags/${TARGET_VERSION}"
+            tarball_path="$tmp_dir/source.tar.gz"
+            if ! download_file "$tarball_url" "$tarball_path"; then
+                print_error "Failed to download source tarball for tag $TARGET_VERSION from GitHub."
+                exit 1
+            fi
+            tar -xzf "$tarball_path" -C "$tmp_dir"
+            src_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -1)
+            if [ -z "$src_dir" ]; then
+                print_error "Could not locate extracted source directory."
+                exit 1
+            fi
         fi
-        tar -xzf "$tarball_path" -C "$tmp_dir"
-        src_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -1)
-        if [ -z "$src_dir" ]; then
-            print_error "Could not locate extracted source directory."
-            exit 1
+    else
+        print_info "Fetching source..."
+
+        if command -v git >/dev/null 2>&1; then
+            if git clone --depth 1 "$repo_url" "$src_dir" >/dev/null 2>&1; then
+                fetched=1
+            else
+                print_warn "git clone failed, attempting tarball download..."
+            fi
+        fi
+
+        if [ "$fetched" -ne 1 ]; then
+            tarball_url="https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/main"
+            tarball_path="$tmp_dir/source.tar.gz"
+            if ! download_file "$tarball_url" "$tarball_path"; then
+                print_error "Failed to download source tarball from GitHub."
+                exit 1
+            fi
+            tar -xzf "$tarball_path" -C "$tmp_dir"
+            src_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -1)
+            if [ -z "$src_dir" ]; then
+                print_error "Could not locate extracted source directory."
+                exit 1
+            fi
+            used_main_tarball=1
         fi
     fi
 
@@ -722,7 +849,26 @@ try_go_install() {
     fi
     print_info "Building $BIN_NAME from source with $toolchain..."
     build_output="$tmp_dir/$BIN_NAME"
-    if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN="$toolchain" go build -o "$build_output" "./cmd/$BIN_NAME"); then
+
+    local build_extra_args=()
+    if [ -n "$TARGET_VERSION" ]; then
+        build_extra_args=(-ldflags "-X github.com/${REPO_OWNER}/${REPO_NAME}/pkg/version.version=${TARGET_VERSION}")
+    elif [ "$used_main_tarball" -eq 1 ]; then
+        # A codeload main tarball lacks .git VCS metadata, so pkg/version.init()
+        # cannot append -dev+<sha>. Stamp -source explicitly so an unverified
+        # tarball build never impersonates a sealed release tag.
+        local base_ver="v0.0.0"
+        if [ -f "$src_dir/pkg/version/version.go" ]; then
+            local parsed_ver
+            parsed_ver=$(awk -F'"' '/^[[:space:]]*(const fallback|var Version)[[:space:]]*=/ {print $2; exit}' "$src_dir/pkg/version/version.go" 2>/dev/null || true)
+            if [ -n "$parsed_ver" ]; then
+                base_ver="${parsed_ver%%-*}"
+            fi
+        fi
+        build_extra_args=(-ldflags "-X github.com/${REPO_OWNER}/${REPO_NAME}/pkg/version.version=${base_ver}-source")
+    fi
+
+    if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN="$toolchain" go build -o "$build_output" ${build_extra_args[@]+"${build_extra_args[@]}"} "./cmd/$BIN_NAME"); then
         print_error "Go build failed."
         exit 1
     fi
@@ -746,7 +892,24 @@ try_go_install() {
 }
 
 main() {
-    print_info "Installing $BIN_NAME..."
+    parse_args "$@" || exit $?
+
+    if [ -n "$TARGET_VERSION" ]; then
+        print_info "Installing $BIN_NAME ($TARGET_VERSION)..."
+    else
+        print_info "Installing $BIN_NAME..."
+    fi
+
+    if [ "$FROM_SOURCE" = "1" ] || [ "$FROM_SOURCE" = "true" ]; then
+        print_info "Building from source (--from-source requested)..."
+        try_go_install
+        check_path_and_warn "$INSTALL_DIR"
+        print_info "Run '$BIN_NAME' in any beads project to view issues."
+        echo ""
+        echo "Tip: You can also install via Homebrew:"
+        echo "  brew install dicklesworthstone/tap/bv"
+        exit 0
+    fi
 
     local platform
     platform=$(detect_platform) || {

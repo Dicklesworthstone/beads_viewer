@@ -1323,6 +1323,10 @@ type Analyzer struct {
 	readinessOnce    sync.Once
 	readiness        *model.ReadinessIndex
 	candidateIDs     map[string]bool // nil = every analysis issue; empty = no candidates
+	unblockIDs       map[string]bool // optional wider downstream-unblock scope (nil = candidateIDs)
+	unlockOnce       sync.Once
+	unlockFrontiers  map[string][]string
+	extParentLinked  []string
 
 	// now is the reference instant for time-gated readiness and scoring.
 	// Defaults to wall-clock time at construction; robot entrypoints with a
@@ -1378,6 +1382,28 @@ func (a *Analyzer) IsCandidate(id string) bool {
 // HasCandidateScope reports whether an explicit candidate scope filter is active.
 func (a *Analyzer) HasCandidateScope() bool {
 	return a != nil && a.candidateIDs != nil
+}
+
+// SetUnblockScope sets an optional downstream-unblock eligibility map used when
+// simulating which dependents become actionable after completing a candidate
+// (for example, --recipe actionable or max_items where blocked dependents were
+// excluded from top-level CandidateIDs). Nil falls back to IsCandidate.
+func (a *Analyzer) SetUnblockScope(ids map[string]bool) {
+	if a != nil {
+		a.unblockIDs = ids
+	}
+}
+
+// IsUnblockCandidate reports whether id may be credited as newly unblocked in
+// downstream completion simulations.
+func (a *Analyzer) IsUnblockCandidate(id string) bool {
+	if a == nil {
+		return true
+	}
+	if a.unblockIDs != nil {
+		return a.unblockIDs[id]
+	}
+	return a.IsCandidate(id)
 }
 
 // SetNow overrides the reference instant used for time-gated readiness checks
@@ -2071,7 +2097,7 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 			}
 		} else {
 			incCacheKey = a.graphStructureHash()
-			if config.ComputeCycles {
+			if config.ComputeCycles || config.ComputeCriticalPath || config.ComputeSlack {
 				incCacheKey += "|cycles:" + a.cycleEligibilityHash()
 			}
 			incCacheKey += "|" + configHash
@@ -2517,6 +2543,42 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 		metrics.HITSCompute.Record(profile.HITS)
 	}
 
+	// When the full graph contains a cycle involving closed/tombstoned issues,
+	// stats.TopologicalOrder is empty (preserving cache invariants), yet the
+	// active blocking subgraph may still be a valid DAG. Compute activeGraph and
+	// its topological ordering once so Critical Path, Cycles, and Slack share it.
+	var (
+		activeGraph      directedGraph
+		activeSorted     []graph.Node
+		activeTopoTried  bool
+		activeTopoFailed bool
+	)
+	ensureActiveTopo := func() {
+		if activeTopoTried {
+			return
+		}
+		activeTopoTried = true
+		if activeGraph == nil {
+			activeGraph = a.activeCycleGraph()
+		}
+		sorted, err := topo.Sort(activeGraph)
+		if err != nil {
+			activeTopoFailed = true
+			return
+		}
+		filtered := make([]graph.Node, 0, len(sorted))
+		for _, n := range sorted {
+			id, ok := a.nodeToID[n.ID()]
+			if !ok {
+				continue
+			}
+			if iss, exists := a.issueMap[id]; exists && !isClosedLikeStatus(iss.Status) {
+				filtered = append(filtered, n)
+			}
+		}
+		activeSorted = filtered
+	}
+
 	// Critical Path
 	if ctx.Err() == nil && config.ComputeCriticalPath {
 		cpStart := time.Now()
@@ -2534,7 +2596,12 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 			}
 			localCriticalPath = a.computeHeights(sorted)
 		} else {
-			criticalPathUnavailableReason = "dependency graph contains a cycle; topological order unavailable"
+			ensureActiveTopo()
+			if !activeTopoFailed {
+				localCriticalPath = a.computeHeightsOnGraph(activeGraph, activeSorted)
+			} else {
+				criticalPathUnavailableReason = "dependency graph contains a cycle; topological order unavailable"
+			}
 		}
 		profile.CriticalPath = time.Since(cpStart)
 	}
@@ -2547,7 +2614,10 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 			maxCycles = 100
 		}
 
-		cycleGraph := a.activeCycleGraph()
+		if activeGraph == nil {
+			activeGraph = a.activeCycleGraph()
+		}
+		cycleGraph := activeGraph
 		sccs := topo.TarjanSCC(cycleGraph)
 		hasCycles := false
 		for _, scc := range sccs {
@@ -2632,7 +2702,20 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 		if len(stats.TopologicalOrder) == len(a.issueMap) {
 			localSlack = a.computeSlack(stats.TopologicalOrder)
 		} else {
-			slackUnavailableReason = "dependency graph contains a cycle; topological order unavailable"
+			ensureActiveTopo()
+			if !activeTopoFailed {
+				if len(activeSorted) == 0 {
+					localSlack = map[string]float64{}
+				} else {
+					activeOrderIDs := make([]string, 0, len(activeSorted))
+					for i := len(activeSorted) - 1; i >= 0; i-- {
+						activeOrderIDs = append(activeOrderIDs, a.nodeToID[activeSorted[i].ID()])
+					}
+					localSlack = a.computeSlackOnGraph(activeGraph, activeOrderIDs)
+				}
+			} else {
+				slackUnavailableReason = "dependency graph contains a cycle; topological order unavailable"
+			}
 		}
 		profile.Slack = time.Since(slackStart)
 	}
@@ -2825,6 +2908,10 @@ func (a *Analyzer) computePhase2(ctx context.Context, stats *GraphStats, config 
 }
 
 func (a *Analyzer) computeHeights(sorted []graph.Node) map[string]float64 {
+	return a.computeHeightsOnGraph(a.g, sorted)
+}
+
+func (a *Analyzer) computeHeightsOnGraph(g directedGraph, sorted []graph.Node) map[string]float64 {
 	heights := make(map[int64]float64)
 	impactScores := make(map[string]float64)
 
@@ -2832,7 +2919,7 @@ func (a *Analyzer) computeHeights(sorted []graph.Node) map[string]float64 {
 		nid := n.ID()
 		maxParentHeight := 0.0
 
-		to := a.g.To(nid)
+		to := g.To(nid)
 		for to.Next() {
 			p := to.Node()
 			if h, ok := heights[p.ID()]; ok {
@@ -2935,6 +3022,10 @@ func (a *Analyzer) computeCoreAndArticulation() (map[string]int, map[string]bool
 // computeSlack calculates longest-path slack per node (0 on critical path).
 // Edges are interpreted in execution order (prereq -> dependent), i.e., reversed from the stored direction.
 func (a *Analyzer) computeSlack(order []string) map[string]float64 {
+	return a.computeSlackOnGraph(a.g, order)
+}
+
+func (a *Analyzer) computeSlackOnGraph(g directedGraph, order []string) map[string]float64 {
 	if len(a.issueMap) == 0 {
 		return nil
 	}
@@ -2966,7 +3057,7 @@ func (a *Analyzer) computeSlack(order []string) map[string]float64 {
 	size := maxNode + 1
 	prereqs := make([][]int, size)
 	for _, node := range nodeOrder {
-		from := a.g.From(int64(node))
+		from := g.From(int64(node))
 		for from.Next() {
 			prereqs[node] = append(prereqs[node], int(from.Node().ID()))
 		}
@@ -3187,8 +3278,9 @@ func (a *Analyzer) GetActionableIssues() []model.Issue {
 // sorting IDs or cloning issue bodies for consumers that only need a count.
 func (a *Analyzer) CountActionableIssues() int {
 	count := 0
+	readiness := a.Readiness()
 	for id := range a.issueMap {
-		if a.isActionableAfterCompletions(id, nil) {
+		if a.IsCandidate(id) && readiness.Ready(id, a.now) {
 			count++
 		}
 	}
@@ -3211,13 +3303,119 @@ func (a *Analyzer) getActionableIssuesAfterCompletions(completed map[string]bool
 
 	var actionable []model.Issue
 	readiness := a.Readiness()
+	hasCompleted := len(completed) > 0
 	for _, id := range ids {
-		if a.IsCandidate(id) && readiness.ReadyAfter(id, a.now, completed) {
+		eligible := a.IsCandidate(id) || (hasCompleted && a.IsUnblockCandidate(id) && !readiness.Ready(id, a.now))
+		if eligible && readiness.ReadyAfter(id, a.now, completed) {
 			actionable = append(actionable, a.issueMap[id])
 		}
 	}
 
 	return actionable
+}
+
+// directUnlockFrontier returns the sorted, deduplicated set of in-graph issue IDs
+// whose readiness can transition from false to true when issueID completes in a
+// single step (direct blocking dependents, hierarchy children, and transitive
+// hierarchy descendants, plus any issues linked to external out-of-graph parents).
+func (a *Analyzer) directUnlockFrontier(issueID string) []string {
+	a.unlockOnce.Do(func() {
+		a.unlockFrontiers = make(map[string][]string, len(a.issueMap))
+		extRoots := make(map[string]bool)
+		for id, issue := range a.issueMap {
+			for _, dep := range issue.Dependencies {
+				if dep != nil && dep.Type == model.DepParentChild {
+					if _, inGraph := a.issueMap[dep.DependsOnID]; !inGraph {
+						extRoots[id] = true
+					}
+				}
+			}
+		}
+		if len(extRoots) > 0 {
+			queue := make([]string, 0, len(extRoots))
+			for id := range extRoots {
+				queue = append(queue, id)
+			}
+			for len(queue) > 0 {
+				curr := queue[0]
+				queue = queue[1:]
+				for _, childID := range a.childrenByParent[curr] {
+					if !extRoots[childID] {
+						extRoots[childID] = true
+						queue = append(queue, childID)
+					}
+				}
+			}
+			a.extParentLinked = make([]string, 0, len(extRoots))
+			for id := range extRoots {
+				a.extParentLinked = append(a.extParentLinked, id)
+			}
+			sort.Strings(a.extParentLinked)
+		}
+
+		for id, nodeID := range a.idToNode {
+			seen := make(map[string]bool)
+			var queue []string
+			dependents := a.g.To(nodeID)
+			for dependents.Next() {
+				depID := a.nodeToID[dependents.Node().ID()]
+				if !seen[depID] {
+					seen[depID] = true
+					queue = append(queue, depID)
+				}
+			}
+			for _, childID := range a.childrenByParent[id] {
+				if !seen[childID] {
+					seen[childID] = true
+					queue = append(queue, childID)
+				}
+			}
+			for len(queue) > 0 {
+				curr := queue[0]
+				queue = queue[1:]
+				for _, childID := range a.childrenByParent[curr] {
+					if !seen[childID] {
+						seen[childID] = true
+						queue = append(queue, childID)
+					}
+				}
+			}
+			if len(seen) == 0 {
+				continue
+			}
+			out := make([]string, 0, len(seen))
+			for candID := range seen {
+				out = append(out, candID)
+			}
+			sort.Strings(out)
+			a.unlockFrontiers[id] = out
+		}
+	})
+	base := a.unlockFrontiers[issueID]
+	if len(a.extParentLinked) == 0 {
+		return base
+	}
+	if len(base) == 0 {
+		return a.extParentLinked
+	}
+	merged := make([]string, 0, len(base)+len(a.extParentLinked))
+	i, j := 0, 0
+	for i < len(base) && j < len(a.extParentLinked) {
+		if base[i] == a.extParentLinked[j] {
+			merged = append(merged, base[i])
+			i++
+			j++
+		} else if base[i] < a.extParentLinked[j] {
+			merged = append(merged, base[i])
+			i++
+		} else {
+			merged = append(merged, a.extParentLinked[j])
+			j++
+		}
+	}
+	merged = append(merged, base[i:]...)
+	merged = append(merged, a.extParentLinked[j:]...)
+	return merged
 }
 
 // ParentsWithOpenChildren returns the set of issue IDs that are a parent (via a

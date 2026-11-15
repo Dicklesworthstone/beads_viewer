@@ -321,3 +321,51 @@ func TestDefaultIndexPath_ModelSlug(t *testing.T) {
 		t.Fatalf("model 'org/v1' collided with literal slug model %q at %q", literalSlug, slashModelPath)
 	}
 }
+
+func TestIndexPathForScope(t *testing.T) {
+	projectDir := filepath.Join(t.TempDir(), "proj")
+	expectedDir := filepath.Join(projectDir, ".bv", "semantic")
+	baseCfg := EmbeddingConfig{Provider: ProviderHash, Dim: 384}
+	modelCfg := EmbeddingConfig{Provider: ProviderHash, Model: "org/embed-v2", Dim: 512}
+
+	// Empty and whitespace scope keys must preserve DefaultIndexPath bit-for-bit.
+	for _, cfg := range []EmbeddingConfig{baseCfg, modelCfg} {
+		want := DefaultIndexPath(projectDir, cfg)
+		for _, emptyScope := range []string{"", "   ", "\t\n"} {
+			if got := IndexPathForScope(projectDir, cfg, emptyScope); got != want {
+				t.Fatalf("IndexPathForScope(%q) = %q, want DefaultIndexPath %q", emptyScope, got, want)
+			}
+		}
+	}
+
+	scopeA := IndexPathForScope(projectDir, baseCfg, "workspace:/repo/.bv/workspace.yaml")
+	scopeARepeat := IndexPathForScope(projectDir, baseCfg, "  workspace:/repo/.bv/workspace.yaml  ")
+	scopeB := IndexPathForScope(projectDir, baseCfg, "db:/custom/beads.db")
+	scopeGit := IndexPathForScope(projectDir, baseCfg, "as-of:HEAD~3")
+	scopeModel := IndexPathForScope(projectDir, modelCfg, "db:/custom/beads.db")
+
+	if scopeA != scopeARepeat {
+		t.Fatalf("expected trimmed scope key determinism: %q != %q", scopeA, scopeARepeat)
+	}
+	seen := map[string]string{
+		DefaultIndexPath(projectDir, baseCfg):  "default-base",
+		DefaultIndexPath(projectDir, modelCfg): "default-model",
+	}
+	for label, p := range map[string]string{
+		"scopeA":     scopeA,
+		"scopeB":     scopeB,
+		"scopeGit":   scopeGit,
+		"scopeModel": scopeModel,
+	} {
+		if filepath.Dir(p) != expectedDir {
+			t.Fatalf("%s escaped semantic dir: got %q, want %q", label, filepath.Dir(p), expectedDir)
+		}
+		if !strings.HasSuffix(p, ".bvvi") {
+			t.Fatalf("%s missing .bvvi extension: %q", label, p)
+		}
+		if prev, exists := seen[p]; exists {
+			t.Fatalf("%s collided with %s at %q", label, prev, p)
+		}
+		seen[p] = label
+	}
+}

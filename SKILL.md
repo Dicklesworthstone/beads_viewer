@@ -108,7 +108,7 @@ bv --robot-suggest                     # Hygiene: duplicates, missing deps, cycl
 bv --robot-graph                       # Dependency graph export (JSON, DOT, Mermaid)
 bv --robot-capabilities                # Machine-readable command/flag/env/schema discovery
 bv --robot-schema                      # JSON Schema definitions for all robot commands
-bv --export-graph graph.html           # Self-contained interactive HTML visualization
+bv --export-graph graph.html           # Self-contained interactive HTML (or .svg / .png snapshot)
 ```
 
 ## Scoping & Filtering
@@ -268,7 +268,7 @@ bv --robot-graph                              # JSON (default)
 bv --robot-graph --graph-format=dot | jq -r .graph      # Extract Graphviz DOT from JSON
 bv --robot-graph --graph-format=mermaid | jq -r .graph  # Extract Mermaid from JSON
 bv --robot-graph --graph-root=bd-123 --graph-depth=3  # Subgraph
-bv --export-graph report.html                 # Interactive HTML
+bv --export-graph report.html                 # Interactive HTML (or .svg / .png static snapshot)
 ```
 
 For JSON graphs, `.nodes` and `.edges` are counts. Records are in `.adjacency.nodes` and `.adjacency.edges`; an empty result may omit `.adjacency`.

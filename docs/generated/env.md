@@ -22,7 +22,7 @@
 | `BV_NO_BROWSER` | Any value: never open a browser after exports or deployments. | (unset) |
 | `BV_NO_CACHE` | Set to `1` to bypass the robot analysis and correlation disk caches (`--no-cache` sets it). | (cache on) |
 | `BV_NO_GITIGNORE` | Disable automatic ignore-file management for `.bv/` entirely (any non-empty value). See [Automatic `.bv/` ignore handling](#automatic-bv-ignore-handling). | (enabled) |
-| `BV_NO_SAVED_CONFIG` | Any value: the `--pages` wizard ignores the saved deployment configuration. | (unset) |
+| `BV_NO_SAVED_CONFIG` | Any non-empty value disables saved deployment configuration (`--pages`), user-level saved preferences, and user recipe defaults unless explicitly specified. | (unset) |
 | `BV_NO_UPDATE_CHECK` | Skip the TUI's startup release check with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` enables it. Nonempty values override `updates.check` in user config (case-insensitive, trimmed); invalid values skip the check, and empty values preserve config. Explicit `--check-update` / `--update` still work. | (check on) |
 | `BV_OUTPUT_FORMAT` | Default robot output format: `json` or `toon` (overridden by `--format`). | `json` |
 | `BV_PHASE2_TIMEOUT_S` | Override per-metric Phase 2 timeouts (seconds). | (size-based) |

@@ -480,7 +480,7 @@ func TestSuggestRepoName_EdgeCases(t *testing.T) {
 }
 
 func TestVerifyGitHubPagesDeployment_IssueCountMismatchReturnsError(t *testing.T) {
-	requireCurl(t)
+	t.Setenv("PATH", "")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
@@ -500,7 +500,7 @@ func TestVerifyGitHubPagesDeployment_IssueCountMismatchReturnsError(t *testing.T
 }
 
 func TestVerifyGitHubPagesDeployment_ZeroIssueCountMismatchReturnsError(t *testing.T) {
-	requireCurl(t)
+	t.Setenv("PATH", "")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
@@ -520,7 +520,7 @@ func TestVerifyGitHubPagesDeployment_ZeroIssueCountMismatchReturnsError(t *testi
 }
 
 func TestVerifyGitHubPagesDeployment_Success(t *testing.T) {
-	requireCurl(t)
+	t.Setenv("PATH", "")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
@@ -532,6 +532,64 @@ func TestVerifyGitHubPagesDeployment_Success(t *testing.T) {
 
 	if err := VerifyGitHubPagesDeployment(server.URL, 2, time.Second); err != nil {
 		t.Fatalf("VerifyGitHubPagesDeployment returned error: %v", err)
+	}
+}
+
+func TestEnableGitHubPagesArgsAndPreviewServerWithConfig(t *testing.T) {
+	args := enableGitHubPagesArgs("octo/demo-pages")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"api repos/octo/demo-pages/pages",
+		"-X POST",
+		"-f build_type=workflow",
+		"-f source[branch]=main",
+		"-f source[path]=/",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("enableGitHubPagesArgs missing %q in %v", want, args)
+		}
+	}
+
+	bundleDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundleDir, "index.html"), []byte("<!doctype html><html><body>ok</body></html>"), 0o644); err != nil {
+		t.Fatalf("WriteFile index.html: %v", err)
+	}
+	cfg := DefaultPreviewConfig()
+	cfg.BundlePath = bundleDir
+	cfg.Port = 0
+	cfg.OpenBrowser = false
+	cfg.Quiet = true
+
+	srv := NewPreviewServerWithConfig(cfg)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Start()
+	}()
+	t.Cleanup(func() {
+		_ = srv.Stop()
+		select {
+		case <-errCh:
+		case <-time.After(2 * time.Second):
+		}
+	})
+
+	var statusOK bool
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.Port() > 0 {
+			resp, err := http.Get(srv.URL() + LiveReloadScriptPath)
+			if err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					statusOK = true
+					break
+				}
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !statusOK {
+		t.Fatalf("NewPreviewServerWithConfig(DefaultPreviewConfig()) did not expose live-reload script endpoint")
 	}
 }
 

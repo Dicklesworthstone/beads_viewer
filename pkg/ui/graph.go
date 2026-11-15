@@ -326,6 +326,22 @@ func (g *GraphModel) MoveDown() {
 func (g *GraphModel) MoveLeft()  { g.MoveUp() }
 func (g *GraphModel) MoveRight() { g.MoveDown() }
 
+func (g *GraphModel) MoveToStart() {
+	if len(g.sortedIDs) == 0 {
+		return
+	}
+	g.selectedIdx = 0
+	g.ensureVisible()
+}
+
+func (g *GraphModel) MoveToEnd() {
+	if len(g.sortedIDs) == 0 {
+		return
+	}
+	g.selectedIdx = len(g.sortedIDs) - 1
+	g.ensureVisible()
+}
+
 func (g *GraphModel) PageUp() {
 	g.selectedIdx -= 10
 	if g.selectedIdx < 0 {

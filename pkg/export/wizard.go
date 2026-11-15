@@ -859,7 +859,10 @@ func (w *Wizard) OfferPreview() (string, error) {
 		return "", fmt.Errorf("could not find available port: %w", err)
 	}
 
-	server := NewPreviewServer(w.bundlePath, port)
+	previewCfg := DefaultPreviewConfig()
+	previewCfg.BundlePath = w.bundlePath
+	previewCfg.Port = port
+	server := NewPreviewServerWithConfig(previewCfg)
 
 	// Start server in goroutine
 	errChan := make(chan error, 1)

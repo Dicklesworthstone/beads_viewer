@@ -1097,27 +1097,57 @@ INSERT INTO dependencies VALUES ('api-safe', 'web-gone', 'blocks'), ('api-unknow
 	}
 }
 
+func stripDownstreamUnblockFields(v any) any {
+	switch typed := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for k, child := range typed {
+			switch k {
+			case "unblocks_ids", "unblocks", "unblocked_issues", "unblocked_issue_ids", "enabled_tracks":
+				continue
+			default:
+				out[k] = stripDownstreamUnblockFields(child)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, child := range typed {
+			out[i] = stripDownstreamUnblockFields(child)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 func TestRobotScoping_LabelRecipeRepoHonouredByEveryCommand(t *testing.T) {
 	bv := buildBvBinary(t)
 	repoDir := t.TempDir()
-	// api-1 (backend, open, unblocked) blocks api-2 (backend); web-9 (frontend, open).
+	// api-1 (backend, open, unblocked) blocks api-2 (backend, open, blocked by api-1);
+	// api-closed (backend, closed) and api-parked (backend, deferred) are non-actionable
+	// backend issues NOT unblocked by api-1; web-9 (frontend, open) is out of label/repo.
 	writeIssuesJSONL(t, repoDir, strings.Join([]string{
 		`{"id":"api-1","title":"Backend root","status":"open","issue_type":"task","priority":1,"labels":["backend"],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}`,
 		`{"id":"api-2","title":"Backend follow-up","status":"open","issue_type":"task","priority":2,"labels":["backend"],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z","dependencies":[{"issue_id":"api-2","depends_on_id":"api-1","type":"blocks"}]}`,
+		`{"id":"api-closed","title":"Backend closed","status":"closed","issue_type":"task","priority":2,"labels":["backend"],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z","closed_at":"2026-08-02T00:00:00Z"}`,
+		`{"id":"api-parked","title":"Backend deferred","status":"deferred","issue_type":"task","priority":2,"labels":["backend"],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}`,
 		`{"id":"web-9","title":"Frontend only","status":"open","issue_type":"task","priority":2,"labels":["frontend"],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}`,
 	}, "\n")+"\n")
 	// The repo filter also honours source_repo; ids carry the api-/web- prefixes.
 
 	cases := []struct {
-		name       string
-		flags      []string
-		scopeKey   string
-		scopeValue string
-		excluded   string // an issue id that must not appear anywhere in the payload
+		name               string
+		flags              []string
+		scopeKey           string
+		scopeValue         string
+		rawExcluded        []string // issue ids that must not appear anywhere in raw stdout
+		candidateExcluded  []string // issue ids that must not appear as candidates (may appear in downstream unblock fields)
+		expectApi2Unblocks bool
 	}{
-		{"label", []string{"--label", "backend"}, "label", "backend", "web-9"},
-		{"recipe", []string{"--recipe", "actionable"}, "recipe", "actionable", "api-2"},
-		{"repo", []string{"--repo", "api"}, "repo", "api", "web-9"},
+		{"label", []string{"--label", "backend"}, "label", "backend", []string{"web-9"}, nil, false},
+		{"recipe", []string{"--recipe", "actionable"}, "recipe", "actionable", []string{"api-closed", "api-parked"}, []string{"api-2"}, true},
+		{"repo", []string{"--repo", "api"}, "repo", "api", []string{"web-9"}, nil, false},
 	}
 
 	commands := loadCapabilities(t, bv)
@@ -1146,8 +1176,34 @@ func TestRobotScoping_LabelRecipeRepoHonouredByEveryCommand(t *testing.T) {
 			if !ok || scope[tc.scopeKey] != tc.scopeValue {
 				t.Errorf("%s with %v: envelope scope = %v, want %s=%s", c.Name, tc.flags, scope, tc.scopeKey, tc.scopeValue)
 			}
-			if strings.Contains(r.stdout, `"`+tc.excluded+`"`) {
-				t.Errorf("%s with %v: payload mentions out-of-scope issue %s:\n%s", c.Name, tc.flags, tc.excluded, truncate(r.stdout, 800))
+			for _, excluded := range tc.rawExcluded {
+				if strings.Contains(r.stdout, `"`+excluded+`"`) {
+					t.Errorf("%s with %v: payload mentions out-of-scope issue %s:\n%s", c.Name, tc.flags, excluded, truncate(r.stdout, 800))
+				}
+			}
+			if len(tc.candidateExcluded) > 0 {
+				var generic any
+				if err := json.Unmarshal([]byte(r.stdout), &generic); err != nil {
+					t.Fatalf("%s with %v: json unmarshal: %v", c.Name, tc.flags, err)
+				}
+				strippedBytes, err := json.Marshal(stripDownstreamUnblockFields(generic))
+				if err != nil {
+					t.Fatalf("%s with %v: json marshal stripped: %v", c.Name, tc.flags, err)
+				}
+				stripped := string(strippedBytes)
+				for _, candExcl := range tc.candidateExcluded {
+					if strings.Contains(stripped, `"`+candExcl+`"`) {
+						t.Errorf("%s with %v: payload leaks non-candidate issue %s outside downstream unblock fields:\n%s", c.Name, tc.flags, candExcl, truncate(stripped, 800))
+					}
+				}
+			}
+			if tc.expectApi2Unblocks {
+				switch c.Name {
+				case "robot-triage", "robot-plan", "robot-whatif", "robot-insights":
+					if !strings.Contains(r.stdout, `"api-2"`) {
+						t.Errorf("%s with %v: erased downstream unblock impact api-2 for actionable blocker api-1:\n%s", c.Name, tc.flags, truncate(r.stdout, 800))
+					}
+				}
 			}
 			covered++
 		}
@@ -1295,4 +1351,120 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+func TestWave13_RecipeScopingTopologyVelocityAndForecast(t *testing.T) {
+	bv := buildBvBinary(t)
+	dir := t.TempDir()
+	// Pinned SOURCE_DATE_EPOCH = 2026-08-15T00:00:00Z (1786752000).
+	t.Setenv("SOURCE_DATE_EPOCH", "1786752000")
+
+	writeIssuesJSONL(t, dir, strings.Join([]string{
+		`{"id":"OUTER-CLOSED","title":"Closed frontend prereq","status":"closed","issue_type":"task","priority":1,"labels":["frontend"],"estimated_minutes":120,"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-10T00:00:00Z","closed_at":"2026-08-10T00:00:00Z"}`,
+		`{"id":"A","title":"Backend root","status":"open","issue_type":"bug","priority":1,"labels":["backend","bug"],"estimated_minutes":60,"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-12T00:00:00Z","dependencies":[{"issue_id":"A","depends_on_id":"OUTER-CLOSED","type":"blocks"}]}`,
+		`{"id":"B","title":"Backend middle","status":"open","issue_type":"bug","priority":2,"labels":["backend","bug"],"estimated_minutes":60,"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-12T00:00:00Z","dependencies":[{"issue_id":"B","depends_on_id":"A","type":"blocks"}]}`,
+		`{"id":"C","title":"Backend leaf","status":"open","issue_type":"task","priority":2,"labels":["backend"],"estimated_minutes":60,"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-12T00:00:00Z","dependencies":[{"issue_id":"C","depends_on_id":"B","type":"blocks"}]}`,
+		`{"id":"CLOSED-BUG","title":"Closed backend bug","status":"closed","issue_type":"bug","priority":1,"labels":["backend","bug"],"estimated_minutes":60,"created_at":"2026-08-05T00:00:00Z","updated_at":"2026-08-13T00:00:00Z","closed_at":"2026-08-13T00:00:00Z"}`,
+		`{"id":"CLOSED-FEAT","title":"Closed backend feature","status":"closed","issue_type":"feature","priority":2,"labels":["backend","feature"],"estimated_minutes":60,"created_at":"2026-08-05T00:00:00Z","updated_at":"2026-08-14T00:00:00Z","closed_at":"2026-08-14T00:00:00Z"}`,
+	}, "\n")+"\n")
+
+	bugsRecipe := filepath.Join(dir, "bugs-only.yaml")
+	if err := os.WriteFile(bugsRecipe, []byte("name: bugs-only\nfilters:\n  status: [open, in_progress]\n  actionable: true\n  tags: [bug]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. --label backend --recipe actionable:
+	// - A unblocks B (downstream backend issue), transitive unblocks {B, C}
+	// - Velocity counts CLOSED-BUG and CLOSED-FEAT (2 backend closures in last 7d), NOT OUTER-CLOSED (1-hop frontend context)!
+	triageRes := runScoped(t, bv, dir, "--robot-triage", "--label", "backend", "--recipe", "actionable")
+	if triageRes.exit != nil {
+		t.Fatalf("robot-triage failed: %v\n%s%s", triageRes.exit, triageRes.stdout, triageRes.stderr)
+	}
+	var triagePayload struct {
+		Triage struct {
+			Recommendations []struct {
+				ID          string   `json:"id"`
+				UnblocksIDs []string `json:"unblocks_ids"`
+			} `json:"recommendations"`
+			ProjectHealth struct {
+				Velocity struct {
+					ClosedLast7Days  int `json:"closed_last_7_days"`
+					ClosedLast30Days int `json:"closed_last_30_days"`
+				} `json:"velocity"`
+			} `json:"project_health"`
+		} `json:"triage"`
+	}
+	if err := json.Unmarshal([]byte(triageRes.stdout), &triagePayload); err != nil {
+		t.Fatalf("unmarshal triage: %v", err)
+	}
+	if len(triagePayload.Triage.Recommendations) != 1 || triagePayload.Triage.Recommendations[0].ID != "A" {
+		t.Fatalf("expected sole candidate A, got %+v", triagePayload.Triage.Recommendations)
+	}
+	if !slices.Equal(triagePayload.Triage.Recommendations[0].UnblocksIDs, []string{"B"}) {
+		t.Errorf("expected A unblocks_ids=[B] under --recipe actionable, got %v", triagePayload.Triage.Recommendations[0].UnblocksIDs)
+	}
+	if triagePayload.Triage.ProjectHealth.Velocity.ClosedLast7Days != 2 || triagePayload.Triage.ProjectHealth.Velocity.ClosedLast30Days != 2 {
+		t.Errorf("expected velocity Closed7=2 Closed30=2 (excluding 1-hop OUTER-CLOSED), got %+v", triagePayload.Triage.ProjectHealth.Velocity)
+	}
+
+	// 2. --recipe bugs-only:
+	// - A unblocks B (has bug tag), does NOT credit C in domain-restricted WhatIf/unblock scope
+	// - Velocity counts ONLY CLOSED-BUG (1 closure), excluding CLOSED-FEAT and OUTER-CLOSED!
+	bugsTriageRes := runScoped(t, bv, dir, "--robot-triage", "--recipe", bugsRecipe)
+	if bugsTriageRes.exit != nil {
+		t.Fatalf("robot-triage bugs-only failed: %v\n%s%s", bugsTriageRes.exit, bugsTriageRes.stdout, bugsTriageRes.stderr)
+	}
+	if err := json.Unmarshal([]byte(bugsTriageRes.stdout), &triagePayload); err != nil {
+		t.Fatalf("unmarshal bugs-only triage: %v", err)
+	}
+	if !slices.Equal(triagePayload.Triage.Recommendations[0].UnblocksIDs, []string{"B"}) {
+		t.Errorf("expected A unblocks_ids=[B] under bugs-only, got %v", triagePayload.Triage.Recommendations[0].UnblocksIDs)
+	}
+	if triagePayload.Triage.ProjectHealth.Velocity.ClosedLast7Days != 1 || triagePayload.Triage.ProjectHealth.Velocity.ClosedLast30Days != 1 {
+		t.Errorf("expected bugs-only velocity Closed7=1 Closed30=1 (CLOSED-BUG only), got %+v", triagePayload.Triage.ProjectHealth.Velocity)
+	}
+
+	// WhatIf on A under bugs-only: B is unblocked, C (no bug tag) is NOT credited!
+	bugsWhatIf := runScoped(t, bv, dir, "--robot-whatif", "A", "--recipe", bugsRecipe)
+	if bugsWhatIf.exit != nil {
+		t.Fatalf("robot-whatif A bugs-only failed: %v\n%s%s", bugsWhatIf.exit, bugsWhatIf.stdout, bugsWhatIf.stderr)
+	}
+	if strings.Contains(bugsWhatIf.stdout, `"C"`) {
+		t.Errorf("bugs-only whatif leaked non-bug issue C into unblocked set:\n%s", bugsWhatIf.stdout)
+	}
+
+	// 3. --robot-forecast all --recipe actionable retains historical closures for ETA velocity!
+	forecastRes := runScoped(t, bv, dir, "--robot-forecast", "all", "--label", "backend", "--recipe", "actionable")
+	if forecastRes.exit != nil {
+		t.Fatalf("robot-forecast failed: %v\n%s%s", forecastRes.exit, forecastRes.stdout, forecastRes.stderr)
+	}
+	var forecastPayload struct {
+		Forecasts []struct {
+			IssueID string   `json:"issue_id"`
+			Factors []string `json:"factors"`
+		} `json:"forecasts"`
+	}
+	if err := json.Unmarshal([]byte(forecastRes.stdout), &forecastPayload); err != nil {
+		t.Fatalf("unmarshal forecast: %v", err)
+	}
+	if len(forecastPayload.Forecasts) != 1 || forecastPayload.Forecasts[0].IssueID != "A" {
+		t.Fatalf("expected sole forecast for A, got %+v", forecastPayload.Forecasts)
+	}
+	for _, f := range forecastPayload.Forecasts[0].Factors {
+		if strings.Contains(f, "no recent closures") {
+			t.Errorf("forecast under --recipe actionable lost closed history (%q): %+v", f, forecastPayload.Forecasts[0].Factors)
+		}
+	}
+
+	// 4. --emit-script --recipe actionable preserves Unblocks count on A.
+	scriptCmd := exec.Command(bv, "--emit-script", "--label", "backend", "--recipe", "actionable")
+	scriptCmd.Dir = dir
+	scriptCmd.Env = append(os.Environ(), "BV_NO_SAVED_CONFIG=1", "SOURCE_DATE_EPOCH=1786752000")
+	scriptOut, err := scriptCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("emit-script failed: %v\n%s", err, string(scriptOut))
+	}
+	if !strings.Contains(string(scriptOut), "Unblocks: 1 downstream items") {
+		t.Errorf("emit-script under --recipe actionable lost downstream unblock count:\n%s", string(scriptOut))
+	}
 }

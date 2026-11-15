@@ -3377,3 +3377,68 @@ func TestLabelHealthAndFlowAndAttention_ScopedExternalEdgesAndPageRank(t *testin
 		t.Fatalf("scoped PageRankSum = %.12f, want %.12f (out-of-scope deferred issue inflated PageRankSum)", attnScoped.Labels[0].PageRankSum, wantPRSum)
 	}
 }
+
+func TestLabelHealth_PopulatesHistoricalVelocity(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	w0 := now.Add(-2 * 24 * time.Hour)
+	w1 := now.Add(-9 * 24 * time.Hour)
+	w2 := now.Add(-16 * 24 * time.Hour)
+
+	issues := []model.Issue{
+		{ID: "api-1", Title: "Closed this week", Labels: []string{"api"}, Status: model.StatusClosed, ClosedAt: &w0, UpdatedAt: w0, CreatedAt: now.Add(-30 * 24 * time.Hour)},
+		{ID: "api-2", Title: "Also closed this week", Labels: []string{"api"}, Status: model.StatusClosed, ClosedAt: &w0, UpdatedAt: w0, CreatedAt: now.Add(-30 * 24 * time.Hour)},
+		{ID: "api-3", Title: "Closed last week", Labels: []string{"api"}, Status: model.StatusClosed, ClosedAt: &w1, UpdatedAt: w1, CreatedAt: now.Add(-30 * 24 * time.Hour)},
+		{ID: "api-4", Title: "Closed two weeks ago", Labels: []string{"api"}, Status: model.StatusClosed, ClosedAt: &w2, UpdatedAt: w2, CreatedAt: now.Add(-30 * 24 * time.Hour)},
+		{ID: "api-open", Title: "Still open", Labels: []string{"api"}, Status: model.StatusOpen, UpdatedAt: now, CreatedAt: now.Add(-5 * 24 * time.Hour)},
+	}
+
+	cfg := DefaultLabelHealthConfig()
+	all := ComputeAllLabelHealthWithScope(issues, cfg, now, nil, model.NewReadinessIndex(issues), nil)
+	if len(all.Labels) != 1 {
+		t.Fatalf("expected 1 label health entry, got %d", len(all.Labels))
+	}
+	indexedVel := all.Labels[0].Velocity
+	singleHealth := ComputeLabelHealthForLabel("api", issues, cfg, now, nil)
+	directVel := ComputeLabelVelocity("api", issues, now)
+	oracleHist := ComputeHistoricalVelocity(issues, "api", 8, now)
+
+	for name, vel := range map[string]VelocityMetrics{
+		"ComputeAllLabelHealthWithScope": indexedVel,
+		"ComputeLabelHealthForLabel":     singleHealth.Velocity,
+		"ComputeLabelVelocity":           directVel,
+	} {
+		if vel.ClosedLast7Days != 2 || vel.ClosedLast30Days != 4 {
+			t.Fatalf("%s counts = (7d=%d, 30d=%d), want (2, 4)", name, vel.ClosedLast7Days, vel.ClosedLast30Days)
+		}
+		if vel.Historical == nil {
+			t.Fatalf("%s: expected non-nil Velocity.Historical", name)
+		}
+		if vel.Historical.WeeksAnalyzed != 8 || len(vel.Historical.WeeklyVelocity) != 8 {
+			t.Fatalf("%s: expected 8 weekly buckets, got WeeksAnalyzed=%d len=%d", name, vel.Historical.WeeksAnalyzed, len(vel.Historical.WeeklyVelocity))
+		}
+		if !reflect.DeepEqual(*vel.Historical, oracleHist) {
+			t.Fatalf("%s: Historical %+v != ComputeHistoricalVelocity oracle %+v", name, *vel.Historical, oracleHist)
+		}
+	}
+
+	encoded, err := json.Marshal(all.Labels[0])
+	if err != nil {
+		t.Fatalf("json.Marshal(LabelHealth): %v", err)
+	}
+	if !strings.Contains(string(encoded), `"historical":{`) {
+		t.Fatalf("expected marshaled LabelHealth JSON to include velocity.historical, got %s", encoded)
+	}
+
+	// Negative control: unknown/empty label leaves Historical nil and omits it from JSON.
+	missingVel := ComputeLabelVelocity("nonexistent", issues, now)
+	if missingVel.Historical != nil {
+		t.Fatalf("expected nil Historical for nonexistent label, got %+v", missingVel.Historical)
+	}
+	encodedMissing, err := json.Marshal(missingVel)
+	if err != nil {
+		t.Fatalf("json.Marshal(missingVel): %v", err)
+	}
+	if strings.Contains(string(encodedMissing), `"historical"`) {
+		t.Fatalf("expected nil Historical to be omitted from JSON, got %s", encodedMissing)
+	}
+}

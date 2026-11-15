@@ -1484,3 +1484,44 @@ func TestIssue_IsParkedForStalenessAt(t *testing.T) {
 		})
 	}
 }
+
+func TestSprint_IsActiveAt(t *testing.T) {
+	start := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC)
+	validSprint := &Sprint{
+		ID:        "sp-1",
+		Name:      "Wave 12 Sprint",
+		StartDate: start,
+		EndDate:   end,
+	}
+	nyLoc := time.FixedZone("EST", -5*3600)
+
+	var nilSprint *Sprint
+	if nilSprint.IsActiveAt(start) {
+		t.Fatal("nil *Sprint must not be active")
+	}
+
+	tests := []struct {
+		name   string
+		sprint *Sprint
+		now    time.Time
+		want   bool
+	}{
+		{"zero StartDate", &Sprint{EndDate: end}, start, false},
+		{"zero EndDate", &Sprint{StartDate: start}, start, false},
+		{"1ns before StartDate", validSprint, start.Add(-time.Nanosecond), false},
+		{"exact StartDate UTC", validSprint, start, true},
+		{"exact StartDate non-UTC zone", validSprint, start.In(nyLoc), true},
+		{"midpoint", validSprint, start.Add(7 * 24 * time.Hour), true},
+		{"exact EndDate", validSprint, end, true},
+		{"1ns after EndDate", validSprint, end.Add(time.Nanosecond), false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.sprint.IsActiveAt(tc.now); got != tc.want {
+				t.Fatalf("IsActiveAt(%v) = %v, want %v", tc.now, got, tc.want)
+			}
+		})
+	}
+}

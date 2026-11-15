@@ -565,3 +565,64 @@ func TestSaveGraphSnapshot_DependencyBlockedColorsAndReadiness(t *testing.T) {
 		}
 	})
 }
+
+func TestSaveGraphSnapshot_LongTitleClipPathAndHeaderLegendBounds(t *testing.T) {
+	longHeaderTitle := "Extremely Long Sprint Snapshot Header Title That Must Never Bleed Under The Legend Box On 640px Canvas"
+	longDataHash := "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	longNodeID := "issue-with-an-unusually-long-identifier-exceeding-compact-box-width"
+	longNodeTitle := "Long node title that would previously overflow 170px compact column width into adjacent nodes"
+
+	issues := []model.Issue{
+		{ID: longNodeID, Title: longNodeTitle, Status: model.StatusOpen},
+	}
+	stats := analysis.NewAnalyzer(issues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+
+	tmp := t.TempDir()
+	svgPath := filepath.Join(tmp, "bounds.svg")
+	pngPath := filepath.Join(tmp, "bounds.png")
+
+	opts := GraphSnapshotOptions{
+		Path:     svgPath,
+		Title:    longHeaderTitle,
+		Issues:   issues,
+		Stats:    &stats,
+		DataHash: longDataHash,
+	}
+	if err := SaveGraphSnapshot(opts); err != nil {
+		t.Fatalf("SaveGraphSnapshot(svg): %v", err)
+	}
+	opts.Path = pngPath
+	opts.Format = "png"
+	if err := SaveGraphSnapshot(opts); err != nil {
+		t.Fatalf("SaveGraphSnapshot(png): %v", err)
+	}
+
+	rawSVG, err := os.ReadFile(svgPath)
+	if err != nil {
+		t.Fatalf("ReadFile(svg): %v", err)
+	}
+	svg := string(rawSVG)
+	for _, want := range []string{
+		"<defs>",
+		`<clipPath id="clip-node-0"`,
+		`clip-path="url(#clip-node-0)"`,
+	} {
+		if !hasSubstr(svg, want) {
+			t.Fatalf("SVG missing expected clipPath structure %q:\n%s", want, svg)
+		}
+	}
+	for _, overflow := range []string{longHeaderTitle, longDataHash, longNodeID, longNodeTitle} {
+		if hasSubstr(svg, overflow) {
+			t.Fatalf("SVG should truncate overflowing text %q to stay within bounds:\n%s", overflow, svg)
+		}
+	}
+	if maxRunes := nodeMaxTextRunes(170); maxRunes < 21 || maxRunes > 24 {
+		t.Fatalf("compact nodeMaxTextRunes(170) = %d, want 21..24", maxRunes)
+	}
+	if maxTitle := summaryMaxTitleRunes(640); 32+maxTitle*10 > 640-200 {
+		t.Fatalf("summaryMaxTitleRunes(640) = %d collides with Legend at x=440", maxTitle)
+	}
+	if maxDetail := summaryMaxDetailRunes(640); 32+maxDetail*8 > 640-200 {
+		t.Fatalf("summaryMaxDetailRunes(640) = %d collides with Legend at x=440", maxDetail)
+	}
+}

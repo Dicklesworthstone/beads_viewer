@@ -11,7 +11,8 @@ import (
 
 // MermaidConfig configures the Mermaid graph generation.
 type MermaidConfig struct {
-	ShowNoDependenciesNode bool // If true, adds a "No Dependencies" node when no edges exist
+	ShowNoDependenciesNode bool                  // If true, adds a "No Dependencies" node when no edges exist
+	Readiness              *model.ReadinessIndex // Optional full-source readiness index (falls back to issues when nil)
 }
 
 // GenerateMermaidGraph generates a Mermaid diagram for the given issues.
@@ -24,8 +25,18 @@ func GenerateMermaidGraph(issues []model.Issue, issueIDs map[string]bool, config
 	sb.WriteString("    classDef open fill:#50FA7B,stroke:#333,color:#000\n")
 	sb.WriteString("    classDef inprogress fill:#8BE9FD,stroke:#333,color:#000\n")
 	sb.WriteString("    classDef blocked fill:#FF5555,stroke:#333,color:#000\n")
+	sb.WriteString("    classDef deferred fill:#FFB86C,stroke:#333,color:#000\n")
+	sb.WriteString("    classDef pinned fill:#BD93F9,stroke:#333,color:#000\n")
+	sb.WriteString("    classDef hooked fill:#FF79C6,stroke:#333,color:#000\n")
+	sb.WriteString("    classDef review fill:#F1FA8C,stroke:#333,color:#000\n")
+	sb.WriteString("    classDef custom fill:#E2E8F0,stroke:#333,color:#000\n")
 	sb.WriteString("    classDef closed fill:#6272A4,stroke:#333,color:#fff\n")
 	sb.WriteString("\n")
+
+	readiness := config.Readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
 
 	// Sort issues for deterministic output
 	sortedIssues := make([]model.Issue, len(issues))
@@ -73,18 +84,11 @@ func GenerateMermaidGraph(issues []model.Issue, issueIDs map[string]bool, config
 
 		sb.WriteString(fmt.Sprintf("    %s[\"%s<br/>%s\"]\n", safeID, safeLabelID, safeTitle))
 
-		// Apply class based on status
-		var class string
-		switch {
-		case isClosedLikeStatus(i.Status):
-			class = "closed"
-		case i.Status == model.StatusOpen:
-			class = "open"
-		case i.Status == model.StatusInProgress:
-			class = "inprogress"
-		case i.Status == model.StatusBlocked:
-			class = "blocked"
-		}
+		// Apply class based on status and dependency readiness
+		depBlocked := !isClosedLikeStatus(i.Status) &&
+			(i.Status == model.StatusOpen || i.Status == model.StatusInProgress || i.Status == "") &&
+			len(readiness.Blockers(i.ID)) > 0
+		class := mermaidStatusClass(i.Status, depBlocked)
 		if class != "" {
 			sb.WriteString(fmt.Sprintf("    class %s %s\n", safeID, class))
 		}
@@ -130,6 +134,29 @@ func GenerateMermaidGraph(issues []model.Issue, issueIDs map[string]bool, config
 	}
 
 	return sb.String()
+}
+
+func mermaidStatusClass(status model.Status, depBlocked bool) string {
+	switch {
+	case isClosedLikeStatus(status):
+		return "closed"
+	case status == model.StatusBlocked || depBlocked:
+		return "blocked"
+	case status == model.StatusOpen || status == "":
+		return "open"
+	case status == model.StatusInProgress:
+		return "inprogress"
+	case status == model.StatusDeferred:
+		return "deferred"
+	case status == model.StatusPinned:
+		return "pinned"
+	case status == model.StatusHooked:
+		return "hooked"
+	case status == model.StatusReview:
+		return "review"
+	default:
+		return "custom"
+	}
 }
 
 // Note: sanitizeMermaidID and sanitizeMermaidText are defined in markdown.go

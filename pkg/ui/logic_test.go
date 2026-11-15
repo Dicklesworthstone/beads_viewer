@@ -16,14 +16,17 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/agents"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/instance"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
 )
 
 // White-box testing of UI model logic
@@ -1659,12 +1662,26 @@ func TestRecipeExportJSONAndMermaidDependencyGraph(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected JSON export at %s: %v", jsonPath, err)
 	}
-	var exportedIssues []model.Issue
-	if err := json.Unmarshal(jsonBytes, &exportedIssues); err != nil {
+	var exportedReport struct {
+		Title           string `json:"title"`
+		SourceAuthority any    `json:"source_authority"`
+		Issues          []struct {
+			ID      string             `json:"id"`
+			Actions model.IssueActions `json:"actions"`
+		} `json:"issues"`
+		Graph struct {
+			Nodes int `json:"nodes"`
+			Edges int `json:"edges"`
+		} `json:"graph"`
+	}
+	if err := json.Unmarshal(jsonBytes, &exportedReport); err != nil {
 		t.Fatalf("invalid JSON export payload: %v\n%s", err, string(jsonBytes))
 	}
-	if len(exportedIssues) != 2 {
-		t.Fatalf("expected 2 open issues in JSON export, got %d", len(exportedIssues))
+	if len(exportedReport.Issues) != 2 {
+		t.Fatalf("expected 2 open issues in JSON export, got %d", len(exportedReport.Issues))
+	}
+	if exportedReport.Graph.Nodes != 2 || exportedReport.Graph.Edges != 1 {
+		t.Fatalf("expected JSON report graph with 2 nodes and 1 edge, got %+v", exportedReport.Graph)
 	}
 
 	// 2. Recipe with Export.IncludeGraph = true (Markdown + Mermaid graph TD)
@@ -1688,9 +1705,9 @@ func TestRecipeExportJSONAndMermaidDependencyGraph(t *testing.T) {
 	mdContent := string(mdBytes)
 	if !strings.Contains(mdContent, "## Dependency Graph") ||
 		!strings.Contains(mdContent, "```mermaid\ngraph TD") ||
-		!strings.Contains(mdContent, "EXP-1 --> EXP-2") ||
+		!strings.Contains(mdContent, "EXP-2 ==> EXP-1") ||
 		strings.Contains(mdContent, "EXP-3") {
-		t.Fatalf("expected Mermaid dependency graph with EXP-1 --> EXP-2 and without EXP-3:\n%s", mdContent)
+		t.Fatalf("expected Mermaid dependency graph with EXP-2 ==> EXP-1 and without EXP-3:\n%s", mdContent)
 	}
 }
 
@@ -2052,12 +2069,12 @@ func TestRound1AuditRegressions(t *testing.T) {
 		if !strings.HasPrefix(mmdText, "graph TD\n") {
 			t.Fatalf("expected standalone .mmd to start with 'graph TD', got:\n%s", mmdText)
 		}
-		// Verify "bv-apal.46" and "bv-apal_46" do NOT collide onto a self-loop `bv-apal_46 --> bv-apal_46`!
-		if strings.Contains(mmdText, "bv-apal_46 --> bv-apal_46") {
+		// Verify "bv-apal.46" and "bv-apal_46" do NOT collide onto a self-loop!
+		if strings.Contains(mmdText, "bv-apal_46 --> bv-apal_46") || strings.Contains(mmdText, "bv-apal_46 ==> bv-apal_46") {
 			t.Fatalf("Mermaid node IDs collided into self-loop:\n%s", mmdText)
 		}
-		if !strings.Contains(mmdText, `["bv-apal.46"] --> bv-apal_46`) {
-			t.Fatalf("expected distinct hashed node ref for 'bv-apal.46' pointing to 'bv-apal_46', got:\n%s", mmdText)
+		if !strings.Contains(mmdText, "bv-apal.46<br/>") || !strings.Contains(mmdText, "bv-apal_46<br/>") || !strings.Contains(mmdText, "==>") {
+			t.Fatalf("expected distinct node definitions and blocking edge between 'bv-apal.46' and 'bv-apal_46', got:\n%s", mmdText)
 		}
 
 		// (b) Recipe with Export.Format == "markdown" and Export.IncludeGraph == nil MUST preserve default IncludeGraph == true.
@@ -2083,7 +2100,7 @@ func TestRound1AuditRegressions(t *testing.T) {
 		if !strings.Contains(mdText, "## Dependency Graph") || !strings.Contains(mdText, "```mermaid") {
 			t.Fatalf("expected nil Export.IncludeGraph to preserve default Dependency Graph section:\n%s", mdText)
 		}
-		if !strings.Contains(mdText, `["bv-apal.46"] --> bv-apal_46`) {
+		if !strings.Contains(mdText, "bv-apal.46<br/>") || !strings.Contains(mdText, "bv-apal_46<br/>") || !strings.Contains(mdText, "==>") {
 			t.Fatalf("expected collision-free Mermaid edge in Markdown export:\n%s", mdText)
 		}
 	})
@@ -2414,7 +2431,7 @@ func TestRound2AuditRegressions(t *testing.T) {
 				t.Fatalf("Mermaid alias %q for %q contains consecutive '--'", alias, origID)
 			}
 		}
-		if !strings.Contains(mmdText, `["proj--1"] --> `) || !strings.Contains(mmdText, `["123-abc"]`) {
+		if !strings.Contains(mmdText, "proj--1<br/>") || !strings.Contains(mmdText, "123-abc<br/>") || !strings.Contains(mmdText, "==>") {
 			t.Fatalf("expected sanitized Mermaid edge between proj--1 and 123-abc, got:\n%s", mmdText)
 		}
 	})
@@ -4194,6 +4211,1593 @@ func TestWave10Round2_ExportAuthorityTreeReloadAndBoardQuit(t *testing.T) {
 		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 1})
 		if m.sourceStaleReason != "" || m.statusIsError {
 			t.Fatalf("expected SnapshotReadyMsg to clear sourceStaleReason and statusIsError, got stale=%q err=%v", m.sourceStaleReason, m.statusIsError)
+		}
+	})
+}
+
+func TestWave12TrackBRegressions(t *testing.T) {
+	keyRune := func(s string) tea.KeyMsg {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+
+	// Deliverable 0: Exported TriggerSourceReload() helper for aggregated/file/nil sources.
+	t.Run("Deliverable0_TriggerSourceReload", func(t *testing.T) {
+		initial := []model.Issue{
+			{ID: "SRC-1", Title: "Initial", Status: model.StatusOpen, Priority: 1},
+		}
+		m := NewModel(copyIssues(initial), nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+		// Negative control: pure in-memory model with no beadsPath/watcher/sourceReload returns nil.
+		if cmd := m.TriggerSourceReload(); cmd != nil {
+			t.Fatal("expected TriggerSourceReload() to return nil when no reload route is configured")
+		}
+
+		// Aggregated source reload callback route:
+		reloaded := []model.Issue{
+			{ID: "SRC-1", Title: "Initial", Status: model.StatusOpen, Priority: 1},
+			{ID: "SRC-2", Title: "Reloaded Second", Status: model.StatusOpen, Priority: 2},
+		}
+		called := false
+		m.SetSourceReload(func(ctx context.Context) (SourceReloadResult, error) {
+			called = true
+			return SourceReloadResult{
+				Issues:    copyIssues(reloaded),
+				Authority: model.NewReadinessIndex(reloaded),
+			}, nil
+		})
+		cmd := m.TriggerSourceReload()
+		if cmd == nil {
+			t.Fatal("expected non-nil tea.Cmd from TriggerSourceReload() when SetSourceReload is configured")
+		}
+		msg := cmd()
+		if !called {
+			t.Fatal("expected TriggerSourceReload() cmd to invoke configured sourceReload callback")
+		}
+		m.Update(msg)
+		if len(m.issues) != 2 {
+			t.Fatalf("expected 2 issues after processing TriggerSourceReload() result, got %d", len(m.issues))
+		}
+
+		// File reload route via beadsPath:
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beadsFile := filepath.Join(beadsDir, "issues.jsonl")
+		b1, _ := json.Marshal(initial[0])
+		if err := os.WriteFile(beadsFile, append(b1, '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mf := NewModel(copyIssues(initial), nil, beadsFile)
+		t.Cleanup(mf.Stop)
+		fileCmd := mf.TriggerSourceReload()
+		if fileCmd == nil {
+			t.Fatal("expected non-nil tea.Cmd from TriggerSourceReload() when beadsPath is set")
+		}
+		if _, ok := fileCmd().(FileChangedMsg); !ok {
+			t.Fatalf("expected FileChangedMsg from file-backed TriggerSourceReload()")
+		}
+	})
+
+	// Gap 1: Isolate secondary full-screen views from handleListKeys while preserving cross-view shortcuts.
+	t.Run("Gap1_SecondaryViewIsolationFromHandleListKeys", func(t *testing.T) {
+		now := time.Now().UTC()
+		issues := []model.Issue{
+			{ID: "ISO-1", Title: "Alpha issue", Status: model.StatusOpen, Priority: 1, Labels: []string{"core"}, CreatedAt: now, UpdatedAt: now},
+			{
+				ID: "ISO-2", Title: "Beta issue", Status: model.StatusOpen, Priority: 2, Labels: []string{"api"}, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "ISO-2", DependsOnID: "ISO-1", Type: model.DepBlocks}},
+			},
+			{ID: "ISO-3", Title: "Gamma issue", Status: model.StatusOpen, Priority: 3, Labels: []string{"ui"}, CreatedAt: now, UpdatedAt: now},
+		}
+		sprints := []model.Sprint{
+			{ID: "SP-1", Name: "Sprint 1", BeadIDs: []string{"ISO-1", "ISO-2"}, StartDate: now.Add(-24 * time.Hour), EndDate: now.Add(7 * 24 * time.Hour)},
+		}
+
+		histReport := &correlation.HistoryReport{
+			GeneratedAt: now,
+			Histories: map[string]correlation.BeadHistory{
+				"ISO-1": {
+					BeadID: "ISO-1", Title: "Alpha issue", Status: "open",
+					Commits: []correlation.CorrelatedCommit{
+						{SHA: "aaaa1111", ShortSHA: "aaaa111", Message: "init", Timestamp: now, Confidence: 0.9},
+					},
+				},
+			},
+		}
+
+		secondaryViews := []struct {
+			name         string
+			enter        func(m *Model)
+			expectLocalT bool
+		}{
+			{"focusTree", func(m *Model) { m.Update(keyRune("E")) }, false},
+			{"focusInsights", func(m *Model) { m.Update(keyRune("i")) }, false},
+			{"focusActionable", func(m *Model) { m.Update(keyRune("a")) }, false},
+			{"focusHistory", func(m *Model) { m.Update(keyRune("h")); makeHistoryReportCurrent(m, histReport) }, true},
+			{"focusSprint", func(m *Model) { m.sprints = sprints; m.Update(keyRune("P")) }, false},
+			{"focusFlowMatrix", func(m *Model) { m.Update(keyRune("f")) }, false},
+			{"focusLabelDashboard", func(m *Model) { m.Update(keyRune("[")) }, false},
+			{"focusVelocityComparison", func(m *Model) { m.Update(keyRune("[")); m.Update(keyRune("v")) }, false},
+			{"focusAttention", func(m *Model) { m.Update(keyRune("]")) }, false},
+			{"focusGraph", func(m *Model) { m.Update(keyRune("g")) }, false},
+		}
+
+		for _, tc := range secondaryViews {
+			t.Run(tc.name, func(t *testing.T) {
+				m := NewModel(copyIssues(issues), nil, "")
+				t.Cleanup(m.Stop)
+				m.Update(tea.WindowSizeMsg{Width: 120, Height: 32})
+				m.updateAvailable = true
+				m.updateTag = "v9.9.9"
+				m.updateURL = "https://example.invalid/release"
+
+				rec := &recipe.Recipe{
+					Name:    "open-all",
+					Filters: recipe.FilterConfig{Status: []string{"open"}},
+				}
+				m.setActiveRecipe(rec)
+				m.applyRecipe(rec)
+				m.list.Select(1)
+				origFilter := m.currentFilter
+				origSort := m.sortMode
+				origIndex := m.list.Index()
+
+				tc.enter(m)
+				if m.focused == focusList {
+					t.Fatalf("failed to enter secondary view %s (still focusList)", tc.name)
+				}
+
+				for _, k := range []tea.KeyMsg{
+					keyRune("o"),
+					keyRune("c"),
+					keyRune("r"),
+					keyRune("s"),
+					keyRune("S"),
+					keyRune("G"),
+					{Type: tea.KeyHome},
+					{Type: tea.KeyEnd},
+					{Type: tea.KeyCtrlD},
+					{Type: tea.KeyCtrlU},
+				} {
+					m.Update(k)
+				}
+
+				if m.activeRecipe == nil || m.activeRecipe.Name != "open-all" {
+					t.Fatalf("%s: list keys wiped activeRecipe (got %v)", tc.name, m.activeRecipe)
+				}
+				if m.currentFilter != origFilter {
+					t.Fatalf("%s: list keys mutated currentFilter from %q to %q", tc.name, origFilter, m.currentFilter)
+				}
+				if m.sortMode != origSort {
+					t.Fatalf("%s: list keys mutated sortMode from %v to %v", tc.name, origSort, m.sortMode)
+				}
+				if m.list.Index() != origIndex {
+					t.Fatalf("%s: list keys moved hidden list cursor from %d to %d", tc.name, origIndex, m.list.Index())
+				}
+
+				// Cross-view shortcuts ('t' where not view-local, plus 'U' everywhere) must remain reachable.
+				if !tc.expectLocalT {
+					m.Update(keyRune("t"))
+					if !m.showTimeTravelPrompt {
+						t.Fatalf("%s: expected cross-view 't' to open showTimeTravelPrompt", tc.name)
+					}
+					m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+				}
+				m.Update(keyRune("U"))
+				if !m.showUpdateModal {
+					t.Fatalf("%s: expected cross-view 'U' to open showUpdateModal", tc.name)
+				}
+			})
+		}
+
+		// Positive control: in focusList, 'o', 's', and 'G' DO mutate filter, sort, and list index.
+		ml := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(ml.Stop)
+		ml.Update(tea.WindowSizeMsg{Width: 120, Height: 32})
+		ml.Update(keyRune("o"))
+		if ml.currentFilter != "open" {
+			t.Fatalf("focusList positive control: expected 'o' to set currentFilter='open', got %q", ml.currentFilter)
+		}
+		ml.Update(keyRune("s"))
+		if ml.sortMode == SortDefault {
+			t.Fatalf("focusList positive control: expected 's' to cycle sortMode from SortDefault")
+		}
+		ml.Update(keyRune("G"))
+		if ml.list.Index() != len(issues)-1 {
+			t.Fatalf("focusList positive control: expected 'G' to jump to last item %d, got %d", len(issues)-1, ml.list.Index())
+		}
+	})
+
+	// Gap 2: Insights calculation proof filters non-blocking edges, ToggleCalculation refreshes immediately,
+	// and AdvancedInsights populate lazily only when focusInsights is active and Phase 2 is ready.
+	t.Run("Gap2_InsightsBlockingEdgeCalculationAndAdvancedInsights", func(t *testing.T) {
+		now := time.Now().UTC()
+		issues := []model.Issue{
+			{
+				ID: "ROOT-1", Title: "Root blocker", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: "ROOT-1", DependsOnID: "REL-1", Type: model.DepRelated},
+					{IssueID: "ROOT-1", DependsOnID: "DISC-1", Type: model.DepDiscoveredFrom},
+				},
+			},
+			{
+				ID: "BOTTLE-1", Title: "Central bottleneck", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: "BOTTLE-1", DependsOnID: "ROOT-1", Type: model.DepBlocks},
+				},
+			},
+			{
+				ID: "LEAF-1", Title: "Leaf consumer A", Status: model.StatusOpen, Priority: 2, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: "LEAF-1", DependsOnID: "BOTTLE-1", Type: model.DepBlocks},
+				},
+			},
+			{
+				ID: "LEAF-2", Title: "Leaf consumer B", Status: model.StatusOpen, Priority: 2, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: "LEAF-2", DependsOnID: "BOTTLE-1", Type: model.DepBlocks},
+				},
+			},
+			{ID: "REL-1", Title: "Related non-blocking", Status: model.StatusOpen, Priority: 3, CreatedAt: now, UpdatedAt: now},
+			{ID: "DISC-1", Title: "Discovered non-blocking", Status: model.StatusOpen, Priority: 3, CreatedAt: now, UpdatedAt: now},
+			{
+				ID: "CHILD-1", Title: "Parent-child non-blocking", Status: model.StatusOpen, Priority: 3, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: "CHILD-1", DependsOnID: "ROOT-1", Type: model.DepParentChild},
+				},
+			},
+			{
+				ID: "CYC-1", Title: "Cycle node 1", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "CYC-1", DependsOnID: "CYC-2", Type: model.DepBlocks}},
+			},
+			{
+				ID: "CYC-2", Title: "Cycle node 2", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "CYC-2", DependsOnID: "CYC-1", Type: model.DepBlocks}},
+			},
+		}
+
+		m := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+		m.analysis.WaitForPhase2()
+
+		// Negative control (benchmark safety): SnapshotReadyMsg while focusList is active leaves advancedInsights nil.
+		snap := NewSnapshotBuilder(copyIssues(issues)).Build()
+		snap.Analysis.WaitForPhase2()
+		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 1})
+		if m.insightsPanel.advancedInsights != nil {
+			t.Fatal("expected insightsPanel.advancedInsights to remain nil while focused == focusList")
+		}
+
+		// Enter Insights view ('i') -> rebuildInsightsPanel computes AdvancedInsights lazily.
+		m.Update(keyRune("i"))
+		if m.focused != focusInsights {
+			t.Fatalf("expected focusInsights, got %v", m.focused)
+		}
+		if m.insightsPanel.advancedInsights == nil {
+			t.Fatal("expected insightsPanel.advancedInsights to be populated upon entering focusInsights with Phase 2 ready")
+		}
+
+		// Verify findDependents / findDependencies exclude non-blocking edges (DepRelated, DepDiscoveredFrom, DepParentChild).
+		depsIn := m.insightsPanel.findDependents("ROOT-1")
+		if len(depsIn) != 1 || depsIn[0] != "BOTTLE-1" {
+			t.Fatalf("expected findDependents(ROOT-1) == [BOTTLE-1] (excluding CHILD-1), got %v", depsIn)
+		}
+		depsOut := m.insightsPanel.findDependencies("ROOT-1")
+		if len(depsOut) != 0 {
+			t.Fatalf("expected findDependencies(ROOT-1) == [] (excluding REL-1 and DISC-1), got %v", depsOut)
+		}
+
+		// Verify ToggleCalculation ('x') refreshes detailContent immediately without requiring panel navigation.
+		m.insightsPanel.focusedPanel = PanelBottlenecks
+		m.insightsPanel.selectedIndex[PanelBottlenecks] = 0
+		m.insightsPanel.updateDetailContent()
+		plainDetail := ansi.Strip(m.insightsPanel.detailContent)
+		if !strings.Contains(plainDetail, "Calculation Proof") {
+			t.Fatalf("expected Calculation Proof in initial detailContent, got:\n%s", plainDetail)
+		}
+		m.Update(keyRune("x"))
+		if strings.Contains(ansi.Strip(m.insightsPanel.detailContent), "Calculation Proof") {
+			t.Fatalf("expected 'x' ToggleCalculation to immediately remove Calculation Proof, got:\n%s", ansi.Strip(m.insightsPanel.detailContent))
+		}
+		m.Update(keyRune("x"))
+		plainDetail = ansi.Strip(m.insightsPanel.detailContent)
+		if !strings.Contains(plainDetail, "Calculation Proof") {
+			t.Fatalf("expected second 'x' ToggleCalculation to immediately restore Calculation Proof")
+		}
+
+		// Verify AdvancedInsights sections render in PanelBottlenecks, PanelCycles, PanelPriority, and PanelArticulation.
+		if !strings.Contains(plainDetail, "Parallel Cut Suggestions") &&
+			m.insightsPanel.advancedInsights.ParallelCut != nil &&
+			len(m.insightsPanel.advancedInsights.ParallelCut.Suggestions) > 0 {
+			t.Fatalf("expected Parallel Cut Suggestions in PanelBottlenecks detailContent:\n%s", plainDetail)
+		}
+
+		m.insightsPanel.focusedPanel = PanelCycles
+		m.insightsPanel.selectedIndex[PanelCycles] = 0
+		m.insightsPanel.updateDetailContent()
+		if !strings.Contains(ansi.Strip(m.insightsPanel.detailContent), "Cycle Break Suggestions") {
+			t.Fatalf("expected Cycle Break Suggestions in PanelCycles detailContent:\n%s", ansi.Strip(m.insightsPanel.detailContent))
+		}
+
+		m.insightsPanel.focusedPanel = PanelPriority
+		m.insightsPanel.selectedIndex[PanelPriority] = 0
+		m.insightsPanel.updateDetailContent()
+		plainPrio := ansi.Strip(m.insightsPanel.detailContent)
+		if !strings.Contains(plainPrio, "Greedy Unlock Set") ||
+			!strings.Contains(plainPrio, "Parallel Gain") {
+			t.Fatalf("expected Greedy Unlock Set and Parallel Gain in PanelPriority detailContent:\n%s", plainPrio)
+		}
+
+		m.insightsPanel.insights.Articulation = []string{"BOTTLE-1"}
+		m.insightsPanel.focusedPanel = PanelArticulation
+		m.insightsPanel.selectedIndex[PanelArticulation] = 0
+		m.insightsPanel.updateDetailContent()
+		if !strings.Contains(ansi.Strip(m.insightsPanel.detailContent), "Vertex Coverage Set") {
+			t.Fatalf("expected Vertex Coverage Set in PanelArticulation detailContent:\n%s", ansi.Strip(m.insightsPanel.detailContent))
+		}
+	})
+
+	// Gap 3: Navigation parity (home/G/end, ctrl+d/ctrl+u/pgdown/pgup, LabelDashboard mouse wheel, Help & KeyDocs).
+	t.Run("Gap3_NavigationParityMouseWheelHelpOverlayAndKeyDocs", func(t *testing.T) {
+		var issues []model.Issue
+		now := time.Now().UTC()
+		for i := 0; i < 20; i++ {
+			lbl := fmt.Sprintf("lbl-%02d", i)
+			iss := model.Issue{
+				ID:        fmt.Sprintf("NAV-%02d", i),
+				Title:     fmt.Sprintf("Navigation issue %02d", i),
+				Status:    model.StatusOpen,
+				Priority:  1 + (i % 3),
+				Labels:    []string{lbl},
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+			if i > 0 {
+				iss.Dependencies = []*model.Dependency{
+					{IssueID: iss.ID, DependsOnID: fmt.Sprintf("NAV-%02d", i-1), Type: model.DepParentChild},
+				}
+			}
+			issues = append(issues, iss)
+		}
+
+		m := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 14})
+
+		// 1) focusGraph: G / home / end
+		m.Update(keyRune("g"))
+		m.Update(keyRune("G"))
+		if m.graphView.selectedIdx != len(issues)-1 {
+			t.Fatalf("focusGraph 'G': expected selectedIdx %d, got %d", len(issues)-1, m.graphView.selectedIdx)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyHome})
+		if m.graphView.selectedIdx != 0 {
+			t.Fatalf("focusGraph 'home': expected selectedIdx 0, got %d", m.graphView.selectedIdx)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+		if m.graphView.selectedIdx != len(issues)-1 {
+			t.Fatalf("focusGraph 'end': expected selectedIdx %d, got %d", len(issues)-1, m.graphView.selectedIdx)
+		}
+
+		// 2) focusTree: G / home / end
+		m.Update(keyRune("E"))
+		m.Update(keyRune("X")) // expand all
+		lastTreeIdx := len(m.tree.flatList) - 1
+		m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+		if m.tree.cursor != lastTreeIdx {
+			t.Fatalf("focusTree 'end': expected cursor %d, got %d", lastTreeIdx, m.tree.cursor)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyHome})
+		if m.tree.cursor != 0 {
+			t.Fatalf("focusTree 'home': expected cursor 0, got %d", m.tree.cursor)
+		}
+
+		// 3) focusHistory: bead mode, git mode, and file tree focus
+		report := &correlation.HistoryReport{
+			Histories: map[string]correlation.BeadHistory{
+				"NAV-00": {
+					BeadID: "NAV-00", Title: "Nav 0", Status: "open",
+					Commits: []correlation.CorrelatedCommit{
+						{SHA: "1111111111", ShortSHA: "1111111", Message: "c1", Timestamp: now, Confidence: 0.9, Files: []correlation.FileChange{{Path: "pkg/a.go"}}},
+					},
+				},
+				"NAV-01": {
+					BeadID: "NAV-01", Title: "Nav 1", Status: "open",
+					Commits: []correlation.CorrelatedCommit{
+						{SHA: "2222222222", ShortSHA: "2222222", Message: "c2", Timestamp: now.Add(-time.Hour), Confidence: 0.9, Files: []correlation.FileChange{{Path: "pkg/b.go"}}},
+					},
+				},
+				"NAV-02": {
+					BeadID: "NAV-02", Title: "Nav 2", Status: "open",
+					Commits: []correlation.CorrelatedCommit{
+						{SHA: "3333333333", ShortSHA: "3333333", Message: "c3", Timestamp: now.Add(-2 * time.Hour), Confidence: 0.9, Files: []correlation.FileChange{{Path: "pkg/c.go"}}},
+					},
+				},
+			},
+			CommitIndex: correlation.CommitIndex{
+				"1111111111": {"NAV-00"},
+				"2222222222": {"NAV-01"},
+				"3333333333": {"NAV-02"},
+			},
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc}) // exit focusTree back to focusList before pressing 'h'
+		m.Update(keyRune("h"))
+		makeHistoryReportCurrent(m, report)
+		m.historyView.SetSize(140, 13)
+
+		m.Update(keyRune("G"))
+		if m.historyView.selectedBead != 2 {
+			t.Fatalf("focusHistory bead mode 'G': expected selectedBead 2, got %d", m.historyView.selectedBead)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyHome})
+		if m.historyView.selectedBead != 0 {
+			t.Fatalf("focusHistory bead mode 'home': expected selectedBead 0, got %d", m.historyView.selectedBead)
+		}
+
+		m.Update(keyRune("v")) // Git mode
+		m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+		if m.historyView.selectedGitCommit != 2 {
+			t.Fatalf("focusHistory git mode 'end': expected selectedGitCommit 2, got %d", m.historyView.selectedGitCommit)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyHome})
+		if m.historyView.selectedGitCommit != 0 {
+			t.Fatalf("focusHistory git mode 'home': expected selectedGitCommit 0, got %d", m.historyView.selectedGitCommit)
+		}
+
+		m.historyView.ToggleFileTree()
+		m.historyView.SetFileTreeFocus(true)
+		lastFileIdx := len(m.historyView.flatFileList) - 1
+		m.Update(keyRune("G"))
+		if m.historyView.selectedFileIdx != lastFileIdx {
+			t.Fatalf("focusHistory file tree 'G': expected selectedFileIdx %d, got %d", lastFileIdx, m.historyView.selectedFileIdx)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyHome})
+		if m.historyView.selectedFileIdx != 0 {
+			t.Fatalf("focusHistory file tree 'home': expected selectedFileIdx 0, got %d", m.historyView.selectedFileIdx)
+		}
+		m.isHistoryView = false
+		m.focused = focusList
+
+		// 4) focusAttention: ctrl+d / ctrl+u / pgdown / pgup
+		m.Update(keyRune("]"))
+		if m.focused != focusAttention {
+			t.Fatalf("expected focusAttention, got %v", m.focused)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		afterAttnDown := m.attentionView.Cursor()
+		if afterAttnDown <= 1 {
+			t.Fatalf("focusAttention ctrl+d: expected half-page step > 1, got %d", afterAttnDown)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		afterPgDown := m.attentionView.Cursor()
+		if afterPgDown <= afterAttnDown {
+			t.Fatalf("focusAttention pgdown: expected cursor > %d, got %d", afterAttnDown, afterPgDown)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+		expectedAfterCtrlU := max(0, afterPgDown-afterAttnDown)
+		if m.attentionView.Cursor() != expectedAfterCtrlU {
+			t.Fatalf("focusAttention ctrl+u: expected cursor %d, got %d", expectedAfterCtrlU, m.attentionView.Cursor())
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+		if m.attentionView.Cursor() != 0 {
+			t.Fatalf("focusAttention pgup: expected cursor 0, got %d", m.attentionView.Cursor())
+		}
+
+		// 5) focusLabelDashboard: ctrl+d / ctrl+u / pgdown / pgup + mouse wheel up/down
+		m.Update(keyRune("["))
+		if m.focused != focusLabelDashboard {
+			t.Fatalf("expected focusLabelDashboard, got %v", m.focused)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		afterLblDown := m.labelDashboard.cursor
+		if afterLblDown <= 1 {
+			t.Fatalf("focusLabelDashboard ctrl+d: expected half-page step > 1, got %d", afterLblDown)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+		if m.labelDashboard.cursor != 0 {
+			t.Fatalf("focusLabelDashboard ctrl+u: expected cursor 0, got %d", m.labelDashboard.cursor)
+		}
+		m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+		if m.labelDashboard.cursor != 1 {
+			t.Fatalf("focusLabelDashboard wheel down: expected cursor 1, got %d", m.labelDashboard.cursor)
+		}
+		m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress})
+		if m.labelDashboard.cursor != 0 {
+			t.Fatalf("focusLabelDashboard wheel up: expected cursor 0, got %d", m.labelDashboard.cursor)
+		}
+
+		// 6) renderHelpOverlay() + GetKeyBindingDocs() parity
+		rawHelpLines, _ := m.buildHelpBodyLines()
+		helpLines := strings.Join(rawHelpLines, "\n")
+		for _, expectedToken := range []string{"E", "P", `\`, "~", "`", "y", "V", "U", "Self-update"} {
+			if !strings.Contains(helpLines, expectedToken) {
+				t.Fatalf("expected help overlay body to document %q, got:\n%s", expectedToken, helpLines)
+			}
+		}
+		docs := GetKeyBindingDocs()
+		foundDocs := make(map[string]bool)
+		foundInsightsCalc := false
+		for _, d := range docs {
+			foundDocs[d.Key] = true
+			if d.Category == "Insights" && d.Key == "x" && strings.Contains(strings.ToLower(d.Desc), "calculation") {
+				foundInsightsCalc = true
+			}
+		}
+		for _, key := range []string{"E", "P", `\`, "`", "~", "U", "V", "y"} {
+			if !foundDocs[key] {
+				t.Fatalf("expected GetKeyBindingDocs() to include %q", key)
+			}
+		}
+		if !foundInsightsCalc {
+			t.Fatal("expected GetKeyBindingDocs() Insights 'x' to document Toggle calculation proof")
+		}
+	})
+
+	// Gap 4: focusedIssueForSessions alignment, FlowMatrix detail V/C/y actions, and resetUnderlyingViewToMainList viewport width.
+	t.Run("Gap4_FocusedIssueForSessionsFlowDetailActionsAndResetUnderlyingView", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "OTHER-1", Title: "Hidden list selection", Status: model.StatusOpen, Priority: 1, Labels: []string{"misc"}},
+			{ID: "BLK-1", Title: "Backend blocker", Status: model.StatusOpen, Priority: 1, Labels: []string{"backend"}},
+			{
+				ID: "DEP-1", Title: "Frontend consumer", Status: model.StatusOpen, Priority: 2, Labels: []string{"frontend"},
+				Dependencies: []*model.Dependency{{IssueID: "DEP-1", DependsOnID: "BLK-1", Type: model.DepBlocks}},
+			},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 160, Height: 36}) // Split view active
+		if !m.isSplitView {
+			t.Fatal("expected split view at width 160")
+		}
+		splitViewportWidth := m.viewport.Width
+		m.selectListIssueByID("OTHER-1")
+
+		// Non-issue views and showLabelDrilldown must return nil from focusedIssueForSessions().
+		m.showLabelDrilldown = true
+		m.labelDrilldownLabel = "misc"
+		if got := m.focusedIssueForSessions(); got != nil {
+			t.Fatalf("expected nil focusedIssueForSessions when showLabelDrilldown=true, got %v", got.ID)
+		}
+		m.showLabelDrilldown = false
+		m.labelDrilldownLabel = ""
+
+		for _, nonIssueFocus := range []focus{focusSprint, focusLabelDashboard, focusAttention, focusVelocityComparison} {
+			m.focused = nonIssueFocus
+			if got := m.focusedIssueForSessions(); got != nil {
+				t.Fatalf("expected nil focusedIssueForSessions for %v, got %s", nonIssueFocus, got.ID)
+			}
+		}
+
+		// FlowMatrix detail view: focusedIssueForSessions() + y/C/V must target flowDetailID ("DEP-1"), NOT "OTHER-1".
+		m.focused = focusList
+		m.Update(keyRune("f"))
+		m.flowDetailID = "DEP-1"
+		m.viewport.Width = m.width - 4
+		if got := m.focusedIssueForSessions(); got == nil || got.ID != "DEP-1" {
+			t.Fatalf("expected focusedIssueForSessions() == DEP-1 in FlowMatrix detail, got %v", got)
+		}
+
+		_, yCmd := m.Update(keyRune("y"))
+		if yCmd == nil {
+			t.Fatal("expected 'y' in FlowMatrix detail to return clipboard copy cmd")
+		}
+		_, cCmd := m.Update(keyRune("C"))
+		if cCmd == nil {
+			t.Fatal("expected 'C' in FlowMatrix detail to return context copy cmd")
+		}
+		m.Update(keyRune("V"))
+		if m.cassRequest != nil && m.cassRequest.beadID != "DEP-1" {
+			t.Fatalf("expected 'V' in FlowMatrix detail to look up DEP-1, got %q", m.cassRequest.beadID)
+		}
+		if m.showCassModal && m.cassModal.beadID != "DEP-1" {
+			t.Fatalf("expected 'V' modal in FlowMatrix detail to target DEP-1, got %q", m.cassModal.beadID)
+		}
+		m.cancelCassLookup()
+		m.showCassModal = false
+
+		// resetUnderlyingViewToMainList() must clear flowDetailID and restore split-view m.viewport.Width.
+		m.resetUnderlyingViewToMainList()
+		if m.flowDetailID != "" {
+			t.Fatalf("expected resetUnderlyingViewToMainList to clear flowDetailID, got %q", m.flowDetailID)
+		}
+		if m.viewport.Width != splitViewportWidth {
+			t.Fatalf("expected resetUnderlyingViewToMainList to restore split viewport width %d, got %d", splitViewportWidth, m.viewport.Width)
+		}
+	})
+
+	// Gap 5: Alerts scope (activeRepos + candidateIDs), dynamic dismiss header counts, and candidate-scoped footer counts.
+	t.Run("Gap5_AlertsScopeDynamicCountsAndCandidateScopedFooterCounts", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "api:IN-1", Title: "API open ready", Status: model.StatusOpen, Priority: 1},
+			{
+				ID: "api:IN-2", Title: "API blocked by external", Status: model.StatusBlocked, Priority: 1,
+				Dependencies: []*model.Dependency{{IssueID: "api:IN-2", DependsOnID: "web:EXT-BLK", Type: model.DepBlocks}},
+			},
+			{ID: "api:IN-CLOSED", Title: "API closed", Status: model.StatusClosed, Priority: 2},
+			{ID: "api:OUT-1", Title: "API open outside candidateIDs", Status: model.StatusOpen, Priority: 2},
+			{ID: "api:OUT-BLK", Title: "API blocked outside candidateIDs", Status: model.StatusBlocked, Priority: 2},
+			{ID: "web:OUT-CLOSED", Title: "Web closed outside candidateIDs", Status: model.StatusClosed, Priority: 3},
+			{ID: "web:EXT-BLK", Title: "Web open blocker outside candidateIDs", Status: model.StatusOpen, Priority: 1},
+		}
+		candidates := map[string]bool{
+			"api:IN-1":      true,
+			"api:IN-2":      true,
+			"api:IN-CLOSED": true,
+		}
+		scope := ReadinessScope{
+			Authority:    model.NewReadinessIndex(issues),
+			CandidateIDs: candidates,
+		}
+		m := NewModel(copyIssues(issues), nil, "", scope)
+		t.Cleanup(m.Stop)
+		m.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, RepoPrefixes: []string{"api", "web"}})
+		m.activeRepos = map[string]bool{"api": true}
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 32})
+
+		// Candidate-scoped countOpen (2: IN-1 + IN-2) / countBlocked (1: IN-2) / countClosed (1: IN-CLOSED) in NewModel:
+		if m.countOpen != 2 || m.countBlocked != 1 || m.countClosed != 1 {
+			t.Fatalf("NewModel candidate counts: want open=2 blocked=1 closed=1, got open=%d blocked=%d closed=%d",
+				m.countOpen, m.countBlocked, m.countClosed)
+		}
+
+		// Candidate-scoped counts after SnapshotReadyMsg:
+		snap := NewSnapshotBuilder(copyIssues(issues), scope.Authority).Build()
+		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 1})
+		if m.countOpen != 2 || m.countBlocked != 1 || m.countClosed != 1 {
+			t.Fatalf("SnapshotReadyMsg candidate counts: want open=2 blocked=1 closed=1, got open=%d blocked=%d closed=%d",
+				m.countOpen, m.countBlocked, m.countClosed)
+		}
+
+		// Candidate-scoped counts after FileChangedMsg (via SourceReloadResult):
+		m.SetSourceReload(func(ctx context.Context) (SourceReloadResult, error) {
+			return SourceReloadResult{
+				Issues:       copyIssues(issues),
+				Authority:    model.NewReadinessIndex(issues),
+				CandidateIDs: candidates,
+			}, nil
+		})
+		reloadCmd := m.TriggerSourceReload()
+		m.Update(reloadCmd())
+		if m.countOpen != 2 || m.countBlocked != 1 || m.countClosed != 1 {
+			t.Fatalf("FileChangedMsg candidate counts: want open=2 blocked=1 closed=1, got open=%d blocked=%d closed=%d",
+				m.countOpen, m.countBlocked, m.countClosed)
+		}
+
+		// Alerts scoping across activeRepos + candidateIDs + dynamic dismiss header counts:
+		m.alerts = []drift.Alert{
+			{Type: drift.AlertStaleIssue, Severity: drift.SeverityCritical, IssueID: "api:IN-1", Message: "Crit in scope"},
+			{Type: drift.AlertBlockingCascade, Severity: drift.SeverityWarning, IssueID: "api:IN-2", Message: "Warn in scope"},
+			{Type: drift.AlertDensityGrowth, Severity: drift.SeverityInfo, IssueID: "", Message: "Global info"},
+			{Type: drift.AlertStaleIssue, Severity: drift.SeverityCritical, IssueID: "api:OUT-1", Message: "Excluded by candidateIDs"},
+			{Type: drift.AlertStaleIssue, Severity: drift.SeverityCritical, IssueID: "web:EXT-BLK", Message: "Excluded by activeRepos"},
+		}
+		m.alertsCritical = 3
+		m.alertsWarning = 1
+		m.alertsInfo = 1
+
+		scoped := m.activeScopedAlerts()
+		if len(scoped) != 3 {
+			t.Fatalf("expected 3 activeScopedAlerts (excluding api:OUT-1 and web:EXT-BLK), got %d: %+v", len(scoped), scoped)
+		}
+
+		m.Update(keyRune("!"))
+		if !m.showAlertsPanel {
+			t.Fatal("expected '!' to open showAlertsPanel when scoped alerts exist")
+		}
+		panelBefore := ansi.Strip(m.renderAlertsPanel())
+		if !strings.Contains(panelBefore, "3 total") || !strings.Contains(panelBefore, "1 critical") || !strings.Contains(panelBefore, "1 warning") || !strings.Contains(panelBefore, "1 info") {
+			t.Fatalf("expected scoped dynamic counts (3 total: 1 critical, 1 warning, 1 info) before dismiss, got:\n%s", panelBefore)
+		}
+
+		// Press 'd' to dismiss the critical alert ("api:IN-1") -> header counts MUST decrement immediately!
+		m.Update(keyRune("d"))
+		panelAfter := ansi.Strip(m.renderAlertsPanel())
+		if !strings.Contains(panelAfter, "2 total") || strings.Contains(panelAfter, "critical") || !strings.Contains(panelAfter, "1 warning") || !strings.Contains(panelAfter, "1 info") {
+			t.Fatalf("expected critical badge removed and count decremented to 2 total after 'd' dismiss, got:\n%s", panelAfter)
+		}
+
+		// Dismiss global alert too, then switch activeRepos to {"other": true} so remaining scoped alerts == 0 -> panel auto-closes!
+		m.alerts = []drift.Alert{
+			{Type: drift.AlertBlockingCascade, Severity: drift.SeverityWarning, IssueID: "api:IN-2", Message: "Warn in api"},
+		}
+		m.alertsCursor = 0
+		m.activeRepos = map[string]bool{"web": true}
+		m.syncSecondaryViewsForRepoScope(m.focused)
+		if m.showAlertsPanel {
+			t.Fatal("expected syncSecondaryViewsForRepoScope to close showAlertsPanel when 0 scoped alerts remain")
+		}
+		m.Update(keyRune("!"))
+		if m.showAlertsPanel || !strings.Contains(m.statusMsg, "No active alerts") {
+			t.Fatalf("expected '!' with 0 scoped alerts to stay closed with 'No active alerts', got open=%v status=%q", m.showAlertsPanel, m.statusMsg)
+		}
+	})
+
+	// Gap 6: AgentPromptDecline persists decline for current BlurbVersion via agents.RecordDecline(..., false).
+	t.Run("Gap6_AgentPromptDeclinePersistsForCurrentBlurbVersion", func(t *testing.T) {
+		cfgHome := t.TempDir()
+		t.Setenv("HOME", cfgHome)
+		t.Setenv("XDG_CONFIG_HOME", cfgHome)
+		t.Setenv("BV_NO_SAVED_CONFIG", "")
+
+		workDir := t.TempDir()
+		agentsPath := filepath.Join(workDir, "AGENTS.md")
+		if err := os.WriteFile(agentsPath, []byte("# Project Rules\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !agents.ShouldPromptForAgentFile(workDir) {
+			t.Fatal("precondition: expected ShouldPromptForAgentFile(workDir) == true before decline")
+		}
+
+		m := NewModel([]model.Issue{{ID: "AG-1", Title: "Agent test", Status: model.StatusOpen, Priority: 1}}, nil, "")
+		t.Cleanup(m.Stop)
+		m.workDir = workDir
+		m.agentPromptModal = NewAgentPromptModal(agentsPath, "AGENTS.md", m.theme)
+		m.showAgentPrompt = true
+
+		m.Update(keyRune("n"))
+		if m.showAgentPrompt {
+			t.Fatal("expected 'n' to close showAgentPrompt")
+		}
+		if agents.ShouldPromptForAgentFile(workDir) {
+			t.Fatal("expected ShouldPromptForAgentFile(workDir) == false after declining current BlurbVersion")
+		}
+		pref, err := agents.LoadAgentPromptPreference(workDir)
+		if err != nil || pref == nil || pref.DontAskAgain {
+			t.Fatalf("expected RecordDecline(..., false) with DontAskAgain=false, got pref=%+v err=%v", pref, err)
+		}
+		if !agents.ShouldPromptForAgentUpgrade(workDir, agents.BlurbVersion+1) {
+			t.Fatal("expected ShouldPromptForAgentUpgrade(workDir, BlurbVersion+1) == true after temporary decline")
+		}
+	})
+
+	// Gap 7: Narrow-pane CJK/emoji TreeModel clamping, BuildFromSnapshot deep-copy isolation, and deterministic ID tie-breakers.
+	t.Run("Gap7_TreeNarrowViewportClampingDeepCopyAndDeterministicSortTieBreakers", func(t *testing.T) {
+		sameTime := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+		cjkIssues := []model.Issue{
+			{ID: "ROOT-CJK", Title: "🚀🔥日本語タイトル非常に長いテストケース幅制限確認", Status: model.StatusOpen, Priority: 1, CreatedAt: sameTime},
+			{
+				ID: "CHILD-CJK-1", Title: "🎉サブタスク長い説明文字列オーバーフロー防止テスト", Status: model.StatusInProgress, Priority: 1, CreatedAt: sameTime,
+				Dependencies: []*model.Dependency{{IssueID: "CHILD-CJK-1", DependsOnID: "ROOT-CJK", Type: model.DepParentChild}},
+			},
+			{
+				ID: "CHILD-CJK-2", Title: "🔧もう一つの長い日本語タイトル行折り返し防止", Status: model.StatusBlocked, Priority: 2, CreatedAt: sameTime,
+				Dependencies: []*model.Dependency{{IssueID: "CHILD-CJK-2", DependsOnID: "ROOT-CJK", Type: model.DepParentChild}},
+			},
+		}
+
+		theme := DefaultTheme(lipgloss.NewRenderer(nil))
+		tm := NewTreeModel(theme)
+		tm.Build(copyIssues(cjkIssues))
+		tm.ExpandAll()
+		tm.SetSize(26, 6)
+		rendered := tm.View()
+		lines := strings.Split(rendered, "\n")
+		if len(lines) > 6 {
+			t.Fatalf("expected narrow TreeModel height <= 6 lines, got %d:\n%s", len(lines), rendered)
+		}
+		for idx, line := range lines {
+			if w := lipgloss.Width(line); w > 26 {
+				t.Fatalf("line %d exceeded narrow TreeModel width 26 (got %d): %q", idx, w, line)
+			}
+		}
+
+		// BuildFromSnapshot deep-copy isolation: mutating TreeModel must NOT mutate snapshot.TreeRoots!
+		snap := NewSnapshotBuilder(copyIssues(cjkIssues)).Build()
+		if len(snap.TreeRoots) == 0 || !snap.TreeRoots[0].Expanded {
+			t.Fatalf("precondition: expected expanded root in snap.TreeRoots, got %+v", snap.TreeRoots)
+		}
+		tmSnap := NewTreeModel(theme)
+		tmSnap.BuildFromSnapshot(snap)
+		tmSnap.CollapseAll()
+		if !snap.TreeRoots[0].Expanded {
+			t.Fatal("CollapseAll on TreeModel mutated shared DataSnapshot.TreeRoots[0].Expanded")
+		}
+
+		// Deterministic ID tie-breakers in SnapshotBuilder.Build, BoardModel, and FileChangedMsg:
+		tieInput := []model.Issue{
+			{ID: "TIE-B", Title: "Second ID", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: sameTime, UpdatedAt: sameTime},
+			{ID: "TIE-A", Title: "First ID", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: sameTime, UpdatedAt: sameTime},
+		}
+		tieSnap := NewSnapshotBuilder(copyIssues(tieInput)).Build()
+		if len(tieSnap.Issues) != 2 || tieSnap.Issues[0].ID != "TIE-A" || tieSnap.Issues[1].ID != "TIE-B" {
+			t.Fatalf("expected SnapshotBuilder deterministic ID tie-breaker [TIE-A, TIE-B], got [%s, %s]",
+				tieSnap.Issues[0].ID, tieSnap.Issues[1].ID)
+		}
+
+		bm := NewBoardModel(copyIssues(tieInput), theme)
+		if sel := bm.SelectedIssue(); sel == nil || sel.ID != "TIE-A" {
+			t.Fatalf("expected BoardModel deterministic ID tie-breaker to put TIE-A first, got %v", sel)
+		}
+
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beadsFile := filepath.Join(beadsDir, "issues.jsonl")
+		lineB, _ := json.Marshal(tieInput[0])
+		lineA, _ := json.Marshal(tieInput[1])
+		if err := os.WriteFile(beadsFile, []byte(string(lineB)+"\n"+string(lineA)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mf := NewModel(copyIssues(tieInput), nil, beadsFile)
+		t.Cleanup(mf.Stop)
+		mf.Update(FileChangedMsg{})
+		if len(mf.issues) != 2 || mf.issues[0].ID != "TIE-A" || mf.issues[1].ID != "TIE-B" {
+			t.Fatalf("expected FileChangedMsg deterministic ID tie-breaker [TIE-A, TIE-B], got [%s, %s]",
+				mf.issues[0].ID, mf.issues[1].ID)
+		}
+	})
+
+	// Gap 8: Unified exportToMarkdown via export.GenerateReport + CapsLockTracker / TutorialKeyBindings / ShowTutorialMsg.
+	t.Run("Gap8_UnifiedExportGenerateReportAndCapsLockTutorialBindings", func(t *testing.T) {
+		exportDir := t.TempDir()
+		issues := []model.Issue{
+			{ID: "CLOSED-BLK", Title: "Resolved upstream blocker", Status: model.StatusClosed, Priority: 1},
+			{
+				ID: "OPEN-DEP", Title: "Open downstream task", Status: model.StatusOpen, Priority: 1,
+				Dependencies: []*model.Dependency{{IssueID: "OPEN-DEP", DependsOnID: "CLOSED-BLK", Type: model.DepBlocks}},
+			},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(m.Stop)
+		m.workDir = exportDir
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 32})
+
+		// CSV recipe export through export.GenerateReport:
+		csvRecipe := &recipe.Recipe{
+			Name:    "open-csv",
+			Filters: recipe.FilterConfig{Status: []string{"open"}},
+			Export:  recipe.ExportConfig{Format: "csv"},
+		}
+		m.setActiveRecipe(csvRecipe)
+		m.applyRecipe(csvRecipe)
+		m.exportToMarkdown()
+		if m.statusIsError {
+			t.Fatalf("CSV export failed: %s", m.statusMsg)
+		}
+		csvPath := filepath.Join(exportDir, strings.TrimSuffix(m.generateExportFilename(), ".md")+".csv")
+		csvBytes, err := os.ReadFile(csvPath)
+		if err != nil {
+			t.Fatalf("expected CSV export at %s: %v", csvPath, err)
+		}
+		rows, err := csv.NewReader(strings.NewReader(string(csvBytes))).ReadAll()
+		if err != nil || len(rows) != 2 {
+			t.Fatalf("expected CSV header + 1 open row, got rows=%v err=%v", rows, err)
+		}
+
+		// CapsLockTracker single-tap ('caps_lock') -> timer expired -> full tutorial:
+		mt := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(mt.Stop)
+		mt.Update(tea.WindowSizeMsg{Width: 120, Height: 32})
+
+		_, tickCmd := mt.Update(keyRune("caps_lock"))
+		if mt.showTutorial {
+			t.Fatal("expected first 'caps_lock' with DoubleTapEnable=true to wait for double-tap window before opening tutorial")
+		}
+		if tickCmd == nil || !mt.capsLockTracker.IsPending() {
+			t.Fatal("expected pending CapsLockTracker timer after single 'caps_lock'")
+		}
+		mt.Update(CapsLockTimerExpiredMsg{})
+		if !mt.showTutorial || mt.IsTutorialContextMode() {
+			t.Fatalf("expected CapsLockTimerExpiredMsg to open full tutorial, got show=%v ctx=%v", mt.showTutorial, mt.IsTutorialContextMode())
+		}
+		mt.Update(keyRune("`")) // toggle close
+		if mt.showTutorial {
+			t.Fatal("expected '`' inside tutorial to close tutorial")
+		}
+
+		// CapsLockTracker double-tap -> context-specific tutorial:
+		mt.Update(keyRune("`"))
+		mt.Update(keyRune("`"))
+		if !mt.showTutorial || !mt.IsTutorialContextMode() {
+			t.Fatalf("expected double-tap '`' to open context-specific tutorial, got show=%v ctx=%v", mt.showTutorial, mt.IsTutorialContextMode())
+		}
+		mt.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		// ShowTutorialMsg message handling:
+		mt.Update(ShowTutorialMsg{ContextOnly: true, Context: "insights"})
+		if !mt.showTutorial || !mt.IsTutorialContextMode() {
+			t.Fatal("expected ShowTutorialMsg{ContextOnly: true} to open tutorial in context mode")
+		}
+		mt.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		// Custom TutorialKeyBindings (HelpModalSpace=false, DoubleTapEnable=false):
+		mt.SetTutorialKeyBindings(TutorialKeyBindings{
+			DirectTutorial:  "f2",
+			ContextHelp:     "f3",
+			HelpModalSpace:  false,
+			DoubleTapEnable: false,
+		})
+		mt.Update(keyRune("?"))
+		if !mt.showHelp {
+			t.Fatal("expected '?' to open help modal")
+		}
+		mt.Update(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}})
+		if mt.showTutorial {
+			t.Fatal("expected Space in help modal NOT to open tutorial when HelpModalSpace=false")
+		}
+		mt.Update(tea.KeyMsg{Type: tea.KeyF3})
+		if !mt.showTutorial || !mt.IsTutorialContextMode() {
+			t.Fatal("expected custom ContextHelp='f3' to open context tutorial")
+		}
+	})
+}
+
+func TestWave13Round1AuditRemediations(t *testing.T) {
+	keyRune := func(s string) tea.KeyMsg {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+
+	// [A-6] TUI Semantic Search Scope Key
+	t.Run("A6_SemanticSearchScopeKey", func(t *testing.T) {
+		t.Setenv("BV_SEMANTIC_EMBEDDER", "hash")
+		workDir := t.TempDir()
+		beadsDir := filepath.Join(workDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		canonicalJSONL := filepath.Join(beadsDir, "issues.jsonl")
+		if err := os.WriteFile(canonicalJSONL, []byte(`{"id":"SEM-1","title":"Semantic scope test","status":"open","priority":1}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		issues := []model.Issue{{ID: "SEM-1", Title: "Semantic scope test", Status: model.StatusOpen, Priority: 1}}
+		cfg := search.EmbeddingConfigFromEnv()
+
+		// 1) Canonical <workDir>/.beads/issues.jsonl -> scopeKey == "" -> DefaultIndexPath unchanged.
+		mCanon := NewModel(copyIssues(issues), nil, canonicalJSONL)
+		t.Cleanup(mCanon.Stop)
+		mCanon.SetWorkDir(workDir)
+		if gotKey := mCanon.semanticIndexScopeKey(); gotKey != "" {
+			t.Fatalf("expected empty scopeKey for canonical .beads/issues.jsonl, got %q", gotKey)
+		}
+		cmdCanon := mCanon.startSemanticIndexBuild()
+		if cmdCanon == nil {
+			t.Fatal("expected non-nil startSemanticIndexBuild cmd")
+		}
+		readyCanon, ok := cmdCanon().(SemanticIndexReadyMsg)
+		if !ok || readyCanon.Error != nil {
+			t.Fatalf("BuildSemanticIndexCmd canonical failed: %+v", readyCanon)
+		}
+		wantDefaultPath := search.DefaultIndexPath(workDir, cfg)
+		if readyCanon.IndexPath != wantDefaultPath {
+			t.Fatalf("canonical IndexPath = %q, want %q", readyCanon.IndexPath, wantDefaultPath)
+		}
+
+		// 2) Concrete file outside <workDir>/.beads -> "db:<cleanAbsBeads>" -> scoped .bvvi path.
+		extDir := t.TempDir()
+		externalBeads := filepath.Join(extDir, "external.db")
+		mExt := NewModel(copyIssues(issues), nil, externalBeads)
+		t.Cleanup(mExt.Stop)
+		mExt.SetWorkDir(workDir)
+		wantExtKey := "db:" + filepath.Clean(externalBeads)
+		if gotKey := mExt.semanticIndexScopeKey(); gotKey != wantExtKey {
+			t.Fatalf("external scopeKey = %q, want %q", gotKey, wantExtKey)
+		}
+		cmdExt := mExt.startSemanticIndexBuild()
+		readyExt := cmdExt().(SemanticIndexReadyMsg)
+		wantScopedPath := search.IndexPathForScope(workDir, cfg, wantExtKey)
+		if readyExt.IndexPath != wantScopedPath || readyExt.IndexPath == wantDefaultPath {
+			t.Fatalf("external IndexPath = %q, want scoped %q (!= %q)", readyExt.IndexPath, wantScopedPath, wantDefaultPath)
+		}
+
+		// 3) Non-canonical custom .sqlite inside <workDir>/.beads -> "db:<cleanAbsBeads>".
+		customInBeads := filepath.Join(beadsDir, "custom.sqlite")
+		if got := semanticIndexScopeKey(workDir, customInBeads, false); got != "db:"+filepath.Clean(customInBeads) {
+			t.Fatalf("custom sqlite inside .beads scopeKey = %q, want %q", got, "db:"+filepath.Clean(customInBeads))
+		}
+
+		// 4) git: historical reference or empty path -> scopeKey == "" and in-memory IndexPath == "".
+		mGit := NewModel(copyIssues(issues), nil, "git:HEAD~1:.beads/issues.jsonl")
+		t.Cleanup(mGit.Stop)
+		mGit.SetWorkDir(workDir)
+		if gotKey := mGit.semanticIndexScopeKey(); gotKey != "" {
+			t.Fatalf("git: beadsPath scopeKey = %q, want empty", gotKey)
+		}
+		readyGit := mGit.startSemanticIndexBuild()().(SemanticIndexReadyMsg)
+		if readyGit.IndexPath != "" {
+			t.Fatalf("expected git: historical build to stay in-memory (empty IndexPath), got %q", readyGit.IndexPath)
+		}
+	})
+
+	// [B-1] SourceReloadResult Path/Degraded/Duration Propagation & Slow-Reload Auto-Background Promotion
+	t.Run("B1_SourceReloadResultPathDegradedDurationAndAutoPromotion", func(t *testing.T) {
+		liveIssue, jsonlPath, _ := installEditorTracker(t, "br")
+		t.Setenv("BV_BACKGROUND_MODE", "")
+		t.Setenv("BEADS_DB", "")
+		beadsDir := filepath.Dir(jsonlPath)
+		realProjDir := filepath.Dir(beadsDir)
+		dbPath := filepath.Join(beadsDir, "beads.db")
+
+		makeLiveIssues := func(complete bool) []model.Issue {
+			cloned := liveIssue.Clone()
+			if !complete && cloned.Origin != nil {
+				cloned.Origin.ReadOnlyReason = "incomplete source"
+			}
+			return []model.Issue{cloned}
+		}
+
+		m := NewModel(makeLiveIssues(true), nil, jsonlPath)
+		t.Cleanup(m.Stop)
+		m.SetWorkDir(realProjDir)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+		if gotPath, guiErr := m.guiEditorPath(); guiErr != nil || gotPath != jsonlPath {
+			t.Fatalf("initial guiEditorPath() = (%q, %v), want (%q, nil)", gotPath, guiErr, jsonlPath)
+		}
+
+		// 1) Reload switches .jsonl -> .db with SourceDegraded=true: guiEditorPath() must immediately reject .db,
+		// and sourceReloadCmd() must measure ReloadDuration > 0 when callback leaves ReloadDuration == 0.
+		m.SetSourceReload(func(ctx context.Context) (SourceReloadResult, error) {
+			time.Sleep(5 * time.Millisecond)
+			degraded := makeLiveIssues(false)
+			return SourceReloadResult{
+				Issues:         degraded,
+				Authority:      model.NewReadinessIndex(degraded),
+				SourcePath:     dbPath,
+				SourceDegraded: true,
+				Warnings:       []string{"switched to db"},
+			}, nil
+		})
+		_, cmd1 := m.Update(FileChangedMsg{})
+		msg1 := cmd1().(FileChangedMsg)
+		if msg1.source == nil || msg1.source.ReloadDuration <= 0 {
+			t.Fatalf("expected sourceReloadCmd to populate ReloadDuration > 0, got %+v", msg1.source)
+		}
+		m.Update(msg1)
+		if m.beadsPath != dbPath || !m.sourceDegraded || !m.authorityIncomplete {
+			t.Fatalf("after .jsonl->.db reload: beadsPath=%q degraded=%v incomplete=%v", m.beadsPath, m.sourceDegraded, m.authorityIncomplete)
+		}
+		if gotPath, guiErr := m.guiEditorPath(); guiErr == nil {
+			t.Fatalf("expected guiEditorPath() to reject .db source, got path=%q", gotPath)
+		}
+
+		// 2) Reload switches .db -> .jsonl with SourceDegraded=false, AuthorityIncomplete=false, and ReloadDuration >= 1s:
+		// guiEditorPath() must immediately succeed again AND slow reload must auto-promote to BackgroundWorker even with sourceReload != nil!
+		m.SetSourceReload(func(ctx context.Context) (SourceReloadResult, error) {
+			live := makeLiveIssues(true)
+			return SourceReloadResult{
+				Issues:              live,
+				Authority:           model.NewReadinessIndex(live),
+				SourcePath:          jsonlPath,
+				SourceDegraded:      false,
+				AuthorityIncomplete: false,
+				Warnings:            []string{"non-authority informational note"},
+				ReloadDuration:      1200 * time.Millisecond,
+			}, nil
+		})
+		_, cmd2 := m.Update(FileChangedMsg{})
+		m.Update(cmd2())
+		if m.beadsPath != jsonlPath || m.sourceDegraded || m.authorityIncomplete {
+			t.Fatalf("after .db->.jsonl reload: beadsPath=%q degraded=%v incomplete=%v", m.beadsPath, m.sourceDegraded, m.authorityIncomplete)
+		}
+		if gotPath, guiErr := m.guiEditorPath(); guiErr != nil || gotPath != jsonlPath {
+			t.Fatalf("after .db->.jsonl reload, guiEditorPath() = (%q, %v), want (%q, nil)", gotPath, guiErr, jsonlPath)
+		}
+		if m.backgroundWorker == nil {
+			t.Fatalf("expected slow (>=1s) single-file .jsonl SourceReloadResult to auto-promote to BackgroundWorker; status=%q", m.statusMsg)
+		}
+		if !strings.Contains(m.statusMsg, "background mode auto-enabled") {
+			t.Fatalf("expected statusMsg to mention background mode auto-enabled, got %q", m.statusMsg)
+		}
+
+		// 3) Negative control: explicit --db (SetExplicitDB(true)) must NOT auto-promote to JSONL BackgroundWorker.
+		mExplicit := NewModel(makeLiveIssues(true), nil, jsonlPath, ReadinessScope{ExplicitDB: true})
+		t.Cleanup(mExplicit.Stop)
+		mExplicit.SetSourceReload(func(ctx context.Context) (SourceReloadResult, error) {
+			live := makeLiveIssues(true)
+			return SourceReloadResult{
+				Issues:         live,
+				Authority:      model.NewReadinessIndex(live),
+				SourcePath:     jsonlPath,
+				SourceDegraded: true,
+				ReloadDuration: 1200 * time.Millisecond,
+			}, nil
+		})
+		_, cmd3 := mExplicit.Update(FileChangedMsg{})
+		mExplicit.Update(cmd3())
+		if mExplicit.backgroundWorker != nil {
+			t.Fatal("expected ExplicitDB model NOT to auto-promote to JSONL BackgroundWorker")
+		}
+		if !strings.Contains(mExplicit.statusMsg, "consider BV_BACKGROUND_MODE=1") {
+			t.Fatalf("expected ExplicitDB slow reload to suggest BV_BACKGROUND_MODE=1, got %q", mExplicit.statusMsg)
+		}
+	})
+
+	// [B-2] Preserve flowDetailID Full-Width Sizing & Issue Content Across Modal Overlays
+	t.Run("B2_FlowDetailFullWidthAndIssuePreservedAcrossModals", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "LIST-TOP", Title: "Unrelated Top List Issue", Description: "UnrelatedTopListMarkerBody", Status: model.StatusOpen, Priority: 0},
+			{ID: "FLOW-BLK", Title: "Flow Blocker Issue", Status: model.StatusOpen, Priority: 1, Labels: []string{"ops"}},
+			{
+				ID: "FLOW-END", Title: "Flow Endpoint Target Issue", Description: "UniqueFlowDetailMarkerBody",
+				Status: model.StatusOpen, Priority: 2, Labels: []string{"api"},
+				Dependencies: []*model.Dependency{{IssueID: "FLOW-END", DependsOnID: "FLOW-BLK", Type: model.DepBlocks}},
+			},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+		if !m.isSplitView {
+			t.Fatal("precondition: expected split view at width 140")
+		}
+		// Ensure list cursor is on LIST-TOP, NOT FLOW-END.
+		m.list.Select(0)
+
+		// Open Flow Matrix ('f'), enter drilldown ('Enter'), select FLOW-END ('Down'), and open flowDetailID ('Enter').
+		m.Update(keyRune("f"))
+		m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		if m.flowDetailID != "FLOW-END" {
+			t.Fatalf("expected flowDetailID=FLOW-END after drilldown Enter, got %q", m.flowDetailID)
+		}
+		if m.viewport.Width != 140 {
+			t.Fatalf("expected full-width viewport 140 in flowDetailID, got %d", m.viewport.Width)
+		}
+		if !strings.Contains(ansi.Strip(m.viewport.View()), "UniqueFlowDetailMarkerBody") {
+			t.Fatalf("expected FLOW-END content in viewport, got:\n%s", ansi.Strip(m.viewport.View()))
+		}
+
+		// Press 'V' over flowDetailID and deliver cassSessionsLoadedMsg to open CassModal.
+		_ = m.showCassSessionModal()
+		if m.cassRequest == nil || m.cassRequest.beadID != "FLOW-END" {
+			t.Fatalf("expected cassRequest for FLOW-END, got %+v", m.cassRequest)
+		}
+		m.Update(cassSessionsLoadedMsg{
+			request: m.cassRequest,
+			status:  cass.StatusHealthy,
+			result: cass.CorrelationResult{
+				BeadID: "FLOW-END",
+				TopSessions: []cass.ScoredResult{
+					{SearchResult: cass.SearchResult{Title: "Flow Debug Session", SourcePath: "/tmp/session.jsonl"}},
+				},
+			},
+		})
+		if !m.showCassModal || m.focused != focusCassModal {
+			t.Fatalf("expected focusCassModal open over flowDetailID, got show=%v focus=%v", m.showCassModal, m.focused)
+		}
+
+		// Resize terminal AND deliver SnapshotReadyMsg while CassModal is open!
+		m.Update(tea.WindowSizeMsg{Width: 152, Height: 38})
+		snap := NewSnapshotBuilder(copyIssues(issues)).Build()
+		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 1})
+
+		// Dismiss CassModal with Esc: flowDetailID must retain full width (152) and FLOW-END content!
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.focused != focusFlowMatrix || m.flowDetailID != "FLOW-END" {
+			t.Fatalf("expected return to focusFlowMatrix with flowDetailID=FLOW-END, got focus=%v flowDetailID=%q", m.focused, m.flowDetailID)
+		}
+		if m.viewport.Width != 152 {
+			t.Fatalf("expected full-width viewport 152 preserved across V -> WindowSizeMsg -> Esc, got %d", m.viewport.Width)
+		}
+		vpPlain := ansi.Strip(m.viewport.View())
+		if !strings.Contains(vpPlain, "UniqueFlowDetailMarkerBody") || strings.Contains(vpPlain, "Unrelated Top List Issue") {
+			t.Fatalf("expected FLOW-END content preserved (not overwritten by list selection), got:\n%s", vpPlain)
+		}
+
+		// Also verify Help ('?') and AgentPrompt modals over flowDetailID + WindowSizeMsg + Esc.
+		m.Update(keyRune("?"))
+		if !m.showHelp || m.focused != focusHelp {
+			t.Fatalf("expected Help modal open over flowDetailID, got show=%v focus=%v", m.showHelp, m.focused)
+		}
+		m.Update(tea.WindowSizeMsg{Width: 148, Height: 36})
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.viewport.Width != 148 || !strings.Contains(ansi.Strip(m.viewport.View()), "UniqueFlowDetailMarkerBody") {
+			t.Fatalf("expected full width 148 & FLOW-END content preserved across Help modal, got width=%d", m.viewport.Width)
+		}
+
+		m.Update(AgentFileCheckMsg{ShouldPrompt: true, FilePath: "/tmp/AGENTS.md", FileType: "AGENTS.md"})
+		m.Update(tea.WindowSizeMsg{Width: 146, Height: 36})
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.viewport.Width != 146 || !strings.Contains(ansi.Strip(m.viewport.View()), "UniqueFlowDetailMarkerBody") {
+			t.Fatalf("expected full width 146 & FLOW-END content preserved across AgentPrompt, got width=%d", m.viewport.Width)
+		}
+	})
+
+	// [B-3] SnapshotReadyMsg Candidate-Scoped Alerts & RelatedIssueID Scope Filtering
+	t.Run("B3_SnapshotReadyCandidateScopedAlertsAndRelatedIssueIDScope", func(t *testing.T) {
+		now := time.Now().UTC()
+		staleTime := now.Add(-45 * 24 * time.Hour)
+		issues := []model.Issue{
+			{ID: "cand-1", Title: "Fresh candidate issue", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now},
+			// Non-candidate stale issue that triggers stale alert in unscoped SnapshotBuilder:
+			{ID: "ctx-stale", Title: "Ancient context issue", Status: model.StatusOpen, Priority: 1, CreatedAt: staleTime, UpdatedAt: staleTime},
+		}
+		auth := model.NewReadinessIndex(issues)
+		cands := map[string]bool{"cand-1": true}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{Authority: auth, CandidateIDs: cands})
+		t.Cleanup(m.Stop)
+		m.SetWorkDir(t.TempDir())
+
+		// Unscoped SnapshotBuilder includes stale alert for ctx-stale (and any global unscoped alerts).
+		snap := NewSnapshotBuilder(copyIssues(issues), auth).Build()
+		snap.alerts = append(snap.alerts,
+			drift.Alert{Type: drift.AlertBlockingCascade, Severity: drift.SeverityCritical, Message: "Unscoped global cascade"},
+			drift.Alert{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "ctx-stale", Message: "Stale context"},
+		)
+		snap.alertsCritical = 1
+		snap.alertsWarning = 1
+
+		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 1})
+		for _, a := range m.activeScopedAlerts() {
+			if a.Message == "Unscoped global cascade" || a.IssueID == "ctx-stale" {
+				t.Fatalf("unscoped snapshot alert leaked into candidate-scoped model: %+v", a)
+			}
+		}
+		if m.alertsCritical != 0 || m.alertsWarning != 0 {
+			t.Fatalf("expected recomputed visible alert counts (0, 0), got critical=%d warning=%d", m.alertsCritical, m.alertsWarning)
+		}
+
+		// RelatedIssueID scope filtering & distinct alertKey dismissal for AlertPotentialDuplicate:
+		dupIssues := []model.Issue{
+			{ID: "api-1", Title: "Auth token validation", Status: model.StatusOpen, Priority: 1},
+			{ID: "api-2", Title: "Auth token validator", Status: model.StatusOpen, Priority: 1},
+			{ID: "api-3", Title: "Auth token check", Status: model.StatusOpen, Priority: 1},
+			{ID: "web-1", Title: "Auth token validation UI", Status: model.StatusOpen, Priority: 1},
+		}
+		mDup := NewModel(copyIssues(dupIssues), nil, "")
+		t.Cleanup(mDup.Stop)
+		mDup.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, RepoPrefixes: []string{"api", "web"}})
+		mDup.activeRepos = map[string]bool{"api": true}
+		mDup.alerts = []drift.Alert{
+			{Type: drift.AlertPotentialDuplicate, Severity: drift.SeverityInfo, IssueID: "api-1", RelatedIssueID: "web-1", Message: "cross-repo dup"},
+			{Type: drift.AlertPotentialDuplicate, Severity: drift.SeverityInfo, IssueID: "api-1", RelatedIssueID: "api-2", Message: "in-repo dup 1-2"},
+			{Type: drift.AlertPotentialDuplicate, Severity: drift.SeverityInfo, IssueID: "api-1", RelatedIssueID: "api-3", Message: "in-repo dup 1-3"},
+		}
+		mDup.recomputeVisibleAlertCounts()
+
+		scopedAlerts := mDup.activeScopedAlerts()
+		if len(scopedAlerts) != 2 || mDup.alertsInfo != 2 {
+			t.Fatalf("expected cross-repo RelatedIssueID=web-1 filtered out leaving 2 alerts, got %d (info=%d): %+v",
+				len(scopedAlerts), mDup.alertsInfo, scopedAlerts)
+		}
+		if alertKey(scopedAlerts[0]) == alertKey(scopedAlerts[1]) {
+			t.Fatalf("expected distinct alertKeys for distinct RelatedIssueIDs on api-1, got %q", alertKey(scopedAlerts[0]))
+		}
+
+		// Open Alerts panel ('!') and press 'd' once: only (api-1, api-2) is dismissed; (api-1, api-3) remains!
+		mDup.Update(keyRune("!"))
+		if !mDup.showAlertsPanel {
+			t.Fatal("expected '!' to open alerts panel")
+		}
+		mDup.Update(keyRune("d"))
+		remaining := mDup.activeScopedAlerts()
+		if len(remaining) != 1 || remaining[0].RelatedIssueID != "api-3" || mDup.alertsInfo != 1 {
+			t.Fatalf("expected only (api-1, api-3) remaining after single 'd', got remaining=%+v info=%d", remaining, mDup.alertsInfo)
+		}
+	})
+
+	// [B-4] Unified TUI exportToMarkdown() GeneratedAt, Canonical Metrics, & Repo-Scoped GraphStats
+	t.Run("B4_ExportGeneratedAtCanonicalMetricsAndRepoScopedGraphStats", func(t *testing.T) {
+		histRef := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+		deferUntil := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC) // Future at histRef, past at real time.Now()!
+		issues := []model.Issue{
+			{
+				ID:         "EXP-DEFER",
+				Title:      "Deferred at historical timestamp",
+				Status:     model.StatusOpen,
+				Priority:   1,
+				IssueType:  model.TypeTask,
+				CreatedAt:  histRef.Add(-24 * time.Hour),
+				UpdatedAt:  histRef,
+				DeferUntil: &deferUntil,
+			},
+		}
+
+		// 1) Default Markdown export stamps historical GeneratedAt and evaluates Claimable at GeneratedAt.
+		outDir1 := t.TempDir()
+		beadsFile1 := filepath.Join(outDir1, ".beads", "issues.jsonl")
+		if err := os.MkdirAll(filepath.Dir(beadsFile1), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(beadsFile1, []byte(`{"id":"EXP-DEFER","title":"Deferred","status":"open","priority":1}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mHist := NewModel(copyIssues(issues), nil, beadsFile1)
+		t.Cleanup(mHist.Stop)
+		mHist.SetWorkDir(outDir1)
+		mHist.analyzer.SetNow(histRef)
+		mHist.exportToMarkdown()
+		mdBytes, err := os.ReadFile(filepath.Join(outDir1, mHist.generateExportFilename()))
+		if err != nil {
+			t.Fatalf("reading default markdown export: %v", err)
+		}
+		mdText := string(mdBytes)
+		wantStamp := fmt.Sprintf("*Generated: %s*", histRef.Format(time.RFC1123))
+		if !strings.Contains(mdText, wantStamp) {
+			t.Fatalf("expected historical Generated stamp %q in Markdown export, got:\n%s", wantStamp, mdText)
+		}
+		if strings.Contains(mdText, "--claim") {
+			t.Fatalf("expected EXP-DEFER NOT claimable at historical GeneratedAt %s, got:\n%s", histRef, mdText)
+		}
+
+		// 2) Recipe JSON export with ShowMetrics=true and empty Metrics uses canonical 8-key metric set + historical GeneratedAt.
+		outDir2 := t.TempDir()
+		jsonRecipe := &recipe.Recipe{
+			Name:   "canonical-metrics",
+			View:   recipe.ViewConfig{ShowMetrics: true},
+			Export: recipe.ExportConfig{Format: "json"},
+		}
+		mMetrics := NewModel(copyIssues(issues), jsonRecipe, beadsFile1)
+		t.Cleanup(mMetrics.Stop)
+		mMetrics.SetWorkDir(outDir2)
+		mMetrics.analyzer.SetNow(histRef)
+		mMetrics.analysis.WaitForPhase2()
+		mMetrics.exportToMarkdown()
+
+		jsonPath2 := filepath.Join(outDir2, fmt.Sprintf("beads_export_%s.json", time.Now().Format("2006-01-02")))
+		rawJSON2, err := os.ReadFile(jsonPath2)
+		if err != nil {
+			t.Fatalf("reading recipe JSON export: %v", err)
+		}
+		var parsed2 struct {
+			GeneratedAt time.Time `json:"generated_at"`
+			Issues      []struct {
+				ID      string             `json:"id"`
+				Metrics map[string]float64 `json:"metrics"`
+				Actions struct {
+					ClaimCommand string `json:"claim_command"`
+				} `json:"actions"`
+			} `json:"issues"`
+		}
+		if err := json.Unmarshal(rawJSON2, &parsed2); err != nil {
+			t.Fatalf("unmarshaling recipe JSON export: %v", err)
+		}
+		if !parsed2.GeneratedAt.Equal(histRef) {
+			t.Fatalf("JSON generated_at = %v, want %v", parsed2.GeneratedAt, histRef)
+		}
+		if len(parsed2.Issues) != 1 || parsed2.Issues[0].Actions.ClaimCommand != "" {
+			t.Fatalf("expected empty claim_command at historical ref time, got %+v", parsed2.Issues)
+		}
+		want8Keys := []string{"pagerank", "betweenness", "critical_path", "eigenvector", "hubs", "authorities", "in_degree", "out_degree"}
+		for _, k := range want8Keys {
+			if _, exists := parsed2.Issues[0].Metrics[k]; !exists {
+				t.Fatalf("missing canonical metric key %q in %v", k, parsed2.Issues[0].Metrics)
+			}
+		}
+
+		// 3) Workspace repo-filtered export passes repo-scoped GraphStats (not unscoped multi-repo m.analysis).
+		outDir3 := t.TempDir()
+		wsIssues := []model.Issue{
+			{ID: "api-1", Title: "API root", Status: model.StatusOpen, Priority: 1},
+			{ID: "api-2", Title: "API leaf", Status: model.StatusOpen, Priority: 2, Dependencies: []*model.Dependency{{IssueID: "api-2", DependsOnID: "api-1", Type: model.DepBlocks}}},
+			{ID: "web-1", Title: "Web 1", Status: model.StatusOpen, Priority: 1},
+			{ID: "web-2", Title: "Web 2", Status: model.StatusOpen, Priority: 1, Dependencies: []*model.Dependency{{IssueID: "web-2", DependsOnID: "web-1", Type: model.DepBlocks}}},
+			{ID: "web-3", Title: "Web 3", Status: model.StatusOpen, Priority: 1, Dependencies: []*model.Dependency{{IssueID: "web-3", DependsOnID: "web-2", Type: model.DepBlocks}}},
+		}
+		wsRecipe := &recipe.Recipe{
+			Name:   "ws-json",
+			Export: recipe.ExportConfig{Format: "json"},
+		}
+		mWS := NewModel(copyIssues(wsIssues), wsRecipe, "")
+		t.Cleanup(mWS.Stop)
+		mWS.SetWorkDir(outDir3)
+		mWS.analysis.WaitForPhase2()
+		mWS.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, RepoPrefixes: []string{"api", "web"}})
+		mWS.activeRepos = map[string]bool{"api": true}
+		mWS.applyRecipe(wsRecipe)
+		mWS.exportToMarkdown()
+
+		rawWS, err := os.ReadFile(filepath.Join(outDir3, fmt.Sprintf("beads_export_%s.json", time.Now().Format("2006-01-02"))))
+		if err != nil {
+			t.Fatalf("reading workspace JSON export: %v", err)
+		}
+		var parsedWS struct {
+			Graph struct {
+				Nodes int `json:"nodes"`
+				Edges int `json:"edges"`
+			} `json:"graph"`
+		}
+		if err := json.Unmarshal(rawWS, &parsedWS); err != nil {
+			t.Fatalf("unmarshaling workspace JSON export: %v", err)
+		}
+		if parsedWS.Graph.Nodes != 2 || parsedWS.Graph.Edges != 1 {
+			t.Fatalf("expected repo-scoped graph (2 nodes, 1 edge), got nodes=%d edges=%d:\n%s",
+				parsedWS.Graph.Nodes, parsedWS.Graph.Edges, string(rawWS))
+		}
+	})
+
+	// [B-5], [B-6], [B-7] rebuildInsightsPanel() Refresh, Lazy Gate, ClampSelections, & O(1) Caching
+	t.Run("B5_B6_B7_InsightsRefreshLazyGateClampAndCache", func(t *testing.T) {
+		makeGraphIssues := func(count int) []model.Issue {
+			out := make([]model.Issue, 0, count)
+			for idx := 0; idx < count; idx++ {
+				id := fmt.Sprintf("api-%d", idx+1)
+				iss := model.Issue{ID: id, Title: fmt.Sprintf("Issue %d", idx+1), Status: model.StatusOpen, Priority: 1}
+				if idx > 0 {
+					prev := fmt.Sprintf("api-%d", idx)
+					iss.Dependencies = []*model.Dependency{{IssueID: id, DependsOnID: prev, Type: model.DepBlocks}}
+				}
+				out = append(out, iss)
+			}
+			return out
+		}
+
+		// 1) [B-6] Lazy gate in workspace repo-scoped mode while focus != focusInsights:
+		m := NewModel(append(makeGraphIssues(4), model.Issue{ID: "web-1", Title: "Web", Status: model.StatusOpen, Priority: 1}), nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+		m.analysis.WaitForPhase2()
+		m.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, RepoPrefixes: []string{"api", "web"}})
+		m.activeRepos = map[string]bool{"api": true}
+
+		snap4 := NewSnapshotBuilder(append(makeGraphIssues(4), model.Issue{ID: "web-1", Title: "Web", Status: model.StatusOpen, Priority: 1})).Build()
+		snap4.Analysis.WaitForPhase2()
+		m.Update(SnapshotReadyMsg{Snapshot: snap4, SnapshotVer: 1})
+		if m.insightsPanel.advancedInsights != nil || m.advancedInsightsComputes != 0 {
+			t.Fatalf("expected lazy gate to skip GenerateAdvancedInsightsFromStats while focusList active, got adv=%v computes=%d",
+				m.insightsPanel.advancedInsights, m.advancedInsightsComputes)
+		}
+
+		// 2) [B-7] O(1) cache hit across i -> Esc -> i (in workspace repo-scoped mode AND single-repo mode):
+		m.Update(keyRune("i"))
+		if m.focused != focusInsights || m.insightsPanel.advancedInsights == nil || m.advancedInsightsComputes != 1 {
+			t.Fatalf("expected 1st 'i' to compute AdvancedInsights once, got focus=%v adv=%v computes=%d",
+				m.focused, m.insightsPanel.advancedInsights, m.advancedInsightsComputes)
+		}
+		firstAdvPtr := m.insightsPanel.advancedInsights
+
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.focused != focusList {
+			t.Fatalf("expected focusList after Esc, got %v", m.focused)
+		}
+		m.Update(keyRune("i"))
+		if m.advancedInsightsComputes != 1 || m.insightsPanel.advancedInsights != firstAdvPtr {
+			t.Fatalf("expected 2nd 'i' to reuse cached AdvancedInsights in O(1), got computes=%d samePtr=%v",
+				m.advancedInsightsComputes, m.insightsPanel.advancedInsights == firstAdvPtr)
+		}
+
+		// 3) [B-5] SnapshotReadyMsg & Phase2ReadyMsg while focusInsights (even under Help modal) rebuild & ClampSelections on shrink:
+		m.insightsPanel.focusedPanel = PanelBottlenecks
+		m.insightsPanel.selectedIndex[PanelBottlenecks] = 99
+		m.Update(keyRune("?")) // Help modal over focusInsights -> effectiveUnderlyingFocus() == focusInsights
+		if !m.showHelp || m.effectiveUnderlyingFocus() != focusInsights {
+			t.Fatalf("expected Help modal over focusInsights, got showHelp=%v underlying=%v", m.showHelp, m.effectiveUnderlyingFocus())
+		}
+
+		shrunk := []model.Issue{{ID: "api-1", Title: "Only issue left", Status: model.StatusOpen, Priority: 1}}
+		snapShrunk := NewSnapshotBuilder(copyIssues(shrunk)).Build()
+		snapShrunk.Analysis.WaitForPhase2()
+		m.Update(SnapshotReadyMsg{Snapshot: snapShrunk, SnapshotVer: 2})
+
+		cnt := m.insightsPanel.panelItemCount(PanelBottlenecks)
+		maxAllowed := 0
+		if cnt > 0 {
+			maxAllowed = cnt - 1
+		}
+		if m.insightsPanel.selectedIndex[PanelBottlenecks] > maxAllowed {
+			t.Fatalf("expected SnapshotReadyMsg to run rebuildInsightsPanel+ClampSelections (max %d), got %d",
+				maxAllowed, m.insightsPanel.selectedIndex[PanelBottlenecks])
+		}
+		if m.advancedInsightsComputes != 2 {
+			t.Fatalf("expected new snapshot in focusInsights to recompute AdvancedInsights (computes=2), got %d", m.advancedInsightsComputes)
+		}
+	})
+
+	// [B-8] & [B-9] canScrollShortcutsSidebar() & CapsLockTimerExpiredMsg guards
+	t.Run("B8_B9_ShortcutsSidebarScrollGuardsAndCapsLockTimerReset", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "SB-1", Title: "Scroll guard test", Status: model.StatusOpen, Priority: 1, Labels: []string{"core"}},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 160, Height: 36})
+		m.showShortcutsSidebar = true
+
+		// [B-8] PgUp/PgDown must NOT be hijacked by shortcuts sidebar in scrollable views:
+		for _, f := range []focus{focusInsights, focusAttention, focusLabelDashboard, focusVelocityComparison} {
+			m.focused = f
+			if m.canScrollShortcutsSidebar("pgup") || m.canScrollShortcutsSidebar("pgdown") {
+				t.Fatalf("canScrollShortcutsSidebar must be false for pgup/pgdown in focus %v", f)
+			}
+		}
+
+		// [B-9] Pressing any non-CapsLock key while CapsLockTracker.IsPending() resets the pending timer:
+		m.focused = focusList
+		_, _ = m.Update(keyRune("caps_lock"))
+		if !m.capsLockTracker.IsPending() {
+			t.Fatal("precondition: expected pending capsLockTracker after single 'caps_lock'")
+		}
+		m.Update(keyRune("j"))
+		if m.capsLockTracker.IsPending() {
+			t.Fatal("expected non-CapsLock key 'j' to reset pending capsLockTracker")
+		}
+		m.Update(CapsLockTimerExpiredMsg{})
+		if m.showTutorial {
+			t.Fatal("expected CapsLockTimerExpiredMsg after reset NOT to open tutorial")
+		}
+
+		// [B-9] Guard CapsLockTimerExpiredMsg when text input is active ('/' filtering):
+		m.Update(keyRune("/"))
+		if !m.isTextInputActive() {
+			t.Fatal("precondition: expected isTextInputActive() after '/'")
+		}
+		_, _ = m.capsLockTracker.HandlePress()
+		m.Update(CapsLockTimerExpiredMsg{})
+		if m.showTutorial {
+			t.Fatal("expected CapsLockTimerExpiredMsg NOT to open tutorial while text input is active")
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		// [B-9] Guard CapsLockTimerExpiredMsg when showQuitConfirm is active:
+		m.showQuitConfirm = true
+		_, _ = m.capsLockTracker.HandlePress()
+		m.Update(CapsLockTimerExpiredMsg{})
+		if m.showTutorial {
+			t.Fatal("expected CapsLockTimerExpiredMsg NOT to open tutorial while showQuitConfirm is active")
+		}
+	})
+
+	// [R2-B1] & [R2-B2] DisableInternalWatcher round-trip & candidate-scoped background promotion guard
+	t.Run("R2_B1_B2_DisableInternalWatcherAndCandidateScopedNoBackgroundPromotion", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+		dbPath := filepath.Join(beadsDir, "beads.db")
+		line := `{"id":"ISS-1","title":"Live reload issue","status":"open","priority":1,"issue_type":"task"}` + "\n"
+		if err := os.WriteFile(jsonlPath, []byte(line), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		seed := []model.Issue{{ID: "ISS-1", Title: "Live reload issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
+		m := NewModel(copyIssues(seed), nil, jsonlPath, ReadinessScope{
+			Authority:    model.NewReadinessIndex(seed),
+			CandidateIDs: map[string]bool{"ISS-1": true},
+		})
+		t.Cleanup(m.Stop)
+		m.DisableInternalWatcher()
+		if m.watcher != nil {
+			t.Fatal("expected DisableInternalWatcher() to stop and nil m.watcher")
+		}
+
+		reloadCalls := 0
+		nextSource := dbPath
+		m.SetSourceReload(func(ctx context.Context) (SourceReloadResult, error) {
+			reloadCalls++
+			live := copyIssues(seed)
+			live[0].Title = fmt.Sprintf("Reload #%d", reloadCalls)
+			return SourceReloadResult{
+				Issues:         live,
+				Authority:      model.NewReadinessIndex(live),
+				CandidateIDs:   map[string]bool{"ISS-1": true},
+				SourcePath:     nextSource,
+				ReloadDuration: 1200 * time.Millisecond,
+			}, nil
+		})
+
+		// Round-trip 1: .jsonl -> .db
+		_, cmd1 := m.Update(FileChangedMsg{})
+		m.Update(cmd1())
+		if m.beadsPath != dbPath || m.watcher != nil {
+			t.Fatalf("after .jsonl->.db reload: beadsPath=%q watcher=%v", m.beadsPath, m.watcher)
+		}
+
+		// Round-trip 2: .db -> .jsonl (slow >=1s, with CandidateIDs != nil)
+		nextSource = jsonlPath
+		_, cmd2 := m.Update(FileChangedMsg{})
+		m.Update(cmd2())
+		if m.beadsPath != jsonlPath || m.watcher != nil {
+			t.Fatalf("after .db->.jsonl reload: beadsPath=%q watcher=%v", m.beadsPath, m.watcher)
+		}
+		if m.backgroundWorker != nil {
+			t.Fatalf("expected candidate-scoped Model NOT to auto-promote to BackgroundWorker; status=%q", m.statusMsg)
+		}
+
+		// Round-trip 3: subsequent FileChangedMsg must still invoke m.sourceReload!
+		_, cmd3 := m.Update(FileChangedMsg{})
+		m.Update(cmd3())
+		if reloadCalls != 3 {
+			t.Fatalf("expected 3 sourceReload invocations across round-trips, got %d", reloadCalls)
 		}
 	})
 }

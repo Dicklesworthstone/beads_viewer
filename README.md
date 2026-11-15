@@ -994,8 +994,8 @@ The visualization is fully keyboard-driven:
 ### Features
 
 **Filtering & Search**
-- **Full-text search**: Dropdown search over ID, title, description, design, notes, acceptance criteria, labels and assignee, with live preview (2-character minimum, top 8 results). The graph filter itself dims nodes by ID and title only.
-- **Status filter**: Open, In Progress, Blocked, Closed
+- **Full-text search**: Dropdown search and live graph visibility filter over ID, title, description, design, notes, acceptance criteria, labels, and assignee, with live preview (2-character minimum, top 8 results).
+- **Status filter**: Open, In Progress, Blocked, Deferred, Pinned, Hooked, Review, Draft, Closed
 - **Type filter**: Feature, Bug, Task, Epic
 - **Priority filter**: P0 (Critical) through P4 (Backlog)
 - **Label filter**: Dynamically populated from your data
@@ -1183,7 +1183,7 @@ presentation fields configure the existing list, details, and graph:
 | `view.show_graph` | Opens the dependency graph when selecting the recipe. Later keyboard navigation is preserved across refreshes. |
 | `view.show_metrics` | Shows PageRank, impact, and triage values in rows and issue details. Unavailable metrics display an em dash in rows and `unavailable` in details. |
 | `metrics` | Selects displayed metrics and enables metric display: `pagerank`, `betweenness`, `impact`, `triage`, `hub`, `authority`, `eigenvector`, `kcore`, `slack`. |
-| `view.group_by` | Groups the list by `status`, `priority`, or `tag`; `none` disables groups. Tag grouping uses the first alphabetically sorted label, or `untagged`. |
+| `view.group_by` | Groups the list by `status`, `priority`, `assignee`, or `tag` (`label`/`labels`); `none` disables groups. Tag grouping uses the first alphabetically sorted label, or `untagged`. |
 | `view.collapsed` | Starts groups collapsed. Enter or Space on a group expands/collapses it; search still includes collapsed issues. |
 | `view.truncate_title` | Maximum title display cells, including ellipsis; respects wide Unicode characters. Zero uses available width. |
 
@@ -1206,7 +1206,8 @@ bv --recipe sprint-review --export review.mmd --export-format mermaid
 
 Explicit export flags override recipe defaults. Without either, the format is
 Markdown and graphs are included; CSV defaults to no graph. `--export-md PATH`
-explicitly selects Markdown. `--export-include-graph=false` disables a recipe
+explicitly selects Markdown. `--export-group-by <status|priority|assignee|label|none>`
+overrides `view.group_by` for Markdown exports. `--export-include-graph=false` disables a recipe
 graph, and `--export-template=` clears a recipe template. CSV with a graph,
 Mermaid without a graph, and custom templates for other formats are errors.
 Selecting a recipe for the TUI or robot analysis creates no export file.
@@ -1765,8 +1766,8 @@ The tree construction uses a **parent-child only** filter with intelligent root 
 | `Enter` / `Space` | Toggle expand/collapse on current node |
 | `l` / `→` | Expand node, or move to first child if already expanded |
 | `h` / `←` | Collapse node, or jump to parent if already collapsed |
-| `o` | Expand all nodes in the tree |
-| `O` | Collapse all nodes in the tree |
+| `o` / `X` | Expand all nodes in the tree |
+| `Z` | Collapse all nodes in the tree |
 | **Integration** | |
 | `b` / `m` | Toggle between parent-child hierarchy mode and blocking dependency mode |
 | `Tab` | Sync selection to detail panel (in split view) |
@@ -3323,13 +3324,11 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--agents-reset` | bool | `false` | Clear saved AGENTS.md prompt preference | Agent File Management |
 | `--agents-update` | bool | `false` | Update beads workflow instructions to latest version | Agent File Management |
 | `--agent-brief` | string | (empty) | Export agent brief bundle to directory (includes triage.json, insights.json, brief.md, helpers.md) | Export & Reporting |
-| `--debug-height` | int | `50` | Height for debug render | Export & Reporting |
-| `--debug-render` | string | (empty) | Render a view and output to file (views: insights, board) | Export & Reporting |
-| `--debug-width` | int | `180` | Width for debug render | Export & Reporting |
 | `--emit-script` | bool | `false` | Emit shell script for top-N recommendations (agent workflows) | Export & Reporting |
 | `--export` | string | (empty) | Export a report using recipe defaults or explicit export options | Export & Reporting |
-| `--export-format` | string | (empty) | Report format: markdown, json, csv or mermaid | Export & Reporting |
+| `--export-format` | string | (empty) | Report format: markdown, html, json, csv or mermaid | Export & Reporting |
 | `--export-graph` | string | (empty) | Export graph: .html for interactive, .png/.svg for static (auto-names if empty) | Export & Reporting |
+| `--export-group-by` | string | (empty) | Group exported issues by: status, priority, type, assignee, label, or none (overrides recipe view.group_by) | Export & Reporting |
 | `--export-include-graph` | bool | `true` | Include dependency context in the report (explicit false overrides recipe) | Export & Reporting |
 | `--export-md` | string | (empty) | Export issues to a Markdown file (e.g., report.md) | Export & Reporting |
 | `--export-pages` | string | (empty) | Export static site to directory (e.g., ./bv-pages) | Export & Reporting |
@@ -3353,14 +3352,11 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--watch-export` | bool | `false` | Watch for beads changes and auto-regenerate export (use with --export-pages) | Export & Reporting |
 | `--background-mode` | bool | `false` | Enable experimental background snapshot loading (TUI only) | General Flags |
 | `--check-update` | bool | `false` | Check if a new version is available | General Flags |
-| `--cpu-profile` | string | (empty) | Write CPU profile to file | General Flags |
 | `--db` | string | (empty) | Path to beads database file or .beads directory (overrides BEADS_DB and BEADS_DIR env vars) | General Flags |
 | `--force-full-analysis` | bool | `false` | Compute all metrics regardless of graph size (may be slow for large graphs) | General Flags |
 | `--format` | string | (empty) | Structured output format for --robot-* commands: json or toon (env: BV_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT) | General Flags |
 | `--no-background-mode` | bool | `false` | Disable experimental background snapshot loading (TUI only) | General Flags |
 | `--no-cache` | bool | `false` | Bypass disk cache for robot triage (also: BV_NO_CACHE=1) | General Flags |
-| `--profile-json` | bool | `false` | Output profile in JSON format (use with --profile-startup) | General Flags |
-| `--profile-startup` | bool | `false` | Output detailed startup timing profile for diagnostics | General Flags |
 | `--rollback` | bool | `false` | Rollback to the previous version (from backup) | General Flags |
 | `--stats` | bool | `false` | Show JSON vs TOON token estimates on stderr (env: TOON_STATS=1) | General Flags |
 | `--theme` | string | (empty) | Color theme: light, dark, or auto (default: detect terminal background) | General Flags |
@@ -3379,8 +3375,6 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--init-drift` | bool | `false` | Create default .bv/drift.yaml configuration file (use --yes to overwrite) | History & Drift |
 | `--min-confidence` | float64 | `0` | Filter correlations by minimum confidence (0.0-1.0) | History & Drift |
 | `--save-baseline` | string | (empty) | Save current metrics as baseline with optional description | History & Drift |
-| `--generate-docs` | bool | `false` | Generate documentation markdown and JSON artifacts | Other |
-| `--network-depth` | int | `2` | Depth of subnetwork when querying specific bead (1-3) | Other |
 | `--agents` | int | `1` | Number of parallel agents for capacity simulation | Robot & Planning Flags |
 | `--attention-limit` | int | `5` | Limit number of labels in --robot-label-attention output | Robot & Planning Flags |
 | `--brief` | bool | `false` | Compact --robot-triage output: only decision-relevant fields (id, title, status, assignee, blockers, unblocks) (#183) | Robot & Planning Flags |
@@ -3399,6 +3393,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--graph-format` | string | `json` | Graph output format: json, dot, mermaid | Robot & Planning Flags |
 | `--graph-root` | string | (empty) | Subgraph from specific root issue ID | Robot & Planning Flags |
 | `--hotspots-limit` | int | `10` | Max hotspots to show (use with --robot-file-hotspots) | Robot & Planning Flags |
+| `--network-depth` | int | `2` | Depth of subnetwork when querying specific bead (1-3) | Robot & Planning Flags |
 | `--orphans-min-score` | int | `30` | Minimum suspicion score for orphan candidates (0-100) | Robot & Planning Flags |
 | `--related-include-closed` | bool | `false` | Include closed beads in related work results | Robot & Planning Flags |
 | `--related-max-results` | int | `10` | Max results per category for related work | Robot & Planning Flags |
@@ -3472,6 +3467,13 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--search-weights` | string | (empty) | Hybrid weights JSON (overrides preset; keys: text,pagerank,status,impact,priority,recency) | Search & Filters |
 | `--severity` | string | (empty) | Filter robot alerts by severity (info|warning|critical) | Search & Filters |
 | `--workspace` | string | (empty) | Load issues from workspace config file (.bv/workspace.yaml) | Search & Filters |
+| `--cpu-profile` | string | (empty) | Write CPU profile to file | Debug Flags |
+| `--debug-height` | int | `50` | Height for debug render | Debug Flags |
+| `--debug-render` | string | (empty) | Render a view and output to file (views: insights, board) | Debug Flags |
+| `--debug-width` | int | `180` | Width for debug render | Debug Flags |
+| `--generate-docs` | bool | `false` | Generate documentation markdown and JSON artifacts | Debug Flags |
+| `--profile-json` | bool | `false` | Output profile in JSON format (use with --profile-startup) | Debug Flags |
+| `--profile-startup` | bool | `false` | Output detailed startup timing profile for diagnostics | Debug Flags |
 <!-- /bv:generated -->
 
 ### Time-Travel Commands
@@ -4266,9 +4268,9 @@ bv has a comprehensive built-in help system:
 | **all** | `j` | Move down |
 |  | `k` | Move up |
 | **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity** | `G` | Go to end |
-| **list,detail,board,insights,actionable,flow,attention,label,velocity** | `home` | Go to start |
+|  | `home` | Go to start |
 | **board,tree** | `gg` | Go to start |
-| **list,detail,board,graph,insights,tree,actionable,attention,velocity** | `ctrl+d` | Page down |
+| **list,detail,board,graph,insights,tree,actionable,flow,attention,label,velocity** | `ctrl+d` | Page down |
 |  | `ctrl+u` | Page up |
 | **list,detail,board,graph,insights,actionable,history** | `enter` | Open details |
 | **all** | `esc` | Back/close (list: clear filters) |
@@ -4309,11 +4311,11 @@ bv has a comprehensive built-in help system:
 |  | `N` | Previous changed issue (time travel) |
 | **list,detail** | `x` | Export to markdown |
 | **list,detail,board,graph,insights,tree,actionable,flow** | `y` | Copy issue ID |
-| **list,detail** | `C` | Copy full issue |
+| **list,detail,board,graph,insights,tree,actionable,flow,history** | `C` | Copy full issue |
 | **list,detail,board,graph,tree,actionable,insights,flow,history** | `O` | Open in $EDITOR |
 | **list** | `'` | Recipe picker |
 |  | `U` | Self-update check |
-| **list,detail,board,graph,insights,tree,actionable,history** | `V` | Cass sessions |
+| **list,detail,board,graph,insights,tree,actionable,flow,history** | `V` | Cass sessions |
 | **list,detail** | `\` | Toggle split view |
 | **graph** | `hjkl` | Navigate graph |
 |  | `H` | Scroll left |
@@ -4369,6 +4371,7 @@ bv has a comprehensive built-in help system:
 |  | `>` | Narrow detail panel |
 | **history** | `v` | Toggle git/bead mode |
 |  | `/` | Search history |
+|  | `A` | Filter by commit author |
 |  | `c` | Cycle confidence filter |
 |  | `tab` | Toggle focus |
 |  | `t` | Toggle timeline pane |
@@ -4400,6 +4403,7 @@ bv has a comprehensive built-in help system:
 | **sprint** | `P` | Close sprint dashboard |
 |  | `j` | Next sprint |
 |  | `k` | Previous sprint |
+|  | `enter` | Jump to first sprint bead |
 <!-- /bv:generated -->
 
 ---
@@ -4433,7 +4437,7 @@ bv has a comprehensive built-in help system:
 | `BV_NO_BROWSER` | Any value: never open a browser after exports or deployments. | (unset) |
 | `BV_NO_CACHE` | Set to `1` to bypass the robot analysis and correlation disk caches (`--no-cache` sets it). | (cache on) |
 | `BV_NO_GITIGNORE` | Disable automatic ignore-file management for `.bv/` entirely (any non-empty value). See [Automatic `.bv/` ignore handling](#automatic-bv-ignore-handling). | (enabled) |
-| `BV_NO_SAVED_CONFIG` | Any value: the `--pages` wizard ignores the saved deployment configuration. | (unset) |
+| `BV_NO_SAVED_CONFIG` | Any non-empty value disables saved deployment configuration (`--pages`), user-level saved preferences, and user recipe defaults unless explicitly specified. | (unset) |
 | `BV_NO_UPDATE_CHECK` | Skip the TUI's startup release check with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` enables it. Nonempty values override `updates.check` in user config (case-insensitive, trimmed); invalid values skip the check, and empty values preserve config. Explicit `--check-update` / `--update` still work. | (check on) |
 | `BV_OUTPUT_FORMAT` | Default robot output format: `json` or `toon` (overridden by `--format`). | `json` |
 | `BV_PHASE2_TIMEOUT_S` | Override per-metric Phase 2 timeouts (seconds). | (size-based) |

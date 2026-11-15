@@ -3,6 +3,48 @@
 <svg width="2242" height="812"
      xmlns="http://www.w3.org/2000/svg"
      xmlns:xlink="http://www.w3.org/1999/xlink">
+<defs>
+<clipPath id="clip-node-0" ><rect x="36" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-1" ><rect x="36" y="266" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-2" ><rect x="286" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-3" ><rect x="286" y="266" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-4" ><rect x="536" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-5" ><rect x="536" y="266" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-6" ><rect x="536" y="376" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-7" ><rect x="786" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-8" ><rect x="786" y="266" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-9" ><rect x="786" y="376" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-10" ><rect x="786" y="486" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-11" ><rect x="1036" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-12" ><rect x="1036" y="266" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-13" ><rect x="1036" y="376" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-14" ><rect x="1036" y="486" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-15" ><rect x="1036" y="596" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-16" ><rect x="1286" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-17" ><rect x="1286" y="266" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-18" ><rect x="1536" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-19" ><rect x="1786" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+</defs>
 <rect x="0" y="0" width="2242" height="812" style="fill:#f9fafb" />
 <rect x="16" y="16" width="2210" height="96" rx="10" ry="10" style="fill:#f3f4f6" />
 <text x="32" y="44" style="fill:#111111;font-size:16px;font-family:monospace;font-weight:bold" >golden</text>
@@ -76,83 +118,83 @@
 <line x1="206" y1="191" x2="286" y2="191" style="stroke:#6b80bf;stroke-width:2" />
 <polygon points="286,191 294,195 294,187" style="fill:#6b80bf" />
 <rect x="36" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="46" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-18</text>
-<text x="46" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >task-18</text>
-<text x="46" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.017</text>
+<text x="46" y="178" clip-path="url(#clip-node-0)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-18</text>
+<text x="46" y="198" clip-path="url(#clip-node-0)" style="fill:#666666;font-size:12px;font-family:monospace" >task-18</text>
+<text x="46" y="216" clip-path="url(#clip-node-0)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.017</text>
 <rect x="36" y="266" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="46" y="288" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-9</text>
-<text x="46" y="308" style="fill:#666666;font-size:12px;font-family:monospace" >task-9</text>
-<text x="46" y="326" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.017</text>
+<text x="46" y="288" clip-path="url(#clip-node-1)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-9</text>
+<text x="46" y="308" clip-path="url(#clip-node-1)" style="fill:#666666;font-size:12px;font-family:monospace" >task-9</text>
+<text x="46" y="326" clip-path="url(#clip-node-1)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.017</text>
 <rect x="286" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="296" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-17</text>
-<text x="296" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >task-17</text>
-<text x="296" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.024</text>
+<text x="296" y="178" clip-path="url(#clip-node-2)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-17</text>
+<text x="296" y="198" clip-path="url(#clip-node-2)" style="fill:#666666;font-size:12px;font-family:monospace" >task-17</text>
+<text x="296" y="216" clip-path="url(#clip-node-2)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.024</text>
 <rect x="286" y="266" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="296" y="288" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-8</text>
-<text x="296" y="308" style="fill:#666666;font-size:12px;font-family:monospace" >task-8</text>
-<text x="296" y="326" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.024</text>
+<text x="296" y="288" clip-path="url(#clip-node-3)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-8</text>
+<text x="296" y="308" clip-path="url(#clip-node-3)" style="fill:#666666;font-size:12px;font-family:monospace" >task-8</text>
+<text x="296" y="326" clip-path="url(#clip-node-3)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.024</text>
 <rect x="536" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="546" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-16</text>
-<text x="546" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >task-16</text>
-<text x="546" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.044</text>
+<text x="546" y="178" clip-path="url(#clip-node-4)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-16</text>
+<text x="546" y="198" clip-path="url(#clip-node-4)" style="fill:#666666;font-size:12px;font-family:monospace" >task-16</text>
+<text x="546" y="216" clip-path="url(#clip-node-4)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.044</text>
 <rect x="536" y="266" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="546" y="288" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-6</text>
-<text x="546" y="308" style="fill:#666666;font-size:12px;font-family:monospace" >task-6</text>
-<text x="546" y="326" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.027</text>
+<text x="546" y="288" clip-path="url(#clip-node-5)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-6</text>
+<text x="546" y="308" clip-path="url(#clip-node-5)" style="fill:#666666;font-size:12px;font-family:monospace" >task-6</text>
+<text x="546" y="326" clip-path="url(#clip-node-5)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.027</text>
 <rect x="536" y="376" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="546" y="398" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-7</text>
-<text x="546" y="418" style="fill:#666666;font-size:12px;font-family:monospace" >task-7</text>
-<text x="546" y="436" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.027</text>
+<text x="546" y="398" clip-path="url(#clip-node-6)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-7</text>
+<text x="546" y="418" clip-path="url(#clip-node-6)" style="fill:#666666;font-size:12px;font-family:monospace" >task-7</text>
+<text x="546" y="436" clip-path="url(#clip-node-6)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.027</text>
 <rect x="786" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="796" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-5</text>
-<text x="796" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >task-5</text>
-<text x="796" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.051</text>
+<text x="796" y="178" clip-path="url(#clip-node-7)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-5</text>
+<text x="796" y="198" clip-path="url(#clip-node-7)" style="fill:#666666;font-size:12px;font-family:monospace" >task-5</text>
+<text x="796" y="216" clip-path="url(#clip-node-7)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.051</text>
 <rect x="786" y="266" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="796" y="288" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-14</text>
-<text x="796" y="308" style="fill:#666666;font-size:12px;font-family:monospace" >task-14</text>
-<text x="796" y="326" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.036</text>
+<text x="796" y="288" clip-path="url(#clip-node-8)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-14</text>
+<text x="796" y="308" clip-path="url(#clip-node-8)" style="fill:#666666;font-size:12px;font-family:monospace" >task-14</text>
+<text x="796" y="326" clip-path="url(#clip-node-8)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.036</text>
 <rect x="786" y="376" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="796" y="398" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-15</text>
-<text x="796" y="418" style="fill:#666666;font-size:12px;font-family:monospace" >task-15</text>
-<text x="796" y="436" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.036</text>
+<text x="796" y="398" clip-path="url(#clip-node-9)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-15</text>
+<text x="796" y="418" clip-path="url(#clip-node-9)" style="fill:#666666;font-size:12px;font-family:monospace" >task-15</text>
+<text x="796" y="436" clip-path="url(#clip-node-9)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.036</text>
 <rect x="786" y="486" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="796" y="508" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-4</text>
-<text x="796" y="528" style="fill:#666666;font-size:12px;font-family:monospace" >task-4</text>
-<text x="796" y="546" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.028</text>
+<text x="796" y="508" clip-path="url(#clip-node-10)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-4</text>
+<text x="796" y="528" clip-path="url(#clip-node-10)" style="fill:#666666;font-size:12px;font-family:monospace" >task-4</text>
+<text x="796" y="546" clip-path="url(#clip-node-10)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.028</text>
 <rect x="1036" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1046" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-13</text>
-<text x="1046" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >task-13</text>
-<text x="1046" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.062</text>
+<text x="1046" y="178" clip-path="url(#clip-node-11)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-13</text>
+<text x="1046" y="198" clip-path="url(#clip-node-11)" style="fill:#666666;font-size:12px;font-family:monospace" >task-13</text>
+<text x="1046" y="216" clip-path="url(#clip-node-11)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.062</text>
 <rect x="1036" y="266" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1046" y="288" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-2</text>
-<text x="1046" y="308" style="fill:#666666;font-size:12px;font-family:monospace" >task-2</text>
-<text x="1046" y="326" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.051</text>
+<text x="1046" y="288" clip-path="url(#clip-node-12)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-2</text>
+<text x="1046" y="308" clip-path="url(#clip-node-12)" style="fill:#666666;font-size:12px;font-family:monospace" >task-2</text>
+<text x="1046" y="326" clip-path="url(#clip-node-12)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.051</text>
 <rect x="1036" y="376" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1046" y="398" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-3</text>
-<text x="1046" y="418" style="fill:#666666;font-size:12px;font-family:monospace" >task-3</text>
-<text x="1046" y="436" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.039</text>
+<text x="1046" y="398" clip-path="url(#clip-node-13)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-3</text>
+<text x="1046" y="418" clip-path="url(#clip-node-13)" style="fill:#666666;font-size:12px;font-family:monospace" >task-3</text>
+<text x="1046" y="436" clip-path="url(#clip-node-13)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.039</text>
 <rect x="1036" y="486" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1046" y="508" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-12</text>
-<text x="1046" y="528" style="fill:#666666;font-size:12px;font-family:monospace" >task-12</text>
-<text x="1046" y="546" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.032</text>
+<text x="1046" y="508" clip-path="url(#clip-node-14)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-12</text>
+<text x="1046" y="528" clip-path="url(#clip-node-14)" style="fill:#666666;font-size:12px;font-family:monospace" >task-12</text>
+<text x="1046" y="546" clip-path="url(#clip-node-14)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.032</text>
 <rect x="1036" y="596" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1046" y="618" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-1</text>
-<text x="1046" y="638" style="fill:#666666;font-size:12px;font-family:monospace" >task-1</text>
-<text x="1046" y="656" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.029</text>
+<text x="1046" y="618" clip-path="url(#clip-node-15)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-1</text>
+<text x="1046" y="638" clip-path="url(#clip-node-15)" style="fill:#666666;font-size:12px;font-family:monospace" >task-1</text>
+<text x="1046" y="656" clip-path="url(#clip-node-15)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.029</text>
 <rect x="1286" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1296" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-10</text>
-<text x="1296" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >task-10</text>
-<text x="1296" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.071</text>
+<text x="1296" y="178" clip-path="url(#clip-node-16)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-10</text>
+<text x="1296" y="198" clip-path="url(#clip-node-16)" style="fill:#666666;font-size:12px;font-family:monospace" >task-10</text>
+<text x="1296" y="216" clip-path="url(#clip-node-16)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.071</text>
 <rect x="1286" y="266" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1296" y="288" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-11</text>
-<text x="1296" y="308" style="fill:#666666;font-size:12px;font-family:monospace" >task-11</text>
-<text x="1296" y="326" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.043</text>
+<text x="1296" y="288" clip-path="url(#clip-node-17)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >task-11</text>
+<text x="1296" y="308" clip-path="url(#clip-node-17)" style="fill:#666666;font-size:12px;font-family:monospace" >task-11</text>
+<text x="1296" y="326" clip-path="url(#clip-node-17)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.043</text>
 <rect x="1536" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1546" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >epic-2</text>
-<text x="1546" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >epic-2</text>
-<text x="1546" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.121</text>
+<text x="1546" y="178" clip-path="url(#clip-node-18)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >epic-2</text>
+<text x="1546" y="198" clip-path="url(#clip-node-18)" style="fill:#666666;font-size:12px;font-family:monospace" >epic-2</text>
+<text x="1546" y="216" clip-path="url(#clip-node-18)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.121</text>
 <rect x="1786" y="156" width="170" height="70" rx="8" ry="8" style="fill:#c8e6c9;stroke:#222222;stroke-width:1.2" />
-<text x="1796" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >epic-1</text>
-<text x="1796" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >epic-1</text>
-<text x="1796" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.220</text>
+<text x="1796" y="178" clip-path="url(#clip-node-19)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >epic-1</text>
+<text x="1796" y="198" clip-path="url(#clip-node-19)" style="fill:#666666;font-size:12px;font-family:monospace" >epic-1</text>
+<text x="1796" y="216" clip-path="url(#clip-node-19)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.220</text>
 </svg>

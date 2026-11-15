@@ -64,7 +64,10 @@ func createCoreTables(tx *sql.Tx) error {
 			closed_at TEXT,
 			due_date TEXT,
 			defer_until TEXT,
-			external_ref TEXT
+			external_ref TEXT,
+			estimated_minutes INTEGER,
+			created_by TEXT,
+			close_reason TEXT
 		)
 	`
 	if _, err := tx.Exec(issuesSQL); err != nil {
@@ -268,6 +271,9 @@ func CreateMaterializedViews(db *sql.DB) error {
 			i.due_date,
 			i.defer_until,
 			i.external_ref,
+			i.estimated_minutes,
+			i.created_by,
+			i.close_reason,
 			'unknown' as dependency_state,
 			0 as is_actionable,
 			COALESCE(m.pagerank, 0) as pagerank,

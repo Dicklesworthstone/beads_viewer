@@ -1523,3 +1523,223 @@ func TestGitLoader_HonorsMaxLineSizeEnv(t *testing.T) {
 		t.Fatalf("unexpected report under BV_MAX_LINE_SIZE_MB=4: stats=%+v len=%d", report.ParseStats, len(report.Issues))
 	}
 }
+
+func TestGitLoader_HonorsBeadsDirAndNestedMonorepoBeads(t *testing.T) {
+	repoDir := initGitLoaderTestRepo(t)
+	commitGitLoaderFixture(t, repoDir, "custom_beads/issues.jsonl",
+		`{"id":"CUST-1","title":"Custom beads dir issue","status":"open","priority":1,"issue_type":"task"}`+"\n",
+		"add custom beads dir")
+	commitGitLoaderFixture(t, repoDir, "services/api/.beads/issues.jsonl",
+		`{"id":"API-1","title":"Nested monorepo beads issue","status":"open","priority":1,"issue_type":"task"}`+"\n",
+		"add nested monorepo beads dir")
+
+	// 1. Explicit BEADS_DIR pointing inside the repo
+	t.Setenv("BEADS_DIR", filepath.Join(repoDir, "custom_beads"))
+	glCustom := NewGitLoader(repoDir)
+	hasCustom, err := glCustom.HasBeadsAtRevision("HEAD")
+	if err != nil || !hasCustom {
+		t.Fatalf("HasBeadsAtRevision with BEADS_DIR=(%v, %v), want (true, nil)", hasCustom, err)
+	}
+	repCustom, err := glCustom.LoadAtWithReport("HEAD")
+	if err != nil {
+		t.Fatalf("LoadAtWithReport with BEADS_DIR failed: %v", err)
+	}
+	if len(repCustom.Issues) != 1 || repCustom.Issues[0].ID != "CUST-1" {
+		t.Fatalf("expected CUST-1 from custom_beads, got %+v", repCustom.Issues)
+	}
+	revsCustom, err := glCustom.ListRevisions(10)
+	if err != nil || len(revsCustom) == 0 {
+		t.Fatalf("ListRevisions with BEADS_DIR=(%d, %v), want >=1", len(revsCustom), err)
+	}
+
+	// 2. Nested monorepo subdirectory without BEADS_DIR
+	t.Setenv("BEADS_DIR", "")
+	nestedDir := filepath.Join(repoDir, "services", "api")
+	glNested := NewGitLoader(nestedDir)
+	repNested, err := glNested.LoadAtWithReport("HEAD")
+	if err != nil {
+		t.Fatalf("LoadAtWithReport from nested subdir failed: %v", err)
+	}
+	if len(repNested.Issues) != 1 || repNested.Issues[0].ID != "API-1" {
+		t.Fatalf("expected API-1 from services/api/.beads, got %+v", repNested.Issues)
+	}
+}
+
+func TestGitLoader_ExplicitOverrideConfinementAndRepoRoot(t *testing.T) {
+	t.Run("in_repo_custom_beads_dir_has_no_dot_beads_fallback", func(t *testing.T) {
+		t.Setenv("BEADS_DB", "")
+		t.Setenv("BEADS_DIR", "")
+
+		repoDir := initGitLoaderTestRepo(t)
+		commitGitLoaderFixture(t, repoDir, ".beads/issues.jsonl",
+			`{"id":"DEFAULT-1","title":"Default dot-beads issue","status":"open","priority":1,"issue_type":"task"}`+"\n",
+			"initial default beads")
+		commitGitLoaderFixture(t, repoDir, "custom_beads/issues.jsonl",
+			`{"id":"CUSTOM-1","title":"Custom beads issue","status":"open","priority":1,"issue_type":"task"}`+"\n",
+			"add custom beads")
+
+		t.Setenv("BEADS_DIR", filepath.Join(repoDir, "custom_beads"))
+		gl := NewGitLoader(repoDir)
+
+		repHead, err := gl.LoadAtWithReport("HEAD")
+		if err != nil {
+			t.Fatalf("LoadAtWithReport(HEAD): %v", err)
+		}
+		if repHead.SourcePath != "custom_beads/issues.jsonl" || len(repHead.Issues) != 1 || repHead.Issues[0].ID != "CUSTOM-1" {
+			t.Fatalf("unexpected HEAD report: source=%q issues=%+v", repHead.SourcePath, repHead.Issues)
+		}
+
+		hasPrev, err := gl.HasBeadsAtRevision("HEAD~1")
+		if err != nil {
+			t.Fatalf("HasBeadsAtRevision(HEAD~1): %v", err)
+		}
+		if hasPrev {
+			t.Fatal("HasBeadsAtRevision(HEAD~1) = true; explicit BEADS_DIR fell back to .beads")
+		}
+		if _, err := gl.LoadAt("HEAD~1"); err == nil {
+			t.Fatal("LoadAt(HEAD~1) succeeded; explicit BEADS_DIR must not fall back to .beads/issues.jsonl")
+		}
+
+		revs, err := gl.ListRevisions(10)
+		if err != nil {
+			t.Fatalf("ListRevisions: %v", err)
+		}
+		if len(revs) != 1 || revs[0].Message != "add custom beads" {
+			t.Fatalf("ListRevisions leaked .beads history: %+v", revs)
+		}
+	})
+
+	t.Run("repo_root_beads_dir_uses_clean_filename_without_dot_slash", func(t *testing.T) {
+		t.Setenv("BEADS_DB", "")
+		t.Setenv("BEADS_DIR", "")
+
+		repoDir := initGitLoaderTestRepo(t)
+		commitGitLoaderFixture(t, repoDir, ".beads/issues.jsonl",
+			`{"id":"DOT-1","title":"Dot beads","status":"open","priority":1,"issue_type":"task"}`+"\n",
+			"commit dot beads")
+		commitGitLoaderFixture(t, repoDir, "issues.jsonl",
+			`{"id":"ROOT-1","title":"Root beads","status":"open","priority":1,"issue_type":"task"}`+"\n",
+			"commit root beads")
+
+		t.Setenv("BEADS_DIR", repoDir)
+		gl := NewGitLoader(repoDir)
+
+		hasHead, err := gl.HasBeadsAtRevision("HEAD")
+		if err != nil || !hasHead {
+			t.Fatalf("HasBeadsAtRevision(HEAD) = (%v, %v), want (true, nil)", hasHead, err)
+		}
+		rep, err := gl.LoadAtWithReport("HEAD")
+		if err != nil {
+			t.Fatalf("LoadAtWithReport(HEAD) with repo-root BEADS_DIR: %v", err)
+		}
+		if rep.SourcePath != "issues.jsonl" {
+			t.Fatalf("SourcePath = %q, want %q", rep.SourcePath, "issues.jsonl")
+		}
+		if len(rep.Issues) != 1 || rep.Issues[0].ID != "ROOT-1" {
+			t.Fatalf("expected ROOT-1, got %+v", rep.Issues)
+		}
+		if hasPrev, err := gl.HasBeadsAtRevision("HEAD~1"); err != nil || hasPrev {
+			t.Fatalf("HasBeadsAtRevision(HEAD~1) = (%v, %v), want (false, nil)", hasPrev, err)
+		}
+		if _, err := gl.LoadAt("HEAD~1"); err == nil {
+			t.Fatal("expected error at HEAD~1 before root issues.jsonl existed")
+		}
+		revs, err := gl.ListRevisions(10)
+		if err != nil || len(revs) != 1 || revs[0].Message != "commit root beads" {
+			t.Fatalf("ListRevisions = (%+v, %v), want [commit root beads]", revs, err)
+		}
+	})
+
+	t.Run("external_git_repo_override_and_redirect_use_external_history", func(t *testing.T) {
+		t.Setenv("BEADS_DB", "")
+		t.Setenv("BEADS_DIR", "")
+
+		appRepo := initGitLoaderTestRepo(t)
+		commitGitLoaderFixture(t, appRepo, ".beads/issues.jsonl",
+			`{"id":"APP-1","title":"App local issue","status":"open","priority":1,"issue_type":"task"}`+"\n",
+			"app repo commit")
+
+		extRepo := initGitLoaderTestRepo(t)
+		firstExt := `{"id":"EXT-1","title":"External tracker v1","status":"open","priority":1,"issue_type":"task"}` + "\n"
+		commitGitLoaderFixture(t, extRepo, ".beads/issues.jsonl", firstExt, "ext commit 1")
+		secondExt := firstExt + `{"id":"EXT-2","title":"External tracker v2","status":"open","priority":2,"issue_type":"task"}` + "\n"
+		commitGitLoaderFixture(t, extRepo, ".beads/issues.jsonl", secondExt, "ext commit 2")
+		extHeadSHA := strings.TrimSpace(runGitOutput(t, extRepo, "rev-parse", "HEAD"))
+
+		extBeadsDir := filepath.Join(extRepo, ".beads")
+
+		// Check BEADS_DIR -> external git repo
+		t.Setenv("BEADS_DIR", extBeadsDir)
+		gl := NewGitLoader(appRepo)
+		gotSHA, err := gl.ResolveRevision("HEAD")
+		if err != nil || gotSHA != extHeadSHA {
+			t.Fatalf("ResolveRevision(HEAD) = (%q, %v), want (%q, nil)", gotSHA, err, extHeadSHA)
+		}
+		issuesPrev, err := gl.LoadAt("HEAD~1")
+		if err != nil || len(issuesPrev) != 1 || issuesPrev[0].ID != "EXT-1" {
+			t.Fatalf("LoadAt(HEAD~1) = (%+v, %v), want [EXT-1]", issuesPrev, err)
+		}
+		issuesHead, err := gl.LoadAt("HEAD")
+		if err != nil || len(issuesHead) != 2 || issuesHead[0].ID != "EXT-1" || issuesHead[1].ID != "EXT-2" {
+			t.Fatalf("LoadAt(HEAD) = (%+v, %v), want [EXT-1, EXT-2]", issuesHead, err)
+		}
+		between, err := gl.GetCommitsBetween("HEAD~1", "HEAD")
+		if err != nil || len(between) != 1 || between[0].SHA != extHeadSHA {
+			t.Fatalf("GetCommitsBetween = (%+v, %v), want [%s]", between, err, extHeadSHA)
+		}
+
+		// Check .beads/redirect -> external git repo
+		t.Setenv("BEADS_DIR", "")
+		if err := os.WriteFile(filepath.Join(appRepo, ".beads", "redirect"), []byte(extBeadsDir+"\n"), 0o644); err != nil {
+			t.Fatalf("write redirect: %v", err)
+		}
+		glRedirect := NewGitLoader(appRepo)
+		redirIssues, err := glRedirect.LoadAt("HEAD~1")
+		if err != nil || len(redirIssues) != 1 || redirIssues[0].ID != "EXT-1" {
+			t.Fatalf("redirect LoadAt(HEAD~1) = (%+v, %v), want [EXT-1]", redirIssues, err)
+		}
+	})
+
+	t.Run("external_non_git_override_fails_closed_without_local_fallback", func(t *testing.T) {
+		t.Setenv("BEADS_DB", "")
+		t.Setenv("BEADS_DIR", "")
+
+		appRepo := initGitLoaderTestRepo(t)
+		commitGitLoaderFixture(t, appRepo, ".beads/issues.jsonl",
+			`{"id":"APP-SECRET","title":"Must never leak via fallback","status":"open","priority":1,"issue_type":"task"}`+"\n",
+			"app repo commit")
+
+		nonGitBeads := filepath.Join(t.TempDir(), "external-plain", ".beads")
+		if err := os.MkdirAll(nonGitBeads, 0o755); err != nil {
+			t.Fatalf("mkdir non-git beads: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(nonGitBeads, "issues.jsonl"),
+			[]byte(`{"id":"PLAIN-1","title":"Plain","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatalf("write plain issues.jsonl: %v", err)
+		}
+
+		t.Setenv("BEADS_DIR", nonGitBeads)
+		gl := NewGitLoader(appRepo)
+		if _, err := gl.LoadAt("HEAD"); err == nil || !strings.Contains(err.Error(), "not in a git repository") {
+			t.Fatalf("LoadAt(HEAD) with non-git BEADS_DIR = %v, want fail-closed 'not in a git repository'", err)
+		}
+		if _, err := gl.HasBeadsAtRevision("HEAD"); err == nil || !strings.Contains(err.Error(), "not in a git repository") {
+			t.Fatalf("HasBeadsAtRevision(HEAD) with non-git BEADS_DIR = %v, want fail-closed error", err)
+		}
+		if _, err := gl.ListRevisions(5); err == nil || !strings.Contains(err.Error(), "not in a git repository") {
+			t.Fatalf("ListRevisions with non-git BEADS_DIR = %v, want fail-closed error", err)
+		}
+		if _, err := gl.ResolveRevision("HEAD"); err == nil || !strings.Contains(err.Error(), "not in a git repository") {
+			t.Fatalf("ResolveRevision with non-git BEADS_DIR = %v, want fail-closed error", err)
+		}
+
+		// Also verify .beads/redirect to non-git external directory fails closed
+		t.Setenv("BEADS_DIR", "")
+		if err := os.WriteFile(filepath.Join(appRepo, ".beads", "redirect"), []byte(nonGitBeads+"\n"), 0o644); err != nil {
+			t.Fatalf("write redirect: %v", err)
+		}
+		if _, err := gl.LoadAt("HEAD"); err == nil || !strings.Contains(err.Error(), "not in a git repository") {
+			t.Fatalf("LoadAt(HEAD) with non-git redirect = %v, want fail-closed 'not in a git repository'", err)
+		}
+	})
+}

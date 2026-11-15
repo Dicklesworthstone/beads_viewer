@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"gopkg.in/yaml.v3"
 )
 
@@ -52,21 +53,36 @@ func (e *UnknownRecipeError) Error() string {
 
 // Loader handles loading and merging recipes from multiple sources
 type Loader struct {
-	recipes    map[string]Recipe
-	sources    map[string]string // recipe name -> source
-	paths      map[string]string // recipe name -> defining file (project-file only)
-	userPath   string
-	projectDir string
-	warnings   []string
+	recipes          map[string]Recipe
+	sources          map[string]string // recipe name -> source
+	paths            map[string]string // recipe name -> defining file (project-file only)
+	userPath         string
+	explicitUserPath bool
+	projectDir       string
+	warnings         []string
 }
 
 // LoaderOption configures the loader
 type LoaderOption func(*Loader)
 
-// WithUserPath sets a custom user config path (default: ~/.config/bv/recipes.yaml)
+// DefaultUserRecipesPath returns the default user recipes configuration path,
+// preferring $XDG_CONFIG_HOME/bv/recipes.yaml before ~/.config/bv/recipes.yaml.
+func DefaultUserRecipesPath() string {
+	if xdg := strings.TrimSpace(env.Get("XDG_CONFIG_HOME")); xdg != "" {
+		return filepath.Join(xdg, "bv", "recipes.yaml")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+	return filepath.Join(home, ".config", "bv", "recipes.yaml")
+}
+
+// WithUserPath sets a custom user config path (default: DefaultUserRecipesPath())
 func WithUserPath(path string) LoaderOption {
 	return func(l *Loader) {
 		l.userPath = path
+		l.explicitUserPath = true
 	}
 }
 
@@ -75,6 +91,10 @@ func WithProjectDir(dir string) LoaderOption {
 	return func(l *Loader) {
 		l.projectDir = dir
 	}
+}
+
+func noSavedConfigEnabled() bool {
+	return strings.TrimSpace(env.NoSavedConfig.Get()) != ""
 }
 
 // NewLoader creates a new recipe loader with options
@@ -89,11 +109,12 @@ func NewLoader(opts ...LoaderOption) *Loader {
 		opt(l)
 	}
 
-	// Set defaults
-	if l.userPath == "" {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			l.userPath = filepath.Join(home, ".config", "bv", "recipes.yaml")
+	// Set defaults unless explicitly overridden or isolated via BV_NO_SAVED_CONFIG
+	if !l.explicitUserPath {
+		if noSavedConfigEnabled() {
+			l.userPath = ""
+		} else {
+			l.userPath = DefaultUserRecipesPath()
 		}
 	}
 
@@ -102,6 +123,20 @@ func NewLoader(opts ...LoaderOption) *Loader {
 	}
 
 	return l
+}
+
+// LoadEmbedded creates a recipe loader populated solely from the embedded
+// built-in defaults/recipes.yaml with zero filesystem or environment access.
+func LoadEmbedded() (*Loader, error) {
+	l := &Loader{
+		recipes: make(map[string]Recipe),
+		sources: make(map[string]string),
+		paths:   make(map[string]string),
+	}
+	if err := l.loadBuiltin(); err != nil {
+		return nil, fmt.Errorf("loading builtin recipes: %w", err)
+	}
+	return l, nil
 }
 
 // Load loads recipes from all sources in ascending precedence:
@@ -113,9 +148,13 @@ func (l *Loader) Load() error {
 		return fmt.Errorf("loading builtin recipes: %w", err)
 	}
 
-	// 2. Load user config (optional, no error if missing)
-	if l.userPath != "" {
-		if err := l.loadFromFile(l.userPath, SourceUser); err != nil {
+	// 2. Load user config (optional, no error if missing; skipped when BV_NO_SAVED_CONFIG is non-empty unless WithUserPath was explicitly supplied)
+	userPath := l.userPath
+	if !l.explicitUserPath && noSavedConfigEnabled() {
+		userPath = ""
+	}
+	if userPath != "" {
+		if err := l.loadFromFile(userPath, SourceUser); err != nil {
 			// Only add warning, don't fail
 			if !os.IsNotExist(err) {
 				l.warnings = append(l.warnings, fmt.Sprintf("user config: %v", err))

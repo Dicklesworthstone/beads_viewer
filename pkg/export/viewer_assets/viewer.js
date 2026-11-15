@@ -197,11 +197,43 @@ const DB_STATE = {
   cacheKey: null,       // OPFS cache key (hash)
   source: 'unknown',    // 'network' | 'cache' | 'chunks'
   fts5: null,           // Actual browser SQLite capability, not exported schema.
+  jsonEach: null,       // Cached SQLite json_each() table-valued function capability
+  jsonEachDb: null,     // DB instance associated with jsonEach capability
   referenceNowMs: null, // Snapshot reference timestamp (ms) for deterministic recency scoring
   referenceDb: null,    // DB instance associated with referenceNowMs
 };
 if (typeof window !== 'undefined') {
   window.DB_STATE = DB_STATE;
+}
+
+function supportsJsonEach() {
+  if (!DB_STATE.db) return false;
+  if (DB_STATE.jsonEachDb === DB_STATE.db && typeof DB_STATE.jsonEach === 'boolean') {
+    return DB_STATE.jsonEach;
+  }
+  DB_STATE.jsonEachDb = DB_STATE.db;
+  try {
+    const stmt = DB_STATE.db.prepare(`SELECT value FROM json_each('["probe"]')`);
+    let ok = false;
+    if (stmt.step()) {
+      const row = stmt.get();
+      ok = Array.isArray(row) && row[0] === 'probe';
+    }
+    stmt.free();
+    DB_STATE.jsonEach = ok;
+  } catch {
+    DB_STATE.jsonEach = false;
+  }
+  return DB_STATE.jsonEach;
+}
+
+function formatEstimatedMinutes(minutes) {
+  const num = Number(minutes);
+  if (!Number.isFinite(num) || num <= 0) return '';
+  if (num < 60) return `${Math.round(num)}m`;
+  const hours = Math.floor(num / 60);
+  const rem = Math.round(num % 60);
+  return rem > 0 ? `${hours}h ${rem}m` : `${hours}h`;
 }
 
 const KNOWN_STATUS_BADGES = new Set([
@@ -277,10 +309,12 @@ function getReferenceNowMs() {
 
 // Graph engine state (WASM)
 const GRAPH_STATE = {
-  wasm: null,         // WASM module (bv_graph.js)
-  graph: null,        // DiGraph instance
-  nodeMap: null,      // Map<string, number> - issue ID to node index
-  ready: false,       // true when graph is loaded
+  wasm: null,          // WASM module (bv_graph.js)
+  graph: null,         // Full DiGraph instance (PageRank, Betweenness, HITS, K-core, What-If)
+  nodeMap: null,       // Map<string, number> - issue ID to full graph node index
+  activeGraph: null,   // Active-only DiGraph instance (excludes closed/tombstone for cycles, slack, critical path)
+  activeNodeMap: null, // Map<string, number> - active issue ID to activeGraph node index
+  ready: false,        // true when graph is loaded
 };
 
 // WASM support detection
@@ -389,8 +423,8 @@ const WASM_ALLOCATIONS = {
  * @param {Function} fn - Function to execute with the subgraph
  * @returns {*} Result from the function
  */
-function withSubgraph(indices, fn) {
-  if (!GRAPH_STATE.ready || !GRAPH_STATE.graph) {
+function withSubgraph(indices, fn, baseGraph = GRAPH_STATE.graph) {
+  if (!GRAPH_STATE.ready || !baseGraph) {
     console.warn('[WASM Memory] Cannot create subgraph: graph not ready');
     return null;
   }
@@ -399,7 +433,7 @@ function withSubgraph(indices, fn) {
     ? indices
     : new Uint32Array(indices);
 
-  const subgraph = GRAPH_STATE.graph.subgraph(indicesArray);
+  const subgraph = baseGraph.subgraph(indicesArray);
   WASM_ALLOCATIONS.trackCount++;
 
   try {
@@ -432,6 +466,17 @@ function cleanupWasm() {
     }
   }
   WASM_ALLOCATIONS.subgraphs = [];
+
+  // Free the active graph
+  if (GRAPH_STATE.activeGraph && typeof GRAPH_STATE.activeGraph.free === 'function') {
+    try {
+      GRAPH_STATE.activeGraph.free();
+    } catch (e) {
+      console.warn('[WASM Memory] Error freeing active graph:', e);
+    }
+    GRAPH_STATE.activeGraph = null;
+    GRAPH_STATE.activeNodeMap = null;
+  }
 
   // Free the main graph
   if (GRAPH_STATE.graph && typeof GRAPH_STATE.graph.free === 'function') {
@@ -644,6 +689,40 @@ async function loadChunks(config) {
   return combined;
 }
 
+function ensureSqlFunctions(db) {
+  if (!db || typeof db.create_function !== 'function') {
+    return false;
+  }
+  if (db._bvFunctionsRegistered) {
+    return true;
+  }
+  try {
+    db.create_function('bv_has_label', (labelsJson, target) => {
+      try {
+        const parsed = JSON.parse(labelsJson || '[]');
+        return Array.isArray(parsed) && parsed.includes(String(target)) ? 1 : 0;
+      } catch {
+        return 0;
+      }
+    });
+    if (!db._bvExportWrapped && typeof db.export === 'function') {
+      const rawExport = db.export.bind(db);
+      db.export = function (...args) {
+        const exported = rawExport(...args);
+        db._bvFunctionsRegistered = false;
+        ensureSqlFunctions(db);
+        return exported;
+      };
+      db._bvExportWrapped = true;
+    }
+    db._bvFunctionsRegistered = true;
+    return true;
+  } catch (err) {
+    console.warn('[SQL] Failed to register bv_has_label UDF:', err);
+    return false;
+  }
+}
+
 /**
  * Load database with caching strategy
  */
@@ -670,6 +749,7 @@ async function loadDatabase(updateStatus) {
     const cached = await loadFromOPFS(DB_STATE.cacheKey);
     if (cached) {
       DB_STATE.db = new SQL.Database(cached);
+      ensureSqlFunctions(DB_STATE.db);
       DB_STATE.source = 'cache';
       DIAGNOSTICS.dbSource = 'cache';
       // Clean up stale cache entries in the background
@@ -731,6 +811,7 @@ async function loadDatabase(updateStatus) {
 
   try {
     DB_STATE.db = new SQL.Database(dbData);
+    ensureSqlFunctions(DB_STATE.db);
   } catch (err) {
     showError({
       title: 'Database Corrupted',
@@ -824,6 +905,8 @@ async function initGraphEngine() {
     GRAPH_STATE.wasm = wasmModule;
     GRAPH_STATE.graph = new wasmModule.DiGraph();
     GRAPH_STATE.nodeMap = new Map();
+    GRAPH_STATE.activeGraph = new wasmModule.DiGraph();
+    GRAPH_STATE.activeNodeMap = new Map();
 
     // Load graph data from SQLite
     if (!DB_STATE.db) {
@@ -831,9 +914,14 @@ async function initGraphEngine() {
       return false;
     }
 
+    const resolvedIds = getResolvedIssueIDs();
+
     // Isolated issues participate in metrics too. Edges alone omit them.
     for (const row of execQuery('SELECT id FROM issues ORDER BY id')) {
       GRAPH_STATE.nodeMap.set(row.id, GRAPH_STATE.graph.addNode(row.id));
+      if (!resolvedIds.has(row.id)) {
+        GRAPH_STATE.activeNodeMap.set(row.id, GRAPH_STATE.activeGraph.addNode(row.id));
+      }
     }
 
     const deps = execQuery(`
@@ -860,6 +948,21 @@ async function initGraphEngine() {
         GRAPH_STATE.nodeMap.get(from),
         GRAPH_STATE.nodeMap.get(to)
       );
+
+      // Active-only graph excludes closed/tombstone endpoints so historical closed
+      // cycles cannot poison live cycle detection, critical paths, or slack.
+      if (!resolvedIds.has(from) && !resolvedIds.has(to)) {
+        if (!GRAPH_STATE.activeNodeMap.has(from)) {
+          GRAPH_STATE.activeNodeMap.set(from, GRAPH_STATE.activeGraph.addNode(from));
+        }
+        if (!GRAPH_STATE.activeNodeMap.has(to)) {
+          GRAPH_STATE.activeNodeMap.set(to, GRAPH_STATE.activeGraph.addNode(to));
+        }
+        GRAPH_STATE.activeGraph.addEdge(
+          GRAPH_STATE.activeNodeMap.get(from),
+          GRAPH_STATE.activeNodeMap.get(to)
+        );
+      }
     }
 
     GRAPH_STATE.ready = true;
@@ -933,14 +1036,40 @@ function recalculateMetrics(issueIds) {
   if (indices.length === 0) return null;
 
   // Extract subgraph for filtered issues - use withSubgraph for automatic cleanup
-  const result = withSubgraph(indices, subgraph => ({
-    nodeCount: subgraph.nodeCount(),
-    edgeCount: subgraph.edgeCount(),
-    pagerank: subgraph.pagerankDefault(),
-    betweenness: subgraph.betweenness(),
-    hasCycles: subgraph.hasCycles(),
-    criticalPath: subgraph.criticalPathHeights(),
-  }));
+  const activeIndices = (GRAPH_STATE.activeGraph && GRAPH_STATE.activeNodeMap)
+    ? issueIds.map(id => GRAPH_STATE.activeNodeMap.get(id)).filter(idx => idx !== undefined)
+    : null;
+  const activeMetrics = activeIndices !== null
+    ? (activeIndices.length > 0
+        ? withSubgraph(activeIndices, sg => {
+            const heights = sg.criticalPathHeights();
+            const heightById = new Map();
+            const count = sg.nodeCount();
+            for (let i = 0; i < count; i++) {
+              heightById.set(sg.nodeId(i), heights[i] ?? 0);
+            }
+            return {
+              hasCycles: sg.hasCycles(),
+              heightById,
+            };
+          }, GRAPH_STATE.activeGraph)
+        : { hasCycles: false, heightById: new Map() })
+    : null;
+
+  const result = withSubgraph(indices, subgraph => {
+    const nodeCount = subgraph.nodeCount();
+    const criticalPath = activeMetrics
+      ? Float64Array.from({ length: nodeCount }, (_, i) => activeMetrics.heightById.get(subgraph.nodeId(i)) ?? 0)
+      : subgraph.criticalPathHeights();
+    return {
+      nodeCount,
+      edgeCount: subgraph.edgeCount(),
+      pagerank: subgraph.pagerankDefault(),
+      betweenness: subgraph.betweenness(),
+      hasCycles: activeMetrics ? activeMetrics.hasCycles : subgraph.hasCycles(),
+      criticalPath,
+    };
+  });
 
   const elapsed = performance.now() - start;
   console.log(`[Graph] Recalculated metrics in ${elapsed.toFixed(1)}ms`);
@@ -983,8 +1112,219 @@ function topWhatIf(limit = 10) {
   return (results || []).map(item => ({
     ...item,
     issueId: GRAPH_STATE.graph.nodeId(item.node),
+    isActionable: true,
     result: item.result,
   }));
+}
+
+/**
+ * Get top issues by cascade impact across ALL open issues (including currently blocked issues)
+ */
+function allWhatIf(limit = 10) {
+  if (!GRAPH_STATE.ready || limit <= 0 || typeof GRAPH_STATE.graph?.allWhatIf !== 'function') return [];
+
+  try {
+    const closedSet = buildClosedSet();
+    const visibleIds = new Set(execQuery('SELECT id FROM issue_overview_mv').map(r => r.id));
+    const results = GRAPH_STATE.graph.allWhatIf(closedSet, Math.max(limit * 2, 20));
+    return (results || [])
+      .map(item => {
+        const issueId = GRAPH_STATE.graph.nodeId(item.node);
+        if (!issueId || !visibleIds.has(issueId)) return null;
+        const issue = getIssue(issueId);
+        return {
+          ...item,
+          issueId,
+          isActionable: Boolean(issue?.is_actionable),
+          status: issue?.status || 'open',
+          result: item.result,
+        };
+      })
+      .filter(Boolean)
+      .slice(0, limit);
+  } catch (e) {
+    console.warn('[viewer] allWhatIf failed:', e);
+    return [];
+  }
+}
+
+/**
+ * Compute combined cascade impact of closing a batch of issues together
+ */
+function whatIfCloseBatch(issueIds = []) {
+  if (!GRAPH_STATE.ready || !Array.isArray(issueIds) || issueIds.length === 0) return null;
+  if (typeof GRAPH_STATE.graph?.whatIfCloseBatch !== 'function') return null;
+
+  try {
+    const indices = issueIds
+      .map(id => GRAPH_STATE.nodeMap.get(id))
+      .filter(idx => idx !== undefined);
+    if (indices.length === 0) return null;
+
+    const closedSet = buildClosedSet();
+    const result = GRAPH_STATE.graph.whatIfCloseBatch(new Uint32Array(indices), closedSet);
+    if (result) {
+      result.unblocked_issue_ids = (result.unblocked_ids || [])
+        .map(i => GRAPH_STATE.graph.nodeId(i))
+        .filter(Boolean);
+      result.cascade_issue_ids = (result.cascade_ids || [])
+        .map(i => GRAPH_STATE.graph.nodeId(i))
+        .filter(Boolean);
+    }
+    return result;
+  } catch (e) {
+    console.warn('[viewer] whatIfCloseBatch failed:', e);
+    return null;
+  }
+}
+
+/**
+ * Get parallelism unlockers from WASM parallelCutDefault / parallelCutSuggestions
+ */
+function getParallelCutData(limit = 10) {
+  if (!GRAPH_STATE.ready || limit <= 0) {
+    return { items: [], open_nodes: 0, current_actionable: 0 };
+  }
+
+  try {
+    const closedSet = buildClosedSet();
+    const raw = (limit === 10 && typeof GRAPH_STATE.graph.parallelCutDefault === 'function')
+      ? GRAPH_STATE.graph.parallelCutDefault(closedSet)
+      : (typeof GRAPH_STATE.graph.parallelCutSuggestions === 'function'
+          ? GRAPH_STATE.graph.parallelCutSuggestions(closedSet, limit)
+          : GRAPH_STATE.graph.parallelCutDefault?.(closedSet));
+    const visibleIds = new Set(execQuery('SELECT id FROM issue_overview_mv').map(r => r.id));
+    const items = (raw?.items || [])
+      .map(item => {
+        const issueId = GRAPH_STATE.graph.nodeId(item.node);
+        if (!issueId || !visibleIds.has(issueId)) return null;
+        const issue = getIssue(issueId);
+        return {
+          ...item,
+          issueId,
+          title: issue?.title || issueId,
+          status: issue?.status || 'open',
+          priority: issue?.priority ?? 2,
+          parallel_gain: Number(item.parallel_gain ?? 0),
+          new_actionable: Number(item.new_actionable ?? 0),
+        };
+      })
+      .filter(Boolean)
+      .slice(0, limit);
+    return {
+      items,
+      open_nodes: Number(raw?.open_nodes ?? 0),
+      current_actionable: Number(raw?.current_actionable ?? 0),
+    };
+  } catch (e) {
+    console.warn('[viewer] getParallelCutData failed:', e);
+    return { items: [], open_nodes: 0, current_actionable: 0 };
+  }
+}
+
+/**
+ * Get Tarjan bridge cut-edges (critical single-link dependency bottlenecks)
+ */
+function getBridgeDependencies(limit = 20) {
+  if (!GRAPH_STATE.ready || limit <= 0 || typeof GRAPH_STATE.graph?.bridges !== 'function') return [];
+
+  try {
+    const rawBridges = GRAPH_STATE.graph.bridges();
+    if (!Array.isArray(rawBridges) || rawBridges.length === 0) return [];
+
+    const directedEdges = new Set(
+      execQuery(`
+        SELECT issue_id, depends_on_id
+        FROM dependencies
+        WHERE COALESCE(type, 'blocks') IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
+      `).map(r => `${r.issue_id}\0${r.depends_on_id}`)
+    );
+
+    const bridges = [];
+    for (const pair of rawBridges) {
+      if (!Array.isArray(pair) || pair.length < 2) continue;
+      const idA = GRAPH_STATE.graph.nodeId(pair[0]);
+      const idB = GRAPH_STATE.graph.nodeId(pair[1]);
+      if (!idA || !idB) continue;
+
+      let from = idA;
+      let to = idB;
+      if (!directedEdges.has(`${idA}\0${idB}`) && directedEdges.has(`${idB}\0${idA}`)) {
+        from = idB;
+        to = idA;
+      }
+
+      const fromIssue = getIssue(from);
+      const toIssue = getIssue(to);
+      bridges.push({
+        from,
+        to,
+        fromTitle: fromIssue?.title || from,
+        toTitle: toIssue?.title || to,
+        fromAvailable: Boolean(fromIssue),
+        toAvailable: Boolean(toIssue),
+      });
+    }
+
+    bridges.sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
+    return bridges.slice(0, limit);
+  } catch (e) {
+    console.warn('[viewer] getBridgeDependencies failed:', e);
+    return [];
+  }
+}
+
+/**
+ * Format critical-path hop count (edges = max(0, nodeCount - 1))
+ */
+function formatCriticalPathHops(entry) {
+  const explicitHops = Number(entry?.hops);
+  const hops = Number.isFinite(explicitHops) && explicitHops >= 0
+    ? explicitHops
+    : Math.max(0, Number(entry?.length ?? entry?.path?.length ?? 0) - 1);
+  return `${hops} ${hops === 1 ? 'hop' : 'hops'}`;
+}
+
+/**
+ * Get top K critical paths from WASM kCriticalPaths(k) (empty when active cycles exist)
+ */
+function getTopCriticalPaths(k = 5) {
+  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  if (!GRAPH_STATE.ready || !activeGraph || k <= 0 || activeGraph.hasCycles()) return [];
+
+  try {
+    if (typeof activeGraph.kCriticalPaths === 'function') {
+      const res = activeGraph.kCriticalPaths(k);
+      if (res && Array.isArray(res.paths) && res.paths.length > 0) {
+        return res.paths
+          .map(p => {
+            const path = (p.nodes || []).map(idx => activeGraph.nodeId(idx)).filter(Boolean);
+            const nodeCount = Number(p.length ?? path.length);
+            return {
+              path,
+              length: nodeCount,
+              hops: Math.max(0, nodeCount - 1),
+              label: path.join(' → '),
+            };
+          })
+          .filter(p => p.path.length > 0);
+      }
+    }
+    const single = getCriticalPathSequence();
+    if (single && Array.isArray(single.path) && single.path.length > 0) {
+      const nodeCount = Number(single.length || single.path.length);
+      return [{
+        path: single.path,
+        length: nodeCount,
+        hops: Math.max(0, nodeCount - 1),
+        label: single.path.join(' → '),
+      }];
+    }
+    return [];
+  } catch (e) {
+    console.warn('[viewer] getTopCriticalPaths failed:', e);
+    return [];
+  }
 }
 
 /**
@@ -1001,9 +1341,10 @@ function getActionableIssues() {
  * Find cycle break suggestions
  */
 function getCycleBreakSuggestions(limit = 5) {
-  if (!GRAPH_STATE.ready) return null;
+  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  if (!GRAPH_STATE.ready || !activeGraph) return null;
 
-  const result = GRAPH_STATE.graph.cycleBreakSuggestions(limit, 100);
+  const result = activeGraph.cycleBreakSuggestions(limit, 100);
   return result;
 }
 
@@ -1127,12 +1468,36 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
     }
   }
 
-  // Label filter (JSON array contains)
+  // Label filter (JSON array contains; exact json_each match with Go-escaped case-sensitive INSTR fallback)
   if (filters.labels?.length) {
     const labels = Array.isArray(filters.labels) ? filters.labels : [filters.labels];
-    const labelClauses = labels.map(() => `${col('labels')} LIKE ?`);
-    clauses.push(`(${labelClauses.join(' OR ')})`);
-    params.push(...labels.map(l => `%"${l}"%`));
+    if (supportsJsonEach()) {
+      const labelClauses = labels.map(() => `EXISTS (SELECT 1 FROM json_each(COALESCE(${col('labels')}, '[]')) WHERE value = ?)`);
+      clauses.push(`(${labelClauses.join(' OR ')})`);
+      params.push(...labels.map(l => String(l)));
+    } else if (ensureSqlFunctions(DB_STATE.db)) {
+      const labelClauses = labels.map(() => `bv_has_label(COALESCE(${col('labels')}, '[]'), ?) = 1`);
+      clauses.push(`(${labelClauses.join(' OR ')})`);
+      params.push(...labels.map(l => String(l)));
+    } else {
+      const labelClauses = [];
+      const labelsExpr = `COALESCE(${col('labels')}, '[]')`;
+      for (const rawLabel of labels) {
+        const rawToken = JSON.stringify(String(rawLabel));
+        const goToken = rawToken
+          .replace(/</g, '\\u003c')
+          .replace(/>/g, '\\u003e')
+          .replace(/&/g, '\\u0026');
+        if (goToken !== rawToken) {
+          labelClauses.push(`(INSTR(${labelsExpr}, ?) > 0 OR INSTR(${labelsExpr}, ?) > 0)`);
+          params.push(goToken, rawToken);
+        } else {
+          labelClauses.push(`INSTR(${labelsExpr}, ?) > 0`);
+          params.push(goToken);
+        }
+      }
+      clauses.push(`(${labelClauses.join(' OR ')})`);
+    }
   }
 
   // Search filter (LIKE-based, FTS5 handled separately)
@@ -1277,12 +1642,14 @@ function isIssueOverdue(issue) {
 }
 
 function isIssueInCycle(id) {
-  if (!id || !GRAPH_STATE.ready || !GRAPH_STATE.graph) return false;
+  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  const activeMap = GRAPH_STATE.activeNodeMap || GRAPH_STATE.nodeMap;
+  if (!id || !GRAPH_STATE.ready || !activeGraph || !activeMap) return false;
   try {
-    if (!GRAPH_STATE.graph.hasCycles()) return false;
-    const idx = GRAPH_STATE.nodeMap.get(id);
+    if (!activeGraph.hasCycles()) return false;
+    const idx = activeMap.get(id);
     if (idx === undefined) return false;
-    const enumRes = GRAPH_STATE.graph.enumerateCycles?.(100);
+    const enumRes = activeGraph.enumerateCycles?.(100);
     if (!Array.isArray(enumRes?.cycles)) return false;
     return enumRes.cycles.some(cycle => Array.from(cycle).includes(idx));
   } catch {
@@ -2012,11 +2379,11 @@ function getTopBlockers(limit = 10) {
  * Rank exported issue rows by full-graph scores. Missing or filtered dependency
  * endpoints remain in the graph, but do not consume the visible issue limit.
  */
-function getRankedGraphIssues(values, field, limit, include = () => true) {
-  if (!GRAPH_STATE.ready || !values?.length || limit <= 0) return [];
+function getRankedGraphIssues(values, field, limit, include = () => true, nodeMap = GRAPH_STATE.nodeMap) {
+  if (!GRAPH_STATE.ready || !values?.length || !nodeMap || limit <= 0) return [];
 
   const ranked = execQuery('SELECT id FROM issue_overview_mv ORDER BY id')
-    .map(({ id }) => ({ id, value: values[GRAPH_STATE.nodeMap.get(id)] }))
+    .map(({ id }) => ({ id, value: values[nodeMap.get(id)] }))
     .filter(row => row.value !== undefined && include(row.value));
   ranked.sort((a, b) => b.value - a.value);
 
@@ -2059,11 +2426,13 @@ function getTopByBetweenness(limit = 10) {
  * Get top issues by critical path depth (keystones)
  */
 function getTopByCriticalPath(limit = 10) {
+  if (limit <= 0) return [];
   // Try critical_path_depth column if it exists
   try {
     const results = execQuery(`
       SELECT * FROM issue_overview_mv
       WHERE critical_path_depth > 0
+        AND LOWER(status) NOT IN ('closed', 'tombstone')
       ORDER BY critical_path_depth DESC
       LIMIT ?
     `, [limit]);
@@ -2072,11 +2441,13 @@ function getTopByCriticalPath(limit = 10) {
     // Column may not exist
   }
 
-  // Fallback: use WASM if available
-  if (GRAPH_STATE.ready) {
-    const heights = GRAPH_STATE.graph.criticalPathHeights();
+  // Fallback: use active WASM graph if available
+  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  const activeMap = GRAPH_STATE.activeNodeMap || GRAPH_STATE.nodeMap;
+  if (GRAPH_STATE.ready && activeGraph && !activeGraph.hasCycles()) {
+    const heights = activeGraph.criticalPathHeights();
     if (heights && heights.length > 0) {
-      return getRankedGraphIssues(heights, 'critical_path_depth', limit);
+      return getRankedGraphIssues(heights, 'critical_path_depth', limit, value => value > 0, activeMap);
     }
   }
 
@@ -2167,23 +2538,34 @@ function getArticulationPoints() {
  * Issues with 0 slack are on the critical path (no room for delay).
  */
 function getIssuesBySlack(limit = 10, showZeroSlack = true) {
-  if (!GRAPH_STATE.ready) return [];
+  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  const activeMap = GRAPH_STATE.activeNodeMap || GRAPH_STATE.nodeMap;
+  if (!GRAPH_STATE.ready || !activeGraph || activeGraph.hasCycles()) return [];
 
   try {
-    const slackValues = GRAPH_STATE.graph.slack();
+    const slackValues = activeGraph.slack();
     if (!slackValues || slackValues.length === 0) return [];
 
+    if (!showZeroSlack) {
+      const issues = getRankedGraphIssues(slackValues, 'slack', limit, () => true, activeMap);
+      for (const issue of issues) {
+        issue.on_critical_path = Math.abs(issue.slack || 0) < 1e-9;
+      }
+      return issues;
+    }
+
     const activeIds = new Set(
-      execQuery(`SELECT id FROM issue_overview_mv WHERE status NOT IN ('closed', 'tombstone')`).map(r => r.id)
+      execQuery(`SELECT id FROM issue_overview_mv WHERE LOWER(status) NOT IN ('closed', 'tombstone')`).map(r => r.id)
     );
     const issues = getRankedGraphIssues(
       slackValues,
       'slack',
       Math.max(limit * 2, activeIds.size || limit),
-      value => !showZeroSlack || Math.abs(value) < 1e-9
+      value => Math.abs(value) < 1e-9,
+      activeMap
     ).filter(issue => issue && activeIds.has(issue.id)).slice(0, limit);
     for (const issue of issues) {
-      issue.on_critical_path = Math.abs(issue.slack || 0) < 1e-9;
+      issue.on_critical_path = true;
     }
     return issues;
   } catch (e) {
@@ -2193,21 +2575,22 @@ function getIssuesBySlack(limit = 10, showZeroSlack = true) {
 }
 
 /**
- * Get cycle information from graph
+ * Get cycle information from active graph (closed/tombstone historical cycles excluded)
  */
 function getCycleInfo() {
-  if (!GRAPH_STATE.ready) {
+  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  if (!GRAPH_STATE.ready || !activeGraph) {
     return { hasCycles: false, cycleCount: 0, suggestions: null };
   }
 
-  const hasCycles = GRAPH_STATE.graph.hasCycles();
+  const hasCycles = activeGraph.hasCycles();
   const suggestions = hasCycles ? getCycleBreakSuggestions(5) : null;
   if (suggestions && !suggestions.suggestions && Array.isArray(suggestions.top_suggestions)) {
     suggestions.suggestions = suggestions.top_suggestions;
   }
   const cycleCount = suggestions?.total_cycles
     ?? suggestions?.cycles?.length
-    ?? (hasCycles ? (GRAPH_STATE.graph.enumerateCycles?.(100)?.count ?? 0) : 0);
+    ?? (hasCycles ? (activeGraph.enumerateCycles?.(100)?.count ?? 0) : 0);
 
   return {
     hasCycles,
@@ -2217,13 +2600,13 @@ function getCycleInfo() {
 }
 
 /**
- * Get the full critical path sequence from root to sink.
+ * Get the full critical path sequence from root to sink on the active DAG.
  * Returns array of issue IDs representing the longest dependency chain.
  */
 function getCriticalPathSequence() {
-  if (!GRAPH_STATE.ready) return null;
+  const graph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  if (!GRAPH_STATE.ready || !graph || graph.hasCycles()) return null;
 
-  const graph = GRAPH_STATE.graph;
   const heights = graph.criticalPathHeights();
   if (!heights || heights.length === 0) return null;
 
@@ -3132,12 +3515,18 @@ function beadsApp() {
     distributionByType: [],
     distributionByPriority: [],
 
-    // Selected issue
+    // Selected issue & list cursor
     selectedIssue: null,
     copyLinkMessage: '',
     showDepGraph: false,
     issueNavList: [], // List of issue IDs for j/k navigation
+    focusedIssueIndex: -1, // Highlighted row cursor in #/issues list view
     showKeyboardHelp: false, // Keyboard shortcuts help modal
+
+    // Graph search state (top-center search overlay in #/graph)
+    graphSearchQuery: '',
+    graphSearchResult: null,
+    graphSearchOpen: false,
 
     // Graph engine state
     graphReady: false,
@@ -3172,10 +3561,15 @@ function beadsApp() {
     totalCycles: 0,
     currentCyclePath: '',
 
-    // Critical path highlighting
+    // Critical path highlighting & [1/N] kCriticalPaths stepper
     showCriticalPath: false,
     criticalPathData: null, // { path: [issueIds], length: number, animating: boolean }
     criticalPathAnimationStep: -1,
+    criticalPathNavActive: false,
+    currentCriticalPathIdx: 0,
+    totalCriticalPaths: 0,
+    currentCriticalPathLabel: '',
+    topCriticalPaths: [],
 
     // Insights view data
     topByEigenvector: [],
@@ -3189,6 +3583,10 @@ function beadsApp() {
     flexibleSlackIssues: [], // Issues with positive schedule slack
     cycleInfo: null,
     topImpactIssues: [],
+    includeBlockedWhatIf: false,
+    parallelCutData: null,
+    parallelCutIssues: [],
+    bridgeEdges: [],
 
     // Full triage data from triage.json (robot mode output)
     triageData: null,
@@ -3238,6 +3636,7 @@ function beadsApp() {
         if (localStorage.getItem('darkMode') === null) {
           this.darkMode = e.matches;
           document.documentElement.classList.toggle('dark', this.darkMode);
+          window.BVCharts?.applyTheme?.(this.darkMode);
           // Re-render Mermaid graphs if visible
           if (this.showDepGraph && this.selectedIssue) {
             this.renderDepGraph();
@@ -3321,14 +3720,62 @@ function beadsApp() {
           return;
         }
 
-        // 'o' opens issue detail in list view (when row is focused)
-        if (e.key === 'o' && !isInput && this.view === 'issues' && !this.selectedIssue) {
-          // Focus the first issue if none selected
-          if (this.issues.length > 0) {
-            this.selectIssue(this.issues[0].id);
+        // Issues list keyboard navigation (j/k cursor + Enter/o open when no modal or input is active)
+        if (!isInput && this.view === 'issues' && !this.selectedIssue && !this.showKeyboardHelp && !this.showDiagnostics) {
+          if (e.key === 'j') {
+            if (this.issues.length > 0) {
+              e.preventDefault();
+              this.focusedIssueIndex = this.focusedIssueIndex < 0
+                ? 0
+                : Math.min(this.issues.length - 1, this.focusedIssueIndex + 1);
+              this.$nextTick(() => {
+                document.querySelector(`[data-issue-idx="${this.focusedIssueIndex}"]`)?.scrollIntoView?.({ block: 'nearest' });
+              });
+            }
+            return;
           }
-          return;
+          if (e.key === 'k') {
+            if (this.issues.length > 0) {
+              e.preventDefault();
+              this.focusedIssueIndex = this.focusedIssueIndex <= 0 ? 0 : this.focusedIssueIndex - 1;
+              this.$nextTick(() => {
+                document.querySelector(`[data-issue-idx="${this.focusedIssueIndex}"]`)?.scrollIntoView?.({ block: 'nearest' });
+              });
+            }
+            return;
+          }
+          if (e.key === 'o') {
+            if (this.issues.length > 0) {
+              e.preventDefault();
+              const idx = this.focusedIssueIndex >= 0 && this.focusedIssueIndex < this.issues.length ? this.focusedIssueIndex : 0;
+              this.focusedIssueIndex = idx;
+              this.selectIssue(this.issues[idx].id);
+            }
+            return;
+          }
+          if (e.key === 'Enter') {
+            const tag = e.target?.tagName;
+            const role = e.target?.getAttribute?.('role');
+            if (!['BUTTON', 'A', 'SUMMARY'].includes(tag) && role !== 'button' && this.issues.length > 0 && this.focusedIssueIndex >= 0 && this.focusedIssueIndex < this.issues.length) {
+              e.preventDefault();
+              this.selectIssue(this.issues[this.focusedIssueIndex].id);
+              return;
+            }
+          }
         }
+      });
+
+      // Focus #/graph node search input on Ctrl+F / Cmd+F from graph.js
+      window.addEventListener('bv-graph:searchRequest', () => {
+        if (this.view !== 'graph') return;
+        this.graphSearchOpen = true;
+        this.$nextTick(() => {
+          const input = document.getElementById('graph-search-input');
+          if (input) {
+            input.focus();
+            input.select?.();
+          }
+        });
       });
 
       // Force-graph integration: double-click opens the full issue modal.
@@ -3376,6 +3823,17 @@ function beadsApp() {
         this.cycleNavigatorActive = false;
         this.currentCycleIdx = 0;
         this.currentCyclePath = '';
+      });
+      document.addEventListener('bv-graph:criticalPathChange', (e) => {
+        this.criticalPathNavActive = Boolean(e.detail?.active ?? true);
+        this.currentCriticalPathIdx = e.detail?.currentIndex ?? 0;
+        this.totalCriticalPaths = e.detail?.pathCount ?? (this.topCriticalPaths?.length || 0);
+        this.currentCriticalPathLabel = e.detail?.pathLabel || (Array.isArray(e.detail?.path) ? e.detail.path.join(' → ') : '');
+      });
+      document.addEventListener('bv-graph:criticalPathReset', () => {
+        this.criticalPathNavActive = false;
+        this.currentCriticalPathIdx = 0;
+        this.currentCriticalPathLabel = '';
       });
       document.addEventListener('bv-graph:timeTravelReady', (e) => {
         this.timeTravelAvailable = (e.detail?.commits || 0) > 0;
@@ -3519,7 +3977,14 @@ function beadsApp() {
           this.topByKCore = getTopByKCore(10);
           this.articulationPoints = getArticulationPoints();
           this.criticalPathSlack = getIssuesBySlack(10, true); // Zero slack = critical path
-          this.flexibleSlackIssues = getIssuesBySlack(10, false).filter(i => (i.slack || 0) > 0);
+          this.flexibleSlackIssues = getIssuesBySlack(25, false)
+            .filter(i => (i.slack || 0) > 0 && i.status !== 'closed' && i.status !== 'tombstone')
+            .slice(0, 10);
+          this.parallelCutData = getParallelCutData(10);
+          this.parallelCutIssues = this.parallelCutData.items || [];
+          this.bridgeEdges = getBridgeDependencies(15);
+          this.topCriticalPaths = getTopCriticalPaths(5);
+          this.totalCriticalPaths = this.topCriticalPaths.length;
         }
 
         // Handle the initial hash route or a host-rewritten clean path after
@@ -3966,6 +4431,12 @@ function beadsApp() {
         this.totalIssues = countIssues(filters);
       }
 
+      if (this.issues.length === 0) {
+        this.focusedIssueIndex = -1;
+      } else if (this.focusedIssueIndex >= this.issues.length) {
+        this.focusedIssueIndex = this.issues.length - 1;
+      }
+
       // Sync URL state (only on issues view)
       if (this.view === 'issues') {
         syncFiltersToURL('issues', this.filters, this.sort, this.searchQuery, this.searchMode, this.searchPreset);
@@ -4187,11 +4658,30 @@ function beadsApp() {
     },
 
     /**
+     * Check whether a keyboard event originated inside an editable input/control
+     */
+    isEditableEventTarget(event) {
+      const target = event?.target || (typeof document !== 'undefined' ? document.activeElement : null);
+      if (!target) return false;
+      const tag = String(target.tagName || '').toUpperCase();
+      return ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag) || Boolean(target.isContentEditable);
+    },
+
+    /**
+     * Toggle the Mermaid dependency graph inside the issue detail modal (ignoring editable inputs)
+     */
+    toggleDependencyGraphView(event) {
+      if (!this.selectedIssue || this.isEditableEventTarget(event)) return;
+      this.showDepGraph = !this.showDepGraph;
+    },
+
+    /**
      * Navigate to next/previous issue in the list
      * @param {number} direction - 1 for next, -1 for previous
+     * @param {KeyboardEvent} [event] - Optional keyboard event for input guard
      */
-    navigateIssue(direction) {
-      if (!this.selectedIssue) return;
+    navigateIssue(direction, event) {
+      if (!this.selectedIssue || this.isEditableEventTarget(event)) return;
 
       // Build navigation list from current issues if not set
       if (!this.issueNavList.length && this.issues.length) {
@@ -4364,6 +4854,7 @@ function beadsApp() {
       this.darkMode = !this.darkMode;
       localStorage.setItem('darkMode', this.darkMode);
       document.documentElement.classList.toggle('dark', this.darkMode);
+      window.BVCharts?.applyTheme?.(this.darkMode);
 
       // Re-initialize Mermaid with new theme
       if (window.reinitializeMermaid) {
@@ -4417,7 +4908,40 @@ function beadsApp() {
      */
     getTopImpact(limit = 10) {
       if (!this.graphReady) return [];
-      return topWhatIf(limit);
+      return this.includeBlockedWhatIf ? allWhatIf(limit) : topWhatIf(limit);
+    },
+
+    /**
+     * Toggle including blocked open issues in Insights Cascade Impact Analysis
+     */
+    toggleIncludeBlockedWhatIf() {
+      this.includeBlockedWhatIf = !this.includeBlockedWhatIf;
+      if (!this.graphReady) return;
+      this.topImpactIssues = this.includeBlockedWhatIf ? allWhatIf(10) : topWhatIf(10);
+    },
+
+    async highlightCriticalPathInGraph() {
+      const ready = await this.initForceGraph();
+      if (!ready) return;
+      this.forceGraphModule?.toggleCriticalPath?.();
+    },
+
+    async prevCriticalPathInGraph() {
+      const ready = await this.initForceGraph();
+      if (!ready) return;
+      this.forceGraphModule?.prevCriticalPath?.();
+    },
+
+    async nextCriticalPathInGraph() {
+      const ready = await this.initForceGraph();
+      if (!ready) return;
+      this.forceGraphModule?.nextCriticalPath?.();
+    },
+
+    async focusCriticalPathInGraph() {
+      const ready = await this.initForceGraph();
+      if (!ready) return;
+      this.forceGraphModule?.zoomToCriticalPath?.();
     },
 
     /**
@@ -4706,11 +5230,9 @@ function beadsApp() {
      * Format date helper (relative for recent, absolute for older)
      */
     formatDate,
-
-    /**
-     * Format date helper (always absolute with time)
-     */
     formatDateFull,
+    formatEstimatedMinutes,
+    formatCriticalPathHops,
 
     /**
      * Safe number formatter (returns em-dash for NaN/undefined/null/Infinity)
@@ -4816,6 +5338,9 @@ function beadsApp() {
 window.beadsViewer = {
   // Database
   DB_STATE,
+  supportsJsonEach,
+  formatEstimatedMinutes,
+  formatCriticalPathHops,
   loadDatabase,
   execQuery,
   queryIssues,
@@ -4854,7 +5379,12 @@ window.beadsViewer = {
   getResolvedIssueIDs,
   recalculateMetrics,
   whatIfClose,
+  whatIfCloseBatch,
   topWhatIf,
+  allWhatIf,
+  getParallelCutData,
+  getBridgeDependencies,
+  getTopCriticalPaths,
   getActionableIssues,
   getCycleBreakSuggestions,
   getCriticalPathSequence,

@@ -2249,3 +2249,388 @@ func TestGenerateMarkdown_ViewColumnsTagsGroupingAndEscaping(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateReport_MetricsAllFormatsCSVColumnsHeadingNewlinesAndIssueMetadata(t *testing.T) {
+	eta := 90
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(2 * time.Hour)
+	issues := []model.Issue{
+		{
+			ID:               "rep-1",
+			Title:            "Primary\r\nHeading Title That Exceeds Truncation Limit",
+			Description:      "Root blocker task",
+			Status:           model.StatusOpen,
+			Priority:         0,
+			IssueType:        model.TypeBug,
+			CreatedBy:        "alice@example.com",
+			EstimatedMinutes: &eta,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		},
+		{
+			ID:          "rep-2",
+			Title:       "Dependent Closed Item",
+			Status:      model.StatusClosed,
+			Priority:    2,
+			IssueType:   model.TypeTask,
+			CreatedBy:   "bob@example.com",
+			CloseReason: "Verified in production",
+			CreatedAt:   now,
+			UpdatedAt:   closedAt,
+			ClosedAt:    &closedAt,
+			Dependencies: []*model.Dependency{
+				{IssueID: "rep-2", DependsOnID: "rep-1", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	stats := analysis.NewAnalyzer(issues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	metrics := []string{"pagerank", "betweenness", "eigenvector", "hubs", "authorities", "critical_path", "in_degree", "out_degree"}
+
+	// 1. Markdown report: Metrics columns, heading newline stripping, and CreatedBy/EstimatedMinutes/CloseReason.
+	mdBytes, err := GenerateReport(issues, issues, ReportOptions{
+		Format:       "markdown",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		Metrics:      metrics,
+		GraphStats:   &stats,
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(markdown) failed: %v", err)
+	}
+	md := string(mdBytes)
+	for _, want := range []string{
+		"| ID | Title | Type | Priority | Status | PageRank | Betweenness | Eigenvector | Hubs | Authorities | Critical Path | In-Degree | Out-Degree |",
+		"## 🐛 rep-1 Primary Heading Title That Exceeds Truncation Limit\n",
+		"| **Created By** | alice@example.com |",
+		"| **Estimated** | 1h 30m (90m) |",
+		"| **Close Reason** | Verified in production |",
+		"| **PageRank** | ",
+	} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("markdown report missing %q:\n%s", want, md)
+		}
+	}
+	if strings.Contains(md, "## 🐛 rep-1 Primary\n") || strings.Contains(md, "## 🐛 rep-1 Primary\r") {
+		t.Fatalf("markdown heading failed to strip CR/LF:\n%s", md)
+	}
+
+	// 2. HTML report via GenerateReport(Format: "html"): includes metrics columns and metadata rows.
+	htmlBytes, err := GenerateReport(issues, issues, ReportOptions{
+		Format:       "html",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		Metrics:      []string{"pagerank", "critical_path"},
+		GraphStats:   &stats,
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(html) failed: %v", err)
+	}
+	htmlOut := string(htmlBytes)
+	for _, want := range []string{
+		"<th>PageRank</th><th>Critical Path</th>",
+		"<tr><th>Created By</th><td>alice@example.com</td></tr>",
+		"<tr><th>Estimated</th><td>1h 30m (90m)</td></tr>",
+		"<tr><th>Close Reason</th><td>Verified in production</td></tr>",
+	} {
+		if !strings.Contains(htmlOut, want) {
+			t.Fatalf("HTML report missing %q", want)
+		}
+	}
+
+	// 3. CSV report: honors View.Columns, View.TruncateTitle, and Metrics columns.
+	csvBytes, err := GenerateReport(issues, issues, ReportOptions{
+		Format:       "csv",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		Metrics:      []string{"pagerank", "in_degree"},
+		GraphStats:   &stats,
+		View: recipe.ViewConfig{
+			Columns:       []string{"id", "title", "status"},
+			TruncateTitle: 15,
+		},
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(csv) failed: %v", err)
+	}
+	rows, err := csv.NewReader(bytes.NewReader(csvBytes)).ReadAll()
+	if err != nil {
+		t.Fatalf("parse CSV: %v", err)
+	}
+	wantHeader := []string{"id", "title", "status", "pagerank", "in_degree"}
+	if len(rows) != 3 || fmt.Sprint(rows[0]) != fmt.Sprint(wantHeader) {
+		t.Fatalf("CSV header/rows = %q, want header %q", rows, wantHeader)
+	}
+	if utf8.RuneCountInString(rows[1][1]) > 15 || !strings.HasSuffix(rows[1][1], "…") {
+		t.Fatalf("CSV title was not truncated to 15 runes: %q", rows[1][1])
+	}
+
+	// 4. JSON report: includes per-issue "metrics" object when Metrics + GraphStats provided.
+	jsonBytes, err := GenerateReport(issues, issues, ReportOptions{
+		Format:       "json",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		Metrics:      []string{"pagerank", "out_degree"},
+		GraphStats:   &stats,
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(json) failed: %v", err)
+	}
+	var jsonParsed struct {
+		Issues []struct {
+			ID      string             `json:"id"`
+			Metrics map[string]float64 `json:"metrics"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(jsonBytes, &jsonParsed); err != nil {
+		t.Fatalf("Unmarshal JSON report: %v", err)
+	}
+	if len(jsonParsed.Issues) != 2 {
+		t.Fatalf("expected 2 JSON issues, got %d", len(jsonParsed.Issues))
+	}
+	if _, ok := jsonParsed.Issues[0].Metrics["pagerank"]; !ok {
+		t.Fatalf("expected pagerank in JSON issue metrics, got %+v", jsonParsed.Issues[0].Metrics)
+	}
+	if _, ok := jsonParsed.Issues[1].Metrics["out_degree"]; !ok {
+		t.Fatalf("expected out_degree in JSON issue metrics, got %+v", jsonParsed.Issues[1].Metrics)
+	}
+}
+
+func TestGenerateReport_SlackUnavailableOnCyclicAndClosedIssues(t *testing.T) {
+	now := time.Date(2026, 11, 15, 16, 0, 0, 0, time.UTC)
+
+	// Case 1: Active cycle -> slack is unavailable ("N/A" in MD/HTML/CSV, omitted in JSON).
+	cyclicIssues := []model.Issue{
+		{
+			ID: "cyc-1", Title: "Cycle Node 1", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "cyc-1", DependsOnID: "cyc-2", Type: model.DepBlocks}},
+		},
+		{
+			ID: "cyc-2", Title: "Cycle Node 2", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "cyc-2", DependsOnID: "cyc-1", Type: model.DepBlocks}},
+		},
+	}
+	cyclicStats := analysis.NewAnalyzer(cyclicIssues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+
+	for _, format := range []string{"markdown", "html", "csv"} {
+		out, err := GenerateReport(cyclicIssues, cyclicIssues, ReportOptions{
+			Format:       format,
+			IncludeGraph: false,
+			GeneratedAt:  now,
+			Metrics:      []string{"pagerank", "slack"},
+			GraphStats:   &cyclicStats,
+		})
+		if err != nil {
+			t.Fatalf("GenerateReport(%s, cyclic) failed: %v", format, err)
+		}
+		text := string(out)
+		if !strings.Contains(text, "N/A") {
+			t.Fatalf("expected %s cyclic report to render N/A for slack, got:\n%s", format, text)
+		}
+		if format == "markdown" && strings.Contains(text, "| **Slack** | 0.00 |") {
+			t.Fatalf("markdown cyclic report falsely emitted 0.00 slack:\n%s", text)
+		}
+		if format == "html" && strings.Contains(text, "<tr><th>Slack</th><td>0.00</td></tr>") {
+			t.Fatalf("html cyclic report falsely emitted 0.00 slack:\n%s", text)
+		}
+	}
+
+	jsonOut, err := GenerateReport(cyclicIssues, cyclicIssues, ReportOptions{
+		Format:       "json",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		Metrics:      []string{"pagerank", "slack"},
+		GraphStats:   &cyclicStats,
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(json, cyclic) failed: %v", err)
+	}
+	var parsedCyclic struct {
+		Issues []struct {
+			ID      string             `json:"id"`
+			Metrics map[string]float64 `json:"metrics"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(jsonOut, &parsedCyclic); err != nil {
+		t.Fatalf("Unmarshal cyclic JSON: %v", err)
+	}
+	for _, iss := range parsedCyclic.Issues {
+		if _, hasSlack := iss.Metrics["slack"]; hasSlack {
+			t.Fatalf("expected JSON metrics for %s to omit unavailable slack, got %+v", iss.ID, iss.Metrics)
+		}
+		if _, hasPR := iss.Metrics["pagerank"]; !hasPR {
+			t.Fatalf("expected JSON metrics for %s to retain pagerank, got %+v", iss.ID, iss.Metrics)
+		}
+	}
+
+	// Case 2: Acyclic graph with one open issue (slack=0.00) and one closed issue (slack="N/A", omitted in JSON).
+	mixedIssues := []model.Issue{
+		{ID: "open-1", Title: "Active Root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "closed-1", Title: "Historical Closed", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	}
+	mixedStats := analysis.NewAnalyzer(mixedIssues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+
+	csvOut, err := GenerateReport(mixedIssues, mixedIssues, ReportOptions{
+		Format:       "csv",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		Metrics:      []string{"slack"},
+		GraphStats:   &mixedStats,
+		View:         recipe.ViewConfig{Columns: []string{"id", "slack"}},
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(csv, mixed) failed: %v", err)
+	}
+	csvRows, err := csv.NewReader(bytes.NewReader(csvOut)).ReadAll()
+	if err != nil {
+		t.Fatalf("parse mixed CSV: %v", err)
+	}
+	if len(csvRows) != 3 || csvRows[1][1] != "0.00" || csvRows[2][1] != "N/A" {
+		t.Fatalf("unexpected mixed CSV rows (want open-1=0.00, closed-1=N/A): %+v", csvRows)
+	}
+
+	mixedJSON, err := GenerateReport(mixedIssues, mixedIssues, ReportOptions{
+		Format:       "json",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		Metrics:      []string{"pagerank", "slack"},
+		GraphStats:   &mixedStats,
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(json, mixed) failed: %v", err)
+	}
+	var parsedMixed struct {
+		Issues []struct {
+			ID      string             `json:"id"`
+			Metrics map[string]float64 `json:"metrics"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(mixedJSON, &parsedMixed); err != nil {
+		t.Fatalf("Unmarshal mixed JSON: %v", err)
+	}
+	if _, ok := parsedMixed.Issues[0].Metrics["slack"]; !ok {
+		t.Fatalf("expected open-1 to include slack=0, got %+v", parsedMixed.Issues[0].Metrics)
+	}
+	if _, ok := parsedMixed.Issues[1].Metrics["slack"]; ok {
+		t.Fatalf("expected closed-1 to omit slack, got %+v", parsedMixed.Issues[1].Metrics)
+	}
+}
+
+func TestGenerateReport_MermaidPreservesReadinessAfterStrippingTombstones(t *testing.T) {
+	now := time.Date(2026, 11, 15, 16, 30, 0, 0, time.UTC)
+	selected := []model.Issue{
+		{
+			ID: "open-ready", Title: "Unblocked Once Tombstone Removed", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-ready", DependsOnID: "tomb-blocker", Type: model.DepBlocks},
+			},
+		},
+	}
+	context := []model.Issue{
+		selected[0],
+		{
+			ID: "tomb-blocker", Title: "Deleted Prerequisite", Status: model.StatusTombstone, Priority: 2, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+		},
+	}
+	readiness := model.NewReadinessIndex(context)
+	safeID := sanitizeMermaidID("open-ready")
+
+	// Test both explicit opts.Readiness AND nil opts.Readiness across mermaid, markdown, and html formats.
+	for _, explicitReadiness := range []*model.ReadinessIndex{readiness, nil} {
+		for _, format := range []string{"mermaid", "markdown", "html"} {
+			raw, err := GenerateReport(selected, context, ReportOptions{
+				Format:       format,
+				IncludeGraph: true,
+				GeneratedAt:  now,
+				Readiness:    explicitReadiness,
+			})
+			if err != nil {
+				t.Fatalf("GenerateReport(%s, explicitReadiness=%v) failed: %v", format, explicitReadiness != nil, err)
+			}
+			out := string(raw)
+			if !strings.Contains(out, fmt.Sprintf("class %s open", safeID)) {
+				t.Fatalf("%s report (explicitReadiness=%v) failed to classify open-ready as open:\n%s", format, explicitReadiness != nil, out)
+			}
+			if strings.Contains(out, fmt.Sprintf("class %s blocked", safeID)) {
+				t.Fatalf("%s report (explicitReadiness=%v) falsely classified open-ready as blocked:\n%s", format, explicitReadiness != nil, out)
+			}
+			if strings.Contains(out, "tomb-blocker") && format == "mermaid" {
+				t.Fatalf("mermaid report leaked stripped tombstone node:\n%s", out)
+			}
+		}
+	}
+}
+
+func TestGenerateHTMLReport_GroupByModes(t *testing.T) {
+	now := time.Date(2026, 11, 15, 17, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID: "h-1", Title: "Critical Auth Bug", Status: model.StatusInProgress, Priority: 0,
+			IssueType: model.TypeBug, Assignee: "alice", Labels: []string{"security", "backend"},
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "h-2", Title: "Export Polish", Status: model.StatusOpen, Priority: 2,
+			IssueType: model.TypeFeature, Assignee: "bob", Labels: []string{"export"},
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "h-3", Title: "Cleanup Chore", Status: model.StatusClosed, Priority: 3,
+			IssueType: model.TypeChore, CreatedAt: now, UpdatedAt: now,
+		},
+	}
+
+	cases := []struct {
+		groupBy   string
+		wantOrder []string
+	}{
+		{
+			groupBy:   "priority",
+			wantOrder: []string{"<h2>Group: 🔥 Critical (P0) (1)</h2>", "<h2>Group: 🔹 Medium (P2) (1)</h2>", "<h2>Group: ☕ Low (P3) (1)</h2>"},
+		},
+		{
+			groupBy:   "status",
+			wantOrder: []string{"<h2>Group: 🟢 open (1)</h2>", "<h2>Group: 🔵 in_progress (1)</h2>", "<h2>Group: ⚫ closed (1)</h2>"},
+		},
+		{
+			groupBy:   "type",
+			wantOrder: []string{"<h2>Group: 🐛 bug (1)</h2>", "<h2>Group: ✨ feature (1)</h2>", "<h2>Group: 🧹 chore (1)</h2>"},
+		},
+		{
+			groupBy:   "label",
+			wantOrder: []string{"<h2>Group: backend (1)</h2>", "<h2>Group: export (1)</h2>", "<h2>Group: Unlabeled (1)</h2>"},
+		},
+		{
+			groupBy:   "assignee",
+			wantOrder: []string{"<h2>Group: @alice (1)</h2>", "<h2>Group: @bob (1)</h2>", "<h2>Group: Unassigned (1)</h2>"},
+		},
+	}
+
+	for _, tc := range cases {
+		raw, err := GenerateReport(issues, nil, ReportOptions{
+			Format:       "html",
+			IncludeGraph: false,
+			GeneratedAt:  now,
+			View:         recipe.ViewConfig{GroupBy: tc.groupBy},
+		})
+		if err != nil {
+			t.Fatalf("GenerateReport(html, View.GroupBy=%s) failed: %v", tc.groupBy, err)
+		}
+		out := string(raw)
+		lastIdx := -1
+		for _, heading := range tc.wantOrder {
+			idx := strings.Index(out, heading)
+			if idx < 0 {
+				t.Fatalf("HTML report (groupBy=%s) missing group heading %q:\n%s", tc.groupBy, heading, out)
+			}
+			if idx <= lastIdx {
+				t.Fatalf("HTML report (groupBy=%s) heading %q out of order:\n%s", tc.groupBy, heading, out)
+			}
+			lastIdx = idx
+		}
+	}
+}

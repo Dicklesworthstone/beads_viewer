@@ -35,6 +35,8 @@ type ReportOptions struct {
 	Template          string
 	GroupBy           string
 	View              recipe.ViewConfig
+	Metrics           []string
+	GraphStats        *analysis.GraphStats
 	Title             string
 	GeneratedAt       time.Time
 	Readiness         *model.ReadinessIndex
@@ -82,9 +84,9 @@ func ResolveReportOptions(defaults recipe.ExportConfig, explicit ReportOverrides
 
 func (opts ReportOptions) validate() error {
 	switch opts.Format {
-	case "markdown", "json", "csv", "mermaid":
+	case "markdown", "html", "json", "csv", "mermaid":
 	default:
-		return fmt.Errorf("export format %q must be markdown, json, csv or mermaid", opts.Format)
+		return fmt.Errorf("export format %q must be markdown, html, json, csv or mermaid", opts.Format)
 	}
 	if opts.Format == "csv" && opts.IncludeGraph {
 		return fmt.Errorf("CSV cannot include a graph; set --export-include-graph=false")
@@ -96,6 +98,281 @@ func (opts ReportOptions) validate() error {
 		return fmt.Errorf("custom templates require markdown export")
 	}
 	return nil
+}
+
+var defaultReportMetricKeys = []string{
+	"pagerank",
+	"betweenness",
+	"eigenvector",
+	"hubs",
+	"authorities",
+	"critical_path",
+	"in_degree",
+	"out_degree",
+}
+
+func normalizeReportMetricKey(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "pagerank", "page_rank", "pr":
+		return "pagerank", true
+	case "betweenness", "bw":
+		return "betweenness", true
+	case "eigenvector", "eigen":
+		return "eigenvector", true
+	case "hubs", "hub":
+		return "hubs", true
+	case "authorities", "authority", "auth":
+		return "authorities", true
+	case "critical_path", "critical_path_score", "criticalpath", "critical", "impact":
+		return "critical_path", true
+	case "kcore", "k_core", "core_number":
+		return "kcore", true
+	case "slack":
+		return "slack", true
+	case "in_degree", "indegree":
+		return "in_degree", true
+	case "out_degree", "outdegree":
+		return "out_degree", true
+	default:
+		return "", false
+	}
+}
+
+func reportMetricHeader(key string) string {
+	switch key {
+	case "pagerank":
+		return "PageRank"
+	case "betweenness":
+		return "Betweenness"
+	case "eigenvector":
+		return "Eigenvector"
+	case "hubs":
+		return "Hubs"
+	case "authorities":
+		return "Authorities"
+	case "critical_path":
+		return "Critical Path"
+	case "kcore":
+		return "K-Core"
+	case "slack":
+		return "Slack"
+	case "in_degree":
+		return "In-Degree"
+	case "out_degree":
+		return "Out-Degree"
+	default:
+		return key
+	}
+}
+
+type reportMetricsAccessor struct {
+	keys           []string
+	pageRank       map[string]float64
+	betweenness    map[string]float64
+	eigenvector    map[string]float64
+	hubs           map[string]float64
+	authorities    map[string]float64
+	criticalPath   map[string]float64
+	kcore          map[string]int
+	slack          map[string]float64
+	slackAvailable bool
+	resolvedIDs    map[string]bool
+	inDegree       map[string]int
+	outDegree      map[string]int
+}
+
+func newReportMetricsAccessor(opts ReportOptions, issueSlices ...[]model.Issue) *reportMetricsAccessor {
+	if opts.GraphStats == nil || (!opts.View.ShowMetrics && len(opts.Metrics) == 0) {
+		return nil
+	}
+	var keys []string
+	seen := make(map[string]bool)
+	if len(opts.Metrics) == 0 {
+		keys = append(keys, defaultReportMetricKeys...)
+	} else {
+		for _, raw := range opts.Metrics {
+			trimmed := strings.ToLower(strings.TrimSpace(raw))
+			if trimmed == "all" || trimmed == "*" {
+				for _, defKey := range defaultReportMetricKeys {
+					if !seen[defKey] {
+						seen[defKey] = true
+						keys = append(keys, defKey)
+					}
+				}
+				continue
+			}
+			if norm, ok := normalizeReportMetricKey(trimmed); ok && !seen[norm] {
+				seen[norm] = true
+				keys = append(keys, norm)
+			}
+		}
+		if len(keys) == 0 && opts.View.ShowMetrics {
+			keys = append(keys, defaultReportMetricKeys...)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	resolvedIDs := make(map[string]bool)
+	if opts.Readiness != nil {
+		for _, id := range opts.Readiness.ResolvedIDs() {
+			resolvedIDs[id] = true
+		}
+	}
+	for _, iss := range opts.GraphIssues {
+		if isClosedLikeStatus(iss.Status) {
+			resolvedIDs[iss.ID] = true
+		}
+	}
+	for _, slice := range issueSlices {
+		for _, iss := range slice {
+			if isClosedLikeStatus(iss.Status) {
+				resolvedIDs[iss.ID] = true
+			}
+		}
+	}
+	slack := opts.GraphStats.Slack()
+	return &reportMetricsAccessor{
+		keys:           keys,
+		pageRank:       opts.GraphStats.PageRank(),
+		betweenness:    opts.GraphStats.Betweenness(),
+		eigenvector:    opts.GraphStats.Eigenvector(),
+		hubs:           opts.GraphStats.Hubs(),
+		authorities:    opts.GraphStats.Authorities(),
+		criticalPath:   opts.GraphStats.CriticalPathScore(),
+		kcore:          opts.GraphStats.CoreNumber(),
+		slack:          slack,
+		slackAvailable: len(slack) > 0 && len(opts.GraphStats.Cycles()) == 0,
+		resolvedIDs:    resolvedIDs,
+		inDegree:       opts.GraphStats.InDegree,
+		outDegree:      opts.GraphStats.OutDegree,
+	}
+}
+
+func (m *reportMetricsAccessor) slackForIssue(issueID string) (float64, bool) {
+	if m == nil || !m.slackAvailable || m.slack == nil || m.resolvedIDs[issueID] {
+		return 0, false
+	}
+	val, ok := m.slack[issueID]
+	return val, ok
+}
+
+func (m *reportMetricsAccessor) floatValue(key, issueID string) float64 {
+	if m == nil {
+		return 0
+	}
+	switch key {
+	case "pagerank":
+		return m.pageRank[issueID]
+	case "betweenness":
+		return m.betweenness[issueID]
+	case "eigenvector":
+		return m.eigenvector[issueID]
+	case "hubs":
+		return m.hubs[issueID]
+	case "authorities":
+		return m.authorities[issueID]
+	case "critical_path":
+		return m.criticalPath[issueID]
+	case "kcore":
+		return float64(m.kcore[issueID])
+	case "slack":
+		val, _ := m.slackForIssue(issueID)
+		return val
+	case "in_degree":
+		return float64(m.inDegree[issueID])
+	case "out_degree":
+		return float64(m.outDegree[issueID])
+	default:
+		return 0
+	}
+}
+
+func (m *reportMetricsAccessor) formatValue(key, issueID string) string {
+	if m == nil {
+		return "0"
+	}
+	switch key {
+	case "kcore":
+		return fmt.Sprintf("%d", m.kcore[issueID])
+	case "in_degree":
+		return fmt.Sprintf("%d", m.inDegree[issueID])
+	case "out_degree":
+		return fmt.Sprintf("%d", m.outDegree[issueID])
+	case "slack":
+		val, ok := m.slackForIssue(issueID)
+		if !ok {
+			return "N/A"
+		}
+		return fmt.Sprintf("%.2f", val)
+	case "critical_path":
+		return fmt.Sprintf("%.2f", m.floatValue(key, issueID))
+	default:
+		return fmt.Sprintf("%.4f", m.floatValue(key, issueID))
+	}
+}
+
+func (m *reportMetricsAccessor) mapForIssue(issueID string) map[string]float64 {
+	if m == nil || len(m.keys) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(m.keys))
+	for _, k := range m.keys {
+		if k == "slack" {
+			val, ok := m.slackForIssue(issueID)
+			if !ok {
+				continue
+			}
+			out[k] = val
+			continue
+		}
+		out[k] = m.floatValue(k, issueID)
+	}
+	return out
+}
+
+func buildBlockingReverseMap(issues []model.Issue) map[string][]string {
+	blocksSetByID := make(map[string]map[string]bool, len(issues))
+	for _, iss := range issues {
+		for _, dep := range iss.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == "" {
+				continue
+			}
+			if blocksSetByID[dep.DependsOnID] == nil {
+				blocksSetByID[dep.DependsOnID] = make(map[string]bool)
+			}
+			blocksSetByID[dep.DependsOnID][iss.ID] = true
+		}
+	}
+	blocksByID := make(map[string][]string, len(blocksSetByID))
+	for blockerID, set := range blocksSetByID {
+		list := make([]string, 0, len(set))
+		for depID := range set {
+			list = append(list, depID)
+		}
+		sort.Strings(list)
+		blocksByID[blockerID] = list
+	}
+	return blocksByID
+}
+
+func combineReportIssues(selected, context []model.Issue) []model.Issue {
+	if len(context) == 0 {
+		return selected
+	}
+	combined := make([]model.Issue, 0, len(selected)+len(context))
+	seen := make(map[string]bool, len(selected)+len(context))
+	for _, iss := range selected {
+		seen[iss.ID] = true
+		combined = append(combined, iss)
+	}
+	for _, iss := range context {
+		if !seen[iss.ID] {
+			seen[iss.ID] = true
+			combined = append(combined, iss)
+		}
+	}
+	return combined
 }
 
 // GenerateReport renders selected bodies in their supplied recipe order. The
@@ -111,9 +388,14 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 	if opts.GeneratedAt.IsZero() {
 		opts.GeneratedAt = time.Now().UTC()
 	}
+	hadCallerReadiness := opts.Readiness != nil
 	if opts.IncludeGraph {
+		if opts.Readiness == nil {
+			opts.Readiness = model.NewReadinessIndex(combineReportIssues(selected, context))
+		}
 		opts.GraphIssues = reportGraphContext(selected, context)
 	}
+	metricsAcc := newReportMetricsAccessor(opts, selected, context)
 	switch opts.Format {
 	case "markdown":
 		if opts.Template != "" {
@@ -121,20 +403,32 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 		}
 		content, err := GenerateMarkdown(selected, opts.Title, opts)
 		return []byte(content), err
+	case "html":
+		content, err := GenerateHTMLReport(selected, opts.Title, opts)
+		return []byte(content), err
 	case "json":
 		type row struct {
 			model.Issue
 			Actions model.IssueActions `json:"actions"`
+			Metrics map[string]float64 `json:"metrics,omitempty"`
 		}
 		rows := make([]row, 0, len(selected))
 		for _, issue := range selected {
-			claimable := opts.AuthorityComplete && opts.Readiness != nil && opts.Readiness.Claimable(issue.ID, opts.GeneratedAt)
-			rows = append(rows, row{issue, issue.Actions(claimable)})
+			claimable := opts.AuthorityComplete && hadCallerReadiness && opts.Readiness.Claimable(issue.ID, opts.GeneratedAt)
+			rows = append(rows, row{
+				Issue:   issue,
+				Actions: issue.Actions(claimable),
+				Metrics: metricsAcc.mapForIssue(issue.ID),
+			})
 		}
 		var graph *GraphExportResult
 		if opts.IncludeGraph {
 			var err error
-			graph, err = ExportGraph(opts.GraphIssues, nil, GraphExportConfig{Format: GraphFormatJSON, DataHash: analysis.ComputeDataHash(opts.GraphIssues)})
+			graph, err = ExportGraph(opts.GraphIssues, opts.GraphStats, GraphExportConfig{
+				Format:    GraphFormatJSON,
+				DataHash:  analysis.ComputeDataHash(opts.GraphIssues),
+				Readiness: opts.Readiness,
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -153,22 +447,206 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 			Graph           *GraphExportResult `json:"graph,omitempty"`
 		}{opts.Title, opts.GeneratedAt, opts.SourceAuthority, opts.AuthorityHash, opts.DataHash, opts.SourcePath, opts.SourceKind, opts.AsOf, opts.AsOfCommit, rows, graph}, "", "  ")
 	case "csv":
-		var content bytes.Buffer
-		writer := csv.NewWriter(&content)
-		if err := writer.Write([]string{"id", "title", "status", "priority", "issue_type", "description", "labels"}); err != nil {
-			return nil, err
-		}
-		for _, issue := range selected {
-			if err := writer.Write([]string{issue.ID, issue.Title, string(issue.Status), fmt.Sprint(issue.Priority), string(issue.IssueType), issue.Description, strings.Join(issue.Labels, ";")}); err != nil {
-				return nil, err
-			}
-		}
-		writer.Flush()
-		return content.Bytes(), writer.Error()
+		return writeCSVReport(selected, context, opts, metricsAcc)
 	case "mermaid":
-		return []byte(reportMermaid(opts.GraphIssues)), nil
+		return []byte(reportMermaid(opts.GraphIssues, opts.Readiness)), nil
 	}
 	return nil, fmt.Errorf("unhandled export format %q", opts.Format)
+}
+
+func writeCSVReport(selected, context []model.Issue, opts ReportOptions, metricsAcc *reportMetricsAccessor) ([]byte, error) {
+	allForBlocks := selected
+	if len(context) > 0 {
+		combined := make([]model.Issue, 0, len(context)+len(selected))
+		seen := make(map[string]bool, len(context)+len(selected))
+		for _, iss := range selected {
+			seen[iss.ID] = true
+			combined = append(combined, iss)
+		}
+		for _, iss := range context {
+			if !seen[iss.ID] {
+				seen[iss.ID] = true
+				combined = append(combined, iss)
+			}
+		}
+		allForBlocks = combined
+	}
+	blocksByID := buildBlockingReverseMap(allForBlocks)
+
+	type csvColSpec struct {
+		key    string
+		header string
+		render func(i model.Issue) string
+	}
+
+	resolveCSVCol := func(raw string) (csvColSpec, bool) {
+		norm := strings.ToLower(strings.TrimSpace(raw))
+		switch norm {
+		case "id":
+			return csvColSpec{key: "id", header: "id", render: func(i model.Issue) string { return i.ID }}, true
+		case "title":
+			return csvColSpec{
+				key:    "title",
+				header: "title",
+				render: func(i model.Issue) string {
+					if opts.View.TruncateTitle > 0 {
+						return truncateString(i.Title, opts.View.TruncateTitle)
+					}
+					return i.Title
+				},
+			}, true
+		case "status":
+			return csvColSpec{key: "status", header: "status", render: func(i model.Issue) string { return string(i.Status) }}, true
+		case "priority":
+			return csvColSpec{key: "priority", header: "priority", render: func(i model.Issue) string { return fmt.Sprint(i.Priority) }}, true
+		case "type", "issue_type":
+			return csvColSpec{key: "issue_type", header: "issue_type", render: func(i model.Issue) string { return string(i.IssueType) }}, true
+		case "description":
+			return csvColSpec{key: "description", header: "description", render: func(i model.Issue) string { return i.Description }}, true
+		case "label", "labels", "tag", "tags":
+			return csvColSpec{key: "labels", header: "labels", render: func(i model.Issue) string { return strings.Join(i.Labels, ";") }}, true
+		case "assignee":
+			return csvColSpec{key: "assignee", header: "assignee", render: func(i model.Issue) string { return strings.TrimSpace(i.Assignee) }}, true
+		case "created", "created_at":
+			return csvColSpec{
+				key:    "created_at",
+				header: "created_at",
+				render: func(i model.Issue) string {
+					if i.CreatedAt.IsZero() {
+						return ""
+					}
+					return i.CreatedAt.Format(time.RFC3339)
+				},
+			}, true
+		case "updated", "updated_at":
+			return csvColSpec{
+				key:    "updated_at",
+				header: "updated_at",
+				render: func(i model.Issue) string {
+					if i.UpdatedAt.IsZero() {
+						return ""
+					}
+					return i.UpdatedAt.Format(time.RFC3339)
+				},
+			}, true
+		case "closed", "closed_at":
+			return csvColSpec{
+				key:    "closed_at",
+				header: "closed_at",
+				render: func(i model.Issue) string {
+					if i.ClosedAt == nil || i.ClosedAt.IsZero() {
+						return ""
+					}
+					return i.ClosedAt.Format(time.RFC3339)
+				},
+			}, true
+		case "created_by":
+			return csvColSpec{key: "created_by", header: "created_by", render: func(i model.Issue) string { return i.CreatedBy }}, true
+		case "close_reason":
+			return csvColSpec{key: "close_reason", header: "close_reason", render: func(i model.Issue) string { return i.CloseReason }}, true
+		case "estimated_minutes":
+			return csvColSpec{
+				key:    "estimated_minutes",
+				header: "estimated_minutes",
+				render: func(i model.Issue) string {
+					if i.EstimatedMinutes == nil {
+						return ""
+					}
+					return fmt.Sprint(*i.EstimatedMinutes)
+				},
+			}, true
+		case "blocked_by", "blockers":
+			return csvColSpec{
+				key:    "blocked_by",
+				header: "blocked_by",
+				render: func(i model.Issue) string {
+					var blockers []string
+					seen := make(map[string]bool)
+					for _, dep := range i.Dependencies {
+						if dep != nil && dep.Type.IsBlocking() && dep.DependsOnID != "" && !seen[dep.DependsOnID] {
+							seen[dep.DependsOnID] = true
+							blockers = append(blockers, dep.DependsOnID)
+						}
+					}
+					return strings.Join(blockers, ";")
+				},
+			}, true
+		case "blocks", "unblocks":
+			return csvColSpec{
+				key:    "blocks",
+				header: "blocks",
+				render: func(i model.Issue) string {
+					return strings.Join(blocksByID[i.ID], ";")
+				},
+			}, true
+		default:
+			if opts.GraphStats != nil {
+				if mKey, ok := normalizeReportMetricKey(norm); ok {
+					acc := metricsAcc
+					if acc == nil {
+						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness}, selected, context)
+					}
+					return csvColSpec{
+						key:    mKey,
+						header: mKey,
+						render: func(i model.Issue) string { return acc.formatValue(mKey, i.ID) },
+					}, true
+				}
+			}
+			return csvColSpec{}, false
+		}
+	}
+
+	var specs []csvColSpec
+	seenKey := make(map[string]bool)
+	for _, col := range opts.View.Columns {
+		if spec, ok := resolveCSVCol(col); ok && !seenKey[spec.key] {
+			seenKey[spec.key] = true
+			specs = append(specs, spec)
+		}
+	}
+	if len(specs) == 0 {
+		for _, defCol := range []string{"id", "title", "status", "priority", "issue_type", "description", "labels"} {
+			if spec, ok := resolveCSVCol(defCol); ok && !seenKey[spec.key] {
+				seenKey[spec.key] = true
+				specs = append(specs, spec)
+			}
+		}
+	}
+	if metricsAcc != nil {
+		for _, mKey := range metricsAcc.keys {
+			if !seenKey[mKey] {
+				seenKey[mKey] = true
+				keyCopy := mKey
+				specs = append(specs, csvColSpec{
+					key:    keyCopy,
+					header: keyCopy,
+					render: func(i model.Issue) string { return metricsAcc.formatValue(keyCopy, i.ID) },
+				})
+			}
+		}
+	}
+
+	var content bytes.Buffer
+	writer := csv.NewWriter(&content)
+	headers := make([]string, len(specs))
+	for idx, s := range specs {
+		headers[idx] = s.header
+	}
+	if err := writer.Write(headers); err != nil {
+		return nil, err
+	}
+	for _, issue := range selected {
+		row := make([]string, len(specs))
+		for idx, s := range specs {
+			row[idx] = s.render(issue)
+		}
+		if err := writer.Write(row); err != nil {
+			return nil, err
+		}
+	}
+	writer.Flush()
+	return content.Bytes(), writer.Error()
 }
 
 func reportGraphContext(selected, context []model.Issue) []model.Issue {
@@ -205,12 +683,15 @@ func reportGraphContext(selected, context []model.Issue) []model.Issue {
 	return result
 }
 
-func reportMermaid(issues []model.Issue) string {
+func reportMermaid(issues []model.Issue, readiness *model.ReadinessIndex) string {
 	ids := make(map[string]bool, len(issues))
 	for _, issue := range issues {
 		ids[issue.ID] = true
 	}
-	return GenerateMermaidGraph(issues, ids, MermaidConfig{ShowNoDependenciesNode: true})
+	return GenerateMermaidGraph(issues, ids, MermaidConfig{
+		ShowNoDependenciesNode: true,
+		Readiness:              readiness,
+	})
 }
 
 // Template data has no methods or function-valued fields. No filesystem,
@@ -243,7 +724,7 @@ func renderReportTemplate(issues []model.Issue, opts ReportOptions) ([]byte, err
 		Issues                    []issueData
 	}{Title: escapeReportText(opts.Title), GeneratedAt: opts.GeneratedAt.Format(time.RFC3339), Issues: make([]issueData, 0, len(issues))}
 	if opts.IncludeGraph {
-		data.Graph = reportMermaid(opts.GraphIssues)
+		data.Graph = reportMermaid(opts.GraphIssues, opts.Readiness)
 	}
 	for _, issue := range issues {
 		labels := make([]string, 0, len(issue.Labels))
@@ -457,7 +938,7 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 		sb.WriteString("## Dependency Graph\n\n")
 		sb.WriteString("```mermaid\n")
 
-		graph := reportMermaid(opts.GraphIssues)
+		graph := reportMermaid(opts.GraphIssues, opts.Readiness)
 		sb.WriteString(graph)
 
 		sb.WriteString("```\n\n")
@@ -628,35 +1109,17 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 		return
 	}
 
-	blocksSetByID := make(map[string]map[string]bool, len(issues))
-	for _, iss := range issues {
-		for _, dep := range iss.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == "" {
-				continue
-			}
-			if blocksSetByID[dep.DependsOnID] == nil {
-				blocksSetByID[dep.DependsOnID] = make(map[string]bool)
-			}
-			blocksSetByID[dep.DependsOnID][iss.ID] = true
-		}
-	}
-	blocksByID := make(map[string][]string, len(blocksSetByID))
-	for blockerID, set := range blocksSetByID {
-		list := make([]string, 0, len(set))
-		for depID := range set {
-			list = append(list, depID)
-		}
-		sort.Strings(list)
-		blocksByID[blockerID] = list
-	}
+	blocksByID := buildBlockingReverseMap(issues)
+	metricsAcc := newReportMetricsAccessor(opts, issues)
 
-	resolveColumn := func(raw string) (summaryColumnSpec, bool) {
-		switch strings.ToLower(strings.TrimSpace(raw)) {
+	resolveColumn := func(raw string) (summaryColumnSpec, string, bool) {
+		norm := strings.ToLower(strings.TrimSpace(raw))
+		switch norm {
 		case "id":
 			return summaryColumnSpec{
 				header: "ID",
 				render: func(i model.Issue) string { return escapeTableText(i.ID) },
-			}, true
+			}, "id", true
 		case "title":
 			return summaryColumnSpec{
 				header: "Title",
@@ -667,28 +1130,28 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 					}
 					return escapeTableText(t)
 				},
-			}, true
+			}, "title", true
 		case "type", "issue_type":
 			return summaryColumnSpec{
 				header: "Type",
 				render: func(i model.Issue) string {
 					return fmt.Sprintf("%s %s", getTypeEmoji(string(i.IssueType)), escapeTableText(string(i.IssueType)))
 				},
-			}, true
+			}, "type", true
 		case "priority":
 			return summaryColumnSpec{
 				header: "Priority",
 				render: func(i model.Issue) string {
 					return fmt.Sprintf("P%d", i.Priority)
 				},
-			}, true
+			}, "priority", true
 		case "status":
 			return summaryColumnSpec{
 				header: "Status",
 				render: func(i model.Issue) string {
 					return fmt.Sprintf("%s %s", getStatusEmoji(string(i.Status)), escapeTableText(string(i.Status)))
 				},
-			}, true
+			}, "status", true
 		case "assignee":
 			return summaryColumnSpec{
 				header: "Assignee",
@@ -699,7 +1162,7 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 					}
 					return "@" + escapeTableText(clean)
 				},
-			}, true
+			}, "assignee", true
 		case "label", "labels", "tag", "tags":
 			return summaryColumnSpec{
 				header: "Labels",
@@ -713,7 +1176,7 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 					}
 					return strings.Join(escaped, ", ")
 				},
-			}, true
+			}, "labels", true
 		case "created", "created_at":
 			return summaryColumnSpec{
 				header: "Created",
@@ -723,7 +1186,7 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 					}
 					return i.CreatedAt.Format("2006-01-02")
 				},
-			}, true
+			}, "created", true
 		case "updated", "updated_at":
 			return summaryColumnSpec{
 				header: "Updated",
@@ -733,7 +1196,7 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 					}
 					return i.UpdatedAt.Format("2006-01-02")
 				},
-			}, true
+			}, "updated", true
 		case "blocked_by", "blockers":
 			return summaryColumnSpec{
 				header: "Blocked By",
@@ -751,7 +1214,7 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 					}
 					return strings.Join(blockers, ", ")
 				},
-			}, true
+			}, "blocked_by", true
 		case "blocks", "unblocks":
 			return summaryColumnSpec{
 				header: "Blocks",
@@ -766,22 +1229,49 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 					}
 					return strings.Join(escaped, ", ")
 				},
-			}, true
+			}, "blocks", true
 		default:
-			return summaryColumnSpec{}, false
+			if opts.GraphStats != nil {
+				if mKey, ok := normalizeReportMetricKey(norm); ok {
+					acc := metricsAcc
+					if acc == nil {
+						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness}, issues)
+					}
+					return summaryColumnSpec{
+						header: reportMetricHeader(mKey),
+						render: func(i model.Issue) string { return acc.formatValue(mKey, i.ID) },
+					}, mKey, true
+				}
+			}
+			return summaryColumnSpec{}, "", false
 		}
 	}
 
 	var specs []summaryColumnSpec
+	seenKey := make(map[string]bool)
 	for _, col := range opts.View.Columns {
-		if spec, ok := resolveColumn(col); ok {
+		if spec, key, ok := resolveColumn(col); ok && !seenKey[key] {
+			seenKey[key] = true
 			specs = append(specs, spec)
 		}
 	}
 	if len(specs) == 0 {
 		for _, defCol := range []string{"id", "title", "type", "priority", "status"} {
-			if spec, ok := resolveColumn(defCol); ok {
+			if spec, key, ok := resolveColumn(defCol); ok && !seenKey[key] {
+				seenKey[key] = true
 				specs = append(specs, spec)
+			}
+		}
+	}
+	if metricsAcc != nil {
+		for _, mKey := range metricsAcc.keys {
+			if !seenKey[mKey] {
+				seenKey[mKey] = true
+				keyCopy := mKey
+				specs = append(specs, summaryColumnSpec{
+					header: reportMetricHeader(keyCopy),
+					render: func(i model.Issue) string { return metricsAcc.formatValue(keyCopy, i.ID) },
+				})
 			}
 		}
 	}
@@ -804,6 +1294,21 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 	sb.WriteString("\n")
 }
 
+func formatEstimatedDuration(minutes int) string {
+	if minutes <= 0 {
+		return ""
+	}
+	if minutes < 60 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	hours := minutes / 60
+	rem := minutes % 60
+	if rem == 0 {
+		return fmt.Sprintf("%dh (%dm)", hours, minutes)
+	}
+	return fmt.Sprintf("%dh %dm (%dm)", hours, rem, minutes)
+}
+
 func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, opts ReportOptions) {
 	typeIcon := getTypeEmoji(string(i.IssueType))
 	sb.WriteString(fmt.Sprintf("<a id=\"%s\"></a>\n\n", slug))
@@ -817,6 +1322,12 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 	if i.Assignee != "" {
 		sb.WriteString(fmt.Sprintf("| **Assignee** | @%s |\n", escapeTableText(i.Assignee)))
 	}
+	if strings.TrimSpace(i.CreatedBy) != "" {
+		sb.WriteString(fmt.Sprintf("| **Created By** | %s |\n", escapeTableText(i.CreatedBy)))
+	}
+	if i.EstimatedMinutes != nil && *i.EstimatedMinutes > 0 {
+		sb.WriteString(fmt.Sprintf("| **Estimated** | %s |\n", formatEstimatedDuration(*i.EstimatedMinutes)))
+	}
 	sb.WriteString(fmt.Sprintf("| **Created** | %s |\n", i.CreatedAt.Format("2006-01-02 15:04")))
 	sb.WriteString(fmt.Sprintf("| **Updated** | %s |\n", i.UpdatedAt.Format("2006-01-02 15:04")))
 	if i.DueDate != nil {
@@ -828,6 +1339,9 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 	if i.ClosedAt != nil {
 		sb.WriteString(fmt.Sprintf("| **Closed** | %s |\n", i.ClosedAt.Format("2006-01-02 15:04")))
 	}
+	if strings.TrimSpace(i.CloseReason) != "" {
+		sb.WriteString(fmt.Sprintf("| **Close Reason** | %s |\n", escapeTableText(i.CloseReason)))
+	}
 	if i.ExternalRef != nil && *i.ExternalRef != "" {
 		escapedRef := strings.ReplaceAll(escapeTableText(*i.ExternalRef), "`", "'")
 		sb.WriteString(fmt.Sprintf("| **External Ref** | `%s` |\n", escapedRef))
@@ -838,6 +1352,11 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 			escapedLabels[idx] = escapeTableText(label)
 		}
 		sb.WriteString(fmt.Sprintf("| **Labels** | %s |\n", strings.Join(escapedLabels, ", ")))
+	}
+	if metricsAcc := newReportMetricsAccessor(opts, []model.Issue{i}); metricsAcc != nil {
+		for _, mKey := range metricsAcc.keys {
+			sb.WriteString(fmt.Sprintf("| **%s** | %s |\n", reportMetricHeader(mKey), metricsAcc.formatValue(mKey, i.ID)))
+		}
 	}
 	sb.WriteString("\n")
 
@@ -894,9 +1413,279 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 	sb.WriteString("---\n\n")
 }
 
+// GenerateHTMLReport renders a self-contained, HTML-escaped report of selected issues.
+func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) (string, error) {
+	if title == "" {
+		title = "Beads Export"
+	}
+	if opts.GeneratedAt.IsZero() {
+		opts.GeneratedAt = time.Now().UTC()
+	}
+	if opts.IncludeGraph && opts.GraphIssues == nil {
+		opts.GraphIssues = issues
+	}
+
+	metricsAcc := newReportMetricsAccessor(opts, issues)
+	blocksByID := buildBlockingReverseMap(issues)
+
+	var sb strings.Builder
+	sb.WriteString("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n")
+	sb.WriteString(fmt.Sprintf("<title>%s</title>\n", html.EscapeString(title)))
+	sb.WriteString("<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#111827;line-height:1.5}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{border:1px solid #d1d5db;padding:0.5rem 0.75rem;text-align:left;font-size:0.9rem}th{background:#f3f4f6;font-weight:600}section.issue-group{border-top:2px solid #9ca3af;padding-top:1rem;margin-top:2rem}section.issue{border-top:1px solid #e5e7eb;padding-top:1rem;margin-top:1.5rem}pre{background:#f9fafb;padding:0.75rem;border-radius:6px;overflow-x:auto}</style>\n")
+	sb.WriteString("</head>\n<body>\n")
+	sb.WriteString(fmt.Sprintf("<h1>%s</h1>\n", html.EscapeString(title)))
+	sb.WriteString(fmt.Sprintf("<p><em>Generated: %s</em></p>\n", html.EscapeString(opts.GeneratedAt.Format(time.RFC1123))))
+
+	// Summary table
+	type htmlCol struct {
+		key    string
+		header string
+		render func(i model.Issue) string
+	}
+	resolveHTMLCol := func(raw string) (htmlCol, bool) {
+		norm := strings.ToLower(strings.TrimSpace(raw))
+		switch norm {
+		case "id":
+			return htmlCol{key: "id", header: "ID", render: func(i model.Issue) string { return html.EscapeString(i.ID) }}, true
+		case "title":
+			return htmlCol{
+				key:    "title",
+				header: "Title",
+				render: func(i model.Issue) string {
+					t := i.Title
+					if opts.View.TruncateTitle > 0 {
+						t = truncateString(t, opts.View.TruncateTitle)
+					}
+					return html.EscapeString(t)
+				},
+			}, true
+		case "type", "issue_type":
+			return htmlCol{key: "type", header: "Type", render: func(i model.Issue) string { return html.EscapeString(string(i.IssueType)) }}, true
+		case "priority":
+			return htmlCol{key: "priority", header: "Priority", render: func(i model.Issue) string { return fmt.Sprintf("P%d", i.Priority) }}, true
+		case "status":
+			return htmlCol{key: "status", header: "Status", render: func(i model.Issue) string { return html.EscapeString(string(i.Status)) }}, true
+		case "assignee":
+			return htmlCol{
+				key:    "assignee",
+				header: "Assignee",
+				render: func(i model.Issue) string {
+					clean := strings.TrimSpace(i.Assignee)
+					if clean == "" {
+						return "-"
+					}
+					return "@" + html.EscapeString(clean)
+				},
+			}, true
+		case "label", "labels", "tag", "tags":
+			return htmlCol{
+				key:    "labels",
+				header: "Labels",
+				render: func(i model.Issue) string {
+					if len(i.Labels) == 0 {
+						return "-"
+					}
+					return html.EscapeString(strings.Join(i.Labels, ", "))
+				},
+			}, true
+		case "created", "created_at":
+			return htmlCol{
+				key:    "created",
+				header: "Created",
+				render: func(i model.Issue) string {
+					if i.CreatedAt.IsZero() {
+						return "-"
+					}
+					return i.CreatedAt.Format("2006-01-02")
+				},
+			}, true
+		case "updated", "updated_at":
+			return htmlCol{
+				key:    "updated",
+				header: "Updated",
+				render: func(i model.Issue) string {
+					if i.UpdatedAt.IsZero() {
+						return "-"
+					}
+					return i.UpdatedAt.Format("2006-01-02")
+				},
+			}, true
+		case "blocked_by", "blockers":
+			return htmlCol{
+				key:    "blocked_by",
+				header: "Blocked By",
+				render: func(i model.Issue) string {
+					var blockers []string
+					seen := make(map[string]bool)
+					for _, dep := range i.Dependencies {
+						if dep != nil && dep.Type.IsBlocking() && dep.DependsOnID != "" && !seen[dep.DependsOnID] {
+							seen[dep.DependsOnID] = true
+							blockers = append(blockers, dep.DependsOnID)
+						}
+					}
+					if len(blockers) == 0 {
+						return "-"
+					}
+					return html.EscapeString(strings.Join(blockers, ", "))
+				},
+			}, true
+		case "blocks", "unblocks":
+			return htmlCol{
+				key:    "blocks",
+				header: "Blocks",
+				render: func(i model.Issue) string {
+					targets := blocksByID[i.ID]
+					if len(targets) == 0 {
+						return "-"
+					}
+					return html.EscapeString(strings.Join(targets, ", "))
+				},
+			}, true
+		default:
+			if opts.GraphStats != nil {
+				if mKey, ok := normalizeReportMetricKey(norm); ok {
+					acc := metricsAcc
+					if acc == nil {
+						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness}, issues)
+					}
+					return htmlCol{
+						key:    mKey,
+						header: reportMetricHeader(mKey),
+						render: func(i model.Issue) string { return html.EscapeString(acc.formatValue(mKey, i.ID)) },
+					}, true
+				}
+			}
+			return htmlCol{}, false
+		}
+	}
+
+	var cols []htmlCol
+	seenCol := make(map[string]bool)
+	for _, col := range opts.View.Columns {
+		if spec, ok := resolveHTMLCol(col); ok && !seenCol[spec.key] {
+			seenCol[spec.key] = true
+			cols = append(cols, spec)
+		}
+	}
+	if len(cols) == 0 {
+		for _, defCol := range []string{"id", "title", "type", "priority", "status"} {
+			if spec, ok := resolveHTMLCol(defCol); ok && !seenCol[spec.key] {
+				seenCol[spec.key] = true
+				cols = append(cols, spec)
+			}
+		}
+	}
+	if metricsAcc != nil {
+		for _, mKey := range metricsAcc.keys {
+			if !seenCol[mKey] {
+				seenCol[mKey] = true
+				keyCopy := mKey
+				cols = append(cols, htmlCol{
+					key:    keyCopy,
+					header: reportMetricHeader(keyCopy),
+					render: func(i model.Issue) string { return html.EscapeString(metricsAcc.formatValue(keyCopy, i.ID)) },
+				})
+			}
+		}
+	}
+
+	sb.WriteString("<h2>Summary</h2>\n<table class=\"issues-summary\">\n<thead><tr>")
+	for _, c := range cols {
+		sb.WriteString("<th>" + html.EscapeString(c.header) + "</th>")
+	}
+	sb.WriteString("</tr></thead>\n<tbody>\n")
+	for _, iss := range issues {
+		sb.WriteString("<tr>")
+		for _, c := range cols {
+			sb.WriteString("<td>" + c.render(iss) + "</td>")
+		}
+		sb.WriteString("</tr>\n")
+	}
+	sb.WriteString("</tbody>\n</table>\n")
+
+	if opts.IncludeGraph {
+		sb.WriteString("<h2>Dependency Graph</h2>\n<pre class=\"mermaid\">")
+		sb.WriteString(html.EscapeString(reportMermaid(opts.GraphIssues, opts.Readiness)))
+		sb.WriteString("</pre>\n")
+	}
+
+	slugCounts := make(map[string]int, len(issues))
+	issueSlugs := make([]string, len(issues))
+	for idx, iss := range issues {
+		issueSlugs[idx] = uniqueSlug(createSlug(issueHeadingText(iss)), slugCounts)
+	}
+
+	writeHTMLIssueSection := func(iss model.Issue, slug string) {
+		sb.WriteString(fmt.Sprintf("<section class=\"issue\" id=\"%s\">\n", html.EscapeString(slug)))
+		sb.WriteString(fmt.Sprintf("<h2>%s</h2>\n", html.EscapeString(issueHeadingText(iss))))
+		sb.WriteString("<table><tbody>\n")
+		sb.WriteString(fmt.Sprintf("<tr><th>Type</th><td>%s</td></tr>\n", html.EscapeString(string(iss.IssueType))))
+		sb.WriteString(fmt.Sprintf("<tr><th>Priority</th><td>%s</td></tr>\n", html.EscapeString(getPriorityLabel(iss.Priority))))
+		sb.WriteString(fmt.Sprintf("<tr><th>Status</th><td>%s</td></tr>\n", html.EscapeString(string(iss.Status))))
+		if iss.Assignee != "" {
+			sb.WriteString(fmt.Sprintf("<tr><th>Assignee</th><td>@%s</td></tr>\n", html.EscapeString(iss.Assignee)))
+		}
+		if strings.TrimSpace(iss.CreatedBy) != "" {
+			sb.WriteString(fmt.Sprintf("<tr><th>Created By</th><td>%s</td></tr>\n", html.EscapeString(iss.CreatedBy)))
+		}
+		if iss.EstimatedMinutes != nil && *iss.EstimatedMinutes > 0 {
+			sb.WriteString(fmt.Sprintf("<tr><th>Estimated</th><td>%s</td></tr>\n", html.EscapeString(formatEstimatedDuration(*iss.EstimatedMinutes))))
+		}
+		if strings.TrimSpace(iss.CloseReason) != "" {
+			sb.WriteString(fmt.Sprintf("<tr><th>Close Reason</th><td>%s</td></tr>\n", html.EscapeString(iss.CloseReason)))
+		}
+		if len(iss.Labels) > 0 {
+			sb.WriteString(fmt.Sprintf("<tr><th>Labels</th><td>%s</td></tr>\n", html.EscapeString(strings.Join(iss.Labels, ", "))))
+		}
+		if metricsAcc != nil {
+			for _, mKey := range metricsAcc.keys {
+				sb.WriteString(fmt.Sprintf("<tr><th>%s</th><td>%s</td></tr>\n",
+					html.EscapeString(reportMetricHeader(mKey)),
+					html.EscapeString(metricsAcc.formatValue(mKey, iss.ID))))
+			}
+		}
+		sb.WriteString("</tbody></table>\n")
+		if iss.Description != "" {
+			sb.WriteString(fmt.Sprintf("<h3>Description</h3><pre>%s</pre>\n", html.EscapeString(iss.Description)))
+		}
+		sb.WriteString("</section>\n")
+	}
+
+	groupBy := effectiveReportGroupBy(opts)
+	if groups := groupMarkdownIssues(issues, groupBy); len(groups) > 0 {
+		for _, grp := range groups {
+			sb.WriteString(fmt.Sprintf("<section class=\"issue-group\" data-group=\"%s\">\n", html.EscapeString(grp.Key)))
+			sb.WriteString(fmt.Sprintf("<h2>Group: %s (%d)</h2>\n", html.EscapeString(grp.Label), len(grp.Indices)))
+			for _, idx := range grp.Indices {
+				writeHTMLIssueSection(issues[idx], issueSlugs[idx])
+			}
+			sb.WriteString("</section>\n")
+		}
+	} else {
+		for idx, iss := range issues {
+			writeHTMLIssueSection(iss, issueSlugs[idx])
+		}
+	}
+
+	sb.WriteString("</body>\n</html>\n")
+	return sb.String(), nil
+}
+
+func sanitizeHeadingLine(value string) string {
+	clean := strings.ReplaceAll(value, "\r\n", " ")
+	clean = strings.ReplaceAll(clean, "\r", " ")
+	clean = strings.ReplaceAll(clean, "\n", " ")
+	return strings.TrimSpace(clean)
+}
+
 func issueHeadingText(i model.Issue) string {
 	typeIcon := getTypeEmoji(string(i.IssueType))
-	return fmt.Sprintf("%s %s %s", typeIcon, i.ID, i.Title)
+	id := sanitizeHeadingLine(i.ID)
+	title := sanitizeHeadingLine(i.Title)
+	if title == "" {
+		return fmt.Sprintf("%s %s", typeIcon, id)
+	}
+	return fmt.Sprintf("%s %s %s", typeIcon, id, title)
 }
 
 func uniqueSlug(base string, counts map[string]int) string {

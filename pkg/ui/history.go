@@ -791,6 +791,20 @@ func (h *HistoryModel) MoveDownFileTree() {
 	}
 }
 
+// MoveToStartFileTree jumps to the first visible node in the file tree
+func (h *HistoryModel) MoveToStartFileTree() {
+	if len(h.flatFileList) > 0 {
+		h.selectedFileIdx = 0
+	}
+}
+
+// MoveToEndFileTree jumps to the last visible node in the file tree
+func (h *HistoryModel) MoveToEndFileTree() {
+	if len(h.flatFileList) > 0 {
+		h.selectedFileIdx = len(h.flatFileList) - 1
+	}
+}
+
 // ToggleExpandFile expands or collapses the selected directory
 func (h *HistoryModel) ToggleExpandFile() {
 	if h.selectedFileIdx >= len(h.flatFileList) {
@@ -910,6 +924,58 @@ func (h *HistoryModel) MoveDown() {
 			if h.selectedCommit < len(commits)-1 {
 				h.selectedCommit++
 				// Update middle pane scroll if in three-pane layout (bv-xrfh)
+				if h.focused == historyFocusMiddle {
+					h.ensureMiddleScrollVisible(h.selectedCommit, len(commits))
+				}
+			}
+		}
+	}
+}
+
+// MoveToStart jumps to the first item in the currently focused bead-mode pane
+func (h *HistoryModel) MoveToStart() {
+	if h.focused == historyFocusList {
+		if len(h.histories) > 0 {
+			h.selectedBead = 0
+			h.selectedCommit = 0
+			h.middleScrollOffset = 0
+			h.ensureBeadVisible()
+		}
+	} else if h.focused == historyFocusTimeline {
+		h.timelineScrollOffset = 0
+	} else {
+		if h.selectedBead < len(h.histories) && len(h.histories[h.selectedBead].Commits) > 0 {
+			h.selectedCommit = 0
+			if h.focused == historyFocusMiddle {
+				h.ensureMiddleScrollVisible(h.selectedCommit, len(h.histories[h.selectedBead].Commits))
+			}
+		}
+	}
+}
+
+// MoveToEnd jumps to the last item in the currently focused bead-mode pane
+func (h *HistoryModel) MoveToEnd() {
+	if h.focused == historyFocusList {
+		if len(h.histories) > 0 {
+			h.selectedBead = len(h.histories) - 1
+			h.selectedCommit = 0
+			h.middleScrollOffset = 0
+			h.ensureBeadVisible()
+		}
+	} else if h.focused == historyFocusTimeline {
+		if h.report != nil && h.selectedBead < len(h.beadIDs) {
+			beadID := h.beadIDs[h.selectedBead]
+			if hist, ok := h.report.Histories[beadID]; ok {
+				entries := h.buildTimeline(hist)
+				_, _, maxScroll := timelineWindow(entries, hist.CycleTime != nil, h.currentTimelineWidth(), h.currentPanelHeight(), h.timelineScrollOffset)
+				h.timelineScrollOffset = maxScroll
+			}
+		}
+	} else {
+		if h.selectedBead < len(h.histories) {
+			commits := h.histories[h.selectedBead].Commits
+			if len(commits) > 0 {
+				h.selectedCommit = len(commits) - 1
 				if h.focused == historyFocusMiddle {
 					h.ensureMiddleScrollVisible(h.selectedCommit, len(commits))
 				}
@@ -1491,6 +1557,45 @@ func (h *HistoryModel) MoveDownGit() {
 				if h.focused == historyFocusMiddle {
 					h.ensureMiddleScrollVisible(h.selectedRelatedBead, beadCount)
 				}
+			}
+		}
+	}
+}
+
+// MoveToStartGit jumps to the first item in the currently focused git-mode pane
+func (h *HistoryModel) MoveToStartGit() {
+	commits := h.GetFilteredCommitList()
+	if h.focused == historyFocusList {
+		if len(commits) > 0 {
+			h.selectedGitCommit = 0
+			h.selectedRelatedBead = 0
+			h.middleScrollOffset = 0
+			h.ensureGitCommitVisible()
+		}
+	} else if h.selectedGitCommit < len(commits) && len(commits[h.selectedGitCommit].BeadIDs) > 0 {
+		h.selectedRelatedBead = 0
+		if h.focused == historyFocusMiddle {
+			h.ensureMiddleScrollVisible(h.selectedRelatedBead, len(commits[h.selectedGitCommit].BeadIDs))
+		}
+	}
+}
+
+// MoveToEndGit jumps to the last item in the currently focused git-mode pane
+func (h *HistoryModel) MoveToEndGit() {
+	commits := h.GetFilteredCommitList()
+	if h.focused == historyFocusList {
+		if len(commits) > 0 {
+			h.selectedGitCommit = len(commits) - 1
+			h.selectedRelatedBead = 0
+			h.middleScrollOffset = 0
+			h.ensureGitCommitVisible()
+		}
+	} else if h.selectedGitCommit < len(commits) {
+		beadCount := len(commits[h.selectedGitCommit].BeadIDs)
+		if beadCount > 0 {
+			h.selectedRelatedBead = beadCount - 1
+			if h.focused == historyFocusMiddle {
+				h.ensureMiddleScrollVisible(h.selectedRelatedBead, beadCount)
 			}
 		}
 	}

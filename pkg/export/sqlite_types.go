@@ -32,6 +32,9 @@ type ExportIssue struct {
 	DueDate            *time.Time      `json:"due_date,omitempty"`
 	DeferUntil         *time.Time      `json:"defer_until,omitempty"`
 	ExternalRef        string          `json:"external_ref,omitempty"`
+	EstimatedMinutes   *int            `json:"estimated_minutes,omitempty"`
+	CreatedBy          string          `json:"created_by,omitempty"`
+	CloseReason        string          `json:"close_reason,omitempty"`
 
 	// Computed graph metrics
 	PageRank       float64  `json:"pagerank"`

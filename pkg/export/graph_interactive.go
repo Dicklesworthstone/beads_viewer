@@ -81,6 +81,7 @@ type graphNode struct {
 	OutDegree       int     `json:"out_degree"`
 	CoreNumber      int     `json:"core_number"`
 	Slack           float64 `json:"slack"`
+	SlackAvailable  bool    `json:"slack_available"`
 	IsArticulation  bool    `json:"is_articulation"`
 	PageRankRank    int     `json:"pagerank_rank"`
 	BetweennessRank int     `json:"betweenness_rank"`
@@ -162,6 +163,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		inDegree = opts.Stats.InDegree
 		outDegree = opts.Stats.OutDegree
 	}
+	slackAvailable := opts.Stats != nil && len(slack) > 0 && len(opts.Stats.Cycles()) == 0
 
 	// Create articulation set for O(1) lookup
 	articulationSet := make(map[string]bool)
@@ -278,10 +280,15 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			InDegree:        inDegree[iss.ID],
 			OutDegree:       outDegree[iss.ID],
 			CoreNumber:      coreNumber[iss.ID],
-			Slack:           slack[iss.ID],
 			IsArticulation:  articulationSet[iss.ID],
 			PageRankRank:    pageRankRank[iss.ID],
 			BetweennessRank: betweennessRank[iss.ID],
+		}
+		if slackAvailable && isActiveIssue(iss.ID) {
+			if s, ok := slack[iss.ID]; ok {
+				node.Slack = s
+				node.SlackAvailable = true
+			}
 		}
 		nodes = append(nodes, node)
 
@@ -290,8 +297,10 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			if dep == nil || !issueMap[dep.DependsOnID] {
 				continue
 			}
-			// Only mark as critical if blocking between active issues, we have stats, AND both ends have zero slack
-			isCritical := dep.Type.IsBlocking() && isActiveIssue(iss.ID) && isActiveIssue(dep.DependsOnID) && opts.Stats != nil && slack[iss.ID] == 0 && slack[dep.DependsOnID] == 0
+			// Only mark as critical if blocking between active issues, slack is valid (no cycles), AND both ends exist in slack with zero slack
+			s1, ok1 := slack[iss.ID]
+			s2, ok2 := slack[dep.DependsOnID]
+			isCritical := dep.Type.IsBlocking() && isActiveIssue(iss.ID) && isActiveIssue(dep.DependsOnID) && slackAvailable && ok1 && ok2 && s1 == 0 && s2 == 0
 			link := graphLink{
 				Source:   iss.ID,
 				Target:   dep.DependsOnID,
@@ -307,9 +316,12 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		return nodes[i].ID < nodes[j].ID
 	})
 
+	hasCycles := opts.Stats != nil && len(opts.Stats.Cycles()) > 0
 	graphData := map[string]interface{}{
-		"nodes": nodes,
-		"links": links,
+		"nodes":           nodes,
+		"links":           links,
+		"slack_available": slackAvailable,
+		"has_cycles":      hasCycles,
 	}
 	for key, value := range opts.RobotEnvelope {
 		graphData[key] = value

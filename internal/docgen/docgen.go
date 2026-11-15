@@ -44,16 +44,18 @@ type FlagSection struct {
 	Match func(string) bool
 }
 
-// DefaultFlagSections mirrors rootHelpSections from cmd/bv/main.go.
+// DefaultFlagSections defines the canonical CLI flag groups shared by `bv --help`
+// and `bv --generate-docs`.
 func DefaultFlagSections() []FlagSection {
 	return []FlagSection{
 		{
 			Title: "General Flags",
 			Match: func(name string) bool {
 				switch name {
-				case "help", "version", "db", "as-of", "recipe", "label",
-					"filter", "theme", "no-browser", "no-hooks", "save-baseline",
-					"background-mode", "no-background-mode", "check-update", "update":
+				case "help", "version", "db", "update", "check-update",
+					"update-dry-run", "rollback", "yes", "format", "stats",
+					"no-cache", "force-full-analysis", "theme",
+					"background-mode", "no-background-mode":
 					return true
 				default:
 					return false
@@ -63,11 +65,14 @@ func DefaultFlagSections() []FlagSection {
 		{
 			Title: "Search & Filters",
 			Match: func(name string) bool {
+				if strings.HasPrefix(name, "search-") {
+					return true
+				}
 				switch name {
-				case "search", "search-mode", "search-preset", "search-weights",
-					"search-limit", "search-score-threshold", "search-rebuild",
-					"priority-intent", "priority-history-window", "priority-sample-size",
-					"priority-explain", "priority-include-closed":
+				case "recipe", "search", "label", "severity", "alert-type",
+					"alert-label", "workspace", "repo",
+					"robot-min-confidence", "robot-max-results",
+					"robot-by-label", "robot-by-assignee":
 					return true
 				default:
 					return false
@@ -77,14 +82,33 @@ func DefaultFlagSections() []FlagSection {
 		{
 			Title: "Robot & Planning Flags",
 			Match: func(name string) bool {
-				return strings.HasPrefix(name, "robot-") || name == "format" || name == "toon-stats" || name == "no-cache" || name == "force-full-analysis"
+				if strings.HasPrefix(name, "robot-") || strings.HasPrefix(name, "correlation-") {
+					return true
+				}
+				switch name {
+				case "attention-limit", "brief", "schema-command",
+					"suggest-type", "suggest-confidence", "suggest-bead",
+					"graph-format", "graph-root", "graph-depth",
+					"orphans-min-score", "file-beads-limit", "hotspots-limit",
+					"relations-threshold", "relations-limit",
+					"related-min-relevance", "related-max-results", "related-include-closed",
+					"network-depth",
+					"forecast-label", "forecast-sprint", "forecast-agents",
+					"agents", "capacity-label",
+					"feedback-accept", "feedback-ignore", "feedback-reset", "feedback-show":
+					return true
+				default:
+					return false
+				}
 			},
 		},
 		{
 			Title: "History & Drift",
 			Match: func(name string) bool {
 				switch name {
-				case "diff-since", "drift", "drift-since", "drift-critical-only", "history", "recent":
+				case "diff-since", "as-of", "save-baseline", "baseline-info",
+					"check-drift", "init-drift", "bead-history",
+					"history-since", "history-limit", "min-confidence", "id-pattern":
 					return true
 				default:
 					return false
@@ -95,8 +119,15 @@ func DefaultFlagSections() []FlagSection {
 			Title: "Export & Reporting",
 			Match: func(name string) bool {
 				switch name {
-				case "export-pages", "watch-export", "export-graph", "pages", "preview-pages",
-					"pages-title", "pages-base-url", "graph-format", "burndown", "forecast":
+				case "export", "export-format", "export-group-by",
+					"export-include-graph", "export-include-actions", "export-template",
+					"export-md", "no-hooks", "hooks-info", "trust-hooks", "hook-env",
+					"export-graph", "graph-preset", "graph-title",
+					"emit-script", "script-limit", "script-format",
+					"priority-brief", "agent-brief",
+					"export-pages", "pages-title", "pages-subtitle",
+					"pages-include-closed", "pages-include-history",
+					"preview-pages", "no-live-reload", "watch-export", "pages":
 					return true
 				default:
 					return false
@@ -106,20 +137,15 @@ func DefaultFlagSections() []FlagSection {
 		{
 			Title: "Agent File Management",
 			Match: func(name string) bool {
-				switch name {
-				case "install-agent-blurb", "check-agent-blurb", "blurb-format", "workspace":
-					return true
-				default:
-					return false
-				}
+				return strings.HasPrefix(name, "agents-")
 			},
 		},
 		{
 			Title: "Debug Flags",
 			Match: func(name string) bool {
 				switch name {
-				case "cpu-profile", "profile-startup", "profile-json", "debug-render",
-					"debug-width", "debug-height", "generate-docs":
+				case "cpu-profile", "profile-startup", "profile-json",
+					"debug-render", "debug-width", "debug-height", "generate-docs":
 					return true
 				default:
 					return false
@@ -360,11 +386,14 @@ func RenderAlertsTables(cfg *drift.Config) string {
 	return strings.TrimSpace(sb.String())
 }
 
-// RenderRecipesTable generates the Markdown table of built-in recipes.
+// RenderRecipesTable generates the Markdown table of built-in recipes only,
+// isolated from any host ~/.config/bv/recipes.yaml or project .bv/recipes.yaml.
 func RenderRecipesTable() string {
-	l := recipe.NewLoader()
-	_ = l.Load()
-	recipes := l.List()
+	l, err := recipe.LoadEmbedded()
+	var recipes []recipe.Recipe
+	if err == nil && l != nil {
+		recipes = l.List()
+	}
 
 	// Keep clean standard ordering
 	order := []string{

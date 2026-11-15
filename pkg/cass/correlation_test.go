@@ -152,14 +152,29 @@ func TestWorkspaceFromBeadsPath(t *testing.T) {
 		expected string
 	}{
 		{
-			name:     "empty path returns empty string",
+			name:     "empty path resolves to cwd",
 			input:    "",
-			expected: "",
+			expected: tmpRoot,
 		},
 		{
-			name:     "whitespace path returns empty string",
+			name:     "whitespace path resolves to cwd",
 			input:    "   ",
-			expected: "",
+			expected: tmpRoot,
+		},
+		{
+			name:     "git HEAD pseudo-path resolves to cwd instead of parent dir",
+			input:    "git:HEAD",
+			expected: tmpRoot,
+		},
+		{
+			name:     "git revision pseudo-path resolves to cwd instead of parent dir",
+			input:    "git:main~3",
+			expected: tmpRoot,
+		},
+		{
+			name:     "padded git revision pseudo-path resolves to cwd",
+			input:    "  git:v1.2.0^{commit}  ",
+			expected: tmpRoot,
 		},
 		{
 			name:     "standard path",
@@ -169,6 +184,11 @@ func TestWorkspaceFromBeadsPath(t *testing.T) {
 		{
 			name:     "windows-like path",
 			input:    "C:/Users/dev/project/.beads/issues.jsonl",
+			expected: "C:/Users/dev/project",
+		},
+		{
+			name:     "windows backslash path",
+			input:    `C:\Users\dev\project\.beads\issues.jsonl`,
 			expected: "C:/Users/dev/project",
 		},
 		{
@@ -183,11 +203,15 @@ func TestWorkspaceFromBeadsPath(t *testing.T) {
 		},
 	}
 
+	parentOfTmpRoot := filepath.Dir(tmpRoot)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := WorkspaceFromBeadsPath(tt.input)
 			if result != tt.expected {
 				t.Errorf("WorkspaceFromBeadsPath(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+			if strings.HasPrefix(strings.TrimSpace(tt.input), "git:") && result == parentOfTmpRoot {
+				t.Errorf("WorkspaceFromBeadsPath(%q) erroneously resolved to parent directory %q", tt.input, result)
 			}
 		})
 	}

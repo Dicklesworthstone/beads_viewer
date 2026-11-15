@@ -562,3 +562,73 @@ func TestExportGraph_DeterministicOutput(t *testing.T) {
 		t.Error("DOT output should be deterministic across calls")
 	}
 }
+
+func TestExportGraph_MermaidAndDOT_DependencyBlockedAndCustomStatuses(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "ready-root", Title: "Ready Open Root", Status: model.StatusOpen, Priority: 1},
+		{ID: "closed-prereq", Title: "Closed Prereq", Status: model.StatusClosed, Priority: 1},
+		{
+			ID:       "blocked-open",
+			Title:    "Open With Active Blocker",
+			Status:   model.StatusOpen,
+			Priority: 1,
+			Dependencies: []*model.Dependency{
+				{IssueID: "blocked-open", DependsOnID: "ready-root", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:       "unblocked-open",
+			Title:    "Open With Closed Blocker",
+			Status:   model.StatusOpen,
+			Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "unblocked-open", DependsOnID: "closed-prereq", Type: model.DepBlocks},
+			},
+		},
+		{ID: "st-deferred", Title: "Deferred", Status: model.StatusDeferred, Priority: 3},
+		{ID: "st-pinned", Title: "Pinned", Status: model.StatusPinned, Priority: 2},
+		{ID: "st-hooked", Title: "Hooked", Status: model.StatusHooked, Priority: 2},
+		{ID: "st-review", Title: "Review", Status: model.StatusReview, Priority: 2},
+		{ID: "st-custom", Title: "Custom Triaged", Status: model.Status("triaged"), Priority: 2},
+	}
+
+	stats := analysis.NewAnalyzer(issues).Analyze()
+
+	mermaidRes, err := ExportGraph(issues, &stats, GraphExportConfig{Format: GraphFormatMermaid})
+	if err != nil {
+		t.Fatalf("ExportGraph(mermaid) failed: %v", err)
+	}
+	for _, want := range []string{
+		"class ready-root open",
+		"class blocked-open blocked",
+		"class unblocked-open open",
+		"class st-deferred deferred",
+		"class st-pinned pinned",
+		"class st-hooked hooked",
+		"class st-review review",
+		"class st-custom custom",
+	} {
+		if !strings.Contains(mermaidRes.Graph, want) {
+			t.Fatalf("Mermaid graph missing %q:\n%s", want, mermaidRes.Graph)
+		}
+	}
+
+	dotRes, err := ExportGraph(issues, &stats, GraphExportConfig{Format: GraphFormatDOT})
+	if err != nil {
+		t.Fatalf("ExportGraph(dot) failed: %v", err)
+	}
+	for _, want := range []string{
+		`"ready-root" [label="ready-root\nReady Open Root\nP1 open", fillcolor="#C8E6C9"`,
+		`"blocked-open" [label="blocked-open\nOpen With Active Blocker\nP1 open", fillcolor="#FFCDD2"`,
+		`"unblocked-open" [label="unblocked-open\nOpen With Closed Blocker\nP2 open", fillcolor="#C8E6C9"`,
+		`"st-deferred" [label="st-deferred\nDeferred\nP3 deferred", fillcolor="#FFE0B2"`,
+		`"st-pinned" [label="st-pinned\nPinned\nP2 pinned", fillcolor="#E1BEE7"`,
+		`"st-hooked" [label="st-hooked\nHooked\nP2 hooked", fillcolor="#F8BBD0"`,
+		`"st-review" [label="st-review\nReview\nP2 review", fillcolor="#FFF9C4"`,
+		`"st-custom" [label="st-custom\nCustom Triaged\nP2 triaged", fillcolor="#E2E8F0"`,
+	} {
+		if !strings.Contains(dotRes.Graph, want) {
+			t.Fatalf("DOT graph missing %q:\n%s", want, dotRes.Graph)
+		}
+	}
+}

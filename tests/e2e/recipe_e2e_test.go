@@ -560,6 +560,8 @@ func TestRecipeUserTemplateAuthority(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	configDir := filepath.Join(home, ".config", "bv")
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)

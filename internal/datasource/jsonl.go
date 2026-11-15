@@ -13,23 +13,28 @@ import (
 // JSONLReader implements IssueReader for JSONL files on disk.
 type JSONLReader struct {
 	path     string
+	silent   bool
 	reportMu sync.Mutex
 	report   LoadReport
 }
 
 // NewJSONLReader creates a reader for a JSONL data source.
 func NewJSONLReader(source DataSource) (*JSONLReader, error) {
+	return newJSONLReader(source, false)
+}
+
+func newJSONLReader(source DataSource, silent bool) (*JSONLReader, error) {
 	if source.Type != SourceTypeJSONLLocal && source.Type != SourceTypeJSONLWorktree {
 		return nil, fmt.Errorf("source is not JSONL: %s", source.Type)
 	}
-	return &JSONLReader{path: source.Path}, nil
+	return &JSONLReader{path: source.Path, silent: silent}, nil
 }
 
 // LoadIssues returns all non-tombstone issues from the JSONL file.
 // Parse accounting is retained by this reader so records dropped during
 // load (malformed JSON, failed validation) stay visible to callers (#190).
 func (r *JSONLReader) LoadIssues() ([]model.Issue, error) {
-	rec := newLoadRecorder(r.path)
+	rec := newLoadRecorderWithSilence(r.path, r.silent)
 	all, err := loader.LoadIssuesFromFileWithOptions(r.path, rec.options())
 	r.reportMu.Lock()
 	r.report = rec.finish(all, err == nil)

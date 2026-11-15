@@ -42,7 +42,8 @@ type LoadReport struct {
 	Stale             bool
 	// TombstoneIDs preserves satisfied dependencies whose records are hidden
 	// from the viewer. These IDs come from the same successful source read.
-	TombstoneIDs []string
+	TombstoneIDs       []string
+	corruptSQLitePaths []string
 }
 
 // LoadResult binds visible issues, selected source, and accounting from the
@@ -57,6 +58,7 @@ func cloneLoadReport(report LoadReport) LoadReport {
 	report.Warnings = append([]string(nil), report.Warnings...)
 	report.AuthorityWarnings = append([]string(nil), report.AuthorityWarnings...)
 	report.TombstoneIDs = append([]string(nil), report.TombstoneIDs...)
+	report.corruptSQLitePaths = append([]string(nil), report.corruptSQLitePaths...)
 	return report
 }
 
@@ -82,7 +84,11 @@ type loadRecorder struct {
 }
 
 func newLoadRecorder(path string) *loadRecorder {
-	return &loadRecorder{path: path, robot: env.Robot.Bool()}
+	return newLoadRecorderWithSilence(path, false)
+}
+
+func newLoadRecorderWithSilence(path string, silent bool) *loadRecorder {
+	return &loadRecorder{path: path, robot: env.Robot.Bool() || silent}
 }
 
 // options wires the parse to this recorder. Warnings are buffered rather than
@@ -146,16 +152,33 @@ func tombstoneIDs(issues []model.Issue) []string {
 // Falls back to legacy JSONL-only loading via loader.LoadIssues if smart
 // detection finds no valid sources.
 func LoadIssues(repoPath string) (result LoadResult, err error) {
+	return loadIssuesWithMode(repoPath, false)
+}
+
+// LoadIssuesSilent performs the same multi-source discovery and loading as
+// LoadIssues without ever writing warnings to os.Stderr (for TUI live reloads
+// and alt-screen protection), while validating sibling SQLite databases when a
+// fresher JSONL source wins so Origin cannot target a corrupt beads.db.
+func LoadIssuesSilent(beadsDir string) (result LoadResult, err error) {
+	return loadIssuesWithMode(beadsDir, true)
+}
+
+func loadIssuesWithMode(repoPath string, silent bool) (result LoadResult, err error) {
 	defer func() { result.bindOrigins(err) }()
 	if source, ok, err := ExplicitBeadsDBSource(); err != nil {
 		return LoadResult{}, err
 	} else if ok {
-		return LoadFromSource(source)
+		return loadFromSource(source, silent)
 	}
 
 	beadsDir, err := loader.GetBeadsDir(repoPath)
 	if err != nil {
 		return LoadResult{}, err
+	}
+	if silent && repoPath != "" && !explicitBeadsDirectorySelectorActive() {
+		if _, statErr := os.Stat(beadsDir); os.IsNotExist(statErr) && looksLikeDirectBeadsDir(repoPath) {
+			beadsDir = repoPath
+		}
 	}
 
 	// bd/Dolt workspaces (#189): the issue data lives in a Dolt database that
@@ -164,19 +187,22 @@ func LoadIssues(repoPath string) (result LoadResult, err error) {
 	// `bd export` when possible and errors loudly when no export exists —
 	// instead of silently reporting an empty project.
 	if loader.IsBDWorkspace(beadsDir) {
-		return loadBDWorkspace(beadsDir)
+		return loadBDWorkspace(beadsDir, silent)
 	}
 
-	issues, smartErr := loadSmart(beadsDir, repoPath, explicitBeadsDirectorySelectorActive())
+	issues, smartErr := loadSmart(beadsDir, repoPath, explicitBeadsDirectorySelectorActive(), silent)
 	if smartErr == nil {
 		return issues, nil
 	}
 
 	// Fall back to legacy JSONL-only loading
-	fallback, err := loadLegacyJSONL(beadsDir)
+	fallback, err := loadLegacyJSONLWithSilence(beadsDir, silent)
 	if fallback.Source.Path != issues.Source.Path && issues.Source.Path != "" {
 		fallback.Report.Stale = true
 		fallback.Report.AuthorityWarnings = append(fallback.Report.AuthorityWarnings, fmt.Sprintf("source selection failed before fallback: %v", smartErr))
+	}
+	if len(issues.Report.corruptSQLitePaths) > 0 {
+		fallback.Report.corruptSQLitePaths = append(fallback.Report.corruptSQLitePaths, issues.Report.corruptSQLitePaths...)
 	}
 	return fallback, err
 }
@@ -188,11 +214,15 @@ func LoadIssues(repoPath string) (result LoadResult, err error) {
 // which is exactly when dropped records MUST stay visible instead of the load
 // silently yielding fewer (or zero) issues (#190).
 func loadLegacyJSONL(beadsDir string) (LoadResult, error) {
+	return loadLegacyJSONLWithSilence(beadsDir, false)
+}
+
+func loadLegacyJSONLWithSilence(beadsDir string, silent bool) (LoadResult, error) {
 	jsonlPath, err := loader.FindJSONLPath(beadsDir)
 	if err != nil {
 		return LoadResult{}, err
 	}
-	rec := newLoadRecorder(jsonlPath)
+	rec := newLoadRecorderWithSilence(jsonlPath, silent)
 	issues, err := loader.LoadIssuesFromFileWithOptions(jsonlPath, rec.options())
 	report := rec.finish(issues, err == nil)
 	visible := make([]model.Issue, 0, len(issues))
@@ -214,19 +244,22 @@ func LoadIssuesFromDir(beadsDir string) (result LoadResult, err error) {
 	defer func() { result.bindOrigins(err) }()
 	// bd/Dolt workspaces (#189): see LoadIssues.
 	if loader.IsBDWorkspace(beadsDir) {
-		return loadBDWorkspace(beadsDir)
+		return loadBDWorkspace(beadsDir, false)
 	}
 
-	issues, smartErr := loadSmart(beadsDir, "", true)
+	issues, smartErr := loadSmart(beadsDir, "", true, false)
 	if smartErr == nil {
 		return issues, nil
 	}
 
 	// Fall back to JSONL (legacy tolerant parse, with load accounting; #190)
-	fallback, err := loadLegacyJSONL(beadsDir)
+	fallback, err := loadLegacyJSONLWithSilence(beadsDir, false)
 	if fallback.Source.Path != issues.Source.Path && issues.Source.Path != "" {
 		fallback.Report.Stale = true
 		fallback.Report.AuthorityWarnings = append(fallback.Report.AuthorityWarnings, fmt.Sprintf("source selection failed before fallback: %v", smartErr))
+	}
+	if len(issues.Report.corruptSQLitePaths) > 0 {
+		fallback.Report.corruptSQLitePaths = append(fallback.Report.corruptSQLitePaths, issues.Report.corruptSQLitePaths...)
 	}
 	return fallback, err
 }
@@ -238,11 +271,11 @@ func LoadIssuesFromDir(beadsDir string) (result LoadResult, err error) {
 // fails, and returns a hard error when no compatibility JSONL can be produced.
 // This guarantees bd workspaces either load real data or fail loudly — never
 // a silently-empty result from a stray non-issue JSONL (#189).
-func loadBDWorkspace(beadsDir string) (LoadResult, error) {
+func loadBDWorkspace(beadsDir string, silent bool) (LoadResult, error) {
 	var authorityWarnings []string
 	warn := func(msg string) {
 		authorityWarnings = append(authorityWarnings, msg)
-		if !env.Robot.Bool() {
+		if !silent && !env.Robot.Bool() {
 			fmt.Fprintf(os.Stderr, "Warning: %s\n", msg)
 		}
 	}
@@ -255,7 +288,7 @@ func loadBDWorkspace(beadsDir string) (LoadResult, error) {
 		Path:     jsonlPath,
 		Priority: PriorityJSONLLocal,
 	}
-	result, err := loadAndValidateJSONL(src)
+	result, err := loadAndValidateJSONLWithSilence(src, silent)
 	result.Report.AuthorityWarnings = authorityWarnings
 	result.Report.Stale = len(authorityWarnings) > 0
 	return result, err
@@ -297,7 +330,13 @@ func SourceFromFile(dbPath string) (DataSource, bool, error) {
 		Priority: priority,
 	}
 	if err == nil {
-		source.ModTime = info.ModTime()
+		modTime := info.ModTime()
+		if sourceType == SourceTypeSQLite {
+			if walInfo, walErr := os.Stat(sqliteWALPath(dbPath)); walErr == nil && walInfo.ModTime().After(modTime) {
+				modTime = walInfo.ModTime()
+			}
+		}
+		source.ModTime = modTime
 		source.Size = info.Size()
 	}
 	return source, true, nil
@@ -326,9 +365,9 @@ func explicitBeadsDBFileType(dbPath string) (SourceType, int, bool) {
 // pass: the same 10% malformed-error-rate gate is applied to the loader's parse
 // stats post-load. A genuinely-corrupt JSONL is still rejected (and we fall
 // through to the next candidate), but the happy path reads the file exactly once.
-func loadSmart(beadsDir, repoPath string, skipWorktreeSources bool) (LoadResult, error) {
+func loadSmart(beadsDir, repoPath string, skipWorktreeSources, silent bool) (LoadResult, error) {
 	var warn func(string)
-	if !env.Robot.Bool() {
+	if !silent && !env.Robot.Bool() {
 		warn = func(message string) {
 			fmt.Fprintf(os.Stderr, "Warning: %s\n", message)
 		}
@@ -357,11 +396,15 @@ func loadSmart(beadsDir, repoPath string, skipWorktreeSources bool) (LoadResult,
 	var lastErr error
 	var lastResult LoadResult
 	var rejected []string
+	var corruptSQLitePaths []string
 	for i := range ordered {
-		result, err := loadAndValidate(ordered[i])
+		result, err := loadAndValidate(ordered[i], silent)
 		if err != nil {
 			lastErr = err
 			lastResult = result
+			if ordered[i].Type == SourceTypeSQLite {
+				corruptSQLitePaths = append(corruptSQLitePaths, ordered[i].Path)
+			}
 			if len(rejected) < maxLoadReportWarnings {
 				rejected = append(rejected, fmt.Sprintf("rejected source %s: %v", ordered[i].Path, err))
 			}
@@ -369,11 +412,13 @@ func loadSmart(beadsDir, repoPath string, skipWorktreeSources bool) (LoadResult,
 		}
 		result.Report.AuthorityWarnings = rejected
 		result.Report.Stale = len(rejected) > 0
+		result.Report.corruptSQLitePaths = append([]string(nil), corruptSQLitePaths...)
 		return result, nil
 	}
 
 	if lastErr != nil {
 		lastResult.Report.AuthorityWarnings = rejected
+		lastResult.Report.corruptSQLitePaths = append([]string(nil), corruptSQLitePaths...)
 		return lastResult, fmt.Errorf("no valid sources discovered: %w", lastErr)
 	}
 	return LoadResult{}, fmt.Errorf("no valid sources discovered")
@@ -384,12 +429,25 @@ func explicitBeadsDirectorySelectorActive() bool {
 		strings.TrimSpace(env.BeadsDir.Get()) != ""
 }
 
+func looksLikeDirectBeadsDir(dir string) bool {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	for _, marker := range []string{"metadata.json", "beads.db", "issues.jsonl", "beads.jsonl", "beads.base.jsonl"} {
+		if _, err := os.Stat(filepath.Join(dir, marker)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // loadAndValidate loads a single source while applying the validation gate in the
 // same pass. For SQLite the validation (integrity + schema check) is cheap and
 // independent of the row read, so it runs first. For JSONL the loader's tolerant
 // parse IS the validation pass: a single read materializes issues and yields the
 // parse stats used to apply the malformed-error-rate gate.
-func loadAndValidate(source DataSource) (LoadResult, error) {
+func loadAndValidate(source DataSource, silent bool) (LoadResult, error) {
 	var (
 		result LoadResult
 		err    error
@@ -399,9 +457,9 @@ func loadAndValidate(source DataSource) (LoadResult, error) {
 		if err := ValidateSource(&source); err != nil {
 			return LoadResult{Source: source, Report: LoadReport{Path: source.Path}}, err
 		}
-		result, err = LoadFromSource(source)
+		result, err = loadFromSource(source, silent)
 	case SourceTypeJSONLLocal, SourceTypeJSONLWorktree:
-		result, err = loadAndValidateJSONL(source)
+		result, err = loadAndValidateJSONLWithSilence(source, silent)
 	default:
 		return LoadResult{Source: source}, fmt.Errorf("unsupported source type: %s", source.Type)
 	}
@@ -414,7 +472,11 @@ func loadAndValidate(source DataSource) (LoadResult, error) {
 // honor the IssueReader contract. Reading the file a single time replaces the
 // previous validate-then-load double parse.
 func loadAndValidateJSONL(source DataSource) (LoadResult, error) {
-	rec := newLoadRecorder(source.Path)
+	return loadAndValidateJSONLWithSilence(source, false)
+}
+
+func loadAndValidateJSONLWithSilence(source DataSource, silent bool) (LoadResult, error) {
+	rec := newLoadRecorderWithSilence(source.Path, silent)
 	all, err := loader.LoadIssuesFromFileWithOptions(source.Path, rec.options())
 	if err != nil {
 		return LoadResult{Source: source, Report: rec.finish(all, false)}, err
@@ -462,8 +524,24 @@ func loadAndValidateJSONL(source DataSource) (LoadResult, error) {
 // LoadFromSource loads issues from a specific DataSource via the IssueReader
 // interface, dispatching to the appropriate backend based on source type.
 func LoadFromSource(source DataSource) (result LoadResult, err error) {
+	return loadFromSource(source, false)
+}
+
+// LoadFromSourceSilent loads issues from a specific DataSource without writing
+// warnings to os.Stderr (intended for interactive TUI live reloads).
+func LoadFromSourceSilent(source DataSource) (result LoadResult, err error) {
+	return loadFromSource(source, true)
+}
+
+func loadFromSource(source DataSource, silent bool) (result LoadResult, err error) {
 	defer func() { result.bindOrigins(err) }()
-	reader, err := NewReader(source)
+	var reader IssueReader
+	switch source.Type {
+	case SourceTypeJSONLLocal, SourceTypeJSONLWorktree:
+		reader, err = newJSONLReader(source, silent)
+	default:
+		reader, err = NewReader(source)
+	}
 	if err != nil {
 		return LoadResult{Source: source, Report: LoadReport{Path: source.Path}}, fmt.Errorf("failed to open source %s: %w", source.Path, err)
 	}
@@ -472,9 +550,72 @@ func LoadFromSource(source DataSource) (result LoadResult, err error) {
 	return LoadResult{Issues: issues, Source: source, Report: reader.LoadReport()}, err
 }
 
+func sameResolvedFilePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	norm := func(p string) string {
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if eval, err := filepath.EvalSymlinks(p); err == nil {
+			p = eval
+		}
+		return filepath.Clean(p)
+	}
+	return norm(a) == norm(b)
+}
+
 func (r *LoadResult) bindOrigins(err error) {
 	if err == nil {
 		complete := r.Report.Errors == 0 && r.Report.ReadErrors == 0 && !r.Report.Stale && len(r.Report.AuthorityWarnings) == 0
 		loader.AttachIssueOrigins(r.Issues, r.Source.Path, complete)
+		if r.Source.Type != SourceTypeSQLite && r.Source.Path != "" {
+			var probeOrigin *model.IssueOrigin
+			if len(r.Issues) > 0 {
+				probeOrigin = r.Issues[0].Origin
+			} else {
+				probe := []model.Issue{{ID: "_probe"}}
+				loader.AttachIssueOrigins(probe, r.Source.Path, complete)
+				probeOrigin = probe[0].Origin
+			}
+			if probeOrigin != nil && probeOrigin.Tracker == "br" && probeOrigin.Database != "" {
+				alreadyKnownCorrupt := false
+				for _, corruptDB := range r.Report.corruptSQLitePaths {
+					if sameResolvedFilePath(probeOrigin.Database, corruptDB) {
+						alreadyKnownCorrupt = true
+						break
+					}
+				}
+				if !alreadyKnownCorrupt {
+					sibSrc := DataSource{Type: SourceTypeSQLite, Path: probeOrigin.Database}
+					if sibErr := ValidateSource(&sibSrc); sibErr != nil {
+						r.Report.corruptSQLitePaths = append(r.Report.corruptSQLitePaths, probeOrigin.Database)
+						if len(r.Report.AuthorityWarnings) < maxLoadReportWarnings {
+							r.Report.AuthorityWarnings = append(r.Report.AuthorityWarnings, fmt.Sprintf("sibling SQLite source %s failed validation: %v", probeOrigin.Database, sibErr))
+						}
+						r.Report.Stale = true
+					}
+				}
+			}
+		}
+		if len(r.Report.corruptSQLitePaths) > 0 || r.Report.Stale || len(r.Report.AuthorityWarnings) > 0 {
+			for i := range r.Issues {
+				orig := r.Issues[i].Origin
+				if orig == nil {
+					continue
+				}
+				for _, corruptDB := range r.Report.corruptSQLitePaths {
+					if orig.Database != "" && sameResolvedFilePath(orig.Database, corruptDB) {
+						orig.Database = ""
+						orig.ReadOnlyReason = "sibling SQLite database is corrupt"
+						break
+					}
+				}
+				if orig.ReadOnlyReason == "" && (r.Report.Stale || len(r.Report.AuthorityWarnings) > 0) {
+					orig.ReadOnlyReason = "source authority is incomplete or stale"
+				}
+			}
+		}
 	}
 }

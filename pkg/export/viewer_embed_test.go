@@ -441,8 +441,8 @@ func TestCopyEmbeddedAssets_ExcludesDevOnlyAssets(t *testing.T) {
 		}
 	}
 
-	// Production assets must still be present.
-	for _, required := range []string{"index.html", "viewer.js", "graph.js", "hybrid_scorer.js"} {
+	// Production assets and GitHub Pages .nojekyll marker must be present.
+	for _, required := range []string{"index.html", "viewer.js", "graph.js", "hybrid_scorer.js", ".nojekyll", filepath.Join(".github", "workflows", "static.yml")} {
 		if _, err := os.Stat(filepath.Join(outDir, required)); err != nil {
 			t.Errorf("expected production asset %s in bundle: %v", required, err)
 		}

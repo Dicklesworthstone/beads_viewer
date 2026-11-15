@@ -129,6 +129,26 @@ func (m *AttentionModel) MoveToBottom() {
 	}
 }
 
+// PageDown advances the cursor by half a visible page.
+func (m *AttentionModel) PageDown() {
+	if len(m.labels) == 0 {
+		return
+	}
+	step := max(1, m.visibleRows()/2)
+	m.cursor = min(len(m.labels)-1, m.cursor+step)
+	m.ensureCursorVisible()
+}
+
+// PageUp moves the cursor back by half a visible page.
+func (m *AttentionModel) PageUp() {
+	if len(m.labels) == 0 {
+		return
+	}
+	step := max(1, m.visibleRows()/2)
+	m.cursor = max(0, m.cursor-step)
+	m.ensureCursorVisible()
+}
+
 // Update handles navigation keys. It returns the selected label on Enter and
 // whether the key was consumed; exit keys (]/Esc/q) and the 1-9 quick filters
 // are the parent's responsibility.
@@ -142,6 +162,10 @@ func (m *AttentionModel) Update(msg tea.KeyMsg) (string, bool) {
 		m.MoveToTop()
 	case "G", "end":
 		m.MoveToBottom()
+	case "ctrl+d", "pgdown":
+		m.PageDown()
+	case "ctrl+u", "pgup":
+		m.PageUp()
 	case "enter":
 		return m.SelectedLabel(), true
 	default:

@@ -469,6 +469,15 @@ type TriageOptions struct {
 	// ClaimedByAgent identifies the calling agent so its own claimed issues are
 	// not penalized by EnableClaimPenalty.
 	ClaimedByAgent string
+
+	// UnblockIDs optionally widens downstream unblock credit (unblocks_ids,
+	// blockers_to_clear, what-if cascades) beyond CandidateIDs without widening
+	// top-level candidate recommendations (for example, --recipe actionable or max_items).
+	UnblockIDs map[string]bool
+
+	// VelocityIssues optionally supplies the pre-filter issue slice used to
+	// compute ProjectHealth.Velocity and velocity_drop alerts consistently in a single pass.
+	VelocityIssues []model.Issue
 }
 
 // TrackRecommendationGroup groups recommendations by execution track (bv-87)
@@ -510,6 +519,9 @@ func ComputeTriageWithOptionsAndTime(issues []model.Issue, opts TriageOptions, n
 	// Build analyzer and stats
 	analyzer := NewAnalyzer(issues)
 	analyzer.SetReadinessScope(opts.Readiness, opts.CandidateIDs)
+	if opts.UnblockIDs != nil {
+		analyzer.SetUnblockScope(opts.UnblockIDs)
+	}
 	// Time-gated readiness (defer_until) must use the same clock as the rest of
 	// this triage pass, so a pinned `now` yields deterministic output.
 	analyzer.SetNow(now)
@@ -640,6 +652,9 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	}
 	if opts.BlockerN <= 0 {
 		opts.BlockerN = 5
+	}
+	if opts.UnblockIDs != nil {
+		analyzer.SetUnblockScope(opts.UnblockIDs)
 	}
 
 	// Create TriageContext for unified caching (bv-oko3)
@@ -845,7 +860,11 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	}
 
 	elapsed := time.Since(start)
-	projectVelocity := ComputeProjectVelocity(candidateIssues, now.UTC(), 8)
+	velocitySource := candidateIssues
+	if opts.VelocityIssues != nil {
+		velocitySource = opts.VelocityIssues
+	}
+	projectVelocity := ComputeProjectVelocity(velocitySource, now.UTC(), 8)
 
 	// Calculate staleness over in-scope candidate issues (uses git history when available, falling back to issue timestamps)
 	staleness := ComputeStaleness(opts.History, candidateIssues, now)
@@ -880,7 +899,7 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 		RecommendationsByLabel: recsByLabel,
 		ProjectHealth: ProjectHealth{
 			Counts:    counts,
-			Graph:     buildGraphHealth(stats),
+			Graph:     buildScopedGraphHealth(stats, analyzer),
 			Velocity:  projectVelocity,
 			Staleness: staleness,
 		},
@@ -1495,8 +1514,15 @@ func hasAnyLabel(issueLabels, wanted []string) bool {
 
 // buildGraphHealth constructs graph health metrics from stats
 func buildGraphHealth(stats *GraphStats) GraphHealth {
+	return buildScopedGraphHealth(stats, nil)
+}
+
+// buildScopedGraphHealth constructs graph health metrics from stats, scoping
+// cycle counts to cycles involving at least one candidate issue when analyzer
+// has an active candidate scope.
+func buildScopedGraphHealth(stats *GraphStats, analyzer *Analyzer) GraphHealth {
 	// Call Cycles() once to avoid duplicate work (it makes a copy each time)
-	cycles := stats.Cycles()
+	cycles := filterCyclesForCandidateScope(stats.Cycles(), analyzer)
 	cycleCount := 0
 	if cycles != nil {
 		cycleCount = len(cycles)

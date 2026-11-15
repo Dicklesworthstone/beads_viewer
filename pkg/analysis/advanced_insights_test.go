@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1717,5 +1718,129 @@ func TestKPathsCycleBreakAndTopKSet_RespectCandidateScopeAndWithholding(t *testi
 	}
 	if insCyc.KPaths == nil || insCyc.KPaths.Status.State != "available" || len(insCyc.KPaths.Paths) != 1 {
 		t.Fatalf("expected in-scope KPaths to remain available despite out-of-scope cycle, got %+v", insCyc.KPaths)
+	}
+}
+
+func TestGenerateAdvancedInsightsFromStats_LargeGraphFastAndDeterministic(t *testing.T) {
+	buildLargeDAG := func(n int) []model.Issue {
+		issues := make([]model.Issue, 0, n)
+		// First 600 nodes are actionable roots/hubs (> 200 actionable frontier), followed by layered dependents.
+		roots := 600
+		if roots > n/2 {
+			roots = n / 2
+		}
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("LG-%05d", i)
+			iss := model.Issue{
+				ID:        id,
+				Title:     fmt.Sprintf("Large graph issue %d", i),
+				Status:    model.StatusOpen,
+				IssueType: model.TypeTask,
+				Priority:  (i % 4) + 1,
+			}
+			if i >= roots {
+				hub := fmt.Sprintf("LG-%05d", i%roots)
+				iss.Dependencies = append(iss.Dependencies, &model.Dependency{
+					IssueID:     id,
+					DependsOnID: hub,
+					Type:        model.DepBlocks,
+				})
+				if i%3 == 0 && i >= 2*roots {
+					prev := fmt.Sprintf("LG-%05d", i-roots)
+					iss.Dependencies = append(iss.Dependencies, &model.Dependency{
+						IssueID:     id,
+						DependsOnID: prev,
+						Type:        model.DepBlocks,
+					})
+				}
+			}
+			issues = append(issues, iss)
+		}
+		return issues
+	}
+
+	for _, size := range []int{2500, 5000} {
+		t.Run(fmt.Sprintf("N=%d", size), func(t *testing.T) {
+			issues := buildLargeDAG(size)
+			cfg := DefaultAdvancedInsightsConfig()
+			an := NewAnalyzer(issues)
+			stats := an.AnalyzeWithConfig(ConfigForSize(len(issues), 5000))
+
+			// Warm up once, then measure steady-state wall clock and verify byte-for-byte determinism
+			// (normalizing only wall-clock DurationMs telemetry).
+			first := an.GenerateAdvancedInsightsFromStats(&stats, cfg)
+			if first.ParallelGain != nil {
+				first.ParallelGain.Status.DurationMs = 0
+			}
+			firstJSON, err := json.Marshal(first)
+			if err != nil {
+				t.Fatalf("marshal first result: %v", err)
+			}
+
+			start := time.Now()
+			second := an.GenerateAdvancedInsightsFromStats(&stats, cfg)
+			elapsed := time.Since(start)
+			if second.ParallelGain != nil {
+				second.ParallelGain.Status.DurationMs = 0
+			}
+
+			secondJSON, err := json.Marshal(second)
+			if err != nil {
+				t.Fatalf("marshal second result: %v", err)
+			}
+			if string(firstJSON) != string(secondJSON) {
+				t.Fatalf("non-deterministic output across repeated runs on %d-issue graph", size)
+			}
+			if second.TopKSet == nil || len(second.TopKSet.Items) == 0 {
+				t.Fatalf("expected non-empty TopKSet on %d-issue graph, got %+v", size, second.TopKSet)
+			}
+			if second.ParallelCut == nil || len(second.ParallelCut.Suggestions) == 0 {
+				t.Fatalf("expected non-empty ParallelCut on %d-issue graph, got %+v", size, second.ParallelCut)
+			}
+			t.Logf("N=%d GenerateAdvancedInsightsFromStats elapsed=%v", size, elapsed)
+			// Allow generous headroom under -race instrumentation while still guarding against O(k*A*V) regressions.
+			if elapsed > 500*time.Millisecond {
+				t.Fatalf("GenerateAdvancedInsightsFromStats(N=%d) took %v, expected sub-25ms uninstrumented (<500ms under -race)", size, elapsed)
+			}
+		})
+	}
+}
+
+func TestParallelGain_CandidateScopedAlreadyReadyChildrenNotCountedAsUnblocks(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "EPIC-1", Title: "In-progress epic", Status: model.StatusInProgress, IssueType: model.TypeEpic, Priority: 1},
+		{
+			ID:        "CHILD-1",
+			Title:     "Already ready child 1",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Priority:  2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CHILD-1", DependsOnID: "EPIC-1", Type: model.DepParentChild},
+			},
+		},
+		{
+			ID:        "CHILD-2",
+			Title:     "Already ready child 2",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Priority:  2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CHILD-2", DependsOnID: "EPIC-1", Type: model.DepParentChild},
+			},
+		},
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetReadinessScope(model.NewReadinessIndex(issues), map[string]bool{"EPIC-1": true})
+	an.SetUnblockScope(map[string]bool{"EPIC-1": true, "CHILD-1": true, "CHILD-2": true})
+	stats := an.Analyze()
+	adv := an.GenerateAdvancedInsightsFromStats(&stats, DefaultAdvancedInsightsConfig())
+
+	if adv.ParallelGain == nil {
+		t.Fatal("expected ParallelGain result")
+	}
+	if len(adv.ParallelGain.Metrics) != 0 {
+		t.Fatalf("expected 0 ParallelGain items when non-candidate children were already ready before EPIC-1 closes, got %+v", adv.ParallelGain.Metrics)
 	}
 }

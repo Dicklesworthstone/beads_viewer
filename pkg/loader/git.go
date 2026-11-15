@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"golang.org/x/sync/singleflight"
 )
@@ -59,24 +60,38 @@ type GitLoadReport struct {
 
 const maxGitLoadWarnings = 10
 
+func (g *GitLoader) defaultRepoRoot() string {
+	if g.repoRoot != "" {
+		return g.repoRoot
+	}
+	return resolveGitLoaderRoot(g.repoPath)
+}
+
+func (g *GitLoader) gitCommandInDir(dir string, args ...string) *exec.Cmd {
+	gitArgs := make([]string, 0, len(args)+1)
+	gitArgs = append(gitArgs, "--no-replace-objects")
+	gitArgs = append(gitArgs, args...)
+	cmd := exec.Command("git", gitArgs...)
+	if dir == "" {
+		dir = g.defaultRepoRoot()
+	}
+	cmd.Dir = dir
+	cmd.Env = gitLoaderEnvironment()
+	return cmd
+}
+
 // gitCommand returns a read-only Git subprocess pinned to this loader's
-// repository. Ambient Git routing/configuration variables commonly leak from
+// repository (or the explicitly configured BEADS_DB/BEADS_DIR/redirect target's
+// repository). Ambient Git routing/configuration variables commonly leak from
 // hooks and parent Git commands; retaining them would let a historical load
 // resolve a revision in one object database while g.repoPath names another.
 // Replacement refs are disabled because they can substitute different commit
 // trees without changing the requested revision string or cache key.
 func (g *GitLoader) gitCommand(args ...string) *exec.Cmd {
-	gitArgs := make([]string, 0, len(args)+1)
-	gitArgs = append(gitArgs, "--no-replace-objects")
-	gitArgs = append(gitArgs, args...)
-	cmd := exec.Command("git", gitArgs...)
-	dir := g.repoRoot
-	if dir == "" {
-		dir = resolveGitLoaderRoot(g.repoPath)
+	if target, err := g.resolveTarget(); err == nil && target.repoRoot != "" {
+		return g.gitCommandInDir(target.repoRoot, args...)
 	}
-	cmd.Dir = dir
-	cmd.Env = gitLoaderEnvironment()
-	return cmd
+	return g.gitCommandInDir(g.defaultRepoRoot(), args...)
 }
 
 func resolveGitLoaderRoot(repoPath string) string {
@@ -176,14 +191,21 @@ func (g *GitLoader) LoadAtWithStats(revision string) ([]model.Issue, ParseStats,
 // accounting and bounded warnings are cached with the issues so cache hits
 // cannot erase evidence that the tolerant JSONL parser dropped records.
 func (g *GitLoader) LoadAtWithReport(revision string) (GitLoadReport, error) {
+	target, err := g.resolveTarget()
+	if err != nil {
+		return GitLoadReport{}, err
+	}
+
 	// Resolve to commit SHA for caching
-	sha, err := g.resolveRevision(revision)
+	sha, err := g.resolveRevisionInDir(target.repoRoot, revision)
 	if err != nil {
 		return GitLoadReport{}, fmt.Errorf("resolving revision %q: %w", revision, err)
 	}
 
+	cacheKey := g.cacheKeyForTarget(sha, target)
+
 	// Check cache
-	if report, ok := g.cache.getReport(sha); ok {
+	if report, ok := g.cache.getReport(cacheKey); ok {
 		return report, nil
 	}
 
@@ -192,21 +214,21 @@ func (g *GitLoader) LoadAtWithReport(revision string) (GitLoadReport, error) {
 	// the same Git subprocesses and parse the same JSONL independently. Recheck
 	// the cache inside the flight because another caller may have populated it
 	// between the optimistic lookup above and flight admission.
-	loaded, err, _ := g.flight.Do(sha, func() (any, error) {
-		if report, ok := g.cache.getReport(sha); ok {
+	loaded, err, _ := g.flight.Do(cacheKey, func() (any, error) {
+		if report, ok := g.cache.getReport(cacheKey); ok {
 			return report, nil
 		}
 
-		report, err := g.loadFromGitWithReport(sha)
+		report, err := g.loadFromGitTargetWithReport(target, sha)
 		if err != nil {
 			return report, err
 		}
-		commitTime, err := g.resolveCommitTime(sha)
+		commitTime, err := g.resolveCommitTimeInDir(target.repoRoot, sha)
 		if err != nil {
 			return GitLoadReport{}, err
 		}
 		report.CommitTime = commitTime
-		g.cache.setReport(report)
+		g.cache.setReportForKey(cacheKey, report)
 		return report, nil
 	})
 	if err != nil {
@@ -227,7 +249,11 @@ func (g *GitLoader) LoadAtWithReport(revision string) (GitLoadReport, error) {
 // LoadAtDate loads issues from the state at a specific date/time
 // Uses git rev-list to find the commit at or before the given time
 func (g *GitLoader) LoadAtDate(t time.Time) ([]model.Issue, error) {
-	sha, err := g.resolveDateRevision(t)
+	target, err := g.resolveTarget()
+	if err != nil {
+		return nil, err
+	}
+	sha, err := g.resolveDateRevisionInDir(target.repoRoot, t)
 	if err != nil {
 		return nil, err
 	}
@@ -236,14 +262,22 @@ func (g *GitLoader) LoadAtDate(t time.Time) ([]model.Issue, error) {
 
 // ResolveRevision resolves any git revision to its commit SHA
 func (g *GitLoader) ResolveRevision(revision string) (string, error) {
-	return g.resolveRevision(revision)
+	target, err := g.resolveTarget()
+	if err != nil {
+		return "", err
+	}
+	return g.resolveRevisionInDir(target.repoRoot, revision)
 }
 
 func (g *GitLoader) resolveCommitTime(sha string) (time.Time, error) {
+	return g.resolveCommitTimeInDir(g.defaultRepoRoot(), sha)
+}
+
+func (g *GitLoader) resolveCommitTimeInDir(repoRoot, sha string) (time.Time, error) {
 	// sha is the already-resolved object ID, so it cannot inject options. Use
 	// the committer timestamp because it identifies when this exact repository
 	// snapshot became history.
-	cmd := g.gitCommand("show", "-s", "--format=%cI", sha)
+	cmd := g.gitCommandInDir(repoRoot, "show", "-s", "--format=%cI", sha)
 	out, err := cmd.Output()
 	if err != nil {
 		return time.Time{}, fmt.Errorf("reading commit time for %s: %w", sha, err)
@@ -258,20 +292,22 @@ func (g *GitLoader) resolveCommitTime(sha string) (time.Time, error) {
 
 // ListRevisions returns commits that modified beads files
 func (g *GitLoader) ListRevisions(limit int) ([]RevisionInfo, error) {
+	target, err := g.resolveTarget()
+	if err != nil {
+		return nil, err
+	}
 	args := []string{
 		"log",
 		"--format=%H|%aI|%s",
 		"--",
-		".beads/beads.base.jsonl",
-		".beads/beads.jsonl",
-		".beads/issues.jsonl",
 	}
+	args = append(args, target.gitPaths(nil)...)
 	if limit > 0 {
 		// Insert -n limit after "log"
 		args = append([]string{"log", fmt.Sprintf("-n%d", limit)}, args[1:]...)
 	}
 
-	cmd := g.gitCommand(args...)
+	cmd := g.gitCommandInDir(target.repoRoot, args...)
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -314,12 +350,20 @@ type RevisionInfo struct {
 
 // resolveRevision converts any revision specifier to a commit SHA
 func (g *GitLoader) resolveRevision(revision string) (string, error) {
+	target, err := g.resolveTarget()
+	if err != nil {
+		return "", err
+	}
+	return g.resolveRevisionInDir(target.repoRoot, revision)
+}
+
+func (g *GitLoader) resolveRevisionInDir(repoRoot, revision string) (string, error) {
 	// Peel the revision to a commit: later historical-load steps require a tree
 	// and a committer timestamp, so accepting an arbitrary blob/tree/tag object
 	// here only defers the error and can put a non-commit object into the cache
 	// identity. Annotated tags resolve to the commit they name.
 	// Use --end-of-options to prevent argument injection (e.g. revision starting with -)
-	cmd := g.gitCommand("rev-parse", "--verify", "--end-of-options", revision+"^{commit}")
+	cmd := g.gitCommandInDir(repoRoot, "rev-parse", "--verify", "--end-of-options", revision+"^{commit}")
 
 	out, err := cmd.Output()
 	if err == nil {
@@ -328,14 +372,22 @@ func (g *GitLoader) resolveRevision(revision string) (string, error) {
 
 	// If rev-parse failed, try to interpret the revision as a date.
 	if t, ok := parseDateString(revision); ok {
-		return g.resolveDateRevision(t)
+		return g.resolveDateRevisionInDir(repoRoot, t)
 	}
 
 	return "", fmt.Errorf("git rev-parse failed: %w", err)
 }
 
 func (g *GitLoader) resolveDateRevision(t time.Time) (string, error) {
-	cmd := g.gitCommand("rev-list", "-1", fmt.Sprintf("--before=%s", t.Format(time.RFC3339)), "HEAD")
+	target, err := g.resolveTarget()
+	if err != nil {
+		return "", err
+	}
+	return g.resolveDateRevisionInDir(target.repoRoot, t)
+}
+
+func (g *GitLoader) resolveDateRevisionInDir(repoRoot string, t time.Time) (string, error) {
+	cmd := g.gitCommandInDir(repoRoot, "rev-list", "-1", fmt.Sprintf("--before=%s", t.Format(time.RFC3339)), "HEAD")
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -389,15 +441,344 @@ func (g *GitLoader) loadFromGitWithStats(sha string) ([]model.Issue, ParseStats,
 	return report.Issues, report.ParseStats, err
 }
 
-func (g *GitLoader) loadFromGitWithReport(sha string) (GitLoadReport, error) {
-	// Try known beads file paths in order, matching loader.go precedence
-	var paths []string
-	for _, name := range PreferredJSONLNames {
-		paths = append(paths, fmt.Sprintf(".beads/%s", name))
+func canonicalLocalPath(p string) string {
+	if strings.TrimSpace(p) == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	clean := filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.Clean(resolved)
+	}
+	// Resolve symlinks on the deepest existing ancestor when leaf components
+	// only exist in historical commits (e.g. symlinked temp/parent roots).
+	cur := clean
+	var suffix []string
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return clean
+		}
+		suffix = append(suffix, filepath.Base(cur))
+		cur = parent
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved)
+		}
+	}
+}
+
+func repoRelativeSlashDir(repoRoot, targetDir string) (string, bool) {
+	rootClean := canonicalLocalPath(repoRoot)
+	dirClean := canonicalLocalPath(targetDir)
+	if rootClean == "" || dirClean == "" {
+		return "", false
+	}
+	rel, err := filepath.Rel(rootClean, dirClean)
+	if err != nil || rel == "" || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	if rel == "." {
+		return ".", true
+	}
+	return strings.Trim(filepath.ToSlash(rel), "/"), true
+}
+
+func joinRelSlash(dir, filename string) string {
+	dir = strings.Trim(filepath.ToSlash(dir), "/")
+	if dir == "" || dir == "." {
+		return filename
+	}
+	return dir + "/" + filename
+}
+
+type gitLoaderTarget struct {
+	repoRoot  string
+	dirs      []string
+	fileNames []string
+	explicit  bool
+}
+
+func (t gitLoaderTarget) gitPaths(names []string) []string {
+	if len(names) == 0 {
+		names = t.fileNames
+	}
+	if len(names) == 0 {
+		names = PreferredJSONLNames
+	}
+	paths := make([]string, 0, len(t.dirs)*len(names))
+	for _, dir := range t.dirs {
+		for _, name := range names {
+			paths = append(paths, joinRelSlash(dir, name))
+		}
+	}
+	return paths
+}
+
+func escapedTempBoundary(targetPath, gitRoot string) bool {
+	tempRoot := canonicalLocalPath(os.TempDir())
+	if tempRoot == "" {
+		return false
+	}
+	relTarget, targetInTemp := repoRelativeSlashDir(tempRoot, targetPath)
+	if !targetInTemp || relTarget == "." {
+		return false
+	}
+	_, rootInTemp := repoRelativeSlashDir(tempRoot, gitRoot)
+	return !rootInTemp
+}
+
+func resolveExplicitTargetGitRoot(beadsDir string) (string, error) {
+	trimmed := strings.TrimSpace(beadsDir)
+	if trimmed == "" {
+		return "", fmt.Errorf("configured beads directory is empty")
+	}
+	absTarget, err := filepath.Abs(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("resolving beads directory %q: %w", beadsDir, err)
+	}
+	probe := filepath.Clean(absTarget)
+	if info, statErr := os.Stat(probe); statErr == nil {
+		if !info.IsDir() {
+			return "", fmt.Errorf("configured beads path %s is not a directory", beadsDir)
+		}
+	} else if os.IsNotExist(statErr) {
+		for {
+			parent := filepath.Dir(probe)
+			if parent == probe {
+				return "", fmt.Errorf("configured beads directory %s is not in a git repository", beadsDir)
+			}
+			probe = parent
+			info, pErr := os.Stat(probe)
+			if pErr == nil {
+				if !info.IsDir() {
+					return "", fmt.Errorf("configured beads ancestor %s is not a directory", probe)
+				}
+				break
+			}
+			if !os.IsNotExist(pErr) {
+				return "", fmt.Errorf("inspecting beads directory %s: %w", probe, pErr)
+			}
+		}
+	} else {
+		return "", fmt.Errorf("inspecting beads directory %s: %w", beadsDir, statErr)
 	}
 
+	gitRoot, err := GetGitWorktreeRoot(probe)
+	if err != nil {
+		return "", fmt.Errorf("configured beads directory %s is not in a git repository: %w", beadsDir, err)
+	}
+	if escapedTempBoundary(absTarget, gitRoot) {
+		return "", fmt.Errorf("configured beads directory %s is not in a git repository", beadsDir)
+	}
+	return gitRoot, nil
+}
+
+func buildExplicitGitTarget(beadsDir string, fileNames []string) (gitLoaderTarget, error) {
+	gitRoot, err := resolveExplicitTargetGitRoot(beadsDir)
+	if err != nil {
+		return gitLoaderTarget{}, err
+	}
+	rel, ok := repoRelativeSlashDir(gitRoot, beadsDir)
+	if !ok {
+		return gitLoaderTarget{}, fmt.Errorf("configured beads directory %s is outside git repository %s", beadsDir, gitRoot)
+	}
+	if len(fileNames) == 0 {
+		fileNames = PreferredJSONLNames
+	}
+	return gitLoaderTarget{
+		repoRoot:  gitRoot,
+		dirs:      []string{rel},
+		fileNames: fileNames,
+		explicit:  true,
+	}, nil
+}
+
+func (g *GitLoader) discoverRepoBeadsDirWithTrace() (string, []string, error) {
+	repoPath := g.repoPath
+	if strings.TrimSpace(repoPath) == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to get current working directory: %w", err)
+		}
+		repoPath = wd
+	}
+	info, err := os.Stat(repoPath)
+	if err != nil || !info.IsDir() {
+		return filepath.Join(repoPath, ".beads"), nil, nil
+	}
+
+	beadsDir := filepath.Join(repoPath, ".beads")
+	if _, statErr := os.Stat(beadsDir); statErr == nil {
+		return resolveBeadsRedirect(beadsDir)
+	} else if !os.IsNotExist(statErr) {
+		return "", nil, fmt.Errorf("inspect beads directory %s: %w", beadsDir, statErr)
+	}
+
+	worktreeRoot := g.defaultRepoRoot()
+	_, hasDotGitErr := os.Stat(filepath.Join(worktreeRoot, ".git"))
+	if hasDotGitErr == nil {
+		curr := canonicalLocalPath(repoPath)
+		rootClean := canonicalLocalPath(worktreeRoot)
+		for curr != "" && curr != rootClean {
+			parent := filepath.Dir(curr)
+			if parent == curr {
+				break
+			}
+			candidate := filepath.Join(parent, ".beads")
+			if cInfo, cErr := os.Stat(candidate); cErr == nil && cInfo.IsDir() {
+				return resolveBeadsRedirect(candidate)
+			} else if cErr != nil && !os.IsNotExist(cErr) {
+				return "", nil, fmt.Errorf("inspect beads directory %s: %w", candidate, cErr)
+			}
+			curr = parent
+		}
+	} else {
+		if ancestorBeadsDir, ancErr := findAncestorBeadsDir(repoPath); ancErr != nil {
+			return "", nil, ancErr
+		} else if ancestorBeadsDir != "" {
+			return resolveBeadsRedirect(ancestorBeadsDir)
+		}
+	}
+
+	if mainRepoRoot, mainErr := getMainRepoRoot(repoPath); mainErr == nil && mainRepoRoot != "" && canonicalLocalPath(mainRepoRoot) != canonicalLocalPath(repoPath) {
+		mainBeadsDir := filepath.Join(mainRepoRoot, ".beads")
+		if _, mStatErr := os.Stat(mainBeadsDir); mStatErr == nil {
+			return resolveBeadsRedirect(mainBeadsDir)
+		} else if !os.IsNotExist(mStatErr) {
+			return "", nil, fmt.Errorf("inspect main repository beads directory %s: %w", mainBeadsDir, mStatErr)
+		}
+	}
+
+	return beadsDir, nil, nil
+}
+
+func (g *GitLoader) resolveTarget() (gitLoaderTarget, error) {
+	if envDB := env.BeadsDB.Get(); envDB != "" {
+		fileNames := PreferredJSONLNames
+		if info, statErr := os.Stat(envDB); statErr == nil && !info.IsDir() {
+			if strings.HasSuffix(strings.ToLower(envDB), ".jsonl") {
+				fileNames = []string{filepath.Base(envDB)}
+			}
+		} else if statErr != nil && strings.HasSuffix(strings.ToLower(envDB), ".jsonl") {
+			fileNames = []string{filepath.Base(envDB)}
+		}
+		beadsDir, _, err := resolveBeadsDBWithTrace(envDB)
+		if err != nil {
+			return gitLoaderTarget{}, fmt.Errorf("resolving BEADS_DB %q: %w", envDB, err)
+		}
+		return buildExplicitGitTarget(beadsDir, fileNames)
+	}
+
+	if envDir := env.BeadsDir.Get(); envDir != "" {
+		beadsDir, _, err := resolveBeadsRedirect(envDir)
+		if err != nil {
+			return gitLoaderTarget{}, fmt.Errorf("resolving BEADS_DIR %q: %w", envDir, err)
+		}
+		return buildExplicitGitTarget(beadsDir, PreferredJSONLNames)
+	}
+
+	beadsDir, trace, err := g.discoverRepoBeadsDirWithTrace()
+	if err != nil {
+		return gitLoaderTarget{}, fmt.Errorf("resolving beads directory: %w", err)
+	}
+	if len(trace) > 1 {
+		return buildExplicitGitTarget(beadsDir, PreferredJSONLNames)
+	}
+
+	root := g.defaultRepoRoot()
+	var dirs []string
+	seen := make(map[string]struct{}, 3)
+	addDir := func(d string) {
+		if d != "." {
+			d = strings.Trim(filepath.ToSlash(d), "/")
+		}
+		if d == "" {
+			return
+		}
+		if _, exists := seen[d]; !exists {
+			seen[d] = struct{}{}
+			dirs = append(dirs, d)
+		}
+	}
+
+	if root != "" {
+		if beadsDir != "" {
+			if rel, ok := repoRelativeSlashDir(root, beadsDir); ok {
+				addDir(rel)
+			}
+		}
+		if strings.TrimSpace(g.repoPath) != "" {
+			if relSub, ok := repoRelativeSlashDir(root, filepath.Join(g.repoPath, ".beads")); ok {
+				addDir(relSub)
+			}
+		}
+	}
+	addDir(".beads")
+	return gitLoaderTarget{
+		repoRoot:  root,
+		dirs:      dirs,
+		fileNames: PreferredJSONLNames,
+		explicit:  false,
+	}, nil
+}
+
+func (g *GitLoader) candidateBeadsDirs() []string {
+	target, err := g.resolveTarget()
+	if err != nil {
+		return nil
+	}
+	return target.dirs
+}
+
+func (g *GitLoader) candidateBeadsGitPaths(names []string) []string {
+	target, err := g.resolveTarget()
+	if err != nil {
+		return nil
+	}
+	return target.gitPaths(names)
+}
+
+func (g *GitLoader) cacheKey(sha string) string {
+	target, err := g.resolveTarget()
+	if err != nil {
+		return sha
+	}
+	return g.cacheKeyForTarget(sha, target)
+}
+
+func (g *GitLoader) cacheKeyForTarget(sha string, target gitLoaderTarget) string {
+	if !target.explicit && len(target.dirs) == 1 && target.dirs[0] == ".beads" &&
+		canonicalLocalPath(target.repoRoot) == canonicalLocalPath(g.defaultRepoRoot()) {
+		return sha
+	}
+	return fmt.Sprintf("%s|%s|%s|%s",
+		sha,
+		canonicalLocalPath(target.repoRoot),
+		strings.Join(target.dirs, ","),
+		strings.Join(target.fileNames, ","),
+	)
+}
+
+func (g *GitLoader) loadFromGitWithReport(sha string) (GitLoadReport, error) {
+	target, err := g.resolveTarget()
+	if err != nil {
+		return GitLoadReport{}, err
+	}
+	return g.loadFromGitTargetWithReport(target, sha)
+}
+
+func (g *GitLoader) loadFromGitTargetWithReport(target gitLoaderTarget, sha string) (GitLoadReport, error) {
+	// Try known beads file paths in order, matching loader.go precedence
+	paths := target.gitPaths(nil)
+
 	for _, path := range paths {
-		exists, err := g.historicalPathExists(sha, path)
+		exists, err := g.historicalPathExistsInDir(target.repoRoot, sha, path)
 		if err != nil {
 			return GitLoadReport{}, fmt.Errorf("inspect historical beads path %s:%s: %w", sha, path, err)
 		}
@@ -405,7 +786,7 @@ func (g *GitLoader) loadFromGitWithReport(sha string) (GitLoadReport, error) {
 			continue
 		}
 
-		report, err := g.loadFileFromGitWithReport(sha, path)
+		report, err := g.loadFileFromGitInDirWithReport(target.repoRoot, sha, path)
 		if err != nil {
 			// Once the highest-precedence existing authority is selected, any read
 			// or parse failure is fatal. Falling through to a lower-precedence legacy
@@ -427,10 +808,14 @@ func (g *GitLoader) loadFromGitWithReport(sha string) (GitLoadReport, error) {
 }
 
 func (g *GitLoader) historicalPathExists(sha, path string) (bool, error) {
+	return g.historicalPathExistsInDir(g.defaultRepoRoot(), sha, path)
+}
+
+func (g *GitLoader) historicalPathExistsInDir(repoRoot, sha, path string) (bool, error) {
 	// Unlike `git show <commit>:<path>`, ls-tree distinguishes absence (empty,
 	// successful output) from repository/object failures (non-zero exit). This
 	// lets precedence fallback happen only when a candidate path truly is absent.
-	cmd := g.gitCommand("ls-tree", "--name-only", "--full-tree", "-z", sha, "--", path)
+	cmd := g.gitCommandInDir(repoRoot, "ls-tree", "--name-only", "--full-tree", "-z", sha, "--", path)
 	out, err := cmd.Output()
 	if err != nil {
 		return false, err
@@ -450,7 +835,11 @@ func (g *GitLoader) loadFileFromGitWithStats(sha, path string) ([]model.Issue, P
 }
 
 func (g *GitLoader) loadFileFromGitWithReport(sha, path string) (GitLoadReport, error) {
-	cmd := g.gitCommand("show", fmt.Sprintf("%s:%s", sha, path))
+	return g.loadFileFromGitInDirWithReport(g.defaultRepoRoot(), sha, path)
+}
+
+func (g *GitLoader) loadFileFromGitInDirWithReport(repoRoot, sha, path string) (GitLoadReport, error) {
+	cmd := g.gitCommandInDir(repoRoot, "show", fmt.Sprintf("%s:%s", sha, path))
 
 	out, err := cmd.Output()
 	if err != nil {
@@ -561,6 +950,10 @@ func (c *revisionCache) setWithStats(sha string, issues []model.Issue, stats Par
 }
 
 func (c *revisionCache) setReport(report GitLoadReport) {
+	c.setReportForKey(report.CommitSHA, report)
+}
+
+func (c *revisionCache) setReportForKey(key string, report GitLoadReport) {
 	// Establish immutable cache ownership before taking the exclusive metadata
 	// lock. Deep-cloning a large report does not need to block independent hits.
 	stored := cloneGitLoadReport(report)
@@ -568,7 +961,7 @@ func (c *revisionCache) setReport(report GitLoadReport) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.entries[report.CommitSHA] = cacheEntry{
+	c.entries[key] = cacheEntry{
 		issues:       stored.Issues,
 		tombstoneIDs: stored.TombstoneIDs,
 		parseStats:   stored.ParseStats,
@@ -639,25 +1032,30 @@ type CacheStats struct {
 
 // GetCommitsBetween returns commits between two revisions
 func (g *GitLoader) GetCommitsBetween(fromRev, toRev string) ([]RevisionInfo, error) {
+	target, err := g.resolveTarget()
+	if err != nil {
+		return nil, err
+	}
+
 	// Resolve revisions
-	fromSHA, err := g.resolveRevision(fromRev)
+	fromSHA, err := g.resolveRevisionInDir(target.repoRoot, fromRev)
 	if err != nil {
 		return nil, fmt.Errorf("resolving from revision: %w", err)
 	}
 
-	toSHA, err := g.resolveRevision(toRev)
+	toSHA, err := g.resolveRevisionInDir(target.repoRoot, toRev)
 	if err != nil {
 		return nil, fmt.Errorf("resolving to revision: %w", err)
 	}
 
-	cmd := g.gitCommand("log",
+	gitArgs := []string{
+		"log",
 		"--format=%H|%aI|%s",
 		fmt.Sprintf("%s..%s", fromSHA, toSHA),
 		"--",
-		".beads/beads.base.jsonl",
-		".beads/beads.jsonl",
-		".beads/issues.jsonl",
-	)
+	}
+	gitArgs = append(gitArgs, target.gitPaths(nil)...)
+	cmd := g.gitCommandInDir(target.repoRoot, gitArgs...)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("listing commits between revisions: %w", err)
@@ -692,16 +1090,16 @@ func (g *GitLoader) GetCommitsBetween(fromRev, toRev string) ([]RevisionInfo, er
 
 // HasBeadsAtRevision checks if beads files exist at a given revision
 func (g *GitLoader) HasBeadsAtRevision(revision string) (bool, error) {
-	sha, err := g.resolveRevision(revision)
+	target, err := g.resolveTarget()
+	if err != nil {
+		return false, err
+	}
+	sha, err := g.resolveRevisionInDir(target.repoRoot, revision)
 	if err != nil {
 		return false, err
 	}
 
-	paths := []string{
-		".beads/beads.jsonl",
-		".beads/beads.base.jsonl",
-		".beads/issues.jsonl",
-	}
+	paths := target.gitPaths(nil)
 	// Ask Git once for all candidate paths. The previous per-path cat-file loop
 	// spawned up to three subprocesses and treated every failure (including an
 	// unreadable/corrupt repository) as ordinary absence. ls-tree distinguishes a
@@ -709,7 +1107,7 @@ func (g *GitLoader) HasBeadsAtRevision(revision string) (bool, error) {
 	// path matching.
 	args := []string{"ls-tree", "--name-only", "--full-tree", sha, "--"}
 	args = append(args, paths...)
-	out, err := g.gitCommand(args...).Output()
+	out, err := g.gitCommandInDir(target.repoRoot, args...).Output()
 	if err != nil {
 		return false, fmt.Errorf("checking beads files at %s: %w", sha, err)
 	}

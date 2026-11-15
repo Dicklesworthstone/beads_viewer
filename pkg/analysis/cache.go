@@ -25,9 +25,9 @@ import (
 )
 
 const (
-	// v5 changes cycle semantics to ignore closed/tombstoned issues. Reject v4
-	// entries so an upgrade cannot resurrect historical cycles from disk.
-	robotAnalysisDiskCacheVersion = 5
+	// v6 excludes closed/tombstoned issues from active-subgraph CriticalPathScore
+	// and Slack fallback when the full graph contains a historical closed cycle.
+	robotAnalysisDiskCacheVersion = 6
 	// robotAnalysisDiskCacheSubdirName holds one file per cache entry. The
 	// pre-v3 layout kept every entry in a single analysis_cache.json, which
 	// made each lookup decode — and each store rewrite + fsync — the entire

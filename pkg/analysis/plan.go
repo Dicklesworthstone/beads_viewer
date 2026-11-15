@@ -253,14 +253,14 @@ func (a *Analyzer) computeUnblocks(issueID string) []string {
 // needs to be checked.
 func (a *Analyzer) isActionableAfterCompletions(issueID string, completed map[string]bool) bool {
 	_, exists := a.issueMap[issueID]
-	return exists && a.IsCandidate(issueID) && a.Readiness().ReadyAfter(issueID, a.now, completed)
+	return exists && a.IsUnblockCandidate(issueID) && a.Readiness().ReadyAfter(issueID, a.now, completed)
 }
 
 // isActionableAfterSingleCompletion evaluates isActionableAfterCompletions for
 // a single simulated completion without allocating a map per call.
 func (a *Analyzer) isActionableAfterSingleCompletion(issueID, completedID string) bool {
 	_, exists := a.issueMap[issueID]
-	return exists && a.IsCandidate(issueID) && a.Readiness().ReadyAfterSingle(issueID, a.now, completedID)
+	return exists && a.IsUnblockCandidate(issueID) && a.Readiness().ReadyAfterSingle(issueID, a.now, completedID)
 }
 
 // ComputeUnblocks is an exported wrapper for computeUnblocks for consumers outside analysis.

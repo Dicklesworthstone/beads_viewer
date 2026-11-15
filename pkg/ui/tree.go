@@ -864,12 +864,30 @@ func (t *TreeModel) BuildFromSnapshot(snapshot *DataSnapshot) {
 		return
 	}
 
-	// Reset view state, but keep dimensions/theme/beadsDir.
-	t.roots = snapshot.TreeRoots
-	t.issueMap = snapshot.TreeNodeMap
+	// Deep-copy precomputed hierarchy roots and rebuild t.issueMap over the copied
+	// nodes so ToggleExpand/ExpandAll/CollapseAll never mutate shared DataSnapshot.TreeRoots.
+	t.roots, t.issueMap = deepCopyTree(snapshot.TreeRoots, snapshot.TreeNodeMap, snapshot.IssueMap)
+	if len(t.roots) > 0 && len(t.issueMap) == 0 {
+		t.issueMap = make(map[string]*IssueTreeNode)
+		var indexCopied func([]*IssueTreeNode)
+		indexCopied = func(nodes []*IssueTreeNode) {
+			for _, n := range nodes {
+				if n == nil {
+					continue
+				}
+				if n.Issue != nil && !n.SharedRef {
+					if _, exists := t.issueMap[n.Issue.ID]; !exists {
+						t.issueMap[n.Issue.ID] = n
+					}
+				}
+				indexCopied(n.Children)
+			}
+		}
+		indexCopied(t.roots)
+	}
 
 	// If the snapshot didn't include tree data, fall back to building it now.
-	if len(t.roots) == 0 || t.issueMap == nil {
+	if len(t.roots) == 0 || len(t.issueMap) == 0 {
 		t.Build(snapshot.Issues)
 		t.lastHash = snapshotHash
 		if prevSelectedID != "" {
@@ -1071,6 +1089,13 @@ func (t *TreeModel) View() string {
 			// Highlight selected row using theme's Selected style
 			line = t.theme.Selected.Render(line)
 		}
+		if t.width > 0 && lipgloss.Width(line) > t.width {
+			tail := "…"
+			if t.width <= 1 {
+				tail = ""
+			}
+			line = ansi.Truncate(line, t.width, tail)
+		}
 
 		lines = append(lines, line)
 	}
@@ -1093,9 +1118,17 @@ func (t *TreeModel) renderPositionIndicator(start, end int) string {
 	displayEnd := end
 
 	indicator := fmt.Sprintf(" [%d-%d of %d]", displayStart, displayEnd, total)
-	return t.theme.Renderer.NewStyle().
+	rendered := t.theme.Renderer.NewStyle().
 		Foreground(t.theme.Muted).
 		Render(indicator)
+	if t.width > 0 && lipgloss.Width(rendered) > t.width {
+		tail := "…"
+		if t.width <= 1 {
+			tail = ""
+		}
+		rendered = ansi.Truncate(rendered, t.width, tail)
+	}
+	return rendered
 }
 
 // renderEmptyState renders the view when there are no issues (or no blocking edges in Blocking mode).
@@ -1130,6 +1163,17 @@ func (t *TreeModel) renderEmptyState() string {
 			mutedStyle.Render("Press b/m for Blocking Tree mode. Press E to return to list view."),
 		}
 	}
+	if t.width > 0 {
+		tail := "…"
+		if t.width <= 1 {
+			tail = ""
+		}
+		for i := range lines {
+			if lipgloss.Width(lines[i]) > t.width {
+				lines[i] = ansi.Truncate(lines[i], t.width, tail)
+			}
+		}
+	}
 	if t.height > 0 && len(lines) > t.height {
 		lines = lines[:t.height]
 	}
@@ -1144,23 +1188,23 @@ func (t *TreeModel) renderNode(node *IssueTreeNode, isSelected bool) string {
 
 	issue := node.Issue
 	r := t.theme.Renderer
-	var sb strings.Builder
+	var leftBuilder strings.Builder
 
-	// Build the tree prefix (indentation + branch characters)
+	// Build the tree prefix (indentation + branch characters for node.Depth)
 	prefix := t.buildTreePrefix(node)
-	sb.WriteString(prefix)
+	leftBuilder.WriteString(prefix)
 
 	// Expand/collapse indicator
 	indicator := t.getExpandIndicator(node)
 	indicatorStyle := r.NewStyle().Foreground(t.theme.Secondary)
-	sb.WriteString(indicatorStyle.Render(indicator))
-	sb.WriteString(" ")
+	leftBuilder.WriteString(indicatorStyle.Render(indicator))
+	leftBuilder.WriteString(" ")
 
 	// Type icon
 	icon, iconColor := t.theme.GetTypeIcon(string(issue.IssueType))
 	iconStyle := r.NewStyle().Foreground(iconColor)
-	sb.WriteString(iconStyle.Render(icon))
-	sb.WriteString(" ")
+	leftBuilder.WriteString(iconStyle.Render(icon))
+	leftBuilder.WriteString(" ")
 
 	// Priority badge (P0, P1, P2, etc.)
 	prioText := fmt.Sprintf("P%d", issue.Priority)
@@ -1170,33 +1214,56 @@ func (t *TreeModel) renderNode(node *IssueTreeNode, isSelected bool) string {
 	} else {
 		prioStyle = prioStyle.Foreground(t.theme.Muted)
 	}
-	sb.WriteString(prioStyle.Render(prioText))
-	sb.WriteString(" ")
+	leftBuilder.WriteString(prioStyle.Render(prioText))
+	leftBuilder.WriteString(" ")
 
-	// Issue ID
+	// Issue ID (single-line sanitized)
+	cleanID := strings.ReplaceAll(strings.ReplaceAll(issue.ID, "\r", ""), "\n", "")
 	idStyle := r.NewStyle().Foreground(t.theme.Highlight)
-	sb.WriteString(idStyle.Render(issue.ID))
-	sb.WriteString(" ")
+	leftBuilder.WriteString(idStyle.Render(cleanID))
+	leftBuilder.WriteString(" ")
 
-	// Title (truncated if needed)
-	title := issue.Title
-	// Use lipgloss.Width for proper display width (handles ANSI codes + Unicode)
-	maxTitleLen := t.width - lipgloss.Width(prefix) - 25 // Account for prefix, indicator, icon, priority, ID
-	if maxTitleLen < 20 {
-		maxTitleLen = 20
-	}
-	title = t.truncateTitle(title, maxTitleLen)
-
-	// Title uses base style foreground
-	sb.WriteString(title)
+	leftPart := leftBuilder.String()
 
 	// Status indicator (colored dot at end)
 	statusColor := t.theme.GetStatusColor(string(issue.Status))
 	statusDot := " " + GetStatusIcon(string(issue.Status))
 	statusStyle := r.NewStyle().Foreground(statusColor)
-	sb.WriteString(statusStyle.Render(statusDot))
+	rightPart := statusStyle.Render(statusDot)
 
-	return sb.String()
+	// Compute cell-width budget from actual rendered node chrome (using node.Depth
+	// prefix width + selected row border/padding chrome, with zero minimum floor).
+	title := issue.Title
+	if t.width > 0 {
+		selectedChrome := 0
+		if isSelected {
+			selectedChrome = lipgloss.Width(t.theme.Selected.Render(""))
+		}
+		availRowWidth := t.width - selectedChrome
+		if availRowWidth <= 0 {
+			return ""
+		}
+		leftWidth := lipgloss.Width(leftPart)
+		rightWidth := lipgloss.Width(rightPart)
+		maxTitleLen := availRowWidth - leftWidth - rightWidth
+		if maxTitleLen > 0 {
+			title = t.truncateTitle(title, maxTitleLen)
+		} else {
+			title = ""
+		}
+		line := leftPart + title + rightPart
+		if lipgloss.Width(line) > availRowWidth {
+			tail := "…"
+			if availRowWidth <= 1 {
+				tail = ""
+			}
+			line = ansi.Truncate(line, availRowWidth, tail)
+		}
+		return line
+	}
+
+	title = t.truncateTitle(title, 80)
+	return leftPart + title + rightPart
 }
 
 // buildTreePrefix builds the indentation and branch characters for a node.
@@ -1293,18 +1360,19 @@ func (t *TreeModel) getExpandIndicator(node *IssueTreeNode) string {
 	return "▸" // Collapsed
 }
 
-// truncateTitle truncates a title to the given max length with ellipsis.
+// truncateTitle truncates a title to the given max cell width with ellipsis.
 func (t *TreeModel) truncateTitle(title string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	clean := strings.ReplaceAll(strings.ReplaceAll(title, "\r", " "), "\n", " ")
 	if maxLen <= 3 {
-		return "..."
+		return strings.Repeat(".", maxLen)
 	}
-
-	runes := []rune(title)
-	if len(runes) <= maxLen {
-		return title
+	if lipgloss.Width(clean) <= maxLen {
+		return clean
 	}
-
-	return string(runes[:maxLen-1]) + "…"
+	return ansi.Truncate(clean, maxLen, "…")
 }
 
 // GetPriorityColor returns the color for a priority level.

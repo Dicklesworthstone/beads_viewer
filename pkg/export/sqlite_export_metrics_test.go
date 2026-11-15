@@ -751,3 +751,182 @@ func TestSQLiteExporter_EigenvectorBreakdownFTSAndHybridWasmMeta(t *testing.T) {
 		t.Fatalf("meta.json has_hybrid_wasm = false, want true when wasm/bv_hybrid_scorer.js is present")
 	}
 }
+
+func TestSQLiteExporter_CreatedByCloseReasonAndEstimatedMinutes(t *testing.T) {
+	eta := 45
+	now := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	closedAt := now.Add(time.Hour)
+	issues := []*model.Issue{
+		{
+			ID:               "meta-open",
+			Title:            "Open with ETA and creator",
+			Status:           model.StatusOpen,
+			Priority:         1,
+			IssueType:        model.TypeTask,
+			CreatedBy:        "creator-a",
+			EstimatedMinutes: &eta,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		},
+		{
+			ID:          "meta-closed",
+			Title:       "Closed with reason",
+			Status:      model.StatusClosed,
+			Priority:    2,
+			IssueType:   model.TypeBug,
+			CreatedBy:   "creator-b",
+			CloseReason: "Fixed root cause",
+			CreatedAt:   now,
+			UpdatedAt:   closedAt,
+			ClosedAt:    &closedAt,
+		},
+	}
+
+	outDir := t.TempDir()
+	exp := NewSQLiteExporter(issues, nil, nil, nil)
+	if err := exp.Export(outDir); err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	exported := exp.GetExportedIssues()
+	if len(exported) != 2 || exported[0].CreatedBy != "creator-a" || exported[0].EstimatedMinutes == nil || *exported[0].EstimatedMinutes != 45 || exported[1].CloseReason != "Fixed root cause" {
+		t.Fatalf("GetExportedIssues missing new metadata fields: %+v", exported)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(outDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	for _, table := range []string{"issues", "issue_overview_mv"} {
+		var gotETA sql.NullInt64
+		var gotCreator, gotCloseReason sql.NullString
+		query := "SELECT estimated_minutes, created_by, close_reason FROM " + table + " WHERE id = ?"
+		if err := db.QueryRow(query, "meta-open").Scan(&gotETA, &gotCreator, &gotCloseReason); err != nil {
+			t.Fatalf("%s meta-open Scan: %v", table, err)
+		}
+		if !gotETA.Valid || gotETA.Int64 != 45 || gotCreator.String != "creator-a" || gotCloseReason.Valid {
+			t.Fatalf("%s meta-open = (%v, %v, %v), want (45, creator-a, NULL)", table, gotETA, gotCreator, gotCloseReason)
+		}
+		if err := db.QueryRow(query, "meta-closed").Scan(&gotETA, &gotCreator, &gotCloseReason); err != nil {
+			t.Fatalf("%s meta-closed Scan: %v", table, err)
+		}
+		if gotETA.Valid || gotCreator.String != "creator-b" || gotCloseReason.String != "Fixed root cause" {
+			t.Fatalf("%s meta-closed = (%v, %v, %v), want (NULL, creator-b, Fixed root cause)", table, gotETA, gotCreator, gotCloseReason)
+		}
+	}
+}
+
+func TestSQLiteExporter_ClosedCycleDoesNotPoisonActiveMetricsAndLabelInstrEscaping(t *testing.T) {
+	now := time.Date(2026, 11, 15, 17, 15, 0, 0, time.UTC)
+	closedAt := now.Add(-1 * time.Hour)
+
+	// Closed historical cycle (closed-a <-> closed-b) + active open chain (open-root <- open-mid <- open-leaf) + open side branch (open-side).
+	issues := []*model.Issue{
+		{
+			ID: "closed-a", Title: "Legacy Cycle A", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: closedAt, ClosedAt: &closedAt,
+			Dependencies: []*model.Dependency{{IssueID: "closed-a", DependsOnID: "closed-b", Type: model.DepBlocks}},
+		},
+		{
+			ID: "closed-b", Title: "Legacy Cycle B", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: closedAt, ClosedAt: &closedAt,
+			Dependencies: []*model.Dependency{{IssueID: "closed-b", DependsOnID: "closed-a", Type: model.DepBlocks}},
+		},
+		{
+			ID: "open-root", Title: "Open Root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask,
+			Labels:    []string{"p0<urgent>&fix", "Backend"},
+			CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "open-mid", Title: "Open Middle", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Labels:    []string{"backend"},
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-mid", DependsOnID: "open-root", Type: model.DepBlocks},
+				{IssueID: "open-mid", DependsOnID: "closed-a", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "open-leaf", Title: "Open Leaf", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-leaf", DependsOnID: "open-mid", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "open-side", Title: "Flexible Open Side", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+		},
+	}
+
+	var valueIssues []model.Issue
+	var allDeps []*model.Dependency
+	for _, iss := range issues {
+		valueIssues = append(valueIssues, *iss)
+		allDeps = append(allDeps, iss.Dependencies...)
+	}
+
+	stats := analysis.NewAnalyzer(valueIssues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	if len(stats.Cycles()) != 0 {
+		t.Fatalf("expected closed-only cycle to be ignored by active cycle analysis, got %v", stats.Cycles())
+	}
+	if len(stats.Slack()) == 0 {
+		t.Fatalf("expected active slack map to be populated despite closed cycle")
+	}
+
+	outDir := t.TempDir()
+	exp := NewSQLiteExporter(issues, allDeps, &stats, nil)
+	if err := exp.Export(outDir); err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(outDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Active critical path depths remain > 0 for open chain (root=3, leaf=1) and 0 for closed cycle nodes.
+	var rootCP, leafCP, closedCP int
+	if err := db.QueryRow(`SELECT critical_path_depth FROM issue_overview_mv WHERE id = 'open-root'`).Scan(&rootCP); err != nil {
+		t.Fatalf("Scan open-root critical_path_depth: %v", err)
+	}
+	if err := db.QueryRow(`SELECT critical_path_depth FROM issue_overview_mv WHERE id = 'open-leaf'`).Scan(&leafCP); err != nil {
+		t.Fatalf("Scan open-leaf critical_path_depth: %v", err)
+	}
+	if err := db.QueryRow(`SELECT critical_path_depth FROM issue_overview_mv WHERE id = 'closed-a'`).Scan(&closedCP); err != nil {
+		t.Fatalf("Scan closed-a critical_path_depth: %v", err)
+	}
+	if rootCP < 3 || leafCP < 1 || closedCP != 0 {
+		t.Fatalf("critical_path_depth = (open-root:%d, open-leaf:%d, closed-a:%d), want (>=3, >=1, 0)", rootCP, leafCP, closedCP)
+	}
+
+	// Verify Go encoding/json HTML-escaped token + SQLite INSTR fallback matches <, >, & and is case-sensitive!
+	goEscapedAngleToken := `"p0\u003curgent\u003e\u0026fix"`
+	var matchedID string
+	if err := db.QueryRow(`SELECT id FROM issue_overview_mv WHERE INSTR(COALESCE(labels, '[]'), ?) > 0`, goEscapedAngleToken).Scan(&matchedID); err != nil {
+		t.Fatalf("INSTR escaped <,>,& label lookup failed: %v", err)
+	}
+	if matchedID != "open-root" {
+		t.Fatalf("INSTR escaped <,>,& matched %q, want open-root", matchedID)
+	}
+
+	rows, err := db.Query(`SELECT id FROM issue_overview_mv WHERE INSTR(COALESCE(labels, '[]'), ?) > 0 ORDER BY id`, `"Backend"`)
+	if err != nil {
+		t.Fatalf("INSTR case-sensitive label lookup failed: %v", err)
+	}
+	defer rows.Close()
+	var gotIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("rows.Scan: %v", err)
+		}
+		gotIDs = append(gotIDs, id)
+	}
+	if len(gotIDs) != 1 || gotIDs[0] != "open-root" {
+		t.Fatalf("case-sensitive INSTR for \"Backend\" matched %v, want [open-root] (excluding lowercase backend on open-mid)", gotIDs)
+	}
+}

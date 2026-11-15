@@ -308,3 +308,206 @@ sudo() { echo "SUDO $*" >&2; return 0; }`
 		t.Errorf("expected a checksum mismatch error; stdout=%s stderr=%s", stdout, stderr)
 	}
 }
+
+func TestEnsureGoKeepsStdoutPureWhenInstallingViaHomebrew(t *testing.T) {
+	setup := `
+has_controlling_tty() { return 1; }
+installed_go=0
+brew() {
+    echo "homebrew noisy progress line on stdout"
+    installed_go=1
+    return 0
+}
+go() {
+    if [ "$installed_go" -eq 1 ]; then
+        printf 'go version go1.26.11 darwin/arm64\n'
+    else
+        printf 'go version go1.21.0 darwin/arm64\n'
+    fi
+}`
+	out, stderr, code := runInstallFunc(t, nil, setup, `ver=$(ensure_go); printf 'captured=%s\n' "$ver"`, "")
+	if code != 0 || out != "captured=1.26.11\n" {
+		t.Fatalf("ensure_go polluted stdout or failed: exit=%d, stdout=%q, stderr=%s", code, out, stderr)
+	}
+	for _, wantErr := range []string{"Go 1.26.11 or later is required", "homebrew noisy progress line", "Installed Go 1.26.11 via Homebrew"} {
+		if !strings.Contains(stderr, wantErr) {
+			t.Errorf("expected %q in stderr, got stderr=%q", wantErr, stderr)
+		}
+	}
+}
+
+func TestParseArgsVersionAndFromSource(t *testing.T) {
+	out, stderr, code := runInstallFunc(t, nil, "", `parse_args --version 0.26.0 --from-source && printf '%s|%s\n' "$TARGET_VERSION" "$FROM_SOURCE"`, "")
+	if code != 0 || out != "v0.26.0|1\n" {
+		t.Fatalf("parse_args failed: exit=%d, out=%q, stderr=%s", code, out, stderr)
+	}
+
+	_, stderr, code = runInstallFunc(t, nil, "", `parse_args --version ../evil`, "")
+	if code == 0 || !strings.Contains(stderr, "Invalid release version") {
+		t.Fatalf("expected invalid --version rejection, got exit=%d stderr=%q", code, stderr)
+	}
+
+	_, stderr, code = runInstallFunc(t, nil, "", `parse_args --bogus-flag`, "")
+	if code == 0 || !strings.Contains(stderr, "Unknown option") {
+		t.Fatalf("expected unknown option rejection, got exit=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestSourceInstallTarballFallbackStampsSourceVersion(t *testing.T) {
+	realVersionGo, err := os.ReadFile(filepath.Join("..", "..", "pkg", "version", "version.go"))
+	if err != nil {
+		t.Fatalf("read real pkg/version/version.go: %v", err)
+	}
+
+	t.Run("unverified main tarball compiles real pkg/version to -source", func(t *testing.T) {
+		dir := t.TempDir()
+		buildDir := filepath.Join(dir, "build")
+		installDir := filepath.Join(dir, "install")
+		fixturePkg := filepath.Join(buildDir, "srcpkg", "beads_viewer-main")
+		for _, p := range []string{
+			filepath.Join(fixturePkg, "pkg", "version"),
+			filepath.Join(fixturePkg, "cmd", "bv"),
+			installDir,
+		} {
+			if err := os.MkdirAll(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		hostGoVer := strings.TrimPrefix(runtime.Version(), "go")
+		goMod := "module github.com/Dicklesworthstone/beads_viewer\n\ngo " + hostGoVer + "\n"
+		if err := os.WriteFile(filepath.Join(fixturePkg, "go.mod"), []byte(goMod), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(fixturePkg, "pkg", "version", "version.go"), realVersionGo, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stubMain := `package main
+
+import (
+	"fmt"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/version"
+)
+
+func main() {
+	fmt.Println(version.Version)
+}
+`
+		if err := os.WriteFile(filepath.Join(fixturePkg, "cmd", "bv", "main.go"), []byte(stubMain), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		setup := `
+ensure_go() { printf '1.26.11'; }
+make_tmp_dir() { printf '%s\n' "$BUILD_FIXTURE"; }
+git() { return 1; }
+download_file() {
+    tar -czf "$2" -C "$BUILD_FIXTURE/srcpkg" beads_viewer-main
+}`
+		out, stderr, code := runInstallFunc(t, []string{
+			"BUILD_FIXTURE=" + buildDir,
+			"INSTALL_DIR=" + installDir,
+			"GOTOOLCHAIN=local",
+		}, setup, `try_go_install`, "")
+		if code != 0 {
+			t.Fatalf("try_go_install tarball fallback failed: exit=%d out=%s stderr=%s", code, out, stderr)
+		}
+		verOut, err := exec.Command(filepath.Join(installDir, "bv")).CombinedOutput()
+		if err != nil {
+			t.Fatalf("execute built bv: %v (%s)", err, verOut)
+		}
+		gotVer := strings.TrimSpace(string(verOut))
+		if !strings.HasSuffix(gotVer, "-source") || gotVer == "v0.0.0-source" {
+			t.Fatalf("expected unverified main tarball binary to report <release>-source (not sealed release or v0.0.0-source), got %q", gotVer)
+		}
+	})
+
+	t.Run("pinned --version --from-source compiles real pkg/version to exact tag", func(t *testing.T) {
+		dir := t.TempDir()
+		buildDir := filepath.Join(dir, "build")
+		installDir := filepath.Join(dir, "install")
+		fixturePkg := filepath.Join(buildDir, "srcpkg", "beads_viewer-0.25.0")
+		for _, p := range []string{
+			filepath.Join(fixturePkg, "pkg", "version"),
+			filepath.Join(fixturePkg, "cmd", "bv"),
+			installDir,
+		} {
+			if err := os.MkdirAll(p, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		hostGoVer := strings.TrimPrefix(runtime.Version(), "go")
+		goMod := "module github.com/Dicklesworthstone/beads_viewer\n\ngo " + hostGoVer + "\n"
+		if err := os.WriteFile(filepath.Join(fixturePkg, "go.mod"), []byte(goMod), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(fixturePkg, "pkg", "version", "version.go"), realVersionGo, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stubMain := `package main
+
+import (
+	"fmt"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/version"
+)
+
+func main() {
+	fmt.Println(version.Version)
+}
+`
+		if err := os.WriteFile(filepath.Join(fixturePkg, "cmd", "bv", "main.go"), []byte(stubMain), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		setup := `
+ensure_go() { printf '1.26.11'; }
+make_tmp_dir() { printf '%s\n' "$BUILD_FIXTURE"; }
+git() { return 1; }
+download_file() {
+    tar -czf "$2" -C "$BUILD_FIXTURE/srcpkg" beads_viewer-0.25.0
+}`
+		out, stderr, code := runInstallFunc(t, []string{
+			"BUILD_FIXTURE=" + buildDir,
+			"INSTALL_DIR=" + installDir,
+			"GOTOOLCHAIN=local",
+		}, setup, `parse_args --from-source --version v0.25.0 && try_go_install`, "")
+		if code != 0 {
+			t.Fatalf("try_go_install --version v0.25.0 failed: exit=%d out=%s stderr=%s", code, out, stderr)
+		}
+		verOut, err := exec.Command(filepath.Join(installDir, "bv")).CombinedOutput()
+		if err != nil {
+			t.Fatalf("execute built bv: %v (%s)", err, verOut)
+		}
+		if gotVer := strings.TrimSpace(string(verOut)); gotVer != "v0.25.0" {
+			t.Fatalf("expected pinned --version v0.25.0 binary to report v0.25.0, got %q", gotVer)
+		}
+	})
+}
+
+func TestHasControllingTTYAndBrewStdinIsolation(t *testing.T) {
+	// Piped stdin (curl ... | bash) must NOT be consumed by brew install go, and
+	// detached non-TTY execution must not abort with /dev/tty ENXIO.
+	setup := `
+installed_go=0
+brew() {
+    local leaked=""
+    read -r leaked || true
+    if [ -n "$leaked" ]; then
+        echo "LEAKED_STDIN:$leaked" >&2
+        return 99
+    fi
+    installed_go=1
+    return 0
+}
+go() {
+    if [ "$installed_go" -eq 1 ]; then
+        printf 'go version go1.26.11 linux/amd64\n'
+    else
+        printf 'go version go1.20.0 linux/amd64\n'
+    fi
+}`
+	out, stderr, code := runInstallFunc(t, nil, setup, `ver=$(ensure_go); rest=$(cat); printf '%s|%s\n' "$ver" "$rest"`, "remaining_script_line\n")
+	if code != 0 || out != "1.26.11|remaining_script_line\n" {
+		t.Fatalf("ensure_go consumed piped stdin or failed: exit=%d out=%q stderr=%s", code, out, stderr)
+	}
+	if strings.Contains(stderr, "LEAKED_STDIN") {
+		t.Fatalf("brew read from piped stdin: %s", stderr)
+	}
+}

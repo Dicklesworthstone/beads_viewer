@@ -17,12 +17,30 @@
 // THEME CONSTANTS (matches graph.js Dracula palette)
 // ============================================================================
 
-const CHART_THEME = {
+const DARK_CHART_PALETTE = {
     bg: '#282a36',
     bgSecondary: '#44475a',
     bgTertiary: '#21222c',
     fg: '#f8f8f2',
     fgMuted: '#6272a4',
+    gridColor: '#44475a44',
+    tooltipBg: '#282a36ee',
+    borderColor: '#44475a'
+};
+
+const LIGHT_CHART_PALETTE = {
+    bg: '#f8fafc',
+    bgSecondary: '#e2e8f0',
+    bgTertiary: '#f1f5f9',
+    fg: '#1e293b',
+    fgMuted: '#64748b',
+    gridColor: '#cbd5e188',
+    tooltipBg: '#fffffff2',
+    borderColor: '#cbd5e1'
+};
+
+const CHART_THEME = {
+    ...DARK_CHART_PALETTE,
 
     // Status colors
     status: {
@@ -48,12 +66,7 @@ const CHART_THEME = {
         task: '#8BE9FD',
         epic: '#FF79C6',
         chore: '#6272A4'
-    },
-
-    // Chart-specific
-    gridColor: '#44475a44',
-    tooltipBg: '#282a36ee',
-    borderColor: '#44475a'
+    }
 };
 
 // Chart.js global defaults
@@ -106,6 +119,11 @@ function initCharts(issues, dependencies, resolvedIds) {
     chartsState.resolvedIds = normalizeResolvedIds(resolvedIds);
     chartsState.initialized = true;
 
+    const initialDark = typeof document !== 'undefined'
+        ? document.documentElement.classList.contains('dark')
+        : true;
+    applyTheme(initialDark);
+
     // Initialize all charts
     initBurndownChart();
     initPriorityChart();
@@ -113,6 +131,82 @@ function initCharts(issues, dependencies, resolvedIds) {
     initHeatmap();
 
     console.log('[bv-charts] Dashboard initialized with', issues.length, 'issues');
+}
+
+/**
+ * Sync Chart.js defaults, active chart instances, and custom heatmap canvas with light/dark theme
+ * @param {boolean} isDark - Whether dark mode is active
+ */
+function applyTheme(isDark = true) {
+    Object.assign(CHART_THEME, isDark ? DARK_CHART_PALETTE : LIGHT_CHART_PALETTE);
+
+    if (typeof Chart !== 'undefined') {
+        Chart.defaults.color = CHART_THEME.fg;
+        Chart.defaults.borderColor = CHART_THEME.borderColor;
+    }
+
+    if (chartsState.burndownChart) {
+        const opts = chartsState.burndownChart.options;
+        if (opts.plugins?.legend?.labels) {
+            opts.plugins.legend.labels.color = CHART_THEME.fg;
+        }
+        if (opts.plugins?.tooltip) {
+            opts.plugins.tooltip.backgroundColor = CHART_THEME.tooltipBg;
+            opts.plugins.tooltip.titleColor = CHART_THEME.fg;
+            opts.plugins.tooltip.bodyColor = CHART_THEME.fg;
+            opts.plugins.tooltip.borderColor = CHART_THEME.borderColor;
+        }
+        if (opts.scales?.x) {
+            if (opts.scales.x.grid) opts.scales.x.grid.color = CHART_THEME.gridColor;
+            if (opts.scales.x.ticks) opts.scales.x.ticks.color = CHART_THEME.fg;
+        }
+        if (opts.scales?.y) {
+            if (opts.scales.y.grid) opts.scales.y.grid.color = CHART_THEME.gridColor;
+            if (opts.scales.y.ticks) opts.scales.y.ticks.color = CHART_THEME.fg;
+        }
+        chartsState.burndownChart.update('none');
+    }
+
+    if (chartsState.priorityChart) {
+        const ds = chartsState.priorityChart.data?.datasets?.[0];
+        if (ds) {
+            ds.borderColor = CHART_THEME.bg;
+            ds.hoverBorderColor = CHART_THEME.fg;
+        }
+        const opts = chartsState.priorityChart.options;
+        if (opts.plugins?.legend?.labels) {
+            opts.plugins.legend.labels.color = CHART_THEME.fg;
+        }
+        if (opts.plugins?.tooltip) {
+            opts.plugins.tooltip.backgroundColor = CHART_THEME.tooltipBg;
+            opts.plugins.tooltip.titleColor = CHART_THEME.fg;
+            opts.plugins.tooltip.bodyColor = CHART_THEME.fg;
+            opts.plugins.tooltip.borderColor = CHART_THEME.borderColor;
+        }
+        chartsState.priorityChart.update('none');
+    }
+
+    if (chartsState.typeChart) {
+        const opts = chartsState.typeChart.options;
+        if (opts.plugins?.tooltip) {
+            opts.plugins.tooltip.backgroundColor = CHART_THEME.tooltipBg;
+            opts.plugins.tooltip.titleColor = CHART_THEME.fg;
+            opts.plugins.tooltip.bodyColor = CHART_THEME.fg;
+            opts.plugins.tooltip.borderColor = CHART_THEME.borderColor;
+        }
+        if (opts.scales?.x) {
+            if (opts.scales.x.grid) opts.scales.x.grid.color = CHART_THEME.gridColor;
+            if (opts.scales.x.ticks) opts.scales.x.ticks.color = CHART_THEME.fg;
+        }
+        if (opts.scales?.y?.ticks) {
+            opts.scales.y.ticks.color = CHART_THEME.fg;
+        }
+        chartsState.typeChart.update('none');
+    }
+
+    if (chartsState.heatmapCanvas) {
+        renderHeatmap();
+    }
 }
 
 /**
@@ -446,12 +540,14 @@ function initPriorityChart() {
                     labels: {
                         usePointStyle: true,
                         padding: 12,
+                        color: CHART_THEME.fg,
                         generateLabels: (chart) => {
                             const data = chart.data;
                             return data.labels.map((label, i) => ({
                                 text: `${label} (${data.datasets[0].data[i]})`,
                                 fillStyle: data.datasets[0].backgroundColor[i],
                                 strokeStyle: CHART_THEME.bg,
+                                fontColor: CHART_THEME.fg,
                                 lineWidth: 1,
                                 pointStyle: 'circle',
                                 hidden: false,
@@ -925,8 +1021,11 @@ if (typeof window !== 'undefined') {
         init: initCharts,
         update: updateCharts,
         destroy: destroyCharts,
+        applyTheme: applyTheme,
+        renderHeatmapChart: renderHeatmap,
         computeBurndownData: computeBurndownData,
         computeLabelMatrix: computeLabelMatrix,
         CHART_THEME: CHART_THEME
     };
+    window.BVCharts = window.bvCharts;
 }

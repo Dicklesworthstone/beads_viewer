@@ -7,8 +7,11 @@ package export
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -386,17 +389,23 @@ func firstArg(args []string) string {
 	return args[0]
 }
 
+func enableGitHubPagesArgs(repoFullName string) []string {
+	return []string{
+		"api",
+		fmt.Sprintf("repos/%s/pages", repoFullName),
+		"-X", "POST",
+		"-f", "build_type=workflow",
+		"-f", "source[branch]=main",
+		"-f", "source[path]=/",
+	}
+}
+
 // EnableGitHubPages enables GitHub Pages for a repository.
 func EnableGitHubPages(repoFullName string) (string, error) {
 	fmt.Println("  -> Enabling GitHub Pages...")
 
 	// Try to enable Pages via API
-	cmd := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/pages", repoFullName),
-		"-X", "POST",
-		"-f", "source[branch]=main",
-		"-f", "source[path]=/",
-	)
+	cmd := exec.Command("gh", enableGitHubPagesArgs(repoFullName)...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -966,6 +975,45 @@ func PushToGHPagesBranch(bundlePath string, repoFullName string) error {
 	return nil
 }
 
+func sleepDeploymentPoll(interval time.Duration, deadline time.Time) {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return
+	}
+	if remaining < interval {
+		interval = remaining
+	}
+	time.Sleep(interval)
+}
+
+func fetchDeploymentMetaJSON(client *http.Client, metaURL string, deadline time.Time) ([]byte, error) {
+	reqTimeout := 10 * time.Second
+	if remaining := time.Until(deadline); remaining > 0 && remaining < reqTimeout {
+		reqTimeout = remaining
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metaURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	return body, nil
+}
+
 // VerifyGitHubPagesDeployment polls the live site to verify deployment succeeded.
 // It checks that meta.json is accessible and contains the expected issue count.
 func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeout time.Duration) error {
@@ -975,17 +1023,16 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 
 	metaURL := strings.TrimSuffix(pagesURL, "/") + "/data/meta.json"
 	deadline := time.Now().Add(timeout)
+	httpClient := &http.Client{Timeout: 10 * time.Second}
 	var lastErr error
 
 	fmt.Printf("  -> Verifying deployment at %s...\n", pagesURL)
 
 	for time.Now().Before(deadline) {
-		// Use curl to fetch meta.json (more reliable than Go's http client for this)
-		cmd := exec.Command("curl", "-sf", "--max-time", "10", metaURL)
-		output, err := cmd.Output()
+		output, err := fetchDeploymentMetaJSON(httpClient, metaURL, deadline)
 		if err != nil {
 			lastErr = fmt.Errorf("fetch failed: %w", err)
-			time.Sleep(5 * time.Second)
+			sleepDeploymentPoll(5*time.Second, deadline)
 			continue
 		}
 
@@ -995,7 +1042,7 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 		}
 		if err := json.Unmarshal(output, &meta); err != nil {
 			lastErr = fmt.Errorf("parse failed: %w", err)
-			time.Sleep(5 * time.Second)
+			sleepDeploymentPoll(5*time.Second, deadline)
 			continue
 		}
 

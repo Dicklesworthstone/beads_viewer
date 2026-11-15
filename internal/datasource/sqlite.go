@@ -15,6 +15,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -267,6 +268,7 @@ func (r *SQLiteReader) LoadIssueSnapshot() ([]model.Issue, LoadReport, error) {
 // LoadIssueSnapshotContext binds the transaction and every SQL statement to
 // the caller's context. It never retains that context between refreshes.
 func (r *SQLiteReader) LoadIssueSnapshotContext(ctx context.Context) ([]model.Issue, LoadReport, error) {
+	defer metrics.Timer(metrics.LoaderParse)()
 	report := LoadReport{Path: r.path}
 	issues, err := r.readIssueSnapshot(ctx, &report)
 	seen := make(map[string]bool, len(issues))

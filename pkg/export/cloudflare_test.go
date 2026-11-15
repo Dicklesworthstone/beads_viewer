@@ -384,7 +384,7 @@ func TestCreateCloudflareProject_Signature(t *testing.T) {
 }
 
 func TestVerifyCloudflareDeployment_IssueCountMismatchReturnsError(t *testing.T) {
-	requireCurl(t)
+	t.Setenv("PATH", "")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
@@ -404,7 +404,7 @@ func TestVerifyCloudflareDeployment_IssueCountMismatchReturnsError(t *testing.T)
 }
 
 func TestVerifyCloudflareDeployment_ZeroIssueCountMismatchReturnsError(t *testing.T) {
-	requireCurl(t)
+	t.Setenv("PATH", "")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
@@ -424,7 +424,7 @@ func TestVerifyCloudflareDeployment_ZeroIssueCountMismatchReturnsError(t *testin
 }
 
 func TestVerifyCloudflareDeployment_Success(t *testing.T) {
-	requireCurl(t)
+	t.Setenv("PATH", "")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {

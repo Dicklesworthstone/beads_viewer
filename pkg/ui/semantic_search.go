@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -720,7 +721,55 @@ func BuildHybridMetricsCmd(issues []model.Issue, dataGen, buildGen uint64, readi
 	}
 }
 
+// semanticIndexScopeKey derives the search.IndexPathForScope key for a live TUI
+// source. Canonical single-repo .beads files under workDir return "" so the
+// single-repo .bvvi path is unchanged; concrete files outside <workDir>/.beads
+// or non-canonical custom --db / BEADS_DB files return "db:<cleanAbsBeads>".
+func semanticIndexScopeKey(workDir, beadsPath string, isExplicitDB bool) string {
+	workDir = strings.TrimSpace(workDir)
+	beadsPath = strings.TrimSpace(beadsPath)
+	if workDir == "" || beadsPath == "" || strings.HasPrefix(beadsPath, "git:") {
+		return ""
+	}
+	absWorkDir, err := filepath.Abs(workDir)
+	if err != nil {
+		absWorkDir = filepath.Clean(workDir)
+	} else {
+		absWorkDir = filepath.Clean(absWorkDir)
+	}
+	absBeads, err := filepath.Abs(beadsPath)
+	if err != nil {
+		absBeads = filepath.Clean(beadsPath)
+	} else {
+		absBeads = filepath.Clean(absBeads)
+	}
+	if isExplicitDB {
+		return "db:" + absBeads
+	}
+	expectedBeadsDir := filepath.Clean(filepath.Join(absWorkDir, ".beads"))
+	beadsParent := filepath.Clean(filepath.Dir(absBeads))
+	inCanonicalBeadsDir := beadsParent == expectedBeadsDir
+	if !inCanonicalBeadsDir {
+		if evalParent, err1 := filepath.EvalSymlinks(beadsParent); err1 == nil {
+			if evalExpected, err2 := filepath.EvalSymlinks(expectedBeadsDir); err2 == nil &&
+				filepath.Clean(evalParent) == filepath.Clean(evalExpected) {
+				inCanonicalBeadsDir = true
+			}
+		}
+	}
+	if !inCanonicalBeadsDir {
+		return "db:" + absBeads
+	}
+	switch strings.ToLower(filepath.Base(absBeads)) {
+	case "issues.jsonl", "beads.jsonl", "beads.base.jsonl", "beads.db":
+		return ""
+	default:
+		return "db:" + absBeads
+	}
+}
+
 // BuildSemanticIndexCmd builds or updates the semantic index for the given issues.
+// Optional workDir arguments specify [projectDir] or [projectDir, scopeKey].
 func BuildSemanticIndexCmd(issues []model.Issue, dataGen, buildGen uint64, workDir ...string) tea.Cmd {
 	return func() tea.Msg {
 		cfg := search.EmbeddingConfigFromEnv()
@@ -732,6 +781,10 @@ func BuildSemanticIndexCmd(issues []model.Issue, dataGen, buildGen uint64, workD
 		projectDir := ""
 		if len(workDir) > 0 {
 			projectDir = strings.TrimSpace(workDir[0])
+		}
+		scopeKey := ""
+		if len(workDir) > 1 {
+			scopeKey = strings.TrimSpace(workDir[1])
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -759,7 +812,7 @@ func BuildSemanticIndexCmd(issues []model.Issue, dataGen, buildGen uint64, workD
 			}
 		}
 
-		indexPath := search.DefaultIndexPath(projectDir, cfg)
+		indexPath := search.IndexPathForScope(projectDir, cfg, scopeKey)
 		idx, loaded, err := search.LoadOrNewVectorIndex(indexPath, embedder.Dim())
 		if err != nil {
 			return SemanticIndexReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}

@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -55,166 +56,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 )
-
-type flagHelpSection struct {
-	title string
-	match func(string) bool
-}
-
-var rootHelpSections = []flagHelpSection{
-	{
-		title: "General Flags",
-		match: func(name string) bool {
-			return isOneOf(name,
-				"help",
-				"version",
-				"cpu-profile",
-				"db",
-				"update",
-				"check-update",
-				"update-dry-run",
-				"rollback",
-				"yes",
-				"format",
-				"stats",
-				"profile-startup",
-				"profile-json",
-				"no-cache",
-				"force-full-analysis",
-				"theme",
-				"background-mode",
-				"no-background-mode",
-			)
-		},
-	},
-	{
-		title: "Search & Filters",
-		match: func(name string) bool {
-			return isOneOf(name,
-				"recipe",
-				"search",
-				"label",
-				"severity",
-				"alert-type",
-				"alert-label",
-				"workspace",
-				"repo",
-				"robot-min-confidence",
-				"robot-max-results",
-				"robot-by-label",
-				"robot-by-assignee",
-			) || hasAnyPrefix(name, "search-")
-		},
-	},
-	{
-		title: "Robot & Planning Flags",
-		match: func(name string) bool {
-			return strings.HasPrefix(name, "robot-") ||
-				isOneOf(name,
-					"attention-limit",
-					"brief",
-					"schema-command",
-					"suggest-type",
-					"suggest-confidence",
-					"suggest-bead",
-					"graph-format",
-					"graph-root",
-					"graph-depth",
-					"orphans-min-score",
-					"file-beads-limit",
-					"hotspots-limit",
-					"relations-threshold",
-					"relations-limit",
-					"related-min-relevance",
-					"related-max-results",
-					"related-include-closed",
-					"forecast-label",
-					"forecast-sprint",
-					"forecast-agents",
-					"agents",
-					"capacity-label",
-					"feedback-accept",
-					"feedback-ignore",
-					"feedback-reset",
-					"feedback-show",
-				) ||
-				hasAnyPrefix(name, "correlation-")
-		},
-	},
-	{
-		title: "History & Drift",
-		match: func(name string) bool {
-			return isOneOf(name,
-				"diff-since",
-				"as-of",
-				"save-baseline",
-				"baseline-info",
-				"check-drift",
-				"init-drift",
-				"bead-history",
-				"history-since",
-				"history-limit",
-				"min-confidence",
-				"id-pattern",
-			)
-		},
-	},
-	{
-		title: "Export & Reporting",
-		match: func(name string) bool {
-			return isOneOf(name,
-				"export",
-				"export-format",
-				"export-include-graph",
-				"export-template",
-				"export-md",
-				"no-hooks",
-				"hooks-info",
-				"trust-hooks",
-				"hook-env",
-				"export-graph",
-				"graph-preset",
-				"graph-title",
-				"emit-script",
-				"script-limit",
-				"script-format",
-				"priority-brief",
-				"agent-brief",
-				"export-pages",
-				"pages-title",
-				"pages-subtitle",
-				"pages-include-closed",
-				"pages-include-history",
-				"preview-pages",
-				"no-live-reload",
-				"watch-export",
-				"pages",
-				"debug-render",
-				"debug-width",
-				"debug-height",
-			)
-		},
-	},
-	{
-		title: "Agent File Management",
-		match: func(name string) bool {
-			return strings.HasPrefix(name, "agents-")
-		},
-	},
-}
-
-func isOneOf(name string, values ...string) bool {
-	return slices.Contains(values, name)
-}
-
-func hasAnyPrefix(name string, prefixes ...string) bool {
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(name, prefix) {
-			return true
-		}
-	}
-	return false
-}
 
 type modifierFlagRule struct {
 	modifier string
@@ -549,22 +390,26 @@ func newRootCommand(run func() error) *cobra.Command {
 
 func rewriteSingleDashLongFlags(args []string, flags *flag.FlagSet) []string {
 	rewritten := make([]string, 0, len(args))
-	for _, arg := range args {
-		if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") || len(arg) <= 2 {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			rewritten = append(rewritten, args[i:]...)
+			break
+		}
+		name, _, hasEq, isDoubleDash, ok := parseCLIFlagToken(arg)
+		if !ok {
 			rewritten = append(rewritten, arg)
 			continue
 		}
-
-		name := arg[1:]
-		if eq := strings.IndexRune(name, '='); eq >= 0 {
-			name = name[:eq]
+		outArg := arg
+		if !isDoubleDash && len(name) > 1 && flags != nil && flags.Lookup(name) != nil {
+			outArg = "-" + arg
 		}
-		if len(name) <= 1 || flags.Lookup(name) == nil {
-			rewritten = append(rewritten, arg)
-			continue
+		rewritten = append(rewritten, outArg)
+		if !hasEq && flagTakesSeparateValue(name) && i+1 < len(args) {
+			i++
+			rewritten = append(rewritten, args[i])
 		}
-
-		rewritten = append(rewritten, "-"+arg)
 	}
 	return rewritten
 }
@@ -580,22 +425,81 @@ func rewriteAgentIntentArgs(args []string) []string {
 
 	rewritten := rewriteAgentIntentFlagAliases(args, inferAgentFlagContext(args))
 	if containsAgentStructuredOutputAlias(args) && !hasPrimaryRobotArg(rewritten) && !hasNonRobotPrimaryArg(rewritten) {
-		return append([]string{"--robot-triage"}, rewritten...)
+		defaultRobotFlag := defaultStructuredRobotFlagForArgs(rewritten)
+		filtered := make([]string, 0, len(rewritten)+1)
+		filtered = append(filtered, defaultRobotFlag)
+		for i := 0; i < len(rewritten); i++ {
+			arg := rewritten[i]
+			if arg == "--" {
+				filtered = append(filtered, rewritten[i:]...)
+				break
+			}
+			if name, eqVal, hasEq, _, ok := parseCLIFlagToken(arg); ok {
+				if !hasEq && flagTakesSeparateValue(name) {
+					filtered = append(filtered, arg)
+					if i+1 < len(rewritten) {
+						i++
+						filtered = append(filtered, rewritten[i])
+					}
+					continue
+				}
+				if hasEq && strings.EqualFold("--"+name, defaultRobotFlag) && isNegatedBoolFlagValue(eqVal) {
+					continue
+				}
+			}
+			filtered = append(filtered, arg)
+		}
+		return filtered
 	}
 	return rewritten
+}
+
+func defaultStructuredRobotFlagForArgs(args []string) string {
+	for i := 0; i < len(args); i++ {
+		raw := args[i]
+		if raw == "--" {
+			break
+		}
+		name, eqVal, hasEq, _, ok := parseCLIFlagToken(raw)
+		if !ok {
+			continue
+		}
+		takesVal := flagTakesSeparateValue(name)
+		val := eqVal
+		if !hasEq && takesVal && i+1 < len(args) {
+			i++
+			val = args[i]
+		}
+		switch strings.ToLower(name) {
+		case "search":
+			if strings.TrimSpace(val) != "" {
+				return "--robot-search"
+			}
+		case "diff-since":
+			if strings.TrimSpace(val) != "" {
+				return "--robot-diff"
+			}
+		}
+	}
+	return "--robot-triage"
 }
 
 func inferAgentFlagContext(args []string) string {
 	hasEmitScript := false
 	hasTriage := false
 	detected := ""
-	for _, raw := range args {
-		if !strings.HasPrefix(raw, "-") {
+	for i := 0; i < len(args); i++ {
+		raw := args[i]
+		if raw == "--" {
+			break
+		}
+		name, eqVal, hasEq, _, ok := parseCLIFlagToken(raw)
+		if !ok {
 			continue
 		}
-		name := strings.TrimLeft(raw, "-")
-		if eq := strings.IndexByte(name, '='); eq >= 0 {
-			name = name[:eq]
+		takesVal := flagTakesSeparateValue(name)
+		if !takesVal && hasEq && isNegatedBoolFlagValue(eqVal) {
+			continue
 		}
 		switch strings.ToLower(name) {
 		case "emit-script":
@@ -626,6 +530,9 @@ func inferAgentFlagContext(args []string) string {
 			detected = "related"
 		case "robot-file-relations":
 			detected = "file-relations"
+		}
+		if !hasEq && takesVal && i+1 < len(args) {
+			i++
 		}
 	}
 	if hasEmitScript && !hasTriage {
@@ -869,7 +776,7 @@ func rewriteRobotSearchIntent(rest []string) []string {
 			continue
 		}
 		aliases, remaining := consumeLeadingAgentIntentFlagAliases(rest, "search")
-		if len(aliases) == 0 {
+		if len(remaining) == len(rest) {
 			break
 		}
 		prefix = append(prefix, aliases...)
@@ -920,13 +827,12 @@ func consumeLeadingAgentIntentFlagAliases(args []string, context string) ([]stri
 	rest := args
 	for len(rest) > 0 {
 		arg := rest[0]
+		if tokens, ok := rewriteStructuredOutputBoolAliasTokens(arg); ok {
+			rewritten = append(rewritten, tokens...)
+			rest = rest[1:]
+			continue
+		}
 		switch arg {
-		case "--json":
-			rewritten = append(rewritten, "--format", "json")
-			rest = rest[1:]
-		case "--toon":
-			rewritten = append(rewritten, "--format", "toon")
-			rest = rest[1:]
 		case "--output", "-o":
 			if len(rest) >= 2 && isRobotOutputFormat(rest[1]) {
 				rewritten = append(rewritten, "--format", strings.ToLower(rest[1]))
@@ -957,23 +863,47 @@ func rewriteAgentIntentFlagAliases(args []string, context string) []string {
 	rewritten := make([]string, 0, len(args)+2)
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
+		if arg == "--" {
+			rewritten = append(rewritten, args[i:]...)
+			break
+		}
+		if tokens, ok := rewriteStructuredOutputBoolAliasTokens(arg); ok {
+			rewritten = append(rewritten, tokens...)
+			continue
+		}
 		switch arg {
-		case "--json":
-			rewritten = append(rewritten, "--format", "json")
-		case "--toon":
-			rewritten = append(rewritten, "--format", "toon")
 		case "--output", "-o":
 			if i+1 < len(args) && isRobotOutputFormat(args[i+1]) {
 				rewritten = append(rewritten, "--format", strings.ToLower(args[i+1]))
 				i++
 			} else {
 				rewritten = append(rewritten, arg)
+				if i+1 < len(args) {
+					i++
+					rewritten = append(rewritten, args[i])
+				}
 			}
 		case "--name":
 			rewritten = append(rewritten, "--label")
+			if i+1 < len(args) {
+				i++
+				rewritten = append(rewritten, args[i])
+			}
 		case "--limit":
 			rewritten = append(rewritten, limitFlagForAgentContext(context))
+			if i+1 < len(args) {
+				i++
+				rewritten = append(rewritten, args[i])
+			}
 		default:
+			if name, _, hasEq, _, ok := parseCLIFlagToken(arg); ok && !hasEq && flagTakesSeparateValue(name) {
+				rewritten = append(rewritten, arg)
+				if i+1 < len(args) {
+					i++
+					rewritten = append(rewritten, args[i])
+				}
+				continue
+			}
 			rewritten = append(rewritten, rewriteAgentIntentEqualsArg(arg, context))
 		}
 	}
@@ -1000,14 +930,6 @@ func rewriteAgentIntentEqualsAlias(arg, context string) (string, bool) {
 
 func rewriteLeadingAgentIntentEqualsAlias(arg, context string) (string, bool) {
 	switch {
-	case arg == "--json=true":
-		return "--format=json", true
-	case arg == "--json=false":
-		return "--format=json", true
-	case arg == "--toon=true":
-		return "--format=toon", true
-	case arg == "--toon=false":
-		return "--format=json", true
 	case strings.HasPrefix(arg, "--output="):
 		value := strings.TrimPrefix(arg, "--output=")
 		if isRobotOutputFormat(value) {
@@ -1055,41 +977,274 @@ func normalizeRobotCommandName(value string) string {
 	return "robot-" + value
 }
 
+var knownValueTakingCLIFlags = map[string]bool{
+	"cpu-profile":               true,
+	"db":                        true,
+	"beads-dir":                 true,
+	"export-md":                 true,
+	"export":                    true,
+	"export-format":             true,
+	"export-group-by":           true,
+	"export-template":           true,
+	"robot-docs":                true,
+	"format":                    true,
+	"f":                         true,
+	"output":                    true,
+	"o":                         true,
+	"robot-not-ready-labels":    true,
+	"attention-limit":           true,
+	"schema-command":            true,
+	"suggest-type":              true,
+	"suggest-confidence":        true,
+	"suggest-bead":              true,
+	"graph-format":              true,
+	"graph-root":                true,
+	"graph-depth":               true,
+	"export-graph":              true,
+	"graph-preset":              true,
+	"graph-title":               true,
+	"robot-min-confidence":      true,
+	"robot-max-results":         true,
+	"robot-by-label":            true,
+	"robot-by-assignee":         true,
+	"label":                     true,
+	"l":                         true,
+	"name":                      true,
+	"limit":                     true,
+	"severity":                  true,
+	"alert-type":                true,
+	"alert-label":               true,
+	"recipe":                    true,
+	"r":                         true,
+	"search":                    true,
+	"search-limit":              true,
+	"search-min-score":          true,
+	"search-mode":               true,
+	"search-preset":             true,
+	"search-weights":            true,
+	"diff-since":                true,
+	"as-of":                     true,
+	"trust-hooks":               true,
+	"hook-env":                  true,
+	"workspace":                 true,
+	"repo":                      true,
+	"save-baseline":             true,
+	"bead-history":              true,
+	"history-since":             true,
+	"history-limit":             true,
+	"robot-history-timeout-ms":  true,
+	"min-confidence":            true,
+	"id-pattern":                true,
+	"robot-explain-correlation": true,
+	"robot-confirm-correlation": true,
+	"robot-reject-correlation":  true,
+	"correlation-by":            true,
+	"correlation-reason":        true,
+	"orphans-min-score":         true,
+	"robot-file-beads":          true,
+	"robot-commit":              true,
+	"file-beads-limit":          true,
+	"hotspots-limit":            true,
+	"robot-impact":              true,
+	"robot-file-relations":      true,
+	"relations-threshold":       true,
+	"relations-limit":           true,
+	"robot-related":             true,
+	"related-min-relevance":     true,
+	"related-max-results":       true,
+	"robot-blocker-chain":       true,
+	"robot-whatif":              true,
+	"robot-impact-network":      true,
+	"network-depth":             true,
+	"robot-causality":           true,
+	"robot-sprint-show":         true,
+	"robot-forecast":            true,
+	"forecast-label":            true,
+	"forecast-sprint":           true,
+	"forecast-agents":           true,
+	"agents":                    true,
+	"capacity-label":            true,
+	"robot-burndown":            true,
+	"script-limit":              true,
+	"script-format":             true,
+	"feedback-accept":           true,
+	"feedback-ignore":           true,
+	"priority-brief":            true,
+	"agent-brief":               true,
+	"export-pages":              true,
+	"pages-title":               true,
+	"pages-subtitle":            true,
+	"preview-pages":             true,
+	"debug-render":              true,
+	"debug-width":               true,
+	"debug-height":              true,
+	"theme":                     true,
+}
+
+func parseCLIFlagToken(arg string) (name string, eqVal string, hasEq bool, isDoubleDash bool, ok bool) {
+	if len(arg) < 2 || arg == "--" || !strings.HasPrefix(arg, "-") {
+		return "", "", false, false, false
+	}
+	raw := arg[1:]
+	if strings.HasPrefix(arg, "--") {
+		isDoubleDash = true
+		raw = arg[2:]
+	}
+	if eq := strings.IndexByte(raw, '='); eq >= 0 {
+		name = raw[:eq]
+		eqVal = raw[eq+1:]
+		hasEq = true
+	} else {
+		name = raw
+	}
+	if name == "" {
+		return "", "", false, false, false
+	}
+	return name, eqVal, hasEq, isDoubleDash, true
+}
+
+func isNegatedBoolFlagValue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "false", "0", "no", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+func flagTakesSeparateValue(name string) bool {
+	if knownValueTakingCLIFlags[strings.ToLower(name)] {
+		return true
+	}
+	if flag.CommandLine != nil {
+		if f := flag.CommandLine.Lookup(name); f != nil {
+			return f.NoOptDefVal == ""
+		}
+		if len(name) == 1 {
+			if f := flag.CommandLine.ShorthandLookup(name); f != nil {
+				return f.NoOptDefVal == ""
+			}
+		}
+	}
+	return false
+}
+
+func isPositiveBoolFlagValue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func rewriteStructuredOutputBoolAliasTokens(arg string) ([]string, bool) {
+	name, eqVal, hasEq, _, parsed := parseCLIFlagToken(arg)
+	if !parsed {
+		return nil, false
+	}
+	lowerName := strings.ToLower(name)
+	if lowerName != "json" && lowerName != "toon" {
+		return nil, false
+	}
+	if !hasEq {
+		return []string{"--format", lowerName}, true
+	}
+	if isPositiveBoolFlagValue(eqVal) {
+		return []string{"--format=" + lowerName}, true
+	}
+	if isNegatedBoolFlagValue(eqVal) {
+		// Both --json=<neg> and --toon=<neg> preserve non-interactive JSON output
+		// (avoiding the TUI and overriding BV_OUTPUT_FORMAT=toon back to json).
+		return []string{"--format=json"}, true
+	}
+	return nil, false
+}
+
 func containsAgentStructuredOutputAlias(args []string) bool {
-	for i, arg := range args {
-		if arg == "--json" || arg == "--json=true" || arg == "--json=false" || arg == "--toon" || arg == "--toon=true" || arg == "--toon=false" {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		if _, ok := rewriteStructuredOutputBoolAliasTokens(arg); ok {
 			return true
 		}
 		if strings.EqualFold(arg, "--output=json") || strings.EqualFold(arg, "-o=json") || strings.EqualFold(arg, "--output=toon") || strings.EqualFold(arg, "-o=toon") {
 			return true
 		}
-		if (arg == "--output" || arg == "-o") && i+1 < len(args) && isRobotOutputFormat(args[i+1]) {
-			return true
+		if (arg == "--output" || arg == "-o") && i+1 < len(args) {
+			if isRobotOutputFormat(args[i+1]) {
+				return true
+			}
+			i++
+			continue
+		}
+		if name, _, hasEq, _, ok := parseCLIFlagToken(arg); ok && !hasEq && flagTakesSeparateValue(name) && i+1 < len(args) {
+			i++
 		}
 	}
 	return false
 }
 
 func hasPrimaryRobotArg(args []string) bool {
-	for _, arg := range args {
-		name := strings.TrimPrefix(strings.SplitN(arg, "=", 2)[0], "--")
-		if _, ok := primaryRobotFlagNames()[name]; ok {
+	primaryFlags := primaryRobotFlagNames()
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		name, eqVal, hasEq, isDoubleDash, ok := parseCLIFlagToken(arg)
+		if !ok {
+			continue
+		}
+		takesVal := flagTakesSeparateValue(name)
+		if _, isPrimary := primaryFlags[name]; isPrimary && (isDoubleDash || len(name) > 1) {
+			if !takesVal && hasEq && isNegatedBoolFlagValue(eqVal) {
+				continue
+			}
 			return true
+		}
+		if !hasEq && takesVal && i+1 < len(args) {
+			i++
 		}
 	}
 	return false
 }
 
 func hasNonRobotPrimaryArg(args []string) bool {
-	for _, arg := range args {
-		name := strings.TrimPrefix(strings.SplitN(arg, "=", 2)[0], "--")
-		switch name {
-		case "version", "help", "check-update", "update", "update-dry-run", "rollback",
-			"pages", "export-pages", "preview-pages", "export", "export-md", "export-graph", "hooks-info",
-			"init-drift", "save-baseline", "baseline-info", "check-drift",
-			"agents-add", "agents-update", "agents-check", "agents-reset",
-			"feedback-accept", "feedback-ignore", "feedback-reset", "feedback-show":
-			return true
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			break
+		}
+		name, eqVal, hasEq, isDoubleDash, ok := parseCLIFlagToken(arg)
+		if !ok {
+			continue
+		}
+		if !isDoubleDash && name == "h" {
+			if !hasEq || !isNegatedBoolFlagValue(eqVal) {
+				return true
+			}
+			continue
+		}
+		takesVal := flagTakesSeparateValue(name)
+		if isDoubleDash || len(name) > 1 {
+			switch name {
+			case "version", "help", "generate-docs", "check-update", "update", "update-dry-run", "rollback",
+				"pages", "export-pages", "preview-pages", "export", "export-md", "export-graph", "hooks-info",
+				"priority-brief", "agent-brief", "emit-script", "debug-render", "profile-startup",
+				"init-drift", "save-baseline", "baseline-info", "check-drift",
+				"agents-add", "agents-update", "agents-remove", "agents-check", "agents-reset", "agents-dry-run", "agents-force",
+				"feedback-accept", "feedback-ignore", "feedback-reset", "feedback-show":
+				if !takesVal && hasEq && isNegatedBoolFlagValue(eqVal) {
+					continue
+				}
+				return true
+			}
+		}
+		if !hasEq && takesVal && i+1 < len(args) {
+			i++
 		}
 	}
 	return false
@@ -1432,9 +1587,9 @@ func printRootHelp(cmd *cobra.Command) {
 	fmt.Fprintln(out, "A TUI viewer for beads issue tracker.")
 	fmt.Fprintln(out)
 
-	for _, section := range rootHelpSections {
-		names := collectFlagNames(allFlags, seen, section.match)
-		printFlagSection(out, allFlags, section.title, names)
+	for _, section := range docgen.DefaultFlagSections() {
+		names := collectFlagNames(allFlags, seen, section.Match)
+		printFlagSection(out, allFlags, section.Title, names)
 		markFlagNamesSeen(seen, names)
 	}
 
@@ -1523,7 +1678,8 @@ func main() {
 	yesFlag := flag.Bool("yes", false, "Skip confirmation prompts (use with --update)")
 	exportFile := flag.String("export-md", "", "Export issues to a Markdown file (e.g., report.md)")
 	exportReport := flag.String("export", "", "Export a report using recipe defaults or explicit export options")
-	exportFormat := flag.String("export-format", "", "Report format: markdown, json, csv or mermaid")
+	exportFormat := flag.String("export-format", "", "Report format: markdown, html, json, csv or mermaid")
+	exportGroupBy := flag.String("export-group-by", "", "Group exported issues by: status, priority, type, assignee, label, or none (overrides recipe view.group_by)")
 	exportIncludeGraph := flag.Bool("export-include-graph", true, "Include dependency context in the report (explicit false overrides recipe)")
 	exportTemplate := flag.String("export-template", "", "Explicitly authorize a Markdown template path; explicit empty disables a recipe template")
 	robotHelp := flag.Bool("robot-help", false, "Show AI agent help")
@@ -1828,27 +1984,14 @@ func main() {
 	}
 	rootCmd := newRootCommand(func() error {
 		if *generateDocs {
-			var sections []docgen.FlagSection
-			for _, s := range rootHelpSections {
-				sections = append(sections, docgen.FlagSection{
-					Title: s.title,
-					Match: s.match,
-				})
-			}
 			if err := docgen.Generate(docgen.GenerateOptions{
 				FlagSet:  flag.CommandLine,
-				Sections: sections,
+				Sections: docgen.DefaultFlagSections(),
 			}); err != nil {
 				return fmt.Errorf("generating docs: %w", err)
 			}
 			return nil
 		}
-
-		// Resolve and pin the color theme before anything renders, so every
-		// adaptive color — package-global styles, per-model renderers, and
-		// glamour markdown — agrees on light vs dark. Precedence:
-		// --theme > BV_THEME > ~/.config/bv/config.yaml > auto-detect. (bv-128)
-		ui.SetThemeOverride(effectiveThemePreference(*themeFlag, flag.CommandLine.Changed("theme"), os.Stderr))
 
 		// Register custom bead ID patterns (--id-pattern, #188) before any
 		// correlation work runs, so every message-based ID matcher (explicit
@@ -1871,6 +2014,7 @@ func main() {
 			{modifier: "trust-hooks", requires: []string{"export", "export-md", "export-pages", "export-graph", "priority-brief", "agent-brief", "pages"}},
 			{modifier: "hook-env", requires: []string{"export", "export-md", "export-pages", "export-graph", "priority-brief", "agent-brief", "pages"}},
 			{modifier: "export-format", requires: []string{"export", "export-md"}},
+			{modifier: "export-group-by", requires: []string{"export", "export-md"}},
 			{modifier: "export-include-graph", requires: []string{"export", "export-md"}},
 			{modifier: "export-template", requires: []string{"export", "export-md"}},
 			{modifier: "robot-diff", requires: []string{"diff-since"}},
@@ -1960,6 +2104,7 @@ func main() {
 		enumRules := []enumFlagRule{
 			{name: "graph-format", allowed: []string{"json", "dot", "mermaid"}},
 			{name: "script-format", allowed: []string{"bash", "fish", "zsh"}},
+			{name: "export-group-by", allowed: []string{"status", "priority", "type", "issue_type", "assignee", "label", "labels", "tag", "tags", "none"}},
 		}
 		primaryRobotCommandGroups := []primaryCommandGroup{
 			{flags: []string{"robot-help"}},
@@ -2145,6 +2290,14 @@ func main() {
 			envRobot = true
 		}
 
+		// Resolve and pin the color theme only in human/TUI/debug-render mode so
+		// an invalid BV_THEME env var or user config never writes warnings to
+		// stderr during pure robot invocations. Precedence:
+		// --theme > BV_THEME > ~/.config/bv/config.yaml > auto-detect. (bv-128)
+		if !envRobot {
+			ui.SetThemeOverride(effectiveThemePreference(*themeFlag, flag.CommandLine.Changed("theme"), os.Stderr))
+		}
+
 		// Structured output format for --robot-* commands.
 		robotOutputFormat = resolveRobotOutputFormat(*outputFormat)
 		robotToonEncodeOptions = resolveToonEncodeOptionsFromEnv()
@@ -2296,6 +2449,7 @@ func main() {
 		agentsAnyAction := *agentsAdd || *agentsRemove || *agentsUpdate || *agentsCheck || *agentsReset
 		agentsAnyFlag := agentsAnyAction || *agentsDryRun || *agentsForce
 		if agentsAnyFlag {
+			agentsRobotMode := robotMode || flag.CommandLine.Changed("format")
 			workDir, err := os.Getwd()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error getting working directory: %v\n", err)
@@ -2322,7 +2476,7 @@ func main() {
 					prefDir = filepath.Dir(detection.FilePath)
 				}
 				if *agentsDryRun {
-					if robotMode {
+					if agentsRobotMode {
 						emitAgentsRobot(map[string]interface{}{
 							"action":   "reset",
 							"dry_run":  true,
@@ -2333,7 +2487,7 @@ func main() {
 					os.Exit(0)
 				}
 				if agents.SavedConfigDisabled() {
-					if robotMode {
+					if agentsRobotMode {
 						emitAgentsRobot(map[string]interface{}{
 							"action":         "reset",
 							"cleared":        false,
@@ -2345,7 +2499,7 @@ func main() {
 					os.Exit(0)
 				}
 				if err := agents.ClearPreference(prefDir); err != nil {
-					if robotMode {
+					if agentsRobotMode {
 						emitAgentsRobot(map[string]interface{}{
 							"action":   "reset",
 							"error":    err.Error(),
@@ -2358,7 +2512,7 @@ func main() {
 				if prefDir != workDir {
 					_ = agents.ClearPreference(workDir)
 				}
-				if robotMode {
+				if agentsRobotMode {
 					emitAgentsRobot(map[string]interface{}{
 						"action":   "reset",
 						"cleared":  true,
@@ -2370,7 +2524,7 @@ func main() {
 			}
 
 			if isCheck || *agentsCheck {
-				if robotMode {
+				if agentsRobotMode {
 					result := map[string]interface{}{
 						"action":                "check",
 						"found":                 detection.Found(),
@@ -2448,14 +2602,19 @@ func main() {
 				}
 				if detection.Found() && detection.NeedsUpgrade() {
 					errOut := os.Stdout
-					if robotMode {
+					if agentsRobotMode {
 						errOut = os.Stderr
 					}
 					fmt.Fprintln(errOut, "Existing blurb found but it needs update or normalization. Use --agents-update instead.")
 					os.Exit(1)
 				}
 				if detection.Found() && detection.HasBlurb && detection.BlurbVersion >= agents.BlurbVersion {
-					if robotMode {
+					prefDir := filepath.Dir(detection.FilePath)
+					_ = agents.RecordAccept(prefDir)
+					if prefDir != workDir {
+						_ = agents.RecordAccept(workDir)
+					}
+					if agentsRobotMode {
 						emitAgentsRobot(map[string]interface{}{
 							"action":           "add",
 							"file_path":        detection.FilePath,
@@ -2478,7 +2637,7 @@ func main() {
 				}
 
 				if *agentsDryRun {
-					if robotMode {
+					if agentsRobotMode {
 						emitAgentsRobot(map[string]interface{}{
 							"action":           "add",
 							"file_path":        targetPath,
@@ -2499,7 +2658,7 @@ func main() {
 					os.Exit(0)
 				}
 
-				if !*agentsForce && !robotMode {
+				if !*agentsForce && !agentsRobotMode {
 					action := "Append blurb to"
 					if creating {
 						action = "Create"
@@ -2519,7 +2678,7 @@ func main() {
 						fmt.Fprintf(os.Stderr, "Error creating agent file: %v\n", err)
 						os.Exit(1)
 					}
-					if !robotMode {
+					if !agentsRobotMode {
 						fmt.Printf("Created %s with beads workflow instructions.\n", targetPath)
 					}
 				} else {
@@ -2527,7 +2686,7 @@ func main() {
 						fmt.Fprintf(os.Stderr, "Error appending blurb: %v\n", err)
 						os.Exit(1)
 					}
-					if !robotMode {
+					if !agentsRobotMode {
 						fmt.Printf("Appended beads workflow instructions to %s.\n", targetPath)
 					}
 				}
@@ -2541,7 +2700,12 @@ func main() {
 					fmt.Fprintf(os.Stderr, "Warning: verification failed — blurb may not have been written correctly.\n")
 					os.Exit(1)
 				}
-				if robotMode {
+				prefDir := filepath.Dir(targetPath)
+				_ = agents.RecordAccept(prefDir)
+				if prefDir != workDir {
+					_ = agents.RecordAccept(workDir)
+				}
+				if agentsRobotMode {
 					emitAgentsRobot(map[string]interface{}{
 						"action":           "add",
 						"file_path":        targetPath,
@@ -2558,7 +2722,7 @@ func main() {
 			if *agentsUpdate {
 				if !detection.Found() {
 					errOut := os.Stdout
-					if robotMode {
+					if agentsRobotMode {
 						errOut = os.Stderr
 					}
 					fmt.Fprintln(errOut, "No agent file found. Use --agents-add to create one.")
@@ -2575,14 +2739,19 @@ func main() {
 				}
 				if !detection.HasBlurb && !detection.HasLegacyBlurb {
 					errOut := os.Stdout
-					if robotMode {
+					if agentsRobotMode {
 						errOut = os.Stderr
 					}
 					fmt.Fprintf(errOut, "%s has no blurb to update. Use --agents-add to add one.\n", detection.FilePath)
 					os.Exit(1)
 				}
 				if !detection.NeedsUpgrade() {
-					if robotMode {
+					prefDir := filepath.Dir(detection.FilePath)
+					_ = agents.RecordAccept(prefDir)
+					if prefDir != workDir {
+						_ = agents.RecordAccept(workDir)
+					}
+					if agentsRobotMode {
 						emitAgentsRobot(map[string]interface{}{
 							"action":           "update",
 							"file_path":        detection.FilePath,
@@ -2597,7 +2766,7 @@ func main() {
 				}
 
 				if *agentsDryRun {
-					if robotMode {
+					if agentsRobotMode {
 						emitAgentsRobot(map[string]interface{}{
 							"action":           "update",
 							"file_path":        detection.FilePath,
@@ -2620,7 +2789,7 @@ func main() {
 					os.Exit(0)
 				}
 
-				if !*agentsForce && !robotMode {
+				if !*agentsForce && !agentsRobotMode {
 					fmt.Printf("Update blurb in %s? [Y/n]: ", detection.FilePath)
 					reader := bufio.NewReader(os.Stdin)
 					response, _ := reader.ReadString('\n')
@@ -2635,7 +2804,7 @@ func main() {
 					fmt.Fprintf(os.Stderr, "Error updating blurb: %v\n", err)
 					os.Exit(1)
 				}
-				if !robotMode {
+				if !agentsRobotMode {
 					fmt.Printf("Updated blurb to v%d in %s.\n", agents.BlurbVersion, detection.FilePath)
 				}
 
@@ -2648,7 +2817,12 @@ func main() {
 					fmt.Fprintf(os.Stderr, "Warning: verification failed — blurb may not have been written correctly.\n")
 					os.Exit(1)
 				}
-				if robotMode {
+				prefDir := filepath.Dir(detection.FilePath)
+				_ = agents.RecordAccept(prefDir)
+				if prefDir != workDir {
+					_ = agents.RecordAccept(workDir)
+				}
+				if agentsRobotMode {
 					emitAgentsRobot(map[string]interface{}{
 						"action":           "update",
 						"file_path":        detection.FilePath,
@@ -2663,7 +2837,7 @@ func main() {
 
 			if *agentsRemove {
 				if !detection.Found() {
-					if robotMode {
+					if agentsRobotMode {
 						emitAgentsRobot(map[string]interface{}{
 							"action":           "remove",
 							"file_path":        "",
@@ -2686,7 +2860,7 @@ func main() {
 					os.Exit(1)
 				}
 				if !detection.HasBlurb && !detection.HasLegacyBlurb {
-					if robotMode {
+					if agentsRobotMode {
 						emitAgentsRobot(map[string]interface{}{
 							"action":           "remove",
 							"file_path":        detection.FilePath,
@@ -2701,7 +2875,7 @@ func main() {
 				}
 
 				if *agentsDryRun {
-					if robotMode {
+					if agentsRobotMode {
 						emitAgentsRobot(map[string]interface{}{
 							"action":           "remove",
 							"file_path":        detection.FilePath,
@@ -2716,7 +2890,7 @@ func main() {
 					os.Exit(0)
 				}
 
-				if !*agentsForce && !robotMode {
+				if !*agentsForce && !agentsRobotMode {
 					fmt.Printf("Remove blurb from %s? [Y/n]: ", detection.FilePath)
 					reader := bufio.NewReader(os.Stdin)
 					response, _ := reader.ReadString('\n')
@@ -2731,7 +2905,12 @@ func main() {
 					fmt.Fprintf(os.Stderr, "Error removing blurb: %v\n", err)
 					os.Exit(1)
 				}
-				if robotMode {
+				prefDir := filepath.Dir(detection.FilePath)
+				_ = agents.RecordDecline(prefDir, true)
+				if prefDir != workDir {
+					_ = agents.RecordDecline(workDir, true)
+				}
+				if agentsRobotMode {
 					emitAgentsRobot(map[string]interface{}{
 						"action":           "remove",
 						"file_path":        detection.FilePath,
@@ -2908,6 +3087,9 @@ func main() {
 				an := analysis.NewAnalyzer(issues)
 				an.SetNow(robotNow())
 				an.SetReadinessScope(model.NewReadinessIndex(authorityIssues), nil)
+				if feedback.Applies() {
+					an.SetWeights(feedback.Weights())
+				}
 				if *forceFullAnalysis {
 					fullCfg := analysis.FullAnalysisConfig()
 					an.SetConfig(&fullCfg)
@@ -3024,6 +3206,7 @@ func main() {
 		var beadsPath string
 		var workspaceInfo *workspace.LoadSummary
 		var asOfResolved string // Resolved commit SHA when using --as-of (for robot output metadata)
+		var asOfCommitTime time.Time
 		var sourceTombstoneIDs []string
 		var singleSourceLoad datasource.LoadResult
 		var sourceAuthority *RobotSourceAuthority
@@ -3060,6 +3243,7 @@ func main() {
 				unfilteredDataHash = historicalSource.DataHash
 			}
 			asOfResolved = historical.CommitSHA
+			asOfCommitTime = historical.CommitTime
 			// No live reload for historical view
 			beadsPath = ""
 			if !envRobot {
@@ -3181,6 +3365,8 @@ func main() {
 		robotDispatchContext.DataHash = unfilteredDataHash
 		robotDispatchContext.AsOf = *asOf
 		robotDispatchContext.AsOfCommit = asOfResolved
+		robotDispatchContext.AsOfCommitTime = asOfCommitTime
+		robotDispatchContext.ForecastSprint = *forecastSprint
 		robotDispatchContext.LabelScope = *labelScope
 		robotDispatchContext.Recipe = *recipeName
 		robotDispatchContext.Repo = *repoFilter
@@ -3250,9 +3436,36 @@ func main() {
 				os.Exit(1)
 			}
 
-			indexPath := search.DefaultIndexPath(projectDir, embedCfg)
+			searchScopeKey := ""
+			switch {
+			case *asOf != "" || asOfResolved != "":
+				// Scoped below to a dedicated historical-* cache file so live .bvvi is never touched.
+			case *workspaceConfig != "":
+				absWS := *workspaceConfig
+				if resolvedWS, absErr := filepath.Abs(absWS); absErr == nil {
+					absWS = resolvedWS
+				}
+				searchScopeKey = "workspace:" + filepath.Clean(absWS)
+			case *dbPath != "" || strings.TrimSpace(env.BeadsDB.Get()) != "":
+				absSrc := robotDispatchContext.SourcePath
+				if absSrc == "" {
+					absSrc = *dbPath
+				}
+				if absSrc == "" {
+					absSrc = strings.TrimSpace(env.BeadsDB.Get())
+				}
+				if resolvedSrc, absErr := filepath.Abs(absSrc); absErr == nil {
+					absSrc = resolvedSrc
+				}
+				searchScopeKey = "db:" + filepath.Clean(absSrc)
+			}
+
+			indexPath := search.IndexPathForScope(projectDir, embedCfg, searchScopeKey)
 			if asOfResolved != "" {
 				indexPath = filepath.Join(filepath.Dir(indexPath), "historical-"+asOfResolved+"-"+filepath.Base(indexPath))
+			} else if *asOf != "" {
+				scopedHist := search.IndexPathForScope(projectDir, embedCfg, "historical:"+*asOf)
+				indexPath = filepath.Join(filepath.Dir(scopedHist), "historical-"+filepath.Base(scopedHist))
 			}
 			idx, loaded, err := search.LoadOrNewVectorIndex(indexPath, embedder.Dim())
 			if err != nil {
@@ -3359,7 +3572,7 @@ func main() {
 					os.Exit(1)
 				}
 
-				referenceTime := robotNow()
+				referenceTime := robotDispatchContext.ReferenceNow()
 				rankingTime = &referenceTime
 				scorer := search.NewHybridScorerAt(weights, cache, referenceTime)
 				hybridResults, err = buildHybridScores(results, scorer)
@@ -3497,11 +3710,12 @@ func main() {
 
 				// Each watch iteration reloads and verifies the same user-supplied
 				// digest before executing either phase or writing the bundle.
+				exportNow := exportContext.ReferenceNow()
 				pagesExecutor, err := hooks.RunHooks(projectDir, hooks.ExportContext{
 					ExportPath:   *exportPages,
 					ExportFormat: "html",
 					IssueCount:   len(exportIssues),
-					Timestamp:    time.Now(),
+					Timestamp:    exportNow,
 				}, *noHooks, hookOptions)
 				if err != nil {
 					return err
@@ -3523,8 +3737,11 @@ func main() {
 				// Build graph and compute stats
 				fmt.Println("  → Running graph analysis...")
 				analyzer := analysis.NewAnalyzer(exportIssues)
-				analyzer.SetNow(robotNow())
+				analyzer.SetNow(exportNow)
 				analyzer.SetReadinessScope(exportContext.Readiness, exportContext.CandidateIDs)
+				if exportContext.RecipeUnblockIDs != nil {
+					analyzer.SetUnblockScope(exportContext.RecipeUnblockIDs)
+				}
 				var stats *analysis.GraphStats
 				if *forceFullAnalysis {
 					fullCfg := analysis.FullAnalysisConfig()
@@ -3542,16 +3759,29 @@ func main() {
 					HistoryTimeoutMs: robotHistoryTimeoutMs,
 				})
 				_, exportFeedbackWeights := loadRobotFeedbackForContext(exportContext)
-				triage := analysis.ComputeTriageWithOptionsAndTime(exportIssues, analysis.TriageOptions{
+				triageInputIssues := exportIssues
+				triageCandidates := exportContext.CandidateIDs
+				if exportContext.ActiveRecipe != nil && len(exportIssues) > 0 {
+					triageInputIssues = exportContext.GraphIssues()
+					triageCandidates = make(map[string]bool, len(exportIssues))
+					for _, iss := range exportIssues {
+						if exportContext.CandidateIDs == nil || exportContext.CandidateIDs[iss.ID] {
+							triageCandidates[iss.ID] = true
+						}
+					}
+				}
+				triage := analysis.ComputeTriageWithOptionsAndTime(triageInputIssues, analysis.TriageOptions{
 					WaitForPhase2:     true,
 					ActionableOnly:    !*robotIncludeInactive,
 					Readiness:         exportContext.Readiness,
-					CandidateIDs:      exportContext.CandidateIDs,
+					CandidateIDs:      triageCandidates,
+					UnblockIDs:        exportContext.RecipeUnblockIDs,
+					VelocityIssues:    exportContext.VelocityIssues(),
 					History:           triageHistory,
 					ForceFullAnalysis: *forceFullAnalysis,
 					NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
 					Weights:           exportFeedbackWeights,
-				}, robotNow())
+				}, exportNow)
 				triage.Meta.HistoryStatus = triageHistoryStatus
 				if !exportContext.claimsProven() {
 					suppressUnprovenTriageClaims(&triage)
@@ -3582,7 +3812,7 @@ func main() {
 				}
 				exporter := export.NewSQLiteExporter(issuePointers, deps, stats, &triage)
 				exporter.Config.Readiness = exportContext.Readiness
-				exporter.Config.ReadinessAt = robotNow()
+				exporter.Config.ReadinessAt = exportNow
 				envelope, err := withEnvelope(exportContext.Envelope(), struct{}{})
 				if err != nil {
 					return fmt.Errorf("encoding export source authority: %w", err)
@@ -3967,11 +4197,12 @@ func main() {
 			if *exportGraph == "html" || *exportGraph == "interactive" {
 				resolvedGraphExportPath = export.GenerateInteractiveGraphFilename(projectName)
 			}
+			graphExportNow := robotDispatchContext.ReferenceNow()
 			graphHookExecutor, hookErr := hooks.RunHooks(projectDir, hooks.ExportContext{
 				ExportPath:   resolvedGraphExportPath,
 				ExportFormat: graphFormatName,
 				IssueCount:   len(exportIssues),
-				Timestamp:    robotNow(),
+				Timestamp:    graphExportNow,
 			}, *noHooks, hookOptions)
 			if hookErr != nil {
 				return hookErr
@@ -3999,8 +4230,11 @@ func main() {
 			}
 
 			analyzer := analysis.NewAnalyzer(exportIssues)
-			analyzer.SetNow(robotNow())
+			analyzer.SetNow(graphExportNow)
 			analyzer.SetReadinessScope(robotDispatchContext.Readiness, robotDispatchContext.CandidateIDs)
+			if robotDispatchContext.RecipeUnblockIDs != nil {
+				analyzer.SetUnblockScope(robotDispatchContext.RecipeUnblockIDs)
+			}
 			if *forceFullAnalysis {
 				cfg := analysis.FullAnalysisConfig()
 				analyzer.SetConfig(&cfg)
@@ -4039,12 +4273,14 @@ func main() {
 					ActionableOnly:    !*robotIncludeInactive,
 					Readiness:         robotDispatchContext.Readiness,
 					CandidateIDs:      robotDispatchContext.CandidateIDs,
+					UnblockIDs:        robotDispatchContext.RecipeUnblockIDs,
+					VelocityIssues:    robotDispatchContext.VelocityIssues(),
 					History:           historyReport,
 					ForceFullAnalysis: *forceFullAnalysis,
 					NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
 					Weights:           graphFeedbackWeights,
 				}
-				triage := analysis.ComputeTriageWithOptionsAndTime(exportIssues, triageOpts, robotNow())
+				triage := analysis.ComputeTriageWithOptionsAndTime(robotDispatchContext.GraphIssues(), triageOpts, graphExportNow)
 				if !robotDispatchContext.claimsProven() {
 					suppressUnprovenTriageClaims(&triage)
 				}
@@ -4111,9 +4347,8 @@ func main() {
 
 		// Handle --save-baseline
 		if *saveBaseline != "" {
-			analyzer := analysis.NewAnalyzer(issues)
-			analyzer.SetNow(robotNow())
-			analyzer.SetReadinessScope(robotDispatchContext.Readiness, robotDispatchContext.CandidateIDs)
+			baselineIssues := robotDispatchContext.GraphIssues()
+			analyzer := robotDispatchContext.GraphAnalyzer()
 			if *forceFullAnalysis {
 				cfg := analysis.FullAnalysisConfig()
 				analyzer.SetConfig(&cfg)
@@ -4123,7 +4358,7 @@ func main() {
 			// Compute dependency-aware status counts from candidate issues
 			partition := analyzer.CountStatusPartition()
 			openCount := 0
-			for _, issue := range issues {
+			for _, issue := range baselineIssues {
 				if !analyzer.IsCandidate(issue.ID) {
 					continue
 				}
@@ -4189,10 +4424,10 @@ func main() {
 			// Run analysis on current issues. Use one captured instant throughout
 			// the snapshot and drift calculation so SOURCE_DATE_EPOCH controls
 			// nested scoring values as well as the output envelope.
-			driftNow := robotNow()
-			analyzer := analysis.NewAnalyzer(issues)
+			driftNow := robotDispatchContext.ReferenceNow()
+			driftIssues := robotDispatchContext.GraphIssues()
+			analyzer := robotDispatchContext.GraphAnalyzer()
 			analyzer.SetNow(driftNow)
-			analyzer.SetReadinessScope(robotDispatchContext.Readiness, robotDispatchContext.CandidateIDs)
 			if *forceFullAnalysis {
 				cfg := analysis.FullAnalysisConfig()
 				analyzer.SetConfig(&cfg)
@@ -4201,7 +4436,7 @@ func main() {
 
 			partition := analyzer.CountStatusPartition()
 			openCount := 0
-			for _, issue := range issues {
+			for _, issue := range driftIssues {
 				if !analyzer.IsCandidate(issue.ID) {
 					continue
 				}
@@ -4242,7 +4477,7 @@ func main() {
 
 			calc := drift.NewCalculator(bl, current, driftConfig)
 			calc.SetNow(driftNow)
-			calc.SetIssues(issues)
+			calc.SetIssues(driftIssues)
 			_ = calc.ReuseAnalyzer(analyzer)
 			attachSourceDiffsForContext(calc, robotDispatchContext, driftConfig.SourceDriftMaxAlerts)
 			result := calc.Calculate()
@@ -4267,16 +4502,19 @@ func main() {
 				HistoryLimit:     historyLimit,
 				HistoryTimeoutMs: robotHistoryTimeoutMs,
 			})
-			triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
+			scriptNow := robotDispatchContext.ReferenceNow()
+			triage := analysis.ComputeTriageWithOptionsAndTime(robotDispatchContext.GraphIssues(), analysis.TriageOptions{
 				WaitForPhase2:     true,
 				ActionableOnly:    !*robotIncludeInactive,
 				Readiness:         readiness,
 				CandidateIDs:      candidateIDs,
+				UnblockIDs:        robotDispatchContext.RecipeUnblockIDs,
+				VelocityIssues:    robotDispatchContext.VelocityIssues(),
 				History:           scriptHistory,
 				ForceFullAnalysis: *forceFullAnalysis,
 				NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
 				Weights:           scriptFeedbackWeights,
-			}, robotNow())
+			}, scriptNow)
 			triage.Meta.HistoryStatus = scriptHistoryStatus
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
@@ -4309,7 +4547,7 @@ func main() {
 				sb.WriteString("set -euo pipefail\n")
 			}
 
-			sb.WriteString(fmt.Sprintf("# Generated by bv --emit-script at %s\n", robotNow().Format(time.RFC3339)))
+			sb.WriteString(fmt.Sprintf("# Generated by bv --emit-script at %s\n", scriptNow.Format(time.RFC3339)))
 			sb.WriteString(fmt.Sprintf("# Data hash: %s\n", dataHash))
 			authorityJSON, err := json.Marshal(sourceAuthority)
 			if err != nil {
@@ -4390,11 +4628,12 @@ func main() {
 
 		// Handle --priority-brief flag (bv-96)
 		if *priorityBrief != "" {
+			briefNow := robotDispatchContext.ReferenceNow()
 			briefHookExecutor, hookErr := hooks.RunHooks(projectDir, hooks.ExportContext{
 				ExportPath:   *priorityBrief,
 				ExportFormat: "markdown",
 				IssueCount:   len(issues),
-				Timestamp:    robotNow(),
+				Timestamp:    briefNow,
 			}, *noHooks, hookOptions)
 			if hookErr != nil {
 				return hookErr
@@ -4413,16 +4652,18 @@ func main() {
 				HistoryLimit:     historyLimit,
 				HistoryTimeoutMs: robotHistoryTimeoutMs,
 			})
-			triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
+			triage := analysis.ComputeTriageWithOptionsAndTime(robotDispatchContext.GraphIssues(), analysis.TriageOptions{
 				WaitForPhase2:     true,
 				ActionableOnly:    !*robotIncludeInactive,
 				Readiness:         readiness,
 				CandidateIDs:      candidateIDs,
+				UnblockIDs:        robotDispatchContext.RecipeUnblockIDs,
+				VelocityIssues:    robotDispatchContext.VelocityIssues(),
 				History:           briefHistory,
 				ForceFullAnalysis: *forceFullAnalysis,
 				NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
 				Weights:           briefFeedbackWeights,
-			}, robotNow())
+			}, briefNow)
 			triage.Meta.HistoryStatus = briefHistoryStatus
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
@@ -4482,11 +4723,12 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error creating directory: refusing symlink output directory %s\n", *agentBrief)
 				os.Exit(1)
 			}
+			agentBriefNow := robotDispatchContext.ReferenceNow()
 			agentHookExecutor, hookErr := hooks.RunHooks(projectDir, hooks.ExportContext{
 				ExportPath:   *agentBrief,
 				ExportFormat: "bundle",
 				IssueCount:   len(issues),
-				Timestamp:    robotNow(),
+				Timestamp:    agentBriefNow,
 			}, *noHooks, hookOptions)
 			if hookErr != nil {
 				return hookErr
@@ -4513,16 +4755,18 @@ func main() {
 				HistoryLimit:     historyLimit,
 				HistoryTimeoutMs: robotHistoryTimeoutMs,
 			})
-			triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{
+			triage := analysis.ComputeTriageWithOptionsAndTime(robotDispatchContext.GraphIssues(), analysis.TriageOptions{
 				WaitForPhase2:     true,
 				ActionableOnly:    !*robotIncludeInactive,
 				Readiness:         readiness,
 				CandidateIDs:      candidateIDs,
+				UnblockIDs:        robotDispatchContext.RecipeUnblockIDs,
+				VelocityIssues:    robotDispatchContext.VelocityIssues(),
 				History:           agentHistory,
 				ForceFullAnalysis: *forceFullAnalysis,
 				NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
 				Weights:           agentFeedbackWeights,
-			}, robotNow())
+			}, agentBriefNow)
 			triage.Meta.HistoryStatus = agentHistoryStatus
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
@@ -4744,9 +4988,9 @@ func main() {
 				}
 			}
 
-			// Create snapshots (honoring historical CommitTime, SOURCE_DATE_EPOCH via robotNow(), and --force-full-analysis)
+			// Create snapshots (honoring historical CommitTime, ReferenceNow(), and --force-full-analysis)
 			fromSnapshot := newScopedSnapshotForCLI(fromIssues, historicalCtx.Readiness, nil, histReport.CommitTime, revision, *forceFullAnalysis)
-			toSnapshot := newScopedSnapshotForCLI(toIssues, readiness, nil, robotNow(), "HEAD", *forceFullAnalysis)
+			toSnapshot := newScopedSnapshotForCLI(toIssues, readiness, nil, robotDispatchContext.ReferenceNow(), "HEAD", *forceFullAnalysis)
 
 			// Compute diff
 			diff := analysis.CompareSnapshots(fromSnapshot, toSnapshot)
@@ -4786,7 +5030,7 @@ func main() {
 				fmt.Println(output)
 				os.Exit(0)
 			}
-			if err := runTUIProgram(m); err != nil {
+			if err := runTUIProgram(m, nil); err != nil {
 				fmt.Printf("Error running beads viewer: %v\n", err)
 				os.Exit(1)
 			}
@@ -4812,6 +5056,9 @@ func main() {
 			if flag.CommandLine.Changed("export-template") {
 				overrides.Template = exportTemplate
 			}
+			if flag.CommandLine.Changed("export-group-by") {
+				overrides.GroupBy = exportGroupBy
+			}
 			if *exportFile != "" {
 				reportPath = *exportFile
 				if !flag.CommandLine.Changed("export-format") {
@@ -4825,10 +5072,42 @@ func main() {
 			}
 			if activeRecipe != nil {
 				options.View = activeRecipe.View
+				if len(activeRecipe.Metrics) > 0 {
+					options.Metrics = append([]string(nil), activeRecipe.Metrics...)
+				}
 			}
-			options.GeneratedAt = robotNow()
+			options.GeneratedAt = robotDispatchContext.ReferenceNow()
 			options.Readiness = readiness
 			options.AuthorityComplete = robotDispatchContext.claimsProven() && *asOf == ""
+			needsReportStats := options.IncludeGraph || len(options.Metrics) > 0 || options.View.ShowMetrics
+			if !needsReportStats {
+				for _, col := range options.View.Columns {
+					switch strings.ToLower(strings.TrimSpace(col)) {
+					case "pagerank", "page_rank", "pr", "betweenness", "bw", "eigenvector", "eigen",
+						"hubs", "hub", "authorities", "authority", "auth",
+						"critical_path", "critical_path_score", "criticalpath", "critical",
+						"in_degree", "indegree", "out_degree", "outdegree",
+						"slack", "kcore", "core_number", "k_core", "impact", "triage", "triage_score":
+						needsReportStats = true
+					}
+				}
+			}
+			if needsReportStats && len(issuesForSearch) > 0 {
+				reportAnalyzer := analysis.NewAnalyzer(issuesForSearch)
+				reportAnalyzer.SetNow(options.GeneratedAt)
+				reportAnalyzer.SetReadinessScope(readiness, candidateIDs)
+				if *forceFullAnalysis {
+					fullCfg := analysis.FullAnalysisConfig()
+					reportAnalyzer.SetConfig(&fullCfg)
+					stats := reportAnalyzer.AnalyzeAsyncWithConfig(context.Background(), fullCfg)
+					stats.WaitForPhase2()
+					options.GraphStats = stats
+				} else {
+					stats := reportAnalyzer.AnalyzeAsync(context.Background())
+					stats.WaitForPhase2()
+					options.GraphStats = stats
+				}
+			}
 			envelope := robotDispatchContext.Envelope()
 			options.SourceAuthority = envelope.SourceAuthority
 			options.AuthorityHash = envelope.AuthorityHash
@@ -4935,6 +5214,7 @@ func main() {
 		boundSourceDegraded := workspaceInfo == nil && *asOf == "" &&
 			(singleSourceLoad.Report.Stale || len(singleSourceLoad.Report.AuthorityWarnings) > 0 ||
 				(!robotDispatchContext.claimsProven() && singleSourceLoad.Report.Errors == 0 && singleSourceLoad.Report.ReadErrors == 0))
+		explicitDBPinned := *dbPath != "" || strings.TrimSpace(env.BeadsDB.Get()) != ""
 
 		// Initial Model with live reload support
 		m := ui.NewModel(issues, activeRecipe, beadsPath, ui.ReadinessScope{
@@ -4942,11 +5222,16 @@ func main() {
 			CandidateIDs:        candidateIDs,
 			AuthorityIncomplete: !robotDispatchContext.claimsProven() || *asOf != "",
 			SourceDegraded:      boundSourceDegraded,
+			ExplicitDB:          explicitDBPinned,
 		})
 		if projectDir != "" {
 			m.SetWorkDir(projectDir)
 		}
 		defer m.Stop() // Clean up file watcher
+
+		var externalReloadCh <-chan struct{}
+		stopExternalWatchers := func() {}
+		defer func() { stopExternalWatchers() }()
 
 		// Enable workspace mode if loading from workspace config
 		if workspaceInfo != nil {
@@ -4965,12 +5250,26 @@ func main() {
 				}
 				return reloadWorkspaceForUI(ctx, reloadPath, reloadLabel, reloadRepo)
 			})
-		} else if beadsPath != "" && (*labelScope != "" || *repoFilter != "") {
+			externalReloadCh, stopExternalWatchers = startExternalTUIWatchers(tuiWorkspaceWatchPaths(robotDispatchContext, *workspaceConfig), "")
+		} else if beadsPath != "" {
 			boundSource := singleSourceLoad.Source
 			reloadLabel, reloadRepo := *labelScope, *repoFilter
-			m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
-				return reloadSingleRepoForUIWithDegraded(ctx, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
-			})
+			bgModeVal := strings.ToLower(strings.TrimSpace(env.BackgroundMode.Get()))
+			bgEnabled := bgModeVal == "1" || bgModeVal == "true" || bgModeVal == "yes" || bgModeVal == "on"
+			if !explicitDBPinned && !bgEnabled {
+				reloadDir := projectDir
+				m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
+					return reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+				})
+				externalReloadCh, stopExternalWatchers = startExternalTUIWatchers(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, beadsPath), "")
+				if externalReloadCh != nil {
+					m.DisableInternalWatcher()
+				}
+			} else if *labelScope != "" || *repoFilter != "" {
+				m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
+					return reloadSingleRepoForUIWithDegraded(ctx, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+				})
+			}
 		}
 
 		// Debug render mode - output a view to file and exit
@@ -4981,7 +5280,7 @@ func main() {
 		}
 
 		// Run Program
-		if err := runTUIProgram(m); err != nil {
+		if err := runTUIProgram(m, externalReloadCh); err != nil {
 			fmt.Printf("Error running beads viewer: %v\n", err)
 			os.Exit(1)
 		}
@@ -4992,7 +5291,8 @@ func main() {
 	rootCmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
 		return enrichFlagParseError(err, cmd.Flags(), originalArgs)
 	})
-	normalizedArgs := rewriteAgentIntentArgs(originalArgs)
+	singleDashNormalized := rewriteSingleDashLongFlags(originalArgs, rootCmd.Flags())
+	normalizedArgs := rewriteAgentIntentArgs(singleDashNormalized)
 	rootCmd.SetArgs(rewriteSingleDashLongFlags(normalizedArgs, rootCmd.Flags()))
 
 	if err := rootCmd.Execute(); err != nil {
@@ -5001,7 +5301,7 @@ func main() {
 	}
 }
 
-func runTUIProgram(m *ui.Model) error {
+func runTUIProgram(m *ui.Model, externalReloadCh <-chan struct{}) error {
 	p := tea.NewProgram(
 		m,
 		tea.WithAltScreen(),
@@ -5011,6 +5311,22 @@ func runTUIProgram(m *ui.Model) error {
 
 	runDone := make(chan struct{})
 	defer close(runDone)
+
+	if externalReloadCh != nil {
+		go func() {
+			for {
+				select {
+				case <-runDone:
+					return
+				case _, ok := <-externalReloadCh:
+					if !ok {
+						return
+					}
+					p.Send(ui.FileChangedMsg{})
+				}
+			}
+		}()
+	}
 
 	// Graceful shutdown on SIGINT/SIGTERM (bv-bzt8).
 	sigCh := make(chan os.Signal, 2)
@@ -5322,6 +5638,9 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 	ctx.FullIssues = fullSource
 	ctx.ActiveRecipe = r
 	ctx.CandidateIDs = nil
+	ctx.RecipeUnblockIDs = nil
+	ctx.RecipeVelocityIssues = nil
+	ctx.HasRecipeVelocityScope = false
 	ctx.LabelContext = nil
 	if ctx.Repo != "" {
 		ctx.Issues = filterByRepo(ctx.Issues, ctx.Repo)
@@ -5339,9 +5658,15 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 	if ctx.LabelScope != "" {
 		sg := analysis.ComputeLabelSubgraph(ctx.Issues, ctx.LabelScope)
 		ctx.CandidateIDs = make(map[string]bool, len(sg.CoreIssues))
+		coreVelocity := make([]model.Issue, 0, len(sg.CoreIssues))
 		for _, id := range sg.CoreIssues {
 			ctx.CandidateIDs[id] = true
+			if issue, ok := sg.IssueMap[id]; ok {
+				coreVelocity = append(coreVelocity, issue)
+			}
 		}
+		ctx.RecipeVelocityIssues = coreVelocity
+		ctx.HasRecipeVelocityScope = true
 		// Label neighbors remain analysis context, not work candidates. An
 		// unmatched label is an empty selection with its source envelope intact.
 		ctx.Issues = make([]model.Issue, 0, len(sg.AllIssues))
@@ -5352,6 +5677,7 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 		}
 		ctx.DataHashMatchesIssues = false
 	}
+	ctx.PreRecipeIssues = append([]model.Issue(nil), ctx.Issues...)
 	if r != nil {
 		metrics := recipeMetricsForContext(ctx, fullSource, r)
 		metrics.Readiness = ctx.Readiness
@@ -5364,7 +5690,7 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 				}
 			}
 		}
-		applied, err := recipe.Apply(recipeIssues, metrics, r, robotNow())
+		applied, err := recipe.Apply(recipeIssues, metrics, r, ctx.ReferenceNow())
 		if err != nil {
 			return RobotContext{}, fmt.Errorf("recipe %s: %w", r.Name, err)
 		}
@@ -5374,7 +5700,45 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 				nextCandidates[iss.ID] = true
 			}
 		}
+		unblockRecipe := recipe.Recipe{
+			Name: r.Name,
+			Filters: recipe.FilterConfig{
+				Tags:        r.Filters.Tags,
+				ExcludeTags: r.Filters.ExcludeTags,
+				IDPrefix:    r.Filters.IDPrefix,
+			},
+		}
+		unblockIssues, uErr := recipe.Apply(recipeIssues, recipe.Metrics{}, &unblockRecipe, ctx.ReferenceNow())
+		if uErr != nil {
+			unblockIssues = recipeIssues
+		}
+		unblockIDs := make(map[string]bool, len(unblockIssues))
+		for _, iss := range unblockIssues {
+			unblockIDs[iss.ID] = true
+		}
+		for id := range nextCandidates {
+			unblockIDs[id] = true
+		}
+
+		velFilters := r.Filters
+		velFilters.Status = nil
+		velFilters.Actionable = nil
+		velFilters.HasBlockers = nil
+		velFilters.UpdatedAfter = ""
+		velFilters.UpdatedBefore = ""
+		velRecipe := recipe.Recipe{
+			Name:    r.Name,
+			Filters: velFilters,
+		}
+		velIssues, vErr := recipe.Apply(recipeIssues, recipe.Metrics{}, &velRecipe, ctx.ReferenceNow())
+		if vErr != nil {
+			velIssues = recipeIssues
+		}
+
 		ctx.CandidateIDs = nextCandidates
+		ctx.RecipeUnblockIDs = unblockIDs
+		ctx.RecipeVelocityIssues = velIssues
+		ctx.HasRecipeVelocityScope = true
 		ctx.Issues = applied
 		ctx.DataHashMatchesIssues = false
 	}
@@ -5385,7 +5749,7 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 		if ctx.Repo != "" {
 			labelBaseIssues = filterByRepo(fullSource, ctx.Repo)
 		}
-		allHealth := analysis.ComputeAllLabelHealthWithScope(labelBaseIssues, analysis.DefaultLabelHealthConfig(), robotNow(), nil, ctx.Readiness, ctx.CandidateIDs)
+		allHealth := analysis.ComputeAllLabelHealthWithScope(labelBaseIssues, analysis.DefaultLabelHealthConfig(), ctx.ReferenceNow(), nil, ctx.Readiness, ctx.CandidateIDs)
 		for i := range allHealth.Labels {
 			if allHealth.Labels[i].Label == ctx.LabelScope {
 				ctx.LabelContext = &allHealth.Labels[i]
@@ -5489,6 +5853,123 @@ func newScopedSnapshotForCLI(issues []model.Issue, readiness *model.ReadinessInd
 	return snap
 }
 
+func reloadSingleRepoAutoDiscoverForUI(ctx context.Context, projectDir string, fallbackSource datasource.DataSource, fallbackDegraded bool, label, repo string) (ui.SourceReloadResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ui.SourceReloadResult{}, err
+	}
+	loaded, err := datasource.LoadIssuesSilent(projectDir)
+	if err != nil {
+		if fallbackSource.Path != "" {
+			return reloadSingleRepoForUIWithDegraded(ctx, fallbackSource, fallbackDegraded, label, repo)
+		}
+		return ui.SourceReloadResult{}, fmt.Errorf("reload beads source: %w", err)
+	}
+	degraded := loaded.Report.Stale || len(loaded.Report.AuthorityWarnings) > 0
+	return buildSingleRepoReloadResult(ctx, loaded, degraded, label, repo)
+}
+
+func tuiWorkspaceWatchPaths(ctx RobotContext, workspaceConfigPath string) []string {
+	var paths []string
+	if workspaceConfigPath != "" {
+		paths = append(paths, workspaceConfigPath)
+	}
+	if ctx.SourceAuthority != nil {
+		for _, source := range ctx.SourceAuthority.Sources {
+			if source.Status == "disabled" {
+				continue
+			}
+			paths = append(paths, source.WatchPaths...)
+			if source.Status == "loaded" && source.SourcePath != "" {
+				paths = append(paths, source.SourcePath)
+			}
+		}
+	}
+	return paths
+}
+
+func tuiSingleRepoSiblingWatchPaths(ctx RobotContext, primaryPath string) []string {
+	var paths []string
+	if ctx.SourceAuthority != nil {
+		for _, source := range ctx.SourceAuthority.Sources {
+			paths = append(paths, source.WatchPaths...)
+		}
+	}
+	if primaryPath != "" {
+		beadsDir := filepath.Dir(primaryPath)
+		paths = append(paths,
+			primaryPath,
+			filepath.Join(beadsDir, "beads.db"),
+			filepath.Join(beadsDir, "issues.jsonl"),
+			filepath.Join(beadsDir, "beads.jsonl"),
+		)
+	}
+	return paths
+}
+
+func startExternalTUIWatchers(paths []string, skipPath string) (<-chan struct{}, func()) {
+	var skipAbs string
+	if skipPath != "" {
+		if abs, err := filepath.Abs(skipPath); err == nil {
+			skipAbs = abs
+		}
+	}
+	seen := make(map[string]bool, len(paths))
+	var unique []string
+	for _, raw := range paths {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		abs, err := filepath.Abs(raw)
+		if err != nil {
+			continue
+		}
+		if skipAbs != "" && abs == skipAbs {
+			continue
+		}
+		if !seen[abs] {
+			seen[abs] = true
+			unique = append(unique, abs)
+		}
+	}
+	if len(unique) == 0 {
+		return nil, func() {}
+	}
+	changeCh := make(chan struct{}, 1)
+	notify := func() {
+		select {
+		case changeCh <- struct{}{}:
+		default:
+		}
+	}
+	var watchers []*watcher.Watcher
+	for _, path := range unique {
+		w, err := watcher.NewWatcher(path,
+			watcher.WithDebounceDuration(200*time.Millisecond),
+			watcher.WithOnChange(notify),
+			watcher.WithOnError(func(error) { notify() }),
+		)
+		if err != nil {
+			continue
+		}
+		if err := w.Start(); err != nil {
+			continue
+		}
+		watchers = append(watchers, w)
+	}
+	if len(watchers) == 0 {
+		return nil, func() {}
+	}
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			for _, w := range watchers {
+				w.Stop()
+			}
+		})
+	}
+	return changeCh, stop
+}
+
 func reloadSingleRepoForUI(ctx context.Context, source datasource.DataSource, label, repo string) (ui.SourceReloadResult, error) {
 	return reloadSingleRepoForUIWithDegraded(ctx, source, false, label, repo)
 }
@@ -5502,10 +5983,14 @@ func reloadSingleRepoForUIWithDegraded(ctx context.Context, source datasource.Da
 			return ui.SourceReloadResult{}, fmt.Errorf("reload beads source: %w", err)
 		}
 	}
-	loaded, err := datasource.LoadFromSource(source)
+	loaded, err := datasource.LoadFromSourceSilent(source)
 	if err != nil {
 		return ui.SourceReloadResult{}, fmt.Errorf("reload beads source: %w", err)
 	}
+	return buildSingleRepoReloadResult(ctx, loaded, sourceDegraded, label, repo)
+}
+
+func buildSingleRepoReloadResult(ctx context.Context, loaded datasource.LoadResult, sourceDegraded bool, label, repo string) (ui.SourceReloadResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ui.SourceReloadResult{}, err
 	}
@@ -5543,6 +6028,8 @@ func reloadSingleRepoForUIWithDegraded(ctx context.Context, source datasource.Da
 		CandidateIDs:        scoped.CandidateIDs,
 		Warnings:            warnings,
 		AuthorityIncomplete: !claimSafe,
+		SourcePath:          loaded.Source.Path,
+		SourceDegraded:      sourceDegraded,
 	}, nil
 }
 
@@ -5569,7 +6056,7 @@ func recipeMetricsForContext(ctx RobotContext, issues []model.Issue, r *recipe.R
 	if r == nil || (!r.NeedsGraphMetrics() && !r.NeedsTriageScores()) {
 		return metrics
 	}
-	now := robotNow()
+	now := ctx.ReferenceNow()
 	analyzer := analysis.NewAnalyzer(issues)
 	analyzer.SetNow(now)
 	if ctx.Readiness != nil {
@@ -5957,12 +6444,12 @@ func copyViewerAssets(bundle *export.Bundle, title string) error {
 func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string) error {
 	// First try to use embedded assets (production builds)
 	if export.HasEmbeddedAssets() {
-		if err := bundle.CopyEmbeddedAssetsWithSubtitle(title, subtitle); err != nil {
+		// Prepare optional hybrid WASM assets before CopyEmbeddedAssetsWithSubtitle
+		// binds coi-serviceworker.js's OFFLINE_ASSETS manifest.
+		if err := maybeBuildHybridWasmAssets(bundle); err != nil {
 			return err
 		}
-		// The optional hybrid scorer is built from source straight into the
-		// bundle so BV_BUILD_HYBRID_WASM works in the released binary too.
-		return maybeBuildHybridWasmAssets(bundle)
+		return bundle.CopyEmbeddedAssetsWithSubtitle(title, subtitle)
 	}
 
 	// Fall back to filesystem-based approach (development mode)
@@ -5974,6 +6461,7 @@ func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string)
 	// Files to copy
 	files := []string{
 		"index.html",
+		"head_init.js",
 		"viewer.js",
 		"styles.css",
 		"graph.js",
@@ -6020,6 +6508,12 @@ func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string)
 	}
 	if err := maybeBuildHybridWasmAssets(bundle); err != nil {
 		return err
+	}
+	if err := bundle.BindOfflineBundleAssets(); err != nil {
+		return err
+	}
+	if err := bundle.WriteFile(".nojekyll", []byte{}, 0644); err != nil {
+		return fmt.Errorf("writing .nojekyll: %w", err)
 	}
 
 	// Always add GitHub Actions workflow for reliable Pages deployment
@@ -6606,11 +7100,12 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		bundlePath = tmpDir
 	}
 
+	wizardNow := scopedSourceCtx.ReferenceNow()
 	pagesExecutor, err := hooks.RunHooks(wizardProjectDir, hooks.ExportContext{
 		ExportPath:   bundlePath,
 		ExportFormat: "html",
 		IssueCount:   len(exportIssues),
-		Timestamp:    robotNow(),
+		Timestamp:    wizardNow,
 	}, noHooks, hookOptions)
 	if err != nil {
 		return err
@@ -6646,8 +7141,11 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	// Build graph and compute stats
 	fmt.Println("  -> Running graph analysis...")
 	analyzer := analysis.NewAnalyzer(exportIssues)
-	analyzer.SetNow(robotNow())
+	analyzer.SetNow(wizardNow)
 	analyzer.SetReadinessScope(source.Readiness, scopedSourceCtx.CandidateIDs)
+	if scopedSourceCtx.RecipeUnblockIDs != nil {
+		analyzer.SetUnblockScope(scopedSourceCtx.RecipeUnblockIDs)
+	}
 	var stats *analysis.GraphStats
 	if forceFullAnalysis {
 		fullCfg := analysis.FullAnalysisConfig()
@@ -6676,16 +7174,29 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	wizardTriageHistory, wizardHistoryStatus := loadTriageHistoryForContext(exportContext, phaseThreeRobotHandlerConfig{
 		HistoryLimit: wizardHistLimit,
 	})
-	triage := analysis.ComputeTriageWithOptionsAndTime(exportIssues, analysis.TriageOptions{
+	wizardTriageInput := exportIssues
+	wizardTriageCandidates := scopedSourceCtx.CandidateIDs
+	if scopedSourceCtx.ActiveRecipe != nil && len(exportIssues) > 0 {
+		wizardTriageInput = scopedSourceCtx.GraphIssues()
+		wizardTriageCandidates = make(map[string]bool, len(exportIssues))
+		for _, iss := range exportIssues {
+			if scopedSourceCtx.CandidateIDs == nil || scopedSourceCtx.CandidateIDs[iss.ID] {
+				wizardTriageCandidates[iss.ID] = true
+			}
+		}
+	}
+	triage := analysis.ComputeTriageWithOptionsAndTime(wizardTriageInput, analysis.TriageOptions{
 		WaitForPhase2:     true,
 		ActionableOnly:    !includeInactive,
 		Readiness:         source.Readiness,
-		CandidateIDs:      scopedSourceCtx.CandidateIDs,
+		CandidateIDs:      wizardTriageCandidates,
+		UnblockIDs:        scopedSourceCtx.RecipeUnblockIDs,
+		VelocityIssues:    scopedSourceCtx.VelocityIssues(),
 		History:           wizardTriageHistory,
 		ForceFullAnalysis: forceFullAnalysis,
 		NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: &notReadyLabels}),
 		Weights:           wizardFeedbackWeights,
-	}, robotNow())
+	}, wizardNow)
 	triage.Meta.HistoryStatus = wizardHistoryStatus
 	if !exportContext.claimsProven() {
 		suppressUnprovenTriageClaims(&triage)
@@ -6716,7 +7227,7 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	}
 	exporter := export.NewSQLiteExporter(issuePointers, deps, stats, &triage)
 	exporter.Config.Readiness = source.Readiness
-	exporter.Config.ReadinessAt = robotNow()
+	exporter.Config.ReadinessAt = wizardNow
 	envelope, err := withEnvelope(exportContext.Envelope(), struct{}{})
 	if err != nil {
 		return fmt.Errorf("encoding export source authority: %w", err)
@@ -9323,10 +9834,21 @@ func generateRobotSchemas() RobotSchemas {
 			"source_authority": map[string]interface{}{
 				"type": "object", "description": "Per-source accounting; readiness is provisional and claim_safe is false when any required source is failed, incomplete, stale, or unknown",
 				"properties": map[string]interface{}{
-					"state":      map[string]interface{}{"type": "string", "enum": []string{"complete", "partial", "unknown"}},
-					"claim_safe": map[string]interface{}{"type": "boolean"},
-					"readiness":  map[string]interface{}{"type": "string", "enum": []string{"proven", "provisional"}},
-					"sources":    map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
+					"state":         map[string]interface{}{"type": "string", "enum": []string{"complete", "partial", "unknown"}},
+					"claim_safe":    map[string]interface{}{"type": "boolean"},
+					"readiness":     map[string]interface{}{"type": "string", "enum": []string{"proven", "provisional"}},
+					"loaded":        map[string]interface{}{"type": "integer"},
+					"failed":        map[string]interface{}{"type": "integer"},
+					"disabled":      map[string]interface{}{"type": "integer"},
+					"valid":         map[string]interface{}{"type": "integer"},
+					"errors":        map[string]interface{}{"type": "integer"},
+					"skipped":       map[string]interface{}{"type": "integer"},
+					"read_errors":   map[string]interface{}{"type": "integer"},
+					"visible":       map[string]interface{}{"type": "integer"},
+					"tombstones":    map[string]interface{}{"type": "integer"},
+					"warning_count": map[string]interface{}{"type": "integer"},
+					"sources":       map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
+					"error":         map[string]interface{}{"type": "string"},
 				},
 				"required": []string{"state", "claim_safe", "readiness", "sources"},
 			},
@@ -9503,6 +10025,8 @@ func generateRobotSchemas() RobotSchemas {
 			"properties": map[string]interface{}{
 				"generated_at":        map[string]interface{}{"type": "string", "format": "date-time"},
 				"data_hash":           map[string]interface{}{"type": "string"},
+				"output_format":       map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":             map[string]interface{}{"type": "string"},
 				"id":                  map[string]interface{}{"type": "string"},
 				"title":               map[string]interface{}{"type": "string"},
 				"score":               map[string]interface{}{"type": "number"},
@@ -9727,6 +10251,9 @@ func generateRobotSchemas() RobotSchemas {
 			"type":        "object",
 			"properties": map[string]interface{}{
 				"generated_at":      map[string]interface{}{"type": "string", "format": "date-time"},
+				"data_hash":         map[string]interface{}{"type": "string"},
+				"output_format":     map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":           map[string]interface{}{"type": "string"},
 				"resolved_revision": map[string]interface{}{"type": "string"},
 				"as_of":             map[string]interface{}{"type": "string"},
 				"as_of_commit":      map[string]interface{}{"type": "string"},
@@ -9861,8 +10388,10 @@ func generateRobotSchemas() RobotSchemas {
 			"description": "Smart suggestions for duplicates, dependencies, labels, cycle breaks",
 			"type":        "object",
 			"properties": map[string]interface{}{
-				"generated_at": map[string]interface{}{"type": "string", "format": "date-time"},
-				"data_hash":    map[string]interface{}{"type": "string"},
+				"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
+				"data_hash":     map[string]interface{}{"type": "string"},
+				"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":       map[string]interface{}{"type": "string"},
 				"filters": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -10619,6 +11148,15 @@ func robotCorrelationStatsOutputSchema() map[string]interface{} {
 			"generated_at":     map[string]interface{}{"type": "string", "format": "date-time"},
 			"output_format":    map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
 			"version":          map[string]interface{}{"type": "string"},
+			"source_path":      map[string]interface{}{"type": "string"},
+			"source_kind":      map[string]interface{}{"type": "string"},
+			"as_of":            map[string]interface{}{"type": "string"},
+			"as_of_commit":     map[string]interface{}{"type": "string"},
+			"scope":            map[string]interface{}{"type": "object"},
+			"load_stats":       map[string]interface{}{"type": "object"},
+			"source_authority": map[string]interface{}{"type": "object"},
+			"authority_hash":   map[string]interface{}{"type": "string"},
+			"scope_hash":       map[string]interface{}{"type": "string"},
 			"total_feedback":   map[string]interface{}{"type": "integer"},
 			"confirmed":        map[string]interface{}{"type": "integer"},
 			"rejected":         map[string]interface{}{"type": "integer"},
@@ -10671,6 +11209,7 @@ func robotOrphansOutputSchema() map[string]interface{} {
 			"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
 			"version":       map[string]interface{}{"type": "string"},
 			"git_range":     map[string]interface{}{"type": "string"},
+			"window":        map[string]interface{}{"type": []string{"object", "null"}},
 			"stats":         robotOrphanStatsSchema(),
 			"candidates":    map[string]interface{}{"type": "array", "items": robotOrphanCandidateSchema()},
 			"by_bead": map[string]interface{}{
@@ -10680,6 +11219,7 @@ func robotOrphansOutputSchema() map[string]interface{} {
 					"items": map[string]interface{}{"type": "string"},
 				},
 			},
+			"usage_hints": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 		},
 		"required": []string{"generated_at", "data_hash", "output_format", "version", "git_range", "stats", "candidates"},
 	}
@@ -10690,6 +11230,7 @@ func robotOrphanStatsSchema() map[string]interface{} {
 		"type": "object",
 		"properties": map[string]interface{}{
 			"total_commits":       map[string]interface{}{"type": "integer"},
+			"beads_only_commits":  map[string]interface{}{"type": "integer"},
 			"correlated_count":    map[string]interface{}{"type": "integer"},
 			"orphan_count":        map[string]interface{}{"type": "integer"},
 			"candidate_count":     map[string]interface{}{"type": "integer"},

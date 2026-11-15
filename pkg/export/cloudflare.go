@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -707,16 +708,16 @@ func VerifyCloudflareDeployment(deployURL string, expectedIssueCount int, timeou
 
 	metaURL := strings.TrimSuffix(deployURL, "/") + "/data/meta.json"
 	deadline := time.Now().Add(timeout)
+	httpClient := &http.Client{Timeout: 10 * time.Second}
 	var lastErr error
 
 	fmt.Printf("  -> Verifying deployment at %s...\n", deployURL)
 
 	for time.Now().Before(deadline) {
-		cmd := exec.Command("curl", "-sf", "--max-time", "10", metaURL)
-		output, err := cmd.Output()
+		output, err := fetchDeploymentMetaJSON(httpClient, metaURL, deadline)
 		if err != nil {
 			lastErr = fmt.Errorf("fetch failed: %w", err)
-			time.Sleep(3 * time.Second)
+			sleepDeploymentPoll(3*time.Second, deadline)
 			continue
 		}
 
@@ -726,7 +727,7 @@ func VerifyCloudflareDeployment(deployURL string, expectedIssueCount int, timeou
 		}
 		if err := json.Unmarshal(output, &meta); err != nil {
 			lastErr = fmt.Errorf("parse failed: %w", err)
-			time.Sleep(3 * time.Second)
+			sleepDeploymentPoll(3*time.Second, deadline)
 			continue
 		}
 

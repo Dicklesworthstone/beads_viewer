@@ -178,7 +178,7 @@ var (
 
 	NoSavedConfig = register(Var{
 		Name:        "BV_NO_SAVED_CONFIG",
-		Description: "Any value: the `--pages` wizard ignores the saved deployment configuration.",
+		Description: "Any non-empty value disables saved deployment configuration (`--pages`), user-level saved preferences, and user recipe defaults unless explicitly specified.",
 		Default:     "(unset)",
 	})
 

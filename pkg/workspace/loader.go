@@ -540,8 +540,9 @@ func (l *AggregateLoader) loadSingleRepo(ctx context.Context, repo RepoConfig, k
 	}
 
 	var (
-		issues     []model.Issue
-		sourcePath string
+		issues             []model.Issue
+		sourcePath         string
+		corruptSQLitePaths []string
 	)
 	if loader.IsBDWorkspace(beadsDir) {
 		jsonlPath, prepErr := loader.PrepareBeadsDirForReadContext(ctx, beadsDir, true, warnSourceFallback)
@@ -569,7 +570,7 @@ func (l *AggregateLoader) loadSingleRepo(ctx context.Context, repo RepoConfig, k
 			return result
 		}
 	} else {
-		issues, sourcePath, err = l.loadStandardRepoIssues(ctx, repo.GetName(), beadsDir, &result, warnSourceFallback, emitParseWarning)
+		issues, sourcePath, err = l.loadStandardRepoIssues(ctx, repo.GetName(), beadsDir, &result, &corruptSQLitePaths, warnSourceFallback, emitParseWarning)
 		if err != nil {
 			if sourcePath != "" {
 				result.SourcePath = sourcePath
@@ -606,6 +607,50 @@ func (l *AggregateLoader) loadSingleRepo(ctx context.Context, repo RepoConfig, k
 
 	// Apply namespacing to all IDs
 	loader.AttachIssueOrigins(issues, sourcePath, result.ParseStats.Errors == 0 && result.ReadErrors == 0 && len(result.AuthorityWarnings) == 0)
+	if result.SourceKind != string(datasource.SourceTypeSQLite) && sourcePath != "" {
+		var probeOrigin *model.IssueOrigin
+		if len(issues) > 0 {
+			probeOrigin = issues[0].Origin
+		} else {
+			probe := []model.Issue{{ID: "_probe"}}
+			loader.AttachIssueOrigins(probe, sourcePath, len(result.AuthorityWarnings) == 0)
+			probeOrigin = probe[0].Origin
+		}
+		if probeOrigin != nil && probeOrigin.Tracker == "br" && probeOrigin.Database != "" {
+			alreadyKnownCorrupt := false
+			for _, corruptDB := range corruptSQLitePaths {
+				if sameResolvedWorkspaceFilePath(probeOrigin.Database, corruptDB) {
+					alreadyKnownCorrupt = true
+					break
+				}
+			}
+			if !alreadyKnownCorrupt {
+				sibSrc := datasource.DataSource{Type: datasource.SourceTypeSQLite, Path: probeOrigin.Database}
+				if sibErr := datasource.ValidateSource(&sibSrc); sibErr != nil {
+					corruptSQLitePaths = append(corruptSQLitePaths, probeOrigin.Database)
+					warnSourceFallback(fmt.Sprintf("sibling SQLite source %s failed validation: %v", probeOrigin.Database, sibErr))
+				}
+			}
+		}
+	}
+	if len(corruptSQLitePaths) > 0 || len(result.AuthorityWarnings) > 0 {
+		for i := range issues {
+			orig := issues[i].Origin
+			if orig == nil {
+				continue
+			}
+			for _, corruptDB := range corruptSQLitePaths {
+				if orig.Database != "" && sameResolvedWorkspaceFilePath(orig.Database, corruptDB) {
+					orig.Database = ""
+					orig.ReadOnlyReason = "sibling SQLite database is corrupt"
+					break
+				}
+			}
+			if orig.ReadOnlyReason == "" && len(result.AuthorityWarnings) > 0 {
+				orig.ReadOnlyReason = "source authority is incomplete or stale"
+			}
+		}
+	}
 	namespacedIssues := l.namespaceIssues(issues, prefix, localIDs, knownPrefixes)
 
 	result.Issues = namespacedIssues
@@ -652,11 +697,28 @@ func sortWorkspaceCandidates(sources []datasource.DataSource) {
 	})
 }
 
+func sameResolvedWorkspaceFilePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	norm := func(p string) string {
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if eval, err := filepath.EvalSymlinks(p); err == nil {
+			p = eval
+		}
+		return filepath.Clean(p)
+	}
+	return norm(a) == norm(b)
+}
+
 func (l *AggregateLoader) loadStandardRepoIssues(
 	ctx context.Context,
 	_ string,
 	beadsDir string,
 	result *LoadResult,
+	corruptSQLitePaths *[]string,
 	warnSourceFallback func(string),
 	emitParseWarning func(string),
 ) ([]model.Issue, string, error) {
@@ -701,6 +763,9 @@ func (l *AggregateLoader) loadStandardRepoIssues(
 			valCopy := candidate
 			if valErr := datasource.ValidateSource(&valCopy); valErr != nil {
 				lastErr = valErr
+				if corruptSQLitePaths != nil {
+					*corruptSQLitePaths = append(*corruptSQLitePaths, candidate.Path)
+				}
 				if hasMore {
 					warnSourceFallback(fmt.Sprintf("SQLite source %s failed validation, falling back: %v", candidate.Path, valErr))
 					continue
@@ -713,6 +778,9 @@ func (l *AggregateLoader) loadStandardRepoIssues(
 					return nil, candidate.Path, ctxErr
 				}
 				lastErr = openErr
+				if corruptSQLitePaths != nil {
+					*corruptSQLitePaths = append(*corruptSQLitePaths, candidate.Path)
+				}
 				if hasMore {
 					warnSourceFallback(fmt.Sprintf("SQLite source %s could not be opened, falling back: %v", candidate.Path, openErr))
 					continue
@@ -726,6 +794,9 @@ func (l *AggregateLoader) loadStandardRepoIssues(
 			}
 			if readErr != nil {
 				lastErr = readErr
+				if corruptSQLitePaths != nil {
+					*corruptSQLitePaths = append(*corruptSQLitePaths, candidate.Path)
+				}
 				if hasMore {
 					warnSourceFallback(fmt.Sprintf("SQLite source %s failed during read, falling back: %v", candidate.Path, readErr))
 					continue
@@ -736,6 +807,9 @@ func (l *AggregateLoader) loadStandardRepoIssues(
 			errCount := report.Errors + report.ReadErrors
 			if errCount > 0 && hasMore && (totalAccounted == 0 || float64(errCount)/float64(totalAccounted) > maxErrorRate || report.ReadErrors > 0) {
 				lastErr = fmt.Errorf("SQLite source %s had %d issue/read errors", candidate.Path, errCount)
+				if corruptSQLitePaths != nil {
+					*corruptSQLitePaths = append(*corruptSQLitePaths, candidate.Path)
+				}
 				warnSourceFallback(fmt.Sprintf("SQLite source %s had %d errors, falling back", candidate.Path, errCount))
 				continue
 			}

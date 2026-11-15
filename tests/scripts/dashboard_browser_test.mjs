@@ -1047,10 +1047,31 @@ async function hitsJourney(page) {
   }
   await click(page, 'a[href="#/insights"]');
   assert.deepEqual(await evaluate(page, '[GRAPH_STATE.graph.nodeCount(), GRAPH_STATE.graph.edgeCount()]'), before, 'ranking and navigation do not mutate graph');
-  const slack = await evaluate(page, 'Array.from(GRAPH_STATE.graph.slack()).map((value,idx)=>({id:GRAPH_STATE.graph.nodeId(idx),value})).filter(row=>getIssue(row.id))');
+  const slack = await evaluate(page, 'Array.from(GRAPH_STATE.activeGraph.slack()).map((value,idx)=>({id:GRAPH_STATE.activeGraph.nodeId(idx),value})).filter(row=>getIssue(row.id))');
+  assert.equal(slack.some(row => row.id === 'sim-closed'), false, 'activeGraph.slack() excludes closed issues');
   assert.ok(slack.some(row=>row.value > 0), 'asymmetric fixture includes flexible work');
   assert.deepEqual(await evaluate(page, 'getIssuesBySlack(100,true).map(i=>i.id).sort()'), slack.filter(row=>row.value===0).map(row=>row.id).sort(), 'zero-slack filter excludes flexible work');
   assert.deepEqual(await evaluate(page, 'getIssuesBySlack(100,false).map(i=>i.slack)'), slack.map(row=>row.value).sort((a,b)=>b-a), 'flexible-work list preserves all actual slack scores');
+  const cpHopsAudit = await evaluate(page, `(() => ({
+    top0: getTopCriticalPaths(5)[0] || null,
+    fmtTop0: formatCriticalPathHops(getTopCriticalPaths(5)[0]),
+    fmt2: formatCriticalPathHops({ length: 2 }),
+    fmt1: formatCriticalPathHops({ length: 1 }),
+    insightsText: document.body.innerText,
+  }))()`);
+  assert.equal(cpHopsAudit.top0?.length, 3, 'sim-* critical chain has 3 nodes');
+  assert.equal(cpHopsAudit.top0?.hops, 2, '3-node critical chain reports 2 hops');
+  assert.equal(cpHopsAudit.fmtTop0, '2 hops', 'formatCriticalPathHops formats 3-node chain as 2 hops');
+  assert.equal(cpHopsAudit.fmt2, '1 hop', 'formatCriticalPathHops singularizes 2-node chain as 1 hop');
+  assert.equal(cpHopsAudit.fmt1, '0 hops', 'formatCriticalPathHops formats 1-node chain as 0 hops');
+  assert.ok(
+    cpHopsAudit.insightsText.includes('CHAIN (2 HOPS)') || cpHopsAudit.insightsText.includes('Chain (2 hops)'),
+    `Insights Top Critical Paths renders 2 hops instead of off-by-one 3 hops: ${cpHopsAudit.insightsText}`
+  );
+  assert.ok(
+    !cpHopsAudit.insightsText.includes('CHAIN (3 HOPS)') && !cpHopsAudit.insightsText.includes('Chain (3 hops)'),
+    'Insights Top Critical Paths never renders off-by-one 3 hops on 3-node chain'
+  );
   await capture(page, 'hits-panels');
   clean(page);
   console.log(`PASS: ${page.name} actual HITS hub/authority rankings, rendered scores and issue navigation`);
@@ -1073,17 +1094,17 @@ async function metricVisibilityJourney(page) {
   assert.equal(initial.length, 6, 'authority ranking retains all six actual issues despite eleven missing endpoints');
   assert.equal(initial[0].id, 'rank-root', 'real prerequisite leads authorities');
   assert.ok(initial[0].score > 0, 'real prerequisite has positive authority');
-  for (const [fn, field, vector, suffix] of [
-    ['getTopByHITSAuth', 'hits_auth', 'GRAPH_STATE.graph.hitsDefault().authorities', ''],
-    ['getTopByHITSHub', 'hits_hub', 'GRAPH_STATE.graph.hitsDefault().hubs', ''],
-    ['getTopByKCore', 'kcore', 'GRAPH_STATE.graph.kcore()', ''],
-    ['getTopByBetweenness', 'betweenness', 'GRAPH_STATE.graph.betweenness()', ''],
-    ['getIssuesBySlack', 'slack', 'GRAPH_STATE.graph.slack()', ',true'],
-    ['getIssuesBySlack', 'slack', 'GRAPH_STATE.graph.slack()', ',false'],
+  for (const [fn, field, vector, graphExpr, suffix] of [
+    ['getTopByHITSAuth', 'hits_auth', 'GRAPH_STATE.graph.hitsDefault().authorities', 'GRAPH_STATE.graph', ''],
+    ['getTopByHITSHub', 'hits_hub', 'GRAPH_STATE.graph.hitsDefault().hubs', 'GRAPH_STATE.graph', ''],
+    ['getTopByKCore', 'kcore', 'GRAPH_STATE.graph.kcore()', 'GRAPH_STATE.graph', ''],
+    ['getTopByBetweenness', 'betweenness', 'GRAPH_STATE.graph.betweenness()', 'GRAPH_STATE.graph', ''],
+    ['getIssuesBySlack', 'slack', 'GRAPH_STATE.activeGraph.slack()', 'GRAPH_STATE.activeGraph', ',true'],
+    ['getIssuesBySlack', 'slack', 'GRAPH_STATE.activeGraph.slack()', 'GRAPH_STATE.activeGraph', ',false'],
   ]) {
     const all = await evaluate(page, `${fn}(100${suffix}).map(i=>({id:i.id,score:i.${field}}))`);
     assert.deepEqual(all.map(i=>i.id).sort(), visibleIDs, `${fn}${suffix}: each actual issue appears once`);
-    const raw = await evaluate(page, `Array.from(${vector}).map((score,idx)=>({id:GRAPH_STATE.graph.nodeId(idx),score}))`);
+    const raw = await evaluate(page, `Array.from(${vector}).map((score,idx)=>({id:${graphExpr}.nodeId(idx),score}))`);
     for (const row of all) {
       assert.equal(row.score, raw.find(r=>r.id===row.id).score, `${fn}: preserves actual WASM score for ${row.id}`);
       assert.ok(Number.isFinite(row.score), `${fn}: finite score`);
@@ -1300,8 +1321,47 @@ async function journey(page, mobile) {
   assert.equal(acyclicMetrics.legacyP0, undefined);
   assert.equal(acyclicMetrics.nodes['browser-root'].slack, 0, 'critical-path prerequisite has zero slack');
   assert.equal(acyclicMetrics.nodes['browser-detail'].slack, 0, 'critical-path dependent has zero slack');
-  assert.ok(acyclicMetrics.nodes['browser-other'].slack > 0 && acyclicMetrics.nodes['browser-closed'].slack > 0, 'isolated DAG issues receive positive WASM slack');
+  assert.ok(acyclicMetrics.nodes['browser-other'].slack > 0 && acyclicMetrics.nodes['browser-closed'].slack === null, 'active isolated DAG issue receives positive WASM slack while closed issue gets null slack');
   assert.ok(acyclicMetrics.nodes['browser-detail'].hitsHub > 0 && acyclicMetrics.nodes['browser-root'].hitsAuth > 0, 'directed WASM HITS hub/authority attached to force-graph nodes');
+  const acyclicGraphExtras = await evaluate(page, `(() => {
+    const m = ${app}.forceGraphModule, g = m.getGraph();
+    const zeroSlackIds = (${app}.criticalPathSlack || []).map(i => i.id).sort();
+    const fmt0 = m.formatSlack(0), fmt1 = m.formatSlack(1), fmtOther = m.formatSlack(${JSON.stringify(acyclicMetrics.nodes['browser-other'].slack)});
+    m.animateCriticalPath(false);
+    const cpInit = m.getCriticalPathState();
+    m.nextCriticalPath();
+    const cpNext = m.getCriticalPathState();
+    m.prevCriticalPath();
+    const cpPrev = m.getCriticalPathState();
+    m.resetCriticalPath();
+    const cpReset = m.getCriticalPathState();
+
+    m.toggleHeatmap();
+    const draw = g.linkCanvasObject();
+    const redLinks = g.graphData().links.filter(link => {
+      const c = new OffscreenCanvas(256, 256), ctx = c.getContext('2d');
+      const a = link.source, b = link.target;
+      const scale = 180 / Math.max(Math.abs(b.x - a.x), Math.abs(b.y - a.y), 1);
+      ctx.setTransform(scale, 0, 0, scale, 128 - scale * (a.x + b.x) / 2, 128 - scale * (a.y + b.y) / 2);
+      draw(link, ctx, scale);
+      const px = ctx.getImageData(0, 0, 256, 256).data;
+      for (let i = 0; i < px.length; i += 4) {
+        if (px[i + 3] >= 40 && px[i] >= 245 && px[i + 1] <= 10 && px[i + 2] <= 10) return true;
+      }
+      return false;
+    }).length;
+    m.toggleHeatmap();
+    return { zeroSlackIds, fmt0, fmt1, fmtOther, cpInit, cpNext, cpPrev, cpReset, redLinks };
+  })()`);
+  assert.deepEqual(acyclicGraphExtras.zeroSlackIds, ['browser-detail', 'browser-root'], 'acyclic Critical Path Slack populates active zero-slack nodes');
+  assert.equal(acyclicGraphExtras.fmt0, '0 hops (critical)');
+  assert.equal(acyclicGraphExtras.fmt1, '1 hop');
+  assert.match(acyclicGraphExtras.fmtOther, /^\d+ hops?$/, 'positive topological slack formatted in hops');
+  assert.equal(acyclicGraphExtras.cpInit.active, true, 'kCriticalPaths stepper activates on acyclic DAG');
+  assert.ok(acyclicGraphExtras.cpInit.pathCount >= 1 && acyclicGraphExtras.cpInit.path.length === 2, `kCriticalPaths finds 2-node critical path: ${JSON.stringify(acyclicGraphExtras.cpInit)}`);
+  assert.equal(acyclicGraphExtras.cpPrev.currentIndex, 0);
+  assert.equal(acyclicGraphExtras.cpReset.active, false);
+  assert.equal(acyclicGraphExtras.redLinks, 1, 'acyclic zero-slack edge paints THEME.priority[0] urgency red in heatmap mode');
   // Click an actual force-graph node using its rendered graph-to-screen transform.
   await delay(1000);
   const point = await evaluate(page, `(() => { const g=${app}.forceGraphModule.getGraph(); const n=g.graphData().nodes.find(n=>n.id==='browser-root'); const p=g.graph2ScreenCoords(n.x,n.y); const r=document.querySelector('#graph-container canvas').getBoundingClientRect(); return {x:r.x+p.x,y:r.y+p.y}; })()`);
@@ -1620,6 +1680,105 @@ async function capabilitiesJourney(page) {
   await search(page, '');
   await resultIDs(page, allCapIDs);
 
+  // 8b-3. SQL label wildcard escaping ('_' and '%'), Go HTML-escaped <,>,& ('\u003c','\u003e','\u0026'), and case-sensitivity across json_each and INSTR fallback.
+  const labelAuditSeedRows = [
+    ['cap-lbl-us-exact', 'Underscore exact', '["bug_fix"]'],
+    ['cap-lbl-us-wild', 'Underscore wildcard probe', '["bugXfix"]'],
+    ['cap-lbl-pct-exact', 'Percent exact', '["100%_done"]'],
+    ['cap-lbl-pct-wild', 'Percent wildcard probe', '["1000%done"]'],
+    ['cap-lbl-html-esc', 'HTML escaped label', '["ui\\u003ccore\\u003e\\u0026v2"]'],
+    ['cap-lbl-case-low', 'Lowercase label', '["caseprobe"]'],
+    ['cap-lbl-case-up', 'Uppercase label', '["CaseProbe"]'],
+    ['cap-lbl-esc-quote', 'Escaped quote label', '["foo\\"bar"]'],
+    ['cap-lbl-esc-comma', 'Escaped comma-quote label', '["a\\",\\"b"]'],
+  ];
+  const labelWildcardAudit = await evaluate(page, `(() => {
+    const prevJsonEach = DB_STATE.jsonEach;
+    const prevJsonEachDb = DB_STATE.jsonEachDb;
+    const rows = ${JSON.stringify(labelAuditSeedRows)};
+    for (const [id, title, labels] of rows) {
+      DB_STATE.db.run("INSERT INTO issues (id, title, status, priority, issue_type, labels, created_at, updated_at) VALUES (?, ?, 'open', 2, 'task', ?, '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')", [id, title, labels]);
+      DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES (?, ?, 'open', 2, 'task', ?, '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'satisfied', 1, 0, 0, 0, 0, 0.2, 0, 0, 0, 0, 0, 0, 0)", [id, title, labels]);
+    }
+    try {
+      const storedHtmlRaw = execScalar("SELECT labels FROM issues WHERE id = 'cap-lbl-html-esc'");
+      const hasJsonEach = supportsJsonEach();
+      const jsonUs = queryIssues({ labels: ['bug_fix'] }).map(i => i.id);
+      const jsonPct = queryIssues({ labels: ['100%_done'] }).map(i => i.id);
+      const jsonHtml = queryIssues({ labels: ['ui<core>&v2'] }).map(i => i.id);
+      const jsonCaseLow = queryIssues({ labels: ['caseprobe'] }).map(i => i.id);
+      const jsonCaseUp = queryIssues({ labels: ['CaseProbe'] }).map(i => i.id);
+      const jsonUsCount = countIssues({ labels: ['bug_fix'] });
+      const jsonPctCount = countIssues({ labels: ['100%_done'] });
+      const jsonHtmlCount = countIssues({ labels: ['ui<core>&v2'] });
+
+      DB_STATE.jsonEach = false;
+      DB_STATE.jsonEachDb = DB_STATE.db;
+      const likeUs = queryIssues({ labels: ['bug_fix'] }).map(i => i.id);
+      const likePct = queryIssues({ labels: ['100%_done'] }).map(i => i.id);
+      const instrHtml = queryIssues({ labels: ['ui<core>&v2'] }).map(i => i.id);
+      const instrCaseLow = queryIssues({ labels: ['caseprobe'] }).map(i => i.id);
+      const instrCaseUp = queryIssues({ labels: ['CaseProbe'] }).map(i => i.id);
+      const udfFalseBar = queryIssues({ labels: ['bar'] }).map(i => i.id);
+      const udfFalseB = queryIssues({ labels: ['b'] }).map(i => i.id);
+      const udfExactQuote = queryIssues({ labels: ['foo"bar'] }).map(i => i.id);
+      const udfExactComma = queryIssues({ labels: ['a","b'] }).map(i => i.id);
+      const likeUsCount = countIssues({ labels: ['bug_fix'] });
+      const likePctCount = countIssues({ labels: ['100%_done'] });
+      const instrHtmlCount = countIssues({ labels: ['ui<core>&v2'] });
+      const instrCaseLowCount = countIssues({ labels: ['caseprobe'] });
+      const instrCaseUpCount = countIssues({ labels: ['CaseProbe'] });
+      const closedIds = execQuery("SELECT id FROM issues WHERE LOWER(status) = 'closed' ORDER BY id").map(r => r.id);
+      const openIds = execQuery("SELECT id FROM issues WHERE LOWER(status) = 'open' ORDER BY id").map(r => r.id);
+      const mixedIds = [...closedIds.slice(0, 1), ...openIds.slice(0, 2)];
+      const recalc = recalculateMetrics(mixedIds);
+      return {
+        storedHtmlRaw,
+        hasJsonEach,
+        jsonUs, jsonPct, jsonHtml, jsonCaseLow, jsonCaseUp,
+        jsonUsCount, jsonPctCount, jsonHtmlCount,
+        likeUs, likePct, instrHtml, instrCaseLow, instrCaseUp,
+        udfFalseBar, udfFalseB, udfExactQuote, udfExactComma,
+        likeUsCount, likePctCount, instrHtmlCount, instrCaseLowCount, instrCaseUpCount,
+        recalcNodeCount: recalc ? recalc.nodeCount : -1,
+        recalcPrLen: recalc ? recalc.pagerank.length : -1,
+        recalcCpLen: recalc ? recalc.criticalPath.length : -1,
+        recalcClosedCp: (recalc && closedIds.length > 0) ? recalc.criticalPath[0] : -1,
+      };
+    } finally {
+      DB_STATE.jsonEach = prevJsonEach;
+      DB_STATE.jsonEachDb = prevJsonEachDb;
+      DB_STATE.db.run("DELETE FROM issue_overview_mv WHERE id LIKE 'cap-lbl-%'");
+      DB_STATE.db.run("DELETE FROM issues WHERE id LIKE 'cap-lbl-%'");
+    }
+  })()`);
+  assert.equal(labelWildcardAudit.storedHtmlRaw, '["ui\\u003ccore\\u003e\\u0026v2"]', 'seeded SQLite column stores Go encoding/json \\u003c/\\u003e/\\u0026 literal');
+  assert.deepEqual(labelWildcardAudit.jsonUs, ['cap-lbl-us-exact'], 'json_each label filter matches literal underscore only');
+  assert.deepEqual(labelWildcardAudit.jsonPct, ['cap-lbl-pct-exact'], 'json_each label filter matches literal % and _ only');
+  assert.deepEqual(labelWildcardAudit.jsonHtml, ['cap-lbl-html-esc'], 'json_each label filter matches <, >, &');
+  assert.deepEqual(labelWildcardAudit.jsonCaseLow, ['cap-lbl-case-low'], 'json_each label filter is case-sensitive (lowercase)');
+  assert.deepEqual(labelWildcardAudit.jsonCaseUp, ['cap-lbl-case-up'], 'json_each label filter is case-sensitive (uppercase)');
+  assert.equal(labelWildcardAudit.jsonUsCount, 1);
+  assert.equal(labelWildcardAudit.jsonPctCount, 1);
+  assert.equal(labelWildcardAudit.jsonHtmlCount, 1);
+  assert.deepEqual(labelWildcardAudit.likeUs, ['cap-lbl-us-exact'], 'bv_has_label fallback matches literal _ only');
+  assert.deepEqual(labelWildcardAudit.likePct, ['cap-lbl-pct-exact'], 'bv_has_label fallback matches literal % and _ only');
+  assert.deepEqual(labelWildcardAudit.instrHtml, ['cap-lbl-html-esc'], 'bv_has_label fallback parses \\u003c, \\u003e, \\u0026 matching Go encoding/json');
+  assert.deepEqual(labelWildcardAudit.instrCaseLow, ['cap-lbl-case-low'], 'bv_has_label fallback is case-sensitive (lowercase)');
+  assert.deepEqual(labelWildcardAudit.instrCaseUp, ['cap-lbl-case-up'], 'bv_has_label fallback is case-sensitive (uppercase)');
+  assert.deepEqual(labelWildcardAudit.udfFalseBar, [], 'bv_has_label fallback does not false-match substring after escaped quote');
+  assert.deepEqual(labelWildcardAudit.udfFalseB, [], 'bv_has_label fallback does not false-match substring after escaped quote+comma');
+  assert.deepEqual(labelWildcardAudit.udfExactQuote, ['cap-lbl-esc-quote'], 'bv_has_label fallback matches exact label containing literal quote');
+  assert.deepEqual(labelWildcardAudit.udfExactComma, ['cap-lbl-esc-comma'], 'bv_has_label fallback matches exact label containing literal quote+comma');
+  assert.equal(labelWildcardAudit.recalcCpLen, labelWildcardAudit.recalcNodeCount, 'recalculateMetrics criticalPath array length matches full subgraph nodeCount even with closed issues');
+  assert.equal(labelWildcardAudit.recalcCpLen, labelWildcardAudit.recalcPrLen, 'recalculateMetrics criticalPath aligns 1:1 with pagerank array length');
+  assert.equal(labelWildcardAudit.recalcClosedCp, 0, 'recalculateMetrics assigns 0 criticalPath height to leading closed issue');
+  assert.equal(labelWildcardAudit.likeUsCount, 1);
+  assert.equal(labelWildcardAudit.likePctCount, 1);
+  assert.equal(labelWildcardAudit.instrHtmlCount, 1);
+  assert.equal(labelWildcardAudit.instrCaseLowCount, 1);
+  assert.equal(labelWildcardAudit.instrCaseUpCount, 1);
+
   // URL hash restoration for mode=hybrid&preset=impact-first&critical=1 and Critical Path filter pill removal.
   await evaluate(page, `window.location.hash = '#/issues?mode=hybrid&preset=impact-first&critical=1'`);
   await waitFor(page, `${app}.view === 'issues' && ${app}.searchMode === 'hybrid' && ${app}.searchPreset === 'impact-first' && ${app}.filters.criticalPath === true`, 'URL hash restores mode, preset, and critical=1');
@@ -1635,6 +1794,20 @@ async function capabilitiesJourney(page) {
   // Global search from Dashboard switches to Issues, and returning to #/ Overview + clicking Blocked KPI stat card or chart drill-down clears stale searchQuery!
   await click(page, 'a[href="#/"]');
   await waitFor(page, `${app}.view === 'dashboard'`, 'returned to dashboard for global search');
+  const chartThemeSync = await evaluate(page, `(() => {
+    const origDark = Boolean(${app}.darkMode);
+    ${app}.toggleDarkMode();
+    const afterFirstColor = Chart.defaults.color;
+    const afterFirstDark = Boolean(${app}.darkMode);
+    ${app}.toggleDarkMode();
+    const afterSecondColor = Chart.defaults.color;
+    const afterSecondDark = Boolean(${app}.darkMode);
+    return { origDark, afterFirstDark, afterSecondDark, afterFirstColor, afterSecondColor };
+  })()`);
+  assert.equal(chartThemeSync.afterSecondDark, chartThemeSync.origDark, 'darkMode restored after theme sync toggle');
+  assert.notEqual(chartThemeSync.afterFirstColor, chartThemeSync.afterSecondColor, 'toggleDarkMode updates Chart.defaults.color via BVCharts.applyTheme');
+  assert.equal(chartThemeSync.afterFirstDark ? chartThemeSync.afterFirstColor : chartThemeSync.afterSecondColor, '#f8f8f2', 'dark mode Chart.js foreground color');
+  assert.equal(chartThemeSync.afterFirstDark ? chartThemeSync.afterSecondColor : chartThemeSync.afterFirstColor, '#1e293b', 'light mode Chart.js foreground color');
   await search(page, 'OAuth');
   await waitFor(page, `${app}.view === 'issues' && ${app}.searchQuery === 'OAuth' && ${app}.issues.length === 3`, 'global header search from Dashboard switches to Issues view');
   await click(page, 'a[href="#/"]');
@@ -1654,9 +1827,47 @@ async function capabilitiesJourney(page) {
   await waitFor(page, `${app}.filters.priority.length === 0 && ${app}.searchQuery === ''`, 'cleared priority filter');
   await resultIDs(page, allCapIDs);
 
-  // 8c. Issue Detail Modal external_ref + resolved blocker line-through + "Show Graph" Mermaid diagram across multiple issues.
+  // 8b-4. #/issues j/k/Enter keyboard cursor navigation + modal input hijack guard + SQLite metadata columns.
+  await evaluate(page, `document.activeElement?.blur?.()`);
+  const expectedFirstRowId = await evaluate(page, `${app}.issues[0]?.id`);
+  const expectedSecondRowId = await evaluate(page, `${app}.issues[1]?.id`);
+  await key(page, 'j', 'KeyJ');
+  assert.equal(await evaluate(page, `${app}.focusedIssueIndex`), 0, 'first j highlights row 0 in #/issues');
+  await key(page, 'j', 'KeyJ');
+  assert.equal(await evaluate(page, `${app}.focusedIssueIndex`), 1, 'second j advances cursor to row 1');
+  await key(page, 'k', 'KeyK');
+  assert.equal(await evaluate(page, `${app}.focusedIssueIndex`), 0, 'k moves cursor back to row 0');
+  assert.ok(expectedFirstRowId && expectedSecondRowId && expectedFirstRowId !== expectedSecondRowId);
+  await key(page, 'Enter');
+  await waitFor(page, `${app}.selectedIssue?.id === ${JSON.stringify(expectedFirstRowId)}`, 'Enter opens highlighted issue row');
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.selectedIssue`, 'Escape closes cursor-opened modal');
+
+  // 8c. Issue Detail Modal external_ref + resolved blocker line-through + input hijack guard + "Show Graph" Mermaid diagram across multiple issues.
   await click(page, '[aria-label^="View issue cap-hub-leaf:"]');
   await waitFor(page, `${app}.selectedIssue?.id === 'cap-hub-leaf'`, 'cap-hub-leaf modal opened');
+  const modalInputGuardAudit = await evaluate(page, `(() => {
+    const input = [...document.querySelectorAll('input[placeholder="Search issues..."]')].find(${visible});
+    if (!input) return { found: false };
+    input.focus();
+    for (const k of ['j', 'k', 'g']) {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true }));
+    }
+    const idAfterKeys = ${app}.selectedIssue?.id;
+    const depGraphAfterKeys = Boolean(${app}.showDepGraph);
+    input.blur();
+    const cols = execQuery("PRAGMA table_info(issue_overview_mv)").map(c => c.name);
+    return {
+      found: true,
+      idAfterKeys,
+      depGraphAfterKeys,
+      hasMetadataCols: ['estimated_minutes', 'created_by', 'close_reason'].every(c => cols.includes(c)),
+    };
+  })()`);
+  assert.equal(modalInputGuardAudit.found, true);
+  assert.equal(modalInputGuardAudit.idAfterKeys, 'cap-hub-leaf', 'typing j/k in input while modal open does not hijack issue navigation');
+  assert.equal(modalInputGuardAudit.depGraphAfterKeys, false, 'typing g in input while modal open does not toggle dependency graph');
+  assert.equal(modalInputGuardAudit.hasMetadataCols, true, 'issue_overview_mv exposes estimated_minutes, created_by, and close_reason');
   await click(page, 'button', 'Show Graph');
   await waitFor(page, `!!document.querySelector('[x-ref="depGraph"] svg')`, 'Show Graph renders Mermaid SVG including resolved prerequisite');
   const modalDepAudit = await evaluate(page, `(() => {
@@ -1715,19 +1926,42 @@ async function capabilitiesJourney(page) {
   assert.ok(eigenAudit.hasSubtitle && eigenAudit.rendersFirstScore, `Influencers panel renders Eigenvector Centrality score in DOM: ${JSON.stringify(eigenAudit)}`);
   const slackAndWeightsAudit = await evaluate(page, `(() => {
     const slackItems = ${app}.criticalPathSlack || [];
+    const flexItems = ${app}.flexibleSlackIssues || [];
+    const topPaths = ${app}.topCriticalPaths || [];
     const weights = ${app}.getTriageWeightComponents();
     const weightSum = weights.reduce((acc, w) => acc + (w.value || 0), 0);
     const hasSlackHeading = document.body.innerText.includes('Critical Path Slack');
+    const hasCycleUnavailableMsg = document.body.innerText.includes('Unavailable while dependency cycles exist');
+    const defaultImpactCount = (${app}.topImpactIssues || []).length;
+    ${app}.toggleIncludeBlockedWhatIf();
+    const includeBlockedActive = Boolean(${app}.includeBlockedWhatIf);
+    const expandedImpactCount = (${app}.topImpactIssues || []).length;
+    ${app}.toggleIncludeBlockedWhatIf();
     return {
       slackCount: slackItems.length,
-      slackActiveZero: slackItems.every(i => i.status !== 'closed' && i.status !== 'tombstone' && Math.abs(i.slack || 0) < 0.001),
+      flexCount: flexItems.length,
+      topPathsCount: topPaths.length,
       weightsLen: weights.length,
       weightSum,
       hasSlackHeading,
+      hasCycleUnavailableMsg,
+      parallelCutIsArray: Array.isArray(${app}.parallelCutIssues),
+      bridgesIsArray: Array.isArray(${app}.bridgeEdges),
+      defaultImpactCount,
+      includeBlockedActive,
+      expandedImpactCount,
     };
   })()`);
-  assert.ok(slackAndWeightsAudit.slackCount > 0 && slackAndWeightsAudit.slackActiveZero && slackAndWeightsAudit.hasSlackHeading,
-    `Critical Path Slack card populated with active zero-slack nodes: ${JSON.stringify(slackAndWeightsAudit)}`);
+  assert.equal(slackAndWeightsAudit.slackCount, 0, 'cyclic graph omits false zero-slack critical path items');
+  assert.equal(slackAndWeightsAudit.flexCount, 0, 'cyclic graph omits undefined topological float');
+  assert.equal(slackAndWeightsAudit.topPathsCount, 0, 'cyclic graph omits kCriticalPaths');
+  assert.ok(slackAndWeightsAudit.hasSlackHeading && slackAndWeightsAudit.hasCycleUnavailableMsg,
+    `Critical Path Slack card explains cyclic unavailability: ${JSON.stringify(slackAndWeightsAudit)}`);
+  assert.equal(slackAndWeightsAudit.parallelCutIsArray, true);
+  assert.equal(slackAndWeightsAudit.bridgesIsArray, true);
+  assert.equal(slackAndWeightsAudit.includeBlockedActive, true);
+  assert.ok(slackAndWeightsAudit.expandedImpactCount >= slackAndWeightsAudit.defaultImpactCount,
+    `allWhatIf includes blocked cascade multipliers: ${JSON.stringify(slackAndWeightsAudit)}`);
   assert.equal(slackAndWeightsAudit.weightsLen, 8, 'getTriageWeightComponents exposes all 8 triage components');
   assert.ok(Math.abs(slackAndWeightsAudit.weightSum - 1.0) < 1e-6, `triage weights sum to 1.0: ${slackAndWeightsAudit.weightSum}`);
   await click(page, 'button', 'Highlight Cycles');
@@ -1746,11 +1980,77 @@ async function capabilitiesJourney(page) {
 
   await click(page, 'a[href="#/insights"]');
   await click(page, 'button', 'Zoom to Cycle');
-  await waitFor(page, `${app}.view === 'graph' && ${app}.cycleNavigatorActive`, 'focusCycleInGraph navigates to graph with cycle focused');
+  await waitFor(page, `${app}.view === 'graph' && ${app}.cycleNavigatorActive && (${visible})(document.querySelector('#graph-container'))`, 'focusCycleInGraph navigates to visible graph with cycle focused');
+  await evaluate(page, 'document.activeElement?.blur?.()');
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.cycleNavigatorActive && !${app}.forceGraphModule.getCycleNavigatorState().active`, 'Escape in Graph View resets active cycleNavigatorState');
 
+  await click(page, 'a[href="#/insights"]');
+  await click(page, 'button', 'Highlight Cycles');
+  await waitFor(page, `${app}.view === 'graph' && ${app}.cycleNavigatorActive`, 're-enabled cycle navigator before Reset View');
   await click(page, 'a[href="#/insights"]');
   await click(page, 'button', 'Reset View');
   await waitFor(page, `${app}.view === 'graph' && !${app}.cycleNavigatorActive && !${app}.forceGraphModule.getCycleNavigatorState().active`, 'Reset View clears cycle navigator');
+
+  // Ctrl+F / bv-graph:searchRequest focuses #graph-search-input, and multi-node performBatchWhatIf tracks sourceNodes.
+  const graphCtrlFAndBatchAudit = await evaluate(page, `new Promise(resolve => {
+    const m = ${app}.forceGraphModule;
+    const batchRes = m.performBatchWhatIf(['cap-auth-root', 'cap-billing-a']);
+    const batchState = m.getWhatIfState();
+    const batchIds = m.getBatchWhatIfSourceIds();
+    m.resetWhatIf();
+
+    document.activeElement?.blur?.();
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', code: 'KeyF', ctrlKey: true, bubbles: true, cancelable: true }));
+    setTimeout(() => {
+      const focusedId = document.activeElement?.id || '';
+      document.activeElement?.blur?.();
+      resolve({ batchRes, batchState, batchIds, focusedId });
+    }, 60);
+  })`);
+  assert.equal(graphCtrlFAndBatchAudit.focusedId, 'graph-search-input', 'Ctrl+F in #/graph focuses #graph-search-input');
+  assert.deepEqual(graphCtrlFAndBatchAudit.batchIds, ['cap-auth-root', 'cap-billing-a'], 'performBatchWhatIf tracks multi-node source IDs');
+  assert.deepEqual(graphCtrlFAndBatchAudit.batchState.sourceNodes, ['cap-auth-root', 'cap-billing-a']);
+  assert.ok(graphCtrlFAndBatchAudit.batchRes !== null, 'WASM whatIfCloseBatch returns batch simulation result');
+
+  // [C-5] Overlay state synchronization across setFilter, clearFilters, and resetView in graph.js.
+  const overlaySyncAudit = await evaluate(page, `(() => {
+    const m = ${app}.forceGraphModule;
+    m.initCycleNavigator();
+    m.highlightCycle(0, false);
+    const firstCycleNodeId = m.getCycleNavigatorState().currentCycle[0];
+    m.setFilter('search', firstCycleNodeId);
+    const afterKeepFilter = {
+      active: m.getCycleNavigatorState().active,
+      visibleFlagged: m.getGraph().graphData().nodes.some(n => n.id === firstCycleNodeId && n._cycleHighlight === true),
+    };
+    m.setFilter('search', 'zzz-nonexistent-overlay-filter');
+    const afterEmptyFilter = {
+      nodeCount: m.getGraph().graphData().nodes.length,
+      cycleActive: m.getCycleNavigatorState().active,
+    };
+    m.clearFilters();
+    const afterClear = {
+      nodeCount: m.getGraph().graphData().nodes.length,
+      anyStaleCycleFlag: m.getGraph().graphData().nodes.some(n => Boolean(n._cycleHighlight)),
+    };
+
+    m.performWhatIf(m.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root'));
+    m.initCycleNavigator();
+    m.highlightCycle(0, false);
+    m.resetView();
+    const afterResetView = {
+      whatIfActive: m.getWhatIfState().active,
+      cpActive: m.getCriticalPathState().active,
+      cycleActive: m.getCycleNavigatorState().active,
+      anyOverlayFlag: m.getGraph().graphData().nodes.some(n => Boolean(n._whatIfState || n._cycleHighlight || n._criticalPathHighlight)),
+    };
+    return { afterKeepFilter, afterEmptyFilter, afterClear, afterResetView };
+  })()`);
+  assert.deepEqual(overlaySyncAudit.afterKeepFilter, { active: true, visibleFlagged: true }, 'setFilter re-applies _cycleHighlight onto newly prepared visible cycle nodes');
+  assert.deepEqual(overlaySyncAudit.afterEmptyFilter, { nodeCount: 0, cycleActive: false }, 'setFilter auto-resets cycle navigator when zero highlighted cycle nodes remain visible');
+  assert.deepEqual(overlaySyncAudit.afterClear, { nodeCount: 6, anyStaleCycleFlag: false }, 'clearFilters restores all 6 nodes with zero stale overlay flags');
+  assert.deepEqual(overlaySyncAudit.afterResetView, { whatIfActive: false, cpActive: false, cycleActive: false, anyOverlayFlag: false }, 'graph.js resetView() resets What-If, Critical Path, and Cycle Navigator overlays');
 
   // 2. Galaxy ('5') preset + viewModeChange sync, Time-Travel ('T') button + Space/T, and ArrowRight nodeSelect sync.
   await click(page, 'button[title="Cluster by label (5)"]');
@@ -1780,7 +2080,7 @@ async function capabilitiesJourney(page) {
   await key(page, 't', 'KeyT');
   await waitFor(page, `!${app}.timeTravelActive && !${app}.forceGraphModule.getTimeTravelState().active && !document.querySelector('#time-travel-controls')?.classList.contains('active')`, 'T shortcut exits time-travel');
 
-  // 3. Force-graph WASM hitsHub/hitsAuth/slack + THEME.priority[0]/[1] heatmap urgency link painting.
+  // 3. Force-graph WASM hitsHub/hitsAuth + cyclic null slack (no false zero-slack urgency red links on cyclic graph).
   await click(page, 'button[title="Toggle heatmap coloring (H)"]');
   await waitFor(page, `${app}.graphHeatmapActive`, 'heatmap link urgency mode enabled');
   const graphAudit = await evaluate(page, `(() => {
@@ -1799,14 +2099,26 @@ async function capabilitiesJourney(page) {
       }
       return false;
     }).length;
-    return { themeP0: m.THEME.priority[0], themeP1: m.THEME.priority[1], nodes, redLinks, nonCycleCount: nonCycleLinks.length };
+    return {
+      themeP0: m.THEME.priority[0],
+      themeP1: m.THEME.priority[1],
+      fmtNull: m.formatSlack(null),
+      fmtZero: m.formatSlack(0),
+      fmtThree: m.formatSlack(3),
+      nodes,
+      redLinks,
+      nonCycleCount: nonCycleLinks.length,
+    };
   })()`);
   assert.equal(graphAudit.themeP0, '#FF0000');
   assert.equal(graphAudit.themeP1, '#FF5555');
-  assert.ok(graphAudit.nodes.every(n => Number.isFinite(n.slack) && Number.isFinite(n.hitsHub) && Number.isFinite(n.hitsAuth)), 'every node carries finite slack, hitsHub, and hitsAuth');
+  assert.equal(graphAudit.fmtNull, '—');
+  assert.equal(graphAudit.fmtZero, '0 hops (critical)');
+  assert.equal(graphAudit.fmtThree, '3 hops');
+  assert.ok(graphAudit.nodes.every(n => n.slack === null && Number.isFinite(n.hitsHub) && Number.isFinite(n.hitsAuth)), 'cyclic graph sets slack=null while keeping finite hitsHub and hitsAuth');
   assert.ok(graphAudit.nodes.some(n => n.hitsHub > 0) && graphAudit.nodes.some(n => n.hitsAuth > 0), 'positive HITS hub and authority scores attached');
   assert.equal(graphAudit.nonCycleCount, 2);
-  assert.equal(graphAudit.redLinks, graphAudit.nonCycleCount, 'non-cycle zero-slack links paint THEME.priority[0] urgency red in heatmap mode');
+  assert.equal(graphAudit.redLinks, 0, 'cyclic graph never paints false zero-slack red links in heatmap mode');
   await click(page, 'button[title="Toggle heatmap coloring (H)"]');
 
   // 3b. #graphSizeMetric new options and live node sizing updates.
@@ -1846,6 +2158,89 @@ async function capabilitiesJourney(page) {
   await waitFor(page, `${app}.graphDetailNode && ${app}.graphDetailNode.id !== 'cap-auth-root' && ${app}.graphDetailNode.id === ${app}.forceGraphModule.getSelectedNode()?.id`, 'second ArrowRight advances graphDetailNode');
   await key(page, 'Escape');
   await waitFor(page, `!${app}.graphDetailNode`, 'Escape clears selected graph detail node');
+
+  // [C-2] Closed-only historical cycles must NOT poison active WASM DiGraph in viewer.js or graph.js.
+  const closedCycleIsolationAudit = await evaluate(page, `(async () => {
+    const m = ${app}.forceGraphModule;
+    DB_STATE.db.run("UPDATE issues SET status = 'closed' WHERE id IN ('cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b')");
+    DB_STATE.db.run("UPDATE issue_overview_mv SET status = 'closed', in_cycle = 0 WHERE id IN ('cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b')");
+    DB_STATE.db.run("INSERT INTO issues (id, title, status, priority, issue_type, labels, created_at, updated_at) VALUES ('cap-open-prereq', 'Active Open Prereq', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
+    DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES ('cap-open-prereq', 'Active Open Prereq', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'satisfied', 1, 0.2, 0, 0, 2, 0.5, 1, 0, 0, 1, 2, 0, 0)");
+    DB_STATE.db.run("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('cap-hub-leaf', 'cap-open-prereq', 'blocks')");
+    try {
+      cleanupWasm();
+      await initGraphEngine();
+      const gd = getGraphViewData();
+      const subMetrics = recalculateMetrics(gd.issues.map(i => i.id));
+      m.loadData(gd.issues, gd.dependencies, null);
+
+      const topPaths = getTopCriticalPaths(5);
+      m.animateCriticalPath(false);
+      const cpState = m.getCriticalPathState();
+      m.resetCriticalPath();
+      const graphNodes = Object.fromEntries(m.getGraph().graphData().nodes.map(n => [n.id, { slack: n.slack, inCycle: n.inCycle, criticalDepth: n.criticalDepth }]));
+
+      return {
+        fullHasCycles: GRAPH_STATE.graph.hasCycles(),
+        activeHasCycles: GRAPH_STATE.activeGraph.hasCycles(),
+        recalcSubgraphHasCycles: subMetrics?.hasCycles,
+        viewerCycleInfoHasCycles: getCycleInfo().hasCycles,
+        viewerBreakSuggestionsLen: (getCycleBreakSuggestions(5)?.top_suggestions || getCycleBreakSuggestions(5)?.suggestions || []).length,
+        viewerBreakTotalCycles: getCycleBreakSuggestions(5)?.total_cycles ?? -1,
+        closedInCycle: isIssueInCycle('cap-auth-root'),
+        zeroSlackIds: getIssuesBySlack(10, true).map(i => i.id).sort(),
+        allSlackIds: getIssuesBySlack(10, false).map(i => i.id).sort(),
+        topPath0Len: topPaths[0]?.length || 0,
+        topPath0Hops: topPaths[0]?.hops ?? -1,
+        topPath0Fmt: formatCriticalPathHops(topPaths[0]),
+        forceFullHasCycles: m.getWasmGraph().hasCycles(),
+        forceActiveHasCycles: m.getActiveWasmGraph().hasCycles(),
+        forceMetricsHasCycles: m.getMetrics().hasCycles,
+        cpStateActive: cpState.active,
+        cpStatePathLen: cpState.path.length,
+        graphNodes,
+      };
+    } finally {
+      DB_STATE.db.run("DELETE FROM dependencies WHERE issue_id = 'cap-hub-leaf' AND depends_on_id = 'cap-open-prereq'");
+      DB_STATE.db.run("DELETE FROM issue_overview_mv WHERE id = 'cap-open-prereq'");
+      DB_STATE.db.run("DELETE FROM issues WHERE id = 'cap-open-prereq'");
+      DB_STATE.db.run("UPDATE issues SET status = 'open' WHERE id IN ('cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b')");
+      DB_STATE.db.run("UPDATE issue_overview_mv SET status = 'open', in_cycle = 1 WHERE id IN ('cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b')");
+      cleanupWasm();
+      await initGraphEngine();
+      const origGd = getGraphViewData();
+      recalculateMetrics(origGd.issues.map(i => i.id));
+      m.loadData(origGd.issues, origGd.dependencies, null);
+      try {
+        const histResp = await fetch('./data/history.json');
+        if (histResp.ok) {
+          const histData = await histResp.json();
+          if (histData?.commits?.length > 0 && m.initTimeTravel) m.initTimeTravel(histData);
+        }
+      } catch { /* optional */ }
+    }
+  })()`);
+  assert.equal(closedCycleIsolationAudit.fullHasCycles, true, 'full historical WASM graph retains closed-only cycles');
+  assert.equal(closedCycleIsolationAudit.activeHasCycles, false, 'active WASM graph excludes closed-only cycles');
+  assert.equal(closedCycleIsolationAudit.recalcSubgraphHasCycles, false, 'recalculateMetrics uses activeGraph for subgraph cycle check');
+  assert.equal(closedCycleIsolationAudit.viewerCycleInfoHasCycles, false, 'getCycleInfo ignores closed-only cycles');
+  assert.equal(closedCycleIsolationAudit.viewerBreakSuggestionsLen, 0, 'getCycleBreakSuggestions ignores closed-only cycles');
+  assert.equal(closedCycleIsolationAudit.viewerBreakTotalCycles, 0, 'cycleBreakSuggestions reports total_cycles=0 on active DAG');
+  assert.equal(closedCycleIsolationAudit.closedInCycle, false, 'closed historical cycle issue is not reported as active cycle');
+  assert.deepEqual(closedCycleIsolationAudit.zeroSlackIds, ['cap-hub-leaf', 'cap-open-prereq'], 'active critical chain has zero slack despite closed cycles');
+  assert.deepEqual(closedCycleIsolationAudit.allSlackIds, ['cap-hub-leaf', 'cap-open-prereq'], 'getIssuesBySlack excludes all closed issues');
+  assert.equal(closedCycleIsolationAudit.topPath0Len, 2, 'active 2-node chain found by kCriticalPaths despite closed cycles');
+  assert.equal(closedCycleIsolationAudit.topPath0Hops, 1, '2-node critical path has 1 hop');
+  assert.equal(closedCycleIsolationAudit.topPath0Fmt, '1 hop', '2-node critical path formats as singular 1 hop');
+  assert.equal(closedCycleIsolationAudit.forceFullHasCycles, true, 'force-graph full WASM graph retains closed cycles');
+  assert.equal(closedCycleIsolationAudit.forceActiveHasCycles, false, 'force-graph activeWasmGraph is acyclic');
+  assert.equal(closedCycleIsolationAudit.forceMetricsHasCycles, false, 'force-graph metrics.hasCycles reflects activeWasmGraph');
+  assert.equal(closedCycleIsolationAudit.cpStateActive, true, 'animateCriticalPath activates on active DAG despite closed cycles');
+  assert.equal(closedCycleIsolationAudit.cpStatePathLen, 2, 'animateCriticalPath highlights 2-node active chain');
+  assert.equal(closedCycleIsolationAudit.graphNodes['cap-hub-leaf'].slack, 0, 'active leaf gets 0 slack');
+  assert.equal(closedCycleIsolationAudit.graphNodes['cap-open-prereq'].slack, 0, 'active prerequisite gets 0 slack');
+  assert.equal(closedCycleIsolationAudit.graphNodes['cap-auth-root'].slack, null, 'closed historical cycle node gets null slack');
+  assert.equal(closedCycleIsolationAudit.graphNodes['cap-auth-root'].inCycle, false, 'closed historical cycle node gets inCycle=false');
 
   // 4b. Scoped graph.js keyboard shortcuts (inactive outside #/graph) & >20-label top-20 cross-label heatmap matrix.
   await click(page, 'a[href="#/issues"]');
@@ -1942,21 +2337,135 @@ async function capabilitiesJourney(page) {
 
 async function standaloneGraphJourney(page) {
   await waitFor(page, `typeof Graph !== 'undefined' && typeof applyFilters === 'function' && typeof computeNodeColor === 'function' && DATA.nodes.length === 6`, 'standalone interactive HTML graph booted');
-  const initialAudit = await evaluate(page, `(() => {
+  const adversarialMarkdown = [
+    '> Quote line',
+    '',
+    'Inline: `a < b && c != "x"` and **bold**',
+    '',
+    '```go',
+    'fmt.Println("safe")',
+    '```',
+    '',
+    '| ColA | ColB |',
+    '| :--- | ---: |',
+    '| left | right |',
+    '',
+    '[SafeDocs](https://example.com/docs "DocsTitle")',
+    '[bad-js](javascript:window.__js_xss=1)',
+    '[tab-js](java&#x09;script:window.__tab_xss=1)',
+    '[proto-rel](//evil.example/steal)',
+    '[backslash](/\\evil.example/steal)',
+    '<img src=x onerror="window.__img_xss=1">',
+    '<svg><a id="animlink" href="https://example.com"><text y="20">ClickMe</text><set attributeName="href" to="javascript:window.__svg_set_xss=1"/></a></svg>',
+    '<svg><animate attributeName="href" values="javascript:window.__svg_anim_xss=1"/></svg>',
+    '<math><mtext><script>window.__math_xss=1</script></mtext></math>',
+    '<template><script>window.__tmpl_xss=1</script></template>',
+    '<button formaction="javascript:window.__form_xss=1">Submit</button>',
+    '<a id="DATA" name="m-slack" style="position:fixed" onclick="window.__click_xss=1" href="https://example.com/clobber">Clobber</a>',
+  ].join('\n');
+  const initialAudit = await evaluate(page, `(async () => {
     const blockedNode = DATA.nodes.find(n => n.id === 'cap-hub-leaf');
     const closedNode = DATA.nodes.find(n => n.id === 'cap-closed-prereq');
     populatePanelContent('docked-', closedNode);
     const closedBadges = [...document.querySelectorAll('#docked-badges .badge')].map(el => el.textContent.trim());
+    populatePanelContent('docked-', blockedNode);
+    const blockedBadges = [...document.querySelectorAll('#docked-badges .badge')].map(el => el.textContent.trim());
+    const dockedMetricsText = document.getElementById('docked-metrics')?.textContent || '';
+    const statCritical = document.getElementById('stat-critical')?.textContent.trim() || '';
+
+    const frag = renderSafeMarkdownFragment(${JSON.stringify(adversarialMarkdown)});
+    const isDocFragment = frag instanceof DocumentFragment;
+    const descEl = document.getElementById('docked-description-content');
+    descEl.replaceChildren(frag);
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+    const mdHtml = descEl.innerHTML;
+    const forbiddenTagCount = descEl.querySelectorAll('svg, math, set, animate, script, template, iframe, object, embed, form, input, button, textarea, select, style, link, meta, base, img').length;
+    const nonXhtmlCount = [...descEl.querySelectorAll('*')].filter(el => el.namespaceURI !== 'http://www.w3.org/1999/xhtml').length;
+    const unsafeAttrCount = [...descEl.querySelectorAll('*')].filter(el =>
+      el.hasAttribute('id') || el.hasAttribute('name') || el.hasAttribute('style') ||
+      [...el.attributes].some(a => a.name.toLowerCase().startsWith('on') || a.name.toLowerCase() === 'formaction' || a.name.toLowerCase() === 'srcdoc')
+    ).length;
+    const anchorAudit = [...descEl.querySelectorAll('a')].map(a => ({
+      text: a.textContent.trim(),
+      href: a.getAttribute('href'),
+      rel: a.getAttribute('rel'),
+      target: a.getAttribute('target'),
+    }));
+    const xssGlobalsTriggered = Boolean(
+      window.__js_xss || window.__tab_xss || window.__img_xss || window.__svg_set_xss ||
+      window.__svg_anim_xss || window.__math_xss || window.__tmpl_xss || window.__form_xss || window.__click_xss
+    );
+    const dataClobbered = !Array.isArray(DATA?.nodes);
+
+    toggleLightMode();
+    const lightOn = document.body.classList.contains('light-mode');
+    toggleLightMode();
+    const lightOff = !document.body.classList.contains('light-mode');
+
+    localStorage.setItem('bv-graph-layout', 'td');
+    applyGraphDagMode('td');
+
     return {
+      dataHasCycles: DATA.has_cycles,
+      dataSlackAvailable: DATA.slack_available,
+      blockedSlackAvailable: blockedNode?.slack_available,
+      closedSlackAvailable: closedNode?.slack_available,
       blockedNodeBlockerCount: blockedNode?.blockerCount || 0,
       blockedNodeColor: computeNodeColor(blockedNode),
       expectedBlockedColor: STATUS_COLORS.blocked,
       closedBadges,
+      blockedBadges,
+      dockedMetricsText,
+      statCritical,
+      isDocFragment,
+      mdHtml,
+      forbiddenTagCount,
+      nonXhtmlCount,
+      unsafeAttrCount,
+      anchorAudit,
+      xssGlobalsTriggered,
+      dataClobbered,
+      lightOn,
+      lightOff,
     };
   })()`);
+  assert.equal(initialAudit.dataHasCycles, true, 'cyclic standalone graph sets DATA.has_cycles=true');
+  assert.equal(initialAudit.dataSlackAvailable, false, 'cyclic standalone graph sets DATA.slack_available=false');
+  assert.equal(initialAudit.blockedSlackAvailable, false, 'cyclic standalone graph node sets slack_available=false');
+  assert.equal(initialAudit.closedSlackAvailable, false, 'closed standalone graph node sets slack_available=false');
+  assert.equal(initialAudit.statCritical, '0', 'cyclic standalone graph reports 0 critical-path nodes');
   assert.equal(initialAudit.blockedNodeBlockerCount, 1, 'cap-hub-leaf counts only active blocker cap-auth-root, not cap-closed-prereq');
   assert.equal(initialAudit.blockedNodeColor, initialAudit.expectedBlockedColor, 'active node with blockers colors with STATUS_COLORS.blocked');
   assert.equal(initialAudit.closedBadges.includes('Critical Path'), false, 'closed node never receives Critical Path badge');
+  assert.equal(initialAudit.blockedBadges.includes('Critical Path'), false, 'cyclic active node never receives false Critical Path badge');
+  assert.ok(initialAudit.dockedMetricsText.includes('N/A (cycle)'), `cyclic standalone graph shows N/A (cycle) slack: ${initialAudit.dockedMetricsText}`);
+  assert.equal(initialAudit.isDocFragment, true, 'renderSafeMarkdownFragment returns a live DocumentFragment');
+  assert.equal(initialAudit.forbiddenTagCount, 0, 'zero forbidden/foreign/form/script/template/svg/math tags survive sanitizer');
+  assert.equal(initialAudit.nonXhtmlCount, 0, 'all surviving Markdown elements belong strictly to XHTML namespace');
+  assert.equal(initialAudit.unsafeAttrCount, 0, 'zero id, name, style, event-handler, or formaction attributes survive sanitizer');
+  assert.equal(initialAudit.xssGlobalsTriggered, false, 'no XSS payload executed in live Chrome DOM');
+  assert.equal(initialAudit.dataClobbered, false, 'DOM clobbering id="DATA" stripped cleanly');
+  assert.deepEqual(
+    initialAudit.anchorAudit.filter(a => a.href !== null),
+    [
+      { text: 'SafeDocs', href: 'https://example.com/docs', rel: 'noopener noreferrer', target: '_blank' },
+      { text: 'Clobber', href: 'https://example.com/clobber', rel: 'noopener noreferrer', target: '_blank' },
+    ],
+    `only validated https:// hrefs survive with rel="noopener noreferrer" target="_blank": ${JSON.stringify(initialAudit.anchorAudit)}`
+  );
+  assert.ok(
+    initialAudit.mdHtml.includes('<blockquote>') &&
+    initialAudit.mdHtml.includes('a &lt; b &amp;&amp; c != "x"') &&
+    !initialAudit.mdHtml.includes('&amp;lt;') &&
+    initialAudit.mdHtml.includes('class="language-go"') &&
+    initialAudit.mdHtml.includes('<table>'),
+    `renderSafeMarkdownFragment preserves blockquotes, code, language-* class, and tables without double-escaping: ${initialAudit.mdHtml}`
+  );
+  assert.ok(!initialAudit.mdHtml.includes('onerror') && !initialAudit.mdHtml.includes('javascript:') && !initialAudit.mdHtml.includes('evil.example'),
+    `renderSafeMarkdownFragment strips XSS attributes, javascript: schemes, and protocol-relative/backslash URLs: ${initialAudit.mdHtml}`);
+  assert.equal(initialAudit.lightOn, true, 'toggleLightMode enables body.light-mode');
+  assert.equal(initialAudit.lightOff, true, 'toggleLightMode restores dark mode');
+  await waitFor(page, `document.getElementById('view-mode')?.value === 'force' && localStorage.getItem('bv-graph-layout') === null && !Graph.dagMode() && (document.getElementById('toast')?.textContent || '').includes('Cannot apply DAG layout: dependency cycle detected')`, 'ForceGraph onDagError recovers from cycle, resets #view-mode to force, clears localStorage, and shows toast');
 
   // Verify unified applyFilters across status, label, priority, and search.
   const filterAudit = await evaluate(page, `(() => {
@@ -1982,6 +2491,8 @@ async function standaloneGraphJourney(page) {
     const hub = graphNodes.find(n => n.id === 'cap-hub-leaf');
     const ui = graphNodes.find(n => n.id === 'cap-auth-ui');
     selectNode(hub);
+    const sidebarSlackText = document.getElementById('m-slack')?.textContent.trim() || '';
+    const sidebarSlackHighlighted = Boolean(document.getElementById('m-slack')?.classList.contains('highlight'));
     document.getElementById('btn-recent').click();
     const recentOpenAfterClick = document.getElementById('recent-panel').classList.contains('visible') &&
       document.getElementById('btn-recent').classList.contains('active');
@@ -2013,6 +2524,8 @@ async function standaloneGraphJourney(page) {
     const allVisibleAfterReset = DATA.nodes.filter(n => currentVisibilityFilter(n)).length;
 
     return {
+      sidebarSlackText,
+      sidebarSlackHighlighted,
       recentOpenAfterClick,
       recentIds,
       startAfterFirst,
@@ -2026,6 +2539,8 @@ async function standaloneGraphJourney(page) {
       allVisibleAfterReset,
     };
   })()`);
+  assert.equal(recentAndPathAudit.sidebarSlackText, 'N/A (cycle)', 'selectNode sets #m-slack to N/A (cycle) when slack_available=false');
+  assert.equal(recentAndPathAudit.sidebarSlackHighlighted, false, 'selectNode never adds .highlight to #m-slack when slack_available=false');
   assert.equal(recentAndPathAudit.recentOpenAfterClick, true);
   assert.deepEqual(recentAndPathAudit.recentIds, ['cap-hub-leaf']);
   assert.equal(recentAndPathAudit.startAfterFirst, 'cap-hub-leaf');

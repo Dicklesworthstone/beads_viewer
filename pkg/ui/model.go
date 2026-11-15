@@ -277,6 +277,19 @@ type SourceReloadResult struct {
 	Warnings            []string
 	Workspace           *WorkspaceInfo
 	AuthorityIncomplete bool
+	SourcePath          string
+	SourceDegraded      bool
+	ReloadDuration      time.Duration
+}
+
+// SetExplicitDB records whether the issue source was pinned via an explicit
+// --db flag or BEADS_DB override, preventing auto-promotion to JSONL background
+// file watching and scoping semantic index paths distinctly.
+func (m *Model) SetExplicitDB(explicit bool) {
+	if m == nil {
+		return
+	}
+	m.isExplicitDB = explicit
 }
 
 // SetSourceReload supplies a live reload route for aggregated sources. Replacing
@@ -313,12 +326,45 @@ func (m *Model) sourceReloadCmd() tea.Cmd {
 	reload, version, request := m.sourceReload, m.sourceVersion, m.sourceReloadRequest
 	return func() tea.Msg {
 		defer cancel()
+		start := time.Now()
 		result, err := reload(ctx)
 		if ctx.Err() != nil {
 			err = errors.Join(err, ctx.Err())
 		}
+		if err == nil && result.ReloadDuration == 0 {
+			result.ReloadDuration = time.Since(start)
+		}
 		return FileChangedMsg{source: &result, err: err, sourceVersion: version, request: request}
 	}
+}
+
+func (m *Model) startSourceReload() tea.Cmd {
+	if m == nil {
+		return nil
+	}
+	if m.pendingTrackerRefresh != nil {
+		return m.retryEditorExport()
+	}
+	if m.backgroundWorker != nil && m.backgroundWorker.State() != WorkerStopped {
+		m.backgroundWorker.HandleRefreshRequest(RefreshRequestMsg{Force: true})
+		return nil
+	}
+	if m.backgroundWorker != nil {
+		m.backgroundWorker = nil
+	}
+	if m.sourceReload != nil {
+		return m.sourceReloadCmd()
+	}
+	if m.beadsPath == "" && m.watcher == nil {
+		return nil
+	}
+	return func() tea.Msg { return FileChangedMsg{} }
+}
+
+// TriggerSourceReload initiates a live reload of the configured issue source
+// (aggregated workspace/multi-source reload callback, background worker, or file reload).
+func (m *Model) TriggerSourceReload() tea.Cmd {
+	return m.startSourceReload()
 }
 
 // editorExitMsg is sent when a terminal editor process exits after editing an issue (bv-134).
@@ -792,6 +838,20 @@ func loadIssuesForReloadWithDegraded(path string, opts loader.ParseOptions, sour
 		complete = false
 	}
 	loader.AttachIssueOrigins(loaded.Issues, path, complete)
+	if !isSQLiteReloadPath(path) && len(loaded.Issues) > 0 {
+		if orig := loaded.Issues[0].Origin; orig != nil && orig.Tracker == "br" && orig.Database != "" {
+			sibSrc := datasource.DataSource{Type: datasource.SourceTypeSQLite, Path: orig.Database}
+			if datasource.ValidateSource(&sibSrc) != nil {
+				complete = false
+				for i := range loaded.Issues {
+					if loaded.Issues[i].Origin != nil {
+						loaded.Issues[i].Origin.Database = ""
+						loaded.Issues[i].Origin.ReadOnlyReason = "sibling SQLite database is corrupt"
+					}
+				}
+			}
+		}
+	}
 	result := reloadIssueData{
 		Authority:         model.NewReadinessIndex(loaded.Issues),
 		AuthorityHash:     analysis.ComputeDataHash(loaded.Issues),
@@ -1279,23 +1339,36 @@ type ReadinessScope struct {
 	CandidateIDs        map[string]bool
 	AuthorityIncomplete bool
 	SourceDegraded      bool
+	ExplicitDB          bool
+}
+
+type advancedInsightsCacheKey struct {
+	stats        *analysis.GraphStats
+	dataGen      uint64
+	recipeName   string
+	activeRepos  string
+	candidateLen int
 }
 
 // Model is the main Bubble Tea model for the beads viewer
 type Model struct {
 	// Data
-	issues                  []model.Issue
-	pooledIssues            []*model.Issue // Issue pool refs for sync reloads (return to pool on replace)
-	issueMap                map[string]*model.Issue
-	analyzer                *analysis.Analyzer
-	analysis                *analysis.GraphStats
-	phase2PreparationCancel context.CancelFunc
-	candidateIDs            map[string]bool  // Owned selection; graph context remains in issues.
-	authorityIncomplete     bool             // True when authority is incomplete, historical, or warned.
-	sourceDegraded          bool             // True when discovery fell back to a stale/degraded source.
-	beadsPath               string           // Path to beads.jsonl for reloading
-	watcher                 *watcher.Watcher // File watcher for live reload
-	instanceLock            *instance.Lock   // Multi-instance coordination lock
+	issues                   []model.Issue
+	pooledIssues             []*model.Issue // Issue pool refs for sync reloads (return to pool on replace)
+	issueMap                 map[string]*model.Issue
+	analyzer                 *analysis.Analyzer
+	analysis                 *analysis.GraphStats
+	phase2PreparationCancel  context.CancelFunc
+	candidateIDs             map[string]bool  // Owned selection; graph context remains in issues.
+	authorityIncomplete      bool             // True when authority is incomplete, historical, or warned.
+	sourceDegraded           bool             // True when discovery fell back to a stale/degraded source.
+	isExplicitDB             bool             // True when source was explicitly pinned via --db / BEADS_DB.
+	beadsPath                string           // Path to beads.jsonl for reloading
+	watcher                  *watcher.Watcher // File watcher for live reload
+	instanceLock             *instance.Lock   // Multi-instance coordination lock
+	advancedInsightsCache    *analysis.AdvancedInsights
+	advancedInsightsCacheKey advancedInsightsCacheKey
+	advancedInsightsComputes uint64
 
 	// Background Worker (Phase 2 architecture - bv-m7v8)
 	// snapshot is the current immutable data snapshot from BackgroundWorker.
@@ -1521,9 +1594,13 @@ type Model struct {
 	workDir          string // Working directory for agent file detection
 
 	// Tutorial integration (bv-8y31)
-	showTutorial        bool
-	tutorialModel       TutorialModel
-	focusBeforeTutorial focus
+	showTutorial              bool
+	tutorialModel             TutorialModel
+	focusBeforeTutorial       focus
+	contextBeforeTutorial     string
+	capsLockTracker           *CapsLockTracker
+	tutorialKeyBindings       TutorialKeyBindings
+	tutorialKeyBindingsLoaded bool
 
 	// Cass session preview modal (bv-5bqh)
 	showCassModal   bool
@@ -1699,6 +1776,8 @@ func (m *Model) beginSemanticDatasetUpdate() {
 	// cannot seed a lookup for refreshed title or timestamp metadata.
 	m.cassCorrelator = nil
 	m.historyView.ClearSessionCache()
+	m.advancedInsightsCache = nil
+	m.advancedInsightsCacheKey = advancedInsightsCacheKey{}
 	m.semanticDataGeneration++
 	m.invalidateSemanticFilter()
 	m.semanticIndexBuilding = false
@@ -1721,6 +1800,10 @@ func (m *Model) beginSemanticDatasetUpdate() {
 	}
 }
 
+func (m *Model) semanticIndexScopeKey() string {
+	return semanticIndexScopeKey(m.workDir, m.beadsPath, m.isExplicitDB)
+}
+
 func (m *Model) startSemanticIndexBuild() tea.Cmd {
 	if m.semanticSearch == nil {
 		return nil
@@ -1732,10 +1815,10 @@ func (m *Model) startSemanticIndexBuild() tea.Cmd {
 	m.semanticIndexBuildGen++
 	m.semanticIndexBuildData = m.semanticDataGeneration
 	indexWorkDir := m.workDir
-	if m.beadsPath == "" {
+	if m.beadsPath == "" || strings.HasPrefix(strings.TrimSpace(m.beadsPath), "git:") {
 		indexWorkDir = ""
 	}
-	return BuildSemanticIndexCmd(m.issuesForAsync(), m.semanticDataGeneration, m.semanticIndexBuildGen, indexWorkDir)
+	return BuildSemanticIndexCmd(m.issuesForAsync(), m.semanticDataGeneration, m.semanticIndexBuildGen, indexWorkDir, m.semanticIndexScopeKey())
 }
 
 func (m *Model) queueSemanticIndexSave(request semanticIndexSaveRequest) tea.Cmd {
@@ -2324,10 +2407,14 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	var authority *model.ReadinessIndex
 	authorityIncomplete := false
 	sourceDegraded := false
+	isExplicitDB := strings.TrimSpace(env.BeadsDB.Get()) != ""
 	if len(scope) > 0 {
 		authority = scope[0].Authority
 		sourceDegraded = scope[0].SourceDegraded
 		authorityIncomplete = scope[0].AuthorityIncomplete || sourceDegraded
+		if scope[0].ExplicitDB {
+			isExplicitDB = true
+		}
 	}
 	if authority == nil {
 		authority = model.NewReadinessIndex(issues)
@@ -2395,6 +2482,9 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	readyNow := analyzer.Now()
 	for i := range issues {
 		issue := &issues[i]
+		if candidateIDs != nil && !candidateIDs[issue.ID] {
+			continue
+		}
 		if isClosedLikeStatus(issue.Status) {
 			cClosed++
 			continue
@@ -2663,6 +2753,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		candidateIDs:            candidateIDs,
 		authorityIncomplete:     authorityIncomplete,
 		sourceDegraded:          sourceDegraded,
+		isExplicitDB:            isExplicitDB,
 		analysis:                graphStats,
 		beadsPath:               beadsPath,
 		watcher:                 fileWatcher,
@@ -2734,12 +2825,16 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		// AGENTS.md integration (bv-i8dk) - workDir derived from beadsPath
 		workDir: workDir,
 		// Tutorial integration (bv-8y31)
-		tutorialModel: NewTutorialModel(theme),
+		tutorialModel:             NewTutorialModel(theme),
+		capsLockTracker:           NewCapsLockTracker(),
+		tutorialKeyBindings:       DefaultTutorialKeyBindings(),
+		tutorialKeyBindingsLoaded: true,
 	}
 
 	m.installBackgroundWorker(backgroundWorker)
 	m.registerKeyBindings()
 	m.attachHistoryCassLookup()
+	m.recomputeVisibleAlertCounts()
 	if activeRecipe != nil {
 		m.setActiveRecipe(activeRecipe)
 		m.applyRecipe(activeRecipe)
@@ -2772,6 +2867,7 @@ func (m *Model) SetWorkDir(dir string) {
 			m.sprintAtRiskThresholds = driftCfg.AtRiskThresholds()
 		}
 		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
+		m.recomputeVisibleAlertCounts()
 	}
 }
 
@@ -2814,6 +2910,43 @@ func (m *Model) syncBoardReadinessAndFullIssues() {
 		return
 	}
 	m.board.SetFullIssues(m.issues)
+}
+
+func (m *Model) currentAdvancedInsightsKey() advancedInsightsCacheKey {
+	recipeName := ""
+	if m.activeRecipe != nil {
+		recipeName = m.activeRecipe.Name
+	}
+	reposKey := ""
+	if m.workspaceMode && m.activeRepos != nil {
+		reposKey = strings.Join(sortedRepoKeys(m.activeRepos), ",")
+	}
+	candLen := -1
+	if m.candidateIDs != nil {
+		candLen = len(m.candidateIDs)
+	}
+	return advancedInsightsCacheKey{
+		stats:        m.analysis,
+		dataGen:      m.semanticDataGeneration,
+		recipeName:   recipeName,
+		activeRepos:  reposKey,
+		candidateLen: candLen,
+	}
+}
+
+func (m *Model) cachedOrComputeAdvancedInsights(analyzer *analysis.Analyzer, stats *analysis.GraphStats) *analysis.AdvancedInsights {
+	if analyzer == nil || stats == nil {
+		return nil
+	}
+	key := m.currentAdvancedInsightsKey()
+	if m.advancedInsightsCache != nil && m.advancedInsightsCacheKey == key {
+		return m.advancedInsightsCache
+	}
+	adv := analyzer.GenerateAdvancedInsightsFromStats(stats, analysis.DefaultAdvancedInsightsConfig())
+	m.advancedInsightsComputes++
+	m.advancedInsightsCache = adv
+	m.advancedInsightsCacheKey = key
+	return adv
 }
 
 // rebuildInsightsPanel refreshes the underlying insights view model from the
@@ -2875,16 +3008,29 @@ func (m *Model) rebuildInsightsPanel() {
 	panel.showHeatmap = prev.showHeatmap
 	panel.detailRatio = prev.detailRatio
 
+	wantsAdvanced := m.effectiveUnderlyingFocus() == focusInsights
 	if scopedAnalyzer != nil && scopedStats != nil {
 		triage := analysis.ComputeTriageFromAnalyzer(scopedAnalyzer, scopedStats, scoped, analysis.TriageOptions{}, scopedAnalyzer.Now())
 		panel.SetTopPicks(triage.QuickRef.TopPicks)
 		dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
 		panel.SetRecommendations(triage.Recommendations, dataHash)
+		if wantsAdvanced && scopedStats.IsPhase2Ready() {
+			panel.SetAdvancedInsights(m.cachedOrComputeAdvancedInsights(scopedAnalyzer, scopedStats))
+		} else {
+			panel.SetAdvancedInsights(nil)
+		}
 	} else if m.analyzer != nil && m.analysis != nil {
 		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analyzer.Now())
 		panel.SetTopPicks(triage.QuickRef.TopPicks)
 		dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
 		panel.SetRecommendations(triage.Recommendations, dataHash)
+		if wantsAdvanced && (m.analysis.IsPhase2Ready() || (m.snapshot != nil && m.snapshot.IsPhase2Ready())) {
+			panel.SetAdvancedInsights(m.cachedOrComputeAdvancedInsights(m.analyzer, m.analysis))
+		} else {
+			panel.SetAdvancedInsights(nil)
+		}
+	} else {
+		panel.SetAdvancedInsights(nil)
 	}
 
 	panelHeight := m.height - 2
@@ -3290,7 +3436,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingSelectedID = ""
 		}
 		m.updateListDelegate()
-		if m.isSplitView || m.showDetails {
+		if m.isSplitView || m.showDetails || (m.effectiveUnderlyingFocus() == focusFlowMatrix && m.flowDetailID != "") {
 			m.updateViewportContent()
 		}
 		return m, tea.Batch(cmd, m.pendingSemanticFilterCmd())
@@ -3611,11 +3757,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Update UI components with Phase 2 insights
+		m.advancedInsightsCache = nil
+		m.advancedInsightsCacheKey = advancedInsightsCacheKey{}
 		bodyHeight := m.height - 1
 		if bodyHeight < 5 {
 			bodyHeight = 5
 		}
-		if m.workspaceMode && m.activeRepos != nil {
+		if m.effectiveUnderlyingFocus() == focusInsights || (m.workspaceMode && m.activeRepos != nil) {
 			m.insightsPanel.SetSize(m.mainContentWidth(), bodyHeight)
 			m.rebuildInsightsPanel()
 		} else {
@@ -3635,6 +3783,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Set full recommendations with breakdown for priority radar (bv-93)
 			dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
 			m.insightsPanel.SetRecommendations(triage.Recommendations, dataHash)
+			m.insightsPanel.SetAdvancedInsights(nil)
+			m.insightsPanel.ClampSelections()
 		}
 		if m.workspaceMode && m.activeRepos != nil {
 			if m.isGraphView {
@@ -3664,6 +3814,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
 		}
+		m.recomputeVisibleAlertCounts()
 
 		// Invalidate label health and attention caches since we have new graph metrics (criticality)
 		m.labelHealthCached = false
@@ -3704,7 +3855,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if visible := len(m.list.VisibleItems()); visible > 0 && m.list.Index() >= visible {
 			m.list.Select(0)
 		}
-		if m.isSplitView || m.showDetails {
+		if m.isSplitView || m.showDetails || (underlyingFocus == focusFlowMatrix && m.flowDetailID != "") {
 			m.updateViewportContent()
 		}
 
@@ -3729,8 +3880,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Mark snapshot as Phase 2 ready
 		m.snapshot.phase2Ready = true
+		m.advancedInsightsCache = nil
+		m.advancedInsightsCacheKey = advancedInsightsCacheKey{}
 		m.syncBoardReadinessAndFullIssues()
-		if m.workspaceMode && m.activeRepos != nil {
+		if m.effectiveUnderlyingFocus() == focusInsights || (m.workspaceMode && m.activeRepos != nil) {
 			m.rebuildInsightsPanel()
 		}
 		if m.isBoardView || (m.isGraphView && m.workspaceMode && m.activeRepos != nil) {
@@ -3844,6 +3997,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.focused = m.restoreTopModalOrListFocus()
 		}
 
+	case CapsLockTimerExpiredMsg:
+		if m.capsLockTracker != nil && m.capsLockTracker.HandleTimerExpired() == TriggerFullTutorial {
+			if !m.showTutorial && !m.isTextInputActive() && !m.showQuitConfirm {
+				m.openFullTutorialFromFocus(m.focused)
+			}
+		}
+		return m, nil
+
+	case ShowTutorialMsg:
+		if m.capsLockTracker != nil {
+			m.capsLockTracker.Reset()
+		}
+		if msg.ContextOnly {
+			ctx := msg.Context
+			if ctx == "" {
+				ctx = string(m.CurrentContext())
+			}
+			m.openContextTutorialWithContext(m.focused, ctx)
+		} else {
+			m.openFullTutorialFromFocus(m.focused)
+		}
+		return m, nil
+
 	case SnapshotReadyMsg:
 		// Background worker has a new snapshot ready (bv-m7v8)
 		// This is the atomic pointer swap - O(1), sub-microsecond
@@ -3942,12 +4118,36 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.analyzer.SetWeights(*w)
 			}
 		}
-		m.countOpen = msg.Snapshot.CountOpen
-		m.countReady = msg.Snapshot.CountReady
-		m.countBlocked = msg.Snapshot.CountBlocked
-		m.countClosed = msg.Snapshot.CountClosed
 		if m.candidateIDs != nil {
-			m.countReady = len(m.analyzer.GetActionableIssues())
+			cOpen, cReady, cBlocked, cClosed := 0, 0, 0, 0
+			readiness := m.analyzer.Readiness()
+			readyNow := m.analysisReferenceTime()
+			for i := range m.issues {
+				issue := &m.issues[i]
+				if !m.candidateIDs[issue.ID] {
+					continue
+				}
+				if isClosedLikeStatus(issue.Status) {
+					cClosed++
+					continue
+				}
+				cOpen++
+				if issue.Status == model.StatusBlocked {
+					cBlocked++
+				}
+				if m.analyzer.IsCandidate(issue.ID) && readiness.Ready(issue.ID, readyNow) {
+					cReady++
+				}
+			}
+			m.countOpen = cOpen
+			m.countReady = cReady
+			m.countBlocked = cBlocked
+			m.countClosed = cClosed
+		} else {
+			m.countOpen = msg.Snapshot.CountOpen
+			m.countReady = msg.Snapshot.CountReady
+			m.countBlocked = msg.Snapshot.CountBlocked
+			m.countClosed = msg.Snapshot.CountClosed
 		}
 		m.syncBoardReadinessAndFullIssues()
 		oldPooled := m.pooledIssues
@@ -3978,16 +4178,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			clear(m.labelDrilldownCache)
 		}
 
-		// Alerts are derived while the immutable snapshot is built, off the UI loop.
-		m.alerts = msg.Snapshot.alerts
-		m.alertsCritical = msg.Snapshot.alertsCritical
-		m.alertsWarning = msg.Snapshot.alertsWarning
-		m.alertsInfo = msg.Snapshot.alertsInfo
+		// Alerts are derived while the immutable snapshot is built, off the UI loop,
+		// except when candidateIDs scope the UI view (where global alerts must be
+		// recomputed against the candidate-scoped analyzer).
 		if m.dismissedAlerts == nil {
 			m.dismissedAlerts = make(map[string]bool)
 		} else {
 			clear(m.dismissedAlerts)
 		}
+		if m.candidateIDs != nil {
+			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
+		} else {
+			m.alerts = msg.Snapshot.alerts
+			m.alertsCritical = msg.Snapshot.alertsCritical
+			m.alertsWarning = msg.Snapshot.alertsWarning
+			m.alertsInfo = msg.Snapshot.alertsInfo
+		}
+		m.recomputeVisibleAlertCounts()
 		m.showAlertsPanel = false
 
 		// Invalidate every async semantic result from the previous dataset before
@@ -4003,11 +4210,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Regenerate sub-views (Phase 1 data; Phase 2 will update via Phase2ReadyMsg)
-		if m.workspaceMode && m.activeRepos != nil {
+		if underlyingFocus == focusInsights || (m.workspaceMode && m.activeRepos != nil) {
 			m.rebuildInsightsPanel()
 		} else {
 			m.insightsPanel.SetInsights(m.snapshot.GetInsights())
 			m.insightsPanel.SetIssueMap(m.issueMap)
+			m.insightsPanel.SetAdvancedInsights(nil)
+			m.insightsPanel.ClampSelections()
 			bodyHeight := m.height - 1
 			if bodyHeight < 5 {
 				bodyHeight = 5
@@ -4234,7 +4443,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshLabelViews(underlyingFocus)
 
 		// Refresh detail pane if visible
-		if m.isSplitView || m.showDetails {
+		if m.isSplitView || m.showDetails || (underlyingFocus == focusFlowMatrix && m.flowDetailID != "") {
 			m.updateViewportContent()
 		}
 		if oldSnapshot != nil && oldSnapshot.hasPooledIssues() {
@@ -4323,16 +4532,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.sourceReloadCancel = nil
-		} else if m.sourceReload != nil {
-			return m, m.sourceReloadCmd()
 		}
-		// File changed on disk - reload issues and recompute analysis
+		// File changed on disk - reload issues and recompute analysis.
 		// In background mode the BackgroundWorker owns file watching and snapshot building.
-		if m.backgroundWorker != nil {
+		if m.backgroundWorker != nil && m.backgroundWorker.State() != WorkerStopped && msg.source == nil {
 			if m.watcher != nil {
 				cmds = append(cmds, WatchFileCmd(m.watcher))
 			}
 			return m, tea.Batch(cmds...)
+		}
+		if m.backgroundWorker != nil && m.backgroundWorker.State() == WorkerStopped {
+			m.backgroundWorker = nil
+		}
+		if msg.source == nil && m.sourceReload != nil {
+			return m, m.sourceReloadCmd()
 		}
 		if m.beadsPath == "" && msg.source == nil {
 			// Re-start watch for next change
@@ -4397,7 +4610,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}, m.sourceDegraded)
 		}
 		if profileRefresh {
-			recordTiming("load_issues", time.Since(loadStart))
+			loadDur := time.Since(loadStart)
+			if msg.source != nil {
+				loadDur += msg.source.ReloadDuration
+			}
+			recordTiming("load_issues", loadDur)
 		}
 		if err != nil {
 			m.statusMsg = fmt.Sprintf("Reload error: %v", err)
@@ -4411,13 +4628,34 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.sourceStaleReason = ""
 		if msg.source != nil {
-			m.authorityIncomplete = msg.source.AuthorityIncomplete || len(msg.source.Warnings) > 0
-			m.candidateIDs = maps.Clone(msg.source.CandidateIDs)
 			if msg.source.Workspace != nil {
 				activeRepos := m.activeRepos
 				m.EnableWorkspaceMode(*msg.source.Workspace)
 				m.activeRepos = activeRepos
 			}
+			if !m.workspaceMode && msg.source.SourcePath != "" {
+				prevPath := m.beadsPath
+				m.beadsPath = msg.source.SourcePath
+				m.tree.SetBeadsDir(filepath.Dir(m.beadsPath))
+				m.tree.SetReadOnly(strings.HasPrefix(m.beadsPath, "git:"))
+				if prevPath != m.beadsPath {
+					if m.backgroundWorker != nil && !strings.HasSuffix(strings.ToLower(m.beadsPath), ".jsonl") {
+						m.backgroundWorker.Stop()
+						m.backgroundWorker = nil
+					}
+					if m.watcher != nil && !strings.HasPrefix(m.beadsPath, "git:") {
+						if w, wErr := watcher.NewWatcher(m.beadsPath, watcher.WithDebounceDuration(200*time.Millisecond)); wErr == nil {
+							if sErr := w.Start(); sErr == nil {
+								m.watcher.Stop()
+								m.watcher = w
+							}
+						}
+					}
+				}
+			}
+			m.sourceDegraded = msg.source.SourceDegraded
+			m.authorityIncomplete = msg.source.AuthorityIncomplete || msg.source.SourceDegraded
+			m.candidateIDs = maps.Clone(msg.source.CandidateIDs)
 		} else {
 			m.authorityIncomplete = m.sourceDegraded || !loadedIssues.AuthorityComplete || len(reloadWarnings) > 0
 		}
@@ -4455,7 +4693,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if newIssues[i].Priority != newIssues[j].Priority {
 				return newIssues[i].Priority < newIssues[j].Priority
 			}
-			return newIssues[i].CreatedAt.After(newIssues[j].CreatedAt)
+			if !newIssues[i].CreatedAt.Equal(newIssues[j].CreatedAt) {
+				return newIssues[i].CreatedAt.After(newIssues[j].CreatedAt)
+			}
+			return newIssues[i].ID < newIssues[j].ID
 		})
 		if profileRefresh {
 			recordTiming("sort_issues", time.Since(sortStart))
@@ -4518,6 +4759,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		readyNow := m.analysisReferenceTime()
 		for i := range m.issues {
 			issue := &m.issues[i]
+			if m.candidateIDs != nil && !m.candidateIDs[issue.ID] {
+				continue
+			}
 			if isClosedLikeStatus(issue.Status) {
 				m.countClosed++
 				continue
@@ -4544,6 +4788,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			recordTiming("alerts", time.Since(alertsStart))
 		}
 		m.dismissedAlerts = make(map[string]bool)
+		m.recomputeVisibleAlertCounts()
 		m.showAlertsPanel = false
 
 		// Rebuild list items (preserve triage data to avoid flicker)
@@ -4598,6 +4843,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.insightsPanel.SetInsights(m.analysis.GenerateInsights(len(m.issues)))
 			m.insightsPanel.SetIssueMap(m.issueMap)
+			m.insightsPanel.SetAdvancedInsights(nil)
+			m.insightsPanel.ClampSelections()
 		}
 		if underlyingFocus == focusAttention {
 			var attentionStart time.Time
@@ -4662,7 +4909,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if visible := len(m.list.VisibleItems()); visible > 0 && m.list.Index() >= visible {
 			m.list.Select(0)
 		}
-		if m.isSplitView || m.showDetails {
+		if m.isSplitView || m.showDetails || (underlyingFocus == focusFlowMatrix && m.flowDetailID != "") {
 			m.updateViewportContent()
 		}
 		if oldSnapshot != nil && oldSnapshot.hasPooledIssues() {
@@ -4691,6 +4938,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusMsg += fmt.Sprintf(" (%d warnings)", len(reloadWarnings))
 		}
 		reloadDuration := time.Since(reloadStart)
+		if msg.source != nil {
+			reloadDuration += msg.source.ReloadDuration
+		}
 		if profileRefresh {
 			recordTiming("total", reloadDuration)
 		}
@@ -4716,7 +4966,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Auto-enable background mode after slow sync reloads (opt-out via BV_BACKGROUND_MODE=0).
 		autoEnabled := false
 		slowReload := reloadDuration >= time.Second
-		if (slowReload || m.restoreBackgroundAfterEdit) && m.backgroundWorker == nil && m.beadsPath != "" {
+		canPromoteToBackground := !m.workspaceMode && !m.isExplicitDB && m.candidateIDs == nil &&
+			m.beadsPath != "" && strings.HasSuffix(strings.ToLower(m.beadsPath), ".jsonl")
+		if (slowReload || m.restoreBackgroundAfterEdit) && m.backgroundWorker == nil && canPromoteToBackground {
 			autoAllowed := true
 			if v := strings.TrimSpace(env.BackgroundMode.Get()); v != "" {
 				switch strings.ToLower(v) {
@@ -4735,6 +4987,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.watcher.Stop()
 					}
 					m.watcher = nil
+					if m.sourceReloadCancel != nil {
+						m.sourceReloadCancel()
+						m.sourceReloadCancel = nil
+					}
 					m.installBackgroundWorker(bw)
 					m.restoreBackgroundAfterEdit = false
 					m.snapshotInitPending = true
@@ -4771,6 +5027,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Clear status message on any keypress
 		m.statusMsg = ""
 		m.statusIsError = false
+		if m.capsLockTracker != nil && m.capsLockTracker.IsPending() {
+			tb := m.effectiveTutorialKeyBindings()
+			if !IsCapsLock(msg) && !tb.IsDirectTutorial(msg) {
+				m.capsLockTracker.Reset()
+			}
+		}
 		if msg.String() == "ctrl+c" {
 			return m, m.quitCommand()
 		}
@@ -4792,7 +5054,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// 2) Help overlay (rendered above Tutorial, AgentPrompt, CassModal, UpdateModal, etc.)
 		if m.showHelp {
-			if msg.String() == "`" {
+			tb := m.effectiveTutorialKeyBindings()
+			if tb.IsDirectTutorial(msg) || IsCapsLock(msg) {
+				if m.capsLockTracker != nil {
+					m.capsLockTracker.Reset()
+				}
 				if m.focusBeforeHelp != focusTutorial {
 					m.focusBeforeTutorial = m.focusBeforeHelp
 				}
@@ -4805,7 +5071,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focused = focusTutorial
 				return m, nil
 			}
-			if IsContextHelpTrigger(msg) {
+			if tb.IsContextHelp(msg) {
+				if m.capsLockTracker != nil {
+					m.capsLockTracker.Reset()
+				}
 				if m.focusBeforeHelp != focusTutorial {
 					m.focusBeforeTutorial = m.focusBeforeHelp
 				}
@@ -4828,14 +5097,39 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// 3) Interactive tutorial overlay (rendered above AgentPrompt, CassModal, UpdateModal, etc.)
 		if m.showTutorial {
+			tb := m.effectiveTutorialKeyBindings()
 			if msg.String() == "?" || msg.String() == "f1" {
+				if m.capsLockTracker != nil {
+					m.capsLockTracker.Reset()
+				}
 				m.openHelpFromFocus(focusTutorial)
 				return m, nil
 			}
-			if msg.String() == "`" || IsContextHelpTrigger(msg) {
+			if (tb.IsDirectTutorial(msg) || IsCapsLock(msg)) && tb.DoubleTapEnable && m.capsLockTracker != nil && m.capsLockTracker.IsPending() {
+				trigger, _ := m.capsLockTracker.HandlePress()
+				if trigger == TriggerContextHelp {
+					ctx := m.contextBeforeTutorial
+					if ctx == "" {
+						ctx = string(m.CurrentContext())
+					}
+					m.tutorialModel.SetContext(ctx)
+					m.tutorialModel.SetContextMode(true)
+					m.tutorialModel.SetSize(m.width, m.height)
+					m.tutorialModel.markCurrentPageViewed()
+					m.focused = focusTutorial
+					return m, nil
+				}
+			}
+			if tb.IsDirectTutorial(msg) || tb.IsContextHelp(msg) || IsCapsLock(msg) {
+				if m.capsLockTracker != nil {
+					m.capsLockTracker.Reset()
+				}
 				m.closeTutorial()
 				m.ensureActiveModalInputFocus()
 				return m, nil
+			}
+			if m.capsLockTracker != nil {
+				m.capsLockTracker.Reset()
 			}
 			m.focused = focusTutorial
 			var tutorialCmd tea.Cmd
@@ -4860,7 +5154,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openHelpFromFocus(focusAgentPrompt)
 				return m, nil
 			}
-			if IsContextHelpTrigger(msg) {
+			if m.effectiveTutorialKeyBindings().IsContextHelp(msg) {
 				m.openContextTutorialFromFocus(focusAgentPrompt)
 				return m, nil
 			}
@@ -4900,7 +5194,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focused = m.restoreTopModalOrListFocus()
 				m.ensureActiveModalInputFocus()
 			case AgentPromptDecline:
-				// User declined - just dismiss, may ask again next time
+				// User declined - suppress re-prompting for the current blurb version
+				filePath := m.agentPromptModal.FilePath()
+				if m.workDir != "" {
+					_ = agents.RecordDecline(m.workDir, false)
+				}
+				if dir := filepath.Dir(filePath); dir != "" && dir != "." && dir != m.workDir {
+					_ = agents.RecordDecline(dir, false)
+				}
 				m.showAgentPrompt = false
 				m.focused = m.restoreTopModalOrListFocus()
 				m.ensureActiveModalInputFocus()
@@ -4927,7 +5228,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openHelpFromFocus(focusCassModal)
 				return m, nil
 			}
-			if IsContextHelpTrigger(msg) {
+			if m.effectiveTutorialKeyBindings().IsContextHelp(msg) {
 				m.openContextTutorialFromFocus(focusCassModal)
 				return m, nil
 			}
@@ -4961,7 +5262,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.openHelpFromFocus(focusUpdateModal)
 					return m, nil
 				}
-				if IsContextHelpTrigger(msg) {
+				if m.effectiveTutorialKeyBindings().IsContextHelp(msg) {
 					m.openContextTutorialFromFocus(focusUpdateModal)
 					return m, nil
 				}
@@ -5006,7 +5307,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.openHelpFromFocus(m.focused)
 					return m, nil
 				}
-				if IsContextHelpTrigger(msg) {
+				if m.effectiveTutorialKeyBindings().IsContextHelp(msg) {
 					m.openContextTutorialFromFocus(m.focused)
 					return m, nil
 				}
@@ -5038,7 +5339,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.openHelpFromFocus(m.focused)
 					return m, nil
 				}
-				if IsContextHelpTrigger(msg) {
+				if m.effectiveTutorialKeyBindings().IsContextHelp(msg) {
 					m.openContextTutorialFromFocus(m.focused)
 					return m, nil
 				}
@@ -5064,7 +5365,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.openHelpFromFocus(m.focused)
 					return m, nil
 				}
-				if IsContextHelpTrigger(msg) {
+				if m.effectiveTutorialKeyBindings().IsContextHelp(msg) {
 					m.openContextTutorialFromFocus(m.focused)
 					return m, nil
 				}
@@ -5107,18 +5408,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// 10) Alerts panel modal (bv-168) — routed ABOVE focusAttention and all lower pickers/views
 		if m.showAlertsPanel {
-			var activeAlerts []drift.Alert
-			for _, a := range m.alerts {
-				if !m.dismissedAlerts[alertKey(a)] {
-					activeAlerts = append(activeAlerts, a)
-				}
-			}
+			activeAlerts := m.activeScopedAlerts()
 			s := msg.String()
 			if s == "?" || s == "f1" {
 				m.openHelpFromFocus(m.focused)
 				return m, nil
 			}
-			if IsContextHelpTrigger(msg) {
+			if m.effectiveTutorialKeyBindings().IsContextHelp(msg) {
 				m.openContextTutorialFromFocus(m.focused)
 				return m, nil
 			}
@@ -5154,12 +5450,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.alertsCursor < len(activeAlerts) {
 					key := alertKey(activeAlerts[m.alertsCursor])
 					m.dismissedAlerts[key] = true
-					remaining := 0
-					for _, a := range m.alerts {
-						if !m.dismissedAlerts[alertKey(a)] {
-							remaining++
-						}
-					}
+					m.recomputeVisibleAlertCounts()
+					remaining := len(m.activeScopedAlerts())
 					if m.alertsCursor >= remaining {
 						m.alertsCursor = remaining - 1
 					}
@@ -5201,7 +5493,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openHelpFromFocus(focusRecipePicker)
 				return m, nil
 			}
-			if IsContextHelpTrigger(msg) {
+			if m.effectiveTutorialKeyBindings().IsContextHelp(msg) {
 				m.openContextTutorialFromFocus(focusRecipePicker)
 				return m, nil
 			}
@@ -5217,7 +5509,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openHelpFromFocus(focusRepoPicker)
 				return m, nil
 			}
-			if IsContextHelpTrigger(msg) {
+			if m.effectiveTutorialKeyBindings().IsContextHelp(msg) {
 				m.openContextTutorialFromFocus(focusRepoPicker)
 				return m, nil
 			}
@@ -5268,48 +5560,53 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Handle tutorial toggle (backtick `) - bv-8y31
-		if msg.String() == "`" && !m.isTextInputActive() {
-			if !m.showTutorial {
-				if m.showHelp {
-					m.focusBeforeTutorial = m.focusBeforeHelp
-				} else {
-					m.focusBeforeTutorial = m.focused
+		// Handle CapsLock / tutorial toggle / context-sensitive tutorial trigger - bv-324s, bv-8y31
+		if !m.isTextInputActive() {
+			tb := m.effectiveTutorialKeyBindings()
+			if IsCapsLock(msg) {
+				tracker := m.ensureCapsLockTracker()
+				if tb.DoubleTapEnable {
+					if !tracker.IsPending() {
+						m.contextBeforeTutorial = string(m.CurrentContext())
+					}
+					trigger, tickCmd := tracker.HandlePress()
+					if trigger == TriggerContextHelp {
+						ctx := m.contextBeforeTutorial
+						if ctx == "" {
+							ctx = string(m.CurrentContext())
+						}
+						m.openContextTutorialWithContext(m.focused, ctx)
+						return m, nil
+					}
+					return m, tickCmd
 				}
-				m.showTutorial = true
-				m.showHelp = false // Close help if open
-				m.helpScroll = 0
-				m.tutorialModel.SetContextMode(false)
-				m.tutorialModel.SetSize(m.width, m.height)
-				m.tutorialModel.markCurrentPageViewed() // the resumed page counts as viewed
-				m.focused = focusTutorial
-			} else {
-				m.closeTutorial()
-			}
-			return m, nil
-		}
-
-		// Handle context-sensitive tutorial trigger (~) - bv-324s, bv-8y31
-		if IsContextHelpTrigger(msg) && !m.isTextInputActive() {
-			if m.showTutorial {
-				m.closeTutorial()
+				m.openFullTutorialFromFocus(m.focused)
 				return m, nil
 			}
-			if m.showHelp {
-				m.focusBeforeTutorial = m.focusBeforeHelp
-			} else {
-				m.focusBeforeTutorial = m.focused
+			if tb.IsDirectTutorial(msg) {
+				if !m.showTutorial {
+					m.contextBeforeTutorial = string(m.CurrentContext())
+					m.openFullTutorialFromFocus(m.focused)
+					if tb.DoubleTapEnable {
+						_, tickCmd := m.ensureCapsLockTracker().HandlePress()
+						return m, tickCmd
+					}
+				} else {
+					m.closeTutorial()
+				}
+				return m, nil
 			}
-			ctx := string(m.CurrentContext())
-			m.showHelp = false
-			m.helpScroll = 0
-			m.showTutorial = true
-			m.tutorialModel.SetContext(ctx)
-			m.tutorialModel.SetContextMode(true)
-			m.tutorialModel.SetSize(m.width, m.height)
-			m.tutorialModel.markCurrentPageViewed()
-			m.focused = focusTutorial
-			return m, nil
+			if tb.IsContextHelp(msg) {
+				if m.capsLockTracker != nil {
+					m.capsLockTracker.Reset()
+				}
+				if m.showTutorial {
+					m.closeTutorial()
+					return m, nil
+				}
+				m.openContextTutorialFromFocus(m.focused)
+				return m, nil
+			}
 		}
 
 		// Force refresh (bv-4auz): Ctrl+R / F5 triggers an immediate reload.
@@ -5320,31 +5617,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.lastForceRefresh = now
 
-			m.statusMsg = "Refreshing…"
-			m.statusIsError = false
-			if m.pendingTrackerRefresh != nil {
-				return m, m.retryEditorExport()
-			}
-
-			if m.backgroundWorker != nil && m.backgroundWorker.State() != WorkerStopped {
-				m.backgroundWorker.HandleRefreshRequest(RefreshRequestMsg{Force: true})
-				// Init (or background auto-enable) owns exactly one standing waiter;
-				// every worker message handler re-arms that chain. Starting another
-				// receiver here lets consecutive worker messages be delivered to
-				// Update out of order because tea.Batch runs commands concurrently.
-				return m, tea.Batch(cmds...)
-			}
-			if m.backgroundWorker != nil {
-				m.backgroundWorker = nil
-			}
-
-			if m.beadsPath == "" && m.watcher == nil && m.sourceReload == nil {
+			if m.pendingTrackerRefresh == nil &&
+				(m.backgroundWorker == nil || m.backgroundWorker.State() == WorkerStopped) &&
+				m.beadsPath == "" && m.watcher == nil && m.sourceReload == nil {
+				if m.backgroundWorker != nil {
+					m.backgroundWorker = nil
+				}
 				m.statusMsg = "Refresh unavailable"
 				m.statusIsError = true
 				return m, nil
 			}
 
-			cmds = append(cmds, func() tea.Msg { return FileChangedMsg{} })
+			m.statusMsg = "Refreshing…"
+			m.statusIsError = false
+			if reloadCmd := m.startSourceReload(); reloadCmd != nil {
+				cmds = append(cmds, reloadCmd)
+			}
 			return m, tea.Batch(cmds...)
 		}
 		// Handle shortcuts sidebar toggle (; or F2) - bv-3qi5
@@ -5554,6 +5842,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, editorCmd
 				}
 				return m, nil
+			case "V":
+				return m, m.showCassSessionModal()
+			case "C":
+				return m, m.copyIssueToClipboard()
 			case "y":
 				return m, m.copyIssueIDByIDCmd(m.flowDetailID)
 			case "g", "home":
@@ -5871,7 +6163,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case focusLabelDashboard:
 				switch keyStr {
-				case "j", "k", "up", "down", "g", "home", "G", "end", "enter":
+				case "j", "k", "up", "down", "g", "home", "G", "end", "ctrl+d", "ctrl+u", "pgdown", "pgup", "enter":
 					if selectedLabel, cmd := m.labelDashboard.Update(msg); selectedLabel != "" {
 						// Filter list by selected label and jump back to list view
 						m.setActiveRecipe(nil)
@@ -5961,6 +6253,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				switch keyStr {
 				case "h", "l",
 					"j", "k", "left", "right", "up", "down",
+					"home", "G", "end",
 					"H", "L", "ctrl+d", "ctrl+u", "pgup", "pgdown",
 					"J", "K", " ", "enter":
 					m = m.handleGraphKeys(msg)
@@ -6003,7 +6296,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				case "h", "l",
 					"j", "k", "left", "right", "up", "down",
-					"G", "o", "X", "Z", "E", "esc",
+					"home", "G", "end", "o", "X", "Z", "E", "esc",
 					"b", "m",
 					"enter", " ", "tab",
 					"ctrl+d", "ctrl+u", "pgup", "pgdown":
@@ -6061,6 +6354,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					switch keyStr {
 					case "h", "f", "g", "t",
 						"j", "k", "up", "down",
+						"home", "G", "end",
 						"J", "K", "v", "tab", "enter",
 						"y", "c", "F", "o", "/", "A":
 						m, cmd = m.handleHistoryKeys(msg)
@@ -6373,14 +6667,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "!":
 				// Toggle alerts panel (bv-168)
-				// Only show if there are active alerts
-				activeCount := 0
-				for _, a := range m.alerts {
-					if !m.dismissedAlerts[alertKey(a)] {
-						activeCount++
-					}
-				}
-				if activeCount > 0 {
+				// Only show if there are active alerts in current scope
+				if len(m.activeScopedAlerts()) > 0 {
 					m.showAlertsPanel = !m.showAlertsPanel
 					m.alertsCursor = 0 // Reset cursor when opening
 				} else {
@@ -6454,6 +6742,37 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 
+			case "t":
+				m, cmd = m.toggleTimeTravelPrompt()
+				return m, cmd
+
+			case "T":
+				if m.timeTravelMode {
+					m.exitTimeTravelMode()
+				} else {
+					m.enterTimeTravelMode("HEAD~5")
+				}
+				return m, nil
+
+			case "C":
+				return m, m.copyIssueToClipboard()
+
+			case "V":
+				return m, m.showCassSessionModal()
+
+			case "U":
+				m.showSelfUpdateModal()
+				return m, nil
+
+			case "y":
+				issuePtr, errMsg := m.selectedIssueForActionWithReason()
+				if issuePtr == nil {
+					m.statusMsg = errMsg
+					m.statusIsError = true
+					return m, nil
+				}
+				return m, m.copyIssueIDByIDCmd(issuePtr.ID)
+
 			case "\\", "|":
 				if m.focused == focusList || m.focused == focusDetail {
 					m.ToggleSplitView()
@@ -6461,9 +6780,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			// Remaining list-level keys handled by handleListKeys
-			m, cmd = m.handleListKeys(msg)
-			cmds = append(cmds, cmd)
+			// Remaining list-level keys handled by handleListKeys ONLY when list has focus
+			if m.focused == focusList {
+				m, cmd = m.handleListKeys(msg)
+				cmds = append(cmds, cmd)
+			}
 		}
 
 	case tea.MouseMsg:
@@ -6490,6 +6811,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.insightsPanel.MoveUp()
 			case focusAttention:
 				m.attentionView.MoveUp()
+			case focusLabelDashboard:
+				m.labelDashboard.MoveUp()
 			case focusBoard:
 				m.board.MoveUp()
 			case focusGraph:
@@ -6529,6 +6852,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.insightsPanel.MoveDown()
 			case focusAttention:
 				m.attentionView.MoveDown()
+			case focusLabelDashboard:
+				m.labelDashboard.MoveDown()
 			case focusBoard:
 				m.board.MoveDown()
 			case focusGraph:
@@ -6871,6 +7196,10 @@ func (m *Model) handleGraphKeys(msg tea.KeyMsg) *Model {
 		m.graphView.MoveDown()
 	case "k", "up":
 		m.graphView.MoveUp()
+	case "home":
+		m.graphView.MoveToStart()
+	case "G", "end":
+		m.graphView.MoveToEnd()
 	case "ctrl+d", "pgdown":
 		m.graphView.PageDown()
 	case "ctrl+u", "pgup":
@@ -6918,7 +7247,9 @@ func (m *Model) handleTreeKeys(msg tea.KeyMsg) *Model {
 		m.tree.CollapseOrJumpToParent()
 	case "l", "right":
 		m.tree.ExpandOrMoveToChild()
-	case "G":
+	case "home":
+		m.tree.JumpToTop()
+	case "G", "end":
 		m.tree.JumpToBottom()
 	case "o", "X":
 		m.tree.ExpandAll()
@@ -7028,6 +7359,12 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		case "k", "up":
 			m.historyView.MoveUpFileTree()
 			return m, nil
+		case "home":
+			m.historyView.MoveToStartFileTree()
+			return m, nil
+		case "G", "end":
+			m.historyView.MoveToEndFileTree()
+			return m, nil
 		case "enter":
 			// Toggle filter on selected file or directory (bv-190l)
 			node := m.historyView.SelectedFileNode()
@@ -7123,6 +7460,18 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.historyView.MoveUpGit()
 		} else {
 			m.historyView.MoveUp()
+		}
+	case "home":
+		if m.historyView.IsGitMode() {
+			m.historyView.MoveToStartGit()
+		} else {
+			m.historyView.MoveToStart()
+		}
+	case "G", "end":
+		if m.historyView.IsGitMode() {
+			m.historyView.MoveToEndGit()
+		} else {
+			m.historyView.MoveToEnd()
 		}
 	case "J":
 		// In git mode: navigate to next related bead; in bead mode: next commit
@@ -7573,6 +7922,16 @@ func (m *Model) syncSecondaryViewsForRepoScope(targetFocus focus) {
 	if m.isBoardView || m.isGraphView {
 		m.refreshBoardAndGraphForCurrentFilter()
 	}
+	m.recomputeVisibleAlertCounts()
+	if m.showAlertsPanel {
+		remaining := len(m.activeScopedAlerts())
+		if remaining == 0 {
+			m.showAlertsPanel = false
+			m.alertsCursor = 0
+		} else if m.alertsCursor >= remaining {
+			m.alertsCursor = remaining - 1
+		}
+	}
 }
 
 // handleRepoPickerKeys handles keyboard input when repo picker is focused (workspace mode).
@@ -7754,6 +8113,33 @@ func (m *Model) handleInsightsKeys(msg tea.KeyMsg) *Model {
 	return m
 }
 
+func (m *Model) toggleTimeTravelPrompt() (*Model, tea.Cmd) {
+	if m.timeTravelMode {
+		m.exitTimeTravelMode()
+		return m, nil
+	}
+	// Show input prompt for revision. When invoked from list/detail,
+	// cancel returns to list; when invoked from a secondary view
+	// (Insights, Tree, FlowMatrix, Attention, LabelDashboard), Esc
+	// cancels in place back to that view.
+	if m.focused == focusList || m.focused == focusDetail {
+		if !m.isSplitView {
+			m.showDetails = false
+		}
+		m.savedViewFocus = focusList
+	} else {
+		m.recordSavedViewFocus()
+	}
+	m.showTimeTravelPrompt = true
+	m.timeTravelInput.SetValue("")
+	m.focused = m.restoreTopModalOrListFocus()
+	cmd := m.beginEmbeddedTextInputSession(
+		embeddedTextInputTimeTravel,
+		m.timeTravelInput.Focus(),
+	)
+	return m, cmd
+}
+
 // handleListKeys handles keyboard input when the list is focused and returns
 // any command needed by a newly focused embedded component.
 func (m *Model) handleListKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
@@ -7796,30 +8182,7 @@ func (m *Model) handleListKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.jumpToChangedIssue(msg.String() == "n")
 		}
 	case "t":
-		// Toggle time-travel mode off, or show prompt for custom revision
-		if m.timeTravelMode {
-			m.exitTimeTravelMode()
-		} else {
-			// Show input prompt for revision. When invoked from list/detail,
-			// cancel returns to list; when invoked from a secondary view
-			// (Insights, Tree, FlowMatrix, Attention, LabelDashboard), Esc
-			// cancels in place back to that view.
-			if m.focused == focusList || m.focused == focusDetail {
-				if !m.isSplitView {
-					m.showDetails = false
-				}
-				m.savedViewFocus = focusList
-			} else {
-				m.recordSavedViewFocus()
-			}
-			m.showTimeTravelPrompt = true
-			m.timeTravelInput.SetValue("")
-			m.focused = m.restoreTopModalOrListFocus()
-			cmd = m.beginEmbeddedTextInputSession(
-				embeddedTextInputTimeTravel,
-				m.timeTravelInput.Focus(),
-			)
-		}
+		m, cmd = m.toggleTimeTravelPrompt()
 	case "T":
 		// Quick time-travel with default HEAD~5
 		if m.timeTravelMode {
@@ -7896,7 +8259,7 @@ func (m *Model) handleTimeTravelInputKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 
 func isHistoryFileTreeNavKey(key string) bool {
 	switch key {
-	case "j", "down", "k", "up", "enter", "l", "right", " ", "left", "backspace", "tab":
+	case "j", "down", "k", "up", "home", "G", "end", "enter", "l", "right", " ", "left", "backspace", "tab":
 		return true
 	default:
 		return false
@@ -7921,6 +8284,8 @@ func (m *Model) recordSavedViewFocus() {
 }
 
 func (m *Model) resetUnderlyingViewToMainList() {
+	hadFlowDetail := m.flowDetailID != ""
+	m.flowDetailID = ""
 	m.isBoardView = false
 	m.isGraphView = false
 	m.isActionableView = false
@@ -7942,6 +8307,12 @@ func (m *Model) resetUnderlyingViewToMainList() {
 	}
 	if !isModalFocus(m.cassReturnFocus) {
 		m.cassReturnFocus = focusList
+	}
+	if hadFlowDetail && m.width > 0 && m.height > 0 {
+		m.applyContentSizing()
+		if m.isSplitView {
+			m.updateViewportContent()
+		}
 	}
 }
 
@@ -7968,9 +8339,56 @@ func (m *Model) openHelpFromFocus(prior focus) {
 	m.helpScroll = 0
 }
 
-func (m *Model) openContextTutorialFromFocus(prior focus) {
-	m.focusBeforeTutorial = prior
-	ctx := string(m.CurrentContext())
+func (m *Model) effectiveTutorialKeyBindings() TutorialKeyBindings {
+	if !m.tutorialKeyBindingsLoaded && m.tutorialKeyBindings.DirectTutorial == "" && m.tutorialKeyBindings.ContextHelp == "" {
+		return DefaultTutorialKeyBindings()
+	}
+	return m.tutorialKeyBindings
+}
+
+func (m *Model) ensureCapsLockTracker() *CapsLockTracker {
+	if m.capsLockTracker == nil {
+		m.capsLockTracker = NewCapsLockTracker()
+	}
+	return m.capsLockTracker
+}
+
+// SetTutorialKeyBindings configures tutorial and context-help trigger bindings.
+func (m *Model) SetTutorialKeyBindings(bindings TutorialKeyBindings) {
+	m.tutorialKeyBindings = bindings
+	m.tutorialKeyBindingsLoaded = true
+}
+
+// TutorialKeyBindings returns the active tutorial and context-help trigger bindings.
+func (m *Model) TutorialKeyBindings() TutorialKeyBindings {
+	return m.effectiveTutorialKeyBindings()
+}
+
+func (m *Model) openFullTutorialFromFocus(prior focus) {
+	if !m.showTutorial {
+		if m.showHelp {
+			m.focusBeforeTutorial = m.focusBeforeHelp
+		} else {
+			m.focusBeforeTutorial = prior
+		}
+	}
+	m.showTutorial = true
+	m.showHelp = false
+	m.helpScroll = 0
+	m.tutorialModel.SetContextMode(false)
+	m.tutorialModel.SetSize(m.width, m.height)
+	m.tutorialModel.markCurrentPageViewed()
+	m.focused = focusTutorial
+}
+
+func (m *Model) openContextTutorialWithContext(prior focus, ctx string) {
+	if !m.showTutorial {
+		if m.showHelp {
+			m.focusBeforeTutorial = m.focusBeforeHelp
+		} else {
+			m.focusBeforeTutorial = prior
+		}
+	}
 	m.showHelp = false
 	m.helpScroll = 0
 	m.showTutorial = true
@@ -7979,6 +8397,10 @@ func (m *Model) openContextTutorialFromFocus(prior focus) {
 	m.tutorialModel.SetSize(m.width, m.height)
 	m.tutorialModel.markCurrentPageViewed()
 	m.focused = focusTutorial
+}
+
+func (m *Model) openContextTutorialFromFocus(prior focus) {
+	m.openContextTutorialWithContext(prior, string(m.CurrentContext()))
 }
 
 func (m *Model) validateViewFocus(candidate focus) focus {
@@ -8194,20 +8616,26 @@ func (m *Model) handleHelpKeys(msg tea.KeyMsg) *Model {
 		m.showHelp = false
 		m.helpScroll = 0
 		m.focused = m.restoreFocusFromHelp()
-	case " ": // Space opens interactive tutorial (bv-0trk, bv-8y31)
-		reopenedFromTutorial := m.focusBeforeHelp == focusTutorial && m.showTutorial
-		if m.focusBeforeHelp != focusTutorial {
-			m.focusBeforeTutorial = m.focusBeforeHelp
+	case " ": // Space opens interactive tutorial when enabled (bv-0trk, bv-8y31)
+		if m.effectiveTutorialKeyBindings().HelpModalSpace {
+			reopenedFromTutorial := m.focusBeforeHelp == focusTutorial && m.showTutorial
+			if m.focusBeforeHelp != focusTutorial {
+				m.focusBeforeTutorial = m.focusBeforeHelp
+			}
+			m.showHelp = false
+			m.helpScroll = 0
+			m.showTutorial = true
+			if !reopenedFromTutorial {
+				m.tutorialModel.SetContextMode(false)
+				m.tutorialModel.SetSize(m.width, m.height)
+				m.tutorialModel.markCurrentPageViewed()
+			}
+			m.focused = focusTutorial
+		} else {
+			m.showHelp = false
+			m.helpScroll = 0
+			m.focused = m.restoreFocusFromHelp()
 		}
-		m.showHelp = false
-		m.helpScroll = 0
-		m.showTutorial = true
-		if !reopenedFromTutorial {
-			m.tutorialModel.SetContextMode(false)
-			m.tutorialModel.SetSize(m.width, m.height)
-			m.tutorialModel.markCurrentPageViewed()
-		}
-		m.focused = focusTutorial
 	default:
 		// Any other key dismisses help and restores previous focus
 		m.showHelp = false
@@ -8834,16 +9262,21 @@ func (m *Model) buildHelpBodyLines() (bodyLines []string, availLines int) {
 	viewsSection := []struct{ key, desc string }{
 		{"b", "Kanban board"},
 		{"g", "Graph view"},
+		{"E", "Tree view"},
 		{"i", "Insights"},
 		{"h", "History view"},
 		{"a", "Actionable"},
+		{"P", "Sprint view"},
 		{"f", "Flow matrix"},
 		{"[", "Label dashboard"},
 		{"]", "Attention view"},
+		{"\\", "Toggle split"},
 	}
 
 	globalSection := []struct{ key, desc string }{
 		{"?", "This help"},
+		{"~", "Context help"},
+		{"`", "Tutorial"},
 		{";", "Shortcuts bar"},
 		{"!", "Alerts panel"},
 		{"'", "Recipes"},
@@ -8887,6 +9320,7 @@ func (m *Model) buildHelpBodyLines() (bodyLines []string, availLines int) {
 		{"Tab", "Toggle focus"},
 		{"y", "Copy SHA"},
 		{"c", "Confidence filter"},
+		{"A", "Author filter"},
 	}
 
 	actionsSection := []struct{ key, desc string }{
@@ -8896,8 +9330,11 @@ func (m *Model) buildHelpBodyLines() (bodyLines []string, availLines int) {
 		{"t", "Time-travel"},
 		{"T", "Quick time-travel"},
 		{"x", "Export markdown"},
+		{"y", "Copy ID"},
 		{"C", "Copy to clipboard"},
 		{"O", "Open in editor"},
+		{"V", "Cass sessions"},
+		{"U", "Self-update"},
 	}
 
 	statusSection := []struct{ key, desc string }{
@@ -9671,15 +10108,16 @@ func (m *Model) renderFooter() string {
 		blockedStyle := lipgloss.NewStyle().Foreground(ColorWarning)
 		closedStyle := lipgloss.NewStyle().Foreground(ColorMuted)
 
+		openCount, readyCount, blockedCount, closedCount := m.footerCounts()
 		statsContent := fmt.Sprintf("%s%d %s%d %s%d %s%d",
 			openStyle.Render("○"),
-			m.countOpen,
+			openCount,
 			readyStyle.Render("◉"),
-			m.countReady,
+			readyCount,
 			blockedStyle.Render("◈"),
-			m.countBlocked,
+			blockedCount,
 			closedStyle.Render("●"),
-			m.countClosed)
+			closedCount)
 		statsSection = statsStyle.Render(statsContent)
 	}
 
@@ -9868,12 +10306,12 @@ func (m *Model) renderFooter() string {
 	// ALERTS BADGE - Project health alerts (bv-168)
 	// ─────────────────────────────────────────────────────────────────────────
 	alertsSection := ""
-	// Count active (non-dismissed) alerts
+	// Count active (non-dismissed, in-scope) alerts
 	activeAlerts := 0
 	activeCritical := 0
 	activeWarning := 0
 	for _, a := range m.alerts {
-		if len(m.dismissedAlerts) == 0 || !m.dismissedAlerts[alertKey(a)] {
+		if (len(m.dismissedAlerts) == 0 || !m.dismissedAlerts[alertKey(a)]) && m.isAlertInActiveScope(a) {
 			activeAlerts++
 			switch a.Severity {
 			case drift.SeverityCritical:
@@ -10978,7 +11416,7 @@ func (m *Model) applyContentSizing() {
 	// appended in View().
 	contentWidth := m.mainContentWidth()
 
-	if m.focused == focusFlowMatrix && m.flowDetailID != "" {
+	if m.effectiveUnderlyingFocus() == focusFlowMatrix && m.flowDetailID != "" {
 		m.viewport = viewport.New(contentWidth, bodyHeight)
 		m.viewportContent = ""
 		m.renderer.SetWidthWithTheme(contentWidth, m.theme)
@@ -11231,7 +11669,7 @@ func (m *Model) setViewportContent(content string) {
 
 func (m *Model) updateViewportContent() {
 	selectedItem := m.list.SelectedItem()
-	if m.flowDetailID != "" && (m.focused == focusFlowMatrix || (m.focused == focusHelp && m.focusBeforeHelp == focusFlowMatrix) || (m.focused == focusTutorial && m.restoreFocusFromTutorial() == focusFlowMatrix)) {
+	if m.flowDetailID != "" && m.effectiveUnderlyingFocus() == focusFlowMatrix {
 		issue := m.issueMap[m.flowDetailID]
 		if issue == nil {
 			m.setViewportContent("Issue no longer available")
@@ -11987,86 +12425,6 @@ func buildMermaidNodeRefs(issues []model.Issue) map[string]string {
 	return refs
 }
 
-func mermaidSafeNodeRef(id string) string {
-	if isPureMermaidNodeID(id) {
-		return id
-	}
-	refs := buildMermaidNodeRefs([]model.Issue{{ID: id}})
-	return refs[id]
-}
-
-func buildMermaidGraphLines(issues []model.Issue, includeIsolatedNodes bool) []string {
-	exported := make(map[string]bool, len(issues))
-	for i := range issues {
-		exported[issues[i].ID] = true
-	}
-	nodeRefs := buildMermaidNodeRefs(issues)
-	connected := make(map[string]bool, len(issues))
-	edgeSet := make(map[string]struct{})
-	var edges []string
-	for i := range issues {
-		issue := issues[i]
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() || !exported[dep.DependsOnID] {
-				continue
-			}
-			connected[dep.DependsOnID] = true
-			connected[issue.ID] = true
-			line := fmt.Sprintf("    %s --> %s", nodeRefs[dep.DependsOnID], nodeRefs[issue.ID])
-			if _, exists := edgeSet[line]; !exists {
-				edgeSet[line] = struct{}{}
-				edges = append(edges, line)
-			}
-		}
-	}
-	sort.Strings(edges)
-
-	if !includeIsolatedNodes {
-		return edges
-	}
-	var isolated []string
-	for i := range issues {
-		id := issues[i].ID
-		if !connected[id] {
-			isolated = append(isolated, "    "+nodeRefs[id])
-		}
-	}
-	sort.Strings(isolated)
-	return append(edges, isolated...)
-}
-
-func renderStandaloneDependencyGraphMermaid(issues []model.Issue) string {
-	lines := buildMermaidGraphLines(issues, true)
-	var sb strings.Builder
-	sb.WriteString("graph TD\n")
-	if len(lines) == 0 {
-		sb.WriteString("    %% No exported issues\n")
-	} else {
-		for _, line := range lines {
-			sb.WriteString(line)
-			sb.WriteByte('\n')
-		}
-	}
-	return sb.String()
-}
-
-func renderExportDependencyGraphMermaid(issues []model.Issue) string {
-	edges := buildMermaidGraphLines(issues, false)
-
-	var sb strings.Builder
-	sb.WriteString("\n## Dependency Graph\n\n```mermaid\ngraph TD\n")
-	if len(edges) == 0 {
-		sb.WriteString("    %% No blocking dependencies among exported issues\n")
-	} else {
-		for _, edge := range edges {
-			sb.WriteString(edge)
-			sb.WriteByte('\n')
-		}
-	}
-	sb.WriteString("```\n")
-	return sb.String()
-}
-
 func (m *Model) exportReadiness() *model.ReadinessIndex {
 	if m.analyzer != nil {
 		if r := m.analyzer.Readiness(); r != nil {
@@ -12084,7 +12442,7 @@ func (m *Model) isExportAuthorityComplete(readiness *model.ReadinessIndex) bool 
 		m.workspaceFailedCount == 0
 }
 
-// exportToMarkdown exports active (or all) issues to a Markdown, CSV, JSON, or Mermaid file with auto-generated filename
+// exportToMarkdown exports active (or all) issues to a Markdown, HTML, CSV, JSON, or Mermaid file with auto-generated filename
 func (m *Model) exportToMarkdown() {
 	rootDir := strings.TrimSpace(m.workDir)
 	if rootDir == "" {
@@ -12095,6 +12453,29 @@ func (m *Model) exportToMarkdown() {
 	readiness := m.exportReadiness()
 	authorityComplete := m.isExportAuthorityComplete(readiness)
 	graphIssues := m.repoScopedIssues()
+	generatedAt := m.analysisReferenceTime()
+	graphStats := m.analysis
+	if m.workspaceMode && m.activeRepos != nil {
+		scopedAnalyzer := analysis.NewAnalyzer(graphIssues)
+		scopedAnalyzer.SetNow(generatedAt)
+		scopedSet := make(map[string]bool, len(graphIssues))
+		for i := range graphIssues {
+			scopedSet[graphIssues[i].ID] = true
+		}
+		candidates := scopedSet
+		if m.candidateIDs != nil {
+			filtered := make(map[string]bool, len(m.candidateIDs))
+			for id, ok := range m.candidateIDs {
+				if ok && scopedSet[id] {
+					filtered[id] = true
+				}
+			}
+			candidates = filtered
+		}
+		scopedAnalyzer.SetReadinessScope(readiness, candidates)
+		stats := scopedAnalyzer.Analyze()
+		graphStats = &stats
+	}
 
 	if m.activeRecipe != nil {
 		exportCfg := m.activeRecipe.Export
@@ -12118,110 +12499,70 @@ func (m *Model) exportToMarkdown() {
 			return
 		}
 		opts.Title = "Beads Project Report"
+		opts.GeneratedAt = generatedAt
 		opts.View = m.activeRecipe.View
 		if opts.GroupBy == "" && strings.TrimSpace(m.activeRecipe.View.GroupBy) != "" {
 			opts.GroupBy = strings.TrimSpace(m.activeRecipe.View.GroupBy)
 		}
+		if len(m.activeRecipe.Metrics) > 0 {
+			opts.Metrics = append([]string(nil), m.activeRecipe.Metrics...)
+		}
+		opts.GraphStats = graphStats
 		opts.Readiness = readiness
 		opts.AuthorityComplete = authorityComplete
 		opts.GraphIssues = graphIssues
 
+		var outPath string
 		switch opts.Format {
 		case "json":
 			jsonFilename := fmt.Sprintf("beads_export_%s.json", time.Now().Format("2006-01-02"))
-			outPath := filepath.Join(rootDir, jsonFilename)
-			if strings.TrimSpace(m.workDir) == "" {
-				outPath = jsonFilename
+			outPath = jsonFilename
+			if strings.TrimSpace(m.workDir) != "" {
+				outPath = filepath.Join(rootDir, jsonFilename)
 			}
-			payload, err := json.MarshalIndent(issuesToExport, "", "  ")
-			if err != nil {
-				m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
-				m.statusIsError = true
-				return
-			}
-			payload = append(payload, '\n')
-			if err := export.SafeWriteOutput(outPath, payload, 0o644); err != nil {
-				m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
-				m.statusIsError = true
-				return
-			}
-			m.statusMsg = fmt.Sprintf("✅ Exported %d issues to %s", len(issuesToExport), outPath)
-			m.statusIsError = false
-			return
-
 		case "mermaid":
 			mmdFilename := fmt.Sprintf("beads_export_%s.mmd", time.Now().Format("2006-01-02"))
-			outPath := filepath.Join(rootDir, mmdFilename)
-			if strings.TrimSpace(m.workDir) == "" {
-				outPath = mmdFilename
+			outPath = mmdFilename
+			if strings.TrimSpace(m.workDir) != "" {
+				outPath = filepath.Join(rootDir, mmdFilename)
 			}
-			mmdContent := renderStandaloneDependencyGraphMermaid(issuesToExport)
-			if err := export.SafeWriteOutput(outPath, []byte(mmdContent), 0o644); err != nil {
-				m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
-				m.statusIsError = true
-				return
+		case "html":
+			htmlFilename := strings.TrimSuffix(m.generateExportFilename(), ".md") + ".html"
+			outPath = htmlFilename
+			if strings.TrimSpace(m.workDir) != "" {
+				outPath = filepath.Join(rootDir, htmlFilename)
 			}
-			m.statusMsg = fmt.Sprintf("✅ Exported %d issues to %s", len(issuesToExport), outPath)
-			m.statusIsError = false
-			return
-
 		case "csv":
 			csvFilename := strings.TrimSuffix(m.generateExportFilename(), ".md") + ".csv"
-			outPath := csvFilename
+			outPath = csvFilename
 			if strings.TrimSpace(m.workDir) != "" {
 				outPath = filepath.Join(rootDir, csvFilename)
 			}
-			csvBytes, err := export.GenerateReport(issuesToExport, graphIssues, opts)
-			if err != nil {
-				m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
-				m.statusIsError = true
-				return
-			}
-			if err := export.SafeWriteOutput(outPath, csvBytes, 0o644); err != nil {
-				m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
-				m.statusIsError = true
-				return
-			}
-			m.statusMsg = fmt.Sprintf("✅ Exported %d issues to %s", len(issuesToExport), outPath)
-			m.statusIsError = false
-			return
-
 		default:
 			filename := m.generateExportFilename()
-			outPath := filename
+			outPath = filename
 			if strings.TrimSpace(m.workDir) != "" {
 				outPath = filepath.Join(rootDir, filename)
 			}
-			var (
-				mdBytes []byte
-				err     error
-			)
-			if opts.Template != "" {
-				mdBytes, err = export.GenerateReport(issuesToExport, graphIssues, opts)
-			} else {
-				wantGraph := opts.IncludeGraph
-				opts.IncludeGraph = false
-				var mdContent string
-				mdContent, err = export.GenerateMarkdown(issuesToExport, "Beads Project Report", opts)
-				if err == nil && wantGraph {
-					mdContent += renderExportDependencyGraphMermaid(issuesToExport)
-				}
-				mdBytes = []byte(mdContent)
-			}
-			if err != nil {
-				m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
-				m.statusIsError = true
-				return
-			}
-			if err := export.SafeWriteOutput(outPath, mdBytes, 0o644); err != nil {
-				m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
-				m.statusIsError = true
-				return
-			}
-			m.statusMsg = fmt.Sprintf("✅ Exported %d issues to %s", len(issuesToExport), outPath)
-			m.statusIsError = false
+		}
+
+		reportBytes, err := export.GenerateReport(issuesToExport, graphIssues, opts)
+		if err != nil {
+			m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
+			m.statusIsError = true
 			return
 		}
+		if opts.Format == "json" && len(reportBytes) > 0 && reportBytes[len(reportBytes)-1] != '\n' {
+			reportBytes = append(reportBytes, '\n')
+		}
+		if err := export.SafeWriteOutput(outPath, reportBytes, 0o644); err != nil {
+			m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
+			m.statusIsError = true
+			return
+		}
+		m.statusMsg = fmt.Sprintf("✅ Exported %d issues to %s", len(issuesToExport), outPath)
+		m.statusIsError = false
+		return
 	}
 
 	// Generate smart filename: beads_report_<project>_YYYY-MM-DD.md
@@ -12238,17 +12579,20 @@ func (m *Model) exportToMarkdown() {
 		return
 	}
 	defaultOpts.Title = "Beads Project Report"
+	defaultOpts.GeneratedAt = generatedAt
+	defaultOpts.GraphStats = graphStats
 	defaultOpts.Readiness = readiness
 	defaultOpts.AuthorityComplete = authorityComplete
+	defaultOpts.GraphIssues = graphIssues
 
-	mdContent, err := export.GenerateMarkdown(issuesToExport, "Beads Project Report", defaultOpts)
+	reportBytes, err := export.GenerateReport(issuesToExport, graphIssues, defaultOpts)
 	if err != nil {
 		m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
 		m.statusIsError = true
 		return
 	}
 
-	if err := export.SafeWriteOutput(outPath, []byte(mdContent), 0o644); err != nil {
+	if err := export.SafeWriteOutput(outPath, reportBytes, 0o644); err != nil {
 		m.statusMsg = fmt.Sprintf("❌ Export failed: %v", err)
 		m.statusIsError = true
 		return
@@ -12981,6 +13325,9 @@ func (m *Model) resolveLiveIssue(id string, fallback *model.Issue) *model.Issue 
 // list (handling both IssueItem and IssueGroupItem), detail, board, graph,
 // actionable, insights, flow matrix, tree, and history views.
 func (m *Model) selectedIssueForActionWithReason() (*model.Issue, string) {
+	if m.showLabelDrilldown {
+		return nil, "❌ No issue selected in label drilldown"
+	}
 	switch m.focused {
 	case focusBoard:
 		sel := m.board.SelectedIssue()
@@ -13345,6 +13692,17 @@ func parseBodyFromFrontmatter(content string) string {
 	return body
 }
 
+// DisableInternalWatcher stops the Model's internal single-file watcher so an
+// external multi-candidate watcher channel can manage all sibling sources
+// across unlimited .jsonl <-> .db authority switches without duplicate or
+// orphaned watchers.
+func (m *Model) DisableInternalWatcher() {
+	if m.watcher != nil {
+		m.watcher.Stop()
+		m.watcher = nil
+	}
+}
+
 // Stop cleans up resources (file watcher, instance lock, background worker, etc.)
 // Should be called when the program exits
 func (m *Model) Stop() {
@@ -13526,7 +13884,8 @@ func (m *Model) canScrollShortcutsSidebar(key string) bool {
 		return true
 	case "pgup", "pgdown":
 		switch m.focused {
-		case focusDetail, focusGraph, focusTree, focusActionable, focusFlowMatrix:
+		case focusDetail, focusGraph, focusTree, focusActionable, focusFlowMatrix,
+			focusInsights, focusAttention, focusLabelDashboard, focusVelocityComparison:
 			return false
 		case focusBoard:
 			return !m.board.IsDetailShown()
@@ -13721,7 +14080,132 @@ func buildBaselineMetricItems(scores map[string]float64, limit int) []baseline.M
 
 // alertKey generates a unique key for an alert (for dismissal tracking)
 func alertKey(a drift.Alert) string {
+	if a.RelatedIssueID != "" {
+		return fmt.Sprintf("%s:%s:%s:%s", a.Type, a.Severity, a.IssueID, a.RelatedIssueID)
+	}
 	return fmt.Sprintf("%s:%s:%s", a.Type, a.Severity, a.IssueID)
+}
+
+func (m *Model) isIssueIDInActiveScope(issueID string) bool {
+	if issueID == "" {
+		return true
+	}
+	if m.candidateIDs != nil && !m.candidateIDs[issueID] {
+		return false
+	}
+	if m.workspaceMode && m.activeRepos != nil {
+		repoKey := ""
+		if m.issueMap != nil {
+			if iss := m.issueMap[issueID]; iss != nil {
+				repoKey = issueRepoKey(*iss)
+			}
+		}
+		if repoKey == "" {
+			repoKey = normalizeRepoKey(ExtractRepoPrefix(issueID))
+		}
+		if repoKey != "" && !m.activeRepos[repoKey] {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *Model) isAlertInActiveScope(a drift.Alert) bool {
+	if !m.isIssueIDInActiveScope(a.IssueID) {
+		return false
+	}
+	if a.RelatedIssueID != "" && !m.isIssueIDInActiveScope(a.RelatedIssueID) {
+		return false
+	}
+	return true
+}
+
+func (m *Model) recomputeVisibleAlertCounts() {
+	if len(m.dismissedAlerts) == 0 && m.candidateIDs == nil && (!m.workspaceMode || m.activeRepos == nil) {
+		critical, warning, info := 0, 0, 0
+		for i := range m.alerts {
+			switch m.alerts[i].Severity {
+			case drift.SeverityCritical:
+				critical++
+			case drift.SeverityWarning:
+				warning++
+			case drift.SeverityInfo:
+				info++
+			}
+		}
+		m.alertsCritical = critical
+		m.alertsWarning = warning
+		m.alertsInfo = info
+		return
+	}
+	critical, warning, info := 0, 0, 0
+	for i := range m.alerts {
+		a := m.alerts[i]
+		if len(m.dismissedAlerts) > 0 && m.dismissedAlerts[alertKey(a)] {
+			continue
+		}
+		if !m.isAlertInActiveScope(a) {
+			continue
+		}
+		switch a.Severity {
+		case drift.SeverityCritical:
+			critical++
+		case drift.SeverityWarning:
+			warning++
+		case drift.SeverityInfo:
+			info++
+		}
+	}
+	m.alertsCritical = critical
+	m.alertsWarning = warning
+	m.alertsInfo = info
+}
+
+func (m *Model) activeScopedAlerts() []drift.Alert {
+	var visible []drift.Alert
+	for _, a := range m.alerts {
+		if len(m.dismissedAlerts) > 0 && m.dismissedAlerts[alertKey(a)] {
+			continue
+		}
+		if !m.isAlertInActiveScope(a) {
+			continue
+		}
+		visible = append(visible, a)
+	}
+	return visible
+}
+
+func (m *Model) footerCounts() (openCount, readyCount, blockedCount, closedCount int) {
+	if !m.workspaceMode || m.activeRepos == nil {
+		return m.countOpen, m.countReady, m.countBlocked, m.countClosed
+	}
+	var readiness *model.ReadinessIndex
+	readyNow := m.analysisReferenceTime()
+	if m.analyzer != nil {
+		readiness = m.analyzer.Readiness()
+	}
+	for i := range m.issues {
+		issue := &m.issues[i]
+		if m.candidateIDs != nil && !m.candidateIDs[issue.ID] {
+			continue
+		}
+		repoKey := issueRepoKey(*issue)
+		if repoKey != "" && !m.activeRepos[repoKey] {
+			continue
+		}
+		if isClosedLikeStatus(issue.Status) {
+			closedCount++
+			continue
+		}
+		openCount++
+		if issue.Status == model.StatusBlocked {
+			blockedCount++
+		}
+		if readiness != nil && (m.analyzer == nil || m.analyzer.IsCandidate(issue.ID)) && readiness.Ready(issue.ID, readyNow) {
+			readyCount++
+		}
+	}
+	return openCount, readyCount, blockedCount, closedCount
 }
 
 func wrappedAlertTextLines(s string, width int) int {
@@ -13796,13 +14280,8 @@ func (m *Model) renderAlertsPanel() string {
 		Foreground(t.Primary).
 		MarginBottom(1)
 
-	// Filter out dismissed alerts
-	var visibleAlerts []drift.Alert
-	for _, a := range m.alerts {
-		if !m.dismissedAlerts[alertKey(a)] {
-			visibleAlerts = append(visibleAlerts, a)
-		}
-	}
+	// Filter out dismissed and out-of-scope alerts
+	visibleAlerts := m.activeScopedAlerts()
 
 	var sb strings.Builder
 	sb.WriteString(titleStyle.Render("🔔 Alerts Panel"))
@@ -13812,17 +14291,28 @@ func (m *Model) renderAlertsPanel() string {
 		sb.WriteString(t.Renderer.NewStyle().Foreground(ColorSuccess).Render("✓ No active alerts"))
 		sb.WriteString("\n\n")
 	} else {
-		// Summary line
+		// Summary line computed dynamically from visibleAlerts
+		critical, warning, info := 0, 0, 0
+		for _, a := range visibleAlerts {
+			switch a.Severity {
+			case drift.SeverityCritical:
+				critical++
+			case drift.SeverityWarning:
+				warning++
+			case drift.SeverityInfo:
+				info++
+			}
+		}
 		summaryStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
 		summary := fmt.Sprintf("%d total", len(visibleAlerts))
-		if m.alertsCritical > 0 {
-			summary += fmt.Sprintf(" • %d critical", m.alertsCritical)
+		if critical > 0 {
+			summary += fmt.Sprintf(" • %d critical", critical)
 		}
-		if m.alertsWarning > 0 {
-			summary += fmt.Sprintf(" • %d warning", m.alertsWarning)
+		if warning > 0 {
+			summary += fmt.Sprintf(" • %d warning", warning)
 		}
-		if m.alertsInfo > 0 {
-			summary += fmt.Sprintf(" • %d info", m.alertsInfo)
+		if info > 0 {
+			summary += fmt.Sprintf(" • %d info", info)
 		}
 		sb.WriteString(summaryStyle.Render(summary))
 		sb.WriteString("\n\n")
@@ -14076,13 +14566,28 @@ func (m *Model) countActiveDependents(issueID string) int {
 // history row (or related bead in git mode), or the list item (also used by
 // the detail pane). nil when nothing is selected.
 func (m *Model) focusedIssueForSessions() *model.Issue {
+	if m.showLabelDrilldown {
+		return nil
+	}
 	switch m.focused {
 	case focusBoard:
-		return m.board.SelectedIssue()
+		sel := m.board.SelectedIssue()
+		if sel == nil {
+			return nil
+		}
+		return m.resolveLiveIssue(sel.ID, sel)
 	case focusGraph:
-		return m.graphView.SelectedIssue()
+		sel := m.graphView.SelectedIssue()
+		if sel == nil {
+			return nil
+		}
+		return m.resolveLiveIssue(sel.ID, sel)
 	case focusTree:
-		return m.tree.SelectedIssue()
+		sel := m.tree.SelectedIssue()
+		if sel == nil {
+			return nil
+		}
+		return m.resolveLiveIssue(sel.ID, sel)
 	case focusActionable:
 		id := m.actionableView.SelectedIssueID()
 		if id == "" {
@@ -14095,6 +14600,20 @@ func (m *Model) focusedIssueForSessions() *model.Issue {
 			return nil
 		}
 		return m.resolveLiveIssue(id, nil)
+	case focusFlowMatrix:
+		if m.flowDetailID != "" {
+			if iss := m.resolveLiveIssue(m.flowDetailID, nil); iss != nil {
+				return iss
+			}
+		}
+		if sel := m.flowMatrix.SelectedDrilldownIssue(); sel != nil {
+			return m.resolveLiveIssue(sel.ID, sel)
+		}
+		if len(m.flowMatrix.drilldownIssues) > 0 && m.flowMatrix.drilldownCursor >= 0 && m.flowMatrix.drilldownCursor < len(m.flowMatrix.drilldownIssues) {
+			fallback := m.flowMatrix.drilldownIssues[m.flowMatrix.drilldownCursor]
+			return m.resolveLiveIssue(fallback.ID, &fallback)
+		}
+		return nil
 	case focusHistory:
 		var id string
 		if m.historyView.IsGitMode() {
@@ -14106,6 +14625,14 @@ func (m *Model) focusedIssueForSessions() *model.Issue {
 			return nil
 		}
 		return m.resolveLiveIssue(id, nil)
+	case focusSprint, focusLabelDashboard, focusAttention, focusVelocityComparison:
+		return nil
+	case focusDetail:
+		if m.flowDetailID != "" {
+			if iss := m.resolveLiveIssue(m.flowDetailID, nil); iss != nil {
+				return iss
+			}
+		}
 	}
 	selectedItem := m.list.SelectedItem()
 	if selectedItem == nil {
@@ -14113,8 +14640,7 @@ func (m *Model) focusedIssueForSessions() *model.Issue {
 	}
 	switch typed := selectedItem.(type) {
 	case IssueItem:
-		iss := typed.Issue
-		return &iss
+		return m.resolveLiveIssue(typed.Issue.ID, &typed.Issue)
 	case IssueGroupItem:
 		return m.selectedIssueForAction()
 	default:

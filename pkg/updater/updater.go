@@ -1043,7 +1043,7 @@ func ensureNoMalformedChecksumLineForAsset(data []byte, assetName string) error 
 		}
 		parts := strings.Fields(line)
 		if len(parts) < 2 {
-			if line == assetName {
+			if line == assetName || strings.TrimSpace(strings.TrimPrefix(line, "*")) == assetName {
 				return fmt.Errorf("malformed checksum entry for %s", assetName)
 			}
 			continue
@@ -1180,7 +1180,7 @@ func parseChecksumData(data []byte) (map[string]string, error) {
 			continue
 		}
 
-		filename := strings.TrimSpace(line[len(rawHash):])
+		filename := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line[len(rawHash):]), "*"))
 		if filename == "" {
 			continue
 		}

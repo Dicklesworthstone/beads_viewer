@@ -184,7 +184,7 @@ func (a *Analyzer) GenerateScopedInsights(s *GraphStats, limit int, includeInact
 		authorities = filterFloatMap(s.Authorities(), candidateOnly)
 	}
 
-	cycles := s.Cycles()
+	cycles := filterCyclesForCandidateScope(s.Cycles(), a)
 	if cycles == nil {
 		cycles = make([][]string, 0)
 	}
@@ -274,4 +274,23 @@ func limitStrings(s []string, limit int) []string {
 		return s
 	}
 	return s[:limit]
+}
+
+// filterCyclesForCandidateScope retains only cycles containing at least one
+// candidate issue when candidate scoping is active on a. When a is nil or
+// unscoped, cycles is returned unchanged.
+func filterCyclesForCandidateScope(cycles [][]string, a *Analyzer) [][]string {
+	if a == nil || !a.HasCandidateScope() || len(cycles) == 0 {
+		return cycles
+	}
+	filtered := make([][]string, 0, len(cycles))
+	for _, cyc := range cycles {
+		for _, id := range cyc {
+			if a.IsCandidate(id) {
+				filtered = append(filtered, cyc)
+				break
+			}
+		}
+	}
+	return filtered
 }

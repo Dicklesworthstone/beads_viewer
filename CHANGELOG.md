@@ -240,6 +240,38 @@ every reported vulnerability has an exploitable execution path in bv.
   and complete static-dashboard WASM `criticalPathSlack`, `triage.alerts`,
   blocking-aware Blocked KPI/list/Kanban classification, offline `wasm/` service-worker
   manifest precaching, and `BV_BUILD_HYBRID_WASM=1` pre-manifest bundle staging.
+- **Wave 12–13 historical/scoped robot purity, active-DAG critical-path recovery,
+  TUI focus/advanced-insights/live-reload parity, and static-viewer/WASM/report
+  completeness (`bv-apal.58`..`bv-apal.65`):** thread `--as-of` commit timestamps
+  (`ReferenceNow()`) and pre-recipe velocity history (`VelocityIssues()`) across all
+  Phase 2–3 robot handlers, `--emit-script`, `--priority-brief`, `--agent-brief`, and
+  `--search`, isolate `--search` vector indexes per scope (`IndexPathForScope` +
+  in-memory `memory://historical-...` on `--as-of`), honor `BEADS_DIR`/`.beads/redirect`/
+  nested monorepo `.beads/` in `GitLoader` with fail-closed repo confinement, route
+  `defaultStructuredRobotFlagForArgs` + 1:1 `tty_guard.go` structured-output boolean
+  aliases, complete `DefaultFlagSections()` (`0` `"Other"` flags) + `RobotSchemas`
+  (`source_authority`, `output_format`, `version`), wire `--agents-* --format json` +
+  `RecordAccept`/`RecordDecline` + `--feedback-*` weights + `--robot-triage-by-{track,label} --brief`,
+  and harden `install.sh` stdout purity, `--version`/`--from-source`, and `sha256sum` `*`
+  binary-mode parsing; recover live critical-path heights/slack when closed/tombstoned
+  issues form historical cycles, filter out-of-scope neighbor cycles from scoped
+  `Insights`/`ProjectHealth`, populate 8-week `VelocityMetrics.Historical`, fail closed
+  on `metadata.json`-bound corrupt sibling `beads.db` origins/authority across single-repo,
+  `--db`, `--workspace`, and TUI reloads, and resolve symlinked SQLite + `-wal` freshness
+  with trailing-edge `SourceWatcher` debouncing; isolate TUI secondary full-screen views
+  from main-list key leaks, filter Insights calculation proofs to blocking edges, wire
+  lazy Phase-2 `AdvancedInsights` (`CycleBreak`, `TopKSet`, `ParallelGain`, `ParallelCut`,
+  `CoverageSet`), multi-repo/sibling-SQLite live reloads (`DisableInternalWatcher` +
+  candidate-scoped background-promotion guard), scoped alerts/footer counts,
+  `CapsLockTracker`, and multi-format `x` exports (`export.GenerateReport`); and wire
+  `bv-graph-wasm` `kCriticalPaths(5)`, `whatIfCloseBatch`, `parallelCutDefault`, `bridges`,
+  and `allWhatIf` into the static dashboard with active-only WASM `DiGraph` + mixed
+  `recalculateMetrics` projection, enforce live-DOM XHTML allowlist sanitization
+  (`renderSafeMarkdownFragment`) in standalone HTML graphs, register `bv_has_label`
+  SQLite UDF (with `db.export` re-registration) for `!supportsJsonEach()` label filtering,
+  sync Chart.js light/dark palettes, and add `--export-group-by`, `--export-format html`,
+  recipe metrics, `.nojekyll`, SVG/PNG node `<clipPath>` clamping, Mermaid/DOT
+  blocked/custom status classes, and pure-Go Pages/Cloudflare verification.
 
 ## v0.26.0 — 2026-11-02
 

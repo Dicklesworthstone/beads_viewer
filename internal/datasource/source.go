@@ -234,6 +234,44 @@ func resolveBeadsDBPath(dbPath string) string {
 	return filepath.Dir(dbPath)
 }
 
+// resolveSourceTargetPath resolves symlinks on p (or its parent directory when
+// p does not exist yet) so companion sidecars like SQLite's -wal file and
+// directory-based fsnotify watches attach to the real target location.
+func resolveSourceTargetPath(p string) string {
+	if strings.TrimSpace(p) == "" {
+		return p
+	}
+	absPath, err := filepath.Abs(p)
+	if err != nil {
+		absPath = filepath.Clean(p)
+	}
+	if resolved, err := filepath.EvalSymlinks(absPath); err == nil && resolved != "" {
+		return resolved
+	}
+	cur := absPath
+	for depth := 0; depth < 8; depth++ {
+		linkTarget, err := os.Readlink(cur)
+		if err != nil {
+			break
+		}
+		if !filepath.IsAbs(linkTarget) {
+			linkTarget = filepath.Join(filepath.Dir(cur), linkTarget)
+		}
+		cur = filepath.Clean(linkTarget)
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil && resolved != "" {
+			return resolved
+		}
+	}
+	if evalDir, err := filepath.EvalSymlinks(filepath.Dir(cur)); err == nil && evalDir != "" {
+		return filepath.Join(evalDir, filepath.Base(cur))
+	}
+	return cur
+}
+
+func sqliteWALPath(dbPath string) string {
+	return resolveSourceTargetPath(dbPath) + "-wal"
+}
+
 // discoverSQLiteSources finds SQLite databases in the beads directory
 func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource, error) {
 	if loader.IsBDWorkspace(beadsDir) {
@@ -252,9 +290,10 @@ func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource
 	}
 
 	// A committed transaction can advance the WAL without checkpointing the
-	// main database. Compare the effective SQLite freshness with JSONL exports.
+	// main database. Compare the effective SQLite freshness with JSONL exports,
+	// resolving symlinks first because SQLite creates -wal next to the target.
 	modTime := info.ModTime()
-	walPath := dbPath + "-wal"
+	walPath := sqliteWALPath(dbPath)
 	walInfo, walErr := os.Stat(walPath)
 	if walErr == nil {
 		if walInfo.ModTime().After(modTime) {

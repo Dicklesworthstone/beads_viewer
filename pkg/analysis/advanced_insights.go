@@ -61,7 +61,11 @@ func DefaultAdvancedInsightsConfig() AdvancedInsightsConfig {
 
 // parallelGainMaxIssues bounds generateParallelGain: above this many issues the
 // O(actionable x (V+E)) sweep is skipped with state=skipped, reason=size.
-const parallelGainMaxIssues = 5000
+const (
+	parallelGainMaxIssues       = 5000
+	largeInsightsGraphThreshold = 500
+	maxInsightsCandidateSweep   = 200
+)
 
 // normalized replaces zero or negative caps with the defaults so a partially
 // populated config never disables a feature by accident.
@@ -508,20 +512,21 @@ func (a *Analyzer) generateTopKSet(k int) *TopKSetResult {
 	// Greedy selection: at each step, consider only issues that are actionable
 	// after the preceding selections. This keeps "work these in order" honest:
 	// a blocked high-fanout node can never precede its prerequisite.
+	actionable := a.getActionableIssuesAfterCompletions(completed)
+	before := a.initialUnblockReadySet(actionable)
 	for i := 0; i < k; i++ {
-		actionable := a.getActionableIssuesAfterCompletions(completed)
 		if len(actionable) == 0 {
 			break
 		}
-		before := issueIDSet(actionable)
+		sweep := a.rankActionableFrontier(actionable)
 
 		bestID := ""
 		bestGain := -1
 		var bestUnblocks []string
 
-		// getActionableIssuesAfterCompletions returns ID-sorted results, so the
+		// rankActionableFrontier returns ID-sorted results, so the
 		// explicit tie-break below is defensive as well as deterministic.
-		for _, candidate := range actionable {
+		for _, candidate := range sweep {
 			candID := candidate.ID
 			unblocks := a.computeMarginalUnblocksFromBefore(candID, completed, before)
 			gain := len(unblocks)
@@ -537,8 +542,34 @@ func (a *Analyzer) generateTopKSet(k int) *TopKSetResult {
 			break // no more candidates
 		}
 
-		// Select this candidate
+		// Select this candidate and incrementally update actionable + before
 		completed[bestID] = true
+		delete(before, bestID)
+		nextActionable := make([]model.Issue, 0, len(actionable)-1+len(bestUnblocks))
+		for _, iss := range actionable {
+			if iss.ID != bestID {
+				nextActionable = append(nextActionable, iss)
+			}
+		}
+		addedCandidate := false
+		for _, uid := range bestUnblocks {
+			if !before[uid] {
+				before[uid] = true
+				if a.IsCandidate(uid) {
+					if uIss, ok := a.issueMap[uid]; ok {
+						nextActionable = append(nextActionable, uIss)
+						addedCandidate = true
+					}
+				}
+			}
+		}
+		if addedCandidate {
+			sort.Slice(nextActionable, func(i, j int) bool {
+				return nextActionable[i].ID < nextActionable[j].ID
+			})
+		}
+		actionable = nextActionable
+
 		title := ""
 		if issue, exists := a.issueMap[bestID]; exists {
 			title = issue.Title
@@ -556,7 +587,7 @@ func (a *Analyzer) generateTopKSet(k int) *TopKSetResult {
 	// Reaching the output limit only means truncation when the simulated state
 	// has another feasible pick. Counting every remaining open issue produced a
 	// false capped claim for issues stranded in a dependency cycle.
-	hasNextFeasiblePick := len(items) >= k && len(a.getActionableIssuesAfterCompletions(completed)) > 0
+	hasNextFeasiblePick := len(items) >= k && len(actionable) > 0
 	status := FeatureStatus{
 		State:   "available",
 		Count:   len(items),
@@ -584,26 +615,95 @@ func issueIDSet(issues []model.Issue) map[string]bool {
 	return result
 }
 
+func (a *Analyzer) initialUnblockReadySet(actionable []model.Issue) map[string]bool {
+	result := issueIDSet(actionable)
+	if a.unblockIDs == nil {
+		return result
+	}
+	readiness := a.Readiness()
+	for id := range a.unblockIDs {
+		if !result[id] && readiness.Ready(id, a.now) {
+			result[id] = true
+		}
+	}
+	return result
+}
+
+// rankActionableFrontier bounds candidate sweeps on large graphs (>500 issues)
+// to the top maxInsightsCandidateSweep actionable issues ranked deterministically
+// by downstream unlock frontier size, active dependents, priority, and ID,
+// re-sorted by ID so tie-breaking remains strictly deterministic.
+func (a *Analyzer) rankActionableFrontier(actionable []model.Issue) []model.Issue {
+	if len(a.issueMap) <= largeInsightsGraphThreshold || len(actionable) <= maxInsightsCandidateSweep {
+		return actionable
+	}
+	type rankedIssue struct {
+		issue      model.Issue
+		unlockSize int
+		activeDeps int
+	}
+	scored := make([]rankedIssue, len(actionable))
+	for i, iss := range actionable {
+		scored[i] = rankedIssue{
+			issue:      iss,
+			unlockSize: len(a.directUnlockFrontier(iss.ID)),
+			activeDeps: a.countDependents(iss.ID),
+		}
+	}
+	sort.Slice(scored, func(i, j int) bool {
+		if scored[i].unlockSize != scored[j].unlockSize {
+			return scored[i].unlockSize > scored[j].unlockSize
+		}
+		if scored[i].activeDeps != scored[j].activeDeps {
+			return scored[i].activeDeps > scored[j].activeDeps
+		}
+		if scored[i].issue.Priority != scored[j].issue.Priority {
+			return scored[i].issue.Priority < scored[j].issue.Priority
+		}
+		return scored[i].issue.ID < scored[j].issue.ID
+	})
+	top := make([]model.Issue, maxInsightsCandidateSweep)
+	for i := 0; i < maxInsightsCandidateSweep; i++ {
+		top[i] = scored[i].issue
+	}
+	sort.Slice(top, func(i, j int) bool {
+		return top[i].ID < top[j].ID
+	})
+	return top
+}
+
 // computeMarginalUnblocksFromBefore returns newly actionable IDs after completing
 // issueID on top of alreadyCompleted. before is the actionable ID set for
 // alreadyCompleted, shared by callers evaluating independent candidates.
 func (a *Analyzer) computeMarginalUnblocksFromBefore(issueID string, alreadyCompleted, before map[string]bool) []string {
+	frontier := a.directUnlockFrontier(issueID)
+	if len(frontier) == 0 {
+		return nil
+	}
+	readiness := a.Readiness()
+	var unblocks []string
+	if len(alreadyCompleted) == 0 {
+		for _, id := range frontier {
+			if !before[id] && a.IsUnblockCandidate(id) && readiness.ReadyAfterSingle(id, a.now, issueID) {
+				unblocks = append(unblocks, id)
+			}
+		}
+		return unblocks
+	}
+
 	completedAfter := make(map[string]bool, len(alreadyCompleted)+1)
 	for id, done := range alreadyCompleted {
 		completedAfter[id] = done
 	}
 	completedAfter[issueID] = true
 
-	var unblocks []string
-	readiness := a.Readiness()
-	for id := range a.issueMap {
-		// Already-actionable issues cannot be new unlocks. Select only the IDs
-		// we need instead of copying every ready issue for each what-if candidate.
-		if !before[id] && a.IsCandidate(id) && readiness.ReadyAfter(id, a.now, completedAfter) {
+	for _, id := range frontier {
+		// Already-actionable issues cannot be new unlocks. Evaluate only the
+		// affected downstream frontier instead of scanning every issue in the graph.
+		if !before[id] && a.IsUnblockCandidate(id) && readiness.ReadyAfter(id, a.now, completedAfter) {
 			unblocks = append(unblocks, id)
 		}
 	}
-	sort.Strings(unblocks)
 	return unblocks
 }
 
@@ -657,28 +757,26 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 		}
 	}
 
-	// Track uncovered edges and degrees
-	uncovered := make(map[int]edge, len(edges))
-	for i, e := range edges {
-		uncovered[i] = e
+	// Track uncovered edges and incremental node degrees
+	covered := make([]bool, len(edges))
+	uncoveredCount := len(edges)
+	curDeg := make(map[string]int, len(totalDegree))
+	for id, d := range totalDegree {
+		curDeg[id] = d
 	}
 
 	var items []CoverageItem
 	selection := 0
 	edgesCovered := 0
 
-	for len(uncovered) > 0 && len(items) < limit {
-		// recompute degree from uncovered edges
-		deg := make(map[string]int)
-		for _, e := range uncovered {
-			deg[e.from]++
-			deg[e.to]++
-		}
-
-		// pick node with highest degree (tie-break lexicographically)
+	for uncoveredCount > 0 && len(items) < limit {
+		// pick node with highest current uncovered degree (tie-break lexicographically)
 		bestID := ""
-		bestDeg := -1
-		for id, d := range deg {
+		bestDeg := 0
+		for id, d := range curDeg {
+			if d <= 0 {
+				continue
+			}
 			if d > bestDeg || (d == bestDeg && (bestID == "" || id < bestID)) {
 				bestID, bestDeg = id, d
 			}
@@ -687,14 +785,21 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 			break
 		}
 
-		// remove all edges incident to bestID
+		// remove all edges incident to bestID and update neighbor degrees
 		added := 0
-		for idx, e := range uncovered {
-			if e.from == bestID || e.to == bestID {
-				delete(uncovered, idx)
+		for idx, e := range edges {
+			if !covered[idx] && (e.from == bestID || e.to == bestID) {
+				covered[idx] = true
+				uncoveredCount--
 				added++
+				if e.from == bestID {
+					curDeg[e.to]--
+				} else {
+					curDeg[e.from]--
+				}
 			}
 		}
+		delete(curDeg, bestID)
 		edgesCovered += added
 		selection++
 
@@ -712,7 +817,7 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 		})
 	}
 
-	capped := len(uncovered) > 0
+	capped := uncoveredCount > 0
 	return &CoverageSetResult{
 		Status: FeatureStatus{
 			State:   "available",
@@ -1022,7 +1127,7 @@ func (a *Analyzer) generateParallelCut(limit int) *ParallelCutResult {
 		}
 	}
 
-	before := issueIDSet(actionable)
+	before := a.initialUnblockReadySet(actionable)
 
 	// Calculate parallel gain only for work that can actually start now. The
 	// canonical readiness simulation handles blocking dependency types,
@@ -1033,8 +1138,15 @@ func (a *Analyzer) generateParallelCut(limit int) *ParallelCutResult {
 		enabledTracks []string
 	}
 	var candidates []parallelCandidate
-
+	forkEligible := make([]model.Issue, 0, len(actionable))
 	for _, issue := range actionable {
+		if len(a.directUnlockFrontier(issue.ID)) >= 2 {
+			forkEligible = append(forkEligible, issue)
+		}
+	}
+	sweep := a.rankActionableFrontier(forkEligible)
+
+	for _, issue := range sweep {
 		id := issue.ID
 		newlyActionable := a.computeMarginalUnblocksFromBefore(id, nil, before)
 
@@ -1087,7 +1199,22 @@ func (a *Analyzer) generateParallelCut(limit int) *ParallelCutResult {
 	for _, c := range candidates {
 		completedCut[c.id] = true
 	}
-	maxParallel := len(a.getActionableIssuesAfterCompletions(completedCut))
+	maxParallel := len(actionable) - len(completedCut)
+	if len(completedCut) > 0 {
+		readiness := a.Readiness()
+		seenCutFrontier := make(map[string]bool)
+		for _, c := range candidates {
+			for _, uid := range a.directUnlockFrontier(c.id) {
+				if seenCutFrontier[uid] || before[uid] || completedCut[uid] {
+					continue
+				}
+				seenCutFrontier[uid] = true
+				if a.IsUnblockCandidate(uid) && readiness.ReadyAfter(uid, a.now, completedCut) {
+					maxParallel++
+				}
+			}
+		}
+	}
 
 	return &ParallelCutResult{
 		Status: FeatureStatus{
@@ -1100,6 +1227,17 @@ func (a *Analyzer) generateParallelCut(limit int) *ParallelCutResult {
 		MaxParallel: maxParallel,
 		HowToUse:    DefaultUsageHints()["parallel_cut"],
 	}
+}
+
+// measuredDurationMs converts a measured wall-clock elapsed duration to
+// milliseconds, rounding positive sub-millisecond runs up to 1ms so fast
+// sweeps are not dropped by json:"duration_ms,omitempty" (pinned-clock callers
+// explicitly clear DurationMs to 0).
+func measuredDurationMs(start time.Time) int64 {
+	if ms := time.Since(start).Milliseconds(); ms > 0 {
+		return ms
+	}
+	return 1
 }
 
 // generateParallelGain measures, for every actionable issue, how many extra
@@ -1128,7 +1266,7 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 		return result
 	}
 
-	// Open issues in sorted order so every map walk below is deterministic.
+	// Open issues in sorted order so every walk below is deterministic.
 	openIDs := make([]string, 0, len(a.issueMap))
 	for id, issue := range a.issueMap {
 		if !isClosedLikeStatus(issue.Status) {
@@ -1136,87 +1274,185 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 		}
 	}
 	sort.Strings(openIDs)
-	openSet := make(map[string]bool, len(openIDs))
-	for _, id := range openIDs {
-		openSet[id] = true
+	nOpen := len(openIDs)
+	openIdx := make(map[string]int32, nOpen)
+	for i, id := range openIDs {
+		openIdx[id] = int32(i)
 	}
 
 	// Undirected edges between open issues, matching findConnectedComponents.
-	type edge struct{ from, to string }
-	var edges []edge
-	for _, id := range openIDs {
+	var intEdges [][2]int32
+	deg := make([]int32, nOpen)
+	type idxPair struct{ lo, hi int32 }
+	seenPairs := make(map[idxPair]struct{}, nOpen)
+	for uIdx, id := range openIDs {
+		u := int32(uIdx)
 		for _, dep := range a.issueMap[id].Dependencies {
 			if dep == nil || !(dep.Type.IsBlocking() || dep.Type == model.DepParentChild) {
 				continue
 			}
-			if openSet[dep.DependsOnID] {
-				edges = append(edges, edge{from: id, to: dep.DependsOnID})
+			v, ok := openIdx[dep.DependsOnID]
+			if !ok || u == v {
+				continue
 			}
+			lo, hi := u, v
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			pair := idxPair{lo: lo, hi: hi}
+			if _, exists := seenPairs[pair]; exists {
+				continue
+			}
+			seenPairs[pair] = struct{}{}
+			intEdges = append(intEdges, [2]int32{lo, hi})
+			deg[u]++
+			deg[v]++
 		}
 	}
 
 	actionable := a.GetActionableIssues()
-	actionableSet := make(map[string]bool, len(actionable))
 	actionableIDs := make([]string, 0, len(actionable))
+	actionableIndices := make([]int32, 0, len(actionable))
 	for _, iss := range actionable {
-		actionableSet[iss.ID] = true
 		actionableIDs = append(actionableIDs, iss.ID)
+		if idx, ok := openIdx[iss.ID]; ok {
+			actionableIndices = append(actionableIndices, idx)
+		}
 	}
 	sort.Strings(actionableIDs)
+	beforeReady := a.initialUnblockReadySet(actionable)
 
-	// countTracks groups the open graph without `excluded` and counts the
-	// components that contain at least one member of `active`.
-	countTracks := func(excluded string, active map[string]bool) int {
-		parent := make(map[string]string, len(openIDs))
-		for _, id := range openIDs {
-			if id != excluded {
-				parent[id] = id
-			}
+	parent := make([]int32, nOpen)
+	for i := int32(0); i < int32(nOpen); i++ {
+		parent[i] = i
+	}
+	find := func(x int32) int32 {
+		for parent[x] != x {
+			parent[x] = parent[parent[x]]
+			x = parent[x]
 		}
-		var find func(string) string
-		find = func(x string) string {
-			for parent[x] != x {
-				parent[x] = parent[parent[x]]
-				x = parent[x]
-			}
-			return x
+		return x
+	}
+	for _, e := range intEdges {
+		pu, pv := find(e[0]), find(e[1])
+		if pu == pv {
+			continue
 		}
-		for _, e := range edges {
-			if e.from == excluded || e.to == excluded {
-				continue
-			}
-			pf, pt := find(e.from), find(e.to)
-			if pf == pt {
-				continue
-			}
-			if pf < pt {
-				parent[pt] = pf
-			} else {
-				parent[pf] = pt
-			}
+		if pu < pv {
+			parent[pv] = pu
+		} else {
+			parent[pu] = pv
 		}
-		roots := make(map[string]bool)
-		for id := range active {
-			if id == excluded {
-				continue
-			}
-			if _, ok := parent[id]; !ok {
-				continue
-			}
-			roots[find(id)] = true
-		}
-		return len(roots)
 	}
 
-	tracksNow := countTracks("", actionableSet)
+	rootToComp := make([]int32, nOpen)
+	for i := range rootToComp {
+		rootToComp[i] = -1
+	}
+	compOfNode := make([]int32, nOpen)
+	var compNodes [][]int32
+	for i := int32(0); i < int32(nOpen); i++ {
+		r := find(i)
+		c := rootToComp[r]
+		if c < 0 {
+			c = int32(len(compNodes))
+			rootToComp[r] = c
+			compNodes = append(compNodes, nil)
+		}
+		compOfNode[i] = c
+		compNodes[c] = append(compNodes[c], i)
+	}
+	nComps := len(compNodes)
+	compEdges := make([][][2]int32, nComps)
+	for _, e := range intEdges {
+		c := compOfNode[e[0]]
+		compEdges[c] = append(compEdges[c], e)
+	}
+	compAct := make([][]int32, nComps)
+	for _, idx := range actionableIndices {
+		c := compOfNode[idx]
+		compAct[c] = append(compAct[c], idx)
+	}
+	compActiveNow := make([]bool, nComps)
+	tracksNow := 0
+	for c := 0; c < nComps; c++ {
+		if len(compAct[c]) > 0 {
+			compActiveNow[c] = true
+			tracksNow++
+		}
+	}
 	result.CurrentParallel = tracksNow
+
+	seenRoot := make([]int32, nOpen)
+	seenExtComp := make([]int32, nComps)
+	var epoch int32
+
+	// countTracksIdx recomputes connected components ONLY inside excludedIdx's
+	// base component (all other base components are unaffected by removing
+	// excludedIdx) and accounts for any newly unblocked open issues.
+	countTracksIdx := func(excludedIdx int32, extraIndices []int32) int {
+		epoch++
+		curEpoch := epoch
+		c0 := compOfNode[excludedIdx]
+		localBefore := 0
+		if compActiveNow[c0] {
+			localBefore = 1
+		}
+		for _, v := range compNodes[c0] {
+			parent[v] = v
+		}
+		for _, e := range compEdges[c0] {
+			u, v := e[0], e[1]
+			if u == excludedIdx || v == excludedIdx {
+				continue
+			}
+			pu, pv := find(u), find(v)
+			if pu == pv {
+				continue
+			}
+			if pu < pv {
+				parent[pv] = pu
+			} else {
+				parent[pu] = pv
+			}
+		}
+		localAfter := 0
+		for _, idx := range compAct[c0] {
+			if idx == excludedIdx {
+				continue
+			}
+			r := find(idx)
+			if seenRoot[r] != curEpoch {
+				seenRoot[r] = curEpoch
+				localAfter++
+			}
+		}
+		extGain := 0
+		for _, idx := range extraIndices {
+			if idx == excludedIdx {
+				continue
+			}
+			cu := compOfNode[idx]
+			if cu == c0 {
+				r := find(idx)
+				if seenRoot[r] != curEpoch {
+					seenRoot[r] = curEpoch
+					localAfter++
+				}
+			} else if !compActiveNow[cu] && seenExtComp[cu] != curEpoch {
+				seenExtComp[cu] = curEpoch
+				extGain++
+			}
+		}
+		return tracksNow - localBefore + localAfter + extGain
+	}
 
 	if len(actionableIDs) == 0 {
 		result.Status = FeatureStatus{
 			State:      "computed",
 			Count:      0,
 			Reason:     "No actionable issues",
-			DurationMs: time.Since(start).Milliseconds(),
+			DurationMs: measuredDurationMs(start),
 		}
 		return result
 	}
@@ -1227,25 +1463,77 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 		deadline = start.Add(budget)
 	}
 
-	var items []ParallelGainItem
-	evaluated := 0
+	type pgCandidate struct {
+		id       string
+		idx      int32
+		deg      int32
+		unblocks []string
+		priority int
+	}
+	nonTrivial := make([]pgCandidate, 0, len(actionableIDs))
+	trivialSkipped := 0
 	for _, id := range actionableIDs {
+		candIdx, ok := openIdx[id]
+		if !ok {
+			trivialSkipped++
+			continue
+		}
+		unblocks := a.computeMarginalUnblocksFromBefore(id, nil, beforeReady)
+		// Mathematical pruning: an isolated vertex (deg==0) or a leaf (deg==1)
+		// cannot disconnect its open component, so unless out-of-graph parent links
+		// exist it can never increase active tracks (gain <= 0).
+		if deg[candIdx] <= 1 && (len(unblocks) == 0 || len(a.extParentLinked) == 0) {
+			trivialSkipped++
+			continue
+		}
+		nonTrivial = append(nonTrivial, pgCandidate{
+			id:       id,
+			idx:      candIdx,
+			deg:      deg[candIdx],
+			unblocks: unblocks,
+			priority: a.issueMap[id].Priority,
+		})
+	}
+
+	frontierCapped := false
+	if len(a.issueMap) > largeInsightsGraphThreshold && len(nonTrivial) > maxInsightsCandidateSweep {
+		sort.Slice(nonTrivial, func(i, j int) bool {
+			if len(nonTrivial[i].unblocks) != len(nonTrivial[j].unblocks) {
+				return len(nonTrivial[i].unblocks) > len(nonTrivial[j].unblocks)
+			}
+			if nonTrivial[i].deg != nonTrivial[j].deg {
+				return nonTrivial[i].deg > nonTrivial[j].deg
+			}
+			if nonTrivial[i].priority != nonTrivial[j].priority {
+				return nonTrivial[i].priority < nonTrivial[j].priority
+			}
+			return nonTrivial[i].id < nonTrivial[j].id
+		})
+		nonTrivial = nonTrivial[:maxInsightsCandidateSweep]
+		sort.Slice(nonTrivial, func(i, j int) bool {
+			return nonTrivial[i].id < nonTrivial[j].id
+		})
+		frontierCapped = true
+	}
+
+	var items []ParallelGainItem
+	var extraIndices []int32
+	evaluated := trivialSkipped
+	timedOut := false
+	for _, cand := range nonTrivial {
 		if !deadline.IsZero() && time.Now().After(deadline) {
+			timedOut = true
 			break
 		}
 		evaluated++
 
-		unblocks := a.computeMarginalUnblocksFromBefore(id, nil, actionableSet)
-		after := make(map[string]bool, len(actionableSet)+len(unblocks))
-		for k := range actionableSet {
-			if k != id {
-				after[k] = true
+		extraIndices = extraIndices[:0]
+		for _, u := range cand.unblocks {
+			if uIdx, ok := openIdx[u]; ok {
+				extraIndices = append(extraIndices, uIdx)
 			}
 		}
-		for _, u := range unblocks {
-			after[u] = true
-		}
-		tracksAfter := countTracks(id, after)
+		tracksAfter := countTracksIdx(cand.idx, extraIndices)
 		gain := tracksAfter - tracksNow
 		if gain <= 0 {
 			continue
@@ -1255,13 +1543,13 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 			pct = float64(gain) / float64(tracksNow) * 100
 		}
 		items = append(items, ParallelGainItem{
-			ID:                id,
-			Title:             a.issueMap[id].Title,
+			ID:                cand.id,
+			Title:             a.issueMap[cand.id].Title,
 			CurrentParallel:   tracksNow,
 			PotentialParallel: tracksAfter,
 			Gain:              gain,
 			GainPercent:       pct,
-			Unblocks:          unblocks,
+			Unblocks:          cand.unblocks,
 		})
 	}
 
@@ -1282,13 +1570,15 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 	status := FeatureStatus{
 		State:      "computed",
 		Count:      len(items),
-		Capped:     total > limit,
+		Capped:     total > limit || frontierCapped,
 		Limited:    total,
-		DurationMs: time.Since(start).Milliseconds(),
+		DurationMs: measuredDurationMs(start),
 	}
-	if evaluated < len(actionableIDs) {
+	if timedOut {
 		status.Capped = true
 		status.Reason = fmt.Sprintf("time budget %s exhausted after %d of %d candidates", budget, evaluated, len(actionableIDs))
+	} else if frontierCapped {
+		status.Reason = fmt.Sprintf("frontier capped to top %d of %d actionable candidates", maxInsightsCandidateSweep, len(actionableIDs))
 	}
 	result.Status = status
 	result.Metrics = items

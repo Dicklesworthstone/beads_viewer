@@ -26,8 +26,9 @@ import (
 
 // PreviewServer serves a static site bundle locally for previewing.
 type PreviewServer struct {
-	bundlePath string
-	port       int
+	bundlePath    string
+	port          int
+	defaultConfig *PreviewConfig
 
 	// SAFETY: server publication and stopRequested form one lifecycle state.
 	// Never call into net/http while holding mu: Shutdown may wait for handlers,
@@ -47,14 +48,39 @@ func NewPreviewServer(bundlePath string, port int) *PreviewServer {
 	}
 }
 
+// NewPreviewServerWithConfig creates a new preview server configured by PreviewConfig
+// (including LiveReload, OpenBrowser, and Quiet settings).
+func NewPreviewServerWithConfig(config PreviewConfig) *PreviewServer {
+	cfgCopy := config
+	return &PreviewServer{
+		bundlePath:    config.BundlePath,
+		port:          config.Port,
+		defaultConfig: &cfgCopy,
+	}
+}
+
+func (p *PreviewServer) effectiveConfig() PreviewConfig {
+	if p.defaultConfig != nil {
+		cfg := *p.defaultConfig
+		if cfg.BundlePath == "" {
+			cfg.BundlePath = p.bundlePath
+		}
+		if cfg.Port == 0 {
+			cfg.Port = p.port
+		}
+		return cfg
+	}
+	return PreviewConfig{OpenBrowser: true}
+}
+
 // Start starts the preview server and blocks until stopped.
 func (p *PreviewServer) Start() error {
-	return p.start(PreviewConfig{OpenBrowser: true})
+	return p.start(p.effectiveConfig())
 }
 
 // StartWithGracefulShutdown starts the server with signal handling for clean shutdown.
 func (p *PreviewServer) StartWithGracefulShutdown() error {
-	return p.startWithGracefulShutdown(PreviewConfig{OpenBrowser: true})
+	return p.startWithGracefulShutdown(p.effectiveConfig())
 }
 
 func (p *PreviewServer) startWithGracefulShutdown(config PreviewConfig) error {

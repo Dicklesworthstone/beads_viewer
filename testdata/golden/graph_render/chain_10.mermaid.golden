@@ -2,26 +2,31 @@ graph TD
     classDef open fill:#50FA7B,stroke:#333,color:#000
     classDef inprogress fill:#8BE9FD,stroke:#333,color:#000
     classDef blocked fill:#FF5555,stroke:#333,color:#000
+    classDef deferred fill:#FFB86C,stroke:#333,color:#000
+    classDef pinned fill:#BD93F9,stroke:#333,color:#000
+    classDef hooked fill:#FF79C6,stroke:#333,color:#000
+    classDef review fill:#F1FA8C,stroke:#333,color:#000
+    classDef custom fill:#E2E8F0,stroke:#333,color:#000
     classDef closed fill:#6272A4,stroke:#333,color:#fff
 
     n0["n0<br/>n0"]
-    class n0 open
+    class n0 blocked
     n1["n1<br/>n1"]
-    class n1 open
+    class n1 blocked
     n2["n2<br/>n2"]
-    class n2 open
+    class n2 blocked
     n3["n3<br/>n3"]
-    class n3 open
+    class n3 blocked
     n4["n4<br/>n4"]
-    class n4 open
+    class n4 blocked
     n5["n5<br/>n5"]
-    class n5 open
+    class n5 blocked
     n6["n6<br/>n6"]
-    class n6 open
+    class n6 blocked
     n7["n7<br/>n7"]
-    class n7 open
+    class n7 blocked
     n8["n8<br/>n8"]
-    class n8 open
+    class n8 blocked
     n9["n9<br/>n9"]
     class n9 open
 

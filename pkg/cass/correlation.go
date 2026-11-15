@@ -2,6 +2,8 @@ package cass
 
 import (
 	"context"
+	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -597,14 +599,23 @@ func (c *Correlator) cacheResult(beadID string, result *CorrelationResult) {
 }
 
 // WorkspaceFromBeadsPath extracts the workspace directory from a beads.jsonl path.
-// An empty path returns "", and relative paths are resolved to absolute paths
-// before stripping the beads directory and filename.
+// Empty paths and git:<rev> historical pseudo-paths resolve via os.Getwd() so
+// TUI --as-of sessions stay anchored to the repository instead of resolving to "..".
 func WorkspaceFromBeadsPath(beadsPath string) string {
 	trimmed := strings.TrimSpace(beadsPath)
-	if trimmed == "" {
-		return ""
+	if trimmed == "" || strings.HasPrefix(trimmed, "git:") {
+		cwd, err := os.Getwd()
+		if err != nil {
+			return ""
+		}
+		return cwd
 	}
-	if !filepath.IsAbs(trimmed) && !isWindowsDrivePath(trimmed) {
+	if isWindowsDrivePath(trimmed) {
+		normalized := path.Clean(strings.ReplaceAll(trimmed, "\\", "/"))
+		dir := path.Dir(normalized)
+		return path.Dir(dir)
+	}
+	if !filepath.IsAbs(trimmed) {
 		if abs, err := filepath.Abs(trimmed); err == nil {
 			trimmed = abs
 		}

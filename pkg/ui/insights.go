@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
@@ -134,10 +135,11 @@ var metricDescriptions = map[MetricPanel]MetricInfo{
 
 // InsightsModel is an interactive insights dashboard
 type InsightsModel struct {
-	insights  analysis.Insights
-	issueMap  map[string]*model.Issue
-	theme     Theme
-	labelFlow *analysis.CrossLabelFlow
+	insights         analysis.Insights
+	advancedInsights *analysis.AdvancedInsights
+	issueMap         map[string]*model.Issue
+	theme            Theme
+	labelFlow        *analysis.CrossLabelFlow
 
 	// Priority triage data (bv-91)
 	topPicks []analysis.TopPick
@@ -291,6 +293,17 @@ func (m *InsightsModel) adjustDetailRatio(delta float64) {
 
 func (m *InsightsModel) SetInsights(ins analysis.Insights) {
 	m.insights = ins
+	m.detailContent = ""
+}
+
+// SetAdvancedInsights sets advanced graph analysis results (cycle break, top-k unlock,
+// parallel gain/cut, and vertex coverage set) for the insights detail panel.
+func (m *InsightsModel) SetAdvancedInsights(adv *analysis.AdvancedInsights) {
+	m.advancedInsights = adv
+	m.detailContent = ""
+	if adv != nil && m.ready {
+		m.updateDetailContent()
+	}
 }
 
 // SetIssueMap updates the issue lookup map used when rendering panel items and details.
@@ -546,6 +559,8 @@ func (m *InsightsModel) ToggleExplanations() {
 
 func (m *InsightsModel) ToggleCalculation() {
 	m.showCalculation = !m.showCalculation
+	m.detailContent = ""
+	m.updateDetailContent()
 }
 
 // ToggleHeatmap toggles between priority list and heatmap view (bv-95)
@@ -2060,6 +2075,10 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 		sb.WriteString(fmt.Sprintf("- **Degree:** In `%d` ← → Out `%d`\n\n", stats.InDegree[selectedID], stats.OutDegree[selectedID]))
 	}
 
+	if advMD := m.renderAdvancedInsightsMD(); advMD != "" {
+		sb.WriteString(advMD)
+	}
+
 	// === Description ===
 	if issue.Description != "" {
 		sb.WriteString("### Description\n\n")
@@ -2230,6 +2249,103 @@ func (m *InsightsModel) renderCalculationProofMD(selectedID string) string {
 	return sb.String()
 }
 
+// renderAdvancedInsightsMD renders panel-specific AdvancedInsights sections for
+// Cycles (CycleBreak), Priority (TopKSet + ParallelGain), Bottlenecks (ParallelCut),
+// and Articulation (CoverageSet).
+func (m *InsightsModel) renderAdvancedInsightsMD() string {
+	adv := m.advancedInsights
+	if adv == nil {
+		return ""
+	}
+
+	var sb strings.Builder
+	switch m.focusedPanel {
+	case PanelCycles:
+		if adv.CycleBreak != nil && len(adv.CycleBreak.Suggestions) > 0 {
+			sb.WriteString("### ✂️ Cycle Break Suggestions\n\n")
+			if adv.CycleBreak.CycleCount > 0 {
+				sb.WriteString(fmt.Sprintf("**Cycles Analyzed:** `%d`\n\n", adv.CycleBreak.CycleCount))
+			}
+			limit := min(5, len(adv.CycleBreak.Suggestions))
+			for i := 0; i < limit; i++ {
+				s := adv.CycleBreak.Suggestions[i]
+				sb.WriteString(fmt.Sprintf("- **`%s -> %s`** — breaks `%d` cycle(s) _(collateral: %d)_\n",
+					s.EdgeFrom, s.EdgeTo, s.Impact, s.Collateral))
+			}
+			sb.WriteString("\n")
+		}
+
+	case PanelPriority:
+		if adv.TopKSet != nil && len(adv.TopKSet.Items) > 0 {
+			sb.WriteString("### 🎯 Greedy Unlock Set\n\n")
+			sb.WriteString(fmt.Sprintf("**Total Gain:** `+%d` unlocked issues\n\n", adv.TopKSet.TotalGain))
+			limit := min(5, len(adv.TopKSet.Items))
+			for i := 0; i < limit; i++ {
+				it := adv.TopKSet.Items[i]
+				title := it.Title
+				if title == "" {
+					title = m.getBeadTitle(it.ID, 32)
+				} else {
+					title = truncateRunesHelper(title, 32, "…")
+				}
+				sb.WriteString(fmt.Sprintf("%d. **`%s`** (+%d) — %s\n", i+1, it.ID, it.MarginalGain, title))
+			}
+			sb.WriteString("\n")
+		}
+		if adv.ParallelGain != nil && (adv.ParallelGain.CurrentParallel > 0 || len(adv.ParallelGain.Metrics) > 0) {
+			sb.WriteString("### ⚡ Parallel Gain\n\n")
+			sb.WriteString(fmt.Sprintf("**Current Parallel Tracks:** `%d`\n\n", adv.ParallelGain.CurrentParallel))
+			limit := min(5, len(adv.ParallelGain.Metrics))
+			for i := 0; i < limit; i++ {
+				pg := adv.ParallelGain.Metrics[i]
+				sb.WriteString(fmt.Sprintf("- **`%s`** — `+%d` track(s) (`%d -> %d`)\n",
+					pg.ID, pg.Gain, pg.CurrentParallel, pg.PotentialParallel))
+			}
+			sb.WriteString("\n")
+		}
+
+	case PanelBottlenecks:
+		if adv.ParallelCut != nil && (adv.ParallelCut.MaxParallel > 0 || len(adv.ParallelCut.Suggestions) > 0) {
+			sb.WriteString("### 🔀 Parallel Cut Suggestions\n\n")
+			sb.WriteString(fmt.Sprintf("**Max Parallel Streams:** `%d`\n\n", adv.ParallelCut.MaxParallel))
+			limit := min(5, len(adv.ParallelCut.Suggestions))
+			for i := 0; i < limit; i++ {
+				pc := adv.ParallelCut.Suggestions[i]
+				title := pc.Title
+				if title == "" {
+					title = m.getBeadTitle(pc.ID, 30)
+				} else {
+					title = truncateRunesHelper(title, 30, "…")
+				}
+				sb.WriteString(fmt.Sprintf("- **`%s`** — `+%d` stream(s) — %s\n", pc.ID, pc.ParallelGain, title))
+			}
+			sb.WriteString("\n")
+		}
+
+	case PanelArticulation:
+		if adv.CoverageSet != nil && (adv.CoverageSet.TotalEdges > 0 || len(adv.CoverageSet.Items) > 0) {
+			sb.WriteString("### 🛡️ Vertex Coverage Set\n\n")
+			sb.WriteString(fmt.Sprintf("**Coverage:** `%d/%d` blocking edges (`%.0f%%`)\n\n",
+				adv.CoverageSet.EdgesCovered, adv.CoverageSet.TotalEdges, adv.CoverageSet.CoverageRatio*100))
+			limit := min(5, len(adv.CoverageSet.Items))
+			for i := 0; i < limit; i++ {
+				cv := adv.CoverageSet.Items[i]
+				title := cv.Title
+				if title == "" {
+					title = m.getBeadTitle(cv.ID, 30)
+				} else {
+					title = truncateRunesHelper(title, 30, "…")
+				}
+				sb.WriteString(fmt.Sprintf("- **`%s`** — `+%d` edges (deg `%d`) — %s\n",
+					cv.ID, cv.EdgesAdded, cv.TotalDegree, title))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	return sb.String()
+}
+
 func (m *InsightsModel) renderDetailPanel(width, height int, t Theme) string {
 	// width is detailPanelWidth(): size the viewport and the markdown
 	// renderer to its content area (border and padding excluded).
@@ -2253,6 +2369,9 @@ Navigate to a metric panel and select an item to view its details here.
 - Ctrl+j/k scroll details
 - Enter to view in main view
 `
+		if advMD := m.renderAdvancedInsightsMD(); advMD != "" {
+			emptyContent += "\n---\n\n" + advMD
+		}
 		if m.mdRenderer != nil {
 			rendered, err := m.mdRenderer.Render(emptyContent)
 			if err == nil {
@@ -2326,7 +2445,7 @@ func (m *InsightsModel) getBeadTitle(id string, maxWidth int) string {
 	return truncateRunesHelper(id, maxWidth, "…")
 }
 
-// findDependents returns IDs of beads that depend on the given bead (sorted for consistent order)
+// findDependents returns IDs of beads that have a blocking dependency on targetID (sorted for consistent order)
 func (m *InsightsModel) findDependents(targetID string) []string {
 	var dependents []string
 	for id, issue := range m.issueMap {
@@ -2334,34 +2453,35 @@ func (m *InsightsModel) findDependents(targetID string) []string {
 			continue
 		}
 		for _, dep := range issue.Dependencies {
-			if dep != nil && dep.DependsOnID == targetID {
+			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			if dep.DependsOnID == targetID {
 				dependents = append(dependents, id)
 				break
 			}
 		}
 	}
-	// Sort for consistent display order (map iteration is non-deterministic)
-	for i := 0; i < len(dependents)-1; i++ {
-		for j := i + 1; j < len(dependents); j++ {
-			if dependents[j] < dependents[i] {
-				dependents[i], dependents[j] = dependents[j], dependents[i]
-			}
-		}
-	}
+	sort.Strings(dependents)
 	return dependents
 }
 
-// findDependencies returns IDs of beads that the given bead depends on
+// findDependencies returns deduplicated IDs of beads that targetID has a blocking dependency on
 func (m *InsightsModel) findDependencies(targetID string) []string {
 	issue := m.issueMap[targetID]
 	if issue == nil {
 		return nil
 	}
 	var deps []string
+	seen := make(map[string]struct{}, len(issue.Dependencies))
 	for _, dep := range issue.Dependencies {
-		if dep == nil {
+		if dep == nil || !dep.Type.IsBlocking() {
 			continue
 		}
+		if _, dup := seen[dep.DependsOnID]; dup {
+			continue
+		}
+		seen[dep.DependsOnID] = struct{}{}
 		deps = append(deps, dep.DependsOnID)
 	}
 	return deps

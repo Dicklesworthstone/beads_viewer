@@ -104,6 +104,53 @@ func (m *LabelDashboardModel) SetData(labels []analysis.LabelHealth) {
 	m.clampCursorAndScroll()
 }
 
+// MoveUp moves selection up by one label row.
+func (m *LabelDashboardModel) MoveUp() {
+	if m.cursor > 0 {
+		m.cursor--
+		if m.cursor < m.scrollOffset {
+			m.scrollOffset = m.cursor
+		}
+	}
+}
+
+// MoveDown moves selection down by one label row.
+func (m *LabelDashboardModel) MoveDown() {
+	visibleRows := max(1, m.height-1)
+	if m.cursor < len(m.labels)-1 {
+		m.cursor++
+		if m.cursor >= m.scrollOffset+visibleRows {
+			m.scrollOffset = m.cursor - visibleRows + 1
+		}
+	}
+}
+
+// PageDown advances selection by half a visible page.
+func (m *LabelDashboardModel) PageDown() {
+	if len(m.labels) == 0 {
+		return
+	}
+	visibleRows := max(1, m.height-1)
+	step := max(1, visibleRows/2)
+	m.cursor = min(len(m.labels)-1, m.cursor+step)
+	if m.cursor >= m.scrollOffset+visibleRows {
+		m.scrollOffset = m.cursor - visibleRows + 1
+	}
+}
+
+// PageUp moves selection back by half a visible page.
+func (m *LabelDashboardModel) PageUp() {
+	if len(m.labels) == 0 {
+		return
+	}
+	visibleRows := max(1, m.height-1)
+	step := max(1, visibleRows/2)
+	m.cursor = max(0, m.cursor-step)
+	if m.cursor < m.scrollOffset {
+		m.scrollOffset = m.cursor
+	}
+}
+
 // Update handles navigation keys; returns selected label on enter
 func (m *LabelDashboardModel) Update(msg tea.KeyMsg) (string, tea.Cmd) {
 	visibleRows := m.height - 1
@@ -113,21 +160,9 @@ func (m *LabelDashboardModel) Update(msg tea.KeyMsg) (string, tea.Cmd) {
 
 	switch msg.String() {
 	case "j", "down":
-		if m.cursor < len(m.labels)-1 {
-			m.cursor++
-			// Scroll down if moving past bottom
-			if m.cursor >= m.scrollOffset+visibleRows {
-				m.scrollOffset = m.cursor - visibleRows + 1
-			}
-		}
+		m.MoveDown()
 	case "k", "up":
-		if m.cursor > 0 {
-			m.cursor--
-			// Scroll up if moving past top
-			if m.cursor < m.scrollOffset {
-				m.scrollOffset = m.cursor
-			}
-		}
+		m.MoveUp()
 	case "g", "home":
 		m.cursor = 0
 		m.scrollOffset = 0
@@ -141,6 +176,10 @@ func (m *LabelDashboardModel) Update(msg tea.KeyMsg) (string, tea.Cmd) {
 				m.scrollOffset = 0
 			}
 		}
+	case "ctrl+d", "pgdown":
+		m.PageDown()
+	case "ctrl+u", "pgup":
+		m.PageUp()
 	case "enter":
 		if m.cursor >= 0 && m.cursor < len(m.labels) {
 			return m.labels[m.cursor].Label, nil

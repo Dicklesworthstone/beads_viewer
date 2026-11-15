@@ -162,12 +162,13 @@ func buildLayout(opts GraphSnapshotOptions) layoutResult {
 	}
 
 	// group nodes by level for row placement
+	maxNodeRunes := nodeMaxTextRunes(nodeW)
 	levelBuckets := make(map[int][]layoutNode, maxLevel)
 	for _, iss := range opts.Issues {
 		level := levelByID[iss.ID]
 		n := layoutNode{
 			ID:       iss.ID,
-			Title:    truncate(iss.Title, 44),
+			Title:    truncate(iss.Title, maxNodeRunes),
 			Status:   iss.Status,
 			Blocked:  !isClosedLikeStatus(iss.Status) && len(readiness.Blockers(iss.ID)) > 0,
 			Level:    level,
@@ -404,6 +405,15 @@ func renderSVG(opts GraphSnapshotOptions, layout layoutResult) error {
 func renderSVGToWriter(w io.Writer, layout layoutResult) error {
 	canvas := svg.New(w)
 	canvas.Start(layout.Width, layout.Height)
+	if len(layout.Nodes) > 0 {
+		canvas.Def()
+		for idx, n := range layout.Nodes {
+			canvas.ClipPath(fmt.Sprintf(`id="clip-node-%d"`, idx))
+			canvas.Roundrect(int(n.X), int(n.Y), int(n.NodeW), int(n.NodeH), 8, 8)
+			canvas.ClipEnd()
+		}
+		canvas.DefEnd()
+	}
 	canvas.Rect(0, 0, layout.Width, layout.Height, fmt.Sprintf("fill:%s", css(colorBackdrop)))
 	canvas.Roundrect(16, 16, layout.Width-32, int(layout.Header-24), 10, 10, fmt.Sprintf("fill:%s", css(colorHeaderBG)))
 
@@ -431,14 +441,16 @@ func renderSVGToWriter(w io.Writer, layout layoutResult) error {
 		)
 	}
 
-	for _, n := range layout.Nodes {
+	for idx, n := range layout.Nodes {
 		x := int(n.X)
 		y := int(n.Y)
+		maxRunes := nodeMaxTextRunes(n.NodeW)
 		canvas.Roundrect(x, y, int(n.NodeW), int(n.NodeH), 8, 8,
 			fmt.Sprintf("fill:%s;stroke:%s;stroke-width:1.2", css(nodeFillColor(n)), css(colorStroke)))
-		canvas.Text(x+10, y+22, n.ID, fmt.Sprintf("fill:%s;font-size:13px;font-family:monospace;font-weight:bold", css(colorText)))
-		canvas.Text(x+10, y+42, truncate(n.Title, 40), fmt.Sprintf("fill:%s;font-size:12px;font-family:monospace", css(colorSubtle)))
-		canvas.Text(x+10, y+60, fmt.Sprintf("PR %.3f", n.PageRank),
+		clipAttr := fmt.Sprintf(`clip-path="url(#clip-node-%d)"`, idx)
+		canvas.Text(x+10, y+22, truncate(n.ID, maxRunes), clipAttr, fmt.Sprintf("fill:%s;font-size:13px;font-family:monospace;font-weight:bold", css(colorText)))
+		canvas.Text(x+10, y+42, truncate(n.Title, maxRunes), clipAttr, fmt.Sprintf("fill:%s;font-size:12px;font-family:monospace", css(colorSubtle)))
+		canvas.Text(x+10, y+60, fmt.Sprintf("PR %.3f", n.PageRank), clipAttr,
 			fmt.Sprintf("fill:%s;font-size:11px;font-family:monospace", css(colorSubtle)))
 	}
 
@@ -455,11 +467,15 @@ func drawNode(dc *gg.Context, n layoutNode) {
 	dc.DrawRoundedRectangle(n.X, n.Y, n.NodeW, n.NodeH, 8)
 	dc.Stroke()
 
+	maxRunes := nodeMaxTextRunes(n.NodeW)
+	dc.DrawRoundedRectangle(n.X+2, n.Y+2, n.NodeW-4, n.NodeH-4, 6)
+	dc.Clip()
 	dc.SetColor(colorText)
-	dc.DrawStringAnchored(n.ID, n.X+10, n.Y+18, 0, 0.5)
+	dc.DrawStringAnchored(truncate(n.ID, maxRunes), n.X+10, n.Y+18, 0, 0.5)
 	dc.SetColor(colorSubtle)
-	dc.DrawStringAnchored(truncate(n.Title, 40), n.X+10, n.Y+36, 0, 0.5)
+	dc.DrawStringAnchored(truncate(n.Title, maxRunes), n.X+10, n.Y+36, 0, 0.5)
 	dc.DrawStringAnchored(fmt.Sprintf("PR %.3f", n.PageRank), n.X+10, n.Y+54, 0, 0.5)
+	dc.ResetClip()
 }
 
 func drawArrow(dc *gg.Context, x, y, dx, dy float64) {
@@ -473,12 +489,17 @@ func drawArrow(dc *gg.Context, x, y, dx, dy float64) {
 }
 
 func drawSummaryBlock(dc *gg.Context, layout layoutResult) {
+	titleLimit := summaryMaxTitleRunes(layout.Width)
+	detailLimit := summaryMaxDetailRunes(layout.Width)
+	dc.DrawRectangle(24, 20, math.Max(64, float64(layout.Width)-236), layout.Header-28)
+	dc.Clip()
 	dc.SetColor(colorText)
-	dc.DrawStringAnchored(layout.Summary.Title, 32, 44, 0, 0.5)
+	dc.DrawStringAnchored(truncate(layout.Summary.Title, titleLimit), 32, 44, 0, 0.5)
 	dc.SetColor(colorSubtle)
-	dc.DrawStringAnchored(fmt.Sprintf("data_hash: %s", layout.Summary.DataHash), 32, 64, 0, 0.5)
-	dc.DrawStringAnchored(fmt.Sprintf("nodes: %d  edges: %d", layout.Summary.NodeCount, layout.Summary.EdgeCount), 32, 84, 0, 0.5)
-	dc.DrawStringAnchored(fmt.Sprintf("top bottleneck: %s", layout.Summary.TopBottleneck), 32, 104, 0, 0.5)
+	dc.DrawStringAnchored(truncate(fmt.Sprintf("data_hash: %s", layout.Summary.DataHash), detailLimit), 32, 64, 0, 0.5)
+	dc.DrawStringAnchored(truncate(fmt.Sprintf("nodes: %d  edges: %d", layout.Summary.NodeCount, layout.Summary.EdgeCount), detailLimit), 32, 84, 0, 0.5)
+	dc.DrawStringAnchored(truncate(fmt.Sprintf("top bottleneck: %s", layout.Summary.TopBottleneck), detailLimit), 32, 104, 0, 0.5)
+	dc.ResetClip()
 }
 
 func drawLegend(dc *gg.Context, layout layoutResult) {
@@ -513,10 +534,38 @@ func drawLegendRow(dc *gg.Context, x, y float64, c color.RGBA, label string) {
 }
 
 func drawSummaryBlockSVG(canvas *svg.SVG, layout layoutResult) {
-	canvas.Text(32, 44, layout.Summary.Title, fmt.Sprintf("fill:%s;font-size:16px;font-family:monospace;font-weight:bold", css(colorText)))
-	canvas.Text(32, 64, fmt.Sprintf("data_hash: %s", layout.Summary.DataHash), fmt.Sprintf("fill:%s;font-size:13px;font-family:monospace", css(colorSubtle)))
-	canvas.Text(32, 84, fmt.Sprintf("nodes: %d  edges: %d", layout.Summary.NodeCount, layout.Summary.EdgeCount), fmt.Sprintf("fill:%s;font-size:13px;font-family:monospace", css(colorSubtle)))
-	canvas.Text(32, 104, fmt.Sprintf("top bottleneck: %s", layout.Summary.TopBottleneck), fmt.Sprintf("fill:%s;font-size:13px;font-family:monospace", css(colorSubtle)))
+	titleLimit := summaryMaxTitleRunes(layout.Width)
+	detailLimit := summaryMaxDetailRunes(layout.Width)
+	canvas.Text(32, 44, truncate(layout.Summary.Title, titleLimit), fmt.Sprintf("fill:%s;font-size:16px;font-family:monospace;font-weight:bold", css(colorText)))
+	canvas.Text(32, 64, truncate(fmt.Sprintf("data_hash: %s", layout.Summary.DataHash), detailLimit), fmt.Sprintf("fill:%s;font-size:13px;font-family:monospace", css(colorSubtle)))
+	canvas.Text(32, 84, truncate(fmt.Sprintf("nodes: %d  edges: %d", layout.Summary.NodeCount, layout.Summary.EdgeCount), detailLimit), fmt.Sprintf("fill:%s;font-size:13px;font-family:monospace", css(colorSubtle)))
+	canvas.Text(32, 104, truncate(fmt.Sprintf("top bottleneck: %s", layout.Summary.TopBottleneck), detailLimit), fmt.Sprintf("fill:%s;font-size:13px;font-family:monospace", css(colorSubtle)))
+}
+
+func nodeMaxTextRunes(nodeW float64) int {
+	maxRunes := int((nodeW - 16) / 7)
+	if maxRunes < 8 {
+		return 8
+	}
+	return maxRunes
+}
+
+func summaryMaxTitleRunes(canvasWidth int) int {
+	// Summary starts at x=32 and Legend starts at x=canvasWidth-200; leave 16px margin.
+	maxRunes := (canvasWidth - 248) / 10
+	if maxRunes < 12 {
+		return 12
+	}
+	return maxRunes
+}
+
+func summaryMaxDetailRunes(canvasWidth int) int {
+	// Summary starts at x=32 and Legend starts at x=canvasWidth-200; leave 16px margin.
+	maxRunes := (canvasWidth - 248) / 8
+	if maxRunes < 16 {
+		return 16
+	}
+	return maxRunes
 }
 
 func drawLegendSVG(canvas *svg.SVG, layout layoutResult) {

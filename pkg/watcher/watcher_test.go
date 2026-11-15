@@ -1205,3 +1205,194 @@ func TestWatcher_EnvPollIntervalDurationAndMillis(t *testing.T) {
 		t.Fatalf("WithPollInterval(600ms) -> PollInterval() = %v, want 600ms", got)
 	}
 }
+
+func TestWatcher_SymlinkedSQLiteAndWALInFsnotifyAndPollingModes(t *testing.T) {
+	t.Setenv("BV_FORCE_POLL", "")
+	t.Setenv("BV_FORCE_POLLING", "")
+
+	for _, forcePoll := range []bool{false, true} {
+		modeName := "fsnotify"
+		if forcePoll {
+			modeName = "polling"
+		}
+		t.Run(modeName, func(t *testing.T) {
+			root := t.TempDir()
+			realDir := filepath.Join(root, "real-store")
+			linkParent := filepath.Join(root, "workspace")
+			if err := os.MkdirAll(realDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(linkParent, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			realDB := filepath.Join(realDir, "beads.db")
+			if err := os.WriteFile(realDB, []byte("sqlite-header"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			symlinkBeadsDir := filepath.Join(linkParent, ".beads")
+			if err := os.Symlink(realDir, symlinkBeadsDir); err != nil {
+				t.Skipf("symlinks unsupported: %v", err)
+			}
+			watchedPath := filepath.Join(symlinkBeadsDir, "beads.db")
+
+			w, err := NewWatcher(watchedPath,
+				WithForcePoll(forcePoll),
+				WithPollInterval(15*time.Millisecond),
+				WithDebounceDuration(15*time.Millisecond),
+			)
+			if err != nil {
+				t.Fatalf("NewWatcher: %v", err)
+			}
+
+			wantAbs, err := filepath.Abs(watchedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantResolved, err := filepath.EvalSymlinks(realDB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if w.Path() != wantAbs {
+				t.Fatalf("Path() = %q, want %q", w.Path(), wantAbs)
+			}
+			if w.ResolvedPath() != wantResolved {
+				t.Fatalf("ResolvedPath() = %q, want %q", w.ResolvedPath(), wantResolved)
+			}
+
+			if err := w.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer w.Stop()
+
+			// Negative control: SQLite -shm sidecar writes must not trigger reload storms.
+			if err := os.WriteFile(wantResolved+"-shm", []byte("shm-lock-bytes"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-w.Changed():
+				t.Fatal("unexpected change notification for -shm sidecar write")
+			case <-time.After(80 * time.Millisecond):
+			}
+
+			// Positive assertion: WAL commit against the real target behind the symlink notifies.
+			if err := os.WriteFile(wantResolved+"-wal", []byte("wal-frame-1"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-w.Changed():
+			case <-time.After(2 * time.Second):
+				t.Fatalf("timed out waiting for -wal notification through symlink in %s mode", modeName)
+			}
+		})
+	}
+}
+
+func TestWatcher_AtomicSymlinkReplacementAndRetargeting(t *testing.T) {
+	t.Setenv("BV_FORCE_POLL", "")
+	t.Setenv("BV_FORCE_POLLING", "")
+
+	for _, forcePoll := range []bool{false, true} {
+		modeName := "fsnotify"
+		if forcePoll {
+			modeName = "polling"
+		}
+		t.Run(modeName, func(t *testing.T) {
+			root := t.TempDir()
+			storeA := filepath.Join(root, "store-a")
+			storeB := filepath.Join(root, "store-b")
+			wsBeads := filepath.Join(root, "workspace", ".beads")
+			for _, d := range []string{storeA, storeB, wsBeads} {
+				if err := os.MkdirAll(d, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			dbA := filepath.Join(storeA, "beads.db")
+			dbB := filepath.Join(storeB, "beads.db")
+			fixedTime := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+			if err := os.WriteFile(dbA, []byte("sqlite-store-a!"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(dbB, []byte("sqlite-store-b!"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			// Give both targets identical size and mtime so retarget detection cannot rely on mtime/size drift.
+			if err := os.Chtimes(dbA, fixedTime, fixedTime); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(dbB, fixedTime, fixedTime); err != nil {
+				t.Fatal(err)
+			}
+
+			symlinkPath := filepath.Join(wsBeads, "beads.db")
+			if err := os.Symlink(dbA, symlinkPath); err != nil {
+				t.Skipf("symlinks unsupported: %v", err)
+			}
+
+			w, err := NewWatcher(symlinkPath,
+				WithForcePoll(forcePoll),
+				WithPollInterval(15*time.Millisecond),
+				WithDebounceDuration(15*time.Millisecond),
+			)
+			if err != nil {
+				t.Fatalf("NewWatcher: %v", err)
+			}
+			if err := w.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			defer w.Stop()
+
+			resolvedA, err := filepath.EvalSymlinks(dbA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolvedB, err := filepath.EvalSymlinks(dbB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := w.ResolvedPath(); got != resolvedA {
+				t.Fatalf("initial ResolvedPath() = %q, want %q", got, resolvedA)
+			}
+
+			// Atomically replace symlinkPath -> dbB via os.Rename(newLink, symlinkPath).
+			newLink := filepath.Join(wsBeads, "beads.db.next")
+			if err := os.Symlink(dbB, newLink); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(newLink, symlinkPath); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case <-w.Changed():
+			case <-time.After(2 * time.Second):
+				t.Fatalf("timed out waiting for atomic symlink replacement notification in %s mode", modeName)
+			}
+			if got := w.ResolvedPath(); got != resolvedB {
+				t.Fatalf("post-retarget ResolvedPath() = %q, want %q", got, resolvedB)
+			}
+
+			// Negative control: writing to detached store-a WAL must NOT trigger change.
+			if err := os.WriteFile(resolvedA+"-wal", []byte("stale-wal"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-w.Changed():
+				t.Fatalf("unexpected notification from detached store-a WAL in %s mode", modeName)
+			case <-time.After(80 * time.Millisecond):
+			}
+
+			// Positive assertion: writing to new store-b WAL triggers change.
+			if err := os.WriteFile(resolvedB+"-wal", []byte("fresh-wal-b"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-w.Changed():
+			case <-time.After(2 * time.Second):
+				t.Fatalf("timed out waiting for post-retarget store-b WAL notification in %s mode", modeName)
+			}
+		})
+	}
+}

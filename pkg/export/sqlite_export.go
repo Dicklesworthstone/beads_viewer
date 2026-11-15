@@ -260,8 +260,8 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at, due_date, defer_until, external_ref)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at, due_date, defer_until, external_ref, estimated_minutes, created_by, close_reason)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -295,6 +295,21 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 			s := *issue.ExternalRef
 			externalRef = &s
 		}
+		var estimatedMinutes *int
+		if issue.EstimatedMinutes != nil {
+			v := *issue.EstimatedMinutes
+			estimatedMinutes = &v
+		}
+		var createdBy *string
+		if issue.CreatedBy != "" {
+			s := issue.CreatedBy
+			createdBy = &s
+		}
+		var closeReason *string
+		if issue.CloseReason != "" {
+			s := issue.CloseReason
+			closeReason = &s
+		}
 
 		_, err := stmt.Exec(
 			issue.ID,
@@ -314,6 +329,9 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 			dueDate,
 			deferUntil,
 			externalRef,
+			estimatedMinutes,
+			createdBy,
+			closeReason,
 		)
 		if err != nil {
 			return fmt.Errorf("insert issue %s: %w", issue.ID, err)
@@ -1043,6 +1061,11 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 		if issue.ExternalRef != nil {
 			extRef = *issue.ExternalRef
 		}
+		var estCopy *int
+		if issue.EstimatedMinutes != nil {
+			v := *issue.EstimatedMinutes
+			estCopy = &v
+		}
 		exp := ExportIssue{
 			ID:                 issue.ID,
 			Title:              issue.Title,
@@ -1061,6 +1084,9 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 			DueDate:            issue.DueDate,
 			DeferUntil:         issue.DeferUntil,
 			ExternalRef:        extRef,
+			EstimatedMinutes:   estCopy,
+			CreatedBy:          issue.CreatedBy,
+			CloseReason:        issue.CloseReason,
 		}
 
 		if m := e.Metrics; m != nil {

@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"context"
 	"testing"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -484,5 +485,266 @@ func BenchmarkFindOneCycleInSCC(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		findOneCycleInSCC(g, toGraphNodes(scc))
+	}
+}
+
+func TestPhase2_ClosedOnlyCyclePreservesCriticalPathAndSlack(t *testing.T) {
+	issues := []model.Issue{
+		{
+			ID:     "closed-a",
+			Title:  "Historical cycle A",
+			Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{
+				{IssueID: "closed-a", DependsOnID: "closed-b", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:     "closed-b",
+			Title:  "Historical cycle B",
+			Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{
+				{IssueID: "closed-b", DependsOnID: "closed-a", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:     "open-root",
+			Title:  "Active root unblocked by closed cycle",
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-root", DependsOnID: "closed-a", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:     "open-mid",
+			Title:  "Critical chain middle",
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-mid", DependsOnID: "open-root", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:     "open-leaf",
+			Title:  "Critical chain leaf",
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-leaf", DependsOnID: "open-mid", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:     "open-side",
+			Title:  "Shorter parallel branch",
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-side", DependsOnID: "open-root", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	cfg := AnalysisConfig{
+		DisableCache:        true,
+		RunToCompletion:     true,
+		ComputeCriticalPath: true,
+		ComputeCycles:       true,
+		ComputeSlack:        true,
+	}
+
+	analyzer := NewAnalyzer(issues)
+	stats := analyzer.AnalyzeWithConfig(cfg)
+
+	// Full graph has a closed cycle, so Phase 1 TopologicalOrder must stay empty (cache invariant).
+	if len(stats.TopologicalOrder) != 0 {
+		t.Fatalf("expected empty TopologicalOrder when full graph has closed cycle, got %v", stats.TopologicalOrder)
+	}
+	if got := stats.Cycles(); len(got) != 0 {
+		t.Fatalf("expected 0 active cycles when cycle is closed-only, got %v", got)
+	}
+
+	status := stats.Status()
+	if status.Critical.State != "computed" || status.Critical.Reason != "" {
+		t.Fatalf("Critical status = %+v, want computed with empty reason", status.Critical)
+	}
+	if status.Slack.State != "computed" || status.Slack.Reason != "" {
+		t.Fatalf("Slack status = %+v, want computed with empty reason", status.Slack)
+	}
+
+	cp := stats.CriticalPathScore()
+	if cp["open-root"] != 3 || cp["open-mid"] != 2 || cp["open-leaf"] != 1 {
+		t.Fatalf("unexpected CriticalPathScore on active chain: %v", cp)
+	}
+	for _, closedID := range []string{"closed-a", "closed-b"} {
+		if _, hasClosedCP := cp[closedID]; hasClosedCP {
+			t.Fatalf("closed issue %s leaked into CriticalPathScore: %v", closedID, cp)
+		}
+	}
+
+	slack := stats.Slack()
+	if slack == nil {
+		t.Fatal("expected non-nil Slack map when cycle is closed-only")
+	}
+	for _, closedID := range []string{"closed-a", "closed-b"} {
+		if _, hasClosedSlack := slack[closedID]; hasClosedSlack {
+			t.Fatalf("closed issue %s leaked into Slack: %v", closedID, slack)
+		}
+	}
+	for _, critID := range []string{"open-root", "open-mid", "open-leaf"} {
+		if slack[critID] != 0 {
+			t.Fatalf("expected 0 slack on critical path node %s, got %v (all=%v)", critID, slack[critID], slack)
+		}
+	}
+	if slack["open-side"] <= 0 {
+		t.Fatalf("expected positive slack on shorter parallel branch open-side, got %v (all=%v)", slack["open-side"], slack)
+	}
+
+	whatIf, err := analyzer.ComputeWhatIfDeltaFromStats("open-root", &stats)
+	if err != nil {
+		t.Fatalf("ComputeWhatIfDeltaFromStats(open-root): %v", err)
+	}
+	if whatIf.DepthReduction <= 0 {
+		t.Fatalf("expected positive WhatIf.DepthReduction for open-root, got %f", whatIf.DepthReduction)
+	}
+
+	// Negative control: reopen closed-a and closed-b into a live active cycle -> CriticalPath and Slack skip cleanly.
+	activeCycleIssues := model.CloneIssues(issues)
+	activeCycleIssues[0].Status = model.StatusOpen
+	activeCycleIssues[1].Status = model.StatusOpen
+	activeStats := NewAnalyzer(activeCycleIssues).AnalyzeWithConfig(cfg)
+	if len(activeStats.Cycles()) == 0 {
+		t.Fatal("expected active cycle to be detected when cycle members are open")
+	}
+	activeStatus := activeStats.Status()
+	if activeStatus.Critical.State != "skipped" || activeStatus.Slack.State != "skipped" {
+		t.Fatalf("expected Critical and Slack skipped for live cycle, got critical=%+v slack=%+v", activeStatus.Critical, activeStatus.Slack)
+	}
+	if len(activeStats.CriticalPathScore()) != 0 || len(activeStats.Slack()) != 0 {
+		t.Fatalf("expected empty CriticalPathScore and Slack on live cycle, got cp=%v slack=%v", activeStats.CriticalPathScore(), activeStats.Slack())
+	}
+}
+
+func TestPhase2_AllClosedWithCycleComputesEmptyCriticalPathAndSlack(t *testing.T) {
+	issues := []model.Issue{
+		{
+			ID:     "closed-a",
+			Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{
+				{IssueID: "closed-a", DependsOnID: "closed-b", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:     "closed-b",
+			Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{
+				{IssueID: "closed-b", DependsOnID: "closed-a", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:     "tombstone-c",
+			Status: model.StatusTombstone,
+		},
+	}
+
+	cfg := AnalysisConfig{
+		DisableCache:        true,
+		RunToCompletion:     true,
+		ComputeCriticalPath: true,
+		ComputeCycles:       true,
+		ComputeSlack:        true,
+	}
+
+	stats := NewAnalyzer(issues).AnalyzeWithConfig(cfg)
+	status := stats.Status()
+	if status.Critical.State != "computed" || status.Critical.Reason != "" {
+		t.Fatalf("Critical status = %+v, want computed with empty reason", status.Critical)
+	}
+	if status.Slack.State != "computed" || status.Slack.Reason != "" {
+		t.Fatalf("Slack status = %+v, want computed with empty reason", status.Slack)
+	}
+	if cp := stats.CriticalPathScore(); cp == nil || len(cp) != 0 {
+		t.Fatalf("expected non-nil empty CriticalPathScore for all-closed cycle graph, got %v", cp)
+	}
+	if slack := stats.Slack(); slack == nil || len(slack) != 0 {
+		t.Fatalf("expected non-nil empty Slack for all-closed cycle graph, got %v", slack)
+	}
+}
+
+func TestPhase2_IncrementalCacheInvalidatesOnCycleStatusTransitionWithoutComputeCycles(t *testing.T) {
+	t.Setenv("BV_ROBOT", "0")
+	clearIncCache := func() {
+		incrementalGraphStatsCacheMu.Lock()
+		clear(incrementalGraphStatsCache)
+		incrementalGraphStatsCacheMu.Unlock()
+	}
+	clearIncCache()
+	t.Cleanup(clearIncCache)
+
+	makeIssues := func(cycleStatus model.Status) []model.Issue {
+		return []model.Issue{
+			{
+				ID:     "inc-cyc-a",
+				Status: cycleStatus,
+				Dependencies: []*model.Dependency{
+					{IssueID: "inc-cyc-a", DependsOnID: "inc-cyc-b", Type: model.DepBlocks},
+				},
+			},
+			{
+				ID:     "inc-cyc-b",
+				Status: cycleStatus,
+				Dependencies: []*model.Dependency{
+					{IssueID: "inc-cyc-b", DependsOnID: "inc-cyc-a", Type: model.DepBlocks},
+				},
+			},
+			{ID: "inc-open-root", Status: model.StatusOpen},
+			{
+				ID:     "inc-open-leaf",
+				Status: model.StatusOpen,
+				Dependencies: []*model.Dependency{
+					{IssueID: "inc-open-leaf", DependsOnID: "inc-open-root", Type: model.DepBlocks},
+				},
+			},
+		}
+	}
+
+	// Simulate XL-style config where ComputeCycles is false, while CriticalPath and Slack are enabled
+	// and globalIncrementalCache is active (DisableCache: false).
+	cfg := AnalysisConfig{
+		DisableCache:        false,
+		RunToCompletion:     true,
+		ComputeCycles:       false,
+		ComputeCriticalPath: true,
+		ComputeSlack:        true,
+	}
+
+	// 1. Open cycle -> CriticalPath and Slack must skip.
+	openStats1 := NewAnalyzer(makeIssues(model.StatusOpen)).AnalyzeAsyncWithConfig(context.Background(), cfg)
+	openStats1.WaitForPhase2()
+	if st := openStats1.Status(); st.Critical.State != "skipped" || st.Slack.State != "skipped" {
+		t.Fatalf("step 1 (open cycle): expected skipped Critical/Slack, got critical=%+v slack=%+v", st.Critical, st.Slack)
+	}
+
+	// 2. Close cycle nodes -> incremental cache must invalidate and compute CriticalPath/Slack on active chain.
+	closedStats := NewAnalyzer(makeIssues(model.StatusClosed)).AnalyzeAsyncWithConfig(context.Background(), cfg)
+	closedStats.WaitForPhase2()
+	if st := closedStats.Status(); st.Critical.State != "computed" || st.Slack.State != "computed" {
+		t.Fatalf("step 2 (closed cycle): expected computed Critical/Slack after closing cycle, got critical=%+v slack=%+v", st.Critical, st.Slack)
+	}
+	cp := closedStats.CriticalPathScore()
+	if cp["inc-open-root"] != 2 || cp["inc-open-leaf"] != 1 {
+		t.Fatalf("step 2 (closed cycle): unexpected CriticalPathScore=%v", cp)
+	}
+	if _, leaked := cp["inc-cyc-a"]; leaked {
+		t.Fatalf("step 2 (closed cycle): closed cycle node leaked into CriticalPathScore=%v", cp)
+	}
+	slack := closedStats.Slack()
+	if _, leaked := slack["inc-cyc-a"]; leaked {
+		t.Fatalf("step 2 (closed cycle): closed cycle node leaked into Slack=%v", slack)
+	}
+
+	// 3. Reopen cycle nodes -> incremental cache must invalidate again and skip CriticalPath/Slack.
+	openStats2 := NewAnalyzer(makeIssues(model.StatusOpen)).AnalyzeAsyncWithConfig(context.Background(), cfg)
+	openStats2.WaitForPhase2()
+	if st := openStats2.Status(); st.Critical.State != "skipped" || st.Slack.State != "skipped" {
+		t.Fatalf("step 3 (reopened cycle): expected skipped Critical/Slack after reopening cycle, got critical=%+v slack=%+v", st.Critical, st.Slack)
+	}
+	if len(openStats2.CriticalPathScore()) != 0 || len(openStats2.Slack()) != 0 {
+		t.Fatalf("step 3 (reopened cycle): expected empty CriticalPathScore/Slack, got cp=%v slack=%v", openStats2.CriticalPathScore(), openStats2.Slack())
 	}
 }

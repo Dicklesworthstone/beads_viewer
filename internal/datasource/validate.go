@@ -154,7 +154,7 @@ func sourceValidationIdentity(source *DataSource) (validationFileIdentity, error
 	if source.Type != SourceTypeSQLite {
 		return identity, nil
 	}
-	walInfo, err := os.Stat(source.Path + "-wal")
+	walInfo, err := os.Stat(sqliteWALPath(source.Path))
 	if os.IsNotExist(err) {
 		return identity, nil
 	}
@@ -723,7 +723,13 @@ func RefreshSourceInfo(source *DataSource) error {
 	if err != nil {
 		return fmt.Errorf("cannot access file: %w", err)
 	}
-	source.ModTime = info.ModTime()
+	modTime := info.ModTime()
+	if source.Type == SourceTypeSQLite {
+		if walInfo, walErr := os.Stat(sqliteWALPath(source.Path)); walErr == nil && walInfo.ModTime().After(modTime) {
+			modTime = walInfo.ModTime()
+		}
+	}
+	source.ModTime = modTime
 	source.Size = info.Size()
 	return nil
 }

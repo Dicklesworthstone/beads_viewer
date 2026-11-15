@@ -1032,38 +1032,121 @@ function safeClassToken(value) {
     return String(value || '').toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
 }
 
+const XHTML_NS = 'http://www.w3.org/1999/xhtml';
+const ALLOWED_MARKDOWN_TAGS = new Set([
+    'p', 'br', 'strong', 'b', 'em', 'i', 'del', 's', 'code', 'pre',
+    'blockquote', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'hr', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'a', 'span'
+]);
+const DROP_SUBTREE_TAGS = new Set([
+    'script', 'style', 'template', 'iframe', 'object', 'embed', 'form',
+    'input', 'button', 'textarea', 'select', 'option', 'meta', 'link',
+    'base', 'title', 'noscript', 'noembed', 'noframes', 'xmp', 'svg', 'math'
+]);
+
 function isSafeRenderedURL(value) {
-    const raw = String(value || '').trim();
-    if (raw === '' || raw.startsWith('#')) return true;
-    try {
-        const url = new URL(raw, window.location.href);
-        return ['http:', 'https:', 'mailto:'].includes(url.protocol);
-    } catch {
+    const compact = String(value ?? '').replace(/[\u0000-\u0020]+/g, '');
+    if (compact === '') return false;
+    const lower = compact.toLowerCase();
+    if (compact.startsWith('#')) return true;
+    if (
+        compact.startsWith('//') ||
+        compact.startsWith('\\') ||
+        compact.startsWith('/\\') ||
+        compact.includes('\\') ||
+        lower.startsWith('/%%5c') ||
+        lower.startsWith('%%5c')
+    ) {
         return false;
     }
+    if (compact.startsWith('/') || compact.startsWith('./') || compact.startsWith('../')) {
+        return true;
+    }
+    if (lower.startsWith('http://') || lower.startsWith('https://') || lower.startsWith('mailto:')) {
+        try {
+            const parsed = new URL(compact);
+            return parsed.protocol === 'http:' || parsed.protocol === 'https:' || parsed.protocol === 'mailto:';
+        } catch {
+            return false;
+        }
+    }
+    return false;
 }
 
 function sanitizeHTMLFragment(root) {
-    root.querySelectorAll('script,style,iframe,object,embed,link,meta,base,form,input,button,textarea,select').forEach(el => el.remove());
-    root.querySelectorAll('*').forEach(el => {
-        [...el.attributes].forEach(attr => {
-            const name = attr.name.toLowerCase();
-            if (name.startsWith('on') || name === 'srcdoc' || name === 'style') {
-                el.removeAttribute(attr.name);
-                return;
+    const commentWalker = document.createTreeWalker(root, NodeFilter.SHOW_COMMENT);
+    const comments = [];
+    while (commentWalker.nextNode()) comments.push(commentWalker.currentNode);
+    comments.forEach(c => c.remove());
+
+    const cleanChildren = (parent) => {
+        for (const child of Array.from(parent.childNodes)) {
+            if (child.nodeType === Node.TEXT_NODE) {
+                continue;
             }
-            if ((name === 'href' || name === 'src' || name === 'xlink:href') && !isSafeRenderedURL(attr.value)) {
-                el.removeAttribute(attr.name);
+            if (child.nodeType !== Node.ELEMENT_NODE) {
+                child.remove();
+                continue;
             }
-        });
-    });
+            const el = child;
+            const tag = (el.localName || '').toLowerCase();
+            if (el.namespaceURI !== XHTML_NS || DROP_SUBTREE_TAGS.has(tag)) {
+                el.remove();
+                continue;
+            }
+            if (!ALLOWED_MARKDOWN_TAGS.has(tag)) {
+                cleanChildren(el);
+                el.replaceWith(...Array.from(el.childNodes));
+                continue;
+            }
+            const rawHref = tag === 'a' ? el.getAttribute('href') : null;
+            const rawTitle = tag === 'a' ? el.getAttribute('title') : null;
+            const rawAlign = (tag === 'th' || tag === 'td') ? el.getAttribute('align') : null;
+            const rawClass = tag === 'code' ? el.getAttribute('class') : null;
+            for (const attr of Array.from(el.attributes)) {
+                el.removeAttributeNode(attr);
+            }
+            if (tag === 'a') {
+                if (rawHref !== null && isSafeRenderedURL(rawHref)) {
+                    el.setAttribute('href', String(rawHref).replace(/[\u0000-\u0020]+/g, ''));
+                    el.setAttribute('rel', 'noopener noreferrer');
+                    el.setAttribute('target', '_blank');
+                }
+                if (rawTitle !== null && rawTitle !== '') {
+                    el.setAttribute('title', rawTitle);
+                }
+            } else if (tag === 'th' || tag === 'td') {
+                const align = String(rawAlign || '').toLowerCase();
+                if (align === 'left' || align === 'center' || align === 'right') {
+                    el.setAttribute('align', align);
+                }
+            } else if (tag === 'code') {
+                const cls = String(rawClass || '').trim();
+                if (/^language-[a-z0-9_-]+$/i.test(cls)) {
+                    el.setAttribute('class', cls);
+                }
+            }
+            cleanChildren(el);
+        }
+    };
+    cleanChildren(root);
+    return root;
 }
 
-function renderSafeMarkdown(value) {
-    const template = document.createElement('template');
-    template.innerHTML = marked.parse(escapeHTML(value));
-    sanitizeHTMLFragment(template.content);
-    return template.innerHTML;
+function renderSafeMarkdownFragment(value) {
+    const raw = String(value ?? '');
+    const frag = document.createDocumentFragment();
+    if (typeof marked !== 'undefined' && marked && typeof marked.parse === 'function') {
+        const template = document.createElement('template');
+        template.innerHTML = marked.parse(raw);
+        sanitizeHTMLFragment(template.content);
+        frag.appendChild(template.content);
+    } else {
+        const pre = document.createElement('pre');
+        pre.textContent = raw;
+        frag.appendChild(pre);
+    }
+    return frag;
 }
 
 function highlightMatches(text, query) {
@@ -1114,7 +1197,7 @@ DATA.nodes.forEach(n => {
     n.blockerCount = isActiveNodeStatus(n.status) && blockerSetByNode[n.id] ? blockerSetByNode[n.id].size : 0;
     if ((n.status === 'open' || n.status === 'in_progress') && n.blockerCount === 0) actionable++;
     if (n.status === 'blocked' || (isActiveNodeStatus(n.status) && n.blockerCount > 0)) blocked++;
-    if (isActiveNodeStatus(n.status) && n.slack === 0) onCriticalPath++;
+    if (n.slack_available !== false && isActiveNodeStatus(n.status) && n.slack === 0) onCriticalPath++;
     if (n.is_articulation) articulationCount++;
 });
 document.getElementById('stat-actionable').textContent = actionable;
@@ -1200,7 +1283,38 @@ function getConnectedNodes(nodeId, depth = 2) {
 }
 
 const container = document.getElementById('graph-container');
+let dagErrorTriggered = false;
+function handleDagCycleError() {
+    dagErrorTriggered = true;
+    const sel = document.getElementById('view-mode');
+    if (sel) sel.value = 'force';
+    try { Graph.dagMode(null); } catch (_) {}
+    localStorage.removeItem('bv-graph-layout');
+    showToast('Cannot apply DAG layout: dependency cycle detected');
+}
+function applyGraphDagMode(mode) {
+    dagErrorTriggered = false;
+    const sel = document.getElementById('view-mode');
+    if (!mode || mode === 'force') {
+        if (sel) sel.value = 'force';
+        Graph.dagMode(null);
+        localStorage.setItem('bv-graph-layout', 'force');
+        return true;
+    }
+    if (sel) sel.value = mode;
+    try {
+        Graph.dagMode(mode);
+    } catch (err) {
+        handleDagCycleError();
+        return false;
+    }
+    if (dagErrorTriggered) return false;
+    localStorage.setItem('bv-graph-layout', mode);
+    return true;
+}
+
 const Graph = ForceGraph()(container)
+    .onDagError(() => handleDagCycleError())
     .graphData(JSON.parse(JSON.stringify(DATA)))
     .backgroundColor('transparent')
     .nodeId('id')
@@ -1263,7 +1377,7 @@ const Graph = ForceGraph()(container)
         }
 
         // Critical path indicator (active issues only)
-        if (isActiveNodeStatus(node.status) && node.slack === 0 && isHighlighted) {
+        if (node.slack_available !== false && isActiveNodeStatus(node.status) && node.slack === 0 && isHighlighted) {
             ctx.save();
             ctx.globalAlpha = 0.2;
             ctx.beginPath(); ctx.arc(x, y, size + 3, 0, 2 * Math.PI);
@@ -1313,7 +1427,7 @@ const Graph = ForceGraph()(container)
             const fontSize = Math.max(10 / globalScale, 3);
             ctx.font = fontSize + 'px Inter, sans-serif';
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-            ctx.fillStyle = '#e8e8f0';
+            ctx.fillStyle = document.body.classList.contains('light-mode') ? '#1a1a2e' : '#e8e8f0';
             ctx.fillText(node.id, x, y + size + fontSize + 2);
             if (globalScale > 2) {
                 ctx.fillStyle = pColor;
@@ -1369,35 +1483,35 @@ function populatePanelContent(prefix, node) {
     addBadge('badge-' + safeClassToken(node.status), node.status.replace('_', ' '));
     addBadge('', 'P' + node.priority);
     if (node.is_articulation) addBadge('badge-articulation', 'Cut Vertex');
-    if (isActiveNodeStatus(node.status) && node.slack === 0) addBadge('badge-critical', 'Critical Path');
+    if (node.slack_available !== false && isActiveNodeStatus(node.status) && node.slack === 0) addBadge('badge-critical', 'Critical Path');
     (node.labels || []).forEach(l => addBadge('badge-type', l));
 
     // Description
     const descSection = document.getElementById(prefix + 'description');
     if (node.description) {
         descSection.style.display = 'block';
-        document.getElementById(prefix + 'description-content').innerHTML = renderSafeMarkdown(node.description);
+        document.getElementById(prefix + 'description-content').replaceChildren(renderSafeMarkdownFragment(node.description));
     } else { descSection.style.display = 'none'; }
 
     // Design
     const designSection = document.getElementById(prefix + 'design');
     if (node.design) {
         designSection.style.display = 'block';
-        document.getElementById(prefix + 'design-content').innerHTML = renderSafeMarkdown(node.design);
+        document.getElementById(prefix + 'design-content').replaceChildren(renderSafeMarkdownFragment(node.design));
     } else { designSection.style.display = 'none'; }
 
     // Acceptance Criteria
     const acSection = document.getElementById(prefix + 'acceptance');
     if (node.acceptance_criteria) {
         acSection.style.display = 'block';
-        document.getElementById(prefix + 'acceptance-content').innerHTML = renderSafeMarkdown(node.acceptance_criteria);
+        document.getElementById(prefix + 'acceptance-content').replaceChildren(renderSafeMarkdownFragment(node.acceptance_criteria));
     } else { acSection.style.display = 'none'; }
 
     // Notes
     const notesSection = document.getElementById(prefix + 'notes');
     if (node.notes) {
         notesSection.style.display = 'block';
-        document.getElementById(prefix + 'notes-content').innerHTML = renderSafeMarkdown(node.notes);
+        document.getElementById(prefix + 'notes-content').replaceChildren(renderSafeMarkdownFragment(node.notes));
     } else { notesSection.style.display = 'none'; }
 
     // Metadata
@@ -1414,6 +1528,9 @@ function populatePanelContent(prefix, node) {
     addMeta('Deferred Until', node.defer_until);
     addMeta('External Ref', node.external_ref);
     if (node.closed_at) addMeta('Closed', node.closed_at);
+    if (node.last_author) addMeta('Last Author', node.last_author);
+    if (node.commit_count > 0) addMeta('Commits', String(node.commit_count));
+    if (DATA.git_range) addMeta('Git Range', DATA.git_range);
 
     // Blocked By
     const blockedBySection = document.getElementById(prefix + 'blocked-by');
@@ -1434,9 +1551,15 @@ function populatePanelContent(prefix, node) {
     // Commits
     const commitsSection = document.getElementById(prefix + 'commits');
     const commitsList = document.getElementById(prefix + 'commits-list');
-    if (node.commits && node.commits.length > 0) {
+    if ((node.commits && node.commits.length > 0) || node.commit_count > 0) {
         commitsSection.style.display = 'block';
-        commitsList.innerHTML = node.commits.slice(0, 5).map(c => '<div class="hover-commit"><span class="hover-commit-sha">' + escapeHTML(c.short_sha) + '</span> <span class="hover-commit-msg">' + escapeHTML((c.message || '').split('\\n')[0].substring(0, 60)) + '</span></div>').join('');
+        const headerParts = [];
+        if (node.commit_count > 0) headerParts.push(escapeHTML(node.commit_count) + (node.commit_count === 1 ? ' commit' : ' commits'));
+        if (node.last_author) headerParts.push('last by ' + escapeHTML(node.last_author));
+        if (DATA.git_range) headerParts.push('range ' + escapeHTML(DATA.git_range));
+        const summaryHtml = headerParts.length > 0 ? '<div class="hover-commit"><span class="hover-commit-msg">' + headerParts.join(' · ') + '</span></div>' : '';
+        const rowsHtml = (node.commits || []).slice(0, 5).map(c => '<div class="hover-commit"><span class="hover-commit-sha">' + escapeHTML(c.short_sha) + '</span> <span class="hover-commit-msg">' + escapeHTML((c.message || '').split(/\r?\n/)[0].substring(0, 60)) + '</span></div>').join('');
+        commitsList.innerHTML = summaryHtml + rowsHtml;
     } else { commitsSection.style.display = 'none'; }
 
     // Metrics
@@ -1450,8 +1573,12 @@ function populatePanelContent(prefix, node) {
     addMetric('PR Rank', '#' + (node.pagerank_rank || '-'));
     addMetric('Betweenness', fmt(node.betweenness, 4));
     addMetric('BW Rank', '#' + (node.betweenness_rank || '-'));
+    addMetric('Eigenvector', fmt(node.eigenvector, 4));
+    addMetric('HITS Hub', fmt(node.hub, 4));
+    addMetric('HITS Authority', fmt(node.authority, 4));
+    addMetric('K-Core', node.core_number ?? '-');
     addMetric('Critical Path', fmt(node.critical_path, 1));
-    addMetric('Slack', fmt(node.slack, 1));
+    addMetric('Slack', node.slack_available === false ? (DATA.has_cycles ? 'N/A (cycle)' : 'N/A') : fmt(node.slack, 1));
     addMetric('In-Degree', node.in_degree ?? '-');
     addMetric('Out-Degree', node.out_degree ?? '-');
 }
@@ -1555,8 +1682,8 @@ function selectNode(node) {
     document.getElementById('m-bwrank').textContent = '#' + (node.betweenness_rank || '-');
     document.getElementById('m-critical').textContent = fmtSide(node.critical_path, 1);
     const slackEl = document.getElementById('m-slack');
-    slackEl.textContent = fmtSide(node.slack, 1);
-    slackEl.className = 'metric-value' + (node.slack === 0 ? ' highlight' : '');
+    slackEl.textContent = node.slack_available === false ? (DATA.has_cycles ? 'N/A (cycle)' : 'N/A') : fmtSide(node.slack, 1);
+    slackEl.className = 'metric-value' + (node.slack_available !== false && isActiveNodeStatus(node.status) && node.slack === 0 ? ' highlight' : '');
     document.getElementById('m-indeg').textContent = node.in_degree ?? '-';
     document.getElementById('m-outdeg').textContent = node.out_degree ?? '-';
     document.getElementById('node-detail').classList.add('visible');
@@ -1855,8 +1982,9 @@ function updateVisibleCount() {
 // View mode
 document.getElementById('view-mode').onchange = e => {
     const mode = e.target.value;
-    Graph.dagMode(mode === 'force' ? null : mode);
-    setTimeout(() => Graph.zoomToFit(400), 100);
+    if (applyGraphDagMode(mode)) {
+        setTimeout(() => Graph.zoomToFit(400), 100);
+    }
 };
 
 // Size metric
@@ -1993,6 +2121,8 @@ function toggleLightMode() {
     btn.textContent = isDarkMode ? '☀️' : '🌙';
     btn.title = isDarkMode ? 'Switch to light mode (L)' : 'Switch to dark mode (L)';
     localStorage.setItem('bv-graph-theme', isDarkMode ? 'dark' : 'light');
+    Graph.nodeColor(Graph.nodeColor());
+    updateMinimap();
 }
 
 // Recently viewed nodes
@@ -2127,16 +2257,12 @@ setInterval(updateMinimap, 2000);
 // LocalStorage preferences
 function loadPreferences() {
     const theme = localStorage.getItem('bv-graph-theme');
-    if (theme === 'light') { isDarkMode = false; toggleLightMode(); toggleLightMode(); }
+    if (theme === 'light') { isDarkMode = true; toggleLightMode(); }
     const layout = localStorage.getItem('bv-graph-layout');
     if (layout) {
-        document.getElementById('view-mode').value = layout;
-        Graph.dagMode(layout === 'force' ? null : layout);
+        applyGraphDagMode(layout);
     }
 }
-document.getElementById('view-mode').addEventListener('change', e => {
-    localStorage.setItem('bv-graph-layout', e.target.value);
-});
 
 // Keyboard shortcuts
 document.onkeydown = e => {
@@ -2157,10 +2283,10 @@ document.onkeydown = e => {
         case 'l': toggleLightMode(); break;
         case 'y': document.getElementById('btn-recent').click(); break;
         case 'p': togglePathFinder(); break;
-        case '1': document.getElementById('view-mode').value = 'force'; Graph.dagMode(null); localStorage.setItem('bv-graph-layout', 'force'); break;
-        case '2': document.getElementById('view-mode').value = 'td'; Graph.dagMode('td'); localStorage.setItem('bv-graph-layout', 'td'); break;
-        case '3': document.getElementById('view-mode').value = 'lr'; Graph.dagMode('lr'); localStorage.setItem('bv-graph-layout', 'lr'); break;
-        case '4': document.getElementById('view-mode').value = 'radialout'; Graph.dagMode('radialout'); localStorage.setItem('bv-graph-layout', 'radialout'); break;
+        case '1': applyGraphDagMode('force'); break;
+        case '2': applyGraphDagMode('td'); break;
+        case '3': applyGraphDagMode('lr'); break;
+        case '4': applyGraphDagMode('radialout'); break;
     }
 };
 

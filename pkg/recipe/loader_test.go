@@ -841,3 +841,109 @@ func TestLoader_InvalidPresentationValues(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultUserRecipesPathAndNoSavedConfigIsolation(t *testing.T) {
+	homeDir := filepath.Join(t.TempDir(), "home")
+	xdgDir := filepath.Join(t.TempDir(), "xdg")
+	projectDir := filepath.Join(t.TempDir(), "project")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("HOME", homeDir)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	wantHomePath := filepath.Join(homeDir, ".config", "bv", "recipes.yaml")
+	if got := recipe.DefaultUserRecipesPath(); got != wantHomePath {
+		t.Fatalf("DefaultUserRecipesPath() without XDG_CONFIG_HOME = %q, want %q", got, wantHomePath)
+	}
+
+	t.Setenv("XDG_CONFIG_HOME", xdgDir)
+	wantXDGPath := filepath.Join(xdgDir, "bv", "recipes.yaml")
+	if got := recipe.DefaultUserRecipesPath(); got != wantXDGPath {
+		t.Fatalf("DefaultUserRecipesPath() with XDG_CONFIG_HOME = %q, want %q", got, wantXDGPath)
+	}
+
+	writeFile(t, wantHomePath, "recipes:\n  home-only:\n    description: from-home\n")
+	writeFile(t, wantXDGPath, "recipes:\n  xdg-user:\n    description: from-xdg\n")
+	writeFile(t, filepath.Join(projectDir, ".bv", "recipes.yaml"), "recipes:\n  proj-recipe:\n    description: from-project\n")
+
+	// 1. BV_NO_SAVED_CONFIG unset/empty: default NewLoader loads XDG user config (taking precedence over ~/.config).
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	lAllowed := recipe.NewLoader(recipe.WithProjectDir(projectDir))
+	if err := lAllowed.Load(); err != nil {
+		t.Fatalf("Load (saved config allowed): %v", err)
+	}
+	if lAllowed.Get("xdg-user") == nil || lAllowed.Source("xdg-user") != recipe.SourceUser {
+		t.Fatalf("expected xdg-user loaded from XDG_CONFIG_HOME when BV_NO_SAVED_CONFIG is empty")
+	}
+	if lAllowed.Get("home-only") != nil {
+		t.Fatalf("expected XDG_CONFIG_HOME to shadow HOME/.config/bv/recipes.yaml")
+	}
+
+	// 2. Any non-empty BV_NO_SAVED_CONFIG disables default user config both at NewLoader() and if toggled before Load().
+	for _, nonEmpty := range []string{"1", "true", "YES", "on", "anything", "0", "false"} {
+		t.Run("isolated_"+nonEmpty, func(t *testing.T) {
+			t.Setenv("BV_NO_SAVED_CONFIG", nonEmpty)
+			l := recipe.NewLoader(recipe.WithProjectDir(projectDir))
+			if err := l.Load(); err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if l.Get("xdg-user") != nil || l.Get("home-only") != nil {
+				t.Fatalf("BV_NO_SAVED_CONFIG=%q leaked user recipe into default loader", nonEmpty)
+			}
+			if l.Get("proj-recipe") == nil || l.Get("default") == nil {
+				t.Fatalf("BV_NO_SAVED_CONFIG=%q suppressed project or builtin recipes", nonEmpty)
+			}
+		})
+	}
+
+	// Also verify Load()-time check when loader was constructed before BV_NO_SAVED_CONFIG was enabled.
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	lConstructedFirst := recipe.NewLoader(recipe.WithProjectDir(projectDir))
+	t.Setenv("BV_NO_SAVED_CONFIG", "anything")
+	if err := lConstructedFirst.Load(); err != nil {
+		t.Fatalf("Load after setting BV_NO_SAVED_CONFIG=anything: %v", err)
+	}
+	if lConstructedFirst.Get("xdg-user") != nil {
+		t.Fatal("Load() failed to enforce non-empty BV_NO_SAVED_CONFIG when constructed earlier")
+	}
+
+	// 3. Explicit WithUserPath(...) must still be honored even when BV_NO_SAVED_CONFIG is non-empty.
+	explicitPath := filepath.Join(t.TempDir(), "explicit-user.yaml")
+	writeFile(t, explicitPath, "recipes:\n  explicit-user:\n    description: explicit\n")
+	t.Setenv("BV_NO_SAVED_CONFIG", "anything")
+	lExplicit := recipe.NewLoader(recipe.WithUserPath(explicitPath), recipe.WithProjectDir(projectDir))
+	if err := lExplicit.Load(); err != nil {
+		t.Fatalf("Load (explicit user path): %v", err)
+	}
+	if lExplicit.Get("explicit-user") == nil || lExplicit.Source("explicit-user") != recipe.SourceUser {
+		t.Fatal("explicit WithUserPath must still load when BV_NO_SAVED_CONFIG is non-empty")
+	}
+}
+
+func TestLoadEmbedded_IgnoresHostAndProjectRecipes(t *testing.T) {
+	tmpHome := t.TempDir()
+	xdgDir := filepath.Join(tmpHome, "xdg")
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_CONFIG_HOME", xdgDir)
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+
+	writeFile(t, filepath.Join(xdgDir, "bv", "recipes.yaml"), "recipes:\n  actionable: null\n  xdg-user:\n    description: from xdg\n")
+	projDir := t.TempDir()
+	writeFile(t, filepath.Join(projDir, ".bv", "recipes.yaml"), "recipes:\n  proj-recipe:\n    description: from project\n")
+	writeFile(t, filepath.Join(projDir, ".beads", "recipes", "file-recipe.yaml"), "description: from beads recipes dir\n")
+	t.Chdir(projDir)
+
+	l, err := recipe.LoadEmbedded()
+	if err != nil {
+		t.Fatalf("LoadEmbedded: %v", err)
+	}
+	if l.Get("actionable") == nil || l.Source("actionable") != recipe.SourceBuiltin {
+		t.Fatal("expected LoadEmbedded to preserve builtin actionable recipe")
+	}
+	for _, forbidden := range []string{"xdg-user", "proj-recipe", "file-recipe"} {
+		if l.Get(forbidden) != nil {
+			t.Fatalf("LoadEmbedded leaked filesystem recipe %q", forbidden)
+		}
+	}
+}

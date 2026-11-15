@@ -2,24 +2,36 @@ package datasource
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
+// sourceDebounceTimer tracks a trailing-edge debounce timer for a logical source.
+type sourceDebounceTimer struct {
+	seq   uint64
+	timer *time.Timer
+}
+
 // SourceWatcher monitors data sources for changes and triggers callbacks
 type SourceWatcher struct {
-	watcher    *fsnotify.Watcher
-	sources    []DataSource
-	callback   func(changed DataSource)
-	debounce   time.Duration
-	lastChange map[string]time.Time
-	mu         sync.Mutex
-	done       chan struct{}
-	stopOnce   sync.Once
-	verbose    bool
-	logger     func(msg string)
+	watcher       *fsnotify.Watcher
+	sources       []DataSource
+	watchRefs     map[string]int
+	sourceWatches map[string][]string
+	callback      func(changed DataSource)
+	debounce      time.Duration
+	timers        map[string]*sourceDebounceTimer
+	nextSeq       uint64
+	stopped       bool
+	mu            sync.Mutex
+	done          chan struct{}
+	stopOnce      sync.Once
+	verbose       bool
+	logger        func(msg string)
 }
 
 // WatcherOptions configures the source watcher
@@ -42,6 +54,155 @@ func DefaultWatcherOptions() WatcherOptions {
 	}
 }
 
+func sourceWatchTargets(source DataSource) (primary string, extras []string) {
+	resolvedMain := resolveSourceTargetPath(source.Path)
+	primary = resolvedMain
+	resolvedDir := filepath.Dir(resolvedMain)
+	if resolvedDir != "" && resolvedDir != resolvedMain {
+		extras = append(extras, resolvedDir)
+	}
+	if source.Type == SourceTypeSQLite {
+		walPath := resolvedMain + "-wal"
+		if _, err := os.Stat(walPath); err == nil {
+			extras = append(extras, walPath)
+		}
+	}
+	if absOrig, err := filepath.Abs(source.Path); err == nil {
+		origDir := filepath.Dir(absOrig)
+		if origDir != "" && origDir != resolvedDir {
+			extras = append(extras, origDir)
+		}
+	}
+	return primary, extras
+}
+
+func (sw *SourceWatcher) addWatchRefLocked(target string) error {
+	target = filepath.Clean(target)
+	if sw.watchRefs[target] == 0 {
+		if err := sw.watcher.Add(target); err != nil {
+			return err
+		}
+	}
+	sw.watchRefs[target]++
+	return nil
+}
+
+func (sw *SourceWatcher) releaseWatchRefLocked(target string) error {
+	target = filepath.Clean(target)
+	if sw.watchRefs[target] <= 1 {
+		delete(sw.watchRefs, target)
+		return sw.watcher.Remove(target)
+	}
+	sw.watchRefs[target]--
+	return nil
+}
+
+func (sw *SourceWatcher) registerSourceLocked(source DataSource, strict bool) error {
+	primary, extras := sourceWatchTargets(source)
+	var registered []string
+	if err := sw.addWatchRefLocked(primary); err != nil {
+		if strict {
+			return err
+		}
+	} else {
+		registered = append(registered, filepath.Clean(primary))
+	}
+	seen := make(map[string]bool, len(registered)+len(extras))
+	for _, r := range registered {
+		seen[r] = true
+	}
+	for _, extra := range extras {
+		cleanExtra := filepath.Clean(extra)
+		if seen[cleanExtra] {
+			continue
+		}
+		if err := sw.addWatchRefLocked(cleanExtra); err == nil {
+			seen[cleanExtra] = true
+			registered = append(registered, cleanExtra)
+		}
+	}
+	sw.sourceWatches[source.Path] = registered
+	return nil
+}
+
+// syncSourceWatchesLocked reconciles fsnotify watch targets for source when its
+// symlink target retargets to a different directory or its SQLite -wal sibling
+// is created or checkpointed away.
+func (sw *SourceWatcher) syncSourceWatchesLocked(source DataSource) {
+	if sw.stopped {
+		return
+	}
+	primary, extras := sourceWatchTargets(source)
+	desiredList := make([]string, 0, 1+len(extras))
+	desiredSet := make(map[string]bool, 1+len(extras))
+	addDesired := func(p string) {
+		if p == "" {
+			return
+		}
+		clean := filepath.Clean(p)
+		if !desiredSet[clean] {
+			desiredSet[clean] = true
+			desiredList = append(desiredList, clean)
+		}
+	}
+	addDesired(primary)
+	for _, extra := range extras {
+		addDesired(extra)
+	}
+
+	oldTargets := sw.sourceWatches[source.Path]
+	oldSet := make(map[string]bool, len(oldTargets))
+	for _, t := range oldTargets {
+		oldSet[t] = true
+	}
+
+	var nextRegistered []string
+	for _, target := range desiredList {
+		if oldSet[target] {
+			nextRegistered = append(nextRegistered, target)
+			continue
+		}
+		if err := sw.addWatchRefLocked(target); err == nil {
+			nextRegistered = append(nextRegistered, target)
+		}
+	}
+	for _, oldTarget := range oldTargets {
+		if !desiredSet[oldTarget] {
+			_ = sw.releaseWatchRefLocked(oldTarget)
+		}
+	}
+	sw.sourceWatches[source.Path] = nextRegistered
+}
+
+func matchEventToSource(source DataSource, watchedTargets []string, cleanEvent string, op fsnotify.Op) bool {
+	resolvedMain := filepath.Clean(resolveSourceTargetPath(source.Path))
+	cleanOrig := filepath.Clean(source.Path)
+	absOrig := cleanOrig
+	if abs, err := filepath.Abs(source.Path); err == nil {
+		absOrig = filepath.Clean(abs)
+	}
+	if source.Type == SourceTypeSQLite {
+		walTarget := resolvedMain + "-wal"
+		walOrig := cleanOrig + "-wal"
+		walAbs := absOrig + "-wal"
+		if cleanEvent == walTarget || cleanEvent == walOrig || cleanEvent == walAbs {
+			return op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0
+		}
+	}
+	if cleanEvent == resolvedMain || cleanEvent == cleanOrig || cleanEvent == absOrig {
+		return op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0
+	}
+	// Match events against the previously registered primary target (or its -wal)
+	// in case a symlink retargeted right as an event from the previous target arrived.
+	if len(watchedTargets) > 0 {
+		prevPrimary := watchedTargets[0]
+		if cleanEvent == prevPrimary || (source.Type == SourceTypeSQLite && cleanEvent == prevPrimary+"-wal") {
+			return op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0
+		}
+	}
+	return false
+}
+
 // NewSourceWatcher creates a watcher for the given sources
 func NewSourceWatcher(sources []DataSource, callback func(DataSource), opts WatcherOptions) (*SourceWatcher, error) {
 	if opts.Logger == nil {
@@ -56,24 +217,26 @@ func NewSourceWatcher(sources []DataSource, callback func(DataSource), opts Watc
 		return nil, fmt.Errorf("failed to create file watcher: %w", err)
 	}
 
+	copiedSources := append([]DataSource(nil), sources...)
 	sw := &SourceWatcher{
-		watcher:    watcher,
-		sources:    sources,
-		callback:   callback,
-		debounce:   opts.Debounce,
-		lastChange: make(map[string]time.Time),
-		done:       make(chan struct{}),
-		verbose:    opts.Verbose,
-		logger:     opts.Logger,
+		watcher:       watcher,
+		sources:       copiedSources,
+		watchRefs:     make(map[string]int),
+		sourceWatches: make(map[string][]string),
+		callback:      callback,
+		debounce:      opts.Debounce,
+		timers:        make(map[string]*sourceDebounceTimer),
+		done:          make(chan struct{}),
+		verbose:       opts.Verbose,
+		logger:        opts.Logger,
 	}
 
-	// Add all source paths to the watcher
-	for _, source := range sources {
-		if err := watcher.Add(source.Path); err != nil {
+	// Add all source paths (and SQLite WAL / resolved parent directories) to the watcher
+	for _, source := range copiedSources {
+		if err := sw.registerSourceLocked(source, false); err != nil {
 			if opts.Verbose {
 				opts.Logger(fmt.Sprintf("Cannot watch %s: %v", source.Path, err))
 			}
-			// Continue with other sources
 		} else if opts.Verbose {
 			opts.Logger(fmt.Sprintf("Watching: %s", source.Path))
 		}
@@ -87,12 +250,118 @@ func (sw *SourceWatcher) Start() {
 	go sw.run()
 }
 
-// Stop stops watching for file changes. Safe to call multiple times.
+// Stop stops watching file changes. Safe to call multiple times.
 func (sw *SourceWatcher) Stop() {
 	sw.stopOnce.Do(func() {
+		sw.mu.Lock()
+		sw.stopped = true
+		for path, entry := range sw.timers {
+			if entry != nil && entry.timer != nil {
+				entry.timer.Stop()
+			}
+			delete(sw.timers, path)
+		}
+		sw.mu.Unlock()
+
 		close(sw.done)
 		sw.watcher.Close()
 	})
+}
+
+func (sw *SourceWatcher) scheduleDebouncedLocked(source DataSource, eventName string) {
+	if sw.stopped {
+		return
+	}
+	sourcePath := source.Path
+	if prev, ok := sw.timers[sourcePath]; ok && prev != nil && prev.timer != nil {
+		prev.timer.Stop()
+	}
+	sw.nextSeq++
+	seq := sw.nextSeq
+	sw.timers[sourcePath] = &sourceDebounceTimer{
+		seq: seq,
+		timer: time.AfterFunc(sw.debounce, func() {
+			sw.fireDebouncedSource(sourcePath, eventName, seq)
+		}),
+	}
+}
+
+func (sw *SourceWatcher) fireDebouncedSource(sourcePath, eventName string, seq uint64) {
+	sw.mu.Lock()
+	if sw.stopped {
+		sw.mu.Unlock()
+		return
+	}
+	entry, ok := sw.timers[sourcePath]
+	if !ok || entry == nil || entry.seq != seq {
+		sw.mu.Unlock()
+		return
+	}
+	delete(sw.timers, sourcePath)
+
+	var changedSource DataSource
+	found := false
+	for i := range sw.sources {
+		if sw.sources[i].Path == sourcePath {
+			changedSource = sw.sources[i]
+			found = true
+			break
+		}
+	}
+	verbose := sw.verbose
+	logger := sw.logger
+	callback := sw.callback
+	sw.mu.Unlock()
+
+	if !found {
+		return
+	}
+	select {
+	case <-sw.done:
+		return
+	default:
+	}
+
+	if verbose {
+		logger(fmt.Sprintf("Source changed: %s", eventName))
+	}
+
+	if err := RefreshSourceInfo(&changedSource); err != nil {
+		if verbose {
+			logger(fmt.Sprintf("Failed to refresh source info: %v", err))
+		}
+	}
+
+	sw.mu.Lock()
+	if sw.stopped {
+		sw.mu.Unlock()
+		return
+	}
+	sourceStillWatched := false
+	for i := range sw.sources {
+		if sw.sources[i].Path == sourcePath {
+			sw.sources[i] = changedSource
+			sourceStillWatched = true
+			break
+		}
+	}
+	if sourceStillWatched {
+		sw.syncSourceWatchesLocked(changedSource)
+	}
+	sw.mu.Unlock()
+	if !sourceStillWatched {
+		return
+	}
+
+	select {
+	case <-sw.done:
+		return
+	default:
+	}
+
+	if callback != nil {
+		callback(changedSource)
+	}
 }
 
 // run is the main event loop for the watcher
@@ -107,16 +376,22 @@ func (sw *SourceWatcher) run() {
 				return
 			}
 
-			// Only care about write and create events
-			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+			// Ignore pure chmod/unrelated events; WAL checkpoints may rename/remove -wal
+			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
 				continue
 			}
 
+			cleanEvent := filepath.Clean(event.Name)
+
 			sw.mu.Lock()
+			if sw.stopped {
+				sw.mu.Unlock()
+				return
+			}
 			var changedSource DataSource
 			sourceFound := false
 			for i := range sw.sources {
-				if sw.sources[i].Path == event.Name {
+				if matchEventToSource(sw.sources[i], sw.sourceWatches[sw.sources[i].Path], cleanEvent, event.Op) {
 					changedSource = sw.sources[i]
 					sourceFound = true
 					break
@@ -127,45 +402,14 @@ func (sw *SourceWatcher) run() {
 				continue
 			}
 
-			// Check debounce
-			lastTime := sw.lastChange[event.Name]
-			now := time.Now()
-			if now.Sub(lastTime) < sw.debounce {
-				sw.mu.Unlock()
-				continue
-			}
-			sw.lastChange[event.Name] = now
+			// Re-resolve symlink/WAL watch targets immediately so follow-up events
+			// in a newly retargeted directory are captured during the quiet window.
+			sw.syncSourceWatchesLocked(changedSource)
+
+			// Trailing-edge debounce keyed by logical source path so rapid WAL page
+			// writes followed by a SQLite commit coalesce into a post-commit refresh.
+			sw.scheduleDebouncedLocked(changedSource, event.Name)
 			sw.mu.Unlock()
-
-			if sw.verbose {
-				sw.logger(fmt.Sprintf("Source changed: %s", event.Name))
-			}
-
-			// Refresh source info
-			if err := RefreshSourceInfo(&changedSource); err != nil {
-				if sw.verbose {
-					sw.logger(fmt.Sprintf("Failed to refresh source info: %v", err))
-				}
-			}
-
-			sw.mu.Lock()
-			sourceStillWatched := false
-			for i := range sw.sources {
-				if sw.sources[i].Path == changedSource.Path {
-					sw.sources[i] = changedSource
-					sourceStillWatched = true
-					break
-				}
-			}
-			sw.mu.Unlock()
-			if !sourceStillWatched {
-				continue
-			}
-
-			// Call the callback
-			if sw.callback != nil {
-				sw.callback(changedSource)
-			}
 
 		case err, ok := <-sw.watcher.Errors:
 			if !ok {
@@ -181,6 +425,10 @@ func (sw *SourceWatcher) run() {
 // AddSource adds a new source to watch
 func (sw *SourceWatcher) AddSource(source DataSource) error {
 	sw.mu.Lock()
+	if sw.stopped {
+		sw.mu.Unlock()
+		return fmt.Errorf("watcher is stopped")
+	}
 
 	// Check if already watching
 	for _, s := range sw.sources {
@@ -190,7 +438,7 @@ func (sw *SourceWatcher) AddSource(source DataSource) error {
 		}
 	}
 
-	if err := sw.watcher.Add(source.Path); err != nil {
+	if err := sw.registerSourceLocked(source, true); err != nil {
 		sw.mu.Unlock()
 		return fmt.Errorf("failed to watch %s: %w", source.Path, err)
 	}
@@ -213,9 +461,31 @@ func (sw *SourceWatcher) AddSource(source DataSource) error {
 func (sw *SourceWatcher) RemoveSource(path string) error {
 	sw.mu.Lock()
 
-	if err := sw.watcher.Remove(path); err != nil {
-		sw.mu.Unlock()
-		return fmt.Errorf("failed to remove watch %s: %w", path, err)
+	if prev, ok := sw.timers[path]; ok {
+		if prev != nil && prev.timer != nil {
+			prev.timer.Stop()
+		}
+		delete(sw.timers, path)
+	}
+
+	targets, ok := sw.sourceWatches[path]
+	if !ok {
+		if err := sw.watcher.Remove(path); err != nil {
+			sw.mu.Unlock()
+			return fmt.Errorf("failed to remove watch %s: %w", path, err)
+		}
+	} else {
+		var firstErr error
+		for _, target := range targets {
+			if err := sw.releaseWatchRefLocked(target); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		delete(sw.sourceWatches, path)
+		if firstErr != nil {
+			sw.mu.Unlock()
+			return fmt.Errorf("failed to remove watch %s: %w", path, firstErr)
+		}
 	}
 
 	// Remove from sources list
@@ -226,7 +496,6 @@ func (sw *SourceWatcher) RemoveSource(path string) error {
 		}
 	}
 
-	delete(sw.lastChange, path)
 	verbose := sw.verbose
 	logger := sw.logger
 	sw.mu.Unlock()
@@ -270,21 +539,22 @@ type AutoRefreshOptions struct {
 
 // NewAutoRefreshManager creates a manager that automatically re-selects sources on changes
 func NewAutoRefreshManager(sources []DataSource, opts AutoRefreshOptions) (*AutoRefreshManager, error) {
+	copiedSources := append([]DataSource(nil), sources...)
 	manager := &AutoRefreshManager{
-		sources:        sources,
+		sources:        copiedSources,
 		onSourceChange: opts.OnSourceChange,
 		opts:           opts.SelectionOptions,
 	}
 
 	// Initial source selection
-	selected, err := SelectBestSourceWithOptions(sources, opts.SelectionOptions)
+	selected, err := SelectBestSourceWithOptions(copiedSources, opts.SelectionOptions)
 	if err != nil {
 		return nil, err
 	}
 	manager.currentSource = &selected
 
 	// Create watcher
-	watcher, err := NewSourceWatcher(sources, manager.handleChange, opts.WatcherOptions)
+	watcher, err := NewSourceWatcher(copiedSources, manager.handleChange, opts.WatcherOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -340,7 +610,10 @@ func (m *AutoRefreshManager) handleChange(changed DataSource) {
 
 	// Check if selection changed
 	if m.currentSource != nil && m.currentSource.Path == newSelected.Path &&
-		m.currentSource.ModTime.Equal(newSelected.ModTime) {
+		m.currentSource.ModTime.Equal(newSelected.ModTime) &&
+		m.currentSource.Size == newSelected.Size &&
+		m.currentSource.IssueCount == newSelected.IssueCount &&
+		m.currentSource.Valid == newSelected.Valid {
 		m.mu.Unlock()
 		flushSelectionLogs()
 		return

@@ -3,6 +3,28 @@
 <svg width="2742" height="480"
      xmlns="http://www.w3.org/2000/svg"
      xmlns:xlink="http://www.w3.org/1999/xlink">
+<defs>
+<clipPath id="clip-node-0" ><rect x="36" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-1" ><rect x="286" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-2" ><rect x="536" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-3" ><rect x="786" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-4" ><rect x="1036" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-5" ><rect x="1286" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-6" ><rect x="1536" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-7" ><rect x="1786" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-8" ><rect x="2036" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+<clipPath id="clip-node-9" ><rect x="2286" y="156" width="170" height="70" rx="8" ry="8" />
+</clipPath>
+</defs>
 <rect x="0" y="0" width="2742" height="480" style="fill:#f9fafb" />
 <rect x="16" y="16" width="2710" height="96" rx="10" ry="10" style="fill:#f3f4f6" />
 <text x="32" y="44" style="fill:#111111;font-size:16px;font-family:monospace;font-weight:bold" >golden</text>
@@ -38,43 +60,43 @@
 <line x1="2206" y1="191" x2="2286" y2="191" style="stroke:#6b80bf;stroke-width:2" />
 <polygon points="2286,191 2294,195 2294,187" style="fill:#6b80bf" />
 <rect x="36" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="46" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n0</text>
-<text x="46" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n0</text>
-<text x="46" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.028</text>
+<text x="46" y="178" clip-path="url(#clip-node-0)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n0</text>
+<text x="46" y="198" clip-path="url(#clip-node-0)" style="fill:#666666;font-size:12px;font-family:monospace" >n0</text>
+<text x="46" y="216" clip-path="url(#clip-node-0)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.028</text>
 <rect x="286" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="296" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n1</text>
-<text x="296" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n1</text>
-<text x="296" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.051</text>
+<text x="296" y="178" clip-path="url(#clip-node-1)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n1</text>
+<text x="296" y="198" clip-path="url(#clip-node-1)" style="fill:#666666;font-size:12px;font-family:monospace" >n1</text>
+<text x="296" y="216" clip-path="url(#clip-node-1)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.051</text>
 <rect x="536" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="546" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n2</text>
-<text x="546" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n2</text>
-<text x="546" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.071</text>
+<text x="546" y="178" clip-path="url(#clip-node-2)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n2</text>
+<text x="546" y="198" clip-path="url(#clip-node-2)" style="fill:#666666;font-size:12px;font-family:monospace" >n2</text>
+<text x="546" y="216" clip-path="url(#clip-node-2)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.071</text>
 <rect x="786" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="796" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n3</text>
-<text x="796" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n3</text>
-<text x="796" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.088</text>
+<text x="796" y="178" clip-path="url(#clip-node-3)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n3</text>
+<text x="796" y="198" clip-path="url(#clip-node-3)" style="fill:#666666;font-size:12px;font-family:monospace" >n3</text>
+<text x="796" y="216" clip-path="url(#clip-node-3)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.088</text>
 <rect x="1036" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1046" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n4</text>
-<text x="1046" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n4</text>
-<text x="1046" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.102</text>
+<text x="1046" y="178" clip-path="url(#clip-node-4)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n4</text>
+<text x="1046" y="198" clip-path="url(#clip-node-4)" style="fill:#666666;font-size:12px;font-family:monospace" >n4</text>
+<text x="1046" y="216" clip-path="url(#clip-node-4)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.102</text>
 <rect x="1286" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1296" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n5</text>
-<text x="1296" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n5</text>
-<text x="1296" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.114</text>
+<text x="1296" y="178" clip-path="url(#clip-node-5)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n5</text>
+<text x="1296" y="198" clip-path="url(#clip-node-5)" style="fill:#666666;font-size:12px;font-family:monospace" >n5</text>
+<text x="1296" y="216" clip-path="url(#clip-node-5)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.114</text>
 <rect x="1536" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1546" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n6</text>
-<text x="1546" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n6</text>
-<text x="1546" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.125</text>
+<text x="1546" y="178" clip-path="url(#clip-node-6)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n6</text>
+<text x="1546" y="198" clip-path="url(#clip-node-6)" style="fill:#666666;font-size:12px;font-family:monospace" >n6</text>
+<text x="1546" y="216" clip-path="url(#clip-node-6)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.125</text>
 <rect x="1786" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="1796" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n7</text>
-<text x="1796" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n7</text>
-<text x="1796" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.134</text>
+<text x="1796" y="178" clip-path="url(#clip-node-7)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n7</text>
+<text x="1796" y="198" clip-path="url(#clip-node-7)" style="fill:#666666;font-size:12px;font-family:monospace" >n7</text>
+<text x="1796" y="216" clip-path="url(#clip-node-7)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.134</text>
 <rect x="2036" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
-<text x="2046" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n8</text>
-<text x="2046" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n8</text>
-<text x="2046" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.141</text>
+<text x="2046" y="178" clip-path="url(#clip-node-8)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n8</text>
+<text x="2046" y="198" clip-path="url(#clip-node-8)" style="fill:#666666;font-size:12px;font-family:monospace" >n8</text>
+<text x="2046" y="216" clip-path="url(#clip-node-8)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.141</text>
 <rect x="2286" y="156" width="170" height="70" rx="8" ry="8" style="fill:#c8e6c9;stroke:#222222;stroke-width:1.2" />
-<text x="2296" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n9</text>
-<text x="2296" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n9</text>
-<text x="2296" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.147</text>
+<text x="2296" y="178" clip-path="url(#clip-node-9)" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n9</text>
+<text x="2296" y="198" clip-path="url(#clip-node-9)" style="fill:#666666;font-size:12px;font-family:monospace" >n9</text>
+<text x="2296" y="216" clip-path="url(#clip-node-9)" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.147</text>
 </svg>

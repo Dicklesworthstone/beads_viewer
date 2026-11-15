@@ -569,8 +569,9 @@ bv is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in c
 - `commands`: copy-paste shell commands for next steps
 
 ```bash
-bv --robot-triage        # THE MEGA-COMMAND: start here
+bv --robot-triage        # THE MEGA-COMMAND: start here (ready leaf work; pass --robot-include-inactive for diagnostics)
 bv --robot-next          # Minimal: just the single top pick + claim command
+bv --robot-graph --format toon  # Compact tabular TOON output where beneficial
 ```
 
 ### Command Reference
@@ -580,19 +581,22 @@ bv --robot-next          # Minimal: just the single top pick + claim command
 |---------|---------|
 | `--robot-plan` | Parallel execution tracks with `unblocks` lists |
 | `--robot-priority` | Priority misalignment detection with confidence |
+| `--robot-whatif <id>` | Simulated downstream unblock impact of completing an issue |
 
 **Graph Analysis:**
 | Command | Returns |
 |---------|---------|
 | `--robot-insights` | Full metrics: PageRank, betweenness, HITS, eigenvector, critical path, cycles, k-core, articulation points, slack |
 | `--robot-label-health` | Per-label health: `health_level`, `velocity_score`, `staleness`, `blocked_count` |
-| `--robot-label-flow` | Cross-label dependency: `flow_matrix`, `dependencies`, `bottleneck_labels` |
+| `--robot-label-flow` | Cross-label dependency: `flow_matrix`, `dependencies`, `bottleneck_labels`, `blockage_cascade` |
 | `--robot-label-attention [--attention-limit=N]` | Attention-ranked labels |
 
 **History & Change Tracking:**
 | Command | Returns |
 |---------|---------|
 | `--robot-history` | Bead-to-commit correlations |
+| `--bead-history <id>` | Single-bead lifecycle events and correlated git commits |
+| `--robot-commit <sha\|ref>` | Reverse lookup: beads correlated with a git commit |
 | `--robot-diff --diff-since <ref>` | Changes since ref: new/closed/modified issues, cycles |
 
 **Other:**
@@ -600,10 +604,11 @@ bv --robot-next          # Minimal: just the single top pick + claim command
 |---------|---------|
 | `--robot-burndown <sprint>` | Sprint burndown, scope changes, at-risk items |
 | `--robot-forecast <id\|all>` | ETA estimates from a duration heuristic and 30-day closure velocity (not a scheduler) |
-| `--robot-alerts` | Stale issues, blocking cascades, priority mismatches |
-| `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions |
+| `--robot-alerts` | Stale issues, blocking cascades, priority mismatches, source inconsistencies |
+| `--check-drift --robot-drift` | Baseline drift evaluation + live issue health alerts |
+| `--robot-suggest` | Hygiene: duplicates, missing deps, label suggestions, cycle breaks |
 | `--robot-graph [--graph-format=json\|dot\|mermaid]` | Dependency graph export |
-| `--export-graph <file.html>` | Interactive HTML visualization |
+| `--export-graph <file.html\|svg\|png>` | Interactive HTML visualization or static SVG/PNG snapshot |
 
 ### Scoping & Filtering
 

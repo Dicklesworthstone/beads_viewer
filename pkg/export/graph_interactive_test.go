@@ -156,13 +156,18 @@ func TestGenerateInteractiveGraphHTML_EscapesDynamicHTML(t *testing.T) {
 	html := string(data)
 
 	required := []string{
+		"const XHTML_NS = 'http://www.w3.org/1999/xhtml';",
+		"const ALLOWED_MARKDOWN_TAGS = new Set([",
+		"const DROP_SUBTREE_TAGS = new Set([",
 		"function escapeHTML(value)",
 		"function sanitizeHTMLFragment(root)",
-		"function renderSafeMarkdown(value)",
-		"renderSafeMarkdown(node.description)",
-		"renderSafeMarkdown(node.design)",
-		"renderSafeMarkdown(node.acceptance_criteria)",
-		"renderSafeMarkdown(node.notes)",
+		"function renderSafeMarkdownFragment(value)",
+		"document.getElementById(prefix + 'description-content').replaceChildren(renderSafeMarkdownFragment(node.description))",
+		"document.getElementById(prefix + 'design-content').replaceChildren(renderSafeMarkdownFragment(node.design))",
+		"document.getElementById(prefix + 'acceptance-content').replaceChildren(renderSafeMarkdownFragment(node.acceptance_criteria))",
+		"document.getElementById(prefix + 'notes-content').replaceChildren(renderSafeMarkdownFragment(node.notes))",
+		"el.namespaceURI !== XHTML_NS || DROP_SUBTREE_TAGS.has(tag)",
+		"document.createTreeWalker(root, NodeFilter.SHOW_COMMENT)",
 		"escapeHTML(n.title)",
 		"highlightMatches(f.substring(start, end), query)",
 		"safeClassToken(n.status)",
@@ -174,6 +179,12 @@ func TestGenerateInteractiveGraphHTML_EscapesDynamicHTML(t *testing.T) {
 	}
 
 	forbidden := []string{
+		"function renderSafeMarkdown(value)",
+		"description-content').innerHTML =",
+		"design-content').innerHTML =",
+		"acceptance-content').innerHTML =",
+		"notes-content').innerHTML =",
+		"return template.innerHTML",
 		"marked.parse(node.description)",
 		"marked.parse(node.design)",
 		"marked.parse(node.acceptance_criteria)",
@@ -323,6 +334,223 @@ func TestGenerateInteractiveGraphHTML_UnifiedFiltersPathFinderRecentAndActiveBlo
 		}
 		if (l.Target == "bv-closed" || l.Target == "bv-tomb") && l.Critical {
 			t.Fatalf("resolved link %+v should never be marked critical", l)
+		}
+	}
+}
+
+func TestGenerateInteractiveGraphHTML_CyclicSlackSafetyDagErrorMarkdownAndMetrics(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cyclicIssues := []model.Issue{
+		{
+			ID:          "cyc-a",
+			Title:       "Cycle A",
+			Description: "> Quote\n\nInline `a < b && c != \"x\"`",
+			Status:      model.StatusOpen,
+			Priority:    0,
+			IssueType:   model.TypeBug,
+			Dependencies: []*model.Dependency{
+				{IssueID: "cyc-a", DependsOnID: "cyc-b", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "cyc-b",
+			Title:     "Cycle B",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{
+				{IssueID: "cyc-b", DependsOnID: "cyc-a", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "cyc-leaf",
+			Title:     "Downstream of cycle",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeFeature,
+			Dependencies: []*model.Dependency{
+				{IssueID: "cyc-leaf", DependsOnID: "cyc-a", Type: model.DepBlocks},
+			},
+		},
+	}
+	cyclicStats := analysis.NewAnalyzer(cyclicIssues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	if len(cyclicStats.Cycles()) == 0 {
+		t.Fatalf("expected cyclic fixture to report at least 1 cycle")
+	}
+
+	cyclicPath, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues:      cyclicIssues,
+		Stats:       &cyclicStats,
+		Title:       "Cyclic Graph Safety",
+		Path:        tmpDir + "/cyclic.html",
+		ProjectName: "cyclic",
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML(cyclic) failed: %v", err)
+	}
+	rawCyclic, err := os.ReadFile(cyclicPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", cyclicPath, err)
+	}
+	html := string(rawCyclic)
+
+	for _, want := range []string{
+		".onDagError(() => handleDagCycleError())",
+		"Cannot apply DAG layout: dependency cycle detected",
+		"localStorage.removeItem('bv-graph-layout')",
+		"addMetric('Slack', node.slack_available === false ? (DATA.has_cycles ? 'N/A (cycle)' : 'N/A') : fmt(node.slack, 1))",
+		"slackEl.textContent = node.slack_available === false ? (DATA.has_cycles ? 'N/A (cycle)' : 'N/A') : fmtSide(node.slack, 1);",
+		"slackEl.className = 'metric-value' + (node.slack_available !== false && isActiveNodeStatus(node.status) && node.slack === 0 ? ' highlight' : '');",
+		"template.innerHTML = marked.parse(raw);",
+		"sanitizeHTMLFragment(template.content);",
+		"frag.appendChild(template.content);",
+		`.split(/\r?\n/)[0]`,
+		"document.body.classList.contains('light-mode') ? '#1a1a2e' : '#e8e8f0'",
+		"node.core_number",
+		"node.eigenvector",
+		"node.hub",
+		"node.authority",
+		"node.last_author",
+		"node.commit_count",
+		"DATA.git_range",
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("cyclic interactive HTML missing expected guard/wiring %q", want)
+		}
+	}
+	for _, bad := range []string{
+		"marked.parse(escapeHTML(",
+		`.split('\\n')[0]`,
+	} {
+		if strings.Contains(html, bad) {
+			t.Fatalf("cyclic interactive HTML contains regressed pattern %q", bad)
+		}
+	}
+
+	const prefix = "\nconst DATA = "
+	start := strings.Index(html, prefix)
+	end := strings.Index(html[start+len(prefix):], ";\nconst STATUS_COLORS")
+	if start < 0 || end < 0 {
+		t.Fatalf("could not extract embedded DATA JSON")
+	}
+	var cyclicPayload struct {
+		SlackAvailable bool        `json:"slack_available"`
+		HasCycles      bool        `json:"has_cycles"`
+		Nodes          []graphNode `json:"nodes"`
+		Links          []graphLink `json:"links"`
+	}
+	if err := json.Unmarshal([]byte(html[start+len(prefix):start+len(prefix)+end]), &cyclicPayload); err != nil {
+		t.Fatalf("Unmarshal cyclic DATA JSON: %v", err)
+	}
+	if cyclicPayload.SlackAvailable {
+		t.Fatalf("expected slack_available=false on cyclic graph")
+	}
+	if !cyclicPayload.HasCycles {
+		t.Fatalf("expected has_cycles=true on cyclic graph")
+	}
+	for _, n := range cyclicPayload.Nodes {
+		if n.SlackAvailable {
+			t.Fatalf("expected node %s slack_available=false on cyclic graph", n.ID)
+		}
+	}
+	for _, l := range cyclicPayload.Links {
+		if l.Critical {
+			t.Fatalf("expected zero critical links on cyclic graph, got %+v", l)
+		}
+	}
+
+	// Acyclic graph positive control: critical path nodes & link ARE marked critical with slack_available=true.
+	acyclicIssues := []model.Issue{
+		{ID: "dag-root", Title: "Root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask},
+		{
+			ID:        "dag-leaf",
+			Title:     "Leaf",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{
+				{IssueID: "dag-leaf", DependsOnID: "dag-root", Type: model.DepBlocks},
+			},
+		},
+	}
+	acyclicStats := analysis.NewAnalyzer(acyclicIssues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	acyclicPath, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues: acyclicIssues,
+		Stats:  &acyclicStats,
+		Path:   tmpDir + "/acyclic.html",
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML(acyclic) failed: %v", err)
+	}
+	rawAcyclic, err := os.ReadFile(acyclicPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", acyclicPath, err)
+	}
+	aHTML := string(rawAcyclic)
+	aStart := strings.Index(aHTML, prefix)
+	aEnd := strings.Index(aHTML[aStart+len(prefix):], ";\nconst STATUS_COLORS")
+	var acyclicPayload struct {
+		SlackAvailable bool        `json:"slack_available"`
+		Nodes          []graphNode `json:"nodes"`
+		Links          []graphLink `json:"links"`
+	}
+	if err := json.Unmarshal([]byte(aHTML[aStart+len(prefix):aStart+len(prefix)+aEnd]), &acyclicPayload); err != nil {
+		t.Fatalf("Unmarshal acyclic DATA JSON: %v", err)
+	}
+	if !acyclicPayload.SlackAvailable {
+		t.Fatalf("expected slack_available=true on acyclic graph")
+	}
+	for _, n := range acyclicPayload.Nodes {
+		if !n.SlackAvailable {
+			t.Fatalf("expected node %s slack_available=true on acyclic graph", n.ID)
+		}
+	}
+	if len(acyclicPayload.Links) != 1 || !acyclicPayload.Links[0].Critical {
+		t.Fatalf("expected critical link on 2-node DAG chain, got %+v", acyclicPayload.Links)
+	}
+
+	// Closed node on an acyclic graph must have slack_available=false (never false critical-path slack=0).
+	acyclicWithClosed := append(append([]model.Issue{}, acyclicIssues...), model.Issue{
+		ID:        "dag-closed",
+		Title:     "Closed historical task",
+		Status:    model.StatusClosed,
+		Priority:  2,
+		IssueType: model.TypeTask,
+	})
+	closedStats := analysis.NewAnalyzer(acyclicWithClosed).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	closedPath, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues: acyclicWithClosed,
+		Stats:  &closedStats,
+		Path:   tmpDir + "/acyclic_closed.html",
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML(acyclicWithClosed) failed: %v", err)
+	}
+	rawClosed, err := os.ReadFile(closedPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", closedPath, err)
+	}
+	cHTML := string(rawClosed)
+	cStart := strings.Index(cHTML, prefix)
+	cEnd := strings.Index(cHTML[cStart+len(prefix):], ";\nconst STATUS_COLORS")
+	var closedPayload struct {
+		SlackAvailable bool        `json:"slack_available"`
+		HasCycles      bool        `json:"has_cycles"`
+		Nodes          []graphNode `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(cHTML[cStart+len(prefix):cStart+len(prefix)+cEnd]), &closedPayload); err != nil {
+		t.Fatalf("Unmarshal acyclicWithClosed DATA JSON: %v", err)
+	}
+	if !closedPayload.SlackAvailable || closedPayload.HasCycles {
+		t.Fatalf("expected slack_available=true and has_cycles=false, got %+v", closedPayload)
+	}
+	for _, n := range closedPayload.Nodes {
+		if n.ID == "dag-closed" && n.SlackAvailable {
+			t.Fatalf("expected closed node dag-closed to have slack_available=false")
+		}
+		if n.ID != "dag-closed" && !n.SlackAvailable {
+			t.Fatalf("expected active node %s to have slack_available=true", n.ID)
 		}
 	}
 }

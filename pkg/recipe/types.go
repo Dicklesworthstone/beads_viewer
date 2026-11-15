@@ -275,9 +275,9 @@ func (r *Recipe) Validate() error {
 		problems = append(problems, "view.collapsed requires view.group_by")
 	}
 	switch r.Export.Format {
-	case "", "markdown", "json", "csv", "mermaid":
+	case "", "markdown", "html", "json", "csv", "mermaid":
 	default:
-		problems = append(problems, fmt.Sprintf("export.format %q must be markdown, json, csv or mermaid", r.Export.Format))
+		problems = append(problems, fmt.Sprintf("export.format %q must be markdown, html, json, csv or mermaid", r.Export.Format))
 	}
 	if len(problems) == 0 {
 		return nil

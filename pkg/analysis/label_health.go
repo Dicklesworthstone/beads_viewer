@@ -36,12 +36,13 @@ type LabelHealth struct {
 
 // VelocityMetrics tracks the rate of work completion for a label
 type VelocityMetrics struct {
-	ClosedLast7Days  int     `json:"closed_last_7_days"`  // Issues closed in past week
-	ClosedLast30Days int     `json:"closed_last_30_days"` // Issues closed in past month
-	AvgDaysToClose   float64 `json:"avg_days_to_close"`   // Average time from open to close
-	TrendDirection   string  `json:"trend_direction"`     // "improving", "stable", "declining"
-	TrendPercent     float64 `json:"trend_percent"`       // Percent change vs prior period
-	VelocityScore    int     `json:"velocity_score"`      // Normalized 0-100 score
+	ClosedLast7Days  int                 `json:"closed_last_7_days"`   // Issues closed in past week
+	ClosedLast30Days int                 `json:"closed_last_30_days"`  // Issues closed in past month
+	AvgDaysToClose   float64             `json:"avg_days_to_close"`    // Average time from open to close
+	TrendDirection   string              `json:"trend_direction"`      // "improving", "stable", "declining"
+	TrendPercent     float64             `json:"trend_percent"`        // Percent change vs prior period
+	VelocityScore    int                 `json:"velocity_score"`       // Normalized 0-100 score
+	Historical       *HistoricalVelocity `json:"historical,omitempty"` // Multi-week historical velocity breakdown
 }
 
 // HistoricalVelocity captures velocity data across multiple time periods (bv-123)
@@ -672,6 +673,26 @@ func ComputeVelocityMetrics(issues []model.Issue, now time.Time) VelocityMetrics
 	}
 }
 
+// ComputeLabelVelocity computes VelocityMetrics enriched with an 8-week
+// HistoricalVelocity snapshot for the specified label at now.
+func ComputeLabelVelocity(label string, issues []model.Issue, now time.Time) VelocityMetrics {
+	var labeled []model.Issue
+	for i := range issues {
+		for _, l := range issues[i].Labels {
+			if l == label {
+				labeled = append(labeled, issues[i])
+				break
+			}
+		}
+	}
+	velocity := ComputeVelocityMetrics(labeled, now)
+	if len(labeled) > 0 {
+		hist := computeHistoricalVelocityFromLabeled(labeled, label, 8, now)
+		velocity.Historical = &hist
+	}
+	return velocity
+}
+
 func sortedIssueOrder(issues []model.Issue) []int {
 	order := make([]int, len(issues))
 	for i := range issues {
@@ -836,6 +857,8 @@ func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHea
 	}
 
 	velocity := ComputeVelocityMetrics(labeled, now)
+	hist := computeHistoricalVelocityFromLabeled(labeled, label, 8, now)
+	velocity.Historical = &hist
 	freshness := ComputeFreshnessMetrics(labeled, now, cfg.StaleThresholdDays)
 
 	// Flow: count cross-label deps
@@ -1032,6 +1055,8 @@ func computeIndexedLabelHealth(
 	}
 
 	velocity := ComputeVelocityMetrics(labeled, now)
+	hist := computeHistoricalVelocityFromLabeled(labeled, label, 8, now)
+	velocity.Historical = &hist
 	freshness := ComputeFreshnessMetrics(labeled, now, cfg.StaleThresholdDays)
 
 	flow := FlowMetrics{}
@@ -3204,15 +3229,6 @@ func (r *LabelAttentionResult) GetLabelAttention(label string) *LabelAttentionSc
 // This enables trend analysis, anomaly detection, and forecasting.
 // Uses ClosedAt timestamps from issues to bucket closures into weeks.
 func ComputeHistoricalVelocity(issues []model.Issue, label string, numWeeks int, now time.Time) HistoricalVelocity {
-	if numWeeks <= 0 {
-		numWeeks = 8
-	}
-	result := HistoricalVelocity{
-		Label:          label,
-		WeeklyVelocity: make([]WeeklySnapshot, numWeeks),
-		WeeksAnalyzed:  numWeeks,
-	}
-
 	// Filter to labeled issues
 	var labeled []model.Issue
 	for _, iss := range issues {
@@ -3222,6 +3238,18 @@ func ComputeHistoricalVelocity(issues []model.Issue, label string, numWeeks int,
 				break
 			}
 		}
+	}
+	return computeHistoricalVelocityFromLabeled(labeled, label, numWeeks, now)
+}
+
+func computeHistoricalVelocityFromLabeled(labeled []model.Issue, label string, numWeeks int, now time.Time) HistoricalVelocity {
+	if numWeeks <= 0 {
+		numWeeks = 8
+	}
+	result := HistoricalVelocity{
+		Label:          label,
+		WeeklyVelocity: make([]WeeklySnapshot, numWeeks),
+		WeeksAnalyzed:  numWeeks,
 	}
 
 	// Calculate week boundaries (weeks start on Monday)

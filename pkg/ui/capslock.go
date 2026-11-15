@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -153,8 +154,10 @@ func IsCapsLock(msg tea.KeyMsg) bool {
 		return false // Still too ambiguous
 	}
 
-	// Kitty terminal protocol might send CapsLock as a specific sequence
-	// but BubbleTea doesn't expose this directly
+	key := strings.TrimSpace(msg.String())
+	if strings.EqualFold(key, "caps_lock") || strings.EqualFold(key, "capslock") {
+		return true
+	}
 
 	return false // Conservative: assume CapsLock not detected
 }

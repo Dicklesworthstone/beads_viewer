@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -219,7 +220,22 @@ func installEditorTracker(t *testing.T, tracker string) (model.Issue, string, st
 		Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Labels: []string{"keep-this-label"}}
 	data, _ := json.Marshal(issue)
 	path := filepath.Join(beadsDir, "issues.jsonl")
-	for target, contents := range map[string][]byte{state: data, path: append(data, '\n'), filepath.Join(beadsDir, "beads.db"): []byte("fixture")} {
+	beadsDBPath := filepath.Join(beadsDir, "beads.db")
+	fixtureDB, err := sql.Open("sqlite", beadsDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixtureDB.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL)`); err != nil {
+		_ = fixtureDB.Close()
+		t.Fatal(err)
+	}
+	if err := fixtureDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(beadsDBPath, now, now); err != nil {
+		t.Fatal(err)
+	}
+	for target, contents := range map[string][]byte{state: data, path: append(data, '\n')} {
 		if err := os.WriteFile(target, contents, 0o600); err != nil {
 			t.Fatal(err)
 		}

@@ -2,6 +2,8 @@ package search
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"os"
@@ -25,6 +27,21 @@ func DefaultIndexPath(projectDir string, cfg EmbeddingConfig) string {
 	}
 	safeModel := sanitizeModelFilenameSlug(cfg.Model)
 	return filepath.Join(projectDir, ".bv", "semantic", fmt.Sprintf("index-%s-%s-%d.bvvi", safeProvider, safeModel, cfg.Dim))
+}
+
+// IndexPathForScope returns the semantic index path for an optional scopeKey
+// (such as a multi-repo --workspace or custom --db/--beads-file source).
+// When scopeKey is empty/whitespace, it returns DefaultIndexPath unchanged so
+// default single-repo callers continue to use the canonical .bvvi file.
+func IndexPathForScope(projectDir string, cfg EmbeddingConfig, scopeKey string) string {
+	trimmedScope := strings.TrimSpace(scopeKey)
+	if trimmedScope == "" {
+		return DefaultIndexPath(projectDir, cfg)
+	}
+	basePath := DefaultIndexPath(projectDir, cfg)
+	sum := sha256.Sum256([]byte(trimmedScope))
+	shortHash := hex.EncodeToString(sum[:6])
+	return strings.TrimSuffix(basePath, ".bvvi") + "-" + shortHash + ".bvvi"
 }
 
 func sanitizeFilenameSlug(raw string, fallback string) string {

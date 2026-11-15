@@ -859,9 +859,9 @@ func TestRobotDiskCache_WritesAndHits(t *testing.T) {
 		t.Fatalf("parsing cache entry json: %v", err)
 	}
 	// Must track robotAnalysisDiskCacheVersion in cache.go (unexported; this is
-	// an external test package). Bumped to 5 with the SoA payload change.
-	if entry.Version != 5 {
-		t.Fatalf("cache entry version: got %d, want %d", entry.Version, 5)
+	// an external test package). Bumped to 6 for active-only critical path/slack fallback.
+	if entry.Version != 6 {
+		t.Fatalf("cache entry version: got %d, want %d", entry.Version, 6)
 	}
 	if entry.Key != fullKey {
 		t.Fatalf("cache entry key: got %q, want %q", entry.Key, fullKey)

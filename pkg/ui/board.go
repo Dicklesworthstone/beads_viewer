@@ -289,13 +289,16 @@ func formatOldestAge(d time.Duration) string {
 	return fmt.Sprintf("%dmo", months)
 }
 
-// sortIssuesByPriorityAndDate sorts issues by priority (ascending) then by creation date (descending)
+// sortIssuesByPriorityAndDate sorts issues by priority (ascending), creation date (descending), then ID (ascending)
 func sortIssuesByPriorityAndDate(issues []model.Issue) {
 	sort.Slice(issues, func(i, j int) bool {
 		if issues[i].Priority != issues[j].Priority {
 			return issues[i].Priority < issues[j].Priority
 		}
-		return issues[i].CreatedAt.After(issues[j].CreatedAt)
+		if !issues[i].CreatedAt.Equal(issues[j].CreatedAt) {
+			return issues[i].CreatedAt.After(issues[j].CreatedAt)
+		}
+		return issues[i].ID < issues[j].ID
 	})
 }
 

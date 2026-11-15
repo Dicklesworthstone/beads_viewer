@@ -934,3 +934,53 @@ func TestCanRollbackAndPerformRollback(t *testing.T) {
 		}
 	})
 }
+
+func TestParseChecksumData_BinaryModeAsteriskPrefix(t *testing.T) {
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+	hashC := strings.Repeat("c", 64)
+
+	manifest := strings.Join([]string{
+		hashA + " *bv_linux_amd64.tar.gz",
+		hashB + "  bv_darwin_arm64.tar.gz",
+		hashC + " *bv windows bundle.zip",
+		"",
+	}, "\n")
+
+	checksums, err := parseChecksumData([]byte(manifest))
+	if err != nil {
+		t.Fatalf("parseChecksumData failed: %v", err)
+	}
+	want := map[string]string{
+		"bv_linux_amd64.tar.gz":  hashA,
+		"bv_darwin_arm64.tar.gz": hashB,
+		"bv windows bundle.zip":  hashC,
+	}
+	for name, expectedHash := range want {
+		if got := checksums[name]; got != expectedHash {
+			t.Fatalf("checksums[%q] = %q, want %q (full=%v)", name, got, expectedHash, checksums)
+		}
+	}
+	if _, leaked := checksums["*bv_linux_amd64.tar.gz"]; leaked {
+		t.Fatalf("binary-mode '*' prefix leaked into filename key: %v", checksums)
+	}
+	if err := ensureNoMalformedChecksumLineForAsset([]byte(manifest), "bv_linux_amd64.tar.gz"); err != nil {
+		t.Fatalf("ensureNoMalformedChecksumLineForAsset rejected valid binary-mode entry: %v", err)
+	}
+
+	// Duplicate across text-mode and binary-mode for the same asset must fail closed.
+	dupManifest := hashA + "  bv_linux_amd64.tar.gz\n" + hashB + " *bv_linux_amd64.tar.gz\n"
+	if _, err := parseChecksumData([]byte(dupManifest)); err == nil || !strings.Contains(err.Error(), "duplicate checksum entry for bv_linux_amd64.tar.gz") {
+		t.Fatalf("expected duplicate checksum error across text/binary modes, got %v", err)
+	}
+
+	// Malformed digest or hashless binary-mode line for target asset must fail closed.
+	for _, bad := range []string{
+		"deadbeef *bv_linux_amd64.tar.gz\n",
+		"*bv_linux_amd64.tar.gz\n",
+	} {
+		if err := ensureNoMalformedChecksumLineForAsset([]byte(bad), "bv_linux_amd64.tar.gz"); err == nil {
+			t.Fatalf("expected ensureNoMalformedChecksumLineForAsset error for %q", bad)
+		}
+	}
+}

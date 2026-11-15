@@ -5,9 +5,9 @@
 | **all** | `j` | Move down |
 |  | `k` | Move up |
 | **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity** | `G` | Go to end |
-| **list,detail,board,insights,actionable,flow,attention,label,velocity** | `home` | Go to start |
+|  | `home` | Go to start |
 | **board,tree** | `gg` | Go to start |
-| **list,detail,board,graph,insights,tree,actionable,attention,velocity** | `ctrl+d` | Page down |
+| **list,detail,board,graph,insights,tree,actionable,flow,attention,label,velocity** | `ctrl+d` | Page down |
 |  | `ctrl+u` | Page up |
 | **list,detail,board,graph,insights,actionable,history** | `enter` | Open details |
 | **all** | `esc` | Back/close (list: clear filters) |
@@ -48,11 +48,11 @@
 |  | `N` | Previous changed issue (time travel) |
 | **list,detail** | `x` | Export to markdown |
 | **list,detail,board,graph,insights,tree,actionable,flow** | `y` | Copy issue ID |
-| **list,detail** | `C` | Copy full issue |
+| **list,detail,board,graph,insights,tree,actionable,flow,history** | `C` | Copy full issue |
 | **list,detail,board,graph,tree,actionable,insights,flow,history** | `O` | Open in $EDITOR |
 | **list** | `'` | Recipe picker |
 |  | `U` | Self-update check |
-| **list,detail,board,graph,insights,tree,actionable,history** | `V` | Cass sessions |
+| **list,detail,board,graph,insights,tree,actionable,flow,history** | `V` | Cass sessions |
 | **list,detail** | `\` | Toggle split view |
 | **graph** | `hjkl` | Navigate graph |
 |  | `H` | Scroll left |
@@ -108,6 +108,7 @@
 |  | `>` | Narrow detail panel |
 | **history** | `v` | Toggle git/bead mode |
 |  | `/` | Search history |
+|  | `A` | Filter by commit author |
 |  | `c` | Cycle confidence filter |
 |  | `tab` | Toggle focus |
 |  | `t` | Toggle timeline pane |
@@ -139,3 +140,4 @@
 | **sprint** | `P` | Close sprint dashboard |
 |  | `j` | Next sprint |
 |  | `k` | Previous sprint |
+|  | `enter` | Jump to first sprint bead |

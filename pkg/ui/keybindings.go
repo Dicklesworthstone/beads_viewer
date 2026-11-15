@@ -225,12 +225,12 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"j", "Move down", "Navigation", "all"},
 		{"k", "Move up", "Navigation", "all"},
 		{"G", "Go to end", "Navigation", "list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity"},
-		{"home", "Go to start", "Navigation", "list,detail,board,insights,actionable,flow,attention,label,velocity"},
+		{"home", "Go to start", "Navigation", "list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity"},
 		// gg is a 200 ms combo; only the board and tree implement it. In the
 		// list a single g opens the graph view.
 		{"gg", "Go to start", "Navigation", "board,tree"},
-		{"ctrl+d", "Page down", "Navigation", "list,detail,board,graph,insights,tree,actionable,attention,velocity"},
-		{"ctrl+u", "Page up", "Navigation", "list,detail,board,graph,insights,tree,actionable,attention,velocity"},
+		{"ctrl+d", "Page down", "Navigation", "list,detail,board,graph,insights,tree,actionable,flow,attention,label,velocity"},
+		{"ctrl+u", "Page up", "Navigation", "list,detail,board,graph,insights,tree,actionable,flow,attention,label,velocity"},
 		{"enter", "Open details", "Navigation", "list,detail,board,graph,insights,actionable,history"},
 		{"esc", "Back/close (list: clear filters)", "Navigation", "all"},
 		{"q", "Quit / close view", "Navigation", "all"},
@@ -276,11 +276,11 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"N", "Previous changed issue (time travel)", "Actions", "list"},
 		{"x", "Export to markdown", "Actions", "list,detail"},
 		{"y", "Copy issue ID", "Actions", "list,detail,board,graph,insights,tree,actionable,flow"},
-		{"C", "Copy full issue", "Actions", "list,detail"},
+		{"C", "Copy full issue", "Actions", "list,detail,board,graph,insights,tree,actionable,flow,history"},
 		{"O", "Open in $EDITOR", "Actions", "list,detail,board,graph,tree,actionable,insights,flow,history"},
 		{"'", "Recipe picker", "Actions", "list"},
 		{"U", "Self-update check", "Actions", "list"},
-		{"V", "Cass sessions", "Actions", "list,detail,board,graph,insights,tree,actionable,history"},
+		{"V", "Cass sessions", "Actions", "list,detail,board,graph,insights,tree,actionable,flow,history"},
 		{"\\", "Toggle split view", "Views", "list,detail"},
 
 		// Graph View (g)
@@ -348,6 +348,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		// History View (h)
 		{"v", "Toggle git/bead mode", "History", "history"},
 		{"/", "Search history", "History", "history"},
+		{"A", "Filter by commit author", "History", "history"},
 		{"c", "Cycle confidence filter", "History", "history"},
 		{"tab", "Toggle focus", "History", "history"},
 		{"t", "Toggle timeline pane", "History", "history"},
@@ -389,5 +390,6 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"P", "Close sprint dashboard", "Sprint", "sprint"},
 		{"j", "Next sprint", "Sprint", "sprint"},
 		{"k", "Previous sprint", "Sprint", "sprint"},
+		{"enter", "Jump to first sprint bead", "Sprint", "sprint"},
 	}
 }

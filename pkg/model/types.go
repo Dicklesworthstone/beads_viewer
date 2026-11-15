@@ -792,12 +792,20 @@ func (s *Sprint) Validate() error {
 	return nil
 }
 
-// IsActive returns true if the sprint is currently active (today is within the sprint dates)
-func (s *Sprint) IsActive() bool {
-	now := time.Now()
+// IsActiveAt reports whether the sprint is active at the given instant
+// (StartDate <= now <= EndDate, with both dates non-zero).
+func (s *Sprint) IsActiveAt(now time.Time) bool {
+	if s == nil {
+		return false
+	}
 	return !s.StartDate.IsZero() && !s.EndDate.IsZero() &&
 		(now.Equal(s.StartDate) || now.After(s.StartDate)) &&
 		(now.Equal(s.EndDate) || now.Before(s.EndDate))
+}
+
+// IsActive returns true if the sprint is currently active (today is within the sprint dates)
+func (s *Sprint) IsActive() bool {
+	return s.IsActiveAt(time.Now().UTC())
 }
 
 // Forecast represents an ETA prediction for a specific bead

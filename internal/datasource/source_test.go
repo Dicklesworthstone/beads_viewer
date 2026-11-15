@@ -9,12 +9,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -1620,5 +1622,454 @@ func TestDiscoverSources_SkipsLeftoverSQLiteInBDWorkspace(t *testing.T) {
 	}
 	if len(diffs) != 0 {
 		t.Fatalf("expected 0 false-positive source diffs in bd workspace, got %+v", diffs)
+	}
+}
+
+func TestSymlinkedSQLiteWALFreshnessValidationAndWatch(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real-sqlite")
+	beadsDir := filepath.Join(root, "workspace", ".beads")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	realDB := filepath.Join(realDir, "beads.db")
+	createTestSQLiteDB(t, realDB)
+	symlinkDB := filepath.Join(beadsDir, "beads.db")
+	if err := os.Symlink(realDB, symlinkDB); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	resolvedDB, err := filepath.EvalSymlinks(realDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realWAL := resolvedDB + "-wal"
+	realSHM := resolvedDB + "-shm"
+
+	// 1. Validation cache invalidates when real target WAL changes behind a symlinked beads.db.
+	cachedSource := DataSource{Type: SourceTypeSQLite, Path: symlinkDB, Valid: true, IssueCount: 2}
+	storeValidationCache(&cachedSource)
+	if hit, err := lookupValidationCache(&cachedSource, DefaultValidationOptions()); !hit || err != nil {
+		t.Fatalf("expected initial validation cache hit for symlinked SQLite, got hit=%v err=%v", hit, err)
+	}
+
+	// Perform a real WAL-mode SQLite write on resolvedDB so both SQLite validation and WAL freshness hold.
+	dbConn, err := sql.Open("sqlite", resolvedDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbConn.Close()
+	if _, err := dbConn.Exec(`PRAGMA journal_mode=WAL; INSERT INTO issues (id, title, status) VALUES ('TEST-3', 'WAL Issue', 'open');`); err != nil {
+		t.Fatal(err)
+	}
+
+	if hit, _ := lookupValidationCache(&cachedSource, DefaultValidationOptions()); hit {
+		t.Fatal("expected validation cache miss after WAL commit behind symlinked SQLite")
+	}
+
+	// 2. DiscoverSources and SourceFromFile fold real target WAL mtime into symlinked SQLite source ModTime.
+	baseMtime := time.Date(2026, 11, 10, 10, 0, 0, 0, time.UTC)
+	walMtime := baseMtime.Add(2 * time.Hour)
+	if err := os.Chtimes(resolvedDB, baseMtime, baseMtime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(realWAL, walMtime, walMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	discovered, err := DiscoverSources(DiscoveryOptions{BeadsDir: beadsDir, ValidateAfterDiscovery: true})
+	if err != nil {
+		t.Fatalf("DiscoverSources: %v", err)
+	}
+	if len(discovered) != 1 || discovered[0].Path != symlinkDB || !discovered[0].ModTime.Equal(walMtime) {
+		t.Fatalf("DiscoverSources = %+v, want symlinked SQLite with WAL ModTime %v", discovered, walMtime)
+	}
+	fromFile, ok, err := SourceFromFile(symlinkDB)
+	if err != nil || !ok {
+		t.Fatalf("SourceFromFile: ok=%v err=%v", ok, err)
+	}
+	if !fromFile.ModTime.Equal(walMtime) {
+		t.Fatalf("SourceFromFile.ModTime = %v, want WAL ModTime %v", fromFile.ModTime, walMtime)
+	}
+
+	// 3. SourceWatcher and AutoRefreshManager fire on real target WAL updates (and ignore -shm writes).
+	var armCallbacks atomic.Int32
+	armCh := make(chan DataSource, 4)
+	manager, err := NewAutoRefreshManager(discovered, AutoRefreshOptions{
+		WatcherOptions: WatcherOptions{Debounce: 15 * time.Millisecond, Logger: func(string) {}},
+		SelectionOptions: SelectionOptions{
+			PreferFreshest:      true,
+			MinimumValidSources: 1,
+		},
+		OnSourceChange: func(newSource DataSource, _ string) {
+			armCallbacks.Add(1)
+			select {
+			case armCh <- newSource:
+			default:
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAutoRefreshManager: %v", err)
+	}
+	manager.Start()
+	defer manager.Stop()
+
+	// Negative control: -shm metadata/unrelated sibling writes must not trigger AutoRefreshManager callback.
+	// (Note: never O_TRUNC a live WAL-mode SQLite -shm file while sql.DB holds a 32KB mmap on it, which raises SIGBUS.)
+	shmTouch := time.Now().Add(30 * time.Second)
+	if err := os.Chtimes(realSHM, shmTouch, shmTouch); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "unrelated.tmp"), []byte("ignore-me"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case unexpected := <-armCh:
+		t.Fatalf("unexpected source change callback on -shm/unrelated activity: %+v", unexpected)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	// Positive assertion: SQLite WAL commit advances WAL mtime and triggers AutoRefreshManager callback on symlinkDB.
+	if _, err := dbConn.Exec(`INSERT INTO issues (id, title, status) VALUES ('TEST-4', 'Second WAL Issue', 'open');`); err != nil {
+		t.Fatal(err)
+	}
+	laterWAL := time.Now().Add(time.Minute).Truncate(time.Millisecond)
+	if err := os.Chtimes(realWAL, laterWAL, laterWAL); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case updated := <-armCh:
+		if updated.Path != symlinkDB {
+			t.Fatalf("callback source path = %q, want %q", updated.Path, symlinkDB)
+		}
+		if updated.IssueCount != 4 {
+			t.Fatalf("callback IssueCount = %d, want 4", updated.IssueCount)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for AutoRefreshManager callback on symlinked SQLite WAL update (count=%d)", armCallbacks.Load())
+	}
+}
+
+func TestSQLiteReader_RecordsLoaderParseMetric(t *testing.T) {
+	wasEnabled := metrics.Enabled()
+	metrics.SetEnabled(true)
+	defer metrics.SetEnabled(wasEnabled)
+
+	dbPath := filepath.Join(t.TempDir(), "beads.db")
+	createTestSQLiteDB(t, dbPath)
+	src, ok, err := SourceFromFile(dbPath)
+	if err != nil || !ok {
+		t.Fatalf("SourceFromFile: ok=%v err=%v", ok, err)
+	}
+
+	reader, err := NewSQLiteReader(src)
+	if err != nil {
+		t.Fatalf("NewSQLiteReader: %v", err)
+	}
+	defer reader.Close()
+
+	before := metrics.LoaderParse.Count()
+	issues, err := reader.LoadIssues()
+	if err != nil {
+		t.Fatalf("LoadIssues: %v", err)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("len(issues) = %d, want 2", len(issues))
+	}
+	afterLoadIssues := metrics.LoaderParse.Count()
+	if afterLoadIssues != before+1 {
+		t.Fatalf("LoaderParse.Count() after LoadIssues = %d, want %d (no double-counting or omission)", afterLoadIssues, before+1)
+	}
+
+	if _, _, err := reader.LoadIssueSnapshot(); err != nil {
+		t.Fatalf("LoadIssueSnapshot: %v", err)
+	}
+	afterSnapshot := metrics.LoaderParse.Count()
+	if afterSnapshot != before+2 {
+		t.Fatalf("LoaderParse.Count() after LoadIssueSnapshot = %d, want %d", afterSnapshot, before+2)
+	}
+}
+
+func TestSourceWatcher_BurstWALWritesAndSymlinkRetarget(t *testing.T) {
+	root := t.TempDir()
+	realDirA := filepath.Join(root, "real-sqlite-a")
+	realDirB := filepath.Join(root, "real-sqlite-b")
+	beadsDir := filepath.Join(root, "workspace", ".beads")
+	for _, dir := range []string{realDirA, realDirB, beadsDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	realDBA := filepath.Join(realDirA, "beads.db")
+	createTestSQLiteDB(t, realDBA) // starts with 2 issues
+	symlinkDB := filepath.Join(beadsDir, "beads.db")
+	if err := os.Symlink(realDBA, symlinkDB); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+
+	resolvedDBA, err := filepath.EvalSymlinks(realDBA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbConnA, err := sql.Open("sqlite", resolvedDBA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbConnA.Close()
+	dbConnA.SetMaxOpenConns(1)
+	if _, err := dbConnA.Exec(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;`); err != nil {
+		t.Fatal(err)
+	}
+
+	discovered, err := DiscoverSources(DiscoveryOptions{BeadsDir: beadsDir, ValidateAfterDiscovery: true})
+	if err != nil || len(discovered) != 1 {
+		t.Fatalf("DiscoverSources = %+v, err=%v", discovered, err)
+	}
+
+	updatesCh := make(chan DataSource, 32)
+	manager, err := NewAutoRefreshManager(discovered, AutoRefreshOptions{
+		WatcherOptions: WatcherOptions{Debounce: 30 * time.Millisecond, Logger: func(string) {}},
+		SelectionOptions: SelectionOptions{
+			PreferFreshest:      true,
+			MinimumValidSources: 1,
+		},
+		OnSourceChange: func(newSource DataSource, _ string) {
+			updatesCh <- newSource
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewAutoRefreshManager: %v", err)
+	}
+	manager.Start()
+	defer manager.Stop()
+
+	// 1. Burst-write 10 rapid SQLite WAL transactions within <20ms through symlinkDB.
+	// Trailing-edge debounce must coalesce intermediate page writes and deliver the
+	// committed final count (2 + 10 = 12 issues), never dropping the final commit.
+	for i := 1; i <= 10; i++ {
+		if _, err := dbConnA.Exec(`INSERT INTO issues (id, title, status) VALUES (?, ?, 'open')`,
+			fmt.Sprintf("BURST-%d", i), fmt.Sprintf("Burst Issue %d", i)); err != nil {
+			t.Fatalf("burst insert %d: %v", i, err)
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+
+	deadline := time.After(2 * time.Second)
+	gotFinalBurst := false
+	for !gotFinalBurst {
+		select {
+		case updated := <-updatesCh:
+			if updated.Path == symlinkDB && updated.IssueCount == 12 {
+				gotFinalBurst = true
+			}
+		case <-deadline:
+			cur := manager.CurrentSource()
+			t.Fatalf("timed out waiting for IssueCount=12 after 10 rapid WAL transactions; current=%+v", cur)
+		}
+	}
+
+	// 2. Atomically retarget symlinkDB to realDirB/beads.db, then commit a WAL write in realDirB.
+	// SourceWatcher must dynamically add realDirB and realDirB/beads.db-wal to its fsnotify watches.
+	realDBB := filepath.Join(realDirB, "beads.db")
+	createTestSQLiteDB(t, realDBB) // 2 issues
+	resolvedDBB, err := filepath.EvalSymlinks(realDBB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbConnB, err := sql.Open("sqlite", resolvedDBB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbConnB.Close()
+	dbConnB.SetMaxOpenConns(1)
+	if _, err := dbConnB.Exec(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+		INSERT INTO issues (id, title, status) VALUES ('B-3', 'Target B 3', 'open'), ('B-4', 'Target B 4', 'open'), ('B-5', 'Target B 5', 'open');`); err != nil {
+		t.Fatal(err)
+	}
+
+	tmpLink := filepath.Join(beadsDir, "beads.db.next")
+	if err := os.Symlink(realDBB, tmpLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmpLink, symlinkDB); err != nil {
+		t.Fatal(err)
+	}
+
+	retargetDeadline := time.After(2 * time.Second)
+	gotRetarget := false
+	for !gotRetarget {
+		select {
+		case updated := <-updatesCh:
+			if updated.Path == symlinkDB && updated.IssueCount == 5 {
+				gotRetarget = true
+			}
+		case <-retargetDeadline:
+			t.Fatalf("timed out waiting for symlink retarget IssueCount=5; current=%+v", manager.CurrentSource())
+		}
+	}
+
+	// Subsequent WAL commit inside the newly retargeted directory realDirB must also fire.
+	if _, err := dbConnB.Exec(`INSERT INTO issues (id, title, status) VALUES ('B-6', 'Target B Post-Retarget WAL', 'open');`); err != nil {
+		t.Fatal(err)
+	}
+	postRetargetDeadline := time.After(2 * time.Second)
+	for {
+		select {
+		case updated := <-updatesCh:
+			if updated.Path == symlinkDB && updated.IssueCount == 6 {
+				return
+			}
+		case <-postRetargetDeadline:
+			t.Fatalf("timed out waiting for post-retarget WAL commit IssueCount=6; current=%+v", manager.CurrentSource())
+		}
+	}
+}
+
+func TestLoadIssuesSilent_ZeroStderrAndCorruptSiblingSQLiteGuard(t *testing.T) {
+	t.Setenv("BV_ROBOT", "")
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BEADS_DIR", "")
+
+	repoDir := t.TempDir()
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Declare beads.db + issues.jsonl in metadata.json so AttachIssueOrigins binds Origin.Database.
+	meta := `{"database":"beads.db","jsonl_export":"issues.jsonl","backend":"sqlite"}`
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(meta), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Older corrupt sibling beads.db + merge artifact that would normally emit stderr warnings.
+	corruptDBPath := filepath.Join(beadsDir, "beads.db")
+	if err := os.WriteFile(corruptDBPath, []byte("corrupt sqlite database bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.left.jsonl"), []byte(sidecarIssueA+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Newer issues.jsonl with 20 valid issues + 1 malformed line (<10% error rate, emits parse warning).
+	var sb strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&sb, "{\"id\":\"ISS-%d\",\"title\":\"Issue %d\",\"status\":\"open\",\"issue_type\":\"task\"}\n", i, i)
+	}
+	sb.WriteString("{malformed json line\n")
+	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(issuesPath, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	older := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+	newer := older.Add(5 * time.Minute)
+	if err := os.Chtimes(corruptDBPath, older, older); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(issuesPath, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+
+	var loaded LoadResult
+	var loadErr error
+	stderr := captureStderr(t, func() {
+		loaded, loadErr = LoadIssuesSilent(repoDir)
+	})
+	if loadErr != nil {
+		t.Fatalf("LoadIssuesSilent error = %v", loadErr)
+	}
+	if stderr != "" {
+		t.Fatalf("LoadIssuesSilent wrote to os.Stderr: %q", stderr)
+	}
+	if loaded.Source.Path != issuesPath {
+		t.Fatalf("selected source = %q, want %q", loaded.Source.Path, issuesPath)
+	}
+	if len(loaded.Issues) != 20 {
+		t.Fatalf("len(Issues) = %d, want 20", len(loaded.Issues))
+	}
+	if loaded.Report.WarningCount != 1 || len(loaded.Report.Warnings) != 1 {
+		t.Fatalf("expected 1 captured parse warning in Report, got %+v", loaded.Report)
+	}
+	if !loaded.Report.Stale {
+		t.Fatalf("expected Report.Stale=true when sibling beads.db is corrupt: %+v", loaded.Report)
+	}
+	foundSiblingWarn := false
+	for _, w := range loaded.Report.AuthorityWarnings {
+		if strings.Contains(w, "sibling SQLite source") && strings.Contains(w, "failed validation") {
+			foundSiblingWarn = true
+			break
+		}
+	}
+	if !foundSiblingWarn {
+		t.Fatalf("expected sibling SQLite validation warning in AuthorityWarnings, got %v", loaded.Report.AuthorityWarnings)
+	}
+	for _, iss := range loaded.Issues {
+		if iss.Origin == nil {
+			t.Fatalf("issue %s missing Origin", iss.ID)
+		}
+		if iss.Origin.Database != "" {
+			t.Fatalf("issue %s Origin.Database = %q, want empty when sibling beads.db is corrupt", iss.ID, iss.Origin.Database)
+		}
+		if iss.Origin.ReadOnlyReason != "sibling SQLite database is corrupt" {
+			t.Fatalf("issue %s Origin.ReadOnlyReason = %q, want %q", iss.ID, iss.Origin.ReadOnlyReason, "sibling SQLite database is corrupt")
+		}
+	}
+
+	// [R2-A1] Non-silent LoadIssues and direct LoadFromSource must enforce the exact same corrupt sibling SQLite guard.
+	t.Setenv("BV_ROBOT", "1")
+	cliLoaded, cliErr := LoadIssues(repoDir)
+	if cliErr != nil {
+		t.Fatalf("LoadIssues(repoDir) error = %v", cliErr)
+	}
+	if !cliLoaded.Report.Stale || len(cliLoaded.Report.AuthorityWarnings) == 0 {
+		t.Fatalf("LoadIssues(repoDir) expected Stale=true and AuthorityWarnings on corrupt sibling beads.db, got %+v", cliLoaded.Report)
+	}
+	for _, iss := range cliLoaded.Issues {
+		if iss.Origin == nil || iss.Origin.Database != "" || iss.Origin.ReadOnlyReason != "sibling SQLite database is corrupt" {
+			t.Fatalf("LoadIssues issue %s Origin = %+v, want empty Database and corrupt ReadOnlyReason", iss.ID, iss.Origin)
+		}
+	}
+
+	directLoaded, directErr := LoadFromSource(DataSource{Type: SourceTypeJSONLLocal, Path: issuesPath})
+	if directErr != nil {
+		t.Fatalf("LoadFromSource(issues.jsonl) error = %v", directErr)
+	}
+	if !directLoaded.Report.Stale || len(directLoaded.Report.AuthorityWarnings) == 0 {
+		t.Fatalf("LoadFromSource(issues.jsonl) expected Stale=true and AuthorityWarnings on corrupt sibling beads.db, got %+v", directLoaded.Report)
+	}
+	for _, iss := range directLoaded.Issues {
+		if iss.Origin == nil || iss.Origin.Database != "" || iss.Origin.ReadOnlyReason != "sibling SQLite database is corrupt" {
+			t.Fatalf("LoadFromSource issue %s Origin = %+v, want empty Database and corrupt ReadOnlyReason", iss.ID, iss.Origin)
+		}
+	}
+	t.Setenv("BV_ROBOT", "")
+
+	// Also verify bd workspace fallback in LoadIssuesSilent never writes to os.Stderr.
+	bdRepo, bdBeads := makeBDWorkspace(t)
+	hideBD(t, bdRepo)
+	if err := os.WriteFile(filepath.Join(bdBeads, "issues.jsonl"), []byte(sidecarIssueA+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var bdLoaded LoadResult
+	var bdErr error
+	bdStderr := captureStderr(t, func() {
+		bdLoaded, bdErr = LoadIssuesSilent(bdRepo)
+	})
+	if bdErr != nil {
+		t.Fatalf("LoadIssuesSilent(bdRepo) error = %v", bdErr)
+	}
+	if bdStderr != "" {
+		t.Fatalf("LoadIssuesSilent(bdRepo) wrote to os.Stderr: %q", bdStderr)
+	}
+	if !bdLoaded.Report.Stale || len(bdLoaded.Report.AuthorityWarnings) == 0 {
+		t.Fatalf("expected AuthorityWarnings captured on bd fallback, got %+v", bdLoaded.Report)
 	}
 }

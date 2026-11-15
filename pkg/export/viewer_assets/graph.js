@@ -227,6 +227,7 @@ class GraphStore {
     constructor() {
         this.graph = null;
         this.wasmGraph = null;
+        this.activeWasmGraph = null;
         this.wasmReady = false;
         this.container = null;
         this.resizeObserver = null;
@@ -763,12 +764,27 @@ function buildWasmGraph() {
             store.wasmGraph.free();
             store.wasmGraph = null;
         }
+        if (store.activeWasmGraph) {
+            store.activeWasmGraph.free();
+            store.activeWasmGraph = null;
+        }
+
+        const resolvedIds = new Set(window.beadsViewer?.getResolvedIssueIDs?.() || []);
+        store.issues.forEach(issue => {
+            if (isResolvedIssue(issue)) {
+                resolvedIds.add(issue.id);
+            }
+        });
 
         store.wasmGraph = DiGraph.withCapacity(store.issues.length, store.dependencies.length);
+        store.activeWasmGraph = DiGraph.withCapacity(store.issues.length, store.dependencies.length);
 
-        // Add all nodes
+        // Add all nodes to full graph; exclude closed/tombstone from active graph
         store.issues.forEach(issue => {
             store.wasmGraph.addNode(issue.id);
+            if (!resolvedIds.has(issue.id)) {
+                store.activeWasmGraph.addNode(issue.id);
+            }
         });
 
         // Add blocking edges
@@ -780,12 +796,19 @@ function buildWasmGraph() {
                 const fromIdx = store.wasmGraph.addNode(d.issue_id);
                 const toIdx = store.wasmGraph.addNode(d.depends_on_id);
                 store.wasmGraph.addEdge(fromIdx, toIdx);
+
+                if (!resolvedIds.has(d.issue_id) && !resolvedIds.has(d.depends_on_id)) {
+                    const activeFromIdx = store.activeWasmGraph.addNode(d.issue_id);
+                    const activeToIdx = store.activeWasmGraph.addNode(d.depends_on_id);
+                    store.activeWasmGraph.addEdge(activeFromIdx, activeToIdx);
+                }
             });
 
-        console.log(`[bv-graph] WASM graph: ${store.wasmGraph.nodeCount()} nodes, ${store.wasmGraph.edgeCount()} edges`);
+        console.log(`[bv-graph] WASM graph: ${store.wasmGraph.nodeCount()} nodes, ${store.wasmGraph.edgeCount()} edges (active: ${store.activeWasmGraph.nodeCount()} nodes, ${store.activeWasmGraph.edgeCount()} edges)`);
     } catch (e) {
         console.warn('[bv-graph] Failed to build WASM graph:', e);
         store.wasmGraph = null;
+        store.activeWasmGraph = null;
     }
 }
 
@@ -799,13 +822,14 @@ function computeMetrics() {
     if (!store.wasmReady || !store.wasmGraph) return;
 
     const start = performance.now();
+    const activeGraph = store.activeWasmGraph || store.wasmGraph;
 
     try {
         // PageRank (importance)
         if (!store.metrics.pagerank) store.metrics.pagerank = store.wasmGraph.pagerankDefault();
 
-        // Critical path heights (depth)
-        store.metrics.criticalPath = store.wasmGraph.criticalPathHeights();
+        // Critical path heights (depth on active DAG, unaffected by closed cycles)
+        store.metrics.criticalPath = activeGraph.criticalPathHeights();
 
         // Eigenvector (influence)
         store.metrics.eigenvector = store.wasmGraph.eigenvectorDefault();
@@ -828,11 +852,17 @@ function computeMetrics() {
             console.warn('[bv-graph] HITS computation skipped:', e);
         }
 
-        // Slack (schedule flexibility - 0 means on critical path)
-        try {
-            store.metrics.slack = store.wasmGraph.slack();
-        } catch (e) {
-            console.warn('[bv-graph] Slack computation skipped:', e);
+        // Slack (topological float in hops - only valid on active acyclic DAGs)
+        const hasCycles = Boolean(activeGraph.hasCycles());
+        store.metrics.hasCycles = hasCycles;
+        if (!hasCycles) {
+            try {
+                store.metrics.slack = activeGraph.slack();
+            } catch (e) {
+                console.warn('[bv-graph] Slack computation skipped:', e);
+            }
+        } else {
+            store.metrics.slack = null;
         }
 
         // Articulation points (cut vertices - removing them disconnects the graph)
@@ -852,8 +882,8 @@ function computeMetrics() {
             console.warn('[bv-graph] Articulation points computation skipped:', e);
         }
 
-        // Cycles
-        const cycleResult = store.wasmGraph.enumerateCycles(100);
+        // Cycles (enumerated on active graph so closed historical cycles are ignored)
+        const cycleResult = activeGraph.enumerateCycles(100);
         store.metrics.cycles = cycleResult;
 
         const elapsed = performance.now() - start;
@@ -1192,8 +1222,10 @@ function prepareGraphData(layout = null) {
         }));
 
     // Enrich nodes with computed data
+    const activeGraph = store.activeWasmGraph || store.wasmGraph;
     nodes = nodes.map(issue => {
         const idx = store.wasmReady ? store.wasmGraph?.nodeIdx(issue.id) : undefined;
+        const activeIdx = store.wasmReady ? activeGraph?.nodeIdx(issue.id) : undefined;
         const pos = layout?.positions?.[issue.id]; // Pre-computed position
         const blockerCount = issue.blocker_count
             ?? dependencies.filter(d => isBlockingDependency(d) && d.issue_id === issue.id).length;
@@ -1215,10 +1247,10 @@ function prepareGraphData(layout = null) {
             // Metrics computed on the currently loaded graph.
             pagerank: idx !== undefined && metrics.pagerank ? metrics.pagerank[idx] : 0,
             betweenness: idx !== undefined && metrics.betweenness ? metrics.betweenness[idx] : 0,
-            criticalDepth: idx !== undefined && metrics.criticalPath ? metrics.criticalPath[idx] : 0,
+            criticalDepth: activeIdx !== undefined && metrics.criticalPath ? metrics.criticalPath[activeIdx] : 0,
             eigenvector: idx !== undefined && metrics.eigenvector ? metrics.eigenvector[idx] : 0,
             kcore: idx !== undefined && metrics.kcore ? metrics.kcore[idx] : 0,
-            slack: idx !== undefined && metrics.slack ? metrics.slack[idx] : undefined,
+            slack: activeIdx !== undefined ? (metrics.slack ? (metrics.slack[activeIdx] ?? null) : null) : null,
             hitsHub: idx !== undefined && metrics.hits?.hub ? metrics.hits.hub[idx] : undefined,
             hitsAuth: idx !== undefined && metrics.hits?.authority ? metrics.hits.authority[idx] : undefined,
             inDegree: idx !== undefined && store.wasmGraph ? store.wasmGraph.inDegree(idx) : dependentCount,
@@ -1241,12 +1273,12 @@ function prepareGraphData(layout = null) {
         };
     });
 
-    // Mark cycle nodes from the current graph.
+    // Mark active cycle nodes from the current active graph.
     if (metrics.cycles?.cycles) {
         const cycleNodes = new Set(metrics.cycles.cycles.flat());
         nodes.forEach(node => {
-            const idx = store.wasmGraph?.nodeIdx(node.id);
-            node.inCycle = idx !== undefined && cycleNodes.has(idx);
+            const activeIdx = activeGraph?.nodeIdx(node.id);
+            node.inCycle = activeIdx !== undefined && cycleNodes.has(activeIdx);
         });
     }
 
@@ -1521,38 +1553,35 @@ function getLinkColor(link) {
         return THEME.accent.pink; // Distinct color for cross-label dependencies
     }
 
-    // Heatmap mode: color links by slack/urgency of connected nodes
-    // Low slack = urgent (orange/red), high slack = relaxed (cyan/blue)
-    // Only apply if at least one node has real slack data (not undefined/Infinity)
-    if (store.heatmapMode && sourceNode && targetNode) {
+    // Heatmap mode: color links by topological hop slack of connected nodes (acyclic DAGs only)
+    // Zero slack = critical path (red), higher hop float = relaxed (cyan)
+    if (store.heatmapMode && !store.metrics.hasCycles && sourceNode && targetNode) {
         const srcSlack = sourceNode.slack;
         const tgtSlack = targetNode.slack;
-        // Only color by slack if at least one node has real slack data
-        const srcHasSlack = srcSlack !== undefined && srcSlack !== null && srcSlack !== Infinity;
-        const tgtHasSlack = tgtSlack !== undefined && tgtSlack !== null && tgtSlack !== Infinity;
+        const srcHasSlack = srcSlack !== undefined && srcSlack !== null && Number.isFinite(srcSlack);
+        const tgtHasSlack = tgtSlack !== undefined && tgtSlack !== null && Number.isFinite(tgtSlack);
 
         if (srcHasSlack || tgtHasSlack) {
-            // Use minimum slack of nodes that have data
             const minSlack = Math.min(
                 srcHasSlack ? srcSlack : Infinity,
                 tgtHasSlack ? tgtSlack : Infinity
             );
 
-            // Normalize slack (0-14 days typical range, cap at 14)
-            const normalizedSlack = Math.min(minSlack, 14) / 14;
+            // Normalize slack in dependency hops (0..maxHopScale hops, minimum scale of 5 hops)
+            const maxHopScale = Math.max(store.maxMetrics.slack || 0, 5);
+            const normalizedSlack = Math.min(minSlack, maxHopScale) / maxHopScale;
 
-            // Color gradient: red (urgent) -> orange -> yellow -> cyan (relaxed)
+            // Color gradient: red (0 hops critical) -> orange -> yellow -> cyan (high hop float)
             if (normalizedSlack < 0.25) {
-                return THEME.priority[0] + 'aa'; // Red with alpha (very urgent)
+                return THEME.priority[0] + 'aa'; // Red with alpha (critical / 0-1 hop slack)
             } else if (normalizedSlack < 0.5) {
-                return THEME.priority[1] + 'aa'; // Orange (moderately urgent)
+                return THEME.priority[1] + 'aa'; // Orange (low hop float)
             } else if (normalizedSlack < 0.75) {
-                return THEME.accent.yellow + 'aa'; // Yellow (some slack)
+                return THEME.accent.yellow + 'aa'; // Yellow (moderate hop float)
             } else {
-                return THEME.accent.cyan + '88'; // Cyan (plenty of slack)
+                return THEME.accent.cyan + '88'; // Cyan (high hop float)
             }
         }
-        // If neither node has slack data, fall through to default color
     }
 
     return THEME.link.default;
@@ -1710,14 +1739,35 @@ function handleNodeClick(node, event) {
     // Ctrl+click: show dependencies
     // Regular click: select
 
-    if (event.shiftKey) {
-        performWhatIf(node);
-    } else if (event.ctrlKey || event.metaKey) {
+    if (event?.shiftKey) {
+        if (whatIfState.active && whatIfState.sourceNodes.length > 0) {
+            const exists = whatIfState.sourceNodes.some(n => n.id === node.id);
+            if (exists) {
+                const remaining = whatIfState.sourceNodes.filter(n => n.id !== node.id);
+                if (remaining.length === 0) {
+                    resetWhatIf();
+                } else if (remaining.length === 1) {
+                    performWhatIf(remaining[0]);
+                } else {
+                    performBatchWhatIf(remaining);
+                }
+            } else {
+                performBatchWhatIf([...whatIfState.sourceNodes, node]);
+            }
+        } else {
+            performWhatIf(node);
+        }
+    } else if (event?.ctrlKey || event?.metaKey) {
         highlightDependencyPath(node);
     } else {
-        // If what-if is active, reset it
         if (whatIfState.active) {
             resetWhatIf();
+        }
+        if (criticalPathState.active) {
+            resetCriticalPath();
+        }
+        if (cycleNavigatorState.active) {
+            resetCycleNavigator();
         }
         selectNode(node);
     }
@@ -1791,17 +1841,27 @@ function handleZoom(transform) {
 const whatIfState = {
     active: false,
     sourceNode: null,
+    sourceNodes: [],
     unblockedNodes: new Set(),
     animationPhase: 0,
     animationTimer: null,
     unblockTimers: new Set()
 };
 
+function resolveGraphNodeObject(nodeOrId) {
+    if (!nodeOrId) return null;
+    if (typeof nodeOrId === 'string') {
+        return store.graph?.graphData()?.nodes?.find(n => n.id === nodeOrId) || store.nodeMap.get(nodeOrId) || null;
+    }
+    return nodeOrId;
+}
+
 /**
  * Perform what-if simulation for closing an issue
- * @param {Object} node - The node to simulate closing
+ * @param {Object|string} nodeInput - The node (or node ID) to simulate closing
  */
-export function performWhatIf(node) {
+export function performWhatIf(nodeInput) {
+    const node = resolveGraphNodeObject(nodeInput);
     if (!node || !store.wasmReady || !store.wasmGraph) {
         console.warn('[bv-graph] What-if: WASM not ready');
         return null;
@@ -1832,8 +1892,54 @@ export function performWhatIf(node) {
     }
 
     // Animate the cascade
-    animateWhatIfCascade(node, result);
+    animateWhatIfCascade([node], result);
 
+    return result;
+}
+
+/**
+ * Perform multi-node batch what-if simulation using WASM whatIfCloseBatch
+ * @param {Array<Object|string>} nodesInput - Array of nodes or node IDs to simulate closing together
+ */
+export function performBatchWhatIf(nodesInput) {
+    if (!Array.isArray(nodesInput) || nodesInput.length === 0 || !store.wasmReady || !store.wasmGraph) {
+        return null;
+    }
+
+    const uniqueNodes = [];
+    const seenIds = new Set();
+    for (const item of nodesInput) {
+        const node = resolveGraphNodeObject(item);
+        if (!node || seenIds.has(node.id)) continue;
+        if (isResolvedIssue(node)) {
+            showToast(`Issue ${node.id} is already resolved`, 'info');
+            continue;
+        }
+        seenIds.add(node.id);
+        uniqueNodes.push(node);
+    }
+
+    if (uniqueNodes.length === 0) return null;
+    if (uniqueNodes.length === 1) return performWhatIf(uniqueNodes[0]);
+
+    const indices = uniqueNodes
+        .map(n => store.wasmGraph.nodeIdx(n.id))
+        .filter(idx => idx !== undefined);
+    if (indices.length === 0) return null;
+
+    const closedSet = buildClosedSet();
+    let result;
+    try {
+        result = store.wasmGraph.whatIfCloseBatch(new Uint32Array(indices), closedSet);
+        if (typeof result === 'string') {
+            result = JSON.parse(result);
+        }
+    } catch (e) {
+        console.error('[bv-graph] Batch what-if computation failed:', e);
+        return null;
+    }
+
+    animateWhatIfCascade(uniqueNodes, result);
     return result;
 }
 
@@ -1862,14 +1968,19 @@ function buildClosedSet() {
 }
 
 /**
- * Animate the what-if cascade effect
+ * Animate the what-if cascade effect (supports single or multi-node batch close)
  */
-function animateWhatIfCascade(sourceNode, result) {
+function animateWhatIfCascade(sourceNodesInput, result) {
+    const sourceNodes = Array.isArray(sourceNodesInput) ? sourceNodesInput : [sourceNodesInput];
+    const primarySource = sourceNodes[0] || null;
+    const sourceIdSet = new Set(sourceNodes.map(n => n.id));
+
     // Clear any existing animation
     resetWhatIf();
 
     whatIfState.active = true;
-    whatIfState.sourceNode = sourceNode;
+    whatIfState.sourceNode = primarySource;
+    whatIfState.sourceNodes = sourceNodes;
     whatIfState.unblockedNodes.clear();
 
     // Get unblocked node IDs
@@ -1877,34 +1988,36 @@ function animateWhatIfCascade(sourceNode, result) {
         return store.wasmGraph.nodeId(idx);
     }).filter(Boolean);
 
-    // Phase 1: Highlight the source node (pulse green, "closing")
+    // Phase 1: Highlight the source node(s) (pulse green, "closing")
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
-    store.highlightedNodes.add(sourceNode.id);
-
-    // Add closing visual state to source
     const graphData = store.graph.graphData();
-    const sourceGraphNode = graphData.nodes.find(n => n.id === sourceNode.id);
-    if (sourceGraphNode) {
-        sourceGraphNode._whatIfState = 'closing';
-    }
+    sourceNodes.forEach(src => {
+        store.highlightedNodes.add(src.id);
+        const sourceGraphNode = graphData.nodes.find(n => n.id === src.id);
+        if (sourceGraphNode) {
+            sourceGraphNode._whatIfState = 'closing';
+        }
+    });
 
     refreshGraph();
-    dispatchEvent('whatIfStart', { node: sourceNode, result });
+    dispatchEvent('whatIfStart', { node: primarySource, nodes: sourceNodes, result });
 
     // Phase 2: Ripple out to unblocked nodes with staggered animation
     whatIfState.animationPhase = 1;
     let delay = 300;
+    const runToken = whatIfState.sourceNodes;
 
     unblockedIds.forEach((id, i) => {
         const timer = setTimeout(() => {
             whatIfState.unblockTimers.delete(timer);
-            if (!whatIfState.active || whatIfState.sourceNode !== sourceNode) return;
+            if (!whatIfState.active || whatIfState.sourceNodes !== runToken) return;
             whatIfState.unblockedNodes.add(id);
             store.highlightedNodes.add(id);
 
-            // Mark node as unblocked
-            const unblockedNode = graphData.nodes.find(n => n.id === id);
+            // Mark node as unblocked on current graphData (handles mid-animation filter rebuilds)
+            const currentGraphData = store.graph?.graphData();
+            const unblockedNode = currentGraphData?.nodes?.find(n => n.id === id);
             if (unblockedNode) {
                 unblockedNode._whatIfState = 'unblocked';
             }
@@ -1913,7 +2026,7 @@ function animateWhatIfCascade(sourceNode, result) {
             store.dependencies.forEach(dep => {
                 if (!isBlockingDependency(dep) || dep.issue_id !== id) return;
                 const blocker = store.nodeMap.get(dep.depends_on_id);
-                if (dep.depends_on_id === sourceNode.id || (blocker && isResolvedIssue(blocker))) {
+                if (sourceIdSet.has(dep.depends_on_id) || (blocker && isResolvedIssue(blocker))) {
                     store.highlightedLinks.add(`${id}-${dep.depends_on_id}`);
                 }
             });
@@ -1928,20 +2041,26 @@ function animateWhatIfCascade(sourceNode, result) {
     const summaryDelay = delay + unblockedIds.length * 150 + 200;
     whatIfState.animationTimer = setTimeout(() => {
         whatIfState.animationPhase = 2;
-        showWhatIfSummary(sourceNode, result, unblockedIds);
+        showWhatIfSummary(sourceNodes, result, unblockedIds);
     }, summaryDelay);
 }
 
 /**
  * Show what-if summary popup
  */
-function showWhatIfSummary(sourceNode, result, unblockedIds) {
+function showWhatIfSummary(sourceNodesInput, result, unblockedIds) {
+    const sourceNodes = Array.isArray(sourceNodesInput) ? sourceNodesInput : [sourceNodesInput];
+    const sourceNode = sourceNodes[0] || null;
+    const label = sourceNodes.length > 1
+        ? `${sourceNodes.map(n => n.id).join(' + ')} (${sourceNodes.length} issues)`
+        : (sourceNode?.id || 'issue');
     const directCount = result.direct_unblocks || unblockedIds.length;
     const transitiveCount = result.transitive_unblocks || directCount;
     const parallelGain = result.parallel_gain || 0;
 
     dispatchEvent('whatIfComplete', {
         node: sourceNode,
+        nodes: sourceNodes,
         directUnblocks: directCount,
         transitiveUnblocks: transitiveCount,
         parallelGain: parallelGain,
@@ -1951,12 +2070,12 @@ function showWhatIfSummary(sourceNode, result, unblockedIds) {
     // Create summary toast
     if (directCount > 0) {
         showToast(
-            `Closing ${sourceNode.id} would unblock ${directCount} issue${directCount > 1 ? 's' : ''} directly` +
+            `Closing ${label} would unblock ${directCount} issue${directCount > 1 ? 's' : ''} directly` +
             (transitiveCount > directCount ? `, ${transitiveCount} total in cascade` : ''),
             'success'
         );
     } else {
-        showToast(`Closing ${sourceNode.id} would not immediately unblock any issues`, 'info');
+        showToast(`Closing ${label} would not immediately unblock any issues`, 'info');
     }
 }
 
@@ -1981,6 +2100,7 @@ export function resetWhatIf() {
 
     whatIfState.active = false;
     whatIfState.sourceNode = null;
+    whatIfState.sourceNodes = [];
     whatIfState.unblockedNodes.clear();
     whatIfState.animationPhase = 0;
 
@@ -2002,95 +2122,205 @@ export function isWhatIfActive() {
  * Get what-if state
  */
 export function getWhatIfState() {
-    return {
+    const state = {
         active: whatIfState.active,
         sourceNode: whatIfState.sourceNode,
         unblockedCount: whatIfState.unblockedNodes.size
     };
+    if (whatIfState.sourceNodes.length > 1) {
+        state.sourceNodes = whatIfState.sourceNodes.map(n => n.id);
+    }
+    return state;
+}
+
+/**
+ * Get batch what-if selected source node IDs
+ */
+export function getBatchWhatIfSourceIds() {
+    return whatIfState.sourceNodes.map(n => n.id);
 }
 
 // ============================================================================
 // CRITICAL PATH ANIMATION
 // ============================================================================
 
-// Critical path animation state
+// Critical path animation & [1/N] kCriticalPaths stepper state
 const criticalPathState = {
     active: false,
-    path: [],           // Node IDs in path order
-    pathIndices: [],    // Node indices in path order
+    paths: [],          // Array of { ids: string[], indices: number[], length: number }
+    currentIndex: 0,
+    path: [],           // Node IDs in active path order
+    pathIndices: [],    // Node indices in active path order
     currentStep: 0,
     animationTimer: null,
     pathLength: 0
 };
 
-/**
- * Animate the critical path traversal
- * @param {boolean} animate - Whether to animate or just highlight
- */
-export function animateCriticalPath(animate = true) {
-    if (!store.wasmReady || !store.wasmGraph) {
-        console.warn('[bv-graph] Critical path: WASM not ready');
-        return null;
+function emitCriticalPathChange() {
+    dispatchEvent('criticalPathChange', {
+        active: criticalPathState.active,
+        currentIndex: criticalPathState.currentIndex,
+        pathCount: criticalPathState.paths.length,
+        path: [...criticalPathState.path],
+        length: criticalPathState.pathLength,
+        pathLabel: criticalPathState.path.join(' → ')
+    });
+}
+
+function computeTopCriticalPaths(k = 5) {
+    const activeGraph = store.activeWasmGraph || store.wasmGraph;
+    if (!store.wasmReady || !activeGraph || activeGraph.hasCycles()) {
+        return [];
     }
-
-    // Reset any existing animation
-    resetCriticalPath();
-
-    // Get the longest critical path using kCriticalPaths(1)
     let pathResult;
     try {
-        pathResult = store.wasmGraph.kCriticalPathsDefault();
+        pathResult = typeof activeGraph.kCriticalPaths === 'function'
+            ? activeGraph.kCriticalPaths(k)
+            : activeGraph.kCriticalPathsDefault();
         if (typeof pathResult === 'string') {
             pathResult = JSON.parse(pathResult);
         }
     } catch (e) {
         console.error('[bv-graph] Critical path computation failed:', e);
+        return [];
+    }
+    if (!Array.isArray(pathResult?.paths)) return [];
+    return pathResult.paths
+        .map(entry => {
+            const indices = Array.isArray(entry?.nodes) ? entry.nodes : [];
+            const ids = indices.map(idx => activeGraph.nodeId(idx)).filter(Boolean);
+            return {
+                ids,
+                indices,
+                length: entry?.length ?? ids.length
+            };
+        })
+        .filter(entry => entry.ids.length > 0);
+}
+
+/**
+ * Highlight a specific critical path [0..N-1] from kCriticalPaths(5)
+ * @param {number} index - 0-based path index
+ * @param {boolean} animate - Whether to animate traversal
+ */
+export function highlightCriticalPathByIndex(index = 0, animate = false) {
+    const activeGraph = store.activeWasmGraph || store.wasmGraph;
+    if (!store.wasmReady || !activeGraph) {
+        console.warn('[bv-graph] Critical path: WASM not ready');
         return null;
     }
 
-    if (!pathResult?.paths?.length || !pathResult.paths[0]?.nodes?.length) {
-        showToast('No critical path found (graph may be empty or cyclic)', 'info');
-        return null;
+    if (!criticalPathState.paths.length) {
+        const computed = computeTopCriticalPaths(5);
+        if (!computed.length) {
+            showToast('No critical path found (graph may be empty or cyclic)', 'info');
+            return null;
+        }
+        criticalPathState.paths = computed;
     }
 
-    const longestPath = pathResult.paths[0];
-    criticalPathState.pathIndices = longestPath.nodes;
-    criticalPathState.pathLength = longestPath.length;
-
-    // Convert indices to node IDs
-    criticalPathState.path = longestPath.nodes.map(idx =>
-        store.wasmGraph.nodeId(idx)
-    ).filter(Boolean);
-
-    if (criticalPathState.path.length === 0) {
-        showToast('Critical path nodes not found in graph', 'warning');
-        return null;
+    if (criticalPathState.animationTimer) {
+        clearTimeout(criticalPathState.animationTimer);
+        criticalPathState.animationTimer = null;
     }
+    const graphData = store.graph?.graphData();
+    if (graphData) {
+        graphData.nodes.forEach(node => {
+            delete node._criticalPathState;
+        });
+    }
+
+    const total = criticalPathState.paths.length;
+    const normalizedIdx = ((index % total) + total) % total;
+    const chosen = criticalPathState.paths[normalizedIdx];
 
     criticalPathState.active = true;
+    criticalPathState.currentIndex = normalizedIdx;
+    criticalPathState.path = [...chosen.ids];
+    criticalPathState.pathIndices = [...chosen.indices];
+    criticalPathState.pathLength = chosen.length;
+    criticalPathState.currentStep = animate ? 0 : chosen.ids.length;
+
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
 
+    emitCriticalPathChange();
     dispatchEvent('criticalPathStart', {
+        currentIndex: normalizedIdx,
+        pathCount: total,
         pathLength: criticalPathState.pathLength,
         nodeCount: criticalPathState.path.length
     });
 
     if (animate) {
-        // Animate traversal from source to sink
         animateCriticalPathTraversal();
     } else {
-        // Just highlight all at once
-        criticalPathState.path.forEach(id => store.highlightedNodes.add(id));
+        criticalPathState.path.forEach(id => {
+            store.highlightedNodes.add(id);
+            const gNode = graphData?.nodes?.find(n => n.id === id);
+            if (gNode) gNode._criticalPathState = 'active';
+        });
         highlightCriticalPathLinks();
         refreshGraph();
         showCriticalPathSummary();
     }
 
     return {
-        path: criticalPathState.path,
+        currentIndex: normalizedIdx,
+        pathCount: total,
+        path: [...criticalPathState.path],
         length: criticalPathState.pathLength
     };
+}
+
+/**
+ * Animate the critical path traversal
+ * @param {boolean} animate - Whether to animate or just highlight
+ */
+export function animateCriticalPath(animate = true) {
+    const activeGraph = store.activeWasmGraph || store.wasmGraph;
+    if (!store.wasmReady || !activeGraph) {
+        console.warn('[bv-graph] Critical path: WASM not ready');
+        return null;
+    }
+
+    resetCriticalPath();
+    criticalPathState.paths = computeTopCriticalPaths(5);
+    if (!criticalPathState.paths.length) {
+        showToast('No critical path found (graph may be empty or cyclic)', 'info');
+        return null;
+    }
+
+    return highlightCriticalPathByIndex(0, animate);
+}
+
+/**
+ * Step to next critical path [1/N]
+ */
+export function nextCriticalPath() {
+    if (!criticalPathState.active || criticalPathState.paths.length === 0) {
+        return animateCriticalPath(false);
+    }
+    return highlightCriticalPathByIndex(criticalPathState.currentIndex + 1, false);
+}
+
+/**
+ * Step to previous critical path [1/N]
+ */
+export function prevCriticalPath() {
+    if (!criticalPathState.active || criticalPathState.paths.length === 0) {
+        return animateCriticalPath(false);
+    }
+    return highlightCriticalPathByIndex(criticalPathState.currentIndex - 1, false);
+}
+
+/**
+ * Zoom to fit nodes on the currently active critical path
+ */
+export function zoomToCriticalPath() {
+    if (!criticalPathState.active || !criticalPathState.path.length || !store.graph) return;
+    const idSet = new Set(criticalPathState.path);
+    store.graph.zoomToFit(400, 60, node => idSet.has(node.id));
 }
 
 /**
@@ -2115,7 +2345,8 @@ function animateCriticalPathTraversal() {
         store.highlightedNodes.add(nodeId);
 
         // Mark node with critical path state for visual effect
-        const graphNode = graphData.nodes.find(n => n.id === nodeId);
+        const currentGraphData = store.graph?.graphData();
+        const graphNode = currentGraphData?.nodes?.find(n => n.id === nodeId);
         if (graphNode) {
             graphNode._criticalPathState = 'active';
         }
@@ -2161,13 +2392,18 @@ function showCriticalPathSummary() {
 
     const sourceId = path[0];
     const sinkId = path[path.length - 1];
+    const rankPrefix = criticalPathState.paths.length > 1
+        ? `[${criticalPathState.currentIndex + 1}/${criticalPathState.paths.length}] `
+        : '';
 
     showToast(
-        `Critical path: ${path.length} nodes, from ${sourceId} to ${sinkId}`,
+        `${rankPrefix}Critical path: ${path.length} nodes, from ${sourceId} to ${sinkId}`,
         'info'
     );
 
     dispatchEvent('criticalPathComplete', {
+        currentIndex: criticalPathState.currentIndex,
+        pathCount: criticalPathState.paths.length,
         path: criticalPathState.path,
         length: criticalPathState.pathLength,
         source: sourceId,
@@ -2193,6 +2429,8 @@ export function resetCriticalPath() {
     }
 
     criticalPathState.active = false;
+    criticalPathState.paths = [];
+    criticalPathState.currentIndex = 0;
     criticalPathState.path = [];
     criticalPathState.pathIndices = [];
     criticalPathState.currentStep = 0;
@@ -2229,6 +2467,9 @@ export function isCriticalPathActive() {
 export function getCriticalPathState() {
     return {
         active: criticalPathState.active,
+        currentIndex: criticalPathState.currentIndex,
+        pathCount: criticalPathState.paths.length,
+        paths: criticalPathState.paths.map(p => ({ path: [...p.ids], length: p.length })),
         path: [...criticalPathState.path],
         length: criticalPathState.pathLength,
         currentStep: criticalPathState.currentStep
@@ -2307,11 +2548,12 @@ export function highlightDependencyPath(node) {
 }
 
 export function highlightCriticalPath() {
-    if (!store.wasmReady || !store.wasmGraph) return;
+    const activeGraph = store.activeWasmGraph || store.wasmGraph;
+    if (!store.wasmReady || !activeGraph || activeGraph.hasCycles()) return;
 
-    const criticalNodes = store.wasmGraph.criticalPathNodes();
+    const criticalNodes = activeGraph.criticalPathNodes();
     store.highlightedNodes = new Set(
-        criticalNodes.map(idx => store.wasmGraph.nodeId(idx)).filter(Boolean)
+        criticalNodes.map(idx => activeGraph.nodeId(idx)).filter(Boolean)
     );
     refreshGraph();
 
@@ -2321,9 +2563,10 @@ export function highlightCriticalPath() {
 export function highlightCycles() {
     if (!store.metrics.cycles?.cycles) return;
 
+    const activeGraph = store.activeWasmGraph || store.wasmGraph;
     const cycleNodeIndices = new Set(store.metrics.cycles.cycles.flat());
     store.highlightedNodes = new Set(
-        [...cycleNodeIndices].map(idx => store.wasmGraph?.nodeId(idx)).filter(Boolean)
+        [...cycleNodeIndices].map(idx => activeGraph?.nodeId(idx)).filter(Boolean)
     );
     refreshGraph();
 
@@ -2355,9 +2598,10 @@ export function initCycleNavigator() {
         return null;
     }
 
+    const activeGraph = store.activeWasmGraph || store.wasmGraph;
     // Convert cycle indices to node IDs
     cycleNavigatorState.cycles = store.metrics.cycles.cycles.map(cycle =>
-        cycle.map(idx => store.wasmGraph?.nodeId(idx)).filter(Boolean)
+        cycle.map(idx => activeGraph?.nodeId(idx)).filter(Boolean)
     ).filter(cycle => cycle.length > 0);
 
     cycleNavigatorState.currentIndex = 0;
@@ -2568,10 +2812,62 @@ function formatCyclePath(cycle) {
 // FILTERING
 // ============================================================================
 
+function syncOverlaysAfterGraphRebuild(graphData) {
+    if (!graphData || !Array.isArray(graphData.nodes)) return;
+    computeMaxMetrics(graphData.nodes);
+    const nodeById = new Map(graphData.nodes.map(n => [n.id, n]));
+
+    if (cycleNavigatorState.active) {
+        const hasVisibleCycleNode = [...cycleNavigatorState.highlightedCycleNodes]
+            .some(id => nodeById.has(id));
+        if (!hasVisibleCycleNode && cycleNavigatorState.highlightedCycleNodes.size > 0) {
+            resetCycleNavigator();
+        } else {
+            graphData.nodes.forEach(node => {
+                node._cycleHighlight = cycleNavigatorState.highlightedCycleNodes.has(node.id);
+            });
+        }
+    }
+
+    if (criticalPathState.active) {
+        const hasVisiblePathNode = criticalPathState.path.some(id => nodeById.has(id));
+        if (!hasVisiblePathNode) {
+            resetCriticalPath();
+        } else {
+            const limit = criticalPathState.currentStep > 0
+                ? Math.min(criticalPathState.currentStep, criticalPathState.path.length)
+                : criticalPathState.path.length;
+            criticalPathState.path.slice(0, limit).forEach(id => {
+                const gNode = nodeById.get(id);
+                if (gNode) gNode._criticalPathState = 'active';
+            });
+        }
+    }
+
+    if (whatIfState.active) {
+        const sourceIds = (whatIfState.sourceNodes || []).map(n => n.id);
+        const hasVisibleWhatIf = sourceIds.some(id => nodeById.has(id))
+            || [...whatIfState.unblockedNodes].some(id => nodeById.has(id));
+        if (!hasVisibleWhatIf) {
+            resetWhatIf();
+        } else {
+            sourceIds.forEach(id => {
+                const gNode = nodeById.get(id);
+                if (gNode) gNode._whatIfState = 'closing';
+            });
+            whatIfState.unblockedNodes.forEach(id => {
+                const gNode = nodeById.get(id);
+                if (gNode) gNode._whatIfState = 'unblocked';
+            });
+        }
+    }
+}
+
 export function setFilter(key, value) {
     store.filters[key] = value;
     const graphData = prepareGraphData();
     store.graph.graphData(graphData);
+    syncOverlaysAfterGraphRebuild(graphData);
     dispatchEvent('filterChange', { filters: { ...store.filters } });
 }
 
@@ -2585,6 +2881,7 @@ export function clearFilters() {
     };
     const graphData = prepareGraphData();
     store.graph.graphData(graphData);
+    syncOverlaysAfterGraphRebuild(graphData);
     dispatchEvent('filterChange', { filters: { ...store.filters } });
 }
 
@@ -2611,6 +2908,9 @@ export function zoomToFit(padding = 50) {
 }
 
 export function resetView() {
+    resetWhatIf();
+    resetCriticalPath();
+    resetCycleNavigator();
     clearSelection();
     clearFilters();
     store.graph.centerAt(0, 0, 500);
@@ -2955,6 +3255,8 @@ function setupKeyboardShortcuts() {
                     resetWhatIf();
                 } else if (criticalPathState.active) {
                     resetCriticalPath();
+                } else if (cycleNavigatorState.active) {
+                    resetCycleNavigator();
                 } else {
                     clearSelection();
                 }
@@ -3000,15 +3302,19 @@ function setupKeyboardShortcuts() {
                 toggleHeatmap();
                 break;
             case '[':
-                // Previous cycle
+                // Previous cycle or critical path [1/N]
                 if (cycleNavigatorState.active) {
                     prevCycle();
+                } else if (criticalPathState.active) {
+                    prevCriticalPath();
                 }
                 break;
             case ']':
-                // Next cycle
+                // Next cycle or critical path [1/N]
                 if (cycleNavigatorState.active) {
                     nextCycle();
+                } else if (criticalPathState.active) {
+                    nextCriticalPath();
                 }
                 break;
             case '?':
@@ -3165,6 +3471,17 @@ function selectAndCenterNode(node) {
 
 let tooltipEl = null;
 
+/**
+ * Format topological slack in dependency hops (never calendar days/hours)
+ */
+export function formatSlack(slack) {
+    if (slack === undefined || slack === null || typeof slack !== 'number' || !isFinite(slack) || isNaN(slack)) return '—';
+    const hops = Math.max(0, Math.round(slack));
+    if (hops === 0) return '0 hops (critical)';
+    if (hops === 1) return '1 hop';
+    return `${hops} hops`;
+}
+
 function showTooltip(node) {
     if (!tooltipEl) {
         tooltipEl = document.createElement('div');
@@ -3191,15 +3508,6 @@ function showTooltip(node) {
     const statusColor = THEME.status[node.status];
     const priorityColor = THEME.priority[node.priority];
 
-    // Format slack as human-readable time
-    const formatSlack = (slack) => {
-        if (slack === undefined || slack === null || !isFinite(slack)) return '—';
-        if (isNaN(slack)) return '—';
-        if (slack < 1) return `${Math.round(slack * 24)}h`;
-        if (slack < 7) return `${slack.toFixed(1)}d`;
-        return `${Math.round(slack / 7)}w`;
-    };
-
     // Safe number formatter for metrics
     const safeMetric = (val, decimals = 1, suffix = '') => {
         if (val === undefined || val === null || typeof val !== 'number' || !isFinite(val)) return '—';
@@ -3222,9 +3530,11 @@ function showTooltip(node) {
     if (node.eigenvector !== undefined && isFinite(node.eigenvector)) {
         extendedMetrics.push(`<span title="Influence centrality">Eigen: ${safeMetric(node.eigenvector * 100, 1, '%')}</span>`);
     }
-    if (node.slack !== undefined && isFinite(node.slack)) {
-        const slackColor = node.slack < 3 ? THEME.priority[0] : node.slack < 7 ? THEME.priority[1] : THEME.fgMuted;
-        extendedMetrics.push(`<span style="color: ${slackColor}" title="Schedule flexibility">Slack: ${formatSlack(node.slack)}</span>`);
+    if (store.metrics.hasCycles) {
+        extendedMetrics.push(`<span style="color: ${THEME.fgMuted}" title="Topological slack requires an acyclic DAG">Slack: N/A (cycle)</span>`);
+    } else if (typeof node.slack === 'number' && Number.isFinite(node.slack)) {
+        const slackColor = node.slack === 0 ? THEME.priority[0] : node.slack <= 2 ? THEME.priority[1] : THEME.fgMuted;
+        extendedMetrics.push(`<span style="color: ${slackColor}" title="Topological float in dependency hops">Slack: ${formatSlack(node.slack)}</span>`);
     }
     if (node.isArticulationPoint) {
         extendedMetrics.push(`<span style="color: ${THEME.accent.orange || THEME.priority[1]}" title="Removing this node disconnects the dependency graph">Cut vertex: Yes</span>`);
@@ -3455,7 +3765,7 @@ if (typeof window !== 'undefined') {
 // ============================================================================
 
 function dispatchEvent(name, detail = {}) {
-    document.dispatchEvent(new CustomEvent(`bv-graph:${name}`, { detail }));
+    document.dispatchEvent(new CustomEvent(`bv-graph:${name}`, { detail, bubbles: true }));
 }
 
 let _graphToastSequence = 0;
@@ -3497,6 +3807,10 @@ export function getWasmGraph() {
     return store.wasmGraph;
 }
 
+export function getActiveWasmGraph() {
+    return store.activeWasmGraph;
+}
+
 export function isWasmReady() {
     return store.wasmReady;
 }
@@ -3534,6 +3848,10 @@ export function cleanup() {
     if (tooltipEl) {
         tooltipEl.remove();
         tooltipEl = null;
+    }
+    if (store.activeWasmGraph) {
+        store.activeWasmGraph.free();
+        store.activeWasmGraph = null;
     }
     if (store.wasmGraph) {
         store.wasmGraph.free();

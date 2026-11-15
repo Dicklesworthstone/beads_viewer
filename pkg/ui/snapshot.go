@@ -563,7 +563,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	now := b.analyzer.Now()
 
 	// Apply default sorting to match the legacy reload path:
-	// Open first, then priority (ascending), then created date (newest first).
+	// Open first, then priority (ascending), then created date (newest first), then ID (ascending).
 	sort.Slice(issues, func(i, j int) bool {
 		iClosed := isClosedLikeStatus(issues[i].Status)
 		jClosed := isClosedLikeStatus(issues[j].Status)
@@ -573,7 +573,10 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		if issues[i].Priority != issues[j].Priority {
 			return issues[i].Priority < issues[j].Priority
 		}
-		return issues[i].CreatedAt.After(issues[j].CreatedAt)
+		if !issues[i].CreatedAt.Equal(issues[j].CreatedAt) {
+			return issues[i].CreatedAt.After(issues[j].CreatedAt)
+		}
+		return issues[i].ID < issues[j].ID
 	})
 
 	// Compute analysis if not provided

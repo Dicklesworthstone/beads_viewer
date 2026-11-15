@@ -164,7 +164,16 @@ func main() {
 				}
 				t.Setenv("PATH", filepath.Dir(executable)+string(os.PathListSeparator)+os.Getenv("PATH"))
 				for _, name := range []string{"first.db", "second.db"} {
-					if err := os.WriteFile(filepath.Join(filepath.Dir(source), name), []byte("routing fixture; no database commands execute"), 0o600); err != nil {
+					dbPath := filepath.Join(filepath.Dir(source), name)
+					fixtureDB, err := sql.Open("sqlite", dbPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := fixtureDB.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL)`); err != nil {
+						_ = fixtureDB.Close()
+						t.Fatal(err)
+					}
+					if err := fixtureDB.Close(); err != nil {
 						t.Fatal(err)
 					}
 				}

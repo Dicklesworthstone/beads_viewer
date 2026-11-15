@@ -3,7 +3,6 @@ package export
 import (
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"sort"
 	"strings"
 
@@ -22,11 +21,12 @@ const (
 
 // GraphExportConfig configures graph export behavior.
 type GraphExportConfig struct {
-	Format   GraphExportFormat // Output format (json, dot, mermaid)
-	Label    string            // Filter to specific label
-	Root     string            // Subgraph from specific root
-	Depth    int               // Max depth for subgraph (0 = unlimited)
-	DataHash string            // Hash of input data for provenance
+	Format    GraphExportFormat     // Output format (json, dot, mermaid)
+	Label     string                // Filter to specific label
+	Root      string                // Subgraph from specific root
+	Depth     int                   // Max depth for subgraph (0 = unlimited)
+	DataHash  string                // Hash of input data for provenance
+	Readiness *model.ReadinessIndex // Optional full-source readiness index (falls back to issues when nil)
 }
 
 // GraphExportResult contains the exported graph and metadata.
@@ -124,9 +124,14 @@ func ExportGraph(issues []model.Issue, stats *analysis.GraphStats, config GraphE
 		DataHash:       config.DataHash,
 	}
 
+	readiness := config.Readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
+
 	switch config.Format {
 	case GraphFormatDOT:
-		graph := generateDOT(filteredIssues, issueIDs, stats)
+		graph := generateDOTWithReadiness(filteredIssues, issueIDs, stats, readiness)
 		result.Graph = graph
 		result.Explanation = GraphExplanation{
 			What:        "Dependency graph in Graphviz DOT format",
@@ -135,7 +140,10 @@ func ExportGraph(issues []model.Issue, stats *analysis.GraphStats, config GraphE
 		}
 
 	case GraphFormatMermaid:
-		graph := generateMermaid(filteredIssues, issueIDs)
+		graph := GenerateMermaidGraph(filteredIssues, issueIDs, MermaidConfig{
+			ShowNoDependenciesNode: false,
+			Readiness:              readiness,
+		})
 		result.Graph = graph
 		result.Explanation = GraphExplanation{
 			What:        "Dependency graph in Mermaid diagram format",
@@ -261,6 +269,13 @@ func extractSubgraph(issues []model.Issue, rootID string, maxDepth int) []model.
 
 // generateDOT creates a Graphviz DOT format graph.
 func generateDOT(issues []model.Issue, issueIDs map[string]bool, stats *analysis.GraphStats) string {
+	return generateDOTWithReadiness(issues, issueIDs, stats, nil)
+}
+
+func generateDOTWithReadiness(issues []model.Issue, issueIDs map[string]bool, stats *analysis.GraphStats, readiness *model.ReadinessIndex) string {
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
 	var sb strings.Builder
 
 	sb.WriteString("digraph G {\n")
@@ -290,8 +305,14 @@ func generateDOT(issues []model.Issue, issueIDs map[string]bool, stats *analysis
 		title := escapeDOTString(rawTitle)
 		escapedID := escapeDOTString(i.ID)
 
-		// Status color
+		// Status color (dependency-blocked active issues render with blocked red)
+		depBlocked := !isClosedLikeStatus(i.Status) &&
+			(i.Status == model.StatusOpen || i.Status == model.StatusInProgress || i.Status == "") &&
+			len(readiness.Blockers(i.ID)) > 0
 		color := dotStatusColor(i.Status)
+		if depBlocked {
+			color = "#FFCDD2"
+		}
 
 		// Label with ID, title, priority
 		label := fmt.Sprintf("%s\\n%s\\nP%d %s", escapedID, title, i.Priority, i.Status)
@@ -351,14 +372,22 @@ func dotStatusColor(status model.Status) string {
 	switch {
 	case isClosedLikeStatus(status):
 		return "#CFD8DC" // Light gray
-	case status == model.StatusOpen:
+	case status == model.StatusOpen || status == "":
 		return "#C8E6C9" // Light green
 	case status == model.StatusInProgress:
 		return "#BBDEFB" // Light blue
 	case status == model.StatusBlocked:
 		return "#FFCDD2" // Light red
+	case status == model.StatusDeferred:
+		return "#FFE0B2" // Soft amber
+	case status == model.StatusPinned:
+		return "#E1BEE7" // Soft lavender
+	case status == model.StatusHooked:
+		return "#F8BBD0" // Soft pink
+	case status == model.StatusReview:
+		return "#FFF9C4" // Soft yellow
 	default:
-		return "#FFFFFF"
+		return "#E2E8F0" // Slate custom status
 	}
 }
 
@@ -394,113 +423,9 @@ func truncateRunes(s string, max int) string {
 
 // generateMermaid creates a Mermaid diagram format graph.
 func generateMermaid(issues []model.Issue, issueIDs map[string]bool) string {
-	var sb strings.Builder
-
-	sb.WriteString("graph TD\n")
-
-	// Class definitions for styling
-	sb.WriteString("    classDef open fill:#50FA7B,stroke:#333,color:#000\n")
-	sb.WriteString("    classDef inprogress fill:#8BE9FD,stroke:#333,color:#000\n")
-	sb.WriteString("    classDef blocked fill:#FF5555,stroke:#333,color:#000\n")
-	sb.WriteString("    classDef closed fill:#6272A4,stroke:#333,color:#fff\n")
-	sb.WriteString("\n")
-
-	// Sort issues for deterministic output
-	sortedIssues := make([]model.Issue, len(issues))
-	copy(sortedIssues, issues)
-	sort.Slice(sortedIssues, func(i, j int) bool {
-		return sortedIssues[i].ID < sortedIssues[j].ID
+	return GenerateMermaidGraph(issues, issueIDs, MermaidConfig{
+		ShowNoDependenciesNode: false,
 	})
-
-	// Build deterministic, collision-free Mermaid IDs
-	safeIDMap := make(map[string]string)
-	usedSafe := make(map[string]bool)
-
-	getSafeID := func(orig string) string {
-		if safe, ok := safeIDMap[orig]; ok {
-			return safe
-		}
-		base := sanitizeMermaidID(orig)
-		if base == "" {
-			base = "node"
-		}
-		safe := base
-		if usedSafe[safe] && safeIDMap[orig] == "" {
-			// Collision: derive stable hash-based suffix
-			h := fnv.New32a()
-			_, _ = h.Write([]byte(orig))
-			safe = fmt.Sprintf("%s_%x", base, h.Sum32())
-		}
-		usedSafe[safe] = true
-		safeIDMap[orig] = safe
-		return safe
-	}
-
-	// Pre-calculate all safe IDs to ensure consistency
-	for _, i := range sortedIssues {
-		getSafeID(i.ID)
-	}
-
-	// Nodes
-	for _, i := range sortedIssues {
-		safeID := getSafeID(i.ID)
-		safeTitle := sanitizeMermaidText(i.Title)
-		safeLabelID := sanitizeMermaidText(i.ID)
-
-		sb.WriteString(fmt.Sprintf("    %s[\"%s<br/>%s\"]\n", safeID, safeLabelID, safeTitle))
-
-		// Apply class based on status
-		var class string
-		switch {
-		case isClosedLikeStatus(i.Status):
-			class = "closed"
-		case i.Status == model.StatusOpen:
-			class = "open"
-		case i.Status == model.StatusInProgress:
-			class = "inprogress"
-		case i.Status == model.StatusBlocked:
-			class = "blocked"
-		}
-		if class != "" {
-			sb.WriteString(fmt.Sprintf("    class %s %s\n", safeID, class))
-		}
-	}
-
-	sb.WriteString("\n")
-
-	// Edges
-	for _, i := range sortedIssues {
-		// Sort dependencies
-		deps := make([]*model.Dependency, len(i.Dependencies))
-		copy(deps, i.Dependencies)
-		sort.Slice(deps, func(a, b int) bool {
-			if deps[a] == nil {
-				return false
-			}
-			if deps[b] == nil {
-				return true
-			}
-			return deps[a].DependsOnID < deps[b].DependsOnID
-		})
-
-		for _, dep := range deps {
-			if dep == nil || !issueIDs[dep.DependsOnID] {
-				continue
-			}
-
-			safeFromID := getSafeID(i.ID)
-			safeToID := getSafeID(dep.DependsOnID)
-
-			linkStyle := "-.->" // Dashed for related
-			if dep.Type.IsBlocking() {
-				linkStyle = "==>" // Bold for blockers
-			}
-
-			sb.WriteString(fmt.Sprintf("    %s %s %s\n", safeFromID, linkStyle, safeToID))
-		}
-	}
-
-	return sb.String()
 }
 
 // generateAdjacency creates a JSON adjacency list representation.

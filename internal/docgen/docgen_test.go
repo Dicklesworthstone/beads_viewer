@@ -3,6 +3,8 @@ package docgen_test
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -40,6 +42,49 @@ func TestDocgen_RenderRecipesTable(t *testing.T) {
 	for _, expected := range []string{"default", "actionable", "recent", "blocked", "high-impact", "stale", "triage", "closed", "release-cut", "quick-wins", "bottlenecks"} {
 		if !strings.Contains(table, "`"+expected+"`") {
 			t.Errorf("recipes table missing recipe %s", expected)
+		}
+	}
+}
+
+func TestDocgen_RenderRecipesTable_IgnoresHostAndProjectRecipes(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpHome, ".config"))
+	userCfgDir := filepath.Join(tmpHome, ".config", "bv")
+	if err := os.MkdirAll(userCfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	userYAML := "recipes:\n  actionable: null\n  host-secret-recipe:\n    description: leaked from host\n"
+	if err := os.WriteFile(filepath.Join(userCfgDir, "recipes.yaml"), []byte(userYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	projDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projDir, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projYAML := "recipes:\n  project-secret-recipe:\n    description: leaked from project\n"
+	if err := os.WriteFile(filepath.Join(projDir, ".bv", "recipes.yaml"), []byte(projYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(projDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(origWD)
+	})
+
+	table := docgen.RenderRecipesTable()
+	if !strings.Contains(table, "`actionable`") {
+		t.Fatalf("expected built-in actionable recipe even when disabled in host config, got:\n%s", table)
+	}
+	for _, forbidden := range []string{"host-secret-recipe", "leaked from host", "project-secret-recipe", "leaked from project"} {
+		if strings.Contains(table, forbidden) {
+			t.Fatalf("recipes table leaked non-builtin recipe content %q:\n%s", forbidden, table)
 		}
 	}
 }
@@ -89,6 +134,10 @@ func TestDocgen_RenderFlagsTable(t *testing.T) {
 	fs.String("db", "", "Database path")
 	fs.Bool("robot-triage", false, "Triage flag")
 	fs.String("cpu-profile", "", "Profile flag")
+	fs.Bool("agents-add", false, "Agents add flag")
+	fs.Int("network-depth", 2, "Network depth")
+	fs.String("export-group-by", "", "Export group by")
+	fs.Bool("generate-docs", false, "Generate docs")
 
 	table := docgen.RenderFlagsTable(fs, nil)
 	if !strings.Contains(table, "`--db`") {
@@ -102,6 +151,9 @@ func TestDocgen_RenderFlagsTable(t *testing.T) {
 	}
 	if !strings.Contains(table, "Debug Flags") {
 		t.Errorf("flags table missing Debug Flags group")
+	}
+	if strings.Contains(table, "| Other |") {
+		t.Errorf("expected DefaultFlagSections to classify live CLI flags without falling into Other:\n%s", table)
 	}
 }
 
