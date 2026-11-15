@@ -3417,6 +3417,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, workerPollTickCmd())
 			}
 		}
+		// Status ticks only affect the footer drawn by View. Keep them from
+		// rebuilding and rendering the selected issue's Markdown every 120 ms.
+		return m, tea.Batch(cmds...)
 
 	case Phase2ReadyMsg:
 		// Ignore stale Phase2 completions (from before a file reload)

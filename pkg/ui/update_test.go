@@ -19,6 +19,106 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func TestWorkerPollTickPreservesDetails(t *testing.T) {
+	t.Setenv("BV_BACKGROUND_MODE", "0")
+	for _, tc := range []struct {
+		name        string
+		worker      *BackgroundWorker
+		spinner     int
+		wantSpinner int
+		wantPoll    bool
+	}{
+		{"idle", &BackgroundWorker{state: WorkerIdle, cancel: func() {}}, 3, 0, true},
+		{"processing", &BackgroundWorker{state: WorkerProcessing, cancel: func() {}}, 3, 4, true},
+		{"spinner wrap", &BackgroundWorker{state: WorkerProcessing, cancel: func() {}}, len(workerSpinnerFrames) - 1, 0, true},
+		{"stopped", &BackgroundWorker{state: WorkerStopped}, 3, 0, false},
+		{"no worker", nil, 3, 3, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewModel([]model.Issue{{
+				ID: "SELECTED", Title: "Selected issue", Status: model.StatusOpen,
+				Description: strings.Repeat("Unchanged **detail** with [notes](https://example.com).\n\n", 60),
+			}}, nil, "")
+			t.Cleanup(m.Stop)
+			m.Update(tea.WindowSizeMsg{Width: 220, Height: 55})
+			m.backgroundMode = true
+			m.backgroundWorker = tc.worker
+			m.workerSpinnerIdx = tc.spinner
+			m.viewport.SetYOffset(3)
+			if !m.isSplitView || m.focused != focusList || m.viewport.YOffset != 3 {
+				t.Fatal("fixture must show scrolled details with list focus in split view")
+			}
+			content, view := m.viewportContent, m.viewport.View()
+
+			// Equal viewport output alone would miss the bug: it can still cost
+			// a full render. Seed the renderer's cache without changing the
+			// displayed details so any redundant render is observable.
+			const cacheMarker = "Markdown unrelated to the selected issue"
+			if _, err := m.renderer.Render(cacheMarker); err != nil {
+				t.Fatal(err)
+			}
+			if m.renderer.lastMarkdown != cacheMarker {
+				t.Fatal("fixture did not seed the renderer cache")
+			}
+
+			_, cmd := m.Update(workerPollTickMsg{})
+			if m.renderer.lastMarkdown != cacheMarker {
+				t.Error("worker status tick rendered the selected issue's Markdown")
+			}
+			if m.viewportContent != content || m.viewport.View() != view || m.viewport.YOffset != 3 {
+				t.Error("worker status tick changed the displayed details or scroll position")
+			}
+			if m.workerSpinnerIdx != tc.wantSpinner {
+				t.Errorf("spinner = %d, want %d", m.workerSpinnerIdx, tc.wantSpinner)
+			}
+			if (cmd != nil) != tc.wantPoll {
+				t.Fatalf("poll command present = %v, want %v", cmd != nil, tc.wantPoll)
+			}
+			if cmd != nil {
+				msg := cmd()
+				if _, ok := msg.(workerPollTickMsg); !ok {
+					t.Errorf("poll command returned %T, want workerPollTickMsg", msg)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkerPollTickAllowsDetailRefresh(t *testing.T) {
+	t.Setenv("BV_BACKGROUND_MODE", "0")
+	issues := []model.Issue{
+		{ID: "FIRST", Title: "First issue", Status: model.StatusOpen, Priority: 0, Description: "Original first details"},
+		{ID: "SECOND", Title: "Second issue", Status: model.StatusOpen, Priority: 1, Description: "Original second details"},
+	}
+	m := NewModel(copyIssues(issues), nil, "")
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 220, Height: 55})
+	m.backgroundMode = true
+	m.backgroundWorker = &BackgroundWorker{state: WorkerIdle, cancel: func() {}}
+	if !strings.Contains(m.viewportContent, "Original first details") {
+		t.Fatal("fixture did not display the first issue")
+	}
+
+	m.Update(workerPollTickMsg{})
+	m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if !strings.Contains(m.viewportContent, "Original second details") || strings.Contains(m.viewportContent, "Original first details") {
+		t.Fatal("navigation after a worker status tick did not refresh the selected details")
+	}
+
+	m.Update(workerPollTickMsg{})
+	issues[1].Description = "Reloaded second details"
+	snapshot := NewSnapshotBuilder(copyIssues(issues)).Build()
+	m.Update(SnapshotReadyMsg{Snapshot: snapshot, SnapshotVer: 1})
+	if !strings.Contains(m.viewportContent, "Reloaded second details") || strings.Contains(m.viewportContent, "Original second details") {
+		t.Fatal("snapshot delivery after a worker status tick did not refresh the selected details")
+	}
+	content := m.viewportContent
+	m.Update(workerPollTickMsg{})
+	if m.viewportContent != content {
+		t.Fatal("worker status tick changed the refreshed details")
+	}
+}
+
 // exercise Phase2Ready and FileChanged branches of Update for coverage.
 func TestModelUpdatePhase2AndFileChanged(t *testing.T) {
 	issues := []model.Issue{{ID: "A", Title: "Alpha", Status: model.StatusOpen}}
