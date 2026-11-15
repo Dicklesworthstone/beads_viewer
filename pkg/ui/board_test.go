@@ -11,6 +11,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 func createTime(hoursAgo int) time.Time {
@@ -1839,5 +1840,346 @@ func TestInlineCardExpansion_ShowsDescription(t *testing.T) {
 	// Should contain the unique description text
 	if !strings.Contains(output, "UNIQUE_DESC_CONTENT") {
 		t.Error("Expanded card should show description content")
+	}
+}
+
+// TestBoardResolvedBlockersAndBlocksIndex verifies resolved/tombstone blockers do not
+// show active blocker badges (🚫) or inflate ⚡→N open unblocks count (bv-apal.52).
+func TestBoardResolvedBlockersAndBlocksIndex(t *testing.T) {
+	theme := createTheme()
+	issues := []model.Issue{
+		{
+			ID:       "BLK-CLOSED",
+			Title:    "Already Closed Blocker",
+			Status:   model.StatusClosed,
+			Priority: 1,
+		},
+		{
+			ID:       "BLK-TOMB",
+			Title:    "Tombstone Blocker",
+			Status:   model.StatusTombstone,
+			Priority: 1,
+		},
+		{
+			ID:       "READY-1",
+			Title:    "Ready Card With Resolved Blockers",
+			Status:   model.StatusOpen,
+			Priority: 1,
+			Dependencies: []*model.Dependency{
+				{IssueID: "READY-1", DependsOnID: "BLK-CLOSED", Type: model.DepBlocks},
+				{IssueID: "READY-1", DependsOnID: "BLK-TOMB", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:       "CLOSED-DEP",
+			Title:    "Closed Dependent",
+			Status:   model.StatusClosed,
+			Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CLOSED-DEP", DependsOnID: "READY-1", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	b := ui.NewBoardModel(issues, theme)
+	b.SetReadiness(model.NewReadinessIndex(issues))
+
+	out := b.View(140, 35)
+	if strings.Contains(out, "🚫←") {
+		t.Fatalf("expected no active card blocker badge 🚫← when all blockers are closed/tombstone, got:\n%s", out)
+	}
+	if strings.Contains(out, "⚡→") {
+		t.Fatalf("expected no ⚡→N badge when blockers are already closed/tombstone or dependent is closed, got:\n%s", out)
+	}
+
+	// Expand READY-1 and verify resolved blockers are labeled rather than active red blockers.
+	if !b.SelectIssueByID("READY-1") {
+		t.Fatal("expected to select READY-1")
+	}
+	b.ToggleExpand()
+	expandedOut := b.View(140, 40)
+	if !strings.Contains(expandedOut, "resolved") {
+		t.Fatalf("expected expanded card to distinguish resolved blockers, got:\n%s", expandedOut)
+	}
+}
+
+// TestBoardCustomParkedStatusBadgeInOpenColumn verifies non-standard statuses in ColOpen
+// render a compact status pill like [deferred] or [pinned] (bv-apal.52).
+func TestBoardCustomParkedStatusBadgeInOpenColumn(t *testing.T) {
+	theme := createTheme()
+	issues := []model.Issue{
+		{ID: "DEF-1", Title: "Deferred Task", Status: model.Status("deferred"), Priority: 1},
+		{ID: "PIN-1", Title: "Pinned Spec", Status: model.StatusPinned, Priority: 2},
+	}
+	b := ui.NewBoardModel(issues, theme)
+	out := b.View(140, 30)
+	if !strings.Contains(out, "[deferred]") {
+		t.Fatalf("expected [deferred] pill in Open column card, got:\n%s", out)
+	}
+	if !strings.Contains(out, "[pinned]") {
+		t.Fatalf("expected [pinned] pill in Open column card, got:\n%s", out)
+	}
+}
+
+// TestBoardSearchPersistenceAndSelectionPreservation verifies search highlights and header
+// indicator persist after FinishSearch() until ClearSearch(), and SetIssues preserves selection (bv-apal.52).
+func TestBoardSearchPersistenceAndSelectionPreservation(t *testing.T) {
+	theme := createTheme()
+	issues := []model.Issue{
+		{ID: "AUTH-1", Title: "OAuth login callback", Status: model.StatusOpen, Priority: 1},
+		{ID: "AUTH-2", Title: "Session refresh", Status: model.StatusOpen, Priority: 2},
+		{ID: "AUTH-3", Title: "OAuth login token", Status: model.StatusInProgress, Priority: 1},
+	}
+	b := ui.NewBoardModel(issues, theme)
+	b.StartSearch()
+	for _, r := range "login" {
+		b.AppendSearchChar(r)
+	}
+	b.FinishSearch()
+
+	if b.IsSearchMode() {
+		t.Fatal("expected searchMode=false after FinishSearch")
+	}
+	if b.GetSearchQuery() != "login" || b.SearchMatchCount() != 2 {
+		t.Fatalf("expected persistent query 'login' with 2 matches after FinishSearch, got query=%q count=%d",
+			b.GetSearchQuery(), b.SearchMatchCount())
+	}
+	if !b.IsSearchMatch(ui.ColOpen, 0) {
+		t.Fatal("expected ColOpen row 0 to remain highlighted as a search match after FinishSearch")
+	}
+	outAfterEnter := b.View(140, 30)
+	if !strings.Contains(outAfterEnter, `"login"`) || !strings.Contains(outAfterEnter, "1/2") {
+		t.Fatalf("expected persistent search indicator in board header after Enter, got:\n%s", outAfterEnter)
+	}
+
+	b.NextMatch()
+	if sel := b.SelectedIssue(); sel == nil || sel.ID != "AUTH-3" {
+		t.Fatalf("expected NextMatch after Enter to select AUTH-3, got %+v", sel)
+	}
+
+	b.ClearSearch()
+	if b.GetSearchQuery() != "" || b.SearchMatchCount() != 0 {
+		t.Fatalf("expected ClearSearch to reset query and matches, got query=%q count=%d",
+			b.GetSearchQuery(), b.SearchMatchCount())
+	}
+
+	// SetIssues preserves selected issue ID (AUTH-3) across rebuilds.
+	b.SetIssues([]model.Issue{
+		{ID: "NEW-0", Title: "New first item", Status: model.StatusInProgress, Priority: 0},
+		{ID: "AUTH-3", Title: "OAuth login token", Status: model.StatusInProgress, Priority: 1},
+	})
+	if sel := b.SelectedIssue(); sel == nil || sel.ID != "AUTH-3" {
+		t.Fatalf("expected SetIssues to preserve selected issue AUTH-3, got %+v", sel)
+	}
+}
+
+func TestBoardSetIssuesAndSnapshotPreserveActiveSearchAndExpandedCard(t *testing.T) {
+	theme := createTheme()
+	initial := []model.Issue{
+		{ID: "AUTH-1", Title: "OAuth callback", Status: model.StatusOpen, Priority: 1, Description: "First expanded card"},
+		{ID: "AUTH-2", Title: "OAuth refresh", Status: model.StatusOpen, Priority: 2},
+		{ID: "AUTH-3", Title: "OAuth logout", Status: model.StatusInProgress, Priority: 1},
+	}
+	b := ui.NewBoardModel(initial, theme)
+	if !b.SelectIssueByID("AUTH-1") {
+		t.Fatal("expected to select AUTH-1")
+	}
+	b.ToggleExpand()
+	if !b.HasExpandedCard() || b.GetExpandedID() != "AUTH-1" {
+		t.Fatalf("expected AUTH-1 expanded, got %q", b.GetExpandedID())
+	}
+
+	b.StartSearch()
+	for _, r := range "oauth" {
+		b.AppendSearchChar(r)
+	}
+	b.NextMatch()
+	b.NextMatch() // cursor at index 2 (3rd match)
+	if !b.IsSearchMode() || b.SearchMatchCount() != 3 || b.SearchCursorPos() != 3 {
+		t.Fatalf("expected searchMode=true matches=3 pos=3, got mode=%v matches=%d pos=%d",
+			b.IsSearchMode(), b.SearchMatchCount(), b.SearchCursorPos())
+	}
+
+	// SetIssues removes AUTH-3 -> searchMode stays true, query preserved, cursor clamped to 2/2, AUTH-1 stays expanded!
+	refreshed := []model.Issue{
+		{ID: "AUTH-1", Title: "OAuth callback", Status: model.StatusOpen, Priority: 1, Description: "First expanded card"},
+		{ID: "AUTH-2", Title: "OAuth refresh", Status: model.StatusOpen, Priority: 2},
+	}
+	b.SetIssues(refreshed)
+	if !b.IsSearchMode() || b.GetSearchQuery() != "oauth" {
+		t.Fatalf("SetIssues wiped active search: mode=%v query=%q", b.IsSearchMode(), b.GetSearchQuery())
+	}
+	if b.SearchMatchCount() != 2 || b.SearchCursorPos() != 2 {
+		t.Fatalf("expected clamped 2/2 matches after SetIssues, got pos=%d/%d", b.SearchCursorPos(), b.SearchMatchCount())
+	}
+	if !b.HasExpandedCard() || b.GetExpandedID() != "AUTH-1" {
+		t.Fatalf("SetIssues collapsed still-present expanded card AUTH-1, got %q", b.GetExpandedID())
+	}
+
+	// SetSnapshot also preserves active search and expanded card when present.
+	snap := ui.NewSnapshotBuilder(refreshed).Build()
+	b.SetSnapshot(snap)
+	if !b.IsSearchMode() || b.GetSearchQuery() != "oauth" || b.SearchMatchCount() != 2 {
+		t.Fatalf("SetSnapshot wiped active search: mode=%v query=%q count=%d",
+			b.IsSearchMode(), b.GetSearchQuery(), b.SearchMatchCount())
+	}
+	if !b.HasExpandedCard() || b.GetExpandedID() != "AUTH-1" {
+		t.Fatalf("SetSnapshot collapsed still-present expanded card AUTH-1, got %q", b.GetExpandedID())
+	}
+
+	// If expanded card is removed from refreshed board, expandedCardID clears cleanly.
+	b.SetIssues([]model.Issue{{ID: "AUTH-2", Title: "OAuth refresh", Status: model.StatusOpen, Priority: 2}})
+	if b.HasExpandedCard() {
+		t.Fatalf("expected removed expanded card to clear, got %q", b.GetExpandedID())
+	}
+}
+
+func TestBoardSearchSanitizesControlCharsAndMultilinePaste(t *testing.T) {
+	theme := createTheme()
+	b := ui.NewBoardModel([]model.Issue{{ID: "A-1", Title: "oauth login flow", Status: model.StatusOpen}}, theme)
+	b.StartSearch()
+	for _, r := range "\r\noauth\r\n\tlogin\x00\x1bflow" {
+		b.AppendSearchChar(r)
+	}
+	if got := b.GetSearchQuery(); got != "oauth loginflow" {
+		t.Fatalf("expected sanitized 1-line query %q, got %q", "oauth loginflow", got)
+	}
+	out := b.View(100, 24)
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "Search:") && strings.Contains(line, "\r") {
+			t.Fatalf("search bar leaked carriage return: %q", line)
+		}
+	}
+}
+
+func TestBoardFullIssuesScopeAndClaimableBorder(t *testing.T) {
+	r := lipgloss.NewRenderer(os.Stdout)
+	r.SetColorProfile(termenv.TrueColor)
+	theme := ui.DefaultTheme(r)
+
+	future := time.Now().Add(48 * time.Hour)
+	allIssues := []model.Issue{
+		{ID: "READY-GATE", Title: "Ready Unblocker", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{
+			ID: "DOWN-1", Title: "Downstream 1", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "DOWN-1", DependsOnID: "READY-GATE", Type: model.DepBlocks}},
+		},
+		{
+			ID: "DOWN-2", Title: "Downstream 2", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "DOWN-2", DependsOnID: "READY-GATE", Type: model.DepBlocks}},
+		},
+		{ID: "OPEN-BLK", Title: "Still Open Blocker", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug},
+		{
+			ID: "CLOSED-1", Title: "Closed With Open Blocker", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "CLOSED-1", DependsOnID: "OPEN-BLK", Type: model.DepBlocks}},
+		},
+		{ID: "PINNED-1", Title: "Pinned Open Item", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Pinned: true},
+		{ID: "DEFER-1", Title: "Deferred Open Item", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, DeferUntil: &future},
+		{ID: "CLAIM-1", Title: "Claimable Ready Item", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask},
+	}
+
+	b := ui.NewBoardModel(allIssues, theme)
+	b.SetReadiness(model.NewReadinessIndex(allIssues))
+	b.SetFullIssues(allIssues)
+
+	// (a) Under Ready filter (DOWN-1 and DOWN-2 excluded from filtered view), READY-GATE still shows ⚡→2!
+	b.SetIssues([]model.Issue{allIssues[0]})
+	readyOut := b.View(140, 30)
+	if !strings.Contains(readyOut, "⚡→2") {
+		t.Fatalf("expected READY-GATE under Ready filter to retain ⚡→2 from fullIssues, got:\n%s", readyOut)
+	}
+
+	// (b) Under Closed filter (OPEN-BLK excluded from filtered view), CLOSED-1 must NOT mismark OPEN-BLK as resolved!
+	b.SetIssues([]model.Issue{allIssues[4]})
+	if !b.SelectIssueByID("CLOSED-1") {
+		t.Fatal("expected to select CLOSED-1")
+	}
+	b.ToggleExpand()
+	closedOut := b.View(140, 35)
+	if strings.Contains(closedOut, "resolved") {
+		t.Fatalf("expected open blocker OPEN-BLK on closed card CLOSED-1 NOT marked resolved, got:\n%s", closedOut)
+	}
+	b.CollapseExpanded()
+
+	// (c) Non-claimable ColOpen cards (Pinned, DeferUntil) must NOT get the green Ready border that CLAIM-1 gets.
+	bClaim := ui.NewBoardModel([]model.Issue{allIssues[7]}, theme)
+	bClaim.SetReadiness(model.NewReadinessIndex(allIssues))
+	bClaim.SetFullIssues(allIssues)
+	bClaim.MoveRight() // move selection away from ColOpen so selection highlight doesn't mask border color
+	claimANSI := bClaim.View(140, 28)
+
+	bPinned := ui.NewBoardModel([]model.Issue{allIssues[5]}, theme)
+	bPinned.SetReadiness(model.NewReadinessIndex(allIssues))
+	bPinned.SetFullIssues(allIssues)
+	bPinned.MoveRight()
+	pinnedANSI := bPinned.View(140, 28)
+
+	bDefer := ui.NewBoardModel([]model.Issue{allIssues[6]}, theme)
+	bDefer.SetReadiness(model.NewReadinessIndex(allIssues))
+	bDefer.SetFullIssues(allIssues)
+	bDefer.MoveRight()
+	deferANSI := bDefer.View(140, 28)
+
+	// ColorSuccess hex is #81c784 -> RGB 129;199;131 on the card's rounded top-left border ("╭─").
+	const greenCardTopBorder = "\x1b[38;2;129;199;131m╭─"
+	if !strings.Contains(claimANSI, greenCardTopBorder) {
+		t.Fatalf("expected claimable open card CLAIM-1 to render with green Ready border, got:\n%q", claimANSI)
+	}
+	if strings.Contains(pinnedANSI, greenCardTopBorder) {
+		t.Fatalf("Pinned card must NOT get green Ready card border:\n%q", pinnedANSI)
+	}
+	if strings.Contains(deferANSI, greenCardTopBorder) {
+		t.Fatalf("Future-deferred card must NOT get green Ready card border:\n%q", deferANSI)
+	}
+}
+
+func TestBoardPreservedSearchColumnMoveAndCrossFilterInlineBlockerTitle(t *testing.T) {
+	theme := createTheme()
+
+	// 1) refreshPreservedSearch tracks prevMatchID across column moves so the matched card stays focused.
+	initial := []model.Issue{
+		{ID: "match-alpha", Title: "Alpha Search Card", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{ID: "match-beta", Title: "Beta Search Card", Status: model.StatusBlocked, Priority: 0, IssueType: model.TypeTask},
+	}
+	b := ui.NewBoardModel(initial, theme)
+	b.StartSearch()
+	for _, ch := range "match" {
+		b.AppendSearchChar(ch)
+	}
+	b.FinishSearch()
+	b.NextMatch() // moves to match index 1 ("match-beta" in Blocked column)
+	if sel := b.SelectedIssue(); sel == nil || sel.ID != "match-beta" || b.SearchCursorPos() != 2 {
+		t.Fatalf("precondition failed: sel=%v pos=%d", sel, b.SearchCursorPos())
+	}
+
+	// Move match-beta to Open (Priority 0 sorts BEFORE match-alpha Priority 1, becoming match index 0).
+	moved := []model.Issue{
+		{ID: "match-alpha", Title: "Alpha Search Card", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{ID: "match-beta", Title: "Beta Search Card", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask},
+	}
+	b.SetIssues(moved)
+	if sel := b.SelectedIssue(); sel == nil || sel.ID != "match-beta" {
+		t.Fatalf("expected match-beta to stay selected after column move, got %v", sel)
+	}
+	if b.SearchCursorPos() != 1 || !b.IsMatchHighlighted(ui.ColOpen, 0) {
+		t.Fatalf("expected searchCursor to follow match-beta to index 0 (pos 1) at (ColOpen, 0), got pos=%d highlighted=%v",
+			b.SearchCursorPos(), b.IsMatchHighlighted(ui.ColOpen, 0))
+	}
+
+	// 2) Unexpanded card 1-blocker inline title preview resolves external/cross-filter blocker via lookupIssue (fullIssues).
+	extBlocker := model.Issue{ID: "EXT-BLK", Title: "AuthGateService", Status: model.StatusInProgress, Priority: 0, IssueType: model.TypeBug}
+	dependent := model.Issue{
+		ID: "CARD-DEP", Title: "Ship Dashboard", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeFeature,
+		Dependencies: []*model.Dependency{{IssueID: "CARD-DEP", DependsOnID: "EXT-BLK", Type: model.DepBlocks}},
+	}
+	all := []model.Issue{extBlocker, dependent}
+	bFiltered := ui.NewBoardModel([]model.Issue{dependent}, theme)
+	bFiltered.SetReadiness(model.NewReadinessIndex(all))
+	bFiltered.SetFullIssues(all)
+	bFiltered.SetIssues([]model.Issue{dependent})
+
+	out := bFiltered.View(140, 28)
+	if !strings.Contains(out, "EXT-BLK (AuthGateSer") {
+		t.Fatalf("expected unexpanded card inline 1-blocker preview to include blocker title from fullIssues, got:\n%s", out)
 	}
 }

@@ -128,6 +128,11 @@ func (w walkedCommit) trackerOnly(storeDirRel string) bool {
 // considered. It spawns no per-commit subprocesses: the walk over 500 commits
 // of this repository costs ~50 ms.
 func walkCommits(ctx context.Context, repoPath string, opts ExtractOptions) ([]walkedCommit, error) {
+	if opts.Revision != "" {
+		if err := validateGitRefArg(opts.Revision); err != nil {
+			return nil, err
+		}
+	}
 	args := []string{
 		"log",
 		"--no-merges",

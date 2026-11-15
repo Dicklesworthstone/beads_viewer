@@ -54,8 +54,10 @@ type SuggestAllConfig struct {
 
 // DefaultSuggestAllConfig returns sensible defaults with all features enabled
 func DefaultSuggestAllConfig() SuggestAllConfig {
+	dups := DefaultDuplicateConfig()
+	dups.IgnoreClosed = true
 	return SuggestAllConfig{
-		Duplicates:         DefaultDuplicateConfig(),
+		Duplicates:         dups,
 		Dependencies:       DefaultDependencySuggestionConfig(),
 		Labels:             DefaultLabelSuggestionConfig(),
 		Cycles:             DefaultCycleWarningConfig(),
@@ -122,12 +124,16 @@ func GenerateAllSuggestionsAt(issues []model.Issue, config SuggestAllConfig, dat
 	}
 
 	if config.EnableDependencies && (config.FilterType == "" || config.FilterType == SuggestionMissingDependency) {
+		if depsCfg.MaxSuggestions > 0 {
+			depsCfg.MaxSuggestions = math.MaxInt
+		}
 		dependencies := DetectMissingDependencies(issues, depsCfg)
 		if config.CandidateIDs != nil {
 			dependencies = FilterSuggestionsByCandidates(dependencies, config.CandidateIDs)
-			if config.Dependencies.MaxSuggestions > 0 && len(dependencies) > config.Dependencies.MaxSuggestions {
-				dependencies = dependencies[:config.Dependencies.MaxSuggestions]
-			}
+		}
+		dependencies = GetCycleFreeSuggestions(issues, dependencies)
+		if config.Dependencies.MaxSuggestions > 0 && len(dependencies) > config.Dependencies.MaxSuggestions {
+			dependencies = dependencies[:config.Dependencies.MaxSuggestions]
 		}
 		allSuggestions = append(allSuggestions, dependencies...)
 	}

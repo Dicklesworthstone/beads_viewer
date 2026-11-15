@@ -229,6 +229,29 @@ func TestSuggestProjectName(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("cwd dot and beads paths", func(t *testing.T) {
+		tmpParent := t.TempDir()
+		repoDir := filepath.Join(tmpParent, "Acme_Repo")
+		beadsDir := filepath.Join(repoDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		t.Chdir(repoDir)
+
+		if got := SuggestProjectName(""); got != "acme-repo-pages" {
+			t.Fatalf("SuggestProjectName(\"\") = %q, want %q", got, "acme-repo-pages")
+		}
+		if got := SuggestProjectName("."); got != "acme-repo" {
+			t.Fatalf("SuggestProjectName(\".\") = %q, want %q", got, "acme-repo")
+		}
+		if got := SuggestProjectName(beadsDir); got != "acme-repo-pages" {
+			t.Fatalf("SuggestProjectName(.beads) = %q, want %q", got, "acme-repo-pages")
+		}
+		if got := SuggestProjectName(filepath.Join(beadsDir, "issues.jsonl")); got != "acme-repo-pages" {
+			t.Fatalf("SuggestProjectName(.beads/issues.jsonl) = %q, want %q", got, "acme-repo-pages")
+		}
+	})
 }
 
 func TestGenerateHeadersFile(t *testing.T) {
@@ -413,5 +436,26 @@ func TestVerifyCloudflareDeployment_Success(t *testing.T) {
 
 	if err := VerifyCloudflareDeployment(server.URL, 2, time.Second); err != nil {
 		t.Fatalf("VerifyCloudflareDeployment returned error: %v", err)
+	}
+}
+
+func TestSuggestProjectName_DotGitTruncationAndValidateProjectName(t *testing.T) {
+	if got := SuggestProjectName("/tmp/acme_repo.git/.beads"); got != "acme-repo-pages" {
+		t.Fatalf("SuggestProjectName(.git/.beads) = %q, want %q", got, "acme-repo-pages")
+	}
+	if got := SuggestProjectName("/tmp/acme.GIT/bv-pages"); got != "acme-pages" {
+		t.Fatalf("SuggestProjectName(.GIT/bv-pages) = %q, want %q", got, "acme-pages")
+	}
+
+	longDir := "/tmp/" + strings.Repeat("verylongsegment-", 6) + "tail.git/.beads/issues.jsonl"
+	gotLong := SuggestProjectName(longDir)
+	if len(gotLong) > cloudflareProjectNameMaxLen {
+		t.Fatalf("SuggestProjectName length = %d, want <= %d (%q)", len(gotLong), cloudflareProjectNameMaxLen, gotLong)
+	}
+	if err := ValidateProjectName(gotLong); err != nil {
+		t.Fatalf("ValidateProjectName(%q) failed: %v", gotLong, err)
+	}
+	if err := ValidateProjectName("Invalid_Upper"); err == nil {
+		t.Fatal("expected ValidateProjectName to reject uppercase/underscore project name")
 	}
 }

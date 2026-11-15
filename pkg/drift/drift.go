@@ -4,10 +4,12 @@ package drift
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/datasource"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -26,21 +28,22 @@ const (
 type AlertType string
 
 const (
-	AlertNewCycle           AlertType = "new_cycle"
-	AlertPageRankChange     AlertType = "pagerank_change"
-	AlertDensityGrowth      AlertType = "density_growth"
-	AlertNodeCountChange    AlertType = "node_count_change"
-	AlertEdgeCountChange    AlertType = "edge_count_change"
-	AlertBlockedIncrease    AlertType = "blocked_increase"
-	AlertActionableChange   AlertType = "actionable_change"
-	AlertStaleIssue         AlertType = "stale_issue"
-	AlertVelocityDrop       AlertType = "velocity_drop"
-	AlertBlockingCascade    AlertType = "blocking_cascade"
-	AlertHighImpactUnblock  AlertType = "high_impact_unblock"
-	AlertAbandonedClaim     AlertType = "abandoned_claim"
-	AlertPotentialDuplicate AlertType = "potential_duplicate"
-	AlertPriorityMismatch   AlertType = "priority_mismatch"
-	AlertScopeCreep         AlertType = "scope_creep"
+	AlertNewCycle            AlertType = "new_cycle"
+	AlertPageRankChange      AlertType = "pagerank_change"
+	AlertDensityGrowth       AlertType = "density_growth"
+	AlertNodeCountChange     AlertType = "node_count_change"
+	AlertEdgeCountChange     AlertType = "edge_count_change"
+	AlertBlockedIncrease     AlertType = "blocked_increase"
+	AlertActionableChange    AlertType = "actionable_change"
+	AlertStaleIssue          AlertType = "stale_issue"
+	AlertVelocityDrop        AlertType = "velocity_drop"
+	AlertBlockingCascade     AlertType = "blocking_cascade"
+	AlertHighImpactUnblock   AlertType = "high_impact_unblock"
+	AlertAbandonedClaim      AlertType = "abandoned_claim"
+	AlertPotentialDuplicate  AlertType = "potential_duplicate"
+	AlertPriorityMismatch    AlertType = "priority_mismatch"
+	AlertScopeCreep          AlertType = "scope_creep"
+	AlertSourceInconsistency AlertType = "source_inconsistency"
 )
 
 // AllAlertTypes returns every alert type Calculate can emit. Tests iterate it
@@ -64,6 +67,7 @@ func AllAlertTypes() []AlertType {
 		AlertBlockedIncrease,
 		AlertActionableChange,
 		AlertPageRankChange,
+		AlertSourceInconsistency,
 	}
 }
 
@@ -133,11 +137,12 @@ func (c *Calculator) expensiveCheckAllowed(result *Result, typ AlertType) bool {
 
 // Calculator performs drift detection
 type Calculator struct {
-	config   *Config
-	baseline *baseline.Baseline
-	current  *baseline.Baseline
-	issues   []model.Issue
-	now      time.Time
+	config      *Config
+	baseline    *baseline.Baseline
+	current     *baseline.Baseline
+	issues      []model.Issue
+	sourceDiffs []datasource.SourceDiff
+	now         time.Time
 
 	// analyzerCache is the graph analyzer over issues, built on first use so
 	// the issue-level checks share unblock/actionable/impact computations.
@@ -205,10 +210,15 @@ func (c *Calculator) ReuseAnalyzer(a *analysis.Analyzer) bool {
 		return false
 	}
 	issues := make([]model.Issue, len(c.issues))
-	candidates := make(map[string]bool, len(c.issues))
+	var candidates map[string]bool
+	if a.HasCandidateScope() {
+		candidates = make(map[string]bool, len(c.issues))
+	}
 	for i := range c.issues {
 		issues[i] = c.issues[i].Clone()
-		candidates[issues[i].ID] = a.IsCandidate(issues[i].ID)
+		if candidates != nil {
+			candidates[issues[i].ID] = a.IsCandidate(issues[i].ID)
+		}
 	}
 	c.issues = issues
 	c.analyzerReadiness = a.Readiness()
@@ -226,15 +236,59 @@ func (c *Calculator) validateBorrowedAnalyzer() {
 	}
 	valid := a.CaptureScoring() == c.analyzerScoring && a.Readiness() == c.analyzerReadiness
 	if valid {
-		for id, selected := range c.analyzerCandidates {
-			if a.IsCandidate(id) != selected {
-				valid = false
-				break
+		if c.analyzerCandidates == nil {
+			valid = !a.HasCandidateScope()
+		} else if !a.HasCandidateScope() {
+			valid = false
+		} else {
+			for i := range c.issues {
+				id := c.issues[i].ID
+				if a.IsCandidate(id) != c.analyzerCandidates[id] {
+					valid = false
+					break
+				}
 			}
 		}
 	}
 	if !valid {
 		c.analyzerSource = nil
+		c.analyzerCache = nil
+	}
+}
+
+// AllowCandidateIDs marks additional issue IDs (such as secondary-source-only
+// presence diffs that passed CLI scope filters) as eligible candidates when a
+// candidate scope is active. When no candidate scope is active
+// (analyzerCandidates == nil), all IDs are already eligible and this is a no-op.
+func (c *Calculator) AllowCandidateIDs(ids []string) {
+	if c.analyzerCandidates == nil || len(ids) == 0 {
+		return
+	}
+	copied := make(map[string]bool, len(c.analyzerCandidates)+len(ids))
+	for id, selected := range c.analyzerCandidates {
+		copied[id] = selected
+	}
+	changedAttached := false
+	if c.analyzerCache != nil && c.analyzerSource == nil {
+		for i := range c.issues {
+			id := c.issues[i].ID
+			if !copied[id] {
+				for _, allowID := range ids {
+					if allowID == id {
+						changedAttached = true
+						break
+					}
+				}
+			}
+		}
+	}
+	for _, id := range ids {
+		if id != "" {
+			copied[id] = true
+		}
+	}
+	c.analyzerCandidates = copied
+	if changedAttached {
 		c.analyzerCache = nil
 	}
 }
@@ -257,6 +311,16 @@ func (c *Calculator) SetCandidates(candidateIDs map[string]bool) {
 	c.analyzerCandidates = copied
 	c.analyzerSource = nil
 	c.analyzerCache = nil
+}
+
+// SetSourceDiffs attaches detected SQLite/JSONL source inconsistencies so
+// Calculate can emit source_inconsistency warnings alongside graph drift alerts.
+func (c *Calculator) SetSourceDiffs(diffs []datasource.SourceDiff) {
+	if len(diffs) == 0 {
+		c.sourceDiffs = nil
+		return
+	}
+	c.sourceDiffs = append([]datasource.SourceDiff(nil), diffs...)
 }
 
 func (c *Calculator) isCandidate(id string) bool {
@@ -323,6 +387,7 @@ func (c *Calculator) Calculate() *Result {
 	c.checkAbandonedClaim(result)
 	c.checkPotentialDuplicate(result)
 	c.checkPriorityMismatch(result)
+	c.checkSourceInconsistencies(result)
 
 	// Compute summary
 	for _, alert := range result.Alerts {
@@ -733,7 +798,7 @@ func (c *Calculator) checkStaleness(result *Result) {
 // stalenessSeverity is shared by capacity counting and emission so label
 // overrides, status multipliers and inclusive time boundaries stay identical.
 func (c *Calculator) stalenessSeverity(issue *model.Issue, now time.Time) (Severity, time.Time, float64) {
-	if issue.Status == model.StatusClosed || issue.Status == model.StatusTombstone {
+	if issue.IsParkedForStalenessAt(now) {
 		return "", time.Time{}, 0
 	}
 	lastActive := issue.UpdatedAt
@@ -1082,7 +1147,7 @@ func (c *Calculator) checkAbandonedClaim(result *Result) {
 		if !c.isCandidate(iss.ID) {
 			continue
 		}
-		if iss.Status != model.StatusInProgress || strings.TrimSpace(iss.Assignee) == "" {
+		if iss.Status != model.StatusInProgress || strings.TrimSpace(iss.Assignee) == "" || iss.IsParkedForStalenessAt(now) {
 			continue
 		}
 		lastActive := iss.UpdatedAt
@@ -1140,14 +1205,14 @@ func (c *Calculator) checkPotentialDuplicate(result *Result) {
 	if maxAlerts > 0 {
 		cfg.MaxSuggestions = maxAlerts
 	}
-	// Closed and tombstoned issues cannot be consolidated any more; pairing
-	// them only buries the live duplicates under history.
+	// Closed, tombstoned, and template issues cannot be consolidated any more;
+	// pairing them only buries live duplicates under history or boilerplate.
 	live := make([]model.Issue, 0, len(c.issues))
 	for _, iss := range c.issues {
 		if !c.isCandidate(iss.ID) {
 			continue
 		}
-		if iss.Status == model.StatusClosed || iss.Status == model.StatusTombstone {
+		if model.IsClosedLikeStatus(iss.Status) || iss.IsTemplate {
 			continue
 		}
 		live = append(live, iss)
@@ -1216,4 +1281,297 @@ func (c *Calculator) checkPriorityMismatch(result *Result) {
 			SuggestedAction: fmt.Sprintf("Review with bv --robot-priority; if it holds, set the priority to P%d", rec.SuggestedPriority),
 		})
 	}
+}
+
+const (
+	sourceInconsistencySuggestedActionGeneric    = "Check which source is authoritative before running 'br sync --flush-only' (SQLite -> JSONL) vs 'br sync --import-only' (JSONL -> SQLite)"
+	sourceInconsistencySuggestedActionImportOnly = "Run 'br sync --import-only' to import JSONL changes into SQLite without overwriting newer external JSONL edits"
+	sourceInconsistencySuggestedActionFlushOnly  = "Run 'br sync --flush-only' to export SQLite changes to JSONL"
+)
+
+func classifySourceKind(path string) string {
+	trimmed := strings.ToLower(strings.TrimSpace(path))
+	trimmed = strings.TrimSuffix(trimmed, "-wal")
+	switch filepath.Ext(trimmed) {
+	case ".db", ".sqlite", ".sqlite3":
+		return "sqlite"
+	case ".jsonl":
+		return "jsonl"
+	}
+	if strings.Contains(trimmed, "beads.db") {
+		return "sqlite"
+	}
+	if strings.Contains(trimmed, ".jsonl") {
+		return "jsonl"
+	}
+	return ""
+}
+
+func suggestSourceInconsistencyAction(item datasource.IssueSourceDiff) string {
+	kindA := classifySourceKind(item.SourceA)
+	kindB := classifySourceKind(item.SourceB)
+	if !((kindA == "sqlite" && kindB == "jsonl") || (kindA == "jsonl" && kindB == "sqlite")) {
+		return sourceInconsistencySuggestedActionGeneric
+	}
+
+	var sqliteUpdated, jsonlUpdated, sqliteMod, jsonlMod time.Time
+	if kindA == "sqlite" {
+		sqliteUpdated, jsonlUpdated = item.UpdatedAtA, item.UpdatedAtB
+		sqliteMod, jsonlMod = item.ModTimeA, item.ModTimeB
+	} else {
+		jsonlUpdated, sqliteUpdated = item.UpdatedAtA, item.UpdatedAtB
+		jsonlMod, sqliteMod = item.ModTimeA, item.ModTimeB
+	}
+
+	diffLower := strings.ToLower(strings.TrimSpace(item.Difference))
+	isPresence := item.Field == "presence" || strings.HasPrefix(diffLower, "missing in ")
+	if isPresence {
+		var presentKind string
+		switch {
+		case item.ValueA != "" && item.ValueB == "":
+			presentKind = kindA
+		case item.ValueB != "" && item.ValueA == "":
+			presentKind = kindB
+		case item.SourceA != "" && strings.Contains(diffLower, strings.ToLower(item.SourceA)):
+			presentKind = kindB
+		case item.SourceB != "" && strings.Contains(diffLower, strings.ToLower(item.SourceB)):
+			presentKind = kindA
+		}
+		switch presentKind {
+		case "jsonl":
+			if !sqliteMod.IsZero() && !jsonlMod.IsZero() && sqliteMod.After(jsonlMod) {
+				return sourceInconsistencySuggestedActionGeneric
+			}
+			return sourceInconsistencySuggestedActionImportOnly
+		case "sqlite":
+			if !jsonlMod.IsZero() && !sqliteMod.IsZero() && jsonlMod.After(sqliteMod) {
+				return sourceInconsistencySuggestedActionImportOnly
+			}
+			return sourceInconsistencySuggestedActionFlushOnly
+		}
+	}
+
+	// Field mismatch: if JSONL is strictly newer by issue UpdatedAt or file ModTime, lead with --import-only.
+	if !jsonlUpdated.IsZero() && !sqliteUpdated.IsZero() {
+		if jsonlUpdated.After(sqliteUpdated) {
+			return sourceInconsistencySuggestedActionImportOnly
+		}
+	} else if !jsonlMod.IsZero() && !sqliteMod.IsZero() && jsonlMod.After(sqliteMod) {
+		return sourceInconsistencySuggestedActionImportOnly
+	}
+
+	return sourceInconsistencySuggestedActionGeneric
+}
+
+func expandSourceDiffItems(diffs []datasource.SourceDiff) []datasource.IssueSourceDiff {
+	var items []datasource.IssueSourceDiff
+	for _, d := range diffs {
+		if len(d.IssueDiffs) > 0 {
+			for _, item := range d.IssueDiffs {
+				if item.SourceA == "" {
+					item.SourceA = d.SourceA
+				}
+				if item.SourceB == "" {
+					item.SourceB = d.SourceB
+				}
+				if item.ModTimeA.IsZero() {
+					item.ModTimeA = d.ModTimeA
+				}
+				if item.ModTimeB.IsZero() {
+					item.ModTimeB = d.ModTimeB
+				}
+				items = append(items, item)
+			}
+			continue
+		}
+		if d.IssueID != "" {
+			items = append(items, datasource.IssueSourceDiff{
+				IssueID:    d.IssueID,
+				Difference: d.Difference,
+				SourceA:    d.SourceA,
+				SourceB:    d.SourceB,
+				ValueA:     d.ValueA,
+				ValueB:     d.ValueB,
+				ModTimeA:   d.ModTimeA,
+				ModTimeB:   d.ModTimeB,
+			})
+			continue
+		}
+		if len(d.MissingInB) > 0 {
+			missingB := append([]string(nil), d.MissingInB...)
+			sort.Strings(missingB)
+			for _, id := range missingB {
+				items = append(items, datasource.IssueSourceDiff{
+					IssueID:    id,
+					Field:      "presence",
+					Difference: fmt.Sprintf("missing in %s", d.SourceB),
+					SourceA:    d.SourceA,
+					SourceB:    d.SourceB,
+					ModTimeA:   d.ModTimeA,
+					ModTimeB:   d.ModTimeB,
+				})
+			}
+		}
+		if len(d.MissingInA) > 0 {
+			missingA := append([]string(nil), d.MissingInA...)
+			sort.Strings(missingA)
+			for _, id := range missingA {
+				items = append(items, datasource.IssueSourceDiff{
+					IssueID:    id,
+					Field:      "presence",
+					Difference: fmt.Sprintf("missing in %s", d.SourceA),
+					SourceA:    d.SourceA,
+					SourceB:    d.SourceB,
+					ModTimeA:   d.ModTimeA,
+					ModTimeB:   d.ModTimeB,
+				})
+			}
+		}
+		for _, m := range d.StatusMismatch {
+			items = append(items, datasource.IssueSourceDiff{
+				IssueID:    m.ID,
+				Field:      "status",
+				Difference: "status mismatch",
+				SourceA:    d.SourceA,
+				SourceB:    d.SourceB,
+				ValueA:     m.StatusA,
+				ValueB:     m.StatusB,
+				ModTimeA:   d.ModTimeA,
+				ModTimeB:   d.ModTimeB,
+			})
+		}
+		for _, m := range d.FieldMismatches {
+			field := m.Field
+			if field == "" {
+				field = "field"
+			}
+			items = append(items, datasource.IssueSourceDiff{
+				IssueID:    m.ID,
+				Field:      field,
+				Difference: fmt.Sprintf("%s mismatch", field),
+				SourceA:    d.SourceA,
+				SourceB:    d.SourceB,
+				ValueA:     m.ValueA,
+				ValueB:     m.ValueB,
+				ModTimeA:   d.ModTimeA,
+				ModTimeB:   d.ModTimeB,
+			})
+		}
+	}
+	return items
+}
+
+func sourceInconsistencyAlertsFiltered(
+	diffs []datasource.SourceDiff,
+	maxAlerts int,
+	now time.Time,
+	allow func(string) bool,
+	issueMap map[string]*model.Issue,
+) []Alert {
+	items := expandSourceDiffItems(diffs)
+	if len(items) == 0 {
+		return nil
+	}
+	var missingIssues map[string]model.Issue
+	for _, d := range diffs {
+		for id, iss := range d.MissingIssues {
+			if missingIssues == nil {
+				missingIssues = make(map[string]model.Issue, len(d.MissingIssues))
+			}
+			if _, exists := missingIssues[id]; !exists {
+				missingIssues[id] = iss
+			}
+		}
+	}
+	alerts := make([]Alert, 0, len(items))
+	for _, item := range items {
+		if allow != nil && item.IssueID != "" && !allow(item.IssueID) {
+			continue
+		}
+		if maxAlerts > 0 && len(alerts) >= maxAlerts {
+			break
+		}
+		diffDesc := strings.TrimSpace(item.Difference)
+		if diffDesc == "" {
+			if item.Field != "" {
+				diffDesc = fmt.Sprintf("%s mismatch", item.Field)
+			} else {
+				diffDesc = "source mismatch"
+			}
+		}
+		srcA := item.SourceA
+		if srcA == "" {
+			srcA = "source A"
+		}
+		srcB := item.SourceB
+		if srcB == "" {
+			srcB = "source B"
+		}
+
+		var details []string
+		details = append(details, fmt.Sprintf("source_a=%s", srcA), fmt.Sprintf("source_b=%s", srcB))
+		if item.Field != "" {
+			details = append(details, fmt.Sprintf("field=%s", item.Field))
+		}
+		if item.ValueA != "" {
+			details = append(details, fmt.Sprintf("value_a=%s", item.ValueA))
+		}
+		if item.ValueB != "" {
+			details = append(details, fmt.Sprintf("value_b=%s", item.ValueB))
+		}
+
+		var labels []string
+		if issueMap != nil {
+			if iss := issueMap[item.IssueID]; iss != nil {
+				labels = iss.Labels
+			}
+		}
+		if len(labels) == 0 && missingIssues != nil {
+			if iss, ok := missingIssues[item.IssueID]; ok && len(iss.Labels) > 0 {
+				labels = append([]string(nil), iss.Labels...)
+			}
+		}
+
+		msg := fmt.Sprintf("Source inconsistency on %s (%s) between %s and %s", item.IssueID, diffDesc, srcA, srcB)
+		if item.ValueA != "" && item.ValueB != "" {
+			msg = fmt.Sprintf("Source inconsistency on %s (%s: %q vs %q) between %s and %s", item.IssueID, diffDesc, item.ValueA, item.ValueB, srcA, srcB)
+		}
+
+		alerts = append(alerts, Alert{
+			Type:            AlertSourceInconsistency,
+			Severity:        SeverityWarning,
+			Message:         msg,
+			IssueID:         item.IssueID,
+			Labels:          labels,
+			DetectedAt:      now,
+			Details:         details,
+			SuggestedAction: suggestSourceInconsistencyAction(item),
+		})
+	}
+	return alerts
+}
+
+// SourceInconsistencyAlerts converts detected data-source differences (e.g.
+// SQLite vs JSONL drift) into structured drift warnings capped at maxAlerts
+// (0 = unlimited).
+func SourceInconsistencyAlerts(diffs []datasource.SourceDiff, maxAlerts int, now time.Time) []Alert {
+	return sourceInconsistencyAlertsFiltered(diffs, maxAlerts, now.UTC(), nil, nil)
+}
+
+func (c *Calculator) checkSourceInconsistencies(result *Result) {
+	if c.config.IsAlertDisabled(string(AlertSourceInconsistency)) || len(c.sourceDiffs) == 0 {
+		return
+	}
+	var issueMap map[string]*model.Issue
+	if len(c.issues) > 0 {
+		issueMap = c.issueMap()
+	}
+	alerts := sourceInconsistencyAlertsFiltered(
+		c.sourceDiffs,
+		c.config.SourceDriftMaxAlerts,
+		c.nowUTC(),
+		c.isCandidate,
+		issueMap,
+	)
+	result.Alerts = append(result.Alerts, alerts...)
 }

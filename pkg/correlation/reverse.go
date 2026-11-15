@@ -13,14 +13,18 @@ import (
 
 // CommitBeadResult represents the result of a commit-to-bead lookup.
 type CommitBeadResult struct {
-	CommitSHA    string        `json:"commit_sha"`
-	ShortSHA     string        `json:"short_sha"`
-	Message      string        `json:"message"`
-	Author       string        `json:"author"`
-	AuthorEmail  string        `json:"author_email"`
-	Timestamp    time.Time     `json:"timestamp"`
-	RelatedBeads []RelatedBead `json:"related_beads"`
-	IsOrphan     bool          `json:"is_orphan"` // True if no beads found
+	CommitSHA        string           `json:"commit_sha"`
+	ShortSHA         string           `json:"short_sha"`
+	Message          string           `json:"message"`
+	Author           string           `json:"author"`
+	AuthorEmail      string           `json:"author_email"`
+	Timestamp        time.Time        `json:"timestamp"`
+	RelatedBeads     []RelatedBead    `json:"related_beads"`
+	IsOrphan         bool             `json:"is_orphan"`                    // True if code commit has no beads correlated
+	BeadsOnly        bool             `json:"beads_only,omitempty"`         // True if commit touched only tracker (.beads/) files
+	FilteredOutCount int              `json:"filtered_out_count,omitempty"` // Correlated beads hidden by scope/confidence filters
+	OrphanCandidate  *OrphanCandidate `json:"orphan_candidate,omitempty"`   // Orphan candidate rescue analysis when is_orphan is true
+	OrphanCandidates []ProbableBead   `json:"orphan_candidates,omitempty"`  // Rescued probable beads when is_orphan is true
 }
 
 // RelatedBead represents a bead related to a commit.
@@ -309,6 +313,20 @@ func (rl *ReverseLookup) LookupByCommit(sha string) (*CommitBeadResult, error) {
 	// Find related beads
 	beadIDs := rl.index[fullSHA]
 	if len(beadIDs) == 0 {
+		if rl.repoPath != "" {
+			if walk, walkErr := walkCommitsBySHAs(rl.ctx, rl.repoPath, []string{fullSHA}); walkErr == nil {
+				if len(walk) == 0 {
+					// Merge commit (--no-merges excluded it): never counted as an orphan.
+					result.IsOrphan = false
+					return result, nil
+				}
+				if rl.isTrackerOnlyCommit(walk[0]) {
+					result.BeadsOnly = true
+					result.IsOrphan = false
+					return result, nil
+				}
+			}
+		}
 		result.IsOrphan = true
 		return result, nil
 	}
@@ -349,10 +367,10 @@ func (rl *ReverseLookup) LookupByCommit(sha string) (*CommitBeadResult, error) {
 
 // resolveSHA expands a unique short SHA prefix to the indexed full SHA.
 func (rl *ReverseLookup) resolveSHA(sha string) (string, error) {
-	sha = strings.ToLower(strings.TrimSpace(sha))
-	if sha == "" {
-		return "", fmt.Errorf("commit SHA is required")
+	if err := validateGitRefArg(sha); err != nil {
+		return "", err
 	}
+	sha = strings.ToLower(strings.TrimSpace(sha))
 
 	if _, ok := rl.index[sha]; ok {
 		return sha, nil
@@ -391,8 +409,11 @@ func (rl *ReverseLookup) getCommitInfo(sha string) (*commitInfo, error) {
 	if rl.repoPath == "" {
 		return nil, fmt.Errorf("no repo path configured")
 	}
+	if err := validateGitRefArg(sha); err != nil {
+		return nil, err
+	}
 
-	cmd := gitCommand(rl.ctx, "log", "-1", "--format="+gitLogHeaderFormat, sha)
+	cmd := gitCommand(rl.ctx, "log", "-1", "--format="+gitLogHeaderFormat, "--end-of-options", sha)
 	cmd.Dir = rl.repoPath
 
 	out, err := cmd.Output()

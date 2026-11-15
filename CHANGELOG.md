@@ -216,6 +216,30 @@ every reported vulnerability has an exploitable execution path in bv.
   combining-mark FTS5/LIKE search with literal `_`/`%` wildcard escaping, monotonic
   Mermaid render sequencing, WASM cycle/metric fallbacks, non-blocking dependency
   views, and standalone HTML graph filters/Path Finder reset.
+- **Wave 10 unwired-capability closure, `--robot-commit` & `--init-drift`, live
+  SQLite/JSONL drift alerts, full-source readiness parity, TUI `TreeModeBlocking`,
+  and static-dashboard/WASM bundle fidelity (`bv-apal.50`..`bv-apal.57`):** wire
+  reverse commit-to-bead lookup (`--robot-commit <sha|ref>` / `bv commit <ref> --json`
+  across `RobotRegistry`, `RobotSchemas`, single-repo & `--workspace`, and orphan
+  candidate rescue), `.bv/drift.yaml` bootstrap (`--init-drift` with `--yes`
+  overwrite guard), and live SQLite-vs-JSONL `source_inconsistency` drift alerts in
+  `--robot-alerts`, `--robot-drift`, and `--check-drift` (`internal/datasource/diff.go`);
+  filter cycle-creating missing-dependency suggestions via incremental
+  `GetCycleFreeSuggestions` (`dep.Type.IsBlocking()`) before `MaxSuggestions` in
+  `--robot-suggest`, suppress parked/deferred/template staleness, abandoned-claim,
+  duplicate, and sprint `at_risk` false positives, and honor `BV_NO_SAVED_CONFIG`,
+  `$XDG_CONFIG_HOME/bv/agent-prompts`, and `SOURCE_DATE_EPOCH` across preferences
+  and baselines; preserve full-source `ReadinessIndex` (external cross-scope blockers
+  and `TombstoneIDs`) across `--robot-label-health`, `--robot-label-flow`,
+  `--robot-label-attention`, hybrid semantic search, `--diff-since` historical
+  snapshots/commit timestamps, `--feedback-accept`/`--feedback-ignore`, and static
+  SVG/PNG `#ffcdd2` blocked-node snapshots; wire TUI `TreeModeBlocking` (`m` in Tree
+  View), active-filter Tree/Actionable/Board/Insights synchronization, multi-repo
+  History correlation, Cass workspace/relative-path stripping, Flow Matrix/Attention/
+  Sprint viewport scrolling & live refreshes, and `Recipe.Sort.Field = "updated"`;
+  and complete static-dashboard WASM `criticalPathSlack`, `triage.alerts`,
+  blocking-aware Blocked KPI/list/Kanban classification, offline `wasm/` service-worker
+  manifest precaching, and `BV_BUILD_HYBRID_WASM=1` pre-manifest bundle staging.
 
 ## v0.26.0 — 2026-11-02
 

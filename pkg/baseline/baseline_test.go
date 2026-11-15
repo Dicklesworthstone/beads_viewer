@@ -1,6 +1,7 @@
 package baseline
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -240,5 +241,40 @@ func TestLoadInvalidJSON(t *testing.T) {
 	_, err := Load(path)
 	if err == nil {
 		t.Error("expected error for invalid JSON")
+	}
+}
+
+func TestNewForDir_HonorsSourceDateEpoch(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("SOURCE_DATE_EPOCH", "1700000000")
+
+	b := NewForDir(tmpDir, GraphStats{NodeCount: 3}, TopMetrics{}, nil, "deterministic")
+	want := time.Unix(1700000000, 0).UTC()
+	if !b.CreatedAt.Equal(want) {
+		t.Fatalf("CreatedAt = %s, want %s", b.CreatedAt.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+	if b.CreatedAt.Location() != time.UTC {
+		t.Fatalf("expected UTC location, got %v", b.CreatedAt.Location())
+	}
+
+	// Invalid / negative SOURCE_DATE_EPOCH falls back to current UTC wall clock.
+	t.Setenv("SOURCE_DATE_EPOCH", "-5")
+	before := time.Now().UTC().Add(-2 * time.Second)
+	bFallback := NewForDir(tmpDir, GraphStats{NodeCount: 1}, TopMetrics{}, nil, "fallback")
+	after := time.Now().UTC().Add(2 * time.Second)
+	if bFallback.CreatedAt.Before(before) || bFallback.CreatedAt.After(after) {
+		t.Fatalf("expected fallback CreatedAt in [%s, %s], got %s", before, after, bFallback.CreatedAt)
+	}
+
+	// Year >= 10000 (>= 253402300800) must also fall back to wall-clock time so json.Marshal never fails.
+	for _, huge := range []string{"253402300800", "9999999999999"} {
+		t.Setenv("SOURCE_DATE_EPOCH", huge)
+		bHuge := NewForDir(tmpDir, GraphStats{NodeCount: 1}, TopMetrics{}, nil, "huge-epoch")
+		if bHuge.CreatedAt.Year() < 0 || bHuge.CreatedAt.Year() >= 10000 {
+			t.Fatalf("SOURCE_DATE_EPOCH=%s produced unencodable year %d", huge, bHuge.CreatedAt.Year())
+		}
+		if _, err := json.Marshal(bHuge); err != nil {
+			t.Fatalf("json.Marshal failed for SOURCE_DATE_EPOCH=%s: %v", huge, err)
+		}
 	}
 }

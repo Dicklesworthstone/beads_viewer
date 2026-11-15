@@ -364,6 +364,15 @@ func TestSortIssues_DefaultsAndFields(t *testing.T) {
 	requireIDs(t, sorted("title", "desc"), "A", "B")
 	requireIDs(t, sorted("status", ""), "B", "A") // "blocked" < "open"
 
+	assigneeIssues := []model.Issue{
+		{ID: "A", Assignee: "zoe"},
+		{ID: "B", Assignee: "alice"},
+	}
+	recipe.SortIssues(assigneeIssues, recipe.Metrics{}, &recipe.Recipe{Sort: recipe.SortConfig{Field: "assignee"}})
+	requireIDs(t, assigneeIssues, "B", "A")
+	recipe.SortIssues(assigneeIssues, recipe.Metrics{}, &recipe.Recipe{Sort: recipe.SortConfig{Field: "assignee", Direction: "desc"}})
+	requireIDs(t, assigneeIssues, "A", "B")
+
 	// ID sorts naturally: bv-2 before bv-10.
 	idIssues := []model.Issue{{ID: "bv-10"}, {ID: "bv-2"}, {ID: "bv-1"}, {ID: "x"}}
 	recipe.SortIssues(idIssues, recipe.Metrics{}, &recipe.Recipe{Sort: recipe.SortConfig{Field: "id"}})

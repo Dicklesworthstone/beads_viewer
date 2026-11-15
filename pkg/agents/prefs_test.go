@@ -3,6 +3,7 @@ package agents
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -371,5 +372,105 @@ func TestShouldPromptForAgentUpgrade(t *testing.T) {
 				t.Errorf("ShouldPromptForAgentUpgrade(..., %d) = %v, want %v", tt.targetVersion, got, tt.expected)
 			}
 		})
+	}
+}
+
+func TestAgentPrefs_NoSavedConfigAndXDGConfigHome(t *testing.T) {
+	homeDir := t.TempDir()
+	xdgDir := filepath.Join(t.TempDir(), "custom-xdg")
+	projectDir := t.TempDir()
+
+	t.Setenv("HOME", homeDir)
+	t.Setenv("XDG_CONFIG_HOME", xdgDir)
+	t.Setenv("BV_NO_SAVED_CONFIG", "1")
+
+	if ShouldPromptForAgentFile(projectDir) {
+		t.Fatal("ShouldPromptForAgentFile should return false when BV_NO_SAVED_CONFIG=1")
+	}
+	if ShouldPromptForAgentUpgrade(projectDir, BlurbVersion) {
+		t.Fatal("ShouldPromptForAgentUpgrade should return false when BV_NO_SAVED_CONFIG=1")
+	}
+	pref, err := LoadAgentPromptPreference(projectDir)
+	if err != nil {
+		t.Fatalf("LoadAgentPromptPreference error: %v", err)
+	}
+	if pref != nil {
+		t.Fatalf("expected nil preference when BV_NO_SAVED_CONFIG=1, got %+v", pref)
+	}
+
+	if err := SaveAgentPromptPreference(projectDir, AgentPromptPreference{DontAskAgain: true}); err != nil {
+		t.Fatalf("SaveAgentPromptPreference should no-op cleanly under BV_NO_SAVED_CONFIG=1: %v", err)
+	}
+	if err := RecordDecline(projectDir, true); err != nil {
+		t.Fatalf("RecordDecline should no-op cleanly under BV_NO_SAVED_CONFIG=1: %v", err)
+	}
+	if err := RecordAccept(projectDir); err != nil {
+		t.Fatalf("RecordAccept should no-op cleanly under BV_NO_SAVED_CONFIG=1: %v", err)
+	}
+	if err := ClearPreference(projectDir); err != nil {
+		t.Fatalf("ClearPreference should no-op cleanly under BV_NO_SAVED_CONFIG=1: %v", err)
+	}
+	if _, err := os.Stat(xdgDir); !os.IsNotExist(err) {
+		t.Fatalf("expected zero disk writes to XDG_CONFIG_HOME under BV_NO_SAVED_CONFIG=1, stat err=%v", err)
+	}
+
+	// Any non-empty value (including "0" or "false") still disables saved config.
+	for _, nonEmpty := range []string{"0", "false", "no", "off"} {
+		t.Setenv("BV_NO_SAVED_CONFIG", nonEmpty)
+		if !SavedConfigDisabled() {
+			t.Fatalf("SavedConfigDisabled() = false for BV_NO_SAVED_CONFIG=%q, want true", nonEmpty)
+		}
+		if err := RecordAccept(projectDir); err != nil {
+			t.Fatalf("RecordAccept under BV_NO_SAVED_CONFIG=%q: %v", nonEmpty, err)
+		}
+		if _, err := os.Stat(xdgDir); !os.IsNotExist(err) {
+			t.Fatalf("expected zero disk writes under BV_NO_SAVED_CONFIG=%q, stat err=%v", nonEmpty, err)
+		}
+	}
+
+	// Unset / empty BV_NO_SAVED_CONFIG re-enables saved config and routes to XDG_CONFIG_HOME.
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	if SavedConfigDisabled() {
+		t.Fatal("SavedConfigDisabled() = true when BV_NO_SAVED_CONFIG is empty, want false")
+	}
+	if err := RecordAccept(projectDir); err != nil {
+		t.Fatalf("RecordAccept with XDG_CONFIG_HOME: %v", err)
+	}
+	prefsPath, err := getPrefsPath(projectDir)
+	if err != nil {
+		t.Fatalf("getPrefsPath: %v", err)
+	}
+	wantXDGPrefix := filepath.Join(xdgDir, "bv", "agent-prompts")
+	if filepath.Dir(prefsPath) != wantXDGPrefix {
+		t.Fatalf("getPrefsPath dir = %q, want %q", filepath.Dir(prefsPath), wantXDGPrefix)
+	}
+	if _, err := os.Stat(prefsPath); err != nil {
+		t.Fatalf("expected preference file at %s: %v", prefsPath, err)
+	}
+
+	// Even when a preference file exists on disk, BV_NO_SAVED_CONFIG=1 must ignore it and suppress prompts.
+	t.Setenv("BV_NO_SAVED_CONFIG", "true")
+	if got, err := LoadAgentPromptPreference(projectDir); err != nil || got != nil {
+		t.Fatalf("expected nil preference when BV_NO_SAVED_CONFIG=true, got %+v (err=%v)", got, err)
+	}
+	if err := ClearPreference(projectDir); err != nil {
+		t.Fatalf("ClearPreference under BV_NO_SAVED_CONFIG=true: %v", err)
+	}
+	if _, err := os.Stat(prefsPath); err != nil {
+		t.Fatalf("ClearPreference must not delete existing file when BV_NO_SAVED_CONFIG=true: %v", err)
+	}
+
+	// Unset XDG_CONFIG_HOME on Unix -> ~/.config/bv/agent-prompts.
+	if runtime.GOOS != "windows" {
+		t.Setenv("BV_NO_SAVED_CONFIG", "")
+		t.Setenv("XDG_CONFIG_HOME", "")
+		dir, err := getPrefsDir()
+		if err != nil {
+			t.Fatalf("getPrefsDir with unset XDG_CONFIG_HOME: %v", err)
+		}
+		wantHomeConfig := filepath.Join(homeDir, ".config", "bv", "agent-prompts")
+		if dir != wantHomeConfig {
+			t.Fatalf("getPrefsDir() = %q, want %q", dir, wantHomeConfig)
+		}
 	}
 }

@@ -66,15 +66,34 @@ type ViewConfig struct {
 	Columns       []string `yaml:"columns,omitempty" json:"columns,omitempty"`               // Ordered list columns; empty keeps the normal adaptive row
 	ShowGraph     bool     `yaml:"show_graph,omitempty" json:"show_graph,omitempty"`         // Start in the dependency graph
 	ShowMetrics   bool     `yaml:"show_metrics,omitempty" json:"show_metrics,omitempty"`     // Show selected metric values on list rows and in issue details
-	GroupBy       string   `yaml:"group_by,omitempty" json:"group_by,omitempty"`             // List groups: status, priority, tag (first sorted label), none
+	GroupBy       string   `yaml:"group_by,omitempty" json:"group_by,omitempty"`             // List groups: status, priority, assignee, tag/label (first sorted label), none
 	Collapsed     bool     `yaml:"collapsed,omitempty" json:"collapsed,omitempty"`           // Start list groups collapsed; Enter toggles a group
 	MaxItems      int      `yaml:"max_items,omitempty" json:"max_items,omitempty"`           // Keep only the first N issues after sorting (0 = unlimited)
 	TruncateTitle int      `yaml:"truncate_title,omitempty" json:"truncate_title,omitempty"` // Maximum title display cells; 0 uses available width
 }
 
 // Presentation field names are shared by validation and the TUI renderer.
-var ViewColumns = []string{"id", "title", "status", "priority", "created", "updated", "tags", "blockers"}
+var ViewColumns = []string{"id", "title", "status", "priority", "assignee", "created", "updated", "tags", "blockers"}
 var ViewMetrics = []string{"pagerank", "betweenness", "impact", "triage", "hub", "authority", "eigenvector", "kcore", "slack"}
+
+var viewColumnAliases = map[string]string{
+	"label":  "tags",
+	"labels": "tags",
+}
+
+// CanonicalViewColumn normalizes accepted column aliases (e.g. label/labels -> tags).
+func CanonicalViewColumn(col string) (string, bool) {
+	c := strings.ToLower(strings.TrimSpace(col))
+	if alias, ok := viewColumnAliases[c]; ok {
+		c = alias
+	}
+	for _, known := range ViewColumns {
+		if c == known {
+			return c, true
+		}
+	}
+	return c, false
+}
 
 // ExportConfig supplies defaults only when an export is explicitly requested.
 type ExportConfig struct {
@@ -104,6 +123,7 @@ const (
 	SortFieldTitle       = "title"
 	SortFieldID          = "id"
 	SortFieldStatus      = "status"
+	SortFieldAssignee    = "assignee"
 	SortFieldPageRank    = "pagerank"    // Metrics.Graph
 	SortFieldBetweenness = "betweenness" // Metrics.Graph
 	SortFieldImpact      = "impact"      // Metrics.Graph (critical-path score)
@@ -123,7 +143,7 @@ func canonicalSortField(field string) (string, bool) {
 		f = alias
 	}
 	switch f {
-	case SortFieldPriority, SortFieldCreated, SortFieldUpdated, SortFieldTitle, SortFieldID, SortFieldStatus,
+	case SortFieldPriority, SortFieldCreated, SortFieldUpdated, SortFieldTitle, SortFieldID, SortFieldStatus, SortFieldAssignee,
 		SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage:
 		return f, true
 	}
@@ -217,37 +237,41 @@ func (r *Recipe) Validate() error {
 	if r.View.TruncateTitle < 0 {
 		problems = append(problems, "view.truncate_title must not be negative")
 	}
-	for _, field := range []struct {
-		name          string
-		values, known []string
-	}{
-		{"view.columns", r.View.Columns, ViewColumns},
-		{"metrics", r.Metrics, ViewMetrics},
-	} {
-		seen := make(map[string]bool)
-		for _, value := range field.values {
-			valid := false
-			for _, known := range field.known {
-				if value == known {
-					valid = true
-					break
-				}
-			}
-			if !valid {
-				problems = append(problems, fmt.Sprintf("%s %q must be one of %s", field.name, value, strings.Join(field.known, ", ")))
-			}
-			if seen[value] {
-				problems = append(problems, fmt.Sprintf("%s repeats %q", field.name, value))
-			}
-			seen[value] = true
+	seenCols := make(map[string]bool)
+	for _, value := range r.View.Columns {
+		canon, valid := CanonicalViewColumn(value)
+		if !valid {
+			problems = append(problems, fmt.Sprintf("view.columns %q must be one of %s (or label/labels)", value, strings.Join(ViewColumns, ", ")))
 		}
+		if seenCols[canon] {
+			problems = append(problems, fmt.Sprintf("view.columns repeats %q", value))
+		}
+		seenCols[canon] = true
 	}
-	switch r.View.GroupBy {
-	case "", "none", "status", "priority", "tag":
+	seenMetrics := make(map[string]bool)
+	for _, value := range r.Metrics {
+		valid := false
+		for _, known := range ViewMetrics {
+			if value == known {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			problems = append(problems, fmt.Sprintf("metrics %q must be one of %s", value, strings.Join(ViewMetrics, ", ")))
+		}
+		if seenMetrics[value] {
+			problems = append(problems, fmt.Sprintf("metrics repeats %q", value))
+		}
+		seenMetrics[value] = true
+	}
+	groupBy := strings.ToLower(strings.TrimSpace(r.View.GroupBy))
+	switch groupBy {
+	case "", "none", "status", "priority", "assignee", "tag", "tags", "label", "labels":
 	default:
-		problems = append(problems, fmt.Sprintf("view.group_by %q must be status, priority, tag or none", r.View.GroupBy))
+		problems = append(problems, fmt.Sprintf("view.group_by %q must be status, priority, assignee, tag, label or none", r.View.GroupBy))
 	}
-	if r.View.Collapsed && (r.View.GroupBy == "" || r.View.GroupBy == "none") {
+	if r.View.Collapsed && (groupBy == "" || groupBy == "none") {
 		problems = append(problems, "view.collapsed requires view.group_by")
 	}
 	switch r.Export.Format {
@@ -262,7 +286,7 @@ func (r *Recipe) Validate() error {
 }
 
 func knownSortFields() []string {
-	return []string{SortFieldPriority, SortFieldCreated, SortFieldUpdated, SortFieldTitle, SortFieldID, SortFieldStatus,
+	return []string{SortFieldPriority, SortFieldCreated, SortFieldUpdated, SortFieldTitle, SortFieldID, SortFieldStatus, SortFieldAssignee,
 		SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage}
 }
 

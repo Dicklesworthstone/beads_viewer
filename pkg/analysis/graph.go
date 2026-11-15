@@ -1372,7 +1372,12 @@ func (a *Analyzer) Readiness() *model.ReadinessIndex {
 
 // IsCandidate reports output eligibility independently of dependency state.
 func (a *Analyzer) IsCandidate(id string) bool {
-	return a.candidateIDs == nil || a.candidateIDs[id]
+	return a == nil || a.candidateIDs == nil || a.candidateIDs[id]
+}
+
+// HasCandidateScope reports whether an explicit candidate scope filter is active.
+func (a *Analyzer) HasCandidateScope() bool {
+	return a != nil && a.candidateIDs != nil
 }
 
 // SetNow overrides the reference instant used for time-gated readiness checks

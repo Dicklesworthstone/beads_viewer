@@ -155,12 +155,15 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 
 	var sources []DataSource
 
-	// Discover SQLite database
-	sqliteSources, err := discoverSQLiteSources(beadsDir, opts)
-	if err != nil {
-		return nil, err
+	// Discover SQLite database unless this is a bd/Dolt workspace (#189),
+	// where any leftover beads.db is stale pre-migration state rather than an active store.
+	if !loader.IsBDWorkspace(beadsDir) {
+		sqliteSources, err := discoverSQLiteSources(beadsDir, opts)
+		if err != nil {
+			return nil, err
+		}
+		sources = append(sources, sqliteSources...)
 	}
-	sources = append(sources, sqliteSources...)
 
 	// Discover local JSONL files
 	localSources, err := discoverLocalJSONLSources(beadsDir, opts)
@@ -233,6 +236,9 @@ func resolveBeadsDBPath(dbPath string) string {
 
 // discoverSQLiteSources finds SQLite databases in the beads directory
 func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource, error) {
+	if loader.IsBDWorkspace(beadsDir) {
+		return nil, nil
+	}
 	var sources []DataSource
 
 	// Look for beads.db

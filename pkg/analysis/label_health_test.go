@@ -3,6 +3,7 @@ package analysis
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"strings"
@@ -3147,5 +3148,232 @@ func TestComputeAllLabelHealthDeduplicatesDuplicateLabelsOnSameIssue(t *testing.
 	scoresClean := ComputeLabelHealthScores(cleanIssues, cfg, now, nil)
 	if scoresDup["api"] != scoresClean["api"] || scoresDup["db"] != scoresClean["db"] {
 		t.Fatalf("ComputeLabelHealthScores mismatch with duplicate labels: got %+v, want %+v", scoresDup, scoresClean)
+	}
+}
+
+func TestLabelHealth_ParkedBeadsDoNotInflateStaleness(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	ancient := now.Add(-60 * 24 * time.Hour)
+	future := now.Add(14 * 24 * time.Hour)
+
+	issues := []model.Issue{
+		{ID: "DEF-1", Labels: []string{"roadmap"}, Status: model.StatusDeferred, UpdatedAt: ancient, CreatedAt: ancient},
+		{ID: "PIN-1", Labels: []string{"roadmap"}, Status: model.StatusOpen, Pinned: true, UpdatedAt: ancient, CreatedAt: ancient},
+		{ID: "TMPL-1", Labels: []string{"roadmap"}, Status: model.StatusOpen, IsTemplate: true, UpdatedAt: ancient, CreatedAt: ancient},
+		{ID: "EPH-1", Labels: []string{"roadmap"}, Status: model.StatusOpen, Ephemeral: true, UpdatedAt: ancient, CreatedAt: ancient},
+		{ID: "FUT-1", Labels: []string{"roadmap"}, Status: model.StatusOpen, DeferUntil: &future, UpdatedAt: ancient, CreatedAt: ancient},
+		{ID: "FRESH-1", Labels: []string{"roadmap"}, Status: model.StatusOpen, UpdatedAt: now.Add(-24 * time.Hour), CreatedAt: ancient},
+	}
+
+	cfg := DefaultLabelHealthConfig()
+	fresh := ComputeFreshnessMetrics(issues, now, cfg.StaleThresholdDays)
+	if fresh.StaleCount != 0 {
+		t.Fatalf("expected StaleCount=0 when all old issues are parked/template/ephemeral, got %+v", fresh)
+	}
+	if fresh.AvgDaysSinceUpdate > 1.01 {
+		t.Fatalf("expected AvgDaysSinceUpdate ~1.0 from FRESH-1 only, got %f", fresh.AvgDaysSinceUpdate)
+	}
+
+	single := ComputeLabelHealthForLabel("roadmap", issues, cfg, now, nil)
+	scores := ComputeLabelHealthScores(issues, cfg, now, nil)
+	if scores["roadmap"] != single.Health {
+		t.Fatalf("ComputeLabelHealthScores[%q]=%d != ComputeLabelHealthForLabel.Health=%d", "roadmap", scores["roadmap"], single.Health)
+	}
+
+	attn := ComputeLabelAttentionScores(issues, cfg, now)
+	if got := attn.GetLabelAttention("roadmap"); got == nil || got.StaleCount != 0 {
+		t.Fatalf("expected StaleCount=0 in ComputeLabelAttentionScores, got %+v", got)
+	}
+	fastAttn := ComputeLabelAttentionScoresFast(issues, cfg, now, nil)
+	if _, ok := fastAttn["roadmap"]; !ok {
+		t.Fatalf("expected roadmap in ComputeLabelAttentionScoresFast, got %+v", fastAttn)
+	}
+}
+
+func TestLabelHealthFlowAttention_WithScopeAndReadiness(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+
+	// CAND-1 (label "frontend") is in candidate scope and depends on:
+	// - EXT-OPEN (label "infra", outside candidate scope, open -> blocks CAND-1!)
+	// CAND-2 (label "frontend") depends on TOMB-1 (outside issues, marked tombstoned in ReadinessIndex -> NOT blocked!).
+	allForReadiness := []model.Issue{
+		{
+			ID:        "CAND-1",
+			Title:     "Frontend login screen",
+			Labels:    []string{"frontend"},
+			Status:    model.StatusOpen,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CAND-1", DependsOnID: "EXT-OPEN", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "CAND-2",
+			Title:     "Frontend logout button",
+			Labels:    []string{"frontend"},
+			Status:    model.StatusOpen,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CAND-2", DependsOnID: "TOMB-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "EXT-OPEN",
+			Title:     "Infra cluster provisioning",
+			Labels:    []string{"infra"},
+			Status:    model.StatusOpen,
+			UpdatedAt: now,
+		},
+	}
+
+	fullWithTombstone := append([]model.Issue{
+		{ID: "TOMB-1", Status: model.StatusTombstone, UpdatedAt: now},
+	}, allForReadiness...)
+	readiness := model.NewReadinessIndex(fullWithTombstone)
+	candidates := map[string]bool{"CAND-1": true, "CAND-2": true}
+	cfg := DefaultLabelHealthConfig()
+
+	healthRes := ComputeAllLabelHealthWithScope(allForReadiness, cfg, now, nil, readiness, candidates)
+	if len(healthRes.Labels) != 1 || healthRes.Labels[0].Label != "frontend" {
+		t.Fatalf("expected only scoped label 'frontend', got %+v", healthRes.Labels)
+	}
+	if healthRes.Labels[0].Blocked != 1 {
+		t.Fatalf("expected Blocked=1 (CAND-1 blocked by EXT-OPEN; CAND-2 unblocked by tombstone TOMB-1), got %d", healthRes.Labels[0].Blocked)
+	}
+	if healthRes.Labels[0].Flow.IncomingDeps != 1 || len(healthRes.Labels[0].Flow.IncomingLabels) != 1 || healthRes.Labels[0].Flow.IncomingLabels[0] != "infra" || healthRes.Labels[0].Flow.BlockedByExternal != 1 {
+		t.Fatalf("expected scoped IncomingDeps=1 from external 'infra' blocker, got %+v", healthRes.Labels[0].Flow)
+	}
+
+	attnRes := ComputeLabelAttentionScoresWithScope(allForReadiness, cfg, now, readiness, candidates)
+	if len(attnRes.Labels) != 1 || attnRes.Labels[0].Label != "frontend" {
+		t.Fatalf("expected only scoped label 'frontend' in attention scores, got %+v", attnRes.Labels)
+	}
+
+	flowRes := ComputeCrossLabelFlowWithScope(allForReadiness, cfg, candidates)
+	if len(flowRes.Labels) != 2 || flowRes.Labels[0] != "frontend" || flowRes.Labels[1] != "infra" || flowRes.TotalCrossLabelDeps != 1 {
+		t.Fatalf("expected external edge infra->frontend retained in scoped flow, got %+v", flowRes)
+	}
+
+	cascadeRes := ComputeBlockageCascadeAtWithScope(allForReadiness, flowRes, cfg, now, readiness, candidates)
+	if cascadeRes.TotalBlocked != 1 {
+		t.Fatalf("expected TotalBlocked=1 for scoped cascade (CAND-1 only), got %+v", cascadeRes)
+	}
+}
+
+func TestLabelHealthAndFlowAndAttention_ScopedExternalEdgesAndPageRank(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultLabelHealthConfig()
+
+	// Chain: bv-infra ([infra]) -> bv-back ([backend]) -> bv-front ([frontend]), plus disconnected bv-unrelated ([unrelated]).
+	allIssues := []model.Issue{
+		{
+			ID:        "bv-infra",
+			Title:     "Infra blocker",
+			Labels:    []string{"infra"},
+			Status:    model.StatusOpen,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "bv-back",
+			Title:     "Backend service",
+			Labels:    []string{"backend"},
+			Status:    model.StatusOpen,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-back", DependsOnID: "bv-infra", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "bv-front",
+			Title:     "Frontend UI",
+			Labels:    []string{"frontend"},
+			Status:    model.StatusOpen,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-front", DependsOnID: "bv-back", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "bv-unrelated",
+			Title:     "Unrelated docs",
+			Labels:    []string{"unrelated"},
+			Status:    model.StatusOpen,
+			UpdatedAt: now,
+		},
+	}
+
+	readiness := model.NewReadinessIndex(allIssues)
+	unscopedHealth := ComputeAllLabelHealthWithScope(allIssues, cfg, now, nil, readiness, nil)
+	var wantBackendFlow FlowMetrics
+	foundUnscoped := false
+	for _, lh := range unscopedHealth.Labels {
+		if lh.Label == "backend" {
+			wantBackendFlow = lh.Flow
+			foundUnscoped = true
+			break
+		}
+	}
+	if !foundUnscoped {
+		t.Fatalf("missing backend in unscoped health: %+v", unscopedHealth.Labels)
+	}
+
+	scopedCandidates := map[string]bool{"bv-back": true}
+	scopedHealth := ComputeAllLabelHealthWithScope(allIssues, cfg, now, nil, readiness, scopedCandidates)
+	if len(scopedHealth.Labels) != 1 || scopedHealth.Labels[0].Label != "backend" {
+		t.Fatalf("expected only label 'backend' under candidate scope, got %+v", scopedHealth.Labels)
+	}
+	gotFlow := scopedHealth.Labels[0].Flow
+	if gotFlow.IncomingDeps != 1 || gotFlow.OutgoingDeps != 1 ||
+		len(gotFlow.IncomingLabels) != 1 || gotFlow.IncomingLabels[0] != "infra" ||
+		len(gotFlow.OutgoingLabels) != 1 || gotFlow.OutgoingLabels[0] != "frontend" ||
+		gotFlow.BlockedByExternal != 1 || gotFlow.BlockingExternal != 1 {
+		t.Fatalf("scoped backend flow mismatch: got %+v, want %+v", gotFlow, wantBackendFlow)
+	}
+	if !reflect.DeepEqual(gotFlow, wantBackendFlow) {
+		t.Fatalf("scoped backend flow %+v != unscoped backend flow %+v", gotFlow, wantBackendFlow)
+	}
+
+	// Cross-label flow under --label backend must retain both infra->backend and backend->frontend while omitting disconnected 'unrelated'.
+	crossFlow := ComputeCrossLabelFlowWithScope(allIssues, cfg, scopedCandidates)
+	wantLabels := []string{"backend", "frontend", "infra"}
+	if !reflect.DeepEqual(crossFlow.Labels, wantLabels) {
+		t.Fatalf("scoped CrossLabelFlow.Labels = %v, want %v", crossFlow.Labels, wantLabels)
+	}
+	if crossFlow.TotalCrossLabelDeps != 2 || len(crossFlow.Dependencies) != 2 {
+		t.Fatalf("expected 2 retained cross-label dependencies (infra->backend, backend->frontend), got %+v", crossFlow)
+	}
+
+	// Verify Analyzer.HasCandidateScope() and scoped computeLabelAttention PageRankSum.
+	anUnscoped := NewAnalyzer(allIssues)
+	if anUnscoped.HasCandidateScope() {
+		t.Fatal("expected HasCandidateScope()=false on unscoped Analyzer")
+	}
+	anScoped := NewAnalyzer(allIssues)
+	anScoped.SetReadinessScope(readiness, scopedCandidates)
+	if !anScoped.HasCandidateScope() {
+		t.Fatal("expected HasCandidateScope()=true when candidateIDs is non-nil")
+	}
+
+	// Add an out-of-scope deferred issue sharing label 'backend' and verify its CoreOnly PageRank does not inflate scoped PageRankSum.
+	withDeferred := append([]model.Issue(nil), allIssues...)
+	withDeferred = append(withDeferred, model.Issue{
+		ID:        "bv-back-deferred",
+		Title:     "Deferred backend epic",
+		Labels:    []string{"backend"},
+		Status:    model.StatusDeferred,
+		UpdatedAt: now,
+	})
+	sg := ComputeLabelSubgraph(withDeferred, "backend")
+	pr := ComputeLabelPageRank(sg)
+	if pr.CoreOnly["bv-back-deferred"] <= 0 {
+		t.Fatalf("expected positive CoreOnly PageRank on bv-back-deferred, got %f", pr.CoreOnly["bv-back-deferred"])
+	}
+	attnScoped := ComputeLabelAttentionScoresWithScope(withDeferred, cfg, now, model.NewReadinessIndex(withDeferred), map[string]bool{"bv-back": true})
+	if len(attnScoped.Labels) != 1 {
+		t.Fatalf("expected 1 scoped label attention score, got %+v", attnScoped.Labels)
+	}
+	wantPRSum := pr.CoreOnly["bv-back"]
+	if math.Abs(attnScoped.Labels[0].PageRankSum-wantPRSum) > 1e-12 {
+		t.Fatalf("scoped PageRankSum = %.12f, want %.12f (out-of-scope deferred issue inflated PageRankSum)", attnScoped.Labels[0].PageRankSum, wantPRSum)
 	}
 }

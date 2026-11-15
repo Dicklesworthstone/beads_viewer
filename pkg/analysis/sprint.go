@@ -115,7 +115,7 @@ func DetectAtRisk(issues []model.Issue, sprint *model.Sprint, now time.Time, thr
 		}
 		seen[beadID] = true
 		iss, ok := issueMap[beadID]
-		if !ok || isClosedLikeStatus(iss.Status) {
+		if !ok || iss.IsParkedForStalenessAt(now) {
 			continue
 		}
 		if item, flagged := evaluateAtRisk(iss, issueMap, now, thresholds); flagged {

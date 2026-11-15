@@ -228,3 +228,67 @@ func (d *CycleWarningDetector) ValidateNewDependency(issues []model.Issue, fromI
 	canAdd, _, warning := CheckDependencyAddition(issues, fromID, toID)
 	return canAdd, warning
 }
+
+// GetCycleFreeSuggestions filters out any missing-dependency suggestions that
+// would create a blocking cycle in issues (or among previously accepted
+// suggestions in the returned slice). Non-dependency suggestions pass through
+// unchanged.
+func GetCycleFreeSuggestions(issues []model.Issue, suggestions []Suggestion) []Suggestion {
+	if len(suggestions) == 0 {
+		return nil
+	}
+
+	adj := make(map[string][]string, len(issues))
+	for _, issue := range issues {
+		for _, dep := range issue.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			adj[issue.ID] = append(adj[issue.ID], dep.DependsOnID)
+		}
+	}
+
+	visited := make(map[string]bool, len(issues))
+	canReach := func(start, goal string) bool {
+		if start == goal {
+			return true
+		}
+		clear(visited)
+		stack := []string{start}
+		visited[start] = true
+		for len(stack) > 0 {
+			curr := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			for _, next := range adj[curr] {
+				if next == goal {
+					return true
+				}
+				if !visited[next] {
+					visited[next] = true
+					stack = append(stack, next)
+				}
+			}
+		}
+		return false
+	}
+
+	out := make([]Suggestion, 0, len(suggestions))
+	for _, sug := range suggestions {
+		if sug.Type != SuggestionMissingDependency {
+			out = append(out, sug)
+			continue
+		}
+		fromID := sug.TargetBead
+		toID := sug.RelatedBead
+		if fromID == "" || toID == "" {
+			out = append(out, sug)
+			continue
+		}
+		if canReach(toID, fromID) {
+			continue
+		}
+		adj[fromID] = append(adj[fromID], toID)
+		out = append(out, sug)
+	}
+	return out
+}

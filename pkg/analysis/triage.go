@@ -942,7 +942,7 @@ func buildTriageAlerts(analyzer *Analyzer, candidateIssues []model.Issue, stats 
 
 	var abandoned []string
 	for _, iss := range candidateIssues {
-		if iss.Status != model.StatusInProgress || iss.UpdatedAt.IsZero() {
+		if iss.Status != model.StatusInProgress || iss.UpdatedAt.IsZero() || iss.IsParkedForStalenessAt(now) {
 			continue
 		}
 		days := int(now.Sub(iss.UpdatedAt).Hours() / 24)
@@ -988,7 +988,7 @@ func ComputeStaleness(history *correlation.HistoryReport, issues []model.Issue, 
 	stalestID := ""
 
 	for _, issue := range issues {
-		if issue.Status == model.StatusClosed || issue.Status == model.StatusTombstone {
+		if issue.IsParkedForStalenessAt(now) {
 			continue
 		}
 

@@ -98,10 +98,12 @@
     .status-in_progress { background-color: #fef3c7; color: #92400e; }
     .status-blocked { background-color: #fee2e2; color: #991b1b; }
     .status-closed { background-color: #dcfce7; color: #166534; }
+    .status-deferred, .status-draft, .status-review, .status-pinned, .status-hooked { background-color: #e0e7ff; color: #3730a3; }
     .dark .status-open { background-color: #1e3a8a; color: #bfdbfe; }
     .dark .status-in_progress { background-color: #78350f; color: #fef3c7; }
     .dark .status-blocked { background-color: #7f1d1d; color: #fecaca; }
     .dark .status-closed { background-color: #14532d; color: #bbf7d0; }
+    .dark .status-deferred, .dark .status-draft, .dark .status-review, .dark .status-pinned, .dark .status-hooked { background-color: #312e81; color: #c7d2fe; }
 
     /* Priority indicators - raw CSS fallback */
     .priority-0 { border-left: 4px solid #ef4444; }
@@ -530,7 +532,7 @@
         <div class="sm:hidden -mx-4 px-4 mb-6">
           <div class="flex gap-3 overflow-x-auto scroll-snap-x scrollbar-hide pb-2">
             <!-- Open -->
-            <div @click="filters.status = ['open']; view = 'issues'; applyFilters()"
+            <div @click="navigateToIssuesWithFilter({ status: ['open'] })"
                  class="stat-card-mobile flex-shrink-0 w-[130px] scroll-snap-start touch-btn haptic-light">
               <div class="w-9 h-9 bg-blue-100 dark:bg-blue-900/50 rounded-xl flex items-center justify-center mb-3">
                 <svg class="w-5 h-5 text-blue-600 dark:text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -541,7 +543,7 @@
               <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-medium">Open</p>
             </div>
             <!-- In Progress -->
-            <div @click="filters.status = ['in_progress']; view = 'issues'; applyFilters()"
+            <div @click="navigateToIssuesWithFilter({ status: ['in_progress'] })"
                  class="stat-card-mobile flex-shrink-0 w-[130px] scroll-snap-start touch-btn haptic-light">
               <div class="w-9 h-9 bg-amber-100 dark:bg-amber-900/50 rounded-xl flex items-center justify-center mb-3">
                 <svg class="w-5 h-5 text-amber-600 dark:text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -552,7 +554,7 @@
               <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-medium">In Progress</p>
             </div>
             <!-- Blocked -->
-            <div @click="filters.hasBlockers = true; filters.status = ['open', 'in_progress']; view = 'issues'; applyFilters()"
+            <div @click="navigateToIssuesWithFilter({ status: ['open', 'in_progress', 'blocked'], hasBlockers: true })"
                  class="stat-card-mobile flex-shrink-0 w-[130px] scroll-snap-start touch-btn haptic-light">
               <div class="w-9 h-9 bg-red-100 dark:bg-red-900/50 rounded-xl flex items-center justify-center mb-3">
                 <svg class="w-5 h-5 text-red-600 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -563,7 +565,7 @@
               <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-medium">Blocked</p>
             </div>
             <!-- Actionable -->
-            <div @click="filters.hasBlockers = false; filters.status = ['open', 'in_progress']; view = 'issues'; applyFilters()"
+            <div @click="navigateToIssuesWithFilter({ status: ['open', 'in_progress'], hasBlockers: false })"
                  class="stat-card-mobile flex-shrink-0 w-[130px] scroll-snap-start touch-btn haptic-light border-emerald-200 dark:border-emerald-800">
               <div class="w-9 h-9 bg-emerald-100 dark:bg-emerald-900/50 rounded-xl flex items-center justify-center mb-3">
                 <svg class="w-5 h-5 text-emerald-600 dark:text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -574,7 +576,7 @@
               <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 font-medium">Actionable</p>
             </div>
             <!-- Closed -->
-            <div @click="filters.status = ['closed']; view = 'issues'; applyFilters()"
+            <div @click="navigateToIssuesWithFilter({ status: ['closed'] })"
                  class="stat-card-mobile flex-shrink-0 w-[130px] scroll-snap-start touch-btn haptic-light">
               <div class="w-9 h-9 bg-gray-100 dark:bg-gray-700 rounded-xl flex items-center justify-center mb-3">
                 <svg class="w-5 h-5 text-gray-600 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -595,7 +597,7 @@
 
         <!-- DESKTOP Stats: 5-column grid with stagger animation -->
         <div class="hidden sm:grid grid-cols-3 lg:grid-cols-5 gap-4 mb-8 stagger-children">
-          <div @click="filters.status = ['open']; view = 'issues'; applyFilters()"
+          <div @click="navigateToIssuesWithFilter({ status: ['open'] })"
                class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5 cursor-pointer card-lift focus-ring group">
             <div class="flex items-center justify-between">
               <div>
@@ -610,7 +612,7 @@
             </div>
           </div>
 
-          <div @click="filters.status = ['in_progress']; view = 'issues'; applyFilters()"
+          <div @click="navigateToIssuesWithFilter({ status: ['in_progress'] })"
                class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5 cursor-pointer card-lift focus-ring group">
             <div class="flex items-center justify-between">
               <div>
@@ -625,7 +627,7 @@
             </div>
           </div>
 
-          <div @click="filters.hasBlockers = true; filters.status = ['open', 'in_progress']; view = 'issues'; applyFilters()"
+          <div @click="navigateToIssuesWithFilter({ status: ['open', 'in_progress', 'blocked'], hasBlockers: true })"
                class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5 cursor-pointer card-lift focus-ring group">
             <div class="flex items-center justify-between">
               <div>
@@ -640,7 +642,7 @@
             </div>
           </div>
 
-          <div @click="filters.hasBlockers = false; filters.status = ['open', 'in_progress']; view = 'issues'; applyFilters()"
+          <div @click="navigateToIssuesWithFilter({ status: ['open', 'in_progress'], hasBlockers: false })"
                class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5 cursor-pointer card-lift focus-ring group">
             <div class="flex items-center justify-between">
               <div>
@@ -655,7 +657,7 @@
             </div>
           </div>
 
-          <div @click="filters.status = ['closed']; view = 'issues'; applyFilters()"
+          <div @click="navigateToIssuesWithFilter({ status: ['closed'] })"
                class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-5 cursor-pointer card-lift focus-ring group">
             <div class="flex items-center justify-between">
               <div>
@@ -668,6 +670,34 @@
                 </svg>
               </div>
             </div>
+          </div>
+        </div>
+
+        <!-- Proactive & Drift Alerts (from triage.json when present) -->
+        <div x-show="getTriageAlerts().length > 0"
+             class="mb-6 bg-amber-50/80 dark:bg-amber-900/20 rounded-2xl border border-amber-200 dark:border-amber-800/60 p-4">
+          <div class="flex items-center justify-between mb-2">
+            <h3 class="text-sm font-semibold text-amber-900 dark:text-amber-200 flex items-center gap-2">
+              <span>⚠️</span>
+              <span>Proactive Triage Alerts</span>
+              <span class="px-2 py-0.5 text-xs rounded-full bg-amber-200/70 dark:bg-amber-800/60 text-amber-900 dark:text-amber-100" x-text="getTriageAlerts().length"></span>
+            </h3>
+          </div>
+          <div class="space-y-2">
+            <template x-for="alert in getTriageAlerts().slice(0, 5)" :key="alert.key">
+              <div class="flex flex-wrap items-center justify-between gap-2 text-xs bg-white/80 dark:bg-gray-800/70 rounded-xl px-3 py-2 border border-amber-100 dark:border-amber-800/40">
+                <div class="flex items-center gap-2 min-w-0">
+                  <span class="px-1.5 py-0.5 rounded font-semibold uppercase text-[10px]"
+                        :class="alert.severity === 'critical' || alert.severity === 'error' ? 'bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300' : 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300'"
+                        x-text="alert.type"></span>
+                  <span class="text-gray-700 dark:text-gray-200 truncate" x-text="alert.message"></span>
+                </div>
+                <button x-show="alert.issue_id"
+                        @click="showIssue(alert.issue_id)"
+                        class="font-mono px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 hover:underline shrink-0"
+                        x-text="alert.issue_id"></button>
+              </div>
+            </template>
           </div>
         </div>
 
@@ -861,7 +891,7 @@
                       <h3 class="font-medium truncate text-sm" x-text="issue.title" :title="issue.title"></h3>
                     </div>
                     <span class="px-2 py-0.5 text-xs font-medium rounded-full ml-2"
-                          :class="'status-' + issue.status"
+                          :class="statusBadgeClass(issue.status)"
                           x-text="issue.status"></span>
                   </div>
                 </div>
@@ -937,11 +967,12 @@
 
             <!-- Label Dependency Heatmap -->
             <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-6">
-              <h3 class="text-lg font-semibold mb-4 flex items-center">
+              <h3 class="text-lg font-semibold mb-4 flex items-center flex-wrap">
                 <svg class="w-5 h-5 text-pink-500 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z"/>
                 </svg>
-                Label Dependency Heatmap
+                <span>Label Dependency Heatmap</span>
+                <span id="heatmap-truncation-note" class="ml-2 text-xs font-normal text-gray-500 dark:text-gray-400 hidden"></span>
               </h3>
               <div id="heatmap-container" class="h-64 overflow-auto flex items-center justify-center">
                 <p class="text-gray-500 dark:text-gray-400 text-sm">Expand to load heatmap</p>
@@ -958,7 +989,7 @@
               <div class="flex items-center space-x-3 p-3 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer transition-colors"
                    @click="showIssue(issue.id)">
                 <span class="px-2 py-1 text-xs font-medium rounded-full shrink-0"
-                      :class="'status-' + issue.status"
+                      :class="statusBadgeClass(issue.status)"
                       x-text="issue.status"></span>
                 <div class="flex-1 min-w-0">
                   <p class="font-medium truncate text-sm" x-text="issue.title" :title="issue.title"></p>
@@ -996,6 +1027,16 @@
             <button x-show="hasActiveFilters" @click="clearFilters()"
                     class="text-sm text-gray-500 hover:text-gray-700 dark:hover:text-gray-300">
               Clear all
+            </button>
+          </div>
+
+          <!-- Active Critical Path Filter Pill -->
+          <div x-show="filters.criticalPath" class="mt-2 flex flex-wrap items-center gap-2">
+            <button @click="clearCriticalPathFilter()"
+                    class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800 hover:bg-red-200 dark:hover:bg-red-900/60 transition-colors"
+                    title="Remove Critical Path filter">
+              <span>🔥 Critical Path</span>
+              <span aria-hidden="true">×</span>
             </button>
           </div>
 
@@ -1158,7 +1199,7 @@
                       </span>
                       <!-- Status badge shown inline on mobile only -->
                       <span class="sm:hidden px-2 py-0.5 text-xs font-medium rounded-full"
-                            :class="'status-' + issue.status"
+                            :class="statusBadgeClass(issue.status)"
                             x-text="issue.status"></span>
                     </div>
                     <h3 class="font-medium mt-1 text-sm sm:text-base" x-text="issue.title"></h3>
@@ -1170,7 +1211,7 @@
                   <!-- Right column: hidden on mobile (status shown inline above) -->
                   <div class="hidden sm:flex flex-col items-end space-y-2 ml-4 shrink-0">
                     <span class="px-2 py-1 text-xs font-medium rounded-full"
-                          :class="'status-' + issue.status"
+                          :class="statusBadgeClass(issue.status)"
                           x-text="issue.status"></span>
                     <span class="text-xs text-gray-500 dark:text-gray-400" x-text="formatDate(issue.updated_at)"></span>
                   </div>
@@ -2450,6 +2491,76 @@
               </div>
             </div>
 
+            <!-- Critical Path Slack Panel -->
+            <div class="metric-panel-premium border-rose-200 dark:border-rose-800/50 relative"
+                 :class="expandedPanel === 'slack' ? 'ring-2 ring-rose-400/50' : ''">
+              <div class="metric-panel-header bg-gradient-to-r from-rose-50 to-orange-50/50 dark:from-rose-900/20 dark:to-orange-900/20 border-b border-rose-100 dark:border-rose-800/50"
+                   @click="expandedPanel = expandedPanel === 'slack' ? null : 'slack'">
+                <div class="flex items-center gap-2.5">
+                  <div class="metric-panel-icon bg-gradient-to-br from-rose-500 to-orange-500 text-white shadow-sm">
+                    <span>⏱️</span>
+                  </div>
+                  <div>
+                    <div class="flex items-center gap-1.5">
+                      <h3 class="metric-panel-title text-gray-900 dark:text-white">Critical Path Slack</h3>
+                    </div>
+                    <p class="metric-panel-subtitle text-rose-600 dark:text-rose-400">Zero-Slack Bottlenecks &amp; Float</p>
+                  </div>
+                </div>
+                <div class="metric-panel-expand">
+                  <svg :class="expandedPanel === 'slack' ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                </div>
+              </div>
+              <div x-show="expandedPanel === 'slack'" x-collapse
+                   class="metric-panel-explanation bg-gradient-to-r from-rose-50/50 to-orange-50/30 dark:from-rose-950/20 dark:to-orange-950/10">
+                <div class="space-y-2">
+                  <p><strong class="text-rose-700 dark:text-rose-300">📐 What:</strong> Schedule slack computed by WASM topological longest-path analysis.</p>
+                  <p><strong class="text-rose-700 dark:text-rose-300">💡 Why:</strong> Zero-slack issues lie directly on the critical path; any delay shifts final completion.</p>
+                  <p x-show="flexibleSlackIssues.length > 0" class="text-xs text-gray-600 dark:text-gray-400">
+                    Flexible float available on <strong x-text="flexibleSlackIssues.length"></strong> non-critical issue(s).
+                  </p>
+                </div>
+              </div>
+              <div class="metric-panel-items">
+                <template x-for="(issue, idx) in criticalPathSlack.slice(0, expandedPanel === 'slack' ? 10 : 5)" :key="issue.id">
+                  <div class="metric-item group" @click.stop="showIssue(issue.id)">
+                    <span class="metric-item-rank text-white"
+                          :class="idx === 0 ? 'bg-gradient-to-br from-rose-500 to-orange-500' : idx === 1 ? 'bg-gradient-to-br from-gray-300 to-gray-400' : idx === 2 ? 'bg-gradient-to-br from-orange-500 to-amber-600' : 'bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400'"
+                          x-text="idx + 1"></span>
+                    <span class="metric-item-title group-hover:text-rose-600 dark:group-hover:text-rose-400" x-text="issue.title"></span>
+                    <span class="metric-item-score bg-rose-100 dark:bg-rose-900/40 text-rose-600 dark:text-rose-400">0 slack</span>
+                  </div>
+                </template>
+                <p x-show="criticalPathSlack.length === 0" class="text-xs text-gray-400 text-center py-6 italic">No zero-slack critical path bottlenecks</p>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- Proactive & Drift Alerts in Insights (when present in triage.json) -->
+        <div x-show="getTriageAlerts().length > 0"
+             class="mb-6 bg-amber-50/80 dark:bg-amber-900/20 rounded-2xl border border-amber-200 dark:border-amber-800/60 p-4">
+          <h3 class="text-sm font-semibold text-amber-900 dark:text-amber-200 mb-2 flex items-center gap-2">
+            <span>⚠️</span>
+            <span>Triage &amp; Drift Alerts</span>
+            <span class="px-2 py-0.5 text-xs rounded-full bg-amber-200/70 dark:bg-amber-800/60 text-amber-900 dark:text-amber-100" x-text="getTriageAlerts().length"></span>
+          </h3>
+          <div class="space-y-2">
+            <template x-for="alert in getTriageAlerts()" :key="'ins-' + alert.key">
+              <div class="flex flex-wrap items-center justify-between gap-2 text-xs bg-white/80 dark:bg-gray-800/70 rounded-xl px-3 py-2 border border-amber-100 dark:border-amber-800/40">
+                <div class="flex items-center gap-2 min-w-0">
+                  <span class="px-1.5 py-0.5 rounded font-semibold uppercase text-[10px]"
+                        :class="alert.severity === 'critical' || alert.severity === 'error' ? 'bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300' : 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300'"
+                        x-text="alert.type"></span>
+                  <span class="text-gray-700 dark:text-gray-200" x-text="alert.message"></span>
+                </div>
+                <button x-show="alert.issue_id"
+                        @click="showIssue(alert.issue_id)"
+                        class="font-mono px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 hover:underline shrink-0"
+                        x-text="alert.issue_id"></button>
+              </div>
+            </template>
           </div>
         </div>
 
@@ -2600,69 +2711,19 @@
                 <div class="mt-6">
                   <h4 class="text-xs font-semibold text-gray-600 dark:text-gray-400 mb-3 flex items-center gap-2">
                     <svg class="w-3.5 h-3.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01"/></svg>
-                    Score Component Weights
+                    <span>Score Component Weights</span>
+                    <span x-show="triageData?.feedback" class="text-[10px] font-normal px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300">Adaptive</span>
                   </h4>
                   <div class="space-y-2">
-                    <!-- PageRank -->
-                    <div class="flex items-center gap-2">
-                      <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-20">🎯 PageRank</span>
-                      <div class="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                        <div class="h-full bg-blue-500 rounded-full" style="width: 22%"></div>
+                    <template x-for="comp in getTriageWeightComponents()" :key="comp.key">
+                      <div class="flex items-center gap-2">
+                        <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-20" x-text="comp.label"></span>
+                        <div class="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                          <div class="h-full rounded-full" :class="comp.barClass" :style="'width: ' + comp.pct + '%'"></div>
+                        </div>
+                        <span class="text-[10px] font-mono text-gray-500 w-8" x-text="comp.pctText"></span>
                       </div>
-                      <span class="text-[10px] font-mono text-gray-500 w-8">22%</span>
-                    </div>
-                    <!-- Betweenness -->
-                    <div class="flex items-center gap-2">
-                      <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-20">🔀 Between.</span>
-                      <div class="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                        <div class="h-full bg-orange-500 rounded-full" style="width: 20%"></div>
-                      </div>
-                      <span class="text-[10px] font-mono text-gray-500 w-8">20%</span>
-                    </div>
-                    <!-- Blocker Ratio -->
-                    <div class="flex items-center gap-2">
-                      <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-20">🚧 Blockers</span>
-                      <div class="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                        <div class="h-full bg-red-500 rounded-full" style="width: 13%"></div>
-                      </div>
-                      <span class="text-[10px] font-mono text-gray-500 w-8">13%</span>
-                    </div>
-                    <!-- Priority, Time, Urgency, Risk - grouped -->
-                    <div class="flex items-center gap-2">
-                      <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-20">⭐ Priority</span>
-                      <div class="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                        <div class="h-full bg-yellow-500 rounded-full" style="width: 10%"></div>
-                      </div>
-                      <span class="text-[10px] font-mono text-gray-500 w-8">10%</span>
-                    </div>
-                    <div class="flex items-center gap-2">
-                      <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-20">⚡ Time</span>
-                      <div class="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                        <div class="h-full bg-cyan-500 rounded-full" style="width: 10%"></div>
-                      </div>
-                      <span class="text-[10px] font-mono text-gray-500 w-8">10%</span>
-                    </div>
-                    <div class="flex items-center gap-2">
-                      <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-20">🔥 Urgency</span>
-                      <div class="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                        <div class="h-full bg-rose-500 rounded-full" style="width: 10%"></div>
-                      </div>
-                      <span class="text-[10px] font-mono text-gray-500 w-8">10%</span>
-                    </div>
-                    <div class="flex items-center gap-2">
-                      <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-20">⚠️ Risk</span>
-                      <div class="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                        <div class="h-full bg-purple-500 rounded-full" style="width: 10%"></div>
-                      </div>
-                      <span class="text-[10px] font-mono text-gray-500 w-8">10%</span>
-                    </div>
-                    <div class="flex items-center gap-2">
-                      <span class="text-[10px] font-medium text-gray-500 dark:text-gray-400 w-20">⏰ Staleness</span>
-                      <div class="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                        <div class="h-full bg-gray-400 rounded-full" style="width: 5%"></div>
-                      </div>
-                      <span class="text-[10px] font-mono text-gray-500 w-8">5%</span>
-                    </div>
+                    </template>
                   </div>
                 </div>
               </div>
@@ -2712,14 +2773,14 @@
                     </div>
                     <!-- Mini breakdown bars -->
                     <div class="mt-2 flex gap-0.5 h-1.5 rounded-full overflow-hidden bg-gray-100 dark:bg-gray-700">
-                      <div class="bg-blue-500 transition-all" :style="'width: ' + ((rec.breakdown?.pagerank_norm || 0) * 22) + '%'" title="PageRank"></div>
-                      <div class="bg-orange-500 transition-all" :style="'width: ' + ((rec.breakdown?.betweenness_norm || 0) * 20) + '%'" title="Betweenness"></div>
-                      <div class="bg-red-500 transition-all" :style="'width: ' + ((rec.breakdown?.blocker_ratio_norm || 0) * 13) + '%'" title="Blockers"></div>
-                      <div class="bg-yellow-500 transition-all" :style="'width: ' + ((rec.breakdown?.priority_boost_norm || 0) * 10) + '%'" title="Priority"></div>
-                      <div class="bg-cyan-500 transition-all" :style="'width: ' + ((rec.breakdown?.time_to_impact_norm || 0) * 10) + '%'" title="Time"></div>
-                      <div class="bg-rose-500 transition-all" :style="'width: ' + ((rec.breakdown?.urgency_norm || 0) * 10) + '%'" title="Urgency"></div>
-                      <div class="bg-purple-500 transition-all" :style="'width: ' + ((rec.breakdown?.risk_norm || 0) * 10) + '%'" title="Risk"></div>
-                      <div class="bg-gray-400 transition-all" :style="'width: ' + ((rec.breakdown?.staleness_norm || 0) * 5) + '%'" title="Staleness"></div>
+                      <div class="bg-blue-500 transition-all" :style="'width: ' + ((rec.breakdown?.pagerank_norm || 0) * (getEffectiveTriageWeights().pagerank * 100)) + '%'" title="PageRank"></div>
+                      <div class="bg-orange-500 transition-all" :style="'width: ' + ((rec.breakdown?.betweenness_norm || 0) * (getEffectiveTriageWeights().betweenness * 100)) + '%'" title="Betweenness"></div>
+                      <div class="bg-red-500 transition-all" :style="'width: ' + ((rec.breakdown?.blocker_ratio_norm || 0) * (getEffectiveTriageWeights().blocker_ratio * 100)) + '%'" title="Blockers"></div>
+                      <div class="bg-yellow-500 transition-all" :style="'width: ' + ((rec.breakdown?.priority_boost_norm || 0) * (getEffectiveTriageWeights().priority_boost * 100)) + '%'" title="Priority"></div>
+                      <div class="bg-cyan-500 transition-all" :style="'width: ' + ((rec.breakdown?.time_to_impact_norm || 0) * (getEffectiveTriageWeights().time_to_impact * 100)) + '%'" title="Time"></div>
+                      <div class="bg-rose-500 transition-all" :style="'width: ' + ((rec.breakdown?.urgency_norm || 0) * (getEffectiveTriageWeights().urgency * 100)) + '%'" title="Urgency"></div>
+                      <div class="bg-purple-500 transition-all" :style="'width: ' + ((rec.breakdown?.risk_norm || 0) * (getEffectiveTriageWeights().risk * 100)) + '%'" title="Risk"></div>
+                      <div class="bg-gray-400 transition-all" :style="'width: ' + ((rec.breakdown?.staleness_norm || 0) * (getEffectiveTriageWeights().staleness * 100)) + '%'" title="Staleness"></div>
                     </div>
                   </div>
                 </template>
@@ -2945,12 +3006,7 @@
           <div class="flex items-center justify-between mb-3">
             <div class="flex items-center gap-2 min-w-0 flex-1">
               <span class="px-2.5 py-1 text-xs font-semibold rounded-full uppercase"
-                    :class="{
-                      'bg-green-500 text-white': graphDetailNode?.status === 'open',
-                      'bg-yellow-500 text-white': graphDetailNode?.status === 'in_progress',
-                      'bg-red-500 text-white': graphDetailNode?.status === 'blocked',
-                      'bg-gray-400 dark:bg-gray-600 text-white': graphDetailNode?.status === 'closed'
-                    }"
+                    :class="statusBadgeClass(graphDetailNode?.status)"
                     x-text="graphDetailNode?.status?.replace('_', ' ')"></span>
               <span class="px-2 py-0.5 text-xs font-bold rounded"
                     :class="{
@@ -3334,7 +3390,7 @@
                       <a :href="'#/issue/' + encodeURIComponent(selectedIssue.id)"
                          class="font-mono text-sm font-medium text-beads-600 dark:text-beads-400 hover:underline bg-beads-50 dark:bg-beads-900/20 px-2 py-0.5 rounded"
                          x-text="selectedIssue.id"></a>
-                      <span class="px-2.5 py-1 text-xs font-semibold rounded-full" :class="'status-' + selectedIssue.status" x-text="selectedIssue.status?.replace('_', ' ')"></span>
+                      <span class="px-2.5 py-1 text-xs font-semibold rounded-full" :class="statusBadgeClass(selectedIssue.status)" x-text="selectedIssue.status?.replace('_', ' ')"></span>
                       <span class="px-2 py-0.5 text-xs font-bold rounded"
                             :class="{
                               'bg-red-500 text-white': selectedIssue.priority === 0,

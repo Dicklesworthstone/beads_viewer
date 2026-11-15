@@ -2,9 +2,11 @@ package ui
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
@@ -32,6 +34,15 @@ type BoardModel struct {
 
 	// Issue lookup map: ID -> *Issue for getting blocker titles (bv-kklp)
 	issueMap map[string]*model.Issue
+
+	// Optional full unscoped issue slice & map so downstream-unblock badges (⚡→N)
+	// and blocker status lookups stay accurate even under Ready/Closed filters.
+	fullIssues   []model.Issue
+	fullIssueMap map[string]*model.Issue
+
+	// Optional full-graph readiness authority so hidden/cross-filter blockers
+	// and closed/tombstone blockers resolve accurately.
+	readiness *model.ReadinessIndex
 
 	// Detail panel (bv-r6kh)
 	showDetail   bool
@@ -62,8 +73,9 @@ type BoardModel struct {
 
 // searchMatch holds info about a matching card (bv-yg39)
 type searchMatch struct {
-	col int // Column index (0-3)
-	row int // Row index within column
+	col     int    // Column index (0-3)
+	row     int    // Row index within column
+	issueID string // Issue ID for tracking matched card across column moves
 }
 
 // Column indices for the Kanban board
@@ -95,8 +107,110 @@ type ColumnStats struct {
 	OldestAge    time.Duration // Age of oldest item
 }
 
+// SetReadiness attaches an optional ReadinessIndex for authoritative blocker checks.
+func (b *BoardModel) SetReadiness(r *model.ReadinessIndex) {
+	b.readiness = r
+	b.lastDetailID = ""
+}
+
+// SetFullIssues attaches the full unscoped issue slice so downstream-unblock
+// counts (⚡→N) and cross-filter blocker status lookups remain accurate even
+// when the board displays a filtered subset (e.g., Ready or Closed filter).
+func (b *BoardModel) SetFullIssues(all []model.Issue) {
+	b.fullIssues = all
+	if len(all) == 0 {
+		b.fullIssueMap = nil
+	} else {
+		b.fullIssueMap = make(map[string]*model.Issue, len(all))
+		for i := range all {
+			b.fullIssueMap[all[i].ID] = &all[i]
+		}
+	}
+	b.rebuildBlocksIndex()
+	b.lastDetailID = ""
+}
+
+func (b *BoardModel) rebuildBlocksIndex() {
+	if len(b.fullIssues) > 0 {
+		b.blocksIndex = buildBlocksIndex(b.fullIssues)
+		return
+	}
+	b.blocksIndex = buildBlocksIndex(b.allIssues)
+}
+
+func (b BoardModel) lookupIssue(id string) (*model.Issue, bool) {
+	if iss, ok := b.issueMap[id]; ok && iss != nil {
+		return iss, true
+	}
+	if iss, ok := b.fullIssueMap[id]; ok && iss != nil {
+		return iss, true
+	}
+	return nil, false
+}
+
+// isBlockerUnsatisfied reports whether blockerID still actively blocks issueID.
+// Closed-like and tombstone blockers are satisfied and never count as active blockers.
+func (b BoardModel) isBlockerUnsatisfied(issueID, blockerID string) bool {
+	if blockerID == "" {
+		return false
+	}
+	if blocker, ok := b.lookupIssue(blockerID); ok {
+		return !isClosedLikeStatus(blocker.Status) && blocker.Status != model.StatusTombstone
+	}
+	if b.readiness != nil {
+		if iss, ok := b.lookupIssue(issueID); ok && (isClosedLikeStatus(iss.Status) || iss.Status == model.StatusTombstone) {
+			return !slices.Contains(b.readiness.ResolvedIDs(), blockerID)
+		}
+		return slices.Contains(b.readiness.Blockers(issueID), blockerID)
+	}
+	return true
+}
+
+// activeBlockingDeps returns only unsatisfied blocking dependencies of issue.
+func (b BoardModel) activeBlockingDeps(issue model.Issue) []*model.Dependency {
+	if isClosedLikeStatus(issue.Status) || issue.Status == model.StatusTombstone {
+		return nil
+	}
+	var active []*model.Dependency
+	for _, dep := range issue.Dependencies {
+		if dep != nil && dep.Type.IsBlocking() && b.isBlockerUnsatisfied(issue.ID, dep.DependsOnID) {
+			active = append(active, dep)
+		}
+	}
+	return active
+}
+
+// customOpenColumnBadge returns a compact status pill for non-standard/parked
+// issues routed into the Open column (e.g., deferred, draft, review, pinned, hooked).
+func customOpenColumnBadge(issue model.Issue) string {
+	status := issue.Status
+	if status != "" &&
+		status != model.StatusOpen &&
+		status != model.StatusInProgress &&
+		status != model.StatusBlocked &&
+		!isClosedLikeStatus(status) &&
+		status != model.StatusTombstone {
+		return "[" + string(status) + "]"
+	}
+	if status == model.StatusOpen && issue.IsDeferredAt(time.Now()) {
+		return "[deferred]"
+	}
+	return ""
+}
+
+func (b BoardModel) isCardClaimable(issue model.Issue, hasBlockingDeps bool, statusBadge string) bool {
+	if hasBlockingDeps || statusBadge != "" || issue.Status != model.StatusOpen {
+		return false
+	}
+	now := time.Now()
+	if b.readiness != nil {
+		return b.readiness.Claimable(issue.ID, now)
+	}
+	return !issue.Pinned && !issue.IsTemplate && !issue.Ephemeral && !issue.IsDeferredAt(now)
+}
+
 // computeColumnStats calculates statistics for issues in a column (bv-nl8a)
-func computeColumnStats(issues []model.Issue, issueMap map[string]*model.Issue) ColumnStats {
+func (b BoardModel) computeColumnStats(issues []model.Issue) ColumnStats {
 	stats := ColumnStats{Total: len(issues)}
 
 	var oldest time.Time
@@ -108,21 +222,7 @@ func computeColumnStats(issues []model.Issue, issueMap map[string]*model.Issue) 
 		}
 
 		// Count blocked items (has unresolved blocking deps)
-		hasOpenBlocker := false
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
-				continue
-			}
-			if issueMap == nil {
-				hasOpenBlocker = true
-				break
-			}
-			if blocker, ok := issueMap[dep.DependsOnID]; ok && blocker != nil && !isClosedLikeStatus(blocker.Status) {
-				hasOpenBlocker = true
-				break
-			}
-		}
-		if hasOpenBlocker {
+		if len(b.activeBlockingDeps(issue)) > 0 {
 			stats.BlockedCount++
 		}
 
@@ -273,14 +373,24 @@ func (b *BoardModel) HiddenColumnCount() int {
 	return hidden
 }
 
-// buildBlocksIndex creates a reverse dependency map: for each issue that is depended on,
-// it stores the list of issue IDs that depend on it (bv-1daf)
+// buildBlocksIndex creates a reverse dependency map: for each active (non-closed,
+// non-tombstone) blocker issue, it stores the list of non-closed, non-tombstone
+// issue IDs that depend on it via blocking edges (bv-1daf).
 func buildBlocksIndex(issues []model.Issue) map[string][]string {
+	closedOrTombstone := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		if isClosedLikeStatus(issue.Status) || issue.Status == model.StatusTombstone {
+			closedOrTombstone[issue.ID] = true
+		}
+	}
 	index := make(map[string][]string)
 	for _, issue := range issues {
+		if closedOrTombstone[issue.ID] {
+			continue
+		}
 		for _, dep := range issue.Dependencies {
-			if dep != nil && dep.Type.IsBlocking() {
-				// dep.DependsOnID blocks issue.ID
+			if dep != nil && dep.Type.IsBlocking() && !closedOrTombstone[dep.DependsOnID] {
+				// Active dep.DependsOnID blocks open/ongoing issue.ID
 				index[dep.DependsOnID] = append(index[dep.DependsOnID], issue.ID)
 			}
 		}
@@ -446,8 +556,81 @@ func NewBoardModel(issues []model.Issue, theme Theme) BoardModel {
 	return b
 }
 
+func (b BoardModel) containsIssueInColumns(id string) bool {
+	if id == "" {
+		return false
+	}
+	for col := 0; col < 4; col++ {
+		for i := range b.columns[col] {
+			if b.columns[col][i].ID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (b *BoardModel) refreshPreservedSearch(prevMode bool, prevQuery string, prevCursor int, prevSelectedID string) {
+	var prevMatchID string
+	if prevCursor >= 0 && prevCursor < len(b.searchMatches) {
+		prevMatchID = b.searchMatches[prevCursor].issueID
+	}
+	b.searchMode = prevMode
+	b.searchQuery = prevQuery
+	b.searchMatches = nil
+	b.searchCursor = 0
+	if prevQuery == "" {
+		return
+	}
+	query := strings.ToLower(prevQuery)
+	for colIdx, issues := range b.columns {
+		for rowIdx, issue := range issues {
+			if strings.Contains(strings.ToLower(issue.ID), query) || strings.Contains(strings.ToLower(issue.Title), query) {
+				b.searchMatches = append(b.searchMatches, searchMatch{col: colIdx, row: rowIdx, issueID: issue.ID})
+			}
+		}
+	}
+	if len(b.searchMatches) == 0 {
+		return
+	}
+	matchedIdx := -1
+	if prevMatchID != "" {
+		for idx, m := range b.searchMatches {
+			if m.issueID == prevMatchID {
+				matchedIdx = idx
+				break
+			}
+		}
+	}
+	if matchedIdx >= 0 {
+		b.searchCursor = matchedIdx
+	} else {
+		if prevCursor < 0 {
+			prevCursor = 0
+		}
+		if prevCursor >= len(b.searchMatches) {
+			prevCursor = len(b.searchMatches) - 1
+		}
+		b.searchCursor = prevCursor
+	}
+	if prevMode || prevSelectedID == "" || !b.containsIssueInColumns(prevSelectedID) || (matchedIdx >= 0 && prevSelectedID == prevMatchID) {
+		b.jumpToMatch(b.searchCursor)
+	}
+}
+
 // SetIssues updates the board data, typically after filtering
 func (b *BoardModel) SetIssues(issues []model.Issue) {
+	var prevSelectedID string
+	if len(b.activeColIdx) > 0 {
+		if sel := b.SelectedIssue(); sel != nil {
+			prevSelectedID = sel.ID
+		}
+	}
+	prevSearchMode := b.searchMode
+	prevSearchQuery := b.searchQuery
+	prevSearchCursor := b.searchCursor
+	prevExpandedID := b.expandedCardID
+
 	// Store all issues for regrouping on mode change (bv-wjs0)
 	b.allIssues = issues
 	b.boardState = nil
@@ -455,7 +638,7 @@ func (b *BoardModel) SetIssues(issues []model.Issue) {
 	// Group by current swimlane mode (bv-wjs0)
 	b.columns = groupIssuesByMode(issues, b.swimLaneMode)
 
-	b.blocksIndex = buildBlocksIndex(issues) // Rebuild reverse dependency index (bv-1daf)
+	b.rebuildBlocksIndex() // Rebuild reverse dependency index (bv-1daf)
 
 	// Rebuild issue lookup map for blocker titles (bv-kklp)
 	b.issueMap = make(map[string]*model.Issue, len(issues))
@@ -463,14 +646,8 @@ func (b *BoardModel) SetIssues(issues []model.Issue) {
 		b.issueMap[issues[i].ID] = &issues[i]
 	}
 
-	// Clear search state - stale matches could reference invalid positions (bv-yg39)
-	b.CancelSearch()
-
 	// Reset detail panel cache to force refresh if same issue is selected
 	b.lastDetailID = ""
-
-	// Clear expanded card - stale ID may reference a removed issue
-	b.expandedCardID = ""
 
 	// Sanitize selection to prevent out-of-bounds
 	for i := 0; i < 4; i++ {
@@ -484,6 +661,14 @@ func (b *BoardModel) SetIssues(issues []model.Issue) {
 	}
 
 	b.updateActiveColumns()
+	if prevSelectedID != "" {
+		b.SelectIssueByID(prevSelectedID)
+	}
+	b.expandedCardID = ""
+	if prevExpandedID != "" && b.containsIssueInColumns(prevExpandedID) {
+		b.expandedCardID = prevExpandedID
+	}
+	b.refreshPreservedSearch(prevSearchMode, prevSearchQuery, prevSearchCursor, prevSelectedID)
 }
 
 // SetSnapshot updates the board data directly from a DataSnapshot (bv-guxz).
@@ -494,6 +679,17 @@ func (b *BoardModel) SetSnapshot(s *DataSnapshot) {
 		return
 	}
 
+	var prevSelectedID string
+	if len(b.activeColIdx) > 0 {
+		if sel := b.SelectedIssue(); sel != nil {
+			prevSelectedID = sel.ID
+		}
+	}
+	prevSearchMode := b.searchMode
+	prevSearchQuery := b.searchQuery
+	prevSearchCursor := b.searchCursor
+	prevExpandedID := b.expandedCardID
+
 	b.allIssues = s.Issues
 	b.boardState = s.BoardState
 
@@ -503,25 +699,15 @@ func (b *BoardModel) SetSnapshot(s *DataSnapshot) {
 		b.columns = groupIssuesByMode(s.Issues, b.swimLaneMode)
 	}
 
-	// Prefer snapshot-precomputed reverse-dependency index when available.
-	graphLayout := s.GetGraphLayout()
-	if graphLayout != nil && graphLayout.Dependents != nil {
-		b.blocksIndex = graphLayout.Dependents
-	} else {
-		b.blocksIndex = buildBlocksIndex(s.Issues)
-	}
+	// Build open-only blocking dependents index so closed/tombstone dependents
+	// and non-blocking hierarchy edges do not inflate ⚡→N.
+	b.rebuildBlocksIndex()
 
 	// Use snapshot issue map for blocker titles.
 	b.issueMap = s.IssueMap
 
-	// Clear search state - stale matches could reference invalid positions (bv-yg39)
-	b.CancelSearch()
-
 	// Reset detail panel cache to force refresh if same issue is selected
 	b.lastDetailID = ""
-
-	// Clear expanded card - stale ID may reference a removed issue
-	b.expandedCardID = ""
 
 	// Sanitize selection to prevent out-of-bounds
 	for i := 0; i < 4; i++ {
@@ -535,6 +721,14 @@ func (b *BoardModel) SetSnapshot(s *DataSnapshot) {
 	}
 
 	b.updateActiveColumns()
+	if prevSelectedID != "" {
+		b.SelectIssueByID(prevSelectedID)
+	}
+	b.expandedCardID = ""
+	if prevExpandedID != "" && b.containsIssueInColumns(prevExpandedID) {
+		b.expandedCardID = prevExpandedID
+	}
+	b.refreshPreservedSearch(prevSearchMode, prevSearchQuery, prevSearchCursor, prevSelectedID)
 }
 
 // actualFocusedCol returns the actual column index (0-3) being focused
@@ -692,6 +886,11 @@ func (b *BoardModel) CancelSearch() {
 	b.searchCursor = 0
 }
 
+// ClearSearch exits search mode and clears any active search query/matches.
+func (b *BoardModel) ClearSearch() {
+	b.CancelSearch()
+}
+
 // FinishSearch exits search mode but keeps results for n/N navigation
 func (b *BoardModel) FinishSearch() {
 	b.searchMode = false
@@ -699,6 +898,9 @@ func (b *BoardModel) FinishSearch() {
 
 // SearchQuery returns the current search query
 func (b *BoardModel) SearchQuery() string { return b.searchQuery }
+
+// GetSearchQuery returns the current search query (alias for SearchQuery).
+func (b *BoardModel) GetSearchQuery() string { return b.searchQuery }
 
 // SearchMatchCount returns the number of matches
 func (b *BoardModel) SearchMatchCount() int { return len(b.searchMatches) }
@@ -711,8 +913,17 @@ func (b *BoardModel) SearchCursorPos() int {
 	return b.searchCursor + 1
 }
 
-// AppendSearchChar adds a character to the search query
+// AppendSearchChar adds a character to the search query, normalizing
+// newline/tab paste sequences to single spaces and ignoring control runes.
 func (b *BoardModel) AppendSearchChar(ch rune) {
+	if ch == '\r' || ch == '\n' || ch == '\t' {
+		if b.searchQuery == "" || strings.HasSuffix(b.searchQuery, " ") {
+			return
+		}
+		ch = ' '
+	} else if unicode.IsControl(ch) {
+		return
+	}
 	b.searchQuery += string(ch)
 	b.updateSearchMatches()
 }
@@ -739,7 +950,7 @@ func (b *BoardModel) updateSearchMatches() {
 			idLower := strings.ToLower(issue.ID)
 			titleLower := strings.ToLower(issue.Title)
 			if strings.Contains(idLower, query) || strings.Contains(titleLower, query) {
-				b.searchMatches = append(b.searchMatches, searchMatch{col: colIdx, row: rowIdx})
+				b.searchMatches = append(b.searchMatches, searchMatch{col: colIdx, row: rowIdx, issueID: issue.ID})
 			}
 		}
 	}
@@ -786,7 +997,10 @@ func (b *BoardModel) PrevMatch() {
 
 // IsMatchHighlighted returns true if position is current search match
 func (b *BoardModel) IsMatchHighlighted(colIdx, rowIdx int) bool {
-	if !b.searchMode || len(b.searchMatches) == 0 {
+	if b.searchQuery == "" || len(b.searchMatches) == 0 {
+		return false
+	}
+	if b.searchCursor < 0 || b.searchCursor >= len(b.searchMatches) {
 		return false
 	}
 	match := b.searchMatches[b.searchCursor]
@@ -795,7 +1009,7 @@ func (b *BoardModel) IsMatchHighlighted(colIdx, rowIdx int) bool {
 
 // IsSearchMatch returns true if position matches the search query
 func (b *BoardModel) IsSearchMatch(colIdx, rowIdx int) bool {
-	if !b.searchMode || b.searchQuery == "" {
+	if b.searchQuery == "" || len(b.searchMatches) == 0 {
 		return false
 	}
 	for _, m := range b.searchMatches {
@@ -1043,7 +1257,7 @@ func (b BoardModel) View(width, height int) string {
 		issueCount := len(issues)
 
 		// Compute column statistics (bv-nl8a)
-		stats := computeColumnStats(issues, b.issueMap)
+		stats := b.computeColumnStats(issues)
 
 		// Build header text with adaptive stats based on terminal width (bv-nl8a)
 		// - Narrow (<100): Just count
@@ -1235,7 +1449,8 @@ func (b BoardModel) View(width, height int) string {
 	return boardView
 }
 
-// renderTitleBar creates the board title bar with swimlane mode and hidden column count (bv-tf6j)
+// renderTitleBar creates the board title bar with swimlane mode, hidden column count,
+// and active search query/match indicator (bv-tf6j, bv-yg39).
 func (b BoardModel) renderTitleBar(width int, t Theme) string {
 	// Build title: "BOARD [by: Status]" or "BOARD [by: Priority] [+2 hidden]"
 	modeName := b.GetSwimLaneModeName()
@@ -1245,6 +1460,24 @@ func (b BoardModel) renderTitleBar(width int, t Theme) string {
 	hiddenCount := b.HiddenColumnCount()
 	if hiddenCount > 0 {
 		title = fmt.Sprintf("%s [+%d hidden]", title, hiddenCount)
+	}
+
+	if b.searchMode || b.searchQuery != "" {
+		var searchInfo string
+		switch {
+		case b.searchMode && b.searchQuery == "":
+			searchInfo = "🔍 /_ — Enter done, Esc cancel"
+		case len(b.searchMatches) > 0 && b.searchMode:
+			searchInfo = fmt.Sprintf("🔍 %q (%d/%d) — Enter done, Esc cancel", b.searchQuery, b.SearchCursorPos(), len(b.searchMatches))
+		case len(b.searchMatches) > 0:
+			searchInfo = fmt.Sprintf("🔍 %q (%d/%d) — n/N next/prev, Esc clear", b.searchQuery, b.SearchCursorPos(), len(b.searchMatches))
+		default:
+			searchInfo = fmt.Sprintf("🔍 %q (0 matches) — Esc clear", b.searchQuery)
+		}
+		title = title + "  " + searchInfo
+	}
+	if width > 4 {
+		title = truncateRunesHelper(title, width-2, "…")
 	}
 
 	// Style the title bar
@@ -1293,14 +1526,10 @@ func (b BoardModel) renderCard(issue model.Issue, width int, selected bool, colI
 	// ══════════════════════════════════════════════════════════════════════════
 	// DETERMINE BLOCKING STATUS for color coding (bv-kklp)
 	// ══════════════════════════════════════════════════════════════════════════
-	hasBlockingDeps := false
-	for _, dep := range issue.Dependencies {
-		if dep != nil && dep.Type.IsBlocking() {
-			hasBlockingDeps = true
-			break
-		}
-	}
+	activeBlockers := b.activeBlockingDeps(issue)
+	hasBlockingDeps := len(activeBlockers) > 0
 	blocksOthers := len(b.blocksIndex[issue.ID]) > 0
+	statusBadge := customOpenColumnBadge(issue)
 
 	// ══════════════════════════════════════════════════════════════════════════
 	// SEARCH MATCH HIGHLIGHTING (bv-yg39)
@@ -1317,9 +1546,9 @@ func (b BoardModel) renderCard(issue model.Issue, width int, selected bool, colI
 		MarginBottom(1)
 
 	// Border color based on blocking status (bv-kklp):
-	// - Red: Blocked (has blocking dependencies)
-	// - Yellow/Orange: High-impact (blocks others)
-	// - Green: Ready to work (open, no blockers)
+	// - Red: Blocked (has unresolved blocking dependencies)
+	// - Yellow/Orange: High-impact (blocks open others)
+	// - Green: Ready to work (claimable open work)
 	// - Default: Normal border
 	// Search matches override border color (bv-yg39)
 	var borderColor lipgloss.TerminalColor
@@ -1333,7 +1562,7 @@ func (b BoardModel) renderCard(issue model.Issue, width int, selected bool, colI
 		borderColor = lipgloss.AdaptiveColor{Light: "#c62828", Dark: "#ef5350"} // Red - blocked
 	} else if blocksOthers {
 		borderColor = lipgloss.AdaptiveColor{Light: "#f57c00", Dark: "#ffb74d"} // Yellow/orange - high impact
-	} else if issue.Status == model.StatusOpen {
+	} else if (b.swimLaneMode != SwimByStatus || colIdx == ColOpen) && b.isCardClaimable(issue, hasBlockingDeps, statusBadge) {
 		borderColor = lipgloss.AdaptiveColor{Light: "#2e7d32", Dark: "#81c784"} // Green - ready
 	} else {
 		borderColor = t.Border // Default border
@@ -1410,25 +1639,30 @@ func (b BoardModel) renderCard(issue model.Issue, width int, selected bool, colI
 	line2 := titleStyle.Render(truncatedTitle)
 
 	// ══════════════════════════════════════════════════════════════════════════
-	// LINE 3: Blocked-by + Blocks count + Labels (bv-1daf)
+	// LINE 3: Status badge + Blocked-by + Blocks count + Labels (bv-1daf)
 	// No @assignee - not useful for agent workflows per spec
 	// ══════════════════════════════════════════════════════════════════════════
 	var meta []string
 
-	// Blocked-by indicator: 🚫←bv-456 (title...) - show first blocking dep with title (bv-kklp)
-	for _, dep := range issue.Dependencies {
-		if dep != nil && dep.Type.IsBlocking() {
-			blockerID := truncateRunesHelper(dep.DependsOnID, 10, "…")
-			blockedStyle := t.Renderer.NewStyle().Foreground(t.Blocked)
-			// Try to get blocker title for better context
-			blockerBadge := "🚫←" + blockerID
-			if blocker, ok := b.issueMap[dep.DependsOnID]; ok && blocker != nil {
-				titleSnippet := truncateRunesHelper(blocker.Title, 12, "…")
-				blockerBadge = fmt.Sprintf("🚫←%s (%s)", blockerID, titleSnippet)
-			}
-			meta = append(meta, blockedStyle.Render(blockerBadge))
-			break // Only show first blocker
+	if statusBadge != "" {
+		badgeStyle := t.Renderer.NewStyle().Foreground(t.Secondary).Bold(true)
+		meta = append(meta, badgeStyle.Render(statusBadge))
+	}
+
+	// Blocked-by indicator: 🚫←bv-456 (title...) - show first active blocking dep with title (bv-kklp)
+	if len(activeBlockers) > 0 {
+		dep := activeBlockers[0]
+		blockerID := truncateRunesHelper(dep.DependsOnID, 10, "…")
+		blockedStyle := t.Renderer.NewStyle().Foreground(t.Blocked)
+		blockerBadge := "🚫←" + blockerID
+		if blocker, ok := b.lookupIssue(dep.DependsOnID); ok && blocker != nil {
+			titleSnippet := truncateRunesHelper(blocker.Title, 12, "…")
+			blockerBadge = fmt.Sprintf("🚫←%s (%s)", blockerID, titleSnippet)
 		}
+		if len(activeBlockers) > 1 {
+			blockerBadge = fmt.Sprintf("%s +%d", blockerBadge, len(activeBlockers)-1)
+		}
+		meta = append(meta, blockedStyle.Render(blockerBadge))
 	}
 
 	// Blocks count: ⚡→N (this card blocks N others) - from reverse index
@@ -1478,14 +1712,10 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 	// ══════════════════════════════════════════════════════════════════════════
 	// DETERMINE BLOCKING STATUS for color coding (same as renderCard)
 	// ══════════════════════════════════════════════════════════════════════════
-	hasBlockingDeps := false
-	for _, dep := range issue.Dependencies {
-		if dep != nil && dep.Type.IsBlocking() {
-			hasBlockingDeps = true
-			break
-		}
-	}
+	activeBlockers := b.activeBlockingDeps(issue)
+	hasBlockingDeps := len(activeBlockers) > 0
 	blocksOthers := len(b.blocksIndex[issue.ID]) > 0
+	statusBadge := customOpenColumnBadge(issue)
 
 	// ══════════════════════════════════════════════════════════════════════════
 	// CARD STYLING - Expanded card is always selected (since we expand selected)
@@ -1501,7 +1731,7 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 		borderColor = lipgloss.AdaptiveColor{Light: "#c62828", Dark: "#ef5350"} // Red - blocked
 	} else if blocksOthers {
 		borderColor = lipgloss.AdaptiveColor{Light: "#f57c00", Dark: "#ffb74d"} // Yellow - high impact
-	} else if issue.Status == model.StatusOpen {
+	} else if issue.Status == model.StatusOpen && statusBadge == "" {
 		borderColor = lipgloss.AdaptiveColor{Light: "#2e7d32", Dark: "#81c784"} // Green - ready
 	} else {
 		borderColor = t.Primary // Selected uses primary
@@ -1524,10 +1754,15 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 		prioStyle = prioStyle.Foreground(t.Secondary)
 	}
 
-	header := fmt.Sprintf("%s %s %s ▼",
+	headerSuffix := "▼"
+	if statusBadge != "" {
+		headerSuffix = t.Renderer.NewStyle().Foreground(t.Secondary).Bold(true).Render(statusBadge) + " ▼"
+	}
+	header := fmt.Sprintf("%s %s %s %s",
 		t.Renderer.NewStyle().Foreground(iconColor).Render(icon),
 		prioStyle.Render(prioText),
 		t.Renderer.NewStyle().Bold(true).Foreground(t.Primary).Render(issue.ID),
+		headerSuffix,
 	)
 
 	// ══════════════════════════════════════════════════════════════════════════
@@ -1567,23 +1802,33 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 	}
 
 	// ══════════════════════════════════════════════════════════════════════════
-	// DEPENDENCIES: Show blocking deps with titles
+	// DEPENDENCIES: Show active vs resolved blocking deps with titles
 	// ══════════════════════════════════════════════════════════════════════════
 	var depLines []string
-	var blockingDeps []*model.Dependency
+	var resolvedDeps []*model.Dependency
 	for _, dep := range issue.Dependencies {
-		if dep != nil && dep.Type.IsBlocking() {
-			blockingDeps = append(blockingDeps, dep)
+		if dep != nil && dep.Type.IsBlocking() && !b.isBlockerUnsatisfied(issue.ID, dep.DependsOnID) {
+			resolvedDeps = append(resolvedDeps, dep)
 		}
 	}
-	if len(blockingDeps) > 0 {
+	if len(activeBlockers) > 0 {
 		depLines = append(depLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Blocked).Render("Blocked by:"))
-		for _, dep := range blockingDeps {
-			blockerText := fmt.Sprintf("  • %s", dep.DependsOnID)
-			if blocker, ok := b.issueMap[dep.DependsOnID]; ok && blocker != nil {
-				blockerText = fmt.Sprintf("  • %s: %s (%s)", dep.DependsOnID, blocker.Title, blocker.Status)
+		for _, dep := range activeBlockers {
+			blockerText := fmt.Sprintf("  • %s (active)", dep.DependsOnID)
+			if blocker, ok := b.lookupIssue(dep.DependsOnID); ok {
+				blockerText = fmt.Sprintf("  • %s: %s (%s, active)", dep.DependsOnID, blocker.Title, blocker.Status)
 			}
 			depLines = append(depLines, t.Renderer.NewStyle().Foreground(t.Blocked).Render(blockerText))
+		}
+	}
+	if len(resolvedDeps) > 0 {
+		depLines = append(depLines, t.Renderer.NewStyle().Foreground(t.Secondary).Render("Resolved blockers:"))
+		for _, dep := range resolvedDeps {
+			blockerText := fmt.Sprintf("  • %s (resolved)", dep.DependsOnID)
+			if blocker, ok := b.lookupIssue(dep.DependsOnID); ok {
+				blockerText = fmt.Sprintf("  • %s: %s (%s, resolved)", dep.DependsOnID, blocker.Title, blocker.Status)
+			}
+			depLines = append(depLines, t.Renderer.NewStyle().Foreground(t.Secondary).Render(blockerText))
 		}
 	}
 
@@ -1592,7 +1837,7 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 		depLines = append(depLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Feature).Render("Blocks:"))
 		for _, blockedID := range blockedIDs {
 			blockedText := fmt.Sprintf("  • %s", blockedID)
-			if blocked, ok := b.issueMap[blockedID]; ok && blocked != nil {
+			if blocked, ok := b.lookupIssue(blockedID); ok {
 				blockedText = fmt.Sprintf("  • %s: %s", blockedID, blocked.Title)
 			}
 			depLines = append(depLines, t.Renderer.NewStyle().Foreground(t.Feature).Render(blockedText))
@@ -1684,7 +1929,7 @@ func (b *BoardModel) syncDetailContent() {
 		content.WriteString(fmt.Sprintf("**Labels:** %s\n\n", strings.Join(issue.Labels, ", ")))
 	}
 
-	// Dependencies - show with titles and status (bv-kklp)
+	// Dependencies - show with titles and active/resolved state (bv-kklp)
 	var blockingDeps []*model.Dependency
 	for _, dep := range issue.Dependencies {
 		if dep != nil && dep.Type.IsBlocking() {
@@ -1694,11 +1939,15 @@ func (b *BoardModel) syncDetailContent() {
 	if len(blockingDeps) > 0 {
 		content.WriteString("**Blocked by:**\n")
 		for _, dep := range blockingDeps {
-			if blocker, ok := b.issueMap[dep.DependsOnID]; ok && blocker != nil {
-				content.WriteString(fmt.Sprintf("- %s: %s (%s)\n",
-					dep.DependsOnID, blocker.Title, blocker.Status))
+			state := "active"
+			if !b.isBlockerUnsatisfied(issue.ID, dep.DependsOnID) {
+				state = "resolved"
+			}
+			if blocker, ok := b.lookupIssue(dep.DependsOnID); ok {
+				content.WriteString(fmt.Sprintf("- %s: %s (%s, %s)\n",
+					dep.DependsOnID, blocker.Title, blocker.Status, state))
 			} else {
-				content.WriteString(fmt.Sprintf("- %s\n", dep.DependsOnID))
+				content.WriteString(fmt.Sprintf("- %s (%s)\n", dep.DependsOnID, state))
 			}
 		}
 		content.WriteString("\n")
@@ -1708,7 +1957,7 @@ func (b *BoardModel) syncDetailContent() {
 	if blockedIDs, ok := b.blocksIndex[issue.ID]; ok && len(blockedIDs) > 0 {
 		content.WriteString("**Blocks:**\n")
 		for _, blockedID := range blockedIDs {
-			if blocked, ok := b.issueMap[blockedID]; ok && blocked != nil {
+			if blocked, ok := b.lookupIssue(blockedID); ok {
 				content.WriteString(fmt.Sprintf("- %s: %s\n", blockedID, blocked.Title))
 			} else {
 				content.WriteString(fmt.Sprintf("- %s\n", blockedID))

@@ -904,3 +904,69 @@ func TestAnalyzerMetricsLoader_DependencyBlockedOpenAndInProgressPromotedToBlock
 		t.Fatalf("expected dependency-blocked INPROG-DEP status=blocked, got %q", metrics["INPROG-DEP"].Status)
 	}
 }
+
+func TestNewAnalyzerMetricsLoaderWithReadiness_PreservesExternalBlockersTombstonesAndReadyStatuses(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	future := now.Add(48 * time.Hour)
+
+	scopedIssues := []model.Issue{
+		{ID: "READY-OPEN", Title: "Ready open", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now},
+		{ID: "READY-INPROG", Title: "Ready in progress", Status: model.StatusInProgress, CreatedAt: now, UpdatedAt: now},
+		{ID: "DEFER-FUTURE", Title: "Deferred until future", Status: model.StatusOpen, DeferUntil: &future, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "EXT-BLOCKED", Title: "Blocked by out-of-scope issue", Status: model.StatusInProgress, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "EXT-BLOCKED", DependsOnID: "OUT-OF-SCOPE-OPEN", Type: model.DepBlocks}},
+		},
+		{
+			ID: "TOMB-SATISFIED", Title: "Depends on tombstoned issue", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "TOMB-SATISFIED", DependsOnID: "DELETED-BLK", Type: model.DepBlocks}},
+		},
+	}
+
+	fullUniverse := append([]model.Issue{
+		{ID: "OUT-OF-SCOPE-OPEN", Title: "External open blocker", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now},
+		{ID: "DELETED-BLK", Title: "Tombstoned blocker", Status: model.StatusTombstone, CreatedAt: now, UpdatedAt: now},
+	}, scopedIssues...)
+	readiness := model.NewReadinessIndex(fullUniverse)
+
+	loader := NewAnalyzerMetricsLoaderWithReadiness(scopedIssues, readiness)
+	metrics, hashWithBlocked, err := loader.LoadMetricsWithHash()
+	if err != nil {
+		t.Fatalf("LoadMetricsWithHash: %v", err)
+	}
+
+	if got := metrics["READY-OPEN"].Status; got != string(model.StatusOpen) {
+		t.Fatalf("expected READY-OPEN status=open, got %q", got)
+	}
+	if got := metrics["READY-INPROG"].Status; got != string(model.StatusInProgress) {
+		t.Fatalf("expected READY-INPROG status=in_progress, got %q", got)
+	}
+	if got := metrics["DEFER-FUTURE"].Status; got != string(model.StatusOpen) {
+		t.Fatalf("expected satisfied future-deferred DEFER-FUTURE status=open (not blocked), got %q", got)
+	}
+	if got := metrics["EXT-BLOCKED"].Status; got != string(model.StatusBlocked) {
+		t.Fatalf("expected externally blocked EXT-BLOCKED status=blocked, got %q", got)
+	}
+	if got := metrics["TOMB-SATISFIED"].Status; got != string(model.StatusOpen) {
+		t.Fatalf("expected tombstone-satisfied TOMB-SATISFIED status=open, got %q", got)
+	}
+
+	// Changing external blocker satisfaction in ReadinessIndex must change ComputeDataHash
+	// even when scopedIssues itself is unchanged.
+	closedUniverse := append([]model.Issue{
+		{ID: "OUT-OF-SCOPE-OPEN", Title: "External closed blocker", Status: model.StatusClosed, CreatedAt: now, UpdatedAt: now},
+		{ID: "DELETED-BLK", Title: "Tombstoned blocker", Status: model.StatusTombstone, CreatedAt: now, UpdatedAt: now},
+	}, scopedIssues...)
+	readinessUnblocked := model.NewReadinessIndex(closedUniverse)
+	loaderUnblocked := NewAnalyzerMetricsLoaderWithReadiness(scopedIssues, readinessUnblocked)
+	metricsUnblocked, hashUnblocked, err := loaderUnblocked.LoadMetricsWithHash()
+	if err != nil {
+		t.Fatalf("LoadMetricsWithHash (unblocked): %v", err)
+	}
+	if got := metricsUnblocked["EXT-BLOCKED"].Status; got != string(model.StatusInProgress) {
+		t.Fatalf("expected EXT-BLOCKED status=in_progress once external blocker closes, got %q", got)
+	}
+	if hashWithBlocked == hashUnblocked {
+		t.Fatalf("expected ComputeDataHash to incorporate readiness dependency state, both returned %q", hashWithBlocked)
+	}
+}

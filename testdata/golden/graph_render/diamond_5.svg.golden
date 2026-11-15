@@ -29,19 +29,19 @@
 <polygon points="536,191 544,195 544,187" style="fill:#6b80bf" />
 <line x1="706" y1="191" x2="786" y2="191" style="stroke:#6b80bf;stroke-width:2" />
 <polygon points="786,191 794,195 794,187" style="fill:#6b80bf" />
-<rect x="36" y="156" width="170" height="70" rx="8" ry="8" style="fill:#c8e6c9;stroke:#222222;stroke-width:1.2" />
+<rect x="36" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
 <text x="46" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n0</text>
 <text x="46" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n0</text>
 <text x="46" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.089</text>
-<rect x="286" y="156" width="170" height="70" rx="8" ry="8" style="fill:#c8e6c9;stroke:#222222;stroke-width:1.2" />
+<rect x="286" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
 <text x="296" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n1</text>
 <text x="296" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n1</text>
 <text x="296" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.127</text>
-<rect x="286" y="266" width="170" height="70" rx="8" ry="8" style="fill:#c8e6c9;stroke:#222222;stroke-width:1.2" />
+<rect x="286" y="266" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
 <text x="296" y="288" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n2</text>
 <text x="296" y="308" style="fill:#666666;font-size:12px;font-family:monospace" >n2</text>
 <text x="296" y="326" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.127</text>
-<rect x="536" y="156" width="170" height="70" rx="8" ry="8" style="fill:#c8e6c9;stroke:#222222;stroke-width:1.2" />
+<rect x="536" y="156" width="170" height="70" rx="8" ry="8" style="fill:#ffcdd2;stroke:#222222;stroke-width:1.2" />
 <text x="546" y="178" style="fill:#111111;font-size:13px;font-family:monospace;font-weight:bold" >n3</text>
 <text x="546" y="198" style="fill:#666666;font-size:12px;font-family:monospace" >n3</text>
 <text x="546" y="216" style="fill:#666666;font-size:11px;font-family:monospace" >PR 0.306</text>

@@ -428,12 +428,87 @@ func (w *Wizard) collectTargetConfig() error {
 	return nil
 }
 
+func isBeadsDataFileName(base string) bool {
+	lower := strings.ToLower(strings.TrimSpace(base))
+	return strings.HasSuffix(lower, ".jsonl") ||
+		strings.HasSuffix(lower, ".db") ||
+		strings.HasSuffix(lower, ".sqlite") ||
+		strings.HasSuffix(lower, ".sqlite3")
+}
+
+func isBeadsSourcePath(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || trimmed == "." || trimmed == "/" {
+		return false
+	}
+	cleaned := filepath.Clean(trimmed)
+	base := filepath.Base(cleaned)
+	if strings.EqualFold(base, ".beads") || isBeadsDataFileName(base) {
+		return true
+	}
+	if strings.EqualFold(filepath.Base(filepath.Dir(cleaned)), ".beads") {
+		return true
+	}
+	if info, err := os.Stat(cleaned); err == nil && !info.IsDir() {
+		return true
+	}
+	return false
+}
+
+// projectRootFromBeadsPath resolves the enclosing project directory for a
+// .beads directory or .beads/<file> path (whether or not it exists on disk).
+func projectRootFromBeadsPath(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		abs = filepath.Clean(trimmed)
+	}
+	base := filepath.Base(abs)
+	if isEmptyPathBase(base) {
+		return ""
+	}
+	if info, err := os.Stat(abs); (err == nil && !info.IsDir()) || isBeadsDataFileName(base) {
+		abs = filepath.Dir(abs)
+	}
+	if strings.EqualFold(filepath.Base(abs), ".beads") {
+		abs = filepath.Dir(abs)
+	}
+	if isEmptyPathBase(filepath.Base(abs)) {
+		return ""
+	}
+	return abs
+}
+
+func (w *Wizard) suggestedTargetSourcePath() string {
+	if strings.TrimSpace(w.bundlePath) != "" {
+		return w.bundlePath
+	}
+	if w.config != nil {
+		if strings.TrimSpace(w.config.SourceRepoRoot) != "" {
+			return filepath.Join(w.config.SourceRepoRoot, "bv-pages")
+		}
+		if root := projectRootFromBeadsPath(w.config.SourceBeadsDir); root != "" {
+			return filepath.Join(root, "bv-pages")
+		}
+		if root := projectRootFromBeadsPath(w.config.SourcePath); root != "" {
+			return filepath.Join(root, "bv-pages")
+		}
+	}
+	if root := projectRootFromBeadsPath(w.beadsPath); root != "" {
+		return filepath.Join(root, "bv-pages")
+	}
+	return ""
+}
+
 func (w *Wizard) collectGitHubConfig() error {
 	fmt.Println("Step 3: GitHub Configuration")
 	fmt.Println("────────────────────────────")
 
-	// Suggest repo name using shared helper
-	suggestedName := SuggestRepoName(w.bundlePath)
+	// Suggest repo name using bundle path, enclosing project root of beadsPath, or cwd
+	suggestedName := SuggestRepoName(w.suggestedTargetSourcePath())
 	if isEmptyPathBase(suggestedName) {
 		suggestedName = "beads-viewer-pages"
 	} else if !strings.HasSuffix(suggestedName, "-pages") {
@@ -477,15 +552,10 @@ func (w *Wizard) collectCloudflareConfig() error {
 	fmt.Println("Step 3: Cloudflare Pages Configuration")
 	fmt.Println("────────────────────────────")
 
-	// Suggest project name based on bundle path or current directory
-	suggestedName := SuggestProjectName(w.beadsPath)
+	// Suggest project name based on bundle path, enclosing project root of beadsPath, or cwd
+	suggestedName := SuggestProjectName(w.suggestedTargetSourcePath())
 	if suggestedName == "" {
-		cwd, _ := os.Getwd()
-		base := filepath.Base(cwd)
-		if base == "." || base == "/" {
-			base = "beads-viewer-pages"
-		}
-		suggestedName = base + "-pages"
+		suggestedName = "beads-viewer-pages"
 	}
 
 	projectName := suggestedName
@@ -496,7 +566,8 @@ func (w *Wizard) collectCloudflareConfig() error {
 			huh.NewInput().
 				Title("Cloudflare Pages project name").
 				Value(&projectName).
-				Placeholder(suggestedName),
+				Placeholder(suggestedName).
+				Validate(ValidateProjectName),
 			huh.NewInput().
 				Title("Branch name").
 				Value(&branch).

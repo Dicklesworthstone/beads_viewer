@@ -263,7 +263,7 @@ function resolveClosedDate(issue) {
         const parsed = new Date(rawClosed);
         if (!isNaN(parsed)) return parsed;
     }
-    if (issue.status === 'closed') {
+    if (String(issue.status || '').toLowerCase() === 'closed') {
         const rawUpdated = issue.updated_at || issue.updatedAt;
         if (rawUpdated) {
             const parsed = new Date(rawUpdated);
@@ -275,10 +275,13 @@ function resolveClosedDate(issue) {
 
 /**
  * Compute burndown data from issues
- * Groups by day and computes cumulative counts (excluding tombstones)
+ * Groups by day and computes cumulative counts (excluding tombstones and parked deferred items)
  */
 function computeBurndownData() {
-    const issues = chartsState.issues.filter(i => i.status !== 'tombstone');
+    const issues = chartsState.issues.filter(i => {
+        const st = String(i.status || '').toLowerCase();
+        return st !== 'tombstone' && st !== 'deferred';
+    });
     if (!issues.length) {
         return { labels: [], open: [], closed: [], blocked: [] };
     }
@@ -293,7 +296,7 @@ function computeBurndownData() {
             created: Number.isNaN(created.getTime()) ? null : created,
             updatedAt: updated && !Number.isNaN(updated.getTime()) ? updated : null,
             closedAt: resolveClosedDate(issue),
-            status: issue.status || 'open'
+            status: String(issue.status || 'open').toLowerCase()
         });
     });
 
@@ -484,7 +487,10 @@ function initPriorityChart() {
 }
 
 function computePriorityData() {
-    const issues = chartsState.issues.filter(i => i.status !== 'closed' && i.status !== 'tombstone');
+    const issues = chartsState.issues.filter(i => {
+        const st = String(i.status || '').toLowerCase();
+        return st !== 'closed' && st !== 'tombstone';
+    });
     const counts = [0, 0, 0, 0, 0]; // P0-P4
 
     issues.forEach(issue => {
@@ -565,11 +571,14 @@ function initTypeChart() {
                     }
                 }
             },
-            onClick: (event, elements) => {
+            onClick: (event, elements, chart) => {
                 if (elements.length > 0) {
                     const typeIndex = elements[0].index;
-                    const type = data.labels[typeIndex].toLowerCase();
-                    dispatchChartEvent('typeClick', { type });
+                    const activeChart = chart || chartsState.typeChart;
+                    const rawLabel = activeChart?.data?.labels?.[typeIndex] ?? data.labels[typeIndex];
+                    if (rawLabel) {
+                        dispatchChartEvent('typeClick', { type: String(rawLabel).toLowerCase() });
+                    }
                 }
             }
         }
@@ -577,10 +586,13 @@ function initTypeChart() {
 }
 
 function computeTypeData() {
-    const activeIssues = chartsState.issues.filter(i => i.status !== 'closed' && i.status !== 'tombstone');
+    const activeIssues = chartsState.issues.filter(i => {
+        const st = String(i.status || '').toLowerCase();
+        return st !== 'closed' && st !== 'tombstone';
+    });
     const issues = activeIssues.length > 0
         ? activeIssues
-        : chartsState.issues.filter(i => i.status !== 'tombstone');
+        : chartsState.issues.filter(i => String(i.status || '').toLowerCase() !== 'tombstone');
     const typeCounts = new Map();
 
     issues.forEach(issue => {
@@ -638,6 +650,17 @@ function renderHeatmap() {
     if (!canvas) return;
 
     const matrix = computeLabelMatrix();
+    const truncNote = document.getElementById('heatmap-truncation-note');
+    if (truncNote) {
+        if (matrix.truncated && matrix.totalLabels > matrix.labels.length) {
+            truncNote.textContent = `(Top ${matrix.labels.length} of ${matrix.totalLabels} active labels)`;
+            truncNote.classList.remove('hidden');
+        } else {
+            truncNote.textContent = '';
+            truncNote.classList.add('hidden');
+        }
+    }
+
     if (!matrix.labels.length) {
         // Show empty state
         const ctx = canvas.getContext('2d');
@@ -651,7 +674,7 @@ function renderHeatmap() {
     }
 
     const { labels, data, maxValue } = matrix;
-    const cellSize = Math.min(40, Math.floor(300 / labels.length));
+    const cellSize = Math.max(14, Math.min(40, Math.floor(300 / labels.length)));
     const padding = { top: 60, right: 20, bottom: 20, left: 100 };
 
     canvas.width = padding.left + labels.length * cellSize + padding.right;
@@ -678,7 +701,7 @@ function renderHeatmap() {
             // Show value if non-zero
             if (value > 0) {
                 ctx.fillStyle = intensity > 0.5 ? CHART_THEME.bg : CHART_THEME.fg;
-                ctx.font = `${Math.min(12, cellSize / 3)}px 'JetBrains Mono', monospace`;
+                ctx.font = `${Math.min(12, Math.max(8, Math.floor(cellSize / 2)))}px 'JetBrains Mono', monospace`;
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
                 ctx.fillText(String(value), x + cellSize / 2, y + cellSize / 2);
@@ -711,11 +734,13 @@ function renderHeatmap() {
     });
     ctx.restore();
 
-    // Add click handler
+    // Add click handler (accounts for responsive CSS canvas scaling)
     canvas.onclick = (e) => {
         const rect = canvas.getBoundingClientRect();
-        const x = e.clientX - rect.left - padding.left;
-        const y = e.clientY - rect.top - padding.top;
+        const scaleX = rect.width > 0 ? canvas.width / rect.width : 1;
+        const scaleY = rect.height > 0 ? canvas.height / rect.height : 1;
+        const x = (e.clientX - rect.left) * scaleX - padding.left;
+        const y = (e.clientY - rect.top) * scaleY - padding.top;
 
         const col = Math.floor(x / cellSize);
         const row = Math.floor(y / cellSize);
@@ -736,25 +761,82 @@ function renderHeatmap() {
     };
 }
 
-function computeLabelMatrix() {
-    const issues = chartsState.issues.filter(i => i.status !== 'tombstone');
-    const deps = (chartsState.dependencies || []).filter(isChartBlockingDep);
+function parseChartLabels(raw) {
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'string' && raw.trim()) {
+        try {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) return parsed;
+        } catch {
+            // Fall back to empty array on invalid JSON
+        }
+    }
+    return [];
+}
 
-    // Build issue -> labels map
+function computeLabelMatrix(issuesInput = null, dependenciesInput = null) {
+    const sourceIssues = Array.isArray(issuesInput) ? issuesInput : chartsState.issues;
+    const sourceDeps = Array.isArray(dependenciesInput) ? dependenciesInput : (chartsState.dependencies || []);
+    const issues = sourceIssues.filter(i => String(i.status || '').toLowerCase() !== 'tombstone');
+    const deps = sourceDeps.filter(isChartBlockingDep);
+
+    // Build issue -> labels map and per-label issue counts
     const issueLabels = new Map();
+    const labelIssueCounts = new Map();
     const labelSet = new Set();
 
     issues.forEach(issue => {
-        const labels = issue.labels || [];
-        issueLabels.set(issue.id, labels);
-        labels.forEach(l => labelSet.add(l));
+        const rawLabels = parseChartLabels(issue.labels);
+        const uniqueIssueLabels = [...new Set(rawLabels.filter(Boolean))];
+        issueLabels.set(issue.id, uniqueIssueLabels);
+        uniqueIssueLabels.forEach(l => {
+            labelSet.add(l);
+            labelIssueCounts.set(l, (labelIssueCounts.get(l) || 0) + 1);
+        });
     });
 
-    const labels = [...labelSet].sort();
-    if (labels.length === 0 || labels.length > 20) {
-        // Skip if no labels or too many
-        return { labels: [], data: [], maxValue: 0 };
+    const uniqueLabels = [...labelSet].sort();
+    const totalLabels = uniqueLabels.length;
+    if (totalLabels === 0) {
+        return { labels: [], data: [], maxValue: 0, totalLabels: 0, truncated: false };
     }
+
+    let labels = uniqueLabels;
+    let truncated = false;
+
+    if (totalLabels > 20) {
+        // Compute cross-label blocking activity across all labels to pick the top 20 active labels
+        const activity = new Map();
+        uniqueLabels.forEach(l => activity.set(l, 0));
+
+        deps.forEach(dep => {
+            const fromLabels = issueLabels.get(dep.issue_id) || [];
+            const toLabels = issueLabels.get(dep.depends_on_id) || [];
+            fromLabels.forEach(fromLabel => {
+                toLabels.forEach(toLabel => {
+                    if (fromLabel !== toLabel) {
+                        activity.set(fromLabel, (activity.get(fromLabel) || 0) + 1);
+                        activity.set(toLabel, (activity.get(toLabel) || 0) + 1);
+                    }
+                });
+            });
+        });
+
+        labels = [...uniqueLabels]
+            .sort((a, b) => {
+                const actDiff = (activity.get(b) || 0) - (activity.get(a) || 0);
+                if (actDiff !== 0) return actDiff;
+                const countDiff = (labelIssueCounts.get(b) || 0) - (labelIssueCounts.get(a) || 0);
+                if (countDiff !== 0) return countDiff;
+                return a.localeCompare(b);
+            })
+            .slice(0, 20)
+            .sort();
+        truncated = true;
+    }
+
+    const labelIndex = new Map();
+    labels.forEach((l, idx) => labelIndex.set(l, idx));
 
     // Initialize matrix
     const data = labels.map(() => labels.map(() => 0));
@@ -766,11 +848,12 @@ function computeLabelMatrix() {
         const toLabels = issueLabels.get(dep.depends_on_id) || [];
 
         fromLabels.forEach(fromLabel => {
+            const i = labelIndex.get(fromLabel);
+            if (i === undefined) return;
             toLabels.forEach(toLabel => {
                 if (fromLabel !== toLabel) {
-                    const i = labels.indexOf(fromLabel);
-                    const j = labels.indexOf(toLabel);
-                    if (i >= 0 && j >= 0) {
+                    const j = labelIndex.get(toLabel);
+                    if (j !== undefined) {
                         data[i][j]++;
                         maxValue = Math.max(maxValue, data[i][j]);
                     }
@@ -779,7 +862,7 @@ function computeLabelMatrix() {
         });
     });
 
-    return { labels, data, maxValue };
+    return { labels, data, maxValue, totalLabels, truncated };
 }
 
 function updateHeatmap() {
@@ -843,6 +926,7 @@ if (typeof window !== 'undefined') {
         update: updateCharts,
         destroy: destroyCharts,
         computeBurndownData: computeBurndownData,
+        computeLabelMatrix: computeLabelMatrix,
         CHART_THEME: CHART_THEME
     };
 }

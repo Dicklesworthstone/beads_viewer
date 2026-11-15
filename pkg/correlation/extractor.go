@@ -271,6 +271,11 @@ const snapshotBlobSizeThreshold = 64 * 1024 // 64 KB
 // (where `-p` blows up to minutes) take the snapshot path; small blobs take the
 // faster native path. See snapshotBlobSizeThreshold.
 func (e *Extractor) Extract(opts ExtractOptions) ([]BeadEvent, error) {
+	if opts.Revision != "" {
+		if err := validateGitRefArg(opts.Revision); err != nil {
+			return nil, err
+		}
+	}
 	if e.preferSnapshotPath() {
 		return e.extractViaSnapshots(opts)
 	}
@@ -301,6 +306,11 @@ func (e *Extractor) preferSnapshotPath() bool {
 // extractViaGitLogPatch is the legacy `git log -p` extraction path, retained for
 // reference and differential testing against extractViaSnapshots.
 func (e *Extractor) extractViaGitLogPatch(opts ExtractOptions) ([]BeadEvent, error) {
+	if opts.Revision != "" {
+		if err := validateGitRefArg(opts.Revision); err != nil {
+			return nil, err
+		}
+	}
 	// Build git log command
 	logArgs := e.buildGitLogArgs(opts)
 
@@ -367,9 +377,6 @@ func (e *Extractor) buildGitLogArgs(opts ExtractOptions) []string {
 	if opts.Limit > 0 {
 		args = insertBefore(args, "--", fmt.Sprintf("-n%d", opts.Limit))
 	}
-	if opts.Revision != "" {
-		args = insertBefore(args, "--", opts.Revision)
-	}
 
 	// Optimization: If filtering by BeadID, tell git to only show commits
 	// where this ID (or one of its target aliases) appears in the diff.
@@ -388,6 +395,11 @@ func (e *Extractor) buildGitLogArgs(opts ExtractOptions) []string {
 		regex := fmt.Sprintf(`"id":\s*"(%s)"`, strings.Join(quoted, "|"))
 		args = insertBefore(args, "--", "--extended-regexp")
 		args = insertBefore(args, "--", fmt.Sprintf("-G%s", regex))
+	}
+
+	if opts.Revision != "" {
+		args = insertBefore(args, "--", "--end-of-options")
+		args = insertBefore(args, "--", opts.Revision)
 	}
 
 	// Use primary beads file for follow support (git requires single pathspec with --follow)

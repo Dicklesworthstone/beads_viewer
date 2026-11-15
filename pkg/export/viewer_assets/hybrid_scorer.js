@@ -20,7 +20,8 @@ class HybridScorer {
   score(result) {
     const statusScore = this.normalizeStatus(result.status);
     const priorityScore = this.normalizePriority(result.priority);
-    const impactScore = this.normalizeImpact(result.blockerCount || 0);
+    const downstreamImpact = result.blockerCount ?? result.impact ?? result.blocks_count ?? result.dependent_count ?? 0;
+    const impactScore = this.normalizeImpact(downstreamImpact);
     const recencyScore = this.normalizeRecency(result.updatedAt);
     const pagerank = typeof result.pagerank === 'number' ? result.pagerank : 0.5;
 
@@ -50,19 +51,35 @@ class HybridScorer {
       return [];
     }
     const maxBlocker = results.reduce(
-      (max, r) => Math.max(max, r.blockerCount || 0),
+      (max, r) => Math.max(max, r.blockerCount ?? r.impact ?? r.blocks_count ?? r.dependent_count ?? 0),
       0
     );
     this.maxBlockerCount = maxBlocker;
 
     return results
       .map(r => this.score(r))
-      .sort((a, b) => b.hybrid_score - a.hybrid_score);
+      .sort((a, b) => {
+        const diff = b.hybrid_score - a.hybrid_score;
+        if (diff !== 0) return diff;
+        return String(a.id || '').localeCompare(String(b.id || ''));
+      });
   }
 
   normalizeStatus(status) {
-    const STATUS_WEIGHTS = { open: 1.0, in_progress: 0.8, blocked: 0.5, closed: 0.1 };
-    return STATUS_WEIGHTS[status] ?? 0.5;
+    const normalized = String(status || '').toLowerCase().trim();
+    const STATUS_WEIGHTS = {
+      open: 1.0,
+      in_progress: 0.8,
+      review: 0.8,
+      hooked: 0.8,
+      pinned: 0.7,
+      blocked: 0.5,
+      deferred: 0.2,
+      draft: 0.2,
+      closed: 0.1,
+      tombstone: 0.0,
+    };
+    return STATUS_WEIGHTS[normalized] ?? 0.5;
   }
 
   normalizePriority(priority) {
@@ -79,7 +96,14 @@ class HybridScorer {
 
   normalizeRecency(updatedAt) {
     if (!updatedAt) return 0.5;
-    const daysSince = (Date.now() - new Date(updatedAt).getTime()) / (1000 * 60 * 60 * 24);
+    const ts = new Date(updatedAt).getTime();
+    if (!Number.isFinite(ts)) return 0.5;
+    const viewerNow = typeof window !== 'undefined' ? window.beadsViewer?.getReferenceNowMs?.() : undefined;
+    const winNow = typeof window !== 'undefined' ? window.BV_REFERENCE_NOW_MS : undefined;
+    const refNow = (typeof viewerNow === 'number' && Number.isFinite(viewerNow) && viewerNow > 0)
+      ? viewerNow
+      : (typeof winNow === 'number' && Number.isFinite(winNow) && winNow > 0 ? winNow : Date.now());
+    const daysSince = Math.max(0, (refNow - ts) / (1000 * 60 * 60 * 24));
     return Math.exp(-daysSince / 30);
   }
 }

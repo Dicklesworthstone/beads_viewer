@@ -139,6 +139,7 @@ type CorrelatorOptions struct {
 	Since                  *time.Time        // Only events after this time
 	Until                  *time.Time        // Only events before this time
 	Limit                  int               // Max commits to process (0 = no limit)
+	TargetCommitSHA        string            // Optional single commit SHA to correlate against full .beads event history
 	CausalityBeadID        string            // Capture full committed dependency authority for this target only
 	TargetBeadAliases      []string          // Optional alternate local IDs for BeadID/CausalityBeadID (e.g. both "99" and "api-99" for deleted workspace targets)
 	ExplicitIDAliases      map[string]string // Optional commit-message token -> canonical local BeadID (e.g. "api-1" -> "1", "api-bd-1" -> "bd-1")
@@ -273,6 +274,17 @@ func (c *Correlator) extractHistoryArtifactWithWalk(opts CorrelatorOptions) (*hi
 }
 
 func (c *Correlator) extractHistoryArtifactWithWalkForBeads(beads []BeadInfo, opts CorrelatorOptions) (*historyArtifact, []walkedCommit, error) {
+	if opts.Revision != "" {
+		if err := validateGitRefArg(opts.Revision); err != nil {
+			return nil, nil, err
+		}
+	}
+	targetSHA := strings.ToLower(strings.TrimSpace(opts.TargetCommitSHA))
+	if targetSHA != "" {
+		if err := validateGitRefArg(targetSHA); err != nil {
+			return nil, nil, err
+		}
+	}
 	extractOpts := ExtractOptions{
 		Revision:      opts.Revision,
 		Since:         opts.Since,
@@ -280,6 +292,11 @@ func (c *Correlator) extractHistoryArtifactWithWalkForBeads(beads []BeadInfo, op
 		Limit:         opts.Limit,
 		BeadID:        opts.BeadID,
 		BeadIDAliases: opts.TargetBeadAliases,
+	}
+	if targetSHA != "" {
+		// Keep full surrounding .beads lifecycle transitions (EventClaimed..EventClosed)
+		// intact while gating the target commit itself against Since/Until below.
+		extractOpts.Since = nil
 	}
 	art := &historyArtifact{FormatVersion: historyArtifactFormatVersion}
 	if opts.CausalityBeadID != "" {
@@ -297,7 +314,23 @@ func (c *Correlator) extractHistoryArtifactWithWalkForBeads(beads []BeadInfo, op
 	if err != nil {
 		return nil, nil, fmt.Errorf("extracting events: %w", err)
 	}
-	commits, err := c.coCommitter.ExtractAllCoCommits(events)
+	coCommitEvents := events
+	if targetSHA != "" {
+		coCommitEvents = make([]BeadEvent, 0, 4)
+		for _, ev := range events {
+			if !strings.EqualFold(ev.CommitSHA, targetSHA) {
+				continue
+			}
+			if opts.Since != nil && ev.Timestamp.Before(*opts.Since) {
+				continue
+			}
+			if opts.Until != nil && ev.Timestamp.After(*opts.Until) {
+				continue
+			}
+			coCommitEvents = append(coCommitEvents, ev)
+		}
+	}
+	commits, err := c.coCommitter.ExtractAllCoCommits(coCommitEvents)
 	if err != nil {
 		return nil, nil, fmt.Errorf("extracting co-commits: %w", err)
 	}
@@ -313,7 +346,25 @@ func (c *Correlator) extractHistoryArtifactWithWalkForBeads(beads []BeadInfo, op
 	if err := c.checkCtx(); err != nil {
 		return nil, nil, err
 	}
-	walk, err := walkCommits(c.ctx, c.repoPath, extractOpts)
+	var walk []walkedCommit
+	if targetSHA != "" {
+		walk, err = walkCommitsBySHAs(c.ctx, c.repoPath, []string{targetSHA})
+		if err == nil && (opts.Since != nil || opts.Until != nil) {
+			filteredWalk := walk[:0]
+			for _, wc := range walk {
+				if opts.Since != nil && wc.Timestamp.Before(*opts.Since) {
+					continue
+				}
+				if opts.Until != nil && wc.Timestamp.After(*opts.Until) {
+					continue
+				}
+				filteredWalk = append(filteredWalk, wc)
+			}
+			walk = filteredWalk
+		}
+	} else {
+		walk, err = walkCommits(c.ctx, c.repoPath, extractOpts)
+	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("walking commits: %w", err)
 	}

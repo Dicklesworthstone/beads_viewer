@@ -773,3 +773,132 @@ func TestEmbedAssetsWithSubtitle(t *testing.T) {
 		t.Fatalf("ReplaceSubtitle with whitespace modified content: %q", got)
 	}
 }
+
+func TestCopyEmbeddedAssets_IncludesWasmInOfflineAssets(t *testing.T) {
+	dir := t.TempDir()
+	wasmDir := filepath.Join(dir, "wasm")
+	dataDir := filepath.Join(dir, "data")
+	if err := os.MkdirAll(wasmDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll wasm: %v", err)
+	}
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll data: %v", err)
+	}
+
+	jsBytes := []byte("// mock bv_graph.js glue\nexport default function init() {}\n")
+	wasmBytes := []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
+	metaBytes := []byte(`{"issue_count":1}`)
+
+	if err := os.WriteFile(filepath.Join(wasmDir, "bv_graph.js"), jsBytes, 0o644); err != nil {
+		t.Fatalf("WriteFile bv_graph.js: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wasmDir, "bv_graph_bg.wasm"), wasmBytes, 0o644); err != nil {
+		t.Fatalf("WriteFile bv_graph_bg.wasm: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "meta.json"), metaBytes, 0o644); err != nil {
+		t.Fatalf("WriteFile meta.json: %v", err)
+	}
+
+	if err := CopyEmbeddedAssets(dir, "Offline WASM Test"); err != nil {
+		t.Fatalf("CopyEmbeddedAssets: %v", err)
+	}
+
+	swRaw, err := os.ReadFile(filepath.Join(dir, "coi-serviceworker.js"))
+	if err != nil {
+		t.Fatalf("ReadFile coi-serviceworker.js: %v", err)
+	}
+	re := regexp.MustCompile(`const OFFLINE_ASSETS = (\[[^\n;]+\]);`)
+	m := re.FindSubmatch(swRaw)
+	if len(m) != 2 {
+		t.Fatalf("coi-serviceworker.js missing bound OFFLINE_ASSETS array")
+	}
+
+	var assets []struct {
+		Path   string `json:"path"`
+		SHA256 string `json:"sha256"`
+	}
+	if err := json.Unmarshal(m[1], &assets); err != nil {
+		t.Fatalf("Unmarshal OFFLINE_ASSETS: %v", err)
+	}
+	byPath := make(map[string]string, len(assets))
+	for _, a := range assets {
+		byPath[a.Path] = a.SHA256
+	}
+
+	wantJS := fmt.Sprintf("%x", sha256.Sum256(jsBytes))
+	wantWasm := fmt.Sprintf("%x", sha256.Sum256(wasmBytes))
+	if got := byPath["wasm/bv_graph.js"]; got != wantJS {
+		t.Fatalf("OFFLINE_ASSETS[wasm/bv_graph.js] = %q, want %q", got, wantJS)
+	}
+	if got := byPath["wasm/bv_graph_bg.wasm"]; got != wantWasm {
+		t.Fatalf("OFFLINE_ASSETS[wasm/bv_graph_bg.wasm] = %q, want %q", got, wantWasm)
+	}
+}
+
+func TestAddScriptCacheBusting_HonorsSourceDateEpoch(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "1700000000")
+	htmlIn := `<script src="viewer.js"></script><script src='wasm_loader.js'></script><script src="vendor/alpine.min.js"></script>`
+
+	first := AddScriptCacheBusting(htmlIn)
+	second := AddScriptCacheBusting(htmlIn)
+	if first != second {
+		t.Fatalf("AddScriptCacheBusting with SOURCE_DATE_EPOCH not deterministic:\nfirst:  %s\nsecond: %s", first, second)
+	}
+	if !strings.Contains(first, "-1700000000\"") && !strings.Contains(first, "?v=1700000000\"") {
+		t.Fatalf("expected SOURCE_DATE_EPOCH 1700000000 in viewer.js cache buster, got: %s", first)
+	}
+	if !strings.Contains(first, "-1700000000'") && !strings.Contains(first, "?v=1700000000'") {
+		t.Fatalf("expected SOURCE_DATE_EPOCH 1700000000 in single-quoted wasm_loader.js cache buster, got: %s", first)
+	}
+	if !strings.Contains(first, `src="vendor/alpine.min.js"`) {
+		t.Fatalf("vendor scripts must remain untouched, got: %s", first)
+	}
+}
+
+func TestBundle_HybridWasmPreparedAndSkipsDotfilesInOfflineAssets(t *testing.T) {
+	var nilBundle *Bundle
+	if nilBundle.HybridWasmPrepared() {
+		t.Fatal("nil Bundle must report HybridWasmPrepared() == false")
+	}
+	nilBundle.MarkHybridWasmPrepared() // no-op, must not panic
+
+	tmpDir := t.TempDir()
+	bundle, err := OpenBundle(tmpDir)
+	if err != nil {
+		t.Fatalf("OpenBundle: %v", err)
+	}
+	defer bundle.Close()
+
+	if bundle.HybridWasmPrepared() {
+		t.Fatal("fresh Bundle must default to HybridWasmPrepared() == false")
+	}
+	bundle.MarkHybridWasmPrepared()
+	if !bundle.HybridWasmPrepared() {
+		t.Fatal("Bundle must report HybridWasmPrepared() == true after MarkHybridWasmPrepared()")
+	}
+
+	if err := bundle.WriteFile("data/meta.json", []byte(`{"issue_count":1}`), 0o644); err != nil {
+		t.Fatalf("write data/meta.json: %v", err)
+	}
+	if err := bundle.WriteFile("data/.gitignore", []byte("*\n"), 0o644); err != nil {
+		t.Fatalf("write data/.gitignore: %v", err)
+	}
+	if err := bundle.WriteFile("wasm/.hidden/secret.txt", []byte("skip"), 0o644); err != nil {
+		t.Fatalf("write wasm/.hidden/secret.txt: %v", err)
+	}
+	if err := bundle.CopyEmbeddedAssets("Dotfile Test"); err != nil {
+		t.Fatalf("CopyEmbeddedAssets: %v", err)
+	}
+
+	swRaw, err := os.ReadFile(filepath.Join(tmpDir, "coi-serviceworker.js"))
+	if err != nil {
+		t.Fatalf("read coi-serviceworker.js: %v", err)
+	}
+	swStr := string(swRaw)
+	if !strings.Contains(swStr, `"data/meta.json"`) {
+		t.Fatalf("expected data/meta.json in OFFLINE_ASSETS, got:\n%s", swStr)
+	}
+	if strings.Contains(swStr, ".gitignore") || strings.Contains(swStr, ".hidden") {
+		t.Fatalf("dotfiles/dotdirs must be excluded from OFFLINE_ASSETS, got:\n%s", swStr)
+	}
+}

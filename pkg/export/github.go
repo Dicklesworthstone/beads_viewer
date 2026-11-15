@@ -697,32 +697,78 @@ func browserOpenCommandForGOOS(goos, url string) (string, []string, error) {
 
 // SuggestRepoName generates a suggested repository name from the bundle path.
 func SuggestRepoName(bundlePath string) string {
-	// Use the directory name
-	name := filepath.Base(bundlePath)
-	if isEmptyPathBase(name) {
-		// Get parent dir name
-		abs, err := filepath.Abs(bundlePath)
-		if err == nil {
-			name = filepath.Base(filepath.Dir(abs))
+	trimmed := strings.TrimSpace(bundlePath)
+	var base string
+	appendPages := false
+	switch {
+	case trimmed == "":
+		if cwd, err := os.Getwd(); err == nil {
+			base = filepath.Base(cwd)
+			appendPages = true
 		}
-	}
-
-	// If it's bv-pages or similar, use parent project name
-	if isGenericPagesDir(name) {
-		abs, err := filepath.Abs(bundlePath)
-		if err == nil {
-			parent := filepath.Base(filepath.Dir(abs))
-			if !isEmptyPathBase(parent) {
-				name = parent + "-pages"
+	case trimmed == ".":
+		if cwd, err := os.Getwd(); err == nil {
+			base = filepath.Base(cwd)
+		}
+	case isBeadsSourcePath(trimmed):
+		if root := projectRootFromBeadsPath(trimmed); root != "" {
+			base = filepath.Base(root)
+			appendPages = true
+		}
+	default:
+		candidate := filepath.Base(trimmed)
+		if !isEmptyPathBase(candidate) {
+			if isGenericPagesDir(candidate) {
+				if abs, err := filepath.Abs(trimmed); err == nil {
+					parent := filepath.Base(filepath.Dir(abs))
+					if !isEmptyPathBase(parent) {
+						base = parent
+						appendPages = true
+					}
+				}
+			} else {
+				base = candidate
 			}
 		}
 	}
 
-	// Sanitize for GitHub repo name
-	name = strings.ReplaceAll(name, " ", "-")
-	name = strings.ToLower(name)
-
+	name := sanitizeGitHubRepoSegment(stripDotGitSuffix(base))
+	if name == "" {
+		return "beads-viewer-pages"
+	}
+	if appendPages && !strings.HasSuffix(name, "-pages") {
+		name = strings.Trim(name, ".-_") + "-pages"
+	}
 	return name
+}
+
+func stripDotGitSuffix(name string) string {
+	if len(name) >= 4 && strings.EqualFold(name[len(name)-4:], ".git") {
+		return name[:len(name)-4]
+	}
+	return name
+}
+
+func sanitizeGitHubRepoSegment(raw string) string {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	if isEmptyPathBase(lower) {
+		return ""
+	}
+	var sb strings.Builder
+	lastHyphen := false
+	for _, r := range lower {
+		isAllowed := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_'
+		if isAllowed {
+			sb.WriteRune(r)
+			lastHyphen = false
+			continue
+		}
+		if !lastHyphen {
+			sb.WriteByte('-')
+			lastHyphen = true
+		}
+	}
+	return strings.Trim(sb.String(), ".-_")
 }
 
 func isEmptyPathBase(name string) bool {
@@ -736,7 +782,7 @@ func isEmptyPathBase(name string) bool {
 
 func isGenericPagesDir(name string) bool {
 	switch name {
-	case "bv-pages", "pages", "docs":
+	case "bv-pages", "pages", "docs", "dist":
 		return true
 	default:
 		return false

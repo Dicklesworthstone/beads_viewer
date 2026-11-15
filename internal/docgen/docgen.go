@@ -281,6 +281,12 @@ func RenderAlertsTables(cfg *drift.Config) string {
 			severity: "Warning",
 			keys:     fmt.Sprintf("`velocity_drop_pct` (%g), `velocity_window_days` (%d), `velocity_min_baseline` (%d)", cfg.VelocityDropPct, cfg.VelocityWindowDays, cfg.VelocityMinBaseline),
 		},
+		{
+			typ:      drift.AlertSourceInconsistency,
+			trigger:  "Live SQLite (`beads.db`) and local JSONL (`issues.jsonl`) tracker sources disagree on issue presence, status, priority, or title",
+			severity: "Warning",
+			keys:     fmt.Sprintf("`source_drift_alert` (%t), `source_drift_max_alerts` (%d)", cfg.SourceDriftAlert == nil || *cfg.SourceDriftAlert, cfg.SourceDriftMaxAlerts),
+		},
 	}
 
 	for _, p := range proactive {

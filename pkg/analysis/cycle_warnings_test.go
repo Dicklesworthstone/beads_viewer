@@ -511,3 +511,64 @@ func BenchmarkCheckDependencyAddition(b *testing.B) {
 		CheckDependencyAddition(issues, "n1", "n2")
 	}
 }
+
+func TestWouldCreateCycle_ParentChildNonBlocking(t *testing.T) {
+	issues := []model.Issue{
+		{
+			ID:     "EPIC-1",
+			Title:  "Parent epic",
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "EPIC-1", DependsOnID: "TASK-1", Type: model.DepParentChild},
+			},
+		},
+		{
+			ID:     "TASK-1",
+			Title:  "Child task",
+			Status: model.StatusOpen,
+		},
+	}
+
+	if wouldCycle, path := WouldCreateCycle(issues, "TASK-1", "EPIC-1"); wouldCycle {
+		t.Fatalf("non-blocking DepParentChild must not trigger cycle detection, got path %v", path)
+	}
+}
+
+func TestGetCycleFreeSuggestions_FiltersDirectTransitiveAndMutualCycles(t *testing.T) {
+	issues := []model.Issue{
+		{
+			ID:     "A",
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "A", DependsOnID: "B", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:     "B",
+			Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "B", DependsOnID: "C", Type: model.DepBlocks},
+			},
+		},
+		{ID: "C", Status: model.StatusOpen},
+		{ID: "X", Status: model.StatusOpen},
+		{ID: "Y", Status: model.StatusOpen},
+	}
+
+	suggestions := []Suggestion{
+		{Type: SuggestionLabelSuggestion, TargetBead: "C", Confidence: 0.99},
+		{Type: SuggestionMissingDependency, TargetBead: "B", RelatedBead: "A", Confidence: 0.95}, // Direct cycle with A->B
+		{Type: SuggestionMissingDependency, TargetBead: "C", RelatedBead: "A", Confidence: 0.92}, // Transitive cycle with A->B->C
+		{Type: SuggestionMissingDependency, TargetBead: "X", RelatedBead: "X", Confidence: 0.91}, // Self-loop
+		{Type: SuggestionMissingDependency, TargetBead: "X", RelatedBead: "Y", Confidence: 0.90}, // Valid
+		{Type: SuggestionMissingDependency, TargetBead: "Y", RelatedBead: "X", Confidence: 0.85}, // Mutual cycle with X->Y
+	}
+
+	got := GetCycleFreeSuggestions(issues, suggestions)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 cycle-free suggestions (label + X->Y), got %+v", got)
+	}
+	if got[0].Type != SuggestionLabelSuggestion || got[1].TargetBead != "X" || got[1].RelatedBead != "Y" {
+		t.Fatalf("unexpected filtered suggestions: %+v", got)
+	}
+}

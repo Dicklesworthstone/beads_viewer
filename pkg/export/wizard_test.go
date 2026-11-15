@@ -396,8 +396,26 @@ func TestWizard_CollectGitHubConfig_UsesSuggestRepoName(t *testing.T) {
 	if err := wizardDefault.collectGitHubConfig(); err != nil {
 		t.Fatalf("collectGitHubConfig (empty bundlePath): %v", err)
 	}
-	if !strings.HasSuffix(wizardDefault.config.RepoName, "-pages") {
-		t.Fatalf("RepoName with empty bundlePath = %q, want -pages suffix", wizardDefault.config.RepoName)
+	if wizardDefault.config.RepoName != "acme-tracker-pages" {
+		t.Fatalf("RepoName with empty bundlePath (.beads) = %q, want %q", wizardDefault.config.RepoName, "acme-tracker-pages")
+	}
+
+	wizardJSONL := NewWizard(filepath.Join(tmpDir, "acme-tracker", ".beads", "issues.jsonl"))
+	wizardJSONL.input = &wizardInputReader{data: []byte("\nn\n\n")}
+	if err := wizardJSONL.collectGitHubConfig(); err != nil {
+		t.Fatalf("collectGitHubConfig (issues.jsonl): %v", err)
+	}
+	if wizardJSONL.config.RepoName != "acme-tracker-pages" {
+		t.Fatalf("RepoName with empty bundlePath (issues.jsonl) = %q, want %q", wizardJSONL.config.RepoName, "acme-tracker-pages")
+	}
+
+	cfWizard := NewWizard(filepath.Join(tmpDir, "acme-tracker", ".beads", "issues.jsonl"))
+	cfWizard.input = &wizardInputReader{data: []byte("\n\n")}
+	if err := cfWizard.collectCloudflareConfig(); err != nil {
+		t.Fatalf("collectCloudflareConfig (issues.jsonl): %v", err)
+	}
+	if cfWizard.config.CloudflareProject != "acme-tracker-pages" {
+		t.Fatalf("CloudflareProject with empty bundlePath (issues.jsonl) = %q, want %q", cfWizard.config.CloudflareProject, "acme-tracker-pages")
 	}
 }
 
@@ -420,5 +438,32 @@ func TestWizard_CheckPrerequisites_GHMissing(t *testing.T) {
 	err = declined.checkPrerequisites()
 	if err == nil || !strings.Contains(err.Error(), "gh CLI is required") {
 		t.Fatalf("declined checkPrerequisites error = %v, want 'gh CLI is required'", err)
+	}
+}
+
+func TestWizard_CollectCloudflareConfig_ValidatesProjectName(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, "acme-repo.git", ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Default suggestion strips .git and validates cleanly
+	validWizard := NewWizard(beadsDir)
+	validWizard.input = &wizardInputReader{data: []byte("\n\n")}
+	if err := validWizard.collectCloudflareConfig(); err != nil {
+		t.Fatalf("collectCloudflareConfig valid default failed: %v", err)
+	}
+	if validWizard.config.CloudflareProject != "acme-repo-pages" {
+		t.Fatalf("CloudflareProject = %q, want %q", validWizard.config.CloudflareProject, "acme-repo-pages")
+	}
+
+	// Invalid project name in accessible/dumb mode fails form validation instead of silently accepting invalid name
+	invalidWizard := NewWizard(beadsDir)
+	invalidWizard.input = &wizardInputReader{data: []byte("INVALID_PROJECT_NAME!\nmain\n")}
+	err := invalidWizard.collectCloudflareConfig()
+	if err == nil && invalidWizard.config.CloudflareProject == "INVALID_PROJECT_NAME!" {
+		t.Fatal("expected collectCloudflareConfig to reject invalid Cloudflare project name 'INVALID_PROJECT_NAME!'")
 	}
 }

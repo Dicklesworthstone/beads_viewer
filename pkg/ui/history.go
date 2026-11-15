@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // historyFocus tracks which pane has focus in the history view
@@ -896,14 +897,7 @@ func (h *HistoryModel) MoveDown() {
 			beadID := h.beadIDs[h.selectedBead]
 			if hist, ok := h.report.Histories[beadID]; ok {
 				entries := h.buildTimeline(hist)
-				maxVisible := h.height - 8
-				if maxVisible < 3 {
-					maxVisible = 3
-				}
-				maxScroll := len(entries) - maxVisible
-				if maxScroll < 0 {
-					maxScroll = 0
-				}
+				_, _, maxScroll := timelineWindow(entries, hist.CycleTime != nil, h.currentTimelineWidth(), h.currentPanelHeight(), h.timelineScrollOffset)
 				if h.timelineScrollOffset < maxScroll {
 					h.timelineScrollOffset++
 				}
@@ -988,6 +982,7 @@ func (h *HistoryModel) NextCommit() {
 	commits := h.histories[h.selectedBead].Commits
 	if h.selectedCommit < len(commits)-1 {
 		h.selectedCommit++
+		h.ensureMiddleScrollVisible(h.selectedCommit, len(commits))
 	}
 }
 
@@ -995,6 +990,11 @@ func (h *HistoryModel) NextCommit() {
 func (h *HistoryModel) PrevCommit() {
 	if h.selectedCommit > 0 {
 		h.selectedCommit--
+		commitCount := 0
+		if h.selectedBead < len(h.histories) {
+			commitCount = len(h.histories[h.selectedBead].Commits)
+		}
+		h.ensureMiddleScrollVisible(h.selectedCommit, commitCount)
 	}
 }
 
@@ -1505,6 +1505,7 @@ func (h *HistoryModel) NextRelatedBead() {
 	beadCount := len(commits[h.selectedGitCommit].BeadIDs)
 	if h.selectedRelatedBead < beadCount-1 {
 		h.selectedRelatedBead++
+		h.ensureMiddleScrollVisible(h.selectedRelatedBead, beadCount)
 	}
 }
 
@@ -1512,6 +1513,12 @@ func (h *HistoryModel) NextRelatedBead() {
 func (h *HistoryModel) PrevRelatedBead() {
 	if h.selectedRelatedBead > 0 {
 		h.selectedRelatedBead--
+		commits := h.GetFilteredCommitList()
+		beadCount := 0
+		if h.selectedGitCommit < len(commits) {
+			beadCount = len(commits[h.selectedGitCommit].BeadIDs)
+		}
+		h.ensureMiddleScrollVisible(h.selectedRelatedBead, beadCount)
 	}
 }
 
@@ -1561,10 +1568,28 @@ func (h *HistoryModel) ensureBeadVisible() {
 	}
 }
 
+// panelHeightForHeader computes the panel height below a rendered header so the
+// combined header + bordered panels never exceed h.height.
+func (h *HistoryModel) panelHeightForHeader(header string) int {
+	headerLines := lipgloss.Height(header)
+	if headerLines < 1 {
+		headerLines = 1
+	}
+	panelHeight := h.height - headerLines
+	if panelHeight < 5 {
+		panelHeight = 5
+	}
+	return panelHeight
+}
+
+func (h *HistoryModel) currentPanelHeight() int {
+	return h.panelHeightForHeader(h.renderHeader())
+}
+
 // ensureMiddleScrollVisible adjusts middle pane scroll offset (bv-xrfh)
 func (h *HistoryModel) ensureMiddleScrollVisible(selectedIdx, itemCount int) {
-	// Use similar height calculation as middle pane (accounting for header/border)
-	visibleItems := h.height - 7 // Header, separator, border padding
+	// Match middle pane's actual rendered item rows (panelHeight - 5)
+	visibleItems := h.currentPanelHeight() - 5
 	if visibleItems < 1 {
 		visibleItems = 1
 	}
@@ -1585,10 +1610,13 @@ func (h *HistoryModel) ensureMiddleScrollVisible(selectedIdx, itemCount int) {
 	}
 }
 
-// listHeight returns the number of visible items in the list
+// listHeight returns the number of visible items in the bordered list panel.
 func (h *HistoryModel) listHeight() int {
-	// Reserve 3 lines for header/filter bar
-	return h.height - 3
+	visibleItems := h.currentPanelHeight() - 5
+	if visibleItems < 1 {
+		visibleItems = 1
+	}
+	return visibleItems
 }
 
 // SelectedBeadID returns the currently selected bead ID
@@ -1739,12 +1767,8 @@ func (h *HistoryModel) renderWithFileTree() string {
 	if totalW <= 0 {
 		totalW = 120
 	}
-	panelHeight := h.height - 2
-	if panelHeight < 5 {
-		panelHeight = 5
-	}
-
 	header := h.renderHeader()
+	panelHeight := h.panelHeightForHeader(header)
 
 	// Compact 2-pane layout (file tree + focused main pane) for 60..89 cols
 	if totalW < fileTreeFullLayoutMinWidth {
@@ -1844,15 +1868,16 @@ func (h *HistoryModel) renderTwoPaneView() string {
 
 	// Render header
 	header := h.renderHeader()
+	panelHeight := h.panelHeightForHeader(header)
 
 	// Render panels based on view mode (bv-tl3n)
 	var listPanel, detailPanel string
 	if h.viewMode == historyModeGit {
-		listPanel = h.renderGitCommitListPanel(listWidth, h.height-2)
-		detailPanel = h.renderGitDetailPanel(detailWidth, h.height-2)
+		listPanel = h.renderGitCommitListPanel(listWidth, panelHeight)
+		detailPanel = h.renderGitDetailPanel(detailWidth, panelHeight)
 	} else {
-		listPanel = h.renderListPanel(listWidth, h.height-2)
-		detailPanel = h.renderDetailPanel(detailWidth, h.height-2)
+		listPanel = h.renderListPanel(listWidth, panelHeight)
+		detailPanel = h.renderDetailPanel(detailWidth, panelHeight)
 	}
 
 	// Combine panels
@@ -1868,7 +1893,7 @@ func (h *HistoryModel) renderThreePaneView() string {
 
 	// Render header
 	header := h.renderHeader()
-	panelHeight := h.height - 2
+	panelHeight := h.panelHeightForHeader(header)
 
 	// Four panes with the timeline (bv-1x6o): default in wide layout, or
 	// pinned on with t in the standard layout.
@@ -2080,24 +2105,8 @@ func (h *HistoryModel) renderTimelinePanel(width, height int) string {
 		b.WriteString("\n")
 		b.WriteString(r.NewStyle().Foreground(t.Secondary).Render("No events recorded"))
 	} else {
-		// Render timeline entries
-		maxVisible := height - 6 // Account for title, borders, summary
-		if maxVisible < 3 {
-			maxVisible = 3
-		}
-
-		// Apply scroll offset
-		startIdx := h.timelineScrollOffset
-		if startIdx > len(entries)-maxVisible {
-			startIdx = len(entries) - maxVisible
-		}
-		if startIdx < 0 {
-			startIdx = 0
-		}
-		endIdx := startIdx + maxVisible
-		if endIdx > len(entries) {
-			endIdx = len(entries)
-		}
+		startIdx, endIdx, maxScroll := timelineWindow(entries, hist.CycleTime != nil, width, height, h.timelineScrollOffset)
+		needsScrollIndicator := maxScroll > 0 || startIdx > 0 || endIdx < len(entries)
 
 		// Timeline line style
 		lineColor := t.Border
@@ -2205,7 +2214,7 @@ func (h *HistoryModel) renderTimelinePanel(width, height int) string {
 		}
 
 		// Scroll indicator if needed
-		if len(entries) > maxVisible {
+		if needsScrollIndicator {
 			b.WriteString("\n")
 			scrollInfo := fmt.Sprintf("↕ %d-%d of %d", startIdx+1, endIdx, len(entries))
 			scrollStyle := r.NewStyle().Foreground(t.Subtext).Italic(true)
@@ -2236,7 +2245,91 @@ func (h *HistoryModel) renderTimelinePanel(width, height int) string {
 		}
 	}
 
-	return panelStyle.Render(b.String())
+	return panelStyle.Render(clampHistoryPanelContent(strings.Split(b.String(), "\n"), width-2, height-2))
+}
+
+func (h *HistoryModel) currentTimelineWidth() int {
+	availWidth := h.width
+	if h.showFileTree && availWidth >= 90 {
+		availWidth -= max(24, int(float64(availWidth)*0.22))
+	}
+	return int(float64(availWidth) * 0.22)
+}
+
+func timelineEntryHeight(entry TimelineEntry, panelWidth int) int {
+	switch entry.EntryType {
+	case timelineEntryCommit:
+		if panelWidth > 28 && strings.TrimSpace(strings.Split(entry.Detail, "\n")[0]) != "" {
+			return 2
+		}
+		return 1
+	case timelineEntrySession:
+		if panelWidth > 16 && entry.Detail != "" {
+			return 2
+		}
+		return 1
+	default:
+		return 1
+	}
+}
+
+func timelineWindow(entries []TimelineEntry, hasCycleSummary bool, panelWidth, panelHeight, scrollOffset int) (startIdx, endIdx, maxScroll int) {
+	if len(entries) == 0 {
+		return 0, 0, 0
+	}
+	innerHeight := panelHeight - 2
+	fixedLines := 2 // title + blank line
+	if hasCycleSummary {
+		fixedLines += 2 // separator + summary line
+	}
+	availLines := innerHeight - fixedLines
+	if availLines < 2 {
+		availLines = 2
+	}
+
+	totalLines := 0
+	for _, entry := range entries {
+		totalLines += timelineEntryHeight(entry, panelWidth)
+	}
+	if totalLines <= availLines {
+		return 0, len(entries), 0
+	}
+
+	budget := availLines - 1 // reserve 1 line for ↕ scroll indicator
+	if budget < 2 {
+		budget = 2
+	}
+
+	tailLines := 0
+	maxScroll = len(entries) - 1
+	for i := len(entries) - 1; i >= 0; i-- {
+		h := timelineEntryHeight(entries[i], panelWidth)
+		if tailLines+h > budget && tailLines > 0 {
+			break
+		}
+		tailLines += h
+		maxScroll = i
+	}
+
+	startIdx = scrollOffset
+	if startIdx > maxScroll {
+		startIdx = maxScroll
+	}
+	if startIdx < 0 {
+		startIdx = 0
+	}
+
+	used := 0
+	endIdx = startIdx
+	for endIdx < len(entries) {
+		h := timelineEntryHeight(entries[endIdx], panelWidth)
+		if used+h > budget && endIdx > startIdx {
+			break
+		}
+		used += h
+		endIdx++
+	}
+	return startIdx, endIdx, maxScroll
 }
 
 // formatDuration formats a duration in a human-readable way (bv-1x6o)
@@ -2583,6 +2676,34 @@ func formatCycleTime(days float64) string {
 	return fmt.Sprintf("%.1fw", weeks)
 }
 
+func clampHistoryPanelContent(lines []string, innerWidth, innerHeight int) string {
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+	if innerHeight < 1 {
+		innerHeight = 1
+	}
+	clamped := make([]string, 0, innerHeight)
+	for _, line := range lines {
+		for _, sub := range strings.Split(line, "\n") {
+			if lipgloss.Width(sub) > innerWidth {
+				sub = ansi.Truncate(sub, innerWidth, "…")
+			}
+			clamped = append(clamped, sub)
+			if len(clamped) >= innerHeight {
+				break
+			}
+		}
+		if len(clamped) >= innerHeight {
+			break
+		}
+	}
+	for len(clamped) < innerHeight {
+		clamped = append(clamped, "")
+	}
+	return strings.Join(clamped, "\n")
+}
+
 // renderListPanel renders the left panel with bead list
 func (h *HistoryModel) renderListPanel(width, height int) string {
 	t := h.theme
@@ -2631,7 +2752,7 @@ func (h *HistoryModel) renderListPanel(width, height int) string {
 		lines = append(lines, "")
 	}
 
-	content := strings.Join(lines, "\n")
+	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)
 }
 
@@ -2680,10 +2801,10 @@ func (h *HistoryModel) renderBeadLine(idx int, hist correlation.BeadHistory, wid
 		badgeWidth += lipgloss.Width(sessionBadge) + 1
 	}
 
-	// Truncate title
-	maxTitleLen := width - len(indicator) - len(statusIcon) - len(commitCount) - badgeWidth - 6
-	if maxTitleLen < 10 {
-		maxTitleLen = 10
+	// Truncate title (accounting for idStyle Width(12))
+	maxTitleLen := width - 12 - lipgloss.Width(indicator) - lipgloss.Width(statusIcon) - lipgloss.Width(commitCount) - badgeWidth - 3
+	if maxTitleLen < 4 {
+		maxTitleLen = 4
 	}
 	title := truncateRunesHelper(hist.Title, maxTitleLen, "…")
 
@@ -2777,11 +2898,7 @@ func (h *HistoryModel) renderFileTreePanel(width, height int) string {
 	}
 
 	// Pad with empty lines
-	for len(lines) < height-2 {
-		lines = append(lines, "")
-	}
-
-	content := strings.Join(lines, "\n")
+	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)
 }
 
@@ -2941,26 +3058,96 @@ func (h *HistoryModel) renderDetailPanel(width, height int) string {
 
 	// Reserve space for footer (3 lines: separator + stats + hint)
 	footerHeight := 3
-	contentHeight := height - 2 - footerHeight - 3 // -3 for header lines
+	maxBodyLines := height - 2 - footerHeight
+	if maxBodyLines < 1 {
+		maxBodyLines = 1
+	}
+	availCommitLines := maxBodyLines - len(lines)
+	if availCommitLines < 4 {
+		availCommitLines = 4
+	}
 
-	// Render commits
-	for i, commit := range hist.Commits {
-		isSelected := i == h.selectedCommit && h.mainPaneFocused(historyFocusDetail)
-		commitLines := h.renderCommitDetail(commit, width-4, isSelected)
-		lines = append(lines, commitLines...)
-		if i < len(hist.Commits)-1 {
-			lines = append(lines, "") // Spacer between commits
+	// Render commits windowed around h.selectedCommit so J/K scrolling reveals later commits
+	if len(hist.Commits) > 0 {
+		selIdx := h.selectedCommit
+		if selIdx < 0 {
+			selIdx = 0
+		} else if selIdx >= len(hist.Commits) {
+			selIdx = len(hist.Commits) - 1
+		}
+
+		renderedCommits := make([][]string, len(hist.Commits))
+		for i, commit := range hist.Commits {
+			isSelected := i == selIdx && h.mainPaneFocused(historyFocusDetail)
+			renderedCommits[i] = h.renderCommitDetail(commit, width-4, isSelected)
+		}
+
+		startIdx := 0
+		for startIdx < selIdx {
+			used := 0
+			if startIdx > 0 {
+				used++
+			}
+			if selIdx < len(hist.Commits)-1 {
+				used++
+			}
+			for i := startIdx; i <= selIdx; i++ {
+				if i > startIdx {
+					used++
+				}
+				used += len(renderedCommits[i])
+			}
+			if used <= availCommitLines {
+				break
+			}
+			startIdx++
+		}
+
+		endIdx := selIdx
+		for endIdx+1 < len(hist.Commits) {
+			candEnd := endIdx + 1
+			used := 0
+			if startIdx > 0 {
+				used++
+			}
+			if candEnd < len(hist.Commits)-1 {
+				used++
+			}
+			for i := startIdx; i <= candEnd; i++ {
+				if i > startIdx {
+					used++
+				}
+				used += len(renderedCommits[i])
+			}
+			if used > availCommitLines {
+				break
+			}
+			endIdx = candEnd
+		}
+
+		scrollIndicatorStyle := t.Renderer.NewStyle().Foreground(t.Muted).Italic(true)
+		if startIdx > 0 {
+			lines = append(lines, scrollIndicatorStyle.Render(fmt.Sprintf("↑ %d earlier commit(s)", startIdx)))
+		}
+		for i := startIdx; i <= endIdx; i++ {
+			lines = append(lines, renderedCommits[i]...)
+			if i < endIdx {
+				lines = append(lines, "") // Spacer between commits
+			}
+		}
+		if rem := len(hist.Commits) - 1 - endIdx; rem > 0 {
+			lines = append(lines, scrollIndicatorStyle.Render(fmt.Sprintf("↓ %d more commit(s)", rem)))
 		}
 	}
 
 	// Pad content to push footer to bottom
-	for len(lines) < contentHeight+3 { // +3 for header lines
+	for len(lines) < maxBodyLines {
 		lines = append(lines, "")
 	}
 
 	// Truncate content if too long (before adding footer)
-	if len(lines) > contentHeight+3 {
-		lines = lines[:contentHeight+3]
+	if len(lines) > maxBodyLines {
+		lines = lines[:maxBodyLines]
 	}
 
 	// === STATS FOOTER (bv-9fk1) ===
@@ -2995,7 +3182,7 @@ func (h *HistoryModel) renderDetailPanel(width, height int) string {
 	hintStyle := t.Renderer.NewStyle().Foreground(ColorFooterHint).Italic(true)
 	lines = append(lines, hintStyle.Render("J/K:nav  y:copy  o:open  g:graph"))
 
-	content := strings.Join(lines, "\n")
+	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)
 }
 
@@ -3639,7 +3826,7 @@ func (h *HistoryModel) renderGitCommitListPanel(width, height int) string {
 		lines = append(lines, "")
 	}
 
-	content := strings.Join(lines, "\n")
+	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)
 }
 
@@ -3729,8 +3916,56 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 	}
 	lines = append(lines, strings.Repeat("─", detailSepWidth))
 
-	// List related beads
-	for i, beadID := range commit.BeadIDs {
+	// Reserve space for footer hint (bv-xf4p)
+	footerHeight := 2
+	contentHeight := height - 2 - footerHeight
+	if contentHeight < 1 {
+		contentHeight = 1 // Minimum content height to avoid negative slicing
+	}
+
+	// Window related beads around h.selectedRelatedBead so J/K reveals later beads
+	// while keeping COMMIT DETAILS visible below.
+	totalBeads := len(commit.BeadIDs)
+	maxBeadBudget := contentHeight - 12
+	if maxBeadBudget < 3 {
+		maxBeadBudget = 3
+	}
+	startBead := 0
+	endBead := totalBeads
+	if totalBeads > maxBeadBudget {
+		selBead := h.selectedRelatedBead
+		if selBead < 0 {
+			selBead = 0
+		} else if selBead >= totalBeads {
+			selBead = totalBeads - 1
+		}
+		if selBead < maxBeadBudget-1 {
+			startBead = 0
+			endBead = maxBeadBudget - 1
+		} else if selBead >= totalBeads-(maxBeadBudget-1) {
+			endBead = totalBeads
+			startBead = totalBeads - (maxBeadBudget - 1)
+			if startBead < 0 {
+				startBead = 0
+			}
+		} else {
+			itemSlots := maxBeadBudget - 2
+			if itemSlots < 1 {
+				itemSlots = 1
+			}
+			startBead = selBead - itemSlots/2
+			endBead = startBead + itemSlots
+		}
+	}
+
+	scrollIndicatorStyle := t.Renderer.NewStyle().Foreground(t.Muted).Italic(true)
+	if startBead > 0 {
+		lines = append(lines, scrollIndicatorStyle.Render(fmt.Sprintf("↑ %d earlier bead(s)", startBead)))
+	}
+
+	// List related beads in window
+	for i := startBead; i < endBead; i++ {
+		beadID := commit.BeadIDs[i]
 		isSelected := i == h.selectedRelatedBead && h.mainPaneFocused(historyFocusDetail)
 
 		indicator := "  "
@@ -3780,6 +4015,10 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 		lines = append(lines, beadLine)
 	}
 
+	if rem := totalBeads - endBead; rem > 0 {
+		lines = append(lines, scrollIndicatorStyle.Render(fmt.Sprintf("↓ %d more bead(s)", rem)))
+	}
+
 	// Add separator before commit details
 	lines = append(lines, "")
 	lines = append(lines, strings.Repeat("─", detailSepWidth))
@@ -3811,13 +4050,6 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 		lines = append(lines, msgStyle.Render(ml))
 	}
 
-	// Reserve space for footer hint (bv-xf4p)
-	footerHeight := 2
-	contentHeight := height - 2 - footerHeight
-	if contentHeight < 1 {
-		contentHeight = 1 // Minimum content height to avoid negative slicing
-	}
-
 	// Pad with empty lines
 	for len(lines) < contentHeight {
 		lines = append(lines, "")
@@ -3833,7 +4065,7 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 	hintStyle := t.Renderer.NewStyle().Foreground(ColorFooterHint).Italic(true)
 	lines = append(lines, hintStyle.Render("J/K:bead  y:copy  o:open  g:graph"))
 
-	content := strings.Join(lines, "\n")
+	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)
 }
 
@@ -3901,7 +4133,8 @@ func (h *HistoryModel) renderCommitMiddlePanel(width, height int) string {
 		if maxMsgLen < 10 {
 			maxMsgLen = 10
 		}
-		msg := truncateRunesHelper(commit.Message, maxMsgLen, "…")
+		firstLineMsg := strings.Split(commit.Message, "\n")[0]
+		msg := truncateRunesHelper(firstLineMsg, maxMsgLen, "…")
 
 		line := fmt.Sprintf("%s%s %s", indicator, shaStyle.Render(commit.ShortSHA), msg)
 		lines = append(lines, line)
@@ -3922,7 +4155,7 @@ func (h *HistoryModel) renderCommitMiddlePanel(width, height int) string {
 		lines = append(lines, "")
 	}
 
-	content := strings.Join(lines, "\n")
+	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)
 }
 
@@ -4032,10 +4265,6 @@ func (h *HistoryModel) renderGitBeadListPanel(width, height int) string {
 		lines = append(lines, scrollInfo.Render(fmt.Sprintf("↕ %d/%d (%d%%)", endIdx, totalBeads, scrollPct)))
 	}
 
-	for len(lines) < height-2 {
-		lines = append(lines, "")
-	}
-
-	content := strings.Join(lines, "\n")
+	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)
 }

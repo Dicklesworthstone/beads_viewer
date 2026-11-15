@@ -1479,11 +1479,17 @@ async function capabilitiesJourney(page) {
     const rawRows = execQuery('SELECT issue_id, pagerank FROM issue_metrics');
     const rawPR = Object.fromEntries(rawRows.map(r => [r.issue_id, r.pagerank]));
     const maxRawPR = Math.max(...rawRows.map(r => r.pagerank));
-    const issues = ${app}.issues.map(i => ({ id: i.id, score: i.hybrid_score, text: i.text_score, components: i.component_scores }));
+    const issues = ${app}.issues.map(i => ({ id: i.id, status: i.status, score: i.hybrid_score, text: i.text_score, components: i.component_scores }));
     return JSON.parse(JSON.stringify({ maxRawPR, rawPR, issues }));
   })()`);
   assert.ok(hybridAudit.maxRawPR > 0 && hybridAudit.maxRawPR < 1.0, 'raw SQLite PageRank is < 1 prior to normalization');
   const byID = Object.fromEntries(hybridAudit.issues.map(r => [r.id, r]));
+  assert.equal(byID['cap-auth-root'].status, 'open', 'cycle-blocked open issue preserves UI status=open');
+  assert.equal(byID['cap-auth-root'].components.status, 0.5, 'cycle-blocked open issue downgrades hybrid status score to 0.5');
+  assert.equal(byID['cap-auth-root'].components.impact, 1.0, 'max downstream blocks_count issue scores impact=1.0');
+  assert.equal(byID['cap-auth-ui'].status, 'open', 'dependency-blocked open issue preserves UI status=open');
+  assert.equal(byID['cap-auth-ui'].components.status, 0.5, 'dependency-blocked open issue downgrades hybrid status score to 0.5');
+  assert.equal(byID['cap-closed-prereq'].components.status, 0.1, 'closed issue scores status=0.1');
   assert.ok(byID['cap-auth-root'].text > byID['cap-auth-ui'].text && byID['cap-auth-ui'].text > 0 && byID['cap-auth-root'].text <= 1.0,
     `lexical scorer ranks title token match above description-only match: ${JSON.stringify(byID)}`);
   assert.ok(Math.abs(byID['cap-auth-root'].components.pagerank - 1.0) < 1e-12, 'top PageRank issue normalizes to 1.0');
@@ -1524,6 +1530,7 @@ async function capabilitiesJourney(page) {
     await search(page, 'nai\u0308ve');
     await resultIDs(page, ['cap-unicode-nfc']);
     assert.ok((await evaluate(page, `${app}.issues[0]?.text_score || 0`)) >= 0.9, 'NFD query scores NFC title prefix match >= 0.9');
+    assert.equal(await evaluate(page, `${app}.issues[0]?.component_scores?.status`), 1.0, 'unblocked open issue scores status=1.0 in hybrid search');
     await search(page, 'हिंदी');
     await resultIDs(page, ['cap-unicode-nfc']);
     await search(page, '___');
@@ -1542,6 +1549,109 @@ async function capabilitiesJourney(page) {
   await search(page, 'bv-123 AND NOT foo:bar');
   assert.equal(await evaluate(page, `${app}.error || ${app}.globalError || null`), null, 'adversarial FTS query does not error');
   await search(page, '');
+  await resultIDs(page, allCapIDs);
+
+  // 8b-2. Lexical text mode (!usedFTS) descending text_score ranking, >200-row exact/title recall, status-weight/tie-break parity, Critical Path pill removal, and stale searchQuery reset on KPI stat-card & chart drill-downs.
+  await evaluate(page, `(() => {
+    const sel = [...document.querySelectorAll('select[x-model="searchMode"]')].find(${visible});
+    sel.value = 'text';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await evaluate(page, `(() => {
+    window.__prevFts5 = window.DB_STATE.fts5;
+    window.DB_STATE.fts5 = false;
+    DB_STATE.db.run("INSERT INTO issues (id, title, description, status, priority, issue_type, labels, created_at, updated_at) VALUES ('cap-lex-desc', 'Unrelated subsystem', 'Contains sapphireprobe token deep in body', 'open', 0, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
+    DB_STATE.db.run("INSERT INTO issues (id, title, description, status, priority, issue_type, labels, created_at, updated_at) VALUES ('cap-lex-title', 'sapphireprobe primary title', 'Short body', 'open', 3, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
+    DB_STATE.db.run("INSERT INTO issues (id, title, description, status, priority, issue_type, labels, created_at, updated_at) VALUES ('cap-lex-closed-exact', 'sapphireprobe archived fix', 'Closed issue with NULL triage_score', 'closed', 2, 'bug', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
+    DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, description, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES ('cap-lex-desc', 'Unrelated subsystem', 'Contains sapphireprobe token deep in body', 'open', 0, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'satisfied', 1, 0, 0, 0, 0, 0.5, 0, 0, 0, 0, 0, 0, 0)");
+    DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, description, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES ('cap-lex-title', 'sapphireprobe primary title', 'Short body', 'open', 3, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'satisfied', 1, 0, 0, 0, 0, 0.1, 0, 0, 0, 0, 0, 0, 0)");
+    DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, description, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES ('cap-lex-closed-exact', 'sapphireprobe archived fix', 'Closed issue with NULL triage_score', 'closed', 2, 'bug', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'satisfied', 0, 0, 0, 0, 0, NULL, 0, 0, 0, 0, 0, 0, 0)");
+    for (let k = 0; k < 305; k++) {
+      const fid = 'cap-lex-fill-' + String(k).padStart(3, '0');
+      DB_STATE.db.run("INSERT INTO issues (id, title, description, status, priority, issue_type, labels, created_at, updated_at) VALUES (?, 'Filler subsystem', 'Body mentions sapphireprobe filler cap-lex-closed-exact context', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')", [fid]);
+      DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, description, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES (?, 'Filler subsystem', 'Body mentions sapphireprobe filler cap-lex-closed-exact context', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'satisfied', 1, 0, 0, 0, 0, 0.9, 0, 0, 0, 0, 0, 0, 0)", [fid]);
+    }
+  })()`);
+  try {
+    await search(page, 'sapphireprobe');
+    await waitFor(page, `${app}.totalIssues === 308 && ${app}.issues.length > 0`, 'lexical text search (>300 matches) recalled title matches ahead of high-triage filler');
+    const topTwoLex = await evaluate(page, `${app}.issues.slice(0, 2).map(i => i.id)`);
+    assert.deepEqual(topTwoLex, ['cap-lex-closed-exact', 'cap-lex-title'], 'text mode (!usedFTS) recalls NULL-triage closed title match and P3 title match ahead of 305 high-triage description-only rows');
+    await search(page, 'cap-lex-closed-exact');
+    await waitFor(page, `${app}.issues[0]?.id === 'cap-lex-closed-exact'`, 'exact ID with NULL triage_score recalled first across >300 matches');
+    const scorerAudit = await evaluate(page, `(() => {
+      const hs = new window.HybridScorer();
+      const statusMap = {};
+      for (const st of ['open', 'in_progress', ' REVIEW ', 'hooked', 'pinned', 'blocked', 'deferred', 'draft', 'closed', 'tombstone', 'custom_stage']) {
+        statusMap[st.trim().toLowerCase()] = hs.normalizeStatus(st);
+      }
+      const tied = hs.scoreAndRank([
+        { id: 'bv-20', status: 'review', priority: 1, pagerank: 0.4, blockerCount: 2, updatedAt: '2026-09-01T12:00:00Z', textScore: 0.75 },
+        { id: 'bv-10', status: 'hooked', priority: 1, pagerank: 0.4, blockerCount: 2, updatedAt: '2026-09-01T12:00:00Z', textScore: 0.75 },
+      ]).map(r => r.id);
+      const batchImpact = window.scoreBatchHybrid([
+        { id: 'upstream-blocked', status: 'open', priority: 2, pagerank: 0.5, blocker_count: 5, blocks_count: 0, updatedAt: '2026-09-01T12:00:00Z', textScore: 0.5 },
+        { id: 'downstream-unblocker', status: 'open', priority: 2, pagerank: 0.5, blocker_count: 0, blocks_count: 5, updatedAt: '2026-09-01T12:00:00Z', textScore: 0.5 },
+      ], window.HYBRID_PRESETS.default).map(r => ({ id: r.id, impact: r.component_scores.impact }));
+      return { statusMap, tied, batchImpact };
+    })()`);
+    assert.deepEqual(scorerAudit.statusMap, {
+      open: 1.0,
+      in_progress: 0.8,
+      review: 0.8,
+      hooked: 0.8,
+      pinned: 0.7,
+      blocked: 0.5,
+      deferred: 0.2,
+      draft: 0.2,
+      closed: 0.1,
+      tombstone: 0.0,
+      custom_stage: 0.5,
+    }, 'HybridScorer status weights match Go pkg/search/normalizers.go');
+    assert.deepEqual(scorerAudit.tied, ['bv-10', 'bv-20'], 'HybridScorer tie-breaks equal hybrid_score deterministically by ID');
+    assert.equal(scorerAudit.batchImpact[0].id, 'downstream-unblocker', 'scoreBatchHybrid uses downstream blocks_count rather than upstream blocker_count');
+  } finally {
+    await evaluate(page, `(() => {
+      window.DB_STATE.fts5 = window.__prevFts5;
+      DB_STATE.db.run("DELETE FROM issue_overview_mv WHERE id LIKE 'cap-lex-%'");
+      DB_STATE.db.run("DELETE FROM issues WHERE id LIKE 'cap-lex-%'");
+    })()`);
+  }
+  await search(page, '');
+  await resultIDs(page, allCapIDs);
+
+  // URL hash restoration for mode=hybrid&preset=impact-first&critical=1 and Critical Path filter pill removal.
+  await evaluate(page, `window.location.hash = '#/issues?mode=hybrid&preset=impact-first&critical=1'`);
+  await waitFor(page, `${app}.view === 'issues' && ${app}.searchMode === 'hybrid' && ${app}.searchPreset === 'impact-first' && ${app}.filters.criticalPath === true`, 'URL hash restores mode, preset, and critical=1');
+  await click(page, 'button[title="Remove Critical Path filter"]');
+  await waitFor(page, `${app}.filters.criticalPath === false && !window.location.hash.includes('critical=1')`, 'Critical Path filter pill clears criticalPath filter and URL hash');
+  await evaluate(page, `(() => {
+    const sel = [...document.querySelectorAll('select[x-model="searchMode"]')].find(${visible});
+    sel.value = 'text';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    ${app}.searchPreset = 'default';
+  })()`);
+
+  // Global search from Dashboard switches to Issues, and returning to #/ Overview + clicking Blocked KPI stat card or chart drill-down clears stale searchQuery!
+  await click(page, 'a[href="#/"]');
+  await waitFor(page, `${app}.view === 'dashboard'`, 'returned to dashboard for global search');
+  await search(page, 'OAuth');
+  await waitFor(page, `${app}.view === 'issues' && ${app}.searchQuery === 'OAuth' && ${app}.issues.length === 3`, 'global header search from Dashboard switches to Issues view');
+  await click(page, 'a[href="#/"]');
+  await waitFor(page, `${app}.view === 'dashboard'`, 'returned to dashboard with active searchQuery before KPI stat-card click');
+  await click(page, 'div[\\@click*="hasBlockers: true"]');
+  await waitFor(page, `${app}.view === 'issues' && ${app}.searchQuery === '' && !window.location.hash.includes('q=') && ${app}.filters.hasBlockers === true && ${app}.totalIssues === ${app}.stats.blocked`, 'Blocked KPI stat card clears stale searchQuery and shows all blocked issues');
+  await click(page, 'a[href="#/"]');
+  await waitFor(page, `${app}.view === 'dashboard'`, 'returned to dashboard before Closed stat card');
+  await click(page, 'div[\\@click*="closed"]');
+  await waitFor(page, `${app}.view === 'issues' && ${app}.filters.hasBlockers === null && ${app}.searchQuery === '' && JSON.stringify(${app}.filters.status) === '["closed"]'`, 'Closed stat card resets stale hasBlockers filter');
+  await resultIDs(page, ['cap-closed-prereq']);
+  await search(page, 'OAuth');
+  await waitFor(page, `${app}.searchQuery === 'OAuth'`, 'seeded searchQuery before chart drill-down event');
+  await evaluate(page, `document.dispatchEvent(new CustomEvent('bv-chart:priorityClick', { detail: { priority: 0 } }))`);
+  await waitFor(page, `${app}.view === 'issues' && ${app}.searchQuery === '' && !window.location.hash.includes('q=') && JSON.stringify(${app}.filters.priority) === '[0]'`, 'chart drill-down clears stale searchQuery');
+  await click(page, 'button', 'Clear all');
+  await waitFor(page, `${app}.filters.priority.length === 0 && ${app}.searchQuery === ''`, 'cleared priority filter');
   await resultIDs(page, allCapIDs);
 
   // 8c. Issue Detail Modal external_ref + resolved blocker line-through + "Show Graph" Mermaid diagram across multiple issues.
@@ -1603,6 +1713,23 @@ async function capabilitiesJourney(page) {
   })()`);
   assert.ok(eigenAudit.count > 0 && eigenAudit.allActive && eigenAudit.allPositive, `topByEigenvector populated with active positive scores: ${JSON.stringify(eigenAudit)}`);
   assert.ok(eigenAudit.hasSubtitle && eigenAudit.rendersFirstScore, `Influencers panel renders Eigenvector Centrality score in DOM: ${JSON.stringify(eigenAudit)}`);
+  const slackAndWeightsAudit = await evaluate(page, `(() => {
+    const slackItems = ${app}.criticalPathSlack || [];
+    const weights = ${app}.getTriageWeightComponents();
+    const weightSum = weights.reduce((acc, w) => acc + (w.value || 0), 0);
+    const hasSlackHeading = document.body.innerText.includes('Critical Path Slack');
+    return {
+      slackCount: slackItems.length,
+      slackActiveZero: slackItems.every(i => i.status !== 'closed' && i.status !== 'tombstone' && Math.abs(i.slack || 0) < 0.001),
+      weightsLen: weights.length,
+      weightSum,
+      hasSlackHeading,
+    };
+  })()`);
+  assert.ok(slackAndWeightsAudit.slackCount > 0 && slackAndWeightsAudit.slackActiveZero && slackAndWeightsAudit.hasSlackHeading,
+    `Critical Path Slack card populated with active zero-slack nodes: ${JSON.stringify(slackAndWeightsAudit)}`);
+  assert.equal(slackAndWeightsAudit.weightsLen, 8, 'getTriageWeightComponents exposes all 8 triage components');
+  assert.ok(Math.abs(slackAndWeightsAudit.weightSum - 1.0) < 1e-6, `triage weights sum to 1.0: ${slackAndWeightsAudit.weightSum}`);
   await click(page, 'button', 'Highlight Cycles');
   await waitFor(page, `${app}.view === 'graph' && ${app}.forceGraphReady && !${app}.forceGraphLoading && ${app}.cycleNavigatorActive`, 'Highlight Cycles opens graph and activates navigator');
   assert.equal(await evaluate(page, `${app}.totalCycles`), 2);
@@ -1719,6 +1846,60 @@ async function capabilitiesJourney(page) {
   await waitFor(page, `${app}.graphDetailNode && ${app}.graphDetailNode.id !== 'cap-auth-root' && ${app}.graphDetailNode.id === ${app}.forceGraphModule.getSelectedNode()?.id`, 'second ArrowRight advances graphDetailNode');
   await key(page, 'Escape');
   await waitFor(page, `!${app}.graphDetailNode`, 'Escape clears selected graph detail node');
+
+  // 4b. Scoped graph.js keyboard shortcuts (inactive outside #/graph) & >20-label top-20 cross-label heatmap matrix.
+  await click(page, 'a[href="#/issues"]');
+  await waitFor(page, `${app}.view === 'issues'`, 'returned to issues view after graph initialization');
+  const scopedShortcutAndHeatmapAudit = await evaluate(page, `(() => {
+    document.activeElement?.blur?.();
+    const arrowEv = new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true });
+    document.body.dispatchEvent(arrowEv);
+    const digit5Ev = new KeyboardEvent('keydown', { key: '5', code: 'Digit5', bubbles: true, cancelable: true });
+    document.body.dispatchEvent(digit5Ev);
+
+    const orig = getGraphViewData();
+    const origResolved = getResolvedIssueIDs();
+    try {
+      const manyIssues = [];
+      for (let i = 0; i < 23; i++) {
+        const prefix = i < 20 ? 'a-idle-' + String(i).padStart(2, '0') : 'z-busy-' + String(i).padStart(2, '0');
+        manyIssues.push({ id: 'hm-' + i, status: 'open', labels: JSON.stringify([prefix]), created_at: '2026-09-01T12:00:00Z', updated_at: '2026-09-01T12:00:00Z' });
+      }
+      // 25 distinct labels total: 20 idle 'a-idle-*', 3 'z-busy-*', plus 'z-busy-23' and 'z-busy-24' with cross-label blocking edges.
+      manyIssues.push({ id: 'hm-23', status: 'open', labels: JSON.stringify(['z-busy-23']), created_at: '2026-09-01T12:00:00Z', updated_at: '2026-09-01T12:00:00Z' });
+      manyIssues.push({ id: 'hm-24', status: 'open', labels: JSON.stringify(['z-busy-24']), created_at: '2026-09-01T12:00:00Z', updated_at: '2026-09-01T12:00:00Z' });
+      const manyDeps = [
+        { issue_id: 'hm-23', depends_on_id: 'hm-24', type: 'blocks' },
+        { issue_id: 'hm-20', depends_on_id: 'hm-21', type: 'blocks' },
+      ];
+      window.bvCharts.init(manyIssues, manyDeps, new Set());
+      const matrix25 = window.bvCharts.computeLabelMatrix();
+      window.bvCharts.init(orig.issues, orig.dependencies, origResolved);
+      const matrixOrig = window.bvCharts.computeLabelMatrix();
+      return {
+        arrowPrevented: arrowEv.defaultPrevented,
+        galaxyHijackedOutsideGraph: ${app}.forceGraphModule.getLabelClusterState().active,
+        matrix25Truncated: matrix25.truncated,
+        matrix25Total: matrix25.totalLabels,
+        matrix25Len: matrix25.labels.length,
+        matrix25HasBusy: matrix25.labels.includes('z-busy-23') && matrix25.labels.includes('z-busy-24') && matrix25.labels.includes('z-busy-20') && matrix25.labels.includes('z-busy-21'),
+        matrix25Max: matrix25.maxValue,
+        matrixOrigTruncated: matrixOrig.truncated,
+        matrixOrigLen: matrixOrig.labels.length,
+      };
+    } finally {
+      window.bvCharts.init(orig.issues, orig.dependencies, origResolved);
+    }
+  })()`);
+  assert.equal(scopedShortcutAndHeatmapAudit.arrowPrevented, false, 'graph.js does not preventDefault ArrowDown on #/issues');
+  assert.equal(scopedShortcutAndHeatmapAudit.galaxyHijackedOutsideGraph, false, 'graph.js does not hijack Digit5 outside #/graph');
+  assert.equal(scopedShortcutAndHeatmapAudit.matrix25Truncated, true, '>20 labels sets truncated=true');
+  assert.equal(scopedShortcutAndHeatmapAudit.matrix25Total, 25, 'totalLabels reports all 25 distinct labels');
+  assert.equal(scopedShortcutAndHeatmapAudit.matrix25Len, 20, 'heatmap caps matrix to top 20 labels');
+  assert.equal(scopedShortcutAndHeatmapAudit.matrix25HasBusy, true, 'top-20 ranking retains z-busy-* labels with cross-label blocking edges over alphabetical a-idle-*');
+  assert.ok(scopedShortcutAndHeatmapAudit.matrix25Max > 0, 'top-20 matrix preserves positive blocking cell counts');
+  assert.equal(scopedShortcutAndHeatmapAudit.matrixOrigTruncated, false, '<=20 labels sets truncated=false');
+  assert.equal(scopedShortcutAndHeatmapAudit.matrixOrigLen, 5, 'original 5-label capability dataset restored');
 
   // 5. Error Modal runErrorAction(action) recovery handler ({ action }, { handler }, { url }).
   await evaluate(page, `(() => {

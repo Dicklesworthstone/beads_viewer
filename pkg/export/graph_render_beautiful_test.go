@@ -47,3 +47,29 @@ func TestGraphHTML_HasNoExternalRequests(t *testing.T) {
 		t.Fatalf("graph HTML still references a web font service")
 	}
 }
+
+func TestGenerateUltimateHTML_CustomStatusTypeFiltersAndKeyboardGuards(t *testing.T) {
+	graphJSON := `{
+		"nodes": [
+			{"id": "1", "status": "deferred", "type": "chore"},
+			{"id": "2", "status": "qa_review", "type": "incident<1>"},
+			{"id": "3", "status": "open", "type": "task"}
+		],
+		"links": []
+	}`
+	out := generateUltimateHTML("Custom Graph", "h1", graphJSON, 3, 0, "proj", "", "")
+
+	for _, want := range []string{
+		`<option value="deferred">Deferred</option>`,
+		`<option value="qa_review">Qa Review</option>`,
+		`<option value="chore">Chore</option>`,
+		`<option value="incident&lt;1&gt;">Incident&lt;1&gt;</option>`,
+		`deferred: '#94a3b8'`,
+		`['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)`,
+		`e.target.isContentEditable`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("generateUltimateHTML output missing %q", want)
+		}
+	}
+}

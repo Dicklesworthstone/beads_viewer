@@ -159,42 +159,65 @@ func (m *ActionableModel) SelectIssueByID(id string) bool {
 	return false
 }
 
-// ensureVisible adjusts scroll to keep selection visible
-func (m *ActionableModel) ensureVisible() {
-	// Calculate the line number of the current selection
-	lineNum := 0
-	for i := 0; i < m.selectedTrack; i++ {
-		lineNum += 1 + len(m.plan.Tracks[i].Items) + 1 // header + items + blank
-	}
-	lineNum += 1 + m.selectedItem // header + item position
+// hasSummaryBanner reports whether Render() emits the 2-line RECOMMENDED summary block.
+func (m *ActionableModel) hasSummaryBanner() bool {
+	return m.plan.Summary.HighestImpact != "" && m.plan.Summary.UnblocksCount > 0
+}
 
-	// Calculate item height (expanded if selected and has unblocks)
+// ensureVisible adjusts scroll to keep selection visible using exact Render() line offsets.
+func (m *ActionableModel) ensureVisible() {
+	if len(m.plan.Tracks) == 0 || m.selectedTrack < 0 || m.selectedTrack >= len(m.plan.Tracks) {
+		m.scrollOffset = 0
+		return
+	}
+
+	// Render() always starts with 2 header lines (header + blank line).
+	lineNum := 2
+	if m.hasSummaryBanner() {
+		lineNum += 2 // summary banner + blank line
+	}
+
+	// Each preceding track emits: track header (1) + divider (1) + items (N) + trailing blank (1) = N + 3 lines.
+	for i := 0; i < m.selectedTrack; i++ {
+		lineNum += len(m.plan.Tracks[i].Items) + 3
+	}
+
+	trackHeaderStart := lineNum
+	itemStart := lineNum + 2 + m.selectedItem // +2 for current track header + divider
+
+	// Selected item expands by 1 extra line when it has UnblocksIDs.
 	itemHeight := 1
 	track := m.plan.Tracks[m.selectedTrack]
-	if len(track.Items) > m.selectedItem {
+	if m.selectedItem >= 0 && m.selectedItem < len(track.Items) {
 		if len(track.Items[m.selectedItem].UnblocksIDs) > 0 {
 			itemHeight = 2
 		}
 	}
 
-	visibleLines := m.height - 2 // account for header (2 lines used in Render for header+blank)
-	if visibleLines < 5 {
-		visibleLines = 5
+	visibleLines := m.height - 2
+	if visibleLines < 1 {
+		visibleLines = 1
 	}
 
-	// Ensure top is visible
-	if lineNum < m.scrollOffset {
-		m.scrollOffset = lineNum
+	topTarget := itemStart
+	if m.selectedItem == 0 {
+		if m.selectedTrack == 0 && itemStart+itemHeight <= visibleLines {
+			topTarget = 0
+		} else if itemStart+itemHeight-trackHeaderStart <= visibleLines {
+			topTarget = trackHeaderStart
+		}
 	}
 
-	// Ensure bottom is visible
-	// We need the last line of the item (lineNum + itemHeight - 1) to be visible
-	// The last visible line index is m.scrollOffset + visibleLines - 1
-	// So: lineNum + itemHeight - 1 <= m.scrollOffset + visibleLines - 1
-	//     lineNum + itemHeight <= m.scrollOffset + visibleLines
-	bottomLine := lineNum + itemHeight
+	if topTarget < m.scrollOffset {
+		m.scrollOffset = topTarget
+	}
+
+	bottomLine := itemStart + itemHeight
 	if bottomLine > m.scrollOffset+visibleLines {
 		m.scrollOffset = bottomLine - visibleLines
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
 	}
 }
 
@@ -215,14 +238,27 @@ func (m *ActionableModel) Render() string {
 		totalItems += len(track.Items)
 	}
 
+	headerWidth := m.width - 4
+	if headerWidth < 8 {
+		headerWidth = 8
+	}
+	innerBannerWidth := m.width - 8
+	if innerBannerWidth < 4 {
+		innerBannerWidth = 4
+	}
+
 	headerStyle := t.Renderer.NewStyle().
 		Bold(true).
 		Foreground(t.Base.GetForeground()).
 		Background(t.Primary).
 		Padding(0, 2).
-		Width(m.width - 4)
+		Width(headerWidth)
 
-	header := fmt.Sprintf("⚡ ACTIONABLE ITEMS  │  %d items in %d tracks", totalItems, len(m.plan.Tracks))
+	header := truncateRunesHelper(
+		fmt.Sprintf("⚡ ACTIONABLE ITEMS  │  %d items in %d tracks", totalItems, len(m.plan.Tracks)),
+		innerBannerWidth,
+		"…",
+	)
 	lines = append(lines, headerStyle.Render(header))
 	lines = append(lines, "")
 
@@ -231,7 +267,7 @@ func (m *ActionableModel) Render() string {
 			Foreground(t.Subtext).
 			Italic(true).
 			Padding(2, 4).
-			Width(m.width - 4).
+			Width(headerWidth).
 			Align(lipgloss.Center)
 		lines = append(lines, emptyStyle.Render("✓ No actionable items. All tasks are either blocked or completed."))
 		return strings.Join(lines, "\n")
@@ -240,17 +276,21 @@ func (m *ActionableModel) Render() string {
 	// ══════════════════════════════════════════════════════════════════════════
 	// IMPACT SUMMARY - Highlighted recommendation
 	// ══════════════════════════════════════════════════════════════════════════
-	if m.plan.Summary.HighestImpact != "" && m.plan.Summary.UnblocksCount > 0 {
+	if m.hasSummaryBanner() {
 		summaryStyle := t.Renderer.NewStyle().
 			Foreground(t.Open).
 			Background(t.Highlight).
 			Bold(true).
 			Padding(0, 2).
-			Width(m.width - 4)
-		summary := fmt.Sprintf("💡 RECOMMENDED: Start with %s → %s (unblocks %d)",
-			m.plan.Summary.HighestImpact,
-			m.plan.Summary.ImpactReason,
-			m.plan.Summary.UnblocksCount)
+			Width(headerWidth)
+		summary := truncateRunesHelper(
+			fmt.Sprintf("💡 RECOMMENDED: Start with %s → %s (unblocks %d)",
+				m.plan.Summary.HighestImpact,
+				m.plan.Summary.ImpactReason,
+				m.plan.Summary.UnblocksCount),
+			innerBannerWidth,
+			"…",
+		)
 		lines = append(lines, summaryStyle.Render(summary))
 		lines = append(lines, "")
 	}
@@ -271,9 +311,14 @@ func (m *ActionableModel) Render() string {
 			Italic(true)
 
 		trackNum := strings.TrimPrefix(track.TrackID, "track-")
+		badge := trackBadgeStyle.Render(fmt.Sprintf("TRACK %s", trackNum))
+		maxReasonWidth := m.width - lipgloss.Width(badge) - 5
+		if maxReasonWidth < 4 {
+			maxReasonWidth = 4
+		}
+		reasonText := truncateRunesHelper(track.Reason, maxReasonWidth, "…")
 
-		trackLine := trackBadgeStyle.Render(fmt.Sprintf("TRACK %s", trackNum)) +
-			" " + trackReasonStyle.Render(track.Reason)
+		trackLine := badge + " " + trackReasonStyle.Render(reasonText)
 		lines = append(lines, trackLine)
 
 		// Subtle divider

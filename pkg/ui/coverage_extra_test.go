@@ -1964,52 +1964,72 @@ func TestGraphRenderBlocksAndDependents(t *testing.T) {
 func TestViewVariantsCoverBranches(t *testing.T) {
 	issues := []model.Issue{{ID: "1", Title: "One", Status: model.StatusOpen}}
 	m := NewModel(issues, nil, "")
-	m.ready = true
-	m.width, m.height = 120, 30
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+	assertValidView := func(label string, out string, wantSubstr string) {
+		t.Helper()
+		if strings.TrimSpace(out) == "" {
+			t.Fatalf("%s rendered empty output", label)
+		}
+		if wantSubstr != "" && !strings.Contains(out, wantSubstr) {
+			t.Fatalf("%s missing %q in output:\n%s", label, wantSubstr, out)
+		}
+		for idx, ln := range strings.Split(out, "\n") {
+			if w := lipgloss.Width(ln); w > m.width {
+				t.Fatalf("%s line %d width %d > %d: %q", label, idx, w, m.width, ln)
+			}
+		}
+	}
 
 	// Quit confirm
 	m.showQuitConfirm = true
-	_ = m.View()
+	assertValidView("quit-confirm", m.View(), "Quit")
 
 	// Time-travel prompt
 	m.showQuitConfirm = false
 	m.showTimeTravelPrompt = true
-	_ = m.View()
+	assertValidView("time-travel-prompt", m.View(), "Time")
 
 	// Recipe picker
 	m.showTimeTravelPrompt = false
 	m.showRecipePicker = true
-	_ = m.View()
+	assertValidView("recipe-picker", m.View(), "Recipe")
 
 	// Help
 	m.showRecipePicker = false
 	m.showHelp = true
-	_ = m.View()
+	assertValidView("help-overlay", m.View(), "Keyboard Shortcuts")
 
 	// Insights view
 	m.showHelp = false
 	m.focused = focusInsights
-	_ = m.View()
+	assertValidView("insights-view", m.View(), "")
 
 	// Graph view
 	m.focused = focusGraph
 	m.isGraphView = true
-	_ = m.View()
+	assertValidView("graph-view", m.View(), "1")
 
 	// Board view
 	m.isGraphView = false
 	m.isBoardView = true
-	_ = m.View()
+	assertValidView("board-view", m.View(), "OPEN")
 
 	// Actionable view
 	m.isBoardView = false
 	m.isActionableView = true
-	_ = m.View()
+	assertValidView("actionable-view", m.View(), "")
 
 	// Split view
 	m.isActionableView = false
+	m.focused = focusList
 	m.isSplitView = true
-	_ = m.View()
+	m.applyContentSizing()
+	m.updateViewportContent()
+	splitBody := m.renderSplitView()
+	assertValidView("renderSplitView", splitBody, "One")
+	assertValidView("split-view-full", m.View(), "One")
 }
 
 func TestUpdateMouseAndResize(t *testing.T) {

@@ -3196,3 +3196,52 @@ func TestParkedStatuses_ZeroQuickWinBoostAndNoGoodStartingPointReason(t *testing
 		}
 	}
 }
+
+func TestComputeStalenessAndAbandonedClaim_SkipParkedBeads(t *testing.T) {
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	ancient := now.Add(-45 * 24 * time.Hour)
+	future := now.Add(7 * 24 * time.Hour)
+	past := now.Add(-2 * 24 * time.Hour)
+
+	parkedOnly := []model.Issue{
+		{ID: "DEF-STATUS", Status: model.StatusDeferred, UpdatedAt: ancient, CreatedAt: ancient},
+		{ID: "PIN-STATUS", Status: model.StatusPinned, UpdatedAt: ancient, CreatedAt: ancient},
+		{ID: "PIN-FLAG", Status: model.StatusInProgress, Pinned: true, UpdatedAt: ancient, CreatedAt: ancient},
+		{ID: "TMPL-1", Status: model.StatusInProgress, IsTemplate: true, UpdatedAt: ancient, CreatedAt: ancient},
+		{ID: "EPH-1", Status: model.StatusInProgress, Ephemeral: true, UpdatedAt: ancient, CreatedAt: ancient},
+		{ID: "DEF-UNTIL", Status: model.StatusInProgress, DeferUntil: &future, UpdatedAt: ancient, CreatedAt: ancient},
+	}
+
+	st := ComputeStaleness(nil, parkedOnly, now)
+	if st != nil {
+		t.Fatalf("expected nil staleness for parked issues, got %+v", st)
+	}
+	alerts := buildTriageAlerts(nil, parkedOnly, nil, st, nil, now)
+	for _, a := range alerts {
+		if a.Type == "stale" || a.Type == "abandoned_claim" {
+			t.Fatalf("parked beads emitted %s alert: %+v", a.Type, a)
+		}
+	}
+
+	withExpiredDefer := append(parkedOnly, model.Issue{
+		ID:         "UNPARKED-CLAIM",
+		Status:     model.StatusInProgress,
+		DeferUntil: &past,
+		UpdatedAt:  ancient,
+		CreatedAt:  ancient,
+	})
+	stActive := ComputeStaleness(nil, withExpiredDefer, now)
+	if stActive.StaleCount != 1 || stActive.StalestIssueID != "UNPARKED-CLAIM" {
+		t.Fatalf("expected UNPARKED-CLAIM to be stale once DeferUntil expired, got %+v", stActive)
+	}
+	activeAlerts := buildTriageAlerts(nil, withExpiredDefer, nil, stActive, nil, now)
+	foundAbandoned := false
+	for _, a := range activeAlerts {
+		if a.Type == "abandoned_claim" && len(a.IssueIDs) == 1 && a.IssueIDs[0] == "UNPARKED-CLAIM" {
+			foundAbandoned = true
+		}
+	}
+	if !foundAbandoned {
+		t.Fatalf("expected abandoned_claim alert solely for UNPARKED-CLAIM, got %+v", activeAlerts)
+	}
+}

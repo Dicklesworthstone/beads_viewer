@@ -21,6 +21,11 @@ import (
 // Only two parsed snapshots are resident; the artifact keeps compact target
 // observations, not every issue in every commit.
 func (e *Extractor) extractCausalHistory(target string, opts ExtractOptions) (*CausalHistory, error) {
+	if opts.Revision != "" {
+		if err := validateGitRefArg(opts.Revision); err != nil {
+			return nil, err
+		}
+	}
 	args := []string{"log", "--first-parent", "--diff-merges=first-parent", "--raw", "--no-abbrev", "--follow", "--format=" + gitLogHeaderFormat + "%x00%cI"}
 	args = appendHistoryFilters(args, opts)
 	args = append(args, "--", e.primaryBeadsFile())
@@ -66,9 +71,12 @@ func (e *Extractor) extractCausalHistory(target string, opts ExtractOptions) (*C
 	}
 	result := &CausalHistory{BeadID: target, Observations: []CausalObservation{}}
 	if opts.Revision != "" {
+		if err := validateGitRefArg(opts.Revision); err != nil {
+			return nil, fmt.Errorf("causal reference commit: %w", err)
+		}
 		// The revision may not change the beads file. Its own clocks, rather
 		// than the last file change or today's clock, bound an ongoing wait.
-		cmd := gitCommand(e.ctx, "show", "-s", "--format=%aI%x00%cI", opts.Revision)
+		cmd := gitCommand(e.ctx, "show", "-s", "--format=%aI%x00%cI", "--end-of-options", opts.Revision)
 		cmd.Dir = e.repoPath
 		out, err := cmd.Output()
 		if err != nil {
@@ -388,6 +396,11 @@ type snapshotCommit struct {
 // ~310 ms git (raw log + dedup cat-file) + ~150 ms hash/diff. Since/Until/Limit
 // and rename-following are honored by the same `--raw --follow` walk.
 func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error) {
+	if opts.Revision != "" {
+		if err := validateGitRefArg(opts.Revision); err != nil {
+			return nil, err
+		}
+	}
 	commits, err := e.snapshotCommits(opts)
 	if err != nil {
 		return nil, err
@@ -570,6 +583,11 @@ func (e *Extractor) extractViaSnapshots(opts ExtractOptions) ([]BeadEvent, error
 // output already carries both blob ids per change, and `--follow` makes git pick
 // the correct parent blob across renames.
 func (e *Extractor) snapshotCommits(opts ExtractOptions) ([]snapshotCommit, error) {
+	if opts.Revision != "" {
+		if err := validateGitRefArg(opts.Revision); err != nil {
+			return nil, err
+		}
+	}
 	primary := e.primaryBeadsFile()
 
 	args := []string{
@@ -608,7 +626,7 @@ func appendHistoryFilters(args []string, opts ExtractOptions) []string {
 		args = append(args, fmt.Sprintf("-n%d", opts.Limit))
 	}
 	if opts.Revision != "" {
-		args = append(args, opts.Revision)
+		args = append(args, "--end-of-options", opts.Revision)
 	}
 	return args
 }

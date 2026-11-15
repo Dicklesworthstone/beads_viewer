@@ -153,6 +153,40 @@ func (m *VelocityComparisonModel) MoveDown() {
 	}
 }
 
+// MoveToTop jumps cursor to the first label row
+func (m *VelocityComparisonModel) MoveToTop() {
+	if len(m.data) > 0 {
+		m.cursor = 0
+		m.scrollOffset = 0
+	}
+}
+
+// MoveToBottom jumps cursor to the last label row
+func (m *VelocityComparisonModel) MoveToBottom() {
+	if len(m.data) > 0 {
+		m.cursor = len(m.data) - 1
+		m.ensureVisible()
+	}
+}
+
+// PageDown moves cursor down by half a page
+func (m *VelocityComparisonModel) PageDown() {
+	if len(m.data) > 0 {
+		step := max(1, m.visibleRowCount()/2)
+		m.cursor = min(len(m.data)-1, m.cursor+step)
+		m.ensureVisible()
+	}
+}
+
+// PageUp moves cursor up by half a page
+func (m *VelocityComparisonModel) PageUp() {
+	if len(m.data) > 0 {
+		step := max(1, m.visibleRowCount()/2)
+		m.cursor = max(0, m.cursor-step)
+		m.ensureVisible()
+	}
+}
+
 // ensureVisible adjusts scroll offset to keep cursor visible
 func (m *VelocityComparisonModel) ensureVisible() {
 	visibleRows := m.visibleRowCount()
@@ -163,10 +197,10 @@ func (m *VelocityComparisonModel) ensureVisible() {
 	}
 }
 
-// visibleRowCount returns how many data rows can be displayed
+// visibleRowCount returns how many data rows can be displayed without clipping
 func (m *VelocityComparisonModel) visibleRowCount() int {
-	// Account for header (2 lines) and footer (1 line)
-	available := m.height - 4
+	// Account for title + blank (2), header + separator (2), optional scroll indicator (1), and blank + footer (2) = 7 lines
+	available := m.height - 7
 	if available < 1 {
 		return 1
 	}

@@ -114,11 +114,17 @@ impl HybridScorer {
 
 fn normalize_status(status: u8) -> f64 {
     match status {
-        0 => 1.0,
-        1 => 0.8,
-        2 => 0.5,
-        3 => 0.1,
-        _ => 0.5,
+        0 => 1.0, // open
+        1 => 0.8, // in_progress
+        2 => 0.5, // blocked
+        3 => 0.1, // closed
+        4 => 0.8, // review
+        5 => 0.8, // hooked
+        6 => 0.7, // pinned
+        7 => 0.2, // deferred
+        8 => 0.2, // draft
+        9 => 0.0, // tombstone
+        _ => 0.5, // custom / unknown
     }
 }
 
@@ -166,5 +172,86 @@ fn safe_number(value: f64) -> f64 {
         value
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_weights_match_go_normalizer() {
+        let expected = [
+            (0_u8, 1.0),   // open
+            (1_u8, 0.8),   // in_progress
+            (2_u8, 0.5),   // blocked
+            (3_u8, 0.1),   // closed
+            (4_u8, 0.8),   // review
+            (5_u8, 0.8),   // hooked
+            (6_u8, 0.7),   // pinned
+            (7_u8, 0.2),   // deferred
+            (8_u8, 0.2),   // draft
+            (9_u8, 0.0),   // tombstone
+            (255_u8, 0.5), // unknown custom status
+        ];
+        for (code, want) in expected {
+            let got = normalize_status(code);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "status code {code}: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn score_batch_ranks_and_tie_breaks_by_id() {
+        let mut scorer = HybridScorer::new("{}");
+        let payload = serde_json::json!([
+            {
+                "id": "bv-20",
+                "text_score": 0.75,
+                "pagerank": 0.4,
+                "status": 4,
+                "priority": 1,
+                "blocker_count": 2,
+                "days_since_update": 0.0
+            },
+            {
+                "id": "bv-10",
+                "text_score": 0.75,
+                "pagerank": 0.4,
+                "status": 5,
+                "priority": 1,
+                "blocker_count": 2,
+                "days_since_update": 0.0
+            },
+            {
+                "id": "bv-30",
+                "text_score": 0.75,
+                "pagerank": 0.4,
+                "status": 7,
+                "priority": 1,
+                "blocker_count": 2,
+                "days_since_update": 0.0
+            }
+        ]);
+        let raw = scorer.score_batch(&payload.to_string());
+        let parsed: Vec<ScoredResult> = serde_json::from_str(&raw).expect("valid JSON output");
+        let ids: Vec<&str> = parsed.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["bv-10", "bv-20", "bv-30"]);
+        assert!((parsed[0].components[1] - 0.8).abs() < 1e-12);
+        assert!((parsed[1].components[1] - 0.8).abs() < 1e-12);
+        assert!((parsed[2].components[1] - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn impact_and_recency_neutral_defaults() {
+        assert!((normalize_impact(0, 0) - 0.5).abs() < 1e-12);
+        assert!((normalize_impact(0, 4) - 0.0).abs() < 1e-12);
+        assert!((normalize_impact(2, 4) - 0.5).abs() < 1e-12);
+        assert!((normalize_impact(4, 4) - 1.0).abs() < 1e-12);
+        assert!((normalize_recency(-1.0) - 0.5).abs() < 1e-12);
+        assert!((normalize_recency(f64::NAN) - 0.5).abs() < 1e-12);
+        assert!((normalize_recency(0.0) - 1.0).abs() < 1e-12);
     }
 }

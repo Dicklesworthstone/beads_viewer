@@ -321,41 +321,77 @@ func parseDeploymentID(output string) string {
 
 // SuggestProjectName generates a suggested Cloudflare Pages project name.
 func SuggestProjectName(bundlePath string) string {
-	// Use the directory name
-	name := filepath.Base(bundlePath)
-	if isEmptyPathBase(name) {
-		// Get parent dir name
-		abs, err := filepath.Abs(bundlePath)
-		if err == nil {
-			name = filepath.Base(filepath.Dir(abs))
+	trimmed := strings.TrimSpace(bundlePath)
+	var base string
+	appendPages := false
+	switch {
+	case trimmed == "":
+		if cwd, err := os.Getwd(); err == nil {
+			base = filepath.Base(cwd)
+			appendPages = true
 		}
-	}
-
-	// If it's bv-pages or similar, use parent project name
-	if isGenericCloudflareOutputDir(name) {
-		abs, err := filepath.Abs(bundlePath)
-		if err == nil {
-			parent := filepath.Base(filepath.Dir(abs))
-			if !isEmptyPathBase(parent) {
-				name = parent + "-pages"
+	case trimmed == ".":
+		if cwd, err := os.Getwd(); err == nil {
+			base = filepath.Base(cwd)
+		}
+	case isBeadsSourcePath(trimmed):
+		if root := projectRootFromBeadsPath(trimmed); root != "" {
+			base = filepath.Base(root)
+			appendPages = true
+		}
+	default:
+		candidate := filepath.Base(trimmed)
+		if !isEmptyPathBase(candidate) {
+			if isGenericCloudflareOutputDir(candidate) {
+				if abs, err := filepath.Abs(trimmed); err == nil {
+					parent := filepath.Base(filepath.Dir(abs))
+					if !isEmptyPathBase(parent) {
+						base = parent
+						appendPages = true
+					}
+				}
 			} else {
-				name = ""
+				base = candidate
 			}
 		}
 	}
 
-	// Sanitize for Cloudflare project name (alphanumeric and hyphens only)
-	name = strings.ToLower(name)
-	name = strings.ReplaceAll(name, " ", "-")
-	name = strings.ReplaceAll(name, "_", "-")
-	name = strings.ReplaceAll(name, ".", "-") // Convert dots to hyphens to separate words
+	base = stripDotGitSuffix(base)
+	if isEmptyPathBase(base) {
+		return "beads-viewer-pages"
+	}
 
-	// Remove any characters that aren't alphanumeric or hyphens
-	name = cfNonAlphanumRegex.ReplaceAllString(name, "")
+	sanitizeSegment := func(raw string) string {
+		s := strings.ToLower(raw)
+		s = strings.ReplaceAll(s, " ", "-")
+		s = strings.ReplaceAll(s, "_", "-")
+		s = strings.ReplaceAll(s, ".", "-") // Convert dots to hyphens to separate words
+		s = cfNonAlphanumRegex.ReplaceAllString(s, "")
+		s = cfMultipleHyphenRegex.ReplaceAllString(s, "-")
+		return strings.Trim(s, "-")
+	}
 
-	// Remove leading/trailing hyphens and collapse multiple hyphens
-	name = strings.Trim(name, "-")
-	name = cfMultipleHyphenRegex.ReplaceAllString(name, "-")
+	cleanBase := sanitizeSegment(base)
+	if cleanBase == "" {
+		return "beads-viewer-pages"
+	}
+
+	var name string
+	if appendPages && !strings.HasSuffix(cleanBase, "-pages") {
+		maxBaseLen := cloudflareProjectNameMaxLen - len("-pages")
+		if len(cleanBase) > maxBaseLen {
+			cleanBase = strings.TrimRight(cleanBase[:maxBaseLen], "-")
+		}
+		if cleanBase == "" {
+			return "beads-viewer-pages"
+		}
+		name = cleanBase + "-pages"
+	} else {
+		name = cleanBase
+		if len(name) > cloudflareProjectNameMaxLen {
+			name = strings.TrimRight(name[:cloudflareProjectNameMaxLen], "-")
+		}
+	}
 	if name == "" {
 		return "beads-viewer-pages"
 	}
@@ -370,6 +406,11 @@ func isGenericCloudflareOutputDir(name string) bool {
 	default:
 		return false
 	}
+}
+
+// ValidateProjectName checks whether projectName satisfies Cloudflare Pages naming rules.
+func ValidateProjectName(projectName string) error {
+	return validateCloudflareProjectName(projectName)
 }
 
 func validateCloudflareProjectName(projectName string) error {

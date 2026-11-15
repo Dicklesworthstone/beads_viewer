@@ -2876,10 +2876,78 @@ function getDefaultExportPreset() {
 // KEYBOARD SHORTCUTS
 // ============================================================================
 
+let keyboardShortcutHandler = null;
+
+function isElementVisibleInLayout(el) {
+    if (!el || !el.isConnected) return false;
+    if (el.getClientRects().length === 0) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    return getComputedStyle(el).visibility !== 'hidden';
+}
+
+function isInteractiveControlTarget(target) {
+    if (!target || typeof target !== 'object') return false;
+    if (['BUTTON', 'A', 'SELECT', 'SUMMARY'].includes(target.tagName)) {
+        return true;
+    }
+    if (typeof target.closest === 'function' && target.closest('button, a, select, summary, [role="button"]')) {
+        return true;
+    }
+    return false;
+}
+
+function isGraphShortcutScopeActive(e) {
+    const target = e.target;
+    if (target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable)) {
+        return false;
+    }
+    if (e.key === ' ' && isInteractiveControlTarget(target)) {
+        return false;
+    }
+
+    const container = store.container || document.getElementById('graph-container');
+    if (!isElementVisibleInLayout(container)) {
+        return false;
+    }
+
+    const rootEl = document.querySelector('[x-data]');
+    const appData = (typeof window !== 'undefined' && typeof window.Alpine !== 'undefined' && rootEl && typeof window.Alpine.$data === 'function')
+        ? window.Alpine.$data(rootEl)
+        : null;
+    if (appData) {
+        if (appData.view && appData.view !== 'graph') {
+            return false;
+        }
+        if (appData.selectedIssue || appData.showKeyboardHelp || appData.globalError || appData.showTriageModal || appData.showDiagnostics) {
+            return false;
+        }
+    }
+
+    const modalSelectors = [
+        '[x-show="selectedIssue"]',
+        '[x-show="showKeyboardHelp"]',
+        '[x-show="globalError"]',
+        '[x-show="showTriageModal"]',
+        '[x-show="showDiagnostics"]'
+    ];
+    for (const sel of modalSelectors) {
+        const modalEl = document.querySelector(sel);
+        if (isElementVisibleInLayout(modalEl)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 function setupKeyboardShortcuts() {
-    document.addEventListener('keydown', (e) => {
-        // Leave native editing and selection keys to form controls.
-        if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName)) return;
+    if (keyboardShortcutHandler) {
+        document.removeEventListener('keydown', keyboardShortcutHandler);
+    }
+
+    keyboardShortcutHandler = (e) => {
+        if (!isGraphShortcutScopeActive(e)) return;
 
         switch (e.key) {
             case 'Escape':
@@ -2953,8 +3021,8 @@ function setupKeyboardShortcuts() {
                 }
                 break;
             case ' ':
-                // Space to play/pause time-travel
-                if (timeTravelState.active) {
+                // Space to play/pause time-travel (when not focused on an interactive control)
+                if (timeTravelState.active && !isInteractiveControlTarget(e.target)) {
                     e.preventDefault();
                     togglePlay();
                 }
@@ -2972,7 +3040,8 @@ function setupKeyboardShortcuts() {
                 navigateByKCore(e.key === 'ArrowUp' ? 1 : -1);
                 break;
         }
-    });
+    };
+    document.addEventListener('keydown', keyboardShortcutHandler);
 }
 
 /**
@@ -3653,8 +3722,13 @@ function createTimelineControls() {
     }
     markers.hidden = !markers.childElementCount;
 
-    // Add styles
-    const style = document.createElement('style');
+    // Add styles (singleton element so re-initializing never duplicates <style> tags)
+    let style = document.getElementById('bv-time-travel-styles');
+    if (!style) {
+        style = document.createElement('style');
+        style.id = 'bv-time-travel-styles';
+        document.head.appendChild(style);
+    }
     style.textContent = `
         .time-travel-controls {
             position: absolute;
@@ -3772,7 +3846,6 @@ function createTimelineControls() {
             to { transform: scale(0); opacity: 0; }
         }
     `;
-    document.head.appendChild(style);
 
     // Append controls to graph container
     if (store.container) {
@@ -3893,6 +3966,14 @@ export function stopTimeTravel() {
 
     // Restore original nodes
     store.graph?.warmupTicks(timeTravelState.warmupTicks);
+    if (timeTravelState.originalNodes.length > 0) {
+        timeTravelState.originalNodes.forEach(n => {
+            if (n._ttOrigStatus !== undefined) {
+                n.status = n._ttOrigStatus;
+                delete n._ttOrigStatus;
+            }
+        });
+    }
     if (store.graph && timeTravelState.originalNodes.length > 0) {
         store.graph.graphData({
             nodes: timeTravelState.originalNodes,
@@ -3939,28 +4020,70 @@ function goToCommit(idx) {
     idx = Math.max(0, Math.min(idx, commits.length - 1));
     timeTravelState.currentIdx = idx;
 
-    // Calculate which nodes should be visible at this point
-    const visibleNodes = new Set(timeTravelState.history.initial_beads || []);
-    const visibleLinks = new Set();
+    // Calculate which nodes should be visible and their historical status at this point
+    const visibleNodes = new Set();
+    const historicalStatus = new Map();
+    (timeTravelState.history.initial_beads || []).forEach(id => {
+        visibleNodes.add(id);
+        historicalStatus.set(id, 'open');
+    });
 
     // Walk through history up to current index
     for (let i = 0; i <= idx; i++) {
         const commit = commits[i];
 
-        // Add nodes from this commit
+        // Add nodes from this commit (historically open when created)
         if (commit.beads_added) {
-            commit.beads_added.forEach(id => visibleNodes.add(id));
+            commit.beads_added.forEach(id => {
+                visibleNodes.add(id);
+                historicalStatus.set(id, 'open');
+            });
         }
 
-        // Remove closed nodes
+        // Remove closed nodes (historically closed once closed event has occurred)
         if (commit.beads_closed) {
-            commit.beads_closed.forEach(id => visibleNodes.delete(id));
+            commit.beads_closed.forEach(id => {
+                visibleNodes.delete(id);
+                historicalStatus.set(id, 'closed');
+            });
         }
+
+        // Restore reopened nodes back to active/open visibility
+        if (commit.beads_reopened) {
+            commit.beads_reopened.forEach(id => {
+                visibleNodes.add(id);
+                historicalStatus.set(id, 'open');
+            });
+        }
+
         // Record removal is distinct from completion; either hides the node.
         if (commit.beads_removed) {
-            commit.beads_removed.forEach(id => visibleNodes.delete(id));
+            commit.beads_removed.forEach(id => {
+                visibleNodes.delete(id);
+                historicalStatus.delete(id);
+            });
+        }
+
+        if (commit.bead_statuses && typeof commit.bead_statuses === 'object') {
+            Object.entries(commit.bead_statuses).forEach(([id, status]) => {
+                historicalStatus.set(id, status);
+            });
         }
     }
+
+    // Reflect historical status at commit idx in-place without breaking node references
+    timeTravelState.originalNodes.forEach(n => {
+        const histStatus = historicalStatus.get(n.id);
+        if (histStatus !== undefined) {
+            if (n._ttOrigStatus === undefined) {
+                n._ttOrigStatus = n.status;
+            }
+            n.status = histStatus;
+        } else if (n._ttOrigStatus !== undefined) {
+            n.status = n._ttOrigStatus;
+            delete n._ttOrigStatus;
+        }
+    });
 
     // Animate from the currently rendered state, including interrupted scrubs.
     stopTimelineTransition();
@@ -4146,8 +4269,17 @@ export function transformHistoryToTimeline(robotHistory) {
         });
     });
 
-    // Sort events by timestamp
-    allEvents.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    // Sort events deterministically by timestamp, lifecycle order, commit SHA, and bead ID
+    const EVENT_TYPE_ORDER = { created: 0, reopened: 1, modified: 2, closed: 3 };
+    allEvents.sort((a, b) => {
+        const timeDiff = new Date(a.timestamp) - new Date(b.timestamp);
+        if (timeDiff !== 0) return timeDiff;
+        const typeDiff = (EVENT_TYPE_ORDER[a.eventType] ?? 99) - (EVENT_TYPE_ORDER[b.eventType] ?? 99);
+        if (typeDiff !== 0) return typeDiff;
+        const shaDiff = String(a.commitSha || '').localeCompare(String(b.commitSha || ''));
+        if (shaDiff !== 0) return shaDiff;
+        return String(a.beadId || '').localeCompare(String(b.beadId || ''));
+    });
 
     // Group events by commit SHA
     const commitMap = new Map();
@@ -4160,6 +4292,7 @@ export function transformHistoryToTimeline(robotHistory) {
                 message: event.commitMessage,
                 beads_added: [],
                 beads_closed: [],
+                beads_reopened: [],
                 beads_modified: []
             });
         }
@@ -4169,15 +4302,28 @@ export function transformHistoryToTimeline(robotHistory) {
             commit.beads_added.push(event.beadId);
         } else if (event.eventType === 'closed') {
             commit.beads_closed.push(event.beadId);
+        } else if (event.eventType === 'reopened') {
+            commit.beads_reopened.push(event.beadId);
         } else if (event.eventType === 'modified') {
             commit.beads_modified.push(event.beadId);
         }
     });
 
-    // Convert to array sorted by date
-    const commits = [...commitMap.values()].sort((a, b) =>
-        new Date(a.date) - new Date(b.date)
-    );
+    // Convert to array sorted deterministically by date, then commit SHA
+    const commits = [...commitMap.values()].sort((a, b) => {
+        const timeDiff = new Date(a.date) - new Date(b.date);
+        if (timeDiff !== 0) return timeDiff;
+        return String(a.sha || '').localeCompare(String(b.sha || ''));
+    });
+
+    // Compute cumulative historical status per bead at each commit index
+    const runningStatuses = {};
+    commits.forEach(commit => {
+        commit.beads_added.forEach(id => { runningStatuses[id] = 'open'; });
+        commit.beads_reopened.forEach(id => { runningStatuses[id] = 'open'; });
+        commit.beads_closed.forEach(id => { runningStatuses[id] = 'closed'; });
+        commit.bead_statuses = { ...runningStatuses };
+    });
 
     return { commits };
 }

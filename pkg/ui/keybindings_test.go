@@ -1398,13 +1398,20 @@ func TestFocusKeyStateMachine(t *testing.T) {
 						}
 
 					case "b":
-						if st.name == "board" {
+						switch st.name {
+						case "board":
 							if m.focused != focusList || m.isBoardView {
 								t.Fatalf("board+b: focused=%v isBoardView=%v, want focusList/false", m.focused, m.isBoardView)
 							}
-						} else if m.focused != focusBoard || !m.isBoardView || m.isSprintView || m.showVelocityComparison {
-							t.Fatalf("%s+b: focused=%v isBoardView=%v sprint=%v vel=%v, want focusBoard/true/false/false",
-								st.name, m.focused, m.isBoardView, m.isSprintView, m.showVelocityComparison)
+						case "tree":
+							if m.focused != focusTree || m.tree.Mode() != TreeModeBlocking {
+								t.Fatalf("tree+b: focused=%v mode=%v, want focusTree/TreeModeBlocking", m.focused, m.tree.Mode())
+							}
+						default:
+							if m.focused != focusBoard || !m.isBoardView || m.isSprintView || m.showVelocityComparison {
+								t.Fatalf("%s+b: focused=%v isBoardView=%v sprint=%v vel=%v, want focusBoard/true/false/false",
+									st.name, m.focused, m.isBoardView, m.isSprintView, m.showVelocityComparison)
+							}
 						}
 
 					case "g":
@@ -1425,7 +1432,7 @@ func TestFocusKeyStateMachine(t *testing.T) {
 								t.Fatalf("%s+g combo expiry: focused=%v isGraphView=%v, want focusGraph/true",
 									st.name, m.focused, m.isGraphView)
 							}
-						case "flow_matrix", "attention", "label_dashboard":
+						case "flow_matrix", "attention", "label_dashboard", "insights", "insights_heatmap_drilldown", "velocity_comparison":
 							if m.focused != priorFocus || m.pendingComboKey != "" {
 								t.Fatalf("%s+g: focused=%v pendingComboKey=%q, want in-view GoToTop staying in %v",
 									st.name, m.focused, m.pendingComboKey, priorFocus)

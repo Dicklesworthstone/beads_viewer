@@ -192,12 +192,88 @@ function showToast(message, type = 'info') {
 
 // Database state
 const DB_STATE = {
-  sql: null,          // sql.js library instance
-  db: null,           // Database instance
-  cacheKey: null,     // OPFS cache key (hash)
-  source: 'unknown',  // 'network' | 'cache' | 'chunks'
-  fts5: null,         // Actual browser SQLite capability, not exported schema.
+  sql: null,            // sql.js library instance
+  db: null,             // Database instance
+  cacheKey: null,       // OPFS cache key (hash)
+  source: 'unknown',    // 'network' | 'cache' | 'chunks'
+  fts5: null,           // Actual browser SQLite capability, not exported schema.
+  referenceNowMs: null, // Snapshot reference timestamp (ms) for deterministic recency scoring
+  referenceDb: null,    // DB instance associated with referenceNowMs
 };
+if (typeof window !== 'undefined') {
+  window.DB_STATE = DB_STATE;
+}
+
+const KNOWN_STATUS_BADGES = new Set([
+  'open',
+  'in_progress',
+  'blocked',
+  'closed',
+  'deferred',
+  'draft',
+  'review',
+  'pinned',
+  'hooked',
+]);
+
+function statusBadgeClass(status) {
+  const normalized = String(status || '').trim().toLowerCase();
+  return KNOWN_STATUS_BADGES.has(normalized) ? `status-${normalized}` : 'status-deferred';
+}
+
+function getReferenceNowMs() {
+  if (!DB_STATE.db) {
+    return (typeof window !== 'undefined' && Number.isFinite(window.BV_REFERENCE_NOW_MS) && window.BV_REFERENCE_NOW_MS > 0)
+      ? window.BV_REFERENCE_NOW_MS
+      : Date.now();
+  }
+  if (DB_STATE.referenceDb === DB_STATE.db && Number.isFinite(DB_STATE.referenceNowMs) && DB_STATE.referenceNowMs > 0) {
+    return DB_STATE.referenceNowMs;
+  }
+
+  let resolved = null;
+  try {
+    const metaRows = execQuery(
+      `SELECT key, value FROM export_meta WHERE key IN ('generated_at', 'exported_at', 'created_at', 'timestamp')`
+    );
+    for (const key of ['generated_at', 'exported_at', 'created_at', 'timestamp']) {
+      const hit = metaRows.find(r => r.key === key && r.value);
+      if (hit) {
+        const parsed = Date.parse(hit.value);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          resolved = parsed;
+          break;
+        }
+      }
+    }
+  } catch {
+    // Ignore missing export_meta table
+  }
+
+  if (!resolved) {
+    try {
+      const maxUpdated = execScalar(
+        `SELECT MAX(updated_at) FROM issues WHERE updated_at IS NOT NULL AND updated_at != ''`
+      );
+      if (maxUpdated) {
+        const parsed = Date.parse(maxUpdated);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          resolved = parsed;
+        }
+      }
+    } catch {
+      // Ignore fallback query errors
+    }
+  }
+
+  const finalNow = resolved || Date.now();
+  DB_STATE.referenceDb = DB_STATE.db;
+  DB_STATE.referenceNowMs = finalNow;
+  if (typeof window !== 'undefined') {
+    window.BV_REFERENCE_NOW_MS = finalNow;
+  }
+  return finalNow;
+}
 
 // Graph engine state (WASM)
 const GRAPH_STATE = {
@@ -1028,7 +1104,7 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
 
   // Readiness comes from the full-source export snapshot, not visible edges.
   if (filters.hasBlockers === true || filters.hasBlockers === 'true') {
-    clauses.push(`${col('dependency_state')} <> 'satisfied'`);
+    clauses.push(`(${col('dependency_state')} <> 'satisfied' OR ${col('status')} = 'blocked')`);
   } else if (filters.hasBlockers === false || filters.hasBlockers === 'false') {
     clauses.push(`${col('is_actionable')} = 1`);
   }
@@ -1036,6 +1112,19 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
   // Blocking filter (has items depending on it)
   if (filters.isBlocking === true || filters.isBlocking === 'true') {
     clauses.push(`${col('blocks_count')} > 0`);
+  }
+
+  // Critical path filter
+  if (filters.criticalPath === true || filters.criticalPath === 'true') {
+    const cpIds = Array.isArray(filters.criticalPathIds)
+      ? filters.criticalPathIds
+      : (getCriticalPathSequence()?.path || []);
+    if (cpIds.length === 0) {
+      clauses.push('1 = 0');
+    } else {
+      clauses.push(`${col('id')} IN (${cpIds.map(() => '?').join(',')})`);
+      params.push(...cpIds);
+    }
   }
 
   // Label filter (JSON array contains)
@@ -1094,15 +1183,22 @@ function queryIssues(filters = {}, sort = 'priority', limit = 50, offset = 0) {
 
   // Sorting
   const sortMap = {
-    'priority': 'priority ASC, triage_score DESC',
+    'priority': 'priority ASC, COALESCE(triage_score, 0) DESC',
     'updated': 'updated_at DESC',
-    'score': 'triage_score DESC',
+    'score': 'COALESCE(triage_score, 0) DESC',
     'blocks': 'blocks_count DESC',
     'created': 'created_at DESC',
     'title': 'title ASC',
     'id': 'id ASC',
   };
-  sql += ` ORDER BY ${sortMap[sort] || sortMap.priority}`;
+  const rawSearch = typeof filters.search === 'string' ? normalizeSearchText(filters.search).trim() : '';
+  if (rawSearch && sort === 'score') {
+    const likeTerm = `%${escapeLikePattern(rawSearch)}%`;
+    sql += ` ORDER BY CASE WHEN LOWER(id) = LOWER(?) THEN 3 WHEN LOWER(title) LIKE LOWER(?) ESCAPE '\\' THEN 2 ELSE 1 END DESC, COALESCE(triage_score, 0) DESC`;
+    params.push(rawSearch, likeTerm);
+  } else {
+    sql += ` ORDER BY ${sortMap[sort] || sortMap.priority}`;
+  }
   sql += ` LIMIT ? OFFSET ?`;
   params.push(limit, offset);
 
@@ -1442,39 +1538,74 @@ function searchIssues(term, options = {}) {
   }
 
   let fetchLimit = limit;
+  const minCandidates = isShortQuery(term) ? HYBRID_CANDIDATE_MIN_SHORT : HYBRID_CANDIDATE_MIN;
   if (mode === 'hybrid') {
-    const minCandidates = isShortQuery(term) ? HYBRID_CANDIDATE_MIN_SHORT : HYBRID_CANDIDATE_MIN;
     fetchLimit = Math.max(limit * 2, offset + limit, minCandidates);
   }
   const fetchOffset = mode === 'hybrid' ? 0 : offset;
   sql += ` ORDER BY ${BM25_EXPR} LIMIT ? OFFSET ?`;
   queryParams.push(fetchLimit, fetchOffset);
 
+  const fallbackPoolLimit = Math.max(limit * 4, offset + limit, minCandidates);
   let rows = [];
+  let usedFTS = false;
   if (supportsFTS5() && ftsQuery) {
     try {
       rows = execQuery(sql, queryParams);
+      usedFTS = true;
     } catch {
       // Invalid FTS syntax can still use plain substring matching. Continue
-      // through the same hybrid scorer instead of silently losing ranking.
-      rows = queryIssues({ ...searchFilters, search: term }, 'score', fetchLimit, fetchOffset);
+      // through lexical or hybrid ranking cleanly.
+      rows = queryIssues({ ...searchFilters, search: term }, 'score', fallbackPoolLimit, 0);
     }
   } else {
-    rows = queryIssues({ ...searchFilters, search: term }, 'score', fetchLimit, fetchOffset);
-  }
-  if (isLikelyIssueID(term)) {
-    rows = promoteExactID(term, rows);
+    rows = queryIssues({ ...searchFilters, search: term }, 'score', fallbackPoolLimit, 0);
   }
 
   if (mode !== 'hybrid' || typeof HybridScorer === 'undefined' || typeof HYBRID_PRESETS === 'undefined') {
-    return rows.slice(0, limit);
+    if (usedFTS) {
+      const bm25Rows = rows.filter(r => r.bm25_score !== undefined && r.bm25_score !== null && Number.isFinite(Number(r.bm25_score)));
+      const maxBM25Text = bm25Rows.length > 0
+        ? Math.max(...bm25Rows.map(r => Math.abs(Number(r.bm25_score))), 0)
+        : 0;
+      rows = rows.map(r => {
+        const hasBM25 = r.bm25_score !== undefined && r.bm25_score !== null && Number.isFinite(Number(r.bm25_score));
+        return {
+          ...r,
+          text_score: hasBM25
+            ? (maxBM25Text > 0 ? Math.min(Math.abs(Number(r.bm25_score)) / maxBM25Text, 1) : 1.0)
+            : computeLexicalTextScore(r, term),
+        };
+      });
+      if (isLikelyIssueID(term)) {
+        rows = promoteExactID(term, rows);
+      }
+      return rows.slice(0, limit);
+    }
+
+    rows = rows
+      .map(r => ({ ...r, text_score: computeLexicalTextScore(r, term) }))
+      .sort((a, b) =>
+        (b.text_score - a.text_score) ||
+        ((a.priority ?? 2) - (b.priority ?? 2)) ||
+        String(a.id || '').localeCompare(String(b.id || ''))
+      );
+    if (isLikelyIssueID(term)) {
+      rows = promoteExactID(term, rows);
+    }
+    return rows.slice(offset, offset + limit);
   }
 
-  const maxBM25 = Math.max(...rows.map(r => Math.abs(r.bm25_score ?? 0)), 0);
+  getReferenceNowMs();
+  const bm25Rows = rows.filter(r => r.bm25_score !== undefined && r.bm25_score !== null && Number.isFinite(Number(r.bm25_score)));
+  const maxBM25 = bm25Rows.length > 0
+    ? Math.max(...bm25Rows.map(r => Math.abs(Number(r.bm25_score))), 0)
+    : 0;
   const { hasMetrics, maxPageRank } = getPageRankBounds();
   const normalized = rows.map(r => {
-    const textScore = maxBM25 > 0
-      ? (1 - Math.min(Math.abs(r.bm25_score ?? 0) / maxBM25, 1))
+    const hasBM25 = r.bm25_score !== undefined && r.bm25_score !== null && Number.isFinite(Number(r.bm25_score));
+    const textScore = hasBM25
+      ? (maxBM25 > 0 ? Math.min(Math.abs(Number(r.bm25_score)) / maxBM25, 1) : 1.0)
       : computeLexicalTextScore(r, term);
     let normalizedPageRank = 0.5;
     if (hasMetrics) {
@@ -1482,13 +1613,17 @@ function searchIssues(term, options = {}) {
         ? Math.min(1, Math.max(0, (Number(r.pagerank) || 0) / maxPageRank))
         : 0;
     }
+    const isDepBlocked = (r.status === 'open' || r.status === 'in_progress') &&
+      ((r.dependency_state && r.dependency_state !== 'satisfied') || Number(r.blocker_count ?? r.blocked_by_count ?? 0) > 0);
+    const scoringStatus = isDepBlocked ? 'blocked' : r.status;
     return {
       ...r,
+      _displayStatus: r.status,
       textScore,
-      blockerCount: r.blocker_count ?? r.blocked_by_count ?? 0,
+      blockerCount: r.blocks_count ?? r.dependent_count ?? 0,
       updatedAt: r.updated_at,
       pagerank: normalizedPageRank,
-      status: r.status,
+      status: scoringStatus,
       priority: r.priority,
     };
   });
@@ -1509,8 +1644,9 @@ function searchIssues(term, options = {}) {
 
   return ranked
     .slice(offset, offset + limit)
-    .map(r => ({
+    .map(({ _displayStatus, ...r }) => ({
       ...r,
+      status: _displayStatus ?? r.status,
       text_score: r.textScore,
     }));
 }
@@ -1640,11 +1776,11 @@ function getStats() {
     console.error('[Stats] Error loading status counts:', err);
   }
 
-  // Missing prerequisites and inherited parent gates also withhold readiness.
+  // Explicit 'blocked' lifecycle status plus dependency-blocked open/in_progress issues.
   stats.blocked = execScalar(`
     SELECT COUNT(*) FROM issue_overview_mv
-    WHERE dependency_state <> 'satisfied'
-    AND status IN ('open', 'in_progress')
+    WHERE status = 'blocked'
+    OR (dependency_state <> 'satisfied' AND status IN ('open', 'in_progress'))
   `) || 0;
 
   // Planning readiness includes deferral and lifecycle at the export clock.
@@ -2037,10 +2173,17 @@ function getIssuesBySlack(limit = 10, showZeroSlack = true) {
     const slackValues = GRAPH_STATE.graph.slack();
     if (!slackValues || slackValues.length === 0) return [];
 
-    const issues = getRankedGraphIssues(slackValues, 'slack', limit,
-      value => !showZeroSlack || value === 0);
+    const activeIds = new Set(
+      execQuery(`SELECT id FROM issue_overview_mv WHERE status NOT IN ('closed', 'tombstone')`).map(r => r.id)
+    );
+    const issues = getRankedGraphIssues(
+      slackValues,
+      'slack',
+      Math.max(limit * 2, activeIds.size || limit),
+      value => !showZeroSlack || Math.abs(value) < 1e-9
+    ).filter(issue => issue && activeIds.has(issue.id)).slice(0, limit);
     for (const issue of issues) {
-      issue.on_critical_path = issue.slack === 0;
+      issue.on_critical_path = Math.abs(issue.slack || 0) < 1e-9;
     }
     return issues;
   } catch (e) {
@@ -2280,10 +2423,13 @@ function getIssueDependencyGroups(id) {
 // URL State Sync - Shareable filtered views
 // ============================================================================
 
+const VALID_SEARCH_MODES = new Set(['text', 'hybrid']);
+const VALID_SEARCH_PRESETS = new Set(['default', 'bug-hunting', 'sprint-planning', 'impact-first', 'text-only']);
+
 /**
  * Serialize filters to URL search params
  */
-function filtersToURL(filters, sort, searchQuery) {
+function filtersToURL(filters = {}, sort = 'priority', searchQuery = '', searchMode = 'text', searchPreset = 'default') {
   const params = new URLSearchParams();
 
   if (filters.status?.length) {
@@ -2326,8 +2472,20 @@ function filtersToURL(filters, sort, searchQuery) {
     params.set('blocking', 'true');
   }
 
+  if (filters.criticalPath === true || filters.criticalPath === 'true') {
+    params.set('critical', 'true');
+  }
+
   if (searchQuery) {
     params.set('q', searchQuery);
+  }
+
+  if (searchMode && VALID_SEARCH_MODES.has(searchMode) && searchMode !== 'text') {
+    params.set('mode', searchMode);
+  }
+
+  if (searchPreset && VALID_SEARCH_PRESETS.has(searchPreset) && searchPreset !== 'default') {
+    params.set('preset', searchPreset);
   }
 
   if (sort && sort !== 'priority') {
@@ -2343,7 +2501,15 @@ function filtersToURL(filters, sort, searchQuery) {
 function filtersFromURL() {
   const hash = window.location.hash;
   const queryIndex = hash.indexOf('?');
-  if (queryIndex === -1) return { filters: {}, sort: 'priority', searchQuery: '' };
+  if (queryIndex === -1) {
+    return {
+      filters: {},
+      sort: 'priority',
+      searchQuery: '',
+      searchMode: 'text',
+      searchPreset: 'default',
+    };
+  }
 
   const params = new URLSearchParams(hash.slice(queryIndex + 1));
 
@@ -2375,30 +2541,42 @@ function filtersFromURL() {
   }
 
   const blockedParam = params.get('blocked');
-  if (blockedParam === 'true') {
+  if (blockedParam === 'true' || blockedParam === '1') {
     filters.hasBlockers = true;
-  } else if (blockedParam === 'false') {
+  } else if (blockedParam === 'false' || blockedParam === '0') {
     filters.hasBlockers = false;
   }
 
   const blockingParam = params.get('blocking');
-  if (blockingParam === 'true') {
+  if (blockingParam === 'true' || blockingParam === '1') {
     filters.isBlocking = true;
   }
+
+  const criticalParam = params.get('critical');
+  if (criticalParam === 'true' || criticalParam === '1') {
+    filters.criticalPath = true;
+  }
+
+  const rawMode = params.get('mode') || 'text';
+  const searchMode = VALID_SEARCH_MODES.has(rawMode) ? rawMode : 'text';
+  const rawPreset = params.get('preset') || 'default';
+  const searchPreset = VALID_SEARCH_PRESETS.has(rawPreset) ? rawPreset : 'default';
 
   return {
     filters,
     sort: params.get('sort') || 'priority',
     searchQuery: params.get('q') || '',
+    searchMode,
+    searchPreset,
   };
 }
 
 /**
  * Update URL with current filter state (without page reload)
  */
-function syncFiltersToURL(view, filters, sort, searchQuery) {
+function syncFiltersToURL(view, filters, sort, searchQuery, searchMode = 'text', searchPreset = 'default') {
   if (window.location.hash.startsWith('#/issue/')) return;
-  const paramString = filtersToURL(filters, sort, searchQuery);
+  const paramString = filtersToURL(filters, sort, searchQuery, searchMode, searchPreset);
   const baseHash = `#/${view}`;
   const newHash = paramString ? `${baseHash}?${paramString}` : baseHash;
 
@@ -2521,8 +2699,8 @@ function navigateToIssue(id) {
 /**
  * Navigate to issues list with filters
  */
-function navigateToIssues(filters = {}, sort = 'priority', search = '') {
-  const params = filtersToURL(filters, sort, search);
+function navigateToIssues(filters = {}, sort = 'priority', search = '', searchMode = 'text', searchPreset = 'default') {
+  const params = filtersToURL(filters, sort, search, searchMode, searchPreset);
   navigate(`/issues${params ? '?' + params : ''}`);
 }
 
@@ -2626,22 +2804,101 @@ function safeNum(value, decimals = 2, suffix = '') {
   return value.toFixed(decimals) + suffix;
 }
 
+const DEFAULT_TRIAGE_WEIGHTS = {
+  pagerank: 0.22,
+  betweenness: 0.20,
+  blocker_ratio: 0.13,
+  priority_boost: 0.10,
+  time_to_impact: 0.10,
+  urgency: 0.10,
+  risk: 0.10,
+  staleness: 0.05,
+};
+
+function resolveEffectiveTriageWeights(triageData) {
+  const base = { ...DEFAULT_TRIAGE_WEIGHTS };
+  if (!triageData || typeof triageData !== 'object') return base;
+  const root = triageData.triage && typeof triageData.triage === 'object' ? triageData.triage : triageData;
+  const fb = triageData.feedback || root.feedback || null;
+  const candidate =
+    fb?.effective_weights ||
+    fb?.adjusted_weights ||
+    fb?.weights ||
+    triageData.effective_weights ||
+    root.effective_weights ||
+    triageData.weights ||
+    root.weights ||
+    null;
+
+  const pickNum = (obj, ...keys) => {
+    if (!obj || typeof obj !== 'object') return undefined;
+    for (const k of keys) {
+      if (typeof obj[k] === 'number' && Number.isFinite(obj[k]) && obj[k] >= 0) {
+        return obj[k];
+      }
+    }
+    return undefined;
+  };
+
+  if (candidate && typeof candidate === 'object') {
+    const mapped = {
+      pagerank: pickNum(candidate, 'pagerank', 'PageRank'),
+      betweenness: pickNum(candidate, 'betweenness', 'Betweenness'),
+      blocker_ratio: pickNum(candidate, 'blocker_ratio', 'BlockerRatio', 'blockers'),
+      priority_boost: pickNum(candidate, 'priority_boost', 'PriorityBoost', 'priority'),
+      time_to_impact: pickNum(candidate, 'time_to_impact', 'TimeToImpact', 'time'),
+      urgency: pickNum(candidate, 'urgency', 'Urgency'),
+      risk: pickNum(candidate, 'risk', 'Risk'),
+      staleness: pickNum(candidate, 'staleness', 'Staleness'),
+    };
+    if (Object.values(mapped).some(v => v !== undefined)) {
+      for (const [k, v] of Object.entries(mapped)) {
+        if (v !== undefined) base[k] = v;
+      }
+      return base;
+    }
+  }
+
+  const byFactor = fb?.by_factor;
+  if (byFactor && typeof byFactor === 'object') {
+    let adjusted = false;
+    for (const k of Object.keys(base)) {
+      const adj = byFactor[k]?.weight_adjustment ?? byFactor[k]?.multiplier;
+      if (typeof adj === 'number' && Number.isFinite(adj) && adj > 0) {
+        base[k] = base[k] * adj;
+        adjusted = true;
+      }
+    }
+    if (adjusted) {
+      const sum = Object.values(base).reduce((a, b) => a + b, 0);
+      if (sum > 0) {
+        for (const k of Object.keys(base)) {
+          base[k] = base[k] / sum;
+        }
+      }
+    }
+  }
+
+  return base;
+}
+
 /**
  * Calculate score breakdown as percentages for visualization
  * Returns array of { name, value, percent, color, weight } sorted by contribution
  */
-function getScoreBreakdownBars(breakdown) {
+function getScoreBreakdownBars(breakdown, weightsOverride = null) {
   if (!breakdown) return [];
 
+  const effWeights = weightsOverride || DEFAULT_TRIAGE_WEIGHTS;
   const components = [
-    { name: 'PageRank', key: 'pagerank', color: '#3b82f6', colorClass: 'sb-c-pagerank', weight: 0.22 },
-    { name: 'Betweenness', key: 'betweenness', color: '#f97316', colorClass: 'sb-c-betweenness', weight: 0.20 },
-    { name: 'Blocker Ratio', key: 'blocker_ratio', color: '#ef4444', colorClass: 'sb-c-blocker_ratio', weight: 0.13 },
-    { name: 'Priority', key: 'priority_boost', color: '#8b5cf6', colorClass: 'sb-c-priority_boost', weight: 0.10 },
-    { name: 'Time Impact', key: 'time_to_impact', color: '#06b6d4', colorClass: 'sb-c-time_to_impact', weight: 0.10 },
-    { name: 'Urgency', key: 'urgency', color: '#ec4899', colorClass: 'sb-c-urgency', weight: 0.10 },
-    { name: 'Risk', key: 'risk', color: '#f59e0b', colorClass: 'sb-c-risk', weight: 0.10 },
-    { name: 'Staleness', key: 'staleness', color: '#6b7280', colorClass: 'sb-c-staleness', weight: 0.05 },
+    { name: 'PageRank', key: 'pagerank', color: '#3b82f6', colorClass: 'sb-c-pagerank', weight: effWeights.pagerank ?? 0.22 },
+    { name: 'Betweenness', key: 'betweenness', color: '#f97316', colorClass: 'sb-c-betweenness', weight: effWeights.betweenness ?? 0.20 },
+    { name: 'Blocker Ratio', key: 'blocker_ratio', color: '#ef4444', colorClass: 'sb-c-blocker_ratio', weight: effWeights.blocker_ratio ?? 0.13 },
+    { name: 'Priority', key: 'priority_boost', color: '#8b5cf6', colorClass: 'sb-c-priority_boost', weight: effWeights.priority_boost ?? 0.10 },
+    { name: 'Time Impact', key: 'time_to_impact', color: '#06b6d4', colorClass: 'sb-c-time_to_impact', weight: effWeights.time_to_impact ?? 0.10 },
+    { name: 'Urgency', key: 'urgency', color: '#ec4899', colorClass: 'sb-c-urgency', weight: effWeights.urgency ?? 0.10 },
+    { name: 'Risk', key: 'risk', color: '#f59e0b', colorClass: 'sb-c-risk', weight: effWeights.risk ?? 0.10 },
+    { name: 'Staleness', key: 'staleness', color: '#6b7280', colorClass: 'sb-c-staleness', weight: effWeights.staleness ?? 0.05 },
   ];
 
   const total = components.reduce((sum, c) => sum + (breakdown[c.key] || 0), 0);
@@ -2857,6 +3114,7 @@ function beadsApp() {
       assignee: '',    // Single select
       hasBlockers: null, // true/false/null
       isBlocking: null,  // true/false/null
+      criticalPath: false, // Filter to critical path issues
     },
     sort: 'priority',
     searchQuery: '',
@@ -2928,6 +3186,7 @@ function beadsApp() {
     topByKCore: [],
     articulationPoints: [],
     criticalPathSlack: [], // Issues with 0 slack (on critical path)
+    flexibleSlackIssues: [], // Issues with positive schedule slack
     cycleInfo: null,
     topImpactIssues: [],
 
@@ -3010,8 +3269,8 @@ function beadsApp() {
 
       // Listen for keyboard shortcuts (vim-style navigation)
       window.addEventListener('keydown', (e) => {
-        // Skip if typing in input fields
-        const isInput = ['INPUT', 'TEXTAREA'].includes(e.target.tagName);
+        // Skip if typing in input or select fields
+        const isInput = ['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target?.tagName) || Boolean(e.target?.isContentEditable);
 
         // '/' focuses search (works globally)
         if (e.key === '/' && !isInput) {
@@ -3037,8 +3296,9 @@ function beadsApp() {
           return;
         }
 
-        // 'c' toggles critical path highlighting
+        // 'c' toggles critical path highlighting (scoped away from graph view, where graph.js handles 'c')
         if (e.key === 'c' && !isInput) {
+          if (this.view === 'graph') return;
           this.toggleCriticalPath();
           return;
         }
@@ -3133,56 +3393,54 @@ function beadsApp() {
       });
 
       // Dashboard chart click-to-filter integration
-      document.addEventListener('bv-chart:priorityClick', (e) => {
-        const priority = e.detail?.priority;
-        if (priority === undefined || priority === null) return;
+      const applyChartDrilldown = (filterOverrides) => {
         this.selectedIssue = null;
         this.graphDetailNode = null;
+        this.showCriticalPath = false;
+        this.criticalPathData = null;
+        this.criticalPathAnimationStep = -1;
+        this.searchQuery = '';
         this.filters = {
           status: [],
           type: [],
-          priority: [Number(priority)],
+          priority: [],
           labels: [],
           assignee: '',
           hasBlockers: null,
           isBlocking: null,
+          criticalPath: false,
+          ...filterOverrides,
         };
         this.page = 1;
-        navigateToIssues(this.filters, this.sort, this.searchQuery);
+        navigateToIssues(this.filters, this.sort, '', this.searchMode, this.searchPreset);
+      };
+      document.addEventListener('bv-chart:priorityClick', (e) => {
+        const priority = e.detail?.priority;
+        if (priority === undefined || priority === null) return;
+        applyChartDrilldown({ priority: [Number(priority)] });
       });
       document.addEventListener('bv-chart:typeClick', (e) => {
         const type = e.detail?.type;
         if (!type) return;
-        this.selectedIssue = null;
-        this.graphDetailNode = null;
-        this.filters = {
-          status: [],
-          type: [String(type)],
-          priority: [],
-          labels: [],
-          assignee: '',
-          hasBlockers: null,
-          isBlocking: null,
-        };
-        this.page = 1;
-        navigateToIssues(this.filters, this.sort, this.searchQuery);
+        applyChartDrilldown({ type: [String(type)] });
+      });
+      document.addEventListener('bv-chart:labelClick', (e) => {
+        const label = e.detail?.label;
+        if (!label) return;
+        applyChartDrilldown({ labels: [String(label)] });
+      });
+      document.addEventListener('bv-chart:blockerClick', (e) => {
+        const issueId = e.detail?.id || e.detail?.issueId;
+        if (issueId) {
+          this.showIssue(String(issueId));
+          return;
+        }
+        applyChartDrilldown({ isBlocking: true });
       });
       document.addEventListener('bv-chart:heatmapClick', (e) => {
         const labels = [...new Set([e.detail?.fromLabel, e.detail?.toLabel].filter(Boolean))];
         if (labels.length === 0) return;
-        this.selectedIssue = null;
-        this.graphDetailNode = null;
-        this.filters = {
-          status: [],
-          type: [],
-          priority: [],
-          labels,
-          assignee: '',
-          hasBlockers: null,
-          isBlocking: null,
-        };
-        this.page = 1;
-        navigateToIssues(this.filters, this.sort, this.searchQuery);
+        applyChartDrilldown({ labels });
       });
 
       try {
@@ -3205,6 +3463,7 @@ function beadsApp() {
         // Load initial data
         this.meta = getMeta();
         window.BV_META = this.meta;
+        getReferenceNowMs();
         this.stats = getStats();
         DIAGNOSTICS.issueCount = this.stats.total || 0;
         if (typeof window.initHybridWasmScorer === 'function') {
@@ -3260,6 +3519,7 @@ function beadsApp() {
           this.topByKCore = getTopByKCore(10);
           this.articulationPoints = getArticulationPoints();
           this.criticalPathSlack = getIssuesBySlack(10, true); // Zero slack = critical path
+          this.flexibleSlackIssues = getIssuesBySlack(10, false).filter(i => (i.slack || 0) > 0);
         }
 
         // Handle the initial hash route or a host-rewritten clean path after
@@ -3362,9 +3622,28 @@ function beadsApp() {
           this.selectedIssue = null;
           this.showDepGraph = false;
           this.whatIfResult = null;
-          this.filters = { ...this.filters, ...urlState.filters };
+          this.filters = {
+            status: [],
+            type: [],
+            priority: [],
+            labels: [],
+            assignee: '',
+            hasBlockers: null,
+            isBlocking: null,
+            criticalPath: false,
+            ...urlState.filters,
+          };
+          if (this.filters.criticalPath && this.graphReady) {
+            this.criticalPathData = this.criticalPathData || getCriticalPathSequence();
+            this.showCriticalPath = Boolean(this.criticalPathData?.path?.length);
+          } else if (!this.filters.criticalPath) {
+            this.showCriticalPath = false;
+            this.criticalPathData = null;
+          }
           this.sort = urlState.sort;
           this.searchQuery = urlState.searchQuery;
+          this.searchMode = urlState.searchMode || 'text';
+          this.searchPreset = urlState.searchPreset || 'default';
           this.page = 1;
           this.loadIssues();
           break;
@@ -3669,6 +3948,9 @@ function beadsApp() {
         ...this.filters,
         search: this.searchQuery,
       };
+      if (filters.criticalPath) {
+        filters.criticalPathIds = this.criticalPathData?.path || getCriticalPathSequence()?.path || [];
+      }
 
       if (this.searchQuery) {
         this.issues = searchIssues(this.searchQuery, {
@@ -3686,7 +3968,7 @@ function beadsApp() {
 
       // Sync URL state (only on issues view)
       if (this.view === 'issues') {
-        syncFiltersToURL('issues', this.filters, this.sort, this.searchQuery);
+        syncFiltersToURL('issues', this.filters, this.sort, this.searchQuery, this.searchMode, this.searchPreset);
       }
     },
 
@@ -3706,6 +3988,49 @@ function beadsApp() {
     },
 
     /**
+     * Reset all filters cleanly, apply stat-card overrides, navigate to Issues view, and sync URL
+     */
+    navigateToIssuesWithFilter(overrides = {}) {
+      const normalizeArr = (val) => {
+        if (val === undefined || val === null || val === '' || val === 'all') return [];
+        return Array.isArray(val) ? [...val] : [val];
+      };
+      const nextFilters = {
+        status: normalizeArr(overrides.status),
+        type: normalizeArr(overrides.type),
+        priority: normalizeArr(overrides.priority),
+        labels: Array.isArray(overrides.labels) ? [...overrides.labels] : normalizeArr(overrides.labels),
+        assignee: overrides.assignee || '',
+        hasBlockers: overrides.hasBlockers === true || overrides.hasBlockers === false ? overrides.hasBlockers : null,
+        isBlocking: overrides.isBlocking === true ? true : null,
+        criticalPath: Boolean(overrides.criticalPath),
+      };
+      this.filters = nextFilters;
+      if (!nextFilters.criticalPath) {
+        this.showCriticalPath = false;
+        this.criticalPathData = null;
+        this.criticalPathAnimationStep = -1;
+      }
+      this.searchQuery = '';
+      this.selectedIssue = null;
+      this.graphDetailNode = null;
+      this.page = 1;
+      this.view = 'issues';
+      this.loadIssues();
+    },
+
+    /**
+     * Clear critical path filter & highlighting
+     */
+    clearCriticalPathFilter() {
+      this.filters.criticalPath = false;
+      this.showCriticalPath = false;
+      this.criticalPathData = null;
+      this.criticalPathAnimationStep = -1;
+      this.applyFilter();
+    },
+
+    /**
      * Clear all filters
      */
     clearFilters() {
@@ -3717,7 +4042,11 @@ function beadsApp() {
         assignee: '',
         hasBlockers: null,
         isBlocking: null,
+        criticalPath: false,
       };
+      this.showCriticalPath = false;
+      this.criticalPathData = null;
+      this.criticalPathAnimationStep = -1;
       this.searchQuery = '';
       this.sort = 'priority';
       this.page = 1;
@@ -3735,6 +4064,7 @@ function beadsApp() {
              this.filters.assignee ||
              this.filters.hasBlockers !== null ||
              this.filters.isBlocking !== null ||
+             Boolean(this.filters.criticalPath) ||
              this.searchQuery;
     },
 
@@ -3763,10 +4093,15 @@ function beadsApp() {
     },
 
     /**
-     * Search issues
+     * Search issues (switches from non-issues views to Issues when typing in global header search)
      */
     search() {
       this.page = 1;
+      if (String(this.searchQuery || '').trim().length > 0 && this.view !== 'issues') {
+        this.selectedIssue = null;
+        this.graphDetailNode = null;
+        this.view = 'issues';
+      }
       this.loadIssues();
     },
 
@@ -3845,7 +4180,7 @@ function beadsApp() {
       // Navigate back
       const currentView = this.view;
       if (currentView === 'issues') {
-        navigateToIssues(this.filters, this.sort, this.searchQuery);
+        navigateToIssues(this.filters, this.sort, this.searchQuery, this.searchMode, this.searchPreset);
       } else {
         navigate('/' + currentView);
       }
@@ -4109,14 +4444,23 @@ function beadsApp() {
         if (!this.criticalPathData || this.criticalPathData.path.length === 0) {
           showToast('No critical path found (may have cycles)', 'info');
           this.showCriticalPath = false;
+          this.filters.criticalPath = false;
           return;
         }
+        this.filters.criticalPath = true;
         showToast(`Critical path: ${this.criticalPathData.length} issues deep`, 'success');
+        if (this.view === 'issues') {
+          this.applyFilter();
+        }
         // Start animation
         this.animateCriticalPath();
       } else {
+        this.filters.criticalPath = false;
         this.criticalPathData = null;
         this.criticalPathAnimationStep = -1;
+        if (this.view === 'issues') {
+          this.applyFilter();
+        }
       }
     },
 
@@ -4265,7 +4609,7 @@ function beadsApp() {
       this.graphDetailNode = null;
       this.page = 1;
       if (this.view !== 'issues') {
-        navigateToIssues(this.filters, this.sort, this.searchQuery);
+        navigateToIssues(this.filters, this.sort, this.searchQuery, this.searchMode, this.searchPreset);
       } else {
         this.loadIssues();
       }
@@ -4393,7 +4737,61 @@ function beadsApp() {
      */
     getIssue,
     isIssueOverdue,
-    getScoreBreakdownBars,
+    statusBadgeClass,
+    getScoreBreakdownBars(breakdown) {
+      return getScoreBreakdownBars(breakdown, this.getEffectiveTriageWeights());
+    },
+
+    getEffectiveTriageWeights() {
+      return resolveEffectiveTriageWeights(this.triageData);
+    },
+
+    getTriageWeightComponents() {
+      const w = this.getEffectiveTriageWeights();
+      return [
+        { key: 'pagerank', label: '🎯 PageRank', barClass: 'bg-blue-500', weight: w.pagerank },
+        { key: 'betweenness', label: '🔀 Between.', barClass: 'bg-orange-500', weight: w.betweenness },
+        { key: 'blocker_ratio', label: '🚧 Blockers', barClass: 'bg-red-500', weight: w.blocker_ratio },
+        { key: 'priority_boost', label: '⭐ Priority', barClass: 'bg-yellow-500', weight: w.priority_boost },
+        { key: 'time_to_impact', label: '⚡ Time', barClass: 'bg-cyan-500', weight: w.time_to_impact },
+        { key: 'urgency', label: '🔥 Urgency', barClass: 'bg-rose-500', weight: w.urgency },
+        { key: 'risk', label: '⚠️ Risk', barClass: 'bg-purple-500', weight: w.risk },
+        { key: 'staleness', label: '⏰ Staleness', barClass: 'bg-gray-400', weight: w.staleness },
+      ].map(item => {
+        const weight = Number(item.weight) || 0;
+        const pct = Math.max(0, Math.min(100, Math.round(weight * 100)));
+        return {
+          ...item,
+          weight,
+          value: weight,
+          pct,
+          pctText: `${pct}%`,
+        };
+      });
+    },
+
+    getTriageAlerts() {
+      const raw = this.triageData?.alerts ?? this.triageData?.triage?.alerts;
+      if (!Array.isArray(raw)) return [];
+      return raw.map((item, idx) => {
+        if (typeof item === 'string') {
+          return {
+            key: `alert-${idx}`,
+            severity: 'warning',
+            type: 'alert',
+            message: item,
+            issue_id: null,
+          };
+        }
+        return {
+          key: item?.id || `${item?.type || 'alert'}-${item?.issue_id || idx}-${idx}`,
+          severity: String(item?.severity || 'warning').toLowerCase(),
+          type: item?.type || item?.kind || 'alert',
+          message: item?.message || item?.summary || item?.description || String(item?.type || 'Alert'),
+          issue_id: item?.issue_id || item?.bead_id || null,
+        };
+      });
+    },
 
     /**
      * Dismiss the current error modal
@@ -4426,6 +4824,9 @@ window.beadsViewer = {
   getIssueDependencies,
   getIssueDependencyGroups,
   isIssueOverdue,
+  statusBadgeClass,
+  getReferenceNowMs,
+  resolveEffectiveTriageWeights,
   getScoreBreakdownBars,
   getStats,
   getMeta,
@@ -4475,6 +4876,7 @@ window.beadsViewer = {
   getTopByBetweenness,
   getTopByCriticalPath,
   getTopByEigenvector,
+  getIssuesBySlack,
   getCycleInfo,
 
   // Error handling

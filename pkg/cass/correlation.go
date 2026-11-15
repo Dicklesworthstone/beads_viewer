@@ -399,31 +399,26 @@ func splitIntoWords(text string) []string {
 	})
 }
 
-// calculateSearchDays determines the time window for searching.
+// calculateSearchDays determines the time window (in days back from now) for searching cass sessions.
+// Because `cass search --days N` filters relative to wall-clock today, both open and closed
+// beads must measure from issue.CreatedAt to c.now() (+ 7d buffer), clamped to [7, 365].
 func (c *Correlator) calculateSearchDays(issue *model.Issue) int {
-	// For closed issues, search the window between creation and closure
-	if issue.ClosedAt != nil && !issue.CreatedAt.IsZero() {
-		days := int(issue.ClosedAt.Sub(issue.CreatedAt).Hours() / 24)
-		if days < 1 {
-			days = 1
-		}
-		// Add buffer
-		return days + 7
+	if issue == nil || issue.CreatedAt.IsZero() {
+		return 30 // Default
 	}
 
-	// For open issues, use time since creation
-	if !issue.CreatedAt.IsZero() {
-		days := int(c.now().Sub(issue.CreatedAt).Hours() / 24)
-		if days < 1 {
-			days = 7
-		}
-		if days > 90 {
-			days = 90 // Cap at 90 days
-		}
-		return days
+	nowFn := c.now
+	if nowFn == nil {
+		nowFn = time.Now
 	}
-
-	return 30 // Default
+	days := int(nowFn().Sub(issue.CreatedAt).Hours()/24) + 7
+	if days < 7 {
+		days = 7
+	}
+	if days > 365 {
+		days = 365
+	}
+	return days
 }
 
 // scoreKeywordMatch scores how well a result matches keywords.

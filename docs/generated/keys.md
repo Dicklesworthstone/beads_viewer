@@ -4,10 +4,10 @@
 | :--- | :---: | :--- |
 | **all** | `j` | Move down |
 |  | `k` | Move up |
-| **list,detail,board,graph,tree,actionable,history,flow,attention,label** | `G` | Go to end |
-| **list,detail,board,actionable,flow,attention,label** | `home` | Go to start |
+| **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity** | `G` | Go to end |
+| **list,detail,board,insights,actionable,flow,attention,label,velocity** | `home` | Go to start |
 | **board,tree** | `gg` | Go to start |
-| **list,detail,board,graph,tree,actionable,attention** | `ctrl+d` | Page down |
+| **list,detail,board,graph,insights,tree,actionable,attention,velocity** | `ctrl+d` | Page down |
 |  | `ctrl+u` | Page up |
 | **list,detail,board,graph,insights,actionable,history** | `enter` | Open details |
 | **all** | `esc` | Back/close (list: clear filters) |
@@ -16,8 +16,9 @@
 |  | `f5` | Refresh issues from disk |
 | **list,detail** | `a` | Actionable view |
 |  | `b` | Board view |
-|  | `g` | Graph view |
-|  | `h` | History view |
+| **list** | `g` | Graph view |
+| **detail** | `g` | Go to top |
+| **list,detail** | `h` | History view |
 |  | `i` | Insights panel |
 |  | `E` | Tree view (parent-child hierarchy) |
 |  | `f` | Flow matrix (cross-label dependencies) |
@@ -51,7 +52,8 @@
 | **list,detail,board,graph,tree,actionable,insights,flow,history** | `O` | Open in $EDITOR |
 | **list** | `'` | Recipe picker |
 |  | `U` | Self-update check |
-| **list,detail,board,tree,history** | `V` | Cass sessions |
+| **list,detail,board,graph,insights,tree,actionable,history** | `V` | Cass sessions |
+| **list,detail** | `\` | Toggle split view |
 | **graph** | `hjkl` | Navigate graph |
 |  | `H` | Scroll left |
 |  | `L` | Scroll right |
@@ -85,11 +87,14 @@
 |  | `tab` | Toggle detail pane |
 |  | `PgUp` | Page up |
 |  | `PgDn` | Page down |
+|  | `b` | Toggle hierarchy / blocking tree mode |
+|  | `m` | Toggle hierarchy / blocking tree mode |
 |  | `E` | Exit tree view |
 | **actionable** | `PgUp` | Page up |
 |  | `PgDn` | Page down |
 |  | `a` | Close actionable view |
-| **insights** | `h` | Previous panel |
+| **insights** | `g` | Go to top |
+|  | `h` | Previous panel |
 |  | `l` | Next panel |
 |  | `tab` | Next panel |
 |  | `shift+tab` | Previous panel |
@@ -126,7 +131,8 @@
 |  | `d` | Label drilldown |
 |  | `v` | Velocity comparison |
 |  | `[` | Close label dashboard |
-| **velocity** | `j` | Next label row |
+| **velocity** | `g` | Go to top |
+|  | `j` | Next label row |
 |  | `k` | Previous label row |
 |  | `enter` | Filter list by label |
 |  | `v` | Return to label dashboard |

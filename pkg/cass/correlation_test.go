@@ -713,7 +713,21 @@ func TestCorrelator_CalculateSearchDays(t *testing.T) {
 		now: func() time.Time { return now },
 	}
 
-	t.Run("closed issue", func(t *testing.T) {
+	t.Run("closed issue long ago measures from CreatedAt to now", func(t *testing.T) {
+		closedAt := now.Add(-60 * 24 * time.Hour)
+		issue := &model.Issue{
+			CreatedAt: now.Add(-70 * 24 * time.Hour),
+			ClosedAt:  &closedAt,
+		}
+
+		days := correlator.calculateSearchDays(issue)
+		// Created 70d ago + 7d buffer = 77 days (>= 67 days so sessions around close are included)
+		if days != 77 {
+			t.Errorf("calculateSearchDays for closed issue (70d old, closed 60d ago) = %d, want 77", days)
+		}
+	})
+
+	t.Run("closed issue recent", func(t *testing.T) {
 		closedAt := now.Add(-10 * 24 * time.Hour)
 		issue := &model.Issue{
 			CreatedAt: now.Add(-20 * 24 * time.Hour),
@@ -721,10 +735,9 @@ func TestCorrelator_CalculateSearchDays(t *testing.T) {
 		}
 
 		days := correlator.calculateSearchDays(issue)
-		// Should be (20-10) + 7 = 17 days
-		expected := 17
-		if days != expected {
-			t.Errorf("calculateSearchDays for closed issue = %d, want %d", days, expected)
+		// Created 20d ago + 7d buffer = 27 days
+		if days != 27 {
+			t.Errorf("calculateSearchDays for closed issue = %d, want 27", days)
 		}
 	})
 
@@ -734,19 +747,37 @@ func TestCorrelator_CalculateSearchDays(t *testing.T) {
 		}
 
 		days := correlator.calculateSearchDays(issue)
-		if days != 14 {
-			t.Errorf("calculateSearchDays for open issue = %d, want 14", days)
+		if days != 21 {
+			t.Errorf("calculateSearchDays for open issue = %d, want 21", days)
 		}
 	})
 
-	t.Run("very old issue capped", func(t *testing.T) {
+	t.Run("brand new issue clamped to minimum 7 days", func(t *testing.T) {
 		issue := &model.Issue{
-			CreatedAt: now.Add(-365 * 24 * time.Hour),
+			CreatedAt: now.Add(2 * 24 * time.Hour),
 		}
 
 		days := correlator.calculateSearchDays(issue)
-		if days != 90 {
-			t.Errorf("calculateSearchDays for old issue = %d, want 90 (capped)", days)
+		if days != 7 {
+			t.Errorf("calculateSearchDays for future/new issue = %d, want 7", days)
+		}
+	})
+
+	t.Run("very old issue capped at 365 days", func(t *testing.T) {
+		issue := &model.Issue{
+			CreatedAt: now.Add(-400 * 24 * time.Hour),
+		}
+
+		days := correlator.calculateSearchDays(issue)
+		if days != 365 {
+			t.Errorf("calculateSearchDays for old issue = %d, want 365 (capped)", days)
+		}
+	})
+
+	t.Run("zero CreatedAt defaults to 30 days", func(t *testing.T) {
+		days := correlator.calculateSearchDays(&model.Issue{})
+		if days != 30 {
+			t.Errorf("calculateSearchDays for zero CreatedAt = %d, want 30", days)
 		}
 	})
 }

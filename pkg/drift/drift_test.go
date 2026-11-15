@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/datasource"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -1935,10 +1936,11 @@ func TestLabelOverridesValidation(t *testing.T) {
 // one alert of the named type. Each fixture is minimal and isolated so a
 // failing type points at exactly one emitter.
 type alertFixture struct {
-	baseline *baseline.Baseline
-	current  *baseline.Baseline
-	issues   []model.Issue
-	config   *Config
+	baseline    *baseline.Baseline
+	current     *baseline.Baseline
+	issues      []model.Issue
+	config      *Config
+	sourceDiffs []datasource.SourceDiff
 }
 
 func alertFixtures(now time.Time) map[AlertType]alertFixture {
@@ -1955,36 +1957,36 @@ func alertFixtures(now time.Time) map[AlertType]alertFixture {
 	fixtures := map[AlertType]alertFixture{}
 
 	bl, cur := quiet()
-	fixtures[AlertStaleIssue] = alertFixture{bl, cur, []model.Issue{
+	fixtures[AlertStaleIssue] = alertFixture{baseline: bl, current: cur, issues: []model.Issue{
 		{ID: "STALE", Status: model.StatusOpen, Labels: []string{"backend"}, UpdatedAt: now.AddDate(0, 0, -20)},
-	}, nil}
+	}}
 
 	bl, cur = quiet()
-	fixtures[AlertBlockingCascade] = alertFixture{bl, cur, []model.Issue{
+	fixtures[AlertBlockingCascade] = alertFixture{baseline: bl, current: cur, issues: []model.Issue{
 		{ID: "ROOT", Status: model.StatusOpen, Priority: 2, UpdatedAt: fresh},
 		{ID: "D1", Status: model.StatusOpen, Priority: 3, UpdatedAt: fresh, Dependencies: []*model.Dependency{blocksOn("D1", "ROOT")}},
 		{ID: "D2", Status: model.StatusOpen, Priority: 3, UpdatedAt: fresh, Dependencies: []*model.Dependency{blocksOn("D2", "ROOT")}},
 		{ID: "D3", Status: model.StatusOpen, Priority: 3, UpdatedAt: fresh, Dependencies: []*model.Dependency{blocksOn("D3", "ROOT")}},
-	}, nil}
+	}}
 
 	bl, cur = quiet()
-	fixtures[AlertHighImpactUnblock] = alertFixture{bl, cur, []model.Issue{
+	fixtures[AlertHighImpactUnblock] = alertFixture{baseline: bl, current: cur, issues: []model.Issue{
 		{ID: "ROOT", Status: model.StatusOpen, Priority: 2, UpdatedAt: fresh},
 		{ID: "P0A", Status: model.StatusOpen, Priority: 0, UpdatedAt: fresh, Dependencies: []*model.Dependency{blocksOn("P0A", "ROOT")}},
 		{ID: "P1B", Status: model.StatusOpen, Priority: 1, UpdatedAt: fresh, Dependencies: []*model.Dependency{blocksOn("P1B", "ROOT")}},
 		{ID: "P3C", Status: model.StatusOpen, Priority: 3, UpdatedAt: fresh, Dependencies: []*model.Dependency{blocksOn("P3C", "ROOT")}},
-	}, nil}
+	}}
 
 	bl, cur = quiet()
-	fixtures[AlertAbandonedClaim] = alertFixture{bl, cur, []model.Issue{
+	fixtures[AlertAbandonedClaim] = alertFixture{baseline: bl, current: cur, issues: []model.Issue{
 		{ID: "CLAIMED", Status: model.StatusInProgress, Assignee: "agent-7", UpdatedAt: now.AddDate(0, 0, -20)},
-	}, nil}
+	}}
 
 	bl, cur = quiet()
-	fixtures[AlertPotentialDuplicate] = alertFixture{bl, cur, []model.Issue{
+	fixtures[AlertPotentialDuplicate] = alertFixture{baseline: bl, current: cur, issues: []model.Issue{
 		{ID: "DUP-1", Title: "Fix login timeout on slow networks", Status: model.StatusOpen, UpdatedAt: fresh},
 		{ID: "DUP-2", Title: "Fix login timeout on slow networks", Status: model.StatusOpen, UpdatedAt: fresh},
-	}, nil}
+	}}
 
 	// A P4 hub that everything depends on: the graph says it deserves a
 	// far higher priority than it carries.
@@ -1994,7 +1996,7 @@ func alertFixtures(now time.Time) map[AlertType]alertFixture {
 		id := fmt.Sprintf("LEAF-%d", i)
 		mismatch = append(mismatch, model.Issue{ID: id, Status: model.StatusOpen, Priority: 0, UpdatedAt: fresh, Dependencies: []*model.Dependency{blocksOn(id, "HUB")}})
 	}
-	fixtures[AlertPriorityMismatch] = alertFixture{bl, cur, mismatch, nil}
+	fixtures[AlertPriorityMismatch] = alertFixture{baseline: bl, current: cur, issues: mismatch}
 
 	bl, cur = quiet()
 	velocity := []model.Issue{}
@@ -2002,47 +2004,56 @@ func alertFixtures(now time.Time) map[AlertType]alertFixture {
 		velocity = append(velocity, model.Issue{ID: fmt.Sprintf("OLD-%d", i), Status: model.StatusClosed, UpdatedAt: fresh, ClosedAt: closedAt(now.AddDate(0, 0, -10))})
 	}
 	velocity = append(velocity, model.Issue{ID: "NEW-0", Status: model.StatusClosed, UpdatedAt: fresh, ClosedAt: closedAt(now.AddDate(0, 0, -2))})
-	fixtures[AlertVelocityDrop] = alertFixture{bl, cur, velocity, nil}
+	fixtures[AlertVelocityDrop] = alertFixture{baseline: bl, current: cur, issues: velocity}
 
 	fixtures[AlertNewCycle] = alertFixture{
-		&baseline.Baseline{Stats: quietStats},
-		&baseline.Baseline{Stats: quietStats, Cycles: [][]string{{"A", "B", "A"}}},
-		nil, nil,
+		baseline: &baseline.Baseline{Stats: quietStats},
+		current:  &baseline.Baseline{Stats: quietStats, Cycles: [][]string{{"A", "B", "A"}}},
 	}
 	fixtures[AlertDensityGrowth] = alertFixture{
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, Density: 0.10}},
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 16, Density: 0.16}},
-		nil, nil,
+		baseline: &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, Density: 0.10}},
+		current:  &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 16, Density: 0.16}},
 	}
 	fixtures[AlertNodeCountChange] = alertFixture{
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10}},
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 14, EdgeCount: 10}},
-		nil, nil,
+		baseline: &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10}},
+		current:  &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 14, EdgeCount: 10}},
 	}
 	fixtures[AlertEdgeCountChange] = alertFixture{
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10}},
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 14}},
-		nil, nil,
+		baseline: &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10}},
+		current:  &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 14}},
 	}
 	fixtures[AlertScopeCreep] = alertFixture{
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, OpenCount: 10}},
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, OpenCount: 13}},
-		nil, nil,
+		baseline: &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, OpenCount: 10}},
+		current:  &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, OpenCount: 13}},
 	}
 	fixtures[AlertBlockedIncrease] = alertFixture{
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, BlockedCount: 1}},
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, BlockedCount: 7}},
-		nil, nil,
+		baseline: &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, BlockedCount: 1}},
+		current:  &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, BlockedCount: 7}},
 	}
 	fixtures[AlertActionableChange] = alertFixture{
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, ActionableCount: 10}},
-		&baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, ActionableCount: 5}},
-		nil, nil,
+		baseline: &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, ActionableCount: 10}},
+		current:  &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 10, EdgeCount: 10, ActionableCount: 5}},
 	}
 	fixtures[AlertPageRankChange] = alertFixture{
-		&baseline.Baseline{Stats: quietStats, TopMetrics: baseline.TopMetrics{PageRank: []baseline.MetricItem{{ID: "X", Value: 0.10}}}},
-		&baseline.Baseline{Stats: quietStats, TopMetrics: baseline.TopMetrics{PageRank: []baseline.MetricItem{{ID: "X", Value: 0.20}}}},
-		nil, nil,
+		baseline: &baseline.Baseline{Stats: quietStats, TopMetrics: baseline.TopMetrics{PageRank: []baseline.MetricItem{{ID: "X", Value: 0.10}}}},
+		current:  &baseline.Baseline{Stats: quietStats, TopMetrics: baseline.TopMetrics{PageRank: []baseline.MetricItem{{ID: "X", Value: 0.20}}}},
+	}
+	bl, cur = quiet()
+	fixtures[AlertSourceInconsistency] = alertFixture{
+		baseline: bl,
+		current:  cur,
+		issues: []model.Issue{
+			{ID: "SRC-1", Title: "SQLite title", Status: model.StatusOpen, Labels: []string{"sync"}, UpdatedAt: fresh},
+		},
+		sourceDiffs: []datasource.SourceDiff{
+			datasource.DetectInconsistencies(
+				[]model.Issue{{ID: "SRC-1", Title: "SQLite title", Status: model.StatusOpen, Priority: 1}},
+				[]model.Issue{{ID: "SRC-1", Title: "SQLite title", Status: model.StatusClosed, Priority: 1}},
+				".beads/beads.db",
+				".beads/issues.jsonl",
+				datasource.DiffOptions{CompareFields: []string{"status", "priority", "title"}},
+			),
+		},
 	}
 	return fixtures
 }
@@ -2077,6 +2088,7 @@ func TestDrift_EveryAlertTypeHasEmitter(t *testing.T) {
 			calc := NewCalculator(fx.baseline, fx.current, fx.config)
 			calc.SetNow(now)
 			calc.SetIssues(fx.issues)
+			calc.SetSourceDiffs(fx.sourceDiffs)
 			result := calc.Calculate()
 			got := alertsOfType(result, typ)
 			t.Logf("%s: %d alert(s): %+v", typ, len(got), got)
@@ -2104,6 +2116,7 @@ func TestDrift_EveryAlertTypeHasEmitter(t *testing.T) {
 			calc = NewCalculator(fx.baseline, fx.current, &disabled)
 			calc.SetNow(now)
 			calc.SetIssues(fx.issues)
+			calc.SetSourceDiffs(fx.sourceDiffs)
 			if left := alertsOfType(calc.Calculate(), typ); len(left) != 0 {
 				t.Fatalf("disabled_alerts=[%s] still produced %d alert(s): %+v", typ, len(left), left)
 			}
@@ -2408,7 +2421,7 @@ func TestConfigValidate_ProactiveKeys(t *testing.T) {
 		t.Fatalf("omitted proactive keys must backfill, got %v", err)
 	}
 	def := DefaultConfig()
-	if cfg.VelocityDropPct != def.VelocityDropPct || cfg.HighImpactUnblockMin != def.HighImpactUnblockMin || cfg.DuplicateJaccardThreshold != def.DuplicateJaccardThreshold || cfg.PriorityMismatchMinConfidence != def.PriorityMismatchMinConfidence || cfg.AbandonedClaimMultiplier != def.AbandonedClaimMultiplier || cfg.ScopeCreepPct != def.ScopeCreepPct {
+	if cfg.VelocityDropPct != def.VelocityDropPct || cfg.HighImpactUnblockMin != def.HighImpactUnblockMin || cfg.DuplicateJaccardThreshold != def.DuplicateJaccardThreshold || cfg.SourceDriftMaxAlerts != 0 || cfg.PriorityMismatchMinConfidence != def.PriorityMismatchMinConfidence || cfg.AbandonedClaimMultiplier != def.AbandonedClaimMultiplier || cfg.ScopeCreepPct != def.ScopeCreepPct {
 		t.Fatalf("backfilled config differs from defaults: %+v", cfg)
 	}
 	bad := map[string]*Config{
@@ -2438,10 +2451,10 @@ func TestConfigValidate_ProactiveKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("example config failed to load: %v", err)
 	}
-	if loaded.VelocityWindowDays != 7 || loaded.DuplicateMaxAlerts != 10 || loaded.ScopeCreepPct != 20 || loaded.HighImpactPriorityMax != 1 {
+	if loaded.VelocityWindowDays != 7 || loaded.DuplicateMaxAlerts != 10 || loaded.SourceDriftMaxAlerts != 10 || loaded.ScopeCreepPct != 20 || loaded.HighImpactPriorityMax != 1 {
 		t.Fatalf("example config keys not honoured: %+v", loaded)
 	}
-	for _, key := range []string{"proactive_max_issues", "scope_creep_pct", "velocity_drop_pct", "velocity_window_days", "velocity_min_baseline", "high_impact_unblock_min", "high_impact_priority_max", "abandoned_claim_multiplier", "duplicate_jaccard_threshold", "duplicate_max_alerts", "priority_mismatch_min_confidence", "sprint_blocked_days", "sprint_inactive_days"} {
+	for _, key := range []string{"proactive_max_issues", "scope_creep_pct", "velocity_drop_pct", "velocity_window_days", "velocity_min_baseline", "high_impact_unblock_min", "high_impact_priority_max", "abandoned_claim_multiplier", "duplicate_jaccard_threshold", "duplicate_max_alerts", "source_drift_max_alerts", "priority_mismatch_min_confidence", "sprint_blocked_days", "sprint_inactive_days"} {
 		if !strings.Contains(ExampleConfig(), key+":") {
 			t.Errorf("ExampleConfig missing key %s", key)
 		}
@@ -2629,5 +2642,337 @@ func TestCalculatorLegacyBaselineAndCandidateCycles(t *testing.T) {
 	gotCyc := alertsOfType(calcIn.Calculate(), AlertNewCycle)
 	if len(gotCyc) != 1 || gotCyc[0].Delta != 1 || gotCyc[0].CurrentVal != 1 {
 		t.Fatalf("expected exactly 1 in-scope cycle alert (Delta=1 CurrentVal=1), got %+v", gotCyc)
+	}
+}
+
+func TestSourceInconsistencyAlerts_CandidateScopingCapAndFallback(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	quiet := &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 3, OpenCount: 3}}
+
+	diffs := []datasource.SourceDiff{
+		datasource.DetectInconsistencies(
+			[]model.Issue{
+				{ID: "EXT-1", Title: "Out of scope A", Status: model.StatusOpen, Priority: 1},
+				{ID: "CAND-1", Title: "SQLite title", Status: model.StatusOpen, Priority: 1},
+				{ID: "CAND-2", Title: "Same", Status: model.StatusOpen, Priority: 0},
+			},
+			[]model.Issue{
+				{ID: "EXT-1", Title: "Out of scope B", Status: model.StatusClosed, Priority: 3},
+				{ID: "CAND-1", Title: "JSONL title", Status: model.StatusClosed, Priority: 2},
+				{ID: "CAND-2", Title: "Same", Status: model.StatusOpen, Priority: 2},
+			},
+			".beads/beads.db",
+			".beads/issues.jsonl",
+			datasource.DiffOptions{CompareFields: []string{"status", "priority", "title"}},
+		),
+	}
+
+	cfg := DefaultConfig()
+	cfg.SourceDriftMaxAlerts = 2
+	calc := NewCalculator(quiet, quiet, cfg)
+	calc.SetNow(now)
+	calc.SetIssues([]model.Issue{
+		{ID: "CAND-1", Status: model.StatusOpen, Labels: []string{"backend"}, UpdatedAt: now},
+		{ID: "CAND-2", Status: model.StatusOpen, Labels: []string{"frontend"}, UpdatedAt: now},
+	})
+	calc.SetCandidates(map[string]bool{"CAND-1": true, "CAND-2": true})
+	calc.SetSourceDiffs(diffs)
+
+	got := alertsOfType(calc.Calculate(), AlertSourceInconsistency)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 in-scope capped source_inconsistency alerts, got %d: %+v", len(got), got)
+	}
+	for _, a := range got {
+		if a.IssueID != "CAND-1" {
+			t.Fatalf("expected sorted in-scope CAND-1 alerts first (EXT-1 filtered out), got %+v", a)
+		}
+		if len(a.Labels) != 1 || a.Labels[0] != "backend" {
+			t.Fatalf("expected issue labels attached to alert, got %+v", a)
+		}
+	}
+
+	// Single-issue fallback literal
+	fallback := SourceInconsistencyAlerts([]datasource.SourceDiff{{
+		IssueID:    "SINGLE-1",
+		Difference: "missing in .beads/issues.jsonl",
+		SourceA:    ".beads/beads.db",
+		SourceB:    ".beads/issues.jsonl",
+		ValueA:     "open",
+	}}, 10, now)
+	if len(fallback) != 1 || fallback[0].IssueID != "SINGLE-1" {
+		t.Fatalf("expected single-issue fallback alert, got %+v", fallback)
+	}
+}
+
+func TestStalenessAndDuplicates_SkipParkedAndTemplateBeads(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	staleTime := now.AddDate(0, 0, -45)
+	future := now.Add(48 * time.Hour)
+	quiet := &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 7, OpenCount: 7}}
+
+	issues := []model.Issue{
+		{ID: "PARK-DEF", Title: "Implement distributed cache invalidation", Status: model.StatusDeferred, UpdatedAt: staleTime},
+		{ID: "PARK-PIN-STATUS", Title: "Implement distributed cache invalidation", Status: model.StatusPinned, UpdatedAt: staleTime},
+		{ID: "PARK-PIN-BOOL", Title: "Implement distributed cache invalidation", Status: model.StatusOpen, Pinned: true, UpdatedAt: staleTime},
+		{ID: "PARK-TMPL", Title: "Implement distributed cache invalidation", Status: model.StatusOpen, IsTemplate: true, UpdatedAt: staleTime},
+		{ID: "PARK-EPH", Title: "Implement distributed cache invalidation", Status: model.StatusOpen, Ephemeral: true, UpdatedAt: staleTime},
+		{ID: "PARK-FUTURE", Title: "Implement distributed cache invalidation", Status: model.StatusOpen, DeferUntil: &future, UpdatedAt: staleTime},
+		{ID: "LIVE-OPEN", Title: "Implement distributed cache invalidation", Status: model.StatusOpen, UpdatedAt: now},
+	}
+
+	calc := NewCalculator(quiet, quiet, nil)
+	calc.SetNow(now)
+	calc.SetIssues(issues)
+	res := calc.Calculate()
+
+	if stale := alertsOfType(res, AlertStaleIssue); len(stale) != 0 {
+		t.Fatalf("parked/template/ephemeral beads triggered stale_issue alerts: %+v", stale)
+	}
+	// Verify PARK-TMPL is excluded from potential_duplicate alerts.
+	for _, a := range alertsOfType(res, AlertPotentialDuplicate) {
+		if a.IssueID == "PARK-TMPL" || a.RelatedIssueID == "PARK-TMPL" {
+			t.Fatalf("IsTemplate bead leaked into potential_duplicate alert: %+v", a)
+		}
+	}
+}
+
+func TestConfigExists(t *testing.T) {
+	dir := t.TempDir()
+	if ConfigExists(dir) {
+		t.Fatal("expected ConfigExists=false for empty dir")
+	}
+
+	custom := DefaultConfig()
+	custom.StaleWarningDays = 3
+	if err := SaveConfig(dir, custom); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	if !ConfigExists(dir) {
+		t.Fatal("expected ConfigExists(dir)=true after SaveConfig")
+	}
+	if !ConfigExists(ConfigPath(dir)) {
+		t.Fatal("expected ConfigExists(ConfigPath(dir))=true after SaveConfig")
+	}
+
+	loaded, err := LoadConfig(dir)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if loaded.StaleWarningDays != 3 {
+		t.Fatalf("expected saved StaleWarningDays=3, got %d", loaded.StaleWarningDays)
+	}
+}
+
+func TestReuseAnalyzer_PreservesSecondaryOnlyPresenceAlertsAndAllowCandidateIDs(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	quiet := &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 1, OpenCount: 1}}
+
+	primaryIssues := []model.Issue{
+		{ID: "PRIM-1", Title: "Primary issue", Status: model.StatusOpen, Labels: []string{"backend"}, UpdatedAt: now},
+	}
+	secondaryIssues := []model.Issue{
+		{ID: "PRIM-1", Title: "Primary issue", Status: model.StatusOpen, Labels: []string{"backend"}, UpdatedAt: now},
+		{ID: "SEC-BACKEND", Title: "Only in JSONL backend", Status: model.StatusOpen, Labels: []string{"backend"}, UpdatedAt: now},
+		{ID: "SEC-FRONTEND", Title: "Only in JSONL frontend", Status: model.StatusOpen, Labels: []string{"frontend"}, UpdatedAt: now},
+	}
+	diffs := []datasource.SourceDiff{
+		datasource.DetectInconsistencies(
+			primaryIssues,
+			secondaryIssues,
+			".beads/beads.db",
+			".beads/issues.jsonl",
+			datasource.DiffOptions{CompareFields: []string{"status", "priority", "title"}},
+		),
+	}
+
+	// 1. Unscoped ReuseAnalyzer (!a.HasCandidateScope()) must emit BOTH secondary-only presence alerts!
+	unscopedAn := analysis.NewAnalyzer(primaryIssues)
+	unscopedAn.SetNow(now)
+	calcUnscoped := NewCalculator(quiet, quiet, nil)
+	calcUnscoped.SetNow(now)
+	calcUnscoped.SetIssues(primaryIssues)
+	if !calcUnscoped.ReuseAnalyzer(unscopedAn) {
+		t.Fatal("expected ReuseAnalyzer(unscopedAn) to succeed")
+	}
+	calcUnscoped.SetSourceDiffs(diffs)
+	gotUnscoped := alertsOfType(calcUnscoped.Calculate(), AlertSourceInconsistency)
+	if len(gotUnscoped) != 2 {
+		t.Fatalf("expected 2 secondary-only source_inconsistency alerts with unscoped ReuseAnalyzer, got %d: %+v", len(gotUnscoped), gotUnscoped)
+	}
+	if len(gotUnscoped[0].Labels) != 1 || gotUnscoped[0].Labels[0] != "backend" {
+		t.Fatalf("expected MissingIssues labels attached to secondary-only alert, got %+v", gotUnscoped[0])
+	}
+
+	// 2. Scoped ReuseAnalyzer + AllowCandidateIDs: only SEC-BACKEND (matching --label backend) is emitted,
+	// while SEC-FRONTEND stays filtered out and the borrowed analyzer cache remains valid!
+	scopedAn := analysis.NewAnalyzer(primaryIssues)
+	scopedAn.SetReadinessScope(model.NewReadinessIndex(primaryIssues), map[string]bool{"PRIM-1": true})
+	scopedAn.SetNow(now)
+
+	calcScoped := NewCalculator(quiet, quiet, nil)
+	calcScoped.SetNow(now)
+	calcScoped.SetIssues(primaryIssues)
+	if !calcScoped.ReuseAnalyzer(scopedAn) {
+		t.Fatal("expected ReuseAnalyzer(scopedAn) to succeed")
+	}
+	calcScoped.AllowCandidateIDs([]string{"SEC-BACKEND"})
+	calcScoped.SetSourceDiffs(diffs)
+
+	gotScoped := alertsOfType(calcScoped.Calculate(), AlertSourceInconsistency)
+	if len(gotScoped) != 1 || gotScoped[0].IssueID != "SEC-BACKEND" {
+		t.Fatalf("expected only SEC-BACKEND alert after AllowCandidateIDs, got %+v", gotScoped)
+	}
+	if calcScoped.analyzerCache != scopedAn {
+		t.Fatal("AllowCandidateIDs for secondary-only ID must not invalidate borrowed analyzer cache")
+	}
+}
+
+func TestLoadConfig_SourceDriftMaxAlertsZeroUnlimitedOn15DriftedIssues(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	quiet := &baseline.Baseline{Stats: baseline.GraphStats{NodeCount: 15, OpenCount: 15}}
+
+	projectDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectDir, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yamlBody := "source_drift_alert: true\nsource_drift_max_alerts: 0\n"
+	if err := os.WriteFile(ConfigPath(projectDir), []byte(yamlBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(projectDir)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.SourceDriftMaxAlerts != 0 {
+		t.Fatalf("SourceDriftMaxAlerts = %d, want 0 (unlimited)", cfg.SourceDriftMaxAlerts)
+	}
+
+	var issuesA, issuesB []model.Issue
+	for i := 0; i < 15; i++ {
+		id := fmt.Sprintf("DRIFT-%02d", i+1)
+		issuesA = append(issuesA, model.Issue{ID: id, Title: "Same", Status: model.StatusOpen, Priority: 1, UpdatedAt: now})
+		issuesB = append(issuesB, model.Issue{ID: id, Title: "Same", Status: model.StatusClosed, Priority: 1, UpdatedAt: now})
+	}
+	diffs := []datasource.SourceDiff{
+		datasource.DetectInconsistencies(issuesA, issuesB, ".beads/beads.db", ".beads/issues.jsonl", datasource.DefaultDiffOptions()),
+	}
+
+	calc := NewCalculator(quiet, quiet, cfg)
+	calc.SetNow(now)
+	calc.SetIssues(issuesA)
+	calc.SetSourceDiffs(diffs)
+
+	got := alertsOfType(calc.Calculate(), AlertSourceInconsistency)
+	if len(got) != 15 {
+		t.Fatalf("expected all 15 alerts when source_drift_max_alerts: 0, got %d", len(got))
+	}
+
+	// Verify negative SourceDriftMaxAlerts normalizes back to default 10 in Validate().
+	negCfg := DefaultConfig()
+	negCfg.SourceDriftMaxAlerts = -5
+	if err := negCfg.Validate(); err != nil {
+		t.Fatalf("Validate with negative SourceDriftMaxAlerts: %v", err)
+	}
+	if negCfg.SourceDriftMaxAlerts != 10 {
+		t.Fatalf("expected negative SourceDriftMaxAlerts to normalize to 10, got %d", negCfg.SourceDriftMaxAlerts)
+	}
+
+	// Verify source_drift_alert: false disables AlertSourceInconsistency.
+	if err := os.WriteFile(ConfigPath(projectDir), []byte("source_drift_alert: false\nsource_drift_max_alerts: 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	disabledCfg, err := LoadConfig(projectDir)
+	if err != nil {
+		t.Fatalf("LoadConfig disabled: %v", err)
+	}
+	calcDisabled := NewCalculator(quiet, quiet, disabledCfg)
+	calcDisabled.SetNow(now)
+	calcDisabled.SetSourceDiffs(diffs)
+	if gotDis := alertsOfType(calcDisabled.Calculate(), AlertSourceInconsistency); len(gotDis) != 0 {
+		t.Fatalf("expected 0 alerts when source_drift_alert: false, got %+v", gotDis)
+	}
+}
+
+func TestSourceInconsistencyAlerts_DirectionAwareSuggestedAction(t *testing.T) {
+	t0 := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Hour)
+
+	sqliteIssues := []model.Issue{
+		{ID: "BV-SQLITE-ONLY", Title: "SQLite only", Status: model.StatusOpen, UpdatedAt: t0},
+		{ID: "BV-JSONL-NEWER", Title: "Old title", Status: model.StatusOpen, UpdatedAt: t0},
+		{ID: "BV-TIE", Title: "Title A", Status: model.StatusOpen, UpdatedAt: t0},
+	}
+	jsonlIssues := []model.Issue{
+		{ID: "BV-JSONL-ONLY", Title: "JSONL only", Status: model.StatusOpen, UpdatedAt: t1},
+		{ID: "BV-JSONL-NEWER", Title: "Newer JSONL title", Status: model.StatusClosed, UpdatedAt: t1},
+		{ID: "BV-TIE", Title: "Title A", Status: model.StatusClosed, UpdatedAt: t0},
+	}
+
+	diff := datasource.DetectInconsistencies(
+		sqliteIssues,
+		jsonlIssues,
+		".beads/beads.db",
+		".beads/issues.jsonl",
+		datasource.DiffOptions{CompareFields: []string{"status"}},
+	)
+	alerts := SourceInconsistencyAlerts([]datasource.SourceDiff{diff}, 0, t1)
+	byID := make(map[string]Alert, len(alerts))
+	for _, a := range alerts {
+		byID[a.IssueID] = a
+	}
+
+	if got := byID["BV-JSONL-ONLY"].SuggestedAction; !strings.HasPrefix(got, "Run 'br sync --import-only'") {
+		t.Fatalf("BV-JSONL-ONLY action should lead with --import-only, got %q", got)
+	}
+	if got := byID["BV-SQLITE-ONLY"].SuggestedAction; !strings.HasPrefix(got, "Run 'br sync --flush-only'") {
+		t.Fatalf("BV-SQLITE-ONLY action should lead with --flush-only, got %q", got)
+	}
+	if got := byID["BV-JSONL-NEWER"].SuggestedAction; !strings.HasPrefix(got, "Run 'br sync --import-only'") {
+		t.Fatalf("BV-JSONL-NEWER action should lead with --import-only when JSONL is newer, got %q", got)
+	}
+	if got := byID["BV-TIE"].SuggestedAction; !strings.Contains(got, "authoritative") || !strings.Contains(got, "--flush-only") || !strings.Contains(got, "--import-only") {
+		t.Fatalf("BV-TIE action should mention checking authoritative source before --flush-only vs --import-only, got %q", got)
+	}
+
+	// Presence mismatch where newer JSONL tombstoned/deleted an issue still in stale SQLite
+	// must NEVER advise --flush-only (which would resurrect deleted issues over newer JSONL).
+	tombDiff := datasource.SourceDiff{
+		SourceA: ".beads/beads.db",
+		SourceB: ".beads/issues.jsonl",
+		IssueDiffs: []datasource.IssueSourceDiff{
+			{
+				IssueID:    "BV-TOMB-UPSTREAM",
+				Field:      "presence",
+				SourceA:    ".beads/beads.db",
+				SourceB:    ".beads/issues.jsonl",
+				ValueA:     "open",
+				ValueB:     "",
+				Difference: "missing in .beads/issues.jsonl",
+				ModTimeA:   t0,
+				ModTimeB:   t1, // JSONL is newer than SQLite
+			},
+			{
+				IssueID:    "BV-DEL-SQLITE",
+				Field:      "presence",
+				SourceA:    ".beads/beads.db",
+				SourceB:    ".beads/issues.jsonl",
+				ValueA:     "",
+				ValueB:     "open",
+				Difference: "missing in .beads/beads.db",
+				ModTimeA:   t1, // SQLite is newer than JSONL
+				ModTimeB:   t0,
+			},
+		},
+	}
+	tombAlerts := SourceInconsistencyAlerts([]datasource.SourceDiff{tombDiff}, 0, t1)
+	if len(tombAlerts) != 2 {
+		t.Fatalf("expected 2 presence alerts, got %d", len(tombAlerts))
+	}
+	if strings.Contains(tombAlerts[0].SuggestedAction, "--flush-only") || !strings.HasPrefix(tombAlerts[0].SuggestedAction, "Run 'br sync --import-only'") {
+		t.Fatalf("newer JSONL deletion must recommend --import-only without --flush-only, got %q", tombAlerts[0].SuggestedAction)
+	}
+	if !strings.Contains(tombAlerts[1].SuggestedAction, "authoritative") {
+		t.Fatalf("newer SQLite deletion vs stale JSONL should advise checking authoritative source, got %q", tombAlerts[1].SuggestedAction)
 	}
 }

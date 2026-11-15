@@ -416,6 +416,7 @@ func hashOptions(opts CorrelatorOptions) string {
 		Since                  *time.Time
 		Until                  *time.Time
 		Limit                  int
+		TargetCommitSHA        string `json:",omitempty"`
 		CausalityBeadID        string
 		TargetBeadAliases      []string    `json:",omitempty"`
 		ExplicitIDAliases      [][2]string `json:",omitempty"`
@@ -428,6 +429,7 @@ func hashOptions(opts CorrelatorOptions) string {
 		Since:                  opts.Since,
 		Until:                  opts.Until,
 		Limit:                  opts.Limit,
+		TargetCommitSHA:        strings.ToLower(strings.TrimSpace(opts.TargetCommitSHA)),
 		CausalityBeadID:        opts.CausalityBeadID,
 		TargetBeadAliases:      sortedUniqueNonEmptyStrings(opts.TargetBeadAliases),
 		ExplicitIDAliases:      sortedExplicitAliasPairs(opts.ExplicitIDAliases),

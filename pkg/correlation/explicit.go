@@ -1201,6 +1201,11 @@ func (m *ExplicitMatcher) searchWithGrep(pattern string, opts ExtractOptions) ([
 }
 
 func (m *ExplicitMatcher) searchWithGrepForBead(pattern, targetBeadID string, opts ExtractOptions) ([]ExplicitMatch, error) {
+	if opts.Revision != "" {
+		if err := validateGitRefArg(opts.Revision); err != nil {
+			return nil, err
+		}
+	}
 	m.mu.RLock()
 	ctx := m.ctx
 	repoPath := m.repoPath
@@ -1225,7 +1230,7 @@ func (m *ExplicitMatcher) searchWithGrepForBead(pattern, targetBeadID string, op
 		args = append(args, fmt.Sprintf("-n%d", opts.Limit))
 	}
 	if opts.Revision != "" {
-		args = append(args, opts.Revision)
+		args = append(args, "--end-of-options", opts.Revision)
 	}
 
 	cmd := gitCommand(ctx, args...)

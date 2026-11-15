@@ -14,8 +14,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/version"
 )
 
 // Note: WriteGitHubActionsWorkflow is defined in github.go
@@ -31,7 +35,20 @@ var ViewerAssetsFS embed.FS
 // invoking user. Keep it open across an export so later path replacements cannot
 // redirect writes, reads, or cleanup through a different directory.
 type Bundle struct {
-	root *os.Root
+	root               *os.Root
+	hybridWasmPrepared bool
+}
+
+// HybridWasmPrepared reports whether optional hybrid WASM assets were prepared in this bundle.
+func (b *Bundle) HybridWasmPrepared() bool {
+	return b != nil && b.hybridWasmPrepared
+}
+
+// MarkHybridWasmPrepared records that optional hybrid WASM assets were prepared in this bundle.
+func (b *Bundle) MarkHybridWasmPrepared() {
+	if b != nil {
+		b.hybridWasmPrepared = true
+	}
 }
 
 // OpenBundle creates the selected output directory if necessary and opens its
@@ -239,8 +256,8 @@ func (b *Bundle) CopyEmbeddedAssetsWithSubtitle(title, subtitle string) error {
 	}
 
 	// SQLite export precedes asset copying. Bind the worker's offline cache to
-	// this exact bundle, including config/chunks, before a browser can activate it.
-	for _, name := range []string{"beads.sqlite3", "beads.sqlite3.config.json", "chunks", "data"} {
+	// this exact bundle, including config/chunks/data/wasm, before a browser can activate it.
+	for _, name := range offlineAssetDirectories {
 		if _, err := b.root.Stat(name); os.IsNotExist(err) {
 			continue // CopyEmbeddedAssets also supports standalone asset callers.
 		} else if err != nil {
@@ -249,6 +266,12 @@ func (b *Bundle) CopyEmbeddedAssetsWithSubtitle(title, subtitle string) error {
 		if err := fs.WalkDir(b.root.FS(), name, func(p string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
+			}
+			if strings.HasPrefix(d.Name(), ".") {
+				if d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
 			}
 			if !d.IsDir() {
 				if !d.Type().IsRegular() {
@@ -318,8 +341,10 @@ func isDevOnlyAsset(relPath string) bool {
 }
 
 var (
-	defaultNavbarH1Pattern = regexp.MustCompile(`(<h1\b[^>]*>)Beads Viewer(</h1>)`)
-	firstNavbarH1Pattern   = regexp.MustCompile(`<h1\b[^>]*>[^<]*</h1>`)
+	offlineAssetDirectories     = []string{"beads.sqlite3", "beads.sqlite3.config.json", "chunks", "data", "wasm"}
+	cacheBusterVersionSanitizer = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+	defaultNavbarH1Pattern      = regexp.MustCompile(`(<h1\b[^>]*>)Beads Viewer(</h1>)`)
+	firstNavbarH1Pattern        = regexp.MustCompile(`<h1\b[^>]*>[^<]*</h1>`)
 )
 
 // replaceTitle replaces the default title in HTML content with the provided title.
@@ -362,13 +387,25 @@ func ReplaceSubtitle(content, subtitle string) string {
 	return content[:loc[1]] + subtitleEl + content[loc[1]:]
 }
 
+func resolveScriptCacheBuster() string {
+	if rawEpoch := strings.TrimSpace(env.SourceDateEpoch.Get()); rawEpoch != "" {
+		if epoch, err := strconv.ParseInt(rawEpoch, 10, 64); err == nil && epoch >= 0 {
+			ver := strings.Trim(cacheBusterVersionSanitizer.ReplaceAllString(strings.TrimSpace(version.Version), "-"), "-")
+			if ver != "" {
+				return fmt.Sprintf("?v=%s-%d", ver, epoch)
+			}
+			return fmt.Sprintf("?v=%d", epoch)
+		}
+	}
+	return fmt.Sprintf("?v=%d", time.Now().Unix())
+}
+
 // AddScriptCacheBusting adds a cache-busting query parameter to script src attributes.
 // This ensures browsers fetch fresh JS files after deployments, preventing stale code
 // from being served by CDN caches (which was causing the "Test Issue 1/2/3" bug where
 // old cached viewer.js would use OPFS-cached stale data).
 func AddScriptCacheBusting(content string) string {
-	// Generate timestamp for cache-busting
-	cacheBuster := fmt.Sprintf("?v=%d", time.Now().Unix())
+	cacheBuster := resolveScriptCacheBuster()
 
 	// List of our JS files that need cache-busting (not vendor files which rarely change)
 	jsFiles := []string{

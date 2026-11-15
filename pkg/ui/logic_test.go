@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -20,6 +21,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/instance"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 )
@@ -3222,6 +3224,976 @@ func TestRound4FocusValidationAndRecipeTimeTravelRegressions(t *testing.T) {
 						sv.name, m.showRecipePicker, m.focused, m.savedViewFocus)
 				}
 			})
+		}
+	})
+}
+
+func TestWave10BoardSearchEscTreeToggleAndSplitOverride(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "AUTH-1", Title: "login config handler", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{
+			ID: "AUTH-2", Title: "JSON token parser", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "AUTH-2", DependsOnID: "AUTH-1", Type: model.DepBlocks}},
+		},
+	}
+
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+
+	// 1) Split-view user override ('\' key) survives >=80 resize and forces false <80.
+	if !m.isSplitView {
+		t.Fatal("expected split view enabled at width 140")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(`\`)})
+	if m.isSplitView || !m.splitViewUserOverride {
+		t.Fatalf("expected '\\' to disable split view and set splitViewUserOverride, got split=%v override=%v",
+			m.isSplitView, m.splitViewUserOverride)
+	}
+	m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	if m.isSplitView {
+		t.Fatal("expected splitViewUserOverride to prevent WindowSizeMsg(160) from re-enabling split view")
+	}
+	if m.tutorialModel.width != 160 || m.tutorialModel.height != 40 {
+		t.Fatalf("expected WindowSizeMsg forwarded to tutorialModel, got %dx%d", m.tutorialModel.width, m.tutorialModel.height)
+	}
+	// Toggle split view back ON, then verify <80 forces isSplitView=false even with override set.
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(`\`)})
+	if !m.isSplitView {
+		t.Fatal("expected '\\' at width 160 to re-enable split view")
+	}
+	m.Update(tea.WindowSizeMsg{Width: 70, Height: 30})
+	if m.isSplitView {
+		t.Fatal("expected narrow resize (<80) to force isSplitView=false despite user override")
+	}
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+	if !m.isSplitView {
+		t.Fatal("expected splitViewUserWant to restore isSplitView=true when resizing back to 140")
+	}
+
+	// 2) Board search accepts 'n', 'N', spaces, UTF-8/multi-rune paste, and layers Esc cleanly.
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	if !m.isBoardView || m.focused != focusBoard {
+		t.Fatalf("expected Board view active, got isBoard=%v focused=%v", m.isBoardView, m.focused)
+	}
+	m.board.ToggleExpand()
+	if !m.board.HasExpandedCard() {
+		t.Fatal("expected expanded card on board")
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+	if !m.board.IsSearchMode() {
+		t.Fatal("expected board search mode active after '/'")
+	}
+	// Type 'login', space, 'config' (includes 'n' and space)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("login")})
+	m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("config")})
+	if got := m.board.GetSearchQuery(); got != "login config" {
+		t.Fatalf("expected board search query 'login config' (without 'n' hijacked), got %q", got)
+	}
+	// Confirm search with Enter: exits searchMode, keeps query & matches.
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.board.IsSearchMode() || m.board.GetSearchQuery() != "login config" {
+		t.Fatalf("expected Enter to finish search while keeping query, got mode=%v query=%q",
+			m.board.IsSearchMode(), m.board.GetSearchQuery())
+	}
+	// First Esc clears persistent search query, staying on Board with expanded card intact.
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if !m.isBoardView || m.board.GetSearchQuery() != "" || !m.board.HasExpandedCard() {
+		t.Fatalf("expected 1st Esc to clear search query only, got board=%v query=%q expanded=%v",
+			m.isBoardView, m.board.GetSearchQuery(), m.board.HasExpandedCard())
+	}
+	// Second Esc collapses expanded card, staying on Board.
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if !m.isBoardView || m.board.HasExpandedCard() {
+		t.Fatalf("expected 2nd Esc to collapse expanded card only, got board=%v expanded=%v",
+			m.isBoardView, m.board.HasExpandedCard())
+	}
+	// Third Esc exits Board back to List.
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.isBoardView || m.focused != focusList {
+		t.Fatalf("expected 3rd Esc to exit Board to focusList, got board=%v focused=%v", m.isBoardView, m.focused)
+	}
+
+	// 3) Tree view 'b'/'m' toggles Hierarchy <-> Blocking Chain while preserving selection.
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("E")})
+	if m.focused != focusTree || m.tree.Mode() != TreeModeHierarchy {
+		t.Fatalf("expected focusTree in Hierarchy mode, got focused=%v mode=%v", m.focused, m.tree.Mode())
+	}
+	m.tree.SelectByID("AUTH-2")
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	if m.tree.Mode() != TreeModeBlocking {
+		t.Fatalf("expected 'b' in Tree view to switch to TreeModeBlocking, got %v", m.tree.Mode())
+	}
+	if sel := m.tree.SelectedIssue(); sel == nil || sel.ID != "AUTH-2" {
+		t.Fatalf("expected selection AUTH-2 preserved across Tree mode toggle, got %+v", sel)
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("m")})
+	if m.tree.Mode() != TreeModeHierarchy {
+		t.Fatalf("expected 'm' in Tree view to toggle back to TreeModeHierarchy, got %v", m.tree.Mode())
+	}
+}
+
+func TestWave10SmallTerminalWindowingRecipeHeadersAndReloadSafety(t *testing.T) {
+	now := time.Now().UTC()
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	sprintsPath := filepath.Join(beadsDir, "sprints.jsonl")
+	initialIssues := `{"id":"API-1","title":"Closed Blocker","status":"closed","priority":1,"issue_type":"task"}` + "\n" +
+		`{"id":"WEB-2","title":"Dependent With Very Long Recommended Title For Narrow Actionable Banner Truncation","status":"open","priority":0,"issue_type":"feature","assignee":"alice","labels":["ux"],"dependencies":[{"issue_id":"WEB-2","depends_on_id":"API-1","type":"blocks"}]}` + "\n"
+	if err := os.WriteFile(beadsPath, []byte(initialIssues), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sprintJSON := `{"id":"sp-1","name":"Sprint Alpha","bead_ids":["WEB-2"],"start_date":"2026-11-01T00:00:00Z","end_date":"2026-11-20T00:00:00Z"}` + "\n"
+	if err := os.WriteFile(sprintsPath, []byte(sprintJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	issues := []model.Issue{
+		{ID: "API-1", Title: "Closed Blocker", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "WEB-2", Title: "Dependent With Very Long Recommended Title For Narrow Actionable Banner Truncation",
+			Status: model.StatusOpen, Priority: 0, IssueType: model.TypeFeature, Assignee: "alice", Labels: []string{"ux"},
+			Dependencies: []*model.Dependency{{IssueID: "WEB-2", DependsOnID: "API-1", Type: model.DepBlocks}},
+			CreatedAt:    now, UpdatedAt: now,
+		},
+	}
+
+	m := NewModel(issues, nil, beadsPath)
+	t.Cleanup(m.Stop)
+	m.backgroundWorker = nil
+	m.Update(tea.WindowSizeMsg{Width: 90, Height: 24})
+
+	if len(m.sprints) != 1 || !m.sprintsLoadedFromDisk {
+		t.Fatalf("expected initial sprint loaded from sprints.jsonl, got len=%d fromDisk=%v", len(m.sprints), m.sprintsLoadedFromDisk)
+	}
+
+	// 1) Small-terminal (24 rows) modal scrolling in RecipePicker, RepoPicker, and AlertsPanel.
+	var manyRecipes []recipe.Recipe
+	var manyRepos []string
+	var manyAlerts []drift.Alert
+	for i := 0; i < 18; i++ {
+		manyRecipes = append(manyRecipes, recipe.Recipe{Name: fmt.Sprintf("rec-%02d", i), Description: "Desc"})
+		manyRepos = append(manyRepos, fmt.Sprintf("repo-%02d", i))
+		manyAlerts = append(manyAlerts, drift.Alert{
+			Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning,
+			Message: fmt.Sprintf("Alert message %02d", i), IssueID: "WEB-2",
+		})
+	}
+	rp := NewRecipePickerModel(manyRecipes, m.theme)
+	rp.SetSize(80, 24)
+	for i := 0; i < 15; i++ {
+		rp.MoveDown()
+	}
+	if out := rp.View(); !strings.Contains(out, "rec-15") || !strings.Contains(out, "↑") {
+		t.Fatalf("expected 24-row RecipePicker to scroll to rec-15 with ↑ indicator, got:\n%s", out)
+	}
+
+	repoP := NewRepoPickerModel(manyRepos, m.theme)
+	repoP.SetSize(80, 24)
+	for i := 0; i < 15; i++ {
+		repoP.MoveDown()
+	}
+	if out := repoP.View(); !strings.Contains(out, "repo-15") || !strings.Contains(out, "↑") {
+		t.Fatalf("expected 24-row RepoPicker to scroll to repo-15 with ↑ indicator, got:\n%s", out)
+	}
+
+	m.alerts = manyAlerts
+	m.alertsWarning = len(manyAlerts)
+	m.alertsCursor = 15
+	if out := m.renderAlertsPanel(); !strings.Contains(out, "Alert message 15") || !strings.Contains(out, "↑") {
+		t.Fatalf("expected 24-row AlertsPanel to window around cursor 15 with ↑ indicator, got:\n%s", out)
+	}
+
+	// 2) LabelDashboard cursor/scroll clamping on shrink & resize, and Actionable banner truncation.
+	ld := NewLabelDashboardModel(m.theme)
+	ld.SetSize(80, 10)
+	ld.SetData([]analysis.LabelHealth{
+		{Label: "l1"}, {Label: "l2"}, {Label: "l3"}, {Label: "l4"}, {Label: "l5"},
+	})
+	ld.cursor = 4
+	ld.scrollOffset = 3
+	ld.SetData([]analysis.LabelHealth{{Label: "l1"}})
+	if ld.cursor != 0 || ld.scrollOffset != 0 {
+		t.Fatalf("expected LabelDashboard cursor/scroll clamped on shrink, got cursor=%d offset=%d", ld.cursor, ld.scrollOffset)
+	}
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	actOut := m.actionableView.Render()
+	for _, line := range strings.Split(actOut, "\n") {
+		if w := ansi.StringWidth(line); w > 90 {
+			t.Fatalf("expected ActionableModel line width <= 90, got %d: %q", w, line)
+		}
+	}
+	if got := m.focusedIssueForSessions(); got == nil || got.ID != "WEB-2" {
+		t.Fatalf("expected focusedIssueForSessions in focusActionable to return WEB-2, got %+v", got)
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	// 3) Workspace REPO header, Recipe Columns + ShowMetrics + GroupBy assignee, and Detail Recipe Metrics / resolved blocker label.
+	m.workspaceMode = true
+	customRec := &recipe.Recipe{
+		Name: "metrics-by-assignee",
+		View: recipe.ViewConfig{
+			Columns:     []string{"id", "priority", "title", "assignee"},
+			ShowMetrics: true,
+			GroupBy:     "assignee",
+		},
+	}
+	m.setActiveRecipe(customRec)
+	m.applyRecipe(customRec)
+	hdr := m.formatListHeader(100, false)
+	for _, col := range []string{"REPO", "PRI", "ASSIGNEE", "METRICS"} {
+		if !strings.Contains(hdr, col) {
+			t.Fatalf("expected formatListHeader to include %s, got %q", col, hdr)
+		}
+	}
+	if key := m.recipeGroupKey(*m.issueMap["WEB-2"]); key != "@alice" {
+		t.Fatalf("expected recipeGroupKey(assignee) == '@alice', got %q", key)
+	}
+	m.selectVisibleListItemByID("WEB-2")
+	m.isSplitView = true
+	m.updateViewportContent()
+	vpOut := ansi.Strip(m.viewportContent)
+	if !strings.Contains(vpOut, "Recipe Metrics") {
+		t.Fatalf("expected viewport content to include Recipe Metrics when ShowMetrics=true, got:\n%s", vpOut)
+	}
+	if !strings.Contains(vpOut, "resolved") {
+		t.Fatalf("expected closed blocker API-1 marked resolved in detail pane, got:\n%s", vpOut)
+	}
+
+	// 4) Deleting sprints.jsonl clears disk-loaded sprints on FileChangedMsg without dangling pool refs.
+	m.openSprintView()
+	if !m.isSprintView || m.selectedSprint == nil {
+		t.Fatal("expected sprint view active before deleting sprints.jsonl")
+	}
+	// Remove sprints.jsonl entry by truncating/emptying (Rule 1 safe: no file deletion needed; also test non-existent path via beadsPath in empty dir).
+	if err := os.WriteFile(sprintsPath, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.Update(FileChangedMsg{})
+	if len(m.sprints) != 0 || m.selectedSprint != nil || !strings.Contains(m.sprintViewText, "No sprint selected") {
+		t.Fatalf("expected emptied sprints.jsonl to clear m.sprints & m.selectedSprint, got len=%d sel=%+v text=%q",
+			len(m.sprints), m.selectedSprint, m.sprintViewText)
+	}
+	// Guard Enter on focusSprint when selectedSprint == nil: must be a safe no-op.
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.isSprintView || m.focused != focusSprint {
+		t.Fatalf("expected Enter with nil selectedSprint to stay in focusSprint, got sprint=%v focused=%v", m.isSprintView, m.focused)
+	}
+}
+
+func TestWave10MissingSprintsAndFocusRouting(t *testing.T) {
+	now := time.Now().UTC()
+	dirNoSprint := t.TempDir()
+	beadsDir := filepath.Join(dirNoSprint, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	raw := `{"id":"ISS-1","title":"Blocker","status":"open","priority":0,"issue_type":"task","labels":["core"]}` + "\n" +
+		`{"id":"ISS-2","title":"Dependent","status":"open","priority":1,"issue_type":"task","labels":["core"],"dependencies":[{"issue_id":"ISS-2","depends_on_id":"ISS-1","type":"blocks"}]}` + "\n"
+	if err := os.WriteFile(beadsPath, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	issues := []model.Issue{
+		{
+			ID: "ISS-1", Title: "Blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask,
+			Labels: []string{"core"}, Description: strings.Repeat("line\n", 80), CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "ISS-2", Title: "Dependent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Labels:       []string{"core"},
+			Dependencies: []*model.Dependency{{IssueID: "ISS-2", DependsOnID: "ISS-1", Type: model.DepBlocks}},
+			CreatedAt:    now, UpdatedAt: now,
+		},
+	}
+
+	m := NewModel(issues, nil, beadsPath)
+	t.Cleanup(m.Stop)
+	m.backgroundWorker = nil
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+
+	// 1) Simulate disk-loaded sprint whose sprints.jsonl file no longer exists on disk.
+	m.sprints = []model.Sprint{{ID: "s-gone", Name: "Gone Sprint", BeadIDs: []string{"ISS-1"}}}
+	m.sprintsLoadedFromDisk = true
+	m.openSprintView()
+	m.Update(FileChangedMsg{})
+	if len(m.sprints) != 0 || m.selectedSprint != nil || m.sprintsLoadedFromDisk {
+		t.Fatalf("expected missing sprints.jsonl to clear disk-loaded sprints, got len=%d sel=%+v fromDisk=%v",
+			len(m.sprints), m.selectedSprint, m.sprintsLoadedFromDisk)
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	// 2) focusDetail g/G viewport navigation and view switches (b -> Board).
+	m.focused = focusDetail
+	m.updateViewportContent()
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	if m.viewport.YOffset == 0 && m.viewport.TotalLineCount() > m.viewport.Height {
+		t.Fatal("expected 'G' in focusDetail to scroll viewport to bottom")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	if m.viewport.YOffset != 0 {
+		t.Fatalf("expected 'g' in focusDetail to scroll viewport to top, got YOffset=%d", m.viewport.YOffset)
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	if !m.isBoardView || m.focused != focusBoard {
+		t.Fatalf("expected 'b' in focusDetail to switch to Board view, got board=%v focused=%v", m.isBoardView, m.focused)
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	// 3) focusedIssueForSessions in focusGraph and focusInsights, plus g/G/ctrl+d/ctrl+u in Insights.
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	if m.focused != focusGraph {
+		t.Fatalf("expected focusGraph, got %v", m.focused)
+	}
+	if got := m.focusedIssueForSessions(); got == nil {
+		t.Fatal("expected focusedIssueForSessions() non-nil in focusGraph")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	if m.focused != focusInsights {
+		t.Fatalf("expected focusInsights, got %v", m.focused)
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	_ = m.focusedIssueForSessions()
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+	// 4) showVelocityComparison cleared when applying a LabelPicker selection.
+	m.showVelocityComparison = true
+	m.focused = focusVelocityComparison
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.showVelocityComparison {
+		t.Fatal("expected showVelocityComparison cleared after applying LabelPicker")
+	}
+
+	// 5) Phase2ReadyMsg refreshes active Board/Actionable/Sprint views without panic.
+	m.isActionableView = true
+	m.isBoardView = true
+	m.Update(Phase2ReadyMsg{})
+}
+
+func TestListPaneWidthCalculation(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "PANE-1", Title: "Split pane width verification", Status: model.StatusOpen, Priority: 1, Description: "Detailed body content"},
+		{ID: "PANE-2", Title: "Secondary list item", Status: model.StatusInProgress, Priority: 2},
+	}
+	m := NewModel(copyIssues(issues), nil, "")
+	t.Cleanup(m.Stop)
+
+	for _, w := range []int{70, 100, 120, 160} {
+		m.Update(tea.WindowSizeMsg{Width: w, Height: 30})
+		wantSplit := w > SplitViewThreshold
+		if m.isSplitView != wantSplit {
+			t.Fatalf("width=%d: isSplitView=%v, want %v", w, m.isSplitView, wantSplit)
+		}
+		fullOut := m.View()
+		if strings.TrimSpace(fullOut) == "" || !strings.Contains(fullOut, "PANE-1") {
+			t.Fatalf("width=%d: m.View() missing PANE-1:\n%s", w, fullOut)
+		}
+		for idx, ln := range strings.Split(fullOut, "\n") {
+			if gotW := lipgloss.Width(ln); gotW > w {
+				t.Fatalf("width=%d: m.View() line %d width=%d > %d: %q", w, idx, gotW, w, ln)
+			}
+		}
+		if m.isSplitView {
+			if m.list.Width() <= 0 || m.viewport.Width <= 0 || m.list.Width()+m.viewport.Width >= w {
+				t.Fatalf("width=%d: invalid split pane widths list=%d viewport=%d", w, m.list.Width(), m.viewport.Width)
+			}
+			splitOut := m.renderSplitView()
+			plainSplit := ansi.Strip(splitOut)
+			if strings.TrimSpace(plainSplit) == "" || !strings.Contains(plainSplit, "PANE-1") || !strings.Contains(plainSplit, "Detailed body content") {
+				t.Fatalf("width=%d: m.renderSplitView() missing list/detail content:\n%s", w, plainSplit)
+			}
+			for idx, ln := range strings.Split(splitOut, "\n") {
+				if gotW := lipgloss.Width(ln); gotW > w {
+					t.Fatalf("width=%d: m.renderSplitView() line %d width=%d > %d: %q", w, idx, gotW, w, ln)
+				}
+			}
+		}
+	}
+}
+
+func TestWave10Round1AuditRegressions(t *testing.T) {
+	// B-5: 100 -> '\' (enable split view) -> 60 (forced false) -> 140 (restored true via splitViewUserWant!)
+	t.Run("B5_SplitViewUserWantRestoresAfterNarrowThenWideResize", func(t *testing.T) {
+		issues := []model.Issue{{ID: "SV-1", Title: "Split restore", Status: model.StatusOpen, Priority: 1}}
+		m := NewModel(issues, nil, "")
+		t.Cleanup(m.Stop)
+
+		m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+		if m.isSplitView {
+			t.Fatal("expected auto split view false at width 100 (<= SplitViewThreshold)")
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(`\`)})
+		if !m.isSplitView || !m.splitViewUserOverride || !m.splitViewUserWant {
+			t.Fatalf("expected '\\' at width 100 to enable split view and set splitViewUserWant=true, got split=%v override=%v want=%v",
+				m.isSplitView, m.splitViewUserOverride, m.splitViewUserWant)
+		}
+		m.Update(tea.WindowSizeMsg{Width: 60, Height: 30})
+		if m.isSplitView || !m.splitViewUserWant {
+			t.Fatalf("expected width 60 to force isSplitView=false while preserving splitViewUserWant=true, got split=%v want=%v",
+				m.isSplitView, m.splitViewUserWant)
+		}
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+		if !m.isSplitView {
+			t.Fatal("expected width 140 resize to restore m.isSplitView=true from splitViewUserWant")
+		}
+	})
+
+	// B-4: Phase2ReadyMsg & Phase2UpdateMsg preserve active Board '/' search, expanded card, and repo-scoped insightsPanel.
+	t.Run("B4_Phase2PreservesBoardSearchExpandedCardAndScopedInsights", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "api-1", Title: "API OAuth gateway", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, SourceRepo: "api"},
+			{
+				ID: "api-2", Title: "API OAuth token store", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api",
+				Dependencies: []*model.Dependency{{IssueID: "api-2", DependsOnID: "api-1", Type: model.DepBlocks}},
+			},
+			{ID: "web-1", Title: "Web OAuth button", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, SourceRepo: "web"},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(m.Stop)
+		m.workspaceMode = true
+		m.activeRepos = map[string]bool{"api": true}
+		m.Update(tea.WindowSizeMsg{Width: 130, Height: 34})
+		m.applyFilter()
+		m.rebuildInsightsPanel()
+
+		// Enter Board view, expand api-1, start '/' search for "oauth", and step to 2nd match.
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+		if !m.board.SelectIssueByID("api-1") {
+			t.Fatal("expected api-1 on board")
+		}
+		m.board.ToggleExpand()
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
+		for _, ch := range "oauth" {
+			m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{ch}})
+		}
+		m.board.NextMatch()
+		if !m.board.IsSearchMode() || m.board.GetSearchQuery() != "oauth" || m.board.SearchCursorPos() != 2 {
+			t.Fatalf("precondition failed: mode=%v query=%q pos=%d",
+				m.board.IsSearchMode(), m.board.GetSearchQuery(), m.board.SearchCursorPos())
+		}
+
+		// Deliver Phase2ReadyMsg: Board search + expanded card + repo-scoped insightsPanel must all survive!
+		m.Update(WaitForPhase2Cmd(m.analysis)())
+		if !m.board.IsSearchMode() || m.board.GetSearchQuery() != "oauth" || m.board.SearchCursorPos() != 2 {
+			t.Fatalf("Phase2ReadyMsg clobbered active Board search: mode=%v query=%q pos=%d",
+				m.board.IsSearchMode(), m.board.GetSearchQuery(), m.board.SearchCursorPos())
+		}
+		if !m.board.HasExpandedCard() || m.board.GetExpandedID() != "api-1" {
+			t.Fatalf("Phase2ReadyMsg collapsed expanded card api-1: got %q", m.board.GetExpandedID())
+		}
+		insOut := ansi.Strip(m.insightsPanel.View())
+		if strings.Contains(insOut, "web-1") {
+			t.Fatalf("Phase2ReadyMsg overwrote repo-scoped insightsPanel with unscoped web-1:\n%s", insOut)
+		}
+	})
+
+	// B-2: exportToMarkdown passes Readiness, AuthorityComplete, and activeRecipe.View (GroupBy + claimable actions).
+	t.Run("B2_ExportToMarkdownReadinessClaimableAndRecipeGroupBy", func(t *testing.T) {
+		exportDir := t.TempDir()
+		beadsDir := filepath.Join(exportDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		dbPath := filepath.Join(beadsDir, "beads.db")
+		now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+
+		mkOrigin := func(localID string) *model.IssueOrigin {
+			return &model.IssueOrigin{
+				LocalID:          localID,
+				WorkingDirectory: exportDir,
+				TrackerDirectory: beadsDir,
+				Database:         dbPath,
+				Tracker:          "br",
+				Executable:       "br",
+				SupportsClaim:    true,
+			}
+		}
+		issues := []model.Issue{
+			{
+				ID: "READY-P2", Title: "Ready P2 Task", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+				CreatedAt: now, UpdatedAt: now, Origin: mkOrigin("READY-P2"),
+			},
+			{
+				ID: "BLOCKED-P0", Title: "Blocked P0 Task", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug,
+				CreatedAt: now, UpdatedAt: now, Origin: mkOrigin("BLOCKED-P0"),
+				Dependencies: []*model.Dependency{{IssueID: "BLOCKED-P0", DependsOnID: "READY-P2", Type: model.DepBlocks}},
+			},
+		}
+
+		m := NewModel(copyIssues(issues), nil, filepath.Join(beadsDir, "issues.jsonl"))
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+		// 1) Default export (activeRecipe == nil) passes Readiness + AuthorityComplete:
+		// claimable READY-P2 gets '--claim', whereas blocked BLOCKED-P0 does NOT!
+		m.exportToMarkdown()
+		if m.statusIsError {
+			t.Fatalf("default exportToMarkdown failed: %s", m.statusMsg)
+		}
+		outPath := filepath.Join(exportDir, m.generateExportFilename())
+		defaultMDBytes, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defaultMD := string(defaultMDBytes)
+		if !strings.Contains(defaultMD, "'--claim' '--' 'READY-P2'") {
+			t.Fatalf("expected default exportToMarkdown with Readiness+AuthorityComplete to emit claim action for READY-P2:\n%s", defaultMD)
+		}
+		if strings.Contains(defaultMD, "'--claim' '--' 'BLOCKED-P0'") {
+			t.Fatalf("blocked issue BLOCKED-P0 must NOT get claim action:\n%s", defaultMD)
+		}
+
+		// 2) Recipe export with View.GroupBy == "priority" honors GroupBy AND Readiness!
+		grpRec := &recipe.Recipe{
+			Name: "grouped-md",
+			View: recipe.ViewConfig{
+				GroupBy: "priority",
+			},
+			Export: recipe.ExportConfig{Format: "markdown"},
+		}
+		m.setActiveRecipe(grpRec)
+		m.applyRecipe(grpRec)
+		m.exportToMarkdown()
+		if m.statusIsError {
+			t.Fatalf("recipe exportToMarkdown failed: %s", m.statusMsg)
+		}
+		groupedMDBytes, err := os.ReadFile(outPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		groupedMD := string(groupedMDBytes)
+		if !strings.Contains(groupedMD, "## Group: 🔥 Critical (P0)") || !strings.Contains(groupedMD, "## Group: 🔹 Medium (P2)") {
+			t.Fatalf("expected priority-grouped markdown to contain ## Group: P0 and P2 headings:\n%s", groupedMD)
+		}
+		if !strings.Contains(groupedMD, "'--claim' '--' 'READY-P2'") || strings.Contains(groupedMD, "'--claim' '--' 'BLOCKED-P0'") {
+			t.Fatalf("expected recipe exportToMarkdown to preserve claimable Readiness semantics:\n%s", groupedMD)
+		}
+	})
+
+	// B-6: Board Esc priority (detail -> search -> expanded -> exit), 24-row Alerts windowing, and Closed-filter open blocker.
+	t.Run("B6_BoardEscDetailFirst24RowAlertsAndClosedBlocker", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "OPEN-BLK", Title: "Open Blocker", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug},
+			{
+				ID: "CLOSED-1", Title: "Closed Dependent", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask,
+				Dependencies: []*model.Dependency{{IssueID: "CLOSED-1", DependsOnID: "OPEN-BLK", Type: model.DepBlocks}},
+			},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+
+		// Under 'c' (Closed filter), OPEN-BLK is still open and must be counted as active (NOT resolved).
+		m.currentFilter = "closed"
+		m.applyFilter()
+		actBlk, resBlk := m.countIssueBlockers(issues[1])
+		if actBlk != 1 || resBlk != 0 {
+			t.Fatalf("expected CLOSED-1 with open blocker OPEN-BLK to have active=1 resolved=0, got active=%d resolved=%d", actBlk, resBlk)
+		}
+
+		// Board Esc priority: HideDetail() FIRST before clearing search, collapsing card, or exiting Board.
+		m.currentFilter = "all"
+		m.applyFilter()
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+		m.board.ToggleExpand()
+		m.board.StartSearch()
+		m.board.AppendSearchChar('o')
+		m.board.FinishSearch()
+		m.board.ShowDetail()
+		if !m.board.IsDetailShown() || m.board.GetSearchQuery() != "o" || !m.board.HasExpandedCard() {
+			t.Fatal("precondition failed for layered Board Esc")
+		}
+
+		// 1st Esc: hides detail panel, preserves search query + expanded card + Board view.
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.board.IsDetailShown() || m.board.GetSearchQuery() != "o" || !m.board.HasExpandedCard() || !m.isBoardView {
+			t.Fatalf("1st Esc should only hide detail: detail=%v query=%q expanded=%v board=%v",
+				m.board.IsDetailShown(), m.board.GetSearchQuery(), m.board.HasExpandedCard(), m.isBoardView)
+		}
+		// 2nd Esc: clears search query, preserves expanded card + Board view.
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.board.GetSearchQuery() != "" || !m.board.HasExpandedCard() || !m.isBoardView {
+			t.Fatalf("2nd Esc should clear search query: query=%q expanded=%v board=%v",
+				m.board.GetSearchQuery(), m.board.HasExpandedCard(), m.isBoardView)
+		}
+		// 3rd Esc: collapses expanded card, preserves Board view.
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.board.HasExpandedCard() || !m.isBoardView {
+			t.Fatalf("3rd Esc should collapse expanded card: expanded=%v board=%v",
+				m.board.HasExpandedCard(), m.isBoardView)
+		}
+		// 4th Esc: exits Board view.
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.isBoardView {
+			t.Fatal("4th Esc should exit Board view")
+		}
+
+		// 24-row Alerts Panel with 12 multi-line alerts + full selected details must NEVER clip '▸ ' or 'Esc: close'.
+		m.alerts = nil
+		for i := 0; i < 12; i++ {
+			m.alerts = append(m.alerts, drift.Alert{
+				Type:                  drift.AlertBlockingCascade,
+				Severity:              drift.SeverityCritical,
+				IssueID:               fmt.Sprintf("OPEN-%02d", i),
+				RelatedIssueID:        "CLOSED-1",
+				UnblocksCount:         4,
+				DownstreamPrioritySum: 7,
+				Message:               fmt.Sprintf("Alert %02d has a long multi-clause diagnostic description wrapping across narrow columns cleanly", i),
+				SuggestedAction:       "Unblock the upstream dependency and re-triage downstream priority cascade",
+			})
+		}
+		m.alertsCritical = 12
+		m.showAlertsPanel = true
+		for cur := 0; cur < 12; cur++ {
+			m.alertsCursor = cur
+			panel := ansi.Strip(m.renderAlertsPanel())
+			if !strings.Contains(panel, fmt.Sprintf("▸ ⚠ Alert %02d", cur)) {
+				t.Fatalf("cursor=%d: 24-row renderAlertsPanel clipped selected cursor:\n%s", cur, panel)
+			}
+			if !strings.Contains(panel, "Esc: close") {
+				t.Fatalf("cursor=%d: 24-row renderAlertsPanel clipped footer 'Esc: close':\n%s", cur, panel)
+			}
+		}
+	})
+}
+
+func TestWave10Round2_ExportAuthorityTreeReloadAndBoardQuit(t *testing.T) {
+	t.Run("R2_B1_ExportToMarkdownGatesAuthorityComplete", func(t *testing.T) {
+		projDir := t.TempDir()
+		beadsDir := filepath.Join(projDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+		validLine := `{"id":"api-1","title":"Claimable API Task","status":"open","priority":1,"issue_type":"task"}` + "\n"
+		if err := os.WriteFile(beadsPath, []byte(validLine), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		dbPath := filepath.Join(beadsDir, "beads.db")
+		makeIssues := func() []model.Issue {
+			return []model.Issue{
+				{
+					ID:        "api-1",
+					Title:     "Claimable API Task",
+					Status:    model.StatusOpen,
+					Priority:  1,
+					IssueType: model.TypeTask,
+					Origin: &model.IssueOrigin{
+						LocalID:          "api-1",
+						WorkingDirectory: projDir,
+						TrackerDirectory: beadsDir,
+						Database:         dbPath,
+						Tracker:          "br",
+						Executable:       "br",
+						SupportsClaim:    true,
+					},
+				},
+			}
+		}
+		grpRec := &recipe.Recipe{
+			Name:   "prio-export",
+			View:   recipe.ViewConfig{GroupBy: "priority"},
+			Export: recipe.ExportConfig{Format: "markdown"},
+		}
+		readExport := func(m *Model) string {
+			t.Helper()
+			m.exportToMarkdown()
+			if m.statusIsError {
+				t.Fatalf("exportToMarkdown failed: %s", m.statusMsg)
+			}
+			outPath := filepath.Join(m.workDir, m.generateExportFilename())
+			raw, err := os.ReadFile(outPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(raw)
+		}
+
+		// Clean TUI session: AuthorityComplete == true even with list, repo, and recipe filters.
+		clean := NewModel(makeIssues(), nil, beadsPath)
+		t.Cleanup(clean.Stop)
+		clean.workDir = t.TempDir()
+		clean.currentFilter = "open"
+		clean.applyFilter()
+		clean.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, FailedCount: 0, RepoPrefixes: []string{"api", "web"}})
+		clean.activeRepos = map[string]bool{"api": true}
+		if md := readExport(clean); !strings.Contains(md, "'--claim' '--' 'api-1'") {
+			t.Fatalf("clean filtered TUI session should emit --claim:\n%s", md)
+		}
+		clean.setActiveRecipe(grpRec)
+		clean.applyRecipe(grpRec)
+		if md := readExport(clean); !strings.Contains(md, "'--claim' '--' 'api-1'") {
+			t.Fatalf("clean recipe-filtered TUI session should emit --claim:\n%s", md)
+		}
+
+		// 1) ReadinessScope{AuthorityIncomplete: true} (e.g., bv --as-of or degraded startup)
+		asOf := NewModel(makeIssues(), nil, "", ReadinessScope{AuthorityIncomplete: true})
+		t.Cleanup(asOf.Stop)
+		asOf.workDir = t.TempDir()
+		if md := readExport(asOf); strings.Contains(md, "--claim") {
+			t.Fatalf("ReadinessScope{AuthorityIncomplete: true} must omit --claim:\n%s", md)
+		}
+		asOf.setActiveRecipe(grpRec)
+		asOf.applyRecipe(grpRec)
+		if md := readExport(asOf); strings.Contains(md, "--claim") {
+			t.Fatalf("recipe export with ReadinessScope{AuthorityIncomplete: true} must omit --claim:\n%s", md)
+		}
+
+		// 2) Time-Travel mode (m.timeTravelMode == true)
+		tt := NewModel(makeIssues(), nil, beadsPath)
+		t.Cleanup(tt.Stop)
+		tt.workDir = t.TempDir()
+		tt.timeTravelMode = true
+		if md := readExport(tt); strings.Contains(md, "--claim") {
+			t.Fatalf("timeTravelMode must omit --claim:\n%s", md)
+		}
+
+		// 3) Partial workspace failure (WorkspaceInfo{FailedCount: 1})
+		wsFail := NewModel(makeIssues(), nil, beadsPath)
+		t.Cleanup(wsFail.Stop)
+		wsFail.workDir = t.TempDir()
+		wsFail.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, FailedCount: 1, RepoPrefixes: []string{"api", "web"}})
+		if md := readExport(wsFail); strings.Contains(md, "--claim") {
+			t.Fatalf("partial workspace (FailedCount=1) must omit --claim:\n%s", md)
+		}
+
+		// 4) Stale source reason (m.sourceStaleReason != "")
+		stale := NewModel(makeIssues(), nil, beadsPath)
+		t.Cleanup(stale.Stop)
+		stale.workDir = t.TempDir()
+		stale.sourceStaleReason = "reload failed"
+		if md := readExport(stale); strings.Contains(md, "--claim") {
+			t.Fatalf("stale source must omit --claim:\n%s", md)
+		}
+
+		// 5) Warned FileChangedMsg (corrupt line in JSONL) AND SourceReloadResult{AuthorityIncomplete: true}
+		warned := NewModel(makeIssues(), nil, beadsPath)
+		t.Cleanup(warned.Stop)
+		warned.workDir = t.TempDir()
+		if err := os.WriteFile(beadsPath, []byte(validLine+"{corrupt json line\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		updated, _ := warned.Update(FileChangedMsg{})
+		warned = updated.(*Model)
+		if md := readExport(warned); strings.Contains(md, "--claim") {
+			t.Fatalf("warned FileChangedMsg reload must omit --claim:\n%s", md)
+		}
+
+		srcReload := NewModel(makeIssues(), nil, "")
+		t.Cleanup(srcReload.Stop)
+		srcReload.workDir = t.TempDir()
+		srcReload.SetSourceReload(func(context.Context) (SourceReloadResult, error) {
+			return SourceReloadResult{
+				Issues:              makeIssues(),
+				Authority:           model.NewReadinessIndex(makeIssues()),
+				AuthorityIncomplete: true,
+			}, nil
+		})
+		_, cmd := srcReload.Update(FileChangedMsg{})
+		if cmd == nil {
+			t.Fatal("expected sourceReloadCmd")
+		}
+		updatedSrc, _ := srcReload.Update(cmd())
+		srcReload = updatedSrc.(*Model)
+		if md := readExport(srcReload); strings.Contains(md, "--claim") {
+			t.Fatalf("SourceReloadResult{AuthorityIncomplete: true} must omit --claim:\n%s", md)
+		}
+	})
+
+	t.Run("R2_B3_UnfocusedBuiltTreeRefreshesOnFileChangedAndSnapshotReady", func(t *testing.T) {
+		projDir := t.TempDir()
+		beadsDir := filepath.Join(projDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+		initialJSONL := strings.Join([]string{
+			`{"id":"TREE-1","title":"OriginalRootTitle","status":"open","priority":0,"issue_type":"epic"}`,
+			`{"id":"TREE-2","title":"ChildTask","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"TREE-2","depends_on_id":"TREE-1","type":"parent-child"}]}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(beadsPath, []byte(initialJSONL), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		loaded, err := loader.LoadIssuesFromFileWithOptionsPooled(beadsPath, loader.ParseOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := NewModel(loaded.Issues, nil, beadsPath)
+		m.pooledIssues = loaded.PoolRefs
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 28})
+
+		// Open Tree ('E'), verify built & initial title, then exit to List ('Esc').
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("E")})
+		if m.focused != focusTree || !m.tree.IsBuilt() {
+			t.Fatalf("expected focusTree with built tree, got focused=%v built=%v", m.focused, m.tree.IsBuilt())
+		}
+		if !strings.Contains(ansi.Strip(m.tree.View()), "OriginalRootTitle") {
+			t.Fatalf("expected OriginalRootTitle in initial tree view:\n%s", ansi.Strip(m.tree.View()))
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.focused != focusList {
+			t.Fatalf("expected focusList after Esc from Tree, got %v", m.focused)
+		}
+
+		// Reload via FileChangedMsg while Tree is unfocused (recycles oldPooled).
+		updatedJSONL := strings.Join([]string{
+			`{"id":"TREE-1","title":"ReloadedSyncRootTitle","status":"open","priority":0,"issue_type":"epic"}`,
+			`{"id":"TREE-2","title":"ChildTask","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"TREE-2","depends_on_id":"TREE-1","type":"parent-child"}]}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(beadsPath, []byte(updatedJSONL), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		m.Update(FileChangedMsg{})
+
+		// Re-open Tree ('E'): must show ReloadedSyncRootTitle with zero stale pooled pointers.
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("E")})
+		treeAfterSync := ansi.Strip(m.tree.View())
+		if !strings.Contains(treeAfterSync, "ReloadedSyncRootTitle") || strings.Contains(treeAfterSync, "OriginalRootTitle") {
+			t.Fatalf("expected unfocused built tree refreshed on FileChangedMsg:\n%s", treeAfterSync)
+		}
+
+		// Exit to List again ('Esc') and deliver SnapshotReadyMsg with updated title.
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		snapJSONL := strings.Join([]string{
+			`{"id":"TREE-1","title":"SnapshotRootTitle","status":"open","priority":0,"issue_type":"epic"}`,
+			`{"id":"TREE-2","title":"ChildTask","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"TREE-2","depends_on_id":"TREE-1","type":"parent-child"}]}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(beadsPath, []byte(snapJSONL), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		snapLoaded, err := loader.LoadIssuesFromFileWithOptionsPooled(beadsPath, loader.ParseOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		snap := NewSnapshotBuilder(snapLoaded.Issues).Build()
+		snap.DataHash = "snap-hash-v2"
+		snap.attachPooledIssues(snapLoaded.PoolRefs)
+		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 2})
+
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("E")})
+		treeAfterSnap := ansi.Strip(m.tree.View())
+		if !strings.Contains(treeAfterSnap, "SnapshotRootTitle") || strings.Contains(treeAfterSnap, "ReloadedSyncRootTitle") {
+			t.Fatalf("expected unfocused built tree refreshed on SnapshotReadyMsg:\n%s", treeAfterSnap)
+		}
+	})
+
+	t.Run("R2_B4_BoardQuitHidesDetailPanel", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "BRD-1", Title: "Board Quit Card", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		}
+		m := NewModel(issues, nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 28})
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+		m.board.ShowDetail()
+		m.board.ToggleExpand()
+		m.board.StartSearch()
+		m.board.AppendSearchChar('b')
+		m.board.FinishSearch()
+
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+		if m.isBoardView || m.board.IsDetailShown() || m.board.HasExpandedCard() || m.board.GetSearchQuery() != "" {
+			t.Fatalf("'q' in Board must exit and clear detail/expanded/search: board=%v detail=%v expanded=%v query=%q",
+				m.isBoardView, m.board.IsDetailShown(), m.board.HasExpandedCard(), m.board.GetSearchQuery())
+		}
+	})
+
+	t.Run("R3_B1a_SourceDegradedRetainsAuthorityIncompleteAcrossSyncAndSnapshotReloads", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+		raw := `{"id":"DEG-1","title":"Fallback JSONL Issue","status":"open","priority":1,"issue_type":"task"}` + "\n"
+		if err := os.WriteFile(beadsPath, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := loader.LoadIssuesFromFileWithOptionsPooled(beadsPath, loader.ParseOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		loader.AttachIssueOrigins(loaded.Issues, beadsPath, false)
+		m := NewModel(loaded.Issues, nil, beadsPath, ReadinessScope{
+			AuthorityIncomplete: true,
+			SourceDegraded:      true,
+		})
+		m.pooledIssues = loaded.PoolRefs
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 28})
+
+		if !m.authorityIncomplete {
+			t.Fatalf("expected initial m.authorityIncomplete=true on degraded fallback")
+		}
+		// 1) Sync FileChangedMsg reload on syntax-clean fallback JSONL must NOT clear authorityIncomplete or read-only Origin.
+		m.Update(FileChangedMsg{})
+		if !m.authorityIncomplete {
+			t.Fatalf("expected m.authorityIncomplete=true after sync FileChangedMsg on degraded fallback")
+		}
+		if len(m.issues) == 0 || m.issues[0].Origin == nil || m.issues[0].Origin.ReadOnlyReason == "" {
+			t.Fatalf("expected Origin.ReadOnlyReason retained after sync reload, got %+v", m.issues[0].Origin)
+		}
+
+		// 2) BackgroundWorker snapshot build with SourceDegraded=true must ALSO set AuthorityComplete=false and retain read-only Origin.
+		bw, err := NewBackgroundWorker(WorkerConfig{
+			BeadsPath:      beadsPath,
+			SourceDegraded: true,
+			DebounceDelay:  50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bw.Stop()
+		snap := bw.buildSnapshot(true)
+		if snap == nil {
+			t.Fatalf("buildSnapshot returned nil")
+		}
+		if snap.AuthorityComplete {
+			t.Fatalf("expected BackgroundWorker snapshot AuthorityComplete=false when SourceDegraded=true")
+		}
+		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 1})
+		if !m.authorityIncomplete {
+			t.Fatalf("expected m.authorityIncomplete=true after SnapshotReadyMsg on degraded fallback")
+		}
+		if len(m.issues) == 0 || m.issues[0].Origin == nil || m.issues[0].Origin.ReadOnlyReason == "" {
+			t.Fatalf("expected Origin.ReadOnlyReason retained after SnapshotReadyMsg, got %+v", m.issues[0].Origin)
+		}
+	})
+
+	t.Run("R3_B1b_SnapshotErrorSetsSourceStaleReasonUntilSnapshotReady", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "BG-1", Title: "Background Issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		}
+		m := NewModel(issues, nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 28})
+
+		m.Update(SnapshotErrorMsg{Err: fmt.Errorf("corrupt jsonl"), Recoverable: true})
+		if m.sourceStaleReason == "" || !m.statusIsError {
+			t.Fatalf("expected SnapshotErrorMsg to set sourceStaleReason and statusIsError, got stale=%q err=%v", m.sourceStaleReason, m.statusIsError)
+		}
+
+		snap := NewSnapshotBuilder(issues).Build()
+		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 1})
+		if m.sourceStaleReason != "" || m.statusIsError {
+			t.Fatalf("expected SnapshotReadyMsg to clear sourceStaleReason and statusIsError, got stale=%q err=%v", m.sourceStaleReason, m.statusIsError)
 		}
 	})
 }

@@ -856,6 +856,9 @@ func TestTreeStateVersion(t *testing.T) {
 // =============================================================================
 
 func TestVisibleRange(t *testing.T) {
+	// With 1 header line and 1 scroll-indicator footer line when scrolling is needed,
+	// height=10 reserves 8 node rows when nodeCount > 9, and 9 node rows when nodeCount <= 9.
+	// Default height=20 reserves 18 node rows when scrolling is needed.
 	tests := []struct {
 		name      string
 		nodeCount int
@@ -866,15 +869,16 @@ func TestVisibleRange(t *testing.T) {
 	}{
 		{"empty tree", 0, 10, 0, 0, 0},
 		{"fewer nodes than viewport", 5, 10, 0, 0, 5},
-		{"exact fit", 10, 10, 0, 0, 10},
-		{"offset at start", 100, 10, 0, 0, 10},
-		{"offset in middle", 100, 10, 45, 45, 55},
-		{"offset near end", 100, 10, 90, 90, 100},
-		{"offset past end clamps", 100, 10, 95, 90, 100},
-		{"zero height uses default 20", 100, 0, 0, 0, 20},
-		{"negative height uses default 20", 100, -5, 0, 0, 20},
+		{"exact fit under header", 9, 10, 0, 0, 9},
+		{"ten nodes triggers scroll footer", 10, 10, 0, 0, 8},
+		{"offset at start", 100, 10, 0, 0, 8},
+		{"offset in middle", 100, 10, 45, 45, 53},
+		{"offset near end", 100, 10, 92, 92, 100},
+		{"offset past end clamps", 100, 10, 95, 92, 100},
+		{"zero height uses default 20 (18 node rows)", 100, 0, 0, 0, 18},
+		{"negative height uses default 20 (18 node rows)", 100, -5, 0, 0, 18},
 		{"single node", 1, 10, 0, 0, 1},
-		{"negative offset clamps to start", 100, 10, -5, 0, 10},
+		{"negative offset clamps to start", 100, 10, -5, 0, 8},
 		{"negative offset small list", 5, 10, -5, 0, 5},
 	}
 
@@ -921,15 +925,15 @@ func TestVisibleRangePerformance(t *testing.T) {
 	tree := NewTreeModel(testTheme())
 	tree.height = 20
 
-	// Large tree
+	// Large tree (height 20 -> 1 header + 18 nodes + 1 footer)
 	tree.flatList = make([]*IssueTreeNode, 100000)
 	tree.viewportOffset = 50000
 
 	// Should complete instantly (O(1))
 	start, end := tree.visibleRange()
 
-	if start != 50000 || end != 50020 {
-		t.Errorf("visibleRange() = (%d, %d), want (50000, 50020)", start, end)
+	if start != 50000 || end != 50018 {
+		t.Errorf("visibleRange() = (%d, %d), want (50000, 50018)", start, end)
 	}
 }
 
@@ -1396,6 +1400,8 @@ func TestLoadStateStaleIDs(t *testing.T) {
 
 // TestEnsureCursorVisible verifies the cursor-follows-viewport behavior
 func TestEnsureCursorVisible(t *testing.T) {
+	// For height=10 with 100 nodes: 1 header + 8 visible nodes + 1 footer => visibleCount=8.
+	// For height=0 (default 20) with 100 nodes: visibleCount=18.
 	tests := []struct {
 		name          string
 		nodeCount     int
@@ -1406,17 +1412,17 @@ func TestEnsureCursorVisible(t *testing.T) {
 	}{
 		{"cursor at start, offset at start", 100, 10, 0, 0, 0},
 		{"cursor in visible range", 100, 10, 5, 0, 0},
-		{"cursor below viewport - scroll down", 100, 10, 15, 0, 6},
+		{"cursor below viewport - scroll down", 100, 10, 15, 0, 8},
 		{"cursor above viewport - scroll up", 100, 10, 0, 10, 0},
-		{"cursor at viewport bottom edge", 100, 10, 9, 0, 0},
-		{"cursor just past viewport bottom", 100, 10, 10, 0, 1},
-		{"cursor at end of list", 100, 10, 99, 0, 90},
+		{"cursor at viewport bottom edge", 100, 10, 7, 0, 0},
+		{"cursor just past viewport bottom", 100, 10, 8, 0, 1},
+		{"cursor at end of list", 100, 10, 99, 0, 92},
 		{"offset already correct", 100, 10, 50, 45, 45},
 		{"empty list", 0, 10, 0, 0, 0},
 		{"single node", 1, 10, 0, 0, 0},
 		{"fewer nodes than viewport", 5, 10, 3, 0, 0},
-		{"zero height uses default 20", 100, 0, 25, 0, 6},
-		{"large cursor with max offset clamping", 100, 10, 95, 0, 86},
+		{"zero height uses default 20 (18 node rows)", 100, 0, 25, 0, 8},
+		{"large cursor with max offset clamping", 100, 10, 95, 0, 88},
 	}
 
 	for _, tt := range tests {
@@ -1440,18 +1446,11 @@ func TestEnsureCursorVisible(t *testing.T) {
 				t.Errorf("ensureCursorVisible() offset = %d, want %d", tree.viewportOffset, tt.wantOffset)
 			}
 
-			// Verify cursor is now within visible range (unless empty)
 			if tt.nodeCount > 0 {
-				visibleCount := tt.height
-				if visibleCount <= 0 {
-					visibleCount = 20
-				}
-				if tree.cursor < tree.viewportOffset || tree.cursor >= tree.viewportOffset+visibleCount {
-					// This check needs adjustment for edge case where list is smaller than viewport
-					if tt.nodeCount > visibleCount && tree.cursor >= tree.viewportOffset+visibleCount {
-						t.Errorf("cursor %d not visible with offset %d and height %d",
-							tree.cursor, tree.viewportOffset, visibleCount)
-					}
+				_, visibleCount, _ := tree.treeViewportLayout()
+				if tt.nodeCount > visibleCount && (tree.cursor < tree.viewportOffset || tree.cursor >= tree.viewportOffset+visibleCount) {
+					t.Errorf("cursor %d not visible with offset %d and visibleCount %d",
+						tree.cursor, tree.viewportOffset, visibleCount)
 				}
 			}
 		})
@@ -1576,10 +1575,9 @@ func TestViewRendersOnlyVisible(t *testing.T) {
 	output := tree.View()
 	lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
 
-	// Should have exactly 11 lines: 10 content lines + 1 position indicator (bv-2nax)
-	// The position indicator shows "[start-end of total]" when scrolling is needed
-	if len(lines) != 11 {
-		t.Errorf("expected 11 lines (10 content + 1 indicator), got %d", len(lines))
+	// Must NEVER exceed t.height (10): 1 header + 8 content lines + 1 position indicator = 10 lines.
+	if len(lines) != 10 {
+		t.Errorf("expected 10 lines (1 header + 8 content + 1 indicator, <= height=10), got %d:\n%s", len(lines), output)
 	}
 
 	// Should contain node 50's content (issue-50)
@@ -1587,9 +1585,9 @@ func TestViewRendersOnlyVisible(t *testing.T) {
 		t.Error("first visible node (issue-50) not rendered")
 	}
 
-	// Should contain node 59's content (last visible)
-	if !strings.Contains(output, "issue-59") {
-		t.Error("last visible node (issue-59) not rendered")
+	// Should contain node 57's content (last visible in 8-node window)
+	if !strings.Contains(output, "issue-57") {
+		t.Error("last visible node (issue-57) not rendered")
 	}
 
 	// Should NOT contain node 0's content
@@ -1602,9 +1600,9 @@ func TestViewRendersOnlyVisible(t *testing.T) {
 		t.Error("non-visible node (issue-49) incorrectly rendered")
 	}
 
-	// Should NOT contain node 60's content (just after viewport)
-	if strings.Contains(output, "issue-60") {
-		t.Error("non-visible node (issue-60) incorrectly rendered")
+	// Should NOT contain node 58's content (just after 8-node viewport)
+	if strings.Contains(output, "issue-58") {
+		t.Error("non-visible node (issue-58) incorrectly rendered")
 	}
 }
 
@@ -1694,14 +1692,14 @@ func TestViewAtEndOfList(t *testing.T) {
 		t.Error("last issue (issue-99) not rendered")
 	}
 
-	// Should contain issue-90 (10 items from the end)
-	if !strings.Contains(output, "issue-90") {
-		t.Error("issue-90 not rendered")
+	// Should contain issue-92 (8 items from the end: 92..99)
+	if !strings.Contains(output, "issue-92") {
+		t.Error("issue-92 not rendered")
 	}
 
-	// Should NOT contain issue-89
-	if strings.Contains(output, "issue-89") {
-		t.Error("issue-89 incorrectly rendered")
+	// Should NOT contain issue-91
+	if strings.Contains(output, "issue-91") {
+		t.Error("issue-91 incorrectly rendered")
 	}
 }
 
@@ -1723,12 +1721,12 @@ func TestPositionIndicatorShown(t *testing.T) {
 
 	tree := NewTreeModel(testTheme())
 	tree.Build(issues)
-	tree.SetSize(80, 10) // Viewport of 10, 100 nodes
+	tree.SetSize(80, 10) // Viewport of 10 (1 header + 8 nodes + 1 indicator), 100 nodes
 
 	output := tree.View()
 
-	// Should contain position indicator "[1-10 of 100]"
-	if !strings.Contains(output, "[1-10 of 100]") {
+	// Should contain position indicator "[1-8 of 100]"
+	if !strings.Contains(output, "[1-8 of 100]") {
 		t.Errorf("position indicator not found in output, got:\n%s", output)
 	}
 }
@@ -1803,8 +1801,421 @@ func TestPositionIndicatorAtEnd(t *testing.T) {
 
 	output := tree.View()
 
-	// Should contain "[91-100 of 100]"
-	if !strings.Contains(output, "[91-100 of 100]") {
+	// Should contain "[93-100 of 100]"
+	if !strings.Contains(output, "[93-100 of 100]") {
 		t.Errorf("position indicator at end not found, got:\n%s", output)
+	}
+}
+
+// TestTreeModeBlockingHierarchyCyclesAndViewport verifies TreeModeBlocking builds
+// blocker->dependent chains, breaks pure cycles deterministically without dropping nodes,
+// keeps View() within height, and scrolls off-screen targets via SelectByID (bv-apal.52).
+func TestTreeModeBlockingHierarchyCyclesAndViewport(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "BLK-ROOT", Title: "Root Blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask},
+		{
+			ID: "BLK-MID", Title: "Mid Dependent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "BLK-MID", DependsOnID: "BLK-ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "BLK-LEAF", Title: "Leaf Dependent", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "BLK-LEAF", DependsOnID: "BLK-MID", Type: model.DepBlocks}},
+		},
+		// Disconnected pure 2-node blocking cycle: CYC-A <-> CYC-B
+		{
+			ID: "CYC-A", Title: "Cycle A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug,
+			Dependencies: []*model.Dependency{{IssueID: "CYC-A", DependsOnID: "CYC-B", Type: model.DepBlocks}},
+		},
+		{
+			ID: "CYC-B", Title: "Cycle B", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug,
+			Dependencies: []*model.Dependency{{IssueID: "CYC-B", DependsOnID: "CYC-A", Type: model.DepBlocks}},
+		},
+		// Unrelated standalone issue without blocking edges
+		{ID: "SOLO-1", Title: "Standalone Task", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeTask},
+	}
+
+	tree := NewTreeModel(newTreeTestTheme())
+	tree.SetSize(100, 12)
+	tree.Build(issues)
+
+	// In Hierarchy mode with zero parent-child edges, header hints Blocking Tree mode.
+	hierOut := tree.View()
+	if !strings.Contains(hierOut, "[Hierarchy]") || !strings.Contains(hierOut, "Blocking Tree mode") {
+		t.Fatalf("expected Hierarchy header badge and Blocking Tree hint when no parent-child deps exist, got:\n%s", hierOut)
+	}
+
+	// Switch to Blocking Chain mode via CycleMode.
+	tree.CycleMode()
+	if tree.Mode() != TreeModeBlocking {
+		t.Fatalf("expected TreeModeBlocking after CycleMode, got %v", tree.Mode())
+	}
+
+	blkOut := tree.View()
+	if !strings.Contains(blkOut, "[Blocking Chain]") {
+		t.Fatalf("expected [Blocking Chain] mode badge, got:\n%s", blkOut)
+	}
+	if strings.Contains(blkOut, "SOLO-1") {
+		t.Fatalf("expected non-blocking standalone issue SOLO-1 excluded from Blocking Chain roots, got:\n%s", blkOut)
+	}
+	for _, wantID := range []string{"BLK-ROOT", "BLK-MID", "BLK-LEAF", "CYC-A", "CYC-B"} {
+		if !strings.Contains(blkOut, wantID) {
+			t.Fatalf("expected %s visible in Blocking Chain tree (including cycle fallback), got:\n%s", wantID, blkOut)
+		}
+	}
+
+	// Verify View() height never exceeds configured height even with many nodes + scroll footer.
+	var many []model.Issue
+	many = append(many, model.Issue{ID: "R-00", Title: "Root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeEpic})
+	for i := 1; i <= 30; i++ {
+		many = append(many, model.Issue{
+			ID:       fmt.Sprintf("D-%02d", i),
+			Title:    fmt.Sprintf("Dep %d", i),
+			Status:   model.StatusOpen,
+			Priority: 1,
+			Dependencies: []*model.Dependency{
+				{IssueID: fmt.Sprintf("D-%02d", i), DependsOnID: "R-00", Type: model.DepBlocks},
+			},
+		})
+	}
+	tree.SetSize(90, 10)
+	tree.Build(many)
+	outTall := tree.View()
+	if lines := strings.Split(outTall, "\n"); len(lines) > 10 {
+		t.Fatalf("expected TreeModel.View() <= 10 lines, got %d lines:\n%s", len(lines), outTall)
+	}
+
+	// SelectByID must scroll off-screen target into the visible viewport.
+	if !tree.SelectByID("D-28") {
+		t.Fatal("expected SelectByID(D-28) to succeed")
+	}
+	outSelected := tree.View()
+	if !strings.Contains(outSelected, "D-28") {
+		t.Fatalf("expected SelectByID(D-28) to scroll D-28 into viewport, got:\n%s", outSelected)
+	}
+}
+
+func countAllTreeNodes(nodes []*IssueTreeNode) int {
+	total := 0
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		total++
+		total += countAllTreeNodes(n.Children)
+	}
+	return total
+}
+
+func TestTreeModeBlockingWaveDAGLinearBoundAndPerformance(t *testing.T) {
+	// 15 layers x 4 beads = 60 issues, 14 * 16 = 224 blocking edges (plus duplicate parallel edges).
+	// Unpruned path enumeration would allocate 4^15 > 10^9 nodes; DAG subtree deduplication bounds this to O(V + E).
+	const (
+		layers = 15
+		width  = 4
+	)
+	issues := make([]model.Issue, 0, layers*width)
+	for layer := 0; layer < layers; layer++ {
+		for col := 0; col < width; col++ {
+			id := fmt.Sprintf("W%02d-B%d", layer, col)
+			iss := model.Issue{
+				ID:        id,
+				Title:     fmt.Sprintf("Wave %d Bead %d", layer, col),
+				Status:    model.StatusOpen,
+				Priority:  1,
+				IssueType: model.TypeTask,
+			}
+			if layer > 0 {
+				for prevCol := 0; prevCol < width; prevCol++ {
+					blockerID := fmt.Sprintf("W%02d-B%d", layer-1, prevCol)
+					iss.Dependencies = append(iss.Dependencies, &model.Dependency{
+						IssueID:     id,
+						DependsOnID: blockerID,
+						Type:        model.DepBlocks,
+					})
+					// Add duplicate parallel blocking edge on wave 0 -> wave 1 to verify deduplication.
+					if layer == 1 && prevCol == 0 {
+						iss.Dependencies = append(iss.Dependencies, &model.Dependency{
+							IssueID:     id,
+							DependsOnID: blockerID,
+							Type:        model.DepBlocks,
+						})
+					}
+				}
+			}
+			issues = append(issues, iss)
+		}
+	}
+
+	tree := NewTreeModel(newTreeTestTheme())
+	tree.SetSize(120, 40)
+	tree.Build(issues)
+
+	start := time.Now()
+	tree.SetMode(TreeModeBlocking)
+	elapsed := time.Since(start)
+	if elapsed >= 100*time.Millisecond {
+		t.Fatalf("SetMode(TreeModeBlocking) on 15x4 wave DAG took %v, want < 100ms", elapsed)
+	}
+
+	totalNodes := countAllTreeNodes(tree.roots)
+	if totalNodes > 350 {
+		t.Fatalf("expected O(V+E) bounded node count <= 350, got %d", totalNodes)
+	}
+	if len(tree.roots) != width {
+		t.Fatalf("expected %d wave-0 roots, got %d", width, len(tree.roots))
+	}
+	// Parallel blocking edge W00-B0 -> W01-B* must be deduplicated to exactly 4 children.
+	if got := len(tree.roots[0].Children); got != width {
+		t.Fatalf("expected parallel blocking edges deduplicated to %d children on W00-B0, got %d", width, got)
+	}
+
+	// Every issue in issueMap must point to its primary expanded node (never overwritten by SharedRef leaf copy).
+	for layer := 0; layer < layers-1; layer++ {
+		for col := 0; col < width; col++ {
+			id := fmt.Sprintf("W%02d-B%d", layer, col)
+			primary := tree.issueMap[id]
+			if primary == nil {
+				t.Fatalf("missing %s in tree.issueMap", id)
+			}
+			if primary.SharedRef || len(primary.Children) != width {
+				t.Fatalf("expected primary node for %s with %d children and SharedRef=false, got children=%d SharedRef=%v",
+					id, width, len(primary.Children), primary.SharedRef)
+			}
+		}
+	}
+
+	// Second root W00-B1 must still visibly list wave-1 children as SharedRef leaf nodes ("↪").
+	secondRoot := tree.roots[1]
+	if len(secondRoot.Children) != width {
+		t.Fatalf("expected W00-B1 to retain %d visible downstream children, got %d", width, len(secondRoot.Children))
+	}
+	for _, ch := range secondRoot.Children {
+		if !ch.SharedRef || len(ch.Children) != 0 {
+			t.Fatalf("expected shared DAG child %s under W00-B1 to be leaf SharedRef=true, got SharedRef=%v children=%d",
+				ch.Issue.ID, ch.SharedRef, len(ch.Children))
+		}
+	}
+
+	tree.ExpandAll()
+	rendered := tree.View()
+	if !strings.Contains(rendered, "↪") {
+		t.Fatalf("expected shared DAG reference indicator '↪' in rendered Blocking view, got:\n%s", rendered)
+	}
+}
+
+func TestTreeModeBlockingPreservesHierarchyStateAndDiskFile(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(beadsDir, "tree-state.json")
+
+	issues := []model.Issue{
+		{ID: "EPIC-1", Title: "Epic One", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeEpic},
+		{
+			ID: "TASK-1", Title: "Task One", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{
+				{IssueID: "TASK-1", DependsOnID: "EPIC-1", Type: model.DepParentChild},
+			},
+		},
+		{
+			ID: "SUB-1", Title: "Subtask One", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{
+				{IssueID: "SUB-1", DependsOnID: "TASK-1", Type: model.DepParentChild},
+				{IssueID: "SUB-1", DependsOnID: "EPIC-2", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "EPIC-2", Title: "Epic Two Blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeEpic,
+		},
+		{
+			ID: "TASK-2", Title: "Task Two", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{
+				{IssueID: "TASK-2", DependsOnID: "EPIC-2", Type: model.DepParentChild},
+				{IssueID: "TASK-2", DependsOnID: "EPIC-1", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	tree := NewTreeModel(newTreeTestTheme())
+	tree.SetBeadsDir(beadsDir)
+	tree.SetSize(100, 30)
+	tree.Build(issues)
+
+	// Customize Hierarchy expand state: collapse EPIC-1, keep EPIC-2 expanded.
+	if !tree.SelectByID("EPIC-1") {
+		t.Fatal("expected SelectByID(EPIC-1) in Hierarchy mode")
+	}
+	tree.ToggleExpand() // collapses EPIC-1 and persists .beads/tree-state.json
+	if tree.issueMap["EPIC-1"].Expanded {
+		t.Fatal("expected EPIC-1 collapsed in Hierarchy mode")
+	}
+	if !tree.issueMap["EPIC-2"].Expanded {
+		t.Fatal("expected EPIC-2 expanded in Hierarchy mode")
+	}
+
+	wantDiskBytes, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("expected Hierarchy tree-state.json written at %s: %v", statePath, err)
+	}
+
+	// Switch to Blocking mode and perform destructive expand/collapse mutations.
+	tree.SetMode(TreeModeBlocking)
+	tree.CollapseAll()
+	tree.ExpandAll()
+	tree.CollapseAll()
+	if tree.SelectByID("EPIC-1") {
+		tree.ToggleExpand()
+	}
+
+	// Disk file MUST remain byte-for-byte identical during TreeModeBlocking mutations.
+	gotDiskDuringBlocking, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("expected tree-state.json still readable: %v", err)
+	}
+	if string(gotDiskDuringBlocking) != string(wantDiskBytes) {
+		t.Fatalf("TreeModeBlocking corrupted .beads/tree-state.json!\ngot:\n%s\nwant:\n%s",
+			string(gotDiskDuringBlocking), string(wantDiskBytes))
+	}
+
+	// Switch back to Hierarchy mode: EPIC-1 must still be collapsed and EPIC-2 expanded!
+	tree.SetMode(TreeModeHierarchy)
+	if tree.issueMap["EPIC-1"].Expanded {
+		t.Fatal("expected EPIC-1 to remain collapsed after returning from Blocking -> Hierarchy")
+	}
+	if !tree.issueMap["EPIC-2"].Expanded {
+		t.Fatal("expected EPIC-2 to remain expanded after returning from Blocking -> Hierarchy")
+	}
+	if !tree.issueMap["TASK-1"].Expanded {
+		t.Fatal("expected TASK-1 depth-1 default expanded preserved after Blocking CollapseAll")
+	}
+
+	gotDiskAfterReturn, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotDiskAfterReturn) != string(wantDiskBytes) {
+		t.Fatalf("returning to Hierarchy altered .beads/tree-state.json:\ngot:\n%s\nwant:\n%s",
+			string(gotDiskAfterReturn), string(wantDiskBytes))
+	}
+}
+
+func TestTreeModeBlockingBFSMinimumDepthSharedRefJumpAndCollapsedSelect(t *testing.T) {
+	// Deep P0 chain R1 -> D1 -> D2 -> D3 -> D4 -> A -> B -> C (A at depth 5 behind default-collapsed D2)
+	// AND shallow P2 root P2 -> A -> B -> C (A at depth 1 under P2).
+	// Raw DFS from P0 R1 would claim A -> B -> C at depth 5 and hide it under collapsed D2;
+	// minimum-depth BFS must make P2 -> A -> B -> C the primary expanded subtree!
+	issues := []model.Issue{
+		{ID: "R1", Title: "Deep Root P0", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeEpic},
+		{
+			ID: "D1", Title: "Deep 1", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "D1", DependsOnID: "R1", Type: model.DepBlocks}},
+		},
+		{
+			ID: "D2", Title: "Deep 2 Default Collapsed", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "D2", DependsOnID: "D1", Type: model.DepBlocks}},
+		},
+		{
+			ID: "D3", Title: "Deep 3", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "D3", DependsOnID: "D2", Type: model.DepBlocks}},
+		},
+		{
+			ID: "D4", Title: "Deep 4", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "D4", DependsOnID: "D3", Type: model.DepBlocks}},
+		},
+		{ID: "P2", Title: "Shallow Root P2", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeEpic},
+		{
+			ID: "A", Title: "Shared Subtree Head", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{
+				{IssueID: "A", DependsOnID: "D4", Type: model.DepBlocks},
+				{IssueID: "A", DependsOnID: "P2", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "B", Title: "Shared Mid", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
+		},
+		{
+			ID: "C", Title: "Shared Leaf", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "C", DependsOnID: "B", Type: model.DepBlocks}},
+		},
+	}
+
+	tree := NewTreeModel(newTreeTestTheme())
+	tree.SetSize(110, 30)
+	tree.SetMode(TreeModeBlocking)
+	tree.Build(issues)
+
+	// 1) P2 -> A -> B -> C is the primary subtree at depth 1..3, so A and B are visible immediately in flatList.
+	primaryA := tree.issueMap["A"]
+	if primaryA == nil || primaryA.SharedRef || primaryA.Parent == nil || primaryA.Parent.Issue.ID != "P2" || primaryA.Depth != 1 {
+		t.Fatalf("expected primary A at depth 1 under P2, got %+v", primaryA)
+	}
+	visibleIDs := make(map[string]bool, len(tree.flatList))
+	for _, n := range tree.flatList {
+		if n != nil && n.Issue != nil && !n.SharedRef {
+			visibleIDs[n.Issue.ID] = true
+		}
+	}
+	if !visibleIDs["A"] || !visibleIDs["B"] {
+		t.Fatalf("expected shallow primary A and B immediately visible in flatList without expanding D2, got %v", visibleIDs)
+	}
+
+	// Verify depth-5 occurrence under D4 is SharedRef=true with no children.
+	nodeD4 := tree.issueMap["D4"]
+	if nodeD4 == nil || len(nodeD4.Children) != 1 || !nodeD4.Children[0].SharedRef || len(nodeD4.Children[0].Children) != 0 {
+		t.Fatalf("expected D4 -> A at depth 5 to be leaf SharedRef=true, got %+v", nodeD4)
+	}
+
+	// 2) Expand R1 chain so depth-5 SharedRef A is visible, collapse P2 so primary A is hidden,
+	// then press Enter (ToggleExpand) and l (ExpandOrMoveToChild) on SharedRef A -> jumps to primary A!
+	tree.ExpandAll()
+	nodeP2 := tree.issueMap["P2"]
+	nodeP2.Expanded = false
+	tree.rebuildFlatList()
+
+	findSharedA := func() int {
+		for idx, n := range tree.flatList {
+			if n != nil && n.SharedRef && n.Issue != nil && n.Issue.ID == "A" {
+				return idx
+			}
+		}
+		return -1
+	}
+
+	sharedIdx := findSharedA()
+	if sharedIdx < 0 {
+		t.Fatal("expected depth-5 SharedRef A visible after ExpandAll")
+	}
+	tree.cursor = sharedIdx
+	tree.ToggleExpand()
+	if sel := tree.SelectedNode(); sel == nil || sel.SharedRef || sel.Issue.ID != "A" || sel.Parent != nodeP2 || !nodeP2.Expanded {
+		t.Fatalf("ToggleExpand on SharedRef A should expand P2 and jump to primary A, got %+v (P2.Expanded=%v)", sel, nodeP2.Expanded)
+	}
+
+	// Repeat with Collapse P2 + ExpandOrMoveToChild ('l' / '→').
+	nodeP2.Expanded = false
+	tree.rebuildFlatList()
+	sharedIdx = findSharedA()
+	if sharedIdx < 0 {
+		t.Fatal("expected depth-5 SharedRef A visible for ExpandOrMoveToChild test")
+	}
+	tree.cursor = sharedIdx
+	tree.ExpandOrMoveToChild()
+	if sel := tree.SelectedNode(); sel == nil || sel.SharedRef || sel.Issue.ID != "A" || sel.Parent != nodeP2 || !nodeP2.Expanded {
+		t.Fatalf("ExpandOrMoveToChild on SharedRef A should expand P2 and jump to primary A, got %+v", sel)
+	}
+
+	// 3) CollapseAll hides C behind collapsed P2 -> A -> B; SelectByID("C") must reveal and focus C.
+	tree.CollapseAll()
+	if !tree.SelectByID("C") {
+		t.Fatal("expected SelectByID(C) to succeed even when ancestors P2, A, B are collapsed")
+	}
+	if sel := tree.SelectedNode(); sel == nil || sel.SharedRef || sel.Issue.ID != "C" {
+		t.Fatalf("expected SelectByID(C) to focus primary C, got %+v", sel)
+	}
+	if !tree.issueMap["P2"].Expanded || !tree.issueMap["A"].Expanded || !tree.issueMap["B"].Expanded {
+		t.Fatal("expected SelectByID(C) to expand collapsed ancestors P2, A, and B")
 	}
 }

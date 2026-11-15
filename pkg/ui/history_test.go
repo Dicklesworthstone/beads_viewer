@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1221,9 +1222,12 @@ func TestHistoryModel_ListHeight(t *testing.T) {
 	h := NewHistoryModel(report, theme)
 
 	h.SetSize(100, 40)
-	expected := 40 - 3 // height - header reserve
+	expected := h.currentPanelHeight() - 5 // panel height minus bordered panel header/separator/borders
 	if intsDiffer(h.listHeight(), expected) {
 		t.Errorf("listHeight() = %d, want %d", h.listHeight(), expected)
+	}
+	if gotHeight := lipgloss.Height(h.View()); gotHeight > 40 {
+		t.Errorf("View() height = %d, want <= 40", gotHeight)
 	}
 }
 
@@ -3808,5 +3812,65 @@ func TestRound2HistoryViewModeFocusClampAndFileTreeGlobalKeys(t *testing.T) {
 	quitCmd := send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
 	if quitCmd == nil {
 		t.Fatal("expected 'q' at top-level list after exiting History view to return quit cmd")
+	}
+}
+
+func TestHistoryTimelineWindowMultiLineCommitsAnd24Rows(t *testing.T) {
+	now := time.Now().UTC()
+	commits := make([]correlation.CorrelatedCommit, 0, 12)
+	for i := 0; i < 12; i++ {
+		commits = append(commits, correlation.CorrelatedCommit{
+			SHA:        fmt.Sprintf("deadbeef%02d", i),
+			ShortSHA:   fmt.Sprintf("deadb%02d", i),
+			Message:    fmt.Sprintf("Multi-line commit subject %02d\nExtra body line that must not break 1-line commit list", i),
+			Author:     "Dev",
+			Timestamp:  now.Add(time.Duration(-12+i) * time.Hour),
+			Confidence: 0.90,
+		})
+	}
+	dur := 12 * time.Hour
+	report := &correlation.HistoryReport{
+		GeneratedAt: now,
+		Histories: map[string]correlation.BeadHistory{
+			"BEAD-TL": {
+				BeadID: "BEAD-TL",
+				Title:  "Timeline 24-row test",
+				Status: "closed",
+				Milestones: correlation.BeadMilestones{
+					Created: &correlation.BeadEvent{Timestamp: now.Add(-14 * time.Hour)},
+					Closed:  &correlation.BeadEvent{Timestamp: now},
+				},
+				Commits:   commits,
+				CycleTime: &correlation.CycleTime{CreateToClose: &dur},
+			},
+		},
+		CommitIndex: correlation.CommitIndex{},
+	}
+
+	h := NewHistoryModel(report, DefaultTheme(lipgloss.NewRenderer(nil)))
+	h.SetSize(120, 22) // 24-row terminal -> 22-row history body
+
+	// Verify 3-column Bead commit list sanitizes multi-line commit messages to 1 line.
+	commitListOut := h.View()
+	if strings.Contains(commitListOut, "Extra body line") {
+		t.Fatalf("expected multi-line commit message sanitized to first line in Bead commit list:\n%s", commitListOut)
+	}
+
+	// Switch to 4-pane layout (width 160 so each commit renders 2 lines in Timeline!), focus Timeline, and scroll to bottom:
+	// Cycle summary and final Closed milestone must BOTH be visible & unclipped on 24-row terminal (22-row body)!
+	h.SetSize(160, 22)
+	if !h.TimelineVisible() {
+		h.ToggleTimeline()
+	}
+	h.ToggleFocus() // List -> Timeline
+	for i := 0; i < 20; i++ {
+		h.MoveDown()
+	}
+	out := h.View()
+	if lines := strings.Split(out, "\n"); len(lines) > 22 {
+		t.Fatalf("expected 24-row HistoryModel.View() <= 22 body lines, got %d:\n%s", len(lines), out)
+	}
+	if !strings.Contains(out, "Closed") || !strings.Contains(out, "Cycle:") {
+		t.Fatalf("expected scrolled Bead timeline on 24-row terminal to reach Closed milestone and keep Cycle footer unclipped:\n%s", out)
 	}
 }

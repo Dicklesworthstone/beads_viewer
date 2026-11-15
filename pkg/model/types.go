@@ -499,6 +499,27 @@ func (i Issue) IsDeferredAt(now time.Time) bool {
 	return i.DeferUntil != nil && i.DeferUntil.After(now)
 }
 
+// IsClosedLikeStatus reports whether s represents a closed or tombstoned state.
+func IsClosedLikeStatus(s Status) bool {
+	norm := s.Normalize()
+	return norm == StatusClosed || norm == StatusTombstone
+}
+
+// IsParkedForStalenessAt reports whether an issue is closed, tombstoned,
+// explicitly deferred/pinned, a template, ephemeral, or actively deferred at
+// now, meaning inactivity is expected and must not trigger staleness alerts or
+// freshness penalties.
+func (i Issue) IsParkedForStalenessAt(now time.Time) bool {
+	norm := i.Status.Normalize()
+	return IsClosedLikeStatus(norm) ||
+		norm == StatusDeferred ||
+		norm == StatusPinned ||
+		i.Pinned ||
+		i.IsTemplate ||
+		i.Ephemeral ||
+		(!now.IsZero() && i.IsDeferredAt(now))
+}
+
 // Validate checks if the issue data is logically valid
 func (i *Issue) Validate() error {
 	if i.ID == "" {

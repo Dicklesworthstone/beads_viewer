@@ -2049,3 +2049,203 @@ func TestGeneratePriorityBriefFromTriageJSON_RendersAlertsAndWhatIf(t *testing.T
 		t.Fatalf("expected Alerts section to remain rendered when alerts are present:\n%s", withoutOptional)
 	}
 }
+
+func TestGenerateMarkdown_DeferredOtherSummaryRowAndGrouping(t *testing.T) {
+	now := time.Date(2026, 11, 14, 15, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "md-open", Title: "Ready API", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, Assignee: "alice", Labels: []string{"security", "backend"}, CreatedAt: now, UpdatedAt: now},
+		{ID: "md-prog", Title: "Active UI", Status: model.StatusInProgress, Priority: 1, IssueType: model.TypeFeature, Assignee: "bob", Labels: []string{"frontend"}, CreatedAt: now, UpdatedAt: now},
+		{ID: "md-def", Title: "Parked Sprint", Status: model.Status("deferred"), Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "md-custom", Title: "QA Signoff", Status: model.Status("qa_review"), Priority: 2, IssueType: model.TypeTask, Assignee: "alice", CreatedAt: now, UpdatedAt: now},
+		{ID: "md-closed", Title: "Shipped Init", Status: model.StatusClosed, Priority: 3, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	}
+
+	md, err := GenerateReport(issues, nil, ReportOptions{
+		Format:       "markdown",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport failed: %v", err)
+	}
+	mdStr := string(md)
+	for _, want := range []string{
+		"| **Total** | 5 |",
+		"| Open | 1 |",
+		"| In Progress | 1 |",
+		"| Blocked | 0 |",
+		"| Deferred / Other | 2 |",
+		"| Closed | 1 |",
+	} {
+		if !strings.Contains(mdStr, want) {
+			t.Fatalf("markdown summary missing %q:\n%s", want, mdStr)
+		}
+	}
+
+	// Verify standard statuses omit Deferred / Other row cleanly.
+	noDeferredMD, err := GenerateReport([]model.Issue{issues[0], issues[4]}, nil, ReportOptions{
+		Format:       "markdown",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(no deferred) failed: %v", err)
+	}
+	if strings.Contains(string(noDeferredMD), "Deferred / Other") {
+		t.Fatalf("expected Deferred / Other row to be omitted when count is 0:\n%s", string(noDeferredMD))
+	}
+
+	// Verify ResolveReportOptions + GroupBy + recipe.ViewConfig.GroupBy render grouped sections and preserve TOC anchors.
+	groupByStatus := "status"
+	resolvedOpts, err := ResolveReportOptions(recipe.ExportConfig{Format: "markdown"}, ReportOverrides{GroupBy: &groupByStatus})
+	if err != nil {
+		t.Fatalf("ResolveReportOptions(GroupBy=status) failed: %v", err)
+	}
+	resolvedOpts.IncludeGraph = false
+	resolvedOpts.GeneratedAt = now
+	groupedStatusRaw, err := GenerateReport(issues, nil, resolvedOpts)
+	if err != nil {
+		t.Fatalf("GenerateReport(GroupBy=status) failed: %v", err)
+	}
+	groupedStatus := string(groupedStatusRaw)
+	for _, want := range []string{
+		"## Group: 🟢 open (1)",
+		"## Group: 🔵 in_progress (1)",
+		"## Group: ⚪ deferred (1)",
+		"## Group: ⚪ qa_review (1)",
+		"## Group: ⚫ closed (1)",
+		`<a id="md-open-ready-api"></a>`,
+		`<a id="md-def-parked-sprint"></a>`,
+	} {
+		if !strings.Contains(groupedStatus, want) {
+			t.Fatalf("grouped status markdown missing %q:\n%s", want, groupedStatus)
+		}
+	}
+
+	// Fallback to View.GroupBy when explicit GroupBy is unset.
+	viewGroupedRaw, err := GenerateReport(issues, nil, ReportOptions{
+		Format:       "markdown",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		View:         recipe.ViewConfig{GroupBy: "assignee"},
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(View.GroupBy=assignee) failed: %v", err)
+	}
+	viewGrouped := string(viewGroupedRaw)
+	alicePos := strings.Index(viewGrouped, "## Group: @alice (2)")
+	bobPos := strings.Index(viewGrouped, "## Group: @bob (1)")
+	unassignedPos := strings.Index(viewGrouped, "## Group: Unassigned (2)")
+	if alicePos < 0 || bobPos < 0 || unassignedPos < 0 || !(alicePos < bobPos && bobPos < unassignedPos) {
+		t.Fatalf("expected deterministic @alice -> @bob -> Unassigned group order:\n%s", viewGrouped)
+	}
+}
+
+func TestGenerateMarkdown_ViewColumnsTagsGroupingAndEscaping(t *testing.T) {
+	now := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:        "bv-1",
+			Title:     "[RC-C17] Pipe | & Bracket [Title]\nNextLine",
+			Status:    model.Status("qa|review"),
+			Priority:  0,
+			IssueType: model.IssueType("sec|bug"),
+			Assignee:  "alice|ops\nteam",
+			Labels:    []string{"auth|v2", "backend"},
+			CreatedAt: now,
+			UpdatedAt: now.Add(24 * time.Hour),
+		},
+		{
+			ID:        "bv-2",
+			Title:     "Downstream Consumer",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "bv-2", DependsOnID: "bv-1", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	// Custom View.Columns + GroupBy: "tags" + TOC bracket escaping + summary/section cell escaping
+	rawCustom, err := GenerateReport(issues, nil, ReportOptions{
+		Format:       "markdown",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		View: recipe.ViewConfig{
+			GroupBy: "tags",
+			Columns: []string{"id", "title", "assignee", "tags", "created", "updated", "blocks", "blocked_by"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(View.Columns + tags) failed: %v", err)
+	}
+	mdCustom := string(rawCustom)
+	for _, want := range []string{
+		"| ID | Title | Assignee | Labels | Created | Updated | Blocks | Blocked By |",
+		`| bv-1 | [RC-C17] Pipe \| & Bracket [Title] NextLine | @alice\|ops team | auth\|v2, backend | 2026-11-15 | 2026-11-16 | bv-2 | - |`,
+		`| bv-2 | Downstream Consumer | - | - | 2026-11-15 | 2026-11-15 | - | bv-1 |`,
+		`- [⚪ bv-1 \[RC-C17\] Pipe | & Bracket \[Title\] NextLine](#`,
+		`## Group: auth|v2 (1)`,
+		`## Group: Unlabeled (1)`,
+		`| **Type** | • sec\|bug |`,
+		`| **Status** | ⚪ qa\|review |`,
+	} {
+		if !strings.Contains(mdCustom, want) {
+			t.Fatalf("expected markdown output to contain %q, got:\n%s", want, mdCustom)
+		}
+	}
+
+	// Empty / unrecognized View.Columns falls back cleanly to default 5 columns
+	rawDefault, err := GenerateReport(issues[:1], nil, ReportOptions{
+		Format:       "markdown",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		View: recipe.ViewConfig{
+			Columns: []string{"unknown_col"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(default fallback columns) failed: %v", err)
+	}
+	if !strings.Contains(string(rawDefault), "| ID | Title | Type | Priority | Status |") {
+		t.Fatalf("expected fallback 5-column header, got:\n%s", string(rawDefault))
+	}
+
+	// Priority brief escapes pipes and newlines across all 4 tables
+	briefJSON := `{
+		"meta": {"version": "1.0", "generated_at": "2026-11-15T10:00:00Z", "phase2_ready": true, "issue_count": 2},
+		"quick_ref": {"open_count": 2, "actionable_count": 1, "blocked_count": 1, "in_progress_count": 0},
+		"recommendations": [{
+			"id": "rec|1",
+			"title": "FixA|B\nLine",
+			"type": "bug",
+			"status": "open",
+			"priority": 0,
+			"score": 0.91,
+			"reasons": ["Unblocks X|Y\nNow"],
+			"unblocks_ids": ["u|1", "u|2"],
+			"breakdown": {"pagerank_norm": 0.8, "betweenness_norm": 0.5, "time_to_impact_norm": 0.9}
+		}],
+		"quick_wins": [{"id": "qw|1", "title": "Win|Title", "score": 0.8, "reason": "Fast|Reason"}],
+		"blockers_to_clear": [{"id": "blk|1", "title": "Blk|Title", "unblocks_count": 2, "unblocks_ids": ["d|1"], "actionable": true}]
+	}`
+	brief, err := GeneratePriorityBriefFromTriageJSON([]byte(briefJSON), DefaultPriorityBriefConfig())
+	if err != nil {
+		t.Fatalf("GeneratePriorityBriefFromTriageJSON failed: %v", err)
+	}
+	for _, want := range []string{
+		`**rec\|1** FixA\|B Line`,
+		`Unblocks X\|Y Now`,
+		`**qw\|1** Win\|Title`,
+		`Fast\|Reason`,
+		`**blk\|1** Blk\|Title`,
+		`u\|1, u\|2`,
+	} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("expected priority brief to escape table cell %q, got:\n%s", want, brief)
+		}
+	}
+}

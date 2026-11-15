@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -2263,15 +2264,40 @@ func TestRobotBurndownSchemaMatchesHandlerEnvelope(t *testing.T) {
 		"total_days", "elapsed_days", "remaining_days",
 		"total_issues", "completed_issues", "remaining_issues",
 		"ideal_burn_rate", "actual_burn_rate", "projected_complete",
-		"on_track", "daily_points", "ideal_line",
+		"on_track", "daily_points", "ideal_line", "at_risk",
 	} {
 		if properties[name] == nil {
 			t.Fatalf("robot-burndown schema missing top-level property %q", name)
 		}
 	}
-	for _, stale := range []string{"burndown", "at_risk"} {
+	for _, stale := range []string{"burndown"} {
 		if properties[stale] != nil {
 			t.Fatalf("robot-burndown schema still exposes stale top-level property %q", stale)
+		}
+	}
+
+	// Verify live BurndownOutput JSON keys match schema properties 1-to-1
+	sampleOut := BurndownOutput{
+		RobotEnvelope: NewRobotEnvelope("abc123"),
+		SprintID:      "sprint-1",
+		SprintName:    "Sprint 1",
+		StartDate:     time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC),
+		EndDate:       time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC),
+		DailyPoints:   []model.BurndownPoint{},
+		IdealLine:     []model.BurndownPoint{},
+		AtRisk:        []analysis.AtRiskItem{},
+	}
+	rawSample, err := json.Marshal(sampleOut)
+	if err != nil {
+		t.Fatalf("marshal sample BurndownOutput: %v", err)
+	}
+	var decodedSample map[string]interface{}
+	if err := json.Unmarshal(rawSample, &decodedSample); err != nil {
+		t.Fatalf("unmarshal sample BurndownOutput: %v", err)
+	}
+	for key := range decodedSample {
+		if properties[key] == nil {
+			t.Fatalf("BurndownOutput emits %q which is missing from robot-burndown schema properties", key)
 		}
 	}
 
@@ -2750,7 +2776,7 @@ func TestModifierFlagValidation(t *testing.T) {
 			name: "history since requires history mode",
 			args: []string{"--history-since", "30 days ago"},
 			wantMessages: []string{
-				"Error: --history-since requires one of --robot-history, --bead-history or --robot-causality",
+				"Error: --history-since requires one of --robot-history, --bead-history, --robot-causality or --robot-commit",
 				"Try: `bv robot-history --history-since \"30 days ago\" --json`.",
 			},
 		},
@@ -3311,6 +3337,7 @@ func TestRobotRegistry_TotalContract(t *testing.T) {
 		"robot-confirm-correlation",
 		"robot-reject-correlation",
 		"robot-correlation-stats",
+		"robot-commit",
 	} {
 		if !primary[mustHave] {
 			t.Errorf("must-have command %q missing from primaryRobotFlagNames()", mustHave)
@@ -3323,7 +3350,7 @@ func TestRobotRegistry_TotalContract(t *testing.T) {
 		}
 	}
 
-	// Live round-trip CLI schema conformance across all 42 registered primary
+	// Live round-trip CLI schema conformance across all 44 registered primary
 	// robot commands against a seeded git + beads + sprint + baseline workspace.
 	exe := buildTestBinary(t)
 	tmpDir := t.TempDir()
@@ -3434,6 +3461,7 @@ func TestRobotRegistry_TotalContract(t *testing.T) {
 		"robot-label-attention":     {"--robot-label-attention"},
 		"robot-orphans":             {"--robot-orphans"},
 		"robot-file-beads":          {"--robot-file-beads", "src/app.go"},
+		"robot-commit":              {"--robot-commit", headSHA},
 		"robot-file-hotspots":       {"--robot-file-hotspots"},
 		"robot-impact":              {"--robot-impact", "src/app.go"},
 		"robot-file-relations":      {"--robot-file-relations", "src/app.go"},
@@ -5463,4 +5491,1145 @@ func fingerprintConfigDir(configDir string) string {
 		return nil
 	})
 	return out
+}
+
+func TestRobotCommitLookupAndScoping(t *testing.T) {
+	exe := buildTestBinary(t)
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	srcDir := filepath.Join(tmpDir, "src")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester",
+			"GIT_AUTHOR_EMAIL=tester@example.com",
+			"GIT_COMMITTER_NAME=Tester",
+			"GIT_COMMITTER_EMAIL=tester@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit("init", "-b", "main")
+	issuesJSONL := strings.Join([]string{
+		`{"id":"bv-1","title":"Auth login pipeline","status":"open","priority":1,"issue_type":"task","labels":["auth"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+		`{"id":"bv-2","title":"Billing webhook handler","status":"open","priority":2,"issue_type":"task","labels":["billing"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(issuesJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "orphan.go"), []byte("package src\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "chore: unrelated bootstrap commit")
+	orphanSHA := runGit("rev-parse", "HEAD")
+
+	if err := os.WriteFile(filepath.Join(srcDir, "auth.go"), []byte("package src\nfunc Login() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "feat: implement bv-1 and bv-2 flows")
+	linkedSHA := runGit("rev-parse", "HEAD")
+
+	// 1. Linked commit lookup via agent intent alias `bv commit HEAD --json`
+	out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "commit", "HEAD", "--json")
+	if err != nil {
+		t.Fatalf("bv commit HEAD --json failed: %v\nstdout:\n%s\nstderr:\n%s", err, out, stderr)
+	}
+	var linked struct {
+		CommitSHA    string `json:"commit_sha"`
+		IsOrphan     bool   `json:"is_orphan"`
+		Author       string `json:"author"`
+		RelatedBeads []struct {
+			BeadID string `json:"bead_id"`
+		} `json:"related_beads"`
+	}
+	if err := json.Unmarshal([]byte(out), &linked); err != nil {
+		t.Fatalf("unmarshal commit lookup: %v\n%s", err, out)
+	}
+	if linked.CommitSHA != linkedSHA {
+		t.Fatalf("commit_sha = %q, want %q", linked.CommitSHA, linkedSHA)
+	}
+	if linked.IsOrphan {
+		t.Fatalf("expected linked commit is_orphan=false, got true")
+	}
+	if len(linked.RelatedBeads) != 2 {
+		t.Fatalf("related_beads len = %d, want 2: %+v", len(linked.RelatedBeads), linked.RelatedBeads)
+	}
+
+	// 2. --label auth and --robot-max-results 1 scope/cap related_beads
+	scopedOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-commit", linkedSHA[:8], "--label", "auth")
+	if err != nil {
+		t.Fatalf("--robot-commit --label auth failed: %v\nstderr:\n%s", err, stderr)
+	}
+	var scoped struct {
+		IsOrphan     bool `json:"is_orphan"`
+		RelatedBeads []struct {
+			BeadID string `json:"bead_id"`
+		} `json:"related_beads"`
+	}
+	if err := json.Unmarshal([]byte(scopedOut), &scoped); err != nil {
+		t.Fatalf("unmarshal scoped commit lookup: %v", err)
+	}
+	if len(scoped.RelatedBeads) != 1 || scoped.RelatedBeads[0].BeadID != "bv-1" || scoped.IsOrphan {
+		t.Fatalf("unexpected --label auth related_beads: %+v", scoped)
+	}
+
+	// 3. Orphan commit returns commit metadata from git and is_orphan=true
+	orphanOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-commit", orphanSHA)
+	if err != nil {
+		t.Fatalf("--robot-commit orphan failed: %v\nstderr:\n%s", err, stderr)
+	}
+	var orphanRes struct {
+		CommitSHA string `json:"commit_sha"`
+		Message   string `json:"message"`
+		IsOrphan  bool   `json:"is_orphan"`
+	}
+	if err := json.Unmarshal([]byte(orphanOut), &orphanRes); err != nil {
+		t.Fatalf("unmarshal orphan commit lookup: %v", err)
+	}
+	if !orphanRes.IsOrphan || orphanRes.CommitSHA != orphanSHA || !strings.Contains(orphanRes.Message, "bootstrap") {
+		t.Fatalf("unexpected orphan commit result: %+v", orphanRes)
+	}
+
+	// 4. Commit outside --history-limit 1 still correlates via 1-commit fallback,
+	//    .beads/-only sync commit reports is_orphan=false & beads_only=true,
+	//    --label mismatch preserves is_orphan=false with filtered_out_count > 0,
+	//    and genuine code orphan rescues probable_beads.
+	syncIssuesJSONL := strings.Join([]string{
+		`{"id":"bv-1","title":"Auth login pipeline","status":"in_progress","priority":1,"issue_type":"task","labels":["auth"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-03T00:00:00Z"}`,
+		`{"id":"bv-2","title":"Billing webhook handler","status":"open","priority":2,"issue_type":"task","labels":["billing"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-03T00:00:00Z"}`,
+		`{"id":"bv-tomb","title":"Deleted legacy task","status":"tombstone","priority":3,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-03T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(syncIssuesJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".beads/issues.jsonl")
+	runGit("commit", "-m", "chore: sync beads tracker")
+	beadsOnlySHA := runGit("rev-parse", "HEAD")
+
+	if err := os.WriteFile(filepath.Join(srcDir, "tomb.go"), []byte("package src\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "chore(bv-tomb): archive legacy tombstoned flow")
+	tombSHA := runGit("rev-parse", "HEAD")
+
+	if err := os.WriteFile(filepath.Join(srcDir, "auth.go"), []byte("package src\nfunc Login() { /* auth login pipeline v2 */ }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "src/auth.go")
+	runGit("commit", "-m", "fix auth login pipeline session handling")
+	rescuedOrphanSHA := runGit("rev-parse", "HEAD")
+
+	// 4a. linkedSHA is older than --history-limit 1, yet still resolves bv-1 & bv-2!
+	outsideOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-commit", linkedSHA, "--history-limit", "1")
+	if err != nil {
+		t.Fatalf("--robot-commit outside --history-limit 1 failed: %v\nstderr:\n%s", err, stderr)
+	}
+	var outsideRes struct {
+		IsOrphan     bool `json:"is_orphan"`
+		RelatedBeads []struct {
+			BeadID string `json:"bead_id"`
+		} `json:"related_beads"`
+	}
+	if err := json.Unmarshal([]byte(outsideOut), &outsideRes); err != nil {
+		t.Fatalf("unmarshal outside-window commit lookup: %v", err)
+	}
+	if outsideRes.IsOrphan || len(outsideRes.RelatedBeads) != 2 {
+		t.Fatalf("expected outside-window linked commit to retain 2 related_beads & is_orphan=false, got %+v", outsideRes)
+	}
+
+	// 4b. --label unmatched preserves is_orphan=false and records filtered_out_count=2
+	mismatchOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-commit", linkedSHA, "--label", "nonexistent")
+	if err != nil {
+		t.Fatalf("--robot-commit --label nonexistent failed: %v\nstderr:\n%s", err, stderr)
+	}
+	var mismatchRes struct {
+		IsOrphan         bool  `json:"is_orphan"`
+		FilteredOutCount int   `json:"filtered_out_count"`
+		RelatedBeads     []any `json:"related_beads"`
+	}
+	if err := json.Unmarshal([]byte(mismatchOut), &mismatchRes); err != nil {
+		t.Fatalf("unmarshal label-mismatch commit lookup: %v", err)
+	}
+	if mismatchRes.IsOrphan || mismatchRes.FilteredOutCount != 2 || len(mismatchRes.RelatedBeads) != 0 {
+		t.Fatalf("expected is_orphan=false, filtered_out_count=2 on label mismatch, got %+v", mismatchRes)
+	}
+
+	// 4c. .beads/-only sync commit is NOT an orphan (beads_only=true, is_orphan=false)
+	beadsOnlyOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-commit", beadsOnlySHA)
+	if err != nil {
+		t.Fatalf("--robot-commit beads-only failed: %v\nstderr:\n%s", err, stderr)
+	}
+	var beadsOnlyRes struct {
+		IsOrphan  bool `json:"is_orphan"`
+		BeadsOnly bool `json:"beads_only"`
+	}
+	if err := json.Unmarshal([]byte(beadsOnlyOut), &beadsOnlyRes); err != nil {
+		t.Fatalf("unmarshal beads-only commit lookup: %v", err)
+	}
+	if beadsOnlyRes.IsOrphan || !beadsOnlyRes.BeadsOnly {
+		t.Fatalf("expected beads-only commit to report is_orphan=false & beads_only=true, got %+v", beadsOnlyRes)
+	}
+
+	// 4d. Commit referencing a tombstoned bead is NOT misclassified as an orphan
+	tombOut, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-commit", tombSHA)
+	if err != nil {
+		t.Fatalf("--robot-commit tombstoned bead failed: %v\nstderr:\n%s", err, stderr)
+	}
+	var tombRes struct {
+		IsOrphan     bool `json:"is_orphan"`
+		RelatedBeads []struct {
+			BeadID string `json:"bead_id"`
+		} `json:"related_beads"`
+	}
+	if err := json.Unmarshal([]byte(tombOut), &tombRes); err != nil {
+		t.Fatalf("unmarshal tombstoned commit lookup: %v", err)
+	}
+	if tombRes.IsOrphan || len(tombRes.RelatedBeads) != 1 || tombRes.RelatedBeads[0].BeadID != "bv-tomb" {
+		t.Fatalf("expected tombstoned bead commit to correlate to bv-tomb with is_orphan=false, got %+v", tombRes)
+	}
+
+	// 4e. Genuine code orphan touching auth.go rescues probable_beads (bv-1) and BV_ROBOT=1 bv commit <sha> works without --json
+	rescueCmd := exec.Command(exe, "commit", rescuedOrphanSHA)
+	rescueCmd.Dir = tmpDir
+	rescueCmd.Env = append(os.Environ(), "BV_ROBOT=1", "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+	rescueBytes, err := rescueCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("BV_ROBOT=1 bv commit failed: %v\n%s", err, string(rescueBytes))
+	}
+	var rescueRes struct {
+		IsOrphan         bool `json:"is_orphan"`
+		OrphanCandidates []struct {
+			BeadID string `json:"bead_id"`
+		} `json:"orphan_candidates"`
+	}
+	if err := json.Unmarshal(rescueBytes, &rescueRes); err != nil {
+		t.Fatalf("unmarshal BV_ROBOT=1 commit lookup: %v\n%s", err, string(rescueBytes))
+	}
+	if !rescueRes.IsOrphan || len(rescueRes.OrphanCandidates) == 0 || rescueRes.OrphanCandidates[0].BeadID != "bv-1" {
+		t.Fatalf("expected orphan rescue to suggest bv-1, got %+v", rescueRes)
+	}
+
+	// 5. Unknown commit exits non-zero with clear stderr
+	if _, badStderr, badErr := runCommandWithTimeout(t, tmpDir, exe, "--robot-commit", "deadbeefdeadbeef"); badErr == nil || !strings.Contains(badStderr, "Commit not found") {
+		t.Fatalf("expected Commit not found error, got err=%v stderr=%q", badErr, badStderr)
+	}
+}
+
+func TestInitDriftBootstrapAndOverwriteGuard(t *testing.T) {
+	exe := buildTestBinary(t)
+	tmpDir := t.TempDir()
+	writeTestBeadsFixture(t, tmpDir)
+
+	// --json alias works with --init-drift without being hijacked into --robot-triage
+	out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--init-drift", "--json")
+	if err != nil {
+		t.Fatalf("--init-drift --format json failed: %v\nstdout:\n%s\nstderr:\n%s", err, out, stderr)
+	}
+	var created map[string]any
+	if err := json.Unmarshal([]byte(out), &created); err != nil {
+		t.Fatalf("unmarshal --init-drift json: %v\n%s", err, out)
+	}
+	if created["action"] != "init_drift" || created["overwritten"] != false {
+		t.Fatalf("unexpected --init-drift payload: %#v", created)
+	}
+	driftPath := filepath.Join(tmpDir, ".bv", "drift.yaml")
+	if _, statErr := os.Stat(driftPath); statErr != nil {
+		t.Fatalf("expected %s to exist: %v", driftPath, statErr)
+	}
+
+	// Refuses to overwrite without --yes
+	if _, dupStderr, dupErr := runCommandWithTimeout(t, tmpDir, exe, "--init-drift"); dupErr == nil || !strings.Contains(dupStderr, "--yes") {
+		t.Fatalf("expected overwrite refusal without --yes, got err=%v stderr=%q", dupErr, dupStderr)
+	}
+
+	// Overwrites cleanly with --yes
+	out2, stderr2, err2 := runCommandWithTimeout(t, tmpDir, exe, "--init-drift", "--yes", "--format", "json")
+	if err2 != nil {
+		t.Fatalf("--init-drift --yes failed: %v\nstdout:\n%s\nstderr:\n%s", err2, out2, stderr2)
+	}
+	var overwritten map[string]any
+	if err := json.Unmarshal([]byte(out2), &overwritten); err != nil {
+		t.Fatalf("unmarshal --init-drift --yes json: %v\n%s", err, out2)
+	}
+	if overwritten["overwritten"] != true {
+		t.Fatalf("expected overwritten=true, got %#v", overwritten)
+	}
+
+	// Rejects --init-drift combined with --as-of
+	if _, asOfStderr, asOfErr := runCommandWithTimeout(t, tmpDir, exe, "--init-drift", "--yes", "--as-of", "HEAD"); asOfErr == nil || !strings.Contains(asOfStderr, "--init-drift cannot be combined with --as-of") {
+		t.Fatalf("expected --init-drift --as-of rejection, got err=%v stderr=%q", asOfErr, asOfStderr)
+	}
+}
+
+func TestDiffSinceHistoricalTombstoneAndCommitTime(t *testing.T) {
+	exe := buildTestBinary(t)
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runGitAt := func(ts string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tmpDir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester",
+			"GIT_AUTHOR_EMAIL=tester@example.com",
+			"GIT_COMMITTER_NAME=Tester",
+			"GIT_COMMITTER_EMAIL=tester@example.com",
+			"GIT_AUTHOR_DATE="+ts,
+			"GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+	}
+
+	runGitAt("2026-02-01T12:00:00Z", "init", "-b", "main")
+	// At HEAD~1: bv-tomb is a tombstone; bv-open depends on bv-tomb so it is ALREADY actionable!
+	histJSONL := strings.Join([]string{
+		`{"id":"bv-tomb","title":"Deleted blocker","status":"tombstone","priority":2,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+		`{"id":"bv-open","title":"Ready task","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"bv-open","depends_on_id":"bv-tomb","type":"blocks"}],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(histJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt("2026-02-01T12:00:00Z", "add", ".")
+	runGitAt("2026-02-01T12:00:00Z", "commit", "-m", "chore: historical state")
+
+	// At HEAD: add one new open issue; bv-open remains actionable (not newly unblocked)
+	currJSONL := histJSONL + `{"id":"bv-new","title":"New task","status":"open","priority":2,"issue_type":"task","created_at":"2026-02-02T00:00:00Z","updated_at":"2026-02-02T00:00:00Z"}` + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(currJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt("2026-02-02T12:00:00Z", "add", ".")
+	runGitAt("2026-02-02T12:00:00Z", "commit", "-m", "feat: add bv-new")
+
+	out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--diff-since", "HEAD~1", "--robot-diff")
+	if err != nil {
+		t.Fatalf("--diff-since HEAD~1 --robot-diff failed: %v\nstderr:\n%s", err, stderr)
+	}
+	var diffPayload struct {
+		Diff struct {
+			FromTimestamp string `json:"from_timestamp"`
+			MetricDeltas  struct {
+				BlockedIssues int `json:"blocked_issues"`
+			} `json:"metric_deltas"`
+		} `json:"diff"`
+	}
+	if err := json.Unmarshal([]byte(out), &diffPayload); err != nil {
+		t.Fatalf("unmarshal --robot-diff: %v\n%s", err, out)
+	}
+	if strings.HasPrefix(diffPayload.Diff.FromTimestamp, "0001-01-01") || !strings.HasPrefix(diffPayload.Diff.FromTimestamp, "2026-02-01") {
+		t.Fatalf("expected historical commit timestamp 2026-02-01..., got %q", diffPayload.Diff.FromTimestamp)
+	}
+	if diffPayload.Diff.MetricDeltas.BlockedIssues != 0 {
+		t.Fatalf("expected blocked_issues delta = 0 (tombstone blocker was already cleared at HEAD~1), got %d", diffPayload.Diff.MetricDeltas.BlockedIssues)
+	}
+}
+
+func TestExportMdHonorsExplicitExportFormatAndPriorityBriefMaxResults(t *testing.T) {
+	exe := buildTestBinary(t)
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issuesJSONL := strings.Join([]string{
+		`{"id":"bv-1","title":"First ready item","status":"open","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+		`{"id":"bv-2","title":"Second ready item","status":"open","priority":2,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(issuesJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	jsonExportPath := filepath.Join(tmpDir, "report.json")
+	if out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--export-md", jsonExportPath, "--export-format", "json"); err != nil {
+		t.Fatalf("--export-md --export-format json failed: %v\nstdout:\n%s\nstderr:\n%s", err, out, stderr)
+	}
+	rawJSON, err := os.ReadFile(jsonExportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exported map[string]any
+	if err := json.Unmarshal(rawJSON, &exported); err != nil {
+		t.Fatalf("expected --export-md --export-format json to emit valid JSON, got error %v:\n%s", err, string(rawJSON))
+	}
+
+	briefPath := filepath.Join(tmpDir, "brief.md")
+	if out, stderr, err := runCommandWithTimeout(t, tmpDir, exe, "--priority-brief", briefPath, "--robot-max-results", "1"); err != nil {
+		t.Fatalf("--priority-brief --robot-max-results 1 failed: %v\nstdout:\n%s\nstderr:\n%s", err, out, stderr)
+	}
+	rawBrief, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	briefStr := string(rawBrief)
+	if !strings.Contains(briefStr, "bv-1") {
+		t.Fatalf("expected brief to include top recommendation bv-1:\n%s", briefStr)
+	}
+	if strings.Contains(briefStr, "Second ready item") {
+		t.Fatalf("expected --robot-max-results 1 to cap priority brief recommendations, got:\n%s", briefStr)
+	}
+}
+
+func TestRobotAlertsSourceInconsistencyAndScopedLabelReadiness(t *testing.T) {
+	exe := buildTestBinary(t)
+
+	// 1. Live SQLite vs JSONL source_inconsistency in --robot-alerts and --check-drift --robot-drift
+	driftDir := t.TempDir()
+	beadsDir := filepath.Join(driftDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jsonlContent := strings.Join([]string{
+		`{"id":"bv-1","title":"Backend API","status":"open","priority":1,"issue_type":"task","labels":["backend"],"created_at":"2026-11-10T00:00:00Z","updated_at":"2026-11-14T00:00:00Z"}`,
+		`{"id":"bv-2","title":"UI Widget","status":"open","priority":2,"issue_type":"task","labels":["frontend"],"created_at":"2026-11-10T00:00:00Z","updated_at":"2026-11-14T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(jsonlContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(beadsDir, "beads.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT,
+			status TEXT NOT NULL,
+			priority INTEGER DEFAULT 3,
+			issue_type TEXT DEFAULT 'task',
+			tombstone INTEGER DEFAULT 0
+		);
+		CREATE TABLE labels (
+			issue_id TEXT NOT NULL,
+			label TEXT NOT NULL
+		);
+		INSERT INTO issues (id, title, status, priority, issue_type) VALUES
+			('bv-1', 'Backend API', 'closed', 1, 'task'),
+			('bv-2', 'UI Widget', 'in_progress', 4, 'task');
+		INSERT INTO labels (issue_id, label) VALUES
+			('bv-1', 'backend'),
+			('bv-2', 'frontend');
+	`)
+	_ = db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alertsOut, stderr, err := runCommandWithTimeout(t, driftDir, exe, "--robot-alerts", "--alert-type", "source_inconsistency", "--label", "backend")
+	if err != nil {
+		t.Fatalf("--robot-alerts --alert-type source_inconsistency failed: %v\nstderr: %s", err, stderr)
+	}
+	var alertsPayload struct {
+		Alerts []struct {
+			Type    string `json:"type"`
+			IssueID string `json:"issue_id"`
+		} `json:"alerts"`
+	}
+	if err := json.Unmarshal([]byte(alertsOut), &alertsPayload); err != nil {
+		t.Fatalf("decode source_inconsistency alerts: %v\n%s", err, alertsOut)
+	}
+	if len(alertsPayload.Alerts) == 0 {
+		t.Fatalf("expected source_inconsistency alert for bv-1, got none:\n%s", alertsOut)
+	}
+	for _, a := range alertsPayload.Alerts {
+		if a.Type != "source_inconsistency" || a.IssueID != "bv-1" {
+			t.Fatalf("expected only scoped bv-1 source_inconsistency alerts under --label backend, got %+v", a)
+		}
+	}
+
+	// 1b. Secondary-only presence alert (bv-99 in SQLite only), source_drift_max_alerts: 0 (unlimited),
+	//     --save-baseline + --robot-drift + --check-drift (exit code 2), and Dolt .beads/dolt suppression.
+	db2, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db2.Exec(`
+		INSERT INTO issues (id, title, status, priority, issue_type) VALUES ('bv-99', 'Unflushed DB item', 'open', 1, 'task');
+		INSERT INTO labels (issue_id, label) VALUES ('bv-99', 'dbonly');
+	`)
+	_ = db2.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Ensure JSONL mtime is newer so loader loads JSONL as primary while SQLite remains secondary
+	dbMtime := time.Date(2026, 11, 14, 1, 0, 0, 0, time.UTC)
+	jsonlMtime := time.Date(2026, 11, 14, 2, 0, 0, 0, time.UTC)
+	_ = os.Chtimes(dbPath, dbMtime, dbMtime)
+	_ = os.Chtimes(filepath.Join(beadsDir, "issues.jsonl"), jsonlMtime, jsonlMtime)
+	if err := os.MkdirAll(filepath.Join(driftDir, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(driftDir, ".bv", "drift.yaml"), []byte("source_drift_alert: true\nsource_drift_max_alerts: 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, sbStderr, sbErr := runCommandWithTimeout(t, driftDir, exe, "--save-baseline", "init"); sbErr != nil {
+		t.Fatalf("--save-baseline failed: %v\nstderr: %s", sbErr, sbStderr)
+	}
+	unscopedAlertsOut, stderr, err := runCommandWithTimeout(t, driftDir, exe, "--robot-alerts", "--alert-type", "source_inconsistency")
+	if err != nil {
+		t.Fatalf("unscoped --robot-alerts failed: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(unscopedAlertsOut, `"bv-99"`) {
+		t.Fatalf("expected unscoped --robot-alerts to retain secondary-only bv-99 presence alert:\n%s", unscopedAlertsOut)
+	}
+	scopedDBOnlyOut, stderr, err := runCommandWithTimeout(t, driftDir, exe, "--robot-alerts", "--alert-type", "source_inconsistency", "--label", "dbonly")
+	if err != nil {
+		t.Fatalf("scoped --label dbonly --robot-alerts failed: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(scopedDBOnlyOut, `"bv-99"`) {
+		t.Fatalf("expected --label dbonly --robot-alerts to include secondary-only bv-99:\n%s", scopedDBOnlyOut)
+	}
+	driftCmd := exec.Command(exe, "--check-drift", "--robot-drift")
+	driftCmd.Dir = driftDir
+	driftCmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+	driftJSONOut, driftJSONErr := driftCmd.Output()
+	var exitErr *exec.ExitError
+	if !errors.As(driftJSONErr, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("expected --robot-drift exit code 2 for warning source_inconsistency, got err=%v\n%s", driftJSONErr, string(driftJSONOut))
+	}
+	if !strings.Contains(string(driftJSONOut), `"source_inconsistency"`) || !strings.Contains(string(driftJSONOut), `"bv-99"`) {
+		t.Fatalf("expected --robot-drift output to include source_inconsistency & bv-99:\n%s", string(driftJSONOut))
+	}
+	checkDriftCmd := exec.Command(exe, "--check-drift")
+	checkDriftCmd.Dir = driftDir
+	checkDriftCmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+	checkOut, checkErr := checkDriftCmd.CombinedOutput()
+	if !errors.As(checkErr, &exitErr) || exitErr.ExitCode() != 2 {
+		t.Fatalf("expected --check-drift exit code 2 for warning source_inconsistency, got err=%v\n%s", checkErr, string(checkOut))
+	}
+
+	// Dolt workspace (.beads/dolt + metadata.json backend=dolt) ignores retired beads.db
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	doltAlertsOut, stderr, err := runCommandWithTimeout(t, driftDir, exe, "--robot-alerts", "--alert-type", "source_inconsistency")
+	if err != nil {
+		t.Fatalf("dolt --robot-alerts failed: %v\nstderr: %s", err, stderr)
+	}
+	if strings.Contains(doltAlertsOut, `"source_inconsistency"`) {
+		t.Fatalf("expected 0 source_inconsistency alerts in Dolt workspace, got:\n%s", doltAlertsOut)
+	}
+
+	// 2. Scoped --robot-label-health, --robot-label-flow, --robot-label-attention, and hybrid --robot-search preserve external readiness
+	labelDir := t.TempDir()
+	labelBeads := filepath.Join(labelDir, ".beads")
+	if err := os.MkdirAll(labelBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	labelJSONL := strings.Join([]string{
+		`{"id":"infra-1","title":"Infra cluster","status":"open","priority":1,"issue_type":"task","labels":["infra"],"created_at":"2026-11-10T00:00:00Z","updated_at":"2026-11-14T00:00:00Z"}`,
+		`{"id":"fe-1","title":"Frontend login","status":"open","priority":1,"issue_type":"task","labels":["frontend"],"dependencies":[{"issue_id":"fe-1","depends_on_id":"infra-1","type":"blocks"}],"created_at":"2026-11-10T00:00:00Z","updated_at":"2026-11-14T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(labelBeads, "issues.jsonl"), []byte(labelJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lhOut, stderr, err := runCommandWithTimeout(t, labelDir, exe, "--robot-label-health", "--label", "frontend")
+	if err != nil {
+		t.Fatalf("--robot-label-health --label frontend failed: %v\nstderr: %s", err, stderr)
+	}
+	var lhPayload struct {
+		Results struct {
+			Labels []struct {
+				Label   string `json:"label"`
+				Blocked int    `json:"blocked_count"`
+			} `json:"labels"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(lhOut), &lhPayload); err != nil {
+		t.Fatalf("decode label health: %v\n%s", err, lhOut)
+	}
+	if len(lhPayload.Results.Labels) != 1 || lhPayload.Results.Labels[0].Label != "frontend" || lhPayload.Results.Labels[0].Blocked != 1 {
+		t.Fatalf("expected only scoped 'frontend' with Blocked=1, got %+v", lhPayload.Results.Labels)
+	}
+
+	lfOut, stderr, err := runCommandWithTimeout(t, labelDir, exe, "--robot-label-flow", "--label", "frontend")
+	if err != nil {
+		t.Fatalf("--robot-label-flow --label frontend failed: %v\nstderr: %s", err, stderr)
+	}
+	var lfPayload struct {
+		Flow struct {
+			Labels       []string `json:"labels"`
+			Dependencies []struct {
+				FromLabel  string `json:"from_label"`
+				ToLabel    string `json:"to_label"`
+				IssueCount int    `json:"issue_count"`
+			} `json:"dependencies"`
+		} `json:"flow"`
+		BlockageCascade struct {
+			TotalBlocked int `json:"total_blocked"`
+		} `json:"blockage_cascade"`
+	}
+	if err := json.Unmarshal([]byte(lfOut), &lfPayload); err != nil {
+		t.Fatalf("decode label flow: %v\n%s", err, lfOut)
+	}
+	if len(lfPayload.Flow.Dependencies) != 1 || lfPayload.Flow.Dependencies[0].FromLabel != "infra" || lfPayload.Flow.Dependencies[0].ToLabel != "frontend" || lfPayload.Flow.Dependencies[0].IssueCount != 1 || lfPayload.BlockageCascade.TotalBlocked != 1 {
+		t.Fatalf("expected scoped label flow edge infra->frontend (count=1) with TotalBlocked=1, got %+v", lfPayload)
+	}
+
+	laOut, stderr, err := runCommandWithTimeout(t, labelDir, exe, "--robot-label-attention", "--label", "infra")
+	if err != nil {
+		t.Fatalf("--robot-label-attention --label infra failed: %v\nstderr: %s", err, stderr)
+	}
+	var laPayload struct {
+		Labels []struct {
+			Label        string `json:"label"`
+			BlockedCount int    `json:"blocked_count"`
+		} `json:"labels"`
+	}
+	if err := json.Unmarshal([]byte(laOut), &laPayload); err != nil {
+		t.Fatalf("decode label attention: %v\n%s", err, laOut)
+	}
+	if len(laPayload.Labels) != 1 || laPayload.Labels[0].Label != "infra" || laPayload.Labels[0].BlockedCount != 1 {
+		t.Fatalf("expected scoped label attention ['infra'] with cross-label BlockedCount=1, got %+v", laPayload.Labels)
+	}
+
+	// Hybrid --robot-search under --label frontend preserves external blocker readiness (fe-1 blocked by infra-1 => status score 0.5, not 1.0)
+	hsOut, stderr, err := runCommandWithTimeout(t, labelDir, exe, "--search", "login", "--search-mode", "hybrid", "--robot-search", "--label", "frontend")
+	if err != nil {
+		t.Fatalf("--robot-search --label frontend failed: %v\nstderr: %s", err, stderr)
+	}
+	var hsPayload struct {
+		Results []struct {
+			IssueID         string             `json:"issue_id"`
+			ComponentScores map[string]float64 `json:"component_scores"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(hsOut), &hsPayload); err != nil {
+		t.Fatalf("decode hybrid search: %v\n%s", err, hsOut)
+	}
+	if len(hsPayload.Results) != 1 || hsPayload.Results[0].IssueID != "fe-1" || hsPayload.Results[0].ComponentScores["status"] != 0.5 {
+		t.Fatalf("expected hybrid search under --label frontend to score externally-blocked fe-1 status=0.5, got %+v", hsPayload.Results)
+	}
+}
+
+func TestWave10Round2RecipeScopingAndWorkspaceCommitCorrelation(t *testing.T) {
+	exe := buildTestBinary(t)
+
+	// 1. Standalone --recipe actionable scopes out closed issues from source_inconsistency,
+	// and secondary-only issues evaluate readiness against full primary+tombstone graph context.
+	recDir := t.TempDir()
+	recBeads := filepath.Join(recDir, ".beads")
+	if err := os.MkdirAll(recBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recDBPath := filepath.Join(recBeads, "beads.db")
+	db, err := sql.Open("sqlite", recDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT DEFAULT '',
+			status TEXT NOT NULL,
+			priority INTEGER NOT NULL,
+			issue_type TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);
+		CREATE TABLE labels (issue_id TEXT NOT NULL, label TEXT NOT NULL);
+		CREATE TABLE dependencies (issue_id TEXT NOT NULL, depends_on_id TEXT NOT NULL, type TEXT NOT NULL);
+		INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) VALUES
+			('CLOSED-1', 'Closed blocker', 'closed', 1, 'task', '2026-11-10T00:00:00Z', '2026-11-15T00:00:00Z'),
+			('CORE-1', 'Core backend', 'open', 1, 'task', '2026-11-10T00:00:00Z', '2026-11-15T00:00:00Z'),
+			('SEC-READY', 'Secondary ready issue', 'open', 1, 'task', '2026-11-10T00:00:00Z', '2026-11-15T00:00:00Z');
+		INSERT INTO labels (issue_id, label) VALUES ('CLOSED-1', 'infra'), ('CORE-1', 'backend'), ('SEC-READY', 'backend');
+		INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('SEC-READY', 'CLOSED-1', 'blocks');
+	`)
+	_ = db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	recJSONLPath := filepath.Join(recBeads, "issues.jsonl")
+	recJSONL := strings.Join([]string{
+		`{"id":"CLOSED-1","title":"Closed blocker","status":"closed","priority":1,"issue_type":"task","labels":["infra"],"created_at":"2026-11-10T00:00:00Z","updated_at":"2026-11-15T00:00:00Z"}`,
+		`{"id":"CORE-1","title":"Core backend","status":"open","priority":1,"issue_type":"task","labels":["backend"],"created_at":"2026-11-10T00:00:00Z","updated_at":"2026-11-15T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(recJSONLPath, []byte(recJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC)
+	newTime := oldTime.Add(2 * time.Minute)
+	_ = os.Chtimes(recDBPath, oldTime, oldTime)
+	_ = os.Chtimes(recJSONLPath, newTime, newTime)
+
+	actOut, stderr, err := runCommandWithTimeout(t, recDir, exe, "--label", "backend", "--recipe", "actionable", "--robot-alerts", "--alert-type", "source_inconsistency")
+	if err != nil {
+		t.Fatalf("actionable --robot-alerts failed: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(actOut, `"SEC-READY"`) {
+		t.Fatalf("expected SEC-READY (blocked only by closed CLOSED-1) in actionable alerts:\n%s", actOut)
+	}
+	blkOut, stderr, err := runCommandWithTimeout(t, recDir, exe, "--label", "backend", "--recipe", "blocked", "--robot-alerts", "--alert-type", "source_inconsistency")
+	if err != nil {
+		t.Fatalf("blocked --robot-alerts failed: %v\nstderr: %s", err, stderr)
+	}
+	if strings.Contains(blkOut, `"SEC-READY"`) {
+		t.Fatalf("expected SEC-READY excluded from blocked alerts:\n%s", blkOut)
+	}
+
+	// Standalone --recipe actionable must NOT leak source_inconsistency on CLOSED-1
+	if err := os.WriteFile(recJSONLPath, []byte(strings.Join([]string{
+		`{"id":"CLOSED-1","title":"Closed blocker","status":"open","priority":1,"issue_type":"task","labels":["infra"],"created_at":"2026-11-10T00:00:00Z","updated_at":"2026-11-14T00:00:00Z"}`,
+		`{"id":"CORE-1","title":"Core backend","status":"open","priority":1,"issue_type":"task","labels":["backend"],"created_at":"2026-11-10T00:00:00Z","updated_at":"2026-11-15T00:00:00Z"}`,
+	}, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(recJSONLPath, oldTime, oldTime)
+	_ = os.Chtimes(recDBPath, newTime, newTime)
+	standaloneActOut, stderr, err := runCommandWithTimeout(t, recDir, exe, "--recipe", "actionable", "--robot-alerts", "--alert-type", "source_inconsistency")
+	if err != nil {
+		t.Fatalf("standalone --recipe actionable --robot-alerts failed: %v\nstderr: %s", err, stderr)
+	}
+	if strings.Contains(standaloneActOut, `"CLOSED-1"`) {
+		t.Fatalf("standalone --recipe actionable leaked CLOSED-1 source_inconsistency:\n%s", standaloneActOut)
+	}
+
+	// 2. Multi-repo --workspace --robot-commit with --history-limit 1, tombstones, file overlap, and temporal_author
+	wsRoot := t.TempDir()
+	repoA := filepath.Join(wsRoot, "repo-a")
+	repoB := filepath.Join(wsRoot, "repo-b")
+	if err := os.MkdirAll(filepath.Join(repoA, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(repoB, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitEnvAt := func(ts string) []string {
+		return append(os.Environ(),
+			"GIT_AUTHOR_NAME=Alice", "GIT_AUTHOR_EMAIL=alice@example.com",
+			"GIT_COMMITTER_NAME=Alice", "GIT_COMMITTER_EMAIL=alice@example.com",
+			"GIT_AUTHOR_DATE="+ts, "GIT_COMMITTER_DATE="+ts,
+		)
+	}
+	runGitAt := func(dir, ts string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = gitEnvAt(ts)
+		out, gErr := cmd.CombinedOutput()
+		if gErr != nil {
+			t.Fatalf("git %v in %s: %v\n%s", args, dir, gErr, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGitAt(repoA, "2026-11-15T00:50:00Z", "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repoA, ".beads", "issues.jsonl"), []byte(
+		`{"id":"A-1","title":"Alpha feature","status":"open","priority":1,"issue_type":"task","labels":["core"],"created_at":"2026-11-15T00:50:00Z","updated_at":"2026-11-15T00:50:00Z"}`+"\n"+
+			`{"id":"GONE-1","title":"Tombstoned bead","status":"tombstone","priority":2,"issue_type":"task","created_at":"2026-11-15T00:50:00Z","updated_at":"2026-11-15T00:50:00Z"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoA, "alpha.go"), []byte("package alpha\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(repoA, "2026-11-15T00:50:00Z", "add", ".")
+	runGitAt(repoA, "2026-11-15T00:50:00Z", "commit", "-m", "seed repo-a")
+
+	// Claim A-1 -> EventClaimed
+	if err := os.WriteFile(filepath.Join(repoA, ".beads", "issues.jsonl"), []byte(
+		`{"id":"A-1","title":"Alpha feature","status":"in_progress","assignee":"Alice","priority":1,"issue_type":"task","labels":["core"],"created_at":"2026-11-15T00:50:00Z","updated_at":"2026-11-15T01:00:00Z"}`+"\n"+
+			`{"id":"GONE-1","title":"Tombstoned bead","status":"tombstone","priority":2,"issue_type":"task","created_at":"2026-11-15T00:50:00Z","updated_at":"2026-11-15T00:50:00Z"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(repoA, "2026-11-15T01:00:00Z", "add", ".beads/issues.jsonl")
+	runGitAt(repoA, "2026-11-15T01:00:00Z", "commit", "-m", "claim A-1")
+
+	// Explicit commit for A-1 touching alpha.go
+	if err := os.WriteFile(filepath.Join(repoA, "alpha.go"), []byte("package alpha\n// A-1 impl\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(repoA, "2026-11-15T01:05:00Z", "add", "alpha.go")
+	runGitAt(repoA, "2026-11-15T01:05:00Z", "commit", "-m", "Implement A-1")
+	explicitSHA := runGitAt(repoA, "2026-11-15T01:05:00Z", "rev-parse", "HEAD")
+
+	// Temporal commit touching alpha.go with no explicit ID
+	if err := os.WriteFile(filepath.Join(repoA, "alpha.go"), []byte("package alpha\n// temporal polish\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(repoA, "2026-11-15T01:10:00Z", "add", "alpha.go")
+	runGitAt(repoA, "2026-11-15T01:10:00Z", "commit", "-m", "Polish edge case")
+	temporalSHA := runGitAt(repoA, "2026-11-15T01:10:00Z", "rev-parse", "HEAD")
+
+	// Commit referencing tombstoned GONE-1
+	if err := os.WriteFile(filepath.Join(repoA, "gone.go"), []byte("package alpha\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(repoA, "2026-11-15T01:12:00Z", "add", "gone.go")
+	runGitAt(repoA, "2026-11-15T01:12:00Z", "commit", "-m", "Clean up GONE-1")
+	tombCommitSHA := runGitAt(repoA, "2026-11-15T01:12:00Z", "rev-parse", "HEAD")
+
+	// Close A-1 -> EventClosed
+	if err := os.WriteFile(filepath.Join(repoA, ".beads", "issues.jsonl"), []byte(
+		`{"id":"A-1","title":"Alpha feature","status":"closed","assignee":"Alice","priority":1,"issue_type":"task","labels":["core"],"created_at":"2026-11-15T00:50:00Z","updated_at":"2026-11-15T01:15:00Z","closed_at":"2026-11-15T01:15:00Z"}`+"\n"+
+			`{"id":"GONE-1","title":"Tombstoned bead","status":"tombstone","priority":2,"issue_type":"task","created_at":"2026-11-15T00:50:00Z","updated_at":"2026-11-15T00:50:00Z"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(repoA, "2026-11-15T01:15:00Z", "add", ".beads/issues.jsonl")
+	runGitAt(repoA, "2026-11-15T01:15:00Z", "commit", "-m", "close A-1")
+
+	// Post-close orphan commit touching alpha.go by Bob -> triggers file-overlap OrphanCandidate for alpha-A-1
+	if err := os.WriteFile(filepath.Join(repoA, "alpha.go"), []byte("package alpha\n// bob orphan edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bobCmd := exec.Command("git", "add", "alpha.go")
+	bobCmd.Dir = repoA
+	if out, err := bobCmd.CombinedOutput(); err != nil {
+		t.Fatalf("bob git add: %v\n%s", err, string(out))
+	}
+	bobCommit := exec.Command("git", "commit", "-m", "Hotfix tweak in alpha")
+	bobCommit.Dir = repoA
+	bobCommit.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Bob", "GIT_AUTHOR_EMAIL=bob@example.com",
+		"GIT_COMMITTER_NAME=Bob", "GIT_COMMITTER_EMAIL=bob@example.com",
+		"GIT_AUTHOR_DATE=2026-11-15T01:20:00Z", "GIT_COMMITTER_DATE=2026-11-15T01:20:00Z",
+	)
+	if out, err := bobCommit.CombinedOutput(); err != nil {
+		t.Fatalf("bob git commit: %v\n%s", err, string(out))
+	}
+	orphanFileOverlapSHA := runGitAt(repoA, "2026-11-15T01:20:00Z", "rev-parse", "HEAD")
+
+	// Sibling repo-b with independent git history
+	runGitAt(repoB, "2026-11-15T01:00:00Z", "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repoB, ".beads", "issues.jsonl"), []byte(
+		`{"id":"B-1","title":"Beta task","status":"open","priority":1,"issue_type":"task","labels":["other"],"created_at":"2026-11-15T01:00:00Z","updated_at":"2026-11-15T01:00:00Z"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(repoB, "2026-11-15T01:00:00Z", "add", ".")
+	runGitAt(repoB, "2026-11-15T01:00:00Z", "commit", "-m", "init repo-b")
+
+	wsYAML := filepath.Join(wsRoot, "workspace.yaml")
+	if err := os.WriteFile(wsYAML, []byte(fmt.Sprintf("repos:\n  - name: alpha\n    path: %s\n    prefix: alpha-\n  - name: beta\n    path: %s\n    prefix: beta-\n", repoA, repoB)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// D2.1: workspace --history-limit 1 on older explicitSHA in repo-a succeeds without sibling repo-b error
+	wsExpOut, stderr, err := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsYAML, "--robot-commit", explicitSHA, "--history-limit", "1")
+	if err != nil {
+		t.Fatalf("workspace --robot-commit explicitSHA --history-limit 1 failed: %v\nstderr: %s", err, stderr)
+	}
+	assertCommitJSON := func(raw string, label string) map[string]any {
+		t.Helper()
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			t.Fatalf("%s: invalid JSON: %v\nraw: %s", label, err, raw)
+		}
+		return payload
+	}
+	wsExp := assertCommitJSON(wsExpOut, "wsExpOut")
+	if wsExp["is_orphan"] == true || !strings.Contains(wsExpOut, `"alpha-A-1"`) {
+		t.Fatalf("expected explicitSHA correlated to alpha-A-1 under --history-limit 1:\n%s", wsExpOut)
+	}
+
+	// D3: temporal_author commit outside --history-limit 1 correlates cleanly in both single-repo and workspace modes
+	singleTempOut, stderr, err := runCommandWithTimeout(t, repoA, exe, "--robot-commit", temporalSHA, "--history-limit", "1")
+	if err != nil {
+		t.Fatalf("single-repo --robot-commit temporalSHA --history-limit 1 failed: %v\nstderr: %s", err, stderr)
+	}
+	singleTemp := assertCommitJSON(singleTempOut, "singleTempOut")
+	if singleTemp["is_orphan"] == true || !strings.Contains(singleTempOut, `"A-1"`) {
+		t.Fatalf("expected temporalSHA correlated to A-1 under --history-limit 1:\n%s", singleTempOut)
+	}
+
+	// D2.3: workspace tombstoned bead GONE-1 correlates to alpha-GONE-1 (not orphan)
+	wsTombOut, stderr, err := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsYAML, "--robot-commit", tombCommitSHA)
+	if err != nil {
+		t.Fatalf("workspace --robot-commit tombCommitSHA failed: %v\nstderr: %s", err, stderr)
+	}
+	wsTomb := assertCommitJSON(wsTombOut, "wsTombOut")
+	if wsTomb["is_orphan"] == true || !strings.Contains(wsTombOut, `"alpha-GONE-1"`) {
+		t.Fatalf("expected tombCommitSHA correlated to tombstoned alpha-GONE-1:\n%s", wsTombOut)
+	}
+
+	// D2.2 + D4: workspace OrphanDetector rescues alpha-A-1 via unprefixed alpha.go file overlap,
+	// and --label other clears orphan_candidate completely so out-of-scope signals do not leak.
+	wsOrphanOut, stderr, err := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsYAML, "--robot-commit", orphanFileOverlapSHA)
+	if err != nil {
+		t.Fatalf("workspace --robot-commit orphanFileOverlapSHA failed: %v\nstderr: %s", err, stderr)
+	}
+	wsOrphan := assertCommitJSON(wsOrphanOut, "wsOrphanOut")
+	if wsOrphan["is_orphan"] != true || !strings.Contains(wsOrphanOut, `"alpha-A-1"`) {
+		t.Fatalf("expected workspace orphan rescue to match alpha-A-1 via alpha.go overlap:\n%s", wsOrphanOut)
+	}
+	wsOrphanScopedOut, stderr, err := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsYAML, "--label", "other", "--robot-commit", orphanFileOverlapSHA)
+	if err != nil {
+		t.Fatalf("scoped workspace --robot-commit orphanFileOverlapSHA failed: %v\nstderr: %s", err, stderr)
+	}
+	wsOrphanScoped := assertCommitJSON(wsOrphanScopedOut, "wsOrphanScopedOut")
+	if wsOrphanScoped["orphan_candidate"] != nil || strings.Contains(wsOrphanScopedOut, `"alpha-A-1"`) {
+		t.Fatalf("expected out-of-scope orphan_candidate cleared under --label other:\n%s", wsOrphanScopedOut)
+	}
+}
+
+func TestWave10Round3WorkspaceRecipeDepsMaxItemsAndSideBranchCommit(t *testing.T) {
+	exe := filepath.Join(t.TempDir(), "bv-wave10-r3")
+	if runtime.GOOS == "windows" {
+		exe += ".exe"
+	}
+	buildCmd := exec.Command("go", "build", "-o", exe, ".")
+	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOWORK=off", "GOTOOLCHAIN=local")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, string(out))
+	}
+
+	// 1. R3-A1: Workspace missing-issue dependency qualification (alpha-SEC-READY blocked only by closed alpha-CLOSED-1)
+	wsRoot := t.TempDir()
+	repoAlpha := filepath.Join(wsRoot, "alpha")
+	alphaBeads := filepath.Join(repoAlpha, ".beads")
+	if err := os.MkdirAll(alphaBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alphaDB := filepath.Join(alphaBeads, "beads.db")
+	db, err := sql.Open("sqlite", alphaDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT DEFAULT '',
+			status TEXT NOT NULL,
+			priority INTEGER NOT NULL,
+			issue_type TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		);
+		CREATE TABLE labels (issue_id TEXT NOT NULL, label TEXT NOT NULL);
+		CREATE TABLE dependencies (issue_id TEXT NOT NULL, depends_on_id TEXT NOT NULL, type TEXT NOT NULL);
+		INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) VALUES
+			('CLOSED-1', 'Closed blocker', 'closed', 1, 'task', '2026-11-10T00:00:00Z', '2026-11-15T00:00:00Z'),
+			('SEC-READY', 'Secondary ready issue', 'open', 1, 'task', '2026-11-10T00:00:00Z', '2026-11-15T00:00:00Z');
+		INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('SEC-READY', 'CLOSED-1', 'blocks');
+	`)
+	_ = db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	alphaJSONL := filepath.Join(alphaBeads, "issues.jsonl")
+	if err := os.WriteFile(alphaJSONL, []byte(`{"id":"CLOSED-1","title":"Closed blocker","status":"closed","priority":1,"issue_type":"task","created_at":"2026-11-10T00:00:00Z","updated_at":"2026-11-15T00:00:00Z"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC)
+	newTime := oldTime.Add(2 * time.Minute)
+	_ = os.Chtimes(alphaDB, oldTime, oldTime)
+	_ = os.Chtimes(alphaJSONL, newTime, newTime)
+	wsYAML := filepath.Join(wsRoot, "workspace.yaml")
+	if err := os.WriteFile(wsYAML, []byte("name: test-ws\nrepos:\n  - name: alpha\n    path: alpha\n    prefix: Alpha-\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wsActOut, stderr, err := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsYAML, "--recipe", "actionable", "--robot-alerts", "--alert-type", "source_inconsistency")
+	if err != nil {
+		t.Fatalf("workspace actionable --robot-alerts failed: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(wsActOut, `"Alpha-SEC-READY"`) {
+		t.Fatalf("expected Alpha-SEC-READY in workspace actionable alerts:\n%s", wsActOut)
+	}
+	wsBlkOut, stderr, err := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsYAML, "--recipe", "blocked", "--robot-alerts", "--alert-type", "source_inconsistency")
+	if err != nil {
+		t.Fatalf("workspace blocked --robot-alerts failed: %v\nstderr: %s", err, stderr)
+	}
+	if strings.Contains(wsBlkOut, `"Alpha-SEC-READY"`) {
+		t.Fatalf("expected Alpha-SEC-READY excluded from workspace blocked alerts:\n%s", wsBlkOut)
+	}
+
+	// 2. R3-A2: Primary MissingInB issues excluded by --recipe high-impact max_items=20 must not be re-admitted
+	maxDir := t.TempDir()
+	maxBeads := filepath.Join(maxDir, ".beads")
+	maxBV := filepath.Join(maxDir, ".bv")
+	if err := os.MkdirAll(maxBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(maxBV, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(maxBV, "drift.yaml"), []byte("source_drift_alert: true\nsource_drift_max_alerts: 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var jsonlLines []string
+	for i := 1; i <= 25; i++ {
+		prio := 1
+		if i > 20 {
+			prio = 4
+		}
+		jsonlLines = append(jsonlLines, fmt.Sprintf(`{"id":"OPEN-%02d","title":"Open %02d","status":"open","priority":%d,"issue_type":"task","created_at":"2026-11-10T00:00:00Z","updated_at":"2026-11-15T00:00:00Z"}`, i, i, prio))
+	}
+	maxJSONL := filepath.Join(maxBeads, "issues.jsonl")
+	if err := os.WriteFile(maxJSONL, []byte(strings.Join(jsonlLines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	maxDB := filepath.Join(maxBeads, "beads.db")
+	db2, err := sql.Open("sqlite", maxDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db2.Exec(`
+		CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER NOT NULL, issue_type TEXT NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL);
+		INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) VALUES ('OPEN-01', 'Open 01', 'open', 1, 'task', '2026-11-10T00:00:00Z', '2026-11-15T00:00:00Z');
+	`)
+	_ = db2.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(maxDB, oldTime, oldTime)
+	_ = os.Chtimes(maxJSONL, newTime, newTime)
+	hiOut, stderr, err := runCommandWithTimeout(t, maxDir, exe, "--recipe", "high-impact", "--robot-alerts", "--alert-type", "source_inconsistency")
+	if err != nil {
+		t.Fatalf("high-impact --robot-alerts failed: %v\nstderr: %s", err, stderr)
+	}
+	for _, excludedID := range []string{`"OPEN-21"`, `"OPEN-22"`, `"OPEN-23"`, `"OPEN-24"`, `"OPEN-25"`} {
+		if strings.Contains(hiOut, excludedID) {
+			t.Fatalf("high-impact max_items=20 leaked excluded P4 primary issue %s:\n%s", excludedID, hiOut)
+		}
+	}
+
+	// 3. R3-B1a: reloadSingleRepoForUIWithDegraded preserves AuthorityIncomplete and read-only Origin
+	degradedRes, err := reloadSingleRepoForUIWithDegraded(
+		context.Background(),
+		datasource.DataSource{Type: datasource.SourceTypeJSONLLocal, Path: maxJSONL},
+		true,
+		"",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("reloadSingleRepoForUIWithDegraded: %v", err)
+	}
+	if !degradedRes.AuthorityIncomplete {
+		t.Fatalf("expected AuthorityIncomplete=true when sourceDegraded=true")
+	}
+	for _, iss := range degradedRes.Issues {
+		if iss.Origin != nil && iss.Origin.ReadOnlyReason == "" {
+			t.Fatalf("expected Origin.ReadOnlyReason set on degraded reload for %s", iss.ID)
+		}
+	}
+
+	// 4. R3-D2 + R3-D4: Side-branch co-commit under --history-limit 2, --as-of future commit exclusion, and scoped orphan signal isolation
+	gitDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(gitDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt := func(ts string, author string, email string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = gitDir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME="+author,
+			"GIT_AUTHOR_EMAIL="+email,
+			"GIT_COMMITTER_NAME="+author,
+			"GIT_COMMITTER_EMAIL="+email,
+			"GIT_AUTHOR_DATE="+ts,
+			"GIT_COMMITTER_DATE="+ts,
+		)
+		out, gErr := cmd.CombinedOutput()
+		if gErr != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, gErr, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGitAt("2026-11-15T01:00:00Z", "Alice", "alice@example.com", "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(gitDir, ".beads", "issues.jsonl"), []byte(strings.Join([]string{
+		`{"id":"BV-SIDE","title":"Side work","status":"open","priority":1,"issue_type":"task","labels":["backend"],"created_at":"2026-11-15T01:00:00Z","updated_at":"2026-11-15T01:00:00Z"}`,
+		`{"id":"OUT-1","title":"Frontend work","status":"closed","priority":1,"issue_type":"task","labels":["frontend"],"created_at":"2026-11-15T01:00:00Z","updated_at":"2026-11-15T01:00:00Z"}`,
+	}, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "shared.go"), []byte("package main\n// v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt("2026-11-15T01:00:00Z", "Alice", "alice@example.com", "add", ".")
+	runGitAt("2026-11-15T01:00:00Z", "Alice", "alice@example.com", "commit", "-m", "BV-SIDE OUT-1 initial")
+	baseSHA := runGitAt("2026-11-15T01:00:00Z", "Alice", "alice@example.com", "rev-parse", "HEAD")
+
+	runGitAt("2026-11-15T02:00:00Z", "Alice", "alice@example.com", "checkout", "-b", "feature-x")
+	if err := os.WriteFile(filepath.Join(gitDir, ".beads", "issues.jsonl"), []byte(strings.Join([]string{
+		`{"id":"BV-SIDE","title":"Side work","status":"closed","priority":1,"issue_type":"task","labels":["backend"],"created_at":"2026-11-15T01:00:00Z","updated_at":"2026-11-15T02:00:00Z"}`,
+		`{"id":"OUT-1","title":"Frontend work","status":"closed","priority":1,"issue_type":"task","labels":["frontend"],"created_at":"2026-11-15T01:00:00Z","updated_at":"2026-11-15T01:00:00Z"}`,
+	}, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "feature.go"), []byte("package main\nfunc side() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt("2026-11-15T02:00:00Z", "Alice", "alice@example.com", "add", ".")
+	runGitAt("2026-11-15T02:00:00Z", "Alice", "alice@example.com", "commit", "-m", "implement side feature")
+	sideSHA := runGitAt("2026-11-15T02:00:00Z", "Alice", "alice@example.com", "rev-parse", "HEAD")
+
+	runGitAt("2026-11-15T03:00:00Z", "Alice", "alice@example.com", "checkout", "main")
+	if err := os.WriteFile(filepath.Join(gitDir, "shared.go"), []byte("package main\n// v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt("2026-11-15T03:00:00Z", "Bob", "bob@example.com", "add", "shared.go")
+	runGitAt("2026-11-15T03:00:00Z", "Bob", "bob@example.com", "commit", "-m", "hotfix shared logic")
+	mixedOrphanSHA := runGitAt("2026-11-15T03:00:00Z", "Bob", "bob@example.com", "rev-parse", "HEAD")
+
+	if err := os.WriteFile(filepath.Join(gitDir, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt("2026-11-15T04:00:00Z", "Alice", "alice@example.com", "add", "main.go")
+	runGitAt("2026-11-15T04:00:00Z", "Alice", "alice@example.com", "commit", "-m", "BV-SIDE future main step")
+	futureSHA := runGitAt("2026-11-15T04:00:00Z", "Alice", "alice@example.com", "rev-parse", "HEAD")
+
+	sideTruncOut, stderr, err := runCommandWithTimeout(t, gitDir, exe, "--history-limit", "2", "--robot-commit", sideSHA)
+	if err != nil {
+		t.Fatalf("side-branch --history-limit 2 --robot-commit failed: %v\nstderr: %s", err, stderr)
+	}
+	var sidePayload map[string]any
+	if err := json.Unmarshal([]byte(sideTruncOut), &sidePayload); err != nil {
+		t.Fatalf("unmarshal sideTruncOut: %v", err)
+	}
+	if sidePayload["is_orphan"] == true || !strings.Contains(sideTruncOut, `"BV-SIDE"`) {
+		t.Fatalf("expected side-branch co-commit correlated to BV-SIDE under --history-limit 2:\n%s", sideTruncOut)
+	}
+
+	asOfFutureOut, stderr, err := runCommandWithTimeout(t, gitDir, exe, "--as-of", baseSHA, "--robot-commit", futureSHA)
+	if err != nil {
+		t.Fatalf("--as-of baseSHA --robot-commit futureSHA failed: %v\nstderr: %s", err, stderr)
+	}
+	var asOfPayload map[string]any
+	if err := json.Unmarshal([]byte(asOfFutureOut), &asOfPayload); err != nil {
+		t.Fatalf("unmarshal asOfFutureOut: %v", err)
+	}
+	if related, _ := asOfPayload["related_beads"].([]any); len(related) != 0 || asOfPayload["is_orphan"] == true {
+		t.Fatalf("expected future commit excluded under --as-of baseSHA:\n%s", asOfFutureOut)
+	}
+
+	mixedScopedOut, stderr, err := runCommandWithTimeout(t, gitDir, exe, "--label", "backend", "--robot-commit", mixedOrphanSHA)
+	if err != nil {
+		t.Fatalf("--label backend --robot-commit mixedOrphanSHA failed: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(mixedScopedOut, `"BV-SIDE"`) || strings.Contains(mixedScopedOut, `"OUT-1"`) {
+		t.Fatalf("expected --label backend orphan signals to include BV-SIDE and exclude OUT-1:\n%s", mixedScopedOut)
+	}
 }

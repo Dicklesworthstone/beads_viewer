@@ -62,14 +62,11 @@
 | `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date) | History & Drift |
 | `--history-limit` | int | `500` | Max commits to analyze (0 = unlimited) | History & Drift |
 | `--history-since` | string | (empty) | Limit history to commits after this date/ref (e.g., '30 days ago', '2024-01-01') | History & Drift |
+| `--id-pattern` | stringArray | `[]` | Custom bead ID regex for commit-message matching, e.g. 'bh-[a-z0-9]{5}' (repeatable; capture group 1 is the ID, else the whole match) (#188) | History & Drift |
+| `--init-drift` | bool | `false` | Create default .bv/drift.yaml configuration file (use --yes to overwrite) | History & Drift |
 | `--min-confidence` | float64 | `0` | Filter correlations by minimum confidence (0.0-1.0) | History & Drift |
 | `--save-baseline` | string | (empty) | Save current metrics as baseline with optional description | History & Drift |
-| `--feedback-accept` | string | (empty) | Record accept feedback for issue ID (tunes recommendation weights) | Other |
-| `--feedback-ignore` | string | (empty) | Record ignore feedback for issue ID (tunes recommendation weights) | Other |
-| `--feedback-reset` | bool | `false` | Reset all feedback data to defaults | Other |
-| `--feedback-show` | bool | `false` | Show current feedback status and weight adjustments | Other |
 | `--generate-docs` | bool | `false` | Generate documentation markdown and JSON artifacts | Other |
-| `--id-pattern` | stringArray | `[]` | Custom bead ID regex for commit-message matching, e.g. 'bh-[a-z0-9]{5}' (repeatable; capture group 1 is the ID, else the whole match) (#188) | Other |
 | `--network-depth` | int | `2` | Depth of subnetwork when querying specific bead (1-3) | Other |
 | `--agents` | int | `1` | Number of parallel agents for capacity simulation | Robot & Planning Flags |
 | `--attention-limit` | int | `5` | Limit number of labels in --robot-label-attention output | Robot & Planning Flags |
@@ -77,6 +74,10 @@
 | `--capacity-label` | string | (empty) | Filter capacity simulation by label | Robot & Planning Flags |
 | `--correlation-by` | string | (empty) | Agent/user identifier for correlation feedback | Robot & Planning Flags |
 | `--correlation-reason` | string | (empty) | Reason for correlation feedback | Robot & Planning Flags |
+| `--feedback-accept` | string | (empty) | Record accept feedback for issue ID (tunes recommendation weights) | Robot & Planning Flags |
+| `--feedback-ignore` | string | (empty) | Record ignore feedback for issue ID (tunes recommendation weights) | Robot & Planning Flags |
+| `--feedback-reset` | bool | `false` | Reset all feedback data to defaults | Robot & Planning Flags |
+| `--feedback-show` | bool | `false` | Show current feedback status and weight adjustments | Robot & Planning Flags |
 | `--file-beads-limit` | int | `20` | Max closed beads to show (use with --robot-file-beads) | Robot & Planning Flags |
 | `--forecast-agents` | int | `1` | Number of parallel agents for capacity calculation | Robot & Planning Flags |
 | `--forecast-label` | string | (empty) | Filter forecast by label | Robot & Planning Flags |
@@ -97,6 +98,7 @@
 | `--robot-capabilities` | bool | `false` | Output machine-readable command capabilities for AI agents | Robot & Planning Flags |
 | `--robot-capacity` | bool | `false` | Output capacity simulation and completion projection as JSON | Robot & Planning Flags |
 | `--robot-causality` | string | (empty) | Output causal chain analysis for bead ID as JSON | Robot & Planning Flags |
+| `--robot-commit` | string | (empty) | Output beads correlated with a git commit SHA or revision as JSON | Robot & Planning Flags |
 | `--robot-confirm-correlation` | string | (empty) | Confirm a correlation is correct (format: SHA:beadID) | Robot & Planning Flags |
 | `--robot-correlation-stats` | bool | `false` | Output correlation feedback statistics as JSON | Robot & Planning Flags |
 | `--robot-diff` | bool | `false` | Output diff as JSON (use with --diff-since) | Robot & Planning Flags |

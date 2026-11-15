@@ -944,3 +944,31 @@ func TestDetectDuplicates_SkipsExplicitlyLinkedIssues(t *testing.T) {
 		})
 	}
 }
+
+func TestDetectDuplicates_SkipsTemplateAndIgnoreClosedPairs(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "TMPL-1", Title: "Implement user authentication system", Status: model.StatusOpen, IsTemplate: true},
+		{ID: "OPEN-1", Title: "Implement user authentication system", Status: model.StatusOpen},
+		{ID: "CLOSED-1", Title: "Implement user authentication system", Status: model.StatusClosed},
+		{ID: "CLOSED-2", Title: "Implement user authentication system", Status: model.StatusClosed},
+	}
+
+	// DefaultSuggestAllConfig sets Duplicates.IgnoreClosed=true: neither template nor closed-vs-closed should match.
+	suggestCfg := DefaultSuggestAllConfig()
+	if got := DetectDuplicates(issues, suggestCfg.Duplicates); len(got) != 0 {
+		t.Fatalf("expected 0 duplicate suggestions for template + closed-vs-closed when IgnoreClosed=true, got %+v", got)
+	}
+
+	// Even with IgnoreClosedVsOpen=false and IgnoreClosed=false, templates must never match.
+	cfg := DefaultDuplicateConfig()
+	cfg.IgnoreClosedVsOpen = false
+	got := DetectDuplicates(issues, cfg)
+	for _, s := range got {
+		if s.TargetBead == "TMPL-1" || s.RelatedBead == "TMPL-1" {
+			t.Fatalf("template issue leaked into duplicate suggestions: %+v", s)
+		}
+	}
+	if len(got) == 0 {
+		t.Fatal("expected non-template open/closed duplicates when IgnoreClosedVsOpen=false")
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	_ "modernc.org/sqlite"
 )
 
@@ -41,7 +42,6 @@ func TestWorkerPollTickPreservesDetails(t *testing.T) {
 			}}, nil, "")
 			t.Cleanup(m.Stop)
 			m.Update(tea.WindowSizeMsg{Width: 220, Height: 55})
-			m.backgroundMode = true
 			m.backgroundWorker = tc.worker
 			m.workerSpinnerIdx = tc.spinner
 			m.viewport.SetYOffset(3)
@@ -93,24 +93,23 @@ func TestWorkerPollTickAllowsDetailRefresh(t *testing.T) {
 	m := NewModel(copyIssues(issues), nil, "")
 	t.Cleanup(m.Stop)
 	m.Update(tea.WindowSizeMsg{Width: 220, Height: 55})
-	m.backgroundMode = true
 	m.backgroundWorker = &BackgroundWorker{state: WorkerIdle, cancel: func() {}}
-	if !strings.Contains(m.viewportContent, "Original first details") {
-		t.Fatal("fixture did not display the first issue")
+	if plain := ansi.Strip(m.viewportContent); !strings.Contains(plain, "Original first details") {
+		t.Fatalf("fixture did not display the first issue: %q", plain)
 	}
 
 	m.Update(workerPollTickMsg{})
 	m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	if !strings.Contains(m.viewportContent, "Original second details") || strings.Contains(m.viewportContent, "Original first details") {
-		t.Fatal("navigation after a worker status tick did not refresh the selected details")
+	if plain := ansi.Strip(m.viewportContent); !strings.Contains(plain, "Original second details") || strings.Contains(plain, "Original first details") {
+		t.Fatalf("navigation after a worker status tick did not refresh the selected details: %q", plain)
 	}
 
 	m.Update(workerPollTickMsg{})
 	issues[1].Description = "Reloaded second details"
 	snapshot := NewSnapshotBuilder(copyIssues(issues)).Build()
 	m.Update(SnapshotReadyMsg{Snapshot: snapshot, SnapshotVer: 1})
-	if !strings.Contains(m.viewportContent, "Reloaded second details") || strings.Contains(m.viewportContent, "Original second details") {
-		t.Fatal("snapshot delivery after a worker status tick did not refresh the selected details")
+	if plain := ansi.Strip(m.viewportContent); !strings.Contains(plain, "Reloaded second details") || strings.Contains(plain, "Original second details") {
+		t.Fatalf("snapshot delivery after a worker status tick did not refresh the selected details: %q", plain)
 	}
 	content := m.viewportContent
 	m.Update(workerPollTickMsg{})

@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -18,6 +19,7 @@ import (
 
 	pflag "github.com/spf13/pflag"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/datasource"
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
@@ -44,9 +46,11 @@ type RobotCommand struct {
 }
 
 type RobotContext struct {
-	Issues     []model.Issue
-	FullIssues []model.Issue
-	DataHash   string
+	Issues       []model.Issue
+	FullIssues   []model.Issue
+	TombstoneIDs []string
+	ActiveRecipe *recipe.Recipe
+	DataHash     string
 	// DataHashMatchesIssues is true when DataHash is the ComputeDataHash of the
 	// exact Issues slice carried here (i.e. no label-scope or recipe filtering
 	// changed Issues after DataHash was computed). When true, handlers may seed
@@ -81,6 +85,7 @@ type RobotContext struct {
 	ProjectDir           string
 	BaselinePath         string
 	HistoryLimit         int
+	ForceFullAnalysis    bool
 	EnvRobot             bool
 	SearchOutput         *robotSearchOutput
 	Diff                 *analysis.SnapshotDiff
@@ -194,6 +199,7 @@ type phaseThreeRobotHandlerConfig struct {
 	RobotOrphansFlag        *bool
 	OrphansMinScore         *int
 	RobotFileBeadsFlag      *string
+	RobotCommitFlag         *string
 	FileBeadsLimit          *int
 	RobotFileHotspotsFlag   *bool
 	HotspotsLimit           *int
@@ -246,7 +252,11 @@ func (ctx RobotContext) Analyzer() *analysis.Analyzer {
 // Envelope builds the shared robot payload header for this dispatch: data
 // hash, source, time-travel metadata, and active scoping.
 func (ctx RobotContext) Envelope() RobotEnvelope {
-	return ctx.EnvelopeWithHash(ctx.DataHash)
+	hash := ctx.DataHash
+	if hash == "" && len(ctx.Issues) > 0 {
+		hash = analysis.ComputeDataHash(ctx.Issues)
+	}
+	return ctx.EnvelopeWithHash(hash)
 }
 
 // EnvelopeWithHash is Envelope for handlers whose payload hashes a derived
@@ -352,7 +362,7 @@ func unsupportedScopeFor(command string, ctx RobotContext) []string {
 		return nil
 	}
 	switch normalizeRobotFlagName(command) {
-	case "robot-history", "bead-history", "robot-orphans", "robot-file-beads", "robot-file-hotspots",
+	case "robot-history", "bead-history", "robot-orphans", "robot-file-beads", "robot-commit", "robot-file-hotspots",
 		"robot-file-relations", "robot-impact-network", "robot-related",
 		"robot-explain-correlation", "robot-confirm-correlation", "robot-reject-correlation",
 		"robot-correlation-stats", "robot-impact",
@@ -1414,6 +1424,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			if !calc.ReuseAnalyzer(analyzer) {
 				return fmt.Errorf("preparing alerts: issue rows do not match the scoped analyzer")
 			}
+			attachSourceDiffsForContext(calc, ctx, driftConfig.SourceDriftMaxAlerts)
 			driftResult := calc.Calculate()
 
 			filtered := driftResult.Alerts[:0]
@@ -1473,7 +1484,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				UsageHints: []string{
 					"--severity=warning --alert-type=stale_issue   # stale warnings only",
 					"--alert-type=blocking_cascade                 # high-unblock opportunities",
-					"--alert-type=high_impact_unblock|abandoned_claim|potential_duplicate|priority_mismatch|velocity_drop   # proactive checks (no baseline needed)",
+					"--alert-type=high_impact_unblock|abandoned_claim|potential_duplicate|priority_mismatch|velocity_drop|source_inconsistency   # proactive checks (no baseline needed)",
 					"--alert-type=new_cycle|density_growth|node_count_change|edge_count_change|scope_creep|blocked_increase|actionable_change|pagerank_change   # drift vs saved baseline (bv --save-baseline)",
 					"--alert-label=backend                        # only alerts on issues carrying that label",
 					"jq '.alerts | map({issue_id, type, suggested_action})'   # what to do about each",
@@ -1579,6 +1590,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			if !calc.ReuseAnalyzer(analyzer) {
 				return fmt.Errorf("preparing drift check: issue rows do not match the scoped analyzer")
 			}
+			attachSourceDiffsForContext(calc, ctx, driftConfig.SourceDriftMaxAlerts)
 			result := calc.Calculate()
 			alerts := result.Alerts
 			if alerts == nil {
@@ -1733,7 +1745,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				SprintCount int            `json:"sprint_count"`
 				Sprints     []model.Sprint `json:"sprints"`
 			}{
-				RobotEnvelope: ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues)),
+				RobotEnvelope: ctx.Envelope(),
 				SprintCount:   len(sprints),
 				Sprints:       sprints,
 			}
@@ -1791,7 +1803,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				driftCfg = drift.DefaultConfig()
 			}
 			burndown := calculateBurndownAtWithThresholds(targetSprint, ctx.Issues, now, driftCfg.AtRiskThresholds())
-			burndown.RobotEnvelope = ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues))
+			burndown.RobotEnvelope = ctx.Envelope()
 			issueMap := make(map[string]model.Issue, len(ctx.Issues))
 			for _, issue := range ctx.Issues {
 				issueMap[issue.ID] = issue
@@ -1961,7 +1973,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			output := ForecastOutput{
-				RobotEnvelope: ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues)),
+				RobotEnvelope: ctx.Envelope(),
 				Agents:        agents,
 				ForecastCount: len(forecasts),
 				Forecasts:     forecasts,
@@ -2089,6 +2101,9 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 	register("robot-file-beads", cfg.RobotFileBeadsFlag, "Output beads that touched a file path as JSON", func(ctx RobotContext) error {
 		return handleRobotFileBeads(ctx, cfg)
 	})
+	register("robot-commit", cfg.RobotCommitFlag, "Output beads correlated with a git commit SHA or revision as JSON", func(ctx RobotContext) error {
+		return handleRobotCommit(ctx, cfg)
+	})
 	register("robot-file-hotspots", cfg.RobotFileHotspotsFlag, "Output files touched by most beads as JSON", func(ctx RobotContext) error {
 		return handleRobotFileHotspots(ctx, cfg)
 	})
@@ -2121,9 +2136,304 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 	})
 }
 
+func attachSourceDiffsForContext(calc *drift.Calculator, ctx RobotContext, maxAlerts int) {
+	if calc == nil {
+		return
+	}
+	diffs := detectSourceDiffsForContext(ctx, maxAlerts)
+	calc.SetSourceDiffs(diffs)
+	if ctx.CandidateIDs != nil && len(diffs) > 0 {
+		allowed := scopeMissingSourceIssuesForContext(ctx, diffs)
+		if len(allowed) > 0 {
+			calc.AllowCandidateIDs(allowed)
+		}
+	}
+}
+
+func scopeMissingSourceIssuesForContext(ctx RobotContext, diffs []datasource.SourceDiff) []string {
+	baseSlice := ctx.Issues
+	if len(ctx.FullIssues) > 0 {
+		baseSlice = ctx.FullIssues
+	}
+	primaryLiveIDs := make(map[string]bool, len(baseSlice))
+	for _, iss := range baseSlice {
+		primaryLiveIDs[iss.ID] = true
+	}
+
+	var recipeMetrics recipe.Metrics
+	if ctx.ActiveRecipe != nil {
+		byID := make(map[string]model.Issue, len(baseSlice)+len(ctx.TombstoneIDs)+8)
+		combined := make([]model.Issue, 0, len(baseSlice)+len(ctx.TombstoneIDs)+8)
+		for _, iss := range baseSlice {
+			byID[iss.ID] = iss
+		}
+		for _, tid := range ctx.TombstoneIDs {
+			if _, exists := byID[tid]; !exists {
+				byID[tid] = model.Issue{ID: tid, Status: model.StatusTombstone}
+			}
+		}
+		for _, d := range diffs {
+			for id, iss := range d.MissingIssues {
+				if primaryLiveIDs[id] {
+					continue
+				}
+				byID[id] = iss
+			}
+		}
+		allIDs := make([]string, 0, len(byID))
+		for id := range byID {
+			allIDs = append(allIDs, id)
+		}
+		sort.Strings(allIDs)
+		for _, id := range allIDs {
+			combined = append(combined, byID[id])
+		}
+		combinedReadiness := model.NewReadinessIndex(combined)
+		ctxWithCombinedReadiness := ctx
+		ctxWithCombinedReadiness.Readiness = combinedReadiness
+		recipeMetrics = recipeMetricsForContext(ctxWithCombinedReadiness, combined, ctx.ActiveRecipe)
+		recipeMetrics.Readiness = combinedReadiness
+	}
+
+	var allowed []string
+	allowedIssueByID := make(map[string]model.Issue)
+	seen := make(map[string]bool)
+	for _, d := range diffs {
+		for id, iss := range d.MissingIssues {
+			if primaryLiveIDs[id] || seen[id] {
+				continue
+			}
+			seen[id] = true
+			if ctx.Repo != "" && len(filterByRepo([]model.Issue{iss}, ctx.Repo)) == 0 {
+				continue
+			}
+			if ctx.LabelScope != "" {
+				sg := analysis.ComputeLabelSubgraph([]model.Issue{iss}, ctx.LabelScope)
+				if len(sg.CoreIssues) == 0 {
+					continue
+				}
+			}
+			if ctx.ActiveRecipe != nil {
+				singleSlice := []model.Issue{iss}
+				rCheck := *ctx.ActiveRecipe
+				rCheck.View.MaxItems = 0
+				applied, err := recipe.Apply(singleSlice, recipeMetrics, &rCheck, robotNow())
+				if err != nil || len(applied) == 0 {
+					continue
+				}
+			}
+			allowed = append(allowed, id)
+			allowedIssueByID[id] = iss
+		}
+	}
+	sort.Strings(allowed)
+	if ctx.ActiveRecipe != nil && ctx.ActiveRecipe.View.MaxItems > 0 && len(allowed) > 0 {
+		windowInput := make([]model.Issue, 0, len(ctx.Issues)+len(allowed))
+		windowInput = append(windowInput, ctx.Issues...)
+		for _, id := range allowed {
+			windowInput = append(windowInput, allowedIssueByID[id])
+		}
+		if windowed, err := recipe.Apply(windowInput, recipeMetrics, ctx.ActiveRecipe, robotNow()); err == nil {
+			inWindow := make(map[string]bool, len(windowed))
+			for _, iss := range windowed {
+				inWindow[iss.ID] = true
+			}
+			capped := allowed[:0]
+			for _, id := range allowed {
+				if inWindow[id] {
+					capped = append(capped, id)
+				}
+			}
+			allowed = capped
+		}
+	}
+	return allowed
+}
+
+func detectSourceDiffsForContext(ctx RobotContext, _ int) []datasource.SourceDiff {
+	var empty []datasource.SourceDiff
+	if ctx.AsOf != "" || ctx.SourceKind == "git" {
+		return empty
+	}
+	if _, explicitFile, _ := datasource.ExplicitBeadsDBSource(); explicitFile {
+		return empty
+	}
+	diffOpts := datasource.DiffOptions{
+		// Leave MaxDifferences uncapped during discovery so out-of-scope issues
+		// cannot starve in-scope issues under --label/--repo/--recipe and so
+		// source_drift_max_alerts: 0 (unlimited) is honored cleanly.
+		MaxDifferences: 0,
+		CompareFields:  []string{"status", "priority", "title"},
+	}
+
+	if ctx.SourceKind == "workspace" {
+		if ctx.SourceAuthority == nil || len(ctx.SourceAuthority.Sources) == 0 {
+			return empty
+		}
+		knownPrefixes := make(map[string]bool, len(ctx.SourceAuthority.Sources))
+		for _, s := range ctx.SourceAuthority.Sources {
+			if s.RepoPrefix != "" {
+				knownPrefixes[s.RepoPrefix] = true
+			}
+		}
+		baseSlice := ctx.Issues
+		if len(ctx.FullIssues) > 0 {
+			baseSlice = ctx.FullIssues
+		}
+		var out []datasource.SourceDiff
+		seenDirs := make(map[string]bool, len(ctx.SourceAuthority.Sources))
+		for _, src := range ctx.SourceAuthority.Sources {
+			if src.Status != "loaded" {
+				continue
+			}
+			if ctx.Repo != "" && !sourceMatchesRepoFilter(src, ctx.Repo) {
+				continue
+			}
+			beadsDir := resolveSourceBeadsDir(src)
+			if beadsDir == "" || beadsDir == "." || seenDirs[beadsDir] || loader.IsBDWorkspace(beadsDir) {
+				continue
+			}
+			seenDirs[beadsDir] = true
+			sources, err := datasource.DiscoverSources(datasource.DiscoveryOptions{
+				BeadsDir:               beadsDir,
+				RepoPath:               src.RepoRoot,
+				ValidateAfterDiscovery: true,
+				SkipWorktreeSources:    true,
+			})
+			if err != nil || len(sources) < 2 {
+				continue
+			}
+			repoDiffs, err := datasource.CheckAllSourcesConsistent(sources, diffOpts)
+			if err != nil || len(repoDiffs) == 0 {
+				continue
+			}
+			if prefix := src.RepoPrefix; prefix != "" {
+				primaryRawIDs := make(map[string]bool)
+				for _, iss := range baseSlice {
+					if strings.HasPrefix(iss.ID, prefix) {
+						primaryRawIDs[strings.TrimPrefix(iss.ID, prefix)] = true
+					}
+				}
+				for _, tid := range ctx.TombstoneIDs {
+					if strings.HasPrefix(tid, prefix) {
+						primaryRawIDs[strings.TrimPrefix(tid, prefix)] = true
+					}
+				}
+				for i := range repoDiffs {
+					qualifySourceDiff(&repoDiffs[i], prefix, primaryRawIDs, knownPrefixes)
+				}
+			}
+			out = append(out, repoDiffs...)
+		}
+		return out
+	}
+
+	projectDir, _ := ctx.ProjectDirOrDefault()
+	beadsDir := ""
+	if ctx.SourcePath != "" {
+		beadsDir = filepath.Dir(ctx.SourcePath)
+	} else if projectDir != "" {
+		beadsDir, _ = loader.GetBeadsDir(projectDir)
+	}
+	if beadsDir == "" || loader.IsBDWorkspace(beadsDir) {
+		return empty
+	}
+	sources, err := datasource.DiscoverSources(datasource.DiscoveryOptions{
+		BeadsDir:               beadsDir,
+		RepoPath:               projectDir,
+		ValidateAfterDiscovery: true,
+		SkipWorktreeSources:    true,
+	})
+	if err != nil || len(sources) < 2 {
+		return empty
+	}
+	diffs, err := datasource.CheckAllSourcesConsistent(sources, diffOpts)
+	if err != nil {
+		return empty
+	}
+	return diffs
+}
+
+func hasAnyRepoPrefix(id string, prefixes map[string]bool) bool {
+	for p := range prefixes {
+		if p != "" && strings.HasPrefix(id, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func qualifySourceDiff(d *datasource.SourceDiff, prefix string, primaryRawIDs, knownPrefixes map[string]bool) {
+	if d == nil || prefix == "" {
+		return
+	}
+	if d.IssueID != "" {
+		d.IssueID = workspace.QualifyID(d.IssueID, prefix)
+	}
+	for i := range d.MissingInA {
+		d.MissingInA[i] = workspace.QualifyID(d.MissingInA[i], prefix)
+	}
+	for i := range d.MissingInB {
+		d.MissingInB[i] = workspace.QualifyID(d.MissingInB[i], prefix)
+	}
+	for i := range d.StatusMismatch {
+		d.StatusMismatch[i].ID = workspace.QualifyID(d.StatusMismatch[i].ID, prefix)
+	}
+	for i := range d.FieldMismatches {
+		d.FieldMismatches[i].ID = workspace.QualifyID(d.FieldMismatches[i].ID, prefix)
+	}
+	for i := range d.IssueDiffs {
+		d.IssueDiffs[i].IssueID = workspace.QualifyID(d.IssueDiffs[i].IssueID, prefix)
+	}
+	if len(d.MissingIssues) > 0 {
+		localRawIDs := make(map[string]bool, len(primaryRawIDs)+len(d.MissingIssues))
+		for id := range primaryRawIDs {
+			localRawIDs[id] = true
+		}
+		for rawID := range d.MissingIssues {
+			localRawIDs[rawID] = true
+		}
+		normSourceRepo := strings.ToLower(strings.TrimRight(strings.TrimSpace(prefix), "-:_"))
+		qualified := make(map[string]model.Issue, len(d.MissingIssues))
+		for rawID, iss := range d.MissingIssues {
+			cloned := iss.Clone()
+			qid := workspace.QualifyID(rawID, prefix)
+			cloned.ID = qid
+			cloned.SourceRepo = normSourceRepo
+			for _, dep := range cloned.Dependencies {
+				if dep == nil {
+					continue
+				}
+				dep.IssueID = workspace.QualifyID(dep.IssueID, prefix)
+				if localRawIDs[dep.DependsOnID] || !hasAnyRepoPrefix(dep.DependsOnID, knownPrefixes) {
+					dep.DependsOnID = workspace.QualifyID(dep.DependsOnID, prefix)
+				}
+			}
+			for _, c := range cloned.Comments {
+				if c != nil {
+					c.IssueID = workspace.QualifyID(c.IssueID, prefix)
+				}
+			}
+			qualified[qid] = cloned
+		}
+		d.MissingIssues = qualified
+	}
+}
+
+func labelAnalysisIssuesForContext(ctx RobotContext) []model.Issue {
+	if ctx.CandidateIDs != nil && len(ctx.FullIssues) > 0 {
+		if ctx.Repo != "" {
+			return filterByRepo(ctx.FullIssues, ctx.Repo)
+		}
+		return ctx.FullIssues
+	}
+	return ctx.Issues
+}
+
 func handleRobotLabelHealth(ctx RobotContext) error {
 	cfg := analysis.DefaultLabelHealthConfig()
-	results := analysis.ComputeAllLabelHealth(ctx.Issues, cfg, robotNow(), nil)
+	baseIssues := labelAnalysisIssuesForContext(ctx)
+	results := analysis.ComputeAllLabelHealthWithScope(baseIssues, cfg, robotNow(), nil, ctx.Readiness, ctx.CandidateIDs)
 
 	output := struct {
 		RobotEnvelope
@@ -2150,8 +2460,9 @@ func handleRobotLabelHealth(ctx RobotContext) error {
 func handleRobotLabelFlow(ctx RobotContext) error {
 	now := robotNow()
 	cfg := analysis.DefaultLabelHealthConfig()
-	flow := analysis.ComputeCrossLabelFlow(ctx.Issues, cfg)
-	cascade := analysis.ComputeBlockageCascadeAt(ctx.Issues, flow, cfg, now)
+	baseIssues := labelAnalysisIssuesForContext(ctx)
+	flow := analysis.ComputeCrossLabelFlowWithScope(baseIssues, cfg, ctx.CandidateIDs)
+	cascade := analysis.ComputeBlockageCascadeAtWithScope(baseIssues, flow, cfg, now, ctx.Readiness, ctx.CandidateIDs)
 	output := struct {
 		RobotEnvelope
 		Flow            analysis.CrossLabelFlow          `json:"flow"`
@@ -2177,7 +2488,8 @@ func handleRobotLabelFlow(ctx RobotContext) error {
 }
 
 func handleRobotLabelAttention(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	result := analysis.ComputeLabelAttentionScores(ctx.Issues, analysis.DefaultLabelHealthConfig(), robotNow())
+	baseIssues := labelAnalysisIssuesForContext(ctx)
+	result := analysis.ComputeLabelAttentionScoresWithScope(baseIssues, analysis.DefaultLabelHealthConfig(), robotNow(), ctx.Readiness, ctx.CandidateIDs)
 
 	limit := 5
 	if cfg.AttentionLimit != nil {
@@ -2214,6 +2526,7 @@ func handleRobotLabelAttention(ctx RobotContext, cfg phaseThreeRobotHandlerConfi
 		RobotEnvelope: ctx.Envelope(),
 		Limit:         limit,
 		TotalLabels:   result.TotalLabels,
+		Labels:        make([]attentionLabel, 0, limit),
 		UsageHints: []string{
 			"jq '.labels[0]' - top attention label details",
 			"jq '.labels[] | select(.blocked_count > 0)' - labels with blocked issues",
@@ -4415,18 +4728,35 @@ func handleRobotCorrelationStats(ctx RobotContext) error {
 		return err
 	}
 
+	env := ctx.Envelope()
 	output := struct {
 		correlation.FeedbackStats
-		GeneratedAt  string      `json:"generated_at"`
-		OutputFormat string      `json:"output_format,omitempty"`
-		Version      string      `json:"version,omitempty"`
-		Scope        *RobotScope `json:"scope,omitempty"`
+		GeneratedAt     string                `json:"generated_at"`
+		OutputFormat    string                `json:"output_format,omitempty"`
+		Version         string                `json:"version,omitempty"`
+		SourcePath      string                `json:"source_path,omitempty"`
+		SourceKind      string                `json:"source_kind,omitempty"`
+		AsOf            string                `json:"as_of,omitempty"`
+		AsOfCommit      string                `json:"as_of_commit,omitempty"`
+		Scope           *RobotScope           `json:"scope,omitempty"`
+		LoadStats       *RobotLoadStats       `json:"load_stats,omitempty"`
+		SourceAuthority *RobotSourceAuthority `json:"source_authority,omitempty"`
+		AuthorityHash   string                `json:"authority_hash,omitempty"`
+		ScopeHash       string                `json:"scope_hash,omitempty"`
 	}{
-		FeedbackStats: stats,
-		GeneratedAt:   robotNow().Format(time.RFC3339),
-		OutputFormat:  robotOutputFormat,
-		Version:       version.Version,
-		Scope:         ctx.Envelope().Scope,
+		FeedbackStats:   stats,
+		GeneratedAt:     env.GeneratedAt,
+		OutputFormat:    env.OutputFormat,
+		Version:         env.Version,
+		SourcePath:      env.SourcePath,
+		SourceKind:      env.SourceKind,
+		AsOf:            env.AsOf,
+		AsOfCommit:      env.AsOfCommit,
+		Scope:           env.Scope,
+		LoadStats:       env.LoadStats,
+		SourceAuthority: env.SourceAuthority,
+		AuthorityHash:   env.AuthorityHash,
+		ScopeHash:       env.ScopeHash,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding stats: %w", err)
@@ -4623,6 +4953,345 @@ func handleRobotFileRelations(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding file relations: %w", err)
+	}
+	return nil
+}
+
+func inferSourceRepoForTombstone(tid string, authority *RobotSourceAuthority) string {
+	if authority == nil {
+		return ""
+	}
+	bestLen := -1
+	bestSourceRepo := ""
+	tidLower := strings.ToLower(strings.TrimSpace(tid))
+	for _, src := range authority.Sources {
+		if src.RepoPrefix != "" {
+			prefLower := strings.ToLower(src.RepoPrefix)
+			if len(tidLower) > len(prefLower) && strings.HasPrefix(tidLower, prefLower) && len(prefLower) > bestLen {
+				bestLen = len(prefLower)
+				bestSourceRepo = src.SourceRepo
+			}
+		} else if bestLen < 0 && src.SourceRepo != "" {
+			bestLen = 0
+			bestSourceRepo = src.SourceRepo
+		}
+	}
+	return bestSourceRepo
+}
+
+func isCommitAncestorOfRevision(repoRoot, sha, rev string) bool {
+	if repoRoot == "" || sha == "" || strings.HasPrefix(sha, "-") || strings.ContainsRune(sha, 0) {
+		return false
+	}
+	targetRev := strings.TrimSpace(rev)
+	if targetRev == "" {
+		targetRev = "HEAD"
+	}
+	if strings.HasPrefix(targetRev, "-") || strings.ContainsRune(targetRev, 0) {
+		return false
+	}
+	cmd := exec.Command("git", "merge-base", "--is-ancestor", "--end-of-options", sha, targetRev)
+	cmd.Dir = repoRoot
+	return cmd.Run() == nil
+}
+
+func handleRobotCommit(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
+	if cfg.RobotCommitFlag == nil {
+		return fmt.Errorf("robot commit flag not configured")
+	}
+	rawRef := strings.TrimSpace(*cfg.RobotCommitFlag)
+	if rawRef == "" || strings.HasPrefix(rawRef, "-") {
+		return fmt.Errorf("--robot-commit requires a commit SHA or git revision")
+	}
+
+	workDir, err := ctx.WorkDirOrDefault()
+	if err != nil {
+		return fmt.Errorf("getting current directory: %w", err)
+	}
+
+	var resolvedSHA string
+	var matchedGitRoot string
+	var commitStoreDirs []string
+	var matchedWorkspaceSources []RobotSourceReport
+	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
+		sources, _ := resolveWorkspaceCorrelationSources(ctx)
+		if len(sources) == 0 {
+			return fmt.Errorf("no git repositories available in workspace")
+		}
+		seenRoots := make(map[string]bool)
+		rootBySHA := make(map[string]string)
+		for _, ws := range sources {
+			if ctx.Repo != "" && !sourceMatchesRepoFilter(ws.source, ctx.Repo) {
+				continue
+			}
+			cleanRoot := filepath.Clean(ws.repoRoot)
+			if seenRoots[cleanRoot] {
+				continue
+			}
+			seenRoots[cleanRoot] = true
+			sha, revErr := loader.NewGitLoader(cleanRoot).ResolveRevision(rawRef)
+			if revErr == nil && strings.TrimSpace(sha) != "" {
+				sha = strings.ToLower(strings.TrimSpace(sha))
+				if _, exists := rootBySHA[sha]; !exists {
+					rootBySHA[sha] = cleanRoot
+				}
+			}
+		}
+		switch len(rootBySHA) {
+		case 0:
+			fmt.Fprintf(ctx.StderrOrDefault(), "Commit not found: %s\n", rawRef)
+			return newReportedRobotHandlerExit(1)
+		case 1:
+			for sha, root := range rootBySHA {
+				resolvedSHA = sha
+				matchedGitRoot = root
+			}
+		default:
+			fmt.Fprintf(ctx.StderrOrDefault(), "Ambiguous commit revision %q matches %d workspace repositories; pass --repo <prefix> or an unambiguous commit SHA\n", rawRef, len(rootBySHA))
+			return newReportedRobotHandlerExit(1)
+		}
+		for _, ws := range sources {
+			if filepath.Clean(ws.repoRoot) != filepath.Clean(matchedGitRoot) {
+				continue
+			}
+			matchedWorkspaceSources = append(matchedWorkspaceSources, ws.source)
+			if storeDir := resolveSourceBeadsDir(ws.source); storeDir != "" {
+				if rel, relErr := filepath.Rel(filepath.Clean(matchedGitRoot), filepath.Clean(storeDir)); relErr == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") {
+					commitStoreDirs = append(commitStoreDirs, filepath.ToSlash(rel))
+				}
+			}
+		}
+	} else {
+		matchedGitRoot = workDir
+		if found, rootErr := correlation.FindGitRoot(workDir); rootErr == nil {
+			matchedGitRoot = found
+		} else if resolvedBeadsPath, bpErr := resolveCorrelationBeadsPathForContext(ctx, workDir); bpErr == nil && resolvedBeadsPath != "" {
+			beadsParent := filepath.Clean(filepath.Dir(resolvedBeadsPath))
+			if !filepath.IsAbs(beadsParent) {
+				beadsParent = filepath.Clean(filepath.Join(workDir, beadsParent))
+			}
+			if found, rootErr2 := correlation.FindGitRoot(beadsParent); rootErr2 == nil {
+				matchedGitRoot = found
+			}
+		}
+		sha, revErr := loader.NewGitLoader(matchedGitRoot).ResolveRevision(rawRef)
+		if revErr != nil || strings.TrimSpace(sha) == "" {
+			fmt.Fprintf(ctx.StderrOrDefault(), "Commit not found: %s\n", rawRef)
+			return newReportedRobotHandlerExit(1)
+		}
+		resolvedSHA = strings.ToLower(strings.TrimSpace(sha))
+		if resolvedBeadsPath, bpErr := resolveCorrelationBeadsPathForContext(ctx, workDir); bpErr == nil && resolvedBeadsPath != "" {
+			storeDir := filepath.Clean(filepath.Dir(resolvedBeadsPath))
+			if !filepath.IsAbs(storeDir) {
+				storeDir = filepath.Clean(filepath.Join(workDir, storeDir))
+			}
+			if rel, relErr := filepath.Rel(filepath.Clean(matchedGitRoot), storeDir); relErr == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") {
+				commitStoreDirs = append(commitStoreDirs, filepath.ToSlash(rel))
+			}
+		}
+	}
+
+	opts := correlation.CorrelatorOptions{Limit: 500, Revision: ctx.AsOfCommit}
+	if cfg.HistoryLimit != nil {
+		opts.Limit = *cfg.HistoryLimit
+	}
+	if cfg.HistorySince != nil && strings.TrimSpace(*cfg.HistorySince) != "" {
+		since, err := recipe.ParseRelativeTime(*cfg.HistorySince, robotNow())
+		if err != nil {
+			return fmt.Errorf("parsing --history-since: %w", err)
+		}
+		if !since.IsZero() {
+			opts.Since = &since
+		}
+	}
+
+	// Correlate over the full unscoped bead set (including tombstones and sibling
+	// shared-.git workspace repos) first so true orphan status is never corrupted
+	// by display/scope filters (--label, --recipe, --repo, --min-confidence).
+	commitCtx := ctx
+	if len(matchedWorkspaceSources) > 0 && commitCtx.SourceAuthority != nil {
+		scopedAuth := *commitCtx.SourceAuthority
+		scopedAuth.Sources = matchedWorkspaceSources
+		commitCtx.SourceAuthority = &scopedAuth
+	}
+	baseIssues := ctx.Issues
+	if len(ctx.FullIssues) > 0 {
+		baseIssues = ctx.FullIssues
+	}
+	if len(ctx.TombstoneIDs) > 0 {
+		seenIDs := make(map[string]bool, len(baseIssues))
+		for _, iss := range baseIssues {
+			seenIDs[iss.ID] = true
+		}
+		merged := make([]model.Issue, len(baseIssues), len(baseIssues)+len(ctx.TombstoneIDs))
+		copy(merged, baseIssues)
+		for _, tid := range ctx.TombstoneIDs {
+			if !seenIDs[tid] {
+				merged = append(merged, model.Issue{
+					ID:         tid,
+					Title:      "(tombstoned)",
+					Status:     model.StatusTombstone,
+					SourceRepo: inferSourceRepoForTombstone(tid, ctx.SourceAuthority),
+				})
+			}
+		}
+		baseIssues = merged
+	}
+	commitCtx.Issues = baseIssues
+	commitCtx.FullIssues = baseIssues
+	commitCtx.Repo = ""
+	commitCtx.LabelScope = ""
+	commitCtx.Recipe = ""
+	commitCtx.CandidateIDs = nil
+
+	report, err := generateCorrelationReportForContext(commitCtx, matchedGitRoot, opts)
+	if err != nil {
+		return err
+	}
+
+	lookup := correlation.NewReverseLookupWithRepo(report, matchedGitRoot).WithStoreDirs(commitStoreDirs...)
+	result, err := lookup.LookupByCommit(resolvedSHA)
+	if err != nil {
+		return err
+	}
+
+	inAsOfAncestry := ctx.AsOfCommit == "" || isCommitAncestorOfRevision(matchedGitRoot, resolvedSHA, ctx.AsOfCommit)
+
+	// If resolvedSHA fell outside the bounded --history-limit window (or lives on
+	// a side branch not reachable from the primary walk revision), evaluate
+	// single-commit correlation directly at resolvedSHA while retaining full
+	// .beads lifecycle event windows so temporal_author and older commits work.
+	if result.IsOrphan && len(result.RelatedBeads) == 0 && !result.BeadsOnly && inAsOfAncestry &&
+		(opts.Since == nil || result.Timestamp.IsZero() || !result.Timestamp.Before(*opts.Since)) {
+		windowTruncated := opts.Limit > 0 && (report.Window == nil || report.Window.Commits >= opts.Limit)
+		runFallback := false
+		fallbackRev := ctx.AsOfCommit
+		if ctx.AsOfCommit != "" {
+			if windowTruncated {
+				runFallback = true
+			}
+		} else {
+			if !isCommitAncestorOfRevision(matchedGitRoot, resolvedSHA, "") {
+				runFallback = true
+				fallbackRev = resolvedSHA
+			} else if windowTruncated {
+				runFallback = true
+				fallbackRev = ""
+			}
+		}
+		if runFallback {
+			singleReport, singleErr := generateCorrelationReportForContext(commitCtx, matchedGitRoot, correlation.CorrelatorOptions{
+				Limit:           0,
+				Revision:        fallbackRev,
+				Since:           opts.Since,
+				Until:           opts.Until,
+				TargetCommitSHA: resolvedSHA,
+			})
+			if singleErr == nil && singleReport != nil {
+				singleLookup := correlation.NewReverseLookupWithRepo(singleReport, matchedGitRoot).WithStoreDirs(commitStoreDirs...)
+				if singleRes, lkErr := singleLookup.LookupByCommit(resolvedSHA); lkErr == nil {
+					if len(singleRes.RelatedBeads) > 0 || singleRes.BeadsOnly || !singleRes.IsOrphan {
+						result = singleRes
+					}
+				}
+			}
+		}
+	}
+
+	effectiveMinConf := 0.0
+	if cfg.MinConfidence != nil && *cfg.MinConfidence > effectiveMinConf {
+		effectiveMinConf = *cfg.MinConfidence
+	}
+	if cfg.RobotMinConf != nil && *cfg.RobotMinConf > effectiveMinConf {
+		effectiveMinConf = *cfg.RobotMinConf
+	}
+
+	unfilteredCount := len(result.RelatedBeads)
+	trueIsOrphan := unfilteredCount == 0 && result.IsOrphan && !result.BeadsOnly && inAsOfAncestry
+
+	scopeIDs := ctx.CandidateIDs
+	if scopeIDs == nil && ctx.ActiveRecipe != nil {
+		scopeIDs = make(map[string]bool, len(ctx.Issues))
+		for _, iss := range ctx.Issues {
+			scopeIDs[iss.ID] = true
+		}
+	}
+
+	filtered := make([]correlation.RelatedBead, 0, unfilteredCount)
+	for _, rb := range result.RelatedBeads {
+		if scopeIDs != nil && !scopeIDs[rb.BeadID] {
+			continue
+		}
+		if effectiveMinConf > 0 && rb.Confidence < effectiveMinConf {
+			continue
+		}
+		filtered = append(filtered, rb)
+	}
+	result.FilteredOutCount = unfilteredCount - len(filtered)
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].Confidence != filtered[j].Confidence {
+			return filtered[i].Confidence > filtered[j].Confidence
+		}
+		return filtered[i].BeadID < filtered[j].BeadID
+	})
+	if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(filtered) > *cfg.RobotMaxResults {
+		filtered = filtered[:*cfg.RobotMaxResults]
+	}
+	result.RelatedBeads = filtered
+	result.IsOrphan = trueIsOrphan
+
+	if result.IsOrphan {
+		orphanReport := report
+		if scopeIDs != nil && report != nil {
+			scopedCopy := *report
+			scopedHistories := make(map[string]correlation.BeadHistory, len(report.Histories))
+			for id, h := range report.Histories {
+				if scopeIDs[id] {
+					scopedHistories[id] = h
+				}
+			}
+			scopedCopy.Histories = scopedHistories
+			orphanReport = &scopedCopy
+		}
+		detector := correlation.NewOrphanDetectorAt(orphanReport, matchedGitRoot, robotNow()).
+			WithStoreDirs(commitStoreDirs...)
+		cand, beadsOnly, candErr := detector.AnalyzeCommit(resolvedSHA)
+		if beadsOnly {
+			result.BeadsOnly = true
+			result.IsOrphan = false
+		} else if candErr == nil && cand != nil {
+			if scopeIDs != nil {
+				scopedProb := make([]correlation.ProbableBead, 0, len(cand.ProbableBeads))
+				for _, pb := range cand.ProbableBeads {
+					if scopeIDs[pb.BeadID] {
+						scopedProb = append(scopedProb, pb)
+					}
+				}
+				cand.ProbableBeads = scopedProb
+				if len(cand.ProbableBeads) == 0 {
+					cand = nil
+				}
+			}
+			if cand != nil {
+				if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(cand.ProbableBeads) > *cfg.RobotMaxResults {
+					cand.ProbableBeads = cand.ProbableBeads[:*cfg.RobotMaxResults]
+				}
+				result.OrphanCandidate = cand
+				result.OrphanCandidates = cand.ProbableBeads
+			}
+		}
+	}
+
+	envHash := ctx.DataHash
+	if envHash == "" {
+		envHash = report.DataHash
+	}
+	enveloped, err := withEnvelope(ctx.EnvelopeWithHash(envHash), result)
+	if err != nil {
+		return fmt.Errorf("commit lookup payload: %w", err)
+	}
+	if err := ctx.EncoderOrDefault().Encode(enveloped); err != nil {
+		return fmt.Errorf("encoding commit lookup: %w", err)
 	}
 	return nil
 }
@@ -4976,7 +5645,7 @@ func handleRobotBlockerChain(ctx RobotContext, cfg phaseThreeRobotHandlerConfig)
 		RobotEnvelope
 		Result *analysis.BlockerChainResult `json:"result"`
 	}{
-		RobotEnvelope: ctx.EnvelopeWithHash(analysis.ComputeDataHash(issues)),
+		RobotEnvelope: ctx.Envelope(),
 		Result:        result,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -4986,8 +5655,6 @@ func handleRobotBlockerChain(ctx RobotContext, cfg phaseThreeRobotHandlerConfig)
 }
 
 func handleRobotWhatIf(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	issues := ctx.Issues
-
 	analyzer := ctx.Analyzer()
 	analyzer.SetNow(robotNow())
 	if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
@@ -5006,7 +5673,7 @@ func handleRobotWhatIf(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		RobotEnvelope
 		Result *analysis.WhatIfResult `json:"result"`
 	}{
-		RobotEnvelope: ctx.EnvelopeWithHash(analysis.ComputeDataHash(issues)),
+		RobotEnvelope: ctx.Envelope(),
 		Result:        result,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -5095,7 +5762,14 @@ func handleRobotCausality(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 		return fmt.Errorf("generating history report: %w", err)
 	}
 
-	blockerTitles := make(map[string]string, len(issues))
+	blockerTitleSource := ctx.FullIssues
+	if len(blockerTitleSource) == 0 {
+		blockerTitleSource = issues
+	}
+	blockerTitles := make(map[string]string, len(blockerTitleSource)+len(issues))
+	for _, issue := range blockerTitleSource {
+		blockerTitles[issue.ID] = issue.Title
+	}
 	for _, issue := range issues {
 		blockerTitles[issue.ID] = issue.Title
 	}
@@ -5138,7 +5812,7 @@ func handleRobotSprintShow(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) e
 		RobotEnvelope
 		Sprint *model.Sprint `json:"sprint"`
 	}{
-		RobotEnvelope: ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues)),
+		RobotEnvelope: ctx.Envelope(),
 		Sprint:        found,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -5330,7 +6004,7 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		Actionable          []string     `json:"actionable"`
 		Bottlenecks         []bottleneck `json:"bottlenecks,omitempty"`
 	}{
-		RobotEnvelope:       ctx.EnvelopeWithHash(analysis.ComputeDataHash(ctx.Issues)),
+		RobotEnvelope:       ctx.Envelope(),
 		Agents:              agents,
 		OpenIssueCount:      len(openIssues),
 		TotalMinutes:        totalMinutes,

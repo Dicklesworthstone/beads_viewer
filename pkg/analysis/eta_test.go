@@ -705,3 +705,28 @@ func TestEstimateETAAndGrahamBounds_DefaultCalendarVelocityParity(t *testing.T) 
 		t.Fatalf("expected 1 issue at medianMinutes with 1 issue/7-calendar-day fallback to take 7.0 days, got %.6f", eta.EstimatedDays)
 	}
 }
+
+func TestComputeGrahamBounds_IgnoresParentChildDependencies(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	m120 := 120
+	openIssues := []model.Issue{
+		{ID: "PARENT", Status: model.StatusOpen, IssueType: model.TypeTask, EstimatedMinutes: &m120},
+		{
+			ID:               "CHILD",
+			Status:           model.StatusOpen,
+			IssueType:        model.TypeTask,
+			EstimatedMinutes: &m120,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CHILD", DependsOnID: "PARENT", Type: model.DepParentChild},
+			},
+		},
+	}
+
+	bounds := ComputeGrahamBounds(openIssues, openIssues, nil, 2, now)
+	if bounds.TotalMinutes != 240 {
+		t.Fatalf("TotalMinutes = %d, want 240", bounds.TotalMinutes)
+	}
+	if bounds.CriticalPathMinutes != 120 {
+		t.Fatalf("non-blocking DepParentChild inflated CriticalPathMinutes to %d, want 120", bounds.CriticalPathMinutes)
+	}
+}

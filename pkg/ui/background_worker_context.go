@@ -58,11 +58,15 @@ func openSQLiteReloadContext(ctx context.Context, path string) (*datasource.SQLi
 // JSONL still uses its existing parser; cancellation there is checked before
 // and after parsing, not claimed to interrupt filesystem reads or the parser.
 func loadIssuesForReloadContext(ctx context.Context, path string, opts loader.ParseOptions) (reloadIssueData, error) {
+	return loadIssuesForReloadContextWithDegraded(ctx, path, opts, false)
+}
+
+func loadIssuesForReloadContextWithDegraded(ctx context.Context, path string, opts loader.ParseOptions, sourceDegraded bool) (reloadIssueData, error) {
 	if err := ctx.Err(); err != nil {
 		return reloadIssueData{}, err
 	}
 	if !isSQLiteReloadPath(path) {
-		loaded, err := loadIssuesForReload(path, opts)
+		loaded, err := loadIssuesForReloadWithDegraded(path, opts, sourceDegraded)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			loader.ReturnIssuePtrsToPool(loaded.PoolRefs)
 			return reloadIssueData{}, ctxErr
@@ -79,13 +83,14 @@ func loadIssuesForReloadContext(ctx context.Context, path string, opts loader.Pa
 		return reloadIssueData{}, err
 	}
 	report := reader.LoadReport()
-	complete := report.Errors == 0 && report.ReadErrors == 0 && !report.Stale && len(report.AuthorityWarnings) == 0
+	complete := report.Errors == 0 && report.ReadErrors == 0 && !report.Stale && len(report.AuthorityWarnings) == 0 && !sourceDegraded
 	loader.AttachIssueOrigins(issues, path, complete)
 	// Build authority before hiding satisfied tombstones or recipe-filtered
 	// blockers. The read transaction is already closed before graph work.
 	result := reloadIssueData{
-		Authority:     model.NewReadinessIndex(issues),
-		AuthorityHash: analysis.ComputeDataHash(issues),
+		Authority:         model.NewReadinessIndex(issues),
+		AuthorityHash:     analysis.ComputeDataHash(issues),
+		AuthorityComplete: complete,
 	}
 	visible := make([]model.Issue, 0, len(issues))
 	for i := range issues {

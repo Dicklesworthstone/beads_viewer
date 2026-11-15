@@ -83,6 +83,7 @@ bv --robot-blocker-chain <id>  # Full upstream blocker chain for one issue
 ```bash
 bv --robot-history                     # Bead-to-commit correlations
 bv --bead-history <id>                 # Single-bead commit correlation history
+bv --robot-commit <sha|ref>            # Beads correlated with one Git commit or revision
 bv --robot-file-beads "pkg/ui/*.go"    # Beads touching a file, directory prefix, or glob
 bv --robot-file-hotspots               # Files touched by the most beads
 bv --robot-file-relations <path>       # Co-changing files above correlation threshold
@@ -100,7 +101,8 @@ bv --robot-sprint-show sprint-1        # Single sprint detail
 bv --robot-burndown sprint-1           # Use an existing sprint ID for burndown/scope changes
 bv --robot-forecast all                # Duration/velocity heuristic, not a scheduler
 bv --robot-capacity --agents=3         # Serial/parallel capacity + Graham makespan bounds
-bv --robot-alerts                      # Stale issues, blocking cascades
+bv --robot-alerts                      # Stale issues, blocking cascades, source inconsistencies
+bv --init-drift                        # Bootstrap default .bv/drift.yaml thresholds
 bv --check-drift --robot-drift         # Saved-baseline drift check as structured JSON
 bv --robot-suggest                     # Hygiene: duplicates, missing deps, cycle breaks
 bv --robot-graph                       # Dependency graph export (JSON, DOT, Mermaid)

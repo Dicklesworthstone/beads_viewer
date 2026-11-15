@@ -23,7 +23,7 @@ function toInt(value, fallback = 0) {
 }
 
 function statusToCode(status) {
-  switch (status) {
+  switch (String(status || '').toLowerCase().trim()) {
     case 'open':
       return 0;
     case 'in_progress':
@@ -32,16 +32,40 @@ function statusToCode(status) {
       return 2;
     case 'closed':
       return 3;
+    case 'review':
+      return 4;
+    case 'hooked':
+      return 5;
+    case 'pinned':
+      return 6;
+    case 'deferred':
+      return 7;
+    case 'draft':
+      return 8;
+    case 'tombstone':
+      return 9;
     default:
       return 255;
   }
+}
+
+function resolveHybridReferenceNowMs() {
+  const viewerNow = typeof window !== 'undefined' ? window.beadsViewer?.getReferenceNowMs?.() : undefined;
+  if (typeof viewerNow === 'number' && Number.isFinite(viewerNow) && viewerNow > 0) {
+    return viewerNow;
+  }
+  const winNow = typeof window !== 'undefined' ? window.BV_REFERENCE_NOW_MS : undefined;
+  if (typeof winNow === 'number' && Number.isFinite(winNow) && winNow > 0) {
+    return winNow;
+  }
+  return Date.now();
 }
 
 function daysSince(updatedAt) {
   if (!updatedAt) return -1;
   const ts = new Date(updatedAt).getTime();
   if (!Number.isFinite(ts)) return -1;
-  return (Date.now() - ts) / (1000 * 60 * 60 * 24);
+  return Math.max(0, (resolveHybridReferenceNowMs() - ts) / (1000 * 60 * 60 * 24));
 }
 
 async function resolveHasHybridWasm(metaOverride) {
@@ -143,7 +167,7 @@ function scoreBatchHybrid(results, weights) {
     pagerank: toNumber(r.pagerank, 0.5),
     status: statusToCode(r.status),
     priority: Math.max(0, Math.min(4, toInt(r.priority, 2))),
-    blocker_count: Math.max(0, toInt(r.blockerCount ?? r.blocker_count, 0)),
+    blocker_count: Math.max(0, toInt(r.blockerCount ?? r.impact ?? r.blocks_count ?? r.dependent_count ?? 0, 0)),
     days_since_update: daysSince(r.updatedAt ?? r.updated_at),
   }));
 

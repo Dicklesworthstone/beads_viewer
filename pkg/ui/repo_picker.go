@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -132,8 +133,47 @@ func (m *RepoPickerModel) View() string {
 		emptyStyle := t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true)
 		lines = append(lines, emptyStyle.Render("No repos available."))
 	} else {
-		for i, repo := range m.repos {
-			isCursor := i == m.selectedIndex
+		selIdx := m.selectedIndex
+		if selIdx < 0 {
+			selIdx = 0
+		} else if selIdx >= len(m.repos) {
+			selIdx = len(m.repos) - 1
+		}
+
+		maxVisible := m.height - 10
+		if maxVisible < 5 {
+			maxVisible = 5
+		}
+
+		startIdx := 0
+		endIdx := len(m.repos)
+		if len(m.repos) > maxVisible {
+			if selIdx < maxVisible-1 {
+				startIdx = 0
+				endIdx = maxVisible - 1
+			} else if selIdx >= len(m.repos)-(maxVisible-1) {
+				endIdx = len(m.repos)
+				startIdx = len(m.repos) - (maxVisible - 1)
+				if startIdx < 0 {
+					startIdx = 0
+				}
+			} else {
+				slots := maxVisible - 2
+				if slots < 1 {
+					slots = 1
+				}
+				startIdx = selIdx - slots/2
+				endIdx = startIdx + slots
+			}
+		}
+
+		moreStyle := t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true)
+		if startIdx > 0 {
+			lines = append(lines, moreStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)))
+		}
+		for i := startIdx; i < endIdx; i++ {
+			repo := m.repos[i]
+			isCursor := i == selIdx
 			isSelected := m.selected[repo]
 
 			nameStyle := t.Renderer.NewStyle().Foreground(t.Base.GetForeground())
@@ -150,8 +190,11 @@ func (m *RepoPickerModel) View() string {
 				check = "[x]"
 			}
 
-			line := prefix + check + " " + repo
+			line := truncateRunesHelper(prefix+check+" "+repo, boxWidth-4, "…")
 			lines = append(lines, nameStyle.Render(line))
+		}
+		if rem := len(m.repos) - endIdx; rem > 0 {
+			lines = append(lines, moreStyle.Render(fmt.Sprintf("  ↓ %d more", rem)))
 		}
 	}
 

@@ -176,6 +176,7 @@ type workerMetrics struct {
 type BackgroundWorker struct {
 	// Configuration
 	beadsPath         string
+	sourceDegraded    bool
 	debounceDelay     time.Duration
 	heartbeatInterval time.Duration
 	watchdogInterval  time.Duration
@@ -262,8 +263,9 @@ type IdleGCConfig struct {
 
 // WorkerConfig configures the BackgroundWorker.
 type WorkerConfig struct {
-	BeadsPath     string
-	DebounceDelay time.Duration
+	BeadsPath      string
+	SourceDegraded bool
+	DebounceDelay  time.Duration
 
 	IdleGC *IdleGCConfig
 
@@ -334,6 +336,7 @@ func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 
 	w := &BackgroundWorker{
 		beadsPath:         cfg.BeadsPath,
+		sourceDegraded:    cfg.SourceDegraded,
 		debounceDelay:     cfg.DebounceDelay,
 		heartbeatInterval: cfg.HeartbeatInterval,
 		watchdogInterval:  cfg.WatchdogInterval,
@@ -1547,6 +1550,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	var pooledRefs []*model.Issue
 	var authority *model.ReadinessIndex
 	var authorityHash string
+	authorityComplete := true
 	loadWarningCount := 0
 	var loadStart time.Time
 	if profileSnapshot {
@@ -1566,12 +1570,13 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 				return i.Status != model.StatusClosed && i.Status != model.StatusTombstone
 			}
 		}
-		loaded, err = loadIssuesForReloadContext(ctx, w.beadsPath, opts)
+		loaded, err = loadIssuesForReloadContextWithDegraded(ctx, w.beadsPath, opts, w.sourceDegraded)
 		if err == nil {
 			issues = loaded.Issues
 			pooledRefs = loaded.PoolRefs
 			authority = loaded.Authority
 			authorityHash = loaded.AuthorityHash
+			authorityComplete = loaded.AuthorityComplete && loadWarningCount == 0 && !w.sourceDegraded
 		}
 		return err
 	})
@@ -1596,6 +1601,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 
 	loadMetadataUnchanged := prevSnapshot != nil &&
 		prevSnapshot.AuthorityHash == authorityHash &&
+		prevSnapshot.AuthorityComplete == authorityComplete &&
 		prevSnapshot.SourceIssueCountHint == sourceLineCount &&
 		prevSnapshot.LoadWarningCount == loadWarningCount &&
 		prevSnapshot.DatasetTier == tier &&
@@ -1659,6 +1665,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	if snapshot != nil {
 		snapshot.DataHash = hash
 		snapshot.AuthorityHash = authorityHash
+		snapshot.AuthorityComplete = authorityComplete
 		snapshot.LoadWarningCount = loadWarningCount
 		snapshot.RecipeName = recipeID
 		snapshot.RecipeHash = recipeHash

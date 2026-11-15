@@ -1026,6 +1026,34 @@ func TestBuildHybridMetricsCmdCarriesGenerations(t *testing.T) {
 	}
 }
 
+func TestBuildHybridMetricsCmdHonorsExternalReadiness(t *testing.T) {
+	closedBlocker := model.Issue{ID: "EXT-CLOSED", Title: "Closed blocker", Status: model.StatusClosed}
+	openDependent := model.Issue{
+		ID:     "SCOPED-OPEN",
+		Title:  "Scoped open issue",
+		Status: model.StatusOpen,
+		Dependencies: []*model.Dependency{
+			{IssueID: "SCOPED-OPEN", DependsOnID: "EXT-CLOSED", Type: model.DepBlocks},
+		},
+	}
+	readiness := model.NewReadinessIndex([]model.Issue{closedBlocker, openDependent})
+	raw := BuildHybridMetricsCmd([]model.Issue{openDependent}, 7, 11, readiness)()
+	msg, ok := raw.(HybridMetricsReadyMsg)
+	if !ok {
+		t.Fatalf("BuildHybridMetricsCmd returned %T, want HybridMetricsReadyMsg", raw)
+	}
+	if msg.Error != nil {
+		t.Fatalf("BuildHybridMetricsCmd returned error: %v", msg.Error)
+	}
+	got, found := msg.Cache.Get("SCOPED-OPEN")
+	if !found {
+		t.Fatal("expected SCOPED-OPEN in hybrid metrics cache")
+	}
+	if got.Status != string(model.StatusOpen) {
+		t.Fatalf("SCOPED-OPEN status = %q, want %q (resolved external blocker must not synthesize blocked status)", got.Status, model.StatusOpen)
+	}
+}
+
 func TestBuildSemanticIndexCmdErrorCarriesGenerations(t *testing.T) {
 	t.Setenv(search.EnvSemanticEmbedder, string(search.ProviderOpenAI))
 

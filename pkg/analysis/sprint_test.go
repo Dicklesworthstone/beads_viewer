@@ -188,3 +188,32 @@ func TestAllAtRiskSignals(t *testing.T) {
 		}
 	}
 }
+
+func TestDetectAtRisk_SkipsParkedTemplatePinnedAndParentChild(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	ancient := now.AddDate(0, 0, -20)
+	future := now.Add(48 * time.Hour)
+	issues := []model.Issue{
+		{ID: "tmpl", Title: "Template", Status: model.StatusOpen, IsTemplate: true, Priority: 0, UpdatedAt: ancient},
+		{ID: "pin-flag", Title: "Pinned flag", Status: model.StatusOpen, Pinned: true, Priority: 0, UpdatedAt: ancient},
+		{ID: "pin-status", Title: "Pinned status", Status: model.StatusPinned, Priority: 0, UpdatedAt: ancient},
+		{ID: "deferred", Title: "Deferred", Status: model.StatusDeferred, Priority: 0, UpdatedAt: ancient},
+		{ID: "ephemeral", Title: "Ephemeral", Status: model.StatusOpen, Ephemeral: true, Priority: 0, UpdatedAt: ancient},
+		{ID: "defer-until", Title: "Snoozed", Status: model.StatusOpen, DeferUntil: &future, Priority: 0, UpdatedAt: ancient},
+		{ID: "parent-epic", Title: "Parent epic", Status: model.StatusOpen, Priority: 1, UpdatedAt: ancient},
+		{
+			ID: "child-fresh", Title: "Child with parent-child link", Status: model.StatusOpen, Priority: 0, UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "child-fresh", DependsOnID: "parent-epic", Type: model.DepParentChild, CreatedAt: ancient},
+			},
+		},
+	}
+	sp := &model.Sprint{
+		ID:      "sprint-1",
+		BeadIDs: []string{"tmpl", "pin-flag", "pin-status", "deferred", "ephemeral", "defer-until", "child-fresh"},
+	}
+
+	if got := DetectAtRisk(issues, sp, now, DefaultAtRiskThresholds()); len(got) != 0 {
+		t.Fatalf("expected 0 at-risk items for parked/template/pinned/parent-child beads, got %+v", got)
+	}
+}

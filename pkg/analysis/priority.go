@@ -298,7 +298,10 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 				blockerNorm = normalizeInt(blockerCounts[nodeID], maxBlockers)
 			}
 		}
-		stalenessNorm := computeStaleness(issue.UpdatedAt, now)
+		stalenessNorm := 0.0
+		if !issue.IsParkedForStalenessAt(now) {
+			stalenessNorm = computeStaleness(issue.UpdatedAt, now)
+		}
 		priorityNorm := computePriorityBoost(issue.Priority)
 
 		// Compute time-to-impact signal
@@ -566,9 +569,9 @@ func computeUrgency(issue *model.Issue, now time.Time) (float64, string) {
 
 	// Apply time decay: urgency increases as issue ages without resolution
 	// Uses exponential growth with half-life of UrgencyDecayDays
-	// Handle zero CreatedAt (unknown creation date)
-	if issue.CreatedAt.IsZero() {
-		// Unknown creation date - return moderate urgency based on labels only
+	// Handle zero CreatedAt (unknown creation date) or parked beads
+	if issue.CreatedAt.IsZero() || issue.IsParkedForStalenessAt(now) {
+		// Unknown creation date or parked bead - return urgency based on labels only
 		if score > 1.0 {
 			score = 1.0
 		}
@@ -712,6 +715,7 @@ func (a *Analyzer) GenerateRecommendationsFromStats(stats *GraphStats, threshold
 		if !a.IsCandidate(score.IssueID) {
 			continue
 		}
+		iss := a.issueMap[score.IssueID]
 		rec := generateRecommendation(
 			score,
 			unblocksMap[score.IssueID],
@@ -720,6 +724,7 @@ func (a *Analyzer) GenerateRecommendationsFromStats(stats *GraphStats, threshold
 			slackMap[score.IssueID],
 			maxCore,
 			thresholds,
+			iss.IsParkedForStalenessAt(now),
 		)
 		if rec != nil {
 			if rec.Confidence >= thresholds.MinConfidence {
@@ -745,7 +750,7 @@ func (a *Analyzer) GenerateRecommendationsFromStats(stats *GraphStats, threshold
 }
 
 // generateRecommendation creates a recommendation for a single issue
-func generateRecommendation(score ImpactScore, unblocksCount int, core int, isArt bool, slack float64, maxCore int, thresholds RecommendationThresholds) *PriorityRecommendation {
+func generateRecommendation(score ImpactScore, unblocksCount int, core int, isArt bool, slack float64, maxCore int, thresholds RecommendationThresholds, isParked bool) *PriorityRecommendation {
 	var reasoning []string
 	var signals int
 	var signalStrength float64
@@ -779,8 +784,8 @@ func generateRecommendation(score ImpactScore, unblocksCount int, core int, isAr
 		signalStrength += 0.2
 	}
 
-	// Check staleness
-	if score.Breakdown.StalenessNorm >= float64(thresholds.StalenessDays)/30.0 {
+	// Check staleness (never attribute staleness to parked beads)
+	if !isParked && score.Breakdown.StalenessNorm > 0 && score.Breakdown.StalenessNorm >= float64(thresholds.StalenessDays)/30.0 {
 		days := int(score.Breakdown.StalenessNorm * 30)
 		reasoning = append(reasoning, fmt.Sprintf("Stale for %d+ days", days))
 		signals++

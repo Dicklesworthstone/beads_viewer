@@ -361,6 +361,39 @@ func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 				}
 			}
 		}
+	case "enter":
+		if m.selectedSprint == nil {
+			return m
+		}
+		scoped := m.repoScopedIssues()
+		scopedSet := make(map[string]bool, len(scoped))
+		for _, iss := range scoped {
+			scopedSet[iss.ID] = true
+		}
+		var targetID string
+		for _, id := range m.selectedSprint.BeadIDs {
+			if scopedSet[id] {
+				targetID = id
+				break
+			}
+		}
+		if targetID == "" {
+			return m
+		}
+		m.revealRecipeIssue(targetID)
+		if !m.selectListIssueByID(targetID) {
+			return m
+		}
+		m.isSprintView = false
+		m.focused = focusList
+		if m.isSplitView {
+			m.focused = focusDetail
+		} else {
+			m.showDetails = true
+			m.focused = focusDetail
+			m.viewport.GotoTop()
+		}
+		m.updateViewportContent()
 	}
 	return m
 }

@@ -496,10 +496,18 @@ func cloneFileChanges(files []FileChange) []FileChange {
 // extractBatchFiles extracts files for a batch of commits using a single git command
 func (b *BatchFileStatsExtractor) extractBatchFiles(shas []string) (map[string][]FileChange, error) {
 	result := make(map[string][]FileChange)
+	if len(shas) == 0 {
+		return result, nil
+	}
+	for _, sha := range shas {
+		if err := validateGitRefArg(sha); err != nil {
+			return result, err
+		}
+	}
 
 	// Use git log with specific commits to get all file changes in one call
 	// Format: commit SHA, then name-status
-	args := []string{"log", "--name-status", "--format=%H", "--no-walk"}
+	args := []string{"log", "--name-status", "--format=%H", "--no-walk", "--end-of-options"}
 	args = append(args, shas...)
 
 	cmd := gitCommand(b.ctx, args...)

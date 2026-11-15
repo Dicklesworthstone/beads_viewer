@@ -13,6 +13,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // TreeState represents the persistent state of the tree view (bv-zv7p).
@@ -69,7 +70,10 @@ func TreeStatePath(beadsDir string) string {
 // beads directory is desired. When empty, persistence is disabled so tree
 // navigation never writes to an unconfigured working directory.
 func (t *TreeModel) SetBeadsDir(dir string) {
-	t.beadsDir = dir
+	if t.beadsDir != dir {
+		t.beadsDir = dir
+		t.hierarchyExpanded = nil
+	}
 }
 
 // SetReadOnly marks the tree model as read-only (e.g., during --as-of or
@@ -88,39 +92,77 @@ func (t *TreeModel) persistenceDisabled() bool {
 	return savedConfigDisabled() || t.readOnly || t.beadsDir == ""
 }
 
-// saveState persists the current expand/collapse state to disk (bv-19vz).
+// collectExpandOverrides walks the current tree roots and records explicit
+// non-default expand/collapse states (ignoring secondary SharedRef leaf copies).
+func (t *TreeModel) collectExpandOverrides() map[string]bool {
+	overrides := make(map[string]bool)
+	var walk func(node *IssueTreeNode)
+	walk = func(node *IssueTreeNode) {
+		if node == nil || node.Issue == nil || node.SharedRef {
+			return
+		}
+		defaultExpanded := node.Depth < 2
+		if node.Expanded != defaultExpanded {
+			overrides[node.Issue.ID] = node.Expanded
+		}
+		for _, child := range node.Children {
+			walk(child)
+		}
+	}
+	for _, root := range t.roots {
+		walk(root)
+	}
+	return overrides
+}
+
+// captureActiveExpandState stores the active mode's explicit expand/collapse
+// overrides into its dedicated per-mode map so Hierarchy and Blocking modes
+// never clobber one another.
+func (t *TreeModel) captureActiveExpandState() {
+	if t.mode == TreeModeBlocking {
+		t.blockingExpanded = t.collectExpandOverrides()
+	} else {
+		t.hierarchyExpanded = t.collectExpandOverrides()
+	}
+}
+
+// resetNodesToDefaultExpansion resets all non-SharedRef nodes to the default
+// depth-based expansion (depth < 2) before applying per-mode overrides.
+func (t *TreeModel) resetNodesToDefaultExpansion() {
+	var walk func(node *IssueTreeNode)
+	walk = func(node *IssueTreeNode) {
+		if node == nil || node.SharedRef {
+			return
+		}
+		node.Expanded = node.Depth < 2
+		for _, child := range node.Children {
+			walk(child)
+		}
+	}
+	for _, root := range t.roots {
+		walk(root)
+	}
+}
+
+// saveState persists the current Hierarchy expand/collapse state to disk (bv-19vz).
 // Only stores explicit user changes; nodes not in the map use default behavior.
-// Strict no-op when BV_NO_SAVED_CONFIG is set, when read-only, or when beadsDir is unset.
+// Strict no-op in TreeModeBlocking, when BV_NO_SAVED_CONFIG is set, when read-only,
+// or when beadsDir is unset.
 func (t *TreeModel) saveState() {
+	if t.mode != TreeModeHierarchy {
+		return
+	}
+	t.hierarchyExpanded = t.collectExpandOverrides()
 	if t.persistenceDisabled() {
 		return
 	}
 
 	state := &TreeState{
 		Version:  TreeStateVersion,
-		Expanded: make(map[string]bool),
+		Expanded: make(map[string]bool, len(t.hierarchyExpanded)),
 	}
-
-	// Walk all nodes and record explicit expand state
-	var walk func(node *IssueTreeNode)
-	walk = func(node *IssueTreeNode) {
-		if node == nil || node.Issue == nil {
-			return
-		}
-
-		// Default: expanded for depth < 2, collapsed otherwise
-		defaultExpanded := node.Depth < 2
-		if node.Expanded != defaultExpanded {
-			state.Expanded[node.Issue.ID] = node.Expanded
-		}
-
-		for _, child := range node.Children {
-			walk(child)
-		}
-	}
-
-	for _, root := range t.roots {
-		walk(root)
+	for id, exp := range t.hierarchyExpanded {
+		state.Expanded[id] = exp
 	}
 
 	// Write to file
@@ -177,10 +219,25 @@ func writeTreeStateFile(path string, data []byte) error {
 	return nil
 }
 
-// loadState restores expand/collapse state from disk (bv-afcm).
-// If persistence is disabled, or the file doesn't exist or is corrupted,
-// defaults are used silently without corrupting TUI output.
+// loadState restores expand/collapse state for the active mode (bv-afcm).
+// TreeModeBlocking uses its separate in-memory blockingExpanded map and never
+// reads or mutates .beads/tree-state.json. TreeModeHierarchy uses in-memory
+// hierarchyExpanded when present, or loads .beads/tree-state.json on first build.
 func (t *TreeModel) loadState() {
+	t.resetNodesToDefaultExpansion()
+
+	if t.mode == TreeModeBlocking {
+		if len(t.blockingExpanded) > 0 {
+			t.applyState(&TreeState{Version: TreeStateVersion, Expanded: t.blockingExpanded})
+		}
+		return
+	}
+
+	if t.hierarchyExpanded != nil {
+		t.applyState(&TreeState{Version: TreeStateVersion, Expanded: t.hierarchyExpanded})
+		return
+	}
+
 	if savedConfigDisabled() || t.beadsDir == "" {
 		return
 	}
@@ -202,6 +259,11 @@ func (t *TreeModel) loadState() {
 		return
 	}
 
+	t.hierarchyExpanded = make(map[string]bool, len(state.Expanded))
+	for id, exp := range state.Expanded {
+		t.hierarchyExpanded[id] = exp
+	}
+
 	// Apply loaded state to nodes
 	t.applyState(&state)
 }
@@ -214,7 +276,7 @@ func (t *TreeModel) applyState(state *TreeState) {
 	}
 
 	for id, expanded := range state.Expanded {
-		if node, ok := t.issueMap[id]; ok {
+		if node, ok := t.issueMap[id]; ok && !node.SharedRef {
 			node.Expanded = expanded
 		}
 		// If ID not found, it's stale - ignore
@@ -226,16 +288,22 @@ type TreeViewMode int
 
 const (
 	TreeModeHierarchy TreeViewMode = iota // parent-child deps (default)
-	TreeModeBlocking                      // blocking deps (future)
+	TreeModeBlocking                      // blocking deps
+)
+
+const (
+	maxBlockingTreeDepth = 64
+	maxBlockingTreeNodes = 10000
 )
 
 // IssueTreeNode represents a node in the hierarchical issue tree
 type IssueTreeNode struct {
-	Issue    *model.Issue     // Reference to the actual issue
-	Children []*IssueTreeNode // Child nodes
-	Expanded bool             // Is this node expanded?
-	Depth    int              // Nesting level (0 = root)
-	Parent   *IssueTreeNode   // Back-reference for navigation
+	Issue     *model.Issue     // Reference to the actual issue
+	Children  []*IssueTreeNode // Child nodes
+	Expanded  bool             // Is this node expanded?
+	Depth     int              // Nesting level (0 = root)
+	Parent    *IssueTreeNode   // Back-reference for navigation
+	SharedRef bool             // True when attached as a non-reexpanded shared DAG target
 }
 
 // TreeModel manages the hierarchical tree view state
@@ -251,9 +319,16 @@ type TreeModel struct {
 	height         int                       // Available height
 	viewportOffset int                       // Index of first visible node (bv-r4ng)
 
+	// Per-mode explicit expand/collapse state
+	hierarchyExpanded map[string]bool
+	blockingExpanded  map[string]bool
+
 	// Build state
-	built    bool   // Has tree been built?
-	lastHash string // Hash of issues for cache invalidation
+	built               bool          // Has tree been built?
+	lastHash            string        // Hash of issues for cache invalidation
+	issues              []model.Issue // Cached source issues for mode switching
+	hasParentChildEdges bool          // True when ≥1 parent-child edge exists in issues
+	hasBlockingEdges    bool          // True when ≥1 blocking edge exists in issues
 
 	// Persistence state (bv-19vz)
 	beadsDir string // Directory containing .beads (for tree-state.json)
@@ -267,6 +342,318 @@ func NewTreeModel(theme Theme) TreeModel {
 		mode:     TreeModeHierarchy,
 		issueMap: make(map[string]*IssueTreeNode),
 	}
+}
+
+// Mode returns the active tree relationship mode (Hierarchy vs Blocking).
+func (t *TreeModel) Mode() TreeViewMode {
+	return t.mode
+}
+
+// ModeName returns the human-readable name for the active tree mode.
+func (t *TreeModel) ModeName() string {
+	if t.mode == TreeModeBlocking {
+		return "Blocking Chain"
+	}
+	return "Hierarchy"
+}
+
+// SetMode sets the active tree mode and rebuilds while preserving the selected issue ID
+// and each mode's independent expand/collapse state.
+func (t *TreeModel) SetMode(mode TreeViewMode) {
+	if t.mode == mode {
+		return
+	}
+	prevSelectedID := t.GetSelectedID()
+	if t.built {
+		t.captureActiveExpandState()
+	}
+	t.mode = mode
+	t.lastHash = ""
+	if t.built {
+		issues := t.issues
+		t.Build(issues)
+		if prevSelectedID != "" {
+			t.SelectByID(prevSelectedID)
+		}
+	}
+}
+
+// CycleMode toggles between TreeModeHierarchy and TreeModeBlocking, preserving selection.
+func (t *TreeModel) CycleMode() {
+	if t.mode == TreeModeHierarchy {
+		t.SetMode(TreeModeBlocking)
+	} else {
+		t.SetMode(TreeModeHierarchy)
+	}
+}
+
+func scanTreeEdgePresence(issues []model.Issue) (hasParentChild, hasBlocking bool) {
+	for i := range issues {
+		for _, dep := range issues[i].Dependencies {
+			if dep == nil {
+				continue
+			}
+			if dep.Type == model.DepParentChild {
+				hasParentChild = true
+			}
+			if dep.Type.IsBlocking() {
+				hasBlocking = true
+			}
+			if hasParentChild && hasBlocking {
+				return true, true
+			}
+		}
+	}
+	return hasParentChild, hasBlocking
+}
+
+// buildBlockingTreeNodes constructs blocker -> dependent chains over blocking edges
+// in strictly O(V + E) nodes by expanding each issue's downstream DAG once and
+// attaching leaf SharedRef nodes on secondary incoming blocking edges.
+func buildBlockingTreeNodes(issues []model.Issue) ([]*IssueTreeNode, map[string]*IssueTreeNode, bool) {
+	t := TreeModel{
+		mode:     TreeModeBlocking,
+		issueMap: make(map[string]*IssueTreeNode),
+	}
+	if len(issues) == 0 {
+		return nil, t.issueMap, false
+	}
+
+	issueByID := make(map[string]*model.Issue, len(issues))
+	for i := range issues {
+		issueByID[issues[i].ID] = &issues[i]
+	}
+
+	childrenOf := make(map[string][]*model.Issue)
+	seenChildEdge := make(map[string]map[string]bool)
+	hasInSetBlocker := make(map[string]bool)
+	participates := make(map[string]bool)
+	hasBlocking := false
+
+	for i := range issues {
+		issue := &issues[i]
+		for _, dep := range issue.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			hasBlocking = true
+			participates[issue.ID] = true
+			blockerID := dep.DependsOnID
+			if _, ok := issueByID[blockerID]; ok {
+				participates[blockerID] = true
+				if seenChildEdge[blockerID] == nil {
+					seenChildEdge[blockerID] = make(map[string]bool)
+				}
+				if !seenChildEdge[blockerID][issue.ID] {
+					seenChildEdge[blockerID][issue.ID] = true
+					childrenOf[blockerID] = append(childrenOf[blockerID], issue)
+				}
+				hasInSetBlocker[issue.ID] = true
+			}
+		}
+	}
+
+	if !hasBlocking {
+		return nil, t.issueMap, false
+	}
+
+	sortBlockingIssues := func(list []*model.Issue) {
+		sort.Slice(list, func(i, j int) bool {
+			a, b := list[i], list[j]
+			if a == nil || b == nil {
+				return a != nil
+			}
+			if a.Priority != b.Priority {
+				return a.Priority < b.Priority
+			}
+			return a.ID < b.ID
+		})
+	}
+
+	var rootIssues []*model.Issue
+	for i := range issues {
+		issue := &issues[i]
+		if participates[issue.ID] && !hasInSetBlocker[issue.ID] {
+			rootIssues = append(rootIssues, issue)
+		}
+	}
+	sortBlockingIssues(rootIssues)
+	for id := range childrenOf {
+		sortBlockingIssues(childrenOf[id])
+	}
+
+	// O(V + E) minimum-depth BFS pre-pass so shallow roots/branches always own the
+	// primary expanded subtree and shared descendants are never hidden behind a
+	// deeper collapsed path.
+	claimed := make(map[string]bool, len(participates))
+	primaryParent := make(map[string]string, len(participates))
+	bfsDepth := make(map[string]int, len(participates))
+	queue := make([]string, 0, len(participates))
+
+	drainBFS := func() {
+		for head := 0; head < len(queue); head++ {
+			u := queue[head]
+			if bfsDepth[u] >= maxBlockingTreeDepth {
+				continue
+			}
+			for _, child := range childrenOf[u] {
+				if child == nil || claimed[child.ID] {
+					continue
+				}
+				claimed[child.ID] = true
+				primaryParent[child.ID] = u
+				bfsDepth[child.ID] = bfsDepth[u] + 1
+				queue = append(queue, child.ID)
+			}
+		}
+		queue = queue[:0]
+	}
+
+	for _, root := range rootIssues {
+		if root == nil || claimed[root.ID] {
+			continue
+		}
+		claimed[root.ID] = true
+		primaryParent[root.ID] = ""
+		bfsDepth[root.ID] = 0
+		queue = append(queue, root.ID)
+	}
+	drainBFS()
+
+	// Cycle fallback: if a connected component is a pure blocking cycle with no
+	// unblocked root, deterministically walk blocking predecessors to the cycle,
+	// pick the lowest-ID member as display root, and run BFS from it.
+	var remaining []string
+	for id := range participates {
+		if !claimed[id] {
+			remaining = append(remaining, id)
+		}
+	}
+	sort.Strings(remaining)
+	var cycleRoots []*model.Issue
+	for _, startID := range remaining {
+		if claimed[startID] {
+			continue
+		}
+		curr := startID
+		order := []string{}
+		pos := make(map[string]int)
+		for {
+			if idx, seen := pos[curr]; seen {
+				minID := order[idx]
+				for _, cid := range order[idx+1:] {
+					if cid < minID {
+						minID = cid
+					}
+				}
+				curr = minID
+				break
+			}
+			pos[curr] = len(order)
+			order = append(order, curr)
+			nextBlocker := ""
+			found := false
+			for _, dep := range issueByID[curr].Dependencies {
+				if dep == nil || !dep.Type.IsBlocking() || issueByID[dep.DependsOnID] == nil {
+					continue
+				}
+				if !found || dep.DependsOnID < nextBlocker {
+					nextBlocker = dep.DependsOnID
+					found = true
+				}
+			}
+			if !found {
+				break
+			}
+			curr = nextBlocker
+		}
+		seedID := curr
+		if claimed[seedID] {
+			seedID = startID
+		}
+		if issueByID[seedID] != nil && !claimed[seedID] {
+			claimed[seedID] = true
+			primaryParent[seedID] = ""
+			bfsDepth[seedID] = 0
+			cycleRoots = append(cycleRoots, issueByID[seedID])
+			queue = append(queue, seedID)
+			drainBFS()
+		}
+	}
+	sortBlockingIssues(cycleRoots)
+
+	visited := make(map[string]bool)
+	primaryBuilt := make(map[string]bool, len(issues))
+	nodeCount := 0
+
+	var buildDAGNode func(issue *model.Issue, depth int, parent *IssueTreeNode) *IssueTreeNode
+	buildDAGNode = func(issue *model.Issue, depth int, parent *IssueTreeNode) *IssueTreeNode {
+		if issue == nil || nodeCount >= maxBlockingTreeNodes {
+			return nil
+		}
+		parentID := ""
+		if parent != nil && parent.Issue != nil {
+			parentID = parent.Issue.ID
+		}
+		isPrimary := !primaryBuilt[issue.ID] && primaryParent[issue.ID] == parentID
+		if visited[issue.ID] || !isPrimary {
+			nodeCount++
+			return &IssueTreeNode{
+				Issue:     issue,
+				Depth:     depth,
+				Parent:    parent,
+				Expanded:  false,
+				SharedRef: true,
+			}
+		}
+
+		primaryBuilt[issue.ID] = true
+		nodeCount++
+		node := &IssueTreeNode{
+			Issue:    issue,
+			Depth:    depth,
+			Parent:   parent,
+			Expanded: depth < 2,
+		}
+		t.issueMap[issue.ID] = node
+		if depth >= maxBlockingTreeDepth {
+			return node
+		}
+
+		visited[issue.ID] = true
+		defer func() { visited[issue.ID] = false }()
+
+		for _, child := range childrenOf[issue.ID] {
+			if nodeCount >= maxBlockingTreeNodes {
+				break
+			}
+			if childNode := buildDAGNode(child, depth+1, node); childNode != nil {
+				node.Children = append(node.Children, childNode)
+			}
+		}
+		t.sortNodes(node.Children)
+		return node
+	}
+
+	for _, issue := range rootIssues {
+		if nodeCount >= maxBlockingTreeNodes {
+			break
+		}
+		if node := buildDAGNode(issue, 0, nil); node != nil {
+			t.roots = append(t.roots, node)
+		}
+	}
+	for _, issue := range cycleRoots {
+		if nodeCount >= maxBlockingTreeNodes {
+			break
+		}
+		if node := buildDAGNode(issue, 0, nil); node != nil {
+			t.roots = append(t.roots, node)
+		}
+	}
+
+	t.sortNodes(t.roots)
+	return t.roots, t.issueMap, true
 }
 
 // buildIssueTreeNodes constructs the hierarchical parent/child tree and returns:
@@ -390,9 +777,10 @@ func (t *TreeModel) SetSize(width, height int) {
 	t.height = height
 	t.viewport.Width = width
 	t.viewport.Height = height
+	t.ensureCursorVisible()
 }
 
-// Build constructs the tree from issues using parent-child dependencies.
+// Build constructs the tree from issues using the active mode (Hierarchy or Blocking).
 // Implementation for bv-j3ck.
 func (t *TreeModel) Build(issues []model.Issue) {
 	// Reset state
@@ -400,30 +788,29 @@ func (t *TreeModel) Build(issues []model.Issue) {
 	t.flatList = nil
 	t.issueMap = make(map[string]*IssueTreeNode)
 	t.cursor = 0
+	t.viewportOffset = 0
 	t.lastHash = ""
+	t.issues = issues
+	t.hasParentChildEdges, t.hasBlockingEdges = scanTreeEdgePresence(issues)
 
 	if len(issues) == 0 {
 		t.built = true
 		return
 	}
 
-	// Build tree structure (no state) and then apply persisted expand/collapse state.
-	roots, nodeMap := buildIssueTreeNodes(issues)
-	t.roots = roots
-	t.issueMap = nodeMap
+	if t.mode == TreeModeBlocking {
+		roots, nodeMap, _ := buildBlockingTreeNodes(issues)
+		t.roots = roots
+		t.issueMap = nodeMap
+	} else {
+		roots, nodeMap := buildIssueTreeNodes(issues)
+		t.roots = roots
+		t.issueMap = nodeMap
+	}
 
-	// Step 5: Handle empty tree (no parent-child relationships found)
-	// If all issues are roots (no hierarchy), that's fine - show them all
-	// The View() will handle displaying a helpful message if needed
-
-	// Step 6: Load persisted state (bv-afcm)
-	// This modifies node.Expanded values before we build the flat list
+	// Load persisted state (bv-afcm) before building the flat list.
 	t.loadState()
-
-	// Step 7: Build the flat list for navigation
-	// This must come after loadState so expand states are applied
 	t.rebuildFlatList()
-
 	t.built = true
 }
 
@@ -436,13 +823,7 @@ func (t *TreeModel) BuildFromIssues(issues []model.Issue) {
 	}
 	t.Build(issues)
 	if prevSelectedID != "" {
-		for i, node := range t.flatList {
-			if node != nil && node.Issue != nil && node.Issue.ID == prevSelectedID {
-				t.cursor = i
-				t.ensureCursorVisible()
-				break
-			}
-		}
+		t.SelectByID(prevSelectedID)
 	}
 }
 
@@ -454,8 +835,13 @@ func (t *TreeModel) BuildFromSnapshot(snapshot *DataSnapshot) {
 		return
 	}
 
-	// Skip work if we're already built for this snapshot.
-	if t.built && snapshot.DataHash != "" && t.lastHash == snapshot.DataHash {
+	snapshotHash := ""
+	if snapshot.DataHash != "" {
+		snapshotHash = fmt.Sprintf("%s:mode=%d", snapshot.DataHash, t.mode)
+	}
+
+	// Skip work if we're already built for this snapshot and mode.
+	if t.built && snapshotHash != "" && t.lastHash == snapshotHash {
 		return
 	}
 
@@ -465,6 +851,19 @@ func (t *TreeModel) BuildFromSnapshot(snapshot *DataSnapshot) {
 		prevSelectedID = issue.ID
 	}
 
+	t.issues = snapshot.Issues
+	t.hasParentChildEdges, t.hasBlockingEdges = scanTreeEdgePresence(snapshot.Issues)
+
+	// Snapshot precomputes Hierarchy roots only; Blocking mode builds from snapshot.Issues.
+	if t.mode == TreeModeBlocking {
+		t.Build(snapshot.Issues)
+		t.lastHash = snapshotHash
+		if prevSelectedID != "" {
+			t.SelectByID(prevSelectedID)
+		}
+		return
+	}
+
 	// Reset view state, but keep dimensions/theme/beadsDir.
 	t.roots = snapshot.TreeRoots
 	t.issueMap = snapshot.TreeNodeMap
@@ -472,7 +871,10 @@ func (t *TreeModel) BuildFromSnapshot(snapshot *DataSnapshot) {
 	// If the snapshot didn't include tree data, fall back to building it now.
 	if len(t.roots) == 0 || t.issueMap == nil {
 		t.Build(snapshot.Issues)
-		t.lastHash = snapshot.DataHash
+		t.lastHash = snapshotHash
+		if prevSelectedID != "" {
+			t.SelectByID(prevSelectedID)
+		}
 		return
 	}
 
@@ -480,17 +882,11 @@ func (t *TreeModel) BuildFromSnapshot(snapshot *DataSnapshot) {
 	t.loadState()
 	t.rebuildFlatList()
 	t.built = true
-	t.lastHash = snapshot.DataHash
+	t.lastHash = snapshotHash
 
 	// Restore selection if possible.
 	if prevSelectedID != "" {
-		for i, node := range t.flatList {
-			if node != nil && node.Issue != nil && node.Issue.ID == prevSelectedID {
-				t.cursor = i
-				t.ensureCursorVisible()
-				break
-			}
-		}
+		t.SelectByID(prevSelectedID)
 	}
 }
 
@@ -574,8 +970,11 @@ func (t *TreeModel) sortNodes(nodes []*IssueTreeNode) {
 			return aTypeOrder < bTypeOrder
 		}
 
-		// 3. CreatedAt (oldest first for stable ordering)
-		return a.CreatedAt.Before(b.CreatedAt)
+		// 3. CreatedAt (oldest first for stable ordering), then ID tiebreaker
+		if !a.CreatedAt.Equal(b.CreatedAt) {
+			return a.CreatedAt.Before(b.CreatedAt)
+		}
+		return a.ID < b.ID
 	})
 }
 
@@ -598,6 +997,49 @@ func issueTypeOrder(t model.IssueType) int {
 	}
 }
 
+// treeViewportLayout returns (headerLines, visibleNodeCount, showFooter) so that
+// View() never exceeds t.height lines (accounting for both the mode header line
+// and the [start-end of total] scroll indicator footer).
+func (t *TreeModel) treeViewportLayout() (headerLines, visibleCount int, showFooter bool) {
+	totalHeight := t.height
+	if totalHeight <= 0 {
+		totalHeight = 20
+	}
+	if totalHeight == 1 {
+		return 0, 1, false
+	}
+	headerLines = 1
+	availAfterHeader := totalHeight - headerLines
+	if len(t.flatList) <= availAfterHeader {
+		return headerLines, availAfterHeader, false
+	}
+	if availAfterHeader >= 2 {
+		return headerLines, availAfterHeader - 1, true
+	}
+	return headerLines, 1, false
+}
+
+func (t *TreeModel) renderHeader() string {
+	r := t.theme.Renderer
+	badgeStyle := r.NewStyle().Foreground(t.theme.Primary).Bold(true)
+	hintStyle := r.NewStyle().Foreground(t.theme.Muted)
+
+	var header string
+	if t.mode == TreeModeBlocking {
+		header = badgeStyle.Render("Tree [Blocking Chain]") + hintStyle.Render(" — b/m: Hierarchy mode")
+	} else {
+		hint := " — b/m: Blocking Tree mode"
+		if !t.hasParentChildEdges && len(t.issues) > 0 {
+			hint = " — no parent-child deps (Press b/m for Blocking Tree mode)"
+		}
+		header = badgeStyle.Render("Tree [Hierarchy]") + hintStyle.Render(hint)
+	}
+	if t.width > 0 {
+		header = ansi.Truncate(header, t.width, "…")
+	}
+	return header
+}
+
 // View renders the tree view.
 // Implementation for bv-1371, updated for windowed rendering (bv-db02).
 // Only renders visible nodes based on viewportOffset and height for O(viewport)
@@ -607,10 +1049,13 @@ func (t *TreeModel) View() string {
 		return t.renderEmptyState()
 	}
 
-	var sb strings.Builder
-
-	// Get visible range - O(1) calculation based on viewportOffset and height
+	headerLines, _, showFooter := t.treeViewportLayout()
 	start, end := t.visibleRange()
+
+	lines := make([]string, 0, headerLines+(end-start)+1)
+	if headerLines > 0 {
+		lines = append(lines, t.renderHeader())
+	}
 
 	// Render only visible nodes (bv-db02: windowed rendering)
 	for i := start; i < end; i++ {
@@ -627,18 +1072,15 @@ func (t *TreeModel) View() string {
 			line = t.theme.Selected.Render(line)
 		}
 
-		sb.WriteString(line)
-		sb.WriteString("\n")
+		lines = append(lines, line)
 	}
 
 	// Add position indicator if scrolling is needed (bv-2nax)
-	// Only shows when there are more nodes than fit in the viewport
-	if len(t.flatList) > t.height && t.height > 0 {
-		indicator := t.renderPositionIndicator(start, end)
-		sb.WriteString(indicator)
+	if showFooter {
+		lines = append(lines, t.renderPositionIndicator(start, end))
 	}
 
-	return sb.String()
+	return strings.Join(lines, "\n")
 }
 
 // renderPositionIndicator renders the scroll position indicator (bv-2nax).
@@ -656,7 +1098,7 @@ func (t *TreeModel) renderPositionIndicator(start, end int) string {
 		Render(indicator)
 }
 
-// renderEmptyState renders the view when there are no issues.
+// renderEmptyState renders the view when there are no issues (or no blocking edges in Blocking mode).
 func (t *TreeModel) renderEmptyState() string {
 	r := t.theme.Renderer
 
@@ -667,18 +1109,31 @@ func (t *TreeModel) renderEmptyState() string {
 	mutedStyle := r.NewStyle().
 		Foreground(t.theme.Muted)
 
-	var sb strings.Builder
-	sb.WriteString(titleStyle.Render("Tree View"))
-	sb.WriteString("\n\n")
-	sb.WriteString(mutedStyle.Render("No issues to display."))
-	sb.WriteString("\n\n")
-	sb.WriteString(mutedStyle.Render("To create hierarchy, add parent-child dependencies:"))
-	sb.WriteString("\n")
-	sb.WriteString(mutedStyle.Render("  br dep add <child> parent-child:<parent>"))
-	sb.WriteString("\n\n")
-	sb.WriteString(mutedStyle.Render("Press E to return to list view."))
-
-	return sb.String()
+	var lines []string
+	if t.mode == TreeModeBlocking && len(t.issues) > 0 {
+		lines = []string{
+			titleStyle.Render("Tree View [Blocking Chain]"),
+			"",
+			mutedStyle.Render("No blocking dependencies found in the current issue set."),
+			mutedStyle.Render("Press b or m to switch to Hierarchy mode."),
+			"",
+			mutedStyle.Render("Press E to return to list view."),
+		}
+	} else {
+		lines = []string{
+			titleStyle.Render("Tree View [Hierarchy]"),
+			"",
+			mutedStyle.Render("No issues to display."),
+			"",
+			mutedStyle.Render("To create hierarchy, add parent-child dependencies:"),
+			mutedStyle.Render("  br dep add <child> parent-child:<parent>"),
+			mutedStyle.Render("Press b/m for Blocking Tree mode. Press E to return to list view."),
+		}
+	}
+	if t.height > 0 && len(lines) > t.height {
+		lines = lines[:t.height]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // renderNode renders a single tree node with tree characters and styling.
@@ -827,6 +1282,9 @@ func (t *TreeModel) isLastChild(node *IssueTreeNode) bool {
 // getExpandIndicator returns the expand/collapse indicator for a node.
 func (t *TreeModel) getExpandIndicator(node *IssueTreeNode) string {
 	if len(node.Children) == 0 {
+		if node.SharedRef {
+			return "↪" // Shared DAG node already expanded elsewhere
+		}
 		return "•" // Leaf node
 	}
 	if node.Expanded {
@@ -897,13 +1355,51 @@ func (t *TreeModel) MoveUp() {
 	}
 }
 
-// ToggleExpand expands or collapses the currently selected node.
+func (t *TreeModel) persistState() {
+	t.captureActiveExpandState()
+	t.saveState()
+}
+
+// jumpToPrimary reveals the primary (non-SharedRef) tree node for id by expanding
+// any collapsed ancestors, rebuilding flatList, and focusing it.
+func (t *TreeModel) jumpToPrimary(id string) bool {
+	if id == "" || t.issueMap == nil {
+		return false
+	}
+	target, ok := t.issueMap[id]
+	if !ok || target == nil {
+		return false
+	}
+	for p := target.Parent; p != nil; p = p.Parent {
+		p.Expanded = true
+	}
+	t.rebuildFlatList()
+	for i, n := range t.flatList {
+		if n == target || (n != nil && !n.SharedRef && n.Issue != nil && n.Issue.ID == id) {
+			t.cursor = i
+			t.ensureCursorVisible()
+			t.persistState()
+			return true
+		}
+	}
+	return false
+}
+
+// ToggleExpand expands or collapses the currently selected node, or jumps to the
+// primary subtree occurrence when invoked on a SharedRef ("↪") node.
 func (t *TreeModel) ToggleExpand() {
 	node := t.SelectedNode()
-	if node != nil && len(node.Children) > 0 {
+	if node == nil {
+		return
+	}
+	if node.SharedRef && node.Issue != nil {
+		t.jumpToPrimary(node.Issue.ID)
+		return
+	}
+	if len(node.Children) > 0 {
 		node.Expanded = !node.Expanded
+		t.persistState() // Persist expand/collapse state (bv-19vz)
 		t.rebuildFlatList()
-		t.saveState() // Persist expand/collapse state (bv-19vz)
 		t.ensureCursorVisible()
 	}
 }
@@ -913,6 +1409,7 @@ func (t *TreeModel) ExpandAll() {
 	for _, root := range t.roots {
 		t.setExpandedRecursive(root, true)
 	}
+	t.captureActiveExpandState()
 	t.rebuildFlatList()
 	t.saveState() // Persist expand/collapse state (bv-19vz)
 	t.ensureCursorVisible()
@@ -923,6 +1420,7 @@ func (t *TreeModel) CollapseAll() {
 	for _, root := range t.roots {
 		t.setExpandedRecursive(root, false)
 	}
+	t.captureActiveExpandState()
 	t.rebuildFlatList()
 	t.saveState() // Persist expand/collapse state (bv-19vz)
 	t.ensureCursorVisible()
@@ -961,18 +1459,27 @@ func (t *TreeModel) JumpToParent() {
 }
 
 // ExpandOrMoveToChild handles the → / l key:
+// - If node is a SharedRef ("↪"): jump to its primary subtree occurrence
 // - If node has children and is collapsed: expand it
 // - If node has children and is expanded: move to first child
 // - If node is a leaf: do nothing
 func (t *TreeModel) ExpandOrMoveToChild() {
 	node := t.SelectedNode()
-	if node == nil || len(node.Children) == 0 {
-		return // No node selected or leaf node
+	if node == nil {
+		return
+	}
+	if node.SharedRef && node.Issue != nil {
+		t.jumpToPrimary(node.Issue.ID)
+		return
+	}
+	if len(node.Children) == 0 {
+		return // Leaf node
 	}
 
 	if !node.Expanded {
 		// Expand the node
 		node.Expanded = true
+		t.captureActiveExpandState()
 		t.rebuildFlatList()
 		t.saveState() // Persist expand/collapse state (bv-19vz)
 		t.ensureCursorVisible()
@@ -1001,6 +1508,7 @@ func (t *TreeModel) CollapseOrJumpToParent() {
 	if len(node.Children) > 0 && node.Expanded {
 		// Collapse the node
 		node.Expanded = false
+		t.captureActiveExpandState()
 		t.rebuildFlatList()
 		t.saveState() // Persist expand/collapse state (bv-19vz)
 		t.ensureCursorVisible()
@@ -1040,18 +1548,15 @@ func (t *TreeModel) PageUp() {
 }
 
 // visibleRange returns the start and end indices of nodes to render (bv-r4ng).
-// The range [start, end) covers nodes visible in the viewport.
+// The range [start, end) covers nodes visible in the viewport after reserving
+// header and optional scroll-indicator footer rows so View() never exceeds t.height.
 // This is an O(1) calculation based on viewportOffset and height.
 func (t *TreeModel) visibleRange() (start, end int) {
 	if len(t.flatList) == 0 {
 		return 0, 0
 	}
 
-	// Each node renders as 1 line
-	visibleCount := t.height
-	if visibleCount <= 0 {
-		visibleCount = 20 // Default
-	}
+	_, visibleCount, _ := t.treeViewportLayout()
 
 	// Start with the viewport offset, clamped to non-negative
 	start = t.viewportOffset
@@ -1074,13 +1579,24 @@ func (t *TreeModel) visibleRange() (start, end int) {
 	return start, end
 }
 
-// SelectByID moves cursor to the node with the given issue ID.
+// SelectByID moves cursor to the node with the given issue ID and scrolls it into view.
+// If the target is hidden under a collapsed ancestor, it expands ancestors to reveal it.
 // Returns true if found, false otherwise.
-// Useful for preserving cursor position after rebuild.
 func (t *TreeModel) SelectByID(id string) bool {
+	for i, node := range t.flatList {
+		if node != nil && !node.SharedRef && node.Issue != nil && node.Issue.ID == id {
+			t.cursor = i
+			t.ensureCursorVisible()
+			return true
+		}
+	}
+	if t.jumpToPrimary(id) {
+		return true
+	}
 	for i, node := range t.flatList {
 		if node != nil && node.Issue != nil && node.Issue.ID == id {
 			t.cursor = i
+			t.ensureCursorVisible()
 			return true
 		}
 	}
@@ -1158,10 +1674,7 @@ func (t *TreeModel) ensureCursorVisible() {
 		return
 	}
 
-	visibleCount := t.height
-	if visibleCount <= 0 {
-		visibleCount = 20 // Default
-	}
+	_, visibleCount, _ := t.treeViewportLayout()
 
 	// Cursor above viewport - scroll up to show cursor at top
 	if t.cursor < t.viewportOffset {

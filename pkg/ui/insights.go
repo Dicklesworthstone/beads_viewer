@@ -293,6 +293,12 @@ func (m *InsightsModel) SetInsights(ins analysis.Insights) {
 	m.insights = ins
 }
 
+// SetIssueMap updates the issue lookup map used when rendering panel items and details.
+func (m *InsightsModel) SetIssueMap(issueMap map[string]*model.Issue) {
+	m.issueMap = issueMap
+	m.detailContent = ""
+}
+
 // SetTopPicks sets the priority triage recommendations (bv-91)
 func (m *InsightsModel) SetTopPicks(picks []analysis.TopPick) {
 	m.topPicks = picks
@@ -381,6 +387,86 @@ func (m *InsightsModel) MoveDown() {
 		m.selectedIndex[m.focusedPanel]++
 		m.updateDetailContent()
 	}
+}
+
+func (m *InsightsModel) MoveToTop() {
+	if m.IsHeatmapActive() {
+		if m.heatmapDrill {
+			m.heatmapDrillIdx = 0
+		} else {
+			m.heatmapRow = 0
+		}
+		m.updateDetailContent()
+		return
+	}
+	if m.currentPanelItemCount() == 0 {
+		return
+	}
+	m.selectedIndex[m.focusedPanel] = 0
+	m.scrollOffset[m.focusedPanel] = 0
+	m.updateDetailContent()
+}
+
+func (m *InsightsModel) MoveToBottom() {
+	if m.IsHeatmapActive() {
+		if m.heatmapDrill {
+			if len(m.heatmapIssues) > 0 {
+				m.heatmapDrillIdx = len(m.heatmapIssues) - 1
+			}
+		} else {
+			m.heatmapRow = heatmapDepthBuckets - 1
+		}
+		m.updateDetailContent()
+		return
+	}
+	count := m.currentPanelItemCount()
+	if count == 0 {
+		return
+	}
+	m.selectedIndex[m.focusedPanel] = count - 1
+	m.updateDetailContent()
+}
+
+func (m *InsightsModel) PageDown() {
+	step := max(3, (m.height-8)/2)
+	if m.IsHeatmapActive() {
+		if m.heatmapDrill {
+			if len(m.heatmapIssues) > 0 {
+				m.heatmapDrillIdx = min(len(m.heatmapIssues)-1, m.heatmapDrillIdx+step)
+			}
+		} else {
+			m.heatmapRow = min(heatmapDepthBuckets-1, m.heatmapRow+step)
+		}
+		m.updateDetailContent()
+		return
+	}
+	count := m.currentPanelItemCount()
+	if count == 0 {
+		return
+	}
+	m.selectedIndex[m.focusedPanel] = min(count-1, m.selectedIndex[m.focusedPanel]+step)
+	m.updateDetailContent()
+}
+
+func (m *InsightsModel) PageUp() {
+	step := max(3, (m.height-8)/2)
+	if m.IsHeatmapActive() {
+		if m.heatmapDrill {
+			m.heatmapDrillIdx = max(0, m.heatmapDrillIdx-step)
+		} else {
+			m.heatmapRow = max(0, m.heatmapRow-step)
+		}
+		m.updateDetailContent()
+		return
+	}
+	if m.currentPanelItemCount() == 0 {
+		return
+	}
+	m.selectedIndex[m.focusedPanel] = max(0, m.selectedIndex[m.focusedPanel]-step)
+	if m.scrollOffset[m.focusedPanel] > m.selectedIndex[m.focusedPanel] {
+		m.scrollOffset[m.focusedPanel] = m.selectedIndex[m.focusedPanel]
+	}
+	m.updateDetailContent()
 }
 
 // ScrollDetailUp scrolls the detail panel viewport up

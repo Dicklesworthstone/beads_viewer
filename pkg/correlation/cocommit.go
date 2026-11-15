@@ -410,8 +410,8 @@ func batchLogArgs(diffFlag string, shas []string) []string {
 }
 
 func batchLogArgsForStore(diffFlag string, shas []string, storeDirRel string) []string {
-	args := make([]string, 0, len(shas)+10)
-	args = append(args, "log", "--no-walk=unsorted", diffFlag, "--format="+gitLogHeaderFormat)
+	args := make([]string, 0, len(shas)+11)
+	args = append(args, "log", "--no-walk=unsorted", diffFlag, "--format="+gitLogHeaderFormat, "--end-of-options")
 	args = append(args, shas...)
 	args = append(args, excludePathspecArgsForStore(storeDirRel)...)
 	return args
@@ -425,6 +425,14 @@ func batchLogArgsForStore(diffFlag string, shas []string, storeDirRel string) []
 // some SHA still returns no error (the empty result is correct and cacheable).
 func (c *CoCommitExtractor) batchFilesChanged(shas []string) (map[string][]FileChange, error) {
 	files := make(map[string][]FileChange, len(shas))
+	if len(shas) == 0 {
+		return files, nil
+	}
+	for _, sha := range shas {
+		if err := validateGitRefArg(sha); err != nil {
+			return files, err
+		}
+	}
 
 	cmd := gitCommand(c.ctx, withNoColorGit(batchLogArgsForStore("--name-status", shas, c.storeDirRel))...)
 	cmd.Dir = c.repoPath
@@ -444,6 +452,14 @@ func (c *CoCommitExtractor) batchFilesChanged(shas []string) (map[string][]FileC
 // a git failure is surfaced as an error so the caller skips persisting empties.
 func (c *CoCommitExtractor) batchLineStats(shas []string) (map[string]map[string]lineStats, error) {
 	stats := make(map[string]map[string]lineStats, len(shas))
+	if len(shas) == 0 {
+		return stats, nil
+	}
+	for _, sha := range shas {
+		if err := validateGitRefArg(sha); err != nil {
+			return stats, err
+		}
+	}
 
 	cmd := gitCommand(c.ctx, withNoColorGit(batchLogArgsForStore("--numstat", shas, c.storeDirRel))...)
 	cmd.Dir = c.repoPath
@@ -584,7 +600,11 @@ func (c *CoCommitExtractor) getFilesChanged(sha string) ([]FileChange, error) {
 	}
 	c.cacheMu.RUnlock()
 
-	gitArgs := append([]string{"show", "--name-status", "--format=", sha}, c.excludePathspecArgs()...)
+	if err := validateGitRefArg(sha); err != nil {
+		return nil, err
+	}
+
+	gitArgs := append([]string{"show", "--name-status", "--format=", "--end-of-options", sha}, c.excludePathspecArgs()...)
 	cmd := gitCommand(c.ctx, gitArgs...)
 	cmd.Dir = c.repoPath
 
@@ -610,7 +630,11 @@ func (c *CoCommitExtractor) getLineStats(sha string) (map[string]lineStats, erro
 	}
 	c.cacheMu.RUnlock()
 
-	gitArgs := append([]string{"show", "--numstat", "--format=", sha}, c.excludePathspecArgs()...)
+	if err := validateGitRefArg(sha); err != nil {
+		return nil, err
+	}
+
+	gitArgs := append([]string{"show", "--numstat", "--format=", "--end-of-options", sha}, c.excludePathspecArgs()...)
 	cmd := gitCommand(c.ctx, gitArgs...)
 	cmd.Dir = c.repoPath
 

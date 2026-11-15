@@ -19,13 +19,14 @@ import (
 
 // GraphSnapshotOptions controls graph snapshot export behaviour.
 type GraphSnapshotOptions struct {
-	Path     string               // Output path; format inferred from extension when Format empty
-	Format   string               // "svg" or "png" (case-insensitive). If empty, inferred from Path.
-	Title    string               // Optional title rendered in summary block
-	Preset   string               // Layout preset: "compact" (default) or "roomy"
-	Issues   []model.Issue        // Issues to render (already filtered by recipe/workspace)
-	Stats    *analysis.GraphStats // Graph analysis used for layout/summary
-	DataHash string               // Hash of input issues for provenance
+	Path      string                // Output path; format inferred from extension when Format empty
+	Format    string                // "svg" or "png" (case-insensitive). If empty, inferred from Path.
+	Title     string                // Optional title rendered in summary block
+	Preset    string                // Layout preset: "compact" (default) or "roomy"
+	Issues    []model.Issue         // Issues to render (already filtered by recipe/workspace)
+	Stats     *analysis.GraphStats  // Graph analysis used for layout/summary
+	Readiness *model.ReadinessIndex // Optional full-source readiness index (falls back to Issues when nil)
+	DataHash  string                // Hash of input issues for provenance
 }
 
 // SaveGraphSnapshot renders a static graph snapshot (SVG or PNG) with a minimal
@@ -81,6 +82,7 @@ type layoutNode struct {
 	ID       string
 	Title    string
 	Status   model.Status
+	Blocked  bool
 	Level    int
 	Rank     float64 // pagerank for ordering
 	X, Y     float64
@@ -140,6 +142,10 @@ func buildLayout(opts GraphSnapshotOptions) layoutResult {
 	// Pre-compute helper maps
 	pageRank := opts.Stats.PageRank()
 	critical := opts.Stats.CriticalPathScore()
+	readiness := opts.Readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(opts.Issues)
+	}
 
 	// determine levels using critical path score (fallback 1)
 	levelByID := make(map[string]int, len(opts.Issues))
@@ -163,6 +169,7 @@ func buildLayout(opts GraphSnapshotOptions) layoutResult {
 			ID:       iss.ID,
 			Title:    truncate(iss.Title, 44),
 			Status:   iss.Status,
+			Blocked:  !isClosedLikeStatus(iss.Status) && len(readiness.Blockers(iss.ID)) > 0,
 			Level:    level,
 			Rank:     pageRank[iss.ID],
 			NodeW:    nodeW,
@@ -230,12 +237,22 @@ func buildLayout(opts GraphSnapshotOptions) layoutResult {
 	}
 
 	// summary
-	// Collect all node IDs for fallback when betweenness is nil/empty
+	// Collect all node IDs and filter betweenness to rendered subgraph nodes only
 	allNodeIDs := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		allNodeIDs = append(allNodeIDs, n.ID)
 	}
-	topBottleneck := topByMetricWithFallback(opts.Stats.Betweenness(), allNodeIDs)
+	rawBetweenness := opts.Stats.Betweenness()
+	var scopedBetweenness map[string]float64
+	if len(rawBetweenness) > 0 {
+		scopedBetweenness = make(map[string]float64, len(nodes))
+		for id, val := range rawBetweenness {
+			if nodeIDs[id] {
+				scopedBetweenness[id] = val
+			}
+		}
+	}
+	topBottleneck := topByMetricWithFallback(scopedBetweenness, allNodeIDs)
 	title := opts.Title
 	if strings.TrimSpace(title) == "" {
 		title = "Graph Snapshot"
@@ -300,6 +317,7 @@ var (
 	colorOpen      = color.RGBA{0xc8, 0xe6, 0xc9, 0xff}
 	colorBlocked   = color.RGBA{0xff, 0xcd, 0xd2, 0xff}
 	colorInProg    = color.RGBA{0xff, 0xf3, 0xe0, 0xff}
+	colorParked    = color.RGBA{0xe0, 0xe7, 0xff, 0xff}
 	colorClosed    = color.RGBA{0xcf, 0xd8, 0xdc, 0xff}
 	colorStroke    = color.RGBA{0x22, 0x22, 0x22, 0xff}
 	colorEdge      = color.RGBA{0x6b, 0x80, 0xbf, 0xff}
@@ -315,15 +333,22 @@ func statusColor(s model.Status) color.RGBA {
 	switch {
 	case isClosedLikeStatus(s):
 		return colorClosed
-	case s == model.StatusOpen:
+	case s == model.StatusOpen || s == "":
 		return colorOpen
 	case s == model.StatusBlocked:
 		return colorBlocked
 	case s == model.StatusInProgress:
 		return colorInProg
 	default:
-		return colorOpen
+		return colorParked
 	}
+}
+
+func nodeFillColor(n layoutNode) color.RGBA {
+	if n.Blocked && (n.Status == model.StatusOpen || n.Status == model.StatusInProgress || n.Status == "") {
+		return colorBlocked
+	}
+	return statusColor(n.Status)
 }
 
 func renderPNG(opts GraphSnapshotOptions, layout layoutResult) error {
@@ -410,7 +435,7 @@ func renderSVGToWriter(w io.Writer, layout layoutResult) error {
 		x := int(n.X)
 		y := int(n.Y)
 		canvas.Roundrect(x, y, int(n.NodeW), int(n.NodeH), 8, 8,
-			fmt.Sprintf("fill:%s;stroke:%s;stroke-width:1.2", css(statusColor(n.Status)), css(colorStroke)))
+			fmt.Sprintf("fill:%s;stroke:%s;stroke-width:1.2", css(nodeFillColor(n)), css(colorStroke)))
 		canvas.Text(x+10, y+22, n.ID, fmt.Sprintf("fill:%s;font-size:13px;font-family:monospace;font-weight:bold", css(colorText)))
 		canvas.Text(x+10, y+42, truncate(n.Title, 40), fmt.Sprintf("fill:%s;font-size:12px;font-family:monospace", css(colorSubtle)))
 		canvas.Text(x+10, y+60, fmt.Sprintf("PR %.3f", n.PageRank),
@@ -422,7 +447,7 @@ func renderSVGToWriter(w io.Writer, layout layoutResult) error {
 }
 
 func drawNode(dc *gg.Context, n layoutNode) {
-	dc.SetColor(statusColor(n.Status))
+	dc.SetColor(nodeFillColor(n))
 	dc.DrawRoundedRectangle(n.X, n.Y, n.NodeW, n.NodeH, 8)
 	dc.Fill()
 	dc.SetColor(colorStroke)

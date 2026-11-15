@@ -26,12 +26,15 @@ type ReportOverrides struct {
 	Format       *string
 	IncludeGraph *bool
 	Template     *string
+	GroupBy      *string
 }
 
 type ReportOptions struct {
 	Format            string
 	IncludeGraph      bool
 	Template          string
+	GroupBy           string
+	View              recipe.ViewConfig
 	Title             string
 	GeneratedAt       time.Time
 	Readiness         *model.ReadinessIndex
@@ -64,6 +67,9 @@ func ResolveReportOptions(defaults recipe.ExportConfig, explicit ReportOverrides
 	opts.Template = defaults.Template
 	if explicit.Template != nil {
 		opts.Template = *explicit.Template
+	}
+	if explicit.GroupBy != nil {
+		opts.GroupBy = strings.TrimSpace(*explicit.GroupBy)
 	}
 	if err := opts.validate(); err != nil {
 		return ReportOptions{}, err
@@ -304,6 +310,19 @@ func escapeReportText(value string) string {
 // Package-level compiled regex for slug creation (avoids recompilation per call)
 var slugNonAlphanumericRegex = regexp.MustCompile(`[^a-z0-9]+`)
 
+var tocLinkTextReplacer = strings.NewReplacer(
+	"[", "\\[",
+	"]", "\\]",
+	"\n", " ",
+	"\r", "",
+)
+
+func escapeTableText(value string) string {
+	clean := strings.ReplaceAll(value, "\r", "")
+	clean = strings.ReplaceAll(clean, "\n", " ")
+	return strings.ReplaceAll(clean, "|", "\\|")
+}
+
 // sanitizeMermaidID ensures an ID is valid for Mermaid diagrams.
 // Mermaid node IDs must be alphanumeric with hyphens/underscores.
 func sanitizeMermaidID(id string) string {
@@ -379,19 +398,21 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 	// Summary Statistics
 	sb.WriteString("## Summary\n\n")
 
-	open, inProgress, blocked, closed := 0, 0, 0, 0
+	open, inProgress, blocked, closed, deferredOther := 0, 0, 0, 0, 0
 	for _, i := range issues {
 		if isClosedLikeStatus(i.Status) {
 			closed++
 			continue
 		}
 		switch i.Status {
+		case model.StatusOpen, "":
+			open++
 		case model.StatusInProgress:
 			inProgress++
 		case model.StatusBlocked:
 			blocked++
 		default:
-			open++
+			deferredOther++
 		}
 	}
 
@@ -400,7 +421,11 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 	sb.WriteString(fmt.Sprintf("| Open | %d |\n", open))
 	sb.WriteString(fmt.Sprintf("| In Progress | %d |\n", inProgress))
 	sb.WriteString(fmt.Sprintf("| Blocked | %d |\n", blocked))
+	if deferredOther > 0 {
+		sb.WriteString(fmt.Sprintf("| Deferred / Other | %d |\n", deferredOther))
+	}
 	sb.WriteString(fmt.Sprintf("| Closed | %d |\n\n", closed))
+	writeSummaryTable(&sb, issues, opts)
 
 	// Quick Actions Section
 	sb.WriteString(generateQuickActions(issues, opts))
@@ -418,7 +443,12 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 	for idx, i := range issues {
 		slug := issueSlugs[idx]
 		statusIcon := getStatusEmoji(string(i.Status))
-		sb.WriteString(fmt.Sprintf("- [%s %s %s](#%s)\n", statusIcon, i.ID, i.Title, slug))
+		sb.WriteString(fmt.Sprintf("- [%s %s %s](#%s)\n",
+			statusIcon,
+			tocLinkTextReplacer.Replace(i.ID),
+			tocLinkTextReplacer.Replace(i.Title),
+			slug,
+		))
 	}
 	sb.WriteString("\n---\n\n")
 
@@ -434,108 +464,434 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 		sb.WriteString("---\n\n")
 	}
 
-	// Individual Issues
-	for idx, i := range issues {
-		typeIcon := getTypeEmoji(string(i.IssueType))
-		slug := issueSlugs[idx]
-		sb.WriteString(fmt.Sprintf("<a id=\"%s\"></a>\n\n", slug))
-		sb.WriteString(fmt.Sprintf("## %s\n\n", issueHeadingText(i)))
-
-		// Metadata Table
-		sb.WriteString("| Property | Value |\n|----------|-------|\n")
-		sb.WriteString(fmt.Sprintf("| **Type** | %s %s |\n", typeIcon, i.IssueType))
-		sb.WriteString(fmt.Sprintf("| **Priority** | %s |\n", getPriorityLabel(i.Priority)))
-		sb.WriteString(fmt.Sprintf("| **Status** | %s %s |\n", getStatusEmoji(string(i.Status)), i.Status))
-		if i.Assignee != "" {
-			// Sanitize assignee: replace newlines with spaces, escape pipes
-			cleanAssignee := strings.ReplaceAll(i.Assignee, "\n", " ")
-			cleanAssignee = strings.ReplaceAll(cleanAssignee, "\r", "")
-			escapedAssignee := strings.ReplaceAll(cleanAssignee, "|", "\\|")
-			sb.WriteString(fmt.Sprintf("| **Assignee** | @%s |\n", escapedAssignee))
-		}
-		sb.WriteString(fmt.Sprintf("| **Created** | %s |\n", i.CreatedAt.Format("2006-01-02 15:04")))
-		sb.WriteString(fmt.Sprintf("| **Updated** | %s |\n", i.UpdatedAt.Format("2006-01-02 15:04")))
-		if i.DueDate != nil {
-			sb.WriteString(fmt.Sprintf("| **Due** | %s |\n", i.DueDate.Format("2006-01-02")))
-		}
-		if i.DeferUntil != nil {
-			sb.WriteString(fmt.Sprintf("| **Deferred Until** | %s |\n", i.DeferUntil.Format("2006-01-02")))
-		}
-		if i.ClosedAt != nil {
-			sb.WriteString(fmt.Sprintf("| **Closed** | %s |\n", i.ClosedAt.Format("2006-01-02 15:04")))
-		}
-		if i.ExternalRef != nil && *i.ExternalRef != "" {
-			cleanRef := strings.ReplaceAll(*i.ExternalRef, "\n", " ")
-			cleanRef = strings.ReplaceAll(cleanRef, "\r", "")
-			escapedRef := strings.ReplaceAll(cleanRef, "|", "\\|")
-			sb.WriteString(fmt.Sprintf("| **External Ref** | `%s` |\n", escapedRef))
-		}
-		if len(i.Labels) > 0 {
-			// Escape pipe characters and sanitize newlines in labels
-			escapedLabels := make([]string, len(i.Labels))
-			for idx, label := range i.Labels {
-				cleanLabel := strings.ReplaceAll(label, "\n", " ")
-				cleanLabel = strings.ReplaceAll(cleanLabel, "\r", "")
-				escapedLabels[idx] = strings.ReplaceAll(cleanLabel, "|", "\\|")
-			}
-			sb.WriteString(fmt.Sprintf("| **Labels** | %s |\n", strings.Join(escapedLabels, ", ")))
-		}
-		sb.WriteString("\n")
-
-		if i.Description != "" {
-			sb.WriteString("### Description\n\n")
-			sb.WriteString(i.Description + "\n\n")
-		}
-
-		if i.AcceptanceCriteria != "" {
-			sb.WriteString("### Acceptance Criteria\n\n")
-			sb.WriteString(i.AcceptanceCriteria + "\n\n")
-		}
-
-		if i.Design != "" {
-			sb.WriteString("### Design\n\n")
-			sb.WriteString(i.Design + "\n\n")
-		}
-
-		if i.Notes != "" {
-			sb.WriteString("### Notes\n\n")
-			sb.WriteString(i.Notes + "\n\n")
-		}
-
-		if len(i.Dependencies) > 0 {
-			sb.WriteString("### Dependencies\n\n")
-			for _, dep := range i.Dependencies {
-				if dep == nil {
-					continue
-				}
-				icon := "🔗"
-				if dep.Type.IsBlocking() {
-					icon = "⛔"
-				}
-				sb.WriteString(fmt.Sprintf("- %s **%s**: `%s`\n", icon, dep.Type, dep.DependsOnID))
-			}
-			sb.WriteString("\n")
-		}
-
-		if len(i.Comments) > 0 {
-			sb.WriteString("### Comments\n\n")
-			for _, c := range i.Comments {
-				if c == nil {
-					continue
-				}
-				escapedText := strings.ReplaceAll(c.Text, "\n", "\n> ")
-				sb.WriteString(fmt.Sprintf("> **%s** (%s)\n>\n> %s\n\n",
-					c.Author, c.CreatedAt.Format("2006-01-02"), escapedText))
+	// Individual Issues (optionally grouped when GroupBy or View.GroupBy is configured)
+	groupBy := effectiveReportGroupBy(opts)
+	if groups := groupMarkdownIssues(issues, groupBy); len(groups) > 0 {
+		for _, grp := range groups {
+			sb.WriteString(fmt.Sprintf("## Group: %s (%d)\n\n", grp.Label, len(grp.Indices)))
+			for _, idx := range grp.Indices {
+				writeMarkdownIssueSection(&sb, issues[idx], issueSlugs[idx], opts)
 			}
 		}
-
-		// Per-issue command snippets
-		sb.WriteString(generateIssueCommands(i, opts))
-
-		sb.WriteString("---\n\n")
+	} else {
+		for idx, i := range issues {
+			writeMarkdownIssueSection(&sb, i, issueSlugs[idx], opts)
+		}
 	}
 
 	return sb.String(), nil
+}
+
+type markdownIssueGroup struct {
+	Key     string
+	SortOrd int
+	Label   string
+	Indices []int
+}
+
+func effectiveReportGroupBy(opts ReportOptions) string {
+	if g := strings.ToLower(strings.TrimSpace(opts.GroupBy)); g != "" {
+		return g
+	}
+	return strings.ToLower(strings.TrimSpace(opts.View.GroupBy))
+}
+
+func sanitizeGroupHeading(s string) string {
+	clean := strings.ReplaceAll(s, "\n", " ")
+	clean = strings.ReplaceAll(clean, "\r", "")
+	return strings.TrimSpace(clean)
+}
+
+func groupMarkdownIssues(issues []model.Issue, groupBy string) []markdownIssueGroup {
+	if len(issues) == 0 || groupBy == "" || groupBy == "none" {
+		return nil
+	}
+	byKey := make(map[string]*markdownIssueGroup)
+	var groups []*markdownIssueGroup
+
+	addToBucket := func(key string, ord int, label string, idx int) {
+		grp, ok := byKey[key]
+		if !ok {
+			grp = &markdownIssueGroup{Key: key, SortOrd: ord, Label: sanitizeGroupHeading(label)}
+			byKey[key] = grp
+			groups = append(groups, grp)
+		}
+		grp.Indices = append(grp.Indices, idx)
+	}
+
+	switch groupBy {
+	case "priority":
+		for idx, iss := range issues {
+			key := fmt.Sprintf("p-%04d", iss.Priority)
+			addToBucket(key, iss.Priority, getPriorityLabel(iss.Priority), idx)
+		}
+	case "status":
+		statusOrder := func(s model.Status) int {
+			switch s {
+			case model.StatusOpen, "":
+				return 0
+			case model.StatusInProgress:
+				return 1
+			case model.StatusBlocked:
+				return 2
+			case model.StatusClosed:
+				return 10
+			case model.StatusTombstone:
+				return 11
+			default:
+				return 5
+			}
+		}
+		for idx, iss := range issues {
+			rawStatus := string(iss.Status)
+			if strings.TrimSpace(rawStatus) == "" {
+				rawStatus = string(model.StatusOpen)
+			}
+			label := fmt.Sprintf("%s %s", getStatusEmoji(rawStatus), rawStatus)
+			addToBucket(rawStatus, statusOrder(iss.Status), label, idx)
+		}
+	case "type", "issue_type":
+		typeOrder := func(t string) int {
+			switch t {
+			case "epic":
+				return 0
+			case "bug":
+				return 1
+			case "feature":
+				return 2
+			case "task":
+				return 3
+			case "chore":
+				return 4
+			default:
+				return 5
+			}
+		}
+		for idx, iss := range issues {
+			rawType := strings.TrimSpace(string(iss.IssueType))
+			if rawType == "" {
+				rawType = "other"
+			}
+			label := fmt.Sprintf("%s %s", getTypeEmoji(rawType), rawType)
+			addToBucket(rawType, typeOrder(rawType), label, idx)
+		}
+	case "assignee":
+		for idx, iss := range issues {
+			clean := sanitizeGroupHeading(iss.Assignee)
+			if clean == "" {
+				addToBucket("~unassigned", 1, "Unassigned", idx)
+			} else {
+				addToBucket(strings.ToLower(clean), 0, "@"+clean, idx)
+			}
+		}
+	case "label", "labels", "tag", "tags":
+		for idx, iss := range issues {
+			var cleaned []string
+			for _, l := range iss.Labels {
+				if c := sanitizeGroupHeading(l); c != "" {
+					cleaned = append(cleaned, c)
+				}
+			}
+			sort.Strings(cleaned)
+			if len(cleaned) == 0 {
+				addToBucket("~unlabeled", 1, "Unlabeled", idx)
+			} else {
+				primary := cleaned[0]
+				addToBucket(strings.ToLower(primary), 0, primary, idx)
+			}
+		}
+	default:
+		return nil
+	}
+
+	sort.SliceStable(groups, func(i, j int) bool {
+		if groups[i].SortOrd != groups[j].SortOrd {
+			return groups[i].SortOrd < groups[j].SortOrd
+		}
+		return groups[i].Key < groups[j].Key
+	})
+
+	out := make([]markdownIssueGroup, len(groups))
+	for i, g := range groups {
+		out[i] = *g
+	}
+	return out
+}
+
+type summaryColumnSpec struct {
+	header string
+	render func(i model.Issue) string
+}
+
+func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOptions) {
+	if len(issues) == 0 {
+		return
+	}
+
+	blocksSetByID := make(map[string]map[string]bool, len(issues))
+	for _, iss := range issues {
+		for _, dep := range iss.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == "" {
+				continue
+			}
+			if blocksSetByID[dep.DependsOnID] == nil {
+				blocksSetByID[dep.DependsOnID] = make(map[string]bool)
+			}
+			blocksSetByID[dep.DependsOnID][iss.ID] = true
+		}
+	}
+	blocksByID := make(map[string][]string, len(blocksSetByID))
+	for blockerID, set := range blocksSetByID {
+		list := make([]string, 0, len(set))
+		for depID := range set {
+			list = append(list, depID)
+		}
+		sort.Strings(list)
+		blocksByID[blockerID] = list
+	}
+
+	resolveColumn := func(raw string) (summaryColumnSpec, bool) {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "id":
+			return summaryColumnSpec{
+				header: "ID",
+				render: func(i model.Issue) string { return escapeTableText(i.ID) },
+			}, true
+		case "title":
+			return summaryColumnSpec{
+				header: "Title",
+				render: func(i model.Issue) string {
+					t := i.Title
+					if opts.View.TruncateTitle > 0 {
+						t = truncateString(t, opts.View.TruncateTitle)
+					}
+					return escapeTableText(t)
+				},
+			}, true
+		case "type", "issue_type":
+			return summaryColumnSpec{
+				header: "Type",
+				render: func(i model.Issue) string {
+					return fmt.Sprintf("%s %s", getTypeEmoji(string(i.IssueType)), escapeTableText(string(i.IssueType)))
+				},
+			}, true
+		case "priority":
+			return summaryColumnSpec{
+				header: "Priority",
+				render: func(i model.Issue) string {
+					return fmt.Sprintf("P%d", i.Priority)
+				},
+			}, true
+		case "status":
+			return summaryColumnSpec{
+				header: "Status",
+				render: func(i model.Issue) string {
+					return fmt.Sprintf("%s %s", getStatusEmoji(string(i.Status)), escapeTableText(string(i.Status)))
+				},
+			}, true
+		case "assignee":
+			return summaryColumnSpec{
+				header: "Assignee",
+				render: func(i model.Issue) string {
+					clean := strings.TrimSpace(i.Assignee)
+					if clean == "" {
+						return "-"
+					}
+					return "@" + escapeTableText(clean)
+				},
+			}, true
+		case "label", "labels", "tag", "tags":
+			return summaryColumnSpec{
+				header: "Labels",
+				render: func(i model.Issue) string {
+					if len(i.Labels) == 0 {
+						return "-"
+					}
+					escaped := make([]string, len(i.Labels))
+					for idx, l := range i.Labels {
+						escaped[idx] = escapeTableText(l)
+					}
+					return strings.Join(escaped, ", ")
+				},
+			}, true
+		case "created", "created_at":
+			return summaryColumnSpec{
+				header: "Created",
+				render: func(i model.Issue) string {
+					if i.CreatedAt.IsZero() {
+						return "-"
+					}
+					return i.CreatedAt.Format("2006-01-02")
+				},
+			}, true
+		case "updated", "updated_at":
+			return summaryColumnSpec{
+				header: "Updated",
+				render: func(i model.Issue) string {
+					if i.UpdatedAt.IsZero() {
+						return "-"
+					}
+					return i.UpdatedAt.Format("2006-01-02")
+				},
+			}, true
+		case "blocked_by", "blockers":
+			return summaryColumnSpec{
+				header: "Blocked By",
+				render: func(i model.Issue) string {
+					var blockers []string
+					seen := make(map[string]bool)
+					for _, dep := range i.Dependencies {
+						if dep != nil && dep.Type.IsBlocking() && dep.DependsOnID != "" && !seen[dep.DependsOnID] {
+							seen[dep.DependsOnID] = true
+							blockers = append(blockers, escapeTableText(dep.DependsOnID))
+						}
+					}
+					if len(blockers) == 0 {
+						return "-"
+					}
+					return strings.Join(blockers, ", ")
+				},
+			}, true
+		case "blocks", "unblocks":
+			return summaryColumnSpec{
+				header: "Blocks",
+				render: func(i model.Issue) string {
+					targets := blocksByID[i.ID]
+					if len(targets) == 0 {
+						return "-"
+					}
+					escaped := make([]string, len(targets))
+					for idx, t := range targets {
+						escaped[idx] = escapeTableText(t)
+					}
+					return strings.Join(escaped, ", ")
+				},
+			}, true
+		default:
+			return summaryColumnSpec{}, false
+		}
+	}
+
+	var specs []summaryColumnSpec
+	for _, col := range opts.View.Columns {
+		if spec, ok := resolveColumn(col); ok {
+			specs = append(specs, spec)
+		}
+	}
+	if len(specs) == 0 {
+		for _, defCol := range []string{"id", "title", "type", "priority", "status"} {
+			if spec, ok := resolveColumn(defCol); ok {
+				specs = append(specs, spec)
+			}
+		}
+	}
+
+	headers := make([]string, len(specs))
+	separators := make([]string, len(specs))
+	for idx, spec := range specs {
+		headers[idx] = spec.header
+		separators[idx] = "---"
+	}
+	sb.WriteString("| " + strings.Join(headers, " | ") + " |\n")
+	sb.WriteString("| " + strings.Join(separators, " | ") + " |\n")
+	for _, iss := range issues {
+		cells := make([]string, len(specs))
+		for idx, spec := range specs {
+			cells[idx] = spec.render(iss)
+		}
+		sb.WriteString("| " + strings.Join(cells, " | ") + " |\n")
+	}
+	sb.WriteString("\n")
+}
+
+func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, opts ReportOptions) {
+	typeIcon := getTypeEmoji(string(i.IssueType))
+	sb.WriteString(fmt.Sprintf("<a id=\"%s\"></a>\n\n", slug))
+	sb.WriteString(fmt.Sprintf("## %s\n\n", issueHeadingText(i)))
+
+	// Metadata Table
+	sb.WriteString("| Property | Value |\n|----------|-------|\n")
+	sb.WriteString(fmt.Sprintf("| **Type** | %s %s |\n", typeIcon, escapeTableText(string(i.IssueType))))
+	sb.WriteString(fmt.Sprintf("| **Priority** | %s |\n", escapeTableText(getPriorityLabel(i.Priority))))
+	sb.WriteString(fmt.Sprintf("| **Status** | %s %s |\n", getStatusEmoji(string(i.Status)), escapeTableText(string(i.Status))))
+	if i.Assignee != "" {
+		sb.WriteString(fmt.Sprintf("| **Assignee** | @%s |\n", escapeTableText(i.Assignee)))
+	}
+	sb.WriteString(fmt.Sprintf("| **Created** | %s |\n", i.CreatedAt.Format("2006-01-02 15:04")))
+	sb.WriteString(fmt.Sprintf("| **Updated** | %s |\n", i.UpdatedAt.Format("2006-01-02 15:04")))
+	if i.DueDate != nil {
+		sb.WriteString(fmt.Sprintf("| **Due** | %s |\n", i.DueDate.Format("2006-01-02")))
+	}
+	if i.DeferUntil != nil {
+		sb.WriteString(fmt.Sprintf("| **Deferred Until** | %s |\n", i.DeferUntil.Format("2006-01-02")))
+	}
+	if i.ClosedAt != nil {
+		sb.WriteString(fmt.Sprintf("| **Closed** | %s |\n", i.ClosedAt.Format("2006-01-02 15:04")))
+	}
+	if i.ExternalRef != nil && *i.ExternalRef != "" {
+		escapedRef := strings.ReplaceAll(escapeTableText(*i.ExternalRef), "`", "'")
+		sb.WriteString(fmt.Sprintf("| **External Ref** | `%s` |\n", escapedRef))
+	}
+	if len(i.Labels) > 0 {
+		escapedLabels := make([]string, len(i.Labels))
+		for idx, label := range i.Labels {
+			escapedLabels[idx] = escapeTableText(label)
+		}
+		sb.WriteString(fmt.Sprintf("| **Labels** | %s |\n", strings.Join(escapedLabels, ", ")))
+	}
+	sb.WriteString("\n")
+
+	if i.Description != "" {
+		sb.WriteString("### Description\n\n")
+		sb.WriteString(i.Description + "\n\n")
+	}
+
+	if i.AcceptanceCriteria != "" {
+		sb.WriteString("### Acceptance Criteria\n\n")
+		sb.WriteString(i.AcceptanceCriteria + "\n\n")
+	}
+
+	if i.Design != "" {
+		sb.WriteString("### Design\n\n")
+		sb.WriteString(i.Design + "\n\n")
+	}
+
+	if i.Notes != "" {
+		sb.WriteString("### Notes\n\n")
+		sb.WriteString(i.Notes + "\n\n")
+	}
+
+	if len(i.Dependencies) > 0 {
+		sb.WriteString("### Dependencies\n\n")
+		for _, dep := range i.Dependencies {
+			if dep == nil {
+				continue
+			}
+			icon := "🔗"
+			if dep.Type.IsBlocking() {
+				icon = "⛔"
+			}
+			sb.WriteString(fmt.Sprintf("- %s **%s**: `%s`\n", icon, dep.Type, dep.DependsOnID))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(i.Comments) > 0 {
+		sb.WriteString("### Comments\n\n")
+		for _, c := range i.Comments {
+			if c == nil {
+				continue
+			}
+			escapedText := strings.ReplaceAll(c.Text, "\n", "\n> ")
+			sb.WriteString(fmt.Sprintf("> **%s** (%s)\n>\n> %s\n\n",
+				c.Author, c.CreatedAt.Format("2006-01-02"), escapedText))
+		}
+	}
+
+	// Per-issue command snippets
+	sb.WriteString(generateIssueCommands(i, opts))
+
+	sb.WriteString("---\n\n")
 }
 
 func issueHeadingText(i model.Issue) string {
@@ -890,15 +1246,15 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 			}
 			sb.WriteString(fmt.Sprintf("| %d | **%s** %s | %s | P%d | %.2f | %s | %s | %s | %s |\n",
 				i+1,
-				rec.ID,
-				truncateString(rec.Title, 25),
+				escapeTableText(rec.ID),
+				escapeTableText(truncateString(rec.Title, 25)),
 				typeIcon,
 				rec.Priority,
 				rec.Score,
 				barChart(rec.Breakdown.PageRankNorm),
 				barChart(rec.Breakdown.BetweennessNorm),
 				barChart(rec.Breakdown.TimeToImpactNorm),
-				reason,
+				escapeTableText(reason),
 			))
 		}
 		sb.WriteString("\n")
@@ -920,9 +1276,9 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 		for i := 0; i < limit; i++ {
 			qw := triage.QuickWins[i]
 			sb.WriteString(fmt.Sprintf("| **%s** %s | %s |\n",
-				qw.ID,
-				truncateString(qw.Title, 30),
-				truncateString(qw.Reason, 40),
+				escapeTableText(qw.ID),
+				escapeTableText(truncateString(qw.Title, 30)),
+				escapeTableText(truncateString(qw.Reason, 40)),
 			))
 		}
 		sb.WriteString("\n")
@@ -948,8 +1304,8 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 				ready = "✅"
 			}
 			sb.WriteString(fmt.Sprintf("| **%s** %s | %d | %s |\n",
-				b.ID,
-				truncateString(b.Title, 30),
+				escapeTableText(b.ID),
+				escapeTableText(truncateString(b.Title, 30)),
 				b.UnblocksCount,
 				ready,
 			))
@@ -997,11 +1353,15 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 					suffix = fmt.Sprintf(" (+%d more)", len(shown)-3)
 					shown = shown[:3]
 				}
+				escapedShown := make([]string, len(shown))
+				for idx, targetID := range shown {
+					escapedShown[idx] = escapeTableText(targetID)
+				}
 				sb.WriteString(fmt.Sprintf("| **%s** %s | %d | %s%s |\n",
-					r.id,
-					truncateString(r.title, 25),
+					escapeTableText(r.id),
+					escapeTableText(truncateString(r.title, 25)),
 					len(r.targets),
-					strings.Join(shown, ", "),
+					strings.Join(escapedShown, ", "),
 					suffix,
 				))
 			}

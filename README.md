@@ -1691,7 +1691,7 @@ The `[Created ↓]` badge instantly communicates the active sort mode without re
 
 ## 🌲 Hierarchical Tree View: Parent-Child Visualization
 
-Press `E` to open the **Hierarchical Tree View**—a collapsible tree that visualizes parent-child relationships between issues. The Graph View shows blocking dependency edges; the Tree View focuses exclusively on **structural hierarchy**: which issues are "part of" other issues.
+Press `E` to open the **Hierarchical Tree View**—a collapsible tree that visualizes parent-child relationships between issues by default, and toggles to **blocking dependency chains** with `b` or `m`. The Graph View renders expandable dependency graphs; the Tree View gives a compact indented outline of either structural hierarchy or blocking chains.
 
 ### Why Parent-Child Matters
 
@@ -1699,10 +1699,12 @@ In complex projects, issues often have two distinct relationship types:
 - **Blocking dependencies** (`blocks`, `conditional-blocks`, `waits-for`, and any dependency written without a `type`, which stays blocking for legacy data): predecessor completion gates readiness according to the dependency type
 - **Parent-child relationships** (`parent-child`): Feature X contains Tasks A, B, and C as sub-work
 
-The Tree View renders only parent-child relationships, creating a work breakdown structure (WBS) that answers questions like:
+In its default hierarchy mode, the Tree View renders parent-child relationships, creating a work breakdown structure (WBS) that answers questions like:
 - "What sub-tasks make up this epic?"
 - "Which feature does this bug belong to?"
 - "How is work decomposed across the project?"
+
+Press `b` or `m` inside Tree View to switch to **blocking mode**, where blockers appear as parents of the issues they block so you can inspect multi-hop blocking cascades in the same collapsible outline.
 
 ### Tree Layout
 
@@ -1766,6 +1768,7 @@ The tree construction uses a **parent-child only** filter with intelligent root 
 | `o` | Expand all nodes in the tree |
 | `O` | Collapse all nodes in the tree |
 | **Integration** | |
+| `b` / `m` | Toggle between parent-child hierarchy mode and blocking dependency mode |
 | `Tab` | Sync selection to detail panel (in split view) |
 | `E` / `Esc` | Exit tree view, return to list |
 
@@ -1783,7 +1786,7 @@ The tree construction uses a **parent-child only** filter with intelligent root 
 
 | Aspect | Tree View (`E`) | Graph View (`g`) |
 |--------|-----------------|------------------|
-| **Relationships** | Parent-child only | Blocking dependencies |
+| **Relationships** | Parent-child hierarchy (default) or blocking chains (`b` / `m`) | Blocking dependencies |
 | **Layout** | Indented hierarchy | Selected-node boxes and expandable dependency paths |
 | **Focus** | Work breakdown structure | Dependency flow |
 | **Navigation** | Vim-style (j/k/h/l) | hjkl selection, H/L panning, J/K scrolling, Space expansion |
@@ -2320,6 +2323,7 @@ Navigate to a file and press `Enter` to see all beads and commits that touched i
 ```bash
 bv --robot-history                          # Full history report
 bv --robot-history --bead-history BV-123    # Single bead focus
+bv --robot-commit HEAD                      # Reverse commit-to-bead lookup (or orphan rescue)
 bv --robot-history --history-since '30 days ago'
 bv --robot-history --min-confidence 0.7     # High-confidence only
 bv --robot-history | jq '{avg_cycle_time_days: .stats.avg_cycle_time_days, beads: [.histories | to_entries[] | {id: .key, claim_to_close_ns: .value.cycle_time.claim_to_close}]}'
@@ -3135,7 +3139,7 @@ The Alerts System surfaces potential problems before they become blockers. It co
 
 ### Alert Types
 
-Alert types are the `AlertType` constants in `pkg/drift/drift.go` (`AllAlertTypes()` lists every one, and a test proves each has an emitter); thresholds are `DefaultConfig()` in `pkg/drift/config.go`, overridable per project in `.bv/drift.yaml` (keys below). Every alert carries a `suggested_action`, and issue-level alerts carry the issue's `labels` so `--alert-label` can filter on them.
+Alert types are the `AlertType` constants in `pkg/drift/drift.go` (`AllAlertTypes()` lists every one, and a test proves each has an emitter); thresholds are `DefaultConfig()` in `pkg/drift/config.go`, overridable per project in `.bv/drift.yaml` (bootstrap a commented starter file with `bv --init-drift`, or `bv --init-drift --yes` to overwrite). Every alert carries a `suggested_action`, and issue-level alerts carry the issue's `labels` so `--alert-label` can filter on them.
 
 <!-- bv:generated:alerts -->
 **Proactive checks** (run on the current graph, no baseline needed):
@@ -3149,6 +3153,7 @@ Alert types are the `AlertType` constants in `pkg/drift/drift.go` (`AllAlertType
 | `potential_duplicate` | Two open issues whose title/description keyword Jaccard similarity reaches the threshold (same detector as `--robot-suggest`); closed issues are never paired | Info | `duplicate_jaccard_threshold` (0.7), `duplicate_max_alerts` (10) |
 | `priority_mismatch` | `--robot-priority` recommends a *higher* priority with confidence at or above the floor (downgrade suggestions stay in `--robot-priority`) | Warning | `priority_mismatch_min_confidence` (0.6) |
 | `velocity_drop` | Closes in the last window fell by the percentage or more versus the previous window, which must contain at least the baseline count of closes | Warning | `velocity_drop_pct` (50), `velocity_window_days` (7), `velocity_min_baseline` (5) |
+| `source_inconsistency` | Live SQLite (`beads.db`) and local JSONL (`issues.jsonl`) tracker sources disagree on issue presence, status, priority, or title | Warning | `source_drift_alert` (true), `source_drift_max_alerts` (10) |
 
 **Drift checks** (compare the current graph with the baseline saved by `bv --save-baseline`):
 
@@ -3164,7 +3169,7 @@ Alert types are the `AlertType` constants in `pkg/drift/drift.go` (`AllAlertType
 | `pagerank_change` | A top-metric issue's PageRank moved by the percentage or more | Warning | `pagerank_change_warning_pct` (50) |
 <!-- /bv:generated -->
 
-Any type can be switched off with `disabled_alerts: [type, ...]`. `priority_mismatch` and `potential_duplicate` re-run whole-graph analysis, so above `proactive_max_issues` (2000) they are skipped and listed in `skipped_checks` with the reason; set the key to 0 to remove the cap. `--robot-alerts` runs both groups (drift checks compare against the saved baseline when one exists, otherwise against the current graph and stay silent); `--check-drift` runs only the drift checks and exits 0 (no alerts or info only), 2 (warnings), or 1 (critical, or no baseline saved yet).
+Any type can be switched off with `disabled_alerts: [type, ...]`. `priority_mismatch` and `potential_duplicate` re-run whole-graph analysis, so above `proactive_max_issues` (2000) they are skipped and listed in `skipped_checks` with the reason; set the key to 0 to remove the cap. `--robot-alerts` runs both groups (drift checks compare against the saved baseline when one exists, otherwise against the current graph and stay silent); `--check-drift` runs baseline drift checks plus live SQLite-vs-JSONL `source_inconsistency` checks and exits 0 (no alerts or info only), 2 (warnings), or 1 (critical, or no baseline saved yet).
 
 ### TUI Integration
 
@@ -3254,6 +3259,7 @@ These commands output **structured JSON** designed for programmatic consumption:
 | `--robot-search` | Hashed keyword or graph-weighted hybrid search (with `--search <query>`) | Issue discovery |
 | `--robot-history` | Bead-to-commit correlations | Code change tracking |
 | `--bead-history <id>` | Single-bead commit correlation history | Scoped code provenance |
+| `--robot-commit <sha\|ref>` | Reverse commit-to-bead lookup with orphan candidate rescue | Commit provenance & audit |
 | `--robot-orphans` | Unlinked commit candidates with probable beads | Hygiene & audit |
 | `--robot-label-health` | Per-label health metrics | Domain health monitoring |
 | `--robot-label-flow` | Cross-label dependency matrix + transitive `blockage_cascade` | Inter-domain bottleneck analysis |
@@ -3369,14 +3375,11 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date) | History & Drift |
 | `--history-limit` | int | `500` | Max commits to analyze (0 = unlimited) | History & Drift |
 | `--history-since` | string | (empty) | Limit history to commits after this date/ref (e.g., '30 days ago', '2024-01-01') | History & Drift |
+| `--id-pattern` | stringArray | `[]` | Custom bead ID regex for commit-message matching, e.g. 'bh-[a-z0-9]{5}' (repeatable; capture group 1 is the ID, else the whole match) (#188) | History & Drift |
+| `--init-drift` | bool | `false` | Create default .bv/drift.yaml configuration file (use --yes to overwrite) | History & Drift |
 | `--min-confidence` | float64 | `0` | Filter correlations by minimum confidence (0.0-1.0) | History & Drift |
 | `--save-baseline` | string | (empty) | Save current metrics as baseline with optional description | History & Drift |
-| `--feedback-accept` | string | (empty) | Record accept feedback for issue ID (tunes recommendation weights) | Other |
-| `--feedback-ignore` | string | (empty) | Record ignore feedback for issue ID (tunes recommendation weights) | Other |
-| `--feedback-reset` | bool | `false` | Reset all feedback data to defaults | Other |
-| `--feedback-show` | bool | `false` | Show current feedback status and weight adjustments | Other |
 | `--generate-docs` | bool | `false` | Generate documentation markdown and JSON artifacts | Other |
-| `--id-pattern` | stringArray | `[]` | Custom bead ID regex for commit-message matching, e.g. 'bh-[a-z0-9]{5}' (repeatable; capture group 1 is the ID, else the whole match) (#188) | Other |
 | `--network-depth` | int | `2` | Depth of subnetwork when querying specific bead (1-3) | Other |
 | `--agents` | int | `1` | Number of parallel agents for capacity simulation | Robot & Planning Flags |
 | `--attention-limit` | int | `5` | Limit number of labels in --robot-label-attention output | Robot & Planning Flags |
@@ -3384,6 +3387,10 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--capacity-label` | string | (empty) | Filter capacity simulation by label | Robot & Planning Flags |
 | `--correlation-by` | string | (empty) | Agent/user identifier for correlation feedback | Robot & Planning Flags |
 | `--correlation-reason` | string | (empty) | Reason for correlation feedback | Robot & Planning Flags |
+| `--feedback-accept` | string | (empty) | Record accept feedback for issue ID (tunes recommendation weights) | Robot & Planning Flags |
+| `--feedback-ignore` | string | (empty) | Record ignore feedback for issue ID (tunes recommendation weights) | Robot & Planning Flags |
+| `--feedback-reset` | bool | `false` | Reset all feedback data to defaults | Robot & Planning Flags |
+| `--feedback-show` | bool | `false` | Show current feedback status and weight adjustments | Robot & Planning Flags |
 | `--file-beads-limit` | int | `20` | Max closed beads to show (use with --robot-file-beads) | Robot & Planning Flags |
 | `--forecast-agents` | int | `1` | Number of parallel agents for capacity calculation | Robot & Planning Flags |
 | `--forecast-label` | string | (empty) | Filter forecast by label | Robot & Planning Flags |
@@ -3404,6 +3411,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--robot-capabilities` | bool | `false` | Output machine-readable command capabilities for AI agents | Robot & Planning Flags |
 | `--robot-capacity` | bool | `false` | Output capacity simulation and completion projection as JSON | Robot & Planning Flags |
 | `--robot-causality` | string | (empty) | Output causal chain analysis for bead ID as JSON | Robot & Planning Flags |
+| `--robot-commit` | string | (empty) | Output beads correlated with a git commit SHA or revision as JSON | Robot & Planning Flags |
 | `--robot-confirm-correlation` | string | (empty) | Confirm a correlation is correct (format: SHA:beadID) | Robot & Planning Flags |
 | `--robot-correlation-stats` | bool | `false` | Output correlation feedback statistics as JSON | Robot & Planning Flags |
 | `--robot-diff` | bool | `false` | Output diff as JSON (use with --diff-since) | Robot & Planning Flags |
@@ -4257,10 +4265,10 @@ bv has a comprehensive built-in help system:
 | :--- | :---: | :--- |
 | **all** | `j` | Move down |
 |  | `k` | Move up |
-| **list,detail,board,graph,tree,actionable,history,flow,attention,label** | `G` | Go to end |
-| **list,detail,board,actionable,flow,attention,label** | `home` | Go to start |
+| **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity** | `G` | Go to end |
+| **list,detail,board,insights,actionable,flow,attention,label,velocity** | `home` | Go to start |
 | **board,tree** | `gg` | Go to start |
-| **list,detail,board,graph,tree,actionable,attention** | `ctrl+d` | Page down |
+| **list,detail,board,graph,insights,tree,actionable,attention,velocity** | `ctrl+d` | Page down |
 |  | `ctrl+u` | Page up |
 | **list,detail,board,graph,insights,actionable,history** | `enter` | Open details |
 | **all** | `esc` | Back/close (list: clear filters) |
@@ -4269,8 +4277,9 @@ bv has a comprehensive built-in help system:
 |  | `f5` | Refresh issues from disk |
 | **list,detail** | `a` | Actionable view |
 |  | `b` | Board view |
-|  | `g` | Graph view |
-|  | `h` | History view |
+| **list** | `g` | Graph view |
+| **detail** | `g` | Go to top |
+| **list,detail** | `h` | History view |
 |  | `i` | Insights panel |
 |  | `E` | Tree view (parent-child hierarchy) |
 |  | `f` | Flow matrix (cross-label dependencies) |
@@ -4304,7 +4313,8 @@ bv has a comprehensive built-in help system:
 | **list,detail,board,graph,tree,actionable,insights,flow,history** | `O` | Open in $EDITOR |
 | **list** | `'` | Recipe picker |
 |  | `U` | Self-update check |
-| **list,detail,board,tree,history** | `V` | Cass sessions |
+| **list,detail,board,graph,insights,tree,actionable,history** | `V` | Cass sessions |
+| **list,detail** | `\` | Toggle split view |
 | **graph** | `hjkl` | Navigate graph |
 |  | `H` | Scroll left |
 |  | `L` | Scroll right |
@@ -4338,11 +4348,14 @@ bv has a comprehensive built-in help system:
 |  | `tab` | Toggle detail pane |
 |  | `PgUp` | Page up |
 |  | `PgDn` | Page down |
+|  | `b` | Toggle hierarchy / blocking tree mode |
+|  | `m` | Toggle hierarchy / blocking tree mode |
 |  | `E` | Exit tree view |
 | **actionable** | `PgUp` | Page up |
 |  | `PgDn` | Page down |
 |  | `a` | Close actionable view |
-| **insights** | `h` | Previous panel |
+| **insights** | `g` | Go to top |
+|  | `h` | Previous panel |
 |  | `l` | Next panel |
 |  | `tab` | Next panel |
 |  | `shift+tab` | Previous panel |
@@ -4379,7 +4392,8 @@ bv has a comprehensive built-in help system:
 |  | `d` | Label drilldown |
 |  | `v` | Velocity comparison |
 |  | `[` | Close label dashboard |
-| **velocity** | `j` | Next label row |
+| **velocity** | `g` | Go to top |
+|  | `j` | Next label row |
 |  | `k` | Previous label row |
 |  | `enter` | Filter list by label |
 |  | `v` | Return to label dashboard |

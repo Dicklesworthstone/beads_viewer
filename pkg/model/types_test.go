@@ -1447,3 +1447,40 @@ func TestReadinessAfterSingle_MatchesReadyAfterOracle(t *testing.T) {
 		}
 	}
 }
+
+func TestIssue_IsParkedForStalenessAt(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	future := now.Add(24 * time.Hour)
+	past := now.Add(-24 * time.Hour)
+
+	tests := []struct {
+		name  string
+		issue Issue
+		now   time.Time
+		want  bool
+	}{
+		{"open active", Issue{ID: "1", Status: StatusOpen}, now, false},
+		{"in_progress active", Issue{ID: "2", Status: StatusInProgress}, now, false},
+		{"blocked active", Issue{ID: "3", Status: StatusBlocked}, now, false},
+		{"draft active", Issue{ID: "4", Status: StatusDraft}, now, false},
+		{"closed", Issue{ID: "5", Status: StatusClosed}, now, true},
+		{"tombstone", Issue{ID: "6", Status: StatusTombstone}, now, true},
+		{"status deferred", Issue{ID: "7", Status: StatusDeferred}, now, true},
+		{"status pinned", Issue{ID: "8", Status: StatusPinned}, now, true},
+		{"unnormalized deferred", Issue{ID: "9", Status: " Deferred "}, now, true},
+		{"pinned bool", Issue{ID: "10", Status: StatusOpen, Pinned: true}, now, true},
+		{"is_template", Issue{ID: "11", Status: StatusOpen, IsTemplate: true}, now, true},
+		{"ephemeral", Issue{ID: "12", Status: StatusOpen, Ephemeral: true}, now, true},
+		{"future defer_until", Issue{ID: "13", Status: StatusOpen, DeferUntil: &future}, now, true},
+		{"past defer_until", Issue{ID: "14", Status: StatusOpen, DeferUntil: &past}, now, false},
+		{"future defer_until with zero now", Issue{ID: "15", Status: StatusOpen, DeferUntil: &future}, time.Time{}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.issue.IsParkedForStalenessAt(tt.now); got != tt.want {
+				t.Fatalf("IsParkedForStalenessAt() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

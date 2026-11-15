@@ -224,13 +224,13 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		// Global Navigation & Help
 		{"j", "Move down", "Navigation", "all"},
 		{"k", "Move up", "Navigation", "all"},
-		{"G", "Go to end", "Navigation", "list,detail,board,graph,tree,actionable,history,flow,attention,label"},
-		{"home", "Go to start", "Navigation", "list,detail,board,actionable,flow,attention,label"},
+		{"G", "Go to end", "Navigation", "list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity"},
+		{"home", "Go to start", "Navigation", "list,detail,board,insights,actionable,flow,attention,label,velocity"},
 		// gg is a 200 ms combo; only the board and tree implement it. In the
 		// list a single g opens the graph view.
 		{"gg", "Go to start", "Navigation", "board,tree"},
-		{"ctrl+d", "Page down", "Navigation", "list,detail,board,graph,tree,actionable,attention"},
-		{"ctrl+u", "Page up", "Navigation", "list,detail,board,graph,tree,actionable,attention"},
+		{"ctrl+d", "Page down", "Navigation", "list,detail,board,graph,insights,tree,actionable,attention,velocity"},
+		{"ctrl+u", "Page up", "Navigation", "list,detail,board,graph,insights,tree,actionable,attention,velocity"},
 		{"enter", "Open details", "Navigation", "list,detail,board,graph,insights,actionable,history"},
 		{"esc", "Back/close (list: clear filters)", "Navigation", "all"},
 		{"q", "Quit / close view", "Navigation", "all"},
@@ -240,7 +240,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		// View Switching & Help Surfaces
 		{"a", "Actionable view", "Views", "list,detail"},
 		{"b", "Board view", "Views", "list,detail"},
-		{"g", "Graph view", "Views", "list,detail"},
+		{"g", "Graph view", "Views", "list"},
+		{"g", "Go to top", "Navigation", "detail"},
 		{"h", "History view", "Views", "list,detail"},
 		{"i", "Insights panel", "Views", "list,detail"},
 		{"E", "Tree view (parent-child hierarchy)", "Views", "list,detail"},
@@ -279,7 +280,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"O", "Open in $EDITOR", "Actions", "list,detail,board,graph,tree,actionable,insights,flow,history"},
 		{"'", "Recipe picker", "Actions", "list"},
 		{"U", "Self-update check", "Actions", "list"},
-		{"V", "Cass sessions", "Actions", "list,detail,board,tree,history"},
+		{"V", "Cass sessions", "Actions", "list,detail,board,graph,insights,tree,actionable,history"},
+		{"\\", "Toggle split view", "Views", "list,detail"},
 
 		// Graph View (g)
 		{"hjkl", "Navigate graph", "Graph", "graph"},
@@ -319,6 +321,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"tab", "Toggle detail pane", "Tree", "tree"},
 		{"PgUp", "Page up", "Tree", "tree"},
 		{"PgDn", "Page down", "Tree", "tree"},
+		{"b", "Toggle hierarchy / blocking tree mode", "Tree", "tree"},
+		{"m", "Toggle hierarchy / blocking tree mode", "Tree", "tree"},
 		{"E", "Exit tree view", "Tree", "tree"},
 
 		// Actionable View (a)
@@ -327,6 +331,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"a", "Close actionable view", "Actionable", "actionable"},
 
 		// Insights View (i)
+		{"g", "Go to top", "Insights", "insights"},
 		{"h", "Previous panel", "Insights", "insights"},
 		{"l", "Next panel", "Insights", "insights"},
 		{"tab", "Next panel", "Insights", "insights"},
@@ -374,6 +379,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"[", "Close label dashboard", "Label", "label"},
 
 		// Velocity Comparison (v in Label Dashboard)
+		{"g", "Go to top", "Velocity", "velocity"},
 		{"j", "Next label row", "Velocity", "velocity"},
 		{"k", "Previous label row", "Velocity", "velocity"},
 		{"enter", "Filter list by label", "Velocity", "velocity"},

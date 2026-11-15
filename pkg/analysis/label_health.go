@@ -207,32 +207,46 @@ type LabelAnalysisResult struct {
 	AttentionNeeded []string        `json:"attention_needed"`           // Labels requiring attention
 }
 
+func filterIssuesByCandidates(issues []model.Issue, candidateIDs map[string]bool) []model.Issue {
+	if candidateIDs == nil {
+		return issues
+	}
+	scoped := make([]model.Issue, 0, len(issues))
+	for i := range issues {
+		if candidateIDs[issues[i].ID] {
+			scoped = append(scoped, issues[i])
+		}
+	}
+	return scoped
+}
+
 // ComputeCrossLabelFlow analyzes blocking dependencies between labels and returns counts.
 // It respects cfg.IncludeClosedInFlow: when false, closed issues are ignored.
 func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLabelFlow {
-	labels := ExtractLabels(issues)
-	labelList := make([]string, len(labels.Labels))
-	copy(labelList, labels.Labels)
-	sort.Strings(labelList)
+	return ComputeCrossLabelFlowWithScope(issues, cfg, nil)
+}
 
-	n := len(labelList)
-	matrix := make([][]int, n)
-	for i := range matrix {
-		matrix[i] = make([]int, n)
+// ComputeCrossLabelFlowWithScope analyzes blocking dependencies between labels, optionally
+// restricting candidate label membership to candidateIDs while retaining cross-label blocking
+// dependencies where at least one endpoint (blocked or blocker) is in candidateIDs.
+func ComputeCrossLabelFlowWithScope(issues []model.Issue, cfg LabelHealthConfig, candidateIDs map[string]bool) CrossLabelFlow {
+	scopedIssues := filterIssuesByCandidates(issues, candidateIDs)
+	labels := ExtractLabels(scopedIssues)
+	labelSet := make(map[string]struct{}, len(labels.Labels))
+	for _, l := range labels.Labels {
+		if l != "" {
+			labelSet[l] = struct{}{}
+		}
 	}
 
-	index := make(map[string]int, n)
-	for i, l := range labelList {
-		index[l] = i
-	}
-
-	// Build issue map for lookup
+	// Build issue map for lookup across all context issues
 	issueMap := make(map[string]model.Issue, len(issues))
 	for _, iss := range issues {
 		issueMap[iss.ID] = iss
 	}
 
-	// Dependency aggregation
+	// Dependency aggregation across all context issues, retaining edges where at least
+	// one endpoint belongs to candidateIDs when scoped.
 	depMap := make(map[crossLabelPairKey]*LabelDependency)
 	totalDeps := 0
 
@@ -251,18 +265,17 @@ func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLab
 			if !cfg.IncludeClosedInFlow && isClosedLikeStatus(blocker.Status) {
 				continue
 			}
+			if candidateIDs != nil && !candidateIDs[blocked.ID] && !candidateIDs[blocker.ID] {
+				continue
+			}
 			// Cross-product of deduplicated labels
 			for _, from := range dedupePreserveOrder(blocker.Labels) {
 				for _, to := range dedupePreserveOrder(blocked.Labels) {
 					if from == "" || to == "" || from == to {
 						continue // skip empty/self
 					}
-					iFrom, okFrom := index[from]
-					iTo, okTo := index[to]
-					if !okFrom || !okTo {
-						continue
-					}
-					matrix[iFrom][iTo]++
+					labelSet[from] = struct{}{}
+					labelSet[to] = struct{}{}
 					totalDeps++
 					key := crossLabelPairKey{from: from, to: to}
 					entry, exists := depMap[key]
@@ -284,6 +297,30 @@ func ComputeCrossLabelFlow(issues []model.Issue, cfg LabelHealthConfig) CrossLab
 					})
 				}
 			}
+		}
+	}
+
+	labelList := make([]string, 0, len(labelSet))
+	for l := range labelSet {
+		labelList = append(labelList, l)
+	}
+	sort.Strings(labelList)
+
+	n := len(labelList)
+	matrix := make([][]int, n)
+	for i := range matrix {
+		matrix[i] = make([]int, n)
+	}
+
+	index := make(map[string]int, n)
+	for i, l := range labelList {
+		index[l] = i
+	}
+	for key, entry := range depMap {
+		iFrom, okFrom := index[key.from]
+		iTo, okTo := index[key.to]
+		if okFrom && okTo {
+			matrix[iFrom][iTo] = entry.IssueCount
 		}
 	}
 
@@ -672,7 +709,7 @@ func ComputeFreshnessMetrics(issues []model.Issue, now time.Time, staleDays int)
 			if !iss.CreatedAt.IsZero() && (oldestOpen.IsZero() || iss.CreatedAt.Before(oldestOpen)) {
 				oldestOpen = iss.CreatedAt
 			}
-			if !iss.UpdatedAt.IsZero() {
+			if !iss.IsParkedForStalenessAt(now) && !iss.UpdatedAt.IsZero() {
 				days := now.Sub(iss.UpdatedAt).Hours() / 24.0
 				totalStaleness += days
 				count++
@@ -1053,7 +1090,18 @@ func computeIndexedLabelHealth(
 
 // ComputeAllLabelHealth computes health for all labels in the issue set.
 func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time.Time, stats *GraphStats) LabelAnalysisResult {
-	labels := ExtractLabels(issues)
+	return ComputeAllLabelHealthWithScope(issues, cfg, now, stats, nil, nil)
+}
+
+// ComputeAllLabelHealthWithScope computes health for all labels while reusing an optional
+// ReadinessIndex (preserving external cross-scope and tombstone blocker state) and scoping
+// label membership and cross-label flow to candidateIDs when non-nil.
+func ComputeAllLabelHealthWithScope(issues []model.Issue, cfg LabelHealthConfig, now time.Time, stats *GraphStats, readiness *model.ReadinessIndex, candidateIDs map[string]bool) LabelAnalysisResult {
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
+	scopedIssues := filterIssuesByCandidates(issues, candidateIDs)
+	labels := extractLabelsWithReadiness(scopedIssues, readiness)
 	result := LabelAnalysisResult{
 		GeneratedAt:     now,
 		TotalLabels:     0,
@@ -1078,8 +1126,9 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 		fullStats = &s
 	}
 
-	// Single-pass O(N) label & ID index + single-pass O(N + E) outgoing flow accumulation,
-	// avoiding O(L * N * E) GetLabelsForIssue linear scans and O(L * N) PageRank map clones.
+	// Single-pass O(N) label & ID index across all context issues + single-pass O(N + E)
+	// outgoing flow accumulation, while restricting per-label issue membership (labeledByLabel)
+	// to scoped candidate issues when candidateIDs is non-nil.
 	firstLabelsByID := make(map[string][]string, len(issues))
 	firstStatusByID := make(map[string]model.Status, len(issues))
 	labelSetByID := make(map[string]map[string]struct{}, len(issues))
@@ -1099,12 +1148,16 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 			idSet = make(map[string]struct{}, len(iss.Labels))
 			labelSetByID[iss.ID] = idSet
 		}
+		inScope := candidateIDs == nil || candidateIDs[iss.ID]
 		clear(seenOnEntry)
 		for _, l := range iss.Labels {
 			if l == "" {
 				continue
 			}
 			idSet[l] = struct{}{}
+			if !inScope {
+				continue
+			}
 			if _, dup := seenOnEntry[l]; dup {
 				continue
 			}
@@ -1127,6 +1180,9 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 		otherSet := labelSetByID[other.ID]
 		for _, dep := range other.Dependencies {
 			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			if candidateIDs != nil && !candidateIDs[dep.DependsOnID] {
 				continue
 			}
 			blockerStatus, exists := firstStatusByID[dep.DependsOnID]
@@ -1165,8 +1221,6 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 	if minIssues < 1 {
 		minIssues = 1
 	}
-
-	readiness := model.NewReadinessIndex(issues)
 
 	result.Labels = make([]LabelHealth, 0, len(labels.Labels))
 	result.Summaries = make([]LabelSummary, 0, len(labels.Labels))
@@ -1309,7 +1363,7 @@ func ComputeLabelHealthScores(issues []model.Issue, cfg LabelHealthConfig, now t
 			}
 		}
 
-		hasUpdated := !isClosed && !iss.UpdatedAt.IsZero()
+		hasUpdated := !iss.IsParkedForStalenessAt(now) && !iss.UpdatedAt.IsZero()
 		var stalenessDays float64
 		if hasUpdated {
 			stalenessDays = now.Sub(iss.UpdatedAt).Hours() / 24.0
@@ -1567,6 +1621,10 @@ type LabelExtractionResult struct {
 // ExtractLabels extracts unique labels from a slice of issues with statistics
 // Handles edge cases: nil issues, empty labels, duplicate labels
 func ExtractLabels(issues []model.Issue) LabelExtractionResult {
+	return extractLabelsWithReadiness(issues, nil)
+}
+
+func extractLabelsWithReadiness(issues []model.Issue, readiness *model.ReadinessIndex) LabelExtractionResult {
 	result := LabelExtractionResult{
 		Stats:     make(map[string]*LabelStats),
 		Labels:    []string{},
@@ -1579,7 +1637,9 @@ func ExtractLabels(issues []model.Issue) LabelExtractionResult {
 
 	result.IssueCount = len(issues)
 	labelSet := make(map[string]bool)
-	readiness := model.NewReadinessIndex(issues)
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
 	seenOnIssue := make(map[string]struct{}, 8)
 
 	for i := range issues {
@@ -1810,6 +1870,12 @@ func ComputeBlockageCascade(issues []model.Issue, flow CrossLabelFlow, cfg Label
 // reference timestamp, counting both explicit status="blocked" issues and open/in-progress issues
 // blocked by unsatisfied dependencies in model.ReadinessIndex.
 func ComputeBlockageCascadeAt(issues []model.Issue, flow CrossLabelFlow, cfg LabelHealthConfig, now time.Time) BlockageCascadeAnalysis {
+	return ComputeBlockageCascadeAtWithScope(issues, flow, cfg, now, nil, nil)
+}
+
+// ComputeBlockageCascadeAtWithScope computes the transitive downstream blockage cascade using an
+// optional prebuilt ReadinessIndex and optional candidateIDs scope filter.
+func ComputeBlockageCascadeAtWithScope(issues []model.Issue, flow CrossLabelFlow, cfg LabelHealthConfig, now time.Time, readiness *model.ReadinessIndex, candidateIDs map[string]bool) BlockageCascadeAnalysis {
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -1830,7 +1896,9 @@ func ComputeBlockageCascadeAt(issues []model.Issue, flow CrossLabelFlow, cfg Lab
 		labelIndex[label] = i
 	}
 
-	readiness := model.NewReadinessIndex(issues)
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
 
 	// Build issue map and count blocked per label using the canonical partition predicate.
 	issueMap := make(map[string]model.Issue, len(issues))
@@ -1838,6 +1906,9 @@ func ComputeBlockageCascadeAt(issues []model.Issue, flow CrossLabelFlow, cfg Lab
 	blockedIssueIDs := make(map[string]bool)
 	for _, iss := range issues {
 		issueMap[iss.ID] = iss
+		if candidateIDs != nil && !candidateIDs[iss.ID] {
+			continue
+		}
 		if isClosedLikeStatus(iss.Status) || readiness.Ready(iss.ID, now) {
 			continue
 		}
@@ -2732,26 +2803,34 @@ type LabelAttentionResult struct {
 // - block_impact: Number of issues blocked by this label
 // - velocity: Recent closures (higher = healthier, less attention needed)
 func ComputeLabelAttentionScores(issues []model.Issue, cfg LabelHealthConfig, now time.Time) LabelAttentionResult {
+	return ComputeLabelAttentionScoresWithScope(issues, cfg, now, nil, nil)
+}
+
+// ComputeLabelAttentionScoresWithScope calculates attention needed for all labels while
+// reusing an optional ReadinessIndex and scoping label membership and block impact to
+// candidateIDs when non-nil.
+func ComputeLabelAttentionScoresWithScope(issues []model.Issue, cfg LabelHealthConfig, now time.Time, readiness *model.ReadinessIndex, candidateIDs map[string]bool) LabelAttentionResult {
 	result := LabelAttentionResult{
 		GeneratedAt: now,
 		Labels:      []LabelAttentionScore{},
 	}
 
-	labels := ExtractLabels(issues)
+	scopedIssues := filterIssuesByCandidates(issues, candidateIDs)
+	labels := extractLabelsWithReadiness(scopedIssues, readiness)
 	if labels.LabelCount == 0 {
 		return result
 	}
 
-	// Build issue map for lookups
+	// Build issue map for lookups across all context issues
 	issueMap := make(map[string]model.Issue, len(issues))
 	for _, iss := range issues {
 		issueMap[iss.ID] = iss
 	}
 
-	// Compute attention for each label
+	// Compute attention for each candidate label while preserving downstream block impact across all context issues
 	var scores []LabelAttentionScore
 	for _, label := range labels.Labels {
-		score := computeLabelAttention(label, issues, issueMap, cfg, now)
+		score := computeLabelAttention(label, scopedIssues, issues, issueMap, cfg, now, candidateIDs)
 		scores = append(scores, score)
 	}
 
@@ -2824,14 +2903,14 @@ func ComputeLabelAttentionScores(issues []model.Issue, cfg LabelHealthConfig, no
 }
 
 // computeLabelAttention calculates attention score for a single label
-func computeLabelAttention(label string, issues []model.Issue, issueMap map[string]model.Issue, cfg LabelHealthConfig, now time.Time) LabelAttentionScore {
+func computeLabelAttention(label string, scopedIssues []model.Issue, allIssues []model.Issue, issueMap map[string]model.Issue, cfg LabelHealthConfig, now time.Time, candidateIDs map[string]bool) LabelAttentionScore {
 	score := LabelAttentionScore{
 		Label: label,
 	}
 
 	// Get issues with this label
 	var labeledIssues []model.Issue
-	for _, iss := range issues {
+	for _, iss := range scopedIssues {
 		if HasLabel(iss, label) {
 			labeledIssues = append(labeledIssues, iss)
 		}
@@ -2849,10 +2928,13 @@ func computeLabelAttention(label string, issues []model.Issue, issueMap map[stri
 	}
 
 	// Compute PageRank sum for open issues in this label in deterministic order
-	sg := ComputeLabelSubgraph(issues, label)
+	sg := ComputeLabelSubgraph(allIssues, label)
 	if !sg.IsEmpty() {
 		pr := ComputeLabelPageRank(sg)
 		for _, id := range sg.CoreIssues {
+			if candidateIDs != nil && !candidateIDs[id] {
+				continue
+			}
 			if iss, exists := issueMap[id]; exists && !isClosedLikeStatus(iss.Status) {
 				score.PageRankSum += pr.CoreOnly[id]
 			}
@@ -2868,14 +2950,14 @@ func computeLabelAttention(label string, issues []model.Issue, issueMap map[stri
 		score.StalenessFactor = 0.0
 	}
 
-	// Compute block impact (how many active issues are blocked by open issues in this label)
+	// Compute block impact (how many active issues across context are blocked by open issues in this label)
 	blockImpact := 0
 	for _, iss := range labeledIssues {
 		if isClosedLikeStatus(iss.Status) {
 			continue
 		}
 		// Count how many active issues depend on this one
-		for _, other := range issues {
+		for _, other := range allIssues {
 			if other.ID == iss.ID || isClosedLikeStatus(other.Status) {
 				continue
 			}
@@ -2997,7 +3079,7 @@ func ComputeLabelAttentionScoresFast(issues []model.Issue, cfg LabelHealthConfig
 		}
 		isClosed := isClosedLikeStatus(iss.Status)
 		isStaleOpen := false
-		if !isClosed && !iss.UpdatedAt.IsZero() {
+		if !iss.IsParkedForStalenessAt(now) && !iss.UpdatedAt.IsZero() {
 			days := now.Sub(iss.UpdatedAt).Hours() / 24.0
 			if days >= threshold {
 				isStaleOpen = true

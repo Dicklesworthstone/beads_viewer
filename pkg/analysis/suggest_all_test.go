@@ -1002,3 +1002,71 @@ func TestGenerateAllSuggestionsAt_BoundaryCycleExcludedFromMissingDependencies(t
 		}
 	}
 }
+
+func TestGenerateAllSuggestionsAt_FiltersCycleFormingSuggestionsWithoutCandidateFilter(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+
+	// A depends on MID, MID depends on B, while A is older than B.
+	// DetectMissingDependencies will propose B -> A (closing cycle A -> MID -> B -> A),
+	// which GenerateAllSuggestionsAt must discard via GetCycleFreeSuggestions even without CandidateIDs.
+	issues := []model.Issue{
+		{
+			ID:          "A",
+			Title:       "Implement distributed cache invalidation",
+			Description: "Build distributed cache invalidation coordinator",
+			Labels:      []string{"cache"},
+			Status:      model.StatusOpen,
+			CreatedAt:   now.Add(-3 * time.Hour),
+			Origin:      suggestionTestOrigin("A"),
+			Dependencies: []*model.Dependency{
+				{IssueID: "A", DependsOnID: "MID", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "MID",
+			Title:     "Unrelated transport layer",
+			Status:    model.StatusOpen,
+			CreatedAt: now.Add(-2 * time.Hour),
+			Origin:    suggestionTestOrigin("MID"),
+			Dependencies: []*model.Dependency{
+				{IssueID: "MID", DependsOnID: "B", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:          "B",
+			Title:       "Add distributed cache invalidation tests",
+			Description: "Verify distributed cache invalidation coordinator",
+			Labels:      []string{"cache"},
+			Status:      model.StatusOpen,
+			CreatedAt:   now.Add(-1 * time.Hour),
+			Origin:      suggestionTestOrigin("B"),
+		},
+		{
+			ID:          "C",
+			Title:       "Document distributed cache invalidation rollout",
+			Description: "Runbook for distributed cache invalidation coordinator",
+			Labels:      []string{"cache"},
+			Status:      model.StatusOpen,
+			CreatedAt:   now,
+			Origin:      suggestionTestOrigin("C"),
+		},
+	}
+
+	cfg := DefaultSuggestAllConfig()
+	cfg.EnableDuplicates = false
+	cfg.EnableLabels = false
+	cfg.EnableCycles = false
+	cfg.Dependencies.MinKeywordOverlap = 2
+	cfg.Dependencies.MinConfidence = 0.1
+	cfg.Dependencies.MaxSuggestions = 1
+
+	set := GenerateAllSuggestionsAt(issues, cfg, "cycle-free-hash", now)
+	for _, sug := range set.Suggestions {
+		if sug.Type == SuggestionMissingDependency && sug.TargetBead == "B" && sug.RelatedBead == "A" {
+			t.Fatalf("cycle-forming suggestion B -> A was not filtered out: %+v", sug)
+		}
+	}
+	if len(set.Suggestions) != 1 {
+		t.Fatalf("expected valid cycle-free suggestion (e.g. C -> A or C -> B) to fill MaxSuggestions=1 slot, got %+v", set.Suggestions)
+	}
+}

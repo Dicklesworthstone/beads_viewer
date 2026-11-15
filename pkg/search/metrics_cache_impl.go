@@ -2,7 +2,10 @@ package search
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -35,9 +38,10 @@ func NewMetricsCache(loader MetricsLoader) MetricsCache {
 
 // AnalyzerMetricsLoader loads metrics from the analysis engine.
 type AnalyzerMetricsLoader struct {
-	issues []model.Issue
-	cache  *analysis.Cache
-	config *analysis.AnalysisConfig
+	issues    []model.Issue
+	readiness *model.ReadinessIndex
+	cache     *analysis.Cache
+	config    *analysis.AnalysisConfig
 
 	// issues is a private deep clone and never changes after construction.
 	// Hash it once, including for a zero-value/empty loader. Mutable loader
@@ -48,7 +52,17 @@ type AnalyzerMetricsLoader struct {
 
 // NewAnalyzerMetricsLoader creates a loader that derives metrics from issues.
 func NewAnalyzerMetricsLoader(issues []model.Issue) *AnalyzerMetricsLoader {
-	return &AnalyzerMetricsLoader{issues: cloneMetricsLoaderIssues(issues)}
+	return NewAnalyzerMetricsLoaderWithReadiness(issues, nil)
+}
+
+// NewAnalyzerMetricsLoaderWithReadiness creates a loader that derives metrics
+// from issues while reusing a prebuilt ReadinessIndex (preserving TombstoneIDs
+// and external cross-scope blockers rather than rebuilding from l.issues alone).
+func NewAnalyzerMetricsLoaderWithReadiness(issues []model.Issue, readiness *model.ReadinessIndex) *AnalyzerMetricsLoader {
+	return &AnalyzerMetricsLoader{
+		issues:    cloneMetricsLoaderIssues(issues),
+		readiness: readiness,
+	}
 }
 
 // WithCache configures a custom analysis cache for this loader.
@@ -80,7 +94,25 @@ func (l *AnalyzerMetricsLoader) ComputeDataHash() (string, error) {
 
 func (l *AnalyzerMetricsLoader) snapshotHash() string {
 	l.hashOnce.Do(func() {
-		l.dataHash = analysis.ComputeDataHash(l.issues)
+		baseHash := analysis.ComputeDataHash(l.issues)
+		if l.readiness == nil || len(l.issues) == 0 {
+			l.dataHash = baseHash
+			return
+		}
+		ids := make([]string, len(l.issues))
+		for i := range l.issues {
+			ids[i] = l.issues[i].ID
+		}
+		sort.Strings(ids)
+		h := sha256.New()
+		h.Write([]byte(baseHash))
+		for _, id := range ids {
+			h.Write([]byte{0})
+			h.Write([]byte(id))
+			h.Write([]byte{':'})
+			h.Write([]byte(string(l.readiness.DependencyState(id))))
+		}
+		l.dataHash = "v" + hex.EncodeToString(h.Sum(nil)[:8])
 	})
 	return l.dataHash
 }
@@ -126,7 +158,10 @@ func (l *AnalyzerMetricsLoader) computeMetricsAndHash(includeHash bool) (map[str
 		normDenom = maxAnyPR
 	}
 
-	readiness := model.NewReadinessIndex(l.issues)
+	readiness := l.readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(l.issues)
+	}
 	metrics := make(map[string]IssueMetrics, len(l.issues))
 	for _, issue := range l.issues {
 		pr := defaultPageRank
@@ -144,8 +179,9 @@ func (l *AnalyzerMetricsLoader) computeMetricsAndHash(includeHash bool) (map[str
 				pr = 0
 			}
 		}
+		normStatus := issue.Status.Normalize()
 		effectiveStatus := issue.Status
-		if (effectiveStatus == model.StatusOpen || effectiveStatus == model.StatusInProgress) &&
+		if (normStatus == model.StatusOpen || normStatus == model.StatusInProgress) &&
 			readiness.DependencyState(issue.ID) != model.DependenciesSatisfied {
 			effectiveStatus = model.StatusBlocked
 		}

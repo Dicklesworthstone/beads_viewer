@@ -302,6 +302,8 @@ func compareIssues(a, b model.Issue, field string, metrics Metrics) int {
 		return 0
 	case SortFieldStatus:
 		return strings.Compare(string(a.Status), string(b.Status))
+	case SortFieldAssignee:
+		return strings.Compare(strings.ToLower(strings.TrimSpace(a.Assignee)), strings.ToLower(strings.TrimSpace(b.Assignee)))
 	case SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage:
 		return compareFloats(metrics.score(field, a.ID), metrics.score(field, b.ID))
 	}

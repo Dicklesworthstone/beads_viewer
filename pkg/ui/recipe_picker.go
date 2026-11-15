@@ -91,38 +91,108 @@ func (m *RecipePickerModel) View() string {
 	lines = append(lines, titleStyle.Render("Select Recipe"))
 	lines = append(lines, "")
 
-	// Recipe list
-	for i, r := range m.recipes {
-		isSelected := i == m.selectedIndex
-
-		// Name line
-		nameStyle := t.Renderer.NewStyle()
-		if isSelected {
-			nameStyle = nameStyle.Foreground(t.Primary).Bold(true)
-		} else {
-			nameStyle = nameStyle.Foreground(t.Base.GetForeground())
+	// Recipe list windowed around selectedIndex so 24-38 row terminals never clip unreachable items
+	if len(m.recipes) > 0 {
+		selIdx := m.selectedIndex
+		if selIdx < 0 {
+			selIdx = 0
+		} else if selIdx >= len(m.recipes) {
+			selIdx = len(m.recipes) - 1
 		}
 
-		prefix := "  "
-		if isSelected {
-			prefix = "▸ "
+		availLines := m.height - 10
+		if availLines < 5 {
+			availLines = 5
 		}
 
-		name := prefix + r.Name
-		lines = append(lines, nameStyle.Render(name))
+		compact := len(m.recipes)*3 > availLines
+		renderedItems := make([][]string, len(m.recipes))
+		for i, r := range m.recipes {
+			isSelected := i == selIdx
+			nameStyle := t.Renderer.NewStyle()
+			if isSelected {
+				nameStyle = nameStyle.Foreground(t.Primary).Bold(true)
+			} else {
+				nameStyle = nameStyle.Foreground(t.Base.GetForeground())
+			}
 
-		// Description (indented, dimmed)
-		if r.Description != "" {
-			descStyle := t.Renderer.NewStyle().
-				Foreground(t.Secondary).
-				Italic(true)
-			desc := "    " + truncateRunesHelper(r.Description, boxWidth-8, "…")
-			lines = append(lines, descStyle.Render(desc))
+			prefix := "  "
+			if isSelected {
+				prefix = "▸ "
+			}
+
+			name := truncateRunesHelper(prefix+r.Name, boxWidth-4, "…")
+			itemLines := []string{nameStyle.Render(name)}
+			if r.Description != "" && (!compact || isSelected || availLines >= 8) {
+				descStyle := t.Renderer.NewStyle().
+					Foreground(t.Secondary).
+					Italic(true)
+				desc := "    " + truncateRunesHelper(r.Description, boxWidth-8, "…")
+				itemLines = append(itemLines, descStyle.Render(desc))
+			}
+			renderedItems[i] = itemLines
 		}
 
-		// Add blank line between recipes
-		if i < len(m.recipes)-1 {
-			lines = append(lines, "")
+		spacerStep := 1
+		if compact {
+			spacerStep = 0
+		}
+
+		startIdx := 0
+		for startIdx < selIdx {
+			used := 0
+			if startIdx > 0 {
+				used++
+			}
+			if selIdx < len(m.recipes)-1 {
+				used++
+			}
+			for i := startIdx; i <= selIdx; i++ {
+				if i > startIdx {
+					used += spacerStep
+				}
+				used += len(renderedItems[i])
+			}
+			if used <= availLines {
+				break
+			}
+			startIdx++
+		}
+
+		endIdx := selIdx
+		for endIdx+1 < len(m.recipes) {
+			candEnd := endIdx + 1
+			used := 0
+			if startIdx > 0 {
+				used++
+			}
+			if candEnd < len(m.recipes)-1 {
+				used++
+			}
+			for i := startIdx; i <= candEnd; i++ {
+				if i > startIdx {
+					used += spacerStep
+				}
+				used += len(renderedItems[i])
+			}
+			if used > availLines {
+				break
+			}
+			endIdx = candEnd
+		}
+
+		moreStyle := t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true)
+		if startIdx > 0 {
+			lines = append(lines, moreStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)))
+		}
+		for i := startIdx; i <= endIdx; i++ {
+			lines = append(lines, renderedItems[i]...)
+			if spacerStep > 0 && i < endIdx {
+				lines = append(lines, "")
+			}
+		}
+		if rem := len(m.recipes) - 1 - endIdx; rem > 0 {
+			lines = append(lines, moreStyle.Render(fmt.Sprintf("  ↓ %d more", rem)))
 		}
 	}
 

@@ -24,9 +24,54 @@ func NewLabelDashboardModel(theme Theme) LabelDashboardModel {
 	return LabelDashboardModel{theme: theme}
 }
 
+func (m *LabelDashboardModel) clampCursorAndScroll() {
+	if len(m.labels) == 0 {
+		m.cursor = 0
+		m.scrollOffset = 0
+		return
+	}
+	if m.cursor >= len(m.labels) {
+		m.cursor = len(m.labels) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+
+	if m.height <= 0 {
+		if m.scrollOffset > m.cursor {
+			m.scrollOffset = m.cursor
+		}
+		if m.scrollOffset < 0 {
+			m.scrollOffset = 0
+		}
+		return
+	}
+
+	visibleRows := m.height - 1
+	if visibleRows < 1 {
+		visibleRows = 1
+	}
+	maxScroll := len(m.labels) - visibleRows
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.scrollOffset > maxScroll {
+		m.scrollOffset = maxScroll
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
+	if m.cursor < m.scrollOffset {
+		m.scrollOffset = m.cursor
+	} else if m.cursor >= m.scrollOffset+visibleRows {
+		m.scrollOffset = m.cursor - visibleRows + 1
+	}
+}
+
 func (m *LabelDashboardModel) SetSize(width, height int) {
 	m.width = width
 	m.height = height
+	m.clampCursorAndScroll()
 }
 
 func (m *LabelDashboardModel) SetData(labels []analysis.LabelHealth) {
@@ -56,12 +101,7 @@ func (m *LabelDashboardModel) SetData(labels []analysis.LabelHealth) {
 		}
 		return li.Label < lj.Label
 	})
-	if m.cursor >= len(labels) {
-		m.cursor = len(labels) - 1
-		if m.cursor < 0 {
-			m.cursor = 0
-		}
-	}
+	m.clampCursorAndScroll()
 }
 
 // Update handles navigation keys; returns selected label on enter
@@ -129,6 +169,14 @@ func (m LabelDashboardModel) View() string {
 	}
 
 	start := m.scrollOffset
+	if maxScroll := len(m.labels) - visibleRows; maxScroll >= 0 && start > maxScroll {
+		start = maxScroll
+	} else if maxScroll < 0 {
+		start = 0
+	}
+	if start < 0 {
+		start = 0
+	}
 	end := start + visibleRows
 	if end > len(m.labels) {
 		end = len(m.labels)

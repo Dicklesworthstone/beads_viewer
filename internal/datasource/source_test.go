@@ -2,9 +2,12 @@ package datasource
 
 import (
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 func TestValidationCacheDoesNotStoreVerdictForChangedInput(t *testing.T) {
@@ -1395,5 +1399,226 @@ func createEmptySQLiteDB(t *testing.T, path string) {
 	`)
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDetectInconsistencies_DeterministicTruncationAndCompareFields(t *testing.T) {
+	var issuesA, issuesB []model.Issue
+	for i := 25; i >= 1; i-- {
+		id := fmt.Sprintf("bv-%02d", i)
+		issuesA = append(issuesA, model.Issue{
+			ID:       id,
+			Title:    fmt.Sprintf("Title A %02d", i),
+			Status:   model.StatusOpen,
+			Priority: 1,
+		})
+		if i%5 == 0 {
+			continue // missing in B
+		}
+		issuesB = append(issuesB, model.Issue{
+			ID:       id,
+			Title:    fmt.Sprintf("Title B %02d", i),
+			Status:   model.StatusClosed,
+			Priority: 3,
+		})
+	}
+	issuesB = append(issuesB, model.Issue{
+		ID:       "bv-00",
+		Title:    "Only in B",
+		Status:   model.StatusOpen,
+		Priority: 2,
+	})
+
+	opts := DiffOptions{
+		MaxDifferences: 6,
+		CompareFields:  []string{" STATUS ", "Priority", "TITLE", "status"},
+	}
+
+	baseline := DetectInconsistencies(issuesA, issuesB, "beads.db", "issues.jsonl", opts)
+	if len(baseline.IssueDiffs) != 6 {
+		t.Fatalf("len(IssueDiffs) = %d, want 6: %+v", len(baseline.IssueDiffs), baseline.IssueDiffs)
+	}
+	// Sorted IDs start at bv-00 (missing in beads.db), bv-01 (status, priority, title), bv-02 (status, priority).
+	wantOrder := []struct {
+		id    string
+		field string
+	}{
+		{"bv-00", "presence"},
+		{"bv-01", "status"},
+		{"bv-01", "priority"},
+		{"bv-01", "title"},
+		{"bv-02", "status"},
+		{"bv-02", "priority"},
+	}
+	for idx, want := range wantOrder {
+		got := baseline.IssueDiffs[idx]
+		if got.IssueID != want.id || got.Field != want.field {
+			t.Fatalf("IssueDiffs[%d] = (%s, %s), want (%s, %s)", idx, got.IssueID, got.Field, want.id, want.field)
+		}
+	}
+
+	for run := 0; run < 25; run++ {
+		again := DetectInconsistencies(issuesA, issuesB, "beads.db", "issues.jsonl", opts)
+		if !reflect.DeepEqual(again, baseline) {
+			t.Fatalf("run %d produced non-deterministic SourceDiff:\ngot:  %+v\nwant: %+v", run, again, baseline)
+		}
+	}
+}
+
+func TestCheckAllSourcesConsistent_DetectsPriorityAndTitleDriftBetweenSQLiteAndJSONL(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dbPath := filepath.Join(beadsDir, "beads.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT,
+			status TEXT NOT NULL,
+			priority INTEGER DEFAULT 2,
+			issue_type TEXT DEFAULT 'task',
+			tombstone INTEGER DEFAULT 0
+		);
+		INSERT INTO issues (id, title, status, priority, issue_type) VALUES
+			('BV-1', 'Updated SQLite Title', 'open', 0, 'task'),
+			('BV-2', 'Only in SQLite', 'open', 2, 'task');
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	jsonlContent := strings.Join([]string{
+		`{"id":"BV-1","title":"Stale JSONL Title","status":"open","priority":2,"issue_type":"task"}`,
+		`{"id":"BV-3","title":"Only in JSONL","status":"closed","priority":1,"issue_type":"task"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(jsonlPath, []byte(jsonlContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sources, err := DiscoverSources(DiscoveryOptions{
+		BeadsDir:               beadsDir,
+		ValidateAfterDiscovery: true,
+	})
+	if err != nil {
+		t.Fatalf("DiscoverSources: %v", err)
+	}
+
+	diffs, err := CheckSourcesConsistent(sources)
+	if err != nil {
+		t.Fatalf("CheckSourcesConsistent: %v", err)
+	}
+	if len(diffs) != 1 {
+		t.Fatalf("expected 1 pair SourceDiff, got %d: %+v", len(diffs), diffs)
+	}
+	got := diffs[0]
+	if len(got.IssueDiffs) != 4 {
+		t.Fatalf("expected 4 IssueDiffs (BV-1 priority + title, BV-2 missing, BV-3 missing), got %+v", got.IssueDiffs)
+	}
+	if _, ok := got.MissingIssues["BV-2"]; !ok {
+		t.Fatalf("expected BV-2 in MissingIssues, got %+v", got.MissingIssues)
+	}
+	if _, ok := got.MissingIssues["BV-3"]; !ok {
+		t.Fatalf("expected BV-3 in MissingIssues, got %+v", got.MissingIssues)
+	}
+}
+
+func TestDetectInconsistencies_PopulatesMissingIssuesClonedAndOmitsInJSON(t *testing.T) {
+	issuesA := []model.Issue{
+		{ID: "ONLY-A", Title: "Only A", Status: model.StatusOpen, Labels: []string{"backend"}},
+	}
+	issuesB := []model.Issue{
+		{ID: "ONLY-B", Title: "Only B", Status: model.StatusInProgress, Labels: []string{"frontend"}},
+	}
+
+	diff := DetectInconsistencies(issuesA, issuesB, ".beads/beads.db", ".beads/issues.jsonl", DefaultDiffOptions())
+	if len(diff.MissingIssues) != 2 {
+		t.Fatalf("expected 2 entries in MissingIssues, got %d: %+v", len(diff.MissingIssues), diff.MissingIssues)
+	}
+
+	// Mutating original slices must not mutate cloned MissingIssues.
+	issuesA[0].Labels[0] = "mutated-a"
+	issuesB[0].Labels[0] = "mutated-b"
+
+	if got := diff.MissingIssues["ONLY-A"].Labels; len(got) != 1 || got[0] != "backend" {
+		t.Fatalf("MissingIssues[ONLY-A] was not cloned cleanly: %+v", diff.MissingIssues["ONLY-A"])
+	}
+	if got := diff.MissingIssues["ONLY-B"].Labels; len(got) != 1 || got[0] != "frontend" {
+		t.Fatalf("MissingIssues[ONLY-B] was not cloned cleanly: %+v", diff.MissingIssues["ONLY-B"])
+	}
+
+	rawJSON, err := json.Marshal(diff)
+	if err != nil {
+		t.Fatalf("json.Marshal(SourceDiff): %v", err)
+	}
+	if strings.Contains(string(rawJSON), "MissingIssues") {
+		t.Fatalf("MissingIssues must be json:\"-\", got %s", string(rawJSON))
+	}
+}
+
+func TestDiscoverSources_SkipsLeftoverSQLiteInBDWorkspace(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"database":"dolt","backend":"dolt"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !loader.IsBDWorkspace(beadsDir) {
+		t.Fatal("expected test fixture to be recognized by loader.IsBDWorkspace")
+	}
+
+	// Plant a leftover pre-migration SQLite beads.db with conflicting rows.
+	dbPath := filepath.Join(beadsDir, "beads.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT,
+			status TEXT NOT NULL,
+			priority INTEGER DEFAULT 2,
+			issue_type TEXT DEFAULT 'task',
+			tombstone INTEGER DEFAULT 0
+		);
+		INSERT INTO issues (id, title, status, priority, issue_type) VALUES
+			('BD-OLD', 'Stale pre-Dolt SQLite row', 'open', 1, 'task');
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(`{"id":"BD-LIVE","title":"Live Dolt export","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sources, err := DiscoverSources(DiscoveryOptions{
+		BeadsDir:               beadsDir,
+		ValidateAfterDiscovery: true,
+	})
+	if err != nil {
+		t.Fatalf("DiscoverSources: %v", err)
+	}
+	if len(sources) != 1 || sources[0].Type != SourceTypeJSONLLocal || sources[0].Path != jsonlPath {
+		t.Fatalf("expected only JSONL export source in bd workspace (leftover beads.db skipped), got %+v", sources)
+	}
+
+	diffs, err := CheckSourcesConsistent(sources)
+	if err != nil {
+		t.Fatalf("CheckSourcesConsistent: %v", err)
+	}
+	if len(diffs) != 0 {
+		t.Fatalf("expected 0 false-positive source diffs in bd workspace, got %+v", diffs)
 	}
 }

@@ -229,12 +229,13 @@ type DataSnapshot struct {
 	graphLayout *GraphLayout
 
 	// Metadata
-	CreatedAt     time.Time      // When this snapshot was built
-	DataHash      string         // Hash of source data for cache validation
-	AuthorityHash string         // Full source identity, including hidden dependency records.
-	RecipeName    string         // Active recipe name for this snapshot (bv-2h40)
-	RecipeHash    string         // Fingerprint of active recipe for this snapshot (bv-4ilb)
-	recipe        *recipe.Recipe // Retained to re-sort ViewIssues/ListItems when Phase 2 completes
+	CreatedAt         time.Time      // When this snapshot was built
+	DataHash          string         // Hash of source data for cache validation
+	AuthorityHash     string         // Full source identity, including hidden dependency records.
+	AuthorityComplete bool           // True when source authority is complete and warning-free.
+	RecipeName        string         // Active recipe name for this snapshot (bv-2h40)
+	RecipeHash        string         // Fingerprint of active recipe for this snapshot (bv-4ilb)
+	recipe            *recipe.Recipe // Retained to re-sort ViewIssues/ListItems when Phase 2 completes
 	// DatasetTier is a tiered performance mode for large datasets (bv-9thm).
 	// When unknown, normal behavior applies.
 	DatasetTier datasetTier
@@ -748,42 +749,43 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsForDir(issues, graphStats, b.analyzer, projectDir)
 
 	snapshot := &DataSnapshot{
-		LoadError:      recipeErr,
-		Issues:         issues,
-		IssueMap:       issueMap,
-		ViewIssues:     viewIssues,
-		Analyzer:       b.analyzer,
-		Analysis:       graphStats,
-		insights:       insights,
-		CountOpen:      cOpen,
-		CountReady:     cReady,
-		CountBlocked:   cBlocked,
-		CountClosed:    cClosed,
-		ListItems:      listItems,
-		listModelItems: listModelItems,
-		listIndexByID:  listIndexByID,
-		listOrderHash:  listOrderFingerprint(listItems),
-		semanticIDs:    semanticIDs,
-		semanticDocs:   semanticDocs,
-		alerts:         alerts,
-		alertsCritical: alertsCritical,
-		alertsWarning:  alertsWarning,
-		alertsInfo:     alertsInfo,
-		TriageScores:   triageScores,
-		TriageReasons:  triageReasons,
-		QuickWinSet:    quickWinSet,
-		BlockerSet:     blockerSet,
-		UnblocksMap:    unblocksMap,
-		TreeRoots:      treeRoots,
-		TreeNodeMap:    treeNodeMap,
-		BoardState:     boardState,
-		graphLayout:    graphLayout,
-		CreatedAt:      createdAt,
-		RecipeName:     recipeName(b.recipe),
-		RecipeHash:     recipeFingerprint(b.recipe),
-		recipe:         b.recipe,
-		phase2Ready:    graphStats.IsPhase2Ready(),
-		IssueDiff:      b.diff,
+		LoadError:         recipeErr,
+		Issues:            issues,
+		IssueMap:          issueMap,
+		ViewIssues:        viewIssues,
+		Analyzer:          b.analyzer,
+		Analysis:          graphStats,
+		insights:          insights,
+		CountOpen:         cOpen,
+		CountReady:        cReady,
+		CountBlocked:      cBlocked,
+		CountClosed:       cClosed,
+		ListItems:         listItems,
+		listModelItems:    listModelItems,
+		listIndexByID:     listIndexByID,
+		listOrderHash:     listOrderFingerprint(listItems),
+		semanticIDs:       semanticIDs,
+		semanticDocs:      semanticDocs,
+		alerts:            alerts,
+		alertsCritical:    alertsCritical,
+		alertsWarning:     alertsWarning,
+		alertsInfo:        alertsInfo,
+		TriageScores:      triageScores,
+		TriageReasons:     triageReasons,
+		QuickWinSet:       quickWinSet,
+		BlockerSet:        blockerSet,
+		UnblocksMap:       unblocksMap,
+		TreeRoots:         treeRoots,
+		TreeNodeMap:       treeNodeMap,
+		BoardState:        boardState,
+		graphLayout:       graphLayout,
+		CreatedAt:         createdAt,
+		AuthorityComplete: true,
+		RecipeName:        recipeName(b.recipe),
+		RecipeHash:        recipeFingerprint(b.recipe),
+		recipe:            b.recipe,
+		phase2Ready:       graphStats.IsPhase2Ready(),
+		IssueDiff:         b.diff,
 		IssueDiffStats: IssueDiffStats{
 			Changed: b.diffStats.Changed,
 			Total:   b.diffStats.Total,
@@ -1154,9 +1156,10 @@ func deepCopyTree(roots []*IssueTreeNode, nodeMap map[string]*IssueTreeNode, iss
 			}
 		}
 		newNode := &IssueTreeNode{
-			Issue:    issue,
-			Expanded: oldNode.Expanded,
-			Depth:    oldNode.Depth,
+			Issue:     issue,
+			Expanded:  oldNode.Expanded,
+			Depth:     oldNode.Depth,
+			SharedRef: oldNode.SharedRef,
 			// Children and Parent set in second pass
 		}
 		oldToNew[oldNode] = newNode
@@ -1486,6 +1489,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		CreatedAt:            s.CreatedAt,
 		DataHash:             s.DataHash,
 		AuthorityHash:        s.AuthorityHash,
+		AuthorityComplete:    s.AuthorityComplete,
 		RecipeName:           s.RecipeName,
 		RecipeHash:           s.RecipeHash,
 		recipe:               s.recipe,

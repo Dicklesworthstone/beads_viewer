@@ -2,6 +2,7 @@ package correlation
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -547,5 +548,282 @@ func TestReverseLookup_WithSubtreeScopeIgnoresTrackerPathsOnCodeCommitsAndNormal
 	}
 	if len(webOrphans) != 2 || webStats.TotalCommits != 2 || webStats.OrphanCommits != 2 {
 		t.Fatalf("web includeSubtrees expected 2 orphan commits, got orphans=%+v stats=%+v", webOrphans, webStats)
+	}
+}
+
+func TestReverseLookup_LookupByCommitMergeAndBeadsOnly(t *testing.T) {
+	repo := t.TempDir()
+	revParse := func() string {
+		t.Helper()
+		cmd := exec.Command("git", "rev-parse", "HEAD")
+		cmd.Dir = repo
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git rev-parse HEAD: %v\n%s", err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit(t, repo, "init", "-b", "main")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test User")
+	if err := os.MkdirAll(filepath.Join(repo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"), []byte(`{"id":"bv-1","title":"Auth login","status":"in_progress"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".beads/issues.jsonl")
+	runGit(t, repo, "commit", "-m", "chore: seed beads only")
+	beadsOnlySHA := revParse()
+
+	// Create a feature branch and merge with --no-ff to produce a real merge commit
+	runGit(t, repo, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repo, "auth.go"), []byte("package main\nfunc Login() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "auth.go")
+	runGit(t, repo, "commit", "-m", "fix auth login session")
+	orphanCodeSHA := revParse()
+
+	runGit(t, repo, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# Readme\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "README.md")
+	runGit(t, repo, "commit", "-m", "docs: readme")
+	runGit(t, repo, "merge", "--no-ff", "feature", "-m", "Merge branch 'feature'")
+	mergeSHA := revParse()
+
+	now := time.Now().UTC()
+	report := &HistoryReport{
+		CommitIndex: make(CommitIndex),
+		Histories: map[string]BeadHistory{
+			"bv-1": {
+				BeadID:     "bv-1",
+				Title:      "Auth login",
+				Status:     "in_progress",
+				LastAuthor: "Test User",
+				Milestones: BeadMilestones{
+					Created: &BeadEvent{Timestamp: now.Add(-2 * time.Hour)},
+					Claimed: &BeadEvent{Timestamp: now.Add(-1 * time.Hour)},
+				},
+				Commits: []CorrelatedCommit{
+					{
+						SHA:       "0000000000000000000000000000000000000001",
+						Author:    "Test User",
+						Timestamp: now.Add(-30 * time.Minute),
+						Files:     []FileChange{{Path: "auth.go"}},
+					},
+				},
+			},
+		},
+	}
+
+	rl := NewReverseLookupWithRepo(report, repo)
+
+	// 1. .beads/-only commit -> IsOrphan=false, BeadsOnly=true
+	boRes, err := rl.LookupByCommit(beadsOnlySHA)
+	if err != nil {
+		t.Fatalf("LookupByCommit(beadsOnlySHA): %v", err)
+	}
+	if boRes.IsOrphan || !boRes.BeadsOnly {
+		t.Fatalf("expected beads-only commit IsOrphan=false & BeadsOnly=true, got %+v", boRes)
+	}
+
+	// 2. Merge commit -> IsOrphan=false (excluded just like FindOrphanCommits --no-merges)
+	mergeRes, err := rl.LookupByCommit(mergeSHA)
+	if err != nil {
+		t.Fatalf("LookupByCommit(mergeSHA): %v", err)
+	}
+	if mergeRes.IsOrphan {
+		t.Fatalf("expected merge commit IsOrphan=false, got %+v", mergeRes)
+	}
+
+	// 3. Genuine unlinked code commit -> IsOrphan=true, and AnalyzeCommit rescues bv-1
+	orphanRes, err := rl.LookupByCommit(orphanCodeSHA)
+	if err != nil {
+		t.Fatalf("LookupByCommit(orphanCodeSHA): %v", err)
+	}
+	if !orphanRes.IsOrphan || orphanRes.BeadsOnly {
+		t.Fatalf("expected unlinked code commit IsOrphan=true & BeadsOnly=false, got %+v", orphanRes)
+	}
+	detector := NewOrphanDetectorAt(report, repo, now)
+	cand, beadsOnly, err := detector.AnalyzeCommit(orphanCodeSHA)
+	if err != nil {
+		t.Fatalf("AnalyzeCommit: %v", err)
+	}
+	if beadsOnly || cand == nil || len(cand.ProbableBeads) == 0 || cand.ProbableBeads[0].BeadID != "bv-1" {
+		t.Fatalf("expected AnalyzeCommit to rescue bv-1, got beadsOnly=%v cand=%+v", beadsOnly, cand)
+	}
+
+	// 4. Library-API git option injection must fail closed without touching filesystem
+	injectTarget := filepath.Join(t.TempDir(), "should-not-exist.txt")
+	injectArg := "--output=" + injectTarget
+	if _, err := rl.LookupByCommit(injectArg); err == nil {
+		t.Fatalf("LookupByCommit(%q) must reject leading-dash git option injection", injectArg)
+	}
+	if _, _, err := detector.AnalyzeCommit(injectArg); err == nil {
+		t.Fatalf("AnalyzeCommit(%q) must reject leading-dash git option injection", injectArg)
+	}
+	if _, err := walkCommitsBySHAs(nil, repo, []string{injectArg}); err == nil {
+		t.Fatalf("walkCommitsBySHAs(%q) must reject leading-dash git option injection", injectArg)
+	}
+	co := NewCoCommitExtractor(repo)
+	if _, err := co.ExtractCoCommittedFiles(BeadEvent{CommitSHA: injectArg}); err == nil {
+		t.Fatalf("CoCommitExtractor(%q) must reject leading-dash git option injection", injectArg)
+	}
+	if _, statErr := os.Stat(injectTarget); !os.IsNotExist(statErr) {
+		t.Fatalf("git option injection created %s!", injectTarget)
+	}
+}
+
+func TestWave10Round3GitRefValidationIncrementalTargetCommitAndZeroScoreOrphan(t *testing.T) {
+	repo := t.TempDir()
+	now := time.Date(2026, 11, 15, 4, 0, 0, 0, time.UTC)
+
+	runGit := func(ts time.Time, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Alice",
+			"GIT_AUTHOR_EMAIL=alice@example.com",
+			"GIT_COMMITTER_NAME=Alice",
+			"GIT_COMMITTER_EMAIL=alice@example.com",
+			"GIT_AUTHOR_DATE="+ts.Format(time.RFC3339),
+			"GIT_COMMITTER_DATE="+ts.Format(time.RFC3339),
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	runGit(now.Add(-3*time.Hour), "init", "-b", "main")
+	if err := os.MkdirAll(filepath.Join(repo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"), []byte(`{"id":"bv-1","title":"First task","status":"closed","priority":1,"issue_type":"task","created_at":"2026-11-15T01:00:00Z","updated_at":"2026-11-15T01:00:00Z"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "one.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(now.Add(-3*time.Hour), "add", ".")
+	runGit(now.Add(-3*time.Hour), "commit", "-m", "bv-1 initial commit")
+	firstSHA := runGit(now.Add(-3*time.Hour), "rev-parse", "HEAD")
+
+	// Second commit touching completely unrelated file by different author outside window -> zero-score orphan
+	if err := os.WriteFile(filepath.Join(repo, "unrelated.go"), []byte("package main\nfunc x() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd2 := exec.Command("git", "add", "unrelated.go")
+	cmd2.Dir = repo
+	if out, err := cmd2.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v %s", err, string(out))
+	}
+	cmd3 := exec.Command("git", "commit", "-m", "completely unrelated note")
+	cmd3.Dir = repo
+	cmd3.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Zoe",
+		"GIT_AUTHOR_EMAIL=zoe@example.com",
+		"GIT_COMMITTER_NAME=Zoe",
+		"GIT_COMMITTER_EMAIL=zoe@example.com",
+		"GIT_AUTHOR_DATE="+now.Format(time.RFC3339),
+		"GIT_COMMITTER_DATE="+now.Format(time.RFC3339),
+	)
+	if out, err := cmd3.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v %s", err, string(out))
+	}
+	zeroOrphanSHA := runGit(now, "rev-parse", "HEAD")
+
+	// 1. R3-D1: Revision & batch SHA validation across all Extractor / ExplicitMatcher / Stream / Incremental helpers
+	injectTarget := filepath.Join(t.TempDir(), "r3-should-not-exist.txt")
+	injectArg := "--output=" + injectTarget
+	ext := NewExtractor(repo)
+	if _, err := ext.Extract(ExtractOptions{Revision: injectArg}); err == nil {
+		t.Fatalf("Extractor.Extract must reject flag-like Revision")
+	}
+	if _, err := ext.extractViaGitLogPatch(ExtractOptions{Revision: injectArg}); err == nil {
+		t.Fatalf("Extractor.extractViaGitLogPatch must reject flag-like Revision")
+	}
+	if _, err := ext.extractViaSnapshots(ExtractOptions{Revision: injectArg}); err == nil {
+		t.Fatalf("Extractor.extractViaSnapshots must reject flag-like Revision")
+	}
+	if _, err := ext.snapshotCommits(ExtractOptions{Revision: injectArg}); err == nil {
+		t.Fatalf("Extractor.snapshotCommits must reject flag-like Revision")
+	}
+	if _, err := walkCommits(nil, repo, ExtractOptions{Revision: injectArg}); err == nil {
+		t.Fatalf("walkCommits must reject flag-like Revision")
+	}
+	em := NewExplicitMatcherWithKnownIDs(repo, []string{"bv-1"})
+	if _, err := em.searchWithGrepForBead("bv-1", "bv-1", ExtractOptions{Revision: injectArg}); err == nil {
+		t.Fatalf("searchWithGrepForBead must reject flag-like Revision")
+	}
+	bfs := NewBatchFileStatsExtractor(repo)
+	if _, err := bfs.extractBatchFiles([]string{injectArg}); err == nil {
+		t.Fatalf("extractBatchFiles must reject flag-like SHA")
+	}
+	if _, err := getCommitsSince(nil, repo, injectArg); err == nil {
+		t.Fatalf("getCommitsSince must reject flag-like SHA")
+	}
+	if _, err := countCommitsSince(nil, repo, injectArg); err == nil {
+		t.Fatalf("countCommitsSince must reject flag-like SHA")
+	}
+	if _, err := extractEventsFromCommits(ext, []string{injectArg}, ""); err == nil {
+		t.Fatalf("extractEventsFromCommits must reject flag-like SHA")
+	}
+	if isCommitAncestor(nil, repo, injectArg, "HEAD") || isCommitAncestor(nil, repo, "HEAD", injectArg) {
+		t.Fatalf("isCommitAncestor must reject flag-like SHA")
+	}
+	if _, statErr := os.Stat(injectTarget); !os.IsNotExist(statErr) {
+		t.Fatalf("git option injection created %s!", injectTarget)
+	}
+
+	// Verify buildGitLogArgs places -G before --end-of-options and Revision
+	logArgs := ext.buildGitLogArgs(ExtractOptions{BeadID: "bv-1", Revision: "HEAD"})
+	idxG, idxEnd, idxRev, idxDashDash := -1, -1, -1, -1
+	for i, a := range logArgs {
+		if strings.HasPrefix(a, "-G") {
+			idxG = i
+		} else if a == "--end-of-options" {
+			idxEnd = i
+		} else if a == "HEAD" {
+			idxRev = i
+		} else if a == "--" {
+			idxDashDash = i
+		}
+	}
+	if !(idxG > 0 && idxG < idxEnd && idxEnd < idxRev && idxRev < idxDashDash) {
+		t.Fatalf("expected -G < --end-of-options < HEAD < -- in buildGitLogArgs, got %v", logArgs)
+	}
+
+	// 2. R3-D3: IncrementalCorrelator must not reuse unfiltered Limit:0 report when TargetCommitSHA is set
+	beads := []BeadInfo{{ID: "bv-1", Title: "First task", Status: "closed"}}
+	inc := NewIncrementalCorrelator(repo, filepath.Join(repo, ".beads", "issues.jsonl"))
+	fullRep, err := inc.GenerateReport(beads, CorrelatorOptions{Limit: 0})
+	if err != nil {
+		t.Fatalf("full GenerateReport: %v", err)
+	}
+	if len(fullRep.CommitIndex[firstSHA]) == 0 {
+		t.Fatalf("expected firstSHA in full report CommitIndex")
+	}
+	singleRep, err := inc.GenerateReport(beads, CorrelatorOptions{Limit: 0, TargetCommitSHA: zeroOrphanSHA})
+	if err != nil {
+		t.Fatalf("TargetCommitSHA GenerateReport: %v", err)
+	}
+	if len(singleRep.CommitIndex[firstSHA]) != 0 {
+		t.Fatalf("TargetCommitSHA=%s leaked unrelated commit %s from incremental cache!", zeroOrphanSHA, firstSHA)
+	}
+
+	// 3. R3-D4: Zero-score orphan commit returns nil candidate from AnalyzeCommit
+	det := NewOrphanDetectorAt(fullRep, repo, now)
+	cand, beadsOnly, err := det.AnalyzeCommit(zeroOrphanSHA)
+	if err != nil {
+		t.Fatalf("AnalyzeCommit(zeroOrphanSHA): %v", err)
+	}
+	if beadsOnly || cand != nil {
+		t.Fatalf("expected zero-score orphan AnalyzeCommit to return cand=nil, got beadsOnly=%v cand=%+v", beadsOnly, cand)
 	}
 }

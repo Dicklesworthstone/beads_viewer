@@ -4,9 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // AgentPromptPreference stores per-project preference for AGENTS.md prompts.
@@ -30,13 +35,54 @@ type AgentPromptPreference struct {
 	AddedAt time.Time `json:"added_at,omitempty"`
 }
 
-// getPrefsDir returns the directory for storing agent prompt preferences.
+// SavedConfigDisabled reports whether BV_NO_SAVED_CONFIG is set to any
+// non-empty value, disabling reads and writes of saved agent prompt preferences.
+func SavedConfigDisabled() bool {
+	return strings.TrimSpace(env.NoSavedConfig.Get()) != ""
+}
+
+func savedConfigDisabled() bool {
+	return SavedConfigDisabled()
+}
+
+// getPrefsDir returns the directory for storing agent prompt preferences:
+// $XDG_CONFIG_HOME/bv/agent-prompts when XDG_CONFIG_HOME is set, otherwise
+// ~/.config/bv/agent-prompts on Unix (matching pkg/updater and README docs)
+// or os.UserConfigDir()/bv/agent-prompts on Windows.
 func getPrefsDir() (string, error) {
-	configDir, err := os.UserConfigDir()
+	if xdg := strings.TrimSpace(env.Get("XDG_CONFIG_HOME")); xdg != "" {
+		return filepath.Join(xdg, "bv", "agent-prompts"), nil
+	}
+	if runtime.GOOS == "windows" {
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(configDir, "bv", "agent-prompts"), nil
+	}
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(configDir, "bv", "agent-prompts"), nil
+	if homeDir == "" {
+		return "", fmt.Errorf("resolving agent prompt config dir: empty home directory")
+	}
+	return filepath.Join(homeDir, ".config", "bv", "agent-prompts"), nil
+}
+
+func getLegacyPrefsPath(workDir string) string {
+	if strings.TrimSpace(env.Get("XDG_CONFIG_HOME")) != "" {
+		return ""
+	}
+	configDir, err := os.UserConfigDir()
+	if err != nil || configDir == "" {
+		return ""
+	}
+	hash, err := projectHash(workDir)
+	if err != nil || hash == "" {
+		return ""
+	}
+	return filepath.Join(configDir, "bv", "agent-prompts", hash+".json")
 }
 
 // projectHash generates a consistent hash for a project directory.
@@ -64,8 +110,11 @@ func getPrefsPath(workDir string) (string, error) {
 }
 
 // LoadAgentPromptPreference loads the preference for a project.
-// Returns nil if no preference exists (new project).
+// Returns nil if no preference exists (new project) or when BV_NO_SAVED_CONFIG is set.
 func LoadAgentPromptPreference(workDir string) (*AgentPromptPreference, error) {
+	if savedConfigDisabled() {
+		return nil, nil
+	}
 	prefsPath, err := getPrefsPath(workDir)
 	if err != nil {
 		return nil, err
@@ -74,9 +123,20 @@ func LoadAgentPromptPreference(workDir string) (*AgentPromptPreference, error) {
 	data, err := os.ReadFile(prefsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil // No preference exists
+			legacyPath := getLegacyPrefsPath(workDir)
+			if legacyPath == "" || legacyPath == prefsPath {
+				return nil, nil // No preference exists
+			}
+			data, err = os.ReadFile(legacyPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil, nil
+				}
+				return nil, err
+			}
+		} else {
+			return nil, err
 		}
-		return nil, err
 	}
 
 	var pref AgentPromptPreference
@@ -88,6 +148,9 @@ func LoadAgentPromptPreference(workDir string) (*AgentPromptPreference, error) {
 
 // SaveAgentPromptPreference saves the preference for a project.
 func SaveAgentPromptPreference(workDir string, pref AgentPromptPreference) error {
+	if savedConfigDisabled() {
+		return nil
+	}
 	// Ensure project path is absolute
 	abs, err := filepath.Abs(workDir)
 	if err != nil {
@@ -123,6 +186,9 @@ func SaveAgentPromptPreference(workDir string, pref AgentPromptPreference) error
 // - No preference exists (new project)
 // - User hasn't checked "don't ask again"
 func ShouldPromptForAgentFile(workDir string) bool {
+	if savedConfigDisabled() {
+		return false
+	}
 	pref, err := LoadAgentPromptPreference(workDir)
 	if err != nil {
 		return true // Error loading = treat as new project
@@ -155,6 +221,9 @@ func ShouldPromptForAgentFile(workDir string) bool {
 // does not suppress upgrade prompts, unless the user selected "don't ask again"
 // or already declined/accepted targetVersion (or newer).
 func ShouldPromptForAgentUpgrade(workDir string, targetVersion int) bool {
+	if savedConfigDisabled() {
+		return false
+	}
 	pref, err := LoadAgentPromptPreference(workDir)
 	if err != nil {
 		return true
@@ -196,13 +265,20 @@ func RecordAccept(workDir string) error {
 // ClearPreference removes the preference for a project.
 // Useful for testing or if user wants to be prompted again.
 func ClearPreference(workDir string) error {
+	if savedConfigDisabled() {
+		return nil
+	}
 	prefsPath, err := getPrefsPath(workDir)
 	if err != nil {
 		return err
 	}
-	err = os.Remove(prefsPath)
-	if os.IsNotExist(err) {
-		return nil // Already doesn't exist
+	if err := os.Remove(prefsPath); err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	return err
+	if legacyPath := getLegacyPrefsPath(workDir); legacyPath != "" && legacyPath != prefsPath {
+		if err := os.Remove(legacyPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }

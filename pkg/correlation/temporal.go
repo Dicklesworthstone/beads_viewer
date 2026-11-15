@@ -178,7 +178,10 @@ func gitAuthorRegex(author, authorEmail string) string {
 // tracker metadata under .beads/. Mixed commits touching both .beads/ and
 // repository code files return false so temporal correlation evaluates them.
 func (t *TemporalCorrelator) isBeadsOnlyCommit(sha string) bool {
-	cmd := gitCommand(t.ctx, "show", "--name-only", "--format=", sha)
+	if err := validateGitRefArg(sha); err != nil {
+		return false
+	}
+	cmd := gitCommand(t.ctx, "show", "--name-only", "--format=", "--end-of-options", sha)
 	cmd.Dir = t.repoPath
 
 	out, err := cmd.Output()

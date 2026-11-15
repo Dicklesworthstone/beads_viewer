@@ -104,7 +104,7 @@ func (ic *IncrementalCorrelator) GenerateReport(beads []BeadInfo, opts Correlato
 }
 
 func canUseIncrementalMode(opts CorrelatorOptions) bool {
-	return opts.Revision == "" && opts.CausalityBeadID == "" && opts.Since == nil && opts.Until == nil
+	return opts.Revision == "" && strings.TrimSpace(opts.TargetCommitSHA) == "" && opts.CausalityBeadID == "" && opts.Since == nil && opts.Until == nil
 }
 
 // GenerateReportWithDetails generates a report and returns detailed update information
@@ -499,10 +499,16 @@ func isCommitAncestor(ctx context.Context, repoPath, ancestorSHA, descendantSHA 
 	if ancestorSHA == "" || descendantSHA == "" {
 		return false
 	}
+	if err := validateGitRefArg(ancestorSHA); err != nil {
+		return false
+	}
+	if err := validateGitRefArg(descendantSHA); err != nil {
+		return false
+	}
 	if ancestorSHA == descendantSHA {
 		return true
 	}
-	cmd := gitCommand(ctx, "merge-base", "--is-ancestor", ancestorSHA, descendantSHA)
+	cmd := gitCommand(ctx, "merge-base", "--is-ancestor", "--end-of-options", ancestorSHA, descendantSHA)
 	cmd.Dir = repoPath
 	return cmd.Run() == nil
 }
@@ -630,9 +636,12 @@ func getCommitsSince(ctx context.Context, repoPath, sinceSHA string) ([]string, 
 	if sinceSHA == "" {
 		return nil, fmt.Errorf("no since SHA provided")
 	}
+	if err := validateGitRefArg(sinceSHA); err != nil {
+		return nil, err
+	}
 
 	// Use git rev-list to get commits since the given SHA
-	cmd := gitCommand(ctx, "rev-list", "--reverse", fmt.Sprintf("%s..HEAD", sinceSHA))
+	cmd := gitCommand(ctx, "rev-list", "--reverse", "--end-of-options", fmt.Sprintf("%s..HEAD", sinceSHA))
 	cmd.Dir = repoPath
 
 	out, err := cmd.Output()
@@ -658,8 +667,11 @@ func countCommitsSince(ctx context.Context, repoPath, sinceSHA string) (int, err
 	if sinceSHA == "" {
 		return 0, fmt.Errorf("no since SHA provided")
 	}
+	if err := validateGitRefArg(sinceSHA); err != nil {
+		return 0, err
+	}
 
-	cmd := gitCommand(ctx, "rev-list", "--count", fmt.Sprintf("%s..HEAD", sinceSHA))
+	cmd := gitCommand(ctx, "rev-list", "--count", "--end-of-options", fmt.Sprintf("%s..HEAD", sinceSHA))
 	cmd.Dir = repoPath
 
 	out, err := cmd.Output()
@@ -680,6 +692,11 @@ func extractEventsFromCommits(extractor *Extractor, commitSHAs []string, filterB
 	if len(commitSHAs) == 0 {
 		return nil, nil
 	}
+	for _, sha := range commitSHAs {
+		if err := validateGitRefArg(sha); err != nil {
+			return nil, err
+		}
+	}
 
 	// Use git log with --no-walk to process specific commits.
 	args := []string{
@@ -688,6 +705,7 @@ func extractEventsFromCommits(extractor *Extractor, commitSHAs []string, filterB
 		"--unified=0",
 		"--format=" + gitLogHeaderFormat,
 		"--no-walk",
+		"--end-of-options",
 	}
 	args = append(args, commitSHAs...)
 	args = append(args, "--", extractor.primaryBeadsFile())
@@ -728,12 +746,18 @@ func walkCommitsBySHAs(ctx context.Context, repoPath string, commitSHAs []string
 	if len(commitSHAs) == 0 {
 		return nil, nil
 	}
+	for _, sha := range commitSHAs {
+		if err := validateGitRefArg(sha); err != nil {
+			return nil, err
+		}
+	}
 	args := []string{
 		"log",
 		"--no-merges",
 		"--name-only",
 		"--no-walk",
 		"--format=" + commitWalkFormat,
+		"--end-of-options",
 	}
 	args = append(args, commitSHAs...)
 

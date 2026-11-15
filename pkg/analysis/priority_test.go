@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -1171,5 +1172,77 @@ func TestCountStatusPartitionAndRecommendationScoping(t *testing.T) {
 	}
 	if !foundDepBlocked && !foundParked {
 		t.Fatalf("expected includeInactive=true to surface blocked/parked items, got %+v", withInactive)
+	}
+}
+
+func TestParkedBeads_NoStalenessUrgencyOrStaleRecommendation(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	ancient := now.AddDate(0, 0, -60)
+	future := now.Add(72 * time.Hour)
+
+	issues := []model.Issue{
+		{ID: "park-deferred", Title: "Deferred", Status: model.StatusDeferred, Priority: 3, CreatedAt: ancient, UpdatedAt: ancient},
+		{ID: "park-ephemeral", Title: "Ephemeral", Status: model.StatusOpen, Ephemeral: true, Priority: 3, CreatedAt: ancient, UpdatedAt: ancient},
+		{ID: "park-pinned-flag", Title: "Pinned Flag", Status: model.StatusOpen, Pinned: true, Priority: 3, CreatedAt: ancient, UpdatedAt: ancient},
+		{ID: "park-pinned-status", Title: "Pinned Status", Status: model.StatusPinned, Priority: 3, CreatedAt: ancient, UpdatedAt: ancient},
+		{ID: "park-template", Title: "Template", Status: model.StatusOpen, IsTemplate: true, Priority: 3, CreatedAt: ancient, UpdatedAt: ancient},
+		{ID: "park-defer-until", Title: "Snoozed", Status: model.StatusOpen, DeferUntil: &future, Priority: 3, CreatedAt: ancient, UpdatedAt: ancient},
+		// Active blocker to give graph structure while also having an active stale peer for contrast.
+		{ID: "active-stale", Title: "Active Stale", Status: model.StatusOpen, Priority: 3, CreatedAt: ancient, UpdatedAt: ancient},
+		{ID: "active-child", Title: "Active Child", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{
+			{IssueID: "active-child", DependsOnID: "park-deferred", Type: model.DepBlocks},
+			{IssueID: "active-child", DependsOnID: "active-stale", Type: model.DepBlocks},
+		}},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+	an.SetNow(now)
+	scores := an.ComputeImpactScoresAt(now)
+	scoreByID := make(map[string]analysis.ImpactScore, len(scores))
+	for _, s := range scores {
+		scoreByID[s.IssueID] = s
+	}
+
+	parkedIDs := []string{
+		"park-deferred",
+		"park-ephemeral",
+		"park-pinned-flag",
+		"park-pinned-status",
+		"park-template",
+		"park-defer-until",
+	}
+	for _, id := range parkedIDs {
+		s, ok := scoreByID[id]
+		if !ok {
+			t.Fatalf("missing score for %s", id)
+		}
+		if s.Breakdown.StalenessNorm != 0 || s.Breakdown.Staleness != 0 {
+			t.Fatalf("parked bead %s received non-zero staleness boost: %+v", id, s.Breakdown)
+		}
+		if s.Breakdown.UrgencyNorm != 0 {
+			t.Fatalf("parked bead %s without urgency labels received aging urgency boost: %+v", id, s.Breakdown)
+		}
+	}
+	if scoreByID["active-stale"].Breakdown.StalenessNorm < 0.99 {
+		t.Fatalf("expected active-stale to retain full staleness norm, got %f", scoreByID["active-stale"].Breakdown.StalenessNorm)
+	}
+
+	thresholds := analysis.DefaultThresholds()
+	thresholds.StalenessDays = 0
+	thresholds.MinConfidence = 0
+	recs := an.GenerateRecommendationsWithThresholds(thresholds)
+	parkedSet := make(map[string]bool, len(parkedIDs))
+	for _, id := range parkedIDs {
+		parkedSet[id] = true
+	}
+	for _, rec := range recs {
+		if !parkedSet[rec.IssueID] {
+			continue
+		}
+		for _, reason := range rec.Reasoning {
+			if strings.Contains(strings.ToLower(reason), "stale") {
+				t.Fatalf("parked bead %s received stale recommendation reason %q: %+v", rec.IssueID, reason, rec)
+			}
+		}
 	}
 }

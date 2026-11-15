@@ -253,6 +253,8 @@ func TestCenterModal(t *testing.T) {
 func TestCheckAgentFileCmd_UpgradeAndNegativeControls(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	t.Setenv("BV_TEST_MODE", "")
 
 	runCheck := func(t *testing.T, dir string) AgentFileCheckMsg {
 		t.Helper()
@@ -330,6 +332,8 @@ func TestCheckAgentFileCmd_UpgradeAndNegativeControls(t *testing.T) {
 func TestModel_AgentUpgradePromptAcceptAndAsOfGuard(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	t.Setenv("BV_TEST_MODE", "")
 
 	// 1. Verify upgrade modal rendering and in-place UpdateBlurbInFile on accept.
 	dir := t.TempDir()
@@ -422,6 +426,8 @@ func TestModel_AgentUpgradePromptAcceptAndAsOfGuard(t *testing.T) {
 func TestCheckAgentFileCmd_ParentDirectoryDetection(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	t.Setenv("BV_TEST_MODE", "")
 
 	runCheck := func(t *testing.T, dir string) AgentFileCheckMsg {
 		t.Helper()

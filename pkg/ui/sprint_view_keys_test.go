@@ -636,6 +636,7 @@ func TestModel_PKeyIgnoredOutsideListAndDetail(t *testing.T) {
 func must2(tm tea.Model, _ tea.Cmd) tea.Model { return tm }
 
 func TestRenderSprintDashboard_RespectsDriftConfigThresholds(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	now := time.Now().UTC()
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")

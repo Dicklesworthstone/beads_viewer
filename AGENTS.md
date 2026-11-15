@@ -328,7 +328,9 @@ beads_viewer/
 - **Division safety** — always guard against division by zero before computing averages/ratios
 - **Nil checks** — always check for nil before dereferencing pointers, especially in graph traversal
 - **Concurrency** — use `sync.RWMutex` for shared state; capture channels before unlock to avoid races
-- **Browser safety** — all browser-opening functions gated by `BV_NO_BROWSER` / `BV_TEST_MODE` env vars
+- **Browser safety** — all browser-opening functions gated by `BV_NO_BROWSER` / `BV_TEST_MODE` env vars (read through `internal/env`)
+- **Typed environment registry** — never call raw `os.Getenv("BV_*")` or `os.Getenv("BEADS_*")` in production packages; read through `internal/env` (`TestEnv_NoRawGetenvInProductionCode`)
+- **TUI `Model` pointer receivers** — unexported methods on `ui.Model` (`pkg/ui`) must use `(m *Model)` pointer receivers (`TestModelUnexportedMethodsUsePointerReceivers`)
 
 ### Logging & Console Output
 

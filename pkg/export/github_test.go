@@ -68,6 +68,29 @@ func TestSuggestRepoName(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("cwd dot and beads paths", func(t *testing.T) {
+		tmpParent := t.TempDir()
+		repoDir := filepath.Join(tmpParent, "acme_repo")
+		beadsDir := filepath.Join(repoDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		t.Chdir(repoDir)
+
+		if got := SuggestRepoName(""); got != "acme_repo-pages" {
+			t.Fatalf("SuggestRepoName(\"\") = %q, want %q", got, "acme_repo-pages")
+		}
+		if got := SuggestRepoName("."); got != "acme_repo" {
+			t.Fatalf("SuggestRepoName(\".\") = %q, want %q", got, "acme_repo")
+		}
+		if got := SuggestRepoName(beadsDir); got != "acme_repo-pages" {
+			t.Fatalf("SuggestRepoName(.beads) = %q, want %q", got, "acme_repo-pages")
+		}
+		if got := SuggestRepoName(filepath.Join(beadsDir, "issues.jsonl")); got != "acme_repo-pages" {
+			t.Fatalf("SuggestRepoName(.beads/issues.jsonl) = %q, want %q", got, "acme_repo-pages")
+		}
+	})
 }
 
 func TestGitHubDeployConfig(t *testing.T) {
@@ -530,5 +553,20 @@ func TestWriteGitHubActionsWorkflow_Idempotent(t *testing.T) {
 	}
 	if !strings.Contains(string(content), "deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e") {
 		t.Error("Workflow content missing expected action")
+	}
+}
+
+func TestSuggestRepoName_DotGitAndSanitization(t *testing.T) {
+	if got := SuggestRepoName("/tmp/acme-service.git/.beads"); got != "acme-service-pages" {
+		t.Fatalf("SuggestRepoName(.git/.beads) = %q, want %q", got, "acme-service-pages")
+	}
+	if got := SuggestRepoName("/tmp/My Repo!@#.GIT/bv-pages"); got != "my-repo-pages" {
+		t.Fatalf("SuggestRepoName(My Repo!@#.GIT/bv-pages) = %q, want %q", got, "my-repo-pages")
+	}
+	if got := SuggestRepoName("/tmp/custom-bundle.git"); got != "custom-bundle" {
+		t.Fatalf("SuggestRepoName(custom-bundle.git) = %q, want %q", got, "custom-bundle")
+	}
+	if got := SuggestRepoName("!!!.git"); got != "beads-viewer-pages" {
+		t.Fatalf("SuggestRepoName(!!!.git) = %q, want %q", got, "beads-viewer-pages")
 	}
 }

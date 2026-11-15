@@ -16,7 +16,8 @@ func TestPresentationValidation(t *testing.T) {
 	}{
 		{"column", recipe.Recipe{View: recipe.ViewConfig{Columns: []string{"secret"}}}, "view.columns"},
 		{"duplicate column", recipe.Recipe{View: recipe.ViewConfig{Columns: []string{"id", "id"}}}, "repeats"},
-		{"group", recipe.Recipe{View: recipe.ViewConfig{GroupBy: "assignee"}}, "view.group_by"},
+		{"duplicate alias column", recipe.Recipe{View: recipe.ViewConfig{Columns: []string{"tags", "label"}}}, "repeats"},
+		{"group", recipe.Recipe{View: recipe.ViewConfig{GroupBy: "unknown_group"}}, "view.group_by"},
 		{"collapse without groups", recipe.Recipe{View: recipe.ViewConfig{Collapsed: true}}, "view.collapsed"},
 		{"negative width", recipe.Recipe{View: recipe.ViewConfig{TruncateTitle: -1}}, "view.truncate_title"},
 		{"metric", recipe.Recipe{Metrics: []string{"invented"}}, "metrics"},
@@ -27,10 +28,19 @@ func TestPresentationValidation(t *testing.T) {
 			}
 		})
 	}
-	for _, group := range []string{"", "none", "status", "priority", "tag"} {
+	for _, group := range []string{"", "none", "status", "priority", "assignee", "tag", "tags", "label", "labels"} {
 		r := recipe.Recipe{View: recipe.ViewConfig{Columns: recipe.ViewColumns, GroupBy: group, TruncateTitle: 1}, Metrics: recipe.ViewMetrics}
 		if err := r.Validate(); err != nil {
-			t.Fatalf("valid presentation: %v", err)
+			t.Fatalf("valid presentation (%s): %v", group, err)
+		}
+	}
+	for _, colAlias := range []string{"label", "labels", "assignee"} {
+		r := recipe.Recipe{
+			Sort: recipe.SortConfig{Field: "assignee"},
+			View: recipe.ViewConfig{Columns: []string{"id", colAlias}, GroupBy: "label"},
+		}
+		if err := r.Validate(); err != nil {
+			t.Fatalf("valid column/sort/group alias (%s): %v", colAlias, err)
 		}
 	}
 }

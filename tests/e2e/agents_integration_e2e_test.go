@@ -12,6 +12,7 @@ import (
 
 // TestAgentsE2E_DetectionFlow tests the complete detection flow across different scenarios.
 func TestAgentsE2E_DetectionFlow(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	t.Run("no_agent_file_prompts", func(t *testing.T) {
 		tmpDir := t.TempDir()
 
@@ -125,6 +126,7 @@ func TestAgentsE2E_DetectionFlow(t *testing.T) {
 
 // TestAgentsE2E_AcceptFlow tests the complete accept flow end-to-end.
 func TestAgentsE2E_AcceptFlow(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	tmpDir := t.TempDir()
 	agentsPath := filepath.Join(tmpDir, "AGENTS.md")
 
@@ -201,6 +203,7 @@ func TestAgentsE2E_AcceptFlow(t *testing.T) {
 
 // TestAgentsE2E_DeclineFlow tests the decline flow.
 func TestAgentsE2E_DeclineFlow(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	tmpDir := t.TempDir()
 	agentsPath := filepath.Join(tmpDir, "AGENTS.md")
 
@@ -232,6 +235,7 @@ func TestAgentsE2E_DeclineFlow(t *testing.T) {
 
 // TestAgentsE2E_NeverAskFlow tests the "don't ask again" flow.
 func TestAgentsE2E_NeverAskFlow(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	tmpDir := t.TempDir()
 	agentsPath := filepath.Join(tmpDir, "AGENTS.md")
 
@@ -261,6 +265,7 @@ func TestAgentsE2E_NeverAskFlow(t *testing.T) {
 
 // TestAgentsE2E_PreferencePersistence tests that preferences persist correctly.
 func TestAgentsE2E_PreferencePersistence(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 	tmpDir := t.TempDir()
 	agentsPath := filepath.Join(tmpDir, "AGENTS.md")
 

@@ -68,6 +68,10 @@ type Config struct {
 	DuplicateJaccardThreshold float64 `yaml:"duplicate_jaccard_threshold" json:"duplicate_jaccard_threshold"`
 	DuplicateMaxAlerts        int     `yaml:"duplicate_max_alerts" json:"duplicate_max_alerts"`
 
+	// Source drift: enable/disable flag and maximum SQLite/JSONL source inconsistency alerts per run (0 = unlimited)
+	SourceDriftAlert     *bool `yaml:"source_drift_alert" json:"source_drift_alert,omitempty"`
+	SourceDriftMaxAlerts int   `yaml:"source_drift_max_alerts" json:"source_drift_max_alerts"`
+
 	// Priority mismatch: minimum recommendation confidence (0-1) that becomes a warning
 	PriorityMismatchMinConfidence float64 `yaml:"priority_mismatch_min_confidence" json:"priority_mismatch_min_confidence"`
 
@@ -104,6 +108,7 @@ type LabelConfig struct {
 
 // DefaultConfig returns sensible default thresholds
 func DefaultConfig() *Config {
+	defaultSourceDriftAlert := true
 	return &Config{
 		DensityWarningPct:            50,  // 50% increase triggers warning
 		DensityInfoPct:               20,  // 20% increase triggers info
@@ -119,19 +124,21 @@ func DefaultConfig() *Config {
 		BlockingCascadeInfo:          3,   // Info alert when unblocks >=3
 		BlockingCascadeWarning:       5,   // Warning when unblocks >=5
 
-		ScopeCreepPct:                 20,   // Info when open issues grew 20%+ over the baseline
-		VelocityDropPct:               50,   // Warning when closes fell 50%+ window over window
-		VelocityWindowDays:            7,    // Compare the last 7 days with the 7 before
-		VelocityMinBaseline:           5,    // ...but only when the prior window closed 5+
-		HighImpactUnblockMin:          3,    // Unblocks 3+ items...
-		HighImpactPriorityMax:         1,    // ...including at least one P0/P1
-		AbandonedClaimMultiplier:      2,    // 2x the in-progress stale threshold (14d by default)
-		DuplicateJaccardThreshold:     0.7,  // Keyword Jaccard similarity for potential_duplicate
-		DuplicateMaxAlerts:            10,   // At most 10 duplicate alerts per run
-		PriorityMismatchMinConfidence: 0.6,  // Recommendation confidence that becomes a warning
-		ProactiveMaxIssues:            2000, // Skip the expensive checks above this many issues
-		SprintBlockedDays:             2,    // Blocked sprint items flagged after 2 days
-		SprintInactiveDays:            4,    // In-progress sprint items flagged after 4 days idle
+		ScopeCreepPct:                 20,                       // Info when open issues grew 20%+ over the baseline
+		VelocityDropPct:               50,                       // Warning when closes fell 50%+ window over window
+		VelocityWindowDays:            7,                        // Compare the last 7 days with the 7 before
+		VelocityMinBaseline:           5,                        // ...but only when the prior window closed 5+
+		HighImpactUnblockMin:          3,                        // Unblocks 3+ items...
+		HighImpactPriorityMax:         1,                        // ...including at least one P0/P1
+		AbandonedClaimMultiplier:      2,                        // 2x the in-progress stale threshold (14d by default)
+		DuplicateJaccardThreshold:     0.7,                      // Keyword Jaccard similarity for potential_duplicate
+		DuplicateMaxAlerts:            10,                       // At most 10 duplicate alerts per run
+		SourceDriftAlert:              &defaultSourceDriftAlert, // Enable SQLite/JSONL source inconsistency alerts by default
+		SourceDriftMaxAlerts:          10,                       // At most 10 source inconsistency alerts per run
+		PriorityMismatchMinConfidence: 0.6,                      // Recommendation confidence that becomes a warning
+		ProactiveMaxIssues:            2000,                     // Skip the expensive checks above this many issues
+		SprintBlockedDays:             2,                        // Blocked sprint items flagged after 2 days
+		SprintInactiveDays:            4,                        // In-progress sprint items flagged after 4 days idle
 	}
 }
 
@@ -141,6 +148,23 @@ const ConfigFilename = "drift.yaml"
 // ConfigPath returns the default config path for a project
 func ConfigPath(projectDir string) string {
 	return filepath.Join(projectDir, ".bv", ConfigFilename)
+}
+
+// ConfigExists reports whether a saved drift configuration file exists for
+// projectDir (or at projectDir directly if a drift.yaml file path is passed).
+func ConfigExists(projectDir string) bool {
+	if projectDir == "" {
+		return false
+	}
+	if info, err := os.Stat(ConfigPath(projectDir)); err == nil && !info.IsDir() {
+		return true
+	}
+	if filepath.Base(projectDir) == ConfigFilename {
+		if info, err := os.Stat(projectDir); err == nil && !info.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadConfig loads drift configuration from .bv/drift.yaml
@@ -245,6 +269,13 @@ func (c *Config) Validate() error {
 	if c.DuplicateMaxAlerts == 0 {
 		c.DuplicateMaxAlerts = defaults.DuplicateMaxAlerts
 	}
+	if c.SourceDriftAlert == nil {
+		defaultAlert := true
+		c.SourceDriftAlert = &defaultAlert
+	}
+	if c.SourceDriftMaxAlerts < 0 {
+		c.SourceDriftMaxAlerts = defaults.SourceDriftMaxAlerts
+	}
 	if c.PriorityMismatchMinConfidence == 0 {
 		c.PriorityMismatchMinConfidence = defaults.PriorityMismatchMinConfidence
 	}
@@ -347,6 +378,9 @@ func (c *Config) Validate() error {
 
 // IsAlertDisabled returns true if the given alert type is in the disabled list (bv-167)
 func (c *Config) IsAlertDisabled(alertType string) bool {
+	if alertType == string(AlertSourceInconsistency) && c.SourceDriftAlert != nil && !*c.SourceDriftAlert {
+		return true
+	}
 	for _, disabled := range c.DisabledAlerts {
 		if disabled == alertType {
 			return true
@@ -475,6 +509,10 @@ abandoned_claim_multiplier: 2    # Idle longer than stale_warning_days x in_prog
 # Potential duplicates (keyword similarity)
 duplicate_jaccard_threshold: 0.7 # Pairs at or above this Jaccard score
 duplicate_max_alerts: 10         # Cap per run
+
+# Source drift (SQLite vs JSONL consistency)
+source_drift_alert: true         # Enable SQLite vs JSONL consistency alerts
+source_drift_max_alerts: 10      # Cap per run (0 = unlimited)
 
 # Priority mismatch (from --robot-priority recommendations)
 priority_mismatch_min_confidence: 0.6  # Warning at this confidence or above

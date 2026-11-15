@@ -368,3 +368,200 @@ func TestBuildLayout_MinDimensions(t *testing.T) {
 		t.Errorf("expected 1 node, got %d", len(layout.Nodes))
 	}
 }
+
+func TestSaveGraphSnapshot_DependencyBlockedColorsAndReadiness(t *testing.T) {
+	openFill := css(colorOpen)       // #c8e6c9
+	blockedFill := css(colorBlocked) // #ffcdd2
+	inProgFill := css(colorInProg)   // #fff3e0
+	parkedFill := css(colorParked)   // #e0e7ff
+
+	findNodeByID := func(t *testing.T, layout layoutResult, id string) layoutNode {
+		t.Helper()
+		for _, n := range layout.Nodes {
+			if n.ID == id {
+				return n
+			}
+		}
+		t.Fatalf("node %q not found in layout", id)
+		return layoutNode{}
+	}
+
+	t.Run("active blocker colors open dependent blocked and ready blocker open", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "A", Title: "Ready blocker", Status: model.StatusOpen},
+			{
+				ID:     "B",
+				Title:  "Blocked dependent",
+				Status: model.StatusOpen,
+				Dependencies: []*model.Dependency{
+					{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks},
+				},
+			},
+		}
+		stats := analysis.NewAnalyzer(issues).Analyze()
+		layout := buildLayout(GraphSnapshotOptions{Issues: issues, Stats: &stats})
+
+		nodeA := findNodeByID(t, layout, "A")
+		nodeB := findNodeByID(t, layout, "B")
+		if got := css(nodeFillColor(nodeA)); got != openFill {
+			t.Fatalf("ready blocker A fill = %s, want %s", got, openFill)
+		}
+		if got := css(nodeFillColor(nodeB)); got != blockedFill {
+			t.Fatalf("dependency-blocked B fill = %s, want %s", got, blockedFill)
+		}
+
+		// Also verify SVG output encodes both exact fills.
+		svgPath := filepath.Join(t.TempDir(), "active_block.svg")
+		if err := SaveGraphSnapshot(GraphSnapshotOptions{Path: svgPath, Issues: issues, Stats: &stats}); err != nil {
+			t.Fatalf("SaveGraphSnapshot: %v", err)
+		}
+		raw, err := os.ReadFile(svgPath)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		svg := string(raw)
+		if !hasSubstr(svg, "fill:"+openFill) || !hasSubstr(svg, "fill:"+blockedFill) {
+			t.Fatalf("SVG missing expected fills %s and %s:\n%s", openFill, blockedFill, svg)
+		}
+	})
+
+	t.Run("closed or tombstoned blocker leaves dependent open or in_progress", func(t *testing.T) {
+		closedIssues := []model.Issue{
+			{ID: "A", Title: "Closed blocker", Status: model.StatusClosed},
+			{
+				ID:     "B",
+				Title:  "Unblocked open",
+				Status: model.StatusOpen,
+				Dependencies: []*model.Dependency{
+					{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks},
+				},
+			},
+		}
+		closedStats := analysis.NewAnalyzer(closedIssues).Analyze()
+		closedLayout := buildLayout(GraphSnapshotOptions{Issues: closedIssues, Stats: &closedStats})
+		if got := css(nodeFillColor(findNodeByID(t, closedLayout, "B"))); got != openFill {
+			t.Fatalf("dependent B with closed blocker fill = %s, want %s", got, openFill)
+		}
+
+		fullWithTombstone := []model.Issue{
+			{ID: "A", Title: "Tombstoned blocker", Status: model.StatusTombstone},
+			{
+				ID:     "B",
+				Title:  "In progress dependent",
+				Status: model.StatusInProgress,
+				Dependencies: []*model.Dependency{
+					{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks},
+				},
+			},
+		}
+		visibleOnly := fullWithTombstone[1:]
+		tombStats := analysis.NewAnalyzer(visibleOnly).Analyze()
+		tombLayout := buildLayout(GraphSnapshotOptions{
+			Issues:    visibleOnly,
+			Stats:     &tombStats,
+			Readiness: model.NewReadinessIndex(fullWithTombstone),
+		})
+		if got := css(nodeFillColor(findNodeByID(t, tombLayout, "B"))); got != inProgFill {
+			t.Fatalf("in_progress B with tombstoned blocker via Readiness fill = %s, want %s", got, inProgFill)
+		}
+	})
+
+	t.Run("scoped Readiness marks external open blocker and custom status uses parked color", func(t *testing.T) {
+		fullIssues := []model.Issue{
+			{ID: "EXT-1", Title: "External open blocker", Status: model.StatusOpen},
+			{
+				ID:     "SUB-1",
+				Title:  "Scoped open dependent",
+				Status: model.StatusOpen,
+				Dependencies: []*model.Dependency{
+					{IssueID: "SUB-1", DependsOnID: "EXT-1", Type: model.DepBlocks},
+				},
+			},
+			{ID: "SUB-DEF", Title: "Deferred task", Status: model.Status("deferred")},
+		}
+		scopedIssues := fullIssues[1:]
+		scopedStats := analysis.NewAnalyzer(scopedIssues).Analyze()
+		layout := buildLayout(GraphSnapshotOptions{
+			Issues:    scopedIssues,
+			Stats:     &scopedStats,
+			Readiness: model.NewReadinessIndex(fullIssues),
+		})
+		if got := css(nodeFillColor(findNodeByID(t, layout, "SUB-1"))); got != blockedFill {
+			t.Fatalf("SUB-1 with external open blocker via Readiness fill = %s, want %s", got, blockedFill)
+		}
+		if got := css(nodeFillColor(findNodeByID(t, layout, "SUB-DEF"))); got != parkedFill {
+			t.Fatalf("deferred node fill = %s, want %s", got, parkedFill)
+		}
+	})
+
+	t.Run("topBottleneck summary scopes to rendered subgraph nodes", func(t *testing.T) {
+		fullIssues := []model.Issue{
+			{ID: "OUT-START", Title: "Out start", Status: model.StatusOpen},
+			{
+				ID:     "HUB-OUTSIDE",
+				Title:  "Outside hub",
+				Status: model.StatusOpen,
+				Dependencies: []*model.Dependency{
+					{IssueID: "HUB-OUTSIDE", DependsOnID: "OUT-START", Type: model.DepBlocks},
+				},
+			},
+			{
+				ID:     "OUT-END-1",
+				Title:  "Out end 1",
+				Status: model.StatusOpen,
+				Dependencies: []*model.Dependency{
+					{IssueID: "OUT-END-1", DependsOnID: "HUB-OUTSIDE", Type: model.DepBlocks},
+				},
+			},
+			{
+				ID:     "OUT-END-2",
+				Title:  "Out end 2",
+				Status: model.StatusOpen,
+				Dependencies: []*model.Dependency{
+					{IssueID: "OUT-END-2", DependsOnID: "HUB-OUTSIDE", Type: model.DepBlocks},
+				},
+			},
+			{ID: "SUB-A", Title: "Sub A", Status: model.StatusOpen},
+			{
+				ID:     "SUB-MID",
+				Title:  "Sub mid",
+				Status: model.StatusOpen,
+				Dependencies: []*model.Dependency{
+					{IssueID: "SUB-MID", DependsOnID: "SUB-A", Type: model.DepBlocks},
+				},
+			},
+			{
+				ID:     "SUB-C",
+				Title:  "Sub C",
+				Status: model.StatusOpen,
+				Dependencies: []*model.Dependency{
+					{IssueID: "SUB-C", DependsOnID: "SUB-MID", Type: model.DepBlocks},
+				},
+			},
+		}
+		fullAnalyzer := analysis.NewAnalyzer(fullIssues)
+		fullStats := fullAnalyzer.AnalyzeAsync(t.Context())
+		fullStats.WaitForPhase2()
+
+		subgraph := fullIssues[4:]
+		svgPath := filepath.Join(t.TempDir(), "subgraph.svg")
+		if err := SaveGraphSnapshot(GraphSnapshotOptions{
+			Path:   svgPath,
+			Issues: subgraph,
+			Stats:  fullStats,
+		}); err != nil {
+			t.Fatalf("SaveGraphSnapshot(subgraph): %v", err)
+		}
+		raw, err := os.ReadFile(svgPath)
+		if err != nil {
+			t.Fatalf("ReadFile(subgraph.svg): %v", err)
+		}
+		svg := string(raw)
+		if hasSubstr(svg, "HUB-OUTSIDE") {
+			t.Fatalf("subgraph SVG leaked excluded node HUB-OUTSIDE in summary:\n%s", svg)
+		}
+		if !hasSubstr(svg, "top bottleneck: SUB-MID") {
+			t.Fatalf("expected subgraph SVG summary to report SUB-MID as top bottleneck:\n%s", svg)
+		}
+	})
+}

@@ -9,8 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 )
 
 // Baseline represents a snapshot of project metrics at a point in time
@@ -230,6 +233,15 @@ func New(stats GraphStats, top TopMetrics, cycles [][]string, description string
 	return NewForDir(".", stats, top, cycles, description)
 }
 
+func baselineNow() time.Time {
+	if raw := strings.TrimSpace(env.SourceDateEpoch.Get()); raw != "" {
+		if sec, err := strconv.ParseInt(raw, 10, 64); err == nil && sec >= 0 && sec < 253402300800 {
+			return time.Unix(sec, 0).UTC()
+		}
+	}
+	return time.Now().UTC()
+}
+
 // NewForDir creates a new baseline resolving git commit/branch metadata from projectDir.
 func NewForDir(projectDir string, stats GraphStats, top TopMetrics, cycles [][]string, description string) *Baseline {
 	if projectDir == "" {
@@ -239,7 +251,7 @@ func NewForDir(projectDir string, stats GraphStats, top TopMetrics, cycles [][]s
 
 	return &Baseline{
 		Version:       CurrentVersion,
-		CreatedAt:     time.Now(),
+		CreatedAt:     baselineNow(),
 		CommitSHA:     sha,
 		CommitMessage: msg,
 		Branch:        branch,

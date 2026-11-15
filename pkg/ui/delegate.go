@@ -354,8 +354,22 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 		return t.Format("2006-01-02")
 	}
 	fixedWidth := 2
+	repoCell := ""
+	if d.WorkspaceMode {
+		trimmedRepo := strings.TrimSpace(item.RepoPrefix)
+		if trimmedRepo != "" {
+			repoCell = fmt.Sprintf("[%s]", strings.ToUpper(trimmedRepo))
+		} else {
+			repoCell = "    "
+		}
+		fixedWidth += lipgloss.Width(repoCell) + 3
+	}
 	titleIndex := -1
-	for n, column := range columns {
+	for n, rawColumn := range columns {
+		column := rawColumn
+		if canonical, ok := recipe.CanonicalViewColumn(rawColumn); ok {
+			column = canonical
+		}
 		switch column {
 		case "id":
 			values[n] = item.Issue.ID
@@ -365,6 +379,12 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 			values[n] = string(item.Issue.Status)
 		case "priority":
 			values[n] = fmt.Sprintf("P%d", item.Issue.Priority)
+		case "assignee":
+			if item.Issue.Assignee != "" {
+				values[n] = "@" + item.Issue.Assignee
+			} else {
+				values[n] = "—"
+			}
 		case "created":
 			values[n] = date(item.Issue.CreatedAt)
 		case "updated":
@@ -390,10 +410,11 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 	}
 	if titleIndex >= 0 {
 		available := max(1, width-fixedWidth-(len(columns)-1)*3)
-		// Reserve space for metrics when the terminal can still show a title.
-		metricWidth := lipgloss.Width(strings.Join(metrics, " "))
-		if metricWidth+12 < available {
-			available -= metricWidth + 3
+		// Always reserve right-side space for inline metrics so metrics never collide with or get clipped by titles.
+		if len(metrics) > 0 {
+			metricReserve := lipgloss.Width(strings.Join(metrics, " ")) + 3
+			minTitle := min(8, available)
+			available = max(minTitle, available-metricReserve)
 		}
 		if d.TruncateTitle > 0 {
 			available = min(available, d.TruncateTitle)
@@ -404,7 +425,11 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 	if index == m.Index() {
 		prefix = "▸ "
 	}
-	row := prefix + strings.Join(values, " │ ")
+	cells := values
+	if d.WorkspaceMode {
+		cells = append([]string{repoCell}, values...)
+	}
+	row := prefix + strings.Join(cells, " │ ")
 	if len(metrics) > 0 {
 		row += " │ " + strings.Join(metrics, " ")
 	}

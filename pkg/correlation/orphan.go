@@ -318,6 +318,57 @@ func (od *OrphanDetector) DetectOrphans(opts ExtractOptions) (*OrphanReport, err
 	return report, nil
 }
 
+// AnalyzeCommit evaluates a single commit SHA for tracker-only status and
+// orphan candidate rescue heuristics (probable beads and suspicion signals).
+// When the commit modified only configured tracker (.beads/) paths, beadsOnly
+// is true and candidate is nil.
+func (od *OrphanDetector) AnalyzeCommit(sha string) (candidate *OrphanCandidate, beadsOnly bool, err error) {
+	if od == nil || od.lookup == nil || od.repoPath == "" {
+		return nil, false, nil
+	}
+	if strings.TrimSpace(sha) == "" {
+		return nil, false, nil
+	}
+	if err := validateGitRefArg(sha); err != nil {
+		return nil, false, err
+	}
+	fullSHA := strings.ToLower(strings.TrimSpace(sha))
+	walk, err := walkCommitsBySHAs(od.lookup.ctx, od.repoPath, []string{fullSHA})
+	if err != nil {
+		return nil, false, err
+	}
+	if len(walk) == 0 || walk[0].SHA != fullSHA {
+		return nil, false, nil
+	}
+	wc := walk[0]
+	if od.lookup.isTrackerOnlyCommit(wc) {
+		return nil, true, nil
+	}
+	files := make([]string, 0, len(wc.Files))
+	for _, f := range wc.Files {
+		if !isExcludedPath(f) && !od.lookup.isConfiguredTrackerPath(f) {
+			files = append(files, f)
+		}
+	}
+	orphan := OrphanCommit{
+		SHA:         wc.SHA,
+		ShortSHA:    shortSHA(wc.SHA),
+		Message:     wc.Subject,
+		Author:      wc.Author,
+		AuthorEmail: wc.AuthorEmail,
+		Timestamp:   wc.Timestamp,
+		Files:       files,
+	}
+	analyzed, err := od.analyzeOrphan(orphan)
+	if err != nil {
+		return nil, false, err
+	}
+	if analyzed.SuspicionScore == 0 {
+		return nil, false, nil
+	}
+	return &analyzed, false, nil
+}
+
 // analyzeOrphan applies heuristics to an orphan commit.
 func (od *OrphanDetector) analyzeOrphan(orphan OrphanCommit) (OrphanCandidate, error) {
 	candidate := OrphanCandidate{

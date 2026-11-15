@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -78,7 +79,7 @@ func TestVelocityComparisonNavigation(t *testing.T) {
 func TestVelocityComparisonSetDataClampsStaleScrollOffset(t *testing.T) {
 	theme := Theme{Renderer: lipgloss.DefaultRenderer()}
 	m := NewVelocityComparisonModel(theme)
-	m.SetSize(80, 5) // One visible data row.
+	m.SetSize(80, 8) // One visible data row (height 8 - 7 chrome lines).
 
 	now := time.Now().UTC()
 	var many []model.Issue
@@ -118,7 +119,7 @@ func TestVelocityComparisonSetDataClampsStaleScrollOffset(t *testing.T) {
 func TestVelocityComparisonResizeKeepsCursorVisible(t *testing.T) {
 	theme := Theme{Renderer: lipgloss.DefaultRenderer()}
 	m := NewVelocityComparisonModel(theme)
-	m.SetSize(80, 10) // Six visible data rows.
+	m.SetSize(80, 13) // Six visible data rows (height 13 - 7 chrome lines).
 
 	now := time.Now().UTC()
 	var issues []model.Issue
@@ -139,7 +140,7 @@ func TestVelocityComparisonResizeKeepsCursorVisible(t *testing.T) {
 		t.Fatalf("test setup = cursor %d, offset %d", m.cursor, m.scrollOffset)
 	}
 
-	m.SetSize(80, 5) // One visible data row.
+	m.SetSize(80, 8) // One visible data row.
 	if got, want := m.scrollOffset, m.cursor; got != want {
 		t.Fatalf("resize offset = %d, want cursor %d to remain visible", got, want)
 	}
@@ -288,4 +289,39 @@ func timePtr(t time.Time) *time.Time {
 
 func containsString(s, substr string) bool {
 	return len(s) > 0 && len(substr) > 0 && (s == substr || len(s) > len(substr) && (s[:len(substr)] == substr || containsString(s[1:], substr)))
+}
+
+func TestVelocityComparison24RowNoFooterClip(t *testing.T) {
+	theme := Theme{Renderer: lipgloss.DefaultRenderer()}
+	vc := NewVelocityComparisonModel(theme)
+	vc.SetSize(100, 18) // 24-row terminal passes inner modal height ~18 to VelocityComparisonModel
+
+	now := time.Now().UTC()
+	var issues []model.Issue
+	for i := 0; i < 20; i++ {
+		lbl := "label-" + string(rune('a'+i))
+		closedAt := now.Add(-time.Duration(i+1) * 24 * time.Hour)
+		issues = append(issues, model.Issue{
+			ID:       "V-" + lbl,
+			Labels:   []string{lbl},
+			Status:   model.StatusClosed,
+			ClosedAt: &closedAt,
+		})
+	}
+	vc.SetData(issues)
+
+	for step := 0; step < 19; step++ {
+		vc.MoveDown()
+	}
+	out := vc.View()
+	lines := strings.Split(out, "\n")
+	if len(lines) > 18 {
+		t.Fatalf("expected VelocityComparisonModel.View() <= 18 lines on 24-row terminal, got %d:\n%s", len(lines), out)
+	}
+	if !strings.Contains(out, "> label-t") {
+		t.Fatalf("expected final selected row '> label-t' visible after scrolling to bottom:\n%s", out)
+	}
+	if !strings.Contains(out, "esc: back") {
+		t.Fatalf("expected footer 'esc: back' unclipped on 24-row terminal:\n%s", out)
+	}
 }

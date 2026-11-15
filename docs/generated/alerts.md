@@ -11,6 +11,7 @@
 | `potential_duplicate` | Two open issues whose title/description keyword Jaccard similarity reaches the threshold (same detector as `--robot-suggest`); closed issues are never paired | Info | `duplicate_jaccard_threshold` (0.7), `duplicate_max_alerts` (10) |
 | `priority_mismatch` | `--robot-priority` recommends a *higher* priority with confidence at or above the floor (downgrade suggestions stay in `--robot-priority`) | Warning | `priority_mismatch_min_confidence` (0.6) |
 | `velocity_drop` | Closes in the last window fell by the percentage or more versus the previous window, which must contain at least the baseline count of closes | Warning | `velocity_drop_pct` (50), `velocity_window_days` (7), `velocity_min_baseline` (5) |
+| `source_inconsistency` | Live SQLite (`beads.db`) and local JSONL (`issues.jsonl`) tracker sources disagree on issue presence, status, priority, or title | Warning | `source_drift_alert` (true), `source_drift_max_alerts` (10) |
 
 **Drift checks** (compare the current graph with the baseline saved by `bv --save-baseline`):
 

@@ -34,7 +34,20 @@ var stopWords = map[string]bool{
 }
 
 func isClosedLikeDuplicateStatus(status model.Status) bool {
-	return status == model.StatusClosed || status == model.StatusTombstone
+	return model.IsClosedLikeStatus(status)
+}
+
+func shouldSkipDuplicateIssue(issue *model.Issue, config DuplicateConfig) bool {
+	if issue == nil {
+		return true
+	}
+	if issue.Status.Normalize() == model.StatusTombstone || issue.IsTemplate {
+		return true
+	}
+	if config.IgnoreClosed && isClosedLikeDuplicateStatus(issue.Status) {
+		return true
+	}
+	return false
 }
 
 // DuplicateConfig configures duplicate detection behavior
@@ -50,6 +63,12 @@ type DuplicateConfig struct {
 	// IgnoreClosedVsOpen skips pairs where one is closed and one is open
 	// Default: true
 	IgnoreClosedVsOpen bool
+
+	// IgnoreClosed skips closed/tombstoned issues completely (including
+	// closed-vs-closed pairs). Enabled by default in DefaultSuggestAllConfig
+	// and drift alerting so live consolidation suggestions are not buried by
+	// historical closed pairs.
+	IgnoreClosed bool
 
 	// IgnoreLinked skips pairs already connected by an explicit dependency edge
 	// (used by drift/hygiene alerting so already-triaged related/blocking pairs
@@ -95,6 +114,9 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 	index := make(map[string][]int)
 
 	for i := range issues {
+		if shouldSkipDuplicateIssue(&issues[i], config) {
+			continue
+		}
 		kws := extractKeywords(issues[i].Title, issues[i].Description)
 		keywords[i] = kws
 
@@ -209,7 +231,7 @@ func DetectDuplicates(issues []model.Issue, config DuplicateConfig) []Suggestion
 			issue1 := &issues[i]
 			issue2 := &issues[j]
 
-			if issue1.Status == model.StatusTombstone || issue2.Status == model.StatusTombstone {
+			if shouldSkipDuplicateIssue(issue1, config) || shouldSkipDuplicateIssue(issue2, config) {
 				continue
 			}
 

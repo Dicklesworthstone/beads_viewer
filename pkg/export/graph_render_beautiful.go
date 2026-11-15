@@ -1,10 +1,89 @@
 package export
 
 import (
+	"encoding/json"
 	"fmt"
 	"html"
+	"sort"
+	"strings"
 	"time"
+	"unicode"
 )
+
+func formatFilterOptionLabel(raw string) string {
+	cleaned := strings.NewReplacer("_", " ", "-", " ").Replace(strings.TrimSpace(raw))
+	parts := strings.Fields(cleaned)
+	if len(parts) == 0 {
+		return raw
+	}
+	for i, part := range parts {
+		runes := []rune(part)
+		runes[0] = unicode.ToUpper(runes[0])
+		parts[i] = string(runes)
+	}
+	return strings.Join(parts, " ")
+}
+
+func buildCustomFilterOptionsHTML(graphDataJSON string) (string, string) {
+	var parsed struct {
+		Nodes []struct {
+			Status string `json:"status"`
+			Type   string `json:"type"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(graphDataJSON), &parsed); err != nil {
+		return "", ""
+	}
+	builtinStatuses := map[string]bool{
+		"": true, "all": true, "actionable": true,
+		"open": true, "in_progress": true, "blocked": true, "closed": true,
+	}
+	builtinTypes := map[string]bool{
+		"": true, "all": true,
+		"feature": true, "bug": true, "task": true, "epic": true,
+	}
+	customStatusSet := make(map[string]bool)
+	customTypeSet := make(map[string]bool)
+	for _, n := range parsed.Nodes {
+		st := strings.TrimSpace(n.Status)
+		if !builtinStatuses[st] {
+			customStatusSet[st] = true
+		}
+		tp := strings.TrimSpace(n.Type)
+		if !builtinTypes[tp] {
+			customTypeSet[tp] = true
+		}
+	}
+
+	var statusKeys []string
+	for k := range customStatusSet {
+		statusKeys = append(statusKeys, k)
+	}
+	sort.Strings(statusKeys)
+
+	var typeKeys []string
+	for k := range customTypeSet {
+		typeKeys = append(typeKeys, k)
+	}
+	sort.Strings(typeKeys)
+
+	var statusSB, typeSB strings.Builder
+	for _, st := range statusKeys {
+		statusSB.WriteString("\n                    <option value=\"")
+		statusSB.WriteString(html.EscapeString(st))
+		statusSB.WriteString("\">")
+		statusSB.WriteString(html.EscapeString(formatFilterOptionLabel(st)))
+		statusSB.WriteString("</option>")
+	}
+	for _, tp := range typeKeys {
+		typeSB.WriteString("\n                    <option value=\"")
+		typeSB.WriteString(html.EscapeString(tp))
+		typeSB.WriteString("\">")
+		typeSB.WriteString(html.EscapeString(formatFilterOptionLabel(tp)))
+		typeSB.WriteString("</option>")
+	}
+	return statusSB.String(), typeSB.String()
+}
 
 // generateUltimateHTML creates the enhanced HTML visualization with all features
 func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edgeCount int, projectName, forceGraphLib, markedLib string) string {
@@ -12,7 +91,7 @@ func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edge
 	safeTitle := html.EscapeString(title)
 	safeHash := html.EscapeString(dataHash)
 	safeProject := html.EscapeString(projectName)
-	return fmt.Sprintf(`<!DOCTYPE html>
+	rendered := fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -392,10 +471,12 @@ func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edge
         .badge {
             font-size: 0.65rem; padding: 0.2rem 0.5rem; border-radius: 4px;
             text-transform: uppercase; font-weight: 600; letter-spacing: 0.03em;
+            background: #64748b; color: white;
         }
         .badge-open { background: var(--green); color: var(--bg); }
         .badge-in_progress { background: var(--orange); color: var(--bg); }
         .badge-blocked { background: var(--red); color: white; }
+        .badge-deferred, .badge-draft, .badge-review, .badge-pinned, .badge-hooked { background: #64748b; color: white; }
         .badge-closed { background: var(--fg-dim); color: var(--bg); }
         .badge-type { background: var(--purple); color: white; }
         .badge-feature { background: linear-gradient(135deg, var(--purple), var(--pink)); color: white; }
@@ -814,6 +895,7 @@ func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edge
                     <div class="legend-item"><div class="legend-dot" style="background:#22c55e;color:#22c55e"></div>Open</div>
                     <div class="legend-item"><div class="legend-dot" style="background:#f97316;color:#f97316"></div>In Progress</div>
                     <div class="legend-item"><div class="legend-dot" style="background:#ef4444;color:#ef4444"></div>Blocked</div>
+                    <div class="legend-item"><div class="legend-dot" style="background:#94a3b8;color:#94a3b8"></div>Deferred / Custom</div>
                     <div class="legend-item"><div class="legend-dot" style="background:#555577;color:#555577"></div>Closed</div>
                 </div>
             </div>
@@ -929,9 +1011,9 @@ func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edge
     <script>%s</script>
     <script>
 const DATA = %s;
-const STATUS_COLORS = { open: '#22c55e', in_progress: '#f97316', blocked: '#ef4444', closed: '#555577' };
+const STATUS_COLORS = { open: '#22c55e', in_progress: '#f97316', blocked: '#ef4444', deferred: '#94a3b8', draft: '#94a3b8', review: '#94a3b8', pinned: '#94a3b8', hooked: '#94a3b8', closed: '#555577', tombstone: '#555577' };
 const PRIORITY_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#555577'];
-const TYPE_COLORS = { feature: '#a855f7', bug: '#ef4444', task: '#22d3ee', epic: '#fbbf24' };
+const TYPE_COLORS = { feature: '#a855f7', bug: '#ef4444', task: '#22d3ee', epic: '#fbbf24', chore: '#94a3b8' };
 
 // Configure marked for safe HTML rendering
 marked.setOptions({ breaks: true, gfm: true });
@@ -1081,7 +1163,10 @@ function getNodeStatusColor(n) {
     if ((n.status === 'open' || n.status === 'in_progress') && (n.blockerCount || 0) > 0) {
         return STATUS_COLORS.blocked;
     }
-    return STATUS_COLORS[n.status] || '#555577';
+    if (STATUS_COLORS[n.status]) {
+        return STATUS_COLORS[n.status];
+    }
+    return isActiveNodeStatus(n.status) ? '#94a3b8' : STATUS_COLORS.closed;
 }
 
 function computeNodeBaseColor(n) {
@@ -2055,7 +2140,7 @@ document.getElementById('view-mode').addEventListener('change', e => {
 
 // Keyboard shortcuts
 document.onkeydown = e => {
-    if (e.target.tagName === 'INPUT') return;
+    if (e.target && (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable)) return;
     if (e.key === '?') { toggleHelp(); return; }
     switch(e.key.toLowerCase()) {
         case 'f': Graph.zoomToFit(400, 50); break;
@@ -2088,4 +2173,12 @@ setTimeout(() => { Graph.zoomToFit(400, 50); updateVisibleCount(); updateMinimap
     </script>
 </body>
 </html>`, safeTitle, safeTitle, nodeCount, edgeCount, nodeCount, nodeCount, edgeCount, timestamp, safeHash, safeProject, forceGraphLib, markedLib, graphDataJSON)
+	customStatusOpts, customTypeOpts := buildCustomFilterOptionsHTML(graphDataJSON)
+	if customStatusOpts != "" {
+		rendered = strings.Replace(rendered, `<option value="closed">Closed</option>`, `<option value="closed">Closed</option>`+customStatusOpts, 1)
+	}
+	if customTypeOpts != "" {
+		rendered = strings.Replace(rendered, `<option value="epic">Epic</option>`, `<option value="epic">Epic</option>`+customTypeOpts, 1)
+	}
+	return rendered
 }

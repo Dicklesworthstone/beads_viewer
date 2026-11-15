@@ -693,9 +693,13 @@ func ComputeSemanticFilterCmd(s *SemanticSearch, term string, dataGen, queryGen 
 }
 
 // BuildHybridMetricsCmd computes metrics for hybrid scoring asynchronously.
-func BuildHybridMetricsCmd(issues []model.Issue, dataGen, buildGen uint64) tea.Cmd {
+func BuildHybridMetricsCmd(issues []model.Issue, dataGen, buildGen uint64, readiness ...*model.ReadinessIndex) tea.Cmd {
+	var authReadiness *model.ReadinessIndex
+	if len(readiness) > 0 {
+		authReadiness = readiness[0]
+	}
 	return func() tea.Msg {
-		loader := search.NewAnalyzerMetricsLoader(issues).WithCache(analysis.GetGlobalCache())
+		loader := search.NewAnalyzerMetricsLoaderWithReadiness(issues, authReadiness).WithCache(analysis.GetGlobalCache())
 		metrics, err := loader.LoadMetrics()
 		if err != nil {
 			return HybridMetricsReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}
