@@ -511,3 +511,87 @@ go() {
 		t.Fatalf("brew read from piped stdin: %s", stderr)
 	}
 }
+
+func TestDefaultInstallDirSkipsRelativePathEntries(t *testing.T) {
+	home := t.TempDir()
+	absBin := filepath.Join(t.TempDir(), "absbin")
+	if err := os.MkdirAll(absBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Do not create ~/.local/bin so default_install_dir reaches PATH fallback.
+	// Relative ".", "", and "./bin" entries must never be selected.
+	out, stderr, code := runInstallFunc(t, []string{
+		"HOME=" + home,
+		"INSTALL_DIR=",
+		"PATH=.:./bin::" + absBin,
+	}, "", `default_install_dir`, "")
+	if code != 0 || strings.TrimSpace(out) != absBin {
+		t.Fatalf("default_install_dir picked relative dir or failed: exit=%d out=%q want=%q stderr=%s", code, out, absBin, stderr)
+	}
+}
+
+func TestPinnedVersionMetadataFailureRefusesUnverifiedSourceFallback(t *testing.T) {
+	installDir := t.TempDir()
+	setup := `
+ensure_json_tool() { JSON_TOOL=jq; return 0; }
+get_release_by_tag() { return 1; }
+try_go_install() { echo "UNEXPECTED_SOURCE_FALLBACK" >&2; return 0; }`
+	out, stderr, code := runInstallFunc(t, []string{"INSTALL_DIR=" + installDir}, setup, `parse_args --version v9.9.9 && try_binary_install linux_amd64`, "")
+	if code == 0 {
+		t.Fatalf("expected pinned --version lookup failure to exit non-zero, got out=%q stderr=%q", out, stderr)
+	}
+	if strings.Contains(stderr, "UNEXPECTED_SOURCE_FALLBACK") {
+		t.Fatalf("pinned --version lookup failure fell back to source: %s", stderr)
+	}
+	if !strings.Contains(out+stderr, "Could not fetch release metadata for v9.9.9") {
+		t.Fatalf("expected clear pinned-version failure message, got out=%q stderr=%q", out, stderr)
+	}
+}
+
+func TestGitHubAPIGetForwardsAuthTokenAndSourceBuildScrubsEnv(t *testing.T) {
+	setup := `
+curl() {
+    printf '%s\n' "$@"
+}`
+	out, stderr, code := runInstallFunc(t, []string{"GITHUB_TOKEN=ghs_test_token"}, setup, `get_latest_release`, "")
+	if code != 0 || !strings.Contains(out, "Authorization: Bearer ghs_test_token") {
+		t.Fatalf("expected Authorization header when GITHUB_TOKEN is set: exit=%d out=%q stderr=%s", code, out, stderr)
+	}
+
+	dir := t.TempDir()
+	buildDir := filepath.Join(dir, "build")
+	installDir := filepath.Join(dir, "install")
+	for _, p := range []string{buildDir, installDir} {
+		if err := os.MkdirAll(p, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srcSetup := `
+ensure_go() { printf '1.26.11'; }
+make_tmp_dir() { printf '%s\n' "$BUILD_FIXTURE"; }
+git() { mkdir -p "$5/vendor"; printf 'module example.test/bv\ngo 1.26.11\n' > "$5/go.mod"; }
+go() {
+    if [ "$1" = version ] && [ "$2" = -m ]; then
+        printf '%s: go1.26.11\n' "$3"
+        return 0
+    fi
+    [ -z "$GOFLAGS" ] || { echo "GOFLAGS leaked: $GOFLAGS" >&2; return 91; }
+    [ -z "$GOOS" ] || { echo "GOOS leaked: $GOOS" >&2; return 92; }
+    [ -z "$GOARCH" ] || { echo "GOARCH leaked: $GOARCH" >&2; return 93; }
+    case " $* " in
+        *" -mod=vendor "*) ;;
+        *) echo "missing -mod=vendor in args: $*" >&2; return 94 ;;
+    esac
+    printf 'ok\n' > "$3"
+}`
+	out, stderr, code = runInstallFunc(t, []string{
+		"BUILD_FIXTURE=" + buildDir,
+		"INSTALL_DIR=" + installDir,
+		"GOFLAGS=-mod=readonly -race",
+		"GOOS=plan9",
+		"GOARCH=mips",
+	}, srcSetup, `try_go_install`, "")
+	if code != 0 {
+		t.Fatalf("expected source build env scrub + -mod=vendor to succeed: exit=%d out=%q stderr=%s", code, out, stderr)
+	}
+}

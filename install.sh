@@ -47,10 +47,10 @@ default_install_dir() {
         fi
     done
 
-    # Fall back to the first writable entry in PATH
+    # Fall back to the first writable absolute entry in PATH
     IFS=: read -r -a path_entries <<<"${PATH:-}"
     for dir in "${path_entries[@]}"; do
-        if [ -d "$dir" ] && [ -w "$dir" ]; then
+        if [[ "$dir" == /* ]] && [ -d "$dir" ] && [ -w "$dir" ]; then
             echo "$dir"
             return
         fi
@@ -179,29 +179,34 @@ detect_platform() {
     echo "${os}_${arch}"
 }
 
-get_latest_release() {
-    local url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+github_api_get() {
+    local url="$1"
+    local auth_token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$url" 2>/dev/null || return 1
+        if [ -n "$auth_token" ]; then
+            curl -fsSL -H "Authorization: Bearer ${auth_token}" "$url" 2>/dev/null || return 1
+        else
+            curl -fsSL "$url" 2>/dev/null || return 1
+        fi
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO- "$url" 2>/dev/null || return 1
+        if [ -n "$auth_token" ]; then
+            wget -qO- --header="Authorization: Bearer ${auth_token}" "$url" 2>/dev/null || return 1
+        else
+            wget -qO- "$url" 2>/dev/null || return 1
+        fi
     else
         return 1
     fi
 }
 
+get_latest_release() {
+    github_api_get "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+}
+
 get_release_by_tag() {
     local tag="$1"
-    local url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${tag}"
-
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$url" 2>/dev/null || return 1
-    elif command -v wget >/dev/null 2>&1; then
-        wget -qO- "$url" 2>/dev/null || return 1
-    else
-        return 1
-    fi
+    github_api_get "https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${tag}"
 }
 
 download_file() {
@@ -622,7 +627,10 @@ try_binary_install() {
     # Get release info (pinned tag when --version/BV_VERSION is set, else latest)
     local release_json
     if [ -n "$TARGET_VERSION" ]; then
-        release_json=$(get_release_by_tag "$TARGET_VERSION") || return 1
+        if ! release_json=$(get_release_by_tag "$TARGET_VERSION"); then
+            print_error "Could not fetch release metadata for $TARGET_VERSION from GitHub; pass --from-source to build tag from source"
+            exit 1
+        fi
     else
         release_json=$(get_latest_release) || return 1
     fi
@@ -763,7 +771,11 @@ try_binary_install() {
 
     # Install to destination
     ensure_install_dir "$INSTALL_DIR"
-    local dest_path="$INSTALL_DIR/$BIN_NAME"
+    local dest_name="$BIN_NAME"
+    if [[ "$platform" == windows_* ]]; then
+        dest_name="${BIN_NAME}.exe"
+    fi
+    local dest_path="$INSTALL_DIR/$dest_name"
 
     if [ -w "$INSTALL_DIR" ]; then
         mv "$binary_path" "$dest_path"
@@ -843,16 +855,22 @@ try_go_install() {
         fi
     fi
 
-    local toolchain
+    local toolchain bin_ext=""
+    case "$(uname -s | tr '[:upper:]' '[:lower:]')" in
+        mingw*|msys*|cygwin*) bin_ext=".exe" ;;
+    esac
     if ! toolchain=$(source_toolchain "$src_dir/go.mod"); then
         exit 1
     fi
     print_info "Building $BIN_NAME from source with $toolchain..."
-    build_output="$tmp_dir/$BIN_NAME"
+    build_output="$tmp_dir/${BIN_NAME}${bin_ext}"
 
     local build_extra_args=()
+    if [ -d "$src_dir/vendor" ]; then
+        build_extra_args+=(-mod=vendor)
+    fi
     if [ -n "$TARGET_VERSION" ]; then
-        build_extra_args=(-ldflags "-X github.com/${REPO_OWNER}/${REPO_NAME}/pkg/version.version=${TARGET_VERSION}")
+        build_extra_args+=(-ldflags "-X github.com/${REPO_OWNER}/${REPO_NAME}/pkg/version.version=${TARGET_VERSION}")
     elif [ "$used_main_tarball" -eq 1 ]; then
         # A codeload main tarball lacks .git VCS metadata, so pkg/version.init()
         # cannot append -dev+<sha>. Stamp -source explicitly so an unverified
@@ -865,10 +883,10 @@ try_go_install() {
                 base_ver="${parsed_ver%%-*}"
             fi
         fi
-        build_extra_args=(-ldflags "-X github.com/${REPO_OWNER}/${REPO_NAME}/pkg/version.version=${base_ver}-source")
+        build_extra_args+=(-ldflags "-X github.com/${REPO_OWNER}/${REPO_NAME}/pkg/version.version=${base_ver}-source")
     fi
 
-    if ! (cd "$src_dir" && GO111MODULE=on CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN="$toolchain" go build -o "$build_output" ${build_extra_args[@]+"${build_extra_args[@]}"} "./cmd/$BIN_NAME"); then
+    if ! (cd "$src_dir" && GOFLAGS="" GOOS="" GOARCH="" GO111MODULE=on CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN="$toolchain" go build -o "$build_output" ${build_extra_args[@]+"${build_extra_args[@]}"} "./cmd/$BIN_NAME"); then
         print_error "Go build failed."
         exit 1
     fi
@@ -878,7 +896,7 @@ try_go_install() {
     fi
 
     ensure_install_dir "$INSTALL_DIR"
-    local dest_path="$INSTALL_DIR/$BIN_NAME"
+    local dest_path="$INSTALL_DIR/${BIN_NAME}${bin_ext}"
 
     if [ -w "$INSTALL_DIR" ]; then
         mv "$build_output" "$dest_path"

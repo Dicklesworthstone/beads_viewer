@@ -61,6 +61,11 @@
                 echo "Nix compiler does not match go.mod: expected $expected_go" >&2
                 exit 1
               fi
+              expected_bv_ver="$(awk -F'"' '/^[[:space:]]*const fallback[[:space:]]*=/ { sub(/^v/, "", $2); print $2; exit }' pkg/version/version.go)"
+              if [ -z "$expected_bv_ver" ] || [ "$expected_bv_ver" != "${bvVersion}" ]; then
+                echo "flake.nix bvVersion (${bvVersion}) does not match pkg/version/version.go (v$expected_bv_ver)" >&2
+                exit 1
+              fi
             '';
 
             postInstall = ''
@@ -107,6 +112,7 @@
           GOWORK = "off";
           buildInputs = [
             go
+            pkgs.gitMinimal
             pkgs.gopls
             pkgs.gotools
             pkgs.go-tools
