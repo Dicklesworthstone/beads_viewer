@@ -6,7 +6,6 @@ package datasource
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -395,17 +394,11 @@ func discoverWorktreeSources(repoPath string, opts DiscoveryOptions) ([]DataSour
 		}
 	}
 
-	// Find git directory
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
-	cmd.Dir = repoPath
-	out, err := cmd.Output()
+	// Find git directory via loader.GetGitDir (sanitizes ambient GIT_DIR/GIT_* and disables replace objects)
+	gitDir, err := loader.GetGitDir(repoPath)
 	if err != nil {
 		// Not a git repository
 		return nil, nil
-	}
-	gitDir := strings.TrimSpace(string(out))
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(repoPath, gitDir)
 	}
 
 	// Look for beads-worktrees directory
