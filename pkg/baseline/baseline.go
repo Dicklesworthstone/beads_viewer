@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 // Baseline represents a snapshot of project metrics at a point in time
@@ -158,10 +159,14 @@ func GetGitInfo(dir string) (sha, message, branch string) {
 	return sha, message, branch
 }
 
-// runGit runs a git command and returns output
+// runGit runs a git command with sanitized ambient GIT_* variables and replace-refs disabled.
 func runGit(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
+	gitArgs := make([]string, 0, len(args)+1)
+	gitArgs = append(gitArgs, "--no-replace-objects")
+	gitArgs = append(gitArgs, args...)
+	cmd := exec.Command("git", gitArgs...)
 	cmd.Dir = dir
+	cmd.Env = loader.SanitizedGitEnv()
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err

@@ -117,6 +117,14 @@ func resolveGitLoaderRoot(repoPath string) string {
 	return repoPath
 }
 
+// SanitizedGitEnv returns the process environment stripped of ambient Git
+// repository/config routing overrides (GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR,
+// GIT_CONFIG*, etc.) with LC_ALL=C pinned so Git subprocesses stay anchored to
+// their explicit working directory.
+func SanitizedGitEnv() []string {
+	return gitLoaderEnvironment()
+}
+
 func gitLoaderEnvironment() []string {
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
