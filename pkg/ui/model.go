@@ -12605,6 +12605,9 @@ func (m *Model) exportIssuesForCurrentView() []model.Issue {
 	out := make([]model.Issue, 0, len(visible))
 	for _, item := range visible {
 		if issueItem, ok := item.(IssueItem); ok {
+			if m.candidateIDs != nil && !m.candidateIDs[issueItem.Issue.ID] {
+				continue
+			}
 			out = append(out, issueItem.Issue)
 		}
 	}
