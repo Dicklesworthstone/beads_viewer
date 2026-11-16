@@ -1,7 +1,10 @@
 package workspace
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,8 +178,23 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("parsing workspace config: %w", err)
+	if len(bytes.TrimSpace(data)) > 0 {
+		dec := yaml.NewDecoder(bytes.NewReader(data))
+		dec.KnownFields(true)
+		if err := dec.Decode(&config); err != nil {
+			if !errors.Is(err, io.EOF) {
+				return nil, fmt.Errorf("parsing workspace config: %w", err)
+			}
+		} else {
+			var extra yaml.Node
+			if err := dec.Decode(&extra); err != nil {
+				if !errors.Is(err, io.EOF) {
+					return nil, fmt.Errorf("parsing workspace config: %w", err)
+				}
+			} else {
+				return nil, fmt.Errorf("parsing workspace config: line %d: multiple YAML documents are not supported", extra.Line)
+			}
+		}
 	}
 
 	// Apply defaults
