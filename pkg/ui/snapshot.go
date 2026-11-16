@@ -348,10 +348,11 @@ type GraphLayout struct {
 // BoardState contains precomputed Kanban columns for each swimlane mode.
 // This lets the UI swap board data in O(1) when the full dataset is shown.
 type BoardState struct {
-	ByStatus    [4][]model.Issue
-	ByPriority  [4][]model.Issue
-	ByType      [4][]model.Issue
-	BlocksIndex map[string][]string
+	ByStatus     [4][]model.Issue
+	ByPriority   [4][]model.Issue
+	ByType       [4][]model.Issue
+	BlocksIndex  map[string][]string
+	ReferenceNow time.Time
 }
 
 func (s *BoardState) ColumnsForMode(mode SwimLaneMode) [4][]model.Issue {
@@ -632,18 +633,24 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		}
 	}
 
-	var recipeTriage map[string]float64
-	var triageResult analysis.TriageResult
-	if b.cfg.PrecomputeTriage || (b.recipe != nil && b.recipe.NeedsTriageScores()) {
+	var (
+		recipeTriage  map[string]float64
+		triageResult  analysis.TriageResult
+		triageScores  map[string]float64
+		triageReasons map[string]analysis.TriageReasons
+		quickWinSet   map[string]bool
+		blockerSet    map[string]bool
+		unblocksMap   map[string][]string
+	)
+	hasTriage := b.cfg.PrecomputeTriage || (b.recipe != nil && b.recipe.NeedsTriageScores())
+	if hasTriage {
 		opts := analysis.TriageOptions{}
 		if feedbackWeights != nil {
 			opts.Weights = feedbackWeights
 		}
 		triageResult = analysis.ComputeTriageFromAnalyzer(b.analyzer, graphStats, issues, opts, now)
-		recipeTriage = make(map[string]float64, len(triageResult.Recommendations))
-		for _, rec := range triageResult.Recommendations {
-			recipeTriage[rec.ID] = rec.Score
-		}
+		triageScores, triageReasons, quickWinSet, blockerSet, unblocksMap = extractTriageMaps(triageResult)
+		recipeTriage = triageScores
 	}
 	viewIssues := issues
 	var recipeErr error
@@ -668,41 +675,8 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		listItems = buildListItems(viewIssues, statsForListItems)
 	}
 
-	var (
-		triageScores  map[string]float64
-		triageReasons map[string]analysis.TriageReasons
-		quickWinSet   map[string]bool
-		blockerSet    map[string]bool
-		unblocksMap   map[string][]string
-	)
-
-	// Compute triage insights (may be skipped for large/huge datasets; bv-9thm).
-	if b.cfg.PrecomputeTriage || (b.recipe != nil && b.recipe.NeedsTriageScores()) {
-		triageScores = make(map[string]float64, len(triageResult.Recommendations))
-		triageReasons = make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
-		quickWinSet = make(map[string]bool, len(triageResult.QuickWins))
-		blockerSet = make(map[string]bool, len(triageResult.BlockersToClear))
-		unblocksMap = make(map[string][]string, len(triageResult.Recommendations))
-
-		for _, rec := range triageResult.Recommendations {
-			triageScores[rec.ID] = rec.Score
-			if len(rec.Reasons) > 0 {
-				triageReasons[rec.ID] = analysis.TriageReasons{
-					Primary:    rec.Reasons[0],
-					All:        rec.Reasons,
-					ActionHint: rec.Action,
-				}
-			}
-			unblocksMap[rec.ID] = rec.UnblocksIDs
-		}
-		for _, qw := range triageResult.QuickWins {
-			quickWinSet[qw.ID] = true
-		}
-		for _, bl := range triageResult.BlockersToClear {
-			blockerSet[bl.ID] = true
-		}
-
-		// Update list items with triage data
+	// Populate list items with triage insights (may be skipped for large/huge datasets; bv-9thm).
+	if hasTriage {
 		for i := range listItems {
 			id := listItems[i].Issue.ID
 			listItems[i].TriageScore = triageScores[id]
@@ -726,7 +700,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 
 	var boardState *BoardState
 	if b.cfg.PrecomputeBoard {
-		boardState = buildBoardState(issues)
+		boardState = buildBoardStateAt(issues, now)
 	}
 
 	insights := analysis.Insights{Stats: graphStats, ClusterDensity: graphStats.Density}
@@ -1000,7 +974,7 @@ func applyRecipeToIssues(issues []model.Issue, analyzer *analysis.Analyzer, stat
 		metrics.Readiness = analyzer.Readiness()
 	}
 	candidates := issues
-	if r.Filters.Actionable != nil && analyzer != nil {
+	if analyzer != nil && analyzer.HasCandidateScope() {
 		candidates = make([]model.Issue, 0, len(issues))
 		for _, issue := range issues {
 			if analyzer.IsCandidate(issue.ID) {
@@ -1009,6 +983,45 @@ func applyRecipeToIssues(issues []model.Issue, analyzer *analysis.Analyzer, stat
 		}
 	}
 	return recipe.Apply(candidates, metrics, r, now)
+}
+
+func extractTriageMaps(triageResult analysis.TriageResult) (
+	triageScores map[string]float64,
+	triageReasons map[string]analysis.TriageReasons,
+	quickWinSet map[string]bool,
+	blockerSet map[string]bool,
+	unblocksMap map[string][]string,
+) {
+	triageScores = make(map[string]float64, len(triageResult.Recommendations))
+	triageReasons = make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
+	quickWinSet = make(map[string]bool, len(triageResult.QuickWins))
+	blockerSet = make(map[string]bool, len(triageResult.BlockersToClear))
+	unblocksMap = make(map[string][]string, len(triageResult.Recommendations))
+
+	for _, rec := range triageResult.Recommendations {
+		triageScores[rec.ID] = rec.Score
+		if len(rec.Reasons) > 0 {
+			reasonsCopy := make([]string, len(rec.Reasons))
+			copy(reasonsCopy, rec.Reasons)
+			triageReasons[rec.ID] = analysis.TriageReasons{
+				Primary:    reasonsCopy[0],
+				All:        reasonsCopy,
+				ActionHint: rec.Action,
+			}
+		}
+		if len(rec.UnblocksIDs) > 0 {
+			cp := make([]string, len(rec.UnblocksIDs))
+			copy(cp, rec.UnblocksIDs)
+			unblocksMap[rec.ID] = cp
+		}
+	}
+	for _, qw := range triageResult.QuickWins {
+		quickWinSet[qw.ID] = true
+	}
+	for _, bl := range triageResult.BlockersToClear {
+		blockerSet[bl.ID] = true
+	}
+	return triageScores, triageReasons, quickWinSet, blockerSet, unblocksMap
 }
 
 func buildGraphLayout(issues []model.Issue, stats *analysis.GraphStats) *GraphLayout {
@@ -1052,14 +1065,19 @@ func buildGraphLayout(issues []model.Issue, stats *analysis.GraphStats) *GraphLa
 }
 
 func buildBoardState(issues []model.Issue) *BoardState {
+	return buildBoardStateAt(issues, time.Time{})
+}
+
+func buildBoardStateAt(issues []model.Issue, now time.Time) *BoardState {
 	if len(issues) == 0 {
 		return nil
 	}
 	return &BoardState{
-		ByStatus:    groupIssuesByMode(issues, SwimByStatus),
-		ByPriority:  groupIssuesByMode(issues, SwimByPriority),
-		ByType:      groupIssuesByMode(issues, SwimByType),
-		BlocksIndex: buildBlocksIndex(issues),
+		ByStatus:     groupIssuesByMode(issues, SwimByStatus),
+		ByPriority:   groupIssuesByMode(issues, SwimByPriority),
+		ByType:       groupIssuesByMode(issues, SwimByType),
+		BlocksIndex:  buildBlocksIndex(issues),
+		ReferenceNow: now,
 	}
 }
 
@@ -1260,7 +1278,9 @@ func deepCopyBoardState(bs *BoardState) *BoardState {
 	if bs == nil {
 		return nil
 	}
-	cloned := &BoardState{}
+	cloned := &BoardState{
+		ReferenceNow: bs.ReferenceNow,
+	}
 	for i := 0; i < 4; i++ {
 		if len(bs.ByStatus[i]) > 0 {
 			cloned.ByStatus[i] = make([]model.Issue, len(bs.ByStatus[i]))
@@ -1405,29 +1425,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		}
 		triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, stats, issues, opts, analyzer.Now())
 		completedTriage = &triageResult
-		triageScores = make(map[string]float64, len(triageResult.Recommendations))
-		triageReasons = make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
-		quickWinSet = make(map[string]bool, len(triageResult.QuickWins))
-		blockerSet = make(map[string]bool, len(triageResult.BlockersToClear))
-		unblocksMap = make(map[string][]string, len(triageResult.Recommendations))
-
-		for _, rec := range triageResult.Recommendations {
-			triageScores[rec.ID] = rec.Score
-			if len(rec.Reasons) > 0 {
-				triageReasons[rec.ID] = analysis.TriageReasons{
-					Primary:    rec.Reasons[0],
-					All:        rec.Reasons,
-					ActionHint: rec.Action,
-				}
-			}
-			unblocksMap[rec.ID] = rec.UnblocksIDs
-		}
-		for _, qw := range triageResult.QuickWins {
-			quickWinSet[qw.ID] = true
-		}
-		for _, bl := range triageResult.BlockersToClear {
-			blockerSet[bl.ID] = true
-		}
+		triageScores, triageReasons, quickWinSet, blockerSet, unblocksMap = extractTriageMaps(triageResult)
 	}
 
 	// Deep copy tree structures since tree view mutates node.Expanded and node.Children.
@@ -1465,6 +1463,22 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		listModelItems[i] = listItems[i]
 		listIndexByID[listItems[i].Issue.ID] = i
 	}
+	newListOrderHash := listOrderFingerprint(listItems)
+	semanticIDs := s.semanticIDs
+	semanticDocs := s.semanticDocs
+	if newListOrderHash != s.listOrderHash || len(listItems) != len(s.semanticIDs) {
+		semanticIDs = make([]string, len(listItems))
+		semanticDocs = make(map[string]string, len(listItems))
+		for i := range listItems {
+			id := listItems[i].Issue.ID
+			semanticIDs[i] = id
+			if doc, ok := s.semanticDocs[id]; ok {
+				semanticDocs[id] = doc
+			} else {
+				semanticDocs[id] = search.IssueDocument(listItems[i].Issue)
+			}
+		}
+	}
 	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsForDir(issuesClone, stats, analyzer, s.projectDir)
 
 	return &DataSnapshot{
@@ -1477,9 +1491,9 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		ListItems:      listItems, // Deep copy - contains mutable SearchComponents/TriageReasons
 		listModelItems: listModelItems,
 		listIndexByID:  listIndexByID,
-		listOrderHash:  listOrderFingerprint(listItems),
-		semanticIDs:    s.semanticIDs,
-		semanticDocs:   s.semanticDocs,
+		listOrderHash:  newListOrderHash,
+		semanticIDs:    semanticIDs,
+		semanticDocs:   semanticDocs,
 		alerts:         alerts,
 		alertsCritical: alertsCritical,
 		alertsWarning:  alertsWarning,

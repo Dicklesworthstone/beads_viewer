@@ -193,6 +193,11 @@ func (a *Analyzer) GenerateScopedInsights(s *GraphStats, limit int, includeInact
 		limit = s.NodeCount
 	}
 
+	clusterDensity := s.Density
+	if a.HasScope() {
+		_, _, clusterDensity = a.ScopedGraphTotals(s)
+	}
+
 	return Insights{
 		Bottlenecks:    getTopItems(betweenness, limit),
 		Keystones:      getTopItems(criticalPath, limit),
@@ -204,7 +209,7 @@ func (a *Analyzer) GenerateScopedInsights(s *GraphStats, limit int, includeInact
 		Slack:          getTopItems(slack, limit),
 		Orphans:        limitStrings(orphans, limit),
 		Cycles:         cycles,
-		ClusterDensity: s.Density,
+		ClusterDensity: clusterDensity,
 		Stats:          s,
 	}
 }

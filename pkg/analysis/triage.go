@@ -59,6 +59,11 @@ type TriageResult struct {
 	// These allow multiple agents to grab their own top-N without collision
 	RecommendationsByTrack []TrackRecommendationGroup `json:"recommendations_by_track,omitempty"`
 	RecommendationsByLabel []LabelRecommendationGroup `json:"recommendations_by_label,omitempty"`
+
+	// Internal full-corpus triage lookups for in-process callers (TUI / export)
+	// while keeping Recommendations capped at TopN on the --robot-triage JSON wire.
+	AllScores   map[string]float64  `json:"-"`
+	UnblocksMap map[string][]string `json:"-"`
 }
 
 // TriageMeta contains metadata about the triage computation
@@ -872,12 +877,32 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 	alerts := buildTriageAlerts(analyzer, candidateIssues, stats, staleness, projectVelocity, now)
 	partition := analyzer.CountStatusPartition()
 
+	allScores := make(map[string]float64, len(triageScores))
+	for _, score := range triageScores {
+		if analyzer.IsCandidate(score.IssueID) {
+			allScores[score.IssueID] = score.TriageScore
+		}
+	}
+	scopedUnblocksMap := make(map[string][]string, len(unblocksMap))
+	for id, ids := range unblocksMap {
+		if !analyzer.IsCandidate(id) {
+			continue
+		}
+		if len(ids) > 0 {
+			copied := make([]string, len(ids))
+			copy(copied, ids)
+			scopedUnblocksMap[id] = copied
+		} else {
+			scopedUnblocksMap[id] = nil
+		}
+	}
+
 	return TriageResult{
 		Meta: TriageMeta{
 			Version:       "1.0.0",
 			GeneratedAt:   now,
 			Phase2Ready:   stats.IsPhase2Ready(),
-			IssueCount:    len(issues),
+			IssueCount:    counts.Total,
 			ComputeTimeMs: elapsed.Milliseconds(),
 		},
 		Status: stats.Status(),
@@ -897,6 +922,8 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 		BlockersToClear:        blockersToClear,
 		RecommendationsByTrack: recsByTrack,
 		RecommendationsByLabel: recsByLabel,
+		AllScores:              allScores,
+		UnblocksMap:            scopedUnblocksMap,
 		ProjectHealth: ProjectHealth{
 			Counts:    counts,
 			Graph:     buildScopedGraphHealth(stats, analyzer),
@@ -1521,20 +1548,36 @@ func buildGraphHealth(stats *GraphStats) GraphHealth {
 // cycle counts to cycles involving at least one candidate issue when analyzer
 // has an active candidate scope.
 func buildScopedGraphHealth(stats *GraphStats, analyzer *Analyzer) GraphHealth {
+	if stats == nil && analyzer == nil {
+		return GraphHealth{}
+	}
+	var rawCycles [][]string
+	phase2Ready := false
+	if stats != nil {
+		rawCycles = stats.Cycles()
+		phase2Ready = stats.IsPhase2Ready()
+	}
 	// Call Cycles() once to avoid duplicate work (it makes a copy each time)
-	cycles := filterCyclesForCandidateScope(stats.Cycles(), analyzer)
+	cycles := filterCyclesForCandidateScope(rawCycles, analyzer)
 	cycleCount := 0
 	if cycles != nil {
 		cycleCount = len(cycles)
 	}
 
+	nodeCount, edgeCount, density := 0, 0, 0.0
+	if analyzer != nil {
+		nodeCount, edgeCount, density = analyzer.ScopedGraphTotals(stats)
+	} else if stats != nil {
+		nodeCount, edgeCount, density = stats.NodeCount, stats.EdgeCount, stats.Density
+	}
+
 	return GraphHealth{
-		NodeCount:   stats.NodeCount,
-		EdgeCount:   stats.EdgeCount,
-		Density:     stats.Density,
+		NodeCount:   nodeCount,
+		EdgeCount:   edgeCount,
+		Density:     density,
 		HasCycles:   cycleCount > 0,
 		CycleCount:  cycleCount,
-		Phase2Ready: stats.IsPhase2Ready(),
+		Phase2Ready: phase2Ready,
 	}
 }
 

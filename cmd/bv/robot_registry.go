@@ -5681,9 +5681,15 @@ func handleRobotOrphans(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 			return err
 		}
 	} else {
-		report, err := generateCorrelationReportForContext(ctx, workDir, correlation.CorrelatorOptions{Limit: limit, Revision: ctx.AsOfCommit})
+		orphanCtx := ctx
+		orphanCtx.Issues = labelAnalysisIssuesForContext(ctx)
+		orphanCtx.CandidateIDs = nil
+		report, err := generateCorrelationReportForContext(orphanCtx, workDir, correlation.CorrelatorOptions{Limit: limit, Revision: ctx.AsOfCommit})
 		if err != nil {
 			return err
+		}
+		if ctx.DataHash != "" {
+			report.DataHash = ctx.DataHash
 		}
 		orphanGitRoot := workDir
 		if found, rootErr := correlation.FindGitRoot(workDir); rootErr == nil {
@@ -5715,7 +5721,7 @@ func handleRobotOrphans(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 	if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
 		maxResults = *cfg.RobotMaxResults
 	}
-	filterOrphanReport(orphanReport, minScore, maxResults)
+	filterOrphanReportWithScope(orphanReport, minScore, maxResults, ctx.CandidateIDs)
 
 	// Copy fields rather than embedding: OrphanReport defines generated_at and
 	// data_hash too, and encoding/json drops colliding embedded keys silently.
@@ -5747,11 +5753,24 @@ func filterOrphanReportByMinScore(orphanReport *correlation.OrphanReport, minSco
 }
 
 func filterOrphanReport(orphanReport *correlation.OrphanReport, minScore, maxResults int) {
+	filterOrphanReportWithScope(orphanReport, minScore, maxResults, nil)
+}
+
+func filterOrphanReportWithScope(orphanReport *correlation.OrphanReport, minScore, maxResults int, candidateIDs map[string]bool) {
 	filtered := make([]correlation.OrphanCandidate, 0, len(orphanReport.Candidates))
 	byBead := make(map[string][]string)
 	totalSuspicion := 0
 
 	for _, candidate := range orphanReport.Candidates {
+		if candidateIDs != nil && len(candidate.ProbableBeads) > 0 {
+			scopedProb := make([]correlation.ProbableBead, 0, len(candidate.ProbableBeads))
+			for _, pb := range candidate.ProbableBeads {
+				if candidateIDs[pb.BeadID] {
+					scopedProb = append(scopedProb, pb)
+				}
+			}
+			candidate.ProbableBeads = scopedProb
+		}
 		if candidate.SuspicionScore < minScore {
 			continue
 		}
@@ -5919,10 +5938,9 @@ func handleRobotRelated(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		return fmt.Errorf("getting current directory: %w", err)
 	}
 
-	// Use the dispatch context's issue set: it already carries --as-of,
-	// --label, --recipe, and --repo scoping. Reloading the working tree here
-	// silently bypassed all four (reality check 2026-09-01, gap 2).
-	issues := ctx.Issues
+	// Use the dispatch context's candidate-scoped issue set: it already carries --as-of,
+	// --label, --recipe, and --repo scoping without leaking 1-hop label neighbors.
+	issues := scopedCorrelationIssues(ctx)
 	limit := 500
 	if cfg.HistoryLimit != nil {
 		limit = *cfg.HistoryLimit
@@ -5932,10 +5950,14 @@ func handleRobotRelated(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		return err
 	}
 
+	candSet := ctx.CandidateIDs
 	depGraph := make(map[string][]string)
 	for _, issue := range issues {
 		for _, dep := range issue.Dependencies {
 			if dep == nil {
+				continue
+			}
+			if candSet != nil && !candSet[dep.DependsOnID] {
 				continue
 			}
 			depGraph[issue.ID] = append(depGraph[issue.ID], dep.DependsOnID)
@@ -6056,10 +6078,9 @@ func handleRobotImpactNetwork(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 		return fmt.Errorf("getting current directory: %w", err)
 	}
 
-	// Use the dispatch context's issue set: it already carries --as-of,
-	// --label, --recipe, and --repo scoping. Reloading the working tree here
-	// silently bypassed all four (reality check 2026-09-01, gap 2).
-	issues := ctx.Issues
+	// Use the dispatch context's candidate-scoped issue set so 1-hop label neighbors
+	// never leak into network nodes.
+	issues := scopedCorrelationIssues(ctx)
 	limit := 500
 	if cfg.HistoryLimit != nil {
 		limit = *cfg.HistoryLimit
@@ -6107,10 +6128,9 @@ func handleRobotCausality(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 		return fmt.Errorf("getting current directory: %w", err)
 	}
 
-	// Use the dispatch context's issue set: it already carries --as-of,
-	// --label, --recipe, and --repo scoping. Reloading the working tree here
-	// silently bypassed all four (reality check 2026-09-01, gap 2).
-	issues := ctx.Issues
+	// Use the dispatch context's candidate-scoped issue set so 1-hop label neighbors
+	// never leak into network nodes.
+	issues := scopedCorrelationIssues(ctx)
 	limit := 500
 	if cfg.HistoryLimit != nil {
 		limit = *cfg.HistoryLimit

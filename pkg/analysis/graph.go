@@ -1384,6 +1384,110 @@ func (a *Analyzer) HasCandidateScope() bool {
 	return a != nil && a.candidateIDs != nil
 }
 
+// HasScope reports whether an explicit candidate scope filter is active.
+func (a *Analyzer) HasScope() bool {
+	return a.HasCandidateScope()
+}
+
+// ScopedGraphTotals returns the node count, unique blocking edge count, and
+// directed density for the analyzer's candidate-induced subgraph. When no
+// candidate scope is active, it returns stats' totals (or computes unscoped
+// totals from a.issueMap and a.g when stats is nil).
+func (a *Analyzer) ScopedGraphTotals(stats *GraphStats) (nodes, edges int, density float64) {
+	if a == nil {
+		if stats != nil {
+			return stats.NodeCount, stats.EdgeCount, stats.Density
+		}
+		return 0, 0, 0
+	}
+	if !a.HasScope() {
+		if stats != nil {
+			return stats.NodeCount, stats.EdgeCount, stats.Density
+		}
+		nodes = len(a.issueMap)
+		if a.g != nil {
+			edges = a.g.Edges().Len()
+		} else {
+			for _, iss := range a.issueMap {
+				seen := make(map[string]struct{}, len(iss.Dependencies))
+				for _, dep := range iss.Dependencies {
+					if dep == nil || !dep.Type.IsBlocking() {
+						continue
+					}
+					if _, exists := a.issueMap[dep.DependsOnID]; !exists {
+						continue
+					}
+					if _, dup := seen[dep.DependsOnID]; dup {
+						continue
+					}
+					seen[dep.DependsOnID] = struct{}{}
+					edges++
+				}
+			}
+		}
+		if nodes > 1 {
+			density = float64(edges) / (float64(nodes) * float64(nodes-1))
+		}
+		return nodes, edges, density
+	}
+
+	for id := range a.issueMap {
+		if a.IsCandidate(id) {
+			nodes++
+		}
+	}
+
+	if cg, ok := a.g.(*compactDirectedGraph); ok && len(a.nodeToID) == len(cg.nodes) {
+		for u, outs := range cg.out {
+			uID := a.nodeToID[int64(u)]
+			if uID == "" || !a.IsCandidate(uID) {
+				continue
+			}
+			for _, v := range outs {
+				vID := a.nodeToID[v]
+				if vID != "" && a.IsCandidate(vID) {
+					edges++
+				}
+			}
+		}
+	} else if a.g != nil {
+		it := a.g.Edges()
+		for it.Next() {
+			e := it.Edge()
+			uID := a.nodeToID[e.From().ID()]
+			vID := a.nodeToID[e.To().ID()]
+			if uID != "" && vID != "" && a.IsCandidate(uID) && a.IsCandidate(vID) {
+				edges++
+			}
+		}
+	} else {
+		for uID, iss := range a.issueMap {
+			if !a.IsCandidate(uID) {
+				continue
+			}
+			seen := make(map[string]struct{}, len(iss.Dependencies))
+			for _, dep := range iss.Dependencies {
+				if dep == nil || !dep.Type.IsBlocking() {
+					continue
+				}
+				if _, exists := a.issueMap[dep.DependsOnID]; !exists || !a.IsCandidate(dep.DependsOnID) {
+					continue
+				}
+				if _, dup := seen[dep.DependsOnID]; dup {
+					continue
+				}
+				seen[dep.DependsOnID] = struct{}{}
+				edges++
+			}
+		}
+	}
+
+	if nodes > 1 {
+		density = float64(edges) / (float64(nodes) * float64(nodes-1))
+	}
+	return nodes, edges, density
+}
+
 // SetUnblockScope sets an optional downstream-unblock eligibility map used when
 // simulating which dependents become actionable after completing a candidate
 // (for example, --recipe actionable or max_items where blocked dependents were
