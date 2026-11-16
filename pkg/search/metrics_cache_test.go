@@ -929,7 +929,7 @@ func TestNewAnalyzerMetricsLoaderWithReadiness_PreservesExternalBlockersTombston
 	}, scopedIssues...)
 	readiness := model.NewReadinessIndex(fullUniverse)
 
-	loader := NewAnalyzerMetricsLoaderWithReadiness(scopedIssues, readiness)
+	loader := NewAnalyzerMetricsLoaderWithReadiness(scopedIssues, readiness).WithNow(now)
 	metrics, hashWithBlocked, err := loader.LoadMetricsWithHash()
 	if err != nil {
 		t.Fatalf("LoadMetricsWithHash: %v", err)
@@ -941,8 +941,8 @@ func TestNewAnalyzerMetricsLoaderWithReadiness_PreservesExternalBlockersTombston
 	if got := metrics["READY-INPROG"].Status; got != string(model.StatusInProgress) {
 		t.Fatalf("expected READY-INPROG status=in_progress, got %q", got)
 	}
-	if got := metrics["DEFER-FUTURE"].Status; got != string(model.StatusOpen) {
-		t.Fatalf("expected satisfied future-deferred DEFER-FUTURE status=open (not blocked), got %q", got)
+	if got := metrics["DEFER-FUTURE"].Status; got != string(model.StatusDeferred) {
+		t.Fatalf("expected satisfied future-deferred DEFER-FUTURE status=deferred (not open or blocked), got %q", got)
 	}
 	if got := metrics["EXT-BLOCKED"].Status; got != string(model.StatusBlocked) {
 		t.Fatalf("expected externally blocked EXT-BLOCKED status=blocked, got %q", got)
@@ -958,7 +958,7 @@ func TestNewAnalyzerMetricsLoaderWithReadiness_PreservesExternalBlockersTombston
 		{ID: "DELETED-BLK", Title: "Tombstoned blocker", Status: model.StatusTombstone, CreatedAt: now, UpdatedAt: now},
 	}, scopedIssues...)
 	readinessUnblocked := model.NewReadinessIndex(closedUniverse)
-	loaderUnblocked := NewAnalyzerMetricsLoaderWithReadiness(scopedIssues, readinessUnblocked)
+	loaderUnblocked := NewAnalyzerMetricsLoaderWithReadiness(scopedIssues, readinessUnblocked).WithNow(now)
 	metricsUnblocked, hashUnblocked, err := loaderUnblocked.LoadMetricsWithHash()
 	if err != nil {
 		t.Fatalf("LoadMetricsWithHash (unblocked): %v", err)
@@ -968,5 +968,100 @@ func TestNewAnalyzerMetricsLoaderWithReadiness_PreservesExternalBlockersTombston
 	}
 	if hashWithBlocked == hashUnblocked {
 		t.Fatalf("expected ComputeDataHash to incorporate readiness dependency state, both returned %q", hashWithBlocked)
+	}
+}
+
+func TestHybridSearchDowngradesDeferredTemplatePinned(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	future := now.Add(72 * time.Hour)
+	past := now.Add(-24 * time.Hour)
+
+	issues := []model.Issue{
+		{ID: "OPEN-READY", Title: "Auth token refresh", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "INPROG-READY", Title: "Auth token refresh", Status: model.StatusInProgress, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "BLOCKED-STATUS", Title: "Auth token refresh", Status: model.StatusBlocked, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "DEFER-OPEN", Title: "Auth token refresh", Status: model.StatusOpen, DeferUntil: &future, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "DEFER-INPROG", Title: "Auth token refresh", Status: model.StatusInProgress, DeferUntil: &future, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "TMPL-OPEN", Title: "Auth token refresh", Status: model.StatusOpen, IsTemplate: true, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "PIN-FLAG", Title: "Auth token refresh", Status: model.StatusOpen, Pinned: true, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "PIN-STATUS", Title: "Auth token refresh", Status: model.StatusPinned, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		// Planted negative controls:
+		{ID: "EXPIRED-DEFER", Title: "Auth token refresh", Status: model.StatusOpen, DeferUntil: &past, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "CLOSED-TMPL", Title: "Auth token refresh", Status: model.StatusClosed, IsTemplate: true, Priority: 1, CreatedAt: now, UpdatedAt: now},
+	}
+
+	loader := NewAnalyzerMetricsLoader(issues).WithNow(now)
+	cache := NewMetricsCache(loader)
+	if err := cache.Refresh(); err != nil {
+		t.Fatalf("cache.Refresh: %v", err)
+	}
+
+	wantStatuses := map[string]string{
+		"OPEN-READY":     string(model.StatusOpen),
+		"INPROG-READY":   string(model.StatusInProgress),
+		"BLOCKED-STATUS": string(model.StatusBlocked),
+		"DEFER-OPEN":     string(model.StatusDeferred),
+		"DEFER-INPROG":   string(model.StatusDeferred),
+		"TMPL-OPEN":      string(model.StatusDeferred),
+		"PIN-FLAG":       string(model.StatusDeferred),
+		"PIN-STATUS":     string(model.StatusDeferred),
+		"EXPIRED-DEFER":  string(model.StatusOpen),
+		"CLOSED-TMPL":    string(model.StatusClosed),
+	}
+	for id, want := range wantStatuses {
+		m, ok := cache.Get(id)
+		if !ok {
+			t.Fatalf("missing metrics for %s", id)
+		}
+		if m.Status != want {
+			t.Fatalf("metrics[%s].Status = %q, want %q", id, m.Status, want)
+		}
+	}
+
+	weights, err := GetPreset(PresetDefault)
+	if err != nil {
+		t.Fatalf("GetPreset(PresetDefault): %v", err)
+	}
+	scorer := NewHybridScorer(weights, cache)
+
+	scoreOf := func(id string) float64 {
+		t.Helper()
+		res, err := scorer.Score(id, 0.75)
+		if err != nil {
+			t.Fatalf("scorer.Score(%s): %v", id, err)
+		}
+		return res.FinalScore
+	}
+
+	openScore := scoreOf("OPEN-READY")
+	inProgScore := scoreOf("INPROG-READY")
+	blockedScore := scoreOf("BLOCKED-STATUS")
+	closedScore := scoreOf("CLOSED-TMPL")
+
+	if diff := openScore - scoreOf("EXPIRED-DEFER"); diff < -1e-9 || diff > 1e-9 {
+		t.Fatalf("expired DeferUntil should match open score: open=%f expired=%f", openScore, scoreOf("EXPIRED-DEFER"))
+	}
+	if !(openScore > inProgScore && inProgScore > blockedScore) {
+		t.Fatalf("expected open (%f) > in_progress (%f) > blocked (%f)", openScore, inProgScore, blockedScore)
+	}
+
+	for _, parkedID := range []string{"DEFER-OPEN", "DEFER-INPROG", "TMPL-OPEN", "PIN-FLAG", "PIN-STATUS"} {
+		s := scoreOf(parkedID)
+		if !(blockedScore > s && s > closedScore) {
+			t.Fatalf("expected blocked (%f) > %s (%f) > closed (%f)", blockedScore, parkedID, s, closedScore)
+		}
+	}
+
+	// Verify SOURCE_DATE_EPOCH fallback when WithNow is not set.
+	t.Setenv("SOURCE_DATE_EPOCH", fmt.Sprintf("%d", now.Unix()))
+	epochMetrics, err := NewAnalyzerMetricsLoader(issues).LoadMetrics()
+	if err != nil {
+		t.Fatalf("LoadMetrics with SOURCE_DATE_EPOCH: %v", err)
+	}
+	if epochMetrics["DEFER-OPEN"].Status != string(model.StatusDeferred) {
+		t.Fatalf("SOURCE_DATE_EPOCH DEFER-OPEN status = %q, want deferred", epochMetrics["DEFER-OPEN"].Status)
+	}
+	if epochMetrics["EXPIRED-DEFER"].Status != string(model.StatusOpen) {
+		t.Fatalf("SOURCE_DATE_EPOCH EXPIRED-DEFER status = %q, want open", epochMetrics["EXPIRED-DEFER"].Status)
 	}
 }

@@ -2073,3 +2073,187 @@ func TestLoadIssuesSilent_ZeroStderrAndCorruptSiblingSQLiteGuard(t *testing.T) {
 		t.Fatalf("expected AuthorityWarnings captured on bd fallback, got %+v", bdLoaded.Report)
 	}
 }
+
+func TestSourceDiffDetectsDepsAssigneeLabelsDefer(t *testing.T) {
+	deferUTC := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	ist := time.FixedZone("IST", 5*3600+1800)
+	deferIST := deferUTC.In(ist)
+
+	issuesA := []model.Issue{
+		{
+			ID:         "DRIFT-ALL",
+			Title:      "Same title",
+			Status:     model.StatusOpen,
+			Priority:   1,
+			Assignee:   "alice",
+			Labels:     []string{"api", "urgent"},
+			DeferUntil: &deferUTC,
+			Dependencies: []*model.Dependency{
+				{IssueID: "DRIFT-ALL", DependsOnID: "B-1", Type: model.DepBlocks},
+			},
+		},
+		{
+			// Planted negative control: reordered/duplicate deps & labels, default ""->"blocks",
+			// whitespace-padded assignee, and timezone-equivalent DeferUntil must NOT diff.
+			ID:         "CANONICAL-EQ",
+			Title:      "Canonical",
+			Status:     model.StatusOpen,
+			Priority:   2,
+			Assignee:   "  carol  ",
+			Labels:     []string{" z-tag ", "a-tag", "z-tag", ""},
+			DeferUntil: &deferIST,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CANONICAL-EQ", DependsOnID: "B-2", Type: model.DepParentChild},
+				{IssueID: "CANONICAL-EQ", DependsOnID: "B-1", Type: ""},
+				{IssueID: "CANONICAL-EQ", DependsOnID: "B-1", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	issuesB := []model.Issue{
+		{
+			ID:         "DRIFT-ALL",
+			Title:      "Same title",
+			Status:     model.StatusOpen,
+			Priority:   1,
+			Assignee:   "bob",
+			Labels:     []string{"api", "backlog"},
+			DeferUntil: nil,
+			Dependencies: []*model.Dependency{
+				{IssueID: "DRIFT-ALL", DependsOnID: "B-1", Type: model.DepBlocks},
+				{IssueID: "DRIFT-ALL", DependsOnID: "B-2", Type: model.DepParentChild},
+			},
+		},
+		{
+			ID:         "CANONICAL-EQ",
+			Title:      "Canonical",
+			Status:     model.StatusOpen,
+			Priority:   2,
+			Assignee:   "carol",
+			Labels:     []string{"a-tag", "z-tag"},
+			DeferUntil: &deferUTC,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CANONICAL-EQ", DependsOnID: "B-1", Type: model.DepBlocks},
+				{IssueID: "CANONICAL-EQ", DependsOnID: "B-2", Type: model.DepParentChild},
+			},
+		},
+	}
+
+	diff := DetectInconsistencies(issuesA, issuesB, "sqlite", "jsonl", DefaultDiffOptions())
+	if !diff.HasInconsistencies() || diff.TotalDiffs() != 4 {
+		t.Fatalf("DetectInconsistencies TotalDiffs=%d FieldMismatches=%+v, want 4", diff.TotalDiffs(), diff.FieldMismatches)
+	}
+
+	byField := make(map[string]FieldDifference, len(diff.FieldMismatches))
+	for _, fm := range diff.FieldMismatches {
+		if fm.ID == "CANONICAL-EQ" {
+			t.Fatalf("negative control CANONICAL-EQ falsely flagged: %+v", fm)
+		}
+		byField[fm.Field] = fm
+	}
+	for _, wantField := range []string{"dependencies", "assignee", "labels", "defer_until"} {
+		if _, ok := byField[wantField]; !ok {
+			t.Fatalf("missing FieldMismatch for %q in %+v", wantField, diff.FieldMismatches)
+		}
+	}
+
+	// Negative control: explicit CompareFields=["status"] ignores non-status fields.
+	statusOnly := DetectInconsistencies(issuesA, issuesB, "sqlite", "jsonl", DiffOptions{CompareFields: []string{"status"}})
+	if statusOnly.HasInconsistencies() {
+		t.Fatalf("expected 0 inconsistencies for status-only CompareFields, got %+v", statusOnly)
+	}
+
+	// End-to-end file-backed CheckSourcesConsistent & CheckAllSourcesConsistent check.
+	dir := t.TempDir()
+	writeJSONL := func(name string, list []model.Issue) DataSource {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		var b strings.Builder
+		for _, iss := range list {
+			raw, err := json.Marshal(iss)
+			if err != nil {
+				t.Fatalf("marshal %s: %v", iss.ID, err)
+			}
+			b.Write(raw)
+			b.WriteByte('\n')
+		}
+		if err := os.WriteFile(p, []byte(b.String()), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return DataSource{Type: SourceTypeJSONLLocal, Path: p, ModTime: deferUTC}
+	}
+
+	srcA := writeJSONL("a.jsonl", issuesA)
+	srcB := writeJSONL("b.jsonl", issuesB)
+	consistent, reasons, err := CheckSourcesConsistent(srcA, srcB)
+	if err != nil {
+		t.Fatalf("CheckSourcesConsistent error: %v", err)
+	}
+	if consistent || len(reasons) != 4 {
+		t.Fatalf("CheckSourcesConsistent = (%v, %v), want (false, 4 reasons)", consistent, reasons)
+	}
+
+	allDiffs, err := CheckAllSourcesConsistent([]DataSource{srcA, srcB}, DefaultDiffOptions())
+	if err != nil {
+		t.Fatalf("CheckAllSourcesConsistent error: %v", err)
+	}
+	if len(allDiffs) != 1 || allDiffs[0].TotalDiffs() != 4 {
+		t.Fatalf("CheckAllSourcesConsistent = %+v, want 1 SourceDiff with 4 diffs", allDiffs)
+	}
+
+	// Also verify worktree discovery in DiscoverSources strips poisoned ambient GIT_DIR.
+	mainRepo := t.TempDir()
+	poisonRepo := t.TempDir()
+	for _, r := range []string{mainRepo, poisonRepo} {
+		cmd := exec.Command("git", "init", r)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git init %s: %v (%s)", r, err, out)
+		}
+		for _, kv := range [][2]string{{"user.email", "test@example.com"}, {"user.name", "Test"}} {
+			cfgCmd := exec.Command("git", "-C", r, "config", kv[0], kv[1])
+			if out, err := cfgCmd.CombinedOutput(); err != nil {
+				t.Fatalf("git config: %v (%s)", err, out)
+			}
+		}
+	}
+	mainBeads := filepath.Join(mainRepo, ".beads")
+	if err := os.MkdirAll(mainBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainBeads, "issues.jsonl"), []byte(`{"id":"WT-1","title":"Main worktree issue","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", mainRepo, "add", ".").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v (%s)", err, out)
+	}
+	if out, err := exec.Command("git", "-C", mainRepo, "commit", "-m", "init").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v (%s)", err, out)
+	}
+	wtDir := filepath.Join(t.TempDir(), "linked-wt")
+	if out, err := exec.Command("git", "-C", mainRepo, "worktree", "add", "-b", "wt-branch", wtDir).CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v (%s)", err, out)
+	}
+	// Remove tracked .beads in the linked worktree checkout so DiscoverSources uses main-worktree fallback via GetGitDir.
+	if err := os.WriteFile(filepath.Join(wtDir, ".beads", "issues.jsonl"), nil, 0o644); err == nil {
+		// Rename .beads inside linked worktree (Rule 1 compliant: os.Rename, zero file deletion)
+		if err := os.Rename(filepath.Join(wtDir, ".beads"), filepath.Join(wtDir, ".beads-moved-aside")); err != nil {
+			t.Fatalf("rename linked worktree .beads: %v", err)
+		}
+	}
+
+	t.Setenv("GIT_DIR", filepath.Join(poisonRepo, ".git"))
+	t.Setenv("GIT_WORK_TREE", poisonRepo)
+	sources, err := DiscoverSources(DiscoveryOptions{RepoPath: wtDir, ValidateAfterDiscovery: false})
+	if err != nil {
+		t.Fatalf("DiscoverSources with poisoned GIT_DIR: %v", err)
+	}
+	foundMainWorktreeBeads := false
+	for _, s := range sources {
+		if s.Type == SourceTypeJSONLWorktree {
+			foundMainWorktreeBeads = true
+		}
+	}
+	if !foundMainWorktreeBeads {
+		t.Fatalf("expected SourceTypeJSONLWorktree despite poisoned GIT_DIR, got %+v", sources)
+	}
+}
