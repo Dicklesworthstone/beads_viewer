@@ -34,6 +34,7 @@ var canonicalRobotFlags = []string{
 	"robot-graph",
 	"robot-help",
 	"robot-history",
+	"robot-ignore-correlation",
 	"robot-impact",
 	"robot-impact-network",
 	"robot-insights",
@@ -114,7 +115,7 @@ var nonInteractiveSubcommandSet = map[string]struct{}{
 	"alerts": {}, "analysis": {}, "analyze": {}, "bead-history": {},
 	"blocker-chain": {}, "blockers": {}, "burndown": {}, "capabilities": {},
 	"capability": {}, "capacity": {}, "causality": {}, "changes": {},
-	"commit": {}, "diff": {}, "doc": {}, "docs": {},
+	"commit": {}, "diff": {}, "doc": {}, "docs": {}, "drift": {},
 	"file-beads": {}, "file-hotspots": {}, "file-relations": {}, "find": {},
 	"forecast": {}, "graph": {}, "help": {}, "history": {},
 	"hotspots": {}, "impact": {}, "impact-network": {}, "insight": {},
@@ -194,10 +195,9 @@ func isNegatedBoolFlagValue(val string) bool {
 }
 
 var valueTakingTUIFlagSet = map[string]struct{}{
-	"as-of": {}, "beads-dir": {}, "beads-file": {}, "cpu-profile": {},
-	"db": {}, "debug-height": {}, "debug-width": {}, "label": {}, "l": {},
-	"profile-output": {}, "recipe": {}, "r": {}, "repo": {}, "theme": {},
-	"workspace": {}, "w": {},
+	"as-of": {}, "cpu-profile": {}, "db": {}, "debug-height": {},
+	"debug-width": {}, "label": {}, "l": {}, "recipe": {}, "r": {},
+	"repo": {}, "theme": {}, "workspace": {},
 }
 
 func shouldSuppressTTYQueries(args []string, envRobot, envTest bool) bool {

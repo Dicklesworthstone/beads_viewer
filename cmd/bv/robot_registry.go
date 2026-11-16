@@ -107,6 +107,7 @@ type RobotContext struct {
 	SearchOutput         *robotSearchOutput
 	Diff                 *analysis.SnapshotDiff
 	DiffHistoricalIssues []model.Issue
+	DiffFromDataHash     string
 	DiffResolvedRevision string
 }
 
@@ -210,6 +211,7 @@ type phaseThreeRobotHandlerConfig struct {
 	RobotExplainCorrFlag    *string
 	RobotConfirmCorrFlag    *string
 	RobotRejectCorrFlag     *string
+	RobotIgnoreCorrFlag     *string
 	RobotCorrStatsFlag      *bool
 	CorrelationFeedbackBy   *string
 	CorrelationReason       *string
@@ -457,7 +459,7 @@ func unsupportedScopeFor(command string, ctx RobotContext) []string {
 		return nil
 	case "robot-history", "bead-history", "robot-orphans", "robot-file-beads", "robot-commit", "robot-file-hotspots",
 		"robot-file-relations", "robot-impact-network", "robot-related",
-		"robot-explain-correlation", "robot-confirm-correlation", "robot-reject-correlation",
+		"robot-explain-correlation", "robot-confirm-correlation", "robot-reject-correlation", "robot-ignore-correlation",
 		"robot-correlation-stats", "robot-impact",
 		"robot-burndown":
 		if ctx.AsOf != "" {
@@ -700,12 +702,14 @@ func configuredPrimaryRobotFlagNames() []string {
 		RobotExplainCorrFlag:    &dummyStr,
 		RobotConfirmCorrFlag:    &dummyStr,
 		RobotRejectCorrFlag:     &dummyStr,
+		RobotIgnoreCorrFlag:     &dummyStr,
 		RobotCorrStatsFlag:      &dummyBool,
 		CorrelationFeedbackBy:   &dummyStr,
 		CorrelationReason:       &dummyStr,
 		RobotOrphansFlag:        &dummyBool,
 		OrphansMinScore:         &dummyInt,
 		RobotFileBeadsFlag:      &dummyStr,
+		RobotCommitFlag:         &dummyStr,
 		FileBeadsLimit:          &dummyInt,
 		RobotFileHotspotsFlag:   &dummyBool,
 		HotspotsLimit:           &dummyInt,
@@ -1000,6 +1004,17 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 		FlagPtr:     cfg.VersionFlag,
 		Description: "Show version",
 		Handler: func(ctx RobotContext) error {
+			if cfg.StructuredOutput != nil && cfg.StructuredOutput() {
+				if err := ctx.EncoderOrDefault().Encode(map[string]interface{}{
+					"generated_at":  robotNow().Format(time.RFC3339),
+					"tool":          "bv",
+					"version":       version.Version,
+					"output_format": robotOutputFormat,
+				}); err != nil {
+					return fmt.Errorf("encoding version output: %w", err)
+				}
+				return nil
+			}
 			_, err := fmt.Fprintf(ctx.StdoutOrDefault(), "bv %s\n", version.Version)
 			if err != nil {
 				return fmt.Errorf("writing version output: %w", err)
@@ -1493,10 +1508,11 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				}
 			}
 			cycles := filterCyclesForCandidates(stats.Cycles(), ctx.CandidateIDs)
+			scopedNodes, scopedEdges, scopedDensity := scopedGraphTotalsForCLI(graphIssues, &stats, ctx.CandidateIDs)
 			curStats := baseline.GraphStats{
-				NodeCount:       stats.NodeCount,
-				EdgeCount:       stats.EdgeCount,
-				Density:         stats.Density,
+				NodeCount:       scopedNodes,
+				EdgeCount:       scopedEdges,
+				Density:         scopedDensity,
 				OpenCount:       openCount,
 				ClosedCount:     partition.Closed,
 				BlockedCount:    partition.Blocked,
@@ -1665,10 +1681,11 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				}
 			}
 			cycles := filterCyclesForCandidates(stats.Cycles(), ctx.CandidateIDs)
+			scopedNodes, scopedEdges, scopedDensity := scopedGraphTotalsForCLI(graphIssues, &stats, ctx.CandidateIDs)
 			currentStats := baseline.GraphStats{
-				NodeCount:       stats.NodeCount,
-				EdgeCount:       stats.EdgeCount,
-				Density:         stats.Density,
+				NodeCount:       scopedNodes,
+				EdgeCount:       scopedEdges,
+				Density:         scopedDensity,
 				OpenCount:       openCount,
 				ClosedCount:     partition.Closed,
 				BlockedCount:    partition.Blocked,
@@ -1792,7 +1809,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				return newReportedRobotHandlerExit(1)
 			}
 
-			suggest := analysis.GenerateRobotSuggestOutputAt(ctx.Issues, config, ctx.DataHash, ctx.ReferenceNow())
+			suggest := analysis.GenerateRobotSuggestOutputAt(labelAnalysisIssuesForContext(ctx), config, ctx.DataHash, ctx.ReferenceNow())
 			rebuildSet := false
 			if maxSuggestions > 0 && len(suggest.Set.Suggestions) > maxSuggestions {
 				suggest.Set.Suggestions = suggest.Set.Suggestions[:maxSuggestions]
@@ -1910,16 +1927,41 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			if cfgErr != nil || driftCfg == nil {
 				driftCfg = drift.DefaultConfig()
 			}
-			burndown := calculateBurndownAtWithThresholds(targetSprint, ctx.Issues, now, driftCfg.AtRiskThresholds())
+			scopedSprint := *targetSprint
+			if ctx.CandidateIDs != nil {
+				filteredBeads := make([]string, 0, len(scopedSprint.BeadIDs))
+				for _, bid := range scopedSprint.BeadIDs {
+					if ctx.CandidateIDs[bid] {
+						filteredBeads = append(filteredBeads, bid)
+					}
+				}
+				scopedSprint.BeadIDs = filteredBeads
+			}
+			burndownIssues := ctx.GraphIssues()
+			if len(ctx.FullIssues) > 0 {
+				burndownIssues = labelAnalysisIssuesForContext(ctx)
+			}
+			burndown := calculateBurndownAtWithThresholds(&scopedSprint, burndownIssues, now, driftCfg.AtRiskThresholds())
 			burndown.RobotEnvelope = ctx.Envelope()
-			issueMap := make(map[string]model.Issue, len(ctx.Issues))
-			for _, issue := range ctx.Issues {
+			issueMap := make(map[string]model.Issue, len(burndownIssues))
+			for _, issue := range burndownIssues {
 				issueMap[issue.ID] = issue
 			}
 			if scopeChanges, err := computeSprintScopeChangesForContext(ctx, workDir, targetSprint, issueMap, now); err == nil && len(scopeChanges) > 0 {
-				burndown.ScopeChanges = scopeChanges
-				// Re-linearize the ideal trajectory at each scope change.
-				burndown.IdealLine = generateIdealLineScoped(targetSprint, burndown.TotalIssues, scopeChanges)
+				if ctx.CandidateIDs != nil {
+					filteredChanges := scopeChanges[:0]
+					for _, ev := range scopeChanges {
+						if ctx.CandidateIDs[ev.IssueID] {
+							filteredChanges = append(filteredChanges, ev)
+						}
+					}
+					scopeChanges = filteredChanges
+				}
+				if len(scopeChanges) > 0 {
+					burndown.ScopeChanges = scopeChanges
+					// Re-linearize the ideal trajectory at each scope change.
+					burndown.IdealLine = generateIdealLineScoped(&scopedSprint, burndown.TotalIssues, scopeChanges)
+				}
 			}
 
 			if err := ctx.EncoderOrDefault().Encode(burndown); err != nil {
@@ -1971,9 +2013,10 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					continue
 				}
 				if cfg.ForecastLabel != nil && strings.TrimSpace(*cfg.ForecastLabel) != "" {
+					wantLabel := strings.TrimSpace(*cfg.ForecastLabel)
 					hasLabel := false
 					for _, label := range issue.Labels {
-						if label == *cfg.ForecastLabel {
+						if strings.EqualFold(strings.TrimSpace(label), wantLabel) {
 							hasLabel = true
 							break
 						}
@@ -2016,10 +2059,14 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			etaIssues := ctx.VelocityIssues()
+			includeInactive := cfg.IncludeInactive != nil && *cfg.IncludeInactive
 			forecasts := make([]analysis.ETAEstimate, 0)
 			if forecastTarget == "all" {
 				for _, issue := range targetIssues {
-					if issue.Status == model.StatusClosed {
+					if issue.Status.IsClosed() || issue.Status.IsTombstone() {
+						continue
+					}
+					if !includeInactive && (issue.IsTemplate || issue.Pinned || issue.Status == model.StatusPinned) {
 						continue
 					}
 					eta, err := analysis.EstimateETAForIssue(etaIssues, &graphStats, issue.ID, agents, now)
@@ -2027,6 +2074,15 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 						continue
 					}
 					forecasts = append(forecasts, eta)
+				}
+				sort.Slice(forecasts, func(i, j int) bool {
+					if !forecasts[i].ETADate.Equal(forecasts[j].ETADate) {
+						return forecasts[i].ETADate.Before(forecasts[j].ETADate)
+					}
+					return forecasts[i].IssueID < forecasts[j].IssueID
+				})
+				if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(forecasts) > *cfg.RobotMaxResults {
+					forecasts = forecasts[:*cfg.RobotMaxResults]
 				}
 			} else {
 				selected := false
@@ -2129,6 +2185,10 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			// robot timestamp so reproducible output does not mutate caller state.
 			diff := *ctx.Diff
 			diff.ToTimestamp = ctx.ReferenceNow()
+			fromDataHash := ctx.DiffFromDataHash
+			if fromDataHash == "" {
+				fromDataHash = analysis.ComputeDataHash(ctx.DiffHistoricalIssues)
+			}
 			output := struct {
 				RobotEnvelope
 				ResolvedRevision string                 `json:"resolved_revision"`
@@ -2138,7 +2198,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}{
 				RobotEnvelope:    ctx.Envelope(),
 				ResolvedRevision: ctx.DiffResolvedRevision,
-				FromDataHash:     analysis.ComputeDataHash(ctx.DiffHistoricalIssues),
+				FromDataHash:     fromDataHash,
 				ToDataHash:       ctx.DataHash,
 				Diff:             &diff,
 			}
@@ -2194,10 +2254,13 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 		return handleRobotExplainCorrelation(ctx, cfg)
 	})
 	register("robot-confirm-correlation", cfg.RobotConfirmCorrFlag, "Confirm a correlation is correct", func(ctx RobotContext) error {
-		return handleRobotCorrelationFeedback(ctx, cfg, false)
+		return handleRobotCorrelationFeedback(ctx, cfg, correlation.FeedbackConfirm)
 	})
 	register("robot-reject-correlation", cfg.RobotRejectCorrFlag, "Reject an incorrect correlation", func(ctx RobotContext) error {
-		return handleRobotCorrelationFeedback(ctx, cfg, true)
+		return handleRobotCorrelationFeedback(ctx, cfg, correlation.FeedbackReject)
+	})
+	register("robot-ignore-correlation", cfg.RobotIgnoreCorrFlag, "Mark a correlation as ignored without accuracy penalty", func(ctx RobotContext) error {
+		return handleRobotCorrelationFeedback(ctx, cfg, correlation.FeedbackIgnore)
 	})
 	register("robot-label-health", cfg.RobotLabelHealthFlag, "Output label health metrics as JSON", handleRobotLabelHealth)
 	register("robot-label-flow", cfg.RobotLabelFlowFlag, "Output cross-label dependency flow as JSON", handleRobotLabelFlow)
@@ -2765,7 +2828,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 	}
 
 	filterFloatMap := func(m map[string]float64) map[string]float64 {
-		if ctx.ActiveRecipe == nil || ctx.CandidateIDs == nil {
+		if ctx.CandidateIDs == nil {
 			return m
 		}
 		scoped := make(map[string]float64, len(ctx.CandidateIDs))
@@ -2777,7 +2840,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		return scoped
 	}
 	filterIntMap := func(m map[string]int) map[string]int {
-		if ctx.ActiveRecipe == nil || ctx.CandidateIDs == nil {
+		if ctx.CandidateIDs == nil {
 			return m
 		}
 		scoped := make(map[string]int, len(ctx.CandidateIDs))
@@ -2789,7 +2852,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		return scoped
 	}
 	filterStringSlice := func(in []string) []string {
-		if ctx.ActiveRecipe == nil || ctx.CandidateIDs == nil {
+		if ctx.CandidateIDs == nil {
 			return in
 		}
 		scoped := make([]string, 0, len(in))
@@ -2801,14 +2864,15 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		return scoped
 	}
 
-	if ctx.ActiveRecipe != nil && ctx.CandidateIDs != nil && insights.Stats != nil {
+	if ctx.CandidateIDs != nil && insights.Stats != nil {
+		scopedNodes, scopedEdges, scopedDensity := scopedGraphTotalsForCLI(graphIssues, &stats, ctx.CandidateIDs)
 		insights.Stats = &analysis.GraphStats{
 			OutDegree:        filterIntMap(insights.Stats.OutDegree),
 			InDegree:         filterIntMap(insights.Stats.InDegree),
 			TopologicalOrder: filterStringSlice(insights.Stats.TopologicalOrder),
-			Density:          insights.Stats.Density,
-			NodeCount:        len(ctx.CandidateIDs),
-			EdgeCount:        insights.Stats.EdgeCount,
+			Density:          scopedDensity,
+			NodeCount:        scopedNodes,
+			EdgeCount:        scopedEdges,
 			Config:           insights.Stats.Config,
 		}
 	}
@@ -3503,6 +3567,7 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	}
 	_, feedbackWeights := loadRobotFeedbackForContext(ctx)
 	forceFull := cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis
+	notReadyLabels := resolveNotReadyLabels(cfg)
 	triage := analysis.ComputeTriageWithOptionsAndTime(graphIssues, analysis.TriageOptions{
 		WaitForPhase2:     true,
 		Readiness:         ctx.Readiness,
@@ -3514,10 +3579,29 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 		History:           historyReport,
 		RootIssueID:       rootIssueID,
 		SeedDataHash:      seedHash,
-		NotReadyLabels:    resolveNotReadyLabels(cfg),
+		NotReadyLabels:    notReadyLabels,
 		Weights:           feedbackWeights,
 	}, now)
 	stabilizeRobotTriageForPinnedClock(&triage)
+
+	topDiagnosticCandidate := func() *robotNextDiagnosticPick {
+		if len(triage.QuickRef.TopPicks) > 0 {
+			diag := robotNextDiagnosticFromPick(triage.QuickRef.TopPicks[0])
+			return &diag
+		}
+		if len(triage.Recommendations) > 0 {
+			rec := triage.Recommendations[0]
+			diag := robotNextDiagnosticPick{
+				ID:       rec.ID,
+				Title:    rec.Title,
+				Score:    rec.Score,
+				Reasons:  rec.Reasons,
+				Unblocks: len(rec.UnblocksIDs),
+			}
+			return &diag
+		}
+		return nil
+	}
 
 	output := robotNextOutput{
 		RobotEnvelope: ctx.Envelope(),
@@ -3531,10 +3615,7 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	}
 	if !ctx.claimsProven() {
 		output.Message = "No claim command emitted because source authority is incomplete or stale"
-		if len(triage.QuickRef.TopPicks) > 0 {
-			diagnostic := robotNextDiagnosticFromPick(triage.QuickRef.TopPicks[0])
-			output.DiagnosticTopPick = &diagnostic
-		}
+		output.DiagnosticTopPick = topDiagnosticCandidate()
 		output.Degraded = []robotNextDegradation{{Code: "source_authority_incomplete", Severity: "warning",
 			Message: "Readiness is provisional; inspect source_authority for failed sources, dropped records, or stale fallback.",
 			Repair:  "Restore or refresh the affected sources and rerun the command before claiming work."}}
@@ -3546,10 +3627,35 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 
 	if len(triage.QuickRef.TopPicks) == 0 {
 		output.Message = "No proven actionable item available"
+		diag := topDiagnosticCandidate()
+		output.DiagnosticTopPick = diag
+		msg := "No open, unblocked, unassigned non-epic recommendation passed the robot-next claimability filter."
+		if diag != nil {
+			issueByID := robotNextIssueIndex(graphIssues)
+			reasons := robotNextClaimabilityReasons(analysis.TopPick{
+				ID:       diag.ID,
+				Title:    diag.Title,
+				Score:    diag.Score,
+				Reasons:  diag.Reasons,
+				Unblocks: diag.Unblocks,
+			}, issueByID, ctx.Readiness, now)
+			if iss, ok := issueByID[diag.ID]; ok && len(notReadyLabels) > 0 {
+				for _, nr := range notReadyLabels {
+					for _, lbl := range iss.Labels {
+						if strings.EqualFold(strings.TrimSpace(lbl), nr) {
+							reasons = append(reasons, fmt.Sprintf("%s carries not-ready label %q", diag.ID, lbl))
+						}
+					}
+				}
+			}
+			if len(reasons) > 0 {
+				msg = fmt.Sprintf("%s Top candidate %s withheld: %s.", msg, diag.ID, strings.Join(reasons, "; "))
+			}
+		}
 		output.Degraded = []robotNextDegradation{{
 			Code:     "no_actionable_recommendation",
 			Severity: "info",
-			Message:  "No open, unblocked, unassigned non-epic recommendation passed the robot-next claimability filter.",
+			Message:  msg,
 			Repair:   "Use br ready --json or scripts/br_retry.sh actionable --json for authoritative claim candidates.",
 		}}
 		if err := ctx.EncoderOrDefault().Encode(output); err != nil {
@@ -4808,12 +4914,28 @@ func detectWorkspaceOrphans(ctx RobotContext, limit int) (*correlation.OrphanRep
 	}, nil
 }
 
+func scopedCorrelationIssues(ctx RobotContext) []model.Issue {
+	if ctx.CandidateIDs == nil {
+		return ctx.Issues
+	}
+	scoped := make([]model.Issue, 0, len(ctx.CandidateIDs))
+	for _, iss := range ctx.Issues {
+		if ctx.CandidateIDs[iss.ID] {
+			scoped = append(scoped, iss)
+		}
+	}
+	return scoped
+}
+
 func generateCorrelationReportForContext(ctx RobotContext, workDir string, opts correlation.CorrelatorOptions) (*correlation.HistoryReport, error) {
 	if opts.Revision == "" {
 		opts.Revision = ctx.AsOfCommit
 	}
+	scopedIssues := scopedCorrelationIssues(ctx)
 	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
-		return generateWorkspaceCorrelationReport(ctx, opts, false)
+		wsCtx := ctx
+		wsCtx.Issues = scopedIssues
+		return generateWorkspaceCorrelationReport(wsCtx, opts, false)
 	}
 	beadsPath, err := resolveCorrelationBeadsPathForContext(ctx, workDir)
 	if err != nil {
@@ -4823,7 +4945,7 @@ func generateCorrelationReportForContext(ctx RobotContext, workDir string, opts 
 	if err != nil {
 		return nil, err
 	}
-	report, err := correlator.GenerateReportCached(buildCorrelationBeadInfos(ctx.Issues), opts)
+	report, err := correlator.GenerateReportCached(buildCorrelationBeadInfos(scopedIssues), opts)
 	if err != nil {
 		return nil, fmt.Errorf("generating history report: %w", err)
 	}
@@ -5013,7 +5135,7 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 	// Explain the raw strategy score: a rejected pair is removed from the
 	// feedback-applied report, but the user asking "why was this correlated?"
 	// still needs the signals plus the stored decision.
-	report, err := generateRawCorrelationReport(ctx, workDir, ctx.Issues, correlation.CorrelatorOptions{BeadID: beadID, Revision: ctx.AsOfCommit})
+	report, err := generateRawCorrelationReport(ctx, workDir, scopedCorrelationIssues(ctx), correlation.CorrelatorOptions{BeadID: beadID, Revision: ctx.AsOfCommit})
 	if err != nil {
 		return fmt.Errorf("generating report: %w", err)
 	}
@@ -5050,12 +5172,25 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 	return nil
 }
 
-func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandlerConfig, reject bool) error {
-	flagPtr := cfg.RobotConfirmCorrFlag
+func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandlerConfig, feedbackType correlation.FeedbackType) error {
+	if ctx.AsOf != "" {
+		fmt.Fprintln(ctx.StderrOrDefault(), "Error: correlation feedback commands cannot be combined with --as-of (historical snapshots are read-only)")
+		return newReportedRobotHandlerExit(1)
+	}
+	var flagPtr *string
 	status := "confirmed"
-	if reject {
+	switch feedbackType {
+	case correlation.FeedbackConfirm:
+		flagPtr = cfg.RobotConfirmCorrFlag
+		status = "confirmed"
+	case correlation.FeedbackReject:
 		flagPtr = cfg.RobotRejectCorrFlag
 		status = "rejected"
+	case correlation.FeedbackIgnore:
+		flagPtr = cfg.RobotIgnoreCorrFlag
+		status = "ignored"
+	default:
+		return fmt.Errorf("unsupported correlation feedback type %q", feedbackType)
 	}
 	if flagPtr == nil {
 		return fmt.Errorf("robot correlation feedback flag not configured")
@@ -5076,7 +5211,7 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 		return err
 	}
 
-	report, err := generateRawCorrelationReport(ctx, workDir, ctx.Issues, correlation.CorrelatorOptions{BeadID: beadID, Revision: ctx.AsOfCommit})
+	report, err := generateRawCorrelationReport(ctx, workDir, scopedCorrelationIssues(ctx), correlation.CorrelatorOptions{BeadID: beadID, Revision: ctx.AsOfCommit})
 	if err != nil {
 		return fmt.Errorf("generating report: %w", err)
 	}
@@ -5106,11 +5241,16 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 		reason = *cfg.CorrelationReason
 	}
 
-	if reject {
+	switch feedbackType {
+	case correlation.FeedbackReject:
 		if err := feedbackStore.Reject(commitSHA, fbBeadID, feedbackBy, originalConf, reason); err != nil {
 			return fmt.Errorf("saving feedback: %w", err)
 		}
-	} else {
+	case correlation.FeedbackIgnore:
+		if err := feedbackStore.Ignore(commitSHA, fbBeadID, feedbackBy, originalConf, reason); err != nil {
+			return fmt.Errorf("saving feedback: %w", err)
+		}
+	default:
 		if err := feedbackStore.Confirm(commitSHA, fbBeadID, feedbackBy, originalConf, reason); err != nil {
 			return fmt.Errorf("saving feedback: %w", err)
 		}
@@ -5217,8 +5357,9 @@ func isCommitAncestorOfRevision(repoRoot, sha, rev string) bool {
 	if strings.HasPrefix(targetRev, "-") || strings.ContainsRune(targetRev, 0) {
 		return false
 	}
-	cmd := exec.Command("git", "merge-base", "--is-ancestor", "--end-of-options", sha, targetRev)
+	cmd := exec.Command("git", "--no-replace-objects", "merge-base", "--is-ancestor", "--end-of-options", sha, targetRev)
 	cmd.Dir = repoRoot
+	cmd.Env = sanitizedGitEnvForCLI()
 	return cmd.Run() == nil
 }
 
