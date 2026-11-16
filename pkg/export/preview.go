@@ -238,6 +238,8 @@ func noCacheMiddleware(next http.Handler) http.Handler {
 // Apply this outside the mux so data, status and live-reload share the policy.
 func previewRequestGuard(port int, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		w.Header().Set("Cross-Origin-Embedder-Policy", "require-corp")
 		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		authority, allowed := previewAuthority(r.Host, port)

@@ -26,13 +26,13 @@ function cacheKey(request) {
   return url.href;
 }
 
-// Headers needed for cross-origin isolation
-// Using 'credentialless' instead of 'require-corp' to allow CDN resources
-// while still enabling SharedArrayBuffer for sql.js WASM performance.
-// 'credentialless' allows cross-origin resources without credentials (cookies).
+// Headers needed for cross-origin isolation.
+// All static viewer assets are self-contained on the same origin, so 'require-corp'
+// + 'same-origin' enables SharedArrayBuffer across Safari/WebKit, Chrome, and Firefox.
 const COI_HEADERS = {
-  'Cross-Origin-Embedder-Policy': 'credentialless',
+  'Cross-Origin-Embedder-Policy': 'require-corp',
   'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Resource-Policy': 'same-origin',
 };
 
 /**
@@ -91,7 +91,10 @@ self.addEventListener('install', (event) => {
     const cache = await caches.open(CACHE_NAME);
     for (const asset of OFFLINE_ASSETS) {
       const url = new URL(asset.path, self.registration.scope);
-      const response = await fetch(url, { cache: 'no-store' });
+      const response = await fetch(url, {
+        cache: 'no-store',
+        headers: { 'X-BV-SW-PreCache': '1' },
+      });
       if (!response.ok) throw new Error(`Offline asset unavailable: ${asset.path}`);
       const bytes = await response.clone().arrayBuffer();
       const digest = await crypto.subtle.digest('SHA-256', bytes);

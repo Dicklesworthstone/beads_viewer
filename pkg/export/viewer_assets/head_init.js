@@ -70,7 +70,17 @@ tailwind.config = {
       window.location.reload();
     }
   });
+  function isLiveReloadPreview() {
+    return Boolean(
+      window.crossOriginIsolated &&
+      document.querySelector('script[src*="/__preview__/livereload.js"]')
+    );
+  }
   function registerWorker() {
+    if (isLiveReloadPreview()) {
+      console.log('[COI] Live-reload preview already cross-origin isolated; skipping SW registration');
+      return;
+    }
     // Keep the already verified bundle while offline. Starting an update
     // without network can only produce an incomplete installation.
     if (!navigator.onLine) {
@@ -91,5 +101,9 @@ tailwind.config = {
     });
   }
   window.addEventListener('online', registerWorker);
-  registerWorker();
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', registerWorker, { once: true });
+  } else {
+    registerWorker();
+  }
 })();

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -265,9 +266,31 @@ func liveReloadScriptHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(LiveReloadScript))
 }
 
+func isServiceWorkerOrSubresourceFetch(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.Header.Get("X-BV-SW-PreCache") != "" || r.Header.Get("Service-Worker") != "" {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Dest"))) {
+	case "serviceworker", "worker", "sharedworker", "empty":
+		return true
+	}
+	return false
+}
+
+func isHTMLContentType(contentType string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "text/html")
+}
+
 // liveReloadMiddleware injects the live-reload script tag into HTML responses.
 func liveReloadMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isServiceWorkerOrSubresourceFetch(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		// Only inject into HTML files
 		if filepath.Ext(r.URL.Path) != ".html" && r.URL.Path != "/" && filepath.Ext(r.URL.Path) != "" {
 			next.ServeHTTP(w, r)
@@ -290,22 +313,35 @@ func liveReloadMiddleware(next http.Handler) http.Handler {
 // injectingResponseWriter wraps http.ResponseWriter to inject script before </body>.
 type injectingResponseWriter struct {
 	http.ResponseWriter
-	inject    []byte
-	injected  bool
-	buf       []byte
-	committed bool
+	inject        []byte
+	injected      bool
+	buf           []byte
+	committed     bool
+	statusCode    int
+	hasStatus     bool
+	headerWritten bool
+	passthrough   bool
 }
 
-// WriteHeader deletes Content-Length before writing headers.
-// Since we inject script bytes, the original Content-Length from http.FileServer
-// would be incorrect. Removing it allows Go to use chunked transfer encoding.
+// WriteHeader records status and switches non-200 or explicit non-HTML responses
+// into passthrough mode so error/plain-text/JSON responses are never mutated.
 func (w *injectingResponseWriter) WriteHeader(code int) {
-	w.Header().Del("Content-Length")
-	w.ResponseWriter.WriteHeader(code)
+	if w.headerWritten {
+		return
+	}
+	w.statusCode = code
+	w.hasStatus = true
+
+	ct := strings.TrimSpace(w.Header().Get("Content-Type"))
+	if code != http.StatusOK || (ct != "" && !isHTMLContentType(ct)) {
+		w.passthrough = true
+		w.headerWritten = true
+		w.ResponseWriter.WriteHeader(code)
+	}
 }
 
 func (w *injectingResponseWriter) Write(b []byte) (int, error) {
-	if w.committed {
+	if w.passthrough || w.committed {
 		return w.ResponseWriter.Write(b)
 	}
 
@@ -314,7 +350,6 @@ func (w *injectingResponseWriter) Write(b []byte) (int, error) {
 
 	// If we've seen </html>, flush everything
 	if findLastIndex(w.buf, []byte("</html>")) >= 0 {
-		w.injectScript()
 		err := w.commit()
 		return len(b), err
 	}
@@ -324,8 +359,7 @@ func (w *injectingResponseWriter) Write(b []byte) (int, error) {
 
 // Flush ensures any remaining buffered content is written.
 func (w *injectingResponseWriter) Flush() {
-	if !w.committed && len(w.buf) > 0 {
-		w.injectScript()
+	if !w.committed && (len(w.buf) > 0 || w.hasStatus) {
 		_ = w.commit()
 	}
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
@@ -359,7 +393,34 @@ func (w *injectingResponseWriter) commit() error {
 		return nil
 	}
 	w.committed = true
-	w.Header().Del("Content-Length")
+
+	status := w.statusCode
+	if !w.hasStatus {
+		status = http.StatusOK
+	}
+
+	ct := strings.TrimSpace(w.Header().Get("Content-Type"))
+	if ct == "" && len(w.buf) > 0 {
+		ct = http.DetectContentType(w.buf)
+	}
+
+	if !w.passthrough && status == http.StatusOK && isHTMLContentType(ct) {
+		w.Header().Del("Content-Length")
+		if len(w.buf) > 0 {
+			w.injectScript()
+			if w.Header().Get("Content-Type") == "" {
+				w.Header().Set("Content-Type", ct)
+			}
+		}
+	}
+
+	if !w.headerWritten {
+		w.headerWritten = true
+		w.ResponseWriter.WriteHeader(status)
+	}
+	if len(w.buf) == 0 {
+		return nil
+	}
 	_, err := w.ResponseWriter.Write(w.buf)
 	return err
 }
