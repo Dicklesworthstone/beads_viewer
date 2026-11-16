@@ -243,11 +243,24 @@ pub struct CycleEnumerationResult {
 
 /// Enumerate cycles with metadata about truncation.
 pub fn enumerate_cycles_with_info(graph: &DiGraph, max_cycles: usize) -> CycleEnumerationResult {
-    let cycles = enumerate_cycles(graph, max_cycles);
+    if max_cycles == 0 {
+        return CycleEnumerationResult {
+            cycles: Vec::new(),
+            truncated: false,
+            count: 0,
+        };
+    }
+
+    let probe_limit = max_cycles.saturating_add(1);
+    let mut cycles = enumerate_cycles(graph, probe_limit);
+    let truncated = cycles.len() > max_cycles;
+    if truncated {
+        cycles.truncate(max_cycles);
+    }
     let count = cycles.len();
     CycleEnumerationResult {
         cycles,
-        truncated: count >= max_cycles,
+        truncated,
         count,
     }
 }
@@ -623,8 +636,24 @@ mod tests {
         // (since there's only 1 cycle to find)
         let result_one = enumerate_cycles_with_info(&graph, 1);
         assert_eq!(result_one.count, 1);
-        // Truncated because we hit the limit (count >= max)
-        assert!(result_one.truncated);
+        assert!(!result_one.truncated);
+
+        // With limit of 0, truncated must remain false
+        let result_zero = enumerate_cycles_with_info(&graph, 0);
+        assert_eq!(result_zero.count, 0);
+        assert!(!result_zero.truncated);
+
+        // Add a second cycle (b <-> c): now total cycles == 2 > limit 1 -> truncated == true
+        let c = graph.add_node("c");
+        graph.add_edge(b, c);
+        graph.add_edge(c, b);
+        let result_truncated = enumerate_cycles_with_info(&graph, 1);
+        assert_eq!(result_truncated.count, 1);
+        assert!(result_truncated.truncated);
+
+        let result_exact_two = enumerate_cycles_with_info(&graph, 2);
+        assert_eq!(result_exact_two.count, 2);
+        assert!(!result_exact_two.truncated);
     }
 
     #[test]

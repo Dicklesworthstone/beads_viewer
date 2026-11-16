@@ -81,12 +81,16 @@ pub fn k_critical_paths(graph: &DiGraph, k: usize) -> KPathsResult {
         }
     }
 
-    // Find k nodes with longest paths
-    // We prefer sinks (out-degree 0) but also consider other nodes
-    let mut candidates: Vec<(usize, usize)> = (0..n).map(|v| (v, dist[v])).collect();
+    // Restrict candidate endpoints to sink nodes (out-degree 0) with positive
+    // incoming path length so a single chain emits 1 full sink-ending path
+    // instead of nested intermediate prefixes.
+    let mut candidates: Vec<(usize, usize)> = (0..n)
+        .filter(|&v| graph.out_degree(v) == 0 && dist[v] > 0)
+        .map(|v| (v, dist[v]))
+        .collect();
 
-    // Sort by distance descending
-    candidates.sort_by_key(|candidate| Reverse(candidate.1));
+    // Sort deterministically by distance descending, then sink index ascending.
+    candidates.sort_by_key(|&(v, d)| (Reverse(d), v));
     candidates.truncate(k);
 
     // Find max length
@@ -95,7 +99,6 @@ pub fn k_critical_paths(graph: &DiGraph, k: usize) -> KPathsResult {
     // Reconstruct paths
     let paths: Vec<CriticalPath> = candidates
         .iter()
-        .filter(|(_, d)| *d > 0) // Skip isolated nodes
         .map(|&(sink, _)| {
             let mut path = vec![sink];
             let mut curr = sink;
@@ -182,10 +185,47 @@ mod tests {
         let g = make_graph(&[(0, 1), (1, 2), (2, 3)]);
         let result = k_critical_paths(&g, 5);
 
-        assert!(!result.paths.is_empty());
+        assert_eq!(result.paths.len(), 1);
         // The longest path should be the entire chain
         assert_eq!(result.paths[0].nodes, vec![0, 1, 2, 3]);
         assert_eq!(result.paths[0].length, 4);
+        assert_eq!(result.max_length, 4);
+    }
+
+    #[test]
+    fn test_single_six_node_chain_emits_one_full_sink_path() {
+        // Chain: 0 -> 1 -> 2 -> 3 -> 4 -> 5
+        let g = make_graph(&[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]);
+        let result = k_critical_paths(&g, 5);
+
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(result.paths[0].nodes, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(result.paths[0].length, 6);
+        assert_eq!(result.max_length, 6);
+    }
+
+    #[test]
+    fn test_multi_sink_dag_emits_k_distinct_sink_paths_deterministically() {
+        // Sink 5: 0 -> 1 -> 2 -> 5 (len 4)
+        // Sink 6: 0 -> 3 -> 6      (len 3)
+        // Sink 7: 0 -> 4 -> 7      (len 3, tied with sink 6 -> deterministic order 6 before 7)
+        // Sink 8: 0 -> 8           (len 2)
+        let g = make_graph(&[
+            (0, 1),
+            (1, 2),
+            (2, 5),
+            (0, 3),
+            (3, 6),
+            (0, 4),
+            (4, 7),
+            (0, 8),
+        ]);
+        let result = k_critical_paths(&g, 3);
+
+        assert_eq!(result.paths.len(), 3);
+        assert_eq!(result.paths[0].nodes, vec![0, 1, 2, 5]);
+        assert_eq!(result.paths[1].nodes, vec![0, 3, 6]);
+        assert_eq!(result.paths[2].nodes, vec![0, 4, 7]);
         assert_eq!(result.max_length, 4);
     }
 

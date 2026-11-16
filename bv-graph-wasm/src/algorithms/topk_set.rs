@@ -5,6 +5,7 @@
 //! the node with maximum marginal gain.
 
 use crate::graph::DiGraph;
+use crate::reachability::is_actionable;
 use crate::whatif::what_if_close;
 use serde::Serialize;
 
@@ -83,10 +84,11 @@ pub fn topk_set(
         let mut best_gain = 0;
         let mut best_unblocked: Vec<usize> = Vec::new();
 
-        // Exclude ineligible choices before simulation: filtering the result
-        // afterward would retain gains from pretending those choices closed.
+        // Exclude ineligible or still-blocked choices before simulation:
+        // step 1 never recommends a node whose own prerequisites are still open,
+        // while step s > 1 can chain sequential unlocks once prior steps close blockers.
         let mut candidates: Vec<usize> = (0..n)
-            .filter(|&i| !current_closed[i] && eligible(i))
+            .filter(|&i| !current_closed[i] && eligible(i) && is_actionable(graph, i, &current_closed))
             .collect();
         // Sort for determinism when gains are equal
         candidates.sort_unstable();
@@ -364,5 +366,38 @@ mod tests {
         assert_eq!(result.items[0].node, 0);
         assert_eq!(result.items[0].unblocked_ids, vec![1, 2]);
         assert_eq!(result.total_gain, 2);
+    }
+
+    #[test]
+    fn step_one_never_selects_blocked_node_and_step_two_chains_unlocks() {
+        // Node 2 depends on BOTH 0 and 1. Nodes 3, 4, 5 depend on 2.
+        // Node 6 depends only on 0.
+        // At step 1: 2 has high fan-out (3,4,5) if closed directly, MUST NOT be selected
+        // because 0 and 1 are still open! Only 0 and 1 are actionable:
+        // - 0 directly unblocks 6 (gain 1)
+        // - 1 directly unblocks nothing yet (gain 0)
+        // So step 1 picks 0 (closing 0 and 6).
+        // At step 2: 0 is now closed, so actionable node 1 now unblocks 2 -> 3,4,5 (gain 4)!
+        let g = make_graph(&[(2, 0), (2, 1), (3, 2), (4, 2), (5, 2), (6, 0)]);
+        let result = topk_set(&g, &[false; 7], 5, None);
+
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0].node, 0);
+        assert_eq!(result.items[0].marginal_gain, 1);
+        assert_eq!(result.items[1].node, 1);
+        assert_eq!(result.items[1].marginal_gain, 4);
+        assert_eq!(result.total_gain, 5);
+    }
+
+    #[test]
+    fn blocked_intermediate_not_selected_when_prerequisite_excluded() {
+        // 1 depends on excluded 0; 2, 3, 4 depend on 1.
+        // Because 0 is open and excluded, 1 is not actionable and must never be recommended.
+        let g = make_graph(&[(1, 0), (2, 1), (3, 1), (4, 1)]);
+        let mask = [0, 1, 1, 1, 1];
+        let result = topk_set(&g, &[false; 5], 5, Some(&mask));
+        assert!(result.items.is_empty());
+        assert_eq!(result.total_gain, 0);
+        assert_eq!(result.open_nodes, 4);
     }
 }
