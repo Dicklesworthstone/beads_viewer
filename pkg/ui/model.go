@@ -1340,6 +1340,7 @@ type ReadinessScope struct {
 	AuthorityIncomplete bool
 	SourceDegraded      bool
 	ExplicitDB          bool
+	ReferenceNow        time.Time
 }
 
 type advancedInsightsCacheKey struct {
@@ -1363,6 +1364,7 @@ type Model struct {
 	authorityIncomplete      bool             // True when authority is incomplete, historical, or warned.
 	sourceDegraded           bool             // True when discovery fell back to a stale/degraded source.
 	isExplicitDB             bool             // True when source was explicitly pinned via --db / BEADS_DB.
+	referenceNow             time.Time        // Optional pinned reference clock (e.g. --as-of).
 	beadsPath                string           // Path to beads.jsonl for reloading
 	watcher                  *watcher.Watcher // File watcher for live reload
 	instanceLock             *instance.Lock   // Multi-instance coordination lock
@@ -2423,12 +2425,17 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	// Graph Analysis - Phase 1 is instant, Phase 2 runs in background
 	analyzer := analysis.NewAnalyzer(issues)
 	var candidateIDs map[string]bool
+	var referenceNow time.Time
 	if len(scope) > 0 {
 		if scope[0].CandidateIDs != nil {
 			candidateIDs = make(map[string]bool, len(scope[0].CandidateIDs))
 			for id, selected := range scope[0].CandidateIDs {
 				candidateIDs[id] = selected
 			}
+		}
+		if !scope[0].ReferenceNow.IsZero() {
+			referenceNow = scope[0].ReferenceNow
+			analyzer.SetNow(referenceNow)
 		}
 	}
 	analyzer.SetReadinessScope(authority, candidateIDs)
@@ -2540,6 +2547,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	// Initialize sub-components
 	board := NewBoardModel(issues, theme)
 	board.SetReadiness(readiness)
+	board.SetReferenceTime(analyzer.Now())
 	board.SetFullIssues(issues)
 	labelDashboard := NewLabelDashboardModel(theme)
 	labelDashboard.SetSize(defaultWidth, defaultHeight-1)
@@ -2558,29 +2566,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 
 	// Compute triage insights (bv-151) - reuse existing analyzer/stats (bv-runn.12)
 	triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, graphStats, issues, analysis.TriageOptions{}, analyzer.Now())
-	triageScores := make(map[string]float64, len(triageResult.Recommendations))
-	triageReasons := make(map[string]analysis.TriageReasons, len(triageResult.Recommendations))
-	quickWinSet := make(map[string]bool, len(triageResult.QuickWins))
-	blockerSet := make(map[string]bool, len(triageResult.BlockersToClear))
-	unblocksMap := make(map[string][]string, len(triageResult.Recommendations))
-
-	for _, rec := range triageResult.Recommendations {
-		triageScores[rec.ID] = rec.Score
-		if len(rec.Reasons) > 0 {
-			triageReasons[rec.ID] = analysis.TriageReasons{
-				Primary:    rec.Reasons[0],
-				All:        rec.Reasons,
-				ActionHint: rec.Action,
-			}
-		}
-		unblocksMap[rec.ID] = rec.UnblocksIDs
-	}
-	for _, qw := range triageResult.QuickWins {
-		quickWinSet[qw.ID] = true
-	}
-	for _, bl := range triageResult.BlockersToClear {
-		blockerSet[bl.ID] = true
-	}
+	triageScores, triageReasons, quickWinSet, blockerSet, unblocksMap := extractTriageMaps(triageResult)
 
 	// Update items with triage data
 	for i := range items {
@@ -2641,12 +2627,14 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	if beadsPath != "" && backgroundModeRequested {
 		bw, err := NewBackgroundWorker(WorkerConfig{
 			BeadsPath:      beadsPath,
+			ProjectDir:     workDir,
 			SourceDegraded: sourceDegraded,
 			DebounceDelay:  200 * time.Millisecond,
 		})
 		if err != nil {
 			backgroundModeErr = err
 		} else {
+			bw.SetRecipe(activeRecipe)
 			backgroundWorker = bw
 		}
 	}
@@ -2687,6 +2675,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		}
 	}
 	semanticSearch.SetDocuments(semanticIDs, semanticDocs)
+	semanticSearch.SetReferenceTime(analyzer.Now())
 	semanticHybridEnabled := false
 	semanticHybridPreset := search.PresetDefault
 	if searchCfg, err := search.SearchConfigFromEnv(); err == nil {
@@ -2697,6 +2686,10 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		} else if semanticHybridEnabled || semanticHybridPreset != search.PresetDefault {
 			semanticSearch.SetHybridConfig(semanticHybridEnabled, semanticHybridPreset)
 		}
+	}
+	semanticSearchEnabled := semanticHybridEnabled
+	if semanticSearchEnabled {
+		l.Filter = semanticSearch.Filter
 	}
 
 	// Build initial status message if watcher failed
