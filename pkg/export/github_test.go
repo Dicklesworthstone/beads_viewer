@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -626,5 +627,69 @@ func TestSuggestRepoName_DotGitAndSanitization(t *testing.T) {
 	}
 	if got := SuggestRepoName("!!!.git"); got != "beads-viewer-pages" {
 		t.Fatalf("SuggestRepoName(!!!.git) = %q, want %q", got, "beads-viewer-pages")
+	}
+}
+
+func TestSwitchToLegacyDeploymentArgsAndGitFallbackAuthor(t *testing.T) {
+	args := switchToLegacyDeploymentArgs("octo/demo-pages")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"api -X PUT repos/octo/demo-pages/pages",
+		"-f build_type=legacy",
+		"-f source[branch]=gh-pages",
+		"-f source[path]=/",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("switchToLegacyDeploymentArgs missing %q in %v", want, args)
+		}
+	}
+
+	// Isolate git config so neither system nor user identity exists.
+	emptyHome := t.TempDir()
+	t.Setenv("HOME", emptyHome)
+	t.Setenv("XDG_CONFIG_HOME", emptyHome)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(emptyHome, "nonexistent-gitconfig"))
+
+	repoDir := t.TempDir()
+	initCmd := exec.Command("git", "init")
+	initCmd.Dir = repoDir
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, string(out))
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "index.html"), []byte("<h1>Pages</h1>"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	addCmd := exec.Command("git", "add", ".")
+	addCmd.Dir = repoDir
+	if out, err := addCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v (%s)", err, string(out))
+	}
+
+	commitArgs := gitCommitArgsForDir(repoDir, []string{"commit", "-m", "Update bv pages"})
+	if gotFirst := firstArg(commitArgs); gotFirst != "commit" {
+		t.Fatalf("firstArg(%v) = %q, want %q", commitArgs, gotFirst, "commit")
+	}
+	commitJoined := strings.Join(commitArgs, " ")
+	for _, want := range []string{"-c user.name=bv-pages", "-c user.email=bv-pages@users.noreply.github.com"} {
+		if !strings.Contains(commitJoined, want) {
+			t.Fatalf("gitCommitArgsForDir missing fallback %q in %v", want, commitArgs)
+		}
+	}
+
+	commitCmd := exec.Command("git", commitArgs...)
+	commitCmd.Dir = repoDir
+	if out, err := commitCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit with fallback author failed: %v (%s)", err, string(out))
+	}
+
+	logCmd := exec.Command("git", "log", "-1", "--format=%an <%ae>")
+	logCmd.Dir = repoDir
+	logOut, err := logCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git log: %v (%s)", err, string(logOut))
+	}
+	if got := strings.TrimSpace(string(logOut)); got != "bv-pages <bv-pages@users.noreply.github.com>" {
+		t.Fatalf("commit author = %q, want %q", got, "bv-pages <bv-pages@users.noreply.github.com>")
 	}
 }
