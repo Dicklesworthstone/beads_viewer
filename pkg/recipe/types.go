@@ -250,9 +250,10 @@ func (r *Recipe) Validate() error {
 	}
 	seenMetrics := make(map[string]bool)
 	for _, value := range r.Metrics {
+		canon := strings.ToLower(strings.TrimSpace(value))
 		valid := false
 		for _, known := range ViewMetrics {
-			if value == known {
+			if canon == known {
 				valid = true
 				break
 			}
@@ -260,10 +261,10 @@ func (r *Recipe) Validate() error {
 		if !valid {
 			problems = append(problems, fmt.Sprintf("metrics %q must be one of %s", value, strings.Join(ViewMetrics, ", ")))
 		}
-		if seenMetrics[value] {
+		if seenMetrics[canon] {
 			problems = append(problems, fmt.Sprintf("metrics repeats %q", value))
 		}
-		seenMetrics[value] = true
+		seenMetrics[canon] = true
 	}
 	groupBy := strings.ToLower(strings.TrimSpace(r.View.GroupBy))
 	switch groupBy {
@@ -274,7 +275,8 @@ func (r *Recipe) Validate() error {
 	if r.View.Collapsed && (groupBy == "" || groupBy == "none") {
 		problems = append(problems, "view.collapsed requires view.group_by")
 	}
-	switch r.Export.Format {
+	exportFormat := strings.ToLower(strings.TrimSpace(r.Export.Format))
+	switch exportFormat {
 	case "", "markdown", "html", "json", "csv", "mermaid":
 	default:
 		problems = append(problems, fmt.Sprintf("export.format %q must be markdown, html, json, csv or mermaid", r.Export.Format))
