@@ -72,7 +72,11 @@ func TestPreviewRequestGuard(t *testing.T) {
 			if recorder.Code != tc.want || called != (tc.want == 200) {
 				t.Fatalf("status=%d handler called=%v want=%d", recorder.Code, called, tc.want)
 			}
-			if recorder.Header().Get("Access-Control-Allow-Origin") != "" || recorder.Header().Get("Cross-Origin-Resource-Policy") != "same-origin" {
+			if recorder.Header().Get("Access-Control-Allow-Origin") != "" ||
+				recorder.Header().Get("Cross-Origin-Resource-Policy") != "same-origin" ||
+				recorder.Header().Get("Cross-Origin-Opener-Policy") != "same-origin" ||
+				recorder.Header().Get("Cross-Origin-Embedder-Policy") != "require-corp" ||
+				recorder.Header().Get("X-Content-Type-Options") != "nosniff" {
 				t.Fatalf("unexpected browser policy headers: %v", recorder.Header())
 			}
 			if tc.want != 200 && strings.Contains(recorder.Body.String(), "fake private") {

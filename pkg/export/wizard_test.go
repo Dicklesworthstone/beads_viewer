@@ -467,3 +467,74 @@ func TestWizard_CollectCloudflareConfig_ValidatesProjectName(t *testing.T) {
 		t.Fatal("expected collectCloudflareConfig to reject invalid Cloudflare project name 'INVALID_PROJECT_NAME!'")
 	}
 }
+
+func TestWizard_IsolatesSavedConfigByRepo(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+
+	parentDir := t.TempDir()
+	repoABeads := filepath.Join(parentDir, "repo-a", ".beads")
+	repoBBeads := filepath.Join(parentDir, "repo-b", ".beads")
+	for _, dir := range []string{repoABeads, repoBBeads} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte{}, 0o644); err != nil {
+			t.Fatalf("WriteFile issues.jsonl: %v", err)
+		}
+	}
+
+	wizA := NewWizard(filepath.Join(repoABeads, "issues.jsonl"))
+	wizA.config.Title = "Repo A Dashboard"
+	wizA.config.DeployTarget = "github"
+	wizA.config.RepoName = "repo-a-pages"
+	wizA.config.RepoPrivate = true
+	if err := SaveWizardConfig(wizA.config); err != nil {
+		t.Fatalf("SaveWizardConfig(repo-a): %v", err)
+	}
+
+	saved, err := LoadWizardConfig()
+	if err != nil || saved == nil {
+		t.Fatalf("LoadWizardConfig: saved=%+v err=%v", saved, err)
+	}
+
+	// Same repo (including .beads directory path) matches saved config.
+	if !NewWizard(repoABeads).matchesSavedConfigRepo(saved) {
+		t.Fatal("expected repo-a wizard to match repo-a saved config")
+	}
+
+	// Symlink to repo-a also resolves and matches.
+	symlinkRepoA := filepath.Join(parentDir, "repo-a-link")
+	if err := os.Symlink(filepath.Join(parentDir, "repo-a"), symlinkRepoA); err == nil {
+		if !NewWizard(filepath.Join(symlinkRepoA, ".beads")).matchesSavedConfigRepo(saved) {
+			t.Fatal("expected symlinked repo-a wizard to match repo-a saved config")
+		}
+	}
+
+	// Different repo-b MUST NOT match or reuse repo-a's saved deployment config!
+	wizB := NewWizard(repoBBeads)
+	if wizB.matchesSavedConfigRepo(saved) {
+		t.Fatalf("repo-b wizard falsely matched repo-a saved config: saved=%+v", saved)
+	}
+
+	// Running wizB.Run() must go straight to Step 1 (Export Configuration) rather
+	// than prompting "Use previous configuration?" or inheriting repo-a-pages.
+	// Step 1: IncludeClosed (y), IncludeHistory (y), Title ("Repo B Dashboard"), Subtitle ("")
+	// Step 2: Select option 3 ("local")
+	// Step 3: Output directory ("./bv-pages-b")
+	wizB.input = &wizardInputReader{data: []byte("y\ny\nRepo B Dashboard\n\n3\n./bv-pages-b\n")}
+	res, err := wizB.Run()
+	if err != nil {
+		t.Fatalf("wizB.Run() failed: %v", err)
+	}
+	if res.DeployTarget != "local" {
+		t.Fatalf("wizB DeployTarget = %q, want %q", res.DeployTarget, "local")
+	}
+	if wizB.isUpdate {
+		t.Fatal("wizB.isUpdate = true, expected false when saved config belongs to repo-a")
+	}
+	if wizB.config.RepoName == "repo-a-pages" || wizB.config.Title == "Repo A Dashboard" {
+		t.Fatalf("wizB leaked repo-a config: %+v", wizB.config)
+	}
+}

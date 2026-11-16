@@ -311,3 +311,83 @@ func TestFindLastIndex(t *testing.T) {
 		}
 	}
 }
+
+func TestLiveReloadMiddleware_Skips404JsonAndServiceWorkerRequests(t *testing.T) {
+	t.Run("extensionless 404 plain text is never injected", func(t *testing.T) {
+		handler := liveReloadMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.NotFound(w, r)
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/missing-route", nil)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rr.Code)
+		}
+		if strings.Contains(rr.Body.String(), LiveReloadScriptTag) {
+			t.Fatalf("404 response must not contain LiveReloadScriptTag: %q", rr.Body.String())
+		}
+	})
+
+	t.Run("extensionless 200 JSON preserves Content-Length and skips script injection", func(t *testing.T) {
+		const payload = `{"status":"ok","count":42}`
+		handler := liveReloadMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			_, _ = w.Write([]byte(payload))
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/api-status", nil)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rr.Code)
+		}
+		if got := rr.Header().Get("Content-Length"); got != strconv.Itoa(len(payload)) {
+			t.Fatalf("Content-Length = %q, want %d", got, len(payload))
+		}
+		if rr.Body.String() != payload {
+			t.Fatalf("JSON body = %q, want %q", rr.Body.String(), payload)
+		}
+	})
+
+	t.Run("sniffed non-HTML extensionless 200 skips script injection", func(t *testing.T) {
+		const payload = `{"sniffed":true}`
+		handler := liveReloadMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(payload))
+		}))
+		req := httptest.NewRequest(http.MethodGet, "/sniffed-json", nil)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		if rr.Body.String() != payload {
+			t.Fatalf("sniffed non-HTML body = %q, want %q", rr.Body.String(), payload)
+		}
+	})
+
+	t.Run("service worker and fetch subresource requests receive unmodified HTML bytes", func(t *testing.T) {
+		const exactHTML = "<!doctype html><html><body><h1>Offline Hash Target</h1></body></html>"
+		handler := liveReloadMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(exactHTML))
+		}))
+
+		headers := []struct {
+			key, val string
+		}{
+			{"X-BV-SW-PreCache", "1"},
+			{"Service-Worker", "script"},
+			{"Sec-Fetch-Dest", "empty"},
+			{"Sec-Fetch-Dest", "serviceworker"},
+		}
+		for _, h := range headers {
+			req := httptest.NewRequest(http.MethodGet, "/index.html", nil)
+			req.Header.Set(h.key, h.val)
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+			if rr.Body.String() != exactHTML {
+				t.Fatalf("header %s=%s mutated HTML bytes:\ngot:  %q\nwant: %q", h.key, h.val, rr.Body.String(), exactHTML)
+			}
+		}
+	})
+}

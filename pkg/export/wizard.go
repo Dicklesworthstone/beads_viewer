@@ -241,8 +241,8 @@ func (w *Wizard) Run() (*WizardResult, error) {
 	// Always print banner first (tests and users expect to see it)
 	w.printBanner()
 
-	// Early exit if stdin is not a terminal and is empty/closed.
-	if !isTerminal() {
+	// Early exit if stdin is not a terminal and is empty/closed (when no explicit input reader is injected).
+	if w.input == nil && !isTerminal() {
 		stat, err := os.Stdin.Stat()
 		if err == nil {
 			mode := stat.Mode()
