@@ -13,12 +13,14 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	urlpath "path"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
@@ -117,7 +119,13 @@ func (e *SQLiteExporter) ExportBundle(bundle *Bundle) error {
 	}
 	e.readinessAt = e.Config.ReadinessAt
 	if e.readinessAt.IsZero() {
-		e.readinessAt = time.Now().UTC()
+		if ts, ok := sourceDateEpochTime(); ok {
+			e.readinessAt = ts
+		} else {
+			e.readinessAt = time.Now().UTC()
+		}
+	} else {
+		e.readinessAt = e.readinessAt.UTC()
 	}
 
 	// Create data subdirectory for JSON outputs
@@ -719,15 +727,40 @@ func bundleHasHybridWasm(bundle *Bundle) bool {
 	return false
 }
 
+func sourceDateEpochTime() (time.Time, bool) {
+	rawEpoch := strings.TrimSpace(env.SourceDateEpoch.Get())
+	if rawEpoch == "" {
+		return time.Time{}, false
+	}
+	epoch, err := strconv.ParseInt(rawEpoch, 10, 64)
+	if err != nil || epoch < 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(epoch, 0).UTC(), true
+}
+
+func (e *SQLiteExporter) exportTimestamp() time.Time {
+	if e != nil && !e.readinessAt.IsZero() {
+		return e.readinessAt.UTC()
+	}
+	if e != nil && !e.Config.ReadinessAt.IsZero() {
+		return e.Config.ReadinessAt.UTC()
+	}
+	if ts, ok := sourceDateEpochTime(); ok {
+		return ts
+	}
+	return time.Now().UTC()
+}
+
 // insertMeta inserts export metadata.
 func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 	meta := map[string]string{
 		"version":          "1.0.0",
-		"generated_at":     time.Now().UTC().Format(time.RFC3339),
+		"generated_at":     e.exportTimestamp().Format(time.RFC3339),
 		"issue_count":      fmt.Sprintf("%d", len(e.Issues)),
 		"dependency_count": fmt.Sprintf("%d", len(e.Deps)),
 		"schema_version":   fmt.Sprintf("%d", SchemaVersion),
-		"readiness_at":     e.readinessAt.UTC().Format(time.RFC3339Nano),
+		"readiness_at":     e.exportTimestamp().Format(time.RFC3339Nano),
 		"has_hybrid_wasm":  strconv.FormatBool(e.hasHybridWasm),
 	}
 
@@ -782,7 +815,7 @@ func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error
 	// Write export metadata
 	meta := ExportMeta{
 		Version:       "1.0.0",
-		GeneratedAt:   time.Now().UTC(),
+		GeneratedAt:   e.exportTimestamp(),
 		GitCommit:     e.gitHash,
 		IssueCount:    len(e.Issues),
 		DepCount:      len(e.Deps),
@@ -913,14 +946,15 @@ func (e *SQLiteExporter) chunkIfNeeded(bundle *Bundle, dbPath string) error {
 	// Re-read chunks to record paths and hashes
 	for i := 0; i < chunkNum; i++ {
 		name := fmt.Sprintf("%05d.bin", i)
-		path := filepath.Join("chunks", name)
-		data, err := bundle.root.ReadFile(path)
+		diskPath := filepath.Join("chunks", name)
+		chunkURLPath := urlpath.Join("chunks", name)
+		data, err := bundle.root.ReadFile(diskPath)
 		if err != nil {
 			return fmt.Errorf("hash chunk %d: %w", i, err)
 		}
 		h := sha256.Sum256(data)
 		config.Chunks = append(config.Chunks, ChunkInfo{
-			Path: path,
+			Path: chunkURLPath,
 			Hash: hex.EncodeToString(h[:]),
 			Size: int64(len(data)),
 		})
@@ -1151,7 +1185,7 @@ func (e *SQLiteExporter) ExportToJSON(path string) error {
 	}{
 		Meta: ExportMeta{
 			Version:     "1.0.0",
-			GeneratedAt: time.Now().UTC(),
+			GeneratedAt: e.exportTimestamp(),
 			GitCommit:   e.gitHash,
 			IssueCount:  len(issues),
 			DepCount:    len(e.Deps),
@@ -1384,7 +1418,7 @@ func (e *SQLiteExporter) writeGraphLayout(bundle *Bundle, dataDir string) error 
 		Links:       links,
 		Cycles:      cycles,
 		Version:     "1.0.0",
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		GeneratedAt: e.exportTimestamp().Format(time.RFC3339),
 		NodeCount:   len(e.Issues),
 		EdgeCount:   len(links),
 	}
