@@ -9529,7 +9529,8 @@ func (m *Model) buildHelpBodyLines() (bodyLines []string, availLines int) {
 	graphSection := []struct{ key, desc string }{
 		{"hjkl", "Navigate nodes"},
 		{"H/L", "Scroll left/right"},
-		{"PgUp/Dn", "Scroll up/down"},
+		{"J/K", "Scroll up/down"},
+		{"PgUp/Dn", "Page nodes"},
 		{"Enter", "Jump to issue"},
 	}
 
@@ -10454,7 +10455,7 @@ func (m *Model) renderFooter() string {
 	// PHASE 2 PROGRESS - show while metrics are still computing (bv-tspo)
 	// ─────────────────────────────────────────────────────────────────────────
 	phase2Section := ""
-	if m.snapshot != nil && !m.snapshot.IsPhase2Ready() {
+	if (m.snapshot != nil && !m.snapshot.IsPhase2Ready()) || (m.snapshot == nil && m.analysis != nil && !m.analysis.IsPhase2Ready()) {
 		phase2Style := lipgloss.NewStyle().
 			Background(ColorBgHighlight).
 			Foreground(ColorInfo).
@@ -10660,7 +10661,7 @@ func (m *Model) renderFooter() string {
 
 	var keyHints []string
 	if m.showHelp {
-		keyHints = append(keyHints, "Press any key to close")
+		keyHints = append(keyHints, keyStyle.Render("j/k")+" scroll", keyStyle.Render("space")+" tutorial", keyStyle.Render("?/esc/q")+" close")
 	} else if m.showTimeTravelPrompt {
 		keyHints = append(keyHints, keyStyle.Render("⏎")+" compare", keyStyle.Render("esc")+" cancel")
 	} else if m.showRecipePicker {
@@ -10677,6 +10678,10 @@ func (m *Model) renderFooter() string {
 		if m.flowDetailID != "" {
 			keyHints = []string{keyStyle.Render("j/k") + " scroll", keyStyle.Render("esc") + " relationships"}
 		}
+	} else if m.focused == focusTree {
+		keyHints = append(keyHints, keyStyle.Render("j/k")+" nav", keyStyle.Render("⏎")+" expand", keyStyle.Render("b")+" mode", keyStyle.Render("E")+" close")
+	} else if m.isSprintView || m.focused == focusSprint {
+		keyHints = append(keyHints, keyStyle.Render("j/k")+" scroll", keyStyle.Render("P/esc")+" close")
 	} else if m.isGraphView {
 		keyHints = append(keyHints, keyStyle.Render("hjkl")+" nav", keyStyle.Render("H/L")+" scroll", keyStyle.Render("⏎")+" view", keyStyle.Render("g")+" list")
 	} else if m.isBoardView {
@@ -10723,7 +10728,7 @@ func (m *Model) renderFooter() string {
 	countBadge := lipgloss.NewStyle().
 		Foreground(ColorFooterDim).
 		Padding(0, 1).
-		Render(fmt.Sprintf("%d issues", len(m.list.Items())))
+		Render(fmt.Sprintf("%d issues", m.displayedIssueCount()))
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// ASSEMBLE FOOTER with proper spacing
@@ -10958,9 +10963,26 @@ func (m *Model) jumpToChangedIssue(forward bool) {
 	m.statusIsError = false
 }
 
+func (m *Model) displayedIssueCount() int {
+	items := m.list.Items()
+	if m.recipeGroupingActive() && m.list.FilterState() == list.Unfiltered && len(m.recipeListItems) > 0 {
+		items = m.recipeListItems
+	}
+	count := 0
+	for _, item := range items {
+		if _, ok := item.(IssueItem); ok {
+			count++
+		}
+	}
+	return count
+}
+
 // hasActiveFilters returns true if any filter is currently applied
-// (status filter, label filter, recipe filter, or fuzzy search)
+// (status filter, label filter, recipe filter, repo scope, or fuzzy search)
 func (m *Model) hasActiveFilters() bool {
+	if m.workspaceMode && m.activeRepos != nil {
+		return true
+	}
 	// Check status/label/recipe filter
 	if m.currentFilter != "all" {
 		return true
@@ -10974,11 +10996,15 @@ func (m *Model) hasActiveFilters() bool {
 
 // clearAllFilters resets all filters to their default state
 func (m *Model) clearAllFilters() {
+	hadActiveRepos := m.workspaceMode && m.activeRepos != nil
+	m.activeRepos = nil
 	m.currentFilter = "all"
 	m.setActiveRecipe(nil) // Clear any active recipe filter
-	// Reset the fuzzy search filter by resetting the filter state
-	m.list.ResetFilter()
+	m.clearListFuzzyFilter()
 	m.applyFilter()
+	if hadActiveRepos {
+		m.syncSecondaryViewsForRepoScope(m.focused)
+	}
 }
 
 func (m *Model) setActiveRecipe(r *recipe.Recipe) {
@@ -11043,7 +11069,11 @@ func (m *Model) ensureActiveRecipeIssueIDs() map[string]bool {
 }
 
 func (m *Model) recipeGroupingActive() bool {
-	return m.activeRecipe != nil && m.activeRecipe.View.GroupBy != "" && m.activeRecipe.View.GroupBy != "none"
+	if m.activeRecipe == nil {
+		return false
+	}
+	g := strings.ToLower(strings.TrimSpace(m.activeRecipe.View.GroupBy))
+	return g != "" && g != "none"
 }
 
 func (m *Model) recipeGroupKey(issue model.Issue) string {
@@ -11180,7 +11210,7 @@ func (m *Model) refreshRecipeMetrics() {
 		}
 	}
 	for _, column := range m.activeRecipe.View.Columns {
-		if column == "blockers" && m.analyzer != nil {
+		if canon, ok := recipe.CanonicalViewColumn(column); ok && canon == "blockers" && m.analyzer != nil {
 			m.recipeBlockerCounts = make(map[string]int, len(m.issues))
 			for _, issue := range m.issues {
 				m.recipeBlockerCounts[issue.ID] = len(m.analyzer.Readiness().Blockers(issue.ID))
@@ -11192,8 +11222,12 @@ func (m *Model) refreshRecipeMetrics() {
 
 // analysisReferenceTime keeps readiness and recipe projections consistent with
 // the snapshot's counts and triage, even if a deferral expires while it is shown.
-// A newly loaded snapshot advances the reference instant with its analyzer.
+// A newly loaded snapshot advances the reference instant with its analyzer, unless
+// an explicit --as-of ReferenceNow was supplied at launch.
 func (m *Model) analysisReferenceTime() time.Time {
+	if !m.referenceNow.IsZero() {
+		return m.referenceNow
+	}
 	if m.analyzer != nil {
 		return m.analyzer.Now()
 	}
@@ -11815,6 +11849,9 @@ func (m *Model) listChromeLines() int {
 // they are already focused, so a click there is treated as a no-op rather than
 // guessing at their internal geometry. The viewer stays read-only.
 func (m *Model) handleLeftClick(x, y int) *Model {
+	if x < 0 || y < 0 || y >= m.height-1 || x >= m.mainContentWidth() {
+		return m
+	}
 	// Ignore clicks while any overlay/modal is up: the main list isn't drawn,
 	// so there is nothing meaningful to focus or select.
 	if m.showQuitConfirm || m.showAgentPrompt || m.showCassModal ||
@@ -12554,7 +12591,9 @@ func (m *Model) exportIssuesForCurrentView() []model.Issue {
 	hasViewScope := m.list.FilterState() != list.Unfiltered ||
 		m.activeRecipe != nil ||
 		(m.currentFilter != "" && m.currentFilter != "all") ||
-		(m.workspaceMode && m.activeRepos != nil)
+		(m.workspaceMode && m.activeRepos != nil) ||
+		m.candidateIDs != nil ||
+		m.sortMode != SortDefault
 	if !hasViewScope {
 		return m.issues
 	}
@@ -13999,6 +14038,7 @@ func (m *Model) refreshActionableView() {
 	prevSelectedID := m.actionableView.SelectedIssueID()
 	scopedIssues := m.repoScopedIssues()
 	analyzer := analysis.NewAnalyzer(scopedIssues)
+	analyzer.SetNow(m.analysisReferenceTime())
 	if m.analyzer != nil {
 		candidates := m.candidateIDs
 		if m.workspaceMode && m.activeRepos != nil {
@@ -14037,9 +14077,10 @@ func (m *Model) refreshLabelViews(underlyingFocus focus) {
 		return
 	}
 	scopedIssues := m.repoScopedIssues()
+	refNow := m.analysisReferenceTime().UTC()
 	if needLabelHealth {
 		cfg := analysis.DefaultLabelHealthConfig()
-		m.labelHealthCache = analysis.ComputeAllLabelHealth(scopedIssues, cfg, time.Now().UTC(), m.analysis)
+		m.labelHealthCache = analysis.ComputeAllLabelHealth(scopedIssues, cfg, refNow, m.analysis)
 		m.labelHealthCached = true
 		m.labelDashboard.SetData(m.labelHealthCache.Labels)
 		m.labelDashboard.SetSize(m.mainContentWidth(), m.height-1)
@@ -14077,7 +14118,7 @@ func (m *Model) refreshLabelViews(underlyingFocus focus) {
 		}
 	}
 	if m.showVelocityComparison || underlyingFocus == focusVelocityComparison {
-		m.velocityComparison.SetData(scopedIssues)
+		m.velocityComparison.SetDataAt(scopedIssues, refNow)
 		bodyHeight := m.height - 1
 		if bodyHeight < 5 {
 			bodyHeight = 5
@@ -14113,10 +14154,10 @@ func (m *Model) canScrollShortcutsSidebar(key string) bool {
 	case "pgup", "pgdown":
 		switch m.focused {
 		case focusDetail, focusGraph, focusTree, focusActionable, focusFlowMatrix,
-			focusInsights, focusAttention, focusLabelDashboard, focusVelocityComparison:
+			focusInsights, focusAttention, focusLabelDashboard, focusVelocityComparison, focusHistory:
 			return false
 		case focusBoard:
-			return !m.board.IsDetailShown()
+			return !m.board.IsDetailShown() && len(m.board.columns[m.board.actualFocusedCol()]) <= 1
 		case focusList:
 			return m.list.Paginator.TotalPages <= 1
 		default:
