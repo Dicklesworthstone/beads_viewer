@@ -1258,19 +1258,68 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 	}
 	result := &ParallelGainResult{HowToUse: DefaultUsageHints()["parallel_gain"]}
 
-	if len(a.issueMap) > parallelGainMaxIssues {
+	activeCandidateCount := 0
+	for id, issue := range a.issueMap {
+		if !isClosedLikeStatus(issue.Status) && a.IsCandidate(id) {
+			activeCandidateCount++
+		}
+	}
+	if activeCandidateCount > parallelGainMaxIssues {
 		result.Status = FeatureStatus{
 			State:  "skipped",
-			Reason: fmt.Sprintf("size: %d issues exceeds the %d-issue cap", len(a.issueMap), parallelGainMaxIssues),
+			Reason: fmt.Sprintf("size: %d issues exceeds the %d-issue cap", activeCandidateCount, parallelGainMaxIssues),
 		}
 		return result
 	}
 
 	// Open issues in sorted order so every walk below is deterministic.
-	openIDs := make([]string, 0, len(a.issueMap))
-	for id, issue := range a.issueMap {
-		if !isClosedLikeStatus(issue.Status) {
+	// When candidate-scoped, restrict openIDs to active candidates (and explicit
+	// unblock-scope dependents) plus their open transitive blockers so large
+	// out-of-scope PreRecipeIssues neither skip the sweep nor inflate tracksNow.
+	var openIDs []string
+	if a.HasScope() || a.unblockIDs != nil {
+		keepOpen := make(map[string]bool, activeCandidateCount)
+		queue := make([]string, 0, activeCandidateCount)
+		for id, issue := range a.issueMap {
+			if isClosedLikeStatus(issue.Status) {
+				continue
+			}
+			if a.IsCandidate(id) || a.IsUnblockCandidate(id) {
+				keepOpen[id] = true
+				queue = append(queue, id)
+			}
+		}
+		for head := 0; head < len(queue); head++ {
+			cur := queue[head]
+			for _, dep := range a.issueMap[cur].Dependencies {
+				if dep == nil || !(dep.Type.IsBlocking() || dep.Type == model.DepParentChild) {
+					continue
+				}
+				blk, ok := a.issueMap[dep.DependsOnID]
+				if !ok || isClosedLikeStatus(blk.Status) || keepOpen[dep.DependsOnID] {
+					continue
+				}
+				keepOpen[dep.DependsOnID] = true
+				queue = append(queue, dep.DependsOnID)
+			}
+		}
+		if len(keepOpen) > parallelGainMaxIssues {
+			result.Status = FeatureStatus{
+				State:  "skipped",
+				Reason: fmt.Sprintf("size: %d issues exceeds the %d-issue cap", len(keepOpen), parallelGainMaxIssues),
+			}
+			return result
+		}
+		openIDs = make([]string, 0, len(keepOpen))
+		for id := range keepOpen {
 			openIDs = append(openIDs, id)
+		}
+	} else {
+		openIDs = make([]string, 0, activeCandidateCount)
+		for id, issue := range a.issueMap {
+			if !isClosedLikeStatus(issue.Status) {
+				openIDs = append(openIDs, id)
+			}
 		}
 	}
 	sort.Strings(openIDs)
@@ -1457,7 +1506,7 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 		return result
 	}
 
-	budget := a.parallelGainBudget()
+	budget := a.parallelGainBudgetForSubgraph(nOpen, len(intEdges))
 	var deadline time.Time
 	if budget > 0 {
 		deadline = start.Add(budget)
@@ -1473,6 +1522,9 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 	nonTrivial := make([]pgCandidate, 0, len(actionableIDs))
 	trivialSkipped := 0
 	for _, id := range actionableIDs {
+		if !a.IsCandidate(id) {
+			continue
+		}
 		candIdx, ok := openIdx[id]
 		if !ok {
 			trivialSkipped++
@@ -1496,7 +1548,7 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 	}
 
 	frontierCapped := false
-	if len(a.issueMap) > largeInsightsGraphThreshold && len(nonTrivial) > maxInsightsCandidateSweep {
+	if nOpen > largeInsightsGraphThreshold && len(nonTrivial) > maxInsightsCandidateSweep {
 		sort.Slice(nonTrivial, func(i, j int) bool {
 			if len(nonTrivial[i].unblocks) != len(nonTrivial[j].unblocks) {
 				return len(nonTrivial[i].unblocks) > len(nonTrivial[j].unblocks)
@@ -1590,11 +1642,15 @@ func (a *Analyzer) generateParallelGain(limit int) *ParallelGainResult {
 // (ConfigForSize) analysis config, since both computations are in the same
 // O(V*E) cost class. RunToCompletion (reproducible output) disables the budget.
 func (a *Analyzer) parallelGainBudget() time.Duration {
+	return a.parallelGainBudgetForSubgraph(len(a.issueMap), a.g.Edges().Len())
+}
+
+func (a *Analyzer) parallelGainBudgetForSubgraph(nodeCount, edgeCount int) time.Duration {
 	var cfg AnalysisConfig
 	if a.config != nil {
 		cfg = *a.config
 	} else {
-		cfg = ConfigForSize(len(a.issueMap), a.g.Edges().Len())
+		cfg = ConfigForSize(nodeCount, edgeCount)
 	}
 	if cfg.RunToCompletion {
 		return 0

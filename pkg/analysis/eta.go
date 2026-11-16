@@ -172,7 +172,7 @@ func estimateVelocityMinutesPerDayWithStats(issues []model.Issue, stats *GraphSt
 	const windowDays = 30
 	since := now.Add(-time.Duration(windowDays) * 24 * time.Hour)
 
-	globalV, globalN := velocityMinutesPerDayForLabelWithStats(issues, stats, "", since, medianMinutes)
+	globalV, globalN := velocityMinutesPerDayForLabelWithStats(issues, stats, "", since, now, medianMinutes)
 	labels := issue.Labels
 	if len(labels) == 0 {
 		return globalV, globalN, []string{fmt.Sprintf("velocity: global (%d samples/30d)", globalN)}
@@ -185,7 +185,7 @@ func estimateVelocityMinutesPerDayWithStats(issues []model.Issue, stats *GraphSt
 	bestV := 0.0
 	bestN := 0
 	for _, label := range labels {
-		rawV, n := velocityMinutesPerDayForLabelWithStats(issues, stats, label, since, medianMinutes)
+		rawV, n := velocityMinutesPerDayForLabelWithStats(issues, stats, label, since, now, medianMinutes)
 		if n == 0 || rawV <= 0 {
 			continue
 		}
@@ -210,10 +210,11 @@ func estimateVelocityMinutesPerDayWithStats(issues []model.Issue, stats *GraphSt
 }
 
 func velocityMinutesPerDayForLabel(issues []model.Issue, label string, since time.Time, medianMinutes int) (float64, int) {
-	return velocityMinutesPerDayForLabelWithStats(issues, nil, label, since, medianMinutes)
+	now := since.Add(time.Duration(etaVelocityWindowDays) * 24 * time.Hour)
+	return velocityMinutesPerDayForLabelWithStats(issues, nil, label, since, now, medianMinutes)
 }
 
-func velocityMinutesPerDayForLabelWithStats(issues []model.Issue, stats *GraphStats, label string, since time.Time, medianMinutes int) (float64, int) {
+func velocityMinutesPerDayForLabelWithStats(issues []model.Issue, stats *GraphStats, label string, since, now time.Time, medianMinutes int) (float64, int) {
 	total := 0
 	samples := 0
 
@@ -228,7 +229,7 @@ func velocityMinutesPerDayForLabelWithStats(issues []model.Issue, stats *GraphSt
 			closedAt = *iss.ClosedAt
 		}
 
-		if closedAt.Before(since) {
+		if closedAt.Before(since) || closedAt.After(now) {
 			continue
 		}
 		if label != "" && !hasLabel(iss.Labels, label) {
@@ -273,7 +274,7 @@ func ComputeGrahamBounds(openIssues []model.Issue, allIssues []model.Issue, stat
 	}
 	medianMinutes := computeMedianEstimatedMinutes(allIssues)
 	since := now.Add(-time.Duration(etaVelocityWindowDays) * 24 * time.Hour)
-	velocityPerDay, _ := velocityMinutesPerDayForLabelWithStats(allIssues, stats, "", since, medianMinutes)
+	velocityPerDay, _ := velocityMinutesPerDayForLabelWithStats(allIssues, stats, "", since, now, medianMinutes)
 	if velocityPerDay <= 0 {
 		velocityPerDay = defaultVelocityMinutesPerDay(medianMinutes)
 	}

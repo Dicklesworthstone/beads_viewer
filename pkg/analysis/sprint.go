@@ -107,6 +107,7 @@ func DetectAtRisk(issues []model.Issue, sprint *model.Sprint, now time.Time, thr
 	for _, iss := range issues {
 		issueMap[iss.ID] = iss
 	}
+	readiness := model.NewReadinessIndex(issues)
 
 	seen := make(map[string]bool, len(sprint.BeadIDs))
 	for _, beadID := range sprint.BeadIDs {
@@ -118,7 +119,7 @@ func DetectAtRisk(issues []model.Issue, sprint *model.Sprint, now time.Time, thr
 		if !ok || iss.IsParkedForStalenessAt(now) {
 			continue
 		}
-		if item, flagged := evaluateAtRisk(iss, issueMap, now, thresholds); flagged {
+		if item, flagged := evaluateAtRisk(iss, issueMap, readiness, now, thresholds); flagged {
 			items = append(items, item)
 		}
 	}
@@ -128,32 +129,99 @@ func DetectAtRisk(issues []model.Issue, sprint *model.Sprint, now time.Time, thr
 }
 
 // evaluateAtRisk applies the four signals to a single non-closed bead.
-func evaluateAtRisk(iss model.Issue, issueMap map[string]model.Issue, now time.Time, thresholds AtRiskThresholds) (AtRiskItem, bool) {
+func evaluateAtRisk(iss model.Issue, issueMap map[string]model.Issue, readiness *model.ReadinessIndex, now time.Time, thresholds AtRiskThresholds) (AtRiskItem, bool) {
 	lastActivity := issueLastActivity(iss)
 
-	// Open blockers: blocking dependencies whose target is known and not closed.
+	// Consult ReadinessIndex so transitive DepParentChild epic blockers and
+	// DependenciesUnknown missing blocker IDs are recognized alongside direct
+	// open blocking dependencies, while open unblocked parents remain non-blocking.
 	type blocker struct {
 		id           string
 		lastActivity time.Time
 	}
+	blockerIDs := readiness.Blockers(iss.ID)
+	blockerSet := make(map[string]bool, len(blockerIDs))
 	var openBlockers []blocker
-	blockedSince := lastActivity
-	for _, dep := range iss.Dependencies {
-		if dep == nil || !dep.Type.IsBlocking() {
-			continue
-		}
-		target, ok := issueMap[dep.DependsOnID]
-		if !ok || isClosedLikeStatus(target.Status) {
-			continue
-		}
-		openBlockers = append(openBlockers, blocker{id: target.ID, lastActivity: issueLastActivity(target)})
-		if !dep.CreatedAt.IsZero() && dep.CreatedAt.After(blockedSince) {
-			blockedSince = dep.CreatedAt
+	for _, bID := range blockerIDs {
+		blockerSet[bID] = true
+		if target, ok := issueMap[bID]; ok {
+			openBlockers = append(openBlockers, blocker{id: bID, lastActivity: issueLastActivity(target)})
+		} else {
+			openBlockers = append(openBlockers, blocker{id: bID})
 		}
 	}
+
+	blockedSince := lastActivity
+	hasBlockedParent := false
+	for _, dep := range iss.Dependencies {
+		if dep == nil || !(dep.Type.IsBlocking() || dep.Type == model.DepParentChild) {
+			continue
+		}
+		if !blockerSet[dep.DependsOnID] {
+			continue
+		}
+		if dep.Type == model.DepParentChild {
+			hasBlockedParent = true
+		}
+		if !dep.CreatedAt.IsZero() && dep.CreatedAt.UTC().After(blockedSince) {
+			blockedSince = dep.CreatedAt.UTC()
+		}
+	}
+
+	var ancestorBlockers []blocker
+	if hasBlockedParent {
+		visitedParents := map[string]bool{iss.ID: true}
+		var parentQueue []string
+		for _, dep := range iss.Dependencies {
+			if dep != nil && dep.Type == model.DepParentChild && blockerSet[dep.DependsOnID] && !visitedParents[dep.DependsOnID] {
+				visitedParents[dep.DependsOnID] = true
+				parentQueue = append(parentQueue, dep.DependsOnID)
+			}
+		}
+		seenAncBlocker := make(map[string]bool, len(blockerSet))
+		for k := range blockerSet {
+			seenAncBlocker[k] = true
+		}
+		for head := 0; head < len(parentQueue); head++ {
+			pID := parentQueue[head]
+			parentIss, ok := issueMap[pID]
+			if !ok || isClosedLikeStatus(parentIss.Status) {
+				continue
+			}
+			pBlockerSet := make(map[string]bool)
+			for _, pb := range readiness.Blockers(pID) {
+				pBlockerSet[pb] = true
+			}
+			for _, dep := range parentIss.Dependencies {
+				if dep == nil || !pBlockerSet[dep.DependsOnID] {
+					continue
+				}
+				if dep.Type == model.DepParentChild {
+					if !visitedParents[dep.DependsOnID] {
+						visitedParents[dep.DependsOnID] = true
+						parentQueue = append(parentQueue, dep.DependsOnID)
+					}
+				} else if dep.Type.IsBlocking() {
+					if !dep.CreatedAt.IsZero() && dep.CreatedAt.UTC().After(blockedSince) {
+						blockedSince = dep.CreatedAt.UTC()
+					}
+					if !seenAncBlocker[dep.DependsOnID] {
+						seenAncBlocker[dep.DependsOnID] = true
+						if target, ok := issueMap[dep.DependsOnID]; ok {
+							ancestorBlockers = append(ancestorBlockers, blocker{id: dep.DependsOnID, lastActivity: issueLastActivity(target)})
+						}
+					}
+				}
+			}
+		}
+		sort.Slice(ancestorBlockers, func(i, j int) bool { return ancestorBlockers[i].id < ancestorBlockers[j].id })
+	}
+
 	sort.Slice(openBlockers, func(i, j int) bool { return openBlockers[i].id < openBlockers[j].id })
 
-	blocked := iss.Status == model.StatusBlocked || len(openBlockers) > 0
+	blocked := iss.Status == model.StatusBlocked ||
+		readiness.DependencyState(iss.ID) != model.DependenciesSatisfied ||
+		len(openBlockers) > 0
 
 	var signals []AtRiskSignal
 	var details []string
@@ -207,9 +275,13 @@ func evaluateAtRisk(iss model.Issue, issueMap map[string]model.Issue, now time.T
 	}
 
 	// blockers_not_closing
-	if len(openBlockers) > 0 {
+	if len(openBlockers) > 0 || len(ancestorBlockers) > 0 {
+		stalledCandidates := make([]blocker, 0, len(openBlockers)+len(ancestorBlockers))
+		stalledCandidates = append(stalledCandidates, openBlockers...)
+		stalledCandidates = append(stalledCandidates, ancestorBlockers...)
+		sort.Slice(stalledCandidates, func(i, j int) bool { return stalledCandidates[i].id < stalledCandidates[j].id })
 		var stalled []string
-		for _, b := range openBlockers {
+		for _, b := range stalledCandidates {
 			if b.lastActivity.IsZero() {
 				continue
 			}

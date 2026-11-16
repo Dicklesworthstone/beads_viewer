@@ -420,6 +420,38 @@ func detectChanges(from, to model.Issue) []FieldChange {
 		})
 	}
 
+	if !equalOptionalTime(from.DeferUntil, to.DeferUntil) {
+		changes = append(changes, FieldChange{
+			Field:    "defer_until",
+			OldValue: formatOptionalTime(from.DeferUntil),
+			NewValue: formatOptionalTime(to.DeferUntil),
+		})
+	}
+
+	if !equalOptionalTime(from.DueDate, to.DueDate) {
+		changes = append(changes, FieldChange{
+			Field:    "due_date",
+			OldValue: formatOptionalTime(from.DueDate),
+			NewValue: formatOptionalTime(to.DueDate),
+		})
+	}
+
+	if !equalOptionalInt(from.EstimatedMinutes, to.EstimatedMinutes) {
+		changes = append(changes, FieldChange{
+			Field:    "estimated_minutes",
+			OldValue: formatOptionalInt(from.EstimatedMinutes),
+			NewValue: formatOptionalInt(to.EstimatedMinutes),
+		})
+	}
+
+	if formatOptionalString(from.ExternalRef) != formatOptionalString(to.ExternalRef) {
+		changes = append(changes, FieldChange{
+			Field:    "external_ref",
+			OldValue: formatOptionalString(from.ExternalRef),
+			NewValue: formatOptionalString(to.ExternalRef),
+		})
+	}
+
 	return changes
 }
 
@@ -681,6 +713,49 @@ func priorityString(p int) string {
 	}
 	// For priority >= 10, use standard formatting
 	return "P" + fmt.Sprintf("%d", p)
+}
+
+func equalOptionalTime(a, b *time.Time) bool {
+	aEmpty := a == nil || a.IsZero()
+	bEmpty := b == nil || b.IsZero()
+	if aEmpty && bEmpty {
+		return true
+	}
+	if aEmpty != bEmpty {
+		return false
+	}
+	return a.Equal(*b)
+}
+
+func formatOptionalTime(t *time.Time) string {
+	if t == nil || t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func equalOptionalInt(a, b *int) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+func formatOptionalInt(v *int) string {
+	if v == nil {
+		return ""
+	}
+	return fmt.Sprintf("%d", *v)
+}
+
+func formatOptionalString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func dependencySet(deps []*model.Dependency) map[string]bool {
