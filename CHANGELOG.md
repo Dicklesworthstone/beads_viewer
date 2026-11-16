@@ -272,6 +272,33 @@ every reported vulnerability has an exploitable execution path in bv.
   sync Chart.js light/dark palettes, and add `--export-group-by`, `--export-format html`,
   recipe metrics, `.nojekyll`, SVG/PNG node `<clipPath>` clamping, Mermaid/DOT
   blocked/custom status classes, and pure-Go Pages/Cloudflare verification.
+- **Wave 14–15 Pages data-leak confinement, `--robot-ignore-correlation` (`45`
+  robot commands), scoped graph/capacity/search/drift invariants, TUI viewport &
+  historical fidelity, and static/WASM/installer hardening (`bv-apal.66`..`bv-apal.73`):**
+  eliminate cross-repo `bv --pages` data leakage (`per-repo` `WizardConfig` keys,
+  zero `$HOME`/`/dp` crawling, and empty-project `isSuspiciousIssueCount(0, 0) == false`);
+  register `--robot-ignore-correlation <sha:id>` (`45` total primary robot commands),
+  add `orphans`/`drift`/`version` agent intents + `bv schema bead-history`, and fix
+  `tty_guard.go` phantom value-taking flags; enforce candidate-scoped `NodeCount`/
+  `EdgeCount`/`Density`, `0` 1-hop neighbor leakage across `--robot-insights`/
+  correlation/orphan/related/network/causality/suggest/burndown, weighted
+  `longestWeightedCapacityChain` (`serial_minutes == critical_path_minutes`),
+  in-memory `--as-of` CLI `--search`, symmetric `--diff-since` (`--workspace` +
+  `from_data_hash == to_data_hash`), and `BV_NO_SAVED_CONFIG`/`XDG_CONFIG_HOME`
+  user-config guards; harden `pkg/analysis` (`AllScores`/`UnblocksMap` beyond
+  `TopN`, candidate-scoped `AdvancedInsights`, non-blocking edge filtering in
+  `GetLabelCriticalPath`/`ComputeWhatIf`, multi-hop parent-gate `EstimateETAForIssue`,
+  `BV_CACHE_DEBUG` stderr purity, and `SanitizedGitEnv` across `datasource`/`workspace`/
+  `baseline`/`cass`/`drift`), `pkg/ui` (full-set `TriageScores` + `UnblocksMap`,
+  `ReferenceNow` historical time-travel, CLI `--search-*` wiring, ANSI-safe
+  `truncateRunesHelper`, Cass modal mouse-wheel, Attention viewport clipping,
+  Board `s`/`0` empty-column sync, and Sprint scope-change history), and `pkg/export` +
+  `bv-graph-wasm` (wired `bv-search-wasm` hybrid vector engine in `viewer.js`,
+  `graph.js` WASM `pagerank`/`eigenvector`/`degree` + keyboard pan/zoom/cycle/PNG +
+  touch pinch-zoom + theme re-render, `sprint.html` multi-sprint selector,
+  `markdown.go` blocked/triage/external-dep rendering, `install.sh` relative-`PATH`/
+  `GITHUB_TOKEN`/pinned-tag/ `-mod=vendor` hardening, and `flake.nix` `bvVersion`
+  guard + `gitMinimal` devShell).
 
 ## v0.26.0 — 2026-11-02
 
