@@ -704,7 +704,13 @@ func (e *SQLiteExporter) populateOverviewMetrics(db *sql.DB) error {
 	}
 	defer stmt.Close()
 
+	cycleNodeIDs := make([]string, 0, len(cycleNodes))
 	for id := range cycleNodes {
+		cycleNodeIDs = append(cycleNodeIDs, id)
+	}
+	sort.Strings(cycleNodeIDs)
+
+	for _, id := range cycleNodeIDs {
 		if _, err := stmt.Exec(1, id); err != nil {
 			return fmt.Errorf("update in_cycle for %s: %w", id, err)
 		}
@@ -786,7 +792,14 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 	}
 	defer tx.Rollback()
 
-	for key, value := range meta {
+	metaKeys := make([]string, 0, len(meta))
+	for key := range meta {
+		metaKeys = append(metaKeys, key)
+	}
+	sort.Strings(metaKeys)
+
+	for _, key := range metaKeys {
+		value := meta[key]
 		if _, err := tx.Exec(`INSERT OR REPLACE INTO export_meta (key, value) VALUES (?, ?)`, key, value); err != nil {
 			return fmt.Errorf("insert meta %s: %w", key, err)
 		}
@@ -1253,9 +1266,14 @@ func (e *SQLiteExporter) graphCentrality() *GraphCentrality {
 		}
 		byID[dep.IssueID].Dependencies = append(byID[dep.IssueID].Dependencies, dep)
 	}
+	byIDKeys := make([]string, 0, len(byID))
+	for id := range byID {
+		byIDKeys = append(byIDKeys, id)
+	}
+	sort.Strings(byIDKeys)
 	issues := make([]model.Issue, 0, len(byID))
-	for _, issue := range byID {
-		issues = append(issues, *issue)
+	for _, id := range byIDKeys {
+		issues = append(issues, *byID[id])
 	}
 	cfg := analysis.ConfigForSize(len(issues), len(e.Deps))
 	// Browser sampling has different pivots and thresholds, so it cannot reuse

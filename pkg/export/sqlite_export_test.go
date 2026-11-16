@@ -2,9 +2,11 @@ package export
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -1232,5 +1234,112 @@ func TestExport_ExplicitMetricsWithoutStats(t *testing.T) {
 	if pr != 0.75 || bw != 0.40 || cp != 3 || score != 0.92 || blocks != 1 || blockedBy != 0 {
 		t.Fatalf("met-1 overview metrics = (pr=%v, bw=%v, cp=%d, score=%v, blocks=%d, blockedBy=%d), want (0.75, 0.4, 3, 0.92, 1, 0)",
 			pr, bw, cp, score, blocks, blockedBy)
+	}
+}
+
+func TestSQLiteExporter_SourceDateEpochDeterminismAndChunkForwardSlashes(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "1700000000")
+	fixedTime := time.Unix(1700000000, 0).UTC()
+
+	buildExporter := func() *SQLiteExporter {
+		i1 := &model.Issue{
+			ID:          "det-1",
+			Title:       "Deterministic Root Issue",
+			Description: "Ensures reproducible SQLite and offline manifest exports",
+			Status:      model.StatusOpen,
+			Priority:    0,
+			IssueType:   model.TypeFeature,
+			Labels:      []string{"export", "determinism"},
+			CreatedAt:   fixedTime,
+			UpdatedAt:   fixedTime,
+		}
+		i2 := &model.Issue{
+			ID:          "det-2",
+			Title:       "Deterministic Dependent Issue",
+			Description: "Depends on det-1",
+			Status:      model.StatusOpen,
+			Priority:    1,
+			IssueType:   model.TypeTask,
+			Labels:      []string{"export"},
+			CreatedAt:   fixedTime,
+			UpdatedAt:   fixedTime,
+			Dependencies: []*model.Dependency{
+				{IssueID: "det-2", DependsOnID: "det-1", Type: model.DepBlocks},
+			},
+		}
+		deps := []*model.Dependency{
+			{IssueID: "det-2", DependsOnID: "det-1", Type: model.DepBlocks, CreatedAt: fixedTime},
+		}
+		stats := analysis.NewAnalyzer([]model.Issue{*i1, *i2}).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+		triage := analysis.ComputeTriageWithOptionsAndTime([]model.Issue{*i1, *i2}, analysis.TriageOptions{
+			UseFastConfig: true,
+			WaitForPhase2: true,
+		}, fixedTime)
+		exp := NewSQLiteExporter([]*model.Issue{i1, i2}, deps, nil, &triage)
+		exp.Stats = &stats
+		exp.SetGitHash("0123456789abcdef")
+		exp.Config.Title = "Deterministic Dashboard"
+		exp.Config.ChunkThreshold = 1 // Force chunking so ChunkInfo.Path forward-slash format is verified too
+		exp.Config.ChunkSize = 8192
+		return exp
+	}
+
+	dir1 := filepath.Join(t.TempDir(), "bundle1")
+	if err := buildExporter().Export(dir1); err != nil {
+		t.Fatalf("first Export failed: %v", err)
+	}
+	if err := EmbedAssetsWithSubtitle(dir1, "Deterministic Dashboard", ""); err != nil {
+		t.Fatalf("first EmbedAssetsWithSubtitle failed: %v", err)
+	}
+
+	// Advance wall clock across at least one Unix second boundary.
+	time.Sleep(1100 * time.Millisecond)
+
+	dir2 := filepath.Join(t.TempDir(), "bundle2")
+	if err := buildExporter().Export(dir2); err != nil {
+		t.Fatalf("second Export failed: %v", err)
+	}
+	if err := EmbedAssetsWithSubtitle(dir2, "Deterministic Dashboard", ""); err != nil {
+		t.Fatalf("second EmbedAssetsWithSubtitle failed: %v", err)
+	}
+
+	hashFile := func(path string) string {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile(%q): %v", path, err)
+		}
+		return fmt.Sprintf("%x", sha256.Sum256(data))
+	}
+
+	for _, rel := range []string{
+		"beads.sqlite3",
+		"beads.sqlite3.config.json",
+		filepath.Join("data", "meta.json"),
+		filepath.Join("data", "graph_layout.json"),
+		"index.html",
+		"coi-serviceworker.js",
+	} {
+		h1 := hashFile(filepath.Join(dir1, rel))
+		h2 := hashFile(filepath.Join(dir2, rel))
+		if h1 != h2 {
+			t.Fatalf("SOURCE_DATE_EPOCH export drift in %s: hash1=%s != hash2=%s", rel, h1, h2)
+		}
+	}
+
+	cfgBytes, err := os.ReadFile(filepath.Join(dir1, "beads.sqlite3.config.json"))
+	if err != nil {
+		t.Fatalf("ReadFile chunk config: %v", err)
+	}
+	var chunkCfg ChunkConfig
+	if err := json.Unmarshal(cfgBytes, &chunkCfg); err != nil {
+		t.Fatalf("Unmarshal ChunkConfig: %v", err)
+	}
+	if !chunkCfg.Chunked || len(chunkCfg.Chunks) == 0 {
+		t.Fatalf("expected chunked export with >= 1 chunk, got %+v", chunkCfg)
+	}
+	for _, ch := range chunkCfg.Chunks {
+		if strings.Contains(ch.Path, `\`) || !strings.HasPrefix(ch.Path, "chunks/") {
+			t.Fatalf("ChunkInfo.Path must use URL forward slashes (\"chunks/...\"), got %q", ch.Path)
+		}
 	}
 }
