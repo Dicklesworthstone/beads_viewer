@@ -282,6 +282,10 @@ func (r *Recipe) Validate() error {
 		problems = append(problems, fmt.Sprintf("export.format %q must be markdown, html, json, csv or mermaid", r.Export.Format))
 	}
 	if len(problems) == 0 {
+		for i, value := range r.Metrics {
+			r.Metrics[i] = strings.ToLower(strings.TrimSpace(value))
+		}
+		r.Export.Format = exportFormat
 		return nil
 	}
 	return errors.New(strings.Join(problems, "; "))

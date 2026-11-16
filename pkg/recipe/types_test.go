@@ -191,3 +191,33 @@ func TestRecipeStructTags(t *testing.T) {
 		t.Error("Filters.Status should not be nil")
 	}
 }
+
+func TestRecipeValidateNormalizesCaseInsensitiveMetricsAndExportFormat(t *testing.T) {
+	r := recipe.Recipe{
+		Name:    "case-normalized",
+		Metrics: []string{" PageRank ", "BETWEENNESS", "KCore"},
+		Export:  recipe.ExportConfig{Format: " MARKDOWN "},
+	}
+	if err := r.Validate(); err != nil {
+		t.Fatalf("Validate() rejected mixed-case metrics/export format: %v", err)
+	}
+	wantMetrics := []string{"pagerank", "betweenness", "kcore"}
+	for i, want := range wantMetrics {
+		if r.Metrics[i] != want {
+			t.Fatalf("r.Metrics[%d] = %q, want canonical %q", i, r.Metrics[i], want)
+		}
+	}
+	if r.Export.Format != "markdown" {
+		t.Fatalf("r.Export.Format = %q, want canonical \"markdown\"", r.Export.Format)
+	}
+
+	// Planted negative controls: case-only duplicate metrics and unknown export formats still fail closed.
+	dup := recipe.Recipe{Metrics: []string{"PageRank", "pagerank"}}
+	if err := dup.Validate(); err == nil || !strings.Contains(err.Error(), "repeats") {
+		t.Fatalf("expected case-insensitive duplicate metric rejection, got %v", err)
+	}
+	badExport := recipe.Recipe{Export: recipe.ExportConfig{Format: "PDF"}}
+	if err := badExport.Validate(); err == nil || !strings.Contains(err.Error(), "export.format") {
+		t.Fatalf("expected unknown export format rejection, got %v", err)
+	}
+}
