@@ -1093,10 +1093,29 @@ func CheckAgentFileCmd(workDir string) tea.Cmd {
 			}
 		}
 
-		// Upgrade prompt when file has an outdated blurb (v1..v7 or legacy),
-		// never when future-versioned or malformed.
+		// Upgrade prompt when file has an outdated blurb (v1..v7 or legacy) or
+		// duplicate v8 blurbs requiring consolidation, never when future-versioned or malformed.
 		if detection.NeedsUpgrade() && !detection.HasFutureBlurb() && !detection.HasMalformedBlurb() {
-			if !agents.ShouldPromptForAgentUpgrade(workDir, agents.BlurbVersion) || (prefDir != workDir && !agents.ShouldPromptForAgentUpgrade(prefDir, agents.BlurbVersion)) {
+			canPromptDir := func(dir string) bool {
+				if !detection.HasDuplicateBlurbs() {
+					return agents.ShouldPromptForAgentUpgrade(dir, agents.BlurbVersion)
+				}
+				if agents.SavedConfigDisabled() {
+					return false
+				}
+				pref, err := agents.LoadAgentPromptPreference(dir)
+				if err != nil || pref == nil {
+					return true
+				}
+				if pref.DontAskAgain {
+					return false
+				}
+				if !pref.DeclinedAt.IsZero() && pref.BlurbVersionOffered >= agents.BlurbVersion {
+					return false
+				}
+				return true
+			}
+			if !canPromptDir(workDir) || (prefDir != workDir && !canPromptDir(prefDir)) {
 				return AgentFileCheckMsg{ShouldPrompt: false}
 			}
 			return AgentFileCheckMsg{
@@ -2744,6 +2763,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		issueMap:                issueMap,
 		analyzer:                analyzer,
 		candidateIDs:            candidateIDs,
+		referenceNow:            referenceNow,
 		authorityIncomplete:     authorityIncomplete,
 		sourceDegraded:          sourceDegraded,
 		isExplicitDB:            isExplicitDB,
@@ -2771,6 +2791,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		keyRegistry:             keyRegistry,
 		currentFilter:           "all",
 		semanticSearch:          semanticSearch,
+		semanticSearchEnabled:   semanticSearchEnabled,
 		semanticIndexSaver:      saveSemanticIndex,
 		semanticDataGeneration:  1,
 		semanticQueryGeneration: 1,
@@ -2851,6 +2872,10 @@ func (m *Model) SetWorkDir(dir string) {
 	_ = recipeLoader.Load()
 	m.recipeLoader = recipeLoader
 	m.recipePicker = NewRecipePickerModel(recipeLoader.List(), m.theme)
+	m.recipePicker.SetSize(m.width, max(1, m.height-1))
+	if m.backgroundWorker != nil {
+		m.backgroundWorker.SetProjectDir(m.workDir)
+	}
 	if warnings := recipeLoader.Warnings(); len(warnings) > 0 && m.statusMsg == "" {
 		m.statusMsg = fmt.Sprintf("⚠️ Recipe config warning: %s", warnings[0])
 		m.statusIsError = true
@@ -2864,29 +2889,50 @@ func (m *Model) SetWorkDir(dir string) {
 	}
 }
 
+// SetSearchConfig applies CLI/resolved search mode, preset, and custom weights
+// directly to the interactive TUI search subsystem.
+func (m *Model) SetSearchConfig(cfg search.SearchConfig) {
+	if m == nil {
+		return
+	}
+	preset := cfg.Preset
+	if preset == "" {
+		preset = search.PresetDefault
+	}
+	hybrid := cfg.Mode == search.SearchModeHybrid
+	m.semanticHybridEnabled = hybrid
+	m.semanticHybridPreset = preset
+	if m.semanticSearch != nil {
+		m.semanticSearch.SetReferenceTime(m.analysisReferenceTime())
+		if cfg.HasWeights {
+			m.semanticSearch.SetHybridConfigWithWeights(hybrid, preset, cfg.Weights)
+		} else {
+			m.semanticSearch.SetHybridConfig(hybrid, preset)
+		}
+	}
+	if hybrid {
+		m.semanticSearchEnabled = m.semanticSearch != nil
+		if m.semanticSearch != nil {
+			m.list.Filter = m.semanticSearch.Filter
+		}
+	} else if cfg.Mode == search.SearchModeText {
+		m.semanticSearchEnabled = false
+		m.list.Filter = list.DefaultFilter
+		m.semanticHybridBuilding = false
+		m.semanticHybridBuildData = 0
+		m.semanticHybridBuildGen++
+	}
+	m.invalidateSemanticFilter()
+	m.clearSemanticScores()
+	m.updateListDelegate()
+}
+
 // refreshScopedTriageData replaces worker rankings computed without the UI's
 // selected IDs. Context nodes still contribute graph metrics, but cannot be
 // promoted to recommended work after a reload.
 func (m *Model) refreshScopedTriageData() {
-	triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analyzer.Now())
-	m.triageScores = make(map[string]float64, len(triage.Recommendations))
-	m.triageReasons = make(map[string]analysis.TriageReasons, len(triage.Recommendations))
-	m.unblocksMap = make(map[string][]string, len(triage.Recommendations))
-	m.quickWinSet = make(map[string]bool, len(triage.QuickWins))
-	m.blockerSet = make(map[string]bool, len(triage.BlockersToClear))
-	for _, rec := range triage.Recommendations {
-		m.triageScores[rec.ID] = rec.Score
-		if len(rec.Reasons) > 0 {
-			m.triageReasons[rec.ID] = analysis.TriageReasons{Primary: rec.Reasons[0], All: rec.Reasons, ActionHint: rec.Action}
-		}
-		m.unblocksMap[rec.ID] = rec.UnblocksIDs
-	}
-	for _, quickWin := range triage.QuickWins {
-		m.quickWinSet[quickWin.ID] = true
-	}
-	for _, blocker := range triage.BlockersToClear {
-		m.blockerSet[blocker.ID] = true
-	}
+	triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analysisReferenceTime())
+	m.triageScores, m.triageReasons, m.quickWinSet, m.blockerSet, m.unblocksMap = extractTriageMaps(triage)
 	if !m.workspaceMode || m.activeRepos == nil {
 		m.insightsPanel.SetTopPicks(triage.QuickRef.TopPicks)
 		dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
@@ -2895,6 +2941,11 @@ func (m *Model) refreshScopedTriageData() {
 }
 
 func (m *Model) syncBoardReadinessAndFullIssues() {
+	refNow := m.analysisReferenceTime()
+	m.board.SetReferenceTime(refNow)
+	if m.semanticSearch != nil {
+		m.semanticSearch.SetReferenceTime(refNow)
+	}
 	if m.analyzer != nil {
 		m.board.SetReadiness(m.analyzer.Readiness())
 	}
@@ -3035,12 +3086,25 @@ func (m *Model) rebuildInsightsPanel() {
 	m.insightsPanel = panel
 }
 
+func (m *Model) resizeAgentPromptModal() {
+	modalW := 60
+	if m.width > 0 && m.width < 64 {
+		modalW = max(24, m.width-4)
+	}
+	m.agentPromptModal.SetSize(modalW, m.height)
+}
+
 func (m *Model) Init() tea.Cmd {
 	// Note: ReadyTimeoutCmd is no longer needed since the model is now
 	// initialized as ready with default dimensions in NewModel().
 	// This eliminates the "Initializing..." phase entirely.
 	cmds := []tea.Cmd{
 		m.preparePhase2Cmd(),
+	}
+	if m.semanticSearchEnabled && m.semanticSearch != nil && !m.semanticSearch.Snapshot().Ready {
+		if indexCmd := m.startSemanticIndexBuild(); indexCmd != nil {
+			cmds = append(cmds, indexCmd)
+		}
 	}
 	if m.semanticHybridEnabled && !m.semanticHybridReady {
 		if hybridCmd := m.startSemanticHybridBuild(); hybridCmd != nil {
@@ -3747,6 +3811,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quickWinSet = newSnap.QuickWinSet
 			m.blockerSet = newSnap.BlockerSet
 			m.unblocksMap = newSnap.UnblocksMap
+		} else if m.analyzer != nil && m.analysis != nil {
+			triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analysisReferenceTime())
+			m.triageScores, m.triageReasons, m.quickWinSet, m.blockerSet, m.unblocksMap = extractTriageMaps(triage)
 		}
 
 		// Update UI components with Phase 2 insights
@@ -3987,6 +4054,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.agentPromptModal = NewAgentPromptModal(msg.FilePath, msg.FileType, m.theme)
 			}
+			m.resizeAgentPromptModal()
 			m.focused = m.restoreTopModalOrListFocus()
 		}
 
@@ -4101,23 +4169,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.issueMap = msg.Snapshot.IssueMap
 		m.analyzer = msg.Snapshot.Analyzer
 		m.analysis = msg.Snapshot.Analysis
-		if m.candidateIDs != nil {
+		if m.candidateIDs != nil || !m.referenceNow.IsZero() {
 			// The worker owns its analyzer. Bind a UI-owned analyzer to the
 			// fresh authority without mutating analysis still used off-thread.
 			m.analyzer = analysis.NewAnalyzer(m.issues)
+			if !m.referenceNow.IsZero() {
+				m.analyzer.SetNow(m.referenceNow)
+			}
 			m.analyzer.SetReadinessScope(msg.Snapshot.Analyzer.Readiness(), m.candidateIDs)
 			m.analyzer.RestoreScoring(msg.Snapshot.Analyzer.CaptureScoring())
 			if w := feedbackWeightsForBeadsPath(m.beadsPath); w != nil {
 				m.analyzer.SetWeights(*w)
 			}
 		}
-		if m.candidateIDs != nil {
+		if m.candidateIDs != nil || !m.referenceNow.IsZero() {
 			cOpen, cReady, cBlocked, cClosed := 0, 0, 0, 0
 			readiness := m.analyzer.Readiness()
 			readyNow := m.analysisReferenceTime()
 			for i := range m.issues {
 				issue := &m.issues[i]
-				if !m.candidateIDs[issue.ID] {
+				if m.candidateIDs != nil && !m.candidateIDs[issue.ID] {
 					continue
 				}
 				if isClosedLikeStatus(issue.Status) {
@@ -4147,7 +4218,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pooledIssues = nil
 		// Preserve existing triage data unless the snapshot has Phase 2 results.
 		// Avoid flicker when Phase 1 snapshots arrive without triage data.
-		if m.candidateIDs != nil {
+		if m.candidateIDs != nil || !m.referenceNow.IsZero() {
 			m.refreshScopedTriageData()
 		} else if msg.Snapshot.IsPhase2Ready() || len(msg.Snapshot.TriageScores) > 0 {
 			m.triageScores = msg.Snapshot.TriageScores
@@ -4179,7 +4250,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			clear(m.dismissedAlerts)
 		}
-		if m.candidateIDs != nil {
+		if m.candidateIDs != nil || !m.referenceNow.IsZero() {
 			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
 		} else {
 			m.alerts = msg.Snapshot.alerts
@@ -4509,6 +4580,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if failedWorker != nil {
 				failedWorker.Stop()
 			}
+			if m.watcher == nil && m.sourceReload == nil && m.beadsPath != "" && !strings.HasPrefix(strings.TrimSpace(m.beadsPath), "git:") {
+				if w, wErr := watcher.NewWatcher(m.beadsPath, watcher.WithDebounceDuration(200*time.Millisecond)); wErr == nil {
+					if sErr := w.Start(); sErr == nil {
+						m.watcher = w
+						return m, WatchFileCmd(m.watcher)
+					}
+				}
+			}
 			return m, nil
 		}
 		if m.backgroundWorker != nil {
@@ -4527,6 +4606,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sourceReloadCancel = nil
 		}
 		// File changed on disk - reload issues and recompute analysis.
+		if msg.source == nil && m.sourceReload != nil {
+			return m, m.sourceReloadCmd()
+		}
 		// In background mode the BackgroundWorker owns file watching and snapshot building.
 		if m.backgroundWorker != nil && m.backgroundWorker.State() != WorkerStopped && msg.source == nil {
 			if m.watcher != nil {
@@ -4536,9 +4618,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.backgroundWorker != nil && m.backgroundWorker.State() == WorkerStopped {
 			m.backgroundWorker = nil
-		}
-		if msg.source == nil && m.sourceReload != nil {
-			return m, m.sourceReloadCmd()
 		}
 		if m.beadsPath == "" && msg.source == nil {
 			// Re-start watch for next change
@@ -4707,6 +4786,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		cachedAnalyzer := analysis.NewCachedAnalyzer(newIssues, nil)
 		m.analyzer = cachedAnalyzer.Analyzer
+		if !m.referenceNow.IsZero() {
+			m.analyzer.SetNow(m.referenceNow)
+		}
 		m.analyzer.SetReadinessScope(loadedIssues.Authority, m.candidateIDs)
 		if w := feedbackWeightsForBeadsPath(m.beadsPath); w != nil {
 			m.analyzer.SetWeights(*w)
@@ -4960,6 +5042,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		autoEnabled := false
 		slowReload := reloadDuration >= time.Second
 		canPromoteToBackground := !m.workspaceMode && !m.isExplicitDB && m.candidateIDs == nil &&
+			(m.sourceReload == nil || m.restoreBackgroundAfterEdit) &&
 			m.beadsPath != "" && strings.HasSuffix(strings.ToLower(m.beadsPath), ".jsonl")
 		if (slowReload || m.restoreBackgroundAfterEdit) && m.backgroundWorker == nil && canPromoteToBackground {
 			autoAllowed := true
@@ -4972,6 +5055,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if autoAllowed || m.restoreBackgroundAfterEdit {
 				bw, err := NewBackgroundWorker(WorkerConfig{
 					BeadsPath:      m.beadsPath,
+					ProjectDir:     m.workDir,
 					SourceDegraded: m.sourceDegraded,
 					DebounceDelay:  200 * time.Millisecond,
 				})
@@ -4984,9 +5068,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.sourceReloadCancel()
 						m.sourceReloadCancel = nil
 					}
+					bw.SetRecipe(m.activeRecipe)
 					m.installBackgroundWorker(bw)
 					m.restoreBackgroundAfterEdit = false
-					m.snapshotInitPending = true
+					if len(m.issues) == 0 && !m.ready {
+						m.snapshotInitPending = true
+					}
 					autoEnabled = true
 					cmds = append(cmds, StartBackgroundWorkerCmd(m.backgroundWorker))
 					cmds = append(cmds, WaitForBackgroundWorkerMsgCmd(m.backgroundWorker))
@@ -5013,7 +5100,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.watcher != nil && !autoEnabled {
 			cmds = append(cmds, WatchFileCmd(m.watcher))
 		}
-		cmds = append(cmds, m.preparePhase2Cmd())
+		if !autoEnabled {
+			cmds = append(cmds, m.preparePhase2Cmd())
+		}
 		return m, tea.Batch(cmds...)
 
 	case tea.KeyMsg:
@@ -5159,7 +5248,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case AgentPromptAccept:
 				// User accepted - add or upgrade blurb in file
 				filePath := m.agentPromptModal.FilePath()
-				shouldUpgrade := m.agentPromptModal.IsUpgrade() || agents.DetectAgentFile(filepath.Dir(filePath)).NeedsUpgrade()
+				shouldUpgrade := m.agentPromptModal.IsUpgrade()
+				if !shouldUpgrade && filePath != "" {
+					if info, statErr := os.Lstat(filePath); statErr == nil && info.Mode().IsRegular() {
+						if raw, readErr := os.ReadFile(filePath); readErr == nil {
+							content := string(raw)
+							shouldUpgrade = agents.ContainsAnyBlurb(content) || agents.NeedsUpdate(content)
+						}
+					}
+				}
 				var writeErr error
 				if shouldUpgrade {
 					writeErr = agents.UpdateBlurbInFile(filePath)
@@ -5687,6 +5784,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				m.semanticSearch.SetHybridConfig(m.semanticHybridEnabled, m.semanticHybridPreset)
+				if m.semanticHybridEnabled && !m.semanticSearchEnabled {
+					m.semanticSearchEnabled = true
+					m.list.Filter = m.semanticSearch.Filter
+					if !m.semanticSearch.Snapshot().Ready {
+						if indexCmd := m.startSemanticIndexBuild(); indexCmd != nil {
+							cmds = append(cmds, indexCmd)
+						}
+					}
+				}
 				m.invalidateSemanticFilter()
 				refiltered := m.clearSemanticScores()
 				if !m.semanticHybridEnabled {
@@ -5990,6 +6096,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m, cmd = m.handleHistoryKeys(msg)
 						return m, cmd
 					}
+					if m.historyReportIsCurrent() && (m.historyView.SearchQuery() != "" || m.historyView.HasActiveFilters()) {
+						m.historyView.ClearFilters()
+						m.statusMsg = "🔍 History filters cleared"
+						m.statusIsError = false
+						return m, nil
+					}
 					m.isHistoryView = false
 					m.focused = focusList
 					return m, nil
@@ -6139,7 +6251,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				case "h", "l",
 					"j", "k", "left", "right", "up", "down",
-					"home", "end", "G", "ctrl+d", "ctrl+u",
+					"home", "end", "G", "ctrl+d", "ctrl+u", "pgdown", "pgup",
 					"1", "2", "3", "4", "H", "L", "0", "$",
 					"/", "n", "N", "y", "o", "c", "r", "s", "e", "d",
 					"tab", "enter", "ctrl+j", "ctrl+k":
@@ -6192,7 +6304,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					viewToggleHandled = true
 				case "v":
 					// Open velocity comparison sub-view on 'v' (bv-125)
-					m.velocityComparison.SetData(m.repoScopedIssues())
+					m.velocityComparison.SetDataAt(m.repoScopedIssues(), m.analysisReferenceTime().UTC())
 					bodyHeight := m.height - 1
 					if bodyHeight < 5 {
 						bodyHeight = 5
@@ -6347,6 +6459,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					switch keyStr {
 					case "h", "f", "g", "t",
 						"j", "k", "up", "down",
+						"ctrl+d", "ctrl+u", "pgdown", "pgup",
 						"home", "G", "end",
 						"J", "K", "v", "tab", "enter",
 						"y", "c", "F", "o", "/", "A":
@@ -6613,7 +6726,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Compute label health (fast; phase1 metrics only needed) with caching
 				if !m.labelHealthCached {
 					cfg := analysis.DefaultLabelHealthConfig()
-					m.labelHealthCache = analysis.ComputeAllLabelHealth(m.repoScopedIssues(), cfg, time.Now().UTC(), m.analysis)
+					m.labelHealthCache = analysis.ComputeAllLabelHealth(m.repoScopedIssues(), cfg, m.analysisReferenceTime().UTC(), m.analysis)
 					m.labelHealthCached = true
 				}
 				m.labelDashboard.SetData(m.labelHealthCache.Labels)
@@ -6781,88 +6894,189 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
-		// Handle mouse wheel scrolling
+		// Handle mouse wheel scrolling in exact renderMainView overlay Z-order
 		switch msg.Button {
-		case tea.MouseButtonWheelUp:
-			// Scroll up based on current focus
-			switch m.focused {
-			case focusList:
-				cur := m.listIndexInBounds()
-				if cur > 0 {
-					cur--
-				}
-				if m.list.Index() != cur {
-					m.selectListIndex(cur)
-					// Sync detail panel in split view mode
-					if m.isSplitView {
-						m.updateViewportContent()
-					}
-				}
-			case focusDetail:
-				m.viewport.ScrollUp(3)
-			case focusInsights:
-				m.insightsPanel.MoveUp()
-			case focusAttention:
-				m.attentionView.MoveUp()
-			case focusLabelDashboard:
-				m.labelDashboard.MoveUp()
-			case focusBoard:
-				m.board.MoveUp()
-			case focusGraph:
-				m.graphView.PageUp()
-			case focusTree:
-				m.tree.MoveUp()
-			case focusActionable:
-				m.actionableView.MoveUp()
-			case focusHistory:
-				if m.historyReportIsCurrent() {
-					m.historyView.MoveUp()
-				}
-			case focusFlowMatrix:
-				m.flowMatrix.MoveUp()
-			case focusVelocityComparison:
-				m.velocityComparison.MoveUp()
+		case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
+			up := msg.Button == tea.MouseButtonWheelUp
+			if m.showQuitConfirm {
+				return m, nil
 			}
-			return m, nil
-		case tea.MouseButtonWheelDown:
-			// Scroll down based on current focus
-			switch m.focused {
-			case focusList:
-				cur := m.listIndexInBounds()
-				if cur < len(m.list.VisibleItems())-1 {
-					cur++
+			if m.showHelp {
+				if up {
+					m.helpScroll = max(0, m.helpScroll-3)
+				} else {
+					m.helpScroll = min(m.maxHelpScroll(), m.helpScroll+3)
 				}
-				if m.list.Index() != cur {
-					m.selectListIndex(cur)
-					// Sync detail panel in split view mode
-					if m.isSplitView {
-						m.updateViewportContent()
+				return m, nil
+			}
+			if m.showTutorial {
+				var tutorialCmd tea.Cmd
+				m.tutorialModel, tutorialCmd = m.tutorialModel.Update(msg)
+				return m, tutorialCmd
+			}
+			if m.showAgentPrompt {
+				return m, nil
+			}
+			if m.showCassModal {
+				var cassCmd tea.Cmd
+				m.cassModal, cassCmd = m.cassModal.Update(msg)
+				return m, cassCmd
+			}
+			if m.showUpdateModal {
+				return m, nil
+			}
+			if (m.showLabelHealthDetail && m.labelHealthDetail != nil) ||
+				(m.showLabelGraphAnalysis && m.labelGraphAnalysisResult != nil) ||
+				(m.showLabelDrilldown && m.labelDrilldownLabel != "") {
+				return m, nil
+			}
+			if m.showAlertsPanel {
+				alerts := m.activeScopedAlerts()
+				if len(alerts) == 0 {
+					m.alertsCursor = 0
+				} else if up {
+					if m.alertsCursor > 0 {
+						m.alertsCursor--
 					}
+				} else if m.alertsCursor < len(alerts)-1 {
+					m.alertsCursor++
 				}
-			case focusDetail:
-				m.viewport.ScrollDown(3)
-			case focusInsights:
-				m.insightsPanel.MoveDown()
-			case focusAttention:
-				m.attentionView.MoveDown()
-			case focusLabelDashboard:
-				m.labelDashboard.MoveDown()
-			case focusBoard:
-				m.board.MoveDown()
-			case focusGraph:
-				m.graphView.PageDown()
-			case focusTree:
-				m.tree.MoveDown()
-			case focusActionable:
-				m.actionableView.MoveDown()
-			case focusHistory:
-				if m.historyReportIsCurrent() {
-					m.historyView.MoveDown()
+				return m, nil
+			}
+			if m.showTimeTravelPrompt {
+				return m, nil
+			}
+			if m.showRecipePicker {
+				if up {
+					m.recipePicker.MoveUp()
+				} else {
+					m.recipePicker.MoveDown()
 				}
-			case focusFlowMatrix:
-				m.flowMatrix.MoveDown()
-			case focusVelocityComparison:
-				m.velocityComparison.MoveDown()
+				return m, nil
+			}
+			if m.showRepoPicker {
+				if up {
+					m.repoPicker.MoveUp()
+				} else {
+					m.repoPicker.MoveDown()
+				}
+				return m, nil
+			}
+			if m.showLabelPicker {
+				if up {
+					m.labelPicker.MoveUp()
+				} else {
+					m.labelPicker.MoveDown()
+				}
+				return m, nil
+			}
+			if m.snapshotInitPending && m.snapshot == nil {
+				return m, nil
+			}
+			if m.showShortcutsSidebar && m.width > 0 && msg.X >= m.mainContentWidth() {
+				if up {
+					m.shortcutsSidebar.ScrollUp()
+				} else {
+					m.shortcutsSidebar.ScrollDown()
+				}
+				return m, nil
+			}
+			if up {
+				switch m.focused {
+				case focusList:
+					cur := m.listIndexInBounds()
+					if cur > 0 {
+						cur--
+					}
+					if m.list.Index() != cur {
+						m.selectListIndex(cur)
+						if m.isSplitView {
+							m.updateViewportContent()
+						}
+					}
+				case focusDetail:
+					m.viewport.ScrollUp(3)
+				case focusInsights:
+					m.insightsPanel.MoveUp()
+				case focusAttention:
+					m.attentionView.MoveUp()
+				case focusLabelDashboard:
+					m.labelDashboard.MoveUp()
+				case focusBoard:
+					m.board.MoveUp()
+				case focusGraph:
+					m.graphView.PageUp()
+				case focusTree:
+					m.tree.MoveUp()
+				case focusActionable:
+					m.actionableView.MoveUp()
+				case focusHistory:
+					if m.historyReportIsCurrent() {
+						if m.historyView.FileTreeRendered() && m.historyView.FileTreeHasFocus() {
+							m.historyView.MoveUpFileTree()
+						} else if m.historyView.IsGitMode() {
+							m.historyView.MoveUpGit()
+						} else {
+							m.historyView.MoveUp()
+						}
+					}
+				case focusFlowMatrix:
+					if m.flowDetailID != "" {
+						m.viewport.ScrollUp(3)
+					} else {
+						m.flowMatrix.MoveUp()
+					}
+				case focusVelocityComparison:
+					m.velocityComparison.MoveUp()
+				}
+			} else {
+				switch m.focused {
+				case focusList:
+					cur := m.listIndexInBounds()
+					if cur < len(m.list.VisibleItems())-1 {
+						cur++
+					}
+					if m.list.Index() != cur {
+						m.selectListIndex(cur)
+						if m.isSplitView {
+							m.updateViewportContent()
+						}
+					}
+				case focusDetail:
+					m.viewport.ScrollDown(3)
+				case focusInsights:
+					m.insightsPanel.MoveDown()
+				case focusAttention:
+					m.attentionView.MoveDown()
+				case focusLabelDashboard:
+					m.labelDashboard.MoveDown()
+				case focusBoard:
+					m.board.MoveDown()
+				case focusGraph:
+					m.graphView.PageDown()
+				case focusTree:
+					m.tree.MoveDown()
+				case focusActionable:
+					m.actionableView.MoveDown()
+				case focusHistory:
+					if m.historyReportIsCurrent() {
+						if m.historyView.FileTreeRendered() && m.historyView.FileTreeHasFocus() {
+							m.historyView.MoveDownFileTree()
+						} else if m.historyView.IsGitMode() {
+							m.historyView.MoveDownGit()
+						} else {
+							m.historyView.MoveDown()
+						}
+					}
+				case focusFlowMatrix:
+					if m.flowDetailID != "" {
+						m.viewport.ScrollDown(3)
+					} else {
+						m.flowMatrix.MoveDown()
+					}
+				case focusVelocityComparison:
+					m.velocityComparison.MoveDown()
+				}
 			}
 			return m, nil
 
@@ -6904,6 +7118,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.showHelp {
 			m.helpScroll = min(m.helpScroll, m.maxHelpScroll())
+		}
+		m.recipePicker.SetSize(m.width, max(1, m.height-1))
+		if m.showRepoPicker {
+			m.repoPicker.SetSize(m.width, max(1, m.height-1))
+		}
+		m.labelPicker.SetSize(m.width, max(1, m.height-1))
+		if m.showUpdateModal {
+			m.updateModal.SetSize(m.width, m.height)
+		}
+		if m.showAgentPrompt {
+			m.resizeAgentPromptModal()
 		}
 		if m.showCassModal {
 			m.cassModal.SetSize(m.width, m.height)
@@ -7048,9 +7273,9 @@ func (m *Model) handleBoardKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		m.board.MoveToTop()
 	case "G", "end":
 		m.board.MoveToBottom()
-	case "ctrl+d":
+	case "ctrl+d", "pgdown":
 		m.board.PageDown(m.height / 3)
-	case "ctrl+u":
+	case "ctrl+u", "pgup":
 		m.board.PageUp(m.height / 3)
 
 	// Column jumping (bv-yg39)
@@ -7352,6 +7577,12 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		case "k", "up":
 			m.historyView.MoveUpFileTree()
 			return m, nil
+		case "ctrl+d", "pgdown":
+			m.historyView.PageDown()
+			return m, nil
+		case "ctrl+u", "pgup":
+			m.historyView.PageUp()
+			return m, nil
 		case "home":
 			m.historyView.MoveToStartFileTree()
 			return m, nil
@@ -7454,6 +7685,10 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		} else {
 			m.historyView.MoveUp()
 		}
+	case "ctrl+d", "pgdown":
+		m.historyView.PageDown()
+	case "ctrl+u", "pgup":
+		m.historyView.PageUp()
 	case "home":
 		if m.historyView.IsGitMode() {
 			m.historyView.MoveToStartGit()
@@ -8252,7 +8487,7 @@ func (m *Model) handleTimeTravelInputKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 
 func isHistoryFileTreeNavKey(key string) bool {
 	switch key {
-	case "j", "down", "k", "up", "home", "G", "end", "enter", "l", "right", " ", "left", "backspace", "tab":
+	case "j", "down", "k", "up", "ctrl+d", "ctrl+u", "pgdown", "pgup", "home", "G", "end", "enter", "l", "right", " ", "left", "backspace", "tab":
 		return true
 	default:
 		return false

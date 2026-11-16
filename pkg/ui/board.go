@@ -861,12 +861,14 @@ func (b *BoardModel) MoveToBottom() {
 }
 
 func (b *BoardModel) PageDown(visibleRows int) {
+	b.CollapseExpanded()
 	col := b.actualFocusedCol()
 	count := len(b.columns[col])
 	if count == 0 {
 		return
 	}
-	newRow := b.selectedRow[col] + visibleRows/2
+	step := max(1, visibleRows/2)
+	newRow := b.selectedRow[col] + step
 	if newRow >= count {
 		newRow = count - 1
 	}
@@ -874,8 +876,10 @@ func (b *BoardModel) PageDown(visibleRows int) {
 }
 
 func (b *BoardModel) PageUp(visibleRows int) {
+	b.CollapseExpanded()
 	col := b.actualFocusedCol()
-	newRow := b.selectedRow[col] - visibleRows/2
+	step := max(1, visibleRows/2)
+	newRow := b.selectedRow[col] - step
 	if newRow < 0 {
 		newRow = 0
 	}

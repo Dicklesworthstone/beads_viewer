@@ -38,6 +38,9 @@ func mouseTestIssues(n int) []model.Issue {
 func sizedModel(t *testing.T, issues []model.Issue, width, height int) *Model {
 	t.Helper()
 	m := NewModel(issues, nil, "")
+	if m.analysis != nil {
+		m.analysis.WaitForPhase2()
+	}
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: width, Height: height})
 	return updated.(*Model)
 }
