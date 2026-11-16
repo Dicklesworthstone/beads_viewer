@@ -75,11 +75,13 @@ type Wizard struct {
 
 // NewWizard creates a new deployment wizard.
 func NewWizard(beadsPath string) *Wizard {
+	cfg := &WizardConfig{
+		IncludeClosed:  true, // Include all issues by default
+		IncludeHistory: true, // Include git history by default
+	}
+	populateWizardSourceMetadata(cfg, beadsPath)
 	return &Wizard{
-		config: &WizardConfig{
-			IncludeClosed:  true, // Include all issues by default
-			IncludeHistory: true, // Include git history by default
-		},
+		config:    cfg,
 		beadsPath: beadsPath,
 	}
 }
@@ -275,8 +277,8 @@ func (w *Wizard) Run() (*WizardResult, error) {
 	// Check for saved configuration first (unless BV_NO_SAVED_CONFIG is set)
 	savedConfig, err := LoadWizardConfig()
 	skipSaved := env.NoSavedConfig.Get() != ""
-	if !skipSaved && err == nil && savedConfig != nil && savedConfig.DeployTarget != "" {
-		// Found saved config - ask if user wants to use it
+	if !skipSaved && err == nil && savedConfig != nil && savedConfig.DeployTarget != "" && w.matchesSavedConfigRepo(savedConfig) {
+		// Found saved config for this repository - ask if user wants to use it
 		useSaved, err := w.offerSavedConfig(savedConfig)
 		if err != nil {
 			return nil, err
@@ -284,6 +286,7 @@ func (w *Wizard) Run() (*WizardResult, error) {
 		if useSaved {
 			// Use saved config and mark as update
 			w.config = savedConfig
+			populateWizardSourceMetadata(w.config, w.beadsPath)
 			w.isUpdate = true
 
 			// Skip to prerequisites check
@@ -480,6 +483,87 @@ func projectRootFromBeadsPath(raw string) string {
 		return ""
 	}
 	return abs
+}
+
+func normalizeWizardRepoPath(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(trimmed)
+	if err != nil {
+		abs = filepath.Clean(trimmed)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil && strings.TrimSpace(resolved) != "" {
+		abs = resolved
+	}
+	return filepath.Clean(abs)
+}
+
+func populateWizardSourceMetadata(cfg *WizardConfig, beadsPath string) {
+	if cfg == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(beadsPath)
+	if trimmed == "" {
+		return
+	}
+	if root := projectRootFromBeadsPath(trimmed); root != "" {
+		if cfg.SourceRepoRoot == "" {
+			cfg.SourceRepoRoot = root
+		}
+		if cfg.SourceBeadsDir == "" {
+			cfg.SourceBeadsDir = filepath.Join(root, ".beads")
+		}
+	}
+	if cfg.SourcePath == "" && isBeadsDataFileName(filepath.Base(trimmed)) {
+		if abs, err := filepath.Abs(trimmed); err == nil {
+			cfg.SourcePath = abs
+		} else {
+			cfg.SourcePath = filepath.Clean(trimmed)
+		}
+	}
+}
+
+func savedWizardConfigRepoRoot(saved *WizardConfig) string {
+	if saved == nil {
+		return ""
+	}
+	if strings.TrimSpace(saved.SourceRepoRoot) != "" {
+		return normalizeWizardRepoPath(saved.SourceRepoRoot)
+	}
+	if root := projectRootFromBeadsPath(saved.SourceBeadsDir); root != "" {
+		return normalizeWizardRepoPath(root)
+	}
+	if root := projectRootFromBeadsPath(saved.SourcePath); root != "" {
+		return normalizeWizardRepoPath(root)
+	}
+	return ""
+}
+
+func (w *Wizard) currentRepoRoot() string {
+	if w != nil {
+		if root := projectRootFromBeadsPath(w.beadsPath); root != "" {
+			return normalizeWizardRepoPath(root)
+		}
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return normalizeWizardRepoPath(cwd)
+}
+
+func (w *Wizard) matchesSavedConfigRepo(saved *WizardConfig) bool {
+	if w == nil || saved == nil {
+		return false
+	}
+	currentRoot := w.currentRepoRoot()
+	savedRoot := savedWizardConfigRepoRoot(saved)
+	if currentRoot == "" || savedRoot == "" {
+		return false
+	}
+	return currentRoot == savedRoot
 }
 
 func (w *Wizard) suggestedTargetSourcePath() string {

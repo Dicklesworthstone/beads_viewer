@@ -317,7 +317,11 @@ func InitAndPush(bundlePath string, repoFullName string, forceOverwrite bool) er
 	for _, c := range commands {
 		fmt.Printf("  -> %s...\n", c.desc)
 		commandName := firstArg(c.args)
-		cmd := exec.Command("git", c.args...)
+		args := c.args
+		if commandName == "commit" {
+			args = gitCommitArgsForDir(bundlePath, c.args)
+		}
+		cmd := exec.Command("git", args...)
 		cmd.Dir = bundlePath
 		if output, err := cmd.CombinedOutput(); err != nil {
 			switch commandName {
@@ -383,10 +387,47 @@ func gitCommandOutputError(context string, output []byte, err error) error {
 }
 
 func firstArg(args []string) string {
-	if len(args) == 0 {
-		return ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-c" {
+			i++
+			continue
+		}
+		return args[i]
 	}
-	return args[0]
+	return ""
+}
+
+func hasGitConfigValue(dir, key string) bool {
+	cmd := exec.Command("git", "config", "--get", key)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
+func gitCommitArgsForDir(dir string, commitArgs []string) []string {
+	var prefix []string
+	if !hasGitConfigValue(dir, "user.name") {
+		prefix = append(prefix, "-c", "user.name=bv-pages")
+	}
+	if !hasGitConfigValue(dir, "user.email") {
+		prefix = append(prefix, "-c", "user.email=bv-pages@users.noreply.github.com")
+	}
+	if len(prefix) == 0 {
+		return commitArgs
+	}
+	return append(prefix, commitArgs...)
+}
+
+func switchToLegacyDeploymentArgs(repoFullName string) []string {
+	return []string{
+		"api", "-X", "PUT",
+		fmt.Sprintf("repos/%s/pages", repoFullName),
+		"-f", "build_type=legacy",
+		"-f", "source[branch]=gh-pages",
+		"-f", "source[path]=/",
+	}
 }
 
 func enableGitHubPagesArgs(repoFullName string) []string {
@@ -912,11 +953,7 @@ func SwitchToLegacyDeployment(repoFullName string) error {
 	fmt.Println("  -> Switching to legacy branch-based deployment...")
 
 	// Update Pages source to use gh-pages branch with legacy build type
-	// The GitHub API expects source as an object: {"source": {"branch": "gh-pages", "path": "/"}}
-	cmd := exec.Command("gh", "api", "-X", "PUT",
-		fmt.Sprintf("repos/%s/pages", repoFullName),
-		"-f", "source[branch]=gh-pages",
-		"-f", "source[path]=/")
+	cmd := exec.Command("gh", switchToLegacyDeploymentArgs(repoFullName)...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// Check if it's just telling us the config is already set
@@ -943,7 +980,11 @@ func PushToGHPagesBranch(bundlePath string, repoFullName string) error {
 
 	for _, c := range commands {
 		commandName := firstArg(c.args)
-		cmd := exec.Command("git", c.args...)
+		args := c.args
+		if commandName == "commit" {
+			args = gitCommitArgsForDir(bundlePath, c.args)
+		}
+		cmd := exec.Command("git", args...)
 		cmd.Dir = bundlePath
 		if output, err := cmd.CombinedOutput(); err != nil {
 			switch commandName {
