@@ -12,7 +12,7 @@ func TestNormalizeStatus(t *testing.T) {
 		"in_progress": 0.8,
 		"hooked":      0.8,
 		"review":      0.8,
-		"pinned":      0.7,
+		"pinned":      0.2,
 		"blocked":     0.5,
 		"draft":       0.2,
 		"deferred":    0.2,

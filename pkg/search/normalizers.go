@@ -15,11 +15,9 @@ func normalizeStatus(status string) float64 {
 		return 1.0
 	case model.StatusInProgress, model.StatusHooked, model.StatusReview:
 		return 0.8
-	case model.StatusPinned:
-		return 0.7
 	case model.StatusBlocked:
 		return 0.5
-	case model.StatusDraft, model.StatusDeferred:
+	case model.StatusDraft, model.StatusDeferred, model.StatusPinned:
 		return 0.2
 	case model.StatusClosed:
 		return 0.1

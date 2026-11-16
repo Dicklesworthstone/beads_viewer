@@ -6,9 +6,12 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"golang.org/x/sync/singleflight"
@@ -42,6 +45,8 @@ type AnalyzerMetricsLoader struct {
 	readiness *model.ReadinessIndex
 	cache     *analysis.Cache
 	config    *analysis.AnalysisConfig
+	now       time.Time
+	hasNow    bool
 
 	// issues is a private deep clone and never changes after construction.
 	// Hash it once, including for a zero-value/empty loader. Mutable loader
@@ -75,6 +80,25 @@ func (l *AnalyzerMetricsLoader) WithCache(cache *analysis.Cache) *AnalyzerMetric
 func (l *AnalyzerMetricsLoader) WithConfig(config *analysis.AnalysisConfig) *AnalyzerMetricsLoader {
 	l.config = config
 	return l
+}
+
+// WithNow overrides the reference clock used to evaluate future defer_until timestamps.
+func (l *AnalyzerMetricsLoader) WithNow(now time.Time) *AnalyzerMetricsLoader {
+	l.now = now
+	l.hasNow = true
+	return l
+}
+
+func (l *AnalyzerMetricsLoader) referenceNow() time.Time {
+	if l != nil && l.hasNow {
+		return l.now
+	}
+	if raw := env.SourceDateEpoch.Get(); raw != "" {
+		if sec, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			return time.Unix(sec, 0).UTC()
+		}
+	}
+	return time.Now().UTC()
 }
 
 // LoadMetrics computes metrics for all issues using the analysis engine.
@@ -162,6 +186,7 @@ func (l *AnalyzerMetricsLoader) computeMetricsAndHash(includeHash bool) (map[str
 	if readiness == nil {
 		readiness = model.NewReadinessIndex(l.issues)
 	}
+	refNow := l.referenceNow()
 	metrics := make(map[string]IssueMetrics, len(l.issues))
 	for _, issue := range l.issues {
 		pr := defaultPageRank
@@ -181,9 +206,16 @@ func (l *AnalyzerMetricsLoader) computeMetricsAndHash(includeHash bool) (map[str
 		}
 		normStatus := issue.Status.Normalize()
 		effectiveStatus := issue.Status
-		if (normStatus == model.StatusOpen || normStatus == model.StatusInProgress) &&
-			readiness.DependencyState(issue.ID) != model.DependenciesSatisfied {
-			effectiveStatus = model.StatusBlocked
+		if normStatus != model.StatusClosed && !normStatus.IsTombstone() {
+			switch {
+			case issue.IsTemplate || issue.Pinned || normStatus == model.StatusPinned:
+				effectiveStatus = model.StatusDeferred
+			case (normStatus == model.StatusOpen || normStatus == model.StatusInProgress) && issue.IsDeferredAt(refNow):
+				effectiveStatus = model.StatusDeferred
+			case (normStatus == model.StatusOpen || normStatus == model.StatusInProgress) &&
+				readiness.DependencyState(issue.ID) != model.DependenciesSatisfied:
+				effectiveStatus = model.StatusBlocked
+			}
 		}
 		metrics[issue.ID] = IssueMetrics{
 			IssueID:      issue.ID,
