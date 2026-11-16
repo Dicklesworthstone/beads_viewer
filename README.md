@@ -2584,6 +2584,9 @@ bv --robot-confirm-correlation abc1234:bv-xyz
 # Reject an incorrect correlation (removes it)
 bv --robot-reject-correlation abc1234:bv-xyz
 
+# Mark a correlation as ignored (retains raw link without accuracy penalty)
+bv --robot-ignore-correlation abc1234:bv-xyz
+
 # View feedback statistics
 bv --robot-correlation-stats
 ```
@@ -2600,7 +2603,7 @@ bv --robot-correlation-stats
 }
 ```
 
-Stored feedback applies to the identified commit/issue pair: confirmation pins confidence to 1.0 and rejection removes that pair from the report and derived index. A third `ignore` type exists in the stored format and is counted when present, but no `bv` command records one — only `--robot-confirm-correlation` and `--robot-reject-correlation` write feedback. These decisions do not train patterns for unrelated pairs or establish calibrated accuracy.
+Stored feedback applies to the identified commit/issue pair: confirmation pins confidence to 1.0, rejection removes that pair from the report and derived index, and `--robot-ignore-correlation` records an `ignore` entry that keeps the correlation at its raw confidence while excluding it from confirm/reject accuracy decisions. These decisions do not train patterns for unrelated pairs or establish calibrated accuracy.
 
 **Impact Network Output Excerpt:**
 Selected fields from `--robot-impact-network all`; clusters and edges belong to `.network`, while `.top_clusters` is a separate shortlist.

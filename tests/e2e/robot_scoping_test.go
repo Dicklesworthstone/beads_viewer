@@ -655,6 +655,7 @@ var scopingSkip = map[string]string{
 	"robot-search":              "requires --search (covered by robot_search_test.go)",
 	"robot-confirm-correlation": "mutates the feedback store",
 	"robot-reject-correlation":  "mutates the feedback store",
+	"robot-ignore-correlation":  "mutates the feedback store",
 	"robot-explain-correlation": "needs a real commit sha",
 	"robot-sprint-show":         "needs a sprint id (needs_sprint)",
 }

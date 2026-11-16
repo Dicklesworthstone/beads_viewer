@@ -92,7 +92,7 @@ bv --robot-orphans                     # Commits missing explicit bead links
 bv --robot-explain-correlation <sha:id> # Explain commit-to-bead correlation score
 bv --robot-confirm-correlation <sha:id> # Confirm correlation pair in feedback store
 bv --robot-reject-correlation <sha:id>  # Reject correlation pair in feedback store
-bv --robot-ignore-correlation <sha:id>  # Suppress correlation pair without weight penalty
+bv --robot-ignore-correlation <sha:id>  # Mark correlation pair as ignored without accuracy penalty
 bv --robot-correlation-stats           # Correlation feedback summary statistics
 bv --robot-diff --diff-since HEAD~1    # Changes since an existing Git ref
 bv --search "oauth" --robot-search     # Keyword or --search-mode hybrid semantic search

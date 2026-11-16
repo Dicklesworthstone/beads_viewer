@@ -6242,13 +6242,18 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	}
 	sort.Slice(targetIssues, func(i, j int) bool { return targetIssues[i].ID < targetIssues[j].ID })
 
+	includeInactive := cfg.IncludeInactive != nil && *cfg.IncludeInactive
 	openIssues := make([]model.Issue, 0)
 	issueMap := make(map[string]model.Issue, len(targetIssues))
 	for _, issue := range targetIssues {
-		if !issue.Status.IsClosed() && !issue.Status.IsTombstone() {
-			issueMap[issue.ID] = issue
-			openIssues = append(openIssues, issue)
+		if issue.Status.IsClosed() || issue.Status.IsTombstone() {
+			continue
 		}
+		if !includeInactive && (issue.IsTemplate || issue.Pinned || issue.Status == model.StatusPinned) {
+			continue
+		}
+		issueMap[issue.ID] = issue
+		openIssues = append(openIssues, issue)
 	}
 
 	agents := 1
@@ -6258,9 +6263,11 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 
 	etaIssues := ctx.VelocityIssues()
 	totalMinutes := 0
+	minutesByID := make(map[string]int, len(openIssues))
 	for _, issue := range openIssues {
 		eta, err := analysis.EstimateETAForIssue(etaIssues, &graphStats, issue.ID, 1, now)
 		if err == nil {
+			minutesByID[issue.ID] = eta.EstimatedMinutes
 			totalMinutes += eta.EstimatedMinutes
 		}
 	}
@@ -6312,17 +6319,9 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		}
 	}
 
-	longestChain := longestCapacityChain(chainStarts, blocks)
+	longestChain, serialMinutes := longestWeightedCapacityChain(chainStarts, blocks, minutesByID)
 	if longestChain == nil {
 		longestChain = []string{}
-	}
-
-	serialMinutes := 0
-	for _, id := range longestChain {
-		eta, err := analysis.EstimateETAForIssue(etaIssues, &graphStats, id, 1, now)
-		if err == nil {
-			serialMinutes += eta.EstimatedMinutes
-		}
 	}
 
 	parallelMinutes := totalMinutes - serialMinutes
@@ -6498,6 +6497,157 @@ func longestCapacityChain(starts []string, blocks map[string][]string) []string 
 		dfs(id, nil)
 	}
 	return longest
+}
+
+// longestWeightedCapacityChain selects the simple blocking path maximizing
+// cumulative work minutes (matching Graham critical_path_minutes), breaking
+// ties by hop count and seed/neighbor order.
+func longestWeightedCapacityChain(starts []string, blocks map[string][]string, minutes map[string]int) ([]string, int) {
+	if len(starts) == 0 {
+		return nil, 0
+	}
+	state := make(map[string]uint8)
+	var postorder []string
+	hasCycle := false
+	var visit func(string)
+	visit = func(id string) {
+		if state[id] == 1 {
+			hasCycle = true
+			return
+		}
+		if state[id] == 2 {
+			return
+		}
+		state[id] = 1
+		for _, nextID := range blocks[id] {
+			visit(nextID)
+		}
+		state[id] = 2
+		postorder = append(postorder, id)
+	}
+	for _, id := range starts {
+		visit(id)
+	}
+	if !hasCycle {
+		bestMinutes := make(map[string]int, len(postorder))
+		bestHops := make(map[string]int, len(postorder))
+		next := make(map[string]string, len(postorder))
+		for _, id := range postorder {
+			own := minutes[id]
+			bestMinutes[id] = own
+			bestHops[id] = 1
+			for _, nextID := range blocks[id] {
+				candMin := own + bestMinutes[nextID]
+				candHops := 1 + bestHops[nextID]
+				if candMin > bestMinutes[id] || (candMin == bestMinutes[id] && candHops > bestHops[id]) {
+					bestMinutes[id] = candMin
+					bestHops[id] = candHops
+					next[id] = nextID
+				}
+			}
+		}
+		start := starts[0]
+		for _, id := range starts[1:] {
+			if bestMinutes[id] > bestMinutes[start] || (bestMinutes[id] == bestMinutes[start] && bestHops[id] > bestHops[start]) {
+				start = id
+			}
+		}
+		path := make([]string, 0, bestHops[start])
+		for id, remaining := start, bestHops[start]; remaining > 0; id, remaining = next[id], remaining-1 {
+			path = append(path, id)
+		}
+		return path, bestMinutes[start]
+	}
+
+	var longest []string
+	longestMin := -1
+	visited := make(map[string]bool)
+	var dfs func(string, []string, int)
+	dfs = func(id string, path []string, sumMin int) {
+		if visited[id] {
+			return
+		}
+		visited[id] = true
+		path = append(path, id)
+		sumMin += minutes[id]
+		if sumMin > longestMin || (sumMin == longestMin && len(path) > len(longest)) {
+			longestMin = sumMin
+			longest = append([]string(nil), path...)
+		}
+		for _, nextID := range blocks[id] {
+			dfs(nextID, path, sumMin)
+		}
+		visited[id] = false
+	}
+	for _, id := range starts {
+		dfs(id, nil, 0)
+	}
+	if longestMin < 0 {
+		longestMin = 0
+	}
+	return longest, longestMin
+}
+
+func scopedGraphTotalsForCLI(issues []model.Issue, stats *analysis.GraphStats, candidateIDs map[string]bool) (int, int, float64) {
+	if stats == nil {
+		return 0, 0, 0
+	}
+	if candidateIDs == nil {
+		return stats.NodeCount, stats.EdgeCount, stats.Density
+	}
+	present := make(map[string]bool, len(candidateIDs))
+	for _, iss := range issues {
+		if iss.ID != "" && candidateIDs[iss.ID] {
+			present[iss.ID] = true
+		}
+	}
+	nodeCount := len(present)
+	edgeCount := 0
+	for _, iss := range issues {
+		if !present[iss.ID] {
+			continue
+		}
+		seen := make(map[string]bool)
+		for _, dep := range iss.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == iss.ID || seen[dep.DependsOnID] {
+				continue
+			}
+			if present[dep.DependsOnID] {
+				seen[dep.DependsOnID] = true
+				edgeCount++
+			}
+		}
+	}
+	density := 0.0
+	if nodeCount > 1 {
+		density = float64(edgeCount) / float64(nodeCount*(nodeCount-1))
+	}
+	return nodeCount, edgeCount, density
+}
+
+func sanitizedGitEnvForCLI() []string {
+	raw := os.Environ()
+	filtered := make([]string, 0, len(raw)+4)
+	for _, kv := range raw {
+		key := kv
+		if eq := strings.IndexByte(kv, '='); eq >= 0 {
+			key = kv[:eq]
+		}
+		switch key {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+			"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR",
+			"GIT_CEILING_DIRECTORIES", "GIT_PREFIX",
+			"GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+			"GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_EXEC_PATH":
+			continue
+		}
+		if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
+			continue
+		}
+		filtered = append(filtered, kv)
+	}
+	filtered = append(filtered, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
+	return filtered
 }
 
 func (r *RobotRegistry) Validate() error {

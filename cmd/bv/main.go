@@ -592,6 +592,12 @@ func rewriteAgentIntentCommand(args []string) ([]string, bool) {
 		return append([]string{"--robot-label-attention"}, rewriteAgentIntentFlagAliases(rest, "label-attention")...), true
 	case "hotspots", "file-hotspots":
 		return append([]string{"--robot-file-hotspots"}, rewriteAgentIntentFlagAliases(rest, "file-hotspots")...), true
+	case "orphans":
+		return append([]string{"--robot-orphans"}, rewriteAgentIntentFlagAliases(rest, "orphans")...), true
+	case "drift":
+		return append([]string{"--check-drift", "--robot-drift"}, rewriteAgentIntentFlagAliases(rest, "drift")...), true
+	case "version":
+		return append([]string{"--version"}, rewriteAgentIntentFlagAliases(rest, "version")...), true
 	case "file-beads":
 		return rewriteRobotValueIntent(rest, "file-beads", "", "--robot-file-beads", ""), true
 	case "commit":
@@ -711,6 +717,8 @@ func rewriteCanonicalRobotCommandIntent(command string, rest []string) ([]string
 		return rewriteRobotValueIntent(rest, "correlation", "", "--robot-confirm-correlation", ""), true
 	case "robot-reject-correlation":
 		return rewriteRobotValueIntent(rest, "correlation", "", "--robot-reject-correlation", ""), true
+	case "robot-ignore-correlation":
+		return rewriteRobotValueIntent(rest, "correlation", "", "--robot-ignore-correlation", ""), true
 	case "robot-file-beads":
 		return rewriteRobotValueIntent(rest, "file-beads", "", "--robot-file-beads", ""), true
 	case "robot-commit":
@@ -971,7 +979,7 @@ func limitFlagForAgentContext(context string) string {
 
 func normalizeRobotCommandName(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "" || strings.HasPrefix(value, "robot-") {
+	if value == "" || value == "bead-history" || strings.HasPrefix(value, "robot-") {
 		return value
 	}
 	return "robot-" + value
@@ -980,7 +988,6 @@ func normalizeRobotCommandName(value string) string {
 var knownValueTakingCLIFlags = map[string]bool{
 	"cpu-profile":               true,
 	"db":                        true,
-	"beads-dir":                 true,
 	"export-md":                 true,
 	"export":                    true,
 	"export-format":             true,
@@ -1038,6 +1045,7 @@ var knownValueTakingCLIFlags = map[string]bool{
 	"robot-explain-correlation": true,
 	"robot-confirm-correlation": true,
 	"robot-reject-correlation":  true,
+	"robot-ignore-correlation":  true,
 	"correlation-by":            true,
 	"correlation-reason":        true,
 	"orphans-min-score":         true,
@@ -1322,6 +1330,9 @@ func agentIntentCommandNames() []string {
 		"capacity",
 		"burndown",
 		"commit",
+		"drift",
+		"orphans",
+		"version",
 		"upgrade",
 		"self-update",
 		"selfupdate",
@@ -1768,6 +1779,7 @@ func main() {
 	robotExplainCorrelation := flag.String("robot-explain-correlation", "", "Explain why a commit is linked to a bead (format: SHA:beadID)")
 	robotConfirmCorrelation := flag.String("robot-confirm-correlation", "", "Confirm a correlation is correct (format: SHA:beadID)")
 	robotRejectCorrelation := flag.String("robot-reject-correlation", "", "Reject an incorrect correlation (format: SHA:beadID)")
+	robotIgnoreCorrelation := flag.String("robot-ignore-correlation", "", "Mark a correlation as ignored without accuracy penalty (format: SHA:beadID)")
 	correlationFeedbackBy := flag.String("correlation-by", "", "Agent/user identifier for correlation feedback")
 	correlationFeedbackReason := flag.String("correlation-reason", "", "Reason for correlation feedback")
 	robotCorrelationStats := flag.Bool("robot-correlation-stats", false, "Output correlation feedback statistics as JSON")
@@ -1930,6 +1942,7 @@ func main() {
 		RobotExplainCorrFlag:    robotExplainCorrelation,
 		RobotConfirmCorrFlag:    robotConfirmCorrelation,
 		RobotRejectCorrFlag:     robotRejectCorrelation,
+		RobotIgnoreCorrFlag:     robotIgnoreCorrelation,
 		RobotCorrStatsFlag:      robotCorrelationStats,
 		CorrelationFeedbackBy:   correlationFeedbackBy,
 		CorrelationReason:       correlationFeedbackReason,
@@ -2050,7 +2063,7 @@ func main() {
 			{modifier: "brief", requires: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label"}},
 			{modifier: "robot-include-inactive", requires: []string{
 				"robot-triage", "robot-triage-by-track", "robot-triage-by-label",
-				"robot-priority", "robot-insights",
+				"robot-priority", "robot-insights", "robot-forecast", "robot-capacity",
 				"emit-script", "agent-brief", "priority-brief",
 				"export-pages", "pages", "export-graph",
 			}},
@@ -2058,6 +2071,7 @@ func main() {
 				"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
 				"robot-priority", "robot-insights", "robot-plan",
 				"robot-alerts", "robot-suggest", "robot-orphans", "robot-commit",
+				"robot-forecast", "search", "robot-search",
 				"emit-script", "priority-brief", "agent-brief",
 			}},
 			{modifier: "robot-min-confidence", requires: []string{
@@ -2072,8 +2086,8 @@ func main() {
 				"emit-script", "priority-brief", "agent-brief", "export-pages", "pages", "export-graph",
 			}},
 			{modifier: "min-confidence", requires: []string{"robot-history", "bead-history", "robot-commit"}},
-			{modifier: "correlation-by", requires: []string{"robot-confirm-correlation", "robot-reject-correlation"}},
-			{modifier: "correlation-reason", requires: []string{"robot-confirm-correlation", "robot-reject-correlation"}},
+			{modifier: "correlation-by", requires: []string{"robot-confirm-correlation", "robot-reject-correlation", "robot-ignore-correlation"}},
+			{modifier: "correlation-reason", requires: []string{"robot-confirm-correlation", "robot-reject-correlation", "robot-ignore-correlation"}},
 			{modifier: "orphans-min-score", requires: []string{"robot-orphans"}},
 			{modifier: "file-beads-limit", requires: []string{"robot-file-beads"}},
 			{modifier: "hotspots-limit", requires: []string{"robot-file-hotspots"}},
@@ -2131,6 +2145,7 @@ func main() {
 			{flags: []string{"robot-explain-correlation"}},
 			{flags: []string{"robot-confirm-correlation"}},
 			{flags: []string{"robot-reject-correlation"}},
+			{flags: []string{"robot-ignore-correlation"}},
 			{flags: []string{"robot-correlation-stats"}},
 			{flags: []string{"robot-orphans"}},
 			{flags: []string{"robot-file-beads"}},
@@ -2178,6 +2193,18 @@ func main() {
 		if *watchExport && *asOf != "" {
 			fmt.Fprintln(os.Stderr, "Error: --watch-export cannot be combined with --as-of; omit --watch-export to export a fixed historical snapshot.")
 			os.Exit(1)
+		}
+
+		// Apply --db flag early so all downstream commands (including --hooks-info,
+		// --baseline-info, and recipe resolution) respect it.
+		// Priority: --db flag > BEADS_DB env > BEADS_DIR env > auto-discovery.
+		if *dbPath != "" {
+			absDB, err := filepath.Abs(*dbPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving --db path: %v\n", err)
+				os.Exit(1)
+			}
+			os.Setenv(loader.BeadsDBEnvVar, absDB)
 		}
 
 		// Inspection is deliberately independent of issue loading and never
@@ -2234,17 +2261,6 @@ func main() {
 				}
 			}
 			defer stopCPUProfile()
-		}
-
-		// Apply --db flag: set BEADS_DB env var so all downstream code respects it.
-		// Priority: --db flag > BEADS_DB env > BEADS_DIR env > auto-discovery.
-		if *dbPath != "" {
-			absDB, err := filepath.Abs(*dbPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving --db path: %v\n", err)
-				os.Exit(1)
-			}
-			os.Setenv(loader.BeadsDBEnvVar, absDB)
 		}
 
 		// Apply --no-cache flag: set BV_NO_CACHE=1 so disk cache is bypassed.
@@ -2991,6 +3007,10 @@ func main() {
 
 		// Handle feedback commands (bv-90, bv-apal.36)
 		if *feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset || *feedbackShow {
+			if *asOf != "" && (*feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset) {
+				fmt.Fprintln(os.Stderr, "Error: feedback mutation flags cannot be combined with --as-of")
+				os.Exit(1)
+			}
 			if *feedbackAccept != "" && *feedbackIgnore != "" {
 				fmt.Fprintln(os.Stderr, "Error: --feedback-accept and --feedback-ignore cannot be used together")
 				os.Exit(1)
@@ -3436,17 +3456,18 @@ func main() {
 				os.Exit(1)
 			}
 
+			isHistoricalSearch := *asOf != "" || asOfResolved != ""
 			searchScopeKey := ""
 			switch {
-			case *asOf != "" || asOfResolved != "":
-				// Scoped below to a dedicated historical-* cache file so live .bvvi is never touched.
+			case isHistoricalSearch:
+				// Historical --as-of queries run strictly in-memory so read-only time-travel never mutates .bv/semantic/.
 			case *workspaceConfig != "":
 				absWS := *workspaceConfig
 				if resolvedWS, absErr := filepath.Abs(absWS); absErr == nil {
 					absWS = resolvedWS
 				}
 				searchScopeKey = "workspace:" + filepath.Clean(absWS)
-			case *dbPath != "" || strings.TrimSpace(env.BeadsDB.Get()) != "":
+			case *dbPath != "" || strings.TrimSpace(env.BeadsDB.Get()) != "" || strings.TrimSpace(env.BeadsDir.Get()) != "":
 				absSrc := robotDispatchContext.SourcePath
 				if absSrc == "" {
 					absSrc = *dbPath
@@ -3454,27 +3475,33 @@ func main() {
 				if absSrc == "" {
 					absSrc = strings.TrimSpace(env.BeadsDB.Get())
 				}
+				if absSrc == "" {
+					absSrc = strings.TrimSpace(env.BeadsDir.Get())
+				}
 				if resolvedSrc, absErr := filepath.Abs(absSrc); absErr == nil {
 					absSrc = resolvedSrc
 				}
 				searchScopeKey = "db:" + filepath.Clean(absSrc)
 			}
 
-			indexPath := search.IndexPathForScope(projectDir, embedCfg, searchScopeKey)
-			if asOfResolved != "" {
-				indexPath = filepath.Join(filepath.Dir(indexPath), "historical-"+asOfResolved+"-"+filepath.Base(indexPath))
-			} else if *asOf != "" {
-				scopedHist := search.IndexPathForScope(projectDir, embedCfg, "historical:"+*asOf)
-				indexPath = filepath.Join(filepath.Dir(scopedHist), "historical-"+filepath.Base(scopedHist))
-			}
-			idx, loaded, err := search.LoadOrNewVectorIndex(indexPath, embedder.Dim())
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+			var (
+				idx       *search.VectorIndex
+				loaded    bool
+				indexPath string
+			)
+			if isHistoricalSearch {
+				idx = search.NewVectorIndex(embedder.Dim())
+			} else {
+				indexPath = search.IndexPathForScope(projectDir, embedCfg, searchScopeKey)
+				idx, loaded, err = search.LoadOrNewVectorIndex(indexPath, embedder.Dim())
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
 			}
 
 			docs := search.DocumentsFromIssues(issuesForSearch)
-			if !*robotSearch && !loaded {
+			if !*robotSearch && !loaded && !isHistoricalSearch {
 				fmt.Fprintf(os.Stderr, "Building semantic index (%d issues)...\n", len(docs))
 			}
 
@@ -3486,7 +3513,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error building semantic index: %v\n", err)
 				os.Exit(1)
 			}
-			if !loaded || syncStats.Changed() {
+			if !isHistoricalSearch && (!loaded || syncStats.Changed()) {
 				if err := idx.Save(indexPath); err != nil {
 					fmt.Fprintf(os.Stderr, "Error saving semantic index: %v\n", err)
 					os.Exit(1)
@@ -3503,6 +3530,9 @@ func main() {
 			}
 
 			limit := *searchLimit
+			if !flag.CommandLine.Changed("search-limit") && *robotMaxResults > 0 {
+				limit = *robotMaxResults
+			}
 			if limit <= 0 {
 				limit = 10
 			}
@@ -4369,12 +4399,13 @@ func main() {
 
 			// Get cycles (method returns a copy)
 			cycles := filterCyclesForCandidates(stats.Cycles(), robotDispatchContext.CandidateIDs)
+			scopedNodes, scopedEdges, scopedDensity := scopedGraphTotalsForCLI(baselineIssues, &stats, robotDispatchContext.CandidateIDs)
 
 			// Build GraphStats from analysis
 			graphStats := baseline.GraphStats{
-				NodeCount:       stats.NodeCount,
-				EdgeCount:       stats.EdgeCount,
-				Density:         stats.Density,
+				NodeCount:       scopedNodes,
+				EdgeCount:       scopedEdges,
+				Density:         scopedDensity,
 				OpenCount:       openCount,
 				ClosedCount:     partition.Closed,
 				BlockedCount:    partition.Blocked,
@@ -4406,7 +4437,8 @@ func main() {
 
 		// Handle --check-drift
 		if *checkDrift {
-			if *robotDriftCheck {
+			if *robotDriftCheck || envRobot || flag.CommandLine.Changed("format") {
+				*robotDriftCheck = true
 				dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-drift", robotDispatchContext)
 			}
 			if !baseline.Exists(baselinePath) {
@@ -4445,12 +4477,13 @@ func main() {
 				}
 			}
 			cycles := filterCyclesForCandidates(stats.Cycles(), robotDispatchContext.CandidateIDs)
+			scopedNodes, scopedEdges, scopedDensity := scopedGraphTotalsForCLI(driftIssues, &stats, robotDispatchContext.CandidateIDs)
 
 			// Build current snapshot as baseline for comparison
 			currentStats := baseline.GraphStats{
-				NodeCount:       stats.NodeCount,
-				EdgeCount:       stats.EdgeCount,
-				Density:         stats.Density,
+				NodeCount:       scopedNodes,
+				EdgeCount:       scopedEdges,
+				Density:         scopedDensity,
 				OpenCount:       openCount,
 				ClosedCount:     partition.Closed,
 				BlockedCount:    partition.Blocked,
@@ -4880,6 +4913,7 @@ func main() {
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-explain-correlation", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-confirm-correlation", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-reject-correlation", robotDispatchContext)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-ignore-correlation", robotDispatchContext)
 
 		// Handle correlation audit commands (bv-e1u6)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-orphans", robotDispatchContext)
@@ -4934,23 +4968,52 @@ func main() {
 				*robotDiff = true
 			}
 
-			gitLoader := loader.NewGitLoader(projectDir)
+			var (
+				historicalIssues   []model.Issue
+				histAuthoritySlice []model.Issue
+				revision           string
+				histCommitTime     time.Time
+			)
+			if *workspaceConfig != "" && robotDispatchContext.SourceAuthority != nil {
+				wsHistIssues, wsAuthIssues, wsRev, wsTime, wsErr := loadWorkspaceHistoricalDiffSource(robotDispatchContext, *diffSince)
+				if wsErr != nil {
+					fmt.Fprintf(os.Stderr, "Error loading workspace issues at %s: %v\n", *diffSince, wsErr)
+					os.Exit(1)
+				}
+				historicalIssues = wsHistIssues
+				histAuthoritySlice = wsAuthIssues
+				revision = wsRev
+				histCommitTime = wsTime
+			} else {
+				gitLoader := loader.NewGitLoader(projectDir)
 
-			// Load historical issues (including tombstones + commit metadata) and apply the same scope as current issues
-			histReport, err := gitLoader.LoadAtWithReport(*diffSince)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading issues at %s: %v\n", *diffSince, err)
-				os.Exit(1)
-			}
-			historicalIssues := histReport.Issues
-			histAuthorityIssues := make([]model.Issue, 0, len(historicalIssues)+len(histReport.TombstoneIDs))
-			histAuthorityIssues = append(histAuthorityIssues, historicalIssues...)
-			for _, id := range histReport.TombstoneIDs {
-				histAuthorityIssues = append(histAuthorityIssues, model.Issue{ID: id, Status: model.StatusTombstone})
+				// Load historical issues (including tombstones + commit metadata) and apply the same scope as current issues
+				histReport, err := gitLoader.LoadAtWithReport(*diffSince)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error loading issues at %s: %v\n", *diffSince, err)
+					os.Exit(1)
+				}
+				historicalIssues = histReport.Issues
+				histAuthoritySlice = make([]model.Issue, 0, len(historicalIssues)+len(histReport.TombstoneIDs))
+				histAuthoritySlice = append(histAuthoritySlice, historicalIssues...)
+				for _, id := range histReport.TombstoneIDs {
+					histAuthoritySlice = append(histAuthoritySlice, model.Issue{ID: id, Status: model.StatusTombstone})
+				}
+				revision = histReport.CommitSHA
+				if revision == "" {
+					revision, err = gitLoader.ResolveRevision(*diffSince)
+					if err != nil {
+						revision = *diffSince
+					}
+				}
+				histCommitTime = histReport.CommitTime
 			}
 			historicalCtx, scopeErr := scopeLoadedIssues(RobotContext{
 				Issues:            historicalIssues,
-				Readiness:         model.NewReadinessIndex(histAuthorityIssues),
+				Readiness:         model.NewReadinessIndex(histAuthoritySlice),
+				AsOf:              *diffSince,
+				AsOfCommit:        revision,
+				AsOfCommitTime:    histCommitTime,
 				Repo:              *repoFilter,
 				LabelScope:        *labelScope,
 				Recipe:            *recipeName,
@@ -4960,45 +5023,39 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", scopeErr)
 				os.Exit(1)
 			}
-			fromIssues := historicalCtx.Issues
-			if recipeForScope == nil && historicalCtx.CandidateIDs != nil {
-				fromIssues = make([]model.Issue, 0, len(historicalCtx.Issues))
-				for _, issue := range historicalCtx.Issues {
-					if historicalCtx.CandidateIDs[issue.ID] {
-						fromIssues = append(fromIssues, issue)
-					}
-				}
-			}
-			toIssues := issues
-			if recipeForScope == nil && candidateIDs != nil {
-				toIssues = make([]model.Issue, 0, len(issues))
-				for _, issue := range issues {
-					if candidateIDs[issue.ID] {
-						toIssues = append(toIssues, issue)
-					}
-				}
-			}
 
-			// Get revision info and commit timestamp
-			revision := histReport.CommitSHA
-			if revision == "" {
-				revision, err = gitLoader.ResolveRevision(*diffSince)
-				if err != nil {
-					revision = *diffSince
-				}
-			}
-
-			// Create snapshots (honoring historical CommitTime, ReferenceNow(), and --force-full-analysis)
-			fromSnapshot := newScopedSnapshotForCLI(fromIssues, historicalCtx.Readiness, nil, histReport.CommitTime, revision, *forceFullAnalysis)
-			toSnapshot := newScopedSnapshotForCLI(toIssues, readiness, nil, robotDispatchContext.ReferenceNow(), "HEAD", *forceFullAnalysis)
+			// Create snapshots over full topology (preserving multi-hop cycles/readiness)
+			// while restricting snap.Issues to candidate IDs so out-of-scope issues never leak.
+			fromSnapshot := newScopedSnapshotForCLI(historicalCtx.GraphIssues(), historicalCtx.Readiness, historicalCtx.CandidateIDs, historicalCtx.ReferenceNow(), revision, *forceFullAnalysis)
+			toSnapshot := newScopedSnapshotForCLI(robotDispatchContext.GraphIssues(), readiness, candidateIDs, robotDispatchContext.ReferenceNow(), "HEAD", *forceFullAnalysis)
 
 			// Compute diff
 			diff := analysis.CompareSnapshots(fromSnapshot, toSnapshot)
+			if historicalCtx.CandidateIDs != nil || candidateIDs != nil {
+				if candidateIDs != nil {
+					diff.NewCycles = filterCyclesForCandidates(diff.NewCycles, candidateIDs)
+					if diff.NewCycles == nil {
+						diff.NewCycles = [][]string{}
+					}
+				}
+				if historicalCtx.CandidateIDs != nil {
+					diff.ResolvedCycles = filterCyclesForCandidates(diff.ResolvedCycles, historicalCtx.CandidateIDs)
+					if diff.ResolvedCycles == nil {
+						diff.ResolvedCycles = [][]string{}
+					}
+				}
+				fromCycles := len(filterCyclesForCandidates(fromSnapshot.Stats.Cycles(), historicalCtx.CandidateIDs))
+				toCycles := len(filterCyclesForCandidates(toSnapshot.Stats.Cycles(), candidateIDs))
+				diff.MetricDeltas.CycleCount = toCycles - fromCycles
+				diff.Summary.CyclesIntroduced = len(diff.NewCycles)
+				diff.Summary.CyclesResolved = len(diff.ResolvedCycles)
+			}
 
 			if *robotDiff {
 				diffDispatchContext := robotDispatchContext
 				diffDispatchContext.Diff = diff
-				diffDispatchContext.DiffHistoricalIssues = fromIssues
+				diffDispatchContext.DiffHistoricalIssues = fromSnapshot.Issues
+				diffDispatchContext.DiffFromDataHash = historicalCtx.DataHash
 				diffDispatchContext.DiffResolvedRevision = revision
 				dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-diff", diffDispatchContext)
 			} else {
@@ -5445,11 +5502,14 @@ func effectiveThemePreference(flagVal string, flagSet bool, warnTo io.Writer) st
 // ~/.config/bv/config.yaml, returning (value, true) when present and
 // non-empty. Value validation is canonicalTheme's job. (bv-128)
 func loadThemeFromUserConfig() (string, bool) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil || homeDir == "" {
+	if strings.TrimSpace(env.NoSavedConfig.Get()) != "" {
 		return "", false
 	}
-	configPath := filepath.Join(homeDir, ".config", "bv", "config.yaml")
+	configDir, err := updater.UserConfigDir()
+	if err != nil || configDir == "" {
+		return "", false
+	}
+	configPath := filepath.Join(configDir, "config.yaml")
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -5470,11 +5530,14 @@ func loadThemeFromUserConfig() (string, bool) {
 }
 
 func loadBackgroundModeFromUserConfig() (bool, bool) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil || homeDir == "" {
+	if strings.TrimSpace(env.NoSavedConfig.Get()) != "" {
 		return false, false
 	}
-	configPath := filepath.Join(homeDir, ".config", "bv", "config.yaml")
+	configDir, err := updater.UserConfigDir()
+	if err != nil || configDir == "" {
+		return false, false
+	}
+	configPath := filepath.Join(configDir, "config.yaml")
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -5843,14 +5906,119 @@ func newScopedSnapshotForCLI(issues []model.Issue, readiness *model.ReadinessInd
 		analyzer.SetConfig(&fullCfg)
 	}
 	stats := analyzer.Analyze()
+	snapIssues := issues
+	if candidateIDs != nil {
+		snapIssues = make([]model.Issue, 0, len(candidateIDs))
+		for _, issue := range issues {
+			if candidateIDs[issue.ID] {
+				snapIssues = append(snapIssues, issue)
+			}
+		}
+		scopedNodes, scopedEdges, scopedDensity := scopedGraphTotalsForCLI(issues, &stats, candidateIDs)
+		stats.NodeCount = scopedNodes
+		stats.EdgeCount = scopedEdges
+		stats.Density = scopedDensity
+	}
 	snap := &analysis.Snapshot{
 		Timestamp: timestamp,
 		Revision:  revision,
-		Issues:    issues,
+		Issues:    snapIssues,
 		Stats:     &stats,
 	}
 	snap.ComputeScopedCounts(readiness, refTime, analyzer.IsCandidate)
 	return snap
+}
+
+func loadWorkspaceHistoricalDiffSource(ctx RobotContext, ref string) ([]model.Issue, []model.Issue, string, time.Time, error) {
+	if ctx.SourceAuthority == nil || len(ctx.SourceAuthority.Sources) == 0 {
+		return nil, nil, "", time.Time{}, fmt.Errorf("no workspace sources available")
+	}
+	knownPrefixes := make(map[string]bool, len(ctx.SourceAuthority.Sources))
+	for _, s := range ctx.SourceAuthority.Sources {
+		if s.RepoPrefix != "" {
+			knownPrefixes[s.RepoPrefix] = true
+		}
+	}
+	var (
+		allIssues   []model.Issue
+		authIssues  []model.Issue
+		firstRev    string
+		latestTime  time.Time
+		loadedRepos int
+		lastErr     error
+	)
+	for _, src := range ctx.SourceAuthority.Sources {
+		if src.Status != "loaded" {
+			continue
+		}
+		repoPath := strings.TrimSpace(src.RepoRoot)
+		if repoPath == "" {
+			if bd := resolveSourceBeadsDir(src); bd != "" {
+				repoPath = filepath.Dir(bd)
+			}
+		}
+		if repoPath == "" {
+			continue
+		}
+		gl := loader.NewGitLoader(repoPath)
+		hist, err := gl.LoadAtWithReport(ref)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		loadedRepos++
+		if firstRev == "" && hist.CommitSHA != "" {
+			firstRev = hist.CommitSHA
+		}
+		if hist.CommitTime.After(latestTime) {
+			latestTime = hist.CommitTime
+		}
+		prefix := src.RepoPrefix
+		localRawIDs := make(map[string]bool, len(hist.Issues)+len(hist.TombstoneIDs))
+		for _, iss := range hist.Issues {
+			localRawIDs[iss.ID] = true
+		}
+		for _, tid := range hist.TombstoneIDs {
+			localRawIDs[tid] = true
+		}
+		for _, iss := range hist.Issues {
+			cloned := iss.Clone()
+			if prefix != "" {
+				cloned.ID = workspace.QualifyID(cloned.ID, prefix)
+				for _, dep := range cloned.Dependencies {
+					if dep == nil {
+						continue
+					}
+					dep.IssueID = workspace.QualifyID(dep.IssueID, prefix)
+					if localRawIDs[dep.DependsOnID] || !hasAnyRepoPrefix(dep.DependsOnID, knownPrefixes) {
+						dep.DependsOnID = workspace.QualifyID(dep.DependsOnID, prefix)
+					}
+				}
+			}
+			if src.SourceRepo != "" {
+				cloned.SourceRepo = src.SourceRepo
+			}
+			allIssues = append(allIssues, cloned)
+			authIssues = append(authIssues, cloned)
+		}
+		for _, tid := range hist.TombstoneIDs {
+			qid := tid
+			if prefix != "" {
+				qid = workspace.QualifyID(tid, prefix)
+			}
+			authIssues = append(authIssues, model.Issue{ID: qid, Status: model.StatusTombstone, SourceRepo: src.SourceRepo})
+		}
+	}
+	if loadedRepos == 0 {
+		if lastErr != nil {
+			return nil, nil, "", time.Time{}, lastErr
+		}
+		return nil, nil, "", time.Time{}, fmt.Errorf("no workspace repositories resolved %s", ref)
+	}
+	if firstRev == "" {
+		firstRev = ref
+	}
+	return allIssues, authIssues, firstRev, latestTime, nil
 }
 
 func reloadSingleRepoAutoDiscoverForUI(ctx context.Context, projectDir string, fallbackSource datasource.DataSource, fallbackDegraded bool, label, repo string) (ui.SourceReloadResult, error) {
@@ -7413,7 +7581,46 @@ func resolvePagesSource(config *export.WizardConfig, beadsPath string) (pagesSou
 		}
 		return src, nil
 	}
-	if config.SourcePath != "" {
+	if explicitBeadsDir := strings.TrimSpace(env.BeadsDir.Get()); explicitBeadsDir != "" {
+		resolvedDir, err := loader.GetBeadsDir("")
+		if err != nil {
+			return pagesSource{}, err
+		}
+		loaded, err := loadIssuesFromBeadsDir(resolvedDir)
+		if err != nil {
+			return pagesSource{}, err
+		}
+		return pagesSource{
+			Issues:          loaded.Issues,
+			BeadsDir:        resolvedDir,
+			RepoRoot:        filepath.Dir(resolvedDir),
+			Reason:          "explicit BEADS_DIR",
+			SourcePath:      loaded.Source.Path,
+			SourceKind:      string(loaded.Source.Type),
+			SourceAuthority: newRobotSourceAuthority([]RobotSourceReport{robotSourceFromLoad(loaded, nil)}),
+			Readiness:       model.NewReadinessIndex(issuesWithTombstones(loaded.Issues, loaded.Report.TombstoneIDs)),
+		}, nil
+	}
+
+	activeRepoRoot := ""
+	if beadsPath != "" {
+		if absBeads, absErr := filepath.Abs(beadsPath); absErr == nil {
+			activeRepoRoot = filepath.Clean(filepath.Dir(filepath.Dir(absBeads)))
+		}
+	}
+	configMatchesActiveRepo := func(candidatePath string) bool {
+		if activeRepoRoot == "" || candidatePath == "" {
+			return true
+		}
+		absCand, absErr := filepath.Abs(candidatePath)
+		if absErr != nil {
+			return false
+		}
+		absCand = filepath.Clean(absCand)
+		return absCand == activeRepoRoot || strings.HasPrefix(absCand, activeRepoRoot+string(os.PathSeparator))
+	}
+
+	if config.SourcePath != "" && configMatchesActiveRepo(config.SourcePath) {
 		lowerPath := strings.ToLower(strings.TrimSpace(config.SourcePath))
 		if strings.HasSuffix(lowerPath, ".yaml") || strings.HasSuffix(lowerPath, ".yml") {
 			src, err := loadPagesSourceFromWorkspace(config.SourcePath, "saved workspace config")
@@ -7445,10 +7652,10 @@ func resolvePagesSource(config *export.WizardConfig, beadsPath string) (pagesSou
 		candidates = append(candidates, pagesSourceCandidate{BeadsDir: dir, Reason: reason})
 	}
 
-	if config.SourceBeadsDir != "" {
+	if config.SourceBeadsDir != "" && configMatchesActiveRepo(config.SourceBeadsDir) {
 		addCandidate(config.SourceBeadsDir, "saved source")
 	}
-	if config.SourceRepoRoot != "" {
+	if config.SourceRepoRoot != "" && configMatchesActiveRepo(config.SourceRepoRoot) {
 		addCandidate(filepath.Join(config.SourceRepoRoot, ".beads"), "saved repo root")
 	}
 	if beadsPath != "" {
@@ -7559,11 +7766,11 @@ func loadPagesSourceFromDataSource(source datasource.DataSource, reason string) 
 }
 
 func isSuspiciousIssueCount(current, expected int) bool {
-	if current == 0 {
-		return true
-	}
 	if expected <= 0 {
 		return false
+	}
+	if current == 0 {
+		return true
 	}
 	threshold := expected / 5
 	if threshold < 5 {
@@ -7602,7 +7809,7 @@ func findBetterPagesSource(config *export.WizardConfig, current pagesSource, bea
 		roots = append(roots, root)
 	}
 
-	if config.SourceRepoRoot != "" {
+	if config.SourceRepoRoot != "" && beadsPath == "" {
 		addRoot(config.SourceRepoRoot)
 	}
 	if beadsPath != "" {
@@ -7610,12 +7817,6 @@ func findBetterPagesSource(config *export.WizardConfig, current pagesSource, bea
 	}
 	if cwd, err := os.Getwd(); err == nil {
 		addRoot(cwd)
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		addRoot(home)
-	}
-	if info, err := os.Stat("/dp"); err == nil && info.IsDir() {
-		addRoot("/dp")
 	}
 
 	bestDir := ""
@@ -7937,6 +8138,7 @@ func computeSprintScopeChangesAtPath(
 
 	relSlash := filepath.ToSlash(sprintsRelPath)
 	args := []string{
+		"--no-replace-objects",
 		"-c", "color.ui=false",
 		"log",
 		"-p",
@@ -7950,6 +8152,7 @@ func computeSprintScopeChangesAtPath(
 
 	cmd := exec.Command("git", args...)
 	cmd.Dir = gitRoot
+	cmd.Env = sanitizedGitEnvForCLI()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("git log %s: %w: %s", relSlash, err, bytes.TrimSpace(out))
@@ -8334,7 +8537,16 @@ func generateDailyBurndown(sprint *model.Sprint, issues []model.Issue, now time.
 		completed := 0
 
 		for _, iss := range issues {
-			if iss.Status == model.StatusClosed && iss.ClosedAt != nil && !iss.ClosedAt.After(dayEnd) {
+			if iss.Status != model.StatusClosed {
+				continue
+			}
+			closedTime := time.Time{}
+			if iss.ClosedAt != nil && !iss.ClosedAt.IsZero() {
+				closedTime = *iss.ClosedAt
+			} else if !iss.UpdatedAt.IsZero() {
+				closedTime = iss.UpdatedAt
+			}
+			if !closedTime.IsZero() && !closedTime.After(dayEnd) {
 				completed++
 			}
 		}
@@ -8624,8 +8836,9 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		revTarget = ctx.AsOfCommit
 	}
 	for repoIdx, root := range repoRoots {
-		orderCmd := exec.Command("git", "log", "--format=%H", "--topo-order", revTarget)
+		orderCmd := exec.Command("git", "--no-replace-objects", "log", "--format=%H", "--topo-order", revTarget)
 		orderCmd.Dir = root
+		orderCmd.Env = sanitizedGitEnvForCLI()
 		orderOutput, err := orderCmd.Output()
 		if err != nil {
 			if len(repoRoots) == 1 {
@@ -9286,6 +9499,14 @@ func robotCommandDocs() map[string]robotCommandDoc {
 			NeedsGit:     true,
 			MutatesState: true,
 		},
+		"robot-ignore-correlation": {
+			Flag:         "--robot-ignore-correlation <sha:bead>",
+			Description:  "Mark a commit-to-bead correlation as ignored without accuracy penalty.",
+			Params:       []string{"--correlation-by agent", "--correlation-reason neutral"},
+			NeedsIssues:  true,
+			NeedsGit:     true,
+			MutatesState: true,
+		},
 		"robot-search": {
 			Flag: "--robot-search", Description: "Hashed keyword or graph-weighted hybrid search over issue text.",
 			Params:      []string{"--search <query>", "--search-limit <n>", "--search-min-score SCORE", "--search-mode text|hybrid"},
@@ -9529,6 +9750,8 @@ func preferredRobotInvocationOverride(commandName string) string {
 		return "bv robot-confirm-correlation deadbeef:ISSUE_ID --correlation-by agent --json"
 	case "robot-reject-correlation":
 		return "bv robot-reject-correlation deadbeef:ISSUE_ID --correlation-by agent --json"
+	case "robot-ignore-correlation":
+		return "bv robot-ignore-correlation deadbeef:ISSUE_ID --correlation-by agent --json"
 	case "robot-file-beads":
 		return "bv robot-file-beads README.md --json"
 	case "robot-commit":
@@ -10177,7 +10400,7 @@ func generateRobotSchemas() RobotSchemas {
 							"suggested_priority": map[string]interface{}{"type": "integer"},
 							"impact_score":       map[string]interface{}{"type": "number"},
 							"confidence":         map[string]interface{}{"type": "number"},
-							"direction":          map[string]interface{}{"type": "string", "enum": []string{"increase", "decrease"}},
+							"direction":          map[string]interface{}{"type": "string", "enum": []string{"increase", "decrease", "none"}},
 							"reasoning":          map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 							"what_if":            map[string]interface{}{"type": "object"},
 							"explanation":        map[string]interface{}{"type": "object"},
@@ -10216,7 +10439,10 @@ func generateRobotSchemas() RobotSchemas {
 			"description": "Dependency graph in JSON/DOT/Mermaid format",
 			"type":        "object",
 			"properties": map[string]interface{}{
-				"format": map[string]interface{}{"type": "string", "enum": []string{"json", "dot", "mermaid"}},
+				"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
+				"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":       map[string]interface{}{"type": "string"},
+				"format":        map[string]interface{}{"type": "string", "enum": []string{"json", "dot", "mermaid"}},
 				"graph":  map[string]interface{}{"type": "string"},
 				"nodes":  map[string]interface{}{"type": "integer"},
 				"edges":  map[string]interface{}{"type": "integer"},
@@ -10349,6 +10575,7 @@ func generateRobotSchemas() RobotSchemas {
 		"robot-explain-correlation": robotExplainCorrelationOutputSchema(),
 		"robot-confirm-correlation": robotCorrelationFeedbackOutputSchema("Robot Confirm Correlation Output", "Confirmation receipt for a commit-to-bead correlation"),
 		"robot-reject-correlation":  robotCorrelationFeedbackOutputSchema("Robot Reject Correlation Output", "Rejection receipt for a commit-to-bead correlation"),
+		"robot-ignore-correlation":  robotCorrelationFeedbackOutputSchema("Robot Ignore Correlation Output", "Ignore receipt for a commit-to-bead correlation"),
 		"robot-file-beads":          robotFileBeadsOutputSchema(),
 		"robot-commit":              robotCommitOutputSchema(),
 		"robot-file-hotspots":       robotFileHotspotsOutputSchema(),
@@ -10413,6 +10640,8 @@ func generateRobotSchemas() RobotSchemas {
 			"properties": map[string]interface{}{
 				"generated_at":    map[string]interface{}{"type": "string", "format": "date-time"},
 				"data_hash":       map[string]interface{}{"type": "string"},
+				"output_format":   map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":         map[string]interface{}{"type": "string"},
 				"analysis_config": labelHealthConfigSchema(),
 				"results":         labelAnalysisResultSchema(),
 				"usage_hints":     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
@@ -10427,6 +10656,8 @@ func generateRobotSchemas() RobotSchemas {
 			"properties": map[string]interface{}{
 				"generated_at":     map[string]interface{}{"type": "string", "format": "date-time"},
 				"data_hash":        map[string]interface{}{"type": "string"},
+				"output_format":    map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":          map[string]interface{}{"type": "string"},
 				"flow":             crossLabelFlowSchema(),
 				"blockage_cascade": blockageCascadeSchema(),
 				"analysis_config":  labelHealthConfigSchema(),
@@ -10440,10 +10671,12 @@ func generateRobotSchemas() RobotSchemas {
 			"description": "Attention-ranked labels requiring focus",
 			"type":        "object",
 			"properties": map[string]interface{}{
-				"generated_at": map[string]interface{}{"type": "string", "format": "date-time"},
-				"data_hash":    map[string]interface{}{"type": "string"},
-				"limit":        map[string]interface{}{"type": "integer"},
-				"total_labels": map[string]interface{}{"type": "integer"},
+				"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
+				"data_hash":     map[string]interface{}{"type": "string"},
+				"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+				"version":       map[string]interface{}{"type": "string"},
+				"limit":         map[string]interface{}{"type": "integer"},
+				"total_labels":  map[string]interface{}{"type": "integer"},
 				"labels": map[string]interface{}{
 					"type":  "array",
 					"items": labelAttentionItemSchema(),
