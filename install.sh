@@ -185,16 +185,13 @@ github_api_get() {
 
     if command -v curl >/dev/null 2>&1; then
         if [ -n "$auth_token" ]; then
-            curl -fsSL -H "Authorization: Bearer ${auth_token}" "$url" 2>/dev/null || return 1
-        else
-            curl -fsSL "$url" 2>/dev/null || return 1
+            if printf 'header = "Authorization: Bearer %s"\n' "$auth_token" | curl -fsSL -K - "$url" 2>/dev/null; then
+                return 0
+            fi
         fi
+        curl -fsSL "$url" 2>/dev/null || return 1
     elif command -v wget >/dev/null 2>&1; then
-        if [ -n "$auth_token" ]; then
-            wget -qO- --header="Authorization: Bearer ${auth_token}" "$url" 2>/dev/null || return 1
-        else
-            wget -qO- "$url" 2>/dev/null || return 1
-        fi
+        wget -qO- "$url" 2>/dev/null || return 1
     else
         return 1
     fi
@@ -866,7 +863,7 @@ try_go_install() {
     build_output="$tmp_dir/${BIN_NAME}${bin_ext}"
 
     local build_extra_args=()
-    if [ -d "$src_dir/vendor" ]; then
+    if [ -f "$src_dir/vendor/modules.txt" ]; then
         build_extra_args+=(-mod=vendor)
     fi
     if [ -n "$TARGET_VERSION" ]; then
@@ -931,15 +928,14 @@ main() {
 
     local platform
     platform=$(detect_platform) || {
-        print_warn "Could not detect platform, will try building from source"
-        try_go_install
-        check_path_and_warn "$INSTALL_DIR"
-        exit 0
+        print_error "Unsupported platform and --from-source was not specified. Re-run with --from-source to build from source."
+        exit 1
     }
 
     print_info "Detected platform: $platform"
 
-    # First, try to download pre-built binary
+    # Download and SHA-256 verify pre-built release binary; never fall back to an
+    # unverified source build unless --from-source was explicitly requested.
     if try_binary_install "$platform"; then
         check_path_and_warn "$INSTALL_DIR"
         print_info "Run '$BIN_NAME' in any beads project to view issues."
@@ -949,15 +945,8 @@ main() {
         exit 0
     fi
 
-    # Fall back to building from source
-    print_info "Pre-built binary not available, falling back to source build..."
-    try_go_install
-
-    check_path_and_warn "$INSTALL_DIR"
-    print_info "Run '$BIN_NAME' in any beads project to view issues."
-    echo ""
-    echo "Tip: You can also install via Homebrew:"
-    echo "  brew install dicklesworthstone/tap/bv"
+    print_error "Pre-built binary install failed. Re-run with --from-source to build from source."
+    exit 1
 }
 
 if [[ ${BASH_SOURCE+x} != x ]]; then

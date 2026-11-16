@@ -260,6 +260,51 @@ func candidateIssueIDs(issue *model.Issue) []string {
 	return nil
 }
 
+func isASCIIWordByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+func isASCIIAlnumByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+}
+
+func containsTokenBoundedIssueID(combined, id string) bool {
+	if id == "" || len(combined) < len(id) {
+		return false
+	}
+	offset := 0
+	for offset <= len(combined)-len(id) {
+		rel := strings.Index(combined[offset:], id)
+		if rel < 0 {
+			return false
+		}
+		start := offset + rel
+		end := start + len(id)
+		offset = start + 1
+
+		if start > 0 {
+			prev := combined[start-1]
+			if isASCIIWordByte(prev) || prev == '-' {
+				continue
+			}
+			if prev == '.' && start >= 2 && isASCIIAlnumByte(combined[start-2]) {
+				continue
+			}
+		}
+		if end < len(combined) {
+			next := combined[end]
+			if isASCIIWordByte(next) {
+				continue
+			}
+			if (next == '-' || next == '.') && end+1 < len(combined) && isASCIIAlnumByte(combined[end+1]) {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
 func mentionsAnyIssueID(r SearchResult, ids []string) bool {
 	if len(ids) == 0 {
 		return false
@@ -267,7 +312,7 @@ func mentionsAnyIssueID(r SearchResult, ids []string) bool {
 	combined := strings.ToLower(r.Snippet + " " + r.Title)
 	for _, id := range ids {
 		trimmed := strings.ToLower(strings.TrimSpace(id))
-		if trimmed != "" && strings.Contains(combined, trimmed) {
+		if trimmed != "" && containsTokenBoundedIssueID(combined, trimmed) {
 			return true
 		}
 	}

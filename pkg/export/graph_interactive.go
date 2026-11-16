@@ -11,6 +11,7 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -120,7 +121,8 @@ func generateInteractiveGraphFilenameAt(projectName string, exportTime time.Time
 
 	// Get short git commit hash
 	gitShort := "nogit"
-	cmd := exec.Command("git", "rev-parse", "--short", "HEAD")
+	cmd := exec.Command("git", "--no-replace-objects", "rev-parse", "--short", "HEAD")
+	cmd.Env = loader.SanitizedGitEnv()
 	if output, err := cmd.Output(); err == nil {
 		gitShort = strings.TrimSpace(string(output))
 	}

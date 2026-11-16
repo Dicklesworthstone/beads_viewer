@@ -65,6 +65,7 @@ const (
 type SearchConfig struct {
 	Mode       SearchMode
 	Preset     PresetName
+	HasPreset  bool
 	Weights    Weights
 	HasWeights bool
 }
@@ -100,6 +101,7 @@ func ParseSearchConfig(modeValue, presetValue, weightsValue string) (SearchConfi
 			return SearchConfig{}, err
 		}
 		cfg.Preset = name
+		cfg.HasPreset = true
 		// A preset only affects hybrid ranking: setting one implies hybrid
 		// mode unless the mode was pinned explicitly (text-only implies text).
 		switch {

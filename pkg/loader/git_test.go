@@ -1743,3 +1743,170 @@ func TestGitLoader_ExplicitOverrideConfinementAndRepoRoot(t *testing.T) {
 		}
 	})
 }
+
+func TestSanitizedGitEnvStripsAmbientGitDir(t *testing.T) {
+	// Initialize real and poison git repositories BEFORE setting poison env vars
+	// so the raw `git init` test helper itself is unaffected.
+	realRepo := initGitLoaderTestRepo(t)
+	commitGitLoaderFixture(t, realRepo, ".beads/issues.jsonl",
+		`{"id":"REAL-1","title":"Real repo issue","status":"open","priority":1,"issue_type":"task"}`+"\n",
+		"real commit")
+
+	poisonRepo := initGitLoaderTestRepo(t)
+	commitGitLoaderFixture(t, poisonRepo, ".beads/issues.jsonl",
+		`{"id":"POISON-1","title":"Poison repo issue","status":"open","priority":1,"issue_type":"task"}`+"\n",
+		"poison commit")
+
+	poisonVars := map[string]string{
+		"GIT_DIR":                          filepath.Join(poisonRepo, ".git"),
+		"GIT_WORK_TREE":                    poisonRepo,
+		"GIT_COMMON_DIR":                   "/nonexistent/common",
+		"GIT_INDEX_FILE":                   "/nonexistent/index",
+		"GIT_OBJECT_DIRECTORY":             "/nonexistent/objects",
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES": "/nonexistent/alt",
+		"GIT_CEILING_DIRECTORIES":          "/",
+		"GIT_DISCOVERY_ACROSS_FILESYSTEM":  "1",
+		"GIT_CONFIG_COUNT":                 "1",
+		"GIT_CONFIG_KEY_0":                 "core.bare",
+		"GIT_CONFIG_VALUE_0":               "true",
+		"GIT_CONFIG_GLOBAL":                "/nonexistent/gitconfig",
+		"GIT_CONFIG_SYSTEM":                "/nonexistent/sysconfig",
+		"GIT_CONFIG_NOSYSTEM":              "0",
+		"GIT_NAMESPACE":                    "poison-ns",
+		"GIT_PREFIX":                       "poison-prefix",
+		"GIT_INTERNAL_SUPER_PREFIX":        "poison-super-prefix",
+		"LC_ALL":                           "fr_FR.UTF-8",
+	}
+	for k, v := range poisonVars {
+		t.Setenv(k, v)
+	}
+	t.Setenv("BV_NON_GIT_CUSTOM_VAR", "keep-me")
+
+	env := SanitizedGitEnv()
+	envMap := make(map[string]string, len(env))
+	for _, entry := range env {
+		k, v, ok := strings.Cut(entry, "=")
+		if ok {
+			envMap[k] = v
+		}
+	}
+
+	for k := range poisonVars {
+		if k == "LC_ALL" {
+			if envMap[k] != "C" {
+				t.Fatalf("SanitizedGitEnv()[LC_ALL] = %q, want \"C\"", envMap[k])
+			}
+			continue
+		}
+		if got, exists := envMap[k]; exists {
+			t.Fatalf("SanitizedGitEnv() leaked poisoned %s=%q", k, got)
+		}
+	}
+	// Planted negative control: non-git environment variables remain intact.
+	if envMap["BV_NON_GIT_CUSTOM_VAR"] != "keep-me" {
+		t.Fatalf("SanitizedGitEnv() stripped unrelated env var: %q", envMap["BV_NON_GIT_CUSTOM_VAR"])
+	}
+
+	gitDir, err := GetGitDir(realRepo)
+	if err != nil {
+		t.Fatalf("GetGitDir(realRepo) under poisoned GIT_DIR failed: %v", err)
+	}
+	wantRealGit, _ := filepath.EvalSymlinks(filepath.Join(realRepo, ".git"))
+	gotRealGit, _ := filepath.EvalSymlinks(gitDir)
+	if gotRealGit != wantRealGit {
+		t.Fatalf("GetGitDir(realRepo) = %q, want %q (poisoned by GIT_DIR!)", gotRealGit, wantRealGit)
+	}
+
+	issues, err := NewGitLoader(realRepo).LoadAt("HEAD")
+	if err != nil || len(issues) != 1 || issues[0].ID != "REAL-1" {
+		t.Fatalf("NewGitLoader(realRepo).LoadAt(HEAD) = (%+v, %v), want [REAL-1]", issues, err)
+	}
+}
+
+func TestNewGitLoaderWithBeadsDir_SharedGitMonorepoIgnoresAmbientBeadsEnv(t *testing.T) {
+	monoRepo := t.TempDir()
+	poisonRepo := t.TempDir()
+
+	runGitCmd := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Test",
+			"GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=Test",
+			"GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	writeJSONL := func(dir, relDir, id string) {
+		t.Helper()
+		fullDir := filepath.Join(dir, filepath.FromSlash(relDir))
+		if err := os.MkdirAll(fullDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		line := fmt.Sprintf(`{"id":%q,"title":%q,"status":"open","priority":1,"issue_type":"task"}`+"\n", id, "Issue "+id)
+		if err := os.WriteFile(filepath.Join(fullDir, "issues.jsonl"), []byte(line), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Commit 1 in shared-.git monorepo: root, services/api, services/web, and services/legacy.
+	runGitCmd(monoRepo, "init")
+	writeJSONL(monoRepo, ".beads", "ROOT-1")
+	writeJSONL(monoRepo, "services/api/.beads", "API-1")
+	writeJSONL(monoRepo, "services/web/.beads", "WEB-1")
+	writeJSONL(monoRepo, "services/legacy/.beads", "LEGACY-1")
+	runGitCmd(monoRepo, "add", ".")
+	runGitCmd(monoRepo, "commit", "-m", "c1")
+	c1SHA := runGitCmd(monoRepo, "rev-parse", "HEAD")
+
+	// Commit 2: remove services/legacy/.beads from git tree so it exists ONLY in history at c1SHA.
+	runGitCmd(monoRepo, "rm", "-r", "services/legacy/.beads")
+	runGitCmd(monoRepo, "commit", "-m", "remove legacy beads dir")
+
+	// Separate poison repo configured in ambient BEADS_DIR and BEADS_DB.
+	runGitCmd(poisonRepo, "init")
+	writeJSONL(poisonRepo, ".beads", "POISON-1")
+	runGitCmd(poisonRepo, "add", ".")
+	runGitCmd(poisonRepo, "commit", "-m", "poison")
+
+	t.Setenv(BeadsDirEnvVar, filepath.Join(poisonRepo, ".beads"))
+	t.Setenv(BeadsDBEnvVar, filepath.Join(poisonRepo, ".beads", "issues.jsonl"))
+
+	// Relative sub-repo path (`path: .`, `beads_path: services/api/.beads`).
+	apiLoader := NewGitLoaderWithBeadsDir(monoRepo, "services/api/.beads")
+	if apiLoader.beadsDir != "services/api/.beads" {
+		t.Fatalf("apiLoader.beadsDir = %q, want normalized repo-relative %q", apiLoader.beadsDir, "services/api/.beads")
+	}
+	apiIssues, err := apiLoader.LoadAt("HEAD")
+	if err != nil || len(apiIssues) != 1 || apiIssues[0].ID != "API-1" {
+		t.Fatalf("apiLoader.LoadAt(HEAD) = (%+v, %v), want [API-1]", apiIssues, err)
+	}
+
+	// Absolute sub-repo path inside monoRepo.
+	webLoader := NewGitLoaderWithBeadsDir(monoRepo, filepath.Join(monoRepo, "services", "web", ".beads"))
+	if webLoader.beadsDir != "services/web/.beads" {
+		t.Fatalf("webLoader.beadsDir = %q, want normalized repo-relative %q", webLoader.beadsDir, "services/web/.beads")
+	}
+	webIssues, err := webLoader.LoadAt("HEAD")
+	if err != nil || len(webIssues) != 1 || webIssues[0].ID != "WEB-1" {
+		t.Fatalf("webLoader.LoadAt(HEAD) = (%+v, %v), want [WEB-1]", webIssues, err)
+	}
+
+	// Historical-only sub-repo path absent from working tree at HEAD.
+	legacyLoader := NewGitLoaderWithBeadsDir(monoRepo, "services/legacy/.beads")
+	legacyIssues, err := legacyLoader.LoadAt(c1SHA)
+	if err != nil || len(legacyIssues) != 1 || legacyIssues[0].ID != "LEGACY-1" {
+		t.Fatalf("legacyLoader.LoadAt(c1SHA) = (%+v, %v), want [LEGACY-1]", legacyIssues, err)
+	}
+	// Negative control: at HEAD where services/legacy/.beads is absent, pinned loader must NOT fall back to root .beads!
+	if headLegacy, err := legacyLoader.LoadAt("HEAD"); err == nil {
+		t.Fatalf("expected error loading removed services/legacy/.beads at HEAD, got fallback %+v", headLegacy)
+	}
+}

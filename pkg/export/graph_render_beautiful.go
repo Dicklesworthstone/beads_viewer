@@ -1807,10 +1807,11 @@ let contextNode = null;
 function showContextMenu(node, event) {
     contextNode = node;
     const menu = document.getElementById('context-menu');
+    menu.style.left = '0px';
+    menu.style.top = '0px';
     menu.classList.add('visible');
-    const rect = menu.getBoundingClientRect();
-    const menuW = rect.width || menu.offsetWidth || 220;
-    const menuH = rect.height || menu.offsetHeight || 280;
+    const menuW = menu.offsetWidth || 220;
+    const menuH = menu.offsetHeight || 280;
     const pad = 8;
     const maxLeft = Math.max(pad, window.innerWidth - menuW - pad);
     const maxTop = Math.max(pad, window.innerHeight - menuH - pad);

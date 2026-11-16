@@ -23,16 +23,59 @@ class HybridScorer {
     ) ? configuredMax : null;
   }
 
-  score(result) {
-    const statusScore = this.normalizeStatus(result.status);
+  resolveReferenceNowMs() {
+    const viewerNow = typeof window !== 'undefined' ? window.beadsViewer?.getReferenceNowMs?.() : undefined;
+    if (typeof viewerNow === 'number' && Number.isFinite(viewerNow) && viewerNow > 0) {
+      return viewerNow;
+    }
+    const winNow = typeof window !== 'undefined' ? window.BV_REFERENCE_NOW_MS : undefined;
+    if (typeof winNow === 'number' && Number.isFinite(winNow) && winNow > 0) {
+      return winNow;
+    }
+    return Date.now();
+  }
+
+  resolveEffectiveStatus(result, refNowMs = this.resolveReferenceNowMs()) {
+    const normStatus = String(result?.status || '').trim().toLowerCase();
+    if (normStatus === 'closed' || normStatus === 'tombstone') {
+      return normStatus;
+    }
+    const isTruthy = (v) => v === true || v === 'true' || Number(v) > 0;
+    if (
+      isTruthy(result?.is_template ?? result?.isTemplate) ||
+      isTruthy(result?.pinned ?? result?.isPinned) ||
+      normStatus === 'pinned'
+    ) {
+      return 'deferred';
+    }
+    const deferRaw = result?.defer_until ?? result?.deferUntil;
+    if ((normStatus === 'open' || normStatus === 'in_progress') && deferRaw) {
+      const deferMs = new Date(deferRaw).getTime();
+      if (Number.isFinite(deferMs) && deferMs > refNowMs) {
+        return 'deferred';
+      }
+    }
+    const depState = String(result?.dependency_state ?? result?.dependencyState ?? '').trim().toLowerCase();
+    const isDepBlocked = (depState !== '' && depState !== 'satisfied') || Number(result?.open_blocker_count ?? 0) > 0;
+    if ((normStatus === 'open' || normStatus === 'in_progress') && isDepBlocked) {
+      return 'blocked';
+    }
+    return normStatus;
+  }
+
+  score(result, refNowMs = this.resolveReferenceNowMs()) {
+    const statusScore = this.normalizeStatus(this.resolveEffectiveStatus(result, refNowMs));
     const priorityScore = this.normalizePriority(result.priority);
-    const downstreamImpact = result.blockerCount ?? result.impact ?? result.blocks_count ?? result.dependent_count ?? 0;
+    const rawBlocker = Number(result.blockerCount ?? result.impact ?? result.blocks_count ?? result.dependent_count ?? 0);
+    const downstreamImpact = Number.isFinite(rawBlocker) ? Math.max(0, Math.trunc(rawBlocker)) : 0;
     const impactScore = this.normalizeImpact(downstreamImpact);
-    const recencyScore = this.normalizeRecency(result.updatedAt);
-    const pagerank = typeof result.pagerank === 'number' ? result.pagerank : 0.5;
+    const recencyScore = this.normalizeRecency(result.updatedAt ?? result.updated_at, refNowMs);
+    const pagerank = (typeof result.pagerank === 'number' && Number.isFinite(result.pagerank)) ? result.pagerank : 0.5;
+    const rawText = Number(result.textScore ?? result.text_score ?? 0);
+    const textScore = Number.isFinite(rawText) ? rawText : 0;
 
     const finalScore =
-      this.weights.text * result.textScore +
+      this.weights.text * textScore +
       this.weights.pagerank * pagerank +
       this.weights.status * statusScore +
       this.weights.impact * impactScore +
@@ -56,20 +99,26 @@ class HybridScorer {
     if (!Array.isArray(results) || results.length === 0) {
       return [];
     }
+    const refNowMs = this.resolveReferenceNowMs();
     const maxBlocker = results.reduce(
-      (max, r) => Math.max(max, r.blockerCount ?? r.impact ?? r.blocks_count ?? r.dependent_count ?? 0),
+      (max, r) => {
+        const val = Number(r.blockerCount ?? r.impact ?? r.blocks_count ?? r.dependent_count ?? 0);
+        return Math.max(max, Number.isFinite(val) ? Math.max(0, Math.trunc(val)) : 0);
+      },
       0
     );
     this.maxBlockerCount = this.configuredMaxBlockerCount !== null
-      ? Math.max(maxBlocker, this.configuredMaxBlockerCount)
+      ? Math.max(maxBlocker, Math.max(0, Math.trunc(this.configuredMaxBlockerCount)))
       : maxBlocker;
 
     return results
-      .map(r => this.score(r))
+      .map(r => this.score(r, refNowMs))
       .sort((a, b) => {
         const diff = b.hybrid_score - a.hybrid_score;
         if (diff !== 0) return diff;
-        return String(a.id || '').localeCompare(String(b.id || ''));
+        const aid = String(a.id ?? a.issue_id ?? '');
+        const bid = String(b.id ?? b.issue_id ?? '');
+        return aid < bid ? -1 : (aid > bid ? 1 : 0);
       });
   }
 
@@ -80,7 +129,7 @@ class HybridScorer {
       in_progress: 0.8,
       review: 0.8,
       hooked: 0.8,
-      pinned: 0.7,
+      pinned: 0.2,
       blocked: 0.5,
       deferred: 0.2,
       draft: 0.2,
@@ -92,7 +141,13 @@ class HybridScorer {
 
   normalizePriority(priority) {
     const PRIORITY_WEIGHTS = [1.0, 0.8, 0.6, 0.4, 0.2];
-    return PRIORITY_WEIGHTS[priority] ?? 0.5;
+    if (typeof priority === 'number' && Number.isInteger(priority) && priority >= 0 && priority <= 4) {
+      return PRIORITY_WEIGHTS[priority];
+    }
+    if (typeof priority === 'string' && /^[0-4]$/.test(priority.trim())) {
+      return PRIORITY_WEIGHTS[Number(priority.trim())];
+    }
+    return 0.5;
   }
 
   normalizeImpact(blockerCount) {
@@ -102,15 +157,10 @@ class HybridScorer {
     return blockerCount / this.maxBlockerCount;
   }
 
-  normalizeRecency(updatedAt) {
+  normalizeRecency(updatedAt, refNow = this.resolveReferenceNowMs()) {
     if (!updatedAt) return 0.5;
     const ts = new Date(updatedAt).getTime();
     if (!Number.isFinite(ts)) return 0.5;
-    const viewerNow = typeof window !== 'undefined' ? window.beadsViewer?.getReferenceNowMs?.() : undefined;
-    const winNow = typeof window !== 'undefined' ? window.BV_REFERENCE_NOW_MS : undefined;
-    const refNow = (typeof viewerNow === 'number' && Number.isFinite(viewerNow) && viewerNow > 0)
-      ? viewerNow
-      : (typeof winNow === 'number' && Number.isFinite(winNow) && winNow > 0 ? winNow : Date.now());
     const daysSince = Math.max(0, (refNow - ts) / (1000 * 60 * 60 * 24));
     return Math.exp(-daysSince / 30);
   }

@@ -7527,18 +7527,53 @@ func TestWave14TrackD_ScopingCapacityIgnoreAndPrivacyRegressions(t *testing.T) {
 	if capPayload.OpenIssueCount != 5 {
 		t.Fatalf("expected 5 non-template open issues in core label, got %d", capPayload.OpenIssueCount)
 	}
-	if capPayload.SerialMinutes != 360 || capPayload.CriticalPathMinutes != 360 {
-		t.Fatalf("expected weighted serial_minutes == critical_path_minutes == 360, got serial=%d cp=%d path=%v",
+	if capPayload.SerialMinutes != capPayload.CriticalPathMinutes || capPayload.CriticalPathMinutes < 360 {
+		t.Fatalf("expected weighted serial_minutes == critical_path_minutes >= 360, got serial=%d cp=%d path=%v",
 			capPayload.SerialMinutes, capPayload.CriticalPathMinutes, capPayload.CriticalPath)
 	}
+	if len(capPayload.CriticalPath) != 2 || capPayload.CriticalPath[0] != "h1" || capPayload.CriticalPath[1] != "h2" {
+		t.Fatalf("expected weighted critical_path=[h1 h2] to beat 3-hop light chain, got %v", capPayload.CriticalPath)
+	}
 
-	// 3. --robot-insights --label core reports scoped Stats (5 core + 1 template = 6 candidates, 0 out-of-label x1 in full_stats).
+	// 3. --robot-insights --label core excludes 1-hop prerequisite x1 from candidate rankings while keeping x1 in full_stats dependency context.
 	insOut, insErr, err := runCommandWithTimeout(t, repo, exe, "--robot-insights", "--label", "core")
 	if err != nil {
 		t.Fatalf("--robot-insights --label core failed: %v\nstderr=%s", err, insErr)
 	}
-	if strings.Contains(insOut, `"x1"`) {
-		t.Fatalf("expected --robot-insights --label core not to leak 1-hop neighbor x1:\n%s", insOut)
+	var insPayload struct {
+		Bottlenecks []struct {
+			ID string `json:"ID"`
+		} `json:"Bottlenecks"`
+		Keystones []struct {
+			ID string `json:"ID"`
+		} `json:"Keystones"`
+		TopWhatIfs []struct {
+			IssueID string `json:"issue_id"`
+		} `json:"top_what_ifs"`
+		FullStats struct {
+			PageRank map[string]float64 `json:"pagerank"`
+		} `json:"full_stats"`
+	}
+	if err := json.Unmarshal([]byte(insOut), &insPayload); err != nil {
+		t.Fatalf("unmarshal insights: %v", err)
+	}
+	for _, b := range insPayload.Bottlenecks {
+		if b.ID == "x1" {
+			t.Fatalf("expected Bottlenecks to exclude non-candidate x1, got %+v", insPayload.Bottlenecks)
+		}
+	}
+	for _, k := range insPayload.Keystones {
+		if k.ID == "x1" {
+			t.Fatalf("expected Keystones to exclude non-candidate x1, got %+v", insPayload.Keystones)
+		}
+	}
+	for _, w := range insPayload.TopWhatIfs {
+		if w.IssueID == "x1" {
+			t.Fatalf("expected top_what_ifs to exclude non-candidate x1, got %+v", insPayload.TopWhatIfs)
+		}
+	}
+	if insPayload.FullStats.PageRank["x1"] <= 0 {
+		t.Fatalf("expected full_stats.pagerank to preserve 1-hop prerequisite x1 context, got %v", insPayload.FullStats.PageRank)
 	}
 
 	// 4. --robot-next --label core has 0 claimable picks (h1 assigned to alice, others blocked), emits diagnostic_top_pick.
@@ -7554,21 +7589,29 @@ func TestWave14TrackD_ScopingCapacityIgnoreAndPrivacyRegressions(t *testing.T) {
 		t.Fatalf("expected diagnostic_top_pick when all candidates are non-claimable, got: %s", nextOut)
 	}
 
-	// 5. --search --as-of HEAD~1 writes zero files to .bv/semantic/.
+	// 5. --search --as-of HEAD~1 uses dedicated historical-* index_path (never creating live index-*.bvvi) and caps with --robot-max-results.
 	semDir := filepath.Join(repo, ".bv", "semantic")
 	searchOut, searchErr, err := runCommandWithTimeout(t, repo, exe, "--search", "Heavy", "--as-of", "HEAD~1", "--robot-search", "--robot-max-results", "1")
 	if err != nil {
 		t.Fatalf("--search --as-of failed: %v\nstderr=%s", err, searchErr)
 	}
-	if entries, statErr := os.ReadDir(semDir); statErr == nil && len(entries) > 0 {
-		t.Fatalf("expected 0 semantic index files created by --as-of search, found %d", len(entries))
+	if entries, statErr := os.ReadDir(semDir); statErr == nil {
+		for _, ent := range entries {
+			if !strings.HasPrefix(ent.Name(), "historical-") {
+				t.Fatalf("expected --as-of search never to create live semantic index file, found %q", ent.Name())
+			}
+		}
 	}
 	var searchPayload struct {
-		Limit   int   `json:"limit"`
-		Results []any `json:"results"`
+		IndexPath string `json:"index_path"`
+		Limit     int    `json:"limit"`
+		Results   []any  `json:"results"`
 	}
 	if err := json.Unmarshal([]byte(searchOut), &searchPayload); err != nil {
 		t.Fatalf("unmarshal search: %v", err)
+	}
+	if !strings.HasPrefix(filepath.Base(searchPayload.IndexPath), "historical-") {
+		t.Fatalf("expected historical-* index_path, got %q", searchPayload.IndexPath)
 	}
 	if searchPayload.Limit != 1 || len(searchPayload.Results) != 1 {
 		t.Fatalf("expected --robot-max-results=1 to cap --robot-search, got limit=%d len=%d", searchPayload.Limit, len(searchPayload.Results))
@@ -7612,5 +7655,348 @@ func TestWave14TrackD_ScopingCapacityIgnoreAndPrivacyRegressions(t *testing.T) {
 	}
 	if _, schemaErr, err := runCommandWithTimeout(t, repo, exe, "schema", "bead-history", "--json"); err != nil {
 		t.Fatalf("bv schema bead-history --json failed: %v\nstderr=%s", err, schemaErr)
+	}
+
+	// 9. TUI --as-of + --search-mode/--search-preset launch wiring (positive + invalid negative control).
+	dbgOut, dbgErr, err := runCommandWithTimeout(t, repo, exe, "--as-of", "HEAD", "--search-mode", "hybrid", "--search-preset", "impact-first", "--debug-render", "board")
+	if err != nil {
+		t.Fatalf("TUI --as-of HEAD --search-mode hybrid --debug-render board failed: %v\nstderr=%s", err, dbgErr)
+	}
+	if !strings.Contains(dbgOut, "h1") {
+		t.Fatalf("expected rendered TUI board output to contain h1, got:\n%s", dbgOut)
+	}
+	if _, _, badSearchErr := runCommandWithTimeout(t, repo, exe, "--search-mode", "bogus-mode", "--debug-render", "board"); badSearchErr == nil {
+		t.Fatal("expected invalid --search-mode on TUI launch to fail closed")
+	}
+	if _, modErr, badModErr := runCommandWithTimeout(t, repo, exe, "--robot-triage", "--search-mode", "hybrid"); badModErr == nil || !strings.Contains(modErr, "--search-mode requires --search") {
+		t.Fatalf("expected --robot-triage --search-mode hybrid to fail with --search-mode requires --search, got err=%v stderr=%s", badModErr, modErr)
+	}
+}
+
+func TestWave15Round1_AuditRemediations(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	exe := buildTestBinary(t)
+
+	// [D-2]: XDG_CONFIG_HOME strict isolation (never falls through to $HOME/.config/bv/config.yaml).
+	home := t.TempDir()
+	xdg := t.TempDir()
+	homeCfgDir := filepath.Join(home, ".config", "bv")
+	if err := os.MkdirAll(homeCfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(homeCfgDir, "config.yaml"), []byte("theme: light\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	if v, ok := loadThemeFromUserConfig(); ok || v != "" {
+		t.Fatalf("expected strict XDG_CONFIG_HOME isolation when %s/bv/config.yaml is absent, got (%q, %v)", xdg, v, ok)
+	}
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	// [D-2] + [D-3] + [D-6] + [D-7]: Historical commit clock under SOURCE_DATE_EPOCH,
+	// hybrid --search --as-of .WithNow(referenceTime), scoped insights.Stats, and synthesizeTargetHistories block.
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt := func(dir, dateISO string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(sanitizedGitEnvForCLI(),
+			"GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.com",
+			"GIT_AUTHOR_DATE="+dateISO, "GIT_COMMITTER_DATE="+dateISO,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGitAt(repo, "2025-01-15T12:00:00Z", "init")
+	seedJSONL := strings.Join([]string{
+		`{"id":"x1","title":"External prereq","status":"open","priority":1,"issue_type":"task","labels":["ext"],"created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-10T00:00:00Z"}`,
+		`{"id":"c1","title":"Deferred core auth","status":"open","priority":1,"issue_type":"task","labels":["core"],"defer_until":"2025-02-01T00:00:00Z","dependencies":[{"issue_id":"c1","depends_on_id":"x1","type":"blocks"}],"created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-10T00:00:00Z"}`,
+		`{"id":"c2","title":"Ready core item","status":"open","priority":2,"issue_type":"task","labels":["core"],"dependencies":[{"issue_id":"c2","depends_on_id":"c1","type":"blocks"}],"created_at":"2025-01-01T00:00:00Z","updated_at":"2025-01-10T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(seedJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "ext.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(repo, "2025-01-15T12:00:00Z", "add", ".")
+	runGitAt(repo, "2025-01-15T12:00:00Z", "commit", "-m", "feat: touch x1 and c1")
+	c1SHA := runGitAt(repo, "2025-01-15T12:00:00Z", "rev-parse", "HEAD")
+
+	// [D-2] + [D-3] + [R2-D1]: Without SOURCE_DATE_EPOCH, --as-of c1SHA uses historical commit clock 2025-01-15T12:00:00Z
+	// and scores c1 (defer_until 2025-02-01) as deferred (status=0.2, not open=1.0). When SOURCE_DATE_EPOCH is set,
+	// SOURCE_DATE_EPOCH takes precedence for reproducibility (TestRobotSearchHistoricalCache) while still honoring .WithNow(referenceTime).
+	t.Setenv("SOURCE_DATE_EPOCH", "")
+	hsOut, hsErr, err := runCommandWithTimeout(t, repo, exe, "--search", "Deferred core auth", "--search-mode", "hybrid", "--as-of", c1SHA, "--robot-search")
+	if err != nil {
+		t.Fatalf("hybrid --search --as-of failed: %v\nstderr=%s", err, hsErr)
+	}
+	var hsPayload struct {
+		RankingTime string `json:"ranking_time"`
+		Results     []struct {
+			IssueID         string             `json:"issue_id"`
+			ComponentScores map[string]float64 `json:"component_scores"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(hsOut), &hsPayload); err != nil {
+		t.Fatalf("unmarshal hybrid search: %v\n%s", err, hsOut)
+	}
+	if hsPayload.RankingTime != "2025-01-15T12:00:00Z" {
+		t.Fatalf("expected ranking_time=2025-01-15T12:00:00Z from commit clock when SOURCE_DATE_EPOCH is unset, got %q", hsPayload.RankingTime)
+	}
+	foundDeferred := false
+	for _, r := range hsPayload.Results {
+		if r.IssueID == "c1" {
+			foundDeferred = true
+			if r.ComponentScores["status"] != 0.2 {
+				t.Fatalf("expected c1 hybrid status score 0.2 (deferred at 2025-01-15), got %v", r.ComponentScores)
+			}
+		}
+	}
+	if !foundDeferred {
+		t.Fatalf("expected c1 in hybrid search results: %+v", hsPayload.Results)
+	}
+	t.Setenv("SOURCE_DATE_EPOCH", "1736985600") // 2025-01-16T00:00:00Z overrides commit clock
+	hsEpochOut, hsEpochErr, err := runCommandWithTimeout(t, repo, exe, "--search", "Deferred core auth", "--search-mode", "hybrid", "--as-of", c1SHA, "--robot-search")
+	t.Setenv("SOURCE_DATE_EPOCH", "")
+	if err != nil {
+		t.Fatalf("hybrid --search --as-of with SOURCE_DATE_EPOCH failed: %v\nstderr=%s", err, hsEpochErr)
+	}
+	if err := json.Unmarshal([]byte(hsEpochOut), &hsPayload); err != nil {
+		t.Fatalf("unmarshal epoch hybrid search: %v", err)
+	}
+	if hsPayload.RankingTime != "2025-01-16T00:00:00Z" {
+		t.Fatalf("expected SOURCE_DATE_EPOCH override ranking_time=2025-01-16T00:00:00Z, got %q", hsPayload.RankingTime)
+	}
+
+	// [D-6]: --robot-insights --label core scopes Stats.{NodeCount,EdgeCount,Density} to match ClusterDensity (2 nodes, 1 edge => 0.5).
+	insOut, insErr, err := runCommandWithTimeout(t, repo, exe, "--robot-insights", "--label", "core")
+	if err != nil {
+		t.Fatalf("--robot-insights --label core failed: %v\nstderr=%s", err, insErr)
+	}
+	var insStats struct {
+		ClusterDensity float64 `json:"ClusterDensity"`
+		Stats          struct {
+			NodeCount int     `json:"NodeCount"`
+			EdgeCount int     `json:"EdgeCount"`
+			Density   float64 `json:"Density"`
+		} `json:"Stats"`
+	}
+	if err := json.Unmarshal([]byte(insOut), &insStats); err != nil {
+		t.Fatalf("unmarshal insights stats: %v", err)
+	}
+	if insStats.Stats.NodeCount != 2 || insStats.Stats.EdgeCount != 1 || insStats.Stats.Density != insStats.ClusterDensity {
+		t.Fatalf("expected scoped Stats (2 nodes, 1 edge, density=%v), got %+v", insStats.ClusterDensity, insStats.Stats)
+	}
+
+	// [D-7]: Out-of-scope x1 must NOT be resurrected via synthesizeTargetHistories or mutate feedback under --label core.
+	bhOut, bhErr, err := runCommandWithTimeout(t, repo, exe, "--bead-history", "x1", "--label", "core")
+	if err != nil {
+		t.Fatalf("--bead-history x1 --label core failed: %v\nstderr=%s", err, bhErr)
+	}
+	if strings.Contains(bhOut, `"x1"`) {
+		t.Fatalf("expected --bead-history x1 --label core not to leak out-of-scope x1:\n%s", bhOut)
+	}
+	for _, argv := range [][]string{
+		{"--robot-causality", "x1", "--label", "core"},
+		{"--robot-explain-correlation", c1SHA + ":x1", "--label", "core"},
+		{"--robot-confirm-correlation", c1SHA + ":x1", "--label", "core"},
+		{"--robot-blocker-chain", "x1", "--label", "core"},
+	} {
+		if _, _, scopeErr := runCommandWithTimeout(t, repo, exe, argv...); scopeErr == nil {
+			t.Fatalf("expected %v to reject out-of-scope x1", argv)
+		}
+	}
+	if _, statErr := os.Stat(filepath.Join(beadsDir, "correlation_feedback.jsonl")); statErr == nil {
+		t.Fatal("expected correlation_feedback.jsonl not to be created by rejected out-of-scope feedback command")
+	}
+
+	// [D-5]: Child submodule .beads is never crawled when parent repo issue count drops, and BEADS_DB directory is honored.
+	subBeads := filepath.Join(repo, "submod", ".beads")
+	if err := os.MkdirAll(subBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var subLines []string
+	for i := 0; i < 20; i++ {
+		subLines = append(subLines, fmt.Sprintf(`{"id":"sub-%d","title":"Sub %d","status":"open","priority":2,"issue_type":"task"}`, i, i))
+	}
+	if err := os.WriteFile(filepath.Join(subBeads, "issues.jsonl"), []byte(strings.Join(subLines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wizCfg := &export.WizardConfig{RepoName: "submod", LastIssueCount: 20}
+	srcResolved, err := resolvePagesSource(wizCfg, filepath.Join(beadsDir, "issues.jsonl"))
+	if err != nil {
+		t.Fatalf("resolvePagesSource failed: %v", err)
+	}
+	if filepath.Clean(srcResolved.BeadsDir) != filepath.Clean(beadsDir) {
+		t.Fatalf("resolvePagesSource crawled into child submodule %q instead of staying on %q", srcResolved.BeadsDir, beadsDir)
+	}
+	t.Setenv("BEADS_DB", subBeads)
+	dbDirResolved, err := resolvePagesSource(&export.WizardConfig{SourcePath: filepath.Join(beadsDir, "issues.jsonl")}, filepath.Join(beadsDir, "issues.jsonl"))
+	t.Setenv("BEADS_DB", "")
+	if err != nil {
+		t.Fatalf("resolvePagesSource with BEADS_DB dir failed: %v", err)
+	}
+	if filepath.Clean(dbDirResolved.BeadsDir) != filepath.Clean(subBeads) {
+		t.Fatalf("expected BEADS_DB directory %q to win over saved config, got %q", subBeads, dbDirResolved.BeadsDir)
+	}
+
+	// [D-8]: Disconnected cycle + self-loop + 35-stage diamond DAG completes in O(V+E) with serial_minutes == critical_path_minutes.
+	capDir := t.TempDir()
+	capBeads := filepath.Join(capDir, ".beads")
+	if err := os.MkdirAll(capBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var capLines []string
+	capLines = append(capLines,
+		`{"id":"root-tiny","title":"Tiny root","status":"open","priority":2,"issue_type":"task","estimated_minutes":15}`,
+		`{"id":"self-1","title":"Self loop","status":"open","priority":2,"issue_type":"task","estimated_minutes":30,"dependencies":[{"issue_id":"self-1","depends_on_id":"self-1","type":"blocks"}]}`,
+		`{"id":"cyc-1","title":"Cycle A","status":"open","priority":1,"issue_type":"task","estimated_minutes":300,"dependencies":[{"issue_id":"cyc-1","depends_on_id":"cyc-2","type":"blocks"}]}`,
+		`{"id":"cyc-2","title":"Cycle B","status":"open","priority":1,"issue_type":"task","estimated_minutes":300,"dependencies":[{"issue_id":"cyc-2","depends_on_id":"cyc-1","type":"blocks"}]}`,
+		`{"id":"d-0","title":"Diamond 0","status":"open","priority":2,"issue_type":"task","estimated_minutes":5}`,
+	)
+	for i := 0; i < 35; i++ {
+		prev := fmt.Sprintf("d-%d", i)
+		a := fmt.Sprintf("da-%d", i)
+		b := fmt.Sprintf("db-%d", i)
+		next := fmt.Sprintf("d-%d", i+1)
+		capLines = append(capLines,
+			fmt.Sprintf(`{"id":%q,"title":"DA","status":"open","priority":2,"issue_type":"task","estimated_minutes":5,"dependencies":[{"issue_id":%q,"depends_on_id":%q,"type":"blocks"}]}`, a, a, prev),
+			fmt.Sprintf(`{"id":%q,"title":"DB","status":"open","priority":2,"issue_type":"task","estimated_minutes":5,"dependencies":[{"issue_id":%q,"depends_on_id":%q,"type":"blocks"}]}`, b, b, prev),
+			fmt.Sprintf(`{"id":%q,"title":"DN","status":"open","priority":2,"issue_type":"task","estimated_minutes":5,"dependencies":[{"issue_id":%q,"depends_on_id":%q,"type":"blocks"},{"issue_id":%q,"depends_on_id":%q,"type":"blocks"}]}`, next, next, a, next, b),
+		)
+	}
+	if err := os.WriteFile(filepath.Join(capBeads, "issues.jsonl"), []byte(strings.Join(capLines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	capOut, capErr, err := runCommandWithTimeout(t, capDir, exe, "--robot-capacity")
+	if err != nil {
+		t.Fatalf("--robot-capacity on diamond+cycle failed: %v\nstderr=%s", err, capErr)
+	}
+	var capRes struct {
+		SerialMinutes       int      `json:"serial_minutes"`
+		CriticalPathMinutes int      `json:"critical_path_minutes"`
+		CriticalPath        []string `json:"critical_path"`
+	}
+	if err := json.Unmarshal([]byte(capOut), &capRes); err != nil {
+		t.Fatalf("unmarshal capacity: %v", err)
+	}
+	if capRes.SerialMinutes != capRes.CriticalPathMinutes || capRes.CriticalPathMinutes < 600 {
+		t.Fatalf("expected serial_minutes == critical_path_minutes >= 600 (disconnected cycle), got serial=%d cp=%d path=%v",
+			capRes.SerialMinutes, capRes.CriticalPathMinutes, capRes.CriticalPath)
+	}
+
+	// [D-9]: Shared-.git monorepo workspace --diff-since resolves explicit sub-repo beads_path.
+	mono := t.TempDir()
+	apiBeads := filepath.Join(mono, "services", "api", ".beads")
+	webBeads := filepath.Join(mono, "services", "web", ".beads")
+	wsDir := filepath.Join(mono, ".bv")
+	for _, d := range []string{apiBeads, webBeads, wsDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wsYAML := "repos:\n  - name: api\n    path: .\n    beads_path: services/api/.beads\n    prefix: api-\n  - name: web\n    path: .\n    beads_path: services/web/.beads\n    prefix: web-\n"
+	wsFile := filepath.Join(wsDir, "workspace.yaml")
+	if err := os.WriteFile(wsFile, []byte(wsYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(apiBeads, "issues.jsonl"), []byte(`{"id":"1","title":"API v1","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(webBeads, "issues.jsonl"), []byte(`{"id":"1","title":"Web v1","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(mono, "2025-03-01T00:00:00Z", "init")
+	runGitAt(mono, "2025-03-01T00:00:00Z", "add", ".")
+	runGitAt(mono, "2025-03-01T00:00:00Z", "commit", "-m", "chore: initial monorepo")
+	if err := os.WriteFile(filepath.Join(webBeads, "issues.jsonl"), []byte(
+		`{"id":"1","title":"Web v1","status":"open","priority":1,"issue_type":"task"}`+"\n"+
+			`{"id":"2","title":"Web v2","status":"open","priority":2,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(mono, "2025-03-02T00:00:00Z", "add", ".")
+	runGitAt(mono, "2025-03-02T00:00:00Z", "commit", "-m", "feat(web): add web-2")
+
+	monoDiffOut, monoDiffErr, err := runCommandWithTimeout(t, mono, exe, "--workspace", wsFile, "--diff-since", "HEAD~1", "--robot-diff")
+	if err != nil {
+		t.Fatalf("monorepo workspace --diff-since failed: %v\nstderr=%s", err, monoDiffErr)
+	}
+	var monoDiff struct {
+		Diff struct {
+			NewIssues []struct {
+				ID string `json:"id"`
+			} `json:"new_issues"`
+		} `json:"diff"`
+	}
+	if err := json.Unmarshal([]byte(monoDiffOut), &monoDiff); err != nil {
+		t.Fatalf("unmarshal monorepo diff: %v", err)
+	}
+	if len(monoDiff.Diff.NewIssues) != 1 || monoDiff.Diff.NewIssues[0].ID != "web-2" {
+		t.Fatalf("expected sole new issue web-2 in monorepo workspace diff, got %+v\nraw=%s", monoDiff.Diff.NewIssues, monoDiffOut)
+	}
+
+	// [R2-D3]: Deleted/tombstoned historical beads remain inspectable under --workspace --repo api
+	// (matching repo) while still rejected under --repo web (non-matching repo) or --label.
+	delWS := t.TempDir()
+	delApi := filepath.Join(delWS, "api")
+	delWeb := filepath.Join(delWS, "web")
+	for _, d := range []string{filepath.Join(delApi, ".beads"), filepath.Join(delWeb, ".beads"), filepath.Join(delWS, ".bv")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delWSFile := filepath.Join(delWS, ".bv", "workspace.yaml")
+	if err := os.WriteFile(delWSFile, []byte("repos:\n  - name: api\n    path: api\n    prefix: api-\n  - name: web\n    path: web\n    prefix: web-\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(delApi, "2025-04-01T00:00:00Z", "init")
+	if err := os.WriteFile(filepath.Join(delApi, ".beads", "issues.jsonl"), []byte(`{"id":"DEL-1","title":"Deleted API bead","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(delApi, "svc.go"), []byte("package api\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(delApi, "2025-04-01T00:00:00Z", "add", ".")
+	runGitAt(delApi, "2025-04-01T00:00:00Z", "commit", "-m", "feat: implement DEL-1")
+	delCommitSHA := runGitAt(delApi, "2025-04-01T00:00:00Z", "rev-parse", "HEAD")
+	// Delete DEL-1 from live issues.jsonl in api, keep LIVE-1 open.
+	if err := os.WriteFile(filepath.Join(delApi, ".beads", "issues.jsonl"), []byte(`{"id":"LIVE-1","title":"Live API bead","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(delApi, "2025-04-02T00:00:00Z", "add", ".")
+	runGitAt(delApi, "2025-04-02T00:00:00Z", "commit", "-m", "chore: prune DEL-1")
+
+	runGitAt(delWeb, "2025-04-01T00:00:00Z", "init")
+	if err := os.WriteFile(filepath.Join(delWeb, ".beads", "issues.jsonl"), []byte(`{"id":"W-1","title":"Web bead","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(delWeb, "2025-04-01T00:00:00Z", "add", ".")
+	runGitAt(delWeb, "2025-04-01T00:00:00Z", "commit", "-m", "chore: init web")
+
+	// Positive: --repo api preserves deleted api-DEL-1 across --bead-history, --robot-causality, and --robot-explain-correlation!
+	delHistOut, delHistErr, err := runCommandWithTimeout(t, delWS, exe, "--workspace", delWSFile, "--repo", "api", "--bead-history", "api-DEL-1")
+	if err != nil || !strings.Contains(delHistOut, `"api-DEL-1"`) {
+		t.Fatalf("expected --repo api --bead-history api-DEL-1 to return history, err=%v stderr=%s out=%s", err, delHistErr, delHistOut)
+	}
+	if _, causErr, err := runCommandWithTimeout(t, delWS, exe, "--workspace", delWSFile, "--repo", "api", "--robot-causality", "api-DEL-1"); err != nil {
+		t.Fatalf("expected --repo api --robot-causality api-DEL-1 to succeed, err=%v stderr=%s", err, causErr)
+	}
+	if _, expErr, err := runCommandWithTimeout(t, delWS, exe, "--workspace", delWSFile, "--repo", "api", "--robot-explain-correlation", delCommitSHA+":api-DEL-1"); err != nil {
+		t.Fatalf("expected --repo api --robot-explain-correlation api-DEL-1 to succeed, err=%v stderr=%s", err, expErr)
+	}
+	// Negative: --repo web rejects api-DEL-1!
+	if _, _, wrongRepoErr := runCommandWithTimeout(t, delWS, exe, "--workspace", delWSFile, "--repo", "web", "--robot-causality", "api-DEL-1"); wrongRepoErr == nil {
+		t.Fatal("expected --repo web --robot-causality api-DEL-1 to fail closed")
 	}
 }

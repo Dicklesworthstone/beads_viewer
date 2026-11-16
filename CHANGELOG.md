@@ -275,30 +275,33 @@ every reported vulnerability has an exploitable execution path in bv.
 - **Wave 14–15 Pages data-leak confinement, `--robot-ignore-correlation` (`45`
   robot commands), scoped graph/capacity/search/drift invariants, TUI viewport &
   historical fidelity, and static/WASM/installer hardening (`bv-apal.66`..`bv-apal.73`):**
-  eliminate cross-repo `bv --pages` data leakage (`per-repo` `WizardConfig` keys,
-  zero `$HOME`/`/dp` crawling, and empty-project `isSuspiciousIssueCount(0, 0) == false`);
-  register `--robot-ignore-correlation <sha:id>` (`45` total primary robot commands),
-  add `orphans`/`drift`/`version` agent intents + `bv schema bead-history`, and fix
-  `tty_guard.go` phantom value-taking flags; enforce candidate-scoped `NodeCount`/
-  `EdgeCount`/`Density`, `0` 1-hop neighbor leakage across `--robot-insights`/
-  correlation/orphan/related/network/causality/suggest/burndown, weighted
-  `longestWeightedCapacityChain` (`serial_minutes == critical_path_minutes`),
-  in-memory `--as-of` CLI `--search`, symmetric `--diff-since` (`--workspace` +
-  `from_data_hash == to_data_hash`), and `BV_NO_SAVED_CONFIG`/`XDG_CONFIG_HOME`
-  user-config guards; harden `pkg/analysis` (`AllScores`/`UnblocksMap` beyond
-  `TopN`, candidate-scoped `AdvancedInsights`, non-blocking edge filtering in
-  `GetLabelCriticalPath`/`ComputeWhatIf`, multi-hop parent-gate `EstimateETAForIssue`,
-  `BV_CACHE_DEBUG` stderr purity, and `SanitizedGitEnv` across `datasource`/`workspace`/
-  `baseline`/`cass`/`drift`), `pkg/ui` (full-set `TriageScores` + `UnblocksMap`,
-  `ReferenceNow` historical time-travel, CLI `--search-*` wiring, ANSI-safe
-  `truncateRunesHelper`, Cass modal mouse-wheel, Attention viewport clipping,
-  Board `s`/`0` empty-column sync, and Sprint scope-change history), and `pkg/export` +
-  `bv-graph-wasm` (wired `bv-search-wasm` hybrid vector engine in `viewer.js`,
-  `graph.js` WASM `pagerank`/`eigenvector`/`degree` + keyboard pan/zoom/cycle/PNG +
-  touch pinch-zoom + theme re-render, `sprint.html` multi-sprint selector,
-  `markdown.go` blocked/triage/external-dep rendering, `install.sh` relative-`PATH`/
-  `GITHUB_TOKEN`/pinned-tag/ `-mod=vendor` hardening, and `flake.nix` `bvVersion`
-  guard + `gitMinimal` devShell).
+  eliminate cross-repo `bv --pages` data leakage (multi-repo `WizardConfig` keys,
+  `BEADS_DB` directory support, zero `$HOME`/`/dp`/subtree crawling, and empty-project
+  `isSuspiciousIssueCount(0, 0) == false`); register `--robot-ignore-correlation <sha:id>`
+  (`45` total primary robot commands), add `orphans`/`drift`/`version` agent intents +
+  `bv schema bead-history`, and complete `tty_guard.go` value-taking TUI flags; enforce
+  candidate-scoped `NodeCount`/`EdgeCount`/`Density`, `0` 1-hop neighbor leakage across
+  `--robot-insights`/correlation/orphan/related/network/causality/suggest/burndown
+  (while preserving matching `--repo` deleted-bead correlation), Tarjan SCC-condensed
+  `analysis.LongestWeightedChain` (`serial_minutes == critical_path_minutes`), isolated
+  `historical-*` `.bvvi` `--as-of` CLI `--search` (with `--no-cache` and read-only
+  memory fallback), symmetric `--diff-since` (`--workspace` + monorepo `beads_path` +
+  `from_data_hash == to_data_hash`), and strict `BV_NO_SAVED_CONFIG`/`XDG_CONFIG_HOME`
+  user-config isolation; harden `pkg/analysis` & `pkg/search` (`AllScores`/`UnblocksMap`
+  beyond `TopN`, `ScopedGraphTotals`, candidate-scoped `generateParallelGain`,
+  `DetectAtRiskWithReadiness` parent-epic exclusion, `AnalyzerMetricsLoader.WithNow`
+  `StatusPinned: 0.2`, SQLite↔JSONL `dependencies`/`assignee`/`labels`/`defer_until`
+  `source_inconsistency` diffs, workspace `cass` `Origin.WorkingDirectory`/`LocalID`,
+  `KnownFields(true)` YAML validation, and `loader.SanitizedGitEnv()`); harden `pkg/ui`
+  (full-corpus `TriageScores` + `UnblocksMap`, seamless `BackgroundWorker` promotion,
+  `ReadinessScope.ReferenceNow`, `Model.SetSearchConfig` `HasPreset`/custom-weights
+  fidelity, and modal/mouse/theme polish); and harden `pkg/export` + `bv-graph-wasm`
+  (sink-ending `k_critical_paths`, self-loop/exact `cycles`, step-actionable `topk_set`,
+  `coverageSetDefault`, `dependencyCone`, `HybridWasmCtor` `bv_hybrid_scorer` activation,
+  COOP/COEP preview + `coi-serviceworker.js` `/__preview__/` safety, `SOURCE_DATE_EPOCH`
+  determinism, tracked-only `ViewerAssetsFS` embed globs, `install.sh` stdin-`curl`
+  auth/`vendor/modules.txt`/`FROM_SOURCE=0` hardening, and `flake.nix` `bvVersion`
+  alignment).
 
 ## v0.26.0 — 2026-11-02
 

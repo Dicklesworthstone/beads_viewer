@@ -20,9 +20,12 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 const skipDeploymentIssueCountVerification = -1
+
+var githubActionsInitialWait = 5 * time.Second
 
 // GitHubDeployConfig configures GitHub Pages deployment.
 type GitHubDeployConfig struct {
@@ -88,12 +91,14 @@ func CheckGHStatus() (*GitHubStatus, error) {
 	}
 
 	// Check git configuration
-	nameCmd := exec.Command("git", "config", "user.name")
+	nameCmd := exec.Command("git", "--no-replace-objects", "config", "user.name")
+	nameCmd.Env = loader.SanitizedGitEnv()
 	if nameOut, err := nameCmd.Output(); err == nil {
 		status.GitName = strings.TrimSpace(string(nameOut))
 	}
 
-	emailCmd := exec.Command("git", "config", "user.email")
+	emailCmd := exec.Command("git", "--no-replace-objects", "config", "user.email")
+	emailCmd.Env = loader.SanitizedGitEnv()
 	if emailOut, err := emailCmd.Output(); err == nil {
 		status.GitEmail = strings.TrimSpace(string(emailOut))
 	}
@@ -307,10 +312,12 @@ func InitAndPush(bundlePath string, repoFullName string, forceOverwrite bool) er
 	// Check if remote already exists
 	checkRemote := exec.Command("git", "remote", "get-url", "origin")
 	checkRemote.Dir = bundlePath
+	checkRemote.Env = loader.SanitizedGitEnv()
 	if checkRemote.Run() == nil {
 		// Remote exists, remove it first
 		rmRemote := exec.Command("git", "remote", "remove", "origin")
 		rmRemote.Dir = bundlePath
+		rmRemote.Env = loader.SanitizedGitEnv()
 		rmRemote.Run()
 	}
 
@@ -323,6 +330,7 @@ func InitAndPush(bundlePath string, repoFullName string, forceOverwrite bool) er
 		}
 		cmd := exec.Command("git", args...)
 		cmd.Dir = bundlePath
+		cmd.Env = loader.SanitizedGitEnv()
 		if output, err := cmd.CombinedOutput(); err != nil {
 			switch commandName {
 			case "branch":
@@ -343,6 +351,7 @@ func InitAndPush(bundlePath string, repoFullName string, forceOverwrite bool) er
 	// Configure git for large pushes (prevents HTTP 408 timeouts)
 	configCmd := exec.Command("git", "config", "http.postBuffer", "524288000") // 500MB
 	configCmd.Dir = bundlePath
+	configCmd.Env = loader.SanitizedGitEnv()
 	_ = configCmd.Run() // Ignore errors - this is best-effort
 
 	// Push with force-with-lease for safety.
@@ -362,6 +371,7 @@ func InitAndPush(bundlePath string, repoFullName string, forceOverwrite bool) er
 
 	pushCmd := exec.Command("git", pushArgs...)
 	pushCmd.Dir = bundlePath
+	pushCmd.Env = loader.SanitizedGitEnv()
 	if output, err := pushCmd.CombinedOutput(); err != nil {
 		return gitCommandOutputError("push", output, err)
 	}
@@ -372,6 +382,7 @@ func InitAndPush(bundlePath string, repoFullName string, forceOverwrite bool) er
 func fetchRemoteBranch(bundlePath, branch string) error {
 	cmd := exec.Command("git", "fetch", "--depth=1", "origin", branch)
 	cmd.Dir = bundlePath
+	cmd.Env = loader.SanitizedGitEnv()
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return gitCommandOutputError(fmt.Sprintf("git fetch origin %s", branch), output, err)
 	}
@@ -398,10 +409,11 @@ func firstArg(args []string) string {
 }
 
 func hasGitConfigValue(dir, key string) bool {
-	cmd := exec.Command("git", "config", "--get", key)
+	cmd := exec.Command("git", "--no-replace-objects", "config", "--get", key)
 	if dir != "" {
 		cmd.Dir = dir
 	}
+	cmd.Env = loader.SanitizedGitEnv()
 	out, err := cmd.Output()
 	return err == nil && strings.TrimSpace(string(out)) != ""
 }
@@ -897,49 +909,114 @@ func WriteGitHubActionsWorkflow(bundlePath string) error {
 
 // GitHubActionsStatus represents the status of GitHub Actions for a repository.
 type GitHubActionsStatus struct {
+	TotalCount          int
+	HasActiveRun        bool
 	WorkflowRunning     bool
 	WorkflowQueued      bool
 	LastRunStatus       string
+	LastConclusion      string
 	LastRunCreatedAt    string
 	PossiblyRateLimited bool
 }
 
+func isGitHubActionsRunActive(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "queued", "in_progress", "waiting", "requested", "pending":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldFallbackToLegacyPages(status *GitHubActionsStatus) bool {
+	if status == nil {
+		return false
+	}
+	if status.PossiblyRateLimited {
+		return true
+	}
+	if !status.HasActiveRun {
+		if status.TotalCount == 0 {
+			return true
+		}
+		switch strings.ToLower(strings.TrimSpace(status.LastConclusion)) {
+		case "failure", "cancelled", "startup_failure", "timed_out", "action_required":
+			return true
+		}
+	}
+	return false
+}
+
 // CheckGitHubActionsStatus checks if GitHub Actions is working properly for a repository.
-// It detects stuck/queued workflows that might indicate rate limiting.
+// It detects missing, failed, or stuck/queued workflows that require legacy Pages fallback.
 func CheckGitHubActionsStatus(repoFullName string) (*GitHubActionsStatus, error) {
 	status := &GitHubActionsStatus{}
 
-	// Get the latest workflow run
+	// Query workflow runs from GitHub API without jq null-projection pitfalls.
 	cmd := exec.Command("gh", "api",
-		fmt.Sprintf("repos/%s/actions/runs", repoFullName),
-		"--jq", ".workflow_runs[0] | {status: .status, conclusion: .conclusion, created_at: .created_at}")
+		fmt.Sprintf("repos/%s/actions/runs", repoFullName))
 	output, err := cmd.Output()
 	if err != nil {
-		// No workflow runs yet - that's OK
+		// No workflow runs / Actions unavailable - TotalCount remains 0.
 		return status, nil
 	}
 
-	// Parse the JSON output
-	var run struct {
+	type actionsRunPayload struct {
 		Status     string `json:"status"`
 		Conclusion string `json:"conclusion"`
 		CreatedAt  string `json:"created_at"`
 	}
-	if err := json.Unmarshal(output, &run); err != nil {
-		return status, nil // Can't parse, assume OK
+	var payload struct {
+		TotalCount   *int                `json:"total_count"`
+		WorkflowRuns []actionsRunPayload `json:"workflow_runs"`
+		Status       string              `json:"status"`
+		Conclusion   string              `json:"conclusion"`
+		CreatedAt    string              `json:"created_at"`
+	}
+	if err := json.Unmarshal(output, &payload); err != nil {
+		return status, nil
 	}
 
-	status.LastRunStatus = run.Status
-	status.LastRunCreatedAt = run.CreatedAt
+	runs := payload.WorkflowRuns
+	if len(runs) == 0 && strings.TrimSpace(payload.Status) != "" {
+		runs = []actionsRunPayload{{
+			Status:     payload.Status,
+			Conclusion: payload.Conclusion,
+			CreatedAt:  payload.CreatedAt,
+		}}
+	}
 
-	if run.Status == "queued" {
+	if payload.TotalCount != nil {
+		status.TotalCount = *payload.TotalCount
+	} else {
+		status.TotalCount = len(runs)
+	}
+
+	for _, r := range runs {
+		if isGitHubActionsRunActive(r.Status) {
+			status.HasActiveRun = true
+			break
+		}
+	}
+
+	if len(runs) == 0 {
+		return status, nil
+	}
+
+	latest := runs[0]
+	normStatus := strings.ToLower(strings.TrimSpace(latest.Status))
+	status.LastRunStatus = normStatus
+	status.LastConclusion = strings.ToLower(strings.TrimSpace(latest.Conclusion))
+	status.LastRunCreatedAt = latest.CreatedAt
+
+	if normStatus == "queued" {
 		status.WorkflowQueued = true
 		// Check if it's been queued for more than 2 minutes - might be rate limited
-		createdAt, err := time.Parse(time.RFC3339, run.CreatedAt)
+		createdAt, err := time.Parse(time.RFC3339, latest.CreatedAt)
 		if err == nil && time.Since(createdAt) > 2*time.Minute {
 			status.PossiblyRateLimited = true
 		}
-	} else if run.Status == "in_progress" {
+	} else if normStatus == "in_progress" {
 		status.WorkflowRunning = true
 	}
 
@@ -986,6 +1063,7 @@ func PushToGHPagesBranch(bundlePath string, repoFullName string) error {
 		}
 		cmd := exec.Command("git", args...)
 		cmd.Dir = bundlePath
+		cmd.Env = loader.SanitizedGitEnv()
 		if output, err := cmd.CombinedOutput(); err != nil {
 			switch commandName {
 			case "commit":
@@ -1009,6 +1087,7 @@ func PushToGHPagesBranch(bundlePath string, repoFullName string) error {
 
 	pushCmd := exec.Command("git", pushArgs...)
 	pushCmd.Dir = bundlePath
+	pushCmd.Env = loader.SanitizedGitEnv()
 	if output, err := pushCmd.CombinedOutput(); err != nil {
 		return gitCommandOutputError("push gh-pages", output, err)
 	}
@@ -1116,12 +1195,18 @@ func DeployToGitHubPagesWithFallback(config GitHubDeployConfig, expectedIssueCou
 	}
 
 	// Wait a moment for Pages to process
-	time.Sleep(5 * time.Second)
+	if githubActionsInitialWait > 0 {
+		time.Sleep(githubActionsInitialWait)
+	}
 
 	// Check if workflow deployment is working
 	actionsStatus, _ := CheckGitHubActionsStatus(result.RepoFullName)
-	if actionsStatus.PossiblyRateLimited {
-		fmt.Println("\n  ⚠ GitHub Actions appears to be rate-limited (workflow stuck in queue)")
+	if shouldFallbackToLegacyPages(actionsStatus) {
+		if actionsStatus != nil && actionsStatus.PossiblyRateLimited {
+			fmt.Println("\n  ⚠ GitHub Actions appears to be rate-limited (workflow stuck in queue)")
+		} else {
+			fmt.Println("\n  ⚠ GitHub Actions workflow did not trigger or failed")
+		}
 		fmt.Println("  -> Attempting fallback to legacy branch-based deployment...")
 
 		// Try legacy deployment

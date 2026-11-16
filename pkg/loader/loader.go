@@ -195,7 +195,11 @@ func resolveIssueOriginWithCapabilities(sourcePath string, capabilities func(str
 	if err != nil {
 		return refuse("source path cannot be resolved to a live tracker")
 	}
-	beadsDir := filepath.Dir(path)
+	beadsDir := filepath.Clean(filepath.Dir(path))
+	origin.TrackerDirectory = beadsDir
+	if base := filepath.Base(beadsDir); base == ".beads" || base == "_beads" {
+		origin.WorkingDirectory = filepath.Dir(beadsDir)
+	}
 	metadata, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
 	if err != nil {
 		return refuse("source has no readable tracker metadata")
@@ -209,7 +213,7 @@ func resolveIssueOriginWithCapabilities(sourcePath string, capabilities func(str
 	default:
 		return refuse("unsupported tracker backend: " + meta.Backend)
 	}
-	origin.TrackerDirectory, origin.WorkingDirectory = beadsDir, filepath.Dir(beadsDir)
+	origin.WorkingDirectory = filepath.Dir(beadsDir)
 	origin.Tracker = "br"
 	resolve := func(name string) (string, error) {
 		if name == "" {
@@ -407,6 +411,12 @@ func findAncestorBeadsDir(startPath string) (string, error) {
 
 	curr := cleanStart
 	for {
+		// Stop climbing once an enclosing .git directory or worktree gitfile is
+		// reached so a fresh repository with no .beads never leaks into an
+		// ancestor directory's .beads (e.g. /dp/.beads or $HOME/.beads).
+		if _, gitErr := os.Lstat(filepath.Join(curr, ".git")); gitErr == nil {
+			return "", nil
+		}
 		parent := filepath.Dir(curr)
 		if parent == curr || stopDirs[curr] || stopDirs[parent] {
 			return "", nil

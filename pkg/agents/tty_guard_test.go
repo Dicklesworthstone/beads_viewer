@@ -138,6 +138,9 @@ func TestShouldSuppressTTYQueries_PositionalAndStructuredFormatForms(t *testing.
 		{"bv", "--as-of", "HEAD~1"},
 		{"bv", "--", "--robot-triage"},
 		{"bv", "--output", "report.md"},
+		{"bv", "--id-pattern", "-v"},
+		{"bv", "--search-mode", "-h"},
+		{"bv", "--history-since", "-v"},
 	}
 	for _, argv := range tuiCases {
 		if shouldSuppressTTYQueries(argv, false, false) {

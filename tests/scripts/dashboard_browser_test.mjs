@@ -1144,10 +1144,11 @@ async function suggestionVisibilityJourney(page) {
     const picks = await evaluate(page, `getTopKSet(${limit})`);
     assert.deepEqual(picks.items.map(i=>[i.issueId,i.marginal_gain,i.unblocked_issue_ids]), [['pick-root',1,['pick-child']]], 'missing prerequisite neither selected nor presumed completed');
     assert.equal(picks.total_gain, 1);
-    assert.equal(picks.open_nodes, 6, 'candidate count excludes the synthetic endpoint');
+    assert.equal(picks.open_nodes, 1, 'actionable candidate count selects only ready issues');
     const impact = await evaluate(page, `topWhatIf(${limit})`);
     assert.deepEqual(impact.map(i=>[i.issueId,i.result.transitive_unblocks]), [['pick-root',1]], 'top cascade limit is applied after candidate eligibility');
   }
+  assert.equal(await evaluate(page, `GRAPH_STATE.graph.topkSet(buildClosedSet(), 5, buildCandidateSet(false)).open_nodes`), 6, 'lifecycle candidate count excludes only the synthetic endpoint');
   assert.deepEqual(await evaluate(page, 'getTopKSet(0).items'), []);
   assert.deepEqual(await evaluate(page, 'topWhatIf(0)'), []);
   assert.deepEqual(await evaluate(page, 'getActionableIssues()'), ['pick-root']);
@@ -1326,6 +1327,11 @@ async function journey(page, mobile) {
   const acyclicGraphExtras = await evaluate(page, `(() => {
     const m = ${app}.forceGraphModule, g = m.getGraph();
     const zeroSlackIds = (${app}.criticalPathSlack || []).map(i => i.id).sort();
+    const flexibleSlackIds = (${app}.flexibleSlackIssues || []).map(i => i.id).sort();
+    const triageQuickWinIds = ${app}.getTriageQuickWins().map(i => i.id).sort();
+    const triageBlockerIds = ${app}.getTriageBlockersToClear().map(i => i.id).sort();
+    const triageByTrackLen = ${app}.getTriageRecommendationsByTrack().length;
+    const triageByLabelLen = ${app}.getTriageRecommendationsByLabel().length;
     const fmt0 = m.formatSlack(0), fmt1 = m.formatSlack(1), fmtOther = m.formatSlack(${JSON.stringify(acyclicMetrics.nodes['browser-other'].slack)});
     m.animateCriticalPath(false);
     const cpInit = m.getCriticalPathState();
@@ -1351,9 +1357,13 @@ async function journey(page, mobile) {
       return false;
     }).length;
     m.toggleHeatmap();
-    return { zeroSlackIds, fmt0, fmt1, fmtOther, cpInit, cpNext, cpPrev, cpReset, redLinks };
+    return { zeroSlackIds, flexibleSlackIds, triageQuickWinIds, triageBlockerIds, triageByTrackLen, triageByLabelLen, fmt0, fmt1, fmtOther, cpInit, cpNext, cpPrev, cpReset, redLinks };
   })()`);
   assert.deepEqual(acyclicGraphExtras.zeroSlackIds, ['browser-detail', 'browser-root'], 'acyclic Critical Path Slack populates active zero-slack nodes');
+  assert.deepEqual(acyclicGraphExtras.flexibleSlackIds, ['browser-other'], 'acyclic Critical Path Slack populates positive-float flexibleSlackIssues');
+  assert.deepEqual(acyclicGraphExtras.triageQuickWinIds, ['browser-other', 'browser-root'], 'getTriageQuickWins surfaces claimable triage.json quick_wins');
+  assert.deepEqual(acyclicGraphExtras.triageBlockerIds, ['browser-root'], 'getTriageBlockersToClear surfaces triage.json blockers_to_clear');
+  assert.ok(acyclicGraphExtras.triageByTrackLen > 0 && acyclicGraphExtras.triageByLabelLen > 0, `actionable triage.json populates By Track and By Label recommendation groups: ${JSON.stringify(acyclicGraphExtras)}`);
   assert.equal(acyclicGraphExtras.fmt0, '0 hops (critical)');
   assert.equal(acyclicGraphExtras.fmt1, '1 hop');
   assert.match(acyclicGraphExtras.fmtOther, /^\d+ hops?$/, 'positive topological slack formatted in hops');
@@ -1660,7 +1670,7 @@ async function capabilitiesJourney(page) {
       in_progress: 0.8,
       review: 0.8,
       hooked: 0.8,
-      pinned: 0.7,
+      pinned: 0.2,
       blocked: 0.5,
       deferred: 0.2,
       draft: 0.2,
@@ -2296,6 +2306,386 @@ async function capabilitiesJourney(page) {
   assert.equal(scopedShortcutAndHeatmapAudit.matrixOrigTruncated, false, '<=20 labels sets truncated=false');
   assert.equal(scopedShortcutAndHeatmapAudit.matrixOrigLen, 5, 'original 5-label capability dataset restored');
 
+  // 4c. Wave 14: Hash routing (#/graph <-> #/), Force-Graph light mode, container-scoped legend/tooltip,
+  // dependency_state blocked coloring, dependencyCone, Insights coverageSet + Tarjan SCC + mobile metric-tooltip + triageData sections,
+  // corpus-global MAX(blocks_count) hybrid impact, and exact-ID substring search.
+  await click(page, 'a[href="#/"]');
+  await waitFor(page, `${app}.view === 'dashboard'`, 'navigated to dashboard for Hero CTA hash routing check');
+  const dashboardTriageAudit = await evaluate(page, `(() => {
+    const suffix = window.beadsViewer.getViewerAssetQuerySuffix();
+    const resources = performance.getEntriesByType('resource').map(e => e.name);
+    return {
+      quickWinsLen: ${app}.getTriageQuickWins().length,
+      blockersIds: ${app}.getTriageBlockersToClear().map(i => i.id).sort(),
+      assetQuerySuffix: suffix,
+      wasmResourceHasSuffix: Boolean(suffix) && resources.some(u => u.includes('bv_graph_bg.wasm' + suffix)),
+    };
+  })()`);
+  assert.equal(dashboardTriageAudit.quickWinsLen, 0, 'capabilities-fixture has 0 claimable triage.json quick_wins because all open issues are blocked');
+  assert.deepEqual(dashboardTriageAudit.blockersIds, ['cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b'], 'triage.json blockers_to_clear populates all 4 cycle blockers');
+  assert.match(dashboardTriageAudit.assetQuerySuffix, /^\?v=[A-Za-z0-9._-]+$/, 'viewer.js exposes ?v= cache-busting query suffix');
+  assert.equal(dashboardTriageAudit.wasmResourceHasSuffix, true, 'bv_graph_bg.wasm fetched with ?v= cache-buster query suffix');
+
+  await evaluate(page, `[...document.querySelectorAll('div')].find(el => el.getAttribute('@click') === "window.location.hash = '#/graph'").click()`);
+  await waitFor(page, `window.location.hash === '#/graph' && ${app}.view === 'graph' && ${app}.forceGraphReady`, 'Hero Explore Graph CTA navigates via #/graph hash');
+  await click(page, 'button span', 'Back to Dashboard');
+  await waitFor(page, `window.location.hash === '#/' && ${app}.view === 'dashboard'`, 'Back to Dashboard resets hash to #/');
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `window.location.hash === '#/graph' && ${app}.view === 'graph' && ${app}.forceGraphReady`, 're-clicking top Graph nav fires hashchange cleanly');
+
+  const wave14GraphAudit = await evaluate(page, `(() => {
+    const m = ${app}.forceGraphModule;
+    const initialMode = m.getGraphTheme();
+    const initialBg = m.THEME.bg;
+    const initialLink = m.THEME.link.default;
+    ${app}.toggleDarkMode();
+    const toggledMode = m.getGraphTheme();
+    const toggledBg = m.THEME.bg;
+    const toggledLink = m.THEME.link.default;
+    const priorityP0AfterToggle = m.THEME.priority[0];
+    const blockedColorInToggledMode = m.getNodeColor({ id: 'synth-dep-blocked', status: 'open', blocker_count: 0, dependency_state: 'blocked_open', priority: 2 });
+    const expectedBlockedInToggled = m.THEME.status.blocked;
+    const openSatisfiedColorInToggled = m.getNodeColor({ id: 'synth-dep-sat', status: 'open', blocker_count: 0, dependency_state: 'satisfied', priority: 2 });
+    const expectedOpenInToggled = m.THEME.status.open;
+    ${app}.toggleDarkMode();
+    const restoredMode = m.getGraphTheme();
+    const restoredBg = m.THEME.bg;
+
+    const gdIssues = getGraphViewData().issues;
+    const hasDepState = gdIssues.every(i => typeof i.dependency_state === 'string' && i.dependency_state.length > 0 && typeof i.is_actionable === 'boolean');
+
+    m.setViewMode('galaxy');
+    const legendInContainer = document.querySelector('#graph-container > .bv-label-legend');
+    const legendInBody = document.querySelector('body > .bv-label-legend');
+    const tooltipInContainer = document.querySelector('#graph-container > .bv-graph-tooltip');
+    const tooltipInBody = document.querySelector('body > .bv-graph-tooltip');
+    const legendStyle = legendInContainer ? getComputedStyle(legendInContainer) : null;
+    const legendPos = legendStyle?.position || '';
+    const legendZ = legendStyle?.zIndex || '';
+    m.setViewMode('force');
+
+    const rootNode = m.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
+    m.selectNode(rootNode);
+
+    return {
+      initialMode,
+      initialBg,
+      initialLink,
+      toggledMode,
+      toggledBg,
+      toggledLink,
+      restoredMode,
+      restoredBg,
+      priorityP0AfterToggle,
+      blockedColorInToggledMode,
+      expectedBlockedInToggled,
+      openSatisfiedColorInToggled,
+      expectedOpenInToggled,
+      hasDepState,
+      legendScoped: Boolean(legendInContainer) && !legendInBody,
+      tooltipScoped: !tooltipInBody && Boolean(tooltipInContainer || true),
+      legendPos,
+      legendZ,
+    };
+  })()`);
+  assert.ok((wave14GraphAudit.initialMode === 'dark' || wave14GraphAudit.initialMode === 'light') && wave14GraphAudit.initialMode !== wave14GraphAudit.toggledMode,
+    `toggleDarkMode switches graph.js theme palette: ${JSON.stringify(wave14GraphAudit)}`);
+  assert.notEqual(wave14GraphAudit.initialBg, wave14GraphAudit.toggledBg, 'toggleDarkMode switches THEME.bg between dark and light palettes');
+  assert.notEqual(wave14GraphAudit.initialLink, wave14GraphAudit.toggledLink, 'toggleDarkMode switches THEME.link.default between dark and light palettes');
+  assert.equal(wave14GraphAudit.restoredMode, wave14GraphAudit.initialMode, 'second toggleDarkMode restores original graph theme');
+  assert.equal(wave14GraphAudit.restoredBg, wave14GraphAudit.initialBg, 'second toggleDarkMode restores original THEME.bg');
+  assert.equal(wave14GraphAudit.priorityP0AfterToggle, '#FF0000', 'THEME.priority[0] stays invariant across graph theme switches');
+  assert.equal(wave14GraphAudit.blockedColorInToggledMode, wave14GraphAudit.expectedBlockedInToggled, 'open node with non-satisfied dependency_state colors as blocked even if blocker_count=0');
+  assert.equal(wave14GraphAudit.openSatisfiedColorInToggled, wave14GraphAudit.expectedOpenInToggled, 'open satisfied node colors as open');
+  assert.equal(wave14GraphAudit.hasDepState, true, 'getGraphViewData includes dependency_state and is_actionable');
+  assert.equal(wave14GraphAudit.legendScoped, true, '.bv-label-legend mounts inside #graph-container and never leaks onto document.body');
+  assert.equal(wave14GraphAudit.tooltipScoped, true, '.bv-graph-tooltip never mounts onto document.body');
+  assert.equal(wave14GraphAudit.legendPos, 'absolute', '.bv-label-legend uses position: absolute inside #graph-container');
+  assert.equal(wave14GraphAudit.legendZ, '25', '.bv-label-legend uses scoped z-index: 25');
+
+  await waitFor(page, `${app}.graphDetailNode?.id === 'cap-auth-root'`, 'cap-auth-root selected for modal-open & Focus Cone checks');
+  assert.equal(await evaluate(page, `document.body.classList.contains('modal-open')`), true, 'selecting graph node sets body.modal-open');
+  // [C-3] Leaving #/graph while graphDetailNode is open must clear graphDetailNode & body.modal-open!
+  await click(page, 'button span', 'Back to Dashboard');
+  await waitFor(page, `window.location.hash === '#/' && ${app}.view === 'dashboard'`, 'Back to Dashboard from open graphDetailNode');
+  assert.equal(await evaluate(page, `document.body.classList.contains('modal-open')`), false, 'leaving #/graph clears body.modal-open');
+  assert.equal(await evaluate(page, `${app}.graphDetailNode`), null, 'leaving #/graph resets graphDetailNode to null');
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `window.location.hash === '#/graph' && ${app}.view === 'graph' && ${app}.forceGraphReady`, 'returned to #/graph for Focus Cone checks');
+  await evaluate(page, `(() => {
+    const m = ${app}.forceGraphModule;
+    const rootNode = m.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
+    m.selectNode(rootNode);
+  })()`);
+  await waitFor(page, `${app}.graphDetailNode?.id === 'cap-auth-root'`, 're-selected cap-auth-root for Focus Cone check');
+
+  await click(page, '#graph-focus-cone-btn');
+  await waitFor(page, `${app}.dependencyConeActive === true && ${app}.dependencyConeFocusId === 'cap-auth-root'`, 'Focus Cone button isolates transitive dependency cone');
+  const coneState = await evaluate(page, `({
+    count: ${app}.dependencyConeCount,
+    hudVisible: (${visible})(document.getElementById('graph-dependency-cone-hud')),
+    coneIds: ${app}.forceGraphModule.getDependencyConeState().nodeIds.sort(),
+  })`);
+  assert.ok(coneState.count >= 3 && coneState.hudVisible, `dependencyCone highlights transitive cone and HUD: ${JSON.stringify(coneState)}`);
+  assert.deepEqual(coneState.coneIds, ['cap-auth-root', 'cap-auth-ui', 'cap-hub-leaf'], 'cap-auth-root dependency cone isolates auth cycle + downstream telemetry hub');
+
+  // [C-6] Selecting another node, clearSelection, performWhatIf, and toggleCycleNavigator must each clear dependencyCone!
+  const coneResetAudit = await evaluate(page, `(() => {
+    const m = ${app}.forceGraphModule;
+    const nodes = m.getGraph().graphData().nodes;
+    const rootNode = nodes.find(n => n.id === 'cap-auth-root');
+    const uiNode = nodes.find(n => n.id === 'cap-auth-ui');
+
+    m.selectNode(uiNode);
+    const clearedBySelect = !m.getDependencyConeState().active && !${app}.dependencyConeActive && !rootNode._coneFocus;
+
+    m.focusDependencyCone('cap-auth-ui', false);
+    const activeBeforeClear = m.getDependencyConeState().active;
+    m.clearSelection();
+    const clearedByClearSelection = activeBeforeClear && !m.getDependencyConeState().active && !${app}.dependencyConeActive && !uiNode._coneFocus;
+
+    m.focusDependencyCone('cap-auth-root', false);
+    m.performWhatIf(rootNode);
+    const clearedByWhatIf = !m.getDependencyConeState().active && !${app}.dependencyConeActive;
+    m.resetWhatIf();
+
+    m.focusDependencyCone('cap-auth-root', false);
+    m.toggleCycleNavigator();
+    const clearedByCycleNav = !m.getDependencyConeState().active && !${app}.dependencyConeActive;
+    m.resetCycleNavigator();
+
+    return { clearedBySelect, clearedByClearSelection, clearedByWhatIf, clearedByCycleNav };
+  })()`);
+  assert.deepEqual(coneResetAudit, {
+    clearedBySelect: true,
+    clearedByClearSelection: true,
+    clearedByWhatIf: true,
+    clearedByCycleNav: true,
+  }, 'selectNode, clearSelection, performWhatIf, and toggleCycleNavigator all clear dependencyCone cleanly');
+
+  await evaluate(page, `(() => {
+    const m = ${app}.forceGraphModule;
+    m.selectNode(m.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root'));
+    m.focusDependencyCone('cap-auth-root', false);
+  })()`);
+  await key(page, 'Escape');
+  await waitFor(page, `${app}.dependencyConeActive === false && !${app}.graphDetailNode`, 'Escape clears dependency cone and selection');
+
+  await click(page, 'a[href="#/insights"]');
+  await waitFor(page, `${app}.view === 'insights'`, 'navigated to insights for Wave 14/15 WASM & triage checks');
+  const insightsWave14Audit = await evaluate(page, `(async () => {
+    const cov = ${app}.coverageSet;
+    const cyc = ${app}.cycleInfo;
+    const covCardVisible = (${visible})(document.getElementById('dependency-coverage-set-card'));
+
+    // [C-6] getCoverageSet() must NEVER fall back to closed GRAPH_STATE.graph when activeGraph has 0 edges
+    const savedActiveGraph = GRAPH_STATE.activeGraph;
+    const emptyActive = new window.bvGraphWasm.DiGraph();
+    emptyActive.addNode('isolated-active');
+    GRAPH_STATE.activeGraph = emptyActive;
+    const emptyCov = getCoverageSet(10);
+    GRAPH_STATE.activeGraph = savedActiveGraph;
+    emptyActive.free();
+
+    // [C-5] 1-node self-loop in WASM DiGraph + max_cycles=0 truncated semantics
+    const selfG = new window.bvGraphWasm.DiGraph();
+    const uSelf = selfG.addNode('self-1');
+    selfG.addEdge(uSelf, uSelf);
+    const selfHasCycles = selfG.hasCycles();
+    const selfTarjan = selfG.tarjanScc();
+    const selfEnum5 = selfG.enumerateCycles(5);
+    const selfEnum5Ids = (selfEnum5?.cycles || []).map(c => c.map(idx => selfG.nodeId(idx)));
+    const selfEnum0 = selfG.enumerateCycles(0);
+    const selfSuggest = selfG.cycleBreakSuggestions(5, 20);
+    selfG.free();
+
+    const dagG = new window.bvGraphWasm.DiGraph();
+    const dA = dagG.addNode('dag-a');
+    const dB = dagG.addNode('dag-b');
+    dagG.addEdge(dA, dB);
+    const dagEnum0 = dagG.enumerateCycles(0);
+    dagG.free();
+
+    // Mobile/click .metric-tooltip toggle inside Critical Path Slack
+    const trigger = document.querySelector('.metric-tooltip-trigger');
+    const tip = trigger?.querySelector('.metric-tooltip');
+    trigger?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    const tipOpened = Boolean(tip?.classList.contains('tooltip-visible'));
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    const tipClosedOnOutsideClick = !tip?.classList.contains('tooltip-visible');
+
+    // [C-2] capabilities-fixture has 0 actionable items -> triage.json must NOT run unscoped fallback!
+    const byTrackLen = ${app}.getTriageRecommendationsByTrack().length;
+    const byLabelLen = ${app}.getTriageRecommendationsByLabel().length;
+
+    const origRecs = ${app}.triageData?.recommendations;
+    const origByTrack = ${app}.triageData?.recommendations_by_track;
+    const origByLabel = ${app}.triageData?.recommendations_by_label;
+    const origAuth = ${app}.triageData?.source_authority;
+    let copiedCmd = '';
+    let tabAfterTrack = '';
+    let tabAfterLabel = '';
+    let bannerShownWhenProvisional = false;
+    let claimHiddenWhenProvisional = false;
+    let showKeptWhenProvisional = false;
+    let helperOmitsClaimWhenProvisional = false;
+    if (${app}.triageData) {
+      ${app}.triageData.recommendations = [{
+        id: 'cap-auth-root',
+        title: 'OAuth login gateway',
+        score: 0.91,
+        priority: 0,
+        status: 'open',
+        actions: {
+          claim: { shell: 'br update cap-auth-root --status in_progress' },
+          show: { shell: 'br show cap-auth-root --json' },
+        },
+      }];
+      ${app}.triageData.recommendations_by_track = [{
+        track_id: 'track-A',
+        reason: 'Auth cycle track',
+        claim_command: 'br update cap-auth-root --status in_progress',
+        top_pick: { id: 'cap-auth-root', title: 'OAuth login gateway', score: 0.91, priority: 0 },
+      }];
+      ${app}.triageData.recommendations_by_label = [{
+        label: 'backend',
+        claim_command: 'br update cap-auth-root --status in_progress',
+        top_pick: { id: 'cap-auth-root', title: 'OAuth login gateway', score: 0.91, priority: 0 },
+      }];
+      await new Promise(r => setTimeout(r, 30));
+
+      document.querySelector('[data-rec-tab="track"]')?.click();
+      tabAfterTrack = ${app}.triageRecView;
+      document.querySelector('[data-rec-tab="label"]')?.click();
+      tabAfterLabel = ${app}.triageRecView;
+      document.querySelector('[data-rec-tab="top"]')?.click();
+      await new Promise(r => setTimeout(r, 30));
+
+      const cmdBtn = document.querySelector('[data-rec-claim-cmd]');
+      cmdBtn?.click();
+      await new Promise(r => setTimeout(r, 30));
+      copiedCmd = ${app}.copiedCommandText || '';
+
+      // Provisional source_authority warning banner + Claim button suppression check
+      ${app}.triageData.source_authority = { state: 'provisional_jsonl', claim_safe: false };
+      await new Promise(r => setTimeout(r, 30));
+      bannerShownWhenProvisional = (${visible})(document.querySelector('[data-source-authority-banner="insights"]'));
+      claimHiddenWhenProvisional = !(${visible})(document.querySelector('[data-rec-claim-cmd]'));
+      showKeptWhenProvisional = (${visible})(document.querySelector('[data-rec-show-cmd]'));
+      const cmdsUnderProvisional = ${app}.getIssueActionCommands('cap-auth-root');
+      helperOmitsClaimWhenProvisional = !cmdsUnderProvisional?.claim && Boolean(cmdsUnderProvisional?.show?.shell);
+
+      ${app}.triageData.recommendations = origRecs;
+      ${app}.triageData.recommendations_by_track = origByTrack;
+      ${app}.triageData.recommendations_by_label = origByLabel;
+      ${app}.triageData.source_authority = origAuth;
+      await new Promise(r => setTimeout(r, 30));
+    }
+
+    return {
+      covTotalEdges: cov?.total_edges || 0,
+      covRatio: cov?.coverage_ratio || 0,
+      covItemsLen: cov?.items?.length || 0,
+      covCardVisible,
+      emptyCov,
+      selfLoop: {
+        hasCycles: selfHasCycles,
+        cycleCount: selfTarjan?.cycle_count,
+        cycles5: selfEnum5Ids,
+        trunc5: selfEnum5?.truncated,
+        trunc0: selfEnum0?.truncated,
+        firstSuggestion: selfSuggest?.suggestions?.[0] ? [selfSuggest.suggestions[0].from_id, selfSuggest.suggestions[0].to_id] : null,
+        dagTrunc0: dagEnum0?.truncated,
+      },
+      sccCount: cyc?.sccCount || 0,
+      nonTrivialSccCount: cyc?.nonTrivialSccCount || 0,
+      largestSccSize: cyc?.largestSccSize || 0,
+      cycTruncated: cyc?.truncated,
+      tipOpened,
+      tipClosedOnOutsideClick,
+      byTrackLen,
+      byLabelLen,
+      copiedCmd,
+      tabAfterTrack,
+      tabAfterLabel,
+      bannerShownWhenProvisional,
+      claimHiddenWhenProvisional,
+      showKeptWhenProvisional,
+      helperOmitsClaimWhenProvisional,
+    };
+  })()`);
+  assert.ok(insightsWave14Audit.covTotalEdges > 0 && insightsWave14Audit.covRatio > 0 && insightsWave14Audit.covItemsLen > 0 && insightsWave14Audit.covCardVisible,
+    `Dependency Coverage Set card renders WASM coverageSetDefault: ${JSON.stringify(insightsWave14Audit)}`);
+  assert.deepEqual(
+    [insightsWave14Audit.emptyCov.items.length, insightsWave14Audit.emptyCov.edgesCovered, insightsWave14Audit.emptyCov.totalEdges, insightsWave14Audit.emptyCov.coverageRatio],
+    [0, 0, 0, 1],
+    'getCoverageSet() never falls back to closed GRAPH_STATE.graph when activeGraph has 0 edges'
+  );
+  assert.deepEqual(insightsWave14Audit.selfLoop, {
+    hasCycles: true,
+    cycleCount: 1,
+    cycles5: [['self-1']],
+    trunc5: false,
+    trunc0: true,
+    firstSuggestion: ['self-1', 'self-1'],
+    dagTrunc0: false,
+  }, 'WASM DiGraph detects 1-node self-loop cycle, suggests self-edge break, and sets truncated accurately for max_cycles=0');
+  assert.equal(insightsWave14Audit.nonTrivialSccCount, 2, 'Tarjan SCC reports 2 non-trivial active cycle SCCs');
+  assert.equal(insightsWave14Audit.largestSccSize, 2, 'Tarjan SCC reports largest SCC size = 2');
+  assert.equal(insightsWave14Audit.cycTruncated, false, 'exact cycle count <= max_cycles sets truncated=false');
+  assert.equal(insightsWave14Audit.tipOpened, true, 'clicking .metric-tooltip-trigger toggles .tooltip-visible for coarse/touch pointers');
+  assert.equal(insightsWave14Audit.tipClosedOnOutsideClick, true, 'outside click closes .metric-tooltip');
+  assert.equal(insightsWave14Audit.byTrackLen, 0, '0-actionable capabilities-fixture does not leak unscoped By Track fallback');
+  assert.equal(insightsWave14Audit.byLabelLen, 0, '0-actionable capabilities-fixture does not leak unscoped By Label fallback');
+  assert.equal(insightsWave14Audit.tabAfterTrack, 'track');
+  assert.equal(insightsWave14Audit.tabAfterLabel, 'label');
+  assert.ok(insightsWave14Audit.copiedCmd.includes('br '), `clicking recommendation command badge copies shell command: ${insightsWave14Audit.copiedCmd}`);
+  assert.equal(insightsWave14Audit.bannerShownWhenProvisional, true, 'provisional source_authority (claim_safe=false) displays warning banner');
+  assert.equal(insightsWave14Audit.claimHiddenWhenProvisional, true, 'provisional source_authority hides Claim button');
+  assert.equal(insightsWave14Audit.showKeptWhenProvisional, true, 'provisional source_authority keeps Show button');
+  assert.equal(insightsWave14Audit.helperOmitsClaimWhenProvisional, true, 'getIssueActionCommands omits claim when hasProvisionalSourceAuthority()');
+
+  // Corpus-global MAX(blocks_count) hybrid impact normalization, [C-1] template/pinned hybrid status parity, & exact-ID substring search.
+  await click(page, 'a[href="#/issues"]');
+  await waitFor(page, `${app}.view === 'issues'`, 'returned to issues for Wave 14/15 hybrid impact & exact-ID search check');
+  await evaluate(page, `(() => {
+    const sel = [...document.querySelectorAll('select[x-model="searchMode"]')].find(${visible});
+    sel.value = 'hybrid';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await search(page, 'zircon-design-arch-v2');
+  await resultIDs(page, ['cap-auth-ui']);
+  const globalImpactRatio = await evaluate(page, `${app}.issues[0]?.component_scores?.impact`);
+  assert.ok(Math.abs(globalImpactRatio - 0.5) < 1e-9, `single-result hybrid search normalizes blocks_count=1 against corpus MAX(blocks_count)=2 -> 0.5, got ${globalImpactRatio}`);
+  const hybridStatusParityAudit = await evaluate(page, `(() => {
+    const weights = typeof HYBRID_PRESETS !== 'undefined' ? HYBRID_PRESETS.default : { text: 0.4, pagerank: 0.2, status: 0.15, impact: 0.1, priority: 0.1, recency: 0.05 };
+    const rows = [
+      { id: 'tmpl-row', textScore: 0.5, pagerank: 0.5, status: 'open', is_template: 1, blockerCount: 1, priority: 1, updatedAt: '2026-09-04T12:00:00Z' },
+      { id: 'pinned-flag-row', textScore: 0.5, pagerank: 0.5, status: 'open', pinned: 1, blockerCount: 1, priority: 1, updatedAt: '2026-09-04T12:00:00Z' },
+      { id: 'pinned-status-row', textScore: 0.5, pagerank: 0.5, status: 'pinned', blockerCount: 1, priority: 1, updatedAt: '2026-09-04T12:00:00Z' },
+      { id: 'future-defer-row', textScore: 0.5, pagerank: 0.5, status: 'open', defer_until: '2099-01-01T00:00:00Z', blockerCount: 1, priority: 1, updatedAt: '2026-09-04T12:00:00Z' },
+    ];
+    const rankedJs = new HybridScorer(weights, { maxBlockerCount: 4 }).scoreAndRank(rows);
+    const rankedBatch = window.scoreBatchHybrid(rows, weights, { maxBlockerCount: 4 });
+    const mvCols = execQuery("PRAGMA table_info(issue_overview_mv)").map(c => c.name);
+    return {
+      jsStatuses: rankedJs.map(r => r.component_scores.status),
+      batchStatuses: rankedBatch.map(r => r.component_scores.status),
+      batchImpacts: rankedBatch.map(r => r.component_scores.impact),
+      hasTemplateCol: mvCols.includes('is_template'),
+      hasPinnedCol: mvCols.includes('pinned'),
+    };
+  })()`);
+  assert.deepEqual(hybridStatusParityAudit.jsStatuses, [0.2, 0.2, 0.2, 0.2], 'HybridScorer normalizes is_template, pinned, status=pinned, and future defer_until to 0.2');
+  assert.deepEqual(hybridStatusParityAudit.batchStatuses, [0.2, 0.2, 0.2, 0.2], 'scoreBatchHybrid normalizes is_template, pinned, status=pinned, and future defer_until to 0.2');
+  assert.deepEqual(hybridStatusParityAudit.batchImpacts, [0.25, 0.25, 0.25, 0.25], 'scoreBatchHybrid honors maxBlockerCount=4');
+  assert.equal(hybridStatusParityAudit.hasTemplateCol, true, 'issue_overview_mv exports is_template column');
+  assert.equal(hybridStatusParityAudit.hasPinnedCol, true, 'issue_overview_mv exports pinned column');
+  await search(page, 'cap-closed-prereq');
+  await waitFor(page, `${app}.issues[0]?.id === 'cap-closed-prereq' && ${app}.issues[0]?.text_score === 1`, 'exact closed issue ID recalled #1 with text_score=1.0 in !supportsFTS5 substring mode');
+  await search(page, '');
+  await resultIDs(page, allCapIDs);
+
   // 5. Error Modal runErrorAction(action) recovery handler ({ action }, { handler }, { url }).
   await evaluate(page, `(() => {
     window.__errorRecovered = [];
@@ -2552,6 +2942,23 @@ async function standaloneGraphJourney(page) {
   assert.equal(recentAndPathAudit.billingColorAfterOff, '#ef4444', 'un-dimmed blocked cycle node restores full STATUS_COLORS.blocked');
   assert.equal(recentAndPathAudit.recentClosedAfterReset, true, '#btn-reset closes #recent-panel and clears .active on #btn-recent');
   assert.equal(recentAndPathAudit.allVisibleAfterReset, 6, '#btn-reset restores all 6 nodes');
+
+  const standaloneThemeAndMenuAudit = await evaluate(page, `(() => {
+    const sampleLink = Graph.graphData().links.find(l => !l.critical) || Graph.graphData().links[0];
+    const darkLinkColor = computeLinkColor(sampleLink);
+    toggleLightMode();
+    const lightLinkColor = computeLinkColor(sampleLink);
+    toggleLightMode();
+    const hub = Graph.graphData().nodes[0];
+    showContextMenu(hub, { clientX: 99999, clientY: 99999 });
+    const menu = document.getElementById('context-menu');
+    const rect = menu.getBoundingClientRect();
+    const clampedInsideViewport = rect.right <= window.innerWidth && rect.bottom <= window.innerHeight && rect.left >= 0 && rect.top >= 0;
+    hideContextMenu();
+    return { darkLinkColor, lightLinkColor, clampedInsideViewport };
+  })()`);
+  assert.notEqual(standaloneThemeAndMenuAudit.darkLinkColor, standaloneThemeAndMenuAudit.lightLinkColor, 'standalone graph switches default link color in light mode');
+  assert.equal(standaloneThemeAndMenuAudit.clampedInsideViewport, true, 'standalone graph clamps #context-menu inside viewport bounds');
 
   await capture(page, 'standalone-graph');
   clean(page);

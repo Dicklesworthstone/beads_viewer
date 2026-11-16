@@ -180,7 +180,11 @@ func (m *Model) renderSprintDashboard() string {
 	// --robot-burndown reports (analysis.DetectAtRisk), so the TUI and robot agree.
 	sb.WriteString(labelStyle.Render("At Risk:"))
 	sb.WriteString("\n")
-	atRisk := analysis.DetectAtRisk(scopedIssues, sprint, now, m.sprintAtRiskThresholds)
+	var sprintReadiness *model.ReadinessIndex
+	if m.analyzer != nil {
+		sprintReadiness = m.analyzer.Readiness()
+	}
+	atRisk := analysis.DetectAtRiskWithReadiness(scopedIssues, sprint, sprintReadiness, now, m.sprintAtRiskThresholds)
 	if len(atRisk) == 0 {
 		sb.WriteString(t.Renderer.NewStyle().Foreground(t.Open).Render("  ✓ No at-risk items"))
 		sb.WriteString("\n")

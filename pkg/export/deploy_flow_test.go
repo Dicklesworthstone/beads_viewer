@@ -98,13 +98,14 @@ exit 0
 		t.Fatalf("WriteFile gh_authed: %v", err)
 	}
 
-	// Provide a minimal global git identity without touching the real user config.
-	gitConfigPath := filepath.Join(t.TempDir(), "gitconfig")
+	// Provide a minimal global git identity via isolated HOME (loader.SanitizedGitEnv strips GIT_CONFIG_*).
+	tmpHome := t.TempDir()
+	gitConfigPath := filepath.Join(tmpHome, ".gitconfig")
 	if err := os.WriteFile(gitConfigPath, []byte("[user]\n\tname = Test User\n\temail = test@example.com\n"), 0644); err != nil {
 		t.Fatalf("WriteFile gitconfig: %v", err)
 	}
-	t.Setenv("GIT_CONFIG_GLOBAL", gitConfigPath)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpHome, ".config"))
 
 	withStdin(t, "y\n", func() {
 		_, err := DeployToGitHubPages(GitHubDeployConfig{
@@ -231,13 +232,14 @@ exit 0
 	t.Setenv("PATH", fmt.Sprintf("%s%c%s", binDir, os.PathListSeparator, origPath))
 	t.Setenv("BV_TEST_STATE_DIR", stateDir)
 
-	// Force "git identity not configured" without touching the real user config.
-	gitConfigPath := filepath.Join(t.TempDir(), "gitconfig")
+	// Force "git identity not configured" via isolated HOME (loader.SanitizedGitEnv strips GIT_CONFIG_*).
+	tmpHome := t.TempDir()
+	gitConfigPath := filepath.Join(tmpHome, ".gitconfig")
 	if err := os.WriteFile(gitConfigPath, []byte(""), 0644); err != nil {
 		t.Fatalf("WriteFile gitconfig: %v", err)
 	}
-	t.Setenv("GIT_CONFIG_GLOBAL", gitConfigPath)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("HOME", tmpHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpHome, ".config"))
 
 	// Ensure git isn't reading repo-local config from the test workspace.
 	cwd, err := os.Getwd()

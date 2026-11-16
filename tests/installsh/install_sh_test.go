@@ -551,11 +551,40 @@ try_go_install() { echo "UNEXPECTED_SOURCE_FALLBACK" >&2; return 0; }`
 func TestGitHubAPIGetForwardsAuthTokenAndSourceBuildScrubsEnv(t *testing.T) {
 	setup := `
 curl() {
-    printf '%s\n' "$@"
+    case " $* " in
+        *"ghs_test_token"*) echo "token leaked in argv: $*" >&2; return 99 ;;
+    esac
+    case " $* " in
+        *" -K - "*) cat ;;
+        *) printf 'unauthenticated:%s\n' "$*" ;;
+    esac
 }`
 	out, stderr, code := runInstallFunc(t, []string{"GITHUB_TOKEN=ghs_test_token"}, setup, `get_latest_release`, "")
 	if code != 0 || !strings.Contains(out, "Authorization: Bearer ghs_test_token") {
-		t.Fatalf("expected Authorization header when GITHUB_TOKEN is set: exit=%d out=%q stderr=%s", code, out, stderr)
+		t.Fatalf("expected Authorization header via stdin (-K -) when GITHUB_TOKEN is set: exit=%d out=%q stderr=%s", code, out, stderr)
+	}
+
+	// Expired/rejected token (curl -K - fails) falls back cleanly to unauthenticated request.
+	expiredSetup := `
+curl() {
+    case " $* " in
+        *" -K - "*) cat >/dev/null; return 22 ;;
+        *) printf '{"tag_name":"v0.26.0"}\n'; return 0 ;;
+    esac
+}`
+	out, stderr, code = runInstallFunc(t, []string{"GITHUB_TOKEN=expired_token"}, expiredSetup, `get_latest_release`, "")
+	if code != 0 || !strings.Contains(out, `"tag_name":"v0.26.0"`) {
+		t.Fatalf("expected unauthenticated fallback when GITHUB_TOKEN returns 401: exit=%d out=%q stderr=%s", code, out, stderr)
+	}
+
+	// main() without --from-source refuses to fall back to try_go_install when try_binary_install fails.
+	noFallbackSetup := `
+detect_platform() { printf 'linux_amd64\n'; }
+try_binary_install() { return 1; }
+try_go_install() { echo "UNEXPECTED_GO_INSTALL" >&2; return 0; }`
+	out, stderr, code = runInstallFunc(t, []string{"INSTALL_DIR=" + t.TempDir()}, noFallbackSetup, `main`, "")
+	if code == 0 || strings.Contains(out+stderr, "UNEXPECTED_GO_INSTALL") {
+		t.Fatalf("expected main() without --from-source to fail closed without try_go_install: exit=%d out=%q stderr=%s", code, out, stderr)
 	}
 
 	dir := t.TempDir()
@@ -569,7 +598,7 @@ curl() {
 	srcSetup := `
 ensure_go() { printf '1.26.11'; }
 make_tmp_dir() { printf '%s\n' "$BUILD_FIXTURE"; }
-git() { mkdir -p "$5/vendor"; printf 'module example.test/bv\ngo 1.26.11\n' > "$5/go.mod"; }
+git() { mkdir -p "$5/vendor"; printf '# vendor\n' > "$5/vendor/modules.txt"; printf 'module example.test/bv\ngo 1.26.11\n' > "$5/go.mod"; }
 go() {
     if [ "$1" = version ] && [ "$2" = -m ]; then
         printf '%s: go1.26.11\n' "$3"

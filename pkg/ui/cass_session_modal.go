@@ -40,6 +40,7 @@ type CassSessionModal struct {
 	searchCmd  string   // Command to run for more results
 	theme      Theme
 	width      int
+	termWidth  int
 	height     int
 	copied     bool      // Flash feedback for clipboard copy
 	copiedAt   time.Time // When copy happened
@@ -114,9 +115,21 @@ func (m CassSessionModal) Update(msg tea.Msg) (CassSessionModal, tea.Cmd) {
 	return m, nil
 }
 
+func (m CassSessionModal) effectiveWidth() int {
+	modalWidth := m.width
+	if modalWidth <= 0 {
+		modalWidth = 70
+	}
+	if m.termWidth > 0 {
+		modalWidth = min(modalWidth, max(24, m.termWidth-4))
+	}
+	return modalWidth
+}
+
 // View renders the modal.
 func (m CassSessionModal) View() string {
 	r := m.theme.Renderer
+	modalWidth := m.effectiveWidth()
 
 	// Check if copy flash should be shown (within 2 seconds of copy)
 	showCopied := m.copied && time.Since(m.copiedAt) <= 2*time.Second
@@ -126,7 +139,7 @@ func (m CassSessionModal) View() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Primary).
 		Padding(1, 2).
-		Width(m.width)
+		Width(modalWidth)
 
 	// Header style
 	headerStyle := r.NewStyle().
@@ -153,7 +166,7 @@ func (m CassSessionModal) View() string {
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(m.theme.Border).
 		Padding(0, 1).
-		Width(m.width - 10)
+		Width(max(14, modalWidth-10))
 
 	footerStyle := r.NewStyle().
 		Foreground(ColorFooterHint).
@@ -273,7 +286,7 @@ func (m CassSessionModal) formatSnippet(snippet string) string {
 			continue
 		}
 		// Truncate long lines (UTF-8 safe)
-		maxLineLen := m.width - 14 // Account for box padding
+		maxLineLen := max(10, m.effectiveWidth()-14) // Account for box padding
 		line = truncateRunesHelper(line, maxLineLen, "...")
 		cleaned = append(cleaned, line)
 		if len(cleaned) >= 3 {
@@ -338,6 +351,7 @@ func (m *CassSessionModal) SetSize(width, height int) {
 		maxWidth = 80
 	}
 	m.width = maxWidth
+	m.termWidth = width
 	m.height = height
 }
 
@@ -348,6 +362,9 @@ func (m CassSessionModal) HasSessions() bool {
 
 // CenterModal returns the modal view centered in the given dimensions.
 func (m CassSessionModal) CenterModal(termWidth, termHeight int) string {
+	if termWidth > 0 {
+		m.termWidth = termWidth
+	}
 	modal := m.View()
 
 	// Get actual rendered dimensions

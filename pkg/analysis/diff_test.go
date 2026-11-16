@@ -654,3 +654,98 @@ func TestSnapshot_ComputeScopedCounts(t *testing.T) {
 		t.Fatalf("scoped BlockedCount = %d, want 2 (SCOPED-DEP-BLOCKED + SCOPED-STATUS-BLOCKED; parked/deferred/withheld excluded)", subSnap.BlockedCount)
 	}
 }
+
+func TestDiffDetectsScheduleAndEstimateMutations(t *testing.T) {
+	t1 := time.Date(2026, 11, 20, 15, 30, 0, 123456789, time.UTC)
+	t2 := time.Date(2026, 11, 25, 9, 0, 0, 0, time.UTC)
+	ist := time.FixedZone("IST", 5*3600+1800)
+	t1IST := t1.In(ist)
+	zeroTime := time.Time{}
+
+	est45 := 45
+	est90 := 90
+	est60A := 60
+	est60B := 60
+	refGH := "GH-42"
+	refJira := "JIRA-99"
+	emptyRef := ""
+
+	from := NewSnapshot([]model.Issue{
+		{
+			ID:               "MUTATED-1",
+			Title:            "Schedule & estimate tracked",
+			Status:           model.StatusOpen,
+			Priority:         2,
+			DeferUntil:       nil,
+			DueDate:          &t1,
+			EstimatedMinutes: &est45,
+			ExternalRef:      &refGH,
+		},
+		{
+			ID:               "UNCHANGED-CTRL",
+			Title:            "Equivalent representations",
+			Status:           model.StatusOpen,
+			Priority:         2,
+			DeferUntil:       &t1,
+			DueDate:          nil,
+			EstimatedMinutes: &est60A,
+			ExternalRef:      nil,
+		},
+	})
+
+	to := NewSnapshot([]model.Issue{
+		{
+			ID:               "MUTATED-1",
+			Title:            "Schedule & estimate tracked",
+			Status:           model.StatusOpen,
+			Priority:         2,
+			DeferUntil:       &t2,
+			DueDate:          nil,
+			EstimatedMinutes: &est90,
+			ExternalRef:      &refJira,
+		},
+		{
+			ID:               "UNCHANGED-CTRL",
+			Title:            "Equivalent representations",
+			Status:           model.StatusOpen,
+			Priority:         2,
+			DeferUntil:       &t1IST,    // same UTC instant in different timezone
+			DueDate:          &zeroTime, // zero time equivalent to nil
+			EstimatedMinutes: &est60B,   // distinct pointer with identical value
+			ExternalRef:      &emptyRef, // empty string equivalent to nil
+		},
+	})
+
+	diff := CompareSnapshots(from, to)
+	if len(diff.ModifiedIssues) != 1 {
+		t.Fatalf("ModifiedIssues = %+v, want exactly [MUTATED-1] (UNCHANGED-CTRL must produce 0 diffs)", diff.ModifiedIssues)
+	}
+	mod := diff.ModifiedIssues[0]
+	if mod.IssueID != "MUTATED-1" {
+		t.Fatalf("ModifiedIssues[0].IssueID = %q, want MUTATED-1", mod.IssueID)
+	}
+
+	byField := make(map[string]FieldChange, len(mod.Changes))
+	for _, ch := range mod.Changes {
+		byField[ch.Field] = ch
+	}
+
+	wantChanges := map[string][2]string{
+		"defer_until":       {"", t2.UTC().Format(time.RFC3339Nano)},
+		"due_date":          {t1.UTC().Format(time.RFC3339Nano), ""},
+		"estimated_minutes": {"45", "90"},
+		"external_ref":      {"GH-42", "JIRA-99"},
+	}
+	if len(byField) != len(wantChanges) {
+		t.Fatalf("Changes = %+v, want %d fields", mod.Changes, len(wantChanges))
+	}
+	for field, want := range wantChanges {
+		got, ok := byField[field]
+		if !ok {
+			t.Fatalf("missing FieldChange for %q in %+v", field, mod.Changes)
+		}
+		if got.OldValue != want[0] || got.NewValue != want[1] {
+			t.Fatalf("FieldChange[%s] = (%q -> %q), want (%q -> %q)", field, got.OldValue, got.NewValue, want[0], want[1])
+		}
+	}
+}

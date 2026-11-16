@@ -27,6 +27,7 @@ type IssueDelegate struct {
 	MetricNames       []string
 	MetricValues      map[string]map[string]float64
 	BlockerCounts     map[string]int
+	ReferenceNow      time.Time
 }
 
 // IssueGroupItem is a navigable header in the existing issue list. It carries
@@ -90,6 +91,9 @@ func (d IssueDelegate) Render(w io.Writer, m list.Model, index int, listItem lis
 	idStr := i.Issue.ID
 	title := i.Issue.Title
 	ageStr := FormatTimeRel(i.Issue.CreatedAt)
+	if !d.ReferenceNow.IsZero() {
+		ageStr = FormatTimeRelAt(i.Issue.CreatedAt, d.ReferenceNow)
+	}
 	commentCount := len(i.Issue.Comments)
 
 	// Measure actual icon display width (emojis vary: 1-2 cells)

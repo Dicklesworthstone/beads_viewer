@@ -142,3 +142,34 @@ fn score_batch_handles_negative_recency() {
     assert_eq!(results.len(), 1);
     assert_close(results[0].components[4], 0.5, 1e-6, "recency fallback");
 }
+
+#[test]
+fn score_batch_honors_configured_max_blocker_count() {
+    let metrics = vec![IssueMetrics {
+        id: "cap-auth-ui".to_string(),
+        text_score: 0.9,
+        pagerank: 0.5,
+        status: 0,
+        priority: 1,
+        blocker_count: 1,
+        days_since_update: 0.0,
+    }];
+    let metrics_json = serde_json::to_string(&metrics).unwrap();
+
+    // Via constructor JSON max_blocker_count=4 -> 1 / 4 = 0.25 (instead of single-item 1 / 1 = 1.0)
+    let mut scorer = HybridScorer::new(
+        r#"{"text":0.4,"pagerank":0.2,"status":0.15,"impact":0.1,"priority":0.1,"recency":0.05,"max_blocker_count":4}"#,
+    );
+    let results: Vec<ScoredResult> =
+        serde_json::from_str(&scorer.score_batch(&metrics_json)).expect("parse results");
+    assert_eq!(results.len(), 1);
+    assert_close(results[0].components[2], 0.25, 1e-12, "configured max_blocker_count=4");
+
+    // Via score_batch_with_max(..., 2) -> 1 / 2 = 0.5
+    let mut scorer2 = HybridScorer::new("{}");
+    let results2: Vec<ScoredResult> = serde_json::from_str(
+        &scorer2.score_batch_with_max(&metrics_json, 2),
+    )
+    .expect("parse results2");
+    assert_close(results2[0].components[2], 0.5, 1e-12, "score_batch_with_max=2");
+}

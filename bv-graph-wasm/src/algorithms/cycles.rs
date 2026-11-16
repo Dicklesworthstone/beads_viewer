@@ -13,15 +13,20 @@ use std::collections::HashSet;
 pub struct SCCResult {
     /// List of strongly connected components (each is a list of node indices)
     pub components: Vec<Vec<usize>>,
-    /// True if any SCC has more than one node (cycle exists)
+    /// True if any SCC has a cycle (size > 1 or 1-node self-loop)
     pub has_cycles: bool,
-    /// Number of non-trivial SCCs (size > 1)
+    /// Number of cyclic SCCs (size > 1 or 1-node self-loop)
     pub cycle_count: usize,
+}
+
+#[inline]
+fn scc_has_cycle(graph: &DiGraph, comp: &[usize]) -> bool {
+    comp.len() > 1 || (comp.len() == 1 && graph.successors_slice(comp[0]).contains(&comp[0]))
 }
 
 /// Tarjan's algorithm for finding strongly connected components.
 ///
-/// An SCC with more than one node indicates a cycle.
+/// An SCC with more than one node, or a single node with a self-loop, indicates a cycle.
 /// Complexity: O(V + E)
 pub fn tarjan_scc(graph: &DiGraph) -> SCCResult {
     let n = graph.len();
@@ -49,7 +54,11 @@ pub fn tarjan_scc(graph: &DiGraph) -> SCCResult {
         }
     }
 
-    let cycle_count = state.components.iter().filter(|c| c.len() > 1).count();
+    let cycle_count = state
+        .components
+        .iter()
+        .filter(|c| scc_has_cycle(graph, c))
+        .count();
 
     SCCResult {
         components: state.components,
@@ -246,7 +255,7 @@ pub fn enumerate_cycles_with_info(graph: &DiGraph, max_cycles: usize) -> CycleEn
     if max_cycles == 0 {
         return CycleEnumerationResult {
             cycles: Vec::new(),
-            truncated: false,
+            truncated: has_cycles(graph),
             count: 0,
         };
     }
@@ -333,10 +342,10 @@ pub fn cycle_break_suggestions(
         std::collections::HashMap::new();
 
     for cycle in cycles {
-        if cycle.len() < 2 {
+        if cycle.is_empty() {
             continue;
         }
-        // Count edges in this cycle
+        // Count edges in this cycle (including 1-node self-loops u -> u)
         for i in 0..cycle.len() {
             let from = cycle[i];
             let to = cycle[(i + 1) % cycle.len()];
@@ -344,32 +353,27 @@ pub fn cycle_break_suggestions(
         }
     }
 
-    // Build set of nodes in non-trivial SCCs
-    let cycle_nodes: HashSet<usize> = scc
-        .components
-        .iter()
-        .filter(|c| c.len() > 1)
-        .flat_map(|c| c.iter().copied())
-        .collect();
-
-    // Find all edges within cycle SCCs
+    // Find all intra-SCC edges within cyclic SCCs
     let mut suggestions: Vec<CycleBreakItem> = Vec::new();
 
-    for &from in &cycle_nodes {
-        for &to in graph.successors_slice(from) {
-            if cycle_nodes.contains(&to) {
-                let cycles_broken = edge_cycle_count.get(&(from, to)).copied().unwrap_or(0);
-                let collateral =
-                    graph.successors_slice(from).len() + graph.predecessors_slice(to).len();
+    for comp in scc.components.iter().filter(|c| scc_has_cycle(graph, c)) {
+        let comp_nodes: HashSet<usize> = comp.iter().copied().collect();
+        for &from in comp {
+            for &to in graph.successors_slice(from) {
+                if comp_nodes.contains(&to) {
+                    let cycles_broken = edge_cycle_count.get(&(from, to)).copied().unwrap_or(0);
+                    let collateral =
+                        graph.successors_slice(from).len() + graph.predecessors_slice(to).len();
 
-                suggestions.push(CycleBreakItem {
-                    from,
-                    to,
-                    cycles_broken,
-                    collateral,
-                    from_id: graph.node_id(from),
-                    to_id: graph.node_id(to),
-                });
+                    suggestions.push(CycleBreakItem {
+                        from,
+                        to,
+                        cycles_broken,
+                        collateral,
+                        from_id: graph.node_id(from),
+                        to_id: graph.node_id(to),
+                    });
+                }
             }
         }
     }
@@ -399,31 +403,26 @@ pub fn quick_cycle_break_edges(graph: &DiGraph, limit: usize) -> Vec<CycleBreakI
         return Vec::new();
     }
 
-    // Build set of nodes in non-trivial SCCs
-    let cycle_nodes: HashSet<usize> = scc
-        .components
-        .iter()
-        .filter(|c| c.len() > 1)
-        .flat_map(|c| c.iter().copied())
-        .collect();
-
     let mut suggestions: Vec<CycleBreakItem> = Vec::new();
 
-    for &from in &cycle_nodes {
-        for &to in graph.successors_slice(from) {
-            if cycle_nodes.contains(&to) {
-                // Heuristic: edges with low total degree are better to remove
-                let collateral =
-                    graph.successors_slice(from).len() + graph.predecessors_slice(to).len();
+    for comp in scc.components.iter().filter(|c| scc_has_cycle(graph, c)) {
+        let comp_nodes: HashSet<usize> = comp.iter().copied().collect();
+        for &from in comp {
+            for &to in graph.successors_slice(from) {
+                if comp_nodes.contains(&to) {
+                    // Heuristic: edges with low total degree are better to remove
+                    let collateral =
+                        graph.successors_slice(from).len() + graph.predecessors_slice(to).len();
 
-                suggestions.push(CycleBreakItem {
-                    from,
-                    to,
-                    cycles_broken: 1, // Unknown without enumeration
-                    collateral,
-                    from_id: graph.node_id(from),
-                    to_id: graph.node_id(to),
-                });
+                    suggestions.push(CycleBreakItem {
+                        from,
+                        to,
+                        cycles_broken: 1, // Unknown without enumeration
+                        collateral,
+                        from_id: graph.node_id(from),
+                        to_id: graph.node_id(to),
+                    });
+                }
             }
         }
     }
@@ -462,9 +461,9 @@ mod tests {
         let a = graph.add_node("a");
         graph.add_edge(a, a);
         let result = tarjan_scc(&graph);
-        // Self-loop creates SCC of size 1 with edge to itself
-        // Tarjan considers this a cycle
-        assert!(result.has_cycles || result.components[0].len() == 1);
+        assert!(result.has_cycles);
+        assert_eq!(result.cycle_count, 1);
+        assert_eq!(result.components, vec![vec![a]]);
     }
 
     #[test]
@@ -638,10 +637,19 @@ mod tests {
         assert_eq!(result_one.count, 1);
         assert!(!result_one.truncated);
 
-        // With limit of 0, truncated must remain false
+        // With limit of 0 on a cyclic graph, truncated must be true (at least 1 cycle exists)
         let result_zero = enumerate_cycles_with_info(&graph, 0);
         assert_eq!(result_zero.count, 0);
-        assert!(!result_zero.truncated);
+        assert!(result_zero.truncated);
+
+        // With limit of 0 on an acyclic DAG, truncated must remain false
+        let mut dag = DiGraph::new();
+        let d0 = dag.add_node("d0");
+        let d1 = dag.add_node("d1");
+        dag.add_edge(d0, d1);
+        let dag_zero = enumerate_cycles_with_info(&dag, 0);
+        assert_eq!(dag_zero.count, 0);
+        assert!(!dag_zero.truncated);
 
         // Add a second cycle (b <-> c): now total cycles == 2 > limit 1 -> truncated == true
         let c = graph.add_node("c");
@@ -893,6 +901,41 @@ mod tests {
             } else {
                 assert!(prev.cycles_broken >= curr.cycles_broken);
             }
+        }
+    }
+
+    #[test]
+    fn test_self_loop_enumeration_and_break_suggestions() {
+        // Node u -> u self-loop bridged to node v -> v self-loop via DAG edge u -> v
+        let mut graph = DiGraph::new();
+        let u = graph.add_node("self-u");
+        let v = graph.add_node("self-v");
+        graph.add_edge(u, u);
+        graph.add_edge(u, v);
+        graph.add_edge(v, v);
+
+        assert!(has_cycles(&graph));
+        let scc = tarjan_scc(&graph);
+        assert!(scc.has_cycles);
+        assert_eq!(scc.cycle_count, 2);
+
+        let enum_res = enumerate_cycles_with_info(&graph, 10);
+        assert_eq!(enum_res.count, 2);
+        assert!(!enum_res.truncated);
+        assert_eq!(enum_res.cycles, vec![vec![u], vec![v]]);
+
+        let enum_zero = enumerate_cycles_with_info(&graph, 0);
+        assert_eq!(enum_zero.count, 0);
+        assert!(enum_zero.truncated);
+
+        let brk = cycle_break_suggestions(&graph, 10, 100);
+        assert_eq!(brk.total_cycles, 2);
+        assert!(!brk.truncated);
+        // Only the two self-edges (u, u) and (v, v) belong to cyclic SCCs; bridge (u, v) must not appear.
+        assert_eq!(brk.suggestions.len(), 2);
+        for item in &brk.suggestions {
+            assert_eq!(item.from, item.to);
+            assert_eq!(item.cycles_broken, 1);
         }
     }
 }

@@ -129,6 +129,7 @@ type UpdateModal struct {
 	lastOpWasRollback bool
 	theme             Theme
 	width             int
+	termWidth         int
 	height            int
 	startTime         time.Time
 	confirmFocus      int // 0 = Update, 1 = Cancel, 2 = Rollback (when available)
@@ -410,16 +411,28 @@ func (m UpdateModal) Update(msg tea.Msg) (UpdateModal, tea.Cmd) {
 	return m, nil
 }
 
+func (m UpdateModal) effectiveWidth() int {
+	modalWidth := m.width
+	if modalWidth <= 0 {
+		modalWidth = 60
+	}
+	if m.termWidth > 0 {
+		modalWidth = min(modalWidth, max(24, m.termWidth-4))
+	}
+	return modalWidth
+}
+
 // View renders the modal.
 func (m UpdateModal) View() string {
 	r := m.theme.Renderer
+	modalWidth := m.effectiveWidth()
 
 	// Modal container style
 	modalStyle := r.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Primary).
 		Padding(1, 2).
-		Width(m.width)
+		Width(modalWidth)
 
 	// Header style
 	headerStyle := r.NewStyle().
@@ -692,6 +705,7 @@ func (m *UpdateModal) SetSize(width, height int) {
 		maxWidth = 70
 	}
 	m.width = maxWidth
+	m.termWidth = width
 	m.height = height
 }
 
@@ -720,6 +734,9 @@ func (m UpdateModal) IsInProgress() bool {
 
 // CenterModal returns the modal view centered in the given dimensions.
 func (m UpdateModal) CenterModal(termWidth, termHeight int) string {
+	if termWidth > 0 {
+		m.termWidth = termWidth
+	}
 	modal := m.View()
 
 	// Get actual rendered dimensions

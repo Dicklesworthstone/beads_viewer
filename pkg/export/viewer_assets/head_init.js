@@ -79,6 +79,17 @@ tailwind.config = {
   function registerWorker() {
     if (isLiveReloadPreview()) {
       console.log('[COI] Live-reload preview already cross-origin isolated; skipping SW registration');
+      if (typeof navigator.serviceWorker.getRegistrations === 'function') {
+        navigator.serviceWorker.getRegistrations()
+          .then(function (registrations) {
+            return Promise.all(registrations.map(function (reg) {
+              return reg.unregister();
+            }));
+          })
+          .catch(function (err) {
+            console.warn('[COI] Failed to unregister stale preview service worker:', err);
+          });
+      }
       return;
     }
     // Keep the already verified bundle while offline. Starting an update

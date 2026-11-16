@@ -24,11 +24,11 @@ import (
 
 // Note: WriteGitHubActionsWorkflow is defined in github.go
 
-// ViewerAssetsFS embeds the viewer_assets directory for static site export.
-// This allows the bv binary to include all necessary HTML/JS/CSS assets
-// without requiring them to exist on the filesystem.
+// ViewerAssetsFS embeds the tracked viewer_assets files for static site export
+// without accidentally embedding gitignored local wasm-pack output directories
+// (viewer_assets/wasm/, which is populated opt-in per bundle via BV_BUILD_HYBRID_WASM).
 //
-//go:embed viewer_assets
+//go:embed viewer_assets/*.html viewer_assets/*.js viewer_assets/*.css viewer_assets/vendor
 var ViewerAssetsFS embed.FS
 
 // Bundle anchors all generated files to the output directory selected by the
@@ -349,6 +349,13 @@ func (b *Bundle) BindOfflineBundleAssets() error {
 // partial offline bundle. This list exists only to serve the offline cache.
 func bindOfflineAssets(bundle *Bundle, files []string) error {
 	sort.Strings(files)
+	deduped := files[:0]
+	for _, name := range files {
+		if len(deduped) == 0 || deduped[len(deduped)-1] != name {
+			deduped = append(deduped, name)
+		}
+	}
+	files = deduped
 	type asset struct {
 		Path string `json:"path"`
 		Hash string `json:"sha256"`
@@ -386,7 +393,13 @@ func isDevOnlyAsset(relPath string) bool {
 	if relPath == "graph-demo.html" {
 		return true
 	}
-	return strings.HasSuffix(relPath, ".test.js")
+	if strings.HasSuffix(relPath, ".test.js") || strings.HasSuffix(relPath, ".d.ts") {
+		return true
+	}
+	if filepath.Base(relPath) == "package.json" {
+		return true
+	}
+	return false
 }
 
 var (

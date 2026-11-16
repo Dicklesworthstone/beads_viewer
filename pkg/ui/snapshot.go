@@ -271,9 +271,10 @@ type DataSnapshot struct {
 	ErrorTime    time.Time // When error occurred
 	StaleWarning bool      // True if data is from previous successful load
 
-	beadsPath       string
-	projectDir      string
-	explicitWeights bool
+	beadsPath          string
+	projectDir         string
+	explicitProjectDir string
+	explicitWeights    bool
 }
 
 func (s *DataSnapshot) attachPooledIssues(refs []*model.Issue) {
@@ -389,14 +390,16 @@ func (l *GraphLayout) UpdatePhase2Ranks(stats *analysis.GraphStats) {
 // SnapshotBuilder constructs DataSnapshots from raw data.
 // This is used by the BackgroundWorker to build new snapshots.
 type SnapshotBuilder struct {
-	issues          []model.Issue
-	analyzer        *analysis.Analyzer
-	analysis        *analysis.GraphStats
-	recipe          *recipe.Recipe
-	cfg             snapshotBuildConfig
-	beadsPath       string
-	projectDir      string
-	explicitWeights bool
+	ctx                context.Context
+	issues             []model.Issue
+	analyzer           *analysis.Analyzer
+	analysis           *analysis.GraphStats
+	recipe             *recipe.Recipe
+	cfg                snapshotBuildConfig
+	beadsPath          string
+	projectDir         string
+	explicitProjectDir string
+	explicitWeights    bool
 
 	prevSnapshot *DataSnapshot
 	diff         *analysis.IssueDiff
@@ -464,6 +467,7 @@ func (b *SnapshotBuilder) WithBeadsPath(beadsPath string) *SnapshotBuilder {
 // WithProjectDir associates a project root directory with this snapshot build.
 func (b *SnapshotBuilder) WithProjectDir(projectDir string) *SnapshotBuilder {
 	b.projectDir = projectDir
+	b.explicitProjectDir = projectDir
 	return b
 }
 
@@ -528,6 +532,12 @@ func feedbackWeightsForBeadsPath(beadsPath string) *analysis.Weights {
 	return feedbackWeightsForBeadsDir(filepath.Dir(beadsPath))
 }
 
+// WithContext binds Phase 2 async analysis to the caller's lifecycle context.
+func (b *SnapshotBuilder) WithContext(ctx context.Context) *SnapshotBuilder {
+	b.ctx = ctx
+	return b
+}
+
 // WithAnalysis sets the pre-computed analysis (for when we have cached results).
 func (b *SnapshotBuilder) WithAnalysis(a *analysis.GraphStats) *SnapshotBuilder {
 	b.analysis = a
@@ -584,6 +594,10 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	// Use AnalyzeAsync to allow Phase 2 to run in background
 	graphStats := b.analysis
 	if graphStats == nil {
+		analysisCtx := b.ctx
+		if analysisCtx == nil {
+			analysisCtx = context.Background()
+		}
 		if b.cfg.SkipPhase2 {
 			// Still compute Phase 1 metrics, but skip expensive Phase 2 work.
 			cfg := analysis.ConfigForSize(len(issues), 0)
@@ -593,9 +607,9 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 			cfg.ComputeHITS = false
 			cfg.ComputeCriticalPath = false
 			cfg.ComputeCycles = false
-			graphStats = b.analyzer.AnalyzeAsyncWithConfig(context.Background(), cfg)
+			graphStats = b.analyzer.AnalyzeAsyncWithConfig(analysisCtx, cfg)
 		} else {
-			graphStats = b.analyzer.AnalyzeAsync(context.Background())
+			graphStats = b.analyzer.AnalyzeAsync(analysisCtx)
 		}
 	}
 
@@ -772,6 +786,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		IncrementalListUsed: listItemsIncremental,
 		beadsPath:           b.beadsPath,
 		projectDir:          projectDir,
+		explicitProjectDir:  b.explicitProjectDir,
 		explicitWeights:     b.explicitWeights,
 	}
 	snapshot.phase2Input = snapshot.detachedPhase2Input()
@@ -1565,6 +1580,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		StaleWarning:         s.StaleWarning,
 		beadsPath:            s.beadsPath,
 		projectDir:           s.projectDir,
+		explicitProjectDir:   s.explicitProjectDir,
 		explicitWeights:      s.explicitWeights,
 	}
 }

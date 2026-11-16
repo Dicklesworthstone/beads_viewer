@@ -96,6 +96,13 @@ type AtRiskItem struct {
 // A nil sprint, an empty sprint, or an empty issue list yields an empty
 // (non-nil) slice.
 func DetectAtRisk(issues []model.Issue, sprint *model.Sprint, now time.Time, thresholds AtRiskThresholds) []AtRiskItem {
+	return DetectAtRiskWithReadiness(issues, sprint, nil, now, thresholds)
+}
+
+// DetectAtRiskWithReadiness evaluates the four at-risk signals using a caller-supplied
+// ReadinessIndex (preserving TombstoneIDs and cross-repository blockers when scoped),
+// falling back to model.NewReadinessIndex(issues) when readiness is nil.
+func DetectAtRiskWithReadiness(issues []model.Issue, sprint *model.Sprint, readiness *model.ReadinessIndex, now time.Time, thresholds AtRiskThresholds) []AtRiskItem {
 	items := []AtRiskItem{}
 	if sprint == nil || len(sprint.BeadIDs) == 0 || len(issues) == 0 {
 		return items
@@ -107,7 +114,9 @@ func DetectAtRisk(issues []model.Issue, sprint *model.Sprint, now time.Time, thr
 	for _, iss := range issues {
 		issueMap[iss.ID] = iss
 	}
-	readiness := model.NewReadinessIndex(issues)
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(issues)
+	}
 
 	seen := make(map[string]bool, len(sprint.BeadIDs))
 	for _, beadID := range sprint.BeadIDs {
@@ -135,15 +144,35 @@ func evaluateAtRisk(iss model.Issue, issueMap map[string]model.Issue, readiness 
 	// Consult ReadinessIndex so transitive DepParentChild epic blockers and
 	// DependenciesUnknown missing blocker IDs are recognized alongside direct
 	// open blocking dependencies, while open unblocked parents remain non-blocking.
+	// Parent epics themselves stay open until all children finish — they do NOT
+	// close to unblock a child, so exclude DepParentChild-only targets from
+	// openBlockers and track their actual IsBlocking() blockers in ancestorBlockers.
 	type blocker struct {
 		id           string
 		lastActivity time.Time
 	}
+	directBlockingTargets := make(map[string]bool, len(iss.Dependencies))
+	parentChildTargets := make(map[string]bool, len(iss.Dependencies))
+	for _, dep := range iss.Dependencies {
+		if dep == nil {
+			continue
+		}
+		if dep.Type.IsBlocking() {
+			directBlockingTargets[dep.DependsOnID] = true
+		}
+		if dep.Type == model.DepParentChild {
+			parentChildTargets[dep.DependsOnID] = true
+		}
+	}
+
 	blockerIDs := readiness.Blockers(iss.ID)
 	blockerSet := make(map[string]bool, len(blockerIDs))
 	var openBlockers []blocker
 	for _, bID := range blockerIDs {
 		blockerSet[bID] = true
+		if parentChildTargets[bID] && !directBlockingTargets[bID] {
+			continue
+		}
 		if target, ok := issueMap[bID]; ok {
 			openBlockers = append(openBlockers, blocker{id: bID, lastActivity: issueLastActivity(target)})
 		} else {
@@ -178,9 +207,9 @@ func evaluateAtRisk(iss model.Issue, issueMap map[string]model.Issue, readiness 
 				parentQueue = append(parentQueue, dep.DependsOnID)
 			}
 		}
-		seenAncBlocker := make(map[string]bool, len(blockerSet))
-		for k := range blockerSet {
-			seenAncBlocker[k] = true
+		seenAncBlocker := make(map[string]bool, len(openBlockers))
+		for _, b := range openBlockers {
+			seenAncBlocker[b.id] = true
 		}
 		for head := 0; head < len(parentQueue); head++ {
 			pID := parentQueue[head]
@@ -209,6 +238,8 @@ func evaluateAtRisk(iss model.Issue, issueMap map[string]model.Issue, readiness 
 						seenAncBlocker[dep.DependsOnID] = true
 						if target, ok := issueMap[dep.DependsOnID]; ok {
 							ancestorBlockers = append(ancestorBlockers, blocker{id: dep.DependsOnID, lastActivity: issueLastActivity(target)})
+						} else {
+							ancestorBlockers = append(ancestorBlockers, blocker{id: dep.DependsOnID})
 						}
 					}
 				}
@@ -265,6 +296,14 @@ func evaluateAtRisk(iss model.Issue, issueMap map[string]model.Issue, readiness 
 				ids[i] = b.id
 			}
 			by = "blocked by " + strings.Join(ids, ", ")
+		} else if len(ancestorBlockers) > 0 {
+			ids := make([]string, len(ancestorBlockers))
+			for i, b := range ancestorBlockers {
+				ids[i] = b.id
+			}
+			by = "blocked by " + strings.Join(ids, ", ")
+		} else if len(blockerIDs) > 0 {
+			by = "blocked by " + strings.Join(blockerIDs, ", ")
 		}
 		details = append(details, fmt.Sprintf("P%d %s", iss.Priority, by))
 		if !blockedSince.IsZero() {

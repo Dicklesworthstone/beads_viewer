@@ -607,6 +607,34 @@ func (l *AggregateLoader) loadSingleRepo(ctx context.Context, repo RepoConfig, k
 
 	// Apply namespacing to all IDs
 	loader.AttachIssueOrigins(issues, sourcePath, result.ParseStats.Errors == 0 && result.ReadErrors == 0 && len(result.AuthorityWarnings) == 0)
+	if repoPath != "" {
+		canonicalizeDir := func(dir string) string {
+			clean := filepath.Clean(dir)
+			if abs, absErr := filepath.Abs(clean); absErr == nil {
+				if eval, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
+					return filepath.Clean(eval)
+				}
+				return filepath.Clean(abs)
+			}
+			return clean
+		}
+		fallbackWorkDir := canonicalizeDir(repoPath)
+		preferredWorkDir := fallbackWorkDir
+		cleanTarget := filepath.Clean(beadsTarget)
+		if base := filepath.Base(cleanTarget); base == ".beads" || base == "_beads" {
+			if root := loader.ProjectRootFromBeadsDir(cleanTarget); root != "" {
+				preferredWorkDir = canonicalizeDir(root)
+			}
+		}
+		for i := range issues {
+			if issues[i].Origin == nil {
+				continue
+			}
+			if issues[i].Origin.WorkingDirectory == "" || issues[i].Origin.ReadOnlyReason != "" || len(redirects) > 1 {
+				issues[i].Origin.WorkingDirectory = preferredWorkDir
+			}
+		}
+	}
 	if result.SourceKind != string(datasource.SourceTypeSQLite) && sourcePath != "" {
 		var probeOrigin *model.IssueOrigin
 		if len(issues) > 0 {

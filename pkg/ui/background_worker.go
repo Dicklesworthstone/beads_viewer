@@ -247,11 +247,13 @@ type BackgroundWorker struct {
 	msgCh   chan tea.Msg
 
 	// Lifecycle
-	ctx        context.Context
-	cancel     context.CancelFunc
-	loopCtx    context.Context
-	loopCancel context.CancelFunc
-	done       chan struct{}
+	ctx             context.Context
+	cancel          context.CancelFunc
+	loopCtx         context.Context
+	loopCancel      context.CancelFunc
+	done            chan struct{}
+	activeWorkCount int
+	activeWorkDone  chan struct{}
 }
 
 type IdleGCConfig struct {
@@ -669,6 +671,7 @@ func (w *BackgroundWorker) Stop() {
 	wasStarted := w.started
 	loopCancel := w.loopCancel
 	done := w.done
+	workDone := w.activeWorkDone
 	w.loopCancel = nil
 	restoreGCPercent := w.idleGCAppliedGCPercent
 	prevGCPercent := w.idleGCPrevGCPercent
@@ -688,14 +691,25 @@ func (w *BackgroundWorker) Stop() {
 		w.watcher.Stop()
 	}
 
-	// Only wait for done if Start() was called
-	if wasStarted {
+	// Wait for processLoop (if Start() was called) and any in-flight process/Phase2 goroutines.
+	if wasStarted || workDone != nil {
 		timer := time.NewTimer(backgroundWorkerShutdownTimeout)
 		defer timer.Stop()
-		select {
-		case <-done:
-		case <-timer.C:
-			w.logEvent(LogLevelWarn, "shutdown_timeout", nil)
+		timedOut := false
+		if wasStarted {
+			select {
+			case <-done:
+			case <-timer.C:
+				timedOut = true
+				w.logEvent(LogLevelWarn, "shutdown_timeout", nil)
+			}
+		}
+		if !timedOut && workDone != nil {
+			select {
+			case <-workDone:
+			case <-timer.C:
+				w.logEvent(LogLevelWarn, "shutdown_timeout", nil)
+			}
 		}
 	}
 
@@ -899,6 +913,27 @@ func (w *BackgroundWorker) attemptRecovery(reason string) {
 	w.ForceRefresh()
 }
 
+func (w *BackgroundWorker) beginAsyncWorkLocked() bool {
+	if w.state == WorkerStopped {
+		return false
+	}
+	if w.activeWorkCount == 0 {
+		w.activeWorkDone = make(chan struct{})
+	}
+	w.activeWorkCount++
+	return true
+}
+
+func (w *BackgroundWorker) endAsyncWork() {
+	w.mu.Lock()
+	w.activeWorkCount--
+	if w.activeWorkCount == 0 && w.activeWorkDone != nil {
+		close(w.activeWorkDone)
+		w.activeWorkDone = nil
+	}
+	w.mu.Unlock()
+}
+
 // TriggerRefresh manually triggers a refresh of the data.
 // Has no effect if the worker is stopped. Concurrent refresh requests are
 // coalesced while processing is active or already scheduled.
@@ -918,10 +953,14 @@ func (w *BackgroundWorker) TriggerRefresh() {
 		return
 	}
 	w.processScheduled = true
+	w.beginAsyncWorkLocked()
 	w.mu.Unlock()
 
 	// Trigger processing
-	go w.process()
+	go func() {
+		defer w.endAsyncWork()
+		w.process()
+	}()
 }
 
 // ForceRefresh triggers immediate processing, bypassing debounce and content-hash
@@ -945,9 +984,13 @@ func (w *BackgroundWorker) ForceRefresh() {
 		return
 	}
 	w.processScheduled = true
+	w.beginAsyncWorkLocked()
 	w.mu.Unlock()
 
-	go w.process()
+	go func() {
+		defer w.endAsyncWork()
+		w.process()
+	}()
 }
 
 // HandleRefreshRequest applies a UI refresh request on the worker side. Recipe
@@ -955,7 +998,7 @@ func (w *BackgroundWorker) ForceRefresh() {
 func (w *BackgroundWorker) HandleRefreshRequest(msg RefreshRequestMsg) {
 	recipeChanged := false
 	if msg.Recipe != nil {
-		recipeChanged = w.setRecipe(msg.Recipe)
+		recipeChanged, _ = w.setRecipe(msg.Recipe)
 	}
 	if msg.Force || recipeChanged {
 		w.ForceRefresh()
@@ -1002,19 +1045,23 @@ func (w *BackgroundWorker) SetProjectDir(dir string) {
 	}
 }
 
-// SetRecipe updates the worker's current recipe and triggers a refresh (bv-2h40).
+// SetRecipe updates the worker's current recipe and triggers a refresh if the
+// worker has already started or published a snapshot (bv-2h40).
 // This allows Phase 3 view builders to incorporate recipe/filter state off-thread.
 func (w *BackgroundWorker) SetRecipe(r *recipe.Recipe) {
-	if w.setRecipe(r) {
+	if _, shouldRefresh := w.setRecipe(r); shouldRefresh {
 		w.ForceRefresh()
 	}
 }
 
-func (w *BackgroundWorker) setRecipe(r *recipe.Recipe) bool {
+func (w *BackgroundWorker) setRecipe(r *recipe.Recipe) (changed bool, shouldRefresh bool) {
+	if w == nil {
+		return false, false
+	}
 	w.mu.Lock()
 	if w.state == WorkerStopped {
 		w.mu.Unlock()
-		return false
+		return false, false
 	}
 
 	nextID := ""
@@ -1024,12 +1071,16 @@ func (w *BackgroundWorker) setRecipe(r *recipe.Recipe) bool {
 		nextHash = recipeFingerprint(r)
 	}
 
-	changed := w.currentRecipeID != nextID || w.currentRecipeHash != nextHash
+	changed = w.currentRecipeID != nextID || w.currentRecipeHash != nextHash
 	w.currentRecipe = r
 	w.currentRecipeID = nextID
 	w.currentRecipeHash = nextHash
+	shouldRefresh = changed && (w.started || w.snapshot != nil)
+	if changed {
+		w.forceNext = true
+	}
 	w.mu.Unlock()
-	return changed
+	return changed, shouldRefresh
 }
 
 // GetSnapshot returns the current snapshot (may be nil).
@@ -1300,7 +1351,15 @@ func (w *BackgroundWorker) processSnapshotContext(build func(context.Context, bo
 		// This guarantees message order and gives the completion message the
 		// exact snapshot/version identity needed to reject same-hash refreshes.
 		if !snapshot.IsPhase2Ready() {
-			go w.runPhase2Analysis(snapshot, version, gen)
+			w.mu.Lock()
+			canSpawnPhase2 := w.beginAsyncWorkLocked()
+			w.mu.Unlock()
+			if canSpawnPhase2 {
+				go func() {
+					defer w.endAsyncWork()
+					w.runPhase2Analysis(snapshot, version, gen)
+				}()
+			}
 		}
 	}
 
@@ -1627,6 +1686,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	w.mu.RUnlock()
 
 	loadMetadataUnchanged := prevSnapshot != nil &&
+		prevSnapshot.explicitProjectDir == projectDir &&
 		prevSnapshot.AuthorityHash == authorityHash &&
 		prevSnapshot.AuthorityComplete == authorityComplete &&
 		prevSnapshot.SourceIssueCountHint == sourceLineCount &&
@@ -1664,6 +1724,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	analyzeStart := time.Now()
 	analyzeErr := w.safeCompute("analyze_phase1", func() error {
 		builder := NewSnapshotBuilder(issues, authority).
+			WithContext(w.ctx).
 			WithBeadsPath(w.beadsPath).
 			WithProjectDir(projectDir).
 			WithRecipe(currentRecipe).

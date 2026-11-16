@@ -5259,7 +5259,8 @@ func TestWave13Round1AuditRemediations(t *testing.T) {
 		}
 
 		// 2) Reload switches .db -> .jsonl with SourceDegraded=false, AuthorityIncomplete=false, and ReloadDuration >= 1s:
-		// guiEditorPath() must immediately succeed again AND slow reload must auto-promote to BackgroundWorker even with sourceReload != nil!
+		// guiEditorPath() must immediately succeed again, while sourceReload != nil (auto-discovered sibling SQLite coexistence)
+		// must NOT auto-promote to JSONL-only BackgroundWorker unless restoreBackgroundAfterEdit was explicitly active!
 		m.SetSourceReload(func(ctx context.Context) (SourceReloadResult, error) {
 			live := makeLiveIssues(true)
 			return SourceReloadResult{
@@ -5280,11 +5281,18 @@ func TestWave13Round1AuditRemediations(t *testing.T) {
 		if gotPath, guiErr := m.guiEditorPath(); guiErr != nil || gotPath != jsonlPath {
 			t.Fatalf("after .db->.jsonl reload, guiEditorPath() = (%q, %v), want (%q, nil)", gotPath, guiErr, jsonlPath)
 		}
-		if m.backgroundWorker == nil {
-			t.Fatalf("expected slow (>=1s) single-file .jsonl SourceReloadResult to auto-promote to BackgroundWorker; status=%q", m.statusMsg)
+		if m.backgroundWorker != nil {
+			t.Fatalf("expected sourceReload != nil NOT to auto-promote to JSONL-only BackgroundWorker; status=%q", m.statusMsg)
 		}
-		if !strings.Contains(m.statusMsg, "background mode auto-enabled") {
-			t.Fatalf("expected statusMsg to mention background mode auto-enabled, got %q", m.statusMsg)
+		// Explicit restoreBackgroundAfterEdit=true DOES restore BackgroundWorker and still routes msg.source==nil through sourceReloadCmd!
+		m.restoreBackgroundAfterEdit = true
+		_, cmd2b := m.Update(FileChangedMsg{})
+		m.Update(cmd2b())
+		if m.backgroundWorker == nil {
+			t.Fatalf("expected restoreBackgroundAfterEdit=true to restore BackgroundWorker; status=%q", m.statusMsg)
+		}
+		if _, cmd2c := m.Update(FileChangedMsg{}); cmd2c == nil {
+			t.Fatalf("expected FileChangedMsg with sourceReload != nil and backgroundWorker != nil to still invoke sourceReloadCmd")
 		}
 
 		// 3) Negative control: explicit --db (SetExplicitDB(true)) must NOT auto-promote to JSONL BackgroundWorker.
@@ -5532,7 +5540,7 @@ func TestWave13Round1AuditRemediations(t *testing.T) {
 		mMetrics.analysis.WaitForPhase2()
 		mMetrics.exportToMarkdown()
 
-		jsonPath2 := filepath.Join(outDir2, fmt.Sprintf("beads_export_%s.json", time.Now().Format("2006-01-02")))
+		jsonPath2 := filepath.Join(outDir2, fmt.Sprintf("beads_export_%s.json", histRef.Format("2006-01-02")))
 		rawJSON2, err := os.ReadFile(jsonPath2)
 		if err != nil {
 			t.Fatalf("reading recipe JSON export: %v", err)
@@ -5798,6 +5806,1005 @@ func TestWave13Round1AuditRemediations(t *testing.T) {
 		m.Update(cmd3())
 		if reloadCalls != 3 {
 			t.Fatalf("expected 3 sourceReload invocations across round-trips, got %d", reloadCalls)
+		}
+	})
+}
+
+func TestWave14TrackB(t *testing.T) {
+	t.Run("FullCorpusTriageScoresAndUnblocksAcrossAll4Paths", func(t *testing.T) {
+		now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+		var issues []model.Issue
+		// 12 high-priority issues in repo "api" (8 blocked + 4 actionable) so top-10 Recommendations
+		// are dominated by "api-*", leaving "web-*" issues outside global top-10.
+		issues = append(issues, model.Issue{
+			ID: "api-root", Title: "API Root Blocker", Status: model.StatusOpen, Priority: 0,
+			IssueType: model.TypeTask, CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now,
+		})
+		for i := 1; i <= 8; i++ {
+			issues = append(issues, model.Issue{
+				ID: fmt.Sprintf("api-blocked-%02d", i), Title: fmt.Sprintf("Blocked API %d", i),
+				Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask,
+				CreatedAt: now.Add(-time.Duration(i) * time.Hour), UpdatedAt: now,
+				Dependencies: []*model.Dependency{{DependsOnID: "api-root", Type: model.DepBlocks}},
+			})
+		}
+		for i := 1; i <= 10; i++ {
+			issues = append(issues, model.Issue{
+				ID: fmt.Sprintf("api-ready-%02d", i), Title: fmt.Sprintf("Ready API %d", i),
+				Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+				CreatedAt: now.Add(-time.Duration(i) * time.Hour), UpdatedAt: now,
+			})
+		}
+		// Lower-priority "web-*" issues (outside top-10 Recommendations), where web-hub unblocks 2 issues.
+		issues = append(issues,
+			model.Issue{
+				ID: "web-hub", Title: "Web Hub Foundation", Status: model.StatusOpen, Priority: 3,
+				IssueType: model.TypeTask, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now,
+			},
+			model.Issue{
+				ID: "web-leaf-1", Title: "Web Leaf 1", Status: model.StatusOpen, Priority: 4,
+				IssueType: model.TypeTask, CreatedAt: now.Add(-47 * time.Hour), UpdatedAt: now,
+				Dependencies: []*model.Dependency{{DependsOnID: "web-hub", Type: model.DepBlocks}},
+			},
+			model.Issue{
+				ID: "web-leaf-2", Title: "Web Leaf 2", Status: model.StatusOpen, Priority: 4,
+				IssueType: model.TypeTask, CreatedAt: now.Add(-46 * time.Hour), UpdatedAt: now,
+				Dependencies: []*model.Dependency{{DependsOnID: "web-hub", Type: model.DepBlocks}},
+			},
+		)
+		for i := 1; i <= 10; i++ {
+			issues = append(issues, model.Issue{
+				ID: fmt.Sprintf("web-extra-%02d", i), Title: fmt.Sprintf("Web Extra %d", i),
+				Status: model.StatusOpen, Priority: 4, IssueType: model.TypeTask,
+				CreatedAt: now.Add(-time.Duration(50+i) * time.Hour), UpdatedAt: now,
+			})
+		}
+
+		// Path 1: NewModel initial triage population (>25 open issues)
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: now})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
+
+		if len(m.triageScores) < len(issues) {
+			t.Fatalf("Path 1 (NewModel): expected full-corpus triageScores for all %d open issues, got %d", len(issues), len(m.triageScores))
+		}
+		if m.triageScores["web-hub"] <= 0 {
+			t.Fatalf("Path 1 (NewModel): expected non-zero triageScore for outside-top-10 issue web-hub, got %v", m.triageScores["web-hub"])
+		}
+		if got := len(m.unblocksMap["web-hub"]); got != 2 {
+			t.Fatalf("Path 1 (NewModel): expected web-hub unblocksMap len=2, got %d (%v)", got, m.unblocksMap["web-hub"])
+		}
+
+		// Built-in triage recipe (max_items: 20) must give non-zero scores to ranks 11..20!
+		triageRecipe := m.recipeLoader.Get("triage")
+		if triageRecipe == nil {
+			t.Fatalf("expected built-in triage recipe")
+		}
+		m.setActiveRecipe(triageRecipe)
+		m.applyRecipe(triageRecipe)
+		if got := len(m.list.Items()); got != 20 {
+			t.Fatalf("triage recipe max_items=20: got %d items", got)
+		}
+		for idx, raw := range m.list.Items() {
+			it, ok := raw.(IssueItem)
+			if !ok {
+				t.Fatalf("item %d: expected IssueItem, got %T", idx, raw)
+			}
+			if it.TriageScore <= 0 {
+				t.Fatalf("triage recipe rank %d (%s): expected non-zero TriageScore, got %v", idx+1, it.Issue.ID, it.TriageScore)
+			}
+		}
+
+		// Workspace repo filter ('w') to "web" must retain non-zero TriageScore & UnblocksCount=2 on web-hub!
+		m.setActiveRecipe(nil)
+		m.currentFilter = "all"
+		m.workspaceMode = true
+		m.availableRepos = []string{"api", "web"}
+		m.activeRepos = map[string]bool{"web": true}
+		m.applyFilter()
+		foundWebHub := false
+		for _, raw := range m.list.Items() {
+			it, ok := raw.(IssueItem)
+			if !ok {
+				continue
+			}
+			if it.Issue.ID == "web-hub" {
+				foundWebHub = true
+				if it.TriageScore <= 0 || it.UnblocksCount != 2 {
+					t.Fatalf("workspace repo filter 'web': web-hub TriageScore=%v UnblocksCount=%d, want >0 and 2", it.TriageScore, it.UnblocksCount)
+				}
+			}
+		}
+		if !foundWebHub {
+			t.Fatalf("expected web-hub in workspace repo-filtered list")
+		}
+
+		// Path 2: refreshScopedTriageData()
+		cands := make(map[string]bool, len(issues))
+		for _, iss := range issues {
+			cands[iss.ID] = true
+		}
+		mScoped := NewModel(copyIssues(issues), nil, "", ReadinessScope{CandidateIDs: cands, ReferenceNow: now})
+		t.Cleanup(mScoped.Stop)
+		mScoped.analysis.WaitForPhase2()
+		mScoped.refreshScopedTriageData()
+		if mScoped.triageScores["web-hub"] <= 0 || len(mScoped.unblocksMap["web-hub"]) != 2 {
+			t.Fatalf("Path 2 (refreshScopedTriageData): web-hub score=%v unblocks=%v", mScoped.triageScores["web-hub"], mScoped.unblocksMap["web-hub"])
+		}
+
+		// Path 3 & Path 4: SnapshotBuilder.Build() & DataSnapshot.WithPhase2()
+		sb := NewSnapshotBuilder(copyIssues(issues)).WithRecipe(triageRecipe)
+		snap1 := sb.Build()
+		if len(snap1.TriageScores) < len(issues) || snap1.TriageScores["web-hub"] <= 0 || len(snap1.UnblocksMap["web-hub"]) != 2 {
+			t.Fatalf("Path 3 (SnapshotBuilder.Build): len=%d web-hub score=%v unblocks=%v", len(snap1.TriageScores), snap1.TriageScores["web-hub"], snap1.UnblocksMap["web-hub"])
+		}
+		snap1.Analysis.WaitForPhase2()
+		ins := snap1.Analysis.GenerateInsights(len(issues))
+		snap2 := snap1.WithPhase2(snap1.Analysis, ins, snap1.Issues, snap1.Analyzer)
+		if len(snap2.TriageScores) < len(issues) || snap2.TriageScores["web-hub"] <= 0 || len(snap2.UnblocksMap["web-hub"]) != 2 {
+			t.Fatalf("Path 4 (DataSnapshot.WithPhase2): len=%d web-hub score=%v unblocks=%v", len(snap2.TriageScores), snap2.TriageScores["web-hub"], snap2.UnblocksMap["web-hub"])
+		}
+
+		// Fallback negative control: synthetic TriageResult without AllScores/UnblocksMap still populates from Recommendations.
+		synthScores, _, _, _, synthUnblocks := extractTriageMaps(analysis.TriageResult{
+			Recommendations: []analysis.Recommendation{
+				{ID: "synth-1", Score: 0.77, UnblocksIDs: []string{"synth-2"}},
+			},
+		})
+		if synthScores["synth-1"] != 0.77 || len(synthUnblocks["synth-1"]) != 1 {
+			t.Fatalf("fallback extractTriageMaps failed: scores=%v unblocks=%v", synthScores, synthUnblocks)
+		}
+	})
+
+	t.Run("SeamlessWorkerPromotion_ExternalProjectDir_AndFallbackWatcher", func(t *testing.T) {
+		projectDir := t.TempDir()
+		extBeadsDir := t.TempDir()
+		jsonlPath := filepath.Join(extBeadsDir, "issues.jsonl")
+		rawLine := `{"id":"W14-1","title":"Open issue","status":"open","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}` + "\n"
+		if err := os.WriteFile(jsonlPath, []byte(rawLine), 0o644); err != nil {
+			t.Fatalf("write jsonl: %v", err)
+		}
+		// Configure custom drift config in projectDir/.bv/drift.yaml (separate from extBeadsDir)
+		bvDir := filepath.Join(projectDir, ".bv")
+		if err := os.MkdirAll(bvDir, 0o755); err != nil {
+			t.Fatalf("mkdir .bv: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(bvDir, "drift.yaml"), []byte("stale_threshold_days: 1\n"), 0o644); err != nil {
+			t.Fatalf("write drift.yaml: %v", err)
+		}
+
+		initIssues := []model.Issue{{
+			ID: "W14-1", Title: "Open issue", Status: model.StatusOpen, Priority: 1,
+			IssueType: model.TypeTask,
+			CreatedAt: time.Now().Add(-10 * 24 * time.Hour),
+			UpdatedAt: time.Now().Add(-10 * 24 * time.Hour),
+		}}
+		t.Setenv("BV_BACKGROUND_MODE", "0")
+		m := NewModel(initIssues, nil, jsonlPath)
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		m.SetWorkDir(projectDir)
+		m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+		// Force explicit restoreBackgroundAfterEdit promotion on an already-rendered TUI (sourceReload == nil)
+		t.Setenv("BV_BACKGROUND_MODE", "")
+		activeRec := m.recipeLoader.Get("triage")
+		m.setActiveRecipe(activeRec)
+		m.restoreBackgroundAfterEdit = true
+		_, _ = m.Update(FileChangedMsg{})
+
+		if m.backgroundWorker == nil {
+			t.Fatalf("expected BackgroundWorker promotion")
+		}
+		if m.snapshotInitPending {
+			t.Fatalf("expected snapshotInitPending=false when len(m.issues)>0 && m.ready so TUI never flashes Loading beads")
+		}
+		if view := m.View(); strings.Contains(view, "Loading beads") {
+			t.Fatalf("expected rendered TUI view to stay visible instead of cold-start Loading beads screen")
+		}
+		if m.backgroundWorker.projectDir != projectDir {
+			t.Fatalf("expected BackgroundWorker.projectDir=%q, got %q", projectDir, m.backgroundWorker.projectDir)
+		}
+		if m.backgroundWorker.currentRecipe != activeRec {
+			t.Fatalf("expected promoted BackgroundWorker to inherit activeRecipe")
+		}
+
+		// Terminal SnapshotErrorMsg must recover live reload via fallback watcher when beadsPath is a real file!
+		_, errCmd := m.Update(SnapshotErrorMsg{
+			Err:              fmt.Errorf("fatal snapshot failure"),
+			Recoverable:      false,
+			WorkerGeneration: m.backgroundWorker.Generation(),
+		})
+		if m.backgroundWorker != nil {
+			t.Fatalf("expected backgroundWorker cleared after unrecoverable SnapshotErrorMsg")
+		}
+		if m.watcher == nil || errCmd == nil {
+			t.Fatalf("expected fallback watcher and WatchFileCmd after unrecoverable SnapshotErrorMsg; watcher=%v cmd=%v", m.watcher, errCmd)
+		}
+
+		// Negative control: git: beadsPath must NOT start a filesystem watcher on SnapshotErrorMsg
+		mGit := NewModel(initIssues, nil, "")
+		t.Cleanup(mGit.Stop)
+		mGit.analysis.WaitForPhase2()
+		mGit.beadsPath = "git:HEAD~1"
+		_, gitCmd := mGit.Update(SnapshotErrorMsg{Err: fmt.Errorf("boom"), Recoverable: false})
+		if mGit.watcher != nil || gitCmd != nil {
+			t.Fatalf("expected git: beadsPath not to create fallback watcher; watcher=%v cmd=%v", mGit.watcher, gitCmd)
+		}
+	})
+
+	t.Run("AsOfReferenceNowAcrossSubViewsAndSetSearchConfig", func(t *testing.T) {
+		refNow := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+		deferUntil := time.Date(2025, 1, 20, 0, 0, 0, 0, time.UTC) // Future at refNow, expired at wall-clock 2026!
+		closedRecent := time.Date(2025, 1, 14, 10, 0, 0, 0, time.UTC)
+
+		issues := []model.Issue{
+			{
+				ID: "ASOF-DEF", Title: "Deferred at refNow", Status: model.StatusOpen, Priority: 1,
+				IssueType: model.TypeTask, Labels: []string{"core"},
+				CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow.Add(-24 * time.Hour),
+				DeferUntil: &deferUntil,
+			},
+			{
+				ID: "ASOF-RDY", Title: "Ready login auth", Status: model.StatusOpen, Priority: 2,
+				IssueType: model.TypeFeature, Labels: []string{"core"},
+				CreatedAt: refNow.Add(-72 * time.Hour), UpdatedAt: refNow.Add(-2 * time.Hour),
+			},
+			{
+				ID: "ASOF-DONE", Title: "Closed yesterday at refNow", Status: model.StatusClosed, Priority: 1,
+				IssueType: model.TypeBug, Labels: []string{"core"},
+				CreatedAt: refNow.Add(-96 * time.Hour), UpdatedAt: closedRecent, ClosedAt: &closedRecent,
+			},
+		}
+
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
+
+		if !m.analysisReferenceTime().Equal(refNow) {
+			t.Fatalf("analysisReferenceTime() = %v, want %v", m.analysisReferenceTime(), refNow)
+		}
+
+		// Board: ASOF-DEF must be deferred ([deferred], NOT claimable) and show relative age anchored to refNow,
+		// whereas wall-clock Board treats past 2025 deferral as expired.
+		boardAtRef := m.board.View(120, 30)
+		if !strings.Contains(boardAtRef, "[deferred]") || !strings.Contains(boardAtRef, "1d ago") {
+			t.Fatalf("expected Board at refNow to render [deferred] badge and 1d ago age for ASOF-DEF:\n%s", boardAtRef)
+		}
+		mWall := NewModel(copyIssues(issues), nil, "")
+		t.Cleanup(mWall.Stop)
+		mWall.analysis.WaitForPhase2()
+		boardAtWall := mWall.board.View(120, 30)
+		if strings.Contains(boardAtWall, "[deferred]") {
+			t.Fatalf("negative control: expected wall-clock Board NOT to render [deferred] for past 2025 deferral")
+		}
+
+		// Actionable view: ASOF-DEF must not appear as ready actionable work at refNow
+		m.refreshActionableView()
+		actRendered := m.actionableView.Render()
+		if strings.Contains(actRendered, "ASOF-DEF") {
+			t.Fatalf("expected deferred ASOF-DEF excluded from Actionable view at refNow:\n%s", actRendered)
+		}
+
+		// Label Dashboard ('[') and Velocity Comparison ('v') use refNow (closed yesterday -> Velocity7d > 0)
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'['}})
+		if len(m.labelHealthCache.Labels) == 0 || m.labelHealthCache.Labels[0].Velocity.ClosedLast7Days == 0 {
+			t.Fatalf("expected LabelHealth at refNow to count ASOF-DONE in ClosedLast7Days, got %+v", m.labelHealthCache.Labels)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+		velView := m.velocityComparison.View()
+		if strings.Contains(velView, "No labels with closed issues") {
+			t.Fatalf("expected VelocityComparison at refNow to show velocity data:\n%s", velView)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		// Sprint Dashboard ('P') uses refNow (4 days remaining at refNow vs Ended on wall-clock control)
+		m.sprints = []model.Sprint{{
+			ID:        "sprint-hist",
+			Name:      "Historical Sprint",
+			StartDate: time.Date(2025, 1, 10, 0, 0, 0, 0, time.UTC),
+			EndDate:   time.Date(2025, 1, 20, 0, 0, 0, 0, time.UTC),
+			BeadIDs:   []string{"ASOF-RDY", "ASOF-DONE"},
+		}}
+		m.openSprintView()
+		if !strings.Contains(m.sprintViewText, "Remaining: 4 days") {
+			t.Fatalf("expected Sprint dashboard at refNow to show 'Remaining: 4 days', got:\n%s", m.sprintViewText)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		mWall.sprints = m.sprints
+		mWall.openSprintView()
+		if strings.Contains(mWall.sprintViewText, "Remaining: 4 days") {
+			t.Fatalf("negative control: wall-clock Sprint dashboard should not show 'Remaining: 4 days':\n%s", mWall.sprintViewText)
+		}
+		mWall.Update(tea.KeyMsg{Type: tea.KeyEsc})
+
+		// SetSearchConfig + Init() + 'H' auto-enabling semanticSearchEnabled
+		customW := search.Weights{TextRelevance: 0.5, PageRank: 0.2, Status: 0.1, Impact: 0.1, Priority: 0.05, Recency: 0.05}
+		m.SetSearchConfig(search.SearchConfig{
+			Mode:       search.SearchModeHybrid,
+			Preset:     search.PresetImpactFirst,
+			Weights:    customW,
+			HasWeights: true,
+		})
+		if !m.semanticHybridEnabled || !m.semanticSearchEnabled || m.semanticHybridPreset != search.PresetImpactFirst {
+			t.Fatalf("SetSearchConfig(hybrid) failed: hybrid=%v semantic=%v preset=%q", m.semanticHybridEnabled, m.semanticSearchEnabled, m.semanticHybridPreset)
+		}
+		if !m.semanticSearch.GetReferenceTime().Equal(refNow) {
+			t.Fatalf("expected semanticSearch ReferenceTime=%v, got %v", refNow, m.semanticSearch.GetReferenceTime())
+		}
+		if initCmd := m.Init(); initCmd == nil {
+			t.Fatalf("expected Init() to schedule index+hybrid build commands")
+		}
+		// Negative control: SetSearchConfig(text) disables hybrid/semantic
+		m.SetSearchConfig(search.SearchConfig{Mode: search.SearchModeText, Preset: search.PresetTextOnly})
+		if m.semanticHybridEnabled || m.semanticSearchEnabled {
+			t.Fatalf("SetSearchConfig(text) should disable hybrid & semantic, got hybrid=%v semantic=%v", m.semanticHybridEnabled, m.semanticSearchEnabled)
+		}
+		// Pressing 'H' in focusList auto-enables semanticSearchEnabled!
+		m.focused = focusList
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+		if !m.semanticHybridEnabled || !m.semanticSearchEnabled {
+			t.Fatalf("pressing 'H' should enable both semanticHybridEnabled and semanticSearchEnabled")
+		}
+	})
+
+	t.Run("LabelCandidateScopingInRecipesAndMarkdownExport", func(t *testing.T) {
+		now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+		issues := []model.Issue{
+			{
+				ID: "CTX-UNLABELED", Title: "Unlabeled Blocker Neighbor", Status: model.StatusOpen,
+				Priority: 0, IssueType: model.TypeTask,
+				CreatedAt: now.Add(-60 * 24 * time.Hour), UpdatedAt: now.Add(-45 * 24 * time.Hour),
+			},
+			{
+				ID: "LAB-BLOCKED", Title: "Labeled Blocked", Status: model.StatusOpen,
+				Priority: 2, IssueType: model.TypeTask, Labels: []string{"api"},
+				CreatedAt: now.Add(-50 * 24 * time.Hour), UpdatedAt: now.Add(-40 * 24 * time.Hour),
+				Dependencies: []*model.Dependency{{DependsOnID: "CTX-UNLABELED", Type: model.DepBlocks}},
+			},
+			{
+				ID: "LAB-READY", Title: "Labeled Ready", Status: model.StatusOpen,
+				Priority: 1, IssueType: model.TypeTask, Labels: []string{"api"},
+				CreatedAt: now.Add(-10 * 24 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour),
+			},
+		}
+		cands := map[string]bool{"LAB-BLOCKED": true, "LAB-READY": true}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(issues),
+			CandidateIDs: cands,
+			ReferenceNow: now,
+		})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+
+		for _, rName := range []string{"default", "high-impact", "blocked", "stale"} {
+			r := m.recipeLoader.Get(rName)
+			if r == nil {
+				continue
+			}
+			got, err := applyRecipeToIssues(m.issues, m.analyzer, m.analysis, m.triageScores, r, now)
+			if err != nil {
+				t.Fatalf("recipe %q error: %v", rName, err)
+			}
+			for _, iss := range got {
+				if iss.ID == "CTX-UNLABELED" {
+					t.Fatalf("recipe %q leaked unlabeled 1-hop context neighbor CTX-UNLABELED!", rName)
+				}
+			}
+		}
+
+		// Export under --label (m.candidateIDs != nil, no active recipe/filter) must exclude CTX-UNLABELED
+		exported := m.exportIssuesForCurrentView()
+		for _, iss := range exported {
+			if iss.ID == "CTX-UNLABELED" {
+				t.Fatalf("exportIssuesForCurrentView() leaked unlabeled neighbor CTX-UNLABELED")
+			}
+		}
+		if len(exported) != 2 {
+			t.Fatalf("expected 2 candidate issues exported under --label, got %d", len(exported))
+		}
+
+		// Export under non-default sort mode ('s') must preserve user's active sort order!
+		mUnscoped := NewModel([]model.Issue{
+			{ID: "B-OLD", Title: "Old High Prio", Status: model.StatusOpen, Priority: 0, CreatedAt: now.Add(-10 * time.Hour), UpdatedAt: now},
+			{ID: "A-NEW", Title: "New Low Prio", Status: model.StatusOpen, Priority: 3, CreatedAt: now.Add(-1 * time.Hour), UpdatedAt: now},
+		}, nil, "", ReadinessScope{ReferenceNow: now})
+		t.Cleanup(mUnscoped.Stop)
+		mUnscoped.analysis.WaitForPhase2()
+		mUnscoped.sortMode = SortCreatedAsc
+		mUnscoped.applyFilter()
+		sortedExport := mUnscoped.exportIssuesForCurrentView()
+		if len(sortedExport) != 2 || sortedExport[0].ID != "B-OLD" {
+			t.Fatalf("expected SortCreatedAsc export order [B-OLD, A-NEW], got [%s, %s]", sortedExport[0].ID, sortedExport[1].ID)
+		}
+		mUnscoped.sortMode = SortCreatedDesc
+		mUnscoped.applyFilter()
+		sortedDescExport := mUnscoped.exportIssuesForCurrentView()
+		if len(sortedDescExport) != 2 || sortedDescExport[0].ID != "A-NEW" {
+			t.Fatalf("expected SortCreatedDesc export order [A-NEW, B-OLD], got [%s, %s]", sortedDescExport[0].ID, sortedDescExport[1].ID)
+		}
+	})
+
+	t.Run("History_MouseZOrder_SidebarClickGuard_ModalResize_DupV8_RecipeFooterTheme", func(t *testing.T) {
+		now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+		var issues []model.Issue
+		for i := 1; i <= 15; i++ {
+			issues = append(issues, model.Issue{
+				ID: fmt.Sprintf("UX-%02d", i), Title: fmt.Sprintf("UX Issue %02d", i),
+				Status: model.StatusOpen, Priority: (i % 3) + 1, IssueType: model.TypeTask,
+				Labels: []string{"ux"}, CreatedAt: now.Add(-time.Duration(i) * time.Hour), UpdatedAt: now,
+			})
+		}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: now})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+		// 1) History: preserve Tab-selected searchMode across '/', clear filters on first Esc, page with pgdown/pgup
+		histMap := make(map[string]correlation.BeadHistory, 15)
+		var commits []correlation.CorrelatedCommit
+		for i := 1; i <= 15; i++ {
+			id := fmt.Sprintf("UX-%02d", i)
+			sha := fmt.Sprintf("%040d", i)
+			cc := correlation.CorrelatedCommit{
+				BeadID: id, SHA: sha, ShortSHA: sha[:7],
+				Message: fmt.Sprintf("commit %d", i), Author: "alice", Timestamp: now.Add(-time.Duration(i) * time.Minute),
+				Confidence: 0.9,
+			}
+			histMap[id] = correlation.BeadHistory{BeadID: id, Title: id, Status: "open", Commits: []correlation.CorrelatedCommit{cc}}
+			commits = append(commits, cc)
+		}
+		report := &correlation.HistoryReport{Histories: histMap, CommitIndex: make(correlation.CommitIndex)}
+		for _, cc := range commits {
+			report.CommitIndex[cc.SHA] = []string{cc.BeadID}
+		}
+		m.historyView = NewHistoryModel(report, m.theme)
+		m.historyView.SetSize(120, 28)
+		m.historyLoading = false
+		m.historyLoadFailed = false
+		m.historyReportDataGeneration = m.semanticDataGeneration
+		m.isHistoryView = true
+		m.focused = focusHistory
+
+		// Start search ('/'), cycle mode with Tab twice (-> Author), Enter to finish, '/' again -> must preserve Author!
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+		m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		wantMode := m.historyView.GetSearchModeName()
+		if wantMode == "All" {
+			t.Fatalf("expected Tab to advance searchMode from All, got %q", wantMode)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+		m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+		if got := m.historyView.GetSearchModeName(); got != wantMode {
+			t.Fatalf("StartSearch() reset searchMode: got %q, want %q", got, wantMode)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // confirm active query "a"
+
+		// First Esc in History clears active filter without exiting History view; second Esc exits History view!
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if !m.isHistoryView || m.historyView.SearchQuery() != "" || m.historyView.HasActiveFilters() {
+			t.Fatalf("first Esc should clear History filters and stay in History view: isHistory=%v query=%q", m.isHistoryView, m.historyView.SearchQuery())
+		}
+		// PageDown / PageUp in focusHistory even when shortcuts sidebar is open!
+		m.showShortcutsSidebar = true
+		m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		if m.historyView.selectedBead == 0 {
+			t.Fatalf("expected PgDown in focusHistory to advance selection even with shortcuts sidebar open")
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+		m.showShortcutsSidebar = false
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.isHistoryView || m.focused != focusList {
+			t.Fatalf("second Esc should exit History view to focusList; isHistory=%v focused=%v", m.isHistoryView, m.focused)
+		}
+
+		// Board PgDown / PgUp
+		m.isBoardView = true
+		m.focused = focusBoard
+		m.board.SetIssues(m.issues)
+		m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+		if m.board.selectedRow[ColOpen] == 0 {
+			t.Fatalf("expected PgDown in focusBoard to advance Open column selection")
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+		m.isBoardView = false
+		m.focused = focusList
+
+		// 2) Mouse wheel Z-order + Shortcuts Sidebar / Footer click guard
+		m.alerts = []drift.Alert{
+			{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "UX-01", Message: "a1"},
+			{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "UX-02", Message: "a2"},
+		}
+		m.showAlertsPanel = true
+		m.alertsCursor = 0
+		listBefore := m.list.Index()
+		m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+		if m.alertsCursor != 1 || m.list.Index() != listBefore {
+			t.Fatalf("wheel over showAlertsPanel: alertsCursor=%d (want 1), listIndex=%d (want %d)", m.alertsCursor, m.list.Index(), listBefore)
+		}
+		m.showAlertsPanel = false
+
+		// CassSessionModal wheel navigation
+		m.cassModal = NewCassSessionModal("UX-01", cass.CorrelationResult{
+			TopSessions: []cass.ScoredResult{
+				{SearchResult: cass.SearchResult{Agent: "claude"}},
+				{SearchResult: cass.SearchResult{Agent: "codex"}},
+			},
+		}, m.theme)
+		m.showCassModal = true
+		m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+		if m.cassModal.selected != 1 {
+			t.Fatalf("expected CassSessionModal wheel down to select index 1, got %d", m.cassModal.selected)
+		}
+		m.showCassModal = false
+
+		// Sidebar & footer left-click guard vs valid list row click
+		m.showShortcutsSidebar = true
+		m.applyContentSizing()
+		m.selectListIndex(0)
+		sidebarX := m.mainContentWidth() + 2
+		m.Update(tea.MouseMsg{X: sidebarX, Y: m.listChromeLines() + 2, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+		if m.list.Index() != 0 || m.focused != focusList {
+			t.Fatalf("click inside shortcuts sidebar mutated state: index=%d focused=%v", m.list.Index(), m.focused)
+		}
+		m.Update(tea.MouseMsg{X: 5, Y: m.height - 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+		if m.list.Index() != 0 {
+			t.Fatalf("click on footer row mutated list index: %d", m.list.Index())
+		}
+		// Positive control: clicking row 2 inside list panel selects index 2
+		m.Update(tea.MouseMsg{X: 5, Y: m.listChromeLines() + 2, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+		if m.list.Index() != 2 {
+			t.Fatalf("positive control: click inside list panel row 2 got index=%d, want 2", m.list.Index())
+		}
+		m.showShortcutsSidebar = false
+
+		// 3) Duplicate v8 blurb consolidation copy + narrow modal resize (<64 cols)
+		agentDir := t.TempDir()
+		t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+		t.Setenv("BV_NO_SAVED_CONFIG", "")
+		dupContent := "# Repo\n\n" + agents.AgentBlurb + "\n\n" + agents.AgentBlurb + "\n"
+		agentFile := filepath.Join(agentDir, "AGENTS.md")
+		if err := os.WriteFile(agentFile, []byte(dupContent), 0o644); err != nil {
+			t.Fatalf("write duplicate AGENTS.md: %v", err)
+		}
+		_ = agents.RecordAccept(agentDir) // Even after accepting v8 previously, duplicate v8 blurbs must prompt to consolidate!
+		checkMsg, ok := CheckAgentFileCmd(agentDir)().(AgentFileCheckMsg)
+		if !ok || !checkMsg.ShouldPrompt || !checkMsg.IsUpgrade || checkMsg.ExistingVersion != agents.BlurbVersion {
+			t.Fatalf("expected CheckAgentFileCmd on duplicate v8 blurbs to prompt upgrade/consolidation, got %+v", checkMsg)
+		}
+		m.workDir = agentDir
+		m.Update(checkMsg)
+		m.Update(tea.WindowSizeMsg{Width: 48, Height: 22})
+		modalView := m.agentPromptModal.View()
+		if !strings.Contains(modalView, "duplicate") || strings.Contains(modalView, "outdated") {
+			t.Fatalf("expected duplicate-v8 consolidation copy without claiming outdated:\n%s", modalView)
+		}
+		for _, line := range strings.Split(modalView, "\n") {
+			if ansi.StringWidth(line) > 48 {
+				t.Fatalf("narrow 48-col AgentPromptModal line overflowed (%d > 48): %q", ansi.StringWidth(line), line)
+			}
+		}
+		// Accept consolidates duplicate v8 blurbs down to 1
+		m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		afterBytes, err := os.ReadFile(agentFile)
+		if err != nil {
+			t.Fatalf("read consolidated AGENTS.md: %v", err)
+		}
+		if agents.NeedsUpdate(string(afterBytes)) {
+			t.Fatalf("expected consolidated AGENTS.md to pass !NeedsUpdate()")
+		}
+		m.Update(tea.WindowSizeMsg{Width: 200, Height: 30})
+
+		// 4) Recipe normalized GroupBy + canonical Blockers + configured-row badges + footer count excluding IssueGroupItem headers + ◌ metrics… + clearAllFilters repo scope
+		customRec := &recipe.Recipe{
+			Name: "grouped-custom",
+			View: recipe.ViewConfig{
+				GroupBy: " Status ",
+				Columns: []string{"id", "title", " Blockers "},
+			},
+		}
+		m.statusMsg = ""
+		m.setActiveRecipe(customRec)
+		m.applyRecipe(customRec)
+		if !m.recipeGroupingActive() {
+			t.Fatalf("expected recipeGroupingActive() true for GroupBy=' Status '")
+		}
+		if m.recipeBlockerCounts == nil {
+			t.Fatalf("expected canonical column ' Blockers ' to populate recipeBlockerCounts")
+		}
+		if gotCount := m.displayedIssueCount(); gotCount != len(issues) {
+			t.Fatalf("displayedIssueCount() = %d, want %d (must exclude IssueGroupItem headers)", gotCount, len(issues))
+		}
+		footer := m.renderFooter()
+		if !strings.Contains(footer, fmt.Sprintf("%d issues", len(issues))) {
+			t.Fatalf("expected footer count badge '%d issues', got:\n%s", len(issues), footer)
+		}
+		// Phase 2 progress badge when m.snapshot == nil && !m.analysis.IsPhase2Ready()
+		savedAnalysis := m.analysis
+		m.analysis = &analysis.GraphStats{}
+		if p2Footer := m.renderFooter(); !strings.Contains(p2Footer, "◌ metrics…") {
+			t.Fatalf("expected '◌ metrics…' in footer when m.snapshot == nil && !m.analysis.IsPhase2Ready(), got:\n%s", p2Footer)
+		}
+		m.analysis = savedAnalysis
+
+		// delegate renderConfiguredRow preserves search/priority/diff/triage badges
+		del := IssueDelegate{
+			Theme:             m.theme,
+			ShowPriorityHints: true,
+			PriorityHints:     map[string]*analysis.PriorityRecommendation{"UX-01": {IssueID: "UX-01", Direction: "increase"}},
+			ShowSearchScores:  true,
+			WorkspaceMode:     true,
+			Columns:           []string{"id", "title", "blockers"},
+			BlockerCounts:     map[string]int{"UX-01": 3},
+		}
+		var rowBuf strings.Builder
+		del.renderConfiguredRow(&rowBuf, m.list, 0, IssueItem{
+			Issue:          issues[0],
+			RepoPrefix:     "ux",
+			DiffStatus:     DiffStatusNew,
+			SearchScore:    0.88,
+			SearchScoreSet: true,
+			UnblocksCount:  2,
+			IsBlocker:      true,
+		})
+		rowOut := rowBuf.String()
+		for _, token := range []string{"0.88", "↑", "🔓2", DiffStatusNew.Badge()} {
+			if !strings.Contains(rowOut, token) {
+				t.Fatalf("expected renderConfiguredRow to preserve badge %q, got: %q", token, rowOut)
+			}
+		}
+
+		// clearAllFilters clears workspace activeRepos too
+		m.workspaceMode = true
+		m.activeRepos = map[string]bool{"ux": true}
+		if !m.hasActiveFilters() {
+			t.Fatalf("expected hasActiveFilters() true when workspace activeRepos != nil")
+		}
+		m.clearAllFilters()
+		if m.activeRepos != nil || m.activeRecipe != nil {
+			t.Fatalf("expected clearAllFilters() to clear activeRepos and activeRecipe")
+		}
+
+		// 5) Help Graph View text, Tree/Sprint footer hints, LabelDashboard single-line truncation, and Light-theme AdaptiveColor
+		m.showHelp = true
+		helpBody, _ := m.buildHelpBodyLines()
+		joinedHelp := strings.Join(helpBody, "\n")
+		if !strings.Contains(joinedHelp, "J/K") || !strings.Contains(joinedHelp, "Page nodes") {
+			t.Fatalf("expected ? Help Graph View section to list J/K Scroll up/down and PgUp/Dn Page nodes:\n%s", joinedHelp)
+		}
+		helpFooter := m.renderFooter()
+		if !strings.Contains(helpFooter, "tutorial") || strings.Contains(helpFooter, "Press any key") {
+			t.Fatalf("expected accurate showHelp footer hints, got: %s", helpFooter)
+		}
+		m.showHelp = false
+
+		m.focused = focusTree
+		if treeFooter := m.renderFooter(); !strings.Contains(treeFooter, "expand") {
+			t.Fatalf("expected focusTree footer hint, got: %s", treeFooter)
+		}
+		m.focused = focusSprint
+		m.isSprintView = true
+		if sprintFooter := m.renderFooter(); !strings.Contains(sprintFooter, "P/esc") {
+			t.Fatalf("expected focusSprint footer hint, got: %s", sprintFooter)
+		}
+		m.isSprintView = false
+		m.focused = focusList
+
+		// LabelDashboard single-line cell truncation with newline in label name
+		ld := NewLabelDashboardModel(m.theme)
+		ld.SetSize(70, 20)
+		ld.SetData([]analysis.LabelHealth{{
+			Label:       "super-long-multiline\nlabel-name-that-must-not-wrap",
+			HealthLevel: analysis.HealthLevelHealthy,
+			Health:      95,
+		}})
+		for _, ln := range strings.Split(ld.View(), "\n") {
+			if ansi.StringWidth(ln) > 70 {
+				t.Fatalf("LabelDashboard row exceeded width 70 (%d): %q", ansi.StringWidth(ln), ln)
+			}
+		}
+
+		// Light-theme contrast: TriageStar, TriageUnblocks, PriorityDownArrow use adaptive Light/Dark colors
+		for name, fg := range map[string]lipgloss.TerminalColor{
+			"TriageStar":        m.theme.TriageStar.GetForeground(),
+			"TriageUnblocks":    m.theme.TriageUnblocks.GetForeground(),
+			"PriorityDownArrow": m.theme.PriorityDownArrow.GetForeground(),
+		} {
+			switch ac := fg.(type) {
+			case lipgloss.CompleteAdaptiveColor:
+				if ac.Light.TrueColor == "" || ac.Dark.TrueColor == "" || ac.Light.TrueColor == ac.Dark.TrueColor {
+					t.Fatalf("%s expected distinct Light/Dark CompleteAdaptiveColor, got %#v", name, ac)
+				}
+			case lipgloss.AdaptiveColor:
+				if ac.Light == "" || ac.Dark == "" || ac.Light == ac.Dark {
+					t.Fatalf("%s expected distinct Light/Dark AdaptiveColor, got %#v", name, ac)
+				}
+			default:
+				t.Fatalf("%s expected adaptive Light/Dark color, got %#v", name, fg)
+			}
+		}
+	})
+
+	t.Run("Wave15_1_AuditRemediations_B2_Through_B6", func(t *testing.T) {
+		// [B-2] Unstarted BackgroundWorker.SetRecipe must NOT spawn background goroutines,
+		// and SetProjectDir must invalidate loadMetadataUnchanged dedup!
+		dirA := t.TempDir()
+		dirB := t.TempDir()
+		extBeads := t.TempDir()
+		jsonlPath := filepath.Join(extBeads, "issues.jsonl")
+		oldLine := `{"id":"B2-1","title":"Stale candidate","status":"open","priority":1,"issue_type":"task","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z"}` + "\n"
+		if err := os.WriteFile(jsonlPath, []byte(oldLine), 0o644); err != nil {
+			t.Fatalf("write jsonl: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(dirB, ".bv"), 0o755); err != nil {
+			t.Fatalf("mkdir .bv: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dirB, ".bv", "drift.yaml"), []byte("stale_threshold_days: 99999\n"), 0o644); err != nil {
+			t.Fatalf("write drift.yaml: %v", err)
+		}
+
+		bw, err := NewBackgroundWorker(WorkerConfig{
+			BeadsPath:     jsonlPath,
+			ProjectDir:    dirA,
+			DebounceDelay: 50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("NewBackgroundWorker: %v", err)
+		}
+		recDefault := &recipe.Recipe{Name: "default"}
+		bw.SetRecipe(recDefault)
+		bw.mu.RLock()
+		scheduledBeforeStart := bw.processScheduled
+		forcedBeforeStart := bw.forceNext
+		bw.mu.RUnlock()
+		if scheduledBeforeStart || !forcedBeforeStart {
+			bw.Stop()
+			t.Fatalf("[B-2] unstarted SetRecipe spawned goroutine or missed forceNext: scheduled=%v forceNext=%v", scheduledBeforeStart, forcedBeforeStart)
+		}
+		resA := bw.buildSnapshotResultContext(t.Context(), false)
+		if resA.err != nil || resA.snapshot == nil {
+			bw.Stop()
+			t.Fatalf("[B-2] buildSnapshotResultContext dirA failed: %v", resA.err)
+		}
+		if resA.snapshot.Analysis != nil {
+			resA.snapshot.Analysis.WaitForPhase2()
+		}
+		bw.mu.Lock()
+		bw.snapshot = resA.snapshot
+		bw.lastHash = resA.snapshot.DataHash
+		bw.projectDir = dirB // simulate projectDir change even if forceNext were false
+		bw.mu.Unlock()
+		resB := bw.buildSnapshotResultContext(t.Context(), false)
+		if resB.err != nil || resB.snapshot == nil {
+			bw.Stop()
+			t.Fatalf("[B-2] expected loadMetadataUnchanged=false when projectDir changed from dirA to dirB, got snapshot=%v err=%v", resB.snapshot, resB.err)
+		}
+		if resB.snapshot.Analysis != nil {
+			resB.snapshot.Analysis.WaitForPhase2()
+		}
+		bw.Stop()
+
+		// [B-3] BuildHybridMetricsAtCmd / startSemanticHybridBuild honors ReferenceNow for DeferUntil
+		refNow := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+		deferFutureAtRef := refNow.Add(48 * time.Hour) // 2025-01-17: deferred at refNow, expired at wall-clock 2026!
+		hybIssues := []model.Issue{{
+			ID: "HYB-DEF", Title: "Deferred OAuth", Status: model.StatusOpen, Priority: 1,
+			IssueType: model.TypeTask, CreatedAt: refNow.Add(-24 * time.Hour), UpdatedAt: refNow.Add(-2 * time.Hour),
+			DeferUntil: &deferFutureAtRef,
+			Comments:   []*model.Comment{{Author: "alice", Text: "check", CreatedAt: refNow.Add(-2 * time.Hour)}},
+		}}
+		mHyb := NewModel(copyIssues(hybIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mHyb.Stop)
+		mHyb.analysis.WaitForPhase2()
+
+		hybCmd := mHyb.startSemanticHybridBuild()
+		if hybCmd == nil {
+			t.Fatalf("[B-3] expected non-nil hybrid build cmd")
+		}
+		hybMsg, ok := hybCmd().(HybridMetricsReadyMsg)
+		if !ok || hybMsg.Error != nil || hybMsg.Cache == nil {
+			t.Fatalf("[B-3] HybridMetricsReadyMsg error: %+v", hybMsg)
+		}
+		mAtRef, foundRef := hybMsg.Cache.Get("HYB-DEF")
+		if !foundRef || mAtRef.Status != "deferred" {
+			t.Fatalf("[B-3] expected HYB-DEF metric Status='deferred' at refNow, got found=%v status=%q", foundRef, mAtRef.Status)
+		}
+		statusOnlyW := search.Weights{Status: 1.0}
+		scoreAtRef, err := search.NewHybridScorerAt(statusOnlyW, hybMsg.Cache, refNow).Score("HYB-DEF", 0)
+		if err != nil || scoreAtRef.ComponentScores["status"] != 0.2 {
+			t.Fatalf("[B-3] expected deferred status score 0.2 at refNow, got %+v (err=%v)", scoreAtRef, err)
+		}
+		// Negative control: wall-clock BuildHybridMetricsCmd treats 2025-01-17 deferral as expired ("open" -> 1.0)
+		wallMsg := BuildHybridMetricsCmd(copyIssues(hybIssues), 1, 1)().(HybridMetricsReadyMsg)
+		mAtWall, _ := wallMsg.Cache.Get("HYB-DEF")
+		if mAtWall.Status != "open" {
+			t.Fatalf("[B-3] negative control: expected wall-clock status='open', got %q", mAtWall.Status)
+		}
+
+		// [B-5] + [R2-B1] SetSearchConfig custom weights via real ParseSearchConfig (which sets Preset="default")
+		// persist across 'H' toggles, display 'custom', and cycle to 'default' first on 'alt+h'!
+		parsedCustomCfg, parseErr := search.ParseSearchConfig(
+			string(search.SearchModeHybrid),
+			"",
+			`{"text":0.1,"pagerank":0.9,"status":0,"impact":0,"priority":0,"recency":0}`,
+		)
+		if parseErr != nil {
+			t.Fatalf("[R2-B1] ParseSearchConfig failed: %v", parseErr)
+		}
+		customW := parsedCustomCfg.Weights
+		mHyb.SetSearchConfig(parsedCustomCfg)
+		mHyb.Update(hybMsg) // mark hybrid metrics ready
+		if mHyb.semanticHybridPreset != "custom" || mHyb.semanticHybridLabel() != "custom" {
+			t.Fatalf("[B-5/R2-B1] expected preset/label 'custom', got preset=%q label=%q", mHyb.semanticHybridPreset, mHyb.semanticHybridLabel())
+		}
+		if !strings.Contains(mHyb.statusMsg, "(custom)") {
+			t.Fatalf("[B-5/R2-B1] expected ready statusMsg to display '(custom)', got %q", mHyb.statusMsg)
+		}
+		// Toggle 'H' off and back on: custom weights must survive!
+		mHyb.focused = focusList
+		mHyb.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+		mHyb.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'H'}})
+		cfgAfterToggle := mHyb.semanticSearch.getHybridConfig()
+		if !cfgAfterToggle.CustomWeights || cfgAfterToggle.Weights != customW.Normalize() {
+			t.Fatalf("[B-5] custom weights clobbered by 'H' toggle: %+v", cfgAfterToggle)
+		}
+		if !strings.Contains(mHyb.statusMsg, "(custom)") {
+			t.Fatalf("[B-5] expected statusMsg after 'H' re-enable to say '(custom)', got %q", mHyb.statusMsg)
+		}
+		// Pressing 'alt+h' explicitly cycles to 'default' first (never skipping 'default') and clears custom weights!
+		mHyb.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}, Alt: true})
+		if mHyb.semanticHybridHasCustomWeights || mHyb.semanticSearch.getHybridConfig().CustomWeights {
+			t.Fatalf("[B-5] expected alt+h to clear custom weights")
+		}
+		if mHyb.semanticHybridPreset != search.PresetDefault {
+			t.Fatalf("[R2-B1] expected alt+h from 'custom' to land on 'default', got %q", mHyb.semanticHybridPreset)
+		}
+
+		// [B-4] SnapshotReadyMsg with active non-actionable recipe ('default') under CandidateIDs must NOT leak unlabeled neighbors
+		candIssues := []model.Issue{
+			{ID: "CTX-0", Title: "Unlabeled Blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+			{
+				ID: "CAND-1", Title: "Labeled Candidate", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+				Labels: []string{"api"}, CreatedAt: refNow, UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{{DependsOnID: "CTX-0", Type: model.DepBlocks}},
+			},
+		}
+		defRec := mHyb.recipeLoader.Get("default")
+		snapUnscoped := NewSnapshotBuilder(copyIssues(candIssues)).WithRecipe(defRec).Build()
+		snapUnscoped.Analysis.WaitForPhase2()
+		mCand := NewModel(copyIssues(candIssues), defRec, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(candIssues),
+			CandidateIDs: map[string]bool{"CAND-1": true},
+			ReferenceNow: refNow,
+		})
+		t.Cleanup(mCand.Stop)
+		mCand.analysis.WaitForPhase2()
+		mCand.Update(SnapshotReadyMsg{Snapshot: snapUnscoped})
+		for _, raw := range mCand.list.Items() {
+			if it, ok := raw.(IssueItem); ok && it.Issue.ID == "CTX-0" {
+				t.Fatalf("[B-4] SnapshotReadyMsg leaked non-candidate neighbor CTX-0 into m.list!")
+			}
+		}
+		if gotBoardTotal := mCand.board.TotalCount(); gotBoardTotal != 1 {
+			t.Fatalf("[B-4] expected exactly 1 candidate card on m.board, got %d", gotBoardTotal)
+		}
+		for colIdx, colIssues := range mCand.board.columns {
+			for _, iss := range colIssues {
+				if iss.ID == "CTX-0" {
+					t.Fatalf("[B-4] SnapshotReadyMsg leaked non-candidate neighbor CTX-0 as a card into m.board column %d!", colIdx)
+				}
+			}
+		}
+
+		// [B-6] Delegate/Comment/History/Export ReferenceNow, FileChangedMsg closed-issue triage guard, <52-col modals, loading click guard
+		var delBuf strings.Builder
+		mHyb.updateListDelegate()
+		delRef := IssueDelegate{Theme: mHyb.theme, ReferenceNow: refNow}
+		delRef.Render(&delBuf, mHyb.list, 0, IssueItem{Issue: hybIssues[0]})
+		if !strings.Contains(delBuf.String(), "1d ago") {
+			t.Fatalf("[B-6] expected IssueDelegate with ReferenceNow to render '1d ago', got: %q", delBuf.String())
+		}
+		mHyb.isSplitView = true
+		mHyb.Update(tea.WindowSizeMsg{Width: 120, Height: 45})
+		mHyb.updateViewportContent()
+		if strippedVP := ansi.Strip(mHyb.viewport.View()); !strings.Contains(strippedVP, "2h ago") {
+			t.Fatalf("[B-6] expected comment timestamp in detail viewport to render '2h ago' at refNow, got:\n%s", strippedVP)
+		}
+		if expName := mHyb.generateExportFilename(); !strings.Contains(expName, "2025-01-15") {
+			t.Fatalf("[B-6] expected generateExportFilename() to use refNow date 2025-01-15, got %q", expName)
+		}
+
+		// HistoryModel SetReferenceTime
+		ccHist := correlation.CorrelatedCommit{
+			BeadID: "HYB-DEF", SHA: strings.Repeat("a", 40), ShortSHA: "aaaaaaa",
+			Message: "fix auth", Author: "Bob", Timestamp: refNow.Add(-3 * time.Hour), Confidence: 0.9,
+		}
+		hRep := &correlation.HistoryReport{
+			Histories: map[string]correlation.BeadHistory{
+				"HYB-DEF": {
+					BeadID: "HYB-DEF", Title: "Deferred OAuth", Status: "open",
+					Commits: []correlation.CorrelatedCommit{ccHist},
+					Events:  []correlation.BeadEvent{{BeadID: "HYB-DEF", EventType: correlation.EventCreated, Timestamp: refNow.Add(-3 * time.Hour), Author: "Bob"}},
+				},
+			},
+			CommitIndex: correlation.CommitIndex{ccHist.SHA: []string{"HYB-DEF"}},
+		}
+		mHyb.historyView.SetReport(hRep)
+		mHyb.historyView.SetSize(120, 28)
+		histCommitLines := strings.Join(mHyb.historyView.renderCommitDetail(ccHist, 60, true), "\n")
+		if !strings.Contains(histCommitLines, "3h ago") {
+			t.Fatalf("[B-6] expected HistoryModel commit detail to render '3h ago' at refNow, got:\n%s", histCommitLines)
+		}
+
+		// FileChangedMsg must NOT copy stale open-issue triage badges onto newly closed issues during Phase 1!
+		reloadDir := t.TempDir()
+		reloadJSONL := filepath.Join(reloadDir, "issues.jsonl")
+		closedLine := `{"id":"CLS-1","title":"Just closed","status":"closed","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}` + "\n"
+		if err := os.WriteFile(reloadJSONL, []byte(closedLine), 0o644); err != nil {
+			t.Fatalf("write reloadJSONL: %v", err)
+		}
+		t.Setenv("BV_BACKGROUND_MODE", "0")
+		mReload := NewModel([]model.Issue{{
+			ID: "CLS-1", Title: "Previously open", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: refNow, UpdatedAt: refNow,
+		}}, nil, reloadJSONL)
+		t.Cleanup(mReload.Stop)
+		mReload.analysis.WaitForPhase2()
+		mReload.triageScores["CLS-1"] = 0.95
+		mReload.quickWinSet["CLS-1"] = true
+		mReload.blockerSet["CLS-1"] = true
+		mReload.unblocksMap["CLS-1"] = []string{"OTHER-1"}
+		_, _ = mReload.Update(FileChangedMsg{})
+		mReload.analysis.WaitForPhase2()
+		for _, raw := range mReload.list.Items() {
+			if it, ok := raw.(IssueItem); ok && it.Issue.ID == "CLS-1" {
+				if it.TriageScore != 0 || it.IsQuickWin || it.IsBlocker || it.UnblocksCount != 0 {
+					t.Fatalf("[B-6] newly closed issue CLS-1 retained stale Phase-1 triage badges: %+v", it)
+				}
+			}
+		}
+
+		// Narrow <52-col modal clamp on CassSessionModal & UpdateModal
+		cm := NewCassSessionModal("HYB-DEF", cass.CorrelationResult{}, mHyb.theme)
+		cm.SetSize(48, 22)
+		if cm.effectiveWidth() > 44 {
+			t.Fatalf("[B-6] expected CassSessionModal effectiveWidth <= 44 at 48 cols, got %d", cm.effectiveWidth())
+		}
+		for _, line := range strings.Split(cm.CenterModal(48, 22), "\n") {
+			if w := ansi.StringWidth(line); w > 48 {
+				t.Fatalf("[B-6] CassSessionModal overflowed 48 cols (width=%d): %q", w, line)
+			}
+		}
+		um := NewUpdateModal("v1.2.3", "", mHyb.theme)
+		um.SetSize(48, 22)
+		if um.effectiveWidth() > 44 {
+			t.Fatalf("[B-6] expected UpdateModal effectiveWidth <= 44 at 48 cols, got %d", um.effectiveWidth())
+		}
+		for _, line := range strings.Split(um.CenterModal(48, 22), "\n") {
+			if w := ansi.StringWidth(line); w > 48 {
+				t.Fatalf("[B-6] UpdateModal overflowed 48 cols (width=%d): %q", w, line)
+			}
+		}
+
+		// Loading screen click guard (snapshotInitPending && snapshot == nil)
+		mLoadClick := NewModel([]model.Issue{
+			{ID: "L-1", Title: "One", Status: model.StatusOpen, Priority: 1, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "L-2", Title: "Two", Status: model.StatusOpen, Priority: 2, CreatedAt: refNow, UpdatedAt: refNow},
+		}, nil, "")
+		t.Cleanup(mLoadClick.Stop)
+		mLoadClick.analysis.WaitForPhase2()
+		mLoadClick.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+		mLoadClick.selectListIndex(0)
+		mLoadClick.snapshotInitPending = true
+		mLoadClick.snapshot = nil
+		mLoadClick.Update(tea.MouseMsg{X: 5, Y: mLoadClick.listChromeLines() + 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+		if mLoadClick.list.Index() != 0 {
+			t.Fatalf("[B-6] click during cold-start loading screen mutated list index to %d", mLoadClick.list.Index())
 		}
 	})
 }

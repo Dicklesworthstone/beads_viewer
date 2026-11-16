@@ -1491,29 +1491,31 @@ type Model struct {
 	historyLoadCommand           historyLoadCommandFactory
 
 	// Filter and sort state
-	currentFilter            string
-	sortMode                 SortMode // bv-3ita: current sort mode
-	semanticSearchEnabled    bool
-	semanticIndexBuilding    bool
-	semanticDataGeneration   uint64
-	semanticIndexBuildGen    uint64
-	semanticIndexBuildData   uint64
-	semanticIndexSaver       semanticIndexSaveFunc
-	semanticIndexSaveActive  *semanticIndexSaveRequest
-	semanticIndexSavePending *semanticIndexSaveRequest
-	semanticSearch           *SemanticSearch
-	semanticHybridEnabled    bool
-	semanticHybridPreset     search.PresetName
-	semanticHybridBuilding   bool
-	semanticHybridBuildGen   uint64
-	semanticHybridBuildData  uint64
-	semanticHybridReady      bool
-	semanticQueryGeneration  uint64
-	semanticFilterBuilding   bool
-	semanticFilterDataGen    uint64
-	semanticFilterQueryGen   uint64
-	semanticFilterTerm       string
-	lastSearchTerm           string
+	currentFilter                  string
+	sortMode                       SortMode // bv-3ita: current sort mode
+	semanticSearchEnabled          bool
+	semanticIndexBuilding          bool
+	semanticDataGeneration         uint64
+	semanticIndexBuildGen          uint64
+	semanticIndexBuildData         uint64
+	semanticIndexSaver             semanticIndexSaveFunc
+	semanticIndexSaveActive        *semanticIndexSaveRequest
+	semanticIndexSavePending       *semanticIndexSaveRequest
+	semanticSearch                 *SemanticSearch
+	semanticHybridEnabled          bool
+	semanticHybridPreset           search.PresetName
+	semanticHybridCustomWeights    search.Weights
+	semanticHybridHasCustomWeights bool
+	semanticHybridBuilding         bool
+	semanticHybridBuildGen         uint64
+	semanticHybridBuildData        uint64
+	semanticHybridReady            bool
+	semanticQueryGeneration        uint64
+	semanticFilterBuilding         bool
+	semanticFilterDataGen          uint64
+	semanticFilterQueryGen         uint64
+	semanticFilterTerm             string
+	lastSearchTerm                 string
 
 	// Stats (cached)
 	countOpen    int
@@ -1576,6 +1578,8 @@ type Model struct {
 	sourceVersion              uint64
 	sourceReloadRequest        uint64
 	sourceReloadCancel         context.CancelFunc
+	ownedAnalysis              *analysis.GraphStats
+	analysisCancel             context.CancelFunc
 	sourceStaleReason          string
 	pendingTrackerRefresh      *model.IssueOrigin
 	pendingExportSource        string
@@ -1875,6 +1879,27 @@ func (m *Model) finishSemanticIndexSave(msg semanticIndexSaveDoneMsg) tea.Cmd {
 	return m.queueSemanticIndexSave(*pending)
 }
 
+func (m *Model) syncSemanticHybridConfig(enabled bool) {
+	if m.semanticSearch == nil {
+		return
+	}
+	if m.semanticHybridHasCustomWeights {
+		m.semanticSearch.SetHybridConfigWithWeights(enabled, m.semanticHybridPreset, m.semanticHybridCustomWeights)
+	} else {
+		m.semanticSearch.SetHybridConfig(enabled, m.semanticHybridPreset)
+	}
+}
+
+func (m *Model) semanticHybridLabel() string {
+	if m.semanticHybridHasCustomWeights && (m.semanticHybridPreset == "" || m.semanticHybridPreset == "custom") {
+		return "custom"
+	}
+	if m.semanticHybridPreset == "" {
+		return string(search.PresetDefault)
+	}
+	return string(m.semanticHybridPreset)
+}
+
 func (m *Model) startSemanticHybridBuild() tea.Cmd {
 	if m.semanticSearch == nil {
 		return nil
@@ -1889,7 +1914,11 @@ func (m *Model) startSemanticHybridBuild() tea.Cmd {
 	if m.analyzer != nil {
 		readiness = m.analyzer.Readiness()
 	}
-	return BuildHybridMetricsCmd(m.issuesForAsync(), m.semanticDataGeneration, m.semanticHybridBuildGen, readiness)
+	refNow := m.referenceNow
+	if refNow.IsZero() {
+		refNow = m.analysisReferenceTime()
+	}
+	return BuildHybridMetricsAtCmd(m.issuesForAsync(), m.semanticDataGeneration, m.semanticHybridBuildGen, refNow, readiness)
 }
 
 func (m *Model) startSemanticFilter(term string) tea.Cmd {
@@ -2232,6 +2261,7 @@ func (m *Model) updateListDelegate() {
 		MetricNames:       recipeMetricNames(m.activeRecipe),
 		MetricValues:      m.recipeMetricValues,
 		BlockerCounts:     m.recipeBlockerCounts,
+		ReferenceNow:      m.referenceNow,
 	}
 	if m.activeRecipe != nil {
 		delegate.Columns = m.activeRecipe.View.Columns
@@ -2463,7 +2493,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	if w := feedbackWeightsForBeadsPath(beadsPath); w != nil {
 		analyzer.SetWeights(*w)
 	}
-	graphStats := analyzer.AnalyzeAsync(context.Background())
+	analysisCtx, analysisCancel := context.WithCancel(context.Background())
+	graphStats := analyzer.AnalyzeAsync(analysisCtx)
 
 	// Sort issues
 	if activeRecipe != nil && activeRecipe.Sort.Field != "" {
@@ -2535,7 +2566,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	const defaultHeight = 40
 
 	// List setup - initialize with default dimensions so UI is immediately usable
-	delegate := IssueDelegate{Theme: theme, WorkspaceMode: false}
+	delegate := IssueDelegate{Theme: theme, WorkspaceMode: false, ReferenceNow: referenceNow}
 	l := list.New(items, delegate, defaultWidth, defaultHeight-3)
 	l.Title = ""
 	l.SetShowTitle(false)
@@ -2697,10 +2728,17 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	semanticSearch.SetReferenceTime(analyzer.Now())
 	semanticHybridEnabled := false
 	semanticHybridPreset := search.PresetDefault
+	var semanticHybridCustomWeights search.Weights
+	semanticHybridHasCustomWeights := false
 	if searchCfg, err := search.SearchConfigFromEnv(); err == nil {
 		semanticHybridEnabled = searchCfg.Mode == search.SearchModeHybrid
 		semanticHybridPreset = searchCfg.Preset
 		if searchCfg.HasWeights {
+			semanticHybridHasCustomWeights = true
+			semanticHybridCustomWeights = searchCfg.Weights
+			if !searchCfg.HasPreset {
+				semanticHybridPreset = search.PresetName("custom")
+			}
 			semanticSearch.SetHybridConfigWithWeights(semanticHybridEnabled, semanticHybridPreset, searchCfg.Weights)
 		} else if semanticHybridEnabled || semanticHybridPreset != search.PresetDefault {
 			semanticSearch.SetHybridConfig(semanticHybridEnabled, semanticHybridPreset)
@@ -2758,50 +2796,59 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		treeModel.SetReadOnly(true)
 	}
 
+	historyView := NewHistoryModel(nil, theme) // Initialize with empty report for safe search access
+	if !referenceNow.IsZero() {
+		historyView.SetReferenceTime(referenceNow)
+	}
+
 	m := Model{
-		issues:                  issues,
-		issueMap:                issueMap,
-		analyzer:                analyzer,
-		candidateIDs:            candidateIDs,
-		referenceNow:            referenceNow,
-		authorityIncomplete:     authorityIncomplete,
-		sourceDegraded:          sourceDegraded,
-		isExplicitDB:            isExplicitDB,
-		analysis:                graphStats,
-		beadsPath:               beadsPath,
-		watcher:                 fileWatcher,
-		snapshotInitPending:     backgroundWorker != nil,
-		instanceLock:            instLock,
-		list:                    l,
-		listItemsBuffer:         items,
-		listDataGeneration:      1,
-		listQueryGeneration:     1,
-		viewport:                vp,
-		renderer:                renderer,
-		board:                   board,
-		labelDashboard:          labelDashboard,
-		attentionView:           NewAttentionModel(theme),
-		velocityComparison:      velocityComparison,
-		shortcutsSidebar:        shortcutsSidebar,
-		graphView:               graphView,
-		tree:                    treeModel,
-		insightsPanel:           insightsPanel,
-		historyView:             NewHistoryModel(nil, theme), // Initialize with empty report for safe search access
-		theme:                   theme,
-		keyRegistry:             keyRegistry,
-		currentFilter:           "all",
-		semanticSearch:          semanticSearch,
-		semanticSearchEnabled:   semanticSearchEnabled,
-		semanticIndexSaver:      saveSemanticIndex,
-		semanticDataGeneration:  1,
-		semanticQueryGeneration: 1,
-		semanticHybridEnabled:   semanticHybridEnabled,
-		semanticHybridPreset:    semanticHybridPreset,
-		semanticHybridBuilding:  false,
-		semanticHybridReady:     false,
-		lastSearchTerm:          "",
-		focused:                 focusList,
-		splitPaneRatio:          0.4, // Default: list pane gets 40% of width
+		issues:                         issues,
+		issueMap:                       issueMap,
+		analyzer:                       analyzer,
+		candidateIDs:                   candidateIDs,
+		referenceNow:                   referenceNow,
+		authorityIncomplete:            authorityIncomplete,
+		sourceDegraded:                 sourceDegraded,
+		isExplicitDB:                   isExplicitDB,
+		analysis:                       graphStats,
+		ownedAnalysis:                  graphStats,
+		analysisCancel:                 analysisCancel,
+		beadsPath:                      beadsPath,
+		watcher:                        fileWatcher,
+		snapshotInitPending:            backgroundWorker != nil,
+		instanceLock:                   instLock,
+		list:                           l,
+		listItemsBuffer:                items,
+		listDataGeneration:             1,
+		listQueryGeneration:            1,
+		viewport:                       vp,
+		renderer:                       renderer,
+		board:                          board,
+		labelDashboard:                 labelDashboard,
+		attentionView:                  NewAttentionModel(theme),
+		velocityComparison:             velocityComparison,
+		shortcutsSidebar:               shortcutsSidebar,
+		graphView:                      graphView,
+		tree:                           treeModel,
+		insightsPanel:                  insightsPanel,
+		historyView:                    historyView,
+		theme:                          theme,
+		keyRegistry:                    keyRegistry,
+		currentFilter:                  "all",
+		semanticSearch:                 semanticSearch,
+		semanticSearchEnabled:          semanticSearchEnabled,
+		semanticIndexSaver:             saveSemanticIndex,
+		semanticDataGeneration:         1,
+		semanticQueryGeneration:        1,
+		semanticHybridEnabled:          semanticHybridEnabled,
+		semanticHybridPreset:           semanticHybridPreset,
+		semanticHybridCustomWeights:    semanticHybridCustomWeights,
+		semanticHybridHasCustomWeights: semanticHybridHasCustomWeights,
+		semanticHybridBuilding:         false,
+		semanticHybridReady:            false,
+		lastSearchTerm:                 "",
+		focused:                        focusList,
+		splitPaneRatio:                 0.4, // Default: list pane gets 40% of width
 		// Initialize as ready with default dimensions to eliminate "Initializing..." phase
 		ready:               true,
 		width:               defaultWidth,
@@ -2896,19 +2943,23 @@ func (m *Model) SetSearchConfig(cfg search.SearchConfig) {
 		return
 	}
 	preset := cfg.Preset
-	if preset == "" {
+	if cfg.HasWeights && !cfg.HasPreset && (preset == "" || preset == search.PresetDefault) {
+		preset = search.PresetName("custom")
+	} else if preset == "" {
 		preset = search.PresetDefault
 	}
 	hybrid := cfg.Mode == search.SearchModeHybrid
 	m.semanticHybridEnabled = hybrid
 	m.semanticHybridPreset = preset
+	m.semanticHybridHasCustomWeights = cfg.HasWeights
+	if cfg.HasWeights {
+		m.semanticHybridCustomWeights = cfg.Weights
+	} else {
+		m.semanticHybridCustomWeights = search.Weights{}
+	}
 	if m.semanticSearch != nil {
 		m.semanticSearch.SetReferenceTime(m.analysisReferenceTime())
-		if cfg.HasWeights {
-			m.semanticSearch.SetHybridConfigWithWeights(hybrid, preset, cfg.Weights)
-		} else {
-			m.semanticSearch.SetHybridConfig(hybrid, preset)
-		}
+		m.syncSemanticHybridConfig(hybrid)
 	}
 	if hybrid {
 		m.semanticSearchEnabled = m.semanticSearch != nil
@@ -3680,7 +3731,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.semanticHybridReady = false
 			if m.semanticSearch != nil {
 				m.semanticSearch.SetMetricsCache(nil)
-				m.semanticSearch.SetHybridConfig(false, m.semanticHybridPreset)
+				m.syncSemanticHybridConfig(false)
 			}
 			m.statusMsg = fmt.Sprintf("Hybrid search unavailable: %v", msg.Error)
 			m.statusIsError = true
@@ -3688,9 +3739,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.semanticSearch != nil && msg.Cache != nil {
 			m.semanticSearch.SetMetricsCache(msg.Cache)
+			m.syncSemanticHybridConfig(m.semanticHybridEnabled)
 		}
 		m.semanticHybridReady = msg.Cache != nil
-		m.statusMsg = fmt.Sprintf("Hybrid search ready (%s)", m.semanticHybridPreset)
+		m.statusMsg = fmt.Sprintf("Hybrid search ready (%s)", m.semanticHybridLabel())
 		m.statusIsError = false
 
 		// Recompute semantic results if hybrid is enabled and search is active.
@@ -4165,6 +4217,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Update legacy fields for backwards compatibility during migration
 		// Eventually these will be removed when all code reads from snapshot
+		m.cancelOwnedAnalysis()
 		m.issues = msg.Snapshot.Issues
 		m.issueMap = msg.Snapshot.IssueMap
 		m.analyzer = msg.Snapshot.Analyzer
@@ -4297,9 +4350,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.activeRecipe != nil {
 			// If the snapshot already includes recipe filtering/sorting AND no workspace
-			// repo filter is active, use it directly (bv-cwwd). When activeRepos != nil,
-			// re-apply over repoScopedIssues() so MaxItems never starves active repos.
-			if (!m.workspaceMode || m.activeRepos == nil) && snapshotMatchesActiveRecipe {
+			// repo filter, candidate scope, or custom reference clock is active, use it directly (bv-cwwd).
+			if (!m.workspaceMode || m.activeRepos == nil) && m.candidateIDs == nil && m.referenceNow.IsZero() && snapshotMatchesActiveRecipe {
 				filteredItems := make([]list.Item, 0, len(msg.Snapshot.ListItems))
 				filteredIssues := make([]model.Issue, 0, len(msg.Snapshot.ListItems))
 				recipeIDs := make(map[string]bool, len(msg.Snapshot.ListItems))
@@ -4793,8 +4845,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if w := feedbackWeightsForBeadsPath(m.beadsPath); w != nil {
 			m.analyzer.SetWeights(*w)
 		}
-		m.analysis = cachedAnalyzer.AnalyzeAsync(context.Background())
+		m.cancelOwnedAnalysis()
+		analysisCtx, analysisCancel := context.WithCancel(context.Background())
+		m.analysis = cachedAnalyzer.AnalyzeAsync(analysisCtx)
 		cacheHit := cachedAnalyzer.WasCacheHit()
+		if !cacheHit {
+			m.ownedAnalysis = m.analysis
+			m.analysisCancel = analysisCancel
+		} else {
+			analysisCancel()
+		}
 		if profileRefresh {
 			recordTiming("phase1_setup", time.Since(analysisStart))
 			debug.Log("refresh.phase1_cache_hit=%t issues=%d", cacheHit, len(newIssues))
@@ -4882,14 +4942,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				Impact:     m.analysis.GetCriticalPathScore(m.issues[i].ID),
 				RepoPrefix: issueRepoKey(m.issues[i]),
 			}
-			item.TriageScore = m.triageScores[m.issues[i].ID]
-			if reasons, exists := m.triageReasons[m.issues[i].ID]; exists {
-				item.TriageReason = reasons.Primary
-				item.TriageReasons = reasons.All
+			if !isClosedLikeStatus(m.issues[i].Status) {
+				item.TriageScore = m.triageScores[m.issues[i].ID]
+				if reasons, exists := m.triageReasons[m.issues[i].ID]; exists {
+					item.TriageReason = reasons.Primary
+					item.TriageReasons = reasons.All
+				}
+				item.IsQuickWin = m.quickWinSet[m.issues[i].ID]
+				item.IsBlocker = m.blockerSet[m.issues[i].ID]
+				item.UnblocksCount = len(m.unblocksMap[m.issues[i].ID])
 			}
-			item.IsQuickWin = m.quickWinSet[m.issues[i].ID]
-			item.IsBlocker = m.blockerSet[m.issues[i].ID]
-			item.UnblocksCount = len(m.unblocksMap[m.issues[i].ID])
 			items[i] = item
 		}
 		if profileRefresh {
@@ -5783,7 +5845,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.statusIsError = true
 					return m, nil
 				}
-				m.semanticSearch.SetHybridConfig(m.semanticHybridEnabled, m.semanticHybridPreset)
+				m.syncSemanticHybridConfig(m.semanticHybridEnabled)
 				if m.semanticHybridEnabled && !m.semanticSearchEnabled {
 					m.semanticSearchEnabled = true
 					m.list.Filter = m.semanticSearch.Filter
@@ -5806,7 +5868,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						cmds = append(cmds, hybridCmd)
 					}
 				} else if m.semanticHybridEnabled {
-					m.statusMsg = fmt.Sprintf("Hybrid search enabled (%s)", m.semanticHybridPreset)
+					m.statusMsg = fmt.Sprintf("Hybrid search enabled (%s)", m.semanticHybridLabel())
 				} else {
 					m.statusMsg = "Semantic search: text-only"
 				}
@@ -5826,6 +5888,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			case "alt+h", "alt+H":
 				m.statusIsError = false
+				m.semanticHybridHasCustomWeights = false
+				m.semanticHybridCustomWeights = search.Weights{}
 				m.semanticHybridPreset = nextHybridPreset(m.semanticHybridPreset)
 				if m.semanticSearch != nil {
 					m.semanticSearch.SetHybridConfig(m.semanticHybridEnabled, m.semanticHybridPreset)
@@ -10248,9 +10312,10 @@ func (m *Model) renderFooter() string {
 				mode = "semantic (indexing)"
 			}
 			if m.semanticHybridEnabled {
-				mode = fmt.Sprintf("hybrid/%s", m.semanticHybridPreset)
+				label := m.semanticHybridLabel()
+				mode = fmt.Sprintf("hybrid/%s", label)
 				if m.semanticHybridBuilding {
-					mode = fmt.Sprintf("hybrid/%s (metrics)", m.semanticHybridPreset)
+					mode = fmt.Sprintf("hybrid/%s (metrics)", label)
 				}
 			}
 		}
@@ -11849,6 +11914,9 @@ func (m *Model) listChromeLines() int {
 // they are already focused, so a click there is treated as a no-op rather than
 // guessing at their internal geometry. The viewer stays read-only.
 func (m *Model) handleLeftClick(x, y int) *Model {
+	if m.snapshotInitPending && m.snapshot == nil {
+		return m
+	}
 	if x < 0 || y < 0 || y >= m.height-1 || x >= m.mainContentWidth() {
 		return m
 	}
@@ -12150,7 +12218,7 @@ func (m *Model) updateViewportContent() {
 			}
 			sb.WriteString(fmt.Sprintf("> **%s** (%s)\n> \n> %s\n\n",
 				comment.Author,
-				FormatTimeRel(comment.CreatedAt),
+				FormatTimeRelAt(comment.CreatedAt, m.analysisReferenceTime()),
 				strings.ReplaceAll(comment.Text, "\n", "\n> ")))
 		}
 	}
@@ -12783,15 +12851,16 @@ func (m *Model) exportToMarkdown() {
 		opts.GraphIssues = graphIssues
 
 		var outPath string
+		exportDate := m.analysisReferenceTime().Format("2006-01-02")
 		switch opts.Format {
 		case "json":
-			jsonFilename := fmt.Sprintf("beads_export_%s.json", time.Now().Format("2006-01-02"))
+			jsonFilename := fmt.Sprintf("beads_export_%s.json", exportDate)
 			outPath = jsonFilename
 			if strings.TrimSpace(m.workDir) != "" {
 				outPath = filepath.Join(rootDir, jsonFilename)
 			}
 		case "mermaid":
-			mmdFilename := fmt.Sprintf("beads_export_%s.mmd", time.Now().Format("2006-01-02"))
+			mmdFilename := fmt.Sprintf("beads_export_%s.mmd", exportDate)
 			outPath = mmdFilename
 			if strings.TrimSpace(m.workDir) != "" {
 				outPath = filepath.Join(rootDir, mmdFilename)
@@ -12894,7 +12963,7 @@ func (m *Model) generateExportFilename() string {
 	}
 
 	// Format: beads_report_<project>_YYYY-MM-DD.md
-	timestamp := time.Now().Format("2006-01-02")
+	timestamp := m.analysisReferenceTime().Format("2006-01-02")
 	return fmt.Sprintf("beads_report_%s_%s.md", projectName, timestamp)
 }
 
@@ -13975,7 +14044,23 @@ func (m *Model) DisableInternalWatcher() {
 
 // Stop cleans up resources (file watcher, instance lock, background worker, etc.)
 // Should be called when the program exits
+func (m *Model) cancelOwnedAnalysis() {
+	if m == nil {
+		return
+	}
+	if m.analysisCancel != nil {
+		m.analysisCancel()
+		m.analysisCancel = nil
+	}
+	m.ownedAnalysis = nil
+}
+
 func (m *Model) Stop() {
+	ownedAnalysis := m.ownedAnalysis
+	m.cancelOwnedAnalysis()
+	if ownedAnalysis != nil {
+		ownedAnalysis.WaitForPhase2()
+	}
 	m.cancelHistoryLoad()
 	m.cancelPhase2Preparation()
 	m.cancelCassLookup()

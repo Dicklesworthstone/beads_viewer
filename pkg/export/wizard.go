@@ -275,8 +275,12 @@ func (w *Wizard) Run() (*WizardResult, error) {
 	}
 
 	// Check for saved configuration first (unless BV_NO_SAVED_CONFIG is set)
-	savedConfig, err := LoadWizardConfig()
-	skipSaved := env.NoSavedConfig.Get() != ""
+	skipSaved := strings.TrimSpace(env.NoSavedConfig.Get()) != ""
+	var savedConfig *WizardConfig
+	var err error
+	if !skipSaved {
+		savedConfig, err = w.loadSavedConfigForCurrentRepo()
+	}
 	if !skipSaved && err == nil && savedConfig != nil && savedConfig.DeployTarget != "" && w.matchesSavedConfigRepo(savedConfig) {
 		// Found saved config for this repository - ask if user wants to use it
 		useSaved, err := w.offerSavedConfig(savedConfig)
@@ -1158,8 +1162,16 @@ func (w *Wizard) PrintSuccess(result *WizardResult) {
 	fmt.Println("")
 }
 
+type persistedWizardConfig struct {
+	WizardConfig
+	Repos map[string]WizardConfig `json:"repos,omitempty"`
+}
+
 // WizardConfigPath returns the path to the wizard config file.
 func WizardConfigPath() string {
+	if xdg := strings.TrimSpace(env.Get("XDG_CONFIG_HOME")); xdg != "" {
+		return filepath.Join(xdg, "bv", "pages-wizard.json")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -1167,8 +1179,10 @@ func WizardConfigPath() string {
 	return filepath.Join(home, ".config", "bv", "pages-wizard.json")
 }
 
-// LoadWizardConfig loads previously saved wizard configuration.
-func LoadWizardConfig() (*WizardConfig, error) {
+func readPersistedWizardConfig() (*persistedWizardConfig, error) {
+	if strings.TrimSpace(env.NoSavedConfig.Get()) != "" {
+		return nil, nil
+	}
 	path := WizardConfigPath()
 	if path == "" {
 		return nil, fmt.Errorf("could not determine config path")
@@ -1182,23 +1196,109 @@ func LoadWizardConfig() (*WizardConfig, error) {
 		return nil, err
 	}
 
-	var config WizardConfig
-	if err := json.Unmarshal(data, &config); err != nil {
+	var persisted persistedWizardConfig
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return nil, err
+	}
+	return &persisted, nil
+}
+
+// LoadWizardConfig loads previously saved wizard configuration (most recently saved).
+func LoadWizardConfig() (*WizardConfig, error) {
+	persisted, err := readPersistedWizardConfig()
+	if err != nil || persisted == nil {
+		return nil, err
+	}
+	cfg := persisted.WizardConfig
+	return &cfg, nil
+}
+
+// LoadWizardConfigForRepo loads previously saved wizard configuration for a specific
+// repository or .beads path without clobbering or cross-matching other repositories.
+func LoadWizardConfigForRepo(beadsPath string) (*WizardConfig, error) {
+	persisted, err := readPersistedWizardConfig()
+	if err != nil || persisted == nil {
 		return nil, err
 	}
 
-	return &config, nil
+	var targetRoot string
+	if root := projectRootFromBeadsPath(beadsPath); root != "" {
+		targetRoot = normalizeWizardRepoPath(root)
+	} else if cwd, err := os.Getwd(); err == nil {
+		targetRoot = normalizeWizardRepoPath(cwd)
+	}
+	if targetRoot == "" {
+		return nil, nil
+	}
+
+	if len(persisted.Repos) > 0 {
+		if entry, ok := persisted.Repos[targetRoot]; ok {
+			cp := entry
+			return &cp, nil
+		}
+		for key, entry := range persisted.Repos {
+			if normalizeWizardRepoPath(key) == targetRoot || savedWizardConfigRepoRoot(&entry) == targetRoot {
+				cp := entry
+				return &cp, nil
+			}
+		}
+	}
+
+	if savedWizardConfigRepoRoot(&persisted.WizardConfig) == targetRoot {
+		cp := persisted.WizardConfig
+		return &cp, nil
+	}
+	return nil, nil
 }
 
-// SaveWizardConfig saves wizard configuration for future runs.
+func (w *Wizard) loadSavedConfigForCurrentRepo() (*WizardConfig, error) {
+	if w == nil {
+		return LoadWizardConfigForRepo("")
+	}
+	return LoadWizardConfigForRepo(w.beadsPath)
+}
+
+// SaveWizardConfig saves wizard configuration for future runs while preserving
+// configurations saved for other repositories.
 func SaveWizardConfig(config *WizardConfig) error {
 	if config == nil {
 		return errors.New("wizard config is nil")
+	}
+	if strings.TrimSpace(env.NoSavedConfig.Get()) != "" {
+		return nil
 	}
 
 	path := WizardConfigPath()
 	if path == "" {
 		return fmt.Errorf("could not determine config path")
+	}
+
+	repos := make(map[string]WizardConfig)
+	if existingData, err := os.ReadFile(path); err == nil {
+		var existing persistedWizardConfig
+		if json.Unmarshal(existingData, &existing) == nil {
+			for k, v := range existing.Repos {
+				if strings.TrimSpace(k) != "" {
+					repos[k] = v
+				}
+			}
+			if legacyRoot := savedWizardConfigRepoRoot(&existing.WizardConfig); legacyRoot != "" {
+				if _, exists := repos[legacyRoot]; !exists && existing.WizardConfig.DeployTarget != "" {
+					repos[legacyRoot] = existing.WizardConfig
+				}
+			}
+		}
+	}
+
+	if currentRoot := savedWizardConfigRepoRoot(config); currentRoot != "" {
+		repos[currentRoot] = *config
+	}
+
+	persisted := persistedWizardConfig{
+		WizardConfig: *config,
+	}
+	if len(repos) > 0 {
+		persisted.Repos = repos
 	}
 
 	// Ensure directory exists
@@ -1207,7 +1307,7 @@ func SaveWizardConfig(config *WizardConfig) error {
 		return fmt.Errorf("create wizard config directory: %w", err)
 	}
 
-	data, err := json.MarshalIndent(config, "", "  ")
+	data, err := json.MarshalIndent(persisted, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal wizard config: %w", err)
 	}

@@ -40,6 +40,7 @@ func (w *BackgroundWorker) reserveLoadRetry(loopCtx context.Context, now time.Ti
 	}
 	attempt := &loadRetryAttempt{loop: loopCtx, generation: w.generation, failure: w.lastError}
 	w.processScheduled = true
+	w.beginAsyncWorkLocked()
 	return attempt
 }
 
@@ -52,6 +53,9 @@ func (a *loadRetryAttempt) validLocked(w *BackgroundWorker) bool {
 
 func (w *BackgroundWorker) retryFailedLoad(loopCtx context.Context, now time.Time) {
 	if attempt := w.reserveLoadRetry(loopCtx, now); attempt != nil {
-		go w.processSnapshotContext(w.buildSnapshotResultContext, attempt)
+		go func() {
+			defer w.endAsyncWork()
+			w.processSnapshotContext(w.buildSnapshotResultContext, attempt)
+		}()
 	}
 }

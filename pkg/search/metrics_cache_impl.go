@@ -1,6 +1,7 @@
 package search
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -45,14 +46,17 @@ type AnalyzerMetricsLoader struct {
 	readiness *model.ReadinessIndex
 	cache     *analysis.Cache
 	config    *analysis.AnalysisConfig
-	now       time.Time
-	hasNow    bool
 
-	// issues is a private deep clone and never changes after construction.
-	// Hash it once, including for a zero-value/empty loader. Mutable loader
-	// implementations still recompute their hash through ensureFresh.
-	hashOnce sync.Once
-	dataHash string
+	hashMu          sync.Mutex
+	now             time.Time
+	hasNow          bool
+	baseComputed    bool
+	baseHash        string
+	deferIndices    []int
+	cachedHash      string
+	cachedDeferMask uint64
+	cachedDeferBits []byte
+	scratchBits     []byte
 }
 
 // NewAnalyzerMetricsLoader creates a loader that derives metrics from issues.
@@ -84,12 +88,18 @@ func (l *AnalyzerMetricsLoader) WithConfig(config *analysis.AnalysisConfig) *Ana
 
 // WithNow overrides the reference clock used to evaluate future defer_until timestamps.
 func (l *AnalyzerMetricsLoader) WithNow(now time.Time) *AnalyzerMetricsLoader {
+	if l == nil {
+		return nil
+	}
+	l.hashMu.Lock()
 	l.now = now
-	l.hasNow = true
+	l.hasNow = !now.IsZero()
+	l.cachedHash = ""
+	l.hashMu.Unlock()
 	return l
 }
 
-func (l *AnalyzerMetricsLoader) referenceNow() time.Time {
+func (l *AnalyzerMetricsLoader) referenceNowLocked() time.Time {
 	if l != nil && l.hasNow {
 		return l.now
 	}
@@ -99,6 +109,15 @@ func (l *AnalyzerMetricsLoader) referenceNow() time.Time {
 		}
 	}
 	return time.Now().UTC()
+}
+
+func (l *AnalyzerMetricsLoader) referenceNow() time.Time {
+	if l == nil {
+		return time.Now().UTC()
+	}
+	l.hashMu.Lock()
+	defer l.hashMu.Unlock()
+	return l.referenceNowLocked()
 }
 
 // LoadMetrics computes metrics for all issues using the analysis engine.
@@ -116,29 +135,114 @@ func (l *AnalyzerMetricsLoader) ComputeDataHash() (string, error) {
 	return l.snapshotHash(), nil
 }
 
-func (l *AnalyzerMetricsLoader) snapshotHash() string {
-	l.hashOnce.Do(func() {
-		baseHash := analysis.ComputeDataHash(l.issues)
-		if l.readiness == nil || len(l.issues) == 0 {
-			l.dataHash = baseHash
-			return
+func (l *AnalyzerMetricsLoader) ensureBaseLocked() {
+	if l.baseComputed {
+		return
+	}
+	rawHash := analysis.ComputeDataHash(l.issues)
+	for i := range l.issues {
+		if l.issues[i].DeferUntil != nil {
+			l.deferIndices = append(l.deferIndices, i)
 		}
+	}
+	if len(l.deferIndices) > 1 {
+		sort.Slice(l.deferIndices, func(i, j int) bool {
+			return l.issues[l.deferIndices[i]].ID < l.issues[l.deferIndices[j]].ID
+		})
+	}
+	if l.readiness == nil || len(l.issues) == 0 {
+		l.baseHash = rawHash
+	} else {
 		ids := make([]string, len(l.issues))
 		for i := range l.issues {
 			ids[i] = l.issues[i].ID
 		}
 		sort.Strings(ids)
 		h := sha256.New()
-		h.Write([]byte(baseHash))
+		h.Write([]byte(rawHash))
 		for _, id := range ids {
 			h.Write([]byte{0})
 			h.Write([]byte(id))
 			h.Write([]byte{':'})
 			h.Write([]byte(string(l.readiness.DependencyState(id))))
 		}
-		l.dataHash = "v" + hex.EncodeToString(h.Sum(nil)[:8])
-	})
-	return l.dataHash
+		l.baseHash = "v" + hex.EncodeToString(h.Sum(nil)[:8])
+	}
+	l.baseComputed = true
+}
+
+func (l *AnalyzerMetricsLoader) snapshotHash() string {
+	return l.snapshotHashAt(time.Time{}, false)
+}
+
+func (l *AnalyzerMetricsLoader) snapshotHashAt(refNow time.Time, hasRefNow bool) string {
+	if l == nil {
+		return analysis.ComputeDataHash(nil)
+	}
+	l.hashMu.Lock()
+	defer l.hashMu.Unlock()
+
+	l.ensureBaseLocked()
+	if len(l.deferIndices) == 0 {
+		if l.cachedHash == "" {
+			l.cachedHash = l.baseHash
+		}
+		return l.cachedHash
+	}
+
+	now := refNow
+	if !hasRefNow {
+		now = l.referenceNowLocked()
+	}
+
+	if len(l.deferIndices) <= 64 {
+		var mask uint64
+		for bit, idx := range l.deferIndices {
+			if l.issues[idx].IsDeferredAt(now) {
+				mask |= 1 << uint(bit)
+			}
+		}
+		if l.cachedHash != "" && mask == l.cachedDeferMask {
+			return l.cachedHash
+		}
+		l.cachedDeferMask = mask
+	} else {
+		if cap(l.scratchBits) < len(l.deferIndices) {
+			l.scratchBits = make([]byte, len(l.deferIndices))
+		} else {
+			l.scratchBits = l.scratchBits[:len(l.deferIndices)]
+		}
+		for k, idx := range l.deferIndices {
+			if l.issues[idx].IsDeferredAt(now) {
+				l.scratchBits[k] = '1'
+			} else {
+				l.scratchBits[k] = '0'
+			}
+		}
+		if l.cachedHash != "" && bytes.Equal(l.scratchBits, l.cachedDeferBits) {
+			return l.cachedHash
+		}
+		if cap(l.cachedDeferBits) < len(l.scratchBits) {
+			l.cachedDeferBits = make([]byte, len(l.scratchBits))
+		} else {
+			l.cachedDeferBits = l.cachedDeferBits[:len(l.scratchBits)]
+		}
+		copy(l.cachedDeferBits, l.scratchBits)
+	}
+
+	h := sha256.New()
+	h.Write([]byte(l.baseHash))
+	for _, idx := range l.deferIndices {
+		h.Write([]byte{0, 'd', ':'})
+		h.Write([]byte(l.issues[idx].ID))
+		if l.issues[idx].IsDeferredAt(now) {
+			h.Write([]byte{':', '1'})
+		} else {
+			h.Write([]byte{':', '0'})
+		}
+	}
+	l.cachedHash = "v" + hex.EncodeToString(h.Sum(nil)[:8])
+	return l.cachedHash
 }
 
 // LoadMetricsWithHash computes metrics and hash atomically from the same issue set.
@@ -229,7 +333,7 @@ func (l *AnalyzerMetricsLoader) computeMetricsAndHash(includeHash bool) (map[str
 
 	var hash string
 	if includeHash {
-		hash = l.snapshotHash()
+		hash = l.snapshotHashAt(refNow, true)
 	}
 	return metrics, hash
 }

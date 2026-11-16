@@ -1,6 +1,7 @@
 package workspace_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -766,5 +767,102 @@ func TestWorkspaceAndDriftConfigRejectUnknownYAMLFields(t *testing.T) {
 	}
 	if _, err := drift.LoadConfig(driftDir); err != nil {
 		t.Fatalf("drift.LoadConfig() comment-only failed: %v", err)
+	}
+}
+
+func TestAggregateLoader_JSONLOnlySubRepoPopulatesOriginWorkingDirectory(t *testing.T) {
+	wsRoot := t.TempDir()
+	apiDir := filepath.Join(wsRoot, "services", "api")
+	apiBeads := filepath.Join(apiDir, ".beads")
+	if err := os.MkdirAll(apiBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// JSONL-only sub-repo (no metadata.json, no beads.db).
+	if err := os.WriteFile(filepath.Join(apiBeads, "issues.jsonl"), []byte(`{"id":"bv-1","title":"Sub-repo task","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wantApiDir := apiDir
+	if eval, err := filepath.EvalSymlinks(apiDir); err == nil {
+		wantApiDir = filepath.Clean(eval)
+	}
+
+	cfg := &workspace.Config{
+		Name: "mono",
+		Repos: []workspace.RepoConfig{
+			{Name: "api", Path: "services/api", Prefix: "api-"},
+		},
+	}
+	agg := workspace.NewAggregateLoader(cfg, wsRoot)
+	issues, _, err := agg.LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("AggregateLoader.LoadAll failed: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("loaded %d issues, want 1", len(issues))
+	}
+	if issues[0].Origin == nil {
+		t.Fatal("expected non-nil IssueOrigin on workspace issue")
+	}
+	if issues[0].Origin.LocalID != "bv-1" {
+		t.Fatalf("Origin.LocalID = %q, want %q", issues[0].Origin.LocalID, "bv-1")
+	}
+	if issues[0].Origin.WorkingDirectory != wantApiDir {
+		t.Fatalf("Origin.WorkingDirectory = %q, want %q", issues[0].Origin.WorkingDirectory, wantApiDir)
+	}
+	actions := issues[0].Actions(true)
+	if actions.Show != nil || actions.Claim != nil || actions.UnavailableReason == "" {
+		t.Fatalf("JSONL-only workspace sub-repo must remain read-only for CLI actions: %+v", actions)
+	}
+
+	// [R2-A1]: Custom non-.beads beads_path ("trackers/beads") and external .beads/redirect both resolve Origin.WorkingDirectory to the sub-repo root.
+	customDir := filepath.Join(wsRoot, "services", "custom")
+	customTracker := filepath.Join(customDir, "trackers", "beads")
+	if err := os.MkdirAll(customTracker, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customTracker, "issues.jsonl"), []byte(`{"id":"c-1","title":"Custom tracker","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	redirRepoDir := filepath.Join(wsRoot, "services", "redir")
+	redirBeads := filepath.Join(redirRepoDir, ".beads")
+	centralStore := filepath.Join(wsRoot, "central-stores", "redir", ".beads")
+	if err := os.MkdirAll(redirBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(centralStore, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(redirBeads, "redirect"), []byte(centralStore+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(centralStore, "issues.jsonl"), []byte(`{"id":"r-1","title":"Redirected tracker","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg2 := &workspace.Config{
+		Name: "mono2",
+		Repos: []workspace.RepoConfig{
+			{Name: "custom", Path: "services/custom", BeadsPath: "trackers/beads", Prefix: "cust-"},
+			{Name: "redir", Path: "services/redir", Prefix: "red-"},
+		},
+	}
+	issues2, _, err := workspace.NewAggregateLoader(cfg2, wsRoot).LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll(cfg2) failed: %v", err)
+	}
+	wantCustom, _ := filepath.EvalSymlinks(customDir)
+	wantRedir, _ := filepath.EvalSymlinks(redirRepoDir)
+	gotDirs := map[string]string{}
+	for _, iss := range issues2 {
+		if iss.Origin != nil {
+			gotDirs[iss.ID] = iss.Origin.WorkingDirectory
+		}
+	}
+	if gotDirs["cust-c-1"] != filepath.Clean(wantCustom) {
+		t.Fatalf("custom beads_path Origin.WorkingDirectory = %q, want %q", gotDirs["cust-c-1"], filepath.Clean(wantCustom))
+	}
+	if gotDirs["red-r-1"] != filepath.Clean(wantRedir) {
+		t.Fatalf("redirected .beads Origin.WorkingDirectory = %q, want %q", gotDirs["red-r-1"], filepath.Clean(wantRedir))
 	}
 }

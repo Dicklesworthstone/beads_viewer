@@ -196,8 +196,10 @@ func isNegatedBoolFlagValue(val string) bool {
 
 var valueTakingTUIFlagSet = map[string]struct{}{
 	"as-of": {}, "cpu-profile": {}, "db": {}, "debug-height": {},
-	"debug-width": {}, "label": {}, "l": {}, "recipe": {}, "r": {},
-	"repo": {}, "theme": {}, "workspace": {},
+	"debug-width": {}, "history-limit": {}, "history-since": {},
+	"id-pattern": {}, "label": {}, "l": {}, "recipe": {}, "r": {},
+	"repo": {}, "search-mode": {}, "search-preset": {},
+	"search-weights": {}, "theme": {}, "workspace": {},
 }
 
 func shouldSuppressTTYQueries(args []string, envRobot, envTest bool) bool {

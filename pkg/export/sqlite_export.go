@@ -268,8 +268,8 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at, due_date, defer_until, external_ref, estimated_minutes, created_by, close_reason)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at, due_date, defer_until, external_ref, estimated_minutes, created_by, close_reason, is_template, pinned)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -340,6 +340,8 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 			estimatedMinutes,
 			createdBy,
 			closeReason,
+			boolToInt(issue.IsTemplate),
+			boolToInt(issue.Pinned),
 		)
 		if err != nil {
 			return fmt.Errorf("insert issue %s: %w", issue.ID, err)
@@ -347,6 +349,13 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 	}
 
 	return tx.Commit()
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 // insertDependencies inserts all dependencies into the database.
@@ -433,8 +442,10 @@ func (e *SQLiteExporter) insertComments(db *sql.DB) error {
 
 // insertMetrics inserts computed graph metrics for all issues.
 func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
-	if e.Stats == nil && len(e.Metrics) == 0 {
-		return nil // No stats or precomputed metrics available
+	// Get triage scores if available (prefer AllScores so #11+ candidates retain scores)
+	triageScores := e.buildTriageScoresMap()
+	if e.Stats == nil && len(e.Metrics) == 0 && len(triageScores) == 0 {
+		return nil // No stats, precomputed metrics, or triage scores available
 	}
 
 	tx, err := db.Begin()
@@ -496,14 +507,6 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 		}
 		blocksCount[dep.DependsOnID]++
 		blockedByCount[dep.IssueID]++
-	}
-
-	// Get triage scores if available
-	triageScores := make(map[string]float64)
-	if e.Triage != nil {
-		for _, rec := range e.Triage.Recommendations {
-			triageScores[rec.ID] = rec.Score
-		}
 	}
 
 	if e.Stats != nil {
@@ -815,7 +818,32 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error {
 	// Write triage output
 	if e.Triage != nil {
-		if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "triage.json"), e.Triage); err != nil {
+		triageOut := *e.Triage
+		if triageOut.RecommendationsByTrack == nil &&
+			triageOut.RecommendationsByLabel == nil &&
+			len(triageOut.Recommendations) > 0 &&
+			len(e.Issues) > 0 {
+			valueIssues := make([]model.Issue, 0, len(e.Issues))
+			for _, iss := range e.Issues {
+				if iss != nil {
+					valueIssues = append(valueIssues, *iss)
+				}
+			}
+			grouped := analysis.ComputeTriageWithOptionsAndTime(valueIssues, analysis.TriageOptions{
+				GroupByTrack:   true,
+				GroupByLabel:   true,
+				ActionableOnly: true,
+				Readiness:      e.Config.Readiness,
+				UseFastConfig:  true,
+				WaitForPhase2:  true,
+			}, e.exportTimestamp())
+			triageOut.RecommendationsByTrack = grouped.RecommendationsByTrack
+			triageOut.RecommendationsByLabel = grouped.RecommendationsByLabel
+		}
+		if e.envelopeClaimsUnproven(&triageOut) {
+			suppressExportGroupedClaims(&triageOut)
+		}
+		if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "triage.json"), &triageOut); err != nil {
 			return fmt.Errorf("write triage.json: %w", err)
 		}
 
@@ -840,6 +868,90 @@ func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error
 	}
 
 	return nil
+}
+
+func (e *SQLiteExporter) buildTriageScoresMap() map[string]float64 {
+	triageScores := make(map[string]float64)
+	if e.Triage == nil {
+		return triageScores
+	}
+	if len(e.Triage.AllScores) > 0 {
+		for id, score := range e.Triage.AllScores {
+			triageScores[id] = score
+		}
+		return triageScores
+	}
+	for _, rec := range e.Triage.Recommendations {
+		triageScores[rec.ID] = rec.Score
+	}
+	return triageScores
+}
+
+func (e *SQLiteExporter) envelopeClaimsUnproven(triage *analysis.TriageResult) bool {
+	if raw, ok := e.Config.RobotEnvelope["source_authority"]; ok && len(raw) > 0 {
+		var sa struct {
+			ClaimSafe *bool `json:"claim_safe"`
+		}
+		if err := json.Unmarshal(raw, &sa); err == nil && sa.ClaimSafe != nil && !*sa.ClaimSafe {
+			return true
+		}
+	}
+	if triage != nil && triage.Commands.ClaimTop == "" && len(triage.QuickRef.TopPicks) == 0 && len(triage.Recommendations) > 0 {
+		if !triage.Recommendations[0].Claimable && triage.Recommendations[0].Actions.UnavailableReason != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func suppressExportGroupedClaims(triage *analysis.TriageResult) {
+	if triage == nil {
+		return
+	}
+	triage.Commands.ClaimTop = ""
+	triage.QuickRef.TopPicks = []analysis.TopPick{}
+	triage.QuickWins = []analysis.QuickWin{}
+
+	suppress := func(recs []analysis.Recommendation) []analysis.Recommendation {
+		if recs == nil {
+			return nil
+		}
+		cloned := append([]analysis.Recommendation(nil), recs...)
+		for i := range cloned {
+			cloned[i].Claimable = false
+			cloned[i].Actions.Claim = nil
+			cloned[i].Actions.UnavailableReason = "source authority is incomplete or stale"
+			cloned[i].Action = "Inspect source diagnostics before claiming work"
+		}
+		return cloned
+	}
+
+	triage.Recommendations = suppress(triage.Recommendations)
+	if triage.BlockersToClear != nil {
+		clonedBlockers := append([]analysis.BlockerItem(nil), triage.BlockersToClear...)
+		for i := range clonedBlockers {
+			clonedBlockers[i].Actionable = false
+		}
+		triage.BlockersToClear = clonedBlockers
+	}
+	if triage.RecommendationsByTrack != nil {
+		clonedTracks := append([]analysis.TrackRecommendationGroup(nil), triage.RecommendationsByTrack...)
+		for i := range clonedTracks {
+			group := &clonedTracks[i]
+			group.TopPick, group.ClaimCommand = nil, ""
+			group.Recommendations = suppress(group.Recommendations)
+		}
+		triage.RecommendationsByTrack = clonedTracks
+	}
+	if triage.RecommendationsByLabel != nil {
+		clonedLabels := append([]analysis.LabelRecommendationGroup(nil), triage.RecommendationsByLabel...)
+		for i := range clonedLabels {
+			group := &clonedLabels[i]
+			group.TopPick, group.ClaimCommand = nil, ""
+			group.Recommendations = suppress(group.Recommendations)
+		}
+		triage.RecommendationsByLabel = clonedLabels
+	}
 }
 
 func (e *SQLiteExporter) writeRobotJSON(bundle *Bundle, path string, payload any) error {
@@ -1089,13 +1201,8 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 		sort.Strings(blockedByIDs[id])
 	}
 
-	// Get triage scores
-	triageScores := make(map[string]float64)
-	if e.Triage != nil {
-		for _, rec := range e.Triage.Recommendations {
-			triageScores[rec.ID] = rec.Score
-		}
-	}
+	// Get triage scores (prefer AllScores so #11+ candidates retain scores)
+	triageScores := e.buildTriageScoresMap()
 
 	var eigenvectorMap map[string]float64
 	if e.Stats != nil {

@@ -20,6 +20,7 @@ import (
 type GitLoader struct {
 	repoPath string
 	repoRoot string
+	beadsDir string
 	cache    *revisionCache
 	flight   singleflight.Group
 }
@@ -165,6 +166,36 @@ func NewGitLoader(repoPath string) *GitLoader {
 			maxAge:  5 * time.Minute,
 		},
 	}
+}
+
+// NewGitLoaderWithBeadsDir creates a git history loader pinned to a specific
+// beads directory (for example a shared-.git monorepo sub-project such as
+// services/api/.beads), bypassing ambient BEADS_DIR / BEADS_DB discovery.
+// When beadsDir is empty, it behaves identically to NewGitLoader(repoPath).
+func NewGitLoaderWithBeadsDir(repoPath, beadsDir string) *GitLoader {
+	g := NewGitLoader(repoPath)
+	trimmed := strings.TrimSpace(beadsDir)
+	if trimmed == "" {
+		return g
+	}
+	candidate := trimmed
+	if !filepath.IsAbs(candidate) {
+		base := strings.TrimSpace(repoPath)
+		if base == "" {
+			base = g.repoRoot
+		}
+		if base != "" {
+			candidate = filepath.Join(base, candidate)
+		}
+	}
+	if g.repoRoot != "" {
+		if rel, ok := repoRelativeSlashDir(g.repoRoot, candidate); ok {
+			g.beadsDir = rel
+			return g
+		}
+	}
+	g.beadsDir = canonicalLocalPath(candidate)
+	return g
 }
 
 // NewGitLoaderWithCacheTTL creates a loader with custom cache TTL
@@ -667,6 +698,22 @@ func (g *GitLoader) discoverRepoBeadsDirWithTrace() (string, []string, error) {
 }
 
 func (g *GitLoader) resolveTarget() (gitLoaderTarget, error) {
+	if pinned := strings.TrimSpace(g.beadsDir); pinned != "" {
+		targetDir := pinned
+		if !filepath.IsAbs(targetDir) {
+			if root := g.defaultRepoRoot(); root != "" {
+				targetDir = filepath.Join(root, filepath.FromSlash(targetDir))
+			} else if strings.TrimSpace(g.repoPath) != "" {
+				targetDir = filepath.Join(g.repoPath, filepath.FromSlash(targetDir))
+			}
+		}
+		resolvedDir, _, err := resolveBeadsRedirect(targetDir)
+		if err != nil {
+			return gitLoaderTarget{}, fmt.Errorf("resolving configured beads directory %q: %w", g.beadsDir, err)
+		}
+		return buildExplicitGitTarget(resolvedDir, PreferredJSONLNames)
+	}
+
 	if envDB := env.BeadsDB.Get(); envDB != "" {
 		fileNames := PreferredJSONLNames
 		if info, statErr := os.Stat(envDB); statErr == nil && !info.IsDir() {

@@ -390,4 +390,50 @@ func TestLiveReloadMiddleware_Skips404JsonAndServiceWorkerRequests(t *testing.T)
 			}
 		}
 	})
+
+	t.Run("HEAD requests skip HTML buffering and preserve upstream Content-Length", func(t *testing.T) {
+		const exactHTML = "<!doctype html><html><body><h1>HEAD Probe</h1></body></html>"
+		wantLen := strconv.Itoa(len(exactHTML))
+		handler := liveReloadMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Content-Length", wantLen)
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest(http.MethodHead, "/index.html", nil)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		if got := rr.Header().Get("Content-Length"); got != wantLen {
+			t.Fatalf("HEAD Content-Length = %q, want %q", got, wantLen)
+		}
+		if rr.Body.Len() != 0 {
+			t.Fatalf("HEAD body len = %d (%q), want 0", rr.Body.Len(), rr.Body.String())
+		}
+	})
+
+	t.Run("Content-Encoding responses pass through untouched without script injection", func(t *testing.T) {
+		compressedPayload := []byte{0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad, 0xbe, 0xef}
+		wantLen := strconv.Itoa(len(compressedPayload))
+		handler := liveReloadMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Length", wantLen)
+			_, _ = w.Write(compressedPayload)
+		}))
+
+		req := httptest.NewRequest(http.MethodGet, "/index.html", nil)
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+
+		if got := rr.Header().Get("Content-Length"); got != wantLen {
+			t.Fatalf("gzip Content-Length = %q, want %q", got, wantLen)
+		}
+		if string(rr.Body.Bytes()) != string(compressedPayload) {
+			t.Fatalf("gzip payload mutated: got %x, want %x", rr.Body.Bytes(), compressedPayload)
+		}
+		if strings.Contains(rr.Body.String(), LiveReloadScriptTag) {
+			t.Fatalf("compressed response must not receive script injection")
+		}
+	})
 }

@@ -767,9 +767,15 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 
 		if opts.GroupByTrack {
 			recsByTrack = buildRecommendationsByTrack(allRecommendations, analyzer, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
+			if recsByTrack == nil {
+				recsByTrack = []TrackRecommendationGroup{}
+			}
 		}
 		if opts.GroupByLabel {
 			recsByLabel = buildRecommendationsByLabel(allRecommendations, unblocksMap, now, opts.NotReadyLabels, parentsWithOpenChildren)
+			if recsByLabel == nil {
+				recsByLabel = []LabelRecommendationGroup{}
+			}
 		}
 
 		recommendations = allRecommendations
@@ -2495,7 +2501,7 @@ func buildRecommendationsByLabel(recs []Recommendation, unblocksMap map[string][
 		}
 	}
 
-	var result []LabelRecommendationGroup
+	result := make([]LabelRecommendationGroup, 0, len(groups))
 	for _, g := range groups {
 		result = append(result, *g)
 	}

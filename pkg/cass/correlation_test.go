@@ -936,3 +936,244 @@ func TestCorrelator_EmptyResults(t *testing.T) {
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
+
+func TestCassWorkspaceOriginLocalID(t *testing.T) {
+	detector := NewDetector()
+	detector.lookPath = func(name string) (string, error) { return "/usr/bin/cass", nil }
+	detector.runCommand = func(ctx context.Context, name string, args ...string) (int, error) { return 0, nil }
+	_ = detector.Check()
+
+	type callRecord struct {
+		query     string
+		workspace string
+	}
+	var calls []callRecord
+
+	searcher := NewSearcher(detector)
+	searcher.runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		var q, ws string
+		if len(args) >= 2 && args[0] == "search" {
+			q = args[1]
+		}
+		for i := 0; i < len(args)-1; i++ {
+			if args[i] == "--workspace" {
+				ws = args[i+1]
+			}
+		}
+		calls = append(calls, callRecord{query: q, workspace: ws})
+
+		switch q {
+		case `"bv-42"`:
+			return []byte(`{
+				"hits": [
+					{"source_path": "/sessions/api-1.jsonl", "line_number": 10, "agent": "claude", "title": "API fix", "score": 5.0, "content": "Fixed bv-42", "workspace": "/workspace/services/api"},
+					{"source_path": "/sessions/web-1.jsonl", "line_number": 4, "agent": "claude", "title": "Sibling mention", "score": 5.0, "content": "Mentioned bv-42", "workspace": "/workspace/services/web"}
+				],
+				"total_matches": 2
+			}`), nil
+		case `"api-bv-42"`:
+			return []byte(`{
+				"hits": [
+					{"source_path": "/sessions/api-1.jsonl", "line_number": 10, "agent": "claude", "title": "API fix", "score": 5.0, "content": "Fixed bv-42", "workspace": "/workspace/services/api"},
+					{"source_path": "/sessions/api-2.jsonl", "line_number": 22, "agent": "codex", "title": "Follow-up", "score": 4.0, "content": "Verified api-bv-42", "workspace": "/workspace/services/api"}
+				],
+				"total_matches": 2
+			}`), nil
+		case `"bv-single"`:
+			return []byte(`{
+				"hits": [
+					{"source_path": "/sessions/root.jsonl", "line_number": 1, "agent": "claude", "title": "Root", "score": 3.0, "content": "bv-single", "workspace": "/workspace"}
+				],
+				"total_matches": 1
+			}`), nil
+		default:
+			return []byte(`{"hits": [], "total_matches": 0}`), nil
+		}
+	}
+
+	correlator := NewCorrelator(searcher, nil, "/workspace")
+
+	wsIssue := &model.Issue{
+		ID:     "api-bv-42",
+		Title:  "Fix token refresh race",
+		Status: model.StatusOpen,
+		Origin: &model.IssueOrigin{
+			LocalID:          "bv-42",
+			WorkingDirectory: "/workspace/services/api",
+		},
+	}
+
+	res := correlator.Correlate(context.Background(), wsIssue)
+	if res.Strategy != StrategyIDMention {
+		t.Fatalf("Strategy = %q, want %q", res.Strategy, StrategyIDMention)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 cass ID queries (LocalID + namespaced ID), got %d: %+v", len(calls), calls)
+	}
+	if calls[0].query != `"bv-42"` || calls[1].query != `"api-bv-42"` {
+		t.Fatalf("queries = %+v, want [\"bv-42\", \"api-bv-42\"]", calls)
+	}
+	for i, c := range calls {
+		if c.workspace != "/workspace/services/api" {
+			t.Fatalf("call[%d].workspace = %q, want sub-repo WorkingDirectory /workspace/services/api", i, c.workspace)
+		}
+	}
+
+	// Duplicate (/sessions/api-1.jsonl, line 10) across both queries must deduplicate,
+	// leaving 3 unique sessions (api-1, api-2, web-1).
+	if len(res.TopSessions) != 3 {
+		t.Fatalf("TopSessions len = %d, want 3 deduplicated sessions: %+v", len(res.TopSessions), res.TopSessions)
+	}
+	// Positive + negative workspace boost check: api-1 (in /workspace/services/api) gets 1.5x boost
+	// while web-1 (sibling /workspace/services/web with identical raw score 5.0) does NOT.
+	if res.TopSessions[0].SourcePath != "/sessions/api-1.jsonl" {
+		t.Fatalf("TopSessions[0] = %q, want boosted /sessions/api-1.jsonl ahead of sibling web-1", res.TopSessions[0].SourcePath)
+	}
+
+	// Keyword fallback elevation check: if direct ID queries return 0 hits, keyword fallback
+	// mentioning Origin.LocalID ("bv-local-7") elevates to ScoreIDMention & scopes to WorkingDirectory.
+	calls = nil
+	searcher.runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		var q, ws string
+		if len(args) >= 2 && args[0] == "search" {
+			q = args[1]
+		}
+		for i := 0; i < len(args)-1; i++ {
+			if args[i] == "--workspace" {
+				ws = args[i+1]
+			}
+		}
+		calls = append(calls, callRecord{query: q, workspace: ws})
+		if strings.HasPrefix(q, `"`) {
+			return []byte(`{"hits": [], "total_matches": 0}`), nil
+		}
+		return []byte(`{
+			"hits": [
+				{"source_path": "/sessions/kw.jsonl", "line_number": 9, "agent": "claude", "title": "OAuth callback", "score": 2.0, "content": "investigating bv-local-7 timeout", "workspace": "/workspace/services/auth"}
+			],
+			"total_matches": 1
+		}`), nil
+	}
+	kwIssue := &model.Issue{
+		ID:    "auth-bv-local-7",
+		Title: "OAuth callback timeout",
+		Origin: &model.IssueOrigin{
+			LocalID:          "bv-local-7",
+			WorkingDirectory: "/workspace/services/auth",
+		},
+	}
+	kwRes := correlator.Correlate(context.Background(), kwIssue)
+	if len(kwRes.TopSessions) != 1 {
+		t.Fatalf("expected 1 keyword-fallback session, got %+v", kwRes.TopSessions)
+	}
+	for i, c := range calls {
+		if c.workspace != "/workspace/services/auth" {
+			t.Fatalf("fallback call[%d].workspace = %q, want /workspace/services/auth", i, c.workspace)
+		}
+	}
+	wantBoostedIDScore := float64(ScoreIDMention) * MultiplierSameWorkspace
+	if kwRes.TopSessions[0].FinalScore < wantBoostedIDScore-1e-6 || kwRes.TopSessions[0].FinalScore > wantBoostedIDScore+1e-6 {
+		t.Fatalf("keyword hit mentioning Origin.LocalID FinalScore = %.2f, want %.2f", kwRes.TopSessions[0].FinalScore, wantBoostedIDScore)
+	}
+
+	// Planted negative control: single-repo issue (Origin == nil) executes exactly 1 ID query on root "/workspace".
+	calls = nil
+	searcher.runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		var q, ws string
+		if len(args) >= 2 && args[0] == "search" {
+			q = args[1]
+		}
+		for i := 0; i < len(args)-1; i++ {
+			if args[i] == "--workspace" {
+				ws = args[i+1]
+			}
+		}
+		calls = append(calls, callRecord{query: q, workspace: ws})
+		return []byte(`{
+			"hits": [{"source_path": "/sessions/root.jsonl", "line_number": 1, "agent": "claude", "score": 3.0, "content": "bv-single", "workspace": "/workspace"}],
+			"total_matches": 1
+		}`), nil
+	}
+	singleRes := correlator.Correlate(context.Background(), &model.Issue{ID: "bv-single", Title: "Single repo"})
+	if len(calls) != 1 || calls[0].query != `"bv-single"` || calls[0].workspace != "/workspace" {
+		t.Fatalf("Origin==nil calls = %+v, want single (\"bv-single\", \"/workspace\")", calls)
+	}
+	if len(singleRes.TopSessions) != 1 {
+		t.Fatalf("Origin==nil TopSessions = %+v, want 1", singleRes.TopSessions)
+	}
+}
+
+func TestMentionsAnyIssueID_StrictTokenBoundariesAndJSONLOnlySubRepo(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		snippet string
+		title   string
+		ids     []string
+		want    bool
+	}{
+		{name: "exact_token", snippet: "bv-1", ids: []string{"bv-1"}, want: true},
+		{name: "sentence_final_period", snippet: "Fixed bv-1.", title: "Summary", ids: []string{"bv-1"}, want: true},
+		{name: "parens", snippet: "see (bv-1) for details", ids: []string{"bv-1"}, want: true},
+		{name: "brackets_colon", snippet: "[BV-1]: handle auth", ids: []string{"bv-1"}, want: true},
+		{name: "dash_spaced", snippet: "bv-1 - completed", ids: []string{"bv-1"}, want: true},
+		{name: "later_real_match_after_false_prefix", snippet: "checked bv-10 then fixed bv-1.", ids: []string{"bv-1"}, want: true},
+		// Planted negative controls that previously false-matched via strings.Contains:
+		{name: "numeric_suffix_10", snippet: "working on bv-10", ids: []string{"bv-1"}, want: false},
+		{name: "numeric_suffix_100", snippet: "closed bv-100 today", ids: []string{"bv-1"}, want: false},
+		{name: "alpha_suffix", snippet: "bv-1a follow-up", ids: []string{"bv-1"}, want: false},
+		{name: "underscore_suffix", snippet: "bv-1_patch", ids: []string{"bv-1"}, want: false},
+		{name: "hierarchical_child_dot", snippet: "implemented bv-1.2", ids: []string{"bv-1"}, want: false},
+		{name: "hyphen_sub_id", snippet: "branch bv-1-hotfix", ids: []string{"bv-1"}, want: false},
+		{name: "namespaced_other_repo_prefix", snippet: "working on api-bv-1", ids: []string{"bv-1"}, want: false},
+		{name: "namespaced_other_repo_longer", snippet: "working on api-bv-19", ids: []string{"bv-1"}, want: false},
+		{name: "word_prefix", snippet: "xbv-1", ids: []string{"bv-1"}, want: false},
+		{name: "dot_prefix", snippet: "ns.bv-1", ids: []string{"bv-1"}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mentionsAnyIssueID(SearchResult{Snippet: tc.snippet, Title: tc.title}, tc.ids)
+			if got != tc.want {
+				t.Fatalf("mentionsAnyIssueID(snippet=%q, title=%q, ids=%v) = %v, want %v", tc.snippet, tc.title, tc.ids, got, tc.want)
+			}
+		})
+	}
+
+	// End-to-end check: keyword fallback with LocalID="bv-1" must NOT promote "bv-10" / "api-bv-19" to ScoreIDMention.
+	detector := NewDetector()
+	detector.lookPath = func(string) (string, error) { return "/usr/bin/cass", nil }
+	detector.runCommand = func(context.Context, string, ...string) (int, error) { return 0, nil }
+	_ = detector.Check()
+
+	searcher := NewSearcher(detector)
+	searcher.runCommand = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && strings.HasPrefix(args[1], `"`) {
+			return []byte(`{"hits": [], "total_matches": 0}`), nil
+		}
+		return []byte(`{
+			"hits": [
+				{"source_path": "/sessions/false-prefix-nokw.jsonl", "line_number": 1, "agent": "claude", "title": "Misc", "score": 5.0, "content": "worked on bv-10 and bv-1.2 and web-bv-19", "workspace": "/other"},
+				{"source_path": "/sessions/false-prefix-kw.jsonl", "line_number": 2, "agent": "claude", "title": "Token", "score": 5.0, "content": "worked on bv-100 authentication token validation", "workspace": "/other"},
+				{"source_path": "/sessions/true-mention.jsonl", "line_number": 3, "agent": "claude", "title": "Auth", "score": 5.0, "content": "Fixed bv-1.", "workspace": "/other"}
+			],
+			"total_matches": 3
+		}`), nil
+	}
+
+	correlator := NewCorrelator(searcher, nil, "/workspace")
+	res := correlator.Correlate(context.Background(), &model.Issue{
+		ID:    "api-bv-1",
+		Title: "Authentication token validation",
+		Origin: &model.IssueOrigin{
+			LocalID:          "bv-1",
+			WorkingDirectory: "/workspace/services/api",
+		},
+	})
+	if len(res.TopSessions) != 2 {
+		t.Fatalf("expected 2 sessions (false-prefix-nokw dropped below threshold), got %+v", res.TopSessions)
+	}
+	if res.TopSessions[0].SourcePath != "/sessions/true-mention.jsonl" || res.TopSessions[0].BaseScore != ScoreIDMention {
+		t.Fatalf("true mention session = %+v, want BaseScore=%d", res.TopSessions[0], ScoreIDMention)
+	}
+	if res.TopSessions[1].SourcePath != "/sessions/false-prefix-kw.jsonl" || res.TopSessions[1].BaseScore >= ScoreIDMention {
+		t.Fatalf("false-prefix session (bv-100) falsely promoted to ID mention: %+v", res.TopSessions[1])
+	}
+}

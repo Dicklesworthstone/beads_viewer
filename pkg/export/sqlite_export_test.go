@@ -1343,3 +1343,292 @@ func TestSQLiteExporter_SourceDateEpochDeterminismAndChunkForwardSlashes(t *test
 		}
 	}
 }
+
+func TestSQLiteExport_IsTemplateAndPinnedColumns(t *testing.T) {
+	now := time.Date(2026, 11, 16, 0, 0, 0, 0, time.UTC)
+	tmpl := &model.Issue{
+		ID:         "tmpl-1",
+		Title:      "Template Issue",
+		Status:     model.StatusOpen,
+		Priority:   1,
+		IssueType:  model.TypeTask,
+		IsTemplate: true,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	pinned := &model.Issue{
+		ID:        "pin-1",
+		Title:     "Pinned Issue",
+		Status:    model.StatusOpen,
+		Priority:  1,
+		IssueType: model.TypeTask,
+		Pinned:    true,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	ready := &model.Issue{
+		ID:        "ready-1",
+		Title:     "Ready Issue",
+		Status:    model.StatusOpen,
+		Priority:  1,
+		IssueType: model.TypeTask,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	outDir := filepath.Join(t.TempDir(), "bundle")
+	exp := NewSQLiteExporter([]*model.Issue{tmpl, pinned, ready}, nil, nil, nil)
+	if err := exp.Export(outDir); err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(outDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	for _, table := range []string{"issues", "issue_overview_mv"} {
+		var gotTmpl, gotPinned int
+		err := db.QueryRow(fmt.Sprintf(`SELECT is_template, pinned FROM %s WHERE id = ?`, table), "tmpl-1").Scan(&gotTmpl, &gotPinned)
+		if err != nil || gotTmpl != 1 || gotPinned != 0 {
+			t.Fatalf("%s[tmpl-1] (is_template, pinned) = (%d, %d), err=%v; want (1, 0)", table, gotTmpl, gotPinned, err)
+		}
+		err = db.QueryRow(fmt.Sprintf(`SELECT is_template, pinned FROM %s WHERE id = ?`, table), "pin-1").Scan(&gotTmpl, &gotPinned)
+		if err != nil || gotTmpl != 0 || gotPinned != 1 {
+			t.Fatalf("%s[pin-1] (is_template, pinned) = (%d, %d), err=%v; want (0, 1)", table, gotTmpl, gotPinned, err)
+		}
+		err = db.QueryRow(fmt.Sprintf(`SELECT is_template, pinned FROM %s WHERE id = ?`, table), "ready-1").Scan(&gotTmpl, &gotPinned)
+		if err != nil || gotTmpl != 0 || gotPinned != 0 {
+			t.Fatalf("%s[ready-1] (is_template, pinned) = (%d, %d), err=%v; want (0, 0)", table, gotTmpl, gotPinned, err)
+		}
+	}
+
+	for id, wantActionable := range map[string]int{"tmpl-1": 0, "pin-1": 0, "ready-1": 1} {
+		var got int
+		if err := db.QueryRow(`SELECT is_actionable FROM issue_overview_mv WHERE id = ?`, id).Scan(&got); err != nil {
+			t.Fatalf("SELECT is_actionable[%s]: %v", id, err)
+		}
+		if got != wantActionable {
+			t.Fatalf("issue_overview_mv[%s].is_actionable = %d, want %d", id, got, wantActionable)
+		}
+	}
+}
+
+func TestSQLiteExport_AllScoresPopulatesRank11Plus(t *testing.T) {
+	now := time.Date(2026, 11, 16, 0, 0, 0, 0, time.UTC)
+	var ptrIssues []*model.Issue
+	var valIssues []model.Issue
+	for i := 1; i <= 15; i++ {
+		iss := model.Issue{
+			ID:        fmt.Sprintf("rank-%02d", i),
+			Title:     fmt.Sprintf("Ranked Issue %02d", i),
+			Status:    model.StatusOpen,
+			Priority:  i % 4,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		valIssues = append(valIssues, iss)
+		cp := iss
+		ptrIssues = append(ptrIssues, &cp)
+	}
+
+	triage := analysis.ComputeTriageWithOptionsAndTime(valIssues, analysis.TriageOptions{
+		TopN:          10,
+		UseFastConfig: true,
+		WaitForPhase2: true,
+	}, now)
+	if len(triage.Recommendations) != 10 {
+		t.Fatalf("len(Recommendations) = %d, want 10", len(triage.Recommendations))
+	}
+	if len(triage.AllScores) != 15 {
+		t.Fatalf("len(AllScores) = %d, want 15", len(triage.AllScores))
+	}
+
+	stats := analysis.NewAnalyzer(valIssues).Analyze()
+	for _, tc := range []struct {
+		name  string
+		stats *analysis.GraphStats
+	}{
+		{name: "with_stats", stats: &stats},
+		{name: "without_stats", stats: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outDir := filepath.Join(t.TempDir(), "bundle")
+			exp := NewSQLiteExporter(ptrIssues, nil, tc.stats, &triage)
+			if err := exp.Export(outDir); err != nil {
+				t.Fatalf("Export failed: %v", err)
+			}
+
+			db, err := sql.Open("sqlite", filepath.Join(outDir, "beads.sqlite3"))
+			if err != nil {
+				t.Fatalf("sql.Open: %v", err)
+			}
+			defer db.Close()
+
+			rows, err := db.Query(`SELECT id, triage_score FROM issue_overview_mv ORDER BY id`)
+			if err != nil {
+				t.Fatalf("SELECT triage_score: %v", err)
+			}
+			defer rows.Close()
+			seen := 0
+			for rows.Next() {
+				var id string
+				var score float64
+				if err := rows.Scan(&id, &score); err != nil {
+					t.Fatalf("Scan: %v", err)
+				}
+				seen++
+				if score <= 0 {
+					t.Fatalf("issue_overview_mv[%s].triage_score = %v, want > 0 (AllScores parity for #11+)", id, score)
+				}
+			}
+			if seen != 15 {
+				t.Fatalf("issue_overview_mv row count = %d, want 15", seen)
+			}
+
+			exportedIssues := exp.GetExportedIssues()
+			if len(exportedIssues) != 15 {
+				t.Fatalf("GetExportedIssues len = %d, want 15", len(exportedIssues))
+			}
+			for _, iss := range exportedIssues {
+				if iss.TriageScore <= 0 {
+					t.Fatalf("GetExportedIssues[%s].TriageScore = %v, want > 0", iss.ID, iss.TriageScore)
+				}
+			}
+		})
+	}
+}
+
+func TestSQLiteExport_TriageZeroActionableNoLeakAndProvisionalScrub(t *testing.T) {
+	now := time.Date(2026, 11, 16, 0, 0, 0, 0, time.UTC)
+
+	t.Run("zero actionable recommendations never re-runs unscoped fallback", func(t *testing.T) {
+		// Issue is open with label "frontend", simulating --label backend export where 0 backend items were actionable
+		// or all scoped items were blocked.
+		unscoped := &model.Issue{
+			ID:        "fe-1",
+			Title:     "Frontend Open Item",
+			Status:    model.StatusOpen,
+			Priority:  0,
+			IssueType: model.TypeTask,
+			Labels:    []string{"frontend"},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		emptyScopedTriage := &analysis.TriageResult{
+			Recommendations: []analysis.Recommendation{},
+		}
+		outDir := filepath.Join(t.TempDir(), "zero-actionable")
+		exp := NewSQLiteExporter([]*model.Issue{unscoped}, nil, nil, emptyScopedTriage)
+		if err := exp.Export(outDir); err != nil {
+			t.Fatalf("Export failed: %v", err)
+		}
+
+		raw, err := os.ReadFile(filepath.Join(outDir, "data", "triage.json"))
+		if err != nil {
+			t.Fatalf("ReadFile triage.json: %v", err)
+		}
+		var parsed analysis.TriageResult
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			t.Fatalf("Unmarshal triage.json: %v", err)
+		}
+		if len(parsed.RecommendationsByTrack) != 0 || len(parsed.RecommendationsByLabel) != 0 {
+			t.Fatalf("expected 0 leaked grouped recommendations when Recommendations is empty, got tracks=%d labels=%d",
+				len(parsed.RecommendationsByTrack), len(parsed.RecommendationsByLabel))
+		}
+	})
+
+	t.Run("provisional source_authority scrubs pre-grouped triage without mutating caller", func(t *testing.T) {
+		iss := &model.Issue{
+			ID:        "prov-1",
+			Title:     "Provisional Item",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Labels:    []string{"core"},
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		rec := analysis.Recommendation{
+			ID:        "prov-1",
+			Title:     "Provisional Item",
+			Score:     0.91,
+			Claimable: true,
+			Action:    "Start work on this issue now",
+			Actions: model.IssueActions{
+				Claim: &model.IssueCommand{Shell: "br update prov-1 --status=in_progress"},
+				Show:  &model.IssueCommand{Shell: "br show prov-1"},
+			},
+		}
+		preGrouped := &analysis.TriageResult{
+			QuickRef: analysis.QuickRef{
+				TopPicks: []analysis.TopPick{{ID: "prov-1", Title: "Provisional Item", Score: 0.91}},
+			},
+			Recommendations: []analysis.Recommendation{rec},
+			QuickWins:       []analysis.QuickWin{{ID: "prov-1", Title: "Provisional Item", Score: 0.91}},
+			BlockersToClear: []analysis.BlockerItem{{ID: "prov-1", Title: "Provisional Item", Actionable: true}},
+			Commands:        analysis.CommandHelpers{ClaimTop: "br update prov-1 --status=in_progress"},
+			RecommendationsByTrack: []analysis.TrackRecommendationGroup{{
+				TrackID:         "track-A",
+				TopPick:         &analysis.TopPick{ID: "prov-1", Title: "Provisional Item"},
+				ClaimCommand:    "br update prov-1 --status=in_progress",
+				Recommendations: []analysis.Recommendation{rec},
+			}},
+			RecommendationsByLabel: []analysis.LabelRecommendationGroup{{
+				Label:           "core",
+				TopPick:         &analysis.TopPick{ID: "prov-1", Title: "Provisional Item"},
+				ClaimCommand:    "br update prov-1 --status=in_progress",
+				Recommendations: []analysis.Recommendation{rec},
+			}},
+		}
+
+		outDir := filepath.Join(t.TempDir(), "provisional")
+		exp := NewSQLiteExporter([]*model.Issue{iss}, nil, nil, preGrouped)
+		exp.Config.RobotEnvelope = map[string]json.RawMessage{
+			"source_authority": json.RawMessage(`{"claim_safe":false,"state":"stale_db"}`),
+		}
+		if err := exp.Export(outDir); err != nil {
+			t.Fatalf("Export failed: %v", err)
+		}
+
+		// Caller's input struct must remain untouched!
+		if preGrouped.Commands.ClaimTop == "" || len(preGrouped.QuickRef.TopPicks) == 0 || !preGrouped.Recommendations[0].Claimable {
+			t.Fatalf("Export mutated caller's TriageResult in-place: %+v", preGrouped)
+		}
+
+		raw, err := os.ReadFile(filepath.Join(outDir, "data", "triage.json"))
+		if err != nil {
+			t.Fatalf("ReadFile triage.json: %v", err)
+		}
+		var scrubbed analysis.TriageResult
+		if err := json.Unmarshal(raw, &scrubbed); err != nil {
+			t.Fatalf("Unmarshal triage.json: %v", err)
+		}
+		if scrubbed.Commands.ClaimTop != "" {
+			t.Fatalf("scrubbed Commands.ClaimTop = %q, want empty", scrubbed.Commands.ClaimTop)
+		}
+		if len(scrubbed.QuickRef.TopPicks) != 0 {
+			t.Fatalf("scrubbed QuickRef.TopPicks = %+v, want empty", scrubbed.QuickRef.TopPicks)
+		}
+		if len(scrubbed.QuickWins) != 0 {
+			t.Fatalf("scrubbed QuickWins = %+v, want empty", scrubbed.QuickWins)
+		}
+		if len(scrubbed.BlockersToClear) != 1 || scrubbed.BlockersToClear[0].Actionable {
+			t.Fatalf("scrubbed BlockersToClear = %+v, want Actionable=false", scrubbed.BlockersToClear)
+		}
+		if len(scrubbed.Recommendations) != 1 || scrubbed.Recommendations[0].Claimable || scrubbed.Recommendations[0].Actions.Claim != nil {
+			t.Fatalf("scrubbed Recommendations[0] = %+v, want Claimable=false and Actions.Claim=nil", scrubbed.Recommendations[0])
+		}
+		if scrubbed.Recommendations[0].Actions.Show == nil {
+			t.Fatalf("scrubbed Recommendations[0].Actions.Show should be preserved")
+		}
+		if scrubbed.RecommendationsByTrack[0].ClaimCommand != "" || scrubbed.RecommendationsByTrack[0].TopPick != nil || scrubbed.RecommendationsByTrack[0].Recommendations[0].Actions.Claim != nil {
+			t.Fatalf("scrubbed RecommendationsByTrack[0] = %+v", scrubbed.RecommendationsByTrack[0])
+		}
+		if scrubbed.RecommendationsByLabel[0].ClaimCommand != "" || scrubbed.RecommendationsByLabel[0].TopPick != nil || scrubbed.RecommendationsByLabel[0].Recommendations[0].Actions.Claim != nil {
+			t.Fatalf("scrubbed RecommendationsByLabel[0] = %+v", scrubbed.RecommendationsByLabel[0])
+		}
+	})
+}

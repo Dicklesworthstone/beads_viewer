@@ -2084,6 +2084,7 @@ func TestSourceDiffDetectsDepsAssigneeLabelsDefer(t *testing.T) {
 			ID:         "DRIFT-ALL",
 			Title:      "Same title",
 			Status:     model.StatusOpen,
+			IssueType:  model.TypeTask,
 			Priority:   1,
 			Assignee:   "alice",
 			Labels:     []string{"api", "urgent"},
@@ -2098,6 +2099,7 @@ func TestSourceDiffDetectsDepsAssigneeLabelsDefer(t *testing.T) {
 			ID:         "CANONICAL-EQ",
 			Title:      "Canonical",
 			Status:     model.StatusOpen,
+			IssueType:  model.TypeTask,
 			Priority:   2,
 			Assignee:   "  carol  ",
 			Labels:     []string{" z-tag ", "a-tag", "z-tag", ""},
@@ -2115,6 +2117,7 @@ func TestSourceDiffDetectsDepsAssigneeLabelsDefer(t *testing.T) {
 			ID:         "DRIFT-ALL",
 			Title:      "Same title",
 			Status:     model.StatusOpen,
+			IssueType:  model.TypeTask,
 			Priority:   1,
 			Assignee:   "bob",
 			Labels:     []string{"api", "backlog"},
@@ -2128,6 +2131,7 @@ func TestSourceDiffDetectsDepsAssigneeLabelsDefer(t *testing.T) {
 			ID:         "CANONICAL-EQ",
 			Title:      "Canonical",
 			Status:     model.StatusOpen,
+			IssueType:  model.TypeTask,
 			Priority:   2,
 			Assignee:   "carol",
 			Labels:     []string{"a-tag", "z-tag"},
@@ -2140,8 +2144,8 @@ func TestSourceDiffDetectsDepsAssigneeLabelsDefer(t *testing.T) {
 	}
 
 	diff := DetectInconsistencies(issuesA, issuesB, "sqlite", "jsonl", DefaultDiffOptions())
-	if !diff.HasInconsistencies() || diff.TotalDiffs() != 4 {
-		t.Fatalf("DetectInconsistencies TotalDiffs=%d FieldMismatches=%+v, want 4", diff.TotalDiffs(), diff.FieldMismatches)
+	if !diff.HasInconsistencies() || len(diff.FieldMismatches) != 4 || len(diff.IssueDiffs) != 4 {
+		t.Fatalf("DetectInconsistencies FieldMismatches=%+v IssueDiffs=%+v, want 4", diff.FieldMismatches, diff.IssueDiffs)
 	}
 
 	byField := make(map[string]FieldDifference, len(diff.FieldMismatches))
@@ -2180,24 +2184,24 @@ func TestSourceDiffDetectsDepsAssigneeLabelsDefer(t *testing.T) {
 		if err := os.WriteFile(p, []byte(b.String()), 0o644); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
-		return DataSource{Type: SourceTypeJSONLLocal, Path: p, ModTime: deferUTC}
+		return DataSource{Type: SourceTypeJSONLLocal, Path: p, ModTime: deferUTC, Valid: true}
 	}
 
 	srcA := writeJSONL("a.jsonl", issuesA)
 	srcB := writeJSONL("b.jsonl", issuesB)
-	consistent, reasons, err := CheckSourcesConsistent(srcA, srcB)
+	consistentDiffs, err := CheckSourcesConsistent([]DataSource{srcA, srcB})
 	if err != nil {
 		t.Fatalf("CheckSourcesConsistent error: %v", err)
 	}
-	if consistent || len(reasons) != 4 {
-		t.Fatalf("CheckSourcesConsistent = (%v, %v), want (false, 4 reasons)", consistent, reasons)
+	if len(consistentDiffs) != 1 || len(consistentDiffs[0].FieldMismatches) != 4 {
+		t.Fatalf("CheckSourcesConsistent = %+v, want 1 SourceDiff with 4 FieldMismatches", consistentDiffs)
 	}
 
 	allDiffs, err := CheckAllSourcesConsistent([]DataSource{srcA, srcB}, DefaultDiffOptions())
 	if err != nil {
 		t.Fatalf("CheckAllSourcesConsistent error: %v", err)
 	}
-	if len(allDiffs) != 1 || allDiffs[0].TotalDiffs() != 4 {
+	if len(allDiffs) != 1 || len(allDiffs[0].FieldMismatches) != 4 || len(allDiffs[0].IssueDiffs) != 4 {
 		t.Fatalf("CheckAllSourcesConsistent = %+v, want 1 SourceDiff with 4 diffs", allDiffs)
 	}
 
@@ -2209,51 +2213,41 @@ func TestSourceDiffDetectsDepsAssigneeLabelsDefer(t *testing.T) {
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git init %s: %v (%s)", r, err, out)
 		}
-		for _, kv := range [][2]string{{"user.email", "test@example.com"}, {"user.name", "Test"}} {
-			cfgCmd := exec.Command("git", "-C", r, "config", kv[0], kv[1])
-			if out, err := cfgCmd.CombinedOutput(); err != nil {
-				t.Fatalf("git config: %v (%s)", err, out)
-			}
-		}
 	}
-	mainBeads := filepath.Join(mainRepo, ".beads")
-	if err := os.MkdirAll(mainBeads, 0o755); err != nil {
+	realWTBeads := filepath.Join(mainRepo, ".git", "beads-worktrees", "real-wt")
+	if err := os.MkdirAll(realWTBeads, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(mainBeads, "issues.jsonl"), []byte(`{"id":"WT-1","title":"Main worktree issue","status":"open"}`+"\n"), 0o644); err != nil {
+	realWTFile := filepath.Join(realWTBeads, "issues.jsonl")
+	if err := os.WriteFile(realWTFile, []byte(`{"id":"WT-REAL","title":"Real worktree issue","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := exec.Command("git", "-C", mainRepo, "add", ".").CombinedOutput(); err != nil {
-		t.Fatalf("git add: %v (%s)", err, out)
+
+	poisonWTBeads := filepath.Join(poisonRepo, ".git", "beads-worktrees", "poison-wt")
+	if err := os.MkdirAll(poisonWTBeads, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if out, err := exec.Command("git", "-C", mainRepo, "commit", "-m", "init").CombinedOutput(); err != nil {
-		t.Fatalf("git commit: %v (%s)", err, out)
-	}
-	wtDir := filepath.Join(t.TempDir(), "linked-wt")
-	if out, err := exec.Command("git", "-C", mainRepo, "worktree", "add", "-b", "wt-branch", wtDir).CombinedOutput(); err != nil {
-		t.Fatalf("git worktree add: %v (%s)", err, out)
-	}
-	// Remove tracked .beads in the linked worktree checkout so DiscoverSources uses main-worktree fallback via GetGitDir.
-	if err := os.WriteFile(filepath.Join(wtDir, ".beads", "issues.jsonl"), nil, 0o644); err == nil {
-		// Rename .beads inside linked worktree (Rule 1 compliant: os.Rename, zero file deletion)
-		if err := os.Rename(filepath.Join(wtDir, ".beads"), filepath.Join(wtDir, ".beads-moved-aside")); err != nil {
-			t.Fatalf("rename linked worktree .beads: %v", err)
-		}
+	poisonWTFile := filepath.Join(poisonWTBeads, "issues.jsonl")
+	if err := os.WriteFile(poisonWTFile, []byte(`{"id":"WT-POISON","title":"Poison worktree issue","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
 	t.Setenv("GIT_DIR", filepath.Join(poisonRepo, ".git"))
 	t.Setenv("GIT_WORK_TREE", poisonRepo)
-	sources, err := DiscoverSources(DiscoveryOptions{RepoPath: wtDir, ValidateAfterDiscovery: false})
+	sources, err := DiscoverSources(DiscoveryOptions{RepoPath: mainRepo, ValidateAfterDiscovery: false})
 	if err != nil {
 		t.Fatalf("DiscoverSources with poisoned GIT_DIR: %v", err)
 	}
-	foundMainWorktreeBeads := false
+	foundRealWorktree := false
 	for _, s := range sources {
-		if s.Type == SourceTypeJSONLWorktree {
-			foundMainWorktreeBeads = true
+		if strings.Contains(s.Path, "poison-wt") {
+			t.Fatalf("DiscoverSources leaked poison GIT_DIR worktree source: %+v", s)
+		}
+		if s.Type == SourceTypeJSONLWorktree && strings.Contains(s.Path, "real-wt") {
+			foundRealWorktree = true
 		}
 	}
-	if !foundMainWorktreeBeads {
-		t.Fatalf("expected SourceTypeJSONLWorktree despite poisoned GIT_DIR, got %+v", sources)
+	if !foundRealWorktree {
+		t.Fatalf("expected SourceTypeJSONLWorktree for real-wt despite poisoned GIT_DIR, got %+v", sources)
 	}
 }

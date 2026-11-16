@@ -1336,7 +1336,7 @@ export function getNodeSize(node) {
     return nodeMinSize + score * (nodeMaxSize - nodeMinSize);
 }
 
-function getNodeColor(node) {
+export function getNodeColor(node) {
     // What-if simulation states take priority
     if (node._whatIfState === 'closing') return THEME.accent.green;
     if (node._whatIfState === 'unblocked') return THEME.accent.cyan;
@@ -1372,8 +1372,10 @@ function getNodeColor(node) {
     // Status-based color, with derived "blocked" semantics so the graph
     // matches the issues view: an open / in-progress node with at least one
     // active blocker or non-satisfied dependency_state is treated as blocked.
+    const depState = node.dependencyState ?? node.dependency_state;
+    const blockers = node.blockerCount ?? node.blocker_count ?? 0;
     if (
-        (node.blockerCount > 0 || (node.dependencyState && node.dependencyState !== 'satisfied'))
+        (blockers > 0 || (depState && depState !== 'satisfied'))
         && (node.status === 'open' || node.status === 'in_progress')
     ) {
         return THEME.status.blocked;
@@ -1926,6 +1928,7 @@ export function performWhatIf(nodeInput) {
     }
 
     // Animate the cascade
+    resetDependencyCone({ refresh: false });
     animateWhatIfCascade([node], result);
 
     return result;
@@ -1973,6 +1976,7 @@ export function performBatchWhatIf(nodesInput) {
         return null;
     }
 
+    resetDependencyCone({ refresh: false });
     animateWhatIfCascade(uniqueNodes, result);
     return result;
 }
@@ -2318,6 +2322,7 @@ export function animateCriticalPath(animate = true) {
         return null;
     }
 
+    resetDependencyCone({ refresh: false });
     resetCriticalPath();
     criticalPathState.paths = computeTopCriticalPaths(5);
     if (!criticalPathState.paths.length) {
@@ -2518,6 +2523,7 @@ export function selectNode(node) {
     if (typeof node === 'string') {
         node = store.graph?.graphData()?.nodes?.find(n => n.id === node) || null;
     }
+    resetDependencyCone({ refresh: false });
     store.selectedNode = node;
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
@@ -2531,6 +2537,7 @@ export function selectNode(node) {
 }
 
 export function clearSelection() {
+    resetDependencyCone({ refresh: false });
     store.selectedNode = null;
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
@@ -2812,6 +2819,7 @@ export function toggleCycleNavigator() {
     if (cycleNavigatorState.active && cycleNavigatorState.highlightedCycleNodes.size > 0) {
         resetCycleNavigator();
     } else {
+        resetDependencyCone({ refresh: false });
         initCycleNavigator();
         if (cycleNavigatorState.cycles.length > 0) {
             highlightCycle(0, true);
@@ -2950,7 +2958,7 @@ export function focusDependencyCone(nodeOrId = null, center = true) {
     return state;
 }
 
-export function resetDependencyCone() {
+export function resetDependencyCone({ refresh = true } = {}) {
     const wasActive = dependencyConeState.active;
     dependencyConeState.active = false;
     dependencyConeState.focusNodeId = null;
@@ -2966,7 +2974,9 @@ export function resetDependencyCone() {
     if (wasActive) {
         store.highlightedNodes.clear();
         store.highlightedLinks.clear();
-        refreshGraph();
+        if (refresh) {
+            refreshGraph();
+        }
         dispatchEvent('dependencyConeReset', { active: false, focusNodeId: null, count: 0, nodeIds: [] });
     }
 }

@@ -172,6 +172,21 @@ type HistoryModel struct {
 	// >= layoutBreakpointWide columns; pressing t pins it on or off.
 	timelinePinned  bool // true once the user toggled explicitly
 	timelineVisible bool // the pinned value; ignored until timelinePinned
+
+	// Optional reference clock for relative/timeline timestamps (e.g. --as-of).
+	referenceNow time.Time
+}
+
+// SetReferenceTime sets an optional reference clock for relative/timeline timestamps (e.g. --as-of).
+func (h *HistoryModel) SetReferenceTime(now time.Time) {
+	h.referenceNow = now
+}
+
+func (h *HistoryModel) effectiveNow() time.Time {
+	if !h.referenceNow.IsZero() {
+		return h.referenceNow
+	}
+	return time.Now()
 }
 
 // TimelineAvailable reports whether the timeline pane can be shown at all:
@@ -2214,7 +2229,7 @@ func capitalizeFirst(s string) string {
 
 // formatTimelineTimestamp formats a timestamp for the timeline (bv-1x6o)
 func (h *HistoryModel) formatTimelineTimestamp(t time.Time) string {
-	now := time.Now()
+	now := h.effectiveNow()
 	diff := now.Sub(t)
 
 	switch {
@@ -3382,7 +3397,7 @@ func (h *HistoryModel) renderCommitDetail(commit correlation.CorrelatedCommit, w
 		shaStyle = shaStyle.Bold(true)
 	}
 
-	relTime := relativeTime(commit.Timestamp)
+	relTime := relativeTimeAt(commit.Timestamp, h.effectiveNow())
 	relTimeStyle := t.Renderer.NewStyle().Foreground(t.Muted).Italic(true)
 
 	// Header line: [indicator] [icon] SHA (relative time)
@@ -3590,7 +3605,13 @@ func authorInitials(name string) string {
 
 // relativeTime formats a time as a relative string (e.g., "2d ago", "3h ago")
 func relativeTime(t time.Time) string {
-	now := time.Now()
+	return relativeTimeAt(t, time.Now())
+}
+
+func relativeTimeAt(t, now time.Time) string {
+	if now.IsZero() {
+		now = time.Now()
+	}
 	diff := now.Sub(t)
 
 	if diff < 0 {
@@ -3889,7 +3910,7 @@ func (h *HistoryModel) renderEventsSection(events []correlation.BeadEvent, width
 		coloredIcon := iconStyle.Render(icon)
 
 		// Relative time
-		timeStr := relativeTime(event.Timestamp)
+		timeStr := relativeTimeAt(event.Timestamp, h.effectiveNow())
 		if len(timeStr) > 7 {
 			timeStr = timeStr[:7]
 		}

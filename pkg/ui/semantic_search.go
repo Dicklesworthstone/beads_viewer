@@ -192,34 +192,26 @@ func (s *SemanticSearch) getHybridConfig() semanticHybridConfig {
 
 // SetHybridConfig updates hybrid scoring configuration.
 func (s *SemanticSearch) SetHybridConfig(enabled bool, preset search.PresetName) {
-	current := s.getHybridConfig()
-	if current.CustomWeights && preset == current.Preset {
-		s.hybridConfig.Store(semanticHybridConfig{
-			Enabled:       enabled,
-			Preset:        preset,
-			Weights:       current.Weights,
-			CustomWeights: true,
-		})
-		s.ResetCache()
-		return
-	}
 	weights, err := search.GetPreset(preset)
 	if err != nil {
 		weights, _ = search.GetPreset(search.PresetDefault)
 		preset = search.PresetDefault
 	}
 	s.hybridConfig.Store(semanticHybridConfig{
-		Enabled: enabled,
-		Preset:  preset,
-		Weights: weights.Normalize(),
+		Enabled:       enabled,
+		Preset:        preset,
+		Weights:       weights.Normalize(),
+		CustomWeights: false,
 	})
 	s.ResetCache()
 }
 
 // SetHybridConfigWithWeights updates hybrid scoring configuration with explicit custom weights.
 func (s *SemanticSearch) SetHybridConfigWithWeights(enabled bool, preset search.PresetName, weights search.Weights) {
-	if _, err := search.GetPreset(preset); err != nil {
-		preset = search.PresetDefault
+	if preset != "custom" {
+		if _, err := search.GetPreset(preset); err != nil {
+			preset = search.PresetDefault
+		}
 	}
 	s.hybridConfig.Store(semanticHybridConfig{
 		Enabled:       enabled,
@@ -719,12 +711,20 @@ func ComputeSemanticFilterCmd(s *SemanticSearch, term string, dataGen, queryGen 
 
 // BuildHybridMetricsCmd computes metrics for hybrid scoring asynchronously.
 func BuildHybridMetricsCmd(issues []model.Issue, dataGen, buildGen uint64, readiness ...*model.ReadinessIndex) tea.Cmd {
+	return BuildHybridMetricsAtCmd(issues, dataGen, buildGen, time.Time{}, readiness...)
+}
+
+// BuildHybridMetricsAtCmd computes metrics for hybrid scoring asynchronously anchored to refNow when non-zero.
+func BuildHybridMetricsAtCmd(issues []model.Issue, dataGen, buildGen uint64, refNow time.Time, readiness ...*model.ReadinessIndex) tea.Cmd {
 	var authReadiness *model.ReadinessIndex
 	if len(readiness) > 0 {
 		authReadiness = readiness[0]
 	}
 	return func() tea.Msg {
 		loader := search.NewAnalyzerMetricsLoaderWithReadiness(issues, authReadiness).WithCache(analysis.GetGlobalCache())
+		if !refNow.IsZero() {
+			loader = loader.WithNow(refNow)
+		}
 		metrics, err := loader.LoadMetrics()
 		if err != nil {
 			return HybridMetricsReadyMsg{DataGeneration: dataGen, BuildGeneration: buildGen, Error: err}

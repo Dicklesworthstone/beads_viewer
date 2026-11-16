@@ -2320,3 +2320,157 @@ func TestMaxJSONLLineSizeBytes_UniversalEffectiveMaxCapacity(t *testing.T) {
 		t.Fatalf("expected 11 MiB line to load cleanly under BV_MAX_LINE_SIZE_MB=16: len=%d stats=%+v", len(issues16), stats16)
 	}
 }
+
+func TestAttachIssueOrigins_JSONLOnlyPopulatesWorkingDirAndRefusesExecution(t *testing.T) {
+	root := t.TempDir()
+	apiDir := filepath.Join(root, "services", "api")
+	beadsDir := filepath.Join(apiDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(`{"id":"bv-1","title":"JSONL only","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wantApiDir := apiDir
+	if eval, err := filepath.EvalSymlinks(apiDir); err == nil {
+		wantApiDir = filepath.Clean(eval)
+	}
+	wantBeadsDir := filepath.Join(wantApiDir, ".beads")
+
+	issues := []model.Issue{{ID: "bv-1", Title: "JSONL only", Status: model.StatusOpen, IssueType: model.TypeTask}}
+	loader.AttachIssueOrigins(issues, jsonlPath, true)
+
+	orig := issues[0].Origin
+	if orig == nil {
+		t.Fatal("expected non-nil IssueOrigin")
+	}
+	if orig.WorkingDirectory != wantApiDir {
+		t.Fatalf("Origin.WorkingDirectory = %q, want %q", orig.WorkingDirectory, wantApiDir)
+	}
+	if orig.TrackerDirectory != wantBeadsDir {
+		t.Fatalf("Origin.TrackerDirectory = %q, want %q", orig.TrackerDirectory, wantBeadsDir)
+	}
+	if orig.ReadOnlyReason == "" || orig.Executable != "" {
+		t.Fatalf("JSONL-only source without metadata.json must stay read-only: %+v", orig)
+	}
+
+	actions := issues[0].Actions(true)
+	if actions.WorkingDirectory != wantApiDir {
+		t.Fatalf("Actions.WorkingDirectory = %q, want %q", actions.WorkingDirectory, wantApiDir)
+	}
+	if actions.Show != nil || actions.Claim != nil || actions.UnavailableReason == "" {
+		t.Fatalf("JSONL-only source must refuse live CLI actions: %+v", actions)
+	}
+	if cmd, reason := issues[0].MutationAction(model.MutationAddLabel, nil, "bug"); cmd != nil || reason == "" {
+		t.Fatalf("JSONL-only source must refuse mutations: cmd=%+v reason=%q", cmd, reason)
+	}
+	if err := loader.RevalidateIssueOrigin(jsonlPath, *orig); err == nil {
+		t.Fatal("RevalidateIssueOrigin must reject read-only JSONL-only origin")
+	}
+}
+
+func TestGetBeadsDir_StopsAtEnclosingGitBoundary(t *testing.T) {
+	t.Setenv(loader.BeadsDBEnvVar, "")
+	t.Setenv(loader.BeadsDirEnvVar, "")
+
+	// Place fixture under a ceiling directory inside TempDir? Note findAncestorBeadsDir stops at os.TempDir(),
+	// so create an intermediate parent `/<tmp>/dp` that holds a stray `.beads` directory!
+	dpDir := filepath.Join(t.TempDir(), "dp")
+	strayAncestorBeads := filepath.Join(dpDir, ".beads")
+	if err := os.MkdirAll(strayAncestorBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(strayAncestorBeads, "issues.jsonl"), []byte(`{"id":"STRAY-1","title":"Stray","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Case 1: Fresh `git init` repo with `.git` directory and NO `.beads` must NOT climb into `dp/.beads`.
+	freshRepo := filepath.Join(dpDir, "fresh-repo")
+	freshSub := filepath.Join(freshRepo, "cmd", "app")
+	if err := os.MkdirAll(filepath.Join(freshRepo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(freshSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, start := range []string{freshRepo, freshSub} {
+		got, err := loader.GetBeadsDir(start)
+		if err != nil {
+			t.Fatalf("GetBeadsDir(%s) unexpected error: %v", start, err)
+		}
+		if filepath.Clean(got) == filepath.Clean(strayAncestorBeads) {
+			t.Fatalf("GetBeadsDir(%s) leaked past .git boundary into ancestor %s", start, got)
+		}
+	}
+
+	// Case 2: Linked git worktree with `.git` gitfile and NO `.beads` must ALSO stop at `.git` boundary.
+	worktreeRepo := filepath.Join(dpDir, "fresh-wt")
+	worktreeSub := filepath.Join(worktreeRepo, "pkg", "sub")
+	if err := os.MkdirAll(worktreeSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreeRepo, ".git"), []byte("gitdir: /nonexistent/worktree\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, start := range []string{worktreeRepo, worktreeSub} {
+		got, err := loader.GetBeadsDir(start)
+		if err != nil {
+			t.Fatalf("GetBeadsDir(%s) unexpected error: %v", start, err)
+		}
+		if filepath.Clean(got) == filepath.Clean(strayAncestorBeads) {
+			t.Fatalf("GetBeadsDir(%s) leaked past worktree .git gitfile into ancestor %s", start, got)
+		}
+	}
+
+	// Case 3 (Planted positive control): Repo with BOTH `.git` AND `.beads` still discovers its own `.beads` from a subdirectory.
+	beadsRepo := filepath.Join(dpDir, "beads-repo")
+	beadsRepoStore := filepath.Join(beadsRepo, ".beads")
+	beadsRepoSub := filepath.Join(beadsRepo, "internal", "svc")
+	if err := os.MkdirAll(filepath.Join(beadsRepo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(beadsRepoStore, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(beadsRepoSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loader.GetBeadsDir(beadsRepoSub)
+	if err != nil {
+		t.Fatalf("GetBeadsDir(%s) failed: %v", beadsRepoSub, err)
+	}
+	if filepath.Clean(got) != filepath.Clean(beadsRepoStore) {
+		t.Fatalf("GetBeadsDir(%s) = %q, want repo-root %q", beadsRepoSub, got, beadsRepoStore)
+	}
+
+	// Case 4 (Control proving dp/.beads IS reachable when no .git boundary intervenes):
+	nonGitSub := filepath.Join(dpDir, "plain-subdir")
+	if err := os.MkdirAll(nonGitSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gotPlain, err := loader.GetBeadsDir(nonGitSub)
+	if err != nil {
+		t.Fatalf("GetBeadsDir(%s) failed: %v", nonGitSub, err)
+	}
+	if filepath.Clean(gotPlain) != filepath.Clean(strayAncestorBeads) {
+		t.Fatalf("GetBeadsDir(%s) = %q, want ancestor %q when no .git boundary exists", nonGitSub, gotPlain, strayAncestorBeads)
+	}
+
+	// [R2-A1]: Standalone non-.beads JSONL file leaves Origin.WorkingDirectory empty (never "/" or parent of arbitrary dir),
+	// whereas a .beads/issues.jsonl without metadata.json populates Origin.WorkingDirectory = parent repo dir.
+	standaloneDir := t.TempDir()
+	standaloneJSONL := filepath.Join(standaloneDir, "export.jsonl")
+	if err := os.WriteFile(standaloneJSONL, []byte(`{"id":"st-1","title":"Standalone","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stIssues, err := loader.LoadIssuesFromFile(standaloneJSONL)
+	if err != nil || len(stIssues) != 1 {
+		t.Fatalf("LoadIssuesFromFile(standalone) failed: err=%v len=%d", err, len(stIssues))
+	}
+	loader.AttachIssueOrigins(stIssues, standaloneJSONL, true)
+	if stIssues[0].Origin == nil || stIssues[0].Origin.WorkingDirectory != "" {
+		t.Fatalf("expected empty Origin.WorkingDirectory on non-.beads standalone JSONL, got %+v", stIssues[0].Origin)
+	}
+}

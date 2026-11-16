@@ -131,6 +131,9 @@ self.addEventListener('fetch', (event) => {
   }
 
   const url = new URL(request.url);
+  if (url.pathname.startsWith('/__preview__/')) {
+    return;
+  }
   if (url.origin !== self.location.origin || !url.href.startsWith(self.registration.scope)) {
     return;
   }

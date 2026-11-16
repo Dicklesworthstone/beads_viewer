@@ -274,6 +274,37 @@ func (ctx RobotContext) ReferenceNow() time.Time {
 	return robotNow()
 }
 
+// isCorrelationTargetInScope reports whether an explicit correlation target beadID
+// is allowed under the active --repo / --label / --recipe scope. When only --repo
+// is active (without --label or --recipe), deleted/tombstoned historical beads
+// absent from ctx.FullIssues remain inspectable when their ID matches ctx.Repo.
+func isCorrelationTargetInScope(ctx RobotContext, beadID string) bool {
+	if ctx.CandidateIDs == nil || ctx.CandidateIDs[beadID] {
+		return true
+	}
+	if ctx.LabelScope != "" || ctx.ActiveRecipe != nil || strings.TrimSpace(ctx.Repo) == "" {
+		return false
+	}
+	for _, iss := range ctx.FullIssues {
+		if iss.ID == beadID {
+			return false
+		}
+	}
+	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
+		for _, src := range ctx.SourceAuthority.Sources {
+			if !sourceMatchesRepoFilter(src, ctx.Repo) {
+				continue
+			}
+			prefix := src.RepoPrefix
+			if prefix != "" && len(beadID) > len(prefix) && strings.EqualFold(beadID[:len(prefix)], prefix) {
+				return true
+			}
+		}
+		return false
+	}
+	return len(filterByRepo([]model.Issue{{ID: beadID}}, ctx.Repo)) > 0
+}
+
 // VelocityIssues returns the issue slice to use for aggregate closure-velocity
 // and historical ETA baselines. When --recipe filtered out closed issues (e.g.
 // --recipe actionable), RecipeVelocityIssues preserves closed history matching
@@ -1941,7 +1972,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			if len(ctx.FullIssues) > 0 {
 				burndownIssues = labelAnalysisIssuesForContext(ctx)
 			}
-			burndown := calculateBurndownAtWithThresholds(&scopedSprint, burndownIssues, now, driftCfg.AtRiskThresholds())
+			burndown := calculateBurndownAtWithThresholds(&scopedSprint, burndownIssues, ctx.Readiness, now, driftCfg.AtRiskThresholds())
 			burndown.RobotEnvelope = ctx.Envelope()
 			issueMap := make(map[string]model.Issue, len(burndownIssues))
 			for _, issue := range burndownIssues {
@@ -2828,7 +2859,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 	}
 
 	filterFloatMap := func(m map[string]float64) map[string]float64 {
-		if ctx.CandidateIDs == nil {
+		if ctx.ActiveRecipe == nil || ctx.CandidateIDs == nil {
 			return m
 		}
 		scoped := make(map[string]float64, len(ctx.CandidateIDs))
@@ -2840,7 +2871,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		return scoped
 	}
 	filterIntMap := func(m map[string]int) map[string]int {
-		if ctx.CandidateIDs == nil {
+		if ctx.ActiveRecipe == nil || ctx.CandidateIDs == nil {
 			return m
 		}
 		scoped := make(map[string]int, len(ctx.CandidateIDs))
@@ -2852,7 +2883,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		return scoped
 	}
 	filterStringSlice := func(in []string) []string {
-		if ctx.CandidateIDs == nil {
+		if ctx.ActiveRecipe == nil || ctx.CandidateIDs == nil {
 			return in
 		}
 		scoped := make([]string, 0, len(in))
@@ -2865,11 +2896,29 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 	}
 
 	if ctx.CandidateIDs != nil && insights.Stats != nil {
+		filterCandidateIntMap := func(m map[string]int) map[string]int {
+			scoped := make(map[string]int, len(ctx.CandidateIDs))
+			for k, v := range m {
+				if ctx.CandidateIDs[k] {
+					scoped[k] = v
+				}
+			}
+			return scoped
+		}
+		filterCandidateSlice := func(in []string) []string {
+			scoped := make([]string, 0, len(in))
+			for _, id := range in {
+				if ctx.CandidateIDs[id] {
+					scoped = append(scoped, id)
+				}
+			}
+			return scoped
+		}
 		scopedNodes, scopedEdges, scopedDensity := scopedGraphTotalsForCLI(graphIssues, &stats, ctx.CandidateIDs)
 		insights.Stats = &analysis.GraphStats{
-			OutDegree:        filterIntMap(insights.Stats.OutDegree),
-			InDegree:         filterIntMap(insights.Stats.InDegree),
-			TopologicalOrder: filterStringSlice(insights.Stats.TopologicalOrder),
+			OutDegree:        filterCandidateIntMap(insights.Stats.OutDegree),
+			InDegree:         filterCandidateIntMap(insights.Stats.InDegree),
+			TopologicalOrder: filterCandidateSlice(insights.Stats.TopologicalOrder),
 			Density:          scopedDensity,
 			NodeCount:        scopedNodes,
 			EdgeCount:        scopedEdges,
@@ -3731,8 +3780,13 @@ func handleRobotHistory(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 	}
 
 	opts := correlation.CorrelatorOptions{Limit: 500, Revision: ctx.AsOfCommit}
-	if cfg.BeadHistoryFlag != nil {
-		opts.BeadID = *cfg.BeadHistoryFlag
+	targetOutOfScope := false
+	if cfg.BeadHistoryFlag != nil && *cfg.BeadHistoryFlag != "" {
+		if !isCorrelationTargetInScope(ctx, *cfg.BeadHistoryFlag) {
+			targetOutOfScope = true
+		} else {
+			opts.BeadID = *cfg.BeadHistoryFlag
+		}
 	}
 	if cfg.HistoryLimit != nil {
 		opts.Limit = *cfg.HistoryLimit
@@ -3752,6 +3806,11 @@ func handleRobotHistory(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		return err
 	}
 	report.GeneratedAt = ctx.ReferenceNow()
+	if targetOutOfScope {
+		report.Histories = map[string]correlation.BeadHistory{}
+		report.CommitIndex = correlation.CommitIndex{}
+		report.Stats = recomputeHistoryStatsFiltered(report.Histories, report.Stats.Strategies, report.Stats.FeedbackApplied, true)
+	}
 
 	effectiveMinConf := 0.0
 	if cfg.MinConfidence != nil && *cfg.MinConfidence > effectiveMinConf {
@@ -4517,6 +4576,9 @@ func resolveWorkspaceFeedbackStoreForBead(ctx RobotContext, workDir, beadID stri
 			continue
 		}
 		for _, ws := range sources {
+			if strings.TrimSpace(ctx.Repo) != "" && !sourceMatchesRepoFilter(ws.source, ctx.Repo) {
+				continue
+			}
 			if strings.EqualFold(strings.TrimSpace(issue.SourceRepo), strings.TrimSpace(ws.source.SourceRepo)) {
 				store, err := loadCorrelationFeedbackStoreForBeadsPath(ws.repoRoot, ws.beadsPath)
 				if err != nil {
@@ -4528,6 +4590,9 @@ func resolveWorkspaceFeedbackStoreForBead(ctx RobotContext, workDir, beadID stri
 	}
 	// Fallback: match by workspace source prefix for deleted/tombstoned beads absent from allIssues.
 	for _, ws := range sources {
+		if strings.TrimSpace(ctx.Repo) != "" && !sourceMatchesRepoFilter(ws.source, ctx.Repo) {
+			continue
+		}
 		prefix := ws.source.RepoPrefix
 		if prefix != "" && len(beadID) > len(prefix) && strings.EqualFold(beadID[:len(prefix)], prefix) {
 			store, err := loadCorrelationFeedbackStoreForBeadsPath(ws.repoRoot, ws.beadsPath)
@@ -4629,9 +4694,19 @@ func detectWorkspaceOrphans(ctx RobotContext, limit int) (*correlation.OrphanRep
 		fullIssuesBySourceRepo[key] = append(fullIssuesBySourceRepo[key], issue)
 	}
 
-	scopedIssueIDs := make(map[string]bool, len(ctx.Issues))
-	for _, issue := range ctx.Issues {
-		scopedIssueIDs[issue.ID] = true
+	var scopedIssueIDs map[string]bool
+	if ctx.CandidateIDs != nil {
+		scopedIssueIDs = make(map[string]bool, len(ctx.CandidateIDs))
+		for id, ok := range ctx.CandidateIDs {
+			if ok {
+				scopedIssueIDs[id] = true
+			}
+		}
+	} else {
+		scopedIssueIDs = make(map[string]bool, len(ctx.Issues))
+		for _, issue := range ctx.Issues {
+			scopedIssueIDs[issue.ID] = true
+		}
 	}
 
 	var (
@@ -5121,6 +5196,10 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 	if err != nil {
 		return err
 	}
+	if !isCorrelationTargetInScope(ctx, beadID) {
+		fmt.Fprintf(ctx.StderrOrDefault(), "Bead not found: %s\n", beadID)
+		return newReportedRobotHandlerExit(1)
+	}
 
 	workDir, err := ctx.WorkDirOrDefault()
 	if err != nil {
@@ -5199,6 +5278,10 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 	commitSHA, beadID, err := parseCorrelationArg(*flagPtr)
 	if err != nil {
 		return err
+	}
+	if !isCorrelationTargetInScope(ctx, beadID) {
+		fmt.Fprintf(ctx.StderrOrDefault(), "Bead not found: %s\n", beadID)
+		return newReportedRobotHandlerExit(1)
 	}
 
 	workDir, err := ctx.WorkDirOrDefault()
@@ -6002,10 +6085,14 @@ func handleRobotBlockerChain(ctx RobotContext, cfg phaseThreeRobotHandlerConfig)
 	issues := ctx.Issues
 	targetID := *cfg.RobotBlockerChainFlag
 	inScope := false
-	for _, issue := range issues {
-		if issue.ID == targetID {
-			inScope = true
-			break
+	if ctx.CandidateIDs != nil {
+		inScope = ctx.CandidateIDs[targetID]
+	} else {
+		for _, issue := range issues {
+			if issue.ID == targetID {
+				inScope = true
+				break
+			}
 		}
 	}
 	if !inScope {
@@ -6123,6 +6210,10 @@ func handleRobotImpactNetwork(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 }
 
 func handleRobotCausality(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
+	if !isCorrelationTargetInScope(ctx, *cfg.RobotCausalityFlag) {
+		fmt.Fprintf(ctx.StderrOrDefault(), "Bead not found: %s\n", *cfg.RobotCausalityFlag)
+		return newReportedRobotHandlerExit(1)
+	}
 	workDir, err := ctx.WorkDirOrDefault()
 	if err != nil {
 		return fmt.Errorf("getting current directory: %w", err)
@@ -6243,8 +6334,7 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	sort.Slice(targetIssues, func(i, j int) bool { return targetIssues[i].ID < targetIssues[j].ID })
 
 	includeInactive := cfg.IncludeInactive != nil && *cfg.IncludeInactive
-	openIssues := make([]model.Issue, 0)
-	issueMap := make(map[string]model.Issue, len(targetIssues))
+	openIssues := make([]model.Issue, 0, len(targetIssues))
 	for _, issue := range targetIssues {
 		if issue.Status.IsClosed() || issue.Status.IsTombstone() {
 			continue
@@ -6252,7 +6342,6 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		if !includeInactive && (issue.IsTemplate || issue.Pinned || issue.Status == model.StatusPinned) {
 			continue
 		}
-		issueMap[issue.ID] = issue
 		openIssues = append(openIssues, issue)
 	}
 
@@ -6261,34 +6350,7 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		agents = *cfg.CapacityAgents
 	}
 
-	etaIssues := ctx.VelocityIssues()
-	totalMinutes := 0
-	minutesByID := make(map[string]int, len(openIssues))
-	for _, issue := range openIssues {
-		eta, err := analysis.EstimateETAForIssue(etaIssues, &graphStats, issue.ID, 1, now)
-		if err == nil {
-			minutesByID[issue.ID] = eta.EstimatedMinutes
-			totalMinutes += eta.EstimatedMinutes
-		}
-	}
-
-	// Readiness retains full-source gates; the duration heuristic below uses
-	// only distinct blocking edges within the selected unresolved backlog.
 	readiness := analyzer.Readiness()
-	blocks := make(map[string][]string)
-	for _, issue := range openIssues {
-		seen := make(map[string]bool)
-		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() || seen[dep.DependsOnID] {
-				continue
-			}
-			if _, exists := issueMap[dep.DependsOnID]; exists {
-				seen[dep.DependsOnID] = true
-				blocks[dep.DependsOnID] = append(blocks[dep.DependsOnID], issue.ID)
-			}
-		}
-	}
-
 	actionable := make([]string, 0)
 	for _, issue := range openIssues {
 		if readiness.Ready(issue.ID, now) {
@@ -6296,30 +6358,10 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		}
 	}
 
-	var chainStarts []string
-	if len(openIssues) > 0 {
-		// Seed from every in-set root (open issues with no open blocker inside
-		// openIssues). This includes all actionable roots plus externally-gated
-		// sub-DAG roots even when unrelated actionable leaf tasks exist.
-		hasInSetBlocker := make(map[string]bool, len(openIssues))
-		for _, downstreamIDs := range blocks {
-			for _, downstreamID := range downstreamIDs {
-				hasInSetBlocker[downstreamID] = true
-			}
-		}
-		for _, issue := range openIssues {
-			if !hasInSetBlocker[issue.ID] {
-				chainStarts = append(chainStarts, issue.ID)
-			}
-		}
-		if len(chainStarts) == 0 {
-			for _, issue := range openIssues {
-				chainStarts = append(chainStarts, issue.ID)
-			}
-		}
-	}
-
-	longestChain, serialMinutes := longestWeightedCapacityChain(chainStarts, blocks, minutesByID)
+	graham := analysis.ComputeGrahamBounds(openIssues, ctx.VelocityIssues(), &graphStats, agents, now)
+	totalMinutes := graham.TotalMinutes
+	serialMinutes := graham.CriticalPathMinutes
+	longestChain := graham.CriticalPathIDs
 	if longestChain == nil {
 		longestChain = []string{}
 	}
@@ -6329,7 +6371,6 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	if totalMinutes > 0 {
 		parallelizablePct = float64(parallelMinutes) / float64(totalMinutes) * 100
 	}
-	graham := analysis.ComputeGrahamBounds(openIssues, ctx.VelocityIssues(), &graphStats, agents, now)
 	velPerDay := graham.VelocityMinutesPerDay
 	if velPerDay <= 0 {
 		velPerDay = 60.0 * 8.0
@@ -6350,6 +6391,23 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		Title       string   `json:"title"`
 		BlocksCount int      `json:"blocks_count"`
 		Blocks      []string `json:"blocks,omitempty"`
+	}
+	openSet := make(map[string]bool, len(openIssues))
+	for _, issue := range openIssues {
+		openSet[issue.ID] = true
+	}
+	blocks := make(map[string][]string, len(openIssues))
+	for _, issue := range openIssues {
+		seen := make(map[string]bool)
+		for _, dep := range issue.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == issue.ID || seen[dep.DependsOnID] {
+				continue
+			}
+			if openSet[dep.DependsOnID] {
+				seen[dep.DependsOnID] = true
+				blocks[dep.DependsOnID] = append(blocks[dep.DependsOnID], issue.ID)
+			}
+		}
 	}
 	bottlenecks := make([]bottleneck, 0)
 	for _, issue := range openIssues {
@@ -6502,92 +6560,6 @@ func longestCapacityChain(starts []string, blocks map[string][]string) []string 
 // longestWeightedCapacityChain selects the simple blocking path maximizing
 // cumulative work minutes (matching Graham critical_path_minutes), breaking
 // ties by hop count and seed/neighbor order.
-func longestWeightedCapacityChain(starts []string, blocks map[string][]string, minutes map[string]int) ([]string, int) {
-	if len(starts) == 0 {
-		return nil, 0
-	}
-	state := make(map[string]uint8)
-	var postorder []string
-	hasCycle := false
-	var visit func(string)
-	visit = func(id string) {
-		if state[id] == 1 {
-			hasCycle = true
-			return
-		}
-		if state[id] == 2 {
-			return
-		}
-		state[id] = 1
-		for _, nextID := range blocks[id] {
-			visit(nextID)
-		}
-		state[id] = 2
-		postorder = append(postorder, id)
-	}
-	for _, id := range starts {
-		visit(id)
-	}
-	if !hasCycle {
-		bestMinutes := make(map[string]int, len(postorder))
-		bestHops := make(map[string]int, len(postorder))
-		next := make(map[string]string, len(postorder))
-		for _, id := range postorder {
-			own := minutes[id]
-			bestMinutes[id] = own
-			bestHops[id] = 1
-			for _, nextID := range blocks[id] {
-				candMin := own + bestMinutes[nextID]
-				candHops := 1 + bestHops[nextID]
-				if candMin > bestMinutes[id] || (candMin == bestMinutes[id] && candHops > bestHops[id]) {
-					bestMinutes[id] = candMin
-					bestHops[id] = candHops
-					next[id] = nextID
-				}
-			}
-		}
-		start := starts[0]
-		for _, id := range starts[1:] {
-			if bestMinutes[id] > bestMinutes[start] || (bestMinutes[id] == bestMinutes[start] && bestHops[id] > bestHops[start]) {
-				start = id
-			}
-		}
-		path := make([]string, 0, bestHops[start])
-		for id, remaining := start, bestHops[start]; remaining > 0; id, remaining = next[id], remaining-1 {
-			path = append(path, id)
-		}
-		return path, bestMinutes[start]
-	}
-
-	var longest []string
-	longestMin := -1
-	visited := make(map[string]bool)
-	var dfs func(string, []string, int)
-	dfs = func(id string, path []string, sumMin int) {
-		if visited[id] {
-			return
-		}
-		visited[id] = true
-		path = append(path, id)
-		sumMin += minutes[id]
-		if sumMin > longestMin || (sumMin == longestMin && len(path) > len(longest)) {
-			longestMin = sumMin
-			longest = append([]string(nil), path...)
-		}
-		for _, nextID := range blocks[id] {
-			dfs(nextID, path, sumMin)
-		}
-		visited[id] = false
-	}
-	for _, id := range starts {
-		dfs(id, nil, 0)
-	}
-	if longestMin < 0 {
-		longestMin = 0
-	}
-	return longest, longestMin
-}
-
 func scopedGraphTotalsForCLI(issues []model.Issue, stats *analysis.GraphStats, candidateIDs map[string]bool) (int, int, float64) {
 	if stats == nil {
 		return 0, 0, 0
@@ -6626,28 +6598,7 @@ func scopedGraphTotalsForCLI(issues []model.Issue, stats *analysis.GraphStats, c
 }
 
 func sanitizedGitEnvForCLI() []string {
-	raw := os.Environ()
-	filtered := make([]string, 0, len(raw)+4)
-	for _, kv := range raw {
-		key := kv
-		if eq := strings.IndexByte(kv, '='); eq >= 0 {
-			key = kv[:eq]
-		}
-		switch key {
-		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
-			"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR",
-			"GIT_CEILING_DIRECTORIES", "GIT_PREFIX",
-			"GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
-			"GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_EXEC_PATH":
-			continue
-		}
-		if strings.HasPrefix(key, "GIT_CONFIG_KEY_") || strings.HasPrefix(key, "GIT_CONFIG_VALUE_") {
-			continue
-		}
-		filtered = append(filtered, kv)
-	}
-	filtered = append(filtered, "GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0")
-	return filtered
+	return loader.SanitizedGitEnv()
 }
 
 func (r *RobotRegistry) Validate() error {

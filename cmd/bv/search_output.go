@@ -113,6 +113,7 @@ func applySearchConfigOverrides(cfg search.SearchConfig, modeFlag, presetFlag, w
 			return search.SearchConfig{}, err
 		}
 		cfg.Preset = name
+		cfg.HasPreset = true
 		// A preset only affects hybrid ranking, so an explicit preset implies
 		// hybrid mode (text-only implies text). Silently ignoring the preset
 		// under the default text mode was a trap: the flag appeared to work

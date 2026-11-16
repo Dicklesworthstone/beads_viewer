@@ -35,14 +35,14 @@ mkdir -p "$tmp/fixture/.beads" "$tmp/updated-fixture/.beads"
 python3 - "$tmp/fixture/.beads/issues.jsonl" "$tmp/updated-fixture/.beads/issues.jsonl" <<'PY'
 import json, pathlib, sys
 base = dict(status='open', priority=1, issue_type='task',
-            created_at='2026-09-01T12:00:00Z', updated_at='2026-09-03T12:00:00Z')
+            created_at='1979-12-01T12:00:00Z', updated_at='1979-12-03T12:00:00Z')
 issues = [
     dict(base, id='browser-root', title='Orchid root infrastructure', labels=['backend']),
     dict(base, id='browser-detail', title='Orchid searchable detail', labels=['frontend'],
          description='Visible **markdown**.\n\n<script>window.__unsafeDisplay=true</script>\n<img src=x onerror="window.__unsafeDisplay=true">',
-         comments=[dict(id='c1', issue_id='browser-detail', author='Reviewer', text='Verified comment violet', created_at='2026-09-03T12:00:00Z')],
+         comments=[dict(id='c1', issue_id='browser-detail', author='Reviewer', text='Verified comment violet', created_at='1979-12-03T12:00:00Z')],
          dependencies=[dict(issue_id='browser-detail', depends_on_id='browser-root', type='blocks')]),
-    dict(base, id='browser-closed', title='Orchid completed', status='closed', closed_at='2026-09-03T12:00:00Z'),
+    dict(base, id='browser-closed', title='Orchid completed', status='closed', closed_at='1979-12-03T12:00:00Z'),
     dict(base, id='browser-other', title='Unrelated saffron task', priority=2),
 ]
 pathlib.Path(sys.argv[1]).write_text(''.join(json.dumps(issue) + '\n' for issue in issues))

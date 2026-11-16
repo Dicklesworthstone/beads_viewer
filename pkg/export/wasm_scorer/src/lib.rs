@@ -43,31 +43,114 @@ pub struct ScoredResult {
     pub components: [f64; 5],
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ScorerConfig {
+    #[serde(default = "default_weight_text")]
+    text: f64,
+    #[serde(default = "default_weight_pagerank")]
+    pagerank: f64,
+    #[serde(default = "default_weight_status")]
+    status: f64,
+    #[serde(default = "default_weight_impact")]
+    impact: f64,
+    #[serde(default = "default_weight_priority")]
+    priority: f64,
+    #[serde(default = "default_weight_recency")]
+    recency: f64,
+    #[serde(default, alias = "maxBlockerCount")]
+    max_blocker_count: Option<u32>,
+}
+
+fn default_weight_text() -> f64 {
+    0.40
+}
+fn default_weight_pagerank() -> f64 {
+    0.20
+}
+fn default_weight_status() -> f64 {
+    0.15
+}
+fn default_weight_impact() -> f64 {
+    0.10
+}
+fn default_weight_priority() -> f64 {
+    0.10
+}
+fn default_weight_recency() -> f64 {
+    0.05
+}
+
+impl Default for ScorerConfig {
+    fn default() -> Self {
+        Self {
+            text: default_weight_text(),
+            pagerank: default_weight_pagerank(),
+            status: default_weight_status(),
+            impact: default_weight_impact(),
+            priority: default_weight_priority(),
+            recency: default_weight_recency(),
+            max_blocker_count: None,
+        }
+    }
+}
+
 #[wasm_bindgen]
 pub struct HybridScorer {
     weights: Weights,
     max_blocker_count: u32,
+    configured_max_blocker_count: Option<u32>,
 }
 
 #[wasm_bindgen]
 impl HybridScorer {
     #[wasm_bindgen(constructor)]
     pub fn new(weights_json: &str) -> HybridScorer {
-        let weights = serde_json::from_str(weights_json).unwrap_or_default();
+        let cfg: ScorerConfig = serde_json::from_str(weights_json).unwrap_or_default();
         HybridScorer {
-            weights,
+            weights: Weights {
+                text: cfg.text,
+                pagerank: cfg.pagerank,
+                status: cfg.status,
+                impact: cfg.impact,
+                priority: cfg.priority,
+                recency: cfg.recency,
+            },
             max_blocker_count: 0,
+            configured_max_blocker_count: cfg.max_blocker_count,
         }
     }
 
     #[wasm_bindgen]
     pub fn score_batch(&mut self, metrics_json: &str) -> String {
+        self.score_batch_internal(metrics_json, self.configured_max_blocker_count)
+    }
+
+    #[wasm_bindgen]
+    pub fn score_batch_with_max(
+        &mut self,
+        metrics_json: &str,
+        max_blocker_count: u32,
+    ) -> String {
+        self.score_batch_internal(metrics_json, Some(max_blocker_count))
+    }
+}
+
+impl HybridScorer {
+    fn score_batch_internal(
+        &mut self,
+        metrics_json: &str,
+        configured_max: Option<u32>,
+    ) -> String {
         let metrics: Vec<IssueMetrics> = match serde_json::from_str(metrics_json) {
             Ok(metrics) => metrics,
             Err(_) => return "[]".to_string(),
         };
 
-        self.max_blocker_count = metrics.iter().map(|m| m.blocker_count).max().unwrap_or(0);
+        let batch_max = metrics.iter().map(|m| m.blocker_count).max().unwrap_or(0);
+        self.max_blocker_count = match configured_max {
+            Some(cfg_max) => batch_max.max(cfg_max),
+            None => batch_max,
+        };
 
         let mut results: Vec<ScoredResult> = metrics.iter().map(|m| self.score_single(m)).collect();
 
@@ -80,9 +163,6 @@ impl HybridScorer {
 
         serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string())
     }
-}
-
-impl HybridScorer {
     fn score_single(&self, m: &IssueMetrics) -> ScoredResult {
         let status_score = normalize_status(m.status);
         let priority_score = normalize_priority(m.priority);
@@ -120,7 +200,7 @@ fn normalize_status(status: u8) -> f64 {
         3 => 0.1, // closed
         4 => 0.8, // review
         5 => 0.8, // hooked
-        6 => 0.7, // pinned
+        6 => 0.2, // pinned
         7 => 0.2, // deferred
         8 => 0.2, // draft
         9 => 0.0, // tombstone
@@ -188,7 +268,7 @@ mod tests {
             (3_u8, 0.1),   // closed
             (4_u8, 0.8),   // review
             (5_u8, 0.8),   // hooked
-            (6_u8, 0.7),   // pinned
+            (6_u8, 0.2),   // pinned
             (7_u8, 0.2),   // deferred
             (8_u8, 0.2),   // draft
             (9_u8, 0.0),   // tombstone

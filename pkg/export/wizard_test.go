@@ -214,6 +214,8 @@ func TestWizardConfigPath(t *testing.T) {
 func TestSaveAndLoadWizardConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 
 	loaded, err := LoadWizardConfig()
 	if err != nil {
@@ -267,6 +269,8 @@ func TestSaveWizardConfigRejectsNil(t *testing.T) {
 func TestSaveWizardConfigCleansTempOnReplaceFailure(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 
 	configPath := WizardConfigPath()
 	if configPath == "" {
@@ -293,6 +297,8 @@ func TestSaveWizardConfigCleansTempOnReplaceFailure(t *testing.T) {
 func TestLoadWizardConfig_InvalidJSON(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 
 	configPath := WizardConfigPath()
 	if configPath == "" {
@@ -472,6 +478,8 @@ func TestWizard_IsolatesSavedConfigByRepo(t *testing.T) {
 	t.Setenv("TERM", "dumb")
 	homeDir := t.TempDir()
 	t.Setenv("HOME", homeDir)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
 
 	parentDir := t.TempDir()
 	repoABeads := filepath.Join(parentDir, "repo-a", ".beads")
@@ -536,5 +544,120 @@ func TestWizard_IsolatesSavedConfigByRepo(t *testing.T) {
 	}
 	if wizB.config.RepoName == "repo-a-pages" || wizB.config.Title == "Repo A Dashboard" {
 		t.Fatalf("wizB leaked repo-a config: %+v", wizB.config)
+	}
+}
+
+func TestWizardConfig_XDGAndNoSavedConfig(t *testing.T) {
+	homeDir := t.TempDir()
+	xdgDir := filepath.Join(t.TempDir(), "custom-xdg")
+	t.Setenv("HOME", homeDir)
+	t.Setenv("XDG_CONFIG_HOME", xdgDir)
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+
+	wantPath := filepath.Join(xdgDir, "bv", "pages-wizard.json")
+	if got := WizardConfigPath(); got != wantPath {
+		t.Fatalf("WizardConfigPath() with XDG_CONFIG_HOME = %q, want %q", got, wantPath)
+	}
+
+	// When BV_NO_SAVED_CONFIG is set, SaveWizardConfig must not write to disk.
+	t.Setenv("BV_NO_SAVED_CONFIG", "1")
+	if err := SaveWizardConfig(&WizardConfig{
+		Title:        "Should Not Persist",
+		DeployTarget: "local",
+	}); err != nil {
+		t.Fatalf("SaveWizardConfig under BV_NO_SAVED_CONFIG=1 failed: %v", err)
+	}
+	if _, err := os.Stat(wantPath); !os.IsNotExist(err) {
+		t.Fatalf("expected no config file written when BV_NO_SAVED_CONFIG=1, stat err=%v", err)
+	}
+
+	// Write a real config when BV_NO_SAVED_CONFIG is cleared, then verify LoadWizardConfig
+	// and LoadWizardConfigForRepo both return nil without reading when BV_NO_SAVED_CONFIG=1.
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	repoBeads := filepath.Join(t.TempDir(), "xdg-repo", ".beads")
+	if err := os.MkdirAll(repoBeads, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	wiz := NewWizard(repoBeads)
+	wiz.config.Title = "XDG Persisted"
+	wiz.config.DeployTarget = "local"
+	wiz.config.OutputPath = "./xdg-out"
+	if err := SaveWizardConfig(wiz.config); err != nil {
+		t.Fatalf("SaveWizardConfig(xdg): %v", err)
+	}
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Fatalf("expected XDG config file at %q: %v", wantPath, err)
+	}
+
+	t.Setenv("BV_NO_SAVED_CONFIG", "1")
+	if cfg, err := LoadWizardConfig(); err != nil || cfg != nil {
+		t.Fatalf("LoadWizardConfig under BV_NO_SAVED_CONFIG=1 = (%+v, %v), want (nil, nil)", cfg, err)
+	}
+	if cfg, err := LoadWizardConfigForRepo(repoBeads); err != nil || cfg != nil {
+		t.Fatalf("LoadWizardConfigForRepo under BV_NO_SAVED_CONFIG=1 = (%+v, %v), want (nil, nil)", cfg, err)
+	}
+}
+
+func TestWizard_MultiRepoSavedConfigPreservation(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "xdg"))
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+
+	parentDir := t.TempDir()
+	repoABeads := filepath.Join(parentDir, "repo-alpha", ".beads")
+	repoBBeads := filepath.Join(parentDir, "repo-beta", ".beads")
+	for _, dir := range []string{repoABeads, repoBBeads} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q): %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "issues.jsonl"), []byte{}, 0o644); err != nil {
+			t.Fatalf("WriteFile issues.jsonl: %v", err)
+		}
+	}
+
+	wizA := NewWizard(repoABeads)
+	wizA.config.Title = "Alpha Pages"
+	wizA.config.DeployTarget = "local"
+	wizA.config.OutputPath = filepath.Join(parentDir, "alpha-out")
+	if err := SaveWizardConfig(wizA.config); err != nil {
+		t.Fatalf("SaveWizardConfig(alpha): %v", err)
+	}
+
+	wizB := NewWizard(repoBBeads)
+	wizB.config.Title = "Beta Pages"
+	wizB.config.DeployTarget = "local"
+	wizB.config.OutputPath = filepath.Join(parentDir, "beta-out")
+	if err := SaveWizardConfig(wizB.config); err != nil {
+		t.Fatalf("SaveWizardConfig(beta): %v", err)
+	}
+
+	// Saving Repo B must NOT clobber Repo A's saved config!
+	loadedA, err := LoadWizardConfigForRepo(repoABeads)
+	if err != nil || loadedA == nil {
+		t.Fatalf("LoadWizardConfigForRepo(alpha): got (%+v, %v)", loadedA, err)
+	}
+	if loadedA.Title != "Alpha Pages" || loadedA.OutputPath != wizA.config.OutputPath {
+		t.Fatalf("Repo A config clobbered after saving Repo B: %+v", loadedA)
+	}
+
+	loadedB, err := LoadWizardConfigForRepo(repoBBeads)
+	if err != nil || loadedB == nil {
+		t.Fatalf("LoadWizardConfigForRepo(beta): got (%+v, %v)", loadedB, err)
+	}
+	if loadedB.Title != "Beta Pages" || loadedB.OutputPath != wizB.config.OutputPath {
+		t.Fatalf("Repo B config mismatch: %+v", loadedB)
+	}
+
+	// Re-running Wizard in Repo A must offer Repo A's saved config and accept "y\n" update!
+	wizAResume := NewWizard(repoABeads)
+	wizAResume.input = &wizardInputReader{data: []byte("y\n")}
+	res, err := wizAResume.Run()
+	if err != nil {
+		t.Fatalf("wizAResume.Run() failed: %v", err)
+	}
+	if !wizAResume.isUpdate || res.DeployTarget != "local" || wizAResume.config.Title != "Alpha Pages" {
+		t.Fatalf("wizAResume failed to restore Repo A config: isUpdate=%v res=%+v cfg=%+v",
+			wizAResume.isUpdate, res, wizAResume.config)
 	}
 }

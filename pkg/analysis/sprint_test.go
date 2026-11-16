@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -239,16 +240,17 @@ func TestSprintAtRiskHonorsReadinessIndex(t *testing.T) {
 		},
 		{
 			// Transitive parent-child readiness: has NO direct DepBlocks, only DepParentChild to blocked-epic!
+			// UpdatedAt is 3d ago (< 4d InactiveDays so no_activity stays quiet, >= 2d BlockedDays).
 			ID: "child-of-blocked-epic", Title: "Child of blocked epic", Status: model.StatusOpen,
-			Priority: 0, IssueType: model.TypeTask, UpdatedAt: now.Add(-time.Hour),
+			Priority: 0, IssueType: model.TypeTask, UpdatedAt: now.AddDate(0, 0, -3),
 			Dependencies: []*model.Dependency{
-				{IssueID: "child-of-blocked-epic", DependsOnID: "blocked-epic", Type: model.DepParentChild, CreatedAt: now.Add(-time.Hour)},
+				{IssueID: "child-of-blocked-epic", DependsOnID: "blocked-epic", Type: model.DepParentChild, CreatedAt: blockedLinkCreated},
 			},
 		},
 		{
 			// Unknown external blocker ID missing from loaded slice -> ReadinessIndex marks DependenciesUnknown (unsatisfied).
 			ID: "dangling-blocker", Title: "Depends on unloaded external ID", Status: model.StatusOpen,
-			Priority: 0, IssueType: model.TypeTask, UpdatedAt: now.Add(-time.Hour),
+			Priority: 0, IssueType: model.TypeTask, UpdatedAt: now.AddDate(0, 0, -3),
 			Dependencies: []*model.Dependency{
 				{IssueID: "dangling-blocker", DependsOnID: "MISSING-EXT-99", Type: model.DepBlocks, CreatedAt: unknownLinkCreated},
 			},
@@ -291,7 +293,7 @@ func TestSprintAtRiskHonorsReadinessIndex(t *testing.T) {
 	got := DetectAtRisk(issues, sp, now, DefaultAtRiskThresholds())
 	byID := make(map[string]AtRiskItem, len(got))
 	for _, item := range got {
-		byID[item.IssueID] = item
+		byID[item.ID] = item
 	}
 
 	if len(byID) != 2 {
@@ -313,11 +315,8 @@ func TestSprintAtRiskHonorsReadinessIndex(t *testing.T) {
 	if len(wantChildSignals) != 0 {
 		t.Fatalf("child-of-blocked-epic signals = %v, missing %v", childItem.Signals, wantChildSignals)
 	}
-	if childItem.BlockedDays != 5 {
-		t.Fatalf("child-of-blocked-epic BlockedDays = %d, want 5 from ancestor DepBlocks CreatedAt", childItem.BlockedDays)
-	}
-	if len(childItem.StalledBlockerIDs) != 1 || childItem.StalledBlockerIDs[0] != "stalled-root" {
-		t.Fatalf("child-of-blocked-epic StalledBlockerIDs = %v, want [stalled-root]", childItem.StalledBlockerIDs)
+	if !strings.Contains(childItem.Detail, "blocked for 3d") || !strings.Contains(childItem.Detail, "stalled-root") {
+		t.Fatalf("child-of-blocked-epic Detail = %q, want 'blocked for 3d' and 'stalled-root'", childItem.Detail)
 	}
 
 	danglingItem, ok := byID["dangling-blocker"]
@@ -334,13 +333,148 @@ func TestSprintAtRiskHonorsReadinessIndex(t *testing.T) {
 	if len(wantDanglingSignals) != 0 {
 		t.Fatalf("dangling-blocker signals = %v, missing %v", danglingItem.Signals, wantDanglingSignals)
 	}
-	if danglingItem.BlockedDays != 4 {
-		t.Fatalf("dangling-blocker BlockedDays = %d, want 4", danglingItem.BlockedDays)
+	if !strings.Contains(danglingItem.Detail, "blocked for 3d") {
+		t.Fatalf("dangling-blocker Detail = %q, want 'blocked for 3d'", danglingItem.Detail)
 	}
 
 	for _, neg := range []string{"child-of-ready-epic", "tomb-satisfied"} {
 		if item, exists := byID[neg]; exists {
 			t.Fatalf("negative control %s falsely flagged at-risk: %+v", neg, item)
 		}
+	}
+}
+
+func TestDetectAtRisk_ParentChildEpicDoesNotTriggerBlockersNotClosing(t *testing.T) {
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	tenDaysAgo := now.AddDate(0, 0, -10)
+	oneHourAgo := now.Add(-time.Hour)
+
+	issues := []model.Issue{
+		// Active blocker R updated 1h ago gating 10d-old epic E:
+		// E stays open until its children finish, so E's 10d age must NOT fire blockers_not_closing on C.
+		{
+			ID: "R", Title: "Active blocker", Status: model.StatusOpen,
+			Priority: 2, IssueType: model.TypeTask, UpdatedAt: oneHourAgo,
+		},
+		{
+			ID: "E", Title: "Ten-day-old parent epic", Status: model.StatusOpen,
+			Priority: 1, IssueType: model.TypeEpic, UpdatedAt: tenDaysAgo,
+			Dependencies: []*model.Dependency{
+				{IssueID: "E", DependsOnID: "R", Type: model.DepBlocks, CreatedAt: oneHourAgo},
+			},
+		},
+		{
+			ID: "C", Title: "Child of E with active blocker", Status: model.StatusOpen,
+			Priority: 2, IssueType: model.TypeTask, UpdatedAt: oneHourAgo,
+			Dependencies: []*model.Dependency{
+				{IssueID: "C", DependsOnID: "E", Type: model.DepParentChild, CreatedAt: oneHourAgo},
+			},
+		},
+		{
+			ID: "C-crit", Title: "Critical child of E", Status: model.StatusOpen,
+			Priority: 0, IssueType: model.TypeTask, UpdatedAt: oneHourAgo,
+			Dependencies: []*model.Dependency{
+				{IssueID: "C-crit", DependsOnID: "E", Type: model.DepParentChild, CreatedAt: oneHourAgo},
+			},
+		},
+		// Planted positive control: 10d-idle blocker R2 gating fresh epic E2 MUST flag C2 with blockers_not_closing.
+		{
+			ID: "R2", Title: "Stalled blocker", Status: model.StatusOpen,
+			Priority: 2, IssueType: model.TypeTask, UpdatedAt: tenDaysAgo,
+		},
+		{
+			ID: "E2", Title: "Parent epic gated by stalled R2", Status: model.StatusOpen,
+			Priority: 1, IssueType: model.TypeEpic, UpdatedAt: oneHourAgo,
+			Dependencies: []*model.Dependency{
+				{IssueID: "E2", DependsOnID: "R2", Type: model.DepBlocks, CreatedAt: oneHourAgo},
+			},
+		},
+		{
+			ID: "C2", Title: "Child of E2 gated by stalled R2", Status: model.StatusOpen,
+			Priority: 2, IssueType: model.TypeTask, UpdatedAt: oneHourAgo,
+			Dependencies: []*model.Dependency{
+				{IssueID: "C2", DependsOnID: "E2", Type: model.DepParentChild, CreatedAt: oneHourAgo},
+			},
+		},
+	}
+
+	sp := &model.Sprint{
+		ID:      "sprint-parent-epic",
+		BeadIDs: []string{"C", "C-crit", "C2"},
+	}
+	got := DetectAtRisk(issues, sp, now, DefaultAtRiskThresholds())
+	byID := make(map[string]AtRiskItem, len(got))
+	for _, item := range got {
+		byID[item.ID] = item
+	}
+
+	if item, flagged := byID["C"]; flagged {
+		t.Fatalf("C must NOT be flagged with blockers_not_closing from 10d-old parent epic E, got %+v", item)
+	}
+
+	critItem, ok := byID["C-crit"]
+	if !ok {
+		t.Fatalf("expected C-crit to be flagged critical_blocked, got %+v", got)
+	}
+	if len(critItem.Signals) != 1 || critItem.Signals[0] != AtRiskCriticalBlocked {
+		t.Fatalf("C-crit signals = %v, want only [critical_blocked] (detail=%q)", critItem.Signals, critItem.Detail)
+	}
+	if !strings.Contains(critItem.Detail, "blocked by R") {
+		t.Fatalf("C-crit detail = %q, want 'blocked by R'", critItem.Detail)
+	}
+
+	c2Item, ok := byID["C2"]
+	if !ok {
+		t.Fatalf("expected C2 to be flagged blockers_not_closing from 10d-idle R2, got %+v", got)
+	}
+	if len(c2Item.Signals) != 1 || c2Item.Signals[0] != AtRiskBlockersNotClosing {
+		t.Fatalf("C2 signals = %v, want [blockers_not_closing]", c2Item.Signals)
+	}
+	if !strings.Contains(c2Item.Detail, "R2") || strings.Contains(c2Item.Detail, "E2") {
+		t.Fatalf("C2 detail = %q, want R2 cited and E2 excluded", c2Item.Detail)
+	}
+}
+
+func TestDetectAtRiskWithReadiness_HonorsTombstoneIDsAndCrossRepoBlockers(t *testing.T) {
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	oneHourAgo := now.Add(-time.Hour)
+
+	repoIssues := []model.Issue{
+		{
+			ID: "api:tomb-gated", Title: "Depends on stripped tombstone ID", Status: model.StatusOpen,
+			Priority: 0, IssueType: model.TypeTask, UpdatedAt: oneHourAgo,
+			Dependencies: []*model.Dependency{
+				{IssueID: "api:tomb-gated", DependsOnID: "api:deleted-1", Type: model.DepBlocks, CreatedAt: oneHourAgo},
+			},
+		},
+		{
+			ID: "api:xrepo-gated", Title: "Depends on sibling repo open blocker", Status: model.StatusOpen,
+			Priority: 0, IssueType: model.TypeTask, UpdatedAt: oneHourAgo,
+			Dependencies: []*model.Dependency{
+				{IssueID: "api:xrepo-gated", DependsOnID: "web:open-1", Type: model.DepBlocks, CreatedAt: oneHourAgo},
+			},
+		},
+	}
+	allWorkspaceIssues := append([]model.Issue{}, repoIssues...)
+	allWorkspaceIssues = append(allWorkspaceIssues,
+		model.Issue{ID: "api:deleted-1", Status: model.StatusTombstone},
+		model.Issue{
+			ID: "web:open-1", Title: "Open blocker in web repo", Status: model.StatusOpen,
+			Priority: 1, IssueType: model.TypeTask, UpdatedAt: oneHourAgo,
+		},
+	)
+
+	readiness := model.NewReadinessIndex(allWorkspaceIssues)
+	sp := &model.Sprint{
+		ID:      "sprint-ws",
+		BeadIDs: []string{"api:tomb-gated", "api:xrepo-gated"},
+	}
+
+	got := DetectAtRiskWithReadiness(repoIssues, sp, readiness, now, DefaultAtRiskThresholds())
+	if len(got) != 1 || got[0].ID != "api:xrepo-gated" {
+		t.Fatalf("DetectAtRiskWithReadiness = %+v, want only [api:xrepo-gated] (tombstone blocker must be satisfied)", got)
+	}
+	if !strings.Contains(got[0].Detail, "web:open-1") {
+		t.Fatalf("api:xrepo-gated detail = %q, want cross-repo blocker web:open-1", got[0].Detail)
 	}
 }

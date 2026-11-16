@@ -917,8 +917,11 @@ async function initGraphEngine() {
 
   try {
     // Dynamic import of the WASM module (propagate deployment cache-buster if present)
-    const wasmModule = await import('./vendor/bv_graph.js' + getViewerAssetQuerySuffix());
-    await wasmModule.default(); // Initialize WASM
+    const suffix = getViewerAssetQuerySuffix();
+    const wasmModule = await import('./vendor/bv_graph.js' + suffix);
+    await wasmModule.default({
+      module_or_path: new URL('./vendor/bv_graph_bg.wasm' + suffix, window.location.href),
+    }); // Initialize WASM
 
     // Expose for other modules (e.g., graph.js force-graph view) to reuse.
     window.bvGraphWasm = wasmModule;
@@ -1032,17 +1035,32 @@ function buildClosedSet() {
   return closed;
 }
 
+function overviewHasTemplatePinnedColumns() {
+  try {
+    const cols = new Set(
+      execQuery('PRAGMA table_info(issue_overview_mv)').map(r => String(r.name || '').toLowerCase())
+    );
+    return cols.has('is_template') && cols.has('pinned');
+  } catch {
+    return false;
+  }
+}
+
 /** Restrict selectable issues without marking excluded prerequisites closed. */
 function buildCandidateSet(options = false) {
   const candidates = new Uint8Array(GRAPH_STATE.graph.nodeCount());
   const actionableOnly = options === true || Boolean(options?.actionableOnly);
   const lifecycleOnly = Boolean(options && typeof options === 'object' && options.lifecycleOnly);
+  const templatePinnedGuard = overviewHasTemplatePinnedColumns()
+    ? ' AND COALESCE(is_template, 0) = 0 AND COALESCE(pinned, 0) = 0'
+    : '';
+
   if (lifecycleOnly) {
     const nowMs = getReferenceNowMs();
     const rows = execQuery(`
       SELECT id, defer_until
       FROM issue_overview_mv
-      WHERE LOWER(status) NOT IN ('closed', 'tombstone', 'deferred', 'draft', 'pinned')
+      WHERE LOWER(status) NOT IN ('closed', 'tombstone', 'deferred', 'draft', 'pinned')${templatePinnedGuard}
       ORDER BY id
     `);
     for (const row of rows) {
@@ -1055,7 +1073,30 @@ function buildCandidateSet(options = false) {
     }
     return candidates;
   }
-  const rows = execQuery(`SELECT id FROM issue_overview_mv${actionableOnly ? ' WHERE is_actionable = 1' : ''} ORDER BY id`);
+
+  if (actionableOnly) {
+    const nowMs = getReferenceNowMs();
+    const rows = execQuery(`
+      SELECT id, defer_until
+      FROM issue_overview_mv
+      WHERE is_actionable = 1
+        AND LOWER(status) NOT IN ('closed', 'tombstone', 'deferred', 'draft', 'pinned')${templatePinnedGuard}
+      ORDER BY id
+    `);
+    for (const row of rows) {
+      if (row.defer_until) {
+        const deferMs = Date.parse(row.defer_until);
+        if (Number.isFinite(deferMs) && deferMs > nowMs) continue;
+      }
+      const idx = GRAPH_STATE.nodeMap.get(row.id);
+      if (idx !== undefined) candidates[idx] = 1;
+    }
+    return candidates;
+  }
+
+  const rows = execQuery(
+    `SELECT id FROM issue_overview_mv WHERE LOWER(status) != 'pinned'${templatePinnedGuard} ORDER BY id`
+  );
   for (const { id } of rows) {
     const idx = GRAPH_STATE.nodeMap.get(id);
     if (idx !== undefined) candidates[idx] = 1;
@@ -1396,7 +1437,7 @@ function getTopKSet(k = 5) {
   if (!GRAPH_STATE.ready) return null;
 
   const closedSet = buildClosedSet();
-  const result = GRAPH_STATE.graph.topkSet(closedSet, k, buildCandidateSet({ lifecycleOnly: true }));
+  const result = GRAPH_STATE.graph.topkSet(closedSet, k, buildCandidateSet(true));
 
   // Enrich with issue IDs
   if (result && result.items) {
@@ -1416,17 +1457,34 @@ function getTopKSet(k = 5) {
  * Compute greedy dependency vertex cover from the WASM graph engine
  */
 function getCoverageSet(limit = 10) {
-  const graph = (GRAPH_STATE.activeGraph && GRAPH_STATE.activeGraph.edgeCount() > 0)
-    ? GRAPH_STATE.activeGraph
-    : GRAPH_STATE.graph;
-  if (!GRAPH_STATE.ready || !graph) return null;
+  if (!GRAPH_STATE.ready) return null;
+  if (!GRAPH_STATE.activeGraph || GRAPH_STATE.activeGraph.edgeCount() === 0) {
+    return {
+      items: [],
+      edgesCovered: 0,
+      totalEdges: 0,
+      coverageRatio: 1,
+      edges_covered: 0,
+      total_edges: 0,
+      coverage_ratio: 1,
+    };
+  }
+  const graph = GRAPH_STATE.activeGraph;
 
   try {
     const raw = (limit === 10 && typeof graph.coverageSetDefault === 'function')
       ? graph.coverageSetDefault()
       : graph.coverageSet?.(limit);
     if (!raw || !Array.isArray(raw.items)) {
-      return { items: [], edges_covered: 0, total_edges: 0, coverage_ratio: 0 };
+      return {
+        items: [],
+        edgesCovered: 0,
+        totalEdges: 0,
+        coverageRatio: 1,
+        edges_covered: 0,
+        total_edges: 0,
+        coverage_ratio: 1,
+      };
     }
 
     const ids = raw.items
@@ -1459,13 +1517,31 @@ function getCoverageSet(limit = 10) {
       })
       .filter(Boolean);
 
+    const edgesCovered = Number(raw.edges_covered ?? raw.edgesCovered ?? 0);
+    const totalEdges = Number(raw.total_edges ?? raw.totalEdges ?? 0);
+    const coverageRatio = Number(raw.coverage_ratio ?? raw.coverageRatio ?? (totalEdges === 0 ? 1 : 0));
+
     return {
       ...raw,
       items,
+      edgesCovered,
+      totalEdges,
+      coverageRatio,
+      edges_covered: edgesCovered,
+      total_edges: totalEdges,
+      coverage_ratio: coverageRatio,
     };
   } catch (e) {
     console.warn('[viewer] getCoverageSet failed:', e);
-    return { items: [], edges_covered: 0, total_edges: 0, coverage_ratio: 0 };
+    return {
+      items: [],
+      edgesCovered: 0,
+      totalEdges: 0,
+      coverageRatio: 0,
+      edges_covered: 0,
+      total_edges: 0,
+      coverage_ratio: 0,
+    };
   }
 }
 
@@ -2065,7 +2141,7 @@ function searchIssues(term, options = {}) {
     return rows.slice(offset, offset + limit);
   }
 
-  getReferenceNowMs();
+  const refNowMs = getReferenceNowMs();
   const bm25Rows = rows.filter(r => r.bm25_score !== undefined && r.bm25_score !== null && Number.isFinite(Number(r.bm25_score)));
   const maxBM25 = bm25Rows.length > 0
     ? Math.max(...bm25Rows.map(r => Math.abs(Number(r.bm25_score))), 0)
@@ -2083,9 +2159,21 @@ function searchIssues(term, options = {}) {
         ? Math.min(1, Math.max(0, (Number(r.pagerank) || 0) / maxPageRank))
         : 0;
     }
-    const isDepBlocked = (r.status === 'open' || r.status === 'in_progress') &&
-      ((r.dependency_state && r.dependency_state !== 'satisfied') || Number(r.blocker_count ?? r.blocked_by_count ?? 0) > 0);
-    const scoringStatus = isDepBlocked ? 'blocked' : r.status;
+    const normStatus = String(r.status || '').trim().toLowerCase();
+    const isClosedOrTombstone = normStatus === 'closed' || normStatus === 'tombstone';
+    const isTemplateOrPinned =
+      r.is_template === true || r.is_template === 'true' || Number(r.is_template) > 0 ||
+      r.pinned === true || r.pinned === 'true' || Number(r.pinned) > 0 ||
+      normStatus === 'pinned';
+    const deferUntilMs = r.defer_until ? Date.parse(r.defer_until) : NaN;
+    const isFutureDeferred = (normStatus === 'open' || normStatus === 'in_progress') &&
+      Number.isFinite(deferUntilMs) && deferUntilMs > refNowMs;
+    const isDeferredEffective = !isClosedOrTombstone && (isTemplateOrPinned || isFutureDeferred);
+    const isDepBlocked = !isClosedOrTombstone && !isDeferredEffective &&
+      (normStatus === 'open' || normStatus === 'in_progress') &&
+      ((r.dependency_state && String(r.dependency_state).trim().toLowerCase() !== 'satisfied') ||
+        Number(r.open_blocker_count ?? r.blocker_count ?? r.blocked_by_count ?? 0) > 0);
+    const scoringStatus = isDeferredEffective ? 'deferred' : (isDepBlocked ? 'blocked' : normStatus);
     return {
       ...r,
       _displayStatus: r.status,
@@ -2750,10 +2838,13 @@ function getCycleInfo() {
   if (suggestions && !suggestions.suggestions && Array.isArray(suggestions.top_suggestions)) {
     suggestions.suggestions = suggestions.top_suggestions;
   }
-  const cycleCount = suggestions?.total_cycles
+  const rawCycleCount = suggestions?.total_cycles
     ?? suggestions?.cycles?.length
     ?? enumInfo?.count
     ?? 0;
+  const cycleCount = hasCycles
+    ? Math.max(Number(rawCycleCount) || 0, nonTrivialComponents.length)
+    : 0;
   const truncated = Boolean(suggestions?.truncated || enumInfo?.truncated);
 
   return {
@@ -2761,7 +2852,7 @@ function getCycleInfo() {
     cycleCount,
     truncated,
     sccCount: rawComponents.length,
-    nonTrivialSccCount: scc?.cycle_count ?? nonTrivialComponents.length,
+    nonTrivialSccCount: Math.max(Number(scc?.cycle_count) || 0, nonTrivialComponents.length),
     largestSccSize,
     sccComponents,
     suggestions,
@@ -3769,6 +3860,22 @@ function beadsApp() {
     copiedCommandText: '',
     showTriageJson: false, // Modal for raw JSON view
 
+    syncModalOpenBodyClass() {
+      const hasModal = !!(this.selectedIssue || (this.view === 'graph' && this.graphDetailNode));
+      if (hasModal) {
+        if (!document.body.classList.contains('modal-open')) {
+          document.body.style.setProperty('--scroll-y', `${window.scrollY}px`);
+          document.body.classList.add('modal-open');
+        }
+      } else if (document.body.classList.contains('modal-open')) {
+        const scrollY = document.body.style.getPropertyValue('--scroll-y');
+        document.body.classList.remove('modal-open');
+        if (scrollY) {
+          window.scrollTo(0, parseInt(scrollY || '0', 10));
+        }
+      }
+    },
+
     /**
      * Initialize the application
      */
@@ -3780,21 +3887,7 @@ function beadsApp() {
 
       // Body scroll lock for modals (iOS scroll bleed fix)
       // Watches both issue modal and graph detail pane
-      const updateBodyScrollLock = () => {
-        const hasModal = !!(this.selectedIssue || this.graphDetailNode);
-        if (hasModal) {
-          // Save scroll position before locking
-          document.body.style.setProperty('--scroll-y', `${window.scrollY}px`);
-          document.body.classList.add('modal-open');
-        } else {
-          // Restore scroll position after unlocking
-          const scrollY = document.body.style.getPropertyValue('--scroll-y');
-          document.body.classList.remove('modal-open');
-          if (scrollY) {
-            window.scrollTo(0, parseInt(scrollY || '0', 10));
-          }
-        }
-      };
+      const updateBodyScrollLock = () => this.syncModalOpenBodyClass();
 
       // Watch for modal state changes using Alpine's $watch
       this.$watch('selectedIssue', updateBodyScrollLock);
@@ -3802,8 +3895,14 @@ function beadsApp() {
 
       // Scroll to top on view change, hide stray graph tooltips, and guard direct view transitions
       this.$watch('view', (newView, oldView) => {
-        if (oldView === 'graph' && newView !== 'graph') {
-          this.forceGraphModule?.hideTooltip?.();
+        if (newView !== 'graph') {
+          if (this.graphDetailNode) {
+            this.graphDetailNode = null;
+          }
+          if (oldView === 'graph') {
+            this.forceGraphModule?.hideTooltip?.();
+          }
+          this.syncModalOpenBodyClass();
         }
         if (newView === 'graph' && !this.forceGraphReady && !this.forceGraphLoading && DB_STATE.db) {
           this.$nextTick(() => this.initForceGraphView());
@@ -4254,6 +4353,7 @@ function beadsApp() {
         case 'issue':
           // Issue detail view
           this.view = 'issues'; // Keep issues as backdrop
+          this.graphDetailNode = null;
           if (route.params.id) {
             // Preserve open dependency graph when navigating between issues inside the modal
             const keepDepGraph = Boolean(this.selectedIssue && this.showDepGraph);
@@ -4270,16 +4370,19 @@ function beadsApp() {
               this.issueNavList = this.issues.map(i => i.id);
             }
           }
+          this.syncModalOpenBodyClass();
           break;
 
         case 'issues':
           this.view = 'issues';
+          this.graphDetailNode = null;
           if (this.$refs && this.$refs.depGraph) {
             this.$refs.depGraph.innerHTML = '';
           }
           this.selectedIssue = null;
           this.showDepGraph = false;
           this.whatIfResult = null;
+          this.syncModalOpenBodyClass();
           this.filters = {
             status: [],
             type: [],
@@ -4309,11 +4412,14 @@ function beadsApp() {
         case 'insights':
           this.view = 'insights';
           this.selectedIssue = null;
+          this.graphDetailNode = null;
+          this.syncModalOpenBodyClass();
           break;
 
         case 'graph':
           this.view = 'graph';
           this.selectedIssue = null;
+          this.syncModalOpenBodyClass();
           this.$nextTick(() => {
             this.initForceGraphView();
           });
@@ -4322,6 +4428,8 @@ function beadsApp() {
         default:
           this.view = 'dashboard';
           this.selectedIssue = null;
+          this.graphDetailNode = null;
+          this.syncModalOpenBodyClass();
       }
     },
 
@@ -4418,7 +4526,11 @@ function beadsApp() {
           document.addEventListener('bv-graph:nodeClick', handleGraphNodeDetail);
           document.addEventListener('bv-graph:nodeSelect', handleGraphNodeDetail);
           document.addEventListener('bv-graph:selectionChange', (e) => {
-            if (e.detail && e.detail.node === null && this.graphDetailNode) {
+            if (e.detail?.node) {
+              if (this.graphDetailNode?.id !== e.detail.node.id) {
+                handleGraphNodeDetail(e);
+              }
+            } else if (e.detail && e.detail.node === null && this.graphDetailNode) {
               this.graphDetailNode = null;
               setTimeout(() => this.resizeForceGraph(), 250);
             }
@@ -4443,7 +4555,7 @@ function beadsApp() {
           document.addEventListener('bv-graph:dependencyConeChange', (e) => {
             this.dependencyConeActive = Boolean(e.detail?.active);
             this.dependencyConeFocusId = e.detail?.focusNodeId || null;
-            this.dependencyConeCount = Number(e.detail?.coneCount || 0);
+            this.dependencyConeCount = Number(e.detail?.count ?? e.detail?.coneCount ?? 0);
           });
           document.addEventListener('bv-graph:dependencyConeReset', () => {
             this.dependencyConeActive = false;
@@ -5535,13 +5647,13 @@ function beadsApp() {
 
     getTriageQuickWins() {
       const raw = this.triageData?.quick_wins ?? this.triageData?.triage?.quick_wins;
-      if (Array.isArray(raw) && raw.length > 0) return raw;
+      if (Array.isArray(raw)) return raw;
       return this.quickWins || [];
     },
 
     getTriageBlockersToClear() {
       const raw = this.triageData?.blockers_to_clear ?? this.triageData?.triage?.blockers_to_clear;
-      if (Array.isArray(raw) && raw.length > 0) return raw;
+      if (Array.isArray(raw)) return raw;
       return this.blockersToClose || [];
     },
 
@@ -5563,7 +5675,14 @@ function beadsApp() {
     getIssueActionCommands(issueId) {
       if (!issueId) return null;
       const rec = this.getTriageRecommendations().find(r => r && r.id === issueId);
-      return rec?.actions || null;
+      const actions = rec?.actions || null;
+      if (!actions) return null;
+      if (this.hasProvisionalSourceAuthority()) {
+        if (!actions.show) return null;
+        const { claim: _claim, ...rest } = actions;
+        return rest;
+      }
+      return actions;
     },
 
     async copyShellCommand(cmd) {

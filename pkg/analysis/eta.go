@@ -256,13 +256,14 @@ func velocityMinutesPerDayForLabelWithStats(issues []model.Issue, stats *GraphSt
 //
 // expressed both in raw work-minutes and in velocity-calibrated days.
 type GrahamBounds struct {
-	TotalMinutes          int     `json:"total_minutes"`
-	CriticalPathMinutes   int     `json:"critical_path_minutes"`
-	GrahamMinMinutes      float64 `json:"graham_min_minutes"`
-	GrahamMaxMinutes      float64 `json:"graham_max_minutes"`
-	VelocityMinutesPerDay float64 `json:"velocity_minutes_per_day"`
-	GrahamMinDays         float64 `json:"graham_min_days"`
-	GrahamMaxDays         float64 `json:"graham_max_days"`
+	TotalMinutes          int      `json:"total_minutes"`
+	CriticalPathMinutes   int      `json:"critical_path_minutes"`
+	CriticalPathIDs       []string `json:"-"`
+	GrahamMinMinutes      float64  `json:"graham_min_minutes"`
+	GrahamMaxMinutes      float64  `json:"graham_max_minutes"`
+	VelocityMinutesPerDay float64  `json:"velocity_minutes_per_day"`
+	GrahamMinDays         float64  `json:"graham_min_days"`
+	GrahamMaxDays         float64  `json:"graham_max_days"`
 }
 
 // ComputeGrahamBounds computes Graham (1969) lower and upper makespan bounds for
@@ -284,105 +285,14 @@ func ComputeGrahamBounds(openIssues []model.Issue, allIssues []model.Issue, stat
 	}
 
 	weights := make(map[string]int, len(openIssues))
-	openSet := make(map[string]model.Issue, len(openIssues))
 	totalMinutes := 0
 	for _, iss := range openIssues {
 		w, _ := estimateComplexityMinutes(iss, stats, medianMinutes)
 		weights[iss.ID] = w
-		openSet[iss.ID] = iss
 		totalMinutes += w
 	}
 
-	// Build prerequisite -> dependent adjacency on the unresolved subgraph.
-	dependents := make(map[string][]string, len(openIssues))
-	for _, iss := range openIssues {
-		seen := make(map[string]bool)
-		for _, dep := range iss.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() || seen[dep.DependsOnID] || dep.DependsOnID == iss.ID {
-				continue
-			}
-			if _, ok := openSet[dep.DependsOnID]; ok {
-				seen[dep.DependsOnID] = true
-				dependents[dep.DependsOnID] = append(dependents[dep.DependsOnID], iss.ID)
-			}
-		}
-	}
-	for k := range dependents {
-		sort.Strings(dependents[k])
-	}
-
-	// Longest work-weighted simple path (memoized on acyclic subgraphs, cycle-safe).
-	const (
-		unvisited = 0
-		visiting  = 1
-		visited   = 2
-	)
-	state := make(map[string]int, len(openIssues))
-	memo := make(map[string]int, len(openIssues))
-	hasCycle := false
-
-	var dfsDAG func(id string) int
-	dfsDAG = func(id string) int {
-		if state[id] == visited {
-			return memo[id]
-		}
-		if state[id] == visiting {
-			hasCycle = true
-			return 0
-		}
-		state[id] = visiting
-		bestSuffix := 0
-		for _, next := range dependents[id] {
-			if cand := dfsDAG(next); cand > bestSuffix {
-				bestSuffix = cand
-			}
-		}
-		state[id] = visited
-		memo[id] = weights[id] + bestSuffix
-		return memo[id]
-	}
-
-	ids := make([]string, 0, len(openIssues))
-	for id := range openSet {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-
-	critMinutes := 0
-	for _, id := range ids {
-		if cand := dfsDAG(id); cand > critMinutes {
-			critMinutes = cand
-		}
-	}
-
-	if hasCycle {
-		// Cycle fallback: bounded simple-path search so cyclic components remain exact/finite.
-		critMinutes = 0
-		onPath := make(map[string]bool, len(ids))
-		var dfsSimple func(id string, depth int) int
-		dfsSimple = func(id string, depth int) int {
-			if depth > 64 {
-				return weights[id]
-			}
-			onPath[id] = true
-			bestSuffix := 0
-			for _, next := range dependents[id] {
-				if onPath[next] {
-					continue
-				}
-				if cand := dfsSimple(next, depth+1); cand > bestSuffix {
-					bestSuffix = cand
-				}
-			}
-			onPath[id] = false
-			return weights[id] + bestSuffix
-		}
-		for _, id := range ids {
-			if cand := dfsSimple(id, 0); cand > critMinutes {
-				critMinutes = cand
-			}
-		}
-	}
+	critPath, critMinutes := LongestWeightedChain(openIssues, weights)
 	if critMinutes > totalMinutes {
 		critMinutes = totalMinutes
 	}
@@ -396,12 +306,207 @@ func ComputeGrahamBounds(openIssues []model.Issue, allIssues []model.Issue, stat
 	return GrahamBounds{
 		TotalMinutes:          totalMinutes,
 		CriticalPathMinutes:   critMinutes,
+		CriticalPathIDs:       critPath,
 		GrahamMinMinutes:      minMinutes,
 		GrahamMaxMinutes:      maxMinutes,
 		VelocityMinutesPerDay: velocityPerDay,
 		GrahamMinDays:         minMinutes / velocityPerDay,
 		GrahamMaxDays:         maxMinutes / velocityPerDay,
 	}
+}
+
+// LongestWeightedChain returns the highest work-minute simple blocking chain
+// across openIssues (ignoring self-loops) using Tarjan strongly-connected-component
+// condensation followed by reverse-topological DAG dynamic programming.
+// Acyclic diamonds run in strict O(V + E) time without exponential backtracking,
+// and disconnected cyclic components are evaluated symmetrically alongside roots.
+func LongestWeightedChain(openIssues []model.Issue, weights map[string]int) ([]string, int) {
+	if len(openIssues) == 0 {
+		return []string{}, 0
+	}
+	openSet := make(map[string]bool, len(openIssues))
+	for _, iss := range openIssues {
+		if iss.ID != "" {
+			openSet[iss.ID] = true
+		}
+	}
+	ids := make([]string, 0, len(openSet))
+	for id := range openSet {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return []string{}, 0
+	}
+
+	dependents := make(map[string][]string, len(ids))
+	for _, iss := range openIssues {
+		if !openSet[iss.ID] {
+			continue
+		}
+		seen := make(map[string]bool)
+		for _, dep := range iss.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == iss.ID || seen[dep.DependsOnID] {
+				continue
+			}
+			if openSet[dep.DependsOnID] {
+				seen[dep.DependsOnID] = true
+				dependents[dep.DependsOnID] = append(dependents[dep.DependsOnID], iss.ID)
+			}
+		}
+	}
+	for k := range dependents {
+		sort.Strings(dependents[k])
+	}
+
+	// Tarjan SCC emits components in reverse topological order (sink SCCs first).
+	index := 0
+	indices := make(map[string]int, len(ids))
+	lowlink := make(map[string]int, len(ids))
+	onStack := make(map[string]bool, len(ids))
+	stack := make([]string, 0, len(ids))
+	sccOf := make(map[string]int, len(ids))
+	var sccs [][]string
+
+	var strongConnect func(v string)
+	strongConnect = func(v string) {
+		index++
+		indices[v] = index
+		lowlink[v] = index
+		stack = append(stack, v)
+		onStack[v] = true
+
+		for _, w := range dependents[v] {
+			if indices[w] == 0 {
+				strongConnect(w)
+				if lowlink[w] < lowlink[v] {
+					lowlink[v] = lowlink[w]
+				}
+			} else if onStack[w] && indices[w] < lowlink[v] {
+				lowlink[v] = indices[w]
+			}
+		}
+
+		if lowlink[v] == indices[v] {
+			cid := len(sccs)
+			var comp []string
+			for {
+				n := len(stack) - 1
+				w := stack[n]
+				stack = stack[:n]
+				onStack[w] = false
+				sccOf[w] = cid
+				comp = append(comp, w)
+				if w == v {
+					break
+				}
+			}
+			sort.Strings(comp)
+			sccs = append(sccs, comp)
+		}
+	}
+
+	for _, id := range ids {
+		if indices[id] == 0 {
+			strongConnect(id)
+		}
+	}
+
+	bestMinFrom := make(map[string]int, len(ids))
+	bestPathFrom := make(map[string][]string, len(ids))
+
+	for cid, comp := range sccs {
+		// Precompute best downstream cross-SCC exit from each node in this SCC.
+		extMin := make(map[string]int, len(comp))
+		extPath := make(map[string][]string, len(comp))
+		for _, u := range comp {
+			bestW := 0
+			var bestP []string
+			for _, v := range dependents[u] {
+				if sccOf[v] == cid {
+					continue
+				}
+				candW := bestMinFrom[v]
+				candP := bestPathFrom[v]
+				if candW > bestW || (candW == bestW && len(candP) > len(bestP)) {
+					bestW = candW
+					bestP = candP
+				}
+			}
+			extMin[u] = bestW
+			extPath[u] = bestP
+		}
+
+		if len(comp) == 1 {
+			u := comp[0]
+			bestMinFrom[u] = weights[u] + extMin[u]
+			path := make([]string, 1+len(extPath[u]))
+			path[0] = u
+			copy(path[1:], extPath[u])
+			bestPathFrom[u] = path
+			continue
+		}
+
+		// Non-trivial cyclic SCC: bounded intra-SCC simple-path search per entry node.
+		for _, start := range comp {
+			visited := make(map[string]bool, len(comp))
+			budget := 512
+			bestTotal := -1
+			var bestSeq []string
+
+			var dfsInSCC func(u string, cur []string, sum int)
+			dfsInSCC = func(u string, cur []string, sum int) {
+				if budget <= 0 {
+					return
+				}
+				budget--
+				visited[u] = true
+				cur = append(cur, u)
+				sum += weights[u]
+
+				candTotal := sum + extMin[u]
+				candLen := len(cur) + len(extPath[u])
+				if candTotal > bestTotal || (candTotal == bestTotal && candLen > len(bestSeq)) {
+					bestTotal = candTotal
+					seq := make([]string, candLen)
+					copy(seq, cur)
+					copy(seq[len(cur):], extPath[u])
+					bestSeq = seq
+				}
+
+				for _, next := range dependents[u] {
+					if sccOf[next] != cid || visited[next] {
+						continue
+					}
+					dfsInSCC(next, cur, sum)
+				}
+				visited[u] = false
+			}
+
+			dfsInSCC(start, nil, 0)
+			if bestTotal < 0 {
+				bestTotal = weights[start]
+				bestSeq = []string{start}
+			}
+			bestMinFrom[start] = bestTotal
+			bestPathFrom[start] = bestSeq
+		}
+	}
+
+	globalBestMin := -1
+	var globalBestPath []string
+	for _, id := range ids {
+		w := bestMinFrom[id]
+		p := bestPathFrom[id]
+		if w > globalBestMin || (w == globalBestMin && len(p) > len(globalBestPath)) {
+			globalBestMin = w
+			globalBestPath = p
+		}
+	}
+	if globalBestMin < 0 {
+		return []string{}, 0
+	}
+	return globalBestPath, globalBestMin
 }
 
 func hasLabel(labels []string, target string) bool {

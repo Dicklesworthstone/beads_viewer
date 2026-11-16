@@ -10,7 +10,6 @@ import (
 	"hash/fnv"
 	"html"
 	"io"
-	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -2023,6 +2022,23 @@ func main() {
 			correlation.SetCustomIDPatterns(compiled)
 		}
 
+		isNonTUICLIInvocation := env.Robot.Bool() || hasPrimaryRobotArg(os.Args[1:])
+		if !isNonTUICLIInvocation {
+			for _, nonTUIFlag := range []string{
+				"version", "help", "check-update", "update", "update-dry-run", "rollback",
+				"pages", "export-pages", "preview-pages", "export", "export-md", "export-graph", "hooks-info",
+				"priority-brief", "agent-brief", "emit-script", "profile-startup", "diff-since",
+				"init-drift", "save-baseline", "baseline-info", "check-drift",
+				"agents-add", "agents-update", "agents-remove", "agents-check", "agents-reset",
+				"feedback-accept", "feedback-ignore", "feedback-reset", "feedback-show",
+			} {
+				if f := flag.CommandLine.Lookup(nonTUIFlag); f != nil && f.Changed {
+					isNonTUICLIInvocation = true
+					break
+				}
+			}
+		}
+
 		modifierRules := []modifierFlagRule{
 			{modifier: "trust-hooks", requires: []string{"export", "export-md", "export-pages", "export-graph", "priority-brief", "agent-brief", "pages"}},
 			{modifier: "hook-env", requires: []string{"export", "export-md", "export-pages", "export-graph", "priority-brief", "agent-brief", "pages"}},
@@ -2034,9 +2050,6 @@ func main() {
 			{modifier: "robot-search", requires: []string{"search"}},
 			{modifier: "search-limit", requires: []string{"search"}},
 			{modifier: "search-min-score", requires: []string{"search"}},
-			{modifier: "search-mode", requires: []string{"search"}},
-			{modifier: "search-preset", requires: []string{"search"}},
-			{modifier: "search-weights", requires: []string{"search"}},
 			{modifier: "attention-limit", requires: []string{"robot-label-attention"}},
 			{modifier: "schema-command", requires: []string{"robot-schema"}},
 			{modifier: "suggest-type", requires: []string{"robot-suggest"}},
@@ -2114,6 +2127,13 @@ func main() {
 			{modifier: "watch-export", requires: []string{"export-pages"}},
 			{modifier: "debug-width", requires: []string{"debug-render"}},
 			{modifier: "debug-height", requires: []string{"debug-render"}},
+		}
+		if isNonTUICLIInvocation {
+			modifierRules = append(modifierRules,
+				modifierFlagRule{modifier: "search-mode", requires: []string{"search"}},
+				modifierFlagRule{modifier: "search-preset", requires: []string{"search"}},
+				modifierFlagRule{modifier: "search-weights", requires: []string{"search"}},
+			)
 		}
 		enumRules := []enumFlagRule{
 			{name: "graph-format", allowed: []string{"json", "dot", "mermaid"}},
@@ -3456,11 +3476,10 @@ func main() {
 				os.Exit(1)
 			}
 
-			isHistoricalSearch := *asOf != "" || asOfResolved != ""
 			searchScopeKey := ""
 			switch {
-			case isHistoricalSearch:
-				// Historical --as-of queries run strictly in-memory so read-only time-travel never mutates .bv/semantic/.
+			case *asOf != "" || asOfResolved != "":
+				// Scoped below to a dedicated historical-* .bvvi file so live index-*.bvvi is never touched.
 			case *workspaceConfig != "":
 				absWS := *workspaceConfig
 				if resolvedWS, absErr := filepath.Abs(absWS); absErr == nil {
@@ -3484,15 +3503,22 @@ func main() {
 				searchScopeKey = "db:" + filepath.Clean(absSrc)
 			}
 
+			skipDiskIndex := env.NoCache.Bool()
+			indexPath := search.IndexPathForScope(projectDir, embedCfg, searchScopeKey)
+			if asOfResolved != "" {
+				indexPath = filepath.Join(filepath.Dir(indexPath), "historical-"+asOfResolved+"-"+filepath.Base(indexPath))
+			} else if *asOf != "" {
+				scopedHist := search.IndexPathForScope(projectDir, embedCfg, "historical:"+*asOf)
+				indexPath = filepath.Join(filepath.Dir(scopedHist), "historical-"+filepath.Base(scopedHist))
+			}
 			var (
-				idx       *search.VectorIndex
-				loaded    bool
-				indexPath string
+				idx    *search.VectorIndex
+				loaded bool
 			)
-			if isHistoricalSearch {
+			if skipDiskIndex {
+				indexPath = ""
 				idx = search.NewVectorIndex(embedder.Dim())
 			} else {
-				indexPath = search.IndexPathForScope(projectDir, embedCfg, searchScopeKey)
 				idx, loaded, err = search.LoadOrNewVectorIndex(indexPath, embedder.Dim())
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -3501,7 +3527,7 @@ func main() {
 			}
 
 			docs := search.DocumentsFromIssues(issuesForSearch)
-			if !*robotSearch && !loaded && !isHistoricalSearch {
+			if !*robotSearch && !loaded && !skipDiskIndex {
 				fmt.Fprintf(os.Stderr, "Building semantic index (%d issues)...\n", len(docs))
 			}
 
@@ -3513,10 +3539,15 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error building semantic index: %v\n", err)
 				os.Exit(1)
 			}
-			if !isHistoricalSearch && (!loaded || syncStats.Changed()) {
+			if !skipDiskIndex && (!loaded || syncStats.Changed()) {
 				if err := idx.Save(indexPath); err != nil {
-					fmt.Fprintf(os.Stderr, "Error saving semantic index: %v\n", err)
-					os.Exit(1)
+					if *asOf != "" || asOfResolved != "" {
+						// Read-only historical repo fallback: keep in-memory index without failing search.
+						indexPath = ""
+					} else {
+						fmt.Fprintf(os.Stderr, "Error saving semantic index: %v\n", err)
+						os.Exit(1)
+					}
 				}
 			}
 
@@ -3591,7 +3622,11 @@ func main() {
 				resolvedPreset = presetName
 				resolvedWeights = &weights
 
-				metricsLoader := search.NewAnalyzerMetricsLoaderWithReadiness(issuesForSearch, readiness).WithCache(analysis.GetGlobalCache())
+				referenceTime := robotDispatchContext.ReferenceNow()
+				rankingTime = &referenceTime
+				metricsLoader := search.NewAnalyzerMetricsLoaderWithReadiness(issuesForSearch, readiness).
+					WithCache(analysis.GetGlobalCache()).
+					WithNow(referenceTime)
 				if *forceFullAnalysis {
 					fullCfg := analysis.FullAnalysisConfig()
 					metricsLoader = metricsLoader.WithConfig(&fullCfg)
@@ -3602,8 +3637,6 @@ func main() {
 					os.Exit(1)
 				}
 
-				referenceTime := robotDispatchContext.ReferenceNow()
-				rankingTime = &referenceTime
 				scorer := search.NewHybridScorerAt(weights, cache, referenceTime)
 				hybridResults, err = buildHybridScores(results, scorer)
 				if err != nil {
@@ -3678,7 +3711,7 @@ func main() {
 			}
 
 			// Human-readable output
-			if !loaded || syncStats.Changed() {
+			if indexPath != "" && (!loaded || syncStats.Changed()) {
 				fmt.Fprintf(os.Stderr, "Index: +%d ~%d -%d (%d total) → %s\n", syncStats.Added, syncStats.Updated, syncStats.Removed, idx.Size(), indexPath)
 			}
 			if searchCfg.Mode == search.SearchModeHybrid {
@@ -3808,6 +3841,8 @@ func main() {
 					UnblockIDs:        exportContext.RecipeUnblockIDs,
 					VelocityIssues:    exportContext.VelocityIssues(),
 					History:           triageHistory,
+					GroupByTrack:      true,
+					GroupByLabel:      true,
 					ForceFullAnalysis: *forceFullAnalysis,
 					NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
 					Weights:           exportFeedbackWeights,
@@ -5026,7 +5061,11 @@ func main() {
 
 			// Create snapshots over full topology (preserving multi-hop cycles/readiness)
 			// while restricting snap.Issues to candidate IDs so out-of-scope issues never leak.
-			fromSnapshot := newScopedSnapshotForCLI(historicalCtx.GraphIssues(), historicalCtx.Readiness, historicalCtx.CandidateIDs, historicalCtx.ReferenceNow(), revision, *forceFullAnalysis)
+			fromTime := histCommitTime.UTC()
+			if fromTime.IsZero() {
+				fromTime = historicalCtx.ReferenceNow()
+			}
+			fromSnapshot := newScopedSnapshotForCLI(historicalCtx.GraphIssues(), historicalCtx.Readiness, historicalCtx.CandidateIDs, fromTime, revision, *forceFullAnalysis)
 			toSnapshot := newScopedSnapshotForCLI(robotDispatchContext.GraphIssues(), readiness, candidateIDs, robotDispatchContext.ReferenceNow(), "HEAD", *forceFullAnalysis)
 
 			// Compute diff
@@ -5065,6 +5104,20 @@ func main() {
 			os.Exit(0)
 		}
 
+		hasTUISearchOverrides := *searchMode != "" || *searchPreset != "" || *searchWeights != "" ||
+			strings.TrimSpace(env.SearchMode.Get()) != "" ||
+			strings.TrimSpace(env.SearchPreset.Get()) != "" ||
+			strings.TrimSpace(env.SearchWeights.Get()) != ""
+		var tuiSearchCfg search.SearchConfig
+		if hasTUISearchOverrides && *exportFile == "" && *exportReport == "" {
+			var searchCfgErr error
+			tuiSearchCfg, searchCfgErr = resolveSearchConfig(*searchMode, *searchPreset, *searchWeights)
+			if searchCfgErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", searchCfgErr)
+				os.Exit(1)
+			}
+		}
+
 		// Handle --as-of flag for TUI mode (robot commands already handled above with historical data)
 		if *asOf != "" && *exportFile == "" && *exportReport == "" {
 			if len(issues) == 0 {
@@ -5077,9 +5130,13 @@ func main() {
 				Authority:           readiness,
 				CandidateIDs:        candidateIDs,
 				AuthorityIncomplete: true,
+				ReferenceNow:        robotDispatchContext.ReferenceNow(),
 			})
 			if projectDir != "" {
 				m.SetWorkDir(projectDir)
+			}
+			if hasTUISearchOverrides {
+				m.SetSearchConfig(tuiSearchCfg)
 			}
 			defer m.Stop()
 			if *debugRender != "" {
@@ -5273,6 +5330,11 @@ func main() {
 				(!robotDispatchContext.claimsProven() && singleSourceLoad.Report.Errors == 0 && singleSourceLoad.Report.ReadErrors == 0))
 		explicitDBPinned := *dbPath != "" || strings.TrimSpace(env.BeadsDB.Get()) != ""
 
+		var liveTUIReferenceNow time.Time
+		if sourceDateEpochActive() {
+			liveTUIReferenceNow = robotDispatchContext.ReferenceNow()
+		}
+
 		// Initial Model with live reload support
 		m := ui.NewModel(issues, activeRecipe, beadsPath, ui.ReadinessScope{
 			Authority:           readiness,
@@ -5280,9 +5342,13 @@ func main() {
 			AuthorityIncomplete: !robotDispatchContext.claimsProven() || *asOf != "",
 			SourceDegraded:      boundSourceDegraded,
 			ExplicitDB:          explicitDBPinned,
+			ReferenceNow:        liveTUIReferenceNow,
 		})
 		if projectDir != "" {
 			m.SetWorkDir(projectDir)
+		}
+		if hasTUISearchOverrides {
+			m.SetSearchConfig(tuiSearchCfg)
 		}
 		defer m.Stop() // Clean up file watcher
 
@@ -5501,18 +5567,31 @@ func effectiveThemePreference(flagVal string, flagSet bool, warnTo io.Writer) st
 // loadThemeFromUserConfig reads the top-level `theme:` key from
 // ~/.config/bv/config.yaml, returning (value, true) when present and
 // non-empty. Value validation is canonicalTheme's job. (bv-128)
-func loadThemeFromUserConfig() (string, bool) {
+func readUserConfigYAML() ([]byte, bool) {
 	if strings.TrimSpace(env.NoSavedConfig.Get()) != "" {
-		return "", false
+		return nil, false
 	}
-	configDir, err := updater.UserConfigDir()
-	if err != nil || configDir == "" {
-		return "", false
+	if xdg := strings.TrimSpace(env.Get("XDG_CONFIG_HOME")); xdg != "" {
+		data, err := os.ReadFile(filepath.Join(xdg, "bv", "config.yaml"))
+		if err != nil {
+			return nil, false
+		}
+		return data, true
 	}
-	configPath := filepath.Join(configDir, "config.yaml")
-
-	data, err := os.ReadFile(configPath)
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil, false
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".config", "bv", "config.yaml"))
 	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+func loadThemeFromUserConfig() (string, bool) {
+	data, ok := readUserConfigYAML()
+	if !ok {
 		return "", false
 	}
 
@@ -5530,17 +5609,8 @@ func loadThemeFromUserConfig() (string, bool) {
 }
 
 func loadBackgroundModeFromUserConfig() (bool, bool) {
-	if strings.TrimSpace(env.NoSavedConfig.Get()) != "" {
-		return false, false
-	}
-	configDir, err := updater.UserConfigDir()
-	if err != nil || configDir == "" {
-		return false, false
-	}
-	configPath := filepath.Join(configDir, "config.yaml")
-
-	data, err := os.ReadFile(configPath)
-	if err != nil {
+	data, ok := readUserConfigYAML()
+	if !ok {
 		return false, false
 	}
 
@@ -5945,26 +6015,32 @@ func loadWorkspaceHistoricalDiffSource(ctx RobotContext, ref string) ([]model.Is
 		firstRev    string
 		latestTime  time.Time
 		loadedRepos int
-		lastErr     error
 	)
 	for _, src := range ctx.SourceAuthority.Sources {
 		if src.Status != "loaded" {
 			continue
 		}
+		beadsDir := resolveSourceBeadsDir(src)
 		repoPath := strings.TrimSpace(src.RepoRoot)
-		if repoPath == "" {
-			if bd := resolveSourceBeadsDir(src); bd != "" {
-				repoPath = filepath.Dir(bd)
-			}
+		if repoPath == "" && beadsDir != "" {
+			repoPath = filepath.Dir(beadsDir)
 		}
 		if repoPath == "" {
 			continue
 		}
-		gl := loader.NewGitLoader(repoPath)
+		var gl *loader.GitLoader
+		if beadsDir != "" {
+			gl = loader.NewGitLoaderWithBeadsDir(repoPath, beadsDir)
+		} else {
+			gl = loader.NewGitLoader(repoPath)
+		}
 		hist, err := gl.LoadAtWithReport(ref)
 		if err != nil {
-			lastErr = err
-			continue
+			repoName := src.Name
+			if repoName == "" {
+				repoName = repoPath
+			}
+			return nil, nil, "", time.Time{}, fmt.Errorf("resolving %s in workspace repo %s: %w", ref, repoName, err)
 		}
 		loadedRepos++
 		if firstRev == "" && hist.CommitSHA != "" {
@@ -6010,9 +6086,6 @@ func loadWorkspaceHistoricalDiffSource(ctx RobotContext, ref string) ([]model.Is
 		}
 	}
 	if loadedRepos == 0 {
-		if lastErr != nil {
-			return nil, nil, "", time.Time{}, lastErr
-		}
 		return nil, nil, "", time.Time{}, fmt.Errorf("no workspace repositories resolved %s", ref)
 	}
 	if firstRev == "" {
@@ -7196,24 +7269,26 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	config := wizard.GetConfig()
 
 	var source pagesSource
-	if dispatchCtx.SourceKind == "workspace" && config.SourcePath == "" && config.SourceBeadsDir == "" {
+	if dispatchCtx.SourceKind == "workspace" || dispatchCtx.AsOf != "" {
 		baseIssues := dispatchCtx.FullIssues
 		if len(baseIssues) == 0 {
 			baseIssues = dispatchCtx.Issues
+		}
+		reason := "workspace configuration"
+		if dispatchCtx.AsOf != "" {
+			reason = "historical --as-of snapshot"
 		}
 		source = pagesSource{
 			Issues:          baseIssues,
 			RepoRoot:        dispatchCtx.ProjectDir,
 			SourcePath:      dispatchCtx.SourcePath,
-			Reason:          "workspace configuration",
-			SourceKind:      "workspace",
+			Reason:          reason,
+			SourceKind:      dispatchCtx.SourceKind,
 			SourceAuthority: dispatchCtx.SourceAuthority,
 			Readiness:       dispatchCtx.Readiness,
 		}
 	} else {
 		// Resolve the actual source of issues for this deployment.
-		// This ensures updates always use the originally-deployed dataset,
-		// even if the user runs bv from a different directory.
 		source, err = resolvePagesSource(config, beadsPath)
 		if err != nil {
 			return err
@@ -7222,10 +7297,14 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 
 	scopedSourceCtx := RobotContext{
 		Issues:            source.Issues,
+		TombstoneIDs:      dispatchCtx.TombstoneIDs,
 		Readiness:         source.Readiness,
 		SourceAuthority:   source.SourceAuthority,
 		SourcePath:        source.SourcePath,
 		SourceKind:        source.SourceKind,
+		AsOf:              dispatchCtx.AsOf,
+		AsOfCommit:        dispatchCtx.AsOfCommit,
+		AsOfCommitTime:    dispatchCtx.AsOfCommitTime,
 		LabelScope:        dispatchCtx.LabelScope,
 		Recipe:            dispatchCtx.Recipe,
 		Repo:              dispatchCtx.Repo,
@@ -7361,6 +7440,8 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		UnblockIDs:        scopedSourceCtx.RecipeUnblockIDs,
 		VelocityIssues:    scopedSourceCtx.VelocityIssues(),
 		History:           wizardTriageHistory,
+		GroupByTrack:      true,
+		GroupByLabel:      true,
 		ForceFullAnalysis: forceFullAnalysis,
 		NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: &notReadyLabels}),
 		Weights:           wizardFeedbackWeights,
@@ -7404,7 +7485,9 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	if config.Title != "" {
 		exporter.Config.Title = config.Title
 	}
-	if wizardProjectDir != "" {
+	if exportContext.AsOfCommit != "" {
+		exporter.SetGitHash(exportContext.AsOfCommit)
+	} else if wizardProjectDir != "" {
 		if commit, _, _ := baseline.GetGitInfo(wizardProjectDir); commit != "" {
 			exporter.SetGitHash(commit)
 		}
@@ -7500,6 +7583,9 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	config.LastIssueCount = len(exportIssues)
 	config.LastDataHash = analysis.ComputeDataHash(exportIssues)
 	saveWizardConfig := func() error {
+		if dispatchCtx.AsOf != "" {
+			return nil
+		}
 		if err := export.SaveWizardConfig(config); err != nil {
 			return fmt.Errorf("save pages wizard configuration: %w", err)
 		}
@@ -7514,14 +7600,11 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		}
 
 		if action == "cancel" {
-			// User cancelled after preview - show local result instead
+			// User cancelled after preview - do not persist deploy config so future runs stay fresh
 			fmt.Println("Deployment cancelled. Bundle available at:", bundlePath)
 			result := &export.WizardResult{
 				BundlePath:   bundlePath,
 				DeployTarget: "local",
-			}
-			if err := saveWizardConfig(); err != nil {
-				return err
 			}
 			wizard.PrintSuccess(result)
 		} else {
@@ -7581,7 +7664,7 @@ func resolvePagesSource(config *export.WizardConfig, beadsPath string) (pagesSou
 		}
 		return src, nil
 	}
-	if explicitBeadsDir := strings.TrimSpace(env.BeadsDir.Get()); explicitBeadsDir != "" {
+	if explicitBeadsDir := strings.TrimSpace(env.BeadsDir.Get()); explicitBeadsDir != "" || strings.TrimSpace(env.BeadsDB.Get()) != "" {
 		resolvedDir, err := loader.GetBeadsDir("")
 		if err != nil {
 			return pagesSource{}, err
@@ -7590,11 +7673,15 @@ func resolvePagesSource(config *export.WizardConfig, beadsPath string) (pagesSou
 		if err != nil {
 			return pagesSource{}, err
 		}
+		reason := "explicit BEADS_DIR"
+		if explicitBeadsDir == "" {
+			reason = "explicit BEADS_DB directory"
+		}
 		return pagesSource{
 			Issues:          loaded.Issues,
 			BeadsDir:        resolvedDir,
 			RepoRoot:        filepath.Dir(resolvedDir),
-			Reason:          "explicit BEADS_DIR",
+			Reason:          reason,
 			SourcePath:      loaded.Source.Path,
 			SourceKind:      string(loaded.Source.Type),
 			SourceAuthority: newRobotSourceAuthority([]RobotSourceReport{robotSourceFromLoad(loaded, nil)}),
@@ -7602,12 +7689,7 @@ func resolvePagesSource(config *export.WizardConfig, beadsPath string) (pagesSou
 		}, nil
 	}
 
-	activeRepoRoot := ""
-	if beadsPath != "" {
-		if absBeads, absErr := filepath.Abs(beadsPath); absErr == nil {
-			activeRepoRoot = filepath.Clean(filepath.Dir(filepath.Dir(absBeads)))
-		}
-	}
+	activeRepoRoot := pagesRepoRootFromBeadsPath(beadsPath)
 	configMatchesActiveRepo := func(candidatePath string) bool {
 		if activeRepoRoot == "" || candidatePath == "" {
 			return true
@@ -7779,166 +7861,66 @@ func isSuspiciousIssueCount(current, expected int) bool {
 	return current < threshold
 }
 
+func pagesRepoRootFromBeadsPath(beadsPath string) string {
+	if beadsPath == "" {
+		return ""
+	}
+	absBeads, err := filepath.Abs(beadsPath)
+	if err != nil {
+		return ""
+	}
+	absBeads = filepath.Clean(absBeads)
+	if info, statErr := os.Stat(absBeads); statErr == nil && info.IsDir() {
+		if filepath.Base(absBeads) == ".beads" {
+			return filepath.Dir(absBeads)
+		}
+		return absBeads
+	}
+	parent := filepath.Dir(absBeads)
+	if filepath.Base(parent) == ".beads" {
+		return filepath.Dir(parent)
+	}
+	return parent
+}
+
+// findBetterPagesSource checks only explicit same-repository .beads candidates
+// when beadsPath was omitted (never crawling cwd, $HOME, /dp, or child subtrees).
 func findBetterPagesSource(config *export.WizardConfig, current pagesSource, beadsPath string) (pagesSource, bool) {
+	if beadsPath != "" || config == nil || config.SourceRepoRoot == "" {
+		return pagesSource{}, false
+	}
 	expected := config.LastIssueCount
-	currentCount := len(current.Issues)
-	currentDiff := absInt(currentCount - expected)
-
-	repoHint := strings.ToLower(strings.TrimSpace(config.RepoName))
-	altHint := repoHint
-	if strings.HasPrefix(altHint, "beads-for-") {
-		altHint = strings.TrimPrefix(altHint, "beads-for-")
-	}
-
-	roots := []string{}
-	seenRoots := map[string]bool{}
-	addRoot := func(root string) {
-		if root == "" {
-			return
-		}
-		if abs, err := filepath.Abs(root); err == nil {
-			root = abs
-		}
-		if seenRoots[root] {
-			return
-		}
-		if info, err := os.Stat(root); err != nil || !info.IsDir() {
-			return
-		}
-		seenRoots[root] = true
-		roots = append(roots, root)
-	}
-
-	if config.SourceRepoRoot != "" && beadsPath == "" {
-		addRoot(config.SourceRepoRoot)
-	}
-	if beadsPath != "" {
-		addRoot(filepath.Dir(filepath.Dir(beadsPath)))
-	}
-	if cwd, err := os.Getwd(); err == nil {
-		addRoot(cwd)
-	}
-
-	bestDir := ""
-	bestCount := 0
-	bestDiff := 0
-	bestHintDir := ""
-	bestHintCount := 0
-	bestHintDiff := 0
-
-	for _, root := range roots {
-		for _, beadsDir := range discoverBeadsDirs(root, 4) {
-			if beadsDir == current.BeadsDir {
-				continue
-			}
-			count, err := countIssuesInBeadsDir(beadsDir)
-			if err != nil || count == 0 {
-				continue
-			}
-
-			pathLower := strings.ToLower(beadsDir)
-			hintMatch := repoHint != "" && (strings.Contains(pathLower, repoHint) || strings.Contains(pathLower, altHint))
-
-			if expected > 0 {
-				diff := absInt(count - expected)
-				if bestDir == "" || diff < bestDiff || (diff == bestDiff && count > bestCount) {
-					bestDir = beadsDir
-					bestCount = count
-					bestDiff = diff
-				}
-				if hintMatch && (bestHintDir == "" || diff < bestHintDiff || (diff == bestHintDiff && count > bestHintCount)) {
-					bestHintDir = beadsDir
-					bestHintCount = count
-					bestHintDiff = diff
-				}
-			} else if count > bestCount {
-				if hintMatch && count > bestHintCount {
-					bestHintDir = beadsDir
-					bestHintCount = count
-				} else if bestHintDir == "" {
-					bestDir = beadsDir
-					bestCount = count
-				}
-			}
-		}
-	}
-
-	if bestHintDir != "" && (bestDir == "" || bestHintDiff <= bestDiff) {
-		bestDir = bestHintDir
-		bestCount = bestHintCount
-		bestDiff = bestHintDiff
-	}
-
-	if bestDir == "" {
+	if expected <= 0 {
 		return pagesSource{}, false
 	}
-
-	if expected > 0 && bestDiff >= currentDiff {
+	candidateDir := filepath.Clean(filepath.Join(config.SourceRepoRoot, ".beads"))
+	if candidateDir == filepath.Clean(current.BeadsDir) {
 		return pagesSource{}, false
 	}
-	if expected == 0 && bestCount <= currentCount {
+	if info, err := os.Stat(candidateDir); err != nil || !info.IsDir() {
 		return pagesSource{}, false
 	}
-
-	loaded, err := loadIssuesFromBeadsDir(bestDir)
+	count, err := countIssuesInBeadsDir(candidateDir)
+	if err != nil || count == 0 {
+		return pagesSource{}, false
+	}
+	currentDiff := absInt(len(current.Issues) - expected)
+	if absInt(count-expected) >= currentDiff {
+		return pagesSource{}, false
+	}
+	loaded, err := loadIssuesFromBeadsDir(candidateDir)
 	if err != nil {
 		return pagesSource{}, false
 	}
 	return pagesSource{
 		Issues:     loaded.Issues,
-		BeadsDir:   bestDir,
-		RepoRoot:   filepath.Dir(bestDir),
-		Reason:     "auto-detected better source",
+		BeadsDir:   candidateDir,
+		RepoRoot:   filepath.Dir(candidateDir),
+		Reason:     "saved repo .beads source",
 		SourcePath: loaded.Source.Path, SourceKind: string(loaded.Source.Type),
 		SourceAuthority: newRobotSourceAuthority([]RobotSourceReport{robotSourceFromLoad(loaded, nil)}),
 		Readiness:       model.NewReadinessIndex(issuesWithTombstones(loaded.Issues, loaded.Report.TombstoneIDs)),
 	}, true
-}
-
-func discoverBeadsDirs(root string, maxDepth int) []string {
-	var dirs []string
-	root = filepath.Clean(root)
-	sep := string(os.PathSeparator)
-
-	skip := map[string]bool{
-		".git":         true,
-		"node_modules": true,
-		"vendor":       true,
-		"dist":         true,
-		"build":        true,
-		"target":       true,
-		".cache":       true,
-		".bv":          true,
-		".idea":        true,
-		".vscode":      true,
-	}
-
-	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err == nil {
-			if !d.IsDir() {
-				return nil
-			}
-
-			name := d.Name()
-			if skip[name] && path != root {
-				return fs.SkipDir
-			}
-
-			rel := strings.TrimPrefix(strings.TrimPrefix(path, root), sep)
-			if rel != "" {
-				if depth := len(strings.Split(rel, sep)); depth > maxDepth {
-					return fs.SkipDir
-				}
-			}
-
-			if name == ".beads" {
-				dirs = append(dirs, path)
-				return fs.SkipDir
-			}
-		}
-		return nil
-	})
-	return dirs
 }
 
 func countIssuesInBeadsDir(beadsDir string) (int, error) {
@@ -8336,11 +8318,11 @@ func setDifference(a, b []string) []string {
 
 // calculateBurndownAt is a deterministic variant of calculateBurndown for testing.
 func calculateBurndownAt(sprint *model.Sprint, issues []model.Issue, now time.Time) BurndownOutput {
-	return calculateBurndownAtWithThresholds(sprint, issues, now, analysis.DefaultAtRiskThresholds())
+	return calculateBurndownAtWithThresholds(sprint, issues, nil, now, analysis.DefaultAtRiskThresholds())
 }
 
 // calculateBurndownAtWithThresholds computes sprint burndown using explicit at-risk thresholds.
-func calculateBurndownAtWithThresholds(sprint *model.Sprint, issues []model.Issue, now time.Time, thresholds analysis.AtRiskThresholds) BurndownOutput {
+func calculateBurndownAtWithThresholds(sprint *model.Sprint, issues []model.Issue, readiness *model.ReadinessIndex, now time.Time, thresholds analysis.AtRiskThresholds) BurndownOutput {
 
 	// Build issue map for sprint beads
 	issueMap := make(map[string]model.Issue, len(issues))
@@ -8435,7 +8417,7 @@ func calculateBurndownAtWithThresholds(sprint *model.Sprint, issues []model.Issu
 		DailyPoints:       dailyPoints,
 		IdealLine:         idealLine,
 		ScopeChanges:      nil,
-		AtRisk:            analysis.DetectAtRisk(issues, sprint, now, thresholds),
+		AtRisk:            analysis.DetectAtRiskWithReadiness(issues, sprint, readiness, now, thresholds),
 	}
 }
 
@@ -10439,10 +10421,7 @@ func generateRobotSchemas() RobotSchemas {
 			"description": "Dependency graph in JSON/DOT/Mermaid format",
 			"type":        "object",
 			"properties": map[string]interface{}{
-				"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
-				"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
-				"version":       map[string]interface{}{"type": "string"},
-				"format":        map[string]interface{}{"type": "string", "enum": []string{"json", "dot", "mermaid"}},
+				"format": map[string]interface{}{"type": "string", "enum": []string{"json", "dot", "mermaid"}},
 				"graph":  map[string]interface{}{"type": "string"},
 				"nodes":  map[string]interface{}{"type": "integer"},
 				"edges":  map[string]interface{}{"type": "integer"},
@@ -10573,9 +10552,9 @@ func generateRobotSchemas() RobotSchemas {
 		},
 		"robot-correlation-stats":   robotCorrelationStatsOutputSchema(),
 		"robot-explain-correlation": robotExplainCorrelationOutputSchema(),
-		"robot-confirm-correlation": robotCorrelationFeedbackOutputSchema("Robot Confirm Correlation Output", "Confirmation receipt for a commit-to-bead correlation"),
-		"robot-reject-correlation":  robotCorrelationFeedbackOutputSchema("Robot Reject Correlation Output", "Rejection receipt for a commit-to-bead correlation"),
-		"robot-ignore-correlation":  robotCorrelationFeedbackOutputSchema("Robot Ignore Correlation Output", "Ignore receipt for a commit-to-bead correlation"),
+		"robot-confirm-correlation": robotCorrelationFeedbackOutputSchema("Robot Confirm Correlation Output", "Confirmation receipt for a commit-to-bead correlation", "confirmed"),
+		"robot-reject-correlation":  robotCorrelationFeedbackOutputSchema("Robot Reject Correlation Output", "Rejection receipt for a commit-to-bead correlation", "rejected"),
+		"robot-ignore-correlation":  robotCorrelationFeedbackOutputSchema("Robot Ignore Correlation Output", "Ignore receipt for a commit-to-bead correlation", "ignored"),
 		"robot-file-beads":          robotFileBeadsOutputSchema(),
 		"robot-commit":              robotCommitOutputSchema(),
 		"robot-file-hotspots":       robotFileHotspotsOutputSchema(),
@@ -10640,8 +10619,6 @@ func generateRobotSchemas() RobotSchemas {
 			"properties": map[string]interface{}{
 				"generated_at":    map[string]interface{}{"type": "string", "format": "date-time"},
 				"data_hash":       map[string]interface{}{"type": "string"},
-				"output_format":   map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
-				"version":         map[string]interface{}{"type": "string"},
 				"analysis_config": labelHealthConfigSchema(),
 				"results":         labelAnalysisResultSchema(),
 				"usage_hints":     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
@@ -10656,8 +10633,6 @@ func generateRobotSchemas() RobotSchemas {
 			"properties": map[string]interface{}{
 				"generated_at":     map[string]interface{}{"type": "string", "format": "date-time"},
 				"data_hash":        map[string]interface{}{"type": "string"},
-				"output_format":    map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
-				"version":          map[string]interface{}{"type": "string"},
 				"flow":             crossLabelFlowSchema(),
 				"blockage_cascade": blockageCascadeSchema(),
 				"analysis_config":  labelHealthConfigSchema(),
@@ -10671,12 +10646,10 @@ func generateRobotSchemas() RobotSchemas {
 			"description": "Attention-ranked labels requiring focus",
 			"type":        "object",
 			"properties": map[string]interface{}{
-				"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
-				"data_hash":     map[string]interface{}{"type": "string"},
-				"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
-				"version":       map[string]interface{}{"type": "string"},
-				"limit":         map[string]interface{}{"type": "integer"},
-				"total_labels":  map[string]interface{}{"type": "integer"},
+				"generated_at": map[string]interface{}{"type": "string", "format": "date-time"},
+				"data_hash":    map[string]interface{}{"type": "string"},
+				"limit":        map[string]interface{}{"type": "integer"},
+				"total_labels": map[string]interface{}{"type": "integer"},
 				"labels": map[string]interface{}{
 					"type":  "array",
 					"items": labelAttentionItemSchema(),
@@ -11419,9 +11392,12 @@ func robotExplainCorrelationOutputSchema() map[string]interface{} {
 	}, []string{"generated_at", "data_hash", "output_format", "version", "commit_sha", "bead_id", "confidence", "method"})
 }
 
-func robotCorrelationFeedbackOutputSchema(title, description string) map[string]interface{} {
+func robotCorrelationFeedbackOutputSchema(title, description string, statusEnum ...string) map[string]interface{} {
+	if len(statusEnum) == 0 {
+		statusEnum = []string{"confirmed", "rejected", "ignored"}
+	}
 	return robotFileCommandOutputSchema(title, description, map[string]interface{}{
-		"status":    map[string]interface{}{"type": "string", "enum": []string{"confirmed", "rejected"}},
+		"status":    map[string]interface{}{"type": "string", "enum": statusEnum},
 		"commit":    map[string]interface{}{"type": "string"},
 		"bead":      map[string]interface{}{"type": "string"},
 		"by":        map[string]interface{}{"type": "string"},

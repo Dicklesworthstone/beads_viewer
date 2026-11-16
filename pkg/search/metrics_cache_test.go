@@ -1065,3 +1065,86 @@ func TestHybridSearchDowngradesDeferredTemplatePinned(t *testing.T) {
 		t.Fatalf("SOURCE_DATE_EPOCH EXPIRED-DEFER status = %q, want open", epochMetrics["EXPIRED-DEFER"].Status)
 	}
 }
+
+func TestAnalyzerMetricsLoader_DeferUntilCrossingInvalidatesHashAndRefreshesStatus(t *testing.T) {
+	base := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	deferUntil := base.Add(2 * time.Hour)
+	t1 := base.Add(1 * time.Hour) // t1 < deferUntil -> deferred (0.2)
+	t2 := base.Add(3 * time.Hour) // t2 > deferUntil -> open (1.0)
+
+	issues := []model.Issue{
+		{ID: "D-1", Title: "Snoozed task", Status: model.StatusOpen, DeferUntil: &deferUntil, Priority: 1, CreatedAt: base, UpdatedAt: base},
+		{ID: "O-1", Title: "Always open", Status: model.StatusOpen, Priority: 2, CreatedAt: base, UpdatedAt: base},
+	}
+
+	loader := NewAnalyzerMetricsLoader(issues)
+	// Call ComputeDataHash BEFORE .WithNow(...) to verify hash is not frozen by sync.Once!
+	if _, err := loader.ComputeDataHash(); err != nil {
+		t.Fatalf("initial ComputeDataHash before WithNow: %v", err)
+	}
+
+	loader.WithNow(t1)
+	h1, err := loader.ComputeDataHash()
+	if err != nil {
+		t.Fatalf("ComputeDataHash at t1: %v", err)
+	}
+	allocs := testing.AllocsPerRun(5, func() {
+		got, err := loader.ComputeDataHash()
+		if err != nil || got != h1 {
+			t.Fatalf("warm ComputeDataHash at t1 = (%q, %v), want %q", got, err, h1)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("warm ComputeDataHash with DeferUntil allocated %.0f objects; want 0", allocs)
+	}
+
+	m1, err := loader.LoadMetrics()
+	if err != nil {
+		t.Fatalf("LoadMetrics at t1: %v", err)
+	}
+	if m1["D-1"].Status != string(model.StatusDeferred) {
+		t.Fatalf("at t1 < DeferUntil: D-1 status = %q, want deferred", m1["D-1"].Status)
+	}
+
+	cache := NewMetricsCache(loader)
+	weights, err := GetPreset(PresetDefault)
+	if err != nil {
+		t.Fatalf("GetPreset: %v", err)
+	}
+	scorer := NewHybridScorer(weights, cache)
+
+	scoreAtT1, err := scorer.Score("D-1", 0.5)
+	if err != nil {
+		t.Fatalf("Score at t1: %v", err)
+	}
+	if got := scoreAtT1.ComponentScores["status"]; got != 0.2 {
+		t.Fatalf("at t1 < DeferUntil: ComponentScores[status] = %v, want 0.2", got)
+	}
+
+	// Cross DeferUntil to t2 > deferUntil WITHOUT manually calling cache.Refresh():
+	// ensureFresh() must observe the changed ComputeDataHash() and recompute StatusOpen (1.0).
+	loader.WithNow(t2)
+	h2, err := loader.ComputeDataHash()
+	if err != nil {
+		t.Fatalf("ComputeDataHash at t2: %v", err)
+	}
+	if h2 == h1 {
+		t.Fatalf("ComputeDataHash did not change across DeferUntil boundary: h1=%q h2=%q", h1, h2)
+	}
+
+	m2, err := loader.LoadMetrics()
+	if err != nil {
+		t.Fatalf("LoadMetrics at t2: %v", err)
+	}
+	if m2["D-1"].Status != string(model.StatusOpen) {
+		t.Fatalf("at t2 > DeferUntil: D-1 status = %q, want open", m2["D-1"].Status)
+	}
+
+	scoreAtT2, err := scorer.Score("D-1", 0.5)
+	if err != nil {
+		t.Fatalf("Score at t2: %v", err)
+	}
+	if got := scoreAtT2.ComponentScores["status"]; got != 1.0 {
+		t.Fatalf("at t2 > DeferUntil: ComponentScores[status] = %v, want 1.0", got)
+	}
+}

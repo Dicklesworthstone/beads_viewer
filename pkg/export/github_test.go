@@ -1,6 +1,7 @@
 package export
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -691,5 +692,145 @@ func TestSwitchToLegacyDeploymentArgsAndGitFallbackAuthor(t *testing.T) {
 	}
 	if got := strings.TrimSpace(string(logOut)); got != "bv-pages <bv-pages@users.noreply.github.com>" {
 		t.Fatalf("commit author = %q, want %q", got, "bv-pages <bv-pages@users.noreply.github.com>")
+	}
+}
+
+func TestShouldFallbackToLegacyPages(t *testing.T) {
+	cases := []struct {
+		name   string
+		status *GitHubActionsStatus
+		want   bool
+	}{
+		{"nil status", nil, false},
+		{"zero runs and inactive", &GitHubActionsStatus{TotalCount: 0, HasActiveRun: false}, true},
+		{"failed run", &GitHubActionsStatus{TotalCount: 1, HasActiveRun: false, LastRunStatus: "completed", LastConclusion: "failure"}, true},
+		{"cancelled run", &GitHubActionsStatus{TotalCount: 1, HasActiveRun: false, LastRunStatus: "completed", LastConclusion: "cancelled"}, true},
+		{"startup_failure run", &GitHubActionsStatus{TotalCount: 1, HasActiveRun: false, LastRunStatus: "completed", LastConclusion: "startup_failure"}, true},
+		{"rate limited queued run", &GitHubActionsStatus{TotalCount: 1, HasActiveRun: true, WorkflowQueued: true, PossiblyRateLimited: true}, true},
+		{"active in_progress run", &GitHubActionsStatus{TotalCount: 1, HasActiveRun: true, WorkflowRunning: true, LastRunStatus: "in_progress"}, false},
+		{"fresh queued run", &GitHubActionsStatus{TotalCount: 1, HasActiveRun: true, WorkflowQueued: true, LastRunStatus: "queued"}, false},
+		{"completed success run", &GitHubActionsStatus{TotalCount: 1, HasActiveRun: false, LastRunStatus: "completed", LastConclusion: "success"}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldFallbackToLegacyPages(tc.status); got != tc.want {
+				t.Fatalf("shouldFallbackToLegacyPages(%+v) = %v, want %v", tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCheckGitHubActionsStatus_ParsesRunsAndTriggersFallback(t *testing.T) {
+	binDir := t.TempDir()
+	responseFile := filepath.Join(t.TempDir(), "runs.json")
+	ghLog := filepath.Join(t.TempDir(), "gh.log")
+	gitLog := filepath.Join(t.TempDir(), "git.log")
+
+	ghScript := filepath.Join(binDir, "gh")
+	ghBody := "#!/usr/bin/env bash\n" +
+		"echo \"$*\" >> " + fmt.Sprintf("%q", ghLog) + "\n" +
+		"if [[ \"$1\" == \"auth\" && \"$2\" == \"status\" ]]; then\n" +
+		"  echo \"  Logged in to github.com account octo (oauth_token)\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n" +
+		"  echo \"octo/demo-pages\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [[ \"$1\" == \"api\" && \"$*\" == *\"/contents\"* ]]; then\n" +
+		"  echo '[]'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [[ \"$1\" == \"api\" && \"$*\" == *\"/actions/runs\"* ]]; then\n" +
+		"  cat " + fmt.Sprintf("%q", responseFile) + "\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [[ \"$1\" == \"api\" && \"$*\" == *\"/pages\"* ]]; then\n" +
+		"  echo '{\"html_url\":\"https://octo.github.io/demo-pages/\"}'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"echo '{}'\n"
+	if err := os.WriteFile(ghScript, []byte(ghBody), 0o755); err != nil {
+		t.Fatalf("WriteFile gh stub: %v", err)
+	}
+
+	gitScript := filepath.Join(binDir, "git")
+	gitBody := "#!/usr/bin/env bash\n" +
+		"if [[ -n \"${GIT_DIR:-}\" || -n \"${GIT_WORK_TREE:-}\" ]]; then\n" +
+		"  echo \"poisoned git env leaked: GIT_DIR=${GIT_DIR:-} GIT_WORK_TREE=${GIT_WORK_TREE:-}\" >&2\n" +
+		"  exit 99\n" +
+		"fi\n" +
+		"echo \"$*\" >> " + fmt.Sprintf("%q", gitLog) + "\n" +
+		"if [[ \"$*\" == *\"config user.name\"* || \"$*\" == *\"config --get user.name\"* ]]; then\n" +
+		"  echo \"Octo\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [[ \"$*\" == *\"config user.email\"* || \"$*\" == *\"config --get user.email\"* ]]; then\n" +
+		"  echo \"octo@example.com\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [[ \"$1\" == \"remote\" && \"$2\" == \"get-url\" ]]; then\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(gitScript, []byte(gitBody), 0o755); err != nil {
+		t.Fatalf("WriteFile git stub: %v", err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// Poison ambient GIT_DIR and GIT_WORK_TREE to prove SanitizedGitEnv strips them!
+	t.Setenv("GIT_DIR", "/nonexistent/poison/.git")
+	t.Setenv("GIT_WORK_TREE", "/nonexistent/poison")
+	t.Setenv("GIT_REPLACE_REF_BASE", "refs/replace/")
+
+	origWait := githubActionsInitialWait
+	githubActionsInitialWait = 0
+	t.Cleanup(func() { githubActionsInitialWait = origWait })
+
+	// 1. Failed workflow run -> CheckGitHubActionsStatus captures failure & triggers legacy fallback.
+	if err := os.WriteFile(responseFile, []byte(`{"total_count":1,"workflow_runs":[{"status":"completed","conclusion":"failure","created_at":"2026-11-16T00:00:00Z"}]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile runs.json: %v", err)
+	}
+	st, err := CheckGitHubActionsStatus("octo/demo-pages")
+	if err != nil {
+		t.Fatalf("CheckGitHubActionsStatus error: %v", err)
+	}
+	if st.TotalCount != 1 || st.HasActiveRun || st.LastConclusion != "failure" {
+		t.Fatalf("unexpected failed status: %+v", st)
+	}
+	if !shouldFallbackToLegacyPages(st) {
+		t.Fatalf("expected legacy fallback on failed conclusion: %+v", st)
+	}
+
+	// 2. DeployToGitHubPagesWithFallback with zero runs triggers SwitchToLegacyDeployment + PushToGHPagesBranch
+	// and never leaks poisoned GIT_DIR / GIT_WORK_TREE into git subprocesses.
+	if err := os.WriteFile(responseFile, []byte(`{"total_count":0,"workflow_runs":[]}`), 0o644); err != nil {
+		t.Fatalf("WriteFile zero runs.json: %v", err)
+	}
+	bundleDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundleDir, "index.html"), []byte("<!doctype html>"), 0o644); err != nil {
+		t.Fatalf("WriteFile index.html: %v", err)
+	}
+	res, err := DeployToGitHubPagesWithFallback(GitHubDeployConfig{
+		RepoName:         "demo-pages",
+		BundlePath:       bundleDir,
+		SkipConfirmation: true,
+		ForceOverwrite:   true,
+	}, skipDeploymentIssueCountVerification)
+	if err != nil {
+		t.Fatalf("DeployToGitHubPagesWithFallback failed: %v", err)
+	}
+	if res.RepoFullName != "octo/demo-pages" {
+		t.Fatalf("RepoFullName = %q, want octo/demo-pages", res.RepoFullName)
+	}
+
+	ghLogged, _ := os.ReadFile(ghLog)
+	if !strings.Contains(string(ghLogged), "build_type=legacy") {
+		t.Fatalf("expected SwitchToLegacyDeployment (build_type=legacy) in gh log, got:\n%s", string(ghLogged))
+	}
+	gitLogged, _ := os.ReadFile(gitLog)
+	if !strings.Contains(string(gitLogged), "HEAD:gh-pages") {
+		t.Fatalf("expected PushToGHPagesBranch (HEAD:gh-pages) in git log, got:\n%s", string(gitLogged))
 	}
 }

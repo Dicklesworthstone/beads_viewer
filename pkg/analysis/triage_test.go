@@ -3560,8 +3560,10 @@ func TestTriageResult_ExposesAllScoresAndUnblocksMap(t *testing.T) {
 
 	for i := 1; i <= 12; i++ {
 		id := fmt.Sprintf("CAND-%02d", i)
-		prio := 1
-		if i == 12 {
+		prio := 2
+		if i <= 3 {
+			prio = 0 // Ensure CAND-01..CAND-03 dominate TopN=3
+		} else if i == 11 || i == 12 {
 			prio = 4 // Force CAND-12 below TopN=3 while still unblocking CAND-11
 		}
 		allIssues = append(allIssues, model.Issue{
@@ -3575,9 +3577,14 @@ func TestTriageResult_ExposesAllScoresAndUnblocksMap(t *testing.T) {
 		})
 		candidates[id] = true
 	}
-	// CAND-02 and CAND-03 depend on CAND-01; CAND-11 depends on low-priority CAND-12.
-	allIssues[1].Dependencies = []*model.Dependency{{IssueID: "CAND-02", DependsOnID: "CAND-01", Type: model.DepBlocks}}
-	allIssues[2].Dependencies = []*model.Dependency{{IssueID: "CAND-03", DependsOnID: "CAND-01", Type: model.DepBlocks}}
+	// CAND-04 and CAND-05 depend on CAND-01; CAND-06 and CAND-07 depend on CAND-02;
+	// CAND-08 and CAND-09 depend on CAND-03; CAND-11 depends on low-priority CAND-12.
+	allIssues[3].Dependencies = []*model.Dependency{{IssueID: "CAND-04", DependsOnID: "CAND-01", Type: model.DepBlocks}}
+	allIssues[4].Dependencies = []*model.Dependency{{IssueID: "CAND-05", DependsOnID: "CAND-01", Type: model.DepBlocks}}
+	allIssues[5].Dependencies = []*model.Dependency{{IssueID: "CAND-06", DependsOnID: "CAND-02", Type: model.DepBlocks}}
+	allIssues[6].Dependencies = []*model.Dependency{{IssueID: "CAND-07", DependsOnID: "CAND-02", Type: model.DepBlocks}}
+	allIssues[7].Dependencies = []*model.Dependency{{IssueID: "CAND-08", DependsOnID: "CAND-03", Type: model.DepBlocks}}
+	allIssues[8].Dependencies = []*model.Dependency{{IssueID: "CAND-09", DependsOnID: "CAND-03", Type: model.DepBlocks}}
 	allIssues[10].Dependencies = []*model.Dependency{{IssueID: "CAND-11", DependsOnID: "CAND-12", Type: model.DepBlocks}}
 
 	// Negative control 1: closed candidate must not enter AllScores or UnblocksMap.
@@ -3648,8 +3655,8 @@ func TestTriageResult_ExposesAllScoresAndUnblocksMap(t *testing.T) {
 			t.Fatalf("expected CAND-12 to fall outside TopN=3 Recommendations")
 		}
 	}
-	if got := res.UnblocksMap["CAND-01"]; !reflect.DeepEqual(got, []string{"CAND-02", "CAND-03"}) {
-		t.Fatalf("UnblocksMap[CAND-01] = %v, want [CAND-02 CAND-03]", got)
+	if got := res.UnblocksMap["CAND-01"]; !reflect.DeepEqual(got, []string{"CAND-04", "CAND-05"}) {
+		t.Fatalf("UnblocksMap[CAND-01] = %v, want [CAND-04 CAND-05]", got)
 	}
 	if got := res.UnblocksMap["CAND-12"]; !reflect.DeepEqual(got, []string{"CAND-11"}) {
 		t.Fatalf("UnblocksMap[CAND-12] = %v, want [CAND-11] even past TopN", got)
@@ -3658,7 +3665,7 @@ func TestTriageResult_ExposesAllScoresAndUnblocksMap(t *testing.T) {
 	// Defensive copy check: mutating UnblocksMap must not mutate Recommendations.
 	res.UnblocksMap["CAND-01"][0] = "MUTATED"
 	for _, rec := range res.Recommendations {
-		if rec.ID == "CAND-01" && !reflect.DeepEqual(rec.UnblocksIDs, []string{"CAND-02", "CAND-03"}) {
+		if rec.ID == "CAND-01" && !reflect.DeepEqual(rec.UnblocksIDs, []string{"CAND-04", "CAND-05"}) {
 			t.Fatalf("mutating UnblocksMap aliased Recommendation.UnblocksIDs: %v", rec.UnblocksIDs)
 		}
 	}
@@ -3770,37 +3777,31 @@ func TestScopedGraphTotals_InducedSubgraph(t *testing.T) {
 	if triage.Meta.IssueCount != 4 {
 		t.Fatalf("TriageResult.Meta.IssueCount = %d, want scoped count 4 (not full corpus 6)", triage.Meta.IssueCount)
 	}
-	if triage.ProjectHealth.Graph.TotalNodes != 4 || triage.ProjectHealth.Graph.TotalEdges != 2 {
-		t.Fatalf("ProjectHealth.Graph = %+v, want TotalNodes=4 TotalEdges=2", triage.ProjectHealth.Graph)
+	if triage.ProjectHealth.Graph.NodeCount != 4 || triage.ProjectHealth.Graph.EdgeCount != 2 {
+		t.Fatalf("ProjectHealth.Graph = %+v, want NodeCount=4 EdgeCount=2", triage.ProjectHealth.Graph)
 	}
-	if triage.ProjectHealth.Graph.Density != 0.1667 {
-		t.Fatalf("ProjectHealth.Graph.Density = %v, want 0.1667 (not unscoped 0.2)", triage.ProjectHealth.Graph.Density)
+	if triage.ProjectHealth.Graph.Density < wantDensity-1e-9 || triage.ProjectHealth.Graph.Density > wantDensity+1e-9 {
+		t.Fatalf("ProjectHealth.Graph.Density = %v, want %v (not unscoped 0.2)", triage.ProjectHealth.Graph.Density, wantDensity)
 	}
 
-	ins := scoped.GenerateScopedInsights(10)
+	ins := scoped.GenerateScopedInsights(scopedStats, 10, true)
 	if ins.ClusterDensity < wantDensity-1e-9 || ins.ClusterDensity > wantDensity+1e-9 {
 		t.Fatalf("GenerateScopedInsights.ClusterDensity = %.9f, want %.9f", ins.ClusterDensity, wantDensity)
 	}
 
 	// ParallelGain on >5000 PreRecipeIssues with narrow candidate scope must run on the scoped
 	// active subgraph rather than bailing out at parallelGainMaxIssues (5000).
+	// D-ROOT unblocks two independent branches (D-LEFT and D-RIGHT), raising parallel tracks 1 -> 2 (gain +1).
 	largeIssues := make([]model.Issue, 0, parallelGainMaxIssues+5)
 	largeIssues = append(largeIssues,
-		model.Issue{ID: "D-ROOT", Title: "Diamond root", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0},
+		model.Issue{ID: "D-ROOT", Title: "Fanout root", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0},
 		model.Issue{
-			ID: "D-LEFT", Title: "Diamond left", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1,
+			ID: "D-LEFT", Title: "Branch left", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "D-LEFT", DependsOnID: "D-ROOT", Type: model.DepBlocks}},
 		},
 		model.Issue{
-			ID: "D-RIGHT", Title: "Diamond right", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1,
+			ID: "D-RIGHT", Title: "Branch right", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "D-RIGHT", DependsOnID: "D-ROOT", Type: model.DepBlocks}},
-		},
-		model.Issue{
-			ID: "D-TOP", Title: "Diamond top", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
-			Dependencies: []*model.Dependency{
-				{IssueID: "D-TOP", DependsOnID: "D-LEFT", Type: model.DepBlocks},
-				{IssueID: "D-TOP", DependsOnID: "D-RIGHT", Type: model.DepBlocks},
-			},
 		},
 	)
 	for i := 0; i < parallelGainMaxIssues+1; i++ {
@@ -3813,30 +3814,74 @@ func TestScopedGraphTotals_InducedSubgraph(t *testing.T) {
 		})
 	}
 
-	// Negative control 2: unscoped 5005-open-issue analyzer skips ParallelGain at parallelGainMaxIssues.
+	// Negative control 2: unscoped >5000-open-issue analyzer skips ParallelGain at parallelGainMaxIssues.
 	unscopedLarge := NewAnalyzer(largeIssues)
 	unscopedAdv := unscopedLarge.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig())
-	if unscopedAdv.ParallelGain == nil || !unscopedAdv.ParallelGain.Skipped || !strings.Contains(unscopedAdv.ParallelGain.SkipReason, "Graph too large") {
+	if unscopedAdv.ParallelGain == nil || unscopedAdv.ParallelGain.Status.State != "skipped" || !strings.Contains(unscopedAdv.ParallelGain.Status.Reason, "exceeds") {
 		t.Fatalf("expected unscoped >5000 graph to skip ParallelGain, got %+v", unscopedAdv.ParallelGain)
 	}
 
-	diamondScope := map[string]bool{"D-ROOT": true, "D-LEFT": true, "D-RIGHT": true, "D-TOP": true}
+	fanoutScope := map[string]bool{"D-ROOT": true, "D-LEFT": true, "D-RIGHT": true}
 	scopedLarge := NewAnalyzer(largeIssues)
-	scopedLarge.SetReadinessScope(model.NewReadinessIndex(largeIssues), diamondScope)
+	scopedLarge.SetReadinessScope(model.NewReadinessIndex(largeIssues), fanoutScope)
 	scopedAdv := scopedLarge.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig())
-	if scopedAdv.ParallelGain == nil || scopedAdv.ParallelGain.Skipped || !scopedAdv.ParallelGain.Available {
-		t.Fatalf("expected scoped 4-candidate subgraph on 5005-issue corpus to compute ParallelGain, got %+v", scopedAdv.ParallelGain)
+	if scopedAdv.ParallelGain == nil || scopedAdv.ParallelGain.Status.State != "computed" {
+		t.Fatalf("expected scoped 3-candidate subgraph on >5000-issue corpus to compute ParallelGain, got %+v", scopedAdv.ParallelGain)
 	}
 	foundRoot := false
-	for _, item := range scopedAdv.ParallelGain.Items {
-		if strings.HasPrefix(item.IssueID, "NOISE-") {
-			t.Fatalf("out-of-scope issue leaked into ParallelGain.Items: %+v", item)
+	for _, item := range scopedAdv.ParallelGain.Metrics {
+		if strings.HasPrefix(item.ID, "NOISE-") {
+			t.Fatalf("out-of-scope issue leaked into ParallelGain.Metrics: %+v", item)
 		}
-		if item.IssueID == "D-ROOT" {
+		if item.ID == "D-ROOT" && item.Gain == 1 {
 			foundRoot = true
 		}
 	}
 	if !foundRoot {
-		t.Fatalf("expected D-ROOT in scoped ParallelGain.Items, got %+v", scopedAdv.ParallelGain.Items)
+		t.Fatalf("expected D-ROOT with Gain=1 in scoped ParallelGain.Metrics, got %+v", scopedAdv.ParallelGain.Metrics)
+	}
+}
+
+func TestComputeTriage_GroupedSlicesNonNilWhenEmpty(t *testing.T) {
+	now := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-time.Hour)
+	closedOnly := []model.Issue{
+		{
+			ID: "c-1", Title: "Already done", Status: model.StatusClosed,
+			Priority: 1, IssueType: model.TypeTask, CreatedAt: closedAt, UpdatedAt: closedAt, ClosedAt: &closedAt,
+		},
+	}
+
+	for _, tc := range []struct {
+		name   string
+		issues []model.Issue
+	}{
+		{name: "empty_corpus", issues: nil},
+		{name: "all_closed_corpus", issues: closedOnly},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			grouped := ComputeTriageWithOptionsAndTime(tc.issues, TriageOptions{
+				WaitForPhase2: true,
+				GroupByTrack:  true,
+				GroupByLabel:  true,
+			}, now)
+			if grouped.RecommendationsByTrack == nil || len(grouped.RecommendationsByTrack) != 0 {
+				t.Fatalf("GroupByTrack=true: RecommendationsByTrack = %#v, want non-nil empty slice", grouped.RecommendationsByTrack)
+			}
+			if grouped.RecommendationsByLabel == nil || len(grouped.RecommendationsByLabel) != 0 {
+				t.Fatalf("GroupByLabel=true: RecommendationsByLabel = %#v, want non-nil empty slice", grouped.RecommendationsByLabel)
+			}
+
+			// Planted negative control: when GroupByTrack/GroupByLabel are false, slices stay nil.
+			ungrouped := ComputeTriageWithOptionsAndTime(tc.issues, TriageOptions{
+				WaitForPhase2: true,
+			}, now)
+			if ungrouped.RecommendationsByTrack != nil {
+				t.Fatalf("GroupByTrack=false: RecommendationsByTrack = %#v, want nil", ungrouped.RecommendationsByTrack)
+			}
+			if ungrouped.RecommendationsByLabel != nil {
+				t.Fatalf("GroupByLabel=false: RecommendationsByLabel = %#v, want nil", ungrouped.RecommendationsByLabel)
+			}
+		})
 	}
 }

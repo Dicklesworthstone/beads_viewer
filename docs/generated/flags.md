@@ -107,6 +107,7 @@
 | `--robot-help` | bool | `false` | Show AI agent help | Robot & Planning Flags |
 | `--robot-history` | bool | `false` | Output bead-to-commit correlations as JSON | Robot & Planning Flags |
 | `--robot-history-timeout-ms` | int | `-1` | Budget in ms for the git-history prologue of robot triage (0 = unbounded; default 10000, env BV_ROBOT_HISTORY_TIMEOUT_MS) | Robot & Planning Flags |
+| `--robot-ignore-correlation` | string | (empty) | Mark a correlation as ignored without accuracy penalty (format: SHA:beadID) | Robot & Planning Flags |
 | `--robot-impact` | string | (empty) | Analyze impact of modifying files (comma-separated paths) | Robot & Planning Flags |
 | `--robot-impact-network` | string | (empty) | Output bead impact network as JSON (empty for full, or bead ID for subnetwork) | Robot & Planning Flags |
 | `--robot-include-inactive` | bool | `false` | Include parked, blocked, and container-epic diagnostics in triage, priority, insights, script, and export outputs; never enables claims | Robot & Planning Flags |

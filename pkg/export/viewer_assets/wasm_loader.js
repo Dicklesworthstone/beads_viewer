@@ -49,6 +49,47 @@ function statusToCode(status) {
   }
 }
 
+function priorityToCode(priority) {
+  if (typeof priority === 'number' && Number.isInteger(priority) && priority >= 0 && priority <= 4) {
+    return priority;
+  }
+  if (typeof priority === 'string' && /^[0-4]$/.test(priority.trim())) {
+    return Number(priority.trim());
+  }
+  return 255;
+}
+
+function isTruthyHybridFlag(val) {
+  return val === true || val === 'true' || Number(val) > 0;
+}
+
+function resolveHybridEffectiveStatus(r, refNowMs) {
+  const normStatus = String(r?.status || '').trim().toLowerCase();
+  if (normStatus === 'closed' || normStatus === 'tombstone') {
+    return normStatus;
+  }
+  if (
+    isTruthyHybridFlag(r?.is_template ?? r?.isTemplate) ||
+    isTruthyHybridFlag(r?.pinned ?? r?.isPinned) ||
+    normStatus === 'pinned'
+  ) {
+    return 'deferred';
+  }
+  const deferRaw = r?.defer_until ?? r?.deferUntil;
+  if ((normStatus === 'open' || normStatus === 'in_progress') && deferRaw) {
+    const deferMs = new Date(deferRaw).getTime();
+    if (Number.isFinite(deferMs) && deferMs > refNowMs) {
+      return 'deferred';
+    }
+  }
+  const depState = String(r?.dependency_state ?? r?.dependencyState ?? '').trim().toLowerCase();
+  const isDepBlocked = (depState !== '' && depState !== 'satisfied') || Number(r?.open_blocker_count ?? 0) > 0;
+  if ((normStatus === 'open' || normStatus === 'in_progress') && isDepBlocked) {
+    return 'blocked';
+  }
+  return normStatus;
+}
+
 function resolveHybridReferenceNowMs() {
   const viewerNow = typeof window !== 'undefined' ? window.beadsViewer?.getReferenceNowMs?.() : undefined;
   if (typeof viewerNow === 'number' && Number.isFinite(viewerNow) && viewerNow > 0) {
@@ -61,11 +102,11 @@ function resolveHybridReferenceNowMs() {
   return Date.now();
 }
 
-function daysSince(updatedAt) {
+function daysSince(updatedAt, refNowMs = resolveHybridReferenceNowMs()) {
   if (!updatedAt) return -1;
   const ts = new Date(updatedAt).getTime();
   if (!Number.isFinite(ts)) return -1;
-  return Math.max(0, (resolveHybridReferenceNowMs() - ts) / (1000 * 60 * 60 * 24));
+  return Math.max(0, (refNowMs - ts) / (1000 * 60 * 60 * 24));
 }
 
 async function resolveHasHybridWasm(metaOverride) {
@@ -130,8 +171,19 @@ async function initHybridWasmScorer(issueCount, meta = null) {
   }
 
   try {
-    const wasmModule = await import('./wasm/bv_hybrid_scorer.js');
-    await wasmModule.default();
+    const suffix = (typeof getViewerAssetQuerySuffix === 'function')
+      ? getViewerAssetQuerySuffix()
+      : (typeof window !== 'undefined' && typeof window.beadsViewer?.getViewerAssetQuerySuffix === 'function'
+        ? window.beadsViewer.getViewerAssetQuerySuffix()
+        : '');
+    const wasmModule = await import('./wasm/bv_hybrid_scorer.js' + suffix);
+    if (suffix && typeof window !== 'undefined' && window.location?.href) {
+      await wasmModule.default({
+        module_or_path: new URL('./wasm/bv_hybrid_scorer_bg.wasm' + suffix, window.location.href),
+      });
+    } else {
+      await wasmModule.default();
+    }
     HybridWasmCtor = wasmModule.HybridScorer;
     HYBRID_WASM_STATE.ready = true;
     HYBRID_WASM_STATE.reason = null;
@@ -161,29 +213,35 @@ function scoreBatchHybrid(results, weights, options = {}) {
     typeof options?.maxBlockerCount === 'number' &&
     Number.isFinite(options.maxBlockerCount) &&
     options.maxBlockerCount >= 0
-  ) ? options.maxBlockerCount : null;
+  ) ? Math.max(0, toInt(options.maxBlockerCount, 0)) : null;
 
-  if (!HybridWasmCtor || configuredMax !== null) {
+  if (!HybridWasmCtor) {
     return scoreBatchHybridFallback(results, weights, options);
   }
 
+  const refNowMs = resolveHybridReferenceNowMs();
   const payload = results.map(r => ({
     id: String(r.id ?? r.issue_id ?? ''),
     text_score: toNumber(r.textScore ?? r.text_score, 0),
-    pagerank: toNumber(r.pagerank, 0.5),
-    status: statusToCode(r.status),
-    priority: Math.max(0, Math.min(4, toInt(r.priority, 2))),
+    pagerank: (typeof r.pagerank === 'number' && Number.isFinite(r.pagerank)) ? r.pagerank : 0.5,
+    status: statusToCode(resolveHybridEffectiveStatus(r, refNowMs)),
+    priority: priorityToCode(r.priority),
     blocker_count: Math.max(0, toInt(r.blockerCount ?? r.impact ?? r.blocks_count ?? r.dependent_count ?? 0, 0)),
-    days_since_update: daysSince(r.updatedAt ?? r.updated_at),
+    days_since_update: daysSince(r.updatedAt ?? r.updated_at, refNowMs),
   }));
 
   let scorer;
   try {
-    scorer = new HybridWasmCtor(JSON.stringify(weights));
-    const raw = scorer.score_batch(JSON.stringify(payload));
+    const scorerConfig = configuredMax !== null
+      ? { ...weights, max_blocker_count: configuredMax }
+      : weights;
+    scorer = new HybridWasmCtor(JSON.stringify(scorerConfig));
+    const raw = (configuredMax !== null && typeof scorer.score_batch_with_max === 'function')
+      ? scorer.score_batch_with_max(JSON.stringify(payload), configuredMax)
+      : scorer.score_batch(JSON.stringify(payload));
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed) || parsed.length === 0) {
-      return scoreBatchHybridFallback(results, weights);
+      return scoreBatchHybridFallback(results, weights, options);
     }
 
     const byId = new Map(
@@ -206,12 +264,12 @@ function scoreBatchHybrid(results, weights, options = {}) {
       });
     }
     if (merged.length !== results.length) {
-      return scoreBatchHybridFallback(results, weights);
+      return scoreBatchHybridFallback(results, weights, options);
     }
     return merged;
   } catch (err) {
     console.warn('[HybridScorer] WASM scoring failed, using JS fallback', err);
-    return scoreBatchHybridFallback(results, weights);
+    return scoreBatchHybridFallback(results, weights, options);
   } finally {
     if (scorer && typeof scorer.free === 'function') {
       scorer.free();

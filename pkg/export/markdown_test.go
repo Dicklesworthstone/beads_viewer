@@ -2634,3 +2634,181 @@ func TestGenerateHTMLReport_GroupByModes(t *testing.T) {
 		}
 	}
 }
+
+func TestGenerateHTMLReport_CompleteMetadataAndSanitizedPriorityBriefAlerts(t *testing.T) {
+	now := time.Date(2026, 11, 15, 18, 0, 0, 0, time.UTC)
+	due := now.Add(72 * time.Hour)
+	deferUntil := now.Add(48 * time.Hour)
+	closedAt := now.Add(24 * time.Hour)
+	extRef := "EXT-999<tag>"
+	issues := []model.Issue{
+		{
+			ID:                 "html-full-1",
+			Title:              "HTML Complete Issue",
+			Description:        "Detailed body",
+			Status:             model.StatusClosed,
+			Priority:           1,
+			IssueType:          model.TypeFeature,
+			CreatedAt:          now,
+			UpdatedAt:          now.Add(12 * time.Hour),
+			DueDate:            &due,
+			DeferUntil:         &deferUntil,
+			ClosedAt:           &closedAt,
+			ExternalRef:        &extRef,
+			AcceptanceCriteria: "Must pass <script>alert('ac')</script>",
+			Design:             "Architecture <img src=x onerror=alert(1)>",
+			Notes:              "Operational notes & details",
+			Dependencies: []*model.Dependency{
+				{IssueID: "html-full-1", DependsOnID: "dep-target<1>", Type: model.DepBlocks},
+			},
+			Comments: []*model.Comment{
+				{ID: "1", Author: "alice<b>", Text: "Comment <script>x</script>", CreatedAt: now.Add(2 * time.Hour)},
+			},
+		},
+	}
+
+	rawHTML, err := GenerateReport(issues, issues, ReportOptions{
+		Format:       "html",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(html) failed: %v", err)
+	}
+	htmlStr := string(rawHTML)
+	for _, want := range []string{
+		"<tr><th>Created</th><td>2026-11-15 18:00</td></tr>",
+		"<tr><th>Updated</th><td>2026-11-16 06:00</td></tr>",
+		"<tr><th>Due</th><td>2026-11-18</td></tr>",
+		"<tr><th>Deferred Until</th><td>2026-11-17</td></tr>",
+		"<tr><th>Closed</th><td>2026-11-16 18:00</td></tr>",
+		"<tr><th>External Ref</th><td><code>EXT-999&lt;tag&gt;</code></td></tr>",
+		"<h3>Acceptance Criteria</h3>",
+		"&lt;script&gt;alert(&#39;ac&#39;)&lt;/script&gt;",
+		"<h3>Design</h3>",
+		"&lt;img src=x onerror=alert(1)&gt;",
+		"<h3>Notes</h3>",
+		"Operational notes &amp; details",
+		"<h3>Dependencies</h3>",
+		"<code>dep-target&lt;1&gt;</code>",
+		"<h3>Comments</h3>",
+		"<strong>alice&lt;b&gt;</strong>",
+		"Comment &lt;script&gt;x&lt;/script&gt;",
+	} {
+		if !strings.Contains(htmlStr, want) {
+			t.Fatalf("HTML report missing %q:\n%s", want, htmlStr)
+		}
+	}
+	if strings.Contains(htmlStr, "<script>alert('ac')</script>") || strings.Contains(htmlStr, "<script>x</script>") {
+		t.Fatalf("HTML report failed to escape raw <script> tags:\n%s", htmlStr)
+	}
+
+	// Verify sanitizeInlineMarkdown on alert.Type and alert.Message in GeneratePriorityBriefFromTriageJSON.
+	alertJSON := `{
+		"meta": {"version": "1.0", "generated_at": "2026-11-15T18:00:00Z", "phase2_ready": true, "issue_count": 1},
+		"quick_ref": {"open_count": 1, "actionable_count": 1, "blocked_count": 0, "in_progress_count": 0},
+		"alerts": [{
+			"type": "stale|type\ninjected",
+			"severity": "warning",
+			"message": "Alert line 1\r\n## Injected Heading | Pipe"
+		}]
+	}`
+	brief, err := GeneratePriorityBriefFromTriageJSON([]byte(alertJSON), DefaultPriorityBriefConfig())
+	if err != nil {
+		t.Fatalf("GeneratePriorityBriefFromTriageJSON failed: %v", err)
+	}
+	if strings.Contains(brief, "\n## Injected Heading") {
+		t.Fatalf("priority brief allowed newline heading injection in alert message:\n%s", brief)
+	}
+	for _, want := range []string{
+		`**stale\|type injected**`,
+		`\#\# Injected Heading \| Pipe`,
+	} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("priority brief missing sanitized alert %q:\n%s", want, brief)
+		}
+	}
+}
+
+func TestInteractiveGraph_VendorEmbedDeterminismDeferredAndLightMode(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "1700000000")
+	exportNow := time.Unix(1700000000, 0).UTC()
+	futureDefer := exportNow.Add(6 * time.Hour) // Same day or future sub-day timestamp
+
+	issues := []model.Issue{
+		{
+			ID:        "ig-ready",
+			Title:     "Actionable Open Node",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			CreatedAt: exportNow,
+			UpdatedAt: exportNow,
+		},
+		{
+			ID:         "ig-deferred",
+			Title:      "Future DeferUntil Open Node",
+			Status:     model.StatusOpen,
+			Priority:   1,
+			IssueType:  model.TypeTask,
+			DeferUntil: &futureDefer,
+			CreatedAt:  exportNow,
+			UpdatedAt:  exportNow,
+		},
+	}
+
+	dir := t.TempDir()
+	path1, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues: issues,
+		Title:  "Deterministic Interactive Graph",
+		Path:   filepath.Join(dir, "g1.html"),
+	})
+	if err != nil {
+		t.Fatalf("first GenerateInteractiveGraphHTML: %v", err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	path2, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues: issues,
+		Title:  "Deterministic Interactive Graph",
+		Path:   filepath.Join(dir, "g2.html"),
+	})
+	if err != nil {
+		t.Fatalf("second GenerateInteractiveGraphHTML: %v", err)
+	}
+
+	b1, err := os.ReadFile(path1)
+	if err != nil {
+		t.Fatalf("ReadFile(g1.html): %v", err)
+	}
+	b2, err := os.ReadFile(path2)
+	if err != nil {
+		t.Fatalf("ReadFile(g2.html): %v", err)
+	}
+	if !bytes.Equal(b1, b2) {
+		t.Fatal("InteractiveGraphHTML output differed across wall-clock time despite SOURCE_DATE_EPOCH")
+	}
+
+	htmlOut := string(b1)
+	for _, want := range []string{
+		`"id":"ig-deferred"`,
+		`"is_deferred":true`,
+		`"exported_at_ms":1700000000000`,
+		`function isNodeDeferred(n)`,
+		`function computeLinkColor(l)`,
+		`function computeLinkArrowColor(l)`,
+		`window.innerWidth - menuW - pad`,
+	} {
+		if !strings.Contains(htmlOut, want) {
+			t.Fatalf("InteractiveGraphHTML missing %q", want)
+		}
+	}
+
+	// Verify vendor scripts match ViewerAssetsFS.
+	fgVendor, err := ViewerAssetsFS.ReadFile("viewer_assets/vendor/force-graph.min.js")
+	if err != nil || len(fgVendor) == 0 {
+		t.Fatalf("ViewerAssetsFS force-graph.min.js read failed: %v", err)
+	}
+	if !bytes.Contains(b1, fgVendor[:128]) {
+		t.Fatal("InteractiveGraphHTML did not embed force-graph.min.js from ViewerAssetsFS")
+	}
+}

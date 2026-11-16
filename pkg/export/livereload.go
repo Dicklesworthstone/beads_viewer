@@ -287,7 +287,7 @@ func isHTMLContentType(contentType string) bool {
 // liveReloadMiddleware injects the live-reload script tag into HTML responses.
 func liveReloadMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isServiceWorkerOrSubresourceFetch(r) {
+		if r.Method == http.MethodHead || isServiceWorkerOrSubresourceFetch(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -323,8 +323,9 @@ type injectingResponseWriter struct {
 	passthrough   bool
 }
 
-// WriteHeader records status and switches non-200 or explicit non-HTML responses
-// into passthrough mode so error/plain-text/JSON responses are never mutated.
+// WriteHeader records status and switches non-200, Content-Encoded, or explicit
+// non-HTML responses into passthrough mode so compressed/error/JSON responses
+// are never mutated.
 func (w *injectingResponseWriter) WriteHeader(code int) {
 	if w.headerWritten {
 		return
@@ -333,7 +334,8 @@ func (w *injectingResponseWriter) WriteHeader(code int) {
 	w.hasStatus = true
 
 	ct := strings.TrimSpace(w.Header().Get("Content-Type"))
-	if code != http.StatusOK || (ct != "" && !isHTMLContentType(ct)) {
+	ce := strings.TrimSpace(w.Header().Get("Content-Encoding"))
+	if code != http.StatusOK || ce != "" || (ct != "" && !isHTMLContentType(ct)) {
 		w.passthrough = true
 		w.headerWritten = true
 		w.ResponseWriter.WriteHeader(code)
@@ -341,6 +343,17 @@ func (w *injectingResponseWriter) WriteHeader(code int) {
 }
 
 func (w *injectingResponseWriter) Write(b []byte) (int, error) {
+	if !w.passthrough && !w.committed && strings.TrimSpace(w.Header().Get("Content-Encoding")) != "" {
+		w.passthrough = true
+		if !w.headerWritten {
+			w.headerWritten = true
+			status := w.statusCode
+			if !w.hasStatus {
+				status = http.StatusOK
+			}
+			w.ResponseWriter.WriteHeader(status)
+		}
+	}
 	if w.passthrough || w.committed {
 		return w.ResponseWriter.Write(b)
 	}
@@ -400,11 +413,12 @@ func (w *injectingResponseWriter) commit() error {
 	}
 
 	ct := strings.TrimSpace(w.Header().Get("Content-Type"))
-	if ct == "" && len(w.buf) > 0 {
+	ce := strings.TrimSpace(w.Header().Get("Content-Encoding"))
+	if ct == "" && ce == "" && len(w.buf) > 0 {
 		ct = http.DetectContentType(w.buf)
 	}
 
-	if !w.passthrough && status == http.StatusOK && isHTMLContentType(ct) {
+	if !w.passthrough && status == http.StatusOK && ce == "" && isHTMLContentType(ct) {
 		w.Header().Del("Content-Length")
 		if len(w.buf) > 0 {
 			w.injectScript()
