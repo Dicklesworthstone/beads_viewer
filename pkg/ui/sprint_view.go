@@ -35,7 +35,7 @@ func (m *Model) renderSprintDashboard() string {
 	sb.WriteString("\n\n")
 
 	// Date range and days remaining
-	now := time.Now()
+	now := m.analysisReferenceTime()
 	labelStyle := t.Renderer.NewStyle().Foreground(t.Secondary).Bold(true)
 	valStyle := t.Renderer.NewStyle().Foreground(t.Base.GetForeground())
 
@@ -311,7 +311,7 @@ func activeSprintIndex(sprints []model.Sprint, now time.Time) int {
 // (bv-161). With no sprints loaded it only reports a status message and
 // leaves the current view untouched.
 func (m *Model) openSprintView() (*Model, tea.Cmd) {
-	idx := activeSprintIndex(m.sprints, time.Now())
+	idx := activeSprintIndex(m.sprints, m.analysisReferenceTime())
 	if idx < 0 {
 		m.statusMsg = noSprintsStatus
 		m.statusIsError = false

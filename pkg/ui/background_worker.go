@@ -176,6 +176,7 @@ type workerMetrics struct {
 type BackgroundWorker struct {
 	// Configuration
 	beadsPath         string
+	projectDir        string
 	sourceDegraded    bool
 	debounceDelay     time.Duration
 	heartbeatInterval time.Duration
@@ -264,6 +265,7 @@ type IdleGCConfig struct {
 // WorkerConfig configures the BackgroundWorker.
 type WorkerConfig struct {
 	BeadsPath      string
+	ProjectDir     string
 	SourceDegraded bool
 	DebounceDelay  time.Duration
 
@@ -336,6 +338,7 @@ func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 
 	w := &BackgroundWorker{
 		beadsPath:         cfg.BeadsPath,
+		projectDir:        cfg.ProjectDir,
 		sourceDegraded:    cfg.SourceDegraded,
 		debounceDelay:     cfg.DebounceDelay,
 		heartbeatInterval: cfg.HeartbeatInterval,
@@ -976,6 +979,29 @@ func recipeFingerprint(r *recipe.Recipe) string {
 	return fmt.Sprintf("%x", sum[:])
 }
 
+// SetProjectDir updates the project root directory used to resolve .bv/ config
+// files (such as .bv/drift.yaml and .bv/baseline.json) when BEADS_DIR is external.
+func (w *BackgroundWorker) SetProjectDir(dir string) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	if w.state == WorkerStopped {
+		w.mu.Unlock()
+		return
+	}
+	changed := w.projectDir != dir
+	w.projectDir = dir
+	shouldRefresh := changed && (w.started || w.snapshot != nil)
+	if changed {
+		w.forceNext = true
+	}
+	w.mu.Unlock()
+	if shouldRefresh {
+		w.ForceRefresh()
+	}
+}
+
 // SetRecipe updates the worker's current recipe and triggers a refresh (bv-2h40).
 // This allows Phase 3 view builders to incorporate recipe/filter state off-thread.
 func (w *BackgroundWorker) SetRecipe(r *recipe.Recipe) {
@@ -1597,6 +1623,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	w.mu.RLock()
 	lastHash := w.lastHash
 	prevSnapshot := w.snapshot
+	projectDir := w.projectDir
 	w.mu.RUnlock()
 
 	loadMetadataUnchanged := prevSnapshot != nil &&
@@ -1638,6 +1665,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	analyzeErr := w.safeCompute("analyze_phase1", func() error {
 		builder := NewSnapshotBuilder(issues, authority).
 			WithBeadsPath(w.beadsPath).
+			WithProjectDir(projectDir).
 			WithRecipe(currentRecipe).
 			WithWeights(feedbackWeightsForBeadsPath(w.beadsPath)).
 			WithBuildConfig(snapshotBuildConfigForTier(tier))

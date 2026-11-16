@@ -8,6 +8,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // LabelDashboardModel renders a lightweight table of label health
@@ -279,11 +280,13 @@ func (m LabelDashboardModel) computeColumnWidths(headers []string) []int {
 func (m LabelDashboardModel) renderRow(cells []string, widths []int, header bool, selected bool) string {
 	var parts []string
 	for i, cell := range cells {
-		// Use lipgloss to handle width (padding) and max width (truncation)
-		// Note: MaxWidth might wrap, so we ensure no newlines are introduced if possible,
-		// but standard table cells usually single line.
-		style := lipgloss.NewStyle().Width(widths[i]).MaxWidth(widths[i])
-		parts = append(parts, style.Render(cell))
+		singleLine := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(cell)
+		w := widths[i]
+		if w > 0 && ansi.StringWidth(singleLine) > w {
+			singleLine = ansi.Truncate(singleLine, w, "…")
+		}
+		style := lipgloss.NewStyle().Width(w).MaxWidth(w)
+		parts = append(parts, style.Render(singleLine))
 	}
 	row := strings.Join(parts, " ")
 	if header {

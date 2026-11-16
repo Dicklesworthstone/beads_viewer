@@ -228,11 +228,11 @@ func DefaultTheme(r *lipgloss.Renderer) Theme {
 	t.InfoBold = r.NewStyle().Foreground(paletteColor(ColorInfo)).Bold(true)
 	t.SecondaryText = r.NewStyle().Foreground(paletteColor(t.Secondary))
 	t.PrimaryBold = r.NewStyle().Foreground(paletteColor(t.Primary)).Bold(true)
-	t.PriorityUpArrow = r.NewStyle().Foreground(ThemeFg("#FF6B6B")).Bold(true)
-	t.PriorityDownArrow = r.NewStyle().Foreground(ThemeFg("#4ECDC4")).Bold(true)
-	t.TriageStar = r.NewStyle().Foreground(ThemeFg("#FFD700"))
-	t.TriageUnblocks = r.NewStyle().Foreground(ThemeFg("#50FA7B"))
-	t.TriageUnblocksAlt = r.NewStyle().Foreground(ThemeFg("#6272A4"))
+	t.PriorityUpArrow = r.NewStyle().Foreground(paletteColor(lipgloss.AdaptiveColor{Light: "#C92A2A", Dark: "#FF6B6B"})).Bold(true)
+	t.PriorityDownArrow = r.NewStyle().Foreground(paletteColor(lipgloss.AdaptiveColor{Light: "#0B7285", Dark: "#4ECDC4"})).Bold(true)
+	t.TriageStar = r.NewStyle().Foreground(paletteColor(lipgloss.AdaptiveColor{Light: "#9A6700", Dark: "#FFD700"}))
+	t.TriageUnblocks = r.NewStyle().Foreground(paletteColor(lipgloss.AdaptiveColor{Light: "#15803D", Dark: "#50FA7B"}))
+	t.TriageUnblocksAlt = r.NewStyle().Foreground(paletteColor(lipgloss.AdaptiveColor{Light: "#475569", Dark: "#6272A4"}))
 
 	return t
 }

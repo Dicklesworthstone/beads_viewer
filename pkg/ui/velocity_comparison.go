@@ -38,9 +38,18 @@ func NewVelocityComparisonModel(theme Theme) VelocityComparisonModel {
 	}
 }
 
-// SetData updates the view with computed velocity data
+// SetData updates the view with computed velocity data using wall-clock UTC time.
 func (m *VelocityComparisonModel) SetData(issues []model.Issue) {
-	now := time.Now().UTC()
+	m.SetDataAt(issues, time.Now().UTC())
+}
+
+// SetDataAt updates the view with computed velocity data anchored to reference time now.
+func (m *VelocityComparisonModel) SetDataAt(issues []model.Issue, now time.Time) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
 	velocities := analysis.ComputeAllHistoricalVelocity(issues, 4, now)
 
 	// Convert to rows and sort by average velocity (descending)

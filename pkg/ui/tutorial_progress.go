@@ -58,7 +58,7 @@ func GetTutorialProgressManager() *tutorialProgressManager {
 // $XDG_CONFIG_HOME/bv/tutorial-progress.json when XDG_CONFIG_HOME is set,
 // otherwise ~/.config/bv/tutorial-progress.json.
 func TutorialProgressPath() string {
-	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
+	if xdg := strings.TrimSpace(env.Get("XDG_CONFIG_HOME")); xdg != "" {
 		return filepath.Join(xdg, "bv", "tutorial-progress.json")
 	}
 	home, err := os.UserHomeDir()

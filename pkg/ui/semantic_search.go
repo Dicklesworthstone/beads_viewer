@@ -58,12 +58,13 @@ type SemanticScore struct {
 }
 
 type SemanticSearch struct {
-	cacheMu      sync.Mutex
-	snapshot     atomic.Value // semanticSearchSnapshot
-	cache        atomic.Value // *semanticResultCache
-	scores       atomic.Value // *semanticScoreCache
-	hybridConfig atomic.Value // semanticHybridConfig
-	metricsCache atomic.Value // *metricsCacheHolder
+	cacheMu       sync.Mutex
+	snapshot      atomic.Value // semanticSearchSnapshot
+	cache         atomic.Value // *semanticResultCache
+	scores        atomic.Value // *semanticScoreCache
+	hybridConfig  atomic.Value // semanticHybridConfig
+	metricsCache  atomic.Value // *metricsCacheHolder
+	referenceTime atomic.Value // time.Time
 }
 
 func NewSemanticSearch() *SemanticSearch {
@@ -72,6 +73,7 @@ func NewSemanticSearch() *SemanticSearch {
 	s.cache.Store(&semanticResultCache{results: make(map[string][]list.Rank)})
 	s.scores.Store(&semanticScoreCache{byTerm: make(map[string]map[string]SemanticScore)})
 	s.metricsCache.Store(&metricsCacheHolder{})
+	s.referenceTime.Store(time.Time{})
 	defaultWeights, err := search.GetPreset(search.PresetDefault)
 	if err != nil {
 		defaultWeights = search.Weights{TextRelevance: 1.0}
@@ -241,6 +243,24 @@ func (s *SemanticSearch) getMetricsCache() search.MetricsCache {
 func (s *SemanticSearch) SetMetricsCache(cache search.MetricsCache) {
 	s.metricsCache.Store(&metricsCacheHolder{cache: cache})
 	s.ResetCache()
+}
+
+// SetReferenceTime sets an optional reference clock for hybrid recency/status scoring (e.g. --as-of).
+func (s *SemanticSearch) SetReferenceTime(now time.Time) {
+	if s.GetReferenceTime().Equal(now) {
+		return
+	}
+	s.referenceTime.Store(now)
+	s.ResetCache()
+}
+
+// GetReferenceTime returns the configured reference clock, or zero when wall-clock time is used.
+func (s *SemanticSearch) GetReferenceTime() time.Time {
+	v := s.referenceTime.Load()
+	if v == nil {
+		return time.Time{}
+	}
+	return v.(time.Time)
 }
 
 // ResetCache clears cached semantic results and scores.
@@ -472,7 +492,11 @@ func (s *SemanticSearch) computeSemanticResults(term string) ([]list.Rank, map[s
 	if hybridConfig.Enabled {
 		if cache := s.getMetricsCache(); cache != nil {
 			weights := search.AdjustWeightsForQuery(hybridConfig.Weights, term)
-			scorer = search.NewHybridScorer(weights, cache)
+			if refNow := s.GetReferenceTime(); !refNow.IsZero() {
+				scorer = search.NewHybridScorerAt(weights, cache, refNow)
+			} else {
+				scorer = search.NewHybridScorer(weights, cache)
+			}
 		}
 	}
 

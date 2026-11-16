@@ -45,6 +45,9 @@ type BoardModel struct {
 	// and closed/tombstone blockers resolve accurately.
 	readiness *model.ReadinessIndex
 
+	// Optional reference clock (e.g. --as-of) for time-gated deferral and card age.
+	referenceNow time.Time
+
 	// Detail panel (bv-r6kh)
 	showDetail   bool
 	detailVP     viewport.Model
@@ -211,9 +214,31 @@ func (b BoardModel) activeBlockingDeps(issue model.Issue) []*model.Dependency {
 	return active
 }
 
+// SetReferenceTime sets an optional reference clock (e.g. --as-of) for time-gated deferral and card age.
+func (b *BoardModel) SetReferenceTime(now time.Time) {
+	if !b.referenceNow.Equal(now) {
+		b.referenceNow = now
+		b.lastDetailID = ""
+	}
+}
+
+func (b BoardModel) effectiveNow() time.Time {
+	if !b.referenceNow.IsZero() {
+		return b.referenceNow
+	}
+	if b.boardState != nil && !b.boardState.ReferenceNow.IsZero() {
+		return b.boardState.ReferenceNow
+	}
+	return time.Now()
+}
+
 // customOpenColumnBadge returns a compact status pill for non-standard/parked
 // issues routed into the Open column (e.g., deferred, draft, review, pinned, hooked).
 func customOpenColumnBadge(issue model.Issue) string {
+	return customOpenColumnBadgeAt(issue, time.Now())
+}
+
+func customOpenColumnBadgeAt(issue model.Issue, now time.Time) string {
 	status := issue.Status
 	if status != "" &&
 		status != model.StatusOpen &&
@@ -223,7 +248,7 @@ func customOpenColumnBadge(issue model.Issue) string {
 		status != model.StatusTombstone {
 		return "[" + string(status) + "]"
 	}
-	if status == model.StatusOpen && issue.IsDeferredAt(time.Now()) {
+	if status == model.StatusOpen && issue.IsDeferredAt(now) {
 		return "[deferred]"
 	}
 	return ""
@@ -233,7 +258,7 @@ func (b BoardModel) isCardClaimable(issue model.Issue, hasBlockingDeps bool, sta
 	if hasBlockingDeps || statusBadge != "" || issue.Status != model.StatusOpen {
 		return false
 	}
-	now := time.Now()
+	now := b.effectiveNow()
 	if b.readiness != nil {
 		return b.readiness.Claimable(issue.ID, now)
 	}
@@ -266,7 +291,11 @@ func (b BoardModel) computeColumnStats(issues []model.Issue) ColumnStats {
 	}
 
 	if !oldest.IsZero() {
-		stats.OldestAge = time.Since(oldest)
+		age := b.effectiveNow().Sub(oldest)
+		if age < 0 {
+			age = 0
+		}
+		stats.OldestAge = age
 	}
 
 	return stats
@@ -1573,7 +1602,7 @@ func (b BoardModel) renderCard(issue model.Issue, width int, selected bool, colI
 	activeBlockers := b.activeBlockingDeps(issue)
 	hasBlockingDeps := len(activeBlockers) > 0
 	blocksOthers := len(b.blocksIndex[issue.ID]) > 0
-	statusBadge := customOpenColumnBadge(issue)
+	statusBadge := customOpenColumnBadgeAt(issue, b.effectiveNow())
 
 	// ══════════════════════════════════════════════════════════════════════════
 	// SEARCH MATCH HIGHLIGHTING (bv-yg39)
@@ -1759,7 +1788,7 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 	activeBlockers := b.activeBlockingDeps(issue)
 	hasBlockingDeps := len(activeBlockers) > 0
 	blocksOthers := len(b.blocksIndex[issue.ID]) > 0
-	statusBadge := customOpenColumnBadge(issue)
+	statusBadge := customOpenColumnBadgeAt(issue, b.effectiveNow())
 
 	// ══════════════════════════════════════════════════════════════════════════
 	// CARD STYLING - Expanded card is always selected (since we expand selected)

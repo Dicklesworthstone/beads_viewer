@@ -984,6 +984,54 @@ func (h *HistoryModel) MoveToEnd() {
 	}
 }
 
+func (h *HistoryModel) pageStep() int {
+	step := h.listHeight() / 2
+	if step < 3 {
+		step = 5
+	}
+	return step
+}
+
+// PageDown moves selection down by half a page in the active History mode/pane.
+func (h *HistoryModel) PageDown() {
+	step := h.pageStep()
+	if h.FileTreeRendered() && h.FileTreeHasFocus() {
+		for i := 0; i < step; i++ {
+			h.MoveDownFileTree()
+		}
+		return
+	}
+	if h.IsGitMode() {
+		for i := 0; i < step; i++ {
+			h.MoveDownGit()
+		}
+		return
+	}
+	for i := 0; i < step; i++ {
+		h.MoveDown()
+	}
+}
+
+// PageUp moves selection up by half a page in the active History mode/pane.
+func (h *HistoryModel) PageUp() {
+	step := h.pageStep()
+	if h.FileTreeRendered() && h.FileTreeHasFocus() {
+		for i := 0; i < step; i++ {
+			h.MoveUpFileTree()
+		}
+		return
+	}
+	if h.IsGitMode() {
+		for i := 0; i < step; i++ {
+			h.MoveUpGit()
+		}
+		return
+	}
+	for i := 0; i < step; i++ {
+		h.MoveUp()
+	}
+}
+
 // ToggleFocus cycles through panes based on current layout (bv-xrfh)
 func (h *HistoryModel) ToggleFocus() {
 	panes := h.paneCount()
@@ -1095,10 +1143,12 @@ func (h *HistoryModel) ToggleExpand() {
 
 // Search and Filter methods (bv-nkrj)
 
-// StartSearch activates the search input
+// StartSearch activates the search input while preserving any previously selected search mode.
 func (h *HistoryModel) StartSearch() tea.Cmd {
 	h.searchActive = true
-	h.searchMode = searchModeAll
+	if h.searchMode == searchModeOff {
+		h.searchMode = searchModeAll
+	}
 	h.updateSearchPlaceholder()
 	return h.searchInput.Focus()
 }
@@ -1823,6 +1873,24 @@ func (h *HistoryModel) reportHasAnyCommits() bool {
 		}
 	}
 	return false
+}
+
+// HasActiveFilters reports whether any History search or filter (file, confidence, author, query) is active.
+func (h *HistoryModel) HasActiveFilters() bool {
+	return h.hasActiveFilters()
+}
+
+// ClearFilters clears all active History search queries and filters (file, confidence, author).
+func (h *HistoryModel) ClearFilters() {
+	h.fileFilter = ""
+	h.minConfidence = 0
+	h.authorFilter = ""
+	h.searchActive = false
+	h.searchInput.Blur()
+	h.searchInput.SetValue("")
+	h.searchMode = searchModeOff
+	h.lastSearchQuery = ""
+	h.refreshAfterFilterChange()
 }
 
 func (h *HistoryModel) hasActiveFilters() bool {

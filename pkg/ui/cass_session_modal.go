@@ -99,6 +99,17 @@ func (m CassSessionModal) Update(msg tea.Msg) (CassSessionModal, tea.Cmd) {
 			// runs commands off the Update loop, preserving UI responsiveness.
 			return m, copyToClipboardCmd(m.searchCmd, m.copyToken)
 		}
+	case tea.MouseMsg:
+		switch msg.Button {
+		case tea.MouseButtonWheelDown:
+			if displayCount > 1 && m.selected < displayCount-1 {
+				m.selected++
+			}
+		case tea.MouseButtonWheelUp:
+			if m.selected > 0 {
+				m.selected--
+			}
+		}
 	}
 	return m, nil
 }

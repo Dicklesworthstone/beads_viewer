@@ -95,12 +95,24 @@ func (m AgentPromptModal) Update(msg tea.Msg) (AgentPromptModal, tea.Cmd) {
 func (m AgentPromptModal) View() string {
 	r := m.theme.Renderer
 
+	modalWidth := m.width
+	if modalWidth <= 0 {
+		modalWidth = 60
+	}
+	if modalWidth < 20 {
+		modalWidth = 20
+	}
+	previewWidth := modalWidth - 8
+	if previewWidth < 10 {
+		previewWidth = 10
+	}
+
 	// Modal container style
 	modalStyle := r.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Primary).
 		Padding(1, 2).
-		Width(m.width)
+		Width(modalWidth)
 
 	// Title
 	titleStyle := r.NewStyle().
@@ -117,7 +129,7 @@ func (m AgentPromptModal) View() string {
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(m.theme.Border).
 		Padding(0, 1).
-		Width(m.width - 8).
+		Width(previewWidth).
 		MaxHeight(8)
 
 	previewHeaderStyle := r.NewStyle().
@@ -146,24 +158,40 @@ func (m AgentPromptModal) View() string {
 
 	// Title & Body
 	if m.isUpgrade {
-		b.WriteString(titleStyle.Render("🔄 Update AI Agent Instructions?"))
-		b.WriteString("\n\n")
+		if m.existingVersion == agents.BlurbVersion {
+			b.WriteString(titleStyle.Render("🔄 Consolidate AI Agent Instructions?"))
+			b.WriteString("\n\n")
+			b.WriteString(bodyStyle.Render(fmt.Sprintf("We found %s with duplicate beads_viewer instruction blocks (v%d).", m.fileType, agents.BlurbVersion)))
+			b.WriteString("\n")
+			b.WriteString(bodyStyle.Render(fmt.Sprintf("Would you like to consolidate them into a single clean v%d blurb?", agents.BlurbVersion)))
+			b.WriteString("\n\n")
+			b.WriteString(bodyStyle.Render("Consolidating keeps AI coding agent instructions unambiguous"))
+			b.WriteString("\n")
+			b.WriteString(bodyStyle.Render("without duplicating workflow guidance."))
+			b.WriteString("\n\n")
 
-		existingDesc := "a legacy unversioned format"
-		if m.existingVersion > 0 {
-			existingDesc = fmt.Sprintf("v%d", m.existingVersion)
+			b.WriteString(previewHeaderStyle.Render(fmt.Sprintf("Preview of consolidated content (v%d):", agents.BlurbVersion)))
+			b.WriteString("\n")
+		} else {
+			b.WriteString(titleStyle.Render("🔄 Update AI Agent Instructions?"))
+			b.WriteString("\n\n")
+
+			existingDesc := "a legacy unversioned format"
+			if m.existingVersion > 0 {
+				existingDesc = fmt.Sprintf("v%d", m.existingVersion)
+			}
+			b.WriteString(bodyStyle.Render(fmt.Sprintf("We found %s with outdated beads_viewer instructions (%s).", m.fileType, existingDesc)))
+			b.WriteString("\n")
+			b.WriteString(bodyStyle.Render(fmt.Sprintf("Would you like to update the instructions blurb to v%d?", agents.BlurbVersion)))
+			b.WriteString("\n\n")
+			b.WriteString(bodyStyle.Render("Updating ensures AI coding agents have the latest"))
+			b.WriteString("\n")
+			b.WriteString(bodyStyle.Render("robot flags and workflow guidance."))
+			b.WriteString("\n\n")
+
+			b.WriteString(previewHeaderStyle.Render(fmt.Sprintf("Preview of updated content (v%d):", agents.BlurbVersion)))
+			b.WriteString("\n")
 		}
-		b.WriteString(bodyStyle.Render(fmt.Sprintf("We found %s with outdated beads_viewer instructions (%s).", m.fileType, existingDesc)))
-		b.WriteString("\n")
-		b.WriteString(bodyStyle.Render(fmt.Sprintf("Would you like to update the instructions blurb to v%d?", agents.BlurbVersion)))
-		b.WriteString("\n\n")
-		b.WriteString(bodyStyle.Render("Updating ensures AI coding agents have the latest"))
-		b.WriteString("\n")
-		b.WriteString(bodyStyle.Render("robot flags and workflow guidance."))
-		b.WriteString("\n\n")
-
-		b.WriteString(previewHeaderStyle.Render(fmt.Sprintf("Preview of updated content (v%d):", agents.BlurbVersion)))
-		b.WriteString("\n")
 	} else {
 		b.WriteString(titleStyle.Render("📝 Enhance AI Agent Integration?"))
 		b.WriteString("\n\n")
@@ -286,6 +314,9 @@ func getBlurbPreview() string {
 
 // CenterModal returns the modal view centered in the given dimensions.
 func (m AgentPromptModal) CenterModal(termWidth, termHeight int) string {
+	if termWidth > 0 && termWidth < 64 && m.width > termWidth-4 {
+		m.width = max(20, termWidth-4)
+	}
 	modal := m.View()
 
 	// Get actual rendered dimensions

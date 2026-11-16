@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // IssueDelegate renders issue items in the list
@@ -335,7 +336,7 @@ func (d IssueDelegate) styleRow(row string, width int, selected bool) string {
 	if selected {
 		style = style.Background(d.Theme.Highlight).Bold(true)
 	}
-	return style.Render(truncateRunesHelper(row, width, "…"))
+	return style.Render(ansi.Truncate(row, width, "…"))
 }
 
 // Configured columns share the normal delegate, selection and width handling.
@@ -353,6 +354,17 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 		}
 		return t.Format("2006-01-02")
 	}
+	var priorityArrow string
+	if d.ShowPriorityHints && d.PriorityHints != nil {
+		if hint, ok := d.PriorityHints[item.Issue.ID]; ok {
+			switch hint.Direction {
+			case "increase":
+				priorityArrow = "↑"
+			case "decrease":
+				priorityArrow = "↓"
+			}
+		}
+	}
 	fixedWidth := 2
 	repoCell := ""
 	if d.WorkspaceMode {
@@ -365,6 +377,7 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 		fixedWidth += lipgloss.Width(repoCell) + 3
 	}
 	titleIndex := -1
+	hasPriorityColumn := false
 	for n, rawColumn := range columns {
 		column := rawColumn
 		if canonical, ok := recipe.CanonicalViewColumn(rawColumn); ok {
@@ -378,7 +391,8 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 		case "status":
 			values[n] = string(item.Issue.Status)
 		case "priority":
-			values[n] = fmt.Sprintf("P%d", item.Issue.Priority)
+			hasPriorityColumn = true
+			values[n] = fmt.Sprintf("P%d%s", item.Issue.Priority, priorityArrow)
 		case "assignee":
 			if item.Issue.Assignee != "" {
 				values[n] = "@" + item.Issue.Assignee
@@ -395,9 +409,30 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 			values[n] = fmt.Sprintf("blockers:%d", d.BlockerCounts[item.Issue.ID])
 		}
 		if column != "title" {
-			values[n] = truncateRunesHelper(values[n], max(4, width/3), "…")
+			values[n] = ansi.Truncate(values[n], max(4, width/3), "…")
 			fixedWidth += lipgloss.Width(values[n])
 		}
+	}
+	var inlineBadges []string
+	if !hasPriorityColumn && priorityArrow != "" {
+		inlineBadges = append(inlineBadges, priorityArrow)
+	}
+	if item.IsQuickWin {
+		inlineBadges = append(inlineBadges, "⭐")
+	} else if item.IsBlocker && item.UnblocksCount > 0 {
+		inlineBadges = append(inlineBadges, fmt.Sprintf("🔓%d", item.UnblocksCount))
+	} else if item.UnblocksCount > 0 {
+		inlineBadges = append(inlineBadges, fmt.Sprintf("↪%d", item.UnblocksCount))
+	}
+	if d.ShowSearchScores && item.SearchScoreSet {
+		inlineBadges = append(inlineBadges, fmt.Sprintf("[%.2f]", item.SearchScore))
+	}
+	if diffBadge := item.DiffStatus.Badge(); diffBadge != "" {
+		inlineBadges = append(inlineBadges, diffBadge)
+	}
+	badgePrefix := ""
+	if len(inlineBadges) > 0 {
+		badgePrefix = strings.Join(inlineBadges, " ")
 	}
 	var metrics []string
 	for _, name := range d.MetricNames {
@@ -416,10 +451,22 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 			minTitle := min(8, available)
 			available = max(minTitle, available-metricReserve)
 		}
+		if badgePrefix != "" {
+			badgeReserve := lipgloss.Width(badgePrefix) + 1
+			available = max(4, available-badgeReserve)
+		}
 		if d.TruncateTitle > 0 {
 			available = min(available, d.TruncateTitle)
 		}
-		values[titleIndex] = truncateRunesHelper(item.Issue.Title, available, "…")
+		truncatedTitle := ansi.Truncate(item.Issue.Title, available, "…")
+		if badgePrefix != "" {
+			values[titleIndex] = badgePrefix + " " + truncatedTitle
+		} else {
+			values[titleIndex] = truncatedTitle
+		}
+	} else if badgePrefix != "" && len(values) > 0 {
+		lastIdx := len(values) - 1
+		values[lastIdx] = values[lastIdx] + " " + badgePrefix
 	}
 	prefix := "  "
 	if index == m.Index() {
