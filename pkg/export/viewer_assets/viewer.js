@@ -4155,6 +4155,7 @@ function beadsApp() {
         DIAGNOSTICS.graphWasm = this.graphReady;
         if (this.graphReady) {
           this.topKSet = getTopKSet(5);
+          this.coverageSet = getCoverageSet(10);
           this.topByBetweenness = getTopByBetweenness(10);
           this.topByCriticalPath = getTopByCriticalPath(10);
           if (!this.topByEigenvector.length) {
@@ -4389,7 +4390,7 @@ function beadsApp() {
         }
 
         if (!this.forceGraphModule) {
-          this.forceGraphModule = await import('./graph.js');
+          this.forceGraphModule = await import('./graph.js' + getViewerAssetQuerySuffix());
         }
 
         // Seed live physics only when the exported topology matches this database.
@@ -4438,6 +4439,18 @@ function beadsApp() {
             this.graphSizeMetric = e.detail?.metric ?? 'pagerank';
           });
 
+          // Sync transitive dependency cone isolation state
+          document.addEventListener('bv-graph:dependencyConeChange', (e) => {
+            this.dependencyConeActive = Boolean(e.detail?.active);
+            this.dependencyConeFocusId = e.detail?.focusNodeId || null;
+            this.dependencyConeCount = Number(e.detail?.coneCount || 0);
+          });
+          document.addEventListener('bv-graph:dependencyConeReset', () => {
+            this.dependencyConeActive = false;
+            this.dependencyConeFocusId = null;
+            this.dependencyConeCount = 0;
+          });
+
           // Track simulation progress for loading indicator
           document.addEventListener('bv-graph:simulationProgress', (e) => {
             if (this.graphLoadingStage !== 'simulating') return;
@@ -4454,6 +4467,9 @@ function beadsApp() {
             }
           });
         }
+
+        // Synchronize Force-Graph palette with current light/dark mode
+        this.forceGraphModule.setGraphTheme?.(this.darkMode);
 
         // Stage 4: Running force simulation
         this.graphLoadingStage = 'simulating';
@@ -5047,6 +5063,7 @@ function beadsApp() {
       localStorage.setItem('darkMode', this.darkMode);
       document.documentElement.classList.toggle('dark', this.darkMode);
       window.BVCharts?.applyTheme?.(this.darkMode);
+      this.forceGraphModule?.setGraphTheme?.(this.darkMode);
 
       // Re-initialize Mermaid with new theme
       if (window.reinitializeMermaid) {
@@ -5507,6 +5524,94 @@ function beadsApp() {
       });
     },
 
+    getTriageSourceAuthority() {
+      return this.triageData?.source_authority ?? this.triageData?.triage?.source_authority ?? null;
+    },
+
+    hasProvisionalSourceAuthority() {
+      const sa = this.getTriageSourceAuthority();
+      return Boolean(sa && sa.claim_safe === false);
+    },
+
+    getTriageQuickWins() {
+      const raw = this.triageData?.quick_wins ?? this.triageData?.triage?.quick_wins;
+      if (Array.isArray(raw) && raw.length > 0) return raw;
+      return this.quickWins || [];
+    },
+
+    getTriageBlockersToClear() {
+      const raw = this.triageData?.blockers_to_clear ?? this.triageData?.triage?.blockers_to_clear;
+      if (Array.isArray(raw) && raw.length > 0) return raw;
+      return this.blockersToClose || [];
+    },
+
+    getTriageRecommendations() {
+      const raw = this.triageData?.recommendations ?? this.triageData?.triage?.recommendations;
+      return Array.isArray(raw) ? raw : [];
+    },
+
+    getTriageRecommendationsByTrack() {
+      const raw = this.triageData?.recommendations_by_track ?? this.triageData?.triage?.recommendations_by_track;
+      return Array.isArray(raw) ? raw : [];
+    },
+
+    getTriageRecommendationsByLabel() {
+      const raw = this.triageData?.recommendations_by_label ?? this.triageData?.triage?.recommendations_by_label;
+      return Array.isArray(raw) ? raw : [];
+    },
+
+    getIssueActionCommands(issueId) {
+      if (!issueId) return null;
+      const rec = this.getTriageRecommendations().find(r => r && r.id === issueId);
+      return rec?.actions || null;
+    },
+
+    async copyShellCommand(cmd) {
+      const text = String(cmd || '').trim();
+      if (!text) return false;
+      this.copiedCommandText = text;
+      try {
+        await navigator.clipboard.writeText(text);
+        showToast('Command copied', 'info');
+        return true;
+      } catch {
+        showToast('Select command to copy manually', 'warning');
+        return false;
+      }
+    },
+
+    async focusNodeDependencyCone(nodeId) {
+      if (!nodeId) return false;
+      const ready = await this.initForceGraph();
+      if (!ready) return false;
+      if (this.dependencyConeActive && this.dependencyConeFocusId === nodeId) {
+        this.forceGraphModule?.resetDependencyCone?.();
+        return false;
+      }
+      return Boolean(this.forceGraphModule?.focusDependencyCone?.(nodeId));
+    },
+
+    resetGraphDependencyCone() {
+      this.forceGraphModule?.resetDependencyCone?.();
+    },
+
+    toggleMobileTooltip(event) {
+      const trigger = event?.currentTarget?.closest?.('.metric-tooltip-trigger')
+        || event?.target?.closest?.('.metric-tooltip-trigger');
+      if (!trigger) return;
+      const tooltip = trigger.querySelector('.metric-tooltip');
+      if (!tooltip) return;
+      const nextOpen = !tooltip.classList.contains('tooltip-visible');
+      document.querySelectorAll('.metric-tooltip.tooltip-visible').forEach(el => {
+        if (el !== tooltip) el.classList.remove('tooltip-visible');
+      });
+      document.querySelectorAll('.metric-tooltip-trigger.tooltip-open').forEach(el => {
+        if (el !== trigger) el.classList.remove('tooltip-open');
+      });
+      trigger.classList.toggle('tooltip-open', nextOpen);
+      tooltip.classList.toggle('tooltip-visible', nextOpen);
+    },
+
     /**
      * Dismiss the current error modal
      */
@@ -5550,6 +5655,8 @@ window.beadsViewer = {
   getFilterOptions,
   getUniqueLabels,
   searchIssues,
+  getMaxBlocksCount,
+  getViewerAssetQuerySuffix,
 
   // URL State & Router
   filtersToURL,
@@ -5568,6 +5675,7 @@ window.beadsViewer = {
   GRAPH_STATE,
   initGraphEngine,
   buildClosedSet,
+  buildCandidateSet,
   getResolvedIssueIDs,
   recalculateMetrics,
   whatIfClose,
@@ -5581,6 +5689,7 @@ window.beadsViewer = {
   getCycleBreakSuggestions,
   getCriticalPathSequence,
   getTopKSet,
+  getCoverageSet,
 
   // WASM Fallback
   WASM_STATUS,

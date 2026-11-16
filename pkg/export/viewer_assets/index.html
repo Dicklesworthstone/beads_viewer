@@ -701,8 +701,23 @@
           </div>
         </div>
 
+        <!-- Provisional Source Authority Warning Banner (Dashboard) -->
+        <div x-show="hasProvisionalSourceAuthority()"
+             x-cloak
+             data-source-authority-banner="dashboard"
+             class="mb-4 bg-amber-50/90 dark:bg-amber-950/40 rounded-2xl border border-amber-300 dark:border-amber-700/80 p-4 flex items-start gap-3">
+          <span class="text-lg leading-none mt-0.5">⚠️</span>
+          <div class="min-w-0 flex-1 text-xs text-amber-900 dark:text-amber-100">
+            <div class="font-bold">Provisional Source Snapshot — Not Safe for Autonomous Claiming</div>
+            <p class="mt-0.5 text-amber-800 dark:text-amber-200">
+              Source state: <code class="font-mono px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60" x-text="getTriageSourceAuthority()?.state || 'provisional'"></code>.
+              Verify live issue tracker state before claiming work items.
+            </p>
+          </div>
+        </div>
+
         <!-- Explore Graph CTA - Hero Card (Premium with animation) -->
-        <div @click="view = 'graph'"
+        <div @click="window.location.hash = '#/graph'"
              class="mb-6 sm:mb-8 relative overflow-hidden bg-gradient-to-br from-beads-500 via-beads-600 to-beads-700 dark:from-beads-600 dark:via-beads-700 dark:to-beads-800 rounded-2xl cursor-pointer group touch-btn haptic-medium animate-fade-in-up"
              style="animation-delay: 100ms; box-shadow: 0 10px 40px -10px rgba(14, 165, 233, 0.4);">
           <!-- Animated background pattern -->
@@ -1706,6 +1721,59 @@
           </div>
         </div>
 
+        <!-- Provisional Source Authority Warning Banner (Insights) -->
+        <div x-show="hasProvisionalSourceAuthority()"
+             x-cloak
+             data-source-authority-banner="insights"
+             class="mb-6 bg-amber-50/90 dark:bg-amber-950/40 rounded-2xl border border-amber-300 dark:border-amber-700/80 p-4 flex items-start gap-3">
+          <span class="text-lg leading-none mt-0.5">⚠️</span>
+          <div class="min-w-0 flex-1 text-xs text-amber-900 dark:text-amber-100">
+            <div class="font-bold">Provisional Source Snapshot — Claim Safety Disabled</div>
+            <p class="mt-0.5 text-amber-800 dark:text-amber-200">
+              Source authority reported <code class="font-mono px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-900/60" x-text="getTriageSourceAuthority()?.state || 'provisional'"></code>
+              (<code class="font-mono">claim_safe: false</code>). Sync local issue tracker before claiming recommendations.
+            </p>
+          </div>
+        </div>
+
+        <!-- Dependency Coverage Set (WASM coverageSetDefault) -->
+        <div x-show="coverageSet?.items?.length > 0"
+             id="dependency-coverage-set-card"
+             class="bg-white dark:bg-gray-800 rounded-2xl border border-teal-200 dark:border-teal-800/50 overflow-hidden mb-6 animate-fade-in-up"
+             style="animation-delay: 160ms;">
+          <div class="px-4 sm:px-6 py-3.5 bg-gradient-to-r from-teal-50 to-cyan-50 dark:from-teal-900/20 dark:to-cyan-900/20 border-b border-teal-100 dark:border-teal-800/50 flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2.5">
+              <span class="text-xl">🛡️</span>
+              <div>
+                <h3 class="font-bold text-gray-900 dark:text-white text-sm">Dependency Coverage Set</h3>
+                <p class="text-[10px] text-teal-600 dark:text-teal-400 font-medium">Greedy vertex cover spanning active dependency edges</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-2 text-xs font-mono">
+              <span class="px-2 py-0.5 rounded-full bg-teal-100 dark:bg-teal-900/50 text-teal-700 dark:text-teal-300"
+                    x-text="(coverageSet?.edges_covered || 0) + ' / ' + (coverageSet?.total_edges || 0) + ' edges'"></span>
+              <span class="px-2 py-0.5 rounded-full bg-cyan-100 dark:bg-cyan-900/50 text-cyan-700 dark:text-cyan-300 font-bold"
+                    x-text="(((coverageSet?.coverage_ratio || 0) * 100).toFixed(0)) + '% covered'"></span>
+            </div>
+          </div>
+          <div class="p-3 grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-[260px] overflow-y-auto">
+            <template x-for="(item, idx) in (coverageSet?.items || [])" :key="item.issueId">
+              <div @click="showIssue(item.issueId)"
+                   class="group flex items-center gap-2.5 p-2.5 rounded-xl bg-gray-50 dark:bg-gray-700/30 hover:bg-teal-50 dark:hover:bg-teal-900/20 cursor-pointer touch-btn transition-colors">
+                <span class="w-6 h-6 rounded-lg bg-teal-100 dark:bg-teal-900/50 text-teal-700 dark:text-teal-300 text-xs font-bold flex items-center justify-center shrink-0"
+                      x-text="idx + 1"></span>
+                <div class="flex-1 min-w-0">
+                  <p class="text-[11px] font-mono text-teal-600 dark:text-teal-400" x-text="item.issueId"></p>
+                  <p class="text-xs font-medium text-gray-700 dark:text-gray-200 truncate group-hover:text-teal-700 dark:group-hover:text-teal-300"
+                     x-text="item.title" :title="item.title"></p>
+                </div>
+                <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-teal-100/80 dark:bg-teal-900/40 text-teal-700 dark:text-teal-300 shrink-0"
+                      x-text="'+' + (item.edges_added || 0) + ' edge' + ((item.edges_added || 0) === 1 ? '' : 's')"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+
         <!-- Project Velocity & Health (when triageData available) -->
         <div x-show="triageData?.project_health" class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6 animate-fade-in-up" style="animation-delay: 180ms;">
           <!-- Velocity Card -->
@@ -1803,7 +1871,12 @@
                 </div>
                 <div>
                   <h2 class="text-base sm:text-lg font-bold text-red-700 dark:text-red-300">Circular Dependencies Detected</h2>
-                  <p class="text-xs text-red-600 dark:text-red-400"><span x-text="totalCycles || cycleInfo?.cycleCount || 'Multiple'"></span> cycle(s) found in dependency graph</p>
+                  <p class="text-xs text-red-600 dark:text-red-400">
+                    <span x-text="totalCycles || cycleInfo?.cycleCount || 'Multiple'"></span><span x-show="cycleInfo?.truncated">+</span> cycle(s) found in dependency graph
+                    <span x-show="cycleInfo?.nonTrivialSccCount > 0" class="ml-1 font-mono text-[11px] px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-200"
+                          x-text="cycleInfo.nonTrivialSccCount + ' cyclic SCC' + (cycleInfo.nonTrivialSccCount === 1 ? '' : 's') + ' (max ' + (cycleInfo.largestSccSize || 0) + ' nodes)'"></span>
+                    <span x-show="cycleInfo?.truncated" class="ml-1 font-semibold uppercase text-[10px] px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200">Truncated</span>
+                  </p>
                 </div>
               </div>
               <div class="hidden sm:flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400">
@@ -2657,7 +2730,7 @@
 
             <!-- Critical Path Slack Panel -->
             <div class="metric-panel-premium border-rose-200 dark:border-rose-800/50 relative"
-                 :class="expandedPanel === 'slack' ? 'ring-2 ring-rose-400/50' : ''">
+                 :class="expandedPanel === 'slack' ? 'sm:col-span-2 lg:col-span-2 metric-panel-expanded ring-2 ring-rose-400/50' : ''">
               <div class="metric-panel-header bg-gradient-to-r from-rose-50 to-orange-50/50 dark:from-rose-900/20 dark:to-orange-900/20 border-b border-rose-100 dark:border-rose-800/50"
                    @click="expandedPanel = expandedPanel === 'slack' ? null : 'slack'">
                 <div class="flex items-center gap-2.5">
@@ -2665,8 +2738,26 @@
                     <span>⏱️</span>
                   </div>
                   <div>
-                    <div class="flex items-center gap-1.5">
+                    <div class="metric-tooltip-trigger flex items-center gap-1.5"
+                         @click.stop="toggleMobileTooltip($event)">
                       <h3 class="metric-panel-title text-gray-900 dark:text-white">Critical Path Slack</h3>
+                      <div class="metric-tooltip text-left" @click.stop>
+                        <div class="metric-tooltip-header">
+                          <span class="metric-tooltip-icon">⏱️</span>
+                          <div>
+                            <div class="metric-tooltip-title">Critical Path Slack</div>
+                            <div class="metric-tooltip-subtitle">Zero-Slack Bottlenecks &amp; Float</div>
+                          </div>
+                        </div>
+                        <div class="metric-tooltip-section">
+                          <div class="metric-tooltip-label">What It Measures</div>
+                          <p class="metric-tooltip-text">Schedule float (<strong class="text-gray-900 dark:text-white">critical path length minus longest path through node</strong>) on the active DAG.</p>
+                        </div>
+                        <div class="metric-tooltip-section">
+                          <div class="metric-tooltip-label">Why It Matters</div>
+                          <p class="metric-tooltip-text"><strong>0-hop</strong> issues cannot slip without delaying completion; positive-hop issues have flexible float.</p>
+                        </div>
+                      </div>
                     </div>
                     <p class="metric-panel-subtitle text-rose-600 dark:text-rose-400">Zero-Slack Bottlenecks &amp; Float</p>
                   </div>
@@ -2695,7 +2786,18 @@
                     <span class="metric-item-score bg-rose-100 dark:bg-rose-900/40 text-rose-600 dark:text-rose-400">0 hops</span>
                   </div>
                 </template>
-                <p x-show="criticalPathSlack.length === 0" class="text-xs text-gray-400 text-center py-6 italic" x-text="cycleInfo?.hasCycles ? 'Unavailable while dependency cycles exist' : 'No zero-slack critical path bottlenecks'"></p>
+                <div x-show="flexibleSlackIssues.length > 0" class="mt-2 pt-2 border-t border-rose-100 dark:border-rose-800/40">
+                  <div class="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-emerald-600 dark:text-emerald-400">Flexible Float (Non-Critical)</div>
+                  <template x-for="flexIssue in flexibleSlackIssues.slice(0, expandedPanel === 'slack' ? 8 : 3)" :key="'flex-' + flexIssue.id">
+                    <div class="metric-item group" data-flexible-slack-item @click.stop="showIssue(flexIssue.id)">
+                      <span class="metric-item-rank bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300">~</span>
+                      <span class="metric-item-title group-hover:text-emerald-600 dark:group-hover:text-emerald-400" x-text="flexIssue.title"></span>
+                      <span class="metric-item-score bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300"
+                            x-text="'+' + Math.round(flexIssue.slack || 0) + ' hop' + (Math.round(flexIssue.slack || 0) === 1 ? '' : 's')"></span>
+                    </div>
+                  </template>
+                </div>
+                <p x-show="criticalPathSlack.length === 0 && flexibleSlackIssues.length === 0" class="text-xs text-gray-400 text-center py-6 italic" x-text="cycleInfo?.hasCycles ? 'Unavailable while dependency cycles exist' : 'No zero-slack critical path bottlenecks'"></p>
               </div>
             </div>
 
@@ -2742,7 +2844,7 @@
               </div>
             </div>
             <div class="p-3 space-y-2 max-h-[280px] overflow-y-auto">
-              <template x-for="(issue, idx) in quickWins" :key="issue.id">
+              <template x-for="(issue, idx) in getTriageQuickWins()" :key="issue.id">
                 <div class="group flex items-center gap-2 p-2.5 rounded-xl bg-gray-50 dark:bg-gray-700/30 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 cursor-pointer touch-btn transition-colors"
                      @click="showIssue(issue.id)">
                   <span class="w-6 h-6 rounded-lg bg-emerald-100 dark:bg-emerald-900/50 text-emerald-600 dark:text-emerald-400 text-xs font-bold flex items-center justify-center shrink-0" x-text="idx + 1"></span>
@@ -2750,10 +2852,17 @@
                     <p class="text-sm font-medium text-gray-700 dark:text-gray-300 truncate group-hover:text-emerald-700 dark:group-hover:text-emerald-300" x-text="issue.title" :title="issue.title"></p>
                     <p class="text-[10px] text-gray-500 dark:text-gray-400" x-text="issue.reason || 'Quick resolution potential'"></p>
                   </div>
+                  <button x-show="getIssueActionCommands(issue.id)?.claim?.shell"
+                          type="button"
+                          @click.stop="copyShellCommand(getIssueActionCommands(issue.id)?.claim?.shell)"
+                          :title="getIssueActionCommands(issue.id)?.claim?.shell || 'Copy claim command'"
+                          class="px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/50 text-[10px] font-mono text-emerald-700 dark:text-emerald-300 hover:bg-emerald-200 dark:hover:bg-emerald-800 shrink-0">
+                    Claim
+                  </button>
                   <svg class="w-4 h-4 text-gray-300 group-hover:text-emerald-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
                 </div>
               </template>
-              <p x-show="quickWins.length === 0" class="text-xs text-gray-400 text-center py-4">No quick wins identified</p>
+              <p x-show="getTriageQuickWins().length === 0" class="text-xs text-gray-400 text-center py-4">No quick wins identified</p>
             </div>
           </div>
 
@@ -2769,18 +2878,21 @@
               </div>
             </div>
             <div class="p-3 space-y-2 max-h-[280px] overflow-y-auto">
-              <template x-for="(issue, idx) in blockersToClose" :key="issue.id">
+              <template x-for="(issue, idx) in getTriageBlockersToClear()" :key="issue.id">
                 <div class="group flex items-center gap-2 p-2.5 rounded-xl bg-gray-50 dark:bg-gray-700/30 hover:bg-rose-50 dark:hover:bg-rose-900/20 cursor-pointer touch-btn transition-colors"
                      @click="showIssue(issue.id)">
                   <span class="w-6 h-6 rounded-lg bg-rose-100 dark:bg-rose-900/50 text-rose-600 dark:text-rose-400 text-xs font-bold flex items-center justify-center shrink-0" x-text="idx + 1"></span>
                   <div class="flex-1 min-w-0">
                     <p class="text-sm font-medium text-gray-700 dark:text-gray-300 truncate group-hover:text-rose-700 dark:group-hover:text-rose-300" x-text="issue.title" :title="issue.title"></p>
-                    <p class="text-[10px] text-gray-500 dark:text-gray-400">Blocking <span class="font-semibold text-rose-500" x-text="issue.blocks_count || issue.unblocks_count || '?'"></span> issues</p>
+                    <p class="text-[10px] text-gray-500 dark:text-gray-400">
+                      Blocking <span class="font-semibold text-rose-500" x-text="issue.unblocks_count ?? issue.blocks_count ?? '?'"></span> issues
+                      <span x-show="issue.actionable === true" class="ml-1 px-1 py-0.2 rounded bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 font-medium">Ready</span>
+                    </p>
                   </div>
                   <svg class="w-4 h-4 text-gray-300 group-hover:text-rose-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
                 </div>
               </template>
-              <p x-show="blockersToClose.length === 0" class="text-xs text-gray-400 text-center py-4">No blockers identified</p>
+              <p x-show="getTriageBlockersToClear().length === 0" class="text-xs text-gray-400 text-center py-4">No blockers identified</p>
             </div>
           </div>
         </div>
@@ -2896,10 +3008,11 @@
         </div>
 
         <!-- Full Triage Data from Robot Mode (when available) -->
-        <div x-show="triageData?.recommendations?.length > 0" class="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 overflow-hidden mt-6 animate-fade-in-up" style="animation-delay: 450ms;"
+        <div x-show="getTriageRecommendations().length > 0 || getTriageRecommendationsByTrack().length > 0 || getTriageRecommendationsByLabel().length > 0"
+             class="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 overflow-hidden mt-6 animate-fade-in-up" style="animation-delay: 450ms;"
              x-data="{ selectedRec: null }">
           <div class="px-4 sm:px-6 py-4 bg-gradient-to-r from-violet-50 via-purple-50 to-fuchsia-50 dark:from-violet-900/20 dark:via-purple-900/20 dark:to-fuchsia-900/20 border-b border-violet-200 dark:border-violet-800/50">
-            <div class="flex items-center justify-between gap-3">
+            <div class="flex flex-wrap items-center justify-between gap-3">
               <div class="flex items-center gap-3">
                 <div class="w-10 h-10 bg-gradient-to-br from-violet-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-violet-500/25">
                   <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -2911,14 +3024,34 @@
                   <p class="text-xs text-violet-600 dark:text-violet-400">Detailed analysis from robot-triage</p>
                 </div>
               </div>
-              <span class="text-xs font-mono text-gray-400 bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded-lg" x-text="(triageData?.recommendations?.length || 0) + ' items'"></span>
+              <div class="flex items-center gap-2">
+                <div class="inline-flex rounded-lg bg-white/80 dark:bg-gray-800/80 border border-violet-200 dark:border-violet-700/60 p-0.5 text-xs" role="tablist" aria-label="Recommendation grouping">
+                  <button type="button"
+                          data-rec-tab="top"
+                          @click="triageRecView = 'top'"
+                          :class="triageRecView === 'top' ? 'bg-violet-600 text-white shadow-sm' : 'text-gray-600 dark:text-gray-300 hover:bg-violet-50 dark:hover:bg-violet-900/30'"
+                          class="px-2.5 py-1 rounded-md font-medium transition-colors">Top</button>
+                  <button type="button"
+                          data-rec-tab="track"
+                          @click="triageRecView = 'track'"
+                          :class="triageRecView === 'track' ? 'bg-violet-600 text-white shadow-sm' : 'text-gray-600 dark:text-gray-300 hover:bg-violet-50 dark:hover:bg-violet-900/30'"
+                          class="px-2.5 py-1 rounded-md font-medium transition-colors">By Track</button>
+                  <button type="button"
+                          data-rec-tab="label"
+                          @click="triageRecView = 'label'"
+                          :class="triageRecView === 'label' ? 'bg-violet-600 text-white shadow-sm' : 'text-gray-600 dark:text-gray-300 hover:bg-violet-50 dark:hover:bg-violet-900/30'"
+                          class="px-2.5 py-1 rounded-md font-medium transition-colors">By Label</button>
+                </div>
+                <span class="text-xs font-mono text-gray-400 bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded-lg" x-text="getTriageRecommendations().length + ' items'"></span>
+              </div>
             </div>
           </div>
           <div class="p-4 sm:p-5">
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <!-- Top Recommendations View -->
+            <div x-show="triageRecView === 'top'" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
               <!-- Recommendations List -->
               <div class="space-y-2 max-h-[400px] overflow-y-auto">
-                <template x-for="(rec, idx) in (triageData?.recommendations || []).slice(0, 15)" :key="rec.id">
+                <template x-for="(rec, idx) in getTriageRecommendations().slice(0, 15)" :key="rec.id">
                   <div class="group p-3 rounded-xl border transition-all cursor-pointer touch-btn"
                        :class="selectedRec?.id === rec.id ? 'border-violet-400 bg-violet-50 dark:bg-violet-900/20' : 'border-gray-200 dark:border-gray-700 hover:border-violet-300 dark:hover:border-violet-700 hover:bg-gray-50 dark:hover:bg-gray-700/30'"
                        @click="selectedRec = selectedRec?.id === rec.id ? null : rec">
@@ -2934,6 +3067,26 @@
                         <div class="text-sm font-bold text-violet-600 dark:text-violet-400" x-text="(rec.score || 0).toFixed(2)"></div>
                         <div class="text-[10px] text-gray-400" x-text="rec.action || 'action'"></div>
                       </div>
+                    </div>
+                    <!-- Action command badges (claim / show) -->
+                    <div x-show="rec.actions?.claim?.shell || rec.actions?.show?.shell" class="mt-2 flex flex-wrap items-center gap-1.5">
+                      <button x-show="rec.actions?.claim?.shell"
+                              type="button"
+                              data-rec-claim-cmd
+                              @click.stop="copyShellCommand(rec.actions.claim.shell)"
+                              :title="'Copy: ' + (rec.actions?.claim?.shell || '')"
+                              class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-200 dark:hover:bg-emerald-800 text-[10px] font-mono">
+                        <span>📋</span>
+                        <span x-text="rec.actions?.claim?.shell"></span>
+                      </button>
+                      <button x-show="rec.actions?.show?.shell"
+                              type="button"
+                              data-rec-show-cmd
+                              @click.stop="copyShellCommand(rec.actions.show.shell)"
+                              :title="'Copy: ' + (rec.actions?.show?.shell || '')"
+                              class="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-600 text-[10px] font-mono">
+                        <span x-text="rec.actions?.show?.shell"></span>
+                      </button>
                     </div>
                     <!-- Mini breakdown bars -->
                     <div class="mt-2 flex gap-0.5 h-1.5 rounded-full overflow-hidden bg-gray-100 dark:bg-gray-700">
@@ -3060,9 +3213,93 @@
                         <span x-show="selectedRec.unblocks_ids?.length > 8" class="text-[10px] text-gray-400">+<span x-text="selectedRec.unblocks_ids.length - 8"></span> more</span>
                       </div>
                     </div>
+                    <!-- Action Commands in Selected Recommendation -->
+                    <div x-show="selectedRec.actions?.claim?.shell || selectedRec.actions?.show?.shell" class="mt-4 pt-3 border-t border-gray-200 dark:border-gray-600 space-y-1.5">
+                      <h5 class="text-xs font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide">CLI Actions</h5>
+                      <div class="flex flex-wrap gap-1.5">
+                        <button x-show="selectedRec.actions?.claim?.shell"
+                                type="button"
+                                @click="copyShellCommand(selectedRec.actions.claim.shell)"
+                                class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/50 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-200 dark:hover:bg-emerald-800 text-xs font-mono">
+                          <span>📋</span>
+                          <span x-text="selectedRec.actions?.claim?.shell"></span>
+                        </button>
+                        <button x-show="selectedRec.actions?.show?.shell"
+                                type="button"
+                                @click="copyShellCommand(selectedRec.actions.show.shell)"
+                                class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-300 dark:hover:bg-gray-600 text-xs font-mono">
+                          <span x-text="selectedRec.actions?.show?.shell"></span>
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </template>
               </div>
+            </div>
+
+            <!-- By Track Recommendations View -->
+            <div x-show="triageRecView === 'track'" data-rec-panel="track" class="space-y-3">
+              <template x-for="group in getTriageRecommendationsByTrack()" :key="group.track_id">
+                <div class="p-3.5 rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-700/20">
+                  <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                    <div class="flex items-center gap-2">
+                      <span class="px-2 py-0.5 rounded bg-violet-100 dark:bg-violet-900/50 text-violet-700 dark:text-violet-300 font-mono text-xs font-bold" x-text="group.track_id"></span>
+                      <span class="text-xs text-gray-500 dark:text-gray-400" x-text="group.reason || ''"></span>
+                    </div>
+                    <div class="flex items-center gap-2">
+                      <span class="text-[11px] font-mono text-emerald-600 dark:text-emerald-400" x-text="'Unblocks ' + (group.total_unblocks || 0)"></span>
+                      <button x-show="group.claim_command"
+                              type="button"
+                              @click="copyShellCommand(group.claim_command)"
+                              class="px-2 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-200 text-[10px] font-mono hover:bg-emerald-200 dark:hover:bg-emerald-800"
+                              x-text="group.claim_command"></button>
+                    </div>
+                  </div>
+                  <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <template x-for="rec in (group.recommendations || []).slice(0, 6)" :key="group.track_id + '-' + rec.id">
+                      <div @click="showIssue(rec.id)" class="p-2 rounded-lg bg-white dark:bg-gray-800 border border-gray-200/80 dark:border-gray-700 hover:border-violet-300 dark:hover:border-violet-600 cursor-pointer flex items-center justify-between gap-2">
+                        <div class="min-w-0">
+                          <p class="text-[11px] font-mono text-violet-600 dark:text-violet-400" x-text="rec.id"></p>
+                          <p class="text-xs font-medium text-gray-800 dark:text-gray-200 truncate" x-text="rec.title"></p>
+                        </div>
+                        <span class="text-xs font-mono font-bold text-violet-600 dark:text-violet-400 shrink-0" x-text="(rec.score || 0).toFixed(2)"></span>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </template>
+              <p x-show="getTriageRecommendationsByTrack().length === 0" class="text-xs text-gray-400 text-center py-6 italic">No parallel execution tracks identified</p>
+            </div>
+
+            <!-- By Label Recommendations View -->
+            <div x-show="triageRecView === 'label'" data-rec-panel="label" class="space-y-3">
+              <template x-for="group in getTriageRecommendationsByLabel()" :key="group.label">
+                <div class="p-3.5 rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-700/20">
+                  <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                    <span class="px-2.5 py-0.5 rounded-full bg-purple-100 dark:bg-purple-900/50 text-purple-700 dark:text-purple-300 text-xs font-semibold" x-text="group.label"></span>
+                    <div class="flex items-center gap-2">
+                      <span class="text-[11px] font-mono text-emerald-600 dark:text-emerald-400" x-text="'Unblocks ' + (group.total_unblocks || 0)"></span>
+                      <button x-show="group.claim_command"
+                              type="button"
+                              @click="copyShellCommand(group.claim_command)"
+                              class="px-2 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-200 text-[10px] font-mono hover:bg-emerald-200 dark:hover:bg-emerald-800"
+                              x-text="group.claim_command"></button>
+                    </div>
+                  </div>
+                  <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <template x-for="rec in (group.recommendations || []).slice(0, 6)" :key="group.label + '-' + rec.id">
+                      <div @click="showIssue(rec.id)" class="p-2 rounded-lg bg-white dark:bg-gray-800 border border-gray-200/80 dark:border-gray-700 hover:border-purple-300 dark:hover:border-purple-600 cursor-pointer flex items-center justify-between gap-2">
+                        <div class="min-w-0">
+                          <p class="text-[11px] font-mono text-purple-600 dark:text-purple-400" x-text="rec.id"></p>
+                          <p class="text-xs font-medium text-gray-800 dark:text-gray-200 truncate" x-text="rec.title"></p>
+                        </div>
+                        <span class="text-xs font-mono font-bold text-purple-600 dark:text-purple-400 shrink-0" x-text="(rec.score || 0).toFixed(2)"></span>
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </template>
+              <p x-show="getTriageRecommendationsByLabel().length === 0" class="text-xs text-gray-400 text-center py-6 italic">No labeled recommendation groups available</p>
             </div>
           </div>
         </div>
@@ -3183,6 +3420,13 @@
               <code class="text-xs font-medium text-beads-600 dark:text-beads-400 bg-beads-50 dark:bg-beads-900/20 px-2 py-0.5 rounded truncate" x-text="graphDetailNode?.id"></code>
             </div>
             <div class="flex items-center gap-1 shrink-0">
+              <button @click="if (graphDetailNode?.id) focusNodeDependencyCone(graphDetailNode.id)"
+                      id="graph-focus-cone-btn"
+                      title="Isolate transitive dependency cone (Shift+C)"
+                      :class="dependencyConeActive && dependencyConeFocusId === graphDetailNode?.id ? 'bg-cyan-100 dark:bg-cyan-900/60 text-cyan-800 dark:text-cyan-200 border-cyan-400' : 'bg-cyan-50 dark:bg-cyan-900/25 text-cyan-700 dark:text-cyan-300 border-cyan-200 dark:border-cyan-700/50 hover:bg-cyan-100 dark:hover:bg-cyan-900/40'"
+                      class="flex items-center gap-1 px-2 py-1.5 text-xs font-medium border rounded-md transition-colors">
+                <span x-text="dependencyConeActive && dependencyConeFocusId === graphDetailNode?.id ? 'Reset Cone' : 'Focus Cone'"></span>
+              </button>
               <button @click="if (graphDetailNode?.id) selectIssue(graphDetailNode.id)"
                       title="Open full issue details (or double-click the node)"
                       class="flex items-center gap-1 px-2 py-1.5 text-xs font-medium text-beads-700 dark:text-beads-300 bg-beads-50 dark:bg-beads-900/30 hover:bg-beads-100 dark:hover:bg-beads-900/50 border border-beads-200 dark:border-beads-700/50 rounded-md transition-colors">
@@ -3292,7 +3536,7 @@
         <!-- Left controls -->
         <div class="pointer-events-auto flex flex-col gap-2 md:gap-3">
           <!-- Back button - larger touch target on mobile -->
-          <button @click="view = 'dashboard'"
+          <button @click="window.location.hash = '#/'"
                   class="flex items-center gap-2 px-3 py-2.5 md:px-4 md:py-2 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 active:bg-gray-100 dark:active:bg-gray-600 transition-colors min-h-[44px]">
             <svg class="w-5 h-5 md:w-4 md:h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/>
@@ -3314,6 +3558,21 @@
                 <span class="text-xs md:text-sm font-medium" x-text="(stats.closed || 0) + ' closed'"></span>
               </div>
             </div>
+          </div>
+
+          <!-- Active Dependency Cone HUD Pill -->
+          <div x-show="dependencyConeActive"
+               id="graph-dependency-cone-hud"
+               x-cloak
+               class="bg-white/95 dark:bg-gray-800/95 backdrop-blur-sm rounded-lg shadow-lg border border-cyan-300 dark:border-cyan-700 px-2.5 py-2 flex items-center gap-2">
+            <span class="text-xs font-semibold text-cyan-700 dark:text-cyan-300">Cone:</span>
+            <span class="text-xs font-mono font-bold text-cyan-800 dark:text-cyan-200" x-text="dependencyConeFocusId"></span>
+            <span class="text-[11px] font-mono text-gray-500 dark:text-gray-400" x-text="'(' + dependencyConeCount + ')'"></span>
+            <button type="button"
+                    @click="resetGraphDependencyCone()"
+                    class="px-1.5 py-0.5 rounded bg-cyan-100 dark:bg-cyan-900/50 text-cyan-700 dark:text-cyan-300 hover:bg-cyan-200 dark:hover:bg-cyan-800 text-[10px] font-medium">
+              Reset
+            </button>
           </div>
 
           <!-- Active Critical Path [1/N] Stepper Pill in Graph HUD -->
@@ -3514,10 +3773,7 @@
             </svg>
           </button>
           <!-- Search input (always visible on desktop, toggle on mobile) -->
-          <div x-show="graphSearchOpen || window.innerWidth >= 768"
-               x-transition:enter="transition ease-out duration-150"
-               x-transition:enter-start="opacity-0 scale-95"
-               x-transition:enter-end="opacity-100 scale-100"
+          <div :class="graphSearchOpen ? 'block' : 'hidden md:block'"
                class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-1.5">
             <div class="flex items-center gap-2">
               <div class="relative">

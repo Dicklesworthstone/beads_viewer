@@ -1593,6 +1593,14 @@ body.modal-open .overflow-y-auto {
     }
 }
 
+.metric-tooltip-trigger.tooltip-open .metric-tooltip,
+.metric-tooltip.tooltip-visible {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0) scale(1);
+    pointer-events: auto;
+}
+
 /* Tooltip content styling */
 .metric-tooltip-header {
     display: flex;

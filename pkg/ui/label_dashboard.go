@@ -261,13 +261,15 @@ func (m LabelDashboardModel) computeColumnWidths(headers []string) []int {
 		}
 	}
 
-	// Ensure total fits width; if not, truncate label column first
+	// Ensure total fits width (including row style horizontal frame); if not, truncate label column first
+	framePad := max(m.theme.Header.GetHorizontalFrameSize(), max(m.theme.Selected.GetHorizontalFrameSize(), m.theme.Base.GetHorizontalFrameSize()))
+	availWidth := m.width - framePad
 	total := len(headers) - 1 // spaces between columns
 	for _, w := range widths {
 		total += w
 	}
-	if m.width > 0 && total > m.width {
-		excess := total - m.width
+	if m.width > 0 && availWidth > 0 && total > availWidth {
+		excess := total - availWidth
 		if excess >= widths[0]-4 {
 			widths[0] = 4
 		} else {
@@ -289,23 +291,29 @@ func (m LabelDashboardModel) renderRow(cells []string, widths []int, header bool
 		parts = append(parts, style.Render(singleLine))
 	}
 	row := strings.Join(parts, " ")
+	var rendered string
 	if header {
-		return m.theme.Header.Render(row)
+		rendered = m.theme.Header.Render(row)
+	} else if selected {
+		rendered = m.theme.Selected.Render(row)
+	} else {
+		rendered = m.theme.Base.Render(row)
 	}
-	if selected {
-		return m.theme.Selected.Render(row)
+	if m.width > 0 && ansi.StringWidth(rendered) > m.width {
+		rendered = ansi.Truncate(rendered, m.width, "…")
 	}
-	return m.theme.Base.Render(row)
+	return rendered
 }
 
 func (m LabelDashboardModel) renderLabelCell(lh analysis.LabelHealth) string {
+	cleanLabel := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(lh.Label)
 	indicator := ""
 	if lh.HealthLevel == analysis.HealthLevelCritical {
 		indicator = " !"
 	} else if lh.Blocked > 0 {
 		indicator = " ⛔"
 	}
-	return lh.Label + indicator
+	return cleanLabel + indicator
 }
 
 func (m LabelDashboardModel) renderHealthCell(lh analysis.LabelHealth) string {
