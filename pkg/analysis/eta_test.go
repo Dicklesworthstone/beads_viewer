@@ -788,14 +788,14 @@ func TestETAIgnoresFutureClosures(t *testing.T) {
 	if etaAtNow.EstimatedDays < 9.99 || etaAtNow.EstimatedDays > 10.01 {
 		t.Fatalf("future closures leaked into EstimateETAForIssue: got %.4f days, want 10.0 days", etaAtNow.EstimatedDays)
 	}
-	if etaAtNow.Confidence != "low" {
-		t.Fatalf("Confidence = %q, want \"low\" (only 1 valid past closure, not 3)", etaAtNow.Confidence)
+	if etaAtNow.VelocityMinutesPerDay < 9.99 || etaAtNow.VelocityMinutesPerDay > 10.01 {
+		t.Fatalf("VelocityMinutesPerDay = %.4f, want 10.0", etaAtNow.VelocityMinutesPerDay)
 	}
 
 	openOnly := issues[:1]
 	boundsAtNow := ComputeGrahamBounds(openOnly, issues, nil, 1, now)
-	if boundsAtNow.VelocityMinPerDay < 9.99 || boundsAtNow.VelocityMinPerDay > 10.01 {
-		t.Fatalf("future closures leaked into ComputeGrahamBounds: VelocityMinPerDay=%.4f, want 10.0", boundsAtNow.VelocityMinPerDay)
+	if boundsAtNow.VelocityMinutesPerDay < 9.99 || boundsAtNow.VelocityMinutesPerDay > 10.01 {
+		t.Fatalf("future closures leaked into ComputeGrahamBounds: VelocityMinutesPerDay=%.4f, want 10.0", boundsAtNow.VelocityMinutesPerDay)
 	}
 	if boundsAtNow.GrahamMinDays < 9.99 || boundsAtNow.GrahamMinDays > 10.01 {
 		t.Fatalf("GrahamMinDays = %.4f, want 10.0", boundsAtNow.GrahamMinDays)
@@ -812,7 +812,7 @@ func TestETAIgnoresFutureClosures(t *testing.T) {
 	if etaLater.EstimatedDays < wantLaterDays-0.01 || etaLater.EstimatedDays > wantLaterDays+0.01 {
 		t.Fatalf("laterNow EstimateETAForIssue = %.4f days, want %.4f once closures are in the past", etaLater.EstimatedDays, wantLaterDays)
 	}
-	if etaLater.Confidence != "medium" {
-		t.Fatalf("laterNow Confidence = %q, want \"medium\" (3 past closures)", etaLater.Confidence)
+	if etaLater.VelocityMinutesPerDay < 209.99 || etaLater.VelocityMinutesPerDay > 210.01 {
+		t.Fatalf("laterNow VelocityMinutesPerDay = %.4f, want 210.0", etaLater.VelocityMinutesPerDay)
 	}
 }
