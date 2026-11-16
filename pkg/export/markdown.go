@@ -798,6 +798,22 @@ var tocLinkTextReplacer = strings.NewReplacer(
 	"\r", "",
 )
 
+func sanitizeInlineMarkdown(value string) string {
+	var collapsed strings.Builder
+	collapsed.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r == '\r' || r == '\n' || r == '\t':
+			collapsed.WriteByte(' ')
+		case unicode.IsControl(r):
+			continue
+		default:
+			collapsed.WriteRune(r)
+		}
+	}
+	return escapeReportText(strings.TrimSpace(collapsed.String()))
+}
+
 func escapeTableText(value string) string {
 	clean := strings.ReplaceAll(value, "\r", "")
 	clean = strings.ReplaceAll(clean, "\n", " ")
@@ -1631,8 +1647,26 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 		if iss.EstimatedMinutes != nil && *iss.EstimatedMinutes > 0 {
 			sb.WriteString(fmt.Sprintf("<tr><th>Estimated</th><td>%s</td></tr>\n", html.EscapeString(formatEstimatedDuration(*iss.EstimatedMinutes))))
 		}
+		if !iss.CreatedAt.IsZero() {
+			sb.WriteString(fmt.Sprintf("<tr><th>Created</th><td>%s</td></tr>\n", html.EscapeString(iss.CreatedAt.Format("2006-01-02 15:04"))))
+		}
+		if !iss.UpdatedAt.IsZero() {
+			sb.WriteString(fmt.Sprintf("<tr><th>Updated</th><td>%s</td></tr>\n", html.EscapeString(iss.UpdatedAt.Format("2006-01-02 15:04"))))
+		}
+		if iss.DueDate != nil {
+			sb.WriteString(fmt.Sprintf("<tr><th>Due</th><td>%s</td></tr>\n", html.EscapeString(iss.DueDate.Format("2006-01-02"))))
+		}
+		if iss.DeferUntil != nil {
+			sb.WriteString(fmt.Sprintf("<tr><th>Deferred Until</th><td>%s</td></tr>\n", html.EscapeString(iss.DeferUntil.Format("2006-01-02"))))
+		}
+		if iss.ClosedAt != nil {
+			sb.WriteString(fmt.Sprintf("<tr><th>Closed</th><td>%s</td></tr>\n", html.EscapeString(iss.ClosedAt.Format("2006-01-02 15:04"))))
+		}
 		if strings.TrimSpace(iss.CloseReason) != "" {
 			sb.WriteString(fmt.Sprintf("<tr><th>Close Reason</th><td>%s</td></tr>\n", html.EscapeString(iss.CloseReason)))
+		}
+		if iss.ExternalRef != nil && *iss.ExternalRef != "" {
+			sb.WriteString(fmt.Sprintf("<tr><th>External Ref</th><td><code>%s</code></td></tr>\n", html.EscapeString(*iss.ExternalRef)))
 		}
 		if len(iss.Labels) > 0 {
 			sb.WriteString(fmt.Sprintf("<tr><th>Labels</th><td>%s</td></tr>\n", html.EscapeString(strings.Join(iss.Labels, ", "))))
@@ -1647,6 +1681,50 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 		sb.WriteString("</tbody></table>\n")
 		if iss.Description != "" {
 			sb.WriteString(fmt.Sprintf("<h3>Description</h3><pre>%s</pre>\n", html.EscapeString(iss.Description)))
+		}
+		if iss.AcceptanceCriteria != "" {
+			sb.WriteString(fmt.Sprintf("<h3>Acceptance Criteria</h3><pre>%s</pre>\n", html.EscapeString(iss.AcceptanceCriteria)))
+		}
+		if iss.Design != "" {
+			sb.WriteString(fmt.Sprintf("<h3>Design</h3><pre>%s</pre>\n", html.EscapeString(iss.Design)))
+		}
+		if iss.Notes != "" {
+			sb.WriteString(fmt.Sprintf("<h3>Notes</h3><pre>%s</pre>\n", html.EscapeString(iss.Notes)))
+		}
+		var nonNilDeps []*model.Dependency
+		for _, dep := range iss.Dependencies {
+			if dep != nil {
+				nonNilDeps = append(nonNilDeps, dep)
+			}
+		}
+		if len(nonNilDeps) > 0 {
+			sb.WriteString("<h3>Dependencies</h3><ul>\n")
+			for _, dep := range nonNilDeps {
+				icon := "🔗"
+				if dep.Type.IsBlocking() {
+					icon = "⛔"
+				}
+				sb.WriteString(fmt.Sprintf("<li>%s <strong>%s</strong>: <code>%s</code></li>\n",
+					icon,
+					html.EscapeString(string(dep.Type)),
+					html.EscapeString(dep.DependsOnID)))
+			}
+			sb.WriteString("</ul>\n")
+		}
+		var nonNilComments []*model.Comment
+		for _, c := range iss.Comments {
+			if c != nil {
+				nonNilComments = append(nonNilComments, c)
+			}
+		}
+		if len(nonNilComments) > 0 {
+			sb.WriteString("<h3>Comments</h3>\n")
+			for _, c := range nonNilComments {
+				sb.WriteString(fmt.Sprintf("<blockquote><p><strong>%s</strong> (%s)</p><pre>%s</pre></blockquote>\n",
+					html.EscapeString(c.Author),
+					html.EscapeString(c.CreatedAt.Format("2006-01-02")),
+					html.EscapeString(c.Text)))
+			}
 		}
 		sb.WriteString("</section>\n")
 	}
@@ -2006,7 +2084,7 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 			case "warning":
 				icon = "🟡"
 			}
-			sb.WriteString(fmt.Sprintf("- %s **%s**: %s\n", icon, alert.Type, alert.Message))
+			sb.WriteString(fmt.Sprintf("- %s **%s**: %s\n", icon, sanitizeInlineMarkdown(alert.Type), sanitizeInlineMarkdown(alert.Message)))
 		}
 		sb.WriteString("\n")
 	}
