@@ -70,6 +70,27 @@ window.reinitializeMermaid = function () {
   }
 };
 
+const VIEWER_SCRIPT_SRC = (typeof document !== 'undefined' && document.currentScript?.src) || '';
+
+/**
+ * Extract the ?v=... cache-busting query suffix stamped onto viewer.js by
+ * CopyEmbeddedAssets so dynamic ES module imports fetch matching deployment revisions.
+ */
+function getViewerAssetQuerySuffix() {
+  try {
+    const raw = VIEWER_SCRIPT_SRC ||
+      (typeof document !== 'undefined'
+        ? document.querySelector('script[src*="viewer.js"]')?.getAttribute('src') || ''
+        : '');
+    if (!raw) return '';
+    const parsed = new URL(raw, typeof window !== 'undefined' ? window.location.href : 'http://localhost/');
+    const v = parsed.searchParams.get('v');
+    return v ? `?v=${encodeURIComponent(v)}` : '';
+  } catch {
+    return '';
+  }
+}
+
 // ============================================================================
 // Error Handling and Diagnostics
 // ============================================================================
@@ -895,8 +916,8 @@ async function initGraphEngine() {
   }
 
   try {
-    // Dynamic import of the WASM module
-    const wasmModule = await import('./vendor/bv_graph.js');
+    // Dynamic import of the WASM module (propagate deployment cache-buster if present)
+    const wasmModule = await import('./vendor/bv_graph.js' + getViewerAssetQuerySuffix());
     await wasmModule.default(); // Initialize WASM
 
     // Expose for other modules (e.g., graph.js force-graph view) to reuse.
@@ -1012,8 +1033,28 @@ function buildClosedSet() {
 }
 
 /** Restrict selectable issues without marking excluded prerequisites closed. */
-function buildCandidateSet(actionableOnly = false) {
+function buildCandidateSet(options = false) {
   const candidates = new Uint8Array(GRAPH_STATE.graph.nodeCount());
+  const actionableOnly = options === true || Boolean(options?.actionableOnly);
+  const lifecycleOnly = Boolean(options && typeof options === 'object' && options.lifecycleOnly);
+  if (lifecycleOnly) {
+    const nowMs = getReferenceNowMs();
+    const rows = execQuery(`
+      SELECT id, defer_until
+      FROM issue_overview_mv
+      WHERE LOWER(status) NOT IN ('closed', 'tombstone', 'deferred', 'draft', 'pinned')
+      ORDER BY id
+    `);
+    for (const row of rows) {
+      if (row.defer_until) {
+        const deferMs = Date.parse(row.defer_until);
+        if (Number.isFinite(deferMs) && deferMs > nowMs) continue;
+      }
+      const idx = GRAPH_STATE.nodeMap.get(row.id);
+      if (idx !== undefined) candidates[idx] = 1;
+    }
+    return candidates;
+  }
   const rows = execQuery(`SELECT id FROM issue_overview_mv${actionableOnly ? ' WHERE is_actionable = 1' : ''} ORDER BY id`);
   for (const { id } of rows) {
     const idx = GRAPH_STATE.nodeMap.get(id);
@@ -1355,7 +1396,7 @@ function getTopKSet(k = 5) {
   if (!GRAPH_STATE.ready) return null;
 
   const closedSet = buildClosedSet();
-  const result = GRAPH_STATE.graph.topkSet(closedSet, k, buildCandidateSet());
+  const result = GRAPH_STATE.graph.topkSet(closedSet, k, buildCandidateSet({ lifecycleOnly: true }));
 
   // Enrich with issue IDs
   if (result && result.items) {
@@ -1369,6 +1410,63 @@ function getTopKSet(k = 5) {
   }
 
   return result;
+}
+
+/**
+ * Compute greedy dependency vertex cover from the WASM graph engine
+ */
+function getCoverageSet(limit = 10) {
+  const graph = (GRAPH_STATE.activeGraph && GRAPH_STATE.activeGraph.edgeCount() > 0)
+    ? GRAPH_STATE.activeGraph
+    : GRAPH_STATE.graph;
+  if (!GRAPH_STATE.ready || !graph) return null;
+
+  try {
+    const raw = (limit === 10 && typeof graph.coverageSetDefault === 'function')
+      ? graph.coverageSetDefault()
+      : graph.coverageSet?.(limit);
+    if (!raw || !Array.isArray(raw.items)) {
+      return { items: [], edges_covered: 0, total_edges: 0, coverage_ratio: 0 };
+    }
+
+    const ids = raw.items
+      .map(item => graph.nodeId(item.node))
+      .filter(Boolean);
+    const issueById = new Map();
+    if (ids.length > 0) {
+      const placeholders = ids.map(() => '?').join(',');
+      const rows = execQuery(
+        `SELECT id, title, status, priority FROM issue_overview_mv WHERE id IN (${placeholders})`,
+        ids
+      );
+      for (const row of rows) {
+        issueById.set(row.id, row);
+      }
+    }
+
+    const items = raw.items
+      .map(item => {
+        const issueId = graph.nodeId(item.node);
+        const row = issueById.get(issueId);
+        if (!issueId || !row) return null;
+        return {
+          ...item,
+          issueId,
+          title: row.title || issueId,
+          status: row.status || 'open',
+          priority: row.priority ?? 2,
+        };
+      })
+      .filter(Boolean);
+
+    return {
+      ...raw,
+      items,
+    };
+  } catch (e) {
+    console.warn('[viewer] getCoverageSet failed:', e);
+    return { items: [], edges_covered: 0, total_edges: 0, coverage_ratio: 0 };
+  }
 }
 
 // ============================================================================
@@ -1750,12 +1848,13 @@ function parseLabelsJSON(labelsStr) {
 
 function getGraphViewData() {
   // Pull from issue_overview_mv so the graph sees the same active-blocker
-  // counts the issues view does — closing a blocker drops its dependents'
-  // blocker_count to 0 here too, which getNodeColor uses to derive the
-  // effective "blocked" colouring (bv-issue#143/#144).
+  // counts and dependency_state the issues view does — closing a blocker drops
+  // its dependents' blocker_count to 0 here too, which getNodeColor uses to
+  // derive the effective "blocked" colouring (bv-issue#143/#144).
   const issues = execQuery(`
     SELECT id, title, description, status, priority, issue_type, assignee, labels,
-           created_at, updated_at, closed_at, blocker_count, dependent_count
+           created_at, updated_at, closed_at, blocker_count, dependent_count,
+           dependency_state, is_actionable
     FROM issue_overview_mv
   `).map(row => ({
     id: row.id,
@@ -1773,6 +1872,8 @@ function getGraphViewData() {
     // materialized view (which excludes closed/tombstoned endpoints).
     blocker_count: row.blocker_count ?? 0,
     dependent_count: row.dependent_count ?? 0,
+    dependency_state: row.dependency_state || 'satisfied',
+    is_actionable: Boolean(row.is_actionable),
   }));
 
   const dependencies = execQuery(`
@@ -1913,7 +2014,7 @@ function searchIssues(term, options = {}) {
   sql += ` ORDER BY ${BM25_EXPR} LIMIT ? OFFSET ?`;
   queryParams.push(fetchLimit, fetchOffset);
 
-  const fallbackPoolLimit = Math.max(limit * 4, offset + limit, minCandidates);
+  const UNBOUNDED_SUBSTRING_POOL_LIMIT = 1000000;
   let rows = [];
   let usedFTS = false;
   if (supportsFTS5() && ftsQuery) {
@@ -1921,12 +2022,13 @@ function searchIssues(term, options = {}) {
       rows = execQuery(sql, queryParams);
       usedFTS = true;
     } catch {
-      // Invalid FTS syntax can still use plain substring matching. Continue
-      // through lexical or hybrid ranking cleanly.
-      rows = queryIssues({ ...searchFilters, search: term }, 'score', fallbackPoolLimit, 0);
+      // Invalid FTS syntax can still use plain substring matching. Fetch all
+      // matching rows before lexical/exact-ID/hybrid scoring so low-triage or
+      // closed exact-ID/title matches are never truncated at 200 rows.
+      rows = queryIssues({ ...searchFilters, search: term }, 'score', UNBOUNDED_SUBSTRING_POOL_LIMIT, 0);
     }
   } else {
-    rows = queryIssues({ ...searchFilters, search: term }, 'score', fallbackPoolLimit, 0);
+    rows = queryIssues({ ...searchFilters, search: term }, 'score', UNBOUNDED_SUBSTRING_POOL_LIMIT, 0);
   }
 
   if (mode !== 'hybrid' || typeof HybridScorer === 'undefined' || typeof HYBRID_PRESETS === 'undefined') {
@@ -1969,6 +2071,7 @@ function searchIssues(term, options = {}) {
     ? Math.max(...bm25Rows.map(r => Math.abs(Number(r.bm25_score))), 0)
     : 0;
   const { hasMetrics, maxPageRank } = getPageRankBounds();
+  const maxBlockerCount = getMaxBlocksCount();
   const normalized = rows.map(r => {
     const hasBM25 = r.bm25_score !== undefined && r.bm25_score !== null && Number.isFinite(Number(r.bm25_score));
     const textScore = hasBM25
@@ -1997,12 +2100,13 @@ function searchIssues(term, options = {}) {
 
   const baseWeights = HYBRID_PRESETS[preset] || HYBRID_PRESETS.default;
   const weights = adjustHybridWeightsForQuery(baseWeights, term);
+  const scorerOptions = { maxBlockerCount };
   let ranked = null;
   if (typeof window.scoreBatchHybrid === 'function') {
-    ranked = window.scoreBatchHybrid(normalized, weights);
+    ranked = window.scoreBatchHybrid(normalized, weights, scorerOptions);
   }
   if (!Array.isArray(ranked)) {
-    const scorer = new HybridScorer(weights);
+    const scorer = new HybridScorer(weights, scorerOptions);
     ranked = scorer.scoreAndRank(normalized);
   }
   if (isLikelyIssueID(term)) {
@@ -2033,41 +2137,57 @@ function computeLexicalTextScore(row, query) {
   const labels = normalizeSearchText(row.labels).toLowerCase();
   const assignee = normalizeSearchText(row.assignee).toLowerCase();
   const description = normalizeSearchText(row.description).toLowerCase();
-
-  if (id === q || title === q) return 1.0;
-  if (id.startsWith(q) || title.startsWith(q)) return 0.95;
-  if (title.includes(q)) return 0.9;
-
-  const titleMatches = terms.filter(t => title.includes(t)).length;
-  if (titleMatches > 0) {
-    const titleWords = extractSearchWordParts(title);
-    const prefixHits = terms.filter(t => titleWords.some(w => w.startsWith(t))).length;
-    const score = 0.75 + 0.15 * (titleMatches / terms.length) + 0.05 * (prefixHits / terms.length);
-    return Math.min(0.95, Math.max(0.75, score));
-  }
-
-  if (terms.some(t => id.includes(t) || labels.includes(t) || assignee.includes(t))) {
-    return 0.65;
-  }
-
-  const descMatches = terms.filter(t => description.includes(t)).length;
-  if (descMatches > 0) {
-    return Math.min(0.55, 0.45 + 0.10 * (descMatches / terms.length));
-  }
-
   const extraText = normalizeSearchText(
     [row.notes, row.design, row.acceptance_criteria, row.external_ref]
       .filter(Boolean)
       .join(' ')
   ).toLowerCase();
-  if (extraText) {
-    const extraMatches = terms.filter(t => extraText.includes(t)).length;
-    if (extraMatches > 0) {
-      return Math.min(0.45, 0.40 + 0.05 * (extraMatches / terms.length));
+
+  if (id === q || title === q) return 1.0;
+
+  let baseScore = 0.35;
+  let hasTitleOrIdMatch = false;
+  if (id.startsWith(q) || title.startsWith(q)) {
+    baseScore = 0.95;
+    hasTitleOrIdMatch = true;
+  } else if (title.includes(q)) {
+    baseScore = 0.9;
+    hasTitleOrIdMatch = true;
+  } else {
+    const titleMatches = terms.filter(t => title.includes(t)).length;
+    if (titleMatches > 0) {
+      const titleWords = extractSearchWordParts(title);
+      const prefixHits = terms.filter(t => titleWords.some(w => w.startsWith(t))).length;
+      const score = 0.75 + 0.15 * (titleMatches / terms.length) + 0.05 * (prefixHits / terms.length);
+      baseScore = Math.min(0.95, Math.max(0.75, score));
+      hasTitleOrIdMatch = true;
+    } else if (terms.some(t => id.includes(t) || labels.includes(t) || assignee.includes(t))) {
+      baseScore = 0.65;
+      hasTitleOrIdMatch = terms.some(t => id.includes(t));
+    } else {
+      const descMatches = terms.filter(t => description.includes(t)).length;
+      if (descMatches > 0) {
+        baseScore = Math.min(0.55, 0.45 + 0.10 * (descMatches / terms.length));
+      } else if (extraText) {
+        const extraMatches = terms.filter(t => extraText.includes(t)).length;
+        if (extraMatches > 0) {
+          baseScore = Math.min(0.45, 0.40 + 0.05 * (extraMatches / terms.length));
+        }
+      }
     }
   }
 
-  return 0.35;
+  // Apply +0.35 shortQueryLexicalBoost on short queries (<=2 tokens or <=12 chars)
+  // when every query token matches across searchable fields, keeping non-title/ID
+  // matches strictly below exact/title matches (capped at 0.92 vs 1.0).
+  if (isShortQuery(q)) {
+    const searchableAll = [id, title, labels, assignee, description, extraText].join(' ');
+    if (terms.every(t => searchableAll.includes(t))) {
+      return Math.min(hasTitleOrIdMatch ? 1.0 : 0.92, baseScore + 0.35);
+    }
+  }
+
+  return baseScore;
 }
 
 /**
@@ -2082,6 +2202,20 @@ function getPageRankBounds() {
     return { hasMetrics: count > 0, maxPageRank: Number.isFinite(maxPR) ? maxPR : 0 };
   } catch {
     return { hasMetrics: false, maxPageRank: 0 };
+  }
+}
+
+/**
+ * Inspect corpus-global maximum downstream blocks_count so hybrid impact
+ * normalization matches Go's corpus-wide maxBlockerCount rather than subset max.
+ */
+function getMaxBlocksCount() {
+  try {
+    const rows = execQuery('SELECT MAX(COALESCE(blocks_count, dependent_count, 0)) AS max_blocks FROM issue_overview_mv');
+    const maxBlocks = Number(rows?.[0]?.max_blocks || 0);
+    return Number.isFinite(maxBlocks) && maxBlocks > 0 ? maxBlocks : 0;
+  } catch {
+    return 0;
   }
 }
 
@@ -2580,21 +2714,56 @@ function getIssuesBySlack(limit = 10, showZeroSlack = true) {
 function getCycleInfo() {
   const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
   if (!GRAPH_STATE.ready || !activeGraph) {
-    return { hasCycles: false, cycleCount: 0, suggestions: null };
+    return {
+      hasCycles: false,
+      cycleCount: 0,
+      truncated: false,
+      sccCount: 0,
+      nonTrivialSccCount: 0,
+      largestSccSize: 0,
+      sccComponents: [],
+      suggestions: null,
+    };
   }
 
   const hasCycles = activeGraph.hasCycles();
+  const scc = hasCycles && typeof activeGraph.tarjanScc === 'function'
+    ? activeGraph.tarjanScc()
+    : null;
+  const rawComponents = Array.isArray(scc?.components) ? scc.components : [];
+  const nonTrivialComponents = rawComponents.filter(comp => {
+    if (!Array.isArray(comp) || comp.length === 0) return false;
+    if (comp.length > 1) return true;
+    const u = comp[0];
+    const succ = typeof activeGraph.successors === 'function' ? activeGraph.successors(u) : [];
+    return Array.isArray(succ) && succ.includes(u);
+  });
+  const largestSccSize = nonTrivialComponents.reduce((max, comp) => Math.max(max, comp.length), 0);
+  const sccComponents = nonTrivialComponents.map(comp =>
+    comp.map(idx => activeGraph.nodeId(idx)).filter(Boolean)
+  );
+
+  const enumInfo = hasCycles && typeof activeGraph.enumerateCycles === 'function'
+    ? activeGraph.enumerateCycles(100)
+    : null;
   const suggestions = hasCycles ? getCycleBreakSuggestions(5) : null;
   if (suggestions && !suggestions.suggestions && Array.isArray(suggestions.top_suggestions)) {
     suggestions.suggestions = suggestions.top_suggestions;
   }
   const cycleCount = suggestions?.total_cycles
     ?? suggestions?.cycles?.length
-    ?? (hasCycles ? (activeGraph.enumerateCycles?.(100)?.count ?? 0) : 0);
+    ?? enumInfo?.count
+    ?? 0;
+  const truncated = Boolean(suggestions?.truncated || enumInfo?.truncated);
 
   return {
     hasCycles,
     cycleCount,
+    truncated,
+    sccCount: rawComponents.length,
+    nonTrivialSccCount: scc?.cycle_count ?? nonTrivialComponents.length,
+    largestSccSize,
+    sccComponents,
     suggestions,
   };
 }
@@ -3582,14 +3751,22 @@ function beadsApp() {
     criticalPathSlack: [], // Issues with 0 slack (on critical path)
     flexibleSlackIssues: [], // Issues with positive schedule slack
     cycleInfo: null,
+    coverageSet: null,
     topImpactIssues: [],
     includeBlockedWhatIf: false,
     parallelCutData: null,
     parallelCutIssues: [],
     bridgeEdges: [],
 
+    // Transitive dependency cone isolation in Graph view
+    dependencyConeActive: false,
+    dependencyConeFocusId: null,
+    dependencyConeCount: 0,
+
     // Full triage data from triage.json (robot mode output)
     triageData: null,
+    triageRecView: 'top', // 'top' | 'track' | 'label'
+    copiedCommandText: '',
     showTriageJson: false, // Modal for raw JSON view
 
     /**
@@ -3623,8 +3800,14 @@ function beadsApp() {
       this.$watch('selectedIssue', updateBodyScrollLock);
       this.$watch('graphDetailNode', updateBodyScrollLock);
 
-      // Scroll to top on view change (respect reduced motion preference)
+      // Scroll to top on view change, hide stray graph tooltips, and guard direct view transitions
       this.$watch('view', (newView, oldView) => {
+        if (oldView === 'graph' && newView !== 'graph') {
+          this.forceGraphModule?.hideTooltip?.();
+        }
+        if (newView === 'graph' && !this.forceGraphReady && !this.forceGraphLoading && DB_STATE.db) {
+          this.$nextTick(() => this.initForceGraphView());
+        }
         if (newView !== oldView && !this.selectedIssue && !this.graphDetailNode) {
           const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
           window.scrollTo({ top: 0, behavior: prefersReducedMotion ? 'auto' : 'smooth' });
@@ -3637,10 +3820,19 @@ function beadsApp() {
           this.darkMode = e.matches;
           document.documentElement.classList.toggle('dark', this.darkMode);
           window.BVCharts?.applyTheme?.(this.darkMode);
+          this.forceGraphModule?.setGraphTheme?.(this.darkMode);
           // Re-render Mermaid graphs if visible
           if (this.showDepGraph && this.selectedIssue) {
             this.renderDepGraph();
           }
+        }
+      });
+
+      // Close coarse-pointer / click-opened .metric-tooltip cards when clicking outside
+      document.addEventListener('click', (e) => {
+        if (!e.target?.closest?.('.metric-tooltip-trigger')) {
+          document.querySelectorAll('.metric-tooltip.tooltip-visible').forEach(el => el.classList.remove('tooltip-visible'));
+          document.querySelectorAll('.metric-tooltip-trigger.tooltip-open').forEach(el => el.classList.remove('tooltip-open'));
         }
       });
 
