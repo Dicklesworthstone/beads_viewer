@@ -144,31 +144,43 @@ func (d SourceDiff) Summary() string {
 type DiffOptions struct {
 	// IncludeTombstones includes tombstone/deleted issues in comparison
 	IncludeTombstones bool
-	// CompareFields specifies which fields to compare (empty = just status)
+	// CompareFields specifies which fields to compare (empty = DefaultDiffOptions().CompareFields)
 	CompareFields []string
 	// MaxDifferences limits the number of differences tracked (0 = unlimited)
 	MaxDifferences int
 }
 
+var defaultSourceCompareFields = []string{
+	"status",
+	"priority",
+	"title",
+	"dependencies",
+	"assignee",
+	"labels",
+	"defer_until",
+}
+
 // DefaultDiffOptions returns sensible default diff options
 func DefaultDiffOptions() DiffOptions {
+	fields := make([]string, len(defaultSourceCompareFields))
+	copy(fields, defaultSourceCompareFields)
 	return DiffOptions{
 		IncludeTombstones: false,
-		CompareFields:     []string{"status"},
+		CompareFields:     fields,
 		MaxDifferences:    100,
 	}
 }
 
 func normalizeCompareFields(fields []string) []string {
 	if len(fields) == 0 {
-		fields = DefaultDiffOptions().CompareFields
+		fields = defaultSourceCompareFields
 	}
 	seen := make(map[string]bool, len(fields))
 	out := make([]string, 0, len(fields))
 	for _, raw := range fields {
 		norm := strings.ToLower(strings.TrimSpace(raw))
 		switch norm {
-		case "status", "priority", "title":
+		case "status", "priority", "title", "dependencies", "assignee", "labels", "defer_until":
 			if !seen[norm] {
 				seen[norm] = true
 				out = append(out, norm)
@@ -176,6 +188,82 @@ func normalizeCompareFields(fields []string) []string {
 		}
 	}
 	return out
+}
+
+func canonicalSourceDependencies(deps []*model.Dependency) string {
+	if len(deps) == 0 {
+		return ""
+	}
+	type depPair struct {
+		target string
+		kind   string
+	}
+	seen := make(map[depPair]struct{}, len(deps))
+	pairs := make([]depPair, 0, len(deps))
+	for _, dep := range deps {
+		if dep == nil {
+			continue
+		}
+		target := strings.TrimSpace(dep.DependsOnID)
+		if target == "" {
+			continue
+		}
+		kind := strings.ToLower(strings.TrimSpace(string(dep.Type)))
+		if kind == "" {
+			kind = string(model.DepBlocks)
+		}
+		p := depPair{target: target, kind: kind}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		pairs = append(pairs, p)
+	}
+	if len(pairs) == 0 {
+		return ""
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].target != pairs[j].target {
+			return pairs[i].target < pairs[j].target
+		}
+		return pairs[i].kind < pairs[j].kind
+	})
+	parts := make([]string, len(pairs))
+	for i, p := range pairs {
+		parts[i] = p.target + ":" + p.kind
+	}
+	return strings.Join(parts, ", ")
+}
+
+func canonicalSourceLabels(labels []string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	seen := make(map[string]struct{}, len(labels))
+	unique := make([]string, 0, len(labels))
+	for _, raw := range labels {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		if _, dup := seen[trimmed]; dup {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		unique = append(unique, trimmed)
+	}
+	if len(unique) == 0 {
+		return ""
+	}
+	sort.Strings(unique)
+	return strings.Join(unique, ", ")
+}
+
+func canonicalSourceDeferUntil(t *time.Time) string {
+	if t == nil || t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 // DetectInconsistencies compares two sets of issues and returns differences
@@ -341,6 +429,98 @@ func DetectInconsistencies(issuesA, issuesB []model.Issue, sourceA, sourceB stri
 					})
 					recorded++
 				}
+			case "dependencies":
+				valA := canonicalSourceDependencies(issueA.Dependencies)
+				valB := canonicalSourceDependencies(issueB.Dependencies)
+				if valA != valB {
+					diff.FieldMismatches = append(diff.FieldMismatches, FieldDifference{
+						ID:     id,
+						Field:  "dependencies",
+						ValueA: valA,
+						ValueB: valB,
+					})
+					diff.IssueDiffs = append(diff.IssueDiffs, IssueSourceDiff{
+						IssueID:    id,
+						Field:      "dependencies",
+						Difference: "dependencies mismatch",
+						SourceA:    sourceA,
+						SourceB:    sourceB,
+						ValueA:     valA,
+						ValueB:     valB,
+						UpdatedAtA: issueA.UpdatedAt,
+						UpdatedAtB: issueB.UpdatedAt,
+					})
+					recorded++
+				}
+			case "assignee":
+				valA := strings.TrimSpace(issueA.Assignee)
+				valB := strings.TrimSpace(issueB.Assignee)
+				if valA != valB {
+					diff.FieldMismatches = append(diff.FieldMismatches, FieldDifference{
+						ID:     id,
+						Field:  "assignee",
+						ValueA: valA,
+						ValueB: valB,
+					})
+					diff.IssueDiffs = append(diff.IssueDiffs, IssueSourceDiff{
+						IssueID:    id,
+						Field:      "assignee",
+						Difference: "assignee mismatch",
+						SourceA:    sourceA,
+						SourceB:    sourceB,
+						ValueA:     valA,
+						ValueB:     valB,
+						UpdatedAtA: issueA.UpdatedAt,
+						UpdatedAtB: issueB.UpdatedAt,
+					})
+					recorded++
+				}
+			case "labels":
+				valA := canonicalSourceLabels(issueA.Labels)
+				valB := canonicalSourceLabels(issueB.Labels)
+				if valA != valB {
+					diff.FieldMismatches = append(diff.FieldMismatches, FieldDifference{
+						ID:     id,
+						Field:  "labels",
+						ValueA: valA,
+						ValueB: valB,
+					})
+					diff.IssueDiffs = append(diff.IssueDiffs, IssueSourceDiff{
+						IssueID:    id,
+						Field:      "labels",
+						Difference: "labels mismatch",
+						SourceA:    sourceA,
+						SourceB:    sourceB,
+						ValueA:     valA,
+						ValueB:     valB,
+						UpdatedAtA: issueA.UpdatedAt,
+						UpdatedAtB: issueB.UpdatedAt,
+					})
+					recorded++
+				}
+			case "defer_until":
+				valA := canonicalSourceDeferUntil(issueA.DeferUntil)
+				valB := canonicalSourceDeferUntil(issueB.DeferUntil)
+				if valA != valB {
+					diff.FieldMismatches = append(diff.FieldMismatches, FieldDifference{
+						ID:     id,
+						Field:  "defer_until",
+						ValueA: valA,
+						ValueB: valB,
+					})
+					diff.IssueDiffs = append(diff.IssueDiffs, IssueSourceDiff{
+						IssueID:    id,
+						Field:      "defer_until",
+						Difference: "defer_until mismatch",
+						SourceA:    sourceA,
+						SourceB:    sourceB,
+						ValueA:     valA,
+						ValueB:     valB,
+						UpdatedAtA: issueA.UpdatedAt,
+						UpdatedAtB: issueB.UpdatedAt,
+					})
+					recorded++
+				}
 			}
 		}
 	}
@@ -378,18 +558,18 @@ func loadIssuesFromSource(source DataSource) ([]model.Issue, error) {
 	return loaded.Issues, err
 }
 
-// CheckSourcesConsistent compares all valid sources across status, priority, and title.
+// CheckSourcesConsistent compares all valid sources across all default source-drift fields.
 func CheckSourcesConsistent(sources []DataSource) ([]SourceDiff, error) {
 	return CheckAllSourcesConsistent(sources, DiffOptions{
 		MaxDifferences: 0,
-		CompareFields:  []string{"status", "priority", "title"},
+		CompareFields:  append([]string(nil), defaultSourceCompareFields...),
 	})
 }
 
 // CheckAllSourcesConsistent compares all sources and reports any inconsistencies
 func CheckAllSourcesConsistent(sources []DataSource, opts DiffOptions) ([]SourceDiff, error) {
 	if len(opts.CompareFields) == 0 {
-		opts.CompareFields = []string{"status", "priority", "title"}
+		opts.CompareFields = append([]string(nil), defaultSourceCompareFields...)
 	}
 	var diffs []SourceDiff
 
