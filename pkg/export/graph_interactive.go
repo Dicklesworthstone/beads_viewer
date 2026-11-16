@@ -1,7 +1,6 @@
 package export
 
 import (
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -15,11 +14,23 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
-//go:embed force-graph.min.js
-var forceGraphJS string
+func loadEmbeddedVendorScript(name string) (string, error) {
+	raw, err := ViewerAssetsFS.ReadFile("viewer_assets/vendor/" + name)
+	if err != nil {
+		return "", fmt.Errorf("read embedded vendor script %s: %w", name, err)
+	}
+	return string(raw), nil
+}
 
-//go:embed marked.min.js
-var markedJS string
+func resolveInteractiveExportTime(exportedAt time.Time) time.Time {
+	if !exportedAt.IsZero() {
+		return exportedAt
+	}
+	if ts, ok := sourceDateEpochTime(); ok {
+		return ts
+	}
+	return time.Now()
+}
 
 // InteractiveGraphOptions configures HTML graph generation
 type InteractiveGraphOptions struct {
@@ -31,6 +42,7 @@ type InteractiveGraphOptions struct {
 	DataHash      string
 	Path          string // Output path - if empty, auto-generates based on project
 	ProjectName   string // Project name for auto-naming
+	ExportedAt    time.Time
 	RobotEnvelope map[string]json.RawMessage
 }
 
@@ -59,6 +71,7 @@ type graphNode struct {
 	ClosedAt    string `json:"closed_at,omitempty"`
 	DueDate     string `json:"due_date,omitempty"`
 	DeferUntil  string `json:"defer_until,omitempty"`
+	IsDeferred  bool   `json:"is_deferred,omitempty"`
 	ExternalRef string `json:"external_ref,omitempty"`
 
 	// Dependencies
@@ -98,9 +111,12 @@ type graphLink struct {
 // GenerateInteractiveGraphFilename creates an auto-generated filename
 // Format: {project}_graph_export__as_of__YYYY_MM_DD__HH_MM__git_head_hash__{gitshort}.html
 func GenerateInteractiveGraphFilename(projectName string) string {
-	now := time.Now()
-	dateStr := now.Format("2006_01_02")
-	timeStr := now.Format("15_04")
+	return generateInteractiveGraphFilenameAt(projectName, resolveInteractiveExportTime(time.Time{}))
+}
+
+func generateInteractiveGraphFilenameAt(projectName string, exportTime time.Time) string {
+	dateStr := exportTime.Format("2006_01_02")
+	timeStr := exportTime.Format("15_04")
 
 	// Get short git commit hash
 	gitShort := "nogit"
@@ -121,6 +137,16 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 	if len(opts.Issues) == 0 {
 		return "", fmt.Errorf("no issues to export")
 	}
+
+	forceGraphLib, err := loadEmbeddedVendorScript("force-graph.min.js")
+	if err != nil {
+		return "", err
+	}
+	markedLib, err := loadEmbeddedVendorScript("marked.min.js")
+	if err != nil {
+		return "", err
+	}
+	exportTime := resolveInteractiveExportTime(opts.ExportedAt)
 
 	// Build graph data with all metrics
 	nodes := make([]graphNode, 0, len(opts.Issues))
@@ -215,8 +241,12 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			dueDate = iss.DueDate.Format("2006-01-02")
 		}
 		deferUntil := ""
+		isDeferred := iss.Status == model.StatusDeferred
 		if iss.DeferUntil != nil {
 			deferUntil = iss.DeferUntil.Format("2006-01-02")
+			if iss.DeferUntil.After(exportTime) {
+				isDeferred = true
+			}
 		}
 		externalRef := ""
 		if iss.ExternalRef != nil {
@@ -259,6 +289,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			ClosedAt:    closedAt,
 			DueDate:     dueDate,
 			DeferUntil:  deferUntil,
+			IsDeferred:  isDeferred,
 			ExternalRef: externalRef,
 
 			// Dependencies
@@ -322,6 +353,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		"links":           links,
 		"slack_available": slackAvailable,
 		"has_cycles":      hasCycles,
+		"exported_at_ms":  exportTime.UTC().UnixMilli(),
 	}
 	for key, value := range opts.RobotEnvelope {
 		graphData[key] = value
@@ -355,7 +387,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		if projectName == "" {
 			projectName = "graph"
 		}
-		outputPath = GenerateInteractiveGraphFilename(projectName)
+		outputPath = generateInteractiveGraphFilenameAt(projectName, exportTime)
 	} else if err := validateExistingPathNotSymlinkOrDir(outputPath); err != nil {
 		return "", err
 	}
@@ -365,7 +397,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		outputPath = strings.TrimSuffix(outputPath, filepath.Ext(outputPath)) + ".html"
 	}
 
-	html := generateUltimateHTML(title, opts.DataHash, string(dataJSON), len(nodes), len(links), opts.ProjectName, forceGraphJS, markedJS)
+	html := generateUltimateHTMLWithTime(title, opts.DataHash, string(dataJSON), len(nodes), len(links), opts.ProjectName, forceGraphLib, markedLib, exportTime)
 
 	if err := SafeWriteOutput(outputPath, []byte(html), 0o644); err != nil {
 		return "", err

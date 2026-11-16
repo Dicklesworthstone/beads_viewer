@@ -87,7 +87,11 @@ func buildCustomFilterOptionsHTML(graphDataJSON string) (string, string) {
 
 // generateUltimateHTML creates the enhanced HTML visualization with all features
 func generateUltimateHTML(title, dataHash, graphDataJSON string, nodeCount, edgeCount int, projectName, forceGraphLib, markedLib string) string {
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	return generateUltimateHTMLWithTime(title, dataHash, graphDataJSON, nodeCount, edgeCount, projectName, forceGraphLib, markedLib, resolveInteractiveExportTime(time.Time{}))
+}
+
+func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCount, edgeCount int, projectName, forceGraphLib, markedLib string, exportTime time.Time) string {
+	timestamp := exportTime.Format("2006-01-02 15:04:05")
 	safeTitle := html.EscapeString(title)
 	safeHash := html.EscapeString(dataHash)
 	safeProject := html.EscapeString(projectName)
@@ -1193,9 +1197,20 @@ DATA.links.forEach(l => {
         blockerSetByNode[src].add(tgt);
     }
 });
+const EXPORT_NOW_MS = typeof DATA.exported_at_ms === 'number' ? DATA.exported_at_ms : Date.now();
+function isNodeDeferred(n) {
+    if (!n) return false;
+    if (n.status === 'deferred' || Boolean(n.is_deferred)) return true;
+    if (n.defer_until) {
+        const parsed = Date.parse(n.defer_until);
+        if (!Number.isNaN(parsed) && parsed > EXPORT_NOW_MS) return true;
+    }
+    return false;
+}
+
 DATA.nodes.forEach(n => {
     n.blockerCount = isActiveNodeStatus(n.status) && blockerSetByNode[n.id] ? blockerSetByNode[n.id].size : 0;
-    if ((n.status === 'open' || n.status === 'in_progress') && n.blockerCount === 0) actionable++;
+    if ((n.status === 'open' || n.status === 'in_progress') && !isNodeDeferred(n) && n.blockerCount === 0) actionable++;
     if (n.status === 'blocked' || (isActiveNodeStatus(n.status) && n.blockerCount > 0)) blocked++;
     if (n.slack_available !== false && isActiveNodeStatus(n.status) && n.slack === 0) onCriticalPath++;
     if (n.is_articulation) articulationCount++;
@@ -1211,7 +1226,7 @@ const maxBW = Math.max(...DATA.nodes.map(n => n.betweenness || 0), 0.001);
 const maxCP = Math.max(...DATA.nodes.map(n => n.critical_path || 0), 1);
 const maxInDeg = Math.max(...DATA.nodes.map(n => n.in_degree || 0), 1);
 
-let sizeMetric = 'pagerank', heatmapMode = false, hoveredNode = null, highlightedNodes = new Set(), activePathNodes = null;
+let sizeMetric = 'pagerank', heatmapMode = false, hoveredNode = null, highlightedNodes = new Set(), activePathNodes = null, isDarkMode = true;
 const recentlyViewed = [];
 const MAX_RECENT = 8;
 
@@ -1313,6 +1328,27 @@ function applyGraphDagMode(mode) {
     return true;
 }
 
+function computeLinkColor(l) {
+    const src = typeof l.source === 'object' ? l.source.id : l.source;
+    const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+    if (highlightedNodes.size > 0) {
+        if (highlightedNodes.has(src) && highlightedNodes.has(tgt)) return isDarkMode ? '#fbbf24aa' : '#d97706cc';
+        return isDarkMode ? '#44475a15' : '#94a3b833';
+    }
+    if (l.critical) return isDarkMode ? '#ec489980' : '#db277799';
+    return isDarkMode ? '#44475a40' : '#64748b80';
+}
+
+function computeLinkArrowColor(l) {
+    const src = typeof l.source === 'object' ? l.source.id : l.source;
+    const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+    if (highlightedNodes.size > 0 && highlightedNodes.has(src) && highlightedNodes.has(tgt)) {
+        return isDarkMode ? '#fbbf24' : '#d97706';
+    }
+    if (l.critical) return isDarkMode ? '#ec4899' : '#db2777';
+    return isDarkMode ? '#44475a' : '#475569';
+}
+
 const Graph = ForceGraph()(container)
     .onDagError(() => handleDagCycleError())
     .graphData(JSON.parse(JSON.stringify(DATA)))
@@ -1321,15 +1357,7 @@ const Graph = ForceGraph()(container)
     .nodeLabel(null)
     .nodeColor(computeNodeColor)
     .nodeVal(n => getNodeSize(n))
-    .linkColor(l => {
-        const src = typeof l.source === 'object' ? l.source.id : l.source;
-        const tgt = typeof l.target === 'object' ? l.target.id : l.target;
-        if (highlightedNodes.size > 0) {
-            if (highlightedNodes.has(src) && highlightedNodes.has(tgt)) return '#fbbf24aa';
-            return '#44475a15';
-        }
-        return l.critical ? '#ec489980' : '#44475a40';
-    })
+    .linkColor(computeLinkColor)
     .linkWidth(l => {
         const src = typeof l.source === 'object' ? l.source.id : l.source;
         const tgt = typeof l.target === 'object' ? l.target.id : l.target;
@@ -1337,12 +1365,7 @@ const Graph = ForceGraph()(container)
         return l.critical ? 2 : 1;
     })
     .linkDirectionalArrowLength(5)
-    .linkDirectionalArrowColor(l => {
-        const src = typeof l.source === 'object' ? l.source.id : l.source;
-        const tgt = typeof l.target === 'object' ? l.target.id : l.target;
-        if (highlightedNodes.size > 0 && highlightedNodes.has(src) && highlightedNodes.has(tgt)) return '#fbbf24';
-        return l.critical ? '#ec4899' : '#44475a';
-    })
+    .linkDirectionalArrowColor(computeLinkArrowColor)
     .linkDirectionalArrowRelPos(1)
     .linkCurvature(0.1)
     .linkDirectionalParticles(l => l.critical ? 2 : 0)
@@ -1784,9 +1807,15 @@ let contextNode = null;
 function showContextMenu(node, event) {
     contextNode = node;
     const menu = document.getElementById('context-menu');
-    menu.style.left = event.clientX + 'px';
-    menu.style.top = event.clientY + 'px';
     menu.classList.add('visible');
+    const rect = menu.getBoundingClientRect();
+    const menuW = rect.width || menu.offsetWidth || 220;
+    const menuH = rect.height || menu.offsetHeight || 280;
+    const pad = 8;
+    const maxLeft = Math.max(pad, window.innerWidth - menuW - pad);
+    const maxTop = Math.max(pad, window.innerHeight - menuH - pad);
+    menu.style.left = Math.max(pad, Math.min(event.clientX, maxLeft)) + 'px';
+    menu.style.top = Math.max(pad, Math.min(event.clientY, maxTop)) + 'px';
 }
 function hideContextMenu() { document.getElementById('context-menu').classList.remove('visible'); contextNode = null; }
 async function writeClipboardText(value) {
@@ -1957,7 +1986,7 @@ function applyFilters() {
 
         if (statusFilter && statusFilter !== 'all') {
             if (statusFilter === 'actionable') {
-                if (!((n.status === 'open' || n.status === 'in_progress') && (n.blockerCount || 0) === 0)) return false;
+                if (!((n.status === 'open' || n.status === 'in_progress') && !isNodeDeferred(n) && (n.blockerCount || 0) === 0)) return false;
             } else if (statusFilter === 'blocked') {
                 if (!(n.status === 'blocked' || (isActiveNodeStatus(n.status) && (n.blockerCount || 0) > 0))) return false;
             } else if (n.status !== statusFilter) {
@@ -2020,15 +2049,8 @@ document.getElementById('btn-reset').onclick = () => {
     Graph.dagMode(null);
     Graph.nodeVal(n => getNodeSize(n));
     Graph.nodeColor(computeNodeColor);
-    Graph.linkColor(l => {
-        const src = typeof l.source === 'object' ? l.source.id : l.source;
-        const tgt = typeof l.target === 'object' ? l.target.id : l.target;
-        if (highlightedNodes.size > 0) {
-            if (highlightedNodes.has(src) && highlightedNodes.has(tgt)) return '#fbbf24aa';
-            return '#44475a15';
-        }
-        return l.critical ? '#ec489980' : '#44475a40';
-    });
+    Graph.linkColor(computeLinkColor);
+    Graph.linkDirectionalArrowColor(computeLinkArrowColor);
     Graph.linkWidth(Graph.linkWidth());
     applyFilters();
     clearSelection();
@@ -2113,7 +2135,6 @@ function showToast(msg) {
 }
 
 // Light/Dark mode toggle
-let isDarkMode = true;
 function toggleLightMode() {
     isDarkMode = !isDarkMode;
     document.body.classList.toggle('light-mode', !isDarkMode);
@@ -2122,6 +2143,8 @@ function toggleLightMode() {
     btn.title = isDarkMode ? 'Switch to light mode (L)' : 'Switch to dark mode (L)';
     localStorage.setItem('bv-graph-theme', isDarkMode ? 'dark' : 'light');
     Graph.nodeColor(Graph.nodeColor());
+    Graph.linkColor(computeLinkColor);
+    Graph.linkDirectionalArrowColor(computeLinkArrowColor);
     updateMinimap();
 }
 
