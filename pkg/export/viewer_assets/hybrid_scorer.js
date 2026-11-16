@@ -12,9 +12,15 @@ const HYBRID_PRESETS = {
 };
 
 class HybridScorer {
-  constructor(weights = HYBRID_PRESETS.default) {
+  constructor(weights = HYBRID_PRESETS.default, options = {}) {
     this.weights = { ...weights };
     this.maxBlockerCount = 0;
+    const configuredMax = options?.maxBlockerCount;
+    this.configuredMaxBlockerCount = (
+      typeof configuredMax === 'number' &&
+      Number.isFinite(configuredMax) &&
+      configuredMax >= 0
+    ) ? configuredMax : null;
   }
 
   score(result) {
@@ -54,7 +60,9 @@ class HybridScorer {
       (max, r) => Math.max(max, r.blockerCount ?? r.impact ?? r.blocks_count ?? r.dependent_count ?? 0),
       0
     );
-    this.maxBlockerCount = maxBlocker;
+    this.maxBlockerCount = this.configuredMaxBlockerCount !== null
+      ? Math.max(maxBlocker, this.configuredMaxBlockerCount)
+      : maxBlocker;
 
     return results
       .map(r => this.score(r))

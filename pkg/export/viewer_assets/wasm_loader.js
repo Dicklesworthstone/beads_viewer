@@ -144,21 +144,27 @@ async function initHybridWasmScorer(issueCount, meta = null) {
   }
 }
 
-function scoreBatchHybridFallback(results, weights) {
+function scoreBatchHybridFallback(results, weights, options = {}) {
   if (typeof HybridScorer === 'undefined') {
     return results;
   }
-  const scorer = new HybridScorer(weights);
+  const scorer = new HybridScorer(weights, options);
   return scorer.scoreAndRank(results);
 }
 
-function scoreBatchHybrid(results, weights) {
+function scoreBatchHybrid(results, weights, options = {}) {
   if (!Array.isArray(results) || results.length === 0) {
     return [];
   }
 
-  if (!HybridWasmCtor) {
-    return scoreBatchHybridFallback(results, weights);
+  const configuredMax = (
+    typeof options?.maxBlockerCount === 'number' &&
+    Number.isFinite(options.maxBlockerCount) &&
+    options.maxBlockerCount >= 0
+  ) ? options.maxBlockerCount : null;
+
+  if (!HybridWasmCtor || configuredMax !== null) {
+    return scoreBatchHybridFallback(results, weights, options);
   }
 
   const payload = results.map(r => ({

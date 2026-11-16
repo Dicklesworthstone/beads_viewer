@@ -12,8 +12,29 @@
 // THEME & CONSTANTS
 // ============================================================================
 
+const THEME_PALETTES = {
+    dark: {
+        bg: '#282a36',
+        bgSecondary: '#44475a',
+        bgTertiary: '#21222c',
+        fg: '#f8f8f2',
+        fgMuted: '#6272a4',
+        linkDefault: '#44475a'
+    },
+    light: {
+        bg: '#f8fafc',
+        bgSecondary: '#ffffff',
+        bgTertiary: '#f1f5f9',
+        fg: '#0f172a',
+        fgMuted: '#475569',
+        linkDefault: '#94a3b8'
+    }
+};
+
+let currentGraphDarkMode = true;
+
 const THEME = {
-    // Dracula-inspired palette
+    // Dracula-inspired palette (default dark; dynamically switched via setGraphTheme)
     bg: '#282a36',
     bgSecondary: '#44475a',
     bgTertiary: '#21222c',
@@ -906,8 +927,18 @@ export async function initGraph(containerId, options = {}) {
     // Merge config
     Object.assign(store.config, options);
 
-    // Clear container
+    // Clear container and ensure relative positioning for scoped overlays
     store.container.innerHTML = '';
+    if (!store.container.style.position) {
+        store.container.style.position = 'relative';
+    }
+    tooltipEl = null;
+    labelLegendEl = null;
+
+    const initialDark = typeof options.darkMode === 'boolean'
+        ? options.darkMode
+        : (typeof document !== 'undefined' ? document.documentElement.classList.contains('dark') : true);
+    applyThemePalette(initialDark);
 
     // Initialize WASM
     await initWasm();
@@ -1110,6 +1141,7 @@ export function loadData(issues, dependencies, layout = null) {
     resetWhatIf();
     resetCriticalPath();
     resetCycleNavigator();
+    resetDependencyCone();
     store.reset();
     store.issues = issues;
     store.dependencies = dependencies;
@@ -1264,6 +1296,8 @@ function prepareGraphData(layout = null) {
             // (bv-issue#143/#144). Fall back to blocking dependency-row counts.
             blockerCount,
             dependentCount,
+            dependencyState: issue.dependency_state || 'satisfied',
+            isActionable: issue.is_actionable !== undefined ? Boolean(issue.is_actionable) : blockerCount === 0,
 
             // Seed the simulation without pinning nodes or preventing dragging.
             x: pos ? pos[0] : undefined,
@@ -1316,6 +1350,9 @@ function getNodeColor(node) {
     // Cycle nodes get special color (all cycles, dimmer)
     if (node.inCycle) return THEME.accent.pink;
 
+    // Dependency cone focal node stands out in purple, cone members in cyan
+    if (node._coneFocus) return THEME.accent.purple;
+
     // Highlighted nodes
     if (store.highlightedNodes.has(node.id)) return THEME.accent.cyan;
 
@@ -1334,12 +1371,9 @@ function getNodeColor(node) {
 
     // Status-based color, with derived "blocked" semantics so the graph
     // matches the issues view: an open / in-progress node with at least one
-    // active (non-closed, non-tombstoned) blocker is treated as blocked.
-    // The materialized view already excludes resolved blockers from
-    // blockerCount, so this branch only fires when there really is an
-    // open dependency upstream (bv-issue#143/#144).
+    // active blocker or non-satisfied dependency_state is treated as blocked.
     if (
-        node.blockerCount > 0
+        (node.blockerCount > 0 || (node.dependencyState && node.dependencyState !== 'satisfied'))
         && (node.status === 'open' || node.status === 'in_progress')
     ) {
         return THEME.status.blocked;
@@ -2809,6 +2843,155 @@ function formatCyclePath(cycle) {
 }
 
 // ============================================================================
+// DEPENDENCY CONE ISOLATION (WASM dependencyCone)
+// ============================================================================
+
+const dependencyConeState = {
+    active: false,
+    focusNodeId: null,
+    nodeIds: new Set()
+};
+
+function computeDependencyConeIds(focusId) {
+    if (!focusId) return new Set();
+    if (store.wasmReady && store.wasmGraph) {
+        const idx = store.wasmGraph.nodeIdx(focusId);
+        if (idx !== undefined) {
+            const coneIndices = store.wasmGraph.dependencyCone(idx);
+            if (coneIndices && typeof coneIndices.length === 'number') {
+                const ids = new Set();
+                for (const rawIdx of Array.from(coneIndices)) {
+                    const nid = store.wasmGraph.nodeId(rawIdx);
+                    if (nid) ids.add(nid);
+                }
+                if (ids.size > 0) return ids;
+            }
+        }
+    }
+
+    // Fallback BFS over blocking dependencies (ancestors + self + descendants)
+    const ids = new Set([focusId]);
+    const blockingDeps = (store.dependencies || []).filter(isBlockingDependency);
+    const fwd = [focusId];
+    while (fwd.length > 0) {
+        const cur = fwd.shift();
+        for (const d of blockingDeps) {
+            if (d.issue_id === cur && !ids.has(d.depends_on_id)) {
+                ids.add(d.depends_on_id);
+                fwd.push(d.depends_on_id);
+            }
+        }
+    }
+    const rev = [focusId];
+    const visitedRev = new Set([focusId]);
+    while (rev.length > 0) {
+        const cur = rev.shift();
+        for (const d of blockingDeps) {
+            if (d.depends_on_id === cur && !visitedRev.has(d.issue_id)) {
+                visitedRev.add(d.issue_id);
+                ids.add(d.issue_id);
+                rev.push(d.issue_id);
+            }
+        }
+    }
+    return ids;
+}
+
+function applyDependencyConeToGraphData(graphData) {
+    if (!graphData || !dependencyConeState.active) return;
+    store.highlightedNodes.clear();
+    store.highlightedLinks.clear();
+    for (const node of (graphData.nodes || [])) {
+        const inCone = dependencyConeState.nodeIds.has(node.id);
+        node._coneFocus = node.id === dependencyConeState.focusNodeId;
+        node._coneMember = inCone;
+        if (inCone) {
+            store.highlightedNodes.add(node.id);
+        }
+    }
+    for (const link of (graphData.links || [])) {
+        if (link.blocking === false) continue;
+        const srcId = link.source?.id || link.source;
+        const tgtId = link.target?.id || link.target;
+        if (dependencyConeState.nodeIds.has(srcId) && dependencyConeState.nodeIds.has(tgtId)) {
+            store.highlightedLinks.add(`${srcId}-${tgtId}`);
+        }
+    }
+}
+
+export function focusDependencyCone(nodeOrId = null, center = true) {
+    const focusId = typeof nodeOrId === 'string'
+        ? nodeOrId
+        : (nodeOrId?.id || store.selectedNode?.id || store.hoveredNode?.id || null);
+    if (!focusId || !store.graph) return null;
+
+    resetWhatIf();
+    resetCriticalPath();
+    resetCycleNavigator();
+
+    const coneIds = computeDependencyConeIds(focusId);
+    if (coneIds.size === 0) return null;
+
+    dependencyConeState.active = true;
+    dependencyConeState.focusNodeId = focusId;
+    dependencyConeState.nodeIds = coneIds;
+
+    const graphData = store.graph.graphData();
+    applyDependencyConeToGraphData(graphData);
+
+    const focusNode = graphData.nodes.find(n => n.id === focusId);
+    if (center && focusNode && typeof focusNode.x === 'number' && typeof focusNode.y === 'number') {
+        store.graph.centerAt(focusNode.x, focusNode.y, 400);
+    }
+    refreshGraph();
+
+    const state = getDependencyConeState();
+    dispatchEvent('dependencyConeChange', state);
+    return state;
+}
+
+export function resetDependencyCone() {
+    const wasActive = dependencyConeState.active;
+    dependencyConeState.active = false;
+    dependencyConeState.focusNodeId = null;
+    dependencyConeState.nodeIds = new Set();
+
+    if (store.graph) {
+        const graphData = store.graph.graphData();
+        for (const node of (graphData?.nodes || [])) {
+            delete node._coneFocus;
+            delete node._coneMember;
+        }
+    }
+    if (wasActive) {
+        store.highlightedNodes.clear();
+        store.highlightedLinks.clear();
+        refreshGraph();
+        dispatchEvent('dependencyConeReset', { active: false, focusNodeId: null, count: 0, nodeIds: [] });
+    }
+}
+
+export function toggleDependencyCone(nodeOrId = null) {
+    const targetId = typeof nodeOrId === 'string'
+        ? nodeOrId
+        : (nodeOrId?.id || store.selectedNode?.id || store.hoveredNode?.id || null);
+    if (dependencyConeState.active && (!targetId || dependencyConeState.focusNodeId === targetId)) {
+        resetDependencyCone();
+        return false;
+    }
+    return Boolean(focusDependencyCone(targetId));
+}
+
+export function getDependencyConeState() {
+    return {
+        active: dependencyConeState.active,
+        focusNodeId: dependencyConeState.focusNodeId,
+        count: dependencyConeState.nodeIds.size,
+        nodeIds: [...dependencyConeState.nodeIds]
+    };
+}
+
+// ============================================================================
 // FILTERING
 // ============================================================================
 
@@ -2861,6 +3044,15 @@ function syncOverlaysAfterGraphRebuild(graphData) {
             });
         }
     }
+
+    if (dependencyConeState.active) {
+        const hasVisibleConeNode = [...dependencyConeState.nodeIds].some(id => nodeById.has(id));
+        if (!hasVisibleConeNode) {
+            resetDependencyCone();
+        } else {
+            applyDependencyConeToGraphData(graphData);
+        }
+    }
 }
 
 export function setFilter(key, value) {
@@ -2911,6 +3103,7 @@ export function resetView() {
     resetWhatIf();
     resetCriticalPath();
     resetCycleNavigator();
+    resetDependencyCone();
     clearSelection();
     clearFilters();
     store.graph.centerAt(0, 0, 500);
@@ -3257,6 +3450,8 @@ function setupKeyboardShortcuts() {
                     resetCriticalPath();
                 } else if (cycleNavigatorState.active) {
                     resetCycleNavigator();
+                } else if (dependencyConeState.active) {
+                    resetDependencyCone();
                 } else {
                     clearSelection();
                 }
@@ -3293,6 +3488,9 @@ function setupKeyboardShortcuts() {
                 break;
             case 'c':
                 toggleCriticalPath();
+                break;
+            case 'C':
+                toggleDependencyCone();
                 break;
             case 'y':
                 toggleCycleNavigator();
@@ -3482,27 +3680,63 @@ export function formatSlack(slack) {
     return `${hops} hops`;
 }
 
+function applyThemePalette(isDark) {
+    currentGraphDarkMode = Boolean(isDark);
+    const palette = currentGraphDarkMode ? THEME_PALETTES.dark : THEME_PALETTES.light;
+    THEME.bg = palette.bg;
+    THEME.bgSecondary = palette.bgSecondary;
+    THEME.bgTertiary = palette.bgTertiary;
+    THEME.fg = palette.fg;
+    THEME.fgMuted = palette.fgMuted;
+    THEME.link.default = palette.linkDefault;
+}
+
+export function getGraphTheme() {
+    return currentGraphDarkMode ? 'dark' : 'light';
+}
+
+export function setGraphTheme(isDark) {
+    applyThemePalette(isDark);
+    if (store.graph) {
+        store.graph.backgroundColor(THEME.bg);
+    }
+    if (tooltipEl) {
+        tooltipEl.style.background = THEME.bgSecondary;
+        tooltipEl.style.color = THEME.fg;
+    }
+    if (labelClusterState.active && labelLegendEl) {
+        showLabelLegend();
+    }
+    if (typeof document !== 'undefined' && document.getElementById('bv-time-travel-styles')) {
+        applyTimeTravelStyles();
+    }
+    refreshGraph();
+}
+
 function showTooltip(node) {
+    const mountTarget = store.container || document.body;
     if (!tooltipEl) {
         tooltipEl = document.createElement('div');
         tooltipEl.className = 'bv-graph-tooltip';
-        tooltipEl.style.cssText = `
-            position: fixed;
-            background: ${THEME.bgSecondary};
-            color: ${THEME.fg};
-            padding: 12px 16px;
-            border-radius: 8px;
-            border: 1px solid ${THEME.accent.purple};
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 12px;
-            max-width: 320px;
-            pointer-events: none;
-            z-index: 1000;
-            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-            transition: opacity 0.15s;
-        `;
-        document.body.appendChild(tooltipEl);
     }
+    if (tooltipEl.parentElement !== mountTarget) {
+        mountTarget.appendChild(tooltipEl);
+    }
+    tooltipEl.style.cssText = `
+        position: ${store.container ? 'absolute' : 'fixed'};
+        background: ${THEME.bgSecondary};
+        color: ${THEME.fg};
+        padding: 12px 16px;
+        border-radius: 8px;
+        border: 1px solid ${THEME.accent.purple};
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 12px;
+        max-width: 320px;
+        pointer-events: none;
+        z-index: 25;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.28);
+        transition: opacity 0.15s;
+    `;
 
     const icon = TYPE_ICONS[node.type] || TYPE_ICONS.default;
     const statusColor = THEME.status[node.status];
@@ -3579,13 +3813,23 @@ function showTooltip(node) {
 
 function positionTooltip(e) {
     if (!tooltipEl) return;
+    if (store.container) {
+        const rect = store.container.getBoundingClientRect();
+        const relX = e.clientX - rect.left + 15;
+        const relY = e.clientY - rect.top + 15;
+        const maxLeft = Math.max(8, rect.width - 332);
+        const maxTop = Math.max(8, rect.height - 200);
+        tooltipEl.style.left = `${Math.max(8, Math.min(relX, maxLeft))}px`;
+        tooltipEl.style.top = `${Math.max(8, Math.min(relY, maxTop))}px`;
+        return;
+    }
     const x = e.clientX + 15;
     const y = e.clientY + 15;
     tooltipEl.style.left = `${Math.min(x, window.innerWidth - 340)}px`;
     tooltipEl.style.top = `${Math.min(y, window.innerHeight - 200)}px`;
 }
 
-function hideTooltip() {
+export function hideTooltip() {
     if (tooltipEl) {
         tooltipEl.style.opacity = '0';
         document.removeEventListener('mousemove', positionTooltip);
@@ -3613,9 +3857,9 @@ function showLabelLegend() {
     labelLegendEl = document.createElement('div');
     labelLegendEl.className = 'bv-label-legend';
     labelLegendEl.style.cssText = `
-        position: fixed;
-        top: 60px;
-        right: 16px;
+        position: ${store.container ? 'absolute' : 'fixed'};
+        top: 156px;
+        left: 16px;
         background: ${THEME.bgSecondary}ee;
         color: ${THEME.fg};
         padding: 12px 16px;
@@ -3623,10 +3867,11 @@ function showLabelLegend() {
         border: 1px solid ${THEME.accent.purple};
         font-family: 'JetBrains Mono', monospace;
         font-size: 11px;
-        max-height: calc(100vh - 120px);
+        max-width: 240px;
+        max-height: calc(100% - 310px);
         overflow-y: auto;
-        z-index: 900;
-        box-shadow: 0 4px 24px rgba(0,0,0,0.3);
+        z-index: 25;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.25);
         backdrop-filter: blur(8px);
     `;
 
@@ -3715,7 +3960,7 @@ function showLabelLegend() {
     hint.textContent = 'Press 5 to toggle galaxy view';
     labelLegendEl.appendChild(hint);
 
-    document.body.appendChild(labelLegendEl);
+    (store.container || document.body).appendChild(labelLegendEl);
 }
 
 /**
@@ -3841,6 +4086,8 @@ export function cleanup() {
     resetWhatIf();
     resetCriticalPath();
     resetCycleNavigator();
+    resetDependencyCone();
+    hideLabelLegend();
     store.resizeObserver?.disconnect();
     store.resizeObserver = null;
     store.graph?.pauseAnimation();
@@ -4040,7 +4287,20 @@ function createTimelineControls() {
     }
     markers.hidden = !markers.childElementCount;
 
-    // Add styles (singleton element so re-initializing never duplicates <style> tags)
+    applyTimeTravelStyles();
+
+    // Append controls to graph container
+    if (store.container) {
+        store.container.appendChild(controls);
+    }
+
+    timeTravelState.controlsEl = controls;
+
+    // Setup event listeners
+    setupTimeTravelListeners();
+}
+
+function applyTimeTravelStyles() {
     let style = document.getElementById('bv-time-travel-styles');
     if (!style) {
         style = document.createElement('style');
@@ -4057,7 +4317,7 @@ function createTimelineControls() {
             border: 1px solid ${THEME.fgMuted};
             border-radius: 8px;
             padding: 8px 12px;
-            z-index: 1000;
+            z-index: 25;
             min-width: 300px;
             box-shadow: 0 4px 12px rgba(0,0,0,0.3);
             display: none;
@@ -4164,16 +4424,6 @@ function createTimelineControls() {
             to { transform: scale(0); opacity: 0; }
         }
     `;
-
-    // Append controls to graph container
-    if (store.container) {
-        store.container.appendChild(controls);
-    }
-
-    timeTravelState.controlsEl = controls;
-
-    // Setup event listeners
-    setupTimeTravelListeners();
 }
 
 /**
