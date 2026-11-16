@@ -5,7 +5,7 @@ description: "Beads Viewer - Graph-aware triage engine for Beads projects. Compu
 
 # BV - Beads Viewer
 
-A graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in current `br` and Dolt-backed `bd` workspaces, with `.beads/beads.jsonl` supported for legacy workspaces). Computes graph metrics, generates execution plans, and explains recommendations. Human TUI for browsing; robot flags for AI agents. Compare source, scope, configuration, reference time and metric status when checking repeatability.
+A graph-aware triage engine for Beads projects (`.beads/beads.db` SQLite and `.beads/issues.jsonl` in current `br` and Dolt-backed `bd` workspaces, with `.beads/beads.jsonl` supported for legacy workspaces). Computes graph metrics, generates execution plans, and explains recommendations. Human TUI for browsing; robot flags for AI agents. Compare source, scope, configuration, reference time and metric status when checking repeatability.
 
 ## Why BV vs Raw Beads
 
@@ -89,6 +89,11 @@ bv --robot-file-hotspots               # Files touched by the most beads
 bv --robot-file-relations <path>       # Co-changing files above correlation threshold
 bv --robot-impact <paths>              # Risk analysis before editing comma-separated paths
 bv --robot-orphans                     # Commits missing explicit bead links
+bv --robot-explain-correlation <sha:id> # Explain commit-to-bead correlation score
+bv --robot-confirm-correlation <sha:id> # Confirm correlation pair in feedback store
+bv --robot-reject-correlation <sha:id>  # Reject correlation pair in feedback store
+bv --robot-ignore-correlation <sha:id>  # Suppress correlation pair without weight penalty
+bv --robot-correlation-stats           # Correlation feedback summary statistics
 bv --robot-diff --diff-since HEAD~1    # Changes since an existing Git ref
 bv --search "oauth" --robot-search     # Keyword or --search-mode hybrid semantic search
 ```
@@ -234,7 +239,7 @@ When running `bv` interactively (not for agents):
 
 ## Integration with br/bd CLIs
 
-BV reads `.beads/issues.jsonl` in current `br` and Dolt-backed `bd` workspaces and `.beads/beads.jsonl` in legacy workspaces:
+BV reads `.beads/beads.db` directly when fresh (including SQLite WAL frames) or `.beads/issues.jsonl` in current `br` and Dolt-backed `bd` workspaces, and `.beads/beads.jsonl` in legacy workspaces:
 
 ```bash
 br ready --json             # Show actionable beads

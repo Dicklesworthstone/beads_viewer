@@ -103,7 +103,7 @@ go mod tidy                       # Clean up unused deps
 | `charmbracelet/bubbles` | Reusable TUI components (viewport, list, etc.) |
 | `charmbracelet/huh` | Interactive form components |
 | `charmbracelet/glamour` | Markdown rendering |
-| `modernc.org/sqlite` | Pure-Go SQLite for the static-site export (`beads.sqlite3` with an FTS5 index) |
+| `modernc.org/sqlite` | Pure-Go SQLite for direct `.beads/beads.db` reading and static-site export (`beads.sqlite3` with FTS5) |
 | `gonum.org/v1/gonum` | Graph algorithms (PageRank, betweenness, HITS, eigenvector) |
 | `goccy/go-json` | High-performance JSON serialization |
 | `fsnotify/fsnotify` | Filesystem event watching (daemon mode) |
@@ -258,7 +258,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## beads_viewer — This Project
 
-**This is the project you're working on.** beads_viewer (`bv`) is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in current `br` and Dolt-backed `bd` workspaces, with `.beads/beads.jsonl` supported for legacy workspaces). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically. It provides both an interactive TUI and machine-readable `--robot-*` JSON outputs for AI agent consumption.
+**This is the project you're working on.** beads_viewer (`bv`) is a graph-aware triage engine for Beads projects (`.beads/beads.db` SQLite and `.beads/issues.jsonl` in current `br` and Dolt-backed `bd` workspaces, with `.beads/beads.jsonl` supported for legacy workspaces). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically. It provides both an interactive TUI and machine-readable `--robot-*` JSON outputs for AI agent consumption.
 
 ### What It Does
 
@@ -267,7 +267,7 @@ Analyzes Beads issue graphs to produce actionable triage recommendations, parall
 ### Architecture
 
 ```
-.beads/{issues,beads}.jsonl → Loader → Graph Build → ┬─ Phase 1 (instant): degree, topo sort, density
+.beads/{beads.db,issues.jsonl,beads.jsonl} → Datasource/Loader → Graph Build → ┬─ Phase 1 (instant): degree, topo sort, density
                                               └─ Phase 2 (async, size-tiered): PageRank, betweenness,
                                                                           HITS, eigenvector, cycles
                                                               │
@@ -288,6 +288,10 @@ Analyzes Beads issue graphs to produce actionable triage recommendations, parall
 beads_viewer/
 ├── go.mod                          # Module root (Go 1.26.11+)
 ├── cmd/bv/                         # CLI entry point (Cobra/pflag and robot registry)
+├── internal/
+│   ├── datasource/                 # Smart source discovery & validation (SQLite WAL, Dolt, JSONL)
+│   ├── docgen/                     # Deterministic CLI/env/schema documentation generator
+│   └── env/                        # Typed BV_*/BEADS_* environment variable registry
 ├── pkg/
 │   ├── analysis/                   # Graph metrics, triage, planning, priority, forecasting
 │   ├── search/                     # Hybrid semantic search (text + graph metrics)
@@ -320,7 +324,7 @@ beads_viewer/
 
 - **Two-phase analysis**: Phase 1 metrics (degree, topo sort, density) are instant; Phase 2 (PageRank, betweenness, HITS, eigenvector, cycles) runs async with size-tiered timeouts (2 s down to 200 ms, `ConfigForSize` in `pkg/analysis/config.go`) — check `status` flags
 - **Robot-first API**: All `--robot-*` flags emit deterministic JSON to stdout; human TUI is secondary
-- **Pure-Go SQLite** (`modernc.org/sqlite`) for the static-site export's FTS5 index — no CGO dependency; `pkg/search` itself is an in-memory hash-embedding index, not SQLite
+- **Pure-Go SQLite** (`modernc.org/sqlite`) for direct `.beads/beads.db` reading (WAL-aware via `internal/datasource`) and the static-site export's FTS5 index — no CGO dependency; `pkg/search` itself is an in-memory hash-embedding index, not SQLite
 - **Hybrid search** combines text relevance with graph metrics (PageRank, status, impact, priority, recency) via configurable weight presets
 - **Elm architecture TUI** via bubbletea — all state transitions are message-based
 - **Structured error wrapping** with `fmt.Errorf("context: %w", err)` for traceability
