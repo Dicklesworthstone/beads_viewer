@@ -3,6 +3,7 @@ package baseline
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -276,5 +277,70 @@ func TestNewForDir_HonorsSourceDateEpoch(t *testing.T) {
 		if _, err := json.Marshal(bHuge); err != nil {
 			t.Fatalf("json.Marshal failed for SOURCE_DATE_EPOCH=%s: %v", huge, err)
 		}
+	}
+}
+
+func TestGetGitInfoIgnoresAmbientGitDirAndReplaceRefs(t *testing.T) {
+	initRepo := func(branch, msg string) string {
+		t.Helper()
+		dir := t.TempDir()
+		run := func(args ...string) string {
+			t.Helper()
+			cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v: %v (%s)", args, err, out)
+			}
+			return strings.TrimSpace(string(out))
+		}
+		run("init", "-b", branch)
+		run("config", "user.email", "test@example.com")
+		run("config", "user.name", "Test")
+		if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte(msg+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run("add", "README.md")
+		run("commit", "-m", msg)
+		return dir
+	}
+
+	realRepo := initRepo("main", "real commit message")
+	poisonRepo := initRepo("poison-branch", "poison commit message")
+
+	// Create an unreferenced commit in realRepo and attach a git replace ref onto HEAD
+	// to verify --no-replace-objects prevents spoofed commit messages in GetGitInfo.
+	spoofRepo := initRepo("spoof", "spoofed replace message")
+	fetchCmd := exec.Command("git", "-C", realRepo, "fetch", spoofRepo, "HEAD")
+	if out, err := fetchCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git fetch spoof commit: %v (%s)", err, out)
+	}
+	spoofSHAOut, err := exec.Command("git", "-C", realRepo, "rev-parse", "FETCH_HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse FETCH_HEAD: %v (%s)", err, spoofSHAOut)
+	}
+	spoofSHA := strings.TrimSpace(string(spoofSHAOut))
+	realSHAOut, err := exec.Command("git", "-C", realRepo, "--no-replace-objects", "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v (%s)", err, realSHAOut)
+	}
+	realSHA := strings.TrimSpace(string(realSHAOut))
+
+	if out, err := exec.Command("git", "-C", realRepo, "replace", realSHA, spoofSHA).CombinedOutput(); err != nil {
+		t.Fatalf("git replace: %v (%s)", err, out)
+	}
+
+	// Poison ambient GIT_DIR and GIT_WORK_TREE to point at poisonRepo.
+	t.Setenv("GIT_DIR", filepath.Join(poisonRepo, ".git"))
+	t.Setenv("GIT_WORK_TREE", poisonRepo)
+
+	sha, msg, branch := GetGitInfo(realRepo)
+	if sha != realSHA {
+		t.Fatalf("GetGitInfo SHA = %q, want %q", sha, realSHA)
+	}
+	if msg != "real commit message" {
+		t.Fatalf("GetGitInfo message = %q, want \"real commit message\" (neither poison nor git-replace spoof)", msg)
+	}
+	if branch != "main" {
+		t.Fatalf("GetGitInfo branch = %q, want \"main\" (not poison-branch)", branch)
 	}
 }
