@@ -217,3 +217,130 @@ func TestDetectAtRisk_SkipsParkedTemplatePinnedAndParentChild(t *testing.T) {
 		t.Fatalf("expected 0 at-risk items for parked/template/pinned/parent-child beads, got %+v", got)
 	}
 }
+
+func TestSprintAtRiskHonorsReadinessIndex(t *testing.T) {
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	stalledUpdated := now.AddDate(0, 0, -8)
+	blockedLinkCreated := now.AddDate(0, 0, -5)
+	unknownLinkCreated := now.AddDate(0, 0, -4)
+	ancient := now.AddDate(0, 0, -15)
+
+	issues := []model.Issue{
+		{
+			ID: "stalled-root", Title: "Stalled root blocker", Status: model.StatusOpen,
+			Priority: 2, IssueType: model.TypeTask, UpdatedAt: stalledUpdated,
+		},
+		{
+			ID: "blocked-epic", Title: "Blocked parent epic", Status: model.StatusOpen,
+			Priority: 1, IssueType: model.TypeEpic, UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "blocked-epic", DependsOnID: "stalled-root", Type: model.DepBlocks, CreatedAt: blockedLinkCreated},
+			},
+		},
+		{
+			// Transitive parent-child readiness: has NO direct DepBlocks, only DepParentChild to blocked-epic!
+			ID: "child-of-blocked-epic", Title: "Child of blocked epic", Status: model.StatusOpen,
+			Priority: 0, IssueType: model.TypeTask, UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "child-of-blocked-epic", DependsOnID: "blocked-epic", Type: model.DepParentChild, CreatedAt: now.Add(-time.Hour)},
+			},
+		},
+		{
+			// Unknown external blocker ID missing from loaded slice -> ReadinessIndex marks DependenciesUnknown (unsatisfied).
+			ID: "dangling-blocker", Title: "Depends on unloaded external ID", Status: model.StatusOpen,
+			Priority: 0, IssueType: model.TypeTask, UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "dangling-blocker", DependsOnID: "MISSING-EXT-99", Type: model.DepBlocks, CreatedAt: unknownLinkCreated},
+			},
+		},
+		// Planted negative controls:
+		{
+			ID: "ready-epic", Title: "Open unblocked epic", Status: model.StatusOpen,
+			Priority: 1, IssueType: model.TypeEpic, UpdatedAt: ancient,
+		},
+		{
+			ID: "child-of-ready-epic", Title: "Child of open unblocked epic", Status: model.StatusOpen,
+			Priority: 0, IssueType: model.TypeTask, UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "child-of-ready-epic", DependsOnID: "ready-epic", Type: model.DepParentChild, CreatedAt: ancient},
+			},
+		},
+		{
+			ID: "tomb-blocker", Title: "Deleted blocker", Status: model.StatusTombstone,
+			Priority: 1, IssueType: model.TypeTask, UpdatedAt: ancient,
+		},
+		{
+			ID: "tomb-satisfied", Title: "Depends on tombstoned blocker", Status: model.StatusOpen,
+			Priority: 0, IssueType: model.TypeTask, UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "tomb-satisfied", DependsOnID: "tomb-blocker", Type: model.DepBlocks, CreatedAt: ancient},
+			},
+		},
+	}
+
+	sp := &model.Sprint{
+		ID: "sprint-readiness",
+		BeadIDs: []string{
+			"child-of-blocked-epic",
+			"dangling-blocker",
+			"child-of-ready-epic",
+			"tomb-satisfied",
+		},
+	}
+
+	got := DetectAtRisk(issues, sp, now, DefaultAtRiskThresholds())
+	byID := make(map[string]AtRiskItem, len(got))
+	for _, item := range got {
+		byID[item.IssueID] = item
+	}
+
+	if len(byID) != 2 {
+		t.Fatalf("DetectAtRisk items = %+v, want exactly [child-of-blocked-epic, dangling-blocker]", got)
+	}
+
+	childItem, ok := byID["child-of-blocked-epic"]
+	if !ok {
+		t.Fatalf("missing child-of-blocked-epic in %+v", got)
+	}
+	wantChildSignals := map[AtRiskSignal]bool{
+		AtRiskBlockedTooLong:     true,
+		AtRiskCriticalBlocked:    true,
+		AtRiskBlockersNotClosing: true,
+	}
+	for _, sig := range childItem.Signals {
+		delete(wantChildSignals, sig)
+	}
+	if len(wantChildSignals) != 0 {
+		t.Fatalf("child-of-blocked-epic signals = %v, missing %v", childItem.Signals, wantChildSignals)
+	}
+	if childItem.BlockedDays != 5 {
+		t.Fatalf("child-of-blocked-epic BlockedDays = %d, want 5 from ancestor DepBlocks CreatedAt", childItem.BlockedDays)
+	}
+	if len(childItem.StalledBlockerIDs) != 1 || childItem.StalledBlockerIDs[0] != "stalled-root" {
+		t.Fatalf("child-of-blocked-epic StalledBlockerIDs = %v, want [stalled-root]", childItem.StalledBlockerIDs)
+	}
+
+	danglingItem, ok := byID["dangling-blocker"]
+	if !ok {
+		t.Fatalf("missing dangling-blocker in %+v", got)
+	}
+	wantDanglingSignals := map[AtRiskSignal]bool{
+		AtRiskBlockedTooLong:  true,
+		AtRiskCriticalBlocked: true,
+	}
+	for _, sig := range danglingItem.Signals {
+		delete(wantDanglingSignals, sig)
+	}
+	if len(wantDanglingSignals) != 0 {
+		t.Fatalf("dangling-blocker signals = %v, missing %v", danglingItem.Signals, wantDanglingSignals)
+	}
+	if danglingItem.BlockedDays != 4 {
+		t.Fatalf("dangling-blocker BlockedDays = %d, want 4", danglingItem.BlockedDays)
+	}
+
+	for _, neg := range []string{"child-of-ready-epic", "tomb-satisfied"} {
+		if item, exists := byID[neg]; exists {
+			t.Fatalf("negative control %s falsely flagged at-risk: %+v", neg, item)
+		}
+	}
+}

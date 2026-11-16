@@ -3552,3 +3552,291 @@ func TestComputeTriageFromAnalyzer_VelocityIssuesConsistentWithAlerts(t *testing
 		t.Fatalf("expected velocity_drop alert when VelocityIssues shows 3.0/wk -> 0/wk drop, got alerts=%+v", withVel.Alerts)
 	}
 }
+
+func TestTriageResult_ExposesAllScoresAndUnblocksMap(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	var allIssues []model.Issue
+	candidates := make(map[string]bool)
+
+	for i := 1; i <= 12; i++ {
+		id := fmt.Sprintf("CAND-%02d", i)
+		prio := 1
+		if i == 12 {
+			prio = 4 // Force CAND-12 below TopN=3 while still unblocking CAND-11
+		}
+		allIssues = append(allIssues, model.Issue{
+			ID:        id,
+			Title:     fmt.Sprintf("Candidate %02d", i),
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Priority:  prio,
+			CreatedAt: now.Add(-24 * time.Hour),
+			UpdatedAt: now.Add(-time.Hour),
+		})
+		candidates[id] = true
+	}
+	// CAND-02 and CAND-03 depend on CAND-01; CAND-11 depends on low-priority CAND-12.
+	allIssues[1].Dependencies = []*model.Dependency{{IssueID: "CAND-02", DependsOnID: "CAND-01", Type: model.DepBlocks}}
+	allIssues[2].Dependencies = []*model.Dependency{{IssueID: "CAND-03", DependsOnID: "CAND-01", Type: model.DepBlocks}}
+	allIssues[10].Dependencies = []*model.Dependency{{IssueID: "CAND-11", DependsOnID: "CAND-12", Type: model.DepBlocks}}
+
+	// Negative control 1: closed candidate must not enter AllScores or UnblocksMap.
+	closedAt := now.Add(-2 * time.Hour)
+	allIssues = append(allIssues, model.Issue{
+		ID:        "CAND-CLOSED",
+		Title:     "Closed candidate",
+		Status:    model.StatusClosed,
+		IssueType: model.TypeTask,
+		Priority:  0,
+		CreatedAt: now.Add(-48 * time.Hour),
+		UpdatedAt: closedAt,
+		ClosedAt:  &closedAt,
+	})
+	candidates["CAND-CLOSED"] = true
+
+	// Negative control 2: out-of-scope issues (including one blocked by CAND-01) must not leak.
+	allIssues = append(allIssues,
+		model.Issue{
+			ID:        "EXT-01",
+			Title:     "External root",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Priority:  0,
+			CreatedAt: now.Add(-24 * time.Hour),
+			UpdatedAt: now.Add(-time.Hour),
+		},
+		model.Issue{
+			ID:        "EXT-02",
+			Title:     "External dependent",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Priority:  0,
+			CreatedAt: now.Add(-24 * time.Hour),
+			UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "EXT-02", DependsOnID: "EXT-01", Type: model.DepBlocks},
+				{IssueID: "EXT-02", DependsOnID: "CAND-01", Type: model.DepBlocks},
+			},
+		},
+	)
+
+	readiness := model.NewReadinessIndex(allIssues)
+	an := NewAnalyzer(allIssues)
+	an.SetNow(now)
+	an.SetReadinessScope(readiness, candidates)
+	stats := an.AnalyzeAsync(context.Background())
+	stats.WaitForPhase2()
+
+	res := ComputeTriageFromAnalyzer(an, stats, allIssues, TriageOptions{
+		TopN:          3,
+		WaitForPhase2: true,
+		CandidateIDs:  candidates,
+		Readiness:     readiness,
+	}, now)
+
+	if len(res.Recommendations) != 3 {
+		t.Fatalf("Recommendations len = %d, want TopN=3", len(res.Recommendations))
+	}
+	if len(res.AllScores) != 12 {
+		t.Fatalf("AllScores len = %d, want all 12 active candidates", len(res.AllScores))
+	}
+	if _, ok := res.AllScores["CAND-12"]; !ok {
+		t.Fatalf("expected truncated low-priority CAND-12 in AllScores, got %v", res.AllScores)
+	}
+	for _, rec := range res.Recommendations {
+		if rec.ID == "CAND-12" {
+			t.Fatalf("expected CAND-12 to fall outside TopN=3 Recommendations")
+		}
+	}
+	if got := res.UnblocksMap["CAND-01"]; !reflect.DeepEqual(got, []string{"CAND-02", "CAND-03"}) {
+		t.Fatalf("UnblocksMap[CAND-01] = %v, want [CAND-02 CAND-03]", got)
+	}
+	if got := res.UnblocksMap["CAND-12"]; !reflect.DeepEqual(got, []string{"CAND-11"}) {
+		t.Fatalf("UnblocksMap[CAND-12] = %v, want [CAND-11] even past TopN", got)
+	}
+
+	// Defensive copy check: mutating UnblocksMap must not mutate Recommendations.
+	res.UnblocksMap["CAND-01"][0] = "MUTATED"
+	for _, rec := range res.Recommendations {
+		if rec.ID == "CAND-01" && !reflect.DeepEqual(rec.UnblocksIDs, []string{"CAND-02", "CAND-03"}) {
+			t.Fatalf("mutating UnblocksMap aliased Recommendation.UnblocksIDs: %v", rec.UnblocksIDs)
+		}
+	}
+
+	// Negative controls: closed candidate and out-of-scope issues excluded.
+	for _, excluded := range []string{"CAND-CLOSED", "EXT-01", "EXT-02"} {
+		if _, ok := res.AllScores[excluded]; ok {
+			t.Fatalf("unexpected %s in AllScores", excluded)
+		}
+		if _, ok := res.UnblocksMap[excluded]; ok {
+			t.Fatalf("unexpected %s in UnblocksMap", excluded)
+		}
+	}
+
+	// JSON wire check: AllScores and UnblocksMap must never serialize onto --robot-triage output.
+	wireBytes, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("json.Marshal(TriageResult): %v", err)
+	}
+	wire := string(wireBytes)
+	for _, forbidden := range []string{"AllScores", "all_scores", "UnblocksMap", "unblocks_map"} {
+		if strings.Contains(wire, forbidden) {
+			t.Fatalf("JSON wire leaked internal field %q: %s", forbidden, wire)
+		}
+	}
+}
+
+func TestScopedGraphTotals_InducedSubgraph(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-3 * time.Hour)
+
+	// 6 total nodes, 6 unique blocking edges (unscoped density = 6 / 30 = 0.2).
+	// Scoped candidates {C1, C2, C3, C4}: 4 nodes, 2 induced blocking edges C2->C1 and C3->C2
+	// (induced density = 2 / 12 = 0.166666..., rounded to 0.1667 in GraphHealth).
+	issues := []model.Issue{
+		{
+			ID: "C1", Title: "Candidate root", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1,
+			CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{{IssueID: "C1", DependsOnID: "X1", Type: model.DepBlocks}},
+		},
+		{
+			ID: "C2", Title: "Candidate mid", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1,
+			CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "C2", DependsOnID: "C1", Type: model.DepBlocks},
+				{IssueID: "C2", DependsOnID: "C1", Type: model.DepBlocks}, // duplicate edge must dedup
+			},
+		},
+		{
+			ID: "C3", Title: "Candidate leaf", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{{IssueID: "C3", DependsOnID: "C2", Type: model.DepBlocks}},
+		},
+		{
+			ID: "C4", Title: "Candidate closed", Status: model.StatusClosed, IssueType: model.TypeTask, Priority: 2,
+			CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt,
+		},
+		{
+			ID: "X1", Title: "External 1", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1,
+			CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{{IssueID: "X1", DependsOnID: "C2", Type: model.DepBlocks}},
+		},
+		{
+			ID: "X2", Title: "External 2", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1,
+			CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now.Add(-time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "X2", DependsOnID: "X1", Type: model.DepBlocks},
+				{IssueID: "X2", DependsOnID: "C3", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	// Negative control 1: unscoped analyzer reports full 6-node, 6-edge totals.
+	unscoped := NewAnalyzer(issues)
+	unscoped.SetNow(now)
+	if unscoped.HasScope() {
+		t.Fatal("expected HasScope() == false on unscoped analyzer")
+	}
+	unscopedStats := unscoped.AnalyzeAsync(context.Background())
+	unscopedStats.WaitForPhase2()
+	if n, e, d := unscoped.ScopedGraphTotals(unscopedStats); n != 6 || e != 6 || d < 0.1999 || d > 0.2001 {
+		t.Fatalf("unscoped ScopedGraphTotals = (%d, %d, %.6f), want (6, 6, 0.2)", n, e, d)
+	}
+
+	candidates := map[string]bool{"C1": true, "C2": true, "C3": true, "C4": true}
+	readiness := model.NewReadinessIndex(issues)
+	scoped := NewAnalyzer(issues)
+	scoped.SetNow(now)
+	scoped.SetReadinessScope(readiness, candidates)
+	if !scoped.HasScope() {
+		t.Fatal("expected HasScope() == true on candidate-scoped analyzer")
+	}
+	scopedStats := scoped.AnalyzeAsync(context.Background())
+	scopedStats.WaitForPhase2()
+
+	wantDensity := 2.0 / 12.0
+	for _, s := range []*GraphStats{scopedStats, nil} {
+		n, e, d := scoped.ScopedGraphTotals(s)
+		if n != 4 || e != 2 || d < wantDensity-1e-9 || d > wantDensity+1e-9 {
+			t.Fatalf("scoped ScopedGraphTotals(stats=%v) = (%d, %d, %.9f), want (4, 2, %.9f)", s != nil, n, e, d, wantDensity)
+		}
+	}
+
+	triage := ComputeTriageFromAnalyzer(scoped, scopedStats, issues, TriageOptions{
+		WaitForPhase2: true,
+		CandidateIDs:  candidates,
+		Readiness:     readiness,
+	}, now)
+	if triage.Meta.IssueCount != 4 {
+		t.Fatalf("TriageResult.Meta.IssueCount = %d, want scoped count 4 (not full corpus 6)", triage.Meta.IssueCount)
+	}
+	if triage.ProjectHealth.Graph.TotalNodes != 4 || triage.ProjectHealth.Graph.TotalEdges != 2 {
+		t.Fatalf("ProjectHealth.Graph = %+v, want TotalNodes=4 TotalEdges=2", triage.ProjectHealth.Graph)
+	}
+	if triage.ProjectHealth.Graph.Density != 0.1667 {
+		t.Fatalf("ProjectHealth.Graph.Density = %v, want 0.1667 (not unscoped 0.2)", triage.ProjectHealth.Graph.Density)
+	}
+
+	ins := scoped.GenerateScopedInsights(10)
+	if ins.ClusterDensity < wantDensity-1e-9 || ins.ClusterDensity > wantDensity+1e-9 {
+		t.Fatalf("GenerateScopedInsights.ClusterDensity = %.9f, want %.9f", ins.ClusterDensity, wantDensity)
+	}
+
+	// ParallelGain on >5000 PreRecipeIssues with narrow candidate scope must run on the scoped
+	// active subgraph rather than bailing out at parallelGainMaxIssues (5000).
+	largeIssues := make([]model.Issue, 0, parallelGainMaxIssues+5)
+	largeIssues = append(largeIssues,
+		model.Issue{ID: "D-ROOT", Title: "Diamond root", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0},
+		model.Issue{
+			ID: "D-LEFT", Title: "Diamond left", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1,
+			Dependencies: []*model.Dependency{{IssueID: "D-LEFT", DependsOnID: "D-ROOT", Type: model.DepBlocks}},
+		},
+		model.Issue{
+			ID: "D-RIGHT", Title: "Diamond right", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1,
+			Dependencies: []*model.Dependency{{IssueID: "D-RIGHT", DependsOnID: "D-ROOT", Type: model.DepBlocks}},
+		},
+		model.Issue{
+			ID: "D-TOP", Title: "Diamond top", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "D-TOP", DependsOnID: "D-LEFT", Type: model.DepBlocks},
+				{IssueID: "D-TOP", DependsOnID: "D-RIGHT", Type: model.DepBlocks},
+			},
+		},
+	)
+	for i := 0; i < parallelGainMaxIssues+1; i++ {
+		largeIssues = append(largeIssues, model.Issue{
+			ID:        fmt.Sprintf("NOISE-%04d", i),
+			Title:     "Out-of-scope open issue",
+			Status:    model.StatusOpen,
+			IssueType: model.TypeTask,
+			Priority:  3,
+		})
+	}
+
+	// Negative control 2: unscoped 5005-open-issue analyzer skips ParallelGain at parallelGainMaxIssues.
+	unscopedLarge := NewAnalyzer(largeIssues)
+	unscopedAdv := unscopedLarge.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig())
+	if unscopedAdv.ParallelGain == nil || !unscopedAdv.ParallelGain.Skipped || !strings.Contains(unscopedAdv.ParallelGain.SkipReason, "Graph too large") {
+		t.Fatalf("expected unscoped >5000 graph to skip ParallelGain, got %+v", unscopedAdv.ParallelGain)
+	}
+
+	diamondScope := map[string]bool{"D-ROOT": true, "D-LEFT": true, "D-RIGHT": true, "D-TOP": true}
+	scopedLarge := NewAnalyzer(largeIssues)
+	scopedLarge.SetReadinessScope(model.NewReadinessIndex(largeIssues), diamondScope)
+	scopedAdv := scopedLarge.GenerateAdvancedInsights(DefaultAdvancedInsightsConfig())
+	if scopedAdv.ParallelGain == nil || scopedAdv.ParallelGain.Skipped || !scopedAdv.ParallelGain.Available {
+		t.Fatalf("expected scoped 4-candidate subgraph on 5005-issue corpus to compute ParallelGain, got %+v", scopedAdv.ParallelGain)
+	}
+	foundRoot := false
+	for _, item := range scopedAdv.ParallelGain.Items {
+		if strings.HasPrefix(item.IssueID, "NOISE-") {
+			t.Fatalf("out-of-scope issue leaked into ParallelGain.Items: %+v", item)
+		}
+		if item.IssueID == "D-ROOT" {
+			foundRoot = true
+		}
+	}
+	if !foundRoot {
+		t.Fatalf("expected D-ROOT in scoped ParallelGain.Items, got %+v", scopedAdv.ParallelGain.Items)
+	}
+}

@@ -730,3 +730,89 @@ func TestComputeGrahamBounds_IgnoresParentChildDependencies(t *testing.T) {
 		t.Fatalf("non-blocking DepParentChild inflated CriticalPathMinutes to %d, want 120", bounds.CriticalPathMinutes)
 	}
 }
+
+func TestETAIgnoresFutureClosures(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+	pastClosed := now.AddDate(0, 0, -5)
+	futureClosed := now.Add(48 * time.Hour)
+	futureUpdated := now.Add(3 * time.Hour)
+
+	est100 := 100
+	est300 := 300
+	est3000 := 3000
+
+	issues := []model.Issue{
+		{
+			ID:               "TARGET",
+			Title:            "Open API work",
+			Status:           model.StatusOpen,
+			IssueType:        model.TypeTask,
+			Labels:           []string{"api"},
+			EstimatedMinutes: &est100,
+		},
+		{
+			ID:               "PAST-1",
+			Title:            "Completed 5 days ago",
+			Status:           model.StatusClosed,
+			IssueType:        model.TypeTask,
+			Labels:           []string{"api"},
+			EstimatedMinutes: &est300, // 300 min / 30d = 10 min/day -> TARGET takes 10.0 days
+			ClosedAt:         &pastClosed,
+			UpdatedAt:        pastClosed,
+		},
+		{
+			ID:               "FUTURE-CLOSED",
+			Title:            "Future ClosedAt (e.g. historical --as-of or clock skew)",
+			Status:           model.StatusClosed,
+			IssueType:        model.TypeTask,
+			Labels:           []string{"api"},
+			EstimatedMinutes: &est3000,
+			ClosedAt:         &futureClosed,
+			UpdatedAt:        futureClosed,
+		},
+		{
+			ID:               "FUTURE-UPDATED-FALLBACK",
+			Title:            "Closed without ClosedAt, future UpdatedAt",
+			Status:           model.StatusClosed,
+			IssueType:        model.TypeTask,
+			Labels:           []string{"api"},
+			EstimatedMinutes: &est3000,
+			UpdatedAt:        futureUpdated,
+		},
+	}
+
+	etaAtNow, err := EstimateETAForIssue(issues, nil, "TARGET", 1, now)
+	if err != nil {
+		t.Fatalf("EstimateETAForIssue(now) failed: %v", err)
+	}
+	if etaAtNow.EstimatedDays < 9.99 || etaAtNow.EstimatedDays > 10.01 {
+		t.Fatalf("future closures leaked into EstimateETAForIssue: got %.4f days, want 10.0 days", etaAtNow.EstimatedDays)
+	}
+	if etaAtNow.Confidence != "low" {
+		t.Fatalf("Confidence = %q, want \"low\" (only 1 valid past closure, not 3)", etaAtNow.Confidence)
+	}
+
+	openOnly := issues[:1]
+	boundsAtNow := ComputeGrahamBounds(openOnly, issues, nil, 1, now)
+	if boundsAtNow.VelocityMinPerDay < 9.99 || boundsAtNow.VelocityMinPerDay > 10.01 {
+		t.Fatalf("future closures leaked into ComputeGrahamBounds: VelocityMinPerDay=%.4f, want 10.0", boundsAtNow.VelocityMinPerDay)
+	}
+	if boundsAtNow.GrahamMinDays < 9.99 || boundsAtNow.GrahamMinDays > 10.01 {
+		t.Fatalf("GrahamMinDays = %.4f, want 10.0", boundsAtNow.GrahamMinDays)
+	}
+
+	// Planted negative control: advancing `now` past those closure timestamps makes them legitimate
+	// historical closures within (laterNow-30d, laterNow], increasing velocity to 6300/30 = 210 min/day.
+	laterNow := now.AddDate(0, 0, 5)
+	etaLater, err := EstimateETAForIssue(issues, nil, "TARGET", 1, laterNow)
+	if err != nil {
+		t.Fatalf("EstimateETAForIssue(laterNow) failed: %v", err)
+	}
+	wantLaterDays := 100.0 / 210.0
+	if etaLater.EstimatedDays < wantLaterDays-0.01 || etaLater.EstimatedDays > wantLaterDays+0.01 {
+		t.Fatalf("laterNow EstimateETAForIssue = %.4f days, want %.4f once closures are in the past", etaLater.EstimatedDays, wantLaterDays)
+	}
+	if etaLater.Confidence != "medium" {
+		t.Fatalf("laterNow Confidence = %q, want \"medium\" (3 past closures)", etaLater.Confidence)
+	}
+}
