@@ -12,11 +12,19 @@ import (
 
 // FormatTimeRel returns a relative time string (e.g., "2h ago", "3d ago")
 func FormatTimeRel(t time.Time) string {
+	return FormatTimeRelAt(t, time.Now())
+}
+
+// FormatTimeRelAt returns a relative time string anchored to now (falls back to time.Now() if zero).
+func FormatTimeRelAt(t, now time.Time) string {
 	if t.IsZero() {
 		return "unknown"
 	}
+	if now.IsZero() {
+		now = time.Now()
+	}
 
-	d := time.Since(t)
+	d := now.Sub(t)
 	if d < 0 {
 		// Future timestamps treated as now
 		return "now"

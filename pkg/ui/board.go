@@ -1571,10 +1571,17 @@ func (b BoardModel) renderTitleBar(width int, t Theme) string {
 // getAgeColor returns a color based on issue age (bv-1daf)
 // green (<7d), yellow (7-30d), red (>30d stale)
 func getAgeColor(t time.Time) lipgloss.TerminalColor {
+	return getAgeColorAt(t, time.Now())
+}
+
+func getAgeColorAt(t, now time.Time) lipgloss.TerminalColor {
 	if t.IsZero() {
 		return ColorMuted
 	}
-	days := int(time.Since(t).Hours() / 24)
+	if now.IsZero() {
+		now = time.Now()
+	}
+	days := int(now.Sub(t).Hours() / 24)
 	switch {
 	case days < 7:
 		return lipgloss.AdaptiveColor{Light: "#2e7d32", Dark: "#81c784"} // green
@@ -1684,11 +1691,12 @@ func (b BoardModel) renderCard(issue model.Issue, width int, selected bool, colI
 	displayID := truncateRunesHelper(issue.ID, maxIDLen, "…")
 
 	// Age indicator with color coding: green(<7d), yellow(7-30d), red(>30d)
-	ageText := FormatTimeRel(issue.UpdatedAt)
+	now := b.effectiveNow()
+	ageText := FormatTimeRelAt(issue.UpdatedAt, now)
 	if len(ageText) > 6 {
 		ageText = truncateRunesHelper(ageText, 6, "")
 	}
-	ageColor := getAgeColor(issue.UpdatedAt)
+	ageColor := getAgeColorAt(issue.UpdatedAt, now)
 	ageStyled := t.Renderer.NewStyle().Foreground(ageColor).Render(ageText)
 
 	line1 := fmt.Sprintf("%s %s %s %s",
@@ -1808,7 +1816,7 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 		borderColor = lipgloss.AdaptiveColor{Light: "#c62828", Dark: "#ef5350"} // Red - blocked
 	} else if blocksOthers {
 		borderColor = lipgloss.AdaptiveColor{Light: "#f57c00", Dark: "#ffb74d"} // Yellow - high impact
-	} else if issue.Status == model.StatusOpen && statusBadge == "" {
+	} else if b.isCardClaimable(issue, hasBlockingDeps, statusBadge) {
 		borderColor = lipgloss.AdaptiveColor{Light: "#2e7d32", Dark: "#81c784"} // Green - ready
 	} else {
 		borderColor = t.Primary // Selected uses primary
@@ -1933,9 +1941,10 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 	// ══════════════════════════════════════════════════════════════════════════
 	// TIMESTAMPS
 	// ══════════════════════════════════════════════════════════════════════════
+	now := b.effectiveNow()
 	timeStyle := t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true)
 	timestamps := timeStyle.Render(fmt.Sprintf("Created: %s | Updated: %s",
-		FormatTimeRel(issue.CreatedAt), FormatTimeRel(issue.UpdatedAt)))
+		FormatTimeRelAt(issue.CreatedAt, now), FormatTimeRelAt(issue.UpdatedAt, now)))
 
 	// ══════════════════════════════════════════════════════════════════════════
 	// ASSEMBLE CARD
@@ -2051,9 +2060,10 @@ func (b *BoardModel) syncDetailContent() {
 	}
 
 	// Timestamps
+	now := b.effectiveNow()
 	content.WriteString("\n---\n\n")
-	content.WriteString(fmt.Sprintf("*Created: %s*\n", FormatTimeRel(issue.CreatedAt)))
-	content.WriteString(fmt.Sprintf("*Updated: %s*\n", FormatTimeRel(issue.UpdatedAt)))
+	content.WriteString(fmt.Sprintf("*Created: %s*\n", FormatTimeRelAt(issue.CreatedAt, now)))
+	content.WriteString(fmt.Sprintf("*Updated: %s*\n", FormatTimeRelAt(issue.UpdatedAt, now)))
 
 	// Render with markdown
 	rendered := content.String()
