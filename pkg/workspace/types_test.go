@@ -3,8 +3,10 @@ package workspace_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/workspace"
 )
 
@@ -690,5 +692,79 @@ func TestConfigValidateDisabledRepos(t *testing.T) {
 				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestWorkspaceAndDriftConfigRejectUnknownYAMLFields(t *testing.T) {
+	writeWorkspaceYAML := func(content string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "workspace.yaml")
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "unknown top-level workspace key",
+			yaml: "name: mono\ndiscovery_typo: true\nrepos:\n  - path: services/api\n",
+			want: "field discovery_typo not found",
+		},
+		{
+			name: "unknown nested repo key",
+			yaml: "repos:\n  - path: services/api\n    prefx: api-\n",
+			want: "field prefx not found",
+		},
+		{
+			name: "multi-document workspace YAML",
+			yaml: "repos:\n  - path: services/api\n---\nrepos:\n  - path: services/web\n",
+			want: "multiple YAML documents",
+		},
+		{
+			name: "comment-only workspace YAML fails validation cleanly",
+			yaml: "# comment only\n",
+			want: "workspace must have at least one repo or enable discovery",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := workspace.LoadConfig(writeWorkspaceYAML(tc.yaml))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("workspace.LoadConfig() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+
+	// Planted negative control: valid workspace.yaml with comments loads cleanly.
+	validWS := writeWorkspaceYAML("# Workspace config\nname: mono\nrepos:\n  - name: api\n    path: services/api\n    prefix: api-\n")
+	wsCfg, err := workspace.LoadConfig(validWS)
+	if err != nil {
+		t.Fatalf("valid workspace.yaml failed: %v", err)
+	}
+	if wsCfg.Name != "mono" || len(wsCfg.Repos) != 1 || wsCfg.Repos[0].Prefix != "api-" {
+		t.Fatalf("unexpected workspace.Config: %+v", wsCfg)
+	}
+
+	// Also verify drift.LoadConfig rejects unknown YAML keys & multi-document streams while accepting comment-only files.
+	driftDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(driftDir, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	driftFile := filepath.Join(driftDir, ".bv", "drift.yaml")
+	if err := os.WriteFile(driftFile, []byte("unknown_drift_key: 42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := drift.LoadConfig(driftDir); err == nil || !strings.Contains(err.Error(), "field unknown_drift_key not found") {
+		t.Fatalf("drift.LoadConfig() unknown field error = %v, want field not found", err)
+	}
+	if err := os.WriteFile(driftFile, []byte("# comment only\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := drift.LoadConfig(driftDir); err != nil {
+		t.Fatalf("drift.LoadConfig() comment-only failed: %v", err)
 	}
 }

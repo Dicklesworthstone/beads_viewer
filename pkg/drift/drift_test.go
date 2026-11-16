@@ -2976,3 +2976,67 @@ func TestSourceInconsistencyAlerts_DirectionAwareSuggestedAction(t *testing.T) {
 		t.Fatalf("newer SQLite deletion vs stale JSONL should advise checking authoritative source, got %q", tombAlerts[1].SuggestedAction)
 	}
 }
+
+func TestDriftLoadConfigRejectsUnknownYAMLFieldsAndMultiDoc(t *testing.T) {
+	writeDriftYAML := func(content string) string {
+		t.Helper()
+		dir := t.TempDir()
+		bvDir := filepath.Join(dir, ".bv")
+		if err := os.MkdirAll(bvDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bvDir, "drift.yaml"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	// Positive observable 1: unknown top-level or nested label_overrides key fails closed.
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "unknown top-level key",
+			yaml: "stale_warnig_days: 7\n",
+			want: "field stale_warnig_days not found",
+		},
+		{
+			name: "unknown nested label_overrides key",
+			yaml: "label_overrides:\n  urgent:\n    stale_warnig_days: 3\n",
+			want: "field stale_warnig_days not found",
+		},
+		{
+			name: "multi-document YAML",
+			yaml: "stale_warning_days: 10\n---\nstale_warning_days: 5\n",
+			want: "multiple YAML documents",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadConfig(writeDriftYAML(tc.yaml))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("LoadConfig() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+
+	// Planted negative controls: comment-only YAML and valid YAML succeed.
+	commentDir := writeDriftYAML("# Only comments in .bv/drift.yaml\n\n")
+	defCfg, err := LoadConfig(commentDir)
+	if err != nil {
+		t.Fatalf("comment-only drift.yaml failed: %v", err)
+	}
+	if defCfg.StaleWarningDays != DefaultConfig().StaleWarningDays {
+		t.Fatalf("comment-only StaleWarningDays = %d, want default %d", defCfg.StaleWarningDays, DefaultConfig().StaleWarningDays)
+	}
+
+	validDir := writeDriftYAML("# Valid config\nstale_warning_days: 10\nstale_critical_days: 25\n")
+	validCfg, err := LoadConfig(validDir)
+	if err != nil {
+		t.Fatalf("valid drift.yaml failed: %v", err)
+	}
+	if validCfg.StaleWarningDays != 10 || validCfg.StaleCriticalDays != 25 {
+		t.Fatalf("validCfg = (%d, %d), want (10, 25)", validCfg.StaleWarningDays, validCfg.StaleCriticalDays)
+	}
+}
