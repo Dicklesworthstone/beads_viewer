@@ -190,9 +190,8 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 	}
 
 	// Strategy 1: ID mention search (definitive match)
-	idResults, idMeta := c.searchByID(ctx, issue.ID)
-	result.TotalFound = idMeta.Total
-	stop := note("ID search", idMeta)
+	idResults, idTotal, stop := c.searchByIssueIDs(ctx, issue, note)
+	result.TotalFound = idTotal
 	if len(idResults) > 0 {
 		result.TopSessions = idResults
 		result.Strategy = StrategyIDMention
@@ -234,15 +233,111 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 	return finish()
 }
 
+func (c *Correlator) workspaceForIssue(issue *model.Issue) string {
+	if issue != nil && issue.Origin != nil {
+		if wd := strings.TrimSpace(issue.Origin.WorkingDirectory); wd != "" {
+			return wd
+		}
+	}
+	return c.workspace
+}
+
+func candidateIssueIDs(issue *model.Issue) []string {
+	if issue == nil {
+		return nil
+	}
+	if issue.Origin != nil {
+		if localID := strings.TrimSpace(issue.Origin.LocalID); localID != "" {
+			if issue.ID != "" && issue.ID != localID {
+				return []string{localID, issue.ID}
+			}
+			return []string{localID}
+		}
+	}
+	if issue.ID != "" {
+		return []string{issue.ID}
+	}
+	return nil
+}
+
+func mentionsAnyIssueID(r SearchResult, ids []string) bool {
+	if len(ids) == 0 {
+		return false
+	}
+	combined := strings.ToLower(r.Snippet + " " + r.Title)
+	for _, id := range ids {
+		trimmed := strings.ToLower(strings.TrimSpace(id))
+		if trimmed != "" && strings.Contains(combined, trimmed) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Correlator) searchByIssueIDs(ctx context.Context, issue *model.Issue, note func(string, SearchMeta) bool) ([]ScoredResult, int, bool) {
+	ws := c.workspaceForIssue(issue)
+	ids := candidateIssueIDs(issue)
+	if len(ids) == 0 {
+		return nil, 0, false
+	}
+
+	type hitKey struct {
+		path string
+		line int
+	}
+	byKey := make(map[hitKey]ScoredResult)
+	order := make([]hitKey, 0)
+	totalFound := 0
+	dupHits := 0
+	stop := false
+
+	for _, id := range ids {
+		results, meta := c.searchByIDInWorkspace(ctx, id, ws)
+		totalFound += meta.Total
+		stop = note("ID search", meta)
+		for _, sr := range results {
+			k := hitKey{path: sr.SourcePath, line: sr.LineNumber}
+			if prev, exists := byKey[k]; exists {
+				dupHits++
+				if sr.FinalScore > prev.FinalScore {
+					byKey[k] = sr
+				}
+				continue
+			}
+			byKey[k] = sr
+			order = append(order, k)
+		}
+		if stop {
+			break
+		}
+	}
+
+	if totalFound >= dupHits {
+		totalFound -= dupHits
+	}
+	if len(order) == 0 {
+		return nil, totalFound, stop
+	}
+	merged := make([]ScoredResult, 0, len(order))
+	for _, k := range order {
+		merged = append(merged, byKey[k])
+	}
+	return c.rankAndLimit(merged), totalFound, stop
+}
+
 // searchByID searches for the bead ID literally in sessions.
 func (c *Correlator) searchByID(ctx context.Context, beadID string) ([]ScoredResult, SearchMeta) {
+	return c.searchByIDInWorkspace(ctx, beadID, c.workspace)
+}
+
+func (c *Correlator) searchByIDInWorkspace(ctx context.Context, beadID, workspace string) ([]ScoredResult, SearchMeta) {
 	// Quote the ID for exact matching
 	query := `"` + beadID + `"`
 
 	resp := c.searcher.Search(ctx, SearchOptions{
 		Query:     query,
 		Limit:     MaxSessionsReturned,
-		Workspace: c.workspace,
+		Workspace: workspace,
 	})
 
 	if len(resp.Results) == 0 {
@@ -253,7 +348,7 @@ func (c *Correlator) searchByID(ctx context.Context, beadID string) ([]ScoredRes
 	for _, r := range resp.Results {
 		score := float64(ScoreIDMention)
 		score = c.applyTimeDecay(score, r.Timestamp)
-		score = c.applyWorkspaceBoost(score, r.Workspace)
+		score = c.applyWorkspaceBoostFor(score, r.Workspace, workspace)
 
 		if score >= MinScoreThreshold {
 			scored = append(scored, ScoredResult{
@@ -278,12 +373,14 @@ func (c *Correlator) searchByKeywords(ctx context.Context, issue *model.Issue, k
 
 	// Calculate search window based on bead activity
 	days := c.calculateSearchDays(issue)
+	workspace := c.workspaceForIssue(issue)
+	ids := candidateIssueIDs(issue)
 
 	resp := c.searcher.Search(ctx, SearchOptions{
 		Query:     query,
 		Limit:     MaxSessionsReturned * 2, // Get extra to filter
 		Days:      days,
-		Workspace: c.workspace,
+		Workspace: workspace,
 	})
 
 	if len(resp.Results) == 0 {
@@ -292,10 +389,13 @@ func (c *Correlator) searchByKeywords(ctx context.Context, issue *model.Issue, k
 
 	scored := make([]ScoredResult, 0, len(resp.Results))
 	for _, r := range resp.Results {
-		// Score based on how well keywords match
+		// Score based on how well keywords match (elevating literal mentions of LocalID or ID)
 		baseScore := c.scoreKeywordMatch(r, keywords)
+		if mentionsAnyIssueID(r, ids) && baseScore < float64(ScoreIDMention) {
+			baseScore = float64(ScoreIDMention)
+		}
 		score := c.applyTimeDecay(baseScore, r.Timestamp)
-		score = c.applyWorkspaceBoost(score, r.Workspace)
+		score = c.applyWorkspaceBoostFor(score, r.Workspace, workspace)
 
 		if score >= MinScoreThreshold {
 			matchedKeywords := c.findMatchedKeywords(r, keywords)
@@ -319,13 +419,15 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 	if days == 0 {
 		days = 7 // Default to a week
 	}
+	workspace := c.workspaceForIssue(issue)
+	ids := candidateIssueIDs(issue)
 
 	// Search broadly - we're relying on timestamp for relevance
 	resp := c.searcher.Search(ctx, SearchOptions{
 		Query:     "*", // Match all within time window
 		Limit:     MaxSessionsReturned * 3,
 		Days:      days,
-		Workspace: c.workspace,
+		Workspace: workspace,
 	})
 
 	if len(resp.Results) == 0 {
@@ -335,7 +437,10 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 	scored := make([]ScoredResult, 0, len(resp.Results))
 	for _, r := range resp.Results {
 		baseScore := c.scoreTimestampProximity(r.Timestamp, issue)
-		score := c.applyWorkspaceBoost(baseScore, r.Workspace)
+		if mentionsAnyIssueID(r, ids) && baseScore < float64(ScoreIDMention) {
+			baseScore = float64(ScoreIDMention)
+		}
+		score := c.applyWorkspaceBoostFor(baseScore, r.Workspace, workspace)
 
 		if score >= MinScoreThreshold {
 			scored = append(scored, ScoredResult{
@@ -528,12 +633,16 @@ func (c *Correlator) applyTimeDecay(score float64, sessionTime time.Time) float6
 
 // applyWorkspaceBoost multiplies score if session is in the same workspace.
 func (c *Correlator) applyWorkspaceBoost(score float64, sourcePath string) float64 {
-	if c.workspace == "" || sourcePath == "" {
+	return c.applyWorkspaceBoostFor(score, sourcePath, c.workspace)
+}
+
+func (c *Correlator) applyWorkspaceBoostFor(score float64, sourcePath, targetWorkspace string) float64 {
+	if targetWorkspace == "" || sourcePath == "" {
 		return score
 	}
 
 	// Normalize paths for comparison
-	workspace := filepath.Clean(c.workspace)
+	workspace := filepath.Clean(targetWorkspace)
 	source := filepath.Clean(sourcePath)
 
 	// Check if sourcePath is under workspace (primary check)
