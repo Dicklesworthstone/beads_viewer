@@ -43,6 +43,7 @@ func TestFileChangedPreservesTriageData(t *testing.T) {
 	beadsPath := writeTempBeadsFile(t, t.TempDir(), issue)
 
 	m := NewModel([]model.Issue{issue}, nil, beadsPath)
+	t.Cleanup(m.Stop)
 
 	m.triageScores = map[string]float64{issue.ID: 0.9}
 	m.triageReasons = map[string]analysis.TriageReasons{

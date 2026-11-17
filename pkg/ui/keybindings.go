@@ -229,8 +229,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		// gg is a 200 ms combo; only the board and tree implement it. In the
 		// list a single g opens the graph view.
 		{"gg", "Go to start", "Navigation", "board,tree"},
-		{"ctrl+d", "Page down", "Navigation", "list,detail,board,graph,insights,tree,actionable,flow,attention,label,velocity"},
-		{"ctrl+u", "Page up", "Navigation", "list,detail,board,graph,insights,tree,actionable,flow,attention,label,velocity"},
+		{"ctrl+d", "Page down", "Navigation", "list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity"},
+		{"ctrl+u", "Page up", "Navigation", "list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity"},
 		{"enter", "Open details", "Navigation", "list,detail,board,graph,insights,actionable,history"},
 		{"esc", "Back/close (list: clear filters)", "Navigation", "all"},
 		{"q", "Quit / close view", "Navigation", "all"},

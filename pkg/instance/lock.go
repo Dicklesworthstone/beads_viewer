@@ -81,6 +81,7 @@ type Lock struct {
 	pid      int
 	hostname string
 	isFirst  bool
+	released bool
 	ownerID  string
 }
 
@@ -244,6 +245,15 @@ func (l *Lock) SameHost() bool {
 	return holderHost == localHost
 }
 
+// Refresh re-checks lock ownership when this instance is currently secondary,
+// taking over stale or released locks once the primary instance exits.
+func (l *Lock) Refresh() {
+	if l == nil {
+		return
+	}
+	l.checkStale()
+}
+
 // checkStale checks if the existing lock is stale (held by a dead process or
 // an expired foreign-host lease) and takes it over if so. Uses atomic rename
 // to avoid TOCTOU race conditions.
@@ -252,7 +262,7 @@ func (l *Lock) checkStale() {
 		return
 	}
 	l.mu.RLock()
-	if l.isFirst {
+	if l.isFirst || l.released || l.path == "" {
 		l.mu.RUnlock()
 		return
 	}
@@ -264,7 +274,7 @@ func (l *Lock) checkStale() {
 	defer staleLockMu.Unlock()
 
 	l.mu.RLock()
-	if l.isFirst {
+	if l.isFirst || l.released || l.path == "" {
 		l.mu.RUnlock()
 		return
 	}
@@ -273,6 +283,10 @@ func (l *Lock) checkStale() {
 	// Re-read the lock file to get current state (another goroutine may have taken over)
 	existing, err := readLockFile(lockPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			l.acquireMissingLock(lockPath)
+			return
+		}
 		// A recent unreadable file may be a process between O_EXCL create and
 		// JSON write. Only recover older unreadable files that are likely left
 		// behind by a crash or interrupted write.
@@ -296,6 +310,60 @@ func (l *Lock) checkStale() {
 	}
 
 	l.takeOverStaleLock(lockPath)
+}
+
+func (l *Lock) acquireMissingLock(lockPath string) {
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0644)
+	if err != nil {
+		if os.IsExist(err) {
+			if existing, readErr := readLockFile(lockPath); readErr == nil && existing != nil {
+				l.mu.Lock()
+				if !l.isFirst {
+					l.pid = existing.PID
+					l.hostname = existing.Hostname
+				}
+				l.mu.Unlock()
+			}
+		}
+		return
+	}
+	ownerID, err := newLockOwnerID()
+	if err != nil {
+		_ = file.Close()
+		removeLockFileBestEffort(lockPath)
+		return
+	}
+	ownerPID := os.Getpid()
+	hostname, _ := currentHostname()
+	info := LockInfo{
+		PID:       ownerPID,
+		StartedAt: time.Now(),
+		Hostname:  hostname,
+		OwnerID:   ownerID,
+	}
+	if err := json.NewEncoder(file).Encode(info); err != nil {
+		_ = file.Close()
+		removeLockFileBestEffort(lockPath)
+		return
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		removeLockFileBestEffort(lockPath)
+		return
+	}
+	l.mu.Lock()
+	if l.released {
+		l.mu.Unlock()
+		_ = file.Close()
+		removeLockFileBestEffort(lockPath)
+		return
+	}
+	l.lockFile = file
+	l.isFirst = true
+	l.pid = ownerPID
+	l.hostname = hostname
+	l.ownerID = ownerID
+	l.mu.Unlock()
 }
 
 func isExistingLockStale(lockPath string, existing *LockInfo) bool {
@@ -428,11 +496,13 @@ func (l *Lock) Release() {
 	if l.isFirst && l.ownsCurrentLockFileLocked() {
 		if err := os.Remove(l.path); err != nil && !os.IsNotExist(err) {
 			l.isFirst = false
+			l.released = true
 			return
 		}
 	}
 
 	l.isFirst = false
+	l.released = true
 }
 
 func (l *Lock) ownsCurrentLockFileLocked() bool {

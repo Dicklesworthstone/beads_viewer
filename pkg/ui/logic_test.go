@@ -65,7 +65,9 @@ func TestFlowMatrixParentRefreshAndDetails(t *testing.T) {
 	}
 	press(tea.KeyMsg{Type: tea.KeyDown})
 	issues[2].Title = "REFRESHED API rollout"
-	m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(copyIssues(issues)).Build(), SnapshotVer: 1})
+	snap1 := NewSnapshotBuilder(copyIssues(issues)).Build()
+	snap1.Analysis.WaitForPhase2()
+	m.Update(SnapshotReadyMsg{Snapshot: snap1, SnapshotVer: 1})
 	if got := m.flowMatrix.SelectedDrilldownIssue(); got == nil || got.ID != "dependent" || got.Title != issues[2].Title {
 		t.Fatalf("parent snapshot kept stale/wrong endpoint: %+v\n%s", got, m.flowMatrix.View())
 	}
@@ -75,7 +77,9 @@ func TestFlowMatrixParentRefreshAndDetails(t *testing.T) {
 	}
 	press(tea.KeyMsg{Type: tea.KeyEsc})
 	issues[0].Status = model.StatusClosed
-	m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(copyIssues(issues)).Build(), SnapshotVer: 2})
+	snap2 := NewSnapshotBuilder(copyIssues(issues)).Build()
+	snap2.Analysis.WaitForPhase2()
+	m.Update(SnapshotReadyMsg{Snapshot: snap2, SnapshotVer: 2})
 	if m.flowMatrix.SelectedDrilldownIssue() != nil || strings.Contains(m.flowMatrix.View(), "API rollout") {
 		t.Fatalf("parent retained closed relationship:\n%s", m.flowMatrix.View())
 	}
@@ -166,6 +170,7 @@ func TestComputeAlertsPreservesSourceAuthorityScopeAndClock(t *testing.T) {
 			a.SetReadinessScope(model.NewReadinessIndex(authorityIssues), tc.candidates)
 			a.SetNow(tc.now)
 			stats := a.AnalyzeWithConfig(analysis.AnalysisConfig{})
+			stats.WaitForPhase2()
 			alerts, _, _, _ := computeAlerts(issues, &stats, a)
 			gate := false
 			for _, alert := range alerts {
@@ -197,6 +202,7 @@ func TestApplyRecipe_StatusFilter(t *testing.T) {
 		{ID: "blocked", Status: model.StatusBlocked},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 
 	r := &recipe.Recipe{
 		Name: "closed-only",
@@ -226,6 +232,7 @@ func TestApplyRecipe_PriorityFilter(t *testing.T) {
 		{ID: "p2", Status: model.StatusOpen, Priority: 2},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 
 	r := &recipe.Recipe{
 		Filters: recipe.FilterConfig{
@@ -253,6 +260,7 @@ func TestApplyRecipe_ActionableFilter(t *testing.T) {
 		}},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 
 	yes := true
 	r := &recipe.Recipe{
@@ -285,6 +293,7 @@ func TestNewModel_ScopedReadinessAuthority(t *testing.T) {
 	yes := true
 	r := &recipe.Recipe{Name: "actionable", Filters: recipe.FilterConfig{Actionable: &yes}}
 	m := NewModel(copyIssues(selected), r, "", ReadinessScope{Authority: model.NewReadinessIndex(full)})
+	t.Cleanup(func() { m.Stop() })
 	if got := m.FilteredIssues(); len(got) != 1 || got[0].ID != "allowed" {
 		t.Errorf("initial actionable recipe = %v, want allowed only", got)
 	}
@@ -311,6 +320,7 @@ func TestNewModel_LabelContextIsNotCandidateWork(t *testing.T) {
 	}
 	candidates := map[string]bool{"api-blocked": true, "api-ready": true}
 	m := NewModel(copyIssues(issues), nil, "", ReadinessScope{Authority: model.NewReadinessIndex(issues), CandidateIDs: candidates})
+	t.Cleanup(func() { m.Stop() })
 	if m.countReady != 1 {
 		t.Errorf("ready count includes graph context: %d, want 1", m.countReady)
 	}
@@ -350,7 +360,9 @@ func TestNewModel_LabelContextIsNotCandidateWork(t *testing.T) {
 	// Mutating the caller's map must not widen the model's owned selection.
 	candidates["web-ready"] = true
 	assertSelectedWork(t, m)
-	updated, _ := m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(copyIssues(issues)).WithRecipe(m.activeRecipe).Build()})
+	snapRecipe := NewSnapshotBuilder(copyIssues(issues)).WithRecipe(m.activeRecipe).Build()
+	snapRecipe.Analysis.WaitForPhase2()
+	updated, _ := m.Update(SnapshotReadyMsg{Snapshot: snapRecipe})
 	m = updated.(*Model)
 	if m.countReady != 1 {
 		t.Errorf("reloaded ready count includes graph context: %d, want 1", m.countReady)
@@ -362,7 +374,9 @@ func TestNewModel_LabelContextIsNotCandidateWork(t *testing.T) {
 
 	m.setActiveRecipe(nil)
 	m.SetFilter("all")
-	updated, _ = m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(copyIssues(issues)).Build()})
+	snapAll := NewSnapshotBuilder(copyIssues(issues)).Build()
+	snapAll.Analysis.WaitForPhase2()
+	updated, _ = m.Update(SnapshotReadyMsg{Snapshot: snapAll})
 	m = updated.(*Model)
 	if len(m.FilteredIssues()) != 3 {
 		t.Fatal("reloaded graph context should remain available in the all view")
@@ -395,7 +409,9 @@ func TestNewModel_LabelContextIsNotCandidateWork(t *testing.T) {
 			reloaded[i].Status = model.StatusClosed
 		}
 	}
-	updated, _ = m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(reloaded).Build()})
+	snapReloaded := NewSnapshotBuilder(reloaded).Build()
+	snapReloaded.Analysis.WaitForPhase2()
+	updated, _ = m.Update(SnapshotReadyMsg{Snapshot: snapReloaded})
 	m = updated.(*Model)
 	m.SetFilter("ready")
 	if got := m.FilteredIssues(); len(got) != 2 || m.countReady != 2 {
@@ -406,6 +422,7 @@ func TestNewModel_LabelContextIsNotCandidateWork(t *testing.T) {
 func TestNewModel_EmptyReadinessSelectionDoesNotSelectContext(t *testing.T) {
 	issues := []model.Issue{{ID: "context", Status: model.StatusOpen}}
 	m := NewModel(copyIssues(issues), nil, "", ReadinessScope{CandidateIDs: map[string]bool{}})
+	t.Cleanup(func() { m.Stop() })
 	if len(m.FilteredIssues()) != 1 {
 		t.Fatal("empty work selection must preserve exploration context")
 	}
@@ -413,7 +430,9 @@ func TestNewModel_EmptyReadinessSelectionDoesNotSelectContext(t *testing.T) {
 	if len(m.FilteredIssues()) != 0 || m.countReady != 0 {
 		t.Fatal("empty candidate map must select no ready work")
 	}
-	updated, _ := m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(copyIssues(issues)).Build()})
+	snapEmpty := NewSnapshotBuilder(copyIssues(issues)).Build()
+	snapEmpty.Analysis.WaitForPhase2()
+	updated, _ := m.Update(SnapshotReadyMsg{Snapshot: snapEmpty})
 	m = updated.(*Model)
 	if len(m.FilteredIssues()) != 0 || m.countReady != 0 || len(m.insightsPanel.topPicks) != 0 {
 		t.Fatal("reload widened empty candidate selection")
@@ -432,6 +451,7 @@ func TestNewModel_RepoSelectionSurvivesFullSourceReload(t *testing.T) {
 	selected := copyIssues(issues[:2])
 	candidateIDs := map[string]bool{"api-ready": true, "api-blocked": true}
 	m := NewModel(selected, nil, "", ReadinessScope{Authority: model.NewReadinessIndex(issues), CandidateIDs: candidateIDs})
+	t.Cleanup(func() { m.Stop() })
 	m.SetFilter("ready")
 	if got := m.FilteredIssues(); len(got) != 1 || got[0].ID != "api-ready" {
 		t.Fatalf("initial repository selection = %v, want api-ready", got)
@@ -443,7 +463,9 @@ func TestNewModel_RepoSelectionSurvivesFullSourceReload(t *testing.T) {
 			loaded[2].Status = model.StatusClosed
 			wantReady = 2
 		}
-		updated, _ := m.Update(SnapshotReadyMsg{Snapshot: NewSnapshotBuilder(loaded).Build()})
+		snapLoaded := NewSnapshotBuilder(loaded).Build()
+		snapLoaded.Analysis.WaitForPhase2()
+		updated, _ := m.Update(SnapshotReadyMsg{Snapshot: snapLoaded})
 		m = updated.(*Model)
 		if len(m.issues) != len(issues) {
 			t.Fatal("regression must exercise a complete source reload")
@@ -472,6 +494,7 @@ func TestReadinessFilters_UseOneClockIncludingDeferralBoundary(t *testing.T) {
 	deadline := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
 	issue := model.Issue{ID: "scheduled", Status: model.StatusOpen, DeferUntil: &deadline}
 	m := NewModel([]model.Issue{issue}, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.currentFilter = "ready"
 	for _, now := range []time.Time{deadline.Add(-time.Nanosecond), deadline, deadline.Add(time.Nanosecond)} {
 		want := !now.Before(deadline)
@@ -566,6 +589,7 @@ func TestApplyRecipe_Sorting(t *testing.T) {
 		{ID: "C", Priority: 3},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 
 	r := &recipe.Recipe{
 		Sort: recipe.SortConfig{
@@ -618,13 +642,16 @@ func TestNewModel_RecipeSortDescendingTieBreaksByID(t *testing.T) {
 		m := NewModel(append([]model.Issue(nil), perm...), r, "")
 		filtered := m.FilteredIssues()
 		if len(filtered) != len(expected) {
+			m.Stop()
 			t.Fatalf("Expected %d issues, got %d", len(expected), len(filtered))
 		}
 		for i, want := range expected {
 			if filtered[i].ID != want {
+				m.Stop()
 				t.Fatalf("Input order %v: position %d = %s, want %s", perm, i, filtered[i].ID, want)
 			}
 		}
+		m.Stop()
 	}
 }
 
@@ -635,6 +662,7 @@ func TestAttentionView_CloseRestoresInsightsPanel(t *testing.T) {
 	}
 
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
 	m = updated.(*Model)
 	m.insightsPanel.focusedPanel = PanelCycles
@@ -672,6 +700,7 @@ func TestTimeTravel_DiffBadgePropagation(t *testing.T) {
 		{ID: "A", Status: model.StatusOpen},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 
 	// Manually inject diff state (simulating enterTimeTravelMode)
 	m.timeTravelMode = true
@@ -732,6 +761,7 @@ func TestModel_InitSkipsUpdateCheckWhenDisabled(t *testing.T) {
 	issues := []model.Issue{{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
 	initCmdCount := func() int {
 		m := NewModel(issues, nil, "")
+		defer m.Stop()
 		m.analysis = nil // WaitForPhase2Cmd then returns immediately if executed
 		cmd := m.Init()
 		if cmd == nil {
@@ -761,6 +791,7 @@ func TestModel_InitSkipsUpdateCheckWhenDisabled(t *testing.T) {
 func TestRenderAlertsPanel_ShowsEverySeverityAndSuggestedAction(t *testing.T) {
 	issues := []model.Issue{{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.width, m.height = 120, 40
 	m.alerts = []drift.Alert{
 		{Type: drift.AlertStaleIssue, Severity: drift.SeverityCritical, Message: "Issue A inactive for 45 days", IssueID: "A", SuggestedAction: "Update, close, or re-triage the issue"},
@@ -806,6 +837,7 @@ func TestRenderAlertsPanel_ShowsEverySeverityAndSuggestedAction(t *testing.T) {
 func TestInsightsKeys_ShiftTabAndTabCyclePanels(t *testing.T) {
 	issues := []model.Issue{{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.focused = focusInsights
 	m.insightsPanel.focusedPanel = 1
 
@@ -831,6 +863,7 @@ func TestTimeTravelKeys_NextPrevChangedIssue(t *testing.T) {
 		{ID: "D", Title: "D", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.focused = focusList
 	idAt := func(i int) string { return m.list.Items()[i].(IssueItem).Issue.ID }
 	changed := map[string]bool{idAt(1): true, idAt(3): true}
@@ -869,6 +902,7 @@ func TestTimeTravelKeys_NextPrevChangedIssue(t *testing.T) {
 func TestHistoryKeys_TTogglesTimelinePane(t *testing.T) {
 	issues := []model.Issue{{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.focused = focusHistory
 	m.historyView.SetSize(160, 40) // wide: timeline on by default
 	if !m.historyView.TimelineVisible() {
@@ -2248,6 +2282,7 @@ func TestRound2AuditRegressions(t *testing.T) {
 		mAll.applyRecipe(triageTop)
 
 		staleSnapAll := NewSnapshotBuilder(copyIssues(allIssues)).WithRecipe(triageTop).Build()
+		staleSnapAll.Analysis.WaitForPhase2()
 		if staleSnapAll.RecipeName != "triage-top" || len(staleSnapAll.ListItems) != 1 {
 			t.Fatalf("precondition: expected stale recipe snapshot with RecipeName=triage-top and 1 ListItem, got name=%q len=%d",
 				staleSnapAll.RecipeName, len(staleSnapAll.ListItems))
@@ -2274,6 +2309,7 @@ func TestRound2AuditRegressions(t *testing.T) {
 		mClosed.applyRecipe(triageTop)
 
 		staleSnapClosed := NewSnapshotBuilder(copyIssues(allIssues)).WithRecipe(triageTop).Build()
+		staleSnapClosed.Analysis.WaitForPhase2()
 		mClosed.setActiveRecipe(nil)
 		mClosed.currentFilter = "closed"
 		mClosed.applyFilter()
@@ -4100,6 +4136,7 @@ func TestWave10Round2_ExportAuthorityTreeReloadAndBoardQuit(t *testing.T) {
 			t.Fatal(err)
 		}
 		snap := NewSnapshotBuilder(snapLoaded.Issues).Build()
+		snap.Analysis.WaitForPhase2()
 		snap.DataHash = "snap-hash-v2"
 		snap.attachPooledIssues(snapLoaded.PoolRefs)
 		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 2})
@@ -4208,6 +4245,7 @@ func TestWave10Round2_ExportAuthorityTreeReloadAndBoardQuit(t *testing.T) {
 		}
 
 		snap := NewSnapshotBuilder(issues).Build()
+		snap.Analysis.WaitForPhase2()
 		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 1})
 		if m.sourceStaleReason != "" || m.statusIsError {
 			t.Fatalf("expected SnapshotReadyMsg to clear sourceStaleReason and statusIsError, got stale=%q err=%v", m.sourceStaleReason, m.statusIsError)
@@ -4847,6 +4885,7 @@ func TestWave12TrackBRegressions(t *testing.T) {
 
 		// Candidate-scoped counts after SnapshotReadyMsg:
 		snap := NewSnapshotBuilder(copyIssues(issues), scope.Authority).Build()
+		snap.Analysis.WaitForPhase2()
 		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 1})
 		if m.countOpen != 2 || m.countBlocked != 1 || m.countClosed != 1 {
 			t.Fatalf("SnapshotReadyMsg candidate counts: want open=2 blocked=1 closed=1, got open=%d blocked=%d closed=%d",
@@ -4988,6 +5027,7 @@ func TestWave12TrackBRegressions(t *testing.T) {
 
 		// BuildFromSnapshot deep-copy isolation: mutating TreeModel must NOT mutate snapshot.TreeRoots!
 		snap := NewSnapshotBuilder(copyIssues(cjkIssues)).Build()
+		snap.Analysis.WaitForPhase2()
 		if len(snap.TreeRoots) == 0 || !snap.TreeRoots[0].Expanded {
 			t.Fatalf("precondition: expected expanded root in snap.TreeRoots, got %+v", snap.TreeRoots)
 		}
@@ -5004,6 +5044,7 @@ func TestWave12TrackBRegressions(t *testing.T) {
 			{ID: "TIE-A", Title: "First ID", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: sameTime, UpdatedAt: sameTime},
 		}
 		tieSnap := NewSnapshotBuilder(copyIssues(tieInput)).Build()
+		tieSnap.Analysis.WaitForPhase2()
 		if len(tieSnap.Issues) != 2 || tieSnap.Issues[0].ID != "TIE-A" || tieSnap.Issues[1].ID != "TIE-B" {
 			t.Fatalf("expected SnapshotBuilder deterministic ID tie-breaker [TIE-A, TIE-B], got [%s, %s]",
 				tieSnap.Issues[0].ID, tieSnap.Issues[1].ID)
@@ -5375,6 +5416,7 @@ func TestWave13Round1AuditRemediations(t *testing.T) {
 		// Resize terminal AND deliver SnapshotReadyMsg while CassModal is open!
 		m.Update(tea.WindowSizeMsg{Width: 152, Height: 38})
 		snap := NewSnapshotBuilder(copyIssues(issues)).Build()
+		snap.Analysis.WaitForPhase2()
 		m.Update(SnapshotReadyMsg{Snapshot: snap, SnapshotVer: 1})
 
 		// Dismiss CassModal with Esc: flowDetailID must retain full width (152) and FLOW-END content!
@@ -5426,6 +5468,7 @@ func TestWave13Round1AuditRemediations(t *testing.T) {
 
 		// Unscoped SnapshotBuilder includes stale alert for ctx-stale (and any global unscoped alerts).
 		snap := NewSnapshotBuilder(copyIssues(issues), auth).Build()
+		snap.Analysis.WaitForPhase2()
 		snap.alerts = append(snap.alerts,
 			drift.Alert{Type: drift.AlertBlockingCascade, Severity: drift.SeverityCritical, Message: "Unscoped global cascade"},
 			drift.Alert{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "ctx-stale", Message: "Stale context"},

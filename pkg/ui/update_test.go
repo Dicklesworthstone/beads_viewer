@@ -206,6 +206,7 @@ func TestUpdateFileChangedReloadsSelection(t *testing.T) {
 		t.Fatalf("write beads: %v", err)
 	}
 	m := NewModel(nil, nil, beads)
+	t.Cleanup(m.Stop)
 	m.list.SetItems([]list.Item{IssueItem{Issue: model.Issue{ID: "ONE", Title: "One", Status: model.StatusOpen}}})
 	m.list.Select(0)
 
@@ -676,6 +677,7 @@ func TestUpdateFileChangedReloadsSQLiteSource(t *testing.T) {
 	}
 
 	m := NewModel(nil, nil, dbPath)
+	t.Cleanup(func() { m.Stop() })
 	if m.watcher != nil {
 		defer m.watcher.Stop()
 	}
@@ -717,6 +719,7 @@ func TestReloadPreservesHiddenTombstoneAuthority(t *testing.T) {
 				}
 			}
 			m := NewModel(nil, nil, "")
+			t.Cleanup(func() { m.Stop() })
 			m.beadsPath = path
 			updated, _ := m.Update(FileChangedMsg{})
 			m = updated.(*Model)
@@ -856,6 +859,7 @@ func TestNewModel_SetsTreeBeadsDirFromBeadsPath(t *testing.T) {
 	}
 
 	m := NewModel(nil, nil, beads)
+	t.Cleanup(m.Stop)
 	if m.watcher != nil {
 		m.watcher.Stop()
 	}

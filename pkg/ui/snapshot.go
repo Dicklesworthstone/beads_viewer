@@ -607,6 +607,9 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 			cfg.ComputeHITS = false
 			cfg.ComputeCriticalPath = false
 			cfg.ComputeCycles = false
+			cfg.ComputeKCore = false
+			cfg.ComputeArticulation = false
+			cfg.ComputeSlack = false
 			graphStats = b.analyzer.AnalyzeAsyncWithConfig(analysisCtx, cfg)
 		} else {
 			graphStats = b.analyzer.AnalyzeAsync(analysisCtx)
@@ -624,6 +627,9 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	readiness := b.analyzer.Readiness()
 	for i := range issues {
 		issue := &issues[i]
+		if !b.analyzer.IsCandidate(issue.ID) {
+			continue
+		}
 		if isClosedLikeStatus(issue.Status) {
 			cClosed++
 			continue
@@ -633,7 +639,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		if issue.Status == model.StatusBlocked {
 			cBlocked++
 		}
-		if b.analyzer.IsCandidate(issue.ID) && readiness.Ready(issue.ID, now) {
+		if readiness.Ready(issue.ID, now) {
 			cReady++
 		}
 	}

@@ -42,9 +42,11 @@ type RollbackCompleteMsg struct {
 }
 
 type updatePhaseTracker struct {
-	mu     sync.Mutex
-	stage  string
-	detail string
+	mu         sync.Mutex
+	stage      string
+	detail     string
+	downloaded int64
+	total      int64
 }
 
 func (t *updatePhaseTracker) Write(p []byte) (int, error) {
@@ -76,10 +78,20 @@ func (t *updatePhaseTracker) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (t *updatePhaseTracker) snapshot() (stage, detail string) {
+func (t *updatePhaseTracker) ReportBytes(downloaded, total int64) {
+	t.mu.Lock()
+	t.downloaded = downloaded
+	t.total = total
+	if t.stage == "" {
+		t.stage = "downloading"
+	}
+	t.mu.Unlock()
+}
+
+func (t *updatePhaseTracker) snapshot() (stage, detail string, downloaded, total int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.stage, t.detail
+	return t.stage, t.detail, t.downloaded, t.total
 }
 
 // UpdateProgress represents progress during download
@@ -354,8 +366,13 @@ func (m UpdateModal) Update(msg tea.Msg) (UpdateModal, tea.Cmd) {
 	case updateTickMsg:
 		if m.IsInProgress() && msg.startedAt == m.startTime {
 			if m.phaseTracker != nil {
-				stage, detail := m.phaseTracker.snapshot()
+				stage, detail, downloaded, total := m.phaseTracker.snapshot()
 				m.phaseDetail = detail
+				m.progress.BytesDownloaded = downloaded
+				m.progress.TotalBytes = total
+				if stage != "" {
+					m.progress.Stage = stage
+				}
 				switch stage {
 				case "downloading":
 					m.state = UpdateStateDownloading

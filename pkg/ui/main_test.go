@@ -79,6 +79,7 @@ func TestViewportAndInsightsDetailSurfaceDueDeferAndExternalRef(t *testing.T) {
 	}
 
 	m := NewModel([]model.Issue{issue}, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.isSplitView = true
 	m.updateViewportContent()
 	for _, want := range []string{"2026-11-20", "2026-10-25", "JIRA-9001"} {
@@ -110,6 +111,7 @@ func TestListVisibleBoundsClamping_GH210(t *testing.T) {
 		{ID: "GAMMA-3", Title: "Gamma other", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.list.SetSize(80, 20)
 
 	// Narrow visible items via a fuzzy filter to 1 row ("ALPHA-1"), then force
@@ -152,6 +154,7 @@ func TestInsightsHeatmapNavigationAndDrilldown(t *testing.T) {
 		{ID: "HM-2", Title: "Dependent mid score", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "HM-2", DependsOnID: "HM-1", Type: model.DepBlocks}}},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 45})
 	m = updated.(*Model)
 
@@ -224,6 +227,7 @@ func TestContextTutorialAndFocusRestoration(t *testing.T) {
 		{ID: "TUT-1", Title: "Tutorial focus test", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	m = updated.(*Model)
 
@@ -280,6 +284,7 @@ func TestHistoryCassSessionsWiredFromModel(t *testing.T) {
 		{ID: "HIST-1", Title: "History session test", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	m = updated.(*Model)
 
@@ -331,6 +336,7 @@ func TestVelocityComparisonWiredInLabelDashboard(t *testing.T) {
 		{ID: "VEL-2", Title: "Open frontend task", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"frontend"}, CreatedAt: now.Add(-5 * 24 * time.Hour), UpdatedAt: now},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	// Wide terminal (isSplitView == true) must still render LabelDashboardModel when focused on focusLabelDashboard.
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
 	m = updated.(*Model)
@@ -382,6 +388,7 @@ func TestInsightsHeatmapAndDrilldownViaModelUpdate(t *testing.T) {
 		{ID: "UPD-2", Title: "Dependent mid score", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "UPD-2", DependsOnID: "UPD-1", Type: model.DepBlocks}}},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 45})
 	m = updated.(*Model)
 
@@ -451,6 +458,7 @@ func TestLiveReloadRefreshesActionableAttentionAndLabelViews(t *testing.T) {
 		{ID: "LR-1", Title: "Initial task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"alpha"}, CreatedAt: now, UpdatedAt: now},
 	}
 	m := NewModel(issues1, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	m = updated.(*Model)
 
@@ -471,6 +479,7 @@ func TestLiveReloadRefreshesActionableAttentionAndLabelViews(t *testing.T) {
 		{ID: "LR-2", Title: "New urgent task", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, Labels: []string{"alpha", "beta"}, CreatedAt: now, UpdatedAt: now},
 	}
 	snap2 := NewSnapshotBuilder(issues2).Build()
+	t.Cleanup(snap2.Analysis.WaitForPhase2)
 	updated, _ = m.Update(SnapshotReadyMsg{Snapshot: snap2})
 	m = updated.(*Model)
 
@@ -495,6 +504,7 @@ func TestTextInputsConsumeGlobalOverlayTriggerKeys(t *testing.T) {
 		{ID: "TI-1", Title: "Text input test", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"alpha"}, CreatedAt: now, UpdatedAt: now},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	m = updated.(*Model)
 
@@ -522,6 +532,7 @@ func TestCrossViewPageJumpAndCopyKeybindings(t *testing.T) {
 		{ID: "ACT-3", Title: "Third actionable", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	m = updated.(*Model)
 
@@ -587,6 +598,7 @@ func TestNewModelHonorsSearchConfigFromEnvAndCustomWeights(t *testing.T) {
 		{ID: "ENV-1", Title: "Hybrid env config", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
 	}
 	m := NewModel(issues, nil, "/repo/.beads/issues.jsonl")
+	t.Cleanup(func() { m.Stop() })
 	if !m.semanticHybridEnabled {
 		t.Fatalf("expected semanticHybridEnabled=true from BV_SEARCH_MODE=hybrid")
 	}
@@ -702,6 +714,7 @@ func TestFileChangedAndPhase2PreserveFilterSortRecipeAndSprintDashboard(t *testi
 		Sort: recipe.SortConfig{Field: "pagerank", Direction: "desc"},
 	}
 	snap1 := NewSnapshotBuilder(graphIssues).WithRecipe(r).Build()
+	snap1.Analysis.WaitForPhase2()
 	analyzer := analysis.NewAnalyzer(graphIssues)
 	stats := analyzer.Analyze()
 	snap2 := snap1.WithPhase2(&stats, stats.GenerateInsights(len(graphIssues)), graphIssues, analyzer)
@@ -723,6 +736,7 @@ func TestModel_StartupUpdateDisclosureShownOnce(t *testing.T) {
 		{ID: "DISC-1", Title: "Disclosure test", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	updated, _ := m.Update(StartupUpdateCheckMsg{TagName: "", URL: "", Err: nil})
 	m = updated.(*Model)
 
@@ -749,6 +763,7 @@ func TestModel_StartupUpdateDisclosureShownOnce(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", noSaveRoot)
 	t.Setenv("BV_NO_SAVED_CONFIG", "1")
 	m2 := NewModel(issues, nil, "")
+	t.Cleanup(func() { m2.Stop() })
 	updated2, _ := m2.Update(StartupUpdateCheckMsg{TagName: "", URL: "", Err: nil})
 	m2 = updated2.(*Model)
 	if m2.statusMsg != "" {
@@ -777,6 +792,7 @@ func TestFlowMatrix_RendersTransitiveCascade(t *testing.T) {
 	}
 	flow := analysis.ComputeCrossLabelFlow(issues, analysis.DefaultLabelHealthConfig())
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	fm := NewFlowMatrixModel(m.theme)
 	fm.SetData(&flow, issues)
 	fm.SetSize(120, 35)

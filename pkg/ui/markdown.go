@@ -134,6 +134,11 @@ func (mr *MarkdownRenderer) Render(markdown string) (string, error) {
 	return rendered, err
 }
 
+var unstyledPaddingMarkdown = goldmark.New(
+	goldmark.WithExtensions(extension.GFM, extension.DefinitionList),
+	goldmark.WithParserOptions(parser.WithAutoHeadingID()),
+)
+
 // HTML and definition lists inherit Document.Color; wrapped links can carry
 // underline into its padding. Use Glamour's Markdown grammar to preserve their
 // original rendering, without mistaking fenced dependency labels for links.
@@ -159,11 +164,7 @@ func permitsUnstyledDocumentPadding(markdown string) bool {
 			}
 		}
 	}
-	md := goldmark.New(
-		goldmark.WithExtensions(extension.GFM, extension.DefinitionList),
-		goldmark.WithParserOptions(parser.WithAutoHeadingID()),
-	)
-	doc := md.Parser().Parse(text.NewReader([]byte(markdown)))
+	doc := unstyledPaddingMarkdown.Parser().Parse(text.NewReader([]byte(markdown)))
 	allowed := true
 	err := ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
 		if entering {

@@ -248,8 +248,17 @@ func customOpenColumnBadgeAt(issue model.Issue, now time.Time) string {
 		status != model.StatusTombstone {
 		return "[" + string(status) + "]"
 	}
-	if status == model.StatusOpen && issue.IsDeferredAt(now) {
-		return "[deferred]"
+	if status == model.StatusOpen {
+		switch {
+		case issue.Pinned:
+			return "[pinned]"
+		case issue.IsTemplate:
+			return "[template]"
+		case issue.Ephemeral:
+			return "[ephemeral]"
+		case issue.IsDeferredAt(now):
+			return "[deferred]"
+		}
 	}
 	return ""
 }

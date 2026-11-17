@@ -308,7 +308,17 @@ func (l *Loader) remove(name string) {
 func decodeStrict(data []byte, out any) error {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
-	if err := dec.Decode(out); err != nil && !errors.Is(err, io.EOF) {
+	if err := dec.Decode(out); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("unexpected multiple YAML documents")
+		}
 		return err
 	}
 	return nil

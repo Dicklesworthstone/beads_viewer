@@ -361,10 +361,66 @@ func (g *GraphModel) PageDown() {
 	g.ensureVisible()
 }
 
-func (g *GraphModel) ScrollLeft()  { g.scrollX = max(0, g.scrollX-8) }
-func (g *GraphModel) ScrollRight() { g.scrollX = min(g.maxScrollX, g.scrollX+8) }
-func (g *GraphModel) ScrollUp()    { g.scrollY = max(0, g.scrollY-3) }
-func (g *GraphModel) ScrollDown()  { g.scrollY = min(g.maxScrollY, g.scrollY+3) }
+func (g *GraphModel) ScrollLeft() { g.scrollX = max(0, g.scrollX-8) }
+func (g *GraphModel) ScrollRight() {
+	g.ensureCanvasBounds()
+	g.scrollX = min(g.maxScrollX, g.scrollX+8)
+}
+func (g *GraphModel) ScrollUp() { g.scrollY = max(0, g.scrollY-3) }
+func (g *GraphModel) ScrollDown() {
+	g.ensureCanvasBounds()
+	g.scrollY = min(g.maxScrollY, g.scrollY+3)
+}
+
+func (g *GraphModel) visualGraphDimensions(width, height int) (int, int) {
+	if width <= 0 {
+		width = 120
+	}
+	if height <= 0 {
+		height = 40
+	}
+	if width < 80 {
+		return width, height
+	}
+	listWidth := 28
+	if width < 120 {
+		listWidth = 24
+	}
+	return width - listWidth - 3, height - 2
+}
+
+func (g *GraphModel) ensureCanvasBounds() {
+	issue := g.SelectedIssue()
+	if issue == nil {
+		g.maxScrollX, g.maxScrollY = 0, 0
+		return
+	}
+	id := issue.ID
+	paneWidth, paneHeight := g.visualGraphDimensions(g.width, g.height)
+	viewportWidth, viewportHeight := max(1, paneWidth), max(1, paneHeight)
+	canvasWidth := max(60, viewportWidth)
+	neighbors := max(len(g.blockers[id]), len(g.dependents[id]))
+	rowWidth := min(5, neighbors) * 22
+	if neighbors > 5 {
+		rowWidth += len(fmt.Sprintf("+%d more", neighbors-5))
+	}
+	canvasWidth = max(canvasWidth, rowWidth)
+	t := g.theme
+	if t.Renderer == nil {
+		t = DefaultTheme(lipgloss.DefaultRenderer())
+	}
+	if g.canvasLines == nil || g.canvasID != id || g.canvasWidth != canvasWidth || g.canvasExpanded != g.expanded[id] {
+		g.canvasLines = g.renderGraphCanvas(id, issue, canvasWidth, t)
+		g.canvasID, g.canvasWidth, g.canvasExpanded = id, canvasWidth, g.expanded[id]
+		g.canvasColumns = 0
+		for _, line := range g.canvasLines {
+			g.canvasColumns = max(g.canvasColumns, ansi.StringWidth(line))
+		}
+	}
+	bodyHeight := max(0, viewportHeight-2)
+	g.maxScrollX = max(0, g.canvasColumns-viewportWidth)
+	g.maxScrollY = max(0, len(g.canvasLines)-max(1, bodyHeight))
+}
 
 func (g *GraphModel) ensureVisible() {
 	g.scrollX, g.scrollY = 0, 0

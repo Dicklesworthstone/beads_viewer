@@ -1064,11 +1064,31 @@ func ensureNoMalformedChecksumLineForAsset(data []byte, assetName string) error 
 	return nil
 }
 
+type byteProgressReader struct {
+	reader     io.Reader
+	downloaded int64
+	total      int64
+	report     func(downloaded, total int64)
+}
+
+func (r *byteProgressReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 && r.report != nil {
+		r.downloaded += int64(n)
+		r.report(r.downloaded, r.total)
+	}
+	return n, err
+}
+
 // downloadFile downloads a file from URL to a local path.
 //
 // If expectedSize is > 0, the download is size-verified against the HTTP Content-Length
 // (when present) and the number of bytes written.
 func downloadFile(url, destPath string, expectedSize int64) error {
+	return downloadFileWithProgress(url, destPath, expectedSize, nil)
+}
+
+func downloadFileWithProgress(url, destPath string, expectedSize int64, progress io.Writer) error {
 	if expectedSize < 0 {
 		return fmt.Errorf("download size cannot be negative: %d", expectedSize)
 	}
@@ -1114,7 +1134,21 @@ func downloadFile(url, destPath string, expectedSize int64) error {
 		limit = expectedSize + 1
 	}
 
-	n, err := io.Copy(out, io.LimitReader(resp.Body, limit))
+	src := io.LimitReader(resp.Body, limit)
+	if reporter, ok := progress.(interface{ ReportBytes(downloaded, total int64) }); ok && reporter != nil {
+		total := expectedSize
+		if total <= 0 && resp.ContentLength > 0 {
+			total = resp.ContentLength
+		}
+		reporter.ReportBytes(0, total)
+		src = &byteProgressReader{
+			reader: src,
+			total:  total,
+			report: reporter.ReportBytes,
+		}
+	}
+
+	n, err := io.Copy(out, src)
 	if closeErr := out.Close(); err == nil {
 		err = closeErr
 	}
@@ -1546,7 +1580,7 @@ func PerformUpdate(release *Release, progress io.Writer) (*UpdateResult, error) 
 	}
 	archivePath := filepath.Join(tmpDir, assetName)
 	fmt.Fprintf(progress, "Downloading %s...\n", release.TagName)
-	if err := downloadFile(asset.BrowserDownloadURL, archivePath, asset.Size); err != nil {
+	if err := downloadFileWithProgress(asset.BrowserDownloadURL, archivePath, asset.Size, progress); err != nil {
 		return nil, fmt.Errorf("download failed: %w", err)
 	}
 

@@ -32,41 +32,75 @@ type clipboardStatusMsg struct {
 // CassSessionModal displays correlated cass sessions for a bead.
 // It shows session previews with agent name, timestamp, match reason, and snippet.
 type CassSessionModal struct {
-	beadID     string              // The bead this modal is showing sessions for
-	sessions   []cass.ScoredResult // Correlated sessions to display
-	strategy   cass.CorrelationStrategy
-	keywords   []string // Keywords used for correlation (for display)
-	selected   int      // Currently selected session (for keyboard nav)
-	searchCmd  string   // Command to run for more results
-	theme      Theme
-	width      int
-	termWidth  int
-	height     int
-	copied     bool      // Flash feedback for clipboard copy
-	copiedAt   time.Time // When copy happened
-	copyToken  *byte     // Reject late results from a dismissed modal instance (non-zero-size so each allocation is unique)
-	maxDisplay int       // Max sessions to show (rest are summarized)
+	beadID       string              // The bead this modal is showing sessions for
+	localID      string              // Optional unprefixed local ID in workspace mode
+	workspace    string              // Optional workspace directory for `cass search`
+	referenceNow time.Time           // Optional deterministic clock override
+	sessions     []cass.ScoredResult // Correlated sessions to display
+	strategy     cass.CorrelationStrategy
+	keywords     []string // Keywords used for correlation (for display)
+	selected     int      // Currently selected session (for keyboard nav)
+	searchCmd    string   // Command to run for more results
+	theme        Theme
+	width        int
+	termWidth    int
+	height       int
+	copied       bool      // Flash feedback for clipboard copy
+	copiedAt     time.Time // When copy happened
+	copyToken    *byte     // Reject late results from a dismissed modal instance (non-zero-size so each allocation is unique)
+	maxDisplay   int       // Max sessions to show (rest are summarized)
+}
+
+// CassSessionModalOptions configures workspace-aware search command generation
+// and deterministic relative timestamp formatting for CassSessionModal.
+type CassSessionModalOptions struct {
+	LocalID      string
+	Workspace    string
+	ReferenceNow time.Time
 }
 
 // NewCassSessionModal creates a modal from correlation results.
 func NewCassSessionModal(beadID string, result cass.CorrelationResult, theme Theme) CassSessionModal {
-	searchCmd := fmt.Sprintf("cass search %q", beadID)
-	if len(result.Keywords) > 0 {
-		searchCmd = fmt.Sprintf("cass search %q", strings.Join(result.Keywords, " "))
+	return NewCassSessionModalWithOptions(beadID, result, theme, CassSessionModalOptions{})
+}
+
+// NewCassSessionModalWithOptions creates a modal from correlation results with explicit options.
+func NewCassSessionModalWithOptions(beadID string, result cass.CorrelationResult, theme Theme, opts CassSessionModalOptions) CassSessionModal {
+	localID := strings.TrimSpace(opts.LocalID)
+	workspacePath := strings.TrimSpace(opts.Workspace)
+	queryTarget := beadID
+	if localID != "" {
+		queryTarget = localID
+	}
+
+	useKeywords := len(result.Keywords) > 0 && (result.Strategy == "" || result.Strategy == cass.StrategyKeywords)
+	var keywords []string
+	query := queryTarget
+	if useKeywords {
+		keywords = append([]string(nil), result.Keywords...)
+		query = strings.Join(keywords, " ")
+	}
+
+	searchCmd := fmt.Sprintf("cass search %q", query)
+	if workspacePath != "" {
+		searchCmd = fmt.Sprintf("cass search %q --workspace %q", query, workspacePath)
 	}
 
 	return CassSessionModal{
-		beadID:     beadID,
-		sessions:   result.TopSessions,
-		strategy:   result.Strategy,
-		keywords:   result.Keywords,
-		selected:   0,
-		searchCmd:  searchCmd,
-		theme:      theme,
-		width:      70,
-		height:     25,
-		copyToken:  new(byte),
-		maxDisplay: 3,
+		beadID:       beadID,
+		localID:      localID,
+		workspace:    workspacePath,
+		referenceNow: opts.ReferenceNow,
+		sessions:     result.TopSessions,
+		strategy:     result.Strategy,
+		keywords:     keywords,
+		selected:     0,
+		searchCmd:    searchCmd,
+		theme:        theme,
+		width:        70,
+		height:       25,
+		copyToken:    new(byte),
+		maxDisplay:   3,
 	}
 }
 
@@ -207,7 +241,7 @@ func (m CassSessionModal) View() string {
 			if agentStr == "" {
 				agentStr = "Unknown"
 			}
-			timeStr := formatRelativeTime(session.Timestamp)
+			timeStr := formatRelativeTimeAt(session.Timestamp, m.effectiveNow())
 
 			sessionInfo := fmt.Sprintf("%s • %s", agentStr, timeStr)
 			if i == m.selected {
@@ -300,13 +334,26 @@ func (m CassSessionModal) formatSnippet(snippet string) string {
 	return strings.Join(cleaned, "\n")
 }
 
+func (m CassSessionModal) effectiveNow() time.Time {
+	if !m.referenceNow.IsZero() {
+		return m.referenceNow
+	}
+	return time.Now()
+}
+
 // formatRelativeTime formats a timestamp as a relative time string.
 func formatRelativeTime(t time.Time) string {
+	return formatRelativeTimeAt(t, time.Now())
+}
+
+func formatRelativeTimeAt(t, now time.Time) string {
 	if t.IsZero() {
 		return "unknown time"
 	}
+	if now.IsZero() {
+		now = time.Now()
+	}
 
-	now := time.Now()
 	diff := now.Sub(t)
 
 	switch {

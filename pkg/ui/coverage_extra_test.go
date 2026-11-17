@@ -1540,6 +1540,7 @@ func TestOpenInEditorWithArguments(t *testing.T) {
 	t.Setenv("EDITOR", "gedit --wait")
 
 	m := NewModel([]model.Issue{issue}, nil, beadsFile)
+	t.Cleanup(m.Stop)
 	m.openInEditor()
 	if m.statusIsError {
 		t.Fatalf("expected success with EDITOR containing arguments, got error: %q", m.statusMsg)
@@ -1553,6 +1554,7 @@ func TestOpenInEditorWithArguments(t *testing.T) {
 	// Now dispatches via TUI suspend (bv-134); with no issue selected, returns error
 	t.Setenv("EDITOR", "vim -u NONE")
 	m2 := NewModel(nil, nil, beadsFile)
+	t.Cleanup(m2.Stop)
 	m2.openInEditor()
 	if !m2.statusIsError || !strings.Contains(m2.statusMsg, "No issue selected") {
 		t.Fatalf("expected 'No issue selected' for 'vim -u NONE', got %q", m2.statusMsg)
@@ -1784,6 +1786,8 @@ func TestOpenInEditorMissingAndGUI(t *testing.T) {
 	t.Setenv("VISUAL", "")
 
 	m := NewModel([]model.Issue{{ID: "1", Title: "x", Status: model.StatusOpen}}, nil, "")
+	m0 := m
+	t.Cleanup(m0.Stop)
 	m.openInEditor()
 	if !m.statusIsError || !strings.Contains(m.statusMsg, "no live JSONL") {
 		t.Fatalf("expected missing beads error, got %q", m.statusMsg)
@@ -1793,6 +1797,8 @@ func TestOpenInEditorMissingAndGUI(t *testing.T) {
 	// never supplies authority for the earlier unbound historical view.
 	issue, beadsFile, _ := installEditorTracker(t, "br")
 	m = NewModel([]model.Issue{issue}, nil, beadsFile)
+	m1 := m
+	t.Cleanup(m1.Stop)
 
 	// A missing executable must fail even though the beads file exists.
 	m.openInEditor()
@@ -2537,6 +2543,7 @@ Description.
 	issue, source, _ := installEditorTracker(t, "br")
 	issue.ID, issue.Title, issue.Priority = "t1", "Test", 1
 	m := NewModel([]model.Issue{issue}, nil, source)
+	t.Cleanup(m.Stop)
 	m.editorSession = &editorSession{issue: issue.Clone(), sourcePath: source}
 	result, cmd := m.Update(editorExitMsg{
 		issueID:  "t1",

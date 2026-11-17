@@ -312,7 +312,10 @@ func ParseRelativeTime(s string, now time.Time) (time.Time, error) {
 
 	// Try relative time first (case-insensitive)
 	if matches := relativeTimePattern.FindStringSubmatch(strings.ToLower(s)); matches != nil {
-		n, _ := strconv.Atoi(matches[1])
+		n, err := strconv.Atoi(matches[1])
+		if err != nil || n < 0 || n > 365000 {
+			return time.Time{}, &TimeParseError{Input: s}
+		}
 		unit := matches[2]
 
 		switch unit {

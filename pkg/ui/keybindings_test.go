@@ -182,7 +182,9 @@ func keyMsg(key string) tea.KeyMsg {
 func setupTestModel(t *testing.T) *Model {
 	t.Helper()
 	issues := testIssuesForKeyDispatch()
-	return NewModel(issues, nil, "")
+	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
+	return m
 }
 
 // testIssuesForKeyDispatch creates a minimal issue set for testing.
@@ -1086,6 +1088,7 @@ func setupFSMModel(t *testing.T, beadsPath string) *Model {
 	}
 
 	m := NewModel(issues, nil, beadsPath)
+	t.Cleanup(func() { m.Stop() })
 	m.sprints = []model.Sprint{
 		{
 			ID:        "sprint-1",

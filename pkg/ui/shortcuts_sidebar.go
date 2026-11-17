@@ -55,6 +55,9 @@ func (s *ShortcutsSidebar) SetContext(ctx string) {
 
 // SetFocus updates the current focus for registry-based bindings (bv-xl6g)
 func (s *ShortcutsSidebar) SetFocus(f focus) {
+	if s.focusHint != f {
+		s.scrollOffset = 0
+	}
 	s.focusHint = f
 	s.context = ContextFromFocus(f)
 }
