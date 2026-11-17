@@ -23,15 +23,19 @@ import (
 // ReportOverrides contains only explicitly supplied CLI settings. A pointer to
 // false or an empty template deliberately overrides the recipe value.
 type ReportOverrides struct {
-	Format       *string
-	IncludeGraph *bool
-	Template     *string
-	GroupBy      *string
+	Format         *string
+	IncludeGraph   *bool
+	IncludeActions *bool
+	Template       *string
+	GroupBy        *string
 }
 
 type ReportOptions struct {
 	Format            string
 	IncludeGraph      bool
+	IncludeActionPlan bool
+	IncludeActions    *bool
+	actionPlanSet     bool
 	Template          string
 	GroupBy           string
 	View              recipe.ViewConfig
@@ -51,8 +55,23 @@ type ReportOptions struct {
 	AsOfCommit        string
 }
 
+func (opts ReportOptions) includeActions() bool {
+	if opts.IncludeActions != nil {
+		return *opts.IncludeActions
+	}
+	if opts.actionPlanSet {
+		return opts.IncludeActionPlan
+	}
+	return true
+}
+
 func ResolveReportOptions(defaults recipe.ExportConfig, explicit ReportOverrides) (ReportOptions, error) {
-	opts := ReportOptions{Format: "markdown", Title: "Beads Export"}
+	opts := ReportOptions{
+		Format:            "markdown",
+		Title:             "Beads Export",
+		IncludeActionPlan: true,
+		actionPlanSet:     true,
+	}
 	if defaults.Format != "" {
 		opts.Format = defaults.Format
 	}
@@ -65,6 +84,11 @@ func ResolveReportOptions(defaults recipe.ExportConfig, explicit ReportOverrides
 	}
 	if explicit.IncludeGraph != nil {
 		opts.IncludeGraph = *explicit.IncludeGraph
+	}
+	if explicit.IncludeActions != nil {
+		v := *explicit.IncludeActions
+		opts.IncludeActionPlan = v
+		opts.IncludeActions = &v
 	}
 	opts.Template = defaults.Template
 	if explicit.Template != nil {
@@ -414,10 +438,14 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 		}
 		rows := make([]row, 0, len(selected))
 		for _, issue := range selected {
-			claimable := opts.AuthorityComplete && hadCallerReadiness && opts.Readiness.Claimable(issue.ID, opts.GeneratedAt)
+			var actions model.IssueActions
+			if opts.includeActions() {
+				claimable := opts.AuthorityComplete && hadCallerReadiness && opts.Readiness.Claimable(issue.ID, opts.GeneratedAt)
+				actions = issue.Actions(claimable)
+			}
 			rows = append(rows, row{
 				Issue:   issue,
-				Actions: issue.Actions(claimable),
+				Actions: actions,
 				Metrics: metricsAcc.mapForIssue(issue.ID),
 			})
 		}
@@ -922,7 +950,8 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 		sb.WriteString(fmt.Sprintf("| Deferred / Other | %d |\n", deferredOther))
 	}
 	sb.WriteString(fmt.Sprintf("| Closed | %d |\n\n", closed))
-	writeSummaryTable(&sb, issues, opts)
+	metricsAcc := newReportMetricsAccessor(opts, issues)
+	writeSummaryTable(&sb, issues, opts, metricsAcc)
 
 	// Quick Actions Section
 	sb.WriteString(generateQuickActions(issues, opts))
@@ -967,12 +996,12 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 		for _, grp := range groups {
 			sb.WriteString(fmt.Sprintf("## Group: %s (%d)\n\n", grp.Label, len(grp.Indices)))
 			for _, idx := range grp.Indices {
-				writeMarkdownIssueSection(&sb, issues[idx], issueSlugs[idx], opts)
+				writeMarkdownIssueSection(&sb, issues[idx], issueSlugs[idx], opts, metricsAcc)
 			}
 		}
 	} else {
 		for idx, i := range issues {
-			writeMarkdownIssueSection(&sb, i, issueSlugs[idx], opts)
+			writeMarkdownIssueSection(&sb, i, issueSlugs[idx], opts, metricsAcc)
 		}
 	}
 
@@ -1120,13 +1149,12 @@ type summaryColumnSpec struct {
 	render func(i model.Issue) string
 }
 
-func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOptions) {
+func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOptions, metricsAcc *reportMetricsAccessor) {
 	if len(issues) == 0 {
 		return
 	}
 
 	blocksByID := buildBlockingReverseMap(issues)
-	metricsAcc := newReportMetricsAccessor(opts, issues)
 
 	resolveColumn := func(raw string) (summaryColumnSpec, string, bool) {
 		norm := strings.ToLower(strings.TrimSpace(raw))
@@ -1325,7 +1353,7 @@ func formatEstimatedDuration(minutes int) string {
 	return fmt.Sprintf("%dh %dm (%dm)", hours, rem, minutes)
 }
 
-func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, opts ReportOptions) {
+func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, opts ReportOptions, metricsAcc *reportMetricsAccessor) {
 	typeIcon := getTypeEmoji(string(i.IssueType))
 	sb.WriteString(fmt.Sprintf("<a id=\"%s\"></a>\n\n", slug))
 	sb.WriteString(fmt.Sprintf("## %s\n\n", issueHeadingText(i)))
@@ -1369,7 +1397,7 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 		}
 		sb.WriteString(fmt.Sprintf("| **Labels** | %s |\n", strings.Join(escapedLabels, ", ")))
 	}
-	if metricsAcc := newReportMetricsAccessor(opts, []model.Issue{i}); metricsAcc != nil {
+	if metricsAcc != nil {
 		for _, mKey := range metricsAcc.keys {
 			sb.WriteString(fmt.Sprintf("| **%s** | %s |\n", reportMetricHeader(mKey), metricsAcc.formatValue(mKey, i.ID)))
 		}
@@ -1881,6 +1909,9 @@ func SaveMarkdownToFile(issues []model.Issue, filename string) error {
 // generateQuickActions offers inspection commands bound to each live tracker.
 // A report does not establish that every open issue is ready to be closed.
 func generateQuickActions(issues []model.Issue, options ReportOptions) string {
+	if !options.includeActions() {
+		return ""
+	}
 	var sb strings.Builder
 	for _, issue := range issues {
 		if isClosedLikeStatus(issue.Status) {
@@ -1902,6 +1933,9 @@ func generateQuickActions(issues []model.Issue, options ReportOptions) string {
 
 // generateIssueCommands creates command snippets for a single issue
 func generateIssueCommands(issue model.Issue, options ReportOptions) string {
+	if !options.includeActions() {
+		return ""
+	}
 	var sb strings.Builder
 
 	// Skip command snippets for closed issues

@@ -473,6 +473,24 @@ export class DiGraph {
         return ret;
     }
     /**
+     * Find eligible actionable nodes that increase parallelization when completed.
+     * Returns JSON: { items: [{node, parallel_gain, new_actionable}], open_nodes, current_actionable }
+     * closed_js is an array of bytes where non-zero means closed.
+     * candidate_js is an optional eligibility byte mask where non-zero means eligible.
+     * @param {Uint8Array} closed_js
+     * @param {number} limit
+     * @param {Uint8Array | null} [candidate_js]
+     * @returns {any}
+     */
+    parallelCutFiltered(closed_js, limit, candidate_js) {
+        const ptr0 = passArray8ToWasm0(closed_js, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        var ptr1 = isLikeNone(candidate_js) ? 0 : passArray8ToWasm0(candidate_js, wasm.__wbindgen_malloc);
+        var len1 = WASM_VECTOR_LEN;
+        const ret = wasm.digraph_parallelCutFiltered(this.__wbg_ptr, ptr0, len0, limit, ptr1, len1);
+        return ret;
+    }
+    /**
      * Find nodes that increase parallelization when completed.
      * Returns JSON: { items: [{node, parallel_gain, new_actionable}], open_nodes, current_actionable }
      * closed_set is an array of bytes where non-zero means closed.

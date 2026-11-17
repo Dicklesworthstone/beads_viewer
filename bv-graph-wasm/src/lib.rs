@@ -24,7 +24,11 @@ pub use algorithms::eigenvector::{eigenvector, eigenvector_default, EigenvectorC
 pub use algorithms::hits::{hits, hits_default, HITSConfig};
 pub use algorithms::kcore::{degeneracy, kcore};
 pub use algorithms::pagerank::{pagerank, pagerank_default, PageRankConfig};
+pub use algorithms::parallel_cut::{
+    parallel_cut_default, parallel_cut_filtered, parallel_cut_suggestions,
+};
 pub use algorithms::slack::{slack, total_float};
+pub use algorithms::topk_set::{topk_set, topk_set_default};
 pub use reachability::{reachable_from, reachable_to};
 
 /// Initialize panic hook for better error messages in browser console.

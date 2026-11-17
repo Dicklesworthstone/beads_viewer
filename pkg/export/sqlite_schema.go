@@ -69,7 +69,8 @@ func createCoreTables(tx *sql.Tx) error {
 			created_by TEXT,
 			close_reason TEXT,
 			is_template INTEGER NOT NULL DEFAULT 0,
-			pinned INTEGER NOT NULL DEFAULT 0
+			pinned INTEGER NOT NULL DEFAULT 0,
+			ephemeral INTEGER NOT NULL DEFAULT 0
 		)
 	`
 	if _, err := tx.Exec(issuesSQL); err != nil {
@@ -278,6 +279,7 @@ func CreateMaterializedViews(db *sql.DB) error {
 			i.close_reason,
 			i.is_template,
 			i.pinned,
+			i.ephemeral,
 			'unknown' as dependency_state,
 			0 as is_actionable,
 			COALESCE(m.pagerank, 0) as pagerank,

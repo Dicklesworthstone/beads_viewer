@@ -1207,13 +1207,38 @@ function isNodeDeferred(n) {
     }
     return false;
 }
+function isNodeWithheldFromReady(n) {
+    if (!n) return false;
+    const st = String(n.status || '').toLowerCase();
+    return Boolean(n.is_template) || Boolean(n.pinned) || Boolean(n.ephemeral) || st === 'draft' || st === 'pinned' || st === 'hooked' || isNodeDeferred(n);
+}
+function isNodeBlockedByDeps(n) {
+    if (!n || !isActiveNodeStatus(n.status)) return false;
+    if (typeof n.dependency_state === 'string' && n.dependency_state !== '') {
+        return n.dependency_state !== 'satisfied';
+    }
+    return (n.blockerCount || 0) > 0;
+}
+function isNodeActionable(n) {
+    if (!n) return false;
+    if (typeof n.is_actionable === 'boolean') {
+        return n.is_actionable;
+    }
+    return (n.status === 'open' || n.status === 'in_progress') && !isNodeWithheldFromReady(n) && !isNodeBlockedByDeps(n);
+}
+function isNodeBlocked(n) {
+    if (!n) return false;
+    return n.status === 'blocked' || isNodeBlockedByDeps(n);
+}
 
 DATA.nodes.forEach(n => {
-    n.blockerCount = isActiveNodeStatus(n.status) && blockerSetByNode[n.id] ? blockerSetByNode[n.id].size : 0;
-    if ((n.status === 'open' || n.status === 'in_progress') && !isNodeDeferred(n) && n.blockerCount === 0) actionable++;
-    if (n.status === 'blocked' || (isActiveNodeStatus(n.status) && n.blockerCount > 0)) blocked++;
+    n.blockerCount = isActiveNodeStatus(n.status)
+        ? (typeof n.blocker_count === 'number' ? n.blocker_count : (blockerSetByNode[n.id] ? blockerSetByNode[n.id].size : 0))
+        : 0;
+    if (isNodeActionable(n)) actionable++;
+    if (isNodeBlocked(n)) blocked++;
     if (n.slack_available !== false && isActiveNodeStatus(n.status) && n.slack === 0) onCriticalPath++;
-    if (n.is_articulation) articulationCount++;
+    if (isActiveNodeStatus(n.status) && n.is_articulation) articulationCount++;
 });
 document.getElementById('stat-actionable').textContent = actionable;
 document.getElementById('stat-blocked').textContent = blocked;
@@ -1258,13 +1283,22 @@ function getHeatmapColor(n, alpha) {
 }
 
 function getNodeStatusColor(n) {
-    if ((n.status === 'open' || n.status === 'in_progress') && (n.blockerCount || 0) > 0) {
+    if (!isActiveNodeStatus(n.status)) {
+        return STATUS_COLORS[n.status] || STATUS_COLORS.closed;
+    }
+    if (isNodeBlocked(n)) {
         return STATUS_COLORS.blocked;
+    }
+    if (isNodeActionable(n)) {
+        return n.status === 'in_progress' ? STATUS_COLORS.in_progress : STATUS_COLORS.open;
+    }
+    if (isNodeWithheldFromReady(n)) {
+        return '#94a3b8';
     }
     if (STATUS_COLORS[n.status]) {
         return STATUS_COLORS[n.status];
     }
-    return isActiveNodeStatus(n.status) ? '#94a3b8' : STATUS_COLORS.closed;
+    return '#94a3b8';
 }
 
 function computeNodeBaseColor(n) {
@@ -1987,9 +2021,9 @@ function applyFilters() {
 
         if (statusFilter && statusFilter !== 'all') {
             if (statusFilter === 'actionable') {
-                if (!((n.status === 'open' || n.status === 'in_progress') && !isNodeDeferred(n) && (n.blockerCount || 0) === 0)) return false;
+                if (!isNodeActionable(n)) return false;
             } else if (statusFilter === 'blocked') {
-                if (!(n.status === 'blocked' || (isActiveNodeStatus(n.status) && (n.blockerCount || 0) > 0))) return false;
+                if (!isNodeBlocked(n)) return false;
             } else if (n.status !== statusFilter) {
                 return false;
             }

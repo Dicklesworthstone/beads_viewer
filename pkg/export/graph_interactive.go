@@ -37,6 +37,7 @@ func resolveInteractiveExportTime(exportedAt time.Time) time.Time {
 type InteractiveGraphOptions struct {
 	Issues        []model.Issue
 	Stats         *analysis.GraphStats
+	Readiness     *model.ReadinessIndex      // Full-source readiness index (preserved across recipe filters)
 	Triage        *analysis.TriageResult     // Full triage output for display
 	History       *correlation.HistoryReport // Git history correlation data
 	Title         string
@@ -44,6 +45,8 @@ type InteractiveGraphOptions struct {
 	Path          string // Output path - if empty, auto-generates based on project
 	ProjectName   string // Project name for auto-naming
 	ExportedAt    time.Time
+	GitHash       string
+	WorkDir       string
 	RobotEnvelope map[string]json.RawMessage
 }
 
@@ -60,11 +63,17 @@ type graphNode struct {
 	Notes              string `json:"notes,omitempty"`
 
 	// Metadata
-	Status   string   `json:"status"`
-	Priority int      `json:"priority"`
-	Type     string   `json:"type"`
-	Labels   []string `json:"labels"`
-	Assignee string   `json:"assignee,omitempty"`
+	Status          string   `json:"status"`
+	Priority        int      `json:"priority"`
+	Type            string   `json:"type"`
+	Labels          []string `json:"labels"`
+	Assignee        string   `json:"assignee,omitempty"`
+	IsActionable    bool     `json:"is_actionable"`
+	DependencyState string   `json:"dependency_state"`
+	BlockerCount    int      `json:"blocker_count"`
+	IsTemplate      bool     `json:"is_template,omitempty"`
+	Pinned          bool     `json:"pinned,omitempty"`
+	Ephemeral       bool     `json:"ephemeral,omitempty"`
 
 	// Timestamps & external reference
 	CreatedAt   string `json:"created_at,omitempty"`
@@ -112,19 +121,30 @@ type graphLink struct {
 // GenerateInteractiveGraphFilename creates an auto-generated filename
 // Format: {project}_graph_export__as_of__YYYY_MM_DD__HH_MM__git_head_hash__{gitshort}.html
 func GenerateInteractiveGraphFilename(projectName string) string {
-	return generateInteractiveGraphFilenameAt(projectName, resolveInteractiveExportTime(time.Time{}))
+	return GenerateInteractiveGraphFilenameWithOpts(projectName, resolveInteractiveExportTime(time.Time{}), "", "")
 }
 
-func generateInteractiveGraphFilenameAt(projectName string, exportTime time.Time) string {
+// GenerateInteractiveGraphFilenameWithOpts creates an auto-generated filename using
+// an explicit export timestamp, git working directory, and optional pre-resolved git hash.
+func GenerateInteractiveGraphFilenameWithOpts(projectName string, exportTime time.Time, workDir, gitHash string) string {
+	exportTime = resolveInteractiveExportTime(exportTime)
 	dateStr := exportTime.Format("2006_01_02")
 	timeStr := exportTime.Format("15_04")
 
 	// Get short git commit hash
-	gitShort := "nogit"
-	cmd := exec.Command("git", "--no-replace-objects", "rev-parse", "--short", "HEAD")
-	cmd.Env = loader.SanitizedGitEnv()
-	if output, err := cmd.Output(); err == nil {
-		gitShort = strings.TrimSpace(string(output))
+	gitShort := strings.TrimSpace(gitHash)
+	if gitShort == "" {
+		gitShort = "nogit"
+		cmd := exec.Command("git", "--no-replace-objects", "rev-parse", "--short", "HEAD")
+		cmd.Env = loader.SanitizedGitEnv()
+		if trimmedDir := strings.TrimSpace(workDir); trimmedDir != "" {
+			cmd.Dir = trimmedDir
+		}
+		if output, err := cmd.Output(); err == nil {
+			if parsed := strings.TrimSpace(string(output)); parsed != "" {
+				gitShort = parsed
+			}
+		}
 	}
 
 	// Clean project name
@@ -132,6 +152,62 @@ func generateInteractiveGraphFilenameAt(projectName string, exportTime time.Time
 	safeName = strings.ReplaceAll(safeName, "/", "_")
 
 	return fmt.Sprintf("%s_graph_export__as_of__%s__%s__git_head_hash__%s.html", safeName, dateStr, timeStr, gitShort)
+}
+
+func generateInteractiveGraphFilenameAt(projectName string, exportTime time.Time) string {
+	return GenerateInteractiveGraphFilenameWithOpts(projectName, exportTime, "", "")
+}
+
+func hasClosedOrTombstoneIssues(issues []model.Issue) bool {
+	for i := range issues {
+		if issues[i].Status.IsClosed() || issues[i].Status.IsTombstone() {
+			return true
+		}
+	}
+	return false
+}
+
+func activeSubgraphStatsForIssues(issues []model.Issue, computeBetweenness, computeKCore, computeArticulation bool) *analysis.GraphStats {
+	activeSet := make(map[string]bool, len(issues))
+	for i := range issues {
+		if !issues[i].Status.IsClosed() && !issues[i].Status.IsTombstone() {
+			activeSet[issues[i].ID] = true
+		}
+	}
+	if len(activeSet) == 0 {
+		return nil
+	}
+	activeIssues := make([]model.Issue, 0, len(activeSet))
+	activeEdges := 0
+	for i := range issues {
+		iss := issues[i]
+		if !activeSet[iss.ID] {
+			continue
+		}
+		var filteredDeps []*model.Dependency
+		for _, dep := range iss.Dependencies {
+			if dep != nil && dep.Type.IsBlocking() && activeSet[dep.DependsOnID] {
+				filteredDeps = append(filteredDeps, dep)
+				activeEdges++
+			}
+		}
+		iss.Dependencies = filteredDeps
+		activeIssues = append(activeIssues, iss)
+	}
+	cfg := analysis.ConfigForSize(len(activeIssues), activeEdges)
+	cfg.ComputePageRank = false
+	cfg.ComputeHITS = false
+	cfg.ComputeEigenvector = false
+	cfg.ComputeCriticalPath = false
+	cfg.ComputeCycles = false
+	cfg.ComputeSlack = false
+	if !computeBetweenness {
+		cfg.ComputeBetweenness = false
+	}
+	cfg.ComputeKCore = computeKCore
+	cfg.ComputeArticulation = computeArticulation
+	stats := analysis.NewAnalyzer(activeIssues).AnalyzeWithConfig(cfg)
+	return &stats
 }
 
 // GenerateInteractiveGraphHTML creates a self-contained HTML file with force-graph visualization
@@ -149,6 +225,10 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		return "", err
 	}
 	exportTime := resolveInteractiveExportTime(opts.ExportedAt)
+	readiness := opts.Readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(opts.Issues)
+	}
 
 	// Build graph data with all metrics
 	nodes := make([]graphNode, 0, len(opts.Issues))
@@ -190,13 +270,28 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		betweennessRank = opts.Stats.BetweennessRank()
 		inDegree = opts.Stats.InDegree
 		outDegree = opts.Stats.OutDegree
+		if hasClosedOrTombstoneIssues(opts.Issues) {
+			if activeStats := activeSubgraphStatsForIssues(opts.Issues, true, true, true); activeStats != nil {
+				betweenness = activeStats.Betweenness()
+				betweennessRank = activeStats.BetweennessRank()
+				coreNumber = activeStats.CoreNumber()
+				articulation = activeStats.ArticulationPoints()
+			} else {
+				betweenness = nil
+				betweennessRank = nil
+				coreNumber = nil
+				articulation = nil
+			}
+		}
 	}
 	slackAvailable := opts.Stats != nil && len(slack) > 0 && len(opts.Stats.Cycles()) == 0
 
-	// Create articulation set for O(1) lookup
+	// Create articulation set for O(1) lookup (active issues only)
 	articulationSet := make(map[string]bool)
 	for _, id := range articulation {
-		articulationSet[id] = true
+		if isActiveIssue(id) {
+			articulationSet[id] = true
+		}
 	}
 
 	// Build reverse dependency map (who actively blocks who)
@@ -214,16 +309,10 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 
 	// Build nodes with full bead data
 	for _, iss := range opts.Issues {
-		// Compute active blocked_by list: blocking dependencies pointing to missing (!issueMap)
-		// or active (non-closed, non-tombstone) target issues, matching ReadinessIndex.
-		var blockedBy []string
-		if isActiveIssue(iss.ID) {
-			for _, dep := range iss.Dependencies {
-				if dep != nil && dep.Type.IsBlocking() && (!issueMap[dep.DependsOnID] || isActiveIssue(dep.DependsOnID)) {
-					blockedBy = append(blockedBy, dep.DependsOnID)
-				}
-			}
-		}
+		isActionable := readiness.Ready(iss.ID, exportTime)
+		depState := string(readiness.DependencyState(iss.ID))
+		blockedBy := readiness.Blockers(iss.ID)
+		blockerCount := len(blockedBy)
 
 		// Format timestamps
 		createdAt := ""
@@ -279,11 +368,17 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			Notes:              iss.Notes,
 
 			// Metadata
-			Status:   string(iss.Status),
-			Priority: iss.Priority,
-			Type:     string(iss.IssueType),
-			Labels:   iss.Labels,
-			Assignee: iss.Assignee,
+			Status:          string(iss.Status),
+			Priority:        iss.Priority,
+			Type:            string(iss.IssueType),
+			Labels:          iss.Labels,
+			Assignee:        iss.Assignee,
+			IsActionable:    isActionable,
+			DependencyState: depState,
+			BlockerCount:    blockerCount,
+			IsTemplate:      iss.IsTemplate,
+			Pinned:          iss.Pinned,
+			Ephemeral:       iss.Ephemeral,
 
 			// Timestamps & external reference
 			CreatedAt:   createdAt,
@@ -313,9 +408,14 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			InDegree:        inDegree[iss.ID],
 			OutDegree:       outDegree[iss.ID],
 			CoreNumber:      coreNumber[iss.ID],
-			IsArticulation:  articulationSet[iss.ID],
+			IsArticulation:  isActiveIssue(iss.ID) && articulationSet[iss.ID],
 			PageRankRank:    pageRankRank[iss.ID],
 			BetweennessRank: betweennessRank[iss.ID],
+		}
+		if !isActiveIssue(iss.ID) {
+			node.Betweenness = 0
+			node.CoreNumber = 0
+			node.BetweennessRank = 0
 		}
 		if slackAvailable && isActiveIssue(iss.ID) {
 			if s, ok := slack[iss.ID]; ok {
@@ -389,7 +489,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		if projectName == "" {
 			projectName = "graph"
 		}
-		outputPath = generateInteractiveGraphFilenameAt(projectName, exportTime)
+		outputPath = GenerateInteractiveGraphFilenameWithOpts(projectName, exportTime, opts.WorkDir, opts.GitHash)
 	} else if err := validateExistingPathNotSymlinkOrDir(outputPath); err != nil {
 		return "", err
 	}

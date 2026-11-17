@@ -4,7 +4,9 @@
 //! parallel work by unblocking multiple dependents.
 
 use crate::graph::DiGraph;
+use crate::reachability::is_actionable;
 use serde::Serialize;
+use std::collections::HashSet;
 
 /// A node that could increase parallelization when completed.
 #[derive(Debug, Clone, Serialize)]
@@ -45,39 +47,53 @@ pub fn parallel_cut_suggestions(
     closed_set: &[bool],
     limit: usize,
 ) -> ParallelCutResult {
+    parallel_cut_filtered(graph, closed_set, limit, None)
+}
+
+/// Find eligible, currently actionable nodes that would increase parallelization
+/// when completed.
+///
+/// Only currently actionable nodes (`is_actionable(graph, v, closed_set)`) that
+/// also satisfy `candidate_set` (when provided) can be suggested or counted in
+/// `current_actionable`.
+pub fn parallel_cut_filtered(
+    graph: &DiGraph,
+    closed_set: &[bool],
+    limit: usize,
+    candidate_set: Option<&HashSet<usize>>,
+) -> ParallelCutResult {
     let n = graph.node_count();
+    let is_eligible = |v: usize| candidate_set.is_none_or(|s| s.contains(&v));
 
-    // Count current actionable nodes
+    let is_open_eligible =
+        |v: usize| !closed_set.get(v).copied().unwrap_or(false) && is_eligible(v);
+
+    // Count current actionable eligible nodes
     let current_actionable = (0..n)
-        .filter(|&v| {
-            !closed_set.get(v).copied().unwrap_or(false)
-                && graph
-                    .successors_slice(v)
-                    .iter()
-                    .all(|&p| closed_set.get(p).copied().unwrap_or(false))
-        })
+        .filter(|&v| is_open_eligible(v) && is_actionable(graph, v, closed_set))
         .count();
 
-    // Count open nodes
-    let open_nodes = (0..n)
-        .filter(|&v| !closed_set.get(v).copied().unwrap_or(false))
-        .count();
+    // Count eligible open nodes
+    let open_nodes = (0..n).filter(|&v| is_open_eligible(v)).count();
 
-    // Calculate parallel gain for each open node
+    // Calculate parallel gain ONLY for currently actionable eligible open nodes
     let mut suggestions: Vec<ParallelCutItem> = (0..n)
-        .filter(|&v| !closed_set.get(v).copied().unwrap_or(false))
+        .filter(|&v| is_open_eligible(v) && is_actionable(graph, v, closed_set))
         .map(|v| {
             // Count how many dependents would become actionable if v is closed
             let new_actionable = graph
                 .predecessors_slice(v)
                 .iter()
                 .filter(|&&w| {
-                    // w must be open
-                    !closed_set.get(w).copied().unwrap_or(false)
-                    // All of w's other prerequisites must be closed
-                    && graph.successors_slice(w).iter()
-                        .filter(|&&p| p != v)
-                        .all(|&p| closed_set.get(p).copied().unwrap_or(false))
+                    w != v
+                        // w must be open
+                        && !closed_set.get(w).copied().unwrap_or(false)
+                        // All of w's other prerequisites must be closed
+                        && graph
+                            .successors_slice(w)
+                            .iter()
+                            .filter(|&&p| p != v)
+                            .all(|&p| closed_set.get(p).copied().unwrap_or(false))
                 })
                 .count();
 
@@ -288,5 +304,53 @@ mod tests {
 
         assert_eq!(result.current_actionable, 1); // Only node 0
         assert_eq!(result.open_nodes, 3);
+    }
+
+    #[test]
+    fn test_blocked_fanout_node_never_suggested() {
+        // A (0) <- B (1) <- {C (2), D (3), E (4)}
+        // Node 1 has 3 direct dependents, so if closed in isolation it would unlock 3,
+        // BUT node 1 is blocked by open prerequisite node 0!
+        // parallel_cut_suggestions MUST NOT suggest blocked node 1.
+        let g = make_graph(&[(1, 0), (2, 1), (3, 1), (4, 1)]);
+        let closed = vec![false; 5];
+        let result = parallel_cut_suggestions(&g, &closed, 10);
+
+        assert!(result.items.is_empty());
+        assert_eq!(result.current_actionable, 1);
+
+        // Once prerequisite 0 is closed, node 1 becomes actionable and IS suggested.
+        let closed_after_0 = vec![true, false, false, false, false];
+        let result_after = parallel_cut_suggestions(&g, &closed_after_0, 10);
+        assert_eq!(result_after.items.len(), 1);
+        assert_eq!(result_after.items[0].node, 1);
+        assert_eq!(result_after.items[0].parallel_gain, 2);
+        assert_eq!(result_after.items[0].new_actionable, 3);
+    }
+
+    #[test]
+    fn test_parallel_cut_filtered_respects_candidate_set() {
+        // Two actionable hubs:
+        // - Node 0 (e.g. deferred/template/ephemeral, excluded from candidate_set) unlocks {1, 2, 3}
+        // - Node 4 (eligible actionable) unlocks {5, 6}
+        let g = make_graph(&[(1, 0), (2, 0), (3, 0), (5, 4), (6, 4)]);
+        let closed = vec![false; 7];
+        let candidates: HashSet<usize> = [4usize].into_iter().collect();
+
+        let filtered = parallel_cut_filtered(&g, &closed, 10, Some(&candidates));
+        assert_eq!(filtered.current_actionable, 1);
+        assert_eq!(filtered.open_nodes, 1);
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].node, 4);
+        assert_eq!(filtered.items[0].parallel_gain, 1);
+        assert_eq!(filtered.items[0].new_actionable, 2);
+
+        // Negative control: unfiltered sees both hubs with node 0 ranked first.
+        let unfiltered = parallel_cut_suggestions(&g, &closed, 10);
+        assert_eq!(unfiltered.current_actionable, 2);
+        assert_eq!(
+            unfiltered.items.iter().map(|i| i.node).collect::<Vec<_>>(),
+            vec![0, 4]
+        );
     }
 }

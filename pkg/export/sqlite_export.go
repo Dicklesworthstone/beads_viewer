@@ -268,8 +268,8 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at, due_date, defer_until, external_ref, estimated_minutes, created_by, close_reason, is_template, pinned)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at, due_date, defer_until, external_ref, estimated_minutes, created_by, close_reason, is_template, pinned, ephemeral)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -342,6 +342,7 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 			closeReason,
 			boolToInt(issue.IsTemplate),
 			boolToInt(issue.Pinned),
+			boolToInt(issue.Ephemeral),
 		)
 		if err != nil {
 			return fmt.Errorf("insert issue %s: %w", issue.ID, err)
@@ -441,6 +442,97 @@ func (e *SQLiteExporter) insertComments(db *sql.DB) error {
 }
 
 // insertMetrics inserts computed graph metrics for all issues.
+func (e *SQLiteExporter) activeBetweennessMap() map[string]float64 {
+	if e.Stats == nil {
+		return nil
+	}
+	hasClosed := false
+	activeByID := make(map[string]model.Issue, len(e.Issues))
+	for _, issue := range e.Issues {
+		if issue == nil {
+			continue
+		}
+		if issue.Status.IsClosed() || issue.Status.IsTombstone() {
+			hasClosed = true
+			continue
+		}
+		cloned := *issue
+		cloned.Dependencies = nil
+		activeByID[issue.ID] = cloned
+	}
+	if !hasClosed {
+		return e.Stats.Betweenness()
+	}
+	if len(activeByID) == 0 {
+		return nil
+	}
+	seenEdges := make(map[[2]string]bool)
+	activeEdges := 0
+	addDep := func(fromID, toID string, depType model.DependencyType) {
+		if !depType.IsBlocking() {
+			return
+		}
+		if _, okFrom := activeByID[fromID]; !okFrom {
+			return
+		}
+		if _, okTo := activeByID[toID]; !okTo {
+			return
+		}
+		key := [2]string{fromID, toID}
+		if seenEdges[key] {
+			return
+		}
+		seenEdges[key] = true
+		iss := activeByID[fromID]
+		iss.Dependencies = append(iss.Dependencies, &model.Dependency{
+			IssueID:     fromID,
+			DependsOnID: toID,
+			Type:        depType,
+		})
+		activeByID[fromID] = iss
+		activeEdges++
+	}
+	for _, dep := range e.Deps {
+		if dep != nil {
+			addDep(dep.IssueID, dep.DependsOnID, dep.Type)
+		}
+	}
+	for _, issue := range e.Issues {
+		if issue == nil || issue.Status.IsClosed() || issue.Status.IsTombstone() {
+			continue
+		}
+		for _, dep := range issue.Dependencies {
+			if dep != nil {
+				fromID := dep.IssueID
+				if fromID == "" {
+					fromID = issue.ID
+				}
+				addDep(fromID, dep.DependsOnID, dep.Type)
+			}
+		}
+	}
+	ids := make([]string, 0, len(activeByID))
+	for id := range activeByID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	activeIssues := make([]model.Issue, 0, len(ids))
+	for _, id := range ids {
+		activeIssues = append(activeIssues, activeByID[id])
+	}
+	cfg := analysis.ConfigForSize(len(activeIssues), activeEdges)
+	cfg.ComputePageRank = false
+	cfg.ComputeHITS = false
+	cfg.ComputeEigenvector = false
+	cfg.ComputeCriticalPath = false
+	cfg.ComputeCycles = false
+	cfg.ComputeKCore = false
+	cfg.ComputeArticulation = false
+	cfg.ComputeSlack = false
+	stats := analysis.NewAnalyzer(activeIssues).AnalyzeWithConfig(cfg)
+	return stats.Betweenness()
+}
+
 func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 	// Get triage scores if available (prefer AllScores so #11+ candidates retain scores)
 	triageScores := e.buildTriageScoresMap()
@@ -510,9 +602,9 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 	}
 
 	if e.Stats != nil {
-		// Get metrics maps from stats
+		// Get metrics maps from stats (using active-subgraph betweenness when closed/tombstone issues exist)
 		pageRankMap := e.Stats.PageRank()
-		betweennessMap := e.Stats.Betweenness()
+		betweennessMap := e.activeBetweennessMap()
 		eigenvectorMap := e.Stats.Eigenvector()
 		criticalPathMap := e.Stats.CriticalPathScore()
 
@@ -522,7 +614,10 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 			}
 			id := issue.ID
 			pr := pageRankMap[id]
-			bw := betweennessMap[id]
+			bw := 0.0
+			if isActiveCounterpart(id) {
+				bw = betweennessMap[id]
+			}
 			ev := eigenvectorMap[id]
 			cp := int(criticalPathMap[id])
 			score := triageScores[id]
@@ -1204,9 +1299,10 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 	// Get triage scores (prefer AllScores so #11+ candidates retain scores)
 	triageScores := e.buildTriageScoresMap()
 
-	var eigenvectorMap map[string]float64
+	var eigenvectorMap, betweennessMap map[string]float64
 	if e.Stats != nil {
 		eigenvectorMap = e.Stats.Eigenvector()
+		betweennessMap = e.activeBetweennessMap()
 	}
 
 	result := make([]ExportIssue, len(e.Issues))
@@ -1254,7 +1350,9 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 			}
 		} else if e.Stats != nil {
 			exp.PageRank = e.Stats.GetPageRankScore(issue.ID)
-			exp.Betweenness, _ = e.Stats.BetweennessValue(issue.ID) // O(1) lookup via bv-77ec
+			if isActiveCounterpart(issue.ID) {
+				exp.Betweenness = betweennessMap[issue.ID]
+			}
 			exp.Eigenvector = eigenvectorMap[issue.ID]
 			exp.CriticalPath = int(e.Stats.GetCriticalPathScore(issue.ID))
 		}

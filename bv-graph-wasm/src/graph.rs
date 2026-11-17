@@ -478,6 +478,30 @@ impl DiGraph {
         serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
     }
 
+    /// Find eligible actionable nodes that increase parallelization when completed.
+    /// Returns JSON: { items: [{node, parallel_gain, new_actionable}], open_nodes, current_actionable }
+    /// closed_js is an array of bytes where non-zero means closed.
+    /// candidate_js is an optional eligibility byte mask where non-zero means eligible.
+    #[wasm_bindgen(js_name = parallelCutFiltered)]
+    pub fn parallel_cut_filtered(
+        &self,
+        closed_js: &[u8],
+        limit: usize,
+        candidate_js: Option<Vec<u8>>,
+    ) -> JsValue {
+        use crate::algorithms::parallel_cut::parallel_cut_filtered;
+        use std::collections::HashSet;
+        let closed: Vec<bool> = closed_js.iter().map(|&b| b != 0).collect();
+        let candidates: Option<HashSet<usize>> = candidate_js.map(|mask| {
+            mask.into_iter()
+                .enumerate()
+                .filter_map(|(idx, flag)| (flag != 0).then_some(idx))
+                .collect()
+        });
+        let result = parallel_cut_filtered(self, &closed, limit, candidates.as_ref());
+        serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+    }
+
     /// Find parallel cut suggestions with default limit of 10.
     /// closed_set is an array of bytes where non-zero means closed.
     #[wasm_bindgen(js_name = parallelCutDefault)]

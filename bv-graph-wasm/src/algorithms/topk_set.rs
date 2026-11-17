@@ -14,9 +14,9 @@ use serde::Serialize;
 pub struct TopKSetItem {
     /// Node index in the graph
     pub node: usize,
-    /// Marginal gain from selecting this node (transitive unblocks)
+    /// Marginal gain from selecting this node (newly actionable direct unblocks)
     pub marginal_gain: usize,
-    /// IDs of nodes that become actionable after this selection
+    /// IDs of nodes that directly become actionable after this selection
     pub unblocked_ids: Vec<usize>,
 }
 
@@ -33,9 +33,10 @@ pub struct TopKSetResult {
 
 /// Greedy submodular selection for maximum unlock.
 ///
-/// Iteratively selects nodes that maximize transitive unblocks.
-/// Each iteration simulates closing the best node and updates
-/// the closed set for the next iteration.
+/// Iteratively selects currently actionable nodes that maximize newly actionable
+/// direct unlocks (tie-breaking by transitive unblocks, then lower node index).
+/// Each iteration simulates closing ONLY the selected node (`current_closed[node] = true`)
+/// so subsequent steps can select newly unlocked sequential bottlenecks.
 ///
 /// # Arguments
 /// * `graph` - The directed dependency graph
@@ -50,7 +51,7 @@ pub struct TopKSetResult {
 ///
 /// # Complexity
 /// O(n * k * n) = O(n²k) where n is node count and k is selection limit.
-/// Each iteration evaluates all open nodes using what_if_close.
+/// Each iteration evaluates currently actionable eligible nodes using what_if_close.
 pub fn topk_set(
     graph: &DiGraph,
     closed_set: &[bool],
@@ -79,9 +80,10 @@ pub fn topk_set(
     let mut total_gain = 0;
 
     for _ in 0..k {
-        // Find node with maximum marginal gain among open nodes
+        // Find node with maximum marginal direct gain among currently actionable eligible nodes
         let mut best_node: Option<usize> = None;
         let mut best_gain = 0;
+        let mut best_transitive_gain = 0;
         let mut best_unblocked: Vec<usize> = Vec::new();
 
         // Exclude ineligible or still-blocked choices before simulation:
@@ -95,13 +97,23 @@ pub fn topk_set(
 
         for node in candidates {
             let result = what_if_close(graph, node, &current_closed);
-            let gain = result.transitive_unblocks;
+            let gain = result.direct_unblocks;
+            let transitive_gain = result.transitive_unblocks;
 
-            // Prefer higher gain, or lower node index for determinism
-            if gain > best_gain || (gain == best_gain && best_node.is_none()) {
+            // Prefer higher direct gain, then higher transitive gain, then lower node index
+            let is_better = match best_node {
+                None => true,
+                Some(_) => {
+                    gain > best_gain
+                        || (gain == best_gain && transitive_gain > best_transitive_gain)
+                }
+            };
+            if is_better {
                 best_gain = gain;
+                best_transitive_gain = transitive_gain;
                 best_node = Some(node);
-                best_unblocked = result.cascade_ids;
+                best_unblocked = result.unblocked_ids;
+                best_unblocked.sort_unstable();
             }
         }
 
@@ -110,16 +122,11 @@ pub fn topk_set(
                 selected.push(TopKSetItem {
                     node,
                     marginal_gain: best_gain,
-                    unblocked_ids: best_unblocked.clone(),
+                    unblocked_ids: best_unblocked,
                 });
-                // Mark the selected node as closed
+                // Mark ONLY the selected node as closed (do NOT mark cascade_ids closed
+                // for free, so step s+1 can select newly unlocked sequential bottlenecks).
                 current_closed[node] = true;
-                // Also mark all cascade nodes as closed (they'll be completed transitively)
-                for &cascade_node in &best_unblocked {
-                    if cascade_node < n {
-                        current_closed[cascade_node] = true;
-                    }
-                }
                 total_gain += best_gain;
             }
             _ => break, // No more beneficial nodes
@@ -175,16 +182,24 @@ mod tests {
     #[test]
     fn test_simple_chain() {
         // 0 <- 1 <- 2 <- 3 (dependent -> prerequisite)
-        // Completing 0 unblocks 1,2,3 (gain=3)
-        // Simulating completion of the cascade leaves no further gain.
+        // Step-by-step sequential selection closes ONLY the chosen node per step:
+        // step 1: 0 unblocks [1] (gain=1)
+        // step 2: 1 unblocks [2] (gain=1)
+        // step 3: 2 unblocks [3] (gain=1)
         let g = make_graph(&[(1, 0), (2, 1), (3, 2)]);
         let result = topk_set(&g, &[false; 4], 5, None);
 
-        assert_eq!(result.items.len(), 1);
-        // First selection should be 0 (highest impact)
+        assert_eq!(result.items.len(), 3);
         assert_eq!(result.items[0].node, 0);
-        assert_eq!(result.items[0].marginal_gain, 3);
-        assert_eq!(result.items[0].unblocked_ids, vec![1, 2, 3]);
+        assert_eq!(result.items[0].marginal_gain, 1);
+        assert_eq!(result.items[0].unblocked_ids, vec![1]);
+        assert_eq!(result.items[1].node, 1);
+        assert_eq!(result.items[1].marginal_gain, 1);
+        assert_eq!(result.items[1].unblocked_ids, vec![2]);
+        assert_eq!(result.items[2].node, 2);
+        assert_eq!(result.items[2].marginal_gain, 1);
+        assert_eq!(result.items[2].unblocked_ids, vec![3]);
+        assert_eq!(result.total_gain, 3);
     }
 
     #[test]
@@ -218,26 +233,34 @@ mod tests {
     #[test]
     fn test_submodularity() {
         // Chain: 0 <- 1 <- 2 <- 3 <- 4
-        // First selection: 0 (gain=4)
-        // After that, no more nodes with positive gain (all unblocked)
+        // Sequential steps select 0, 1, 2, 3 in order (total_gain = 4).
         let g = make_graph(&[(1, 0), (2, 1), (3, 2), (4, 3)]);
         let result = topk_set(&g, &[false; 5], 5, None);
 
-        assert_eq!(result.items.len(), 1);
-        assert_eq!(result.items[0].marginal_gain, 4);
+        assert_eq!(result.items.len(), 4);
+        assert_eq!(
+            result.items.iter().map(|i| (i.node, i.marginal_gain)).collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1), (2, 1), (3, 1)]
+        );
+        assert_eq!(result.total_gain, 4);
     }
 
     #[test]
     fn test_partially_closed() {
         // 2 -> 0, 2 -> 1, 3 -> 2
-        // If 0 is already closed, closing 1 unblocks 2 (then 3)
+        // If 0 is already closed: step 1 closes 1 (unblocking 2), step 2 closes 2 (unblocking 3).
         let g = make_graph(&[(2, 0), (2, 1), (3, 2)]);
         let closed = vec![true, false, false, false];
         let result = topk_set(&g, &closed, 5, None);
 
-        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items.len(), 2);
         assert_eq!(result.items[0].node, 1);
-        assert_eq!(result.items[0].marginal_gain, 2); // 2 and 3
+        assert_eq!(result.items[0].marginal_gain, 1);
+        assert_eq!(result.items[0].unblocked_ids, vec![2]);
+        assert_eq!(result.items[1].node, 2);
+        assert_eq!(result.items[1].marginal_gain, 1);
+        assert_eq!(result.items[1].unblocked_ids, vec![3]);
+        assert_eq!(result.total_gain, 2);
     }
 
     #[test]
@@ -303,6 +326,7 @@ mod tests {
     #[test]
     fn test_deep_cascade() {
         // Deep chain: 0 <- 1 <- 2 <- 3 <- 4 <- 5 <- 6 <- 7 <- 8 <- 9
+        // With k=5, sequential selection picks 0, 1, 2, 3, 4 (1 direct unlock each).
         let mut edges = Vec::new();
         for i in 0..9 {
             edges.push((i + 1, i));
@@ -310,9 +334,12 @@ mod tests {
         let g = make_graph(&edges);
         let result = topk_set(&g, &[false; 10], 5, None);
 
-        assert_eq!(result.items.len(), 1);
-        assert_eq!(result.items[0].node, 0);
-        assert_eq!(result.items[0].marginal_gain, 9);
+        assert_eq!(result.items.len(), 5);
+        assert_eq!(
+            result.items.iter().map(|i| (i.node, i.marginal_gain)).collect::<Vec<_>>(),
+            vec![(0, 1), (1, 1), (2, 1), (3, 1), (4, 1)]
+        );
+        assert_eq!(result.total_gain, 5);
     }
 
     #[test]
@@ -360,33 +387,65 @@ mod tests {
 
     #[test]
     fn candidate_mask_does_not_truncate_cascades() {
-        let g = make_graph(&[(1, 0), (2, 1)]);
-        let result = topk_set(&g, &[], 5, Some(&[1]));
-        assert_eq!(result.open_nodes, 1);
+        // Node 0 is eligible; nodes 1 and 2 are excluded from selection mask.
+        // Selecting 0 directly unblocks node 1; step 2 cannot pick node 1 because mask excludes 1.
+        // Furthermore, transitive tie-breaking favors deeper cascades when direct gains tie:
+        // compare chain 0<-1<-2 (direct=1, transitive=2) vs 3<-4 (direct=1, transitive=1).
+        let g = make_graph(&[(1, 0), (2, 1), (4, 3)]);
+        let result = topk_set(&g, &[], 5, Some(&[1, 0, 0, 1, 0]));
+        assert_eq!(result.open_nodes, 2);
+        assert_eq!(result.items.len(), 2);
         assert_eq!(result.items[0].node, 0);
-        assert_eq!(result.items[0].unblocked_ids, vec![1, 2]);
+        assert_eq!(result.items[0].unblocked_ids, vec![1]);
+        assert_eq!(result.items[1].node, 3);
+        assert_eq!(result.items[1].unblocked_ids, vec![4]);
         assert_eq!(result.total_gain, 2);
+
+        // Even when node 3 has lower index than deeper-cascade root:
+        let g2 = make_graph(&[(1, 0), (3, 2), (4, 3)]);
+        let res2 = topk_set(&g2, &[], 1, Some(&[1, 0, 1, 0, 0]));
+        assert_eq!(res2.items[0].node, 2, "transitive tie-breaker selects deeper cascade root");
     }
 
     #[test]
     fn step_one_never_selects_blocked_node_and_step_two_chains_unlocks() {
         // Node 2 depends on BOTH 0 and 1. Nodes 3, 4, 5 depend on 2.
         // Node 6 depends only on 0.
-        // At step 1: 2 has high fan-out (3,4,5) if closed directly, MUST NOT be selected
-        // because 0 and 1 are still open! Only 0 and 1 are actionable:
-        // - 0 directly unblocks 6 (gain 1)
-        // - 1 directly unblocks nothing yet (gain 0)
-        // So step 1 picks 0 (closing 0 and 6).
-        // At step 2: 0 is now closed, so actionable node 1 now unblocks 2 -> 3,4,5 (gain 4)!
+        // Step 1: 2 is blocked; 0 directly unblocks [6] (gain 1), 1 directly unblocks [] (gain 0) -> picks 0.
+        // Step 2: 0 is closed; 1 now directly unblocks [2] (gain 1, transitive 4) -> picks 1.
+        // Step 3: 0 and 1 are closed; 2 is now actionable and directly unblocks [3, 4, 5] (gain 3) -> picks 2!
         let g = make_graph(&[(2, 0), (2, 1), (3, 2), (4, 2), (5, 2), (6, 0)]);
         let result = topk_set(&g, &[false; 7], 5, None);
+
+        assert_eq!(result.items.len(), 3);
+        assert_eq!(result.items[0].node, 0);
+        assert_eq!(result.items[0].marginal_gain, 1);
+        assert_eq!(result.items[0].unblocked_ids, vec![6]);
+        assert_eq!(result.items[1].node, 1);
+        assert_eq!(result.items[1].marginal_gain, 1);
+        assert_eq!(result.items[1].unblocked_ids, vec![2]);
+        assert_eq!(result.items[2].node, 2);
+        assert_eq!(result.items[2].marginal_gain, 3);
+        assert_eq!(result.items[2].unblocked_ids, vec![3, 4, 5]);
+        assert_eq!(result.total_gain, 5);
+    }
+
+    #[test]
+    fn test_sequential_bottleneck_chain_a_b_cde() {
+        // Sequential bottleneck chain: A (0) <- B (1) <- {C (2), D (3), E (4)}
+        // Step 1 picks A (directly unblocks B, gain=1), NOT marking B closed for free!
+        // Step 2 picks B (now actionable, directly unblocks C, D, E, gain=3)!
+        let g = make_graph(&[(1, 0), (2, 1), (3, 1), (4, 1)]);
+        let result = topk_set(&g, &[false; 5], 5, None);
 
         assert_eq!(result.items.len(), 2);
         assert_eq!(result.items[0].node, 0);
         assert_eq!(result.items[0].marginal_gain, 1);
+        assert_eq!(result.items[0].unblocked_ids, vec![1]);
         assert_eq!(result.items[1].node, 1);
-        assert_eq!(result.items[1].marginal_gain, 4);
-        assert_eq!(result.total_gain, 5);
+        assert_eq!(result.items[1].marginal_gain, 3);
+        assert_eq!(result.items[1].unblocked_ids, vec![2, 3, 4]);
+        assert_eq!(result.total_gain, 4);
     }
 
     #[test]

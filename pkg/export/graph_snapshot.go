@@ -238,22 +238,42 @@ func buildLayout(opts GraphSnapshotOptions) layoutResult {
 	}
 
 	// summary
-	// Collect all node IDs and filter betweenness to rendered subgraph nodes only
+	// Collect rendered node IDs and compute TopBottleneck over active (non-closed,
+	// non-tombstone) issues on the active subgraph whenever active issues exist.
 	allNodeIDs := make([]string, 0, len(nodes))
+	activeNodeIDs := make(map[string]bool, len(nodes))
+	activeNodeSlice := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		allNodeIDs = append(allNodeIDs, n.ID)
+		if !n.Status.IsClosed() && !n.Status.IsTombstone() {
+			activeNodeIDs[n.ID] = true
+			activeNodeSlice = append(activeNodeSlice, n.ID)
+		}
 	}
-	rawBetweenness := opts.Stats.Betweenness()
+	var rawBetweenness map[string]float64
+	if opts.Stats != nil {
+		if hasClosedOrTombstoneIssues(opts.Issues) {
+			if activeStats := activeSubgraphStatsForIssues(opts.Issues, true, false, false); activeStats != nil {
+				rawBetweenness = activeStats.Betweenness()
+			}
+		} else {
+			rawBetweenness = opts.Stats.Betweenness()
+		}
+	}
 	var scopedBetweenness map[string]float64
 	if len(rawBetweenness) > 0 {
-		scopedBetweenness = make(map[string]float64, len(nodes))
+		scopedBetweenness = make(map[string]float64, len(activeNodeIDs))
 		for id, val := range rawBetweenness {
-			if nodeIDs[id] {
+			if activeNodeIDs[id] {
 				scopedBetweenness[id] = val
 			}
 		}
 	}
-	topBottleneck := topByMetricWithFallback(scopedBetweenness, allNodeIDs)
+	fallbackIDs := activeNodeSlice
+	if len(fallbackIDs) == 0 {
+		fallbackIDs = allNodeIDs
+	}
+	topBottleneck := topByMetricWithFallback(scopedBetweenness, fallbackIDs)
 	title := opts.Title
 	if strings.TrimSpace(title) == "" {
 		title = "Graph Snapshot"
