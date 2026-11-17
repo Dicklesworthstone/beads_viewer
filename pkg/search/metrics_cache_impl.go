@@ -154,8 +154,12 @@ func (l *AnalyzerMetricsLoader) ensureBaseLocked() {
 		l.baseHash = rawHash
 	} else {
 		ids := make([]string, len(l.issues))
+		ephemeralByID := make(map[string]bool, len(l.issues))
 		for i := range l.issues {
 			ids[i] = l.issues[i].ID
+			if l.issues[i].Ephemeral {
+				ephemeralByID[l.issues[i].ID] = true
+			}
 		}
 		sort.Strings(ids)
 		h := sha256.New()
@@ -165,6 +169,9 @@ func (l *AnalyzerMetricsLoader) ensureBaseLocked() {
 			h.Write([]byte(id))
 			h.Write([]byte{':'})
 			h.Write([]byte(string(l.readiness.DependencyState(id))))
+			if ephemeralByID[id] {
+				h.Write([]byte(":eph"))
+			}
 		}
 		l.baseHash = "v" + hex.EncodeToString(h.Sum(nil)[:8])
 	}
@@ -312,7 +319,7 @@ func (l *AnalyzerMetricsLoader) computeMetricsAndHash(includeHash bool) (map[str
 		effectiveStatus := issue.Status
 		if normStatus != model.StatusClosed && !normStatus.IsTombstone() {
 			switch {
-			case issue.IsTemplate || issue.Pinned || normStatus == model.StatusPinned:
+			case issue.IsTemplate || issue.Pinned || issue.Ephemeral || normStatus == model.StatusPinned:
 				effectiveStatus = model.StatusDeferred
 			case (normStatus == model.StatusOpen || normStatus == model.StatusInProgress) && issue.IsDeferredAt(refNow):
 				effectiveStatus = model.StatusDeferred

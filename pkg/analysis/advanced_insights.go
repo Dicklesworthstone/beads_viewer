@@ -691,36 +691,39 @@ func (a *Analyzer) computeMarginalUnblocksFromBefore(issueID string, alreadyComp
 		return unblocks
 	}
 
-	completedAfter := make(map[string]bool, len(alreadyCompleted)+1)
-	for id, done := range alreadyCompleted {
-		completedAfter[id] = done
-	}
-	completedAfter[issueID] = true
+	had, existed := alreadyCompleted[issueID]
+	alreadyCompleted[issueID] = true
 
 	for _, id := range frontier {
 		// Already-actionable issues cannot be new unlocks. Evaluate only the
 		// affected downstream frontier instead of scanning every issue in the graph.
-		if !before[id] && a.IsUnblockCandidate(id) && readiness.ReadyAfter(id, a.now, completedAfter) {
+		if !before[id] && a.IsUnblockCandidate(id) && readiness.ReadyAfter(id, a.now, alreadyCompleted) {
 			unblocks = append(unblocks, id)
 		}
+	}
+	if !existed {
+		delete(alreadyCompleted, issueID)
+	} else {
+		alreadyCompleted[issueID] = had
 	}
 	return unblocks
 }
 
 // generateCoverageSet computes a bounded greedy vertex-cover heuristic over blocking edges.
-// Uses only open issues; returns deterministic ordering with caps.
+// Uses only open non-withheld issues; returns deterministic ordering with caps.
 func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 	if limit <= 0 {
 		limit = 5
 	}
 
-	// Build edge list of blocking deps between non-closed issues
+	// Build edge list of blocking deps between non-closed, non-withheld issues
 	type edge struct{ from, to string }
 	var edges []edge
 	seenEdges := make(map[edge]struct{})
 	totalDegree := make(map[string]int)
+	incident := make(map[string][]int)
 	for id, issue := range a.issueMap {
-		if !a.IsCandidate(id) || isClosedLikeStatus(issue.Status) {
+		if !a.IsCandidate(id) || isClosedLikeStatus(issue.Status) || isWithheldIssue(&issue) {
 			continue
 		}
 		for _, dep := range issue.Dependencies {
@@ -730,13 +733,18 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 			if !a.IsCandidate(dep.DependsOnID) {
 				continue
 			}
-			if target, ok := a.issueMap[dep.DependsOnID]; ok && !isClosedLikeStatus(target.Status) {
+			if target, ok := a.issueMap[dep.DependsOnID]; ok && !isClosedLikeStatus(target.Status) && !isWithheldIssue(&target) {
 				e := edge{from: id, to: dep.DependsOnID}
 				if _, seen := seenEdges[e]; !seen {
 					seenEdges[e] = struct{}{}
+					idx := len(edges)
 					edges = append(edges, e)
 					totalDegree[e.from]++
 					totalDegree[e.to]++
+					incident[e.from] = append(incident[e.from], idx)
+					if e.to != e.from {
+						incident[e.to] = append(incident[e.to], idx)
+					}
 				}
 			}
 		}
@@ -787,8 +795,9 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 
 		// remove all edges incident to bestID and update neighbor degrees
 		added := 0
-		for idx, e := range edges {
-			if !covered[idx] && (e.from == bestID || e.to == bestID) {
+		for _, idx := range incident[bestID] {
+			if !covered[idx] {
+				e := edges[idx]
 				covered[idx] = true
 				uncoveredCount--
 				added++

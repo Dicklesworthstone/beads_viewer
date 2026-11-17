@@ -189,6 +189,167 @@ func NewReadinessIndex(issues []Issue) *ReadinessIndex {
 	return r
 }
 
+// NewReadinessIndexFromMap builds a ReadinessIndex directly from an ID-keyed
+// issue map (plus an optional extra issue when absent from issues) without
+// allocating or copying an intermediate []Issue slice.
+func NewReadinessIndexFromMap(issues map[string]Issue, extra *Issue) *ReadinessIndex {
+	capHint := len(issues)
+	includeExtra := false
+	if extra != nil {
+		if _, exists := issues[extra.ID]; !exists {
+			capHint++
+			includeExtra = true
+		}
+	}
+	if capHint == 0 {
+		return &ReadinessIndex{
+			idToIdx:  map[string]int{},
+			ids:      []string{},
+			issues:   []readinessIssue{},
+			states:   []DependencyState{},
+			children: [][]int32{},
+		}
+	}
+
+	ids := make([]string, 0, capHint)
+	for id := range issues {
+		ids = append(ids, id)
+	}
+	if includeExtra {
+		ids = append(ids, extra.ID)
+	}
+	sort.Strings(ids)
+
+	n := len(ids)
+	idToIdx := make(map[string]int, n)
+	for idx, id := range ids {
+		idToIdx[id] = idx
+	}
+
+	lookup := func(id string) Issue {
+		if iss, ok := issues[id]; ok {
+			return iss
+		}
+		return *extra
+	}
+
+	totalDeps := 0
+	totalDefers := 0
+	totalParentEdges := 0
+	for _, id := range ids {
+		src := lookup(id)
+		if src.DeferUntil != nil {
+			totalDefers++
+		}
+		for _, dep := range src.Dependencies {
+			if dep != nil {
+				totalDeps++
+				if dep.Type == DepParentChild {
+					totalParentEdges++
+				}
+			}
+		}
+	}
+
+	var depSlab []readinessDependency
+	if totalDeps > 0 {
+		depSlab = make([]readinessDependency, totalDeps)
+	}
+	var deferSlab []time.Time
+	if totalDefers > 0 {
+		deferSlab = make([]time.Time, totalDefers)
+	}
+
+	ownedIssues := make([]readinessIssue, n)
+	var childDeg []int32
+	if totalParentEdges > 0 {
+		childDeg = make([]int32, n)
+	}
+	var missingChildren map[string][]int32
+
+	depPos := 0
+	deferPos := 0
+	for idx, id := range ids {
+		src := lookup(id)
+		owned := readinessIssue{
+			Status:     src.Status,
+			IssueType:  src.IssueType,
+			Assignee:   src.Assignee,
+			Ephemeral:  src.Ephemeral,
+			Pinned:     src.Pinned,
+			IsTemplate: src.IsTemplate,
+		}
+		if src.DeferUntil != nil {
+			deferSlab[deferPos] = *src.DeferUntil
+			owned.DeferUntil = &deferSlab[deferPos]
+			deferPos++
+		}
+		if len(src.Dependencies) > 0 {
+			start := depPos
+			for _, dep := range src.Dependencies {
+				if dep == nil {
+					continue
+				}
+				targetIdx := int32(-1)
+				if resolvedIdx, ok := idToIdx[dep.DependsOnID]; ok {
+					targetIdx = int32(resolvedIdx)
+				}
+				depSlab[depPos] = readinessDependency{
+					DependsOnID:  dep.DependsOnID,
+					DependsOnIdx: targetIdx,
+					Type:         dep.Type,
+				}
+				depPos++
+				if dep.Type == DepParentChild {
+					owned.hasParentEdge = true
+					if targetIdx >= 0 {
+						childDeg[targetIdx]++
+					} else {
+						if missingChildren == nil {
+							missingChildren = make(map[string][]int32)
+						}
+						missingChildren[dep.DependsOnID] = append(missingChildren[dep.DependsOnID], int32(idx))
+					}
+				}
+			}
+			if depPos > start {
+				owned.Dependencies = depSlab[start:depPos:depPos]
+			}
+		}
+		ownedIssues[idx] = owned
+	}
+
+	children := make([][]int32, n)
+	if totalParentEdges > 0 {
+		knownParentEdges := 0
+		for _, deg := range childDeg {
+			knownParentEdges += int(deg)
+		}
+		if knownParentEdges > 0 {
+			childSlab := make([]int32, knownParentEdges)
+			offset := 0
+			for idx, deg := range childDeg {
+				if deg > 0 {
+					end := offset + int(deg)
+					children[idx] = childSlab[offset:offset:end]
+					offset = end
+				}
+			}
+		}
+	}
+
+	r := &ReadinessIndex{
+		idToIdx:         idToIdx,
+		ids:             ids,
+		issues:          ownedIssues,
+		states:          make([]DependencyState, n),
+		children:        children,
+		missingChildren: missingChildren,
+	}
+	r.compute()
+	return r
+}
+
 func closedForReadiness(status Status) bool {
 	return status == StatusClosed || status == StatusTombstone
 }

@@ -624,18 +624,32 @@ func (c *Calculator) checkActionable(result *Result) {
 
 // collectTopMetricChanges compares baseline and current top-N items for a single structural metric.
 func collectTopMetricChanges(blItems, curItems []baseline.MetricItem, warningPct float64, prefix string) []string {
+	return (*Calculator)(nil).collectTopMetricChanges(blItems, curItems, warningPct, prefix)
+}
+
+func (c *Calculator) collectTopMetricChanges(blItems, curItems []baseline.MetricItem, warningPct float64, prefix string) []string {
 	if len(blItems) == 0 && len(curItems) == 0 {
 		return nil
 	}
 
 	blMap := make(map[string]float64, len(blItems))
 	for _, item := range blItems {
+		if c != nil && !c.isCandidate(item.ID) {
+			continue
+		}
 		blMap[item.ID] = item.Value
 	}
 
 	curMap := make(map[string]float64, len(curItems))
 	for _, item := range curItems {
+		if c != nil && !c.isCandidate(item.ID) {
+			continue
+		}
 		curMap[item.ID] = item.Value
+	}
+
+	if len(blMap) == 0 && len(curMap) == 0 {
+		return nil
 	}
 
 	formatEntry := func(detail string) string {
@@ -680,7 +694,7 @@ func (c *Calculator) checkPageRankChanges(result *Result) {
 	warnPct := c.config.PageRankChangeWarningPct
 	var prRaw []string
 	if len(c.current.TopMetrics.PageRank) > 0 || c.current.Stats.NodeCount == 0 {
-		prRaw = collectTopMetricChanges(c.baseline.TopMetrics.PageRank, c.current.TopMetrics.PageRank, warnPct, "")
+		prRaw = c.collectTopMetricChanges(c.baseline.TopMetrics.PageRank, c.current.TopMetrics.PageRank, warnPct, "")
 	}
 
 	var otherChanges []string
@@ -699,7 +713,7 @@ func (c *Calculator) checkPageRankChanges(result *Result) {
 		if (len(metric.bl) == 0 && len(c.baseline.TopMetrics.PageRank) > 0) || len(metric.cur) == 0 {
 			continue
 		}
-		otherChanges = append(otherChanges, collectTopMetricChanges(metric.bl, metric.cur, warnPct, metric.name)...)
+		otherChanges = append(otherChanges, c.collectTopMetricChanges(metric.bl, metric.cur, warnPct, metric.name)...)
 	}
 
 	if len(prRaw) == 0 && len(otherChanges) == 0 {
@@ -714,7 +728,7 @@ func (c *Calculator) checkPageRankChanges(result *Result) {
 	} else {
 		var prPrefixed []string
 		if len(c.current.TopMetrics.PageRank) > 0 || c.current.Stats.NodeCount == 0 {
-			prPrefixed = collectTopMetricChanges(c.baseline.TopMetrics.PageRank, c.current.TopMetrics.PageRank, warnPct, "PageRank")
+			prPrefixed = c.collectTopMetricChanges(c.baseline.TopMetrics.PageRank, c.current.TopMetrics.PageRank, warnPct, "PageRank")
 		}
 		details = make([]string, 0, len(prPrefixed)+len(otherChanges))
 		details = append(details, prPrefixed...)
@@ -1212,7 +1226,7 @@ func (c *Calculator) checkPotentialDuplicate(result *Result) {
 		if !c.isCandidate(iss.ID) {
 			continue
 		}
-		if model.IsClosedLikeStatus(iss.Status) || iss.IsTemplate {
+		if model.IsClosedLikeStatus(iss.Status) || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned || iss.Ephemeral {
 			continue
 		}
 		live = append(live, iss)
@@ -1255,8 +1269,16 @@ func (c *Calculator) checkPriorityMismatch(result *Result) {
 	if minConfidence > thresholds.MinConfidence {
 		thresholds.MinConfidence = minConfidence
 	}
+	a := c.analyzer()
+	readyLeaf := a.CandidateIssueSet(analysis.SelectionReadyLeaf)
+	if len(readyLeaf) == 0 {
+		return
+	}
 	issueMap := c.issueMap()
-	for _, rec := range c.analyzer().GenerateRecommendationsWithThresholds(thresholds) {
+	for _, rec := range a.GenerateRecommendationsWithThresholds(thresholds) {
+		if !readyLeaf[rec.IssueID] {
+			continue
+		}
 		// Only under-prioritised load-bearing issues are alerts; "could be
 		// lower" recommendations are hygiene for --robot-priority, and on
 		// small graphs they fire for nearly every leaf.

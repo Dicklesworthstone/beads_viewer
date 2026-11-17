@@ -157,8 +157,10 @@ type CorrelatorOptions struct {
 // per-strategy timings; v3 = owned before/after transitions and optional full
 // historical constraint evidence for one causal-analysis target; v4 = Aho-Corasick
 // known-ID matching, synthesized creation milestones, mixed .beads/+code
-// temporal candidates, and expanded code/explicit file retention.
-const historyArtifactFormatVersion = 4
+// temporal candidates, and expanded code/explicit file retention; v5 = claimed
+// open/in_progress temporal windows bounded by latest walked commit, inclusive
+// single-commit overlap, and case-insensitive claimant matching.
+const historyArtifactFormatVersion = 5
 
 // historyArtifact holds the purely history-derived (HEAD + options only)
 // intermediate products of report generation: the extracted lifecycle events
@@ -583,11 +585,42 @@ func (c *Correlator) extractTemporalCandidates(events []BeadEvent, walk []walked
 }
 
 func (c *Correlator) extractTemporalCandidatesWithOptions(events []BeadEvent, walk []walkedCommit, opts CorrelatorOptions) ([]temporalCandidate, error) {
-	windows := temporalWindowsFromEvents(events, opts.BeadID, opts.TargetBeadAliases...)
+	var latestCommitTime time.Time
+	for i := range walk {
+		if walk[i].Timestamp.After(latestCommitTime) {
+			latestCommitTime = walk[i].Timestamp
+		}
+	}
+	windows := temporalWindowsFromEvents(events, latestCommitTime, opts.BeadID, opts.TargetBeadAliases...)
 	if len(windows) == 0 {
 		return nil, nil
 	}
 	storeDirRel := c.storeDirRel()
+
+	type indexedCommit struct {
+		order  int
+		commit walkedCommit
+	}
+	byEmail := make(map[string][]indexedCommit)
+	byAuthor := make(map[string][]indexedCommit)
+	byZeroEmailAuthor := make(map[string][]indexedCommit)
+	for idx, wc := range walk {
+		if len(wc.Files) == 0 || wc.trackerOnly(storeDirRel) {
+			continue
+		}
+		ic := indexedCommit{order: idx, commit: wc}
+		if wc.AuthorEmail != "" {
+			key := strings.ToLower(wc.AuthorEmail)
+			byEmail[key] = append(byEmail[key], ic)
+		} else if wc.Author != "" {
+			key := strings.ToLower(wc.Author)
+			byZeroEmailAuthor[key] = append(byZeroEmailAuthor[key], ic)
+		}
+		if wc.Author != "" {
+			key := strings.ToLower(wc.Author)
+			byAuthor[key] = append(byAuthor[key], ic)
+		}
+	}
 
 	type pair struct {
 		window TemporalWindow
@@ -597,8 +630,24 @@ func (c *Correlator) extractTemporalCandidatesWithOptions(events []BeadEvent, wa
 	var shas []string
 	queued := make(map[string]struct{})
 	for _, w := range windows {
-		for _, wc := range walk {
-			if len(wc.Files) == 0 || wc.trackerOnly(storeDirRel) || !commitInWindow(w, wc) {
+		var bucket []indexedCommit
+		if w.AuthorEmail != "" {
+			bucket = byEmail[strings.ToLower(w.AuthorEmail)]
+			if w.Author != "" {
+				if zeroEmail := byZeroEmailAuthor[strings.ToLower(w.Author)]; len(zeroEmail) > 0 {
+					merged := make([]indexedCommit, 0, len(bucket)+len(zeroEmail))
+					merged = append(merged, bucket...)
+					merged = append(merged, zeroEmail...)
+					sort.Slice(merged, func(i, j int) bool { return merged[i].order < merged[j].order })
+					bucket = merged
+				}
+			}
+		} else if w.Author != "" {
+			bucket = byAuthor[strings.ToLower(w.Author)]
+		}
+		for _, ic := range bucket {
+			wc := ic.commit
+			if !commitInWindow(w, wc) {
 				continue
 			}
 			pairs = append(pairs, pair{window: w, commit: wc})

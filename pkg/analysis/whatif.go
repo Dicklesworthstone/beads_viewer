@@ -143,8 +143,8 @@ func (a *Analyzer) GenerateEnhancedRecommendationsFromStats(stats *GraphStats, t
 		return nil
 	}
 
-	// Get basic recommendations
-	basicRecs := a.GenerateRecommendationsFromStats(stats, thresholds)
+	// Get basic recommendations reusing precomputed scores
+	basicRecs := a.generateRecommendationsFromStatsAndScores(stats, scores, rawNow, thresholds)
 
 	// Create a map for quick lookup
 	recMap := make(map[string]*PriorityRecommendation)
@@ -171,8 +171,16 @@ func (a *Analyzer) GenerateEnhancedRecommendationsFromStats(stats *GraphStats, t
 
 		rec, hasRec := recMap[score.IssueID]
 
-		// Generate what-if for all scores (not just those with recommendations)
-		whatIf := a.computeWhatIfDeltaFromStats(score.IssueID, stats)
+		// Reuse what-if delta when already computed on basic recommendation
+		var whatIf *WhatIfDelta
+		if hasRec && rec.WhatIf != nil {
+			whatIf = rec.WhatIf
+		} else {
+			whatIf = a.computeWhatIfDeltaFromStats(score.IssueID, stats)
+			if hasRec {
+				rec.WhatIf = whatIf
+			}
+		}
 		topReasons := GenerateTopReasons(score)
 
 		// Determine if caps were applied

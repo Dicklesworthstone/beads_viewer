@@ -260,6 +260,7 @@ func (s *Searcher) SearchInWorkspace(ctx context.Context, query, workspace strin
 // defaultSearchRunCommand executes a command and returns its stdout.
 func defaultSearchRunCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = time.Second
 
 	// Use a limited reader for stdout
 	var stdout bytes.Buffer

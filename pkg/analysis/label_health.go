@@ -612,10 +612,17 @@ func ComputeVelocityMetrics(issues []model.Issue, now time.Time) VelocityMetrics
 		if !isClosedLikeStatus(iss.Status) {
 			continue
 		}
-		if iss.ClosedAt == nil {
+		var closedAt time.Time
+		if iss.ClosedAt != nil && !iss.ClosedAt.IsZero() {
+			closedAt = *iss.ClosedAt
+		} else if !iss.UpdatedAt.IsZero() {
+			closedAt = iss.UpdatedAt
+		} else {
 			continue
 		}
-		closedAt := *iss.ClosedAt
+		if closedAt.After(now) {
+			continue
+		}
 		if closedAt.After(weekAgo) {
 			closed7++
 		}
@@ -1965,7 +1972,7 @@ func ComputeBlockageCascadeAtWithScope(issues []model.Issue, flow CrossLabelFlow
 			return blockedIssues[i].ID < blockedIssues[j].ID
 		})
 
-		cascade := computeSingleCascade(sourceLabel, blockedIssues, flow, labelIndex, issueMap, readiness)
+		cascade := computeSingleCascade(sourceLabel, blockedIssues, flow, labelIndex, issueMap, readiness, candidateIDs)
 		if cascade.TotalImpact > 0 || cascade.BlockedCount > 0 {
 			allCascades = append(allCascades, cascade)
 		}
@@ -1983,7 +1990,7 @@ func ComputeBlockageCascadeAtWithScope(issues []model.Issue, flow CrossLabelFlow
 	})
 	result.Cascades = allCascades
 
-	// Collect all recommendations and sort deterministically.
+	// Collect all recommendations, sort deterministically, and deduplicate by IssueID.
 	allRecs := make([]UnblockRecommendation, 0)
 	for _, cascade := range allCascades {
 		allRecs = append(allRecs, cascade.Recommendations...)
@@ -2001,11 +2008,19 @@ func ComputeBlockageCascadeAtWithScope(issues []model.Issue, flow CrossLabelFlow
 		return allRecs[i].Label < allRecs[j].Label
 	})
 
-	// Take top 10 recommendations
-	if len(allRecs) > 10 {
-		allRecs = allRecs[:10]
+	dedupedRecs := make([]UnblockRecommendation, 0, len(allRecs))
+	seenRecIDs := make(map[string]struct{}, len(allRecs))
+	for _, rec := range allRecs {
+		if _, seen := seenRecIDs[rec.IssueID]; seen {
+			continue
+		}
+		seenRecIDs[rec.IssueID] = struct{}{}
+		dedupedRecs = append(dedupedRecs, rec)
+		if len(dedupedRecs) >= 10 {
+			break
+		}
 	}
-	result.TopUnblocks = allRecs
+	result.TopUnblocks = dedupedRecs
 
 	// Find critical chain (longest cascade)
 	longestChain := []string{}
@@ -2026,7 +2041,7 @@ func ComputeBlockageCascadeAtWithScope(issues []model.Issue, flow CrossLabelFlow
 }
 
 // computeSingleCascade computes the cascade for a single source label
-func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow CrossLabelFlow, labelIndex map[string]int, issueMap map[string]model.Issue, readiness *model.ReadinessIndex) BlockageCascadeResult {
+func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow CrossLabelFlow, labelIndex map[string]int, issueMap map[string]model.Issue, readiness *model.ReadinessIndex, candidateIDs map[string]bool) BlockageCascadeResult {
 	result := BlockageCascadeResult{
 		SourceLabel:     sourceLabel,
 		BlockedCount:    len(blockedIssues),
@@ -2136,6 +2151,9 @@ func computeSingleCascade(sourceLabel string, blockedIssues []model.Issue, flow 
 	for _, blockedIssue := range blockedIssues {
 		blockerIDs := readiness.Blockers(blockedIssue.ID)
 		for _, blockerID := range blockerIDs {
+			if candidateIDs != nil && !candidateIDs[blockerID] {
+				continue
+			}
 			blocker, exists := issueMap[blockerID]
 			if !exists || isClosedLikeStatus(blocker.Status) {
 				continue
@@ -2846,16 +2864,25 @@ func ComputeLabelAttentionScoresWithScope(issues []model.Issue, cfg LabelHealthC
 		return result
 	}
 
-	// Build issue map for lookups across all context issues
+	// Build issue map and pre-index reverse active blocking edges once across context issues
 	issueMap := make(map[string]model.Issue, len(issues))
+	activeDependentEdges := make(map[string]int, len(issues))
 	for _, iss := range issues {
 		issueMap[iss.ID] = iss
+		if isClosedLikeStatus(iss.Status) {
+			continue
+		}
+		for _, dep := range iss.Dependencies {
+			if dep != nil && dep.DependsOnID != iss.ID && dep.Type.IsBlocking() {
+				activeDependentEdges[dep.DependsOnID]++
+			}
+		}
 	}
 
 	// Compute attention for each candidate label while preserving downstream block impact across all context issues
 	var scores []LabelAttentionScore
 	for _, label := range labels.Labels {
-		score := computeLabelAttention(label, scopedIssues, issues, issueMap, cfg, now, candidateIDs)
+		score := computeLabelAttention(label, scopedIssues, issues, issueMap, activeDependentEdges, cfg, now, candidateIDs)
 		scores = append(scores, score)
 	}
 
@@ -2928,7 +2955,7 @@ func ComputeLabelAttentionScoresWithScope(issues []model.Issue, cfg LabelHealthC
 }
 
 // computeLabelAttention calculates attention score for a single label
-func computeLabelAttention(label string, scopedIssues []model.Issue, allIssues []model.Issue, issueMap map[string]model.Issue, cfg LabelHealthConfig, now time.Time, candidateIDs map[string]bool) LabelAttentionScore {
+func computeLabelAttention(label string, scopedIssues []model.Issue, allIssues []model.Issue, issueMap map[string]model.Issue, activeDependentEdges map[string]int, cfg LabelHealthConfig, now time.Time, candidateIDs map[string]bool) LabelAttentionScore {
 	score := LabelAttentionScore{
 		Label: label,
 	}
@@ -2978,19 +3005,8 @@ func computeLabelAttention(label string, scopedIssues []model.Issue, allIssues [
 	// Compute block impact (how many active issues across context are blocked by open issues in this label)
 	blockImpact := 0
 	for _, iss := range labeledIssues {
-		if isClosedLikeStatus(iss.Status) {
-			continue
-		}
-		// Count how many active issues depend on this one
-		for _, other := range allIssues {
-			if other.ID == iss.ID || isClosedLikeStatus(other.Status) {
-				continue
-			}
-			for _, dep := range other.Dependencies {
-				if dep != nil && dep.DependsOnID == iss.ID && dep.Type.IsBlocking() {
-					blockImpact++
-				}
-			}
+		if !isClosedLikeStatus(iss.Status) {
+			blockImpact += activeDependentEdges[iss.ID]
 		}
 	}
 	score.BlockImpact = float64(blockImpact)
@@ -3111,8 +3127,16 @@ func ComputeLabelAttentionScoresFast(issues []model.Issue, cfg LabelHealthConfig
 			}
 		}
 		closed30Inc := 0
-		if isClosed && iss.ClosedAt != nil && iss.ClosedAt.After(monthAgo) {
-			closed30Inc = 1
+		if isClosed {
+			var closedAt time.Time
+			if iss.ClosedAt != nil && !iss.ClosedAt.IsZero() {
+				closedAt = *iss.ClosedAt
+			} else if !iss.UpdatedAt.IsZero() {
+				closedAt = iss.UpdatedAt
+			}
+			if !closedAt.IsZero() && !closedAt.After(now) && closedAt.After(monthAgo) {
+				closed30Inc = 1
+			}
 		}
 		issBlockImpact := blockingDepCountToID[iss.ID]
 

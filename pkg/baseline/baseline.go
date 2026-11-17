@@ -37,6 +37,9 @@ type Baseline struct {
 	// Description is an optional user-provided note
 	Description string `json:"description,omitempty"`
 
+	// Scope records the filter/workspace scope active when the baseline was saved
+	Scope *BaselineScope `json:"scope,omitempty"`
+
 	// Stats contains the graph statistics snapshot
 	Stats GraphStats `json:"stats"`
 
@@ -45,6 +48,23 @@ type Baseline struct {
 
 	// Cycles stores one representative cycle per detected cyclic component.
 	Cycles [][]string `json:"cycles,omitempty"`
+}
+
+// BaselineScope records the filter/workspace scope active when a baseline was captured.
+type BaselineScope struct {
+	Label     string `json:"label,omitempty"`
+	Recipe    string `json:"recipe,omitempty"`
+	Repo      string `json:"repo,omitempty"`
+	Workspace bool   `json:"workspace,omitempty"`
+}
+
+// MatchesScope reports whether b's recorded scope matches other, treating a nil
+// Scope (legacy/unscoped baseline) as equivalent to an empty BaselineScope{}.
+func (b *Baseline) MatchesScope(other BaselineScope) bool {
+	if b == nil || b.Scope == nil {
+		return other == (BaselineScope{})
+	}
+	return *b.Scope == other
 }
 
 // GraphStats contains basic graph statistics
@@ -94,11 +114,15 @@ func DefaultPath(projectDir string) string {
 	return filepath.Join(projectDir, ".bv", DefaultFilename)
 }
 
-// Save writes the baseline to a file
+// Save writes the baseline atomically via temp file + rename in the target directory.
 func (b *Baseline) Save(path string) error {
-	// Ensure parent directory exists
+	if b == nil {
+		return fmt.Errorf("encoding baseline: nil baseline")
+	}
+
+	// Ensure parent directory exists with private permissions
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("creating directory: %w", err)
 	}
 
@@ -108,7 +132,41 @@ func (b *Baseline) Save(path string) error {
 		return fmt.Errorf("encoding baseline: %w", err)
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	tmp, err := os.CreateTemp(dir, ".baseline-*.tmp")
+	if err != nil {
+		return fmt.Errorf("writing baseline: %w", err)
+	}
+	tmpName := tmp.Name()
+	closed := false
+	cleanup := func() {
+		if !closed {
+			_ = tmp.Close()
+			closed = true
+		}
+		_ = os.Remove(tmpName)
+	}
+
+	if err := tmp.Chmod(0o600); err != nil {
+		cleanup()
+		return fmt.Errorf("writing baseline: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
+		return fmt.Errorf("writing baseline: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return fmt.Errorf("writing baseline: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		closed = true
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("writing baseline: %w", err)
+	}
+	closed = true
+
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("writing baseline: %w", err)
 	}
 

@@ -191,8 +191,8 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 
 	// Strategy 1: ID mention search (definitive match)
 	idResults, idTotal, stop := c.searchByIssueIDs(ctx, issue, note)
-	result.TotalFound = idTotal
 	if len(idResults) > 0 {
+		result.TotalFound = idTotal
 		result.TopSessions = idResults
 		result.Strategy = StrategyIDMention
 		return finish()
@@ -207,9 +207,9 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 
 	if len(keywords) > 0 {
 		keywordResults, keywordMeta := c.searchByKeywords(ctx, issue, keywords)
-		result.TotalFound = keywordMeta.Total
 		stop := note("keyword search", keywordMeta)
 		if len(keywordResults) > 0 {
+			result.TotalFound = keywordMeta.Total
 			result.TopSessions = keywordResults
 			result.Strategy = StrategyKeywords
 			return finish()
@@ -222,9 +222,9 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 	// Strategy 3: Timestamp proximity (for closed beads)
 	if issue.ClosedAt != nil || !issue.CreatedAt.IsZero() {
 		timestampResults, timestampMeta := c.searchByTimestamp(ctx, issue)
-		result.TotalFound = timestampMeta.Total
 		note("timestamp search", timestampMeta)
 		if len(timestampResults) > 0 {
+			result.TotalFound = timestampMeta.Total
 			result.TopSessions = timestampResults
 			result.Strategy = StrategyTimestamp
 		}
@@ -375,6 +375,18 @@ func (c *Correlator) searchByID(ctx context.Context, beadID string) ([]ScoredRes
 	return c.searchByIDInWorkspace(ctx, beadID, c.workspace)
 }
 
+func hasConflictingSubstringWithoutTokenMatch(r SearchResult, beadID string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(beadID))
+	if trimmed == "" {
+		return false
+	}
+	combined := strings.ToLower(r.Title + "\n" + r.Snippet)
+	if !strings.Contains(combined, trimmed) {
+		return false
+	}
+	return !mentionsAnyIssueID(r, []string{beadID})
+}
+
 func (c *Correlator) searchByIDInWorkspace(ctx context.Context, beadID, workspace string) ([]ScoredResult, SearchMeta) {
 	// Quote the ID for exact matching
 	query := `"` + beadID + `"`
@@ -389,8 +401,15 @@ func (c *Correlator) searchByIDInWorkspace(ctx context.Context, beadID, workspac
 		return nil, resp.Meta
 	}
 
+	meta := resp.Meta
 	scored := make([]ScoredResult, 0, len(resp.Results))
 	for _, r := range resp.Results {
+		if hasConflictingSubstringWithoutTokenMatch(r, beadID) {
+			if meta.Total > 0 {
+				meta.Total--
+			}
+			continue
+		}
 		score := float64(ScoreIDMention)
 		score = c.applyTimeDecay(score, r.Timestamp)
 		score = c.applyWorkspaceBoostFor(score, r.Workspace, workspace)
@@ -405,7 +424,7 @@ func (c *Correlator) searchByIDInWorkspace(ctx context.Context, beadID, workspac
 		}
 	}
 
-	return c.rankAndLimit(scored), resp.Meta
+	return c.rankAndLimit(scored), meta
 }
 
 // searchByKeywords searches for extracted keywords with time filtering.
@@ -485,7 +504,10 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 		if mentionsAnyIssueID(r, ids) && baseScore < float64(ScoreIDMention) {
 			baseScore = float64(ScoreIDMention)
 		}
-		score := c.applyWorkspaceBoostFor(baseScore, r.Workspace, workspace)
+		score := baseScore
+		if baseScore > 0 {
+			score = c.applyWorkspaceBoostFor(baseScore, r.Workspace, workspace)
+		}
 
 		if score >= MinScoreThreshold {
 			scored = append(scored, ScoredResult{
@@ -620,17 +642,20 @@ func (c *Correlator) findMatchedKeywords(result SearchResult, keywords []string)
 
 // scoreTimestampProximity scores based on how close the session is to bead activity.
 func (c *Correlator) scoreTimestampProximity(sessionTime time.Time, issue *model.Issue) float64 {
+	if sessionTime.IsZero() || issue == nil {
+		return 0
+	}
 	var referenceTime time.Time
 
 	// Prefer closed_at if available, otherwise updated_at, then created_at
-	if issue.ClosedAt != nil {
+	if issue.ClosedAt != nil && !issue.ClosedAt.IsZero() {
 		referenceTime = *issue.ClosedAt
 	} else if !issue.UpdatedAt.IsZero() {
 		referenceTime = issue.UpdatedAt
 	} else if !issue.CreatedAt.IsZero() {
 		referenceTime = issue.CreatedAt
 	} else {
-		return float64(ScorePartialKeyword) / 2 // Low baseline
+		return 0
 	}
 
 	// Calculate time difference
@@ -641,18 +666,15 @@ func (c *Correlator) scoreTimestampProximity(sessionTime time.Time, issue *model
 
 	hours := diff.Hours()
 
-	// Score based on proximity
+	// Score based on proximity (only sessions within 7d qualify on timestamp alone)
 	if hours <= 24 {
 		return float64(ScorePartialKeyword) + float64(BonusRecent24h)
 	}
 	if hours <= 24*7 {
 		return float64(ScorePartialKeyword) + float64(BonusRecent7d)
 	}
-	if hours > 24*30 {
-		return float64(ScorePartialKeyword) + float64(PenaltyOld30d)
-	}
 
-	return float64(ScorePartialKeyword)
+	return 0
 }
 
 // applyTimeDecay adjusts score based on session recency.

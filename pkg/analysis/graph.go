@@ -831,6 +831,73 @@ func (s *GraphStats) ArticulationPoints() []string {
 	return points
 }
 
+// ActiveBetweenness returns a copy of the active-subgraph Betweenness map when
+// pre-populated for graphs with closed issues, or delegates to Betweenness().
+func (s *GraphStats) ActiveBetweenness() map[string]float64 {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	if s.activeMetricsKey != "" {
+		if s.activeBetweenness == nil {
+			s.mu.RUnlock()
+			return nil
+		}
+		cp := make(map[string]float64, len(s.activeBetweenness))
+		for k, v := range s.activeBetweenness {
+			cp[k] = v
+		}
+		s.mu.RUnlock()
+		return cp
+	}
+	s.mu.RUnlock()
+	return s.Betweenness()
+}
+
+// ActiveCoreNumber returns a copy of the active-subgraph k-core map when
+// pre-populated for graphs with closed issues, or delegates to CoreNumber().
+func (s *GraphStats) ActiveCoreNumber() map[string]int {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	if s.activeMetricsKey != "" {
+		if s.activeCoreNumber == nil {
+			s.mu.RUnlock()
+			return nil
+		}
+		cp := make(map[string]int, len(s.activeCoreNumber))
+		for k, v := range s.activeCoreNumber {
+			cp[k] = v
+		}
+		s.mu.RUnlock()
+		return cp
+	}
+	s.mu.RUnlock()
+	return s.CoreNumber()
+}
+
+// ActiveArticulationPoints returns a copy of the active-subgraph articulation
+// points when pre-populated for graphs with closed issues, or delegates to ArticulationPoints().
+func (s *GraphStats) ActiveArticulationPoints() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	if s.activeMetricsKey != "" {
+		if s.activeArticulation == nil {
+			s.mu.RUnlock()
+			return nil
+		}
+		cp := make([]string, len(s.activeArticulation))
+		copy(cp, s.activeArticulation)
+		s.mu.RUnlock()
+		return cp
+	}
+	s.mu.RUnlock()
+	return s.ArticulationPoints()
+}
+
 // Slack returns per-node slack (longest-path slack; 0 on critical path).
 func (s *GraphStats) Slack() map[string]float64 {
 	s.mu.RLock()
@@ -1767,6 +1834,33 @@ func (a *Analyzer) cycleEligibilityHash() string {
 	return hash
 }
 
+// ActiveSubgraphMetrics returns defensive copies of betweenness centrality,
+// k-core numbers, and articulation points computed over the induced subgraph of
+// non-closed issues (or full-graph metrics when no closed issues exist).
+func (a *Analyzer) ActiveSubgraphMetrics(stats *GraphStats) (map[string]float64, map[string]int, []string) {
+	bw, core, art := a.activeSubgraphMetrics(stats)
+	var bwCopy map[string]float64
+	if bw != nil {
+		bwCopy = make(map[string]float64, len(bw))
+		for k, v := range bw {
+			bwCopy[k] = v
+		}
+	}
+	var coreCopy map[string]int
+	if core != nil {
+		coreCopy = make(map[string]int, len(core))
+		for k, v := range core {
+			coreCopy[k] = v
+		}
+	}
+	var artCopy []string
+	if art != nil {
+		artCopy = make([]string, len(art))
+		copy(artCopy, art)
+	}
+	return bwCopy, coreCopy, artCopy
+}
+
 // activeSubgraphMetrics computes betweenness centrality, k-core numbers, and
 // articulation points over the induced subgraph of non-closed issues. When no
 // closed issues exist in the analyzer, it delegates directly to stats' cached
@@ -1807,6 +1901,31 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 	}
 	stats.mu.RUnlock()
 
+	_, bwOut, coreOut, artOut := a.computeActiveSubgraphMetricsWithKey(activeIDs, activeHash, stats.Config, status)
+
+	stats.mu.Lock()
+	stats.activeMetricsKey = cacheKey
+	stats.activeBetweenness = bwOut
+	stats.activeCoreNumber = coreOut
+	stats.activeArticulation = artOut
+	stats.mu.Unlock()
+
+	return bwOut, coreOut, artOut
+}
+
+func (a *Analyzer) computeActiveSubgraphMetricsWithKey(activeIDs []string, activeHash string, cfg AnalysisConfig, status MetricStatus) (string, map[string]float64, map[string]int, []string) {
+	if len(activeIDs) == 0 {
+		cacheKey := activeHash + "|" + status.Betweenness.State + "|" + status.KCore.State + "|" + status.Articulation.State
+		return cacheKey, map[string]float64{}, map[string]int{}, []string{}
+	}
+	wantBW := status.Betweenness.State == "computed" || status.Betweenness.State == "approx" || status.Betweenness.State == ""
+	wantKCore := status.KCore.State == "computed" || status.KCore.State == ""
+	wantArt := status.Articulation.State == "computed" || status.Articulation.State == ""
+	if !wantBW && !wantKCore && !wantArt {
+		return "", map[string]float64{}, map[string]int{}, []string{}
+	}
+
+	cacheKey := activeHash + "|" + status.Betweenness.State + "|" + status.KCore.State + "|" + status.Articulation.State
 	sub := newCompactDirectedGraph(len(activeIDs))
 	edgeCount := 0
 	if cg, ok := a.g.(*compactDirectedGraph); ok && len(a.nodeToID) == len(cg.nodes) {
@@ -1864,14 +1983,14 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 		if edgeCount > 0 && len(activeIDs) > 1 {
 			subCfg := ConfigForSize(len(activeIDs), edgeCount)
 			switch {
-			case stats.Config.BetweennessMode == BetweennessSkip || subCfg.BetweennessMode == BetweennessSkip || !subCfg.ComputeBetweenness:
+			case cfg.BetweennessMode == BetweennessSkip || subCfg.BetweennessMode == BetweennessSkip || !subCfg.ComputeBetweenness:
 				// Dense/skipped tier: retain zeroed betweenness without running O(VE) Brandes.
 			case subCfg.BetweennessMode == BetweennessApproximate ||
-				(stats.Config.BetweennessMode == BetweennessApproximate && stats.Config.BetweennessSampleSize > 0 && len(activeIDs) >= 500):
+				(cfg.BetweennessMode == BetweennessApproximate && cfg.BetweennessSampleSize > 0 && len(activeIDs) >= 500):
 				sampleSize := subCfg.BetweennessSampleSize
-				if stats.Config.BetweennessMode == BetweennessApproximate && stats.Config.BetweennessSampleSize > 0 &&
-					(sampleSize == 0 || stats.Config.BetweennessSampleSize < sampleSize) {
-					sampleSize = stats.Config.BetweennessSampleSize
+				if cfg.BetweennessMode == BetweennessApproximate && cfg.BetweennessSampleSize > 0 &&
+					(sampleSize == 0 || cfg.BetweennessSampleSize < sampleSize) {
+					sampleSize = cfg.BetweennessSampleSize
 				}
 				if sampleSize <= 0 && status.Betweenness.Sample > 0 {
 					sampleSize = status.Betweenness.Sample
@@ -1880,7 +1999,7 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 					sampleSize = 100
 				}
 				var res BetweennessResult
-				if stats.Config.RunToCompletion {
+				if cfg.RunToCompletion {
 					res = approxBetweennessDeterministic(sub, sampleSize, 1)
 				} else {
 					res = ApproxBetweenness(sub, sampleSize, 1)
@@ -1926,14 +2045,7 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 		}
 	}
 
-	stats.mu.Lock()
-	stats.activeMetricsKey = cacheKey
-	stats.activeBetweenness = bwOut
-	stats.activeCoreNumber = coreOut
-	stats.activeArticulation = artOut
-	stats.mu.Unlock()
-
-	return bwOut, coreOut, artOut
+	return cacheKey, bwOut, coreOut, artOut
 }
 
 // activeCycleGraph returns the blocking graph induced by open-like issues.
@@ -2192,6 +2304,9 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 
 			if cached, xfetchRefresh, ok := getRobotDiskCachedStats(robotCacheKey); ok {
 				if !xfetchRefresh || ctx.Err() != nil {
+					if _, hasClosed, _ := a.ensureActiveSet(); hasClosed {
+						a.activeSubgraphMetrics(cached)
+					}
 					metrics.GraphCache.Hit()
 					return cached
 				}
@@ -2201,7 +2316,8 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 			}
 		} else {
 			incCacheKey = a.graphStructureHash()
-			if config.ComputeCycles || config.ComputeCriticalPath || config.ComputeSlack {
+			if config.ComputeCycles || config.ComputeCriticalPath || config.ComputeSlack ||
+				config.ComputeBetweenness || config.ComputeKCore || config.ComputeArticulation {
 				incCacheKey += "|cycles:" + a.cycleEligibilityHash()
 			}
 			incCacheKey += "|" + configHash
@@ -2835,6 +2951,60 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 	localAuthoritiesRank := computeFloatRanks(localAuthorities)
 	localCriticalPathRank := computeFloatRanks(localCriticalPath)
 
+	cycleReason := config.CyclesSkipReason
+	if cyclesTruncated {
+		if cycleReason != "" {
+			cycleReason += "; "
+		}
+		cycleReason += fmt.Sprintf("truncated to %d of %d cycle representatives", len(localCycles), profile.CycleCount)
+	}
+
+	// record status snapshot
+	kcoreComputed := config.ComputeKCore || config.ComputeArticulation
+	articulationComputed := config.ComputeArticulation || config.ComputeKCore
+	slackComputed := config.ComputeSlack
+
+	criticalStatus := statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false), Elapsed: profile.CriticalPath}
+	if config.ComputeCriticalPath && criticalPathUnavailableReason != "" {
+		criticalStatus.State = "skipped"
+		criticalStatus.Reason = criticalPathUnavailableReason
+	}
+	slackStatus := statusEntry{State: stateFromTiming(slackComputed, false), Elapsed: profile.Slack}
+	if slackComputed && slackUnavailableReason != "" {
+		slackStatus.State = "skipped"
+		slackStatus.Reason = slackUnavailableReason
+	}
+
+	localStatus := MetricStatus{
+		PageRank: statusEntry{State: stateFromTiming(config.ComputePageRank, profile.PageRankTO), Elapsed: profile.PageRank},
+		Betweenness: statusEntry{
+			State:   stateFromTiming(config.ComputeBetweenness, profile.BetweennessTO),
+			Reason:  betweennessReason(config, betweennessIsApprox),
+			Sample:  actualBetweennessSample,
+			Elapsed: profile.Betweenness,
+		},
+		Eigenvector:  statusEntry{State: stateFromTiming(config.ComputeEigenvector, false), Elapsed: profile.Eigenvector},
+		HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, profile.HITSTO), Reason: config.HITSSkipReason, Elapsed: profile.HITS},
+		Critical:     criticalStatus,
+		Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, profile.CyclesTO), Reason: cycleReason, Elapsed: profile.Cycles},
+		KCore:        statusEntry{State: stateFromTiming(kcoreComputed, false), Elapsed: profile.KCore},
+		Articulation: statusEntry{State: stateFromTiming(articulationComputed, false), Elapsed: profile.Articulation},
+		Slack:        slackStatus,
+	}
+
+	// Pre-populate active-subgraph metrics before marking Phase 2 ready when closed issues exist.
+	var (
+		activeKey  string
+		activeBW   map[string]float64
+		activeCore map[string]int
+		activeArt  []string
+	)
+	if a.g != nil && ctx.Err() == nil {
+		if activeIDs, hasClosed, activeHash := a.ensureActiveSet(); hasClosed {
+			activeKey, activeBW, activeCore, activeArt = a.computeActiveSubgraphMetricsWithKey(activeIDs, activeHash, config, localStatus)
+		}
+	}
+
 	// Atomic assignment
 	stats.mu.Lock()
 	// Rank construction can itself be material on a large graph. Honor a
@@ -2863,48 +3033,15 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 	stats.authoritiesRank = localAuthoritiesRank
 	stats.criticalPathRank = localCriticalPathRank
 
+	if activeKey != "" {
+		stats.activeMetricsKey = activeKey
+		stats.activeBetweenness = activeBW
+		stats.activeCoreNumber = activeCore
+		stats.activeArticulation = activeArt
+	}
+
+	stats.status = localStatus
 	stats.phase2Ready = true
-
-	cycleReason := config.CyclesSkipReason
-	if cyclesTruncated {
-		if cycleReason != "" {
-			cycleReason += "; "
-		}
-		cycleReason += fmt.Sprintf("truncated to %d of %d cycle representatives", len(localCycles), profile.CycleCount)
-	}
-
-	// record status snapshot
-	kcoreComputed := config.ComputeKCore || config.ComputeArticulation
-	articulationComputed := config.ComputeArticulation || config.ComputeKCore
-	slackComputed := config.ComputeSlack
-
-	criticalStatus := statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false), Elapsed: profile.CriticalPath}
-	if config.ComputeCriticalPath && criticalPathUnavailableReason != "" {
-		criticalStatus.State = "skipped"
-		criticalStatus.Reason = criticalPathUnavailableReason
-	}
-	slackStatus := statusEntry{State: stateFromTiming(slackComputed, false), Elapsed: profile.Slack}
-	if slackComputed && slackUnavailableReason != "" {
-		slackStatus.State = "skipped"
-		slackStatus.Reason = slackUnavailableReason
-	}
-
-	stats.status = MetricStatus{
-		PageRank: statusEntry{State: stateFromTiming(config.ComputePageRank, profile.PageRankTO), Elapsed: profile.PageRank},
-		Betweenness: statusEntry{
-			State:   stateFromTiming(config.ComputeBetweenness, profile.BetweennessTO),
-			Reason:  betweennessReason(config, betweennessIsApprox),
-			Sample:  actualBetweennessSample,
-			Elapsed: profile.Betweenness,
-		},
-		Eigenvector:  statusEntry{State: stateFromTiming(config.ComputeEigenvector, false), Elapsed: profile.Eigenvector},
-		HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, profile.HITSTO), Reason: config.HITSSkipReason, Elapsed: profile.HITS},
-		Critical:     criticalStatus,
-		Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, profile.CyclesTO), Reason: cycleReason, Elapsed: profile.Cycles},
-		KCore:        statusEntry{State: stateFromTiming(kcoreComputed, false), Elapsed: profile.KCore},
-		Articulation: statusEntry{State: stateFromTiming(articulationComputed, false), Elapsed: profile.Articulation},
-		Slack:        slackStatus,
-	}
 	stats.mu.Unlock()
 }
 

@@ -298,10 +298,13 @@ func (a *Analyzer) findConnectedComponents() map[string][]string {
 		}
 	}
 
-	// Initialize all issues
+	// Initialize candidate issues (or all issues when unscoped)
 	// Use sorted IDs for deterministic iteration order
 	var ids []string
 	for id := range a.issueMap {
+		if !a.IsCandidate(id) {
+			continue
+		}
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
@@ -316,6 +319,9 @@ func (a *Analyzer) findConnectedComponents() map[string][]string {
 		issue := a.issueMap[id]
 		for _, dep := range issue.Dependencies {
 			if dep != nil && (dep.Type.IsBlocking() || dep.Type == model.DepParentChild) {
+				if !a.IsCandidate(dep.DependsOnID) {
+					continue
+				}
 				if _, exists := a.issueMap[dep.DependsOnID]; exists {
 					union(issue.ID, dep.DependsOnID)
 				}

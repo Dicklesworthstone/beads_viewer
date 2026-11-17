@@ -685,6 +685,10 @@ func (a *Analyzer) GenerateRecommendationsFromStats(stats *GraphStats, threshold
 		stats = &analyzed
 	}
 	scores := a.ComputeImpactScoresFromStats(stats, now)
+	return a.generateRecommendationsFromStatsAndScores(stats, scores, now, thresholds)
+}
+
+func (a *Analyzer) generateRecommendationsFromStatsAndScores(stats *GraphStats, scores []ImpactScore, now time.Time, thresholds RecommendationThresholds) []PriorityRecommendation {
 	if len(scores) == 0 {
 		return nil
 	}

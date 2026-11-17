@@ -190,6 +190,7 @@ func (d *Detector) detect() Status {
 // defaultRunCommand executes a command and returns its exit code.
 func defaultRunCommand(ctx context.Context, name string, args ...string) (int, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = time.Second
 	err := cmd.Run()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {

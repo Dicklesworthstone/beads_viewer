@@ -116,32 +116,37 @@ func ComputeRiskSignalsWithReadiness(
 
 // computeFanVariance measures variance in blocker In-Degrees (upstream stability variance)
 func computeFanVariance(issue *model.Issue, stats *GraphStats) float64 {
-	// Collect In-Degrees of blocking dependencies
-	var degrees []float64
+	if issue == nil || stats == nil || len(stats.InDegree) == 0 || len(issue.Dependencies) < 2 {
+		return 0
+	}
 
+	count := 0
+	sum := 0.0
 	for _, dep := range issue.Dependencies {
-		if dep == nil || !dep.Type.IsBlocking() {
+		if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == "" {
 			continue
 		}
-		neighborID := dep.DependsOnID
-		if neighborID != "" {
-			// We use InDegree as a proxy for "Stability/Popularity" of the dependency
-			degrees = append(degrees, float64(stats.InDegree[neighborID]))
-		}
+		// We use InDegree as a proxy for "Stability/Popularity" of the dependency
+		sum += float64(stats.InDegree[dep.DependsOnID])
+		count++
 	}
 
 	// We need at least 2 dependencies to calculate variance
-	if len(degrees) < 2 {
+	if count < 2 || sum == 0 {
 		return 0
 	}
 
 	// Compute coefficient of variation (std/mean) - normalized variance
-	mean := computeMean(degrees)
-	if mean == 0 {
-		return 0
+	mean := sum / float64(count)
+	sumSquares := 0.0
+	for _, dep := range issue.Dependencies {
+		if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == "" {
+			continue
+		}
+		diff := float64(stats.InDegree[dep.DependsOnID]) - mean
+		sumSquares += diff * diff
 	}
-
-	stdDev := computeStdDev(degrees, mean)
+	stdDev := math.Sqrt(sumSquares / float64(count))
 	cv := stdDev / mean
 
 	// Normalize: CV > 2 is considered high variance
@@ -314,22 +319,7 @@ func isIssueDependencyBlockedWithReadiness(
 }
 
 func buildReadinessIndexForMap(issues map[string]model.Issue, extra *model.Issue) *model.ReadinessIndex {
-	capHint := len(issues)
-	if extra != nil {
-		if _, ok := issues[extra.ID]; !ok {
-			capHint++
-		}
-	}
-	slice := make([]model.Issue, 0, capHint)
-	for _, iss := range issues {
-		slice = append(slice, iss)
-	}
-	if extra != nil {
-		if _, ok := issues[extra.ID]; !ok {
-			slice = append(slice, *extra)
-		}
-	}
-	return model.NewReadinessIndex(slice)
+	return model.NewReadinessIndexFromMap(issues, extra)
 }
 
 // generateRiskExplanation creates a human-readable risk assessment
@@ -338,7 +328,8 @@ func generateRiskExplanation(signals RiskSignals) string {
 		return "Low risk - stable dependency structure"
 	}
 
-	var explanations []string
+	var explanationsBuf [4]string
+	explanations := explanationsBuf[:0]
 
 	if signals.FanVariance > 0.5 {
 		explanations = append(explanations, "high dependency variance")
