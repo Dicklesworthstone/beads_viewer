@@ -77,10 +77,32 @@ function Get-DefaultInstallDir {
     return Join-Path $HOME ".local/bin"
 }
 
+$script:CachedReleases = @{}
+
 function Invoke-JsonGet {
     param([string]$Url)
+    $baseHeaders = @{ 'User-Agent' = "$BIN_NAME-install.ps1"; 'Accept' = 'application/vnd.github+json' }
+    $authToken = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN.Trim() } elseif ($env:GH_TOKEN) { $env:GH_TOKEN.Trim() } else { "" }
+    if ($authToken) {
+        $authHeaders = @{
+            'User-Agent'    = "$BIN_NAME-install.ps1"
+            'Accept'        = 'application/vnd.github+json'
+            'Authorization' = "Bearer $authToken"
+        }
+        try {
+            return Invoke-RestMethod -Uri $Url -Headers $authHeaders -TimeoutSec 60
+        } catch {
+            $statusCode = $null
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            }
+            if ($statusCode -ne 401 -and $statusCode -ne 403) {
+                Fail "Could not query $Url : $($_.Exception.Message)"
+            }
+        }
+    }
     try {
-        return Invoke-RestMethod -Uri $Url -Headers @{ 'User-Agent' = "$BIN_NAME-install.ps1"; 'Accept' = 'application/vnd.github+json' } -TimeoutSec 60
+        return Invoke-RestMethod -Uri $Url -Headers $baseHeaders -TimeoutSec 60
     } catch {
         Fail "Could not query $Url : $($_.Exception.Message)"
     }
@@ -96,12 +118,20 @@ function Resolve-ReleaseTag {
     }
     $latest = Invoke-JsonGet "$apiBase/releases/latest"
     if (-not $latest.tag_name) { Fail "The latest-release response carries no tag_name; pass -Version explicitly" }
-    return [string]$latest.tag_name
+    $resolvedTag = [string]$latest.tag_name
+    $script:CachedReleases[$resolvedTag] = $latest
+    return $resolvedTag
 }
 
 function Get-ReleaseAssetNames {
     param([string]$Tag)
-    $release = Invoke-JsonGet "$apiBase/releases/tags/$Tag"
+    $release = if ($script:CachedReleases.ContainsKey($Tag)) {
+        $script:CachedReleases[$Tag]
+    } else {
+        $fetched = Invoke-JsonGet "$apiBase/releases/tags/$Tag"
+        $script:CachedReleases[$Tag] = $fetched
+        $fetched
+    }
     if (-not $release.assets) { return @() }
     return @($release.assets | ForEach-Object { [string]$_.name })
 }

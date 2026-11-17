@@ -191,6 +191,11 @@ github_api_get() {
         fi
         curl -fsSL "$url" 2>/dev/null || return 1
     elif command -v wget >/dev/null 2>&1; then
+        if [ -n "$auth_token" ]; then
+            if wget -qO- --header="Authorization: Bearer $auth_token" "$url" 2>/dev/null; then
+                return 0
+            fi
+        fi
         wget -qO- "$url" 2>/dev/null || return 1
     else
         return 1
@@ -279,11 +284,16 @@ fetch_latest_go_pkg() {
         *) print_error "Unsupported macOS architecture for Go install: $arch" >&2; return 1 ;;
     esac
 
-    local releases
-    releases=$(curl -fsSL "https://go.dev/dl/?mode=json") || {
+    local releases=""
+    if command -v curl >/dev/null 2>&1; then
+        releases=$(curl -fsSL "https://go.dev/dl/?mode=json") || releases=""
+    elif command -v wget >/dev/null 2>&1; then
+        releases=$(wget -qO- "https://go.dev/dl/?mode=json") || releases=""
+    fi
+    if [ -z "$releases" ]; then
         print_error "Failed to fetch Go releases from go.dev" >&2
         return 1
-    }
+    fi
 
     if [ "$JSON_TOOL" = "jq" ]; then
         printf '%s' "$releases" | jq -re --arg arch "$arch" '
@@ -350,7 +360,7 @@ install_go_from_pkg() {
     tmpdir=$(mktemp -d)
     pkg_path="$tmpdir/go.pkg"
 
-    if ! curl -fsSL "$url" -o "$pkg_path"; then
+    if ! download_file "$url" "$pkg_path"; then
         print_error "Failed to download Go installer from $url"
         rm -rf "$tmpdir"
         return 1
@@ -517,9 +527,23 @@ source_toolchain() {
     printf 'go%s\n' "$version"
 }
 
+resolve_go_bin() {
+    local min_version="$MIN_GO_VERSION" candidate ver
+    for candidate in go /opt/homebrew/bin/go /usr/local/bin/go /usr/local/go/bin/go; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            ver=$("$candidate" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+            if [ -n "$ver" ] && version_ge "$ver" "$min_version"; then
+                command -v "$candidate"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
 verify_source_toolchain() {
-    local binary="$1" expected="$2" built_go
-    if ! built_go=$(GOTOOLCHAIN=local go version -m "$binary" 2>/dev/null | awk 'NR == 1 { print $NF }'); then
+    local binary="$1" expected="$2" go_cmd="${3:-go}" built_go
+    if ! built_go=$(GOTOOLCHAIN=local "$go_cmd" version -m "$binary" 2>/dev/null | awk 'NR == 1 { print $NF }'); then
         print_error "Cannot read the built executable's Go version; existing installation was not changed" >&2
         return 1
     fi
@@ -788,11 +812,24 @@ try_binary_install() {
 try_go_install() {
     print_info "Attempting to build from source with go build..."
 
-    local go_version
+    local go_version go_bin go_dir
     if ! go_version=$(ensure_go); then
         print_error "Go $MIN_GO_VERSION or later is required for building from source."
         exit 1
     fi
+    if ! go_bin=$(resolve_go_bin); then
+        go_bin=$(command -v go || true)
+    fi
+    if [ -z "$go_bin" ]; then
+        print_error "Go $MIN_GO_VERSION or later was not found on PATH after setup."
+        exit 1
+    fi
+    case "$go_bin" in
+        /*)
+            go_dir=$(dirname "$go_bin")
+            export PATH="$go_dir:$PATH"
+            ;;
+    esac
 
     print_info "Using Go $go_version to launch the source build"
 
@@ -883,12 +920,12 @@ try_go_install() {
         build_extra_args+=(-ldflags "-X github.com/${REPO_OWNER}/${REPO_NAME}/pkg/version.version=${base_ver}-source")
     fi
 
-    if ! (cd "$src_dir" && GOFLAGS="" GOOS="" GOARCH="" GO111MODULE=on CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN="$toolchain" go build -o "$build_output" ${build_extra_args[@]+"${build_extra_args[@]}"} "./cmd/$BIN_NAME"); then
+    if ! (cd "$src_dir" && GOFLAGS="" GOOS="" GOARCH="" GO111MODULE=on CGO_ENABLED=0 GOWORK=off GOTOOLCHAIN="$toolchain" "$go_bin" build -o "$build_output" ${build_extra_args[@]+"${build_extra_args[@]}"} "./cmd/$BIN_NAME"); then
         print_error "Go build failed."
         exit 1
     fi
 
-    if ! verify_source_toolchain "$build_output" "$toolchain"; then
+    if ! verify_source_toolchain "$build_output" "$toolchain" "$go_bin"; then
         exit 1
     fi
 

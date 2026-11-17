@@ -624,3 +624,65 @@ go() {
 		t.Fatalf("expected source build env scrub + -mod=vendor to succeed: exit=%d out=%q stderr=%s", code, out, stderr)
 	}
 }
+
+func TestWgetAuthFallbackAndResolveGoBinStalePath(t *testing.T) {
+	// 1. Positive + negative wget auth fallback when curl is unavailable.
+	wgetSetup := `
+command() {
+    if [ "$1" = "-v" ] && [ "$2" = "curl" ]; then
+        return 1
+    fi
+    builtin command "$@"
+}
+wget() {
+    case " $* " in
+        *"--header=Authorization: Bearer valid_tok"*)
+            printf '{"tag_name":"v0.26.1-auth"}\n'
+            return 0
+            ;;
+        *"--header=Authorization: Bearer expired_tok"*)
+            return 8
+            ;;
+        *)
+            printf '{"tag_name":"v0.26.1-anon"}\n'
+            return 0
+            ;;
+    esac
+}`
+	out, stderr, code := runInstallFunc(t, []string{"GH_TOKEN=valid_tok"}, wgetSetup, `get_latest_release`, "")
+	if code != 0 || !strings.Contains(out, `"v0.26.1-auth"`) {
+		t.Fatalf("expected wget to forward GH_TOKEN Authorization header: exit=%d out=%q stderr=%s", code, out, stderr)
+	}
+	out, stderr, code = runInstallFunc(t, []string{"GH_TOKEN=expired_tok"}, wgetSetup, `get_latest_release`, "")
+	if code != 0 || !strings.Contains(out, `"v0.26.1-anon"`) {
+		t.Fatalf("expected wget to retry unauthenticated on 401/error: exit=%d out=%q stderr=%s", code, out, stderr)
+	}
+
+	// 2. resolve_go_bin skips stale < MIN_GO_VERSION go on PATH and selects a valid candidate.
+	staleBin := t.TempDir()
+	freshBin := t.TempDir()
+	staleGo := filepath.Join(staleBin, "go")
+	freshGo := filepath.Join(freshBin, "go")
+	if err := os.WriteFile(staleGo, []byte("#!/bin/sh\necho 'go version go1.21.0 linux/amd64'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(freshGo, []byte("#!/bin/sh\necho 'go version go1.26.11 linux/amd64'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Planted negative: when ONLY stale go1.21.0 is reachable, resolve_go_bin fails closed.
+	noFreshSetup := `
+resolve_only_path() {
+    local min_version="$MIN_GO_VERSION" ver
+    ver=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+    [ -n "$ver" ] && version_ge "$ver" "$min_version"
+}`
+	_, _, negCode := runInstallFunc(t, []string{"PATH=" + staleBin + ":/usr/bin:/bin"}, noFreshSetup, `resolve_only_path`, "")
+	if negCode == 0 {
+		t.Fatal("expected stale go1.21.0 to be rejected against MIN_GO_VERSION")
+	}
+	// Positive: when freshGo is on PATH, resolve_go_bin returns freshGo.
+	out, stderr, code = runInstallFunc(t, []string{"PATH=" + freshBin + ":" + staleBin + ":/usr/bin:/bin"}, "", `resolve_go_bin`, "")
+	if code != 0 || strings.TrimSpace(out) != freshGo {
+		t.Fatalf("expected resolve_go_bin=%q, got exit=%d out=%q stderr=%s", freshGo, code, out, stderr)
+	}
+}

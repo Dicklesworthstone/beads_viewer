@@ -95,11 +95,11 @@ Vendoring covers the Go module dependencies, not the compiler. The source instal
 
 ---
 
-## Generating the JSONL File (`br` and `bd`)
+## Beads Data Sources (`.beads/beads.db` and JSONL)
 
-`bv` reads Beads JSONL exports from `.beads/`. Current `br` and Dolt-backed `bd` workspaces use `.beads/issues.jsonl`; older legacy workspaces may use `.beads/beads.jsonl`. `bv` auto-discovers the supported file names.
+`bv` reads Beads state directly from `.beads/`, auto-discovering WAL-aware `.beads/beads.db` SQLite databases alongside `.beads/issues.jsonl` (and legacy `.beads/beads.jsonl`).
 
-**Rust (`br`) users** — run `br sync --flush-only` after Beads mutations so `.beads/issues.jsonl` is current.
+**Rust (`br`) users** — `bv` reads `.beads/beads.db` (including uncommitted WAL frames) directly; run `br sync --flush-only` before committing so `.beads/issues.jsonl` stays synchronized in Git.
 
 **Go (`bd`) users** — run:
 
@@ -208,7 +208,7 @@ SQLite or aggregated workspace views.
 
 ### 🔌 Automation Hooks
 
-Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, notifications, or uploads. **Project hooks require explicit approval by the invoking user.** Report exports (`--export` / `--export-md`) and direct Pages exports (`--export-pages`) fail before running hooks or writing the export when configured hooks have not been approved. Projects without hooks export normally. To export without running any project hooks, pass `--no-hooks`; this also bypasses hook configuration parsing, so it works with invalid YAML.
+Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, notifications, or uploads. **Project hooks require explicit approval by the invoking user.** Report exports (`--export` / `--export-md`), direct Pages exports (`--export-pages`), graph exports (`--export-graph`), priority briefs (`--priority-brief`), and agent brief bundles (`--agent-brief`) fail before running hooks or writing the export when configured hooks have not been approved. Projects without hooks export normally. To export without running any project hooks, pass `--no-hooks`; this also bypasses hook configuration parsing, so it works with invalid YAML.
 
 A runnable hook selects exactly one execution form: `command` for a shell command, or `argv` to invoke a program directly. `argv` must be a nonempty list of strings with a nonempty executable name as its first element. Each subsequent element is one literal argument, including empty strings or values containing spaces. For example:
 
@@ -1206,8 +1206,8 @@ bv --recipe sprint-review --export review.mmd --export-format mermaid
 
 Explicit export flags override recipe defaults. Without either, the format is
 Markdown and graphs are included; CSV defaults to no graph. `--export-md PATH`
-explicitly selects Markdown. `--export-group-by <status|priority|assignee|label|none>`
-overrides `view.group_by` for Markdown exports. `--export-include-graph=false` disables a recipe
+explicitly selects Markdown. `--export-group-by <status|priority|type|assignee|label|none>`
+overrides `view.group_by` for Markdown and HTML exports. `--export-include-graph=false` disables a recipe
 graph, and `--export-template=` clears a recipe template. CSV with a graph,
 Mermaid without a graph, and custom templates for other formats are errors.
 Selecting a recipe for the TUI or robot analysis creates no export file.
@@ -3019,6 +3019,8 @@ If the `wasm/` assets are missing, the viewer automatically falls back to the JS
 ```
 ./bv-pages/
 ├── index.html              # Main dashboard with Alpine.js + Tailwind (303 KB)
+├── .nojekyll               # Prevents Jekyll asset stripping on static hosts
+├── .github/workflows/      # Optional static Pages bundle deployment template (static.yml)
 ├── beads.sqlite3           # Full SQLite database (5.5 MB for this repository's 676 issues, plus 1 MiB chunk files above the 5 MiB threshold)
 ├── data/
 │   ├── graph_layout.json   # Pre-computed positions + metrics (158 KB for 676 issues / 816 edges)
@@ -3543,7 +3545,7 @@ bv --priority-brief brief.md
 
 # Export complete agent brief bundle
 bv --agent-brief ./agent-bundle/
-# Creates: triage.json, insights.json, brief.md, helpers.md
+# Creates: triage.json, insights.json, brief.md, helpers.md, meta.json
 ```
 
 ### ETA Forecasting & Capacity Planning
@@ -4414,7 +4416,7 @@ bv has a comprehensive built-in help system:
 
 ## 🛠️ Configuration
 
-`bv` automatically detects your terminal capabilities to render the best possible UI. It looks for `.beads/issues.jsonl`, `.beads/beads.jsonl`, or `.beads/beads.base.jsonl` in your current directory.
+`bv` automatically detects your terminal capabilities to render the best possible UI. It auto-discovers `.beads/beads.db` (WAL-aware SQLite), `.beads/issues.jsonl`, `.beads/beads.jsonl`, or `.beads/beads.base.jsonl` in your project directory.
 
 ### Environment Variables
 
@@ -4595,8 +4597,8 @@ Copyright (c) 2026 Jeffrey Emanuel
 
 ## 🧭 Data Flow at a Glance
 ```
-.beads/issues.jsonl or .beads/beads.jsonl
-   ↓ tolerant loader (BOM strip, 10MB lines, skip malformed)
+.beads/beads.db (WAL SQLite) or .beads/{issues,beads}.jsonl
+   ↓ smart datasource & tolerant loader (BOM strip, 10MB lines, skip malformed)
    ↓ graph builder (blocking deps only)
    ↓ analyzer (Phase 1 fast; Phase 2 centralities with timeouts)
    ↓ cache (hash-keyed)
@@ -4680,8 +4682,8 @@ Copyright (c) 2026 Jeffrey Emanuel
 - Inconsistent outputs between commands → compare source/scope identity, reference clock, configuration and status before interpreting a difference.
 
 ## 🔒 Security & Privacy Notes
-- Local-first: all analysis happens on your repo's JSONL; no network required for robots.
-- Exports run only when you ask for them. Project hooks are denied by default: report exports (`--export` / `--export-md`) and direct Pages exports (`--export-pages`) require explicit `--trust-hooks` approval of the reviewed configuration digest. `--no-hooks` bypasses the hook pipeline entirely. Merely starting `bv` or running a robot analysis does not run export hooks.
+- Local-first: all analysis happens locally on your repo's `.beads/` SQLite/JSONL data and Git history; no network required for robots.
+- Exports run only when you ask for them. Project hooks are denied by default: report exports (`--export` / `--export-md`), direct Pages exports (`--export-pages`), graph exports (`--export-graph`), priority briefs (`--priority-brief`), and agent brief bundles (`--agent-brief`) require explicit `--trust-hooks` approval of the reviewed configuration digest. `--no-hooks` bypasses the hook pipeline entirely. Merely starting `bv` or running a robot analysis does not run export hooks.
 - Hooks inherit only the documented operating-system environment by default; every additional parent variable requires an invoking-user `--hook-env NAME` grant. Project YAML cannot restore ungranted values through environment expansion or aliases, even when their names do not look like credentials. Approved hooks still have your operating-system privileges; direct `argv` execution and filtering are not sandboxes, and configuration approval does not freeze scripts they invoke. See [Automation Hooks](#-automation-hooks).
 - Update checks are silent and tolerate network failures without impacting startup.
 

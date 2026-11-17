@@ -8000,3 +8000,260 @@ func TestWave15Round1_AuditRemediations(t *testing.T) {
 		t.Fatal("expected --repo web --robot-causality api-DEL-1 to fail closed")
 	}
 }
+
+func TestWave16_TrackD_CLIRobotScopingWorkspaceAsOfAndHooks(t *testing.T) {
+	exe := buildTestBinary(t)
+
+	runGitAt := func(dir, isoDate string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Alice",
+			"GIT_AUTHOR_EMAIL=alice@example.com",
+			"GIT_COMMITTER_NAME=Alice",
+			"GIT_COMMITTER_EMAIL=alice@example.com",
+			"GIT_AUTHOR_DATE="+isoDate,
+			"GIT_COMMITTER_DATE="+isoDate,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+
+	// 1. --robot-insights --label & --export-pages --label do not leak 1-hop unlabeled neighbors,
+	//    while preserving full-source Readiness.
+	labelRepo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(labelRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	labelJSONL := strings.Join([]string{
+		`{"id":"IN-1","title":"Core auth flow","status":"open","priority":1,"issue_type":"task","labels":["core"],"dependencies":[{"issue_id":"IN-1","depends_on_id":"EXT-1","type":"blocks"}]}`,
+		`{"id":"EXT-1","title":"External infra gate","status":"open","priority":1,"issue_type":"task","labels":["infra"]}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(labelRepo, ".beads", "issues.jsonl"), []byte(labelJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	insOut, insErr, err := runCommandWithTimeout(t, labelRepo, exe, "--robot-insights", "--label", "core")
+	if err != nil {
+		t.Fatalf("--robot-insights --label core failed: %v\nstderr=%s", err, insErr)
+	}
+	var insPayload struct {
+		FullStats struct {
+			PageRank map[string]float64 `json:"pagerank"`
+		} `json:"full_stats"`
+	}
+	if err := json.Unmarshal([]byte(insOut), &insPayload); err != nil {
+		t.Fatalf("decode insights: %v\n%s", err, insOut)
+	}
+	if _, leaked := insPayload.FullStats.PageRank["EXT-1"]; leaked {
+		t.Fatalf("expected --robot-insights --label core not to leak 1-hop neighbor EXT-1 into full_stats.pagerank: %+v", insPayload.FullStats.PageRank)
+	}
+	if _, ok := insPayload.FullStats.PageRank["IN-1"]; !ok {
+		t.Fatalf("expected IN-1 in full_stats.pagerank: %+v", insPayload.FullStats.PageRank)
+	}
+
+	// Structured --search --json + BV_ROBOT=1 --version + human --robot-help contract:
+	srchOut, srchErr, err := runCommandWithTimeout(t, labelRepo, exe, "--search", "auth", "--json", "--label", "core")
+	if err != nil {
+		t.Fatalf("--search --json failed: %v\nstderr=%s", err, srchErr)
+	}
+	var srchPayload map[string]any
+	if err := json.Unmarshal([]byte(srchOut), &srchPayload); err != nil || srchPayload["query"] != "auth" {
+		t.Fatalf("expected JSON search output for --search --json, err=%v payload=%+v\nraw=%s", err, srchPayload, srchOut)
+	}
+
+	verCmd := exec.Command(exe, "--version")
+	verCmd.Dir = labelRepo
+	verCmd.Env = append(os.Environ(), "BV_ROBOT=1", "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+	verOut, err := verCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("BV_ROBOT=1 --version failed: %v\n%s", err, string(verOut))
+	}
+	var verPayload map[string]any
+	if err := json.Unmarshal(verOut, &verPayload); err != nil || verPayload["tool"] != "bv" {
+		t.Fatalf("expected structured JSON from BV_ROBOT=1 --version, got err=%v raw=%s", err, string(verOut))
+	}
+	helpOut, helpErr, err := runCommandWithTimeout(t, labelRepo, exe, "--robot-help")
+	if err != nil || strings.HasPrefix(strings.TrimSpace(helpOut), "{") {
+		t.Fatalf("expected human text from bare --robot-help, err=%v stderr=%s out=%s", err, helpErr, helpOut)
+	}
+
+	// 2. --limit / --robot-max-results across list commands + bv impact --limit + --robot-drift --severity + --baseline-info --json + --save-baseline --as-of guard
+	gitRepo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(gitRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(gitRepo, "2025-05-01T00:00:00Z", "init")
+	v1Issues := strings.Join([]string{
+		`{"id":"B-1","title":"Service alpha","status":"open","priority":1,"issue_type":"task","labels":["api"]}`,
+		`{"id":"B-2","title":"Service beta","status":"open","priority":2,"issue_type":"task","labels":["web"]}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(gitRepo, ".beads", "issues.jsonl"), []byte(v1Issues), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sprintsJSONL := strings.Join([]string{
+		`{"id":"sp-1","name":"Sprint 1","start_date":"2025-05-01T00:00:00Z","end_date":"2025-05-14T00:00:00Z","bead_ids":["B-1"]}`,
+		`{"id":"sp-2","name":"Sprint 2","start_date":"2025-05-15T00:00:00Z","end_date":"2025-05-28T00:00:00Z","bead_ids":["B-2"]}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(gitRepo, ".beads", "sprints.jsonl"), []byte(sprintsJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitRepo, "svc.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(gitRepo, "2025-05-01T00:00:00Z", "add", ".")
+	runGitAt(gitRepo, "2025-05-01T00:00:00Z", "commit", "-m", "feat: implement B-1 and B-2 in svc.go")
+	firstCommit := runGitAt(gitRepo, "2025-05-01T00:00:00Z", "rev-parse", "HEAD")
+
+	// Add 3 unrelated commits so --history-limit 1 would miss firstCommit while --robot-max-results 1 finds it and caps affected_beads to 1!
+	for i := 1; i <= 3; i++ {
+		if err := os.WriteFile(filepath.Join(gitRepo, fmt.Sprintf("doc%d.md", i)), []byte("# doc\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGitAt(gitRepo, fmt.Sprintf("2025-05-0%dT00:00:00Z", i+1), "add", ".")
+		runGitAt(gitRepo, fmt.Sprintf("2025-05-0%dT00:00:00Z", i+1), "commit", "-m", fmt.Sprintf("docs: note %d", i))
+	}
+
+	// Guard: --save-baseline --as-of must fail closed without writing .bv/baseline.json
+	if _, _, sbAsOfErr := runCommandWithTimeout(t, gitRepo, exe, "--save-baseline", "bad", "--as-of", firstCommit); sbAsOfErr == nil {
+		t.Fatal("expected --save-baseline --as-of to fail closed")
+	}
+	// --baseline-info --json before saving -> exists: false
+	biBeforeOut, biBeforeErr, err := runCommandWithTimeout(t, gitRepo, exe, "--baseline-info", "--json")
+	if err != nil {
+		t.Fatalf("--baseline-info --json before save failed: %v\nstderr=%s", err, biBeforeErr)
+	}
+	if !strings.Contains(biBeforeOut, `"exists": false`) && !strings.Contains(biBeforeOut, `"exists":false`) {
+		t.Fatalf("expected exists=false before baseline save, got:\n%s", biBeforeOut)
+	}
+	if _, sbErr, err := runCommandWithTimeout(t, gitRepo, exe, "--save-baseline", "initial"); err != nil {
+		t.Fatalf("--save-baseline failed: %v\nstderr=%s", err, sbErr)
+	}
+	biAfterOut, biAfterErr, err := runCommandWithTimeout(t, gitRepo, exe, "--baseline-info", "--json")
+	if err != nil || (!strings.Contains(biAfterOut, `"exists": true`) && !strings.Contains(biAfterOut, `"exists":true`)) {
+		t.Fatalf("expected exists=true from --baseline-info --json after save, err=%v stderr=%s out=%s", err, biAfterErr, biAfterOut)
+	}
+
+	// List --limit aliases: recipes, sprints, labels, hotspots, impact
+	recOut, recErr, err := runCommandWithTimeout(t, gitRepo, exe, "recipes", "--limit", "2", "--json")
+	if err != nil {
+		t.Fatalf("bv recipes --limit 2 failed: %v\nstderr=%s", err, recErr)
+	}
+	var recResp struct {
+		Recipes []any `json:"recipes"`
+	}
+	if err := json.Unmarshal([]byte(recOut), &recResp); err != nil || len(recResp.Recipes) != 2 {
+		t.Fatalf("expected 2 recipes from --limit 2, got len=%d err=%v raw=%s", len(recResp.Recipes), err, recOut)
+	}
+
+	spOut, spErr, err := runCommandWithTimeout(t, gitRepo, exe, "sprints", "--limit", "1", "--json")
+	if err != nil {
+		t.Fatalf("bv sprints --limit 1 failed: %v\nstderr=%s", err, spErr)
+	}
+	var spResp struct {
+		Sprints []any `json:"sprints"`
+	}
+	if err := json.Unmarshal([]byte(spOut), &spResp); err != nil || len(spResp.Sprints) != 1 {
+		t.Fatalf("expected 1 sprint from --limit 1, got len=%d err=%v raw=%s", len(spResp.Sprints), err, spOut)
+	}
+
+	lblOut, lblErr, err := runCommandWithTimeout(t, gitRepo, exe, "labels", "--limit", "1", "--json")
+	if err != nil {
+		t.Fatalf("bv labels --limit 1 failed: %v\nstderr=%s", err, lblErr)
+	}
+	var lblResp struct {
+		Results struct {
+			Labels []any `json:"labels"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(lblOut), &lblResp); err != nil || len(lblResp.Results.Labels) != 1 {
+		t.Fatalf("expected 1 label from bv labels --limit 1, got len=%d err=%v raw=%s", len(lblResp.Results.Labels), err, lblOut)
+	}
+
+	impOut, impErr, err := runCommandWithTimeout(t, gitRepo, exe, "impact", "svc.go", "--limit", "1", "--json")
+	if err != nil {
+		t.Fatalf("bv impact svc.go --limit 1 failed: %v\nstderr=%s", err, impErr)
+	}
+	var impResp struct {
+		AffectedBeads []any `json:"affected_beads"`
+	}
+	if err := json.Unmarshal([]byte(impOut), &impResp); err != nil || len(impResp.AffectedBeads) != 1 {
+		t.Fatalf("expected 1 affected bead from bv impact svc.go --limit 1 (not history truncation to 0!), got len=%d err=%v raw=%s", len(impResp.AffectedBeads), err, impOut)
+	}
+
+	// 3. --as-of correlation when working-tree .beads/ is absent (renamed away in a later commit)
+	oldBeadsBackup := filepath.Join(gitRepo, "archived_beads")
+	if err := os.Rename(filepath.Join(gitRepo, ".beads"), oldBeadsBackup); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(gitRepo, "2025-05-06T00:00:00Z", "add", "-A")
+	runGitAt(gitRepo, "2025-05-06T00:00:00Z", "commit", "-m", "chore: archive beads dir")
+
+	if _, causErr, err := runCommandWithTimeout(t, gitRepo, exe, "--robot-causality", "B-1", "--as-of", firstCommit); err != nil {
+		t.Fatalf("expected --robot-causality --as-of to succeed without live .beads/, err=%v stderr=%s", err, causErr)
+	}
+	if _, expErr, err := runCommandWithTimeout(t, gitRepo, exe, "--robot-explain-correlation", firstCommit+":B-1", "--as-of", firstCommit); err != nil {
+		t.Fatalf("expected --robot-explain-correlation --as-of to succeed without live .beads/, err=%v stderr=%s", err, expErr)
+	}
+
+	// 4. --workspace + --as-of in umbrella workspace & --workspace --diff-since <api-sha> --repo api
+	wsRoot := t.TempDir()
+	wsApi := filepath.Join(wsRoot, "api")
+	wsWeb := filepath.Join(wsRoot, "web")
+	for _, d := range []string{filepath.Join(wsApi, ".beads"), filepath.Join(wsWeb, ".beads"), filepath.Join(wsRoot, ".bv")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wsCfgPath := filepath.Join(wsRoot, ".bv", "workspace.yaml")
+	if err := os.WriteFile(wsCfgPath, []byte("repos:\n  - name: api\n    path: api\n    prefix: api-\n  - name: web\n    path: web\n    prefix: web-\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(wsApi, "2025-06-01T00:00:00Z", "init")
+	if err := os.WriteFile(filepath.Join(wsApi, ".beads", "issues.jsonl"), []byte(`{"id":"1","title":"API v1","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(wsApi, "2025-06-01T00:00:00Z", "add", ".")
+	runGitAt(wsApi, "2025-06-01T00:00:00Z", "commit", "-m", "init api")
+	apiV1SHA := runGitAt(wsApi, "2025-06-01T00:00:00Z", "rev-parse", "HEAD")
+
+	if err := os.WriteFile(filepath.Join(wsApi, ".beads", "issues.jsonl"), []byte(`{"id":"1","title":"API v1","status":"closed","priority":1,"issue_type":"task"}`+"\n"+`{"id":"2","title":"API v2","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(wsApi, "2025-06-02T00:00:00Z", "add", ".")
+	runGitAt(wsApi, "2025-06-02T00:00:00Z", "commit", "-m", "api v2")
+
+	runGitAt(wsWeb, "2025-06-01T00:00:00Z", "init")
+	if err := os.WriteFile(filepath.Join(wsWeb, ".beads", "issues.jsonl"), []byte(`{"id":"1","title":"Web v1","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(wsWeb, "2025-06-01T00:00:00Z", "add", ".")
+	runGitAt(wsWeb, "2025-06-01T00:00:00Z", "commit", "-m", "init web")
+	if err := os.WriteFile(filepath.Join(wsWeb, ".beads", "issues.jsonl"), []byte(`{"id":"1","title":"Web v1","status":"open","priority":1,"issue_type":"task"}`+"\n"+`{"id":"2","title":"Web v2","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt(wsWeb, "2025-06-02T00:00:00Z", "add", ".")
+	runGitAt(wsWeb, "2025-06-02T00:00:00Z", "commit", "-m", "web v2")
+
+	// --workspace + --as-of HEAD~1 in umbrella wsRoot (no root .beads/) succeeds and returns ONLY v1 issues!
+	wsAsOfOut, wsAsOfErr, err := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsCfgPath, "--as-of", "HEAD~1", "--robot-triage")
+	if err != nil {
+		t.Fatalf("--workspace --as-of HEAD~1 failed: %v\nstderr=%s", err, wsAsOfErr)
+	}
+	if !strings.Contains(wsAsOfOut, `"api-1"`) || !strings.Contains(wsAsOfOut, `"web-1"`) || strings.Contains(wsAsOfOut, `"api-2"`) || strings.Contains(wsAsOfOut, `"web-2"`) {
+		t.Fatalf("expected --workspace --as-of HEAD~1 to contain api-1 & web-1 and exclude api-2/web-2:\n%s", wsAsOfOut)
+	}
+
+	// --workspace --diff-since <apiV1SHA> --repo api succeeds (whereas without --repo api it fails on web)!
+	wsRepoDiffOut, wsRepoDiffErr, err := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsCfgPath, "--diff-since", apiV1SHA, "--repo", "api", "--robot-diff")
+	if err != nil || !strings.Contains(wsRepoDiffOut, `"api-2"`) {
+		t.Fatalf("expected --workspace --diff-since <apiSHA> --repo api to succeed with api-2, err=%v stderr=%s out=%s", err, wsRepoDiffErr, wsRepoDiffOut)
+	}
+	if _, _, unscopedErr := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsCfgPath, "--diff-since", apiV1SHA, "--robot-diff"); unscopedErr == nil {
+		t.Fatal("expected unscoped --workspace --diff-since <api-only-SHA> to fail resolving SHA in web repo")
+	}
+}

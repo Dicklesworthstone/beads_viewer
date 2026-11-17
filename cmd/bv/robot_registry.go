@@ -156,6 +156,7 @@ type phaseOneRobotHandlerConfig struct {
 	RobotDocsFlag         *string
 	VersionFlag           *bool
 	SchemaCommand         *string
+	RobotMaxResults       *int
 	RecipeLoader          func() *recipe.Loader
 	StructuredOutput      func() bool
 }
@@ -680,6 +681,7 @@ func configuredPrimaryRobotFlagNames() []string {
 		RobotDocsFlag:         &dummyStr,
 		VersionFlag:           &dummyBool,
 		SchemaCommand:         &dummyStr,
+		RobotMaxResults:       &dummyInt,
 	})
 	r2 := newRobotRegistry()
 	registerPhaseTwoRobotHandlers(&r2, phaseTwoRobotHandlerConfig{
@@ -1035,7 +1037,7 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 		FlagPtr:     cfg.VersionFlag,
 		Description: "Show version",
 		Handler: func(ctx RobotContext) error {
-			if cfg.StructuredOutput != nil && cfg.StructuredOutput() {
+			if (cfg.StructuredOutput != nil && cfg.StructuredOutput()) || ctx.EnvRobot {
 				if err := ctx.EncoderOrDefault().Encode(map[string]interface{}{
 					"generated_at":  robotNow().Format(time.RFC3339),
 					"tool":          "bv",
@@ -1083,6 +1085,9 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 			sort.Slice(summaries, func(i, j int) bool {
 				return summaries[i].Name < summaries[j].Name
 			})
+			if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(summaries) > *cfg.RobotMaxResults {
+				summaries = summaries[:*cfg.RobotMaxResults]
+			}
 
 			output := struct {
 				GeneratedAt  string                 `json:"generated_at"`
@@ -1330,9 +1335,10 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					if !ok {
 						continue
 					}
+					wantLabel := strings.TrimSpace(*cfg.RobotByLabel)
 					hasLabel := false
 					for _, label := range issue.Labels {
-						if label == *cfg.RobotByLabel {
+						if strings.EqualFold(strings.TrimSpace(label), wantLabel) {
 							hasLabel = true
 							break
 						}
@@ -1449,8 +1455,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			config := export.GraphExportConfig{
-				Format:   format,
-				DataHash: ctx.DataHash,
+				Format:    format,
+				DataHash:  ctx.DataHash,
+				Readiness: ctx.Readiness,
 			}
 			if cfg.GraphRoot != nil {
 				config.Root = *cfg.GraphRoot
@@ -1748,6 +1755,62 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 			attachSourceDiffsForContext(calc, ctx, driftConfig.SourceDriftMaxAlerts)
 			result := calc.Calculate()
+			hasAlertFilters := (cfg.AlertSeverity != nil && strings.TrimSpace(*cfg.AlertSeverity) != "") ||
+				(cfg.AlertType != nil && strings.TrimSpace(*cfg.AlertType) != "") ||
+				(cfg.AlertLabel != nil && strings.TrimSpace(*cfg.AlertLabel) != "") ||
+				(cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0)
+			if hasAlertFilters {
+				filtered := result.Alerts[:0]
+				for _, alert := range result.Alerts {
+					if cfg.AlertSeverity != nil && strings.TrimSpace(*cfg.AlertSeverity) != "" && string(alert.Severity) != strings.TrimSpace(*cfg.AlertSeverity) {
+						continue
+					}
+					if cfg.AlertType != nil && strings.TrimSpace(*cfg.AlertType) != "" && string(alert.Type) != strings.TrimSpace(*cfg.AlertType) {
+						continue
+					}
+					if cfg.AlertLabel != nil && strings.TrimSpace(*cfg.AlertLabel) != "" {
+						want := strings.ToLower(strings.TrimSpace(*cfg.AlertLabel))
+						found := false
+						for _, label := range alert.Labels {
+							if strings.ToLower(label) == want {
+								found = true
+								break
+							}
+						}
+						if !found && alert.Label != "" && strings.ToLower(alert.Label) == want {
+							found = true
+						}
+						if !found {
+							for _, detail := range alert.Details {
+								if strings.Contains(strings.ToLower(detail), want) {
+									found = true
+									break
+								}
+							}
+						}
+						if !found {
+							continue
+						}
+					}
+					filtered = append(filtered, alert)
+				}
+				if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(filtered) > *cfg.RobotMaxResults {
+					filtered = filtered[:*cfg.RobotMaxResults]
+				}
+				result.Alerts = filtered
+				result.CriticalCount, result.WarningCount, result.InfoCount = 0, 0, 0
+				for _, a := range filtered {
+					switch a.Severity {
+					case drift.SeverityCritical:
+						result.CriticalCount++
+					case drift.SeverityWarning:
+						result.WarningCount++
+					case drift.SeverityInfo:
+						result.InfoCount++
+					}
+				}
+				result.HasDrift = result.CriticalCount > 0 || result.WarningCount > 0
+			}
 			alerts := result.Alerts
 			if alerts == nil {
 				alerts = []drift.Alert{}
@@ -1895,6 +1958,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			if err != nil {
 				return fmt.Errorf("loading sprints: %w", err)
 			}
+			if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(sprints) > *cfg.RobotMaxResults {
+				sprints = sprints[:*cfg.RobotMaxResults]
+			}
 
 			output := struct {
 				RobotEnvelope
@@ -1925,6 +1991,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			sprints, err := loadSprintsForContext(ctx, workDir)
 			if err != nil {
 				return fmt.Errorf("loading sprints: %w", err)
+			}
+			if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(sprints) > *cfg.RobotMaxResults {
+				sprints = sprints[:*cfg.RobotMaxResults]
 			}
 
 			target := ""
@@ -2293,7 +2362,9 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 	register("robot-ignore-correlation", cfg.RobotIgnoreCorrFlag, "Mark a correlation as ignored without accuracy penalty", func(ctx RobotContext) error {
 		return handleRobotCorrelationFeedback(ctx, cfg, correlation.FeedbackIgnore)
 	})
-	register("robot-label-health", cfg.RobotLabelHealthFlag, "Output label health metrics as JSON", handleRobotLabelHealth)
+	register("robot-label-health", cfg.RobotLabelHealthFlag, "Output label health metrics as JSON", func(ctx RobotContext) error {
+		return handleRobotLabelHealth(ctx, cfg)
+	})
 	register("robot-label-flow", cfg.RobotLabelFlowFlag, "Output cross-label dependency flow as JSON", handleRobotLabelFlow)
 	register("robot-label-attention", cfg.RobotLabelAttentionFlag, "Output attention-ranked labels as JSON", func(ctx RobotContext) error {
 		return handleRobotLabelAttention(ctx, cfg)
@@ -2461,13 +2532,11 @@ func detectSourceDiffsForContext(ctx RobotContext, _ int) []datasource.SourceDif
 	if _, explicitFile, _ := datasource.ExplicitBeadsDBSource(); explicitFile {
 		return empty
 	}
-	diffOpts := datasource.DiffOptions{
-		// Leave MaxDifferences uncapped during discovery so out-of-scope issues
-		// cannot starve in-scope issues under --label/--repo/--recipe and so
-		// source_drift_max_alerts: 0 (unlimited) is honored cleanly.
-		MaxDifferences: 0,
-		CompareFields:  []string{"status", "priority", "title"},
-	}
+	diffOpts := datasource.DefaultDiffOptions()
+	// Leave MaxDifferences uncapped during discovery so out-of-scope issues
+	// cannot starve in-scope issues under --label/--repo/--recipe and so
+	// source_drift_max_alerts: 0 (unlimited) is honored cleanly.
+	diffOpts.MaxDifferences = 0
 
 	if ctx.SourceKind == "workspace" {
 		if ctx.SourceAuthority == nil || len(ctx.SourceAuthority.Sources) == 0 {
@@ -2633,10 +2702,19 @@ func labelAnalysisIssuesForContext(ctx RobotContext) []model.Issue {
 	return ctx.Issues
 }
 
-func handleRobotLabelHealth(ctx RobotContext) error {
+func handleRobotLabelHealth(ctx RobotContext, hcfg phaseThreeRobotHandlerConfig) error {
 	cfg := analysis.DefaultLabelHealthConfig()
 	baseIssues := labelAnalysisIssuesForContext(ctx)
 	results := analysis.ComputeAllLabelHealthWithScope(baseIssues, cfg, ctx.ReferenceNow(), nil, ctx.Readiness, ctx.CandidateIDs)
+	if hcfg.RobotMaxResults != nil && *hcfg.RobotMaxResults > 0 {
+		maxN := *hcfg.RobotMaxResults
+		if len(results.Labels) > maxN {
+			results.Labels = results.Labels[:maxN]
+		}
+		if len(results.Summaries) > maxN {
+			results.Summaries = results.Summaries[:maxN]
+		}
+	}
 
 	output := struct {
 		RobotEnvelope
@@ -2697,6 +2775,9 @@ func handleRobotLabelAttention(ctx RobotContext, cfg phaseThreeRobotHandlerConfi
 	limit := 5
 	if cfg.AttentionLimit != nil {
 		limit = *cfg.AttentionLimit
+	}
+	if !pflag.CommandLine.Changed("attention-limit") && cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+		limit = *cfg.RobotMaxResults
 	}
 	if limit <= 0 {
 		limit = 5
@@ -2859,7 +2940,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 	}
 
 	filterFloatMap := func(m map[string]float64) map[string]float64 {
-		if ctx.ActiveRecipe == nil || ctx.CandidateIDs == nil {
+		if ctx.CandidateIDs == nil {
 			return m
 		}
 		scoped := make(map[string]float64, len(ctx.CandidateIDs))
@@ -2871,7 +2952,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		return scoped
 	}
 	filterIntMap := func(m map[string]int) map[string]int {
-		if ctx.ActiveRecipe == nil || ctx.CandidateIDs == nil {
+		if ctx.CandidateIDs == nil {
 			return m
 		}
 		scoped := make(map[string]int, len(ctx.CandidateIDs))
@@ -2883,7 +2964,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		return scoped
 	}
 	filterStringSlice := func(in []string) []string {
-		if ctx.ActiveRecipe == nil || ctx.CandidateIDs == nil {
+		if ctx.CandidateIDs == nil {
 			return in
 		}
 		scoped := make([]string, 0, len(in))
@@ -3826,6 +3907,31 @@ func handleRobotHistory(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 		report.Stats = recomputeHistoryStatsFiltered(report.Histories, report.Stats.Strategies, report.Stats.FeedbackApplied, true)
 	}
 
+	if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+		maxN := *cfg.RobotMaxResults
+		if cfg.BeadHistoryFlag != nil && *cfg.BeadHistoryFlag != "" {
+			for id, hist := range report.Histories {
+				if len(hist.Commits) > maxN {
+					hist.Commits = hist.Commits[:maxN]
+					report.Histories[id] = hist
+				}
+			}
+		} else if len(report.Histories) > maxN {
+			ids := make([]string, 0, len(report.Histories))
+			for id := range report.Histories {
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			capped := make(map[string]correlation.BeadHistory, maxN)
+			for _, id := range ids[:maxN] {
+				capped[id] = report.Histories[id]
+			}
+			report.Histories = capped
+		}
+		report.CommitIndex = correlation.BuildCommitIndex(report.Histories)
+		report.Stats = recomputeHistoryStatsFiltered(report.Histories, report.Stats.Strategies, report.Stats.FeedbackApplied, true)
+	}
+
 	// Same top-level keys as the report plus the shared envelope (source,
 	// scope, as_of). Copy fields rather than embedding: HistoryReport defines
 	// generated_at and data_hash too, and colliding embedded keys are dropped.
@@ -4425,7 +4531,7 @@ func generateWorkspaceCorrelationReportWithContext(runCtx context.Context, ctx R
 			correlator *correlation.Correlator
 			err        error
 		)
-		if raw {
+		if raw || ctx.AsOf != "" {
 			correlator = correlation.NewCorrelator(ws.repoRoot, ws.beadsPath)
 		} else {
 			correlator, err = newCorrelatorWithFeedback(ws.repoRoot, ws.beadsPath)
@@ -5016,9 +5122,14 @@ func generateCorrelationReportForContext(ctx RobotContext, workDir string, opts 
 	if err != nil {
 		return nil, err
 	}
-	correlator, err := newCorrelatorWithFeedback(workDir, beadsPath)
-	if err != nil {
-		return nil, err
+	var correlator *correlation.Correlator
+	if ctx.AsOf != "" {
+		correlator = correlation.NewCorrelator(workDir, beadsPath)
+	} else {
+		correlator, err = newCorrelatorWithFeedback(workDir, beadsPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	report, err := correlator.GenerateReportCached(buildCorrelationBeadInfos(scopedIssues), opts)
 	if err != nil {
@@ -5206,9 +5317,15 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 		return fmt.Errorf("getting current directory: %w", err)
 	}
 
-	feedbackStore, fbBeadID, err := resolveWorkspaceFeedbackStoreForBead(ctx, workDir, beadID)
-	if err != nil {
-		return err
+	var (
+		feedbackStore *correlation.FeedbackStore
+		fbBeadID      string
+	)
+	if ctx.AsOf == "" {
+		feedbackStore, fbBeadID, err = resolveWorkspaceFeedbackStoreForBead(ctx, workDir, beadID)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Explain the raw strategy score: a rejected pair is removed from the
@@ -5235,11 +5352,13 @@ func handleRobotExplainCorrelation(ctx RobotContext, cfg phaseThreeRobotHandlerC
 	}
 
 	explanation := correlation.NewScorer().BuildExplanation(*targetCommit, beadID)
-	if fb, ok := feedbackStore.Get(targetCommit.SHA, fbBeadID); ok {
-		fbCopy := fb
-		fbCopy.BeadID = beadID
-		explanation.Feedback = &fbCopy
-		explanation.Recommendation = describeCorrelationFeedback(fbCopy)
+	if feedbackStore != nil {
+		if fb, ok := feedbackStore.Get(targetCommit.SHA, fbBeadID); ok {
+			fbCopy := fb
+			fbCopy.BeadID = beadID
+			explanation.Feedback = &fbCopy
+			explanation.Recommendation = describeCorrelationFeedback(fbCopy)
+		}
 	}
 	enveloped, err := withEnvelope(ctx.EnvelopeWithHash(report.DataHash), explanation)
 	if err != nil {
@@ -5289,9 +5408,15 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 		return fmt.Errorf("getting current directory: %w", err)
 	}
 
-	feedbackStore, fbBeadID, err := resolveWorkspaceFeedbackStoreForBead(ctx, workDir, beadID)
-	if err != nil {
-		return err
+	var (
+		feedbackStore *correlation.FeedbackStore
+		fbBeadID      string
+	)
+	if ctx.AsOf == "" {
+		feedbackStore, fbBeadID, err = resolveWorkspaceFeedbackStoreForBead(ctx, workDir, beadID)
+		if err != nil {
+			return err
+		}
 	}
 
 	report, err := generateRawCorrelationReport(ctx, workDir, scopedCorrelationIssues(ctx), correlation.CorrelatorOptions{BeadID: beadID, Revision: ctx.AsOfCommit})
@@ -5379,6 +5504,9 @@ func handleRobotFileRelations(ctx RobotContext, cfg phaseThreeRobotHandlerConfig
 	maxResults := 10
 	if cfg.RelationsLimit != nil {
 		maxResults = *cfg.RelationsLimit
+	}
+	if !pflag.CommandLine.Changed("relations-limit") && cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+		maxResults = *cfg.RobotMaxResults
 	}
 	fileLookup := correlation.NewFileLookup(report)
 	result := fileLookup.GetRelatedFiles(*cfg.RobotFileRelationsFlag, threshold, maxResults)
@@ -5929,11 +6057,17 @@ func handleRobotFileBeads(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 	if cfg.FileBeadsLimit != nil {
 		closedLimit = *cfg.FileBeadsLimit
 	}
+	if !pflag.CommandLine.Changed("file-beads-limit") && cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+		closedLimit = *cfg.RobotMaxResults
+	}
 	if closedLimit < 0 {
 		closedLimit = 0
 	}
 	if len(result.ClosedBeads) > closedLimit {
 		result.ClosedBeads = result.ClosedBeads[:closedLimit]
+	}
+	if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(result.OpenBeads) > *cfg.RobotMaxResults {
+		result.OpenBeads = result.OpenBeads[:*cfg.RobotMaxResults]
 	}
 
 	output := struct {
@@ -5991,6 +6125,9 @@ func handleRobotImpact(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		files = append(files, trimmed)
 	}
 	impactResult := fileLookup.ImpactAnalysisAt(files, ctx.ReferenceNow())
+	if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(impactResult.AffectedBeads) > *cfg.RobotMaxResults {
+		impactResult.AffectedBeads = impactResult.AffectedBeads[:*cfg.RobotMaxResults]
+	}
 
 	output := struct {
 		RobotEnvelope
@@ -6056,6 +6193,9 @@ func handleRobotRelated(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 	}
 	if cfg.RelatedMaxResults != nil {
 		options.MaxResults = *cfg.RelatedMaxResults
+	}
+	if !pflag.CommandLine.Changed("related-max-results") && cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+		options.MaxResults = *cfg.RobotMaxResults
 	}
 	if cfg.RelatedIncludeClosed != nil {
 		options.IncludeClosed = *cfg.RelatedIncludeClosed
@@ -6777,6 +6917,9 @@ func handleRobotFileHotspots(ctx RobotContext, cfg phaseThreeRobotHandlerConfig)
 	hotspotsLimit := 10
 	if cfg.HotspotsLimit != nil {
 		hotspotsLimit = *cfg.HotspotsLimit
+	}
+	if !pflag.CommandLine.Changed("hotspots-limit") && cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
+		hotspotsLimit = *cfg.RobotMaxResults
 	}
 	fileLookup := correlation.NewFileLookup(report)
 	output := struct {
