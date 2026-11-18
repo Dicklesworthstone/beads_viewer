@@ -221,3 +221,33 @@ func TestRecipeValidateNormalizesCaseInsensitiveMetricsAndExportFormat(t *testin
 		t.Fatalf("expected unknown export format rejection, got %v", err)
 	}
 }
+
+func TestParseRelativeTimeUpperBoundAndOverflow(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Positive observable: exact upper bound 365000d (~1000 years) is accepted.
+	got, err := recipe.ParseRelativeTime("365000d", now)
+	if err != nil {
+		t.Fatalf("ParseRelativeTime(\"365000d\") unexpected error: %v", err)
+	}
+	want := now.AddDate(0, 0, -365000)
+	if !got.Equal(want) {
+		t.Fatalf("ParseRelativeTime(\"365000d\") = %v, want %v", got, want)
+	}
+
+	// Planted negative controls: 365001d (just above cap) and huge integer overflow return *TimeParseError.
+	for _, bad := range []string{"365001d", "999999999999999999999d"} {
+		parsed, err := recipe.ParseRelativeTime(bad, now)
+		if err == nil {
+			t.Fatalf("ParseRelativeTime(%q) succeeded with %v, want *TimeParseError", bad, parsed)
+		}
+		tpe, ok := err.(*recipe.TimeParseError)
+		if !ok || tpe.Input != bad {
+			t.Fatalf("ParseRelativeTime(%q) error = %T (%v), want *recipe.TimeParseError with Input=%q", bad, err, err, bad)
+		}
+		r := recipe.Recipe{Name: "overflow-check", Filters: recipe.FilterConfig{CreatedAfter: bad}}
+		if valErr := r.Validate(); valErr == nil || !strings.Contains(valErr.Error(), "filters.created_after") {
+			t.Fatalf("Validate() for %q = %v, want filters.created_after error", bad, valErr)
+		}
+	}
+}

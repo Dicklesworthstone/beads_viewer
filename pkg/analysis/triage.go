@@ -35,11 +35,11 @@ func isActionableStatus(status model.Status) bool {
 	return status == model.StatusOpen || status == model.StatusInProgress
 }
 
-// isWithheldIssue reports whether an issue is parked via Pinned, Ephemeral, or
-// IsTemplate metadata flags and must therefore be withheld from claiming,
-// top_picks, and readiness-blocked counts.
+// isWithheldIssue reports whether an issue is parked via Pinned, StatusPinned,
+// Ephemeral, or IsTemplate metadata/status and must therefore be withheld from
+// claiming, top_picks, and readiness-blocked counts.
 func isWithheldIssue(issue *model.Issue) bool {
-	return issue != nil && (issue.Ephemeral || issue.Pinned || issue.IsTemplate)
+	return issue != nil && (issue.Ephemeral || issue.Pinned || issue.IsTemplate || issue.Status.Normalize() == model.StatusPinned)
 }
 
 // TriageResult is the unified output for --robot-triage

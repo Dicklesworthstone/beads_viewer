@@ -121,33 +121,31 @@ func computeFanVariance(issue *model.Issue, stats *GraphStats) float64 {
 	}
 
 	count := 0
-	sum := 0.0
+	mean := 0.0
+	m2 := 0.0
 	for _, dep := range issue.Dependencies {
 		if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == "" {
 			continue
 		}
 		// We use InDegree as a proxy for "Stability/Popularity" of the dependency
-		sum += float64(stats.InDegree[dep.DependsOnID])
+		x := float64(stats.InDegree[dep.DependsOnID])
 		count++
+		delta := x - mean
+		mean += delta / float64(count)
+		m2 += delta * (x - mean)
 	}
 
-	// We need at least 2 dependencies to calculate variance
-	if count < 2 || sum == 0 {
+	// We need at least 2 dependencies with positive mean to calculate variance
+	if count < 2 || mean <= 0 {
 		return 0
 	}
 
-	// Compute coefficient of variation (std/mean) - normalized variance
-	mean := sum / float64(count)
-	sumSquares := 0.0
-	for _, dep := range issue.Dependencies {
-		if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == "" {
-			continue
-		}
-		diff := float64(stats.InDegree[dep.DependsOnID]) - mean
-		sumSquares += diff * diff
+	// Compute coefficient of variation (std/mean) - normalized population variance
+	variance := m2 / float64(count)
+	if variance < 0 {
+		variance = 0
 	}
-	stdDev := math.Sqrt(sumSquares / float64(count))
-	cv := stdDev / mean
+	cv := math.Sqrt(variance) / mean
 
 	// Normalize: CV > 2 is considered high variance
 	normalized := cv / 2.0
@@ -368,32 +366,6 @@ func joinRiskFactors(factors []string) string {
 	}
 	result += ", and " + factors[len(factors)-1]
 	return result
-}
-
-// computeMean calculates the arithmetic mean
-func computeMean(values []float64) float64 {
-	if len(values) == 0 {
-		return 0
-	}
-	sum := 0.0
-	for _, v := range values {
-		sum += v
-	}
-	return sum / float64(len(values))
-}
-
-// computeStdDev calculates the standard deviation
-func computeStdDev(values []float64, mean float64) float64 {
-	if len(values) < 2 {
-		return 0
-	}
-	sumSquares := 0.0
-	for _, v := range values {
-		diff := v - mean
-		sumSquares += diff * diff
-	}
-	variance := sumSquares / float64(len(values))
-	return math.Sqrt(variance)
 }
 
 // ComputeAllRiskSignals calculates risk for all issues in the map in O(N + E)

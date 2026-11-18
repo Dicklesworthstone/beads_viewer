@@ -985,6 +985,7 @@ func TestHandleListKeysFiltersAndTimeTravelPrompt(t *testing.T) {
 		{ID: "3", Title: "Three", Status: model.StatusOpen},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.height = 30
 	m.width = 80
 	m.focused = focusList
@@ -1125,6 +1126,7 @@ func TestViewTogglesGraphBoardInsightsActionable(t *testing.T) {
 		{ID: "B", Title: "Beta", Status: model.StatusOpen},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	// Prime layout so width/height are non-zero
 	_, _ = m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 
@@ -1177,6 +1179,7 @@ func TestHandleGraphBoardActionableKeys(t *testing.T) {
 		{ID: "Y", Title: "Why", Status: model.StatusOpen},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.width, m.height = 120, 30
 
 	// Focus graph and exercise navigation + enter selection logic
@@ -1229,6 +1232,7 @@ func TestHandleRecipePickerAndInsightsKeys(t *testing.T) {
 		{ID: "1", Title: "One", Status: model.StatusOpen},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.width, m.height = 100, 20
 
 	// Seed insights with a selected item
@@ -1284,6 +1288,7 @@ func TestWaitForPhase2CmdCompletes(t *testing.T) {
 
 func TestDiffStatusAndExitTimeTravel(t *testing.T) {
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.timeTravelMode = true
 	m.newIssueIDs = map[string]bool{"N": true}
 	m.closedIssueIDs = map[string]bool{"C": true}
@@ -1314,6 +1319,7 @@ func TestDiffStatusAndExitTimeTravel(t *testing.T) {
 
 func TestRenderFooterStatusAndBadges(t *testing.T) {
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.width = 80
 
 	// status message branch
@@ -1345,6 +1351,10 @@ func TestRenderFooterStatusAndBadges(t *testing.T) {
 
 func TestRenderFooter_FreshnessIndicatorLevels(t *testing.T) {
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() {
+		m.backgroundWorker = nil
+		m.Stop()
+	})
 	m.width = 140
 	m.currentFilter = "all"
 
@@ -1394,6 +1404,10 @@ func TestView_LoadingScreen_TransitionsOnFirstSnapshotOrError(t *testing.T) {
 	}}
 
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() {
+		m.backgroundWorker = nil
+		m.Stop()
+	})
 	m.width, m.height = 120, 30
 	m.backgroundWorker = &BackgroundWorker{state: WorkerProcessing}
 	m.snapshot = nil
@@ -1413,6 +1427,7 @@ func TestView_LoadingScreen_TransitionsOnFirstSnapshotOrError(t *testing.T) {
 	// Snapshot should exit the loading screen.
 	m.snapshotInitPending = true
 	snap := NewSnapshotBuilder(issues).Build()
+	t.Cleanup(snap.Analysis.WaitForPhase2)
 	modelAny, _ = m.Update(SnapshotReadyMsg{Snapshot: snap})
 	mOK := modelAny.(*Model)
 	if out := mOK.View(); strings.Contains(out, "Loading beads") {
@@ -1422,6 +1437,7 @@ func TestView_LoadingScreen_TransitionsOnFirstSnapshotOrError(t *testing.T) {
 
 func TestRenderFooter_ShowsPhase2ProgressBadge(t *testing.T) {
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.width = 80
 	m.snapshot = &DataSnapshot{phase2Ready: false}
 
@@ -1433,6 +1449,10 @@ func TestRenderFooter_ShowsPhase2ProgressBadge(t *testing.T) {
 
 func TestRenderFooter_ShowsWorkerHealthIndicators(t *testing.T) {
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() {
+		m.backgroundWorker = nil
+		m.Stop()
+	})
 	m.width = 140
 	m.currentFilter = "all"
 	m.snapshot = &DataSnapshot{CreatedAt: time.Now()}
@@ -1476,6 +1496,7 @@ func TestExportToMarkdownSmoke(t *testing.T) {
 		CreatedAt: time.Now(),
 	}}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.exportToMarkdown()
 
 	files, _ := os.ReadDir(".")
@@ -1505,6 +1526,7 @@ func TestGraphConnectorDown(t *testing.T) {
 
 func TestCopyIssueToClipboardNoSelection(t *testing.T) {
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	_ = m.copyIssueToClipboard()
 	if !m.statusIsError || !strings.Contains(m.statusMsg, "No issue selected") {
 		t.Fatalf("expected error status for missing selection")
@@ -1525,6 +1547,7 @@ func TestOpenInEditorTerminalEditorGuard(t *testing.T) {
 
 	// With no issues selected, terminal editor dispatch returns "No issue selected"
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.openInEditor()
 	if !m.statusIsError || !strings.Contains(m.statusMsg, "No issue selected") {
 		t.Fatalf("expected 'No issue selected' for terminal editor with no selection, got %q", m.statusMsg)
@@ -1627,6 +1650,7 @@ func TestGraphPageDownAndScrollEmpty(t *testing.T) {
 
 func TestRenderFooterErrorStatus(t *testing.T) {
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.width = 40
 	m.statusMsg = "boom"
 	m.statusIsError = true
@@ -1660,6 +1684,10 @@ func TestRenderFooter_CombinedIndicators(t *testing.T) {
 	t.Cleanup(func() { w.Stop() })
 
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() {
+		m.backgroundWorker = nil
+		m.Stop()
+	})
 	m.width = 160
 	m.currentFilter = "ready"
 	m.countOpen, m.countReady, m.countBlocked, m.countClosed = 1, 2, 3, 4
@@ -1689,6 +1717,7 @@ func TestRenderSplitAndListViews(t *testing.T) {
 		{ID: "2", Title: "Beta", Status: model.StatusClosed},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 
 	// Prime layout into split view
 	modelAny, _ := m.Update(tea.WindowSizeMsg{Width: 180, Height: 40})
@@ -1738,6 +1767,7 @@ func TestInitAndStopNoWatcher(t *testing.T) {
 func TestBoardAndInsightsExtraKeys(t *testing.T) {
 	issues := []model.Issue{{ID: "1", Title: "One", Status: model.StatusOpen}}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.width, m.height = 120, 30
 
 	// Board page up/down coverage
@@ -1822,6 +1852,7 @@ func TestExportToMarkdownCreatesFile(t *testing.T) {
 
 	issues := []model.Issue{{ID: "1", Title: "Alpha", Status: model.StatusOpen}}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	filename := m.generateExportFilename()
 
 	m.exportToMarkdown()
@@ -1902,6 +1933,7 @@ func TestRenderFooterVariantsAndDiffStatus(t *testing.T) {
 		{ID: "2", Title: "Two", Status: model.StatusClosed},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.width = 120
 	m.height = 20
 	m.ready = true
@@ -2060,6 +2092,7 @@ func TestUpdateMouseAndResize(t *testing.T) {
 		{ID: "2", Title: "Two", Status: model.StatusOpen},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 
 	// Window size
 	_, _ = m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
@@ -2087,6 +2120,7 @@ func TestOverlaysAndWorkspaceHelpers(t *testing.T) {
 		{ID: "W-1", Title: "Workspace", Status: model.StatusOpen},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	if updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30}); updated != nil {
 		m = updated.(*Model)
 	}
@@ -2141,6 +2175,7 @@ func TestGraphIconsAndTruncation(t *testing.T) {
 func TestHelpOverlayScroll(t *testing.T) {
 	issues := []model.Issue{{ID: "1", Title: "One", Status: model.StatusOpen}}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.width, m.height = 80, 20 // Small terminal to force scroll
 	m.showHelp = true
 	m.focused = focusHelp
@@ -2469,6 +2504,7 @@ func TestLaunchTerminalEditorNoSelection(t *testing.T) {
 	_ = os.Setenv("EDITOR", "helix")
 
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	cmd := m.openInEditor()
 	if cmd != nil {
 		t.Fatal("expected nil cmd when no issue is selected")
@@ -2499,6 +2535,7 @@ Description.
 	tmpFile.Close()
 
 	m := NewModel([]model.Issue{{ID: "t1", Title: "Test", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	msg := editorExitMsg{
 		issueID:  "t1",
 		tmpFile:  tmpFile.Name(),
@@ -2569,6 +2606,7 @@ func TestEditorExitMsgWithError(t *testing.T) {
 	tmpFile.Close()
 
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	msg := editorExitMsg{
 		issueID:  "t1",
 		tmpFile:  tmpFile.Name(),

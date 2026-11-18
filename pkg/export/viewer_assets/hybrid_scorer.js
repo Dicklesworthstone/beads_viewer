@@ -44,6 +44,7 @@ class HybridScorer {
     if (
       isTruthy(result?.is_template ?? result?.isTemplate) ||
       isTruthy(result?.pinned ?? result?.isPinned) ||
+      isTruthy(result?.ephemeral ?? result?.isEphemeral) ||
       normStatus === 'pinned'
     ) {
       return 'deferred';
@@ -166,5 +167,13 @@ class HybridScorer {
   }
 }
 
-window.HybridScorer = HybridScorer;
-window.HYBRID_PRESETS = HYBRID_PRESETS;
+if (typeof window !== 'undefined') {
+  window.HybridScorer = HybridScorer;
+  window.HYBRID_PRESETS = HYBRID_PRESETS;
+} else if (typeof globalThis !== 'undefined') {
+  globalThis.HybridScorer = HybridScorer;
+  globalThis.HYBRID_PRESETS = HYBRID_PRESETS;
+}
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { HybridScorer, HYBRID_PRESETS };
+}

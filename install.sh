@@ -182,6 +182,7 @@ detect_platform() {
 github_api_get() {
     local url="$1"
     local auth_token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    auth_token="$(printf '%s' "$auth_token" | tr -d '[:space:]')"
 
     if command -v curl >/dev/null 2>&1; then
         if [ -n "$auth_token" ]; then
@@ -528,12 +529,33 @@ source_toolchain() {
 }
 
 resolve_go_bin() {
-    local min_version="$MIN_GO_VERSION" candidate ver
-    for candidate in go /opt/homebrew/bin/go /usr/local/bin/go /usr/local/go/bin/go; do
-        if command -v "$candidate" >/dev/null 2>&1; then
-            ver=$("$candidate" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+    local min_version="$MIN_GO_VERSION" candidate ver dir go_kind=""
+    go_kind="$(type -t go 2>/dev/null || true)"
+    if [ "$go_kind" = "function" ]; then
+        ver=$(GOTOOLCHAIN=local go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+        if [ -n "$ver" ] && version_ge "$ver" "$min_version"; then
+            printf 'go\n'
+            return 0
+        fi
+        return 1
+    fi
+    local -a candidates=() path_dirs=() fallback_bins=()
+    IFS=':' read -r -a path_dirs <<< "${PATH:-}"
+    for dir in "${path_dirs[@]}"; do
+        [ -n "$dir" ] && candidates+=("$dir/go")
+    done
+    local fallback_spec="${BV_GO_FALLBACK_BINS-/opt/homebrew/bin/go:/usr/local/bin/go:/usr/local/go/bin/go}"
+    if [ -n "$fallback_spec" ]; then
+        IFS=':' read -r -a fallback_bins <<< "$fallback_spec"
+        for candidate in "${fallback_bins[@]}"; do
+            [ -n "$candidate" ] && candidates+=("$candidate")
+        done
+    fi
+    for candidate in "${candidates[@]}"; do
+        if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+            ver=$(GOTOOLCHAIN=local "$candidate" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
             if [ -n "$ver" ] && version_ge "$ver" "$min_version"; then
-                command -v "$candidate"
+                printf '%s\n' "$candidate"
                 return 0
             fi
         fi
@@ -542,8 +564,11 @@ resolve_go_bin() {
 }
 
 verify_source_toolchain() {
-    local binary="$1" expected="$2" go_cmd="${3:-go}" built_go
-    if ! built_go=$(GOTOOLCHAIN=local "$go_cmd" version -m "$binary" 2>/dev/null | awk 'NR == 1 { print $NF }'); then
+    local binary="$1" expected="$2" go_cmd="${3:-go}" built_go go_path="$PATH"
+    case "$go_cmd" in
+        */*) go_path="$(dirname "$go_cmd"):$PATH" ;;
+    esac
+    if ! built_go=$(PATH="$go_path" GOTOOLCHAIN=local go version -m "$binary" 2>/dev/null | awk 'NR == 1 { print $NF }'); then
         print_error "Cannot read the built executable's Go version; existing installation was not changed" >&2
         return 1
     fi
@@ -556,10 +581,18 @@ verify_source_toolchain() {
 
 ensure_go() {
     local min_version="$MIN_GO_VERSION"
-    local go_version=""
+    local go_version="" resolved_go=""
+
+    if resolved_go=$(resolve_go_bin); then
+        go_version=$(GOTOOLCHAIN=local "$resolved_go" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+        if [ -n "$go_version" ] && version_ge "$go_version" "$min_version"; then
+            printf '%s' "$go_version"
+            return 0
+        fi
+    fi
 
     if command -v go >/dev/null 2>&1; then
-        go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+        go_version=$(GOTOOLCHAIN=local go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
         if version_ge "$go_version" "$min_version"; then
             printf '%s' "$go_version"
             return 0
@@ -586,8 +619,12 @@ ensure_go() {
         fi
 
         if brew install go </dev/null >&2 || brew upgrade go </dev/null >&2; then
-            go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
-            if version_ge "$go_version" "$min_version"; then
+            if resolved_go=$(resolve_go_bin); then
+                go_version=$("$resolved_go" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+            else
+                go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+            fi
+            if [ -n "$go_version" ] && version_ge "$go_version" "$min_version"; then
                 print_success "Installed Go $go_version via Homebrew" >&2
                 printf '%s' "$go_version"
                 return 0
@@ -614,18 +651,14 @@ ensure_go() {
         fi
 
         if install_go_from_pkg </dev/null >&2; then
-            # Try common locations before giving up (pkg installs to /usr/local/go/bin)
-            local candidates=( "go" "/usr/local/go/bin/go" "/usr/local/bin/go" )
-            for candidate in "${candidates[@]}"; do
-                if command -v "$candidate" >/dev/null 2>&1; then
-                    go_version=$("$candidate" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
-                    if [ -n "$go_version" ] && version_ge "$go_version" "$min_version"; then
-                        print_success "Detected Go $go_version after pkg install" >&2
-                        printf '%s' "$go_version"
-                        return 0
-                    fi
+            if resolved_go=$(resolve_go_bin); then
+                go_version=$("$resolved_go" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+                if [ -n "$go_version" ] && version_ge "$go_version" "$min_version"; then
+                    print_success "Detected Go $go_version after pkg install" >&2
+                    printf '%s' "$go_version"
+                    return 0
                 fi
-            done
+            fi
         fi
     fi
 
@@ -775,7 +808,7 @@ try_binary_install() {
     # Verify before replacing a working installation, and never fall back to a
     # source build after an identity failure.
     local reported reported_version
-    if ! reported=$("$binary_path" --version 2>&1); then
+    if ! reported=$(unset BV_ROBOT BV_OUTPUT_FORMAT TOON_DEFAULT_FORMAT; "$binary_path" --version 2>&1); then
         print_error "Downloaded binary could not report its version: $reported"
         exit 1
     fi

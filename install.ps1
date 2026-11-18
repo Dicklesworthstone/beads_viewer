@@ -93,8 +93,12 @@ function Invoke-JsonGet {
             return Invoke-RestMethod -Uri $Url -Headers $authHeaders -TimeoutSec 60
         } catch {
             $statusCode = $null
-            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-                $statusCode = [int]$_.Exception.Response.StatusCode
+            $respProp = $_.Exception.PSObject.Properties['Response']
+            if ($null -ne $respProp -and $null -ne $respProp.Value) {
+                $codeProp = $respProp.Value.PSObject.Properties['StatusCode']
+                if ($null -ne $codeProp -and $null -ne $codeProp.Value) {
+                    $statusCode = [int]$codeProp.Value
+                }
             }
             if ($statusCode -ne 401 -and $statusCode -ne 403) {
                 Fail "Could not query $Url : $($_.Exception.Message)"
@@ -177,6 +181,14 @@ function Assert-BinaryVersion {
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
+    foreach ($envKey in @('BV_ROBOT', 'BV_OUTPUT_FORMAT', 'TOON_DEFAULT_FORMAT')) {
+        if ($start.PSObject.Properties['Environment'] -and $null -ne $start.Environment) {
+            [void]$start.Environment.Remove($envKey)
+        }
+        if ($start.PSObject.Properties['EnvironmentVariables'] -and $null -ne $start.EnvironmentVariables) {
+            $start.EnvironmentVariables.Remove($envKey)
+        }
+    }
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $start
     try {
@@ -522,8 +534,18 @@ function Main {
     if (-not (Test-Path $binary)) { Fail "Installation failed: $binary is missing" }
 
     if (Test-IsWindowsHost) {
-        $reported = & $binary --version 2>&1
-        if ($LASTEXITCODE -ne 0) { Fail "$binary --version exited with code $LASTEXITCODE" }
+        $savedVerEnv = @{}
+        foreach ($k in @('BV_ROBOT', 'BV_OUTPUT_FORMAT', 'TOON_DEFAULT_FORMAT')) {
+            $savedVerEnv[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
+            [Environment]::SetEnvironmentVariable($k, $null, 'Process')
+        }
+        try {
+            $reported = & $binary --version 2>&1
+            $verCode = $LASTEXITCODE
+        } finally {
+            foreach ($k in $savedVerEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $savedVerEnv[$k], 'Process') }
+        }
+        if ($verCode -ne 0) { Fail "$binary --version exited with code $verCode" }
         Write-Success "Installed $binary ($reported)"
     } else {
         # Only tests run this script off Windows; the .exe cannot execute here.

@@ -1425,8 +1425,8 @@ const Graph = ForceGraph()(container)
             ctx.fillStyle = g; ctx.fill();
         }
 
-        // Articulation point glow
-        if (node.is_articulation && isHighlighted) {
+        // Articulation point glow (active issues only)
+        if (isActiveNodeStatus(node.status) && node.is_articulation && isHighlighted) {
             ctx.beginPath(); ctx.arc(x, y, size + 6, 0, 2 * Math.PI);
             const g = ctx.createRadialGradient(x, y, size, x, y, size + 8);
             g.addColorStop(0, '#ec489960'); g.addColorStop(1, 'transparent');
@@ -1539,7 +1539,7 @@ function populatePanelContent(prefix, node) {
     const addBadge = (cls, text) => { const b = document.createElement('span'); b.className = 'badge ' + cls; b.textContent = text; badgesEl.appendChild(b); };
     addBadge('badge-' + safeClassToken(node.status), node.status.replace('_', ' '));
     addBadge('', 'P' + node.priority);
-    if (node.is_articulation) addBadge('badge-articulation', 'Cut Vertex');
+    if (isActiveNodeStatus(node.status) && node.is_articulation) addBadge('badge-articulation', 'Cut Vertex');
     if (node.slack_available !== false && isActiveNodeStatus(node.status) && node.slack === 0) addBadge('badge-critical', 'Critical Path');
     (node.labels || []).forEach(l => addBadge('badge-type', l));
 

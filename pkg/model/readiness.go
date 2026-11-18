@@ -190,12 +190,12 @@ func NewReadinessIndex(issues []Issue) *ReadinessIndex {
 }
 
 // NewReadinessIndexFromMap builds a ReadinessIndex directly from an ID-keyed
-// issue map (plus an optional extra issue when absent from issues) without
-// allocating or copying an intermediate []Issue slice.
+// issue map (plus an optional extra issue that overrides or supplements issues)
+// without allocating or copying an intermediate []Issue slice.
 func NewReadinessIndexFromMap(issues map[string]Issue, extra *Issue) *ReadinessIndex {
 	capHint := len(issues)
 	includeExtra := false
-	if extra != nil {
+	if extra != nil && extra.ID != "" {
 		if _, exists := issues[extra.ID]; !exists {
 			capHint++
 			includeExtra = true
@@ -227,10 +227,13 @@ func NewReadinessIndexFromMap(issues map[string]Issue, extra *Issue) *ReadinessI
 	}
 
 	lookup := func(id string) Issue {
+		if extra != nil && extra.ID != "" && id == extra.ID {
+			return *extra
+		}
 		if iss, ok := issues[id]; ok {
 			return iss
 		}
-		return *extra
+		return Issue{}
 	}
 
 	totalDeps := 0

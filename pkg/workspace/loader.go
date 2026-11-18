@@ -180,6 +180,15 @@ func (l *AggregateLoader) LoadAll(ctx context.Context) ([]model.Issue, []LoadRes
 	return allIssues, results, nil
 }
 
+// ResolvedRepos returns the configured and auto-discovered repositories after
+// applying workspace defaults and deduplication rules.
+func (l *AggregateLoader) ResolvedRepos() ([]RepoConfig, error) {
+	if l == nil || l.config == nil {
+		return nil, fmt.Errorf("workspace config is nil")
+	}
+	return l.getRepos()
+}
+
 // getRepos returns configured and discovered repositories, including disabled
 // entries whose paths suppress auto-discovery of that same repository.
 func (l *AggregateLoader) getRepos() ([]RepoConfig, error) {

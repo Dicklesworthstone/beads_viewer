@@ -462,6 +462,13 @@ func (g *GraphModel) TotalCount() int {
 	return len(g.sortedIDs)
 }
 
+// SetSize updates the graph dimensions before rendering so scroll bounds
+// respect terminal resize events prior to the next View() call.
+func (g *GraphModel) SetSize(width, height int) {
+	g.width = width
+	g.height = height
+}
+
 // View renders the visual graph view
 func (g *GraphModel) View(width, height int) string {
 	if width <= 0 || height <= 0 {

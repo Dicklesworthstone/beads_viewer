@@ -153,6 +153,7 @@ func TestModel_AttentionViewFocusDrilldownAndFilter(t *testing.T) {
 		{ID: "B", Title: "Beta", Status: model.StatusOpen, Priority: 2, Labels: []string{"frontend"}, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-time.Hour)},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.width, m.height = 120, 30
 
 	press := func(s string) {

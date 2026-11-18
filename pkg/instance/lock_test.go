@@ -741,3 +741,164 @@ func TestLock_HolderHostnameAndSameHost(t *testing.T) {
 		t.Fatalf("foreign-host HolderHostname() = %q, want %q", foreignSecondary.HolderHostname(), foreignHost)
 	}
 }
+
+func TestLock_RefreshPromotionAndConcurrentRelease(t *testing.T) {
+	t.Run("refresh_promotes_on_release_and_dead_pid_but_not_while_primary_alive", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		lockPath := filepath.Join(tmpDir, LockFileName)
+
+		primary, err := NewLock(tmpDir)
+		if err != nil {
+			t.Fatalf("NewLock(primary) failed: %v", err)
+		}
+		primaryInfo, err := readLockFile(lockPath)
+		if err != nil {
+			primary.Release()
+			t.Fatalf("readLockFile(primary): %v", err)
+		}
+
+		secondary, err := NewLock(tmpDir)
+		if err != nil {
+			primary.Release()
+			t.Fatalf("NewLock(secondary) failed: %v", err)
+		}
+		defer secondary.Release()
+
+		// Planted negative control: Refresh() while primary is alive keeps secondary false and preserves primary's lock file.
+		secondary.Refresh()
+		if secondary.IsFirstInstance() {
+			t.Fatal("negative control failed: Refresh() promoted secondary while primary is still alive")
+		}
+		stillPrimary, err := readLockFile(lockPath)
+		if err != nil || stillPrimary.OwnerID != primaryInfo.OwnerID {
+			t.Fatalf("Refresh() disturbed active primary lock file: got=%+v err=%v wantOwner=%q", stillPrimary, err, primaryInfo.OwnerID)
+		}
+
+		// Positive 1: Primary calls Release(), then secondary.Refresh() promotes via acquireMissingLock.
+		primary.Release()
+		secondary.Refresh()
+		if !secondary.IsFirstInstance() {
+			t.Fatal("expected secondary.Refresh() to promote to primary after primary.Release()")
+		}
+		promotedInfo, err := readLockFile(lockPath)
+		if err != nil || promotedInfo.PID != os.Getpid() || promotedInfo.OwnerID == "" || promotedInfo.OwnerID == primaryInfo.OwnerID {
+			t.Fatalf("expected promoted lock file owned by secondary, got=%+v err=%v", promotedInfo, err)
+		}
+		secondary.Release()
+
+		// Positive 2: Dead primary PID on disk -> secondary created while "alive" via hook, then primary dies -> Refresh() promotes via takeOverStaleLock.
+		deadDir := t.TempDir()
+		deadLockPath := filepath.Join(deadDir, LockFileName)
+		const simulatedDeadPID = 99999998
+		alive := atomic.Bool{}
+		alive.Store(true)
+
+		lockHooksMu.Lock()
+		origAlive := processAliveFunc
+		processAliveFunc = func(pid int) bool {
+			if pid == simulatedDeadPID {
+				return alive.Load()
+			}
+			return origAlive(pid)
+		}
+		lockHooksMu.Unlock()
+		t.Cleanup(func() {
+			lockHooksMu.Lock()
+			processAliveFunc = origAlive
+			lockHooksMu.Unlock()
+		})
+
+		host, _ := currentHostname()
+		writeLockInfoForTest(t, deadLockPath, LockInfo{
+			PID:       simulatedDeadPID,
+			StartedAt: time.Now(),
+			Hostname:  host,
+			OwnerID:   "simulated-primary-owner",
+		})
+
+		sec2, err := NewLock(deadDir)
+		if err != nil {
+			t.Fatalf("NewLock(sec2) failed: %v", err)
+		}
+		defer sec2.Release()
+		if sec2.IsFirstInstance() {
+			t.Fatal("sec2 should start as secondary while simulated primary is alive")
+		}
+
+		// Negative control while alive:
+		sec2.Refresh()
+		if sec2.IsFirstInstance() {
+			t.Fatal("sec2 must remain secondary while simulated primary PID is alive")
+		}
+
+		// Simulate primary process death:
+		alive.Store(false)
+		sec2.Refresh()
+		if !sec2.IsFirstInstance() {
+			t.Fatal("expected sec2.Refresh() to take over stale lock after primary PID died")
+		}
+		takeoverInfo, err := readLockFile(deadLockPath)
+		if err != nil || takeoverInfo.PID != os.Getpid() || takeoverInfo.OwnerID == "simulated-primary-owner" {
+			t.Fatalf("expected takeover lock file owned by sec2, got=%+v err=%v", takeoverInfo, err)
+		}
+	})
+
+	t.Run("concurrent_refresh_and_release_leaves_not_first_and_no_orphan_lock", func(t *testing.T) {
+		host, _ := currentHostname()
+		for iter := 0; iter < 40; iter++ {
+			// Exercise both missing-lock (even iter) and stale-lock takeover (odd iter) races against Release().
+			dir := t.TempDir()
+			lockPath := filepath.Join(dir, LockFileName)
+
+			primary, err := NewLock(dir)
+			if err != nil {
+				t.Fatalf("iter %d NewLock(primary): %v", iter, err)
+			}
+			secondary, err := NewLock(dir)
+			if err != nil {
+				primary.Release()
+				t.Fatalf("iter %d NewLock(secondary): %v", iter, err)
+			}
+
+			if iter%2 == 0 {
+				primary.Release()
+			} else {
+				// Replace primary lock with a stale dead-PID lock so Refresh() hits takeOverStaleLock.
+				primary.Release()
+				writeLockInfoForTest(t, lockPath, LockInfo{
+					PID:       99999999,
+					StartedAt: time.Now().Add(-time.Hour),
+					Hostname:  host,
+					OwnerID:   fmt.Sprintf("dead-owner-%d", iter),
+				})
+			}
+
+			start := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-start
+				secondary.Refresh()
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				secondary.Release()
+			}()
+			close(start)
+			wg.Wait()
+
+			if secondary.IsFirstInstance() {
+				t.Fatalf("iter %d: released secondary lock ended with IsFirstInstance() == true", iter)
+			}
+			if info, statErr := os.Stat(lockPath); !os.IsNotExist(statErr) {
+				// In the odd-iter case, if Release() ran BEFORE Refresh() started checkStale(), the pre-existing
+				// dead-owner lock file was never touched by secondary; verify secondary never left its own lock file behind!
+				if lockData, readErr := readLockFile(lockPath); readErr != nil || lockData.PID == os.Getpid() {
+					t.Fatalf("iter %d: orphaned secondary .bv.lock left behind: stat=%v data=%+v readErr=%v", iter, info, lockData, readErr)
+				}
+			}
+		}
+	})
+}

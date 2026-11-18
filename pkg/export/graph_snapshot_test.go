@@ -626,3 +626,132 @@ func TestSaveGraphSnapshot_LongTitleClipPathAndHeaderLegendBounds(t *testing.T) 
 		t.Fatalf("summaryMaxDetailRunes(640) = %d collides with Legend at x=440", maxDetail)
 	}
 }
+
+func TestSaveGraphSnapshot_ActiveSubgraphTopBottleneckAndAllClosedFallback(t *testing.T) {
+	// Active bridge: open-leaf -> open-bridge -> open-root (active betweenness = 1.0).
+	// Closed/tombstone high-betweenness hubs on full graph:
+	// {open-x1, open-x2, open-x3} -> closed-hub -> {open-root, open-y1, open-y2} (full-graph betweenness = 9.0)
+	// {open-z1, open-z2} -> tomb-hub -> {open-root, open-y1} (full-graph betweenness = 4.0)
+	issues := []model.Issue{
+		{ID: "open-root", Title: "Open Root", Status: model.StatusOpen},
+		{
+			ID: "open-bridge", Title: "Active Bridge", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "open-bridge", DependsOnID: "open-root", Type: model.DepBlocks}},
+		},
+		{
+			ID: "open-leaf", Title: "Active Leaf", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "open-leaf", DependsOnID: "open-bridge", Type: model.DepBlocks}},
+		},
+		{ID: "open-y1", Title: "Open Y1", Status: model.StatusOpen},
+		{ID: "open-y2", Title: "Open Y2", Status: model.StatusOpen},
+		{
+			ID: "closed-hub", Title: "Closed High-BW Hub", Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{
+				{IssueID: "closed-hub", DependsOnID: "open-root", Type: model.DepBlocks},
+				{IssueID: "closed-hub", DependsOnID: "open-y1", Type: model.DepBlocks},
+				{IssueID: "closed-hub", DependsOnID: "open-y2", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "open-x1", Title: "Open X1", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "open-x1", DependsOnID: "closed-hub", Type: model.DepBlocks}},
+		},
+		{
+			ID: "open-x2", Title: "Open X2", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "open-x2", DependsOnID: "closed-hub", Type: model.DepBlocks}},
+		},
+		{
+			ID: "open-x3", Title: "Open X3", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "open-x3", DependsOnID: "closed-hub", Type: model.DepBlocks}},
+		},
+		{
+			ID: "tomb-hub", Title: "Tombstone High-BW Hub", Status: model.StatusTombstone,
+			Dependencies: []*model.Dependency{
+				{IssueID: "tomb-hub", DependsOnID: "open-root", Type: model.DepBlocks},
+				{IssueID: "tomb-hub", DependsOnID: "open-y1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "open-z1", Title: "Open Z1", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "open-z1", DependsOnID: "tomb-hub", Type: model.DepBlocks}},
+		},
+		{
+			ID: "open-z2", Title: "Open Z2", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "open-z2", DependsOnID: "tomb-hub", Type: model.DepBlocks}},
+		},
+	}
+
+	fullStats := analysis.NewAnalyzer(issues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	if fullStats.GetBetweennessScore("closed-hub") <= fullStats.GetBetweennessScore("open-bridge") ||
+		fullStats.GetBetweennessScore("tomb-hub") <= fullStats.GetBetweennessScore("open-bridge") {
+		t.Fatalf("negative control setup invalid: full-graph betweenness closed-hub=%v tomb-hub=%v open-bridge=%v",
+			fullStats.GetBetweennessScore("closed-hub"),
+			fullStats.GetBetweennessScore("tomb-hub"),
+			fullStats.GetBetweennessScore("open-bridge"))
+	}
+
+	broaderIssues := append(append([]model.Issue{}, issues...), model.Issue{
+		ID: "outside-extra", Title: "Outside", Status: model.StatusOpen,
+		Dependencies: []*model.Dependency{{IssueID: "outside-extra", DependsOnID: "open-leaf", Type: model.DepBlocks}},
+	})
+	broaderStats := analysis.NewAnalyzer(broaderIssues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+
+	for _, tc := range []struct {
+		name  string
+		stats *analysis.GraphStats
+	}{
+		{name: "prepopulated-stats", stats: &fullStats},
+		{name: "mismatched-stats-fallback", stats: &broaderStats},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svgPath := filepath.Join(t.TempDir(), "active_bottleneck.svg")
+			if err := SaveGraphSnapshot(GraphSnapshotOptions{
+				Path:   svgPath,
+				Issues: issues,
+				Stats:  tc.stats,
+			}); err != nil {
+				t.Fatalf("SaveGraphSnapshot failed: %v", err)
+			}
+			raw, err := os.ReadFile(svgPath)
+			if err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+			svg := string(raw)
+			if !hasSubstr(svg, "top bottleneck: open-bridge (") {
+				t.Fatalf("expected SVG summary to select active bridge open-bridge as top bottleneck, got:\n%s", svg)
+			}
+			if hasSubstr(svg, "top bottleneck: closed-hub") || hasSubstr(svg, "top bottleneck: tomb-hub") {
+				t.Fatalf("SVG summary leaked closed/tombstone hub as top bottleneck:\n%s", svg)
+			}
+		})
+	}
+
+	// All-closed fallback: must not panic and must emit deterministic fallback leader.
+	allClosed := []model.Issue{
+		{ID: "closed-b", Title: "Closed B", Status: model.StatusClosed},
+		{
+			ID: "closed-a", Title: "Closed A", Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{{IssueID: "closed-a", DependsOnID: "closed-b", Type: model.DepBlocks}},
+		},
+		{
+			ID: "closed-c", Title: "Closed C", Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{{IssueID: "closed-c", DependsOnID: "closed-a", Type: model.DepBlocks}},
+		},
+	}
+	closedStats := analysis.NewAnalyzer(allClosed).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	closedSVGPath := filepath.Join(t.TempDir(), "all_closed.svg")
+	if err := SaveGraphSnapshot(GraphSnapshotOptions{
+		Path:   closedSVGPath,
+		Issues: allClosed,
+		Stats:  &closedStats,
+	}); err != nil {
+		t.Fatalf("SaveGraphSnapshot(allClosed) failed: %v", err)
+	}
+	rawClosedSVG, err := os.ReadFile(closedSVGPath)
+	if err != nil {
+		t.Fatalf("ReadFile(all_closed.svg): %v", err)
+	}
+	if !hasSubstr(string(rawClosedSVG), "top bottleneck: closed-a (0.00)") {
+		t.Fatalf("expected all-closed snapshot to fall back to closed-a (0.00), got:\n%s", string(rawClosedSVG))
+	}
+}

@@ -85,6 +85,11 @@ func ResolveReportOptions(defaults recipe.ExportConfig, explicit ReportOverrides
 	if explicit.IncludeGraph != nil {
 		opts.IncludeGraph = *explicit.IncludeGraph
 	}
+	if defaults.IncludeActions != nil {
+		v := *defaults.IncludeActions
+		opts.IncludeActionPlan = v
+		opts.IncludeActions = &v
+	}
 	if explicit.IncludeActions != nil {
 		v := *explicit.IncludeActions
 		opts.IncludeActionPlan = v
@@ -259,18 +264,34 @@ func newReportMetricsAccessor(opts ReportOptions, issueSlices ...[]model.Issue) 
 	return &reportMetricsAccessor{
 		keys:           keys,
 		pageRank:       opts.GraphStats.PageRank(),
-		betweenness:    opts.GraphStats.Betweenness(),
+		betweenness:    opts.GraphStats.ActiveBetweenness(),
 		eigenvector:    opts.GraphStats.Eigenvector(),
 		hubs:           opts.GraphStats.Hubs(),
 		authorities:    opts.GraphStats.Authorities(),
 		criticalPath:   opts.GraphStats.CriticalPathScore(),
-		kcore:          opts.GraphStats.CoreNumber(),
+		kcore:          opts.GraphStats.ActiveCoreNumber(),
 		slack:          slack,
 		slackAvailable: len(slack) > 0 && len(opts.GraphStats.Cycles()) == 0,
 		resolvedIDs:    resolvedIDs,
 		inDegree:       opts.GraphStats.InDegree,
 		outDegree:      opts.GraphStats.OutDegree,
 	}
+}
+
+func (m *reportMetricsAccessor) betweennessForIssue(issueID string) (float64, bool) {
+	if m == nil || m.betweenness == nil || m.resolvedIDs[issueID] {
+		return 0, false
+	}
+	val, ok := m.betweenness[issueID]
+	return val, ok
+}
+
+func (m *reportMetricsAccessor) kcoreForIssue(issueID string) (int, bool) {
+	if m == nil || m.kcore == nil || m.resolvedIDs[issueID] {
+		return 0, false
+	}
+	val, ok := m.kcore[issueID]
+	return val, ok
 }
 
 func (m *reportMetricsAccessor) slackForIssue(issueID string) (float64, bool) {
@@ -289,7 +310,8 @@ func (m *reportMetricsAccessor) floatValue(key, issueID string) float64 {
 	case "pagerank":
 		return m.pageRank[issueID]
 	case "betweenness":
-		return m.betweenness[issueID]
+		val, _ := m.betweennessForIssue(issueID)
+		return val
 	case "eigenvector":
 		return m.eigenvector[issueID]
 	case "hubs":
@@ -299,7 +321,8 @@ func (m *reportMetricsAccessor) floatValue(key, issueID string) float64 {
 	case "critical_path":
 		return m.criticalPath[issueID]
 	case "kcore":
-		return float64(m.kcore[issueID])
+		val, _ := m.kcoreForIssue(issueID)
+		return float64(val)
 	case "slack":
 		val, _ := m.slackForIssue(issueID)
 		return val
@@ -318,7 +341,8 @@ func (m *reportMetricsAccessor) formatValue(key, issueID string) string {
 	}
 	switch key {
 	case "kcore":
-		return fmt.Sprintf("%d", m.kcore[issueID])
+		val, _ := m.kcoreForIssue(issueID)
+		return fmt.Sprintf("%d", val)
 	case "in_degree":
 		return fmt.Sprintf("%d", m.inDegree[issueID])
 	case "out_degree":
@@ -612,7 +636,7 @@ func writeCSVReport(selected, context []model.Issue, opts ReportOptions, metrics
 				if mKey, ok := normalizeReportMetricKey(norm); ok {
 					acc := metricsAcc
 					if acc == nil {
-						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness}, selected, context)
+						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness, GraphIssues: opts.GraphIssues}, selected, context)
 					}
 					return csvColSpec{
 						key:    mKey,
@@ -1279,7 +1303,7 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 				if mKey, ok := normalizeReportMetricKey(norm); ok {
 					acc := metricsAcc
 					if acc == nil {
-						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness}, issues)
+						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness, GraphIssues: opts.GraphIssues}, issues)
 					}
 					return summaryColumnSpec{
 						header: reportMetricHeader(mKey),
@@ -1590,7 +1614,7 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 				if mKey, ok := normalizeReportMetricKey(norm); ok {
 					acc := metricsAcc
 					if acc == nil {
-						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness}, issues)
+						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness, GraphIssues: opts.GraphIssues}, issues)
 					}
 					return htmlCol{
 						key:    mKey,

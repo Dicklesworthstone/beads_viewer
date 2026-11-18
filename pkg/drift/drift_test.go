@@ -3040,3 +3040,264 @@ func TestDriftLoadConfigRejectsUnknownYAMLFieldsAndMultiDoc(t *testing.T) {
 		t.Fatalf("validCfg = (%d, %d), want (10, 25)", validCfg.StaleWarningDays, validCfg.StaleCriticalDays)
 	}
 }
+
+func TestDriftCandidateScopePriorityMismatchWithheldDuplicatesScopeGateAndVelocityReopen(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+
+	// 1. collectTopMetricChanges candidate filter (positive: in-scope change kept; negative: out-of-scope filtered).
+	calcScoped := NewCalculator(&baseline.Baseline{}, &baseline.Baseline{}, DefaultConfig())
+	calcScoped.SetCandidates(map[string]bool{"IN-SCOPE": true})
+	changes := calcScoped.collectTopMetricChanges(
+		[]baseline.MetricItem{{ID: "IN-SCOPE", Value: 0.10}, {ID: "OUT-SCOPE", Value: 0.10}},
+		[]baseline.MetricItem{{ID: "IN-SCOPE", Value: 0.40}, {ID: "OUT-SCOPE", Value: 0.90}},
+		50,
+		"PageRank",
+	)
+	if len(changes) != 1 || !strings.Contains(changes[0], "IN-SCOPE") || strings.Contains(changes[0], "OUT-SCOPE") {
+		t.Fatalf("collectTopMetricChanges candidate filter = %v, want only IN-SCOPE", changes)
+	}
+
+	// 2. MatchesScope gating aggregate cross-snapshot deltas:
+	// Unscoped baseline vs scoped current must suppress aggregate deltas while Scope==nil vs BaselineScope{} fires them.
+	blUnscoped := &baseline.Baseline{
+		Version: baseline.CurrentVersion,
+		Stats: baseline.GraphStats{
+			NodeCount:       10,
+			EdgeCount:       10,
+			Density:         0.10,
+			OpenCount:       5,
+			BlockedCount:    1,
+			ActionableCount: 5,
+		},
+		TopMetrics: baseline.TopMetrics{
+			PageRank: []baseline.MetricItem{{ID: "A", Value: 0.10}},
+		},
+	}
+	curChangedStats := baseline.GraphStats{
+		NodeCount:       30,
+		EdgeCount:       90,
+		Density:         0.30,
+		OpenCount:       20,
+		BlockedCount:    12,
+		ActionableCount: 1,
+	}
+	curScoped := &baseline.Baseline{
+		Version: baseline.CurrentVersion,
+		Scope:   &baseline.BaselineScope{Label: "api"},
+		Stats:   curChangedStats,
+		TopMetrics: baseline.TopMetrics{
+			PageRank: []baseline.MetricItem{{ID: "A", Value: 0.80}},
+		},
+	}
+	curUnscoped := &baseline.Baseline{
+		Version:    baseline.CurrentVersion,
+		Scope:      nil,
+		Stats:      curChangedStats,
+		TopMetrics: curScoped.TopMetrics,
+	}
+
+	aggregateTypes := map[AlertType]bool{
+		AlertDensityGrowth:    true,
+		AlertNodeCountChange:  true,
+		AlertEdgeCountChange:  true,
+		AlertBlockedIncrease:  true,
+		AlertActionableChange: true,
+		AlertScopeCreep:       true,
+		AlertPageRankChange:   true,
+	}
+
+	mismatchedRes := NewCalculator(blUnscoped, curScoped, DefaultConfig()).Calculate()
+	for _, a := range mismatchedRes.Alerts {
+		if aggregateTypes[a.Type] {
+			t.Fatalf("mismatched scope emitted aggregate drift alert %s: %+v", a.Type, a)
+		}
+	}
+
+	matchedRes := NewCalculator(blUnscoped, curUnscoped, DefaultConfig()).Calculate()
+	seenAgg := make(map[AlertType]bool)
+	for _, a := range matchedRes.Alerts {
+		if aggregateTypes[a.Type] {
+			seenAgg[a.Type] = true
+		}
+	}
+	for wantType := range aggregateTypes {
+		if !seenAgg[wantType] {
+			t.Fatalf("matching unscoped comparison missed expected aggregate alert %s (got %v)", wantType, matchedRes.Alerts)
+		}
+	}
+
+	// 3. checkPriorityMismatch SelectionReadyLeaf:
+	// READY-LEAF is P4 unblocking 4 urgent P0 tasks (positive observable), whereas blocked, deferred, pinned,
+	// ephemeral, template, and epic-with-open-child are all withheld by SelectionReadyLeaf (planted negative controls).
+	futureDefer := now.Add(48 * time.Hour)
+	mismatchIssues := []model.Issue{
+		{ID: "READY-LEAF", Title: "Load-bearing leaf", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 4, CreatedAt: now, UpdatedAt: now},
+		{ID: "NEG-BLOCKER", Title: "Upstream blocker", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "NEG-BLOCKED", Title: "Blocked P4", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 4, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "NEG-BLOCKED", DependsOnID: "NEG-BLOCKER", Type: model.DepBlocks}},
+		},
+		{ID: "NEG-DEFERRED", Title: "Deferred P4", Status: model.StatusOpen, DeferUntil: &futureDefer, IssueType: model.TypeTask, Priority: 4, CreatedAt: now, UpdatedAt: now},
+		{ID: "NEG-PINNED", Title: "Pinned P4", Status: model.StatusPinned, IssueType: model.TypeTask, Priority: 4, CreatedAt: now, UpdatedAt: now},
+		{ID: "NEG-EPHEMERAL", Title: "Ephemeral P4", Status: model.StatusOpen, Ephemeral: true, IssueType: model.TypeTask, Priority: 4, CreatedAt: now, UpdatedAt: now},
+		{ID: "NEG-TEMPLATE", Title: "Template P4", Status: model.StatusOpen, IsTemplate: true, IssueType: model.TypeTask, Priority: 4, CreatedAt: now, UpdatedAt: now},
+		{ID: "NEG-EPIC", Title: "Epic parent P4", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 4, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "EPIC-CHILD", Title: "Open child of epic", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "EPIC-CHILD", DependsOnID: "NEG-EPIC", Type: model.DepParentChild}},
+		},
+	}
+	// Give every P4 candidate (READY-LEAF and all negative controls) identical downstream fan-out so any failure of SelectionReadyLeaf would fire!
+	for idx, src := range []string{"READY-LEAF", "NEG-BLOCKED", "NEG-DEFERRED", "NEG-PINNED", "NEG-EPHEMERAL", "NEG-TEMPLATE", "NEG-EPIC"} {
+		for k := 0; k < 4; k++ {
+			depID := fmt.Sprintf("FAN-%d-%d", idx, k)
+			mismatchIssues = append(mismatchIssues, model.Issue{
+				ID: depID, Title: depID, Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: depID, DependsOnID: src, Type: model.DepBlocks}},
+			})
+		}
+	}
+	pmCfg := DefaultConfig()
+	pmCfg.PriorityMismatchMinConfidence = 0.30
+	eqBl := &baseline.Baseline{Version: baseline.CurrentVersion, Stats: baseline.GraphStats{NodeCount: len(mismatchIssues), OpenCount: len(mismatchIssues)}}
+	pmCalc := NewCalculator(eqBl, eqBl, pmCfg)
+	pmCalc.SetNow(now)
+	pmCalc.SetIssues(mismatchIssues)
+	pmRes := pmCalc.Calculate()
+	pmIDs := make(map[string]bool)
+	for _, a := range pmRes.Alerts {
+		if a.Type == AlertPriorityMismatch {
+			pmIDs[a.IssueID] = true
+		}
+	}
+	if !pmIDs["READY-LEAF"] {
+		t.Fatalf("expected AlertPriorityMismatch for READY-LEAF, got %v", pmIDs)
+	}
+	for _, negID := range []string{"NEG-BLOCKED", "NEG-DEFERRED", "NEG-PINNED", "NEG-EPHEMERAL", "NEG-TEMPLATE", "NEG-EPIC"} {
+		if pmIDs[negID] {
+			t.Fatalf("non-ready-leaf %q leaked into AlertPriorityMismatch: %v", negID, pmIDs)
+		}
+	}
+
+	// 4. checkPotentialDuplicate withheld skip (including case-insensitive Status "PINNED"):
+	dupText := "Implement OAuth2 PKCE authentication callback token exchange validation handler"
+	dupIssues := []model.Issue{
+		{ID: "DUP-LIVE-1", Title: dupText, Description: dupText, Status: model.StatusOpen},
+		{ID: "DUP-LIVE-2", Title: dupText, Description: dupText, Status: model.StatusOpen},
+		{ID: "DUP-PIN-UPPER", Title: dupText, Description: dupText, Status: " PINNED "},
+		{ID: "DUP-PIN-BOOL", Title: dupText, Description: dupText, Status: model.StatusOpen, Pinned: true},
+		{ID: "DUP-EPH", Title: dupText, Description: dupText, Status: model.StatusOpen, Ephemeral: true},
+		{ID: "DUP-TPL", Title: dupText, Description: dupText, Status: model.StatusOpen, IsTemplate: true},
+		{ID: "DUP-CLOSED", Title: dupText, Description: dupText, Status: model.StatusClosed},
+	}
+	dupCfg := DefaultConfig()
+	dupCfg.DuplicateJaccardThreshold = 0.5
+	dupCfg.DuplicateMaxAlerts = 20
+	dupCalc := NewCalculator(&baseline.Baseline{Version: 1}, &baseline.Baseline{Version: 1}, dupCfg)
+	dupCalc.SetNow(now)
+	dupCalc.SetIssues(dupIssues)
+	dupRes := dupCalc.Calculate()
+	dupCount := 0
+	for _, a := range dupRes.Alerts {
+		if a.Type != AlertPotentialDuplicate {
+			continue
+		}
+		dupCount++
+		if (a.IssueID != "DUP-LIVE-1" && a.IssueID != "DUP-LIVE-2") || (a.RelatedIssueID != "DUP-LIVE-1" && a.RelatedIssueID != "DUP-LIVE-2") {
+			t.Fatalf("withheld/closed duplicate leaked into AlertPotentialDuplicate: %+v", a)
+		}
+	}
+	if dupCount != 1 {
+		t.Fatalf("expected exactly 1 live duplicate alert (DUP-LIVE-1 <-> DUP-LIVE-2), got %d", dupCount)
+	}
+
+	// 5. checkVelocityDrop reopened negative control + ClosedAt==nil UpdatedAt fallback:
+	priorClose := now.Add(-10 * 24 * time.Hour) // Prior 7d window [-14d, -7d]
+	recentClose := now.Add(-2 * 24 * time.Hour) // Recent 7d window (-7d, 0]
+	futureClose := now.Add(24 * time.Hour)      // Future (> now), must be ignored
+	velIssues := []model.Issue{
+		// 5 genuinely closed issues in prior window (>= DefaultConfig().VelocityMinBaseline=5, including ClosedAt==nil fallback to UpdatedAt):
+		{ID: "PRIOR-1", Status: model.StatusClosed, ClosedAt: &priorClose, UpdatedAt: priorClose},
+		{ID: "PRIOR-2", Status: model.StatusClosed, ClosedAt: &priorClose, UpdatedAt: priorClose},
+		{ID: "PRIOR-3", Status: model.StatusClosed, ClosedAt: nil, UpdatedAt: priorClose},
+		{ID: "PRIOR-4", Status: model.StatusClosed, ClosedAt: nil, UpdatedAt: priorClose},
+		{ID: "PRIOR-5", Status: model.StatusTombstone, ClosedAt: nil, UpdatedAt: priorClose},
+		// Planted negative controls in recent window: reopened StatusOpen/StatusInProgress with stale ClosedAt, plus future ClosedAt:
+		{ID: "REOPEN-1", Status: model.StatusOpen, ClosedAt: &recentClose, UpdatedAt: recentClose},
+		{ID: "REOPEN-2", Status: model.StatusInProgress, ClosedAt: &recentClose, UpdatedAt: recentClose},
+		{ID: "REOPEN-3", Status: model.StatusOpen, ClosedAt: &recentClose, UpdatedAt: recentClose},
+		{ID: "REOPEN-4", Status: model.StatusOpen, ClosedAt: &recentClose, UpdatedAt: recentClose},
+		{ID: "REOPEN-5", Status: model.StatusOpen, ClosedAt: &recentClose, UpdatedAt: recentClose},
+		{ID: "FUTURE-CLOSED", Status: model.StatusClosed, ClosedAt: &futureClose, UpdatedAt: futureClose},
+	}
+	velCalc := NewCalculator(&baseline.Baseline{Version: 1}, &baseline.Baseline{Version: 1}, DefaultConfig())
+	velCalc.SetNow(now)
+	velCalc.SetIssues(velIssues)
+	velRes := velCalc.Calculate()
+	foundDrop := false
+	for _, a := range velRes.Alerts {
+		if a.Type == AlertVelocityDrop {
+			foundDrop = true
+			if a.BaselineVal != 5 || a.CurrentVal != 0 {
+				t.Fatalf("AlertVelocityDrop BaselineVal=%v CurrentVal=%v, want 5 -> 0 (reopened & future excluded)", a.BaselineVal, a.CurrentVal)
+			}
+		}
+	}
+	if !foundDrop {
+		t.Fatalf("expected AlertVelocityDrop when recent window only has reopened open issues with stale ClosedAt, got %+v", velRes.Alerts)
+	}
+	// Positive counterpart: when those 5 recent issues remain genuinely closed, no velocity_drop alert fires.
+	for i := range velIssues {
+		if strings.HasPrefix(velIssues[i].ID, "REOPEN-") {
+			velIssues[i].Status = model.StatusClosed
+		}
+	}
+	noDropCalc := NewCalculator(&baseline.Baseline{Version: 1}, &baseline.Baseline{Version: 1}, DefaultConfig())
+	noDropCalc.SetNow(now)
+	noDropCalc.SetIssues(velIssues)
+	for _, a := range noDropCalc.Calculate().Alerts {
+		if a.Type == AlertVelocityDrop {
+			t.Fatalf("unexpected AlertVelocityDrop when recent window has 5 genuinely closed issues: %+v", a)
+		}
+	}
+}
+
+func TestCheckCycles_GatedOnMatchesScope(t *testing.T) {
+	// Planted negative control: baseline captured under --label frontend (Cycles: nil)
+	// compared against an unscoped current snapshot containing preexisting backend cycle be-1 <-> be-2
+	// must NOT emit a false CRITICAL AlertNewCycle.
+	blFrontend := &baseline.Baseline{
+		Version: baseline.CurrentVersion,
+		Scope:   &baseline.BaselineScope{Label: "frontend"},
+		Cycles:  nil,
+	}
+	curUnscopedWithCycle := &baseline.Baseline{
+		Version: baseline.CurrentVersion,
+		Scope:   &baseline.BaselineScope{},
+		Stats:   baseline.GraphStats{CycleCount: 1},
+		Cycles:  [][]string{{"be-1", "be-2", "be-1"}},
+	}
+	negRes := NewCalculator(blFrontend, curUnscopedWithCycle, DefaultConfig()).Calculate()
+	for _, a := range negRes.Alerts {
+		if a.Type == AlertNewCycle {
+			t.Fatalf("mismatched scope falsely emitted AlertNewCycle: %+v", a)
+		}
+	}
+
+	// Positive observable: when scopes match, a newly introduced cycle DOES trigger AlertNewCycle (critical).
+	blUnscoped := &baseline.Baseline{
+		Version: baseline.CurrentVersion,
+		Scope:   nil,
+		Cycles:  nil,
+	}
+	posRes := NewCalculator(blUnscoped, curUnscopedWithCycle, DefaultConfig()).Calculate()
+	foundCycle := false
+	for _, a := range posRes.Alerts {
+		if a.Type == AlertNewCycle && a.Severity == SeverityCritical {
+			foundCycle = true
+		}
+	}
+	if !foundCycle {
+		t.Fatalf("expected critical AlertNewCycle when sameScope == true, got %+v", posRes.Alerts)
+	}
+}

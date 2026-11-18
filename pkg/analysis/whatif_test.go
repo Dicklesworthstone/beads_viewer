@@ -888,3 +888,53 @@ func TestEnhancedPriorityBatchRegression(t *testing.T) {
 		t.Fatalf("enhanced batch allocated %.0f objects; want at most 250000", allocs)
 	}
 }
+
+func TestGenerateEnhancedRecommendationsFromStats_WhatIfReuseAndInactiveExclusion(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "ROOT", Title: "Critical root", Status: model.StatusOpen, Priority: 4, CreatedAt: now.Add(-15 * 24 * time.Hour), UpdatedAt: now},
+		{
+			ID: "PARKED-PINNED", Title: "Pinned issue", Status: model.StatusPinned, Priority: 4, CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "WITHHELD-EPH", Title: "Ephemeral issue", Status: model.StatusOpen, Ephemeral: true, Priority: 4, CreatedAt: now, UpdatedAt: now,
+		},
+	}
+	for i := 0; i < 12; i++ {
+		depID := fmt.Sprintf("DEP-%02d", i)
+		issues = append(issues, model.Issue{
+			ID: depID, Title: depID, Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: depID, DependsOnID: "ROOT", Type: model.DepBlocks}},
+		})
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.Analyze()
+
+	// includeInactive=false: positive observable on ROOT WhatIf reuse + cap, negative control excluding parked/ephemeral/blocked dependents.
+	recs := an.GenerateEnhancedRecommendationsFromStats(&stats, DefaultThresholds(), 0, false)
+	byID := make(map[string]EnhancedPriorityRecommendation, len(recs))
+	for _, r := range recs {
+		byID[r.IssueID] = r
+	}
+
+	rootRec, ok := byID["ROOT"]
+	if !ok {
+		t.Fatalf("expected ROOT in enhanced recommendations, got %+v", recs)
+	}
+	wantDelta := an.computeWhatIfDeltaFromStats("ROOT", &stats)
+	if rootRec.WhatIf == nil || !reflect.DeepEqual(rootRec.WhatIf, wantDelta) {
+		t.Fatalf("ROOT WhatIf = %+v, want %+v", rootRec.WhatIf, wantDelta)
+	}
+	if !rootRec.Explanation.Status.Capped || rootRec.Explanation.Status.CappedFields != "unblocked_issue_ids" {
+		t.Fatalf("expected Capped=true on unblocked_issue_ids when DirectUnblocks=12 > 10, got %+v", rootRec.Explanation.Status)
+	}
+
+	// Planted negative controls: StatusPinned, Ephemeral, and dependency-blocked DEP-00 must not appear when includeInactive=false.
+	for _, excluded := range []string{"PARKED-PINNED", "WITHHELD-EPH", "DEP-00"} {
+		if _, present := byID[excluded]; present {
+			t.Fatalf("inactive/withheld issue %q leaked into GenerateEnhancedRecommendationsFromStats(includeInactive=false)", excluded)
+		}
+	}
+}

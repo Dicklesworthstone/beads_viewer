@@ -2987,3 +2987,335 @@ func TestSnapshotBuilder_AppliesFeedbackWeightsFromBeadsPath(t *testing.T) {
 			phase2Default.TriageScores["STALE-P3"], phase2Tuned.TriageScores["STALE-P3"])
 	}
 }
+
+func TestGitHistoricalBeadsPathIsolationAndQuitCancel(t *testing.T) {
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	t.Setenv("BV_BACKGROUND_MODE", "1")
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "FRESH-P0", Title: "Fresh P0", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour)},
+		{ID: "STALE-P3", Title: "Stale P3", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeTask, CreatedAt: now.Add(-40 * 24 * time.Hour), UpdatedAt: now.Add(-40 * 24 * time.Hour)},
+	}
+
+	// Plant feedback.json in BOTH cwd ("./feedback.json", which filepath.Dir("git:HEAD~1")=="." would hit!)
+	// AND cwd/.beads ("./.beads/feedback.json", which projectDir fallback would hit!), plus AGENTS.md in cwd.
+	beadsDir := filepath.Join(cwd, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	liveBeadsPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(liveBeadsPath, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "AGENTS.md"), []byte("# Unmodified AGENTS.md\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	fb := analysis.DefaultFeedbackData()
+	for i := 0; i < analysis.MinFeedbackSamples; i++ {
+		fb.Events = append(fb.Events, analysis.FeedbackEvent{IssueID: "STALE-P3", Action: "accept", Score: 0.7, Timestamp: now})
+	}
+	fb.Adjustments = []analysis.WeightAdjustment{
+		{Name: "Staleness", Adjustment: 4.0, Samples: analysis.MinFeedbackSamples, LastUpdated: now},
+		{Name: "PriorityBoost", Adjustment: 0.2, Samples: analysis.MinFeedbackSamples, LastUpdated: now},
+	}
+	if err := fb.Save(cwd); err != nil {
+		t.Fatalf("save cwd feedback.json: %v", err)
+	}
+	if err := fb.Save(beadsDir); err != nil {
+		t.Fatalf("save .beads/feedback.json: %v", err)
+	}
+
+	// Planted negative control: live beadsPath DOES read .beads/feedback.json and dispatches CheckAgentFileCmd.
+	mLive := NewModel(cloneIssuesForAsync(issues), nil, liveBeadsPath, ReadinessScope{ReferenceNow: now})
+	t.Cleanup(mLive.Stop)
+	if mLive.analyzer.Weights() == analysis.DefaultWeights() {
+		t.Fatal("negative control failed: live beadsPath did not apply planted .beads/feedback.json weights")
+	}
+
+	// Positive observable: "git:HEAD~1" has no watcher/worker/lock, tree read-only, no CWD feedback read, no CheckAgentFileCmd.
+	mGit := NewModel(cloneIssuesForAsync(issues), nil, "git:HEAD~1", ReadinessScope{ReferenceNow: now})
+	t.Cleanup(mGit.Stop)
+	if mGit.watcher != nil || mGit.backgroundWorker != nil || mGit.instanceLock != nil {
+		t.Fatalf("expected git:HEAD~1 to skip watcher/worker/lock, got watcher=%v worker=%v lock=%v",
+			mGit.watcher != nil, mGit.backgroundWorker != nil, mGit.instanceLock != nil)
+	}
+	if !mGit.tree.readOnly || mGit.tree.beadsDir != "" {
+		t.Fatalf("expected git:HEAD~1 tree readOnly=true beadsDir=\"\", got readOnly=%v beadsDir=%q",
+			mGit.tree.readOnly, mGit.tree.beadsDir)
+	}
+	if mGit.analyzer.Weights() != analysis.DefaultWeights() {
+		t.Fatalf("git:HEAD~1 read ambient CWD feedback.json: got weights %+v, want default %+v",
+			mGit.analyzer.Weights(), analysis.DefaultWeights())
+	}
+
+	// SnapshotBuilder + DataSnapshot.WithPhase2 with "git:HEAD~1" also ignore CWD feedback.json.
+	gitBuilder := NewSnapshotBuilder(cloneIssuesForAsync(issues)).WithBeadsPath("git:HEAD~1")
+	gitBuilder.cfg.SkipPhase2 = true
+	gitBuilder.analyzer.SetNow(now)
+	gitSnap := gitBuilder.Build()
+	if gitBuilder.resolvedBeadsDir() != "" || gitSnap.resolvedBeadsDir() != "" {
+		t.Fatalf("expected empty resolvedBeadsDir for git:HEAD~1, got builder=%q snap=%q",
+			gitBuilder.resolvedBeadsDir(), gitSnap.resolvedBeadsDir())
+	}
+	if gitBuilder.analyzer.Weights() != analysis.DefaultWeights() {
+		t.Fatalf("SnapshotBuilder(git:HEAD~1) applied CWD feedback weights: %+v", gitBuilder.analyzer.Weights())
+	}
+	azGit := analysis.NewAnalyzer(cloneIssuesForAsync(issues))
+	azGit.SetNow(now)
+	p2Stats := azGit.AnalyzeAsync(nil)
+	p2Stats.WaitForPhase2()
+	_ = gitSnap.WithPhase2(p2Stats, p2Stats.GenerateInsights(len(issues)), cloneIssuesForAsync(issues), azGit)
+	if azGit.Weights() != analysis.DefaultWeights() {
+		t.Fatalf("DataSnapshot.WithPhase2(git:HEAD~1) applied CWD feedback weights: %+v", azGit.Weights())
+	}
+
+	// Init() must not dispatch AgentFileCheckMsg for "git:HEAD~1".
+	var collectMsgs func(tea.Cmd) []tea.Msg
+	collectMsgs = func(cmd tea.Cmd) []tea.Msg {
+		if cmd == nil {
+			return nil
+		}
+		msg := cmd()
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			var out []tea.Msg
+			for _, sub := range batch {
+				out = append(out, collectMsgs(sub)...)
+			}
+			return out
+		}
+		return []tea.Msg{msg}
+	}
+	for _, msg := range collectMsgs(mGit.Init()) {
+		if _, ok := msg.(AgentFileCheckMsg); ok {
+			t.Fatal("Init() dispatched CheckAgentFileCmd for historical git:HEAD~1 beadsPath")
+		}
+	}
+
+	// Enter + exit time-travel must keep tree read-only for "git:HEAD~1" and write zero tree-state.json files.
+	mGit.timeTravelMode = true
+	mGit.tree.SetReadOnly(true)
+	mGit.exitTimeTravelMode()
+	if !mGit.tree.readOnly {
+		t.Fatal("exitTimeTravelMode cleared tree.readOnly on git:HEAD~1 model")
+	}
+	u, _ := mGit.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("E")})
+	mGit = u.(*Model)
+	u, _ = mGit.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("X")})
+	mGit = u.(*Model)
+	for _, candidateState := range []string{
+		filepath.Join(cwd, "tree-state.json"),
+		filepath.Join(beadsDir, "tree-state.json"),
+	} {
+		if _, err := os.Stat(candidateState); !os.IsNotExist(err) {
+			t.Fatalf("git:HEAD~1 tree wrote %s (stat err=%v)", candidateState, err)
+		}
+	}
+
+	// TriggerSourceReload without sourceReload returns nil on git:HEAD~1, and Ctrl+R reports "Refresh unavailable".
+	if cmd := mGit.TriggerSourceReload(); cmd != nil {
+		t.Fatal("expected nil TriggerSourceReload command on git:HEAD~1 without sourceReload callback")
+	}
+	mGit.lastForceRefresh = time.Time{}
+	uRefresh, _ := mGit.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	mGit = uRefresh.(*Model)
+	if !mGit.statusIsError || mGit.statusMsg != "Refresh unavailable" {
+		t.Fatalf("expected Ctrl+R on git:HEAD~1 to set statusMsg=\"Refresh unavailable\" (statusIsError=true), got msg=%q err=%v",
+			mGit.statusMsg, mGit.statusIsError)
+	}
+
+	// gitRevisionFromBeadsPath strips optional :<repo-rel-path> while preserving revspec @{...} selectors,
+	// and guiEditorPath rejects "git:HEAD~1:.beads/issues.jsonl" despite the .jsonl suffix.
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		{"git:HEAD~1:.beads/issues.jsonl", "HEAD~1"},
+		{"git:HEAD@{2026-01-01}", "HEAD@{2026-01-01}"},
+		{"git:HEAD@{1}", "HEAD@{1}"},
+		{"git:HEAD@{2026-01-01 12:00:00}:.beads/issues.jsonl", "HEAD@{2026-01-01 12:00:00}"},
+	} {
+		if got := gitRevisionFromBeadsPath(tc.in); got != tc.want {
+			t.Fatalf("gitRevisionFromBeadsPath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	mGitQualified := NewModel(cloneIssuesForAsync(issues), nil, "git:HEAD~1:.beads/issues.jsonl", ReadinessScope{ReferenceNow: now})
+	t.Cleanup(mGitQualified.Stop)
+	if mGitQualified.asOfRevision != "HEAD~1" {
+		t.Fatalf("expected asOfRevision=\"HEAD~1\" for git:HEAD~1:.beads/issues.jsonl, got %q", mGitQualified.asOfRevision)
+	}
+	if gotPath, gErr := mGitQualified.guiEditorPath(); gotPath != "" || gErr == nil || !strings.Contains(gErr.Error(), "no live JSONL text source") {
+		t.Fatalf("expected guiEditorPath to reject git:HEAD~1:.beads/issues.jsonl as historical, got path=%q err=%v", gotPath, gErr)
+	}
+
+	// Transitioning a live-watcher model via SourceReloadResult{SourcePath: "git:HEAD~2"} stops watcher,
+	// releases instanceLock, clears stale disk sprints, sets asOfRevision="HEAD~2", and marks tree read-only.
+	sprintsRaw := `{"id":"sp-live","name":"Live Disk Sprint","start_date":"2026-06-01T00:00:00Z","end_date":"2026-06-30T00:00:00Z","bead_ids":["FRESH-P0"]}` + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "sprints.jsonl"), []byte(sprintsRaw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BV_BACKGROUND_MODE", "0")
+	mLiveReload := NewModel(cloneIssuesForAsync(issues), nil, liveBeadsPath, ReadinessScope{ReferenceNow: now})
+	t.Cleanup(mLiveReload.Stop)
+	mLiveReload.reloadSprintsFromDisk(focusList)
+	if mLiveReload.watcher == nil || mLiveReload.tree.readOnly || mLiveReload.instanceLock == nil || len(mLiveReload.sprints) != 1 || mLiveReload.selectedSprint == nil || mLiveReload.sprintViewText == "" {
+		t.Fatalf("precondition: expected live watcher, writable tree, instanceLock, and disk sprint; got watcher=%v readOnly=%v lock=%v sprints=%d selected=%v textLen=%d",
+			mLiveReload.watcher != nil, mLiveReload.tree.readOnly, mLiveReload.instanceLock != nil, len(mLiveReload.sprints), mLiveReload.selectedSprint != nil, len(mLiveReload.sprintViewText))
+	}
+	// Planted negative control for Ctrl+R: live model enters "Refreshing…" (not "Refresh unavailable").
+	mLiveReload.lastForceRefresh = time.Time{}
+	uLiveRefresh, _ := mLiveReload.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	mLiveReload = uLiveRefresh.(*Model)
+	if mLiveReload.statusIsError || mLiveReload.statusMsg != "Refreshing…" {
+		t.Fatalf("negative control failed: expected live Ctrl+R statusMsg=\"Refreshing…\", got msg=%q err=%v",
+			mLiveReload.statusMsg, mLiveReload.statusIsError)
+	}
+	mLiveReload.SetSourceReload(func(context.Context) (SourceReloadResult, error) {
+		return SourceReloadResult{
+			Issues:        cloneIssuesForAsync(issues),
+			SourcePath:    "git:HEAD~2",
+			SprintsLoaded: false,
+		}, nil
+	})
+	reloadCmd := mLiveReload.TriggerSourceReload()
+	if reloadCmd == nil {
+		t.Fatal("expected non-nil sourceReloadCmd")
+	}
+	uLive, _ := mLiveReload.Update(reloadCmd())
+	mLiveReload = uLive.(*Model)
+	if !mLiveReload.tree.readOnly || mLiveReload.tree.beadsDir != "" || mLiveReload.watcher != nil {
+		t.Fatalf("SourceReloadResult->git:HEAD~2 left tree/watcher live: readOnly=%v beadsDir=%q watcher=%v",
+			mLiveReload.tree.readOnly, mLiveReload.tree.beadsDir, mLiveReload.watcher != nil)
+	}
+	if mLiveReload.instanceLock != nil {
+		t.Fatal("SourceReloadResult->git:HEAD~2 did not release/nil instanceLock")
+	}
+	if len(mLiveReload.sprints) != 0 || mLiveReload.selectedSprint != nil || mLiveReload.sprintViewText != "" {
+		t.Fatalf("SourceReloadResult->git:HEAD~2 kept stale disk sprints: sprints=%d selected=%v text=%q",
+			len(mLiveReload.sprints), mLiveReload.selectedSprint, mLiveReload.sprintViewText)
+	}
+	if mLiveReload.asOfRevision != "HEAD~2" {
+		t.Fatalf("SourceReloadResult->git:HEAD~2 asOfRevision = %q, want \"HEAD~2\"", mLiveReload.asOfRevision)
+	}
+
+	// quitCommand cancels ownedAnalysis.
+	if mGit.ownedAnalysis == nil || mGit.analysisCancel == nil {
+		t.Fatalf("precondition: expected ownedAnalysis and analysisCancel on mGit")
+	}
+	_ = mGit.quitCommand()
+	if mGit.ownedAnalysis != nil || mGit.analysisCancel != nil {
+		t.Fatalf("quitCommand did not cancel ownedAnalysis: owned=%v cancel=%v", mGit.ownedAnalysis != nil, mGit.analysisCancel != nil)
+	}
+}
+
+func TestSnapshotBuilderCandidateCountsSkipPhase2AndPinnedSnapshotReadyMsg(t *testing.T) {
+	refNow := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	defer2025 := time.Date(2025, 6, 1, 0, 0, 0, 0, time.UTC) // future at refNow (2025-01), past at wall-clock (2026+)
+
+	// 1. Candidate-filtered counts on SnapshotBuilder.Build:
+	// Non-candidate open blocker EXT-OPEN blocks CAND-DEP (so CAND-DEP is NOT Ready even though EXT-OPEN is outside candidateIDs!).
+	scopedIssues := []model.Issue{
+		{ID: "EXT-OPEN", Title: "External open blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		{ID: "EXT-BLOCKED", Title: "External blocked", Status: model.StatusBlocked, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		{ID: "EXT-CLOSED", Title: "External closed", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		{ID: "CAND-READY", Title: "Candidate ready", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		{
+			ID: "CAND-DEP", Title: "Candidate blocked by external", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow,
+			Dependencies: []*model.Dependency{{IssueID: "CAND-DEP", DependsOnID: "EXT-OPEN", Type: model.DepBlocks}},
+		},
+		{ID: "CAND-BLK-STATUS", Title: "Candidate status blocked", Status: model.StatusBlocked, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		{ID: "CAND-CLOSED", Title: "Candidate closed", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+	}
+	auth := model.NewReadinessIndex(scopedIssues)
+	cands := map[string]bool{
+		"CAND-READY":      true,
+		"CAND-DEP":        true,
+		"CAND-BLK-STATUS": true,
+		"CAND-CLOSED":     true,
+	}
+
+	sbScoped := NewSnapshotBuilder(cloneIssuesForAsync(scopedIssues), auth)
+	sbScoped.cfg.SkipPhase2 = true
+	sbScoped.analyzer.SetNow(refNow)
+	sbScoped.analyzer.SetReadinessScope(auth, cands)
+	snapScoped := sbScoped.Build()
+	// Candidates: 3 open (CAND-READY, CAND-DEP, CAND-BLK-STATUS), 1 ready (CAND-READY; CAND-DEP is blocked by EXT-OPEN and CAND-BLK-STATUS is blocked), 1 status-blocked, 1 closed.
+	if snapScoped.CountOpen != 3 || snapScoped.CountReady != 1 || snapScoped.CountBlocked != 1 || snapScoped.CountClosed != 1 {
+		t.Fatalf("scoped SnapshotBuilder counts = (open=%d ready=%d blocked=%d closed=%d), want (3, 1, 1, 1)",
+			snapScoped.CountOpen, snapScoped.CountReady, snapScoped.CountBlocked, snapScoped.CountClosed)
+	}
+
+	// Planted negative control: unscoped SnapshotBuilder includes EXT-* issues in counts (open=5, ready=2, blocked=2, closed=2).
+	sbUnscoped := NewSnapshotBuilder(cloneIssuesForAsync(scopedIssues), auth)
+	sbUnscoped.cfg.SkipPhase2 = true
+	sbUnscoped.analyzer.SetNow(refNow)
+	snapUnscoped := sbUnscoped.Build()
+	if snapUnscoped.CountOpen != 5 || snapUnscoped.CountReady != 2 || snapUnscoped.CountBlocked != 2 || snapUnscoped.CountClosed != 2 {
+		t.Fatalf("unscoped SnapshotBuilder counts = (open=%d ready=%d blocked=%d closed=%d), want (5, 2, 2, 2)",
+			snapUnscoped.CountOpen, snapUnscoped.CountReady, snapUnscoped.CountBlocked, snapUnscoped.CountClosed)
+	}
+
+	// 2. SkipPhase2 disables KCore, Articulation, and Slack (vs full build positive control where B is an articulation point).
+	chain := []model.Issue{
+		{ID: "A", Title: "Root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{ID: "B", Title: "Bridge", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "C", Title: "Leaf", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Dependencies: []*model.Dependency{{IssueID: "C", DependsOnID: "B", Type: model.DepBlocks}}},
+	}
+	skipCfg := snapshotBuildConfigDefault()
+	skipCfg.SkipPhase2 = true
+	snapSkip := NewSnapshotBuilder(cloneIssuesForAsync(chain)).WithBuildConfig(skipCfg).Build()
+	snapSkip.Analysis.WaitForPhase2()
+	if len(snapSkip.Analysis.CoreNumber()) != 0 || len(snapSkip.Analysis.ArticulationPoints()) != 0 || len(snapSkip.Analysis.Slack()) != 0 {
+		t.Fatalf("SkipPhase2 computed KCore/Articulation/Slack: kcore=%v art=%v slack=%v",
+			snapSkip.Analysis.CoreNumber(), snapSkip.Analysis.ArticulationPoints(), snapSkip.Analysis.Slack())
+	}
+
+	// Planted control: full build computes non-empty KCore, ArticulationPoints (containing B), and Slack.
+	snapFull := NewSnapshotBuilder(cloneIssuesForAsync(chain)).Build()
+	snapFull.Analysis.WaitForPhase2()
+	if len(snapFull.Analysis.CoreNumber()) == 0 || len(snapFull.Analysis.ArticulationPoints()) == 0 || len(snapFull.Analysis.Slack()) == 0 {
+		t.Fatalf("full build failed to populate KCore/Articulation/Slack: kcore=%v art=%v slack=%v",
+			snapFull.Analysis.CoreNumber(), snapFull.Analysis.ArticulationPoints(), snapFull.Analysis.Slack())
+	}
+
+	// 3. SnapshotReadyMsg with non-zero Model.referenceNow bypasses fastDefaultView so list items & ready counts use referenceNow.
+	deferredAt2025 := []model.Issue{
+		{
+			ID: "DEF-2025", Title: "Deferred in early 2025", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			DeferUntil: &defer2025, CreatedAt: refNow.Add(-6 * time.Hour), UpdatedAt: refNow.Add(-time.Hour),
+		},
+	}
+	// Build snapshot at wall-clock time (2026+), where defer2025 is in the past and staleness is saturated at 30+ days.
+	wallBuilder := NewSnapshotBuilder(cloneIssuesForAsync(deferredAt2025))
+	wallBuilder.cfg.SkipPhase2 = true
+	wallSnap := wallBuilder.Build()
+	wallSnapScore := wallSnap.TriageScores["DEF-2025"]
+	if wallSnapScore <= 0 || wallSnap.CountReady != 1 {
+		t.Fatalf("precondition: expected wall-clock snapshot TriageScore > 0 and CountReady == 1, got score=%f ready=%d",
+			wallSnapScore, wallSnap.CountReady)
+	}
+
+	mPinned := NewModel(cloneIssuesForAsync(deferredAt2025), nil, "", ReadinessScope{ReferenceNow: refNow})
+	t.Cleanup(mPinned.Stop)
+	uPinned, _ := mPinned.Update(SnapshotReadyMsg{Snapshot: wallSnap})
+	mPinned = uPinned.(*Model)
+	pinnedItem := mPinned.list.Items()[0].(IssueItem)
+	if mPinned.countReady != 0 || pinnedItem.TriageScore >= wallSnapScore {
+		t.Fatalf("expected non-zero ReferenceNow to bypass fastDefaultView (countReady=0, score < wallSnap %f), got ready=%d score=%f",
+			wallSnapScore, mPinned.countReady, pinnedItem.TriageScore)
+	}
+
+	// Planted negative control: wall-clock Model (zero ReferenceNow) takes fastDefaultView and retains wallSnap's exact TriageScore & CountReady.
+	mWall := NewModel(cloneIssuesForAsync(deferredAt2025), nil, "")
+	t.Cleanup(mWall.Stop)
+	uWall, _ := mWall.Update(SnapshotReadyMsg{Snapshot: wallSnap})
+	mWall = uWall.(*Model)
+	wallItem := mWall.list.Items()[0].(IssueItem)
+	if mWall.countReady != 1 || wallItem.TriageScore != wallSnapScore {
+		t.Fatalf("negative control failed: zero ReferenceNow model did not take fastDefaultView (ready=%d score=%f want=%f)",
+			mWall.countReady, wallItem.TriageScore, wallSnapScore)
+	}
+}

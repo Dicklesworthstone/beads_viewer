@@ -448,10 +448,12 @@ func (e *SQLiteExporter) activeBetweennessMap() map[string]float64 {
 	}
 	hasClosed := false
 	activeByID := make(map[string]model.Issue, len(e.Issues))
+	modelIssues := make([]model.Issue, 0, len(e.Issues))
 	for _, issue := range e.Issues {
 		if issue == nil {
 			continue
 		}
+		modelIssues = append(modelIssues, *issue)
 		if issue.Status.IsClosed() || issue.Status.IsTombstone() {
 			hasClosed = true
 			continue
@@ -465,6 +467,9 @@ func (e *SQLiteExporter) activeBetweennessMap() map[string]float64 {
 	}
 	if len(activeByID) == 0 {
 		return nil
+	}
+	if canReusePrepopulatedActiveStats(e.Stats, modelIssues, e.Deps, true, false, false) {
+		return e.Stats.ActiveBetweenness()
 	}
 	seenEdges := make(map[[2]string]bool)
 	activeEdges := 0
@@ -1608,12 +1613,15 @@ func (e *SQLiteExporter) writeGraphLayout(bundle *Bundle, dataDir string) error 
 		}
 	}
 
+	activeBetweenness := e.activeBetweennessMap()
 	metrics := make(map[string][5]float64)
 	for _, issue := range e.Issues {
 		var pr, bt float64
 		if e.Stats != nil {
 			pr = e.Stats.GetPageRankScore(issue.ID)
-			bt = e.Stats.GetBetweennessScore(issue.ID)
+			if !issue.Status.IsClosed() && !issue.Status.IsTombstone() {
+				bt = activeBetweenness[issue.ID]
+			}
 		}
 		inCycle := 0.0
 		if cycleNodes[issue.ID] {

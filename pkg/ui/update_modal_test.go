@@ -902,3 +902,56 @@ func TestUpdateModalCtrlCContextHelpAndRollbackState(t *testing.T) {
 		t.Fatal("expected non-nil quitCmd on Ctrl+C while UpdateModal is open")
 	}
 }
+
+func TestUpdateModal_ByteProgressTickRenderAndRetryReset(t *testing.T) {
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+	m := NewUpdateModal("v2.1.0", "", theme)
+	m.SetSize(80, 24)
+
+	// Start update via 'y': initializes fresh tracker and resets progress.
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	if m.state != UpdateStateDownloading || m.phaseTracker == nil {
+		t.Fatalf("expected UpdateStateDownloading with phaseTracker, got state=%s tracker=%v", m.state, m.phaseTracker)
+	}
+
+	// Report chunked byte progress on tracker (e.g. 256 / 1024 -> 25%).
+	m.phaseTracker.ReportBytes(256, 1024)
+
+	// Planted negative control: a stale updateTickMsg from a prior run is ignored and does NOT copy tracker bytes or schedule a tick.
+	staleStart := m.startTime.Add(-2 * time.Second)
+	mStale, staleCmd := m.Update(updateTickMsg{startedAt: staleStart})
+	if staleCmd != nil || mStale.progress.BytesDownloaded != 0 || mStale.progress.TotalBytes != 0 {
+		t.Fatalf("stale updateTickMsg mutated progress or scheduled tick: cmd=%v progress=%+v", staleCmd != nil, mStale.progress)
+	}
+
+	// Positive observable: matching updateTickMsg snapshots (downloaded, total) and renders percentage in View().
+	m, tickCmd := m.Update(updateTickMsg{startedAt: m.startTime})
+	if tickCmd == nil {
+		t.Fatal("expected matching updateTickMsg to schedule next tick while downloading")
+	}
+	if m.progress.BytesDownloaded != 256 || m.progress.TotalBytes != 1024 {
+		t.Fatalf("progress = %+v, want 256/1024", m.progress)
+	}
+	view25 := ansi.Strip(m.View())
+	if !strings.Contains(view25, "25%") {
+		t.Fatalf("expected 25%% progress bar in Downloading view:\n%s", view25)
+	}
+
+	// Advance to 768 / 1024 (75%) and verify monotonic update.
+	m.phaseTracker.ReportBytes(768, 1024)
+	m, _ = m.Update(updateTickMsg{startedAt: m.startTime})
+	if view75 := ansi.Strip(m.View()); !strings.Contains(view75, "75%") {
+		t.Fatalf("expected 75%% progress bar after chunk advance:\n%s", view75)
+	}
+
+	// Verify startUpdate() resets stale byte counts if restarted after an error.
+	m, _ = m.Update(UpdateCompleteMsg{Success: false, Message: "network glitch"})
+	m.state = UpdateStateConfirm
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	if m.progress.BytesDownloaded != 0 || m.progress.TotalBytes != 0 || m.progress.Stage != "downloading" {
+		t.Fatalf("startUpdate did not clear stale byte counts on retry: %+v", m.progress)
+	}
+	if retryView := ansi.Strip(m.View()); strings.Contains(retryView, "75%") {
+		t.Fatalf("retry view flashed stale 75%% byte count before first tick:\n%s", retryView)
+	}
+}

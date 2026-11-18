@@ -690,6 +690,7 @@ func openLabelPickerWithLabels(t *testing.T, labels ...string) *Model {
 		})
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	updated, _ := m.Update(keyMsg("l"))
 	m = updated.(*Model)
 	if m.focused != focusLabelPicker || !m.showLabelPicker {
@@ -945,6 +946,7 @@ func TestKeyDispatch_ModalConsumesAllKeys(t *testing.T) {
 			{ID: "LH-1", Title: "Labeled issue", Status: model.StatusOpen, Priority: 1, Labels: []string{"backend"}, CreatedAt: now, UpdatedAt: now},
 		}
 		m := NewModel(issues, nil, "")
+		t.Cleanup(func() { m.Stop() })
 		updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
 		m = updated.(*Model)
 
@@ -1747,4 +1749,66 @@ func TestFocusKeyStateMachine(t *testing.T) {
 			}
 		})
 	})
+}
+
+func TestHistoryCtrlDCtrlUDocumentedAndShortcutsSidebarScrollReset(t *testing.T) {
+	m := NewModel(nil, nil, "")
+	t.Cleanup(m.Stop)
+	reg := m.keyRegistry
+	historyBindings := reg.AllBindingsForFocus(focusHistory)
+	foundCtrlD, foundCtrlU := false, false
+	for _, kb := range historyBindings {
+		if kb.Key == "ctrl+d" {
+			foundCtrlD = true
+		}
+		if kb.Key == "ctrl+u" {
+			foundCtrlU = true
+		}
+	}
+	if !foundCtrlD || !foundCtrlU {
+		t.Fatalf("expected ctrl+d and ctrl+u documented for focusHistory: ctrl+d=%v ctrl+u=%v", foundCtrlD, foundCtrlU)
+	}
+	// Planted negative control: focusQuitConfirm does not advertise ctrl+d / ctrl+u paging.
+	for _, kb := range reg.AllBindingsForFocus(focusQuitConfirm) {
+		if kb.Key == "ctrl+d" || kb.Key == "ctrl+u" {
+			t.Fatalf("unexpected paging binding %q on focusQuitConfirm", kb.Key)
+		}
+	}
+
+	// ShortcutsSidebar scroll reset on SetFocus and SetContext changes (and preservation on no-op repeat).
+	sidebar := NewShortcutsSidebar(newTestTheme())
+	sidebar.SetKeyRegistry(reg)
+	sidebar.SetSize(34, 18)
+
+	sidebar.SetFocus(focusList)
+	sidebar.ScrollDown()
+	sidebar.ScrollDown()
+	if sidebar.scrollOffset != 2 {
+		t.Fatalf("precondition scrollOffset = %d, want 2", sidebar.scrollOffset)
+	}
+	// Negative control: calling SetFocus with the SAME focus preserves scrollOffset.
+	sidebar.SetFocus(focusList)
+	if sidebar.scrollOffset != 2 {
+		t.Fatalf("same-focus SetFocus reset scrollOffset to %d, want 2", sidebar.scrollOffset)
+	}
+	// Positive: switching focus resets scrollOffset to 0 and updates context.
+	sidebar.SetFocus(focusHistory)
+	if sidebar.scrollOffset != 0 || sidebar.context != "history" {
+		t.Fatalf("SetFocus(focusHistory): scrollOffset=%d context=%q, want 0/history", sidebar.scrollOffset, sidebar.context)
+	}
+	if view := sidebar.View(); !strings.Contains(view, "ctrl+d") || !strings.Contains(view, "ctrl+u") {
+		t.Fatalf("history ShortcutsSidebar missing ctrl+d/ctrl+u:\n%s", view)
+	}
+
+	// SetContext scroll reset: same context preserves scrollOffset (negative), changed context resets to 0 (positive).
+	sidebar.ScrollDown()
+	sidebar.ScrollDown()
+	sidebar.SetContext("history")
+	if sidebar.scrollOffset != 2 {
+		t.Fatalf("same-context SetContext reset scrollOffset to %d, want 2", sidebar.scrollOffset)
+	}
+	sidebar.SetContext("board")
+	if sidebar.scrollOffset != 0 || sidebar.context != "board" {
+		t.Fatalf("SetContext(\"board\"): scrollOffset=%d context=%q, want 0/board", sidebar.scrollOffset, sidebar.context)
+	}
 }

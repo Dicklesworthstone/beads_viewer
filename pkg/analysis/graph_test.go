@@ -2,6 +2,7 @@ package analysis_test
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -1108,4 +1109,130 @@ func TestGetBlockerChain(t *testing.T) {
 			t.Fatalf("Expected synthetic missing RootBlocker for EXT-MISSING, got %+v", result.RootBlockers)
 		}
 	})
+}
+
+func TestActiveSubgraphMetrics_SyncAnalyzeAnalyzeWithConfigAndCachedAnalyzer(t *testing.T) {
+	// Pure-open oracle: OPEN-LEAF -> OPEN-BRIDGE -> OPEN-ROOT.
+	// On the 3-node open chain, OPEN-BRIDGE has positive betweenness (1.0), is the sole
+	// articulation point, and every open node has k-core == 1.
+	openOnly := []model.Issue{
+		{ID: "OPEN-ROOT", Title: "Open root", Status: model.StatusOpen},
+		{
+			ID: "OPEN-BRIDGE", Title: "Open bridge", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "OPEN-BRIDGE", DependsOnID: "OPEN-ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "OPEN-LEAF", Title: "Open leaf", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "OPEN-LEAF", DependsOnID: "OPEN-BRIDGE", Type: model.DepBlocks}},
+		},
+	}
+
+	pureStats := analysis.NewAnalyzer(openOnly).Analyze()
+	if !reflect.DeepEqual(pureStats.ActiveBetweenness(), pureStats.Betweenness()) {
+		t.Fatalf("pure-open ActiveBetweenness != Betweenness: %v vs %v", pureStats.ActiveBetweenness(), pureStats.Betweenness())
+	}
+	if !reflect.DeepEqual(pureStats.ActiveCoreNumber(), pureStats.CoreNumber()) {
+		t.Fatalf("pure-open ActiveCoreNumber != CoreNumber: %v vs %v", pureStats.ActiveCoreNumber(), pureStats.CoreNumber())
+	}
+	if !reflect.DeepEqual(pureStats.ActiveArticulationPoints(), pureStats.ArticulationPoints()) {
+		t.Fatalf("pure-open ActiveArticulationPoints != ArticulationPoints: %v vs %v", pureStats.ActiveArticulationPoints(), pureStats.ArticulationPoints())
+	}
+
+	// Mixed graph: attach a closed K4 clique + closed bridge/pendant so in the full graph:
+	// - CLOSED-HUB has k-core >= 3, positive betweenness, and is a full-graph articulation point (to CLOSED-PENDANT),
+	// - CLOSED-HUB connects OPEN-LEAF directly to OPEN-ROOT, which in the full graph inflates k-core of OPEN-ROOT/OPEN-LEAF/OPEN-BRIDGE to 2
+	//   and destroys OPEN-BRIDGE's articulation point!
+	mixed := append([]model.Issue(nil), openOnly...)
+	mixed = append(mixed,
+		model.Issue{
+			ID: "CLOSED-HUB", Title: "Closed hub", Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CLOSED-HUB", DependsOnID: "OPEN-ROOT", Type: model.DepBlocks},
+				{IssueID: "CLOSED-HUB", DependsOnID: "CLOSED-C1", Type: model.DepBlocks},
+				{IssueID: "CLOSED-HUB", DependsOnID: "CLOSED-C2", Type: model.DepBlocks},
+				{IssueID: "CLOSED-HUB", DependsOnID: "CLOSED-C3", Type: model.DepBlocks},
+			},
+		},
+		model.Issue{
+			ID: "CLOSED-C1", Title: "Closed clique 1", Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CLOSED-C1", DependsOnID: "CLOSED-C2", Type: model.DepBlocks},
+				{IssueID: "CLOSED-C1", DependsOnID: "CLOSED-C3", Type: model.DepBlocks},
+			},
+		},
+		model.Issue{
+			ID: "CLOSED-C2", Title: "Closed clique 2", Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CLOSED-C2", DependsOnID: "CLOSED-C3", Type: model.DepBlocks},
+			},
+		},
+		model.Issue{ID: "CLOSED-C3", Title: "Closed clique 3", Status: model.StatusClosed},
+		model.Issue{
+			ID: "CLOSED-PENDANT", Title: "Closed pendant", Status: model.StatusClosed,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CLOSED-PENDANT", DependsOnID: "CLOSED-HUB", Type: model.DepBlocks},
+			},
+		},
+	)
+	// Also add edge OPEN-LEAF -> CLOSED-HUB so full-graph has cycle/bypass around OPEN-BRIDGE.
+	mixed[2].Dependencies = append([]*model.Dependency(nil), mixed[2].Dependencies...)
+	mixed[2].Dependencies = append(mixed[2].Dependencies, &model.Dependency{
+		IssueID: "OPEN-LEAF", DependsOnID: "CLOSED-HUB", Type: model.DepBlocks,
+	})
+
+	an := analysis.NewAnalyzer(mixed)
+	cache := analysis.NewCache(5 * time.Minute)
+	ca := analysis.NewCachedAnalyzer(mixed, cache)
+
+	checkStats := func(label string, s *analysis.GraphStats) {
+		t.Helper()
+		// Planted negative control: verify full-graph metrics DO contain CLOSED-HUB contamination,
+		// while Active* metrics completely exclude CLOSED-HUB and match the pure-open oracle!
+		if s.CoreNumber()["CLOSED-HUB"] < 3 {
+			t.Fatalf("%s: expected full-graph CoreNumber[CLOSED-HUB] >= 3, got %d", label, s.CoreNumber()["CLOSED-HUB"])
+		}
+		if _, leaked := s.ActiveBetweenness()["CLOSED-HUB"]; leaked {
+			t.Fatalf("%s: CLOSED-HUB leaked into ActiveBetweenness: %v", label, s.ActiveBetweenness())
+		}
+		if _, leaked := s.ActiveCoreNumber()["CLOSED-HUB"]; leaked {
+			t.Fatalf("%s: CLOSED-HUB leaked into ActiveCoreNumber: %v", label, s.ActiveCoreNumber())
+		}
+		for _, ap := range s.ActiveArticulationPoints() {
+			if ap == "CLOSED-HUB" {
+				t.Fatalf("%s: CLOSED-HUB leaked into ActiveArticulationPoints: %v", label, s.ActiveArticulationPoints())
+			}
+		}
+
+		// Positive observable: Active* metrics on synchronous value-returned GraphStats match pure-open oracle.
+		gotBW := s.ActiveBetweenness()
+		wantBW := pureStats.ActiveBetweenness()
+		if len(gotBW) != len(openOnly) {
+			t.Fatalf("%s: ActiveBetweenness len=%d (%v), want %d open nodes", label, len(gotBW), gotBW, len(openOnly))
+		}
+		for _, openIss := range openOnly {
+			if gotBW[openIss.ID] != wantBW[openIss.ID] {
+				t.Fatalf("%s: ActiveBetweenness[%s] = %v, want %v", label, openIss.ID, gotBW[openIss.ID], wantBW[openIss.ID])
+			}
+		}
+		if gotBW["OPEN-BRIDGE"] <= 0 {
+			t.Fatalf("%s: expected positive ActiveBetweenness[OPEN-BRIDGE], got %v", label, gotBW["OPEN-BRIDGE"])
+		}
+		if !reflect.DeepEqual(s.ActiveCoreNumber(), pureStats.ActiveCoreNumber()) {
+			t.Fatalf("%s: ActiveCoreNumber = %v, want pure-open %v", label, s.ActiveCoreNumber(), pureStats.ActiveCoreNumber())
+		}
+		if !reflect.DeepEqual(s.ActiveArticulationPoints(), pureStats.ActiveArticulationPoints()) {
+			t.Fatalf("%s: ActiveArticulationPoints = %v, want pure-open %v", label, s.ActiveArticulationPoints(), pureStats.ActiveArticulationPoints())
+		}
+	}
+
+	s1 := an.Analyze()
+	checkStats("Analyzer.Analyze", &s1)
+	cfg := analysis.FullAnalysisConfig()
+	cfg.DisableCache = true
+	s2 := an.AnalyzeWithConfig(cfg)
+	checkStats("Analyzer.AnalyzeWithConfig", &s2)
+	s3 := ca.Analyze()
+	checkStats("CachedAnalyzer.Analyze(cold)", &s3)
+	s4 := ca.Analyze()
+	checkStats("CachedAnalyzer.Analyze(warm)", &s4)
 }

@@ -2,8 +2,10 @@ package ui
 
 import (
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -17,6 +19,9 @@ type FlowMatrixModel struct {
 	flow         *analysis.CrossLabelFlow
 	cascade      analysis.BlockageCascadeAnalysis
 	issues       []model.Issue
+	referenceNow time.Time
+	readiness    *model.ReadinessIndex
+	candidateIDs map[string]bool
 	labelStats   []labelFlowStats
 	cursor       int
 	scrollOffset int
@@ -51,6 +56,14 @@ func NewFlowMatrixModel(theme Theme) FlowMatrixModel {
 		theme:      theme,
 		focusPanel: 0,
 	}
+}
+
+// SetScope configures the reference clock, readiness authority, and candidate selection
+// used when computing blockage cascades.
+func (m *FlowMatrixModel) SetScope(referenceNow time.Time, readiness *model.ReadinessIndex, candidateIDs map[string]bool) {
+	m.referenceNow = referenceNow
+	m.readiness = readiness
+	m.candidateIDs = maps.Clone(candidateIDs)
 }
 
 // SetData refreshes flow data while preserving a surviving label and endpoint.
@@ -189,7 +202,7 @@ func (m *FlowMatrixModel) computeStats() {
 	})
 
 	m.labelStats = stats
-	m.cascade = analysis.ComputeBlockageCascade(m.issues, *m.flow, analysis.DefaultLabelHealthConfig())
+	m.cascade = analysis.ComputeBlockageCascadeAtWithScope(m.issues, *m.flow, analysis.DefaultLabelHealthConfig(), m.referenceNow, m.readiness, m.candidateIDs)
 }
 
 // Update handles keyboard input

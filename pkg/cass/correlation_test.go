@@ -1177,3 +1177,267 @@ func TestMentionsAnyIssueID_StrictTokenBoundariesAndJSONLOnlySubRepo(t *testing.
 		t.Fatalf("false-prefix session (bv-100) falsely promoted to ID mention: %+v", res.TopSessions[1])
 	}
 }
+
+func TestSearchByIDInWorkspace_RejectsSeparatorSplitsAndDecrementsTotalFound(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+
+	detector := NewDetector()
+	detector.lookPath = func(string) (string, error) { return "/usr/bin/cass", nil }
+	detector.runCommand = func(context.Context, string, ...string) (int, error) { return 0, nil }
+	_ = detector.Check()
+
+	// 1. Verify searchByIDInWorkspace rejects all false-positive token/separator forms of "bv-1"
+	// and decrements Meta.Total to 0, while accepting exact "bv-1" and unsplit truncated snippets.
+	falseSnippets := []string{
+		"working on bv-10",
+		"child task bv-1.2",
+		"other repo api-bv-1",
+		"snake_case bv_1",
+		"dotted bv.1",
+		"spaced bv 1",
+		"slashed bv/1",
+		"punctuated bv, 1",
+		"colon bv: 1",
+	}
+	for _, snippet := range falseSnippets {
+		searcher := NewSearcher(detector)
+		searcher.runCommand = func(context.Context, string, ...string) ([]byte, error) {
+			return []byte(fmt.Sprintf(`{
+				"hits": [{"source_path": "/s/neg.jsonl", "line_number": 1, "agent": "codex", "title": "Misc", "score": 10.0, "content": %q, "created_at": %d, "workspace": "/work/proj"}],
+				"total_matches": 1
+			}`, snippet, now.UnixMilli())), nil
+		}
+		correlator := NewCorrelator(searcher, nil, "/work/proj")
+		correlator.now = func() time.Time { return now }
+		got, meta := correlator.searchByIDInWorkspace(context.Background(), "bv-1", "/work/proj")
+		if len(got) != 0 || meta.Total != 0 {
+			t.Fatalf("false positive snippet %q was not rejected/decremented: len=%d meta.Total=%d", snippet, len(got), meta.Total)
+		}
+	}
+
+	// Positive observable: exact "bv-1" is accepted and preserves producer total_matches.
+	posSearcher := NewSearcher(detector)
+	posSearcher.runCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte(fmt.Sprintf(`{
+			"hits": [
+				{"source_path": "/s/pos.jsonl", "line_number": 1, "agent": "codex", "title": "Fix", "score": 10.0, "content": "resolved bv-1 cleanly", "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/sep.jsonl", "line_number": 2, "agent": "codex", "title": "Noise", "score": 8.0, "content": "bv_1 and bv.1 and bv 1", "created_at": %d, "workspace": "/work/proj"}
+			],
+			"total_matches": 5
+		}`, now.UnixMilli(), now.UnixMilli())), nil
+	}
+	posCorr := NewCorrelator(posSearcher, nil, "/work/proj")
+	posCorr.now = func() time.Time { return now }
+	posHits, posMeta := posCorr.searchByIDInWorkspace(context.Background(), "bv-1", "/work/proj")
+	if len(posHits) != 1 || posHits[0].SourcePath != "/s/pos.jsonl" || posMeta.Total != 4 {
+		t.Fatalf("expected 1 accepted hit and Meta.Total=4 (5 - 1 rejected), got hits=%+v meta=%+v", posHits, posMeta)
+	}
+
+	// 2. Verify TotalFound decrements on < MinScoreThreshold hits in keyword search (Strategy 2)
+	// and Strategy 3 ('*') timestamp search (rejecting >7d same-workspace without ID, accepting <=6d or LocalID mention,
+	// and triggering Strategy 3 even when only UpdatedAt is set!).
+	kwSearcher := NewSearcher(detector)
+	kwSearcher.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[1] == `"bv-kw"` {
+			return []byte(`{"hits": [], "total_matches": 0}`), nil
+		}
+		// Keyword search: 1 strong hit + 1 old cross-workspace zero-keyword hit (< MinScoreThreshold=30).
+		return []byte(fmt.Sprintf(`{
+			"hits": [
+				{"source_path": "/s/kw-good.jsonl", "line_number": 1, "title": "Database migration", "content": "database migration schema", "score": 10.0, "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/kw-weak.jsonl", "line_number": 2, "title": "Unrelated", "content": "nothing matching", "score": 1.0, "created_at": %d, "workspace": "/elsewhere"}
+			],
+			"total_matches": 6
+		}`, now.Add(-time.Hour).UnixMilli(), now.Add(-60*24*time.Hour).UnixMilli())), nil
+	}
+	kwCorr := NewCorrelator(kwSearcher, nil, "/work/proj")
+	kwCorr.now = func() time.Time { return now }
+	kwRes := kwCorr.Correlate(context.Background(), &model.Issue{
+		ID:        "bv-kw",
+		Title:     "Database migration schema",
+		CreatedAt: now.Add(-2 * time.Hour),
+	})
+	if kwRes.Strategy != StrategyKeywords || len(kwRes.TopSessions) != 1 || kwRes.TotalFound != 5 {
+		t.Fatalf("keyword TotalFound decrement failed: Strategy=%q len=%d TotalFound=%d (want 5)", kwRes.Strategy, len(kwRes.TopSessions), kwRes.TotalFound)
+	}
+
+	// Strategy 3 ('*'): issue has short/stopword-only title ("To do") so ExtractKeywords is empty,
+	// CreatedAt is zero, ClosedAt is nil, and ONLY UpdatedAt is non-zero!
+	tsSearcher := NewSearcher(detector)
+	tsSearcher.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[1] != "*" {
+			return []byte(`{"hits": [], "total_matches": 0}`), nil
+		}
+		return []byte(fmt.Sprintf(`{
+			"hits": [
+				{"source_path": "/s/stale-9d.jsonl", "line_number": 1, "title": "Old chat", "content": "general notes", "score": 5.0, "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/recent-6d.jsonl", "line_number": 2, "title": "Recent chat", "content": "general notes", "score": 5.0, "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/old-localid.jsonl", "line_number": 3, "title": "Old ID chat", "content": "investigated loc-7 here", "score": 5.0, "created_at": %d, "workspace": "/work/proj"}
+			],
+			"total_matches": 4
+		}`,
+			now.Add(-9*24*time.Hour).UnixMilli(),
+			now.Add(-6*24*time.Hour).UnixMilli(),
+			now.Add(-12*24*time.Hour).UnixMilli(),
+		)), nil
+	}
+	tsCorr := NewCorrelator(tsSearcher, nil, "/work/proj")
+	tsCorr.now = func() time.Time { return now }
+	tsRes := tsCorr.Correlate(context.Background(), &model.Issue{
+		ID:        "proj-loc-7",
+		Title:     "To do", // Zero extracted keywords -> falls through to Strategy 3 '*'
+		UpdatedAt: now,     // Zero CreatedAt & nil ClosedAt -> exercises !issue.UpdatedAt.IsZero() guard!
+		Origin: &model.IssueOrigin{
+			LocalID:          "loc-7",
+			WorkingDirectory: "/work/proj",
+		},
+	})
+	if tsRes.Strategy != StrategyTimestamp {
+		t.Fatalf("expected StrategyTimestamp via UpdatedAt guard, got %+v", tsRes)
+	}
+	if len(tsRes.TopSessions) != 2 || tsRes.TotalFound != 2 {
+		t.Fatalf("Strategy 3 sessions=%+v TotalFound=%d, want 2 sessions (<=6d + LocalID mention) and TotalFound=2 (== len(TopSessions))",
+			tsRes.TopSessions, tsRes.TotalFound)
+	}
+	for _, sr := range tsRes.TopSessions {
+		if sr.SourcePath == "/s/stale-9d.jsonl" {
+			t.Fatalf("negative control failed: >7d session without ID mention leaked into Strategy 3: %+v", sr)
+		}
+	}
+}
+
+func TestCorrelator_EmbeddedSubtokensRetainedWildcardTotalAndTrackerDirectoryWorkspace(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	detector := NewDetector()
+	detector.lookPath = func(string) (string, error) { return "/usr/bin/cass", nil }
+	detector.runCommand = func(context.Context, string, ...string) (int, error) { return 0, nil }
+	_ = detector.Check()
+
+	// [A-2] Positive observable: issue.ID = "ui-1" with Title = "Fix build in 12ms", Snippet = "...truncated..."
+	// ("ui" embedded inside "build" and "1" embedded inside "12ms") MUST be retained as a valid Strategy 1 hit!
+	embSearcher := NewSearcher(detector)
+	embSearcher.runCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte(fmt.Sprintf(`{
+			"hits": [{"source_path": "/s/ui1-truncated.jsonl", "line_number": 9, "agent": "claude", "title": "Fix build in 12ms", "score": 15.0, "content": "...truncated...", "created_at": %d, "workspace": "/work/proj"}],
+			"total_matches": 1
+		}`, now.UnixMilli())), nil
+	}
+	embCorr := NewCorrelator(embSearcher, nil, "/work/proj")
+	embCorr.now = func() time.Time { return now }
+	embHits, embMeta := embCorr.searchByIDInWorkspace(context.Background(), "ui-1", "/work/proj")
+	if len(embHits) != 1 || embMeta.Total != 1 {
+		t.Fatalf("[A-2] positive failed: embedded 'ui' in 'build' + '1' in '12ms' falsely rejected: hits=%+v meta=%+v", embHits, embMeta)
+	}
+	// [R2-A2] Positive observable: standalone tokens separated by an intervening alphanumeric word ("Fix UI step 1") must NOT be rejected!
+	stepSearcher := NewSearcher(detector)
+	stepSearcher.runCommand = func(context.Context, string, ...string) ([]byte, error) {
+		return []byte(fmt.Sprintf(`{
+			"hits": [{"source_path": "/s/ui1-step.jsonl", "line_number": 9, "agent": "claude", "title": "Fix UI step 1", "score": 15.0, "content": "...truncated...", "created_at": %d, "workspace": "/work/proj"}],
+			"total_matches": 1
+		}`, now.UnixMilli())), nil
+	}
+	stepCorr := NewCorrelator(stepSearcher, nil, "/work/proj")
+	stepCorr.now = func() time.Time { return now }
+	stepHits, stepMeta := stepCorr.searchByIDInWorkspace(context.Background(), "ui-1", "/work/proj")
+	if len(stepHits) != 1 || stepMeta.Total != 1 {
+		t.Fatalf("[R2-A2] positive failed: intervening-word title 'Fix UI step 1' falsely rejected: hits=%+v meta=%+v", stepHits, stepMeta)
+	}
+
+	// [A-2] Planted negative controls: separator-split "ui_1", "ui.1", "ui 1" without "ui-1" MUST be rejected!
+	for _, sepSnippet := range []string{"touched ui_1", "touched ui.1", "touched ui 1"} {
+		negSearcher := NewSearcher(detector)
+		negSearcher.runCommand = func(context.Context, string, ...string) ([]byte, error) {
+			return []byte(fmt.Sprintf(`{
+				"hits": [{"source_path": "/s/ui1-sep.jsonl", "line_number": 4, "agent": "claude", "title": "Fix build in 12ms", "score": 15.0, "content": %q, "created_at": %d, "workspace": "/work/proj"}],
+				"total_matches": 1
+			}`, sepSnippet, now.UnixMilli())), nil
+		}
+		negCorr := NewCorrelator(negSearcher, nil, "/work/proj")
+		negCorr.now = func() time.Time { return now }
+		negHits, negMeta := negCorr.searchByIDInWorkspace(context.Background(), "ui-1", "/work/proj")
+		if len(negHits) != 0 || negMeta.Total != 0 {
+			t.Fatalf("[A-2] negative failed: separator-split %q was not rejected: hits=%+v meta=%+v", sepSnippet, negHits, negMeta)
+		}
+	}
+
+	// [A-5] Strategy 3 ('*') with producer total_matches=500 and 1 session <=7d + 2 sessions >7d reports TotalFound == 1 (== len(TopSessions)).
+	wildSearcher := NewSearcher(detector)
+	wildSearcher.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[1] != "*" {
+			return []byte(`{"hits": [], "total_matches": 0}`), nil
+		}
+		return []byte(fmt.Sprintf(`{
+			"hits": [
+				{"source_path": "/s/near.jsonl", "line_number": 1, "title": "Misc", "content": "notes", "score": 5.0, "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/far-1.jsonl", "line_number": 2, "title": "Misc", "content": "notes", "score": 5.0, "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/far-2.jsonl", "line_number": 3, "title": "Misc", "content": "notes", "score": 5.0, "created_at": %d, "workspace": "/work/proj"}
+			],
+			"total_matches": 500
+		}`,
+			now.Add(-2*24*time.Hour).UnixMilli(),
+			now.Add(-20*24*time.Hour).UnixMilli(),
+			now.Add(-45*24*time.Hour).UnixMilli(),
+		)), nil
+	}
+	wildCorr := NewCorrelator(wildSearcher, nil, "/work/proj")
+	wildCorr.now = func() time.Time { return now }
+	closedAt := now.Add(-24 * time.Hour)
+	wildRes := wildCorr.Correlate(context.Background(), &model.Issue{
+		ID:        "bv-nokw",
+		Title:     "To do",
+		CreatedAt: now.Add(-60 * 24 * time.Hour),
+		ClosedAt:  &closedAt,
+	})
+	if wildRes.Strategy != StrategyTimestamp || len(wildRes.TopSessions) != 1 || wildRes.TotalFound != 1 {
+		t.Fatalf("[A-5] failed: Strategy=%q len=%d TotalFound=%d, want StrategyTimestamp len=1 TotalFound=1 (not inflated 498)",
+			wildRes.Strategy, len(wildRes.TopSessions), wildRes.TotalFound)
+	}
+
+	// [B-6] workspaceForIssue derives workspace from Origin.TrackerDirectory when Origin.WorkingDirectory is empty.
+	memberDir := filepath.Join(t.TempDir(), "services", "billing")
+	trackerDir := filepath.Join(memberDir, ".beads")
+	if err := os.MkdirAll(trackerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var capturedWorkspace string
+	tdSearcher := NewSearcher(detector)
+	tdSearcher.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		for i := 0; i < len(args)-1; i++ {
+			if args[i] == "--workspace" {
+				capturedWorkspace = args[i+1]
+			}
+		}
+		return []byte(fmt.Sprintf(`{
+			"hits": [{"source_path": "/s/td.jsonl", "line_number": 1, "title": "Billing", "content": "fixed bd-9", "score": 10.0, "created_at": %d, "workspace": %q}],
+			"total_matches": 1
+		}`, now.UnixMilli(), memberDir)), nil
+	}
+	tdCorr := NewCorrelator(tdSearcher, nil, "/umbrella/root")
+	tdCorr.now = func() time.Time { return now }
+	tdRes := tdCorr.Correlate(context.Background(), &model.Issue{
+		ID:    "billing-bd-9",
+		Title: "Billing fix",
+		Origin: &model.IssueOrigin{
+			LocalID:          "bd-9",
+			WorkingDirectory: "   ",
+			TrackerDirectory: trackerDir,
+		},
+	})
+	if capturedWorkspace != memberDir || len(tdRes.TopSessions) != 1 {
+		t.Fatalf("[B-6] TrackerDirectory workspace = %q (want %q), sessions=%+v", capturedWorkspace, memberDir, tdRes.TopSessions)
+	}
+	// Negative counterpart: when both WorkingDirectory and TrackerDirectory are empty, fall back to c.workspace.
+	if gotFallback := tdCorr.workspaceForIssue(&model.Issue{ID: "x", Origin: &model.IssueOrigin{}}); gotFallback != "/umbrella/root" {
+		t.Fatalf("[B-6] empty Origin fallback = %q, want /umbrella/root", gotFallback)
+	}
+	// [R2-A1] Standalone JSONL outside .beads/_beads without tracker metadata (e.g., TrackerDirectory="/tmp") must fall back to c.workspace, NOT "/"!
+	if gotStandalone := tdCorr.workspaceForIssue(&model.Issue{
+		ID: "x-standalone",
+		Origin: &model.IssueOrigin{
+			TrackerDirectory: "/tmp",
+			ReadOnlyReason:   "source has no readable tracker metadata",
+		},
+	}); gotStandalone != "/umbrella/root" {
+		t.Fatalf("[R2-A1] unvalidated standalone TrackerDirectory=/tmp derived %q, want fallback /umbrella/root", gotStandalone)
+	}
+}

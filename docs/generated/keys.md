@@ -7,7 +7,7 @@
 | **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity** | `G` | Go to end |
 |  | `home` | Go to start |
 | **board,tree** | `gg` | Go to start |
-| **list,detail,board,graph,insights,tree,actionable,flow,attention,label,velocity** | `ctrl+d` | Page down |
+| **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity** | `ctrl+d` | Page down |
 |  | `ctrl+u` | Page up |
 | **list,detail,board,graph,insights,actionable,history** | `enter` | Open details |
 | **all** | `esc` | Back/close (list: clear filters) |

@@ -768,3 +768,73 @@ func TestOptimizeDatabase(t *testing.T) {
 		t.Error("Database file is empty after optimize")
 	}
 }
+
+func TestSchemaAndMaterializedView_EphemeralColumnRoundTrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "ephemeral_schema.sqlite3")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	if err := CreateSchema(db); err != nil {
+		t.Fatalf("CreateSchema failed: %v", err)
+	}
+
+	// Positive observable: ephemeral=1 round-trips through both issues and issue_overview_mv.
+	// Negative controls: explicit ephemeral=0 and omitted ephemeral (DEFAULT 0) both round-trip as 0.
+	_, err = db.Exec(`
+		INSERT INTO issues (id, title, status, priority, issue_type, ephemeral, created_at, updated_at)
+		VALUES
+			('eph-yes', 'Ephemeral Open Task', 'open', 1, 'task', 1, '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z'),
+			('eph-no', 'Normal Open Task', 'open', 1, 'task', 0, '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')
+	`)
+	if err != nil {
+		t.Fatalf("Insert issues failed: %v", err)
+	}
+	_, err = db.Exec(`
+		INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at)
+		VALUES ('eph-default', 'Default Omitted Ephemeral Task', 'open', 1, 'task', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')
+	`)
+	if err != nil {
+		t.Fatalf("Insert default ephemeral issue failed: %v", err)
+	}
+	_, err = db.Exec(`
+		INSERT INTO issue_metrics (issue_id, pagerank, betweenness, critical_path_depth, triage_score, blocks_count, blocked_by_count)
+		VALUES
+			('eph-yes', 0.5, 0, 1, 0.4, 0, 0),
+			('eph-no', 0.5, 0, 1, 0.8, 0, 0),
+			('eph-default', 0.5, 0, 1, 0.8, 0, 0)
+	`)
+	if err != nil {
+		t.Fatalf("Insert issue_metrics failed: %v", err)
+	}
+	if err := CreateMaterializedViews(db); err != nil {
+		t.Fatalf("CreateMaterializedViews failed: %v", err)
+	}
+
+	for _, tc := range []struct {
+		id            string
+		wantEphemeral int
+	}{
+		{id: "eph-yes", wantEphemeral: 1},
+		{id: "eph-no", wantEphemeral: 0},
+		{id: "eph-default", wantEphemeral: 0},
+	} {
+		var tblEphemeral int
+		if err := db.QueryRow(`SELECT ephemeral FROM issues WHERE id = ?`, tc.id).Scan(&tblEphemeral); err != nil {
+			t.Fatalf("SELECT issues.ephemeral (%s): %v", tc.id, err)
+		}
+		if tblEphemeral != tc.wantEphemeral {
+			t.Fatalf("%s issues.ephemeral = %d, want %d", tc.id, tblEphemeral, tc.wantEphemeral)
+		}
+
+		var mvEphemeral int
+		if err := db.QueryRow(`SELECT ephemeral FROM issue_overview_mv WHERE id = ?`, tc.id).Scan(&mvEphemeral); err != nil {
+			t.Fatalf("SELECT issue_overview_mv (%s): %v", tc.id, err)
+		}
+		if mvEphemeral != tc.wantEphemeral {
+			t.Fatalf("%s issue_overview_mv.ephemeral = %d, want %d", tc.id, mvEphemeral, tc.wantEphemeral)
+		}
+	}
+}

@@ -3,6 +3,7 @@ package cass
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -475,5 +476,33 @@ func BenchmarkDetector_Status(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		d.Status()
+	}
+}
+
+func TestDefaultRunCommand_WaitDelayBoundsBackgroundPipeHolder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX /bin/sh")
+	}
+
+	// Positive control: fast command returns exit code 0 cleanly.
+	ctxFast, cancelFast := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelFast()
+	code, err := defaultRunCommand(ctxFast, "/bin/sh", "-c", "exit 0")
+	if err != nil || code != 0 {
+		t.Fatalf("fast defaultRunCommand = (%d, %v), want (0, nil)", code, err)
+	}
+
+	// Planted negative / timeout control: backgrounded pipe child with 50ms context timeout
+	// returns within WaitDelay (~1s, < 3s) instead of hanging 5s.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = defaultRunCommand(ctx, "/bin/sh", "-c", "sleep 5 & exec sleep 5")
+	elapsed := time.Since(start)
+	if err == nil && ctx.Err() == nil {
+		t.Fatal("expected context timeout on backgrounded child")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("defaultRunCommand hung for %v despite WaitDelay=1s (expected < 3s)", elapsed)
 	}
 }

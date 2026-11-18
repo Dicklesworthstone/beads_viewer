@@ -67,6 +67,7 @@ func TestBoardModel_SetSnapshot(t *testing.T) {
 	if snap == nil {
 		t.Fatal("expected non-nil snapshot")
 	}
+	t.Cleanup(snap.Analysis.WaitForPhase2)
 	if snap.BoardState == nil {
 		t.Fatal("expected snapshot.BoardState to be computed")
 	}
@@ -2018,6 +2019,7 @@ func TestBoardSetIssuesAndSnapshotPreserveActiveSearchAndExpandedCard(t *testing
 
 	// SetSnapshot also preserves active search and expanded card when present.
 	snap := ui.NewSnapshotBuilder(refreshed).Build()
+	t.Cleanup(snap.Analysis.WaitForPhase2)
 	b.SetSnapshot(snap)
 	if !b.IsSearchMode() || b.GetSearchQuery() != "oauth" || b.SearchMatchCount() != 2 {
 		t.Fatalf("SetSnapshot wiped active search: mode=%v query=%q count=%d",
@@ -2181,5 +2183,91 @@ func TestBoardPreservedSearchColumnMoveAndCrossFilterInlineBlockerTitle(t *testi
 	out := bFiltered.View(140, 28)
 	if !strings.Contains(out, "EXT-BLK (AuthGateSer") {
 		t.Fatalf("expected unexpanded card inline 1-blocker preview to include blocker title from fullIssues, got:\n%s", out)
+	}
+}
+
+func TestBoardNonClaimableOpenBadgesAndReadyBorderExclusion(t *testing.T) {
+	renderer := lipgloss.NewRenderer(os.Stdout)
+	renderer.SetColorProfile(termenv.TrueColor)
+	renderer.SetHasDarkBackground(true)
+	theme := ui.DefaultTheme(renderer)
+
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	futureDefer := now.Add(48 * time.Hour)
+
+	const greenReadySGR = "38;2;129;199;131m" // #81c784 claimable ready border
+
+	// Positive control: a normal open, unblocked, non-parked issue renders the green claimable border when unselected or expanded.
+	claimable := model.Issue{ID: "CLAIM-OK", Title: "Ready work", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now}
+	bClaim := ui.NewBoardModel([]model.Issue{claimable}, theme)
+	bClaim.SetReferenceTime(now)
+	bClaim.SetReadiness(model.NewReadinessIndex([]model.Issue{claimable}))
+	bClaim.ToggleExpand()
+	claimOut := bClaim.View(140, 30)
+	if !strings.Contains(claimOut, greenReadySGR) {
+		t.Fatalf("expected claimable open card to render green ready border (%s), got:\n%q", greenReadySGR, claimOut)
+	}
+
+	// Planted negative controls + positive badge observables: [pinned], [template], [ephemeral], [deferred]
+	// render their compact badge in the Open column AND are excluded from isCardClaimable (no green ready border).
+	parkedCases := []struct {
+		name  string
+		issue model.Issue
+		badge string
+	}{
+		{
+			name:  "pinned",
+			issue: model.Issue{ID: "PIN-1", Title: "Pinned item", Status: model.StatusOpen, Priority: 1, Pinned: true, CreatedAt: now, UpdatedAt: now},
+			badge: "[pinned]",
+		},
+		{
+			name:  "template",
+			issue: model.Issue{ID: "TPL-1", Title: "Template item", Status: model.StatusOpen, Priority: 1, IsTemplate: true, CreatedAt: now, UpdatedAt: now},
+			badge: "[template]",
+		},
+		{
+			name:  "ephemeral",
+			issue: model.Issue{ID: "EPH-1", Title: "Ephemeral item", Status: model.StatusOpen, Priority: 1, Ephemeral: true, CreatedAt: now, UpdatedAt: now},
+			badge: "[ephemeral]",
+		},
+		{
+			name:  "deferred",
+			issue: model.Issue{ID: "DEF-1", Title: "Deferred item", Status: model.StatusOpen, Priority: 1, DeferUntil: &futureDefer, CreatedAt: now, UpdatedAt: now},
+			badge: "[deferred]",
+		},
+	}
+
+	for _, tc := range parkedCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Select a neutral first card so tc.issue is rendered unselected in ColOpen, then also test expanded!
+			anchor := model.Issue{
+				ID: "ANCHOR-BLK", Title: "Blocked anchor", Status: model.StatusOpen, Priority: 0, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "ANCHOR-BLK", DependsOnID: tc.issue.ID, Type: model.DepRelated}},
+			}
+			// Test both with nil readiness (fallback branch) and with ReadinessIndex.
+			for _, withReadiness := range []bool{false, true} {
+				b := ui.NewBoardModel([]model.Issue{anchor, tc.issue}, theme)
+				b.SetReferenceTime(now)
+				if withReadiness {
+					b.SetReadiness(model.NewReadinessIndex([]model.Issue{anchor, tc.issue}))
+				}
+				compactOut := b.View(140, 32)
+				if !strings.Contains(compactOut, tc.badge) {
+					t.Fatalf("withReadiness=%v: expected badge %q in compact board view:\n%s", withReadiness, tc.badge, compactOut)
+				}
+
+				// Expand tc.issue directly so its card border is decided solely by isCardClaimable (not selection highlight).
+				bExpanded := ui.NewBoardModel([]model.Issue{tc.issue}, theme)
+				bExpanded.SetReferenceTime(now)
+				if withReadiness {
+					bExpanded.SetReadiness(model.NewReadinessIndex([]model.Issue{tc.issue}))
+				}
+				bExpanded.ToggleExpand()
+				expOut := bExpanded.View(140, 32)
+				if strings.Contains(expOut, greenReadySGR) {
+					t.Fatalf("withReadiness=%v: non-claimable %s card rendered green claimable border!", withReadiness, tc.badge)
+				}
+			}
+		})
 	}
 }

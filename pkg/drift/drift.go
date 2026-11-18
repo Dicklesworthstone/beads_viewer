@@ -354,23 +354,31 @@ func (c *Calculator) Calculate() *Result {
 	}
 	c.validateBorrowedAnalyzer()
 
-	// Check for new cycles (critical)
-	c.checkCycles(result)
+	var curScope baseline.BaselineScope
+	if c.current.Scope != nil {
+		curScope = *c.current.Scope
+	}
+	sameScope := c.baseline.MatchesScope(curScope)
 
-	// Check density growth (info/warning)
-	c.checkDensity(result)
+	if sameScope {
+		// Check for new cycles (critical)
+		c.checkCycles(result)
 
-	// Check node/edge count changes (info)
-	c.checkGraphSize(result)
+		// Check density growth (info/warning)
+		c.checkDensity(result)
 
-	// Check blocked issues increase (warning)
-	c.checkBlocked(result)
+		// Check node/edge count changes (info)
+		c.checkGraphSize(result)
 
-	// Check actionable count changes (info)
-	c.checkActionable(result)
+		// Check blocked issues increase (warning)
+		c.checkBlocked(result)
 
-	// Check PageRank changes (warning)
-	c.checkPageRankChanges(result)
+		// Check actionable count changes (info)
+		c.checkActionable(result)
+
+		// Check PageRank changes (warning)
+		c.checkPageRankChanges(result)
+	}
 
 	// Check staleness (uses current issues if provided)
 	c.checkStaleness(result)
@@ -379,7 +387,9 @@ func (c *Calculator) Calculate() *Result {
 	c.checkBlockingCascade(result)
 
 	// Scope creep against the baseline's open count (info)
-	c.checkScopeCreep(result)
+	if sameScope {
+		c.checkScopeCreep(result)
+	}
 
 	// Issue-level proactive checks (all need attached issues)
 	c.checkVelocityDrop(result)
@@ -1065,12 +1075,23 @@ func (c *Calculator) checkVelocityDrop(result *Result) {
 	priorStart := now.AddDate(0, 0, -2*window)
 	recent, prior := 0, 0
 	for _, iss := range c.issues {
-		if !c.isCandidate(iss.ID) || iss.ClosedAt == nil {
+		if !c.isCandidate(iss.ID) || !model.IsClosedLikeStatus(iss.Status) {
 			continue
 		}
-		closed := iss.ClosedAt.UTC()
+		var rawClosed time.Time
+		if iss.ClosedAt != nil && !iss.ClosedAt.IsZero() {
+			rawClosed = *iss.ClosedAt
+		} else if !iss.UpdatedAt.IsZero() {
+			rawClosed = iss.UpdatedAt
+		} else {
+			continue
+		}
+		closed := rawClosed.UTC()
+		if closed.After(now) {
+			continue
+		}
 		switch {
-		case closed.After(recentStart) && !closed.After(now):
+		case closed.After(recentStart):
 			recent++
 		case closed.After(priorStart) && !closed.After(recentStart):
 			prior++
@@ -1226,7 +1247,7 @@ func (c *Calculator) checkPotentialDuplicate(result *Result) {
 		if !c.isCandidate(iss.ID) {
 			continue
 		}
-		if model.IsClosedLikeStatus(iss.Status) || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned || iss.Ephemeral {
+		if model.IsClosedLikeStatus(iss.Status) || iss.IsTemplate || iss.Pinned || iss.Status.Normalize() == model.StatusPinned || iss.Ephemeral {
 			continue
 		}
 		live = append(live, iss)

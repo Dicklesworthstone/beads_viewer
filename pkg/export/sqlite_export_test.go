@@ -1632,3 +1632,128 @@ func TestSQLiteExport_TriageZeroActionableNoLeakAndProvisionalScrub(t *testing.T
 		}
 	})
 }
+
+func TestExport_EphemeralRoundTripAndLayoutActiveBetweenness(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	closedAt := now
+	issues := []*model.Issue{
+		{
+			ID:        "open-root",
+			Title:     "Open Root",
+			Status:    model.StatusOpen,
+			Priority:  0,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+		},
+		{
+			ID:        "open-bridge",
+			Title:     "Active Bridge",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-bridge", DependsOnID: "open-root", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "open-top",
+			Title:     "Active Top Dependent",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			Ephemeral: true,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-top", DependsOnID: "open-bridge", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "closed-hub",
+			Title:     "Historical Closed Hub",
+			Status:    model.StatusClosed,
+			ClosedAt:  &closedAt,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "closed-hub", DependsOnID: "open-root", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID:        "open-after-closed",
+			Title:     "Ready After Closed Hub",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-after-closed", DependsOnID: "closed-hub", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	var valIssues []model.Issue
+	var deps []*model.Dependency
+	for _, iss := range issues {
+		valIssues = append(valIssues, *iss)
+		deps = append(deps, iss.Dependencies...)
+	}
+	stats := analysis.NewAnalyzer(valIssues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	if stats.GetBetweennessScore("closed-hub") <= 0 {
+		t.Fatalf("planted negative control invalid: full-graph betweenness for closed-hub = %v, want > 0", stats.GetBetweennessScore("closed-hub"))
+	}
+
+	outDir := t.TempDir()
+	exp := NewSQLiteExporter(issues, deps, &stats, nil)
+	if err := exp.Export(outDir); err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(outDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	// 1. Ephemeral round-trip in issues & issue_overview_mv (+ non-ephemeral control).
+	var ephTbl, ephMV, ephAct int
+	if err := db.QueryRow(`SELECT ephemeral FROM issues WHERE id = 'open-top'`).Scan(&ephTbl); err != nil || ephTbl != 1 {
+		t.Fatalf("open-top issues.ephemeral = %d (err=%v), want 1", ephTbl, err)
+	}
+	if err := db.QueryRow(`SELECT ephemeral, is_actionable FROM issue_overview_mv WHERE id = 'open-top'`).Scan(&ephMV, &ephAct); err != nil || ephMV != 1 || ephAct != 0 {
+		t.Fatalf("open-top mv = (ephemeral=%d, is_actionable=%d, err=%v), want (1, 0, nil)", ephMV, ephAct, err)
+	}
+	var ctrlTbl, ctrlMV, ctrlAct int
+	if err := db.QueryRow(`SELECT ephemeral FROM issues WHERE id = 'open-after-closed'`).Scan(&ctrlTbl); err != nil || ctrlTbl != 0 {
+		t.Fatalf("open-after-closed issues.ephemeral = %d (err=%v), want 0", ctrlTbl, err)
+	}
+	if err := db.QueryRow(`SELECT ephemeral, is_actionable FROM issue_overview_mv WHERE id = 'open-after-closed'`).Scan(&ctrlMV, &ctrlAct); err != nil || ctrlMV != 0 || ctrlAct != 1 {
+		t.Fatalf("open-after-closed mv = (ephemeral=%d, is_actionable=%d, err=%v), want (0, 1, nil)", ctrlMV, ctrlAct, err)
+	}
+
+	// 2. graph_layout.json: layout.Metrics uses activeBetweennessMap (0 for closed-hub, >0 for open-bridge)
+	// while layout.Centrality preserves full exported topology contract.
+	rawLayout, err := os.ReadFile(filepath.Join(outDir, "data", "graph_layout.json"))
+	if err != nil {
+		t.Fatalf("ReadFile graph_layout.json: %v", err)
+	}
+	var layout GraphLayout
+	if err := json.Unmarshal(rawLayout, &layout); err != nil {
+		t.Fatalf("Unmarshal graph_layout.json: %v", err)
+	}
+	if got := layout.Metrics["closed-hub"][1]; got != 0 {
+		t.Fatalf("layout.Metrics[closed-hub][1] (betweenness) = %v, want 0", got)
+	}
+	if got := layout.Metrics["open-bridge"][1]; got <= 0 {
+		t.Fatalf("layout.Metrics[open-bridge][1] (betweenness) = %v, want > 0", got)
+	}
+	if layout.Centrality == nil || layout.Centrality.Betweenness["closed-hub"] <= 0 {
+		t.Fatalf("layout.Centrality.Betweenness[closed-hub] = %v, want > 0 (exported topology centrality preserved)", layout.Centrality)
+	}
+}

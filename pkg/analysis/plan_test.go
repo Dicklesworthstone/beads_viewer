@@ -677,3 +677,36 @@ func TestCountStatusPartition_WithheldOpenRoutedToDeferredOrParked(t *testing.T)
 		t.Fatalf("ExecutionPlan partition mismatch: TotalBlocked=%d TotalDeferredOrParked=%d", plan.TotalBlocked, plan.TotalDeferredOrParked)
 	}
 }
+
+func TestGetExecutionPlan_ScopedCandidatesDoNotMergeTracksThroughOutOfScopeBridge(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "TRACK-A", Title: "Independent stream A", Status: model.StatusOpen, Priority: 1},
+		{ID: "TRACK-B", Title: "Independent stream B", Status: model.StatusOpen, Priority: 1},
+		{
+			ID: "OUT-BRIDGE", Title: "Out-of-scope bridge depending on both A and B", Status: model.StatusOpen, Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "OUT-BRIDGE", DependsOnID: "TRACK-A", Type: model.DepBlocks},
+				{IssueID: "OUT-BRIDGE", DependsOnID: "TRACK-B", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	// Planted negative control: unscoped execution plan merges TRACK-A and TRACK-B into 1 track via OUT-BRIDGE.
+	unscopedPlan := analysis.NewAnalyzer(issues).GetExecutionPlan()
+	if len(unscopedPlan.Tracks) != 1 {
+		t.Fatalf("unscoped control expected 1 merged track via OUT-BRIDGE, got %d tracks: %+v", len(unscopedPlan.Tracks), unscopedPlan.Tracks)
+	}
+
+	// Positive observable: scoping candidateIDs to {TRACK-A, TRACK-B} must NOT union through out-of-scope OUT-BRIDGE,
+	// preserving 2 parallel execution tracks.
+	scopedAn := analysis.NewAnalyzer(issues)
+	scopedAn.SetReadinessScope(model.NewReadinessIndex(issues), map[string]bool{
+		"TRACK-A": true,
+		"TRACK-B": true,
+	})
+	scopedPlan := scopedAn.GetExecutionPlan()
+	if scopedPlan.TotalActionable != 2 || len(scopedPlan.Tracks) != 2 {
+		t.Fatalf("scoped ExecutionPlan expected 2 actionable issues across 2 independent tracks, got TotalActionable=%d Tracks=%+v",
+			scopedPlan.TotalActionable, scopedPlan.Tracks)
+	}
+}

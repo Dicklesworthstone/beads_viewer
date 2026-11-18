@@ -1781,12 +1781,25 @@ func (buffer *limitedOutputBuffer) Write(data []byte) (int, error) {
 	return written, err
 }
 
+func cleanVersionProbeEnv(environ []string) []string {
+	cleaned := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.EqualFold(key, "BV_ROBOT") || strings.EqualFold(key, "BV_OUTPUT_FORMAT") {
+			continue
+		}
+		cleaned = append(cleaned, entry)
+	}
+	return cleaned
+}
+
 func verifyBinaryVersion(binaryPath, expectedVersion string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var stdout limitedOutputBuffer
 	var stderr limitedOutputBuffer
 	cmd := osExec.CommandContext(ctx, binaryPath, "--version")
+	cmd.Env = cleanVersionProbeEnv(os.Environ())
 	cmd.WaitDelay = time.Second
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -1824,6 +1837,7 @@ func smokeProbeBinaryVersion(binaryPath string, timeout time.Duration) error {
 	var stdout limitedOutputBuffer
 	var stderr limitedOutputBuffer
 	cmd := osExec.CommandContext(ctx, binaryPath, "--version")
+	cmd.Env = cleanVersionProbeEnv(os.Environ())
 	cmd.WaitDelay = time.Second
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

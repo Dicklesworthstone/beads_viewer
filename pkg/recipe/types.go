@@ -97,9 +97,10 @@ func CanonicalViewColumn(col string) (string, bool) {
 
 // ExportConfig supplies defaults only when an export is explicitly requested.
 type ExportConfig struct {
-	Format       string `yaml:"format,omitempty" json:"format,omitempty"`               // markdown, json, csv, mermaid
-	IncludeGraph *bool  `yaml:"include_graph,omitempty" json:"include_graph,omitempty"` // nil uses the format default
-	Template     string `yaml:"template,omitempty" json:"template,omitempty"`           // Markdown template path; user defaults resolve relative to their config file
+	Format         string `yaml:"format,omitempty" json:"format,omitempty"`                   // markdown, json, csv, mermaid
+	IncludeGraph   *bool  `yaml:"include_graph,omitempty" json:"include_graph,omitempty"`     // nil uses the format default
+	IncludeActions *bool  `yaml:"include_actions,omitempty" json:"include_actions,omitempty"` // nil uses the format default (true)
+	Template       string `yaml:"template,omitempty" json:"template,omitempty"`               // Markdown template path; user defaults resolve relative to their config file
 
 	// Only the loader can authorize a default from the invoking user's config.
 	// Bind that authority to the exact resolved path, so copying this value and

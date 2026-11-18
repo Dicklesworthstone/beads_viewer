@@ -71,6 +71,7 @@ function resolveHybridEffectiveStatus(r, refNowMs) {
   if (
     isTruthyHybridFlag(r?.is_template ?? r?.isTemplate) ||
     isTruthyHybridFlag(r?.pinned ?? r?.isPinned) ||
+    isTruthyHybridFlag(r?.ephemeral ?? r?.isEphemeral) ||
     normStatus === 'pinned'
   ) {
     return 'deferred';
@@ -277,6 +278,23 @@ function scoreBatchHybrid(results, weights, options = {}) {
   }
 }
 
-window.initHybridWasmScorer = initHybridWasmScorer;
-window.scoreBatchHybrid = scoreBatchHybrid;
-window.getHybridWasmStatus = getHybridWasmStatus;
+function __setHybridWasmCtorForTest(ctor) {
+  HybridWasmCtor = ctor || null;
+  HYBRID_WASM_STATE.ready = Boolean(HybridWasmCtor);
+}
+
+if (typeof window !== 'undefined') {
+  window.initHybridWasmScorer = initHybridWasmScorer;
+  window.scoreBatchHybrid = scoreBatchHybrid;
+  window.getHybridWasmStatus = getHybridWasmStatus;
+}
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    initHybridWasmScorer,
+    scoreBatchHybrid,
+    getHybridWasmStatus,
+    resolveHybridEffectiveStatus,
+    statusToCode,
+    __setHybridWasmCtorForTest,
+  };
+}

@@ -536,3 +536,173 @@ func TestCalculateActiveBeadsPerAuthor(t *testing.T) {
 		t.Errorf("activeByAuth[dev2] = %d, want 1", tc.activeByAuth["dev2@test.com"])
 	}
 }
+
+func TestTemporalWindows_OpenReopenedInstantaneousAndIdentityMatching(t *testing.T) {
+	t0 := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(1 * time.Hour)
+	t2 := t0.Add(2 * time.Hour)
+	t3 := t0.Add(3 * time.Hour)
+	latestCommit := t0.Add(5 * time.Hour)
+
+	// 1. Open claimed window + Reopened claimed window (Claimed -> Closed -> Reopened) bounded by latestCommitTime.
+	openMilestones := BeadMilestones{
+		Claimed: &BeadEvent{BeadID: "bv-open", EventType: EventClaimed, Timestamp: t1, Author: "Alice", AuthorEmail: "ALICE@Example.com"},
+	}
+	if w := ExtractWindowFromMilestones("bv-open", "Open task", openMilestones); w != nil {
+		t.Fatalf("expected nil window for open claimed bead without fallbackEnd, got %+v", w)
+	}
+	openWin := ExtractWindowFromMilestones("bv-open", "Open task", openMilestones, latestCommit)
+	if openWin == nil || !openWin.Start.Equal(t1) || !openWin.End.Equal(latestCommit) {
+		t.Fatalf("open claimed window = %+v, want [%s, %s]", openWin, t1, latestCommit)
+	}
+
+	reopenedMilestones := BeadMilestones{
+		Claimed:  &BeadEvent{BeadID: "bv-reopen", EventType: EventClaimed, Timestamp: t0, Author: "Alice", AuthorEmail: "alice@example.com"},
+		Closed:   &BeadEvent{BeadID: "bv-reopen", EventType: EventClosed, Timestamp: t1, Author: "Alice", AuthorEmail: "alice@example.com"},
+		Reopened: &BeadEvent{BeadID: "bv-reopen", EventType: EventReopened, Timestamp: t2, Author: "Alice", AuthorEmail: "alice@example.com"},
+	}
+	// Planted negative control: reopened bead without fallbackEnd must NOT truncate at old Closed (t1); returns nil without bound.
+	if w := ExtractWindowFromMilestones("bv-reopen", "Reopened task", reopenedMilestones); w != nil {
+		t.Fatalf("reopened claimed bead without fallbackEnd returned stale closed window %+v, want nil", w)
+	}
+	reopenWin := ExtractWindowFromMilestones("bv-reopen", "Reopened task", reopenedMilestones, latestCommit)
+	if reopenWin == nil || !reopenWin.Start.Equal(t0) || !reopenWin.End.Equal(latestCommit) {
+		t.Fatalf("reopened claimed window = %+v, want [%s, %s] (not old Closed %s)", reopenWin, t0, latestCommit, t1)
+	}
+
+	// 2. temporalWindowsFromEvents: open + reopened dilute ActiveBeads on closed windows without auto-linking open claims,
+	//    instantaneous w.Start.Equal(w.End) (ActiveBeads >= 1), and case-insensitive email overlap.
+	events := []BeadEvent{
+		{BeadID: "bv-open", EventType: EventClaimed, Timestamp: t1, Author: "Alice", AuthorEmail: "ALICE@Example.com"},
+		{BeadID: "bv-reopen", EventType: EventClaimed, Timestamp: t0, Author: "alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-reopen", EventType: EventClosed, Timestamp: t1, Author: "alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-reopen", EventType: EventReopened, Timestamp: t2, Author: "alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-alice-closed", EventType: EventClaimed, Timestamp: t2, Author: "Alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-alice-closed", EventType: EventClosed, Timestamp: latestCommit, Author: "Alice", AuthorEmail: "alice@example.com"},
+		// Instantaneous window at t3 (Start == End == t3) for a distinct author with empty email:
+		{BeadID: "bv-instant", EventType: EventClaimed, Timestamp: t3, Author: "SoloDev", AuthorEmail: ""},
+		{BeadID: "bv-instant", EventType: EventClosed, Timestamp: t3, Author: "SoloDev", AuthorEmail: ""},
+		// Another empty-email distinct author overlapping at t3 (planted negative: must NOT increment SoloDev's ActiveBeads):
+		{BeadID: "bv-other-empty", EventType: EventClaimed, Timestamp: t0, Author: "OtherDev", AuthorEmail: ""},
+		{BeadID: "bv-other-empty", EventType: EventClosed, Timestamp: latestCommit, Author: "OtherDev", AuthorEmail: ""},
+	}
+	windows := temporalWindowsFromEvents(events, "")
+	byID := make(map[string]TemporalWindow, len(windows))
+	for _, w := range windows {
+		byID[w.BeadID] = w
+	}
+
+	if _, leaked := byID["bv-open"]; leaked {
+		t.Fatalf("still-open bv-open must not emit automatic temporal window: %+v", byID["bv-open"])
+	}
+	if _, leaked := byID["bv-reopen"]; leaked {
+		t.Fatalf("reopened bv-reopen must not emit stale closed temporal window: %+v", byID["bv-reopen"])
+	}
+	if got := byID["bv-alice-closed"]; !got.End.Equal(latestCommit) || got.ActiveBeads != 3 {
+		t.Fatalf("bv-alice-closed window = %+v, want End=%s ActiveBeads=3 (counting bv-alice-closed + case-insensitive bv-open + reopened bv-reopen)", got, latestCommit)
+	}
+	inst := byID["bv-instant"]
+	if !inst.Start.Equal(inst.End) || inst.ActiveBeads != 1 {
+		t.Fatalf("instantaneous window = %+v, want Start.Equal(End) and ActiveBeads == 1 (empty-email OtherDev excluded)", inst)
+	}
+
+	// 3. Direct commitInWindow positive (case-insensitive email) and planted negative (empty-email distinct authors / both empty).
+	if !commitInWindow(*openWin, walkedCommit{Timestamp: t3, Author: "Anyone", AuthorEmail: "alice@example.com"}) {
+		t.Fatal("expected case-insensitive email match in commitInWindow")
+	}
+	if commitInWindow(inst, walkedCommit{Timestamp: t3, Author: "OtherDev", AuthorEmail: ""}) {
+		t.Fatal("negative control failed: empty-email distinct authors matched in commitInWindow")
+	}
+	if sameClaimantIdentity("", "", "", "") {
+		t.Fatal("negative control failed: two empty author+email identities must not match")
+	}
+}
+
+func TestSameSecondCloseReopenChronology_AndMilestonesFallback(t *testing.T) {
+	t0 := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(1 * time.Minute) // Same-second close & reopen timestamp
+	t3 := t0.Add(5 * time.Minute) // Later fallbackEnd
+
+	// Positive observable: EventClosed at t1 followed by EventReopened at exact same second t1 -> still open!
+	reopenedEvents := []BeadEvent{
+		{BeadID: "bv-same-reopen", EventType: EventClaimed, Timestamp: t0, Author: "Alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-same-reopen", EventType: EventClosed, Timestamp: t1, Author: "Alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-same-reopen", EventType: EventReopened, Timestamp: t1, Author: "Alice", AuthorEmail: "alice@example.com"},
+	}
+	if eventsStillClosed(reopenedEvents) {
+		t.Fatal("eventsStillClosed returned true when EventReopened followed EventClosed at same timestamp")
+	}
+	reopenMilestones := GetBeadMilestones(reopenedEvents)
+	if milestonesStillClosed(reopenMilestones) {
+		t.Fatal("milestonesStillClosed returned true when Reopened.Timestamp.Equal(Closed.Timestamp)")
+	}
+	if w := ExtractWindowFromMilestones("bv-same-reopen", "Same-sec reopen", reopenMilestones); w != nil {
+		t.Fatalf("same-second reopened milestones without fallbackEnd returned closed window %+v, want nil", w)
+	}
+	if w := ExtractWindowFromMilestones("bv-same-reopen", "Same-sec reopen", reopenMilestones, t3); w == nil || !w.End.Equal(t3) {
+		t.Fatalf("same-second reopened milestones with fallbackEnd = %+v, want End=%s", w, t3)
+	}
+	openHist := BeadHistory{BeadID: "bv-same-reopen", Status: "open", Events: reopenedEvents, Milestones: reopenMilestones}
+	if historyStillClosed(openHist) {
+		t.Fatal("historyStillClosed returned true for Status=open same-second reopened bead")
+	}
+
+	// Planted negative control: EventReopened at t1 followed by EventClosed at exact same second t1 -> closed!
+	reclosedEvents := []BeadEvent{
+		{BeadID: "bv-same-reclosed", EventType: EventClaimed, Timestamp: t0, Author: "Alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-same-reclosed", EventType: EventClosed, Timestamp: t1, Author: "Alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-same-reclosed", EventType: EventReopened, Timestamp: t1, Author: "Alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-same-reclosed", EventType: EventClosed, Timestamp: t1, Author: "Alice", AuthorEmail: "alice@example.com"},
+	}
+	if !eventsStillClosed(reclosedEvents) {
+		t.Fatal("negative control failed: eventsStillClosed returned false when EventClosed followed EventReopened at same timestamp")
+	}
+	reclosedMilestones := GetBeadMilestones(reclosedEvents)
+	closedHist := BeadHistory{BeadID: "bv-same-reclosed", Status: "closed", Events: reclosedEvents, Milestones: reclosedMilestones}
+	if !historyStillClosed(closedHist) {
+		t.Fatal("negative control failed: historyStillClosed returned false for Status=closed re-closed bead")
+	}
+	if w := extractWindowForBead("bv-same-reclosed", "Reclosed", reclosedMilestones, historyStillClosed(closedHist), t3); w == nil || !w.End.Equal(t1) {
+		t.Fatalf("re-closed bead window = %+v, want End=%s (bounded at Closed, not fallbackEnd %s)", w, t1, t3)
+	}
+
+	// Verify temporalWindowsFromEvents emits ONLY bv-same-reclosed (not bv-same-reopen) while counting both as active at t1.
+	combined := append(append([]BeadEvent(nil), reopenedEvents...), reclosedEvents...)
+	wins := temporalWindowsFromEvents(combined, "")
+	if len(wins) != 1 || wins[0].BeadID != "bv-same-reclosed" || !wins[0].End.Equal(t1) || wins[0].ActiveBeads != 2 {
+		t.Fatalf("temporalWindowsFromEvents = %+v, want single window for bv-same-reclosed with End=%s ActiveBeads=2", wins, t1)
+	}
+
+	// [R2-A3] Closed-then-deleted synthesized BeadHistory (Status="deleted") stays closed at Closed.Timestamp (t1),
+	// whereas reopened-then-deleted BeadHistory (Status="deleted") stays open (stillClosed == false)!
+	t2 := t0.Add(2 * time.Minute)
+	closedThenDeletedEvents := []BeadEvent{
+		{BeadID: "bv-closed-del", EventType: EventClaimed, Timestamp: t0, Author: "Alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-closed-del", EventType: EventClosed, Timestamp: t1, Author: "Alice", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-closed-del", EventType: EventDeleted, Timestamp: t2, Author: "Alice", AuthorEmail: "alice@example.com"},
+	}
+	closedDelHist := BeadHistory{
+		BeadID:     "bv-closed-del",
+		Status:     "deleted",
+		Events:     closedThenDeletedEvents,
+		Milestones: GetBeadMilestones(closedThenDeletedEvents),
+	}
+	if !historyStillClosed(closedDelHist) {
+		t.Fatal("[R2-A3] historyStillClosed returned false for closed-then-deleted history (Status=deleted)")
+	}
+	if w := extractWindowForBead("bv-closed-del", "Closed then deleted", closedDelHist.Milestones, historyStillClosed(closedDelHist), t3); w == nil || !w.End.Equal(t1) {
+		t.Fatalf("[R2-A3] closed-then-deleted window = %+v, want End=%s (not fallbackEnd %s)", w, t1, t3)
+	}
+	reopenedThenDeletedEvents := append(append([]BeadEvent(nil), reopenedEvents...), BeadEvent{
+		BeadID: "bv-same-reopen", EventType: EventDeleted, Timestamp: t2, Author: "Alice", AuthorEmail: "alice@example.com",
+	})
+	reopenDelHist := BeadHistory{
+		BeadID:     "bv-same-reopen",
+		Status:     "deleted",
+		Events:     reopenedThenDeletedEvents,
+		Milestones: GetBeadMilestones(reopenedThenDeletedEvents),
+	}
+	if historyStillClosed(reopenDelHist) {
+		t.Fatal("[R2-A3] negative control failed: historyStillClosed returned true for reopened-then-deleted history")
+	}
+}

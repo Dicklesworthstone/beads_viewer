@@ -596,6 +596,9 @@ func computeCrossLabelCriticalPaths(labelList []string, matrix [][]int, depMap m
 // ComputeVelocityMetrics calculates simple velocity stats for a label.
 // It looks at closed issues and recent closures to give a quick pulse.
 func ComputeVelocityMetrics(issues []model.Issue, now time.Time) VelocityMetrics {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	const day = 24 * time.Hour
 	var closed7, closed30 int
 	var totalCloseDur time.Duration
@@ -609,18 +612,8 @@ func ComputeVelocityMetrics(issues []model.Issue, now time.Time) VelocityMetrics
 	var prevWeek, currentWeek int
 
 	for _, iss := range issues {
-		if !isClosedLikeStatus(iss.Status) {
-			continue
-		}
-		var closedAt time.Time
-		if iss.ClosedAt != nil && !iss.ClosedAt.IsZero() {
-			closedAt = *iss.ClosedAt
-		} else if !iss.UpdatedAt.IsZero() {
-			closedAt = iss.UpdatedAt
-		} else {
-			continue
-		}
-		if closedAt.After(now) {
+		closedAt, ok := resolveClosureTime(&iss, now)
+		if !ok {
 			continue
 		}
 		if closedAt.After(weekAgo) {
@@ -634,7 +627,7 @@ func ComputeVelocityMetrics(issues []model.Issue, now time.Time) VelocityMetrics
 		} else if closedAt.After(weekAgo) {
 			currentWeek++
 		}
-		if !iss.CreatedAt.IsZero() {
+		if !iss.CreatedAt.IsZero() && !closedAt.Before(iss.CreatedAt) {
 			totalCloseDur += closedAt.Sub(iss.CreatedAt)
 			closeSamples++
 		}
@@ -680,9 +673,31 @@ func ComputeVelocityMetrics(issues []model.Issue, now time.Time) VelocityMetrics
 	}
 }
 
+// resolveClosureTime returns the effective closure timestamp for closed-like
+// issues (ClosedAt if non-nil and non-zero, falling back to UpdatedAt if non-zero)
+// and rejects zero or future (> now) closure timestamps.
+func resolveClosureTime(iss *model.Issue, now time.Time) (time.Time, bool) {
+	if iss == nil || !isClosedLikeStatus(iss.Status) {
+		return time.Time{}, false
+	}
+	var closedAt time.Time
+	if iss.ClosedAt != nil && !iss.ClosedAt.IsZero() {
+		closedAt = *iss.ClosedAt
+	} else if !iss.UpdatedAt.IsZero() {
+		closedAt = iss.UpdatedAt
+	}
+	if closedAt.IsZero() || closedAt.After(now) {
+		return time.Time{}, false
+	}
+	return closedAt, true
+}
+
 // ComputeLabelVelocity computes VelocityMetrics enriched with an 8-week
 // HistoricalVelocity snapshot for the specified label at now.
 func ComputeLabelVelocity(label string, issues []model.Issue, now time.Time) VelocityMetrics {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	var labeled []model.Issue
 	for i := range issues {
 		for _, l := range issues[i].Labels {
@@ -816,6 +831,9 @@ func dedupePreserveOrder(labels []string) []string {
 }
 
 func ComputeLabelHealthForLabel(label string, issues []model.Issue, cfg LabelHealthConfig, now time.Time, stats *GraphStats) LabelHealth {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	health := NewLabelHealth(label)
 	health.Issues = []string{}
 
@@ -1129,6 +1147,9 @@ func ComputeAllLabelHealth(issues []model.Issue, cfg LabelHealthConfig, now time
 // ReadinessIndex (preserving external cross-scope and tombstone blocker state) and scoping
 // label membership and cross-label flow to candidateIDs when non-nil.
 func ComputeAllLabelHealthWithScope(issues []model.Issue, cfg LabelHealthConfig, now time.Time, stats *GraphStats, readiness *model.ReadinessIndex, candidateIDs map[string]bool) LabelAnalysisResult {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	if readiness == nil {
 		readiness = model.NewReadinessIndex(issues)
 	}
@@ -1317,6 +1338,9 @@ func ComputeLabelHealthScores(issues []model.Issue, cfg LabelHealthConfig, now t
 	if len(issues) == 0 {
 		return map[string]int{}
 	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 
 	hasAnyLabel := false
 	for i := range issues {
@@ -1381,10 +1405,8 @@ func ComputeLabelHealthScores(issues []model.Issue, cfg LabelHealthConfig, now t
 		issBW := bw[iss.ID]
 
 		isClosed := isClosedLikeStatus(iss.Status)
-		isClosedWithTime := isClosed && iss.ClosedAt != nil
 		var closed30Inc, prevWeekInc, curWeekInc int
-		if isClosedWithTime {
-			closedAt := *iss.ClosedAt
+		if closedAt, ok := resolveClosureTime(iss, now); ok {
 			if closedAt.After(monthAgo) {
 				closed30Inc = 1
 			}
@@ -3044,6 +3066,9 @@ func ComputeLabelAttentionScoresFast(issues []model.Issue, cfg LabelHealthConfig
 	if len(issues) == 0 {
 		return map[string]float64{}
 	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 
 	hasAnyLabel := false
 	for i := range issues {
@@ -3127,16 +3152,8 @@ func ComputeLabelAttentionScoresFast(issues []model.Issue, cfg LabelHealthConfig
 			}
 		}
 		closed30Inc := 0
-		if isClosed {
-			var closedAt time.Time
-			if iss.ClosedAt != nil && !iss.ClosedAt.IsZero() {
-				closedAt = *iss.ClosedAt
-			} else if !iss.UpdatedAt.IsZero() {
-				closedAt = iss.UpdatedAt
-			}
-			if !closedAt.IsZero() && !closedAt.After(now) && closedAt.After(monthAgo) {
-				closed30Inc = 1
-			}
+		if closedAt, ok := resolveClosureTime(iss, now); ok && closedAt.After(monthAgo) {
+			closed30Inc = 1
 		}
 		issBlockImpact := blockingDepCountToID[iss.ID]
 
@@ -3267,6 +3284,9 @@ func ComputeHistoricalVelocity(issues []model.Issue, label string, numWeeks int,
 }
 
 func computeHistoricalVelocityFromLabeled(labeled []model.Issue, label string, numWeeks int, now time.Time) HistoricalVelocity {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	if numWeeks <= 0 {
 		numWeeks = 8
 	}
@@ -3299,13 +3319,10 @@ func computeHistoricalVelocityFromLabeled(labeled []model.Issue, label string, n
 	// Bucket closed issues by week
 	cumulative := 0
 	for _, iss := range labeled {
-		if !isClosedLikeStatus(iss.Status) {
+		closedAt, ok := resolveClosureTime(&iss, now)
+		if !ok {
 			continue
 		}
-		if iss.ClosedAt == nil {
-			continue
-		}
-		closedAt := *iss.ClosedAt
 
 		// Find the appropriate week bucket
 		for i := range result.WeeklyVelocity {

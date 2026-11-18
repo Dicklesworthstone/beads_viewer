@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -658,5 +659,33 @@ func BenchmarkSearcher_Search(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		s.Search(context.Background(), SearchOptions{Query: "test"})
+	}
+}
+
+func TestDefaultSearchRunCommand_WaitDelayBoundsBackgroundPipeHolder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX /bin/sh")
+	}
+
+	// Positive control: normal fast command returns stdout cleanly.
+	ctxFast, cancelFast := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelFast()
+	out, err := defaultSearchRunCommand(ctxFast, "/bin/sh", "-c", `printf '{"hits":[]}'`)
+	if err != nil || string(out) != `{"hits":[]}` {
+		t.Fatalf("fast defaultSearchRunCommand = (%q, %v), want {\"hits\":[]}", out, err)
+	}
+
+	// Planted negative / timeout control: child spawns a 5s background process inheriting stdout pipe,
+	// while context times out after 50ms. WaitDelay (1s) must bound return well under 3s instead of hanging 5s.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = defaultSearchRunCommand(ctx, "/bin/sh", "-c", "sleep 5 & exec sleep 5")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected timeout error from defaultSearchRunCommand")
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("defaultSearchRunCommand hung for %v despite WaitDelay=1s (expected < 3s)", elapsed)
 	}
 }

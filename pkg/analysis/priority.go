@@ -693,10 +693,10 @@ func (a *Analyzer) generateRecommendationsFromStatsAndScores(stats *GraphStats, 
 		return nil
 	}
 
-	coreMap := stats.CoreNumber()
+	_, coreMap, artPoints := a.activeSubgraphMetrics(stats)
 	slackMap := stats.Slack()
-	artSet := make(map[string]bool)
-	for _, id := range stats.ArticulationPoints() {
+	artSet := make(map[string]bool, len(artPoints))
+	for _, id := range artPoints {
 		artSet[id] = true
 	}
 	maxCore := 0
@@ -706,23 +706,17 @@ func (a *Analyzer) generateRecommendationsFromStatsAndScores(stats *GraphStats, 
 		}
 	}
 
-	// Compute unblocks for reasoning
-	unblocksMap := make(map[string]int)
-	for _, score := range scores {
-		unblocks := a.computeUnblocks(score.IssueID)
-		unblocksMap[score.IssueID] = len(unblocks)
-	}
-
 	var recommendations []PriorityRecommendation
 
 	for _, score := range scores {
 		if !a.IsCandidate(score.IssueID) {
 			continue
 		}
+		unblocks := a.computeUnblocks(score.IssueID)
 		iss := a.issueMap[score.IssueID]
 		rec := generateRecommendation(
 			score,
-			unblocksMap[score.IssueID],
+			len(unblocks),
 			coreMap[score.IssueID],
 			artSet[score.IssueID],
 			slackMap[score.IssueID],

@@ -930,3 +930,113 @@ func TestSQLiteExporter_ClosedCycleDoesNotPoisonActiveMetricsAndLabelInstrEscapi
 		t.Fatalf("case-sensitive INSTR for \"Backend\" matched %v, want [open-root] (excluding lowercase backend on open-mid)", gotIDs)
 	}
 }
+
+func TestSQLiteExporter_ClosedHubBetweennessZeroAcrossMetricsOverviewAndLayout(t *testing.T) {
+	now := time.Date(2026, 9, 4, 15, 0, 0, 0, time.UTC)
+	closedAt := now
+	issues := []*model.Issue{
+		{ID: "act-a", Title: "Active Prereq", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "act-bridge", Title: "Active Bridge", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "act-bridge", DependsOnID: "act-a", Type: model.DepBlocks}},
+		},
+		{
+			ID: "act-c", Title: "Active Leaf", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "act-c", DependsOnID: "act-bridge", Type: model.DepBlocks}},
+		},
+		{
+			ID: "closed-hub", Title: "Closed Historical Bridge", Status: model.StatusClosed, ClosedAt: &closedAt, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "closed-hub", DependsOnID: "act-a", Type: model.DepBlocks}},
+		},
+		{
+			ID: "act-via-closed", Title: "Formerly Blocked By Closed Hub", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "act-via-closed", DependsOnID: "closed-hub", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	var valueIssues []model.Issue
+	var allDeps []*model.Dependency
+	for _, iss := range issues {
+		valueIssues = append(valueIssues, *iss)
+		allDeps = append(allDeps, iss.Dependencies...)
+	}
+
+	// Pre-populated Analyzer stats (exercises canReusePrepopulatedActiveStats fast path).
+	fullStats := analysis.NewAnalyzer(valueIssues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	if fullStats.GetBetweennessScore("closed-hub") <= 0 {
+		t.Fatalf("negative control setup: expected closed-hub full-graph betweenness > 0, got %v", fullStats.GetBetweennessScore("closed-hub"))
+	}
+	if !canReusePrepopulatedActiveStats(&fullStats, valueIssues, allDeps, true, true, true) {
+		t.Fatalf("expected canReusePrepopulatedActiveStats=true for matching fullStats")
+	}
+
+	// Mismatched broader stats (planted negative control for canReusePrepopulatedActiveStats: must NOT reuse!).
+	broaderIssues := append(append([]model.Issue{}, valueIssues...), model.Issue{
+		ID: "extra-outside-slice", Title: "Outside Slice", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+		Dependencies: []*model.Dependency{{IssueID: "extra-outside-slice", DependsOnID: "act-c", Type: model.DepBlocks}},
+	})
+	broaderStats := analysis.NewAnalyzer(broaderIssues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	if canReusePrepopulatedActiveStats(&broaderStats, valueIssues, allDeps, true, false, false) {
+		t.Fatalf("expected canReusePrepopulatedActiveStats=false when Stats were computed on a broader issue set")
+	}
+
+	for _, mode := range []struct {
+		name  string
+		stats *analysis.GraphStats
+	}{
+		{name: "reuse-prepopulated", stats: &fullStats},
+		{name: "fallback-mismatched-stats", stats: &broaderStats},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			outDir := t.TempDir()
+			exp := NewSQLiteExporter(issues, allDeps, mode.stats, nil)
+			if err := exp.Export(outDir); err != nil {
+				t.Fatalf("Export failed: %v", err)
+			}
+
+			db, err := sql.Open("sqlite", filepath.Join(outDir, "beads.sqlite3"))
+			if err != nil {
+				t.Fatalf("sql.Open: %v", err)
+			}
+			defer db.Close()
+
+			var closedMetricsBW, closedMVBW, activeMetricsBW, activeMVBW float64
+			if err := db.QueryRow(`SELECT betweenness FROM issue_metrics WHERE issue_id = 'closed-hub'`).Scan(&closedMetricsBW); err != nil {
+				t.Fatalf("Scan issue_metrics closed-hub: %v", err)
+			}
+			if err := db.QueryRow(`SELECT betweenness FROM issue_overview_mv WHERE id = 'closed-hub'`).Scan(&closedMVBW); err != nil {
+				t.Fatalf("Scan issue_overview_mv closed-hub: %v", err)
+			}
+			if err := db.QueryRow(`SELECT betweenness FROM issue_metrics WHERE issue_id = 'act-bridge'`).Scan(&activeMetricsBW); err != nil {
+				t.Fatalf("Scan issue_metrics act-bridge: %v", err)
+			}
+			if err := db.QueryRow(`SELECT betweenness FROM issue_overview_mv WHERE id = 'act-bridge'`).Scan(&activeMVBW); err != nil {
+				t.Fatalf("Scan issue_overview_mv act-bridge: %v", err)
+			}
+
+			if closedMetricsBW != 0 || closedMVBW != 0 {
+				t.Fatalf("closed-hub betweenness = (issue_metrics=%v, mv=%v), want (0, 0)", closedMetricsBW, closedMVBW)
+			}
+			if activeMetricsBW <= 0 || math.Abs(activeMetricsBW-activeMVBW) > 1e-9 {
+				t.Fatalf("act-bridge betweenness = (issue_metrics=%v, mv=%v), want both > 0 and equal", activeMetricsBW, activeMVBW)
+			}
+
+			rawLayout, err := os.ReadFile(filepath.Join(outDir, "data", "graph_layout.json"))
+			if err != nil {
+				t.Fatalf("ReadFile graph_layout.json: %v", err)
+			}
+			var layout GraphLayout
+			if err := json.Unmarshal(rawLayout, &layout); err != nil {
+				t.Fatalf("Unmarshal graph_layout.json: %v", err)
+			}
+			if got := layout.Metrics["closed-hub"][1]; got != 0 {
+				t.Fatalf("graph_layout.json metrics[closed-hub][1] = %v, want 0", got)
+			}
+			if got := layout.Metrics["act-bridge"][1]; math.Abs(got-activeMetricsBW) > 1e-9 || got <= 0 {
+				t.Fatalf("graph_layout.json metrics[act-bridge][1] = %v, want %v (> 0)", got, activeMetricsBW)
+			}
+		})
+	}
+}

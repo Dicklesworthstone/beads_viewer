@@ -481,7 +481,14 @@ func (b *SnapshotBuilder) resolvedProjectDir() string {
 	return ""
 }
 
+func isHistoricalGitBeadsPath(p string) bool {
+	return strings.HasPrefix(strings.TrimSpace(p), "git:")
+}
+
 func (b *SnapshotBuilder) resolvedBeadsDir() string {
+	if isHistoricalGitBeadsPath(b.beadsPath) {
+		return ""
+	}
 	if strings.TrimSpace(b.beadsPath) != "" {
 		return filepath.Dir(b.beadsPath)
 	}
@@ -492,7 +499,7 @@ func (b *SnapshotBuilder) resolvedBeadsDir() string {
 }
 
 func (s *DataSnapshot) resolvedBeadsDir() string {
-	if s == nil {
+	if s == nil || isHistoricalGitBeadsPath(s.beadsPath) {
 		return ""
 	}
 	if strings.TrimSpace(s.beadsPath) != "" {
@@ -526,7 +533,7 @@ func feedbackWeightsForBeadsDir(beadsDir string) *analysis.Weights {
 // priority hints (p) and the actionable view rank issues the same way
 // --robot-triage does.
 func feedbackWeightsForBeadsPath(beadsPath string) *analysis.Weights {
-	if strings.TrimSpace(beadsPath) == "" {
+	if strings.TrimSpace(beadsPath) == "" || isHistoricalGitBeadsPath(beadsPath) {
 		return nil
 	}
 	return feedbackWeightsForBeadsDir(filepath.Dir(beadsPath))

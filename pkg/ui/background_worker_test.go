@@ -1634,6 +1634,13 @@ func TestStartBackgroundWorkerCmdFailureEndsWaiterChain(t *testing.T) {
 	worker.Stop()
 
 	m := NewModel([]model.Issue{{ID: "issue-1", Title: "Issue", Status: model.StatusOpen}}, nil, "")
+	t.Cleanup(func() {
+		oa := m.ownedAnalysis
+		m.cancelOwnedAnalysis()
+		if oa != nil {
+			oa.WaitForPhase2()
+		}
+	})
 	m.backgroundWorker = worker
 	m.snapshotInitPending = true
 
@@ -1679,6 +1686,13 @@ func TestWaitForBackgroundWorkerMsgDrainsTerminalErrorAfterStop(t *testing.T) {
 	}
 
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() {
+		oa := m.ownedAnalysis
+		m.cancelOwnedAnalysis()
+		if oa != nil {
+			oa.WaitForPhase2()
+		}
+	})
 	m.backgroundWorker = worker
 	updated, cmd := m.Update(envelope)
 	m = updated.(*Model)
@@ -1704,6 +1718,13 @@ func TestStaleBackgroundWorkerStartFailureDoesNotMutateReplacement(t *testing.T)
 	defer replacement.Stop()
 
 	m := NewModel([]model.Issue{{ID: "issue-1", Title: "Issue", Status: model.StatusOpen}}, nil, "")
+	t.Cleanup(func() {
+		oa := m.ownedAnalysis
+		m.cancelOwnedAnalysis()
+		if oa != nil {
+			oa.WaitForPhase2()
+		}
+	})
 	m.backgroundWorker = replacement
 	m.snapshotInitPending = true
 	m.statusMsg = "replacement starting"
@@ -1739,6 +1760,13 @@ func TestStaleBackgroundWorkerMessageDoesNotMutateReplacement(t *testing.T) {
 	defer replacement.Stop()
 
 	m := NewModel(nil, nil, "")
+	t.Cleanup(func() {
+		oa := m.ownedAnalysis
+		m.cancelOwnedAnalysis()
+		if oa != nil {
+			oa.WaitForPhase2()
+		}
+	})
 	m.backgroundWorker = replacement
 	m.snapshotInitPending = true
 	m.statusMsg = "replacement active"
@@ -2314,6 +2342,7 @@ func TestBackgroundWorker_RunPhase2AnalysisSignalsMatchingSnapshot(t *testing.T)
 	}
 
 	m := NewModel(issues, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.snapshot = snapshot
 	m.lastAppliedSnapshotVer = snapshotVersion
 	if view := m.View(); view == "" {
@@ -2775,6 +2804,13 @@ func TestModelUpdate_RecordsUserInputForIdleGC(t *testing.T) {
 			worker.recordActivityAt(oldActivity)
 
 			m := NewModel(nil, nil, "")
+			t.Cleanup(func() {
+				oa := m.ownedAnalysis
+				m.cancelOwnedAnalysis()
+				if oa != nil {
+					oa.WaitForPhase2()
+				}
+			})
 			m.backgroundWorker = worker
 			m.Update(tc.msg)
 

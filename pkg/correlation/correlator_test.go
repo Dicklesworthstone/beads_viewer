@@ -1677,3 +1677,320 @@ func TestCorrelator_WorkspaceAliasesAndSharedGitSubtreeDisambiguation(t *testing
 		t.Fatalf("expected historical causal observations for '99', got empty Observations: %+v", targetRep.CausalHistory)
 	}
 }
+
+func TestCorrelator_ReopenedAndOpenClaimedTemporalWindowsBoundedByLatestCommit(t *testing.T) {
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+
+	base := time.Date(2026, 11, 18, 9, 0, 0, 0, time.UTC)
+	commitAt := func(offset time.Duration, author, email, msg string, files map[string]string) string {
+		t.Helper()
+		for rel, content := range files {
+			full := filepath.Join(repo, rel)
+			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		runAdd := exec.Command("git", "-C", repo, "add", "-A")
+		if out, err := runAdd.CombinedOutput(); err != nil {
+			t.Fatalf("git add: %v (%s)", err, out)
+		}
+		ts := base.Add(offset).Format(time.RFC3339)
+		cmd := exec.Command("git", "-C", repo, "-c", "user.name="+author, "-c", "user.email="+email, "commit", "-m", msg)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME="+author,
+			"GIT_AUTHOR_EMAIL="+email,
+			"GIT_COMMITTER_NAME="+author,
+			"GIT_COMMITTER_EMAIL="+email,
+			"GIT_AUTHOR_DATE="+ts,
+			"GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git commit %q: %v (%s)", msg, err, out)
+		}
+		shaOut, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").CombinedOutput()
+		if err != nil {
+			t.Fatalf("git rev-parse: %v", err)
+		}
+		return strings.TrimSpace(string(shaOut))
+	}
+
+	if out, err := exec.Command("git", "-C", repo, "init", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+
+	// T+0h: Create & claim bv-reopen (in_progress), bv-open (in_progress), and bv-closed (in_progress) with uppercase email.
+	_ = commitAt(0, "Alice Dev", "ALICE@Example.com", "claim tasks", map[string]string{
+		".beads/issues.jsonl": `{"id":"bv-reopen","title":"Fix auth handler","status":"in_progress","assignee":"alice"}` + "\n" +
+			`{"id":"bv-open","title":"Update login service","status":"in_progress","assignee":"alice"}` + "\n" +
+			`{"id":"bv-closed","title":"Harden auth session","status":"in_progress","assignee":"alice"}` + "\n",
+	})
+	// T+1h: Close bv-reopen prematurely.
+	_ = commitAt(1*time.Hour, "Alice Dev", "alice@example.com", "close bv-reopen", map[string]string{
+		".beads/issues.jsonl": `{"id":"bv-reopen","title":"Fix auth handler","status":"closed","assignee":"alice"}` + "\n" +
+			`{"id":"bv-open","title":"Update login service","status":"in_progress","assignee":"alice"}` + "\n" +
+			`{"id":"bv-closed","title":"Harden auth session","status":"in_progress","assignee":"alice"}` + "\n",
+	})
+	// T+2h: Reopen bv-reopen back to in_progress!
+	_ = commitAt(2*time.Hour, "Alice Dev", "alice@example.com", "reopen bv-reopen", map[string]string{
+		".beads/issues.jsonl": `{"id":"bv-reopen","title":"Fix auth handler","status":"in_progress","assignee":"alice"}` + "\n" +
+			`{"id":"bv-open","title":"Update login service","status":"in_progress","assignee":"alice"}` + "\n" +
+			`{"id":"bv-closed","title":"Harden auth session","status":"in_progress","assignee":"alice"}` + "\n",
+	})
+	// T+3h: Alice pushes a code commit without explicit bead ID in commit message (lowercase email vs uppercase claim).
+	aliceCodeSHA := commitAt(3*time.Hour, "Alice Dev", "alice@example.com", "refactor auth handler logic", map[string]string{
+		"pkg/auth/handler.go": "package auth\n",
+	})
+	// T+4h: Planted negative control — Bob pushes a code commit during the same window.
+	bobCodeSHA := commitAt(4*time.Hour, "Bob Dev", "bob@example.com", "unrelated billing tweak", map[string]string{
+		"pkg/billing/charge.go": "package billing\n",
+	})
+	// T+5h: Close bv-closed (leaving bv-open and reopened bv-reopen still in_progress).
+	_ = commitAt(5*time.Hour, "Alice Dev", "alice@example.com", "close bv-closed", map[string]string{
+		".beads/issues.jsonl": `{"id":"bv-reopen","title":"Fix auth handler","status":"in_progress","assignee":"alice"}` + "\n" +
+			`{"id":"bv-open","title":"Update login service","status":"in_progress","assignee":"alice"}` + "\n" +
+			`{"id":"bv-closed","title":"Harden auth session","status":"closed","assignee":"alice"}` + "\n",
+	})
+
+	liveBeads := []BeadInfo{
+		{ID: "bv-reopen", Title: "Fix auth handler", Status: "in_progress"},
+		{ID: "bv-open", Title: "Update login service", Status: "in_progress"},
+		{ID: "bv-closed", Title: "Harden auth session", Status: "closed"},
+	}
+
+	// Verify walk-based Correlator correlates aliceCodeSHA to completed bv-closed (with ActiveBeads=3
+	// counting concurrent open/reopened claims!), does NOT falsely treat reopened bv-reopen's stale T+1h
+	// close as closed, and rejects bobCodeSHA.
+	corr := NewCorrelator(repo, jsonlPath)
+	rep, err := corr.GenerateReportCached(liveBeads, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("GenerateReportCached: %v", err)
+	}
+
+	closedHist := rep.Histories["bv-closed"]
+	var foundAliceOnClosed, foundBob bool
+	for _, c := range closedHist.Commits {
+		if c.SHA == aliceCodeSHA && c.Method == MethodTemporalAuthor {
+			foundAliceOnClosed = true
+		}
+		if c.SHA == bobCodeSHA {
+			foundBob = true
+		}
+	}
+	if !foundAliceOnClosed {
+		t.Fatalf("bv-closed missed temporal commit %s (commits=%+v)", aliceCodeSHA, closedHist.Commits)
+	}
+	if foundBob {
+		t.Fatalf("negative control failed: bv-closed correlated Bob's commit %s", bobCodeSHA)
+	}
+	if len(rep.Histories["bv-reopen"].Commits) != 0 || len(rep.Histories["bv-open"].Commits) != 0 {
+		t.Fatalf("still-open/reopened beads must remain unlinked in automatic history index so OrphanDetector preserves orphan visibility: reopen=%+v open=%+v", rep.Histories["bv-reopen"].Commits, rep.Histories["bv-open"].Commits)
+	}
+
+	// Also verify TemporalCorrelator.ExtractAllTemporalCorrelations queries latest repo commit timestamp
+	// (t+5h > latest open milestone) and correlates aliceCodeSHA across bv-closed, bv-open, AND reopened bv-reopen
+	// in deterministic beadID order while rejecting bobCodeSHA.
+	tc := NewTemporalCorrelator(repo)
+	tcCommits, err := tc.ExtractAllTemporalCorrelations(rep.Histories)
+	if err != nil {
+		t.Fatalf("ExtractAllTemporalCorrelations: %v", err)
+	}
+	seenByBead := make(map[string]bool)
+	for i, c := range tcCommits {
+		if i > 0 && tcCommits[i-1].BeadID > c.BeadID {
+			t.Fatalf("ExtractAllTemporalCorrelations output not sorted by BeadID: %s before %s", tcCommits[i-1].BeadID, c.BeadID)
+		}
+		if c.SHA == bobCodeSHA {
+			t.Fatalf("negative control failed: ExtractAllTemporalCorrelations matched Bob's commit %s", bobCodeSHA)
+		}
+		if c.SHA == aliceCodeSHA {
+			seenByBead[c.BeadID] = true
+		}
+	}
+	if !seenByBead["bv-closed"] || !seenByBead["bv-open"] || !seenByBead["bv-reopen"] {
+		t.Fatalf("ExtractAllTemporalCorrelations missed aliceCodeSHA on closed/open/reopened beads: seen=%v", seenByBead)
+	}
+}
+
+func TestCorrelator_TrimmedEmailWhitespaceFallbackAndSameSecondReopenEndToEnd(t *testing.T) {
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+
+	base := time.Date(2026, 11, 18, 11, 0, 0, 0, time.UTC)
+	commitAt := func(offset time.Duration, author, email, msg string, files map[string]string) string {
+		t.Helper()
+		for rel, content := range files {
+			full := filepath.Join(repo, rel)
+			if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if out, err := exec.Command("git", "-C", repo, "add", "-A").CombinedOutput(); err != nil {
+			t.Fatalf("git add: %v (%s)", err, out)
+		}
+		ts := base.Add(offset).Format(time.RFC3339)
+		cmd := exec.Command("git", "-C", repo, "-c", "user.name="+author, "-c", "user.email="+email, "commit", "-m", msg)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME="+author,
+			"GIT_AUTHOR_EMAIL="+email,
+			"GIT_COMMITTER_NAME="+author,
+			"GIT_COMMITTER_EMAIL="+email,
+			"GIT_AUTHOR_DATE="+ts,
+			"GIT_COMMITTER_DATE="+ts,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git commit %q: %v (%s)", msg, err, out)
+		}
+		shaOut, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").CombinedOutput()
+		if err != nil {
+			t.Fatalf("git rev-parse: %v", err)
+		}
+		return strings.TrimSpace(string(shaOut))
+	}
+
+	if out, err := exec.Command("git", "-C", repo, "init", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+
+	// T+0: Claim bv-same-open and bv-same-closed.
+	_ = commitAt(0, "Alice Dev", "alice@example.com", "claim both", map[string]string{
+		".beads/issues.jsonl": `{"id":"bv-same-open","title":"Auth fix","status":"in_progress"}` + "\n" +
+			`{"id":"bv-same-closed","title":"Session fix","status":"in_progress"}` + "\n",
+	})
+	// T+30m: Alice code commit inside [T+0, T+1h].
+	earlySHA := commitAt(30*time.Minute, "Alice Dev", "alice@example.com", "early work", map[string]string{
+		"pkg/auth/early.go": "package auth\n",
+	})
+	// T+1h (exact same second!):
+	// Commit A at T+1h closes bv-same-open and opens/reopens bv-same-closed? First close both at T+1h:
+	_ = commitAt(1*time.Hour, "Alice Dev", "alice@example.com", "close both at T+1h", map[string]string{
+		".beads/issues.jsonl": `{"id":"bv-same-open","title":"Auth fix","status":"closed"}` + "\n" +
+			`{"id":"bv-same-closed","title":"Session fix","status":"closed"}` + "\n",
+	})
+	// Commit B at exact same timestamp T+1h: reopen BOTH at T+1h!
+	_ = commitAt(1*time.Hour, "Alice Dev", "alice@example.com", "reopen both at T+1h", map[string]string{
+		".beads/issues.jsonl": `{"id":"bv-same-open","title":"Auth fix","status":"open"}` + "\n" +
+			`{"id":"bv-same-closed","title":"Session fix","status":"in_progress"}` + "\n",
+	})
+	// Commit C at exact same timestamp T+1h: re-close ONLY bv-same-closed at T+1h (leaving bv-same-open reopened!).
+	_ = commitAt(1*time.Hour, "Alice Dev", "alice@example.com", "reclose bv-same-closed at T+1h", map[string]string{
+		".beads/issues.jsonl": `{"id":"bv-same-open","title":"Auth fix","status":"open"}` + "\n" +
+			`{"id":"bv-same-closed","title":"Session fix","status":"closed"}` + "\n",
+	})
+	// T+2h: Alice pushes a post-reopen code commit.
+	postReopenSHA := commitAt(2*time.Hour, "Alice Dev", "alice@example.com", "post-reopen work", map[string]string{
+		"pkg/auth/late.go": "package auth\n",
+	})
+
+	corr := NewCorrelator(repo, jsonlPath)
+	rep, err := corr.GenerateReportCached([]BeadInfo{
+		{ID: "bv-same-open", Title: "Auth fix", Status: "open"},
+		{ID: "bv-same-closed", Title: "Session fix", Status: "closed"},
+	}, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("GenerateReportCached: %v", err)
+	}
+
+	// [A-4] Positive observable: bv-same-open (EventClosed@T+1h -> EventReopened@T+1h, Status=open) must NOT auto-link as closed!
+	if len(rep.Histories["bv-same-open"].Commits) != 0 {
+		t.Fatalf("[A-4] same-second reopened bead falsely auto-linked as closed: %+v", rep.Histories["bv-same-open"].Commits)
+	}
+	// [A-4] Planted negative control: bv-same-closed (EventReopened@T+1h -> EventClosed@T+1h, Status=closed) IS closed at T+1h,
+	// so it links earlySHA (T+30m) and does NOT link postReopenSHA (T+2h).
+	var closedGotEarly, closedGotLate bool
+	for _, c := range rep.Histories["bv-same-closed"].Commits {
+		if c.SHA == earlySHA {
+			closedGotEarly = true
+		}
+		if c.SHA == postReopenSHA {
+			closedGotLate = true
+		}
+	}
+	if !closedGotEarly || closedGotLate {
+		t.Fatalf("[A-4] bv-same-closed commits = %+v, want earlySHA=true postReopenSHA=false", rep.Histories["bv-same-closed"].Commits)
+	}
+
+	// Verify ExtractAllTemporalCorrelations bounds bv-same-open to T+2h (correlating postReopenSHA)
+	// while keeping bv-same-closed bounded at T+1h (excluding postReopenSHA).
+	tc := NewTemporalCorrelator(repo)
+	tcOut, err := tc.ExtractAllTemporalCorrelations(rep.Histories)
+	if err != nil {
+		t.Fatalf("ExtractAllTemporalCorrelations: %v", err)
+	}
+	var openGotPostReopen, closedGotPostReopen bool
+	for _, c := range tcOut {
+		if c.SHA == postReopenSHA && c.BeadID == "bv-same-open" {
+			openGotPostReopen = true
+		}
+		if c.SHA == postReopenSHA && c.BeadID == "bv-same-closed" {
+			closedGotPostReopen = true
+		}
+	}
+	if !openGotPostReopen || closedGotPostReopen {
+		t.Fatalf("[A-4] ExtractAllTemporalCorrelations postReopenSHA: open=%v closed=%v (want true / false)", openGotPostReopen, closedGotPostReopen)
+	}
+
+	// [A-3] Direct test of extractTemporalCandidatesWithOptions with padded "  alice@example.com  "
+	// and whitespace-only "   " email falling back to author name (plus distinct-author negative control).
+	a3Events := []BeadEvent{
+		{BeadID: "bv-padded", EventType: EventClaimed, Timestamp: base, Author: "  Alice Dev  ", AuthorEmail: "  ALICE@Example.com  "},
+		{BeadID: "bv-padded", EventType: EventClosed, Timestamp: base.Add(2 * time.Hour), Author: "Alice Dev", AuthorEmail: "alice@example.com"},
+		{BeadID: "bv-ws-email", EventType: EventClaimed, Timestamp: base, Author: "  Solo Author  ", AuthorEmail: "   "},
+		{BeadID: "bv-ws-email", EventType: EventClosed, Timestamp: base.Add(2 * time.Hour), Author: "Solo Author", AuthorEmail: "   "},
+	}
+	a3Walk := []walkedCommit{
+		{
+			SHA:         earlySHA,
+			Author:      "  Alice Dev  ",
+			AuthorEmail: "  alice@example.com  ",
+			Timestamp:   base.Add(30 * time.Minute),
+			Files:       []string{"pkg/auth/early.go"},
+		},
+		{
+			SHA:         postReopenSHA,
+			Author:      "  solo author  ",
+			AuthorEmail: "   ",
+			Timestamp:   base.Add(45 * time.Minute),
+			Files:       []string{"pkg/auth/late.go"},
+		},
+		{
+			// Planted negative control: whitespace-only email with a different author name must NOT match Solo Author or Alice Dev.
+			SHA:         earlySHA,
+			Author:      "Unrelated Person",
+			AuthorEmail: "   ",
+			Timestamp:   base.Add(45 * time.Minute),
+			Files:       []string{"pkg/auth/early.go"},
+		},
+	}
+	cands, err := corr.extractTemporalCandidatesWithOptions(a3Events, a3Walk, CorrelatorOptions{})
+	if err != nil {
+		t.Fatalf("extractTemporalCandidatesWithOptions: %v", err)
+	}
+	matchedPairs := make(map[string]bool)
+	for _, cand := range cands {
+		if cand.Author == "Unrelated Person" {
+			t.Fatalf("[A-3] negative control failed: whitespace-only unrelated author matched %+v", cand)
+		}
+		matchedPairs[cand.BeadID+":"+cand.SHA] = true
+	}
+	if !matchedPairs["bv-padded:"+earlySHA] {
+		t.Fatalf("[A-3] padded email failed to match in extractTemporalCandidatesWithOptions: %+v", cands)
+	}
+	if !matchedPairs["bv-ws-email:"+postReopenSHA] {
+		t.Fatalf("[A-3] whitespace-only email failed to fall back to author name: %+v", cands)
+	}
+}

@@ -1032,7 +1032,8 @@ async function hitsJourney(page) {
     const rows = await evaluate(page, `JSON.parse(JSON.stringify(${app}.${state}.map(i=>({id:i.id,title:i.title,score:i.${field}}))))`);
     console.log(`${page.name} ${title}:`, JSON.stringify(rows));
     assert.equal(rows[0]?.id, leader, `${title}: correct directed leader appears in dashboard`);
-    assert.equal(rows.length, 6, `${title}: all visible issues are ranked, excluding synthetic tombstone`);
+    assert.equal(rows.length, 5, `${title}: all five active issues are ranked, excluding closed and tombstone rows`);
+    assert.equal(rows.some(r => r.id === 'sim-closed' || r.id === 'sim-deleted'), false, `${title}: excludes resolved issues`);
     assert.ok(rows[0].score > 0, `${title}: positive leader score`);
     assert.ok(rows.every((r, i) => Number.isFinite(r.score) && r.score >= 0 && r.score <= 1 && (i === 0 || rows[i-1].score >= r.score)), `${title}: finite normalized scores in descending order`);
     const panel = `[...document.querySelectorAll('.metric-panel-premium')].find(e=>e.querySelector('h3')?.textContent.trim()===${JSON.stringify(title)})`;
@@ -1206,12 +1207,12 @@ async function whatIfJourney(page, includeClosed = true) {
   assert.ok(tombBurndown.open.length > 0 && tombBurndown.open.every(v => v === 1) && tombBurndown.blocked.every(v => v === 0),
     `open issue blocked solely by tombstoned bead is counted as open in burndown: ${JSON.stringify(tombBurndown)}`);
   assert.deepEqual(await evaluate(page, `getActionableIssues().sort()`), ['sim-other', 'sim-root']);
-  assert.deepEqual(await evaluate(page, `getTopKSet(5).items.map(i=>[i.issueId,i.marginal_gain])`), [['sim-root', 2], ['sim-other', 1]]);
+  assert.deepEqual(await evaluate(page, `getTopKSet(5).items.map(i=>[i.issueId,i.marginal_gain])`), [['sim-root', 1], ['sim-child', 1], ['sim-other', 1]]);
   await capture(page, 'what-if-detail');
   await key(page, 'Escape');
   await click(page, 'a[href="#/insights"]');
   await waitFor(page, `[...document.querySelectorAll('span')].some(e=>(${visible})(e) && e.textContent.trim()==='3 potential unblocks')`, 'visible combined priority gain');
-  await waitFor(page, `[...document.querySelectorAll('[x-text="item.marginal_gain"]')].filter(${visible}).map(e=>e.textContent).join(',')==='2,1'`, 'visible per-pick gains');
+  await waitFor(page, `[...document.querySelectorAll('[x-text="item.marginal_gain"]')].filter(${visible}).map(e=>e.textContent).join(',')==='1,1,1'`, 'visible per-pick chained gains');
   await waitFor(page, `[...document.querySelectorAll('[x-text="item.result?.transitive_unblocks || 0"]')].filter(${visible}).map(e=>e.textContent).join(',')==='2'`, 'visible cascade impact card');
   await capture(page, 'what-if-priorities');
   await click(page, 'a[href="#/graph"]');
@@ -2686,6 +2687,350 @@ async function capabilitiesJourney(page) {
   await search(page, '');
   await resultIDs(page, allCapIDs);
 
+  // Track C (bv-apal.78 / bv-apal.79): Live SQLite + WASM + ForceGraph verification of
+  // getTopKSet sequential chaining, parallelCutFiltered, parent-child open-ancestor gates,
+  // activeGraph bridges/cut-vertices/k-core/betweenness & #/insights closed/tombstone exclusion,
+  // ephemeral 0.2 hybrid parity, and getReferenceNowMs() anchoring of isIssueOverdue, formatDate, and computeBurndownData.
+  const trackCAudit = await evaluate(page, `(async () => {
+    const SQL = await initSqlJs();
+    const savedDbBytes = DB_STATE.db.export();
+    try {
+      const testDb = new SQL.Database(savedDbBytes);
+      ensureSqlFunctions(testDb);
+      DB_STATE.db.close();
+      DB_STATE.db = testDb;
+      DB_STATE.referenceDb = null;
+      DB_STATE.referenceNowMs = null;
+
+      // Clear fixture tables in the isolated clone and seed a unified adversarial topology.
+      for (const tbl of ['dependencies', 'comments', 'issue_metrics', 'triage_recommendations', 'issue_overview_mv', 'issues']) {
+        try { DB_STATE.db.run('DELETE FROM ' + tbl); } catch {}
+      }
+      DB_STATE.db.run("DELETE FROM export_meta WHERE key = 'resolved_issue_ids'");
+      DB_STATE.db.run("INSERT OR REPLACE INTO export_meta (key, value) VALUES ('generated_at', '2026-09-10T12:00:00Z'), ('exported_at', '2026-09-10T12:00:00Z')");
+
+      const refTs = '2026-09-08T12:00:00Z';
+      const seedIssues = [
+        // 1. Sequential bottleneck A -> B -> {C, D, E} (+ withheld ephemeral & parked review children on B)
+        { id: 'seq-a', title: 'Sequential Gate A', status: 'open', priority: 0, type: 'task', ephemeral: 0, actionable: 1, triage: 0.85, blocksCount: 1 },
+        { id: 'seq-b', title: 'Sequential Bottleneck B', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 0, triage: 0.70, blocksCount: 5, bw: 5.0 },
+        { id: 'seq-c', title: 'Fanout C', status: 'open', priority: 2, type: 'task', ephemeral: 0, actionable: 0, triage: 0.40, blocksCount: 0 },
+        { id: 'seq-d', title: 'Fanout D', status: 'open', priority: 2, type: 'task', ephemeral: 0, actionable: 0, triage: 0.40, blocksCount: 0 },
+        { id: 'seq-e', title: 'Fanout E', status: 'open', priority: 2, type: 'task', ephemeral: 0, actionable: 0, triage: 0.40, blocksCount: 0 },
+        { id: 'seq-ephemeral', title: 'Withheld Ephemeral wispprobe', status: 'open', priority: 1, type: 'task', ephemeral: 1, actionable: 0, triage: 0.30, blocksCount: 0 },
+        { id: 'seq-parked', title: 'Withheld Review Task', status: 'review', priority: 1, type: 'task', ephemeral: 0, actionable: 0, triage: 0.30, blocksCount: 0 },
+        // Actionable ephemeral blocker with huge fan-out (planted negative control for candidate filtering in topKSet & parallelCutFiltered)
+        { id: 'eph-root', title: 'Ephemeral Root wispprobe', status: 'open', priority: 1, type: 'task', ephemeral: 1, actionable: 0, triage: 0.50, blocksCount: 4 },
+        { id: 'eph-f1', title: 'Eph Fan 1', status: 'open', priority: 2, type: 'task', ephemeral: 0, actionable: 0, triage: 0.20, blocksCount: 0 },
+        { id: 'eph-f2', title: 'Eph Fan 2', status: 'open', priority: 2, type: 'task', ephemeral: 0, actionable: 0, triage: 0.20, blocksCount: 0 },
+        { id: 'eph-f3', title: 'Eph Fan 3', status: 'open', priority: 2, type: 'task', ephemeral: 0, actionable: 0, triage: 0.20, blocksCount: 0 },
+        { id: 'eph-f4', title: 'Eph Fan 4', status: 'open', priority: 2, type: 'task', ephemeral: 0, actionable: 0, triage: 0.20, blocksCount: 0 },
+        // Non-ephemeral open wispprobe + closed ephemeral wispprobe for searchIssues hybrid parity
+        { id: 'open-wisp-ctrl', title: 'Standard Open wispprobe', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 1, triage: 0.60, blocksCount: 0 },
+        { id: 'closed-wisp-ctrl', title: 'Closed Ephemeral wispprobe', status: 'closed', priority: 1, type: 'task', ephemeral: 1, actionable: 0, triage: 0.10, blocksCount: 0 },
+        // 2. parent-child open-ancestor blocking gates vs unblocked open parent vs closed parent
+        { id: 'pc-gate', title: 'Parent Gate Blocker', status: 'open', priority: 0, type: 'task', ephemeral: 0, actionable: 1, triage: 0.80, blocksCount: 1 },
+        { id: 'pc-blocked-epic', title: 'Blocked Open Epic', status: 'open', priority: 1, type: 'epic', ephemeral: 0, actionable: 0, triage: 0.50, blocksCount: 0 },
+        { id: 'pc-blocked-child', title: 'Child Inheriting Open Epic Gate', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 0, triage: 0.50, blocksCount: 0 },
+        { id: 'pc-child-own-blocker', title: 'Direct Blocker On Dual-Gated Child', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 1, triage: 0.48, blocksCount: 1 },
+        { id: 'pc-dual-gated-child', title: 'Child With Both Blocked Epic And Direct Blocker', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 0, triage: 0.44, blocksCount: 0 },
+        { id: 'pc-unblocked-epic', title: 'Unblocked Open Epic', status: 'open', priority: 1, type: 'epic', ephemeral: 0, actionable: 1, triage: 0.55, blocksCount: 0 },
+        { id: 'pc-child-prereq', title: 'Direct Prereq Under Unblocked Epic', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 1, triage: 0.65, blocksCount: 1 },
+        { id: 'pc-gated-child', title: 'Child Under Unblocked Open Epic', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 0, triage: 0.45, blocksCount: 0 },
+        { id: 'pc-stale-blocker', title: 'Stale Open Blocker On Closed Epic', status: 'open', priority: 2, type: 'task', ephemeral: 0, actionable: 1, triage: 0.25, blocksCount: 0 },
+        { id: 'pc-closed-epic', title: 'Closed Epic Stops Inheritance', status: 'closed', priority: 1, type: 'epic', ephemeral: 0, actionable: 0, triage: 0.10, blocksCount: 0 },
+        { id: 'pc-closed-epic-prereq', title: 'Direct Prereq Under Closed Epic', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 1, triage: 0.60, blocksCount: 1 },
+        { id: 'pc-child-under-closed', title: 'Child Under Closed Epic', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 0, triage: 0.45, blocksCount: 0 },
+        // 3. Active 3-clique (k-core = 2) + Closed/Tombstone hubs (planted high SQL metrics as negative controls!)
+        { id: 'core-1', title: 'Active Clique 1', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 1, triage: 0.62, blocksCount: 2 },
+        { id: 'core-2', title: 'Active Clique 2', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 0, triage: 0.58, blocksCount: 1 },
+        { id: 'core-3', title: 'Active Clique 3', status: 'open', priority: 1, type: 'task', ephemeral: 0, actionable: 0, triage: 0.54, blocksCount: 0 },
+        { id: 'closed-hub', title: 'Planted Closed Hub', status: 'closed', priority: 0, type: 'task', ephemeral: 0, actionable: 0, triage: 0.99, blocksCount: 99, bw: 99.0 },
+        { id: 'closed-wing', title: 'Planted Closed Wing', status: 'closed', priority: 2, type: 'task', ephemeral: 0, actionable: 0, triage: 0.95, blocksCount: 50, bw: 50.0 },
+        { id: 'tomb-hub', title: 'Planted Tombstone Hub', status: 'tombstone', priority: 0, type: 'task', ephemeral: 0, actionable: 0, triage: 0.98, blocksCount: 88, bw: 88.0 },
+      ];
+
+      for (const it of seedIssues) {
+        DB_STATE.db.run(
+          'INSERT INTO issues (id, title, description, status, priority, issue_type, labels, ephemeral, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [it.id, it.title, it.title, it.status, it.priority, it.type, '[]', it.ephemeral, '2026-09-01T00:00:00Z', refTs]
+        );
+        DB_STATE.db.run(
+          'INSERT INTO issue_metrics (issue_id, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          [it.id, 0.05, it.bw || 0, 0.05, 1, it.triage, it.blocksCount, it.actionable ? 0 : 1]
+        );
+        if (it.status !== 'tombstone') {
+          DB_STATE.db.run(
+            'INSERT INTO issue_overview_mv (id, title, description, status, priority, issue_type, labels, created_at, updated_at, ephemeral, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocker_count, dependent_count, comment_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [it.id, it.title, it.title, it.status, it.priority, it.type, '[]', '2026-09-01T00:00:00Z', refTs, it.ephemeral, it.actionable ? 'satisfied' : 'unsatisfied', it.actionable, 0.05, it.bw || 0, 0.05, 1, it.triage, it.actionable ? 0 : 1, it.blocksCount, 0]
+          );
+        }
+      }
+
+      const seedDeps = [
+        // Sequential A -> B -> {C, D, E, seq-ephemeral, seq-parked}
+        ['seq-b', 'seq-a', 'blocks'],
+        ['seq-c', 'seq-b', 'blocks'],
+        ['seq-d', 'seq-b', 'blocks'],
+        ['seq-e', 'seq-b', 'blocks'],
+        ['seq-ephemeral', 'seq-b', 'blocks'],
+        ['seq-parked', 'seq-b', 'blocks'],
+        // Ephemeral root fan-out
+        ['eph-f1', 'eph-root', 'blocks'],
+        ['eph-f2', 'eph-root', 'blocks'],
+        ['eph-f3', 'eph-root', 'blocks'],
+        ['eph-f4', 'eph-root', 'blocks'],
+        // parent-child cases
+        ['pc-blocked-epic', 'pc-gate', 'blocks'],
+        ['pc-blocked-child', 'pc-blocked-epic', 'parent-child'],
+        ['pc-dual-gated-child', 'pc-blocked-epic', 'parent-child'],
+        ['pc-dual-gated-child', 'pc-child-own-blocker', 'blocks'],
+        ['pc-gated-child', 'pc-unblocked-epic', 'parent-child'],
+        ['pc-gated-child', 'pc-child-prereq', 'blocks'],
+        ['pc-closed-epic', 'pc-stale-blocker', 'blocks'],
+        ['pc-child-under-closed', 'pc-closed-epic', 'parent-child'],
+        ['pc-child-under-closed', 'pc-closed-epic-prereq', 'blocks'],
+        // Active 3-clique
+        ['core-2', 'core-1', 'blocks'],
+        ['core-3', 'core-1', 'blocks'],
+        ['core-3', 'core-2', 'blocks'],
+        // Closed/tombstone bridges & clique connected to active graph
+        ['closed-hub', 'seq-a', 'blocks'],
+        ['closed-wing', 'closed-hub', 'blocks'],
+        ['closed-wing', 'seq-a', 'blocks'],
+        ['tomb-hub', 'seq-a', 'blocks'],
+      ];
+      for (const [from, to, kind] of seedDeps) {
+        DB_STATE.db.run('INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES (?, ?, ?)', [from, to, kind]);
+      }
+
+      // Rebuild WASM graphs on the seeded DB and compute filtered subgraph metrics via recalculateMetrics
+      try { DB_STATE.db.run("INSERT INTO issues_fts(issues_fts) VALUES('rebuild')"); } catch {}
+      GRAPH_STATE.ready = false;
+      await initGraphEngine();
+      const baseGraphCounts = [GRAPH_STATE.graph.nodeCount(), GRAPH_STATE.graph.edgeCount()];
+      const recalcIds = seedIssues
+        .map(i => i.id)
+        .sort((a, b) => GRAPH_STATE.nodeMap.get(a) - GRAPH_STATE.nodeMap.get(b));
+      const recalc = recalculateMetrics(recalcIds);
+      const recalcClosedHubBw = recalc.betweenness[recalcIds.indexOf('closed-hub')];
+      const recalcSeqBBw = recalc.betweenness[recalcIds.indexOf('seq-b')];
+
+      // 1. getTopKSet(3) sequential chaining + getParallelCutData(5) parallelCutFiltered
+      const topK3 = getTopKSet(3);
+      const parallelCut = getParallelCutData(5);
+      const rawUnfilteredParallel = GRAPH_STATE.graph.parallelCutSuggestions(
+        buildClosedSet().subarray(0, GRAPH_STATE.graph.nodeCount()),
+        5
+      );
+      const rawUnfilteredLeader = rawUnfilteredParallel?.items?.[0]
+        ? GRAPH_STATE.graph.nodeId(rawUnfilteredParallel.items[0].node)
+        : null;
+
+      // 2. parent-child whatIfClose / whatIfCloseBatch / allWhatIf (viewer.js) & performWhatIf / performBatchWhatIf (graph.js)
+      const viewerCloseGate = whatIfClose('pc-gate');
+      const viewerCloseBlockedEpic = whatIfClose('pc-blocked-epic');
+      const viewerBatchBlockedEpic = window.beadsViewer.whatIfCloseBatch(['pc-blocked-epic']);
+      const viewerBatchEpicAndOwnBlocker = window.beadsViewer.whatIfCloseBatch(['pc-blocked-epic', 'pc-child-own-blocker']);
+      const allWhatIfRows = window.beadsViewer.allWhatIf(50);
+      const allWhatIfBlockedEpic = allWhatIfRows.find(r => r.issueId === 'pc-blocked-epic') || null;
+      const viewerCloseChildPrereq = whatIfClose('pc-child-prereq');
+      const viewerCloseUnderClosed = whatIfClose('pc-closed-epic-prereq');
+
+      const gvd = getGraphViewData();
+      const fgm = ${app}.forceGraphModule;
+      fgm.loadData(gvd.issues, gvd.dependencies, null);
+      const graphCloseGate = fgm.performWhatIf('pc-gate');
+      const graphGateUnblocked = (graphCloseGate?.unblocked_ids || []).map(idx => fgm.getWasmGraph().nodeId(idx));
+      const graphCloseBlockedEpic = fgm.performWhatIf('pc-blocked-epic');
+      const graphBlockedEpicUnblocked = (graphCloseBlockedEpic?.unblocked_ids || []).map(idx => fgm.getWasmGraph().nodeId(idx));
+      const graphBatchSingleEpic = fgm.performBatchWhatIf(['pc-blocked-epic']);
+      const graphBatchSingleEpicUnblocked = (graphBatchSingleEpic?.unblocked_ids || []).map(idx => fgm.getWasmGraph().nodeId(idx));
+      const graphBatchEpicAndOwn = fgm.performBatchWhatIf(['pc-blocked-epic', 'pc-child-own-blocker']);
+      const graphBatchEpicAndOwnUnblocked = (graphBatchEpicAndOwn?.unblocked_ids || []).map(idx => fgm.getWasmGraph().nodeId(idx));
+      const graphCloseChildPrereq = fgm.performWhatIf('pc-child-prereq');
+      const graphChildPrereqUnblocked = (graphCloseChildPrereq?.unblocked_ids || []).map(idx => fgm.getWasmGraph().nodeId(idx));
+      fgm.resetWhatIf();
+
+      // 3. Active-subgraph metrics & #/insights top-N closed/tombstone exclusion
+      const bridges = getBridgeDependencies(50);
+      const cutVertices = window.beadsViewer.getArticulationPoints(50);
+      const topKCore = window.beadsViewer.getTopByKCore(50);
+      const topBetweennessSql = getTopByBetweenness(50);
+      // Force WASM fallback path on getTopByBetweenness by zeroing SQL betweenness
+      DB_STATE.db.run('UPDATE issue_metrics SET betweenness = 0; UPDATE issue_overview_mv SET betweenness = 0');
+      const topBetweennessWasm = getTopByBetweenness(50);
+      const topTriage = window.beadsViewer.getTopByTriageScore(50);
+      const topBlockers = window.beadsViewer.getTopBlockers(50);
+      const prScores = GRAPH_STATE.graph.pagerankDefault();
+      const rankedPr = getRankedGraphIssues(prScores, 'pagerank', 50);
+      const rankedPrAllFiniteNonNeg = rankedPr.length > 8 && rankedPr.every(r => typeof r.pagerank === 'number' && Number.isFinite(r.pagerank) && r.pagerank >= 0);
+
+      const fgMetrics = fgm.getMetrics();
+      const closedHubIdx = fgm.getWasmGraph().nodeIdx('closed-hub');
+      const tombHubIdx = fgm.getWasmGraph().nodeIdx('tomb-hub');
+      const seqBIdx = fgm.getWasmGraph().nodeIdx('seq-b');
+      const core1Idx = fgm.getWasmGraph().nodeIdx('core-1');
+      const fgNodesById = Object.fromEntries(fgm.getGraph().graphData().nodes.map(n => [n.id, n]));
+
+      // 4. Hybrid ephemeral 0.2 parity in searchIssues + reference clock anchoring
+      const wispHybrid = searchIssues('wispprobe', { mode: 'hybrid', preset: 'default', limit: 20 });
+      const wispStatusScores = Object.fromEntries(wispHybrid.map(r => [r.id, r.component_scores?.status]));
+
+      const refNowMs = window.beadsViewer.getReferenceNowMs();
+      const overdueFutureRelativeToExport = isIssueOverdue({ status: 'open', due_date: '2026-10-01T00:00:00Z' });
+      const overduePastRelativeToExport = isIssueOverdue({ status: 'open', due_date: '2026-09-05T00:00:00Z' });
+      const formattedTwoDaysAgo = window.beadsViewer.formatDate('2026-09-08T12:00:00Z');
+      const burndown = window.bvCharts.computeBurndownData([
+        { id: 'bd-1', status: 'open', created_at: '2026-09-01T00:00:00Z' },
+      ]);
+
+      return {
+        baseGraphCounts,
+        recalcClosedHubBw,
+        recalcSeqBBw,
+        whatIfNodeCount: GRAPH_STATE.whatIfGraph.nodeCount(),
+        topKItems: topK3.items.map(i => [i.issueId, i.marginal_gain, i.unblocked_issue_ids]),
+        topKTotalGain: topK3.total_gain,
+        parallelCutIds: parallelCut.items.map(i => [i.issueId, i.parallel_gain]),
+        parallelCutOpenNodes: parallelCut.open_nodes,
+        parallelCutCurrentActionable: parallelCut.current_actionable,
+        rawUnfilteredLeader,
+        viewerCloseGateUnblocked: viewerCloseGate.unblocked_issue_ids.slice().sort(),
+        viewerCloseBlockedEpicUnblocked: viewerCloseBlockedEpic.unblocked_issue_ids.slice().sort(),
+        viewerBatchBlockedEpicUnblocked: viewerBatchBlockedEpic.unblocked_issue_ids.slice().sort(),
+        viewerBatchEpicAndOwnUnblocked: viewerBatchEpicAndOwnBlocker.unblocked_issue_ids.slice().sort(),
+        allWhatIfBlockedEpicUnblocked: (allWhatIfBlockedEpic?.result?.unblocked_issue_ids || []).slice().sort(),
+        allWhatIfBlockedEpicDirect: allWhatIfBlockedEpic?.result?.direct_unblocks || 0,
+        viewerCloseChildPrereqUnblocked: viewerCloseChildPrereq.unblocked_issue_ids.slice().sort(),
+        viewerCloseUnderClosedUnblocked: viewerCloseUnderClosed.unblocked_issue_ids.slice().sort(),
+        graphGateUnblocked: graphGateUnblocked.slice().sort(),
+        graphBlockedEpicUnblocked: graphBlockedEpicUnblocked.slice().sort(),
+        graphBatchSingleEpicUnblocked: graphBatchSingleEpicUnblocked.slice().sort(),
+        graphBatchEpicAndOwnUnblocked: graphBatchEpicAndOwnUnblocked.slice().sort(),
+        graphChildPrereqUnblocked: graphChildPrereqUnblocked.slice().sort(),
+        gvdHasEphemeral: gvd.issues.some(i => i.id === 'seq-ephemeral' && Number(i.ephemeral) === 1),
+        bridgesFromTo: bridges.map(b => b.from + '->' + b.to),
+        cutVertexIds: cutVertices.map(v => v.id),
+        topKCoreScores: Object.fromEntries(topKCore.map(r => [r.id, r.kcore])),
+        topBetweennessSqlIds: topBetweennessSql.map(r => r.id),
+        topBetweennessSqlSeqB: topBetweennessSql.find(r => r.id === 'seq-b')?.betweenness || 0,
+        topBetweennessWasmIds: topBetweennessWasm.map(r => r.id),
+        topBetweennessWasmSeqB: topBetweennessWasm.find(r => r.id === 'seq-b')?.betweenness || 0,
+        topTriageIds: topTriage.map(r => r.id),
+        topBlockerIds: topBlockers.map(r => r.id),
+        rankedPrIds: rankedPr.map(r => r.id),
+        rankedPrAllFiniteNonNeg,
+        fgVectorLen: fgMetrics.betweenness.length,
+        fgWasmLen: fgm.getWasmGraph().nodeCount(),
+        fgClosedBw: fgMetrics.betweenness[closedHubIdx],
+        fgTombBw: fgMetrics.betweenness[tombHubIdx],
+        fgSeqBBw: fgMetrics.betweenness[seqBIdx],
+        fgClosedKCore: fgMetrics.kcore[closedHubIdx],
+        fgCore1KCore: fgMetrics.kcore[core1Idx],
+        fgClosedArticulation: fgNodesById['closed-hub']?.isArticulationPoint,
+        fgSeqBArticulation: fgNodesById['seq-b']?.isArticulationPoint,
+        wispStatusScores,
+        refNowIso: new Date(refNowMs).toISOString(),
+        overdueFutureRelativeToExport,
+        overduePastRelativeToExport,
+        formattedTwoDaysAgo,
+        burndownLastLabel: burndown.labels.at(-1),
+        burndownLabelCount: burndown.labels.length,
+      };
+    } finally {
+      // Restore exact original capabilities SQLite DB, WASM engines, and force-graph state.
+      try { DB_STATE.db.close(); } catch {}
+      DB_STATE.db = new SQL.Database(savedDbBytes);
+      ensureSqlFunctions(DB_STATE.db);
+      DB_STATE.referenceDb = null;
+      DB_STATE.referenceNowMs = null;
+      GRAPH_STATE.ready = false;
+      await initGraphEngine();
+      const origGvd = getGraphViewData();
+      ${app}.forceGraphModule.loadData(origGvd.issues, origGvd.dependencies, null);
+    }
+  })()`);
+
+  // Assert Task 1 & [C-1]/[C-5]: getTopKSet sequential chaining, parallelCutFiltered + lifecycle open_nodes, and parent-child gates
+  assert.deepEqual(trackCAudit.baseGraphCounts, [32, 22], 'GRAPH_STATE.graph retains exact 32 nodes and 22 IsBlocking edges (excluding 4 parent-child edges and sentinel)');
+  assert.equal(trackCAudit.whatIfNodeCount, 33, 'companion whatIfGraph appends single unresolved sentinel at index N=32');
+  assert.deepEqual(
+    trackCAudit.topKItems,
+    [
+      ['pc-gate', 2, ['pc-blocked-child', 'pc-blocked-epic']],
+      ['seq-a', 1, ['seq-b']],
+      ['seq-b', 3, ['seq-c', 'seq-d', 'seq-e']],
+    ],
+    `getTopKSet(3) honors parent-child gates and chains sequential bottleneck seq-a -> seq-b -> {seq-c,seq-d,seq-e} while withholding ephemeral & parked review rows: ${JSON.stringify(trackCAudit.topKItems)}`
+  );
+  assert.equal(trackCAudit.topKTotalGain, 6, 'getTopKSet(3) total_gain sums step-1 (2) + step-2 (1) + chained step-3 (3) unlocks');
+  assert.equal(trackCAudit.rawUnfilteredLeader, 'eph-root', 'planted negative control: unfiltered parallelCutSuggestions would pick non-candidate eph-root');
+  assert.deepEqual(
+    trackCAudit.parallelCutIds,
+    [['pc-gate', 1]],
+    `getParallelCutData(parallelCutFiltered) excludes ephemeral eph-root & blocked seq-b and selects actionable pc-gate (parallel_gain=1): ${JSON.stringify(trackCAudit.parallelCutIds)}`
+  );
+  assert.equal(trackCAudit.parallelCutOpenNodes, 27, '[C-5] getParallelCutData.open_nodes reports true non-closed/non-tombstone node count (32 - 5 = 27)');
+  assert.ok(trackCAudit.parallelCutCurrentActionable > 0 && trackCAudit.parallelCutCurrentActionable < trackCAudit.parallelCutOpenNodes, 'getParallelCutData.current_actionable remains candidate-actionable subset');
+  assert.deepEqual(trackCAudit.viewerCloseGateUnblocked, ['pc-blocked-child', 'pc-blocked-epic'], 'viewer.js whatIfClose(pc-gate) unlocks both open epic and its parent-child subtask');
+  assert.deepEqual(trackCAudit.graphGateUnblocked, ['pc-blocked-child', 'pc-blocked-epic'], 'graph.js performWhatIf(pc-gate) unlocks both open epic and its parent-child subtask');
+  // [C-1] Simulating closing a blocked open parent epic stops ancestor inheritance while keeping child's own direct blockers enforced!
+  assert.deepEqual(trackCAudit.viewerCloseBlockedEpicUnblocked, ['pc-blocked-child'], '[C-1] viewer.js whatIfClose(pc-blocked-epic) unblocks pc-blocked-child while withholding pc-dual-gated-child (own blocker open)');
+  assert.deepEqual(trackCAudit.viewerBatchBlockedEpicUnblocked, ['pc-blocked-child'], '[C-1] viewer.js whatIfCloseBatch([pc-blocked-epic]) unblocks pc-blocked-child and withholds pc-dual-gated-child');
+  assert.deepEqual(trackCAudit.viewerBatchEpicAndOwnUnblocked, ['pc-blocked-child', 'pc-dual-gated-child'], '[C-1] viewer.js whatIfCloseBatch([pc-blocked-epic, pc-child-own-blocker]) unblocks both children');
+  assert.equal(trackCAudit.allWhatIfBlockedEpicDirect, 1, '[C-1] viewer.js allWhatIf() evaluates blocked open parent epic with direct_unblocks=1');
+  assert.deepEqual(trackCAudit.allWhatIfBlockedEpicUnblocked, ['pc-blocked-child'], '[C-1] viewer.js allWhatIf() unblocks pc-blocked-child for pc-blocked-epic');
+  assert.deepEqual(trackCAudit.graphBlockedEpicUnblocked, ['pc-blocked-child'], '[C-1] graph.js performWhatIf(pc-blocked-epic) unblocks pc-blocked-child while pc-gate is open');
+  assert.deepEqual(trackCAudit.graphBatchSingleEpicUnblocked, ['pc-blocked-child'], '[C-1] graph.js performBatchWhatIf([pc-blocked-epic]) unblocks pc-blocked-child');
+  assert.deepEqual(trackCAudit.graphBatchEpicAndOwnUnblocked, ['pc-blocked-child', 'pc-dual-gated-child'], '[C-1] graph.js performBatchWhatIf([pc-blocked-epic, pc-child-own-blocker]) unblocks both children');
+  assert.deepEqual(trackCAudit.viewerCloseChildPrereqUnblocked, ['pc-gated-child'], 'unblocked open parent pc-unblocked-epic does NOT block pc-gated-child');
+  assert.deepEqual(trackCAudit.graphChildPrereqUnblocked, ['pc-gated-child'], 'graph.js performWhatIf confirms unblocked open parent does NOT block child');
+  assert.deepEqual(trackCAudit.viewerCloseUnderClosedUnblocked, ['pc-child-under-closed'], 'closed parent pc-closed-epic stops open-ancestor blocker inheritance');
+  assert.equal(trackCAudit.gvdHasEphemeral, true, 'getGraphViewData exposes ephemeral column to graph.js');
+
+  // Assert Task 2 & [C-2]: activeGraph metrics & closed/tombstone exclusion across viewer.js and graph.js
+  assert.equal(trackCAudit.rankedPrIds.length, 27, '[C-2] getRankedGraphIssues(prScores, "pagerank", 50) ranks all 27 active visible issues (> 8)');
+  assert.equal(trackCAudit.rankedPrAllFiniteNonNeg, true, '[C-2] getRankedGraphIssues populates finite non-negative numeric pagerank on every returned issue');
+  for (const resolvedId of ['closed-hub', 'closed-wing', 'tomb-hub']) {
+    assert.equal(trackCAudit.bridgesFromTo.some(e => e.includes(resolvedId)), false, `getBridgeDependencies excludes ${resolvedId}`);
+    assert.equal(trackCAudit.cutVertexIds.includes(resolvedId), false, `getArticulationPoints excludes ${resolvedId}`);
+    assert.equal(Object.hasOwn(trackCAudit.topKCoreScores, resolvedId), false, `getTopByKCore excludes ${resolvedId}`);
+    assert.equal(trackCAudit.topBetweennessSqlIds.includes(resolvedId), false, `getTopByBetweenness (SQL) excludes ${resolvedId}`);
+    assert.equal(trackCAudit.topBetweennessWasmIds.includes(resolvedId), false, `getTopByBetweenness (WASM fallback) excludes ${resolvedId}`);
+    assert.equal(trackCAudit.topTriageIds.includes(resolvedId), false, `getTopByTriageScore excludes ${resolvedId} despite planted 0.99 score`);
+    assert.equal(trackCAudit.topBlockerIds.includes(resolvedId), false, `getTopBlockers excludes ${resolvedId} despite planted 99 blocks_count`);
+    assert.equal(trackCAudit.rankedPrIds.includes(resolvedId), false, `getRankedGraphIssues excludes ${resolvedId}`);
+  }
+  assert.equal(trackCAudit.bridgesFromTo.includes('seq-b->seq-a'), true, 'getBridgeDependencies detects active bridge seq-b->seq-a');
+  assert.equal(trackCAudit.cutVertexIds.includes('seq-b'), true, 'getArticulationPoints detects active cut vertex seq-b');
+  assert.equal(trackCAudit.topKCoreScores['core-1'], 2, 'getTopByKCore computes active 3-clique k-core = 2');
+  assert.ok(trackCAudit.topBetweennessSqlSeqB > 0 && trackCAudit.topBetweennessWasmSeqB > 0, 'seq-b has positive active betweenness in both SQL and WASM fallback');
+  assert.equal(trackCAudit.recalcClosedHubBw, 0, 'recalculateMetrics zeros closed-hub betweenness via activeGraph');
+  assert.ok(trackCAudit.recalcSeqBBw > 0, 'recalculateMetrics computes positive active betweenness for seq-b');
+  assert.equal(trackCAudit.fgVectorLen, trackCAudit.fgWasmLen, 'graph.js projects active betweenness to full wasmGraph length');
+  assert.equal(trackCAudit.fgClosedBw, 0, 'graph.js projects 0 betweenness for closed-hub');
+  assert.equal(trackCAudit.fgTombBw, 0, 'graph.js projects 0 betweenness for tomb-hub');
+  assert.ok(trackCAudit.fgSeqBBw > 0, 'graph.js projects positive active betweenness for seq-b');
+  assert.equal(trackCAudit.fgClosedKCore, 0, 'graph.js projects 0 k-core for closed-hub');
+  assert.equal(trackCAudit.fgCore1KCore, 2, 'graph.js projects active k-core=2 for core-1');
+  assert.equal(trackCAudit.fgClosedArticulation, false, 'graph.js suppresses isArticulationPoint on closed-hub');
+  assert.equal(trackCAudit.fgSeqBArticulation, true, 'graph.js sets isArticulationPoint=true on active cut vertex seq-b');
+
+  // Assert Task 3: ephemeral 0.2 hybrid parity & getReferenceNowMs() wall-clock anchoring
+  assert.deepEqual(trackCAudit.wispStatusScores, {
+    'open-wisp-ctrl': 1.0,
+    'eph-root': 0.2,
+    'seq-ephemeral': 0.2,
+    'closed-wisp-ctrl': 0.1,
+  }, 'searchIssues hybrid scoring downgrades open ephemeral rows to 0.2 while keeping open=1.0 and closed=0.1');
+  assert.equal(trackCAudit.refNowIso, '2026-09-10T12:00:00.000Z', 'getReferenceNowMs anchors to SQLite export_meta timestamp');
+  assert.equal(trackCAudit.overdueFutureRelativeToExport, false, 'isIssueOverdue anchors to getReferenceNowMs (2026-10-01 is NOT overdue at 2026-09-10 export time)');
+  assert.equal(trackCAudit.overduePastRelativeToExport, true, 'isIssueOverdue flags due_date before export reference time');
+  assert.equal(trackCAudit.formattedTwoDaysAgo, '2d ago', 'formatDate anchors relative age to getReferenceNowMs (2026-09-08 vs 2026-09-10 = 2d ago)');
+  assert.ok(trackCAudit.burndownLastLabel?.startsWith('Sep '), `computeBurndownData anchors maxDate to Sep 2026 reference clock instead of Nov 2026 wall-clock Date.now(): ${trackCAudit.burndownLastLabel}`);
+  assert.equal(trackCAudit.burndownLabelCount, 10, 'computeBurndownData emits exact 10 daily buckets from 2026-09-01 through 2026-09-10');
+
   // 5. Error Modal runErrorAction(action) recovery handler ({ action }, { handler }, { url }).
   await evaluate(page, `(() => {
     window.__errorRecovered = [];
@@ -2955,10 +3300,36 @@ async function standaloneGraphJourney(page) {
     const rect = menu.getBoundingClientRect();
     const clampedInsideViewport = rect.right <= window.innerWidth && rect.bottom <= window.innerHeight && rect.left >= 0 && rect.top >= 0;
     hideContextMenu();
-    return { darkLinkColor, lightLinkColor, clampedInsideViewport };
+
+    // Verify closed-node Cut Vertex badge suppression + ephemeral/pinned/template withholding
+    const closedCutProbe = { id: 'probe-closed-cut', title: 'Closed Cut', status: 'closed', priority: 1, type: 'task', is_articulation: true, slack_available: false };
+    const openCutProbe = { id: 'probe-open-cut', title: 'Open Cut', status: 'open', priority: 1, type: 'task', is_articulation: true, slack_available: false };
+    populatePanelContent('docked-', closedCutProbe);
+    const closedCutBadges = [...document.querySelectorAll('#docked-badges .badge')].map(el => el.textContent.trim());
+    populatePanelContent('docked-', openCutProbe);
+    const openCutBadges = [...document.querySelectorAll('#docked-badges .badge')].map(el => el.textContent.trim());
+
+    const ephProbe = { id: 'probe-eph', status: 'open', priority: 1, ephemeral: true };
+    const pinProbe = { id: 'probe-pin', status: 'open', priority: 1, pinned: true };
+    const tplProbe = { id: 'probe-tpl', status: 'open', priority: 1, is_template: true };
+    const readyProbe = { id: 'probe-ready', status: 'open', priority: 1, ephemeral: false };
+
+    return {
+      darkLinkColor,
+      lightLinkColor,
+      clampedInsideViewport,
+      closedCutHasBadge: closedCutBadges.includes('Cut Vertex'),
+      openCutHasBadge: openCutBadges.includes('Cut Vertex'),
+      withheldActionable: [isNodeActionable(ephProbe), isNodeActionable(pinProbe), isNodeActionable(tplProbe), isNodeActionable(readyProbe)],
+      withheldColors: [computeNodeBaseColor(ephProbe), computeNodeBaseColor(pinProbe), computeNodeBaseColor(tplProbe), computeNodeBaseColor(readyProbe)],
+    };
   })()`);
   assert.notEqual(standaloneThemeAndMenuAudit.darkLinkColor, standaloneThemeAndMenuAudit.lightLinkColor, 'standalone graph switches default link color in light mode');
   assert.equal(standaloneThemeAndMenuAudit.clampedInsideViewport, true, 'standalone graph clamps #context-menu inside viewport bounds');
+  assert.equal(standaloneThemeAndMenuAudit.closedCutHasBadge, false, 'standalone graph suppresses Cut Vertex badge on closed nodes even if is_articulation=true');
+  assert.equal(standaloneThemeAndMenuAudit.openCutHasBadge, true, 'standalone graph renders Cut Vertex badge on active articulation nodes');
+  assert.deepEqual(standaloneThemeAndMenuAudit.withheldActionable, [false, false, false, true], 'standalone graph withholds ephemeral, pinned, and template open nodes from actionability');
+  assert.deepEqual(standaloneThemeAndMenuAudit.withheldColors, ['#94a3b8', '#94a3b8', '#94a3b8', '#22c55e'], 'standalone graph colors withheld nodes muted slate (#94a3b8) instead of open green (#22c55e)');
 
   await capture(page, 'standalone-graph');
   clean(page);

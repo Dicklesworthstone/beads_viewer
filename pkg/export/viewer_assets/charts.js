@@ -351,6 +351,18 @@ function isChartBlockingDep(dep) {
     return !dep.type || ['blocks', 'conditional-blocks', 'waits-for'].includes(dep.type);
 }
 
+function resolveChartsReferenceNowMs() {
+    const viewerNow = typeof window !== 'undefined' ? window.beadsViewer?.getReferenceNowMs?.() : undefined;
+    if (typeof viewerNow === 'number' && Number.isFinite(viewerNow) && viewerNow > 0) {
+        return viewerNow;
+    }
+    const winNow = typeof window !== 'undefined' ? window.BV_REFERENCE_NOW_MS : undefined;
+    if (typeof winNow === 'number' && Number.isFinite(winNow) && winNow > 0) {
+        return winNow;
+    }
+    return Date.now();
+}
+
 function resolveClosedDate(issue) {
     const rawClosed = issue.closed_at || issue.closedAt;
     if (rawClosed) {
@@ -414,7 +426,13 @@ function computeBurndownData() {
     }
 
     const minDate = new Date(Math.min(...dates));
-    const maxDate = new Date();
+    const refNow = new Date(resolveChartsReferenceNowMs());
+    const maxTimestamp = Math.max(
+        refNow.getTime(),
+        minDate.getTime(),
+        ...issues.map(i => lifecycleById.get(i.id)?.closedAt?.getTime()).filter(Number.isFinite)
+    );
+    const maxDate = new Date(maxTimestamp);
 
     // Generate daily buckets
     const buckets = new Map();

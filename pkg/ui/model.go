@@ -275,8 +275,12 @@ type SourceReloadResult struct {
 	Issues              []model.Issue
 	Authority           *model.ReadinessIndex
 	CandidateIDs        map[string]bool
+	LabelFilter         string
+	RepoFilter          string
 	Warnings            []string
 	Workspace           *WorkspaceInfo
+	Sprints             []model.Sprint
+	SprintsLoaded       bool
 	AuthorityIncomplete bool
 	SourcePath          string
 	SourceDegraded      bool
@@ -356,7 +360,7 @@ func (m *Model) startSourceReload() tea.Cmd {
 	if m.sourceReload != nil {
 		return m.sourceReloadCmd()
 	}
-	if m.beadsPath == "" && m.watcher == nil {
+	if (m.beadsPath == "" || isHistoricalGitBeadsPath(m.beadsPath)) && m.watcher == nil {
 		return nil
 	}
 	return func() tea.Msg { return FileChangedMsg{} }
@@ -1241,9 +1245,9 @@ func loadHistoryForWorkDirAtRevisionCmd(
 		trimmedBeadsPath := strings.TrimSpace(beadsPath)
 		fsBeadsPath := beadsPath
 		effectiveRev := strings.TrimSpace(revision)
-		if strings.HasPrefix(trimmedBeadsPath, "git:") {
+		if isHistoricalGitBeadsPath(trimmedBeadsPath) {
 			if effectiveRev == "" {
-				effectiveRev = strings.TrimSpace(strings.TrimPrefix(trimmedBeadsPath, "git:"))
+				effectiveRev = gitRevisionFromBeadsPath(trimmedBeadsPath)
 			}
 			fsBeadsPath = ""
 		}
@@ -1376,11 +1380,45 @@ func cloneIssuesForAsync(issues []model.Issue) []model.Issue {
 	return clones
 }
 
+func splitHistoricalGitBeadsPath(beadsPath string) (rev, repoRelPath string, ok bool) {
+	trimmed := strings.TrimSpace(beadsPath)
+	if !strings.HasPrefix(trimmed, "git:") {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "git:"))
+	if rest == "" {
+		return "", "", true
+	}
+	braceDepth := 0
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case '{':
+			braceDepth++
+		case '}':
+			if braceDepth > 0 {
+				braceDepth--
+			}
+		case ':':
+			if braceDepth == 0 {
+				return strings.TrimSpace(rest[:i]), strings.TrimSpace(rest[i+1:]), true
+			}
+		}
+	}
+	return rest, "", true
+}
+
+func gitRevisionFromBeadsPath(beadsPath string) string {
+	rev, _, _ := splitHistoricalGitBeadsPath(beadsPath)
+	return rev
+}
+
 // ReadinessScope keeps selected work separate from graph context. A nil
 // CandidateIDs map selects all issues; an empty map selects no work.
 type ReadinessScope struct {
 	Authority           *model.ReadinessIndex
 	CandidateIDs        map[string]bool
+	LabelFilter         string
+	RepoFilter          string
 	AuthorityIncomplete bool
 	SourceDegraded      bool
 	ExplicitDB          bool
@@ -1405,6 +1443,8 @@ type Model struct {
 	analysis                 *analysis.GraphStats
 	phase2PreparationCancel  context.CancelFunc
 	candidateIDs             map[string]bool  // Owned selection; graph context remains in issues.
+	scopeLabelFilter         string           // Optional CLI --label filter for dynamic historical scoping.
+	scopeRepoFilter          string           // Optional CLI --repo filter for dynamic historical scoping.
 	authorityHash            string           // Full authority hash (including tombstones) for export provenance.
 	authorityIncomplete      bool             // True when authority is incomplete, historical, or warned.
 	sourceDegraded           bool             // True when discovery fell back to a stale/degraded source.
@@ -1618,6 +1658,7 @@ type Model struct {
 
 	// Workspace mode state
 	workspaceMode        bool            // True when viewing multiple repos
+	workspaceInfo        WorkspaceInfo   // Full workspace metadata including configured repo targets
 	workspaceFailedCount int             // Count of failed workspace repos
 	availableRepos       []string        // List of repo prefixes available
 	activeRepos          map[string]bool // Which repos are currently shown (nil = all)
@@ -1719,7 +1760,7 @@ func (m *Model) candidateScopedIssues() []model.Issue {
 // getCrossFlowsForLabel returns outgoing cross-label dependency counts for a label
 func (m *Model) getCrossFlowsForLabel(label string) labelFlowSummary {
 	cfg := analysis.DefaultLabelHealthConfig()
-	flow := analysis.ComputeCrossLabelFlow(m.repoScopedIssues(), cfg)
+	flow := analysis.ComputeCrossLabelFlowWithScope(m.repoScopedIssues(), cfg, m.candidateIDs)
 	out := labelFlowSummary{}
 	inCounts := make(map[string]int)
 	outCounts := make(map[string]int)
@@ -1791,6 +1832,15 @@ func extractLabelCounts(stats map[string]*analysis.LabelStats) map[string]int {
 	return counts
 }
 
+// WorkspaceRepoTarget describes a configured workspace repository for historical
+// loading and scoping even when the repository has zero live issues at HEAD.
+type WorkspaceRepoTarget struct {
+	Name     string
+	Path     string
+	BeadsDir string
+	Prefix   string
+}
+
 // WorkspaceInfo contains workspace loading metadata for TUI display
 type WorkspaceInfo struct {
 	Enabled      bool
@@ -1798,6 +1848,7 @@ type WorkspaceInfo struct {
 	FailedCount  int
 	TotalIssues  int
 	RepoPrefixes []string
+	Repos        []WorkspaceRepoTarget
 }
 
 func (m *Model) updateSemanticIDs(items []list.Item) {
@@ -2524,6 +2575,7 @@ func (m *Model) SetSprints(sprints []model.Sprint) {
 	if len(sprints) == 0 {
 		m.sprints = nil
 		m.selectedSprint = nil
+		m.sprintViewText = ""
 	} else {
 		cloned := make([]model.Sprint, len(sprints))
 		for i := range sprints {
@@ -2536,7 +2588,7 @@ func (m *Model) SetSprints(sprints []model.Sprint) {
 		idx := activeSprintIndex(m.sprints, m.analysisReferenceTime())
 		m.selectedSprint = &m.sprints[idx]
 	}
-	if m.isSprintView || m.focused == focusSprint || m.selectedSprint != nil {
+	if m.isSprintView || m.effectiveUnderlyingFocus() == focusSprint || m.selectedSprint != nil {
 		m.sprintViewText = m.renderSprintDashboard()
 	}
 }
@@ -2565,6 +2617,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	// Graph Analysis - Phase 1 is instant, Phase 2 runs in background
 	analyzer := analysis.NewAnalyzer(issues)
 	var candidateIDs map[string]bool
+	var scopeLabelFilter, scopeRepoFilter string
 	var referenceNow time.Time
 	if len(scope) > 0 {
 		if scope[0].CandidateIDs != nil {
@@ -2573,6 +2626,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 				candidateIDs[id] = selected
 			}
 		}
+		scopeLabelFilter = strings.TrimSpace(scope[0].LabelFilter)
+		scopeRepoFilter = strings.TrimSpace(scope[0].RepoFilter)
 		if !scope[0].ReferenceNow.IsZero() {
 			referenceNow = scope[0].ReferenceNow
 			analyzer.SetNow(referenceNow)
@@ -2737,7 +2792,16 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	recipePicker := NewRecipePickerModel(recipeLoader.List(), theme)
 
 	// Initialize label picker (bv-126)
-	labelExtraction := analysis.ExtractLabels(issues)
+	labelPickerIssues := issues
+	if candidateIDs != nil {
+		labelPickerIssues = make([]model.Issue, 0, len(issues))
+		for _, iss := range issues {
+			if candidateIDs[iss.ID] {
+				labelPickerIssues = append(labelPickerIssues, iss)
+			}
+		}
+	}
+	labelExtraction := analysis.ExtractLabels(labelPickerIssues)
 	labelCounts := extractLabelCounts(labelExtraction.Stats)
 	labelPicker := NewLabelPickerModel(labelExtraction.Labels, labelCounts, theme)
 
@@ -2765,10 +2829,10 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		}
 	}
 
-	isGitRefSource := strings.HasPrefix(strings.TrimSpace(beadsPath), "git:")
+	isGitRefSource := isHistoricalGitBeadsPath(beadsPath)
 	asOfRevision := ""
 	if isGitRefSource {
-		asOfRevision = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(beadsPath), "git:"))
+		asOfRevision = gitRevisionFromBeadsPath(beadsPath)
 	}
 
 	if beadsPath != "" && !isGitRefSource && backgroundModeRequested {
@@ -2903,6 +2967,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		issueMap:                       issueMap,
 		analyzer:                       analyzer,
 		candidateIDs:                   candidateIDs,
+		scopeLabelFilter:               scopeLabelFilter,
+		scopeRepoFilter:                scopeRepoFilter,
 		authorityHash:                  authorityHash,
 		referenceNow:                   referenceNow,
 		asOfRevision:                   asOfRevision,
@@ -3284,8 +3350,8 @@ func (m *Model) Init() tea.Cmd {
 		cmds = append(cmds, historyCmd)
 	}
 	// Check for AGENTS.md integration prompt (bv-i8dk).
-	// Skip in read-only historical mode (beadsPath == "") or workspace mode.
-	if m.beadsPath != "" && m.workDir != "" && !m.workspaceMode {
+	// Skip in read-only historical mode (beadsPath == "" or git:...) or workspace mode.
+	if m.beadsPath != "" && !isHistoricalGitBeadsPath(m.beadsPath) && m.workDir != "" && !m.workspaceMode {
 		cmds = append(cmds, CheckAgentFileCmd(m.workDir))
 	}
 	return tea.Batch(cmds...)
@@ -4340,11 +4406,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// The worker owns its analyzer. Bind a UI-owned analyzer to the
 			// fresh authority without mutating analysis still used off-thread.
 			m.analyzer = analysis.NewAnalyzer(m.issues)
+			m.analyzer.RestoreScoring(msg.Snapshot.Analyzer.CaptureScoring())
 			if !m.referenceNow.IsZero() {
 				m.analyzer.SetNow(m.referenceNow)
 			}
 			m.analyzer.SetReadinessScope(msg.Snapshot.Analyzer.Readiness(), m.candidateIDs)
-			m.analyzer.RestoreScoring(msg.Snapshot.Analyzer.CaptureScoring())
 			if w := feedbackWeightsForBeadsPath(m.beadsPath); w != nil {
 				m.analyzer.SetWeights(*w)
 			}
@@ -4786,7 +4852,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.backgroundWorker != nil && m.backgroundWorker.State() == WorkerStopped {
 			m.backgroundWorker = nil
 		}
-		if m.beadsPath == "" && msg.source == nil {
+		if (m.beadsPath == "" || isHistoricalGitBeadsPath(m.beadsPath)) && msg.source == nil {
 			// Re-start watch for next change
 			if m.watcher != nil {
 				cmds = append(cmds, WatchFileCmd(m.watcher))
@@ -4866,9 +4932,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 		}
 		m.sourceStaleReason = ""
-		if m.instanceLock != nil {
-			m.instanceLock.Refresh()
-		}
 		if msg.source != nil {
 			m.authorityHash = analysis.ComputeDataHash(msg.source.Issues)
 			if msg.source.Workspace != nil {
@@ -4879,18 +4942,36 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.workspaceMode && msg.source.SourcePath != "" {
 				prevPath := m.beadsPath
 				m.beadsPath = msg.source.SourcePath
-				m.tree.SetBeadsDir(filepath.Dir(m.beadsPath))
-				m.tree.SetReadOnly(strings.HasPrefix(m.beadsPath, "git:"))
-				if prevPath != m.beadsPath {
-					if m.backgroundWorker != nil && !strings.HasSuffix(strings.ToLower(m.beadsPath), ".jsonl") {
+				if isHistoricalGitBeadsPath(m.beadsPath) {
+					m.SetAsOfRevision(gitRevisionFromBeadsPath(m.beadsPath))
+					m.tree.SetBeadsDir("")
+					m.tree.SetReadOnly(true)
+					if m.instanceLock != nil {
+						m.instanceLock.Release()
+						m.instanceLock = nil
+					}
+					if m.backgroundWorker != nil {
 						m.backgroundWorker.Stop()
 						m.backgroundWorker = nil
 					}
-					if m.watcher != nil && !strings.HasPrefix(m.beadsPath, "git:") {
-						if w, wErr := watcher.NewWatcher(m.beadsPath, watcher.WithDebounceDuration(200*time.Millisecond)); wErr == nil {
-							if sErr := w.Start(); sErr == nil {
-								m.watcher.Stop()
-								m.watcher = w
+					if m.watcher != nil {
+						m.watcher.Stop()
+						m.watcher = nil
+					}
+				} else {
+					m.tree.SetBeadsDir(filepath.Dir(m.beadsPath))
+					m.tree.SetReadOnly(false)
+					if prevPath != m.beadsPath {
+						if m.backgroundWorker != nil && !strings.HasSuffix(strings.ToLower(m.beadsPath), ".jsonl") {
+							m.backgroundWorker.Stop()
+							m.backgroundWorker = nil
+						}
+						if m.watcher != nil {
+							if w, wErr := watcher.NewWatcher(m.beadsPath, watcher.WithDebounceDuration(200*time.Millisecond)); wErr == nil {
+								if sErr := w.Start(); sErr == nil {
+									m.watcher.Stop()
+									m.watcher = w
+								}
 							}
 						}
 					}
@@ -4899,9 +4980,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sourceDegraded = msg.source.SourceDegraded
 			m.authorityIncomplete = msg.source.AuthorityIncomplete || msg.source.SourceDegraded
 			m.candidateIDs = maps.Clone(msg.source.CandidateIDs)
+			m.scopeLabelFilter = strings.TrimSpace(msg.source.LabelFilter)
+			m.scopeRepoFilter = strings.TrimSpace(msg.source.RepoFilter)
 		} else {
 			m.authorityHash = loadedIssues.AuthorityHash
 			m.authorityIncomplete = m.sourceDegraded || !loadedIssues.AuthorityComplete || len(reloadWarnings) > 0
+		}
+		if m.instanceLock != nil {
+			m.instanceLock.Refresh()
 		}
 		// A synchronous reload after background mode stops must not retain the
 		// previous worker snapshot. Its later Phase 2 completion would otherwise
@@ -5177,7 +5263,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Reload sprints (bv-161)
-		m.reloadSprintsFromDisk(underlyingFocus)
+		if msg.source != nil && msg.source.SprintsLoaded {
+			prevSprintID := ""
+			if m.selectedSprint != nil {
+				prevSprintID = m.selectedSprint.ID
+			}
+			m.SetSprints(msg.source.Sprints)
+			if prevSprintID != "" && len(m.sprints) > 0 {
+				for i := range m.sprints {
+					if m.sprints[i].ID == prevSprintID {
+						m.selectedSprint = &m.sprints[i]
+						m.sprintViewText = m.renderSprintDashboard()
+						break
+					}
+				}
+			}
+			if len(m.sprints) == 0 && (m.isSprintView || underlyingFocus == focusSprint) {
+				m.sprintViewText = m.renderSprintDashboard()
+			}
+		} else if isHistoricalGitBeadsPath(m.beadsPath) {
+			m.SetSprints(nil)
+		} else {
+			m.reloadSprintsFromDisk(underlyingFocus)
+		}
 
 		// Keep semantic index current when enabled.
 		if m.semanticSearchEnabled {
@@ -5225,7 +5333,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		slowReload := reloadDuration >= time.Second
 		canPromoteToBackground := !m.workspaceMode && !m.isExplicitDB && m.candidateIDs == nil &&
 			(m.sourceReload == nil || m.restoreBackgroundAfterEdit) &&
-			m.beadsPath != "" && strings.HasSuffix(strings.ToLower(m.beadsPath), ".jsonl")
+			m.beadsPath != "" && !isHistoricalGitBeadsPath(m.beadsPath) && strings.HasSuffix(strings.ToLower(m.beadsPath), ".jsonl")
 		if (slowReload || m.restoreBackgroundAfterEdit) && m.backgroundWorker == nil && canPromoteToBackground {
 			autoAllowed := true
 			if v := strings.TrimSpace(env.BackgroundMode.Get()); v != "" {
@@ -5655,7 +5763,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.ensureActiveModalInputFocus()
 					return m, m.pendingSemanticFilterCmd()
 				case "g":
-					sg := analysis.ComputeLabelSubgraph(m.repoScopedIssues(), m.labelDrilldownLabel)
+					sg := analysis.ComputeLabelSubgraph(m.candidateScopedIssues(), m.labelDrilldownLabel)
 					pr := analysis.ComputeLabelPageRank(sg)
 					cp := analysis.ComputeLabelCriticalPath(sg)
 					m.labelGraphAnalysisResult = &LabelGraphAnalysisResult{
@@ -5891,7 +5999,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			if m.pendingTrackerRefresh == nil &&
 				(m.backgroundWorker == nil || m.backgroundWorker.State() == WorkerStopped) &&
-				m.beadsPath == "" && m.watcher == nil && m.sourceReload == nil {
+				(m.beadsPath == "" || isHistoricalGitBeadsPath(m.beadsPath)) && m.watcher == nil && m.sourceReload == nil {
 				if m.backgroundWorker != nil {
 					m.backgroundWorker = nil
 				}
@@ -6937,7 +7045,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Flow matrix view (cross-label dependencies)
 				scopedIssues := m.repoScopedIssues()
 				cfg := analysis.DefaultLabelHealthConfig()
-				flow := analysis.ComputeCrossLabelFlow(scopedIssues, cfg)
+				flow := analysis.ComputeCrossLabelFlowWithScope(scopedIssues, cfg, m.candidateIDs)
 				m.isGraphView = false
 				m.isBoardView = false
 				m.isActionableView = false
@@ -6947,6 +7055,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focused = focusFlowMatrix
 				m.flowDetailID = ""
 				m.flowMatrix = NewFlowMatrixModel(m.theme)
+				m.flowMatrix.SetScope(m.analysisReferenceTime(), m.exportReadiness(), m.candidateIDs)
 				m.flowMatrix.SetData(&flow, scopedIssues)
 				panelHeight := m.height - 2
 				if panelHeight < 3 {
@@ -7006,7 +7115,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "l":
 				// Open label picker for quick filter (bv-126)
-				scopedIssues := m.repoScopedIssues()
+				scopedIssues := m.candidateScopedIssues()
 				if len(scopedIssues) == 0 {
 					return m, nil
 				}
@@ -8206,7 +8315,8 @@ func openBrowserURL(url string) error {
 // refreshFlowMatrix installs current relationship data without losing navigation.
 func (m *Model) refreshFlowMatrix() {
 	scoped := m.repoScopedIssues()
-	flow := analysis.ComputeCrossLabelFlow(scoped, analysis.DefaultLabelHealthConfig())
+	flow := analysis.ComputeCrossLabelFlowWithScope(scoped, analysis.DefaultLabelHealthConfig(), m.candidateIDs)
+	m.flowMatrix.SetScope(m.analysisReferenceTime(), m.exportReadiness(), m.candidateIDs)
 	m.flowMatrix.SetData(&flow, scoped)
 	if m.flowDetailID != "" {
 		selected := m.flowMatrix.SelectedDrilldownIssue()
@@ -11927,6 +12037,7 @@ func (m *Model) applyContentSizing() {
 	m.attentionView.SetSize(contentWidth, bodyHeight)
 	m.flowMatrix.SetSize(contentWidth, bodyHeight)
 	m.tree.SetSize(contentWidth, bodyHeight)
+	m.graphView.SetSize(contentWidth, bodyHeight)
 	m.actionableView.SetSize(contentWidth, m.height-2)
 	m.historyView.SetSize(contentWidth, bodyHeight)
 	if m.isSprintView && m.selectedSprint != nil {
@@ -12501,9 +12612,24 @@ func (m Model) FilteredIssues() []model.Issue {
 
 // EnableWorkspaceMode configures the model for workspace (multi-repo) view
 func (m *Model) EnableWorkspaceMode(info WorkspaceInfo) {
+	clonedInfo := info
+	clonedInfo.RepoPrefixes = append([]string(nil), info.RepoPrefixes...)
+	clonedInfo.Repos = append([]WorkspaceRepoTarget(nil), info.Repos...)
+	m.workspaceInfo = clonedInfo
 	m.workspaceMode = info.Enabled
 	m.workspaceFailedCount = info.FailedCount
-	m.availableRepos = normalizeRepoPrefixes(info.RepoPrefixes)
+	prefixes := info.RepoPrefixes
+	if len(prefixes) == 0 && len(info.Repos) > 0 {
+		prefixes = make([]string, 0, len(info.Repos))
+		for _, r := range info.Repos {
+			if strings.TrimSpace(r.Prefix) != "" {
+				prefixes = append(prefixes, r.Prefix)
+			} else if strings.TrimSpace(r.Name) != "" {
+				prefixes = append(prefixes, r.Name)
+			}
+		}
+	}
+	m.availableRepos = normalizeRepoPrefixes(prefixes)
 	m.activeRepos = nil // nil means all repos are active
 
 	if info.RepoCount > 0 {
@@ -12699,6 +12825,120 @@ func newScopedTimeTravelSnapshot(issues []model.Issue, readiness *model.Readines
 	return snap
 }
 
+func issueHasExactLabel(issue model.Issue, label string) bool {
+	if label == "" {
+		return true
+	}
+	for _, l := range issue.Labels {
+		if l == label {
+			return true
+		}
+	}
+	return false
+}
+
+func issueMatchesRepoFilter(issue model.Issue, repoFilter string) bool {
+	filter := strings.TrimSpace(repoFilter)
+	if filter == "" {
+		return true
+	}
+	filterLower := strings.ToLower(filter)
+	needsFlexibleMatch := !strings.HasSuffix(filterLower, "-") &&
+		!strings.HasSuffix(filterLower, ":") &&
+		!strings.HasSuffix(filterLower, "_")
+	idLower := strings.ToLower(issue.ID)
+	if strings.HasPrefix(idLower, filterLower) {
+		return true
+	}
+	if needsFlexibleMatch {
+		if strings.HasPrefix(idLower, filterLower+"-") ||
+			strings.HasPrefix(idLower, filterLower+":") ||
+			strings.HasPrefix(idLower, filterLower+"_") {
+			return true
+		}
+	}
+	if issue.SourceRepo != "" && issue.SourceRepo != "." {
+		if strings.HasPrefix(strings.ToLower(issue.SourceRepo), filterLower) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) evaluateTimeTravelCandidates(
+	issues []model.Issue,
+	readiness *model.ReadinessIndex,
+	evalNow time.Time,
+	activeSourceRepos map[string]bool,
+	retainClosedFrom map[string]bool,
+) map[string]bool {
+	scopedCandidates := make([]model.Issue, 0, len(issues))
+	baseCandidateIDs := make(map[string]bool, len(issues))
+	for i := range issues {
+		iss := issues[i]
+		if m.workspaceMode && m.activeRepos != nil {
+			if rk := issueRepoKey(iss); rk != "" && !m.activeRepos[rk] && !activeSourceRepos[rk] {
+				continue
+			}
+		}
+		if m.scopeRepoFilter != "" && !issueMatchesRepoFilter(iss, m.scopeRepoFilter) {
+			continue
+		}
+		if m.scopeLabelFilter != "" && !issueHasExactLabel(iss, m.scopeLabelFilter) {
+			continue
+		}
+		scopedCandidates = append(scopedCandidates, iss)
+		baseCandidateIDs[iss.ID] = true
+	}
+	if m.activeRecipe == nil {
+		return baseCandidateIDs
+	}
+
+	az := analysis.NewAnalyzer(issues)
+	var azCands map[string]bool
+	if (m.workspaceMode && m.activeRepos != nil) || m.scopeRepoFilter != "" || m.scopeLabelFilter != "" {
+		azCands = baseCandidateIDs
+	}
+	az.SetReadinessScope(readiness, azCands)
+	if !evalNow.IsZero() {
+		az.SetNow(evalNow)
+	}
+	if w := feedbackWeightsForBeadsPath(m.beadsPath); w != nil {
+		az.SetWeights(*w)
+	}
+	stats := az.Analyze()
+	triageRes := analysis.ComputeTriageFromAnalyzer(az, &stats, issues, analysis.TriageOptions{}, az.Now())
+	triageScores, _, _, _, _ := extractTriageMaps(triageRes)
+	applied, err := applyRecipeToIssues(scopedCandidates, az, &stats, triageScores, m.activeRecipe, az.Now())
+	if err != nil {
+		return baseCandidateIDs
+	}
+	out := make(map[string]bool, len(applied))
+	for _, iss := range applied {
+		out[iss.ID] = true
+	}
+	if len(retainClosedFrom) > 0 {
+		structuralFilters := m.activeRecipe.Filters
+		structuralFilters.Status = nil
+		structuralFilters.Actionable = nil
+		structuralFilters.HasBlockers = nil
+		structuralFilters.UpdatedAfter = ""
+		structuralFilters.UpdatedBefore = ""
+		structuralRecipe := recipe.Recipe{
+			Name:    m.activeRecipe.Name,
+			Filters: structuralFilters,
+		}
+		if structApplied, sErr := applyRecipeToIssues(scopedCandidates, az, &stats, triageScores, &structuralRecipe, az.Now()); sErr == nil {
+			for _, iss := range structApplied {
+				if retainClosedFrom[iss.ID] && isClosedLikeStatus(iss.Status) {
+					out[iss.ID] = true
+				}
+			}
+		}
+	}
+	return out
+}
+
 // enterTimeTravelMode loads historical data and computes diff
 func (m *Model) enterTimeTravelMode(revision string) {
 	workDir := strings.TrimSpace(m.workDir)
@@ -12713,22 +12953,108 @@ func (m *Model) enterTimeTravelMode(revision string) {
 	}
 
 	var (
-		historicalIssues []model.Issue
-		histAuthIssues   []model.Issue
-		resolvedFromRev  = revision
-		fromTime         time.Time
+		historicalIssues  []model.Issue
+		histAuthIssues    []model.Issue
+		resolvedFromRev   = revision
+		fromTime          time.Time
+		activeSourceRepos map[string]bool
 	)
 
 	if m.workspaceMode {
 		type wsRepoTarget struct {
+			name       string
 			workDir    string
 			beadsDir   string
 			prefix     string
 			sourceRepo string
 		}
+		canonDir := func(dir string) string {
+			trimmed := strings.TrimSpace(dir)
+			if trimmed == "" {
+				return ""
+			}
+			clean := filepath.Clean(trimmed)
+			if abs, err := filepath.Abs(clean); err == nil {
+				if eval, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
+					return filepath.Clean(eval)
+				}
+				return filepath.Clean(abs)
+			}
+			return clean
+		}
+		effectiveBeadsDir := func(repoWorkDir, beadsDir string) string {
+			cWork := canonDir(repoWorkDir)
+			trimmedBeads := strings.TrimSpace(beadsDir)
+			if trimmedBeads == "" {
+				if cWork == "" {
+					return ""
+				}
+				return canonDir(filepath.Join(cWork, ".beads"))
+			}
+			if !filepath.IsAbs(trimmedBeads) && cWork != "" {
+				return canonDir(filepath.Join(cWork, trimmedBeads))
+			}
+			return canonDir(trimmedBeads)
+		}
+
 		var targets []wsRepoTarget
 		seenTargets := make(map[string]bool)
+		seenDirKeys := make(map[string]bool)
+		seenSourceRepos := make(map[string]bool)
 		knownPrefixes := make(map[string]bool)
+
+		// Seed configured workspace repositories first so repos with zero live issues
+		// at HEAD or multi-hyphen prefixes (e.g. "my-leg-") are discovered accurately.
+		for _, repo := range m.workspaceInfo.Repos {
+			repoWorkDir := strings.TrimSpace(repo.Path)
+			beadsDir := strings.TrimSpace(repo.BeadsDir)
+			if repoWorkDir == "" && beadsDir != "" && filepath.IsAbs(beadsDir) {
+				repoWorkDir = filepath.Dir(beadsDir)
+			}
+			if repoWorkDir == "" {
+				repoWorkDir = workDir
+			}
+			if repoWorkDir == "" {
+				continue
+			}
+			if beadsDir != "" && !filepath.IsAbs(beadsDir) {
+				beadsDir = filepath.Join(repoWorkDir, beadsDir)
+			}
+			prefix := strings.TrimSpace(repo.Prefix)
+			if prefix == "" {
+				name := strings.TrimSpace(repo.Name)
+				if name == "" {
+					name = filepath.Base(repoWorkDir)
+				}
+				if name != "" {
+					prefix = strings.ToLower(name) + "-"
+				}
+			}
+			if prefix != "" {
+				knownPrefixes[prefix] = true
+			}
+			sourceRepo := normalizeRepoKey(prefix)
+			if sourceRepo == "" {
+				sourceRepo = normalizeRepoKey(repo.Name)
+			}
+			dirKey := canonDir(repoWorkDir) + "\x00" + effectiveBeadsDir(repoWorkDir, beadsDir)
+			key := dirKey + "\x00" + prefix
+			if !seenTargets[key] {
+				seenTargets[key] = true
+				seenDirKeys[dirKey] = true
+				if sourceRepo != "" {
+					seenSourceRepos[sourceRepo] = true
+				}
+				targets = append(targets, wsRepoTarget{
+					name:       strings.TrimSpace(repo.Name),
+					workDir:    repoWorkDir,
+					beadsDir:   beadsDir,
+					prefix:     prefix,
+					sourceRepo: sourceRepo,
+				})
+			}
+		}
+
 		for i := range m.issues {
 			iss := &m.issues[i]
 			repoWorkDir := ""
@@ -12736,9 +13062,11 @@ func (m *Model) enterTimeTravelMode(revision string) {
 			prefix := ""
 			if iss.Origin != nil {
 				repoWorkDir = strings.TrimSpace(iss.Origin.WorkingDirectory)
-				beadsDir = strings.TrimSpace(iss.Origin.TrackerDirectory)
-				if repoWorkDir == "" && beadsDir != "" {
-					repoWorkDir = filepath.Dir(beadsDir)
+				if repoWorkDir != "" {
+					beadsDir = strings.TrimSpace(iss.Origin.TrackerDirectory)
+				} else if canDeriveWorkspaceFromTrackerOrigin(iss.Origin) {
+					beadsDir = strings.TrimSpace(iss.Origin.TrackerDirectory)
+					repoWorkDir = filepath.Dir(filepath.Clean(beadsDir))
 				}
 				if iss.Origin.LocalID != "" && strings.HasSuffix(iss.ID, iss.Origin.LocalID) && len(iss.ID) > len(iss.Origin.LocalID) {
 					prefix = iss.ID[:len(iss.ID)-len(iss.Origin.LocalID)]
@@ -12762,7 +13090,11 @@ func (m *Model) enterTimeTravelMode(revision string) {
 			if sourceRepo == "" {
 				sourceRepo = normalizeRepoKey(prefix)
 			}
-			key := repoWorkDir + "\x00" + beadsDir + "\x00" + prefix
+			dirKey := canonDir(repoWorkDir) + "\x00" + effectiveBeadsDir(repoWorkDir, beadsDir)
+			if seenDirKeys[dirKey] || (sourceRepo != "" && seenSourceRepos[sourceRepo]) {
+				continue
+			}
+			key := dirKey + "\x00" + prefix
 			if !seenTargets[key] {
 				seenTargets[key] = true
 				targets = append(targets, wsRepoTarget{
@@ -12774,10 +13106,48 @@ func (m *Model) enterTimeTravelMode(revision string) {
 			}
 		}
 
+		targetMatchesRepoScope := func(target wsRepoTarget) bool {
+			activeMatch := m.activeRepos == nil ||
+				m.activeRepos[normalizeRepoKey(target.sourceRepo)] ||
+				m.activeRepos[normalizeRepoKey(target.prefix)] ||
+				m.activeRepos[normalizeRepoKey(target.name)]
+			if !activeMatch {
+				return false
+			}
+			if m.scopeRepoFilter == "" {
+				return true
+			}
+			sampleID := ""
+			if target.prefix != "" {
+				sampleID = target.prefix + "1"
+			}
+			if issueMatchesRepoFilter(model.Issue{ID: sampleID, SourceRepo: target.sourceRepo}, m.scopeRepoFilter) {
+				return true
+			}
+			if target.name != "" {
+				return issueMatchesRepoFilter(model.Issue{SourceRepo: target.name}, m.scopeRepoFilter)
+			}
+			return false
+		}
+
+		if m.activeRepos != nil {
+			activeSourceRepos = make(map[string]bool, len(targets))
+			for _, target := range targets {
+				if m.activeRepos[normalizeRepoKey(target.sourceRepo)] ||
+					m.activeRepos[normalizeRepoKey(target.prefix)] ||
+					m.activeRepos[normalizeRepoKey(target.name)] {
+					if sk := normalizeRepoKey(target.sourceRepo); sk != "" {
+						activeSourceRepos[sk] = true
+					}
+				}
+			}
+		}
+
 		gitRepos := 0
 		reposWithBeads := 0
 		var firstSHA string
 		for _, target := range targets {
+			inRepoScope := targetMatchesRepoScope(target)
 			var gl *loader.GitLoader
 			if target.beadsDir != "" {
 				gl = loader.NewGitLoaderWithBeadsDir(target.workDir, target.beadsDir)
@@ -12787,23 +13157,30 @@ func (m *Model) enterTimeTravelMode(revision string) {
 			if _, err := gl.ResolveRevision("HEAD"); err != nil {
 				continue
 			}
-			gitRepos++
+			if inRepoScope {
+				gitRepos++
+			}
 			hasBeads, err := gl.HasBeadsAtRevision(revision)
 			if err != nil || !hasBeads {
 				continue
 			}
 			report, err := gl.LoadAtWithReport(revision)
 			if err != nil {
-				m.statusMsg = fmt.Sprintf("❌ Time-travel failed: %v", err)
-				m.statusIsError = true
-				return
+				if inRepoScope {
+					m.statusMsg = fmt.Sprintf("❌ Time-travel failed: %v", err)
+					m.statusIsError = true
+					return
+				}
+				continue
 			}
-			reposWithBeads++
-			if firstSHA == "" && report.CommitSHA != "" {
-				firstSHA = report.CommitSHA
-			}
-			if report.CommitTime.After(fromTime) {
-				fromTime = report.CommitTime
+			if inRepoScope {
+				reposWithBeads++
+				if firstSHA == "" && report.CommitSHA != "" {
+					firstSHA = report.CommitSHA
+				}
+				if report.CommitTime.After(fromTime) {
+					fromTime = report.CommitTime
+				}
 			}
 			localRawIDs := make(map[string]bool, len(report.Issues)+len(report.TombstoneIDs))
 			for _, rawIss := range report.Issues {
@@ -12836,7 +13213,9 @@ func (m *Model) enterTimeTravelMode(revision string) {
 					WorkingDirectory: target.workDir,
 					ReadOnlyReason:   "historical snapshot",
 				}
-				historicalIssues = append(historicalIssues, cloned)
+				if inRepoScope {
+					historicalIssues = append(historicalIssues, cloned)
+				}
 				histAuthIssues = append(histAuthIssues, cloned)
 			}
 			for _, tid := range report.TombstoneIDs {
@@ -12867,8 +13246,10 @@ func (m *Model) enterTimeTravelMode(revision string) {
 	} else {
 		trimmedBeadsPath := strings.TrimSpace(m.beadsPath)
 		var gitLoader *loader.GitLoader
-		if trimmedBeadsPath != "" && !strings.HasPrefix(trimmedBeadsPath, "git:") {
+		if trimmedBeadsPath != "" && !isHistoricalGitBeadsPath(trimmedBeadsPath) {
 			gitLoader = loader.NewGitLoaderWithBeadsDir(workDir, filepath.Dir(trimmedBeadsPath))
+		} else if _, repoRelPath, ok := splitHistoricalGitBeadsPath(trimmedBeadsPath); ok && repoRelPath != "" && filepath.Dir(repoRelPath) != "." {
+			gitLoader = loader.NewGitLoaderWithBeadsDir(workDir, filepath.Dir(repoRelPath))
 		} else {
 			gitLoader = loader.NewGitLoader(workDir)
 		}
@@ -12921,18 +13302,27 @@ func (m *Model) enterTimeTravelMode(revision string) {
 	histReadiness := model.NewReadinessIndex(histAuthIssues)
 	curReadiness := m.exportReadiness()
 
-	hasScope := m.candidateIDs != nil || (m.workspaceMode && m.activeRepos != nil)
+	hasDynamicScope := m.scopeLabelFilter != "" ||
+		m.scopeRepoFilter != "" ||
+		m.activeRecipe != nil ||
+		(m.workspaceMode && m.activeRepos != nil)
+	useStaticCandidates := m.candidateIDs != nil &&
+		m.scopeLabelFilter == "" &&
+		m.scopeRepoFilter == "" &&
+		m.activeRecipe == nil
+	hasScope := hasDynamicScope || useStaticCandidates
+
 	var fromCandidates, toCandidates map[string]bool
-	if hasScope {
+	if useStaticCandidates {
 		fromCandidates = make(map[string]bool)
 		for i := range historicalIssues {
 			iss := &historicalIssues[i]
 			if m.workspaceMode && m.activeRepos != nil {
-				if rk := issueRepoKey(*iss); rk != "" && !m.activeRepos[rk] {
+				if rk := issueRepoKey(*iss); rk != "" && !m.activeRepos[rk] && !activeSourceRepos[rk] {
 					continue
 				}
 			}
-			if m.candidateIDs != nil && !m.candidateIDs[iss.ID] {
+			if !m.candidateIDs[iss.ID] {
 				continue
 			}
 			fromCandidates[iss.ID] = true
@@ -12941,15 +13331,18 @@ func (m *Model) enterTimeTravelMode(revision string) {
 		for i := range m.issues {
 			iss := &m.issues[i]
 			if m.workspaceMode && m.activeRepos != nil {
-				if rk := issueRepoKey(*iss); rk != "" && !m.activeRepos[rk] {
+				if rk := issueRepoKey(*iss); rk != "" && !m.activeRepos[rk] && !activeSourceRepos[rk] {
 					continue
 				}
 			}
-			if m.candidateIDs != nil && !m.candidateIDs[iss.ID] {
+			if !m.candidateIDs[iss.ID] {
 				continue
 			}
 			toCandidates[iss.ID] = true
 		}
+	} else if hasDynamicScope {
+		fromCandidates = m.evaluateTimeTravelCandidates(historicalIssues, histReadiness, fromTime, activeSourceRepos, nil)
+		toCandidates = m.evaluateTimeTravelCandidates(m.issues, curReadiness, toTime, activeSourceRepos, fromCandidates)
 	}
 
 	// Create snapshots and compute diff with consistent authority, candidate scope, and reference timestamps
@@ -13010,7 +13403,7 @@ func (m *Model) exitTimeTravelMode() {
 	m.newIssueIDs = nil
 	m.closedIssueIDs = nil
 	m.modifiedIssueIDs = nil
-	m.tree.SetReadOnly(m.beadsPath == "")
+	m.tree.SetReadOnly(m.beadsPath == "" || isHistoricalGitBeadsPath(m.beadsPath))
 
 	// Feedback
 	m.statusMsg = "⏱️ Time-travel mode disabled"
@@ -13606,6 +13999,21 @@ func (m *Model) copyIssueToClipboard() tea.Cmd {
 }
 
 // showCassSessionModal queues a lookup without running external processes in Update.
+func canDeriveWorkspaceFromTrackerOrigin(origin *model.IssueOrigin) bool {
+	if origin == nil {
+		return false
+	}
+	td := strings.TrimSpace(origin.TrackerDirectory)
+	if td == "" {
+		return false
+	}
+	if strings.TrimSpace(origin.Tracker) != "" {
+		return true
+	}
+	base := filepath.Base(filepath.Clean(td))
+	return base == ".beads" || base == "_beads"
+}
+
 func (m *Model) showCassSessionModal() tea.Cmd {
 	issuePtr := m.focusedIssueForSessions()
 	if issuePtr == nil {
@@ -13630,19 +14038,22 @@ func (m *Model) showCassSessionModal() tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	localID := ""
 	issueWorkspace := ""
-	if issue.Origin != nil && strings.TrimSpace(issue.Origin.LocalID) != "" {
+	if issue.Origin != nil {
 		localID = strings.TrimSpace(issue.Origin.LocalID)
 		issueWorkspace = strings.TrimSpace(issue.Origin.WorkingDirectory)
-		if issueWorkspace == "" && strings.TrimSpace(issue.Origin.TrackerDirectory) != "" {
-			issueWorkspace = filepath.Dir(strings.TrimSpace(issue.Origin.TrackerDirectory))
+		if issueWorkspace == "" && canDeriveWorkspaceFromTrackerOrigin(issue.Origin) {
+			issueWorkspace = strings.TrimSpace(cass.WorkspaceFromBeadsPath(filepath.Join(filepath.Clean(strings.TrimSpace(issue.Origin.TrackerDirectory)), "issues.jsonl")))
 		}
-		if issueWorkspace == "" {
-			issueWorkspace = strings.TrimSpace(m.workDir)
-		}
+	}
+	if issueWorkspace == "" {
+		issueWorkspace = strings.TrimSpace(m.workDir)
+	}
+	if issueWorkspace == "" {
+		issueWorkspace = strings.TrimSpace(cass.WorkspaceFromBeadsPath(m.beadsPath))
 	}
 	request := &cassSessionRequest{
 		cancel: cancel, beadID: issue.ID, localID: localID, issueWorkspace: issueWorkspace,
-		focus: m.focused,
+		focus:          m.focused,
 		dataGeneration: m.semanticDataGeneration, workDir: m.workDir,
 		status: "Looking up sessions for " + issue.ID + "… (V/Esc cancel)",
 		budget: budget,
@@ -14398,7 +14809,7 @@ func (m *Model) launchTerminalEditor(editorArgs []string) tea.Cmd {
 }
 
 func (m *Model) guiEditorPath() (string, error) {
-	if m.beadsPath == "" || !strings.EqualFold(filepath.Ext(m.beadsPath), ".jsonl") {
+	if m.beadsPath == "" || isHistoricalGitBeadsPath(m.beadsPath) || !strings.EqualFold(filepath.Ext(m.beadsPath), ".jsonl") {
 		return "", fmt.Errorf("no live JSONL text source; use a terminal $EDITOR for a verified live issue (historical views are read-only)")
 	}
 	selected := m.selectedIssueForAction()
@@ -14723,7 +15134,7 @@ func (m *Model) refreshLabelViews(underlyingFocus focus) {
 	if m.showLabelDrilldown && m.labelDrilldownLabel != "" {
 		m.labelDrilldownIssues = m.filterIssuesByLabel(m.labelDrilldownLabel)
 		if m.showLabelGraphAnalysis {
-			sg := analysis.ComputeLabelSubgraph(scopedIssues, m.labelDrilldownLabel)
+			sg := analysis.ComputeLabelSubgraph(m.candidateScopedIssues(), m.labelDrilldownLabel)
 			pr := analysis.ComputeLabelPageRank(sg)
 			cp := analysis.ComputeLabelCriticalPath(sg)
 			m.labelGraphAnalysisResult = &LabelGraphAnalysisResult{
@@ -15545,7 +15956,7 @@ func (m *Model) IsTutorialContextMode() bool {
 func (m *Model) reloadSprintsFromDisk(underlyingFocus focus) {
 	sprintsReloaded := false
 	trimmedBeadsPath := strings.TrimSpace(m.beadsPath)
-	if trimmedBeadsPath != "" && !strings.HasPrefix(trimmedBeadsPath, "git:") {
+	if trimmedBeadsPath != "" && !isHistoricalGitBeadsPath(trimmedBeadsPath) {
 		sprintsPath := filepath.Join(filepath.Dir(trimmedBeadsPath), loader.SprintsFileName)
 		if _, statErr := os.Stat(sprintsPath); statErr == nil {
 			if loaded, err := loader.LoadSprintsFromFile(sprintsPath); err == nil {

@@ -159,8 +159,10 @@ type CorrelatorOptions struct {
 // known-ID matching, synthesized creation milestones, mixed .beads/+code
 // temporal candidates, and expanded code/explicit file retention; v5 = claimed
 // open/in_progress temporal windows bounded by latest walked commit, inclusive
-// single-commit overlap, and case-insensitive claimant matching.
-const historyArtifactFormatVersion = 5
+// single-commit overlap, and case-insensitive claimant matching; v6 = completed-only
+// automatic temporal windows with chronological same-second close/reopen ordering
+// and trimmed claimant lookup.
+const historyArtifactFormatVersion = 6
 
 // historyArtifact holds the purely history-derived (HEAD + options only)
 // intermediate products of report generation: the extracted lifecycle events
@@ -585,13 +587,7 @@ func (c *Correlator) extractTemporalCandidates(events []BeadEvent, walk []walked
 }
 
 func (c *Correlator) extractTemporalCandidatesWithOptions(events []BeadEvent, walk []walkedCommit, opts CorrelatorOptions) ([]temporalCandidate, error) {
-	var latestCommitTime time.Time
-	for i := range walk {
-		if walk[i].Timestamp.After(latestCommitTime) {
-			latestCommitTime = walk[i].Timestamp
-		}
-	}
-	windows := temporalWindowsFromEvents(events, latestCommitTime, opts.BeadID, opts.TargetBeadAliases...)
+	windows := temporalWindowsFromEvents(events, opts.BeadID, opts.TargetBeadAliases...)
 	if len(windows) == 0 {
 		return nil, nil
 	}
@@ -609,16 +605,15 @@ func (c *Correlator) extractTemporalCandidatesWithOptions(events []BeadEvent, wa
 			continue
 		}
 		ic := indexedCommit{order: idx, commit: wc}
-		if wc.AuthorEmail != "" {
-			key := strings.ToLower(wc.AuthorEmail)
-			byEmail[key] = append(byEmail[key], ic)
-		} else if wc.Author != "" {
-			key := strings.ToLower(wc.Author)
-			byZeroEmailAuthor[key] = append(byZeroEmailAuthor[key], ic)
+		emailKey := strings.ToLower(strings.TrimSpace(wc.AuthorEmail))
+		authorKey := strings.ToLower(strings.TrimSpace(wc.Author))
+		if emailKey != "" {
+			byEmail[emailKey] = append(byEmail[emailKey], ic)
+		} else if authorKey != "" {
+			byZeroEmailAuthor[authorKey] = append(byZeroEmailAuthor[authorKey], ic)
 		}
-		if wc.Author != "" {
-			key := strings.ToLower(wc.Author)
-			byAuthor[key] = append(byAuthor[key], ic)
+		if authorKey != "" {
+			byAuthor[authorKey] = append(byAuthor[authorKey], ic)
 		}
 	}
 
@@ -631,10 +626,12 @@ func (c *Correlator) extractTemporalCandidatesWithOptions(events []BeadEvent, wa
 	queued := make(map[string]struct{})
 	for _, w := range windows {
 		var bucket []indexedCommit
-		if w.AuthorEmail != "" {
-			bucket = byEmail[strings.ToLower(w.AuthorEmail)]
-			if w.Author != "" {
-				if zeroEmail := byZeroEmailAuthor[strings.ToLower(w.Author)]; len(zeroEmail) > 0 {
+		wEmailKey := strings.ToLower(strings.TrimSpace(w.AuthorEmail))
+		wAuthorKey := strings.ToLower(strings.TrimSpace(w.Author))
+		if wEmailKey != "" {
+			bucket = byEmail[wEmailKey]
+			if wAuthorKey != "" {
+				if zeroEmail := byZeroEmailAuthor[wAuthorKey]; len(zeroEmail) > 0 {
 					merged := make([]indexedCommit, 0, len(bucket)+len(zeroEmail))
 					merged = append(merged, bucket...)
 					merged = append(merged, zeroEmail...)
@@ -642,8 +639,8 @@ func (c *Correlator) extractTemporalCandidatesWithOptions(events []BeadEvent, wa
 					bucket = merged
 				}
 			}
-		} else if w.Author != "" {
-			bucket = byAuthor[strings.ToLower(w.Author)]
+		} else if wAuthorKey != "" {
+			bucket = byAuthor[wAuthorKey]
 		}
 		for _, ic := range bucket {
 			wc := ic.commit

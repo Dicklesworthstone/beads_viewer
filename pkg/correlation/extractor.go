@@ -799,6 +799,22 @@ func (e *Extractor) ExtractForBead(beadID string, opts ExtractOptions) ([]BeadEv
 	return e.Extract(opts)
 }
 
+// eventsStillClosed reports whether chronological lifecycle events leave a bead
+// in a closed state (the latest EventClosed appears after any EventReopened).
+func eventsStillClosed(events []BeadEvent) bool {
+	lastCloseIdx := -1
+	lastReopenIdx := -1
+	for i := range events {
+		switch events[i].EventType {
+		case EventClosed:
+			lastCloseIdx = i
+		case EventReopened:
+			lastReopenIdx = i
+		}
+	}
+	return lastCloseIdx >= 0 && lastCloseIdx > lastReopenIdx
+}
+
 // GetBeadMilestones returns the key lifecycle milestones for a bead
 func GetBeadMilestones(events []BeadEvent) BeadMilestones {
 	var milestones BeadMilestones

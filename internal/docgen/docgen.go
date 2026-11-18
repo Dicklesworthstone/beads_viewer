@@ -309,7 +309,7 @@ func RenderAlertsTables(cfg *drift.Config) string {
 		},
 		{
 			typ:      drift.AlertSourceInconsistency,
-			trigger:  "Live SQLite (`beads.db`) and local JSONL (`issues.jsonl`) tracker sources disagree on issue presence, status, priority, or title",
+			trigger:  "Live SQLite (`beads.db`) and local JSONL (`issues.jsonl`) tracker sources disagree on issue presence, status, priority, title, dependencies, assignee, labels, or defer_until",
 			severity: "Warning",
 			keys:     fmt.Sprintf("`source_drift_alert` (%t), `source_drift_max_alerts` (%d)", cfg.SourceDriftAlert == nil || *cfg.SourceDriftAlert, cfg.SourceDriftMaxAlerts),
 		},

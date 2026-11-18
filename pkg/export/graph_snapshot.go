@@ -253,7 +253,9 @@ func buildLayout(opts GraphSnapshotOptions) layoutResult {
 	var rawBetweenness map[string]float64
 	if opts.Stats != nil {
 		if hasClosedOrTombstoneIssues(opts.Issues) {
-			if activeStats := activeSubgraphStatsForIssues(opts.Issues, true, false, false); activeStats != nil {
+			if canReusePrepopulatedActiveStats(opts.Stats, opts.Issues, nil, true, false, false) {
+				rawBetweenness = opts.Stats.ActiveBetweenness()
+			} else if activeStats := activeSubgraphStatsForIssues(opts.Issues, true, false, false); activeStats != nil {
 				rawBetweenness = activeStats.Betweenness()
 			}
 		} else {

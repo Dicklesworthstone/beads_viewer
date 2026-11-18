@@ -1736,7 +1736,7 @@ func main() {
 	// Robot output filters (bv-84)
 	robotMinConf := flag.Float64("robot-min-confidence", 0.0, "Filter --robot-priority recommendations by minimum confidence (0.0-1.0)")
 	robotMaxResults := flag.Int("robot-max-results", 0, "Limit robot output count (0 = use defaults)")
-	robotByLabel := flag.String("robot-by-label", "", "Filter --robot-priority recommendations by label (exact match); use --label to scope other robot commands")
+	robotByLabel := flag.String("robot-by-label", "", "Filter --robot-priority recommendations by label (case-insensitive match); use --label to scope other robot commands")
 	robotByAssignee := flag.String("robot-by-assignee", "", "Filter --robot-priority recommendations by assignee (exact match)")
 	// Label subgraph scoping (bv-122)
 	labelScope := flag.StringP("label", "l", "", "Scope analysis to label's subgraph (applies to every --robot-* command that loads issues, e.g. --robot-insights, --robot-plan, --robot-priority, --robot-orphans)")
@@ -1891,7 +1891,7 @@ func main() {
 			return recipeLoader
 		},
 		StructuredOutput: func() bool {
-			return flag.CommandLine.Changed("format") || env.OutputFormat.IsSet()
+			return flag.CommandLine.Changed("format") || strings.TrimSpace(env.OutputFormat.Get()) != ""
 		},
 	})
 	phaseTwoRobotRegistry := newRobotRegistry()
@@ -2090,7 +2090,7 @@ func main() {
 				"robot-sprint-list", "robot-label-health", "robot-label-flow", "robot-label-attention", "robot-recipes",
 				"robot-file-beads", "robot-file-hotspots", "robot-file-relations", "robot-related",
 				"robot-impact", "robot-impact-network", "robot-history", "bead-history",
-				"robot-forecast", "search", "robot-search",
+				"robot-forecast", "robot-capacity", "search", "robot-search",
 				"emit-script", "priority-brief", "agent-brief",
 			}},
 			{modifier: "robot-min-confidence", requires: []string{
@@ -2315,22 +2315,28 @@ func main() {
 		_ = capacityLabel
 		_ = labelScope
 		_ = agentBrief
-		_ = exportIncludeActions
 
 		exitCLI := func(code int) {
-			stopCPUProfile()
+			if stopCPUProfile != nil {
+				stopCPUProfile()
+			}
 			os.Exit(code)
 		}
 
-		envRobot := env.Robot.Bool()
+		explicitEnvRobot := env.Robot.Bool()
+		envRobot := explicitEnvRobot
 		stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
+		structuredFormatRequested := flag.CommandLine.Changed("format") || strings.TrimSpace(env.OutputFormat.Get()) != ""
 
 		primaryRobotRegistries := []*RobotRegistry{&phaseOneRobotRegistry, &phaseTwoRobotRegistry, &phaseThreeRobotRegistry}
 		robotMode := envRobot ||
 			anyRobotModeActive(primaryRobotRegistries...) ||
 			// When stdout is non-TTY, --diff-since auto-enables JSON output. Mark this
 			// as robot mode early so parsers keep stdout JSON clean.
-			(*diffSince != "" && !stdoutIsTTY)
+			(*diffSince != "" && !stdoutIsTTY) ||
+			(structuredFormatRequested && (*diffSince != "" || *semanticQuery != "" || *checkDrift || *baselineInfo || *initDrift ||
+				*agentsAdd || *agentsRemove || *agentsUpdate || *agentsCheck || *agentsReset || *agentsDryRun || *agentsForce ||
+				*feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset || *feedbackShow))
 
 		// Mark robot mode for downstream packages (e.g., parsers) to keep stdout JSON clean.
 		if robotMode && !envRobot {
@@ -2352,7 +2358,7 @@ func main() {
 		robotShowToonStats = *toonStats || strings.TrimSpace(env.ToonStats.Get()) == "1"
 		if robotOutputFormat != "json" && robotOutputFormat != "toon" {
 			fmt.Fprintf(os.Stderr, "Invalid --format %q (expected json|toon)\n", robotOutputFormat)
-			os.Exit(2)
+			exitCLI(2)
 		}
 		// TOON encoding shells out to the `tru` binary. Downgrade here rather than
 		// inside the encoder so the payload's own output_format field does not
@@ -2369,6 +2375,7 @@ func main() {
 			Stderr:             os.Stderr,
 			Encoder:            newRobotEncoder(os.Stdout),
 			FinalizeBeforeExit: stopCPUProfile,
+			EnvRobot:           explicitEnvRobot,
 		}
 		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "robot-help", robotDispatchContext)
 		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "version", robotDispatchContext)
@@ -2379,7 +2386,7 @@ func main() {
 			available, newVersion, releaseURL, err := updater.CheckUpdateAvailable()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error checking for updates: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if available {
 				fmt.Printf("New version available: %s (current: %s)\n", newVersion, version.Version)
@@ -2388,7 +2395,7 @@ func main() {
 			} else {
 				fmt.Printf("bv is up to date (version %s)\n", version.Version)
 			}
-			os.Exit(0)
+			exitCLI(0)
 		}
 
 		// Handle --update-dry-run (bv upgrade --dry-run): report exactly what an
@@ -2397,29 +2404,29 @@ func main() {
 			release, err := updater.GetLatestRelease()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error fetching release info: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			newVersion := release.TagName
 			newer, err := updater.CheckNewerThanCurrent(newVersion)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Cannot compare release versions: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if !newer {
 				fmt.Printf("bv is already up to date (version %s)\n", version.Version)
-				os.Exit(0)
+				exitCLI(0)
 			}
 			if err := updater.ValidateReleaseForUpdate(release); err != nil {
 				fmt.Fprintf(os.Stderr, "Latest release cannot be installed automatically: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			asset := release.FindPlatformAsset()
 			expectedDigest, err := updater.VerifyReleaseAssetChecksumEntry(release, asset.Name)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Latest release checksum verification failed: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			fmt.Printf("[dry-run] Would update bv from %s to %s\n", version.Version, newVersion)
 			fmt.Printf("[dry-run] Would download %s (%d bytes) for %s/%s\n",
@@ -2427,7 +2434,7 @@ func main() {
 			fmt.Printf("[dry-run] From: %s\n", asset.BrowserDownloadURL)
 			fmt.Printf("[dry-run] Verified SHA-256 checksum via %s: %s\n", release.FindChecksumAsset().Name, expectedDigest)
 			fmt.Println("[dry-run] No changes made. Run 'bv upgrade' to apply.")
-			os.Exit(0)
+			exitCLI(0)
 		}
 
 		// Handle --update (bv-182)
@@ -2435,22 +2442,22 @@ func main() {
 			release, err := updater.GetLatestRelease()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error fetching release info: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			newVersion := release.TagName
 			newer, err := updater.CheckNewerThanCurrent(newVersion)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Cannot compare release versions: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if !newer {
 				fmt.Printf("bv is already up to date (version %s)\n", version.Version)
-				os.Exit(0)
+				exitCLI(0)
 			}
 			if err := updater.ValidateReleaseForUpdate(release); err != nil {
 				fmt.Fprintf(os.Stderr, "Latest release cannot be installed automatically: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			// Confirm unless --yes is provided
@@ -2459,11 +2466,11 @@ func main() {
 				confirmed, err := readUpdateConfirmation(os.Stdin)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Cannot read update confirmation: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if !confirmed {
 					fmt.Println("Update cancelled")
-					os.Exit(0)
+					exitCLI(0)
 				}
 			}
 
@@ -2473,7 +2480,7 @@ func main() {
 				if result != nil && result.BackupPath != "" {
 					fmt.Fprintf(os.Stderr, "Backup preserved at: %s\n", result.BackupPath)
 				}
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			fmt.Println(result.Message)
@@ -2481,27 +2488,27 @@ func main() {
 				fmt.Printf("Backup saved to: %s\n", result.BackupPath)
 				fmt.Println("Run 'bv --rollback' to restore if needed")
 			}
-			os.Exit(0)
+			exitCLI(0)
 		}
 
 		// Handle --rollback (bv-182)
 		if *rollbackFlag {
 			if err := updater.Rollback(); err != nil {
 				fmt.Fprintf(os.Stderr, "Rollback failed: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
-			os.Exit(0)
+			exitCLI(0)
 		}
 
 		// Handle --agents-* commands (bv-105)
 		agentsAnyAction := *agentsAdd || *agentsRemove || *agentsUpdate || *agentsCheck || *agentsReset
 		agentsAnyFlag := agentsAnyAction || *agentsDryRun || *agentsForce
 		if agentsAnyFlag {
-			agentsRobotMode := robotMode || flag.CommandLine.Changed("format")
+			agentsRobotMode := robotMode || structuredFormatRequested
 			workDir, err := os.Getwd()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error getting working directory: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			// Default to check mode when no explicit action
@@ -2513,9 +2520,9 @@ func main() {
 				encoder := newRobotEncoder(os.Stdout)
 				if err := encoder.Encode(payload); err != nil {
 					fmt.Fprintf(os.Stderr, "Error encoding agents output: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
-				os.Exit(exitCode)
+				exitCLI(exitCode)
 			}
 
 			if *agentsReset {
@@ -2532,7 +2539,7 @@ func main() {
 						}, 0)
 					}
 					fmt.Printf("[dry-run] Would clear AGENTS.md prompt preference for %s\n", prefDir)
-					os.Exit(0)
+					exitCLI(0)
 				}
 				if agents.SavedConfigDisabled() {
 					if agentsRobotMode {
@@ -2544,7 +2551,7 @@ func main() {
 						}, 0)
 					}
 					fmt.Printf("Skipped clearing AGENTS.md prompt preference for %s (BV_NO_SAVED_CONFIG is set)\n", prefDir)
-					os.Exit(0)
+					exitCLI(0)
 				}
 				if err := agents.ClearPreference(prefDir); err != nil {
 					if agentsRobotMode {
@@ -2555,7 +2562,7 @@ func main() {
 						}, 1)
 					}
 					fmt.Fprintf(os.Stderr, "Error clearing AGENTS.md prompt preference: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if prefDir != workDir {
 					_ = agents.ClearPreference(workDir)
@@ -2568,7 +2575,7 @@ func main() {
 					}, 0)
 				}
 				fmt.Printf("✓ Cleared AGENTS.md prompt preference for %s\n", prefDir)
-				os.Exit(0)
+				exitCLI(0)
 			}
 
 			if isCheck || *agentsCheck {
@@ -2596,57 +2603,57 @@ func main() {
 				if !detection.Found() {
 					fmt.Printf("No agent file found (searched up to 3 parent directories from %s)\n", workDir)
 					fmt.Println("Run 'bv --agents-add' to create AGENTS.md with beads workflow instructions.")
-					os.Exit(0)
+					exitCLI(0)
 				}
 				if detection.HasMalformedBlurb() {
 					fmt.Printf("Found %s at %s with malformed bv blurb markers: %s\n",
 						detection.FileType, detection.FilePath, detection.BlurbStructureError)
 					fmt.Println("Repair the marker structure before adding, updating, or removing the blurb.")
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if detection.HasFutureBlurb() {
 					fmt.Printf("Found %s at %s with bv blurb v%d, newer than this bv binary (v%d)\n",
 						detection.FileType, detection.FilePath, detection.BlurbVersion, agents.BlurbVersion)
 					fmt.Println("Use a matching or newer bv binary; this version will not modify the blurb.")
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if detection.HasDuplicateBlurbs() {
 					fmt.Printf("Found %s at %s with %d versioned blurbs — needs normalization\n",
 						detection.FileType, detection.FilePath, detection.BlurbCount)
 					fmt.Println("Run 'bv --agents-update' to consolidate them into one current blurb.")
-					os.Exit(0)
+					exitCLI(0)
 				}
 				if detection.HasLegacyBlurb {
 					fmt.Printf("Found %s at %s (legacy blurb — needs upgrade)\n", detection.FileType, detection.FilePath)
 					fmt.Println("Run 'bv --agents-update' to upgrade to the current format.")
-					os.Exit(0)
+					exitCLI(0)
 				}
 				if detection.HasBlurb && detection.BlurbVersion < agents.BlurbVersion {
 					fmt.Printf("Found %s at %s (blurb v%d, current v%d — needs update)\n",
 						detection.FileType, detection.FilePath, detection.BlurbVersion, agents.BlurbVersion)
 					fmt.Println("Run 'bv --agents-update' to update to the latest version.")
-					os.Exit(0)
+					exitCLI(0)
 				}
 				if detection.HasBlurb {
 					fmt.Printf("Found %s at %s (blurb v%d — up to date)\n",
 						detection.FileType, detection.FilePath, detection.BlurbVersion)
-					os.Exit(0)
+					exitCLI(0)
 				}
 				// File exists but no blurb
 				fmt.Printf("Found %s at %s (no beads workflow instructions)\n", detection.FileType, detection.FilePath)
 				fmt.Println("Run 'bv --agents-add' to add beads workflow instructions.")
-				os.Exit(0)
+				exitCLI(0)
 			}
 
 			if *agentsAdd {
 				if detection.Found() && detection.HasMalformedBlurb() {
 					fmt.Fprintf(os.Stderr, "%s has malformed bv blurb markers: %s\n", detection.FilePath, detection.BlurbStructureError)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if detection.Found() && detection.HasFutureBlurb() {
 					fmt.Fprintf(os.Stderr, "%s contains bv blurb v%d, newer than this bv binary (v%d); refusing to modify it.\n",
 						detection.FilePath, detection.BlurbVersion, agents.BlurbVersion)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if detection.Found() && detection.NeedsUpgrade() {
 					errOut := os.Stdout
@@ -2654,7 +2661,7 @@ func main() {
 						errOut = os.Stderr
 					}
 					fmt.Fprintln(errOut, "Existing blurb found but it needs update or normalization. Use --agents-update instead.")
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if detection.Found() && detection.HasBlurb && detection.BlurbVersion >= agents.BlurbVersion {
 					prefDir := filepath.Dir(detection.FilePath)
@@ -2674,7 +2681,7 @@ func main() {
 						}, 0)
 					}
 					fmt.Printf("%s already has current blurb (v%d) — no action needed.\n", detection.FilePath, detection.BlurbVersion)
-					os.Exit(0)
+					exitCLI(0)
 				}
 
 				targetPath := detection.FilePath
@@ -2703,7 +2710,7 @@ func main() {
 					} else {
 						fmt.Printf("[dry-run] Would append beads workflow instructions to %s.\n", targetPath)
 					}
-					os.Exit(0)
+					exitCLI(0)
 				}
 
 				if !*agentsForce && !agentsRobotMode {
@@ -2717,14 +2724,14 @@ func main() {
 					response = strings.ToLower(strings.TrimSpace(response))
 					if response != "" && response != "y" && response != "yes" {
 						fmt.Println("Cancelled.")
-						os.Exit(0)
+						exitCLI(0)
 					}
 				}
 
 				if creating {
 					if err := agents.CreateAgentFile(targetPath); err != nil {
 						fmt.Fprintf(os.Stderr, "Error creating agent file: %v\n", err)
-						os.Exit(1)
+						exitCLI(1)
 					}
 					if !agentsRobotMode {
 						fmt.Printf("Created %s with beads workflow instructions.\n", targetPath)
@@ -2732,7 +2739,7 @@ func main() {
 				} else {
 					if err := agents.AppendBlurbToFile(targetPath); err != nil {
 						fmt.Fprintf(os.Stderr, "Error appending blurb: %v\n", err)
-						os.Exit(1)
+						exitCLI(1)
 					}
 					if !agentsRobotMode {
 						fmt.Printf("Appended beads workflow instructions to %s.\n", targetPath)
@@ -2742,11 +2749,11 @@ func main() {
 				ok, verifyErr := agents.VerifyBlurbPresent(targetPath)
 				if verifyErr != nil {
 					fmt.Fprintf(os.Stderr, "Warning: verification failed: %v\n", verifyErr)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if !ok {
 					fmt.Fprintf(os.Stderr, "Warning: verification failed — blurb may not have been written correctly.\n")
-					os.Exit(1)
+					exitCLI(1)
 				}
 				prefDir := filepath.Dir(targetPath)
 				_ = agents.RecordAccept(prefDir)
@@ -2764,7 +2771,7 @@ func main() {
 						"dry_run":          false,
 					}, 0)
 				}
-				os.Exit(0)
+				exitCLI(0)
 			}
 
 			if *agentsUpdate {
@@ -2774,16 +2781,16 @@ func main() {
 						errOut = os.Stderr
 					}
 					fmt.Fprintln(errOut, "No agent file found. Use --agents-add to create one.")
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if detection.HasMalformedBlurb() {
 					fmt.Fprintf(os.Stderr, "%s has malformed bv blurb markers: %s\n", detection.FilePath, detection.BlurbStructureError)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if detection.HasFutureBlurb() {
 					fmt.Fprintf(os.Stderr, "%s contains bv blurb v%d, newer than this bv binary (v%d); refusing to downgrade it.\n",
 						detection.FilePath, detection.BlurbVersion, agents.BlurbVersion)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if !detection.HasBlurb && !detection.HasLegacyBlurb {
 					errOut := os.Stdout
@@ -2791,7 +2798,7 @@ func main() {
 						errOut = os.Stderr
 					}
 					fmt.Fprintf(errOut, "%s has no blurb to update. Use --agents-add to add one.\n", detection.FilePath)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if !detection.NeedsUpgrade() {
 					prefDir := filepath.Dir(detection.FilePath)
@@ -2810,7 +2817,7 @@ func main() {
 						}, 0)
 					}
 					fmt.Printf("%s already has current blurb (v%d) — no update needed.\n", detection.FilePath, detection.BlurbVersion)
-					os.Exit(0)
+					exitCLI(0)
 				}
 
 				if *agentsDryRun {
@@ -2834,7 +2841,7 @@ func main() {
 						fmt.Printf("[dry-run] Would update blurb from v%d to v%d in %s.\n",
 							detection.BlurbVersion, agents.BlurbVersion, detection.FilePath)
 					}
-					os.Exit(0)
+					exitCLI(0)
 				}
 
 				if !*agentsForce && !agentsRobotMode {
@@ -2844,13 +2851,13 @@ func main() {
 					response = strings.ToLower(strings.TrimSpace(response))
 					if response != "" && response != "y" && response != "yes" {
 						fmt.Println("Cancelled.")
-						os.Exit(0)
+						exitCLI(0)
 					}
 				}
 
 				if err := agents.UpdateBlurbInFile(detection.FilePath); err != nil {
 					fmt.Fprintf(os.Stderr, "Error updating blurb: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if !agentsRobotMode {
 					fmt.Printf("Updated blurb to v%d in %s.\n", agents.BlurbVersion, detection.FilePath)
@@ -2859,11 +2866,11 @@ func main() {
 				ok, verifyErr := agents.VerifyBlurbPresent(detection.FilePath)
 				if verifyErr != nil {
 					fmt.Fprintf(os.Stderr, "Warning: verification failed: %v\n", verifyErr)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if !ok {
 					fmt.Fprintf(os.Stderr, "Warning: verification failed — blurb may not have been written correctly.\n")
-					os.Exit(1)
+					exitCLI(1)
 				}
 				prefDir := filepath.Dir(detection.FilePath)
 				_ = agents.RecordAccept(prefDir)
@@ -2880,7 +2887,7 @@ func main() {
 						"dry_run":          false,
 					}, 0)
 				}
-				os.Exit(0)
+				exitCLI(0)
 			}
 
 			if *agentsRemove {
@@ -2896,16 +2903,16 @@ func main() {
 						}, 0)
 					}
 					fmt.Println("No agent file found — nothing to remove.")
-					os.Exit(0)
+					exitCLI(0)
 				}
 				if detection.HasMalformedBlurb() {
 					fmt.Fprintf(os.Stderr, "%s has malformed bv blurb markers: %s\n", detection.FilePath, detection.BlurbStructureError)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if detection.HasFutureBlurb() {
 					fmt.Fprintf(os.Stderr, "%s contains bv blurb v%d, newer than this bv binary (v%d); refusing to remove it.\n",
 						detection.FilePath, detection.BlurbVersion, agents.BlurbVersion)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if !detection.HasBlurb && !detection.HasLegacyBlurb {
 					if agentsRobotMode {
@@ -2919,7 +2926,7 @@ func main() {
 						}, 0)
 					}
 					fmt.Printf("%s has no blurb — nothing to remove.\n", detection.FilePath)
-					os.Exit(0)
+					exitCLI(0)
 				}
 
 				if *agentsDryRun {
@@ -2935,7 +2942,7 @@ func main() {
 						}, 0)
 					}
 					fmt.Printf("[dry-run] Would remove blurb from %s.\n", detection.FilePath)
-					os.Exit(0)
+					exitCLI(0)
 				}
 
 				if !*agentsForce && !agentsRobotMode {
@@ -2945,13 +2952,13 @@ func main() {
 					response = strings.ToLower(strings.TrimSpace(response))
 					if response != "" && response != "y" && response != "yes" {
 						fmt.Println("Cancelled.")
-						os.Exit(0)
+						exitCLI(0)
 					}
 				}
 
 				if err := agents.RemoveBlurbFromFile(detection.FilePath); err != nil {
 					fmt.Fprintf(os.Stderr, "Error removing blurb: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				prefDir := filepath.Dir(detection.FilePath)
 				_ = agents.RecordDecline(prefDir, true)
@@ -2969,7 +2976,7 @@ func main() {
 					}, 0)
 				}
 				fmt.Printf("Removed blurb from %s.\n", detection.FilePath)
-				os.Exit(0)
+				exitCLI(0)
 			}
 		}
 
@@ -2977,16 +2984,15 @@ func main() {
 		projectDir, err := resolveCLIProjectDir()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error getting project directory: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 
 		// Workspace auto-discovery (I2): without --workspace, when no .beads
 		// directory is reachable from the working directory (or BEADS_DIR /
 		// BEADS_DB), a .bv/workspace.yaml here or in any parent directory
 		// selects workspace mode for the TUI, early project helpers, and every
-		// robot command. --workspace stays the explicit override; --as-of never
-		// uses it.
-		if *workspaceConfig == "" && *asOf == "" {
+		// robot command (including historical --as-of).
+		if *workspaceConfig == "" {
 			if found := discoverWorkspaceConfig(); found != "" {
 				*workspaceConfig = found
 				if !envRobot {
@@ -2994,7 +3000,7 @@ func main() {
 				}
 			}
 		}
-		if *workspaceConfig != "" && *asOf == "" {
+		if *workspaceConfig != "" {
 			if wsRoot := workspace.ResolveWorkspaceBaseDir(*workspaceConfig); wsRoot != "" {
 				projectDir = wsRoot
 			}
@@ -3004,20 +3010,20 @@ func main() {
 		if *initDrift {
 			if *asOf != "" {
 				fmt.Fprintln(os.Stderr, "Error: --init-drift cannot be combined with --as-of")
-				os.Exit(1)
+				exitCLI(1)
 			}
 			cfgPath := filepath.Join(projectDir, ".bv", "drift.yaml")
 			existed := drift.ConfigExists(projectDir)
 			if existed && !*yesFlag {
 				fmt.Fprintf(os.Stderr, "Error: drift configuration already exists at %s (pass --yes to overwrite)\n", cfgPath)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if err := drift.SaveConfig(projectDir, drift.DefaultConfig()); err != nil {
 				fmt.Fprintf(os.Stderr, "Error writing drift configuration: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			_ = loader.EnsureBVIgnored(projectDir)
-			if envRobot || flag.CommandLine.Changed("format") {
+			if envRobot || structuredFormatRequested {
 				wrapped, encErr := withEnvelope(NewRobotEnvelope(""), map[string]interface{}{
 					"action":      "init_drift",
 					"path":        cfgPath,
@@ -3025,61 +3031,61 @@ func main() {
 				})
 				if encErr != nil {
 					fmt.Fprintf(os.Stderr, "Error encoding init-drift envelope: %v\n", encErr)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if encErr := newRobotEncoder(os.Stdout).Encode(wrapped); encErr != nil {
 					fmt.Fprintf(os.Stderr, "Error encoding init-drift output: %v\n", encErr)
-					os.Exit(1)
+					exitCLI(1)
 				}
-				os.Exit(0)
+				exitCLI(0)
 			}
 			fmt.Printf("Created drift configuration at %s\n", cfgPath)
-			os.Exit(0)
+			exitCLI(0)
 		}
 
 		// Handle feedback commands (bv-90, bv-apal.36)
 		if *feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset || *feedbackShow {
 			if *asOf != "" && (*feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset) {
 				fmt.Fprintln(os.Stderr, "Error: feedback mutation flags cannot be combined with --as-of")
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if *feedbackAccept != "" && *feedbackIgnore != "" {
 				fmt.Fprintln(os.Stderr, "Error: --feedback-accept and --feedback-ignore cannot be used together")
-				os.Exit(1)
+				exitCLI(1)
 			}
 
-			feedbackRobotMode := envRobot || flag.CommandLine.Changed("format")
+			feedbackRobotMode := envRobot || structuredFormatRequested
 			emitFeedbackRobot := func(dataHash string, payload interface{}) {
 				wrapped, encErr := withEnvelope(NewRobotEnvelope(dataHash), payload)
 				if encErr != nil {
 					fmt.Fprintf(os.Stderr, "Error encoding feedback envelope: %v\n", encErr)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				encoder := newRobotEncoder(os.Stdout)
 				if encErr := encoder.Encode(wrapped); encErr != nil {
 					fmt.Fprintf(os.Stderr, "Error encoding feedback output: %v\n", encErr)
-					os.Exit(1)
+					exitCLI(1)
 				}
-				os.Exit(0)
+				exitCLI(0)
 			}
 
 			beadsDir, err := loader.GetBeadsDir(projectDir)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			feedback, err := analysis.LoadFeedback(beadsDir)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error loading feedback: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			if *feedbackReset {
 				feedback.Reset()
 				if err := feedback.Save(beadsDir); err != nil {
 					fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				if feedbackRobotMode {
 					emitFeedbackRobot("", map[string]interface{}{
@@ -3088,7 +3094,7 @@ func main() {
 					})
 				}
 				fmt.Println("Feedback data reset to defaults.")
-				os.Exit(0)
+				exitCLI(0)
 			}
 
 			if *feedbackShow {
@@ -3098,7 +3104,7 @@ func main() {
 				feedbackJSON := feedback.ToJSON()
 				data, _ := json.MarshalIndent(feedbackJSON, "", "  ")
 				fmt.Println(string(data))
-				os.Exit(0)
+				exitCLI(0)
 			}
 
 			// For accept/ignore, compute the issue's score breakdown at robotNow()
@@ -3114,7 +3120,7 @@ func main() {
 				issues := loaded.Issues
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error loading issues: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 
 				var foundIssue *model.Issue
@@ -3127,7 +3133,7 @@ func main() {
 
 				if foundIssue == nil {
 					fmt.Fprintf(os.Stderr, "Issue not found: %s\n", issueID)
-					os.Exit(1)
+					exitCLI(1)
 				}
 
 				authorityIssues := make([]model.Issue, 0, len(issues)+len(loaded.Report.TombstoneIDs))
@@ -3160,12 +3166,12 @@ func main() {
 
 				if err := feedback.RecordFeedback(issueID, action, score, breakdown); err != nil {
 					fmt.Fprintf(os.Stderr, "Error recording feedback: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 
 				if err := feedback.Save(beadsDir); err != nil {
 					fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 
 				if feedbackRobotMode {
@@ -3179,7 +3185,7 @@ func main() {
 
 				fmt.Printf("Recorded %s feedback for %s (score: %.3f)\n", action, issueID, score)
 				fmt.Println(feedback.Summary())
-				os.Exit(0)
+				exitCLI(0)
 			}
 		}
 
@@ -3210,7 +3216,7 @@ func main() {
 
 		// Handle --baseline-info
 		if *baselineInfo {
-			structuredBaselineInfo := envRobot || flag.CommandLine.Changed("format") || env.OutputFormat.IsSet()
+			structuredBaselineInfo := envRobot || structuredFormatRequested
 			if !baseline.Exists(baselinePath) {
 				if structuredBaselineInfo {
 					payload := map[string]interface{}{
@@ -3281,7 +3287,7 @@ func main() {
 					}
 					fmt.Fprintln(os.Stderr, "\nA path ending in .yaml or .yml loads one recipe file, e.g. --recipe .beads/recipes/sprint.yaml")
 				}
-				os.Exit(1)
+				exitCLI(1)
 			}
 			activeRecipe = resolved
 		}
@@ -3289,6 +3295,7 @@ func main() {
 		// Load issues from current directory or workspace (with timing for profile)
 		loadStart := time.Now()
 		var issues []model.Issue
+		var historicalWorkspaceAuthIssues []model.Issue
 		var beadsPath string
 		var workspaceInfo *workspace.LoadSummary
 		var asOfResolved string // Resolved commit SHA when using --as-of (for robot output metadata)
@@ -3300,12 +3307,15 @@ func main() {
 
 		if *asOf != "" {
 			if *workspaceConfig != "" {
-				wsIssues, wsAuthIssues, wsSources, wsTombstones, wsRev, wsTime, wsErr := loadWorkspaceHistoricalAsOf(*workspaceConfig, *asOf, *repoFilter)
+				wsIssues, wsAuthIssues, wsSources, wsTombstones, wsSummary, wsRev, wsTime, wsErr := loadWorkspaceHistoricalAsOf(*workspaceConfig, *asOf, *repoFilter)
 				sourceAuthority = newRobotSourceAuthority(wsSources)
 				robotDispatchContext.SourcePath, robotDispatchContext.SourceKind = *workspaceConfig, "workspace"
 				robotDispatchContext.SourceAuthority = sourceAuthority
 				if wsErr != nil {
 					sourceAuthority.ClaimSafe, sourceAuthority.Readiness = false, "provisional"
+					if sourceAuthority.Loaded > 0 {
+						sourceAuthority.State = "partial"
+					}
 					if envRobot {
 						writeRobotLoadFailure(robotDispatchContext, wsErr)
 					}
@@ -3313,8 +3323,9 @@ func main() {
 					exitCLI(1)
 				}
 				issues = wsIssues
+				historicalWorkspaceAuthIssues = wsAuthIssues
 				sourceTombstoneIDs = wsTombstones
-				_ = wsAuthIssues
+				workspaceInfo = wsSummary
 				if len(sourceTombstoneIDs) == 0 {
 					unfilteredDataHash = analysis.ComputeDataHash(issues)
 				}
@@ -3381,7 +3392,7 @@ func main() {
 					writeRobotLoadFailure(robotDispatchContext, err)
 				}
 				fmt.Fprintf(os.Stderr, "Error loading workspace: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			issues = loadedIssues
 			for _, result := range results {
@@ -3428,7 +3439,7 @@ func main() {
 				}
 				fmt.Fprintf(os.Stderr, "Error loading beads: %v\n", err)
 				fmt.Fprintln(os.Stderr, "Make sure you are in a project initialized with 'br init'.")
-				os.Exit(1)
+				exitCLI(1)
 			}
 			sourceTombstoneIDs = singleSourceLoad.Report.TombstoneIDs
 			if len(sourceTombstoneIDs) == 0 {
@@ -3463,10 +3474,15 @@ func main() {
 			}
 		}
 		// Capture dependency truth before any display filters remove records.
-		authorityIssues := make([]model.Issue, 0, len(issues)+len(sourceTombstoneIDs))
-		authorityIssues = append(authorityIssues, issues...)
-		for _, id := range sourceTombstoneIDs {
-			authorityIssues = append(authorityIssues, model.Issue{ID: id, Status: model.StatusTombstone})
+		var authorityIssues []model.Issue
+		if len(historicalWorkspaceAuthIssues) > 0 {
+			authorityIssues = historicalWorkspaceAuthIssues
+		} else {
+			authorityIssues = make([]model.Issue, 0, len(issues)+len(sourceTombstoneIDs))
+			authorityIssues = append(authorityIssues, issues...)
+			for _, id := range sourceTombstoneIDs {
+				authorityIssues = append(authorityIssues, model.Issue{ID: id, Status: model.StatusTombstone})
+			}
 		}
 		readiness := model.NewReadinessIndex(authorityIssues)
 		issuesForSearch := issues
@@ -3494,7 +3510,7 @@ func main() {
 		scopedContext, scopeErr := scopeLoadedIssues(robotDispatchContext, recipeForScope)
 		if scopeErr != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", scopeErr)
-			os.Exit(1)
+			exitCLI(1)
 		}
 		robotDispatchContext = scopedContext
 		issues = scopedContext.Issues
@@ -3507,12 +3523,12 @@ func main() {
 		// 2026-09-01: a fresher sidecar could be loaded with nothing in the
 		// output revealing it).
 		switch {
-		case *asOf != "":
-			robotDispatchContext.SourceKind = "git"
-			robotDispatchContext.SourcePath = fmt.Sprintf(".beads@%s", *asOf)
 		case *workspaceConfig != "":
 			robotDispatchContext.SourceKind = "workspace"
 			robotDispatchContext.SourcePath = *workspaceConfig
+		case *asOf != "":
+			robotDispatchContext.SourceKind = "git"
+			robotDispatchContext.SourcePath = fmt.Sprintf(".beads@%s", *asOf)
 		default:
 			if src := singleSourceLoad.Source; src.Path != "" {
 				robotDispatchContext.SourcePath = src.Path
@@ -3522,13 +3538,13 @@ func main() {
 
 		// Handle semantic search CLI (bv-9gf.3)
 		if *semanticQuery != "" {
-			if !*robotSearch && (envRobot || flag.CommandLine.Changed("format") || env.OutputFormat.IsSet()) {
+			if !*robotSearch && (envRobot || structuredFormatRequested) {
 				*robotSearch = true
 			}
 			minScore, err := parseSearchMinScore(*searchMinScore)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(2)
+				exitCLI(2)
 			}
 			eligibleIDs := make(map[string]bool, len(issues))
 			selectedIssues := make([]model.Issue, 0, len(issues))
@@ -3542,13 +3558,13 @@ func main() {
 			searchCfg, err := resolveSearchConfig(*searchMode, *searchPreset, *searchWeights)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			embedder, err := search.NewEmbedderFromConfig(embedCfg)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			searchScopeKey := ""
@@ -3578,7 +3594,7 @@ func main() {
 				searchScopeKey = "db:" + filepath.Clean(absSrc)
 			}
 
-			skipDiskIndex := env.NoCache.Bool() || strings.TrimSpace(env.NoSavedConfig.Get()) != ""
+			skipDiskIndex := env.NoCache.Bool()
 			indexPath := search.IndexPathForScope(projectDir, embedCfg, searchScopeKey)
 			if asOfResolved != "" {
 				indexPath = filepath.Join(filepath.Dir(indexPath), "historical-"+asOfResolved+"-"+filepath.Base(indexPath))
@@ -3597,7 +3613,7 @@ func main() {
 				idx, loaded, err = search.LoadOrNewVectorIndex(indexPath, embedder.Dim())
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 			}
 
@@ -3612,7 +3628,7 @@ func main() {
 			syncStats, err := search.SyncVectorIndex(ctx, idx, embedder, docs, 64)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error building semantic index: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if !skipDiskIndex && (!loaded || syncStats.Changed()) {
 				if err := idx.Save(indexPath); err != nil {
@@ -3621,7 +3637,7 @@ func main() {
 						indexPath = ""
 					} else {
 						fmt.Fprintf(os.Stderr, "Error saving semantic index: %v\n", err)
-						os.Exit(1)
+						exitCLI(1)
 					}
 				}
 			}
@@ -3632,7 +3648,7 @@ func main() {
 					err = fmt.Errorf("embedder returned %d vectors for query", len(qvecs))
 				}
 				fmt.Fprintf(os.Stderr, "Error embedding query: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			limit := *searchLimit
@@ -3663,7 +3679,7 @@ func main() {
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error searching index: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			exactID := ""
 			for _, result := range results {
@@ -3690,7 +3706,7 @@ func main() {
 				weights, presetName, err := resolveSearchWeights(searchCfg)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				weights = weights.Normalize()
 				weights = search.AdjustWeightsForQuery(weights, *semanticQuery)
@@ -3709,14 +3725,14 @@ func main() {
 				cache := search.NewMetricsCache(metricsLoader)
 				if err := cache.Refresh(); err != nil {
 					fmt.Fprintf(os.Stderr, "Error computing hybrid metrics: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 
 				scorer := search.NewHybridScorerAt(weights, cache, referenceTime)
 				hybridResults, err = buildHybridScores(results, scorer)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error scoring hybrid results: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				hybridResults = promoteExactHybridResult(exactID, hybridResults)
 				if len(hybridResults) > limit {
@@ -3748,7 +3764,7 @@ func main() {
 				out.RankingHash, err = searchRankingHash(out)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				out.Results = make([]robotSearchResult, 0, max(len(results), len(hybridResults)))
 				if searchCfg.Mode == search.SearchModeHybrid {
@@ -4045,7 +4061,7 @@ func main() {
 			// Initial export
 			if err := doExport(robotDispatchContext); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			// Watch mode (bv-55): monitor .beads/ for changes and auto-regenerate
@@ -4160,7 +4176,7 @@ func main() {
 				}()
 				if _, err := syncWatchers(robotDispatchContext); err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				fmt.Println("  → Press Ctrl+C to stop")
 				fmt.Println("")
@@ -4330,7 +4346,7 @@ func main() {
 
 			if len(exportIssues) == 0 || (robotDispatchContext.CandidateIDs != nil && len(robotDispatchContext.CandidateIDs) == 0) {
 				fmt.Fprintf(os.Stderr, "No issues to export (check filters)\n")
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			// Get project name from canonical project directory
@@ -4340,14 +4356,19 @@ func main() {
 			}
 
 			graphFormatName := strings.TrimPrefix(strings.ToLower(filepath.Ext(*exportGraph)), ".")
-			if graphFormatName == "" || *exportGraph == "html" || *exportGraph == "interactive" {
-				graphFormatName = "html"
+			graphExportNow := robotDispatchContext.ReferenceNow()
+			shortGraphHash := strings.TrimSpace(asOfResolved)
+			if len(shortGraphHash) > 8 {
+				shortGraphHash = shortGraphHash[:8]
 			}
 			resolvedGraphExportPath := *exportGraph
 			if *exportGraph == "html" || *exportGraph == "interactive" {
-				resolvedGraphExportPath = export.GenerateInteractiveGraphFilename(projectName)
+				graphFormatName = "html"
+				resolvedGraphExportPath = export.GenerateInteractiveGraphFilenameWithOpts(projectName, graphExportNow, projectDir, shortGraphHash)
+			} else if graphFormatName == "" {
+				graphFormatName = "svg"
+				resolvedGraphExportPath = *exportGraph + ".svg"
 			}
-			graphExportNow := robotDispatchContext.ReferenceNow()
 			graphHookExecutor, hookErr := hooks.RunHooks(projectDir, hooks.ExportContext{
 				ExportPath:   resolvedGraphExportPath,
 				ExportFormat: graphFormatName,
@@ -4375,7 +4396,7 @@ func main() {
 				}
 				if postErr != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v (export written to %s)\n", postErr, writtenPath)
-					os.Exit(1)
+					exitCLI(1)
 				}
 			}
 
@@ -4437,33 +4458,37 @@ func main() {
 				envelope, err := withEnvelope(robotDispatchContext.Envelope(), struct{}{})
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error encoding graph source authority: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 
 				opts := export.InteractiveGraphOptions{
 					Issues:        exportIssues,
 					Stats:         &stats,
+					Readiness:     robotDispatchContext.Readiness,
 					Triage:        &triage,
 					History:       historyReport,
 					Title:         title,
 					DataHash:      dataHash,
 					Path:          resolvedGraphExportPath,
 					ProjectName:   projectName,
+					ExportedAt:    graphExportNow,
+					GitHash:       asOfResolved,
+					WorkDir:       projectDir,
 					RobotEnvelope: envelope,
 				}
 				outputPath, err := export.GenerateInteractiveGraphHTML(opts)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error exporting interactive graph: %v\n", err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				runGraphPostHooks(outputPath)
 				fmt.Printf("✓ Interactive graph exported to %s (%d nodes, %d edges)\n", outputPath, len(exportIssues), stats.EdgeCount)
-				os.Exit(0)
+				exitCLI(0)
 			}
 
 			// Static PNG/SVG export (use .html for better interactive graphs)
 			opts := export.GraphSnapshotOptions{
-				Path:      *exportGraph,
+				Path:      resolvedGraphExportPath,
 				Title:     *graphTitle,
 				Preset:    *graphPreset,
 				Issues:    exportIssues,
@@ -4475,12 +4500,12 @@ func main() {
 			err := export.SaveGraphSnapshot(opts)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error exporting graph snapshot: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
-			runGraphPostHooks(*exportGraph)
+			runGraphPostHooks(resolvedGraphExportPath)
 
-			fmt.Printf("✓ Graph exported to %s (%d nodes) - tip: use .html for interactive graphs\n", *exportGraph, len(exportIssues))
-			os.Exit(0)
+			fmt.Printf("✓ Graph exported to %s (%d nodes) - tip: use .html for interactive graphs\n", resolvedGraphExportPath, len(exportIssues))
+			exitCLI(0)
 		}
 
 		// Handle --robot-alerts (drift + proactive)
@@ -4491,7 +4516,10 @@ func main() {
 
 		// Handle --profile-startup
 		if *profileStartup {
-			runProfileStartup(issues, loadDuration, *profileJSON, *forceFullAnalysis)
+			if err := runProfileStartup(issues, loadDuration, *profileJSON, *forceFullAnalysis); err != nil {
+				fmt.Fprintf(os.Stderr, "Error encoding profile: %v\n", err)
+				exitCLI(1)
+			}
 			exitCLI(0)
 		}
 
@@ -4541,17 +4569,18 @@ func main() {
 			// Methods return copies of the maps
 			topMetrics := baseline.TopMetrics{
 				PageRank:     buildScopedMetricItems(stats.PageRank(), 10, robotDispatchContext.CandidateIDs),
-				Betweenness:  buildScopedMetricItems(stats.Betweenness(), 10, robotDispatchContext.CandidateIDs),
+				Betweenness:  buildScopedMetricItems(stats.ActiveBetweenness(), 10, robotDispatchContext.CandidateIDs),
 				CriticalPath: buildScopedMetricItems(stats.CriticalPathScore(), 10, robotDispatchContext.CandidateIDs),
 				Hubs:         buildScopedMetricItems(stats.Hubs(), 10, robotDispatchContext.CandidateIDs),
 				Authorities:  buildScopedMetricItems(stats.Authorities(), 10, robotDispatchContext.CandidateIDs),
 			}
 
 			bl := baseline.NewForDir(projectDir, graphStats, topMetrics, cycles, *saveBaseline)
+			bl.Scope = baselineScopeForContext(robotDispatchContext)
 
 			if err := bl.Save(baselinePath); err != nil {
 				fmt.Fprintf(os.Stderr, "Error saving baseline: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			fmt.Printf("Baseline saved to %s\n", baselinePath)
@@ -4561,20 +4590,20 @@ func main() {
 
 		// Handle --check-drift
 		if *checkDrift {
-			if *robotDriftCheck || envRobot || flag.CommandLine.Changed("format") {
+			if *robotDriftCheck || envRobot || flag.CommandLine.Changed("format") || structuredFormatRequested {
 				*robotDriftCheck = true
 				dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-drift", robotDispatchContext)
 			}
 			if !baseline.Exists(baselinePath) {
 				fmt.Fprintln(os.Stderr, "Error: No baseline found.")
 				fmt.Fprintln(os.Stderr, "Create one with: bv --save-baseline \"description\"")
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			bl, err := baseline.Load(baselinePath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error loading baseline: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			// Run analysis on current issues. Use one captured instant throughout
@@ -4616,12 +4645,13 @@ func main() {
 			}
 			currentMetrics := baseline.TopMetrics{
 				PageRank:     buildScopedMetricItems(stats.PageRank(), 10, robotDispatchContext.CandidateIDs),
-				Betweenness:  buildScopedMetricItems(stats.Betweenness(), 10, robotDispatchContext.CandidateIDs),
+				Betweenness:  buildScopedMetricItems(stats.ActiveBetweenness(), 10, robotDispatchContext.CandidateIDs),
 				CriticalPath: buildScopedMetricItems(stats.CriticalPathScore(), 10, robotDispatchContext.CandidateIDs),
 				Hubs:         buildScopedMetricItems(stats.Hubs(), 10, robotDispatchContext.CandidateIDs),
 				Authorities:  buildScopedMetricItems(stats.Authorities(), 10, robotDispatchContext.CandidateIDs),
 			}
 			current := baseline.NewForDir(projectDir, currentStats, currentMetrics, cycles, "current")
+			current.Scope = baselineScopeForContext(robotDispatchContext)
 
 			// Load drift config and run calculator
 			driftConfig, err := drift.LoadConfig(projectDir)
@@ -4638,6 +4668,64 @@ func main() {
 			_ = calc.ReuseAnalyzer(analyzer)
 			attachSourceDiffsForContext(calc, robotDispatchContext, driftConfig.SourceDriftMaxAlerts)
 			result := calc.Calculate()
+			if !baselineMatchesContext(bl, robotDispatchContext) {
+				result.SkippedChecks = append(result.SkippedChecks, drift.SkippedCheck{
+					Type:   drift.AlertType("baseline_scope_mismatch"),
+					Reason: "saved baseline scope does not match active CLI scope; aggregate baseline deltas skipped",
+				})
+			}
+			if strings.TrimSpace(*alertSeverity) != "" || strings.TrimSpace(*alertType) != "" || strings.TrimSpace(*alertLabel) != "" || *robotMaxResults > 0 {
+				filtered := result.Alerts[:0]
+				for _, alert := range result.Alerts {
+					if strings.TrimSpace(*alertSeverity) != "" && string(alert.Severity) != strings.TrimSpace(*alertSeverity) {
+						continue
+					}
+					if strings.TrimSpace(*alertType) != "" && string(alert.Type) != strings.TrimSpace(*alertType) {
+						continue
+					}
+					if strings.TrimSpace(*alertLabel) != "" {
+						want := strings.ToLower(strings.TrimSpace(*alertLabel))
+						found := false
+						for _, label := range alert.Labels {
+							if strings.ToLower(label) == want {
+								found = true
+								break
+							}
+						}
+						if !found && alert.Label != "" && strings.ToLower(alert.Label) == want {
+							found = true
+						}
+						if !found {
+							for _, detail := range alert.Details {
+								if strings.Contains(strings.ToLower(detail), want) {
+									found = true
+									break
+								}
+							}
+						}
+						if !found {
+							continue
+						}
+					}
+					filtered = append(filtered, alert)
+				}
+				if *robotMaxResults > 0 && len(filtered) > *robotMaxResults {
+					filtered = filtered[:*robotMaxResults]
+				}
+				result.Alerts = filtered
+				result.CriticalCount, result.WarningCount, result.InfoCount = 0, 0, 0
+				for _, a := range filtered {
+					switch a.Severity {
+					case drift.SeverityCritical:
+						result.CriticalCount++
+					case drift.SeverityWarning:
+						result.WarningCount++
+					case drift.SeverityInfo:
+						result.InfoCount++
+					}
+				}
+				result.HasDrift = result.CriticalCount > 0 || result.WarningCount > 0
+			}
 
 			// Human-readable output
 			fmt.Print(result.Summary())
@@ -4709,7 +4797,7 @@ func main() {
 			authorityJSON, err := json.Marshal(sourceAuthority)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error encoding script source authority: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			sb.WriteString(fmt.Sprintf("# Source authority: %s\n", authorityJSON))
 			if *robotIncludeInactive {
@@ -4775,7 +4863,7 @@ func main() {
 			}
 
 			fmt.Print(sb.String())
-			os.Exit(0)
+			exitCLI(0)
 		}
 
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-next", robotDispatchContext)
@@ -4830,7 +4918,7 @@ func main() {
 			triageJSON, err := json.Marshal(triage)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error marshaling triage data: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			// Generate the brief
@@ -4848,7 +4936,7 @@ func main() {
 			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error generating priority brief: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if !robotDispatchContext.claimsProven() {
 				brief = "> Readiness is provisional because source data is incomplete or stale. Restore the affected sources before claiming work.\n\n" + brief
@@ -4857,7 +4945,7 @@ func main() {
 			// Write to file safely via os.Root confinement
 			if err := export.SafeWriteOutput(*priorityBrief, []byte(brief), 0644); err != nil {
 				fmt.Fprintf(os.Stderr, "Error writing priority brief: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if briefHookExecutor != nil {
 				postErr := briefHookExecutor.RunPostExport()
@@ -4866,19 +4954,19 @@ func main() {
 				}
 				if postErr != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v (export written to %s)\n", postErr, *priorityBrief)
-					os.Exit(1)
+					exitCLI(1)
 				}
 			}
 
 			fmt.Printf("Done! Priority brief saved to %s\n", *priorityBrief)
-			os.Exit(0)
+			exitCLI(0)
 		}
 
 		// Handle --agent-brief flag (bv-131)
 		if *agentBrief != "" {
 			if st, lErr := os.Lstat(filepath.Clean(*agentBrief)); lErr == nil && st.Mode()&os.ModeSymlink != 0 {
 				fmt.Fprintf(os.Stderr, "Error creating directory: refusing symlink output directory %s\n", *agentBrief)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			agentBriefNow := robotDispatchContext.ReferenceNow()
 			agentHookExecutor, hookErr := hooks.RunHooks(projectDir, hooks.ExportContext{
@@ -4903,7 +4991,7 @@ func main() {
 			// Create output directory
 			if err := os.MkdirAll(*agentBrief, 0755); err != nil {
 				fmt.Fprintf(os.Stderr, "Error creating directory: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			// Generate triage data
@@ -4931,16 +5019,16 @@ func main() {
 			triagePayload, err := withEnvelope(robotDispatchContext.Envelope(), triage)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error encoding triage authority: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			triageJSON, err := json.MarshalIndent(triagePayload, "", "  ")
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error marshaling triage: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "triage.json"), triageJSON, 0644); err != nil {
 				fmt.Fprintf(os.Stderr, "Error writing triage.json: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			fmt.Println("  → triage.json")
 
@@ -4948,16 +5036,16 @@ func main() {
 			insightsPayload, err := buildRobotInsightsPayload(robotDispatchContext, *robotIncludeInactive, *forceFullAnalysis, *robotMaxResults)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error generating insights: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			insightsJSON, err := json.MarshalIndent(insightsPayload, "", "  ")
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error marshaling insights: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "insights.json"), insightsJSON, 0644); err != nil {
 				fmt.Fprintf(os.Stderr, "Error writing insights.json: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			fmt.Println("  → insights.json")
 
@@ -4976,14 +5064,14 @@ func main() {
 			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error generating brief: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			if !robotDispatchContext.claimsProven() {
 				brief = "> Readiness is provisional; inspect source_authority in triage.json before claiming work.\n\n" + brief
 			}
 			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "brief.md"), []byte(brief), 0644); err != nil {
 				fmt.Fprintf(os.Stderr, "Error writing brief.md: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			fmt.Println("  → brief.md")
 
@@ -4991,7 +5079,7 @@ func main() {
 			helpers := generateJQHelpers()
 			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "helpers.md"), []byte(helpers), 0644); err != nil {
 				fmt.Fprintf(os.Stderr, "Error writing helpers.md: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			fmt.Println("  → helpers.md")
 
@@ -5012,7 +5100,7 @@ func main() {
 			metaJSON, _ := json.MarshalIndent(meta, "", "  ")
 			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "meta.json"), metaJSON, 0644); err != nil {
 				fmt.Fprintf(os.Stderr, "Error writing meta.json: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			fmt.Println("  → meta.json")
 
@@ -5023,12 +5111,12 @@ func main() {
 				}
 				if postErr != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v (export written to %s)\n", postErr, *agentBrief)
-					os.Exit(1)
+					exitCLI(1)
 				}
 			}
 
 			fmt.Printf("\nDone! Agent brief bundle saved to %s/\n", *agentBrief)
-			os.Exit(0)
+			exitCLI(0)
 		}
 
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-history", robotDispatchContext)
@@ -5088,7 +5176,7 @@ func main() {
 		// Handle --diff-since flag
 		if *diffSince != "" {
 			// Auto-enable robot diff for non-interactive/agent/structured contexts
-			if !*robotDiff && (envRobot || !stdoutIsTTY || flag.CommandLine.Changed("format") || env.OutputFormat.IsSet()) {
+			if !*robotDiff && (envRobot || !stdoutIsTTY || flag.CommandLine.Changed("format") || structuredFormatRequested) {
 				*robotDiff = true
 			}
 
@@ -5102,7 +5190,7 @@ func main() {
 				wsHistIssues, wsAuthIssues, wsRev, wsTime, wsErr := loadWorkspaceHistoricalDiffSource(robotDispatchContext, *diffSince)
 				if wsErr != nil {
 					fmt.Fprintf(os.Stderr, "Error loading workspace issues at %s: %v\n", *diffSince, wsErr)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				historicalIssues = wsHistIssues
 				histAuthoritySlice = wsAuthIssues
@@ -5115,7 +5203,7 @@ func main() {
 				histReport, err := gitLoader.LoadAtWithReport(*diffSince)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error loading issues at %s: %v\n", *diffSince, err)
-					os.Exit(1)
+					exitCLI(1)
 				}
 				historicalIssues = histReport.Issues
 				histAuthoritySlice = make([]model.Issue, 0, len(historicalIssues)+len(histReport.TombstoneIDs))
@@ -5145,7 +5233,7 @@ func main() {
 			}, recipeForScope)
 			if scopeErr != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", scopeErr)
-				os.Exit(1)
+				exitCLI(1)
 			}
 
 			// Create snapshots over full topology (preserving multi-hop cycles/readiness)
@@ -5207,7 +5295,7 @@ func main() {
 			tuiSearchCfg, searchCfgErr = resolveSearchConfig(*searchMode, *searchPreset, *searchWeights)
 			if searchCfgErr != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", searchCfgErr)
-				os.Exit(1)
+				exitCLI(1)
 			}
 		}
 
@@ -5222,11 +5310,31 @@ func main() {
 			m := ui.NewModel(issues, activeRecipe, "", ui.ReadinessScope{
 				Authority:           readiness,
 				CandidateIDs:        candidateIDs,
+				LabelFilter:         strings.TrimSpace(*labelScope),
+				RepoFilter:          strings.TrimSpace(*repoFilter),
 				AuthorityIncomplete: true,
 				ReferenceNow:        robotDispatchContext.ReferenceNow(),
 			})
 			if projectDir != "" {
 				m.SetWorkDir(projectDir)
+			}
+			if workspaceInfo != nil {
+				m.EnableWorkspaceMode(ui.WorkspaceInfo{
+					Enabled:      true,
+					RepoCount:    workspaceInfo.TotalRepos,
+					FailedCount:  workspaceInfo.FailedRepos,
+					TotalIssues:  workspaceInfo.TotalIssues,
+					RepoPrefixes: workspaceInfo.RepoPrefixes,
+					Repos:        uiWorkspaceReposFromAuthority(sourceAuthority),
+				})
+			}
+			rev := asOfResolved
+			if rev == "" {
+				rev = *asOf
+			}
+			m.SetAsOfRevision(rev)
+			if sprints, sprintErr := loadSprintsForContext(robotDispatchContext, projectDir); sprintErr == nil {
+				m.SetSprints(sprints)
 			}
 			if hasTUISearchOverrides {
 				m.SetSearchConfig(tuiSearchCfg)
@@ -5235,11 +5343,11 @@ func main() {
 			if *debugRender != "" {
 				output := m.RenderDebugView(*debugRender, *debugWidth, *debugHeight)
 				fmt.Println(output)
-				os.Exit(0)
+				exitCLI(0)
 			}
 			if err := runTUIProgram(m, nil); err != nil {
 				fmt.Printf("Error running beads viewer: %v\n", err)
-				os.Exit(1)
+				exitCLI(1)
 			}
 			return nil
 		}
@@ -5259,6 +5367,9 @@ func main() {
 			}
 			if flag.CommandLine.Changed("export-include-graph") {
 				overrides.IncludeGraph = exportIncludeGraph
+			}
+			if flag.CommandLine.Changed("export-include-actions") {
+				overrides.IncludeActions = exportIncludeActions
 			}
 			if flag.CommandLine.Changed("export-template") {
 				overrides.Template = exportTemplate
@@ -5388,7 +5499,7 @@ func main() {
 
 		if len(issues) == 0 {
 			fmt.Println("No issues found. Create some with 'br create'!")
-			os.Exit(0)
+			exitCLI(0)
 		}
 
 		// Keep the scoped source rows available to the recipe picker. NewModel
@@ -5399,7 +5510,7 @@ func main() {
 		// - env var overrides user config file
 		if *backgroundMode && *noBackgroundMode {
 			fmt.Fprintln(os.Stderr, "Error: --background-mode and --no-background-mode are mutually exclusive")
-			os.Exit(2)
+			exitCLI(2)
 		}
 		if *backgroundMode {
 			_ = os.Setenv("BV_BACKGROUND_MODE", "1")
@@ -5427,7 +5538,7 @@ func main() {
 		explicitDBPinned := *dbPath != "" || strings.TrimSpace(env.BeadsDB.Get()) != ""
 
 		var liveTUIReferenceNow time.Time
-		if sourceDateEpochActive() {
+		if sourceDateEpochActive() || *asOf != "" {
 			liveTUIReferenceNow = robotDispatchContext.ReferenceNow()
 		}
 
@@ -5435,6 +5546,8 @@ func main() {
 		m := ui.NewModel(issues, activeRecipe, beadsPath, ui.ReadinessScope{
 			Authority:           readiness,
 			CandidateIDs:        candidateIDs,
+			LabelFilter:         strings.TrimSpace(*labelScope),
+			RepoFilter:          strings.TrimSpace(*repoFilter),
 			AuthorityIncomplete: !robotDispatchContext.claimsProven() || *asOf != "",
 			SourceDegraded:      boundSourceDegraded,
 			ExplicitDB:          explicitDBPinned,
@@ -5442,6 +5555,13 @@ func main() {
 		})
 		if projectDir != "" {
 			m.SetWorkDir(projectDir)
+		}
+		if *asOf != "" {
+			rev := asOfResolved
+			if rev == "" {
+				rev = *asOf
+			}
+			m.SetAsOfRevision(rev)
 		}
 		if hasTUISearchOverrides {
 			m.SetSearchConfig(tuiSearchCfg)
@@ -5460,7 +5580,11 @@ func main() {
 				FailedCount:  workspaceInfo.FailedRepos,
 				TotalIssues:  workspaceInfo.TotalIssues,
 				RepoPrefixes: workspaceInfo.RepoPrefixes,
+				Repos:        uiWorkspaceReposFromAuthority(sourceAuthority),
 			})
+			if sprints, sprintErr := loadSprintsForContext(robotDispatchContext, projectDir); sprintErr == nil {
+				m.SetSprints(sprints)
+			}
 			reloadPath, pathErr := filepath.Abs(*workspaceConfig)
 			reloadLabel, reloadRepo := *labelScope, *repoFilter
 			m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
@@ -5495,13 +5619,13 @@ func main() {
 		if *debugRender != "" {
 			output := m.RenderDebugView(*debugRender, *debugWidth, *debugHeight)
 			fmt.Println(output)
-			os.Exit(0)
+			exitCLI(0)
 		}
 
 		// Run Program
 		if err := runTUIProgram(m, externalReloadCh); err != nil {
 			fmt.Printf("Error running beads viewer: %v\n", err)
-			os.Exit(1)
+			exitCLI(1)
 		}
 
 		return nil
@@ -6042,18 +6166,83 @@ func reloadWorkspaceForUI(ctx context.Context, configPath, label, repo string) (
 		return ui.SourceReloadResult{}, err
 	}
 	summary := workspace.Summarize(results)
+	sprints, sprintErr := loadSprintsForContext(RobotContext{
+		Issues:          issues,
+		FullIssues:      issues,
+		Readiness:       readiness,
+		LabelScope:      label,
+		Repo:            repo,
+		SourceKind:      "workspace",
+		SourceAuthority: authority,
+	}, workspace.ResolveWorkspaceBaseDir(configPath))
 	return ui.SourceReloadResult{
-		Issues: scoped.Issues, Authority: readiness, CandidateIDs: scoped.CandidateIDs, Warnings: warnings,
+		Issues:              scoped.Issues,
+		Authority:           readiness,
+		CandidateIDs:        scoped.CandidateIDs,
+		LabelFilter:         strings.TrimSpace(label),
+		RepoFilter:          strings.TrimSpace(repo),
+		Warnings:            warnings,
+		Sprints:             sprints,
+		SprintsLoaded:       sprintErr == nil,
 		AuthorityIncomplete: !authority.ClaimSafe,
 		Workspace: &ui.WorkspaceInfo{
-			Enabled: true, RepoCount: summary.TotalRepos, FailedCount: summary.FailedRepos,
-			TotalIssues: summary.TotalIssues, RepoPrefixes: summary.RepoPrefixes,
+			Enabled:      true,
+			RepoCount:    summary.TotalRepos,
+			FailedCount:  summary.FailedRepos,
+			TotalIssues:  summary.TotalIssues,
+			RepoPrefixes: summary.RepoPrefixes,
+			Repos:        uiWorkspaceReposFromAuthority(authority),
 		},
 	}, nil
 }
 
-func newSnapshotForCLI(issues []model.Issue, timestamp time.Time, revision string, forceFullAnalysis bool) *analysis.Snapshot {
-	return newScopedSnapshotForCLI(issues, nil, nil, timestamp, revision, forceFullAnalysis)
+func uiWorkspaceReposFromAuthority(authority *RobotSourceAuthority) []ui.WorkspaceRepoTarget {
+	if authority == nil || len(authority.Sources) == 0 {
+		return nil
+	}
+	repos := make([]ui.WorkspaceRepoTarget, 0, len(authority.Sources))
+	for _, src := range authority.Sources {
+		if src.Status == "disabled" {
+			continue
+		}
+		repoPath := strings.TrimSpace(src.RepoRoot)
+		beadsDir := resolveSourceBeadsDir(src)
+		if repoPath == "" && beadsDir != "" {
+			repoPath = filepath.Dir(beadsDir)
+		}
+		if repoPath == "" {
+			repoPath = strings.TrimSpace(src.RepoPath)
+		}
+		repos = append(repos, ui.WorkspaceRepoTarget{
+			Name:     src.Name,
+			Path:     repoPath,
+			BeadsDir: beadsDir,
+			Prefix:   src.RepoPrefix,
+		})
+	}
+	return repos
+}
+
+func summarizeWorkspaceSources(sources []RobotSourceReport) *workspace.LoadSummary {
+	summary := &workspace.LoadSummary{
+		TotalRepos: len(sources),
+	}
+	for _, src := range sources {
+		switch src.Status {
+		case "disabled":
+			summary.DisabledRepos++
+		case "failed":
+			summary.FailedRepos++
+			summary.FailedRepoNames = append(summary.FailedRepoNames, src.Name)
+		default:
+			summary.SuccessfulRepos++
+			summary.TotalIssues += src.Visible
+			if src.RepoPrefix != "" {
+				summary.RepoPrefixes = append(summary.RepoPrefixes, src.RepoPrefix)
+			}
+		}
+	}
+	return summary
 }
 
 func newScopedSnapshotForCLI(issues []model.Issue, readiness *model.ReadinessIndex, candidateIDs map[string]bool, timestamp time.Time, revision string, forceFullAnalysis bool) *analysis.Snapshot {
@@ -6095,15 +6284,22 @@ func newScopedSnapshotForCLI(issues []model.Issue, readiness *model.ReadinessInd
 	return snap
 }
 
-func loadWorkspaceHistoricalAsOf(configPath, ref, repoFilter string) ([]model.Issue, []model.Issue, []RobotSourceReport, []string, string, time.Time, error) {
+func loadWorkspaceHistoricalAsOf(configPath, ref, repoFilter string) ([]model.Issue, []model.Issue, []RobotSourceReport, []string, *workspace.LoadSummary, string, time.Time, error) {
 	wsCfg, err := workspace.LoadConfig(configPath)
 	if err != nil {
-		return nil, nil, nil, nil, "", time.Time{}, fmt.Errorf("loading workspace config: %w", err)
+		return nil, nil, nil, nil, nil, "", time.Time{}, fmt.Errorf("loading workspace config: %w", err)
 	}
 	baseDir := workspace.ResolveWorkspaceBaseDir(configPath)
-	knownPrefixes := make(map[string]bool, len(wsCfg.Repos))
+	agg := workspace.NewAggregateLoader(wsCfg, baseDir)
+	agg.SetLogger(nil)
+	repos, err := agg.ResolvedRepos()
+	if err != nil {
+		return nil, nil, nil, nil, nil, "", time.Time{}, fmt.Errorf("resolving workspace repositories: %w", err)
+	}
+	knownPrefixes := make(map[string]bool, len(repos))
 	var seedSources []RobotSourceReport
-	for _, repo := range wsCfg.Repos {
+	enabledCount := 0
+	for _, repo := range repos {
 		prefix := repo.GetPrefix()
 		if !repo.IsEnabled() {
 			seedSources = append(seedSources, RobotSourceReport{
@@ -6114,6 +6310,7 @@ func loadWorkspaceHistoricalAsOf(configPath, ref, repoFilter string) ([]model.Is
 			})
 			continue
 		}
+		enabledCount++
 		if prefix != "" {
 			knownPrefixes[prefix] = true
 		}
@@ -6122,11 +6319,15 @@ func loadWorkspaceHistoricalAsOf(configPath, ref, repoFilter string) ([]model.Is
 			repoRoot = filepath.Join(baseDir, repoRoot)
 		}
 		repoRoot = filepath.Clean(repoRoot)
-		beadsDir := repo.GetBeadsPath()
-		if !filepath.IsAbs(beadsDir) {
-			beadsDir = filepath.Join(repoRoot, beadsDir)
+		beadsTarget := repo.GetBeadsPath()
+		if !filepath.IsAbs(beadsTarget) {
+			beadsTarget = filepath.Join(repoRoot, beadsTarget)
 		}
-		beadsDir = filepath.Clean(beadsDir)
+		beadsTarget = filepath.Clean(beadsTarget)
+		beadsDir, _ := loader.ResolveBeadsDir(beadsTarget)
+		if beadsDir == "" {
+			beadsDir = beadsTarget
+		}
 		sourceRepo := strings.ToLower(strings.TrimRight(strings.TrimSpace(prefix), "-:_"))
 		if sourceRepo == "" {
 			sourceRepo = strings.ToLower(strings.TrimSpace(repo.GetName()))
@@ -6142,9 +6343,12 @@ func loadWorkspaceHistoricalAsOf(configPath, ref, repoFilter string) ([]model.Is
 			Status:     "loaded",
 		})
 	}
+	if enabledCount == 0 {
+		return nil, nil, seedSources, nil, summarizeWorkspaceSources(seedSources), "", time.Time{}, fmt.Errorf("no enabled repositories in workspace")
+	}
 	seedAuth := newRobotSourceAuthority(seedSources)
 	allIssues, authIssues, resolvedSources, tombstones, firstRev, latestTime, histErr := loadWorkspaceHistoricalFromAuthority(seedAuth, knownPrefixes, ref, repoFilter)
-	return allIssues, authIssues, resolvedSources, tombstones, firstRev, latestTime, histErr
+	return allIssues, authIssues, resolvedSources, tombstones, summarizeWorkspaceSources(resolvedSources), firstRev, latestTime, histErr
 }
 
 func loadWorkspaceHistoricalDiffSource(ctx RobotContext, ref string) ([]model.Issue, []model.Issue, string, time.Time, error) {
@@ -6165,23 +6369,24 @@ func loadWorkspaceHistoricalFromAuthority(authority *RobotSourceAuthority, known
 	if authority == nil || len(authority.Sources) == 0 {
 		return nil, nil, nil, nil, "", time.Time{}, fmt.Errorf("no workspace sources available")
 	}
+	hasRepoFilter := strings.TrimSpace(repoFilter) != ""
 	var (
-		allIssues       []model.Issue
-		authIssues      []model.Issue
-		resolvedSources []RobotSourceReport
-		tombstoneIDs    []string
-		firstRev        string
-		latestTime      time.Time
-		loadedRepos     int
+		allIssues          []model.Issue
+		authIssues         []model.Issue
+		resolvedSources    []RobotSourceReport
+		tombstoneIDs       []string
+		firstRev           string
+		latestTime         time.Time
+		loadedRepos        int
+		matchedLoadedRepos int
 	)
+	issueSource := make(map[string]string)
 	for _, src := range authority.Sources {
-		if src.Status != "loaded" {
+		if src.Status == "disabled" {
 			resolvedSources = append(resolvedSources, src)
 			continue
 		}
-		if strings.TrimSpace(repoFilter) != "" && !sourceMatchesRepoFilter(src, repoFilter) {
-			continue
-		}
+		matchesFilter := !hasRepoFilter || sourceMatchesRepoFilter(src, repoFilter)
 		beadsDir := resolveSourceBeadsDir(src)
 		repoPath := strings.TrimSpace(src.RepoRoot)
 		if repoPath == "" && beadsDir != "" {
@@ -6200,9 +6405,16 @@ func loadWorkspaceHistoricalFromAuthority(authority *RobotSourceAuthority, known
 		histSrc := src
 		histSrc.SourceKind = "git"
 		if hist.SourcePath != "" {
-			histSrc.SourcePath = hist.SourcePath
+			if filepath.IsAbs(hist.SourcePath) {
+				histSrc.SourcePath = filepath.Clean(hist.SourcePath)
+			} else if beadsDir != "" {
+				histSrc.SourcePath = filepath.Join(beadsDir, filepath.Base(hist.SourcePath))
+			} else {
+				histSrc.SourcePath = filepath.Join(repoPath, filepath.FromSlash(hist.SourcePath))
+			}
 		}
 		if hist.CommitSHA != "" {
+			histSrc.AsOfCommit = hist.CommitSHA
 			histSrc.SourcePath += "@" + hist.CommitSHA
 		}
 		if err != nil {
@@ -6213,9 +6425,13 @@ func loadWorkspaceHistoricalFromAuthority(authority *RobotSourceAuthority, known
 			histSrc.Status = "failed"
 			histSrc.Error = err.Error()
 			resolvedSources = append(resolvedSources, histSrc)
-			return nil, nil, resolvedSources, nil, "", time.Time{}, fmt.Errorf("resolving %s in workspace repo %s: %w", ref, repoName, err)
+			if matchesFilter {
+				return nil, nil, resolvedSources, nil, "", time.Time{}, fmt.Errorf("resolving %s in workspace repo %s: %w", ref, repoName, err)
+			}
+			continue
 		}
 		histSrc.Status = "loaded"
+		histSrc.Error = ""
 		histSrc.DataHash = sourceIssuesHash(hist.Issues, hist.TombstoneIDs)
 		histSrc.Valid = hist.ParseStats.Valid
 		histSrc.Errors = hist.ParseStats.Errors
@@ -6226,11 +6442,18 @@ func loadWorkspaceHistoricalFromAuthority(authority *RobotSourceAuthority, known
 		histSrc.WarningCount = hist.ParseStats.Errors
 		resolvedSources = append(resolvedSources, histSrc)
 		loadedRepos++
-		if firstRev == "" && hist.CommitSHA != "" {
-			firstRev = hist.CommitSHA
+		if matchesFilter {
+			matchedLoadedRepos++
+			if firstRev == "" && hist.CommitSHA != "" {
+				firstRev = hist.CommitSHA
+			}
+			if hist.CommitTime.After(latestTime) {
+				latestTime = hist.CommitTime
+			}
 		}
-		if hist.CommitTime.After(latestTime) {
-			latestTime = hist.CommitTime
+		repoIdentity := src.Name
+		if repoIdentity == "" {
+			repoIdentity = repoPath
 		}
 		prefix := src.RepoPrefix
 		localRawIDs := make(map[string]bool, len(hist.Issues)+len(hist.TombstoneIDs))
@@ -6255,6 +6478,10 @@ func loadWorkspaceHistoricalFromAuthority(authority *RobotSourceAuthority, known
 					}
 				}
 			}
+			if prev, dup := issueSource[cloned.ID]; dup && prev != repoIdentity {
+				return nil, nil, resolvedSources, nil, "", time.Time{}, fmt.Errorf("workspace namespacing produced duplicate issue ID %q (%s and %s)", cloned.ID, prev, repoIdentity)
+			}
+			issueSource[cloned.ID] = repoIdentity
 			if src.SourceRepo != "" {
 				cloned.SourceRepo = src.SourceRepo
 			}
@@ -6272,12 +6499,24 @@ func loadWorkspaceHistoricalFromAuthority(authority *RobotSourceAuthority, known
 			if prefix != "" {
 				qid = workspace.QualifyID(tid, prefix)
 			}
+			if prev, dup := issueSource[qid]; dup && prev != repoIdentity {
+				return nil, nil, resolvedSources, nil, "", time.Time{}, fmt.Errorf("workspace namespacing produced duplicate tombstone ID %q (%s and %s)", qid, prev, repoIdentity)
+			}
+			issueSource[qid] = repoIdentity
 			tombstoneIDs = append(tombstoneIDs, qid)
 			authIssues = append(authIssues, model.Issue{ID: qid, Status: model.StatusTombstone, SourceRepo: src.SourceRepo})
 		}
 	}
-	if loadedRepos == 0 {
+	if loadedRepos == 0 || (hasRepoFilter && matchedLoadedRepos == 0) {
 		return nil, nil, resolvedSources, nil, "", time.Time{}, fmt.Errorf("no workspace repositories resolved %s", ref)
+	}
+	if firstRev == "" {
+		for _, src := range resolvedSources {
+			if src.AsOfCommit != "" {
+				firstRev = src.AsOfCommit
+				break
+			}
+		}
 	}
 	if firstRev == "" {
 		firstRev = ref
@@ -6313,6 +6552,9 @@ func tuiWorkspaceWatchPaths(ctx RobotContext, workspaceConfigPath string) []stri
 			paths = append(paths, source.WatchPaths...)
 			if source.Status == "loaded" && source.SourcePath != "" {
 				paths = append(paths, source.SourcePath)
+			}
+			if beadsDir := resolveSourceBeadsDir(source); beadsDir != "" {
+				paths = append(paths, filepath.Join(beadsDir, loader.SprintsFileName))
 			}
 		}
 	}
@@ -6459,6 +6701,8 @@ func buildSingleRepoReloadResult(ctx context.Context, loaded datasource.LoadResu
 		Issues:              scoped.Issues,
 		Authority:           readiness,
 		CandidateIDs:        scoped.CandidateIDs,
+		LabelFilter:         strings.TrimSpace(label),
+		RepoFilter:          strings.TrimSpace(repo),
 		Warnings:            warnings,
 		AuthorityIncomplete: !claimSafe,
 		SourcePath:          loaded.Source.Path,
@@ -6521,7 +6765,7 @@ func recipeMetricsForContext(ctx RobotContext, issues []model.Issue, r *recipe.R
 }
 
 // runProfileStartup runs profiled startup analysis and outputs results
-func runProfileStartup(issues []model.Issue, loadDuration time.Duration, jsonOutput bool, forceFullAnalysis bool) {
+func runProfileStartup(issues []model.Issue, loadDuration time.Duration, jsonOutput bool, forceFullAnalysis bool) error {
 	// Get actual beads path (respects BEADS_DIR)
 	beadsDir, _ := loader.GetBeadsDir("")
 	dataPath, _ := loader.FindJSONLPath(beadsDir)
@@ -6577,13 +6821,13 @@ func runProfileStartup(issues []model.Issue, loadDuration time.Duration, jsonOut
 
 		encoder := newRobotEncoder(os.Stdout)
 		if err := encoder.Encode(output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error encoding profile: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 	} else {
 		// Human-readable output
 		printProfileReport(profile, loadDuration, totalWithLoad)
 	}
+	return nil
 }
 
 // printProfileReport outputs a human-readable startup profile
@@ -6866,12 +7110,6 @@ func buildAttentionReason(score analysis.LabelAttentionScore) string {
 // Static Pages Export Helpers (bv-73f)
 // ============================================================================
 
-// copyViewerAssets copies the viewer HTML/JS/CSS assets to the output directory.
-// If title is provided, it replaces the default title in index.html.
-func copyViewerAssets(bundle *export.Bundle, title string) error {
-	return copyViewerAssetsWithSubtitle(bundle, title, "")
-}
-
 // copyViewerAssetsWithSubtitle copies viewer HTML/JS/CSS assets and applies
 // optional title and subtitle customization to index.html.
 func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string) error {
@@ -7105,12 +7343,6 @@ func copyFile(src string, bundle *export.Bundle, name string) error {
 	defer srcFile.Close()
 
 	return bundle.CopyFile(name, srcFile, 0666)
-}
-
-// copyFileWithTitleAndCacheBusting copies a file while replacing the default title
-// and adding cache-busting query parameters to script tags.
-func copyFileWithTitleAndCacheBusting(src string, bundle *export.Bundle, name, title string) error {
-	return copyFileWithTitleSubtitleAndCacheBusting(src, bundle, name, title, "")
 }
 
 func copyFileWithTitleSubtitleAndCacheBusting(src string, bundle *export.Bundle, name, title, subtitle string) error {
@@ -8891,9 +9123,13 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		commitLimit = ctx.HistoryLimit
 	}
 
+	type repoRootOrderTarget struct {
+		root string
+		rev  string
+	}
 	var (
 		report    *correlation.HistoryReport
-		repoRoots []string
+		repoRoots []repoRootOrderTarget
 		err       error
 	)
 	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
@@ -8913,7 +9149,11 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 			cleanRoot := filepath.Clean(ws.repoRoot)
 			if cleanRoot != "" && !seenRoots[cleanRoot] {
 				seenRoots[cleanRoot] = true
-				repoRoots = append(repoRoots, cleanRoot)
+				rev := workspaceSourceRevision(ctx, ws.source, ctx.AsOfCommit)
+				if rev == "" {
+					rev = "HEAD"
+				}
+				repoRoots = append(repoRoots, repoRootOrderTarget{root: cleanRoot, rev: rev})
 			}
 		}
 		if len(repoRoots) == 0 {
@@ -8931,8 +9171,15 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		if err := correlation.ValidateRepositoryWithBeadsDir(repoDir, exportBeadsDir); err != nil {
 			return nil, err
 		}
-		beadsDir, beadsPath, err := resolveCorrelationBeadsPath(repoDir)
-		if err != nil {
+		beadsDir, fallbackBeadsPath, err := resolveCorrelationBeadsPath(repoDir)
+		if err != nil && ctx.AsOf == "" {
+			return nil, err
+		}
+		beadsPath, ctxPathErr := resolveCorrelationBeadsPathForContext(ctx, repoDir)
+		if ctxPathErr != nil || beadsPath == "" {
+			beadsPath = fallbackBeadsPath
+		}
+		if beadsPath == "" && err != nil {
 			return nil, err
 		}
 		beadInfos := make([]correlation.BeadInfo, len(issues))
@@ -8943,11 +9190,14 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 				Status: string(issue.Status),
 			}
 		}
-		feedbackStore := correlation.NewFeedbackStore(beadsDir)
-		if err := feedbackStore.Load(); err != nil {
-			return nil, fmt.Errorf("loading correlation feedback: %w", err)
+		correlator := correlation.NewCorrelator(repoDir, beadsPath)
+		if ctx.AsOf == "" && beadsDir != "" {
+			feedbackStore := correlation.NewFeedbackStore(beadsDir)
+			if err := feedbackStore.Load(); err != nil {
+				return nil, fmt.Errorf("loading correlation feedback: %w", err)
+			}
+			correlator = correlator.WithFeedbackStore(feedbackStore)
 		}
-		correlator := correlation.NewCorrelator(repoDir, beadsPath).WithFeedbackStore(feedbackStore)
 		report, err = correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{
 			Limit:    commitLimit,
 			Revision: ctx.AsOfCommit,
@@ -8955,7 +9205,11 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		if err != nil {
 			return nil, err
 		}
-		repoRoots = []string{repoDir}
+		rev := "HEAD"
+		if ctx.AsOfCommit != "" {
+			rev = ctx.AsOfCommit
+		}
+		repoRoots = []repoRootOrderTarget{{root: repoDir, rev: rev}}
 	}
 
 	// Timeline visibility follows observed issue records, not inferred code
@@ -9014,13 +9268,9 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		rank      int
 	}
 	order := make(map[string]commitRank)
-	revTarget := "HEAD"
-	if ctx.AsOfCommit != "" {
-		revTarget = ctx.AsOfCommit
-	}
-	for repoIdx, root := range repoRoots {
-		orderCmd := exec.Command("git", "--no-replace-objects", "log", "--format=%H", "--topo-order", revTarget)
-		orderCmd.Dir = root
+	for repoIdx, target := range repoRoots {
+		orderCmd := exec.Command("git", "--no-replace-objects", "log", "--format=%H", "--topo-order", target.rev)
+		orderCmd.Dir = target.root
 		orderCmd.Env = sanitizedGitEnvForCLI()
 		orderOutput, err := orderCmd.Output()
 		if err != nil {
@@ -9075,7 +9325,7 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 
 	sprintWorkDir := ctx.ProjectDir
 	if sprintWorkDir == "" && len(repoRoots) > 0 {
-		sprintWorkDir = repoRoots[0]
+		sprintWorkDir = repoRoots[0].root
 	}
 	sprints, sErr := loadSprintsForContext(ctx, sprintWorkDir)
 	if sErr != nil && len(repoRoots) <= 1 {
@@ -9144,6 +9394,7 @@ type RobotSourceReport struct {
 	RepoRoot     string   `json:"-"`
 	RepoPrefix   string   `json:"-"`
 	SourceRepo   string   `json:"-"`
+	AsOfCommit   string   `json:"-"`
 }
 
 // RobotSourceAuthority keeps exploratory output useful while distinguishing
@@ -10370,8 +10621,8 @@ func generateRobotSchemas() RobotSchemas {
 				"usage_hints": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			},
 			"oneOf": []map[string]interface{}{
-				{"required": []string{"generated_at", "data_hash", "triage"}},
-				{"required": []string{"generated_at", "data_hash", "brief", "quick_ref", "recommendations"}},
+				{"required": []string{"generated_at", "data_hash", "output_format", "version", "triage"}},
+				{"required": []string{"generated_at", "data_hash", "output_format", "version", "brief", "quick_ref", "recommendations"}},
 			},
 			"$defs": map[string]interface{}{
 				"top_pick": map[string]interface{}{
@@ -10448,7 +10699,7 @@ func generateRobotSchemas() RobotSchemas {
 				"diagnostic_top_pick": map[string]interface{}{"type": "object"},
 				"degraded":            map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
 			},
-			"required": []string{"generated_at", "data_hash", "actionable", "phase2_ready", "status"},
+			"required": []string{"generated_at", "data_hash", "output_format", "version", "actionable", "phase2_ready", "status"},
 			"if":       map[string]interface{}{"properties": map[string]interface{}{"actionable": map[string]interface{}{"const": true}}},
 			"then": map[string]interface{}{
 				"required": []string{"id", "title", "score", "claim_command", "show_command", "actions"},
@@ -10687,7 +10938,7 @@ func generateRobotSchemas() RobotSchemas {
 					},
 				},
 			},
-			"required": []string{"generated_at", "resolved_revision", "from_data_hash", "to_data_hash", "diff"},
+			"required": []string{"generated_at", "data_hash", "output_format", "version", "resolved_revision", "from_data_hash", "to_data_hash", "diff"},
 		},
 		"robot-alerts": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",

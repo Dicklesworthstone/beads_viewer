@@ -623,6 +623,9 @@ func (ca *CachedAnalyzer) AnalyzeAsync(ctx context.Context) *GraphStats {
 
 	// Check cache first
 	if stats, ok := ca.cache.GetByHash(fullHash); ok {
+		if _, hasClosed, _ := ca.Analyzer.ensureActiveSet(); hasClosed {
+			ca.Analyzer.activeSubgraphMetrics(stats)
+		}
 		ca.cacheHit = true
 		metrics.GraphCache.Hit()
 		return stats
@@ -648,6 +651,9 @@ func (ca *CachedAnalyzer) AnalyzeAsync(ctx context.Context) *GraphStats {
 func (ca *CachedAnalyzer) Analyze() GraphStats {
 	stats := ca.AnalyzeAsync(context.Background())
 	stats.WaitForPhase2()
+	if _, hasClosed, _ := ca.Analyzer.ensureActiveSet(); hasClosed {
+		ca.Analyzer.activeSubgraphMetrics(stats)
+	}
 	// AnalyzeAsync publishes to the cache from a goroutine once Phase 2 is
 	// done; a synchronous caller must not race it, so a fresh computation is
 	// stored here before returning (SetByHash is idempotent and still refuses
@@ -656,35 +662,7 @@ func (ca *CachedAnalyzer) Analyze() GraphStats {
 	if !ca.cacheHit && !ca.cacheDisabled() {
 		ca.cache.SetByHash(ca.cacheKey(), stats)
 	}
-	return GraphStats{
-		OutDegree:         stats.OutDegree,
-		InDegree:          stats.InDegree,
-		TopologicalOrder:  stats.TopologicalOrder,
-		Density:           stats.Density,
-		NodeCount:         stats.NodeCount,
-		EdgeCount:         stats.EdgeCount,
-		Config:            stats.Config,
-		pageRank:          stats.pageRank,
-		betweenness:       stats.betweenness,
-		eigenvector:       stats.eigenvector,
-		hubs:              stats.hubs,
-		authorities:       stats.authorities,
-		criticalPathScore: stats.criticalPathScore,
-		pageRankRank:      stats.pageRankRank,
-		betweennessRank:   stats.betweennessRank,
-		eigenvectorRank:   stats.eigenvectorRank,
-		hubsRank:          stats.hubsRank,
-		authoritiesRank:   stats.authoritiesRank,
-		criticalPathRank:  stats.criticalPathRank,
-		inDegreeRank:      stats.inDegreeRank,
-		outDegreeRank:     stats.outDegreeRank,
-		coreNumber:        stats.coreNumber,
-		articulation:      stats.articulation,
-		slack:             stats.slack,
-		cycles:            stats.cycles,
-		phase2Ready:       true,
-		status:            stats.status,
-	}
+	return stats.snapshotValue()
 }
 
 // DataHash returns the computed hash for the analyzer's issue data.

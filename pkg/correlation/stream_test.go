@@ -1,12 +1,16 @@
 package correlation
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 func TestDefaultHistoryLimit(t *testing.T) {
@@ -123,6 +127,88 @@ func TestStreamExtractor_BuildStreamCommandDisablesColor(t *testing.T) {
 	}
 	if args[0] != "git" || args[1] != "-c" || args[2] != "color.ui=false" || args[3] != "log" {
 		t.Fatalf("git command should disable color before log, got %#v", args)
+	}
+}
+
+func TestGitCommand_WaitDelaySanitizedEnvAndNoReplaceObjects(t *testing.T) {
+	t.Setenv("GIT_DIR", "/nonexistent/poison/.git")
+	t.Setenv("GIT_WORK_TREE", "/nonexistent/poison")
+	t.Setenv("GIT_NO_REPLACE_OBJECTS", "0")
+
+	cmd := gitCommand(context.Background(), "log", "-n", "1")
+	if cmd.WaitDelay != time.Second {
+		t.Fatalf("gitCommand WaitDelay = %v, want %v", cmd.WaitDelay, time.Second)
+	}
+	if len(cmd.Args) < 2 || cmd.Args[0] != "git" || cmd.Args[1] != "log" {
+		t.Fatalf("gitCommand must keep subcommand as $1 for git shims, got %#v", cmd.Args)
+	}
+	hasNoReplace := false
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "GIT_DIR=") || strings.HasPrefix(kv, "GIT_WORK_TREE=") {
+			t.Fatalf("gitCommand leaked poisoned git env %q", kv)
+		}
+		if kv == "GIT_NO_REPLACE_OBJECTS=0" {
+			t.Fatalf("gitCommand leaked caller GIT_NO_REPLACE_OBJECTS=0")
+		}
+		if kv == "GIT_NO_REPLACE_OBJECTS=1" {
+			hasNoReplace = true
+		}
+	}
+	if !hasNoReplace {
+		t.Fatal("gitCommand missing GIT_NO_REPLACE_OBJECTS=1 in Env")
+	}
+
+	// End-to-end proof against a real git replace spoofed commit object.
+	repoDir := t.TempDir()
+	runRawGit := func(args ...string) string {
+		t.Helper()
+		c := exec.Command("git", args...)
+		c.Dir = repoDir
+		c.Env = append(loader.SanitizedGitEnv(),
+			"GIT_AUTHOR_NAME=Alice",
+			"GIT_AUTHOR_EMAIL=alice@example.com",
+			"GIT_COMMITTER_NAME=Alice",
+			"GIT_COMMITTER_EMAIL=alice@example.com",
+		)
+		out, err := c.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runRawGit("init")
+	if err := os.WriteFile(filepath.Join(repoDir, "file.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runRawGit("add", "file.txt")
+	runRawGit("commit", "-m", "authentic subject")
+	realSHA := runRawGit("rev-parse", "HEAD")
+
+	runRawGit("checkout", "--orphan", "spoof-branch")
+	if err := os.WriteFile(filepath.Join(repoDir, "file.txt"), []byte("spoof\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runRawGit("add", "file.txt")
+	runRawGit("commit", "-m", "spoofed replacement subject")
+	spoofSHA := runRawGit("rev-parse", "HEAD")
+	runRawGit("checkout", "-f", realSHA)
+	runRawGit("replace", realSHA, spoofSHA)
+
+	// Negative control: raw git without GIT_NO_REPLACE_OBJECTS=1 returns the spoofed subject.
+	spoofedOut := runRawGit("log", "-1", "--format=%s", realSHA)
+	if spoofedOut != "spoofed replacement subject" {
+		t.Fatalf("negative control failed: expected git replace to return spoofed subject, got %q", spoofedOut)
+	}
+
+	// Positive observable: gitCommand returns the authentic subject despite refs/replace/*.
+	safeCmd := gitCommand(context.Background(), "log", "-1", "--format=%s", realSHA)
+	safeCmd.Dir = repoDir
+	safeOutBytes, err := safeCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("safe gitCommand failed: %v\n%s", err, safeOutBytes)
+	}
+	if got := strings.TrimSpace(string(safeOutBytes)); got != "authentic subject" {
+		t.Fatalf("gitCommand subject = %q, want %q", got, "authentic subject")
 	}
 }
 

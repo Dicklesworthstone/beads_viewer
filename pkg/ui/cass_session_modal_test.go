@@ -58,6 +58,7 @@ func TestModel_CassInstalledSessionLookup(t *testing.T) {
 		t.Fatalf("live prerequisite must return known sessions: parse=%v hits=%d", err, len(direct.Hits))
 	}
 	m := NewModel([]model.Issue{{ID: id, Title: "Live session lookup", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+	t.Cleanup(func() { m.Stop() })
 	m.workDir = workspace
 	m.width, m.height = 120, 40
 	health := CheckCassHealthCmd()().(CassHealthMsg)
@@ -1107,6 +1108,7 @@ func TestModel_CassLookupReturnsToOriginatingView(t *testing.T) {
 			t.Setenv("PATH", writeStubCass(t))
 			t.Setenv("CASS_STUB_SEARCH", `{"hits":[{"source_path":"/session","agent":"codex","content":"preview"}],"total_matches":1}`)
 			m := NewModel([]model.Issue{{ID: "A", Title: "First", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+			t.Cleanup(m.Stop)
 			m.width, m.height = 120, 40
 			if origin == focusTree {
 				m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("E")})
@@ -1172,6 +1174,7 @@ func TestModel_CassLookupUsesSearchOutcome(t *testing.T) {
 			t.Setenv("CASS_STUB_SEARCH", tc.output)
 			t.Setenv("CASS_STUB_SEARCH_EXIT", tc.exit)
 			m := NewModel([]model.Issue{{ID: "bv-preview", Title: "OAuth preview", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+			t.Cleanup(m.Stop)
 			m.width, m.height = 120, 40
 			updated, lookup := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
 			got := completeCassLookup(t, asModelPtr(t, updated), lookup)
@@ -1194,6 +1197,7 @@ func TestModel_CassLookupTimeoutIsReportedAndConfigurable(t *testing.T) {
 	t.Setenv("CASS_STUB_SEARCH_SLEEP", "5")
 	t.Setenv("BV_CASS_SEARCH_TIMEOUT_MS", "300")
 	m := NewModel([]model.Issue{{ID: "bv-slow", Title: "OAuth preview", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+	t.Cleanup(m.Stop)
 	m.width, m.height = 120, 40
 
 	start := time.Now()
@@ -1238,6 +1242,7 @@ func TestModel_CassDetectionOnStartup(t *testing.T) {
 		t.Setenv("CASS_STUB_EXIT", stubExit)
 		t.Setenv("BV_TEST_MODE", "")
 		m := NewModel(issues, nil, "")
+		t.Cleanup(m.Stop)
 		m.width, m.height = 120, 40
 		msg := CheckCassHealthCmd()()
 		health, ok := msg.(CassHealthMsg)
@@ -1270,6 +1275,7 @@ func TestModel_InitSkipsCassProbeInTestMode(t *testing.T) {
 	t.Setenv("BV_NO_UPDATE_CHECK", "1")
 	issues := []model.Issue{{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
 	m.analysis = nil
 	n := 0
 	if cmd := m.Init(); cmd != nil {
@@ -1281,6 +1287,7 @@ func TestModel_InitSkipsCassProbeInTestMode(t *testing.T) {
 	}
 	t.Setenv("BV_TEST_MODE", "")
 	m2 := NewModel(issues, nil, "")
+	t.Cleanup(m2.Stop)
 	m2.analysis = nil
 	n2 := 0
 	if cmd := m2.Init(); cmd != nil {
@@ -1306,6 +1313,7 @@ func TestModel_VUsesFocusedSelection(t *testing.T) {
 		{ID: "C", Title: "Issue C", Status: model.StatusInProgress, Priority: 2, IssueType: model.TypeTask},
 	}
 	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
 	m.width, m.height = 120, 40
 
 	// List: the list item.
@@ -1474,5 +1482,148 @@ func TestOSC52SequenceWrapping(t *testing.T) {
 				t.Fatalf("sequence:\n got %q\nwant %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCassSessionModalOptionsWorkspaceResolutionAndCachedSessionCount(t *testing.T) {
+	theme := testTheme()
+	refNow := time.Date(2026, 4, 20, 15, 0, 0, 0, time.UTC)
+	sessTime := refNow.Add(-3 * time.Hour)
+
+	res := cass.CorrelationResult{
+		BeadID:   "api-bv-42",
+		Strategy: cass.StrategyIDMention,
+		TopSessions: []cass.ScoredResult{
+			{
+				SearchResult: cass.SearchResult{
+					SourcePath: "/sessions/s1.jsonl",
+					LineNumber: 12,
+					Agent:      "claude",
+					Title:      "Fix auth flow",
+					Snippet:    "Worked on bv-42",
+					Timestamp:  sessTime,
+				},
+				FinalScore: 0.95,
+			},
+			{SearchResult: cass.SearchResult{SourcePath: "/sessions/s2.jsonl", Agent: "codex", Snippet: "s2", Timestamp: sessTime}, FinalScore: 0.9},
+			{SearchResult: cass.SearchResult{SourcePath: "/sessions/s3.jsonl", Agent: "codex", Snippet: "s3", Timestamp: sessTime}, FinalScore: 0.8},
+			{SearchResult: cass.SearchResult{SourcePath: "/sessions/s4.jsonl", Agent: "codex", Snippet: "s4", Timestamp: sessTime}, FinalScore: 0.7},
+		},
+		TotalFound: 4,
+	}
+
+	// 1. NewCassSessionModalWithOptions uses LocalID + --workspace + ReferenceNow relative timestamps.
+	modal := NewCassSessionModalWithOptions("api-bv-42", res, theme, CassSessionModalOptions{
+		LocalID:      "bv-42",
+		Workspace:    "/srv/repos/api",
+		ReferenceNow: refNow,
+	})
+	const wantCmd = `cass search "bv-42" --workspace "/srv/repos/api"`
+	if modal.searchCmd != wantCmd {
+		t.Fatalf("modal.searchCmd = %q, want %q", modal.searchCmd, wantCmd)
+	}
+	rendered := modal.View()
+	if !strings.Contains(rendered, "3 hours ago") || !strings.Contains(rendered, `cass search "bv-42" --workspace`) || !strings.Contains(rendered, `"/srv/repos/api"`) {
+		t.Fatalf("expected ReferenceNow relative timestamp '3 hours ago' and workspace searchCmd in modal view:\n%s", rendered)
+	}
+	// Planted negative control: without LocalID/Workspace and with different ReferenceNow, command omits --workspace and uses beadID.
+	plainModal := NewCassSessionModal("api-bv-42", res, theme)
+	if plainModal.searchCmd != `cass search "api-bv-42"` {
+		t.Fatalf("plain NewCassSessionModal searchCmd = %q, want %q", plainModal.searchCmd, `cass search "api-bv-42"`)
+	}
+
+	// 2. showCassSessionModal passes workspace even when Origin == nil (via m.workDir and fallback to m.beadsPath),
+	// and resolves Origin.TrackerDirectory via WorkspaceFromBeadsPath when Origin.LocalID == "".
+	t.Setenv("PATH", writeStubCass(t))
+	t.Setenv("CASS_STUB_SEARCH", `{"hits":[{"source_path":"/session","agent":"codex","content":"preview"}],"total_matches":1}`)
+
+	wsDir := t.TempDir()
+	beadsPath := filepath.Join(wsDir, ".beads", "issues.jsonl")
+	trackerMemberDir := filepath.Join(t.TempDir(), "member-repo")
+	trackerBeadsDir := filepath.Join(trackerMemberDir, ".beads")
+
+	issues := []model.Issue{
+		{ID: "NIL-ORIGIN", Title: "Nil origin issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		{
+			ID: "TRACKER-ONLY", Title: "Tracker dir without LocalID", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			Origin: &model.IssueOrigin{TrackerDirectory: trackerBeadsDir},
+		},
+		{
+			ID: "STANDALONE-TMP", Title: "Standalone /tmp export without tracker metadata", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeTask,
+			Origin: &model.IssueOrigin{TrackerDirectory: "/tmp", ReadOnlyReason: "source has no readable tracker metadata"},
+		},
+	}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.SetWorkDir(wsDir)
+	m.width, m.height = 120, 40
+
+	m.selectVisibleListItemByID("NIL-ORIGIN")
+	updated, lookup := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	m = completeCassLookup(t, asModelPtr(t, updated), lookup)
+	if !m.showCassModal || m.cassModal.workspace != wsDir || !strings.Contains(m.cassModal.searchCmd, `--workspace "`+wsDir+`"`) {
+		t.Fatalf("expected Origin==nil lookup to pass m.workDir %q, got workspace=%q cmd=%q",
+			wsDir, m.cassModal.workspace, m.cassModal.searchCmd)
+	}
+	m.showCassModal = false
+	m.focused = focusList
+
+	// Also verify fallback to cass.WorkspaceFromBeadsPath(m.beadsPath) when m.workDir == "" and Origin == nil.
+	m.workDir = ""
+	m.beadsPath = beadsPath
+	updated, lookup = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	m = completeCassLookup(t, asModelPtr(t, updated), lookup)
+	if !m.showCassModal || m.cassModal.workspace != wsDir {
+		t.Fatalf("expected beadsPath fallback workspace %q when workDir is empty, got %q", wsDir, m.cassModal.workspace)
+	}
+	m.showCassModal = false
+	m.focused = focusList
+
+	// Also verify Origin.TrackerDirectory resolves parent workspace even when Origin.LocalID == "".
+	m.SetWorkDir(wsDir)
+	m.selectVisibleListItemByID("TRACKER-ONLY")
+	updated, lookup = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	m = completeCassLookup(t, asModelPtr(t, updated), lookup)
+	if !m.showCassModal || m.cassModal.workspace != trackerMemberDir {
+		t.Fatalf("expected TrackerDirectory workspace %q when LocalID is empty, got %q", trackerMemberDir, m.cassModal.workspace)
+	}
+	m.showCassModal = false
+	m.focused = focusList
+
+	// [R2-B1] Planted negative control: standalone JSONL Origin.TrackerDirectory="/tmp" (not .beads/_beads and Tracker=="")
+	// must NOT derive "/" and must fall back to m.workDir!
+	m.selectVisibleListItemByID("STANDALONE-TMP")
+	updated, lookup = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("V")})
+	m = completeCassLookup(t, asModelPtr(t, updated), lookup)
+	if !m.showCassModal || m.cassModal.workspace != wsDir {
+		t.Fatalf("[R2-B1] standalone TrackerDirectory=/tmp derived workspace=%q, want fallback m.workDir=%q", m.cassModal.workspace, wsDir)
+	}
+	if canDeriveWorkspaceFromTrackerOrigin(&model.IssueOrigin{TrackerDirectory: "/tmp"}) {
+		t.Fatal("[R2-B1] canDeriveWorkspaceFromTrackerOrigin(/tmp) returned true")
+	}
+	if !canDeriveWorkspaceFromTrackerOrigin(&model.IssueOrigin{TrackerDirectory: "/tmp/custom", Tracker: "br"}) {
+		t.Fatal("[R2-B1] canDeriveWorkspaceFromTrackerOrigin(with Tracker=br) returned false")
+	}
+
+	// 3. getCassSessionCount(): planted negative control when CorrelationHint{ResultCount: 5, Results: nil} has empty Results -> returns 0;
+	// positive control when Results is non-empty -> returns ResultCount.
+	cache := cass.NewCache()
+	cache.Set("NIL-ORIGIN", &cass.CorrelationHint{BeadID: "NIL-ORIGIN", ResultCount: 5, Results: nil})
+	cache.Set("TRACKER-ONLY", &cass.CorrelationHint{
+		BeadID:      "TRACKER-ONLY",
+		ResultCount: 3,
+		Results:     []cass.ScoredResult{{SearchResult: cass.SearchResult{SourcePath: "/s.jsonl", Agent: "codex"}}},
+	})
+	m.cassCorrelator = cass.NewCorrelator(cass.NewSearcher(m.cassDetector), cache, wsDir)
+	m.showCassModal = false
+	m.focused = focusList
+
+	m.selectVisibleListItemByID("NIL-ORIGIN")
+	if got := m.getCassSessionCount(); got != 0 {
+		t.Fatalf("getCassSessionCount() with ResultCount=5 and nil Results = %d, want 0", got)
+	}
+	m.selectVisibleListItemByID("TRACKER-ONLY")
+	if got := m.getCassSessionCount(); got != 3 {
+		t.Fatalf("getCassSessionCount() with populated Results = %d, want 3", got)
 	}
 }

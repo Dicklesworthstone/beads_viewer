@@ -73,3 +73,42 @@ func TestGenerateUltimateHTML_CustomStatusTypeFiltersAndKeyboardGuards(t *testin
 		}
 	}
 }
+
+func TestGenerateUltimateHTML_ClosedArticulationAndWithheldStatusGuards(t *testing.T) {
+	graphJSON := `{
+		"nodes": [
+			{"id": "open-cut", "title": "Active Cut", "status": "open", "priority": 1, "type": "task", "is_articulation": true, "is_actionable": true},
+			{"id": "closed-cut", "title": "Closed Cut", "status": "closed", "priority": 1, "type": "task", "is_articulation": true, "is_actionable": false},
+			{"id": "eph-open", "title": "Ephemeral Open", "status": "open", "priority": 1, "type": "task", "ephemeral": true},
+			{"id": "pin-open", "title": "Pinned Open", "status": "open", "priority": 1, "type": "task", "pinned": true},
+			{"id": "tpl-open", "title": "Template Open", "status": "open", "priority": 1, "type": "task", "is_template": true}
+		],
+		"links": []
+	}`
+	out := generateUltimateHTML("Articulation & Withheld Guards", "h2", graphJSON, 5, 0, "proj", "", "")
+
+	// Positive observables: active-status guard protects stat-articulation, ring glow, Cut Vertex badge, and withheld node colors.
+	for _, want := range []string{
+		`Boolean(n.is_template) || Boolean(n.pinned) || Boolean(n.ephemeral)`,
+		`if (isNodeActionable(n)) actionable++;`,
+		`document.getElementById('stat-actionable').textContent = actionable;`,
+		`if (isActiveNodeStatus(n.status) && n.is_articulation) articulationCount++;`,
+		`if (isActiveNodeStatus(node.status) && node.is_articulation && isHighlighted)`,
+		`if (isActiveNodeStatus(node.status) && node.is_articulation) addBadge('badge-articulation', 'Cut Vertex');`,
+		`if (isNodeWithheldFromReady(n)) {`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("generateUltimateHTML missing guard %q", want)
+		}
+	}
+
+	// Planted negative controls: unguarded articulation checks must never appear.
+	for _, forbidden := range []string{
+		`if (node.is_articulation && isHighlighted)`,
+		`if (node.is_articulation) addBadge('badge-articulation', 'Cut Vertex');`,
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("generateUltimateHTML contains unguarded articulation check %q", forbidden)
+		}
+	}
+}

@@ -344,3 +344,118 @@ func TestGetGitInfoIgnoresAmbientGitDirAndReplaceRefs(t *testing.T) {
 		t.Fatalf("GetGitInfo branch = %q, want \"main\" (not poison-branch)", branch)
 	}
 }
+
+func TestBaselineScopeRoundTripMatchesScopeAndAtomic0600Save(t *testing.T) {
+	// 1. Scope JSON round-trip (scoped positive + nil-scope omitted negative).
+	scoped := &Baseline{
+		Version:   CurrentVersion,
+		CreatedAt: time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC),
+		Scope: &BaselineScope{
+			Label:     "api",
+			Recipe:    "actionable",
+			Repo:      "services/api",
+			Workspace: true,
+		},
+		Stats: GraphStats{NodeCount: 5, OpenCount: 3},
+	}
+	rawScoped, err := json.Marshal(scoped)
+	if err != nil {
+		t.Fatalf("Marshal scoped baseline: %v", err)
+	}
+	if !strings.Contains(string(rawScoped), `"scope":{`) {
+		t.Fatalf("expected JSON to include scope field, got %s", rawScoped)
+	}
+
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, ".bv", "baseline.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-populate target path with permissive 0o644 permissions to verify atomic rename overwrites with 0o600.
+	if err := os.WriteFile(path, []byte(`{"version":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := scoped.Save(path); err != nil {
+		t.Fatalf("Save() error: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat(%s): %v", path, err)
+	}
+	if gotPerm := info.Mode().Perm(); gotPerm != 0o600 {
+		t.Fatalf("atomic Save() file permissions = %04o, want 0600 (overwriting 0644)", gotPerm)
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ent := range entries {
+		if strings.HasPrefix(ent.Name(), ".baseline-") {
+			t.Fatalf("temp file %q leaked after Save()", ent.Name())
+		}
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if loaded.Scope == nil || *loaded.Scope != *scoped.Scope {
+		t.Fatalf("round-trip Scope = %+v, want %+v", loaded.Scope, scoped.Scope)
+	}
+
+	unscoped := &Baseline{Version: CurrentVersion, CreatedAt: scoped.CreatedAt}
+	rawUnscoped, err := json.Marshal(unscoped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawUnscoped), `"scope"`) {
+		t.Fatalf("nil Scope should be omitted from JSON, got %s", rawUnscoped)
+	}
+
+	// 2. MatchesScope full matrix (including nil receiver negative control).
+	var nilBaseline *Baseline
+	if nilBaseline.MatchesScope(BaselineScope{}) {
+		t.Fatal("nil *Baseline must return false from MatchesScope(BaselineScope{})")
+	}
+	if nilBaseline.MatchesScope(*scoped.Scope) {
+		t.Fatal("nil *Baseline must return false from MatchesScope(non-empty)")
+	}
+	if !unscoped.MatchesScope(BaselineScope{}) {
+		t.Fatal("unscoped Baseline (Scope == nil) must match empty BaselineScope{}")
+	}
+	if unscoped.MatchesScope(BaselineScope{Label: "api"}) {
+		t.Fatal("unscoped Baseline must not match label-scoped BaselineScope")
+	}
+	emptyStructScope := &Baseline{Version: CurrentVersion, Scope: &BaselineScope{}}
+	if !emptyStructScope.MatchesScope(BaselineScope{}) {
+		t.Fatal("Baseline with empty &BaselineScope{} must match BaselineScope{}")
+	}
+	if !loaded.MatchesScope(*scoped.Scope) {
+		t.Fatal("loaded scoped Baseline must match identical BaselineScope")
+	}
+	// [A-6] Repo and Recipe compare case-insensitively with whitespace trimming (matching CLI --repo normalization).
+	if !loaded.MatchesScope(BaselineScope{
+		Label:     "api",
+		Recipe:    " ACTIONABLE ",
+		Repo:      " Services/API ",
+		Workspace: true,
+	}) {
+		t.Fatal("MatchesScope must match case-insensitive / whitespace-padded Repo and Recipe")
+	}
+	for _, mismatch := range []BaselineScope{
+		{},
+		{Label: "other", Recipe: "actionable", Repo: "services/api", Workspace: true},
+		{Label: "api", Recipe: "high-impact", Repo: "services/api", Workspace: true},
+		{Label: "api", Recipe: "actionable", Repo: "services/web", Workspace: true},
+		{Label: "api", Recipe: "actionable", Repo: "services/api", Workspace: false},
+	} {
+		if loaded.MatchesScope(mismatch) {
+			t.Fatalf("scoped Baseline falsely matched mismatched scope %+v", mismatch)
+		}
+	}
+}

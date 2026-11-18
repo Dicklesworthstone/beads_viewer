@@ -108,19 +108,20 @@ bv --robot-forecast all                # Duration/velocity heuristic, not a sche
 bv --robot-capacity --agents=3         # Serial/parallel capacity + Graham makespan bounds
 bv --robot-alerts                      # Stale issues, blocking cascades, source inconsistencies
 bv --init-drift                        # Bootstrap default .bv/drift.yaml thresholds
-bv --check-drift --robot-drift         # Saved-baseline drift check as structured JSON
+bv --check-drift --robot-drift         # Saved-baseline drift check as structured JSON (--severity/--alert-type/--alert-label)
 bv --robot-suggest                     # Hygiene: duplicates, missing deps, cycle breaks
 bv --robot-graph                       # Dependency graph export (JSON, DOT, Mermaid)
 bv --robot-capabilities                # Machine-readable command/flag/env/schema discovery
 bv --robot-schema                      # JSON Schema definitions for all robot commands
 bv --export-graph graph.html           # Self-contained interactive HTML (or .svg / .png snapshot)
+bv --export report.md --export-include-actions=false # Report export with explicit action-plan control
 ```
 
 ## Scoping & Filtering
 
 ```bash
 bv --robot-plan --label backend              # Scope to label's subgraph
-bv --robot-insights --as-of HEAD~30          # Historical point-in-time
+bv --robot-insights --as-of HEAD~30          # Historical point-in-time (also supported with --workspace)
 bv --recipe actionable --robot-plan          # Pre-filter: ready to work
 bv --recipe high-impact --robot-triage       # Pre-filter: top PageRank
 bv --robot-triage --robot-triage-by-track    # Group by parallel work streams

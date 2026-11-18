@@ -218,6 +218,113 @@ rc=$?
 set -e
 if [ "$rc" -eq 0 ] && [ -f "$tmp/install-pinned/bv.exe" ]; then echo "ok: -Version 0.0.1 installs (exit 0)"; else echo "FAIL: -Version path exited $rc"; echo "$out" | tail -5; fail=1; fi
 
+# 4b. GITHUB_TOKEN Authorization header, 401 unauthenticated fallback, and single /releases/latest fetch (0 /releases/tags/<tag> hits).
+if ! python3 - "$pwsh" "$root/install.ps1" "$tmp" "$site/dl/$tag/$asset" "$site/dl/$tag/checksums.txt" "$tag" "$asset" <<'PY'
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+
+pwsh, installer, scratch, zip_path, sums_path, tag, asset = sys.argv[1:]
+scratch = Path(scratch)
+zip_bytes = Path(zip_path).read_bytes()
+sums_bytes = Path(sums_path).read_bytes()
+release_json = json.dumps({"tag_name": tag, "assets": [{"name": asset}, {"name": "checksums.txt"}]}).encode()
+
+requests_log = []
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        pass
+    def do_GET(self):
+        auth = self.headers.get("Authorization", "")
+        requests_log.append((self.path, auth))
+        if self.path == "/api-401/releases/latest" and auth:
+            self.send_response(401)
+            self.end_headers()
+            self.wfile.write(b'{"message":"Bad credentials"}')
+            return
+        if self.path in ("/api/releases/latest", "/api-401/releases/latest"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(release_json)
+            return
+        if self.path == f"/dl/{tag}/{asset}":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(zip_bytes)
+            return
+        if self.path == f"/dl/{tag}/checksums.txt":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(sums_bytes)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+srv = HTTPServer(("127.0.0.1", 0), Handler)
+port = srv.server_address[1]
+t = threading.Thread(target=srv.serve_forever, daemon=True)
+t.start()
+try:
+    # Case A: valid GITHUB_TOKEN sends Bearer header and hits /releases/latest once with 0 /releases/tags/* hits.
+    requests_log.clear()
+    env = dict(os.environ,
+               GITHUB_TOKEN="ghs_valid_ps1",
+               BV_INSTALL_API_URL=f"http://127.0.0.1:{port}/api",
+               BV_INSTALL_DOWNLOAD_URL=f"http://127.0.0.1:{port}/dl")
+    r = subprocess.run([pwsh, "-NoLogo", "-NonInteractive", "-File", installer,
+                        "-InstallDir", str(scratch / "install-auth"), "-NoPathUpdate"],
+                       env=env, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"auth install exited {r.returncode}: {r.stdout}\n{r.stderr}")
+    latest_hits = [req for req in requests_log if req[0] == "/api/releases/latest"]
+    tag_hits = [req for req in requests_log if "/releases/tags/" in req[0]]
+    if len(latest_hits) != 1 or latest_hits[0][1] != "Bearer ghs_valid_ps1" or len(tag_hits) != 0:
+        raise SystemExit(f"unexpected auth request log: {requests_log}")
+    print("ok: GITHUB_TOKEN Bearer header + single /releases/latest fetch (0 /releases/tags hits)")
+
+    # Case B: 401 on expired GH_TOKEN retries without Authorization and succeeds.
+    requests_log.clear()
+    env401 = dict(os.environ,
+                  GH_TOKEN="ghs_expired_ps1",
+                  BV_INSTALL_API_URL=f"http://127.0.0.1:{port}/api-401",
+                  BV_INSTALL_DOWNLOAD_URL=f"http://127.0.0.1:{port}/dl")
+    env401.pop("GITHUB_TOKEN", None)
+    r2 = subprocess.run([pwsh, "-NoLogo", "-NonInteractive", "-File", installer,
+                         "-InstallDir", str(scratch / "install-401-fallback"), "-NoPathUpdate"],
+                        env=env401, capture_output=True, text=True)
+    if r2.returncode != 0:
+        raise SystemExit(f"401 fallback install exited {r2.returncode}: {r2.stdout}\n{r2.stderr}")
+    api401_hits = [req for req in requests_log if req[0] == "/api-401/releases/latest"]
+    if len(api401_hits) != 2 or api401_hits[0][1] != "Bearer ghs_expired_ps1" or api401_hits[1][1] != "":
+        raise SystemExit(f"expected [Bearer, unauthenticated] retry sequence, got: {requests_log}")
+    print("ok: GH_TOKEN 401 retries unauthenticated and installs (exit 0)")
+    # Case C: transport failure under Set-StrictMode -Version Latest with GITHUB_TOKEN set fails cleanly (no PropertyNotFoundException).
+    closed_sock = subprocess.check_output([sys.executable, "-c", "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); print(s.getsockname()[1]); s.close()"], text=True).strip()
+    env_transport = dict(os.environ,
+                         GITHUB_TOKEN="  ghs_transport_err  ",
+                         BV_INSTALL_API_URL=f"http://127.0.0.1:{closed_sock}/api",
+                         BV_INSTALL_DOWNLOAD_URL=f"http://127.0.0.1:{port}/dl")
+    r3 = subprocess.run([pwsh, "-NoLogo", "-NonInteractive", "-File", installer,
+                         "-InstallDir", str(scratch / "install-transport-err"), "-NoPathUpdate"],
+                        env=env_transport, capture_output=True, text=True)
+    combined_r3 = (r3.stdout or "") + (r3.stderr or "")
+    if r3.returncode != 1 or "PropertyNotFoundException" in combined_r3 or "Could not query" not in combined_r3:
+        raise SystemExit(f"expected clean Fail on transport error with GITHUB_TOKEN, got rc={r3.returncode}: {combined_r3}")
+    print("ok: GITHUB_TOKEN transport error under StrictMode fails cleanly without PropertyNotFoundException (exit 1)")
+finally:
+    srv.shutdown()
+    srv.server_close()
+PY
+then
+  fail=1
+fi
+
 # 5. Exercise the actual function without running the rest of the installer.
 # Only the platform guard is overridden: Fail and Assert-BinaryVersion are
 # extracted unchanged, and every candidate is a real process with real pipes.
@@ -267,6 +374,11 @@ def operation_timing_errors(elapsed, timed_out):
 
 cases = [
     ("version-success", "print('bv v0.0.1', flush=True)", 0, ["version accepted"], False),
+    ("version-robot-env-scrubbed",
+     "if os.environ.get('BV_ROBOT') or os.environ.get('BV_OUTPUT_FORMAT') or os.environ.get('TOON_DEFAULT_FORMAT'):\n"
+     "    print('{\"tool\":\"bv\",\"version\":\"v0.0.1\"}', flush=True)\n"
+     "else:\n"
+     "    print('bv v0.0.1', flush=True)", 0, ["version accepted"], False),
     ("version-mismatch", "print('bv v0.0.2', flush=True)", 1, ["expected v0.0.1"], False),
     ("version-nonzero", "print('nonzero diagnostic', file=sys.stderr, flush=True)\nsys.exit(7)", 1,
      ["exited with code 7", "nonzero diagnostic"], False),
@@ -303,9 +415,10 @@ for name, body, expected, markers, timed_out in cases:
     candidate.chmod(0o700)
     timing_file = scratch / (name + '.seconds')
     started = time.monotonic()
+    case_env = dict(os.environ, BV_ROBOT="1", BV_OUTPUT_FORMAT="json", TOON_DEFAULT_FORMAT="toon")
     process = subprocess.Popen([pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-File', str(probe),
                                 '-Installer', installer, '-Binary', str(candidate), '-TimingFile', str(timing_file)],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                               env=case_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     outer_timeout = False
     child_still_running = False
     try:

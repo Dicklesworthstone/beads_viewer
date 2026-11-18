@@ -262,6 +262,7 @@ func (m UpdateModal) startUpdate() (UpdateModal, tea.Cmd) {
 	tracker := &updatePhaseTracker{stage: "downloading"}
 	m.phaseTracker = tracker
 	m.phaseDetail = ""
+	m.progress = UpdateProgress{Stage: "downloading"}
 	m.state = UpdateStateDownloading
 	m.startTime = time.Now()
 	return m, tea.Batch(performUpdateWithProgressCmd(m.newVersion, tracker), updateTickCmd(m.startTime))

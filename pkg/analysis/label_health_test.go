@@ -730,7 +730,7 @@ func TestComputeVelocityMetrics_IgnoresNonClosedWithClosedAt(t *testing.T) {
 
 func TestComputeHistoricalVelocity_IgnoresNonClosedWithClosedAt(t *testing.T) {
 	now := time.Date(2025, 12, 15, 12, 0, 0, 0, time.UTC) // Monday
-	closedAt := now.Add(2 * time.Hour)
+	closedAt := now.Add(-2 * time.Hour)
 
 	issues := []model.Issue{
 		{ID: "open-closedat", ClosedAt: &closedAt, Status: model.StatusOpen, Labels: []string{"api"}},
@@ -2138,8 +2138,8 @@ func TestAttentionScoresSingleLabel(t *testing.T) {
 // ============================================================================
 
 func TestComputeHistoricalVelocity_BasicCounting(t *testing.T) {
-	// Use a Monday as 'now' for clearer week alignment
-	now := time.Date(2025, 12, 15, 12, 0, 0, 0, time.UTC) // Monday Dec 15, 2025
+	// Use Friday Dec 19 as 'now' so Tuesday Dec 16 in current week (Dec 15-21) is not in the future.
+	now := time.Date(2025, 12, 19, 12, 0, 0, 0, time.UTC) // Friday Dec 19, 2025
 
 	// Create issues closed in different weeks (relative to Monday start)
 	// Week 0 = Dec 15-21 (current week)
@@ -2190,8 +2190,8 @@ func TestComputeHistoricalVelocity_BasicCounting(t *testing.T) {
 }
 
 func TestComputeHistoricalVelocity_PeakAndTrough(t *testing.T) {
-	// Use a Monday for clearer week alignment
-	now := time.Date(2025, 12, 15, 12, 0, 0, 0, time.UTC) // Monday Dec 15
+	// Use Friday Dec 19 in current week (Dec 15-21) so week0Close (Dec 16) is <= now.
+	now := time.Date(2025, 12, 19, 12, 0, 0, 0, time.UTC) // Friday Dec 19
 
 	// Create varying velocity with specific dates in each week
 	week0Close := time.Date(2025, 12, 16, 10, 0, 0, 0, time.UTC) // Week 0: Dec 15-21
@@ -2237,15 +2237,16 @@ func TestComputeHistoricalVelocity_PeakAndTrough(t *testing.T) {
 }
 
 func TestComputeHistoricalVelocity_MovingAverages(t *testing.T) {
-	// Use a Monday for clearer week alignment
-	now := time.Date(2025, 12, 15, 12, 0, 0, 0, time.UTC) // Monday Dec 15
+	// Use Friday Dec 19 in current week (Monday Dec 15 - Sunday Dec 21) so Wednesday closures are <= now.
+	now := time.Date(2025, 12, 19, 12, 0, 0, 0, time.UTC) // Friday Dec 19
+	week0Monday := time.Date(2025, 12, 15, 12, 0, 0, 0, time.UTC)
 
 	// Create 8 weeks of data: each week has weeksAgo+1 closures
 	// Week 0: 1, Week 1: 2, Week 2: 3, ... Week 7: 8
 	var issues []model.Issue
 	for w := 0; w < 8; w++ {
 		// Place closures in the middle of each week (Wednesday)
-		weekClose := now.AddDate(0, 0, -7*w+2) // Wednesday of that week
+		weekClose := week0Monday.AddDate(0, 0, -7*w+2) // Wednesday of that week
 		for i := 0; i <= w; i++ {
 			issues = append(issues, model.Issue{
 				ID:       fmt.Sprintf("w%d-%d", w, i),
@@ -2373,8 +2374,8 @@ func TestHistoricalVelocity_GetWeeklyAverage(t *testing.T) {
 }
 
 func TestComputeAllHistoricalVelocity(t *testing.T) {
-	// Use a Monday for clearer week alignment
-	now := time.Date(2025, 12, 15, 12, 0, 0, 0, time.UTC)
+	// Use Friday Dec 19 in current week (Dec 15-21) so Tuesday Dec 16 closures are <= now.
+	now := time.Date(2025, 12, 19, 12, 0, 0, 0, time.UTC)
 	// Close issues on Tuesday of current week (week 0)
 	week0Close := time.Date(2025, 12, 16, 10, 0, 0, 0, time.UTC)
 
@@ -3440,5 +3441,272 @@ func TestLabelHealth_PopulatesHistoricalVelocity(t *testing.T) {
 	}
 	if strings.Contains(string(encodedMissing), `"historical"`) {
 		t.Fatalf("expected nil Historical to be omitted from JSON, got %s", encodedMissing)
+	}
+}
+
+func TestLabelHealth_ClosureFallbackAndFutureExclusionParity(t *testing.T) {
+	// Wednesday Nov 18, 2026 12:00 UTC: +24h (Thursday Nov 19) is inside the same Monday..Sunday week!
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	created := now.Add(-10 * 24 * time.Hour)
+	validFallback := now.Add(-2 * 24 * time.Hour) // Monday Nov 16 (<= now, in Week 0 and last 7d/30d)
+	skewedBeforeCreated := created.Add(-48 * time.Hour)
+	futureClose := now.Add(24 * time.Hour) // Thursday Nov 19 (> now, must be excluded everywhere!)
+	zeroTime := time.Time{}
+
+	cfg := DefaultLabelHealthConfig()
+
+	// Positive observable: ClosedAt == nil (and zero ClosedAt) falls back to UpdatedAt across all 4 surfaces.
+	posIssues := []model.Issue{
+		{
+			ID:        "fb-nil",
+			Title:     "Closed without ClosedAt",
+			Labels:    []string{"fallback"},
+			Status:    model.StatusClosed,
+			CreatedAt: created,
+			UpdatedAt: validFallback,
+			ClosedAt:  nil,
+		},
+		{
+			ID:        "fb-zero-skew",
+			Title:     "Tombstone with zero ClosedAt and skewed UpdatedAt < CreatedAt",
+			Labels:    []string{"fallback"},
+			Status:    model.StatusTombstone,
+			CreatedAt: created,
+			UpdatedAt: skewedBeforeCreated,
+			ClosedAt:  &zeroTime,
+		},
+		{
+			ID:        "fb-open",
+			Title:     "Open peer so attention is non-zero",
+			Labels:    []string{"fallback"},
+			Status:    model.StatusOpen,
+			CreatedAt: created,
+			UpdatedAt: now.Add(-24 * time.Hour),
+		},
+		{
+			ID:        "idle-open",
+			Title:     "Open peer in zero-velocity label",
+			Labels:    []string{"idle"},
+			Status:    model.StatusOpen,
+			CreatedAt: created,
+			UpdatedAt: now.Add(-24 * time.Hour),
+		},
+	}
+
+	anPos := NewAnalyzer(posIssues)
+	statsPos := anPos.Analyze()
+	velPos := ComputeVelocityMetrics(posIssues[:2], now)
+	if velPos.ClosedLast7Days != 1 || velPos.ClosedLast30Days != 2 {
+		t.Fatalf("ComputeVelocityMetrics fallback = (7d=%d, 30d=%d), want (1, 2)", velPos.ClosedLast7Days, velPos.ClosedLast30Days)
+	}
+	if velPos.AvgDaysToClose < 0 || math.Abs(velPos.AvgDaysToClose-8.0) > 1e-9 {
+		t.Fatalf("ComputeVelocityMetrics AvgDaysToClose = %f, want +8.0 (skewed UpdatedAt < CreatedAt excluded)", velPos.AvgDaysToClose)
+	}
+
+	labelVelPos := ComputeLabelVelocity("fallback", posIssues, now)
+	if labelVelPos.ClosedLast7Days != 1 || labelVelPos.ClosedLast30Days != 2 {
+		t.Fatalf("ComputeLabelVelocity fallback = (7d=%d, 30d=%d), want (1, 2)", labelVelPos.ClosedLast7Days, labelVelPos.ClosedLast30Days)
+	}
+	if labelVelPos.Historical == nil || labelVelPos.Historical.WeeklyVelocity[0].Closed != 1 {
+		t.Fatalf("ComputeLabelVelocity Historical week 0 = %+v, want 1 fallback closure", labelVelPos.Historical)
+	}
+
+	scoresPos := ComputeLabelHealthScores(posIssues, cfg, now, &statsPos)
+	oraclePos := ComputeLabelHealthForLabel("fallback", posIssues, cfg, now, &statsPos)
+	if scoresPos["fallback"] != oraclePos.Health {
+		t.Fatalf("ComputeLabelHealthScores[fallback]=%d != oracle %d", scoresPos["fallback"], oraclePos.Health)
+	}
+
+	fastPos := ComputeLabelAttentionScoresFast(posIssues, cfg, now, &statsPos)
+	if !(fastPos["fallback"] < fastPos["idle"]) {
+		t.Fatalf("expected fallback closures to lower attention score vs idle label: fallback=%f idle=%f", fastPos["fallback"], fastPos["idle"])
+	}
+
+	// Planted negative control: future ClosedAt > now and future UpdatedAt > now must be excluded across all 4 surfaces.
+	negIssues := []model.Issue{
+		{
+			ID:        "fut-closedat",
+			Title:     "Future ClosedAt",
+			Labels:    []string{"future"},
+			Status:    model.StatusClosed,
+			CreatedAt: created,
+			UpdatedAt: validFallback, // ClosedAt is non-nil/non-zero, so ClosedAt (> now) governs and must be rejected!
+			ClosedAt:  &futureClose,
+		},
+		{
+			ID:        "fut-updatedat",
+			Title:     "Nil ClosedAt with future UpdatedAt",
+			Labels:    []string{"future"},
+			Status:    model.StatusClosed,
+			CreatedAt: created,
+			UpdatedAt: futureClose,
+			ClosedAt:  nil,
+		},
+		{
+			ID:        "fut-open",
+			Title:     "Open peer",
+			Labels:    []string{"future"},
+			Status:    model.StatusOpen,
+			CreatedAt: created,
+			UpdatedAt: now.Add(-24 * time.Hour),
+		},
+		{
+			ID:        "ctrl-open",
+			Title:     "Identical open peer without future closures",
+			Labels:    []string{"ctrl"},
+			Status:    model.StatusOpen,
+			CreatedAt: created,
+			UpdatedAt: now.Add(-24 * time.Hour),
+		},
+	}
+
+	anNeg := NewAnalyzer(negIssues)
+	statsNeg := anNeg.Analyze()
+	velNeg := ComputeVelocityMetrics(negIssues[:2], now)
+	if velNeg.ClosedLast7Days != 0 || velNeg.ClosedLast30Days != 0 || velNeg.VelocityScore != 0 {
+		t.Fatalf("negative control failed: future closures counted in ComputeVelocityMetrics: %+v", velNeg)
+	}
+
+	labelVelNeg := ComputeLabelVelocity("future", negIssues, now)
+	if labelVelNeg.ClosedLast7Days != 0 || labelVelNeg.ClosedLast30Days != 0 {
+		t.Fatalf("negative control failed: future closures counted in ComputeLabelVelocity: %+v", labelVelNeg)
+	}
+	if labelVelNeg.Historical == nil || labelVelNeg.Historical.WeeklyVelocity[0].Closed != 0 || labelVelNeg.Historical.PeakVelocity != 0 {
+		t.Fatalf("negative control failed: future closures counted in HistoricalVelocity: %+v", labelVelNeg.Historical)
+	}
+
+	scoresNeg := ComputeLabelHealthScores(negIssues, cfg, now, &statsNeg)
+	oracleNeg := ComputeLabelHealthForLabel("future", negIssues, cfg, now, &statsNeg)
+	if scoresNeg["future"] != oracleNeg.Health || oracleNeg.Velocity.VelocityScore != 0 {
+		t.Fatalf("negative control failed: ComputeLabelHealthScores=%d oracle=%+v", scoresNeg["future"], oracleNeg.Velocity)
+	}
+
+	fastNeg := ComputeLabelAttentionScoresFast(negIssues, cfg, now, &statsNeg)
+	if math.Abs(fastNeg["future"]-fastNeg["ctrl"]) > 1e-12 {
+		t.Fatalf("negative control failed: future closures altered ComputeLabelAttentionScoresFast: future=%f ctrl=%f", fastNeg["future"], fastNeg["ctrl"])
+	}
+}
+
+func TestComputeBlockageCascadeAndAttention_DeduplicationScopeAndBlockImpact(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultLabelHealthConfig()
+
+	// SHARED-ROOT is open; SHARED-MID has TWO labels ("api", "core"), is blocked by SHARED-ROOT,
+	// and itself blocks TWO downstream labels ("web", "cli"). Out-of-scope OUT-BLK is blocked by OUT-ROOT.
+	issues := []model.Issue{
+		{ID: "SHARED-ROOT", Title: "Root blocker", Status: model.StatusOpen, Labels: []string{"infra"}, UpdatedAt: now},
+		{
+			ID: "SHARED-MID", Title: "Multi-label blocked bridge", Status: model.StatusOpen, Labels: []string{"api", "core"}, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "SHARED-MID", DependsOnID: "SHARED-ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "DOWN-WEB", Title: "Web consumer", Status: model.StatusOpen, Labels: []string{"web"}, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "DOWN-WEB", DependsOnID: "SHARED-MID", Type: model.DepBlocks}},
+		},
+		{
+			ID: "DOWN-CLI", Title: "CLI consumer", Status: model.StatusOpen, Labels: []string{"cli"}, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "DOWN-CLI", DependsOnID: "SHARED-MID", Type: model.DepBlocks}},
+		},
+		{
+			ID: "DOWN-CLOSED", Title: "Closed consumer (planted negative for BlockImpact)", Status: model.StatusClosed, Labels: []string{"done"}, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "DOWN-CLOSED", DependsOnID: "SHARED-MID", Type: model.DepBlocks}},
+		},
+		{ID: "OUT-ROOT", Title: "Out-of-scope root", Status: model.StatusOpen, Labels: []string{"legacy"}, UpdatedAt: now},
+		{
+			ID: "OUT-BLK", Title: "Out-of-scope blocked", Status: model.StatusOpen, Labels: []string{"legacy-ui"}, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "OUT-BLK", DependsOnID: "OUT-ROOT", Type: model.DepBlocks}},
+		},
+	}
+
+	readiness := model.NewReadinessIndex(issues)
+	candidates := map[string]bool{
+		"SHARED-ROOT": true,
+		"SHARED-MID":  true,
+		"DOWN-WEB":    true,
+		"DOWN-CLI":    true,
+		"DOWN-CLOSED": true,
+	}
+
+	flowScoped := ComputeCrossLabelFlowWithScope(issues, cfg, candidates)
+	cascadeScoped := ComputeBlockageCascadeAtWithScope(issues, flowScoped, cfg, now, readiness, candidates)
+
+	// Positive observable: SHARED-MID appears in both "api" and "core" cascades,
+	// yet TopUnblocks deduplicates SHARED-MID so each IssueID appears at most once.
+	seenTop := make(map[string]int)
+	for _, rec := range cascadeScoped.TopUnblocks {
+		seenTop[rec.IssueID]++
+		if seenTop[rec.IssueID] > 1 {
+			t.Fatalf("duplicate IssueID %q in TopUnblocks: %+v", rec.IssueID, cascadeScoped.TopUnblocks)
+		}
+		if !candidates[rec.IssueID] {
+			t.Fatalf("out-of-scope IssueID %q leaked into scoped TopUnblocks", rec.IssueID)
+		}
+	}
+	if seenTop["SHARED-MID"] != 1 {
+		t.Fatalf("expected SHARED-MID once in TopUnblocks, got count=%d (%+v)", seenTop["SHARED-MID"], cascadeScoped.TopUnblocks)
+	}
+	// Planted negative control: OUT-BLK is excluded when scoped to candidates (TotalBlocked == 3: SHARED-MID, DOWN-WEB, DOWN-CLI),
+	// whereas unscoped TotalBlocked == 4.
+	if cascadeScoped.TotalBlocked != 3 {
+		t.Fatalf("scoped TotalBlocked = %d, want 3 (OUT-BLK excluded)", cascadeScoped.TotalBlocked)
+	}
+	unscopedFlow := ComputeCrossLabelFlow(issues, cfg)
+	unscopedCascade := ComputeBlockageCascadeAt(issues, unscopedFlow, cfg, now)
+	if unscopedCascade.TotalBlocked != 4 {
+		t.Fatalf("unscoped TotalBlocked = %d, want 4", unscopedCascade.TotalBlocked)
+	}
+
+	// Verify ComputeLabelAttentionScoresWithScope enforces BlockedCount == int(BlockImpact)
+	// and excludes closed dependents (DOWN-CLOSED) + out-of-scope labels (legacy/legacy-ui).
+	attn := ComputeLabelAttentionScoresWithScope(issues, cfg, now, readiness, candidates)
+	byLabel := make(map[string]LabelAttentionScore, len(attn.Labels))
+	for _, s := range attn.Labels {
+		byLabel[s.Label] = s
+		if s.BlockedCount != int(s.BlockImpact) {
+			t.Fatalf("label %q BlockedCount=%d != int(BlockImpact)=%d", s.Label, s.BlockedCount, int(s.BlockImpact))
+		}
+	}
+	if _, leaked := byLabel["legacy"]; leaked {
+		t.Fatalf("out-of-scope label 'legacy' leaked into scoped attention scores")
+	}
+	// SHARED-MID blocks 2 active issues (DOWN-WEB, DOWN-CLI); DOWN-CLOSED is closed and must NOT increment BlockImpact.
+	if byLabel["api"].BlockedCount != 2 || byLabel["api"].BlockImpact != 2.0 {
+		t.Fatalf("label 'api' BlockedCount=%d BlockImpact=%f, want 2 / 2.0", byLabel["api"].BlockedCount, byLabel["api"].BlockImpact)
+	}
+	if byLabel["web"].BlockedCount != 0 || byLabel["web"].BlockImpact != 0.0 {
+		t.Fatalf("leaf label 'web' BlockedCount=%d BlockImpact=%f, want 0 / 0.0", byLabel["web"].BlockedCount, byLabel["web"].BlockImpact)
+	}
+}
+
+func TestComputeLabelVelocity_ZeroNowDefaultsToUTCWallClock(t *testing.T) {
+	recent := time.Now().UTC().Add(-24 * time.Hour)
+	future := time.Now().UTC().Add(48 * time.Hour)
+	issues := []model.Issue{
+		{
+			ID:        "recent-closed",
+			Labels:    []string{"api"},
+			Status:    model.StatusClosed,
+			CreatedAt: recent.Add(-48 * time.Hour),
+			UpdatedAt: recent,
+			ClosedAt:  &recent,
+		},
+		{
+			ID:        "future-closed",
+			Labels:    []string{"api"},
+			Status:    model.StatusClosed,
+			CreatedAt: recent,
+			UpdatedAt: future,
+			ClosedAt:  &future,
+		},
+	}
+
+	// Positive observable: passing zero time.Time{} defaults to current UTC time, counting recent-closed (not rejecting > 1970).
+	// Planted negative control: future-closed (+48h beyond wall-clock now) is still excluded!
+	vel := ComputeLabelVelocity("api", issues, time.Time{})
+	if vel.ClosedLast7Days != 1 || vel.ClosedLast30Days != 1 {
+		t.Fatalf("ComputeLabelVelocity(zero now) = (7d=%d, 30d=%d), want (1, 1)", vel.ClosedLast7Days, vel.ClosedLast30Days)
+	}
+	if vel.Historical == nil || vel.Historical.PeakVelocity != 1 {
+		t.Fatalf("ComputeLabelVelocity(zero now) Historical = %+v, want PeakVelocity=1", vel.Historical)
 	}
 }

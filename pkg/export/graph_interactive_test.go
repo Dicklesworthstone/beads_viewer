@@ -3,10 +3,14 @@ package export
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -552,5 +556,181 @@ func TestGenerateInteractiveGraphHTML_CyclicSlackSafetyDagErrorMarkdownAndMetric
 		if n.ID != "dag-closed" && !n.SlackAvailable {
 			t.Fatalf("expected active node %s to have slack_available=true", n.ID)
 		}
+	}
+}
+
+func TestGenerateInteractiveGraphFilenameWithOpts_ExplicitAndGitWorkDirControls(t *testing.T) {
+	exportAt := time.Date(2026, 9, 4, 12, 30, 0, 0, time.UTC)
+
+	// 1. Explicit exportedAt + explicit gitHash ignores workDir git state completely.
+	explicitName := GenerateInteractiveGraphFilenameWithOpts("my repo/sub", exportAt, t.TempDir(), "  cafe987  ")
+	wantExplicit := "my_repo_sub_graph_export__as_of__2026_09_04__12_30__git_head_hash__cafe987.html"
+	if explicitName != wantExplicit {
+		t.Fatalf("explicit filename = %q, want %q", explicitName, wantExplicit)
+	}
+
+	// 1b. 40-char full SHA-1 GitHash (as passed by cmd/bv) truncates to 8 hex chars.
+	fullHashName := GenerateInteractiveGraphFilenameWithOpts("demo", exportAt, t.TempDir(), "0123456789abcdef0123456789abcdef01234567")
+	wantFullHash := "demo_graph_export__as_of__2026_09_04__12_30__git_head_hash__01234567.html"
+	if fullHashName != wantFullHash {
+		t.Fatalf("40-char gitHash filename = %q, want %q", fullHashName, wantFullHash)
+	}
+
+	// 1c. Ref/branch-like gitHash with slashes, backslashes, and spaces sanitizes cleanly.
+	branchName := GenerateInteractiveGraphFilenameWithOpts("demo\\sub", exportAt, t.TempDir(), "feature/branch name\\rev")
+	wantBranch := "demo_sub_graph_export__as_of__2026_09_04__12_30__git_head_hash__feature_branch_name_rev.html"
+	if branchName != wantBranch {
+		t.Fatalf("sanitized gitHash filename = %q, want %q", branchName, wantBranch)
+	}
+
+	// 2. Empty gitHash in a non-git temp directory must fall back to "nogit" (never leaking CWD repo hash!).
+	noGitDir := t.TempDir()
+	noGitName := GenerateInteractiveGraphFilenameWithOpts("demo", exportAt, noGitDir, "")
+	wantNoGit := "demo_graph_export__as_of__2026_09_04__12_30__git_head_hash__nogit.html"
+	if noGitName != wantNoGit {
+		t.Fatalf("non-git workDir filename = %q, want %q", noGitName, wantNoGit)
+	}
+
+	// 3. Empty gitHash in an initialized temp git repo resolves that repo's short HEAD hash.
+	if _, err := exec.LookPath("git"); err == nil {
+		gitDir := t.TempDir()
+		runGit := func(args ...string) string {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = gitDir
+			cmd.Env = append(loader.SanitizedGitEnv(),
+				"GIT_AUTHOR_NAME=Test",
+				"GIT_AUTHOR_EMAIL=test@example.com",
+				"GIT_COMMITTER_NAME=Test",
+				"GIT_COMMITTER_EMAIL=test@example.com",
+				"GIT_AUTHOR_DATE=2026-09-04T12:00:00Z",
+				"GIT_COMMITTER_DATE=2026-09-04T12:00:00Z",
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+			}
+			return strings.TrimSpace(string(out))
+		}
+		runGit("init", "-q")
+		if err := os.WriteFile(filepath.Join(gitDir, "README.md"), []byte("hello\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		runGit("add", "README.md")
+		runGit("commit", "-q", "-m", "init")
+		expectedShort := runGit("rev-parse", "--short", "HEAD")
+
+		resolvedName := GenerateInteractiveGraphFilenameWithOpts("demo", exportAt, gitDir, "")
+		wantResolved := "demo_graph_export__as_of__2026_09_04__12_30__git_head_hash__" + expectedShort + ".html"
+		if resolvedName != wantResolved {
+			t.Fatalf("git workDir filename = %q, want %q", resolvedName, wantResolved)
+		}
+	}
+}
+
+func TestGenerateInteractiveGraphHTML_ExternalReadinessWithheldFlagsAndClosedArticulation(t *testing.T) {
+	exportAt := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	closedAt := exportAt
+
+	// Full workspace contains external open blocker and external closed blocker omitted from the exported slice.
+	fullWorkspace := []model.Issue{
+		{ID: "ext-open-blocker", Title: "External Open Blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask},
+		{ID: "ext-closed-blocker", Title: "External Closed Blocker", Status: model.StatusClosed, ClosedAt: &closedAt, Priority: 1, IssueType: model.TypeTask},
+		{
+			ID: "slice-blocked-ext", Title: "Blocked By Omitted Open Issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "slice-blocked-ext", DependsOnID: "ext-open-blocker", Type: model.DepBlocks}},
+		},
+		{
+			ID: "slice-ready-ext", Title: "Ready Because Omitted Blocker Closed", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "slice-ready-ext", DependsOnID: "ext-closed-blocker", Type: model.DepBlocks}},
+		},
+		{ID: "slice-ephemeral", Title: "Ephemeral Wisp", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Ephemeral: true},
+		{ID: "slice-pinned", Title: "Pinned Notice", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Pinned: true},
+		{ID: "slice-template", Title: "Issue Template", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, IsTemplate: true},
+		// Active cut-vertex chain: open-leaf -> open-cut -> open-root
+		{ID: "open-root", Title: "Open Root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask},
+		{
+			ID: "open-cut", Title: "Active Cut Vertex", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "open-cut", DependsOnID: "open-root", Type: model.DepBlocks}},
+		},
+		{
+			ID: "open-leaf", Title: "Active Leaf", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "open-leaf", DependsOnID: "open-cut", Type: model.DepBlocks}},
+		},
+		// Historical closed cut vertex bridging open-root to closed-wing
+		{
+			ID: "closed-cut", Title: "Closed Historical Cut Vertex", Status: model.StatusClosed, ClosedAt: &closedAt, Priority: 2, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "closed-cut", DependsOnID: "open-root", Type: model.DepBlocks}},
+		},
+		{
+			ID: "closed-wing", Title: "Closed Historical Wing", Status: model.StatusClosed, ClosedAt: &closedAt, Priority: 3, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "closed-wing", DependsOnID: "closed-cut", Type: model.DepBlocks}},
+		},
+	}
+
+	fullReadiness := model.NewReadinessIndex(fullWorkspace)
+	slice := fullWorkspace[2:] // Omit ext-open-blocker and ext-closed-blocker from the rendered slice.
+	sliceStats := analysis.NewAnalyzer(slice).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+
+	outPath, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues:     slice,
+		Stats:      &sliceStats,
+		Readiness:  fullReadiness,
+		ExportedAt: exportAt,
+		Path:       filepath.Join(t.TempDir(), "slice.html"),
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML failed: %v", err)
+	}
+	raw, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	html := string(raw)
+
+	const prefix = "\nconst DATA = "
+	start := strings.Index(html, prefix)
+	end := strings.Index(html[start+len(prefix):], ";\nconst STATUS_COLORS")
+	if start < 0 || end < 0 {
+		t.Fatalf("failed to locate embedded DATA JSON")
+	}
+	var payload struct {
+		Nodes []graphNode `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(html[start+len(prefix):start+len(prefix)+end]), &payload); err != nil {
+		t.Fatalf("Unmarshal DATA JSON: %v", err)
+	}
+	byID := make(map[string]graphNode, len(payload.Nodes))
+	for _, n := range payload.Nodes {
+		byID[n.ID] = n
+	}
+
+	// Authoritative Readiness positive & negative controls on omitted external blockers:
+	if byID["slice-blocked-ext"].IsActionable || len(byID["slice-blocked-ext"].BlockedBy) != 1 || byID["slice-blocked-ext"].BlockedBy[0] != "ext-open-blocker" {
+		t.Fatalf("slice-blocked-ext = %+v, want IsActionable=false BlockedBy=[ext-open-blocker]", byID["slice-blocked-ext"])
+	}
+	if !byID["slice-ready-ext"].IsActionable || len(byID["slice-ready-ext"].BlockedBy) != 0 {
+		t.Fatalf("slice-ready-ext = %+v, want IsActionable=true BlockedBy=[] via authoritative Readiness", byID["slice-ready-ext"])
+	}
+
+	// Ephemeral, pinned, and template flags are withheld from readiness while open-root is actionable:
+	for _, withheldID := range []string{"slice-ephemeral", "slice-pinned", "slice-template"} {
+		if byID[withheldID].IsActionable {
+			t.Fatalf("%s IsActionable = true, want false (withheld)", withheldID)
+		}
+	}
+	if !byID["slice-ephemeral"].Ephemeral || !byID["slice-pinned"].Pinned || !byID["slice-template"].IsTemplate {
+		t.Fatalf("expected ephemeral/pinned/is_template flags serialized in graphNode JSON")
+	}
+	if !byID["open-root"].IsActionable {
+		t.Fatalf("open-root positive control IsActionable = false, want true")
+	}
+
+	// Active cut vertex vs closed historical cut vertex:
+	if !byID["open-cut"].IsArticulation || byID["open-cut"].Betweenness <= 0 {
+		t.Fatalf("open-cut = %+v, want IsArticulation=true and Betweenness > 0", byID["open-cut"])
+	}
+	if byID["closed-cut"].IsArticulation || byID["closed-cut"].Betweenness != 0 || byID["closed-cut"].CoreNumber != 0 || byID["closed-cut"].BetweennessRank != 0 {
+		t.Fatalf("closed-cut = %+v, want IsArticulation=false Betweenness=0 CoreNumber=0 BetweennessRank=0", byID["closed-cut"])
 	}
 }

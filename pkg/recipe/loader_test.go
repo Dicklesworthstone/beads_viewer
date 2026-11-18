@@ -947,3 +947,56 @@ func TestLoadEmbedded_IgnoresHostAndProjectRecipes(t *testing.T) {
 		}
 	}
 }
+
+func TestDecodeStrictRejectsMultiDocumentYAMLAndParsesExportIncludeActions(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1. Positive: single-document YAML (with leading --- marker) and export.include_actions false/true/omitted.
+	singleFalsePath := filepath.Join(dir, "single-false.yaml")
+	writeFile(t, singleFalsePath, "---\nname: no-actions\nexport:\n  format: markdown\n  include_graph: false\n  include_actions: false\n")
+	rFalse, err := recipe.LoadFile(singleFalsePath)
+	if err != nil {
+		t.Fatalf("LoadFile single-doc false failed: %v", err)
+	}
+	if rFalse.Export.IncludeActions == nil || *rFalse.Export.IncludeActions {
+		t.Fatalf("expected export.include_actions=false, got %v", rFalse.Export.IncludeActions)
+	}
+	if rFalse.Export.IncludeGraph == nil || *rFalse.Export.IncludeGraph {
+		t.Fatalf("expected export.include_graph=false, got %v", rFalse.Export.IncludeGraph)
+	}
+
+	userMapPath := filepath.Join(dir, "user-recipes.yaml")
+	writeFile(t, userMapPath, "recipes:\n  with-actions:\n    export:\n      include_actions: true\n  default-actions:\n    export:\n      format: markdown\n")
+	loader := recipe.NewLoader(recipe.WithUserPath(userMapPath), recipe.WithProjectDir(filepath.Join(dir, "empty-proj")))
+	if err := loader.Load(); err != nil {
+		t.Fatalf("Loader.Load single-doc map failed: %v", err)
+	}
+	rTrue := loader.Get("with-actions")
+	if rTrue == nil || rTrue.Export.IncludeActions == nil || !*rTrue.Export.IncludeActions {
+		t.Fatalf("expected export.include_actions=true on with-actions, got %+v", rTrue)
+	}
+	rNil := loader.Get("default-actions")
+	if rNil == nil || rNil.Export.IncludeActions != nil {
+		t.Fatalf("expected omitted export.include_actions to remain nil, got %+v", rNil)
+	}
+
+	// 2. Planted negative controls: multi-document YAML streams (---\n second doc) rejected by decodeStrict.
+	multiRecipeFile := filepath.Join(dir, "multi-doc.yaml")
+	writeFile(t, multiRecipeFile, "name: first-doc\ndescription: valid\n---\nname: smuggled-second-doc\n")
+	if _, err := recipe.LoadFile(multiRecipeFile); err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
+		t.Fatalf("expected multi-document recipe file rejection, got %v", err)
+	}
+
+	projDir := filepath.Join(dir, "multi-proj")
+	writeFile(t, filepath.Join(projDir, ".bv", "recipes.yaml"), "recipes:\n  legit:\n    description: first\n---\nrecipes:\n  smuggled:\n    description: second\n")
+	multiLoader := recipe.NewLoader(recipe.WithUserPath(filepath.Join(dir, "missing.yaml")), recipe.WithProjectDir(projDir))
+	if err := multiLoader.Load(); err != nil {
+		t.Fatalf("multiLoader.Load: %v", err)
+	}
+	if multiLoader.Get("legit") != nil || multiLoader.Get("smuggled") != nil {
+		t.Fatalf("multi-document project recipes.yaml must not register any recipe")
+	}
+	if !hasWarningContaining(multiLoader.Warnings(), "multiple YAML documents") {
+		t.Fatalf("expected warning mentioning multiple YAML documents, got %v", multiLoader.Warnings())
+	}
+}

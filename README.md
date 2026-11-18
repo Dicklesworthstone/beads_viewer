@@ -3159,7 +3159,7 @@ Alert types are the `AlertType` constants in `pkg/drift/drift.go` (`AllAlertType
 | `potential_duplicate` | Two open issues whose title/description keyword Jaccard similarity reaches the threshold (same detector as `--robot-suggest`); closed issues are never paired | Info | `duplicate_jaccard_threshold` (0.7), `duplicate_max_alerts` (10) |
 | `priority_mismatch` | `--robot-priority` recommends a *higher* priority with confidence at or above the floor (downgrade suggestions stay in `--robot-priority`) | Warning | `priority_mismatch_min_confidence` (0.6) |
 | `velocity_drop` | Closes in the last window fell by the percentage or more versus the previous window, which must contain at least the baseline count of closes | Warning | `velocity_drop_pct` (50), `velocity_window_days` (7), `velocity_min_baseline` (5) |
-| `source_inconsistency` | Live SQLite (`beads.db`) and local JSONL (`issues.jsonl`) tracker sources disagree on issue presence, status, priority, or title | Warning | `source_drift_alert` (true), `source_drift_max_alerts` (10) |
+| `source_inconsistency` | Live SQLite (`beads.db`) and local JSONL (`issues.jsonl`) tracker sources disagree on issue presence, status, priority, title, dependencies, assignee, labels, or defer_until | Warning | `source_drift_alert` (true), `source_drift_max_alerts` (10) |
 
 **Drift checks** (compare the current graph with the baseline saved by `bv --save-baseline`):
 
@@ -3328,12 +3328,13 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--agents-remove` | bool | `false` | Remove beads workflow instructions from AGENTS.md | Agent File Management |
 | `--agents-reset` | bool | `false` | Clear saved AGENTS.md prompt preference | Agent File Management |
 | `--agents-update` | bool | `false` | Update beads workflow instructions to latest version | Agent File Management |
-| `--agent-brief` | string | (empty) | Export agent brief bundle to directory (includes triage.json, insights.json, brief.md, helpers.md) | Export & Reporting |
+| `--agent-brief` | string | (empty) | Export agent brief bundle to directory (includes triage.json, insights.json, brief.md, helpers.md, meta.json) | Export & Reporting |
 | `--emit-script` | bool | `false` | Emit shell script for top-N recommendations (agent workflows) | Export & Reporting |
 | `--export` | string | (empty) | Export a report using recipe defaults or explicit export options | Export & Reporting |
 | `--export-format` | string | (empty) | Report format: markdown, html, json, csv or mermaid | Export & Reporting |
 | `--export-graph` | string | (empty) | Export graph: .html for interactive, .png/.svg for static (auto-names if empty) | Export & Reporting |
 | `--export-group-by` | string | (empty) | Group exported issues by: status, priority, type, assignee, label, or none (overrides recipe view.group_by) | Export & Reporting |
+| `--export-include-actions` | bool | `true` | Include recommended action plan in Markdown/HTML reports (explicit false overrides recipe) | Export & Reporting |
 | `--export-include-graph` | bool | `true` | Include dependency context in the report (explicit false overrides recipe) | Export & Reporting |
 | `--export-md` | string | (empty) | Export issues to a Markdown file (e.g., report.md) | Export & Reporting |
 | `--export-pages` | string | (empty) | Export static site to directory (e.g., ./bv-pages) | Export & Reporting |
@@ -3462,7 +3463,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--recipe` | string | (empty) | Apply a recipe by name (e.g., triage, actionable, high-impact) or by .yaml/.yml file path (e.g., .beads/recipes/sprint.yaml) | Search & Filters |
 | `--repo` | string | (empty) | Filter issues by repository prefix (e.g., 'api-' or 'api') | Search & Filters |
 | `--robot-by-assignee` | string | (empty) | Filter --robot-priority recommendations by assignee (exact match) | Search & Filters |
-| `--robot-by-label` | string | (empty) | Filter --robot-priority recommendations by label (exact match); use --label to scope other robot commands | Search & Filters |
+| `--robot-by-label` | string | (empty) | Filter --robot-priority recommendations by label (case-insensitive match); use --label to scope other robot commands | Search & Filters |
 | `--robot-max-results` | int | `0` | Limit robot output count (0 = use defaults) | Search & Filters |
 | `--robot-min-confidence` | float64 | `0` | Filter --robot-priority recommendations by minimum confidence (0.0-1.0) | Search & Filters |
 | `--search` | string | (empty) | Hashed keyword search query (builds/updates index on first run) | Search & Filters |
@@ -4276,7 +4277,7 @@ bv has a comprehensive built-in help system:
 | **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity** | `G` | Go to end |
 |  | `home` | Go to start |
 | **board,tree** | `gg` | Go to start |
-| **list,detail,board,graph,insights,tree,actionable,flow,attention,label,velocity** | `ctrl+d` | Page down |
+| **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity** | `ctrl+d` | Page down |
 |  | `ctrl+u` | Page up |
 | **list,detail,board,graph,insights,actionable,history** | `enter` | Open details |
 | **all** | `esc` | Back/close (list: clear filters) |

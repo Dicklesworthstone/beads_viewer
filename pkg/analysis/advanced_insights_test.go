@@ -3,6 +3,7 @@ package analysis
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1842,5 +1843,106 @@ func TestParallelGain_CandidateScopedAlreadyReadyChildrenNotCountedAsUnblocks(t 
 	}
 	if len(adv.ParallelGain.Metrics) != 0 {
 		t.Fatalf("expected 0 ParallelGain items when non-candidate children were already ready before EPIC-1 closes, got %+v", adv.ParallelGain.Metrics)
+	}
+}
+
+func TestComputeMarginalUnblocksFromBefore_DoesNotMutateCallerMaps(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "B1", Title: "Blocker 1", Status: model.StatusOpen},
+		{ID: "B2", Title: "Blocker 2", Status: model.StatusOpen},
+		{
+			ID: "TARGET", Title: "Co-blocked target", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "TARGET", DependsOnID: "B1", Type: model.DepBlocks},
+				{IssueID: "TARGET", DependsOnID: "B2", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "ALREADY-BEFORE", Title: "Already in before map", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{
+				{IssueID: "ALREADY-BEFORE", DependsOnID: "B2", Type: model.DepBlocks},
+			},
+		},
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+
+	// Case 1: B2 absent from alreadyCompleted; B1=true is already completed.
+	alreadyCompleted := map[string]bool{"B1": true}
+	before := map[string]bool{"ALREADY-BEFORE": true}
+
+	got := an.computeMarginalUnblocksFromBefore("B2", alreadyCompleted, before)
+	// Positive observable: TARGET becomes actionable when B2 completes on top of B1;
+	// Planted negative control: ALREADY-BEFORE is already in `before` and must NOT be returned.
+	if !reflect.DeepEqual(got, []string{"TARGET"}) {
+		t.Fatalf("computeMarginalUnblocksFromBefore = %v, want [TARGET]", got)
+	}
+	if !reflect.DeepEqual(alreadyCompleted, map[string]bool{"B1": true}) {
+		t.Fatalf("caller alreadyCompleted map mutated (absent key case): %v", alreadyCompleted)
+	}
+	if !reflect.DeepEqual(before, map[string]bool{"ALREADY-BEFORE": true}) {
+		t.Fatalf("caller before map mutated: %v", before)
+	}
+
+	// Case 2: B2 explicitly present with false value in alreadyCompleted; must restore B2=false!
+	alreadyWithFalse := map[string]bool{"B1": true, "B2": false}
+	got2 := an.computeMarginalUnblocksFromBefore("B2", alreadyWithFalse, before)
+	if !reflect.DeepEqual(got2, []string{"TARGET"}) {
+		t.Fatalf("computeMarginalUnblocksFromBefore (false key case) = %v, want [TARGET]", got2)
+	}
+	if v, exists := alreadyWithFalse["B2"]; !exists || v {
+		t.Fatalf("caller alreadyWithFalse[B2] mutated: exists=%v val=%v, want exists=true val=false", exists, v)
+	}
+}
+
+func TestGenerateCoverageSet_ExcludesWithheldAndSelfLoops(t *testing.T) {
+	// Planted negative control graph: ONLY self-loops and withheld issues (Ephemeral, Pinned, StatusPinned, IsTemplate).
+	onlyExcluded := []model.Issue{
+		{
+			ID: "SELF", Title: "Self-loop open issue", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "SELF", DependsOnID: "SELF", Type: model.DepBlocks}},
+		},
+		{ID: "OPEN-PEER", Title: "Open peer", Status: model.StatusOpen},
+		{
+			ID: "EPH", Title: "Ephemeral", Status: model.StatusOpen, Ephemeral: true,
+			Dependencies: []*model.Dependency{{IssueID: "EPH", DependsOnID: "OPEN-PEER", Type: model.DepBlocks}},
+		},
+		{
+			ID: "PIN-BOOL", Title: "Pinned bool", Status: model.StatusOpen, Pinned: true,
+			Dependencies: []*model.Dependency{{IssueID: "PIN-BOOL", DependsOnID: "OPEN-PEER", Type: model.DepBlocks}},
+		},
+		{
+			ID: "PIN-STATUS", Title: "Pinned status", Status: " PINNED ",
+			Dependencies: []*model.Dependency{{IssueID: "PIN-STATUS", DependsOnID: "OPEN-PEER", Type: model.DepBlocks}},
+		},
+		{
+			ID: "TPL", Title: "Template", Status: model.StatusOpen, IsTemplate: true,
+			Dependencies: []*model.Dependency{{IssueID: "TPL", DependsOnID: "OPEN-PEER", Type: model.DepBlocks}},
+		},
+	}
+
+	negCov := NewAnalyzer(onlyExcluded).generateCoverageSet(5)
+	if negCov.TotalEdges != 0 || len(negCov.Items) != 0 {
+		t.Fatalf("negative control failed: expected 0 coverage edges for self-loops/withheld issues, got TotalEdges=%d Items=%+v",
+			negCov.TotalEdges, negCov.Items)
+	}
+
+	// Positive observable: add one real open blocking edge SELF -> OPEN-PEER alongside all excluded edges;
+	// TotalEdges must be exactly 1 and covered cleanly without selecting any withheld node.
+	withRealEdge := append([]model.Issue(nil), onlyExcluded...)
+	withRealEdge[0].Dependencies = []*model.Dependency{
+		{IssueID: "SELF", DependsOnID: "SELF", Type: model.DepBlocks},
+		{IssueID: "SELF", DependsOnID: "OPEN-PEER", Type: model.DepBlocks},
+	}
+	posCov := NewAnalyzer(withRealEdge).generateCoverageSet(5)
+	if posCov.TotalEdges != 1 || posCov.EdgesCovered != 1 || len(posCov.Items) != 1 {
+		t.Fatalf("positive coverage failed: TotalEdges=%d EdgesCovered=%d Items=%+v",
+			posCov.TotalEdges, posCov.EdgesCovered, posCov.Items)
+	}
+	picked := posCov.Items[0].ID
+	if picked != "SELF" && picked != "OPEN-PEER" {
+		t.Fatalf("unexpected vertex selected in coverage set: %q", picked)
 	}
 }

@@ -1148,3 +1148,62 @@ func TestAnalyzerMetricsLoader_DeferUntilCrossingInvalidatesHashAndRefreshesStat
 		t.Fatalf("at t2 > DeferUntil: ComponentScores[status] = %v, want 1.0", got)
 	}
 }
+
+func TestAnalyzerMetricsLoader_EphemeralStatusScoreAndReadinessHashInvalidation(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "EPH-OPEN", Title: "Ephemeral open", Status: model.StatusOpen, Ephemeral: true, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "EPH-INPROG", Title: "Ephemeral in_progress", Status: model.StatusInProgress, Ephemeral: true, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "EPH-CLOSED", Title: "Ephemeral closed", Status: model.StatusClosed, Ephemeral: true, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "NORM-OPEN", Title: "Normal open", Status: model.StatusOpen, Ephemeral: false, Priority: 1, CreatedAt: now, UpdatedAt: now},
+	}
+
+	readiness := model.NewReadinessIndex(issues)
+	loader := NewAnalyzerMetricsLoaderWithReadiness(issues, readiness).WithNow(now)
+	cache := NewMetricsCache(loader)
+	weights, err := GetPreset(PresetDefault)
+	if err != nil {
+		t.Fatalf("GetPreset: %v", err)
+	}
+	scorer := NewHybridScorer(weights, cache)
+
+	// Positive observable: Ephemeral=true on open and in_progress scores 0.2 (deferred tier), not 1.0 or 0.8.
+	for _, id := range []string{"EPH-OPEN", "EPH-INPROG"} {
+		sc, err := scorer.Score(id, 0.5)
+		if err != nil {
+			t.Fatalf("Score(%s): %v", id, err)
+		}
+		if got := sc.ComponentScores["status"]; got != 0.2 {
+			t.Fatalf("%s ComponentScores[status] = %v, want 0.2", id, got)
+		}
+	}
+	openSc, err := scorer.Score("NORM-OPEN", 0.5)
+	if err != nil || openSc.ComponentScores["status"] != 1.0 {
+		t.Fatalf("NORM-OPEN ComponentScores[status] = %v (err=%v), want 1.0", openSc.ComponentScores["status"], err)
+	}
+
+	// Planted negative control: Ephemeral=true on closed stays closed (0.1), NOT promoted to deferred (0.2).
+	closedSc, err := scorer.Score("EPH-CLOSED", 0.5)
+	if err != nil {
+		t.Fatalf("Score(EPH-CLOSED): %v", err)
+	}
+	if got := closedSc.ComponentScores["status"]; got != 0.1 {
+		t.Fatalf("negative control failed: EPH-CLOSED ComponentScores[status] = %v, want 0.1", got)
+	}
+
+	// Verify ComputeDataHash() invalidates when Ephemeral flips under NewAnalyzerMetricsLoaderWithReadiness.
+	hBefore, err := loader.ComputeDataHash()
+	if err != nil {
+		t.Fatalf("ComputeDataHash before flip: %v", err)
+	}
+	flipped := append([]model.Issue(nil), issues...)
+	flipped[0].Ephemeral = false // EPH-OPEN -> non-ephemeral
+	loaderAfter := NewAnalyzerMetricsLoaderWithReadiness(flipped, model.NewReadinessIndex(flipped)).WithNow(now)
+	hAfter, err := loaderAfter.ComputeDataHash()
+	if err != nil {
+		t.Fatalf("ComputeDataHash after flip: %v", err)
+	}
+	if hAfter == hBefore {
+		t.Fatalf("ComputeDataHash did not invalidate when Ephemeral flipped: %q", hAfter)
+	}
+}

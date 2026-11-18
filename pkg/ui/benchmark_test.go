@@ -148,11 +148,17 @@ func snapshotSwapFixture(size int) (*Model, [2]*DataSnapshot) {
 	modifiedIssues[len(modifiedIssues)/2].Title += " updated"
 
 	m := NewModel(copyIssues(issues), nil, "")
+	if m.analysis != nil {
+		m.analysis.WaitForPhase2()
+	}
 	snapshots := [2]*DataSnapshot{
 		NewSnapshotBuilder(copyIssues(issues)).Build(),
 		NewSnapshotBuilder(modifiedIssues).Build(),
 	}
 	for _, snapshot := range snapshots {
+		if snapshot.Analysis != nil {
+			snapshot.Analysis.WaitForPhase2()
+		}
 		snapshot.IssueDiff = &analysis.IssueDiff{Modified: []string{modifiedID}}
 	}
 
@@ -181,6 +187,7 @@ func BenchmarkSnapshotSwap(b *testing.B) {
 // layout change), so bound the bytes allocated per swap.
 func TestSnapshotSwapDoesNotCopyModel(t *testing.T) {
 	m, snapshots := snapshotSwapFixture(100)
+	t.Cleanup(func() { m.Stop() })
 	result := testing.Benchmark(func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {

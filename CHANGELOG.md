@@ -302,6 +302,33 @@ every reported vulnerability has an exploitable execution path in bv.
   determinism, tracked-only `ViewerAssetsFS` embed globs, `install.sh` stdin-`curl`
   auth/`vendor/modules.txt`/`FROM_SOURCE=0` hardening, and `flake.nix` `bvVersion`
   alignment).
+- **Wave 16–17 active-subgraph metric isolation, multi-repo `--workspace --as-of`
+  parity, dynamic parent-stopping What-If simulation, TUI `git:` historical/scoped
+  correctness, and installer/updater environment hygiene (`bv-apal.74`..`bv-apal.81`):**
+  eliminate closed/tombstoned hub dominance across priority recommendations,
+  insights, baselines, static SQLite/JSON layouts, SVG/PNG snapshots, and standalone
+  HTML/browser graphs (`ActiveBetweenness`, `ActiveCoreNumber`, `ActiveArticulation`);
+  add single-pass zero-alloc Welford fan variance (`pkg/analysis/risk.go`),
+  `NewReadinessIndexFromMap` `*extra` override, `StatusPinned`/self-loop guards in
+  `generateCoverageSet`, `Baseline.Scope`/`MatchesScope` (skipping mismatched
+  aggregate and baseline-cycle deltas without false `new_cycle` exit codes), bounded
+  chronological `ExtractAllTemporalCorrelations` reopen windows + `GIT_NO_REPLACE_OBJECTS=1`
+  `WaitDelay` git subprocess hygiene, and token-bounded `cass` FTS5 matching;
+  complete `git:` historical TUI isolation (`Ctrl+R`/`F5` guard, `HEAD@{...}`-safe
+  revision parsing, `guiEditorPath`, live->`git:` lock/sprint cleanup), candidate-scoped
+  `FlowMatrixModel` cascades (`ComputeBlockageCascadeAtWithScope`), dynamic historical
+  time-travel candidate evaluation (`LabelFilter`, `RepoFilter`, `WorkspaceInfo.Repos`),
+  and test Phase-2 goroutine cleanup; land `bv-graph-wasm` `parallel_cut_filtered` +
+  single-step `topk_set` chaining, dynamic `parent-child` open-ancestor stopping in
+  arbitrary-target browser What-If (`whatIfClose`, `whatIfCloseBatch`, `allWhatIf`,
+  `performWhatIf`), `ephemeral: 0.2` hybrid search parity across Go/JS/WASM, and
+  `getReferenceNowMs()` timeline anchoring; and wire multi-repo `--workspace --as-of`
+  & `--workspace --diff-since` (auto-discovery, `discovery.enabled`, `.beads/redirect`,
+  cross-repo readiness under `--repo`, per-repo historical correlation SHAs), `--as-of`
+  live correlation-feedback isolation, universal `exitCLI` `--cpu-profile` flushing,
+  `--robot-max-results`/`--limit` list caps, `--export-include-actions`, and
+  `BV_ROBOT`/`BV_OUTPUT_FORMAT`/`GOTOOLCHAIN=local` scrubbing across `pkg/updater`,
+  `install.sh`, and `install.ps1`.
 
 ## v0.26.0 — 2026-11-02
 

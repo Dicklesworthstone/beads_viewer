@@ -2812,3 +2812,239 @@ func TestInteractiveGraph_VendorEmbedDeterminismDeferredAndLightMode(t *testing.
 		t.Fatal("InteractiveGraphHTML did not embed force-graph.min.js from ViewerAssetsFS")
 	}
 }
+
+func TestResolveReportOptionsAndGenerateReport_IncludeActionsPrecedence(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	boolPtr := func(v bool) *bool { return &v }
+	strPtr := func(s string) *string { return &s }
+
+	workDir := t.TempDir()
+	issues := []model.Issue{
+		{
+			ID:        "act-1",
+			Title:     "Actionable Task",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Origin: &model.IssueOrigin{
+				Tracker:          "br",
+				Executable:       "/usr/local/bin/br",
+				Database:         filepath.Join(workDir, ".beads", "beads.db"),
+				TrackerDirectory: filepath.Join(workDir, ".beads"),
+				LocalID:          "act-1",
+				WorkingDirectory: workDir,
+				SupportsClaim:    true,
+			},
+		},
+	}
+	readiness := model.NewReadinessIndex(issues)
+
+	// 1. Recipe defaults.IncludeActions=false suppresses actions when CLI override is nil.
+	optsRecipeFalse, err := ResolveReportOptions(
+		recipe.ExportConfig{IncludeActions: boolPtr(false)},
+		ReportOverrides{},
+	)
+	if err != nil {
+		t.Fatalf("ResolveReportOptions(recipe false): %v", err)
+	}
+	if optsRecipeFalse.IncludeActionPlan || optsRecipeFalse.IncludeActions == nil || *optsRecipeFalse.IncludeActions {
+		t.Fatalf("expected recipe IncludeActions=false to disable actions, got %+v", optsRecipeFalse)
+	}
+	optsRecipeFalse.GeneratedAt = now
+	optsRecipeFalse.Readiness = readiness
+	optsRecipeFalse.AuthorityComplete = true
+	mdDisabled, err := GenerateReport(issues, issues, optsRecipeFalse)
+	if err != nil {
+		t.Fatalf("GenerateReport(recipe false, md): %v", err)
+	}
+	if strings.Contains(string(mdDisabled), "Quick Actions") || strings.Contains(string(mdDisabled), "--status=in_progress") {
+		t.Fatalf("expected Markdown report with recipe IncludeActions=false to omit Quick Actions, got:\n%s", string(mdDisabled))
+	}
+
+	optsRecipeFalseJSON, err := ResolveReportOptions(
+		recipe.ExportConfig{Format: "json", IncludeActions: boolPtr(false)},
+		ReportOverrides{},
+	)
+	if err != nil {
+		t.Fatalf("ResolveReportOptions(recipe false, json): %v", err)
+	}
+	optsRecipeFalseJSON.GeneratedAt = now
+	optsRecipeFalseJSON.Readiness = readiness
+	optsRecipeFalseJSON.AuthorityComplete = true
+	rawDisabledJSON, err := GenerateReport(issues, issues, optsRecipeFalseJSON)
+	if err != nil {
+		t.Fatalf("GenerateReport(recipe false, json): %v", err)
+	}
+	var parsedDisabled struct {
+		Issues []struct {
+			Actions model.IssueActions `json:"actions"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(rawDisabledJSON, &parsedDisabled); err != nil {
+		t.Fatalf("Unmarshal disabled JSON: %v", err)
+	}
+	if len(parsedDisabled.Issues) != 1 || parsedDisabled.Issues[0].Actions.Claim != nil || parsedDisabled.Issues[0].Actions.Show != nil {
+		t.Fatalf("expected JSON actions omitted when recipe IncludeActions=false, got %+v", parsedDisabled.Issues)
+	}
+
+	// 2. Explicit CLI IncludeActions=true overrides recipe IncludeActions=false (positive control).
+	optsOverrideTrue, err := ResolveReportOptions(
+		recipe.ExportConfig{IncludeActions: boolPtr(false)},
+		ReportOverrides{Format: strPtr("json"), IncludeActions: boolPtr(true)},
+	)
+	if err != nil {
+		t.Fatalf("ResolveReportOptions(override true): %v", err)
+	}
+	optsOverrideTrue.GeneratedAt = now
+	optsOverrideTrue.Readiness = readiness
+	optsOverrideTrue.AuthorityComplete = true
+	rawEnabledJSON, err := GenerateReport(issues, issues, optsOverrideTrue)
+	if err != nil {
+		t.Fatalf("GenerateReport(override true, json): %v", err)
+	}
+	var parsedEnabled struct {
+		Issues []struct {
+			Actions model.IssueActions `json:"actions"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(rawEnabledJSON, &parsedEnabled); err != nil {
+		t.Fatalf("Unmarshal enabled JSON: %v", err)
+	}
+	if len(parsedEnabled.Issues) != 1 || parsedEnabled.Issues[0].Actions.Claim == nil || parsedEnabled.Issues[0].Actions.Show == nil {
+		t.Fatalf("expected JSON actions populated when CLI overrides IncludeActions=true, got %+v", parsedEnabled.Issues)
+	}
+
+	optsOverrideTrueMD, err := ResolveReportOptions(
+		recipe.ExportConfig{IncludeActions: boolPtr(false)},
+		ReportOverrides{IncludeActions: boolPtr(true)},
+	)
+	if err != nil {
+		t.Fatalf("ResolveReportOptions(override true, md): %v", err)
+	}
+	optsOverrideTrueMD.GeneratedAt = now
+	optsOverrideTrueMD.Readiness = readiness
+	optsOverrideTrueMD.AuthorityComplete = true
+	mdEnabled, err := GenerateReport(issues, issues, optsOverrideTrueMD)
+	if err != nil {
+		t.Fatalf("GenerateReport(override true, md): %v", err)
+	}
+	if !strings.Contains(string(mdEnabled), "Quick Actions") || !strings.Contains(string(mdEnabled), "--claim") {
+		t.Fatalf("expected Markdown report with override IncludeActions=true to include Quick Actions and --claim, got:\n%s", string(mdEnabled))
+	}
+
+	// 3. Explicit CLI IncludeActions=false overrides recipe IncludeActions=true (negative control).
+	optsOverrideFalse, err := ResolveReportOptions(
+		recipe.ExportConfig{IncludeActions: boolPtr(true)},
+		ReportOverrides{IncludeActions: boolPtr(false)},
+	)
+	if err != nil {
+		t.Fatalf("ResolveReportOptions(override false): %v", err)
+	}
+	if optsOverrideFalse.IncludeActionPlan || optsOverrideFalse.IncludeActions == nil || *optsOverrideFalse.IncludeActions {
+		t.Fatalf("expected explicit IncludeActions=false to override recipe true, got %+v", optsOverrideFalse)
+	}
+}
+
+func TestGenerateMarkdownAndReport_ActiveSubgraphBetweennessAndKCore(t *testing.T) {
+	now := time.Date(2026, 9, 4, 14, 0, 0, 0, time.UTC)
+	closedAt := now
+
+	// Active 3-clique (open-c1, open-c2, open-c3 -> k-core 2) + active bridge (open-leaf -> open-bridge -> open-c1 -> betweenness > 0),
+	// plus a closed 3-clique/bridge (closed-hub bridging closed-a, closed-b, and open-c1) that has positive full-graph betweenness & k-core >= 2!
+	issues := []model.Issue{
+		{ID: "open-c1", Title: "Active Core 1", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "open-c2", Title: "Active Core 2", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "open-c2", DependsOnID: "open-c1", Type: model.DepBlocks}},
+		},
+		{
+			ID: "open-c3", Title: "Active Core 3", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "open-c3", DependsOnID: "open-c1", Type: model.DepBlocks},
+				{IssueID: "open-c3", DependsOnID: "open-c2", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "open-bridge", Title: "Active Bridge", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "open-bridge", DependsOnID: "open-c3", Type: model.DepBlocks}},
+		},
+		{
+			ID: "open-leaf", Title: "Active Leaf", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "open-leaf", DependsOnID: "open-bridge", Type: model.DepBlocks}},
+		},
+		{
+			ID: "closed-hub", Title: "Closed Historical Hub", Status: model.StatusClosed, ClosedAt: &closedAt, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "closed-hub", DependsOnID: "open-c1", Type: model.DepBlocks}},
+		},
+		{
+			ID: "closed-a", Title: "Closed Peer A", Status: model.StatusClosed, ClosedAt: &closedAt, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "closed-a", DependsOnID: "closed-hub", Type: model.DepBlocks},
+				{IssueID: "closed-a", DependsOnID: "open-c1", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "open-after-closed", Title: "Open After Closed Hub", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "open-after-closed", DependsOnID: "closed-hub", Type: model.DepBlocks}},
+		},
+	}
+
+	stats := analysis.NewAnalyzer(issues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	if stats.GetBetweennessScore("closed-hub") <= 0 || stats.CoreNumber()["closed-hub"] < 2 {
+		t.Fatalf("negative control setup invalid: full-graph closed-hub betweenness=%v kcore=%d, want >0 and >=2",
+			stats.GetBetweennessScore("closed-hub"), stats.CoreNumber()["closed-hub"])
+	}
+
+	opts := ReportOptions{
+		Format:       "markdown",
+		IncludeGraph: false,
+		GeneratedAt:  now,
+		Metrics:      []string{"betweenness", "kcore"},
+		GraphStats:   &stats,
+	}
+	md, err := GenerateMarkdown(issues, "Active Metrics Report", opts)
+	if err != nil {
+		t.Fatalf("GenerateMarkdown failed: %v", err)
+	}
+	if !strings.Contains(md, "| closed-hub | Closed Historical Hub | 📋 task | P1 | ⚫ closed | 0.0000 | 0 |") {
+		t.Fatalf("expected closed-hub summary row to render 0.0000 betweenness and 0 kcore, got:\n%s", md)
+	}
+	if !strings.Contains(md, "| open-bridge | Active Bridge | 📋 task | P1 | 🟢 open | 3.0000 | 1 |") {
+		t.Fatalf("expected open-bridge summary row to render active betweenness 3.0000, got:\n%s", md)
+	}
+	if !strings.Contains(md, "| open-c3 | Active Core 3 | 📋 task | P1 | 🟢 open | 4.0000 | 2 |") {
+		t.Fatalf("expected open-c3 summary row to render active betweenness 4.0000 and kcore 2, got:\n%s", md)
+	}
+
+	// Verify exact numeric values via JSON and CSV reports.
+	opts.Format = "json"
+	rawJSON, err := GenerateReport(issues, issues, opts)
+	if err != nil {
+		t.Fatalf("GenerateReport(json) failed: %v", err)
+	}
+	var parsed struct {
+		Issues []struct {
+			ID      string             `json:"id"`
+			Metrics map[string]float64 `json:"metrics"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(rawJSON, &parsed); err != nil {
+		t.Fatalf("Unmarshal JSON report: %v", err)
+	}
+	byID := make(map[string]map[string]float64, len(parsed.Issues))
+	for _, row := range parsed.Issues {
+		byID[row.ID] = row.Metrics
+	}
+	if byID["closed-hub"]["betweenness"] != 0 || byID["closed-hub"]["kcore"] != 0 {
+		t.Fatalf("closed-hub JSON metrics = %+v, want betweenness=0 and kcore=0", byID["closed-hub"])
+	}
+	if byID["open-bridge"]["betweenness"] <= 0 {
+		t.Fatalf("open-bridge JSON metrics = %+v, want active betweenness > 0", byID["open-bridge"])
+	}
+	if byID["open-c1"]["kcore"] != 2 || byID["open-c2"]["kcore"] != 2 || byID["open-c3"]["kcore"] != 2 {
+		t.Fatalf("active 3-clique kcore = (%v, %v, %v), want (2, 2, 2)",
+			byID["open-c1"]["kcore"], byID["open-c2"]["kcore"], byID["open-c3"]["kcore"])
+	}
+}

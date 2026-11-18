@@ -353,9 +353,11 @@ func (l *Lock) acquireMissingLock(lockPath string) {
 	}
 	l.mu.Lock()
 	if l.released {
-		l.mu.Unlock()
 		_ = file.Close()
-		removeLockFileBestEffort(lockPath)
+		if verifyInfo, err := readLockFile(lockPath); err == nil && verifyInfo.PID == ownerPID && verifyInfo.OwnerID == ownerID {
+			removeLockFileBestEffort(lockPath)
+		}
+		l.mu.Unlock()
 		return
 	}
 	l.lockFile = file
@@ -468,6 +470,13 @@ verify:
 	// The lock is enforced by file existence + content, so we don't need to keep
 	// the file open after takeover (it will be closed by the OS on exit anyway).
 	l.mu.Lock()
+	if l.released {
+		if verifyInfo, err := readLockFile(lockPath); err == nil && verifyInfo.PID == ownerPID && verifyInfo.OwnerID == ownerID {
+			removeLockFileBestEffort(lockPath)
+		}
+		l.mu.Unlock()
+		return
+	}
 	l.isFirst = true
 	l.pid = ownerPID
 	l.hostname = hostname

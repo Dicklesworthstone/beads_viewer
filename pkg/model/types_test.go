@@ -1525,3 +1525,175 @@ func TestSprint_IsActiveAt(t *testing.T) {
 		})
 	}
 }
+
+func TestNewReadinessIndexFromMap_ParityOverrideAndEmpty(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+
+	// Nil and empty map edge cases (including extra with empty ID).
+	for _, tc := range []struct {
+		name   string
+		issues map[string]Issue
+		extra  *Issue
+	}{
+		{"nil_map_nil_extra", nil, nil},
+		{"empty_map_nil_extra", map[string]Issue{}, nil},
+		{"nil_map_empty_extra_id", nil, &Issue{ID: "", Status: StatusOpen}},
+		{"empty_map_empty_extra_id", map[string]Issue{}, &Issue{ID: "", Status: StatusClosed}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx := NewReadinessIndexFromMap(tc.issues, tc.extra)
+			if len(idx.ResolvedIDs()) != 0 || idx.Ready("A", now) || idx.Ready("", now) {
+				t.Fatalf("expected empty readiness index for %s", tc.name)
+			}
+		})
+	}
+	// Non-empty map with empty extra.ID must ignore extra without adding "" to ResolvedIDs or Ready.
+	nonEmptyWithBlankExtra := NewReadinessIndexFromMap(
+		map[string]Issue{"A": {ID: "A", Status: StatusOpen}},
+		&Issue{ID: "", Status: StatusClosed},
+	)
+	if !nonEmptyWithBlankExtra.Ready("A", now) || len(nonEmptyWithBlankExtra.ResolvedIDs()) != 0 {
+		t.Fatalf("empty extra.ID polluted non-empty map index: ready(A)=%v resolved=%v",
+			nonEmptyWithBlankExtra.Ready("A", now), nonEmptyWithBlankExtra.ResolvedIDs())
+	}
+
+	// Positive observable vs planted negative control for extra overriding stale map entry.
+	staleMap := map[string]Issue{
+		"BLOCKER": {ID: "BLOCKER", Status: StatusOpen},
+		"TARGET": {
+			ID:     "TARGET",
+			Status: StatusOpen,
+			Dependencies: []*Dependency{
+				{IssueID: "TARGET", DependsOnID: "BLOCKER", Type: DepBlocks},
+			},
+		},
+	}
+
+	// Planted negative control: without extra override, stale map keeps TARGET unsatisfied/unready.
+	negIdx := NewReadinessIndexFromMap(staleMap, nil)
+	if negIdx.Ready("TARGET", now) || negIdx.DependencyState("TARGET") != DependenciesUnsatisfied {
+		t.Fatalf("negative control failed: expected stale TARGET unsatisfied, got state=%q ready=%v",
+			negIdx.DependencyState("TARGET"), negIdx.Ready("TARGET", now))
+	}
+
+	// Positive observable: extra with same ID overrides stale map entry (drops blocker).
+	overrideUnblocked := Issue{ID: "TARGET", Status: StatusOpen}
+	posIdx := NewReadinessIndexFromMap(staleMap, &overrideUnblocked)
+	if !posIdx.Ready("TARGET", now) || posIdx.DependencyState("TARGET") != DependenciesSatisfied {
+		t.Fatalf("positive override failed: expected TARGET satisfied/ready, got state=%q ready=%v",
+			posIdx.DependencyState("TARGET"), posIdx.Ready("TARGET", now))
+	}
+
+	// Reverse override: map has TARGET unblocked, extra overrides TARGET with open blocker.
+	unblockedMap := map[string]Issue{
+		"BLOCKER": {ID: "BLOCKER", Status: StatusOpen},
+		"TARGET":  {ID: "TARGET", Status: StatusOpen},
+	}
+	overrideBlocked := staleMap["TARGET"]
+	revIdx := NewReadinessIndexFromMap(unblockedMap, &overrideBlocked)
+	if revIdx.Ready("TARGET", now) || revIdx.DependencyState("TARGET") != DependenciesUnsatisfied {
+		t.Fatalf("reverse override failed: expected TARGET unsatisfied, got state=%q ready=%v",
+			revIdx.DependencyState("TARGET"), revIdx.Ready("TARGET", now))
+	}
+
+	// 128-graph randomized parity test comparing NewReadinessIndexFromMap vs NewReadinessIndex.
+	rng := rand.New(rand.NewSource(20261118))
+	statuses := []Status{StatusOpen, StatusInProgress, StatusBlocked, StatusClosed, StatusTombstone, StatusDeferred, StatusPinned}
+	types := []IssueType{TypeTask, TypeBug, TypeFeature, TypeEpic}
+	depTypes := []DependencyType{DepBlocks, DepParentChild, DepRelated}
+
+	randomIssue := func(id string, nodePool int) Issue {
+		iss := Issue{
+			ID:         id,
+			Status:     statuses[rng.Intn(len(statuses))],
+			IssueType:  types[rng.Intn(len(types))],
+			Ephemeral:  rng.Intn(6) == 0,
+			Pinned:     rng.Intn(6) == 0,
+			IsTemplate: rng.Intn(6) == 0,
+		}
+		if rng.Intn(3) == 0 {
+			iss.Assignee = "agent-1"
+		}
+		switch rng.Intn(4) {
+		case 0:
+			past := now.Add(-time.Duration(rng.Intn(48)+1) * time.Hour)
+			iss.DeferUntil = &past
+		case 1:
+			future := now.Add(time.Duration(rng.Intn(48)+1) * time.Hour)
+			iss.DeferUntil = &future
+		}
+		depCount := rng.Intn(5)
+		for d := 0; d < depCount; d++ {
+			if rng.Intn(8) == 0 {
+				iss.Dependencies = append(iss.Dependencies, nil)
+				continue
+			}
+			target := fmt.Sprintf("n-%02d", rng.Intn(nodePool+3))
+			iss.Dependencies = append(iss.Dependencies, &Dependency{
+				IssueID:     id,
+				DependsOnID: target,
+				Type:        depTypes[rng.Intn(len(depTypes))],
+			})
+		}
+		return iss
+	}
+
+	for trial := 0; trial < 128; trial++ {
+		n := rng.Intn(24)
+		issueMap := make(map[string]Issue, n)
+		sliceIssues := make([]Issue, 0, n+1)
+		for i := 0; i < n; i++ {
+			id := fmt.Sprintf("n-%02d", i)
+			iss := randomIssue(id, n)
+			issueMap[id] = iss
+			sliceIssues = append(sliceIssues, iss)
+		}
+
+		var extra *Issue
+		switch rng.Intn(3) {
+		case 1: // Extra absent from map
+			ex := randomIssue(fmt.Sprintf("n-%02d", n), n+1)
+			extra = &ex
+			sliceIssues = append(sliceIssues, ex)
+		case 2: // Extra overrides existing map entry (or adds if n==0)
+			targetIdx := 0
+			if n > 0 {
+				targetIdx = rng.Intn(n)
+			}
+			ex := randomIssue(fmt.Sprintf("n-%02d", targetIdx), n+1)
+			extra = &ex
+			sliceIssues = append(sliceIssues, ex) // NewReadinessIndex uses last-row-wins
+		}
+
+		fromMap := NewReadinessIndexFromMap(issueMap, extra)
+		fromSlice := NewReadinessIndex(sliceIssues)
+
+		if !reflect.DeepEqual(fromMap.ResolvedIDs(), fromSlice.ResolvedIDs()) {
+			t.Fatalf("trial=%d ResolvedIDs mismatch: map=%v slice=%v", trial, fromMap.ResolvedIDs(), fromSlice.ResolvedIDs())
+		}
+
+		for q := 0; q <= n+2; q++ {
+			qid := fmt.Sprintf("n-%02d", q)
+			if fromMap.Ready(qid, now) != fromSlice.Ready(qid, now) {
+				t.Fatalf("trial=%d qid=%s Ready mismatch: map=%v slice=%v", trial, qid, fromMap.Ready(qid, now), fromSlice.Ready(qid, now))
+			}
+			if fromMap.Claimable(qid, now) != fromSlice.Claimable(qid, now) {
+				t.Fatalf("trial=%d qid=%s Claimable mismatch", trial, qid)
+			}
+			if fromMap.DependencyState(qid) != fromSlice.DependencyState(qid) {
+				t.Fatalf("trial=%d qid=%s DependencyState mismatch: map=%q slice=%q", trial, qid, fromMap.DependencyState(qid), fromSlice.DependencyState(qid))
+			}
+			if !reflect.DeepEqual(fromMap.Blockers(qid), fromSlice.Blockers(qid)) {
+				t.Fatalf("trial=%d qid=%s Blockers mismatch: map=%v slice=%v", trial, qid, fromMap.Blockers(qid), fromSlice.Blockers(qid))
+			}
+			cand := fmt.Sprintf("n-%02d", q%max(1, n+1))
+			if fromMap.ReadyAfterSingle(qid, now, cand) != fromSlice.ReadyAfterSingle(qid, now, cand) {
+				t.Fatalf("trial=%d qid=%s cand=%s ReadyAfterSingle mismatch", trial, qid, cand)
+			}
+			completed := map[string]bool{cand: true, "n-00": true}
+			if fromMap.ReadyAfter(qid, now, completed) != fromSlice.ReadyAfter(qid, now, completed) {
+				t.Fatalf("trial=%d qid=%s ReadyAfter mismatch", trial, qid)
+			}
+		}
+	}
+}

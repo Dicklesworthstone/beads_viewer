@@ -331,10 +331,12 @@ function getReferenceNowMs() {
 // Graph engine state (WASM)
 const GRAPH_STATE = {
   wasm: null,          // WASM module (bv_graph.js)
-  graph: null,         // Full DiGraph instance (PageRank, Betweenness, HITS, K-core, What-If)
+  graph: null,         // Full DiGraph instance (PageRank, HITS, Eigenvector)
   nodeMap: null,       // Map<string, number> - issue ID to full graph node index
-  activeGraph: null,   // Active-only DiGraph instance (excludes closed/tombstone for cycles, slack, critical path)
+  activeGraph: null,   // Active-only DiGraph instance (excludes closed/tombstone for cycles, slack, critical path, betweenness, k-core, bridges, articulation)
   activeNodeMap: null, // Map<string, number> - active issue ID to activeGraph node index
+  whatIfGraph: null,   // Companion DiGraph for actionable topWhatIf/topK/parallelCut (includes inherited open parent-child gates & readiness withholding)
+  whatIfModel: null,   // Pre-indexed parent-child + blocking readiness model for arbitrary-target whatIfClose / whatIfCloseBatch / allWhatIf
   ready: false,        // true when graph is loaded
 };
 
@@ -487,6 +489,17 @@ function cleanupWasm() {
     }
   }
   WASM_ALLOCATIONS.subgraphs = [];
+
+  // Free the companion what-if graph
+  if (GRAPH_STATE.whatIfGraph && typeof GRAPH_STATE.whatIfGraph.free === 'function') {
+    try {
+      GRAPH_STATE.whatIfGraph.free();
+    } catch (e) {
+      console.warn('[WASM Memory] Error freeing what-if graph:', e);
+    }
+    GRAPH_STATE.whatIfGraph = null;
+  }
+  GRAPH_STATE.whatIfModel = null;
 
   // Free the active graph
   if (GRAPH_STATE.activeGraph && typeof GRAPH_STATE.activeGraph.free === 'function') {
@@ -926,6 +939,20 @@ async function initGraphEngine() {
     // Expose for other modules (e.g., graph.js force-graph view) to reuse.
     window.bvGraphWasm = wasmModule;
 
+    if (GRAPH_STATE.whatIfGraph && typeof GRAPH_STATE.whatIfGraph.free === 'function') {
+      try { GRAPH_STATE.whatIfGraph.free(); } catch {}
+      GRAPH_STATE.whatIfGraph = null;
+    }
+    GRAPH_STATE.whatIfModel = null;
+    if (GRAPH_STATE.activeGraph && typeof GRAPH_STATE.activeGraph.free === 'function') {
+      try { GRAPH_STATE.activeGraph.free(); } catch {}
+      GRAPH_STATE.activeGraph = null;
+    }
+    if (GRAPH_STATE.graph && typeof GRAPH_STATE.graph.free === 'function') {
+      try { GRAPH_STATE.graph.free(); } catch {}
+      GRAPH_STATE.graph = null;
+    }
+
     GRAPH_STATE.wasm = wasmModule;
     GRAPH_STATE.graph = new wasmModule.DiGraph();
     GRAPH_STATE.nodeMap = new Map();
@@ -989,6 +1016,8 @@ async function initGraphEngine() {
       }
     }
 
+    GRAPH_STATE.whatIfGraph = buildCompanionWhatIfGraph(wasmModule, resolvedIds, deps);
+
     GRAPH_STATE.ready = true;
     WASM_STATUS.fallbackMode = false;
     const nodeCount = GRAPH_STATE.graph.nodeCount();
@@ -1018,16 +1047,384 @@ function getResolvedIssueIDs() {
   return ids;
 }
 
+function isTruthyLifecycleFlag(val) {
+  return val === true || val === 'true' || Number(val) > 0;
+}
+
+function isIssueLifecycleWithheld(issue, refNowMs) {
+  if (!issue) return true;
+  const st = String(issue.status || '').trim().toLowerCase();
+  if (st !== 'open' && st !== 'in_progress') return true;
+  if (
+    isTruthyLifecycleFlag(issue.is_template) ||
+    isTruthyLifecycleFlag(issue.pinned) ||
+    isTruthyLifecycleFlag(issue.ephemeral)
+  ) {
+    return true;
+  }
+  if (issue.defer_until) {
+    const deferMs = Date.parse(issue.defer_until);
+    if (Number.isFinite(deferMs) && deferMs > refNowMs) return true;
+  }
+  return false;
+}
+
+function queryIssuesForWhatIf() {
+  const cols = new Set(
+    execQuery('PRAGMA table_info(issues)').map(r => String(r.name || '').toLowerCase())
+  );
+  const selectCols = ['id', 'status'];
+  for (const optionalCol of ['defer_until', 'is_template', 'pinned', 'ephemeral']) {
+    if (cols.has(optionalCol)) selectCols.push(optionalCol);
+  }
+  const map = new Map();
+  for (const row of execQuery(`SELECT ${selectCols.join(', ')} FROM issues ORDER BY id`)) {
+    map.set(row.id, row);
+  }
+  return map;
+}
+
+/**
+ * Build companion DiGraph for what-if / top-k / parallel-cut with identical 0..N-1
+ * indices plus inherited open parent-child prerequisite gates and an optional
+ * unresolved sentinel at index N for missing/cyclic parents or lifecycle-withheld nodes.
+ */
+function buildCompanionWhatIfGraph(wasmModule, resolvedIds, blockingDeps) {
+  const baseGraph = GRAPH_STATE.graph;
+  const realCount = baseGraph.nodeCount();
+  const wg = new wasmModule.DiGraph();
+  for (let i = 0; i < realCount; i++) {
+    wg.addNode(baseGraph.nodeId(i));
+  }
+
+  const directBlockers = Array.from({ length: realCount }, () => []);
+  const directDependents = Array.from({ length: realCount }, () => []);
+  const openParents = Array.from({ length: realCount }, () => []);
+  const openChildren = Array.from({ length: realCount }, () => []);
+  const hasDirectMissingParent = new Uint8Array(realCount);
+  const baseClosed = new Uint8Array(realCount);
+  const lifecycleReady = new Uint8Array(realCount);
+  let hasParentChild = false;
+
+  const directBlockingById = new Map();
+  for (const row of blockingDeps) {
+    const fromIdx = GRAPH_STATE.nodeMap.get(row.issue_id);
+    const toIdx = GRAPH_STATE.nodeMap.get(row.depends_on_id);
+    if (fromIdx === undefined || toIdx === undefined) continue;
+    wg.addEdge(fromIdx, toIdx);
+    directBlockers[fromIdx].push(toIdx);
+    directDependents[toIdx].push(fromIdx);
+    let list = directBlockingById.get(row.issue_id);
+    if (!list) {
+      list = [];
+      directBlockingById.set(row.issue_id, list);
+    }
+    list.push(toIdx);
+  }
+
+  const knownIssues = queryIssuesForWhatIf();
+  const parentChildRows = execQuery(`
+    SELECT issue_id, depends_on_id
+    FROM dependencies
+    WHERE type = 'parent-child'
+    ORDER BY issue_id, depends_on_id
+  `);
+
+  const openParentsById = new Map();
+  const childrenById = new Map();
+  const pendingParents = new Map();
+  const hasMissingParent = new Set();
+
+  for (const id of knownIssues.keys()) {
+    if (!resolvedIds.has(id)) {
+      openParentsById.set(id, []);
+      pendingParents.set(id, 0);
+    }
+  }
+
+  for (const row of parentChildRows) {
+    const childId = row.issue_id;
+    const parentId = row.depends_on_id;
+    if (!childId || resolvedIds.has(childId) || !knownIssues.has(childId)) continue;
+    if (!parentId || resolvedIds.has(parentId)) {
+      // Closed or tombstone parent stops ancestor gate inheritance.
+      continue;
+    }
+    const childIdx = GRAPH_STATE.nodeMap.get(childId);
+    if (!knownIssues.has(parentId)) {
+      hasMissingParent.add(childId);
+      if (childIdx !== undefined && childIdx < realCount) {
+        hasDirectMissingParent[childIdx] = 1;
+        hasParentChild = true;
+      }
+      continue;
+    }
+    hasParentChild = true;
+    const parentIdx = GRAPH_STATE.nodeMap.get(parentId);
+    if (childIdx !== undefined && parentIdx !== undefined && childIdx < realCount && parentIdx < realCount) {
+      openParents[childIdx].push(parentIdx);
+      openChildren[parentIdx].push(childIdx);
+    }
+    openParentsById.get(childId).push(parentId);
+    pendingParents.set(childId, (pendingParents.get(childId) || 0) + 1);
+    let kids = childrenById.get(parentId);
+    if (!kids) {
+      kids = [];
+      childrenById.set(parentId, kids);
+    }
+    kids.push(childId);
+  }
+
+  const inheritedPrereqs = new Map();
+  const inheritedUnknown = new Set();
+  const queue = [];
+  for (const [id, deg] of pendingParents.entries()) {
+    if (deg === 0) queue.push(id);
+  }
+  for (let head = 0; head < queue.length; head++) {
+    const u = queue[head];
+    const reqSet = new Set();
+    let unknown = hasMissingParent.has(u);
+    for (const p of openParentsById.get(u) || []) {
+      if (inheritedUnknown.has(p)) unknown = true;
+      for (const bIdx of directBlockingById.get(p) || []) {
+        reqSet.add(bIdx);
+      }
+      const pInherited = inheritedPrereqs.get(p);
+      if (pInherited) {
+        for (const bIdx of pInherited) reqSet.add(bIdx);
+      }
+    }
+    inheritedPrereqs.set(u, reqSet);
+    if (unknown) inheritedUnknown.add(u);
+
+    for (const childId of childrenById.get(u) || []) {
+      const rem = (pendingParents.get(childId) || 0) - 1;
+      pendingParents.set(childId, rem);
+      if (rem === 0) queue.push(childId);
+    }
+  }
+
+  const refNowMs = getReferenceNowMs();
+  let sentinelIdx = null;
+  const ensureSentinel = () => {
+    if (sentinelIdx === null) {
+      sentinelIdx = wg.addNode('__bv_whatif_unresolved_sentinel__');
+    }
+    return sentinelIdx;
+  };
+
+  for (let idx = 0; idx < realCount; idx++) {
+    const id = baseGraph.nodeId(idx);
+    if (!id) continue;
+    if (resolvedIds.has(id)) {
+      baseClosed[idx] = 1;
+      continue;
+    }
+    const issue = knownIssues.get(id);
+    if (!issue) {
+      wg.addEdge(idx, ensureSentinel());
+      continue;
+    }
+    const withheld = isIssueLifecycleWithheld(issue, refNowMs);
+    if (!withheld) {
+      lifecycleReady[idx] = 1;
+    }
+    const inherited = inheritedPrereqs.get(id);
+    if (inherited) {
+      for (const bIdx of inherited) {
+        wg.addEdge(idx, bIdx);
+      }
+    }
+    const inParentCycle = (pendingParents.get(id) || 0) > 0;
+    if (hasMissingParent.has(id) || inheritedUnknown.has(id) || inParentCycle) {
+      wg.addEdge(idx, ensureSentinel());
+    } else if (withheld) {
+      wg.addEdge(idx, ensureSentinel());
+    }
+  }
+
+  GRAPH_STATE.whatIfModel = {
+    realCount,
+    hasParentChild,
+    baseClosed,
+    lifecycleReady,
+    hasDirectMissingParent,
+    directBlockers,
+    directDependents,
+    openParents,
+    openChildren,
+  };
+
+  return wg;
+}
+
+function createWhatIfDepsEvaluator(model, closedMask) {
+  const memo = new Uint8Array(model.realCount); // 0 = unknown, 1 = satisfied, 2 = unsatisfied
+  const visiting = new Uint8Array(model.realCount);
+
+  function check(cur) {
+    if (closedMask[cur]) return { ok: true, cyclic: false };
+    const cached = memo[cur];
+    if (cached === 1) return { ok: true, cyclic: false };
+    if (cached === 2) return { ok: false, cyclic: false };
+    if (visiting[cur]) return { ok: false, cyclic: true };
+
+    visiting[cur] = 1;
+    let ok = true;
+    let cyclic = false;
+
+    if (model.hasDirectMissingParent[cur]) {
+      ok = false;
+    } else {
+      const blockers = model.directBlockers[cur];
+      for (let i = 0; i < blockers.length; i++) {
+        if (!closedMask[blockers[i]]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        const parents = model.openParents[cur];
+        for (let i = 0; i < parents.length; i++) {
+          const pIdx = parents[i];
+          if (closedMask[pIdx]) continue; // Closed or simulated-closed parent stops inheritance (readiness.go:604)
+          const res = check(pIdx);
+          if (res.cyclic) cyclic = true;
+          if (!res.ok) {
+            ok = false;
+            break;
+          }
+        }
+      }
+    }
+
+    visiting[cur] = 0;
+    if (!cyclic) {
+      memo[cur] = ok ? 1 : 2;
+    }
+    return { ok, cyclic };
+  }
+
+  return nodeIdx => check(nodeIdx).ok;
+}
+
+function evaluateWhatIfReadyMask(model, closedMask) {
+  const ready = new Uint8Array(model.realCount);
+  const depsOk = createWhatIfDepsEvaluator(model, closedMask);
+  for (let i = 0; i < model.realCount; i++) {
+    if (!closedMask[i] && model.lifecycleReady[i] && depsOk(i)) {
+      ready[i] = 1;
+    }
+  }
+  return ready;
+}
+
+function simulateWhatIfCloseIndices(model, targetIndices) {
+  const realCount = model.realCount;
+  const uniqueTargets = [];
+  const seenTargets = new Set();
+  for (const idx of targetIndices) {
+    if (idx === undefined || idx < 0 || idx >= realCount || model.baseClosed[idx] || seenTargets.has(idx)) {
+      continue;
+    }
+    seenTargets.add(idx);
+    uniqueTargets.push(idx);
+  }
+  if (uniqueTargets.length === 0) {
+    return {
+      direct_unblocks: 0,
+      transitive_unblocks: 0,
+      unblocked_ids: [],
+      cascade_ids: [],
+      parallel_gain: 0,
+    };
+  }
+
+  const beforeReady = evaluateWhatIfReadyMask(model, model.baseClosed);
+  const simClosed = new Uint8Array(model.baseClosed);
+  for (const idx of uniqueTargets) {
+    simClosed[idx] = 1;
+  }
+  const afterReady = evaluateWhatIfReadyMask(model, simClosed);
+
+  const unblockedIds = [];
+  for (let u = 0; u < realCount; u++) {
+    if (!simClosed[u] && !beforeReady[u] && afterReady[u]) {
+      unblockedIds.push(u);
+    }
+  }
+
+  const visited = new Uint8Array(realCount);
+  const cascadeIds = [];
+  const queue = [];
+  for (const root of unblockedIds) {
+    visited[root] = 1;
+    cascadeIds.push(root);
+    queue.push(root);
+  }
+
+  for (let head = 0; head < queue.length; head++) {
+    const v = queue[head];
+    simClosed[v] = 1;
+
+    // Collect dependents woken by closing v: direct dependents of v, open children of v,
+    // and open-parent descendant subtrees of both.
+    const candSeen = new Uint8Array(realCount);
+    const expandSubtreeQueue = [];
+    const candidates = [];
+    const enqueueCandidate = x => {
+      if (candSeen[x]) return;
+      candSeen[x] = 1;
+      candidates.push(x);
+      if (!simClosed[x]) {
+        expandSubtreeQueue.push(x);
+      }
+    };
+
+    for (const d of model.directDependents[v]) enqueueCandidate(d);
+    for (const c of model.openChildren[v]) enqueueCandidate(c);
+
+    for (let sHead = 0; sHead < expandSubtreeQueue.length; sHead++) {
+      const p = expandSubtreeQueue[sHead];
+      for (const c of model.openChildren[p]) {
+        enqueueCandidate(c);
+      }
+    }
+
+    if (candidates.length === 0) continue;
+    candidates.sort((a, b) => a - b);
+    const depsOk = createWhatIfDepsEvaluator(model, simClosed);
+    for (const w of candidates) {
+      if (!visited[w] && !simClosed[w] && model.lifecycleReady[w] && depsOk(w)) {
+        visited[w] = 1;
+        cascadeIds.push(w);
+        queue.push(w);
+      }
+    }
+  }
+
+  return {
+    direct_unblocks: unblockedIds.length,
+    transitive_unblocks: cascadeIds.length,
+    unblocked_ids: unblockedIds,
+    cascade_ids: cascadeIds,
+    parallel_gain: Math.max(0, unblockedIds.length - 1),
+  };
+}
+
 /** Return 1 for resolved nodes (closed or tombstone), 0 for unresolved nodes. */
 function buildClosedSet() {
   if (!GRAPH_STATE.ready) return null;
 
-  const n = GRAPH_STATE.graph.nodeCount();
+  const targetGraph = GRAPH_STATE.whatIfGraph || GRAPH_STATE.graph;
+  const n = targetGraph.nodeCount();
+  const realCount = GRAPH_STATE.graph.nodeCount();
   const closed = new Uint8Array(n);
 
   for (const id of getResolvedIssueIDs()) {
     const idx = GRAPH_STATE.nodeMap.get(id);
-    if (idx !== undefined) {
+    if (idx !== undefined && idx < realCount) {
       closed[idx] = 1;
     }
   }
@@ -1035,32 +1432,40 @@ function buildClosedSet() {
   return closed;
 }
 
-function overviewHasTemplatePinnedColumns() {
+function getOverviewColumnSet() {
   try {
-    const cols = new Set(
+    return new Set(
       execQuery('PRAGMA table_info(issue_overview_mv)').map(r => String(r.name || '').toLowerCase())
     );
-    return cols.has('is_template') && cols.has('pinned');
   } catch {
-    return false;
+    return new Set();
   }
+}
+
+function getOverviewWithheldGuardSQL() {
+  const cols = getOverviewColumnSet();
+  let guard = '';
+  if (cols.has('is_template')) guard += ' AND COALESCE(is_template, 0) = 0';
+  if (cols.has('pinned')) guard += ' AND COALESCE(pinned, 0) = 0';
+  if (cols.has('ephemeral')) guard += ' AND COALESCE(ephemeral, 0) = 0';
+  return guard;
 }
 
 /** Restrict selectable issues without marking excluded prerequisites closed. */
 function buildCandidateSet(options = false) {
-  const candidates = new Uint8Array(GRAPH_STATE.graph.nodeCount());
+  const targetGraph = GRAPH_STATE.whatIfGraph || GRAPH_STATE.graph;
+  const realCount = GRAPH_STATE.graph.nodeCount();
+  const candidates = new Uint8Array(targetGraph.nodeCount());
   const actionableOnly = options === true || Boolean(options?.actionableOnly);
   const lifecycleOnly = Boolean(options && typeof options === 'object' && options.lifecycleOnly);
-  const templatePinnedGuard = overviewHasTemplatePinnedColumns()
-    ? ' AND COALESCE(is_template, 0) = 0 AND COALESCE(pinned, 0) = 0'
-    : '';
+  const withheldGuard = getOverviewWithheldGuardSQL();
 
   if (lifecycleOnly) {
     const nowMs = getReferenceNowMs();
     const rows = execQuery(`
       SELECT id, defer_until
       FROM issue_overview_mv
-      WHERE LOWER(status) NOT IN ('closed', 'tombstone', 'deferred', 'draft', 'pinned')${templatePinnedGuard}
+      WHERE LOWER(status) IN ('open', 'in_progress')${withheldGuard}
       ORDER BY id
     `);
     for (const row of rows) {
@@ -1069,7 +1474,7 @@ function buildCandidateSet(options = false) {
         if (Number.isFinite(deferMs) && deferMs > nowMs) continue;
       }
       const idx = GRAPH_STATE.nodeMap.get(row.id);
-      if (idx !== undefined) candidates[idx] = 1;
+      if (idx !== undefined && idx < realCount) candidates[idx] = 1;
     }
     return candidates;
   }
@@ -1080,7 +1485,7 @@ function buildCandidateSet(options = false) {
       SELECT id, defer_until
       FROM issue_overview_mv
       WHERE is_actionable = 1
-        AND LOWER(status) NOT IN ('closed', 'tombstone', 'deferred', 'draft', 'pinned')${templatePinnedGuard}
+        AND LOWER(status) NOT IN ('closed', 'tombstone', 'deferred', 'draft', 'pinned')${withheldGuard}
       ORDER BY id
     `);
     for (const row of rows) {
@@ -1089,17 +1494,17 @@ function buildCandidateSet(options = false) {
         if (Number.isFinite(deferMs) && deferMs > nowMs) continue;
       }
       const idx = GRAPH_STATE.nodeMap.get(row.id);
-      if (idx !== undefined) candidates[idx] = 1;
+      if (idx !== undefined && idx < realCount) candidates[idx] = 1;
     }
     return candidates;
   }
 
   const rows = execQuery(
-    `SELECT id FROM issue_overview_mv WHERE LOWER(status) != 'pinned'${templatePinnedGuard} ORDER BY id`
+    `SELECT id FROM issue_overview_mv WHERE LOWER(status) != 'pinned'${withheldGuard} ORDER BY id`
   );
   for (const { id } of rows) {
     const idx = GRAPH_STATE.nodeMap.get(id);
-    if (idx !== undefined) candidates[idx] = 1;
+    if (idx !== undefined && idx < realCount) candidates[idx] = 1;
   }
   return candidates;
 }
@@ -1108,7 +1513,7 @@ function buildCandidateSet(options = false) {
  * Recalculate graph metrics for a filtered set of issues
  */
 function recalculateMetrics(issueIds) {
-  if (!GRAPH_STATE.ready) return null;
+  if (!GRAPH_STATE.ready || !Array.isArray(issueIds) || issueIds.length === 0) return null;
 
   const start = performance.now();
   const indices = issueIds
@@ -1124,18 +1529,25 @@ function recalculateMetrics(issueIds) {
   const activeMetrics = activeIndices !== null
     ? (activeIndices.length > 0
         ? withSubgraph(activeIndices, sg => {
-            const heights = sg.criticalPathHeights();
-            const heightById = new Map();
             const count = sg.nodeCount();
+            const heights = sg.criticalPathHeights();
+            const bw = count > 500
+              ? sg.betweennessApprox(Math.min(100, count))
+              : sg.betweenness();
+            const heightById = new Map();
+            const betweennessById = new Map();
             for (let i = 0; i < count; i++) {
-              heightById.set(sg.nodeId(i), heights[i] ?? 0);
+              const id = sg.nodeId(i);
+              heightById.set(id, heights[i] ?? 0);
+              betweennessById.set(id, bw[i] ?? 0);
             }
             return {
               hasCycles: sg.hasCycles(),
               heightById,
+              betweennessById,
             };
           }, GRAPH_STATE.activeGraph)
-        : { hasCycles: false, heightById: new Map() })
+        : { hasCycles: false, heightById: new Map(), betweennessById: new Map() })
     : null;
 
   const result = withSubgraph(indices, subgraph => {
@@ -1143,11 +1555,14 @@ function recalculateMetrics(issueIds) {
     const criticalPath = activeMetrics
       ? Float64Array.from({ length: nodeCount }, (_, i) => activeMetrics.heightById.get(subgraph.nodeId(i)) ?? 0)
       : subgraph.criticalPathHeights();
+    const betweenness = activeMetrics
+      ? Float64Array.from({ length: nodeCount }, (_, i) => activeMetrics.betweennessById.get(subgraph.nodeId(i)) ?? 0)
+      : subgraph.betweenness();
     return {
       nodeCount,
       edgeCount: subgraph.edgeCount(),
       pagerank: subgraph.pagerankDefault(),
-      betweenness: subgraph.betweenness(),
+      betweenness,
       hasCycles: activeMetrics ? activeMetrics.hasCycles : subgraph.hasCycles(),
       criticalPath,
     };
@@ -1156,6 +1571,18 @@ function recalculateMetrics(issueIds) {
   const elapsed = performance.now() - start;
   console.log(`[Graph] Recalculated metrics in ${elapsed.toFixed(1)}ms`);
 
+  return result;
+}
+
+function clampWhatIfResult(result, realCount) {
+  if (!result || typeof result !== 'object') return result;
+  const unblockedIds = (result.unblocked_ids || []).filter(i => i < realCount);
+  const cascadeIds = (result.cascade_ids || []).filter(i => i < realCount);
+  result.unblocked_ids = unblockedIds;
+  result.cascade_ids = cascadeIds;
+  result.direct_unblocks = unblockedIds.length;
+  result.transitive_unblocks = cascadeIds.length;
+  result.parallel_gain = Math.max(0, unblockedIds.length - 1);
   return result;
 }
 
@@ -1168,12 +1595,18 @@ function whatIfClose(issueId) {
   const idx = GRAPH_STATE.nodeMap.get(issueId);
   if (idx === undefined) return null;
 
-  const closedSet = buildClosedSet();
-  const result = GRAPH_STATE.graph.whatIfClose(idx, closedSet);
+  const g = GRAPH_STATE.whatIfGraph || GRAPH_STATE.graph;
+  const realCount = GRAPH_STATE.graph.nodeCount();
+  const result = GRAPH_STATE.whatIfModel?.hasParentChild
+    ? simulateWhatIfCloseIndices(GRAPH_STATE.whatIfModel, [idx])
+    : clampWhatIfResult(g.whatIfClose(idx, buildClosedSet()), realCount);
 
   // Convert node indices back to issue IDs
-  if (result && result.cascade_ids) {
-    result.cascade_issue_ids = result.cascade_ids
+  if (result) {
+    result.unblocked_issue_ids = (result.unblocked_ids || [])
+      .map(i => GRAPH_STATE.graph.nodeId(i))
+      .filter(Boolean);
+    result.cascade_issue_ids = (result.cascade_ids || [])
       .map(i => GRAPH_STATE.graph.nodeId(i))
       .filter(Boolean);
   }
@@ -1187,30 +1620,72 @@ function whatIfClose(issueId) {
 function topWhatIf(limit = 10) {
   if (!GRAPH_STATE.ready || limit <= 0) return [];
 
+  const g = GRAPH_STATE.whatIfGraph || GRAPH_STATE.graph;
+  const realCount = GRAPH_STATE.graph.nodeCount();
   const closedSet = buildClosedSet();
-  const results = GRAPH_STATE.graph.topWhatIf(closedSet, limit, buildCandidateSet(true));
+  const results = g.topWhatIf(closedSet, limit, buildCandidateSet(true));
 
   // Enrich with issue IDs
-  return (results || []).map(item => ({
-    ...item,
-    issueId: GRAPH_STATE.graph.nodeId(item.node),
-    isActionable: true,
-    result: item.result,
-  }));
+  return (results || [])
+    .filter(item => item && item.node < realCount)
+    .map(item => {
+      const issueId = GRAPH_STATE.graph.nodeId(item.node);
+      if (!issueId) return null;
+      return {
+        ...item,
+        issueId,
+        isActionable: true,
+        result: clampWhatIfResult(item.result, realCount),
+      };
+    })
+    .filter(Boolean);
 }
 
 /**
  * Get top issues by cascade impact across ALL open issues (including currently blocked issues)
  */
 function allWhatIf(limit = 10) {
-  if (!GRAPH_STATE.ready || limit <= 0 || typeof GRAPH_STATE.graph?.allWhatIf !== 'function') return [];
+  const g = GRAPH_STATE.whatIfGraph || GRAPH_STATE.graph;
+  if (!GRAPH_STATE.ready || limit <= 0 || typeof g?.allWhatIf !== 'function') return [];
 
   try {
+    const realCount = GRAPH_STATE.graph.nodeCount();
     const closedSet = buildClosedSet();
     const visibleIds = new Set(execQuery('SELECT id FROM issue_overview_mv').map(r => r.id));
-    const results = GRAPH_STATE.graph.allWhatIf(closedSet, Math.max(limit * 2, 20));
+
+    if (GRAPH_STATE.whatIfModel?.hasParentChild) {
+      const evaluated = [];
+      for (let node = 0; node < realCount; node++) {
+        if (closedSet[node]) continue;
+        const issueId = GRAPH_STATE.graph.nodeId(node);
+        if (!issueId || !visibleIds.has(issueId)) continue;
+        const simResult = simulateWhatIfCloseIndices(GRAPH_STATE.whatIfModel, [node]);
+        if (simResult.transitive_unblocks <= 0) continue;
+        simResult.unblocked_issue_ids = simResult.unblocked_ids.map(i => GRAPH_STATE.graph.nodeId(i)).filter(Boolean);
+        simResult.cascade_issue_ids = simResult.cascade_ids.map(i => GRAPH_STATE.graph.nodeId(i)).filter(Boolean);
+        evaluated.push({ node, issueId, result: simResult });
+      }
+      evaluated.sort((a, b) =>
+        (b.result.transitive_unblocks - a.result.transitive_unblocks) ||
+        (b.result.direct_unblocks - a.result.direct_unblocks) ||
+        (a.node - b.node)
+      );
+      return evaluated.slice(0, limit).map(item => {
+        const issue = getIssue(item.issueId);
+        return {
+          node: item.node,
+          issueId: item.issueId,
+          isActionable: Boolean(issue?.is_actionable),
+          status: issue?.status || 'open',
+          result: item.result,
+        };
+      });
+    }
+
+    const results = g.allWhatIf(closedSet, Math.max(limit * 2 + 2, 22));
     return (results || [])
       .map(item => {
+        if (!item || item.node >= realCount) return null;
         const issueId = GRAPH_STATE.graph.nodeId(item.node);
         if (!issueId || !visibleIds.has(issueId)) return null;
         const issue = getIssue(issueId);
@@ -1219,7 +1694,7 @@ function allWhatIf(limit = 10) {
           issueId,
           isActionable: Boolean(issue?.is_actionable),
           status: issue?.status || 'open',
-          result: item.result,
+          result: clampWhatIfResult(item.result, realCount),
         };
       })
       .filter(Boolean)
@@ -1234,17 +1709,20 @@ function allWhatIf(limit = 10) {
  * Compute combined cascade impact of closing a batch of issues together
  */
 function whatIfCloseBatch(issueIds = []) {
+  const g = GRAPH_STATE.whatIfGraph || GRAPH_STATE.graph;
   if (!GRAPH_STATE.ready || !Array.isArray(issueIds) || issueIds.length === 0) return null;
-  if (typeof GRAPH_STATE.graph?.whatIfCloseBatch !== 'function') return null;
+  if (!GRAPH_STATE.whatIfModel?.hasParentChild && typeof g?.whatIfCloseBatch !== 'function') return null;
 
   try {
+    const realCount = GRAPH_STATE.graph.nodeCount();
     const indices = issueIds
       .map(id => GRAPH_STATE.nodeMap.get(id))
-      .filter(idx => idx !== undefined);
+      .filter(idx => idx !== undefined && idx < realCount);
     if (indices.length === 0) return null;
 
-    const closedSet = buildClosedSet();
-    const result = GRAPH_STATE.graph.whatIfCloseBatch(new Uint32Array(indices), closedSet);
+    const result = GRAPH_STATE.whatIfModel?.hasParentChild
+      ? simulateWhatIfCloseIndices(GRAPH_STATE.whatIfModel, indices)
+      : clampWhatIfResult(g.whatIfCloseBatch(new Uint32Array(indices), buildClosedSet()), realCount);
     if (result) {
       result.unblocked_issue_ids = (result.unblocked_ids || [])
         .map(i => GRAPH_STATE.graph.nodeId(i))
@@ -1261,7 +1739,7 @@ function whatIfCloseBatch(issueIds = []) {
 }
 
 /**
- * Get parallelism unlockers from WASM parallelCutDefault / parallelCutSuggestions
+ * Get parallelism unlockers from WASM parallelCutFiltered (fallback to parallelCutSuggestions / parallelCutDefault)
  */
 function getParallelCutData(limit = 10) {
   if (!GRAPH_STATE.ready || limit <= 0) {
@@ -1269,15 +1747,24 @@ function getParallelCutData(limit = 10) {
   }
 
   try {
+    const g = GRAPH_STATE.whatIfGraph || GRAPH_STATE.graph;
+    const realCount = GRAPH_STATE.graph.nodeCount();
     const closedSet = buildClosedSet();
-    const raw = (limit === 10 && typeof GRAPH_STATE.graph.parallelCutDefault === 'function')
-      ? GRAPH_STATE.graph.parallelCutDefault(closedSet)
-      : (typeof GRAPH_STATE.graph.parallelCutSuggestions === 'function'
-          ? GRAPH_STATE.graph.parallelCutSuggestions(closedSet, limit)
-          : GRAPH_STATE.graph.parallelCutDefault?.(closedSet));
+    let lifecycleOpenCount = 0;
+    for (let i = 0; i < realCount; i++) {
+      if (!closedSet[i]) lifecycleOpenCount++;
+    }
+    const raw = typeof g.parallelCutFiltered === 'function'
+      ? g.parallelCutFiltered(closedSet, limit, buildCandidateSet(true))
+      : ((limit === 10 && typeof g.parallelCutDefault === 'function')
+          ? g.parallelCutDefault(closedSet)
+          : (typeof g.parallelCutSuggestions === 'function'
+              ? g.parallelCutSuggestions(closedSet, limit)
+              : g.parallelCutDefault?.(closedSet)));
     const visibleIds = new Set(execQuery('SELECT id FROM issue_overview_mv').map(r => r.id));
     const items = (raw?.items || [])
       .map(item => {
+        if (!item || item.node >= realCount) return null;
         const issueId = GRAPH_STATE.graph.nodeId(item.node);
         if (!issueId || !visibleIds.has(issueId)) return null;
         const issue = getIssue(issueId);
@@ -1295,7 +1782,7 @@ function getParallelCutData(limit = 10) {
       .slice(0, limit);
     return {
       items,
-      open_nodes: Number(raw?.open_nodes ?? 0),
+      open_nodes: lifecycleOpenCount,
       current_actionable: Number(raw?.current_actionable ?? 0),
     };
   } catch (e) {
@@ -1305,29 +1792,33 @@ function getParallelCutData(limit = 10) {
 }
 
 /**
- * Get Tarjan bridge cut-edges (critical single-link dependency bottlenecks)
+ * Get Tarjan bridge cut-edges on the active subgraph (critical single-link dependency bottlenecks)
  */
 function getBridgeDependencies(limit = 20) {
-  if (!GRAPH_STATE.ready || limit <= 0 || typeof GRAPH_STATE.graph?.bridges !== 'function') return [];
+  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  if (!GRAPH_STATE.ready || limit <= 0 || typeof activeGraph?.bridges !== 'function') return [];
 
   try {
-    const rawBridges = GRAPH_STATE.graph.bridges();
+    const rawBridges = activeGraph.bridges();
     if (!Array.isArray(rawBridges) || rawBridges.length === 0) return [];
 
+    const resolvedIds = getResolvedIssueIDs();
     const directedEdges = new Set(
       execQuery(`
         SELECT issue_id, depends_on_id
         FROM dependencies
         WHERE COALESCE(type, 'blocks') IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
-      `).map(r => `${r.issue_id}\0${r.depends_on_id}`)
+      `)
+        .filter(r => !resolvedIds.has(r.issue_id) && !resolvedIds.has(r.depends_on_id))
+        .map(r => `${r.issue_id}\0${r.depends_on_id}`)
     );
 
     const bridges = [];
     for (const pair of rawBridges) {
       if (!Array.isArray(pair) || pair.length < 2) continue;
-      const idA = GRAPH_STATE.graph.nodeId(pair[0]);
-      const idB = GRAPH_STATE.graph.nodeId(pair[1]);
-      if (!idA || !idB) continue;
+      const idA = activeGraph.nodeId(pair[0]);
+      const idB = activeGraph.nodeId(pair[1]);
+      if (!idA || !idB || resolvedIds.has(idA) || resolvedIds.has(idB)) continue;
 
       let from = idA;
       let to = idB;
@@ -1436,18 +1927,37 @@ function getCycleBreakSuggestions(limit = 5) {
 function getTopKSet(k = 5) {
   if (!GRAPH_STATE.ready) return null;
 
+  const g = GRAPH_STATE.whatIfGraph || GRAPH_STATE.graph;
+  const realCount = GRAPH_STATE.graph.nodeCount();
   const closedSet = buildClosedSet();
-  const result = GRAPH_STATE.graph.topkSet(closedSet, k, buildCandidateSet(true));
+  const result = g.topkSet(closedSet, k, buildCandidateSet({ lifecycleOnly: true }));
+
+  if (result && k > 0) {
+    const actionableCandidates = buildCandidateSet(true);
+    let actionableCount = 0;
+    for (let i = 0; i < realCount; i++) {
+      if (!closedSet[i] && actionableCandidates[i]) actionableCount++;
+    }
+    result.open_nodes = actionableCount;
+  }
 
   // Enrich with issue IDs
   if (result && result.items) {
-    result.items = result.items.map(item => ({
-      ...item,
-      issueId: GRAPH_STATE.graph.nodeId(item.node),
-      unblocked_issue_ids: (item.unblocked_ids || [])
-        .map(i => GRAPH_STATE.graph.nodeId(i))
-        .filter(Boolean),
-    }));
+    result.items = result.items
+      .filter(item => item && item.node < realCount)
+      .map(item => {
+        const issueId = GRAPH_STATE.graph.nodeId(item.node);
+        if (!issueId) return null;
+        return {
+          ...item,
+          issueId,
+          unblocked_issue_ids: (item.unblocked_ids || [])
+            .filter(i => i < realCount)
+            .map(i => GRAPH_STATE.graph.nodeId(i))
+            .filter(Boolean),
+        };
+      })
+      .filter(Boolean);
   }
 
   return result;
@@ -1810,9 +2320,10 @@ function parseJsonObjectSafe(raw) {
 
 function isIssueOverdue(issue) {
   if (!issue || !issue.due_date) return false;
-  if (issue.status === 'closed' || issue.status === 'tombstone') return false;
+  const st = String(issue.status || '').trim().toLowerCase();
+  if (st === 'closed' || st === 'tombstone') return false;
   const due = new Date(issue.due_date);
-  return !Number.isNaN(due.getTime()) && due.getTime() < Date.now();
+  return !Number.isNaN(due.getTime()) && due.getTime() < getReferenceNowMs();
 }
 
 function isIssueInCycle(id) {
@@ -1927,10 +2438,13 @@ function getGraphViewData() {
   // counts and dependency_state the issues view does — closing a blocker drops
   // its dependents' blocker_count to 0 here too, which getNodeColor uses to
   // derive the effective "blocked" colouring (bv-issue#143/#144).
+  const mvCols = getOverviewColumnSet();
+  const extraCols = ['defer_until', 'is_template', 'pinned', 'ephemeral'].filter(c => mvCols.has(c));
+  const extraSelect = extraCols.length > 0 ? `, ${extraCols.join(', ')}` : '';
   const issues = execQuery(`
     SELECT id, title, description, status, priority, issue_type, assignee, labels,
            created_at, updated_at, closed_at, blocker_count, dependent_count,
-           dependency_state, is_actionable
+           dependency_state, is_actionable${extraSelect}
     FROM issue_overview_mv
   `).map(row => ({
     id: row.id,
@@ -1944,6 +2458,10 @@ function getGraphViewData() {
     created_at: row.created_at,
     updated_at: row.updated_at,
     closed_at: row.closed_at,
+    defer_until: row.defer_until ?? null,
+    is_template: isTruthyLifecycleFlag(row.is_template),
+    pinned: isTruthyLifecycleFlag(row.pinned),
+    ephemeral: isTruthyLifecycleFlag(row.ephemeral),
     // Pre-computed active-blocker / active-dependent counts from the
     // materialized view (which excludes closed/tombstoned endpoints).
     blocker_count: row.blocker_count ?? 0,
@@ -2164,6 +2682,7 @@ function searchIssues(term, options = {}) {
     const isTemplateOrPinned =
       r.is_template === true || r.is_template === 'true' || Number(r.is_template) > 0 ||
       r.pinned === true || r.pinned === 'true' || Number(r.pinned) > 0 ||
+      r.ephemeral === true || r.ephemeral === 'true' || Number(r.ephemeral) > 0 ||
       normStatus === 'pinned';
     const deferUntilMs = r.defer_until ? Date.parse(r.defer_until) : NaN;
     const isFutureDeferred = (normStatus === 'open' || normStatus === 'in_progress') &&
@@ -2580,6 +3099,7 @@ function getTopByTriageScore(limit = 10) {
   return execQuery(`
     SELECT * FROM issue_overview_mv
     WHERE triage_score > 0
+      AND LOWER(status) NOT IN ('closed', 'tombstone')
     ORDER BY triage_score DESC
     LIMIT ?
   `, [limit]);
@@ -2592,19 +3112,20 @@ function getTopBlockers(limit = 10) {
   return execQuery(`
     SELECT * FROM issue_overview_mv
     WHERE blocks_count > 0
+      AND LOWER(status) NOT IN ('closed', 'tombstone')
     ORDER BY blocks_count DESC
     LIMIT ?
   `, [limit]);
 }
 
 /**
- * Rank exported issue rows by full-graph scores. Missing or filtered dependency
- * endpoints remain in the graph, but do not consume the visible issue limit.
+ * Rank exported issue rows by graph scores. Missing or filtered dependency
+ * endpoints and closed/tombstone issues do not consume the visible issue limit.
  */
 function getRankedGraphIssues(values, field, limit, include = () => true, nodeMap = GRAPH_STATE.nodeMap) {
   if (!GRAPH_STATE.ready || !values?.length || !nodeMap || limit <= 0) return [];
 
-  const ranked = execQuery('SELECT id FROM issue_overview_mv ORDER BY id')
+  const ranked = execQuery("SELECT id FROM issue_overview_mv WHERE LOWER(status) NOT IN ('closed', 'tombstone') ORDER BY id")
     .map(({ id }) => ({ id, value: values[nodeMap.get(id)] }))
     .filter(row => row.value !== undefined && include(row.value));
   ranked.sort((a, b) => b.value - a.value);
@@ -2620,11 +3141,13 @@ function getRankedGraphIssues(values, field, limit, include = () => true, nodeMa
  * Get top issues by betweenness centrality (bottlenecks)
  */
 function getTopByBetweenness(limit = 10) {
+  if (limit <= 0) return [];
   // Try betweenness column if it exists
   try {
     const results = execQuery(`
       SELECT * FROM issue_overview_mv
       WHERE betweenness > 0
+        AND LOWER(status) NOT IN ('closed', 'tombstone')
       ORDER BY betweenness DESC
       LIMIT ?
     `, [limit]);
@@ -2633,11 +3156,16 @@ function getTopByBetweenness(limit = 10) {
     // Column may not exist
   }
 
-  // Fallback: use WASM if available
-  if (GRAPH_STATE.ready) {
-    const betweenness = GRAPH_STATE.graph.betweenness();
+  // Fallback: use active WASM graph if available
+  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  const activeMap = GRAPH_STATE.activeNodeMap || GRAPH_STATE.nodeMap;
+  if (GRAPH_STATE.ready && activeGraph) {
+    const count = activeGraph.nodeCount();
+    const betweenness = count > 500
+      ? activeGraph.betweennessApprox(Math.min(100, count))
+      : activeGraph.betweenness();
     if (betweenness && betweenness.length > 0) {
-      return getRankedGraphIssues(betweenness, 'betweenness', limit);
+      return getRankedGraphIssues(betweenness, 'betweenness', limit, () => true, activeMap);
     }
   }
 
@@ -2717,13 +3245,15 @@ function getTopByHITSAuth(limit = 10) {
  * Higher k-core = more tightly coupled with other issues.
  */
 function getTopByKCore(limit = 10) {
-  if (!GRAPH_STATE.ready) return [];
+  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  const activeMap = GRAPH_STATE.activeNodeMap || GRAPH_STATE.nodeMap;
+  if (!GRAPH_STATE.ready || !activeGraph) return [];
 
   try {
-    const kcoreValues = GRAPH_STATE.graph.kcore();
+    const kcoreValues = activeGraph.kcore();
     if (!kcoreValues || kcoreValues.length === 0) return [];
 
-    return getRankedGraphIssues(kcoreValues, 'kcore', limit);
+    return getRankedGraphIssues(kcoreValues, 'kcore', limit, () => true, activeMap);
   } catch (e) {
     console.warn('[viewer] getTopByKCore failed:', e);
     return [];
@@ -2735,18 +3265,22 @@ function getTopByKCore(limit = 10) {
  * Critical structural nodes whose removal would fragment the project.
  */
 function getArticulationPoints() {
-  if (!GRAPH_STATE.ready) return [];
+  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  if (!GRAPH_STATE.ready || !activeGraph) return [];
 
   try {
-    const artPoints = GRAPH_STATE.graph.articulationPoints();
+    const artPoints = activeGraph.articulationPoints();
     if (!artPoints || artPoints.length === 0) return [];
 
+    const resolvedIds = getResolvedIssueIDs();
     return Array.from(artPoints).map(idx => {
-      const id = GRAPH_STATE.graph.nodeId(idx);
+      const id = activeGraph.nodeId(idx);
+      if (!id || resolvedIds.has(id)) return null;
       const issue = getIssue(id);
-      if (issue) {
-        issue.is_articulation = true;
-      }
+      if (!issue) return null;
+      const st = String(issue.status || '').trim().toLowerCase();
+      if (st === 'closed' || st === 'tombstone') return null;
+      issue.is_articulation = true;
       return issue;
     }).filter(Boolean);
   } catch (e) {
@@ -3378,8 +3912,7 @@ function formatDate(isoString) {
     const date = new Date(isoString);
     if (isNaN(date.getTime())) return isoString; // Invalid date
 
-    const now = new Date();
-    const diffMs = now - date;
+    const diffMs = getReferenceNowMs() - date.getTime();
 
     // Future dates or very recent: show absolute date
     if (diffMs < 0) {
@@ -5823,7 +6356,12 @@ window.beadsViewer = {
 
   // Insights helpers
   buildFtsMatchQuery,
+  formatDate,
+  getTopByTriageScore,
+  getTopBlockers,
   getTopByBetweenness,
+  getTopByKCore,
+  getArticulationPoints,
   getTopByCriticalPath,
   getTopByEigenvector,
   getIssuesBySlack,

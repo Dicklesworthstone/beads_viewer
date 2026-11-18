@@ -594,3 +594,139 @@ func TestComputeRiskSignals_ReadinessParentChainPerformanceAndScoped(t *testing.
 		t.Fatalf("expected stale dependency-blocked in_progress issue to have StatusRisk=0.9, got %+v", impactByID["CAND-INPROG-BLK"].Breakdown.RiskSignals)
 	}
 }
+
+func TestComputeFanVariance_WelfordZeroAllocAndNegativeControls(t *testing.T) {
+	stats := &GraphStats{
+		InDegree: map[string]int{
+			"B1":   1,
+			"B2":   9,
+			"B3":   100,
+			"SAME": 4,
+			"ZERO": 0,
+		},
+	}
+
+	// Positive observable: single-pass Welford population variance matches exact CV/2 and allocates 0 heap objects.
+	posIssue := &model.Issue{
+		ID:     "POS",
+		Status: model.StatusOpen,
+		Dependencies: []*model.Dependency{
+			{IssueID: "POS", DependsOnID: "B1", Type: model.DepBlocks},
+			{IssueID: "POS", DependsOnID: "B2", Type: model.DepBlocks},
+		},
+	}
+	// InDegrees [1, 9] -> mean=5, pop variance=16, std=4, cv=0.8, normalized=0.4.
+	got := computeFanVariance(posIssue, stats)
+	if diff := got - 0.4; diff < -1e-12 || diff > 1e-12 {
+		t.Fatalf("computeFanVariance([1, 9]) = %.12f, want 0.4", got)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		if v := computeFanVariance(posIssue, stats); v <= 0 {
+			t.Fatalf("unexpected zero variance: %f", v)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("computeFanVariance allocated %.0f objects; want 0", allocs)
+	}
+
+	// Cap at 1.0 when CV > 2.0 ([0, 0, 100] -> mean=100/3, std=sqrt(2)*100/3 -> cv=sqrt(2)? Use [0,0,0,0,0,100] -> cv=sqrt(5)>2).
+	highSpread := &model.Issue{
+		ID: "CAP",
+		Dependencies: []*model.Dependency{
+			{DependsOnID: "ZERO", Type: model.DepBlocks},
+			{DependsOnID: "ZERO", Type: model.DepBlocks},
+			{DependsOnID: "ZERO", Type: model.DepBlocks},
+			{DependsOnID: "ZERO", Type: model.DepBlocks},
+			{DependsOnID: "ZERO", Type: model.DepBlocks},
+			{DependsOnID: "B3", Type: model.DepBlocks},
+		},
+	}
+	if capGot := computeFanVariance(highSpread, stats); capGot != 1.0 {
+		t.Fatalf("expected CV > 2 to cap at 1.0, got %f", capGot)
+	}
+
+	// Planted negative controls: nil inputs, <2 blocking deps, DepRelated, identical degrees, all-zero degrees.
+	negCases := []struct {
+		name  string
+		issue *model.Issue
+		stats *GraphStats
+	}{
+		{"nil_issue", nil, stats},
+		{"nil_stats", posIssue, nil},
+		{"empty_indegree", posIssue, &GraphStats{}},
+		{"zero_deps", &model.Issue{ID: "Z"}, stats},
+		{"single_blocking_dep", &model.Issue{ID: "S1", Dependencies: []*model.Dependency{
+			{DependsOnID: "B1", Type: model.DepBlocks},
+		}}, stats},
+		{"non_blocking_dep_related_and_nil", &model.Issue{ID: "REL", Dependencies: []*model.Dependency{
+			nil,
+			{DependsOnID: "", Type: model.DepBlocks},
+			{DependsOnID: "B1", Type: model.DepBlocks},
+			{DependsOnID: "B2", Type: model.DepRelated},
+			{DependsOnID: "B3", Type: model.DepParentChild},
+		}}, stats},
+		{"identical_degrees", &model.Issue{ID: "ID", Dependencies: []*model.Dependency{
+			{DependsOnID: "SAME", Type: model.DepBlocks},
+			{DependsOnID: "SAME", Type: model.DepBlocks},
+			{DependsOnID: "SAME", Type: model.DepBlocks},
+		}}, stats},
+		{"all_zero_degrees", &model.Issue{ID: "AZ", Dependencies: []*model.Dependency{
+			{DependsOnID: "ZERO", Type: model.DepBlocks},
+			{DependsOnID: "ZERO", Type: model.DepBlocks},
+		}}, stats},
+	}
+	for _, tc := range negCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if v := computeFanVariance(tc.issue, tc.stats); v != 0 {
+				t.Fatalf("negative control %s returned %f, want 0", tc.name, v)
+			}
+		})
+	}
+}
+
+func TestGenerateRiskExplanation_ZeroToFourFactors(t *testing.T) {
+	// Planted negative control: CompositeRisk < 0.2 returns low-risk message even if a raw field is nonzero.
+	low := generateRiskExplanation(RiskSignals{CompositeRisk: 0.19, FanVariance: 0.9})
+	if low != "Low risk - stable dependency structure" {
+		t.Fatalf("low risk explanation = %q", low)
+	}
+
+	cases := []struct {
+		name    string
+		signals RiskSignals
+		want    string
+	}{
+		{
+			name:    "0_factors_moderate",
+			signals: RiskSignals{CompositeRisk: 0.25, FanVariance: 0.5, ActivityChurn: 0.6, CrossRepoRisk: 0.3, StatusRisk: 0.5},
+			want:    "Moderate risk",
+		},
+		{
+			name:    "1_factor",
+			signals: RiskSignals{CompositeRisk: 0.40, FanVariance: 0.7},
+			want:    "Risk factors: high dependency variance",
+		},
+		{
+			name:    "2_factors",
+			signals: RiskSignals{CompositeRisk: 0.50, FanVariance: 0.7, ActivityChurn: 0.8},
+			want:    "Risk factors: high dependency variance and high activity churn",
+		},
+		{
+			name:    "3_factors",
+			signals: RiskSignals{CompositeRisk: 0.70, FanVariance: 0.7, ActivityChurn: 0.8, CrossRepoRisk: 0.5},
+			want:    "Risk factors: high dependency variance, high activity churn, and cross-repo dependencies",
+		},
+		{
+			name:    "4_factors",
+			signals: RiskSignals{CompositeRisk: 0.90, FanVariance: 0.7, ActivityChurn: 0.8, CrossRepoRisk: 0.5, StatusRisk: 0.9},
+			want:    "Risk factors: high dependency variance, high activity churn, cross-repo dependencies, and status indicates potential blockers",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := generateRiskExplanation(tc.signals); got != tc.want {
+				t.Fatalf("generateRiskExplanation(%s) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}

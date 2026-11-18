@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 )
 
 // gitCommand returns an exec.Cmd for the git binary bound to ctx (issue #166).
@@ -17,7 +20,10 @@ func gitCommand(ctx context.Context, args ...string) *exec.Cmd {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.WaitDelay = time.Second
+	cmd.Env = append(loader.SanitizedGitEnv(), "GIT_NO_REPLACE_OBJECTS=1")
+	return cmd
 }
 
 // validateGitRefArg rejects empty, NUL-containing, or leading-dash revision/SHA

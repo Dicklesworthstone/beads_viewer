@@ -249,6 +249,8 @@ class GraphStore {
         this.graph = null;
         this.wasmGraph = null;
         this.activeWasmGraph = null;
+        this.whatIfWasmGraph = null;
+        this.whatIfModel = null;
         this.wasmReady = false;
         this.container = null;
         this.resizeObserver = null;
@@ -772,7 +774,363 @@ function isRenderableDependency(dependency) {
 }
 
 function isResolvedIssue(issue) {
-    return issue.status === 'closed' || issue.status === 'tombstone';
+    const st = String(issue?.status || '').trim().toLowerCase();
+    return st === 'closed' || st === 'tombstone';
+}
+
+function resolveGraphReferenceNowMs() {
+    const viewerNow = window.beadsViewer?.getReferenceNowMs?.();
+    if (Number.isFinite(viewerNow) && viewerNow > 0) {
+        return viewerNow;
+    }
+    const globalNow = Number(window.BV_REFERENCE_NOW_MS);
+    if (Number.isFinite(globalNow) && globalNow > 0) {
+        return globalNow;
+    }
+    return Date.now();
+}
+
+function isTruthyGraphFlag(val) {
+    return val === true || val === 'true' || Number(val) > 0;
+}
+
+function isGraphIssueLifecycleWithheld(issue, refNowMs) {
+    if (!issue) return true;
+    const st = String(issue.status || 'open').trim().toLowerCase();
+    if (st !== 'open' && st !== 'in_progress') return true;
+    if (
+        isTruthyGraphFlag(issue.is_template) ||
+        isTruthyGraphFlag(issue.pinned) ||
+        isTruthyGraphFlag(issue.ephemeral)
+    ) {
+        return true;
+    }
+    if (issue.defer_until) {
+        const deferMs = Date.parse(issue.defer_until);
+        if (Number.isFinite(deferMs) && deferMs > refNowMs) return true;
+    }
+    return false;
+}
+
+function buildCompanionWhatIfWasmGraph(DiGraph, resolvedIds) {
+    const baseGraph = store.wasmGraph;
+    const realCount = baseGraph.nodeCount();
+    const wg = DiGraph.withCapacity(realCount + 1, store.dependencies.length);
+    for (let i = 0; i < realCount; i++) {
+        wg.addNode(baseGraph.nodeId(i));
+    }
+
+    const directBlockers = Array.from({ length: realCount }, () => []);
+    const directDependents = Array.from({ length: realCount }, () => []);
+    const openParents = Array.from({ length: realCount }, () => []);
+    const openChildren = Array.from({ length: realCount }, () => []);
+    const hasDirectMissingParent = new Uint8Array(realCount);
+    const baseClosed = new Uint8Array(realCount);
+    const lifecycleReady = new Uint8Array(realCount);
+    let hasParentChild = false;
+
+    const directBlockingById = new Map();
+    for (const d of store.dependencies) {
+        if (!isBlockingDependency(d) || !d.issue_id || !d.depends_on_id) continue;
+        const fromIdx = baseGraph.nodeIdx(d.issue_id);
+        const toIdx = baseGraph.nodeIdx(d.depends_on_id);
+        if (fromIdx === undefined || toIdx === undefined) continue;
+        wg.addEdge(fromIdx, toIdx);
+        directBlockers[fromIdx].push(toIdx);
+        directDependents[toIdx].push(fromIdx);
+        let list = directBlockingById.get(d.issue_id);
+        if (!list) {
+            list = [];
+            directBlockingById.set(d.issue_id, list);
+        }
+        list.push(toIdx);
+    }
+
+    const knownIssues = new Map();
+    for (const issue of store.issues) {
+        if (issue && issue.id) knownIssues.set(issue.id, issue);
+    }
+
+    const openParentsById = new Map();
+    const childrenById = new Map();
+    const pendingParents = new Map();
+    const hasMissingParent = new Set();
+
+    for (const id of knownIssues.keys()) {
+        if (!resolvedIds.has(id)) {
+            openParentsById.set(id, []);
+            pendingParents.set(id, 0);
+        }
+    }
+
+    for (const d of store.dependencies) {
+        if (!d || d.type !== 'parent-child') continue;
+        const childId = d.issue_id;
+        const parentId = d.depends_on_id;
+        if (!childId || resolvedIds.has(childId) || !knownIssues.has(childId)) continue;
+        if (!parentId || resolvedIds.has(parentId)) {
+            // Closed or tombstone parent stops ancestor gate inheritance.
+            continue;
+        }
+        const childIdx = baseGraph.nodeIdx(childId);
+        if (!knownIssues.has(parentId)) {
+            hasMissingParent.add(childId);
+            if (childIdx !== undefined && childIdx < realCount) {
+                hasDirectMissingParent[childIdx] = 1;
+                hasParentChild = true;
+            }
+            continue;
+        }
+        hasParentChild = true;
+        const parentIdx = baseGraph.nodeIdx(parentId);
+        if (childIdx !== undefined && parentIdx !== undefined && childIdx < realCount && parentIdx < realCount) {
+            openParents[childIdx].push(parentIdx);
+            openChildren[parentIdx].push(childIdx);
+        }
+        openParentsById.get(childId).push(parentId);
+        pendingParents.set(childId, (pendingParents.get(childId) || 0) + 1);
+        let kids = childrenById.get(parentId);
+        if (!kids) {
+            kids = [];
+            childrenById.set(parentId, kids);
+        }
+        kids.push(childId);
+    }
+
+    const inheritedPrereqs = new Map();
+    const inheritedUnknown = new Set();
+    const queue = [];
+    for (const [id, deg] of pendingParents.entries()) {
+        if (deg === 0) queue.push(id);
+    }
+    for (let head = 0; head < queue.length; head++) {
+        const u = queue[head];
+        const reqSet = new Set();
+        let unknown = hasMissingParent.has(u);
+        for (const p of openParentsById.get(u) || []) {
+            if (inheritedUnknown.has(p)) unknown = true;
+            for (const bIdx of directBlockingById.get(p) || []) {
+                reqSet.add(bIdx);
+            }
+            const pInherited = inheritedPrereqs.get(p);
+            if (pInherited) {
+                for (const bIdx of pInherited) reqSet.add(bIdx);
+            }
+        }
+        inheritedPrereqs.set(u, reqSet);
+        if (unknown) inheritedUnknown.add(u);
+
+        for (const childId of childrenById.get(u) || []) {
+            const rem = (pendingParents.get(childId) || 0) - 1;
+            pendingParents.set(childId, rem);
+            if (rem === 0) queue.push(childId);
+        }
+    }
+
+    const refNowMs = resolveGraphReferenceNowMs();
+    let sentinelIdx = null;
+    const ensureSentinel = () => {
+        if (sentinelIdx === null) {
+            sentinelIdx = wg.addNode('__bv_whatif_unresolved_sentinel__');
+        }
+        return sentinelIdx;
+    };
+
+    for (let idx = 0; idx < realCount; idx++) {
+        const id = baseGraph.nodeId(idx);
+        if (!id) continue;
+        if (resolvedIds.has(id)) {
+            baseClosed[idx] = 1;
+            continue;
+        }
+        const issue = knownIssues.get(id);
+        if (!issue) {
+            wg.addEdge(idx, ensureSentinel());
+            continue;
+        }
+        const withheld = isGraphIssueLifecycleWithheld(issue, refNowMs);
+        if (!withheld) {
+            lifecycleReady[idx] = 1;
+        }
+        const inherited = inheritedPrereqs.get(id);
+        if (inherited) {
+            for (const bIdx of inherited) {
+                wg.addEdge(idx, bIdx);
+            }
+        }
+        const inParentCycle = (pendingParents.get(id) || 0) > 0;
+        if (hasMissingParent.has(id) || inheritedUnknown.has(id) || inParentCycle) {
+            wg.addEdge(idx, ensureSentinel());
+        } else if (withheld) {
+            wg.addEdge(idx, ensureSentinel());
+        }
+    }
+
+    store.whatIfModel = {
+        realCount,
+        hasParentChild,
+        baseClosed,
+        lifecycleReady,
+        hasDirectMissingParent,
+        directBlockers,
+        directDependents,
+        openParents,
+        openChildren,
+    };
+
+    return wg;
+}
+
+function createGraphWhatIfDepsEvaluator(model, closedMask) {
+    const memo = new Uint8Array(model.realCount);
+    const visiting = new Uint8Array(model.realCount);
+
+    function check(cur) {
+        if (closedMask[cur]) return { ok: true, cyclic: false };
+        const cached = memo[cur];
+        if (cached === 1) return { ok: true, cyclic: false };
+        if (cached === 2) return { ok: false, cyclic: false };
+        if (visiting[cur]) return { ok: false, cyclic: true };
+
+        visiting[cur] = 1;
+        let ok = true;
+        let cyclic = false;
+
+        if (model.hasDirectMissingParent[cur]) {
+            ok = false;
+        } else {
+            const blockers = model.directBlockers[cur];
+            for (let i = 0; i < blockers.length; i++) {
+                if (!closedMask[blockers[i]]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                const parents = model.openParents[cur];
+                for (let i = 0; i < parents.length; i++) {
+                    const pIdx = parents[i];
+                    if (closedMask[pIdx]) continue;
+                    const res = check(pIdx);
+                    if (res.cyclic) cyclic = true;
+                    if (!res.ok) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        visiting[cur] = 0;
+        if (!cyclic) {
+            memo[cur] = ok ? 1 : 2;
+        }
+        return { ok, cyclic };
+    }
+
+    return nodeIdx => check(nodeIdx).ok;
+}
+
+function evaluateGraphWhatIfReadyMask(model, closedMask) {
+    const ready = new Uint8Array(model.realCount);
+    const depsOk = createGraphWhatIfDepsEvaluator(model, closedMask);
+    for (let i = 0; i < model.realCount; i++) {
+        if (!closedMask[i] && model.lifecycleReady[i] && depsOk(i)) {
+            ready[i] = 1;
+        }
+    }
+    return ready;
+}
+
+function simulateGraphWhatIfCloseIndices(model, targetIndices) {
+    const realCount = model.realCount;
+    const uniqueTargets = [];
+    const seenTargets = new Set();
+    for (const idx of targetIndices) {
+        if (idx === undefined || idx < 0 || idx >= realCount || model.baseClosed[idx] || seenTargets.has(idx)) {
+            continue;
+        }
+        seenTargets.add(idx);
+        uniqueTargets.push(idx);
+    }
+    if (uniqueTargets.length === 0) {
+        return {
+            direct_unblocks: 0,
+            transitive_unblocks: 0,
+            unblocked_ids: [],
+            cascade_ids: [],
+            parallel_gain: 0,
+        };
+    }
+
+    const beforeReady = evaluateGraphWhatIfReadyMask(model, model.baseClosed);
+    const simClosed = new Uint8Array(model.baseClosed);
+    for (const idx of uniqueTargets) {
+        simClosed[idx] = 1;
+    }
+    const afterReady = evaluateGraphWhatIfReadyMask(model, simClosed);
+
+    const unblockedIds = [];
+    for (let u = 0; u < realCount; u++) {
+        if (!simClosed[u] && !beforeReady[u] && afterReady[u]) {
+            unblockedIds.push(u);
+        }
+    }
+
+    const visited = new Uint8Array(realCount);
+    const cascadeIds = [];
+    const queue = [];
+    for (const root of unblockedIds) {
+        visited[root] = 1;
+        cascadeIds.push(root);
+        queue.push(root);
+    }
+
+    for (let head = 0; head < queue.length; head++) {
+        const v = queue[head];
+        simClosed[v] = 1;
+
+        const candSeen = new Uint8Array(realCount);
+        const expandSubtreeQueue = [];
+        const candidates = [];
+        const enqueueCandidate = x => {
+            if (candSeen[x]) return;
+            candSeen[x] = 1;
+            candidates.push(x);
+            if (!simClosed[x]) {
+                expandSubtreeQueue.push(x);
+            }
+        };
+
+        for (const d of model.directDependents[v]) enqueueCandidate(d);
+        for (const c of model.openChildren[v]) enqueueCandidate(c);
+
+        for (let sHead = 0; sHead < expandSubtreeQueue.length; sHead++) {
+            const p = expandSubtreeQueue[sHead];
+            for (const c of model.openChildren[p]) {
+                enqueueCandidate(c);
+            }
+        }
+
+        if (candidates.length === 0) continue;
+        candidates.sort((a, b) => a - b);
+        const depsOk = createGraphWhatIfDepsEvaluator(model, simClosed);
+        for (const w of candidates) {
+            if (!visited[w] && !simClosed[w] && model.lifecycleReady[w] && depsOk(w)) {
+                visited[w] = 1;
+                cascadeIds.push(w);
+                queue.push(w);
+            }
+        }
+    }
+
+    return {
+        direct_unblocks: unblockedIds.length,
+        transitive_unblocks: cascadeIds.length,
+        unblocked_ids: unblockedIds,
+        cascade_ids: cascadeIds,
+        parallel_gain: Math.max(0, unblockedIds.length - 1),
+    };
 }
 
 function buildWasmGraph() {
@@ -781,6 +1139,11 @@ function buildWasmGraph() {
     try {
         const { DiGraph } = window.bvGraphWasm;
 
+        if (store.whatIfWasmGraph) {
+            store.whatIfWasmGraph.free();
+            store.whatIfWasmGraph = null;
+        }
+        store.whatIfModel = null;
         if (store.wasmGraph) {
             store.wasmGraph.free();
             store.wasmGraph = null;
@@ -825,9 +1188,16 @@ function buildWasmGraph() {
                 }
             });
 
+        store.whatIfWasmGraph = buildCompanionWhatIfWasmGraph(DiGraph, resolvedIds);
+
         console.log(`[bv-graph] WASM graph: ${store.wasmGraph.nodeCount()} nodes, ${store.wasmGraph.edgeCount()} edges (active: ${store.activeWasmGraph.nodeCount()} nodes, ${store.activeWasmGraph.edgeCount()} edges)`);
     } catch (e) {
         console.warn('[bv-graph] Failed to build WASM graph:', e);
+        if (store.whatIfWasmGraph) {
+            try { store.whatIfWasmGraph.free(); } catch {}
+            store.whatIfWasmGraph = null;
+        }
+        store.whatIfModel = null;
         store.wasmGraph = null;
         store.activeWasmGraph = null;
     }
@@ -846,6 +1216,9 @@ function computeMetrics() {
     const activeGraph = store.activeWasmGraph || store.wasmGraph;
 
     try {
+        const fullNodeCount = store.wasmGraph.nodeCount();
+        const activeNodeCount = activeGraph.nodeCount();
+
         // PageRank (importance)
         if (!store.metrics.pagerank) store.metrics.pagerank = store.wasmGraph.pagerankDefault();
 
@@ -855,15 +1228,40 @@ function computeMetrics() {
         // Eigenvector (influence)
         store.metrics.eigenvector = store.wasmGraph.eigenvectorDefault();
 
-        // K-core (cohesion)
-        store.metrics.kcore = store.wasmGraph.kcore();
+        // K-core (cohesion) computed on active subgraph and projected to full graph indices (0 for closed)
+        const projectedKCore = new Uint32Array(fullNodeCount);
+        if (activeNodeCount > 0) {
+            const rawKCore = activeGraph.kcore();
+            if (rawKCore) {
+                for (let aIdx = 0; aIdx < activeNodeCount; aIdx++) {
+                    const id = activeGraph.nodeId(aIdx);
+                    const fullIdx = id ? store.wasmGraph.nodeIdx(id) : undefined;
+                    if (fullIdx !== undefined && fullIdx < fullNodeCount) {
+                        projectedKCore[fullIdx] = rawKCore[aIdx] || 0;
+                    }
+                }
+            }
+        }
+        store.metrics.kcore = projectedKCore;
 
-        // Betweenness (bottleneck) - use approx for large graphs
-        const nodeCount = store.wasmGraph.nodeCount();
-        if (!store.metrics.betweenness && nodeCount > 500) {
-            store.metrics.betweenness = store.wasmGraph.betweennessApprox(Math.min(100, nodeCount));
-        } else if (!store.metrics.betweenness && nodeCount > 0) {
-            store.metrics.betweenness = store.wasmGraph.betweenness();
+        // Betweenness (bottleneck) computed on active subgraph and projected to full graph indices (0 for closed; null when empty)
+        if (!store.metrics.betweenness && fullNodeCount > 0) {
+            const projectedBetweenness = new Float64Array(fullNodeCount);
+            if (activeNodeCount > 0) {
+                const rawBetweenness = activeNodeCount > 500
+                    ? activeGraph.betweennessApprox(Math.min(100, activeNodeCount))
+                    : activeGraph.betweenness();
+                if (rawBetweenness) {
+                    for (let aIdx = 0; aIdx < activeNodeCount; aIdx++) {
+                        const id = activeGraph.nodeId(aIdx);
+                        const fullIdx = id ? store.wasmGraph.nodeIdx(id) : undefined;
+                        if (fullIdx !== undefined && fullIdx < fullNodeCount) {
+                            projectedBetweenness[fullIdx] = rawBetweenness[aIdx] || 0;
+                        }
+                    }
+                }
+            }
+            store.metrics.betweenness = projectedBetweenness;
         }
 
         // HITS (hub and authority scores)
@@ -886,14 +1284,13 @@ function computeMetrics() {
             store.metrics.slack = null;
         }
 
-        // Articulation points (cut vertices - removing them disconnects the graph)
+        // Articulation points (cut vertices on active subgraph - removing them disconnects active work)
         try {
-            const artPoints = store.wasmGraph.articulationPoints();
+            const artPoints = activeGraph.articulationPoints();
             if (artPoints && artPoints.length > 0) {
-                // Convert WASM node indices to issue IDs via wasmGraph.nodeId(idx)
                 store.metrics.articulationPoints = new Set(
                     Array.from(artPoints)
-                        .map(idx => store.wasmGraph.nodeId(idx))
+                        .map(idx => activeGraph.nodeId(idx))
                         .filter(Boolean)
                 );
             } else {
@@ -1160,8 +1557,14 @@ export function loadData(issues, dependencies, layout = null) {
     if (store.wasmReady) {
         buildWasmGraph();
         const centrality = layout?.centralityValues;
+        const hasClosedGraphNodes = Boolean(
+            store.activeWasmGraph &&
+            store.wasmGraph &&
+            store.activeWasmGraph.nodeCount() < store.wasmGraph.nodeCount()
+        );
         if (store.wasmGraph && centrality) {
             for (const name of ['pagerank', 'betweenness']) {
+                if (name === 'betweenness' && hasClosedGraphNodes) continue;
                 if (centrality[name]) {
                     store.metrics[name] = Array.from({length: store.wasmGraph.nodeCount()}, (_, i) => centrality[name][store.wasmGraph.nodeId(i)]);
                     precomputedMetrics.push(name);
@@ -1287,7 +1690,7 @@ function prepareGraphData(layout = null) {
             hitsAuth: idx !== undefined && metrics.hits?.authority ? metrics.hits.authority[idx] : undefined,
             inDegree: idx !== undefined && store.wasmGraph ? store.wasmGraph.inDegree(idx) : dependentCount,
             outDegree: idx !== undefined && store.wasmGraph ? store.wasmGraph.outDegree(idx) : blockerCount,
-            isArticulationPoint: Boolean(metrics.articulationPoints?.has(issue.id)),
+            isArticulationPoint: !isResolvedIssue(issue) && Boolean(metrics.articulationPoints?.has(issue.id)),
             inCycle: false,
 
             // Dependency counts. Prefer the active-blocker count from the
@@ -1892,6 +2295,19 @@ function resolveGraphNodeObject(nodeOrId) {
     return nodeOrId;
 }
 
+function clampGraphWhatIfResult(result, realCount) {
+    if (!result || typeof result !== 'object') return result;
+    const unblockedIds = (result.unblocked_ids || []).filter(i => i < realCount);
+    const cascadeIds = (result.cascade_ids || []).filter(i => i < realCount);
+    return {
+        ...result,
+        unblocked_ids: unblockedIds,
+        cascade_ids: cascadeIds,
+        direct_unblocks: unblockedIds.length,
+        transitive_unblocks: cascadeIds.length,
+    };
+}
+
 /**
  * Perform what-if simulation for closing an issue
  * @param {Object|string} nodeInput - The node (or node ID) to simulate closing
@@ -1912,15 +2328,21 @@ export function performWhatIf(nodeInput) {
     const idx = store.wasmGraph.nodeIdx(node.id);
     if (idx === undefined) return null;
 
-    // Build closed set from current issue states
-    const closedSet = buildClosedSet();
+    const whatIfGraph = store.whatIfWasmGraph || store.wasmGraph;
+    const realCount = store.wasmGraph.nodeCount();
 
-    // Call WASM what-if
+    // Call what-if (dynamic parent-stopping model when parent-child edges exist, else WASM)
     let result;
     try {
-        result = store.wasmGraph.whatIfClose(idx, closedSet);
-        if (typeof result === 'string') {
-            result = JSON.parse(result);
+        if (store.whatIfModel?.hasParentChild) {
+            result = simulateGraphWhatIfCloseIndices(store.whatIfModel, [idx]);
+        } else {
+            const closedSet = buildClosedSet();
+            result = whatIfGraph.whatIfClose(idx, closedSet);
+            if (typeof result === 'string') {
+                result = JSON.parse(result);
+            }
+            result = clampGraphWhatIfResult(result, realCount);
         }
     } catch (e) {
         console.error('[bv-graph] What-if computation failed:', e);
@@ -1964,12 +2386,19 @@ export function performBatchWhatIf(nodesInput) {
         .filter(idx => idx !== undefined);
     if (indices.length === 0) return null;
 
-    const closedSet = buildClosedSet();
+    const whatIfGraph = store.whatIfWasmGraph || store.wasmGraph;
+    const realCount = store.wasmGraph.nodeCount();
     let result;
     try {
-        result = store.wasmGraph.whatIfCloseBatch(new Uint32Array(indices), closedSet);
-        if (typeof result === 'string') {
-            result = JSON.parse(result);
+        if (store.whatIfModel?.hasParentChild) {
+            result = simulateGraphWhatIfCloseIndices(store.whatIfModel, indices);
+        } else {
+            const closedSet = buildClosedSet();
+            result = whatIfGraph.whatIfCloseBatch(new Uint32Array(indices), closedSet);
+            if (typeof result === 'string') {
+                result = JSON.parse(result);
+            }
+            result = clampGraphWhatIfResult(result, realCount);
         }
     } catch (e) {
         console.error('[bv-graph] Batch what-if computation failed:', e);
@@ -1985,13 +2414,15 @@ export function performBatchWhatIf(nodesInput) {
  * Build a boolean array indicating which nodes are already closed
  */
 function buildClosedSet() {
-    const n = store.wasmGraph.nodeCount();
+    const whatIfGraph = store.whatIfWasmGraph || store.wasmGraph;
+    const n = whatIfGraph.nodeCount();
+    const realCount = store.wasmGraph.nodeCount();
     const closedSet = new Uint8Array(n);
 
     store.issues.forEach(issue => {
         if (isResolvedIssue(issue)) {
             const idx = store.wasmGraph.nodeIdx(issue.id);
-            if (idx !== undefined && idx < n) {
+            if (idx !== undefined && idx < realCount) {
                 closedSet[idx] = 1;
             }
         }
@@ -1999,7 +2430,7 @@ function buildClosedSet() {
 
     for (const id of window.beadsViewer?.getResolvedIssueIDs?.() || []) {
         const idx = store.wasmGraph.nodeIdx(id);
-        if (idx !== undefined) closedSet[idx] = 1;
+        if (idx !== undefined && idx < realCount) closedSet[idx] = 1;
     }
 
     return closedSet;
@@ -2021,10 +2452,13 @@ function animateWhatIfCascade(sourceNodesInput, result) {
     whatIfState.sourceNodes = sourceNodes;
     whatIfState.unblockedNodes.clear();
 
+    const realCount = store.wasmGraph ? store.wasmGraph.nodeCount() : 0;
+
     // Get unblocked node IDs
-    const unblockedIds = (result.unblocked_ids || []).map(idx => {
-        return store.wasmGraph.nodeId(idx);
-    }).filter(Boolean);
+    const unblockedIds = (result.unblocked_ids || [])
+        .filter(idx => idx < realCount)
+        .map(idx => store.wasmGraph.nodeId(idx))
+        .filter(Boolean);
 
     // Phase 1: Highlight the source node(s) (pulse green, "closing")
     store.highlightedNodes.clear();
@@ -4066,6 +4500,10 @@ export function getActiveWasmGraph() {
     return store.activeWasmGraph;
 }
 
+export function getWhatIfWasmGraph() {
+    return store.whatIfWasmGraph;
+}
+
 export function isWasmReady() {
     return store.wasmReady;
 }
@@ -4106,6 +4544,11 @@ export function cleanup() {
         tooltipEl.remove();
         tooltipEl = null;
     }
+    if (store.whatIfWasmGraph) {
+        store.whatIfWasmGraph.free();
+        store.whatIfWasmGraph = null;
+    }
+    store.whatIfModel = null;
     if (store.activeWasmGraph) {
         store.activeWasmGraph.free();
         store.activeWasmGraph = null;

@@ -124,6 +124,26 @@ func GenerateInteractiveGraphFilename(projectName string) string {
 	return GenerateInteractiveGraphFilenameWithOpts(projectName, resolveInteractiveExportTime(time.Time{}), "", "")
 }
 
+func isHexGitHash(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeGraphFilenameToken(s string) string {
+	s = strings.ReplaceAll(s, " ", "_")
+	s = strings.ReplaceAll(s, "/", "_")
+	s = strings.ReplaceAll(s, "\\", "_")
+	return s
+}
+
 // GenerateInteractiveGraphFilenameWithOpts creates an auto-generated filename using
 // an explicit export timestamp, git working directory, and optional pre-resolved git hash.
 func GenerateInteractiveGraphFilenameWithOpts(projectName string, exportTime time.Time, workDir, gitHash string) string {
@@ -146,10 +166,16 @@ func GenerateInteractiveGraphFilenameWithOpts(projectName string, exportTime tim
 			}
 		}
 	}
+	if len(gitShort) > 12 && isHexGitHash(gitShort) {
+		gitShort = gitShort[:8]
+	}
+	gitShort = sanitizeGraphFilenameToken(gitShort)
+	if gitShort == "" {
+		gitShort = "nogit"
+	}
 
 	// Clean project name
-	safeName := strings.ReplaceAll(projectName, " ", "_")
-	safeName = strings.ReplaceAll(safeName, "/", "_")
+	safeName := sanitizeGraphFilenameToken(projectName)
 
 	return fmt.Sprintf("%s_graph_export__as_of__%s__%s__git_head_hash__%s.html", safeName, dateStr, timeStr, gitShort)
 }
@@ -165,6 +191,159 @@ func hasClosedOrTombstoneIssues(issues []model.Issue) bool {
 		}
 	}
 	return false
+}
+
+// canReusePrepopulatedActiveStats verifies that stats completed Phase 2 over the
+// exact same issue set and blocking-edge topology, and already carries pre-populated
+// active-subgraph metrics when closed/tombstone issues are present.
+func canReusePrepopulatedActiveStats(
+	stats *analysis.GraphStats,
+	issues []model.Issue,
+	extraDeps []*model.Dependency,
+	wantBW, wantKCore, wantArt bool,
+) bool {
+	if stats == nil || !stats.IsPhase2Ready() || stats.NodeCount == 0 || stats.NodeCount != len(issues) {
+		return false
+	}
+	issueSet := make(map[string]bool, len(issues))
+	closedSet := make(map[string]bool)
+	activeCount := 0
+	for i := range issues {
+		id := issues[i].ID
+		if id == "" || issueSet[id] {
+			return false
+		}
+		issueSet[id] = true
+		if issues[i].Status.IsClosed() || issues[i].Status.IsTombstone() {
+			closedSet[id] = true
+		} else {
+			activeCount++
+		}
+	}
+	if len(issueSet) != stats.NodeCount {
+		return false
+	}
+
+	outDeg := make(map[string]int, len(issues))
+	inDeg := make(map[string]int, len(issues))
+	seenEdge := make(map[[2]string]bool)
+	edgeCount := 0
+	recordEdge := func(fromID, toID string, depType model.DependencyType) bool {
+		if !depType.IsBlocking() || fromID == "" || toID == "" || fromID == toID {
+			return true
+		}
+		if !issueSet[fromID] || !issueSet[toID] {
+			return false
+		}
+		key := [2]string{fromID, toID}
+		if seenEdge[key] {
+			return true
+		}
+		seenEdge[key] = true
+		outDeg[fromID]++
+		inDeg[toID]++
+		edgeCount++
+		return true
+	}
+	for i := range issues {
+		for _, dep := range issues[i].Dependencies {
+			if dep == nil {
+				continue
+			}
+			fromID := dep.IssueID
+			if fromID == "" {
+				fromID = issues[i].ID
+			}
+			if !recordEdge(fromID, dep.DependsOnID, dep.Type) {
+				return false
+			}
+		}
+	}
+	for _, dep := range extraDeps {
+		if dep == nil {
+			continue
+		}
+		if !recordEdge(dep.IssueID, dep.DependsOnID, dep.Type) {
+			return false
+		}
+	}
+	if edgeCount != stats.EdgeCount {
+		return false
+	}
+	for id := range issueSet {
+		sOut, okOut := stats.OutDegree[id]
+		sIn, okIn := stats.InDegree[id]
+		if !okOut || !okIn || sOut != outDeg[id] || sIn != inDeg[id] {
+			return false
+		}
+	}
+
+	status := stats.Status()
+	if wantBW && status.Betweenness.State != "computed" && status.Betweenness.State != "approx" {
+		return false
+	}
+	if wantKCore && status.KCore.State != "computed" {
+		return false
+	}
+	if wantArt && status.Articulation.State != "computed" {
+		return false
+	}
+
+	if len(closedSet) > 0 {
+		if wantBW {
+			bw := stats.ActiveBetweenness()
+			if len(bw) != activeCount {
+				return false
+			}
+			for cid := range closedSet {
+				if _, exists := bw[cid]; exists {
+					return false
+				}
+			}
+		}
+		if wantKCore {
+			core := stats.ActiveCoreNumber()
+			for cid := range closedSet {
+				if _, exists := core[cid]; exists {
+					return false
+				}
+			}
+		}
+		if wantArt {
+			for _, id := range stats.ActiveArticulationPoints() {
+				if closedSet[id] {
+					return false
+				}
+			}
+		}
+	}
+
+	return true
+}
+
+func computeActiveBetweennessRanks(m map[string]float64) map[string]int {
+	if m == nil {
+		return nil
+	}
+	ranks := make(map[string]int, len(m))
+	type kv struct {
+		k string
+		v float64
+	}
+	sorted := make([]kv, 0, len(m))
+	for k, v := range m {
+		sorted = append(sorted, kv{k: k, v: v})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].v == sorted[j].v {
+			return sorted[i].k < sorted[j].k
+		}
+		return sorted[i].v > sorted[j].v
+	})
+	for i, item := range sorted {
+		ranks[item.k] = i + 1
+	}
+	return ranks
 }
 
 func activeSubgraphStatsForIssues(issues []model.Issue, computeBetweenness, computeKCore, computeArticulation bool) *analysis.GraphStats {
@@ -271,7 +450,12 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		inDegree = opts.Stats.InDegree
 		outDegree = opts.Stats.OutDegree
 		if hasClosedOrTombstoneIssues(opts.Issues) {
-			if activeStats := activeSubgraphStatsForIssues(opts.Issues, true, true, true); activeStats != nil {
+			if canReusePrepopulatedActiveStats(opts.Stats, opts.Issues, nil, true, true, true) {
+				betweenness = opts.Stats.ActiveBetweenness()
+				betweennessRank = computeActiveBetweennessRanks(betweenness)
+				coreNumber = opts.Stats.ActiveCoreNumber()
+				articulation = opts.Stats.ActiveArticulationPoints()
+			} else if activeStats := activeSubgraphStatsForIssues(opts.Issues, true, true, true); activeStats != nil {
 				betweenness = activeStats.Betweenness()
 				betweennessRank = activeStats.BetweennessRank()
 				coreNumber = activeStats.CoreNumber()

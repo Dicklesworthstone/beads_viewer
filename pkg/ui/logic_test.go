@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -934,8 +935,10 @@ func TestListKeys_DocumentedViewToggles(t *testing.T) {
 		{ID: "A", Title: "Issue A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"core"}},
 		{ID: "B", Title: "Issue B", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"ui"}, Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}}},
 	}
-	fresh := func() *Model {
+	fresh := func(t *testing.T) *Model {
+		t.Helper()
 		m := NewModel(issues, nil, "")
+		t.Cleanup(m.Stop)
 		m.width, m.height = 120, 40
 		m.focused = focusList
 		return m
@@ -952,7 +955,7 @@ func TestListKeys_DocumentedViewToggles(t *testing.T) {
 	}
 
 	t.Run("a opens the actionable view and toggles back", func(t *testing.T) {
-		m := press(t, fresh(), "a")
+		m := press(t, fresh(t), "a")
 		if !m.isActionableView || m.focused != focusActionable {
 			t.Fatalf("a: actionable=%v focused=%v", m.isActionableView, m.focused)
 		}
@@ -962,7 +965,7 @@ func TestListKeys_DocumentedViewToggles(t *testing.T) {
 		}
 	})
 	t.Run("E opens the tree view", func(t *testing.T) {
-		m := press(t, fresh(), "E")
+		m := press(t, fresh(t), "E")
 		if m.focused != focusTree {
 			t.Fatalf("E: focused=%v; want tree", m.focused)
 		}
@@ -971,13 +974,13 @@ func TestListKeys_DocumentedViewToggles(t *testing.T) {
 		}
 	})
 	t.Run("' opens the recipe picker", func(t *testing.T) {
-		m := press(t, fresh(), "'")
+		m := press(t, fresh(t), "'")
 		if !m.showRecipePicker || m.focused != focusRecipePicker {
 			t.Fatalf("': picker=%v focused=%v", m.showRecipePicker, m.focused)
 		}
 	})
 	t.Run("[ opens the label dashboard", func(t *testing.T) {
-		m := press(t, fresh(), "[")
+		m := press(t, fresh(t), "[")
 		if m.focused != focusLabelDashboard {
 			t.Fatalf("[: focused=%v; want label dashboard", m.focused)
 		}
@@ -995,7 +998,7 @@ func TestListKeys_DocumentedViewToggles(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chdir(wd) })
-		m := press(t, fresh(), "x")
+		m := press(t, fresh(t), "x")
 		if !strings.HasPrefix(m.statusMsg, "✅ Exported") {
 			t.Fatalf("x should export and confirm, status=%q", m.statusMsg)
 		}
@@ -6848,6 +6851,939 @@ func TestWave14TrackB(t *testing.T) {
 		mLoadClick.Update(tea.MouseMsg{X: 5, Y: mLoadClick.listChromeLines() + 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
 		if mLoadClick.list.Index() != 0 {
 			t.Fatalf("[B-6] click during cold-start loading screen mutated list index to %d", mLoadClick.list.Index())
+		}
+	})
+}
+
+func TestTimeTravelCustomBeadsDirMultiRepoWorkspaceAndCandidateScope(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+
+	gitExec := func(t *testing.T, dir string, extraEnv []string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(loader.SanitizedGitEnv(), extraEnv...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, out)
+		}
+	}
+	initGitRepo := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		gitExec(t, dir, nil, "init")
+		gitExec(t, dir, nil, "config", "user.email", "test@example.com")
+		gitExec(t, dir, nil, "config", "user.name", "Test User")
+		return dir
+	}
+
+	// 1. Custom beadsDir (<repo>/custom-beads/issues.jsonl) + candidateIDs + CommitTime/ReferenceNow.
+	repoDir := initGitRepo(t)
+	customBeadsDir := filepath.Join(repoDir, "custom-beads")
+	if err := os.MkdirAll(customBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	customBeadsPath := filepath.Join(customBeadsDir, "issues.jsonl")
+
+	// Commit 1 at 2025-01-10: C-1 (open, deferred until 2025-03-01 -> NOT ready at commit 1!), EXT-1 (non-candidate open).
+	commit1Raw := strings.Join([]string{
+		`{"id":"C-1","title":"Cand one","status":"open","priority":1,"issue_type":"task","defer_until":"2025-03-01T00:00:00Z"}`,
+		`{"id":"EXT-1","title":"Non-cand old","status":"open","priority":2,"issue_type":"task"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(customBeadsPath, []byte(commit1Raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commit1Date := "2025-01-10T09:00:00Z"
+	gitExec(t, repoDir, nil, "add", "custom-beads/issues.jsonl")
+	gitExec(t, repoDir, []string{"GIT_AUTHOR_DATE=" + commit1Date, "GIT_COMMITTER_DATE=" + commit1Date}, "commit", "-m", "commit 1")
+
+	// Commit 2 at 2025-04-01: C-1 closed, C-2 added (open), EXT-1 closed, EXT-2 added (non-candidate).
+	commit2Raw := strings.Join([]string{
+		`{"id":"C-1","title":"Cand one","status":"closed","priority":1,"issue_type":"task"}`,
+		`{"id":"C-2","title":"Cand two","status":"open","priority":1,"issue_type":"task"}`,
+		`{"id":"EXT-1","title":"Non-cand old","status":"closed","priority":2,"issue_type":"task"}`,
+		`{"id":"EXT-2","title":"Non-cand new","status":"open","priority":2,"issue_type":"task"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(customBeadsPath, []byte(commit2Raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	commit2Date := "2025-04-01T09:00:00Z"
+	gitExec(t, repoDir, nil, "add", "custom-beads/issues.jsonl")
+	gitExec(t, repoDir, []string{"GIT_AUTHOR_DATE=" + commit2Date, "GIT_COMMITTER_DATE=" + commit2Date}, "commit", "-m", "commit 2")
+
+	loaded2, err := loader.LoadIssuesFromFile(customBeadsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refNow := time.Date(2025, 4, 15, 12, 0, 0, 0, time.UTC)
+	cands := map[string]bool{"C-1": true, "C-2": true}
+	mCustom := NewModel(copyIssues(loaded2), nil, customBeadsPath, ReadinessScope{
+		Authority:    model.NewReadinessIndex(loaded2),
+		CandidateIDs: cands,
+		ReferenceNow: refNow,
+	})
+	t.Cleanup(mCustom.Stop)
+	mCustom.SetWorkDir(repoDir)
+
+	mCustom.enterTimeTravelMode("HEAD~1")
+	if !mCustom.IsTimeTravelMode() || mCustom.statusIsError {
+		t.Fatalf("enterTimeTravelMode(custom-beads) failed: mode=%v err=%v status=%q",
+			mCustom.IsTimeTravelMode(), mCustom.statusIsError, mCustom.statusMsg)
+	}
+	diff := mCustom.TimeTravelDiff()
+	if diff == nil || diff.Summary.IssuesAdded != 1 || diff.Summary.IssuesClosed != 1 {
+		t.Fatalf("expected candidate-scoped diff (+1 added C-2, +1 closed C-1), got %+v", diff)
+	}
+	if !mCustom.newIssueIDs["C-2"] || mCustom.newIssueIDs["EXT-2"] || !mCustom.closedIssueIDs["C-1"] || mCustom.closedIssueIDs["EXT-1"] {
+		t.Fatalf("candidate filtering leaked non-candidates: new=%v closed=%v", mCustom.newIssueIDs, mCustom.closedIssueIDs)
+	}
+	wantCommit1Time := time.Date(2025, 1, 10, 9, 0, 0, 0, time.UTC)
+	if !diff.FromTimestamp.Equal(wantCommit1Time) || !diff.ToTimestamp.Equal(refNow) {
+		t.Fatalf("expected FromTimestamp=%v (CommitTime) and ToTimestamp=%v (ReferenceNow), got from=%v to=%v",
+			wantCommit1Time, refNow, diff.FromTimestamp, diff.ToTimestamp)
+	}
+
+	// Planted negative control: unscoped model on the same customBeadsPath sees all 2 added and 2 closed issues.
+	mUnscoped := NewModel(copyIssues(loaded2), nil, customBeadsPath, ReadinessScope{ReferenceNow: refNow})
+	t.Cleanup(mUnscoped.Stop)
+	mUnscoped.SetWorkDir(repoDir)
+	mUnscoped.enterTimeTravelMode("HEAD~1")
+	if uDiff := mUnscoped.TimeTravelDiff(); uDiff == nil || uDiff.Summary.IssuesAdded != 2 || uDiff.Summary.IssuesClosed != 2 {
+		t.Fatalf("negative control failed: unscoped custom-beads diff = %+v, want +2 added / +2 closed", uDiff)
+	}
+
+	// 2. Multi-repo workspace time-travel with activeRepos filtering.
+	repoAPI := initGitRepo(t)
+	apiBeads := filepath.Join(repoAPI, ".beads")
+	_ = os.MkdirAll(apiBeads, 0o755)
+	_ = os.WriteFile(filepath.Join(apiBeads, "issues.jsonl"), []byte(`{"id":"1","title":"API base","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644)
+	gitExec(t, repoAPI, nil, "add", ".beads/issues.jsonl")
+	gitExec(t, repoAPI, []string{"GIT_AUTHOR_DATE=" + commit1Date, "GIT_COMMITTER_DATE=" + commit1Date}, "commit", "-m", "api c1")
+	_ = os.WriteFile(filepath.Join(apiBeads, "issues.jsonl"), []byte(
+		`{"id":"1","title":"API base","status":"open","priority":1,"issue_type":"task"}`+"\n"+
+			`{"id":"2","title":"API new","status":"open","priority":1,"issue_type":"task"}`+"\n",
+	), 0o644)
+	gitExec(t, repoAPI, nil, "add", ".beads/issues.jsonl")
+	gitExec(t, repoAPI, []string{"GIT_AUTHOR_DATE=" + commit2Date, "GIT_COMMITTER_DATE=" + commit2Date}, "commit", "-m", "api c2")
+
+	repoWeb := initGitRepo(t)
+	webBeads := filepath.Join(repoWeb, ".beads")
+	_ = os.MkdirAll(webBeads, 0o755)
+	_ = os.WriteFile(filepath.Join(webBeads, "issues.jsonl"), []byte(`{"id":"1","title":"Web base","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644)
+	gitExec(t, repoWeb, nil, "add", ".beads/issues.jsonl")
+	gitExec(t, repoWeb, []string{"GIT_AUTHOR_DATE=" + commit1Date, "GIT_COMMITTER_DATE=" + commit1Date}, "commit", "-m", "web c1")
+	_ = os.WriteFile(filepath.Join(webBeads, "issues.jsonl"), []byte(
+		`{"id":"1","title":"Web base","status":"open","priority":1,"issue_type":"task"}`+"\n"+
+			`{"id":"2","title":"Web new","status":"open","priority":1,"issue_type":"task"}`+"\n",
+	), 0o644)
+	gitExec(t, repoWeb, nil, "add", ".beads/issues.jsonl")
+	gitExec(t, repoWeb, []string{"GIT_AUTHOR_DATE=" + commit2Date, "GIT_COMMITTER_DATE=" + commit2Date}, "commit", "-m", "web c2")
+
+	wsIssues := []model.Issue{
+		{ID: "api-1", Title: "API base", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", Origin: &model.IssueOrigin{LocalID: "1", WorkingDirectory: repoAPI, TrackerDirectory: apiBeads}},
+		{ID: "api-2", Title: "API new", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", Origin: &model.IssueOrigin{LocalID: "2", WorkingDirectory: repoAPI, TrackerDirectory: apiBeads}},
+		{ID: "web-1", Title: "Web base", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "web", Origin: &model.IssueOrigin{LocalID: "1", WorkingDirectory: repoWeb, TrackerDirectory: webBeads}},
+		{ID: "web-2", Title: "Web new", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "web", Origin: &model.IssueOrigin{LocalID: "2", WorkingDirectory: repoWeb, TrackerDirectory: webBeads}},
+	}
+	mWS := NewModel(copyIssues(wsIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+	t.Cleanup(mWS.Stop)
+	mWS.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, TotalIssues: 4, RepoPrefixes: []string{"api-", "web-"}})
+	mWS.activeRepos = map[string]bool{"api": true}
+
+	mWS.enterTimeTravelMode("HEAD~1")
+	wsDiff := mWS.TimeTravelDiff()
+	if !mWS.IsTimeTravelMode() || wsDiff == nil || wsDiff.Summary.IssuesAdded != 1 || !mWS.newIssueIDs["api-2"] || mWS.newIssueIDs["web-2"] {
+		t.Fatalf("expected activeRepos={api} workspace time-travel to report only api-2 (+1), got diff=%+v new=%v status=%q",
+			wsDiff, mWS.newIssueIDs, mWS.statusMsg)
+	}
+
+	// Planted control: clearing activeRepos aggregates both repos (+2 added: api-2 and web-2).
+	mWS.exitTimeTravelMode()
+	mWS.activeRepos = nil
+	mWS.enterTimeTravelMode("HEAD~1")
+	if allDiff := mWS.TimeTravelDiff(); allDiff == nil || allDiff.Summary.IssuesAdded != 2 || !mWS.newIssueIDs["api-2"] || !mWS.newIssueIDs["web-2"] {
+		t.Fatalf("expected unfiltered multi-repo time-travel to report api-2 and web-2 (+2), got diff=%+v new=%v", allDiff, mWS.newIssueIDs)
+	}
+}
+
+func TestScopedLabelViewsFlowMatrixSubgraphPickerAndVelocityExcludeContextIssues(t *testing.T) {
+	refNow := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	closedAt := refNow.Add(-24 * time.Hour)
+
+	issues := []model.Issue{
+		{
+			ID: "CAND-1", Title: "Candidate blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask,
+			Labels: []string{"cand-core"}, CreatedAt: refNow.Add(-5 * 24 * time.Hour), UpdatedAt: refNow.Add(-2 * time.Hour),
+		},
+		{
+			ID: "CAND-2", Title: "Candidate dependent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Labels:    []string{"cand-ui", "cand-core"},
+			CreatedAt: refNow.Add(-4 * 24 * time.Hour), UpdatedAt: refNow.Add(-time.Hour),
+			Dependencies: []*model.Dependency{{IssueID: "CAND-2", DependsOnID: "CAND-1", Type: model.DepBlocks}},
+		},
+		{
+			ID: "CAND-3", Title: "Candidate closed", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask,
+			Labels: []string{"cand-ui"}, CreatedAt: refNow.Add(-6 * 24 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt,
+		},
+		// Non-candidate context issues with disjoint cross-label dependency ghost-db -> ghost-api AND extra node on cand-core:
+		{
+			ID: "GHOST-1", Title: "Context ghost blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask,
+			Labels: []string{"ghost-db"}, CreatedAt: refNow.Add(-5 * 24 * time.Hour), UpdatedAt: refNow.Add(-time.Hour),
+		},
+		{
+			ID: "GHOST-2", Title: "Context ghost dependent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Labels: []string{"ghost-api", "cand-core"}, CreatedAt: refNow.Add(-3 * 24 * time.Hour), UpdatedAt: refNow.Add(-time.Hour),
+			Dependencies: []*model.Dependency{{IssueID: "GHOST-2", DependsOnID: "GHOST-1", Type: model.DepBlocks}},
+		},
+	}
+
+	cands := map[string]bool{"CAND-1": true, "CAND-2": true, "CAND-3": true}
+	auth := model.NewReadinessIndex(issues)
+
+	mScoped := NewModel(copyIssues(issues), nil, "", ReadinessScope{
+		Authority:    auth,
+		CandidateIDs: cands,
+		ReferenceNow: refNow,
+	})
+	t.Cleanup(mScoped.Stop)
+	mScoped.analysis.WaitForPhase2()
+	u, _ := mScoped.Update(tea.WindowSizeMsg{Width: 130, Height: 38})
+	mScoped = u.(*Model)
+
+	// 1. Initial & opened LabelPicker ('l') excludes ghost-db / ghost-api.
+	u, _ = mScoped.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	mScoped = u.(*Model)
+	pickerView := ansi.Strip(mScoped.labelPicker.View())
+	if !strings.Contains(pickerView, "cand-core") || !strings.Contains(pickerView, "cand-ui") {
+		t.Fatalf("scoped labelPicker missing candidate labels:\n%s", pickerView)
+	}
+	if strings.Contains(pickerView, "ghost-db") || strings.Contains(pickerView, "ghost-api") {
+		t.Fatalf("scoped labelPicker leaked non-candidate labels:\n%s", pickerView)
+	}
+	u, _ = mScoped.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mScoped = u.(*Model)
+
+	// 2. LabelDashboard ('['), VelocityComparison ('v'), LabelHealthDetail ('h'), and LabelSubgraph ('enter' -> 'g').
+	u, _ = mScoped.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[")})
+	mScoped = u.(*Model)
+	if mScoped.labelHealthCache.TotalLabels != 2 {
+		t.Fatalf("scoped LabelDashboard TotalLabels = %d, want 2 (cand-core, cand-ui)", mScoped.labelHealthCache.TotalLabels)
+	}
+	dashView := ansi.Strip(mScoped.View())
+	if strings.Contains(dashView, "ghost-db") || strings.Contains(dashView, "ghost-api") {
+		t.Fatalf("scoped LabelDashboard leaked ghost labels:\n%s", dashView)
+	}
+
+	// Cross-flows on cand-core must NOT include GHOST-1(ghost-db) -> GHOST-2(cand-core) since neither endpoint is in candidateIDs!
+	coreFlow := mScoped.getCrossFlowsForLabel("cand-core")
+	for _, inc := range coreFlow.Incoming {
+		if inc.Label == "ghost-db" {
+			t.Fatalf("scoped getCrossFlowsForLabel(cand-core) leaked non-candidate edge from ghost-db: %+v", coreFlow)
+		}
+	}
+
+	// VelocityComparison ('v')
+	u, _ = mScoped.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("v")})
+	mScoped = u.(*Model)
+	if mScoped.velocityComparison.DataCount() != 2 {
+		t.Fatalf("scoped VelocityComparison DataCount = %d, want 2", mScoped.velocityComparison.DataCount())
+	}
+	u, _ = mScoped.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mScoped = u.(*Model)
+
+	// Open drilldown on cand-core and press 'g' for LabelSubgraph: GHOST-2 must be excluded from Subgraph!
+	mScoped.showLabelDrilldown = true
+	mScoped.labelDrilldownLabel = "cand-core"
+	mScoped.labelDrilldownIssues = mScoped.filterIssuesByLabel("cand-core")
+	u, _ = mScoped.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	mScoped = u.(*Model)
+	if mScoped.labelGraphAnalysisResult == nil {
+		t.Fatal("expected labelGraphAnalysisResult after 'g' in drilldown")
+	}
+	for _, id := range mScoped.labelGraphAnalysisResult.Subgraph.CoreIssues {
+		if id == "GHOST-2" {
+			t.Fatalf("scoped ComputeLabelSubgraph leaked non-candidate GHOST-2 into CoreIssues: %v", mScoped.labelGraphAnalysisResult.Subgraph.CoreIssues)
+		}
+	}
+	mScoped.showLabelGraphAnalysis = false
+	mScoped.showLabelDrilldown = false
+	mScoped.focused = focusList
+
+	// 3. AttentionView (']') excludes ghost-db / ghost-api.
+	u, _ = mScoped.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("]")})
+	mScoped = u.(*Model)
+	if mScoped.attentionView.Len() != 2 {
+		t.Fatalf("scoped AttentionView Len = %d, want 2", mScoped.attentionView.Len())
+	}
+	u, _ = mScoped.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mScoped = u.(*Model)
+
+	// 4. FlowMatrix ('f' + refreshFlowMatrix) uses ComputeCrossLabelFlowWithScope and ComputeBlockageCascadeAtWithScope,
+	// excluding ghost-db -> ghost-api AND non-candidate GHOST-2 from cand-core's cascade count.
+	u, _ = mScoped.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+	mScoped = u.(*Model)
+	for _, st := range mScoped.flowMatrix.labelStats {
+		if st.Label == "ghost-db" || st.Label == "ghost-api" {
+			t.Fatalf("scoped FlowMatrix leaked non-candidate label %q: %+v", st.Label, mScoped.flowMatrix.labelStats)
+		}
+	}
+	scopedCascade := mScoped.flowMatrix.cascade.GetCascadeForLabel("cand-core")
+	if scopedCascade == nil || scopedCascade.BlockedCount != 1 {
+		t.Fatalf("scoped FlowMatrix cand-core cascade = %+v, want BlockedCount=1 (excluding GHOST-2)", scopedCascade)
+	}
+	scopedFlowView := ansi.Strip(mScoped.flowMatrix.View())
+	if !strings.Contains(scopedFlowView, "Blocked in cand-core: 1") || strings.Contains(scopedFlowView, "Blocked in cand-core: 2") || strings.Contains(scopedFlowView, "GHOST-2") {
+		t.Fatalf("scoped FlowMatrix View() leaked non-candidate GHOST-2 into cascade:\n%s", scopedFlowView)
+	}
+	mScoped.refreshFlowMatrix()
+	for _, st := range mScoped.flowMatrix.labelStats {
+		if st.Label == "ghost-db" || st.Label == "ghost-api" {
+			t.Fatalf("scoped refreshFlowMatrix leaked non-candidate label %q", st.Label)
+		}
+	}
+	if refreshedCascade := mScoped.flowMatrix.cascade.GetCascadeForLabel("cand-core"); refreshedCascade == nil || refreshedCascade.BlockedCount != 1 {
+		t.Fatalf("scoped refreshFlowMatrix cand-core cascade = %+v, want BlockedCount=1", refreshedCascade)
+	}
+
+	// Planted negative control: unscoped Model includes all 4 labels and counts GHOST-2 in cand-core cascade (BlockedCount == 2).
+	mUnscoped := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: refNow})
+	t.Cleanup(mUnscoped.Stop)
+	mUnscoped.analysis.WaitForPhase2()
+	uUn, _ := mUnscoped.Update(tea.WindowSizeMsg{Width: 130, Height: 38})
+	mUnscoped = uUn.(*Model)
+	uUn, _ = mUnscoped.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[")})
+	mUnscoped = uUn.(*Model)
+	if mUnscoped.labelHealthCache.TotalLabels != 4 {
+		t.Fatalf("negative control failed: unscoped LabelDashboard TotalLabels = %d, want 4", mUnscoped.labelHealthCache.TotalLabels)
+	}
+	uUn, _ = mUnscoped.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mUnscoped = uUn.(*Model)
+	uUn, _ = mUnscoped.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+	mUnscoped = uUn.(*Model)
+	foundGhostFlow := false
+	for _, st := range mUnscoped.flowMatrix.labelStats {
+		if st.Label == "ghost-db" {
+			foundGhostFlow = true
+		}
+	}
+	if !foundGhostFlow {
+		t.Fatalf("negative control failed: unscoped FlowMatrix missing ghost-db: %+v", mUnscoped.flowMatrix.labelStats)
+	}
+	if unscopedCascade := mUnscoped.flowMatrix.cascade.GetCascadeForLabel("cand-core"); unscopedCascade == nil || unscopedCascade.BlockedCount != 2 {
+		t.Fatalf("negative control failed: unscoped FlowMatrix cand-core cascade = %+v, want BlockedCount=2 (CAND-2 + GHOST-2)", unscopedCascade)
+	}
+}
+
+func TestSprintsReloadAsOfGraphSizingClipboardAndExportMetadata(t *testing.T) {
+	refNow := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+
+	t.Run("SetSprints_SetAsOfRevision_SourceReloadSprints_and_reloadSprintsFromDisk_fallback", func(t *testing.T) {
+		dir := t.TempDir()
+		beadsDir := filepath.Join(dir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+		if err := os.WriteFile(beadsPath, []byte(`{"id":"SP-1","title":"Sprint task","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// Write single-repo sprints.jsonl on disk with DISK-ONLY sprint to prove SourceReloadResult{SprintsLoaded: true} wins!
+		sprintsPath := filepath.Join(beadsDir, "sprints.jsonl")
+		diskSprintJSON := `{"id":"disk-sprint","name":"Single Repo Disk Sprint","start_date":"2026-07-01T00:00:00Z","end_date":"2026-07-20T00:00:00Z","bead_ids":["SP-1"]}` + "\n"
+		if err := os.WriteFile(sprintsPath, []byte(diskSprintJSON), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		issues := []model.Issue{{ID: "SP-1", Title: "Sprint task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow}}
+		m := NewModel(copyIssues(issues), nil, beadsPath, ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+
+		// 1. SetSprints clones BeadIDs, selects active sprint at refNow, and clears sprintViewText when emptied outside sprint view.
+		callerIDs := []string{"SP-1"}
+		sActive := model.Sprint{ID: "ws-active", Name: "Active WS Sprint", StartDate: refNow.Add(-24 * time.Hour), EndDate: refNow.Add(5 * 24 * time.Hour), BeadIDs: callerIDs}
+		sFuture := model.Sprint{ID: "ws-future", Name: "Future WS Sprint", StartDate: refNow.Add(10 * 24 * time.Hour), EndDate: refNow.Add(20 * 24 * time.Hour), BeadIDs: []string{"SP-1"}}
+		m.SetSprints([]model.Sprint{sFuture, sActive})
+		callerIDs[0] = "MUTATED"
+		if m.selectedSprint == nil || m.selectedSprint.ID != "ws-active" || m.sprints[1].BeadIDs[0] != "SP-1" {
+			t.Fatalf("SetSprints failed active selection or defensive clone: sel=%+v sprints=%+v", m.selectedSprint, m.sprints)
+		}
+		if m.sprintViewText == "" {
+			t.Fatal("expected SetSprints with non-empty sprints to render sprintViewText")
+		}
+		m.SetSprints(nil)
+		if m.sprints != nil || m.selectedSprint != nil || m.sprintViewText != "" {
+			t.Fatalf("SetSprints(nil) outside sprint view left stale state: sprints=%v sel=%v text=%q",
+				m.sprints, m.selectedSprint, m.sprintViewText)
+		}
+
+		// 2. SetAsOfRevision resets history report & generations when changed, and is a no-op when repeated with same revision.
+		m.historyView.SetReport(createTestHistoryReport())
+		m.historyReportDataGeneration = 7
+		m.SetAsOfRevision("  HEAD~3  ")
+		if m.asOfRevision != "HEAD~3" || m.historyView.report != nil || m.historyReportDataGeneration != 0 {
+			t.Fatalf("SetAsOfRevision did not trim/reset history state: rev=%q report=%v gen=%d",
+				m.asOfRevision, m.historyView.report, m.historyReportDataGeneration)
+		}
+		// Planted negative control: calling SetAsOfRevision with identical trimmed revision preserves existing report.
+		rep := createTestHistoryReport()
+		m.historyView.SetReport(rep)
+		m.SetAsOfRevision("HEAD~3")
+		if m.historyView.report != rep {
+			t.Fatal("same-revision SetAsOfRevision unexpectedly cleared historyView report")
+		}
+
+		// 3. SourceReloadResult{Sprints, SprintsLoaded: true} preserves selected sprint ID when present,
+		// falls back to activeSprintIndex when removed, and is NOT overwritten by disk-sprint!
+		m.SetSprints([]model.Sprint{sActive, sFuture})
+		m.selectedSprint = &m.sprints[1] // user manually selected ws-future
+		reloadSprints := []model.Sprint{sActive, sFuture}
+		m.SetSourceReload(func(context.Context) (SourceReloadResult, error) {
+			return SourceReloadResult{
+				Issues:        copyIssues(issues),
+				Sprints:       reloadSprints,
+				SprintsLoaded: true,
+			}, nil
+		})
+		cmd := m.TriggerSourceReload()
+		u, _ := m.Update(cmd())
+		m = u.(*Model)
+		m.analysis.WaitForPhase2()
+		if m.selectedSprint == nil || m.selectedSprint.ID != "ws-future" || !strings.Contains(m.sprintViewText, "Future WS Sprint") {
+			t.Fatalf("SourceReloadResult{SprintsLoaded:true} lost selected sprint ws-future or got overwritten by disk: sel=%+v text=%q",
+				m.selectedSprint, m.sprintViewText)
+		}
+		// Now drop ws-future from reloadSprints -> falls back to activeSprintIndex (ws-active).
+		reloadSprints = []model.Sprint{
+			{ID: "ws-past", Name: "Past WS Sprint", StartDate: refNow.Add(-20 * 24 * time.Hour), EndDate: refNow.Add(-10 * 24 * time.Hour)},
+			sActive,
+		}
+		cmd = m.TriggerSourceReload()
+		u, _ = m.Update(cmd())
+		m = u.(*Model)
+		m.analysis.WaitForPhase2()
+		if m.selectedSprint == nil || m.selectedSprint.ID != "ws-active" {
+			t.Fatalf("expected SourceReloadResult sprint fallback to activeSprintIndex (ws-active), got %+v", m.selectedSprint)
+		}
+
+		// 4. reloadSprintsFromDisk activeSprintIndex fallback when disk sprints.jsonl replaces the selected sprint ID.
+		mDisk := NewModel(copyIssues(issues), nil, beadsPath, ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mDisk.Stop)
+		mDisk.analysis.WaitForPhase2()
+		if mDisk.selectedSprint != nil && mDisk.selectedSprint.ID != "disk-sprint" {
+			t.Fatalf("unexpected initial disk sprint: %+v", mDisk.selectedSprint)
+		}
+		newDiskSprints := strings.Join([]string{
+			`{"id":"old-ended","name":"Old Ended","start_date":"2026-06-01T00:00:00Z","end_date":"2026-06-15T00:00:00Z","bead_ids":["SP-1"]}`,
+			`{"id":"now-current","name":"Now Current","start_date":"2026-07-05T00:00:00Z","end_date":"2026-07-25T00:00:00Z","bead_ids":["SP-1"]}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(sprintsPath, []byte(newDiskSprints), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mDisk.reloadSprintsFromDisk(focusSprint)
+		if mDisk.selectedSprint == nil || mDisk.selectedSprint.ID != "now-current" {
+			t.Fatalf("expected reloadSprintsFromDisk fallback to active sprint 'now-current', got %+v", mDisk.selectedSprint)
+		}
+	})
+
+	t.Run("GraphModel_SetSize_enables_ScrollDown_and_ScrollRight_before_first_View", func(t *testing.T) {
+		// Build a 2-node graph (1 blocker -> 22 cols wide, ~14 lines tall) that fits inside default 120x40
+		// (where viewport is 89x38, so maxScrollX==0 and maxScrollY==0) but overflows a resized 36x6 terminal!
+		graphIssues := []model.Issue{
+			{ID: "BLK-1", Title: "Blocker One", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask},
+			{
+				ID: "HUB", Title: "Hub Issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+				Dependencies: []*model.Dependency{{IssueID: "HUB", DependsOnID: "BLK-1", Type: model.DepBlocks}},
+			},
+		}
+
+		// Planted negative control: without WindowSizeMsg/SetSize, g.width==0 && g.height==0 fall back to 120x40 where HUB fits (scrollX==0, scrollY==0).
+		mDefault := NewModel(copyIssues(graphIssues), nil, "")
+		t.Cleanup(mDefault.Stop)
+		mDefault.analysis.WaitForPhase2()
+		mDefault.graphView.SelectByID("HUB")
+		mDefault.graphView.ScrollDown()
+		mDefault.graphView.ScrollRight()
+		if mDefault.graphView.scrollY != 0 || mDefault.graphView.scrollX != 0 {
+			t.Fatalf("negative control failed: expected scrollX==0 && scrollY==0 at default 120x40 before resize, got (%d, %d)",
+				mDefault.graphView.scrollX, mDefault.graphView.scrollY)
+		}
+
+		// Positive observable: WindowSizeMsg{Width: 36, Height: 6} calls applyContentSizing -> graphView.SetSize BEFORE any View() call!
+		mResized := NewModel(copyIssues(graphIssues), nil, "")
+		t.Cleanup(mResized.Stop)
+		mResized.analysis.WaitForPhase2()
+		u, _ := mResized.Update(tea.WindowSizeMsg{Width: 36, Height: 6})
+		mResized = u.(*Model)
+		mResized.graphView.SelectByID("HUB")
+		mResized.graphView.ScrollDown()
+		mResized.graphView.ScrollRight()
+		if mResized.graphView.scrollY <= 0 || mResized.graphView.scrollX <= 0 {
+			t.Fatalf("expected ScrollDown & ScrollRight > 0 after WindowSizeMsg before first View(), got scrollX=%d scrollY=%d (max=%d,%d)",
+				mResized.graphView.scrollX, mResized.graphView.scrollY, mResized.graphView.maxScrollX, mResized.graphView.maxScrollY)
+		}
+	})
+
+	t.Run("copyIssueToClipboard_Design_Notes_Comments_and_exportToMarkdown_hashes", func(t *testing.T) {
+		if runtime.GOOS != "windows" {
+			clipBinDir := t.TempDir()
+			clipOut := filepath.Join(clipBinDir, "clipboard.txt")
+			helperName := "wl-copy"
+			if runtime.GOOS == "darwin" {
+				helperName = "pbcopy"
+			}
+			script := "#!/bin/sh\ncat > \"$BV_TEST_CLIP_OUT\"\n"
+			if err := os.WriteFile(filepath.Join(clipBinDir, helperName), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", clipBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("WAYLAND_DISPLAY", "wayland-test")
+			t.Setenv("BV_TEST_CLIP_OUT", clipOut)
+
+			commentTime := time.Date(2026, 7, 9, 10, 0, 0, 0, time.UTC)
+			richIssue := model.Issue{
+				ID:          "CLIP-1",
+				Title:       "Rich Clipboard Issue",
+				Status:      model.StatusOpen,
+				Priority:    1,
+				IssueType:   model.TypeFeature,
+				CreatedAt:   refNow,
+				UpdatedAt:   refNow,
+				Description: "Core description body.",
+				Design:      "Architecture uses immutable snapshots.",
+				Notes:       "Roll out behind feature flag.",
+				Comments: []*model.Comment{
+					nil,
+					{Author: "ghost", Text: "   \n\t  ", CreatedAt: commentTime},
+					{Author: "alice", Text: "Verified parity on staging.", CreatedAt: commentTime},
+					{Author: "", Text: "Anonymous follow-up."},
+				},
+			}
+			blankCommentsIssue := model.Issue{
+				ID:        "CLIP-BLANK",
+				Title:     "Only blank comments",
+				Status:    model.StatusOpen,
+				Priority:  2,
+				IssueType: model.TypeTask,
+				CreatedAt: refNow,
+				Comments: []*model.Comment{
+					nil,
+					{Author: "nobody", Text: "   "},
+				},
+			}
+
+			mClip := NewModel([]model.Issue{richIssue, blankCommentsIssue}, nil, "")
+			t.Cleanup(mClip.Stop)
+			mClip.selectVisibleListItemByID("CLIP-1")
+			copyCmd := mClip.copyIssueToClipboard()
+			if copyCmd == nil {
+				t.Fatalf("expected non-nil copyIssueToClipboard cmd, status=%q", mClip.statusMsg)
+			}
+			_ = copyCmd()
+			copiedBytes, err := os.ReadFile(clipOut)
+			if err != nil {
+				t.Fatalf("read captured clipboard: %v", err)
+			}
+			copied := string(copiedBytes)
+			for _, want := range []string{
+				"## Design\n\nArchitecture uses immutable snapshots.",
+				"## Notes\n\nRoll out behind feature flag.",
+				"## Comments",
+				"- **alice (2026-07-09):** Verified parity on staging.",
+				"- **Comment:** Anonymous follow-up.",
+			} {
+				if !strings.Contains(copied, want) {
+					t.Fatalf("copied markdown missing %q:\n%s", want, copied)
+				}
+			}
+			if strings.Contains(copied, "ghost") {
+				t.Fatalf("copied markdown failed to skip whitespace-only comment:\n%s", copied)
+			}
+
+			// Planted negative control: issue with ONLY nil/blank comments omits "## Comments" section completely.
+			mClip.selectVisibleListItemByID("CLIP-BLANK")
+			blankCmd := mClip.copyIssueToClipboard()
+			_ = blankCmd()
+			blankCopiedBytes, err := os.ReadFile(clipOut)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(blankCopiedBytes), "## Comments") {
+				t.Fatalf("expected blank-only comments to omit ## Comments section, got:\n%s", string(blankCopiedBytes))
+			}
+		}
+
+		// exportToMarkdown: verifies WaitForPhase2() + DataHash / AuthorityHash / SourcePath propagation.
+		exportWorkDir := t.TempDir()
+		beadsSourcePath := filepath.Join(exportWorkDir, ".beads", "issues.jsonl")
+		if err := os.MkdirAll(filepath.Dir(beadsSourcePath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(beadsSourcePath, []byte{}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		allExportIssues := []model.Issue{
+			{ID: "EXP-ROOT", Title: "Root blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, Labels: []string{"ship"}, CreatedAt: refNow, UpdatedAt: refNow},
+			{
+				ID: "EXP-DEP", Title: "Scoped target", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"ship"}, CreatedAt: refNow, UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{{IssueID: "EXP-DEP", DependsOnID: "EXP-ROOT", Type: model.DepBlocks}},
+			},
+			{ID: "EXP-OTHER", Title: "Out-of-filter context", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		}
+		jsonRecipe := &recipe.Recipe{
+			Name:    "ship-json",
+			Filters: recipe.FilterConfig{Status: []string{"open"}},
+			Metrics: []string{"pagerank", "kcore"},
+			Export:  recipe.ExportConfig{Format: "json"},
+		}
+		mExp := NewModel(copyIssues(allExportIssues), jsonRecipe, beadsSourcePath, ReadinessScope{
+			Authority:    model.NewReadinessIndex(allExportIssues),
+			ReferenceNow: refNow,
+		})
+		t.Cleanup(mExp.Stop)
+		mExp.SetWorkDir(exportWorkDir)
+		// Do NOT pre-call WaitForPhase2 — exportToMarkdown must wait for Phase 2 itself!
+		mExp.exportToMarkdown()
+		if mExp.statusIsError || !mExp.analysis.IsPhase2Ready() {
+			t.Fatalf("exportToMarkdown failed or did not WaitForPhase2: err=%v status=%q phase2=%v",
+				mExp.statusIsError, mExp.statusMsg, mExp.analysis.IsPhase2Ready())
+		}
+
+		jsonPath := filepath.Join(exportWorkDir, "beads_export_2026-07-10.json")
+		rawJSON, err := os.ReadFile(jsonPath)
+		if err != nil {
+			t.Fatalf("read exported JSON report %s: %v", jsonPath, err)
+		}
+		var payload struct {
+			AuthorityHash string `json:"authority_hash"`
+			DataHash      string `json:"data_hash"`
+			SourcePath    string `json:"source_path"`
+			Issues        []struct {
+				ID string `json:"id"`
+			} `json:"issues"`
+		}
+		if err := json.Unmarshal(rawJSON, &payload); err != nil {
+			t.Fatalf("unmarshal exported JSON: %v", err)
+		}
+		wantAuthHash := analysis.ComputeDataHash(allExportIssues)
+		wantDataHash := analysis.ComputeDataHash(mExp.exportIssuesForCurrentView())
+		if payload.SourcePath != beadsSourcePath {
+			t.Fatalf("SourcePath = %q, want %q", payload.SourcePath, beadsSourcePath)
+		}
+		if payload.AuthorityHash != wantAuthHash || payload.DataHash != wantDataHash || payload.AuthorityHash == payload.DataHash {
+			t.Fatalf("unexpected hashes: authority_hash=%q (want %q), data_hash=%q (want %q; must differ because EXP-OTHER is filtered out)",
+				payload.AuthorityHash, wantAuthHash, payload.DataHash, wantDataHash)
+		}
+		if len(payload.Issues) != 2 {
+			t.Fatalf("expected 2 open exported issues, got %d", len(payload.Issues))
+		}
+	})
+}
+
+func TestTimeTravelDynamicHistoricalScopeAndWorkspaceRepoTargets(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	gitExec := func(t *testing.T, dir string, extraEnv []string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(loader.SanitizedGitEnv(), extraEnv...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, out)
+		}
+	}
+	initGitRepo := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		gitExec(t, dir, nil, "init")
+		gitExec(t, dir, nil, "config", "user.email", "test@example.com")
+		gitExec(t, dir, nil, "config", "user.name", "Test User")
+		return dir
+	}
+
+	refNow := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+
+	t.Run("a_label_filter_surfaces_deleted_labeled_issue_and_excludes_unlabeled", func(t *testing.T) {
+		repoDir := initGitRepo(t)
+		beadsDir := filepath.Join(repoDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+
+		c1Raw := strings.Join([]string{
+			`{"id":"DEL-1","title":"Deleted backend","status":"open","priority":1,"issue_type":"task","labels":["backend"]}`,
+			`{"id":"OTHER-DEL","title":"Deleted other","status":"open","priority":1,"issue_type":"task"}`,
+			`{"id":"KEEP-1","title":"Kept backend","status":"open","priority":1,"issue_type":"task","labels":["backend"]}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(beadsPath, []byte(c1Raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitExec(t, repoDir, nil, "add", ".beads/issues.jsonl")
+		gitExec(t, repoDir, []string{"GIT_AUTHOR_DATE=2026-02-01T10:00:00Z", "GIT_COMMITTER_DATE=2026-02-01T10:00:00Z"}, "commit", "-m", "c1")
+
+		c2Raw := `{"id":"KEEP-1","title":"Kept backend","status":"open","priority":1,"issue_type":"task","labels":["backend"]}` + "\n"
+		if err := os.WriteFile(beadsPath, []byte(c2Raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitExec(t, repoDir, nil, "add", ".beads/issues.jsonl")
+		gitExec(t, repoDir, []string{"GIT_AUTHOR_DATE=2026-02-15T10:00:00Z", "GIT_COMMITTER_DATE=2026-02-15T10:00:00Z"}, "commit", "-m", "c2")
+
+		headIssues, err := loader.LoadIssuesFromFile(beadsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mScoped := NewModel(copyIssues(headIssues), nil, beadsPath, ReadinessScope{
+			Authority:    model.NewReadinessIndex(headIssues),
+			CandidateIDs: map[string]bool{"KEEP-1": true},
+			LabelFilter:  "backend",
+			ReferenceNow: refNow,
+		})
+		t.Cleanup(mScoped.Stop)
+		mScoped.SetWorkDir(repoDir)
+
+		mScoped.enterTimeTravelMode("HEAD~1")
+		diff := mScoped.TimeTravelDiff()
+		if !mScoped.IsTimeTravelMode() || diff == nil || len(diff.RemovedIssues) != 1 || diff.RemovedIssues[0].ID != "DEL-1" {
+			t.Fatalf("expected LabelFilter=backend to report RemovedIssues=[DEL-1], got diff=%+v status=%q", diff, mScoped.statusMsg)
+		}
+
+		// Planted negative control: unscoped model reports BOTH DEL-1 and OTHER-DEL as removed.
+		mUnscoped := NewModel(copyIssues(headIssues), nil, beadsPath, ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mUnscoped.Stop)
+		mUnscoped.SetWorkDir(repoDir)
+		mUnscoped.enterTimeTravelMode("HEAD~1")
+		if uDiff := mUnscoped.TimeTravelDiff(); uDiff == nil || len(uDiff.RemovedIssues) != 2 {
+			t.Fatalf("negative control failed: expected unscoped RemovedIssues len=2, got %+v", uDiff)
+		}
+	})
+
+	t.Run("b_actionable_recipe_counts_actionable_issue_closed_at_head", func(t *testing.T) {
+		repoDir := initGitRepo(t)
+		beadsDir := filepath.Join(repoDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beadsPath := filepath.Join(beadsDir, "issues.jsonl")
+
+		c1Raw := strings.Join([]string{
+			`{"id":"ACT-1","title":"Actionable then closed","status":"open","priority":1,"issue_type":"task"}`,
+			`{"id":"OPEN-DEP","title":"Still open blocker","status":"open","priority":0,"issue_type":"task"}`,
+			`{"id":"BLK-1","title":"Blocked then closed","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"BLK-1","depends_on_id":"OPEN-DEP","type":"blocks"}]}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(beadsPath, []byte(c1Raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitExec(t, repoDir, nil, "add", ".beads/issues.jsonl")
+		gitExec(t, repoDir, []string{"GIT_AUTHOR_DATE=2026-03-01T10:00:00Z", "GIT_COMMITTER_DATE=2026-03-01T10:00:00Z"}, "commit", "-m", "c1")
+
+		c2Raw := strings.Join([]string{
+			`{"id":"ACT-1","title":"Actionable then closed","status":"closed","priority":1,"issue_type":"task"}`,
+			`{"id":"OPEN-DEP","title":"Still open blocker","status":"open","priority":0,"issue_type":"task"}`,
+			`{"id":"BLK-1","title":"Blocked then closed","status":"closed","priority":1,"issue_type":"task","dependencies":[{"issue_id":"BLK-1","depends_on_id":"OPEN-DEP","type":"blocks"}]}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(beadsPath, []byte(c2Raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitExec(t, repoDir, nil, "add", ".beads/issues.jsonl")
+		gitExec(t, repoDir, []string{"GIT_AUTHOR_DATE=2026-03-10T10:00:00Z", "GIT_COMMITTER_DATE=2026-03-10T10:00:00Z"}, "commit", "-m", "c2")
+
+		headIssues, err := loader.LoadIssuesFromFile(beadsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr := true
+		actionableRecipe := &recipe.Recipe{
+			Name: "actionable",
+			Filters: recipe.FilterConfig{
+				Status:     []string{"open", "in_progress"},
+				Actionable: &tr,
+			},
+		}
+		m := NewModel(copyIssues(headIssues), actionableRecipe, beadsPath, ReadinessScope{
+			Authority:    model.NewReadinessIndex(headIssues),
+			CandidateIDs: map[string]bool{"OPEN-DEP": true},
+			ReferenceNow: refNow,
+		})
+		t.Cleanup(m.Stop)
+		m.SetWorkDir(repoDir)
+
+		m.enterTimeTravelMode("HEAD~1")
+		diff := m.TimeTravelDiff()
+		if !m.IsTimeTravelMode() || diff == nil || len(diff.ClosedIssues) != 1 || diff.ClosedIssues[0].ID != "ACT-1" {
+			t.Fatalf("expected actionable recipe ClosedIssues=[ACT-1] (excluding non-actionable BLK-1), got diff=%+v status=%q", diff, m.statusMsg)
+		}
+		if len(diff.RemovedIssues) != 0 || !m.closedIssueIDs["ACT-1"] || m.closedIssueIDs["BLK-1"] {
+			t.Fatalf("unexpected removed/closed sets under actionable recipe: removed=%+v closedIDs=%v", diff.RemovedIssues, m.closedIssueIDs)
+		}
+	})
+
+	t.Run("c_workspace_repo_targets_anchor_from_time_and_preserve_cross_repo_readiness", func(t *testing.T) {
+		repoWeb := initGitRepo(t)
+		webBeads := filepath.Join(repoWeb, ".beads")
+		if err := os.MkdirAll(webBeads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// web-1 depends on closed api-1 (ready at HEAD~1 only if api is loaded into histAuthIssues).
+		// web-2 is deferred until 2026-06-01 (deferred at web's 2026-03-01, NOT deferred at api's 2026-09-01!).
+		webC1 := strings.Join([]string{
+			`{"id":"1","title":"Web cross-repo ready","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"1","depends_on_id":"api-1","type":"blocks"}]}`,
+			`{"id":"2","title":"Web deferred until June","status":"open","priority":1,"issue_type":"task","defer_until":"2026-06-01T00:00:00Z"}`,
+		}, "\n") + "\n"
+		_ = os.WriteFile(filepath.Join(webBeads, "issues.jsonl"), []byte(webC1), 0o644)
+		gitExec(t, repoWeb, nil, "add", ".beads/issues.jsonl")
+		gitExec(t, repoWeb, []string{"GIT_AUTHOR_DATE=2026-03-01T12:00:00Z", "GIT_COMMITTER_DATE=2026-03-01T12:00:00Z"}, "commit", "-m", "web c1")
+
+		webC2 := strings.Join([]string{
+			`{"id":"1","title":"Web cross-repo ready","status":"closed","priority":1,"issue_type":"task","dependencies":[{"issue_id":"1","depends_on_id":"api-1","type":"blocks"}]}`,
+			`{"id":"2","title":"Web deferred until June","status":"closed","priority":1,"issue_type":"task","defer_until":"2026-06-01T00:00:00Z"}`,
+		}, "\n") + "\n"
+		_ = os.WriteFile(filepath.Join(webBeads, "issues.jsonl"), []byte(webC2), 0o644)
+		gitExec(t, repoWeb, nil, "add", ".beads/issues.jsonl")
+		gitExec(t, repoWeb, []string{"GIT_AUTHOR_DATE=2026-03-15T12:00:00Z", "GIT_COMMITTER_DATE=2026-03-15T12:00:00Z"}, "commit", "-m", "web c2")
+
+		repoAPI := initGitRepo(t)
+		apiBeads := filepath.Join(repoAPI, ".beads")
+		if err := os.MkdirAll(apiBeads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		apiC1 := strings.Join([]string{
+			`{"id":"1","title":"API closed blocker","status":"closed","priority":0,"issue_type":"task"}`,
+			`{"id":"2","title":"API open work","status":"open","priority":1,"issue_type":"task"}`,
+		}, "\n") + "\n"
+		_ = os.WriteFile(filepath.Join(apiBeads, "issues.jsonl"), []byte(apiC1), 0o644)
+		gitExec(t, repoAPI, nil, "add", ".beads/issues.jsonl")
+		gitExec(t, repoAPI, []string{"GIT_AUTHOR_DATE=2026-09-01T12:00:00Z", "GIT_COMMITTER_DATE=2026-09-01T12:00:00Z"}, "commit", "-m", "api c1")
+
+		apiC2 := strings.Join([]string{
+			`{"id":"1","title":"API closed blocker","status":"closed","priority":0,"issue_type":"task"}`,
+			`{"id":"2","title":"API open work","status":"closed","priority":1,"issue_type":"task"}`,
+		}, "\n") + "\n"
+		_ = os.WriteFile(filepath.Join(apiBeads, "issues.jsonl"), []byte(apiC2), 0o644)
+		gitExec(t, repoAPI, nil, "add", ".beads/issues.jsonl")
+		gitExec(t, repoAPI, []string{"GIT_AUTHOR_DATE=2026-09-15T12:00:00Z", "GIT_COMMITTER_DATE=2026-09-15T12:00:00Z"}, "commit", "-m", "api c2")
+
+		repoLegacy := initGitRepo(t)
+		legBeads := filepath.Join(repoLegacy, ".beads")
+		if err := os.MkdirAll(legBeads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_ = os.WriteFile(filepath.Join(legBeads, "issues.jsonl"), []byte(`{"id":"1","title":"Legacy deleted at HEAD","status":"open","priority":2,"issue_type":"task"}`+"\n"), 0o644)
+		gitExec(t, repoLegacy, nil, "add", ".beads/issues.jsonl")
+		gitExec(t, repoLegacy, []string{"GIT_AUTHOR_DATE=2026-02-01T12:00:00Z", "GIT_COMMITTER_DATE=2026-02-01T12:00:00Z"}, "commit", "-m", "legacy c1")
+		_ = os.WriteFile(filepath.Join(legBeads, "issues.jsonl"), []byte(""), 0o644)
+		gitExec(t, repoLegacy, nil, "add", ".beads/issues.jsonl")
+		gitExec(t, repoLegacy, []string{"GIT_AUTHOR_DATE=2026-02-15T12:00:00Z", "GIT_COMMITTER_DATE=2026-02-15T12:00:00Z"}, "commit", "-m", "legacy c2")
+
+		deferJune := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+		liveIssues := []model.Issue{
+			{
+				ID: "web-1", Title: "Web cross-repo ready", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, SourceRepo: "web",
+				Dependencies: []*model.Dependency{{IssueID: "web-1", DependsOnID: "api-1", Type: model.DepBlocks}},
+				Origin:       &model.IssueOrigin{LocalID: "1", WorkingDirectory: repoWeb, TrackerDirectory: webBeads},
+			},
+			{
+				ID: "web-2", Title: "Web deferred until June", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, SourceRepo: "web",
+				DeferUntil: &deferJune,
+				Origin:     &model.IssueOrigin{LocalID: "2", WorkingDirectory: repoWeb, TrackerDirectory: webBeads},
+			},
+			{
+				ID: "api-1", Title: "API closed blocker", Status: model.StatusClosed, Priority: 0, IssueType: model.TypeTask, SourceRepo: "api",
+				Origin: &model.IssueOrigin{LocalID: "1", WorkingDirectory: repoAPI, TrackerDirectory: apiBeads},
+			},
+			{
+				ID: "api-2", Title: "API open work", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api",
+				Origin: &model.IssueOrigin{LocalID: "2", WorkingDirectory: repoAPI, TrackerDirectory: apiBeads},
+			},
+		}
+
+		tr := true
+		actionableRecipe := &recipe.Recipe{
+			Name: "actionable",
+			Filters: recipe.FilterConfig{
+				Status:     []string{"open", "in_progress"},
+				Actionable: &tr,
+			},
+		}
+		mWS := NewModel(copyIssues(liveIssues), actionableRecipe, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(liveIssues),
+			ReferenceNow: refNow,
+		})
+		t.Cleanup(mWS.Stop)
+		mWS.EnableWorkspaceMode(WorkspaceInfo{
+			Enabled:      true,
+			RepoCount:    3,
+			TotalIssues:  len(liveIssues),
+			RepoPrefixes: []string{"web-", "api-", "my-leg-"},
+			Repos: []WorkspaceRepoTarget{
+				{Name: "web", Path: repoWeb, BeadsDir: webBeads, Prefix: "web-"},
+				{Name: "api", Path: repoAPI, BeadsDir: apiBeads, Prefix: "api-"},
+				{Name: "legacy", Path: repoLegacy, BeadsDir: legBeads, Prefix: "my-leg-"},
+			},
+		})
+		mWS.activeRepos = map[string]bool{"web": true}
+
+		mWS.enterTimeTravelMode("HEAD~1")
+		diff := mWS.TimeTravelDiff()
+		wantWebCommitTime := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+		if !mWS.IsTimeTravelMode() || diff == nil || !diff.FromTimestamp.Equal(wantWebCommitTime) {
+			t.Fatalf("expected activeRepos={web} FromTimestamp=%v (NOT api's 2026-09-01), got diff=%+v status=%q",
+				wantWebCommitTime, diff, mWS.statusMsg)
+		}
+		// web-1 is actionable at 2026-03-01 (because closed api-1 was loaded into histAuthIssues!) -> counted in ClosedIssues.
+		// web-2 is still deferred at 2026-03-01 (would falsely be ready if FromTimestamp leaked 2026-09-01!) -> excluded!
+		if len(diff.ClosedIssues) != 1 || diff.ClosedIssues[0].ID != "web-1" {
+			t.Fatalf("expected ClosedIssues=[web-1] (cross-repo api-1 satisfied, web-2 still deferred at 2026-03-01), got %+v", diff.ClosedIssues)
+		}
+
+		// Deleted-at-HEAD repo "legacy" (0 live issues at HEAD, multi-hyphen prefix "my-leg-") is still discovered via WorkspaceInfo.Repos!
+		mWS.exitTimeTravelMode()
+		mWS.setActiveRecipe(nil)
+		mWS.activeRepos = map[string]bool{"my-leg": true}
+		mWS.enterTimeTravelMode("HEAD~1")
+		legDiff := mWS.TimeTravelDiff()
+		if legDiff == nil || len(legDiff.RemovedIssues) != 1 || legDiff.RemovedIssues[0].ID != "my-leg-1" {
+			t.Fatalf("expected legacy repo (0 HEAD issues, prefix my-leg-) RemovedIssues=[my-leg-1], got %+v status=%q", legDiff, mWS.statusMsg)
+		}
+
+		// Planted negative control: clearing activeRepos=nil advances FromTimestamp to api's 2026-09-01.
+		mWS.exitTimeTravelMode()
+		mWS.activeRepos = nil
+		mWS.enterTimeTravelMode("HEAD~1")
+		wantAPICommitTime := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+		if allDiff := mWS.TimeTravelDiff(); allDiff == nil || !allDiff.FromTimestamp.Equal(wantAPICommitTime) {
+			t.Fatalf("negative control failed: expected unfiltered workspace FromTimestamp=%v, got %+v", wantAPICommitTime, allDiff)
+		}
+
+		// [R2-B1] Standalone JSONL issue with unvalidated Origin.TrackerDirectory="/tmp" (no .beads/_beads, Tracker=="")
+		// in workspace mode must NOT derive repoWorkDir="/" and abort enterTimeTravelMode!
+		mWS.exitTimeTravelMode()
+		withTmpOrigin := append(copyIssues(liveIssues), model.Issue{
+			ID:        "tmp-standalone-1",
+			Title:     "Standalone export row",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			Origin:    &model.IssueOrigin{TrackerDirectory: "/tmp", ReadOnlyReason: "source has no readable tracker metadata"},
+		})
+		mWSTmp := NewModel(withTmpOrigin, nil, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(withTmpOrigin),
+			ReferenceNow: refNow,
+		})
+		t.Cleanup(mWSTmp.Stop)
+		mWSTmp.SetWorkDir(repoWeb)
+		mWSTmp.EnableWorkspaceMode(WorkspaceInfo{
+			Enabled:   true,
+			RepoCount: 1,
+			Repos:     []WorkspaceRepoTarget{{Name: "web", Path: repoWeb, BeadsDir: webBeads, Prefix: "web-"}},
+		})
+		mWSTmp.enterTimeTravelMode("HEAD~1")
+		if !mWSTmp.IsTimeTravelMode() || mWSTmp.statusIsError {
+			t.Fatalf("[R2-B1] standalone TrackerDirectory=/tmp broke workspace enterTimeTravelMode: mode=%v err=%v status=%q",
+				mWSTmp.IsTimeTravelMode(), mWSTmp.statusIsError, mWSTmp.statusMsg)
 		}
 	})
 }

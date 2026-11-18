@@ -4,6 +4,7 @@
 package baseline
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -58,13 +59,26 @@ type BaselineScope struct {
 	Workspace bool   `json:"workspace,omitempty"`
 }
 
-// MatchesScope reports whether b's recorded scope matches other, treating a nil
-// Scope (legacy/unscoped baseline) as equivalent to an empty BaselineScope{}.
+func scopesEqual(a, b BaselineScope) bool {
+	return strings.TrimSpace(a.Label) == strings.TrimSpace(b.Label) &&
+		strings.EqualFold(strings.TrimSpace(a.Recipe), strings.TrimSpace(b.Recipe)) &&
+		strings.EqualFold(strings.TrimSpace(a.Repo), strings.TrimSpace(b.Repo)) &&
+		a.Workspace == b.Workspace
+}
+
+// MatchesScope reports whether b's recorded scope matches other. A nil *Baseline
+// never matches; a non-nil *Baseline with nil Scope (legacy/unscoped baseline)
+// is treated as equivalent to an empty BaselineScope{}. Repo and Recipe compare
+// case-insensitively to match CLI filter normalization.
 func (b *Baseline) MatchesScope(other BaselineScope) bool {
-	if b == nil || b.Scope == nil {
-		return other == (BaselineScope{})
+	if b == nil {
+		return false
 	}
-	return *b.Scope == other
+	var self BaselineScope
+	if b.Scope != nil {
+		self = *b.Scope
+	}
+	return scopesEqual(self, other)
 }
 
 // GraphStats contains basic graph statistics
@@ -219,12 +233,15 @@ func GetGitInfo(dir string) (sha, message, branch string) {
 
 // runGit runs a git command with sanitized ambient GIT_* variables and replace-refs disabled.
 func runGit(dir string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	gitArgs := make([]string, 0, len(args)+1)
 	gitArgs = append(gitArgs, "--no-replace-objects")
 	gitArgs = append(gitArgs, args...)
-	cmd := exec.Command("git", gitArgs...)
+	cmd := exec.CommandContext(ctx, "git", gitArgs...)
 	cmd.Dir = dir
 	cmd.Env = loader.SanitizedGitEnv()
+	cmd.WaitDelay = time.Second
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err

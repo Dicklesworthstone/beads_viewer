@@ -50,7 +50,10 @@ func (s *ShortcutsSidebar) SetSize(width, height int) {
 
 // SetContext updates the current context for filtering shortcuts
 func (s *ShortcutsSidebar) SetContext(ctx string) {
-	s.context = ctx
+	if s.context != ctx {
+		s.context = ctx
+		s.scrollOffset = 0
+	}
 }
 
 // SetFocus updates the current focus for registry-based bindings (bv-xl6g)

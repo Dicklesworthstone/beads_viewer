@@ -219,8 +219,8 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 		}
 	}
 
-	// Strategy 3: Timestamp proximity (for closed beads)
-	if issue.ClosedAt != nil || !issue.CreatedAt.IsZero() {
+	// Strategy 3: Timestamp proximity (for closed or active beads with timestamps)
+	if issue.ClosedAt != nil || !issue.UpdatedAt.IsZero() || !issue.CreatedAt.IsZero() {
 		timestampResults, timestampMeta := c.searchByTimestamp(ctx, issue)
 		note("timestamp search", timestampMeta)
 		if len(timestampResults) > 0 {
@@ -237,6 +237,15 @@ func (c *Correlator) workspaceForIssue(issue *model.Issue) string {
 	if issue != nil && issue.Origin != nil {
 		if wd := strings.TrimSpace(issue.Origin.WorkingDirectory); wd != "" {
 			return wd
+		}
+		if td := strings.TrimSpace(issue.Origin.TrackerDirectory); td != "" {
+			cleanTD := filepath.Clean(td)
+			base := filepath.Base(cleanTD)
+			if base == ".beads" || base == "_beads" || strings.TrimSpace(issue.Origin.Tracker) != "" {
+				if derived := strings.TrimSpace(WorkspaceFromBeadsPath(filepath.Join(cleanTD, "issues.jsonl"))); derived != "" {
+					return derived
+				}
+			}
 		}
 	}
 	return c.workspace
@@ -375,13 +384,92 @@ func (c *Correlator) searchByID(ctx context.Context, beadID string) ([]ScoredRes
 	return c.searchByIDInWorkspace(ctx, beadID, c.workspace)
 }
 
+func splitASCIIAlnumSubtokens(s string) []string {
+	var tokens []string
+	start := -1
+	for i := 0; i < len(s); i++ {
+		if isASCIIAlnumByte(s[i]) {
+			if start < 0 {
+				start = i
+			}
+		} else if start >= 0 {
+			tokens = append(tokens, s[start:i])
+			start = -1
+		}
+	}
+	if start >= 0 {
+		tokens = append(tokens, s[start:])
+	}
+	return tokens
+}
+
+func findStandaloneAlnumToken(s, tok string, from int) int {
+	if tok == "" || from < 0 || from+len(tok) > len(s) {
+		return -1
+	}
+	offset := from
+	for offset <= len(s)-len(tok) {
+		rel := strings.Index(s[offset:], tok)
+		if rel < 0 {
+			return -1
+		}
+		start := offset + rel
+		end := start + len(tok)
+		leftOK := start == 0 || !isASCIIAlnumByte(s[start-1])
+		rightOK := end == len(s) || !isASCIIAlnumByte(s[end])
+		if leftOK && rightOK {
+			return start
+		}
+		offset = start + 1
+	}
+	return -1
+}
+
+func hasInterveningASCIIAlnum(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if isASCIIAlnumByte(s[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAllAlnumSubtokens(combinedLower, trimmedLower string) bool {
+	subtokens := splitASCIIAlnumSubtokens(trimmedLower)
+	if len(subtokens) < 2 {
+		return false
+	}
+	const maxSubtokenGap = 32
+	searchFrom := 0
+	for {
+		pos := findStandaloneAlnumToken(combinedLower, subtokens[0], searchFrom)
+		if pos < 0 {
+			return false
+		}
+		curEnd := pos + len(subtokens[0])
+		matchedAll := true
+		for _, tok := range subtokens[1:] {
+			nextPos := findStandaloneAlnumToken(combinedLower, tok, curEnd)
+			if nextPos <= curEnd || nextPos-curEnd > maxSubtokenGap || hasInterveningASCIIAlnum(combinedLower[curEnd:nextPos]) {
+				matchedAll = false
+				break
+			}
+			curEnd = nextPos + len(tok)
+		}
+		if matchedAll {
+			return true
+		}
+		searchFrom = pos + 1
+	}
+}
+
 func hasConflictingSubstringWithoutTokenMatch(r SearchResult, beadID string) bool {
 	trimmed := strings.ToLower(strings.TrimSpace(beadID))
 	if trimmed == "" {
 		return false
 	}
 	combined := strings.ToLower(r.Title + "\n" + r.Snippet)
-	if !strings.Contains(combined, trimmed) {
+	if !strings.Contains(combined, trimmed) && !containsAllAlnumSubtokens(combined, trimmed) {
 		return false
 	}
 	return !mentionsAnyIssueID(r, []string{beadID})
@@ -421,6 +509,8 @@ func (c *Correlator) searchByIDInWorkspace(ctx context.Context, beadID, workspac
 				BaseScore:    float64(ScoreIDMention),
 				Strategy:     StrategyIDMention,
 			})
+		} else if meta.Total > 0 {
+			meta.Total--
 		}
 	}
 
@@ -470,6 +560,8 @@ func (c *Correlator) searchByKeywords(ctx context.Context, issue *model.Issue, k
 				Strategy:     StrategyKeywords,
 				Keywords:     matchedKeywords,
 			})
+		} else if resp.Meta.Total > 0 {
+			resp.Meta.Total--
 		}
 	}
 
@@ -495,10 +587,14 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 	})
 
 	if len(resp.Results) == 0 {
+		if days > 7 {
+			resp.Meta.Total = 0
+		}
 		return nil, resp.Meta
 	}
 
 	scored := make([]ScoredResult, 0, len(resp.Results))
+	rejected := 0
 	for _, r := range resp.Results {
 		baseScore := c.scoreTimestampProximity(r.Timestamp, issue)
 		if mentionsAnyIssueID(r, ids) && baseScore < float64(ScoreIDMention) {
@@ -516,10 +612,19 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 				BaseScore:    baseScore,
 				Strategy:     StrategyTimestamp,
 			})
+		} else {
+			rejected++
+			if resp.Meta.Total > 0 {
+				resp.Meta.Total--
+			}
 		}
 	}
 
-	return c.rankAndLimit(scored), resp.Meta
+	filtered := c.rankAndLimit(scored)
+	if days > 7 || rejected > 0 {
+		resp.Meta.Total = len(filtered)
+	}
+	return filtered, resp.Meta
 }
 
 // ExtractKeywords extracts meaningful search keywords from text.

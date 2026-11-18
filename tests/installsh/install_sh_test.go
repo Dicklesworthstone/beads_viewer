@@ -658,7 +658,13 @@ wget() {
 		t.Fatalf("expected wget to retry unauthenticated on 401/error: exit=%d out=%q stderr=%s", code, out, stderr)
 	}
 
-	// 2. resolve_go_bin skips stale < MIN_GO_VERSION go on PATH and selects a valid candidate.
+	// 2. resolve_go_bin iterates full PATH (skipping stale go1.21.0 earlier in PATH) and fails closed when only stale go exists.
+	toolBin := t.TempDir()
+	for _, util := range []string{"awk", "sed", "tr", "uname"} {
+		if p, err := exec.LookPath(util); err == nil {
+			_ = os.Symlink(p, filepath.Join(toolBin, util))
+		}
+	}
 	staleBin := t.TempDir()
 	freshBin := t.TempDir()
 	staleGo := filepath.Join(staleBin, "go")
@@ -669,20 +675,86 @@ wget() {
 	if err := os.WriteFile(freshGo, []byte("#!/bin/sh\necho 'go version go1.26.11 linux/amd64'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Planted negative: when ONLY stale go1.21.0 is reachable, resolve_go_bin fails closed.
-	noFreshSetup := `
-resolve_only_path() {
-    local min_version="$MIN_GO_VERSION" ver
-    ver=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
-    [ -n "$ver" ] && version_ge "$ver" "$min_version"
-}`
-	_, _, negCode := runInstallFunc(t, []string{"PATH=" + staleBin + ":/usr/bin:/bin"}, noFreshSetup, `resolve_only_path`, "")
+	// Planted negative: calling the real resolve_go_bin when ONLY stale go1.21.0 is reachable fails closed.
+	out, stderr, negCode := runInstallFunc(t, []string{
+		"PATH=" + staleBin + ":" + toolBin,
+		"BV_GO_FALLBACK_BINS=",
+	}, "", `resolve_go_bin`, "")
 	if negCode == 0 {
-		t.Fatal("expected stale go1.21.0 to be rejected against MIN_GO_VERSION")
+		t.Fatalf("expected real resolve_go_bin to reject stale go1.21.0, got out=%q stderr=%s", out, stderr)
 	}
-	// Positive: when freshGo is on PATH, resolve_go_bin returns freshGo.
-	out, stderr, code = runInstallFunc(t, []string{"PATH=" + freshBin + ":" + staleBin + ":/usr/bin:/bin"}, "", `resolve_go_bin`, "")
+	// Positive: when staleBin precedes freshBin in PATH, real resolve_go_bin skips staleGo and returns freshGo.
+	out, stderr, code = runInstallFunc(t, []string{
+		"PATH=" + staleBin + ":" + freshBin + ":" + toolBin,
+		"BV_GO_FALLBACK_BINS=",
+	}, "", `resolve_go_bin`, "")
 	if code != 0 || strings.TrimSpace(out) != freshGo {
-		t.Fatalf("expected resolve_go_bin=%q, got exit=%d out=%q stderr=%s", freshGo, code, out, stderr)
+		t.Fatalf("expected real resolve_go_bin=%q with staleBin first in PATH, got exit=%d out=%q stderr=%s", freshGo, code, out, stderr)
+	}
+
+	// 3. Real ensure_go -> real resolve_go_bin selects freshGo (when staleGo is first in PATH or in BV_GO_FALLBACK_BINS) without calling brew/pkg.
+	ensureSetup := `
+brew() { echo "UNEXPECTED_BREW" >&2; return 99; }
+install_go_from_pkg() { echo "UNEXPECTED_PKG" >&2; return 99; }`
+	out, stderr, code = runInstallFunc(t, []string{
+		"PATH=" + staleBin + ":" + freshBin + ":" + toolBin,
+		"BV_GO_FALLBACK_BINS=",
+	}, ensureSetup, `ensure_go`, "")
+	if code != 0 || strings.TrimSpace(out) != "1.26.11" || strings.Contains(stderr, "UNEXPECTED_") {
+		t.Fatalf("expected real ensure_go=1.26.11 via real resolve_go_bin without brew/pkg, got exit=%d out=%q stderr=%s", code, out, stderr)
+	}
+	out, stderr, code = runInstallFunc(t, []string{
+		"PATH=" + staleBin + ":" + toolBin,
+		"BV_GO_FALLBACK_BINS=" + freshGo,
+	}, ensureSetup, `ensure_go`, "")
+	if code != 0 || strings.TrimSpace(out) != "1.26.11" || strings.Contains(stderr, "UNEXPECTED_") {
+		t.Fatalf("expected real ensure_go=1.26.11 via BV_GO_FALLBACK_BINS without brew/pkg, got exit=%d out=%q stderr=%s", code, out, stderr)
+	}
+
+	// 4. try_binary_install scrubs BV_ROBOT, BV_OUTPUT_FORMAT, and TOON_DEFAULT_FORMAT before running --version.
+	stageDir := t.TempDir()
+	installDir := t.TempDir()
+	binScript := "#!/bin/sh\nif [ -n \"${BV_ROBOT:-}\" ] || [ -n \"${BV_OUTPUT_FORMAT:-}\" ] || [ -n \"${TOON_DEFAULT_FORMAT:-}\" ]; then\n  printf '{\"tool\":\"bv\",\"version\":\"v0.26.1\"}\\n'\n  exit 0\nfi\nprintf 'bv v0.26.1\\n'\n"
+	binFile := filepath.Join(stageDir, "bv")
+	if err := os.WriteFile(binFile, []byte(binScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	archiveFile := filepath.Join(stageDir, "bv_0.26.1_linux_amd64.tar.gz")
+	tarCmd := exec.Command("tar", "-czf", archiveFile, "-C", stageDir, "bv")
+	if tarOut, err := tarCmd.CombinedOutput(); err != nil {
+		t.Fatalf("tar archive: %v\n%s", err, tarOut)
+	}
+	sumOut, err := exec.Command("sha256sum", archiveFile).Output()
+	if err != nil {
+		t.Fatalf("sha256sum: %v", err)
+	}
+	archiveSHA := strings.Fields(string(sumOut))[0]
+	checksumsFile := filepath.Join(stageDir, "checksums.txt")
+	if err := os.WriteFile(checksumsFile, []byte(archiveSHA+"  bv_0.26.1_linux_amd64.tar.gz\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	binInstallSetup := `
+get_latest_release() {
+    printf '{"tag_name":"v0.26.1","assets":[{"name":"bv_0.26.1_linux_amd64.tar.gz","browser_download_url":"https://example.test/dl/bv_0.26.1_linux_amd64.tar.gz"},{"name":"checksums.txt","browser_download_url":"https://example.test/dl/checksums.txt"}]}\n'
+}
+download_file() {
+    case "$1" in
+        *checksums.txt) cp "$STAGE_SUMS" "$2" ;;
+        *) cp "$STAGE_ARCHIVE" "$2" ;;
+    esac
+}`
+	out, stderr, code = runInstallFunc(t, []string{
+		"INSTALL_DIR=" + installDir,
+		"STAGE_ARCHIVE=" + archiveFile,
+		"STAGE_SUMS=" + checksumsFile,
+		"BV_ROBOT=1",
+		"BV_OUTPUT_FORMAT=json",
+		"TOON_DEFAULT_FORMAT=toon",
+	}, binInstallSetup, `try_binary_install linux_amd64`, "")
+	if code != 0 {
+		t.Fatalf("try_binary_install failed under BV_ROBOT=1/BV_OUTPUT_FORMAT=json: exit=%d out=%q stderr=%s", code, out, stderr)
+	}
+	if _, err := os.Stat(filepath.Join(installDir, "bv")); err != nil {
+		t.Fatalf("expected installed binary at %s/bv: %v", installDir, err)
 	}
 }

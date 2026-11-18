@@ -1880,9 +1880,6 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 	if !hasClosed {
 		return stats.Betweenness(), stats.CoreNumber(), stats.ArticulationPoints()
 	}
-	if len(activeIDs) == 0 {
-		return map[string]float64{}, map[string]int{}, []string{}
-	}
 
 	status := stats.Status()
 	wantBW := status.Betweenness.State == "computed" || status.Betweenness.State == "approx" || status.Betweenness.State == ""
@@ -1899,9 +1896,10 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 		stats.mu.RUnlock()
 		return bwCached, coreCached, artCached
 	}
+	cfg := stats.Config
 	stats.mu.RUnlock()
 
-	_, bwOut, coreOut, artOut := a.computeActiveSubgraphMetricsWithKey(activeIDs, activeHash, stats.Config, status)
+	_, bwOut, coreOut, artOut := a.computeActiveSubgraphMetricsWithKey(activeIDs, activeHash, cfg, status)
 
 	stats.mu.Lock()
 	stats.activeMetricsKey = cacheKey
@@ -2322,6 +2320,9 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 			}
 			incCacheKey += "|" + configHash
 			if cached, ok := getIncrementalGraphStatsCache(incCacheKey); ok {
+				if _, hasClosed, _ := a.ensureActiveSet(); hasClosed {
+					a.activeSubgraphMetrics(cached)
+				}
 				return cached
 			}
 		}
@@ -2396,76 +2397,81 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 	return stats
 }
 
+// snapshotValue returns a value copy of s with Phase 2 and active-subgraph
+// fields read safely under s.mu.RLock().
+func (s *GraphStats) snapshotValue() GraphStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var activeBW map[string]float64
+	if s.activeBetweenness != nil {
+		activeBW = make(map[string]float64, len(s.activeBetweenness))
+		for k, v := range s.activeBetweenness {
+			activeBW[k] = v
+		}
+	}
+	var activeCore map[string]int
+	if s.activeCoreNumber != nil {
+		activeCore = make(map[string]int, len(s.activeCoreNumber))
+		for k, v := range s.activeCoreNumber {
+			activeCore[k] = v
+		}
+	}
+	var activeArt []string
+	if s.activeArticulation != nil {
+		activeArt = make([]string, len(s.activeArticulation))
+		copy(activeArt, s.activeArticulation)
+	}
+
+	return GraphStats{
+		OutDegree:          s.OutDegree,
+		InDegree:           s.InDegree,
+		TopologicalOrder:   s.TopologicalOrder,
+		Density:            s.Density,
+		NodeCount:          s.NodeCount,
+		EdgeCount:          s.EdgeCount,
+		Config:             s.Config,
+		pageRank:           s.pageRank,
+		betweenness:        s.betweenness,
+		eigenvector:        s.eigenvector,
+		hubs:               s.hubs,
+		authorities:        s.authorities,
+		criticalPathScore:  s.criticalPathScore,
+		pageRankRank:       s.pageRankRank,
+		betweennessRank:    s.betweennessRank,
+		eigenvectorRank:    s.eigenvectorRank,
+		hubsRank:           s.hubsRank,
+		authoritiesRank:    s.authoritiesRank,
+		criticalPathRank:   s.criticalPathRank,
+		inDegreeRank:       s.inDegreeRank,
+		outDegreeRank:      s.outDegreeRank,
+		coreNumber:         s.coreNumber,
+		articulation:       s.articulation,
+		slack:              s.slack,
+		cycles:             s.cycles,
+		phase2Ready:        true,
+		status:             s.status,
+		activeMetricsKey:   s.activeMetricsKey,
+		activeBetweenness:  activeBW,
+		activeCoreNumber:   activeCore,
+		activeArticulation: activeArt,
+	}
+}
+
 // Analyze performs synchronous graph analysis (for backward compatibility).
 // Blocks until all metrics are computed.
 func (a *Analyzer) Analyze() GraphStats {
 	stats := a.AnalyzeAsync(context.Background())
 	stats.WaitForPhase2()
 	// Return a copy with public fields populated for backward compatibility
-	return GraphStats{
-		OutDegree:         stats.OutDegree,
-		InDegree:          stats.InDegree,
-		TopologicalOrder:  stats.TopologicalOrder,
-		Density:           stats.Density,
-		NodeCount:         stats.NodeCount,
-		EdgeCount:         stats.EdgeCount,
-		Config:            stats.Config,
-		pageRank:          stats.pageRank,
-		betweenness:       stats.betweenness,
-		eigenvector:       stats.eigenvector,
-		hubs:              stats.hubs,
-		authorities:       stats.authorities,
-		criticalPathScore: stats.criticalPathScore,
-		pageRankRank:      stats.pageRankRank,
-		betweennessRank:   stats.betweennessRank,
-		eigenvectorRank:   stats.eigenvectorRank,
-		hubsRank:          stats.hubsRank,
-		authoritiesRank:   stats.authoritiesRank,
-		criticalPathRank:  stats.criticalPathRank,
-		inDegreeRank:      stats.inDegreeRank,
-		outDegreeRank:     stats.outDegreeRank,
-		coreNumber:        stats.coreNumber,
-		articulation:      stats.articulation,
-		slack:             stats.slack,
-		cycles:            stats.cycles,
-		phase2Ready:       true,
-		status:            stats.status,
-	}
+	return stats.snapshotValue()
 }
 
 // AnalyzeWithConfig performs synchronous graph analysis with a custom configuration.
 func (a *Analyzer) AnalyzeWithConfig(config AnalysisConfig) GraphStats {
 	stats := a.AnalyzeAsyncWithConfig(context.Background(), config)
 	stats.WaitForPhase2()
-	return GraphStats{
-		OutDegree:         stats.OutDegree,
-		InDegree:          stats.InDegree,
-		TopologicalOrder:  stats.TopologicalOrder,
-		Density:           stats.Density,
-		NodeCount:         stats.NodeCount,
-		EdgeCount:         stats.EdgeCount,
-		Config:            stats.Config,
-		pageRank:          stats.pageRank,
-		betweenness:       stats.betweenness,
-		eigenvector:       stats.eigenvector,
-		hubs:              stats.hubs,
-		authorities:       stats.authorities,
-		criticalPathScore: stats.criticalPathScore,
-		pageRankRank:      stats.pageRankRank,
-		betweennessRank:   stats.betweennessRank,
-		eigenvectorRank:   stats.eigenvectorRank,
-		hubsRank:          stats.hubsRank,
-		authoritiesRank:   stats.authoritiesRank,
-		criticalPathRank:  stats.criticalPathRank,
-		inDegreeRank:      stats.inDegreeRank,
-		outDegreeRank:     stats.outDegreeRank,
-		coreNumber:        stats.coreNumber,
-		articulation:      stats.articulation,
-		slack:             stats.slack,
-		cycles:            stats.cycles,
-		phase2Ready:       true,
-		status:            stats.status,
-	}
+	return stats.snapshotValue()
 }
 
 // AnalyzeWithProfile performs synchronous graph analysis and returns detailed timing profile.

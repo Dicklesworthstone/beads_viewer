@@ -727,7 +727,7 @@ func (a *Analyzer) generateCoverageSet(limit int) *CoverageSetResult {
 			continue
 		}
 		for _, dep := range issue.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() {
+			if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == id {
 				continue
 			}
 			if !a.IsCandidate(dep.DependsOnID) {

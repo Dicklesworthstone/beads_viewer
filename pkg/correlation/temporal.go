@@ -79,6 +79,7 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 	// Build git log command with author and date filters
 	args := []string{
 		"log",
+		"-i",
 		fmt.Sprintf("--author=%s", authorRegex),
 		fmt.Sprintf("--since=%s", window.Start.Format(time.RFC3339)),
 		fmt.Sprintf("--until=%s", window.End.Format(time.RFC3339)),
@@ -114,6 +115,9 @@ func (t *TemporalCorrelator) FindCommitsInWindow(window TemporalWindow) ([]Corre
 
 		info, err := parseCommitInfo(line)
 		if err != nil {
+			continue
+		}
+		if !sameClaimantIdentity(window.AuthorEmail, window.Author, info.AuthorEmail, info.Author) {
 			continue
 		}
 
@@ -348,27 +352,56 @@ func clamp(value, min, max float64) float64 {
 // when both emails are non-empty, falling back to case-insensitive display name
 // when either email is empty so two unrelated empty-email records never match.
 func sameClaimantIdentity(emailA, authorA, emailB, authorB string) bool {
-	if emailA != "" && emailB != "" {
-		return strings.EqualFold(emailA, emailB)
+	eA := strings.TrimSpace(emailA)
+	eB := strings.TrimSpace(emailB)
+	if eA != "" && eB != "" {
+		return strings.EqualFold(eA, eB)
 	}
-	if authorA != "" && authorB != "" {
-		return strings.EqualFold(authorA, authorB)
+	aA := strings.TrimSpace(authorA)
+	aB := strings.TrimSpace(authorB)
+	if aA != "" && aB != "" {
+		return strings.EqualFold(aA, aB)
 	}
 	return false
 }
 
-// ExtractWindowFromMilestones creates a TemporalWindow from bead milestones.
-// When milestones.Closed is nil and a non-zero fallbackEnd is supplied at or
-// after Claimed.Timestamp, End is bounded to fallbackEnd so claimed open /
-// in_progress beads participate deterministically without consulting time.Now().
-func ExtractWindowFromMilestones(beadID, title string, milestones BeadMilestones, fallbackEnd ...time.Time) *TemporalWindow {
+// milestonesStillClosed reports whether milestones represent a bead that remains
+// closed rather than reopened at or after its most recent Closed timestamp
+// (fallback when raw chronological events are unavailable).
+func milestonesStillClosed(milestones BeadMilestones) bool {
+	if milestones.Closed == nil {
+		return false
+	}
+	if milestones.Reopened != nil && !milestones.Reopened.Timestamp.Before(milestones.Closed.Timestamp) {
+		return false
+	}
+	return true
+}
+
+// historyStillClosed determines whether h remains closed using live history
+// status and chronological event order (handling 1-second git timestamp ties),
+// falling back to milestonesStillClosed only when raw events are unavailable.
+func historyStillClosed(h BeadHistory) bool {
+	if h.Milestones.Closed == nil {
+		return false
+	}
+	if s := strings.ToLower(strings.TrimSpace(h.Status)); s != "" && s != "deleted" && !isClosedHistoryStatus(s) {
+		return false
+	}
+	if len(h.Events) > 0 {
+		return eventsStillClosed(h.Events)
+	}
+	return milestonesStillClosed(h.Milestones)
+}
+
+func extractWindowForBead(beadID, title string, milestones BeadMilestones, stillClosed bool, fallbackEnd ...time.Time) *TemporalWindow {
 	if milestones.Claimed == nil {
 		return nil
 	}
 
 	var end time.Time
 	switch {
-	case milestones.Closed != nil:
+	case stillClosed && milestones.Closed != nil:
 		end = milestones.Closed.Timestamp
 	case len(fallbackEnd) > 0 && !fallbackEnd[0].IsZero() && !fallbackEnd[0].Before(milestones.Claimed.Timestamp):
 		end = fallbackEnd[0]
@@ -386,39 +419,84 @@ func ExtractWindowFromMilestones(beadID, title string, milestones BeadMilestones
 	}
 }
 
+// ExtractWindowFromMilestones creates a TemporalWindow from bead milestones.
+// When the bead is still open (Closed is nil, or Reopened is at or after Closed)
+// and a non-zero fallbackEnd is supplied at or after Claimed.Timestamp, End is
+// bounded to fallbackEnd so claimed open / reopened beads participate
+// deterministically without consulting time.Now().
+func ExtractWindowFromMilestones(beadID, title string, milestones BeadMilestones, fallbackEnd ...time.Time) *TemporalWindow {
+	return extractWindowForBead(beadID, title, milestones, milestonesStillClosed(milestones), fallbackEnd...)
+}
+
+func (t *TemporalCorrelator) latestRepoCommitTime() time.Time {
+	if strings.TrimSpace(t.repoPath) == "" {
+		return time.Time{}
+	}
+	cmd := gitCommand(t.ctx, "log", "-1", "--format=%aI")
+	cmd.Dir = t.repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return time.Time{}
+	}
+	ts, err := time.Parse(time.RFC3339, strings.TrimSpace(string(out)))
+	if err != nil {
+		return time.Time{}
+	}
+	return ts
+}
+
 // ExtractAllTemporalCorrelations finds temporal correlations for all beads with claimed windows.
 func (t *TemporalCorrelator) ExtractAllTemporalCorrelations(histories map[string]BeadHistory) ([]CorrelatedCommit, error) {
 	var allCommits []CorrelatedCommit
+	if len(histories) == 0 {
+		return nil, nil
+	}
 
+	beadIDs := make([]string, 0, len(histories))
 	var latestMilestone time.Time
-	for _, h := range histories {
+	for id, h := range histories {
+		beadIDs = append(beadIDs, id)
+		if h.Milestones.Created != nil && h.Milestones.Created.Timestamp.After(latestMilestone) {
+			latestMilestone = h.Milestones.Created.Timestamp
+		}
 		if h.Milestones.Claimed != nil && h.Milestones.Claimed.Timestamp.After(latestMilestone) {
 			latestMilestone = h.Milestones.Claimed.Timestamp
 		}
 		if h.Milestones.Closed != nil && h.Milestones.Closed.Timestamp.After(latestMilestone) {
 			latestMilestone = h.Milestones.Closed.Timestamp
 		}
+		if h.Milestones.Reopened != nil && h.Milestones.Reopened.Timestamp.After(latestMilestone) {
+			latestMilestone = h.Milestones.Reopened.Timestamp
+		}
+	}
+	sort.Strings(beadIDs)
+
+	windowBound := latestMilestone
+	if latestCommit := t.latestRepoCommitTime(); latestCommit.After(windowBound) {
+		windowBound = latestCommit
 	}
 
-	for beadID, history := range histories {
-		window := ExtractWindowFromMilestones(beadID, history.Title, history.Milestones, latestMilestone)
+	for _, beadID := range beadIDs {
+		history := histories[beadID]
+		window := extractWindowForBead(beadID, history.Title, history.Milestones, historyStillClosed(history), windowBound)
 		if window == nil {
 			continue
 		}
 
 		// Calculate concurrent beads for this author during this window
 		concurrent := 0
-		for _, otherHistory := range histories {
+		for _, otherID := range beadIDs {
+			otherHistory := histories[otherID]
 			if otherHistory.Milestones.Claimed != nil &&
-				sameClaimantIdentity(
+				(otherID == beadID || sameClaimantIdentity(
 					otherHistory.Milestones.Claimed.AuthorEmail,
 					otherHistory.Milestones.Claimed.Author,
 					window.AuthorEmail,
 					window.Author,
-				) {
+				)) {
 				start := otherHistory.Milestones.Claimed.Timestamp
-				end := latestMilestone
-				if otherHistory.Milestones.Closed != nil {
+				end := windowBound
+				if historyStillClosed(otherHistory) {
 					end = otherHistory.Milestones.Closed.Timestamp
 				}
 
@@ -461,12 +539,15 @@ type temporalCandidate struct {
 	ActiveBeads  int          `json:"active_beads"`
 }
 
-// temporalWindowsFromEvents derives one claimed→closed (or claimed→latestCommitTime
-// for still-open claimed beads) window per bead from extracted lifecycle events,
-// with ActiveBeads set to the number of beads the same claimant had claimed and
-// overlapping the window (itself included). It never consults time.Now(), keeping
-// the artifact deterministic. Windows are returned in bead id order.
-func temporalWindowsFromEvents(events []BeadEvent, latestCommitTime time.Time, beadFilter string, beadAliases ...string) []TemporalWindow {
+// temporalWindowsFromEvents derives one claimed→closed window per completed bead
+// from extracted lifecycle events, with ActiveBeads set to the number of beads
+// (both closed and still-open/reopened) the same claimant had claimed and
+// overlapping the window (itself included). Unclosed/reopened claims remain
+// unlinked in the automatic history index so OrphanDetector can surface unlinked
+// commits with probable_beads, while ExtractWindowFromMilestones(..., fallbackEnd)
+// and TemporalCorrelator.ExtractAllTemporalCorrelations bound open windows
+// deterministically by latest commit timestamp. Windows are returned in bead id order.
+func temporalWindowsFromEvents(events []BeadEvent, beadFilter string, beadAliases ...string) []TemporalWindow {
 	eventsByBead := make(map[string][]BeadEvent)
 	for _, ev := range events {
 		eventsByBead[ev.BeadID] = append(eventsByBead[ev.BeadID], ev)
@@ -487,16 +568,18 @@ func temporalWindowsFromEvents(events []BeadEvent, latestCommitTime time.Time, b
 	spans := make(map[string]claimSpan, len(beadIDs))
 	var windows []TemporalWindow
 	for _, id := range beadIDs {
-		m := GetBeadMilestones(eventsByBead[id])
+		beadEvents := eventsByBead[id]
+		m := GetBeadMilestones(beadEvents)
 		if m.Claimed == nil {
 			continue
 		}
+		stillClosed := eventsStillClosed(beadEvents)
 		span := claimSpan{
 			email:  m.Claimed.AuthorEmail,
 			author: m.Claimed.Author,
 			start:  m.Claimed.Timestamp,
 		}
-		if m.Closed != nil {
+		if stillClosed && m.Closed != nil {
 			span.end = m.Closed.Timestamp
 			span.closed = true
 		}
@@ -504,15 +587,15 @@ func temporalWindowsFromEvents(events []BeadEvent, latestCommitTime time.Time, b
 		if !matchesBeadFilter(id, beadFilter, beadAliases) {
 			continue
 		}
-		if w := ExtractWindowFromMilestones(id, "", m, latestCommitTime); w != nil {
+		if w := extractWindowForBead(id, "", m, stillClosed); w != nil {
 			windows = append(windows, *w)
 		}
 	}
 	for i := range windows {
 		w := &windows[i]
 		concurrent := 0
-		for _, span := range spans {
-			if !sameClaimantIdentity(span.email, span.author, w.AuthorEmail, w.Author) {
+		for spanID, span := range spans {
+			if spanID != w.BeadID && !sameClaimantIdentity(span.email, span.author, w.AuthorEmail, w.Author) {
 				continue
 			}
 			if span.start.After(w.End) {

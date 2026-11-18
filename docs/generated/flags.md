@@ -9,12 +9,13 @@
 | `--agents-remove` | bool | `false` | Remove beads workflow instructions from AGENTS.md | Agent File Management |
 | `--agents-reset` | bool | `false` | Clear saved AGENTS.md prompt preference | Agent File Management |
 | `--agents-update` | bool | `false` | Update beads workflow instructions to latest version | Agent File Management |
-| `--agent-brief` | string | (empty) | Export agent brief bundle to directory (includes triage.json, insights.json, brief.md, helpers.md) | Export & Reporting |
+| `--agent-brief` | string | (empty) | Export agent brief bundle to directory (includes triage.json, insights.json, brief.md, helpers.md, meta.json) | Export & Reporting |
 | `--emit-script` | bool | `false` | Emit shell script for top-N recommendations (agent workflows) | Export & Reporting |
 | `--export` | string | (empty) | Export a report using recipe defaults or explicit export options | Export & Reporting |
 | `--export-format` | string | (empty) | Report format: markdown, html, json, csv or mermaid | Export & Reporting |
 | `--export-graph` | string | (empty) | Export graph: .html for interactive, .png/.svg for static (auto-names if empty) | Export & Reporting |
 | `--export-group-by` | string | (empty) | Group exported issues by: status, priority, type, assignee, label, or none (overrides recipe view.group_by) | Export & Reporting |
+| `--export-include-actions` | bool | `true` | Include recommended action plan in Markdown/HTML reports (explicit false overrides recipe) | Export & Reporting |
 | `--export-include-graph` | bool | `true` | Include dependency context in the report (explicit false overrides recipe) | Export & Reporting |
 | `--export-md` | string | (empty) | Export issues to a Markdown file (e.g., report.md) | Export & Reporting |
 | `--export-pages` | string | (empty) | Export static site to directory (e.g., ./bv-pages) | Export & Reporting |
@@ -143,7 +144,7 @@
 | `--recipe` | string | (empty) | Apply a recipe by name (e.g., triage, actionable, high-impact) or by .yaml/.yml file path (e.g., .beads/recipes/sprint.yaml) | Search & Filters |
 | `--repo` | string | (empty) | Filter issues by repository prefix (e.g., 'api-' or 'api') | Search & Filters |
 | `--robot-by-assignee` | string | (empty) | Filter --robot-priority recommendations by assignee (exact match) | Search & Filters |
-| `--robot-by-label` | string | (empty) | Filter --robot-priority recommendations by label (exact match); use --label to scope other robot commands | Search & Filters |
+| `--robot-by-label` | string | (empty) | Filter --robot-priority recommendations by label (case-insensitive match); use --label to scope other robot commands | Search & Filters |
 | `--robot-max-results` | int | `0` | Limit robot output count (0 = use defaults) | Search & Filters |
 | `--robot-min-confidence` | float64 | `0` | Filter --robot-priority recommendations by minimum confidence (0.0-1.0) | Search & Filters |
 | `--search` | string | (empty) | Hashed keyword search query (builds/updates index on first run) | Search & Filters |
