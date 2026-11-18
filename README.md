@@ -70,16 +70,16 @@ Releases up to v0.22.0 used unversioned names (`bv_linux_amd64.tar.gz`); `bv --u
 Prefer Homebrew, Scoop, or a checksum-verified release archive above. If you do pipe the script, pin it to a commit you have read instead of the moving `main` branch:
 
 ```bash
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/79dfd6d683b91201e55c86fd85c667e3c7617372/install.sh
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/79dfd6d683b91201e55c86fd85c667e3c7617372/install.sh" | bash
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/8698c9b6511aae516096727816b1ae61e09e7126/install.sh
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/8698c9b6511aae516096727816b1ae61e09e7126/install.sh" | bash
 ```
 
 > **Warning:** `curl ... | bash` runs whatever the URL serves at that moment. The pinned form above cannot change under you; the `main` form can. `install.sh` downloads the release archive for your platform, verifies it against the release `checksums.txt`, and refuses to install on a mismatch.
 
 **Windows (PowerShell):**
 ```powershell
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/79dfd6d683b91201e55c86fd85c667e3c7617372/install.ps1
-irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/79dfd6d683b91201e55c86fd85c667e3c7617372/install.ps1" | iex
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/8698c9b6511aae516096727816b1ae61e09e7126/install.ps1
+irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/8698c9b6511aae516096727816b1ae61e09e7126/install.ps1" | iex
 ```
 > **Note:** The pinned installer above downloads the Windows release zip, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses anything that does not verify; no Go toolchain is needed. Pass `-Version v0.26.0` to pin a release or `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`). Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
 
@@ -4191,8 +4191,8 @@ The fastest way to get started. Detects your OS and architecture automatically.
 Prefer Homebrew, Scoop, or a checksum-verified release archive above. If you do pipe the script, pin it to a commit you have read instead of the moving `main` branch:
 
 ```bash
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/79dfd6d683b91201e55c86fd85c667e3c7617372/install.sh
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/79dfd6d683b91201e55c86fd85c667e3c7617372/install.sh" | bash
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/8698c9b6511aae516096727816b1ae61e09e7126/install.sh
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/8698c9b6511aae516096727816b1ae61e09e7126/install.sh" | bash
 ```
 
 > **Warning:** `curl ... | bash` runs whatever the URL serves at that moment. The pinned form above cannot change under you; the `main` form can. `install.sh` downloads the release archive for your platform, verifies it against the release `checksums.txt`, and refuses to install on a mismatch.
@@ -4201,8 +4201,8 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/79d
 For Windows users using PowerShell:
 
 ```powershell
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/79dfd6d683b91201e55c86fd85c667e3c7617372/install.ps1
-irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/79dfd6d683b91201e55c86fd85c667e3c7617372/install.ps1" | iex
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/8698c9b6511aae516096727816b1ae61e09e7126/install.ps1
+irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/8698c9b6511aae516096727816b1ae61e09e7126/install.ps1" | iex
 ```
 
 **Requirements:**
