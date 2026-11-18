@@ -572,6 +572,21 @@ func TestDetectAgentFileInParents(t *testing.T) {
 			t.Fatalf("Expected search to stop at .git file boundary, but found %q", detection.FilePath)
 		}
 	})
+
+	t.Run("stops before system temp root and filesystem root", func(t *testing.T) {
+		if !isAgentSearchBoundaryParent(string(filepath.Separator)) {
+			t.Fatal("expected filesystem root to be a parent search boundary")
+		}
+		if !isAgentSearchBoundaryParent(os.TempDir()) {
+			t.Fatalf("expected os.TempDir() %q to be a parent search boundary", os.TempDir())
+		}
+		// Under TMPDIR=/tmp, a fresh temp project 2 levels below /tmp must NEVER climb into /tmp or /AGENTS.md.
+		shallowTmp := t.TempDir()
+		detection := DetectAgentFileInParents(shallowTmp, 10)
+		if detection.Found() {
+			t.Fatalf("Expected search inside temp dir %q to stop before /tmp and /, got %q", shallowTmp, detection.FilePath)
+		}
+	})
 }
 
 func TestAgentFileExists(t *testing.T) {

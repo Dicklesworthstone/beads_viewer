@@ -228,6 +228,27 @@ func highestBlurbBlockVersion(blocks []blurbBlock) int {
 	return version
 }
 
+func isAgentSearchBoundaryParent(parentDir string) bool {
+	clean := filepath.Clean(parentDir)
+	if filepath.Dir(clean) == clean {
+		// Never climb upward into the filesystem root ("/" or "C:\").
+		return true
+	}
+	for _, tmpRoot := range []string{os.TempDir(), "/tmp", "/var/tmp"} {
+		if strings.TrimSpace(tmpRoot) == "" {
+			continue
+		}
+		cleanTmp := filepath.Clean(tmpRoot)
+		if clean == cleanTmp {
+			return true
+		}
+		if evalTmp, err := filepath.EvalSymlinks(cleanTmp); err == nil && clean == filepath.Clean(evalTmp) {
+			return true
+		}
+	}
+	return false
+}
+
 // DetectAgentFileInParents searches for agent files starting from workDir
 // and walking up the directory tree. This is useful for finding a project-level
 // AGENTS.md when running from a subdirectory.
@@ -254,8 +275,8 @@ func DetectAgentFileInParents(workDir string, maxLevels int) AgentFileDetection 
 
 		// Move to parent directory
 		parentDir := filepath.Dir(currentDir)
-		if parentDir == currentDir {
-			// Reached root
+		if parentDir == currentDir || isAgentSearchBoundaryParent(parentDir) {
+			// Reached root or system temp directory boundary
 			break
 		}
 		currentDir = parentDir

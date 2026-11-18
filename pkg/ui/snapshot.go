@@ -392,6 +392,7 @@ func (l *GraphLayout) UpdatePhase2Ranks(stats *analysis.GraphStats) {
 type SnapshotBuilder struct {
 	ctx                context.Context
 	issues             []model.Issue
+	dataHash           string
 	analyzer           *analysis.Analyzer
 	analysis           *analysis.GraphStats
 	recipe             *recipe.Recipe
@@ -468,6 +469,13 @@ func (b *SnapshotBuilder) WithBeadsPath(beadsPath string) *SnapshotBuilder {
 func (b *SnapshotBuilder) WithProjectDir(projectDir string) *SnapshotBuilder {
 	b.projectDir = projectDir
 	b.explicitProjectDir = projectDir
+	return b
+}
+
+// WithDataHash supplies a precomputed issue data hash so Build need not
+// recompute it and UI-thread SnapshotReadyMsg swaps stay O(1).
+func (b *SnapshotBuilder) WithDataHash(hash string) *SnapshotBuilder {
+	b.dataHash = hash
 	return b
 }
 
@@ -752,10 +760,15 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 
 	projectDir := b.resolvedProjectDir()
 	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsForDir(issues, graphStats, b.analyzer, projectDir)
+	dataHash := b.dataHash
+	if dataHash == "" {
+		dataHash = analysis.ComputeDataHash(issues)
+	}
 
 	snapshot := &DataSnapshot{
 		LoadError:         recipeErr,
 		Issues:            issues,
+		DataHash:          dataHash,
 		IssueMap:          issueMap,
 		ViewIssues:        viewIssues,
 		Analyzer:          b.analyzer,
