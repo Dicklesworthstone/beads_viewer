@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // TutorialPage represents a single page of tutorial content.
@@ -254,62 +255,66 @@ func (m TutorialModel) View() string {
 
 	r := m.theme.Renderer
 
-	// Calculate dimensions
-	contentWidth := m.width - 6 // padding and borders
+	// Calculate dimensions within m.width (accounting for 2 border columns and 4 horizontal padding columns)
+	boxWidth := max(m.width-2, 16)
+	innerWidth := max(boxWidth-4, 12)
+	vertPad := 1
+	if m.height > 0 && m.height <= 26 {
+		vertPad = 0
+	}
+	contentWidth := innerWidth
 	if m.tocVisible {
-		contentWidth -= 24 // TOC sidebar width
-	}
-	if contentWidth < 40 {
-		contentWidth = 40
+		contentWidth = max(innerWidth-26, 20) // TOC sidebar (24 cols) + 2-space gap
 	}
 
-	// Build the view
-	var b strings.Builder
-
-	// Header
+	// Header + separator + page title
 	header := m.renderHeader(currentPage, len(pages))
-	b.WriteString(header)
-	b.WriteString("\n")
-
-	// Separator line
 	sepStyle := r.NewStyle().Foreground(m.theme.Border)
-	b.WriteString(sepStyle.Render(strings.Repeat("─", contentWidth+4)))
-	b.WriteString("\n")
+	sep := sepStyle.Render(strings.Repeat("─", innerWidth))
 
-	// Page title and section
 	pageTitleStyle := r.NewStyle().Bold(true).Foreground(m.theme.Primary)
 	sectionStyle := r.NewStyle().Foreground(m.theme.Subtext).Italic(true)
 	pageTitle := pageTitleStyle.Render(currentPage.Title)
 	if currentPage.Section != "" {
 		pageTitle += sectionStyle.Render(" — " + currentPage.Section)
 	}
-	b.WriteString(pageTitle)
+	headerBlock := header + "\n" + sep + "\n" + pageTitle
+
+	// Footer with navigation hints
+	footer := m.renderFooter(len(pages))
+
+	wrapMeasure := r.NewStyle().Width(innerWidth)
+	headerH := lipgloss.Height(wrapMeasure.Render(headerBlock))
+	footerH := lipgloss.Height(wrapMeasure.Render(footer))
+	borderH := 2 + 2*vertPad
+	availBody := max(1, m.height-headerH-footerH-borderH)
+
+	// Build the view
+	var b strings.Builder
+	b.WriteString(headerBlock)
 	b.WriteString("\n")
 
 	// Content area (with optional TOC)
 	if m.tocVisible {
-		toc := m.renderTOC(pages)
-		content := m.renderContent(currentPage, contentWidth)
+		toc := m.renderTOC(pages, availBody)
+		content := m.renderContent(currentPage, contentWidth, availBody)
 		// Join TOC and content horizontally
 		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, toc, "  ", content))
 	} else {
-		content := m.renderContent(currentPage, contentWidth)
+		content := m.renderContent(currentPage, contentWidth, availBody)
 		b.WriteString(content)
 	}
 
 	b.WriteString("\n")
-
-	// Footer with navigation hints
-	footer := m.renderFooter(len(pages))
 	b.WriteString(footer)
 
 	// Wrap in modal style
 	modalStyle := r.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Primary).
-		Padding(1, 2).
-		Width(m.width).
-		MaxHeight(m.height)
+		Padding(vertPad, 2).
+		Width(boxWidth).
+		MaxHeight(max(m.height, 1))
 
 	return modalStyle.Render(b.String())
 }
@@ -380,13 +385,11 @@ func (m TutorialModel) viewedPercent() int {
 }
 
 // renderContent renders the page content with native lipgloss components or Glamour markdown.
-func (m TutorialModel) renderContent(page TutorialPage, width int) string {
-	r := m.theme.Renderer
-
+func (m TutorialModel) renderContent(page TutorialPage, width, availHeight int) string {
 	// Check if we have a structured page for this ID (preferred)
 	if structuredPage := getStructuredPage(page.ID); structuredPage != nil {
 		// Use native lipgloss component rendering
-		return m.renderStructuredContent(*structuredPage, width)
+		return m.renderStructuredContent(*structuredPage, width, availHeight)
 	}
 
 	// Fallback to markdown rendering for unconverted pages
@@ -422,97 +425,76 @@ func (m TutorialModel) renderContent(page TutorialPage, width int) string {
 			compressedLines = append(compressedLines, line)
 		}
 	}
-	lines = compressedLines
-
-	// Calculate visible lines based on height
-	// Overhead: border (2) + padding (2) + header (1) + separator (1) + title (1) +
-	//           title margin (1) + footer (1) = 9 lines
-	// Plus 1-2 for scroll indicators that may be added
-	visibleHeight := m.height - 11
-	if visibleHeight < 5 {
-		visibleHeight = 5
-	}
-
-	// Clamp scroll offset
-	maxScroll := len(lines) - visibleHeight
-	if maxScroll < 0 {
-		maxScroll = 0
-	}
-	if m.scrollOffset > maxScroll {
-		m.scrollOffset = maxScroll
-	}
-
-	// Get visible lines
-	endLine := m.scrollOffset + visibleHeight
-	if endLine > len(lines) {
-		endLine = len(lines)
-	}
-	visibleLines := lines[m.scrollOffset:endLine]
-
-	// Join visible lines (already styled by Glamour)
-	content := strings.Join(visibleLines, "\n")
-
-	// Add scroll indicators (these are accounted for in the height calculation)
-	if m.scrollOffset > 0 {
-		scrollUpHint := r.NewStyle().Foreground(m.theme.Muted).Render("↑ more above")
-		content = scrollUpHint + "\n" + content
-	}
-	if endLine < len(lines) {
-		scrollDownHint := r.NewStyle().Foreground(m.theme.Muted).Render("↓ more below")
-		content = content + "\n" + scrollDownHint
-	}
-
-	return content
+	return m.windowContentLines(compressedLines, width, availHeight)
 }
 
 // renderStructuredContent renders a structured tutorial page with native lipgloss components.
-func (m TutorialModel) renderStructuredContent(page StructuredTutorialPage, width int) string {
-	// Render all elements using native lipgloss components
+func (m TutorialModel) renderStructuredContent(page StructuredTutorialPage, width, availHeight int) string {
 	renderedContent := RenderStructuredPage(page, m.theme, width)
-
-	// Split into lines for scrolling
 	lines := strings.Split(renderedContent, "\n")
+	return m.windowContentLines(lines, width, availHeight)
+}
 
-	// Calculate visible lines based on height
-	visibleHeight := m.height - 11
-	if visibleHeight < 5 {
-		visibleHeight = 5
+func (m TutorialModel) windowContentLines(lines []string, width, availHeight int) string {
+	if availHeight <= 0 {
+		availHeight = max(m.height-11, 5)
+	}
+	if width > 0 {
+		for i, ln := range lines {
+			if lipgloss.Width(ln) > width {
+				lines[i] = ansi.Truncate(ln, width, "…")
+			}
+		}
+	}
+	if len(lines) <= availHeight && m.scrollOffset == 0 {
+		return strings.Join(lines, "\n")
 	}
 
-	// Clamp scroll offset
-	maxScroll := len(lines) - visibleHeight
-	if maxScroll < 0 {
-		maxScroll = 0
-	}
-	if m.scrollOffset > maxScroll {
-		m.scrollOffset = maxScroll
-	}
+	r := m.theme.Renderer
+	hintStyle := r.NewStyle().Foreground(m.theme.Muted)
 
-	// Get visible lines
-	endLine := m.scrollOffset + visibleHeight
-	if endLine > len(lines) {
-		endLine = len(lines)
+	hasUp := m.scrollOffset > 0
+	slots := availHeight
+	if hasUp && slots > 1 {
+		slots--
 	}
-	visibleLines := lines[m.scrollOffset:endLine]
-
-	// Join visible lines
-	content := strings.Join(visibleLines, "\n")
-
-	// Add scroll indicators
-	if m.scrollOffset > 0 {
-		scrollUpHint := m.theme.Renderer.NewStyle().Foreground(m.theme.Muted).Render("↑ more above")
-		content = scrollUpHint + "\n" + content
+	if m.scrollOffset+slots < len(lines) && slots > 1 {
+		slots--
 	}
-	if endLine < len(lines) {
-		scrollDownHint := m.theme.Renderer.NewStyle().Foreground(m.theme.Muted).Render("↓ more below")
-		content = content + "\n" + scrollDownHint
+	maxScroll := max(0, len(lines)-slots)
+	offset := m.scrollOffset
+	if offset > maxScroll {
+		offset = maxScroll
 	}
+	if offset < 0 {
+		offset = 0
+	}
+	hasUp = offset > 0
 
-	return content
+	// Recompute exact slot budget once offset is clamped so total lines <= availHeight.
+	slots = availHeight
+	if hasUp && slots > 1 {
+		slots--
+	}
+	hasDown := offset+slots < len(lines)
+	if hasDown && slots > 1 {
+		slots--
+	}
+	endLine := min(len(lines), offset+slots)
+
+	var out []string
+	if hasUp && availHeight > 1 {
+		out = append(out, hintStyle.Render("↑ more above"))
+	}
+	out = append(out, lines[offset:endLine]...)
+	if endLine < len(lines) && len(out) < availHeight {
+		out = append(out, hintStyle.Render("↓ more below"))
+	}
+	return strings.Join(out, "\n")
 }
 
 // renderTOC renders the table of contents sidebar with focus indication (bv-wdsd).
-func (m TutorialModel) renderTOC(pages []TutorialPage) string {
+func (m TutorialModel) renderTOC(pages []TutorialPage, availHeight int) string {
 	r := m.theme.Renderer
 
 	// Use different border style when TOC has focus
@@ -608,11 +590,26 @@ func (m TutorialModel) renderTOC(pages []TutorialPage) string {
 		tocLines = append(tocLines, style.Render(prefix+title)+viewed)
 	}
 
-	contentHeight := max(m.height-11, 6)
-	availBody := max(contentHeight-1, 4)
+	if availHeight <= 0 {
+		availHeight = max(m.height-8, 6)
+	}
+	if availHeight < 4 {
+		return r.NewStyle().Width(24).MaxHeight(max(availHeight, 1)).Render(headerLine)
+	}
+	// NormalBorder uses 2 vertical rows and headerLine uses 1 row.
+	availBody := max(availHeight-3, 1)
 	var visibleLines []string
 	if len(tocLines) <= availBody {
 		visibleLines = tocLines
+	} else if availBody == 1 {
+		visibleLines = []string{tocLines[activeLineIdx]}
+	} else if availBody == 2 {
+		hintStyle := r.NewStyle().Foreground(m.theme.Muted)
+		if activeLineIdx < len(tocLines)-1 {
+			visibleLines = []string{tocLines[activeLineIdx], hintStyle.Render("  ↓ more")}
+		} else {
+			visibleLines = []string{hintStyle.Render("  ↑ more"), tocLines[activeLineIdx]}
+		}
 	} else {
 		hintStyle := r.NewStyle().Foreground(m.theme.Muted)
 		winSize := max(availBody-2, 1)
