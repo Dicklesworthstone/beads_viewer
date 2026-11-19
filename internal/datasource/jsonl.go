@@ -66,11 +66,15 @@ func (r *JSONLReader) LoadIssues() ([]model.Issue, error) {
 	closed := r.closed
 	r.reportMu.Unlock()
 	if closed {
-		return nil, fmt.Errorf("jsonl reader is closed: %s", r.path)
+		return nil, fmt.Errorf("JSONL reader is closed")
 	}
 
 	issues, report, err := fusedLoadJSONL(r.path, DefaultValidationOptions(), r.silent)
 	r.reportMu.Lock()
+	if r.closed {
+		r.reportMu.Unlock()
+		return nil, fmt.Errorf("JSONL reader is closed")
+	}
 	r.report = report
 	r.reportMu.Unlock()
 	if err != nil {

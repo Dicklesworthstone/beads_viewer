@@ -476,49 +476,8 @@ func loadAndValidateJSONL(source DataSource) (LoadResult, error) {
 }
 
 func loadAndValidateJSONLWithSilence(source DataSource, silent bool) (LoadResult, error) {
-	rec := newLoadRecorderWithSilence(source.Path, silent)
-	all, err := loader.LoadIssuesFromFileWithOptions(source.Path, rec.options())
-	if err != nil {
-		return LoadResult{Source: source, Report: rec.finish(all, false)}, err
-	}
-	stats := rec.stats
-
-	// Apply the error-rate gate against the same default threshold
-	// validateJSONL enforces. Malformed JSON or failed model validation count as
-	// Errors, so a genuinely-corrupt file is rejected here and we fall through to
-	// the next candidate.
-	maxRate := DefaultValidationOptions().MaxJSONLErrorRate
-	if rate := stats.ErrorRate(); rate > maxRate {
-		return LoadResult{Source: source, Report: rec.finish(all, false)}, fmt.Errorf("%s: too many errors: %.1f%% (max %.1f%%)", source.Path, rate*100, maxRate*100)
-	}
-
-	// Reject a source that contained records but yielded ZERO valid issues — e.g.
-	// a fresher stray sprints.jsonl/memories.jsonl, or a file made entirely of
-	// non-issue `_type` records. The error-rate gate above misses these because
-	// non-issue records are Skipped (not Errors), so the rate is 0. The old
-	// validateJSONL counted every such non-issue line as an error and rejected the
-	// file; this reproduces that so loadSmart falls through to the next candidate
-	// instead of returning an empty list as "success". An empty file (no records
-	// at all: Valid==Errors==Skipped==0) stays valid — a legitimately empty
-	// project — matching validateJSONL's empty-file behavior. A file with Valid>0
-	// whose issues are all tombstones is a real issues file and is accepted.
-	if stats.Valid == 0 && stats.Errors+stats.Skipped > 0 {
-		return LoadResult{Source: source, Report: rec.finish(all, false)}, fmt.Errorf("%s: no issue records (%d non-issue/error lines, 0 valid issues)", source.Path, stats.Errors+stats.Skipped)
-	}
-
-	// This source is the one actually being used: publish its parse accounting
-	// so robot payloads can surface any dropped records (#190).
-	report := rec.finish(all, true)
-
-	// Filter out tombstone issues to match the IssueReader contract (the same
-	// filtering JSONLReader.LoadIssues applies).
-	out := make([]model.Issue, 0, len(all))
-	for i := range all {
-		if !all[i].Status.IsTombstone() {
-			out = append(out, all[i])
-		}
-	}
-	return LoadResult{Issues: out, Source: source, Report: report}, nil
+	issues, report, err := fusedLoadJSONL(source.Path, DefaultValidationOptions(), silent)
+	return LoadResult{Issues: issues, Source: source, Report: report}, err
 }
 
 // LoadFromSource loads issues from a specific DataSource via the IssueReader

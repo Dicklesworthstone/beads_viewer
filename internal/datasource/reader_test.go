@@ -1036,14 +1036,33 @@ func TestJSONLReader_EnforcesFusedCorruptionValidationAndCloseState(t *testing.T
 	if err := validReader.Close(); err != nil {
 		t.Fatalf("Close(): %v", err)
 	}
-	if _, err := validReader.LoadIssues(); err == nil {
-		t.Fatal("expected LoadIssues() on closed JSONLReader to return error")
+	if _, err := validReader.LoadIssues(); err == nil || !strings.Contains(err.Error(), "JSONL reader is closed") {
+		t.Fatalf("expected LoadIssues() on closed JSONLReader to return 'JSONL reader is closed', got %v", err)
 	}
 	if _, err := validReader.CountIssues(); err == nil {
 		t.Fatal("expected CountIssues() on closed JSONLReader to return error")
 	}
 	if _, err := validReader.GetIssueByID("V-00"); err == nil {
 		t.Fatal("expected GetIssueByID() on closed JSONLReader to return error")
+	}
+
+	// Concurrent Close() racing with LoadIssues() must be race-free and never panic or overwrite post-close state.
+	raceReader, err := NewReader(DataSource{Type: SourceTypeJSONLLocal, Path: validPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20; i++ {
+			_, _ = raceReader.LoadIssues()
+			_ = raceReader.LoadReport()
+		}
+	}()
+	_ = raceReader.Close()
+	<-done
+	if _, err := raceReader.LoadIssues(); err == nil || !strings.Contains(err.Error(), "JSONL reader is closed") {
+		t.Fatalf("post-race LoadIssues() on closed reader = %v, want closed error", err)
 	}
 
 	emptyPath := filepath.Join(t.TempDir(), "empty.jsonl")
