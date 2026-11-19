@@ -1513,7 +1513,7 @@ func TestCorrelator_WithCutoffAndMaxSessions(t *testing.T) {
 		var rows []string
 		for i := 1; i <= 6; i++ {
 			rows = append(rows, fmt.Sprintf(
-				`{"source_path": "/s/s%d.jsonl", "line_number": %d, "agent": "claude", "title": "Hit %d", "score": %d.0, "content": "fixed bv-max", "created_at": %d, "workspace": "/work/proj"}`,
+				`{"source_path": "/s/s%d.jsonl", "line_number": %d, "agent": "claude", "title": "Hit %d", "score": %d.0, "content": "fixed bv-max and bv-fresh", "created_at": %d, "workspace": "/work/proj"}`,
 				i, i, i, 10-i, cutoff.Add(-time.Duration(i)*time.Hour).UnixMilli(),
 			))
 		}
@@ -1530,5 +1530,32 @@ func TestCorrelator_WithCutoffAndMaxSessions(t *testing.T) {
 	maxRes := maxCorr.Correlate(context.Background(), &model.Issue{ID: "bv-max", Title: "Max sessions check"})
 	if len(maxRes.TopSessions) != 5 || maxRes.TotalFound != 6 {
 		t.Fatalf("WithMaxSessions(5): len(TopSessions)=%d TotalFound=%d, want 5 and 6", len(maxRes.TopSessions), maxRes.TotalFound)
+	}
+
+	// 3. [R2-D5] Shared Cache isolation: WithCutoff and non-default WithMaxSessions must neither
+	// read stale default 3-item cached entries nor write cutoff/custom-limit results back into Cache.
+	sharedCache := NewCache()
+	defaultCorr := NewCorrelatorWithOptions(maxSearcher, sharedCache, WithWorkspace("/work/proj"), WithNow(func() time.Time { return cutoff }))
+	defRes := defaultCorr.Correlate(context.Background(), &model.Issue{ID: "bv-max", Title: "Max sessions check"})
+	if len(defRes.TopSessions) != MaxSessionsReturned {
+		t.Fatalf("default Correlator cached len=%d, want %d", len(defRes.TopSessions), MaxSessionsReturned)
+	}
+	cachedMaxCorr := NewCorrelatorWithOptions(maxSearcher, sharedCache, WithWorkspace("/work/proj"), WithMaxSessions(5), WithNow(func() time.Time { return cutoff }))
+	cachedMaxRes := cachedMaxCorr.Correlate(context.Background(), &model.Issue{ID: "bv-max", Title: "Max sessions check"})
+	if len(cachedMaxRes.TopSessions) != 5 {
+		t.Fatalf("WithMaxSessions(5) read stale 3-item cache: len=%d, want 5", len(cachedMaxRes.TopSessions))
+	}
+	strictCutoff := cutoff.Add(-10 * time.Hour)
+	strictCorr := NewCorrelatorWithOptions(maxSearcher, sharedCache, WithWorkspace("/work/proj"), WithCutoff(strictCutoff), WithNow(func() time.Time { return strictCutoff }))
+	strictRes := strictCorr.Correlate(context.Background(), &model.Issue{ID: "bv-fresh", Title: "Fresh cache check"})
+	if len(strictRes.TopSessions) != 0 {
+		t.Fatalf("expected 0 sessions before strictCutoff, got %d", len(strictRes.TopSessions))
+	}
+	if hint := sharedCache.Get("bv-fresh"); hint != nil {
+		t.Fatalf("WithCutoff poisoned sharedCache with %+v", hint)
+	}
+	freshAfterStrict := defaultCorr.Correlate(context.Background(), &model.Issue{ID: "bv-fresh", Title: "Fresh cache check"})
+	if len(freshAfterStrict.TopSessions) != MaxSessionsReturned {
+		t.Fatalf("expected unfiltered Correlator after WithCutoff to return %d sessions, got %d", MaxSessionsReturned, len(freshAfterStrict.TopSessions))
 	}
 }

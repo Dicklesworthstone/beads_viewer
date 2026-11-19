@@ -184,6 +184,19 @@ func (c *Correlator) GetCached(beadID string) *CorrelationHint {
 	return c.cache.Get(beadID)
 }
 
+func (c *Correlator) canUseSharedCache() bool {
+	if c == nil || c.cache == nil {
+		return false
+	}
+	if c.cutoff != nil {
+		return false
+	}
+	if c.maxSessions > 0 && c.maxSessions != MaxSessionsReturned {
+		return false
+	}
+	return true
+}
+
 // Correlate finds sessions relevant to the given bead.
 // It tries multiple strategies in order of confidence:
 // 1. ID mention (highest confidence)
@@ -196,8 +209,8 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 
 	start := c.now()
 
-	// Check cache first
-	if c.cache != nil {
+	// Check cache first (only when default unfiltered parameters are in effect)
+	if c.canUseSharedCache() {
 		if hint := c.cache.Get(issue.ID); hint != nil {
 			return CorrelationResult{
 				BeadID:        issue.ID,
@@ -217,7 +230,9 @@ func (c *Correlator) Correlate(ctx context.Context, issue *model.Issue) Correlat
 	finish := func() CorrelationResult {
 		result.Error = strings.Join(diagnostics, "; ")
 		result.ComputeTimeMs = int(c.now().Sub(start).Milliseconds())
-		c.cacheResult(issue.ID, &result)
+		if c.canUseSharedCache() {
+			c.cacheResult(issue.ID, &result)
+		}
 		return result
 	}
 	// note records a strategy's diagnostic and reports whether the budget is
