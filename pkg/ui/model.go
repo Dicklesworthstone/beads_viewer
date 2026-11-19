@@ -200,7 +200,11 @@ func (m *Model) preparePhase2Cmd() tea.Cmd {
 	scoring := sourceAnalyzer.CaptureScoring()
 	weights, now := sourceAnalyzer.Weights(), sourceAnalyzer.Now()
 	beadsPath, workDir := m.beadsPath, m.workDir
-	includeInactive := m.insightsIncludeInactive()
+	activeRecipe := m.activeRecipe
+	snapIncludeInactive := recipeExplicitlyIncludesClosed(activeRecipe)
+	if input != nil {
+		snapIncludeInactive = recipeExplicitlyIncludesClosed(input.recipe)
+	}
 	var candidates map[string]bool
 	if m.candidateIDs != nil {
 		candidates = make(map[string]bool, len(m.candidateIDs))
@@ -215,7 +219,7 @@ func (m *Model) preparePhase2Cmd() tea.Cmd {
 		analyzer := analysis.NewAnalyzer(issues)
 		analyzer.SetReadinessScope(authority, candidates)
 		analyzer.RestoreScoring(scoring)
-		insights := generateTUIInsights(analyzer, stats, issues, len(issues), includeInactive)
+		insights := generateTUIInsights(analyzer, stats, issues, len(issues), snapIncludeInactive)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -223,6 +227,7 @@ func (m *Model) preparePhase2Cmd() tea.Cmd {
 			builder := NewSnapshotBuilder(issues, authority).
 				WithBeadsPath(beadsPath).
 				WithProjectDir(workDir).
+				WithRecipe(activeRecipe).
 				WithAnalysis(stats)
 			builder.analyzer.RestoreScoring(scoring)
 			builder.analyzer.SetReadinessScope(authority, candidates)
@@ -994,6 +999,7 @@ type HistoryLoadedMsg struct {
 	RequestGeneration uint64
 	Report            *correlation.HistoryReport
 	CommitRepoDirs    map[string]string
+	BeadRepoKeys      map[string]string
 	Error             error
 }
 
@@ -1458,6 +1464,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 	repos []WorkspaceRepoTarget,
 	workDir string,
 	revision string,
+	scopeRepoFilter string,
 	dataHash string,
 	dataGeneration, requestGeneration uint64,
 ) tea.Cmd {
@@ -1466,11 +1473,17 @@ func loadWorkspaceHistoryAtRevisionCmd(
 	}
 	return func() tea.Msg {
 		type wsCorrTarget struct {
-			label      string
-			workDir    string
-			beadsDir   string
-			prefix     string
-			sourceRepo string
+			label           string
+			workDir         string
+			repoPath        string
+			gitRoot         string
+			beadsDir        string
+			effBeadsDir     string
+			correlationPath string
+			prefix          string
+			sourceRepo      string
+			revision        string
+			subtreePrefix   string
 		}
 		canonDir := func(dir string) string {
 			trimmed := strings.TrimSpace(dir)
@@ -1500,11 +1513,76 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			}
 			return canonDir(trimmedBeads)
 		}
+		resolveGitRepoRoot := func(dir string) string {
+			cDir := canonDir(dir)
+			if cDir == "" {
+				return ""
+			}
+			if root, err := correlation.FindGitRoot(cDir); err == nil && root != "" {
+				return canonDir(root)
+			}
+			return cDir
+		}
+		computeStoreSubtreePrefix := func(gitRoot, effBeads, corrPath string) string {
+			if gitRoot == "" {
+				return ""
+			}
+			sDir := effBeads
+			if corrPath != "" {
+				sDir = canonDir(filepath.Dir(corrPath))
+			}
+			if sDir == "" {
+				return ""
+			}
+			containerDir := filepath.Dir(sDir)
+			if filepath.Base(containerDir) == ".beads" {
+				containerDir = filepath.Dir(containerDir)
+			}
+			rel, err := filepath.Rel(gitRoot, containerDir)
+			if err != nil || rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
+				return ""
+			}
+			return strings.Trim(filepath.ToSlash(rel), "/") + "/"
+		}
 
 		var targets []wsCorrTarget
 		seenTargets := make(map[string]bool)
 		seenDirKeys := make(map[string]bool)
 		seenSourceRepos := make(map[string]bool)
+
+		addTarget := func(label, repoWorkDir, beadsDir, prefix, sourceRepo, rev string) {
+			rPath := canonDir(repoWorkDir)
+			if rPath == "" {
+				return
+			}
+			effBeads := effectiveBeadsDir(repoWorkDir, beadsDir)
+			dirKey := rPath + "\x00" + effBeads
+			key := dirKey + "\x00" + prefix
+			if seenTargets[key] {
+				return
+			}
+			seenTargets[key] = true
+			seenDirKeys[dirKey] = true
+			if sourceRepo != "" {
+				seenSourceRepos[sourceRepo] = true
+			}
+			gRoot := resolveGitRepoRoot(rPath)
+			corrPath := resolveHistoryCorrelationPath(beadsDir, rPath)
+			subPrefix := computeStoreSubtreePrefix(gRoot, effBeads, corrPath)
+			targets = append(targets, wsCorrTarget{
+				label:           label,
+				workDir:         repoWorkDir,
+				repoPath:        rPath,
+				gitRoot:         gRoot,
+				beadsDir:        beadsDir,
+				effBeadsDir:     effBeads,
+				correlationPath: corrPath,
+				prefix:          prefix,
+				sourceRepo:      sourceRepo,
+				revision:        strings.TrimSpace(rev),
+				subtreePrefix:   subPrefix,
+			})
+		}
 
 		for _, repo := range repos {
 			repoWorkDir := strings.TrimSpace(repo.Path)
@@ -1536,22 +1614,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			if label == "" {
 				label = sourceRepo
 			}
-			dirKey := canonDir(repoWorkDir) + "\x00" + effectiveBeadsDir(repoWorkDir, beadsDir)
-			key := dirKey + "\x00" + prefix
-			if !seenTargets[key] {
-				seenTargets[key] = true
-				seenDirKeys[dirKey] = true
-				if sourceRepo != "" {
-					seenSourceRepos[sourceRepo] = true
-				}
-				targets = append(targets, wsCorrTarget{
-					label:      label,
-					workDir:    repoWorkDir,
-					beadsDir:   beadsDir,
-					prefix:     prefix,
-					sourceRepo: sourceRepo,
-				})
-			}
+			addTarget(label, repoWorkDir, beadsDir, prefix, sourceRepo, repo.Revision)
 		}
 
 		for i := range captured {
@@ -1581,21 +1644,131 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			if seenDirKeys[dirKey] || (sourceRepo != "" && seenSourceRepos[sourceRepo]) {
 				continue
 			}
-			key := dirKey + "\x00" + prefix
-			if !seenTargets[key] {
-				seenTargets[key] = true
-				targets = append(targets, wsCorrTarget{
-					label:      sourceRepo,
-					workDir:    repoWorkDir,
-					beadsDir:   beadsDir,
-					prefix:     prefix,
-					sourceRepo: sourceRepo,
-				})
+			addTarget(sourceRepo, repoWorkDir, beadsDir, prefix, sourceRepo, "")
+		}
+
+		// Assign each captured issue exclusively to at most one target:
+		// - When c.sourceRepo != "", match target.sourceRepo == c.sourceRepo ONLY (no prefix fallback).
+		// - When c.sourceRepo == "", prefer the longest matching target.prefix, then exact origin path.
+		assignedByTarget := make([][]int, len(targets))
+		beadRepoKeys := make(map[string]string, len(captured))
+		for i := range captured {
+			c := &captured[i]
+			cRepo := normalizeRepoKey(c.sourceRepo)
+			bestIdx := -1
+			if cRepo != "" {
+				cBeads := canonDir(c.originBeadsDir)
+				cWork := canonDir(c.originWorkDir)
+				for tIdx := range targets {
+					if targets[tIdx].sourceRepo != cRepo {
+						continue
+					}
+					if bestIdx == -1 {
+						bestIdx = tIdx
+					}
+					if (cBeads != "" && cBeads == targets[tIdx].effBeadsDir) || (cWork != "" && cWork == targets[tIdx].repoPath) {
+						bestIdx = tIdx
+						break
+					}
+				}
+			} else {
+				bestPrefixLen := -1
+				for tIdx := range targets {
+					tp := targets[tIdx].prefix
+					if tp != "" && len(c.qualifiedID) > len(tp) && strings.EqualFold(c.qualifiedID[:len(tp)], tp) {
+						if len(tp) > bestPrefixLen {
+							bestPrefixLen = len(tp)
+							bestIdx = tIdx
+						}
+					}
+				}
+				if bestIdx == -1 {
+					cBeads := canonDir(c.originBeadsDir)
+					cWork := canonDir(c.originWorkDir)
+					for tIdx := range targets {
+						if cBeads != "" && cBeads == targets[tIdx].effBeadsDir {
+							bestIdx = tIdx
+							break
+						}
+						if bestIdx == -1 && cWork != "" && cWork == targets[tIdx].repoPath {
+							bestIdx = tIdx
+						}
+					}
+				}
+			}
+			if bestIdx >= 0 {
+				assignedByTarget[bestIdx] = append(assignedByTarget[bestIdx], i)
+				rk := targets[bestIdx].sourceRepo
+				if rk == "" {
+					rk = normalizeRepoKey(targets[bestIdx].label)
+				}
+				if rk != "" && c.qualifiedID != "" {
+					beadRepoKeys[c.qualifiedID] = rk
+				}
+			}
+		}
+
+		resolveLocalIDForTarget := func(c *workspaceBeadCapture, target wsCorrTarget) string {
+			localID := strings.TrimSpace(c.localID)
+			if localID != "" {
+				return localID
+			}
+			if target.prefix != "" && len(c.qualifiedID) > len(target.prefix) && strings.EqualFold(c.qualifiedID[:len(target.prefix)], target.prefix) {
+				return c.qualifiedID[len(target.prefix):]
+			}
+			return c.qualifiedID
+		}
+
+		// Build shared-.git monorepo disambiguation metadata across all workspace targets.
+		distinctRoots := make(map[string][]int)
+		for tIdx := range targets {
+			if targets[tIdx].gitRoot != "" {
+				distinctRoots[targets[tIdx].gitRoot] = append(distinctRoots[targets[tIdx].gitRoot], tIdx)
+			}
+		}
+		ambiguousByRoot := make(map[string]map[string]bool)
+		siblingsByTarget := make([][]string, len(targets))
+		for gRoot, groupIdxs := range distinctRoots {
+			if len(groupIdxs) <= 1 {
+				continue
+			}
+			localIDCounts := make(map[string]int)
+			var nonEmptySubtrees []string
+			seenSub := make(map[string]bool)
+			for _, tIdx := range groupIdxs {
+				if sub := targets[tIdx].subtreePrefix; sub != "" && !seenSub[sub] {
+					seenSub[sub] = true
+					nonEmptySubtrees = append(nonEmptySubtrees, sub)
+				}
+				seenInTarget := make(map[string]bool)
+				for _, cIdx := range assignedByTarget[tIdx] {
+					lid := strings.ToLower(strings.TrimSpace(resolveLocalIDForTarget(&captured[cIdx], targets[tIdx])))
+					if lid != "" && !seenInTarget[lid] {
+						seenInTarget[lid] = true
+						localIDCounts[lid]++
+					}
+				}
+			}
+			sort.Strings(nonEmptySubtrees)
+			amb := make(map[string]bool)
+			for lid, cnt := range localIDCounts {
+				if cnt > 1 {
+					amb[lid] = true
+				}
+			}
+			if len(amb) > 0 {
+				ambiguousByRoot[gRoot] = amb
+			}
+			for _, tIdx := range groupIdxs {
+				if targets[tIdx].subtreePrefix == "" && len(nonEmptySubtrees) > 0 {
+					siblingsByTarget[tIdx] = nonEmptySubtrees
+				}
 			}
 		}
 
 		effectiveRev := strings.TrimSpace(revision)
-		prefixFiles := len(targets) > 1
+		normScopeRepo := normalizeRepoKey(scopeRepoFilter)
+		prefixFiles := len(distinctRoots) > 1
 		mergedHistories := make(map[string]correlation.BeadHistory, len(captured))
 		commitRepoDirs := make(map[string]string)
 		var (
@@ -1610,7 +1783,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			lastErr            error
 		)
 
-		for _, target := range targets {
+		for tIdx, target := range targets {
 			if ctx.Err() != nil {
 				return HistoryLoadedMsg{
 					DataGeneration:    dataGeneration,
@@ -1618,35 +1791,31 @@ func loadWorkspaceHistoryAtRevisionCmd(
 					Error:             ctx.Err(),
 				}
 			}
-			repoPath := canonDir(target.workDir)
+			if normScopeRepo != "" &&
+				target.sourceRepo != normScopeRepo &&
+				normalizeRepoKey(target.label) != normScopeRepo &&
+				normalizeRepoKey(target.prefix) != normScopeRepo {
+				continue
+			}
+			repoPath := target.repoPath
 			if repoPath == "" {
 				continue
 			}
+			gitRoot := target.gitRoot
+			if gitRoot == "" {
+				gitRoot = repoPath
+			}
+			targetRepoKey := target.sourceRepo
+			if targetRepoKey == "" {
+				targetRepoKey = normalizeRepoKey(target.label)
+			}
 
-			localToQualified := make(map[string]string)
+			localToQualified := make(map[string]string, len(assignedByTarget[tIdx]))
 			var aliases map[string]string
-			var localBeads []correlation.BeadInfo
-			for i := range captured {
-				c := &captured[i]
-				belongs := false
-				if target.sourceRepo != "" && normalizeRepoKey(c.sourceRepo) == target.sourceRepo {
-					belongs = true
-				} else if target.prefix != "" && len(c.qualifiedID) > len(target.prefix) && strings.EqualFold(c.qualifiedID[:len(target.prefix)], target.prefix) {
-					belongs = true
-				} else if c.originWorkDir != "" && canonDir(c.originWorkDir) == repoPath {
-					belongs = true
-				}
-				if !belongs {
-					continue
-				}
-				localID := strings.TrimSpace(c.localID)
-				if localID == "" {
-					if target.prefix != "" && len(c.qualifiedID) > len(target.prefix) && strings.EqualFold(c.qualifiedID[:len(target.prefix)], target.prefix) {
-						localID = c.qualifiedID[len(target.prefix):]
-					} else {
-						localID = c.qualifiedID
-					}
-				}
+			localBeads := make([]correlation.BeadInfo, 0, len(assignedByTarget[tIdx]))
+			for _, cIdx := range assignedByTarget[tIdx] {
+				c := &captured[cIdx]
+				localID := resolveLocalIDForTarget(c, target)
 				localToQualified[localID] = c.qualifiedID
 				if c.qualifiedID != "" && localID != "" && !strings.EqualFold(c.qualifiedID, localID) {
 					if aliases == nil {
@@ -1661,9 +1830,13 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				})
 			}
 
-			correlationPath := resolveHistoryCorrelationPath(target.beadsDir, repoPath)
+			targetRev := target.revision
+			if targetRev == "" {
+				targetRev = effectiveRev
+			}
+			correlationPath := target.correlationPath
 			var feedbackStore *correlation.FeedbackStore
-			if effectiveRev == "" && correlationPath != "" {
+			if targetRev == "" && correlationPath != "" {
 				fs := correlation.NewFeedbackStore(filepath.Dir(correlationPath))
 				if err := fs.Load(); err != nil {
 					debug.Log("history: workspace correlation feedback not loaded for %s: %v", repoPath, err)
@@ -1672,11 +1845,14 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				}
 			}
 			opts := correlation.CorrelatorOptions{
-				Revision:          effectiveRev,
-				Limit:             500,
-				ExplicitIDAliases: aliases,
+				Revision:               targetRev,
+				Limit:                  500,
+				ExplicitIDAliases:      aliases,
+				AmbiguousUnprefixedIDs: ambiguousByRoot[gitRoot],
+				StoreSubtreePrefix:     target.subtreePrefix,
+				SiblingSubtreePrefixes: siblingsByTarget[tIdx],
 			}
-			entry := getSharedIncrementalCorrelator(repoPath, correlationPath)
+			entry := getSharedIncrementalCorrelator(gitRoot, correlationPath)
 			part, err := entry.generateReport(ctx, feedbackStore, localBeads, opts)
 			if err != nil {
 				lastErr = err
@@ -1687,8 +1863,8 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			if gitRange == "" && part.GitRange != "" {
 				gitRange = part.GitRange
 			}
-			if part.Window != nil && !countedRoots[repoPath] {
-				countedRoots[repoPath] = true
+			if part.Window != nil && !countedRoots[gitRoot] {
+				countedRoots[gitRoot] = true
 				totalWalkedCommits += part.Window.Commits
 			}
 			allStrategies = append(allStrategies, part.Stats.Strategies...)
@@ -1702,7 +1878,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			}
 			for sha := range part.CommitIndex {
 				if low := strings.ToLower(strings.TrimSpace(sha)); low != "" {
-					commitRepoDirs[low] = repoPath
+					commitRepoDirs[low] = gitRoot
 				}
 			}
 
@@ -1714,6 +1890,9 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				if qualID == "" {
 					qualID = localID
 				}
+				if targetRepoKey != "" {
+					beadRepoKeys[qualID] = targetRepoKey
+				}
 				hist.BeadID = qualID
 				events := make([]correlation.BeadEvent, len(hist.Events))
 				for i, ev := range hist.Events {
@@ -1724,7 +1903,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 						latestSHA = ev.CommitSHA
 					}
 					if low := strings.ToLower(strings.TrimSpace(ev.CommitSHA)); low != "" {
-						commitRepoDirs[low] = repoPath
+						commitRepoDirs[low] = gitRoot
 					}
 				}
 				hist.Events = events
@@ -1734,10 +1913,10 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				for i, cc := range hist.Commits {
 					cc.BeadID = qualID
 					if low := strings.ToLower(strings.TrimSpace(cc.SHA)); low != "" {
-						commitRepoDirs[low] = repoPath
+						commitRepoDirs[low] = gitRoot
 					}
 					if lowShort := strings.ToLower(strings.TrimSpace(cc.ShortSHA)); lowShort != "" {
-						commitRepoDirs[lowShort] = repoPath
+						commitRepoDirs[lowShort] = gitRoot
 					}
 					if prefixFiles && target.label != "" && len(cc.Files) > 0 {
 						files := make([]correlation.FileChange, len(cc.Files))
@@ -1774,7 +1953,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				Error:             lastErr,
 			}
 		}
-		if effectiveRev != "" {
+		if effectiveRev != "" && latestSHA == "" {
 			latestSHA = effectiveRev
 		}
 		commitIndex := correlation.BuildCommitIndex(mergedHistories)
@@ -1798,6 +1977,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			RequestGeneration: requestGeneration,
 			Report:            report,
 			CommitRepoDirs:    commitRepoDirs,
+			BeadRepoKeys:      beadRepoKeys,
 		}
 	}
 }
@@ -1984,6 +2164,7 @@ type Model struct {
 	historyView                  HistoryModel
 	historyFullReport            *correlation.HistoryReport
 	historyCommitRepoDirs        map[string]string
+	historyBeadRepoKeys          map[string]string
 	historyLoading               bool // True while history is being loaded in background
 	historyLoadFailed            bool // True if history loading failed
 	historyReportDataGeneration  uint64
@@ -2911,6 +3092,7 @@ func (m *Model) startHistoryLoad() tea.Cmd {
 		m.historyLoadDataGeneration = 0
 		m.historyFullReport = nil
 		m.historyCommitRepoDirs = nil
+		m.historyBeadRepoKeys = nil
 		m.historyView.SetReport(nil)
 		m.historyReportDataGeneration = 0
 		return nil
@@ -2951,6 +3133,7 @@ func (m *Model) startHistoryLoad() tea.Cmd {
 			repos,
 			m.workDir,
 			m.asOfRevision,
+			m.scopeRepoFilter,
 			analysis.ComputeDataHash(m.issues),
 			m.historyLoadDataGeneration,
 			m.historyLoadRequestGeneration,
@@ -3011,10 +3194,15 @@ func (m *Model) scopeHistoryReportForActiveRepos(report *correlation.HistoryRepo
 	filteredHistories := make(map[string]correlation.BeadHistory, len(report.Histories))
 	for id, hist := range report.Histories {
 		rk := ""
-		if iss, ok := m.issueMap[id]; ok && iss != nil {
-			rk = issueRepoKey(*iss)
-		} else {
-			rk = issueRepoKey(model.Issue{ID: id})
+		if m.historyBeadRepoKeys != nil {
+			rk = m.historyBeadRepoKeys[id]
+		}
+		if rk == "" {
+			if iss, ok := m.issueMap[id]; ok && iss != nil {
+				rk = issueRepoKey(*iss)
+			} else {
+				rk = issueRepoKey(model.Issue{ID: id})
+			}
 		}
 		if rk != "" && !m.activeRepos[rk] {
 			continue
@@ -3726,6 +3914,14 @@ func (m *Model) insightsIncludeInactive() bool {
 	return m.currentFilter == "closed" || recipeExplicitlyIncludesClosed(m.activeRecipe)
 }
 
+func (m *Model) canReuseSnapshotInsights(s *DataSnapshot) bool {
+	return m != nil &&
+		s != nil &&
+		m.candidateIDs == nil &&
+		(!m.workspaceMode || m.activeRepos == nil) &&
+		recipeExplicitlyIncludesClosed(s.recipe) == m.insightsIncludeInactive()
+}
+
 func (m *Model) generateModelInsights(stats *analysis.GraphStats, limit int) analysis.Insights {
 	if stats == nil {
 		return analysis.Insights{}
@@ -3770,7 +3966,7 @@ func (m *Model) rebuildInsightsPanel() {
 		ins = generateTUIInsights(scopedAnalyzer, scopedStats, scoped, len(scoped), m.insightsIncludeInactive())
 	} else {
 		switch {
-		case m.snapshot != nil && !m.insightsIncludeInactive() && m.candidateIDs == nil:
+		case m.canReuseSnapshotInsights(m.snapshot):
 			ins = m.snapshot.GetInsights()
 		case m.analysis != nil:
 			ins = m.generateModelInsights(m.analysis, len(m.issues))
@@ -4539,15 +4735,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		listFilterTerm := m.list.FilterInput.Value()
 		selectedID := m.selectedListIssueID(listFilterActive, listFilterTerm)
 
-		// Create new immutable snapshot with Phase 2 data (bv-b5q1)
-		ins := msg.Insights
+		// Create new immutable snapshot with Phase 2 data (bv-b5q1).
+		// Keep DataSnapshot.insights strictly keyed to recipeExplicitlyIncludesClosed(snap.recipe)
+		// rather than baking transient m.currentFilter == "closed" into m.snapshot.
+		snapIns := msg.Insights
 		if msg.prepared == nil && m.analyzer != nil && msg.Stats != nil {
-			ins = m.generateModelInsights(msg.Stats, len(m.issues))
+			snapRecipe := m.activeRecipe
+			if m.snapshot != nil {
+				snapRecipe = m.snapshot.recipe
+			}
+			snapIns = generateTUIInsights(m.analyzer, msg.Stats, m.issues, len(m.issues), recipeExplicitlyIncludesClosed(snapRecipe))
 		}
 		if msg.prepared != nil || m.snapshot != nil {
 			newSnap := msg.prepared
 			if newSnap == nil {
-				newSnap = m.snapshot.WithPhase2(msg.Stats, ins, m.issues, m.analyzer)
+				newSnap = m.snapshot.WithPhase2(msg.Stats, snapIns, m.issues, m.analyzer)
 			}
 			m.snapshot = newSnap
 			m.triageScores = newSnap.TriageScores
@@ -4558,6 +4760,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if m.analyzer != nil && m.analysis != nil {
 			triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analysisReferenceTime())
 			m.triageScores, m.triageReasons, m.quickWinSet, m.blockerSet, m.unblocksMap = extractTriageMaps(triage)
+		}
+
+		uiIns := snapIns
+		if m.canReuseSnapshotInsights(m.snapshot) {
+			uiIns = m.snapshot.GetInsights()
+		} else if m.analysis != nil {
+			uiIns = m.generateModelInsights(m.analysis, len(m.issues))
 		}
 
 		// Update UI components with Phase 2 insights
@@ -4571,7 +4780,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.insightsPanel.SetSize(m.mainContentWidth(), bodyHeight)
 			m.rebuildInsightsPanel()
 		} else {
-			m.insightsPanel.SetInsights(ins)
+			m.insightsPanel.SetInsights(uiIns)
 			m.insightsPanel.issueMap = m.issueMap
 			m.insightsPanel.SetSize(m.mainContentWidth(), bodyHeight)
 
@@ -4594,10 +4803,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.isGraphView {
 				m.refreshBoardAndGraphForCurrentFilter()
 			}
-		} else if m.snapshot != nil {
+		} else if m.snapshot != nil && m.canReuseSnapshotInsights(m.snapshot) {
 			m.graphView.SetSnapshot(m.snapshot)
 		} else {
-			m.graphView.SetIssues(m.issues, &ins)
+			m.graphView.SetIssues(m.issues, &uiIns)
 		}
 
 		// Generate priority recommendations now that Phase 2 is ready
@@ -4732,6 +4941,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.historyLoadFailed = false
 			m.historyFullReport = msg.Report
 			m.historyCommitRepoDirs = msg.CommitRepoDirs
+			m.historyBeadRepoKeys = msg.BeadRepoKeys
 			m.historyView.SetReport(m.scopeHistoryReportForActiveRepos(msg.Report))
 			m.syncHistoryCassSessions()
 			m.historyReportDataGeneration = msg.DataGeneration
@@ -4788,7 +4998,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Workspace:    msg.request.issueWorkspace,
 			ReferenceNow: m.referenceNow,
 		})
-		m.cassModal.SetSize(m.width, m.height)
+		m.cassModal.SetSize(m.width, max(1, m.height-1))
 		m.showCassModal = true
 		m.cassReturnFocus = msg.request.focus
 		m.focused = m.restoreTopModalOrListFocus()
@@ -5039,7 +5249,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if underlyingFocus == focusInsights || (m.workspaceMode && m.activeRepos != nil) {
 			m.rebuildInsightsPanel()
 		} else {
-			m.insightsPanel.SetInsights(m.snapshot.GetInsights())
+			panelIns := m.snapshot.GetInsights()
+			if !m.canReuseSnapshotInsights(m.snapshot) && m.analysis != nil {
+				panelIns = m.generateModelInsights(m.analysis, len(m.issues))
+			}
+			m.insightsPanel.SetInsights(panelIns)
 			m.insightsPanel.SetIssueMap(m.issueMap)
 			m.insightsPanel.SetAdvancedInsights(nil)
 			m.insightsPanel.ClampSelections()
@@ -5210,10 +5424,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.board.SetIssues(filteredIssues)
 				}
-				if m.snapshot != nil && m.snapshot.RecipeName == "" && m.snapshot.GetGraphLayout() != nil && len(filteredIssues) == len(m.snapshot.Issues) {
+				if m.snapshot != nil && m.snapshot.RecipeName == "" && m.snapshot.GetGraphLayout() != nil && m.canReuseSnapshotInsights(m.snapshot) && len(filteredIssues) == len(m.snapshot.Issues) {
 					m.graphView.SetSnapshot(m.snapshot)
 				} else {
 					ins := m.snapshot.GetInsights()
+					if !m.canReuseSnapshotInsights(m.snapshot) && m.analysis != nil {
+						ins = m.generateModelInsights(m.analysis, len(filteredIssues))
+					}
 					m.graphView.SetIssues(filteredIssues, &ins)
 				}
 
@@ -5969,7 +6186,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.helpScroll = 0
 				m.showTutorial = true
 				m.tutorialModel.SetContextMode(false)
-				m.tutorialModel.SetSize(m.width, m.height)
+				m.tutorialModel.SetSize(m.width, max(1, m.height-1))
 				m.tutorialModel.markCurrentPageViewed()
 				m.focused = focusTutorial
 				return m, nil
@@ -5987,7 +6204,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showTutorial = true
 				m.tutorialModel.SetContext(ctx)
 				m.tutorialModel.SetContextMode(true)
-				m.tutorialModel.SetSize(m.width, m.height)
+				m.tutorialModel.SetSize(m.width, max(1, m.height-1))
 				m.tutorialModel.markCurrentPageViewed()
 				m.focused = focusTutorial
 				return m, nil
@@ -6017,7 +6234,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.tutorialModel.SetContext(ctx)
 					m.tutorialModel.SetContextMode(true)
-					m.tutorialModel.SetSize(m.width, m.height)
+					m.tutorialModel.SetSize(m.width, max(1, m.height-1))
 					m.tutorialModel.markCurrentPageViewed()
 					m.focused = focusTutorial
 					return m, nil
@@ -7948,7 +8165,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.isSplitView = msg.Width > SplitViewThreshold
 		}
-		m.tutorialModel.SetSize(msg.Width, msg.Height)
+		m.tutorialModel.SetSize(msg.Width, max(1, msg.Height-1))
 		if !isModalFocus(m.focused) {
 			m.focused = m.validateViewFocus(m.focused)
 		}
@@ -7975,7 +8192,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.resizeAgentPromptModal()
 		}
 		if m.showCassModal {
-			m.cassModal.SetSize(m.width, m.height)
+			m.cassModal.SetSize(m.width, max(1, m.height-1))
 		}
 	}
 
@@ -8753,15 +8970,17 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 
 func (m *Model) resolveCommitRepoDir(sha string) string {
 	lowSHA := strings.ToLower(strings.TrimSpace(sha))
-	if lowSHA != "" && len(m.historyCommitRepoDirs) > 0 {
-		if dir := strings.TrimSpace(m.historyCommitRepoDirs[lowSHA]); dir != "" {
-			return dir
+	repoPathForRepoKey := func(rk string) string {
+		rk = normalizeRepoKey(rk)
+		if rk == "" || !m.workspaceMode {
+			return ""
 		}
-		for k, dir := range m.historyCommitRepoDirs {
-			if strings.HasPrefix(k, lowSHA) && strings.TrimSpace(dir) != "" {
-				return strings.TrimSpace(dir)
+		for _, repo := range m.workspaceInfo.Repos {
+			if (normalizeRepoKey(repo.Prefix) == rk || normalizeRepoKey(repo.Name) == rk) && strings.TrimSpace(repo.Path) != "" {
+				return strings.TrimSpace(repo.Path)
 			}
 		}
+		return ""
 	}
 	repoPathForIssue := func(iss *model.Issue) string {
 		if iss == nil {
@@ -8770,41 +8989,122 @@ func (m *Model) resolveCommitRepoDir(sha string) string {
 		if iss.Origin != nil && strings.TrimSpace(iss.Origin.WorkingDirectory) != "" {
 			return strings.TrimSpace(iss.Origin.WorkingDirectory)
 		}
-		if m.workspaceMode && len(m.workspaceInfo.Repos) > 0 {
-			rk := issueRepoKey(*iss)
-			for _, repo := range m.workspaceInfo.Repos {
-				if rk != "" && (normalizeRepoKey(repo.Prefix) == rk || normalizeRepoKey(repo.Name) == rk) && strings.TrimSpace(repo.Path) != "" {
-					return strings.TrimSpace(repo.Path)
+		return repoPathForRepoKey(issueRepoKey(*iss))
+	}
+	repoPathForBeadID := func(beadID string) string {
+		if beadID == "" {
+			return ""
+		}
+		if dir := repoPathForIssue(m.issueMap[beadID]); dir != "" {
+			return dir
+		}
+		if m.historyBeadRepoKeys != nil {
+			if dir := repoPathForRepoKey(m.historyBeadRepoKeys[beadID]); dir != "" {
+				return dir
+			}
+		}
+		return repoPathForRepoKey(issueRepoKey(model.Issue{ID: beadID}))
+	}
+	beadHasMatchingCommit := func(rep *correlation.HistoryReport, beadID string) bool {
+		if rep == nil || beadID == "" || lowSHA == "" {
+			return false
+		}
+		hist, ok := rep.Histories[beadID]
+		if !ok {
+			return false
+		}
+		for _, cc := range hist.Commits {
+			lowCommit := strings.ToLower(strings.TrimSpace(cc.SHA))
+			lowShort := strings.ToLower(strings.TrimSpace(cc.ShortSHA))
+			if lowCommit == lowSHA || lowShort == lowSHA || (lowCommit != "" && strings.HasPrefix(lowCommit, lowSHA)) {
+				return true
+			}
+		}
+		for _, ev := range hist.Events {
+			lowEv := strings.ToLower(strings.TrimSpace(ev.CommitSHA))
+			if lowEv == lowSHA || (lowEv != "" && strings.HasPrefix(lowEv, lowSHA)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var focusedBeadID string
+	if m.isHistoryView || m.focused == focusHistory {
+		if m.historyView.IsGitMode() {
+			focusedBeadID = m.historyView.SelectedRelatedBeadID()
+		} else {
+			focusedBeadID = m.historyView.SelectedBeadID()
+		}
+	}
+	if focusedBeadID == "" {
+		if iss := m.focusedIssueForSessions(); iss != nil {
+			focusedBeadID = iss.ID
+		}
+	}
+	if lowSHA != "" && focusedBeadID != "" &&
+		(beadHasMatchingCommit(m.historyFullReport, focusedBeadID) || beadHasMatchingCommit(m.historyView.report, focusedBeadID)) {
+		if dir := repoPathForBeadID(focusedBeadID); dir != "" {
+			return dir
+		}
+	}
+
+	if lowSHA != "" && len(m.historyCommitRepoDirs) > 0 {
+		if dir := strings.TrimSpace(m.historyCommitRepoDirs[lowSHA]); dir != "" {
+			return dir
+		}
+		keys := make([]string, 0, len(m.historyCommitRepoDirs))
+		for k := range m.historyCommitRepoDirs {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if strings.HasPrefix(k, lowSHA) {
+				if dir := strings.TrimSpace(m.historyCommitRepoDirs[k]); dir != "" {
+					return dir
 				}
 			}
 		}
-		return ""
 	}
+
 	if lowSHA != "" && m.historyView.report != nil {
-		for commitKey, beadIDs := range m.historyView.report.CommitIndex {
+		commitKeys := make([]string, 0, len(m.historyView.report.CommitIndex))
+		for k := range m.historyView.report.CommitIndex {
+			commitKeys = append(commitKeys, k)
+		}
+		sort.Strings(commitKeys)
+		for _, commitKey := range commitKeys {
 			lowKey := strings.ToLower(strings.TrimSpace(commitKey))
 			if lowKey == lowSHA || strings.HasPrefix(lowKey, lowSHA) {
-				for _, beadID := range beadIDs {
-					if dir := repoPathForIssue(m.issueMap[beadID]); dir != "" {
+				for _, beadID := range m.historyView.report.CommitIndex[commitKey] {
+					if dir := repoPathForBeadID(beadID); dir != "" {
 						return dir
 					}
 				}
 			}
 		}
-		for beadID, hist := range m.historyView.report.Histories {
+		beadKeys := make([]string, 0, len(m.historyView.report.Histories))
+		for beadID := range m.historyView.report.Histories {
+			beadKeys = append(beadKeys, beadID)
+		}
+		sort.Strings(beadKeys)
+		for _, beadID := range beadKeys {
+			hist := m.historyView.report.Histories[beadID]
 			for _, cc := range hist.Commits {
 				lowCommit := strings.ToLower(strings.TrimSpace(cc.SHA))
 				lowShort := strings.ToLower(strings.TrimSpace(cc.ShortSHA))
 				if lowCommit == lowSHA || lowShort == lowSHA || (lowCommit != "" && strings.HasPrefix(lowCommit, lowSHA)) {
-					if dir := repoPathForIssue(m.issueMap[beadID]); dir != "" {
+					if dir := repoPathForBeadID(beadID); dir != "" {
 						return dir
 					}
 				}
 			}
 		}
 	}
-	if dir := repoPathForIssue(m.focusedIssueForSessions()); dir != "" {
-		return dir
+	if focusedBeadID != "" {
+		if dir := repoPathForBeadID(focusedBeadID); dir != "" {
+			return dir
+		}
 	}
 	return strings.TrimSpace(m.workDir)
 }
@@ -9521,7 +9821,7 @@ func (m *Model) openFullTutorialFromFocus(prior focus) {
 	m.showHelp = false
 	m.helpScroll = 0
 	m.tutorialModel.SetContextMode(false)
-	m.tutorialModel.SetSize(m.width, m.height)
+	m.tutorialModel.SetSize(m.width, max(1, m.height-1))
 	m.tutorialModel.markCurrentPageViewed()
 	m.focused = focusTutorial
 }
@@ -9539,7 +9839,7 @@ func (m *Model) openContextTutorialWithContext(prior focus, ctx string) {
 	m.showTutorial = true
 	m.tutorialModel.SetContext(ctx)
 	m.tutorialModel.SetContextMode(true)
-	m.tutorialModel.SetSize(m.width, m.height)
+	m.tutorialModel.SetSize(m.width, max(1, m.height-1))
 	m.tutorialModel.markCurrentPageViewed()
 	m.focused = focusTutorial
 }
@@ -9772,7 +10072,7 @@ func (m *Model) handleHelpKeys(msg tea.KeyMsg) *Model {
 			m.showTutorial = true
 			if !reopenedFromTutorial {
 				m.tutorialModel.SetContextMode(false)
-				m.tutorialModel.SetSize(m.width, m.height)
+				m.tutorialModel.SetSize(m.width, max(1, m.height-1))
 				m.tutorialModel.markCurrentPageViewed()
 			}
 			m.focused = focusTutorial
@@ -9941,6 +10241,7 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 		case m.isGraphView:
 			body = m.graphView.View(bodyWidth, bodyHeight)
 		case m.isBoardView:
+			m.board.SetSize(bodyWidth, bodyHeight)
 			body = m.board.View(bodyWidth, bodyHeight)
 		case m.isActionableView:
 			m.actionableView.SetSize(bodyWidth, m.height-2)
@@ -12267,7 +12568,7 @@ func (m *Model) refreshBoardAndGraphForCurrentFilter() {
 	}
 
 	if m.isGraphView {
-		useSnapshot := m.sortMode == SortDefault && m.snapshot != nil && m.snapshot.GetGraphLayout() != nil && (!m.workspaceMode || m.activeRepos == nil) && len(filteredIssues) == len(m.snapshot.Issues)
+		useSnapshot := m.sortMode == SortDefault && m.snapshot != nil && m.snapshot.GetGraphLayout() != nil && m.canReuseSnapshotInsights(m.snapshot) && (!m.workspaceMode || m.activeRepos == nil) && len(filteredIssues) == len(m.snapshot.Issues)
 		if useSnapshot {
 			if recipeFilterActive {
 				useSnapshot = m.snapshot.RecipeName == m.activeRecipe.Name && m.snapshot.RecipeHash == recipeFingerprint(m.activeRecipe)
@@ -12331,7 +12632,7 @@ func (m *Model) applyFilter() {
 	} else {
 		m.board.SetIssues(filteredIssues)
 	}
-	if m.sortMode == SortDefault && m.snapshot != nil && m.snapshot.RecipeName == "" && m.snapshot.GetGraphLayout() != nil && m.currentFilter == "all" && (!m.workspaceMode || m.activeRepos == nil) && len(filteredIssues) == len(m.snapshot.Issues) {
+	if m.sortMode == SortDefault && m.snapshot != nil && m.snapshot.RecipeName == "" && m.snapshot.GetGraphLayout() != nil && m.canReuseSnapshotInsights(m.snapshot) && m.currentFilter == "all" && (!m.workspaceMode || m.activeRepos == nil) && len(filteredIssues) == len(m.snapshot.Issues) {
 		m.graphView.SetSnapshot(m.snapshot)
 	} else {
 		// Generate insights for graph view (for metric rankings and sorting)
@@ -12683,6 +12984,7 @@ func (m *Model) applyContentSizing() {
 	m.flowMatrix.SetSize(contentWidth, bodyHeight)
 	m.tree.SetSize(contentWidth, bodyHeight)
 	m.graphView.SetSize(contentWidth, bodyHeight)
+	m.board.SetSize(contentWidth, bodyHeight)
 	m.actionableView.SetSize(contentWidth, m.height-2)
 	m.historyView.SetSize(contentWidth, bodyHeight)
 	if m.isSprintView && m.selectedSprint != nil {
@@ -16431,7 +16733,19 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 	m.height = height
 	m.ready = true
 	m.snapshotInitPending = false
-	m.isSplitView = width >= SplitViewThreshold
+	m.isBoardView = false
+	m.isGraphView = false
+	m.isHistoryView = false
+	m.isActionableView = false
+	m.isSprintView = false
+	m.showVelocityComparison = false
+	if width < SplitViewMinWidth {
+		m.isSplitView = false
+	} else if m.splitViewUserOverride {
+		m.isSplitView = m.splitViewUserWant
+	} else {
+		m.isSplitView = width > SplitViewThreshold
+	}
 
 	if m.analysis != nil {
 		m.analysis.WaitForPhase2()
@@ -16469,7 +16783,8 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 	case "board":
 		m.isBoardView = true
 		m.focused = focusBoard
-		m.syncBoardReadinessAndFullIssues()
+		m.refreshBoardAndGraphForCurrentFilter()
+		m.board.SetSize(width, bodyHeight)
 		return m.board.View(width, bodyHeight)
 	case "history":
 		m.isHistoryView = true
@@ -16486,8 +16801,7 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 	case "graph":
 		m.isGraphView = true
 		m.focused = focusGraph
-		ins := m.generateModelInsights(m.analysis, len(m.issues))
-		m.graphView.SetIssues(m.repoScopedIssues(), &ins)
+		m.refreshBoardAndGraphForCurrentFilter()
 		m.graphView.SetSize(width, bodyHeight)
 		return m.graphView.View(width, bodyHeight)
 	case "tree":

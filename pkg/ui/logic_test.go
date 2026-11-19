@@ -8270,3 +8270,414 @@ func TestWave18ScopedActiveInsightsWorkspaceHistoryFooterSprintHistoryAndDebugVi
 		}
 	})
 }
+
+func TestWave19Round1AuditRemediationsR1B1ToR1B7(t *testing.T) {
+	refNow := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+
+	t.Run("R1_B1_closed_to_open_insight_transition_keeps_snapshot_insights_pure", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "CL-ROOT", Title: "Closed Root", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow.Add(-90 * 24 * time.Hour), UpdatedAt: refNow.Add(-60 * 24 * time.Hour)},
+			{
+				ID: "CL-BRIDGE", Title: "Closed Historical Bridge", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask,
+				CreatedAt: refNow.Add(-85 * 24 * time.Hour), UpdatedAt: refNow.Add(-55 * 24 * time.Hour),
+				Dependencies: []*model.Dependency{{IssueID: "CL-BRIDGE", DependsOnID: "CL-ROOT", Type: model.DepBlocks}},
+			},
+			{
+				ID: "CL-LEAF-1", Title: "Closed Leaf 1", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask,
+				CreatedAt: refNow.Add(-80 * 24 * time.Hour), UpdatedAt: refNow.Add(-50 * 24 * time.Hour),
+				Dependencies: []*model.Dependency{{IssueID: "CL-LEAF-1", DependsOnID: "CL-BRIDGE", Type: model.DepBlocks}},
+			},
+			{
+				ID: "CL-LEAF-2", Title: "Closed Leaf 2", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask,
+				CreatedAt: refNow.Add(-75 * 24 * time.Hour), UpdatedAt: refNow.Add(-45 * 24 * time.Hour),
+				Dependencies: []*model.Dependency{{IssueID: "CL-LEAF-2", DependsOnID: "CL-BRIDGE", Type: model.DepBlocks}},
+			},
+			{ID: "OP-ROOT", Title: "Open Root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: refNow.Add(-5 * 24 * time.Hour), UpdatedAt: refNow.Add(-time.Hour)},
+			{
+				ID: "OP-BRIDGE", Title: "Open Active Bridge", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+				CreatedAt: refNow.Add(-4 * 24 * time.Hour), UpdatedAt: refNow.Add(-time.Hour),
+				Dependencies: []*model.Dependency{{IssueID: "OP-BRIDGE", DependsOnID: "OP-ROOT", Type: model.DepBlocks}},
+			},
+			{
+				ID: "OP-LEAF", Title: "Open Leaf", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+				CreatedAt: refNow.Add(-3 * 24 * time.Hour), UpdatedAt: refNow.Add(-time.Hour),
+				Dependencies: []*model.Dependency{{IssueID: "OP-LEAF", DependsOnID: "OP-BRIDGE", Type: model.DepBlocks}},
+			},
+		}
+		hasBottleneck := func(ins analysis.Insights, id string) bool {
+			for _, it := range ins.Bottlenecks {
+				if it.ID == id {
+					return true
+				}
+			}
+			return false
+		}
+
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		u, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+		m = u.(*Model)
+
+		// Switch to "closed" BEFORE Phase 2 preparation completes!
+		m.currentFilter = "closed"
+		m.applyFilter()
+		prepCmd := m.preparePhase2Cmd()
+		if prepCmd == nil {
+			t.Fatal("expected preparePhase2Cmd non-nil")
+		}
+		if msg := prepCmd(); msg != nil {
+			u, _ = m.Update(msg)
+			m = u.(*Model)
+		}
+
+		// Planted negative control: while m.currentFilter == "closed", insightsPanel shows CL-BRIDGE,
+		// BUT m.snapshot.GetInsights() MUST remain active-only (not poisoned by transient closed filter!).
+		if !hasBottleneck(m.insightsPanel.insights, "CL-BRIDGE") {
+			t.Fatalf("expected CL-BRIDGE in insightsPanel while currentFilter==\"closed\", got %+v", m.insightsPanel.insights.Bottlenecks)
+		}
+		if m.snapshot == nil || hasBottleneck(m.snapshot.GetInsights(), "CL-BRIDGE") {
+			t.Fatalf("transient closed filter poisoned DataSnapshot.insights with CL-BRIDGE: %+v", m.snapshot.GetInsights().Bottlenecks)
+		}
+
+		// Positive observable: switching back to "open" / "all" immediately drops CL-BRIDGE!
+		m.currentFilter = "open"
+		m.applyFilter()
+		m.rebuildInsightsPanel()
+		if hasBottleneck(m.insightsPanel.insights, "CL-BRIDGE") || !hasBottleneck(m.insightsPanel.insights, "OP-BRIDGE") {
+			t.Fatalf("switching closed->open leaked CL-BRIDGE or dropped OP-BRIDGE: %+v", m.insightsPanel.insights.Bottlenecks)
+		}
+	})
+
+	t.Run("R1_B2_B3_prefix_overlap_shared_git_monorepo_per_repo_revision_and_repo_keys", func(t *testing.T) {
+		if _, err := exec.LookPath("git"); err != nil {
+			t.Skip("git not installed")
+		}
+		gitRun := func(dir string, args ...string) string {
+			t.Helper()
+			cmd := exec.CommandContext(context.Background(), "git", args...)
+			cmd.Dir = dir
+			cmd.Env = append(os.Environ(),
+				"GIT_AUTHOR_NAME=Tester",
+				"GIT_AUTHOR_EMAIL=tester@example.com",
+				"GIT_COMMITTER_NAME=Tester",
+				"GIT_COMMITTER_EMAIL=tester@example.com",
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, string(out))
+			}
+			return strings.TrimSpace(string(out))
+		}
+
+		// Part A: Polyrepo with overlapping prefixes ("api-" vs "api-v2-"), per-repo Revision, >10-char hyphenated repo key, and scopeRepoFilter.
+		polyRoot := t.TempDir()
+		repoAPI := filepath.Join(polyRoot, "api")
+		repoAPIV2 := filepath.Join(polyRoot, "api-v2")
+		repoAuth := filepath.Join(polyRoot, "authentication-service")
+		for _, rDir := range []string{repoAPI, repoAPIV2, repoAuth} {
+			if err := os.MkdirAll(filepath.Join(rDir, ".beads"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			gitRun(rDir, "init")
+		}
+		gitRun(repoAPI, "remote", "add", "origin", "https://github.com/acme/api-v1.git")
+		gitRun(repoAPIV2, "remote", "add", "origin", "https://github.com/acme/api-v2.git")
+		gitRun(repoAuth, "remote", "add", "origin", "https://github.com/acme/authentication-service.git")
+
+		if err := os.WriteFile(filepath.Join(repoAPI, ".beads", "issues.jsonl"), []byte(`{"id":"1","title":"V1 route","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repoAPI, "v1.go"), []byte("package api\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(repoAPI, "add", ".")
+		gitRun(repoAPI, "commit", "-m", "feat(1): v1 route")
+		shaV1 := gitRun(repoAPI, "rev-parse", "HEAD")
+
+		if err := os.WriteFile(filepath.Join(repoAPIV2, ".beads", "issues.jsonl"), []byte(`{"id":"1","title":"V2 route","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repoAPIV2, "v2.go"), []byte("package apiv2\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(repoAPIV2, "add", ".")
+		gitRun(repoAPIV2, "commit", "-m", "feat(api-v2-1): v2 route pinned")
+		revV2Pinned := gitRun(repoAPIV2, "rev-parse", "HEAD")
+
+		// Later commit on api-v2 AFTER revV2Pinned (planted negative control for per-repo Revision).
+		if err := os.WriteFile(filepath.Join(repoAPIV2, "v2_future.go"), []byte("package apiv2\nvar future = 1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(repoAPIV2, "add", ".")
+		gitRun(repoAPIV2, "commit", "-m", "feat(api-v2-1): v2 future commit after pinned rev")
+		shaV2Future := gitRun(repoAPIV2, "rev-parse", "HEAD")
+
+		if err := os.WriteFile(filepath.Join(repoAuth, ".beads", "issues.jsonl"), []byte(`{"id":"bv-99","title":"Auth token","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repoAuth, "token.go"), []byte("package auth\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(repoAuth, "add", ".")
+		gitRun(repoAuth, "commit", "-m", "feat(bv-99): auth token")
+
+		polyIssues := []model.Issue{
+			{ID: "api-1", Title: "V1 route", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api"},
+			// Deliberately leave SourceRepo empty on api-v2-1 to prove longest-prefix matching ("api-v2-" beats "api-")!
+			{ID: "api-v2-1", Title: "V2 route", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+			{ID: "authentication-service-bv-99", Title: "Auth token", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "authentication-service"},
+		}
+		mPoly := NewModel(copyIssues(polyIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mPoly.Stop)
+		mPoly.workDir = polyRoot
+		mPoly.EnableWorkspaceMode(WorkspaceInfo{
+			Enabled:   true,
+			RepoCount: 3,
+			Repos: []WorkspaceRepoTarget{
+				{Name: "api", Path: repoAPI, BeadsDir: filepath.Join(repoAPI, ".beads"), Prefix: "api-"},
+				{Name: "api-v2", Path: repoAPIV2, BeadsDir: filepath.Join(repoAPIV2, ".beads"), Prefix: "api-v2-", Revision: revV2Pinned},
+				{Name: "authentication-service", Path: repoAuth, BeadsDir: filepath.Join(repoAuth, ".beads"), Prefix: "authentication-service-"},
+			},
+		})
+		if cmd := mPoly.startHistoryLoad(); cmd != nil {
+			if msg := cmd(); msg != nil {
+				u, _ := mPoly.Update(msg)
+				mPoly = u.(*Model)
+			}
+		}
+		rep := mPoly.historyFullReport
+		if rep == nil {
+			t.Fatal("expected non-nil polyrepo history report")
+		}
+		hV2, okV2 := rep.Histories["api-v2-1"]
+		if !okV2 || len(hV2.Commits) == 0 {
+			t.Fatalf("api-v2-1 was hijacked by api- or failed correlation: %+v", rep.Histories)
+		}
+		sawPinned, sawFuture := false, false
+		for _, cc := range hV2.Commits {
+			if cc.SHA == revV2Pinned {
+				sawPinned = true
+			}
+			if cc.SHA == shaV2Future {
+				sawFuture = true
+			}
+		}
+		if !sawPinned || sawFuture {
+			t.Fatalf("per-repo Revision failed: sawPinned=%v sawFuture=%v commits=%+v", sawPinned, sawFuture, hV2.Commits)
+		}
+
+		// Hyphenated >10-char repo filter ("authentication-service") via m.historyBeadRepoKeys:
+		mPoly.activeRepos = map[string]bool{"authentication-service": true}
+		mPoly.syncSecondaryViewsForRepoScope(focusHistory)
+		if _, ok := mPoly.historyView.report.Histories["authentication-service-bv-99"]; !ok {
+			t.Fatalf("hyphenated >10-char repo key dropped authentication-service-bv-99: %+v", mPoly.historyView.report.Histories)
+		}
+		if _, leaked := mPoly.historyView.report.Histories["api-1"]; leaked {
+			t.Fatalf("repo filter leaked api-1 into authentication-service scope")
+		}
+		mPoly.activeRepos = nil
+
+		// Deterministic resolveCommitRepoDir across 20 calls:
+		firstDir := mPoly.resolveCommitRepoDir(shaV1[:7])
+		if firstDir == "" {
+			t.Fatal("expected non-empty resolveCommitRepoDir")
+		}
+		for range 20 {
+			if got := mPoly.resolveCommitRepoDir(shaV1[:7]); got != firstDir {
+				t.Fatalf("non-deterministic resolveCommitRepoDir: %q vs %q", got, firstDir)
+			}
+		}
+
+		// scopeRepoFilter="api" walks ONLY api, skipping api-v2 and authentication-service:
+		mScoped := NewModel(copyIssues(polyIssues), nil, "", ReadinessScope{ReferenceNow: refNow, RepoFilter: "api"})
+		t.Cleanup(mScoped.Stop)
+		mScoped.workDir = polyRoot
+		mScoped.EnableWorkspaceMode(mPoly.workspaceInfo)
+		if cmd := mScoped.startHistoryLoad(); cmd != nil {
+			if msg := cmd(); msg != nil {
+				u, _ := mScoped.Update(msg)
+				mScoped = u.(*Model)
+			}
+		}
+		if _, leakedV2 := mScoped.historyFullReport.Histories["api-v2-1"]; leakedV2 {
+			t.Fatalf("scopeRepoFilter=\"api\" walked api-v2: %+v", mScoped.historyFullReport.Histories)
+		}
+
+		// Part B: Shared-.git monorepo (/mono/.git with services/api/.beads + services/web/.beads and colliding local ID "bd-1").
+		monoRoot := t.TempDir()
+		monoAPI := filepath.Join(monoRoot, "services", "api")
+		monoWeb := filepath.Join(monoRoot, "services", "web")
+		if err := os.MkdirAll(filepath.Join(monoAPI, ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(monoWeb, ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(monoRoot, "init")
+		if err := os.WriteFile(filepath.Join(monoAPI, ".beads", "issues.jsonl"), []byte(`{"id":"bd-1","title":"API auth","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(monoWeb, ".beads", "issues.jsonl"), []byte(`{"id":"bd-1","title":"Web UI","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(monoRoot, "add", ".")
+		gitRun(monoRoot, "commit", "-m", "chore: seed monorepo stores")
+
+		if err := os.WriteFile(filepath.Join(monoAPI, "auth.go"), []byte("package api\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(monoRoot, "add", ".")
+		gitRun(monoRoot, "commit", "-m", "feat(bd-1): api auth implementation")
+		shaMonoAPI := gitRun(monoRoot, "rev-parse", "HEAD")
+
+		if err := os.WriteFile(filepath.Join(monoWeb, "ui.tsx"), []byte("export const x = 1;\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(monoRoot, "add", ".")
+		gitRun(monoRoot, "commit", "-m", "feat(bd-1): web ui implementation")
+		shaMonoWeb := gitRun(monoRoot, "rev-parse", "HEAD")
+
+		monoIssues := []model.Issue{
+			{ID: "api-bd-1", Title: "API auth", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", Origin: &model.IssueOrigin{LocalID: "bd-1", WorkingDirectory: monoAPI, TrackerDirectory: filepath.Join(monoAPI, ".beads")}},
+			{ID: "web-bd-1", Title: "Web UI", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "web", Origin: &model.IssueOrigin{LocalID: "bd-1", WorkingDirectory: monoWeb, TrackerDirectory: filepath.Join(monoWeb, ".beads")}},
+		}
+		mMono := NewModel(copyIssues(monoIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mMono.Stop)
+		mMono.workDir = monoRoot
+		mMono.EnableWorkspaceMode(WorkspaceInfo{
+			Enabled:   true,
+			RepoCount: 2,
+			Repos: []WorkspaceRepoTarget{
+				{Name: "api", Path: monoAPI, BeadsDir: filepath.Join(monoAPI, ".beads"), Prefix: "api-"},
+				{Name: "web", Path: monoWeb, BeadsDir: filepath.Join(monoWeb, ".beads"), Prefix: "web-"},
+			},
+		})
+		if cmd := mMono.startHistoryLoad(); cmd != nil {
+			if msg := cmd(); msg != nil {
+				u, _ := mMono.Update(msg)
+				mMono = u.(*Model)
+			}
+		}
+		monoRep := mMono.historyFullReport
+		if monoRep == nil || monoRep.Window == nil || monoRep.Window.Commits != 3 {
+			t.Fatalf("shared-.git monorepo double-counted Window.Commits: got %+v, want 3", monoRep.Window)
+		}
+		apiHist := monoRep.Histories["api-bd-1"]
+		foundAPIOnly, leakedWeb, badDoublePrefix := false, false, false
+		for _, cc := range apiHist.Commits {
+			if cc.SHA == shaMonoAPI {
+				foundAPIOnly = true
+				for _, f := range cc.Files {
+					if f.Path != "services/api/auth.go" {
+						badDoublePrefix = true
+					}
+				}
+			}
+			if cc.SHA == shaMonoWeb {
+				leakedWeb = true
+			}
+		}
+		if !foundAPIOnly || leakedWeb || badDoublePrefix {
+			t.Fatalf("shared-.git monorepo disambiguation/path failed: foundAPI=%v leakedWeb=%v badPrefix=%v commits=%+v",
+				foundAPIOnly, leakedWeb, badDoublePrefix, apiHist.Commits)
+		}
+	})
+
+	t.Run("R1_B6_full_model_view_80x24_and_80x26_tutorial_toc_and_cass_modal_borders", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "MODAL-1", Title: "Modal Fit Issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		}
+		for _, termH := range []int{24, 26} {
+			m := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: refNow})
+			t.Cleanup(m.Stop)
+			u, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: termH})
+			m = u.(*Model)
+
+			// 1. Tutorial TOC at 80x24 / 80x26 through full m.View():
+			m.openContextTutorialWithContext(focusList, "list")
+			m.tutorialModel.SetContextMode(false)
+			m.tutorialModel, _ = m.tutorialModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+			m.tutorialModel, _ = m.tutorialModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+			tutFull := ansi.Strip(m.View())
+			if gotH := lipgloss.Height(tutFull); gotH != termH {
+				t.Fatalf("80x%d Tutorial m.View() height = %d, want %d:\n%s", termH, gotH, termH, tutFull)
+			}
+			if !strings.Contains(tutFull, "╭") || !strings.Contains(tutFull, "╰") || !strings.Contains(tutFull, "Page 30/30") {
+				t.Fatalf("80x%d Tutorial m.View() clipped border or page 30:\n%s", termH, tutFull)
+			}
+			m.closeTutorial()
+
+			// 2. CassSessionModal with 5 multi-line sessions + long --workspace path at 80x24 / 80x26 through full m.View():
+			var sessions []cass.ScoredResult
+			for i := 1; i <= 5; i++ {
+				sessions = append(sessions, cass.ScoredResult{
+					SearchResult: cass.SearchResult{
+						Agent:     fmt.Sprintf("claude-%d", i),
+						Timestamp: refNow.Add(-time.Duration(i) * time.Hour),
+						Snippet:   "Line one of session preview\nLine two of session preview\nLine three of session preview",
+					},
+					Strategy: cass.StrategyKeywords,
+					Keywords: []string{"authentication", "workspace", "correlation", "modal-overflow-guard"},
+				})
+			}
+			m.cassModal = NewCassSessionModalWithOptions("MODAL-1", cass.CorrelationResult{BeadID: "MODAL-1", TopSessions: sessions}, m.theme, CassSessionModalOptions{
+				Workspace:    "/very/long/workspace/directory/path/that/would/otherwise/wrap/search/cmd",
+				ReferenceNow: refNow,
+			})
+			m.cassModal.SetSize(m.width, max(1, m.height-1))
+			m.showCassModal = true
+			m.focused = focusCassModal
+			for range 4 {
+				m.cassModal, _ = m.cassModal.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+			}
+			cassFull := ansi.Strip(m.View())
+			if gotH := lipgloss.Height(cassFull); gotH != termH {
+				t.Fatalf("80x%d CassSessionModal m.View() height = %d, want %d:\n%s", termH, gotH, termH, cassFull)
+			}
+			if !strings.Contains(cassFull, "[5]") || !strings.Contains(cassFull, "╭") || !strings.Contains(cassFull, "╰") {
+				t.Fatalf("80x%d CassSessionModal m.View() clipped session #5 or modal border:\n%s", termH, cassFull)
+			}
+		}
+	})
+
+	t.Run("R1_B7_render_debug_view_mode_reset_active_recipe_graph_and_tiny_10x1_sprint", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "REC-OPEN", Title: "Recipe Visible Open", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "REC-CLOSED", Title: "Excluded Closed Issue", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		}
+		openOnly := &recipe.Recipe{
+			Name:    "open-only",
+			Filters: recipe.FilterConfig{Status: []string{"open"}},
+		}
+		m := NewModel(copyIssues(issues), openOnly, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.SetSprints([]model.Sprint{{ID: "sp-tiny", Name: "Tiny Sprint", StartDate: refNow.Add(-24 * time.Hour), EndDate: refNow.Add(24 * time.Hour), BeadIDs: []string{"REC-OPEN"}}})
+
+		// Dirty competing view booleans + user split-view override before RenderDebugView:
+		m.isBoardView = true
+		m.isSprintView = true
+		m.showVelocityComparison = true
+		m.splitViewUserOverride = true
+		m.splitViewUserWant = false
+
+		graphOut := ansi.Strip(m.RenderDebugView("graph", 140, 30))
+		if m.isBoardView || m.isSprintView || m.showVelocityComparison || !m.isGraphView {
+			t.Fatalf("RenderDebugView(\"graph\") failed to reset competing view flags: board=%v sprint=%v vel=%v graph=%v",
+				m.isBoardView, m.isSprintView, m.showVelocityComparison, m.isGraphView)
+		}
+		if !strings.Contains(graphOut, "REC-OPEN") || strings.Contains(graphOut, "REC-CLOSED") {
+			t.Fatalf("RenderDebugView(\"graph\") ignored active recipe open-only:\n%s", graphOut)
+		}
+
+		_ = m.RenderDebugView("triage", 140, 30)
+		if m.isGraphView || m.isSplitView {
+			t.Fatalf("RenderDebugView(\"triage\") failed to clear isGraphView (%v) or honor splitViewUserOverride (%v)", m.isGraphView, m.isSplitView)
+		}
+
+		// Tiny 10x1 sprint render must not panic or pass negative height to Lipgloss.
+		tinySprint := m.RenderDebugView("sprint", 10, 1)
+		if strings.TrimSpace(ansi.Strip(tinySprint)) == "" {
+			t.Fatalf("RenderDebugView(\"sprint\", 10, 1) returned empty output")
+		}
+	})
+}
