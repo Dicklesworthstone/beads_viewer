@@ -2,16 +2,26 @@
 (function runHybridScorerTests() {
   let ScorerClass = typeof HybridScorer !== 'undefined' ? HybridScorer : undefined;
   let Presets = typeof HYBRID_PRESETS !== 'undefined' ? HYBRID_PRESETS : undefined;
+  let scorerHelpers = {
+    computeActivePageRankBounds: typeof computeActivePageRankBounds === 'function' ? computeActivePageRankBounds : undefined,
+    resolveHybridPageRankMax: typeof resolveHybridPageRankMax === 'function' ? resolveHybridPageRankMax : undefined,
+    normalizeHybridPageRank: typeof normalizeHybridPageRank === 'function' ? normalizeHybridPageRank : undefined,
+  };
   let wasmLoader = null;
 
   if (typeof require === 'function') {
+    const mod = require('./hybrid_scorer.js');
     if (!ScorerClass || !Presets) {
-      const mod = require('./hybrid_scorer.js');
       ScorerClass = mod.HybridScorer;
       Presets = mod.HYBRID_PRESETS;
       globalThis.HybridScorer = ScorerClass;
       globalThis.HYBRID_PRESETS = Presets;
     }
+    scorerHelpers = {
+      computeActivePageRankBounds: mod.computeActivePageRankBounds,
+      resolveHybridPageRankMax: mod.resolveHybridPageRankMax,
+      normalizeHybridPageRank: mod.normalizeHybridPageRank,
+    };
     wasmLoader = require('./wasm_loader.js');
   }
 
@@ -192,24 +202,58 @@
   }
 
   function verifyActivePageRankClamping() {
+    const {
+      computeActivePageRankBounds: prodBounds,
+      resolveHybridPageRankMax: prodResolveMax,
+      normalizeHybridPageRank: prodNormalizePR,
+    } = scorerHelpers;
+    if (typeof prodBounds !== 'function' || typeof prodResolveMax !== 'function' || typeof prodNormalizePR !== 'function') {
+      throw new Error('Production PageRank normalization helpers not exported from hybrid_scorer.js');
+    }
+
     const scorer = new ScorerClass(Presets['impact-first']);
     const nowIso = new Date().toISOString();
-    const maxActivePR = 0.08;
-    const clampActivePR = (rawPR) => Math.min(1, Math.max(0, (Number(rawPR) || 0) / maxActivePR));
 
-    const candidates = [
-      { id: 'active-top', textScore: 0.8, pagerank: clampActivePR(0.08), status: 'open', priority: 1, blockerCount: 1, updatedAt: nowIso },
-      { id: 'active-mid', textScore: 0.8, pagerank: clampActivePR(0.02), status: 'open', priority: 1, blockerCount: 1, updatedAt: nowIso },
-      { id: 'closed-mega-hub', textScore: 0.8, pagerank: clampActivePR(0.80), status: 'closed', priority: 1, blockerCount: 0, updatedAt: nowIso },
+    const rawCorpus = [
+      { id: 'active-open-top', textScore: 0.8, rawPR: 0.08, status: 'open', priority: 1, blockerCount: 1, updatedAt: nowIso },
+      { id: 'active-inprog-mid', textScore: 0.8, rawPR: 0.02, status: 'in_progress', priority: 1, blockerCount: 1, updatedAt: nowIso },
+      { id: 'closed-mega-hub', textScore: 0.8, rawPR: 0.80, status: 'closed', priority: 1, blockerCount: 0, updatedAt: nowIso },
+      { id: 'tombstone-mega-hub', textScore: 0.8, rawPR: 0.95, status: 'tombstone', priority: 1, blockerCount: 0, updatedAt: nowIso },
     ];
+
+    const bounds = prodBounds(rawCorpus.map(r => ({ pagerank: r.rawPR, status: r.status })));
+    if (!bounds.hasMetrics) {
+      throw new Error('expected hasMetrics=true');
+    }
+    assertClose(bounds.maxActivePageRank, 0.08, 1e-9, 'maxActivePageRank ignores closed and tombstone rows');
+    assertClose(bounds.maxAnyPageRank, 0.95, 1e-9, 'maxAnyPageRank tracks overall corpus max');
+    assertClose(bounds.maxPageRank, 0.08, 1e-9, 'maxPageRank prefers maxActivePageRank when > 0');
+
+    // Edge cases on production helpers: all-closed fallback, maxPageRank === 0, and hasMetrics === false
+    assertClose(prodResolveMax(0, 0.42), 0.42, 1e-9, 'resolveHybridPageRankMax falls back to maxAny when maxActive is 0');
+    assertClose(prodResolveMax(0, 0), 0, 1e-9, 'resolveHybridPageRankMax returns 0 when all scores are 0');
+    assertClose(prodNormalizePR(0.05, true, 0), 0, 1e-9, 'normalizeHybridPageRank returns 0 when maxPageRank === 0');
+    assertClose(prodNormalizePR(0.05, false, 0), 0.5, 1e-9, 'normalizeHybridPageRank returns neutral 0.5 when hasMetrics === false');
+    assertClose(prodNormalizePR(-0.2, true, 0.08), 0, 1e-9, 'normalizeHybridPageRank clamps negative raw score to 0');
+
+    const candidates = rawCorpus.map(r => ({
+      id: r.id,
+      textScore: r.textScore,
+      pagerank: prodNormalizePR(r.rawPR, bounds.hasMetrics, bounds.maxPageRank),
+      status: r.status,
+      priority: r.priority,
+      blockerCount: r.blockerCount,
+      updatedAt: r.updatedAt,
+    }));
 
     const ranked = scorer.scoreAndRank(candidates);
     const byId = new Map(ranked.map(r => [r.id, r]));
-    assertClose(byId.get('active-top').component_scores.pagerank, 1.0, 1e-9, 'active-top normalized PR');
-    assertClose(byId.get('active-mid').component_scores.pagerank, 0.25, 1e-9, 'active-mid normalized PR');
+    assertClose(byId.get('active-open-top').component_scores.pagerank, 1.0, 1e-9, 'active-open-top normalized PR');
+    assertClose(byId.get('active-inprog-mid').component_scores.pagerank, 0.25, 1e-9, 'active-inprog-mid normalized PR');
     assertClose(byId.get('closed-mega-hub').component_scores.pagerank, 1.0, 1e-9, 'closed-mega-hub clamped PR <= 1.0');
-    if (ranked[0].id !== 'active-top') {
-      throw new Error(`expected active-top to rank #1 over closed-mega-hub, got ${ranked[0].id}`);
+    assertClose(byId.get('tombstone-mega-hub').component_scores.pagerank, 1.0, 1e-9, 'tombstone-mega-hub clamped PR <= 1.0');
+    if (ranked[0].id !== 'active-open-top') {
+      throw new Error(`expected active-open-top to rank #1 over closed/tombstone mega-hubs, got ${ranked[0].id}`);
     }
   }
 

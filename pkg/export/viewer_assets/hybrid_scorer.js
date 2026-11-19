@@ -71,7 +71,9 @@ class HybridScorer {
     const downstreamImpact = Number.isFinite(rawBlocker) ? Math.max(0, Math.trunc(rawBlocker)) : 0;
     const impactScore = this.normalizeImpact(downstreamImpact);
     const recencyScore = this.normalizeRecency(result.updatedAt ?? result.updated_at, refNowMs);
-    const pagerank = (typeof result.pagerank === 'number' && Number.isFinite(result.pagerank)) ? result.pagerank : 0.5;
+    const pagerank = (typeof result.pagerank === 'number' && Number.isFinite(result.pagerank))
+      ? Math.min(1, Math.max(0, result.pagerank))
+      : 0.5;
     const rawText = Number(result.textScore ?? result.text_score ?? 0);
     const textScore = Number.isFinite(rawText) ? rawText : 0;
 
@@ -167,13 +169,76 @@ class HybridScorer {
   }
 }
 
+function isHybridActiveIssueStatus(status) {
+  const norm = String(status || '').trim().toLowerCase();
+  return norm !== 'closed' && norm !== 'tombstone';
+}
+
+function resolveHybridPageRankMax(maxActivePageRank, maxAnyPageRank) {
+  const act = Number(maxActivePageRank);
+  if (Number.isFinite(act) && act > 0) {
+    return act;
+  }
+  const any = Number(maxAnyPageRank);
+  return Number.isFinite(any) && any > 0 ? any : 0;
+}
+
+function computeActivePageRankBounds(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { hasMetrics: false, maxActivePageRank: 0, maxAnyPageRank: 0, maxPageRank: 0 };
+  }
+  let maxActive = 0;
+  let maxAny = 0;
+  let count = 0;
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const pr = Number(row.pagerank);
+    if (!Number.isFinite(pr)) continue;
+    count++;
+    if (pr > maxAny) maxAny = pr;
+    if (isHybridActiveIssueStatus(row.status) && pr > maxActive) {
+      maxActive = pr;
+    }
+  }
+  return {
+    hasMetrics: count > 0,
+    maxActivePageRank: maxActive,
+    maxAnyPageRank: maxAny,
+    maxPageRank: resolveHybridPageRankMax(maxActive, maxAny),
+  };
+}
+
+function normalizeHybridPageRank(rawScore, hasMetrics, maxPageRank) {
+  if (!hasMetrics) return 0.5;
+  const maxPR = Number(maxPageRank);
+  if (!Number.isFinite(maxPR) || maxPR <= 0) return 0;
+  const raw = Number(rawScore);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(1, Math.max(0, raw / maxPR));
+}
+
 if (typeof window !== 'undefined') {
   window.HybridScorer = HybridScorer;
   window.HYBRID_PRESETS = HYBRID_PRESETS;
+  window.isHybridActiveIssueStatus = isHybridActiveIssueStatus;
+  window.resolveHybridPageRankMax = resolveHybridPageRankMax;
+  window.computeActivePageRankBounds = computeActivePageRankBounds;
+  window.normalizeHybridPageRank = normalizeHybridPageRank;
 } else if (typeof globalThis !== 'undefined') {
   globalThis.HybridScorer = HybridScorer;
   globalThis.HYBRID_PRESETS = HYBRID_PRESETS;
+  globalThis.isHybridActiveIssueStatus = isHybridActiveIssueStatus;
+  globalThis.resolveHybridPageRankMax = resolveHybridPageRankMax;
+  globalThis.computeActivePageRankBounds = computeActivePageRankBounds;
+  globalThis.normalizeHybridPageRank = normalizeHybridPageRank;
 }
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { HybridScorer, HYBRID_PRESETS };
+  module.exports = {
+    HybridScorer,
+    HYBRID_PRESETS,
+    isHybridActiveIssueStatus,
+    resolveHybridPageRankMax,
+    computeActivePageRankBounds,
+    normalizeHybridPageRank,
+  };
 }
