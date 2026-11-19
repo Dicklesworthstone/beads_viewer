@@ -2274,6 +2274,7 @@ type WorkspaceRepoTarget struct {
 	Path     string
 	BeadsDir string
 	Prefix   string
+	Revision string
 }
 
 // WorkspaceInfo contains workspace loading metadata for TUI display
