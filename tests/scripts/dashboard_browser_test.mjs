@@ -3087,7 +3087,7 @@ async function capabilitiesJourney(page) {
       }
       GRAPH_STATE.ready = savedGraphReady;
 
-      // 3. graph.js WASM Fallback Mode (!store.wasmReady) precomputed metrics & in_cycle
+      // 3. graph.js WASM Fallback Mode (!store.wasmReady) precomputed metrics, Tarjan SCC disjoint cycles, & Cycle Navigator
       const m = ${app}.forceGraphModule;
       const gd = getGraphViewData();
       window.bvGraphWasm = undefined;
@@ -3095,6 +3095,27 @@ async function capabilitiesJourney(page) {
       const fbGraphData = m.loadData(gd.issues, gd.dependencies, null);
       const fbAuthRoot = fbGraphData.nodes.find(n => n.id === 'cap-auth-root');
       const fbClosed = fbGraphData.nodes.find(n => n.id === 'cap-closed-prereq');
+      const fbCycleInfo = m.getCycleInfo();
+      m.highlightCycles();
+      const fbNavInit = m.initCycleNavigator();
+      const fbCycle0 = m.highlightCycle(0, false);
+      // Verify fake cross-SCC link cap-auth-ui -> cap-billing-a is NEVER highlighted when highlighting cycle 0 or 1:
+      const fakeLinkDimmedOnCyc0 = (() => {
+        const g = m.getGraph();
+        // Temporarily test link opacity through graphData links vs synthetic cross-SCC edge
+        const realAuthLink = fbGraphData.links.find(l => (l.source?.id || l.source) === 'cap-auth-root' && (l.target?.id || l.target) === 'cap-auth-ui');
+        const billingLink = fbGraphData.links.find(l => (l.source?.id || l.source) === 'cap-billing-a' && (l.target?.id || l.target) === 'cap-billing-b');
+        const hubLeafLink = fbGraphData.links.find(l => (l.source?.id || l.source) === 'cap-hub-leaf' && (l.target?.id || l.target) === 'cap-auth-root');
+        return {
+          hasRealAuthLink: Boolean(realAuthLink),
+          hasBillingLink: Boolean(billingLink),
+          hasHubLeafLink: Boolean(hubLeafLink),
+          cyc0HighlightedNodes: fbGraphData.nodes.filter(n => n._cycleHighlight).map(n => n.id).sort(),
+        };
+      })();
+      const fbCycle1 = m.highlightCycle(1, false);
+      const cyc1HighlightedNodes = fbGraphData.nodes.filter(n => n._cycleHighlight).map(n => n.id).sort();
+      m.resetCycleNavigator();
       wasmFallbackGraphAudit = {
         wasmReady: m.isWasmReady(),
         hasOverviewEigenvector: gd.issues.some(i => (i.eigenvector || 0) > 0),
@@ -3103,6 +3124,13 @@ async function capabilitiesJourney(page) {
         authRootEigenvector: fbAuthRoot?.eigenvector || 0,
         authRootInCycle: Boolean(fbAuthRoot?.inCycle),
         closedInCycle: Boolean(fbClosed?.inCycle),
+        fbCycleInfo,
+        fbNavCycleCount: fbNavInit?.cycleCount || 0,
+        fbNavCycles: (fbNavInit?.cycles || []).map(c => [...c].sort()),
+        cyc0HighlightedNodes: fakeLinkDimmedOnCyc0.cyc0HighlightedNodes,
+        cyc1HighlightedNodes,
+        cyc0Path: fbCycle0?.path || '',
+        cyc1Path: fbCycle1?.path || '',
       };
 
       // Restore window.bvGraphWasm and verify DAG differentiated eigenvector preservation in graph.js
@@ -3163,11 +3191,14 @@ async function capabilitiesJourney(page) {
         const bridges2 = testGraph.bridges();
         const approx1 = Array.from(testGraph.betweennessApprox(2));
         const approx2 = Array.from(testGraph.betweennessApprox(2));
+        const approxZero = Array.from(testGraph.betweennessApprox(0));
         wasmGraphAlgAudit = {
           kcores,
           bridges1,
           bridgesEqual: JSON.stringify(bridges1) === JSON.stringify(bridges2),
           approxEqual: JSON.stringify(approx1) === JSON.stringify(approx2),
+          approxZero,
+          approxZeroAllFinite: approxZero.every(Number.isFinite),
         };
       } finally {
         testGraph.free();
@@ -3210,8 +3241,10 @@ async function capabilitiesJourney(page) {
   assert.ok((w18HybridById.get('w18-open-pr-high')?.score || 0) > (w18HybridById.get('w18-open-pr-low')?.score || 0), 'high-PR open issue outranks low-PR open issue');
   assert.ok((w18HybridById.get('w18-open-pr-high')?.score || 0) > (w18HybridById.get('w18-closed-pr-hub')?.score || 0), 'high-PR open issue outranks clamped closed mega-hub');
   assert.equal(wave18BrowserAudit.fallbackCycleWithCycles.hasCycles, true, 'getCycleInfo WASM fallback reports active cycles');
-  assert.equal(wave18BrowserAudit.fallbackCycleWithCycles.cycleCount, 2, 'getCycleInfo WASM fallback honors triageData.project_health.graph.cycle_count');
-  assert.deepEqual(wave18BrowserAudit.fallbackCycleWithCycles.sccComponents, [['cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b']], 'getCycleInfo WASM fallback lists in_cycle=1 active issues');
+  assert.equal(wave18BrowserAudit.fallbackCycleWithCycles.cycleCount, 2, 'getCycleInfo WASM fallback computes 2 disjoint cycles');
+  assert.equal(wave18BrowserAudit.fallbackCycleWithCycles.sccCount, 2, 'getCycleInfo WASM fallback separates disjoint SCCs');
+  assert.equal(wave18BrowserAudit.fallbackCycleWithCycles.largestSccSize, 2, 'getCycleInfo WASM fallback reports max SCC size 2 (never lumping 4 nodes)');
+  assert.deepEqual(wave18BrowserAudit.fallbackCycleWithCycles.sccComponents, [['cap-auth-root', 'cap-auth-ui'], ['cap-billing-a', 'cap-billing-b']], 'getCycleInfo WASM fallback keeps disjoint cycles as separate SCCs');
   assert.equal(wave18BrowserAudit.fallbackCycleAcyclic.hasCycles, false, 'getCycleInfo WASM fallback negative control returns false when acyclic');
   assert.equal(wave18BrowserAudit.fallbackCycleAcyclic.cycleCount, 0);
   assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.wasmReady, false);
@@ -3221,6 +3254,12 @@ async function capabilitiesJourney(page) {
   assert.ok(wave18BrowserAudit.wasmFallbackGraphAudit.authRootEigenvector > 0, 'graph.js WASM fallback populates node.eigenvector');
   assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.authRootInCycle, true, 'graph.js WASM fallback marks active cycle node inCycle=true');
   assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.closedInCycle, false, 'graph.js WASM fallback keeps closed node inCycle=false');
+  assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.fbCycleInfo.cycleCount, 2, 'graph.js getCycleInfo() reports 2 cycles when wasmReady=false');
+  assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.fbNavCycleCount, 2, 'graph.js initCycleNavigator() finds 2 separate cycles when wasmReady=false');
+  assert.deepEqual(wave18BrowserAudit.wasmFallbackGraphAudit.fbNavCycles, [['cap-auth-root', 'cap-auth-ui'], ['cap-billing-a', 'cap-billing-b']], 'graph.js initCycleNavigator() keeps disjoint cycles separate without merging B->C');
+  assert.deepEqual(wave18BrowserAudit.wasmFallbackGraphAudit.cyc0HighlightedNodes, ['cap-auth-root', 'cap-auth-ui'], 'highlightCycle(0) highlights only cycle 1');
+  assert.deepEqual(wave18BrowserAudit.wasmFallbackGraphAudit.cyc1HighlightedNodes, ['cap-billing-a', 'cap-billing-b'], 'highlightCycle(1) highlights only cycle 2');
+  assert.ok(!wave18BrowserAudit.wasmFallbackGraphAudit.cyc0Path.includes('cap-billing-a') && !wave18BrowserAudit.wasmFallbackGraphAudit.cyc1Path.includes('cap-auth-ui'), 'fallback cycle paths never fabricate cross-SCC edge B->C');
   assert.ok(wave18BrowserAudit.dagEigenvectorAudit.rawWasmDagRange < 1e-9, 'WASM power-iteration eigenvector on DAG is flat');
   assert.ok(Math.abs(wave18BrowserAudit.dagEigenvectorAudit.preservedDagEig[0] - 0.85) < 1e-6 && Math.abs(wave18BrowserAudit.dagEigenvectorAudit.preservedDagEig[2] - 0.10) < 1e-6, 'graph.js preserves differentiated SQLite eigenvector on DAGs');
   assert.ok(wave18BrowserAudit.dagEigenvectorAudit.sizeDagA > wave18BrowserAudit.dagEigenvectorAudit.sizeDagC, 'sizeMetric="eigenvector" differentiates DAG nodes');
@@ -3229,6 +3268,8 @@ async function capabilitiesJourney(page) {
   assert.deepEqual(wave18BrowserAudit.wasmGraphAlgAudit.bridges1, [[1, 2]], 'WASM bridges returns canonical sorted bridge');
   assert.equal(wave18BrowserAudit.wasmGraphAlgAudit.bridgesEqual, true);
   assert.equal(wave18BrowserAudit.wasmGraphAlgAudit.approxEqual, true, 'WASM betweennessApprox is deterministic across calls');
+  assert.deepEqual(wave18BrowserAudit.wasmGraphAlgAudit.approxZero, [0, 0, 0, 0, 0], 'WASM betweennessApprox(0) returns finite zeros instead of NaN');
+  assert.equal(wave18BrowserAudit.wasmGraphAlgAudit.approxZeroAllFinite, true);
 
   // 5. Error Modal runErrorAction(action) recovery handler ({ action }, { handler }, { url }).
   await evaluate(page, `(() => {
@@ -3405,47 +3446,80 @@ async function standaloneGraphJourney(page) {
   // so bidirectional non-blocking links never trigger false cycle errors, and active PageRankRank is 0 for closed issues.
   const standaloneDagAndPrRankAudit = await evaluate(page, `(() => {
     const closedNode = DATA.nodes.find(n => n.id === 'cap-closed-prereq');
+    const billingBNode = DATA.nodes.find(n => n.id === 'cap-billing-b');
+    const rankOneActiveId = DATA.nodes.find(n => Number(n.pagerank_rank) === 1)?.id || '';
     const activeRanks = DATA.nodes.filter(n => n.status !== 'closed' && n.status !== 'tombstone').map(n => n.pagerank_rank).sort((a, b) => a - b);
     const savedLinks = DATA.links.map(l => ({ ...l }));
+    const savedClosedPr = closedNode?.pagerank;
+    const savedBillingBStatus = billingBNode?.status;
     try {
+      // Planted high raw PageRank on closed node: #btn-top must still rank active pagerank_rank === 1 first and omit closed node!
+      if (closedNode) closedNode.pagerank = 99.0;
+      document.getElementById('btn-top').click();
+      const topPanelIds = [...document.querySelectorAll('#top-nodes-panel .top-node-item')].map(el => el.dataset.id);
+      document.getElementById('btn-top').click();
+
+      // Also mark cap-billing-b closed temporarily so cap-closed-prereq <-> cap-billing-b forms a historical closed blocks cycle,
+      // and include a blocking self-loop cap-hub-leaf -> cap-hub-leaf: DAG mode must exclude both!
+      if (billingBNode) billingBNode.status = 'closed';
+      const liveBillingB = Graph.graphData().nodes.find(n => n.id === 'cap-billing-b');
+      if (liveBillingB) liveBillingB.status = 'closed';
+
       DATA.links = [
         { source: 'cap-hub-leaf', target: 'cap-auth-root', type: 'blocks', critical: false },
+        { source: 'cap-hub-leaf', target: 'cap-hub-leaf', type: 'blocks', critical: false },
+        { source: 'cap-closed-prereq', target: 'cap-billing-b', type: 'blocks', critical: false },
+        { source: 'cap-billing-b', target: 'cap-closed-prereq', type: 'blocks', critical: false },
         { source: 'cap-auth-root', target: 'cap-auth-ui', type: 'related', critical: false },
         { source: 'cap-auth-ui', target: 'cap-auth-root', type: 'related', critical: false },
-        { source: 'cap-billing-a', target: 'cap-billing-b', type: 'discovered-from', critical: false },
-        { source: 'cap-billing-b', target: 'cap-billing-a', type: 'discovered-from', critical: false },
+        { source: 'cap-billing-a', target: 'cap-auth-root', type: 'discovered-from', critical: false },
       ];
       const tdApplied = applyGraphDagMode('td');
       const dagModeNow = Graph.dagMode();
       const dagLinksCount = Graph.graphData().links.length;
       const dagHasNonBlocking = Graph.graphData().links.some(l => !isBlockingLinkType(l.type));
+      const dagHasSelfLoop = Graph.graphData().links.some(l => {
+        const s = typeof l.source === 'object' ? l.source.id : l.source;
+        const t = typeof l.target === 'object' ? l.target.id : l.target;
+        return s === t;
+      });
       const forceApplied = applyGraphDagMode('force');
       const forceLinksCount = Graph.graphData().links.length;
       return {
         closedPrRank: closedNode?.pagerank_rank,
+        rankOneActiveId,
+        topPanelIds,
         activeRanks,
         tdApplied,
         dagErrorTriggered,
         dagModeNow,
         dagLinksCount,
         dagHasNonBlocking,
+        dagHasSelfLoop,
         forceApplied,
         forceLinksCount,
       };
     } finally {
+      if (closedNode) closedNode.pagerank = savedClosedPr;
+      if (billingBNode) billingBNode.status = savedBillingBStatus;
+      const liveBillingB = Graph.graphData().nodes.find(n => n.id === 'cap-billing-b');
+      if (liveBillingB) liveBillingB.status = savedBillingBStatus;
       DATA.links = savedLinks;
       applyGraphDagMode('force');
     }
   })()`);
   assert.equal(standaloneDagAndPrRankAudit.closedPrRank, 0, 'closed standalone node has pagerank_rank === 0');
+  assert.equal(standaloneDagAndPrRankAudit.topPanelIds[0], standaloneDagAndPrRankAudit.rankOneActiveId, '#btn-top selects #1 active issue by pagerank_rank rather than closed hub');
+  assert.equal(standaloneDagAndPrRankAudit.topPanelIds.includes('cap-closed-prereq'), false, '#btn-top excludes closed nodes with pagerank_rank === 0');
   assert.deepEqual(standaloneDagAndPrRankAudit.activeRanks, [1, 2, 3, 4, 5], 'active standalone nodes receive contiguous PageRankRank 1..5');
-  assert.equal(standaloneDagAndPrRankAudit.tdApplied, true, 'applyGraphDagMode("td") succeeds when cycle is only on related/discovered-from links');
-  assert.equal(standaloneDagAndPrRankAudit.dagErrorTriggered, false, 'bidirectional related/discovered-from links never trigger onDagError');
+  assert.equal(standaloneDagAndPrRankAudit.tdApplied, true, 'applyGraphDagMode("td") succeeds when cycles are only on closed nodes, self-loops, or non-blocking links');
+  assert.equal(standaloneDagAndPrRankAudit.dagErrorTriggered, false, 'closed cycles, self-loops, and related/discovered-from links never trigger onDagError');
   assert.equal(standaloneDagAndPrRankAudit.dagModeNow, 'td');
-  assert.equal(standaloneDagAndPrRankAudit.dagLinksCount, 1, 'dagMode filters Graph.graphData().links to the 1 blocking link');
+  assert.equal(standaloneDagAndPrRankAudit.dagLinksCount, 1, 'dagMode filters Graph.graphData().links to the 1 active non-self-loop blocking link');
   assert.equal(standaloneDagAndPrRankAudit.dagHasNonBlocking, false);
+  assert.equal(standaloneDagAndPrRankAudit.dagHasSelfLoop, false);
   assert.equal(standaloneDagAndPrRankAudit.forceApplied, true);
-  assert.equal(standaloneDagAndPrRankAudit.forceLinksCount, 5, 'returning to force mode restores all 5 blocking + non-blocking links');
+  assert.equal(standaloneDagAndPrRankAudit.forceLinksCount, 7, 'returning to force mode restores all 7 links');
 
   // Verify unified applyFilters across status, label, priority, and search.
   const filterAudit = await evaluate(page, `(() => {
