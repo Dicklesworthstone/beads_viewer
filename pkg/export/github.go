@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1110,7 +1112,34 @@ func sleepDeploymentPoll(interval time.Duration, deadline time.Time) {
 	time.Sleep(interval)
 }
 
-func fetchDeploymentMetaJSON(client *http.Client, metaURL string, deadline time.Time) ([]byte, error) {
+type deploymentMetaPayload struct {
+	IssueCount *int `json:"issue_count"`
+}
+
+func buildDeploymentMetaURL(rawDeployURL string) (*url.URL, error) {
+	trimmed := strings.TrimSpace(rawDeployURL)
+	if trimmed == "" {
+		return nil, fmt.Errorf("empty deployment URL")
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("invalid deployment URL %q: %w", rawDeployURL, err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return nil, fmt.Errorf("invalid deployment URL %q: missing scheme or host", rawDeployURL)
+	}
+	joinedPath, err := url.JoinPath(parsed.Path, "data", "meta.json")
+	if err != nil {
+		return nil, fmt.Errorf("join meta.json path for %q: %w", rawDeployURL, err)
+	}
+	parsed.Path = joinedPath
+	parsed.RawPath = ""
+	parsed.Fragment = ""
+	parsed.RawFragment = ""
+	return parsed, nil
+}
+
+func fetchDeploymentMetaJSON(client *http.Client, baseMetaURL *url.URL, deadline time.Time) ([]byte, error) {
 	reqTimeout := 10 * time.Second
 	if remaining := time.Until(deadline); remaining > 0 && remaining < reqTimeout {
 		reqTimeout = remaining
@@ -1118,12 +1147,12 @@ func fetchDeploymentMetaJSON(client *http.Client, metaURL string, deadline time.
 	ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
 	defer cancel()
 
-	sep := "?"
-	if strings.Contains(metaURL, "?") {
-		sep = "&"
-	}
-	reqURL := fmt.Sprintf("%s%s_t=%d", metaURL, sep, time.Now().UnixNano())
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	pollURL := *baseMetaURL
+	q := pollURL.Query()
+	q.Set("_t", strconv.FormatInt(time.Now().UnixNano(), 10))
+	pollURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pollURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1151,7 +1180,11 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 		timeout = 90 * time.Second
 	}
 
-	metaURL := strings.TrimSuffix(pagesURL, "/") + "/data/meta.json"
+	baseMetaURL, err := buildDeploymentMetaURL(pagesURL)
+	if err != nil {
+		return fmt.Errorf("deployment verification failed: %w", err)
+	}
+	metaURLStr := baseMetaURL.String()
 	deadline := time.Now().Add(timeout)
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 	var lastErr error
@@ -1159,33 +1192,36 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 	fmt.Printf("  -> Verifying deployment at %s...\n", pagesURL)
 
 	for time.Now().Before(deadline) {
-		output, err := fetchDeploymentMetaJSON(httpClient, metaURL, deadline)
+		output, err := fetchDeploymentMetaJSON(httpClient, baseMetaURL, deadline)
 		if err != nil {
 			lastErr = fmt.Errorf("fetch failed: %w", err)
 			sleepDeploymentPoll(githubDeploymentPollInterval, deadline)
 			continue
 		}
 
-		// Parse meta.json
-		var meta struct {
-			IssueCount int `json:"issue_count"`
-		}
+		var meta deploymentMetaPayload
 		if err := json.Unmarshal(output, &meta); err != nil {
 			lastErr = fmt.Errorf("parse failed: %w", err)
+			sleepDeploymentPoll(githubDeploymentPollInterval, deadline)
+			continue
+		}
+		if meta.IssueCount == nil || *meta.IssueCount < 0 {
+			lastErr = fmt.Errorf("invalid meta.json: missing or negative issue_count")
 			sleepDeploymentPoll(githubDeploymentPollInterval, deadline)
 			continue
 		}
 
 		// Check issue count matches expected. Zero is a valid expected
 		// count for empty exports; negative disables count comparison.
-		if expectedIssueCount >= 0 && meta.IssueCount != expectedIssueCount {
+		liveCount := *meta.IssueCount
+		if expectedIssueCount >= 0 && liveCount != expectedIssueCount {
 			lastErr = fmt.Errorf("deployment verification issue count mismatch: live site shows %d issues, expected %d",
-				meta.IssueCount, expectedIssueCount)
+				liveCount, expectedIssueCount)
 			sleepDeploymentPoll(githubDeploymentPollInterval, deadline)
 			continue
 		}
 
-		fmt.Printf("  ✓ Deployment verified: %d issues live\n", meta.IssueCount)
+		fmt.Printf("  ✓ Deployment verified: %d issues live\n", liveCount)
 		return nil
 	}
 
@@ -1193,9 +1229,9 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 		if strings.HasPrefix(lastErr.Error(), "deployment verification ") {
 			return lastErr
 		}
-		return fmt.Errorf("deployment verification failed for %s: %w", metaURL, lastErr)
+		return fmt.Errorf("deployment verification failed for %s: %w", metaURLStr, lastErr)
 	}
-	return fmt.Errorf("deployment verification timed out for %s", metaURL)
+	return fmt.Errorf("deployment verification timed out for %s", metaURLStr)
 }
 
 // DeployToGitHubPagesWithFallback performs deployment with automatic fallback to legacy mode

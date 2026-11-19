@@ -527,3 +527,50 @@ func TestVerifyCloudflareDeployment_PollsStaleIssueCountUntilMatchAndBustsCache(
 		t.Fatalf("expected multiple polls before deadline expiration, got %d", got)
 	}
 }
+
+func TestVerifyCloudflareDeployment_RejectsEmptyObjectAndHandlesQueryFragmentURL(t *testing.T) {
+	t.Setenv("PATH", "")
+	origInterval := cloudflareDeploymentPollInterval
+	cloudflareDeploymentPollInterval = 15 * time.Millisecond
+	t.Cleanup(func() { cloudflareDeploymentPollInterval = origInterval })
+
+	// Planted negative control: `{}` must never pass expectedIssueCount == 0.
+	emptyMux := http.NewServeMux()
+	emptyMux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	})
+	emptySrv := httptest.NewServer(emptyMux)
+	defer emptySrv.Close()
+
+	if err := VerifyCloudflareDeployment(emptySrv.URL, 0, 75*time.Millisecond); err == nil || !strings.Contains(err.Error(), "missing or negative issue_count") {
+		t.Fatalf("expected `{}` with expectedIssueCount=0 to fail with missing issue_count, got: %v", err)
+	}
+
+	// Positive observable: subpath + `?branch=preview#top` resolves `/cf-sub/data/meta.json?branch=preview&_t=...`,
+	// retries past Poll 1 `{"issue_count": -1}` and succeeds on Poll 2 `{"issue_count": 0}`.
+	var calls atomic.Int32
+	subMux := http.NewServeMux()
+	subMux.HandleFunc("/cf-sub/data/meta.json", func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if r.URL.Query().Get("branch") != "preview" || r.URL.Query().Get("_t") == "" {
+			http.Error(w, "missing expected query params", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			_, _ = w.Write([]byte(`{"issue_count": -1}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"issue_count": 0}`))
+	})
+	subSrv := httptest.NewServer(subMux)
+	defer subSrv.Close()
+
+	if err := VerifyCloudflareDeployment(subSrv.URL+"/cf-sub/?branch=preview#top", 0, 500*time.Millisecond); err != nil {
+		t.Fatalf("VerifyCloudflareDeployment with query+fragment failed: %v", err)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("expected >= 2 calls before valid issue_count=0, got %d", calls.Load())
+	}
+}

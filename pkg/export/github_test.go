@@ -903,3 +903,63 @@ func TestVerifyGitHubPagesDeployment_PollsStaleIssueCountUntilMatchAndBustsCache
 		t.Fatalf("expected multiple polls before deadline expiration, got %d", got)
 	}
 }
+
+func TestVerifyGitHubPagesDeployment_RejectsEmptyObjectAndHandlesQueryFragmentURL(t *testing.T) {
+	t.Setenv("PATH", "")
+	origInterval := githubDeploymentPollInterval
+	githubDeploymentPollInterval = 15 * time.Millisecond
+	t.Cleanup(func() { githubDeploymentPollInterval = origInterval })
+
+	// 1. Planted negative control: `{}` (missing issue_count) must NEVER match expectedIssueCount == 0 or < 0.
+	var emptyObjCalls atomic.Int32
+	emptyMux := http.NewServeMux()
+	emptyMux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
+		emptyObjCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	})
+	emptySrv := httptest.NewServer(emptyMux)
+	defer emptySrv.Close()
+
+	if err := VerifyGitHubPagesDeployment(emptySrv.URL, 0, 75*time.Millisecond); err == nil || !strings.Contains(err.Error(), "missing or negative issue_count") {
+		t.Fatalf("expected `{}` with expectedIssueCount=0 to fail with missing issue_count, got: %v", err)
+	}
+	if got := emptyObjCalls.Load(); got < 2 {
+		t.Fatalf("expected `{}` to poll until deadline, got %d calls", got)
+	}
+	if err := VerifyGitHubPagesDeployment(emptySrv.URL, skipDeploymentIssueCountVerification, 60*time.Millisecond); err == nil || !strings.Contains(err.Error(), "missing or negative issue_count") {
+		t.Fatalf("expected `{}` with skipDeploymentIssueCountVerification to fail with missing issue_count, got: %v", err)
+	}
+
+	// 2. Positive observable: subpath URL with `?preview=1#section` strips fragment, preserves query, appends `/data/meta.json?_t=...`,
+	// retries past Poll 1 `{}` and succeeds on Poll 2 `{"issue_count": 0}`.
+	var subCalls atomic.Int32
+	var sawPreviewQuery atomic.Int32
+	var sawCacheBuster atomic.Int32
+	subMux := http.NewServeMux()
+	subMux.HandleFunc("/repo-subpath/data/meta.json", func(w http.ResponseWriter, r *http.Request) {
+		n := subCalls.Add(1)
+		if r.URL.Query().Get("preview") == "1" {
+			sawPreviewQuery.Add(1)
+		}
+		if r.URL.Query().Get("_t") != "" {
+			sawCacheBuster.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n == 1 {
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"issue_count": 0}`))
+	})
+	subSrv := httptest.NewServer(subMux)
+	defer subSrv.Close()
+
+	complexURL := subSrv.URL + "/repo-subpath/?preview=1#overview-section"
+	if err := VerifyGitHubPagesDeployment(complexURL, 0, 500*time.Millisecond); err != nil {
+		t.Fatalf("VerifyGitHubPagesDeployment(%q, 0) failed: %v", complexURL, err)
+	}
+	if subCalls.Load() < 2 || sawPreviewQuery.Load() < 2 || sawCacheBuster.Load() < 2 {
+		t.Fatalf("subCalls=%d sawPreview=%d sawCacheBuster=%d, want >=2 each", subCalls.Load(), sawPreviewQuery.Load(), sawCacheBuster.Load())
+	}
+}
