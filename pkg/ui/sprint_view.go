@@ -243,12 +243,12 @@ func (m *Model) renderSprintDashboard() string {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(t.Primary).
 		Padding(1, 2).
-		Width(min(80, bodyWidth-4)).
-		MaxHeight(m.height - 2)
+		Width(min(80, max(bodyWidth-4, 1))).
+		MaxHeight(max(m.height-2, 1))
 
 	return lipgloss.Place(
-		bodyWidth,
-		m.height-1,
+		max(bodyWidth, 1),
+		max(m.height-1, 1),
 		lipgloss.Center,
 		lipgloss.Top,
 		boxStyle.Render(sb.String()),
