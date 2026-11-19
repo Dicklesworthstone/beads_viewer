@@ -129,9 +129,9 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 		}
 
 		// Check BEADS_DB environment variable (can be file or directory)
-		if envDB := env.BeadsDB.Get(); envDB != "" {
+		if envDB := strings.TrimSpace(env.BeadsDB.Get()); envDB != "" {
 			beadsDir = resolveBeadsDBPath(envDB)
-		} else if envDir := env.BeadsDir.Get(); envDir != "" {
+		} else if envDir := strings.TrimSpace(env.BeadsDir.Get()); envDir != "" {
 			// Check BEADS_DIR environment variable
 			beadsDir = envDir
 		} else {

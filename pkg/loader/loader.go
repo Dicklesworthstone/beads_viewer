@@ -284,12 +284,12 @@ func GetBeadsDir(repoPath string) (string, error) {
 // watcher can observe a newly added hop.
 func GetBeadsDirWithTrace(repoPath string) (string, []string, error) {
 	// Check BEADS_DB environment variable first (highest priority after --db flag)
-	if envDB := env.BeadsDB.Get(); envDB != "" {
+	if envDB := strings.TrimSpace(env.BeadsDB.Get()); envDB != "" {
 		return resolveBeadsDBWithTrace(envDB)
 	}
 
 	// Check BEADS_DIR environment variable
-	if envDir := env.BeadsDir.Get(); envDir != "" {
+	if envDir := strings.TrimSpace(env.BeadsDir.Get()); envDir != "" {
 		return resolveBeadsRedirect(envDir)
 	}
 
@@ -368,7 +368,7 @@ func ResolveProjectRoot(repoPath string) (projectRoot string, beadsDir string, e
 		beadsDir = filepath.Clean(beadsDir)
 	}
 
-	if env.BeadsDB.Get() == "" && env.BeadsDir.Get() == "" {
+	if strings.TrimSpace(env.BeadsDB.Get()) == "" && strings.TrimSpace(env.BeadsDir.Get()) == "" {
 		if len(trace) > 0 {
 			initialBeadsDir := filepath.Dir(trace[0])
 			if info, statErr := os.Stat(initialBeadsDir); statErr == nil && info.IsDir() {

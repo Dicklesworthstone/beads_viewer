@@ -2474,3 +2474,48 @@ func TestGetBeadsDir_StopsAtEnclosingGitBoundary(t *testing.T) {
 		t.Fatalf("expected empty Origin.WorkingDirectory on non-.beads standalone JSONL, got %+v", stIssues[0].Origin)
 	}
 }
+
+func TestGetBeadsDir_WhitespaceOnlyEnvTreatedAsUnset(t *testing.T) {
+	repoRoot := t.TempDir()
+	wantBeads := filepath.Join(repoRoot, ".beads")
+	subDir := filepath.Join(repoRoot, "pkg", "sub")
+	if err := os.MkdirAll(wantBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Positive observable: whitespace-only BEADS_DB / BEADS_DIR must be treated identically to empty,
+	// resolving repoRoot/.beads instead offilepath.Join(cwd, "   ")!
+	t.Setenv("BEADS_DB", "   \t  ")
+	t.Setenv("BEADS_DIR", "  \n\t ")
+	gotDir, err := loader.GetBeadsDir(repoRoot)
+	if err != nil {
+		t.Fatalf("GetBeadsDir with whitespace env failed: %v", err)
+	}
+	if filepath.Clean(gotDir) != filepath.Clean(wantBeads) {
+		t.Fatalf("GetBeadsDir = %q, want %q", gotDir, wantBeads)
+	}
+	gotProj, gotActiveBeads, err := loader.ResolveProjectRoot(subDir)
+	if err != nil {
+		t.Fatalf("ResolveProjectRoot with whitespace env failed: %v", err)
+	}
+	if filepath.Clean(gotProj) != filepath.Clean(repoRoot) || filepath.Clean(gotActiveBeads) != filepath.Clean(wantBeads) {
+		t.Fatalf("ResolveProjectRoot = (%q, %q), want (%q, %q)", gotProj, gotActiveBeads, repoRoot, wantBeads)
+	}
+
+	// Planted negative control: non-blank BEADS_DIR padded with surrounding whitespace trims and resolves overrideBeads!
+	overrideBeads := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(overrideBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", "  "+overrideBeads+" \t")
+	gotOverride, err := loader.GetBeadsDir(repoRoot)
+	if err != nil {
+		t.Fatalf("GetBeadsDir with padded BEADS_DIR failed: %v", err)
+	}
+	if filepath.Clean(gotOverride) != filepath.Clean(overrideBeads) {
+		t.Fatalf("GetBeadsDir with padded BEADS_DIR = %q, want %q", gotOverride, overrideBeads)
+	}
+}
