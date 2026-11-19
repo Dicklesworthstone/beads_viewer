@@ -1079,3 +1079,101 @@ func TestJSONLReader_EnforcesFusedCorruptionValidationAndCloseState(t *testing.T
 		t.Fatalf("empty JSONL must succeed with 0 issues, got len=%d err=%v", len(emptyIssues), err)
 	}
 }
+
+func TestSourceFromFileAndExplicitBeadsDBSource_TrimsSurroundingWhitespace(t *testing.T) {
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+
+	tmpDir := t.TempDir()
+	existingJSONL := filepath.Join(tmpDir, "custom.jsonl")
+	if err := os.WriteFile(existingJSONL, []byte(`{"id":"WS-JSONL-1","title":"Trimmed JSONL","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	existingDB := filepath.Join(tmpDir, "beads.db")
+	createSingleIssueSQLiteDB(t, existingDB, "WS-DB-1")
+	walPath := existingDB + "-wal"
+	walTime := time.Now().Add(2 * time.Minute).UTC().Truncate(time.Second)
+	if err := os.WriteFile(walPath, []byte("wal"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(walPath, walTime, walTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Positive observables: existing .jsonl and .db with leading/trailing spaces, tabs, and newlines.
+	paddedExistingJSONL := "  \t" + existingJSONL + " \n"
+	src, ok, err := SourceFromFile(paddedExistingJSONL)
+	if err != nil || !ok {
+		t.Fatalf("SourceFromFile(padded existing .jsonl) = (%+v, %v, %v), want ok=true err=nil", src, ok, err)
+	}
+	if src.Type != SourceTypeJSONLLocal || src.Path != existingJSONL || src.Size == 0 {
+		t.Fatalf("SourceFromFile(padded existing .jsonl) = %+v, want Type=%s Path=%q Size>0", src, SourceTypeJSONLLocal, existingJSONL)
+	}
+	t.Setenv("BEADS_DB", paddedExistingJSONL)
+	envSrc, ok, err := ExplicitBeadsDBSource()
+	if err != nil || !ok || envSrc.Path != existingJSONL || envSrc.Type != SourceTypeJSONLLocal {
+		t.Fatalf("ExplicitBeadsDBSource(padded existing .jsonl) = (%+v, %v, %v)", envSrc, ok, err)
+	}
+	loadedJSONL, err := LoadIssues(tmpDir)
+	if err != nil || len(loadedJSONL.Issues) != 1 || loadedJSONL.Issues[0].ID != "WS-JSONL-1" {
+		t.Fatalf("LoadIssues with padded BEADS_DB .jsonl = (%+v, %v), want WS-JSONL-1", loadedJSONL.Issues, err)
+	}
+
+	paddedExistingDB := "  " + existingDB + "  \r\n"
+	src, ok, err = SourceFromFile(paddedExistingDB)
+	if err != nil || !ok {
+		t.Fatalf("SourceFromFile(padded existing .db) = (%+v, %v, %v), want ok=true err=nil", src, ok, err)
+	}
+	if src.Type != SourceTypeSQLite || src.Path != existingDB || !src.ModTime.Equal(walTime) {
+		t.Fatalf("SourceFromFile(padded existing .db) = %+v, want Type=%s Path=%q ModTime=%v", src, SourceTypeSQLite, existingDB, walTime)
+	}
+	t.Setenv("BEADS_DB", paddedExistingDB)
+	envSrc, ok, err = ExplicitBeadsDBSource()
+	if err != nil || !ok || envSrc.Path != existingDB || envSrc.Type != SourceTypeSQLite {
+		t.Fatalf("ExplicitBeadsDBSource(padded existing .db) = (%+v, %v, %v)", envSrc, ok, err)
+	}
+	loadedDB, err := LoadIssues(tmpDir)
+	if err != nil || len(loadedDB.Issues) != 1 || loadedDB.Issues[0].ID != "WS-DB-1" {
+		t.Fatalf("LoadIssues with padded BEADS_DB .db = (%+v, %v), want WS-DB-1", loadedDB.Issues, err)
+	}
+
+	// 2. Positive observables: not-yet-existing .jsonl and .db paths with leading/trailing whitespace.
+	missingJSONL := filepath.Join(tmpDir, "not-created-yet.jsonl")
+	src, ok, err = SourceFromFile("  " + missingJSONL + " \n")
+	if err != nil || !ok || src.Type != SourceTypeJSONLLocal || src.Path != missingJSONL || !src.ModTime.IsZero() || src.Size != 0 {
+		t.Fatalf("SourceFromFile(padded missing .jsonl) = (%+v, %v, %v)", src, ok, err)
+	}
+	t.Setenv("BEADS_DB", "\t "+missingJSONL+" \n")
+	if envSrc, ok, err = ExplicitBeadsDBSource(); err != nil || !ok || envSrc.Path != missingJSONL || envSrc.Type != SourceTypeJSONLLocal {
+		t.Fatalf("ExplicitBeadsDBSource(padded missing .jsonl) = (%+v, %v, %v)", envSrc, ok, err)
+	}
+
+	missingDB := filepath.Join(tmpDir, "not-created-yet.db")
+	src, ok, err = SourceFromFile(" \t" + missingDB + "  \n")
+	if err != nil || !ok || src.Type != SourceTypeSQLite || src.Path != missingDB || !src.ModTime.IsZero() || src.Size != 0 {
+		t.Fatalf("SourceFromFile(padded missing .db) = (%+v, %v, %v)", src, ok, err)
+	}
+	t.Setenv("BEADS_DB", "  "+missingDB+"  ")
+	if envSrc, ok, err = ExplicitBeadsDBSource(); err != nil || !ok || envSrc.Path != missingDB || envSrc.Type != SourceTypeSQLite {
+		t.Fatalf("ExplicitBeadsDBSource(padded missing .db) = (%+v, %v, %v)", envSrc, ok, err)
+	}
+
+	// 3. Planted negative controls: whitespace-only, padded directory path, and padded unsupported extension.
+	if src, ok, err = SourceFromFile("   \t\r\n  "); err != nil || ok {
+		t.Fatalf("SourceFromFile(whitespace-only) = (%+v, %v, %v), want ok=false err=nil", src, ok, err)
+	}
+	if src, ok, err = SourceFromFile("  " + tmpDir + " \n"); err != nil || ok {
+		t.Fatalf("SourceFromFile(padded directory) = (%+v, %v, %v), want ok=false err=nil", src, ok, err)
+	}
+	unsupportedExisting := filepath.Join(tmpDir, "notes.txt")
+	if err := os.WriteFile(unsupportedExisting, []byte("not beads"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err = SourceFromFile("  " + unsupportedExisting + " \n"); !ok || err == nil || !strings.Contains(err.Error(), "unsupported BEADS_DB file type") {
+		t.Fatalf("SourceFromFile(padded unsupported existing file) = (ok=%v, err=%v), want ok=true unsupported error", ok, err)
+	}
+	if _, ok, err = SourceFromFile("  " + filepath.Join(tmpDir, "missing.txt") + " \n"); ok || err != nil {
+		t.Fatalf("SourceFromFile(padded unsupported missing file) = (ok=%v, err=%v), want ok=false err=nil", ok, err)
+	}
+}

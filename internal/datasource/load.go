@@ -304,7 +304,8 @@ func ExplicitBeadsDBSource() (DataSource, bool, error) {
 // SourceFromFile returns a DataSource for a concrete source file path. Directory
 // paths and empty values return ok=false so callers can fall back to discovery.
 func SourceFromFile(dbPath string) (DataSource, bool, error) {
-	if strings.TrimSpace(dbPath) == "" {
+	dbPath = strings.TrimSpace(dbPath)
+	if dbPath == "" {
 		return DataSource{}, false, nil
 	}
 
