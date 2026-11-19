@@ -92,6 +92,7 @@
 | `--robot-burndown` | string | (empty) | Output burndown data for sprint ID, or 'current' for active sprint | Robot & Planning Flags |
 | `--robot-capabilities` | bool | `false` | Output machine-readable command capabilities for AI agents | Robot & Planning Flags |
 | `--robot-capacity` | bool | `false` | Output capacity simulation and completion projection as JSON | Robot & Planning Flags |
+| `--robot-cass` | string | (empty) | Output correlated coding-agent sessions (cass) for bead ID as JSON | Robot & Planning Flags |
 | `--robot-causality` | string | (empty) | Output causal chain analysis for bead ID as JSON | Robot & Planning Flags |
 | `--robot-commit` | string | (empty) | Output beads correlated with a git commit SHA or revision as JSON | Robot & Planning Flags |
 | `--robot-confirm-correlation` | string | (empty) | Confirm a correlation is correct (format: SHA:beadID) | Robot & Planning Flags |
@@ -157,7 +158,7 @@
 | `--workspace` | string | (empty) | Load issues from workspace config file (.bv/workspace.yaml) | Search & Filters |
 | `--cpu-profile` | string | (empty) | Write CPU profile to file | Debug Flags |
 | `--debug-height` | int | `50` | Height for debug render | Debug Flags |
-| `--debug-render` | string | (empty) | Render a view and output to file (views: insights, board) | Debug Flags |
+| `--debug-render` | string | (empty) | Render a TUI view to stdout and exit (views: triage, list, insights, board, history, graph, tree, actionable, sprint, flow, attention, labels) | Debug Flags |
 | `--debug-width` | int | `180` | Width for debug render | Debug Flags |
 | `--generate-docs` | bool | `false` | Generate documentation markdown and JSON artifacts | Debug Flags |
 | `--profile-json` | bool | `false` | Output profile in JSON format (use with --profile-startup) | Debug Flags |

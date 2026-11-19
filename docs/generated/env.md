@@ -7,7 +7,7 @@
 | `BV_BACKGROUND_MODE` | Startup default for the background snapshot worker (`1` on, `0` off). At runtime the TUI promotes itself to the worker after any synchronous reload that takes 1 s or longer; `0` pins synchronous reload and disables that promotion. | sync at startup, auto-promote after a slow reload |
 | `BV_BUILD_HYBRID_WASM` | Set to `1` to build the hybrid search WASM scorer during `--export-pages` (requires wasm-pack). | (skip) |
 | `BV_CACHE_DIR` | Base directory for the disk caches (`analysis_cache/` and correlation caches live under it). | `<user cache dir>/bv` |
-| `BV_CASS_SEARCH_TIMEOUT_MS` | Time budget in milliseconds for the TUI's cass session lookup (`V`), shared by all of its searches. Raise it when cass searches are slow on a large archive or a loaded host. | `3000` |
+| `BV_CASS_SEARCH_TIMEOUT_MS` | Time budget in milliseconds for `--robot-cass` and the TUI's cass session lookup (`V`), shared by all of its searches. Raise it when cass searches are slow on a large archive or a loaded host. | `3000` |
 | `BV_DEBOUNCE_MS` | Debounce window (milliseconds) for live reload events in background mode. | `200` |
 | `BV_DEBUG` | Any value: write `[BV_DEBUG]` diagnostics to stderr. | (off) |
 | `BV_FORCE_POLL` | Alias for `BV_FORCE_POLLING`. | (auto) |
@@ -15,6 +15,7 @@
 | `BV_FRESHNESS_STALE_S` | Snapshot staleness critical threshold (seconds). | `120` |
 | `BV_FRESHNESS_WARN_S` | Snapshot staleness warning threshold (seconds). | `30` |
 | `BV_HEARTBEAT_INTERVAL_S` | Background worker heartbeat interval (seconds). | `5` |
+| `BV_HYBRID_WASM_DIR` | Directory containing pre-built `bv_hybrid_scorer` WASM artifacts (`bv_hybrid_scorer.js` and `bv_hybrid_scorer_bg.wasm`) to bundle during `--export-pages`. | `.bv/wasm/hybrid` |
 | `BV_INSIGHTS_MAP_LIMIT` | Positive entry limit for each `--robot-insights` metric map; zero or invalid values use the default. | `200` |
 | `BV_MAX_LINE_SIZE_MB` | Max JSONL line size in MB (lines larger than this are skipped with a warning). Applies to the TUI, the background worker, and robot loads. | `10` |
 | `BV_METRICS` | Set to `0` to disable internal timing metrics collection (`--robot-metrics`). | (enabled) |

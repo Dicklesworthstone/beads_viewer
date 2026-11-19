@@ -3005,10 +3005,11 @@ resolved when their rows are omitted. Re-export to refresh this snapshot.
 For very large datasets, you can build an optional WASM scorer used by the static viewer. Setting `BV_BUILD_HYBRID_WASM=1` makes `--export-pages` run `wasm-pack` from a source checkout (`pkg/export/wasm_scorer`) and write the result into the bundle's `wasm/` directory, in the released binary as well as in development builds; it fails with a clear error when `wasm-pack` or the source tree is missing. The viewer only loads it once the export holds 5,000 or more issues (`threshold` in `wasm_loader.js`); smaller exports always use the JS scorer.
 
 ```bash
-# Build once (requires wasm-pack)
+# Build once into .bv/wasm/hybrid (or $BV_HYBRID_WASM_DIR; requires wasm-pack), then export
 ./scripts/build_hybrid_wasm.sh
+bv --export-pages ./bv-pages
 
-# Or build during export
+# Or build directly into the bundle during export
 BV_BUILD_HYBRID_WASM=1 bv --export-pages ./bv-pages
 ```
 
@@ -3266,6 +3267,7 @@ These commands output **structured JSON** designed for programmatic consumption:
 | `--robot-history` | Bead-to-commit correlations | Code change tracking |
 | `--bead-history <id>` | Single-bead commit correlation history | Scoped code provenance |
 | `--robot-commit <sha\|ref>` | Reverse commit-to-bead lookup with orphan candidate rescue | Commit provenance & audit |
+| `--robot-cass <id>` | Correlated coding-agent sessions (`cass`) for a bead | Prior session context & replay |
 | `--robot-orphans` | Unlinked commit candidates with probable beads | Hygiene & audit |
 | `--robot-label-health` | Per-label health metrics | Domain health monitoring |
 | `--robot-label-flow` | Cross-label dependency matrix + transitive `blockage_cascade` | Inter-domain bottleneck analysis |
@@ -3411,6 +3413,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--robot-burndown` | string | (empty) | Output burndown data for sprint ID, or 'current' for active sprint | Robot & Planning Flags |
 | `--robot-capabilities` | bool | `false` | Output machine-readable command capabilities for AI agents | Robot & Planning Flags |
 | `--robot-capacity` | bool | `false` | Output capacity simulation and completion projection as JSON | Robot & Planning Flags |
+| `--robot-cass` | string | (empty) | Output correlated coding-agent sessions (cass) for bead ID as JSON | Robot & Planning Flags |
 | `--robot-causality` | string | (empty) | Output causal chain analysis for bead ID as JSON | Robot & Planning Flags |
 | `--robot-commit` | string | (empty) | Output beads correlated with a git commit SHA or revision as JSON | Robot & Planning Flags |
 | `--robot-confirm-correlation` | string | (empty) | Confirm a correlation is correct (format: SHA:beadID) | Robot & Planning Flags |
@@ -3476,7 +3479,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--workspace` | string | (empty) | Load issues from workspace config file (.bv/workspace.yaml) | Search & Filters |
 | `--cpu-profile` | string | (empty) | Write CPU profile to file | Debug Flags |
 | `--debug-height` | int | `50` | Height for debug render | Debug Flags |
-| `--debug-render` | string | (empty) | Render a view and output to file (views: insights, board) | Debug Flags |
+| `--debug-render` | string | (empty) | Render a TUI view to stdout and exit (views: triage, list, insights, board, history, graph, tree, actionable, sprint, flow, attention, labels) | Debug Flags |
 | `--debug-width` | int | `180` | Width for debug render | Debug Flags |
 | `--generate-docs` | bool | `false` | Generate documentation markdown and JSON artifacts | Debug Flags |
 | `--profile-json` | bool | `false` | Output profile in JSON format (use with --profile-startup) | Debug Flags |
@@ -4353,6 +4356,7 @@ bv has a comprehensive built-in help system:
 |  | `h` | Collapse or jump to parent |
 |  | `l` | Expand or move to child |
 |  | `o` | Expand all nodes |
+|  | `X` | Expand all nodes |
 |  | `Z` | Collapse all nodes |
 |  | `tab` | Toggle detail pane |
 |  | `PgUp` | Page up |
@@ -4429,7 +4433,7 @@ bv has a comprehensive built-in help system:
 | `BV_BACKGROUND_MODE` | Startup default for the background snapshot worker (`1` on, `0` off). At runtime the TUI promotes itself to the worker after any synchronous reload that takes 1 s or longer; `0` pins synchronous reload and disables that promotion. | sync at startup, auto-promote after a slow reload |
 | `BV_BUILD_HYBRID_WASM` | Set to `1` to build the hybrid search WASM scorer during `--export-pages` (requires wasm-pack). | (skip) |
 | `BV_CACHE_DIR` | Base directory for the disk caches (`analysis_cache/` and correlation caches live under it). | `<user cache dir>/bv` |
-| `BV_CASS_SEARCH_TIMEOUT_MS` | Time budget in milliseconds for the TUI's cass session lookup (`V`), shared by all of its searches. Raise it when cass searches are slow on a large archive or a loaded host. | `3000` |
+| `BV_CASS_SEARCH_TIMEOUT_MS` | Time budget in milliseconds for `--robot-cass` and the TUI's cass session lookup (`V`), shared by all of its searches. Raise it when cass searches are slow on a large archive or a loaded host. | `3000` |
 | `BV_DEBOUNCE_MS` | Debounce window (milliseconds) for live reload events in background mode. | `200` |
 | `BV_DEBUG` | Any value: write `[BV_DEBUG]` diagnostics to stderr. | (off) |
 | `BV_FORCE_POLL` | Alias for `BV_FORCE_POLLING`. | (auto) |
@@ -4437,6 +4441,7 @@ bv has a comprehensive built-in help system:
 | `BV_FRESHNESS_STALE_S` | Snapshot staleness critical threshold (seconds). | `120` |
 | `BV_FRESHNESS_WARN_S` | Snapshot staleness warning threshold (seconds). | `30` |
 | `BV_HEARTBEAT_INTERVAL_S` | Background worker heartbeat interval (seconds). | `5` |
+| `BV_HYBRID_WASM_DIR` | Directory containing pre-built `bv_hybrid_scorer` WASM artifacts (`bv_hybrid_scorer.js` and `bv_hybrid_scorer_bg.wasm`) to bundle during `--export-pages`. | `.bv/wasm/hybrid` |
 | `BV_INSIGHTS_MAP_LIMIT` | Positive entry limit for each `--robot-insights` metric map; zero or invalid values use the default. | `200` |
 | `BV_MAX_LINE_SIZE_MB` | Max JSONL line size in MB (lines larger than this are skipped with a warning). Applies to the TUI, the background worker, and robot loads. | `10` |
 | `BV_METRICS` | Set to `0` to disable internal timing metrics collection (`--robot-metrics`). | (enabled) |

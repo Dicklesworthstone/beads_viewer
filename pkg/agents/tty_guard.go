@@ -19,6 +19,7 @@ var canonicalRobotFlags = []string{
 	"robot-burndown",
 	"robot-capabilities",
 	"robot-capacity",
+	"robot-cass",
 	"robot-causality",
 	"robot-commit",
 	"robot-confirm-correlation",
@@ -114,7 +115,7 @@ var nonInteractiveFlagSet = func() map[string]struct{} {
 var nonInteractiveSubcommandSet = map[string]struct{}{
 	"alerts": {}, "analysis": {}, "analyze": {}, "bead-history": {},
 	"blocker-chain": {}, "blockers": {}, "burndown": {}, "capabilities": {},
-	"capability": {}, "capacity": {}, "causality": {}, "changes": {},
+	"capability": {}, "capacity": {}, "cass": {}, "causality": {}, "changes": {},
 	"commit": {}, "diff": {}, "doc": {}, "docs": {}, "drift": {},
 	"file-beads": {}, "file-hotspots": {}, "file-relations": {}, "find": {},
 	"forecast": {}, "graph": {}, "help": {}, "history": {},
@@ -124,7 +125,7 @@ var nonInteractiveSubcommandSet = map[string]struct{}{
 	"orphans": {}, "pick": {}, "plan": {}, "priorities": {},
 	"priority": {}, "recipes": {}, "recommend": {}, "recommendations": {},
 	"related": {}, "schema": {}, "schemas": {}, "search": {},
-	"self-update": {}, "selfupdate": {}, "sprint": {}, "sprint-list": {},
+	"self-update": {}, "selfupdate": {}, "sessions": {}, "sprint": {}, "sprint-list": {},
 	"sprint-show": {}, "sprints": {}, "suggest": {}, "suggestions": {},
 	"triage": {}, "upgrade": {}, "version": {}, "what-if": {}, "whatif": {},
 }

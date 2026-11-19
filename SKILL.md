@@ -84,6 +84,7 @@ bv --robot-blocker-chain <id>  # Full upstream blocker chain for one issue
 bv --robot-history                     # Bead-to-commit correlations
 bv --bead-history <id>                 # Single-bead commit correlation history
 bv --robot-commit <sha|ref>            # Beads correlated with one Git commit or revision
+bv --robot-cass <id>                   # Correlated coding-agent sessions (cass) for one bead
 bv --robot-file-beads "pkg/ui/*.go"    # Beads touching a file, directory prefix, or glob
 bv --robot-file-hotspots               # Files touched by the most beads
 bv --robot-file-relations <path>       # Co-changing files above correlation threshold

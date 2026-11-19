@@ -3408,6 +3408,7 @@ func TestRobotRegistry_TotalContract(t *testing.T) {
 		"robot-ignore-correlation",
 		"robot-correlation-stats",
 		"robot-commit",
+		"robot-cass",
 	} {
 		if !primary[mustHave] {
 			t.Errorf("must-have command %q missing from primaryRobotFlagNames()", mustHave)
@@ -3539,6 +3540,7 @@ func TestRobotRegistry_TotalContract(t *testing.T) {
 		"robot-related":             {"--robot-related", "bv-1"},
 		"robot-blocker-chain":       {"--robot-blocker-chain", "bv-2"},
 		"robot-whatif":              {"--robot-whatif", "bv-1"},
+		"robot-cass":                {"--robot-cass", "bv-1"},
 		"robot-impact-network":      {"--robot-impact-network", "bv-1"},
 		"robot-causality":           {"--robot-causality", "bv-1"},
 		"robot-sprint-show":         {"--robot-sprint-show", "sprint-1"},
@@ -8636,5 +8638,369 @@ func TestWave16_TrackD_CLIRobotScopingWorkspaceAsOfAndHooks(t *testing.T) {
 	}
 	if _, _, unscopedErr := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsCfgPath, "--diff-since", apiV1SHA, "--robot-diff"); unscopedErr == nil {
 		t.Fatal("expected unscoped --workspace --diff-since <api-only-SHA> to fail resolving SHA in web repo")
+	}
+}
+
+func TestWave18_TrackD_RobotCassExclusivityDBIsolationGraphRootWorkspaceFeedbackBurndownAndExportGraph(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
+	exe := buildTestBinary(t)
+
+	// 1. --robot-cass & `bv cass <id> --json` intent alias with mock cass binary + missing-bead negative control.
+	cassProj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cassProj, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cassJSONL := strings.Join([]string{
+		`{"id":"bv-42","title":"OAuth token refresh deadlock","status":"open","priority":1,"issue_type":"bug","labels":["auth"],"created_at":"2026-01-10T00:00:00Z","updated_at":"2026-01-10T00:00:00Z"}`,
+		`{"id":"bv-99","title":"UI polish","status":"open","priority":2,"issue_type":"task","labels":["ui"],"created_at":"2026-01-10T00:00:00Z","updated_at":"2026-01-10T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(cassProj, ".beads", "issues.jsonl"), []byte(cassJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fakeBinDir := t.TempDir()
+	fakeCassPath := filepath.Join(fakeBinDir, "cass")
+	fakeSessionPath := filepath.Join(cassProj, "sessions", "session with spaces.jsonl")
+	fakeCassScript := fmt.Sprintf(`#!/usr/bin/env bash
+if [ "$1" = "health" ]; then
+  exit 0
+fi
+	if [ "$1" = "search" ]; then
+  cat <<'JSON'
+{"hits":[{"source_path":%q,"line_number":17,"agent":"claude","title":"Debugging bv-42 OAuth refresh","score":9.5,"content":"Fixed bv-42 deadlock in refresh handler","created_at":1768046400000,"match_type":"exact","workspace":%q}],"total_matches":1,"hits_clamped":false,"budget":{"timed_out":false}}
+JSON
+  exit 0
+fi
+exit 1
+`, fakeSessionPath, cassProj)
+	if err := os.WriteFile(fakeCassPath, []byte(fakeCassScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	origPath := os.Getenv("PATH")
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+origPath)
+	cassOut, cassStderr, err := runCommandWithTimeout(t, cassProj, exe, "cass", "bv-42", "--json")
+	if err != nil {
+		t.Fatalf("bv cass bv-42 --json failed: %v\nstderr=%s", err, cassStderr)
+	}
+	var cassPayload struct {
+		BeadID     string `json:"bead_id"`
+		CassStatus string `json:"cass_status"`
+		Available  bool   `json:"available"`
+		Strategy   string `json:"strategy"`
+		TotalFound int    `json:"total_found"`
+		Sessions   []struct {
+			SourcePath    string  `json:"source_path"`
+			LineNumber    int     `json:"line_number"`
+			Agent         string  `json:"agent"`
+			FinalScore    float64 `json:"final_score"`
+			ViewCommand   string  `json:"view_command"`
+			ExpandCommand string  `json:"expand_command"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal([]byte(cassOut), &cassPayload); err != nil {
+		t.Fatalf("unmarshal --robot-cass: %v\nout=%s", err, cassOut)
+	}
+	if cassPayload.BeadID != "bv-42" || cassPayload.CassStatus != "healthy" || !cassPayload.Available || cassPayload.Strategy != "id_mention" || len(cassPayload.Sessions) != 1 {
+		t.Fatalf("unexpected --robot-cass payload: %+v\nraw=%s", cassPayload, cassOut)
+	}
+	if !strings.Contains(cassPayload.Sessions[0].ViewCommand, `'`) || !strings.Contains(cassPayload.Sessions[0].ExpandCommand, "-n 17 -C 3 --json") {
+		t.Fatalf("expected shell-quoted view/expand commands, got view=%q expand=%q", cassPayload.Sessions[0].ViewCommand, cassPayload.Sessions[0].ExpandCommand)
+	}
+	// Planted negative: out-of-scope --label ui must reject bv-42, and missing cass on PATH reports not_installed cleanly.
+	if _, scopedCassErr, err := runCommandWithTimeout(t, cassProj, exe, "--robot-cass", "bv-42", "--label", "ui"); err == nil || !strings.Contains(scopedCassErr, "Bead not found: bv-42") {
+		t.Fatalf("expected --robot-cass bv-42 --label ui to fail with Bead not found, err=%v stderr=%s", err, scopedCassErr)
+	}
+	t.Setenv("PATH", t.TempDir())
+	noCassOut, noCassStderr, err := runCommandWithTimeout(t, cassProj, exe, "--robot-cass", "bv-42")
+	t.Setenv("PATH", origPath)
+	if err != nil {
+		t.Fatalf("--robot-cass without cass installed failed: %v\nstderr=%s", err, noCassStderr)
+	}
+	if !strings.Contains(noCassOut, `"cass_status":"not_installed"`) || !strings.Contains(noCassOut, `"available":false`) {
+		t.Fatalf("expected not_installed status when cass absent:\n%s", noCassOut)
+	}
+
+	// 2. Primary command exclusivity across non-robot flags (no silent --robot-triage hijack!).
+	for _, collisionArgs := range [][]string{
+		{"--search", "oauth", "--robot-triage"},
+		{"--check-drift", "--robot-triage"},
+		{"--diff-since", "HEAD~1", "--robot-triage"},
+		{"--save-baseline", "snap", "--robot-triage"},
+		{"--hooks-info", "--robot-triage"},
+		{"--feedback-show", "--robot-triage"},
+		{"--export-pages", filepath.Join(t.TempDir(), "out"), "--robot-triage"},
+	} {
+		if _, colStderr, colErr := runCommandWithTimeout(t, cassProj, exe, collisionArgs...); colErr == nil || !strings.Contains(colStderr, "multiple primary robot commands specified") {
+			t.Fatalf("expected %v to fail primary exclusivity check, err=%v stderr=%s", collisionArgs, colErr, colStderr)
+		}
+	}
+	// Companion pair --search + --robot-search MUST still succeed!
+	if _, searchErr, err := runCommandWithTimeout(t, cassProj, exe, "--search", "OAuth", "--robot-search"); err != nil {
+		t.Fatalf("expected companion --search --robot-search to succeed, err=%v stderr=%s", err, searchErr)
+	}
+
+	// 3. Explicit --db / BEADS_DIR must NEVER fall back to ancestor .bv/workspace.yaml on missing path!
+	wsParent := t.TempDir()
+	wsMember := filepath.Join(wsParent, "member")
+	wsSubdir := filepath.Join(wsParent, "nested", "empty")
+	if err := os.MkdirAll(filepath.Join(wsParent, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsMember, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(wsSubdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wsMember, ".beads", "issues.jsonl"), []byte(cassJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wsCfg := "name: testws\nrepos:\n  - name: api\n    path: member\n    prefix: api-\n"
+	wsCfgFile := filepath.Join(wsParent, ".bv", "workspace.yaml")
+	if err := os.WriteFile(wsCfgFile, []byte(wsCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, stderr, dbErr := runCommandWithTimeout(t, wsSubdir, exe, "--db", filepath.Join(wsSubdir, "missing.jsonl"), "--robot-next"); dbErr == nil {
+		t.Fatalf("SECURITY/ISOLATION BUG: --db missing.jsonl fell back to ancestor workspace instead of failing!\nstdout=%s\nstderr=%s", out, stderr)
+	}
+
+	// 4. Workspace --feedback-accept / --feedback-show / --feedback-reset + loadRobotFeedbackForContext!
+	if _, fbErr, err := runCommandWithTimeout(t, wsParent, exe, "--workspace", wsCfgFile, "--feedback-accept", "api-bv-42"); err != nil {
+		t.Fatalf("workspace --feedback-accept failed: %v\nstderr=%s", err, fbErr)
+	}
+	wsFbShowOut, wsFbShowErr, err := runCommandWithTimeout(t, wsParent, exe, "--workspace", wsCfgFile, "--feedback-show")
+	if err != nil || !strings.Contains(wsFbShowOut, `"accepted_count": 1`) {
+		t.Fatalf("workspace --feedback-show failed to report accepted_count=1: err=%v stderr=%s out=%s", err, wsFbShowErr, wsFbShowOut)
+	}
+	wsFbDiskBytes, err := os.ReadFile(filepath.Join(wsParent, ".bv", "feedback.json"))
+	if err != nil || !strings.Contains(string(wsFbDiskBytes), `"api-bv-42"`) {
+		t.Fatalf("expected .bv/feedback.json on disk to record api-bv-42, err=%v raw=%s", err, string(wsFbDiskBytes))
+	}
+	wsTriageFbOut, wsTriageFbErr, err := runCommandWithTimeout(t, wsParent, exe, "--workspace", wsCfgFile, "--robot-triage")
+	if err != nil || !strings.Contains(wsTriageFbOut, `"feedback":`) {
+		t.Fatalf("expected workspace --robot-triage to surface persisted .bv/feedback.json, err=%v stderr=%s out=%s", err, wsTriageFbErr, wsTriageFbOut)
+	}
+	if _, fbResetErr, err := runCommandWithTimeout(t, wsParent, exe, "--workspace", wsCfgFile, "--feedback-reset"); err != nil {
+		t.Fatalf("workspace --feedback-reset failed: %v\nstderr=%s", err, fbResetErr)
+	}
+	wsFbResetOut, _, err := runCommandWithTimeout(t, wsParent, exe, "--workspace", wsCfgFile, "--feedback-show")
+	if err != nil || !strings.Contains(wsFbResetOut, `"accepted_count": 0`) {
+		t.Fatalf("expected workspace --feedback-show after reset to report accepted_count=0: err=%v out=%s", err, wsFbResetOut)
+	}
+
+	// 5. --graph-root envelope (scope.graph_root, distinct scope_hash & data_hash, non-blocking edge exclusion, and missing-ID error).
+	rootProj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rootProj, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rootJSONL := strings.Join([]string{
+		`{"id":"epic-A","title":"Epic A","status":"open","priority":1,"issue_type":"epic","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+		`{"id":"child-A","title":"Child A","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"child-A","depends_on_id":"epic-A","type":"blocks"}],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+		`{"id":"related-X","title":"Related associative task","status":"open","priority":0,"issue_type":"bug","dependencies":[{"issue_id":"related-X","depends_on_id":"epic-A","type":"related"}],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+		`{"id":"epic-B","title":"Epic B","status":"open","priority":2,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(rootProj, ".beads", "issues.jsonl"), []byte(rootJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fullTriageRaw, _, err := runCommandWithTimeout(t, rootProj, exe, "--robot-triage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootATriageRaw, rootAErr, err := runCommandWithTimeout(t, rootProj, exe, "--robot-triage", "--graph-root", "epic-A")
+	if err != nil {
+		t.Fatalf("--robot-triage --graph-root epic-A failed: %v\nstderr=%s", err, rootAErr)
+	}
+	var fullEnv, rootAEnv struct {
+		DataHash  string `json:"data_hash"`
+		ScopeHash string `json:"scope_hash"`
+		Scope     *struct {
+			GraphRoot string `json:"graph_root"`
+		} `json:"scope"`
+	}
+	_ = json.Unmarshal([]byte(fullTriageRaw), &fullEnv)
+	_ = json.Unmarshal([]byte(rootATriageRaw), &rootAEnv)
+	if rootAEnv.Scope == nil || rootAEnv.Scope.GraphRoot != "epic-A" || rootAEnv.ScopeHash == fullEnv.ScopeHash || rootAEnv.DataHash == fullEnv.DataHash {
+		t.Fatalf("expected distinct scope.graph_root/scope_hash/data_hash, full=%+v rootA=%+v", fullEnv, rootAEnv)
+	}
+	if strings.Contains(rootATriageRaw, `"related-X"`) {
+		t.Fatalf("non-blocking related-X leaked into --graph-root epic-A triage:\n%s", rootATriageRaw)
+	}
+	if _, missingRootErr, err := runCommandWithTimeout(t, rootProj, exe, "--robot-triage", "--graph-root", "typo-999"); err == nil || !strings.Contains(missingRootErr, "Root issue not found: typo-999") {
+		t.Fatalf("expected --graph-root typo-999 to fail with Root issue not found, err=%v stderr=%s", err, missingRootErr)
+	}
+
+	// 6. Monorepo subdirectory --robot-burndown scope_changes + Bare `bv --export-graph` & `bv --export-graph --graph-title ...`!
+	monoGit := t.TempDir()
+	monoPkg := filepath.Join(monoGit, "services", "api")
+	if err := os.MkdirAll(filepath.Join(monoPkg, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = monoGit
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=t@example.com",
+		)
+		if out, gErr := cmd.CombinedOutput(); gErr != nil {
+			t.Fatalf("git %v: %v\n%s", args, gErr, out)
+		}
+	}
+	runGit("init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(monoPkg, ".beads", "issues.jsonl"), []byte(
+		`{"id":"m-1","title":"Task 1","status":"open","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`+"\n"+
+			`{"id":"m-2","title":"Task 2","status":"open","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(monoPkg, ".beads", "sprints.jsonl"), []byte(
+		`{"id":"sp-1","name":"Sprint 1","start_date":"2026-01-01T00:00:00Z","end_date":"2026-01-20T00:00:00Z","bead_ids":["m-1"]}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	cmd1 := exec.Command("git", "commit", "-m", "init sprint")
+	cmd1.Dir = monoGit
+	cmd1.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=t@example.com",
+		"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=t@example.com",
+		"GIT_AUTHOR_DATE=2026-01-02T12:00:00Z", "GIT_COMMITTER_DATE=2026-01-02T12:00:00Z",
+	)
+	if out, gErr := cmd1.CombinedOutput(); gErr != nil {
+		t.Fatalf("commit 1: %v\n%s", gErr, out)
+	}
+	if err := os.WriteFile(filepath.Join(monoPkg, ".beads", "sprints.jsonl"), []byte(
+		`{"id":"sp-1","name":"Sprint 1","start_date":"2026-01-01T00:00:00Z","end_date":"2026-01-20T00:00:00Z","bead_ids":["m-1","m-2"]}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	cmd2 := exec.Command("git", "commit", "-m", "add m-2 to sprint")
+	cmd2.Dir = monoGit
+	cmd2.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=t@example.com",
+		"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=t@example.com",
+		"GIT_AUTHOR_DATE=2026-01-05T12:00:00Z", "GIT_COMMITTER_DATE=2026-01-05T12:00:00Z",
+	)
+	if out, gErr := cmd2.CombinedOutput(); gErr != nil {
+		t.Fatalf("commit 2: %v\n%s", gErr, out)
+	}
+	t.Setenv("SOURCE_DATE_EPOCH", "1768003200") // 2026-01-10T00:00:00Z
+	bdOut, bdStderr, err := runCommandWithTimeout(t, monoPkg, exe, "--robot-burndown", "sp-1")
+	t.Setenv("SOURCE_DATE_EPOCH", "")
+	if err != nil {
+		t.Fatalf("monorepo --robot-burndown failed: %v\nstderr=%s", err, bdStderr)
+	}
+	if !strings.Contains(bdOut, `"scope_changes":[`) || !strings.Contains(bdOut, `"m-2"`) {
+		t.Fatalf("expected monorepo subdirectory --robot-burndown to detect scope_changes for m-2:\n%s", bdOut)
+	}
+
+	// Bare --export-graph & --export-graph --graph-title "Custom Title"
+	egOut, egStderr, err := runCommandWithTimeout(t, monoPkg, exe, "--export-graph", "--graph-title", "Custom Sprint Graph")
+	if err != nil {
+		t.Fatalf("bare --export-graph --graph-title failed: %v\nout=%s\nstderr=%s", err, egOut, egStderr)
+	}
+	matches, _ := filepath.Glob(filepath.Join(monoPkg, "*graph*.html"))
+	if len(matches) == 0 {
+		t.Fatalf("expected bare --export-graph --graph-title to write auto-named HTML file in %s, out=%s", monoPkg, egOut)
+	}
+
+	// 7. --export-md with --robot-not-ready-labels withholds --claim on gated open beads while keeping ready beads claimable.
+	notReadyProj := t.TempDir()
+	notReadyBeadsDir := filepath.Join(notReadyProj, ".beads")
+	if err := os.MkdirAll(notReadyBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fakeBrPath := filepath.Join(fakeBinDir, "br")
+	if err := os.WriteFile(fakeBrPath, []byte("#!/usr/bin/env bash\necho \"--db --json --no-auto-import --no-auto-flush --claim\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+origPath)
+	if err := os.WriteFile(filepath.Join(notReadyBeadsDir, "metadata.json"), []byte(`{"database":"beads.db","jsonl_export":"issues.jsonl"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	notReadyJSONL := strings.Join([]string{
+		`{"id":"nr-wip","title":"Draft spec","status":"open","priority":0,"issue_type":"task","labels":["wip"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+		`{"id":"nr-ready","title":"Ready task","status":"open","priority":1,"issue_type":"task","labels":["ready"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(notReadyBeadsDir, "issues.jsonl"), []byte(notReadyJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nrDB, err := sql.Open("sqlite", filepath.Join(notReadyBeadsDir, "beads.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nrDB.Exec(`
+		CREATE TABLE issues (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT,
+			status TEXT NOT NULL,
+			priority INTEGER DEFAULT 3,
+			issue_type TEXT DEFAULT 'task',
+			tombstone INTEGER DEFAULT 0
+		);
+		CREATE TABLE labels (
+			issue_id TEXT NOT NULL,
+			label TEXT NOT NULL
+		);
+		INSERT INTO issues (id, title, status, priority, issue_type) VALUES
+			('nr-wip', 'Draft spec', 'open', 0, 'task'),
+			('nr-ready', 'Ready task', 'open', 1, 'task');
+		INSERT INTO labels (issue_id, label) VALUES
+			('nr-wip', 'wip'),
+			('nr-ready', 'ready');
+	`); err != nil {
+		_ = nrDB.Close()
+		t.Fatal(err)
+	}
+	_ = nrDB.Close()
+	mdPath := filepath.Join(notReadyProj, "status.md")
+	if _, mdErr, err := runCommandWithTimeout(t, notReadyProj, exe, "--export-md", mdPath, "--robot-not-ready-labels", "wip"); err != nil {
+		t.Fatalf("--export-md --robot-not-ready-labels wip failed: %v\nstderr=%s", err, mdErr)
+	}
+	mdBytes, err := os.ReadFile(mdPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mdContent := string(mdBytes)
+	if strings.Contains(mdContent, "'--claim' '--' 'nr-wip'") {
+		t.Fatalf("not-ready wip bead must not receive --claim in exported Markdown:\n%s", mdContent)
+	}
+	if !strings.Contains(mdContent, "'show' '--json' '--' 'nr-wip'") || !strings.Contains(mdContent, "'--claim' '--' 'nr-ready'") {
+		t.Fatalf("expected nr-wip show and nr-ready --claim in exported Markdown:\n%s", mdContent)
+	}
+
+	// 8. Pre-built hybrid WASM in <proj>/.bv/wasm/hybrid sets has_hybrid_wasm=true and strips wasm-pack dotfiles (.gitignore).
+	hybridDir := filepath.Join(notReadyProj, ".bv", "wasm", "hybrid")
+	if err := os.MkdirAll(hybridDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hybridDir, "bv_hybrid_scorer.js"), []byte("export default function init() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hybridDir, "bv_hybrid_scorer_bg.wasm"), []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hybridDir, ".gitignore"), []byte("*\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pagesDir := filepath.Join(notReadyProj, "pages-out")
+	if _, pgErr, err := runCommandWithTimeout(t, notReadyProj, exe, "--export-pages", pagesDir); err != nil {
+		t.Fatalf("--export-pages with pre-built .bv/wasm/hybrid failed: %v\nstderr=%s", err, pgErr)
+	}
+	metaBytes, err := os.ReadFile(filepath.Join(pagesDir, "data", "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(metaBytes), `"has_hybrid_wasm": true`) && !strings.Contains(string(metaBytes), `"has_hybrid_wasm":true`) {
+		t.Fatalf("expected meta.json to report has_hybrid_wasm=true:\n%s", string(metaBytes))
+	}
+	if _, err := os.Stat(filepath.Join(pagesDir, "wasm", "bv_hybrid_scorer_bg.wasm")); err != nil {
+		t.Fatalf("expected wasm/bv_hybrid_scorer_bg.wasm in bundle: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(pagesDir, "wasm", ".gitignore")); !os.IsNotExist(err) {
+		t.Fatalf("wasm-pack .gitignore must not be copied into bundle wasm/ directory, err=%v", err)
 	}
 }

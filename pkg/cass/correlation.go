@@ -122,6 +122,15 @@ func WithWorkspace(path string) CorrelatorOption {
 	}
 }
 
+// WithNow overrides the reference clock used for recency scoring and search windows.
+func WithNow(now func() time.Time) CorrelatorOption {
+	return func(c *Correlator) {
+		if now != nil {
+			c.now = now
+		}
+	}
+}
+
 // NewCorrelatorWithOptions creates a Correlator with custom options.
 func NewCorrelatorWithOptions(searcher *Searcher, cache *Cache, opts ...CorrelatorOption) *Correlator {
 	c := NewCorrelator(searcher, cache, "")

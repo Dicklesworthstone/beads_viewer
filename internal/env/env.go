@@ -82,7 +82,7 @@ var (
 
 	CassSearchTimeoutMS = register(Var{
 		Name:        "BV_CASS_SEARCH_TIMEOUT_MS",
-		Description: "Time budget in milliseconds for the TUI's cass session lookup (`V`), shared by all of its searches. Raise it when cass searches are slow on a large archive or a loaded host.",
+		Description: "Time budget in milliseconds for `--robot-cass` and the TUI's cass session lookup (`V`), shared by all of its searches. Raise it when cass searches are slow on a large archive or a loaded host.",
 		Default:     "`3000`",
 	})
 
@@ -132,6 +132,12 @@ var (
 		Name:        "BV_HEARTBEAT_INTERVAL_S",
 		Description: "Background worker heartbeat interval (seconds).",
 		Default:     "`5`",
+	})
+
+	HybridWasmDir = register(Var{
+		Name:        "BV_HYBRID_WASM_DIR",
+		Description: "Directory containing pre-built `bv_hybrid_scorer` WASM artifacts (`bv_hybrid_scorer.js` and `bv_hybrid_scorer_bg.wasm`) to bundle during `--export-pages`.",
+		Default:     "`.bv/wasm/hybrid`",
 	})
 
 	InsightsMapLimit = register(Var{

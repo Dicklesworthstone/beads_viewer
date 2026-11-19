@@ -336,6 +336,9 @@ func isFlagActive(flags *flag.FlagSet, name string) bool {
 		v, err := flags.GetBool(name)
 		return err == nil && v
 	case "string":
+		if name == "export-graph" && flags.Changed(name) {
+			return true
+		}
 		v, err := flags.GetString(name)
 		return err == nil && strings.TrimSpace(v) != ""
 	default:
@@ -385,6 +388,30 @@ func newRootCommand(run func() error) *cobra.Command {
 	})
 
 	return cmd
+}
+
+func normalizeOptionalValueCLIFlags(args []string) []string {
+	rewritten := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			rewritten = append(rewritten, args[i:]...)
+			break
+		}
+		name, _, hasEq, _, ok := parseCLIFlagToken(arg)
+		if ok && !hasEq && strings.EqualFold(name, "export-graph") {
+			if i+1 >= len(args) || args[i+1] == "--" || strings.HasPrefix(args[i+1], "-") {
+				rewritten = append(rewritten, "--export-graph=html")
+				continue
+			}
+		}
+		rewritten = append(rewritten, arg)
+		if ok && !hasEq && flagTakesSeparateValue(name) && i+1 < len(args) {
+			i++
+			rewritten = append(rewritten, args[i])
+		}
+	}
+	return rewritten
 }
 
 func rewriteSingleDashLongFlags(args []string, flags *flag.FlagSet) []string {
@@ -523,6 +550,8 @@ func inferAgentFlagContext(args []string) string {
 			detected = "file-beads"
 		case "robot-commit":
 			detected = "commit"
+		case "robot-cass":
+			detected = "cass"
 		case "robot-file-hotspots":
 			detected = "file-hotspots"
 		case "robot-related":
@@ -611,6 +640,8 @@ func rewriteAgentIntentCommand(args []string) ([]string, bool) {
 		return rewriteRobotValueIntent(rest, "blocker-chain", "", "--robot-blocker-chain", ""), true
 	case "whatif", "what-if":
 		return rewriteRobotValueIntent(rest, "whatif", "", "--robot-whatif", ""), true
+	case "cass", "sessions":
+		return rewriteRobotValueIntent(rest, "cass", "", "--robot-cass", ""), true
 	case "impact-network":
 		return rewriteRobotValueIntent(rest, "impact-network", "", "--robot-impact-network", "all"), true
 	case "causality":
@@ -732,6 +763,8 @@ func rewriteCanonicalRobotCommandIntent(command string, rest []string) ([]string
 		return rewriteRobotValueIntent(rest, "blocker-chain", "", "--robot-blocker-chain", ""), true
 	case "robot-whatif":
 		return rewriteRobotValueIntent(rest, "whatif", "", "--robot-whatif", ""), true
+	case "robot-cass":
+		return rewriteRobotValueIntent(rest, "cass", "", "--robot-cass", ""), true
 	case "robot-impact-network":
 		return rewriteRobotValueIntent(rest, "impact-network", "", "--robot-impact-network", "all"), true
 	case "robot-causality":
@@ -1061,6 +1094,7 @@ var knownValueTakingCLIFlags = map[string]bool{
 	"related-max-results":       true,
 	"robot-blocker-chain":       true,
 	"robot-whatif":              true,
+	"robot-cass":                true,
 	"robot-impact-network":      true,
 	"network-depth":             true,
 	"robot-causality":           true,
@@ -1815,6 +1849,8 @@ func main() {
 	robotBlockerChain := flag.String("robot-blocker-chain", "", "Output full blocker chain analysis for issue ID as JSON")
 	// What-if impact simulation flag (bv-apal.36)
 	robotWhatIf := flag.String("robot-whatif", "", "Simulate completing issue ID and output downstream unblock impact as JSON")
+	// Coding agent session search correlation flag (bv-apal.88)
+	robotCass := flag.String("robot-cass", "", "Output correlated coding-agent sessions (cass) for bead ID as JSON")
 	// Impact network graph flag (bv-48kr)
 	robotImpactNetwork := flag.String("robot-impact-network", "", "Output bead impact network as JSON (empty for full, or bead ID for subnetwork)")
 	networkDepth := flag.Int("network-depth", 2, "Depth of subnetwork when querying specific bead (1-3)")
@@ -1858,7 +1894,7 @@ func main() {
 	watchExport := flag.Bool("watch-export", false, "Watch for beads changes and auto-regenerate export (use with --export-pages)")
 	pagesWizard := flag.Bool("pages", false, "Launch interactive Pages deployment wizard")
 	// Debug rendering flag (for diagnosing TUI issues)
-	debugRender := flag.String("debug-render", "", "Render a view and output to file (views: insights, board)")
+	debugRender := flag.String("debug-render", "", "Render a TUI view to stdout and exit (views: triage, list, insights, board, history, graph, tree, actionable, sprint, flow, attention, labels)")
 	debugWidth := flag.Int("debug-width", 180, "Width for debug render")
 	debugHeight := flag.Int("debug-height", 50, "Height for debug render")
 	// Explicit light/dark palette selection for terminals where background
@@ -1962,6 +1998,7 @@ func main() {
 		RobotRelatedFlag:        robotRelatedWork,
 		RobotBlockerChainFlag:   robotBlockerChain,
 		RobotWhatIfFlag:         robotWhatIf,
+		RobotCassFlag:           robotCass,
 		RobotImpactNetworkFlag:  robotImpactNetwork,
 		RobotCausalityFlag:      robotCausality,
 		RobotSprintShowFlag:     robotSprintShow,
@@ -2089,7 +2126,7 @@ func main() {
 				"robot-alerts", "robot-drift", "check-drift", "robot-suggest", "robot-orphans", "robot-commit",
 				"robot-sprint-list", "robot-label-health", "robot-label-flow", "robot-label-attention", "robot-recipes",
 				"robot-file-beads", "robot-file-hotspots", "robot-file-relations", "robot-related",
-				"robot-impact", "robot-impact-network", "robot-history", "bead-history",
+				"robot-impact", "robot-impact-network", "robot-history", "bead-history", "robot-cass",
 				"robot-forecast", "robot-capacity", "search", "robot-search",
 				"emit-script", "priority-brief", "agent-brief",
 			}},
@@ -2102,7 +2139,7 @@ func main() {
 			}},
 			{modifier: "robot-not-ready-labels", requires: []string{
 				"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
-				"emit-script", "priority-brief", "agent-brief", "export-pages", "pages", "export-graph",
+				"emit-script", "priority-brief", "agent-brief", "export", "export-md", "export-pages", "pages", "export-graph",
 			}},
 			{modifier: "min-confidence", requires: []string{"robot-history", "bead-history", "robot-commit"}},
 			{modifier: "correlation-by", requires: []string{"robot-confirm-correlation", "robot-reject-correlation", "robot-ignore-correlation"}},
@@ -2155,7 +2192,7 @@ func main() {
 			{flags: []string{"robot-priority"}},
 			{flags: []string{"robot-next"}},
 			{flags: []string{"robot-triage", "robot-triage-by-track", "robot-triage-by-label"}},
-			{flags: []string{"robot-diff"}},
+			{flags: []string{"robot-diff", "diff-since"}},
 			{flags: []string{"robot-recipes"}},
 			{flags: []string{"robot-label-health"}},
 			{flags: []string{"robot-label-flow"}},
@@ -2165,8 +2202,8 @@ func main() {
 			{flags: []string{"robot-schema"}},
 			{flags: []string{"robot-suggest"}},
 			{flags: []string{"robot-graph"}},
-			{flags: []string{"robot-search"}},
-			{flags: []string{"robot-drift"}},
+			{flags: []string{"robot-search", "search"}},
+			{flags: []string{"robot-drift", "check-drift"}},
 			{flags: []string{"robot-history", "bead-history"}},
 			{flags: []string{"robot-explain-correlation"}},
 			{flags: []string{"robot-confirm-correlation"}},
@@ -2182,6 +2219,7 @@ func main() {
 			{flags: []string{"robot-related"}},
 			{flags: []string{"robot-blocker-chain"}},
 			{flags: []string{"robot-whatif"}},
+			{flags: []string{"robot-cass"}},
 			{flags: []string{"robot-impact-network"}},
 			{flags: []string{"robot-causality"}},
 			{flags: []string{"robot-sprint-list"}},
@@ -2189,6 +2227,19 @@ func main() {
 			{flags: []string{"robot-forecast"}},
 			{flags: []string{"robot-burndown"}},
 			{flags: []string{"robot-capacity"}},
+			{flags: []string{"init-drift"}},
+			{flags: []string{"save-baseline"}},
+			{flags: []string{"baseline-info"}},
+			{flags: []string{"hooks-info"}},
+			{flags: []string{"feedback-accept", "feedback-ignore", "feedback-reset", "feedback-show"}},
+			{flags: []string{"agents-add", "agents-remove", "agents-update", "agents-check", "agents-reset"}},
+			{flags: []string{"export", "export-md"}},
+			{flags: []string{"export-pages"}},
+			{flags: []string{"pages"}},
+			{flags: []string{"preview-pages"}},
+			{flags: []string{"export-graph"}},
+			{flags: []string{"priority-brief"}},
+			{flags: []string{"agent-brief"}},
 		}
 		if err := validateModifierFlags(flag.CommandLine, modifierRules); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -3069,13 +3120,33 @@ func main() {
 				exitCLI(0)
 			}
 
-			beadsDir, err := loader.GetBeadsDir(projectDir)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
-				exitCLI(1)
+			var feedbackStoreDir string
+			if *workspaceConfig != "" {
+				feedbackStoreDir = workspaceFeedbackDirForContext(RobotContext{
+					SourcePath: *workspaceConfig,
+					SourceKind: "workspace",
+					ProjectDir: projectDir,
+				})
+				if feedbackStoreDir == "" {
+					fmt.Fprintln(os.Stderr, "Error resolving workspace feedback directory")
+					exitCLI(1)
+				}
+				if *feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset {
+					if err := os.MkdirAll(feedbackStoreDir, 0755); err != nil {
+						fmt.Fprintf(os.Stderr, "Error creating workspace feedback directory: %v\n", err)
+						exitCLI(1)
+					}
+				}
+			} else {
+				var err error
+				feedbackStoreDir, err = loader.GetBeadsDir(projectDir)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error getting beads directory: %v\n", err)
+					exitCLI(1)
+				}
 			}
 
-			feedback, err := analysis.LoadFeedback(beadsDir)
+			feedback, err := analysis.LoadFeedback(feedbackStoreDir)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error loading feedback: %v\n", err)
 				exitCLI(1)
@@ -3083,7 +3154,7 @@ func main() {
 
 			if *feedbackReset {
 				feedback.Reset()
-				if err := feedback.Save(beadsDir); err != nil {
+				if err := feedback.Save(feedbackStoreDir); err != nil {
 					fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
 					exitCLI(1)
 				}
@@ -3116,11 +3187,37 @@ func main() {
 					action = "ignore"
 				}
 
-				loaded, err := datasource.LoadIssues(projectDir)
-				issues := loaded.Issues
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error loading issues: %v\n", err)
-					exitCLI(1)
+				var (
+					issues          []model.Issue
+					authorityIssues []model.Issue
+				)
+				if *workspaceConfig != "" {
+					wsIssues, wsResults, wsErr := workspace.LoadAllFromConfig(context.Background(), *workspaceConfig)
+					if wsErr != nil {
+						fmt.Fprintf(os.Stderr, "Error loading workspace: %v\n", wsErr)
+						exitCLI(1)
+					}
+					issues = wsIssues
+					authorityIssues = append(authorityIssues, wsIssues...)
+					for _, res := range wsResults {
+						if res.Error == nil {
+							for _, id := range res.TombstoneIDs {
+								authorityIssues = append(authorityIssues, model.Issue{ID: id, Status: model.StatusTombstone})
+							}
+						}
+					}
+				} else {
+					loaded, loadErr := datasource.LoadIssues(projectDir)
+					if loadErr != nil {
+						fmt.Fprintf(os.Stderr, "Error loading issues: %v\n", loadErr)
+						exitCLI(1)
+					}
+					issues = loaded.Issues
+					authorityIssues = make([]model.Issue, 0, len(issues)+len(loaded.Report.TombstoneIDs))
+					authorityIssues = append(authorityIssues, issues...)
+					for _, id := range loaded.Report.TombstoneIDs {
+						authorityIssues = append(authorityIssues, model.Issue{ID: id, Status: model.StatusTombstone})
+					}
 				}
 
 				var foundIssue *model.Issue
@@ -3130,16 +3227,26 @@ func main() {
 						break
 					}
 				}
+				if foundIssue == nil && *workspaceConfig != "" {
+					var uniqueLocal *model.Issue
+					for i := range issues {
+						if issues[i].Origin != nil && strings.TrimSpace(issues[i].Origin.LocalID) == issueID {
+							if uniqueLocal != nil {
+								uniqueLocal = nil
+								break
+							}
+							uniqueLocal = &issues[i]
+						}
+					}
+					if uniqueLocal != nil {
+						foundIssue = uniqueLocal
+						issueID = foundIssue.ID
+					}
+				}
 
 				if foundIssue == nil {
 					fmt.Fprintf(os.Stderr, "Issue not found: %s\n", issueID)
 					exitCLI(1)
-				}
-
-				authorityIssues := make([]model.Issue, 0, len(issues)+len(loaded.Report.TombstoneIDs))
-				authorityIssues = append(authorityIssues, issues...)
-				for _, id := range loaded.Report.TombstoneIDs {
-					authorityIssues = append(authorityIssues, model.Issue{ID: id, Status: model.StatusTombstone})
 				}
 
 				an := analysis.NewAnalyzer(issues)
@@ -3169,7 +3276,7 @@ func main() {
 					exitCLI(1)
 				}
 
-				if err := feedback.Save(beadsDir); err != nil {
+				if err := feedback.Save(feedbackStoreDir); err != nil {
 					fmt.Fprintf(os.Stderr, "Error saving feedback: %v\n", err)
 					exitCLI(1)
 				}
@@ -4338,7 +4445,10 @@ func main() {
 		dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-graph", robotDispatchContext)
 
 		// Handle --export-graph (bv-94) - PNG/SVG/HTML export
-		if *exportGraph != "" {
+		if *exportGraph != "" || flag.CommandLine.Changed("export-graph") {
+			if strings.TrimSpace(*exportGraph) == "" {
+				*exportGraph = "html"
+			}
 			// scopeLoadedIssues already selected --label with 1-hop dependency
 			// context and CandidateIDs; re-filtering by label here would erase
 			// boundary blocker edges.
@@ -5149,6 +5259,8 @@ func main() {
 
 		// Handle --robot-whatif flag (bv-apal.36)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-whatif", robotDispatchContext)
+		// Handle --robot-cass flag (bv-apal.88)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-cass", robotDispatchContext)
 
 		// Handle --robot-blocker-chain flag (bv-nlo0)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-impact-network", robotDispatchContext)
@@ -5465,6 +5577,7 @@ func main() {
 			options.SourceKind = envelope.SourceKind
 			options.AsOf = envelope.AsOf
 			options.AsOfCommit = envelope.AsOfCommit
+			options.NotReadyLabels = resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels})
 			content, err := export.GenerateReport(reportIssues, issuesForSearch, options)
 			if err != nil {
 				return fmt.Errorf("rendering report: %w", err)
@@ -5608,10 +5721,14 @@ func main() {
 				if externalReloadCh != nil {
 					m.DisableInternalWatcher()
 				}
-			} else if *labelScope != "" || *repoFilter != "" {
-				m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
-					return reloadSingleRepoForUIWithDegraded(ctx, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
-				})
+			} else {
+				if *labelScope != "" || *repoFilter != "" {
+					m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
+						return reloadSingleRepoForUIWithDegraded(ctx, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+					})
+				}
+				sprintWatchPath := filepath.Join(filepath.Dir(beadsPath), loader.SprintsFileName)
+				externalReloadCh, stopExternalWatchers = startExternalTUIWatchers([]string{sprintWatchPath}, "")
 			}
 		}
 
@@ -5634,8 +5751,8 @@ func main() {
 	rootCmd.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
 		return enrichFlagParseError(err, cmd.Flags(), originalArgs)
 	})
-	singleDashNormalized := rewriteSingleDashLongFlags(originalArgs, rootCmd.Flags())
-	normalizedArgs := rewriteAgentIntentArgs(singleDashNormalized)
+	singleDashNormalized := rewriteSingleDashLongFlags(normalizeOptionalValueCLIFlags(originalArgs), rootCmd.Flags())
+	normalizedArgs := normalizeOptionalValueCLIFlags(rewriteAgentIntentArgs(singleDashNormalized))
 	rootCmd.SetArgs(rewriteSingleDashLongFlags(normalizedArgs, rootCmd.Flags()))
 
 	if err := rootCmd.Execute(); err != nil {
@@ -7170,11 +7287,15 @@ func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string)
 		}
 	}
 
-	// Copy optional WASM directory
-	wasmSrc := filepath.Join(assetsDir, "wasm")
-	if err := copyDir(wasmSrc, bundle, "wasm"); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("copy wasm: %w", err)
+	// Copy optional WASM directory when not already staged by prepareBundleWasmAssets
+	if !bundle.HybridWasmPrepared() {
+		wasmSrc := filepath.Join(assetsDir, "wasm")
+		if err := copyWasmAssets(wasmSrc, bundle, "wasm"); err != nil {
+			if !os.IsNotExist(err) {
+				return fmt.Errorf("copy wasm: %w", err)
+			}
+		} else {
+			bundle.MarkHybridWasmPrepared()
 		}
 	}
 	if err := maybeBuildHybridWasmAssets(bundle); err != nil {
@@ -7205,11 +7326,30 @@ func prepareBundleWasmAssets(bundle *export.Bundle) error {
 	if bundle == nil {
 		return nil
 	}
-	if !export.HasEmbeddedAssets() {
-		if assetsDir := findViewerAssetsDir(); assetsDir != "" {
-			wasmSrc := filepath.Join(assetsDir, "wasm")
-			if err := copyDir(wasmSrc, bundle, "wasm"); err != nil && !os.IsNotExist(err) {
-				return fmt.Errorf("copy wasm: %w", err)
+	if !bundle.HybridWasmPrepared() {
+		var candidateDirs []string
+		if explicitDir := strings.TrimSpace(env.HybridWasmDir.Get()); explicitDir != "" {
+			candidateDirs = append(candidateDirs, explicitDir)
+		} else if cwd, err := os.Getwd(); err == nil && cwd != "" {
+			candidateDirs = append(candidateDirs, filepath.Join(cwd, ".bv", "wasm", "hybrid"))
+		}
+		if !export.HasEmbeddedAssets() {
+			if assetsDir := findViewerAssetsDir(); assetsDir != "" {
+				candidateDirs = append(candidateDirs, filepath.Join(assetsDir, "wasm"))
+			}
+		}
+		for _, wasmSrc := range candidateDirs {
+			if wasmSrc == "" {
+				continue
+			}
+			jsInfo, jsErr := os.Stat(filepath.Join(wasmSrc, "bv_hybrid_scorer.js"))
+			bgInfo, bgErr := os.Stat(filepath.Join(wasmSrc, "bv_hybrid_scorer_bg.wasm"))
+			if jsErr == nil && !jsInfo.IsDir() && bgErr == nil && !bgInfo.IsDir() {
+				if err := copyWasmAssets(wasmSrc, bundle, "wasm"); err != nil {
+					return fmt.Errorf("copy wasm: %w", err)
+				}
+				bundle.MarkHybridWasmPrepared()
+				break
 			}
 		}
 	}
@@ -8513,6 +8653,33 @@ func computeSprintScopeChanges(repoPath string, sprint *model.Sprint, issueMap m
 	if sprint == nil || sprint.ID == "" {
 		return nil, nil
 	}
+	sprintsFile := filepath.Join(repoPath, ".beads", loader.SprintsFileName)
+	if beadsDir, err := loader.GetBeadsDir(repoPath); err == nil && strings.TrimSpace(beadsDir) != "" {
+		if !filepath.IsAbs(beadsDir) {
+			beadsDir = filepath.Join(repoPath, beadsDir)
+		}
+		sprintsFile = filepath.Join(beadsDir, loader.SprintsFileName)
+	} else if abs, absErr := filepath.Abs(sprintsFile); absErr == nil {
+		sprintsFile = abs
+	}
+	if gitRoot, rootErr := findEnclosingGitRoot(filepath.Dir(sprintsFile)); rootErr == nil && gitRoot != "" {
+		if absSprint, absErr := filepath.Abs(sprintsFile); absErr == nil {
+			if resolvedSprint, evalErr := filepath.EvalSymlinks(absSprint); evalErr == nil && resolvedSprint != "" {
+				absSprint = resolvedSprint
+			}
+			if rel, relErr := filepath.Rel(gitRoot, absSprint); relErr == nil && rel != "" && rel != "." && !strings.HasPrefix(rel, "..") {
+				return computeSprintScopeChangesAtPath(
+					gitRoot,
+					rel,
+					sprint.ID,
+					sprint,
+					issueMap,
+					now,
+					nil,
+				)
+			}
+		}
+	}
 	return computeSprintScopeChangesAtPath(
 		repoPath,
 		filepath.Join(".beads", loader.SprintsFileName),
@@ -9556,11 +9723,11 @@ func robotAuthorityHash(authority *RobotSourceAuthority) string {
 	return fmt.Sprintf("%x", sha256.Sum256(raw))
 }
 
-func robotScopeHash(label, recipeName, repo, dataHash string, ids []string) string {
+func robotScopeHash(label, recipeName, repo, graphRoot, dataHash string, ids []string) string {
 	raw, err := json.Marshal(struct {
-		Label, Recipe, Repo, DataHash string
-		IDs                           []string
-	}{label, recipeName, repo, dataHash, ids})
+		Label, Recipe, Repo, GraphRoot, DataHash string
+		IDs                                      []string
+	}{label, recipeName, repo, graphRoot, dataHash, ids})
 	if err != nil {
 		return ""
 	}
@@ -9587,6 +9754,7 @@ type RobotScope struct {
 	Label       string   `json:"label,omitempty"`
 	Recipe      string   `json:"recipe,omitempty"`
 	Repo        string   `json:"repo,omitempty"`
+	GraphRoot   string   `json:"graph_root,omitempty"`
 	Unsupported []string `json:"unsupported,omitempty"`
 }
 
@@ -10027,6 +10195,13 @@ func robotCommandDocs() map[string]robotCommandDoc {
 			KeyFields:   []string{"result.issue_id", "result.delta.direct_unblocks", "result.delta.transitive_unblocks", "result.delta.blocked_reduction", "result.delta.parallelization_gain", "result.delta.unblocked_issue_ids"},
 			NeedsIssues: true,
 		},
+		"robot-cass": {
+			Flag:        "--robot-cass <id>",
+			Description: "Correlated coding-agent sessions (cass) for a specific bead ID.",
+			KeyFields:   []string{"bead_id", "cass_status", "available", "strategy", "keywords", "total_found", "sessions"},
+			Params:      []string{"--robot-max-results <n>"},
+			NeedsIssues: true,
+		},
 		"robot-impact-network": {
 			Flag: "--robot-impact-network [<id>|all]", Description: "Impact network graph (full or subnetwork for a bead).",
 			KeyFields:   []string{"network.nodes", "network.edges", "stats.total_nodes", "top_clusters", "top_connected"},
@@ -10198,6 +10373,8 @@ func preferredRobotInvocationOverride(commandName string) string {
 		return "bv robot-blocker-chain ISSUE_ID --json"
 	case "robot-whatif":
 		return "bv robot-whatif ISSUE_ID --json"
+	case "robot-cass":
+		return "bv robot-cass ISSUE_ID --json"
 	case "robot-causality":
 		return "bv robot-causality ISSUE_ID --json"
 	case "robot-forecast":
@@ -10334,6 +10511,7 @@ func agentIntentAliasDocs() []map[string]string {
 		{"agent_instinct": "bv graph mermaid --json", "canonical": "bv --robot-graph --graph-format mermaid --format json"},
 		{"agent_instinct": "bv robot-related bv-123 --json", "canonical": "bv --robot-related bv-123 --format json"},
 		{"agent_instinct": "bv commit HEAD --json", "canonical": "bv --robot-commit HEAD --format json"},
+		{"agent_instinct": "bv cass bv-123 --json", "canonical": "bv --robot-cass bv-123 --format json"},
 		{"agent_instinct": "bv --name backend --json", "canonical": "bv --label backend --robot-triage --format json"},
 	}
 }
@@ -10479,6 +10657,7 @@ func generateRobotSchemas() RobotSchemas {
 					"label":       map[string]interface{}{"type": "string"},
 					"recipe":      map[string]interface{}{"type": "string"},
 					"repo":        map[string]interface{}{"type": "string"},
+					"graph_root":  map[string]interface{}{"type": "string"},
 					"unsupported": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 				},
 			},
@@ -11018,6 +11197,7 @@ func generateRobotSchemas() RobotSchemas {
 		"robot-related":             robotRelatedOutputSchema(),
 		"robot-blocker-chain":       robotBlockerChainOutputSchema(),
 		"robot-whatif":              robotWhatIfOutputSchema(),
+		"robot-cass":                robotCassOutputSchema(),
 		"robot-impact-network":      robotImpactNetworkOutputSchema(),
 		"robot-causality":           robotCausalityOutputSchema(),
 		"robot-orphans":             robotOrphansOutputSchema(),
@@ -12099,6 +12279,44 @@ func robotWhatIfOutputSchema() map[string]interface{} {
 	}, []string{"generated_at", "data_hash", "output_format", "version", "result"})
 }
 
+func robotCassOutputSchema() map[string]interface{} {
+	return robotFileCommandOutputSchema("Robot Cass Output", "Correlated coding-agent sessions (cass) for a bead", map[string]interface{}{
+		"bead_id":     map[string]interface{}{"type": "string"},
+		"bead_title":  map[string]interface{}{"type": "string"},
+		"cass_status": map[string]interface{}{"type": "string", "enum": []string{"healthy", "needs_indexing", "not_installed", "unknown"}},
+		"available":   map[string]interface{}{"type": "boolean"},
+		"strategy":    map[string]interface{}{"type": "string"},
+		"keywords":    map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+		"total_found": map[string]interface{}{"type": "integer"},
+		"timed_out":   map[string]interface{}{"type": "boolean"},
+		"diagnostic":  map[string]interface{}{"type": "string"},
+		"sessions": map[string]interface{}{
+			"type": "array",
+			"items": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"source_path":    map[string]interface{}{"type": "string"},
+					"line_number":    map[string]interface{}{"type": "integer"},
+					"agent":          map[string]interface{}{"type": "string"},
+					"title":          map[string]interface{}{"type": "string"},
+					"snippet":        map[string]interface{}{"type": "string"},
+					"timestamp":      map[string]interface{}{"type": "string"},
+					"workspace":      map[string]interface{}{"type": "string"},
+					"match_type":     map[string]interface{}{"type": "string"},
+					"base_score":     map[string]interface{}{"type": "number"},
+					"final_score":    map[string]interface{}{"type": "number"},
+					"strategy":       map[string]interface{}{"type": "string"},
+					"keywords":       map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+					"view_command":   map[string]interface{}{"type": "string"},
+					"expand_command": map[string]interface{}{"type": "string"},
+				},
+				"required": []string{"source_path", "line_number", "agent", "title", "snippet", "timestamp", "base_score", "final_score", "strategy"},
+			},
+		},
+		"usage_hints": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+	}, []string{"generated_at", "data_hash", "output_format", "version", "bead_id", "bead_title", "cass_status", "available", "strategy", "keywords", "total_found", "timed_out", "sessions", "usage_hints"})
+}
+
 func whatIfDeltaSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"type": "object",
@@ -12548,6 +12766,9 @@ func titleCaseRobotCommand(name string) string {
 // and "" otherwise. A present .beads always wins so a nested single repo
 // inside a workspace keeps its own view unless --workspace is passed.
 func discoverWorkspaceConfig() string {
+	if strings.TrimSpace(env.BeadsDB.Get()) != "" || strings.TrimSpace(env.BeadsDir.Get()) != "" {
+		return ""
+	}
 	beadsDir, err := loader.GetBeadsDir("")
 	if err == nil {
 		if info, statErr := os.Stat(beadsDir); statErr == nil && info.IsDir() {

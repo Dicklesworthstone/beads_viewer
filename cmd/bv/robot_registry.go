@@ -23,6 +23,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/export"
@@ -95,6 +96,7 @@ type RobotContext struct {
 	// Issues (LabelScope covers --label).
 	Recipe               string
 	Repo                 string
+	GraphRoot            string
 	Stdout               io.Writer
 	Stderr               io.Writer
 	FinalizeBeforeExit   func()
@@ -266,6 +268,7 @@ type phaseThreeRobotHandlerConfig struct {
 	RobotRelatedFlag        *string
 	RobotBlockerChainFlag   *string
 	RobotWhatIfFlag         *string
+	RobotCassFlag           *string
 	RobotImpactNetworkFlag  *string
 	RobotCausalityFlag      *string
 	RobotSprintShowFlag     *string
@@ -413,15 +416,16 @@ func (ctx RobotContext) EnvelopeWithHash(dataHash string) RobotEnvelope {
 		}
 	}
 	sort.Strings(ids)
-	env.ScopeHash = robotScopeHash(ctx.LabelScope, ctx.Recipe, ctx.Repo, dataHash, ids)
+	env.ScopeHash = robotScopeHash(ctx.LabelScope, ctx.Recipe, ctx.Repo, ctx.GraphRoot, dataHash, ids)
 	env.AsOf = ctx.AsOf
 	env.AsOfCommit = ctx.AsOfCommit
 	unsupported := unsupportedScopeFor(ctx.Command, ctx)
-	if ctx.LabelScope != "" || ctx.Recipe != "" || ctx.Repo != "" || len(unsupported) > 0 {
+	if ctx.LabelScope != "" || ctx.Recipe != "" || ctx.Repo != "" || ctx.GraphRoot != "" || len(unsupported) > 0 {
 		env.Scope = &RobotScope{
 			Label:       ctx.LabelScope,
 			Recipe:      ctx.Recipe,
 			Repo:        ctx.Repo,
+			GraphRoot:   ctx.GraphRoot,
 			Unsupported: unsupported,
 		}
 	}
@@ -789,6 +793,7 @@ func configuredPrimaryRobotFlagNames() []string {
 		RobotRelatedFlag:        &dummyStr,
 		RobotBlockerChainFlag:   &dummyStr,
 		RobotWhatIfFlag:         &dummyStr,
+		RobotCassFlag:           &dummyStr,
 		RobotImpactNetworkFlag:  &dummyStr,
 		RobotCausalityFlag:      &dummyStr,
 		RobotSprintShowFlag:     &dummyStr,
@@ -1482,7 +1487,10 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				Readiness: ctx.Readiness,
 			}
 			if cfg.GraphRoot != nil {
-				config.Root = *cfg.GraphRoot
+				config.Root = strings.TrimSpace(*cfg.GraphRoot)
+			}
+			if config.Root != "" {
+				ctx.GraphRoot = config.Root
 			}
 			if cfg.GraphDepth != nil {
 				config.Depth = *cfg.GraphDepth
@@ -2434,6 +2442,9 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 	})
 	register("robot-whatif", cfg.RobotWhatIfFlag, "Simulate completing an issue and output downstream unblock impact as JSON", func(ctx RobotContext) error {
 		return handleRobotWhatIf(ctx, cfg)
+	})
+	register("robot-cass", cfg.RobotCassFlag, "Output correlated coding-agent sessions (cass) for a bead as JSON", func(ctx RobotContext) error {
+		return handleRobotCass(ctx, cfg)
 	})
 	register("robot-impact-network", cfg.RobotImpactNetworkFlag, "Output bead impact network as JSON", func(ctx RobotContext) error {
 		return handleRobotImpactNetwork(ctx, cfg)
@@ -3395,14 +3406,27 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 
 	// bv-140: scope triage to a subgraph if --graph-root is specified
 	var rootIssueID string
-	if cfg.GraphRoot != nil && *cfg.GraphRoot != "" {
-		rootIssueID = *cfg.GraphRoot
+	if cfg.GraphRoot != nil && strings.TrimSpace(*cfg.GraphRoot) != "" {
+		rootIssueID = strings.TrimSpace(*cfg.GraphRoot)
 	}
 
 	now := ctx.ReferenceNow()
 	graphIssues := ctx.GraphIssues()
+	velocityIssues := ctx.VelocityIssues()
+	if rootIssueID != "" {
+		subgraphIssues, found := extractDescendantSubgraphIssues(graphIssues, rootIssueID)
+		if !found {
+			fmt.Fprintf(ctx.StderrOrDefault(), "Root issue not found: %s\n", rootIssueID)
+			return newReportedRobotHandlerExit(1)
+		}
+		velocityIssues = filterVelocityIssuesToSubgraph(velocityIssues, subgraphIssues, rootIssueID)
+		ctx.GraphRoot = rootIssueID
+		ctx.Issues = subgraphIssues
+		ctx.DataHash = analysis.ComputeDataHash(subgraphIssues)
+		ctx.DataHashMatchesIssues = false
+	}
 	seedHash := ""
-	if ctx.DataHashMatchesIssues && len(graphIssues) == len(ctx.Issues) {
+	if rootIssueID == "" && ctx.DataHashMatchesIssues && len(graphIssues) == len(ctx.Issues) {
 		seedHash = ctx.DataHash
 	}
 	maxResults := 0
@@ -3420,7 +3444,7 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		Readiness:         ctx.Readiness,
 		CandidateIDs:      ctx.CandidateIDs,
 		UnblockIDs:        ctx.RecipeUnblockIDs,
-		VelocityIssues:    ctx.VelocityIssues(),
+		VelocityIssues:    velocityIssues,
 		GroupByLabel:      cfg.RobotTriageByLabelFlag != nil && *cfg.RobotTriageByLabelFlag,
 		WaitForPhase2:     true,
 		UseFastConfig:     !forceFull,
@@ -3723,9 +3747,108 @@ func robotNextClaimablePick(picks []analysis.TopPick, issues []model.Issue, read
 // A missing or unreadable file yields (nil, nil) so scoring uses the defaults.
 // Every scoring surface (triage, next, priority, TUI hints) goes through the
 // same rule so an agent's accept/ignore history changes what it is told next.
+func extractDescendantSubgraphIssues(issues []model.Issue, rootID string) ([]model.Issue, bool) {
+	if rootID == "" {
+		return issues, true
+	}
+	issueMap := make(map[string]model.Issue, len(issues))
+	children := make(map[string][]string, len(issues))
+	for _, iss := range issues {
+		issueMap[iss.ID] = iss
+		for _, dep := range iss.Dependencies {
+			if dep != nil && (dep.Type.IsBlocking() || dep.Type == model.DepParentChild) {
+				children[dep.DependsOnID] = append(children[dep.DependsOnID], iss.ID)
+			}
+		}
+	}
+	if _, exists := issueMap[rootID]; !exists {
+		return nil, false
+	}
+	visited := map[string]bool{rootID: true}
+	queue := []string{rootID}
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		for _, childID := range children[curr] {
+			if visited[childID] {
+				continue
+			}
+			if _, ok := issueMap[childID]; ok {
+				visited[childID] = true
+				queue = append(queue, childID)
+			}
+		}
+	}
+	out := make([]model.Issue, 0, len(visited))
+	for _, iss := range issues {
+		if visited[iss.ID] {
+			out = append(out, iss)
+		}
+	}
+	return out, true
+}
+
+func filterVelocityIssuesToSubgraph(velocityIssues, subgraphIssues []model.Issue, rootID string) []model.Issue {
+	if len(velocityIssues) == 0 || rootID == "" {
+		return velocityIssues
+	}
+	subSet := make(map[string]bool, len(subgraphIssues))
+	for _, iss := range subgraphIssues {
+		subSet[iss.ID] = true
+	}
+	if subVel, ok := extractDescendantSubgraphIssues(velocityIssues, rootID); ok {
+		for _, iss := range subVel {
+			subSet[iss.ID] = true
+		}
+	}
+	out := make([]model.Issue, 0, len(subSet))
+	for _, iss := range velocityIssues {
+		if subSet[iss.ID] {
+			out = append(out, iss)
+		}
+	}
+	return out
+}
+
+func workspaceFeedbackDirForContext(ctx RobotContext) string {
+	if strings.TrimSpace(ctx.SourcePath) != "" {
+		cfgDir := filepath.Dir(ctx.SourcePath)
+		if filepath.Base(cfgDir) == ".bv" {
+			return cfgDir
+		}
+		base := workspace.ResolveWorkspaceBaseDir(ctx.SourcePath)
+		if base != "" {
+			return filepath.Join(base, ".bv")
+		}
+	}
+	dir := ctx.ProjectDir
+	if dir == "" {
+		dir = ctx.WorkDir
+	}
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, ".bv")
+}
+
 func loadRobotFeedbackForContext(ctx RobotContext) (*analysis.FeedbackData, *analysis.Weights) {
-	if ctx.AsOf != "" || ctx.SourceKind == "workspace" {
+	if ctx.AsOf != "" {
 		return nil, nil
+	}
+	if ctx.SourceKind == "workspace" {
+		fbDir := workspaceFeedbackDirForContext(ctx)
+		if fbDir == "" {
+			return nil, nil
+		}
+		fb, err := analysis.LoadFeedback(fbDir)
+		if err != nil || fb == nil {
+			return nil, nil
+		}
+		if !fb.Applies() {
+			return fb, nil
+		}
+		w := fb.Weights()
+		return fb, &w
 	}
 	dir := ctx.ProjectDir
 	if dir == "" {
@@ -3754,14 +3877,27 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	historyReport, _ := loadTriageHistoryForContext(ctx, cfg)
 
 	var rootIssueID string
-	if cfg.GraphRoot != nil && *cfg.GraphRoot != "" {
-		rootIssueID = *cfg.GraphRoot
+	if cfg.GraphRoot != nil && strings.TrimSpace(*cfg.GraphRoot) != "" {
+		rootIssueID = strings.TrimSpace(*cfg.GraphRoot)
 	}
 
 	now := ctx.ReferenceNow()
 	graphIssues := ctx.GraphIssues()
+	velocityIssues := ctx.VelocityIssues()
+	if rootIssueID != "" {
+		subgraphIssues, found := extractDescendantSubgraphIssues(graphIssues, rootIssueID)
+		if !found {
+			fmt.Fprintf(ctx.StderrOrDefault(), "Root issue not found: %s\n", rootIssueID)
+			return newReportedRobotHandlerExit(1)
+		}
+		velocityIssues = filterVelocityIssuesToSubgraph(velocityIssues, subgraphIssues, rootIssueID)
+		ctx.GraphRoot = rootIssueID
+		ctx.Issues = subgraphIssues
+		ctx.DataHash = analysis.ComputeDataHash(subgraphIssues)
+		ctx.DataHashMatchesIssues = false
+	}
 	seedHash := ""
-	if ctx.DataHashMatchesIssues && len(graphIssues) == len(ctx.Issues) {
+	if rootIssueID == "" && ctx.DataHashMatchesIssues && len(graphIssues) == len(ctx.Issues) {
 		seedHash = ctx.DataHash
 	}
 	_, feedbackWeights := loadRobotFeedbackForContext(ctx)
@@ -3772,7 +3908,7 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 		Readiness:         ctx.Readiness,
 		CandidateIDs:      ctx.CandidateIDs,
 		UnblockIDs:        ctx.RecipeUnblockIDs,
-		VelocityIssues:    ctx.VelocityIssues(),
+		VelocityIssues:    velocityIssues,
 		UseFastConfig:     !forceFull,
 		ForceFullAnalysis: forceFull,
 		History:           historyReport,
@@ -4191,13 +4327,49 @@ func findEnclosingGitRoot(startPath string) (string, error) {
 		abs = filepath.Dir(abs)
 	}
 	dir := filepath.Clean(abs)
+	if resolved, evalErr := filepath.EvalSymlinks(dir); evalErr == nil && resolved != "" {
+		dir = filepath.Clean(resolved)
+	}
+
+	ceilings := make(map[string]bool)
+	for _, raw := range filepath.SplitList(os.Getenv("GIT_CEILING_DIRECTORIES")) {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			clean := filepath.Clean(trimmed)
+			ceilings[clean] = true
+			if resolved, evalErr := filepath.EvalSymlinks(clean); evalErr == nil && resolved != "" {
+				ceilings[filepath.Clean(resolved)] = true
+			}
+		}
+	}
+	tempBoundaries := make(map[string]bool)
+	for _, rawTmp := range []string{os.TempDir(), "/tmp", "/var/tmp"} {
+		if strings.TrimSpace(rawTmp) == "" {
+			continue
+		}
+		cleanTmp := filepath.Clean(rawTmp)
+		tempBoundaries[cleanTmp] = true
+		if resolved, evalErr := filepath.EvalSymlinks(cleanTmp); evalErr == nil && resolved != "" {
+			tempBoundaries[filepath.Clean(resolved)] = true
+		}
+	}
+
+	startedAtTempRoot := tempBoundaries[dir]
 	for {
 		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 			return dir, nil
 		}
+		if ceilings[dir] {
+			return "", fmt.Errorf("not a git repository (stopped at GIT_CEILING_DIRECTORIES): %s", startPath)
+		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
 			return "", fmt.Errorf("not a git repository: %s", startPath)
+		}
+		if !startedAtTempRoot && tempBoundaries[parent] {
+			return "", fmt.Errorf("not a git repository: %s", startPath)
+		}
+		if ceilings[parent] {
+			return "", fmt.Errorf("not a git repository (stopped at GIT_CEILING_DIRECTORIES): %s", startPath)
 		}
 		dir = parent
 	}
@@ -6390,6 +6562,207 @@ func handleRobotWhatIf(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding what-if impact: %w", err)
+	}
+	return nil
+}
+
+type robotCassSession struct {
+	SourcePath    string   `json:"source_path"`
+	LineNumber    int      `json:"line_number"`
+	Agent         string   `json:"agent"`
+	Title         string   `json:"title"`
+	Snippet       string   `json:"snippet"`
+	Timestamp     string   `json:"timestamp"`
+	Workspace     string   `json:"workspace,omitempty"`
+	MatchType     string   `json:"match_type,omitempty"`
+	BaseScore     float64  `json:"base_score"`
+	FinalScore    float64  `json:"final_score"`
+	Strategy      string   `json:"strategy"`
+	Keywords      []string `json:"keywords,omitempty"`
+	ViewCommand   string   `json:"view_command,omitempty"`
+	ExpandCommand string   `json:"expand_command,omitempty"`
+}
+
+func shellQuoteCassArg(s string) string {
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func resolveCassTargetIssue(ctx RobotContext, rawID string) *model.Issue {
+	targetID := strings.TrimSpace(rawID)
+	if targetID == "" {
+		return nil
+	}
+	candidates := scopedCorrelationIssues(ctx)
+	for i := range candidates {
+		if candidates[i].ID == targetID {
+			return &candidates[i]
+		}
+	}
+	var uniqueLocal *model.Issue
+	for i := range candidates {
+		if candidates[i].Origin != nil && strings.TrimSpace(candidates[i].Origin.LocalID) == targetID {
+			if uniqueLocal != nil {
+				return nil
+			}
+			uniqueLocal = &candidates[i]
+		}
+	}
+	return uniqueLocal
+}
+
+func cassStatusCode(s cass.Status) string {
+	switch s {
+	case cass.StatusHealthy:
+		return "healthy"
+	case cass.StatusNeedsIndex:
+		return "needs_indexing"
+	case cass.StatusNotInstalled:
+		return "not_installed"
+	default:
+		return "unknown"
+	}
+}
+
+func handleRobotCass(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
+	rawTarget := ""
+	if cfg.RobotCassFlag != nil {
+		rawTarget = strings.TrimSpace(*cfg.RobotCassFlag)
+	}
+	if rawTarget == "" {
+		return fmt.Errorf("--robot-cass requires a bead ID")
+	}
+	targetIssue := resolveCassTargetIssue(ctx, rawTarget)
+	if targetIssue == nil {
+		fmt.Fprintf(ctx.StderrOrDefault(), "Bead not found: %s\n", rawTarget)
+		return newReportedRobotHandlerExit(1)
+	}
+
+	workDir, err := ctx.ProjectDirOrDefault()
+	if err != nil || strings.TrimSpace(workDir) == "" {
+		workDir, _ = ctx.WorkDirOrDefault()
+	}
+
+	timeoutMs := env.CassSearchTimeoutMS.Int(3000)
+	if timeoutMs < 100 {
+		timeoutMs = 100
+	}
+	budget := time.Duration(timeoutMs) * time.Millisecond
+
+	detector := cass.NewDetectorWithOptions(cass.WithHealthTimeout(min(budget, 2*time.Second)))
+	status := detector.Check()
+	available := status == cass.StatusHealthy || status == cass.StatusNeedsIndex
+
+	corr := cass.CorrelationResult{
+		BeadID:   targetIssue.ID,
+		Keywords: cass.ExtractKeywords(targetIssue.Title),
+	}
+	if available {
+		searcher := cass.NewSearcherWithOptions(detector, cass.WithSearchTimeout(budget))
+		correlator := cass.NewCorrelatorWithOptions(
+			searcher,
+			nil,
+			cass.WithWorkspace(workDir),
+			cass.WithNow(func() time.Time { return ctx.ReferenceNow() }),
+		)
+		func() {
+			corrCtx, cancel := context.WithTimeout(context.Background(), budget)
+			defer cancel()
+			corr = correlator.Correlate(corrCtx, targetIssue)
+		}()
+	}
+
+	keywords := corr.Keywords
+	if keywords == nil {
+		keywords = []string{}
+	}
+
+	refNow := ctx.ReferenceNow()
+	sessions := make([]robotCassSession, 0, len(corr.TopSessions))
+	filteredPostCutoff := 0
+	for _, hit := range corr.TopSessions {
+		if ctx.AsOf != "" && !hit.Timestamp.IsZero() && hit.Timestamp.After(refNow) {
+			filteredPostCutoff++
+			continue
+		}
+		ts := ""
+		if !hit.Timestamp.IsZero() {
+			ts = hit.Timestamp.UTC().Format(time.RFC3339)
+		}
+		var viewCmd, expandCmd string
+		if strings.TrimSpace(hit.SourcePath) != "" {
+			quoted := shellQuoteCassArg(hit.SourcePath)
+			if hit.LineNumber > 0 {
+				viewCmd = fmt.Sprintf("cass view %s -n %d --json", quoted, hit.LineNumber)
+				expandCmd = fmt.Sprintf("cass expand %s -n %d -C 3 --json", quoted, hit.LineNumber)
+			} else {
+				viewCmd = fmt.Sprintf("cass view %s --json", quoted)
+			}
+		}
+		sessions = append(sessions, robotCassSession{
+			SourcePath:    hit.SourcePath,
+			LineNumber:    hit.LineNumber,
+			Agent:         hit.Agent,
+			Title:         hit.Title,
+			Snippet:       hit.Snippet,
+			Timestamp:     ts,
+			Workspace:     hit.Workspace,
+			MatchType:     hit.MatchType,
+			BaseScore:     hit.BaseScore,
+			FinalScore:    hit.FinalScore,
+			Strategy:      string(hit.Strategy),
+			Keywords:      hit.Keywords,
+			ViewCommand:   viewCmd,
+			ExpandCommand: expandCmd,
+		})
+	}
+	totalFound := corr.TotalFound
+	if filteredPostCutoff > 0 {
+		totalFound = max(totalFound-filteredPostCutoff, len(sessions))
+		if len(sessions) == 0 {
+			totalFound = 0
+			corr.Strategy = ""
+		}
+	}
+	if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 && len(sessions) > *cfg.RobotMaxResults {
+		sessions = sessions[:*cfg.RobotMaxResults]
+	}
+
+	output := struct {
+		RobotEnvelope
+		BeadID     string             `json:"bead_id"`
+		BeadTitle  string             `json:"bead_title"`
+		CassStatus string             `json:"cass_status"`
+		Available  bool               `json:"available"`
+		Strategy   string             `json:"strategy"`
+		Keywords   []string           `json:"keywords"`
+		TotalFound int                `json:"total_found"`
+		TimedOut   bool               `json:"timed_out"`
+		Diagnostic string             `json:"diagnostic,omitempty"`
+		Sessions   []robotCassSession `json:"sessions"`
+		UsageHints []string           `json:"usage_hints"`
+	}{
+		RobotEnvelope: ctx.Envelope(),
+		BeadID:        targetIssue.ID,
+		BeadTitle:     targetIssue.Title,
+		CassStatus:    cassStatusCode(status),
+		Available:     available,
+		Strategy:      string(corr.Strategy),
+		Keywords:      keywords,
+		TotalFound:    totalFound,
+		TimedOut:      corr.TimedOut,
+		Diagnostic:    corr.Error,
+		Sessions:      sessions,
+		UsageHints: []string{
+			"jq '.sessions[0].expand_command' - Command to expand surrounding transcript turns",
+			"jq '.sessions[] | {agent, title, final_score, strategy, view_command}' - Ranked prior agent sessions",
+			"Set BV_CASS_SEARCH_TIMEOUT_MS=8000 if timed_out is true on a large session archive",
+		},
+	}
+	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
+		return fmt.Errorf("encoding cass sessions: %w", err)
 	}
 	return nil
 }

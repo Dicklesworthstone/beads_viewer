@@ -83,6 +83,7 @@
 |  | `h` | Collapse or jump to parent |
 |  | `l` | Expand or move to child |
 |  | `o` | Expand all nodes |
+|  | `X` | Expand all nodes |
 |  | `Z` | Collapse all nodes |
 |  | `tab` | Toggle detail pane |
 |  | `PgUp` | Page up |
