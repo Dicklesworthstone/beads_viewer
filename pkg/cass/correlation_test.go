@@ -1441,3 +1441,94 @@ func TestCorrelator_EmbeddedSubtokensRetainedWildcardTotalAndTrackerDirectoryWor
 		t.Fatalf("[R2-A1] unvalidated standalone TrackerDirectory=/tmp derived %q, want fallback /umbrella/root", gotStandalone)
 	}
 }
+
+func TestCorrelator_WithCutoffAndMaxSessions(t *testing.T) {
+	cutoff := time.Date(2026, 5, 10, 18, 0, 0, 0, time.UTC)
+	detector := NewDetector()
+	detector.lookPath = func(string) (string, error) { return "/usr/bin/cass", nil }
+	detector.runCommand = func(context.Context, string, ...string) (int, error) { return 0, nil }
+	_ = detector.Check()
+
+	// 1. Strategy 1 returns ONLY post-cutoff and undated hits: WithCutoff must reject them BEFORE
+	// short-circuiting so Strategy 2 (keywords) runs without --days and finds historical sessions!
+	var seenQueries []string
+	var seenDaysFlag bool
+	fallbackSearcher := NewSearcher(detector)
+	fallbackSearcher.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "search" {
+			seenQueries = append(seenQueries, args[1])
+		}
+		for _, a := range args {
+			if a == "--days" {
+				seenDaysFlag = true
+			}
+		}
+		if len(args) >= 2 && strings.HasPrefix(args[1], `"`) {
+			return []byte(fmt.Sprintf(`{
+				"hits": [
+					{"source_path": "/s/future-id.jsonl", "line_number": 1, "agent": "claude", "title": "Future", "score": 9.0, "content": "fixed bv-cut", "created_at": %d, "workspace": "/work/proj"},
+					{"source_path": "/s/undated-id.jsonl", "line_number": 2, "agent": "claude", "title": "Undated", "score": 9.0, "content": "fixed bv-cut", "workspace": "/work/proj"}
+				],
+				"total_matches": 2
+			}`, cutoff.Add(2*time.Hour).UnixMilli())), nil
+		}
+		return []byte(fmt.Sprintf(`{
+			"hits": [
+				{"source_path": "/s/future-kw.jsonl", "line_number": 1, "agent": "claude", "title": "OAuth", "score": 9.0, "content": "oauth token refresh", "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/undated-kw.jsonl", "line_number": 2, "agent": "claude", "title": "OAuth", "score": 9.0, "content": "oauth token refresh", "workspace": "/work/proj"},
+				{"source_path": "/s/hist-kw-1.jsonl", "line_number": 3, "agent": "claude", "title": "OAuth", "score": 8.0, "content": "oauth token refresh", "created_at": %d, "workspace": "/work/proj"}
+			],
+			"total_matches": 99
+		}`, cutoff.Add(time.Minute).UnixMilli(), cutoff.Add(-48*time.Hour).UnixMilli())), nil
+	}
+
+	cutoffCorr := NewCorrelatorWithOptions(
+		fallbackSearcher,
+		nil,
+		WithWorkspace("/work/proj"),
+		WithCutoff(cutoff),
+		WithNow(func() time.Time { return cutoff }),
+	)
+	res := cutoffCorr.Correlate(context.Background(), &model.Issue{
+		ID:        "bv-cut",
+		Title:     "OAuth token refresh",
+		CreatedAt: cutoff.Add(-72 * time.Hour),
+	})
+	if seenDaysFlag {
+		t.Fatalf("WithCutoff passed --days to cass search (would anchor to wall-clock today instead of historical cutoff)")
+	}
+	if len(seenQueries) < 2 {
+		t.Fatalf("expected Strategy 1 post-cutoff/undated hits to fall through to Strategy 2, queries=%v", seenQueries)
+	}
+	if res.Strategy != StrategyKeywords || len(res.TopSessions) != 1 || res.TopSessions[0].SourcePath != "/s/hist-kw-1.jsonl" {
+		t.Fatalf("expected 1 historical keyword hit, got strategy=%q sessions=%+v", res.Strategy, res.TopSessions)
+	}
+	if res.TotalFound != 1 {
+		t.Fatalf("TotalFound = %d, want 1 (excluding post-cutoff and undated hits)", res.TotalFound)
+	}
+
+	// 2. WithMaxSessions(5) returns 5 ranked sessions instead of truncating at MaxSessionsReturned (3).
+	maxSearcher := NewSearcher(detector)
+	maxSearcher.runCommand = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		var rows []string
+		for i := 1; i <= 6; i++ {
+			rows = append(rows, fmt.Sprintf(
+				`{"source_path": "/s/s%d.jsonl", "line_number": %d, "agent": "claude", "title": "Hit %d", "score": %d.0, "content": "fixed bv-max", "created_at": %d, "workspace": "/work/proj"}`,
+				i, i, i, 10-i, cutoff.Add(-time.Duration(i)*time.Hour).UnixMilli(),
+			))
+		}
+		return []byte(fmt.Sprintf(`{"hits": [%s], "total_matches": 6}`, strings.Join(rows, ","))), nil
+	}
+	maxCorr := NewCorrelatorWithOptions(
+		maxSearcher,
+		nil,
+		WithWorkspace("/work/proj"),
+		WithMaxSessions(5),
+		WithCutoff(cutoff),
+		WithNow(func() time.Time { return cutoff }),
+	)
+	maxRes := maxCorr.Correlate(context.Background(), &model.Issue{ID: "bv-max", Title: "Max sessions check"})
+	if len(maxRes.TopSessions) != 5 || maxRes.TotalFound != 6 {
+		t.Fatalf("WithMaxSessions(5): len(TopSessions)=%d TotalFound=%d, want 5 and 6", len(maxRes.TopSessions), maxRes.TotalFound)
+	}
+}

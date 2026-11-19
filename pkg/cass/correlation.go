@@ -94,9 +94,11 @@ type CorrelationResult struct {
 
 // Correlator intelligently matches cass sessions to beads using multiple strategies.
 type Correlator struct {
-	searcher  *Searcher
-	cache     *Cache
-	workspace string // Project workspace path for filtering
+	searcher    *Searcher
+	cache       *Cache
+	workspace   string // Project workspace path for filtering
+	maxSessions int
+	cutoff      *time.Time
 
 	// For testing: allow overriding time
 	now func() time.Time
@@ -105,10 +107,11 @@ type Correlator struct {
 // NewCorrelator creates a new Correlator with the given dependencies.
 func NewCorrelator(searcher *Searcher, cache *Cache, workspace string) *Correlator {
 	return &Correlator{
-		searcher:  searcher,
-		cache:     cache,
-		workspace: workspace,
-		now:       time.Now,
+		searcher:    searcher,
+		cache:       cache,
+		workspace:   workspace,
+		maxSessions: MaxSessionsReturned,
+		now:         time.Now,
 	}
 }
 
@@ -129,6 +132,37 @@ func WithNow(now func() time.Time) CorrelatorOption {
 			c.now = now
 		}
 	}
+}
+
+// WithMaxSessions overrides the maximum number of sessions returned per correlation.
+func WithMaxSessions(n int) CorrelatorOption {
+	return func(c *Correlator) {
+		if n > 0 {
+			c.maxSessions = n
+		}
+	}
+}
+
+// WithCutoff sets an inclusive historical upper bound (e.g. --as-of commit timestamp).
+// Sessions after cutoff or lacking a verifiable timestamp are excluded before ranking.
+func WithCutoff(cutoff time.Time) CorrelatorOption {
+	return func(c *Correlator) {
+		if !cutoff.IsZero() {
+			u := cutoff.UTC()
+			c.cutoff = &u
+		}
+	}
+}
+
+func (c *Correlator) effectiveMaxSessions() int {
+	if c != nil && c.maxSessions > 0 {
+		return c.maxSessions
+	}
+	return MaxSessionsReturned
+}
+
+func (c *Correlator) rejectedByCutoff(ts time.Time) bool {
+	return c != nil && c.cutoff != nil && (ts.IsZero() || ts.After(*c.cutoff))
 }
 
 // NewCorrelatorWithOptions creates a Correlator with custom options.
@@ -355,7 +389,7 @@ func (c *Correlator) searchByIssueIDs(ctx context.Context, issue *model.Issue, n
 	stop := false
 
 	for _, id := range ids {
-		results, meta := c.searchByIDInWorkspace(ctx, id, ws)
+		results, meta := c.searchByIDInWorkspaceRaw(ctx, id, ws)
 		totalFound += meta.Total
 		stop = note("ID search", meta)
 		for _, sr := range results {
@@ -375,7 +409,9 @@ func (c *Correlator) searchByIssueIDs(ctx context.Context, issue *model.Issue, n
 		}
 	}
 
-	if totalFound >= dupHits {
+	if c.cutoff != nil {
+		totalFound = len(order)
+	} else if totalFound >= dupHits {
 		totalFound -= dupHits
 	}
 	if len(order) == 0 {
@@ -485,23 +521,35 @@ func hasConflictingSubstringWithoutTokenMatch(r SearchResult, beadID string) boo
 }
 
 func (c *Correlator) searchByIDInWorkspace(ctx context.Context, beadID, workspace string) ([]ScoredResult, SearchMeta) {
+	scored, meta := c.searchByIDInWorkspaceRaw(ctx, beadID, workspace)
+	return c.rankAndLimit(scored), meta
+}
+
+func (c *Correlator) searchByIDInWorkspaceRaw(ctx context.Context, beadID, workspace string) ([]ScoredResult, SearchMeta) {
 	// Quote the ID for exact matching
 	query := `"` + beadID + `"`
 
+	limit := c.effectiveMaxSessions() * 2
+	if c.cutoff != nil {
+		limit = max(c.effectiveMaxSessions()*8, 50)
+	}
 	resp := c.searcher.Search(ctx, SearchOptions{
 		Query:     query,
-		Limit:     MaxSessionsReturned,
+		Limit:     limit,
 		Workspace: workspace,
 	})
 
 	if len(resp.Results) == 0 {
+		if c.cutoff != nil {
+			resp.Meta.Total = 0
+		}
 		return nil, resp.Meta
 	}
 
 	meta := resp.Meta
 	scored := make([]ScoredResult, 0, len(resp.Results))
 	for _, r := range resp.Results {
-		if hasConflictingSubstringWithoutTokenMatch(r, beadID) {
+		if c.rejectedByCutoff(r.Timestamp) || hasConflictingSubstringWithoutTokenMatch(r, beadID) {
 			if meta.Total > 0 {
 				meta.Total--
 			}
@@ -522,8 +570,11 @@ func (c *Correlator) searchByIDInWorkspace(ctx context.Context, beadID, workspac
 			meta.Total--
 		}
 	}
+	if c.cutoff != nil {
+		meta.Total = len(scored)
+	}
 
-	return c.rankAndLimit(scored), meta
+	return scored, meta
 }
 
 // searchByKeywords searches for extracted keywords with time filtering.
@@ -534,24 +585,41 @@ func (c *Correlator) searchByKeywords(ctx context.Context, issue *model.Issue, k
 		return nil, SearchMeta{}
 	}
 
-	// Calculate search window based on bead activity
+	// Calculate search window based on bead activity.
+	// External `cass search --days` filters relative to wall-clock today; in
+	// historical cutoff mode (--as-of), omit `--days` so older commits are not
+	// dropped while rejectedByCutoff enforces the upper bound strictly.
 	days := c.calculateSearchDays(issue)
+	limit := c.effectiveMaxSessions() * 2
+	if c.cutoff != nil {
+		days = 0
+		limit = max(c.effectiveMaxSessions()*8, 50)
+	}
 	workspace := c.workspaceForIssue(issue)
 	ids := candidateIssueIDs(issue)
 
 	resp := c.searcher.Search(ctx, SearchOptions{
 		Query:     query,
-		Limit:     MaxSessionsReturned * 2, // Get extra to filter
+		Limit:     limit, // Get extra to filter
 		Days:      days,
 		Workspace: workspace,
 	})
 
 	if len(resp.Results) == 0 {
+		if c.cutoff != nil {
+			resp.Meta.Total = 0
+		}
 		return nil, resp.Meta
 	}
 
 	scored := make([]ScoredResult, 0, len(resp.Results))
 	for _, r := range resp.Results {
+		if c.rejectedByCutoff(r.Timestamp) {
+			if resp.Meta.Total > 0 {
+				resp.Meta.Total--
+			}
+			continue
+		}
 		// Score based on how well keywords match (elevating literal mentions of LocalID or ID)
 		baseScore := c.scoreKeywordMatch(r, keywords)
 		if mentionsAnyIssueID(r, ids) && baseScore < float64(ScoreIDMention) {
@@ -573,6 +641,9 @@ func (c *Correlator) searchByKeywords(ctx context.Context, issue *model.Issue, k
 			resp.Meta.Total--
 		}
 	}
+	if c.cutoff != nil {
+		resp.Meta.Total = len(scored)
+	}
 
 	return c.rankAndLimit(scored), resp.Meta
 }
@@ -584,19 +655,24 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 	if days == 0 {
 		days = 7 // Default to a week
 	}
+	limit := c.effectiveMaxSessions() * 3
+	if c.cutoff != nil {
+		days = 0
+		limit = max(c.effectiveMaxSessions()*8, 50)
+	}
 	workspace := c.workspaceForIssue(issue)
 	ids := candidateIssueIDs(issue)
 
 	// Search broadly - we're relying on timestamp for relevance
 	resp := c.searcher.Search(ctx, SearchOptions{
 		Query:     "*", // Match all within time window
-		Limit:     MaxSessionsReturned * 3,
+		Limit:     limit,
 		Days:      days,
 		Workspace: workspace,
 	})
 
 	if len(resp.Results) == 0 {
-		if days > 7 {
+		if days > 7 || c.cutoff != nil {
 			resp.Meta.Total = 0
 		}
 		return nil, resp.Meta
@@ -605,6 +681,13 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 	scored := make([]ScoredResult, 0, len(resp.Results))
 	rejected := 0
 	for _, r := range resp.Results {
+		if c.rejectedByCutoff(r.Timestamp) {
+			rejected++
+			if resp.Meta.Total > 0 {
+				resp.Meta.Total--
+			}
+			continue
+		}
 		baseScore := c.scoreTimestampProximity(r.Timestamp, issue)
 		if mentionsAnyIssueID(r, ids) && baseScore < float64(ScoreIDMention) {
 			baseScore = float64(ScoreIDMention)
@@ -630,7 +713,9 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 	}
 
 	filtered := c.rankAndLimit(scored)
-	if days > 7 || rejected > 0 {
+	if c.cutoff != nil {
+		resp.Meta.Total = len(scored)
+	} else if days > 7 || rejected > 0 {
 		resp.Meta.Total = len(filtered)
 	}
 	return filtered, resp.Meta
@@ -863,8 +948,9 @@ func (c *Correlator) rankAndLimit(results []ScoredResult) []ScoredResult {
 	}
 
 	// Limit
-	if len(results) > MaxSessionsReturned {
-		results = results[:MaxSessionsReturned]
+	maxSess := c.effectiveMaxSessions()
+	if len(results) > maxSess {
+		results = results[:maxSess]
 	}
 
 	return results
