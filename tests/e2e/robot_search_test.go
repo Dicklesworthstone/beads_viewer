@@ -366,8 +366,8 @@ func TestRobotSearchJudgedRelevance(t *testing.T) {
 							exitCode = exitErr.ExitCode()
 						}
 						rejectedBlank := strings.TrimSpace(query.Query) == "" && exitCode == 1 && run.stdout == "" && strings.Contains(run.stderr, "--robot-search requires --search")
-						if run.exit != nil && !rejectedBlank {
-							t.Fatalf("scale=%d config=%s query=%s argv=%q: %v\nstdout=%s\nstderr=%s", distractors, configuration, query.ID, args, run.exit, run.stdout, run.stderr)
+						if (run.exit != nil && !rejectedBlank) || (strings.TrimSpace(query.Query) == "" && !rejectedBlank) {
+							t.Fatalf("scale=%d config=%s query=%s argv=%q: exit=%v rejectedBlank=%v\nstdout=%s\nstderr=%s", distractors, configuration, query.ID, args, run.exit, rejectedBlank, run.stdout, run.stderr)
 						}
 						observation := relevanceObservation{QueryID: query.ID, Split: query.Split, Class: query.Class,
 							QueryHash: relevanceHash(struct{ ID, Query, Intent string }{query.ID, query.Query, query.Intent}),

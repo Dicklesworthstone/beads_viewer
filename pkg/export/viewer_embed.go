@@ -35,8 +35,9 @@ var ViewerAssetsFS embed.FS
 // invoking user. Keep it open across an export so later path replacements cannot
 // redirect writes, reads, or cleanup through a different directory.
 type Bundle struct {
-	root               *os.Root
-	hybridWasmPrepared bool
+	root                *os.Root
+	hybridWasmPrepared  bool
+	hybridWasmEvaluated bool
 }
 
 // HybridWasmPrepared reports whether optional hybrid WASM assets were prepared in this bundle.
@@ -48,6 +49,20 @@ func (b *Bundle) HybridWasmPrepared() bool {
 func (b *Bundle) MarkHybridWasmPrepared() {
 	if b != nil {
 		b.hybridWasmPrepared = true
+		b.hybridWasmEvaluated = true
+	}
+}
+
+// HybridWasmEvaluated reports whether prepareBundleWasmAssets has already evaluated this bundle.
+func (b *Bundle) HybridWasmEvaluated() bool {
+	return b != nil && b.hybridWasmEvaluated
+}
+
+// MarkHybridWasmEvaluated records that prepareBundleWasmAssets has evaluated this bundle
+// (even when no WASM assets were staged, e.g. under --no-hooks).
+func (b *Bundle) MarkHybridWasmEvaluated() {
+	if b != nil {
+		b.hybridWasmEvaluated = true
 	}
 }
 

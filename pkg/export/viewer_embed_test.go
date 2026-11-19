@@ -1032,3 +1032,42 @@ func TestCopyEmbeddedAssetsWithSubtitle_ExcludesDevOnlyAssetsFromDiskAndOfflineM
 		}
 	}
 }
+
+func TestBundleHybridWasmEvaluatedAndPrepared(t *testing.T) {
+	var nilBundle *Bundle
+	if nilBundle.HybridWasmEvaluated() || nilBundle.HybridWasmPrepared() {
+		t.Fatal("nil Bundle must report HybridWasmEvaluated=false and HybridWasmPrepared=false")
+	}
+	// Calling Mark* on nil Bundle must be a safe no-op.
+	nilBundle.MarkHybridWasmEvaluated()
+	nilBundle.MarkHybridWasmPrepared()
+	if nilBundle.HybridWasmEvaluated() || nilBundle.HybridWasmPrepared() {
+		t.Fatal("nil Bundle must remain false after MarkHybridWasmEvaluated/MarkHybridWasmPrepared")
+	}
+
+	bEvalOnly, err := OpenBundle(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenBundle(evalOnly): %v", err)
+	}
+	defer bEvalOnly.Close()
+	if bEvalOnly.HybridWasmEvaluated() || bEvalOnly.HybridWasmPrepared() {
+		t.Fatal("fresh Bundle must start with HybridWasmEvaluated=false and HybridWasmPrepared=false")
+	}
+	bEvalOnly.MarkHybridWasmEvaluated()
+	if !bEvalOnly.HybridWasmEvaluated() {
+		t.Fatal("MarkHybridWasmEvaluated must set HybridWasmEvaluated=true")
+	}
+	if bEvalOnly.HybridWasmPrepared() {
+		t.Fatal("MarkHybridWasmEvaluated must leave HybridWasmPrepared=false when no WASM was staged")
+	}
+
+	bPrepared, err := OpenBundle(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenBundle(prepared): %v", err)
+	}
+	defer bPrepared.Close()
+	bPrepared.MarkHybridWasmPrepared()
+	if !bPrepared.HybridWasmPrepared() || !bPrepared.HybridWasmEvaluated() {
+		t.Fatalf("MarkHybridWasmPrepared must set both Prepared=true (%v) and Evaluated=true (%v)", bPrepared.HybridWasmPrepared(), bPrepared.HybridWasmEvaluated())
+	}
+}

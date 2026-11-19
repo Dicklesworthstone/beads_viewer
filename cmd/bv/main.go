@@ -225,7 +225,7 @@ func validateExclusivePrimaryCommands(flags *flag.FlagSet, groups []primaryComma
 func activePrimaryFlags(flags *flag.FlagSet, names []string) []string {
 	active := make([]string, 0, len(names))
 	for _, name := range names {
-		if isFlagActive(flags, name) {
+		if isFlagActive(flags, name) || (primaryStringCommandFlags[name] && flags.Changed(name)) {
 			active = append(active, "--"+name)
 		}
 	}
@@ -371,7 +371,7 @@ func isFlagActive(flags *flag.FlagSet, name string) bool {
 		v, err := flags.GetBool(name)
 		return err == nil && v
 	case "string":
-		if primaryStringCommandFlags[name] && flags.Changed(name) {
+		if (name == "export-graph" || name == "save-baseline") && flags.Changed(name) {
 			return true
 		}
 		v, err := flags.GetString(name)
@@ -2303,7 +2303,7 @@ func main() {
 		for _, reqStrFlag := range []string{
 			"feedback-accept", "feedback-ignore", "export", "export-md",
 			"export-pages", "preview-pages", "priority-brief", "agent-brief",
-			"debug-render", "diff-since",
+			"debug-render", "diff-since", "search", "bead-history",
 		} {
 			if flag.CommandLine.Changed(reqStrFlag) {
 				val, _ := flag.CommandLine.GetString(reqStrFlag)
@@ -4218,7 +4218,7 @@ func main() {
 
 				// Bind the offline viewer to the completed data, including history.
 				fmt.Println("  → Copying viewer assets...")
-				if err := copyViewerAssetsWithSubtitle(bundle, *pagesTitle, *pagesSubtitle); err != nil {
+				if err := copyViewerAssetsWithSubtitle(bundle, *pagesTitle, *pagesSubtitle, projectDir, *noHooks); err != nil {
 					return fmt.Errorf("copying assets: %w", err)
 				}
 				// Windows holds the directory against renames while open. Release
@@ -6186,6 +6186,16 @@ func formatCycle(cycle []string) string {
 // recipe membership and label context against the current dependency authority.
 // ctx.Readiness must describe the full source, including tombstones; ctx.DataHash
 // may seed its unfiltered hash only when it describes exactly ctx.Issues.
+func recipeStatusListAllowsClosed(statuses []string) bool {
+	for _, st := range statuses {
+		s := model.Status(strings.ToLower(strings.TrimSpace(st)))
+		if s.IsClosed() || s.IsTombstone() {
+			return true
+		}
+	}
+	return false
+}
+
 func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error) {
 	fullSource := ctx.Issues
 	ctx.FullIssues = fullSource
@@ -6265,8 +6275,13 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 		if uErr != nil {
 			unblockIssues = recipeIssues
 		}
+		excludeClosedFromUnblock := (r.Filters.Actionable != nil && *r.Filters.Actionable) ||
+			(len(r.Filters.Status) > 0 && !recipeStatusListAllowsClosed(r.Filters.Status))
 		unblockIDs := make(map[string]bool, len(unblockIssues))
 		for _, iss := range unblockIssues {
+			if excludeClosedFromUnblock && (iss.Status.IsClosed() || iss.Status.IsTombstone()) {
+				continue
+			}
 			unblockIDs[iss.ID] = true
 		}
 		for id := range nextCandidates {
@@ -7313,12 +7328,12 @@ func buildAttentionReason(score analysis.LabelAttentionScore) string {
 
 // copyViewerAssetsWithSubtitle copies viewer HTML/JS/CSS assets and applies
 // optional title and subtitle customization to index.html.
-func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string) error {
+func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle, projectDir string, noHooks bool) error {
 	// First try to use embedded assets (production builds)
 	if export.HasEmbeddedAssets() {
 		// Prepare optional hybrid WASM assets before CopyEmbeddedAssetsWithSubtitle
 		// binds coi-serviceworker.js's OFFLINE_ASSETS manifest.
-		if err := maybeBuildHybridWasmAssets(bundle); err != nil {
+		if err := prepareBundleWasmAssets(bundle, projectDir, noHooks); err != nil {
 			return err
 		}
 		return bundle.CopyEmbeddedAssetsWithSubtitle(title, subtitle)
@@ -7371,8 +7386,8 @@ func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string)
 		}
 	}
 
-	// Stage optional WASM directory when not already prepared by prepareBundleWasmAssets
-	if err := prepareBundleWasmAssets(bundle, "", false); err != nil {
+	// Stage optional WASM directory when not already evaluated by prepareBundleWasmAssets
+	if err := prepareBundleWasmAssets(bundle, projectDir, noHooks); err != nil {
 		return err
 	}
 	if err := bundle.BindOfflineBundleAssets(); err != nil {
@@ -7397,9 +7412,10 @@ func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string)
 // calls on the same *export.Bundle (for example from copyViewerAssetsWithSubtitle)
 // are idempotent no-ops.
 func prepareBundleWasmAssets(bundle *export.Bundle, projectDir string, noHooks bool) error {
-	if bundle == nil || bundle.HybridWasmPrepared() {
+	if bundle == nil || bundle.HybridWasmPrepared() || bundle.HybridWasmEvaluated() {
 		return nil
 	}
+	bundle.MarkHybridWasmEvaluated()
 
 	// 1. Explicit BV_HYBRID_WASM_DIR: fail closed if configured directory is missing or incomplete.
 	if explicitDir := strings.TrimSpace(env.HybridWasmDir.Get()); explicitDir != "" {
@@ -7440,10 +7456,10 @@ func prepareBundleWasmAssets(bundle *export.Bundle, projectDir string, noHooks b
 		if cwd, err := os.Getwd(); err == nil && cwd != "" {
 			addCandidate(filepath.Join(cwd, ".bv", "wasm", "hybrid"))
 		}
-	}
-	if !export.HasEmbeddedAssets() {
-		if assetsDir := findViewerAssetsDir(); assetsDir != "" {
-			addCandidate(filepath.Join(assetsDir, "wasm"))
+		if !export.HasEmbeddedAssets() {
+			if assetsDir := findViewerAssetsDir(); assetsDir != "" {
+				addCandidate(filepath.Join(assetsDir, "wasm"))
+			}
 		}
 	}
 	for _, wasmSrc := range candidateDirs {
@@ -8256,7 +8272,7 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 
 	// Bind the offline viewer after all database/history data has been published.
 	fmt.Println("  -> Copying viewer assets...")
-	if err := copyViewerAssetsWithSubtitle(bundle, config.Title, config.Subtitle); err != nil {
+	if err := copyViewerAssetsWithSubtitle(bundle, config.Title, config.Subtitle, wizardProjectDir, noHooks); err != nil {
 		return fmt.Errorf("failed to copy assets: %w", err)
 	}
 	if err := bundle.Close(); err != nil {
@@ -8681,8 +8697,8 @@ func metadataPreferredSource(beadsDir string) (string, datasource.SourceType) {
 	if err := json.Unmarshal(data, &meta); err != nil {
 		return "", ""
 	}
-	if meta.Database != "" {
-		path := meta.Database
+	if dbTarget := strings.TrimSpace(meta.Database); dbTarget != "" {
+		path := dbTarget
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(beadsDir, path)
 		}
@@ -8690,8 +8706,8 @@ func metadataPreferredSource(beadsDir string) (string, datasource.SourceType) {
 			return path, datasource.SourceTypeSQLite
 		}
 	}
-	if meta.JSONLExport != "" {
-		path := meta.JSONLExport
+	if jsonlTarget := strings.TrimSpace(meta.JSONLExport); jsonlTarget != "" {
+		path := jsonlTarget
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(beadsDir, path)
 		}

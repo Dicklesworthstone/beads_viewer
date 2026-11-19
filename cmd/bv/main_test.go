@@ -9060,6 +9060,12 @@ func TestWave19_TrackD_AuditRemediations(t *testing.T) {
 		{"cass", "", "--json"},
 		{"--robot-whatif", ""},
 		{"--bead-history", ""},
+		{"history", "", "--json"},
+		{"--robot-history", "--bead-history", ""},
+		{"--search", ""},
+		{"--search", "   "},
+		{"--robot-search", "--search", "   "},
+		{"--search", "", "--robot-triage"},
 		{"--robot-file-beads", ""},
 		{"--robot-impact", " , "},
 		{"--robot-file-relations", ""},
@@ -9109,6 +9115,39 @@ func TestWave19_TrackD_AuditRemediations(t *testing.T) {
 	_ = json.Unmarshal([]byte(soloGraphOut), &soloG)
 	if soloG.Nodes != 1 || soloG.DataHash == "" || soloG.DataHash == fullG.DataHash || soloG.ScopeHash == fullG.ScopeHash {
 		t.Fatalf("expected --robot-graph --graph-root solo-3 to emit 1 node and distinct subgraph data_hash/scope_hash, full=%+v solo=%+v", fullG, soloG)
+	}
+	// [R2-D4]: --robot-graph --recipe actionable --graph-root api-1 must NOT leak blocked web-2; --graph-root web-2 fails closed;
+	// --robot-triage --recipe actionable --graph-root <closed> fails closed, while --graph-root <open-epic-all-blocked> exits 0 with 0 recs!
+	actGraphOut, actGraphErr, err := runCommandWithTimeout(t, projDir, exe, "--robot-graph", "--recipe", "actionable", "--graph-root", "api-1")
+	if err != nil {
+		t.Fatalf("--robot-graph --recipe actionable --graph-root api-1 failed: %v\nstderr=%s", err, actGraphErr)
+	}
+	if strings.Contains(actGraphOut, `"web-2"`) || !strings.Contains(actGraphOut, `"api-1"`) {
+		t.Fatalf("--robot-graph --recipe actionable --graph-root api-1 leaked blocked web-2:\n%s", actGraphOut)
+	}
+	if _, stderr, err := runCommandWithTimeout(t, projDir, exe, "--robot-graph", "--recipe", "actionable", "--graph-root", "web-2"); err == nil || !strings.Contains(stderr, "Root issue not found: web-2") {
+		t.Fatalf("expected --robot-graph --recipe actionable --graph-root web-2 to fail closed, err=%v stderr=%s", err, stderr)
+	}
+	allBlockedProj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(allBlockedProj, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	allBlockedJSONL := strings.Join([]string{
+		`{"id":"blk-prereq","title":"Deferred Prerequisite","status":"open","priority":1,"issue_type":"task","defer_until":"2099-01-01T00:00:00Z","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+		`{"id":"open-epic","title":"Open Epic","status":"open","priority":1,"issue_type":"epic","dependencies":[{"issue_id":"open-epic","depends_on_id":"blk-prereq","type":"blocks"}],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+		`{"id":"blk-child","title":"Blocked Child","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"blk-child","depends_on_id":"open-epic","type":"parent-child"},{"issue_id":"blk-child","depends_on_id":"open-epic","type":"blocks"}],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+		`{"id":"closed-leaf","title":"Closed Leaf","status":"closed","priority":2,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-02T00:00:00Z"}`,
+	}, "\n") + "\n"
+	_ = os.WriteFile(filepath.Join(allBlockedProj, ".beads", "issues.jsonl"), []byte(allBlockedJSONL), 0o644)
+	if _, stderr, err := runCommandWithTimeout(t, allBlockedProj, exe, "--robot-triage", "--recipe", "actionable", "--graph-root", "closed-leaf"); err == nil || !strings.Contains(stderr, "Root issue not found: closed-leaf") {
+		t.Fatalf("expected closed-leaf --graph-root under --recipe actionable to fail closed, err=%v stderr=%s", err, stderr)
+	}
+	epicAllBlkOut, epicAllBlkErr, err := runCommandWithTimeout(t, allBlockedProj, exe, "--robot-triage", "--recipe", "actionable", "--graph-root", "open-epic")
+	if err != nil {
+		t.Fatalf("expected open-epic with all blocked children under --recipe actionable --graph-root to succeed with 0 recs, err=%v stderr=%s", err, epicAllBlkErr)
+	}
+	if !strings.Contains(epicAllBlkOut, `"recommendations":[]`) && !strings.Contains(epicAllBlkOut, `"recommendations": []`) {
+		t.Fatalf("expected empty recommendations on all-blocked open-epic, got:\n%s", epicAllBlkOut)
 	}
 
 	// [R1-D12]: `--export-graph="" --recipe actionable` normalizes *exportGraph before recipeForScope so blocked web-2 is excluded from exported graph nodes (2 nodes, not 3).
@@ -9360,6 +9399,9 @@ esac
 	}
 	if !strings.Contains(string(noHooksMeta), `"has_hybrid_wasm": false`) && !strings.Contains(string(noHooksMeta), `"has_hybrid_wasm":false`) {
 		t.Fatalf("expected --no-hooks to suppress .bv/wasm/hybrid (has_hybrid_wasm=false), got:\n%s", string(noHooksMeta))
+	}
+	if _, err := os.Stat(filepath.Join(noHooksOut, "wasm")); !os.IsNotExist(err) {
+		t.Fatalf("expected --no-hooks output directory to contain no wasm/ subdir, err=%v", err)
 	}
 	// Explicit missing BV_HYBRID_WASM_DIR fails closed.
 	t.Setenv("BV_HYBRID_WASM_DIR", filepath.Join(wasmProj, "missing-wasm-dir"))

@@ -365,6 +365,17 @@ func (ctx RobotContext) VelocityIssues() []model.Issue {
 	return ctx.Issues
 }
 
+// GraphRootSourceIssues returns the topology slice used to validate and extract
+// --graph-root subgraphs in triage/next: when --recipe is active, PreRecipeIssues
+// retains open container epics even when all children are currently blocked
+// (len(CandidateIDs) == 0), while isGraphRootInActiveScope enforces domain/status rules.
+func (ctx RobotContext) GraphRootSourceIssues() []model.Issue {
+	if ctx.ActiveRecipe != nil && len(ctx.PreRecipeIssues) > 0 {
+		return ctx.PreRecipeIssues
+	}
+	return ctx.GraphIssues()
+}
+
 // GraphIssues returns the underlying topology slice for graph-metric, triage,
 // plan, alert, forecast, and what-if evaluation. When --recipe narrowed
 // CandidateIDs to a non-empty subset, PreRecipeIssues retains downstream
@@ -1501,16 +1512,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			exportIssues := ctx.Issues
 			if rootIssueID != "" {
 				sourceIssues := ctx.Issues
-				if ctx.Recipe != "" && ctx.RecipeUnblockIDs != nil {
-					fullGraph := ctx.GraphIssues()
-					sourceIssues = make([]model.Issue, 0, len(fullGraph))
-					for _, iss := range fullGraph {
-						if iss.ID == rootIssueID || ctx.RecipeUnblockIDs[iss.ID] {
-							sourceIssues = append(sourceIssues, iss)
-						}
-					}
-				}
-				if !isGraphRootInActiveScope(ctx, rootIssueID) || !containsIssueID(sourceIssues, rootIssueID) {
+				if (ctx.CandidateIDs != nil && !ctx.CandidateIDs[rootIssueID]) || !containsIssueID(sourceIssues, rootIssueID) {
 					fmt.Fprintf(ctx.StderrOrDefault(), "Root issue not found: %s\n", rootIssueID)
 					return newReportedRobotHandlerExit(1)
 				}
@@ -3471,11 +3473,13 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	graphIssues := ctx.GraphIssues()
 	velocityIssues := ctx.VelocityIssues()
 	if rootIssueID != "" {
-		subgraphIssues, found := extractScopedGraphRootIssues(ctx, graphIssues, rootIssueID)
+		rootSource := ctx.GraphRootSourceIssues()
+		subgraphIssues, found := extractScopedGraphRootIssues(ctx, rootSource, rootIssueID)
 		if !found {
 			fmt.Fprintf(ctx.StderrOrDefault(), "Root issue not found: %s\n", rootIssueID)
 			return newReportedRobotHandlerExit(1)
 		}
+		graphIssues = rootSource
 		velocityIssues = filterVelocityIssuesToSubgraph(velocityIssues, subgraphIssues, rootIssueID)
 		ctx.GraphRoot = rootIssueID
 		ctx.Issues = subgraphIssues
@@ -4031,11 +4035,13 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	graphIssues := ctx.GraphIssues()
 	velocityIssues := ctx.VelocityIssues()
 	if rootIssueID != "" {
-		subgraphIssues, found := extractScopedGraphRootIssues(ctx, graphIssues, rootIssueID)
+		rootSource := ctx.GraphRootSourceIssues()
+		subgraphIssues, found := extractScopedGraphRootIssues(ctx, rootSource, rootIssueID)
 		if !found {
 			fmt.Fprintf(ctx.StderrOrDefault(), "Root issue not found: %s\n", rootIssueID)
 			return newReportedRobotHandlerExit(1)
 		}
+		graphIssues = rootSource
 		velocityIssues = filterVelocityIssuesToSubgraph(velocityIssues, subgraphIssues, rootIssueID)
 		ctx.GraphRoot = rootIssueID
 		ctx.Issues = subgraphIssues
