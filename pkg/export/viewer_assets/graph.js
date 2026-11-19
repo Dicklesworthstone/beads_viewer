@@ -260,6 +260,7 @@ class GraphStore {
         this.dependencies = [];
         this.nodeMap = new Map();      // id -> issue
         this.nodeIndexMap = new Map(); // id -> index
+        this.nodeIdByIndex = [];       // index -> id
 
         // Computed metrics
         this.metrics = {
@@ -336,6 +337,7 @@ class GraphStore {
         this.dependencies = [];
         this.nodeMap.clear();
         this.nodeIndexMap.clear();
+        this.nodeIdByIndex = [];
         // A skipped or failed computation belongs to this load, not the
         // previous graph. In particular, empty graphs skip betweenness.
         for (const metric of Object.keys(this.metrics)) this.metrics[metric] = null;
@@ -1569,6 +1571,236 @@ function validateLayout(layout, issues, dependencies) {
         edge_count: layout.edge_count, centrality: snapshot, centralityValues: centrality };
 }
 
+function computeGraphFallbackCycles(issues, dependencies, maxCycles = 100) {
+    const activeIssues = (issues || []).filter(issue => issue && !isResolvedIssue(issue));
+    const sortedIds = [...new Set(activeIssues.map(i => i.id).filter(Boolean))].sort();
+    const n = sortedIds.length;
+    if (n === 0 || !Array.isArray(dependencies) || dependencies.length === 0) {
+        return { sccComponents: [], cycles: [], truncated: false };
+    }
+    const idToIdx = new Map(sortedIds.map((id, i) => [id, i]));
+    const adjSets = Array.from({ length: n }, () => new Set());
+    const selfLoopSet = new Set();
+    for (const d of dependencies) {
+        if (!isBlockingDependency(d)) continue;
+        const u = idToIdx.get(d.issue_id);
+        const v = idToIdx.get(d.depends_on_id);
+        if (u === undefined || v === undefined) continue;
+        adjSets[u].add(v);
+        if (u === v) selfLoopSet.add(u);
+    }
+    const adj = adjSets.map(s => [...s].sort((a, b) => a - b));
+
+    const disc = new Int32Array(n).fill(-1);
+    const low = new Int32Array(n);
+    const onStack = new Uint8Array(n);
+    const tarjanStack = [];
+    const callStack = [];
+    const nonTrivialSccs = [];
+    let timer = 0;
+
+    for (let root = 0; root < n; root++) {
+        if (disc[root] !== -1) continue;
+        disc[root] = low[root] = timer++;
+        onStack[root] = 1;
+        tarjanStack.push(root);
+        callStack.push({ v: root, ni: 0 });
+
+        while (callStack.length > 0) {
+            const frame = callStack[callStack.length - 1];
+            const v = frame.v;
+            const nbrs = adj[v];
+            if (frame.ni < nbrs.length) {
+                const w = nbrs[frame.ni++];
+                if (disc[w] === -1) {
+                    disc[w] = low[w] = timer++;
+                    onStack[w] = 1;
+                    tarjanStack.push(w);
+                    callStack.push({ v: w, ni: 0 });
+                } else if (onStack[w] && disc[w] < low[v]) {
+                    low[v] = disc[w];
+                }
+            } else {
+                callStack.pop();
+                if (callStack.length > 0) {
+                    const parent = callStack[callStack.length - 1].v;
+                    if (low[v] < low[parent]) low[parent] = low[v];
+                }
+                if (low[v] === disc[v]) {
+                    const comp = [];
+                    while (true) {
+                        const w = tarjanStack.pop();
+                        onStack[w] = 0;
+                        comp.push(w);
+                        if (w === v) break;
+                    }
+                    comp.sort((a, b) => a - b);
+                    if (comp.length > 1 || (comp.length === 1 && selfLoopSet.has(comp[0]))) {
+                        nonTrivialSccs.push(comp);
+                    }
+                }
+            }
+        }
+    }
+    nonTrivialSccs.sort((a, b) => a[0] - b[0]);
+
+    const cycles = [];
+    let truncated = false;
+    for (const comp of nonTrivialSccs) {
+        if (cycles.length >= maxCycles) {
+            truncated = true;
+            break;
+        }
+        if (comp.length === 1) {
+            cycles.push([sortedIds[comp[0]]]);
+            continue;
+        }
+        const compSet = new Set(comp);
+        if (comp.length <= 256) {
+            for (let sPos = 0; sPos < comp.length; sPos++) {
+                if (cycles.length >= maxCycles) {
+                    truncated = true;
+                    break;
+                }
+                const start = comp[sPos];
+                if (selfLoopSet.has(start)) {
+                    cycles.push([sortedIds[start]]);
+                    if (cycles.length >= maxCycles) {
+                        truncated = true;
+                        break;
+                    }
+                }
+                const blocked = new Set();
+                const blockMap = new Map();
+                const path = [];
+                const unblock = (u) => {
+                    blocked.delete(u);
+                    const waiting = blockMap.get(u);
+                    if (waiting) {
+                        blockMap.delete(u);
+                        for (const w of waiting) {
+                            if (blocked.has(w)) unblock(w);
+                        }
+                    }
+                };
+                const circuit = (v) => {
+                    let foundCycle = false;
+                    path.push(v);
+                    blocked.add(v);
+                    for (const w of adj[v]) {
+                        if (w < start || !compSet.has(w)) continue;
+                        if (w === start) {
+                            if (path.length > 1) {
+                                cycles.push(path.map(idx => sortedIds[idx]));
+                                foundCycle = true;
+                                if (cycles.length >= maxCycles) {
+                                    truncated = true;
+                                    path.pop();
+                                    return true;
+                                }
+                            }
+                        } else if (!blocked.has(w)) {
+                            if (circuit(w)) foundCycle = true;
+                            if (truncated) {
+                                path.pop();
+                                return true;
+                            }
+                        }
+                    }
+                    if (foundCycle) {
+                        unblock(v);
+                    } else {
+                        for (const w of adj[v]) {
+                            if (w < start || !compSet.has(w)) continue;
+                            let set = blockMap.get(w);
+                            if (!set) {
+                                set = new Set();
+                                blockMap.set(w, set);
+                            }
+                            set.add(v);
+                        }
+                    }
+                    path.pop();
+                    return foundCycle;
+                };
+                circuit(start);
+            }
+        } else {
+            const covered = new Set();
+            for (const start of comp) {
+                if (cycles.length >= maxCycles) {
+                    truncated = true;
+                    break;
+                }
+                if (covered.has(start)) continue;
+                const parent = new Map();
+                const queue = [];
+                let foundEnd = -1;
+                for (const nb of adj[start]) {
+                    if (!compSet.has(nb)) continue;
+                    if (nb === start) {
+                        foundEnd = start;
+                        break;
+                    }
+                    parent.set(nb, start);
+                    queue.push(nb);
+                }
+                let head = 0;
+                while (foundEnd === -1 && head < queue.length) {
+                    const cur = queue[head++];
+                    for (const nb of adj[cur]) {
+                        if (!compSet.has(nb)) continue;
+                        if (nb === start) {
+                            foundEnd = cur;
+                            break;
+                        }
+                        if (!parent.has(nb)) {
+                            parent.set(nb, cur);
+                            queue.push(nb);
+                        }
+                    }
+                }
+                if (foundEnd !== -1) {
+                    const rev = [foundEnd];
+                    let p = foundEnd;
+                    while (p !== start) {
+                        p = parent.get(p);
+                        rev.push(p);
+                    }
+                    rev.reverse();
+                    rev.forEach(idx => covered.add(idx));
+                    cycles.push(rev.map(idx => sortedIds[idx]));
+                }
+            }
+        }
+    }
+
+    return {
+        sccComponents: nonTrivialSccs.map(comp => comp.map(idx => sortedIds[idx])),
+        cycles,
+        truncated
+    };
+}
+
+function resolveCycleNodeId(idx, activeGraph) {
+    if (activeGraph && typeof activeGraph.nodeId === 'function') {
+        return activeGraph.nodeId(idx);
+    }
+    return store.nodeIdByIndex?.[idx];
+}
+
+function buildActiveBlockingEdgeKeys() {
+    const keys = new Set();
+    for (const d of (store.dependencies || [])) {
+        if (!isBlockingDependency(d)) continue;
+        const srcIssue = store.nodeMap.get(d.issue_id);
+        const tgtIssue = store.nodeMap.get(d.depends_on_id);
+        if ((srcIssue && isResolvedIssue(srcIssue)) || (tgtIssue && isResolvedIssue(tgtIssue))) continue;
+        keys.add(`${d.issue_id}-${d.depends_on_id}`);
+    }
+    return keys;
+}
+
 /**
  * Load data with optional starting coordinates and live force simulation.
  * @param {Array} issues - Issue objects from SQLite
@@ -1591,6 +1823,7 @@ export function loadData(issues, dependencies, layout = null) {
     issues.forEach((issue, idx) => {
         store.nodeMap.set(issue.id, issue);
         store.nodeIndexMap.set(issue.id, idx);
+        store.nodeIdByIndex.push(issue.id);
     });
 
     const precomputedMetrics = [];
@@ -1621,7 +1854,7 @@ export function loadData(issues, dependencies, layout = null) {
         const bwVec = new Float64Array(issues.length);
         const evVec = new Float64Array(issues.length);
         const cpVec = new Float64Array(issues.length);
-        const cycleIdxList = [];
+        const standaloneFlaggedIndices = [];
         issues.forEach((issue, i) => {
             const prVal = centrality?.pagerank?.[issue.id] ?? Number(issue.pagerank);
             prVec[i] = Number.isFinite(prVal) ? prVal : 0;
@@ -1634,18 +1867,27 @@ export function loadData(issues, dependencies, layout = null) {
             const cpVal = Number(issue.critical_path_depth ?? issue.critical_depth);
             cpVec[i] = Number.isFinite(cpVal) ? cpVal : 0;
             if (!isResolvedIssue(issue) && Boolean(issue.in_cycle)) {
-                cycleIdxList.push(i);
+                standaloneFlaggedIndices.push(i);
             }
         });
+        const fbCycles = computeGraphFallbackCycles(issues, dependencies, 100);
+        const indexCycles = fbCycles.cycles.length > 0
+            ? fbCycles.cycles
+                .map(cyc => cyc.map(id => store.nodeIndexMap.get(id)).filter(idx => idx !== undefined))
+                .filter(cyc => cyc.length > 0)
+            : standaloneFlaggedIndices.map(idx => [idx]);
+        const hasAnyCycles = indexCycles.length > 0;
         store.metrics.pagerank = prVec;
         store.metrics.betweenness = bwVec;
         store.metrics.eigenvector = evVec;
         store.metrics.criticalPath = cpVec;
-        store.metrics.hasCycles = cycleIdxList.length > 0;
+        store.metrics.hasCycles = hasAnyCycles;
         store.metrics.cycles = {
-            has_cycles: cycleIdxList.length > 0,
-            count: cycleIdxList.length > 0 ? 1 : 0,
-            cycles: cycleIdxList.length > 0 ? [cycleIdxList] : []
+            has_cycles: hasAnyCycles,
+            count: indexCycles.length,
+            truncated: Boolean(fbCycles.truncated),
+            scc_components: fbCycles.sccComponents,
+            cycles: indexCycles
         };
     }
 
@@ -3122,11 +3364,27 @@ export function highlightCycles() {
     const activeGraph = store.activeWasmGraph || store.wasmGraph;
     const cycleNodeIndices = new Set(store.metrics.cycles.cycles.flat());
     store.highlightedNodes = new Set(
-        [...cycleNodeIndices].map(idx => activeGraph?.nodeId(idx)).filter(Boolean)
+        [...cycleNodeIndices].map(idx => resolveCycleNodeId(idx, activeGraph)).filter(Boolean)
     );
     refreshGraph();
 
     dispatchEvent('cycleHighlight', { cycleCount: store.metrics.cycles.count });
+}
+
+export function getCycleInfo() {
+    const activeGraph = store.activeWasmGraph || store.wasmGraph;
+    const rawCycles = store.metrics.cycles?.cycles || [];
+    const cycles = rawCycles
+        .map(cycle => cycle.map(idx => resolveCycleNodeId(idx, activeGraph)).filter(Boolean))
+        .filter(cycle => cycle.length > 0);
+    const hasCycles = Boolean(store.metrics.hasCycles || cycles.length > 0);
+    const cycleCount = hasCycles ? Math.max(Number(store.metrics.cycles?.count) || 0, cycles.length) : 0;
+    return {
+        hasCycles,
+        cycleCount,
+        truncated: Boolean(store.metrics.cycles?.truncated),
+        cycles
+    };
 }
 
 // ============================================================================
@@ -3155,9 +3413,9 @@ export function initCycleNavigator() {
     }
 
     const activeGraph = store.activeWasmGraph || store.wasmGraph;
-    // Convert cycle indices to node IDs
+    // Convert cycle indices to node IDs (works in both WASM and fallback modes)
     cycleNavigatorState.cycles = store.metrics.cycles.cycles.map(cycle =>
-        cycle.map(idx => activeGraph?.nodeId(idx)).filter(Boolean)
+        cycle.map(idx => resolveCycleNodeId(idx, activeGraph)).filter(Boolean)
     ).filter(cycle => cycle.length > 0);
 
     cycleNavigatorState.currentIndex = 0;
@@ -3202,14 +3460,17 @@ export function highlightCycle(index, zoom = false) {
         cycleNavigatorState.highlightedCycleNodes.add(nodeId);
     });
 
-    // Highlight cycle edges (including wraparound edge)
+    // Highlight only real active blocking cycle edges (including wraparound edge)
+    const activeBlockingEdges = buildActiveBlockingEdgeKeys();
     cycleNavigatorState.highlightedCycleEdges.clear();
     for (let i = 0; i < cycle.length; i++) {
         const from = cycle[i];
         const to = cycle[(i + 1) % cycle.length];
         const edgeId = `${from}-${to}`;
-        store.highlightedLinks.add(edgeId);
-        cycleNavigatorState.highlightedCycleEdges.add(edgeId);
+        if (activeBlockingEdges.has(edgeId)) {
+            store.highlightedLinks.add(edgeId);
+            cycleNavigatorState.highlightedCycleEdges.add(edgeId);
+        }
     }
 
     // Mark nodes with cycle state for enhanced visual
