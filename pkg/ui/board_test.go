@@ -2476,3 +2476,68 @@ func TestBoardDetailScrollPreservationWithExpandedCardAnd24RowMultiDepBounds(t *
 		t.Fatalf("24-row multi-dependency expanded card clipped bottom border ╚ or scroll indicator ↕ 2/4:\n%s", heavyOut)
 	}
 }
+
+func TestBoardJumpFirstLastColumnAndSearchMatchCollapseExpandedCard(t *testing.T) {
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "OPEN-ALPHA", Title: "Alpha Open Match", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "PROG-ALPHA", Title: "Alpha Progress Match", Status: model.StatusInProgress, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "CLOSED-ZETA", Title: "Zeta Closed Card", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	}
+
+	b := ui.NewBoardModel(issues, createTheme())
+	b.SetReferenceTime(now)
+
+	// Planted negative control 1: JumpToFirstColumn when already at focusedCol==0 keeps current card expanded.
+	b.ToggleExpand()
+	if !b.HasExpandedCard() || b.GetExpandedID() != "OPEN-ALPHA" {
+		t.Fatalf("precondition: expected OPEN-ALPHA expanded, got %q", b.GetExpandedID())
+	}
+	b.JumpToFirstColumn()
+	if !b.HasExpandedCard() || b.GetExpandedID() != "OPEN-ALPHA" {
+		t.Fatalf("JumpToFirstColumn at col 0 unexpectedly collapsed OPEN-ALPHA")
+	}
+
+	// Positive [R2-B3]: JumpToLastColumn ('L') changes column and collapses hidden expanded card.
+	b.JumpToLastColumn()
+	if b.HasExpandedCard() {
+		t.Fatalf("JumpToLastColumn left hidden card %q expanded", b.GetExpandedID())
+	}
+
+	// Positive [R2-B3]: JumpToFirstColumn ('H') from last column changes column and collapses hidden expanded card.
+	b.ToggleExpand()
+	if !b.HasExpandedCard() || b.GetExpandedID() != "CLOSED-ZETA" {
+		t.Fatalf("precondition: expected CLOSED-ZETA expanded, got %q", b.GetExpandedID())
+	}
+	b.JumpToFirstColumn()
+	if b.HasExpandedCard() {
+		t.Fatalf("JumpToFirstColumn from last col left hidden card %q expanded", b.GetExpandedID())
+	}
+
+	// Planted negative control 2: '/' search whose first match IS the expanded card keeps it expanded,
+	// whereas NextMatch ('n') / PrevMatch ('N') to a different card collapses it!
+	b.ToggleExpand()
+	if !b.HasExpandedCard() || b.GetExpandedID() != "OPEN-ALPHA" {
+		t.Fatal("precondition: expected OPEN-ALPHA expanded before search")
+	}
+	b.StartSearch()
+	for _, ch := range "alpha" {
+		b.AppendSearchChar(ch)
+	}
+	b.FinishSearch()
+	if !b.HasExpandedCard() || b.GetExpandedID() != "OPEN-ALPHA" {
+		t.Fatalf("search landing on already-expanded OPEN-ALPHA unexpectedly collapsed it")
+	}
+	b.NextMatch()
+	if b.HasExpandedCard() {
+		t.Fatalf("NextMatch ('n') to PROG-ALPHA left %q expanded", b.GetExpandedID())
+	}
+	b.ToggleExpand()
+	if !b.HasExpandedCard() || b.GetExpandedID() != "PROG-ALPHA" {
+		t.Fatal("precondition: expected PROG-ALPHA expanded")
+	}
+	b.PrevMatch()
+	if b.HasExpandedCard() {
+		t.Fatalf("PrevMatch ('N') to OPEN-ALPHA left %q expanded", b.GetExpandedID())
+	}
+}

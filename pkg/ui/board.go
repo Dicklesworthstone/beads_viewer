@@ -943,7 +943,8 @@ func (b *BoardModel) JumpToColumn(colIdx int) {
 
 // JumpToFirstColumn jumps to the first non-empty column (H key)
 func (b *BoardModel) JumpToFirstColumn() {
-	if len(b.activeColIdx) > 0 {
+	if len(b.activeColIdx) > 0 && b.focusedCol != 0 {
+		b.CollapseExpanded()
 		b.focusedCol = 0
 	}
 }
@@ -951,7 +952,11 @@ func (b *BoardModel) JumpToFirstColumn() {
 // JumpToLastColumn jumps to the last non-empty column (L key)
 func (b *BoardModel) JumpToLastColumn() {
 	if len(b.activeColIdx) > 0 {
-		b.focusedCol = len(b.activeColIdx) - 1
+		lastIdx := len(b.activeColIdx) - 1
+		if b.focusedCol != lastIdx {
+			b.CollapseExpanded()
+			b.focusedCol = lastIdx
+		}
 	}
 }
 
@@ -985,6 +990,11 @@ func (b *BoardModel) CancelSearch() {
 	b.searchQuery = ""
 	b.searchMatches = nil
 	b.searchCursor = 0
+	if b.expandedCardID != "" {
+		if sel := b.SelectedIssue(); sel == nil || sel.ID != b.expandedCardID {
+			b.CollapseExpanded()
+		}
+	}
 }
 
 // ClearSearch exits search mode and clears any active search query/matches.
@@ -995,6 +1005,11 @@ func (b *BoardModel) ClearSearch() {
 // FinishSearch exits search mode but keeps results for n/N navigation
 func (b *BoardModel) FinishSearch() {
 	b.searchMode = false
+	if b.expandedCardID != "" {
+		if sel := b.SelectedIssue(); sel == nil || sel.ID != b.expandedCardID {
+			b.CollapseExpanded()
+		}
+	}
 }
 
 // SearchQuery returns the current search query
@@ -1067,6 +1082,9 @@ func (b *BoardModel) jumpToMatch(idx int) {
 	}
 	b.searchCursor = idx
 	match := b.searchMatches[idx]
+	if !b.searchMode && b.expandedCardID != "" && b.expandedCardID != match.issueID {
+		b.CollapseExpanded()
+	}
 	for i, activeCol := range b.activeColIdx {
 		if activeCol == match.col {
 			b.focusedCol = i
