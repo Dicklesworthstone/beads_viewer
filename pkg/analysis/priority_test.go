@@ -1302,11 +1302,81 @@ func TestCountTransitiveUnblocks_UnscopedParentPropagatesToScopedChildren(t *tes
 	if err != nil {
 		t.Fatalf("ComputeWhatIfDeltaFromStats(ROOT): %v", err)
 	}
-	// Positive observable: CHILD-1..5 + LEAF-6 = 6 scoped transitive unblocks (unscoped P and OUT-CHILD excluded!).
-	if delta.TransitiveUnblocks != 6 {
-		t.Fatalf("scoped TransitiveUnblocks = %d, want 6 (CHILD-1..5 + LEAF-6; delta=%+v)", delta.TransitiveUnblocks, delta)
+	// Positive observable: CHILD-1..5 + LEAF-6 = 6 scoped transitive unblocks (unscoped P and OUT-CHILD excluded!),
+	// and since DirectUnblocks=0 while TransitiveUnblocks=6, Explanation must describe downstream container unblocks!
+	if delta.DirectUnblocks != 0 || delta.TransitiveUnblocks != 6 {
+		t.Fatalf("scoped delta = %+v, want DirectUnblocks=0 TransitiveUnblocks=6", delta)
+	}
+	if delta.Explanation != "Unblocks 6 downstream issues through intermediate containers" {
+		t.Fatalf("scoped delta.Explanation = %q, want container cascade summary", delta.Explanation)
 	}
 
-	// Planted negative control: parked fixture reports 0 unblocks.
+	// Planted negative control 1: parked fixture reports 0 unblocks.
 	assertParkedDependentsStayWithheld(t, issues, "ROOT")
+
+	// Planted negative control 2 ([R1-A3]): out-of-scope DepBlocks bridge MUST NOT be simulated as completed!
+	// API-ROOT (in scope) <-DepBlocks- WEB-BRIDGE (out of scope) <-DepBlocks- API-LEAF (in scope) -> 0 transitive unblocks!
+	bridgeIssues := []model.Issue{
+		{ID: "API-ROOT", Title: "API root", Status: model.StatusOpen, Labels: []string{"api"}, Priority: 1},
+		{
+			ID: "WEB-BRIDGE", Title: "Out-of-scope bridge", Status: model.StatusOpen, Labels: []string{"web"}, Priority: 2,
+			Dependencies: []*model.Dependency{{IssueID: "WEB-BRIDGE", DependsOnID: "API-ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "API-LEAF", Title: "API leaf behind out-of-scope bridge", Status: model.StatusOpen, Labels: []string{"api"}, Priority: 2,
+			Dependencies: []*model.Dependency{{IssueID: "API-LEAF", DependsOnID: "WEB-BRIDGE", Type: model.DepBlocks}},
+		},
+	}
+	anBridge := analysis.NewAnalyzer(bridgeIssues)
+	apiScope := map[string]bool{"API-ROOT": true, "API-LEAF": true}
+	anBridge.SetReadinessScope(model.NewReadinessIndex(bridgeIssues), apiScope)
+	anBridge.SetUnblockScope(apiScope)
+	bridgeStats := anBridge.Analyze()
+	bridgeDelta, err := anBridge.ComputeWhatIfDeltaFromStats("API-ROOT", &bridgeStats)
+	if err != nil {
+		t.Fatalf("ComputeWhatIfDeltaFromStats(API-ROOT): %v", err)
+	}
+	if bridgeDelta.DirectUnblocks != 0 || bridgeDelta.TransitiveUnblocks != 0 || bridgeDelta.Explanation != "No immediate downstream impact" {
+		t.Fatalf("out-of-scope DepBlocks bridge WEB-BRIDGE illegally simulated as completed: %+v", bridgeDelta)
+	}
+}
+
+func TestWhatIfDelta_OneHopParentChildDirectTwoHopCascadeAndReadyEpic(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "ROOT", Title: "Root blocker", Status: model.StatusOpen, Priority: 1},
+		{
+			ID: "P", Title: "Blocked epic", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 1,
+			Dependencies: []*model.Dependency{{IssueID: "P", DependsOnID: "ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "CHILD", Title: "Epic child", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{{IssueID: "CHILD", DependsOnID: "P", Type: model.DepParentChild}},
+		},
+		{ID: "READY-EPIC", Title: "Already ready epic", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 2},
+		{
+			ID: "READY-CHILD", Title: "Already ready child", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{{IssueID: "READY-CHILD", DependsOnID: "READY-EPIC", Type: model.DepParentChild}},
+		},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+	stats := an.Analyze()
+
+	// 1. 1-hop blocked epic P: ComputeWhatIf("P") reports DirectUnblocks=1 (["CHILD"]), matching ComputeUnblocks("P").
+	pWhatIf := an.ComputeWhatIf("P", &stats)
+	if pWhatIf == nil || pWhatIf.Delta.DirectUnblocks != 1 || pWhatIf.Delta.TransitiveUnblocks != 1 || !reflect.DeepEqual(pWhatIf.Delta.UnblockedIssueIDs, []string{"CHILD"}) {
+		t.Fatalf("1-hop blocked epic P WhatIf = %+v, want DirectUnblocks=1 TransitiveUnblocks=1 UnblockedIssueIDs=[CHILD]", pWhatIf)
+	}
+
+	// 2. 2-hop ROOT: ComputeWhatIf("ROOT") reports DirectUnblocks=1 (["P"]) and TransitiveUnblocks=2 (P + CHILD).
+	rootWhatIf := an.ComputeWhatIf("ROOT", &stats)
+	if rootWhatIf == nil || rootWhatIf.Delta.DirectUnblocks != 1 || rootWhatIf.Delta.TransitiveUnblocks != 2 || !reflect.DeepEqual(rootWhatIf.Delta.UnblockedIssueIDs, []string{"P"}) {
+		t.Fatalf("2-hop ROOT WhatIf = %+v, want DirectUnblocks=1 TransitiveUnblocks=2 UnblockedIssueIDs=[P]", rootWhatIf)
+	}
+
+	// 3. Planted negative control: ready container epic READY-EPIC reports DirectUnblocks=0, TransitiveUnblocks=0.
+	readyWhatIf := an.ComputeWhatIf("READY-EPIC", &stats)
+	if readyWhatIf == nil || readyWhatIf.Delta.DirectUnblocks != 0 || readyWhatIf.Delta.TransitiveUnblocks != 0 || len(readyWhatIf.Delta.UnblockedIssueIDs) != 0 {
+		t.Fatalf("ready container READY-EPIC WhatIf = %+v, want 0 direct/transitive unblocks", readyWhatIf)
+	}
 }

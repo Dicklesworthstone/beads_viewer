@@ -314,10 +314,8 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 		// Compute urgency signal
 		urgencyNorm, urgencyExplanation := computeUrgency(&issue, now)
 
-		// Compute risk signals (bv-82) using canonical dependency order so floating-point
-		// variance reductions remain 0-ULP invariant under input dependency permutations.
-		issueForRisk := canonicalIssueForRisk(issue)
-		riskSignals := ComputeRiskSignalsWithReadiness(&issueForRisk, stats, a.issueMap, readiness, now, riskWeights)
+		// Compute risk signals (bv-82)
+		riskSignals := ComputeRiskSignalsWithReadiness(&issue, stats, a.issueMap, readiness, now, riskWeights)
 
 		// Compute weighted score with the analyzer's (possibly feedback-adjusted) weights
 		breakdown := ScoreBreakdown{
@@ -982,44 +980,11 @@ func (a *Analyzer) ComputeWhatIfDeltaFromStats(issueID string, stats *GraphStats
 	return delta, nil
 }
 
-func canonicalIssueForRisk(issue model.Issue) model.Issue {
-	if len(issue.Dependencies) < 2 {
-		return issue
-	}
-	sorted := true
-	for i := 1; i < len(issue.Dependencies); i++ {
-		if !dependencyLessForRisk(issue.Dependencies[i-1], issue.Dependencies[i]) &&
-			dependencyLessForRisk(issue.Dependencies[i], issue.Dependencies[i-1]) {
-			sorted = false
-			break
-		}
-	}
-	if sorted {
-		return issue
-	}
-	deps := make([]*model.Dependency, len(issue.Dependencies))
-	copy(deps, issue.Dependencies)
-	sort.Slice(deps, func(i, j int) bool {
-		return dependencyLessForRisk(deps[i], deps[j])
-	})
-	issue.Dependencies = deps
-	return issue
-}
-
-func dependencyLessForRisk(a, b *model.Dependency) bool {
-	if a == nil || b == nil {
-		return a == nil && b != nil
-	}
-	if a.DependsOnID != b.DependsOnID {
-		return a.DependsOnID < b.DependsOnID
-	}
-	return a.Type < b.Type
-}
-
-// computeDirectBlockingUnblocks finds direct hard-dependency (DepBlocks) graph
-// neighbors that transition to actionable when issueID completes. WhatIfDelta
-// distinguishes direct edge unblocks from hierarchy/chain cascades (counted in
-// TransitiveUnblocks via countTransitiveUnblocks).
+// computeDirectBlockingUnblocks finds immediate 1-hop dependents (direct
+// DepBlocks graph neighbors union immediate DepParentChild children of issueID)
+// that transition from non-ready to actionable when issueID completes. Multi-hop
+// cascades (e.g., 2-hop ROOT -> blocked parent -> child) are reflected in
+// TransitiveUnblocks via countTransitiveUnblocks.
 func (a *Analyzer) computeDirectBlockingUnblocks(issueID string) []string {
 	blockerNodeID, ok := a.idToNode[issueID]
 	if !ok {
@@ -1030,17 +995,29 @@ func (a *Analyzer) computeDirectBlockingUnblocks(issueID string) []string {
 		return nil
 	}
 
+	readiness := a.Readiness()
+	completed := map[string]bool{issueID: true}
+	seen := make(map[string]bool)
 	var unblocks []string
-	dependents := a.g.To(blockerNodeID)
-	for dependents.Next() {
-		dependentID := a.nodeToID[dependents.Node().ID()]
-		if dependentID == issueID {
-			continue
+
+	checkCandidate := func(candID string) {
+		if candID == "" || candID == issueID || seen[candID] {
+			return
 		}
-		if !a.isActionableAfterSingleCompletion(dependentID, "") && a.isActionableAfterSingleCompletion(dependentID, issueID) {
-			unblocks = append(unblocks, dependentID)
+		seen[candID] = true
+		if !readiness.Ready(candID, a.now) && a.isActionableAfterCompletions(candID, completed) {
+			unblocks = append(unblocks, candID)
 		}
 	}
+
+	dependents := a.g.To(blockerNodeID)
+	for dependents.Next() {
+		checkCandidate(a.nodeToID[dependents.Node().ID()])
+	}
+	for _, childID := range a.childrenByParent[issueID] {
+		checkCandidate(childID)
+	}
+
 	sort.Strings(unblocks)
 	return unblocks
 }
@@ -1136,17 +1113,16 @@ func (a *Analyzer) countTransitiveUnblocks(issueID string) int {
 			if _, candExists := a.issueMap[candidateID]; !candExists {
 				continue
 			}
-			// Existing ready work is not caused by this completion. Evaluate
-			// underlying readiness transitions independent of SetUnblockScope so an
-			// out-of-scope intermediate parent/node still propagates unlock state to
-			// in-scope descendants, while counting only in-scope unblock candidates.
+			// Existing ready work is not caused by this completion. Only candidates
+			// within SetUnblockScope may be counted and simulated as completed;
+			// directUnlockFrontier(curr) already includes DepParentChild descendants
+			// of unscoped parents in one step without simulating out-of-scope
+			// DepBlocks bridges as completed.
 			if readiness.Ready(candidateID, a.now) {
 				continue
 			}
-			if readiness.ReadyAfter(candidateID, a.now, simulatedClosed) {
-				if a.isActionableAfterCompletions(candidateID, simulatedClosed) {
-					count++
-				}
+			if a.isActionableAfterCompletions(candidateID, simulatedClosed) {
+				count++
 				simulatedClosed[candidateID] = true
 				queue = append(queue, candidateID)
 			}
@@ -1189,6 +1165,13 @@ func estimateDaysSaved(unblockedIDs []string, issueMap map[string]model.Issue) f
 // generateWhatIfExplanation creates a human-readable what-if summary
 func generateWhatIfExplanation(direct, transitive, blockedReduction int, daysSaved float64) string {
 	if direct == 0 {
+		if transitive > 0 {
+			noun := "issues"
+			if transitive == 1 {
+				noun = "issue"
+			}
+			return fmt.Sprintf("Unblocks %d downstream %s through intermediate containers", transitive, noun)
+		}
 		return "No immediate downstream impact"
 	}
 

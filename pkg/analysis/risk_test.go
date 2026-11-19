@@ -730,3 +730,75 @@ func TestGenerateRiskExplanation_ZeroToFourFactors(t *testing.T) {
 		})
 	}
 }
+
+func TestComputeRiskSignals_DependencyPermutationInvariance(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	stats := &GraphStats{
+		InDegree: map[string]int{"DEP-A": 1, "DEP-B": 5, "DEP-C": 5},
+	}
+	issues := map[string]model.Issue{
+		"DEP-A": {ID: "DEP-A", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now},
+		"DEP-B": {ID: "DEP-B", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now},
+		"DEP-C": {ID: "DEP-C", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now},
+	}
+	perms := [][3]string{
+		{"DEP-A", "DEP-B", "DEP-C"},
+		{"DEP-A", "DEP-C", "DEP-B"},
+		{"DEP-B", "DEP-A", "DEP-C"},
+		{"DEP-B", "DEP-C", "DEP-A"},
+		{"DEP-C", "DEP-A", "DEP-B"},
+		{"DEP-C", "DEP-B", "DEP-A"},
+	}
+
+	var ref RiskSignals
+	for idx, p := range perms {
+		iss := model.Issue{
+			ID:        "TARGET",
+			Status:    model.StatusOpen,
+			CreatedAt: now.Add(-5 * 24 * time.Hour),
+			UpdatedAt: now.Add(-2 * 24 * time.Hour),
+			Dependencies: []*model.Dependency{
+				{IssueID: "TARGET", DependsOnID: p[0], Type: model.DepBlocks},
+				{IssueID: "TARGET", DependsOnID: p[1], Type: model.DepBlocks},
+				{IssueID: "TARGET", DependsOnID: p[2], Type: model.DepBlocks},
+			},
+		}
+		got := ComputeRiskSignals(&iss, stats, issues, now)
+		// Verify caller's Dependencies slice was NOT mutated in place.
+		if iss.Dependencies[0].DependsOnID != p[0] || iss.Dependencies[1].DependsOnID != p[1] || iss.Dependencies[2].DependsOnID != p[2] {
+			t.Fatalf("ComputeRiskSignals mutated caller Dependencies order: got [%s,%s,%s], want %v",
+				iss.Dependencies[0].DependsOnID, iss.Dependencies[1].DependsOnID, iss.Dependencies[2].DependsOnID, p)
+		}
+		if got.FanVariance <= 0 {
+			t.Fatalf("expected positive FanVariance for degrees [1,5,5], got %v", got.FanVariance)
+		}
+		if idx == 0 {
+			ref = got
+		} else if got.FanVariance != ref.FanVariance || got.CompositeRisk != ref.CompositeRisk {
+			t.Fatalf("perm %v differed from %v: got=%+v ref=%+v", p, perms[0], got, ref)
+		}
+
+		allMap := map[string]model.Issue{
+			"DEP-A":  issues["DEP-A"],
+			"DEP-B":  issues["DEP-B"],
+			"DEP-C":  issues["DEP-C"],
+			"TARGET": iss,
+		}
+		allSigs := ComputeAllRiskSignals(allMap, stats, now)
+		if allSigs["TARGET"].FanVariance != ref.FanVariance || allSigs["TARGET"].CompositeRisk != ref.CompositeRisk {
+			t.Fatalf("ComputeAllRiskSignals perm %v differed: got=%+v ref=%+v", p, allSigs["TARGET"], ref)
+		}
+	}
+
+	// Planted negative control: uniform blocker degrees [5, 5, 5] produce FanVariance == 0.
+	uniform := model.Issue{
+		ID: "UNIFORM", Status: model.StatusOpen, CreatedAt: now, UpdatedAt: now,
+		Dependencies: []*model.Dependency{
+			{IssueID: "UNIFORM", DependsOnID: "DEP-B", Type: model.DepBlocks},
+			{IssueID: "UNIFORM", DependsOnID: "DEP-C", Type: model.DepBlocks},
+		},
+	}
+	if sig := ComputeRiskSignals(&uniform, stats, issues, now); sig.FanVariance != 0 {
+		t.Fatalf("uniform blocker degrees [5,5] must have FanVariance=0, got %v", sig.FanVariance)
+	}
+}

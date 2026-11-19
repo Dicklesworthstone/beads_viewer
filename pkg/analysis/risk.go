@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"math"
+	"sort"
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -83,6 +84,8 @@ func ComputeRiskSignalsWithReadiness(
 	if issue == nil {
 		return RiskSignals{}
 	}
+	canon := canonicalIssueForRisk(*issue)
+	issue = &canon
 	signals := RiskSignals{}
 
 	// 1. Fan variance - measure spread in dependency degrees
@@ -115,6 +118,40 @@ func ComputeRiskSignalsWithReadiness(
 }
 
 // computeFanVariance measures variance in blocker In-Degrees (upstream stability variance)
+func canonicalIssueForRisk(issue model.Issue) model.Issue {
+	if len(issue.Dependencies) < 2 {
+		return issue
+	}
+	sorted := true
+	for i := 1; i < len(issue.Dependencies); i++ {
+		if !dependencyLessForRisk(issue.Dependencies[i-1], issue.Dependencies[i]) &&
+			dependencyLessForRisk(issue.Dependencies[i], issue.Dependencies[i-1]) {
+			sorted = false
+			break
+		}
+	}
+	if sorted {
+		return issue
+	}
+	deps := make([]*model.Dependency, len(issue.Dependencies))
+	copy(deps, issue.Dependencies)
+	sort.Slice(deps, func(i, j int) bool {
+		return dependencyLessForRisk(deps[i], deps[j])
+	})
+	issue.Dependencies = deps
+	return issue
+}
+
+func dependencyLessForRisk(a, b *model.Dependency) bool {
+	if a == nil || b == nil {
+		return a == nil && b != nil
+	}
+	if a.DependsOnID != b.DependsOnID {
+		return a.DependsOnID < b.DependsOnID
+	}
+	return a.Type < b.Type
+}
+
 func computeFanVariance(issue *model.Issue, stats *GraphStats) float64 {
 	if issue == nil || stats == nil || len(stats.InDegree) == 0 || len(issue.Dependencies) < 2 {
 		return 0
