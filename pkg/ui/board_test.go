@@ -2361,3 +2361,121 @@ func TestBoardLightThemeMarkdownRendererAnd24RowExpandedCardVisibility(t *testin
 		t.Fatalf("24-row expanded CARD-3 with long description clipped timestamps or bottom border:\n%s", rendered24Long)
 	}
 }
+
+func TestBoardDetailScrollPreservationWithExpandedCardAnd24RowMultiDepBounds(t *testing.T) {
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	var longDescLines []string
+	for i := 1; i <= 35; i++ {
+		longDescLines = append(longDescLines, fmt.Sprintf("Paragraph %02d detail marker LINE_%02d.", i, i))
+	}
+	issues := []model.Issue{
+		{
+			ID:          "SCROLL-1",
+			Title:       "Scrollable Detail Card",
+			Description: strings.Join(longDescLines, "\n\n"),
+			Status:      model.StatusOpen,
+			Priority:    0,
+			IssueType:   model.TypeFeature,
+			CreatedAt:   now.Add(-4 * time.Hour),
+			UpdatedAt:   now.Add(-time.Hour),
+		},
+		{
+			ID:          "SCROLL-2",
+			Title:       "Second Card Top Marker",
+			Description: "TOP_OF_SECOND_CARD\n\n" + strings.Repeat("Extra paragraph.\n\n", 20),
+			Status:      model.StatusOpen,
+			Priority:    1,
+			IssueType:   model.TypeTask,
+			CreatedAt:   now.Add(-2 * time.Hour),
+			UpdatedAt:   now.Add(-30 * time.Minute),
+		},
+	}
+
+	// [R1-B4]: Expanding a card inline while scrolling the detail panel must never reset detail YOffset across View() calls.
+	b := ui.NewBoardModel(issues, createTheme())
+	b.SetReferenceTime(now)
+	b.SetSize(150, 26)
+	b.ToggleDetail()
+	b.ToggleExpand()
+	initialOut := ansi.Strip(b.View(150, 26))
+	if !strings.Contains(initialOut, "LINE_01") {
+		t.Fatalf("expected LINE_01 at initial detail scroll top:\n%s", initialOut)
+	}
+	b.DetailScrollDown(18)
+	scrolledOut1 := ansi.Strip(b.View(150, 26))
+	scrolledOut2 := ansi.Strip(b.View(150, 26))
+	if strings.Contains(scrolledOut1, "LINE_01") || strings.Contains(scrolledOut2, "LINE_01") {
+		t.Fatalf("detail panel scroll reset to top LINE_01 across View() while card was inline-expanded:\n%s", scrolledOut2)
+	}
+	if !strings.Contains(scrolledOut2, "LINE_1") && !strings.Contains(scrolledOut2, "LINE_2") {
+		t.Fatalf("expected lower detail lines after scrolling down 18 lines:\n%s", scrolledOut2)
+	}
+
+	// Planted negative control: navigating to SCROLL-2 auto-collapses SCROLL-1 and resets detail scroll to top.
+	b.MoveDown()
+	afterMove := ansi.Strip(b.View(150, 26))
+	if b.HasExpandedCard() {
+		t.Fatalf("expected MoveDown to auto-collapse expanded card")
+	}
+	if !strings.Contains(afterMove, "TOP_OF_SECOND_CARD") {
+		t.Fatalf("expected detail panel to reset to top of SCROLL-2 on selection change:\n%s", afterMove)
+	}
+
+	// [R1-B5]: MoveToBottom, MoveToTop, and JumpToColumn auto-collapse inline expansion.
+	b.ToggleExpand()
+	if !b.HasExpandedCard() {
+		t.Fatal("precondition: expected SCROLL-2 expanded")
+	}
+	b.MoveToTop()
+	if b.HasExpandedCard() {
+		t.Fatal("MoveToTop failed to auto-collapse expanded card")
+	}
+	b.ToggleExpand()
+	b.MoveToBottom()
+	if b.HasExpandedCard() {
+		t.Fatal("MoveToBottom failed to auto-collapse expanded card")
+	}
+	b.ToggleExpand()
+	b.JumpToColumn(1)
+	if b.HasExpandedCard() {
+		t.Fatal("JumpToColumn failed to auto-collapse expanded card")
+	}
+
+	// [R1-B5]: 24-row column with multi-dependency expanded card preserves bottom double-border ╚ AND scroll indicator ↕.
+	var multiIssues []model.Issue
+	var deps []*model.Dependency
+	for i := 1; i <= 6; i++ {
+		blkID := fmt.Sprintf("BLK-%d", i)
+		multiIssues = append(multiIssues, model.Issue{
+			ID: blkID, Title: fmt.Sprintf("Active Blocker %d", i), Status: model.StatusInProgress, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+		})
+		deps = append(deps, &model.Dependency{IssueID: "HEAVY-2", DependsOnID: blkID, Type: model.DepBlocks})
+	}
+	multiIssues = append(multiIssues,
+		model.Issue{ID: "HEAVY-1", Title: "Open Above", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		model.Issue{
+			ID: "HEAVY-2", Title: "Heavy Expanded Card With Many Dependencies",
+			Description:  "Line A\n\nLine B\n\nLine C\n\nLine D\n\nLine E",
+			Status:       model.StatusOpen,
+			Priority:     1,
+			IssueType:    model.TypeFeature,
+			Labels:       []string{"alpha", "beta", "gamma", "delta"},
+			Dependencies: deps,
+			CreatedAt:    now.Add(-5 * time.Hour),
+			UpdatedAt:    now.Add(-10 * time.Minute),
+		},
+		model.Issue{ID: "HEAVY-3", Title: "Open Below One", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		model.Issue{ID: "HEAVY-4", Title: "Open Below Two", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	)
+	bHeavy := ui.NewBoardModel(multiIssues, createTheme())
+	bHeavy.SetReferenceTime(now)
+	bHeavy.SetReadiness(model.NewReadinessIndex(multiIssues))
+	if !bHeavy.SelectIssueByID("HEAVY-2") {
+		t.Fatal("expected HEAVY-2 selectable")
+	}
+	bHeavy.ToggleExpand()
+	heavyOut := ansi.Strip(bHeavy.View(100, 23))
+	if !strings.Contains(heavyOut, "HEAVY-2") || !strings.Contains(heavyOut, "╚") || !strings.Contains(heavyOut, "↕ 2/4") {
+		t.Fatalf("24-row multi-dependency expanded card clipped bottom border ╚ or scroll indicator ↕ 2/4:\n%s", heavyOut)
+	}
+}
