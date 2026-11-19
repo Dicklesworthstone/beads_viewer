@@ -114,7 +114,7 @@ func (m CassSessionModal) visibleSlotCount() int {
 	if effHeight <= 0 {
 		effHeight = 40
 	}
-	slots := (effHeight - 10) / 8
+	slots := (effHeight - 12) / 8
 	if slots < 1 {
 		slots = 1
 	}
@@ -193,10 +193,15 @@ func (m CassSessionModal) View() string {
 	showCopied := m.copied && time.Since(m.copiedAt) <= 2*time.Second
 
 	// Modal container style
+	vertPad := 1
+	if m.height > 0 && m.height <= 25 {
+		vertPad = 0
+	}
+	innerWidth := max(16, modalWidth-4)
 	modalStyle := r.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Primary).
-		Padding(1, 2).
+		Padding(vertPad, 2).
 		Width(modalWidth)
 
 	// Header style
@@ -234,9 +239,10 @@ func (m CassSessionModal) View() string {
 	var b strings.Builder
 
 	// Header
-	b.WriteString(headerStyle.Render("📎 Related Coding Sessions"))
+	const headerTitle = "📎 Related Coding Sessions"
+	b.WriteString(headerStyle.Render(headerTitle))
 	b.WriteString("  ")
-	b.WriteString(beadIDStyle.Render(m.beadID))
+	b.WriteString(beadIDStyle.Render(truncateRunesHelper(m.beadID, max(8, innerWidth-28), "…")))
 	b.WriteString("\n\n")
 
 	// Sessions
@@ -278,7 +284,7 @@ func (m CassSessionModal) View() string {
 			}
 			timeStr := formatRelativeTimeAt(session.Timestamp, m.effectiveNow())
 
-			sessionInfo := fmt.Sprintf("%s • %s", agentStr, timeStr)
+			sessionInfo := truncateRunesHelper(fmt.Sprintf("%s • %s", agentStr, timeStr), max(8, innerWidth-len(numPrefix)), "…")
 			if i == m.selected {
 				b.WriteString(selectedSessionStyle.Render(sessionInfo))
 			} else {
@@ -286,8 +292,8 @@ func (m CassSessionModal) View() string {
 			}
 			b.WriteString("\n")
 
-			// Match reason
-			matchReason := m.formatMatchReason(session)
+			// Match reason (clamped to a single line within innerWidth)
+			matchReason := truncateRunesHelper(m.formatMatchReason(session), max(10, innerWidth-4), "…")
 			b.WriteString("    ")
 			b.WriteString(matchReasonStyle.Render(matchReason))
 			b.WriteString("\n")
@@ -298,7 +304,7 @@ func (m CassSessionModal) View() string {
 			b.WriteString("\n\n")
 		}
 
-		// Show count of off-screen sessions and CLI search command
+		// Show count of off-screen sessions and CLI search command (single line)
 		if len(m.sessions) > slots {
 			extra := len(m.sessions) - slots
 			scrollArrows := ""
@@ -315,6 +321,7 @@ func (m CassSessionModal) View() string {
 				moreText += "s"
 			}
 			moreText += fmt.Sprintf(" - run: %s)", m.searchCmd)
+			moreText = truncateRunesHelper(moreText, innerWidth, "…")
 			b.WriteString(matchReasonStyle.Render(moreText))
 			b.WriteString("\n\n")
 		}
@@ -325,6 +332,7 @@ func (m CassSessionModal) View() string {
 	if showCopied {
 		footerText = "[j/k] Navigate    ✓ Copied!              [V/Esc] Close"
 	}
+	footerText = truncateRunesHelper(footerText, innerWidth, "…")
 	b.WriteString(footerStyle.Render(footerText))
 
 	return modalStyle.Render(b.String())
@@ -463,6 +471,9 @@ func (m CassSessionModal) HasSessions() bool {
 func (m CassSessionModal) CenterModal(termWidth, termHeight int) string {
 	if termWidth > 0 {
 		m.termWidth = termWidth
+	}
+	if termHeight > 0 && (m.height <= 0 || m.height > termHeight) {
+		m.height = termHeight
 	}
 	modal := m.View()
 
