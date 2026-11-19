@@ -299,7 +299,7 @@ func (g *GraphModel) computeRankings() {
 
 	// Reuse precomputed ranks from analysis (computed in Phase 1/2).
 	g.rankPageRank = stats.PageRankRank()
-	g.rankBetweenness = stats.BetweennessRank()
+	g.rankBetweenness = stats.ActiveBetweennessRank()
 	g.rankEigenvector = stats.EigenvectorRank()
 	g.rankHubs = stats.HubsRank()
 	g.rankAuthorities = stats.AuthoritiesRank()

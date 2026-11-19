@@ -45,6 +45,10 @@ func (m *VelocityComparisonModel) SetData(issues []model.Issue) {
 
 // SetDataAt updates the view with computed velocity data anchored to reference time now.
 func (m *VelocityComparisonModel) SetDataAt(issues []model.Issue, now time.Time) {
+	selectedLabel := ""
+	if m.cursor >= 0 && m.cursor < len(m.data) {
+		selectedLabel = m.data[m.cursor].Label
+	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -75,8 +79,23 @@ func (m *VelocityComparisonModel) SetDataAt(issues []model.Issue, now time.Time)
 		m.scrollOffset = 0
 		return
 	}
+	if selectedLabel != "" {
+		for i := range m.data {
+			if m.data[i].Label == selectedLabel {
+				m.cursor = i
+				break
+			}
+		}
+	}
 	if m.cursor < 0 || m.cursor >= len(m.data) {
 		m.cursor = 0
+	}
+	maxScroll := max(0, len(m.data)-m.visibleRowCount())
+	if m.scrollOffset > maxScroll {
+		m.scrollOffset = maxScroll
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
 	}
 	m.ensureVisible()
 }

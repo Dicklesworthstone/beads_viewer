@@ -80,7 +80,7 @@ func (m *Model) renderSprintDashboard() string {
 	sb.WriteString("\n\n")
 
 	// Compute bead stats
-	scopedIssues := m.repoScopedIssues()
+	scopedIssues := m.candidateScopedIssues()
 	var totalBeads, closedBeads, openBeads, blockedBeads, inProgressBeads int
 	var sprintIssues []model.Issue
 	beadIDSet := make(map[string]bool)
@@ -369,7 +369,7 @@ func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 		if m.selectedSprint == nil {
 			return m
 		}
-		scoped := m.repoScopedIssues()
+		scoped := m.candidateScopedIssues()
 		scopedSet := make(map[string]bool, len(scoped))
 		for _, iss := range scoped {
 			scopedSet[iss.ID] = true

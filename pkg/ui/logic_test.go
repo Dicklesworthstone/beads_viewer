@@ -7787,3 +7787,485 @@ func TestTimeTravelDynamicHistoricalScopeAndWorkspaceRepoTargets(t *testing.T) {
 		}
 	})
 }
+
+func TestWave18ScopedActiveInsightsWorkspaceHistoryFooterSprintHistoryAndDebugViews(t *testing.T) {
+	refNow := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+
+	t.Run("1_scoped_active_insights_and_active_betweenness_rank_with_closed_filter_negative_control", func(t *testing.T) {
+		closedAt := refNow.Add(-48 * time.Hour)
+		// CLOSED-BRIDGE sits on 4 paths (CL-SRC1, CL-SRC2 -> CLOSED-BRIDGE -> CL-DST1, CL-DST2) so it dominates raw betweenness,
+		// while OPEN-BRIDGE sits on active path OPEN-SRC -> OPEN-BRIDGE -> OPEN-DST.
+		issues := []model.Issue{
+			{ID: "CL-DST1", Title: "Closed dst 1", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, ClosedAt: &closedAt, CreatedAt: refNow.Add(-10 * 24 * time.Hour), UpdatedAt: closedAt},
+			{ID: "CL-DST2", Title: "Closed dst 2", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, ClosedAt: &closedAt, CreatedAt: refNow.Add(-10 * 24 * time.Hour), UpdatedAt: closedAt},
+			{
+				ID: "CLOSED-BRIDGE", Title: "Historical closed bottleneck", Status: model.StatusClosed, Priority: 0, IssueType: model.TypeTask, ClosedAt: &closedAt,
+				CreatedAt: refNow.Add(-9 * 24 * time.Hour), UpdatedAt: closedAt,
+				Dependencies: []*model.Dependency{
+					{IssueID: "CLOSED-BRIDGE", DependsOnID: "CL-DST1", Type: model.DepBlocks},
+					{IssueID: "CLOSED-BRIDGE", DependsOnID: "CL-DST2", Type: model.DepBlocks},
+				},
+			},
+			{
+				ID: "CL-SRC1", Title: "Closed src 1", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, ClosedAt: &closedAt,
+				CreatedAt: refNow.Add(-8 * 24 * time.Hour), UpdatedAt: closedAt,
+				Dependencies: []*model.Dependency{{IssueID: "CL-SRC1", DependsOnID: "CLOSED-BRIDGE", Type: model.DepBlocks}},
+			},
+			{
+				ID: "CL-SRC2", Title: "Closed src 2", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, ClosedAt: &closedAt,
+				CreatedAt: refNow.Add(-8 * 24 * time.Hour), UpdatedAt: closedAt,
+				Dependencies: []*model.Dependency{{IssueID: "CL-SRC2", DependsOnID: "CLOSED-BRIDGE", Type: model.DepBlocks}},
+			},
+			{ID: "OPEN-DST", Title: "Active open foundation", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow.Add(-4 * 24 * time.Hour), UpdatedAt: refNow.Add(-time.Hour)},
+			{
+				ID: "OPEN-BRIDGE", Title: "Active open bridge", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+				CreatedAt: refNow.Add(-3 * 24 * time.Hour), UpdatedAt: refNow.Add(-time.Hour),
+				Dependencies: []*model.Dependency{{IssueID: "OPEN-BRIDGE", DependsOnID: "OPEN-DST", Type: model.DepBlocks}},
+			},
+			{
+				ID: "OPEN-SRC", Title: "Active open leaf", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+				CreatedAt: refNow.Add(-2 * 24 * time.Hour), UpdatedAt: refNow.Add(-time.Hour),
+				Dependencies: []*model.Dependency{{IssueID: "OPEN-SRC", DependsOnID: "OPEN-BRIDGE", Type: model.DepBlocks}},
+			},
+		}
+
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		m.rebuildInsightsPanel()
+
+		hasInsightID := func(items []analysis.InsightItem, id string) bool {
+			for _, it := range items {
+				if it.ID == id {
+					return true
+				}
+			}
+			return false
+		}
+
+		ins := m.insightsPanel.insights
+		if hasInsightID(ins.Bottlenecks, "CLOSED-BRIDGE") || hasInsightID(ins.Keystones, "CLOSED-BRIDGE") ||
+			hasInsightID(ins.Influencers, "CLOSED-BRIDGE") || hasInsightID(ins.Hubs, "CLOSED-BRIDGE") ||
+			hasInsightID(ins.Authorities, "CLOSED-BRIDGE") || hasInsightID(ins.Cores, "CLOSED-BRIDGE") {
+			t.Fatalf("default TUI Insights leaked closed historical bead CLOSED-BRIDGE: %+v", ins)
+		}
+		if !hasInsightID(ins.Bottlenecks, "OPEN-BRIDGE") {
+			t.Fatalf("expected active OPEN-BRIDGE in Bottlenecks, got %+v", ins.Bottlenecks)
+		}
+
+		// Verify GraphModel and SnapshotBuilder use ActiveBetweennessRank (OPEN-BRIDGE ranks #1, NOT CLOSED-BRIDGE).
+		m.graphView.SetIssues(m.issues, &ins)
+		if gotRank := m.graphView.rankBetweenness["OPEN-BRIDGE"]; gotRank != 1 {
+			t.Fatalf("expected GraphModel rankBetweenness[OPEN-BRIDGE]=1 via ActiveBetweennessRank, got %d (map=%v)", gotRank, m.graphView.rankBetweenness)
+		}
+		sb := NewSnapshotBuilder(copyIssues(issues))
+		sb.analyzer.SetNow(refNow)
+		snap := sb.Build()
+		snap.Analysis.WaitForPhase2()
+		snap.GetGraphLayout().UpdatePhase2Ranks(snap.Analysis)
+		if snap.GetGraphLayout().RankBetweenness["OPEN-BRIDGE"] != 1 {
+			t.Fatalf("expected Snapshot GraphLayout RankBetweenness[OPEN-BRIDGE]=1, got %v", snap.GetGraphLayout().RankBetweenness)
+		}
+		if hasInsightID(snap.GetInsights().Cores, "CLOSED-BRIDGE") {
+			t.Fatalf("SnapshotBuilder PrecomputeInsights leaked CLOSED-BRIDGE: %+v", snap.GetInsights().Cores)
+		}
+
+		// Planted negative control: m.currentFilter == "closed" explicitly includes closed issues in Insights.
+		m.currentFilter = "closed"
+		m.applyFilter()
+		m.rebuildInsightsPanel()
+		closedIns := m.insightsPanel.insights
+		if !hasInsightID(closedIns.Bottlenecks, "CLOSED-BRIDGE") {
+			t.Fatalf("negative control failed: expected m.currentFilter==\"closed\" to include CLOSED-BRIDGE in Bottlenecks, got %+v", closedIns.Bottlenecks)
+		}
+	})
+
+	t.Run("2_workspace_multi_repo_history_detail_commits_repo_filter_and_commit_url", func(t *testing.T) {
+		if _, err := exec.LookPath("git"); err != nil {
+			t.Skip("git not installed")
+		}
+		wsRoot := t.TempDir() // non-git parent directory (polyrepo workspace)
+		repoAPI := filepath.Join(wsRoot, "api")
+		repoWeb := filepath.Join(wsRoot, "web")
+		for _, d := range []string{repoAPI, repoWeb} {
+			if err := os.MkdirAll(filepath.Join(d, ".beads"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		gitRun := func(dir string, args ...string) string {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = dir
+			cmd.Env = append(loader.SanitizedGitEnv(),
+				"GIT_AUTHOR_DATE=2026-08-10T10:00:00Z",
+				"GIT_COMMITTER_DATE=2026-08-10T10:00:00Z",
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, out)
+			}
+			return strings.TrimSpace(string(out))
+		}
+
+		gitRun(repoAPI, "init")
+		gitRun(repoAPI, "config", "user.email", "dev@acme.test")
+		gitRun(repoAPI, "config", "user.name", "Acme Dev")
+		gitRun(repoAPI, "remote", "add", "origin", "https://github.com/acme/api-service.git")
+		if err := os.WriteFile(filepath.Join(repoAPI, ".beads", "issues.jsonl"), []byte(`{"id":"bv-101","title":"API auth handler","status":"in_progress","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(repoAPI, "pkg"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repoAPI, "pkg", "auth.go"), []byte("package pkg\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(repoAPI, "add", ".beads/issues.jsonl", "pkg/auth.go")
+		gitRun(repoAPI, "commit", "-m", "feat(bv-101): add auth handler")
+		apiSHA := gitRun(repoAPI, "rev-parse", "HEAD")
+
+		gitRun(repoWeb, "init")
+		gitRun(repoWeb, "config", "user.email", "dev@acme.test")
+		gitRun(repoWeb, "config", "user.name", "Acme Dev")
+		gitRun(repoWeb, "remote", "add", "origin", "git@github.com:acme/web-app.git")
+		if err := os.WriteFile(filepath.Join(repoWeb, ".beads", "issues.jsonl"), []byte(`{"id":"bv-202","title":"Web button layout","status":"in_progress","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(repoWeb, "src"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repoWeb, "src", "btn.tsx"), []byte("export const Btn = () => null;\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitRun(repoWeb, "add", ".beads/issues.jsonl", "src/btn.tsx")
+		gitRun(repoWeb, "commit", "-m", "fix(web-bv-202): button layout")
+		webSHA := gitRun(repoWeb, "rev-parse", "HEAD")
+
+		wsIssues := []model.Issue{
+			{
+				ID: "api-bv-101", Title: "API auth handler", Status: model.StatusInProgress, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api",
+				Origin: &model.IssueOrigin{LocalID: "bv-101", WorkingDirectory: repoAPI, TrackerDirectory: filepath.Join(repoAPI, ".beads")},
+			},
+			{
+				ID: "web-bv-202", Title: "Web button layout", Status: model.StatusInProgress, Priority: 1, IssueType: model.TypeTask, SourceRepo: "web",
+				Origin: &model.IssueOrigin{LocalID: "bv-202", WorkingDirectory: repoWeb, TrackerDirectory: filepath.Join(repoWeb, ".beads")},
+			},
+		}
+		mWS := NewModel(copyIssues(wsIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mWS.Stop)
+		mWS.analysis.WaitForPhase2()
+		mWS.SetWorkDir(wsRoot) // non-git root!
+		mWS.EnableWorkspaceMode(WorkspaceInfo{
+			Enabled:      true,
+			RepoCount:    2,
+			TotalIssues:  2,
+			RepoPrefixes: []string{"api-", "web-"},
+			Repos: []WorkspaceRepoTarget{
+				{Name: "api", Path: repoAPI, BeadsDir: filepath.Join(repoAPI, ".beads"), Prefix: "api-"},
+				{Name: "web", Path: repoWeb, BeadsDir: filepath.Join(repoWeb, ".beads"), Prefix: "web-"},
+			},
+		})
+
+		cmd := mWS.startHistoryLoad()
+		if cmd == nil {
+			t.Fatal("expected non-nil workspace startHistoryLoad command")
+		}
+		u, _ := mWS.Update(cmd())
+		mWS = u.(*Model)
+		if mWS.historyLoadFailed || !mWS.historyReportIsCurrent() {
+			t.Fatalf("workspace history load failed: status=%q", mWS.statusMsg)
+		}
+
+		apiHist := mWS.historyView.GetHistoryForBead("api-bv-101")
+		webHist := mWS.historyView.GetHistoryForBead("web-bv-202")
+		if apiHist == nil || len(apiHist.Commits) == 0 || apiHist.Commits[0].SHA != apiSHA {
+			t.Fatalf("expected correlated commit %s on api-bv-101, got %+v", apiSHA, apiHist)
+		}
+		if webHist == nil || len(webHist.Commits) == 0 || webHist.Commits[0].SHA != webSHA {
+			t.Fatalf("expected correlated commit %s on web-bv-202, got %+v", webSHA, webHist)
+		}
+		foundAPIPrefixedFile := false
+		for _, fc := range apiHist.Commits[0].Files {
+			if fc.Path == "api/pkg/auth.go" {
+				foundAPIPrefixedFile = true
+			}
+		}
+		foundWebPrefixedFile := false
+		for _, fc := range webHist.Commits[0].Files {
+			if fc.Path == "web/src/btn.tsx" {
+				foundWebPrefixedFile = true
+			}
+		}
+		if !foundAPIPrefixedFile || !foundWebPrefixedFile {
+			t.Fatalf("expected repo-prefixed FileChange paths, got api=%+v web=%+v", apiHist.Commits[0].Files, webHist.Commits[0].Files)
+		}
+
+		// Detail-pane commit markdown renders correlated commits for workspace-prefixed IDs.
+		detailMD := mWS.renderBeadHistoryMD("api-bv-101")
+		if !strings.Contains(detailMD, "Related Commits (1):") {
+			t.Fatalf("expected detail-pane Related Commits for api-bv-101, got:\n%s", detailMD)
+		}
+
+		// getCommitURL resolves member repo origin URLs even in History Git Mode ('v') without relying on wsRoot/.git.
+		mWS.isHistoryView = true
+		mWS.focused = focusHistory
+		mWS.historyView.ToggleViewMode()
+		if gotAPIURL := mWS.getCommitURL(apiSHA); gotAPIURL != "https://github.com/acme/api-service/commit/"+apiSHA {
+			t.Fatalf("getCommitURL(apiSHA) = %q, want https://github.com/acme/api-service/commit/%s", gotAPIURL, apiSHA)
+		}
+		if gotWebURL := mWS.getCommitURL(webSHA[:8]); gotWebURL != "https://github.com/acme/web-app/commit/"+webSHA[:8] {
+			t.Fatalf("getCommitURL(webShortSHA) = %q, want https://github.com/acme/web-app/commit/%s", gotWebURL, webSHA[:8])
+		}
+
+		// Active repo filter ('w') scopes workspace HistoryView to activeRepos={"api": true}.
+		mWS.activeRepos = map[string]bool{"api": true}
+		mWS.syncSecondaryViewsForRepoScope(focusHistory)
+		if mWS.historyView.GetHistoryForBead("api-bv-101") == nil || mWS.historyView.GetHistoryForBead("web-bv-202") != nil {
+			t.Fatal("expected activeRepos={api} to retain api-bv-101 and filter out web-bv-202 in historyView")
+		}
+		// Planted negative control: clearing activeRepos restores web-bv-202.
+		mWS.activeRepos = nil
+		mWS.syncSecondaryViewsForRepoScope(focusHistory)
+		if mWS.historyView.GetHistoryForBead("web-bv-202") == nil {
+			t.Fatal("negative control failed: clearing activeRepos did not restore web-bv-202 in historyView")
+		}
+	})
+
+	t.Run("3_filtered_count_split_footers_sprint_scoping_wheel_history_timeline_and_label_cursors", func(t *testing.T) {
+		closedAt := refNow.Add(-24 * time.Hour)
+		issues := []model.Issue{
+			{ID: "SP-CAND", Title: "Alpha Candidate", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"backend"}, CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow.Add(-time.Hour)},
+			{ID: "SP-CAND-2", Title: "Beta Candidate", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, Labels: []string{"backend"}, ClosedAt: &closedAt, CreatedAt: refNow.Add(-72 * time.Hour), UpdatedAt: closedAt},
+			{ID: "SP-CTX", Title: "Gamma Context NonCandidate", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, Labels: []string{"infra"}, CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow.Add(-time.Hour)},
+		}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(issues),
+			CandidateIDs: map[string]bool{"SP-CAND": true, "SP-CAND-2": true},
+			LabelFilter:  "backend",
+			ReferenceNow: refNow,
+		})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		u, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+		m = u.(*Model)
+
+		// Help, ShortcutsSidebar, & GetKeyBindingDocs parity for Tree o/X/Z + b/m & Sprint Enter jump.
+		helpBodyLines, _ := m.buildHelpBodyLines()
+		helpBody := strings.Join(helpBodyLines, "\n")
+		if !strings.Contains(helpBody, "o/X/Z") || !strings.Contains(helpBody, "b/m") {
+			t.Fatalf("? Help missing Tree o/X/Z or b/m:\n%s", helpBody)
+		}
+		sb := NewShortcutsSidebar(m.theme)
+		sb.SetSize(34, 40)
+		sb.SetContext("tree")
+		treeSB := ansi.Strip(sb.View())
+		if !strings.Contains(treeSB, "o/X/Z") || !strings.Contains(treeSB, "b/m") {
+			t.Fatalf("Tree ShortcutsSidebar missing o/X/Z or b/m:\n%s", treeSB)
+		}
+		sb.SetContext("sprint")
+		sprintSB := ansi.Strip(sb.View())
+		if !strings.Contains(sprintSB, "Enter") {
+			t.Fatalf("Sprint ShortcutsSidebar missing Enter jump:\n%s", sprintSB)
+		}
+
+		// '/' filtered displayedIssueCount(): unfiltered has 3 items in m.issues, filtering "Alpha" leaves 1 visible item.
+		if unfilteredCount := m.displayedIssueCount(); unfilteredCount != 3 {
+			t.Fatalf("precondition: expected unfiltered displayedIssueCount=3, got %d", unfilteredCount)
+		}
+		m.list.SetFilterText("Alpha")
+		if filteredCount := m.displayedIssueCount(); filteredCount != 1 {
+			t.Fatalf("expected '/' filtered displayedIssueCount=1, got %d (state=%v)", filteredCount, m.list.FilterState())
+		}
+		m.list.ResetFilter()
+
+		// Split-view secondary-view footers must NOT fall through to generic split-view hints ("tab focus").
+		if !m.isSplitView {
+			t.Fatal("precondition: expected isSplitView=true at width 140")
+		}
+		m.focused = focusLabelDashboard
+		lblFooter := ansi.Strip(m.renderFooter())
+		if !strings.Contains(lblFooter, "h health") || !strings.Contains(lblFooter, "d drill") || !strings.Contains(lblFooter, "v velocity") || strings.Contains(lblFooter, "tab focus") {
+			t.Fatalf("focusLabelDashboard split-view footer wrong: %q", lblFooter)
+		}
+		m.focused = focusVelocityComparison
+		velFooter := ansi.Strip(m.renderFooter())
+		if !strings.Contains(velFooter, "[/esc back") || strings.Contains(velFooter, "tab focus") {
+			t.Fatalf("focusVelocityComparison split-view footer wrong: %q", velFooter)
+		}
+		m.focused = focusAttention
+		attFooter := ansi.Strip(m.renderFooter())
+		if !strings.Contains(attFooter, "1-9 filter label") || !strings.Contains(attFooter, "]/esc close") || strings.Contains(attFooter, "tab focus") {
+			t.Fatalf("focusAttention split-view footer wrong: %q", attFooter)
+		}
+		m.isSprintView = true
+		m.focused = focusSprint
+		spFooter := ansi.Strip(m.renderFooter())
+		if !strings.Contains(spFooter, "⏎ jump") {
+			t.Fatalf("focusSprint footer missing '⏎ jump': %q", spFooter)
+		}
+		m.isSprintView = false
+		m.focused = focusList
+
+		// Sprint candidate scoping + mouse wheel stepping: SP-CTX is NOT in CandidateIDs, so sprint counts only SP-CAND & SP-CAND-2 (1/2 = 50%, NOT 1/3 = 33%),
+		// and Enter jumps to SP-CAND (skipping first BeadID SP-CTX!).
+		m.SetSprints([]model.Sprint{
+			{ID: "sp-1", Name: "Sprint Alpha", StartDate: refNow.Add(-5 * 24 * time.Hour), EndDate: refNow.Add(5 * 24 * time.Hour), BeadIDs: []string{"SP-CTX", "SP-CAND", "SP-CAND-2"}},
+			{ID: "sp-2", Name: "Sprint Beta", StartDate: refNow.Add(6 * 24 * time.Hour), EndDate: refNow.Add(15 * 24 * time.Hour), BeadIDs: []string{"SP-CAND"}},
+		})
+		m.isSprintView = true
+		m.focused = focusSprint
+		spDash := ansi.Strip(m.renderSprintDashboard())
+		if !strings.Contains(spDash, "1/2 (50%)") || strings.Contains(spDash, "1/3") || strings.Contains(spDash, "2/3") {
+			t.Fatalf("Sprint dashboard leaked non-candidate SP-CTX into bead totals:\n%s", spDash)
+		}
+		u, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+		m = u.(*Model)
+		if m.selectedSprint == nil || m.selectedSprint.ID != "sp-2" || !strings.Contains(ansi.Strip(m.sprintViewText), "Sprint Beta") {
+			t.Fatalf("MouseButtonWheelDown did not advance to sp-2: selected=%+v", m.selectedSprint)
+		}
+		u, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp, Action: tea.MouseActionPress})
+		m = u.(*Model)
+		if m.selectedSprint == nil || m.selectedSprint.ID != "sp-1" {
+			t.Fatalf("MouseButtonWheelUp did not step back to sp-1: selected=%+v", m.selectedSprint)
+		}
+		// Enter jumps to SP-CAND (skipping non-candidate SP-CTX).
+		u, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		m = u.(*Model)
+		if sel := m.selectedIssueForAction(); sel == nil || sel.ID != "SP-CAND" {
+			t.Fatalf("Sprint Enter jumped to %+v, want SP-CAND (skipping non-candidate SP-CTX)", sel)
+		}
+
+		// HistoryModel: SetCassLookup populates buildTimeline() sessions without SetSessionsForBead,
+		// and renderFilterLine() compares against non-empty-commit histories.
+		rep := &correlation.HistoryReport{
+			GeneratedAt: refNow,
+			Histories: map[string]correlation.BeadHistory{
+				"SP-CAND": {
+					BeadID:  "SP-CAND",
+					Title:   "Alpha Candidate",
+					Status:  "open",
+					Commits: []correlation.CorrelatedCommit{{SHA: "abcdef123456", ShortSHA: "abcdef1", Message: "feat: alpha", Timestamp: refNow.Add(-2 * time.Hour), Confidence: 0.95}},
+				},
+				"EMPTY-1": {BeadID: "EMPTY-1", Title: "No commits 1", Status: "open"},
+				"EMPTY-2": {BeadID: "EMPTY-2", Title: "No commits 2", Status: "open"},
+			},
+			CommitIndex: correlation.CommitIndex{"abcdef123456": {"SP-CAND"}},
+		}
+		hm := NewHistoryModel(rep, m.theme)
+		hm.SetSize(120, 32)
+		hm.SetCassLookup(func(beadID string) []cass.ScoredResult {
+			if beadID == "SP-CAND" {
+				return []cass.ScoredResult{{SearchResult: cass.SearchResult{Agent: "codex", Title: "Lookup Session Proof", Timestamp: refNow.Add(-time.Hour)}, FinalScore: 0.9}}
+			}
+			return nil
+		})
+		entries := hm.buildTimeline(rep.Histories["SP-CAND"])
+		foundSessionEntry := false
+		for _, e := range entries {
+			if e.EntryType == timelineEntrySession && strings.Contains(e.Detail, "Lookup Session Proof") {
+				foundSessionEntry = true
+			}
+		}
+		if !foundSessionEntry {
+			t.Fatalf("buildTimeline did not include session from SetCassLookup: %+v", entries)
+		}
+		unfilteredLine := ansi.Strip(hm.renderFilterLine())
+		if !strings.Contains(unfilteredLine, "Showing all 1 beads with commits") {
+			t.Fatalf("expected unfiltered renderFilterLine 'Showing all 1 beads with commits', got %q", unfilteredLine)
+		}
+		hm.SetAuthorFilter("nonexistent-author")
+		filteredLine := ansi.Strip(hm.renderFilterLine())
+		if !strings.Contains(filteredLine, "Showing 0/1 beads with commits") {
+			t.Fatalf("expected filtered renderFilterLine 'Showing 0/1 beads with commits', got %q", filteredLine)
+		}
+
+		// Live-reload label cursor preservation in LabelDashboardModel, AttentionModel, and VelocityComparisonModel.
+		ld := NewLabelDashboardModel(m.theme)
+		ld.SetSize(100, 20)
+		ld.SetData([]analysis.LabelHealth{
+			{Label: "alpha", HealthLevel: analysis.HealthLevelWarning, Blocked: 2, Health: 60},
+			{Label: "zeta", HealthLevel: analysis.HealthLevelHealthy, Blocked: 0, Health: 95},
+		})
+		ld.MoveDown() // select "zeta" (index 1)
+		if ld.SelectedLabel() != "zeta" {
+			t.Fatalf("precondition: expected LabelDashboard SelectedLabel=zeta, got %q", ld.SelectedLabel())
+		}
+		// Refresh where "zeta" becomes critical (sorts to index 0) and "beta" is inserted: cursor must track "zeta"!
+		ld.SetData([]analysis.LabelHealth{
+			{Label: "alpha", HealthLevel: analysis.HealthLevelHealthy, Blocked: 0, Health: 95},
+			{Label: "beta", HealthLevel: analysis.HealthLevelWarning, Blocked: 1, Health: 70},
+			{Label: "zeta", HealthLevel: analysis.HealthLevelCritical, Blocked: 5, Health: 20},
+		})
+		if ld.SelectedLabel() != "zeta" || ld.cursor != 0 {
+			t.Fatalf("LabelDashboard SetData lost selected label 'zeta': got %q at cursor %d", ld.SelectedLabel(), ld.cursor)
+		}
+
+		att := NewAttentionModel(m.theme)
+		att.SetSize(100, 20)
+		att.SetData(analysis.LabelAttentionResult{Labels: []analysis.LabelAttentionScore{
+			{Label: "first", AttentionScore: 9.0},
+			{Label: "target-lbl", AttentionScore: 5.0},
+		}})
+		att.MoveDown()
+		att.SetData(analysis.LabelAttentionResult{Labels: []analysis.LabelAttentionScore{
+			{Label: "new-top", AttentionScore: 10.0},
+			{Label: "second", AttentionScore: 8.0},
+			{Label: "target-lbl", AttentionScore: 7.0},
+		}})
+		if att.SelectedLabel() != "target-lbl" || att.Cursor() != 2 {
+			t.Fatalf("AttentionModel SetData lost selected label 'target-lbl': got %q at cursor %d", att.SelectedLabel(), att.Cursor())
+		}
+
+		vc := NewVelocityComparisonModel(m.theme)
+		vc.SetSize(100, 20)
+		w1 := refNow.Add(-2 * 24 * time.Hour)
+		vc.SetDataAt([]model.Issue{
+			{ID: "V1", Status: model.StatusClosed, Labels: []string{"fast"}, ClosedAt: &w1, CreatedAt: refNow.Add(-5 * 24 * time.Hour), UpdatedAt: w1},
+			{ID: "V2", Status: model.StatusClosed, Labels: []string{"fast"}, ClosedAt: &w1, CreatedAt: refNow.Add(-5 * 24 * time.Hour), UpdatedAt: w1},
+			{ID: "V3", Status: model.StatusClosed, Labels: []string{"steady"}, ClosedAt: &w1, CreatedAt: refNow.Add(-5 * 24 * time.Hour), UpdatedAt: w1},
+		}, refNow)
+		vc.MoveDown() // select "steady" (index 1)
+		if vc.SelectedLabel() != "steady" {
+			t.Fatalf("precondition: expected VelocityComparison SelectedLabel=steady, got %q", vc.SelectedLabel())
+		}
+		vc.SetDataAt([]model.Issue{
+			{ID: "V1", Status: model.StatusClosed, Labels: []string{"fast"}, ClosedAt: &w1, CreatedAt: refNow.Add(-5 * 24 * time.Hour), UpdatedAt: w1},
+			{ID: "V3", Status: model.StatusClosed, Labels: []string{"steady"}, ClosedAt: &w1, CreatedAt: refNow.Add(-5 * 24 * time.Hour), UpdatedAt: w1},
+			{ID: "V4", Status: model.StatusClosed, Labels: []string{"steady"}, ClosedAt: &w1, CreatedAt: refNow.Add(-5 * 24 * time.Hour), UpdatedAt: w1},
+			{ID: "V5", Status: model.StatusClosed, Labels: []string{"steady"}, ClosedAt: &w1, CreatedAt: refNow.Add(-5 * 24 * time.Hour), UpdatedAt: w1},
+		}, refNow)
+		if vc.SelectedLabel() != "steady" || vc.cursor != 0 {
+			t.Fatalf("VelocityComparison SetDataAt lost selected label 'steady': got %q at cursor %d", vc.SelectedLabel(), vc.cursor)
+		}
+	})
+
+	t.Run("4_render_debug_view_supports_all_12_views", func(t *testing.T) {
+		dbgIssues := []model.Issue{
+			{ID: "DBG-1", Title: "Debug Foundation", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, Labels: []string{"core"}, CreatedAt: refNow.Add(-24 * time.Hour), UpdatedAt: refNow.Add(-time.Hour)},
+			{
+				ID: "DBG-2", Title: "Debug Dependent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeFeature, Labels: []string{"ui"},
+				CreatedAt: refNow.Add(-12 * time.Hour), UpdatedAt: refNow.Add(-time.Hour),
+				Dependencies: []*model.Dependency{{IssueID: "DBG-2", DependsOnID: "DBG-1", Type: model.DepBlocks}},
+			},
+		}
+		for _, viewName := range []string{
+			"list", "triage", "insights", "board", "history", "graph",
+			"tree", "actionable", "sprint", "flow", "attention", "labels",
+		} {
+			mDbg := NewModel(copyIssues(dbgIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+			t.Cleanup(mDbg.Stop)
+			mDbg.SetSprints([]model.Sprint{{ID: "sp-dbg", Name: "Debug Sprint", StartDate: refNow.Add(-24 * time.Hour), EndDate: refNow.Add(24 * time.Hour), BeadIDs: []string{"DBG-1", "DBG-2"}}})
+			out := ansi.Strip(mDbg.RenderDebugView(viewName, 120, 32))
+			if strings.TrimSpace(out) == "" || strings.HasPrefix(out, "Unknown view:") {
+				t.Fatalf("RenderDebugView(%q) failed: %q", viewName, out)
+			}
+		}
+
+		// Planted negative control: unknown view name still reports "Unknown view: bogus".
+		mBogus := NewModel(copyIssues(dbgIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mBogus.Stop)
+		if got := mBogus.RenderDebugView("bogus", 120, 32); got != "Unknown view: bogus" {
+			t.Fatalf("negative control failed: RenderDebugView(\"bogus\") = %q, want \"Unknown view: bogus\"", got)
+		}
+	})
+}

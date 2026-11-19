@@ -31,13 +31,23 @@ func NewAttentionModel(theme Theme) AttentionModel {
 }
 
 // SetData replaces the ranked labels (already sorted by attention, highest
-// first, by analysis.ComputeLabelAttentionScores) and clamps the cursor.
+// first, by analysis.ComputeLabelAttentionScores) and preserves selection when
+// the previously selected label remains present.
 func (m *AttentionModel) SetData(result analysis.LabelAttentionResult) {
+	selectedLabel := m.SelectedLabel()
 	labels := result.Labels
 	if len(labels) > attentionRowLimit {
 		labels = labels[:attentionRowLimit]
 	}
 	m.labels = append([]analysis.LabelAttentionScore(nil), labels...)
+	if selectedLabel != "" {
+		for i := range m.labels {
+			if m.labels[i].Label == selectedLabel {
+				m.cursor = i
+				break
+			}
+		}
+	}
 	if m.cursor >= len(m.labels) {
 		m.cursor = len(m.labels) - 1
 	}

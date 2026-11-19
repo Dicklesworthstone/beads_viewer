@@ -2189,8 +2189,8 @@ func (h *HistoryModel) buildTimeline(hist correlation.BeadHistory) []TimelineEnt
 		})
 	}
 
-	// Add sessions from cache if available (bv-pr1l)
-	if sessions, ok := h.sessionCache[hist.BeadID]; ok {
+	// Add sessions from cache or lookup callback if available (bv-pr1l)
+	if sessions := h.GetSessionsForBead(hist.BeadID); len(sessions) > 0 {
 		for _, session := range sessions {
 			entries = append(entries, TimelineEntry{
 				Timestamp:           session.Timestamp,
@@ -2836,10 +2836,14 @@ func (h *HistoryModel) renderFilterLine() string {
 	} else {
 		totalBeads := 0
 		if h.report != nil {
-			totalBeads = len(h.report.Histories)
+			for _, hist := range h.report.Histories {
+				if len(hist.Commits) > 0 {
+					totalBeads++
+				}
+			}
 		}
 		if len(h.histories) != totalBeads {
-			parts = append(parts, filterStyle.Render(fmt.Sprintf("Showing %d/%d beads", len(h.histories), totalBeads)))
+			parts = append(parts, filterStyle.Render(fmt.Sprintf("Showing %d/%d beads with commits", len(h.histories), totalBeads)))
 		} else {
 			parts = append(parts, filterStyle.Render(fmt.Sprintf("Showing all %d beads with commits", len(h.histories))))
 		}

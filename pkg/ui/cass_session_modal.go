@@ -40,6 +40,7 @@ type CassSessionModal struct {
 	strategy     cass.CorrelationStrategy
 	keywords     []string // Keywords used for correlation (for display)
 	selected     int      // Currently selected session (for keyboard nav)
+	scrollOffset int      // Sliding window start index
 	searchCmd    string   // Command to run for more results
 	theme        Theme
 	width        int
@@ -98,19 +99,34 @@ func NewCassSessionModalWithOptions(beadID string, result cass.CorrelationResult
 		searchCmd:    searchCmd,
 		theme:        theme,
 		width:        70,
-		height:       25,
+		height:       40,
 		copyToken:    new(byte),
 		maxDisplay:   3,
 	}
 }
 
+func (m CassSessionModal) visibleSlotCount() int {
+	capSlots := m.maxDisplay
+	if capSlots <= 0 {
+		capSlots = 3
+	}
+	effHeight := m.height
+	if effHeight <= 0 {
+		effHeight = 40
+	}
+	slots := (effHeight - 10) / 8
+	if slots < 1 {
+		slots = 1
+	}
+	if slots > capSlots {
+		slots = capSlots
+	}
+	return slots
+}
+
 // Update handles input for the modal.
 func (m CassSessionModal) Update(msg tea.Msg) (CassSessionModal, tea.Cmd) {
-	// Calculate the number of sessions actually displayed (capped by maxDisplay)
-	displayCount := len(m.sessions)
-	if displayCount > m.maxDisplay {
-		displayCount = m.maxDisplay
-	}
+	total := len(m.sessions)
 
 	switch msg := msg.(type) {
 	case cassClipboardCopyMsg:
@@ -122,7 +138,7 @@ func (m CassSessionModal) Update(msg tea.Msg) (CassSessionModal, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "j", "down":
-			if displayCount > 1 && m.selected < displayCount-1 {
+			if total > 1 && m.selected < total-1 {
 				m.selected++
 			}
 		case "k", "up":
@@ -137,13 +153,21 @@ func (m CassSessionModal) Update(msg tea.Msg) (CassSessionModal, tea.Cmd) {
 	case tea.MouseMsg:
 		switch msg.Button {
 		case tea.MouseButtonWheelDown:
-			if displayCount > 1 && m.selected < displayCount-1 {
+			if total > 1 && m.selected < total-1 {
 				m.selected++
 			}
 		case tea.MouseButtonWheelUp:
 			if m.selected > 0 {
 				m.selected--
 			}
+		}
+	}
+	if total > 0 {
+		slots := min(total, m.visibleSlotCount())
+		if m.selected < m.scrollOffset {
+			m.scrollOffset = m.selected
+		} else if m.selected >= m.scrollOffset+slots {
+			m.scrollOffset = m.selected - slots + 1
 		}
 	}
 	return m, nil
@@ -220,12 +244,23 @@ func (m CassSessionModal) View() string {
 		b.WriteString(matchReasonStyle.Render("No correlated sessions found."))
 		b.WriteString("\n\n")
 	} else {
-		displayCount := len(m.sessions)
-		if displayCount > m.maxDisplay {
-			displayCount = m.maxDisplay
+		slots := min(len(m.sessions), m.visibleSlotCount())
+		start := m.scrollOffset
+		if m.selected < start {
+			start = m.selected
+		} else if m.selected >= start+slots {
+			start = m.selected - slots + 1
 		}
+		maxStart := max(0, len(m.sessions)-slots)
+		if start > maxStart {
+			start = maxStart
+		}
+		if start < 0 {
+			start = 0
+		}
+		end := min(len(m.sessions), start+slots)
 
-		for i := 0; i < displayCount; i++ {
+		for i := start; i < end; i++ {
 			session := m.sessions[i]
 
 			// Session number with selection indicator
@@ -263,10 +298,19 @@ func (m CassSessionModal) View() string {
 			b.WriteString("\n\n")
 		}
 
-		// Show count of additional sessions
-		if len(m.sessions) > m.maxDisplay {
-			extra := len(m.sessions) - m.maxDisplay
-			moreText := fmt.Sprintf("(%d more session", extra)
+		// Show count of off-screen sessions and CLI search command
+		if len(m.sessions) > slots {
+			extra := len(m.sessions) - slots
+			scrollArrows := ""
+			switch {
+			case start > 0 && end < len(m.sessions):
+				scrollArrows = "↑↓ "
+			case start > 0:
+				scrollArrows = "↑ "
+			case end < len(m.sessions):
+				scrollArrows = "↓ "
+			}
+			moreText := fmt.Sprintf("%s(%d more session", scrollArrows, extra)
 			if extra > 1 {
 				moreText += "s"
 			}
@@ -400,6 +444,14 @@ func (m *CassSessionModal) SetSize(width, height int) {
 	m.width = maxWidth
 	m.termWidth = width
 	m.height = height
+	if total := len(m.sessions); total > 0 {
+		slots := min(total, m.visibleSlotCount())
+		if m.selected < m.scrollOffset {
+			m.scrollOffset = m.selected
+		} else if m.selected >= m.scrollOffset+slots {
+			m.scrollOffset = m.selected - slots + 1
+		}
+	}
 }
 
 // HasSessions returns true if there are sessions to display.

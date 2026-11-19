@@ -11,6 +11,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 )
 
@@ -2269,5 +2270,94 @@ func TestBoardNonClaimableOpenBadgesAndReadyBorderExclusion(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBoardLightThemeMarkdownRendererAnd24RowExpandedCardVisibility(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+
+	// 1. Light-theme MarkdownRenderer in Board detail panel & expanded card (honors BVThemeOverride / light renderer, no dark #f8f8f2 fallback).
+	t.Cleanup(func() { ui.SetThemeOverride("") })
+	ui.SetThemeOverride("light")
+	lightRenderer := lipgloss.NewRenderer(os.Stdout)
+	lightRenderer.SetColorProfile(termenv.TrueColor)
+	lightRenderer.SetHasDarkBackground(false)
+	lightTheme := ui.DefaultTheme(lightRenderer)
+
+	mdIssues := []model.Issue{
+		{
+			ID:          "LIGHT-1",
+			Title:       "Light Theme Card",
+			Description: "## Section Heading\n\nBody paragraph text for light theme verification.",
+			Status:      model.StatusOpen,
+			Priority:    1,
+			IssueType:   model.TypeFeature,
+			CreatedAt:   now.Add(-2 * time.Hour),
+			UpdatedAt:   now.Add(-time.Hour),
+		},
+	}
+	bLight := ui.NewBoardModel(mdIssues, lightTheme)
+	bLight.SetReferenceTime(now)
+	bLight.ToggleDetail()
+	bLight.ToggleExpand()
+	lightOut := bLight.View(120, 32)
+	// Light theme Primary (#6B47D9 -> 38;2;107;71;217) and light document text (#000000 -> 38;2;0;0;0), NOT dark text (#f8f8f2 -> 38;2;248;248;242).
+	if !strings.Contains(lightOut, "38;2;107;71;217") {
+		t.Fatalf("expected light-theme heading color (#6B47D9 -> 107;71;217) in board output:\n%q", lightOut)
+	}
+	if strings.Contains(lightOut, "38;2;248;248;242") {
+		t.Fatalf("light-theme board markdown leaked dark-theme #f8f8f2 foreground:\n%q", lightOut)
+	}
+
+	// Planted negative control: switching SetThemeOverride("dark") renders dark-theme Primary (#BD93F9 -> 189;147;249).
+	ui.SetThemeOverride("dark")
+	darkRenderer := lipgloss.NewRenderer(os.Stdout)
+	darkRenderer.SetColorProfile(termenv.TrueColor)
+	darkRenderer.SetHasDarkBackground(true)
+	darkTheme := ui.DefaultTheme(darkRenderer)
+	bLight.SetTheme(darkTheme)
+	darkOut := bLight.View(120, 32)
+	if !strings.Contains(darkOut, "38;2;189;147;249") {
+		t.Fatalf("negative control failed: expected dark-theme color (#BD93F9 -> 189;147;249) after SetTheme(dark):\n%q", darkOut)
+	}
+	ui.SetThemeOverride("")
+
+	// 2. 24-row terminal (View(100, 23)): inline-expanding card #3 ('d' at sel==2) anchors around sel so its body & footer are not clipped.
+	descLines := "First expanded line.\n\nSecond line bottom sentinel."
+	fourCards := []model.Issue{
+		{ID: "CARD-1", Title: "Collapsed Above One", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "CARD-2", Title: "Collapsed Above Two", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "CARD-3", Title: "Third Card Expanded", Description: descLines,
+			Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Labels:    []string{"board-ux", "ux-fix"},
+			CreatedAt: now.Add(-3 * time.Hour), UpdatedAt: now.Add(-15 * time.Minute),
+		},
+		{ID: "CARD-4", Title: "Collapsed Below Four", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	}
+	b24 := ui.NewBoardModel(fourCards, createTheme())
+	b24.SetReferenceTime(now)
+	b24.MoveDown()
+	b24.MoveDown() // select CARD-3 (row index 2)
+	b24.ToggleExpand()
+
+	rendered24 := ansi.Strip(b24.View(100, 23))
+	if !strings.Contains(rendered24, "CARD-3") || !strings.Contains(rendered24, "bottom sentinel") || !strings.Contains(rendered24, "Created:") || !strings.Contains(rendered24, "╚") {
+		t.Fatalf("24-row expanded CARD-3 clipped description, timestamps, or bottom border:\n%s", rendered24)
+	}
+	if strings.Contains(rendered24, "CARD-1") {
+		t.Fatalf("expected collapsed CARD-1 above expanded CARD-3 to scroll off on 24-row height:\n%s", rendered24)
+	}
+
+	// Even with a 15-line wrapping description on 24 rows, compact description clamping preserves Created: and bottom border ╚.
+	fourCards[2].Description = strings.Repeat("Long wrapped description sentence in narrow board card. ", 8)
+	b24Long := ui.NewBoardModel(fourCards, createTheme())
+	b24Long.SetReferenceTime(now)
+	b24Long.MoveDown()
+	b24Long.MoveDown()
+	b24Long.ToggleExpand()
+	rendered24Long := ansi.Strip(b24Long.View(100, 23))
+	if !strings.Contains(rendered24Long, "Created:") || !strings.Contains(rendered24Long, "╚") {
+		t.Fatalf("24-row expanded CARD-3 with long description clipped timestamps or bottom border:\n%s", rendered24Long)
 	}
 }

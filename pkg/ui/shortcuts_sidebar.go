@@ -277,7 +277,8 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 				{"j/k", "Move ↓/↑"},
 				{"Enter", "Expand/collapse"},
 				{"h/l", "Parent / Child"},
-				{"o/Z", "Expand/Collapse all"},
+				{"o/X/Z", "Expand/Collapse all"},
+				{"b/m", "Hierarchy/Blocking"},
 				{"gg/G", "Top / Bottom"},
 				{"Tab", "Toggle detail"},
 				{"y", "Copy ID"},
@@ -361,6 +362,7 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 			contexts: []string{"sprint"},
 			items: []shortcutItem{
 				{"j/k", "Next / Prev sprint"},
+				{"Enter", "Jump to first bead"},
 				{"P/Esc", "Exit sprint view"},
 			},
 		},

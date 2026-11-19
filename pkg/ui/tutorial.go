@@ -218,7 +218,9 @@ func (m TutorialModel) handleTOCKeys(msg tea.KeyMsg) TutorialModel {
 	case "g", "home":
 		m.tocCursor = 0
 	case "G", "end":
-		m.tocCursor = len(pages) - 1
+		if len(pages) > 0 {
+			m.tocCursor = len(pages) - 1
+		}
 	case "enter", " ":
 		// Jump to selected page in TOC
 		m.JumpToPage(m.tocCursor)
@@ -549,21 +551,32 @@ func (m TutorialModel) renderTOC(pages []TutorialPage) string {
 	viewedStyle := r.NewStyle().
 		Foreground(m.theme.Open)
 
-	var b strings.Builder
-	b.WriteString(headerStyle.Render("Contents"))
+	headerLine := headerStyle.Render("Contents")
 	if m.focus == focusTutorialTOC {
-		b.WriteString(r.NewStyle().Foreground(m.theme.Primary).Render(" ●"))
+		headerLine += r.NewStyle().Foreground(m.theme.Primary).Render(" ●")
 	}
-	b.WriteString("\n")
 
+	anchorIdx := m.currentPage
+	if m.focus == focusTutorialTOC {
+		anchorIdx = m.tocCursor
+	}
+	if anchorIdx < 0 {
+		anchorIdx = 0
+	} else if len(pages) > 0 && anchorIdx >= len(pages) {
+		anchorIdx = len(pages) - 1
+	}
+
+	var tocLines []string
+	activeLineIdx := 0
 	currentSection := ""
 	for i, page := range pages {
 		// Show section header if changed
 		if page.Section != currentSection && page.Section != "" {
+			if len(tocLines) > 0 {
+				tocLines = append(tocLines, "")
+			}
 			currentSection = page.Section
-			b.WriteString("\n")
-			b.WriteString(sectionStyle.Render("▸ " + currentSection))
-			b.WriteString("\n")
+			tocLines = append(tocLines, sectionStyle.Render("▸ "+currentSection))
 		}
 
 		// Determine style based on cursor position and current page
@@ -589,8 +602,52 @@ func (m TutorialModel) renderTOC(pages []TutorialPage) string {
 			viewed = viewedStyle.Render(" ✓")
 		}
 
-		b.WriteString(style.Render(prefix+title) + viewed)
+		if i == anchorIdx {
+			activeLineIdx = len(tocLines)
+		}
+		tocLines = append(tocLines, style.Render(prefix+title)+viewed)
+	}
+
+	contentHeight := max(m.height-11, 6)
+	availBody := max(contentHeight-1, 4)
+	var visibleLines []string
+	if len(tocLines) <= availBody {
+		visibleLines = tocLines
+	} else {
+		hintStyle := r.NewStyle().Foreground(m.theme.Muted)
+		winSize := max(availBody-2, 1)
+		start := activeLineIdx - winSize/2
+		if start < 0 {
+			start = 0
+		}
+		if start > len(tocLines)-winSize {
+			start = max(0, len(tocLines)-winSize)
+		}
+		if start == 0 {
+			end := min(len(tocLines), availBody-1)
+			visibleLines = append(visibleLines, tocLines[:end]...)
+			if end < len(tocLines) {
+				visibleLines = append(visibleLines, hintStyle.Render("  ↓ more"))
+			}
+		} else if activeLineIdx >= len(tocLines)-(availBody-1) {
+			start = max(1, len(tocLines)-(availBody-1))
+			visibleLines = append(visibleLines, hintStyle.Render("  ↑ more"))
+			visibleLines = append(visibleLines, tocLines[start:]...)
+		} else {
+			end := min(len(tocLines), start+winSize)
+			visibleLines = append(visibleLines, hintStyle.Render("  ↑ more"))
+			visibleLines = append(visibleLines, tocLines[start:end]...)
+			if end < len(tocLines) {
+				visibleLines = append(visibleLines, hintStyle.Render("  ↓ more"))
+			}
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(headerLine)
+	for _, ln := range visibleLines {
 		b.WriteString("\n")
+		b.WriteString(ln)
 	}
 
 	return tocStyle.Render(b.String())

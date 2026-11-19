@@ -377,7 +377,7 @@ func (l *GraphLayout) UpdatePhase2Ranks(stats *analysis.GraphStats) {
 
 	// Phase 2 ranks may become available later (AnalyzeAsync).
 	l.RankPageRank = stats.PageRankRank()
-	l.RankBetweenness = stats.BetweennessRank()
+	l.RankBetweenness = stats.ActiveBetweennessRank()
 	l.RankEigenvector = stats.EigenvectorRank()
 	l.RankHubs = stats.HubsRank()
 	l.RankAuthorities = stats.AuthoritiesRank()
@@ -740,7 +740,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 
 	insights := analysis.Insights{Stats: graphStats, ClusterDensity: graphStats.Density}
 	if b.cfg.PrecomputeInsights {
-		insights = graphStats.GenerateInsights(len(issues))
+		insights = generateTUIInsights(b.analyzer, graphStats, issues, len(issues), recipeExplicitlyIncludesClosed(b.recipe))
 	}
 
 	var graphLayout *GraphLayout
@@ -1000,6 +1000,48 @@ func recipeName(r *recipe.Recipe) string {
 	return r.Name
 }
 
+func recipeExplicitlyIncludesClosed(r *recipe.Recipe) bool {
+	if r == nil {
+		return false
+	}
+	for _, st := range r.Filters.Status {
+		s := strings.ToLower(strings.TrimSpace(st))
+		if s == "closed" || s == string(model.StatusTombstone) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyActiveCandidateIssue(issues []model.Issue, analyzer *analysis.Analyzer) bool {
+	for i := range issues {
+		if analyzer != nil && !analyzer.IsCandidate(issues[i].ID) {
+			continue
+		}
+		if !isClosedLikeStatus(issues[i].Status) && issues[i].Status != model.StatusTombstone {
+			return true
+		}
+	}
+	return false
+}
+
+func generateTUIInsights(
+	analyzer *analysis.Analyzer,
+	stats *analysis.GraphStats,
+	issues []model.Issue,
+	limit int,
+	forceIncludeInactive bool,
+) analysis.Insights {
+	if stats == nil {
+		return analysis.Insights{}
+	}
+	if analyzer == nil {
+		return stats.GenerateInsights(limit)
+	}
+	includeInactive := forceIncludeInactive || !hasAnyActiveCandidateIssue(issues, analyzer)
+	return analyzer.GenerateScopedInsights(stats, limit, includeInactive)
+}
+
 func applyRecipeToIssues(issues []model.Issue, analyzer *analysis.Analyzer, stats *analysis.GraphStats, triage map[string]float64, r *recipe.Recipe, now time.Time) ([]model.Issue, error) {
 	if r == nil {
 		return append([]model.Issue(nil), issues...), nil
@@ -1117,7 +1159,7 @@ func buildGraphLayout(issues []model.Issue, stats *analysis.GraphStats) *GraphLa
 		layout.RankInDegree = stats.InDegreeRank()
 		layout.RankOutDegree = stats.OutDegreeRank()
 		layout.RankPageRank = stats.PageRankRank()
-		layout.RankBetweenness = stats.BetweennessRank()
+		layout.RankBetweenness = stats.ActiveBetweennessRank()
 		layout.RankEigenvector = stats.EigenvectorRank()
 		layout.RankHubs = stats.HubsRank()
 		layout.RankAuthorities = stats.AuthoritiesRank()
@@ -1414,7 +1456,7 @@ func graphLayoutWithRanks(old *GraphLayout, stats *analysis.GraphStats) *GraphLa
 		CriticalPath:     old.CriticalPath,
 		CriticalNext:     old.CriticalNext,
 		RankPageRank:     stats.PageRankRank(),
-		RankBetweenness:  stats.BetweennessRank(),
+		RankBetweenness:  stats.ActiveBetweennessRank(),
 		RankEigenvector:  stats.EigenvectorRank(),
 		RankHubs:         stats.HubsRank(),
 		RankAuthorities:  stats.AuthoritiesRank(),

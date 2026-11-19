@@ -317,6 +317,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"h", "Collapse or jump to parent", "Tree", "tree"},
 		{"l", "Expand or move to child", "Tree", "tree"},
 		{"o", "Expand all nodes", "Tree", "tree"},
+		{"X", "Expand all nodes", "Tree", "tree"},
 		{"Z", "Collapse all nodes", "Tree", "tree"},
 		{"tab", "Toggle detail pane", "Tree", "tree"},
 		{"PgUp", "Page up", "Tree", "tree"},

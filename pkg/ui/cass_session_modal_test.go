@@ -590,9 +590,8 @@ func TestCassSessionModal_SingleSession(t *testing.T) {
 	}
 }
 
-func TestCassSessionModal_NavigationCappedByMaxDisplay(t *testing.T) {
+func TestCassSessionModal_NavigationTraversesAllSessionsWithSlidingWindow(t *testing.T) {
 	theme := testTheme()
-	// Create 5 sessions but maxDisplay is 3
 	result := cass.CorrelationResult{
 		BeadID: "bv-navbound",
 		TopSessions: []cass.ScoredResult{
@@ -606,20 +605,53 @@ func TestCassSessionModal_NavigationCappedByMaxDisplay(t *testing.T) {
 
 	modal := NewCassSessionModal("bv-navbound", result, theme)
 
-	// Navigation should stop at index 2 (third session), not 4
-	// Move down 5 times
+	// Positive observable: j traverses all 0..len(sessions)-1 sessions (reaching index 4 / agent5),
+	// sliding the 3-slot window so sessions #4 and #5 are inspectable.
 	for i := 0; i < 5; i++ {
 		modal, _ = modal.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
 	}
-
-	// Should be capped at maxDisplay-1 (index 2), not len(sessions)-1 (index 4)
-	if modal.selected != 2 {
-		t.Errorf("Navigation should be capped at maxDisplay-1 (2), got %d", modal.selected)
+	if modal.selected != 4 {
+		t.Fatalf("expected navigation to reach last session index 4, got %d", modal.selected)
+	}
+	if modal.sessions[modal.selected].Agent != "agent5" {
+		t.Fatalf("selected session agent = %q, want agent5", modal.sessions[modal.selected].Agent)
+	}
+	scrolledView := modal.View()
+	if !strings.Contains(scrolledView, "[5]") || !strings.Contains(scrolledView, "agent5") || !strings.Contains(scrolledView, "Five") {
+		t.Fatalf("expected sliding window to render session #5:\n%s", scrolledView)
+	}
+	if strings.Contains(scrolledView, "agent1") {
+		t.Fatalf("expected session #1 to scroll out of the 3-slot window:\n%s", scrolledView)
 	}
 
-	// Verify the selected session is the third one (still visible)
-	if modal.selected >= len(modal.sessions) || modal.sessions[modal.selected].Agent != "agent3" {
-		t.Error("Selected session should be the third displayed session (agent3)")
+	// Planted negative control: j at end clamps at 4; k back to top clamps at 0.
+	modal, _ = modal.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	if modal.selected != 4 {
+		t.Fatalf("expected clamp at 4 on trailing j, got %d", modal.selected)
+	}
+	for i := 0; i < 10; i++ {
+		modal, _ = modal.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	}
+	if modal.selected != 0 {
+		t.Fatalf("expected clamp at 0 on repeated k, got %d", modal.selected)
+	}
+
+	// 24-row terminal windowing: visibleSlotCount() == 1, preserving header and footer without clipping.
+	modal.SetSize(80, 24)
+	if slots := modal.visibleSlotCount(); slots != 1 {
+		t.Fatalf("24-row visibleSlotCount() = %d, want 1", slots)
+	}
+	for wantIdx, wantAgent := range []string{"agent1", "agent2", "agent3", "agent4", "agent5"} {
+		if wantIdx > 0 {
+			modal, _ = modal.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+		}
+		v24 := modal.View()
+		if !strings.Contains(v24, "Related Coding Sessions") || !strings.Contains(v24, "[V/Esc] Close") || !strings.Contains(v24, wantAgent) {
+			t.Fatalf("24-row modal at session %d clipped header/footer or %s:\n%s", wantIdx, wantAgent, v24)
+		}
+		if lines := strings.Count(v24, "\n") + 1; lines > 23 {
+			t.Fatalf("24-row modal height = %d lines, must fit within 23 rows:\n%s", lines, v24)
+		}
 	}
 }
 

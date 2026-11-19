@@ -11,9 +11,9 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
 	"github.com/charmbracelet/bubbles/viewport"
-	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 )
 
 // BoardModel represents the Kanban board view with adaptive columns
@@ -51,7 +51,7 @@ type BoardModel struct {
 	// Detail panel (bv-r6kh)
 	showDetail   bool
 	detailVP     viewport.Model
-	mdRenderer   *glamour.TermRenderer
+	mdRenderer   *MarkdownRenderer
 	lastDetailID string // Track which issue detail is currently rendered
 
 	// Search state (bv-yg39)
@@ -600,12 +600,12 @@ func NewBoardModel(issues []model.Issue, theme Theme) BoardModel {
 	// Group issues by default mode (status) - bv-wjs0
 	cols := groupIssuesByMode(issues, SwimByStatus)
 
-	// Initialize markdown renderer for detail panel (bv-r6kh)
-	var mdRenderer *glamour.TermRenderer
-	mdRenderer, _ = glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(60),
-	)
+	// Initialize theme-aware markdown renderer (honors --theme / BV_THEME / BV_NO_BG_QUERY without raw OSC queries)
+	mdRenderer := NewMarkdownRendererWithTheme(50, theme)
+	if wantDark := boardDarkMode(theme); mdRenderer.IsDarkMode() != wantDark {
+		mdRenderer.isDark = wantDark
+		mdRenderer.SetWidthWithTheme(50, theme)
+	}
 
 	// Build issue lookup map for getting blocker titles (bv-kklp)
 	issueMap := make(map[string]*model.Issue, len(issues))
@@ -1431,37 +1431,56 @@ func (b BoardModel) View(width, height int) string {
 			sel = issueCount - 1
 		}
 
-		// Simple scrolling: keep selected card visible
-		start := 0
-		if sel >= visibleCards {
-			start = sel - visibleCards + 1
-		}
-
-		end := start + visibleCards
-		if end > issueCount {
-			end = issueCount
-		}
-
-		// Render cards
 		// Card width = baseWidth - 4 to fit inside column padding (2) and
 		// leave room for the card's own border (2). Clamp to minimum of 6.
 		cardWidth := baseWidth - 4
 		if cardWidth < 6 {
 			cardWidth = 6
 		}
-		var cards []string
-		for rowIdx := start; rowIdx < end; rowIdx++ {
-			issue := issues[rowIdx]
-			isSelected := isFocused && rowIdx == sel
 
-			// Check if this card is expanded (bv-i3ii)
-			var card string
-			if b.IsCardExpanded(issue.ID) {
-				card = b.renderExpandedCard(issue, cardWidth, colIdx, rowIdx)
-			} else {
-				card = b.renderCard(issue, cardWidth, isSelected, colIdx, rowIdx)
+		var cards []string
+		start := 0
+		end := issueCount
+		if issueCount > 0 && sel >= 0 && sel < issueCount && b.IsCardExpanded(issues[sel].ID) {
+			// Anchor around the expanded card's true line height so collapsed cards
+			// above sel never push the expanded body below fitBlock(..., colHeight).
+			budget := colHeight
+			if issueCount > 1 {
+				budget = max(1, colHeight-1)
 			}
-			cards = append(cards, card)
+			selCard := b.renderExpandedCard(issues[sel], cardWidth, colIdx, sel, budget)
+			usedLines := lipgloss.Height(selCard)
+			start = sel
+			for r := sel - 1; r >= 0 && usedLines+cardHeight <= budget; r-- {
+				start = r
+				usedLines += cardHeight
+			}
+			end = sel + 1
+			for r := sel + 1; r < issueCount && usedLines < budget; r++ {
+				end = r + 1
+				usedLines += cardHeight
+			}
+			for rowIdx := start; rowIdx < end; rowIdx++ {
+				if rowIdx == sel {
+					cards = append(cards, selCard)
+				} else {
+					cards = append(cards, b.renderCard(issues[rowIdx], cardWidth, isFocused && rowIdx == sel, colIdx, rowIdx))
+				}
+			}
+		} else {
+			// Simple scrolling: keep selected card visible
+			if sel >= visibleCards {
+				start = sel - visibleCards + 1
+			}
+			end = start + visibleCards
+			if end > issueCount {
+				end = issueCount
+			}
+			for rowIdx := start; rowIdx < end; rowIdx++ {
+				issue := issues[rowIdx]
+				isSelected := isFocused && rowIdx == sel
+				cards = append(cards, b.renderCard(issue, cardWidth, isSelected, colIdx, rowIdx))
+			}
 		}
 
 		// Empty column placeholder
@@ -1476,7 +1495,7 @@ func (b BoardModel) View(width, height int) string {
 		}
 
 		// Scroll indicator
-		if issueCount > visibleCards {
+		if issueCount > 0 && (end-start < issueCount || issueCount > visibleCards) {
 			scrollInfo := fmt.Sprintf("↕ %d/%d", sel+1, issueCount)
 			scrollStyle := t.Renderer.NewStyle().
 				Width(cardWidth).
@@ -1800,7 +1819,7 @@ func (b BoardModel) renderCard(issue model.Issue, width int, selected bool, colI
 // Shows full description, dependencies with titles, and all labels
 // Note: colIdx, rowIdx kept for API consistency with renderCard but unused since
 // expanded card is always the selected card (no separate search highlighting needed)
-func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) string {
+func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int, maxHeight int) string {
 	t := b.theme
 
 	// ══════════════════════════════════════════════════════════════════════════
@@ -1885,12 +1904,20 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 		}
 		desc := strings.Join(lines, "\n")
 
-		// Render with markdown if possible
+		// Render with theme-aware markdown sized to the card interior
 		rendered := desc
-		if b.mdRenderer != nil {
-			if md, err := b.mdRenderer.Render(desc); err == nil {
-				rendered = strings.TrimSpace(md)
-			}
+		wrapWidth := max(width-4, 16)
+		mdRenderer := b.mdRenderer
+		wantDark := boardDarkMode(t)
+		if mdRenderer == nil || mdRenderer.IsDarkMode() != wantDark {
+			mdRenderer = NewMarkdownRendererWithTheme(wrapWidth, t)
+			mdRenderer.isDark = wantDark
+			mdRenderer.SetWidthWithTheme(wrapWidth, t)
+		} else if mdRenderer.width != wrapWidth {
+			mdRenderer.SetWidthWithTheme(wrapWidth, t)
+		}
+		if md, err := mdRenderer.Render(desc); err == nil {
+			rendered = strings.TrimSpace(boardStripANSIForTheme(t, md))
 		}
 		descLines = append(descLines, rendered)
 	}
@@ -1971,7 +1998,48 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int) s
 	}
 	parts = append(parts, separator, timestamps)
 
-	return cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left, parts...))
+	full := cardStyle.Render(lipgloss.JoinVertical(lipgloss.Left, parts...))
+	if maxHeight <= 0 || lipgloss.Height(full) <= maxHeight {
+		return full
+	}
+
+	// Compact mode for constrained 24-row column heights so wrapped descriptions
+	// do not push labels, timestamps, or the bottom card border below colHeight.
+	tightStyle := cardStyle.MarginBottom(0)
+	var shellParts []string
+	shellParts = append(shellParts, header, title, separator)
+	if len(depLines) > 0 {
+		shellParts = append(shellParts, depLines...)
+	}
+	if labelLine != "" {
+		shellParts = append(shellParts, labelLine)
+	}
+	shellParts = append(shellParts, separator, timestamps)
+	shellHeight := lipgloss.Height(tightStyle.Render(lipgloss.JoinVertical(lipgloss.Left, shellParts...)))
+
+	var compactParts []string
+	compactParts = append(compactParts, header, title, separator)
+	if len(descLines) > 0 {
+		availDesc := maxHeight - shellHeight
+		if availDesc < 1 {
+			availDesc = 1
+		}
+		visualDesc := strings.Split(descLines[0], "\n")
+		if len(visualDesc) > availDesc {
+			visualDesc = append([]string(nil), visualDesc[:availDesc]...)
+			lastIdx := len(visualDesc) - 1
+			visualDesc[lastIdx] = ansi.Truncate(visualDesc[lastIdx], max(width-5, 2), "") + "…"
+		}
+		compactParts = append(compactParts, strings.Join(visualDesc, "\n"))
+	}
+	if len(depLines) > 0 {
+		compactParts = append(compactParts, depLines...)
+	}
+	if labelLine != "" {
+		compactParts = append(compactParts, labelLine)
+	}
+	compactParts = append(compactParts, separator, timestamps)
+	return tightStyle.Render(lipgloss.JoinVertical(lipgloss.Left, compactParts...))
 }
 
 // syncDetailContent populates detailVP for the currently selected issue when the
@@ -1986,7 +2054,7 @@ func (b *BoardModel) syncDetailContent() {
 			rendered := helpText
 			if b.mdRenderer != nil {
 				if md, err := b.mdRenderer.Render(helpText); err == nil {
-					rendered = md
+					rendered = boardStripANSIForTheme(t, md)
 				}
 			}
 			b.detailVP.SetContent(rendered)
@@ -2078,11 +2146,42 @@ func (b *BoardModel) syncDetailContent() {
 	rendered := content.String()
 	if b.mdRenderer != nil {
 		if md, err := b.mdRenderer.Render(rendered); err == nil {
-			rendered = md
+			rendered = boardStripANSIForTheme(t, md)
 		}
 	}
 	b.detailVP.SetContent(rendered)
 	b.detailVP.GotoTop()
+}
+
+func boardStripANSIForTheme(t Theme, s string) string {
+	if t.Renderer != nil && t.Renderer.ColorProfile() == termenv.Ascii {
+		return ansi.Strip(s)
+	}
+	return s
+}
+
+func boardDarkMode(t Theme) bool {
+	if BVThemeOverride != "" {
+		return BVThemeOverride == "dark"
+	}
+	if t.Renderer != nil {
+		return t.Renderer.HasDarkBackground()
+	}
+	return lipgloss.HasDarkBackground()
+}
+
+// SetTheme updates the board's theme and refreshes its markdown renderer.
+func (b *BoardModel) SetTheme(theme Theme) {
+	b.theme = theme
+	b.lastDetailID = ""
+	wantDark := boardDarkMode(theme)
+	w := 50
+	if b.mdRenderer != nil && b.mdRenderer.width > 0 {
+		w = b.mdRenderer.width
+	}
+	b.mdRenderer = NewMarkdownRendererWithTheme(w, theme)
+	b.mdRenderer.isDark = wantDark
+	b.mdRenderer.SetWidthWithTheme(w, theme)
 }
 
 // renderDetailPanel renders the detail panel for the selected issue (bv-r6kh)
@@ -2100,6 +2199,17 @@ func (b *BoardModel) renderDetailPanel(width, height int) string {
 	}
 	b.detailVP.Width = vpWidth
 	b.detailVP.Height = vpHeight
+
+	wantDark := boardDarkMode(t)
+	if b.mdRenderer == nil || b.mdRenderer.IsDarkMode() != wantDark {
+		b.mdRenderer = NewMarkdownRendererWithTheme(vpWidth, t)
+		b.mdRenderer.isDark = wantDark
+		b.mdRenderer.SetWidthWithTheme(vpWidth, t)
+		b.lastDetailID = ""
+	} else if b.mdRenderer.width != vpWidth {
+		b.mdRenderer.SetWidthWithTheme(vpWidth, t)
+		b.lastDetailID = ""
+	}
 
 	b.syncDetailContent()
 

@@ -75,7 +75,16 @@ func (m *LabelDashboardModel) SetSize(width, height int) {
 	m.clampCursorAndScroll()
 }
 
+// SelectedLabel returns the currently selected label name, or "" when empty.
+func (m LabelDashboardModel) SelectedLabel() string {
+	if m.cursor < 0 || m.cursor >= len(m.labels) {
+		return ""
+	}
+	return m.labels[m.cursor].Label
+}
+
 func (m *LabelDashboardModel) SetData(labels []analysis.LabelHealth) {
+	selectedLabel := m.SelectedLabel()
 	m.labels = labels
 	// Sort by health level (critical first), then blocked desc, then health asc, then name
 	sort.SliceStable(m.labels, func(i, j int) bool {
@@ -102,6 +111,14 @@ func (m *LabelDashboardModel) SetData(labels []analysis.LabelHealth) {
 		}
 		return li.Label < lj.Label
 	})
+	if selectedLabel != "" {
+		for i := range m.labels {
+			if m.labels[i].Label == selectedLabel {
+				m.cursor = i
+				break
+			}
+		}
+	}
 	m.clampCursorAndScroll()
 }
 

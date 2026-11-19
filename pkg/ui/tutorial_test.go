@@ -1399,3 +1399,67 @@ func TestTutorialContent_PathsAndKeysMatchRuntime(t *testing.T) {
 		}
 	}
 }
+
+func TestTutorialTOC24RowWindowingAndContextHelpTreeSprintKeys(t *testing.T) {
+	t.Setenv("BV_NO_SAVED_CONFIG", "1")
+	m := newTestTutorialModel()
+	m.SetSize(96, 24)
+
+	// Toggle TOC open and focus it ('t')
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
+	if !m.tocVisible || m.focus != focusTutorialTOC {
+		t.Fatalf("expected TOC visible & focused after 't', got visible=%v focus=%v", m.tocVisible, m.focus)
+	}
+	initialView := ansi.Strip(m.View())
+	if h := lipgloss.Height(m.View()); h > 24 {
+		t.Fatalf("24-row tutorial View() height = %d, want <= 24", h)
+	}
+	if !strings.Contains(initialView, "↓ more") || !strings.Contains(initialView, "back to content") || !strings.Contains(initialView, "╰") {
+		t.Fatalf("24-row initial TOC missing overflow hint, footer, or bottom border:\n%s", initialView)
+	}
+
+	// Press 'G' to jump to the last TOC page (page 30) on a 24-row terminal.
+	pages := m.visiblePages()
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	if m.tocCursor != len(pages)-1 {
+		t.Fatalf("expected 'G' to move tocCursor to %d, got %d", len(pages)-1, m.tocCursor)
+	}
+	endView := ansi.Strip(m.View())
+	lastPrefix := truncateRunesHelper(pages[len(pages)-1].Title, 14, "…")
+	if h := lipgloss.Height(m.View()); h > 24 {
+		t.Fatalf("24-row tutorial View() after 'G' height = %d, want <= 24", h)
+	}
+	if !strings.Contains(endView, lastPrefix) || !strings.Contains(endView, "↑ more") || !strings.Contains(endView, "back to content") || !strings.Contains(endView, "╰") {
+		t.Fatalf("24-row TOC after 'G' missing last page %q, ↑ more, footer, or bottom border:\n%s", lastPrefix, endView)
+	}
+
+	// Planted negative control: tall terminal (200 rows) renders entire TOC with zero overflow indicators.
+	m.SetSize(120, 200)
+	tallView := ansi.Strip(m.View())
+	if strings.Contains(tallView, "↑ more") || strings.Contains(tallView, "↓ more") {
+		t.Fatalf("200-row tutorial unexpectedly rendered TOC overflow hints:\n%s", tallView)
+	}
+
+	// Tree context help ('~' on tree) documents "o / X / Z" and "b / m", NOT "o / O" ($EDITOR trap).
+	treeTut := newTestTutorialModel()
+	treeTut.SetSize(110, 45)
+	treeTut.SetContext("tree")
+	treeTut.SetContextMode(true)
+	treeView := ansi.Strip(treeTut.View())
+	if !strings.Contains(treeView, "o / X / Z") || !strings.Contains(treeView, "b / m") {
+		t.Fatalf("tree context help missing 'o / X / Z' or 'b / m':\n%s", treeView)
+	}
+	if strings.Contains(treeView, "o / O") {
+		t.Fatalf("tree context help retained 'o / O' $EDITOR trap:\n%s", treeView)
+	}
+
+	// Sprint context help ('~' on sprint) documents Enter -> "Jump to first sprint bead".
+	sprintTut := newTestTutorialModel()
+	sprintTut.SetSize(110, 45)
+	sprintTut.SetContext("sprint")
+	sprintTut.SetContextMode(true)
+	sprintView := ansi.Strip(sprintTut.View())
+	if !strings.Contains(sprintView, "Enter") || !strings.Contains(sprintView, "Jump to first sprint bead") {
+		t.Fatalf("sprint context help missing Enter jump hint:\n%s", sprintView)
+	}
+}
