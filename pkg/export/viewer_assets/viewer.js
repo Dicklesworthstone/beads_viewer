@@ -3619,25 +3619,17 @@ function getCycleInfo(triageDataOverride = LATEST_TRIAGE_DATA) {
     const computed = computeFallbackActiveCycles(activeIds, activeBlockingEdges, 100);
     const graphHealth = triageDataOverride?.project_health?.graph
       ?? triageDataOverride?.triage?.project_health?.graph
+      ?? triageDataOverride?.graphHealth
       ?? null;
     const rawHealthCount = Number(graphHealth?.cycle_count) || 0;
-    // Respect explicit MV acyclic override when caller cleared in_cycle=0 and health reports acyclic
-    const explicitMvAndHealthAcyclic = graphHealth !== null
-      && !Boolean(graphHealth?.has_cycles)
-      && rawHealthCount === 0
-      && mvCycleIds.length === 0;
-    const sccComponents = explicitMvAndHealthAcyclic
-      ? []
-      : (computed.sccComponents.length > 0
-        ? computed.sccComponents
-        : mvCycleIds.map(id => [id]));
-    const hasCycles = !explicitMvAndHealthAcyclic && (
-      computed.cycles.length > 0 ||
+    const sccComponents = computed.sccComponents.length > 0
+      ? computed.sccComponents
+      : mvCycleIds.map(id => [id]);
+    const hasCycles = computed.cycles.length > 0 ||
       sccComponents.length > 0 ||
       Boolean(graphHealth?.has_cycles) ||
       rawHealthCount > 0 ||
-      mvCycleIds.length > 0
-    );
+      mvCycleIds.length > 0;
     const largestSccSize = sccComponents.reduce((max, comp) => Math.max(max, comp.length), 0);
     const cycleCount = hasCycles
       ? Math.max(rawHealthCount, computed.cycles.length, sccComponents.length)
@@ -3645,11 +3637,13 @@ function getCycleInfo(triageDataOverride = LATEST_TRIAGE_DATA) {
     return {
       hasCycles,
       cycleCount,
+      count: cycleCount,
       truncated: Boolean(computed.truncated),
       sccCount: sccComponents.length,
       nonTrivialSccCount: sccComponents.length || (hasCycles ? 1 : 0),
       largestSccSize,
       sccComponents,
+      cycles: computed.cycles,
       suggestions: null,
     };
   }

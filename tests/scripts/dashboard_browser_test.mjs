@@ -3065,6 +3065,7 @@ async function capabilitiesJourney(page) {
     let prBounds = null;
     let hybridRows = [];
     let fallbackCycleWithCycles = null;
+    let fallbackCyclePhase2Timeout = null;
     let fallbackCycleAcyclic = null;
     let wasmFallbackGraphAudit = null;
     let dagEigenvectorAudit = null;
@@ -3081,7 +3082,31 @@ async function capabilitiesJourney(page) {
       fallbackCycleWithCycles = getCycleInfo({ project_health: { graph: { has_cycles: true, cycle_count: 2 } } });
       DB_STATE.db.run("UPDATE issue_overview_mv SET in_cycle = 0 WHERE id IN ('cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b')");
       try {
-        fallbackCycleAcyclic = getCycleInfo({ project_health: { graph: { has_cycles: false, cycle_count: 0 } } });
+        const savedDataGraphHealth = (typeof DATA === 'object' && DATA) ? DATA.graphHealth : undefined;
+        if (typeof DATA === 'object' && DATA) {
+          DATA.graphHealth = { has_cycles: false, cycle_count: 0 };
+        }
+        try {
+          // Positive Phase-2-timeout / XL / BV_SKIP_PHASE2 recovery: live SQLite dependencies still contain active cycles.
+          fallbackCyclePhase2Timeout = getCycleInfo({
+            project_health: { graph: { has_cycles: false, cycle_count: 0 } },
+            graphHealth: { has_cycles: false, cycle_count: 0 },
+          });
+          // Genuinely acyclic negative control: convert cyclic back-edges to non-blocking 'related' in SQLite dependencies.
+          DB_STATE.db.run("UPDATE dependencies SET type = 'related' WHERE (issue_id = 'cap-auth-root' AND depends_on_id = 'cap-auth-ui') OR (issue_id = 'cap-billing-a' AND depends_on_id = 'cap-billing-b')");
+          try {
+            fallbackCycleAcyclic = getCycleInfo({
+              project_health: { graph: { has_cycles: false, cycle_count: 0 } },
+              graphHealth: { has_cycles: false, cycle_count: 0 },
+            });
+          } finally {
+            DB_STATE.db.run("UPDATE dependencies SET type = 'blocks' WHERE (issue_id = 'cap-auth-root' AND depends_on_id = 'cap-auth-ui') OR (issue_id = 'cap-billing-a' AND depends_on_id = 'cap-billing-b')");
+          }
+        } finally {
+          if (typeof DATA === 'object' && DATA) {
+            DATA.graphHealth = savedDataGraphHealth;
+          }
+        }
       } finally {
         DB_STATE.db.run("UPDATE issue_overview_mv SET in_cycle = 1 WHERE id IN ('cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b')");
       }
@@ -3226,6 +3251,7 @@ async function capabilitiesJourney(page) {
         stComp: r.component_scores?.status,
       })),
       fallbackCycleWithCycles,
+      fallbackCyclePhase2Timeout,
       fallbackCycleAcyclic,
       wasmFallbackGraphAudit,
       dagEigenvectorAudit,
@@ -3245,8 +3271,16 @@ async function capabilitiesJourney(page) {
   assert.equal(wave18BrowserAudit.fallbackCycleWithCycles.sccCount, 2, 'getCycleInfo WASM fallback separates disjoint SCCs');
   assert.equal(wave18BrowserAudit.fallbackCycleWithCycles.largestSccSize, 2, 'getCycleInfo WASM fallback reports max SCC size 2 (never lumping 4 nodes)');
   assert.deepEqual(wave18BrowserAudit.fallbackCycleWithCycles.sccComponents, [['cap-auth-root', 'cap-auth-ui'], ['cap-billing-a', 'cap-billing-b']], 'getCycleInfo WASM fallback keeps disjoint cycles as separate SCCs');
-  assert.equal(wave18BrowserAudit.fallbackCycleAcyclic.hasCycles, false, 'getCycleInfo WASM fallback negative control returns false when acyclic');
+  assert.equal(wave18BrowserAudit.fallbackCyclePhase2Timeout.hasCycles, true, 'getCycleInfo WASM fallback recovers live SQLite cycles even when in_cycle=0 and health reports acyclic');
+  assert.equal(wave18BrowserAudit.fallbackCyclePhase2Timeout.cycleCount, 2, 'Phase-2-timeout fallback recovers both active cycles');
+  assert.equal(wave18BrowserAudit.fallbackCyclePhase2Timeout.count, 2, 'Phase-2-timeout fallback sets count=2');
+  assert.equal(wave18BrowserAudit.fallbackCyclePhase2Timeout.sccCount, 2, 'Phase-2-timeout fallback sets sccCount=2');
+  assert.deepEqual(wave18BrowserAudit.fallbackCyclePhase2Timeout.sccComponents, [['cap-auth-root', 'cap-auth-ui'], ['cap-billing-a', 'cap-billing-b']], 'Phase-2-timeout fallback separates both disjoint SCCs');
+  assert.equal(wave18BrowserAudit.fallbackCycleAcyclic.hasCycles, false, 'getCycleInfo WASM fallback negative control returns false when SQLite graph is genuinely acyclic');
   assert.equal(wave18BrowserAudit.fallbackCycleAcyclic.cycleCount, 0);
+  assert.equal(wave18BrowserAudit.fallbackCycleAcyclic.count, 0);
+  assert.equal(wave18BrowserAudit.fallbackCycleAcyclic.sccCount, 0);
+  assert.deepEqual(wave18BrowserAudit.fallbackCycleAcyclic.sccComponents, []);
   assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.wasmReady, false);
   assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.hasOverviewEigenvector, true);
   assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.hasOverviewInCycle, true);
