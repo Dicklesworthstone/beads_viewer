@@ -1503,21 +1503,22 @@ func TestRobotDiskCache_SymlinkedDBWALEmbeddedDoltAndMetadataTargets(t *testing.
 		t.Fatal("embeddeddolt nested file mtime bump failed to invalidate robot disk cache")
 	}
 
-	// 3. metadata.json custom database + jsonl_export outside standard filenames MUST invalidate!
+	// 3. metadata.json custom database + jsonl_export within .beads/ MUST invalidate, while ".." traversal escaping .beads/ MUST be rejected!
 	root3 := t.TempDir()
 	beads3 := filepath.Join(root3, ".beads")
-	altDir := filepath.Join(root3, "alt")
-	if err := os.MkdirAll(beads3, 0o755); err != nil {
-		t.Fatal(err)
+	customDir := filepath.Join(beads3, "custom")
+	outsideDir := filepath.Join(root3, "alt")
+	for _, d := range []string{beads3, customDir, outsideDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.MkdirAll(altDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	customDB := filepath.Join(altDir, "tracker.data")
+	customDB := filepath.Join(customDir, "tracker.data")
 	customWAL := customDB + "-wal"
-	customExport := filepath.Join(altDir, "export.ndjson")
+	customExport := filepath.Join(customDir, "export.ndjson")
+	outsideEscape := filepath.Join(outsideDir, "escape.data")
 	metaJSON := filepath.Join(beads3, "metadata.json")
-	for _, p := range []string{customDB, customWAL, customExport} {
+	for _, p := range []string{customDB, customWAL, customExport, outsideEscape} {
 		if err := os.WriteFile(p, []byte("{}\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -1525,11 +1526,13 @@ func TestRobotDiskCache_SymlinkedDBWALEmbeddedDoltAndMetadataTargets(t *testing.
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(metaJSON, []byte(`{"backend":"sqlite","database":"../alt/tracker.data","jsonl_export":"../alt/export.ndjson"}`), 0o644); err != nil {
+	if err := os.WriteFile(metaJSON, []byte("{\"backend\":\"sqlite\",\"database\":\"  custom/tracker.data \\n\",\"jsonl_export\":\" custom/export.ndjson \"}"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chtimes(metaJSON, base, base); err != nil {
-		t.Fatal(err)
+	for _, p := range []string{metaJSON, customDir, beads3} {
+		if err := os.Chtimes(p, base, base); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Setenv("BEADS_DB", beads3)
 	s = analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
@@ -1556,5 +1559,245 @@ func TestRobotDiskCache_SymlinkedDBWALEmbeddedDoltAndMetadataTargets(t *testing.
 	s.WaitForPhase2()
 	if got, err := os.ReadFile(cachePath); err != nil || string(got) == string(pinnedMeta2) {
 		t.Fatal("metadata.json custom jsonl_export bump failed to invalidate robot disk cache")
+	}
+
+	// Containment control: ".." escaping .beads/ in metadata.json must NOT fold external files.
+	if err := os.Chtimes(customExport, base, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(metaJSON, []byte(`{"backend":"sqlite","database":"../alt/escape.data","jsonl_export":".."}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(metaJSON, base, base); err != nil {
+		t.Fatal(err)
+	}
+	pinnedEscape := pinCreated()
+	if err := os.Chtimes(outsideEscape, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	s = analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	s.WaitForPhase2()
+	if got, err := os.ReadFile(cachePath); err != nil || string(got) != string(pinnedEscape) {
+		t.Fatal("metadata.json '..' path escaped .beads/ containment and invalidated robot disk cache")
+	}
+}
+
+func TestRobotDiskCache_MetadataDotDirectoryAndDoltNoms600TableFiles(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	cacheDir := t.TempDir()
+	t.Setenv("BV_CACHE_DIR", cacheDir)
+	t.Setenv("BEADS_DIR", "")
+
+	base := time.Now().Add(-4 * time.Hour).UTC().Truncate(time.Second)
+	cacheCreatedAt := base.Add(time.Hour)
+	newer := cacheCreatedAt.Add(30 * time.Minute)
+
+	issues := []model.Issue{
+		{ID: "D1", Status: model.StatusOpen},
+		{ID: "D2", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "D1", Type: model.DepBlocks}}},
+	}
+	config := analysis.ConfigForSize(2, 1)
+	fullKey := analysis.ComputeDataHash(issues) + "|" + analysis.ComputeConfigHash(&config)
+	cachePath := robotCacheEntryPath(cacheDir, fullKey)
+
+	pinCreated := func() []byte {
+		t.Helper()
+		raw, err := os.ReadFile(cachePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var entry map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			t.Fatal(err)
+		}
+		tsRaw, _ := json.Marshal(cacheCreatedAt)
+		zeroRaw, _ := json.Marshal(int64(0))
+		entry["created_at"] = tsRaw
+		entry["compute_duration"] = zeroRaw
+		out, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cachePath, out, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	// Part 1: metadata.json with "database": "." + sidecar FeedbackData.Save must preserve cache hit (no thrashing),
+	// while modifying an actual authority file invalidates it.
+	beadsDot := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issuesJSONL := filepath.Join(beadsDot, "issues.jsonl")
+	metaDot := filepath.Join(beadsDot, "metadata.json")
+	if err := os.WriteFile(issuesJSONL, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(metaDot, []byte("{\"backend\":\"sqlite\",\"database\":\" . \\n\",\"jsonl_export\":\".\"}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{issuesJSONL, metaDot, beadsDot} {
+		if err := os.Chtimes(p, base, base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("BEADS_DB", beadsDot)
+
+	s := analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	s.WaitForPhase2()
+	pinnedDot := pinCreated()
+
+	// Positive observable: FeedbackData.Save + SaveSprintsToFile write sidecars and bump .beads/ dir mtime;
+	// "database": "." must NOT walk .beads/ or thrash the cache!
+	fb := analysis.DefaultFeedbackData()
+	if err := fb.RecordFeedback("D1", "accept", 0.9, analysis.ScoreBreakdown{PageRankNorm: 0.7}); err != nil {
+		t.Fatalf("RecordFeedback: %v", err)
+	}
+	if err := fb.Save(beadsDot); err != nil {
+		t.Fatalf("FeedbackData.Save: %v", err)
+	}
+	if err := loader.SaveSprintsToFile(filepath.Join(beadsDot, loader.SprintsFileName), []model.Sprint{
+		{ID: "sp-dot", Name: "Dot Sprint", StartDate: base, EndDate: base.Add(24 * time.Hour)},
+	}); err != nil {
+		t.Fatalf("SaveSprintsToFile: %v", err)
+	}
+	s = analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	s.WaitForPhase2()
+	if got, err := os.ReadFile(cachePath); err != nil || string(got) != string(pinnedDot) {
+		t.Fatal("metadata.json 'database': '.' with FeedbackData.Save falsely invalidated robot disk cache")
+	}
+
+	// Planted negative control: updating issues.jsonl MUST invalidate the cache!
+	if err := os.Chtimes(issuesJSONL, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	s = analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	s.WaitForPhase2()
+	if got, err := os.ReadFile(cachePath); err != nil || string(got) == string(pinnedDot) {
+		t.Fatal("updating issues.jsonl failed to invalidate robot disk cache")
+	}
+
+	// Part 2: .beads/dolt/proj/.dolt/noms/ with 600 base32 table files (0000... .. 0599...) + manifest +
+	// vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv: LOCK / *.fslock / oldgen preserve cache hit, while mutating ONLY
+	// vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv (in-place write without changing directory mtime) invalidates!
+	beadsDolt := filepath.Join(t.TempDir(), ".beads")
+	nomsDir := filepath.Join(beadsDolt, "dolt", "proj", ".dolt", "noms")
+	if err := os.MkdirAll(nomsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(nomsDir, "manifest")
+	journalPath := filepath.Join(nomsDir, "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv")
+	for i := 0; i < 600; i++ {
+		tbl := filepath.Join(nomsDir, fmt.Sprintf("%04d%s", i, strings.Repeat("a", 28)))
+		if err := os.WriteFile(tbl, []byte("tbl"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(tbl, base, base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{manifestPath, journalPath} {
+		if err := os.WriteFile(p, []byte("dolt-v1-state---"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, base, base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, dir := range []string{
+		nomsDir,
+		filepath.Join(beadsDolt, "dolt", "proj", ".dolt"),
+		filepath.Join(beadsDolt, "dolt", "proj"),
+		filepath.Join(beadsDolt, "dolt"),
+		beadsDolt,
+	} {
+		if err := os.Chtimes(dir, base, base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("BEADS_DB", beadsDolt)
+
+	s = analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	s.WaitForPhase2()
+	pinnedDolt := pinCreated()
+
+	// Positive observable: writing LOCK, 0000.fslock (lexicographically first, visited before table 0000!),
+	// foo.fslock, and oldgen/archived inside noms/ must NOT invalidate the cache!
+	oldgenDir := filepath.Join(nomsDir, "oldgen")
+	if err := os.MkdirAll(oldgenDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, lockFile := range []string{
+		filepath.Join(nomsDir, "LOCK"),
+		filepath.Join(nomsDir, "0000.fslock"),
+		filepath.Join(nomsDir, "foo.fslock"),
+		filepath.Join(oldgenDir, "0000oldtable"),
+	} {
+		if err := os.WriteFile(lockFile, []byte("lock-or-gc"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s = analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	s.WaitForPhase2()
+	if got, err := os.ReadFile(cachePath); err != nil || string(got) != string(pinnedDolt) {
+		t.Fatal("writing LOCK / .fslock / oldgen inside noms/ falsely invalidated robot disk cache")
+	}
+
+	// Planted negative control: reset noms/ directory mtime to base, then mutate ONLY
+	// vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv in-place (advancing its mtime without changing directory mtime).
+	// Even with 600 lexicographically-earlier table files (0000..0599), eager head folding MUST invalidate!
+	if err := os.Chtimes(nomsDir, base, base); err != nil {
+		t.Fatal(err)
+	}
+	jf, err := os.OpenFile(journalPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jf.WriteAt([]byte("dolt-v2-state---"), 0); err != nil {
+		_ = jf.Close()
+		t.Fatal(err)
+	}
+	if err := jf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(journalPath, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	if dirInfo, err := os.Stat(nomsDir); err != nil || !dirInfo.ModTime().Equal(base) {
+		t.Fatalf("expected noms/ dir mtime to stay at %v during in-place write, got %v (err=%v)", base, dirInfo.ModTime(), err)
+	}
+
+	s = analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	s.WaitForPhase2()
+	if got, err := os.ReadFile(cachePath); err != nil || string(got) == string(pinnedDolt) {
+		t.Fatal("in-place mutation of Dolt journal vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv past 600 table files failed to invalidate robot disk cache")
+	}
+
+	// Also verify in-place mutation of manifest past 600 table files invalidates!
+	if err := os.Chtimes(journalPath, base, base); err != nil {
+		t.Fatal(err)
+	}
+	pinnedDolt2 := pinCreated()
+	mf, err := os.OpenFile(manifestPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mf.WriteAt([]byte("dolt-v3-manifest"), 0); err != nil {
+		_ = mf.Close()
+		t.Fatal(err)
+	}
+	if err := mf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(manifestPath, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	s = analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	s.WaitForPhase2()
+	if got, err := os.ReadFile(cachePath); err != nil || string(got) == string(pinnedDolt2) {
+		t.Fatal("in-place mutation of Dolt manifest past 600 table files failed to invalidate robot disk cache")
 	}
 }

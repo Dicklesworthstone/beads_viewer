@@ -1473,20 +1473,48 @@ func foldFileAndSQLiteSidecars(filePath string, latest time.Time) time.Time {
 	return latest
 }
 
+func resolveMetadataPathWithinDir(beadsDir, raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false
+	}
+	absBase, err := filepath.Abs(beadsDir)
+	if err != nil {
+		return "", false
+	}
+	cleanBase := filepath.Clean(absBase)
+	candidate := trimmed
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(cleanBase, candidate)
+	} else {
+		candidate = filepath.Clean(candidate)
+	}
+	rel, err := filepath.Rel(cleanBase, candidate)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", false
+	}
+	return candidate, true
+}
+
+func foldDoltNomsHeadFiles(nomsDir string, latest time.Time) time.Time {
+	for _, headFile := range []string{"manifest", "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"} {
+		if hInfo, hErr := os.Stat(filepath.Join(nomsDir, headFile)); hErr == nil && !hInfo.IsDir() && hInfo.ModTime().After(latest) {
+			latest = hInfo.ModTime()
+		}
+	}
+	return latest
+}
+
 func foldBeadsDirStoreModTime(dirPath string, latest time.Time) time.Time {
 	const maxBoundedWalkEntries = 512
 	info, err := os.Stat(dirPath)
 	if err != nil || !info.IsDir() {
 		return latest
 	}
-	if info.ModTime().After(latest) {
-		latest = info.ModTime()
-	}
 	rootPath := dirPath
 	if evalRoot, evalErr := filepath.EvalSymlinks(dirPath); evalErr == nil {
-		rootPath = evalRoot
-		if rInfo, rErr := os.Stat(rootPath); rErr == nil && rInfo.ModTime().After(latest) {
-			latest = rInfo.ModTime()
+		if rInfo, rErr := os.Stat(evalRoot); rErr == nil && rInfo.IsDir() {
+			rootPath = evalRoot
 		}
 	}
 	seen := 0
@@ -1495,14 +1523,40 @@ func foldBeadsDirStoreModTime(dirPath string, latest time.Time) time.Time {
 			return nil
 		}
 		lower := strings.ToLower(d.Name())
-		if strings.HasSuffix(lower, "-shm") || strings.HasSuffix(lower, ".lock") {
+		if d.IsDir() {
+			if lower == "oldgen" {
+				return fs.SkipDir
+			}
+			seen++
+			if seen > maxBoundedWalkEntries {
+				return fs.SkipAll
+			}
+			if lower == "noms" {
+				latest = foldDoltNomsHeadFiles(p, latest)
+			}
+			return nil
+		}
+		if lower == "lock" ||
+			strings.HasSuffix(lower, "-shm") ||
+			strings.HasSuffix(lower, ".lock") ||
+			strings.HasSuffix(lower, ".fslock") {
 			return nil
 		}
 		seen++
 		if seen > maxBoundedWalkEntries {
 			return fs.SkipAll
 		}
-		if pInfo, sErr := os.Stat(p); sErr == nil && pInfo.ModTime().After(latest) {
+		pInfo, sErr := os.Stat(p)
+		if sErr != nil {
+			return nil
+		}
+		if pInfo.IsDir() {
+			if lower == "noms" {
+				latest = foldDoltNomsHeadFiles(p, latest)
+			}
+			return nil
+		}
+		if pInfo.ModTime().After(latest) {
 			latest = pInfo.ModTime()
 		}
 		return nil
@@ -1567,21 +1621,11 @@ func beadsTreeModTime(beadsDir string) time.Time {
 			}
 			if jsonErr := json.Unmarshal(rawMeta, &meta); jsonErr == nil {
 				for _, target := range []string{meta.Database, meta.JSONLExport} {
-					trimmed := strings.TrimSpace(target)
-					if trimmed == "" {
+					resolved, ok := resolveMetadataPathWithinDir(beadsDir, strings.TrimSpace(target))
+					if !ok {
 						continue
 					}
-					resolved := trimmed
-					if !filepath.IsAbs(resolved) {
-						resolved = filepath.Join(beadsDir, resolved)
-					}
-					tInfo, tErr := os.Stat(resolved)
-					if tErr != nil {
-						continue
-					}
-					if tInfo.IsDir() {
-						latest = foldBeadsDirStoreModTime(resolved, latest)
-					} else {
+					if tInfo, tErr := os.Stat(resolved); tErr == nil && !tInfo.IsDir() {
 						latest = foldFileAndSQLiteSidecars(resolved, latest)
 					}
 				}
