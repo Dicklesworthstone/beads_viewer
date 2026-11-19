@@ -1332,9 +1332,35 @@ function getConnectedNodes(nodeId, depth = 2) {
 }
 
 const container = document.getElementById('graph-container');
+function lookupStandaloneNode(id) {
+    if (typeof Graph !== 'undefined' && Graph) {
+        const liveNodes = Graph.graphData()?.nodes;
+        if (Array.isArray(liveNodes)) {
+            const live = liveNodes.find(n => n.id === id);
+            if (live) return live;
+        }
+    }
+    if (Array.isArray(DATA?.nodes)) {
+        const fromData = DATA.nodes.find(n => n.id === id);
+        if (fromData) return fromData;
+    }
+    return nodeById[id] || null;
+}
 function buildGraphLinksForMode(blockingOnly) {
     return DATA.links
-        .filter(l => !blockingOnly || isBlockingLinkType(l.type))
+        .filter(l => {
+            if (!blockingOnly) return true;
+            if (!isBlockingLinkType(l.type)) return false;
+            const s = typeof l.source === 'object' ? l.source.id : l.source;
+            const t = typeof l.target === 'object' ? l.target.id : l.target;
+            if (!s || !t || s === t) return false;
+            const srcNode = lookupStandaloneNode(s);
+            const tgtNode = lookupStandaloneNode(t);
+            if ((srcNode && !isActiveNodeStatus(srcNode.status)) || (tgtNode && !isActiveNodeStatus(tgtNode.status))) {
+                return false;
+            }
+            return true;
+        })
         .map(l => ({
             ...l,
             source: typeof l.source === 'object' ? l.source.id : l.source,
@@ -2163,8 +2189,22 @@ document.getElementById('btn-top').onclick = () => {
     const visible = panel.classList.toggle('visible');
     document.getElementById('btn-top').classList.toggle('active', visible);
     if (visible) {
-        const sorted = [...DATA.nodes].sort((a, b) => (b.pagerank || 0) - (a.pagerank || 0)).slice(0, 10);
-        panel.innerHTML = sorted.map((n, i) => '<div class="top-node-item" data-id="' + escapeHTML(n.id) + '"><span class="rank">#' + escapeHTML(i+1) + '</span><span>' + escapeHTML(n.id) + '</span></div>').join('');
+        const rankedActive = DATA.nodes
+            .filter(n => isActiveNodeStatus(n.status) && Number(n.pagerank_rank) > 0)
+            .sort((a, b) => (Number(a.pagerank_rank) - Number(b.pagerank_rank)) || String(a.id).localeCompare(String(b.id)));
+        const activeFallback = DATA.nodes
+            .filter(n => isActiveNodeStatus(n.status))
+            .sort((a, b) => ((b.pagerank || 0) - (a.pagerank || 0)) || String(a.id).localeCompare(String(b.id)));
+        const sorted = (rankedActive.length > 0
+            ? rankedActive
+            : (activeFallback.length > 0
+                ? activeFallback
+                : [...DATA.nodes].sort((a, b) => ((b.pagerank || 0) - (a.pagerank || 0)) || String(a.id).localeCompare(String(b.id))))
+        ).slice(0, 10);
+        panel.innerHTML = sorted.map((n, i) => {
+            const rankNum = Number(n.pagerank_rank) > 0 ? Number(n.pagerank_rank) : (i + 1);
+            return '<div class="top-node-item" data-id="' + escapeHTML(n.id) + '"><span class="rank">#' + escapeHTML(rankNum) + '</span><span>' + escapeHTML(n.id) + '</span></div>';
+        }).join('');
         panel.querySelectorAll('.top-node-item').forEach(el => {
             el.onclick = () => {
                 const graphNodes = Graph.graphData().nodes;

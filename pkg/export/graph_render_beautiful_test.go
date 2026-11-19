@@ -97,7 +97,10 @@ func TestGenerateUltimateHTML_ClosedArticulationAndWithheldStatusGuards(t *testi
 		`if (isActiveNodeStatus(node.status) && node.is_articulation) addBadge('badge-articulation', 'Cut Vertex');`,
 		`if (isNodeWithheldFromReady(n)) {`,
 		`function buildGraphLinksForMode(blockingOnly)`,
-		`filter(l => !blockingOnly || isBlockingLinkType(l.type))`,
+		`if (!isBlockingLinkType(l.type)) return false;`,
+		`if (!s || !t || s === t) return false;`,
+		`if ((srcNode && !isActiveNodeStatus(srcNode.status)) || (tgtNode && !isActiveNodeStatus(tgtNode.status)))`,
+		`filter(n => isActiveNodeStatus(n.status) && Number(n.pagerank_rank) > 0)`,
 		`setGraphLinksMode(true);`,
 		`setGraphLinksMode(false);`,
 	} {
@@ -106,10 +109,11 @@ func TestGenerateUltimateHTML_ClosedArticulationAndWithheldStatusGuards(t *testi
 		}
 	}
 
-	// Planted negative controls: unguarded articulation checks must never appear.
+	// Planted negative controls: unguarded articulation checks and unranked closed-hub top-10 sort must never appear.
 	for _, forbidden := range []string{
 		`if (node.is_articulation && isHighlighted)`,
 		`if (node.is_articulation) addBadge('badge-articulation', 'Cut Vertex');`,
+		`const sorted = [...DATA.nodes].sort((a, b) => (b.pagerank || 0) - (a.pagerank || 0)).slice(0, 10);`,
 	} {
 		if strings.Contains(out, forbidden) {
 			t.Fatalf("generateUltimateHTML contains unguarded articulation check %q", forbidden)
