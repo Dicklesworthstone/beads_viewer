@@ -325,6 +325,41 @@ func hasActiveRequiredFlag(flags *flag.FlagSet, names ...string) bool {
 	return false
 }
 
+var primaryStringCommandFlags = map[string]bool{
+	"export-graph":              true,
+	"robot-docs":                true,
+	"robot-burndown":            true,
+	"robot-forecast":            true,
+	"bead-history":              true,
+	"robot-explain-correlation": true,
+	"robot-confirm-correlation": true,
+	"robot-reject-correlation":  true,
+	"robot-ignore-correlation":  true,
+	"robot-file-beads":          true,
+	"robot-commit":              true,
+	"robot-impact":              true,
+	"robot-file-relations":      true,
+	"robot-related":             true,
+	"robot-blocker-chain":       true,
+	"robot-whatif":              true,
+	"robot-cass":                true,
+	"robot-impact-network":      true,
+	"robot-causality":           true,
+	"robot-sprint-show":         true,
+	"diff-since":                true,
+	"search":                    true,
+	"save-baseline":             true,
+	"feedback-accept":           true,
+	"feedback-ignore":           true,
+	"export":                    true,
+	"export-md":                 true,
+	"export-pages":              true,
+	"preview-pages":             true,
+	"priority-brief":            true,
+	"agent-brief":               true,
+	"debug-render":              true,
+}
+
 func isFlagActive(flags *flag.FlagSet, name string) bool {
 	f := flags.Lookup(name)
 	if f == nil {
@@ -336,7 +371,7 @@ func isFlagActive(flags *flag.FlagSet, name string) bool {
 		v, err := flags.GetBool(name)
 		return err == nil && v
 	case "string":
-		if name == "export-graph" && flags.Changed(name) {
+		if primaryStringCommandFlags[name] && flags.Changed(name) {
 			return true
 		}
 		v, err := flags.GetString(name)
@@ -848,7 +883,7 @@ func rewriteRobotValueIntent(rest []string, context, boolFlag, valueFlag, defaul
 	if boolFlag != "" {
 		out = append(out, boolFlag)
 	}
-	if len(rest) > 0 && isPositionalValue(rest[0]) {
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
 		out = append(out, valueFlag, rest[0])
 		rest = rest[1:]
 	} else if defaultValue != "" {
@@ -1353,6 +1388,8 @@ func agentIntentCommandNames() []string {
 		"blocker-chain",
 		"whatif",
 		"what-if",
+		"cass",
+		"sessions",
 		"impact-network",
 		"causality",
 		"sprints",
@@ -2020,6 +2057,9 @@ func main() {
 		CapacityLabel:           capacityLabel,
 		NotReadyLabels:          robotNotReadyLabels,
 	})
+	phaseOneRobotRegistry.SetFlagSet(flag.CommandLine)
+	phaseTwoRobotRegistry.SetFlagSet(flag.CommandLine)
+	phaseThreeRobotRegistry.SetFlagSet(flag.CommandLine)
 	robotModifierRegistry := newRobotRegistry()
 	for _, mod := range []RobotCommand{
 		{Name: "format", FlagName: "format", FlagPtr: outputFormat, IsModifier: true, Description: "Structured output format for robot commands (json|toon)"},
@@ -2066,9 +2106,9 @@ func main() {
 			for _, nonTUIFlag := range []string{
 				"version", "help", "check-update", "update", "update-dry-run", "rollback",
 				"pages", "export-pages", "preview-pages", "export", "export-md", "export-graph", "hooks-info",
-				"priority-brief", "agent-brief", "emit-script", "profile-startup", "diff-since",
+				"priority-brief", "agent-brief", "emit-script", "profile-startup", "diff-since", "debug-render",
 				"init-drift", "save-baseline", "baseline-info", "check-drift",
-				"agents-add", "agents-update", "agents-remove", "agents-check", "agents-reset",
+				"agents-add", "agents-update", "agents-remove", "agents-check", "agents-reset", "agents-dry-run", "agents-force",
 				"feedback-accept", "feedback-ignore", "feedback-reset", "feedback-show",
 			} {
 				if f := flag.CommandLine.Lookup(nonTUIFlag); f != nil && f.Changed {
@@ -2227,13 +2267,23 @@ func main() {
 			{flags: []string{"robot-forecast"}},
 			{flags: []string{"robot-burndown"}},
 			{flags: []string{"robot-capacity"}},
+			{flags: []string{"version"}},
+			{flags: []string{"check-update"}},
+			{flags: []string{"update"}},
+			{flags: []string{"update-dry-run"}},
+			{flags: []string{"rollback"}},
+			{flags: []string{"debug-render"}},
 			{flags: []string{"init-drift"}},
 			{flags: []string{"save-baseline"}},
 			{flags: []string{"baseline-info"}},
 			{flags: []string{"hooks-info"}},
-			{flags: []string{"feedback-accept", "feedback-ignore", "feedback-reset", "feedback-show"}},
-			{flags: []string{"agents-add", "agents-remove", "agents-update", "agents-check", "agents-reset"}},
-			{flags: []string{"export", "export-md"}},
+			{flags: []string{"feedback-accept"}},
+			{flags: []string{"feedback-ignore"}},
+			{flags: []string{"feedback-reset"}},
+			{flags: []string{"feedback-show"}},
+			{flags: []string{"agents-add", "agents-remove", "agents-update", "agents-check", "agents-reset", "agents-dry-run", "agents-force"}},
+			{flags: []string{"export"}},
+			{flags: []string{"export-md"}},
 			{flags: []string{"export-pages"}},
 			{flags: []string{"pages"}},
 			{flags: []string{"preview-pages"}},
@@ -2252,6 +2302,22 @@ func main() {
 		if err := validateExclusivePrimaryCommands(flag.CommandLine, primaryRobotCommandGroups); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
+		}
+		for _, reqStrFlag := range []string{
+			"feedback-accept", "feedback-ignore", "export", "export-md",
+			"export-pages", "preview-pages", "priority-brief", "agent-brief",
+			"debug-render", "diff-since", "search",
+		} {
+			if flag.CommandLine.Changed(reqStrFlag) {
+				val, _ := flag.CommandLine.GetString(reqStrFlag)
+				if strings.TrimSpace(val) == "" {
+					fmt.Fprintf(os.Stderr, "Error: --%s requires a non-empty value\n", reqStrFlag)
+					os.Exit(1)
+				}
+			}
+		}
+		if flag.CommandLine.Changed("export-graph") && strings.TrimSpace(*exportGraph) == "" {
+			*exportGraph = "html"
 		}
 		if *emitScript {
 			for _, group := range primaryRobotCommandGroups {
@@ -2275,8 +2341,12 @@ func main() {
 		// Apply --db flag early so all downstream commands (including --hooks-info,
 		// --baseline-info, and recipe resolution) respect it.
 		// Priority: --db flag > BEADS_DB env > BEADS_DIR env > auto-discovery.
-		if *dbPath != "" {
-			absDB, err := filepath.Abs(*dbPath)
+		if flag.CommandLine.Changed("db") && strings.TrimSpace(*dbPath) == "" {
+			fmt.Fprintln(os.Stderr, "Error: --db requires a non-empty path")
+			os.Exit(1)
+		}
+		if strings.TrimSpace(*dbPath) != "" {
+			absDB, err := filepath.Abs(strings.TrimSpace(*dbPath))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error resolving --db path: %v\n", err)
 				os.Exit(1)
@@ -2552,7 +2622,17 @@ func main() {
 		}
 
 		// Handle --agents-* commands (bv-105)
-		agentsAnyAction := *agentsAdd || *agentsRemove || *agentsUpdate || *agentsCheck || *agentsReset
+		agentsActionCount := 0
+		for _, act := range []bool{*agentsAdd, *agentsRemove, *agentsUpdate, *agentsCheck, *agentsReset} {
+			if act {
+				agentsActionCount++
+			}
+		}
+		if agentsActionCount > 1 {
+			fmt.Fprintln(os.Stderr, "Error: specify at most one --agents-* action (--agents-add, --agents-remove, --agents-update, --agents-check, or --agents-reset)")
+			exitCLI(1)
+		}
+		agentsAnyAction := agentsActionCount > 0
 		agentsAnyFlag := agentsAnyAction || *agentsDryRun || *agentsForce
 		if agentsAnyFlag {
 			agentsRobotMode := robotMode || structuredFormatRequested
@@ -3136,6 +3216,7 @@ func main() {
 						fmt.Fprintf(os.Stderr, "Error creating workspace feedback directory: %v\n", err)
 						exitCLI(1)
 					}
+					_ = loader.EnsureBVIgnored(projectDir)
 				}
 			} else {
 				var err error
@@ -3180,10 +3261,10 @@ func main() {
 
 			// For accept/ignore, compute the issue's score breakdown at robotNow()
 			if *feedbackAccept != "" || *feedbackIgnore != "" {
-				issueID := *feedbackAccept
+				issueID := strings.TrimSpace(*feedbackAccept)
 				action := "accept"
 				if *feedbackIgnore != "" {
-					issueID = *feedbackIgnore
+					issueID = strings.TrimSpace(*feedbackIgnore)
 					action = "ignore"
 				}
 
@@ -3606,12 +3687,27 @@ func main() {
 		robotDispatchContext.Recipe = *recipeName
 		robotDispatchContext.Repo = *repoFilter
 		robotDispatchContext.ForceFullAnalysis = *forceFullAnalysis
+		// Name the source BEFORE scopeLoadedIssues so recipeMetricsForContext
+		// (including workspace triage feedback loading) sees SourceKind and SourcePath.
+		switch {
+		case *workspaceConfig != "":
+			robotDispatchContext.SourceKind = "workspace"
+			robotDispatchContext.SourcePath = *workspaceConfig
+		case *asOf != "":
+			robotDispatchContext.SourceKind = "git"
+			robotDispatchContext.SourcePath = fmt.Sprintf(".beads@%s", *asOf)
+		default:
+			if src := singleSourceLoad.Source; src.Path != "" {
+				robotDispatchContext.SourcePath = src.Path
+				robotDispatchContext.SourceKind = string(src.Type)
+			}
+		}
 		// The TUI retains source rows for its recipe picker. Robot and export
 		// consumers apply the recipe before producing their output.
 		recipeForScope := activeRecipe
 		if !(envRobot || *exportFile != "" || *exportReport != "" || *exportPages != "" || *pagesWizard || *exportGraph != "" ||
 			*priorityBrief != "" || *agentBrief != "" || *emitScript || *semanticQuery != "" ||
-			*checkDrift || *saveBaseline != "" || *diffSince != "") {
+			*checkDrift || flag.CommandLine.Changed("save-baseline") || *diffSince != "") {
 			recipeForScope = nil
 		}
 		scopedContext, scopeErr := scopeLoadedIssues(robotDispatchContext, recipeForScope)
@@ -3625,22 +3721,6 @@ func main() {
 		dataHash := scopedContext.DataHash
 		if *labelScope != "" && len(candidateIDs) == 0 && !envRobot {
 			fmt.Fprintf(os.Stderr, "Warning: No issues found with label %q\n", *labelScope)
-		}
-		// Name the source every payload was computed from (reality check
-		// 2026-09-01: a fresher sidecar could be loaded with nothing in the
-		// output revealing it).
-		switch {
-		case *workspaceConfig != "":
-			robotDispatchContext.SourceKind = "workspace"
-			robotDispatchContext.SourcePath = *workspaceConfig
-		case *asOf != "":
-			robotDispatchContext.SourceKind = "git"
-			robotDispatchContext.SourcePath = fmt.Sprintf(".beads@%s", *asOf)
-		default:
-			if src := singleSourceLoad.Source; src.Path != "" {
-				robotDispatchContext.SourcePath = src.Path
-				robotDispatchContext.SourceKind = string(src.Type)
-			}
 		}
 
 		// Handle semantic search CLI (bv-9gf.3)
@@ -4101,7 +4181,7 @@ func main() {
 
 				// Prepare optional WASM scorer assets before ExportBundle so
 				// beads.sqlite3 and data/meta.json accurately record has_hybrid_wasm.
-				if err := prepareBundleWasmAssets(bundle); err != nil {
+				if err := prepareBundleWasmAssets(bundle, projectDir, *noHooks); err != nil {
 					return fmt.Errorf("preparing hybrid wasm assets: %w", err)
 				}
 
@@ -4634,7 +4714,7 @@ func main() {
 		}
 
 		// Handle --save-baseline
-		if *saveBaseline != "" {
+		if flag.CommandLine.Changed("save-baseline") {
 			if *asOf != "" {
 				fmt.Fprintln(os.Stderr, "Error: --save-baseline cannot be combined with --as-of (historical snapshots are read-only)")
 				exitCLI(1)
@@ -5441,7 +5521,7 @@ func main() {
 				})
 			}
 			rev := asOfResolved
-			if rev == "" {
+			if workspaceInfo != nil || rev == "" {
 				rev = *asOf
 			}
 			m.SetAsOfRevision(rev)
@@ -5671,7 +5751,7 @@ func main() {
 		}
 		if *asOf != "" {
 			rev := asOfResolved
-			if rev == "" {
+			if workspaceInfo != nil || rev == "" {
 				rev = *asOf
 			}
 			m.SetAsOfRevision(rev)
@@ -6319,7 +6399,7 @@ func uiWorkspaceReposFromAuthority(authority *RobotSourceAuthority) []ui.Workspa
 	}
 	repos := make([]ui.WorkspaceRepoTarget, 0, len(authority.Sources))
 	for _, src := range authority.Sources {
-		if src.Status == "disabled" {
+		if src.Status == "disabled" || src.Status == "failed" {
 			continue
 		}
 		repoPath := strings.TrimSpace(src.RepoRoot)
@@ -6335,6 +6415,7 @@ func uiWorkspaceReposFromAuthority(authority *RobotSourceAuthority) []ui.Workspa
 			Path:     repoPath,
 			BeadsDir: beadsDir,
 			Prefix:   src.RepoPrefix,
+			Revision: strings.TrimSpace(src.AsOfCommit),
 		})
 	}
 	return repos
@@ -7287,18 +7368,8 @@ func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string)
 		}
 	}
 
-	// Copy optional WASM directory when not already staged by prepareBundleWasmAssets
-	if !bundle.HybridWasmPrepared() {
-		wasmSrc := filepath.Join(assetsDir, "wasm")
-		if err := copyWasmAssets(wasmSrc, bundle, "wasm"); err != nil {
-			if !os.IsNotExist(err) {
-				return fmt.Errorf("copy wasm: %w", err)
-			}
-		} else {
-			bundle.MarkHybridWasmPrepared()
-		}
-	}
-	if err := maybeBuildHybridWasmAssets(bundle); err != nil {
+	// Stage optional WASM directory when not already prepared by prepareBundleWasmAssets
+	if err := prepareBundleWasmAssets(bundle, "", false); err != nil {
 		return err
 	}
 	if err := bundle.BindOfflineBundleAssets(); err != nil {
@@ -7322,38 +7393,68 @@ func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle string)
 // export runs so ExportBundle records has_hybrid_wasm accurately. Subsequent
 // calls on the same *export.Bundle (for example from copyViewerAssetsWithSubtitle)
 // are idempotent no-ops.
-func prepareBundleWasmAssets(bundle *export.Bundle) error {
-	if bundle == nil {
+func prepareBundleWasmAssets(bundle *export.Bundle, projectDir string, noHooks bool) error {
+	if bundle == nil || bundle.HybridWasmPrepared() {
 		return nil
 	}
-	if !bundle.HybridWasmPrepared() {
-		var candidateDirs []string
-		if explicitDir := strings.TrimSpace(env.HybridWasmDir.Get()); explicitDir != "" {
-			candidateDirs = append(candidateDirs, explicitDir)
-		} else if cwd, err := os.Getwd(); err == nil && cwd != "" {
-			candidateDirs = append(candidateDirs, filepath.Join(cwd, ".bv", "wasm", "hybrid"))
+
+	// 1. Explicit BV_HYBRID_WASM_DIR: fail closed if configured directory is missing or incomplete.
+	if explicitDir := strings.TrimSpace(env.HybridWasmDir.Get()); explicitDir != "" {
+		jsInfo, jsErr := os.Lstat(filepath.Join(explicitDir, "bv_hybrid_scorer.js"))
+		bgInfo, bgErr := os.Lstat(filepath.Join(explicitDir, "bv_hybrid_scorer_bg.wasm"))
+		if jsErr != nil || !jsInfo.Mode().IsRegular() || bgErr != nil || !bgInfo.Mode().IsRegular() {
+			return fmt.Errorf("BV_HYBRID_WASM_DIR %q does not contain regular files bv_hybrid_scorer.js and bv_hybrid_scorer_bg.wasm", explicitDir)
 		}
-		if !export.HasEmbeddedAssets() {
-			if assetsDir := findViewerAssetsDir(); assetsDir != "" {
-				candidateDirs = append(candidateDirs, filepath.Join(assetsDir, "wasm"))
-			}
+		if err := copyWasmAssets(explicitDir, bundle, "wasm"); err != nil {
+			return fmt.Errorf("copy wasm from BV_HYBRID_WASM_DIR: %w", err)
 		}
-		for _, wasmSrc := range candidateDirs {
-			if wasmSrc == "" {
-				continue
-			}
-			jsInfo, jsErr := os.Stat(filepath.Join(wasmSrc, "bv_hybrid_scorer.js"))
-			bgInfo, bgErr := os.Stat(filepath.Join(wasmSrc, "bv_hybrid_scorer_bg.wasm"))
-			if jsErr == nil && !jsInfo.IsDir() && bgErr == nil && !bgInfo.IsDir() {
-				if err := copyWasmAssets(wasmSrc, bundle, "wasm"); err != nil {
-					return fmt.Errorf("copy wasm: %w", err)
-				}
-				bundle.MarkHybridWasmPrepared()
-				break
-			}
+		bundle.MarkHybridWasmPrepared()
+		return nil
+	}
+
+	// 2. Explicit BV_BUILD_HYBRID_WASM: build fresh from Rust source before consulting cached .bv/wasm/hybrid.
+	if strings.TrimSpace(env.BuildHybridWasm.Get()) != "" {
+		return maybeBuildHybridWasmAssets(bundle)
+	}
+
+	// 3. Project/CWD .bv/wasm/hybrid (suppressed under --no-hooks) and dev viewer_assets/wasm fallback.
+	var candidateDirs []string
+	seen := make(map[string]bool)
+	addCandidate := func(dir string) {
+		if strings.TrimSpace(dir) == "" {
+			return
+		}
+		clean := filepath.Clean(dir)
+		if !seen[clean] {
+			seen[clean] = true
+			candidateDirs = append(candidateDirs, clean)
 		}
 	}
-	return maybeBuildHybridWasmAssets(bundle)
+	if !noHooks {
+		if strings.TrimSpace(projectDir) != "" {
+			addCandidate(filepath.Join(projectDir, ".bv", "wasm", "hybrid"))
+		}
+		if cwd, err := os.Getwd(); err == nil && cwd != "" {
+			addCandidate(filepath.Join(cwd, ".bv", "wasm", "hybrid"))
+		}
+	}
+	if !export.HasEmbeddedAssets() {
+		if assetsDir := findViewerAssetsDir(); assetsDir != "" {
+			addCandidate(filepath.Join(assetsDir, "wasm"))
+		}
+	}
+	for _, wasmSrc := range candidateDirs {
+		jsInfo, jsErr := os.Lstat(filepath.Join(wasmSrc, "bv_hybrid_scorer.js"))
+		bgInfo, bgErr := os.Lstat(filepath.Join(wasmSrc, "bv_hybrid_scorer_bg.wasm"))
+		if jsErr == nil && jsInfo.Mode().IsRegular() && bgErr == nil && bgInfo.Mode().IsRegular() {
+			if err := copyWasmAssets(wasmSrc, bundle, "wasm"); err != nil {
+				return fmt.Errorf("copy wasm: %w", err)
+			}
+			bundle.MarkHybridWasmPrepared()
+			break
+		}
+	}
+	return nil
 }
 
 // maybeBuildHybridWasmAssets builds the optional hybrid search scorer with
@@ -7407,41 +7508,68 @@ func maybeBuildHybridWasmAssets(bundle *export.Bundle) error {
 	return nil
 }
 
-// copyWasmAssets copies wasm-pack browser runtime outputs into dstName inside
-// bundle while skipping dotfiles (notably wasm-pack's "*" .gitignore) and npm
-// package metadata.
+// copyWasmAssets copies only the allowlisted regular browser runtime artifacts
+// (bv_hybrid_scorer.js and bv_hybrid_scorer_bg.wasm) into dstName inside bundle,
+// rejecting symlinks, subdirectories, extra files (.d.ts/arbitrary JS), and
+// invalid WASM headers.
 func copyWasmAssets(src string, bundle *export.Bundle, dstName string) error {
-	srcInfo, err := os.Stat(src)
+	srcInfo, err := os.Lstat(src)
 	if err != nil {
 		return err
 	}
-	if err := bundle.MkdirAll(dstName, srcInfo.Mode().Perm()); err != nil {
-		return err
+	if !srcInfo.IsDir() {
+		return fmt.Errorf("wasm asset source %q is not a directory", src)
 	}
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		return err
 	}
+	copiedJS := false
+	copiedWasm := false
+	var dirCreated bool
 	for _, entry := range entries {
 		entryName := entry.Name()
-		if strings.HasPrefix(entryName, ".") {
-			continue
-		}
-		lower := strings.ToLower(entryName)
-		if lower == "package.json" || lower == "readme.md" || strings.HasPrefix(lower, "license") {
-			continue
-		}
 		srcPath := filepath.Join(src, entryName)
-		dstPath := filepath.Join(dstName, entryName)
-		if entry.IsDir() {
-			if err := copyWasmAssets(srcPath, bundle, dstPath); err != nil {
-				return err
-			}
-		} else {
-			if err := copyFile(srcPath, bundle, dstPath); err != nil {
-				return err
-			}
+		info, lstatErr := os.Lstat(srcPath)
+		if lstatErr != nil {
+			return lstatErr
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing symlink in wasm asset directory: %s", srcPath)
+		}
+		if entryName != "bv_hybrid_scorer.js" && entryName != "bv_hybrid_scorer_bg.wasm" {
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("wasm runtime artifact %s is not a regular file", srcPath)
+		}
+		data, readErr := os.ReadFile(srcPath)
+		if readErr != nil {
+			return readErr
+		}
+		if entryName == "bv_hybrid_scorer_bg.wasm" {
+			if len(data) < 8 || data[0] != 0x00 || data[1] != 0x61 || data[2] != 0x73 || data[3] != 0x6d {
+				return fmt.Errorf("invalid WASM binary header in %s", srcPath)
+			}
+			copiedWasm = true
+		} else {
+			if len(strings.TrimSpace(string(data))) == 0 {
+				return fmt.Errorf("empty JS glue file %s", srcPath)
+			}
+			copiedJS = true
+		}
+		if !dirCreated {
+			if err := bundle.MkdirAll(dstName, 0755); err != nil {
+				return err
+			}
+			dirCreated = true
+		}
+		if err := bundle.WriteFile(filepath.Join(dstName, entryName), data, 0644); err != nil {
+			return err
+		}
+	}
+	if !copiedJS || !copiedWasm {
+		return os.ErrNotExist
 	}
 	return nil
 }
@@ -8068,7 +8196,7 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 
 	// Prepare optional WASM scorer assets before ExportBundle so
 	// beads.sqlite3 and data/meta.json accurately record has_hybrid_wasm.
-	if err := prepareBundleWasmAssets(bundle); err != nil {
+	if err := prepareBundleWasmAssets(bundle, wizardProjectDir, noHooks); err != nil {
 		return fmt.Errorf("preparing hybrid wasm assets: %w", err)
 	}
 
@@ -8649,6 +8777,21 @@ type scopeCommit struct {
 	events    []ScopeChangeEvent
 }
 
+func resolveSprintPathForRel(sprintsFile string) string {
+	abs := sprintsFile
+	if a, err := filepath.Abs(sprintsFile); err == nil {
+		abs = a
+	}
+	if resolved, evalErr := filepath.EvalSymlinks(abs); evalErr == nil && resolved != "" {
+		return filepath.Clean(resolved)
+	}
+	dir := filepath.Dir(abs)
+	if resolvedDir, dirErr := filepath.EvalSymlinks(dir); dirErr == nil && resolvedDir != "" {
+		return filepath.Clean(filepath.Join(resolvedDir, filepath.Base(abs)))
+	}
+	return filepath.Clean(abs)
+}
+
 func computeSprintScopeChanges(repoPath string, sprint *model.Sprint, issueMap map[string]model.Issue, now time.Time) ([]ScopeChangeEvent, error) {
 	if sprint == nil || sprint.ID == "" {
 		return nil, nil
@@ -8663,32 +8806,20 @@ func computeSprintScopeChanges(repoPath string, sprint *model.Sprint, issueMap m
 		sprintsFile = abs
 	}
 	if gitRoot, rootErr := findEnclosingGitRoot(filepath.Dir(sprintsFile)); rootErr == nil && gitRoot != "" {
-		if absSprint, absErr := filepath.Abs(sprintsFile); absErr == nil {
-			if resolvedSprint, evalErr := filepath.EvalSymlinks(absSprint); evalErr == nil && resolvedSprint != "" {
-				absSprint = resolvedSprint
-			}
-			if rel, relErr := filepath.Rel(gitRoot, absSprint); relErr == nil && rel != "" && rel != "." && !strings.HasPrefix(rel, "..") {
-				return computeSprintScopeChangesAtPath(
-					gitRoot,
-					rel,
-					sprint.ID,
-					sprint,
-					issueMap,
-					now,
-					nil,
-				)
-			}
+		resolvedSprint := resolveSprintPathForRel(sprintsFile)
+		if rel, relErr := filepath.Rel(gitRoot, resolvedSprint); relErr == nil && rel != "" && rel != "." && !strings.HasPrefix(rel, "..") {
+			return computeSprintScopeChangesAtPath(
+				gitRoot,
+				rel,
+				sprint.ID,
+				sprint,
+				issueMap,
+				now,
+				nil,
+			)
 		}
 	}
-	return computeSprintScopeChangesAtPath(
-		repoPath,
-		filepath.Join(".beads", loader.SprintsFileName),
-		sprint.ID,
-		sprint,
-		issueMap,
-		now,
-		nil,
-	)
+	return nil, nil
 }
 
 func computeSprintScopeChangesAtPath(
