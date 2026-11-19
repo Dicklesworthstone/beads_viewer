@@ -329,6 +329,34 @@ every reported vulnerability has an exploitable execution path in bv.
   `--robot-max-results`/`--limit` list caps, `--export-include-actions`, and
   `BV_ROBOT`/`BV_OUTPUT_FORMAT`/`GOTOOLCHAIN=local` scrubbing across `pkg/updater`,
   `install.sh`, and `install.ps1`.
+- **Wave 18–19 `--robot-cass` (`46` robot commands), `DepParentChild` What-If &
+  unblock parity, TUI workspace/modal/board ergonomics, and static/WASM graph
+  determinism (`bv-apal.82`..`bv-apal.89`):** register `--robot-cass <bead-id>`
+  (`bv cass` / `bv sessions` intent aliases, `--as-of` pre-cutoff correlation,
+  `--robot-max-results` session caps, and bounded `BV_CASS_SEARCH_TIMEOUT_MS`);
+  enforce `--graph-root` subgraph `data_hash`/`scope_hash`/missing-ID exit `1`
+  across `--robot-triage`, `--robot-next`, and `--robot-graph`, workspace
+  `.bv/feedback.json` (`--feedback-*` + `--recipe` triage activation), monorepo &
+  `BEADS_DIR`-isolated `--robot-burndown` `scope_changes`, `--db`/`BEADS_DB`/
+  `BEADS_DIR` workspace isolation, bare `bv --export-graph`, `--export`/`--export-md`
+  `--robot-not-ready-labels` claim gating, and strict primary/intra-group CLI flag
+  exclusivity; traverse `DepParentChild` containers in `ComputeUnblocks`,
+  `ComputeWhatIf`, and triage `buildUnblocksMap` (preserving future-deferred
+  blockers), isolate robot disk cache freshness (`beadsTreeModTime`) to real issue
+  stores (following symlinks, `metadata.json` targets, and `embeddeddolt` while
+  ignoring sidecar/lock/`-shm` churn), enforce symmetric `SourceRepo` isolation in
+  `SuggestLabels`, canonicalize `ComputeRiskSignals` 0-ULP dependency ordering, and
+  fused single-pass JSONL validation; wire TUI workspace per-repo correlation/commit
+  opening (`BeadRepoKeys`, `WorkspaceRepoTarget.Revision`), `RenderDebugView` for
+  `flow`/`attention`/`labels`, unscoped->scoped `DataSnapshot.insights` guards,
+  sliding-window `CassSessionModal`, dedicated `BoardModel` Markdown card rendering +
+  viewport scroll preservation, and narrow-height modal layout bounds; and fix
+  `bv-graph-wasm` `kcore` self-loops, deterministic `articulation` bridge ordering,
+  and `betweennessApprox(0)` finite-zero guards (`verify_vendor.sh --source`),
+  active-issue PageRank hybrid normalization, `!wasmReady` Tarjan SCC cycle fallback,
+  active-only standalone HTML `DAG`/`#btn-top` ranking, `styles.css`/`graph_layout.json`
+  cache busting, regular-file allowlisted `copyWasmAssets`, and `*int` `issue_count`
+  Pages/Cloudflare deployment verification.
 
 ## v0.26.0 — 2026-11-02
 
