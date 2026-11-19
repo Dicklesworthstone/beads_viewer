@@ -6666,6 +6666,7 @@ func TestWave14TrackB(t *testing.T) {
 			t.Fatalf("[B-3] expected deferred status score 0.2 at refNow, got %+v (err=%v)", scoreAtRef, err)
 		}
 		// Negative control: wall-clock BuildHybridMetricsCmd treats 2025-01-17 deferral as expired ("open" -> 1.0)
+		t.Setenv("SOURCE_DATE_EPOCH", "")
 		wallMsg := BuildHybridMetricsCmd(copyIssues(hybIssues), 1, 1)().(HybridMetricsReadyMsg)
 		mAtWall, _ := wallMsg.Cache.Get("HYB-DEF")
 		if mAtWall.Status != "open" {
