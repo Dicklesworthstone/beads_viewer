@@ -2106,7 +2106,7 @@ func main() {
 			for _, nonTUIFlag := range []string{
 				"version", "help", "check-update", "update", "update-dry-run", "rollback",
 				"pages", "export-pages", "preview-pages", "export", "export-md", "export-graph", "hooks-info",
-				"priority-brief", "agent-brief", "emit-script", "profile-startup", "diff-since", "debug-render",
+				"priority-brief", "agent-brief", "emit-script", "profile-startup", "diff-since",
 				"init-drift", "save-baseline", "baseline-info", "check-drift",
 				"agents-add", "agents-update", "agents-remove", "agents-check", "agents-reset", "agents-dry-run", "agents-force",
 				"feedback-accept", "feedback-ignore", "feedback-reset", "feedback-show",
@@ -2277,10 +2277,7 @@ func main() {
 			{flags: []string{"save-baseline"}},
 			{flags: []string{"baseline-info"}},
 			{flags: []string{"hooks-info"}},
-			{flags: []string{"feedback-accept"}},
-			{flags: []string{"feedback-ignore"}},
-			{flags: []string{"feedback-reset"}},
-			{flags: []string{"feedback-show"}},
+			{flags: []string{"feedback-accept", "feedback-ignore", "feedback-reset", "feedback-show"}},
 			{flags: []string{"agents-add", "agents-remove", "agents-update", "agents-check", "agents-reset", "agents-dry-run", "agents-force"}},
 			{flags: []string{"export"}},
 			{flags: []string{"export-md"}},
@@ -2306,7 +2303,7 @@ func main() {
 		for _, reqStrFlag := range []string{
 			"feedback-accept", "feedback-ignore", "export", "export-md",
 			"export-pages", "preview-pages", "priority-brief", "agent-brief",
-			"debug-render", "diff-since", "search",
+			"debug-render", "diff-since",
 		} {
 			if flag.CommandLine.Changed(reqStrFlag) {
 				val, _ := flag.CommandLine.GetString(reqStrFlag)
@@ -2455,7 +2452,7 @@ func main() {
 			// When stdout is non-TTY, --diff-since auto-enables JSON output. Mark this
 			// as robot mode early so parsers keep stdout JSON clean.
 			(*diffSince != "" && !stdoutIsTTY) ||
-			(structuredFormatRequested && (*diffSince != "" || *semanticQuery != "" || *checkDrift || *baselineInfo || *initDrift ||
+			(structuredFormatRequested && (*diffSince != "" || flag.CommandLine.Changed("search") || *checkDrift || *baselineInfo || *initDrift ||
 				*agentsAdd || *agentsRemove || *agentsUpdate || *agentsCheck || *agentsReset || *agentsDryRun || *agentsForce ||
 				*feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset || *feedbackShow))
 
@@ -3176,12 +3173,18 @@ func main() {
 
 		// Handle feedback commands (bv-90, bv-apal.36)
 		if *feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset || *feedbackShow {
-			if *asOf != "" && (*feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset) {
-				fmt.Fprintln(os.Stderr, "Error: feedback mutation flags cannot be combined with --as-of")
+			feedbackActionCount := 0
+			for _, fbActive := range []bool{*feedbackAccept != "", *feedbackIgnore != "", *feedbackReset, *feedbackShow} {
+				if fbActive {
+					feedbackActionCount++
+				}
+			}
+			if feedbackActionCount > 1 {
+				fmt.Fprintln(os.Stderr, "Error: feedback flags (--feedback-accept, --feedback-ignore, --feedback-reset, --feedback-show) cannot be used together")
 				exitCLI(1)
 			}
-			if *feedbackAccept != "" && *feedbackIgnore != "" {
-				fmt.Fprintln(os.Stderr, "Error: --feedback-accept and --feedback-ignore cannot be used together")
+			if *asOf != "" && (*feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset) {
+				fmt.Fprintln(os.Stderr, "Error: feedback mutation flags cannot be combined with --as-of")
 				exitCLI(1)
 			}
 
@@ -3216,7 +3219,7 @@ func main() {
 						fmt.Fprintf(os.Stderr, "Error creating workspace feedback directory: %v\n", err)
 						exitCLI(1)
 					}
-					_ = loader.EnsureBVIgnored(projectDir)
+					_ = loader.EnsureBVIgnored(filepath.Dir(feedbackStoreDir))
 				}
 			} else {
 				var err error
@@ -3706,7 +3709,7 @@ func main() {
 		// consumers apply the recipe before producing their output.
 		recipeForScope := activeRecipe
 		if !(envRobot || *exportFile != "" || *exportReport != "" || *exportPages != "" || *pagesWizard || *exportGraph != "" ||
-			*priorityBrief != "" || *agentBrief != "" || *emitScript || *semanticQuery != "" ||
+			*priorityBrief != "" || *agentBrief != "" || *emitScript || flag.CommandLine.Changed("search") ||
 			*checkDrift || flag.CommandLine.Changed("save-baseline") || *diffSince != "") {
 			recipeForScope = nil
 		}
@@ -3724,7 +3727,7 @@ func main() {
 		}
 
 		// Handle semantic search CLI (bv-9gf.3)
-		if *semanticQuery != "" {
+		if flag.CommandLine.Changed("search") {
 			if !*robotSearch && (envRobot || structuredFormatRequested) {
 				*robotSearch = true
 			}

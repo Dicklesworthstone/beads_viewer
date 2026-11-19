@@ -2099,7 +2099,7 @@ func (b BoardModel) renderExpandedCard(issue model.Issue, width int, _, _ int, m
 	var descWrapped []string
 	if len(descLines) > 0 {
 		for _, ln := range strings.Split(descLines[0], "\n") {
-			descWrapped = append(descWrapped, ansi.Truncate(ln, innerW, "…"))
+			descWrapped = append(descWrapped, ansi.Truncate(strings.TrimRight(ln, " "), innerW, "…"))
 		}
 	}
 	var depWrapped []string

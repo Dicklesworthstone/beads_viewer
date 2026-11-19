@@ -8598,6 +8598,8 @@ func TestWave19Round1AuditRemediationsR1B1ToR1B7(t *testing.T) {
 			m.tutorialModel.SetContextMode(false)
 			m.tutorialModel, _ = m.tutorialModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
 			m.tutorialModel, _ = m.tutorialModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+			m.tutorialModel, _ = m.tutorialModel.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			m.tutorialModel, _ = m.tutorialModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")})
 			tutFull := ansi.Strip(m.View())
 			if gotH := lipgloss.Height(tutFull); gotH != termH {
 				t.Fatalf("80x%d Tutorial m.View() height = %d, want %d:\n%s", termH, gotH, termH, tutFull)
@@ -8624,7 +8626,7 @@ func TestWave19Round1AuditRemediationsR1B1ToR1B7(t *testing.T) {
 				Workspace:    "/very/long/workspace/directory/path/that/would/otherwise/wrap/search/cmd",
 				ReferenceNow: refNow,
 			})
-			m.cassModal.SetSize(m.width, max(1, m.height-1))
+			m.cassModal.SetSize(m.width, m.height)
 			m.showCassModal = true
 			m.focused = focusCassModal
 			for range 4 {

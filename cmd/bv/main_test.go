@@ -9004,3 +9004,368 @@ exit 1
 		t.Fatalf("wasm-pack .gitignore must not be copied into bundle wasm/ directory, err=%v", err)
 	}
 }
+
+func TestWave19_TrackD_AuditRemediations(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "")
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	exe := buildTestBinary(t)
+	origPath := os.Getenv("PATH")
+
+	// [R1-D4] & [R1-D3]: agentIntentCommandNames includes cass/sessions and cassLookupBudget clamps bounds safely.
+	intentNames := agentIntentCommandNames()
+	hasCassIntent, hasSessionsIntent := false, false
+	for _, n := range intentNames {
+		if n == "cass" {
+			hasCassIntent = true
+		}
+		if n == "sessions" {
+			hasSessionsIntent = true
+		}
+	}
+	if !hasCassIntent || !hasSessionsIntent {
+		t.Fatalf("expected agentIntentCommandNames to contain cass and sessions, got %v", intentNames)
+	}
+	t.Setenv("BV_CASS_SEARCH_TIMEOUT_MS", "0")
+	if got := cassLookupBudget(); got != 3000*time.Millisecond {
+		t.Fatalf("cassLookupBudget(0) = %v, want 3s", got)
+	}
+	t.Setenv("BV_CASS_SEARCH_TIMEOUT_MS", "25")
+	if got := cassLookupBudget(); got != 100*time.Millisecond {
+		t.Fatalf("cassLookupBudget(25) = %v, want 100ms", got)
+	}
+	t.Setenv("BV_CASS_SEARCH_TIMEOUT_MS", "999999999")
+	if got := cassLookupBudget(); got != 3600000*time.Millisecond {
+		t.Fatalf("cassLookupBudget(overflow) = %v, want 1h cap", got)
+	}
+	t.Setenv("BV_CASS_SEARCH_TIMEOUT_MS", "")
+
+	// Fixture project for CLI validation checks.
+	projDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fixtureJSONL := strings.Join([]string{
+		`{"id":"api-1","title":"API root blocker","status":"open","priority":1,"issue_type":"task","labels":["api"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+		`{"id":"web-2","title":"Web dependent neighbor","status":"open","priority":2,"issue_type":"task","labels":["web"],"dependencies":[{"issue_id":"web-2","depends_on_id":"api-1","type":"blocks"}],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+		`{"id":"solo-3","title":"Independent task","status":"open","priority":2,"issue_type":"task","labels":["api"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(projDir, ".beads", "issues.jsonl"), []byte(fixtureJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// [R1-D1], [R1-D7], [R1-D8], [R1-D10]: Empty/whitespace primary string flags and newly separated exclusive groups fail fast (exit 1).
+	for _, badArgs := range [][]string{
+		{"--robot-cass", ""},
+		{"--robot-cass", "   "},
+		{"cass", "", "--json"},
+		{"--robot-whatif", ""},
+		{"--bead-history", ""},
+		{"--robot-file-beads", ""},
+		{"--robot-impact", " , "},
+		{"--robot-file-relations", ""},
+		{"--robot-sprint-show", ""},
+		{"--robot-burndown", ""},
+		{"--robot-forecast", ""},
+		{"--feedback-accept", ""},
+		{"--export-md", ""},
+		{"--db", "", "--robot-triage"},
+		{"--version", "--robot-triage"},
+		{"--feedback-reset", "--feedback-show"},
+		{"--export", filepath.Join(projDir, "a.md"), "--export-md", filepath.Join(projDir, "b.md")},
+		{"--agents-add", "--agents-remove"},
+		{"--agents-dry-run", "--robot-triage"},
+		{"--debug-render", "triage", "--robot-triage"},
+		{"--robot-cass", "", "--robot-triage"},
+	} {
+		if out, errStr, err := runCommandWithTimeout(t, projDir, exe, badArgs...); err == nil {
+			t.Fatalf("expected %v to fail closed, succeeded with stdout=%s stderr=%s", badArgs, out, errStr)
+		}
+	}
+
+	// [R1-D5] & [R1-D6]: --robot-graph / --robot-triage --graph-root missing or 1-hop cross-label neighbor fails exit 1; valid --graph-root updates data_hash.
+	if _, stderr, err := runCommandWithTimeout(t, projDir, exe, "--robot-graph", "--graph-root", "missing-999"); err == nil || !strings.Contains(stderr, "Root issue not found: missing-999") {
+		t.Fatalf("expected --robot-graph --graph-root missing-999 to fail with Root issue not found, err=%v stderr=%s", err, stderr)
+	}
+	if _, stderr, err := runCommandWithTimeout(t, projDir, exe, "--robot-graph", "--label", "api", "--graph-root", "web-2"); err == nil || !strings.Contains(stderr, "Root issue not found: web-2") {
+		t.Fatalf("expected 1-hop cross-label neighbor web-2 to be rejected as --graph-root under --label api, err=%v stderr=%s", err, stderr)
+	}
+	if _, stderr, err := runCommandWithTimeout(t, projDir, exe, "--robot-triage", "--label", "api", "--graph-root", "web-2"); err == nil || !strings.Contains(stderr, "Root issue not found: web-2") {
+		t.Fatalf("expected 1-hop cross-label neighbor web-2 to be rejected as triage --graph-root under --label api, err=%v stderr=%s", err, stderr)
+	}
+	fullGraphOut, _, err := runCommandWithTimeout(t, projDir, exe, "--robot-graph")
+	if err != nil {
+		t.Fatal(err)
+	}
+	soloGraphOut, soloGraphErr, err := runCommandWithTimeout(t, projDir, exe, "--robot-graph", "--graph-root", "solo-3")
+	if err != nil {
+		t.Fatalf("--robot-graph --graph-root solo-3 failed: %v\nstderr=%s", err, soloGraphErr)
+	}
+	var fullG, soloG struct {
+		DataHash  string `json:"data_hash"`
+		ScopeHash string `json:"scope_hash"`
+		Nodes     int    `json:"nodes"`
+	}
+	_ = json.Unmarshal([]byte(fullGraphOut), &fullG)
+	_ = json.Unmarshal([]byte(soloGraphOut), &soloG)
+	if soloG.Nodes != 1 || soloG.DataHash == "" || soloG.DataHash == fullG.DataHash || soloG.ScopeHash == fullG.ScopeHash {
+		t.Fatalf("expected --robot-graph --graph-root solo-3 to emit 1 node and distinct subgraph data_hash/scope_hash, full=%+v solo=%+v", fullG, soloG)
+	}
+
+	// [R1-D12]: `--export-graph="" --recipe actionable` normalizes *exportGraph before recipeForScope so blocked web-2 is excluded from exported graph nodes (2 nodes, not 3).
+	egOut, egErr, err := runCommandWithTimeout(t, projDir, exe, "--export-graph=", "--recipe", "actionable")
+	if err != nil {
+		t.Fatalf("--export-graph= --recipe actionable failed: %v\nstderr=%s", err, egErr)
+	}
+	if !strings.Contains(egOut, "(2 nodes,") {
+		t.Fatalf("expected --export-graph= --recipe actionable to export 2 actionable nodes, got stdout=%s", egOut)
+	}
+	htmlMatches, _ := filepath.Glob(filepath.Join(projDir, "*graph*.html"))
+	if len(htmlMatches) != 1 {
+		t.Fatalf("expected 1 exported HTML graph file, got %v", htmlMatches)
+	}
+	htmlBytes, err := os.ReadFile(htmlMatches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(htmlBytes), `"id":"web-2"`) || !strings.Contains(string(htmlBytes), `"id":"api-1"`) {
+		t.Fatalf("expected --export-graph= --recipe actionable to exclude blocked node id web-2 and retain id api-1")
+	}
+
+	// [R1-D2]: --robot-cass --as-of + --robot-max-results 5 under SOURCE_DATE_EPOCH=315532800 rejects post-cutoff & undated Strategy 1 hits,
+	// falls through to Strategy 2 without --days, and returns 5 ranked historical hits.
+	cassGit := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cassGit, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runCassGit := func(envExtra []string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = cassGit
+		cmd.Env = append(append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=t@example.com",
+		), envExtra...)
+		out, gErr := cmd.CombinedOutput()
+		if gErr != nil {
+			t.Fatalf("git %v: %v\n%s", args, gErr, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runCassGit(nil, "init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(cassGit, ".beads", "issues.jsonl"), []byte(
+		`{"id":"bv-hist","title":"OAuth token refresh","status":"open","priority":1,"issue_type":"task","created_at":"2026-05-01T00:00:00Z","updated_at":"2026-05-01T00:00:00Z"}`+"\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCassGit(nil, "add", ".")
+	runCassGit([]string{"GIT_AUTHOR_DATE=2026-05-10T12:00:00Z", "GIT_COMMITTER_DATE=2026-05-10T12:00:00Z"}, "commit", "-m", "snap 1")
+	snap1SHA := runCassGit(nil, "rev-parse", "HEAD")
+
+	snapTime := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	futureIDMs := snapTime.Add(36 * time.Hour).UnixMilli()
+	futureKwMs := snapTime.Add(24 * time.Hour).UnixMilli()
+	fakeCassDir := t.TempDir()
+	fakeCassScript := fmt.Sprintf(`#!/usr/bin/env bash
+if [ "${1:-}" = "health" ]; then
+  exit 0
+fi
+for arg in "$@"; do
+  if [ "$arg" = "--days" ]; then
+    echo "unexpected --days flag in historical cutoff mode" >&2
+    exit 2
+  fi
+done
+query="${2:-}"
+case "$query" in
+  \"*\")
+    cat <<'EOF'
+{"hits":[
+  {"source_path":"/s/future-id.jsonl","line_number":1,"agent":"claude","title":"Future","score":9.0,"content":"fixed bv-hist","created_at":%d,"workspace":%q},
+  {"source_path":"/s/undated-id.jsonl","line_number":2,"agent":"claude","title":"Undated","score":9.0,"content":"fixed bv-hist","workspace":%q}
+],"total_matches":2}
+EOF
+    ;;
+  *)
+    cat <<'EOF'
+{"hits":[
+  {"source_path":"/s/kw-future.jsonl","line_number":1,"agent":"claude","title":"OAuth","score":9.0,"content":"oauth token refresh","created_at":%d,"workspace":%q},
+  {"source_path":"/s/kw-undated.jsonl","line_number":2,"agent":"claude","title":"OAuth","score":9.0,"content":"oauth token refresh","workspace":%q},
+  {"source_path":"/s/kw-1.jsonl","line_number":11,"agent":"claude","title":"OAuth 1","score":9.0,"content":"oauth token refresh","created_at":%d,"workspace":%q},
+  {"source_path":"/s/kw-2.jsonl","line_number":12,"agent":"claude","title":"OAuth 2","score":8.0,"content":"oauth token refresh","created_at":%d,"workspace":%q},
+  {"source_path":"/s/kw-3.jsonl","line_number":13,"agent":"claude","title":"OAuth 3","score":7.0,"content":"oauth token refresh","created_at":%d,"workspace":%q},
+  {"source_path":"/s/kw-4.jsonl","line_number":14,"agent":"claude","title":"OAuth 4","score":6.0,"content":"oauth token refresh","created_at":%d,"workspace":%q},
+  {"source_path":"/s/kw-5.jsonl","line_number":15,"agent":"claude","title":"OAuth 5","score":5.0,"content":"oauth token refresh","created_at":%d,"workspace":%q},
+  {"source_path":"/s/kw-6.jsonl","line_number":16,"agent":"claude","title":"OAuth 6","score":4.0,"content":"oauth token refresh","created_at":%d,"workspace":%q}
+],"total_matches":8}
+EOF
+    ;;
+esac
+`,
+		futureIDMs, cassGit, cassGit,
+		futureKwMs, cassGit, cassGit,
+		snapTime.Add(-24*time.Hour).UnixMilli(), cassGit,
+		snapTime.Add(-25*time.Hour).UnixMilli(), cassGit,
+		snapTime.Add(-26*time.Hour).UnixMilli(), cassGit,
+		snapTime.Add(-27*time.Hour).UnixMilli(), cassGit,
+		snapTime.Add(-28*time.Hour).UnixMilli(), cassGit,
+		snapTime.Add(-29*time.Hour).UnixMilli(), cassGit,
+	)
+	if err := os.WriteFile(filepath.Join(fakeCassDir, "cass"), []byte(fakeCassScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeCassDir+string(os.PathListSeparator)+origPath)
+	t.Setenv("SOURCE_DATE_EPOCH", "315532800") // 1980-01-01: must NOT clobber 2026 AsOfCommitTime cutoff!
+	cassAsOfOut, cassAsOfErr, err := runCommandWithTimeout(t, cassGit, exe, "--robot-cass", "bv-hist", "--as-of", snap1SHA, "--robot-max-results", "5")
+	t.Setenv("SOURCE_DATE_EPOCH", "")
+	t.Setenv("PATH", origPath)
+	if err != nil {
+		t.Fatalf("--robot-cass --as-of --robot-max-results 5 failed: %v\nstderr=%s", err, cassAsOfErr)
+	}
+	var cassAsOfPayload struct {
+		Strategy   string             `json:"strategy"`
+		TotalFound int                `json:"total_found"`
+		Sessions   []robotCassSession `json:"sessions"`
+	}
+	if err := json.Unmarshal([]byte(cassAsOfOut), &cassAsOfPayload); err != nil {
+		t.Fatalf("unmarshal cass --as-of output: %v\nraw=%s", err, cassAsOfOut)
+	}
+	if cassAsOfPayload.Strategy != "keywords" || len(cassAsOfPayload.Sessions) != 5 || cassAsOfPayload.TotalFound != 6 {
+		t.Fatalf("expected keywords strategy with 5 sessions and total_found=6, got %+v", cassAsOfPayload)
+	}
+	for _, s := range cassAsOfPayload.Sessions {
+		if strings.Contains(s.SourcePath, "future") || strings.Contains(s.SourcePath, "undated") {
+			t.Fatalf("post-cutoff or undated session leaked into --as-of output: %+v", s)
+		}
+	}
+
+	// [R1-D9] & [R1-D10]: External BEADS_DIR outside git repo must NOT leak host git repo's .beads/sprints.jsonl history into --robot-burndown.
+	hostGit := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hostGit, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runHostGit := func(envExtra []string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = hostGit
+		cmd.Env = append(append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=t@example.com",
+		), envExtra...)
+		if out, gErr := cmd.CombinedOutput(); gErr != nil {
+			t.Fatalf("git %v: %v\n%s", args, gErr, out)
+		}
+	}
+	runHostGit(nil, "init", "-b", "main")
+	_ = os.WriteFile(filepath.Join(hostGit, ".beads", "issues.jsonl"), []byte(`{"id":"h-1","title":"Host","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(hostGit, ".beads", "sprints.jsonl"), []byte(`{"id":"sp-shared","name":"Host Sprint","start_date":"2026-01-01T00:00:00Z","end_date":"2026-01-20T00:00:00Z","bead_ids":[]}`+"\n"), 0o644)
+	runHostGit(nil, "add", ".")
+	runHostGit([]string{"GIT_AUTHOR_DATE=2026-01-02T12:00:00Z", "GIT_COMMITTER_DATE=2026-01-02T12:00:00Z"}, "commit", "-m", "c1")
+	_ = os.WriteFile(filepath.Join(hostGit, ".beads", "sprints.jsonl"), []byte(`{"id":"sp-shared","name":"Host Sprint","start_date":"2026-01-01T00:00:00Z","end_date":"2026-01-20T00:00:00Z","bead_ids":["h-1"]}`+"\n"), 0o644)
+	runHostGit(nil, "add", ".")
+	runHostGit([]string{"GIT_AUTHOR_DATE=2026-01-05T12:00:00Z", "GIT_COMMITTER_DATE=2026-01-05T12:00:00Z"}, "commit", "-m", "c2")
+
+	extBeads := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(extBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(extBeads, "issues.jsonl"), []byte(`{"id":"h-1","title":"External","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(extBeads, "sprints.jsonl"), []byte(`{"id":"sp-shared","name":"External Sprint","start_date":"2026-01-01T00:00:00Z","end_date":"2026-01-20T00:00:00Z","bead_ids":["h-1"]}`+"\n"), 0o644)
+	t.Setenv("BEADS_DIR", extBeads)
+	t.Setenv("SOURCE_DATE_EPOCH", "1768003200")
+	extBdOut, extBdErr, err := runCommandWithTimeout(t, hostGit, exe, "--robot-burndown", "sp-shared")
+	t.Setenv("SOURCE_DATE_EPOCH", "")
+	t.Setenv("BEADS_DIR", "")
+	if err != nil {
+		t.Fatalf("BEADS_DIR external --robot-burndown failed: %v\nstderr=%s", err, extBdErr)
+	}
+	if strings.Contains(extBdOut, `"scope_changes"`) {
+		t.Fatalf("host git repo .beads/sprints.jsonl scope_changes leaked into external BEADS_DIR burndown:\n%s", extBdOut)
+	}
+
+	// [R1-D11]: Workspace feedback >= 5 samples writes .git/info/exclude (EnsureBVIgnored) and activates feedback under `--recipe triage --robot-triage`.
+	wsRoot := t.TempDir()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("BV_NO_GITIGNORE", "")
+	wsRepo := filepath.Join(wsRoot, "packages", "svc")
+	if err := os.MkdirAll(filepath.Join(wsRoot, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsRoot, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var wsIssuesLines []string
+	for i := 1; i <= 5; i++ {
+		wsIssuesLines = append(wsIssuesLines, fmt.Sprintf(
+			`{"id":"bv-%d","title":"Task %d","status":"open","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`,
+			i, i,
+		))
+	}
+	if err := os.WriteFile(filepath.Join(wsRepo, ".beads", "issues.jsonl"), []byte(strings.Join(wsIssuesLines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wsCfg := filepath.Join(wsRoot, ".bv", "workspace.yaml")
+	if err := os.WriteFile(wsCfg, []byte("name: test\nrepos:\n  - name: svc\n    path: packages/svc\n    prefix: svc-\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 5; i++ {
+		if _, fbErr, err := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsCfg, "--feedback-accept", fmt.Sprintf("svc-bv-%d", i)); err != nil {
+			t.Fatalf("--feedback-accept %d failed: %v\nstderr=%s", i, err, fbErr)
+		}
+	}
+	if excludeBytes, gErr := os.ReadFile(filepath.Join(wsRoot, ".git", "info", "exclude")); gErr != nil || !strings.Contains(string(excludeBytes), ".bv/") {
+		t.Fatalf("expected EnsureBVIgnored to add .bv/ to workspace .git/info/exclude, err=%v content=%q", gErr, string(excludeBytes))
+	}
+	wsRecipeTriageOut, wsRecipeTriageErr, err := runCommandWithTimeout(t, wsRoot, exe, "--workspace", wsCfg, "--recipe", "triage", "--robot-triage")
+	if err != nil {
+		t.Fatalf("--workspace --recipe triage --robot-triage failed: %v\nstderr=%s", err, wsRecipeTriageErr)
+	}
+	if !strings.Contains(wsRecipeTriageOut, `"applied":true`) && !strings.Contains(wsRecipeTriageOut, `"applied": true`) {
+		t.Fatalf("expected >=5 workspace feedback samples to activate feedback (applied=true) under --recipe triage:\n%s", wsRecipeTriageOut)
+	}
+
+	// [R1-D13]: --export-pages --no-hooks suppresses .bv/wasm/hybrid; invalid BV_HYBRID_WASM_DIR fails closed; copyWasmAssets strips .d.ts and rejects symlinks.
+	wasmProj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(wasmProj, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(wasmProj, ".beads", "issues.jsonl"), []byte(fixtureJSONL), 0o644)
+	wasmDropIn := filepath.Join(wasmProj, ".bv", "wasm", "hybrid")
+	if err := os.MkdirAll(wasmDropIn, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(wasmDropIn, "bv_hybrid_scorer.js"), []byte("export default function init() {}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(wasmDropIn, "bv_hybrid_scorer_bg.wasm"), []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}, 0o644)
+	_ = os.WriteFile(filepath.Join(wasmDropIn, "bv_hybrid_scorer.d.ts"), []byte("export function init(): void;\n"), 0o644)
+
+	// Without --no-hooks: copies only .js and .wasm (not .d.ts) and sets has_hybrid_wasm=true.
+	withHooksOut := filepath.Join(wasmProj, "pages-hooks")
+	if _, pgErr, err := runCommandWithTimeout(t, wasmProj, exe, "--export-pages", withHooksOut); err != nil {
+		t.Fatalf("--export-pages failed: %v\nstderr=%s", err, pgErr)
+	}
+	if _, err := os.Stat(filepath.Join(withHooksOut, "wasm", "bv_hybrid_scorer.d.ts")); !os.IsNotExist(err) {
+		t.Fatalf("expected .d.ts to be excluded from bundle wasm/, err=%v", err)
+	}
+	// With --no-hooks: suppresses .bv/wasm/hybrid!
+	noHooksOut := filepath.Join(wasmProj, "pages-no-hooks")
+	if _, pgErr, err := runCommandWithTimeout(t, wasmProj, exe, "--export-pages", noHooksOut, "--no-hooks"); err != nil {
+		t.Fatalf("--export-pages --no-hooks failed: %v\nstderr=%s", err, pgErr)
+	}
+	noHooksMeta, err := os.ReadFile(filepath.Join(noHooksOut, "data", "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(noHooksMeta), `"has_hybrid_wasm": false`) && !strings.Contains(string(noHooksMeta), `"has_hybrid_wasm":false`) {
+		t.Fatalf("expected --no-hooks to suppress .bv/wasm/hybrid (has_hybrid_wasm=false), got:\n%s", string(noHooksMeta))
+	}
+	// Explicit missing BV_HYBRID_WASM_DIR fails closed.
+	t.Setenv("BV_HYBRID_WASM_DIR", filepath.Join(wasmProj, "missing-wasm-dir"))
+	_, missingWasmErr, err := runCommandWithTimeout(t, wasmProj, exe, "--export-pages", filepath.Join(wasmProj, "pages-bad-env"))
+	t.Setenv("BV_HYBRID_WASM_DIR", "")
+	if err == nil || !strings.Contains(missingWasmErr, "BV_HYBRID_WASM_DIR") {
+		t.Fatalf("expected missing BV_HYBRID_WASM_DIR to fail closed, err=%v stderr=%s", err, missingWasmErr)
+	}
+}

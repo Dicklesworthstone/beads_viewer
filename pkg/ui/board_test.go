@@ -2398,17 +2398,14 @@ func TestBoardDetailScrollPreservationWithExpandedCardAnd24RowMultiDepBounds(t *
 	b.ToggleDetail()
 	b.ToggleExpand()
 	initialOut := ansi.Strip(b.View(150, 26))
-	if !strings.Contains(initialOut, "LINE_01") {
-		t.Fatalf("expected LINE_01 at initial detail scroll top:\n%s", initialOut)
+	if !strings.Contains(initialOut, "LINE_01") || strings.Contains(initialOut, "LINE_12") {
+		t.Fatalf("expected LINE_01 (and not LINE_12) at initial detail scroll top:\n%s", initialOut)
 	}
 	b.DetailScrollDown(18)
 	scrolledOut1 := ansi.Strip(b.View(150, 26))
 	scrolledOut2 := ansi.Strip(b.View(150, 26))
-	if strings.Contains(scrolledOut1, "LINE_01") || strings.Contains(scrolledOut2, "LINE_01") {
-		t.Fatalf("detail panel scroll reset to top LINE_01 across View() while card was inline-expanded:\n%s", scrolledOut2)
-	}
-	if !strings.Contains(scrolledOut2, "LINE_1") && !strings.Contains(scrolledOut2, "LINE_2") {
-		t.Fatalf("expected lower detail lines after scrolling down 18 lines:\n%s", scrolledOut2)
+	if !strings.Contains(scrolledOut1, "LINE_12") || !strings.Contains(scrolledOut2, "LINE_12") || !strings.Contains(scrolledOut2, "% ─ ctrl+j/k") {
+		t.Fatalf("detail panel scroll reset to top across View() while card was inline-expanded:\n%s", scrolledOut2)
 	}
 
 	// Planted negative control: navigating to SCROLL-2 auto-collapses SCROLL-1 and resets detail scroll to top.

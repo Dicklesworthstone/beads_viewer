@@ -233,6 +233,15 @@ func (m TutorialModel) handleTOCKeys(msg tea.KeyMsg) TutorialModel {
 	return m
 }
 
+// ViewForBodyHeight renders the tutorial constrained to the available body height
+// (e.g. m.height-1 above Model's global footer) without mutating stored terminal height.
+func (m TutorialModel) ViewForBodyHeight(bodyHeight int) string {
+	if bodyHeight > 0 {
+		m.height = bodyHeight
+	}
+	return m.View()
+}
+
 // View renders the tutorial overlay.
 func (m TutorialModel) View() string {
 	pages := m.visiblePages()

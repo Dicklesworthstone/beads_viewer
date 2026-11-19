@@ -4998,7 +4998,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Workspace:    msg.request.issueWorkspace,
 			ReferenceNow: m.referenceNow,
 		})
-		m.cassModal.SetSize(m.width, max(1, m.height-1))
+		m.cassModal.SetSize(m.width, m.height)
 		m.showCassModal = true
 		m.cassReturnFocus = msg.request.focus
 		m.focused = m.restoreTopModalOrListFocus()
@@ -6186,7 +6186,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.helpScroll = 0
 				m.showTutorial = true
 				m.tutorialModel.SetContextMode(false)
-				m.tutorialModel.SetSize(m.width, max(1, m.height-1))
+				m.tutorialModel.SetSize(m.width, m.height)
 				m.tutorialModel.markCurrentPageViewed()
 				m.focused = focusTutorial
 				return m, nil
@@ -6204,7 +6204,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showTutorial = true
 				m.tutorialModel.SetContext(ctx)
 				m.tutorialModel.SetContextMode(true)
-				m.tutorialModel.SetSize(m.width, max(1, m.height-1))
+				m.tutorialModel.SetSize(m.width, m.height)
 				m.tutorialModel.markCurrentPageViewed()
 				m.focused = focusTutorial
 				return m, nil
@@ -6234,7 +6234,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.tutorialModel.SetContext(ctx)
 					m.tutorialModel.SetContextMode(true)
-					m.tutorialModel.SetSize(m.width, max(1, m.height-1))
+					m.tutorialModel.SetSize(m.width, m.height)
 					m.tutorialModel.markCurrentPageViewed()
 					m.focused = focusTutorial
 					return m, nil
@@ -8165,7 +8165,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.isSplitView = msg.Width > SplitViewThreshold
 		}
-		m.tutorialModel.SetSize(msg.Width, max(1, msg.Height-1))
+		m.tutorialModel.SetSize(msg.Width, msg.Height)
 		if !isModalFocus(m.focused) {
 			m.focused = m.validateViewFocus(m.focused)
 		}
@@ -8192,7 +8192,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.resizeAgentPromptModal()
 		}
 		if m.showCassModal {
-			m.cassModal.SetSize(m.width, max(1, m.height-1))
+			m.cassModal.SetSize(m.width, m.height)
 		}
 	}
 
@@ -9821,7 +9821,7 @@ func (m *Model) openFullTutorialFromFocus(prior focus) {
 	m.showHelp = false
 	m.helpScroll = 0
 	m.tutorialModel.SetContextMode(false)
-	m.tutorialModel.SetSize(m.width, max(1, m.height-1))
+	m.tutorialModel.SetSize(m.width, m.height)
 	m.tutorialModel.markCurrentPageViewed()
 	m.focused = focusTutorial
 }
@@ -9839,7 +9839,7 @@ func (m *Model) openContextTutorialWithContext(prior focus, ctx string) {
 	m.showTutorial = true
 	m.tutorialModel.SetContext(ctx)
 	m.tutorialModel.SetContextMode(true)
-	m.tutorialModel.SetSize(m.width, max(1, m.height-1))
+	m.tutorialModel.SetSize(m.width, m.height)
 	m.tutorialModel.markCurrentPageViewed()
 	m.focused = focusTutorial
 }
@@ -10072,7 +10072,7 @@ func (m *Model) handleHelpKeys(msg tea.KeyMsg) *Model {
 			m.showTutorial = true
 			if !reopenedFromTutorial {
 				m.tutorialModel.SetContextMode(false)
-				m.tutorialModel.SetSize(m.width, max(1, m.height-1))
+				m.tutorialModel.SetSize(m.width, m.height)
 				m.tutorialModel.markCurrentPageViewed()
 			}
 			m.focused = focusTutorial
@@ -10185,8 +10185,8 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 	} else if m.showHelp {
 		body = m.renderHelpOverlay()
 	} else if m.showTutorial {
-		// Interactive tutorial (bv-8y31) - full screen overlay (including context help over modals)
-		body = m.tutorialModel.View()
+		// Interactive tutorial (bv-8y31) - full screen overlay sized to bodyHeight above footer
+		body = m.tutorialModel.ViewForBodyHeight(max(1, bodyHeight))
 	} else if m.showAgentPrompt {
 		// AGENTS.md prompt modal (bv-i8dk)
 		body = m.agentPromptModal.CenterModal(m.width, m.height-1)

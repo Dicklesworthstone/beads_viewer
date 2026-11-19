@@ -292,8 +292,11 @@ func (m CassSessionModal) View() string {
 			}
 			b.WriteString("\n")
 
-			// Match reason (clamped to a single line within innerWidth)
-			matchReason := truncateRunesHelper(m.formatMatchReason(session), max(10, innerWidth-4), "…")
+			// Match reason (clamped to a single line on constrained terminal heights)
+			matchReason := m.formatMatchReason(session)
+			if m.height > 0 && m.height <= 30 {
+				matchReason = truncateRunesHelper(matchReason, max(10, innerWidth-4), "…")
+			}
 			b.WriteString("    ")
 			b.WriteString(matchReasonStyle.Render(matchReason))
 			b.WriteString("\n")
@@ -304,7 +307,7 @@ func (m CassSessionModal) View() string {
 			b.WriteString("\n\n")
 		}
 
-		// Show count of off-screen sessions and CLI search command (single line)
+		// Show count of off-screen sessions and CLI search command (single line when height-constrained)
 		if len(m.sessions) > slots {
 			extra := len(m.sessions) - slots
 			scrollArrows := ""
@@ -321,7 +324,9 @@ func (m CassSessionModal) View() string {
 				moreText += "s"
 			}
 			moreText += fmt.Sprintf(" - run: %s)", m.searchCmd)
-			moreText = truncateRunesHelper(moreText, innerWidth, "…")
+			if m.height > 0 && m.height <= 30 {
+				moreText = truncateRunesHelper(moreText, innerWidth, "…")
+			}
 			b.WriteString(matchReasonStyle.Render(moreText))
 			b.WriteString("\n\n")
 		}
